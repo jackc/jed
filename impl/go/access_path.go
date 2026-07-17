@@ -2,6 +2,7 @@ package jed
 
 import (
 	"bytes"
+	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -2302,6 +2303,10 @@ func isConstSource(e *rExpr, pkType scalarType, siblingColumns columnRanges) boo
 		return pkType.IsDecimal()
 	case reConstInterval:
 		return pkType.IsInterval()
+	case reConstFloat32:
+		return pkType == scalarFloat32
+	case reConstFloat64:
+		return pkType == scalarFloat64
 	}
 	return false
 }
@@ -2465,6 +2470,10 @@ func encodeBoundKey(pkType scalarType, src *rExpr, params []Value, outer []store
 		return encodeTerminated(src.cBytea), false, true
 	case reConstDecimal:
 		return src.cDec.EncodeKey(), false, true
+	case reConstFloat32:
+		return encodeFloat32Key(math.Float32bits(float32(src.cFloat))), false, true
+	case reConstFloat64:
+		return encodeFloat64Key(math.Float64bits(src.cFloat)), false, true
 	case reConstInterval:
 		return src.cIv.EncodeKey(), false, true
 	case reParam:
@@ -2533,8 +2542,12 @@ func encodeValueKey(pkType scalarType, v Value, coll *Collation) (key []byte, is
 		}
 		return v.interval().EncodeKey(), false, true
 	case pkType.IsFloat():
-		// A float PK does NOT push down this slice (full-scan + residual filter, like the container
-		// keys) — drop the half-bound (sound widening), matching Rust encode_value_key's OutOfRange.
+		if pkType == scalarFloat32 && v.Kind == ValFloat32 {
+			return encodeFloat32Key(math.Float32bits(v.F32())), false, true
+		}
+		if pkType == scalarFloat64 && v.Kind == ValFloat64 {
+			return encodeFloat64Key(math.Float64bits(v.F64())), false, true
+		}
 		return nil, false, false
 	case pkType.IsInteger():
 		if !pkType.InRange(v.Int) {

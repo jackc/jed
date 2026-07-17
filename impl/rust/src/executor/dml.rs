@@ -2464,6 +2464,7 @@ impl Engine {
         // Select and execute the target scan through the shared mutation access-path seam. Planning
         // happens after uncorrelated folding, matching the old inline detector timing.
         let scan_plan = self.plan_mutation_scan(del.db.as_deref(), table, filter.as_ref());
+        let scan_before = meter.accrued;
         let batch = self.execute_mutation_scan(
             &scan_plan,
             &del.table,
@@ -2473,19 +2474,29 @@ impl Engine {
             &mut meter,
             &mask,
         )?;
-        meter.charge(
-            COSTS.page_read * batch.pages as i64 + COSTS.value_decompress * batch.slabs as i64,
-        );
+        let mut scan_actual = meter.accrued - scan_before;
+        let block_cost =
+            COSTS.page_read * batch.pages as i64 + COSTS.value_decompress * batch.slabs as i64;
+        meter.charge(block_cost);
+        scan_actual += block_cost;
+        let mut filter_actual = scan_actual;
         let store = self.store_scoped(del.db.as_deref(), &del.table);
         for (k, mut row) in batch.entries {
             meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
+            scan_actual += COSTS.storage_row_read;
+            filter_actual += COSTS.storage_row_read;
             // Materialize the filter's columns if the lazy load left them unfetched — exactly
             // the touched set the block above charged (large-values.md §14).
             store.resolve_columns(&mut row, &mask)?;
             let keep = match &filter {
                 None => true,
-                Some(f) => f.eval(&row, &env, &mut meter)?.is_true(),
+                Some(f) => {
+                    let before = meter.accrued;
+                    let keep = f.eval(&row, &env, &mut meter)?.is_true();
+                    filter_actual += meter.accrued - before;
+                    keep
+                }
             };
             if keep {
                 // The FK parent-side probe + index-entry removal below read this row's key/index
@@ -2493,6 +2504,12 @@ impl Engine {
                 // column is always inline, so cost-free) so those paths see resident values.
                 store.resolve_inline_columns(&mut row)?;
                 matched.push((k, row));
+            }
+        }
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            profile.record(format!("Scan {}", del.table), scan_actual);
+            if filter.is_some() {
+                profile.record("Filter".to_string(), filter_actual);
             }
         }
 
@@ -2857,6 +2874,7 @@ impl Engine {
         // Select and execute the target scan through the shared mutation access-path seam. The
         // keyed batch is over the pre-update state and feeds the unchanged two-phase rewrite.
         let scan_plan = self.plan_mutation_scan(upd.db.as_deref(), table, filter.as_ref());
+        let scan_before = meter.accrued;
         let batch = self.execute_mutation_scan(
             &scan_plan,
             &upd.table,
@@ -2866,19 +2884,29 @@ impl Engine {
             &mut meter,
             &mask,
         )?;
-        meter.charge(
-            COSTS.page_read * batch.pages as i64 + COSTS.value_decompress * batch.slabs as i64,
-        );
+        let mut scan_actual = meter.accrued - scan_before;
+        let block_cost =
+            COSTS.page_read * batch.pages as i64 + COSTS.value_decompress * batch.slabs as i64;
+        meter.charge(block_cost);
+        scan_actual += block_cost;
+        let mut filter_actual = scan_actual;
         let store = self.store_scoped(upd.db.as_deref(), &upd.table);
         for (key, mut row) in batch.entries {
             meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
+            scan_actual += COSTS.storage_row_read;
+            filter_actual += COSTS.storage_row_read;
             // Materialize the filter's + assignment sources' columns if the lazy load left them
             // unfetched — exactly the touched set the block above charged (large-values.md §14).
             store.resolve_columns(&mut row, &mask)?;
             let matched = match &filter {
                 None => true,
-                Some(f) => f.eval(&row, &env, &mut meter)?.is_true(),
+                Some(f) => {
+                    let before = meter.accrued;
+                    let matched = f.eval(&row, &env, &mut meter)?.is_true();
+                    filter_actual += meter.accrued - before;
+                    matched
+                }
             };
             if !matched {
                 continue;
@@ -2914,6 +2942,12 @@ impl Engine {
                 key.clone()
             };
             updates.push((key, new_key, new_row, row));
+        }
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            profile.record(format!("Scan {}", upd.table), scan_actual);
+            if filter.is_some() {
+                profile.record("Filter".to_string(), filter_actual);
+            }
         }
 
         // PRIMARY KEY end-state validation for a re-keying UPDATE (the storage key changed):

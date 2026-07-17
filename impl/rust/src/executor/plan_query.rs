@@ -264,6 +264,9 @@ impl Engine {
         self.fold_uncorrelated_in_plan(&mut plan, &bound, ctx, &mut subquery_cost)?;
         let mut r = self.exec_query_plan(&plan, &[], &bound, ctx)?;
         r.cost += subquery_cost + total_cost;
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            profile.record_parent("WITH".to_string(), r.cost);
+        }
         Ok(r)
     }
 
@@ -281,6 +284,17 @@ impl Engine {
         let mut total_cost: i64 = 0;
         let mut buffers: Vec<Vec<Row>> = Vec::with_capacity(bindings.len());
         for i in 0..bindings.len() {
+            let before = total_cost;
+            let body_visible = bindings[i].refs.get() > 0
+                || bindings[i].recursive.is_some()
+                || matches!(&bindings[i].source, CteSource::Dml(_))
+                || modes[i] == CteMode::Materialize;
+            if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+                profile.record(
+                    format!("@cte-body {}", bindings[i].name),
+                    i64::from(body_visible),
+                );
+            }
             let buf = if let Some(rt) = &bindings[i].recursive {
                 self.materialize_recursive(
                     i,
@@ -309,6 +323,9 @@ impl Engine {
                 }
             };
             buffers.push(buf);
+            if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+                profile.record_parent(format!("CTE {}", bindings[i].name), total_cost - before);
+            }
         }
         Ok((buffers, total_cost))
     }
@@ -463,6 +480,17 @@ impl Engine {
         let mut total_cost: i64 = 0;
         let mut buffers: Vec<Vec<Row>> = Vec::with_capacity(bindings.len());
         for i in 0..bindings.len() {
+            let before = total_cost;
+            let body_visible = bindings[i].refs.get() > 0
+                || bindings[i].recursive.is_some()
+                || matches!(&bindings[i].source, CteSource::Dml(_))
+                || modes[i] == CteMode::Materialize;
+            if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+                profile.record(
+                    format!("@cte-body {}", bindings[i].name),
+                    i64::from(body_visible),
+                );
+            }
             let buf = if let Some(rt) = &bindings[i].recursive {
                 self.materialize_recursive(
                     i,
@@ -498,9 +526,18 @@ impl Engine {
                 Vec::new()
             };
             buffers.push(buf);
+            if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+                profile.record_parent(format!("CTE {}", bindings[i].name), total_cost - before);
+            }
         }
 
         // (4) Execute the primary against the full CTE context, adding the materialization cost.
+        let primary_dml_node = match &body {
+            CteBody::Insert(ins) => Some(format!("Insert {}", ins.table)),
+            CteBody::Update(upd) => Some(format!("Update {}", upd.table)),
+            CteBody::Delete(del) => Some(format!("Delete {}", del.table)),
+            CteBody::Query(_) => None,
+        };
         let outcome = match body {
             CteBody::Query(_) => {
                 let mut plan = primary_plan
@@ -546,7 +583,16 @@ impl Engine {
                 self.execute_delete(*del, params, ctx)?
             }
         };
-        Ok(add_outcome_cost(outcome, total_cost))
+        if let Some(node) = primary_dml_node
+            && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+        {
+            profile.record(node, outcome.cost());
+        }
+        let outcome = add_outcome_cost(outcome, total_cost);
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            profile.record_parent("WITH".to_string(), outcome.cost());
+        }
+        Ok(outcome)
     }
 
     /// Execute a data-modifying CTE (spec/design/writable-cte.md §3): run the `INSERT`/`UPDATE`/
@@ -569,11 +615,19 @@ impl Engine {
             },
             CteSource::Query(_) => unreachable!("exec_dm_cte requires a data-modifying binding"),
         };
+        let node = match &stmt {
+            DmStmt::Insert(ins) => format!("Insert {}", ins.table),
+            DmStmt::Update(upd) => format!("Update {}", upd.table),
+            DmStmt::Delete(del) => format!("Delete {}", del.table),
+        };
         let outcome = match stmt {
             DmStmt::Insert(ins) => self.execute_insert(*ins, params, ctx)?,
             DmStmt::Update(upd) => self.execute_update(*upd, params, ctx)?,
             DmStmt::Delete(del) => self.execute_delete(*del, params, ctx)?,
         };
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            profile.record(node, outcome.cost());
+        }
         Ok(match outcome {
             Outcome::Query { rows, cost, .. } => (rows, cost),
             Outcome::Statement { cost, .. } => (Vec::new(), cost),
@@ -655,12 +709,38 @@ impl Engine {
         params: &[Value],
         ctes: CteCtx,
     ) -> Result<SelectResult> {
-        match plan {
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            profile.begin_frame();
+        }
+        let result = match plan {
             QueryPlan::Select(sp) => self.exec_select_plan(sp, outer, params, ctes),
             QueryPlan::SetOp(sop) => self.exec_set_op_plan(sop, outer, params, ctes),
             QueryPlan::Values(vp) => self.exec_values_plan(vp, outer, params, ctes),
             QueryPlan::With(wp) => self.exec_with_plan(wp, outer, params),
+        };
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            profile.end_frame();
         }
+        result
+    }
+
+    /// Execute an expression subquery whose operators are not rendered as separate EXPLAIN rows.
+    /// Its returned cost still accrues into the containing visible operator checkpoint.
+    pub(crate) fn exec_hidden_query_plan(
+        &self,
+        plan: &QueryPlan,
+        outer: &[&[Value]],
+        params: &[Value],
+        ctes: CteCtx,
+    ) -> Result<SelectResult> {
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            profile.begin_frame();
+        }
+        let result = self.exec_query_plan(plan, outer, params, ctes);
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            profile.discard_frame();
+        }
+        result
     }
 
     /// Execute a nested `WITH` plan (spec/design/cte.md §7): materialize its CTE bindings once (in
@@ -683,6 +763,9 @@ impl Engine {
         };
         let mut r = self.exec_query_plan(&wp.body, outer, params, ctx)?;
         r.cost += total_cost;
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            profile.record_parent("WITH".to_string(), r.cost);
+        }
         Ok(r)
     }
 
@@ -871,6 +954,9 @@ impl Engine {
             }
             rows.push(out);
         }
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            profile.record_parent("Values".to_string(), meter.accrued);
+        }
         Ok(SelectResult {
             column_names: plan.column_names.clone(),
             column_types: plan.column_types.clone(),
@@ -902,9 +988,26 @@ impl Engine {
 
         let mut rows = combine_setop(plan.op, plan.all, left_rows, right_rows);
         let cost = left.cost + right.cost;
+        let root_node = if plan.limit.is_some() || plan.offset.is_some() {
+            "Limit"
+        } else if !plan.order.is_empty() {
+            "Sort"
+        } else {
+            set_op_node_name(plan.op)
+        };
+        if root_node != set_op_node_name(plan.op)
+            && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+        {
+            profile.record_parent(set_op_node_name(plan.op).to_string(), cost);
+        }
 
         if !plan.order.is_empty() {
             sort_rows(&mut rows, &plan.order)?;
+            if root_node != "Sort"
+                && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+            {
+                profile.record_parent("Sort".to_string(), cost);
+            }
         }
 
         // LIMIT / OFFSET window — clamp in the integer domain (counts are non-negative, parser),
@@ -916,6 +1019,9 @@ impl Engine {
             _ => len,
         };
         let rows = rows[start..end].to_vec();
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            profile.record_parent(root_node.to_string(), cost);
+        }
 
         Ok(SelectResult {
             column_names: plan.column_names.clone(),

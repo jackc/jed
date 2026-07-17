@@ -2777,3 +2777,19 @@ SELECT GREATEST(low, NULL, high)                 -- NULLs are skipped; = GREATES
   comparison work under the cost ceiling (§13). Output name for a bare `SELECT GREATEST(…)` /
   `SELECT LEAST(…)` is **`greatest`** / **`least`** (PostgreSQL) — the fixed keyword lowercased, the
   same no-expression-printer rationale as the §8 rule-4 function names.
+
+## 53. `EXPLAIN` options
+
+`EXPLAIN` accepts both the legacy `EXPLAIN ANALYZE <statement>` spelling and a non-empty,
+comma-separated boolean option list:
+
+```sql
+EXPLAIN (ANALYZE, VERBOSE TRUE, COSTS OFF, LANE ON) SELECT ...
+```
+
+The four option names are `ANALYZE`, `VERBOSE`, `COSTS`, and `LANE`. An omitted value means
+`TRUE`; explicit values are `TRUE`, `FALSE`, `ON`, or `OFF`, case-insensitively. Repeating an option,
+using an unknown option, writing an empty list, or mixing the legacy positional `ANALYZE` spelling
+with a parenthesized list is `42601`. These words remain non-reserved: they acquire option meaning
+only between the parentheses immediately following the leading `EXPLAIN`. The result shape and each
+option's behavior are specified in [explain.md](explain.md).

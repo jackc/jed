@@ -252,13 +252,68 @@ impl Parser {
     /// statement begins with the word ANALYZE, so there is no ambiguity.
     fn parse_explain(&mut self) -> Result<Statement> {
         self.advance(); // EXPLAIN
-        let analyze = self.peek_keyword().as_deref() == Some("analyze");
-        if analyze {
+        let (mut analyze, mut verbose, mut costs, mut lane) = (false, false, true, false);
+        let mut seen = std::collections::HashSet::new();
+        let mut option_list = false;
+        if matches!(self.peek(), Token::LParen) {
+            option_list = true;
             self.advance();
+            loop {
+                let name = self
+                    .peek_keyword()
+                    .ok_or_else(|| syntax("expected an EXPLAIN option"))?;
+                if !matches!(name.as_str(), "analyze" | "verbose" | "costs" | "lane") {
+                    return Err(syntax(format!("unrecognized EXPLAIN option: {name}")));
+                }
+                self.advance();
+                if !seen.insert(name.clone()) {
+                    return Err(syntax(format!(
+                        "EXPLAIN option specified more than once: {name}"
+                    )));
+                }
+                let value = match self.peek_keyword().as_deref() {
+                    Some("true") | Some("on") => {
+                        self.advance();
+                        true
+                    }
+                    Some("false") | Some("off") => {
+                        self.advance();
+                        false
+                    }
+                    _ => true,
+                };
+                match name.as_str() {
+                    "analyze" => analyze = value,
+                    "verbose" => verbose = value,
+                    "costs" => costs = value,
+                    "lane" => lane = value,
+                    _ => unreachable!(),
+                }
+                if matches!(self.peek(), Token::RParen) {
+                    self.advance();
+                    break;
+                }
+                if !matches!(self.peek(), Token::Comma) {
+                    return Err(syntax("expected ',' or ')' in EXPLAIN option list"));
+                }
+                self.advance();
+            }
+        }
+        if self.peek_keyword().as_deref() == Some("analyze") {
+            if option_list {
+                return Err(syntax(
+                    "cannot mix EXPLAIN option list with positional ANALYZE",
+                ));
+            }
+            self.advance();
+            analyze = true;
         }
         let inner = self.parse_explain_inner()?;
         Ok(Statement::Explain {
             analyze,
+            verbose,
+            costs,
+            lane,
             inner: Box::new(inner),
         })
     }

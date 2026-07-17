@@ -995,8 +995,12 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   applied once against the base relation; GIN/GiST residual rechecks add work without reducing rows a
   second time.
   P5 now propagates the selected plan through every rendered query/DML node and exposes cumulative
-  non-NULL `i64` `est_rows`/`est_cost` columns in EXPLAIN. ANALYZE keeps actual root cost/rows in its
-  detail, CTE attribution follows execution semantics, and streaming LIMIT prefixes affect estimates.
+  non-NULL `i64` `est_rows`/`est_cost` columns in EXPLAIN. The parenthesized boolean option list adds
+  `VERBOSE`, `COSTS`, and `LANE`; VERBOSE prints canonical resolved filters/projections and exact
+  shortest float bounds under their determinism-ledger entries. ANALYZE adds inclusive per-node
+  `actual_cost` attribution as well as actual root cost/rows. SELECT and DML scans report their exact
+  touched-set widths, writable WITH trees are renderable without execution, CTE attribution follows
+  execution semantics, and streaming LIMIT prefixes affect estimates.
   P6 now cost-selects the complete single-base-relation pipeline: PK, every ordered-B-tree,
   GiST/GIN, both interval-set families, full scan, and eligible order-only B-tree walks compete after
   composing natural order, the complete residual/projection, and LIMIT/OFFSET early-out. Exact ties

@@ -1277,7 +1277,8 @@ pub(crate) fn reject_params_for_ddl(params: &[Value]) -> Result<()> {
 
 // ================================================================================================
 // EXPLAIN — render the planner's chosen plan as a deterministic, cross-core-identical result set
-// (spec/design/explain.md). The output is an ordinary query Outcome with five columns:
+// (spec/design/explain.md). The structural columns are always present; COSTS (the default), ANALYZE,
+// and LANE append their deterministic columns:
 //
 //   depth  i32   the plan node's nesting level (0-based), from a pre-order DFS of the plan tree
 //   node   text  the operator label (a fixed vocabulary — the §8 cross-core spelling contract)
@@ -1297,7 +1298,11 @@ pub(crate) fn reject_params_for_ddl(params: &[Value]) -> Result<()> {
 #[derive(Default)]
 pub(crate) struct ExplainRender {
     pub(crate) rows: Vec<Vec<Value>>,
+    pub(crate) frame_depths: Vec<usize>,
+    pub(crate) frame_depth: usize,
     estimates: Vec<(i64, i64)>,
+    pub(crate) actual: Vec<i64>,
+    pub(crate) verbose: bool,
     next_estimate: usize,
 }
 
@@ -1305,7 +1310,11 @@ impl ExplainRender {
     pub(crate) fn with_estimates(estimates: Vec<(i64, i64)>) -> Self {
         Self {
             rows: Vec::new(),
+            frame_depths: Vec::new(),
+            frame_depth: 0,
             estimates,
+            actual: Vec::new(),
+            verbose: false,
             next_estimate: 0,
         }
     }
@@ -1322,14 +1331,31 @@ impl ExplainRender {
             .copied()
             .unwrap_or((0, 0));
         self.next_estimate += 1;
+        let actual_cost = self
+            .actual
+            .get(self.next_estimate - 1)
+            .copied()
+            .unwrap_or(0);
         self.rows.push(vec![
             Value::Int(depth),
             Value::Text(node.into()),
             Value::Text(detail),
             Value::Int(est_rows),
             Value::Int(est_cost),
+            Value::Int(actual_cost),
         ]);
+        self.frame_depths.push(self.frame_depth);
     }
+}
+
+pub(crate) fn explain_actual_costs(estimates: &[(i64, i64)], total: i64) -> Vec<i64> {
+    // Actual attribution is execution-only: an unexecuted metadata subtree must not inherit its
+    // estimate. The statement root is exact; descendant checkpoints overwrite these zeroes.
+    let mut actual = vec![0; estimates.len()];
+    if let Some(root) = actual.first_mut() {
+        *root = total;
+    }
+    actual
 }
 
 /// Render an INSERT's ON CONFLICT disposition (or "-" when there is none).
@@ -1363,7 +1389,7 @@ pub(crate) fn cte_mode_text(m: CteMode) -> &'static str {
 
 /// Render an Aggregate node's attributes: the grouping-key count, aggregate count, the grouping-set
 /// count when there is more than one set, and the HAVING conjunct count.
-pub(crate) fn agg_detail(sp: &SelectPlan) -> String {
+pub(crate) fn agg_detail(sp: &SelectPlan, verbose: bool) -> String {
     let mut parts = vec![format!(
         "groups={} aggs={}",
         sp.group_keys.len(),
@@ -1373,17 +1399,22 @@ pub(crate) fn agg_detail(sp: &SelectPlan) -> String {
         parts.push(format!("sets={}", sp.group_sets.len()));
     }
     if let Some(having) = &sp.having {
-        parts.push(format!("having:conjuncts={}", conjunct_count(having)));
+        parts.push(if verbose {
+            format!("having={}", render_rexpr(having))
+        } else {
+            format!("having:conjuncts={}", conjunct_count(having))
+        });
     }
     parts.join("; ")
 }
 
 /// Render a Nested Loop node's attributes: the join kind and the ON predicate's conjunct count (a
 /// CROSS join has no ON).
-pub(crate) fn join_detail(j: &PlanJoin) -> String {
+pub(crate) fn join_detail(j: &PlanJoin, verbose: bool) -> String {
     let kind = join_kind_text(j.kind);
     match &j.on {
         None => kind.to_string(),
+        Some(on) if verbose => format!("{kind}; on={}", render_rexpr(on)),
         Some(on) => format!("{kind}; on:conjuncts={}", conjunct_count(on)),
     }
 }
@@ -1448,11 +1479,8 @@ pub(crate) fn bound_op_text(op: CmpOp) -> &'static str {
 }
 
 /// Render a bound's const-source operand: a bind parameter as `$N` (1-based), a correlated
-/// outer-column reference as `outer`, or a literal. Integer / boolean / decimal literals render
-/// deterministically; a text literal renders verbatim unless it contains a newline (which would split
-/// the cell), in which case `<text>`; every other constant type renders `<value>` for now (a later
-/// slice widens this). A `float` bound source cannot arise here — float keys do not push down, so the
-/// determinism-ledger `<float>` token the Go/TS renderers reserve has no [`BoundSrc`] analogue.
+/// outer-column reference as `outer`, or a literal. Floats use the native shortest-round-trip
+/// spelling under `explain-float-literal-layout`; the other variants use their canonical spelling.
 pub(crate) fn render_bound_src(src: &BoundSrc) -> String {
     match src {
         BoundSrc::Param(idx) => format!("${}", idx + 1),
@@ -1464,13 +1492,9 @@ pub(crate) fn render_bound_src(src: &BoundSrc) -> String {
         BoundSrc::Int(n) => n.to_string(),
         BoundSrc::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
         BoundSrc::Decimal(d) => d.render(),
-        BoundSrc::Text(s) => {
-            if s.contains(['\n', '\r']) {
-                "<text>".to_string()
-            } else {
-                format!("'{s}'")
-            }
-        }
+        BoundSrc::Float32(v) => Value::Float32(*v).render(),
+        BoundSrc::Float64(v) => Value::Float64(*v).render(),
+        BoundSrc::Text(s) => quote_explain_text(s),
         BoundSrc::Uuid(_)
         | BoundSrc::Timestamp(_)
         | BoundSrc::Date(_)
@@ -1480,9 +1504,528 @@ pub(crate) fn render_bound_src(src: &BoundSrc) -> String {
     }
 }
 
-/// Count the top-level AND conjuncts of a residual filter (a deterministic integer — the plan text
-/// carries the count, not the expression itself; a full expression printer is a later slice,
-/// spec/design/explain.md §5).
+fn quote_explain_text(s: &str) -> String {
+    format!(
+        "'{}'",
+        s.replace('\\', "\\\\")
+            .replace('\'', "''")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
+    )
+}
+
+fn explain_arith_op(op: ArithOp) -> &'static str {
+    match op {
+        ArithOp::Add => "+",
+        ArithOp::Sub => "-",
+        ArithOp::Mul => "*",
+        ArithOp::Div => "/",
+        ArithOp::Mod => "%",
+    }
+}
+
+fn explain_call(name: &str, args: &[RExpr]) -> String {
+    format!(
+        "{name}({})",
+        args.iter().map(render_rexpr).collect::<Vec<_>>().join(", ")
+    )
+}
+
+fn debug_snake(value: impl std::fmt::Debug) -> String {
+    let source = format!("{value:?}");
+    let mut out = String::with_capacity(source.len() + 4);
+    for (i, ch) in source.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if i != 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn explain_scalar_func(func: ScalarFunc) -> String {
+    debug_snake(func)
+}
+
+fn explain_array_func(func: &ArrayFunc) -> &str {
+    match func {
+        ArrayFunc::ArrayNdims => "array_ndims",
+        ArrayFunc::ArrayLength => "array_length",
+        ArrayFunc::ArrayLower => "array_lower",
+        ArrayFunc::ArrayUpper => "array_upper",
+        ArrayFunc::Cardinality => "cardinality",
+        ArrayFunc::ArrayDims => "array_dims",
+        ArrayFunc::ArrayAppend => "array_append",
+        ArrayFunc::ArrayPrepend => "array_prepend",
+        ArrayFunc::ArrayCat => "array_cat",
+        ArrayFunc::ArrayRemove => "array_remove",
+        ArrayFunc::ArrayReplace => "array_replace",
+        ArrayFunc::ArrayPosition => "array_position",
+        ArrayFunc::ArrayPositions => "array_positions",
+        ArrayFunc::Contains => "contains",
+        ArrayFunc::ContainedBy => "contained_by",
+        ArrayFunc::Overlaps => "overlaps",
+        ArrayFunc::ArrayToJson => "array_to_json",
+    }
+}
+
+fn explain_range_func(func: RangeFunc) -> &'static str {
+    match func {
+        RangeFunc::Lower => "lower",
+        RangeFunc::Upper => "upper",
+        RangeFunc::IsEmpty => "isempty",
+        RangeFunc::LowerInc => "lower_inc",
+        RangeFunc::UpperInc => "upper_inc",
+        RangeFunc::LowerInf => "lower_inf",
+        RangeFunc::UpperInf => "upper_inf",
+    }
+}
+
+fn explain_regex_func(func: RegexFunc) -> &'static str {
+    match func {
+        RegexFunc::Replace => "regexp_replace",
+        RegexFunc::Match => "regexp_match",
+        RegexFunc::Like => "regexp_like",
+        RegexFunc::Count => "regexp_count",
+        RegexFunc::Substr => "regexp_substr",
+        RegexFunc::Instr => "regexp_instr",
+    }
+}
+
+fn explain_range_op(op: RangeOp) -> String {
+    debug_snake(op)
+}
+
+fn explain_range_set_op(op: RangeSetOp) -> String {
+    debug_snake(op)
+}
+
+fn explain_variadic_func(func: &VariadicFunc) -> &'static str {
+    match func {
+        VariadicFunc::NumNulls => "num_nulls",
+        VariadicFunc::NumNonnulls => "num_nonnulls",
+    }
+}
+
+fn explain_json_get(op: JsonGetOp) -> &'static str {
+    match op {
+        JsonGetOp::Arrow => "->",
+        JsonGetOp::ArrowText => "->>",
+        JsonGetOp::HashArrow => "#>",
+        JsonGetOp::HashArrowText => "#>>",
+    }
+}
+
+fn explain_json_has_key(kind: HasKeyKind) -> &'static str {
+    match kind {
+        HasKeyKind::One => "?",
+        HasKeyKind::Any => "?|",
+        HasKeyKind::All => "?&",
+    }
+}
+
+fn explain_jsonpath_func(kind: JsonPathFnKind) -> &'static str {
+    match kind {
+        JsonPathFnKind::Exists => "jsonb_path_exists",
+        JsonPathFnKind::QueryFirst => "jsonb_path_query_first",
+        JsonPathFnKind::QueryArray => "jsonb_path_query_array",
+        JsonPathFnKind::Match => "jsonb_path_match",
+        JsonPathFnKind::MatchSilent => "jsonb_path_match_silent",
+    }
+}
+
+fn explain_json_sql_func(kind: JsonSqlKind) -> &'static str {
+    match kind {
+        JsonSqlKind::Exists => "json_exists",
+        JsonSqlKind::Value => "json_value",
+        JsonSqlKind::Query => "json_query",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_explain_json_sql(
+    kind: JsonSqlKind,
+    ctx: &RExpr,
+    path: &RExpr,
+    returning: ScalarType,
+    decimal: Option<&DecimalTypmod>,
+    wrapper: JsonWrapper,
+    on_empty: JsonOnBehavior,
+    on_error: JsonOnBehavior,
+) -> String {
+    let mut out = format!(
+        "{}({}, {}",
+        explain_json_sql_func(kind),
+        render_rexpr(ctx),
+        render_rexpr(path)
+    );
+    match kind {
+        JsonSqlKind::Exists => {
+            out.push_str(&format!(" {} on error", explain_json_behavior(on_error)));
+        }
+        JsonSqlKind::Value => {
+            out.push_str(&format!(
+                " returning {} {} on empty {} on error",
+                explain_json_returning(returning, decimal),
+                explain_json_behavior(on_empty),
+                explain_json_behavior(on_error),
+            ));
+        }
+        JsonSqlKind::Query => {
+            out.push_str(&format!(
+                " returning {} {} keep quotes on scalar string {} on empty {} on error",
+                explain_json_returning(returning, decimal),
+                explain_json_wrapper(wrapper),
+                explain_json_behavior(on_empty),
+                explain_json_behavior(on_error),
+            ));
+        }
+    }
+    out.push(')');
+    out
+}
+
+fn explain_json_returning(returning: ScalarType, decimal: Option<&DecimalTypmod>) -> String {
+    if returning == ScalarType::Decimal {
+        if let Some(decimal) = decimal {
+            return format!("decimal({},{})", decimal.precision, decimal.scale);
+        }
+    }
+    returning.canonical_name().to_string()
+}
+
+fn explain_json_wrapper(wrapper: JsonWrapper) -> &'static str {
+    match wrapper {
+        JsonWrapper::Without => "without array wrapper",
+        JsonWrapper::Unconditional => "with unconditional array wrapper",
+        JsonWrapper::Conditional => "with conditional array wrapper",
+    }
+}
+
+fn explain_json_behavior(behavior: JsonOnBehavior) -> &'static str {
+    match behavior {
+        JsonOnBehavior::Null => "null",
+        JsonOnBehavior::Error => "error",
+        JsonOnBehavior::True => "true",
+        JsonOnBehavior::False => "false",
+        JsonOnBehavior::Unknown => "unknown",
+        JsonOnBehavior::EmptyArray => "empty array",
+        JsonOnBehavior::EmptyObject => "empty object",
+    }
+}
+
+fn explain_json_predicate(kind: JsonPredicateKind) -> &'static str {
+    match kind {
+        JsonPredicateKind::Value => "",
+        JsonPredicateKind::Scalar => " scalar",
+        JsonPredicateKind::Array => " array",
+        JsonPredicateKind::Object => " object",
+    }
+}
+
+fn render_explain_value(value: &Value) -> String {
+    match value {
+        Value::Null
+        | Value::Int(_)
+        | Value::Bool(_)
+        | Value::Decimal(_)
+        | Value::Float32(_)
+        | Value::Float64(_) => value.render(),
+        _ => quote_explain_text(&value.render()),
+    }
+}
+
+fn explain_subquery(kind: SubqueryKind, lhs: Option<&RExpr>, negated: bool) -> String {
+    match kind {
+        SubqueryKind::Scalar => "scalar(<subquery>)".to_string(),
+        SubqueryKind::Exists => format!("{}exists(<subquery>)", if negated { "not " } else { "" }),
+        SubqueryKind::In => format!(
+            "{} {}in (<subquery>)",
+            render_rexpr(lhs.expect("IN subquery has an lhs")),
+            if negated { "not " } else { "" }
+        ),
+        SubqueryKind::Quantified { op, all } => format!(
+            "{} {} {}(<subquery>)",
+            render_rexpr(lhs.expect("quantified subquery has an lhs")),
+            bound_op_text(op),
+            if all { "all" } else { "any" }
+        ),
+    }
+}
+
+/// EXPLAIN's canonical resolved-expression printer. Compounds are fully parenthesized and column
+/// references use structural zero-based slots, so source aliases cannot perturb the spelling.
+pub(crate) fn render_rexpr(e: &RExpr) -> String {
+    let binary = |lhs: &RExpr, op: &str, rhs: &RExpr| {
+        format!("({} {op} {})", render_rexpr(lhs), render_rexpr(rhs))
+    };
+    match e {
+        RExpr::Column(i) => format!("#{i}"),
+        RExpr::OuterColumn { level, index } => format!("outer({level},{index})"),
+        RExpr::Param(i) => format!("${}", i + 1),
+        RExpr::ConstInt(n) => n.to_string(),
+        RExpr::ConstBool(b) => b.to_string(),
+        RExpr::ConstText(s) => quote_explain_text(s),
+        RExpr::ConstDecimal(d) => d.render(),
+        RExpr::ConstFloat32(f) => Value::Float32(*f).render(),
+        RExpr::ConstFloat64(f) => Value::Float64(*f).render(),
+        RExpr::ConstBytea(b) => quote_explain_text(&Value::Bytea(b.clone()).render()),
+        RExpr::ConstUuid(u) => quote_explain_text(&Value::Uuid(*u).render()),
+        RExpr::ConstTimestamp(v) => quote_explain_text(&Value::Timestamp(*v).render()),
+        RExpr::ConstTimestamptz(v) => quote_explain_text(&Value::Timestamptz(*v).render()),
+        RExpr::ConstDate(v) => quote_explain_text(&Value::Date(*v).render()),
+        RExpr::ConstInterval(v) => quote_explain_text(&Value::Interval(*v).render()),
+        RExpr::ConstJson(s) | RExpr::ConstJsonPath(s) => quote_explain_text(s),
+        RExpr::ConstJsonb(v) => quote_explain_text(&Value::Jsonb((**v).clone()).render()),
+        RExpr::ConstNull => "NULL".to_string(),
+        RExpr::Row(fields) => explain_call("row", fields),
+        RExpr::Array { elems, .. } => format!(
+            "array[{}]",
+            elems
+                .iter()
+                .map(render_rexpr)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        RExpr::ConstArray(v) => quote_explain_text(&Value::Array((**v).clone()).render()),
+        RExpr::ConstRange(v) => quote_explain_text(&Value::Range((**v).clone()).render()),
+        RExpr::Field { base, index } => format!("{}.field{index}", render_rexpr(base)),
+        RExpr::Subscript {
+            base, subscripts, ..
+        } => {
+            let suffix = subscripts
+                .iter()
+                .map(|sub| match sub {
+                    RSubscript::Index(index) => format!("[{}]", render_rexpr(index)),
+                    RSubscript::Slice { lower, upper } => format!(
+                        "[{}:{}]",
+                        lower.as_deref().map(render_rexpr).unwrap_or_default(),
+                        upper.as_deref().map(render_rexpr).unwrap_or_default()
+                    ),
+                })
+                .collect::<String>();
+            format!("{}{suffix}", render_rexpr(base))
+        }
+        RExpr::Cast { inner, target, .. } => {
+            format!(
+                "cast({} as {})",
+                render_rexpr(inner),
+                target.canonical_name()
+            )
+        }
+        RExpr::ArrayCast { inner, .. } => format!("array_cast({})", render_rexpr(inner)),
+        RExpr::Neg { operand, .. } => format!("(-{})", render_rexpr(operand)),
+        RExpr::Not(operand) => format!("(not {})", render_rexpr(operand)),
+        RExpr::Arith { op, lhs, rhs, .. } => binary(lhs, explain_arith_op(*op), rhs),
+        RExpr::Compare { op, lhs, rhs, .. } => binary(lhs, bound_op_text(*op), rhs),
+        RExpr::And(lhs, rhs) => binary(lhs, "and", rhs),
+        RExpr::Or(lhs, rhs) => binary(lhs, "or", rhs),
+        RExpr::JsonGet { op, base, arg } => binary(base, explain_json_get(*op), arg),
+        RExpr::JsonContains { a, b } => binary(a, "@>", b),
+        RExpr::JsonHasKey { kind, base, arg } => binary(base, explain_json_has_key(*kind), arg),
+        RExpr::JsonConcat { a, b } => binary(a, "||", b),
+        RExpr::JsonDelete { kind, base, arg } => binary(
+            base,
+            if *kind == DeleteKind::Path { "#-" } else { "-" },
+            arg,
+        ),
+        RExpr::JsonSetInsert { mode, args } => explain_call(
+            if *mode == json::PathSetMode::Set {
+                "jsonb_set"
+            } else {
+                "jsonb_insert"
+            },
+            args,
+        ),
+        RExpr::JsonObjectFromArrays { json, args } => {
+            explain_call(if *json { "json_object" } else { "jsonb_object" }, args)
+        }
+        RExpr::JsonPathFn { kind, args } => explain_call(explain_jsonpath_func(*kind), args),
+        RExpr::JsonSqlFn {
+            kind,
+            ctx,
+            path,
+            returning,
+            decimal,
+            wrapper,
+            on_empty,
+            on_error,
+        } => render_explain_json_sql(
+            *kind,
+            ctx,
+            path,
+            *returning,
+            decimal.as_ref(),
+            *wrapper,
+            *on_empty,
+            *on_error,
+        ),
+        RExpr::IsNull { operand, negated } => format!(
+            "({} is {}null)",
+            render_rexpr(operand),
+            if *negated { "not " } else { "" }
+        ),
+        RExpr::IsJson {
+            operand,
+            negated,
+            kind,
+            unique_keys,
+        } => format!(
+            "({} is {}json{}{})",
+            render_rexpr(operand),
+            if *negated { "not " } else { "" },
+            explain_json_predicate(*kind),
+            if *unique_keys {
+                " with unique keys"
+            } else {
+                ""
+            }
+        ),
+        RExpr::JsonCtor {
+            operand,
+            unique_keys,
+        } => format!(
+            "json({}{})",
+            render_rexpr(operand),
+            if *unique_keys {
+                " with unique keys"
+            } else {
+                ""
+            }
+        ),
+        RExpr::Distinct { lhs, rhs, negated } => binary(
+            lhs,
+            if *negated {
+                "is not distinct from"
+            } else {
+                "is distinct from"
+            },
+            rhs,
+        ),
+        RExpr::Like {
+            lhs,
+            rhs,
+            negated,
+            insensitive,
+        } => binary(
+            lhs,
+            match (*negated, *insensitive) {
+                (false, false) => "like",
+                (true, false) => "not like",
+                (false, true) => "ilike",
+                (true, true) => "not ilike",
+            },
+            rhs,
+        ),
+        RExpr::Regex {
+            lhs,
+            rhs,
+            negated,
+            insensitive,
+            ..
+        } => binary(
+            lhs,
+            match (*negated, *insensitive) {
+                (false, false) => "~",
+                (true, false) => "!~",
+                (false, true) => "~*",
+                (true, true) => "!~*",
+            },
+            rhs,
+        ),
+        RExpr::Casing { upper, arg } => explain_call(
+            if *upper { "upper" } else { "lower" },
+            std::slice::from_ref(arg),
+        ),
+        RExpr::AtTimeZone { zone, value, .. } => binary(value, "at time zone", zone),
+        RExpr::DateTrunc { unit, value, zone } => {
+            let mut args = vec![render_rexpr(unit), render_rexpr(value)];
+            if let Some(zone) = zone {
+                args.push(render_rexpr(zone));
+            }
+            format!("date_trunc({})", args.join(", "))
+        }
+        RExpr::Extract { field, value } => format!("extract({field} from {})", render_rexpr(value)),
+        RExpr::DateConvert { inner, to } => {
+            format!("cast({} as {})", render_rexpr(inner), to.canonical_name())
+        }
+        RExpr::DateClock { offset_days } => format!("date_clock({offset_days})"),
+        RExpr::Case { arms, els, .. } => {
+            let arms = arms
+                .iter()
+                .map(|(cond, result)| {
+                    format!("when {} then {}", render_rexpr(cond), render_rexpr(result))
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("(case {arms} else {} end)", render_rexpr(els))
+        }
+        RExpr::Coalesce { args, .. } => explain_call("coalesce", args),
+        RExpr::GreatestLeast { args, greatest, .. } => {
+            explain_call(if *greatest { "greatest" } else { "least" }, args)
+        }
+        RExpr::ScalarFunc { func, args, .. } => explain_call(&explain_scalar_func(*func), args),
+        RExpr::ArrayFunc { func, args } => explain_call(explain_array_func(func), args),
+        RExpr::RangeFunc { func, args } => explain_call(explain_range_func(*func), args),
+        RExpr::RegexFunc { func, args, .. } => explain_call(explain_regex_func(*func), args),
+        RExpr::RangeCtor { elem, args } => explain_call(
+            crate::range::range_name_for_element(*elem).unwrap_or("range"),
+            args,
+        ),
+        RExpr::RangeOp { op, args, .. } => {
+            explain_call(&format!("range_{}", explain_range_op(*op)), args)
+        }
+        RExpr::RangeSetOp { op, args } => {
+            explain_call(&format!("range_{}", explain_range_set_op(*op)), args)
+        }
+        RExpr::Variadic { func, args, .. } => explain_call(explain_variadic_func(func), args),
+        RExpr::JsonBuild {
+            kind, json, args, ..
+        } => explain_call(
+            &format!(
+                "{}_build_{}",
+                if *json { "json" } else { "jsonb" },
+                if *kind == JsonBuildKind::Array {
+                    "array"
+                } else {
+                    "object"
+                }
+            ),
+            args,
+        ),
+        RExpr::InValues { lhs, list, negated } => format!(
+            "{} {}in ({})",
+            render_rexpr(lhs),
+            if *negated { "not " } else { "" },
+            list.iter()
+                .map(render_explain_value)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        RExpr::Quantified {
+            op,
+            all,
+            lhs,
+            array,
+        } => format!(
+            "{} {} {}({})",
+            render_rexpr(lhs),
+            bound_op_text(*op),
+            if *all { "all" } else { "any" },
+            render_rexpr(array)
+        ),
+        RExpr::Subquery {
+            kind, lhs, negated, ..
+        } => explain_subquery(*kind, lhs.as_deref(), *negated),
+    }
+}
+
+/// Count the top-level AND conjuncts of a predicate for compact, non-verbose plan text.
 pub(crate) fn conjunct_count(e: &RExpr) -> i64 {
     match e {
         RExpr::And(l, r) => conjunct_count(l) + conjunct_count(r),
@@ -1749,7 +2292,7 @@ pub(crate) fn stmt_is_write(stmt: &Statement) -> bool {
     // EXPLAIN is a read: plain EXPLAIN plans without executing (even of a DML inner — it never
     // mutates). Only EXPLAIN ANALYZE runs the inner statement, so it is a write iff the inner is
     // (spec/design/explain.md §3).
-    if let Statement::Explain { analyze, inner } = stmt {
+    if let Statement::Explain { analyze, inner, .. } = stmt {
         return *analyze && stmt_is_write(inner);
     }
     matches!(

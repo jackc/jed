@@ -2,7 +2,15 @@
 //! impl/go exec_scan.go): the streaming scan/sort/join operators, index-order and window-top-N scans,
 //! relation materialization, and the exec_select_plan entry — as Engine methods.
 
+use super::explain_exec::{select_actual_rel_node, select_actual_root_node};
 use super::*;
+
+#[derive(Default)]
+struct StreamingActual {
+    filter: i64,
+    distinct: i64,
+    output: i64,
+}
 
 #[allow(clippy::too_many_arguments)]
 fn process_streaming_row(
@@ -15,6 +23,7 @@ fn process_streaming_row(
     passed: &mut i64,
     seen: &mut std::collections::HashSet<Vec<Value>>,
     out: &mut Vec<Vec<Value>>,
+    actual: &mut StreamingActual,
     guarded: bool,
 ) -> Result<bool> {
     if !guarded {
@@ -31,15 +40,20 @@ fn process_streaming_row(
         row
     };
     if let Some(filter) = &plan.filter {
-        if !filter.eval(row, env, meter)?.is_true() {
+        let before = meter.accrued;
+        let keep = filter.eval(row, env, meter)?.is_true();
+        actual.filter += meter.accrued - before;
+        if !keep {
             return Ok(true);
         }
     }
     if plan.distinct {
+        let before = meter.accrued;
         let mut projected = Vec::with_capacity(plan.projections.len());
         for p in &plan.projections {
             projected.push(p.eval(row, env, meter)?);
         }
+        actual.distinct += meter.accrued - before;
         if !seen.insert(projected.clone()) {
             return Ok(true);
         }
@@ -48,17 +62,20 @@ fn process_streaming_row(
             return Ok(true);
         }
         meter.charge(COSTS.row_produced);
+        actual.output += COSTS.row_produced;
         out.push(projected);
     } else {
         *passed += 1;
         if *passed <= offset {
             return Ok(true);
         }
+        let before = meter.accrued;
         meter.charge(COSTS.row_produced);
         let mut projected = Vec::with_capacity(plan.projections.len());
         for p in &plan.projections {
             projected.push(p.eval(row, env, meter)?);
         }
+        actual.output += meter.accrued - before;
         out.push(projected);
     }
     Ok(plan.limit.is_none_or(|limit| (out.len() as i64) < limit))
@@ -88,6 +105,7 @@ fn scan_stream_table_interval(
     passed: &mut i64,
     seen: &mut std::collections::HashSet<Vec<Value>>,
     out: &mut Vec<Vec<Value>>,
+    actual: &mut StreamingActual,
     can_pull: bool,
 ) -> Result<bool> {
     let (overlap, slabs) = store.overlap_scan_units(bound, &plan.rel_masks[0])?;
@@ -98,7 +116,7 @@ fn scan_stream_table_interval(
     let mut more = true;
     let mut visit = |_key: &[u8], row: &Row| -> Result<bool> {
         more = process_streaming_row(
-            store, row, plan, env, meter, offset, passed, seen, out, false,
+            store, row, plan, env, meter, offset, passed, seen, out, actual, false,
         )?;
         Ok(more)
     };
@@ -128,6 +146,8 @@ impl Engine {
         let mut passed = 0i64;
         let mut seen = std::collections::HashSet::new();
         let can_pull = plan.limit != Some(0);
+        let profile_start = meter.accrued;
+        let mut actual = StreamingActual::default();
 
         match &plan.phys.rel_bounds[0] {
             None => {
@@ -142,6 +162,7 @@ impl Engine {
                     &mut passed,
                     &mut seen,
                     &mut out,
+                    &mut actual,
                     can_pull,
                 )?;
             }
@@ -158,6 +179,7 @@ impl Engine {
                         &mut passed,
                         &mut seen,
                         &mut out,
+                        &mut actual,
                         can_pull,
                     )?;
                 }
@@ -186,6 +208,7 @@ impl Engine {
                                 &mut passed,
                                 &mut seen,
                                 &mut out,
+                                &mut actual,
                                 can_pull,
                             )? {
                                 break;
@@ -204,6 +227,7 @@ impl Engine {
                                 &mut passed,
                                 &mut seen,
                                 &mut out,
+                                &mut actual,
                                 can_pull,
                             )? {
                                 break;
@@ -240,6 +264,7 @@ impl Engine {
                                 &mut passed,
                                 &mut seen,
                                 &mut out,
+                                &mut actual,
                                 true,
                             )
                         };
@@ -297,6 +322,7 @@ impl Engine {
                                 &mut passed,
                                 &mut seen,
                                 &mut out,
+                                &mut actual,
                                 true,
                             )?;
                             Ok(more)
@@ -352,6 +378,7 @@ impl Engine {
                             &mut passed,
                             &mut seen,
                             &mut out,
+                            &mut actual,
                             true,
                         )? {
                             break;
@@ -403,12 +430,29 @@ impl Engine {
                             &mut passed,
                             &mut seen,
                             &mut out,
+                            &mut actual,
                             true,
                         )? {
                             break;
                         }
                     }
                 }
+            }
+        }
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            let total = meter.accrued - profile_start;
+            let scan = total - actual.filter - actual.distinct - actual.output;
+            let scan_node = format!("Scan {}", plan.rels[0].table_name);
+            let root = select_actual_root_node(plan);
+            if root != scan_node {
+                profile.record(scan_node, scan);
+            }
+            let through_filter = scan + actual.filter;
+            if plan.filter.is_some() && root != "Filter" {
+                profile.record_parent("Filter".to_string(), through_filter);
+            }
+            if plan.distinct && root != "Distinct" {
+                profile.record_parent("Distinct".to_string(), through_filter + actual.distinct);
             }
         }
         Ok(SelectResult {
@@ -533,6 +577,8 @@ impl Engine {
         meter: &mut Meter,
         params: &[Value],
     ) -> Result<Emitter> {
+        let profile_start = meter.accrued;
+        let mut filter_work = 0i64;
         let store = self.store_scoped(plan.rels[0].db.as_deref(), &plan.rels[0].table_name);
         let reverse = plan.phys.pk_reverse;
 
@@ -580,7 +626,12 @@ impl Engine {
                     row
                 };
                 let keep = match &plan.filter {
-                    Some(f) => f.eval(row, env, meter)?.is_true(),
+                    Some(f) => {
+                        let before = meter.accrued;
+                        let keep = f.eval(row, env, meter)?.is_true();
+                        filter_work += meter.accrued - before;
+                        keep
+                    }
                     None => true,
                 };
                 if !keep {
@@ -598,7 +649,23 @@ impl Engine {
 
         // The window stage over the collected prefix — identical to the eager path (§5.2), just fewer
         // rows.
+        let before_window = meter.accrued;
         apply_window_stage(&mut rows, &plan.window_specs, &plan.window_keys, env, meter)?;
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            let scan_and_filter = before_window - profile_start;
+            let scan_work = scan_and_filter - filter_work;
+            let scan_node = select_actual_rel_node(&plan.rels[0]);
+            let root = select_actual_root_node(plan);
+            if root != scan_node {
+                profile.record(scan_node, scan_work);
+            }
+            if plan.filter.is_some() && root != "Filter" {
+                profile.record_parent("Filter".to_string(), scan_and_filter);
+            }
+            if root != "Window" {
+                profile.record_parent("Window".to_string(), meter.accrued - profile_start);
+            }
+        }
 
         // The prefix is already in outer ORDER BY order (`pk_ordered`), so the sort is elided. Slice
         // the OFFSET..OFFSET+LIMIT window and project on emission — only an emitted row charges
@@ -1073,6 +1140,9 @@ impl Engine {
         env: &EvalEnv,
         meter: &mut Meter,
     ) -> Result<SelectResult> {
+        let profile_start = meter.accrued;
+        let mut filter_work = 0i64;
+        let mut output_work = 0i64;
         let store = self.store_scoped(plan.rels[0].db.as_deref(), &plan.rels[0].table_name);
         let istore = self.index_store(&io.name_key);
         // Up-front index-tree page_read (the full block; the index store has no payload, so no slabs).
@@ -1100,7 +1170,12 @@ impl Engine {
                     store.resolve_columns(&mut row, &plan.rel_masks[0])?;
                 }
                 let keep = match &plan.filter {
-                    Some(f) => f.eval(&row, env, meter)?.is_true(),
+                    Some(f) => {
+                        let before = meter.accrued;
+                        let keep = f.eval(&row, env, meter)?.is_true();
+                        filter_work += meter.accrued - before;
+                        keep
+                    }
                     None => true,
                 };
                 if !keep {
@@ -1110,11 +1185,13 @@ impl Engine {
                 if passed <= offset {
                     return Ok(true);
                 }
+                let before = meter.accrued;
                 meter.charge(COSTS.row_produced);
                 let mut projected = Vec::with_capacity(plan.projections.len());
                 for p in &plan.projections {
                     projected.push(p.eval(&row, env, meter)?);
                 }
+                output_work += meter.accrued - before;
                 out.push(projected);
                 // Stop once a LIMIT window is filled (a top-N over the index order).
                 Ok(match limit {
@@ -1124,6 +1201,18 @@ impl Engine {
             };
             // An index store has no payload columns, so its rows carry nothing to mask — whole-row scan.
             istore.scan_range(&KeyBound::unbounded(), &mut visit)?;
+        }
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            let total_work = meter.accrued - profile_start;
+            let scan_work = total_work - filter_work - output_work;
+            let scan_node = select_actual_rel_node(&plan.rels[0]);
+            let root = select_actual_root_node(plan);
+            if root != scan_node {
+                profile.record(scan_node, scan_work);
+            }
+            if plan.filter.is_some() && root != "Filter" {
+                profile.record_parent("Filter".to_string(), scan_work + filter_work);
+            }
         }
         Ok(SelectResult {
             column_names: plan.column_names.clone(),
@@ -1152,6 +1241,8 @@ impl Engine {
         meter: &mut Meter,
         params: &[Value],
     ) -> Result<Emitter> {
+        let profile_start = meter.accrued;
+        let mut filter_work = 0i64;
         let store = self.store_scoped(plan.rels[0].db.as_deref(), &plan.rels[0].table_name);
 
         // Resolve the scan bound (the PK pushdown, if any) and charge the page_read +
@@ -1204,7 +1295,12 @@ impl Engine {
                     };
                     let row_ref = resolved.as_ref().unwrap_or(row);
                     let keep = match &plan.filter {
-                        Some(f) => f.eval(row_ref, env, meter)?.is_true(),
+                        Some(f) => {
+                            let before = meter.accrued;
+                            let keep = f.eval(row_ref, env, meter)?.is_true();
+                            filter_work += meter.accrued - before;
+                            keep
+                        }
                         None => true,
                     };
                     if keep {
@@ -1248,7 +1344,12 @@ impl Engine {
                     };
                     let row_ref = resolved.as_ref().unwrap_or(row);
                     let keep = match &plan.filter {
-                        Some(f) => f.eval(row_ref, env, meter)?.is_true(),
+                        Some(f) => {
+                            let before = meter.accrued;
+                            let keep = f.eval(row_ref, env, meter)?.is_true();
+                            filter_work += meter.accrued - before;
+                            keep
+                        }
                         None => true,
                     };
                     if keep {
@@ -1288,6 +1389,21 @@ impl Engine {
         };
         for _ in 0..start {
             sorted.next()?; // skip the OFFSET rows (unwindowed — no row_produced)
+        }
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            let blocking_work = meter.accrued - profile_start;
+            let scan_work = blocking_work - filter_work;
+            let scan_node = select_actual_rel_node(&plan.rels[0]);
+            let root = select_actual_root_node(plan);
+            if root != scan_node {
+                profile.record(scan_node, scan_work);
+            }
+            if plan.filter.is_some() && root != "Filter" {
+                profile.record_parent("Filter".to_string(), blocking_work);
+            }
+            if root != "Sort" {
+                profile.record_parent("Sort".to_string(), blocking_work);
+            }
         }
         Ok(Emitter::Sorted {
             sorted,
@@ -1351,11 +1467,16 @@ impl Engine {
         outer: &[&[Value]],
         stmt_rng: &std::cell::Cell<crate::seam::StmtRng>,
     ) -> Result<SelectResult> {
+        let profile_start = meter.accrued;
+        let mut rel_work = std::collections::HashMap::<usize, i64>::new();
+        let mut filter_work = 0i64;
+        let mut output_work = 0i64;
         // Materialize the selected physical outer once, in primary-key order. An ordinary inner is
         // materialized once too; an INL inner is opened below per outer row. Every local row is
         // placed back into its original logical slot interval before expression evaluation.
         let outer_ordinal = super::optimize::physical_rel_ordinal(plan, 0);
         let inner_ordinal = super::optimize::physical_rel_ordinal(plan, 1);
+        let mut before = meter.accrued;
         let left_rows = self.materialize_rel(
             plan,
             outer_ordinal,
@@ -1366,11 +1487,13 @@ impl Engine {
             env.ctes,
             meter,
         )?;
+        rel_work.insert(outer_ordinal, meter.accrued - before);
         let right_inl = plan.phys.rel_inl_bounds[inner_ordinal].is_some();
         let right_rows = if right_inl {
             Vec::new()
         } else {
-            self.materialize_rel(
+            before = meter.accrued;
+            let rows = self.materialize_rel(
                 plan,
                 inner_ordinal,
                 params,
@@ -1379,7 +1502,9 @@ impl Engine {
                 stmt_rng,
                 env.ctes,
                 meter,
-            )?
+            )?;
+            rel_work.insert(inner_ordinal, meter.accrued - before);
+            rows
         };
         let on = &plan.joins[0].on;
 
@@ -1408,6 +1533,7 @@ impl Engine {
                 let current_right = if right_inl {
                     let outer_logical =
                         super::exec_emit::place_physical_relation_row(plan, outer_ordinal, left);
+                    before = meter.accrued;
                     inner_rows = self.materialize_rel(
                         plan,
                         inner_ordinal,
@@ -1418,6 +1544,7 @@ impl Engine {
                         env.ctes,
                         meter,
                     )?;
+                    *rel_work.entry(inner_ordinal).or_default() += meter.accrued - before;
                     &inner_rows
                 } else if let Some(table) = &hash_table {
                     hash_rows = table
@@ -1447,7 +1574,12 @@ impl Engine {
                     }
                     // The residual WHERE over the combined row (per surviving pair).
                     let pass = match &plan.filter {
-                        Some(f) => f.eval(&combined, env, meter)?.is_true(),
+                        Some(f) => {
+                            before = meter.accrued;
+                            let pass = f.eval(&combined, env, meter)?.is_true();
+                            filter_work += meter.accrued - before;
+                            pass
+                        }
                         None => true,
                     };
                     if !pass {
@@ -1458,11 +1590,13 @@ impl Engine {
                         continue;
                     }
                     meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+                    before = meter.accrued;
                     meter.charge(COSTS.row_produced);
                     let mut projected = Vec::with_capacity(plan.projections.len());
                     for p in &plan.projections {
                         projected.push(p.eval(&combined, env, meter)?);
                     }
+                    output_work += meter.accrued - before;
                     out.push(projected);
                     // Stop the whole nested loop once the LIMIT window is filled.
                     if let Some(l) = limit
@@ -1471,6 +1605,27 @@ impl Engine {
                         break 'outer;
                     }
                 }
+            }
+        }
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            let root = select_actual_root_node(plan);
+            for ordinal in [outer_ordinal, inner_ordinal] {
+                let node = select_actual_rel_node(&plan.rels[ordinal]);
+                if root != node {
+                    profile.record(node, rel_work.get(&ordinal).copied().unwrap_or(0));
+                }
+            }
+            let through_join = meter.accrued - profile_start - filter_work - output_work;
+            let join_node = if plan.phys.hash_join.is_some() {
+                "Hash Join"
+            } else {
+                "Nested Loop"
+            };
+            if root != join_node {
+                profile.record_parent(join_node.to_string(), through_join);
+            }
+            if plan.filter.is_some() && root != "Filter" {
+                profile.record_parent("Filter".to_string(), through_join + filter_work);
             }
         }
         Ok(SelectResult {
@@ -1492,11 +1647,16 @@ impl Engine {
         outer: &[&[Value]],
         stmt_rng: &std::cell::Cell<crate::seam::StmtRng>,
     ) -> Result<SelectResult> {
+        let profile_start = meter.accrued;
+        let mut filter_work = 0i64;
+        let mut output_work = 0i64;
         let mut materialized = Vec::with_capacity(plan.rels.len());
+        let mut rel_work = vec![0i64; plan.rels.len()];
         for (ordinal, rel) in plan.rels.iter().enumerate() {
             if rel.lateral || plan.phys.rel_inl_bounds[ordinal].is_some() {
                 materialized.push(Vec::new());
             } else {
+                let before = meter.accrued;
                 materialized.push(self.materialize_rel(
                     plan,
                     ordinal,
@@ -1507,6 +1667,7 @@ impl Engine {
                     env.ctes,
                     meter,
                 )?);
+                rel_work[ordinal] = meter.accrued - before;
             }
         }
         let final_position = plan.rels.len() - 1;
@@ -1516,6 +1677,7 @@ impl Engine {
             params,
             outer,
             &materialized,
+            &mut rel_work,
             final_position - 1,
             stmt_rng,
             meter,
@@ -1539,9 +1701,11 @@ impl Engine {
                 let inl_rows;
                 let hash_rows;
                 let candidates = if inner_inl {
+                    let before = meter.accrued;
                     inl_rows = self.materialize_rel(
                         plan, inner, params, outer, left, stmt_rng, env.ctes, meter,
                     )?;
+                    rel_work[inner] += meter.accrued - before;
                     &inl_rows
                 } else if let Some(table) = &hash_table {
                     hash_rows = table
@@ -1571,7 +1735,12 @@ impl Engine {
                         continue;
                     }
                     let pass = match &plan.filter {
-                        Some(filter) => filter.eval(&combined, env, meter)?.is_true(),
+                        Some(filter) => {
+                            let before = meter.accrued;
+                            let pass = filter.eval(&combined, env, meter)?.is_true();
+                            filter_work += meter.accrued - before;
+                            pass
+                        }
                         None => true,
                     };
                     if !pass {
@@ -1582,16 +1751,39 @@ impl Engine {
                         continue;
                     }
                     meter.guard()?;
+                    let before = meter.accrued;
                     meter.charge(COSTS.row_produced);
                     let mut projected = Vec::with_capacity(plan.projections.len());
                     for projection in &plan.projections {
                         projected.push(projection.eval(&combined, env, meter)?);
                     }
+                    output_work += meter.accrued - before;
                     rows.push(projected);
                     if limit.is_some_and(|limit| rows.len() as i64 >= limit) {
                         break 'outer;
                     }
                 }
+            }
+        }
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            for &ordinal in &plan.phys.relation_order {
+                profile.record(
+                    select_actual_rel_node(&plan.rels[ordinal]),
+                    rel_work[ordinal],
+                );
+            }
+            let through_join = meter.accrued - profile_start - filter_work - output_work;
+            profile.record_parent(
+                if step.hash_join.is_some() {
+                    "Hash Join"
+                } else {
+                    "Nested Loop"
+                }
+                .to_string(),
+                through_join,
+            );
+            if plan.filter.is_some() {
+                profile.record_parent("Filter".to_string(), through_join + filter_work);
             }
         }
         Ok(SelectResult {
@@ -1987,6 +2179,9 @@ impl Engine {
                 out
             }
         };
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            profile.record_parent(select_actual_root_node(plan), meter.accrued);
+        }
         Ok(SelectResult {
             column_names: plan.column_names.clone(),
             column_types: plan.column_types.clone(),

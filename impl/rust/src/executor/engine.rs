@@ -32,6 +32,7 @@ impl Engine {
             core: None,
             attached_committed: HashMap::new(),
             estimator_touched: HashSet::new(),
+            explain_actual: std::cell::RefCell::new(None),
         }
     }
 
@@ -58,6 +59,7 @@ impl Engine {
             core: None,
             attached_committed: HashMap::new(),
             estimator_touched: HashSet::new(),
+            explain_actual: std::cell::RefCell::new(None),
         }
     }
 

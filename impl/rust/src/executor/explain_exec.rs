@@ -4,6 +4,69 @@
 
 use super::*;
 
+pub(crate) fn select_actual_root_node(sp: &SelectPlan) -> String {
+    if sp.limit.is_some() || sp.offset.is_some() {
+        return "Limit".to_string();
+    }
+    if !sp.order.is_empty()
+        && !sp.phys.pk_ordered
+        && sp.phys.index_order.is_none()
+        && !sp.phys.join_pk_ordered
+    {
+        return "Sort".to_string();
+    }
+    if sp.distinct {
+        return "Distinct".to_string();
+    }
+    if sp.has_window {
+        return "Window".to_string();
+    }
+    if sp.is_agg {
+        return "Aggregate".to_string();
+    }
+    if sp.filter.is_some() {
+        return "Filter".to_string();
+    }
+    if sp.rels.len() > 1 {
+        let hash = if sp.rels.len() >= 3 && sp.phys.join_steps.len() + 1 == sp.rels.len() {
+            sp.phys
+                .join_steps
+                .last()
+                .is_some_and(|step| step.hash_join.is_some())
+        } else {
+            sp.rels.len() == 2 && sp.phys.hash_join.is_some()
+        };
+        return if hash { "Hash Join" } else { "Nested Loop" }.to_string();
+    }
+    let Some(rel) = sp.rels.first() else {
+        return "Result".to_string();
+    };
+    select_actual_rel_node(rel)
+}
+
+pub(crate) fn select_actual_rel_node(rel: &PlanRel) -> String {
+    if let Some(srf) = &rel.srf {
+        if matches!(
+            srf.kind,
+            SrfKind::JedTables
+                | SrfKind::JedColumns
+                | SrfKind::JedIndexes
+                | SrfKind::JedConstraints
+                | SrfKind::JedStatistics
+        ) {
+            return format!("Catalog Scan {}", rel.table_name);
+        }
+        return format!("SRF {}", rel.table_name);
+    }
+    if rel.cte.is_some() {
+        return format!("CTE Scan {}", rel.table_name);
+    }
+    if rel.derived.is_some() {
+        return format!("Subquery {}", rel.table_name);
+    }
+    format!("Scan {}", rel.table_name)
+}
+
 impl Engine {
     /// Plan the inner statement and render the plan (spec/design/explain.md). Plain EXPLAIN never
     /// executes the inner statement; EXPLAIN ANALYZE (`analyze`) runs it and reports its actual cost.
@@ -11,11 +74,14 @@ impl Engine {
     pub(crate) fn execute_explain(
         &mut self,
         analyze: bool,
+        verbose: bool,
+        costs: bool,
+        lane: bool,
         inner: Statement,
         params: &[Value],
     ) -> Result<Outcome> {
         if analyze {
-            return self.execute_explain_analyze(inner, params);
+            return self.execute_explain_analyze(verbose, costs, lane, inner, params);
         }
         if !params.is_empty() {
             // Plain EXPLAIN renders the plan structurally (a $N bound source prints as "$N", not its
@@ -31,8 +97,9 @@ impl Engine {
             .map(|estimate| (estimate.rows, estimate.cost()))
             .collect();
         let mut r = ExplainRender::with_estimates(estimates);
+        r.verbose = verbose;
         self.render_explain(&mut r, &inner, 0)?;
-        Ok(self.explain_outcome(r.rows))
+        Ok(self.explain_outcome(r.rows, analyze, costs, lane, &inner))
     }
 
     /// Render the plan AND run the inner statement, reporting the inner's ACTUAL accrued cost + row
@@ -45,6 +112,9 @@ impl Engine {
     /// row (independent of the inner cost, which appears only in the root).
     pub(crate) fn execute_explain_analyze(
         &mut self,
+        _verbose: bool,
+        costs: bool,
+        lane: bool,
         inner: Statement,
         params: &[Value],
     ) -> Result<Outcome> {
@@ -55,17 +125,29 @@ impl Engine {
             .map(|estimate| (estimate.rows, estimate.cost()))
             .collect();
         let mut body = ExplainRender::with_estimates(estimates.clone());
+        body.verbose = _verbose;
         self.render_explain(&mut body, &inner, 0)?;
         // Execute the inner statement for real, capturing its actual accrued cost + row count.
-        let inner_out = self.dispatch_stmt_body(inner, params)?;
+        let inner_for_output = inner.clone();
+        self.explain_actual
+            .replace(Some(ActualCostProfile::default()));
+        let inner_result = self.dispatch_stmt_body(inner, params);
+        let profile = self.explain_actual.replace(None).unwrap_or_default();
+        let inner_out = inner_result?;
         let actual_rows = match &inner_out {
             // A DML statement without RETURNING reports its affected-row count; a query its row count.
             Outcome::Statement { rows_affected, .. } => rows_affected.unwrap_or(0),
             Outcome::Query { rows, .. } => rows.len() as i64,
         };
         let inner_cost = inner_out.cost();
+        body.actual = explain_actual_costs(&estimates, inner_cost);
+        profile.apply(&body.rows, &body.frame_depths, &mut body.actual);
+        for (i, row) in body.rows.iter_mut().enumerate() {
+            row[5] = Value::Int(body.actual.get(i).copied().unwrap_or(0));
+        }
         // Assemble: the Analyze root carries the actual figures; the plan tree sits one level deeper.
         let mut r = ExplainRender::with_estimates(estimates.first().copied().into_iter().collect());
+        r.actual.push(inner_cost);
         r.emit(
             0,
             "Analyze",
@@ -81,40 +163,91 @@ impl Engine {
             let detail = it.next().expect("a plan row has a detail cell");
             let est_rows = it.next().expect("a plan row has an est_rows cell");
             let est_cost = it.next().expect("a plan row has an est_cost cell");
+            let actual_cost = it.next().expect("a plan row has an actual_cost cell");
             r.rows.push(vec![
                 Value::Int(depth + 1),
                 node,
                 detail,
                 est_rows,
                 est_cost,
+                actual_cost,
             ]);
         }
-        Ok(self.explain_outcome(r.rows))
+        Ok(self.explain_outcome(r.rows, true, costs, lane, &inner_for_output))
     }
 
     /// Wrap rendered plan rows as a query Outcome, charging the EXPLAIN's own cost — one
     /// `row_produced` per emitted plan row (a deterministic function of the plan-row count).
-    pub(crate) fn explain_outcome(&self, rows: Vec<Vec<Value>>) -> Outcome {
+    pub(crate) fn explain_outcome(
+        &self,
+        rows: Vec<Vec<Value>>,
+        analyze: bool,
+        costs: bool,
+        with_lane: bool,
+        inner: &Statement,
+    ) -> Outcome {
         let mut meter = self.session.new_meter();
         meter.charge(COSTS.row_produced * rows.len() as i64);
+        let mut column_names = vec![
+            "depth".to_string(),
+            "node".to_string(),
+            "detail".to_string(),
+        ];
+        let mut column_types = vec!["i32".to_string(), "text".to_string(), "text".to_string()];
+        if costs {
+            column_names.extend(["est_rows".to_string(), "est_cost".to_string()]);
+            column_types.extend(["i64".to_string(), "i64".to_string()]);
+        }
+        if analyze {
+            column_names.push("actual_cost".to_string());
+            column_types.push("i64".to_string());
+        }
+        if with_lane {
+            column_names.push("lane".to_string());
+            column_types.push("text".to_string());
+        }
+        let lane = with_lane.then(|| self.explain_lane(inner));
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                let mut out = row[..3].to_vec();
+                if costs {
+                    out.extend_from_slice(&row[3..5]);
+                }
+                if analyze {
+                    out.push(row[5].clone());
+                }
+                if let Some(lane) = &lane {
+                    out.push(Value::Text(lane.clone()));
+                }
+                out
+            })
+            .collect();
         Outcome::Query {
-            column_names: vec![
-                "depth".to_string(),
-                "node".to_string(),
-                "detail".to_string(),
-                "est_rows".to_string(),
-                "est_cost".to_string(),
-            ],
-            column_types: vec![
-                "i32".to_string(),
-                "text".to_string(),
-                "text".to_string(),
-                "i64".to_string(),
-                "i64".to_string(),
-            ],
+            column_names,
+            column_types,
             rows,
             cost: meter.accrued,
         }
+    }
+
+    fn explain_lane(&self, inner: &Statement) -> String {
+        // Public Query checks write classification before either lazy lane. Sequence-mutating SELECTs
+        // and top-level WITH statements containing DML therefore use the buffered write dispatcher.
+        if stmt_is_write(inner) {
+            return "buffered".to_string();
+        }
+        if matches!(inner, Statement::With(_) | Statement::SetOp(_)) {
+            return "deferred".to_string();
+        }
+        if let Statement::Select(_) = inner {
+            if let Ok(QueryPlan::Select(sp)) = self.plan_explain_inner(inner) {
+                if pull_streaming_scan_eligible(&sp) {
+                    return "streaming".to_string();
+                }
+            }
+        }
+        "buffered".to_string()
     }
 
     /// Render the plan for the inner statement (spec/design/explain.md). A DML statement is rendered
@@ -126,14 +259,102 @@ impl Engine {
         inner: &Statement,
         depth: i64,
     ) -> Result<()> {
+        self.render_explain_with_bindings(r, inner, depth, &[])
+    }
+
+    fn render_explain_with_bindings(
+        &self,
+        r: &mut ExplainRender,
+        inner: &Statement,
+        depth: i64,
+        bindings: &[CteBinding],
+    ) -> Result<()> {
         match inner {
-            Statement::Insert(ins) => self.explain_insert(r, ins, depth),
-            Statement::Update(upd) => self.explain_update(r, upd, depth),
-            Statement::Delete(del) => self.explain_delete(r, del, depth),
+            Statement::Insert(ins) => self.explain_insert(r, ins, depth, bindings),
+            Statement::Update(upd) => self.explain_update(r, upd, depth, bindings),
+            Statement::Delete(del) => self.explain_delete(r, del, depth, bindings),
+            Statement::With(wq) if with_has_dml(wq) => self.render_explain_with_dml(r, wq, depth),
             _ => {
                 let qp = self.plan_explain_inner(inner)?;
+                // A top-level pure WITH is orchestrated directly by run_with rather than
+                // exec_query_plan. Its wrapper is frame 0; only CTE/body query plans open frames.
+                if matches!(inner, Statement::With(_)) {
+                    if let QueryPlan::With(wp) = &qp {
+                        return self.render_with_plan(r, wp, depth);
+                    }
+                }
                 self.render_query_plan(r, &qp, depth)
             }
+        }
+    }
+
+    pub(crate) fn plan_explain_with_dml(
+        &self,
+        wq: &WithQuery,
+    ) -> Result<(Vec<CteBinding>, Vec<CteMode>, Option<QueryPlan>)> {
+        let mut ptypes = ParamTypes::default();
+        let bindings = self.plan_cte_bindings(&wq.ctes, wq.recursive, &mut ptypes)?;
+        let primary = match &wq.body {
+            CteBody::Query(query) => Some(self.plan_query(query, None, &bindings, &mut ptypes)?),
+            _ => None,
+        };
+        for cte in &wq.ctes {
+            if cte.body.is_data_modifying() {
+                for binding in &bindings {
+                    binding
+                        .refs
+                        .set(binding.refs.get() + count_cte_refs_dml(&cte.body, &binding.name));
+                }
+            }
+        }
+        if wq.body.is_data_modifying() {
+            for binding in &bindings {
+                binding
+                    .refs
+                    .set(binding.refs.get() + count_cte_refs_dml(&wq.body, &binding.name));
+            }
+        }
+        let modes = cte_modes(&bindings);
+        Ok((bindings, modes, primary))
+    }
+
+    fn render_explain_with_dml(
+        &self,
+        r: &mut ExplainRender,
+        wq: &WithQuery,
+        depth: i64,
+    ) -> Result<()> {
+        let (bindings, modes, primary) = self.plan_explain_with_dml(wq)?;
+        r.emit(depth, "WITH", format!("ctes={}", bindings.len()));
+        for (i, binding) in bindings.iter().enumerate() {
+            r.emit(
+                depth + 1,
+                format!("CTE {}", binding.name),
+                cte_detail(binding, modes[i]),
+            );
+            match &binding.source {
+                CteSource::Query(plan) => self.render_query_plan(r, plan, depth + 2)?,
+                CteSource::Dml(dm) => match &dm.stmt {
+                    DmStmt::Insert(insert) => {
+                        self.explain_insert(r, insert, depth + 2, &bindings[..i])?
+                    }
+                    DmStmt::Update(update) => {
+                        self.explain_update(r, update, depth + 2, &bindings[..i])?
+                    }
+                    DmStmt::Delete(delete) => {
+                        self.explain_delete(r, delete, depth + 2, &bindings[..i])?
+                    }
+                },
+            }
+        }
+        if let Some(primary) = primary {
+            return self.render_query_plan(r, &primary, depth + 1);
+        }
+        match &wq.body {
+            CteBody::Insert(insert) => self.explain_insert(r, insert, depth + 1, &bindings),
+            CteBody::Update(update) => self.explain_update(r, update, depth + 1, &bindings),
+            CteBody::Delete(delete) => self.explain_delete(r, delete, depth + 1, &bindings),
+            CteBody::Query(_) => unreachable!("a query primary was planned above"),
         }
     }
 
@@ -145,6 +366,7 @@ impl Engine {
         r: &mut ExplainRender,
         ins: &Insert,
         depth: i64,
+        bindings: &[CteBinding],
     ) -> Result<()> {
         if self.table(&ins.table).is_none() {
             return Err(EngineError::new(
@@ -157,7 +379,7 @@ impl Engine {
             InsertSource::Select(sel) => {
                 let mut ptypes = ParamTypes::default();
                 let plan =
-                    self.plan_query(&QueryExpr::Select(sel.clone()), None, &[], &mut ptypes)?;
+                    self.plan_query(&QueryExpr::Select(sel.clone()), None, bindings, &mut ptypes)?;
                 self.render_query_plan(r, &plan, depth + 1)
             }
             InsertSource::Values(rows) => {
@@ -175,6 +397,7 @@ impl Engine {
         r: &mut ExplainRender,
         upd: &Update,
         depth: i64,
+        bindings: &[CteBinding],
     ) -> Result<()> {
         let table = self.table(&upd.table).ok_or_else(|| {
             EngineError::new(
@@ -182,13 +405,14 @@ impl Engine {
                 format!("table does not exist: {}", upd.table),
             )
         })?;
-        let filter = self.explain_dml_filter(table, upd.filter.as_ref())?;
+        let filter = self.explain_dml_filter(table, upd.filter.as_ref(), bindings)?;
         r.emit(
             depth,
             format!("Update {}", upd.table),
             format!("sets={}", upd.assignments.len()),
         );
-        self.render_dml_scan(r, table, &upd.table, filter.as_ref(), depth + 1);
+        let mask = self.explain_update_touched(table, upd, filter.as_ref(), bindings)?;
+        self.render_dml_scan(r, table, &upd.table, filter.as_ref(), &mask, depth + 1);
         Ok(())
     }
 
@@ -199,6 +423,7 @@ impl Engine {
         r: &mut ExplainRender,
         del: &Delete,
         depth: i64,
+        bindings: &[CteBinding],
     ) -> Result<()> {
         let table = self.table(&del.table).ok_or_else(|| {
             EngineError::new(
@@ -206,9 +431,10 @@ impl Engine {
                 format!("table does not exist: {}", del.table),
             )
         })?;
-        let filter = self.explain_dml_filter(table, del.filter.as_ref())?;
+        let filter = self.explain_dml_filter(table, del.filter.as_ref(), bindings)?;
         r.emit(depth, format!("Delete {}", del.table), "-");
-        self.render_dml_scan(r, table, &del.table, filter.as_ref(), depth + 1);
+        let mask = self.explain_delete_touched(table, del, filter.as_ref(), bindings)?;
+        self.render_dml_scan(r, table, &del.table, filter.as_ref(), &mask, depth + 1);
         Ok(())
     }
 
@@ -218,11 +444,13 @@ impl Engine {
         &self,
         table: &Table,
         where_: Option<&Expr>,
+        bindings: &[CteBinding],
     ) -> Result<Option<RExpr>> {
         match where_ {
             None => Ok(None),
             Some(p) => {
-                let scope = Scope::single(self, table);
+                let mut scope = Scope::single(self, table);
+                scope.ctes = bindings;
                 let mut ptypes = ParamTypes::default();
                 Ok(Some(resolve_boolean_filter(&scope, p, &mut ptypes)?))
             }
@@ -231,27 +459,135 @@ impl Engine {
 
     /// Emit the residual Filter (when present) and the target Scan for an UPDATE/DELETE, choosing the
     /// access path with the SAME detectors the executor uses (PK bound, then GIN, then GiST —
-    /// UPDATE/DELETE do not use secondary B-tree index bounds, indexes.md §5). The touched-set count
-    /// is a DML cost detail left to a follow-on, so it is not shown here (an empty mask).
+    /// UPDATE/DELETE do not use secondary B-tree index bounds, indexes.md §5). The scan detail also
+    /// reports the statement's resolved touched-set width.
     pub(crate) fn render_dml_scan(
         &self,
         r: &mut ExplainRender,
         table: &Table,
         name: &str,
         filter: Option<&RExpr>,
+        mask: &[bool],
         depth: i64,
     ) {
         let mut d = depth;
         if let Some(f) = filter {
-            r.emit(d, "Filter", format!("conjuncts={}", conjunct_count(f)));
+            let detail = if r.verbose {
+                format!("filter={}", render_rexpr(f))
+            } else {
+                format!("conjuncts={}", conjunct_count(f))
+            };
+            r.emit(d, "Filter", detail);
             d += 1;
         }
         let bound = self.dml_scan_bound(table, filter);
         r.emit(
             d,
             format!("Scan {name}"),
-            self.scan_detail(name, bound.as_ref(), false, &[]),
+            self.scan_detail(name, bound.as_ref(), false, mask),
         );
+    }
+
+    fn explain_delete_touched(
+        &self,
+        table: &Table,
+        del: &Delete,
+        filter: Option<&RExpr>,
+        bindings: &[CteBinding],
+    ) -> Result<Vec<bool>> {
+        let mut mask = vec![false; table.columns.len()];
+        if let Some(filter) = filter {
+            collect_touched(filter, 0, &mut mask);
+        }
+        if let Some(items) = &del.returning {
+            let (nodes, _, _) = self.resolve_returning(
+                &del.table,
+                items,
+                true,
+                bindings,
+                &mut ParamTypes::default(),
+            )?;
+            let mut ret_mask = vec![false; 2 * mask.len()];
+            for node in &nodes {
+                collect_touched(node, 0, &mut ret_mask);
+            }
+            for (i, touched) in mask.iter_mut().enumerate() {
+                *touched |= ret_mask[i];
+            }
+        }
+        Ok(mask)
+    }
+
+    fn explain_update_touched(
+        &self,
+        table: &Table,
+        upd: &Update,
+        filter: Option<&RExpr>,
+        bindings: &[CteBinding],
+    ) -> Result<Vec<bool>> {
+        let mut mask = vec![false; table.columns.len()];
+        if let Some(filter) = filter {
+            collect_touched(filter, 0, &mut mask);
+        }
+        let mut scope = Scope::single(self, table);
+        scope.ctes = bindings;
+        let mut ptypes = ParamTypes::default();
+        let mut assigned = vec![false; mask.len()];
+        for assignment in &upd.assignments {
+            let idx = table.column_index(&assignment.column).ok_or_else(|| {
+                EngineError::new(
+                    SqlState::UndefinedColumn,
+                    format!("column does not exist: {}", assignment.column),
+                )
+            })?;
+            assigned[idx] = true;
+            if assignment.is_default {
+                continue;
+            }
+            let col = &table.columns[idx];
+            let source = match &col.ty {
+                Type::Scalar(target) => {
+                    resolve(
+                        &scope,
+                        &assignment.value,
+                        Some(*target),
+                        &mut AggCtx::Forbidden,
+                        &mut ptypes,
+                    )?
+                    .0
+                }
+                Type::Range(_) | Type::Array(_) => resolve_container_assign(
+                    &scope,
+                    col,
+                    &assignment.value,
+                    &mut AggCtx::Forbidden,
+                    &mut ptypes,
+                )?,
+                Type::Composite(_) => {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "updating composite column {} is not supported yet",
+                            assignment.column
+                        ),
+                    ));
+                }
+            };
+            collect_touched(&source, 0, &mut mask);
+        }
+        if let Some(items) = &upd.returning {
+            let (nodes, _, _) =
+                self.resolve_returning(&upd.table, items, false, bindings, &mut ptypes)?;
+            let n = mask.len();
+            let mut ret_mask = vec![false; 2 * n];
+            for node in &nodes {
+                collect_touched(node, 0, &mut ret_mask);
+            }
+            for i in 0..n {
+                mask[i] |= ret_mask[n + i] || (ret_mask[i] && !assigned[i]);
+            }
+        }
+        Ok(mask)
     }
 
     /// EXPLAIN compatibility wrapper over the typed mutation physical plan used by execution. The
@@ -285,10 +621,9 @@ impl Engine {
             ),
             Statement::With(wq) => {
                 let Some(body) = wq.body.as_query() else {
-                    // A data-modifying primary (writable CTE) — a DML EXPLAIN, handled in a later slice.
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
-                        "EXPLAIN of a data-modifying WITH is not yet supported",
+                        "writable WITH requires the DML EXPLAIN renderer",
                     ));
                 };
                 let we = WithExpr {
@@ -314,7 +649,8 @@ impl Engine {
         qp: &QueryPlan,
         depth: i64,
     ) -> Result<()> {
-        match qp {
+        r.frame_depth += 1;
+        let result = match qp {
             QueryPlan::Select(sp) => self.render_select_plan(r, sp, depth),
             QueryPlan::SetOp(sop) => self.render_set_op_plan(r, sop, depth),
             QueryPlan::Values(vp) => {
@@ -322,7 +658,9 @@ impl Engine {
                 Ok(())
             }
             QueryPlan::With(wp) => self.render_with_plan(r, wp, depth),
-        }
+        };
+        r.frame_depth -= 1;
+        result
     }
 
     /// Emit a [`SelectPlan`]'s nodes in operator order — outermost first, each the pre-order parent
@@ -336,6 +674,7 @@ impl Engine {
         sp: &SelectPlan,
         depth: i64,
     ) -> Result<()> {
+        let start = r.rows.len();
         let mut d = depth;
         if sp.limit.is_some() || sp.offset.is_some() {
             r.emit(d, "Limit", limit_detail(sp.limit, sp.offset));
@@ -370,14 +709,35 @@ impl Engine {
             d += 1;
         }
         if sp.is_agg {
-            r.emit(d, "Aggregate", agg_detail(sp));
+            r.emit(d, "Aggregate", agg_detail(sp, r.verbose));
             d += 1;
         }
         if let Some(f) = &sp.filter {
-            r.emit(d, "Filter", format!("conjuncts={}", conjunct_count(f)));
+            let detail = if r.verbose {
+                format!("filter={}", render_rexpr(f))
+            } else {
+                format!("conjuncts={}", conjunct_count(f))
+            };
+            r.emit(d, "Filter", detail);
             d += 1;
         }
-        self.render_from(r, sp, d, &order_note)
+        self.render_from(r, sp, d, &order_note)?;
+        if r.verbose && r.rows.len() > start {
+            let output = format!(
+                "output=[{}]",
+                sp.projections
+                    .iter()
+                    .map(render_rexpr)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let detail = match &r.rows[start][2] {
+                Value::Text(s) if s != "-" => format!("{s}; {output}"),
+                _ => output,
+            };
+            r.rows[start][2] = Value::Text(detail);
+        }
+        Ok(())
     }
 
     /// Emit the FROM tree: a left-deep chain of physical joins over the plan's relations, or a
@@ -423,17 +783,26 @@ impl Engine {
             match &sp.phys.hash_join {
                 Some(hash) => (
                     "Hash Join",
-                    format!(
-                        "{}; keys={}; on:conjuncts={}",
-                        join_kind_text(j.kind),
-                        hash.keys.len(),
-                        j.on.as_ref().map_or(0, conjunct_count)
-                    ),
+                    match &j.on {
+                        Some(on) if r.verbose => format!(
+                            "{}; keys={}; on={}",
+                            join_kind_text(j.kind),
+                            hash.keys.len(),
+                            render_rexpr(on)
+                        ),
+                        Some(on) => format!(
+                            "{}; keys={}; on:conjuncts={}",
+                            join_kind_text(j.kind),
+                            hash.keys.len(),
+                            conjunct_count(on)
+                        ),
+                        None => format!("{}; keys={}", join_kind_text(j.kind), hash.keys.len()),
+                    },
                 ),
-                None => ("Nested Loop", join_detail(j)),
+                None => ("Nested Loop", join_detail(j, r.verbose)),
             }
         } else {
-            ("Nested Loop", join_detail(j))
+            ("Nested Loop", join_detail(j, r.verbose))
         };
         r.emit(depth, node, with_note(detail, note));
         if n == 2 && sp.phys.relation_order.len() == 2 {
@@ -456,9 +825,11 @@ impl Engine {
             return self.render_rel_leaf(r, sp, sp.phys.relation_order[0], depth, note);
         }
         let step = &sp.phys.join_steps[n - 2];
-        let conjuncts = step.on_indices.iter().fold(0i64, |total, index| {
-            total + sp.joins[*index].on.as_ref().map_or(0, conjunct_count)
-        });
+        let ons: Vec<_> = step
+            .on_indices
+            .iter()
+            .filter_map(|index| sp.joins[*index].on.as_ref())
+            .collect();
         let step_kind = step.on_indices.iter().fold(
             if step.on_indices.is_empty() {
                 JoinKind::Cross
@@ -471,30 +842,29 @@ impl Engine {
             },
         );
         let kind = join_kind_text(step_kind);
-        let (node, detail) = match &step.hash_join {
-            Some(hash) if step.on_indices.len() == 1 => (
-                "Hash Join",
-                format!("{kind}; keys={}; on:conjuncts={conjuncts}", hash.keys.len()),
+        let on_detail = match ons.len() {
+            0 => String::new(),
+            1 if !r.verbose => format!("; on:conjuncts={}", conjunct_count(ons[0])),
+            _ if !r.verbose => format!(
+                "; on:predicates={},conjuncts={}",
+                ons.len(),
+                ons.iter().map(|on| conjunct_count(on)).sum::<i64>()
             ),
+            1 => format!("; on={}", render_rexpr(ons[0])),
+            _ => format!(
+                "; on=[{}]",
+                ons.iter()
+                    .map(|on| render_rexpr(on))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        let (node, detail) = match &step.hash_join {
             Some(hash) => (
                 "Hash Join",
-                format!(
-                    "{kind}; keys={}; on:predicates={},conjuncts={conjuncts}",
-                    hash.keys.len(),
-                    step.on_indices.len()
-                ),
+                format!("{kind}; keys={}{on_detail}", hash.keys.len()),
             ),
-            None if step.on_indices.is_empty() => ("Nested Loop", kind.to_string()),
-            None if step.on_indices.len() == 1 => {
-                ("Nested Loop", format!("{kind}; on:conjuncts={conjuncts}"))
-            }
-            None => (
-                "Nested Loop",
-                format!(
-                    "{kind}; on:predicates={},conjuncts={conjuncts}",
-                    step.on_indices.len()
-                ),
-            ),
+            None => ("Nested Loop", format!("{kind}{on_detail}")),
         };
         r.emit(depth, node, with_note(detail, note));
         self.render_nway_join_tree(r, sp, n - 1, depth + 1, "")?;

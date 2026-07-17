@@ -339,8 +339,56 @@ func (p *parser) consumeTransactionOrWork() {
 // statement begins with the word ANALYZE, so there is no ambiguity.
 func (p *parser) parseExplain() (statement, error) {
 	p.advance() // EXPLAIN
-	analyze := false
+	analyze, verbose, costs, lane := false, false, true, false
+	seen := make(map[string]bool)
+	optionList := false
+	if p.peek().Kind == tokLParen {
+		optionList = true
+		p.advance()
+		for {
+			name := p.peekKeyword()
+			switch name {
+			case "analyze", "verbose", "costs", "lane":
+				p.advance()
+			default:
+				if name == "" {
+					return statement{}, newError(SyntaxError, "expected an EXPLAIN option")
+				}
+				return statement{}, newError(SyntaxError, "unrecognized EXPLAIN option: "+name)
+			}
+			if seen[name] {
+				return statement{}, newError(SyntaxError, "EXPLAIN option specified more than once: "+name)
+			}
+			seen[name] = true
+			value := true
+			if kw := p.peekKeyword(); kw == "true" || kw == "false" || kw == "on" || kw == "off" {
+				p.advance()
+				value = kw == "true" || kw == "on"
+			}
+			switch name {
+			case "analyze":
+				analyze = value
+			case "verbose":
+				verbose = value
+			case "costs":
+				costs = value
+			case "lane":
+				lane = value
+			}
+			if p.peek().Kind == tokRParen {
+				p.advance()
+				break
+			}
+			if p.peek().Kind != tokComma {
+				return statement{}, newError(SyntaxError, "expected ',' or ')' in EXPLAIN option list")
+			}
+			p.advance()
+		}
+	}
 	if p.peekKeyword() == "analyze" {
+		if optionList {
+			return statement{}, newError(SyntaxError, "cannot mix EXPLAIN option list with positional ANALYZE")
+		}
 		p.advance()
 		analyze = true
 	}
@@ -348,7 +396,7 @@ func (p *parser) parseExplain() (statement, error) {
 	if err != nil {
 		return statement{}, err
 	}
-	return statement{Explain: &explain{Analyze: analyze, Inner: &inner}}, nil
+	return statement{Explain: &explain{Analyze: analyze, Verbose: verbose, Costs: costs, Lane: lane, Inner: &inner}}, nil
 }
 
 // parseExplainInner parses the statement EXPLAIN wraps — restricted to a query (SELECT / WITH) or a

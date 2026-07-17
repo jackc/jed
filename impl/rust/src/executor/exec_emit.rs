@@ -2,6 +2,7 @@
 //! exec_emit.go): the exec_select_emit driver (projection/GROUP BY/HAVING/DISTINCT/window/ORDER BY),
 //! its eager drain, and uncorrelated-subquery folding — as Engine methods.
 
+use super::explain_exec::{select_actual_rel_node, select_actual_root_node};
 use super::*;
 
 fn logical_join_row_width(plan: &SelectPlan) -> usize {
@@ -50,6 +51,7 @@ impl Engine {
         params: &[Value],
         outer_stack: &[&[Value]],
         materialized: &[Vec<Row>],
+        rel_work: &mut [i64],
         step_count: usize,
         stmt_rng: &std::cell::Cell<crate::seam::StmtRng>,
         meter: &mut Meter,
@@ -82,6 +84,7 @@ impl Engine {
                 let mut lateral_outer_stack;
                 let hash_rows;
                 let candidates = if inner_inl {
+                    let before = meter.accrued;
                     inl_rows = self.materialize_rel(
                         plan,
                         inner,
@@ -92,10 +95,12 @@ impl Engine {
                         env.ctes,
                         meter,
                     )?;
+                    rel_work[inner] += meter.accrued - before;
                     &inl_rows
                 } else if inner_lateral {
                     lateral_outer_stack = outer_stack.to_vec();
                     lateral_outer_stack.push(left);
+                    let before = meter.accrued;
                     lateral_rows = self.materialize_rel(
                         plan,
                         inner,
@@ -106,6 +111,7 @@ impl Engine {
                         env.ctes,
                         meter,
                     )?;
+                    rel_work[inner] += meter.accrued - before;
                     &lateral_rows
                 } else if let Some(table) = &hash_table {
                     hash_rows = table
@@ -156,6 +162,19 @@ impl Engine {
                 }
             }
             running = next;
+            if position + 1 < plan.phys.join_steps.len()
+                && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+            {
+                profile.record_parent(
+                    if step.hash_join.is_some() {
+                        "Hash Join"
+                    } else {
+                        "Nested Loop"
+                    }
+                    .to_string(),
+                    meter.accrued,
+                );
+            }
         }
         Ok(running)
     }
@@ -167,6 +186,7 @@ impl Engine {
         params: &[Value],
         outer_stack: &[&[Value]],
         materialized: &[Vec<Row>],
+        rel_work: &mut [i64],
         stmt_rng: &std::cell::Cell<crate::seam::StmtRng>,
         meter: &mut Meter,
     ) -> Result<Vec<Row>> {
@@ -192,7 +212,8 @@ impl Engine {
         for outer_row in outer_rows {
             let candidates: Vec<Row> = if inner_inl {
                 let outer_logical = place_physical_relation_row(plan, outer_ordinal, outer_row);
-                self.materialize_rel(
+                let before = meter.accrued;
+                let rows = self.materialize_rel(
                     plan,
                     inner_ordinal,
                     params,
@@ -201,7 +222,9 @@ impl Engine {
                     stmt_rng,
                     env.ctes,
                     meter,
-                )?
+                )?;
+                rel_work[inner_ordinal] += meter.accrued - before;
+                rows
             } else if let Some(table) = &hash_table {
                 table
                     .probe(
@@ -271,7 +294,10 @@ impl Engine {
         // the general aggregate branch runs unchanged. (An aggregate plan skips every streaming
         // fast-path below — they all require `!is_agg` — so this front-position placement is only for
         // clarity, mirroring the Go core's ordering.)
-        if meter.is_unmetered() && self.vectorized_agg_eligible(plan) {
+        if meter.is_unmetered()
+            && self.explain_actual.borrow().is_none()
+            && self.vectorized_agg_eligible(plan)
+        {
             return self.exec_vectorized_agg(plan, &env, meter);
         }
 
@@ -363,7 +389,10 @@ impl Engine {
         // path. Gated to the unmetered lane (so a metered query's per-eval guards stay the row path's) and
         // to file-backed stores with no spillable touched column (project_columnar declines otherwise,
         // falling through to the identical-cost row path). Cost-neutral by construction.
-        if meter.is_unmetered() && vectorized_project_eligible(plan) {
+        if meter.is_unmetered()
+            && self.explain_actual.borrow().is_none()
+            && vectorized_project_eligible(plan)
+        {
             if let Some(em) = self.project_columnar(plan, &env, params, outer, meter)? {
                 return Ok(em);
             }
@@ -379,11 +408,13 @@ impl Engine {
         // (its bound seeks per outer row), so it is not materialized up front either — a placeholder
         // holds its slot and the join loop re-materializes it per left row.
         let mut materialized: Vec<Vec<Row>> = Vec::with_capacity(plan.rels.len());
+        let mut rel_work = vec![0i64; plan.rels.len()];
         for (ri, rel) in plan.rels.iter().enumerate() {
             if rel.lateral || plan.phys.rel_inl_bounds[ri].is_some() {
                 materialized.push(Vec::new());
                 continue;
             }
+            let before = meter.accrued;
             materialized.push(self.materialize_rel(
                 plan,
                 ri,
@@ -394,6 +425,7 @@ impl Engine {
                 env.ctes,
                 meter,
             )?);
+            rel_work[ri] = meter.accrued - before;
         }
 
         // Left-deep nested-loop join. `running` holds the combined rows over the relations
@@ -419,6 +451,7 @@ impl Engine {
                 params,
                 outer,
                 &materialized,
+                &mut rel_work,
                 plan.phys.join_steps.len(),
                 stmt_rng,
                 meter,
@@ -430,6 +463,7 @@ impl Engine {
                 params,
                 outer,
                 &materialized,
+                &mut rel_work,
                 stmt_rng,
                 meter,
             )?;
@@ -457,6 +491,7 @@ impl Engine {
                     for left in &running {
                         let mut lat_outer: Vec<&[Value]> = outer.to_vec();
                         lat_outer.push(left);
+                        let before = meter.accrued;
                         let right_rows = self.materialize_rel(
                             plan,
                             k + 1,
@@ -467,6 +502,7 @@ impl Engine {
                             env.ctes,
                             meter,
                         )?;
+                        rel_work[k + 1] += meter.accrued - before;
                         let mut left_matched = false;
                         for right in &right_rows {
                             let mut combined = left.clone();
@@ -498,6 +534,7 @@ impl Engine {
                 if plan.phys.rel_inl_bounds[k + 1].is_some() {
                     debug_assert!(!emit_right, "index-nested-loop excludes RIGHT/FULL joins");
                     for left in &running {
+                        let before = meter.accrued;
                         let right_rows = self.materialize_rel(
                             plan,
                             k + 1,
@@ -508,6 +545,7 @@ impl Engine {
                             env.ctes,
                             meter,
                         )?;
+                        rel_work[k + 1] += meter.accrued - before;
                         let mut left_matched = false;
                         for right in &right_rows {
                             let mut combined = left.clone();
@@ -600,6 +638,46 @@ impl Engine {
             }
         }
 
+        // Scan labels can repeat (self joins), while the optimizer may render relations in physical
+        // rather than authored order. Publish the accumulated leaf work in that same render order so
+        // the label queues remain deterministic; dynamic INL/LATERAL probes contribute to one leaf.
+        let physical_tree = (plan.rels.len() == 2 && plan.phys.relation_order.len() == 2)
+            || (plan.rels.len() >= 3
+                && plan.phys.relation_order.len() == plan.rels.len()
+                && plan.phys.join_steps.len() + 1 == plan.rels.len());
+        let relation_order: Vec<usize> = if physical_tree {
+            plan.phys.relation_order.clone()
+        } else {
+            (0..plan.rels.len()).collect()
+        };
+        for ordinal in relation_order {
+            let node = select_actual_rel_node(&plan.rels[ordinal]);
+            if select_actual_root_node(plan) != node
+                && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+            {
+                profile.record(node, rel_work[ordinal]);
+            }
+        }
+
+        if plan.rels.len() > 1 {
+            let is_hash = (plan.rels.len() == 2 && plan.phys.hash_join.is_some())
+                || plan
+                    .phys
+                    .join_steps
+                    .last()
+                    .is_some_and(|step| step.hash_join.is_some());
+            if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+                if select_actual_root_node(plan)
+                    != if is_hash { "Hash Join" } else { "Nested Loop" }
+                {
+                    profile.record_parent(
+                        if is_hash { "Hash Join" } else { "Nested Loop" }.to_string(),
+                        meter.accrued,
+                    );
+                }
+            }
+        }
+
         // WHERE over the combined rows (consume `running`, no extra clone). A WHERE arithmetic
         // can trap (22003/22012); each surviving combined row's filter accrues operator_eval.
         let mut rows: Vec<Row> = Vec::new();
@@ -610,6 +688,13 @@ impl Engine {
             };
             if keep {
                 rows.push(row);
+            }
+        }
+        if plan.filter.is_some()
+            && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+        {
+            if select_actual_root_node(plan) != "Filter" {
+                profile.record_parent("Filter".to_string(), meter.accrued);
             }
         }
 
@@ -628,6 +713,11 @@ impl Engine {
                 &env,
                 meter,
             )?;
+            if select_actual_root_node(plan) != "Window"
+                && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+            {
+                profile.record_parent("Window".to_string(), meter.accrued);
+            }
         }
 
         // ORDER BY: a stable sort applying each key left to right — the first non-equal key
@@ -646,6 +736,11 @@ impl Engine {
                 rows = top_k_rows(rows, &plan.order, k)?;
             } else {
                 sort_rows(&mut rows, &plan.order)?;
+            }
+            if select_actual_root_node(plan) != "Sort"
+                && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+            {
+                profile.record_parent("Sort".to_string(), meter.accrued);
             }
         }
 
@@ -845,6 +940,11 @@ impl Engine {
                 }
                 group_rows = kept;
             }
+            if select_actual_root_node(plan) != "Aggregate"
+                && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+            {
+                profile.record_parent("Aggregate".to_string(), meter.accrued);
+            }
             // WINDOW stage over the grouped rows (spec/design/window.md §2): runs AFTER GROUP
             // BY/HAVING and BEFORE the query ORDER BY. It appends each window result to the grouped
             // row [group_keys…, agg_results…], so the projection reads window result `w` at slot
@@ -858,12 +958,22 @@ impl Engine {
                     &env,
                     meter,
                 )?;
+                if select_actual_root_node(plan) != "Window"
+                    && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+                {
+                    profile.record_parent("Window".to_string(), meter.accrued);
+                }
             }
             // ORDER BY over the grouped output (a column/ordinal key is a synthetic group-key slot; an
             // expression key is materialized against the grouped row and appended — grammar.md §10).
             if !plan.order.is_empty() {
                 materialize_order_exprs(&mut group_rows, &plan.order_exprs, &env, meter)?;
                 sort_rows(&mut group_rows, &plan.order)?;
+                if select_actual_root_node(plan) != "Sort"
+                    && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+                {
+                    profile.record_parent("Sort".to_string(), meter.accrued);
+                }
             }
             if plan.distinct {
                 // SELECT DISTINCT: project EVERY grouped row (charging its projection operator_evals,
@@ -882,6 +992,11 @@ impl Engine {
                     if seen.insert(out.clone()) {
                         distinct_rows.push(out);
                     }
+                }
+                if select_actual_root_node(plan) != "Distinct"
+                    && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+                {
+                    profile.record_parent("Distinct".to_string(), meter.accrued);
                 }
                 // The dedup already projected every grouped row (the §3 asymmetry, charged above), so
                 // emission is Identity — window + charge row_produced, deferred to the drive (streaming.md §4).
@@ -918,6 +1033,11 @@ impl Engine {
                 if seen.insert(out.clone()) {
                     distinct_rows.push(out);
                 }
+            }
+            if select_actual_root_node(plan) != "Distinct"
+                && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+            {
+                profile.record_parent("Distinct".to_string(), meter.accrued);
             }
             // LIMIT / OFFSET applies to the DISTINCT rows; only the emitted rows charge row_produced
             // (spec/design/cost.md §3). The rows were already projected for their dedup key (the §3
@@ -963,11 +1083,30 @@ impl Engine {
         ctes: CteCtx,
         cost: &mut i64,
     ) -> Result<()> {
+        let frame = self
+            .explain_actual
+            .borrow()
+            .as_ref()
+            .map(|profile| profile.frames.len() + 1)
+            .unwrap_or(1);
+        self.fold_uncorrelated_in_plan_at(plan, bound, ctes, cost, frame)
+    }
+
+    fn fold_uncorrelated_in_plan_at(
+        &self,
+        plan: &mut QueryPlan,
+        bound: &[Value],
+        ctes: CteCtx,
+        cost: &mut i64,
+        frame: usize,
+    ) -> Result<()> {
         match plan {
-            QueryPlan::Select(sp) => self.fold_uncorrelated_in_select(sp, bound, ctes, cost),
+            QueryPlan::Select(sp) => {
+                self.fold_uncorrelated_in_select_at(sp, bound, ctes, cost, frame)
+            }
             QueryPlan::SetOp(sop) => {
-                self.fold_uncorrelated_in_plan(&mut sop.lhs, bound, ctes, cost)?;
-                self.fold_uncorrelated_in_plan(&mut sop.rhs, bound, ctes, cost)
+                self.fold_uncorrelated_in_plan_at(&mut sop.lhs, bound, ctes, cost, frame + 1)?;
+                self.fold_uncorrelated_in_plan_at(&mut sop.rhs, bound, ctes, cost, frame + 1)
             }
             // A VALUES-body value may itself hold an (uncorrelated) scalar subquery to fold once
             // before the rows are produced (grammar.md §42; the §26 fold).
@@ -995,13 +1134,34 @@ impl Engine {
         ctes: CteCtx,
         cost: &mut i64,
     ) -> Result<()> {
+        let frame = self
+            .explain_actual
+            .borrow()
+            .as_ref()
+            .map(|profile| profile.frames.len() + 1)
+            .unwrap_or(1);
+        self.fold_uncorrelated_in_select_at(sp, bound, ctes, cost, frame)
+    }
+
+    fn fold_uncorrelated_in_select_at(
+        &self,
+        sp: &mut SelectPlan,
+        bound: &[Value],
+        ctes: CteCtx,
+        cost: &mut i64,
+        frame: usize,
+    ) -> Result<()> {
         for j in &mut sp.joins {
             if let Some(on) = &mut j.on {
                 self.fold_uncorrelated_in_rexpr(on, bound, ctes, cost)?;
             }
         }
         if let Some(f) = &mut sp.filter {
+            let before = *cost;
             self.fold_uncorrelated_in_rexpr(f, bound, ctes, cost)?;
+            if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+                profile.record_folded(frame, "Filter", *cost - before);
+            }
         }
         if let Some(h) = &mut sp.having {
             self.fold_uncorrelated_in_rexpr(h, bound, ctes, cost)?;
@@ -1042,7 +1202,14 @@ impl Engine {
                 if let Some(l) = lhs {
                     self.fold_uncorrelated_in_rexpr(l, bound, ctes, cost)?;
                 }
-                self.fold_uncorrelated_in_plan(plan, bound, ctes, cost)?;
+                if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+                    profile.suppress_folded();
+                }
+                let fold_result = self.fold_uncorrelated_in_plan(plan, bound, ctes, cost);
+                if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+                    profile.unsuppress_folded();
+                }
+                fold_result?;
                 if query_plan_references_outer(plan, 0) {
                     return Ok(());
                 }
@@ -1059,7 +1226,7 @@ impl Engine {
             else {
                 unreachable!("guarded by matches! above")
             };
-            let r = self.exec_query_plan(&plan, &[], bound, ctes)?;
+            let r = self.exec_hidden_query_plan(&plan, &[], bound, ctes)?;
             *cost += r.cost;
             *e = match kind {
                 SubqueryKind::Scalar => {

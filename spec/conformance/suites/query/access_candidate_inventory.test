@@ -107,6 +107,6 @@ conjuncts=2
 0
 2
 Scan candidate_inventory
-GIN bound: using a_gin
+GIN bound: using a_gin; touched=3
 0
 0

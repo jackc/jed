@@ -232,6 +232,7 @@ func (db *engine) runWith(wq *withQuery, params []Value) (selectResult, error) {
 		return selectResult{}, err
 	}
 	r.cost += subqueryCost + totalCost
+	db.explainActual.recordParent("WITH", r.cost)
 	return r, nil
 }
 
@@ -244,6 +245,13 @@ func (db *engine) materializeCtes(bindings []*cteBinding, modes []cteMode, bound
 	var totalCost int64
 	buffers := make([][]storedRow, 0, len(bindings))
 	for i := range bindings {
+		before := totalCost
+		bodyVisible := bindings[i].refs > 0 || bindings[i].recursive != nil || bindings[i].isDml() || modes[i] == cteMaterialize
+		var bodyMarker int64
+		if bodyVisible {
+			bodyMarker = 1
+		}
+		db.explainActual.record("@cte-body "+bindings[i].name, bodyMarker)
 		var buf []storedRow
 		switch {
 		case bindings[i].recursive != nil:
@@ -265,6 +273,7 @@ func (db *engine) materializeCtes(bindings []*cteBinding, modes []cteMode, bound
 			buf = rowsFromValues(r.rows)
 		}
 		buffers = append(buffers, buf)
+		db.explainActual.recordParent("CTE "+bindings[i].name, totalCost-before)
 	}
 	return buffers, totalCost, nil
 }
@@ -423,6 +432,13 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 	var totalCost int64
 	buffers := make([][]storedRow, 0, len(bindings))
 	for i := range bindings {
+		before := totalCost
+		bodyVisible := bindings[i].refs > 0 || bindings[i].recursive != nil || bindings[i].isDml() || modes[i] == cteMaterialize
+		var bodyMarker int64
+		if bodyVisible {
+			bodyMarker = 1
+		}
+		db.explainActual.record("@cte-body "+bindings[i].name, bodyMarker)
 		var buf []storedRow
 		switch {
 		case bindings[i].recursive != nil:
@@ -450,6 +466,7 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 			buf = rowsFromValues(r.rows)
 		}
 		buffers = append(buffers, buf)
+		db.explainActual.recordParent("CTE "+bindings[i].name, totalCost-before)
 	}
 
 	// (4) Execute the primary against the full CTE context, adding the materialization cost.
@@ -482,7 +499,17 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 	if err != nil {
 		return outcome{}, err
 	}
-	return addOutcomeCost(out, totalCost), nil
+	switch {
+	case wq.Body.Insert != nil:
+		db.explainActual.record("Insert "+wq.Body.Insert.Table, out.Cost)
+	case wq.Body.Update != nil:
+		db.explainActual.record("Update "+wq.Body.Update.Table, out.Cost)
+	case wq.Body.Delete != nil:
+		db.explainActual.record("Delete "+wq.Body.Delete.Table, out.Cost)
+	}
+	out = addOutcomeCost(out, totalCost)
+	db.explainActual.recordParent("WITH", out.Cost)
+	return out, nil
 }
 
 // execDmCte executes a data-modifying CTE (spec/design/writable-cte.md §3): run the INSERT/UPDATE/
@@ -503,6 +530,14 @@ func (db *engine) execDmCte(i int, bindings []*cteBinding, params []Value, ctx c
 	}
 	if err != nil {
 		return nil, 0, err
+	}
+	switch {
+	case dm.insert != nil:
+		db.explainActual.record("Insert "+dm.insert.Table, out.Cost)
+	case dm.update != nil:
+		db.explainActual.record("Update "+dm.update.Table, out.Cost)
+	default:
+		db.explainActual.record("Delete "+dm.delete.Table, out.Cost)
 	}
 	if out.Kind == outcomeQuery {
 		return rowsFromValues(out.Rows), out.Cost, nil
@@ -1178,6 +1213,8 @@ func (db *engine) planWithExpr(we *withExpr, parent *scope, ptypes *paramTypes) 
 // rows, innermost last; nil at top level) and the bound parameters. ctes is the per-statement CTE
 // execution context (spec/design/cte.md §5), the zero cteCtx for a non-WITH statement.
 func (db *engine) execQueryPlan(plan *queryPlan, outer []storedRow, params []Value, ctes cteCtx) (selectResult, error) {
+	db.explainActual.beginFrame()
+	defer db.explainActual.endFrame()
 	if plan.sel != nil {
 		return db.execSelectPlan(plan.sel, outer, params, ctes)
 	}
@@ -1188,6 +1225,14 @@ func (db *engine) execQueryPlan(plan *queryPlan, outer []storedRow, params []Val
 		return db.execWithPlan(plan.with, outer, params)
 	}
 	return db.execSetOpPlan(plan.setop, outer, params, ctes)
+}
+
+// execHiddenQueryPlan executes an expression subquery whose operators are not rendered as separate
+// EXPLAIN rows. Its returned cost still accrues into the containing visible operator checkpoint.
+func (db *engine) execHiddenQueryPlan(plan *queryPlan, outer []storedRow, params []Value, ctes cteCtx) (selectResult, error) {
+	db.explainActual.beginFrame()
+	defer db.explainActual.discardFrame()
+	return db.execQueryPlan(plan, outer, params, ctes)
 }
 
 // execWithPlan executes a nested WITH plan (spec/design/cte.md §7): materialize its CTE bindings
@@ -1207,6 +1252,7 @@ func (db *engine) execWithPlan(wp *withPlan, outer []storedRow, params []Value) 
 		return selectResult{}, err
 	}
 	r.cost += totalCost
+	db.explainActual.recordParent("WITH", r.cost)
 	return r, nil
 }
 
@@ -1284,10 +1330,22 @@ func (db *engine) execSetOpPlan(plan *setOpPlan, outer []storedRow, params []Val
 
 	rows := combineSetop(plan.op, plan.all, left.rows, right.rows)
 	cost := left.cost + right.cost
+	rootNode := setOpNodeName(plan.op)
+	if plan.limit != nil || plan.offset != nil {
+		rootNode = "Limit"
+	} else if len(plan.order) > 0 {
+		rootNode = "Sort"
+	}
+	if rootNode != setOpNodeName(plan.op) {
+		db.explainActual.recordParent(setOpNodeName(plan.op), cost)
+	}
 
 	if len(plan.order) > 0 {
 		if err := sortRows(rows, plan.order); err != nil {
 			return selectResult{}, err
+		}
+		if rootNode != "Sort" {
+			db.explainActual.recordParent("Sort", cost)
 		}
 	}
 
@@ -1303,6 +1361,7 @@ func (db *engine) execSetOpPlan(plan *setOpPlan, outer []storedRow, params []Val
 		end = start + *plan.limit
 	}
 	rows = rows[start:end]
+	db.explainActual.recordParent(rootNode, cost)
 
 	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: rows, cost: cost}, nil
 }
@@ -1403,6 +1462,7 @@ func (db *engine) execValuesPlan(plan *valuesPlan, outer []storedRow, params []V
 		}
 		rows = append(rows, out)
 	}
+	db.explainActual.recordParent("Values", meter.Accrued)
 	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: rows, cost: meter.Accrued}, nil
 }
 

@@ -43,7 +43,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   `ANALYZE` runs it and reports the actual (deterministic) accrued cost + row count on an `Analyze`
   root. Covers read queries + DML (plan-only, never mutates); `ANALYZE` of a write executes + commits.
   The observability substrate for the cost-based planner. → [explain.md](spec/design/explain.md)
-  - [ ] _follow-on:_ per-node actual cost attribution under `ANALYZE`; a full expression printer for
+  - [x] _follow-on:_ per-node actual cost attribution under `ANALYZE`; a full expression printer for
     the residual filter / projections (currently a `conjuncts=N` count) + exact float-literal bound
     rendering (each needs a determinism-ledger entry); an `EXPLAIN (…)` option list; a
     streaming/buffered/deferred lane tag; the DML touched-set count; `EXPLAIN` of a data-modifying `WITH`.

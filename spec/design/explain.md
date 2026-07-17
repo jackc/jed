@@ -1,237 +1,177 @@
 # EXPLAIN — design
 
-> `EXPLAIN [ANALYZE] <statement>` renders the planner's chosen plan as a deterministic result
-> set instead of running the statement. This is the observability surface for the cost-based
-> planner: it makes the planner's access-path / join / sort-elision decisions
-> inspectable and, crucially, **assertable in the shared conformance corpus** — one entry
-> verifies all three cores render a byte-identical plan. This doc is the contract all three
-> cores implement in lockstep (CLAUDE.md §2); the grammar is in
-> [../grammar/grammar.ebnf](../grammar/grammar.ebnf), the capabilities in
-> [../conformance/manifest.toml](../conformance/manifest.toml), and the cost contract EXPLAIN
-> ANALYZE reports in [cost.md](cost.md). EXPLAIN is **jed-owned surface**: PostgreSQL's plan
-> text is not something jed reproduces byte-for-byte (CLAUDE.md §1), so EXPLAIN entries are
-> **not** oracle-imported.
+> `EXPLAIN` renders jed's selected physical plan as a deterministic ordinary result set.
+> `ANALYZE` executes that plan and reports deterministic meter cost, never wall-clock time. This is
+> a jed-owned surface: PostgreSQL supplies behavioral precedent for planning and privilege checks,
+> but jed does not reproduce PostgreSQL's plan text.
 
-## 1. Surface
+The grammar is canonical in [grammar.ebnf](../grammar/grammar.ebnf), estimator arithmetic in
+[estimator.md](estimator.md), and execution units in [cost.md](cost.md). The shared corpus is the
+cross-core contract; no core is the reference renderer.
+
+## 1. Surface and options
+
+Both spellings are accepted:
 
 ```sql
 EXPLAIN [ANALYZE] <statement>
+EXPLAIN (<option> [, ...]) <statement>
 ```
 
-`EXPLAIN` and the optional `ANALYZE` modifier are recognized **positionally** and stay
-**non-reserved** (grammar.md §3): no statement begins with a bare identifier, so the leading
-word disambiguates without lookahead, and `explain` / `analyze` remain legal identifiers
-everywhere else. The inner statement is restricted to a **query** (`SELECT`, a set operation,
-a read-only `WITH`) or a **DML** statement (`INSERT` / `UPDATE` / `DELETE`); DDL, transaction
-control, and a nested `EXPLAIN` have no query plan to render and are rejected **42601**.
+An option is `ANALYZE`, `VERBOSE`, `COSTS`, or `LANE`, optionally followed by `TRUE`, `FALSE`,
+`ON`, or `OFF`. Omitting the value means true. Defaults are `ANALYZE FALSE`, `VERBOSE FALSE`,
+`COSTS TRUE`, and `LANE FALSE`. A duplicate or unknown option, an empty list, or a malformed value
+is `42601`. The legacy positional `EXPLAIN ANALYZE` remains equivalent to
+`EXPLAIN (ANALYZE TRUE)`.
 
-- **Plain `EXPLAIN`** plans the inner statement and renders the plan **without executing it** —
-  an `EXPLAIN DELETE` deletes nothing, an `EXPLAIN INSERT` inserts nothing. It is always a
-  **read**, even of a DML inner. Bind parameters are not accepted (a `$N` renders symbolically).
-- **`EXPLAIN ANALYZE`** additionally **runs** the inner statement and reports its actual
-  accrued cost + row count (§3). Of a DML statement it is a **write** — the mutation runs and
-  commits (`stmtIsWrite` classifies `analyze && inner-is-write` as a write).
+The option words are recognized positionally and remain non-reserved. The inner statement is a
+query (`SELECT`, `VALUES`, a set operation, or `WITH`, including a data-modifying `WITH`) or DML
+(`INSERT`, `UPDATE`, `DELETE`). DDL, transaction control, and nested `EXPLAIN` are rejected `42601`.
 
-**Privileges** are those of the inner statement (an `EXPLAIN INSERT` requires `INSERT`), matching
-PostgreSQL — even though plain `EXPLAIN` never executes.
+- Plain `EXPLAIN` plans and renders without executing. It is a read even when its inner statement
+  is DML, but checks the inner statement's privileges.
+- `ANALYZE` executes the inner statement. It is a write when the inner statement is a write, and a
+  successful autocommit invocation commits that mutation.
+- Bind values are not accepted by plain EXPLAIN; unresolved `$N` sources render symbolically.
 
-## 2. Output shape (the two harness constraints that fix it)
+## 2. Output shape
 
-EXPLAIN produces an ordinary query result set (a SELECT-shaped `Outcome`) with five columns:
+The first three columns are always present:
 
 | column | type | meaning |
 |---|---|---|
-| `depth`  | `i32`  | the plan node's nesting level (0-based), from a **pre-order DFS** of the plan tree |
-| `node`   | `text` | the operator label — a **fixed cross-core vocabulary** (§4), the §8 spelling contract |
-| `detail` | `text` | the node's attributes (access path, keys, counts); the sentinel `-` when it has none |
-| `est_rows` | `i64` | rows this node is estimated to deliver to its rendered parent; a DML root uses estimated affected rows |
-| `est_cost` | `i64` | saturated cumulative scheduled cost attributable through this node |
+| `depth` | `i32` | 0-based nesting in a pre-order DFS |
+| `node` | `text` | fixed operator label (§4) |
+| `detail` | `text` | canonical attributes, or `-` |
 
-The estimate columns are non-NULL shortest-decimal integers in `0..i64::MAX`. They are planner
-estimates, not safety limits and not a promise to equal execution. Their exact arithmetic and
-per-node attribution are specified in [estimator.md §8.3/§11](estimator.md). There is no unavailable
-sentinel: deterministic fallback rules produce an estimate for every currently renderable node.
-For a one-base-relation SELECT, complete-pipeline `est_cost` chooses among every access
-method and eligible order-only B-tree walk; `query/cost_plan_access*.test` asserts row-count and
-selectivity flips, cross-method/name ties, scan-order composition, actual cost, and the staged
-mutation boundary.
+Options append columns in this fixed order:
 
-Two properties of the conformance harness ([../conformance/README.md](../conformance/README.md);
-`impl/*/…/conformance` render the actual cell **raw** while the expected line is `TrimSpace`d, and a
-blank cell terminates a record) fix the format:
+| condition | appended column(s) | type | meaning |
+|---|---|---|---|
+| `COSTS TRUE` (default) | `est_rows`, `est_cost` | `i64`, `i64` | rows delivered to the parent and cumulative scheduled estimate |
+| `ANALYZE TRUE` | `actual_cost` | `i64` | measured inclusive cost attributable through this node |
+| `LANE TRUE` | `lane` | `text` | statement-wide `streaming`, `buffered`, or `deferred` execution lane |
 
-1. **No cell carries leading or trailing whitespace.** Indentation is the `depth` integer, never
-   spaces — this is why the output is columnar rather than an indented text tree.
-2. **No cell is ever the empty string.** A node with no attributes renders `detail = "-"`.
+Thus bare EXPLAIN preserves its five-column compatibility shape. `COSTS FALSE` leaves the three
+structural columns; ANALYZE and LANE are independent of COSTS.
 
-Rows are emitted in **pre-order**, so the tree reads top-down as the executor's pipeline reads
-bottom-up, and the order is **deterministic by construction**. EXPLAIN is therefore asserted with
-**`nosort`** — a sanctioned use of `nosort` on an ORDER-BY-less result, exactly like composite
-`record_out`'s fixed field order (conformance.md), because the row order is a property of the
-rendering, not of a scan or hash.
+Every cell is non-empty and has no leading or trailing whitespace. Indentation is represented by
+`depth`, not spaces. Rows are a deterministic pre-order traversal and are therefore asserted with
+`nosort` even though no SQL `ORDER BY` is present.
 
-## 3. `EXPLAIN ANALYZE` — deterministic actual cost
+Estimate cells are saturated non-negative `i64` values. They are heuristics, not safety limits and
+not promises to equal execution. Complete arithmetic and semantic CTE attribution are specified in
+[estimator.md §8.3/§11](estimator.md).
 
-`EXPLAIN ANALYZE` runs the inner statement and prepends an **`Analyze`** root node whose detail is
-`cost=<C> rows=<R>`, with the plan tree shifted one level deeper. `<C>` is the inner statement's
-**actual accrued cost** and `<R>` is its row count (the rows returned, or the affected-row count for
-a DML statement without `RETURNING`). Because jed's cost meter is a **deterministic, byte-identical
-cross-core contract** (cost.md §1), `<C>` is reproducible across cores and asserted as an ordinary
-cell — no `# cost:` directive is needed for it. This is what makes ANALYZE well-defined here where a
-wall-clock ANALYZE would not be.
+## 3. ANALYZE and actual attribution
 
-**Two independent cost figures.** The inner statement's real cost lives only in the `Analyze` root.
-The `EXPLAIN` statement's **own** cost (its `Outcome.Cost`) is **one `row_produced` per emitted plan
-row** — a small, deterministic function of the plan-row count, independent of the inner cost. So a
-`# cost:` directive on an `EXPLAIN ANALYZE` pins the render cost, while the (larger) inner cost
-appears only inside the root. Plain EXPLAIN runs no inner meter; it charges only its render cost.
+ANALYZE prepends an `Analyze` row whose detail is `cost=<C> rows=<R>` and shifts the rendered plan
+one level deeper. `C` is the inner statement's exact meter total. `R` is returned rows, or affected
+rows for DML without `RETURNING`. The wrapper repeats the planned root estimate when COSTS is on and
+has `actual_cost = C`.
 
-The `Analyze` wrapper repeats the planned child's `est_rows` and `est_cost`; only its `detail`
-contains actual figures. This keeps the estimated and actual surfaces separate without inventing a
-second estimate for a renderer-only wrapper.
+Every plan row also has an inclusive `actual_cost`. The execution profiler records leaf scan
+sub-meter deltas and inclusive checkpoints after joins, residual filters, aggregation/HAVING,
+windows, sort-key evaluation, DISTINCT, emission/projection, and DML target filtering. Parent
+checkpoints include their executed children; a SELECT root is sampled after output projection and
+`row_produced` charges. Metadata-shaped trees use execution semantics: an unexecuted definition
+contributes no work, materialized work is charged once, and an inlined definition wrapper contributes
+no separate work; its definition subtree and reference checkpoint expose the execution work. No
+wall-clock, allocation, or host iteration value enters attribution. Query-plan frames are structural
+identities, so equal labels in an outer query and derived/CTE/set-op child cannot exchange costs.
+An uncorrelated expression subquery has no visible node after folding; its once-only work enters the
+inclusive checkpoint of the containing visible operator (for example `Filter`) and every parent.
 
-Per-node cost attribution is **out** for now (jed's meter is a single global counter); ANALYZE
-reports the whole-statement figure. Per-node metering is a possible follow-on.
+The EXPLAIN statement has a separate outcome cost: one `row_produced` per displayed plan row. The
+inner cost appears only in `actual_cost` and the Analyze detail; it is not added to EXPLAIN's own
+outcome cost.
 
-## 4. Node + detail vocabulary (the §8 cross-core spelling contract)
+## 4. Nodes, order, and lanes
 
-Every token below is fixed and must be spelled identically in every core — this is what makes the
-corpus assertion cross-core-meaningful. The renderer is **hand-written per core** (like the rest of
-the executor, §5 forbids codegenning it); the corpus + this table are the contract.
+The fixed node vocabulary is:
 
-### Nodes
-
-| source | node label |
+| source | node |
 |---|---|
-| base-table scan | `Scan <table>` |
-| set-returning function in FROM | `SRF <name>` |
-| CTE reference | `CTE Scan <name>` |
-| derived table / subquery in FROM | `Subquery <alias>` |
-| nested-loop join | `Nested Loop` |
-| hash join | `Hash Join` |
-| residual WHERE | `Filter` |
-| aggregation / GROUP BY | `Aggregate` |
-| window stage | `Window` |
-| DISTINCT | `Distinct` |
-| ORDER BY (not elided) | `Sort` |
-| LIMIT / OFFSET | `Limit` |
-| FROM-less query | `Result` |
-| VALUES relation | `Values` |
-| set operations | `Union` / `Intersect` / `Except` |
-| WITH wrapper / a CTE binding | `WITH` / `CTE <name>` |
-| DML roots | `Insert <table>` / `Update <table>` / `Delete <table>` |
-| EXPLAIN ANALYZE root | `Analyze` |
+| base/catalog scan | `Scan <table>` / `Catalog Scan <name>` |
+| SRF, CTE reference, derived relation | `SRF <name>` / `CTE Scan <name>` / `Subquery <alias>` |
+| joins | `Nested Loop` / `Hash Join` |
+| SELECT pipeline | `Filter`, `Aggregate`, `Window`, `Distinct`, `Sort`, `Limit`, `Result` |
+| relation/set wrappers | `Values`, `Union`, `Intersect`, `Except`, `WITH`, `CTE <name>` |
+| DML | `Insert <table>`, `Update <table>`, `Delete <table>` |
+| ANALYZE wrapper | `Analyze` |
 
-jed has one aggregation strategy (`Aggregate`) and two join operators (`Nested Loop`, `Hash Join`).
-There is still no `HashAggregate` / `GroupAggregate` split.
+A SELECT renders outermost first in this order: Limit → non-elided Sort → Distinct → Window →
+Aggregate → Filter → FROM tree. The FROM tree is the selected left-deep physical join order. A sort
+served by scan/join order is omitted and its `ordered:` note is placed on the FROM root.
 
-### Operator order for a SELECT
+`LANE TRUE` repeats one statement-level tag on every row:
 
-Emitted outermost-first, each the pre-order parent of the next, so the tree reads top-down as the
-pipeline reads bottom-up: **Limit → Sort → Distinct → Window → Aggregate → Filter → FROM tree**. A
-node is emitted only when present. The FROM tree is a left-deep chain of join nodes over the plan's
-physical relation order (the outermost node is the last join; its right child is the physical inner
-relation), bottoming out at relation leaves. EXPLAIN may therefore render any relation from a
-searched INNER/CROSS island as the driver or a later inner leaf. Hard-fenced outer/dependency
-relations stay
-in their authored position, and independently searched islands may follow them. Resolved logical
-slots remain in source order; EXPLAIN shows execution order.
+- `streaming`: the selected simple bounded pull-scan path can deliver rows incrementally;
+- `deferred`: a read-only top-level WITH or set-operation boundary performs its work on first pull; and
+- `buffered`: every other shape, including DML and blocking query pipelines.
 
-### Detail grammar
+The tag describes the public lazy-query dispatch lane, not an estimate and not whether an
+individual child happens to use a cursor internally. Public statement write classification takes
+precedence: a SELECT containing `nextval`/`setval`, or a top-level WITH containing DML, is `buffered`.
 
-Attributes are `; `-separated; a node with none renders `-`.
+## 5. Detail and expression spelling
 
-- **Scan access path** (from the relation's chosen bound): `Full scan` · `PK bound: <col> <op> <src>`
-  (conjuncts joined by ` and `; composite-PK members render in key order) ·
-  `Index bound: using <index>` · `GIN bound: using <index>` ·
-  `GiST bound: using <index>` · `PK interval set: <col>; intervals=N` ·
-  `Index interval set: using <index>; intervals=N`. `N` is the structural OR-leaf count before
-  runtime parameter encoding/canonicalization. The index name is the stored **lowercased** name. `<op>` is one of
-  `= <> < > <= >=`. `<src>` is `$N` (a bind parameter, 1-based), `outer` (a correlated outer column),
-  or a literal (integer / boolean / decimal / quoted text rendered via the value's canonical form; a
-  **float** renders as the fixed token `<float>` — see §5).
-- **Touched columns** (SELECT scans only): `touched=K`, the count of columns the query statically
-  references (cost.md "touched set"); omitted when zero (e.g. `count(*)`). UPDATE/DELETE scans omit
-  it (a DML touched set includes assignment sources; left to a follow-on).
-- **Sort elision** (on the FROM top node when an ORDER BY is served by scan order rather than a
-  `Sort`): `ordered: pk ordered` (`(reverse)` for a DESC scan) · `ordered: index order: <index>` ·
-  `ordered: join pk ordered`.
-- **Sort**: `keys=N`; when the blocking ORDER BY + LIMIT rule applies, `keys=N, top-k=K`, where
-  K is the checked `OFFSET + LIMIT` retained-row bound (`LIMIT 0` renders `top-k=0`).
-- **Filter / join ON**: `conjuncts=N` (top-level AND count). A full expression printer is a
-  follow-on (§5); v1 renders a count, not the predicate text — except the compact bound predicate
-  above.
-- **Aggregate**: `groups=G aggs=A` (+ `sets=S` when more than one grouping set; + `having:conjuncts=K`).
-- **Window**: `funcs=N`. **Nested Loop**: `<kind>` (`inner`/`cross`/`left`/`right`/`full`) +
-  `on:conjuncts=N`; when several authored ON trees first become ready at the same physical step, the
-  suffix is `on:predicates=P,conjuncts=N`. **Hash Join** inserts `keys=K` before the same ON suffix
-  (`kind` is `inner`, or `left` on the established two-input path).
-- **Limit**: `limit=N` / `offset=M` (an absent side omitted). **Values**: `rows=N`.
-- **Set op**: `all` / `distinct`. **CTE**: `inlined` / `materialized` (the planner's choice) + `recursive`.
-- **Insert**: `-` or `on conflict do nothing` / `on conflict do update`. **Update**: `sets=N`. **Delete**: `-`.
-- **Analyze**: `cost=<C> rows=<R>`.
+Attributes are separated by `; `. A node with no attributes is `-`.
 
-## 5. Determinism (why no ledger entry is needed)
+- Scans render `Full scan`, `PK bound: ...`, `Index bound: using <index>`, `GIN bound: ...`,
+  `GiST bound: ...`, or an interval-set form. Bound operators are `= <> < > <= >=`; sources are
+  `$N`, `outer`, or canonical literals. Float bounds use the core's native shortest round-trip
+  formatter rather than the old `<float>` placeholder.
+- `touched=K` is the exact number of statically referenced stored columns. It is emitted for SELECT
+  scans and UPDATE/DELETE target scans, including assignment sources and the storage-reading side of
+  `RETURNING`; it is omitted when zero.
+- Sort details are `keys=N` and optionally `top-k=K`. Limit details are `limit=N` / `offset=N`.
+  Aggregate, Window, Values, set-op, CTE, and DML counts retain their established compact grammar.
+- Without VERBOSE, residual filters, HAVING, and join predicates retain compact `conjuncts=N`
+  counts for compatibility.
+- With VERBOSE, those counts become `filter=<expr>`, `having=<expr>`, or `on=<expr>`; the outermost
+  SELECT node also appends `output=[<expr>, ...]`.
 
-The plan structs are already cross-core identical (they drive the `# cost:` contract), so the
-rendering is deterministic **by construction provided every emitted token is deterministic**. The
-surfaces and how each is pinned:
+The verbose printer consumes resolved expressions, not source text. It uses zero-based column slots
+(`#0`), `outer(level,index)`, one-based parameters (`$1`), lowercase function/operator names,
+canonical quoted constants, and full parentheses around compound operators. It prints every
+resolved expression variant explicitly; adding a new resolved variant without a printer arm is a
+core implementation error, not a generic fallback string. This makes aliases, whitespace, and
+parser spelling irrelevant while keeping structure byte-assertable. SQL/JSON query functions spell
+their resolved `RETURNING` type, wrapper and quotes mode where applicable, and `ON EMPTY`/`ON ERROR`
+behaviors, including semantic defaults.
 
-- **Index names** — always the stored lowercased name; estimated cost chooses across the complete
-  single-relation set and deterministic lowest-name order breaks an exact same-kind cost tie
-  (indexes.md §5).
-- **Iteration order** — relation leaves iterate the selected physical-order slice inside each
-  island and authored order at every hard fence; retained DP states, joins, aggregates, and CTE
-  bindings iterate their specified structural order, never a map.
-- **Literal rendering** — integer / boolean / decimal / text / date / timestamp / uuid render
-  deterministically. **`float` is the one hazard** (its layout is a ratified determinism-ledger
-  exception, and floats are keyable), so a float bound literal renders as the fixed token `<float>`,
-  keeping the plan text off the ledger entirely.
-- **Residual predicates** — a conjunct **count** (a deterministic integer), not expression text.
+## 6. Data-modifying WITH
 
-So **v1 needs no `determinism_exceptions.toml` entry.** Two follow-ons *would*: exact float-literal
-bound rendering, and a full expression printer.
+Plain EXPLAIN plans a top-level data-modifying WITH without running any sub-statement. The `WITH`
+root contains each `CTE <name>` in authored order. A data-modifying CTE is always `materialized` and
+its complete Insert/Update/Delete subtree appears below its definition; the primary query or DML
+subtree follows the definitions. Reference counts still determine read-only CTE modes. ANALYZE uses
+the ordinary writable-CTE orchestrator, including its pre-statement read pin and last-write-wins
+rules.
 
-### Estimate attribution for non-tree execution shapes
+## 7. Determinism ledger
 
-Most rendered parent/child edges are execution-subtree edges and cumulative cost composes normally.
-`WITH` is the deliberate exception because its display contains both CTE **definitions** and the
-main body, while execution may inline a definition at a reference instead of executing it at its
-displayed definition site:
+Plan traversal, names, counts, integer literals, and non-float constant rendering remain exact
+cross-core contracts. Two newly exposed presentation surfaces are separately audited in
+[determinism_exceptions.toml](../conformance/determinism_exceptions.toml):
 
-- a materialized referenced `CTE <name>` owns its body once; a materialized `CTE Scan <name>` owns
-  only `cte_scan_row` buffer reads;
-- an inlined `CTE <name>` definition contributes zero at the definition site, while its `CTE Scan`
-  owns the referenced body's intrinsic estimate;
-- an unreferenced read-only CTE contributes zero even though its child plan remains displayed and
-  carries its intrinsic informational estimate; and
-- the `WITH` root includes only contributions that execution actually performs, plus its main body.
+- `explain-expression-spelling` records the hand-written resolved-expression spelling contract. It
+  drops no guarantee; exact corpus cells are the differential check.
+- `explain-float-literal-layout` bounds the already-ratified native shortest-float layout exception
+  to float text embedded in EXPLAIN details. The float value and selected bound remain identical;
+  only equivalent exponent/layout spelling may vary at formatter-specific thresholds.
 
-This semantic attribution is intentionally not a blind sum over every displayed metadata edge.
-Derived-table `Subquery` edges are ordinary execution edges and do compose normally.
+No hashmap iteration, locale, clock, entropy, allocation, or wall time may reach plan text,
+estimates, actual costs, or lane tags.
 
-For DML, the root's `est_rows` is estimated affected rows, matching the row-count concept reported
-by `EXPLAIN ANALYZE` for a mutation without `RETURNING`. `INSERT` uses estimated source candidates;
-`UPDATE`/`DELETE` use the selected target scan plus the residual predicate. `ON CONFLICT` keeps the
-candidate count until distribution statistics can predict conflicts without planning-time leaf I/O.
+## 8. PostgreSQL divergences and remaining follow-ons
 
-## 6. Divergences from PostgreSQL (documented per CLAUDE.md §1)
+- The structured result format, node vocabulary, deterministic cost units, actual-cost column, and
+  LANE option are jed-owned rather than PostgreSQL plan-text compatibility surfaces.
+- jed supports only boolean ANALYZE/VERBOSE/COSTS/LANE options. PostgreSQL FORMAT, BUFFERS, TIMING,
+  SUMMARY, WAL, SETTINGS, GENERIC_PLAN, MEMORY, and SERIALIZE are not accepted.
+- ANALYZE reports deterministic logical work instead of timing.
 
-- **Format is jed's own**, not PG's indented `QUERY PLAN` text: structured
-  `depth`/`node`/`detail`/`est_rows`/`est_cost` columns, chosen for corpus-assertability under the
-  whitespace/empty-cell constraints of §2. Not oracle-imported.
-- **No parenthesized option list** (`EXPLAIN (FORMAT …, VERBOSE, …)`); the surface is bare
-  `EXPLAIN [ANALYZE] <stmt>`. A `(…)` option list is a possible follow-on.
-- **Node vocabulary reflects jed's executor** (one `Aggregate`, one `Nested Loop`), not PG's richer
-  set of physical operators — jed owns its surface.
-- **ANALYZE reports deterministic accrued cost and actual root rows, not wall-clock time or
-  per-node actuals** — the estimate columns remain planner values, which keeps both surfaces
-  corpus-assertable.
-
-## 7. Deferred follow-ons (none foreclosed)
-
-- Per-node actual cost attribution under ANALYZE (needs a per-operator sub-meter).
-- A full expression printer for the residual filter / projections (a ledgered spelling contract).
-- Exact float-literal bound rendering (needs a ledger entry).
-- A `(…)` option list; a streaming/buffered/deferred lane tag; EXPLAIN of a data-modifying `WITH`.
-- The DML touched-set count (UPDATE/DELETE), and collation-name rendering in keys.
+Collation-name rendering in keys and additional physical operators remain follow-ons; none changes
+the contracts above.

@@ -516,6 +516,8 @@ fn statistics_bound_value(src: &BoundSrc, ty: ScalarType) -> Option<Value> {
         BoundSrc::Text(value) => Value::Text(value.clone()),
         BoundSrc::Bytea(value) => Value::Bytea(value.clone()),
         BoundSrc::Decimal(value) => Value::Decimal(value.clone()),
+        BoundSrc::Float32(value) => Value::Float32(*value),
+        BoundSrc::Float64(value) => Value::Float64(*value),
         BoundSrc::Interval(value) => Value::Interval(*value),
         BoundSrc::Null => Value::Null,
         BoundSrc::Param(_) | BoundSrc::Outer { .. } | BoundSrc::Sibling(_) => return None,

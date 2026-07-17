@@ -1067,6 +1067,7 @@ impl Engine {
         table: &Table,
         db: Option<&str>,
         filter: Option<&RExpr>,
+        ctx: Option<&EstimateCteCtx>,
     ) -> EstimatedPlan {
         let rel = ScopeRel {
             label: table.name.to_ascii_lowercase(),
@@ -1095,13 +1096,27 @@ impl Engine {
         local[UNIT_OPERATOR_EVAL] = sat_mul(estimator_operator_nodes(Some(filter)), scan.root.rows);
         let invocation_rows = scan.root.rows;
         let mut plan = EstimatedPlan::wrap(scan, rows, logical_rows, local);
-        self.add_expression_subqueries(&mut plan.root, Some(filter), invocation_rows, None);
+        self.add_expression_subqueries(&mut plan.root, Some(filter), invocation_rows, ctx);
         plan.nodes[0] = plan.root.clone();
         plan
     }
 
     /// Build the pre-order estimate stream consumed by the EXPLAIN renderer.
     pub(crate) fn estimate_explain(&self, inner: &Statement) -> Result<Vec<PlanEstimate>> {
+        if let Statement::With(wq) = inner
+            && with_has_dml(wq)
+        {
+            return self.estimate_explain_with_dml(wq);
+        }
+        self.estimate_explain_scoped(inner, &[], None)
+    }
+
+    fn estimate_explain_scoped(
+        &self,
+        inner: &Statement,
+        bindings: &[CteBinding],
+        ctx: Option<&EstimateCteCtx>,
+    ) -> Result<Vec<PlanEstimate>> {
         let plan = match inner {
             Statement::Insert(insert) => {
                 if self
@@ -1119,10 +1134,10 @@ impl Engine {
                         let query = self.plan_query(
                             &QueryExpr::Select(select.clone()),
                             None,
-                            &[],
+                            bindings,
                             &mut ptypes,
                         )?;
-                        self.estimate_query_plan(&query, None)
+                        self.estimate_query_plan(&query, ctx)
                     }
                     InsertSource::Values(rows) => {
                         EstimatedPlan::leaf(PlanEstimate::empty(rows.len() as i64))
@@ -1139,9 +1154,9 @@ impl Engine {
                             format!("table does not exist: {}", update.table),
                         )
                     })?;
-                let filter = self.explain_dml_filter(table, update.filter.as_ref())?;
+                let filter = self.explain_dml_filter(table, update.filter.as_ref(), bindings)?;
                 let scan =
-                    self.estimate_mutation_scan(table, update.db.as_deref(), filter.as_ref());
+                    self.estimate_mutation_scan(table, update.db.as_deref(), filter.as_ref(), ctx);
                 EstimatedPlan::parent(scan.root.clone(), &[&scan])
             }
             Statement::Delete(delete) => {
@@ -1153,13 +1168,72 @@ impl Engine {
                             format!("table does not exist: {}", delete.table),
                         )
                     })?;
-                let filter = self.explain_dml_filter(table, delete.filter.as_ref())?;
+                let filter = self.explain_dml_filter(table, delete.filter.as_ref(), bindings)?;
                 let scan =
-                    self.estimate_mutation_scan(table, delete.db.as_deref(), filter.as_ref());
+                    self.estimate_mutation_scan(table, delete.db.as_deref(), filter.as_ref(), ctx);
                 EstimatedPlan::parent(scan.root.clone(), &[&scan])
             }
             _ => self.estimate_query_plan(&self.plan_explain_inner(inner)?, None),
         };
         Ok(plan.nodes)
+    }
+
+    fn estimate_explain_with_dml(&self, wq: &WithQuery) -> Result<Vec<PlanEstimate>> {
+        let (bindings, modes, primary_plan) = self.plan_explain_with_dml(wq)?;
+        let mut ctx = EstimateCteCtx {
+            modes: modes.clone(),
+            bodies: Vec::with_capacity(bindings.len()),
+        };
+        let mut definition_nodes = Vec::new();
+        let mut contribution = PlanEstimate::empty(0);
+        for (i, binding) in bindings.iter().enumerate() {
+            let body = match &binding.source {
+                CteSource::Query(query) => self.estimate_query_plan(query, Some(&ctx)),
+                CteSource::Dml(dm) => {
+                    let stmt = match &dm.stmt {
+                        DmStmt::Insert(v) => Statement::Insert((**v).clone()),
+                        DmStmt::Update(v) => Statement::Update((**v).clone()),
+                        DmStmt::Delete(v) => Statement::Delete((**v).clone()),
+                    };
+                    let nodes = self.estimate_explain_scoped(&stmt, &bindings[..i], Some(&ctx))?;
+                    EstimatedPlan {
+                        root: nodes[0].clone(),
+                        nodes,
+                    }
+                }
+            };
+            let mut cte_estimate = PlanEstimate::empty(body.root.rows);
+            if matches!(binding.source, CteSource::Dml(_))
+                || modes[i] == CteMode::Materialize && binding.refs.get() > 0
+            {
+                cte_estimate = body.root.clone();
+                contribution = contribution.add(&body.root);
+            }
+            definition_nodes.push(cte_estimate);
+            definition_nodes.extend(body.nodes.iter().cloned());
+            ctx.bodies.push(body);
+        }
+        let primary = if let Some(plan) = primary_plan {
+            self.estimate_query_plan(&plan, Some(&ctx))
+        } else {
+            let stmt = match &wq.body {
+                CteBody::Insert(v) => Statement::Insert((**v).clone()),
+                CteBody::Update(v) => Statement::Update((**v).clone()),
+                CteBody::Delete(v) => Statement::Delete((**v).clone()),
+                CteBody::Query(_) => unreachable!("a query primary was planned above"),
+            };
+            let nodes = self.estimate_explain_scoped(&stmt, &bindings, Some(&ctx))?;
+            EstimatedPlan {
+                root: nodes[0].clone(),
+                nodes,
+            }
+        };
+        let mut root = contribution.add(&primary.root);
+        root.rows = primary.root.rows;
+        root.logical_rows = primary.root.logical_rows;
+        let mut nodes = vec![root];
+        nodes.extend(definition_nodes);
+        nodes.extend(primary.nodes);
+        Ok(nodes)
     }
 }

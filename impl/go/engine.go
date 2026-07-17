@@ -19,6 +19,9 @@ import (
 // Every write — autocommit included — runs as a transaction, which unifies the two paths.
 type engine struct {
 	committed *snapshot
+	// explainActual is non-nil only while EXPLAIN ANALYZE executes its inner statement. Execution
+	// records exact operator sub-meter snapshots here; ordinary statements pay only this nil check.
+	explainActual *actualCostProfile
 	// session is the DEFAULT SESSION (spec/design/session.md §2.1): the per-connection state this
 	// handle runs statements through — the open transaction (the Idle/Open/Failed machine, §2.2),
 	// the relocated settings (maxCost/maxSQLLength/workMem, the entropy/clock seam), and the

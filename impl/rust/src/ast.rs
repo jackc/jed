@@ -32,13 +32,16 @@ pub enum Statement {
     Delete(Delete),
     /// `EXPLAIN [ANALYZE] <statement>` — render the planner's chosen plan for the inner statement
     /// instead of running it (spec/design/explain.md). `inner` is the wrapped statement, restricted
-    /// by the parser to a query (`SELECT` / set operation / read-only `WITH`) or a DML statement
+    /// by the parser to a query (`SELECT` / set operation / `WITH`, including writable `WITH`) or DML
     /// (`INSERT` / `UPDATE` / `DELETE`) — never DDL, transaction control, or a nested `EXPLAIN`.
     /// `analyze` true ⇒ EXPLAIN ANALYZE: the inner statement is executed and its actual accrued cost
     /// + row count reported on an `Analyze` root; false ⇒ the plan is rendered without executing the
     /// inner. Boxed to keep `Statement` small (the `With`/`SetOp` precedent).
     Explain {
         analyze: bool,
+        verbose: bool,
+        costs: bool,
+        lane: bool,
         inner: Box<Statement>,
     },
     /// `BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE]` / `START TRANSACTION [...]` — open an

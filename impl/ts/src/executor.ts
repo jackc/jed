@@ -381,6 +381,7 @@ import {
   countCteRefsDml,
   countTrue,
   cteDetail,
+  explainActualCosts,
   cteModes,
   cteSyntheticTable,
   cteSyntheticTableCols,
@@ -395,6 +396,7 @@ import {
   relOfIndex,
   renderBoundSrc,
   renderBoundTerms,
+  renderRExpr,
   resolvedTypeOf,
   resolvedTypeOfCol,
   rtName,
@@ -1055,6 +1057,12 @@ export class Engine {
   // convenience methods operate on it. newSession mints additional independent sessions (run
   // sequentially on this single-threaded handle by swapping into this slot for a call).
   session: SessionState;
+  // Non-null only while EXPLAIN ANALYZE executes its inner statement. Execution records exact
+  // operator sub-meter snapshots here; ordinary statements pay only this null check.
+  private explainActualProfile: Map<string, bigint[]> | null = null;
+  private explainActualFrames: { byNode: Map<string, bigint[]>; inclusive: bigint }[] = [];
+  private explainActualFolded: Map<string, bigint[]> = new Map();
+  private explainActualFoldSuppress = 0;
   // Persistence identity (spec/design/api.md §2): the backing file path (null for in-memory) and
   // the page size this database serializes with. The commit counter lives in `committed.txid`.
   path: string | null;
@@ -3691,7 +3699,12 @@ export class Engine {
     return { root, nodes: [root, ...definitionNodes, ...body.nodes] };
   }
 
-  private estimateMutationScan(table: Table, db: string | undefined, filter: RExpr | null): EstimatedPlan {
+  private estimateMutationScan(
+    table: Table,
+    db: string | undefined,
+    filter: RExpr | null,
+    ctx: EstimateCteContext | null,
+  ): EstimatedPlan {
     const rel: ScopeRel = { label: table.name.toLowerCase(), table, offset: 0, ...(db === undefined ? {} : { db }) };
     const scan = leafEstimatedPlan(this.estimateSelectedScan(rel, this.planMutationScan(db, table, filter).bound, filter));
     if (filter === null) return scan;
@@ -3700,27 +3713,80 @@ export class Engine {
     const local = Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n);
     local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(estimatorOperatorNodes(filter), scan.root.rows);
     const plan = wrapEstimatedPlan(scan, rows, logicalRows, local);
-    this.addExpressionSubqueries(plan.root, filter, scan.root.rows, null);
+    this.addExpressionSubqueries(plan.root, filter, scan.root.rows, ctx);
     plan.nodes[0] = plan.root;
     return plan;
   }
 
   private estimateExplain(inner: Statement): PlanEstimate[] {
+    if (inner.kind === "with" && withHasDml(inner)) return this.estimateExplainWithDml(inner);
+    return this.estimateExplainScoped(inner, [], null);
+  }
+
+  private estimateExplainScoped(
+    inner: Statement,
+    bindings: CteBinding[],
+    ctx: EstimateCteContext | null,
+  ): PlanEstimate[] {
     if (inner.kind === "insert") {
       if (this.lkpTableScoped(inner.db, inner.table) === undefined) throw engineError("undefined_table", "table does not exist: " + inner.table);
       const source = inner.source.kind === "select"
-        ? this.estimateQueryPlan(this.planQuery(inner.source.select, null, [], new ParamTypes()), null)
+        ? this.estimateQueryPlan(
+            this.planQuery(inner.source.select, null, bindings, new ParamTypes()),
+            ctx,
+          )
         : leafEstimatedPlan(emptyPlanEstimate(BigInt(inner.source.rows.length)));
       return parentEstimatedPlan(source.root, source).nodes;
     }
     if (inner.kind === "update" || inner.kind === "delete") {
       const table = this.lkpTableScoped(inner.db, inner.table);
       if (table === undefined) throw engineError("undefined_table", "table does not exist: " + inner.table);
-      const filter = this.explainDmlFilter(table, inner.filter);
-      const scan = this.estimateMutationScan(table, inner.db, filter);
+      const filter = this.explainDmlFilter(table, inner.filter, bindings);
+      const scan = this.estimateMutationScan(table, inner.db, filter, ctx);
       return parentEstimatedPlan(scan.root, scan).nodes;
     }
     return this.estimateQueryPlan(this.planExplainInner(inner), null).nodes;
+  }
+
+  private estimateExplainWithDml(wq: WithQuery): PlanEstimate[] {
+    const wp = this.planExplainWithDml(wq);
+    const ctx: EstimateCteContext = { bindings: wp.bindings, modes: wp.modes, bodies: [] };
+    const definitionNodes: PlanEstimate[] = [];
+    let contribution = emptyPlanEstimate();
+    for (let i = 0; i < wp.bindings.length; i++) {
+      const binding = wp.bindings[i]!;
+      const body = binding.source.kind === "query"
+        ? this.estimateQueryPlan(binding.source.plan, ctx)
+        : (() => {
+            const nodes = this.estimateExplainScoped(
+              binding.source.dm.stmt,
+              wp.bindings.slice(0, i),
+              ctx,
+            );
+            return { root: nodes[0]!, nodes };
+          })();
+      ctx.bodies.push(body);
+      let cteEstimate = emptyPlanEstimate(body.root.rows);
+      if (binding.source.kind === "dml" || (wp.modes[i] === "materialize" && binding.refs > 0)) {
+        cteEstimate = clonePlanEstimate(body.root);
+        contribution = addPlanEstimates(contribution, body.root);
+      }
+      definitionNodes.push(cteEstimate, ...body.nodes);
+    }
+    const primary = wp.primary !== null
+      ? this.estimateQueryPlan(wp.primary, ctx)
+      : (() => {
+          const nodes = this.estimateExplainScoped(
+            wp.body as Insert | Update | Delete,
+            wp.bindings,
+            ctx,
+          );
+          return { root: nodes[0]!, nodes };
+        })();
+    const root = addPlanEstimates(contribution, primary.root);
+    root.rows = primary.root.rows;
+    root.logicalRows = primary.root.logicalRows;
+    return [root, ...definitionNodes, ...primary.nodes];
   }
 
   // executeExplain plans the inner statement and renders the plan as a deterministic result set
@@ -3730,7 +3796,7 @@ export class Engine {
   // runs the inner statement.
   private executeExplain(ex: Explain, params: Value[]): Outcome {
     if (ex.analyze) {
-      return this.executeExplainAnalyze(ex.inner, params);
+      return this.executeExplainAnalyze(ex, params);
     }
     if (params.length > 0) {
       // Plain EXPLAIN renders the plan structurally (a $N bound source prints as "$N", not its bound
@@ -3742,8 +3808,9 @@ export class Engine {
       cost: planEstimateCost(estimate),
     }));
     const r = new ExplainRender(estimates);
+    r.verbose = ex.verbose;
     this.renderExplain(r, ex.inner, 0);
-    return this.explainOutcome(r.rows);
+    return this.explainOutcome(r.rows, ex);
   }
 
   // executeExplainAnalyze renders the plan AND runs the inner statement, reporting the inner's ACTUAL
@@ -3753,81 +3820,267 @@ export class Engine {
   // statement executes for real (a DML inner mutates, and the outer autocommit commits it — EXPLAIN
   // ANALYZE of a write IS a write, classified by stmtIsWrite). The EXPLAIN statement's OWN cost is one
   // rowProduced per emitted plan row (independent of the inner cost, which appears only in the root).
-  private executeExplainAnalyze(inner: Statement, params: Value[]): Outcome {
+  private executeExplainAnalyze(ex: Explain, params: Value[]): Outcome {
+    const inner = ex.inner;
     // Render the plan tree first (plan-only, no execution — pre-mutation).
     const estimates = this.estimateExplain(inner).map((estimate) => ({
       rows: estimate.rows,
       cost: planEstimateCost(estimate),
     }));
     const body = new ExplainRender(estimates);
+    body.verbose = ex.verbose;
     this.renderExplain(body, inner, 0);
     // Execute the inner statement for real, capturing its actual accrued cost + row count. Privileges
     // and the lifetime budget were already admitted on the EXPLAIN (dispatchStmt recurses into the
     // inner), and the write gate / commit are handled by the outer autocommit.
-    const innerOut = this.dispatchStmtBody(inner, params);
+    const profile = new Map<string, bigint[]>();
+    const previousProfile = this.explainActualProfile;
+    const previousFrames = this.explainActualFrames;
+    const previousFolded = this.explainActualFolded;
+    const previousFoldSuppress = this.explainActualFoldSuppress;
+    this.explainActualProfile = profile;
+    this.explainActualFrames = [];
+    this.explainActualFolded = new Map();
+    this.explainActualFoldSuppress = 0;
+    let innerOut: Outcome;
+    try {
+      innerOut = this.dispatchStmtBody(inner, params);
+    } finally {
+      this.explainActualProfile = previousProfile;
+      this.explainActualFrames = previousFrames;
+      this.explainActualFolded = previousFolded;
+      this.explainActualFoldSuppress = previousFoldSuppress;
+    }
     const actualRows =
       innerOut.kind === "statement"
         ? BigInt(innerOut.rowsAffected ?? 0) // a DML statement without RETURNING
         : BigInt(innerOut.rows.length);
+    body.setActualCosts(explainActualCosts(estimates, innerOut.cost));
+    const used = new Map<string, number>();
+    const cteUsed = new Map<string, number>();
+    let suppressedDepth: number | null = null;
+    for (const [index, row] of body.rows.entries()) {
+      if (suppressedDepth !== null) {
+        if (row.depth > suppressedDepth) continue;
+        suppressedDepth = null;
+      }
+      const key = this.explainActualKey(row.node, row.frameDepth);
+      const values = profile.get(key) ?? [];
+      const at = used.get(key) ?? 0;
+      if (at < values.length) {
+        if (index !== 0) row.actualCost = values[at]!;
+        // The rendered plan root already owns the exact whole-statement total.
+        used.set(key, at + 1);
+      }
+      if (row.node.startsWith("CTE ") && !row.node.startsWith("CTE Scan ")) {
+        const name = row.node.slice("CTE ".length);
+        const markerKey = this.explainActualKey("@cte-body " + name, row.frameDepth);
+        const markers = profile.get(markerKey) ?? [];
+        const markerAt = cteUsed.get(markerKey) ?? 0;
+        if (markerAt < markers.length) {
+          if (markers[markerAt] === 0n) suppressedDepth = row.depth;
+          cteUsed.set(markerKey, markerAt + 1);
+        }
+      }
+    }
     // Assemble: the Analyze root carries the actual figures; the plan tree sits one level deeper.
     const rootEstimate = estimates[0] ?? { rows: 0n, cost: 0n };
-    const r = new ExplainRender([rootEstimate]);
+    const r = new ExplainRender([rootEstimate], [innerOut.cost]);
     r.emit(0, "Analyze", `cost=${innerOut.cost} rows=${actualRows}`);
     for (const row of body.rows) {
       r.rows.push({ ...row, depth: row.depth + 1 });
     }
-    return this.explainOutcome(r.rows);
+    return this.explainOutcome(r.rows, ex);
+  }
+
+  private recordExplainActual(node: string, cost: bigint): void {
+    const target = this.explainActualFrames?.at(-1)?.byNode ?? this.explainActualProfile;
+    const key = this.explainActualKey(node, this.explainActualFrames?.length ?? 0);
+    const costs = target?.get(key) ?? [];
+    costs.push(cost);
+    target?.set(key, costs);
+  }
+
+  private recordExplainActualParent(node: string, cost: bigint): void {
+    const key = this.explainActualKey(node, this.explainActualFrames?.length ?? 0);
+    const frame = this.explainActualFrames?.at(-1);
+    if (frame !== undefined) {
+      const pending = this.explainActualFolded?.get(key) ?? [];
+      if (pending.length > 0) frame.inclusive += pending.shift()!;
+      cost += frame.inclusive;
+    }
+    const target = frame?.byNode ?? this.explainActualProfile;
+    const costs = target?.get(key) ?? [];
+    costs.unshift(cost);
+    target?.set(key, costs);
+  }
+
+  private explainActualKey(node: string, frame: number): string {
+    return `${frame}\u0000${node}`;
+  }
+
+  private recordExplainActualFolded(frame: number, node: string, cost: bigint): void {
+    if (this.explainActualProfile == null || this.explainActualFoldSuppress > 0 || cost === 0n) {
+      return;
+    }
+    this.explainActualFolded ??= new Map();
+    const key = this.explainActualKey(node, frame);
+    const costs = this.explainActualFolded.get(key) ?? [];
+    costs.push(cost);
+    this.explainActualFolded.set(key, costs);
+  }
+
+  private beginExplainActualFrame(): void {
+    if (this.explainActualProfile != null) {
+      this.explainActualFrames ??= [];
+      this.explainActualFrames.push({ byNode: new Map(), inclusive: 0n });
+    }
+  }
+
+  private endExplainActualFrame(): void {
+    const frame = this.explainActualFrames?.pop();
+    if (frame === undefined) return;
+    const target = this.explainActualFrames?.at(-1)?.byNode ?? this.explainActualProfile;
+    if (target === null) return;
+    for (const [node, costs] of frame.byNode) {
+      target.set(node, [...(target.get(node) ?? []), ...costs]);
+    }
+  }
+
+  private discardExplainActualFrame(): void {
+    this.explainActualFrames?.pop();
   }
 
   // explainOutcome wraps rendered plan rows as a query Outcome, charging the EXPLAIN's own cost — one
   // rowProduced per emitted plan row (a deterministic function of the plan-row count).
-  private explainOutcome(rows: ExplainRow[]): Outcome {
+  private explainOutcome(rows: ExplainRow[], ex: Explain): Outcome {
     const meter = this.session.newMeter();
     meter.charge(COSTS.rowProduced * BigInt(rows.length));
+    const columnNames = ["depth", "node", "detail"];
+    const columnTypes = ["i32", "text", "text"];
+    if (ex.costs) {
+      columnNames.push("est_rows", "est_cost");
+      columnTypes.push("i64", "i64");
+    }
+    if (ex.analyze) {
+      columnNames.push("actual_cost");
+      columnTypes.push("i64");
+    }
+    if (ex.lane) {
+      columnNames.push("lane");
+      columnTypes.push("text");
+    }
+    const lane = ex.lane ? this.explainLane(ex.inner) : "";
     return {
       kind: "query",
-      columnNames: ["depth", "node", "detail", "est_rows", "est_cost"],
-      columnTypes: ["i32", "text", "text", "i64", "i64"],
-      rows: rows.map((row) => [
-        intValue(BigInt(row.depth)),
-        textValue(row.node),
-        textValue(row.detail),
-        intValue(row.estRows),
-        intValue(row.estCost),
-      ]),
+      columnNames,
+      columnTypes,
+      rows: rows.map((row) => {
+        const out = [intValue(BigInt(row.depth)), textValue(row.node), textValue(row.detail)];
+        if (ex.costs) out.push(intValue(row.estRows), intValue(row.estCost));
+        if (ex.analyze) out.push(intValue(row.actualCost));
+        if (ex.lane) out.push(textValue(lane));
+        return out;
+      }),
       cost: meter.accrued,
     };
+  }
+
+  private explainLane(inner: Statement): "streaming" | "buffered" | "deferred" {
+    // Public Query classifies writes before either lazy lane. Sequence-mutating SELECTs and a
+    // top-level WITH containing DML therefore use the buffered write dispatcher regardless of shape.
+    if (stmtIsWrite(inner)) return "buffered";
+    if (inner.kind === "with" || inner.kind === "setOp") return "deferred";
+    if (inner.kind === "select") {
+      const plan = this.planExplainInner(inner);
+      if (plan.kind === "select" && pullStreamingScanEligible(plan)) return "streaming";
+    }
+    return "buffered";
   }
 
   // renderExplain renders the plan for the inner statement (spec/design/explain.md). A DML statement is
   // rendered by explainInsert/explainUpdate/explainDelete (plan-only — never executing, so an EXPLAIN of
   // a DELETE deletes nothing); a read query is planned by planExplainInner and walked by renderQueryPlan.
-  private renderExplain(r: ExplainRender, inner: Statement, depth: number): void {
+  private renderExplain(
+    r: ExplainRender,
+    inner: Statement,
+    depth: number,
+    bindings: CteBinding[] = [],
+  ): void {
     switch (inner.kind) {
       case "insert":
-        this.explainInsert(r, inner, depth);
+        this.explainInsert(r, inner, depth, bindings);
         return;
       case "update":
-        this.explainUpdate(r, inner, depth);
+        this.explainUpdate(r, inner, depth, bindings);
         return;
       case "delete":
-        this.explainDelete(r, inner, depth);
+        this.explainDelete(r, inner, depth, bindings);
         return;
+      case "with":
+        if (withHasDml(inner)) {
+          this.renderExplainWithDml(r, inner, depth);
+          return;
+        }
       default:
-        this.renderQueryPlan(r, this.planExplainInner(inner), depth);
+        {
+          const plan = this.planExplainInner(inner);
+          // A top-level pure WITH is orchestrated directly by runWith rather than execQueryPlan.
+          // Its wrapper is frame 0; only CTE/body query plans open execution frames.
+          if (inner.kind === "with" && plan.kind === "with") this.renderWithPlan(r, plan, depth);
+          else this.renderQueryPlan(r, plan, depth);
+        }
     }
+  }
+
+  private planExplainWithDml(wq: WithQuery): {
+    bindings: CteBinding[];
+    modes: CteMode[];
+    primary: QueryPlan | null;
+    body: CteBody;
+  } {
+    const ptypes = new ParamTypes();
+    const bindings = this.planCteBindings(wq.ctes, wq.recursive, ptypes);
+    const query = cteBodyAsQuery(wq.body);
+    const primary = query === null ? null : this.planQuery(query, null, bindings, ptypes);
+    for (const cte of wq.ctes) {
+      if (!cteBodyIsDataModifying(cte.body)) continue;
+      for (const binding of bindings) binding.refs += countCteRefsDml(cte.body, binding.name);
+    }
+    if (cteBodyIsDataModifying(wq.body)) {
+      for (const binding of bindings) binding.refs += countCteRefsDml(wq.body, binding.name);
+    }
+    return { bindings, modes: cteModes(bindings), primary, body: wq.body };
+  }
+
+  private renderExplainWithDml(r: ExplainRender, wq: WithQuery, depth: number): void {
+    const plan = this.planExplainWithDml(wq);
+    r.emit(depth, "WITH", `ctes=${plan.bindings.length}`);
+    for (let i = 0; i < plan.bindings.length; i++) {
+      const binding = plan.bindings[i]!;
+      r.emit(depth + 1, "CTE " + binding.name, cteDetail(binding, plan.modes[i]!));
+      if (binding.source.kind === "query") this.renderQueryPlan(r, binding.source.plan, depth + 2);
+      else this.renderExplain(r, binding.source.dm.stmt, depth + 2, plan.bindings.slice(0, i));
+    }
+    if (plan.primary !== null) this.renderQueryPlan(r, plan.primary, depth + 1);
+    else this.renderExplain(r, plan.body as Insert | Update | Delete, depth + 1, plan.bindings);
   }
 
   // explainInsert renders an INSERT plan: the Insert root (with an ON CONFLICT note), then the row
   // source — a planned SELECT subtree (INSERT … SELECT) or a Values leaf (INSERT … VALUES). It resolves
   // the source but never writes.
-  private explainInsert(r: ExplainRender, ins: Insert, depth: number): void {
+  private explainInsert(
+    r: ExplainRender,
+    ins: Insert,
+    depth: number,
+    bindings: CteBinding[],
+  ): void {
     if (this.lkpTable(ins.table) === undefined) {
       throw engineError("undefined_table", "table does not exist: " + ins.table);
     }
     r.emit(depth, "Insert " + ins.table, insertDetail(ins));
     if (ins.source.kind === "select") {
-      const plan = this.planQuery(ins.source.select, null, [], new ParamTypes());
+      const plan = this.planQuery(ins.source.select, null, bindings, new ParamTypes());
       this.renderQueryPlan(r, plan, depth + 1);
       return;
     }
@@ -3837,52 +4090,149 @@ export class Engine {
   // explainUpdate renders an UPDATE plan: the Update root (with the assignment count), the residual
   // Filter, then the target scan with its chosen access path. It resolves the WHERE and the scan bound
   // via the same detectors the executor uses, but never writes.
-  private explainUpdate(r: ExplainRender, upd: Update, depth: number): void {
+  private explainUpdate(
+    r: ExplainRender,
+    upd: Update,
+    depth: number,
+    bindings: CteBinding[],
+  ): void {
     const table = this.lkpTable(upd.table);
     if (table === undefined) {
       throw engineError("undefined_table", "table does not exist: " + upd.table);
     }
-    const filter = this.explainDmlFilter(table, upd.filter);
+    const filter = this.explainDmlFilter(table, upd.filter, bindings);
     r.emit(depth, "Update " + upd.table, `sets=${upd.assignments.length}`);
-    this.renderDmlScan(r, table, upd.table, filter, depth + 1);
+    this.renderDmlScan(
+      r,
+      table,
+      upd.table,
+      filter,
+      this.explainUpdateTouched(table, upd, filter, bindings),
+      depth + 1,
+    );
   }
 
   // explainDelete renders a DELETE plan: the Delete root, the residual Filter, then the target scan
   // with its chosen access path. It resolves the WHERE and the scan bound but never writes.
-  private explainDelete(r: ExplainRender, del: Delete, depth: number): void {
+  private explainDelete(
+    r: ExplainRender,
+    del: Delete,
+    depth: number,
+    bindings: CteBinding[],
+  ): void {
     const table = this.lkpTable(del.table);
     if (table === undefined) {
       throw engineError("undefined_table", "table does not exist: " + del.table);
     }
-    const filter = this.explainDmlFilter(table, del.filter);
+    const filter = this.explainDmlFilter(table, del.filter, bindings);
     r.emit(depth, "Delete " + del.table, "-");
-    this.renderDmlScan(r, table, del.table, filter, depth + 1);
+    this.renderDmlScan(
+      r,
+      table,
+      del.table,
+      filter,
+      this.explainDeleteTouched(table, del, filter, bindings),
+      depth + 1,
+    );
   }
 
   // explainDmlFilter resolves an UPDATE/DELETE WHERE predicate against a single-table scope (the same
   // prologue the executors use), or returns null for a bare (no-WHERE) statement.
-  private explainDmlFilter(table: Table, where: Expr | null): RExpr | null {
+  private explainDmlFilter(
+    table: Table,
+    where: Expr | null,
+    bindings: CteBinding[],
+  ): RExpr | null {
     if (where === null) return null;
-    return resolveBooleanFilter(Scope.single(this, table), where, new ParamTypes());
+    const scope = Scope.single(this, table);
+    scope.ctes = bindings;
+    return resolveBooleanFilter(scope, where, new ParamTypes());
   }
 
   // renderDmlScan emits the residual Filter (when present) and the target Scan for an UPDATE/DELETE,
   // choosing the access path with the SAME detectors the executor uses (PK bound, then GIN, then GiST —
-  // UPDATE/DELETE do not use secondary B-tree index bounds, indexes.md §5). The touched-set count is a
-  // DML cost detail left to EXPLAIN ANALYZE, so it is not shown here.
+  // UPDATE/DELETE do not use secondary B-tree index bounds, indexes.md §5). The scan detail also
+  // reports the statement's resolved touched-set width.
   private renderDmlScan(
     r: ExplainRender,
     table: Table,
     name: string,
     filter: RExpr | null,
+    mask: boolean[],
     depth: number,
   ): void {
     let d = depth;
     if (filter !== null) {
-      r.emit(d, "Filter", `conjuncts=${conjunctCount(filter)}`);
+      r.emit(
+        d,
+        "Filter",
+        r.verbose ? `filter=${renderRExpr(filter)}` : `conjuncts=${conjunctCount(filter)}`,
+      );
       d++;
     }
-    r.emit(d, "Scan " + name, this.scanDetail(name, this.dmlScanBound(table, filter), false, null));
+    r.emit(d, "Scan " + name, this.scanDetail(name, this.dmlScanBound(table, filter), false, mask));
+  }
+
+  private explainDeleteTouched(
+    table: Table,
+    del: Delete,
+    filter: RExpr | null,
+    bindings: CteBinding[],
+  ): boolean[] {
+    const mask = new Array<boolean>(table.columns.length).fill(false);
+    if (filter !== null) collectTouched(filter, 0, mask);
+    if (del.returning !== null) {
+      const ret = this.resolveReturning(table, del.returning, true, bindings, new ParamTypes());
+      const retMask = new Array<boolean>(2 * mask.length).fill(false);
+      for (const node of ret.nodes) collectTouched(node, 0, retMask);
+      for (let i = 0; i < mask.length; i++) mask[i] ||= retMask[i]!;
+    }
+    return mask;
+  }
+
+  private explainUpdateTouched(
+    table: Table,
+    upd: Update,
+    filter: RExpr | null,
+    bindings: CteBinding[],
+  ): boolean[] {
+    const mask = new Array<boolean>(table.columns.length).fill(false);
+    if (filter !== null) collectTouched(filter, 0, mask);
+    const scope = Scope.single(this, table);
+    scope.ctes = bindings;
+    const ptypes = new ParamTypes();
+    const assigned = new Array<boolean>(mask.length).fill(false);
+    for (const assignment of upd.assignments) {
+      const idx = columnIndex(table, assignment.column);
+      if (idx < 0) throw engineError("undefined_column", "column does not exist: " + assignment.column);
+      assigned[idx] = true;
+      if (assignment.isDefault) continue;
+      const col = table.columns[idx]!;
+      const source = col.type.kind === "scalar"
+        ? resolve(
+            scope,
+            assignment.value,
+            col.type.scalar,
+            { collecting: false, groupKeys: [], specs: [] },
+            ptypes,
+          ).node
+        : resolveContainerAssign(
+            scope,
+            col,
+            assignment.value,
+            { collecting: false, groupKeys: [], specs: [] },
+            ptypes,
+          );
+      collectTouched(source, 0, mask);
+    }
+    if (upd.returning !== null) {
+      const ret = this.resolveReturning(table, upd.returning, false, bindings, ptypes);
+      const n = mask.length;
+      const retMask = new Array<boolean>(2 * n).fill(false);
+      for (const node of ret.nodes) collectTouched(node, 0, retMask);
+      for (let i = 0; i < n; i++) mask[i] ||= retMask[n + i]! || (retMask[i]! && !assigned[i]);
+    }
+    return mask;
   }
 
   // dmlScanBound is EXPLAIN's compatibility wrapper over the typed mutation physical plan used by
@@ -3931,10 +4281,9 @@ export class Engine {
       case "with": {
         const body = cteBodyAsQuery(inner.body);
         if (body === null) {
-          // A data-modifying primary (writable CTE) — a DML EXPLAIN, handled in a later slice.
           throw engineError(
             "feature_not_supported",
-            "EXPLAIN of a data-modifying WITH is not yet supported",
+            "writable WITH requires the DML EXPLAIN renderer",
           );
         }
         return this.planWithExpr(
@@ -3954,18 +4303,23 @@ export class Engine {
   // renderQueryPlan walks a QueryPlan arm at the given depth: a SELECT plan, a set operation, a VALUES
   // relation, or a WITH plan.
   private renderQueryPlan(r: ExplainRender, qp: QueryPlan, depth: number): void {
-    switch (qp.kind) {
-      case "select":
-        this.renderSelectPlan(r, qp, depth);
-        return;
-      case "setOp":
-        this.renderSetOpPlan(r, qp, depth);
-        return;
-      case "values":
-        r.emit(depth, "Values", `rows=${qp.rows.length}`);
-        return;
-      case "with":
-        this.renderWithPlan(r, qp, depth);
+    r.frameDepth++;
+    try {
+      switch (qp.kind) {
+        case "select":
+          this.renderSelectPlan(r, qp, depth);
+          return;
+        case "setOp":
+          this.renderSetOpPlan(r, qp, depth);
+          return;
+        case "values":
+          r.emit(depth, "Values", `rows=${qp.rows.length}`);
+          return;
+        case "with":
+          this.renderWithPlan(r, qp, depth);
+      }
+    } finally {
+      r.frameDepth--;
     }
   }
 
@@ -3975,6 +4329,7 @@ export class Engine {
   // the order is NOT elided; an elided ORDER BY (served by the scan / index / join order) is instead
   // noted on the FROM tree's top node (spec/design/explain.md §5).
   private renderSelectPlan(r: ExplainRender, sp: SelectPlan, depth: number): void {
+    const start = r.rows.length;
     let d = depth;
     if (sp.limit !== null || sp.offset !== null) {
       r.emit(d, "Limit", limitDetail(sp.limit, sp.offset));
@@ -4005,14 +4360,23 @@ export class Engine {
       d++;
     }
     if (sp.isAgg) {
-      r.emit(d, "Aggregate", aggDetail(sp));
+      r.emit(d, "Aggregate", aggDetail(sp, r.verbose));
       d++;
     }
     if (sp.filter !== null) {
-      r.emit(d, "Filter", `conjuncts=${conjunctCount(sp.filter)}`);
+      r.emit(
+        d,
+        "Filter",
+        r.verbose ? `filter=${renderRExpr(sp.filter)}` : `conjuncts=${conjunctCount(sp.filter)}`,
+      );
       d++;
     }
     this.renderFrom(r, sp, d, orderNote);
+    if (r.verbose && r.rows.length > start) {
+      const output = `output=[${sp.projections.map(renderRExpr).join(", ")}]`;
+      const row = r.rows[start]!;
+      row.detail = row.detail === "-" ? output : `${row.detail}; ${output}`;
+    }
   }
 
   // renderFrom emits the FROM tree: a left-deep chain of physical joins over the plan's relations,
@@ -4052,8 +4416,8 @@ export class Engine {
     const j = sp.joins[n - 2]!;
     const isHash = n === 2 && sp.phys.hashJoin !== null;
     const detail = isHash
-      ? `${j.kind}; keys=${sp.phys.hashJoin!.keys.length}; on:conjuncts=${j.on === null ? 0 : conjunctCount(j.on)}`
-      : joinDetail(j);
+      ? `${j.kind}; keys=${sp.phys.hashJoin!.keys.length}${j.on === null ? "" : r.verbose ? `; on=${renderRExpr(j.on)}` : `; on:conjuncts=${conjunctCount(j.on)}`}`
+      : joinDetail(j, r.verbose);
     r.emit(depth, isHash ? "Hash Join" : "Nested Loop", withNote(detail, note));
     if (n === 2 && sp.phys.relationOrder.length === 2) {
       this.renderRelLeaf(r, sp, sp.phys.relationOrder[0]!, depth + 1, "");
@@ -4076,10 +4440,9 @@ export class Engine {
       return;
     }
     const step = sp.phys.joinSteps[n - 2]!;
-    const conjuncts = step.onIndices.reduce((total, index) => {
-      const on = sp.joins[index]!.on;
-      return total + (on === null ? 0 : conjunctCount(on));
-    }, 0);
+    const ons = step.onIndices
+      .map((index) => sp.joins[index]!.on)
+      .filter((on): on is RExpr => on !== null);
     const kind = step.onIndices.reduce<JoinKind>((current, index) => {
       const candidate = sp.joins[index]!.kind;
       return candidate === "left" || candidate === "right" || candidate === "full"
@@ -4087,14 +4450,24 @@ export class Engine {
         : current;
     }, step.onIndices.length === 0 ? "cross" : "inner");
     let detail: string = kind;
-    if (step.onIndices.length === 1) detail = `${kind}; on:conjuncts=${conjuncts}`;
-    else if (step.onIndices.length > 1)
-      detail = `${kind}; on:predicates=${step.onIndices.length},conjuncts=${conjuncts}`;
+    if (!r.verbose && ons.length > 0) {
+      const conjuncts = ons.reduce((n, on) => n + conjunctCount(on), 0);
+      detail = ons.length === 1
+        ? `${kind}; on:conjuncts=${conjuncts}`
+        : `${kind}; on:predicates=${ons.length},conjuncts=${conjuncts}`;
+    } else if (ons.length === 1) detail = `${kind}; on=${renderRExpr(ons[0]!)}`;
+    else if (ons.length > 1) detail = `${kind}; on=[${ons.map(renderRExpr).join(", ")}]`;
     if (step.hashJoin !== null) {
-      detail =
-        step.onIndices.length === 1
-          ? `${kind}; keys=${step.hashJoin.keys.length}; on:conjuncts=${conjuncts}`
-          : `${kind}; keys=${step.hashJoin.keys.length}; on:predicates=${step.onIndices.length},conjuncts=${conjuncts}`;
+      const onDetail = ons.length === 0
+        ? ""
+        : !r.verbose
+        ? ons.length === 1
+          ? `; on:conjuncts=${conjunctCount(ons[0]!)}`
+          : `; on:predicates=${ons.length},conjuncts=${ons.reduce((n, on) => n + conjunctCount(on), 0)}`
+        : ons.length === 1
+        ? `; on=${renderRExpr(ons[0]!)}`
+        : `; on=[${ons.map(renderRExpr).join(", ")}]`;
+      detail = `${kind}; keys=${step.hashJoin.keys.length}${onDetail}`;
     }
     r.emit(depth, step.hashJoin === null ? "Nested Loop" : "Hash Join", withNote(detail, note));
     this.renderNWayJoinTree(r, sp, n - 1, depth + 1, "");
@@ -5239,7 +5612,7 @@ export class Engine {
     return {
       params: [],
       outer: [],
-      runSubquery: (p, o) => this.execQueryPlan(p, o, [], EMPTY_CTE_CTX),
+      runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, [], EMPTY_CTE_CTX),
       seam: this.session.seam,
       rng,
       ctes: EMPTY_CTE_CTX,
@@ -5374,7 +5747,7 @@ export class Engine {
     const env: EvalEnv = {
       params: [],
       outer: [],
-      runSubquery: (p, o) => this.execQueryPlan(p, o, [], EMPTY_CTE_CTX),
+      runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, [], EMPTY_CTE_CTX),
       seam: this.session.seam,
       rng,
       ctes: EMPTY_CTE_CTX,
@@ -8889,7 +9262,7 @@ export class Engine {
         const env: EvalEnv = {
           params: [],
           outer: [],
-          runSubquery: (p, o) => this.execQueryPlan(p, o, [], EMPTY_CTE_CTX),
+          runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, [], EMPTY_CTE_CTX),
           seam: this.session.seam,
           rng,
           ctes: EMPTY_CTE_CTX,
@@ -9107,7 +9480,7 @@ export class Engine {
       const checkEnv: EvalEnv = {
         params: [],
         outer: [],
-        runSubquery: (p, o) => this.execQueryPlan(p, o, [], EMPTY_CTE_CTX),
+        runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, [], EMPTY_CTE_CTX),
         seam: this.session.seam,
         rng,
         ctes: EMPTY_CTE_CTX,
@@ -9489,7 +9862,7 @@ export class Engine {
     const checkEnv = (): EvalEnv => ({
       params: [],
       outer: [],
-      runSubquery: (p, o) => this.execQueryPlan(p, o, [], EMPTY_CTE_CTX),
+      runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, [], EMPTY_CTE_CTX),
       seam: this.session.seam,
       rng,
       ctes: EMPTY_CTE_CTX,
@@ -9582,7 +9955,7 @@ export class Engine {
       const env: EvalEnv = {
         params,
         outer: [],
-        runSubquery: (p, o) => this.execQueryPlan(p, o, params, EMPTY_CTE_CTX),
+        runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, EMPTY_CTE_CTX),
         seam: this.session.seam,
         rng,
         ctes: EMPTY_CTE_CTX,
@@ -9833,7 +10206,7 @@ export class Engine {
     const env: EvalEnv = {
       params,
       outer: [],
-      runSubquery: (p, o) => this.execQueryPlan(p, o, params, ctes),
+      runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, ctes),
       seam: this.session.seam,
       rng: new StmtRng(),
       ctes,
@@ -9905,7 +10278,7 @@ export class Engine {
     const env: EvalEnv = {
       params: bound,
       outer: [],
-      runSubquery: (p, o) => this.execQueryPlan(p, o, bound, ctx),
+      runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, bound, ctx),
       seam: this.session.seam,
       rng: new StmtRng(),
       ctes: ctx,
@@ -9938,6 +10311,7 @@ export class Engine {
     // storageRowRead per scanned row.
     // A host-attached target full-scans this slice (attached-databases.md §8) — a bounded scan would
     // resolve its index store through the unscoped funnel. The whole WHERE stays the residual filter.
+    const scanBefore = meter.accrued;
     const scan = this.executeMutationScan(
       this.planMutationScan(del.db, table, filter),
       del.table,
@@ -9947,23 +10321,37 @@ export class Engine {
       meter,
       mask,
     );
-    if (scan.empty)
+    let scanActual = meter.accrued - scanBefore;
+    if (scan.empty) {
+      this.recordExplainActual("Scan " + del.table, scanActual);
+      if (filter !== null) this.recordExplainActual("Filter", scanActual);
       return dmlOutcome(ret?.names ?? null, ret?.types ?? null, null, 0, meter.accrued); // empty bound
-    meter.charge(COSTS.pageRead * BigInt(scan.pages) + COSTS.valueDecompress * BigInt(scan.slabs));
+    }
+    const blockCost = COSTS.pageRead * BigInt(scan.pages) + COSTS.valueDecompress * BigInt(scan.slabs);
+    meter.charge(blockCost);
+    scanActual += blockCost;
+    let filterActual = scanActual;
     for (const e of scan.entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       // A WHERE arithmetic can throw (22003/22012); the throw propagates naturally.
       meter.charge(COSTS.storageRowRead);
+      scanActual += COSTS.storageRowRead;
+      filterActual += COSTS.storageRowRead;
       // Materialize the filter's columns if the lazy load left them unfetched — exactly the
       // touched set the block above charged (large-values.md §14).
       const row = store.resolveColumns(e.row, mask);
-      if (filter === null || isTrue(evalExpr(filter, row, env, meter))) {
+      const beforeFilter = meter.accrued;
+      const keep = filter === null || isTrue(evalExpr(filter, row, env, meter));
+      filterActual += meter.accrued - beforeFilter;
+      if (keep) {
         // The FK parent-side probe + index-entry removal below read this row's key/index columns
         // directly; resolve its inline-deferred values (lazy-record.md §5b — a key column is always
         // inline, so cost-free) so those paths see resident values.
         matched.push({ key: e.key, row: store.resolveInlineColumns(row) });
       }
     }
+    this.recordExplainActual("Scan " + del.table, scanActual);
+    if (filter !== null) this.recordExplainActual("Filter", filterActual);
 
     // FOREIGN KEY parent-side (constraints.md §6.5): a DELETE must not strand a child. For each
     // inbound FK, every deleted row's referenced tuple disappears (the referenced columns are
@@ -10213,7 +10601,7 @@ export class Engine {
     const env: EvalEnv = {
       params: bound,
       outer: [],
-      runSubquery: (p, o) => this.execQueryPlan(p, o, bound, ctx),
+      runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, bound, ctx),
       seam: this.session.seam,
       rng: new StmtRng(),
       ctes: ctx,
@@ -10253,6 +10641,7 @@ export class Engine {
     // storageRowRead per scanned row.
     // A host-attached target full-scans this slice (attached-databases.md §8) — a bounded scan would
     // resolve its index store through the unscoped funnel. The whole WHERE stays the residual filter.
+    const scanBefore = meter.accrued;
     const scan = this.executeMutationScan(
       this.planMutationScan(upd.db, table, filter),
       upd.table,
@@ -10262,16 +10651,30 @@ export class Engine {
       meter,
       mask,
     );
-    if (scan.empty)
+    let scanActual = meter.accrued - scanBefore;
+    if (scan.empty) {
+      this.recordExplainActual("Scan " + upd.table, scanActual);
+      if (filter !== null) this.recordExplainActual("Filter", scanActual);
       return dmlOutcome(ret?.names ?? null, ret?.types ?? null, null, 0, meter.accrued); // empty bound
-    meter.charge(COSTS.pageRead * BigInt(scan.pages) + COSTS.valueDecompress * BigInt(scan.slabs));
+    }
+    const blockCost = COSTS.pageRead * BigInt(scan.pages) + COSTS.valueDecompress * BigInt(scan.slabs);
+    meter.charge(blockCost);
+    scanActual += blockCost;
+    let filterActual = scanActual;
     for (const e of scan.entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       meter.charge(COSTS.storageRowRead);
+      scanActual += COSTS.storageRowRead;
+      filterActual += COSTS.storageRowRead;
       // Materialize the filter's + assignment sources' columns if the lazy load left them
       // unfetched — exactly the touched set the block above charged (large-values.md §14).
       const filtered = store.resolveColumns(e.row, mask);
-      if (filter !== null && !isTrue(evalExpr(filter, filtered, env, meter))) continue;
+      if (filter !== null) {
+        const beforeFilter = meter.accrued;
+        const keep = isTrue(evalExpr(filter, filtered, env, meter));
+        filterActual += meter.accrued - beforeFilter;
+        if (!keep) continue;
+      }
       // The OLD row is retained for index-entry removal (its key/index columns are read directly
       // below); resolve its inline-deferred values (lazy-record.md §5b — a key column is always
       // inline, so cost-free) so that maintenance sees resident values.
@@ -10299,6 +10702,8 @@ export class Engine {
       const newKey = pkChanged ? encodePkKey(table, pkMembers, colls, resident) : e.key;
       updates.push({ key: e.key, newKey, row: resident, oldRow: row });
     }
+    this.recordExplainActual("Scan " + upd.table, scanActual);
+    if (filter !== null) this.recordExplainActual("Filter", filterActual);
 
     // PRIMARY KEY end-state validation for a re-keying UPDATE (the storage key changed): like
     // UNIQUE (indexes.md §8) this is an END-STATE check — the new keys must be distinct from each
@@ -10796,7 +11201,9 @@ export class Engine {
     const subqueryCost = { value: 0n };
     this.foldUncorrelatedInPlan(plan, bound, ctx, subqueryCost);
     const r = this.execQueryPlan(plan, [], bound, ctx);
-    return { ...r, cost: r.cost + subqueryCost.value + totalCost };
+    const result = { ...r, cost: r.cost + subqueryCost.value + totalCost };
+    this.recordExplainActualParent("WITH", result.cost);
+    return result;
   }
 
   // materializeCtes materializes each CTE once, in list order (spec/design/cte.md §3) — the shared
@@ -10812,6 +11219,14 @@ export class Engine {
     const totalCost = { value: 0n };
     const buffers: Row[][] = [];
     for (let i = 0; i < bindings.length; i++) {
+      const before = totalCost.value;
+      const binding = bindings[i]!;
+      const bodyVisible =
+        binding.refs > 0 ||
+        binding.recursive !== null ||
+        binding.source.kind === "dml" ||
+        modes[i] === "materialize";
+      this.recordExplainActual("@cte-body " + binding.name, bodyVisible ? 1n : 0n);
       const rt = bindings[i]!.recursive;
       let buf: Row[];
       if (rt) {
@@ -10836,6 +11251,7 @@ export class Engine {
         buf = [];
       }
       buffers.push(buf);
+      this.recordExplainActualParent("CTE " + bindings[i]!.name, totalCost.value - before);
     }
     return { buffers, totalCost: totalCost.value };
   }
@@ -10984,6 +11400,14 @@ export class Engine {
     const totalCost = { value: 0n };
     const buffers: Row[][] = [];
     for (let i = 0; i < bindings.length; i++) {
+      const before = totalCost.value;
+      const binding = bindings[i]!;
+      const bodyVisible =
+        binding.refs > 0 ||
+        binding.recursive !== null ||
+        binding.source.kind === "dml" ||
+        modes[i] === "materialize";
+      this.recordExplainActual("@cte-body " + binding.name, bodyVisible ? 1n : 0n);
       const rt = bindings[i]!.recursive;
       let buf: Row[];
       if (rt) {
@@ -11014,6 +11438,7 @@ export class Engine {
         buf = [];
       }
       buffers.push(buf);
+      this.recordExplainActualParent("CTE " + bindings[i]!.name, totalCost.value - before);
     }
 
     // (4) Execute the primary against the full CTE context, adding the materialization cost.
@@ -11038,7 +11463,15 @@ export class Engine {
     } else {
       outcome = this.executeDelete(body, params, ctx);
     }
-    return addOutcomeCost(outcome, totalCost.value);
+    if (body.kind === "insert")
+      this.recordExplainActual("Insert " + body.table, outcome.cost);
+    else if (body.kind === "update")
+      this.recordExplainActual("Update " + body.table, outcome.cost);
+    else if (body.kind === "delete")
+      this.recordExplainActual("Delete " + body.table, outcome.cost);
+    outcome = addOutcomeCost(outcome, totalCost.value);
+    this.recordExplainActualParent("WITH", outcome.cost);
+    return outcome;
   }
 
   // execDmCte executes a data-modifying CTE (spec/design/writable-cte.md §3): run the
@@ -11064,6 +11497,10 @@ export class Engine {
     } else {
       outcome = this.executeDelete(stmt, params, ctx);
     }
+    this.recordExplainActual(
+      `${stmt.kind === "insert" ? "Insert" : stmt.kind === "update" ? "Update" : "Delete"} ${stmt.table}`,
+      outcome.cost,
+    );
     if (outcome.kind === "query") {
       return { rows: outcome.rows, cost: outcome.cost };
     }
@@ -11123,10 +11560,31 @@ export class Engine {
     params: Value[],
     ctes: CteCtx,
   ): SelectResult {
-    if (plan.kind === "select") return this.execSelectPlan(plan, outer, params, ctes);
-    if (plan.kind === "values") return this.execValuesPlan(plan, outer, params, ctes);
-    if (plan.kind === "with") return this.execWithPlan(plan, outer, params);
-    return this.execSetOpPlan(plan, outer, params, ctes);
+    this.beginExplainActualFrame();
+    try {
+      if (plan.kind === "select") return this.execSelectPlan(plan, outer, params, ctes);
+      if (plan.kind === "values") return this.execValuesPlan(plan, outer, params, ctes);
+      if (plan.kind === "with") return this.execWithPlan(plan, outer, params);
+      return this.execSetOpPlan(plan, outer, params, ctes);
+    } finally {
+      this.endExplainActualFrame();
+    }
+  }
+
+  // Execute an expression subquery whose operators are not rendered as separate EXPLAIN rows. Its
+  // returned cost still accrues into the containing visible operator checkpoint.
+  private execHiddenQueryPlan(
+    plan: QueryPlan,
+    outer: Row[],
+    params: Value[],
+    ctes: CteCtx,
+  ): SelectResult {
+    this.beginExplainActualFrame();
+    try {
+      return this.execQueryPlan(plan, outer, params, ctes);
+    } finally {
+      this.discardExplainActualFrame();
+    }
   }
 
   // execWithPlan executes a nested WITH plan (spec/design/cte.md §7): materialize its CTE bindings
@@ -11144,6 +11602,7 @@ export class Engine {
     };
     const r = this.execQueryPlan(plan.body, outer, params, ctx);
     r.cost += totalCost;
+    this.recordExplainActualParent("WITH", r.cost);
     return r;
   }
 
@@ -11218,15 +11677,25 @@ export class Engine {
 
     let rows = combineSetop(plan.op, plan.all, left.rows, right.rows);
     const cost = left.cost + right.cost;
+    const rootNode =
+      plan.limit !== null || plan.offset !== null
+        ? "Limit"
+        : plan.order.length > 0
+          ? "Sort"
+          : setOpNodeName(plan.op);
+    if (rootNode !== setOpNodeName(plan.op))
+      this.recordExplainActualParent(setOpNodeName(plan.op), cost);
 
     if (plan.order.length > 0) {
       sortRows(rows, plan.order);
+      if (rootNode !== "Sort") this.recordExplainActualParent("Sort", cost);
     }
 
     const n = BigInt(rows.length);
     const start = plan.offset === null ? 0n : plan.offset < n ? plan.offset : n;
     const end = plan.limit !== null && plan.limit < n - start ? start + plan.limit : n;
     rows = rows.slice(Number(start), Number(end));
+    this.recordExplainActualParent(rootNode, cost);
 
     return {
       columnNames: plan.columnNames,
@@ -11315,7 +11784,7 @@ export class Engine {
     const env: EvalEnv = {
       params,
       outer,
-      runSubquery: (p, o) => this.execQueryPlan(p, o, params, ctes),
+      runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, ctes),
       seam: this.session.seam,
       rng: new StmtRng(),
       ctes,
@@ -11338,6 +11807,7 @@ export class Engine {
       }
       rows.push(out);
     }
+    this.recordExplainActualParent("Values", meter.accrued);
     return {
       columnNames: plan.columnNames,
       columnTypes: plan.columnTypes,
@@ -13315,7 +13785,7 @@ export class Engine {
       const env: EvalEnv = {
         params: bound,
         outer: [],
-        runSubquery: (p, o) => snap.execQueryPlan(p, o, bound, EMPTY_CTE_CTX),
+        runSubquery: (p, o) => snap.execHiddenQueryPlan(p, o, bound, EMPTY_CTE_CTX),
         seam: snap.session.seam,
         rng: new StmtRng(),
         ctes: EMPTY_CTE_CTX,
@@ -13346,7 +13816,7 @@ export class Engine {
     const env: EvalEnv = {
       params: bound,
       outer: [],
-      runSubquery: (p, o) => snap.execQueryPlan(p, o, bound, EMPTY_CTE_CTX),
+      runSubquery: (p, o) => snap.execHiddenQueryPlan(p, o, bound, EMPTY_CTE_CTX),
       seam: snap.session.seam,
       rng: new StmtRng(),
       ctes: EMPTY_CTE_CTX,
@@ -13546,6 +14016,10 @@ export class Engine {
     meter: Meter,
     params: Value[],
   ): SelectResult {
+    const profileStart = meter.accrued;
+    let filterWork = 0n;
+    let distinctWork = 0n;
+    let outputWork = 0n;
     const store = this.lkpStoreScoped(plan.rels[0]!.db, plan.rels[0]!.tableName);
     const limit = plan.limit;
     const offset = plan.offset ?? 0n;
@@ -13563,25 +14037,33 @@ export class Engine {
         // Materialize the touched columns if the lazy load left them unfetched
         // (large-values.md §14) — a fresh copy only when needed (resolveColumns).
         const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
-        if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
-          return true;
+        if (plan.filter !== null) {
+          const before = meter.accrued;
+          const keep = isTrue(evalExpr(plan.filter, row, env, meter));
+          filterWork += meter.accrued - before;
+          if (!keep) return true;
         }
         if (distinct) {
           // Project per scanned filtered row (the dedup key) and drop duplicates by first occurrence;
           // the OFFSET/LIMIT then window the DISTINCT rows.
+          const before = meter.accrued;
           const tuple = plan.projections.map((p) => evalExpr(p, row, env, meter));
+          distinctWork += meter.accrued - before;
           const key = distinctRowKey(tuple);
           if (seen.has(key)) return true; // a duplicate of an already-emitted/seen value
           seen.add(key);
           passed += 1n;
           if (passed <= offset) return true;
           meter.charge(COSTS.rowProduced);
+          outputWork += COSTS.rowProduced;
           out.push(tuple);
         } else {
           passed += 1n;
           if (passed <= offset) return true;
+          const before = meter.accrued;
           meter.charge(COSTS.rowProduced);
           out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
+          outputWork += meter.accrued - before;
         }
         // Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every survivor
         // after OFFSET, in primary-key scan order).
@@ -13724,6 +14206,15 @@ export class Engine {
         }
       }
     }
+    const totalWork = meter.accrued - profileStart;
+    const scanWork = totalWork - filterWork - distinctWork - outputWork;
+    const scanNode = "Scan " + plan.rels[0]!.tableName;
+    if (selectActualRootNode(plan) !== scanNode) this.recordExplainActual(scanNode, scanWork);
+    const throughFilter = scanWork + filterWork;
+    if (plan.filter !== null && selectActualRootNode(plan) !== "Filter")
+      this.recordExplainActualParent("Filter", throughFilter);
+    if (plan.distinct && selectActualRootNode(plan) !== "Distinct")
+      this.recordExplainActualParent("Distinct", throughFilter + distinctWork);
     return {
       columnNames: plan.columnNames,
       columnTypes: plan.columnTypes,
@@ -13822,6 +14313,8 @@ export class Engine {
   // execStreamingScan's LIMIT stop. pageRead is the full block up front (only per-row work
   // short-circuits, like the streaming scan).
   private execWindowTopN(plan: SelectPlan, env: EvalEnv, meter: Meter, params: Value[]): Emitter {
+    const profileStart = meter.accrued;
+    let filterWork = 0n;
     const store = this.lkpStoreScoped(plan.rels[0]!.db, plan.rels[0]!.tableName);
 
     // The scan bound (the PK pushdown, if any) + its pageRead block, exactly as execStreamingScan.
@@ -13851,7 +14344,12 @@ export class Engine {
         meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
         meter.charge(COSTS.storageRowRead);
         const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
-        if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) return true;
+        if (plan.filter !== null) {
+          const before = meter.accrued;
+          const keep = isTrue(evalExpr(plan.filter, row, env, meter));
+          filterWork += meter.accrued - before;
+          if (!keep) return true;
+        }
         rows.push(row);
         return BigInt(rows.length) < cap; // stop once the OFFSET+LIMIT window is filled
       };
@@ -13860,7 +14358,16 @@ export class Engine {
     }
 
     // The window stage over the collected prefix — identical to the eager path (§5.2), just fewer rows.
+    const beforeWindow = meter.accrued;
     applyWindowStage(rows, plan.windowSpecs, plan.windowKeys, env, meter);
+    const scanAndFilter = beforeWindow - profileStart;
+    const scanWork = scanAndFilter - filterWork;
+    const scanNode = selectActualRelNode(plan.rels[0]!);
+    if (selectActualRootNode(plan) !== scanNode) this.recordExplainActual(scanNode, scanWork);
+    if (plan.filter !== null && selectActualRootNode(plan) !== "Filter")
+      this.recordExplainActualParent("Filter", scanAndFilter);
+    if (selectActualRootNode(plan) !== "Window")
+      this.recordExplainActualParent("Window", meter.accrued - profileStart);
 
     // The prefix is already in outer ORDER BY order (pkOrdered), so the sort is elided. Slice the
     // OFFSET..OFFSET+LIMIT window and project on emission — only an emitted row charges rowProduced +
@@ -13886,6 +14393,9 @@ export class Engine {
     env: EvalEnv,
     meter: Meter,
   ): SelectResult {
+    const profileStart = meter.accrued;
+    let filterWork = 0n;
+    let outputWork = 0n;
     const store = this.lkpStoreScoped(plan.rels[0]!.db, plan.rels[0]!.tableName);
     const istore = this.lkpIndexStore(io.nameKey);
     // Up-front index-tree pageRead (the full block; the index store has no payload, so no slabs).
@@ -13910,17 +14420,28 @@ export class Engine {
             COSTS.storageRowRead,
         );
         const row = store.resolveColumns(u.row, plan.relMasks[0]!);
-        if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
-          return true;
+        if (plan.filter !== null) {
+          const before = meter.accrued;
+          const keep = isTrue(evalExpr(plan.filter, row, env, meter));
+          filterWork += meter.accrued - before;
+          if (!keep) return true;
         }
         passed += 1n;
         if (passed <= offset) return true;
+        const before = meter.accrued;
         meter.charge(COSTS.rowProduced);
         out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
+        outputWork += meter.accrued - before;
         // Stop once a LIMIT window is filled (a top-N over the index order).
         return limit === null ? true : BigInt(out.length) < limit;
       });
     }
+    const totalWork = meter.accrued - profileStart;
+    const scanWork = totalWork - filterWork - outputWork;
+    const scanNode = selectActualRelNode(plan.rels[0]!);
+    if (selectActualRootNode(plan) !== scanNode) this.recordExplainActual(scanNode, scanWork);
+    if (plan.filter !== null && selectActualRootNode(plan) !== "Filter")
+      this.recordExplainActualParent("Filter", scanWork + filterWork);
     return {
       columnNames: plan.columnNames,
       columnTypes: plan.columnTypes,
@@ -13946,6 +14467,8 @@ export class Engine {
     meter: Meter,
     params: Value[],
   ): Emitter {
+    const profileStart = meter.accrued;
+    let filterWork = 0n;
     const store = this.lkpStoreScoped(plan.rels[0]!.db, plan.rels[0]!.tableName);
 
     // Resolve the scan bound (the PK pushdown, if any) and charge the pageRead + valueDecompress block
@@ -13981,8 +14504,11 @@ export class Engine {
           meter.guard();
           meter.charge(COSTS.storageRowRead);
           const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
-          if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
-            return true;
+          if (plan.filter !== null) {
+            const before = meter.accrued;
+            const keep = isTrue(evalExpr(plan.filter, row, env, meter));
+            filterWork += meter.accrued - before;
+            if (!keep) return true;
           }
           rows.push(row);
           return true;
@@ -14007,8 +14533,11 @@ export class Engine {
           meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
           meter.charge(COSTS.storageRowRead);
           const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
-          if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
-            return true;
+          if (plan.filter !== null) {
+            const before = meter.accrued;
+            const keep = isTrue(evalExpr(plan.filter, row, env, meter));
+            filterWork += meter.accrued - before;
+            if (!keep) return true;
           }
           survivorCount++;
           if (keeper !== null) {
@@ -14037,6 +14566,14 @@ export class Engine {
       sorted.close(); // release any spilled runs if the OFFSET skip throws
       throw e;
     }
+    const blockingWork = meter.accrued - profileStart;
+    const scanWork = blockingWork - filterWork;
+    const scanNode = selectActualRelNode(plan.rels[0]!);
+    if (selectActualRootNode(plan) !== scanNode) this.recordExplainActual(scanNode, scanWork);
+    if (plan.filter !== null && selectActualRootNode(plan) !== "Filter")
+      this.recordExplainActualParent("Filter", blockingWork);
+    if (selectActualRootNode(plan) !== "Sort")
+      this.recordExplainActualParent("Sort", blockingWork);
     return sortedEmitter(sorted, Number(end - start));
   }
 
@@ -14054,13 +14591,22 @@ export class Engine {
     params: Value[],
     outer: Row[],
   ): SelectResult {
+    const profileStart = meter.accrued;
+    const relWork = new Map<number, bigint>();
+    let filterWork = 0n;
+    let outputWork = 0n;
     const outerOrdinal = physicalRelOrdinal(plan, 0);
     const innerOrdinal = physicalRelOrdinal(plan, 1);
+    let before = meter.accrued;
     const leftRows = this.materializeRel(plan, outerOrdinal, outer, [], env, params, meter);
+    relWork.set(outerOrdinal, meter.accrued - before);
     const rightINL = plan.phys.relINLBounds[innerOrdinal] !== null;
-    const rightRows = rightINL
-      ? []
-      : this.materializeRel(plan, innerOrdinal, outer, [], env, params, meter);
+    let rightRows: Row[] = [];
+    if (!rightINL) {
+      before = meter.accrued;
+      rightRows = this.materializeRel(plan, innerOrdinal, outer, [], env, params, meter);
+      relWork.set(innerOrdinal, meter.accrued - before);
+    }
     const on = plan.joins[0]!.on;
 
     const limit = plan.limit;
@@ -14083,6 +14629,7 @@ export class Engine {
         let innerRows = rightRows;
         if (rightINL) {
           const outerLogical = placePhysicalRelationRow(plan, outerOrdinal, left);
+          before = meter.accrued;
           innerRows = this.materializeRel(
             plan,
             innerOrdinal,
@@ -14091,6 +14638,10 @@ export class Engine {
             env,
             params,
             meter,
+          );
+          relWork.set(
+            innerOrdinal,
+            (relWork.get(innerOrdinal) ?? 0n) + meter.accrued - before,
           );
         } else if (hashTable !== null) {
           innerRows = hashTable
@@ -14108,18 +14659,36 @@ export class Engine {
           // INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).
           if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) continue;
           // The residual WHERE over the combined row (per surviving pair).
-          if (plan.filter !== null && !isTrue(evalExpr(plan.filter, combined, env, meter)))
-            continue;
+          if (plan.filter !== null) {
+            before = meter.accrued;
+            const keep = isTrue(evalExpr(plan.filter, combined, env, meter));
+            filterWork += meter.accrued - before;
+            if (!keep) continue;
+          }
           passed += 1n;
           if (passed <= offset) continue;
           meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
+          before = meter.accrued;
           meter.charge(COSTS.rowProduced);
           out.push(plan.projections.map((p) => evalExpr(p, combined, env, meter)));
+          outputWork += meter.accrued - before;
           // Stop the whole nested loop once the LIMIT window is filled.
           if (limit !== null && BigInt(out.length) >= limit) break outer;
         }
       }
     }
+    const totalWork = meter.accrued - profileStart;
+    for (const ordinal of [outerOrdinal, innerOrdinal]) {
+      const node = selectActualRelNode(plan.rels[ordinal]!);
+      if (selectActualRootNode(plan) !== node)
+        this.recordExplainActual(node, relWork.get(ordinal) ?? 0n);
+    }
+    const throughJoin = totalWork - filterWork - outputWork;
+    const joinNode = plan.phys.hashJoin === null ? "Nested Loop" : "Hash Join";
+    if (selectActualRootNode(plan) !== joinNode)
+      this.recordExplainActualParent(joinNode, throughJoin);
+    if (plan.filter !== null && selectActualRootNode(plan) !== "Filter")
+      this.recordExplainActualParent("Filter", throughJoin + filterWork);
     return {
       columnNames: plan.columnNames,
       columnTypes: plan.columnTypes,
@@ -14138,11 +14707,17 @@ export class Engine {
     params: Value[],
     outer: Row[],
   ): SelectResult {
-    const materialized: Row[][] = plan.rels.map((rel, ordinal) =>
-      rel.lateral || plan.phys.relINLBounds[ordinal] !== null
-        ? []
-        : this.materializeRel(plan, ordinal, outer, [], env, params, meter),
-    );
+    const profileStart = meter.accrued;
+    let filterWork = 0n;
+    let outputWork = 0n;
+    const relWork = new Array<bigint>(plan.rels.length).fill(0n);
+    const materialized: Row[][] = plan.rels.map((rel, ordinal) => {
+      if (rel.lateral || plan.phys.relINLBounds[ordinal] !== null) return [];
+      const before = meter.accrued;
+      const rows = this.materializeRel(plan, ordinal, outer, [], env, params, meter);
+      relWork[ordinal] = meter.accrued - before;
+      return rows;
+    });
     const finalPosition = plan.rels.length - 1;
     const running = this.execCostedNWayJoin(
       plan,
@@ -14150,6 +14725,7 @@ export class Engine {
       meter,
       params,
       materialized,
+      relWork,
       finalPosition - 1,
     );
     const inner = plan.phys.relationOrder[finalPosition]!;
@@ -14170,7 +14746,9 @@ export class Engine {
       outerRows: for (const left of running) {
         let candidates = innerRows;
         if (innerINL) {
+          const before = meter.accrued;
           candidates = this.materializeRel(plan, inner, outer, left, env, params, meter);
+          relWork[inner] = relWork[inner]! + meter.accrued - before;
         } else if (hashTable !== null) {
           candidates = hashTable
             .probe(step.hashJoin!, left, meter)
@@ -14188,16 +14766,32 @@ export class Engine {
             }
           }
           if (!keep) continue;
-          if (plan.filter !== null && !isTrue(evalExpr(plan.filter, combined, env, meter))) continue;
+          if (plan.filter !== null) {
+            const before = meter.accrued;
+            const keep = isTrue(evalExpr(plan.filter, combined, env, meter));
+            filterWork += meter.accrued - before;
+            if (!keep) continue;
+          }
           passed++;
           if (passed <= offset) continue;
           meter.guard();
+          const before = meter.accrued;
           meter.charge(COSTS.rowProduced);
           rows.push(plan.projections.map((projection) => evalExpr(projection, combined, env, meter)));
+          outputWork += meter.accrued - before;
           if (limit !== null && BigInt(rows.length) >= limit) break outerRows;
         }
       }
     }
+    for (const ordinal of plan.phys.relationOrder)
+      this.recordExplainActual(selectActualRelNode(plan.rels[ordinal]!), relWork[ordinal]!);
+    const throughJoin = meter.accrued - profileStart - filterWork - outputWork;
+    this.recordExplainActualParent(
+      step.hashJoin === null ? "Nested Loop" : "Hash Join",
+      throughJoin,
+    );
+    if (plan.filter !== null)
+      this.recordExplainActualParent("Filter", throughJoin + filterWork);
     return {
       columnNames: plan.columnNames,
       columnTypes: plan.columnTypes,
@@ -14499,7 +15093,7 @@ export class Engine {
       outer,
       // A subquery inherits the same CTE context (a CTE reference works at any nesting depth —
       // cte.md §2/§5).
-      runSubquery: (p, o) => this.execQueryPlan(p, o, params, ctes),
+      runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, ctes),
       seam: this.session.seam,
       rng: new StmtRng(),
       ctes,
@@ -14507,10 +15101,12 @@ export class Engine {
     };
     const meter = this.session.newMeter();
     const em = this.execSelectEmit(plan, env, meter, params);
+    const rows = this.drainEmitterEager(em, plan, env, meter);
+    this.recordExplainActualParent(selectActualRootNode(plan), meter.accrued);
     return {
       columnNames: plan.columnNames,
       columnTypes: plan.columnTypes,
-      rows: this.drainEmitterEager(em, plan, env, meter),
+      rows,
       cost: meter.accrued,
     };
   }
@@ -14874,6 +15470,7 @@ export class Engine {
     meter: Meter,
     params: Value[],
     materialized: Row[][],
+    relWork: bigint[],
   ): Row[] {
     const outerOrdinal = physicalRelOrdinal(plan, 0);
     const innerOrdinal = physicalRelOrdinal(plan, 1);
@@ -14895,6 +15492,7 @@ export class Engine {
       let candidates = innerRows;
       if (innerINL) {
         const outerLogical = placePhysicalRelationRow(plan, outerOrdinal, outerRow);
+        const before = meter.accrued;
         candidates = this.materializeRel(
           plan,
           innerOrdinal,
@@ -14904,6 +15502,7 @@ export class Engine {
           params,
           meter,
         );
+        relWork[innerOrdinal] = relWork[innerOrdinal]! + meter.accrued - before;
       } else if (hashTable !== null) {
         candidates = hashTable
           .probe(plan.phys.hashJoin!, outerRow, meter)
@@ -14929,6 +15528,7 @@ export class Engine {
     meter: Meter,
     params: Value[],
     materialized: Row[][],
+    relWork: bigint[],
     stepCount: number,
   ): Row[] {
     const driver = plan.phys.relationOrder[0]!;
@@ -14959,6 +15559,7 @@ export class Engine {
         let candidates = innerRows;
         let candidateIndices: number[] | null = null;
         if (innerINL) {
+          const before = meter.accrued;
           candidates = this.materializeRel(
             plan,
             inner,
@@ -14968,7 +15569,9 @@ export class Engine {
             params,
             meter,
           );
+          relWork[inner] = relWork[inner]! + meter.accrued - before;
         } else if (innerLateral) {
+          const before = meter.accrued;
           candidates = this.materializeRel(
             plan,
             inner,
@@ -14978,6 +15581,7 @@ export class Engine {
             params,
             meter,
           );
+          relWork[inner] = relWork[inner]! + meter.accrued - before;
         } else if (hashTable !== null) {
           candidateIndices = hashTable.probe(step.hashJoin!, left, meter);
           candidates = candidateIndices.map((index) => innerRows[index]!);
@@ -15014,6 +15618,12 @@ export class Engine {
         }
       }
       running = next;
+      if (position + 1 < plan.phys.joinSteps.length) {
+        this.recordExplainActualParent(
+          step.hashJoin === null ? "Nested Loop" : "Hash Join",
+          meter.accrued,
+        );
+      }
     }
     return running;
   }
@@ -15034,7 +15644,11 @@ export class Engine {
     // corpus proves both). Ineligible / metered ⇒ skipped and the general aggregate branch runs
     // unchanged. (An aggregate plan skips every streaming fast-path below — they all require !isAgg — so
     // this front-position placement is only for clarity, mirroring the Go/Rust cores' ordering.)
-    if (meter.isUnmetered() && this.vectorizedAggEligible(plan)) {
+    if (
+      meter.isUnmetered() &&
+      this.explainActualProfile === null &&
+      this.vectorizedAggEligible(plan)
+    ) {
       return this.execVectorizedAgg(plan, env, meter, params);
     }
 
@@ -15110,7 +15724,11 @@ export class Engine {
     // unmetered lane (so a metered query's per-eval guards stay the row path's) and to file-backed stores
     // with no spillable touched column (projectColumnar declines otherwise, falling through to the
     // identical-cost row path). Cost-neutral by construction.
-    if (meter.isUnmetered() && vectorizedProjectEligible(plan)) {
+    if (
+      meter.isUnmetered() &&
+      this.explainActualProfile === null &&
+      vectorizedProjectEligible(plan)
+    ) {
       const em = this.projectColumnar(plan, env, meter, params);
       if (em !== null) return em;
     }
@@ -15123,11 +15741,18 @@ export class Engine {
     // An INDEX-NESTED-LOOP relation (cost.md §3 "JOIN") likewise depends on the left-hand row (its
     // bound seeks per outer row), so it is not materialized up front either — an empty placeholder
     // holds its slot and the join loop re-materializes it per left row.
-    const materialized: Row[][] = plan.rels.map((rel, ri) =>
-      rel.lateral === true || plan.phys.relINLBounds[ri] !== null
-        ? []
-        : this.materializeRel(plan, ri, env.outer, [], env, params, meter),
-    );
+    const materialized: Row[][] = [];
+    const relWork = new Array<bigint>(plan.rels.length).fill(0n);
+    for (let ri = 0; ri < plan.rels.length; ri++) {
+      const rel = plan.rels[ri]!;
+      if (rel.lateral === true || plan.phys.relINLBounds[ri] !== null) {
+        materialized.push([]);
+        continue;
+      }
+      const before = meter.accrued;
+      materialized.push(this.materializeRel(plan, ri, env.outer, [], env, params, meter));
+      relWork[ri] = meter.accrued - before;
+    }
 
     // Left-deep nested-loop join. `running` holds the combined rows over the relations joined
     // so far (starting with the first table's rows). For each join, concatenate every running
@@ -15153,10 +15778,11 @@ export class Engine {
         meter,
         params,
         materialized,
+        relWork,
         plan.phys.joinSteps.length,
       );
     } else if (plan.phys.relationOrder.length === 2) {
-      running = this.execCostedTwoRelationJoin(plan, env, meter, params, materialized);
+      running = this.execCostedTwoRelationJoin(plan, env, meter, params, materialized, relWork);
     } else {
       running = plan.rels.length === 0 ? [[]] : materialized[0]!;
       for (let k = 0; k < plan.joins.length; k++) {
@@ -15176,6 +15802,7 @@ export class Engine {
       // lateral is 42P10), so there is no unmatched-right emission.
       if (plan.rels[k + 1]!.lateral === true) {
         for (const left of running) {
+          const before = meter.accrued;
           const rightRows = this.materializeRel(
             plan,
             k + 1,
@@ -15185,6 +15812,7 @@ export class Engine {
             params,
             meter,
           );
+          relWork[k + 1] = relWork[k + 1]! + meter.accrued - before;
           let leftMatched = false;
           for (const right of rightRows) {
             const combined = left.concat(right);
@@ -15206,7 +15834,9 @@ export class Engine {
       // (the ON here, the WHERE below), so rows are unchanged.
       if (plan.phys.relINLBounds[k + 1] !== null) {
         for (const left of running) {
+          const before = meter.accrued;
           const rightRows = this.materializeRel(plan, k + 1, env.outer, left, env, params, meter);
+          relWork[k + 1] = relWork[k + 1]! + meter.accrued - before;
           let leftMatched = false;
           for (const right of rightRows) {
             const combined = left.concat(right);
@@ -15269,11 +15899,43 @@ export class Engine {
       }
     }
 
+    // Scan labels can repeat (self joins), while the optimizer may render relations in physical
+    // rather than authored order. Publish the accumulated leaf work in that same render order so
+    // the label queues remain deterministic; dynamic INL/LATERAL probes contribute to one leaf.
+    const physicalTree =
+      (plan.rels.length === 2 && plan.phys.relationOrder.length === 2) ||
+      (plan.rels.length >= 3 &&
+        plan.phys.relationOrder.length === plan.rels.length &&
+        plan.phys.joinSteps.length + 1 === plan.rels.length);
+    const relationOrder = physicalTree
+      ? plan.phys.relationOrder
+      : plan.rels.map((_, ordinal) => ordinal);
+    for (const ordinal of relationOrder) {
+      const node = selectActualRelNode(plan.rels[ordinal]!);
+      if (selectActualRootNode(plan) !== node)
+        this.recordExplainActual(node, relWork[ordinal]!);
+    }
+
+    if (plan.rels.length > 1) {
+      const lastStep = plan.phys.joinSteps.at(-1);
+      const node =
+        (plan.rels.length === 2 && plan.phys.hashJoin !== null) ||
+          (lastStep !== undefined && lastStep.hashJoin !== null)
+          ? "Hash Join"
+          : "Nested Loop";
+      if (selectActualRootNode(plan) !== node)
+        this.recordExplainActualParent(node, meter.accrued);
+    }
+
     // WHERE over the combined rows. A WHERE arithmetic can throw (22003/22012); each surviving
     // combined row's filter accrues operator_eval.
     let rows: Row[] = [];
     for (const row of running) {
       if (plan.filter === null || isTrue(evalExpr(plan.filter, row, env, meter))) rows.push(row);
+    }
+    if (plan.filter !== null) {
+      if (selectActualRootNode(plan) !== "Filter")
+        this.recordExplainActualParent("Filter", meter.accrued);
     }
 
     // WINDOW stage (spec/design/window.md §5.2): a blocking operator over the post-WHERE rows,
@@ -15285,6 +15947,8 @@ export class Engine {
     // (non-aggregate) windows here.
     if (plan.hasWindow && !plan.isAgg) {
       applyWindowStage(rows, plan.windowSpecs, plan.windowKeys, env, meter);
+      if (selectActualRootNode(plan) !== "Window")
+        this.recordExplainActualParent("Window", meter.accrued);
     }
 
     // ORDER BY: stable sort applying each key left to right — the first non-equal key decides,
@@ -15300,6 +15964,8 @@ export class Engine {
       materializeOrderExprs(rows, plan.orderExprs, env, meter);
       if (plan.phys.topK !== null) rows = topKRows(rows, plan.order, plan.phys.topK);
       else sortRows(rows, plan.order);
+      if (selectActualRootNode(plan) !== "Sort")
+        this.recordExplainActualParent("Sort", meter.accrued);
     }
 
     // LIMIT / OFFSET window bounds over a result of `len` rows. Clamp in the bigint domain
@@ -15457,6 +16123,8 @@ export class Engine {
       if (plan.having !== null) {
         groupRows = groupRows.filter((srow) => isTrue(evalExpr(plan.having!, srow, env, meter)));
       }
+      if (selectActualRootNode(plan) !== "Aggregate")
+        this.recordExplainActualParent("Aggregate", meter.accrued);
       // WINDOW stage over the grouped rows (spec/design/window.md §2): runs AFTER GROUP BY/HAVING and
       // BEFORE the query ORDER BY. It appends each window result to the grouped row [group_keys…,
       // agg_results…], so the projection reads window result w at slot groupKeys+aggSpecs+w (the
@@ -15464,12 +16132,16 @@ export class Engine {
       // precede the appended results).
       if (plan.hasWindow) {
         applyWindowStage(groupRows, plan.windowSpecs, plan.windowKeys, env, meter);
+        if (selectActualRootNode(plan) !== "Window")
+          this.recordExplainActualParent("Window", meter.accrued);
       }
       // ORDER BY over the grouped output (a column/ordinal key is a synthetic group-key slot; an
       // expression key is materialized against the grouped row and appended — grammar.md §10).
       if (plan.order.length > 0) {
         materializeOrderExprs(groupRows, plan.orderExprs, env, meter);
         sortRows(groupRows, plan.order);
+        if (selectActualRootNode(plan) !== "Sort")
+          this.recordExplainActualParent("Sort", meter.accrued);
       }
       if (plan.distinct) {
         // SELECT DISTINCT: project EVERY grouped row (charging its projection operatorEvals, the §3
@@ -15487,6 +16159,8 @@ export class Engine {
             distinctRows.push(tuple);
           }
         }
+        if (selectActualRootNode(plan) !== "Distinct")
+          this.recordExplainActualParent("Distinct", meter.accrued);
         // The dedup already projected every grouped row (the §3 asymmetry, charged above), so emission
         // is Identity — window + charge rowProduced, deferred to the drive (streaming.md §4).
         const [start, end] = windowBounds(distinctRows.length);
@@ -15511,6 +16185,8 @@ export class Engine {
           distinctRows.push(tuple);
         }
       }
+      if (selectActualRootNode(plan) !== "Distinct")
+        this.recordExplainActualParent("Distinct", meter.accrued);
       // LIMIT / OFFSET applies to the DISTINCT rows; only the emitted rows charge rowProduced
       // (spec/design/cost.md §3). The rows were already projected for their dedup key (the §3
       // asymmetry, charged above), so emission is Identity — deferred to the drive (streaming.md §4).
@@ -15540,8 +16216,24 @@ export class Engine {
     ctes: CteCtx,
     cost: { value: bigint },
   ): void {
+    this.foldUncorrelatedInPlanAt(
+      plan,
+      bound,
+      ctes,
+      cost,
+      (this.explainActualFrames?.length ?? 0) + 1,
+    );
+  }
+
+  private foldUncorrelatedInPlanAt(
+    plan: QueryPlan,
+    bound: Value[],
+    ctes: CteCtx,
+    cost: { value: bigint },
+    frame: number,
+  ): void {
     if (plan.kind === "select") {
-      this.foldUncorrelatedInSelect(plan, bound, ctes, cost);
+      this.foldUncorrelatedInSelectAt(plan, bound, ctes, cost, frame);
       return;
     }
     if (plan.kind === "values") {
@@ -15562,8 +16254,8 @@ export class Engine {
       // execWithPlan).
       return;
     }
-    this.foldUncorrelatedInPlan(plan.lhs, bound, ctes, cost);
-    this.foldUncorrelatedInPlan(plan.rhs, bound, ctes, cost);
+    this.foldUncorrelatedInPlanAt(plan.lhs, bound, ctes, cost, frame + 1);
+    this.foldUncorrelatedInPlanAt(plan.rhs, bound, ctes, cost, frame + 1);
   }
 
   private foldUncorrelatedInSelect(
@@ -15572,9 +16264,29 @@ export class Engine {
     ctes: CteCtx,
     cost: { value: bigint },
   ): void {
+    this.foldUncorrelatedInSelectAt(
+      sp,
+      bound,
+      ctes,
+      cost,
+      (this.explainActualFrames?.length ?? 0) + 1,
+    );
+  }
+
+  private foldUncorrelatedInSelectAt(
+    sp: SelectPlan,
+    bound: Value[],
+    ctes: CteCtx,
+    cost: { value: bigint },
+    frame: number,
+  ): void {
     for (const j of sp.joins)
       if (j.on !== null) j.on = this.foldUncorrelatedInRExpr(j.on, bound, ctes, cost);
-    if (sp.filter !== null) sp.filter = this.foldUncorrelatedInRExpr(sp.filter, bound, ctes, cost);
+    if (sp.filter !== null) {
+      const before = cost.value;
+      sp.filter = this.foldUncorrelatedInRExpr(sp.filter, bound, ctes, cost);
+      this.recordExplainActualFolded(frame, "Filter", cost.value - before);
+    }
     if (sp.having !== null) sp.having = this.foldUncorrelatedInRExpr(sp.having, bound, ctes, cost);
     for (const s of sp.aggSpecs) {
       if (s.operand !== null)
@@ -15603,10 +16315,15 @@ export class Engine {
         // Bottom-up: fold within this subquery's own sub-plan (and its IN lhs) first, so a
         // globally-uncorrelated subquery nested inside it is already a constant before we run it.
         if (e.lhs !== null) e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost);
-        this.foldUncorrelatedInPlan(e.plan, bound, ctes, cost);
+        if (this.explainActualProfile != null) this.explainActualFoldSuppress++;
+        try {
+          this.foldUncorrelatedInPlan(e.plan, bound, ctes, cost);
+        } finally {
+          if (this.explainActualProfile != null) this.explainActualFoldSuppress--;
+        }
         if (queryPlanReferencesOuter(e.plan, 0)) return e; // correlated — re-run per outer row
         // Uncorrelated: execute ONCE and fold to a constant / inValues.
-        const r = this.execQueryPlan(e.plan, [], bound, ctes);
+        const r = this.execHiddenQueryPlan(e.plan, [], bound, ctes);
         cost.value += r.cost;
         if (e.subKind === "scalar") {
           if (r.rows.length > 1) {
@@ -19907,6 +20624,8 @@ export function isConstSource(e: RExpr, pkType: ScalarType, siblingRange: Column
       return isDecimal(pkType);
     case "constInterval":
       return isInterval(pkType);
+    case "constFloat":
+      return e.ty === pkType;
     default:
       return false;
   }
@@ -20176,6 +20895,11 @@ export function encodeBoundKey(
       return { kind: "key", key: encodeTerminated(src.value) };
     case "constDecimal":
       return { kind: "key", key: src.value.encodeKey() };
+    case "constFloat":
+      return {
+        kind: "key",
+        key: src.ty === "f32" ? encodeFloat32Key(src.value) : encodeFloat64Key(src.value),
+      };
     case "constInterval":
       return { kind: "key", key: intervalEncodeKey(src.value) };
     case "param":
@@ -20226,6 +20950,10 @@ export function encodeValueKey(pkType: ScalarType, v: Value, coll: Collation | n
   if (v.kind === "bytea") return { kind: "key", key: encodeTerminated(v.bytes) };
   if (v.kind === "decimal") return { kind: "key", key: v.dec.encodeKey() };
   if (v.kind === "interval") return { kind: "key", key: intervalEncodeKey(v.iv) };
+  if (v.kind === "f32" && pkType === "f32")
+    return { kind: "key", key: encodeFloat32Key(v.value) };
+  if (v.kind === "f64" && pkType === "f64")
+    return { kind: "key", key: encodeFloat64Key(v.value) };
   if (v.kind === "int")
     return inRange(pkType, v.int)
       ? { kind: "key", key: encodeInt(pkType, v.int) }
@@ -22895,6 +23623,47 @@ export type SelectPlan = {
   // (optimize.ts); zero-valued when resolve hands the plan over (spec/design/planner.md §4).
   phys: PhysicalPlan;
 };
+
+function selectActualRootNode(sp: SelectPlan): string {
+  if (sp.limit !== null || sp.offset !== null) return "Limit";
+  if (
+    sp.order.length > 0 &&
+    !sp.phys.pkOrdered &&
+    sp.phys.indexOrder === null &&
+    !sp.phys.joinPkOrdered
+  )
+    return "Sort";
+  if (sp.distinct) return "Distinct";
+  if (sp.hasWindow) return "Window";
+  if (sp.isAgg) return "Aggregate";
+  if (sp.filter !== null) return "Filter";
+  if (sp.rels.length > 1) {
+    const last = sp.phys.joinSteps.at(-1);
+    return (sp.rels.length === 2 && sp.phys.hashJoin !== null) || last?.hashJoin != null
+      ? "Hash Join"
+      : "Nested Loop";
+  }
+  const rel = sp.rels[0];
+  if (rel === undefined) return "Result";
+  return selectActualRelNode(rel);
+}
+
+function selectActualRelNode(rel: PlanRel): string {
+  if (rel.srf !== undefined) {
+    if (
+      rel.srf.kind === "jed_tables" ||
+      rel.srf.kind === "jed_columns" ||
+      rel.srf.kind === "jed_indexes" ||
+      rel.srf.kind === "jed_constraints" ||
+      rel.srf.kind === "jed_statistics"
+    )
+      return "Catalog Scan " + rel.tableName;
+    return "SRF " + rel.tableName;
+  }
+  if (rel.cte !== undefined) return "CTE Scan " + rel.tableName;
+  if (rel.derived !== undefined) return "Subquery " + rel.tableName;
+  return "Scan " + rel.tableName;
+}
 
 // PhysicalPlan is the physical/access-path half of a SelectPlan: every field is the output of one
 // discrete rule of the optimizeSelect pass (spec/design/planner.md §4), applied in a fixed order

@@ -3867,6 +3867,8 @@ pub(crate) fn const_source(
         RExpr::ConstText(s) if pk_type.is_text() => Some(BoundSrc::Text(s.clone())),
         RExpr::ConstBytea(b) if pk_type.is_bytea() => Some(BoundSrc::Bytea(b.clone())),
         RExpr::ConstDecimal(d) if pk_type.is_decimal() => Some(BoundSrc::Decimal(d.clone())),
+        RExpr::ConstFloat32(v) if pk_type == ScalarType::Float32 => Some(BoundSrc::Float32(*v)),
+        RExpr::ConstFloat64(v) if pk_type == ScalarType::Float64 => Some(BoundSrc::Float64(*v)),
         RExpr::ConstInterval(iv) if pk_type.is_interval() => Some(BoundSrc::Interval(*iv)),
         RExpr::OuterColumn { level, index } => Some(BoundSrc::Outer {
             level: *level,
@@ -4324,6 +4326,8 @@ pub(crate) fn encode_bound_key(
         BoundSrc::Text(s) => encode_text_bound(s, coll),
         BoundSrc::Bytea(b) => BoundKey::Key(encode_terminated(b)),
         BoundSrc::Decimal(d) => BoundKey::Key(d.encode_key()),
+        BoundSrc::Float32(v) => BoundKey::Key(encode_f32_key(*v)),
+        BoundSrc::Float64(v) => BoundKey::Key(encode_f64_key(*v)),
         BoundSrc::Interval(iv) => BoundKey::Key(iv.encode_key()),
         BoundSrc::Param(i) => encode_value_key(pk_ty, &params[*i], coll),
         // A correlated reference: column `index` of the enclosing row `level` hops out — the same
@@ -4382,6 +4386,8 @@ pub(crate) fn encode_value_key(pk_ty: ScalarType, v: &Value, coll: Option<&Colla
         Value::Bytea(b) => BoundKey::Key(encode_terminated(b)),
         Value::Decimal(d) => BoundKey::Key(d.encode_key()),
         Value::Interval(iv) => BoundKey::Key(iv.encode_key()),
+        Value::Float32(v) if pk_ty == ScalarType::Float32 => BoundKey::Key(encode_f32_key(*v)),
+        Value::Float64(v) if pk_ty == ScalarType::Float64 => BoundKey::Key(encode_f64_key(*v)),
         _ => BoundKey::OutOfRange,
     }
 }

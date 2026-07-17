@@ -2770,20 +2770,31 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 	// selected after uncorrelated folding, matching the old inline detector timing; the batch keeps
 	// storage keys for phase 2 and reports the same up-front units as before.
 	scanPlan := db.planMutationScan(del.DB, table, filter)
+	scanBefore := meter.Accrued
 	batch, err := db.executeMutationScan(scanPlan, del.Table, bound, env, meter, mask)
 	if err != nil {
 		return outcome{}, err
 	}
+	scanActual := meter.Accrued - scanBefore
 	if batch.empty {
+		db.explainActual.record("Scan "+del.Table, scanActual)
+		if filter != nil {
+			db.explainActual.record("Filter", scanActual)
+		}
 		return dmlOutcome(retNames, retTypes, nil, 0, meter.Accrued), nil
 	}
 	entries, overlap, slabs := batch.entries, batch.pages, batch.slabs
-	meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
+	blockCost := costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs)
+	meter.Charge(blockCost)
+	scanActual += blockCost
+	filterActual := scanActual
 	for _, e := range entries {
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 			return outcome{}, err
 		}
 		meter.Charge(costs.StorageRowRead)
+		scanActual += costs.StorageRowRead
+		filterActual += costs.StorageRowRead
 		// Materialize the filter's columns if the lazy load left them unfetched — exactly the
 		// touched set the block above charged (large-values.md §14).
 		row, err := store.resolveColumns(e.Row, mask)
@@ -2792,10 +2803,12 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 		}
 		keep := true
 		if filter != nil {
+			beforeFilter := meter.Accrued
 			v, err := filter.eval(row, env, meter)
 			if err != nil {
 				return outcome{}, err
 			}
+			filterActual += meter.Accrued - beforeFilter
 			keep = v.IsTrue()
 		}
 		if keep {
@@ -2808,6 +2821,10 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 			}
 			matched = append(matched, matchedRow{key: e.Key, row: row})
 		}
+	}
+	db.explainActual.record("Scan "+del.Table, scanActual)
+	if filter != nil {
+		db.explainActual.record("Filter", filterActual)
 	}
 
 	// FOREIGN KEY parent-side (constraints.md §6.5): a DELETE must not strand a child. For each
@@ -3145,20 +3162,31 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	// Plan and execute the target scan through the shared mutation access-path seam. The keyed batch
 	// is over the pre-update state and feeds the unchanged two-phase rewrite below.
 	scanPlan := db.planMutationScan(upd.DB, table, filter)
+	scanBefore := meter.Accrued
 	batch, err := db.executeMutationScan(scanPlan, upd.Table, bound, env, meter, mask)
 	if err != nil {
 		return outcome{}, err
 	}
+	scanActual := meter.Accrued - scanBefore
 	if batch.empty {
+		db.explainActual.record("Scan "+upd.Table, scanActual)
+		if filter != nil {
+			db.explainActual.record("Filter", scanActual)
+		}
 		return dmlOutcome(retNames, retTypes, nil, 0, meter.Accrued), nil
 	}
 	entries, overlap, slabs := batch.entries, batch.pages, batch.slabs
-	meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
+	blockCost := costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs)
+	meter.Charge(blockCost)
+	scanActual += blockCost
+	filterActual := scanActual
 	for _, e := range entries {
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 			return outcome{}, err
 		}
 		meter.Charge(costs.StorageRowRead)
+		scanActual += costs.StorageRowRead
+		filterActual += costs.StorageRowRead
 		// Materialize the filter's + assignment sources' columns if the lazy load left them
 		// unfetched — exactly the touched set the block above charged (large-values.md §14).
 		row, err := store.resolveColumns(e.Row, mask)
@@ -3166,13 +3194,16 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			return outcome{}, err
 		}
 		if filter != nil {
+			beforeFilter := meter.Accrued
 			v, err := filter.eval(row, env, meter)
 			if err != nil {
 				return outcome{}, err
 			}
 			if !v.IsTrue() {
+				filterActual += meter.Accrued - beforeFilter
 				continue
 			}
+			filterActual += meter.Accrued - beforeFilter
 		}
 		// The OLD row is retained for index-entry removal (its key/index columns are read directly
 		// below); resolve its inline-deferred values (lazy-record.md §5b — a key column is always
@@ -3216,6 +3247,10 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			}
 		}
 		updates = append(updates, pending{key: e.Key, newKey: newKey, row: newRow, oldRow: row})
+	}
+	db.explainActual.record("Scan "+upd.Table, scanActual)
+	if filter != nil {
+		db.explainActual.record("Filter", filterActual)
 	}
 
 	// PRIMARY KEY end-state validation for a re-keying UPDATE (the storage key changed): like

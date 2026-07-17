@@ -1089,9 +1089,16 @@ export type Rollback = { kind: "rollback" };
 // statement instead of running it (spec/design/explain.md). `analyze` false ⇒ plain EXPLAIN: the plan
 // is rendered WITHOUT executing the inner statement; true ⇒ EXPLAIN ANALYZE: the inner runs and its
 // actual accrued cost + row count are reported. `inner` is the wrapped statement, restricted by the
-// parser to a query (SELECT / set operation / read-only WITH) or DML (INSERT / UPDATE / DELETE) —
+// parser to a query (SELECT / set operation / WITH, including writable WITH) or DML —
 // never DDL, transaction control, or a nested EXPLAIN (42601).
-export type Explain = { kind: "explain"; analyze: boolean; inner: Statement };
+export type Explain = {
+  kind: "explain";
+  analyze: boolean;
+  verbose: boolean;
+  costs: boolean;
+  lane: boolean;
+  inner: Statement;
+};
 
 // SetOpKind is the set operator (spec/design/grammar.md §25).
 export type SetOpKind = "union" | "intersect" | "except";

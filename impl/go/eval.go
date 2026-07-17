@@ -3536,7 +3536,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		child := make([]storedRow, len(env.outer)+1)
 		copy(child, env.outer)
 		child[len(env.outer)] = row
-		r, err := env.exec.execQueryPlan(e.subPlan, child, env.params, env.ctes)
+		r, err := env.exec.execHiddenQueryPlan(e.subPlan, child, env.params, env.ctes)
 		if err != nil {
 			return Value{}, err
 		}

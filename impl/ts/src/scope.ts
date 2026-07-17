@@ -31,7 +31,7 @@ import {
   seqDataTypeRange,
 } from "./catalog.ts";
 import { type EngineError, engineError } from "./errors.ts";
-import type { ScalarType, Type } from "./types.ts";
+import type { DecimalTypmod, ScalarType, Type } from "./types.ts";
 import {
   arrayT,
   canonicalName,
@@ -61,6 +61,8 @@ import type {
   Delete,
   Expr,
   Insert,
+  JsonOnBehavior,
+  JsonWrapper,
   QueryExpr,
   Select,
   SelectItems,
@@ -76,6 +78,7 @@ import type {
 import { cteBodyAsQuery, cteBodyIsDataModifying, forEachGroupExpr } from "./ast.ts";
 import { unifySetopColumn } from "./eval_ops.ts";
 import type { Value } from "./value.ts";
+import { render, renderFloat } from "./value.ts";
 import { storeValue } from "./store.ts";
 import type { Privilege } from "./privileges.ts";
 import type { TableStore } from "./storage.ts";
@@ -1832,9 +1835,8 @@ export function stmtKind(stmt: Statement): string {
 
 // --- EXPLAIN rendering (spec/design/explain.md) ------------------------------------------------
 // EXPLAIN renders the planner's chosen plan as a deterministic, cross-core-identical result set: an
-// ordinary query Outcome with five columns — depth (i32, the pre-order nesting level), node (the
-// operator label — a fixed vocabulary, the §8 spelling contract), detail ("-" when a node has none),
-// and the deterministic est_rows/est_cost pair.
+// ordinary query Outcome whose structural depth/node/detail columns are always present; COSTS (the
+// default), ANALYZE, and LANE append their deterministic columns.
 // Every cell is non-empty and free of leading/trailing whitespace (the harness renders the actual cell
 // raw but TrimSpaces the expected line), so indentation is the depth integer, never whitespace (§2).
 // The renderer is hand-written per core (§5 forbids codegenning it); the corpus + explain.md are the
@@ -1843,31 +1845,54 @@ export function stmtKind(stmt: Statement): string {
 // ExplainRow is one rendered plan row before it becomes a Value tuple in explainOutcome.
 export type ExplainRow = {
   depth: number;
+  frameDepth: number;
   node: string;
   detail: string;
   estRows: bigint;
   estCost: bigint;
+  actualCost: bigint;
 };
 
 // ExplainRender accumulates the rendered plan rows. emit normalizes an empty detail to the "-"
 // sentinel so no cell renders blank (spec/design/explain.md §2).
 export class ExplainRender {
   rows: ExplainRow[] = [];
+  verbose = false;
+  frameDepth = 0;
   private next = 0;
   private estimates: { rows: bigint; cost: bigint }[];
-  constructor(estimates: { rows: bigint; cost: bigint }[] = []) {
+  private actual: bigint[];
+  constructor(estimates: { rows: bigint; cost: bigint }[] = [], actual: bigint[] = []) {
     this.estimates = estimates;
+    this.actual = actual;
+  }
+  setActualCosts(actual: bigint[]): void {
+    this.actual = actual;
+    for (let i = 0; i < this.rows.length; i++) this.rows[i]!.actualCost = actual[i] ?? 0n;
   }
   emit(depth: number, node: string, detail: string): void {
     const estimate = this.estimates[this.next++] ?? { rows: 0n, cost: 0n };
     this.rows.push({
       depth,
+      frameDepth: this.frameDepth,
       node,
       detail: detail === "" ? "-" : detail,
       estRows: estimate.rows,
       estCost: estimate.cost,
+      actualCost: this.actual[this.next - 1] ?? 0n,
     });
   }
+}
+
+export function explainActualCosts(
+  estimates: { rows: bigint; cost: bigint }[],
+  total: bigint,
+): bigint[] {
+  // Actual attribution is execution-only: an unexecuted metadata subtree must not inherit its
+  // estimate. The statement root is exact; descendant checkpoints overwrite these zeroes.
+  const actual = estimates.map(() => 0n);
+  if (actual.length > 0) actual[0] = total;
+  return actual;
 }
 
 // insertDetail renders an INSERT's ON CONFLICT disposition (or "-" when there is none).
@@ -1886,18 +1911,24 @@ export function cteDetail(b: CteBinding, mode: CteMode): string {
 
 // aggDetail renders an Aggregate node's attributes: the grouping-key count, aggregate count, the
 // grouping-set count when there is more than one set, and the HAVING conjunct count.
-export function aggDetail(sp: SelectPlan): string {
+export function aggDetail(sp: SelectPlan, verbose: boolean): string {
   const parts = [`groups=${sp.groupKeys.length} aggs=${sp.aggSpecs.length}`];
   if (sp.groupSets.length > 1) parts.push(`sets=${sp.groupSets.length}`);
-  if (sp.having !== null) parts.push(`having:conjuncts=${conjunctCount(sp.having)}`);
+  if (sp.having !== null) {
+    parts.push(
+      verbose ? `having=${renderRExpr(sp.having)}` : `having:conjuncts=${conjunctCount(sp.having)}`,
+    );
+  }
   return parts.join("; ");
 }
 
 // joinDetail renders a Nested Loop node's attributes: the join kind and the ON predicate's conjunct
 // count (a CROSS join has no ON). The JoinKind labels (inner/cross/left/right/full) are the spelling.
-export function joinDetail(j: PlanJoin): string {
+export function joinDetail(j: PlanJoin, verbose: boolean): string {
   if (j.on === null) return j.kind;
-  return `${j.kind}; on:conjuncts=${conjunctCount(j.on)}`;
+  return verbose
+    ? `${j.kind}; on=${renderRExpr(j.on)}`
+    : `${j.kind}; on:conjuncts=${conjunctCount(j.on)}`;
 }
 
 // setOpNodeName is the node label for a set-operation kind.
@@ -1973,11 +2004,9 @@ export function renderBoundSrc(e: RExpr | null): string {
   }
 }
 
-// renderBoundLit renders a constant bound operand as a single-line token. Integer / boolean / decimal
-// literals render deterministically; a float renders as the fixed token `<float>` (its layout is a
-// determinism-ledger exception, kept out of the plan text — spec/design/explain.md §6); a text literal
-// renders verbatim unless it contains a newline (which would split the cell), in which case `<text>`;
-// every other constant type renders as `<value>` for now (a later slice widens this).
+// renderBoundLit renders a constant bound operand as a single-line token. Floats use the native
+// shortest-round-trip spelling under explain-float-literal-layout; other values use their canonical
+// renderer, quoting textual forms so the token stays structurally unambiguous.
 export function renderBoundLit(e: RExpr): string {
   switch (e.kind) {
     case "constInt":
@@ -1987,17 +2016,346 @@ export function renderBoundLit(e: RExpr): string {
     case "constDecimal":
       return e.value.render();
     case "constText":
-      return /[\n\r]/.test(e.value) ? "<text>" : "'" + e.value + "'";
+      return quoteExplainText(e.value);
     case "constFloat":
-      return "<float>";
+      return renderFloat(e.value);
     default:
       return "<value>";
   }
 }
 
-// conjunctCount counts the top-level AND conjuncts of a residual filter (a deterministic integer —
-// the plan text carries the count, not the expression itself; a full expression printer is a later
-// slice, spec/design/explain.md §5).
+function quoteExplainText(value: string): string {
+  return (
+    "'" +
+    value
+      .replaceAll("\\", "\\\\")
+      .replaceAll("'", "''")
+      .replaceAll("\n", "\\n")
+      .replaceAll("\r", "\\r")
+      .replaceAll("\t", "\\t") +
+    "'"
+  );
+}
+
+function explainOp(op: BinaryOp): string {
+  switch (op) {
+    case "add":
+      return "+";
+    case "sub":
+      return "-";
+    case "mul":
+      return "*";
+    case "div":
+      return "/";
+    case "mod":
+      return "%";
+    case "eq":
+      return "=";
+    case "ne":
+      return "<>";
+    case "lt":
+      return "<";
+    case "gt":
+      return ">";
+    case "le":
+      return "<=";
+    case "ge":
+      return ">=";
+    case "and":
+      return "and";
+    case "or":
+      return "or";
+    case "concat":
+      return "||";
+    case "contains":
+      return "@>";
+    case "containedBy":
+      return "<@";
+    case "overlaps":
+      return "&&";
+    case "strictlyLeft":
+      return "<<";
+    case "strictlyRight":
+      return ">>";
+    case "notExtendRight":
+      return "&<";
+    case "notExtendLeft":
+      return "&>";
+    case "adjacent":
+      return "-|-";
+    case "jsonGet":
+      return "->";
+    case "jsonGetText":
+      return "->>";
+    case "jsonGetPath":
+      return "#>";
+    case "jsonGetPathText":
+      return "#>>";
+    case "jsonHasKey":
+      return "?";
+    case "jsonHasAnyKey":
+      return "?|";
+    case "jsonHasAllKeys":
+      return "?&";
+    case "jsonDeletePath":
+      return "#-";
+    case "jsonPathExists":
+      return "@?";
+    case "jsonPathMatch":
+      return "@@";
+  }
+}
+
+function explainCall(name: string, args: RExpr[]): string {
+  return `${name}(${args.map(renderRExpr).join(", ")})`;
+}
+
+// renderRExpr is EXPLAIN's canonical resolved-expression printer. Slots are structural (`#N`) so
+// aliases and host map order cannot affect the spelling; every compound is fully parenthesized.
+export function renderRExpr(e: RExpr): string {
+  const binary = (lhs: RExpr, op: string, rhs: RExpr): string =>
+    `(${renderRExpr(lhs)} ${op} ${renderRExpr(rhs)})`;
+  switch (e.kind) {
+    case "column":
+      return `#${e.index}`;
+    case "outerColumn":
+      return `outer(${e.level},${e.index})`;
+    case "param":
+      return `$${e.index + 1}`;
+    case "constInt":
+      return e.value.toString();
+    case "constFloat":
+      return renderFloat(e.value);
+    case "constBool":
+      return e.value ? "true" : "false";
+    case "constText":
+      return quoteExplainText(e.value);
+    case "constDecimal":
+      return e.value.render();
+    case "constBytea":
+      return quoteExplainText(render({ kind: "bytea", bytes: e.value }));
+    case "constUuid":
+      return quoteExplainText(render({ kind: "uuid", bytes: e.value }));
+    case "constTimestamp":
+      return quoteExplainText(render({ kind: "timestamp", micros: e.value }));
+    case "constTimestamptz":
+      return quoteExplainText(render({ kind: "timestamptz", micros: e.value }));
+    case "constDate":
+      return quoteExplainText(render({ kind: "date", days: e.value }));
+    case "constInterval":
+      return quoteExplainText(render({ kind: "interval", iv: e.value }));
+    case "constJson":
+      return quoteExplainText(e.value);
+    case "constJsonb":
+      return quoteExplainText(render({ kind: "jsonb", node: e.value }));
+    case "constJsonPath":
+      return quoteExplainText(e.value);
+    case "constNull":
+      return "NULL";
+    case "constArray":
+    case "constRange":
+      return quoteExplainText(render(e.value));
+    case "row":
+      return explainCall("row", e.fields);
+    case "array":
+      return `array[${e.elements.map(renderRExpr).join(", ")}]`;
+    case "field":
+      return `${renderRExpr(e.base)}.field${e.index}`;
+    case "subscript": {
+      const subs = e.subscripts.map((s) =>
+        s.isSlice
+          ? `${s.lower === null ? "" : renderRExpr(s.lower)}:${s.upper === null ? "" : renderRExpr(s.upper)}`
+          : renderRExpr(s.index),
+      );
+      return renderRExpr(e.base) + subs.map((s) => `[${s}]`).join("");
+    }
+    case "cast":
+      return `cast(${renderRExpr(e.operand)} as ${canonicalName(e.target)})`;
+    case "arrayCast":
+      return `array_cast(${renderRExpr(e.operand)})`;
+    case "neg":
+      return `(-${renderRExpr(e.operand)})`;
+    case "not":
+      return `(not ${renderRExpr(e.operand)})`;
+    case "arith":
+    case "compare":
+      return binary(e.lhs, explainOp(e.op), e.rhs);
+    case "and":
+      return binary(e.lhs, "and", e.rhs);
+    case "or":
+      return binary(e.lhs, "or", e.rhs);
+    case "jsonGet":
+      return binary(
+        e.base,
+        e.op === "arrow"
+          ? "->"
+          : e.op === "arrowText"
+            ? "->>"
+            : e.op === "hashArrow"
+              ? "#>"
+              : "#>>",
+        e.arg,
+      );
+    case "jsonContains":
+      return binary(e.a, "@>", e.b);
+    case "jsonHasKey":
+      return binary(
+        e.base,
+        e.hasKeyKind === "one" ? "?" : e.hasKeyKind === "any" ? "?|" : "?&",
+        e.arg,
+      );
+    case "jsonConcat":
+      return binary(e.a, "||", e.b);
+    case "jsonDelete":
+      return binary(e.base, e.deleteKind === "path" ? "#-" : "-", e.arg);
+    case "isNull":
+      return `(${renderRExpr(e.operand)} is ${e.negated ? "not " : ""}null)`;
+    case "isJson": {
+      const predicate = e.jsonKind === "value" ? "" : ` ${e.jsonKind}`;
+      return `(${renderRExpr(e.operand)} is ${e.negated ? "not " : ""}json${predicate}${e.uniqueKeys ? " with unique keys" : ""})`;
+    }
+    case "jsonCtor":
+      return `json(${renderRExpr(e.operand)}${e.uniqueKeys ? " with unique keys" : ""})`;
+    case "distinct":
+      return binary(e.lhs, e.negated ? "is not distinct from" : "is distinct from", e.rhs);
+    case "like":
+      return binary(e.lhs, `${e.negated ? "not " : ""}${e.insensitive ? "ilike" : "like"}`, e.rhs);
+    case "regex":
+      return binary(e.lhs, `${e.negated ? "!" : ""}~${e.insensitive ? "*" : ""}`, e.rhs);
+    case "casing":
+      return explainCall(e.upper ? "upper" : "lower", [e.arg]);
+    case "atTimeZone":
+      return binary(e.value, "at time zone", e.zone);
+    case "dateTrunc":
+      return explainCall(
+        "date_trunc",
+        e.zone === null ? [e.unit, e.value] : [e.unit, e.value, e.zone],
+      );
+    case "extract":
+      return `extract(${e.field} from ${renderRExpr(e.value)})`;
+    case "dateConvert":
+      return `cast(${renderRExpr(e.inner)} as ${canonicalName(e.to)})`;
+    case "dateClock":
+      return `date_clock(${e.offsetDays})`;
+    case "coalesce":
+      return explainCall("coalesce", e.args);
+    case "greatestLeast":
+      return explainCall(e.greatest ? "greatest" : "least", e.args);
+    case "scalarFunc":
+      return explainCall(e.func, e.args);
+    case "arrayFunc":
+      return explainCall(e.func, e.args);
+    case "rangeFunc":
+      return explainCall(e.func, e.args);
+    case "regexFunc":
+      return explainCall(`regexp_${e.func}`, e.args);
+    case "rangeCtor":
+      return explainCall(rangeNameForElement(e.elem) ?? "range", e.args);
+    case "rangeOp":
+      return explainCall(`range_${camelToSnake(e.op)}`, e.args);
+    case "rangeSetOp":
+      return explainCall(`range_${camelToSnake(e.op)}`, e.args);
+    case "variadic":
+      return explainCall(e.func, e.args);
+    case "jsonPathFn":
+      return explainCall(
+        e.pathFnKind === "exists"
+          ? "jsonb_path_exists"
+          : e.pathFnKind === "queryFirst"
+            ? "jsonb_path_query_first"
+            : e.pathFnKind === "queryArray"
+              ? "jsonb_path_query_array"
+              : e.pathFnKind === "match"
+                ? "jsonb_path_match"
+                : "jsonb_path_match_silent",
+        e.args,
+      );
+    case "jsonSqlFn":
+      return renderExplainJsonSql(e);
+    case "jsonObjectFromArrays":
+      return explainCall(e.json ? "json_object" : "jsonb_object", e.args);
+    case "jsonSetInsert":
+      return explainCall(`jsonb_${e.mode}`, e.args);
+    case "jsonBuild":
+      return explainCall(`${e.json ? "json" : "jsonb"}_build_${e.buildKind}`, e.args);
+    case "case": {
+      const arms = e.arms
+        .map((a) => `when ${renderRExpr(a.cond)} then ${renderRExpr(a.result)}`)
+        .join(" ");
+      return `(case ${arms} else ${renderRExpr(e.els)} end)`;
+    }
+    case "quantified":
+      return `${renderRExpr(e.lhs)} ${explainOp(e.op)} ${e.all ? "all" : "any"}(${renderRExpr(e.array)})`;
+    case "inValues":
+      return `${renderRExpr(e.lhs)} ${e.negated ? "not " : ""}in (${e.list.map(renderExplainValue).join(", ")})`;
+    case "subquery": {
+      if (e.subKind === "scalar") return "scalar(<subquery>)";
+      if (e.subKind === "exists") return `${e.negated ? "not " : ""}exists(<subquery>)`;
+      if (e.subKind === "in")
+        return `${renderRExpr(e.lhs!)} ${e.negated ? "not " : ""}in (<subquery>)`;
+      return `${renderRExpr(e.lhs!)} ${explainOp(e.op!)} ${e.all ? "all" : "any"}(<subquery>)`;
+    }
+  }
+}
+
+function renderExplainJsonSql(e: Extract<RExpr, { kind: "jsonSqlFn" }>): string {
+  let out = `json_${e.sqlKind}(${renderRExpr(e.args[0]!)}, ${renderRExpr(e.args[1]!)}`;
+  if (e.sqlKind === "exists") {
+    out += ` ${explainJsonBehavior(e.onError)} on error`;
+  } else if (e.sqlKind === "value") {
+    out += ` returning ${explainJsonReturning(e.returning, e.decimal)}`;
+    out += ` ${explainJsonBehavior(e.onEmpty)} on empty ${explainJsonBehavior(e.onError)} on error`;
+  } else {
+    out += ` returning ${explainJsonReturning(e.returning, e.decimal)}`;
+    out += ` ${explainJsonWrapper(e.wrapper)}`;
+    out += e.keepQuotes ? " keep quotes on scalar string" : " omit quotes on scalar string";
+    out += ` ${explainJsonBehavior(e.onEmpty)} on empty ${explainJsonBehavior(e.onError)} on error`;
+  }
+  return out + ")";
+}
+
+function explainJsonReturning(returning: ScalarType, decimal: DecimalTypmod | null): string {
+  if (returning === "decimal" && decimal !== null) {
+    return `decimal(${decimal.precision},${decimal.scale})`;
+  }
+  return canonicalName(returning);
+}
+
+function explainJsonWrapper(wrapper: JsonWrapper): string {
+  if (wrapper === "without") return "without array wrapper";
+  return `with ${wrapper} array wrapper`;
+}
+
+function explainJsonBehavior(behavior: JsonOnBehavior): string {
+  if (behavior === "emptyArray") return "empty array";
+  if (behavior === "emptyObject") return "empty object";
+  return behavior;
+}
+
+function camelToSnake(value: string): string {
+  return value.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+}
+
+function renderExplainValue(value: Value): string {
+  switch (value.kind) {
+    case "null":
+      return "NULL";
+    case "int":
+      return value.int.toString();
+    case "bool":
+      return value.value ? "true" : "false";
+    case "decimal":
+      return value.dec.render();
+    case "f32":
+    case "f64":
+      return renderFloat(value.value);
+    default:
+      return quoteExplainText(render(value));
+  }
+}
+
+// conjunctCount retains the compact non-VERBOSE spelling. VERBOSE uses the complete resolved-
+// expression printer (spec/design/explain.md §5).
 export function conjunctCount(e: RExpr | null): number {
   if (e === null) return 0;
   if (e.kind === "and") return conjunctCount(e.lhs) + conjunctCount(e.rhs);

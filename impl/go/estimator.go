@@ -2023,7 +2023,7 @@ func (db *engine) estimateQueryPlan(qp queryPlan, ctx *estimateCTECtx) estimated
 	}
 }
 
-func (db *engine) estimateMutationScan(table *catTable, dbScope *string, filter *rExpr) estimatedPlan {
+func (db *engine) estimateMutationScan(table *catTable, dbScope *string, filter *rExpr, ctx *estimateCTECtx) estimatedPlan {
 	rel := scopeRel{label: strings.ToLower(table.Name), table: table, offset: 0, db: dbScope}
 	bound := db.planMutationScan(dbScope, table, filter).bound
 	scan := leafEstimatedPlan(db.estimateSelectedScan(rel, bound, filter))
@@ -2038,7 +2038,7 @@ func (db *engine) estimateMutationScan(table *catTable, dbScope *string, filter 
 	var local [estimatorUnitCount]int64
 	local[estimatorUnitOperatorEval] = satEstimateMul(estimatorOperatorNodes(filter), scan.root.rows)
 	plan := wrapEstimatedPlan(scan, rows, logicalRows, local)
-	db.addExpressionSubqueries(&plan.root, filter, scan.root.rows, nil)
+	db.addExpressionSubqueries(&plan.root, filter, scan.root.rows, ctx)
 	plan.nodes[0] = plan.root
 	return plan
 }
@@ -2047,6 +2047,13 @@ func (db *engine) estimateMutationScan(table *catTable, dbScope *string, filter 
 // renderer. Planning is deliberately unmetered; the renderer independently walks the same selected
 // plan, and a shape mismatch is an internal bug caught by the shared corpus.
 func (db *engine) estimateExplain(inner *statement) ([]planEstimate, error) {
+	if inner.With != nil && withHasDml(inner.With) {
+		return db.estimateExplainWithDml(inner.With)
+	}
+	return db.estimateExplainScoped(inner, nil, nil)
+}
+
+func (db *engine) estimateExplainScoped(inner *statement, bindings []*cteBinding, ctx *estimateCTECtx) ([]planEstimate, error) {
 	switch {
 	case inner.Insert != nil:
 		ins := inner.Insert
@@ -2055,11 +2062,11 @@ func (db *engine) estimateExplain(inner *statement) ([]planEstimate, error) {
 		}
 		var source estimatedPlan
 		if ins.Select != nil {
-			plan, err := db.planQuery(queryExpr{Select: ins.Select}, nil, nil, &paramTypes{})
+			plan, err := db.planQuery(queryExpr{Select: ins.Select}, nil, bindings, &paramTypes{})
 			if err != nil {
 				return nil, err
 			}
-			source = db.estimateQueryPlan(plan, nil)
+			source = db.estimateQueryPlan(plan, ctx)
 		} else {
 			rows := int64(len(ins.Rows))
 			source = leafEstimatedPlan(planEstimate{rows: rows, logicalRows: rows})
@@ -2072,11 +2079,11 @@ func (db *engine) estimateExplain(inner *statement) ([]planEstimate, error) {
 		if !ok {
 			return nil, newError(UndefinedTable, "table does not exist: "+upd.Table)
 		}
-		filter, err := db.explainDmlFilter(table, upd.Filter)
+		filter, err := db.explainDmlFilter(table, upd.Filter, bindings)
 		if err != nil {
 			return nil, err
 		}
-		scan := db.estimateMutationScan(table, upd.DB, filter)
+		scan := db.estimateMutationScan(table, upd.DB, filter, ctx)
 		root := scan.root
 		return parentEstimatedPlan(root, scan).nodes, nil
 	case inner.Delete != nil:
@@ -2085,11 +2092,11 @@ func (db *engine) estimateExplain(inner *statement) ([]planEstimate, error) {
 		if !ok {
 			return nil, newError(UndefinedTable, "table does not exist: "+del.Table)
 		}
-		filter, err := db.explainDmlFilter(table, del.Filter)
+		filter, err := db.explainDmlFilter(table, del.Filter, bindings)
 		if err != nil {
 			return nil, err
 		}
-		scan := db.estimateMutationScan(table, del.DB, filter)
+		scan := db.estimateMutationScan(table, del.DB, filter, ctx)
 		root := scan.root
 		return parentEstimatedPlan(root, scan).nodes, nil
 	default:
@@ -2099,4 +2106,52 @@ func (db *engine) estimateExplain(inner *statement) ([]planEstimate, error) {
 		}
 		return db.estimateQueryPlan(plan, nil).nodes, nil
 	}
+}
+
+func (db *engine) estimateExplainWithDml(wq *withQuery) ([]planEstimate, error) {
+	wp, err := db.planExplainWithDml(wq)
+	if err != nil {
+		return nil, err
+	}
+	ctx := &estimateCTECtx{bindings: wp.bindings, modes: wp.modes, bodies: make([]estimatedPlan, len(wp.bindings))}
+	definitionNodes := make([]planEstimate, 0)
+	var contribution planEstimate
+	for i, binding := range wp.bindings {
+		var body estimatedPlan
+		if binding.isDml() {
+			stmt := statement{Insert: binding.dm.insert, Update: binding.dm.update, Delete: binding.dm.delete}
+			nodes, err := db.estimateExplainScoped(&stmt, wp.bindings[:i], ctx)
+			if err != nil {
+				return nil, err
+			}
+			body = estimatedPlan{root: nodes[0], nodes: nodes}
+		} else {
+			body = db.estimateQueryPlan(binding.plan, ctx)
+		}
+		ctx.bodies[i] = body
+		cteEstimate := planEstimate{rows: body.root.rows, logicalRows: body.root.logicalRows}
+		if binding.isDml() || wp.modes[i] == cteMaterialize && binding.refs > 0 {
+			cteEstimate = body.root
+			contribution = addPlanEstimates(contribution, body.root)
+		}
+		definitionNodes = append(definitionNodes, cteEstimate)
+		definitionNodes = append(definitionNodes, body.nodes...)
+	}
+	var primary estimatedPlan
+	if wp.primary != nil {
+		primary = db.estimateQueryPlan(*wp.primary, ctx)
+	} else {
+		stmt := statement{Insert: wp.body.Insert, Update: wp.body.Update, Delete: wp.body.Delete}
+		nodes, err := db.estimateExplainScoped(&stmt, wp.bindings, ctx)
+		if err != nil {
+			return nil, err
+		}
+		primary = estimatedPlan{root: nodes[0], nodes: nodes}
+	}
+	root := addPlanEstimates(contribution, primary.root)
+	root.rows, root.logicalRows = primary.root.rows, primary.root.logicalRows
+	nodes := []planEstimate{root}
+	nodes = append(nodes, definitionNodes...)
+	nodes = append(nodes, primary.nodes...)
+	return nodes, nil
 }

@@ -61,13 +61,15 @@ sql_statement  ::= create_table
                  | rollback
 
 /* EXPLAIN renders the planner's chosen plan for the inner statement as a result set instead of
- * running it (../design/explain.md). EXPLAIN and the optional ANALYZE modifier are recognized
- * POSITIONALLY and are NOT reserved (§3) — no statement begins with a bare identifier, so the leading
- * word disambiguates without lookahead, and `explain` / `analyze` stay legal identifiers elsewhere.
- * The inner statement is restricted to a query or DML (never DDL, transaction control, or a nested
- * EXPLAIN). Plain EXPLAIN plans without executing the inner statement; EXPLAIN ANALYZE executes it and
- * reports its actual accrued cost + row count. */
-explain        ::= "EXPLAIN" "ANALYZE"? explainable
+ * running it (../design/explain.md). The legacy positional ANALYZE modifier and the parenthesized
+ * boolean option list are mutually exclusive spellings. Option values default to TRUE when omitted;
+ * TRUE/FALSE/ON/OFF are accepted. An option may occur at most once. EXPLAIN and option words are
+ * recognized POSITIONALLY and are NOT reserved (§3). The inner statement is restricted to a query or
+ * DML (never DDL, transaction control, or a nested EXPLAIN). */
+explain        ::= "EXPLAIN" ( "ANALYZE" | explain_options )? explainable
+explain_options ::= "(" explain_option ( "," explain_option )* ")"
+explain_option ::= ( "ANALYZE" | "VERBOSE" | "COSTS" | "LANE" ) explain_boolean?
+explain_boolean ::= "TRUE" | "FALSE" | "ON" | "OFF"
 explainable    ::= query_statement | insert | update | delete
 
 /* Deterministic column-statistics collection (../design/statistics.md). One target per statement;

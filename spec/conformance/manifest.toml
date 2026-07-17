@@ -282,7 +282,7 @@ description = "Index EXPRESSION bound — an index-bounded base-relation SELECT 
 
 [[capability]]
 id = "query.explain"
-description = "EXPLAIN — `EXPLAIN <query>` renders the planner's chosen plan as a deterministic result set instead of executing the statement (spec/design/explain.md). Output columns are `depth` (i32, the plan node's 0-based nesting level from a pre-order DFS), `node` (text, a fixed cross-core operator label), `detail` (text attributes or `-`), `est_rows` (non-NULL i64 rows emitted to the parent), and `est_cost` (non-NULL i64 cumulative scheduled cost through the node). Estimate arithmetic and semantic CTE attribution are the cross-core contract in estimator.md; DML roots report estimated affected rows. Every cell is non-empty and carries no leading/trailing whitespace (indentation is the `depth` integer), so rows are asserted with `nosort`. Plain EXPLAIN plans WITHOUT executing the inner statement and never mutates. Plan text and estimates are byte-identical across cores; this jed-specific rendering is not oracle-imported."
+description = "EXPLAIN — `EXPLAIN <query>` or `EXPLAIN (ANALYZE|VERBOSE|COSTS|LANE [boolean], ...) <query>` renders the selected plan as a deterministic pre-order result set (spec/design/explain.md). `depth`/`node`/`detail` are always present; COSTS (default true) adds non-NULL i64 `est_rows`/`est_cost`, ANALYZE adds `actual_cost`, and LANE adds the statement-wide streaming/buffered/deferred tag. VERBOSE prints canonical resolved filters/ON/HAVING and output projections; ordinary mode retains compact conjunct counts. Exact float bounds use native shortest rendering under the ledgered presentation exception. Plain EXPLAIN never executes or mutates, including a data-modifying WITH. SELECT scans report their exact touched-set width. This jed-specific rendering is not oracle-imported."
 
 [[capability]]
 id = "maintenance.analyze"
@@ -294,15 +294,15 @@ description = "The read-only qualified `jed_statistics` computed relation (spec/
 
 [[capability]]
 id = "query.explain_analyze"
-description = "EXPLAIN ANALYZE of a read query — runs the inner statement and reports its ACTUAL accrued cost + row count on an `Analyze` root node (`cost=<C> rows=<R>`), with the plan tree one level deeper (spec/design/explain.md §3). The Analyze row repeats the planned child's `est_rows`/`est_cost`; actual figures remain detail-only. Because jed's cost meter is deterministic, the reported cost is byte-identical and corpus-assertable. The EXPLAIN statement's OWN cost (one row_produced per emitted plan row) is independent of the inner cost. Builds on query.explain."
+description = "EXPLAIN ANALYZE of a read query — runs the inner statement, reports exact accrued cost + row count on an `Analyze` root (`cost=<C> rows=<R>`), and appends a non-NULL inclusive `actual_cost` for every rendered node (spec/design/explain.md §3). Leaf scan sub-meters and pipeline checkpoints make the attribution execution-derived and deterministic. COSTS may independently hide estimates; EXPLAIN's own outcome cost remains one row_produced per displayed row. Builds on query.explain."
 
 [[capability]]
 id = "dml.explain_analyze"
-description = "EXPLAIN ANALYZE of a DML statement (INSERT / UPDATE / DELETE) — unlike plain EXPLAIN, ANALYZE EXECUTES the inner statement, so the mutation happens and is committed (EXPLAIN ANALYZE of a write IS a write, classified by stmtIsWrite). The Analyze root reports the mutation's actual accrued cost + affected-row count; the plan tree (Insert/Update/Delete + source/scan) sits one level deeper (spec/design/explain.md §3). Builds on dml.explain and query.explain_analyze."
+description = "EXPLAIN ANALYZE of a DML statement (INSERT / UPDATE / DELETE, including a writable WITH primary) executes and commits the mutation. The Analyze root reports actual accrued cost + affected rows, and every plan row has inclusive `actual_cost`; UPDATE/DELETE Filter and Scan attribution comes from the executed target scan. Builds on dml.explain and query.explain_analyze."
 
 [[capability]]
 id = "dml.explain"
-description = "EXPLAIN of a DML statement (INSERT / UPDATE / DELETE) — renders the plan WITHOUT executing it, so an EXPLAIN of a DELETE deletes nothing and an EXPLAIN of an INSERT inserts nothing (spec/design/explain.md §2). The DML root node is `Insert <table>` (with an `on conflict …` note), `Update <table>` (with `sets=N`), or `Delete <table>`; an INSERT … VALUES has a `Values rows=N` child, an INSERT … SELECT renders its source subplan, and an UPDATE/DELETE renders its residual `Filter` and its target `Scan` with the chosen access path. The scan bound is chosen by the SAME detectors the executor uses (the PK range bound, then GIN, then GiST — UPDATE/DELETE do not use secondary B-tree index bounds, indexes.md §5), so the reported access path matches the one the statement would run. Builds on query.explain."
+description = "EXPLAIN of INSERT / UPDATE / DELETE renders without execution, including complete data-modifying-WITH definition and primary-DML trees (spec/design/explain.md). UPDATE/DELETE target scans use the executor's access-path planner and append the exact resolved DML touched-set count (filter, assignment sources, and storage-reading RETURNING side). VERBOSE prints resolved residual/projection expressions. Builds on query.explain."
 
 [[capability]]
 id = "query.gin_scan"

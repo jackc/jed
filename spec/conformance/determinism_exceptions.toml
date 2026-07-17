@@ -39,6 +39,28 @@ test         = "the `R` render tag's tolerant compare (conformance.md §1) — p
 status       = "ratified"
 reason       = "Each language's shortest-round-trip formatter chooses different presentation (Rust {} vs Go FormatFloat(-1) vs JS toString) even when the digits agree. Pinning one shared formatter is decimal-limb-level effort for zero observable benefit given the `R` tolerant compare."
 
+# --- EXPLAIN: canonical resolved-expression spelling ----------------------
+[[exception]]
+id           = "explain-expression-spelling"
+surface      = "EXPLAIN (VERBOSE) residual predicates, HAVING/ON expressions, and output=[...] projection lists (../design/explain.md §5)"
+class        = "P"
+drops        = []
+blast_radius = "presentation inside the EXPLAIN detail text only. The printer consumes the selected resolved-expression tree and cannot affect resolution, plan selection, execution, values, row order, or cost. Every resolved variant has an explicit arm; there is no debug/generic fallback."
+test         = "exact `T` cells in suites/query/explain_followon.test pin fully-parenthesized column slots, constants, operators, CASE, and function/projection spelling across Rust/Go/TypeScript; ordinary query conformance independently pins the expression's semantics and cost."
+status       = "ratified"
+reason       = "The surface is deliberately hand-written in each independent core rather than generated. No determinism guarantee is surrendered, but the explicit ledger audit records the presentation boundary and its non-contamination rule, as required for promoting resolved-expression structure into observable plan text."
+
+# --- EXPLAIN: native shortest float text in details -----------------------
+[[exception]]
+id           = "explain-float-literal-layout"
+surface      = "f32/f64 literals embedded in EXPLAIN bound and VERBOSE expression detail text (../design/explain.md §5)"
+class        = "A"
+drops        = ["G2", "G3"]
+blast_radius = "the float token's STRING layout inside one EXPLAIN detail cell (exponent threshold/spelling) only. The parsed IEEE value, encoded bound, selected access path, result rows, estimates, actual cost, and every non-float detail token remain exact. Plan text is terminal and never reparsed for execution."
+test         = "suites/query/explain_followon.test pins an exactly shared ordinary-layout value in both the verbose expression and compact PK bound. Float-key/query suites independently pin the encoded bound and results; formatter-threshold spellings join the existing float-render-layout exemption rather than gaining a second semantic tolerance path."
+status       = "ratified"
+reason       = "The bound must expose the exact value rather than the former `<float>` placeholder, but jed intentionally retains each language's native shortest-round-trip formatter. As with float-render-layout, equivalent exponent/layout choices can differ even though the value and plan are identical."
+
 # --- uuidv4: random generation on the entropy seam ---------------------------
 [[exception]]
 id           = "uuidv4-entropy"

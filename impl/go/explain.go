@@ -7,7 +7,8 @@ import (
 )
 
 // EXPLAIN renders the planner's chosen plan as a deterministic, cross-core-identical result set
-// (spec/design/explain.md). The output is an ordinary query outcome with five columns:
+// (spec/design/explain.md). The first three columns are structural; COSTS (the default), ANALYZE,
+// and LANE append their deterministic columns:
 //
 //	depth  i32   the plan node's nesting level (0-based), from a pre-order DFS of the plan tree
 //	node   text  the operator label (a fixed vocabulary — the §8 cross-core spelling contract)
@@ -17,7 +18,7 @@ import (
 //
 // Rows are emitted in pre-order, so the row order is deterministic by construction — the corpus
 // asserts an EXPLAIN with `nosort` (a sanctioned use, like composite record_out). Plain EXPLAIN
-// renders the plan WITHOUT executing the inner statement; EXPLAIN ANALYZE (a later slice) runs it.
+// renders the plan WITHOUT executing the inner statement; EXPLAIN ANALYZE runs it.
 //
 // Every cell is non-empty and free of leading/trailing whitespace — the conformance harness renders
 // the actual cell raw but TrimSpaces the expected line, so indentation is carried by `depth`, never
@@ -27,7 +28,13 @@ import (
 type explainRender struct {
 	rows      [][]Value
 	estimates []planEstimate
+	actual    []int64
+	verbose   bool
 	next      int
+	// frameDepths parallels rows and identifies the structural queryPlan frame that emitted each
+	// node. Labels are not identities: an outer query and a derived table may both contain `Scan t`.
+	frameDepths []int
+	frameDepth  int
 }
 
 // emit appends one plan row. An empty detail becomes the "-" sentinel so no cell renders blank.
@@ -42,8 +49,16 @@ func (r *explainRender) emit(depth int, node, detail string) {
 	r.next++
 	r.rows = append(r.rows, []Value{
 		IntValue(int64(depth)), TextValue(node), TextValue(detail),
-		IntValue(estimate.rows), IntValue(estimate.cost()),
+		IntValue(estimate.rows), IntValue(estimate.cost()), IntValue(r.actualCost(r.next - 1)),
 	})
+	r.frameDepths = append(r.frameDepths, r.frameDepth)
+}
+
+func (r *explainRender) actualCost(i int) int64 {
+	if i >= 0 && i < len(r.actual) {
+		return r.actual[i]
+	}
+	return 0
 }
 
 // executeExplain plans the inner statement and renders the plan (spec/design/explain.md). Plain
@@ -51,7 +66,7 @@ func (r *explainRender) emit(depth int, node, detail string) {
 // renderQueryPlan walks. The EXPLAIN statement's own cost is one row_produced per emitted plan row.
 func (db *engine) executeExplain(ex *explain, params []Value) (outcome, error) {
 	if ex.Analyze {
-		return db.executeExplainAnalyze(ex.Inner, params)
+		return db.executeExplainAnalyze(ex, params)
 	}
 	if len(params) > 0 {
 		// Plain EXPLAIN renders the plan structurally (a $N bound source prints as "$N", not its
@@ -62,11 +77,11 @@ func (db *engine) executeExplain(ex *explain, params []Value) (outcome, error) {
 	if err != nil {
 		return outcome{}, err
 	}
-	r := explainRender{estimates: estimates}
+	r := explainRender{estimates: estimates, verbose: ex.Verbose}
 	if err := db.renderExplain(&r, ex.Inner, 0); err != nil {
 		return outcome{}, err
 	}
-	return db.explainOutcome(r.rows), nil
+	return db.explainOutcome(r.rows, ex), nil
 }
 
 // executeExplainAnalyze renders the plan AND runs the inner statement, reporting the inner's ACTUAL
@@ -76,20 +91,25 @@ func (db *engine) executeExplain(ex *explain, params []Value) (outcome, error) {
 // statement executes for real (a DML inner mutates, and the outer autocommit commits it — EXPLAIN
 // ANALYZE of a write IS a write, classified by stmtIsWrite). The EXPLAIN statement's OWN cost is one
 // row_produced per emitted plan row (independent of the inner cost, which appears only in the root).
-func (db *engine) executeExplainAnalyze(inner *statement, params []Value) (outcome, error) {
+func (db *engine) executeExplainAnalyze(ex *explain, params []Value) (outcome, error) {
+	inner := ex.Inner
 	// Render the plan tree first (plan-only, no execution — pre-mutation).
 	estimates, err := db.estimateExplain(inner)
 	if err != nil {
 		return outcome{}, err
 	}
-	body := explainRender{estimates: estimates}
+	body := explainRender{estimates: estimates, verbose: ex.Verbose}
 	if err := db.renderExplain(&body, inner, 0); err != nil {
 		return outcome{}, err
 	}
 	// Execute the inner statement for real, capturing its actual accrued cost + row count. Privileges
 	// and the lifetime budget were already admitted on the EXPLAIN (dispatchStmt recurses into the
 	// inner), and the write gate / commit are handled by the outer autocommit.
+	profile := &actualCostProfile{byNode: make(map[actualCostKey][]int64)}
+	previousProfile := db.explainActual
+	db.explainActual = profile
 	innerOut, err := db.dispatchStmtBody(*inner, params)
+	db.explainActual = previousProfile
 	if err != nil {
 		return outcome{}, err
 	}
@@ -97,8 +117,13 @@ func (db *engine) executeExplainAnalyze(inner *statement, params []Value) (outco
 	if innerOut.Kind == outcomeStatement {
 		actualRows = innerOut.RowsAffected // a DML statement without RETURNING
 	}
+	body.actual = explainActualCosts(estimates, innerOut.Cost)
+	profile.apply(body.rows, body.frameDepths, body.actual)
+	for i := range body.rows {
+		body.rows[i][5] = IntValue(body.actualCost(i))
+	}
 	// Assemble: the Analyze root carries the actual figures; the plan tree sits one level deeper.
-	r := explainRender{estimates: []planEstimate{}}
+	r := explainRender{estimates: []planEstimate{}, actual: []int64{innerOut.Cost}}
 	if len(estimates) > 0 {
 		r.estimates = append(r.estimates, estimates[0])
 	}
@@ -107,54 +132,323 @@ func (db *engine) executeExplainAnalyze(inner *statement, params []Value) (outco
 		shifted := append([]Value{IntValue(row[0].Int + 1)}, row[1:]...)
 		r.rows = append(r.rows, shifted)
 	}
-	return db.explainOutcome(r.rows), nil
+	return db.explainOutcome(r.rows, ex), nil
+}
+
+type actualCostKey struct {
+	frame int
+	node  string
+}
+
+type actualCostFrame struct {
+	byNode    map[actualCostKey][]int64
+	inclusive int64
+}
+
+type actualCostProfile struct {
+	byNode       map[actualCostKey][]int64
+	frames       []actualCostFrame
+	folded       map[actualCostKey][]int64
+	foldSuppress int
+}
+
+func (p *actualCostProfile) key(node string) actualCostKey {
+	return actualCostKey{frame: len(p.frames), node: node}
+}
+
+func (p *actualCostProfile) record(node string, cost int64) {
+	if p != nil {
+		target := p.byNode
+		if len(p.frames) > 0 {
+			target = p.frames[len(p.frames)-1].byNode
+		}
+		key := p.key(node)
+		target[key] = append(target[key], cost)
+	}
+}
+
+// recordParent records an inclusive checkpoint for an operator after its children have run. The
+// renderer walks parents before children, so parents of another occurrence with the same label are
+// placed at the front of that label's deterministic queue.
+func (p *actualCostProfile) recordParent(node string, cost int64) {
+	if p != nil {
+		target := p.byNode
+		key := p.key(node)
+		if len(p.frames) > 0 {
+			frame := &p.frames[len(p.frames)-1]
+			target = frame.byNode
+			if pending := p.folded[key]; len(pending) > 0 {
+				frame.inclusive += pending[0]
+				p.folded[key] = pending[1:]
+			}
+			cost += frame.inclusive
+		}
+		target[key] = append([]int64{cost}, target[key]...)
+	}
+}
+
+// recordFolded activates hidden subquery work at its containing visible operator. Execution records
+// operators bottom-up, so once Filter is reached the same amount remains inclusive in every parent
+// checkpoint above it. frame is the structural queryPlan depth that will execute after folding.
+func (p *actualCostProfile) recordFolded(frame int, node string, cost int64) {
+	if p == nil || p.foldSuppress > 0 || cost == 0 {
+		return
+	}
+	if p.folded == nil {
+		p.folded = make(map[actualCostKey][]int64)
+	}
+	key := actualCostKey{frame: frame, node: node}
+	p.folded[key] = append(p.folded[key], cost)
+}
+
+func (p *actualCostProfile) beginFrame() {
+	if p != nil {
+		p.frames = append(p.frames, actualCostFrame{byNode: make(map[actualCostKey][]int64)})
+	}
+}
+
+func (p *actualCostProfile) endFrame() {
+	if p == nil || len(p.frames) == 0 {
+		return
+	}
+	last := len(p.frames) - 1
+	frame := p.frames[last]
+	p.frames = p.frames[:last]
+	target := p.byNode
+	if len(p.frames) > 0 {
+		target = p.frames[len(p.frames)-1].byNode
+	}
+	for key, costs := range frame.byNode {
+		target[key] = append(target[key], costs...)
+	}
+}
+
+func (p *actualCostProfile) discardFrame() {
+	if p != nil && len(p.frames) > 0 {
+		p.frames = p.frames[:len(p.frames)-1]
+	}
+}
+
+func (p *actualCostProfile) apply(rows [][]Value, frameDepths []int, actual []int64) {
+	used := make(map[actualCostKey]int)
+	cteUsed := make(map[actualCostKey]int)
+	suppressedDepth := -1
+	for i, row := range rows {
+		if len(row) < 2 || row[1].Kind != ValText {
+			continue
+		}
+		depth := int(row[0].Int)
+		if suppressedDepth >= 0 {
+			if depth > suppressedDepth {
+				continue
+			}
+			suppressedDepth = -1
+		}
+		node := row[1].str()
+		frame := 0
+		if i < len(frameDepths) {
+			frame = frameDepths[i]
+		}
+		key := actualCostKey{frame: frame, node: node}
+		values := p.byNode[key]
+		at := used[key]
+		if at < len(values) {
+			if i != 0 {
+				actual[i] = values[at]
+			} // the rendered plan root already owns the exact whole-statement total
+			used[key] = at + 1
+		}
+		if strings.HasPrefix(node, "CTE ") && !strings.HasPrefix(node, "CTE Scan ") {
+			name := strings.TrimPrefix(node, "CTE ")
+			markerKey := actualCostKey{frame: frame, node: "@cte-body " + name}
+			markers := p.byNode[markerKey]
+			at := cteUsed[markerKey]
+			if at < len(markers) {
+				if markers[at] == 0 {
+					suppressedDepth = depth
+				}
+				cteUsed[markerKey] = at + 1
+			}
+		}
+	}
+}
+
+// explainActualCosts seeds execution-only attribution. The root owns the exact statement total;
+// every descendant starts at zero and is populated only by an execution checkpoint. In particular,
+// an informational subtree under an unexecuted CTE definition must never inherit its estimate.
+func explainActualCosts(estimates []planEstimate, total int64) []int64 {
+	actual := make([]int64, len(estimates))
+	if len(actual) > 0 {
+		actual[0] = total
+	}
+	return actual
 }
 
 // explainOutcome wraps rendered plan rows as a query outcome, charging the EXPLAIN's own cost — one
 // row_produced per emitted plan row (a deterministic function of the plan-row count).
-func (db *engine) explainOutcome(rows [][]Value) outcome {
+func (db *engine) explainOutcome(rows [][]Value, ex *explain) outcome {
 	meter := db.session.newMeter()
 	meter.Charge(costs.RowProduced * int64(len(rows)))
+	names := []string{"depth", "node", "detail"}
+	types := []string{"i32", "text", "text"}
+	lane := ""
+	if ex.Lane {
+		lane = db.explainLane(ex.Inner)
+	}
+	outRows := make([][]Value, len(rows))
+	for i, row := range rows {
+		outRows[i] = append([]Value{}, row[:3]...)
+		if ex.Costs {
+			outRows[i] = append(outRows[i], row[3], row[4])
+		}
+		if ex.Analyze {
+			outRows[i] = append(outRows[i], row[5])
+		}
+		if ex.Lane {
+			outRows[i] = append(outRows[i], TextValue(lane))
+		}
+	}
+	if ex.Costs {
+		names = append(names, "est_rows", "est_cost")
+		types = append(types, "i64", "i64")
+	}
+	if ex.Analyze {
+		names = append(names, "actual_cost")
+		types = append(types, "i64")
+	}
+	if ex.Lane {
+		names = append(names, "lane")
+		types = append(types, "text")
+	}
 	return outcome{
 		Kind:        outcomeQuery,
-		ColumnNames: []string{"depth", "node", "detail", "est_rows", "est_cost"},
-		ColumnTypes: []string{"i32", "text", "text", "i64", "i64"},
-		Rows:        rows,
+		ColumnNames: names,
+		ColumnTypes: types,
+		Rows:        outRows,
 		Cost:        meter.Accrued,
 	}
+}
+
+func (db *engine) explainLane(inner *statement) string {
+	// Query checks stmtIsWrite before either lazy lane. A SELECT containing nextval/setval and a
+	// top-level WITH containing DML therefore use the buffered write dispatcher regardless of shape.
+	if stmtIsWrite(*inner) {
+		return "buffered"
+	}
+	if inner.With != nil || inner.SetOp != nil {
+		return "deferred"
+	}
+	if inner.Select != nil {
+		plan, err := db.planExplainInner(inner)
+		if err == nil && plan.sel != nil && pullStreamingScanEligible(plan.sel) {
+			return "streaming"
+		}
+	}
+	return "buffered"
 }
 
 // renderExplain renders the plan for the inner statement (spec/design/explain.md). A DML statement is
 // rendered by explainDml (plan-only — never executing, so an EXPLAIN of a DELETE deletes nothing); a
 // read query is planned by planExplainInner and walked by renderQueryPlan.
 func (db *engine) renderExplain(r *explainRender, inner *statement, depth int) error {
+	return db.renderExplainWithBindings(r, inner, depth, nil)
+}
+
+func (db *engine) renderExplainWithBindings(r *explainRender, inner *statement, depth int, bindings []*cteBinding) error {
 	switch {
 	case inner.Insert != nil:
-		return db.explainInsert(r, inner.Insert, depth)
+		return db.explainInsert(r, inner.Insert, depth, bindings)
 	case inner.Update != nil:
-		return db.explainUpdate(r, inner.Update, depth)
+		return db.explainUpdate(r, inner.Update, depth, bindings)
 	case inner.Delete != nil:
-		return db.explainDelete(r, inner.Delete, depth)
+		return db.explainDelete(r, inner.Delete, depth, bindings)
+	case inner.With != nil && withHasDml(inner.With):
+		return db.renderExplainWithDml(r, inner.With, depth)
 	default:
 		qp, err := db.planExplainInner(inner)
 		if err != nil {
 			return err
 		}
+		// A top-level pure WITH is orchestrated directly by runWith rather than execQueryPlan, so its
+		// wrapper is frame 0 and only its CTE/body query plans open structural execution frames.
+		if inner.With != nil && qp.with != nil {
+			return db.renderWithPlan(r, qp.with, depth)
+		}
 		return db.renderQueryPlan(r, qp, depth)
 	}
+}
+
+type explainWithPlan struct {
+	bindings []*cteBinding
+	modes    []cteMode
+	primary  *queryPlan
+	body     cteBody
+}
+
+func (db *engine) planExplainWithDml(wq *withQuery) (*explainWithPlan, error) {
+	ptypes := &paramTypes{}
+	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, ptypes)
+	if err != nil {
+		return nil, err
+	}
+	var primary *queryPlan
+	if q := wq.Body.AsQuery(); q != nil {
+		plan, err := db.planQuery(*q, nil, bindings, ptypes)
+		if err != nil {
+			return nil, err
+		}
+		primary = &plan
+	}
+	for i := range wq.Ctes {
+		if wq.Ctes[i].Body.IsDataModifying() {
+			for _, binding := range bindings {
+				binding.refs += countCteRefsDml(&wq.Ctes[i].Body, binding.name)
+			}
+		}
+	}
+	if wq.Body.IsDataModifying() {
+		for _, binding := range bindings {
+			binding.refs += countCteRefsDml(&wq.Body, binding.name)
+		}
+	}
+	return &explainWithPlan{bindings: bindings, modes: cteModes(bindings), primary: primary, body: wq.Body}, nil
+}
+
+func (db *engine) renderExplainWithDml(r *explainRender, wq *withQuery, depth int) error {
+	plan, err := db.planExplainWithDml(wq)
+	if err != nil {
+		return err
+	}
+	r.emit(depth, "WITH", fmt.Sprintf("ctes=%d", len(plan.bindings)))
+	for i, binding := range plan.bindings {
+		r.emit(depth+1, "CTE "+binding.name, cteDetail(binding, plan.modes[i]))
+		if binding.isDml() {
+			stmt := statement{Insert: binding.dm.insert, Update: binding.dm.update, Delete: binding.dm.delete}
+			if err := db.renderExplainWithBindings(r, &stmt, depth+2, plan.bindings[:i]); err != nil {
+				return err
+			}
+		} else if err := db.renderQueryPlan(r, binding.plan, depth+2); err != nil {
+			return err
+		}
+	}
+	if plan.primary != nil {
+		return db.renderQueryPlan(r, *plan.primary, depth+1)
+	}
+	stmt := statement{Insert: plan.body.Insert, Update: plan.body.Update, Delete: plan.body.Delete}
+	return db.renderExplainWithBindings(r, &stmt, depth+1, plan.bindings)
 }
 
 // explainInsert renders an INSERT plan: the Insert root (with an ON CONFLICT note), then the row
 // source — a planned SELECT subtree (INSERT … SELECT) or a Values leaf (INSERT … VALUES). It resolves
 // the source but never writes.
-func (db *engine) explainInsert(r *explainRender, ins *insert, depth int) error {
+func (db *engine) explainInsert(r *explainRender, ins *insert, depth int, bindings []*cteBinding) error {
 	if _, ok := db.lkpTable(ins.Table); !ok {
 		return newError(UndefinedTable, "table does not exist: "+ins.Table)
 	}
 	r.emit(depth, "Insert "+ins.Table, insertDetail(ins))
 	if ins.Select != nil {
 		ptypes := &paramTypes{}
-		plan, err := db.planQuery(queryExpr{Select: ins.Select}, nil, nil, ptypes)
+		plan, err := db.planQuery(queryExpr{Select: ins.Select}, nil, bindings, ptypes)
 		if err != nil {
 			return err
 		}
@@ -178,56 +472,135 @@ func insertDetail(ins *insert) string {
 // explainUpdate renders an UPDATE plan: the Update root (with the assignment count), the residual
 // Filter, then the target scan with its chosen access path. It resolves the WHERE and the scan bound
 // via the same detectors the executor uses, but never writes.
-func (db *engine) explainUpdate(r *explainRender, upd *update, depth int) error {
+func (db *engine) explainUpdate(r *explainRender, upd *update, depth int, bindings []*cteBinding) error {
 	table, ok := db.lkpTable(upd.Table)
 	if !ok {
 		return newError(UndefinedTable, "table does not exist: "+upd.Table)
 	}
-	filter, err := db.explainDmlFilter(table, upd.Filter)
+	filter, err := db.explainDmlFilter(table, upd.Filter, bindings)
 	if err != nil {
 		return err
 	}
 	r.emit(depth, "Update "+upd.Table, fmt.Sprintf("sets=%d", len(upd.Assignments)))
-	db.renderDmlScan(r, table, upd.Table, filter, depth+1)
+	mask, err := db.explainUpdateTouched(table, upd, filter, bindings)
+	if err != nil {
+		return err
+	}
+	db.renderDmlScan(r, table, upd.Table, filter, mask, depth+1)
 	return nil
 }
 
 // explainDelete renders a DELETE plan: the Delete root, the residual Filter, then the target scan
 // with its chosen access path. It resolves the WHERE and the scan bound but never writes.
-func (db *engine) explainDelete(r *explainRender, del *deleteStmt, depth int) error {
+func (db *engine) explainDelete(r *explainRender, del *deleteStmt, depth int, bindings []*cteBinding) error {
 	table, ok := db.lkpTable(del.Table)
 	if !ok {
 		return newError(UndefinedTable, "table does not exist: "+del.Table)
 	}
-	filter, err := db.explainDmlFilter(table, del.Filter)
+	filter, err := db.explainDmlFilter(table, del.Filter, bindings)
 	if err != nil {
 		return err
 	}
 	r.emit(depth, "Delete "+del.Table, "-")
-	db.renderDmlScan(r, table, del.Table, filter, depth+1)
+	mask, err := db.explainDeleteTouched(table, del, filter, bindings)
+	if err != nil {
+		return err
+	}
+	db.renderDmlScan(r, table, del.Table, filter, mask, depth+1)
 	return nil
 }
 
 // explainDmlFilter resolves an UPDATE/DELETE WHERE predicate against a single-table scope (the same
 // prologue the executors use), or returns nil for a bare (no-WHERE) statement.
-func (db *engine) explainDmlFilter(table *catTable, where *exprNode) (*rExpr, error) {
+func (db *engine) explainDmlFilter(table *catTable, where *exprNode, bindings []*cteBinding) (*rExpr, error) {
 	if where == nil {
 		return nil, nil
 	}
-	return resolveBooleanFilter(singleScope(db, table), where, &paramTypes{})
+	s := singleScope(db, table)
+	s.ctes = bindings
+	return resolveBooleanFilter(s, where, &paramTypes{})
 }
 
 // renderDmlScan emits the residual Filter (when present) and the target Scan for an UPDATE/DELETE,
 // choosing the access path with the SAME detectors the executor uses (PK bound, then GIN, then GiST —
-// UPDATE/DELETE do not use secondary B-tree index bounds, indexes.md §5). The touched-set count is a
-// DML cost detail left to EXPLAIN ANALYZE, so it is not shown here.
-func (db *engine) renderDmlScan(r *explainRender, table *catTable, name string, filter *rExpr, depth int) {
+// UPDATE/DELETE do not use secondary B-tree index bounds, indexes.md §5). The scan detail also
+// reports the statement's resolved touched-set width.
+func (db *engine) renderDmlScan(r *explainRender, table *catTable, name string, filter *rExpr, mask []bool, depth int) {
 	d := depth
 	if filter != nil {
-		r.emit(d, "Filter", fmt.Sprintf("conjuncts=%d", conjunctCount(filter)))
+		detail := fmt.Sprintf("conjuncts=%d", conjunctCount(filter))
+		if r.verbose {
+			detail = "filter=" + renderRExpr(filter)
+		}
+		r.emit(d, "Filter", detail)
 		d++
 	}
-	r.emit(d, "Scan "+name, db.scanDetail(name, db.dmlScanBound(table, filter), false, nil))
+	r.emit(d, "Scan "+name, db.scanDetail(name, db.dmlScanBound(table, filter), false, mask))
+}
+
+func (db *engine) explainDeleteTouched(table *catTable, del *deleteStmt, filter *rExpr, bindings []*cteBinding) ([]bool, error) {
+	mask := make([]bool, len(table.Columns))
+	collectTouched(filter, 0, mask)
+	if del.Returning == nil {
+		return mask, nil
+	}
+	nodes, _, _, err := db.resolveReturning(table, *del.Returning, true, bindings, &paramTypes{})
+	if err != nil {
+		return nil, err
+	}
+	retMask := make([]bool, 2*len(mask))
+	for _, node := range nodes {
+		collectTouched(node, 0, retMask)
+	}
+	for i := range mask {
+		mask[i] = mask[i] || retMask[i]
+	}
+	return mask, nil
+}
+
+func (db *engine) explainUpdateTouched(table *catTable, upd *update, filter *rExpr, bindings []*cteBinding) ([]bool, error) {
+	mask := make([]bool, len(table.Columns))
+	collectTouched(filter, 0, mask)
+	s := singleScope(db, table)
+	s.ctes = bindings
+	ptypes := &paramTypes{}
+	assigned := make([]bool, len(mask))
+	for _, a := range upd.Assignments {
+		idx := table.ColumnIndex(a.Column)
+		if idx < 0 {
+			return nil, newError(UndefinedColumn, "column does not exist: "+a.Column)
+		}
+		assigned[idx] = true
+		if a.IsDefault {
+			continue
+		}
+		col := table.Columns[idx]
+		var node *rExpr
+		var err error
+		if scalar, ok := col.Type.AsScalar(); ok {
+			node, _, err = resolve(s, a.Value, &scalar, &aggCtx{collecting: false}, ptypes)
+		} else {
+			node, err = resolveContainerAssign(s, col, a.Value, &aggCtx{collecting: false}, ptypes)
+		}
+		if err != nil {
+			return nil, err
+		}
+		collectTouched(node, 0, mask)
+	}
+	if upd.Returning != nil {
+		nodes, _, _, err := db.resolveReturning(table, *upd.Returning, false, bindings, ptypes)
+		if err != nil {
+			return nil, err
+		}
+		retMask := make([]bool, 2*len(mask))
+		for _, node := range nodes {
+			collectTouched(node, 0, retMask)
+		}
+		for i := range mask {
+			mask[i] = mask[i] || retMask[len(mask)+i] || retMask[i] && !assigned[i]
+		}
+	}
+	return mask, nil
 }
 
 // dmlScanBound is EXPLAIN's compatibility wrapper over the typed mutation physical plan used by the
@@ -237,8 +610,9 @@ func (db *engine) dmlScanBound(table *catTable, filter *rExpr) *scanBound {
 }
 
 // planExplainInner resolves the inner statement into a queryPlan WITHOUT executing it. It handles the
-// read-query forms — SELECT, a top-level set operation, and a read-only top-level WITH; DML is a later
-// slice. A top-level WITH is planned as a nested WITH expression (there are no enclosing CTEs to
+// read-query forms — SELECT, a top-level set operation, and a read-only top-level WITH. DML and a
+// writable WITH are routed to their dedicated renderers before this helper. A read-only top-level
+// WITH is planned as a nested WITH expression (there are no enclosing CTEs to
 // inherit at the top level), which produces the same withPlan structure to render.
 func (db *engine) planExplainInner(inner *statement) (queryPlan, error) {
 	ptypes := &paramTypes{}
@@ -250,8 +624,7 @@ func (db *engine) planExplainInner(inner *statement) (queryPlan, error) {
 	case inner.With != nil:
 		body := inner.With.Body.AsQuery()
 		if body == nil {
-			// A data-modifying primary (writable CTE) — a DML EXPLAIN, handled in a later slice.
-			return queryPlan{}, newError(FeatureNotSupported, "EXPLAIN of a data-modifying WITH is not yet supported")
+			return queryPlan{}, newError(FeatureNotSupported, "writable WITH requires the DML EXPLAIN renderer")
 		}
 		wp, err := db.planWithExpr(&withExpr{Ctes: inner.With.Ctes, Recursive: inner.With.Recursive, Body: body}, nil, ptypes)
 		if err != nil {
@@ -266,6 +639,8 @@ func (db *engine) planExplainInner(inner *statement) (queryPlan, error) {
 // renderQueryPlan walks a queryPlan arm at the given depth: a SELECT plan, a set operation, a VALUES
 // relation, or a WITH plan.
 func (db *engine) renderQueryPlan(r *explainRender, qp queryPlan, depth int) error {
+	r.frameDepth++
+	defer func() { r.frameDepth-- }()
 	switch {
 	case qp.sel != nil:
 		return db.renderSelectPlan(r, qp.sel, depth)
@@ -287,6 +662,7 @@ func (db *engine) renderQueryPlan(r *explainRender, qp queryPlan, depth int) err
 // the order is NOT elided; an elided ORDER BY (served by the scan / index / join order) is instead
 // noted on the FROM tree's top node (spec/design/explain.md §5).
 func (db *engine) renderSelectPlan(r *explainRender, sp *selectPlan, depth int) error {
+	start := len(r.rows)
 	d := depth
 	if sp.limit != nil || sp.offset != nil {
 		r.emit(d, "Limit", limitDetail(sp.limit, sp.offset))
@@ -322,14 +698,89 @@ func (db *engine) renderSelectPlan(r *explainRender, sp *selectPlan, depth int) 
 		d++
 	}
 	if sp.isAgg {
-		r.emit(d, "Aggregate", aggDetail(sp))
+		r.emit(d, "Aggregate", aggDetail(sp, r.verbose))
 		d++
 	}
 	if sp.filter != nil {
-		r.emit(d, "Filter", fmt.Sprintf("conjuncts=%d", conjunctCount(sp.filter)))
+		detail := fmt.Sprintf("conjuncts=%d", conjunctCount(sp.filter))
+		if r.verbose {
+			detail = "filter=" + renderRExpr(sp.filter)
+		}
+		r.emit(d, "Filter", detail)
 		d++
 	}
-	return db.renderFrom(r, sp, d, orderNote)
+	if err := db.renderFrom(r, sp, d, orderNote); err != nil {
+		return err
+	}
+	if r.verbose && len(r.rows) > start {
+		parts := make([]string, len(sp.projections))
+		for i, projection := range sp.projections {
+			parts[i] = renderRExpr(projection)
+		}
+		detail := "output=[" + strings.Join(parts, ", ") + "]"
+		old := r.rows[start][2].str()
+		if old != "-" {
+			detail = old + "; " + detail
+		}
+		r.rows[start][2] = TextValue(detail)
+	}
+	return nil
+}
+
+// selectActualRootNode mirrors renderSelectPlan's outermost-node choice. Execution records this
+// checkpoint after emission, when projection and row_produced charges have joined the blocking
+// pipeline, so ANALYZE can attribute the exact inclusive total to nested SELECT roots too.
+func selectActualRootNode(sp *selectPlan) string {
+	if sp.limit != nil || sp.offset != nil {
+		return "Limit"
+	}
+	if len(sp.order) > 0 && !sp.phys.pkOrdered && sp.phys.indexOrder == nil && !sp.phys.joinPkOrdered {
+		return "Sort"
+	}
+	if sp.distinct {
+		return "Distinct"
+	}
+	if sp.hasWindow {
+		return "Window"
+	}
+	if sp.isAgg {
+		return "Aggregate"
+	}
+	if sp.filter != nil {
+		return "Filter"
+	}
+	if len(sp.rels) > 1 {
+		if len(sp.rels) >= 3 && len(sp.phys.joinSteps)+1 == len(sp.rels) {
+			if sp.phys.joinSteps[len(sp.phys.joinSteps)-1].hashJoin != nil {
+				return "Hash Join"
+			}
+		} else if len(sp.rels) == 2 && sp.phys.hashJoin != nil {
+			return "Hash Join"
+		}
+		return "Nested Loop"
+	}
+	if len(sp.rels) == 0 {
+		return "Result"
+	}
+	return selectActualRelNode(sp.rels[0])
+}
+
+func selectActualRelNode(rel planRel) string {
+	if rel.srf != nil {
+		if rel.srf.kind == srfJedTables || rel.srf.kind == srfJedColumns ||
+			rel.srf.kind == srfJedIndexes || rel.srf.kind == srfJedConstraints ||
+			rel.srf.kind == srfJedStatistics {
+			return "Catalog Scan " + rel.tableName
+		}
+		return "SRF " + rel.tableName
+	}
+	if rel.cte != nil {
+		return "CTE Scan " + rel.tableName
+	}
+	if rel.derived != nil {
+		return "Subquery " + rel.tableName
+	}
+	return "Scan " + rel.tableName
 }
 
 // renderFrom emits the FROM tree: a left-deep chain of physical joins over the plan's relations,
@@ -356,12 +807,16 @@ func (db *engine) renderJoinTree(r *explainRender, sp *selectPlan, n, depth int,
 	}
 	j := sp.joins[n-2]
 	node := "Nested Loop"
-	detail := joinDetail(j)
+	detail := joinDetail(j, r.verbose)
 	if n == 2 && sp.phys.hashJoin != nil {
 		node = "Hash Join"
 		detail = fmt.Sprintf("%s; keys=%d", joinKindText(j.kind), len(sp.phys.hashJoin.keys))
 		if j.on != nil {
-			detail += fmt.Sprintf("; on:conjuncts=%d", conjunctCount(j.on))
+			if r.verbose {
+				detail += "; on=" + renderRExpr(j.on)
+			} else {
+				detail += fmt.Sprintf("; on:conjuncts=%d", conjunctCount(j.on))
+			}
 		}
 	}
 	r.emit(depth, node, withNote(detail, note))
@@ -382,26 +837,37 @@ func (db *engine) renderNWayJoinTree(r *explainRender, sp *selectPlan, n, depth 
 		return db.renderRelLeaf(r, sp, sp.phys.relationOrder[0], depth, note)
 	}
 	step := sp.phys.joinSteps[n-2]
+	var ons []string
 	conjuncts := 0
 	for _, onIndex := range step.onIndices {
 		if sp.joins[onIndex].on != nil {
+			ons = append(ons, renderRExpr(sp.joins[onIndex].on))
 			conjuncts += conjunctCount(sp.joins[onIndex].on)
 		}
 	}
 	kind := joinKindText(physicalStepKind(sp, step))
 	node := "Nested Loop"
 	detail := kind
-	if len(step.onIndices) == 1 {
+	if !r.verbose && len(ons) == 1 {
 		detail = fmt.Sprintf("%s; on:conjuncts=%d", kind, conjuncts)
-	} else if len(step.onIndices) > 1 {
-		detail = fmt.Sprintf("%s; on:predicates=%d,conjuncts=%d", kind, len(step.onIndices), conjuncts)
+	} else if !r.verbose && len(ons) > 1 {
+		detail = fmt.Sprintf("%s; on:predicates=%d,conjuncts=%d", kind, len(ons), conjuncts)
+	} else if len(ons) == 1 {
+		detail = kind + "; on=" + ons[0]
+	} else if len(ons) > 1 {
+		detail = kind + "; on=[" + strings.Join(ons, ", ") + "]"
 	}
 	if step.hashJoin != nil {
 		node = "Hash Join"
-		if len(step.onIndices) == 1 {
-			detail = fmt.Sprintf("%s; keys=%d; on:conjuncts=%d", kind, len(step.hashJoin.keys), conjuncts)
-		} else {
-			detail = fmt.Sprintf("%s; keys=%d; on:predicates=%d,conjuncts=%d", kind, len(step.hashJoin.keys), len(step.onIndices), conjuncts)
+		detail = fmt.Sprintf("%s; keys=%d", kind, len(step.hashJoin.keys))
+		if !r.verbose && len(ons) == 1 {
+			detail += fmt.Sprintf("; on:conjuncts=%d", conjuncts)
+		} else if !r.verbose && len(ons) > 1 {
+			detail += fmt.Sprintf("; on:predicates=%d,conjuncts=%d", len(ons), conjuncts)
+		} else if len(ons) == 1 {
+			detail += "; on=" + ons[0]
+		} else if len(ons) > 1 {
+			detail += "; on=[" + strings.Join(ons, ", ") + "]"
 		}
 	}
 	r.emit(depth, node, withNote(detail, note))
@@ -508,23 +974,30 @@ func cteModeText(m cteMode) string {
 
 // aggDetail renders an Aggregate node's attributes: the grouping-key count, aggregate count, the
 // grouping-set count when there is more than one set, and the HAVING conjunct count.
-func aggDetail(sp *selectPlan) string {
+func aggDetail(sp *selectPlan, verbose bool) string {
 	parts := []string{fmt.Sprintf("groups=%d aggs=%d", len(sp.groupKeys), len(sp.aggSpecs))}
 	if len(sp.groupSets) > 1 {
 		parts = append(parts, fmt.Sprintf("sets=%d", len(sp.groupSets)))
 	}
 	if sp.having != nil {
-		parts = append(parts, fmt.Sprintf("having:conjuncts=%d", conjunctCount(sp.having)))
+		if verbose {
+			parts = append(parts, "having="+renderRExpr(sp.having))
+		} else {
+			parts = append(parts, fmt.Sprintf("having:conjuncts=%d", conjunctCount(sp.having)))
+		}
 	}
 	return strings.Join(parts, "; ")
 }
 
 // joinDetail renders a Nested Loop node's attributes: the join kind and the ON predicate's conjunct
 // count (a CROSS join has no ON).
-func joinDetail(j planJoin) string {
+func joinDetail(j planJoin, verbose bool) string {
 	kind := joinKindText(j.kind)
 	if j.on == nil {
 		return kind
+	}
+	if verbose {
+		return kind + "; on=" + renderRExpr(j.on)
 	}
 	return fmt.Sprintf("%s; on:conjuncts=%d", kind, conjunctCount(j.on))
 }
@@ -696,11 +1169,9 @@ func renderBoundSrc(e *rExpr) string {
 	}
 }
 
-// renderBoundLit renders a constant bound operand as a single-line token. Integer / boolean / decimal
-// literals render deterministically; a float renders as the fixed token `<float>` (its layout is a
-// determinism-ledger exception, kept out of the plan text — spec/design/explain.md §6); a text literal
-// renders verbatim unless it contains a newline (which would split the cell), in which case `<text>`;
-// every other constant type renders as `<value>` for now (a later slice widens this).
+// renderBoundLit renders a constant bound operand as a single-line token. Floats use the native
+// shortest-round-trip spelling under explain-float-literal-layout; other values use their canonical
+// renderer, quoting textual forms so the token stays structurally unambiguous.
 func renderBoundLit(e *rExpr) string {
 	switch e.kind {
 	case reConstInt:
@@ -713,20 +1184,621 @@ func renderBoundLit(e *rExpr) string {
 	case reConstDecimal:
 		return e.cDec.Render()
 	case reConstText:
-		if strings.ContainsAny(e.cText, "\n\r") {
-			return "<text>"
-		}
-		return "'" + e.cText + "'"
+		return quoteExplainText(e.cText)
 	case reConstFloat32, reConstFloat64:
-		return "<float>"
+		return strconv.FormatFloat(e.cFloat, 'g', -1, map[bool]int{true: 32, false: 64}[e.kind == reConstFloat32])
 	default:
 		return "<value>"
 	}
 }
 
-// conjunctCount counts the top-level AND conjuncts of a residual filter (a deterministic integer —
-// the plan text carries the count, not the expression itself; a full expression printer is a later
-// slice, spec/design/explain.md §5).
+func quoteExplainText(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "'", "''")
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	s = strings.ReplaceAll(s, "\r", "\\r")
+	s = strings.ReplaceAll(s, "\t", "\\t")
+	return "'" + s + "'"
+}
+
+func explainBinaryOp(op binaryOp) string {
+	switch op {
+	case opAdd:
+		return "+"
+	case opSub:
+		return "-"
+	case opMul:
+		return "*"
+	case opDiv:
+		return "/"
+	case opMod:
+		return "%"
+	case opEq:
+		return "="
+	case opNe:
+		return "<>"
+	case opLt:
+		return "<"
+	case opGt:
+		return ">"
+	case opLe:
+		return "<="
+	case opGe:
+		return ">="
+	case opAnd:
+		return "and"
+	case opOr:
+		return "or"
+	}
+	return "?"
+}
+
+func explainExprCall(name string, args []*rExpr) string {
+	parts := make([]string, len(args))
+	for i, arg := range args {
+		parts[i] = renderRExpr(arg)
+	}
+	return name + "(" + strings.Join(parts, ", ") + ")"
+}
+
+// renderRExpr is EXPLAIN's canonical resolved-expression printer. Every compound is fully
+// parenthesized and resolved columns use structural zero-based slots, never source aliases.
+func renderRExpr(e *rExpr) string {
+	if e == nil {
+		return "NULL"
+	}
+	binary := func(op string) string { return "(" + renderRExpr(e.lhs) + " " + op + " " + renderRExpr(e.rhs) + ")" }
+	switch e.kind {
+	case reColumn:
+		return fmt.Sprintf("#%d", e.index)
+	case reOuterColumn:
+		return fmt.Sprintf("outer(%d,%d)", e.level, e.index)
+	case reParam:
+		return fmt.Sprintf("$%d", e.index+1)
+	case reConstInt:
+		return strconv.FormatInt(e.cInt, 10)
+	case reConstBool:
+		if e.cBool {
+			return "true"
+		}
+		return "false"
+	case reConstText:
+		return quoteExplainText(e.cText)
+	case reConstDecimal:
+		return e.cDec.Render()
+	case reConstBytea:
+		return quoteExplainText(ByteaValue(e.cBytea).Render())
+	case reConstUuid:
+		return quoteExplainText(UuidValue(e.cBytea).Render())
+	case reConstTimestamp:
+		return quoteExplainText(TimestampValue(e.cInt).Render())
+	case reConstTimestamptz:
+		return quoteExplainText(TimestamptzValue(e.cInt).Render())
+	case reConstDate:
+		return quoteExplainText(DateValue(int32(e.cInt)).Render())
+	case reConstInterval:
+		return quoteExplainText(IntervalValue(e.cIv).Render())
+	case reConstFloat32:
+		return Float32Value(float32(e.cFloat)).Render()
+	case reConstFloat64:
+		return Float64Value(e.cFloat).Render()
+	case reConstJson, reConstJsonPath:
+		return quoteExplainText(e.cText)
+	case reConstJsonb:
+		if e.cJsonb != nil {
+			return quoteExplainText(JsonbValue(*e.cJsonb).Render())
+		}
+		return "NULL"
+	case reConstNull:
+		return "NULL"
+	case reConstArray:
+		if e.cArray != nil {
+			return quoteExplainText(Value{Kind: ValArray, ref: e.cArray}.Render())
+		}
+		return "NULL"
+	case reConstRange:
+		if e.cRange != nil {
+			return quoteExplainText(RangeValue(e.cRange).Render())
+		}
+		return "NULL"
+	case reRow:
+		return explainExprCall("row", e.sargs)
+	case reArray:
+		return "array[" + strings.TrimSuffix(strings.TrimPrefix(explainExprCall("", e.sargs), "("), ")") + "]"
+	case reField:
+		return fmt.Sprintf("%s.field%d", renderRExpr(e.operand), e.index)
+	case reSubscript:
+		var b strings.Builder
+		b.WriteString(renderRExpr(e.operand))
+		for _, sub := range e.subs {
+			b.WriteByte('[')
+			if sub.isSlice {
+				if sub.lower != nil {
+					b.WriteString(renderRExpr(sub.lower))
+				}
+				b.WriteByte(':')
+				if sub.upper != nil {
+					b.WriteString(renderRExpr(sub.upper))
+				}
+			} else {
+				b.WriteString(renderRExpr(sub.index))
+			}
+			b.WriteByte(']')
+		}
+		return b.String()
+	case reCast:
+		return "cast(" + renderRExpr(e.operand) + " as " + e.result.CanonicalName() + ")"
+	case reArrayCast:
+		return "array_cast(" + renderRExpr(e.operand) + ")"
+	case reNeg:
+		return "(-" + renderRExpr(e.operand) + ")"
+	case reNot:
+		return "(not " + renderRExpr(e.operand) + ")"
+	case reArith, reCompare:
+		return binary(explainBinaryOp(e.op))
+	case reAnd:
+		return binary("and")
+	case reOr:
+		return binary("or")
+	case reIsNull:
+		if e.negated {
+			return "(" + renderRExpr(e.operand) + " is not null)"
+		}
+		return "(" + renderRExpr(e.operand) + " is null)"
+	case reIsJson:
+		return fmt.Sprintf("(%s is %sjson%s%s)", renderRExpr(e.operand), map[bool]string{true: "not ", false: ""}[e.negated], explainJSONPredicate(e.jpKind), map[bool]string{true: " with unique keys", false: ""}[e.jpUnique])
+	case reJsonCtor:
+		return fmt.Sprintf("json(%s%s)", renderRExpr(e.operand), map[bool]string{true: " with unique keys", false: ""}[e.jpUnique])
+	case reDistinct:
+		if e.negated {
+			return binary("is not distinct from")
+		}
+		return binary("is distinct from")
+	case reLike:
+		op := "like"
+		if e.insensitive {
+			op = "ilike"
+		}
+		if e.negated {
+			op = "not " + op
+		}
+		return binary(op)
+	case reRegex:
+		op := "~"
+		if e.negated {
+			op = "!~"
+		}
+		if e.insensitive {
+			op += "*"
+		}
+		return binary(op)
+	case reCasing:
+		if e.casingUpper {
+			return explainExprCall("upper", []*rExpr{e.operand})
+		}
+		return explainExprCall("lower", []*rExpr{e.operand})
+	case reAtTimeZone:
+		return "(" + renderRExpr(e.rhs) + " at time zone " + renderRExpr(e.lhs) + ")"
+	case reDateTrunc:
+		return explainExprCall("date_trunc", e.sargs)
+	case reExtract:
+		return "extract(" + e.cText + " from " + renderRExpr(e.operand) + ")"
+	case reDateConvert:
+		return "cast(" + renderRExpr(e.operand) + " as " + e.result.CanonicalName() + ")"
+	case reDateClock:
+		return fmt.Sprintf("date_clock(%d)", e.cInt)
+	case reCase:
+		var b strings.Builder
+		b.WriteString("(case")
+		for _, arm := range e.caseArms {
+			b.WriteString(" when ")
+			b.WriteString(renderRExpr(arm.cond))
+			b.WriteString(" then ")
+			b.WriteString(renderRExpr(arm.result))
+		}
+		b.WriteString(" else ")
+		b.WriteString(renderRExpr(e.caseEls))
+		b.WriteString(" end)")
+		return b.String()
+	case reCoalesce:
+		return explainExprCall("coalesce", e.sargs)
+	case reGreatestLeast:
+		if e.greatest {
+			return explainExprCall("greatest", e.sargs)
+		}
+		return explainExprCall("least", e.sargs)
+	case reScalarFunc:
+		return explainExprCall(explainScalarFunc(e.sfunc), e.sargs)
+	case reArrayFunc:
+		return explainExprCall(explainArrayFunc(e.afunc), e.sargs)
+	case reRangeFunc:
+		return explainExprCall(explainRangeFunc(e.rfunc), e.sargs)
+	case reRegexFunc:
+		return explainExprCall(explainRegexFunc(e.rxFunc), e.sargs)
+	case reRangeCtor:
+		name, _ := rangeNameForElement(e.relem)
+		return explainExprCall(name, e.sargs)
+	case reRangeOp:
+		return explainExprCall("range_"+explainRangeOp(e.rop), e.sargs)
+	case reRangeSetOp:
+		return explainExprCall("range_"+explainRangeSetOp(e.rsop), e.sargs)
+	case reVariadic:
+		return explainExprCall(explainVariadicFunc(e.vfunc), e.sargs)
+	case reJsonBuild:
+		family := "jsonb"
+		if e.jbJson {
+			family = "json"
+		}
+		return explainExprCall(family+"_build_"+explainJSONBuildKind(e.jbKind), e.sargs)
+	case reJsonSetInsert:
+		name := "jsonb_set"
+		if e.psMode == psInsert {
+			name = "jsonb_insert"
+		}
+		return explainExprCall(name, e.sargs)
+	case reJsonObject:
+		name := "jsonb_object"
+		if e.jbJson {
+			name = "json_object"
+		}
+		return explainExprCall(name, e.sargs)
+	case reJsonPathFn:
+		return explainExprCall(explainJSONPathFunc(e.jpFnKind), e.sargs)
+	case reJsonSqlFn:
+		return renderExplainJSONSQL(e)
+	case reJsonGet:
+		return binary(explainJSONGetOp(e.jgop))
+	case reJsonContains:
+		return binary("@>")
+	case reJsonHasKey:
+		return binary(explainJSONHasKey(e.hasKey))
+	case reJsonConcat:
+		return binary("||")
+	case reJsonDelete:
+		return binary(explainJSONDelete(e.delKind))
+	case reSubquery:
+		return explainSubquery(e)
+	case reInValues:
+		vals := make([]string, len(e.list))
+		for i := range e.list {
+			vals[i] = renderExplainValue(e.list[i])
+		}
+		return fmt.Sprintf("%s %sin (%s)", renderRExpr(e.lhs), map[bool]string{true: "not ", false: ""}[e.negated], strings.Join(vals, ", "))
+	case reQuantified:
+		return fmt.Sprintf("%s %s %s(%s)", renderRExpr(e.lhs), explainBinaryOp(e.op), map[bool]string{true: "all", false: "any"}[e.quantAll], renderRExpr(e.rhs))
+	}
+	panic("unhandled resolved expression in EXPLAIN")
+}
+
+func explainScalarFunc(f scalarFunc) string {
+	switch f {
+	case sfAbs, sfFloatAbs:
+		return "abs"
+	case sfRound, sfFloatRound:
+		return "round"
+	case sfCeil:
+		return "ceil"
+	case sfFloor:
+		return "floor"
+	case sfTrunc:
+		return "trunc"
+	case sfSqrt:
+		return "sqrt"
+	case sfExp:
+		return "exp"
+	case sfLn:
+		return "ln"
+	case sfLog10:
+		return "log10"
+	case sfPow:
+		return "pow"
+	case sfLog:
+		return "log"
+	case sfSin:
+		return "sin"
+	case sfCos:
+		return "cos"
+	case sfTan:
+		return "tan"
+	case sfCbrt:
+		return "cbrt"
+	case sfPi:
+		return "pi"
+	case sfRadians:
+		return "radians"
+	case sfDegrees:
+		return "degrees"
+	case sfAsin:
+		return "asin"
+	case sfAcos:
+		return "acos"
+	case sfAtan:
+		return "atan"
+	case sfAtan2:
+		return "atan2"
+	case sfCot:
+		return "cot"
+	case sfSinh:
+		return "sinh"
+	case sfCosh:
+		return "cosh"
+	case sfTanh:
+		return "tanh"
+	case sfAsinh:
+		return "asinh"
+	case sfAcosh:
+		return "acosh"
+	case sfAtanh:
+		return "atanh"
+	case sfSign:
+		return "sign"
+	case sfDiv:
+		return "div"
+	case sfGcd:
+		return "gcd"
+	case sfLcm:
+		return "lcm"
+	case sfFactorial:
+		return "factorial"
+	case sfWidthBucket:
+		return "width_bucket"
+	case sfScale:
+		return "scale"
+	case sfMinScale:
+		return "min_scale"
+	case sfTrimScale:
+		return "trim_scale"
+	case sfMakeInterval:
+		return "make_interval"
+	case sfMakeTimestamp:
+		return "make_timestamp"
+	case sfMakeTimestamptz:
+		return "make_timestamptz"
+	case sfMakeDate:
+		return "make_date"
+	case sfCurrentDate:
+		return "current_date"
+	case sfDatePart:
+		return "date_part"
+	case sfUuidExtractVersion:
+		return "uuid_extract_version"
+	case sfUuidExtractTimestamp:
+		return "uuid_extract_timestamp"
+	case sfUuidv4:
+		return "uuidv4"
+	case sfUuidv7:
+		return "uuidv7"
+	case sfNow:
+		return "now"
+	case sfClockTimestamp:
+		return "clock_timestamp"
+	case sfNextval:
+		return "nextval"
+	case sfCurrval:
+		return "currval"
+	case sfSetval:
+		return "setval"
+	case sfLastval:
+		return "lastval"
+	case sfCurrentSetting:
+		return "current_setting"
+	case sfJsonbTypeof:
+		return "jsonb_typeof"
+	case sfJsonTypeof:
+		return "json_typeof"
+	case sfJsonbArrayLength:
+		return "jsonb_array_length"
+	case sfJsonArrayLength:
+		return "json_array_length"
+	case sfJsonbStripNulls:
+		return "jsonb_strip_nulls"
+	case sfJsonStripNulls:
+		return "json_strip_nulls"
+	case sfJsonbPretty:
+		return "jsonb_pretty"
+	case sfToJsonb:
+		return "to_jsonb"
+	case sfToJson:
+		return "to_json"
+	case sfJsonScalar:
+		return "json_scalar"
+	case sfJsonSerialize:
+		return "json_serialize"
+	case sfLength:
+		return "length"
+	case sfOctetLength:
+		return "octet_length"
+	case sfBitLength:
+		return "bit_length"
+	case sfSubstr:
+		return "substr"
+	case sfLeft:
+		return "left"
+	case sfRight:
+		return "right"
+	case sfLpad:
+		return "lpad"
+	case sfRpad:
+		return "rpad"
+	case sfBtrim:
+		return "btrim"
+	case sfLtrim:
+		return "ltrim"
+	case sfRtrim:
+		return "rtrim"
+	case sfReplace:
+		return "replace"
+	case sfTranslate:
+		return "translate"
+	case sfRepeat:
+		return "repeat"
+	case sfReverse:
+		return "reverse"
+	case sfStrpos:
+		return "strpos"
+	case sfSplitPart:
+		return "split_part"
+	case sfStartsWith:
+		return "starts_with"
+	case sfAscii:
+		return "ascii"
+	case sfChr:
+		return "chr"
+	case sfInitcap:
+		return "initcap"
+	case sfToHex:
+		return "to_hex"
+	case sfEncode:
+		return "encode"
+	case sfDecode:
+		return "decode"
+	case sfQuoteLiteral:
+		return "quote_literal"
+	case sfQuoteIdent:
+		return "quote_ident"
+	case sfQuoteNullable:
+		return "quote_nullable"
+	}
+	panic("unhandled scalar function in EXPLAIN")
+}
+
+func explainArrayFunc(f arrayFunc) string {
+	return [...]string{"array_ndims", "array_length", "array_lower", "array_upper", "cardinality", "array_dims", "array_append", "array_prepend", "array_cat", "array_remove", "array_replace", "array_position", "array_positions", "array_to_json", "contains", "contained_by", "overlaps"}[f]
+}
+
+func explainRangeFunc(f rangeFunc) string {
+	return [...]string{"lower", "upper", "isempty", "lower_inc", "upper_inc", "lower_inf", "upper_inf"}[f]
+}
+
+func explainRegexFunc(f regexFunc) string {
+	return [...]string{"regexp_replace", "regexp_match", "regexp_like", "regexp_count", "regexp_substr", "regexp_instr"}[f]
+}
+
+func explainRangeOp(op rangeOp) string {
+	return [...]string{"contains", "contains_elem", "contained_by", "elem_contained_by", "overlaps", "before", "after", "overleft", "overright", "adjacent"}[op]
+}
+
+func explainRangeSetOp(op rangeSetOp) string {
+	return [...]string{"union", "intersect", "difference", "merge"}[op]
+}
+
+func explainVariadicFunc(f variadicFunc) string {
+	return [...]string{"num_nulls", "num_nonnulls"}[f]
+}
+
+func explainJSONBuildKind(k jsonBuildKind) string {
+	return [...]string{"array", "object"}[k]
+}
+
+func explainJSONPathFunc(k jsonPathFnKind) string {
+	return [...]string{"jsonb_path_exists", "jsonb_path_query_first", "jsonb_path_query_array", "jsonb_path_match", "jsonb_path_match_silent"}[k]
+}
+
+func explainJSONSQLFunc(k jsonSqlKind) string {
+	return [...]string{"json_exists", "json_value", "json_query"}[k]
+}
+
+func renderExplainJSONSQL(e *rExpr) string {
+	var b strings.Builder
+	b.WriteString(explainJSONSQLFunc(e.jsKind))
+	b.WriteByte('(')
+	b.WriteString(renderRExpr(e.sargs[0]))
+	b.WriteString(", ")
+	b.WriteString(renderRExpr(e.sargs[1]))
+	switch e.jsKind {
+	case jsExists:
+		b.WriteByte(' ')
+		b.WriteString(explainJSONBehavior(e.jsOnError))
+		b.WriteString(" on error")
+	case jsValue:
+		b.WriteString(" returning ")
+		b.WriteString(e.result.CanonicalName())
+		b.WriteByte(' ')
+		b.WriteString(explainJSONBehavior(e.jsOnEmpty))
+		b.WriteString(" on empty ")
+		b.WriteString(explainJSONBehavior(e.jsOnError))
+		b.WriteString(" on error")
+	case jsQuery:
+		b.WriteString(" returning ")
+		b.WriteString(e.result.CanonicalName())
+		b.WriteByte(' ')
+		b.WriteString(explainJSONWrapper(e.jsWrapper))
+		if e.jsKeepQuotes {
+			b.WriteString(" keep quotes on scalar string")
+		} else {
+			b.WriteString(" omit quotes on scalar string")
+		}
+		b.WriteByte(' ')
+		b.WriteString(explainJSONBehavior(e.jsOnEmpty))
+		b.WriteString(" on empty ")
+		b.WriteString(explainJSONBehavior(e.jsOnError))
+		b.WriteString(" on error")
+	}
+	b.WriteByte(')')
+	return b.String()
+}
+
+func explainJSONWrapper(w jsonWrapper) string {
+	return [...]string{
+		"without array wrapper",
+		"with unconditional array wrapper",
+		"with conditional array wrapper",
+	}[w]
+}
+
+func explainJSONBehavior(b jsonOnBehavior) string {
+	return [...]string{
+		"null", "error", "true", "false", "unknown", "empty array", "empty object",
+	}[b]
+}
+
+func explainJSONGetOp(op jsonGetOp) string {
+	return [...]string{"->", "->>", "#>", "#>>"}[op]
+}
+
+func explainJSONHasKey(k hasKeyKind) string {
+	return [...]string{"?", "?|", "?&"}[k]
+}
+
+func explainJSONDelete(k deleteKind) string {
+	if k == dkPath {
+		return "#-"
+	}
+	return "-"
+}
+
+func explainJSONPredicate(k jsonPredicateKind) string {
+	return [...]string{"", " scalar", " array", " object"}[k]
+}
+
+func explainSubquery(e *rExpr) string {
+	switch e.subKind {
+	case sqScalar:
+		return "scalar(<subquery>)"
+	case sqExists:
+		return map[bool]string{true: "not exists(<subquery>)", false: "exists(<subquery>)"}[e.negated]
+	case sqIn:
+		return fmt.Sprintf("%s %sin (<subquery>)", renderRExpr(e.lhs), map[bool]string{true: "not ", false: ""}[e.negated])
+	case sqQuantified:
+		return fmt.Sprintf("%s %s %s(<subquery>)", renderRExpr(e.lhs), explainBinaryOp(e.op), map[bool]string{true: "all", false: "any"}[e.quantAll])
+	default:
+		panic("unhandled subquery kind in EXPLAIN")
+	}
+}
+
+func renderExplainValue(v Value) string {
+	switch v.Kind {
+	case ValNull:
+		return "NULL"
+	case ValInt, ValBool, ValDecimal, ValFloat32, ValFloat64:
+		return v.Render()
+	default:
+		return quoteExplainText(v.Render())
+	}
+}
+
+// conjunctCount retains the compact non-VERBOSE spelling for a residual filter. VERBOSE uses the
+// complete resolved-expression printer above (spec/design/explain.md §5).
 func conjunctCount(e *rExpr) int {
 	if e == nil {
 		return 0

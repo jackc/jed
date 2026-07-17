@@ -98,7 +98,7 @@ func combinePhysicalRelationRows(plan *selectPlan, outerOrdinal int, outer store
 
 // execCostedTwoRelationJoin executes P7's selected physical orientation while placing every local
 // row back into its original logical slot interval before expression evaluation.
-func (db *engine) execCostedTwoRelationJoin(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value, outerStack []storedRow, materialized [][]storedRow) ([]storedRow, error) {
+func (db *engine) execCostedTwoRelationJoin(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value, outerStack []storedRow, materialized [][]storedRow, relWork []int64) ([]storedRow, error) {
 	outerOrdinal := physicalRelOrdinal(plan, 0)
 	innerOrdinal := physicalRelOrdinal(plan, 1)
 	outerRows := materialized[outerOrdinal]
@@ -126,10 +126,12 @@ func (db *engine) execCostedTwoRelationJoin(plan *selectPlan, env *evalEnv, mete
 		candidates := innerRows
 		if innerINL {
 			outerLogical := placePhysicalRelationRow(plan, outerOrdinal, outerRow)
+			before := meter.Accrued
 			candidates, err = db.materializeRel(plan, innerOrdinal, params, outerStack, outerLogical, env.rng, env.ctes, meter)
 			if err != nil {
 				return nil, err
 			}
+			relWork[innerOrdinal] += meter.Accrued - before
 		} else if table != nil {
 			candidates, err = table.probe(plan.phys.hashJoin, outerRow, meter)
 			if err != nil {
@@ -166,7 +168,7 @@ func physicalStepKind(plan *selectPlan, step physicalJoinStep) joinKind {
 	return kind
 }
 
-func (db *engine) execCostedNWayJoin(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value, outerStack []storedRow, materialized [][]storedRow, stepCount int) ([]storedRow, error) {
+func (db *engine) execCostedNWayJoin(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value, outerStack []storedRow, materialized [][]storedRow, relWork []int64, stepCount int) ([]storedRow, error) {
 	driver := plan.phys.relationOrder[0]
 	running := make([]storedRow, len(materialized[driver]))
 	for i, row := range materialized[driver] {
@@ -192,16 +194,20 @@ func (db *engine) execCostedNWayJoin(plan *selectPlan, env *evalEnv, meter *cost
 		for _, left := range running {
 			candidates := innerRows
 			if plan.phys.relINLBounds[inner] != nil {
+				before := meter.Accrued
 				candidates, err = db.materializeRel(plan, inner, params, outerStack, left, env.rng, env.ctes, meter)
 				if err != nil {
 					return nil, err
 				}
+				relWork[inner] += meter.Accrued - before
 			} else if plan.rels[inner].lateral {
 				lateralOuter := append(append([]storedRow(nil), outerStack...), left)
+				before := meter.Accrued
 				candidates, err = db.materializeRel(plan, inner, params, lateralOuter, nil, env.rng, env.ctes, meter)
 				if err != nil {
 					return nil, err
 				}
+				relWork[inner] += meter.Accrued - before
 			} else if table != nil {
 				candidates, err = table.probe(step.hashJoin, left, meter)
 				if err != nil {
@@ -247,6 +253,13 @@ func (db *engine) execCostedNWayJoin(plan *selectPlan, env *evalEnv, meter *cost
 			}
 		}
 		running = next
+		if position+1 < len(plan.phys.joinSteps) {
+			node := "Nested Loop"
+			if step.hashJoin != nil {
+				node = "Hash Join"
+			}
+			db.explainActual.recordParent(node, meter.Accrued)
+		}
 	}
 	return running, nil
 }
@@ -359,7 +372,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// deterministic abort row stays the scalar path's; results and accrued cost are byte-identical
 	// either way (the conformance corpus proves both). Ineligible / metered ⇒ this is skipped and the
 	// general aggregate branch runs unchanged.
-	if meter.unmetered() && db.vectorizedAggEligible(plan) {
+	if meter.unmetered() && db.explainActual == nil && db.vectorizedAggEligible(plan) {
 		return db.execVectorizedAgg(plan, outer, params, ctes, rng, meter)
 	}
 
@@ -371,7 +384,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// path. Gated to the unmetered lane (so a metered query's per-eval Guards stay the row path's) and to
 	// file-backed stores with no spillable touched column (projectColumnar declines otherwise, falling
 	// through to the identical-cost row path). Cost-neutral by construction.
-	if meter.unmetered() && db.vectorizedProjectEligible(plan) {
+	if meter.unmetered() && db.explainActual == nil && db.vectorizedProjectEligible(plan) {
 		em, ok, err := db.projectColumnar(plan, env, meter)
 		if err != nil {
 			return emitter{}, err
@@ -464,15 +477,18 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// bound seeks per outer row), so it is not materialized up front either — a placeholder (nil)
 	// holds its slot and the join loop re-materializes it per left row.
 	materialized := make([][]storedRow, len(plan.rels))
+	relWork := make([]int64, len(plan.rels))
 	for ri, rel := range plan.rels {
 		if rel.lateral || plan.phys.relINLBounds[ri] != nil {
 			continue
 		}
+		before := meter.Accrued
 		rows, err := db.materializeRel(plan, ri, params, outer, nil, env.rng, env.ctes, meter)
 		if err != nil {
 			return emitter{}, err
 		}
 		materialized[ri] = rows
+		relWork[ri] = meter.Accrued - before
 	}
 
 	// Left-deep nested-loop join. `running` holds the combined rows over the relations joined
@@ -489,13 +505,13 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	var running []storedRow
 	if len(plan.rels) >= 3 && len(plan.phys.relationOrder) == len(plan.rels) && len(plan.phys.joinSteps)+1 == len(plan.rels) {
 		var err error
-		running, err = db.execCostedNWayJoin(plan, env, meter, params, outer, materialized, len(plan.phys.joinSteps))
+		running, err = db.execCostedNWayJoin(plan, env, meter, params, outer, materialized, relWork, len(plan.phys.joinSteps))
 		if err != nil {
 			return emitter{}, err
 		}
 	} else if len(plan.phys.relationOrder) == 2 {
 		var err error
-		running, err = db.execCostedTwoRelationJoin(plan, env, meter, params, outer, materialized)
+		running, err = db.execCostedTwoRelationJoin(plan, env, meter, params, outer, materialized, relWork)
 		if err != nil {
 			return emitter{}, err
 		}
@@ -523,10 +539,12 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					latOuter := make([]storedRow, len(outer)+1)
 					copy(latOuter, outer)
 					latOuter[len(outer)] = left
+					before := meter.Accrued
 					rightRows, err := db.materializeRel(plan, k+1, params, latOuter, nil, env.rng, env.ctes, meter)
 					if err != nil {
 						return emitter{}, err
 					}
+					relWork[k+1] += meter.Accrued - before
 					leftMatched := false
 					for _, right := range rightRows {
 						combined := make(storedRow, 0, len(left)+len(right))
@@ -565,10 +583,12 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			// applied (the ON here, the WHERE below), so rows are unchanged.
 			if plan.phys.relINLBounds[k+1] != nil {
 				for _, left := range running {
+					before := meter.Accrued
 					rightRows, err := db.materializeRel(plan, k+1, params, outer, left, env.rng, env.ctes, meter)
 					if err != nil {
 						return emitter{}, err
 					}
+					relWork[k+1] += meter.Accrued - before
 					leftMatched := false
 					for _, right := range rightRows {
 						combined := make(storedRow, 0, len(left)+len(right))
@@ -684,6 +704,36 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		}
 	}
 
+	// Scan labels can repeat (self joins), while the optimizer may render relations in physical
+	// rather than authored order. Publish the accumulated leaf work in that same render order so
+	// the label queues remain deterministic; dynamic INL/LATERAL probes contribute to one leaf.
+	physicalTree := len(plan.rels) == 2 && len(plan.phys.relationOrder) == 2 ||
+		len(plan.rels) >= 3 && len(plan.phys.relationOrder) == len(plan.rels) && len(plan.phys.joinSteps)+1 == len(plan.rels)
+	relationOrder := make([]int, len(plan.rels))
+	if physicalTree {
+		copy(relationOrder, plan.phys.relationOrder)
+	} else {
+		for ordinal := range plan.rels {
+			relationOrder[ordinal] = ordinal
+		}
+	}
+	for _, ordinal := range relationOrder {
+		node := selectActualRelNode(plan.rels[ordinal])
+		if selectActualRootNode(plan) != node {
+			db.explainActual.record(node, relWork[ordinal])
+		}
+	}
+
+	if len(plan.rels) > 1 {
+		node := "Nested Loop"
+		if len(plan.rels) == 2 && plan.phys.hashJoin != nil || len(plan.phys.joinSteps) > 0 && plan.phys.joinSteps[len(plan.phys.joinSteps)-1].hashJoin != nil {
+			node = "Hash Join"
+		}
+		if selectActualRootNode(plan) != node {
+			db.explainActual.recordParent(node, meter.Accrued)
+		}
+	}
+
 	// WHERE over the combined rows. A WHERE arithmetic can trap (22003/22012); each surviving
 	// combined row's filter accrues operator_eval.
 	var rows []storedRow
@@ -700,6 +750,11 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			rows = append(rows, row)
 		}
 	}
+	if plan.filter != nil {
+		if selectActualRootNode(plan) != "Filter" {
+			db.explainActual.recordParent("Filter", meter.Accrued)
+		}
+	}
 
 	// WINDOW stage (spec/design/window.md §5.2): a blocking operator over the post-WHERE rows,
 	// running BEFORE the query ORDER BY / DISTINCT / LIMIT. Each window function's per-row result is
@@ -711,6 +766,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	if plan.hasWindow && !plan.isAgg {
 		if err := applyWindowStage(rows, plan.windowSpecs, plan.windowKeys, env, meter); err != nil {
 			return emitter{}, err
+		}
+		if selectActualRootNode(plan) != "Window" {
+			db.explainActual.recordParent("Window", meter.Accrued)
 		}
 	}
 
@@ -737,6 +795,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			if err := sortRows(rows, plan.order); err != nil {
 				return emitter{}, err
 			}
+		}
+		if selectActualRootNode(plan) != "Sort" {
+			db.explainActual.recordParent("Sort", meter.Accrued)
 		}
 	}
 
@@ -981,6 +1042,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			}
 			groupRows = kept
 		}
+		if selectActualRootNode(plan) != "Aggregate" {
+			db.explainActual.recordParent("Aggregate", meter.Accrued)
+		}
 		// WINDOW stage over the grouped rows (spec/design/window.md §2): runs AFTER GROUP BY/HAVING
 		// and BEFORE the query ORDER BY. It appends each window result to the grouped row
 		// [group_keys…, agg_results…], so the projection reads window result w at slot
@@ -989,6 +1053,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		if plan.hasWindow {
 			if err := applyWindowStage(groupRows, plan.windowSpecs, plan.windowKeys, env, meter); err != nil {
 				return emitter{}, err
+			}
+			if selectActualRootNode(plan) != "Window" {
+				db.explainActual.recordParent("Window", meter.Accrued)
 			}
 		}
 		// ORDER BY over the grouped output (a column/ordinal key is a synthetic group-key slot; an
@@ -999,6 +1066,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			}
 			if err := sortRows(groupRows, plan.order); err != nil {
 				return emitter{}, err
+			}
+			if selectActualRootNode(plan) != "Sort" {
+				db.explainActual.recordParent("Sort", meter.Accrued)
 			}
 		}
 		if plan.distinct {
@@ -1022,6 +1092,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					seen[key] = true
 					distinctRows = append(distinctRows, projected)
 				}
+			}
+			if selectActualRootNode(plan) != "Distinct" {
+				db.explainActual.recordParent("Distinct", meter.Accrued)
 			}
 			// The dedup already projected every grouped row (the §3 asymmetry, charged above), so
 			// emission is Identity — window + charge row_produced, deferred to the drive (streaming.md §4).
@@ -1054,6 +1127,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 				distinctRows = append(distinctRows, projected)
 			}
 		}
+		if selectActualRootNode(plan) != "Distinct" {
+			db.explainActual.recordParent("Distinct", meter.Accrued)
+		}
 		// LIMIT / OFFSET applies to the DISTINCT rows; only the emitted rows charge RowProduced
 		// (spec/design/cost.md §3). The rows were already projected for their dedup key (the §3
 		// asymmetry, charged above), so emission is Identity — deferred to the drive (streaming.md §4).
@@ -1081,8 +1157,16 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 // it per outer row. So after this pass the only surviving reSubquery nodes are correlated.
 
 func (db *engine) foldUncorrelatedInPlan(plan *queryPlan, bound []Value, ctes cteCtx, cost *int64) error {
+	frame := 1
+	if db.explainActual != nil {
+		frame += len(db.explainActual.frames)
+	}
+	return db.foldUncorrelatedInPlanAt(plan, bound, ctes, cost, frame)
+}
+
+func (db *engine) foldUncorrelatedInPlanAt(plan *queryPlan, bound []Value, ctes cteCtx, cost *int64, frame int) error {
 	if plan.sel != nil {
-		return db.foldUncorrelatedInSelect(plan.sel, bound, ctes, cost)
+		return db.foldUncorrelatedInSelectAt(plan.sel, bound, ctes, cost, frame)
 	}
 	if plan.values != nil {
 		// A VALUES-body value may itself hold an (uncorrelated) scalar subquery to fold once before
@@ -1104,13 +1188,21 @@ func (db *engine) foldUncorrelatedInPlan(plan *queryPlan, bound []Value, ctes ct
 		// (executed once via execWithPlan).
 		return nil
 	}
-	if err := db.foldUncorrelatedInPlan(&plan.setop.lhs, bound, ctes, cost); err != nil {
+	if err := db.foldUncorrelatedInPlanAt(&plan.setop.lhs, bound, ctes, cost, frame+1); err != nil {
 		return err
 	}
-	return db.foldUncorrelatedInPlan(&plan.setop.rhs, bound, ctes, cost)
+	return db.foldUncorrelatedInPlanAt(&plan.setop.rhs, bound, ctes, cost, frame+1)
 }
 
 func (db *engine) foldUncorrelatedInSelect(sp *selectPlan, bound []Value, ctes cteCtx, cost *int64) error {
+	frame := 1
+	if db.explainActual != nil {
+		frame += len(db.explainActual.frames)
+	}
+	return db.foldUncorrelatedInSelectAt(sp, bound, ctes, cost, frame)
+}
+
+func (db *engine) foldUncorrelatedInSelectAt(sp *selectPlan, bound []Value, ctes cteCtx, cost *int64, frame int) error {
 	for k := range sp.joins {
 		if sp.joins[k].on != nil {
 			if err := db.foldUncorrelatedInRExpr(sp.joins[k].on, bound, ctes, cost); err != nil {
@@ -1119,9 +1211,11 @@ func (db *engine) foldUncorrelatedInSelect(sp *selectPlan, bound []Value, ctes c
 		}
 	}
 	if sp.filter != nil {
+		before := *cost
 		if err := db.foldUncorrelatedInRExpr(sp.filter, bound, ctes, cost); err != nil {
 			return err
 		}
+		db.explainActual.recordFolded(frame, "Filter", *cost-before)
 	}
 	if sp.having != nil {
 		if err := db.foldUncorrelatedInRExpr(sp.having, bound, ctes, cost); err != nil {
@@ -1165,14 +1259,21 @@ func (db *engine) foldUncorrelatedInRExpr(e *rExpr, bound []Value, ctes cteCtx, 
 				return err
 			}
 		}
-		if err := db.foldUncorrelatedInPlan(e.subPlan, bound, ctes, cost); err != nil {
+		if db.explainActual != nil {
+			db.explainActual.foldSuppress++
+		}
+		err := db.foldUncorrelatedInPlan(e.subPlan, bound, ctes, cost)
+		if db.explainActual != nil {
+			db.explainActual.foldSuppress--
+		}
+		if err != nil {
 			return err
 		}
 		if queryPlanReferencesOuter(e.subPlan, 0) {
 			return nil // correlated — re-executed per outer row at eval
 		}
 		// Uncorrelated: execute ONCE and fold to a constant / reInValues.
-		r, err := db.execQueryPlan(e.subPlan, nil, bound, ctes)
+		r, err := db.execHiddenQueryPlan(e.subPlan, nil, bound, ctes)
 		if err != nil {
 			return err
 		}

@@ -497,6 +497,160 @@ pub struct Engine {
     /// Relations whose estimator revision was already advanced by the current top-level statement.
     /// Data-modifying CTEs may touch the same table more than once; the P2 contract advances it once.
     pub(crate) estimator_touched: HashSet<(String, String)>,
+    /// Populated only while EXPLAIN ANALYZE executes its inner statement. Exact operator sub-meter
+    /// snapshots are recorded here; ordinary execution pays only a RefCell/Option nil check.
+    pub(crate) explain_actual: std::cell::RefCell<Option<ActualCostProfile>>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ActualCostKey {
+    frame: usize,
+    node: String,
+}
+
+#[derive(Default)]
+struct ActualCostFrame {
+    by_node: HashMap<ActualCostKey, Vec<i64>>,
+    inclusive: i64,
+}
+
+#[derive(Default)]
+pub(crate) struct ActualCostProfile {
+    pub(crate) by_node: HashMap<ActualCostKey, Vec<i64>>,
+    frames: Vec<ActualCostFrame>,
+    folded: HashMap<ActualCostKey, Vec<i64>>,
+    fold_suppress: usize,
+}
+
+impl ActualCostProfile {
+    fn key(&self, node: String) -> ActualCostKey {
+        ActualCostKey {
+            frame: self.frames.len(),
+            node,
+        }
+    }
+
+    pub(crate) fn record(&mut self, node: String, cost: i64) {
+        let key = self.key(node);
+        let target = self
+            .frames
+            .last_mut()
+            .map(|frame| &mut frame.by_node)
+            .unwrap_or(&mut self.by_node);
+        target.entry(key).or_default().push(cost);
+    }
+
+    pub(crate) fn record_parent(&mut self, node: String, mut cost: i64) {
+        let key = self.key(node);
+        if let Some(frame) = self.frames.last_mut() {
+            if let Some(pending) = self.folded.get_mut(&key)
+                && !pending.is_empty()
+            {
+                frame.inclusive += pending.remove(0);
+            }
+            cost += frame.inclusive;
+        }
+        let target = self
+            .frames
+            .last_mut()
+            .map(|frame| &mut frame.by_node)
+            .unwrap_or(&mut self.by_node);
+        target.entry(key).or_default().insert(0, cost);
+    }
+
+    pub(crate) fn record_folded(&mut self, frame: usize, node: &str, cost: i64) {
+        if self.fold_suppress > 0 || cost == 0 {
+            return;
+        }
+        self.folded
+            .entry(ActualCostKey {
+                frame,
+                node: node.to_string(),
+            })
+            .or_default()
+            .push(cost);
+    }
+
+    pub(crate) fn suppress_folded(&mut self) {
+        self.fold_suppress += 1;
+    }
+
+    pub(crate) fn unsuppress_folded(&mut self) {
+        self.fold_suppress -= 1;
+    }
+
+    pub(crate) fn begin_frame(&mut self) {
+        self.frames.push(ActualCostFrame::default());
+    }
+
+    pub(crate) fn end_frame(&mut self) {
+        let Some(frame) = self.frames.pop() else {
+            return;
+        };
+        let target = self
+            .frames
+            .last_mut()
+            .map(|frame| &mut frame.by_node)
+            .unwrap_or(&mut self.by_node);
+        for (key, costs) in frame.by_node {
+            target.entry(key).or_default().extend(costs);
+        }
+    }
+
+    pub(crate) fn discard_frame(&mut self) {
+        self.frames.pop();
+    }
+
+    pub(crate) fn apply(&self, rows: &[Vec<Value>], frame_depths: &[usize], actual: &mut [i64]) {
+        let mut used: HashMap<ActualCostKey, usize> = HashMap::new();
+        let mut cte_used: HashMap<ActualCostKey, usize> = HashMap::new();
+        let mut suppressed_depth: Option<i64> = None;
+        for (i, row) in rows.iter().enumerate() {
+            let Some(Value::Text(node)) = row.get(1) else {
+                continue;
+            };
+            let depth = match row.first() {
+                Some(Value::Int(depth)) => *depth,
+                _ => continue,
+            };
+            if let Some(suppressed) = suppressed_depth {
+                if depth > suppressed {
+                    continue;
+                }
+                suppressed_depth = None;
+            }
+            let key = ActualCostKey {
+                frame: frame_depths.get(i).copied().unwrap_or(0),
+                node: node.clone(),
+            };
+            let at = used.entry(key.clone()).or_default();
+            if let Some(cost) = self.by_node.get(&key).and_then(|values| values.get(*at)) {
+                if i != 0 {
+                    actual[i] = *cost;
+                } // the rendered plan root already owns the exact whole-statement total
+                *at += 1;
+            }
+            if let Some(name) = node.strip_prefix("CTE ")
+                && !node.starts_with("CTE Scan ")
+            {
+                let marker_key = ActualCostKey {
+                    frame: frame_depths.get(i).copied().unwrap_or(0),
+                    node: format!("@cte-body {name}"),
+                };
+                let at = cte_used.entry(marker_key.clone()).or_default();
+                if let Some(marker) = self
+                    .by_node
+                    .get(&marker_key)
+                    .and_then(|values| values.get(*at))
+                {
+                    if *marker == 0 {
+                        suppressed_depth = Some(depth);
+                    }
+                    *at += 1;
+                }
+            }
+        }
+    }
 }
 
 /// An RAII counter for a live streaming cursor (temp-tables.md §6): built by [`Engine::open_stream_guard`]
@@ -1744,7 +1898,7 @@ impl CmpOp {
 /// The scalar functions (kind = "function", spec/design/functions.md §9), parsed from a call
 /// name (case-insensitive). Evaluated per row; the overload (integer vs decimal) is recovered
 /// at eval from the argument's runtime value.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScalarFunc {
     Abs,
     Round,
@@ -1976,6 +2130,7 @@ pub(crate) enum ScalarFunc {
 /// the builders return an *array* type (not a `ScalarType`), so they get their own resolved node
 /// ([`RExpr::ArrayFunc`]). The kernel id is the function name; the eval recovers everything else
 /// from the operand values (the array's own shape header), so the node carries no result type.
+#[derive(Debug)]
 pub(crate) enum ArrayFunc {
     /// array_ndims(anyarray) → i32 — the dimension count; NULL for the empty array.
     ArrayNdims,
@@ -2118,6 +2273,7 @@ pub(crate) enum RangeSetOp {
 /// [`ScalarFunc`] because they are non-strict (`null = "none"`, like [`ArrayFunc`]) and take either
 /// a spread of arguments or a single array via the `VARIADIC` keyword — the call form is carried on
 /// the [`RExpr::Variadic`] node. Both return `i32`.
+#[derive(Debug)]
 pub(crate) enum VariadicFunc {
     /// num_nulls(VARIADIC "any") → i32 — the count of NULL arguments (spread form), or of NULL
     /// flattened elements (VARIADIC-array form; a NULL whole-array operand → NULL). Never NULL in
@@ -4511,6 +4667,8 @@ pub(crate) enum BoundSrc {
     Text(String),
     Bytea(Vec<u8>),
     Decimal(Decimal),
+    Float32(f32),
+    Float64(f64),
     Interval(Interval),
     Null,
     Param(usize),

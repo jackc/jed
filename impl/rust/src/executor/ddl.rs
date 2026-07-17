@@ -269,7 +269,13 @@ impl Engine {
             Statement::Delete(del) => self.execute_delete(del, params, CteCtx::empty()),
             // EXPLAIN renders the inner statement's plan (spec/design/explain.md): plain EXPLAIN is
             // plan-only, EXPLAIN ANALYZE runs the inner and reports its actual cost + row count.
-            Statement::Explain { analyze, inner } => self.execute_explain(analyze, *inner, params),
+            Statement::Explain {
+                analyze,
+                verbose,
+                costs,
+                lane,
+                inner,
+            } => self.execute_explain(analyze, verbose, costs, lane, *inner, params),
             // Transaction control is handled by `execute_stmt_params` before dispatch.
             Statement::Begin { .. } | Statement::Commit | Statement::Rollback => {
                 unreachable!("transaction control is handled before dispatch")

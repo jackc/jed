@@ -814,6 +814,8 @@ func (c *deferredCursor) close() {
 }
 
 func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value) (selectResult, error) {
+	profileStart := meter.Accrued
+	var filterWork, distinctWork, outputWork int64
 	store := db.lkpStoreScoped(plan.rels[0].db, plan.rels[0].tableName)
 	var offset int64
 	if plan.offset != nil {
@@ -840,7 +842,9 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 			return false, err
 		}
 		if plan.filter != nil {
+			before := meter.Accrued
 			v, err := plan.filter.eval(row, env, meter)
+			filterWork += meter.Accrued - before
 			if err != nil {
 				return false, err
 			}
@@ -851,6 +855,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 		if plan.distinct {
 			// Project per scanned filtered row (the dedup key) and drop duplicates by first
 			// occurrence; the OFFSET/LIMIT then window the DISTINCT rows.
+			before := meter.Accrued
 			projected := make([]Value, len(plan.projections))
 			for i, p := range plan.projections {
 				v, err := p.eval(row, env, meter)
@@ -859,6 +864,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 				}
 				projected[i] = v
 			}
+			distinctWork += meter.Accrued - before
 			if key := distinctRowKey(projected); seen[key] {
 				return true, nil // a duplicate of an already-emitted/seen value
 			} else {
@@ -869,12 +875,14 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 				return true, nil
 			}
 			meter.Charge(costs.RowProduced)
+			outputWork += costs.RowProduced
 			out = append(out, projected)
 		} else {
 			passed++
 			if passed <= offset {
 				return true, nil
 			}
+			before := meter.Accrued
 			meter.Charge(costs.RowProduced)
 			projected := make([]Value, len(plan.projections))
 			for i, p := range plan.projections {
@@ -884,6 +892,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 				}
 				projected[i] = v
 			}
+			outputWork += meter.Accrued - before
 			out = append(out, projected)
 		}
 		// Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every
@@ -1080,6 +1089,19 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 			}
 		}
 	}
+	totalWork := meter.Accrued - profileStart
+	scanWork := totalWork - filterWork - distinctWork - outputWork
+	scanNode := "Scan " + plan.rels[0].tableName
+	if selectActualRootNode(plan) != scanNode {
+		db.explainActual.record(scanNode, scanWork)
+	}
+	throughFilter := scanWork + filterWork
+	if plan.filter != nil && selectActualRootNode(plan) != "Filter" {
+		db.explainActual.recordParent("Filter", throughFilter)
+	}
+	if plan.distinct && selectActualRootNode(plan) != "Distinct" {
+		db.explainActual.recordParent("Distinct", throughFilter+distinctWork)
+	}
 	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
 }
 
@@ -1094,6 +1116,8 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 // execStreamingScan's LIMIT stop. page_read is the full block up front (only per-row work
 // short-circuits, like the streaming scan).
 func (db *engine) execWindowTopN(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value) (emitter, error) {
+	profileStart := meter.Accrued
+	var filterWork int64
 	store := db.lkpStoreScoped(plan.rels[0].db, plan.rels[0].tableName)
 
 	// The scan bound (the PK pushdown, if any) + its page_read block, exactly as execStreamingScan.
@@ -1137,7 +1161,9 @@ func (db *engine) execWindowTopN(plan *selectPlan, env *evalEnv, meter *costMete
 				return false, err
 			}
 			if plan.filter != nil {
+				before := meter.Accrued
 				v, err := plan.filter.eval(row, env, meter)
+				filterWork += meter.Accrued - before
 				if err != nil {
 					return false, err
 				}
@@ -1160,8 +1186,21 @@ func (db *engine) execWindowTopN(plan *selectPlan, env *evalEnv, meter *costMete
 	}
 
 	// The window stage over the collected prefix — identical to the eager path (§5.2), just fewer rows.
+	beforeWindow := meter.Accrued
 	if err := applyWindowStage(rows, plan.windowSpecs, plan.windowKeys, env, meter); err != nil {
 		return emitter{}, err
+	}
+	scanAndFilter := beforeWindow - profileStart
+	scanWork := scanAndFilter - filterWork
+	scanNode := selectActualRelNode(plan.rels[0])
+	if selectActualRootNode(plan) != scanNode {
+		db.explainActual.record(scanNode, scanWork)
+	}
+	if plan.filter != nil && selectActualRootNode(plan) != "Filter" {
+		db.explainActual.recordParent("Filter", scanAndFilter)
+	}
+	if selectActualRootNode(plan) != "Window" {
+		db.explainActual.recordParent("Window", meter.Accrued-profileStart)
 	}
 
 	// The prefix is already in outer ORDER BY order (pkOrdered), so the sort is elided. Slice the
@@ -1189,6 +1228,8 @@ func (db *engine) execWindowTopN(plan *selectPlan, env *evalEnv, meter *costMete
 // each scanned entry then charges its point-lookup's page_read/value_decompress + one
 // storage_row_read, plus row_produced and projection operator_evals per produced row.
 func (db *engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *evalEnv, meter *costMeter) (selectResult, error) {
+	profileStart := meter.Accrued
+	var filterWork, outputWork int64
 	store := db.lkpStoreScoped(plan.rels[0].db, plan.rels[0].tableName)
 	istore := db.lkpIndexStore(io.nameKey)
 	// Up-front index-tree page_read (the full block; the index store has no payload, so no slabs).
@@ -1222,7 +1263,9 @@ func (db *engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *
 				return false, err
 			}
 			if plan.filter != nil {
+				before := meter.Accrued
 				v, err := plan.filter.eval(row, env, meter)
+				filterWork += meter.Accrued - before
 				if err != nil {
 					return false, err
 				}
@@ -1234,6 +1277,7 @@ func (db *engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *
 			if passed <= offset {
 				return true, nil
 			}
+			before := meter.Accrued
 			meter.Charge(costs.RowProduced)
 			projected := make([]Value, len(plan.projections))
 			for i, p := range plan.projections {
@@ -1243,6 +1287,7 @@ func (db *engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *
 				}
 				projected[i] = v
 			}
+			outputWork += meter.Accrued - before
 			out = append(out, projected)
 			// Stop once a LIMIT window is filled (a top-N over the index order).
 			if plan.limit != nil {
@@ -1253,6 +1298,15 @@ func (db *engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *
 		if err != nil {
 			return selectResult{}, err
 		}
+	}
+	totalWork := meter.Accrued - profileStart
+	scanWork := totalWork - filterWork - outputWork
+	scanNode := selectActualRelNode(plan.rels[0])
+	if selectActualRootNode(plan) != scanNode {
+		db.explainActual.record(scanNode, scanWork)
+	}
+	if plan.filter != nil && selectActualRootNode(plan) != "Filter" {
+		db.explainActual.recordParent("Filter", scanWork+filterWork)
 	}
 	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
 }
@@ -1269,6 +1323,8 @@ func (db *engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *
 // row accrue — only the sort, which is unmetered (cost.md §3), now spills. Gated (by the caller) to a
 // single table, no join, non-aggregate, non-DISTINCT, with an ORDER BY and no index bound.
 func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value) (emitter, error) {
+	profileStart := meter.Accrued
+	var filterWork int64
 	store := db.lkpStoreScoped(plan.rels[0].db, plan.rels[0].tableName)
 
 	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read + value_decompress
@@ -1320,7 +1376,9 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 				}
 				keep := true
 				if plan.filter != nil {
+					before := meter.Accrued
 					v, err := plan.filter.eval(row, env, meter)
+					filterWork += meter.Accrued - before
 					if err != nil {
 						return false, err
 					}
@@ -1372,7 +1430,9 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 				}
 				keep := true
 				if plan.filter != nil {
+					before := meter.Accrued
 					v, err := plan.filter.eval(row, env, meter)
+					filterWork += meter.Accrued - before
 					if err != nil {
 						return false, err
 					}
@@ -1429,6 +1489,18 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 			sorted.close()
 			return emitter{}, err
 		}
+	}
+	blockingWork := meter.Accrued - profileStart
+	scanWork := blockingWork - filterWork
+	scanNode := selectActualRelNode(plan.rels[0])
+	if selectActualRootNode(plan) != scanNode {
+		db.explainActual.record(scanNode, scanWork)
+	}
+	if plan.filter != nil && selectActualRootNode(plan) != "Filter" {
+		db.explainActual.recordParent("Filter", blockingWork)
+	}
+	if selectActualRootNode(plan) != "Sort" {
+		db.explainActual.recordParent("Sort", blockingWork)
 	}
 	return emitter{sorted: sorted, start: 0, end: end - start, mode: emitSorted}, nil
 }
@@ -1496,19 +1568,26 @@ func topKFixedScalar(ty scalarType) bool {
 // when the window fills. Gated (by the caller / plan.joinPkOrdered) to exactly two non-lateral base
 // relations, an INNER/CROSS join, a LIMIT, and a forward outer-PK ORDER BY.
 func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value, outer []storedRow, rng *stmtRng) (selectResult, error) {
+	profileStart := meter.Accrued
+	relWork := make(map[int]int64, 2)
+	var filterWork, outputWork int64
 	outerOrdinal := physicalRelOrdinal(plan, 0)
 	innerOrdinal := physicalRelOrdinal(plan, 1)
+	before := meter.Accrued
 	leftRows, err := db.materializeRel(plan, outerOrdinal, params, outer, nil, rng, env.ctes, meter)
 	if err != nil {
 		return selectResult{}, err
 	}
+	relWork[outerOrdinal] = meter.Accrued - before
 	rightINL := plan.phys.relINLBounds[innerOrdinal] != nil
 	var rightRows []storedRow
 	if !rightINL {
+		before = meter.Accrued
 		rightRows, err = db.materializeRel(plan, innerOrdinal, params, outer, nil, rng, env.ctes, meter)
 		if err != nil {
 			return selectResult{}, err
 		}
+		relWork[innerOrdinal] = meter.Accrued - before
 	}
 	on := plan.joins[0].on
 	var hashTable *hashJoinTable
@@ -1531,10 +1610,12 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 			innerRows := rightRows
 			if rightINL {
 				outerLogical := placePhysicalRelationRow(plan, outerOrdinal, left)
+				before = meter.Accrued
 				innerRows, err = db.materializeRel(plan, innerOrdinal, params, outer, outerLogical, rng, env.ctes, meter)
 				if err != nil {
 					return selectResult{}, err
 				}
+				relWork[innerOrdinal] += meter.Accrued - before
 			} else if hashTable != nil {
 				innerRows, err = hashTable.probe(plan.phys.hashJoin, left, meter)
 				if err != nil {
@@ -1555,7 +1636,9 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 				}
 				// The residual WHERE over the combined row (per surviving pair).
 				if plan.filter != nil {
+					before = meter.Accrued
 					v, err := plan.filter.eval(combined, env, meter)
+					filterWork += meter.Accrued - before
 					if err != nil {
 						return selectResult{}, err
 					}
@@ -1570,6 +1653,7 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 				if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
 					return selectResult{}, err
 				}
+				before = meter.Accrued
 				meter.Charge(costs.RowProduced)
 				projected := make([]Value, len(plan.projections))
 				for j, p := range plan.projections {
@@ -1579,6 +1663,7 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 					}
 					projected[j] = v
 				}
+				outputWork += meter.Accrued - before
 				out = append(out, projected)
 				// Stop the whole nested loop once the LIMIT window is filled.
 				if plan.limit != nil && int64(len(out)) >= *plan.limit {
@@ -1587,23 +1672,46 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 			}
 		}
 	}
+	totalWork := meter.Accrued - profileStart
+	for _, ordinal := range []int{outerOrdinal, innerOrdinal} {
+		node := selectActualRelNode(plan.rels[ordinal])
+		if selectActualRootNode(plan) != node {
+			db.explainActual.record(node, relWork[ordinal])
+		}
+	}
+	throughJoin := totalWork - filterWork - outputWork
+	joinNode := "Nested Loop"
+	if plan.phys.hashJoin != nil {
+		joinNode = "Hash Join"
+	}
+	if selectActualRootNode(plan) != joinNode {
+		db.explainActual.recordParent(joinNode, throughJoin)
+	}
+	if plan.filter != nil && selectActualRootNode(plan) != "Filter" {
+		db.explainActual.recordParent("Filter", throughJoin+filterWork)
+	}
 	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
 }
 
 func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value, outer []storedRow, rng *stmtRng) (selectResult, error) {
+	profileStart := meter.Accrued
+	var filterWork, outputWork int64
 	materialized := make([][]storedRow, len(plan.rels))
+	relWork := make([]int64, len(plan.rels))
 	for ordinal, rel := range plan.rels {
 		if rel.lateral || plan.phys.relINLBounds[ordinal] != nil {
 			continue
 		}
+		before := meter.Accrued
 		rows, err := db.materializeRel(plan, ordinal, params, outer, nil, rng, env.ctes, meter)
 		if err != nil {
 			return selectResult{}, err
 		}
 		materialized[ordinal] = rows
+		relWork[ordinal] = meter.Accrued - before
 	}
 	finalPosition := len(plan.rels) - 1
-	running, err := db.execCostedNWayJoin(plan, env, meter, params, outer, materialized, finalPosition-1)
+	running, err := db.execCostedNWayJoin(plan, env, meter, params, outer, materialized, relWork, finalPosition-1)
 	if err != nil {
 		return selectResult{}, err
 	}
@@ -1628,10 +1736,12 @@ func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *c
 		for _, left := range running {
 			candidates := innerRows
 			if plan.phys.relINLBounds[inner] != nil {
+				before := meter.Accrued
 				candidates, err = db.materializeRel(plan, inner, params, outer, left, rng, env.ctes, meter)
 				if err != nil {
 					return selectResult{}, err
 				}
+				relWork[inner] += meter.Accrued - before
 			} else if table != nil {
 				candidates, err = table.probe(step.hashJoin, left, meter)
 				if err != nil {
@@ -1659,7 +1769,9 @@ func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *c
 					continue
 				}
 				if plan.filter != nil {
+					before := meter.Accrued
 					v, err := plan.filter.eval(combined, env, meter)
+					filterWork += meter.Accrued - before
 					if err != nil {
 						return selectResult{}, err
 					}
@@ -1674,6 +1786,7 @@ func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *c
 				if err := meter.Guard(); err != nil {
 					return selectResult{}, err
 				}
+				before := meter.Accrued
 				meter.Charge(costs.RowProduced)
 				projected := make([]Value, len(plan.projections))
 				for i, p := range plan.projections {
@@ -1682,12 +1795,25 @@ func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *c
 						return selectResult{}, err
 					}
 				}
+				outputWork += meter.Accrued - before
 				out = append(out, projected)
 				if plan.limit != nil && int64(len(out)) >= *plan.limit {
 					break outerLoop
 				}
 			}
 		}
+	}
+	for _, ordinal := range plan.phys.relationOrder {
+		db.explainActual.record(selectActualRelNode(plan.rels[ordinal]), relWork[ordinal])
+	}
+	throughJoin := meter.Accrued - profileStart - filterWork - outputWork
+	joinNode := "Nested Loop"
+	if step.hashJoin != nil {
+		joinNode = "Hash Join"
+	}
+	db.explainActual.recordParent(joinNode, throughJoin)
+	if plan.filter != nil {
+		db.explainActual.recordParent("Filter", throughJoin+filterWork)
 	}
 	return selectResult{columnNames: append([]string(nil), plan.columnNames...), columnTypes: append([]resolvedType(nil), plan.columnTypes...), rows: out, cost: meter.Accrued}, nil
 }
@@ -1969,5 +2095,6 @@ func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []V
 	if err != nil {
 		return selectResult{}, err
 	}
+	db.explainActual.recordParent(selectActualRootNode(plan), meter.Accrued)
 	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
 }

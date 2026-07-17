@@ -1,0 +1,739 @@
+# EXPLAIN follow-on surface: parenthesized boolean options, canonical verbose expressions, exact
+# float literal text, lane classification, per-node ANALYZE costs, DML touched sets, and writable
+# WITH plans. This is jed-owned deterministic output (spec/design/explain.md).
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.sequence, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.returning, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.limit, query.order_by, query.order_by_pk_scan, query.order_by_index_scan, query.order_by_join_inl, query.order_by_topk, query.window, query.window_ranking, query.cte, query.cte_data_modifying, query.union, query.explain, query.explain_analyze, query.aggregates, query.subquery_scalar, query.derived_table, query.join_inner, query.qualified_column, query.hash_join, dml.explain, expr.arithmetic, expr.json_query_fns, func.sequence, func.jsonb_path, types.i32, types.i64, types.f64, types.jsonb, types.jsonpath, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20)
+
+# COSTS false leaves only the stable structural columns.
+# names: depth, node, detail
+query ITT nosort
+EXPLAIN (COSTS FALSE) SELECT v FROM t WHERE id = 1
+----
+0
+Filter
+conjuncts=1
+1
+Scan t
+PK bound: id = 1; touched=2
+
+# VERBOSE replaces predicate counts with a fully parenthesized resolved-expression spelling and
+# appends the projection list to the outermost SELECT node. LANE is statement-wide.
+# names: depth, node, detail, lane
+query ITTT nosort
+EXPLAIN (VERBOSE TRUE, COSTS OFF, LANE ON) SELECT v + 1 FROM t WHERE id = 1 AND v > 0
+----
+0
+Filter
+filter=((#0 = 1) and (#1 > 0)); output=[(#1 + 1)]
+buffered
+1
+Scan t
+PK bound: id = 1; touched=2
+buffered
+
+# The verbose printer covers resolved control-flow and function nodes, not only binary predicates.
+query ITT nosort
+EXPLAIN (VERBOSE, COSTS FALSE) SELECT CASE WHEN 1 = 1 THEN upper('a') ELSE 'b' END
+----
+0
+Result
+output=[(case when (1 = 1) then upper('a') else 'b' end)]
+
+statement error 42601
+EXPLAIN (COSTS, COSTS FALSE) SELECT 1
+
+statement error 42601
+EXPLAIN (UNKNOWN) SELECT 1
+
+statement error 42601
+EXPLAIN (COSTS FALSE) ANALYZE SELECT 1
+
+# A bounded pull scan is streaming; a WITH/set-operation boundary is deferred.
+query ITTT nosort
+EXPLAIN (COSTS FALSE, LANE) SELECT v FROM t LIMIT 1
+----
+0
+Limit
+limit=1
+streaming
+1
+Scan t
+Full scan; touched=1
+streaming
+
+# Statement write classification precedes shape classification in the public dispatcher. A SELECT
+# that advances a sequence therefore uses the buffered write path even though its scan can stream.
+statement ok
+CREATE SEQUENCE s
+
+query ITTT nosort
+EXPLAIN (COSTS FALSE, LANE) SELECT nextval('s') FROM t LIMIT 1
+----
+0
+Limit
+limit=1
+buffered
+1
+Scan t
+Full scan
+buffered
+
+# A top-level WITH containing DML is likewise a buffered write, not a deferred read.
+query ITTT nosort
+EXPLAIN (COSTS FALSE, LANE) WITH u AS (UPDATE t SET v = v + 1 WHERE id = 1 RETURNING id) SELECT id FROM u
+----
+0
+WITH
+ctes=1
+buffered
+1
+CTE u
+materialized
+buffered
+2
+Update t
+sets=1
+buffered
+3
+Filter
+conjuncts=1
+buffered
+4
+Scan t
+PK bound: id = 1; touched=2
+buffered
+1
+CTE Scan u
+-
+buffered
+
+query ITTT nosort
+EXPLAIN (COSTS FALSE, LANE TRUE) WITH q AS (SELECT v FROM t) SELECT * FROM q
+----
+0
+WITH
+ctes=1
+deferred
+1
+CTE q
+inlined
+deferred
+2
+Scan t
+Full scan; touched=1
+deferred
+1
+CTE Scan q
+-
+deferred
+
+# Actual attribution is execution-only. An unused definition remains visible as plan metadata, but
+# neither its wrapper nor its informational child scan inherits an estimate as fake work.
+query ITTI nosort
+EXPLAIN (ANALYZE, COSTS FALSE) WITH unused AS (SELECT v FROM t) SELECT v FROM t WHERE id = 1
+----
+0
+Analyze
+cost=4 rows=1
+4
+1
+WITH
+ctes=1
+4
+2
+CTE unused
+inlined
+0
+3
+Scan t
+Full scan; touched=1
+0
+2
+Filter
+conjuncts=1
+4
+3
+Scan t
+PK bound: id = 1; touched=2
+2
+
+# A derived query is a separate actual-cost frame. When both frames scan the same table, the outer
+# full scan and inner point scan keep their structural identities despite sharing the `Scan t` label.
+query ITTI nosort
+EXPLAIN (ANALYZE, COSTS FALSE) SELECT o.id FROM t o JOIN (SELECT id FROM t WHERE id = 1) d ON o.id = d.id
+----
+0
+Analyze
+cost=29 rows=1
+29
+1
+Hash Join
+inner; keys=1; on:conjuncts=1
+29
+2
+Scan t
+Full scan; touched=1
+3
+2
+Subquery d
+-
+4
+3
+Filter
+conjuncts=1
+4
+4
+Scan t
+PK bound: id = 1; touched=1
+2
+
+# An uncorrelated predicate subquery folds before the visible SELECT runs. Its hidden work belongs
+# to the inclusive Filter checkpoint (and parents), while the visible table scan remains scan-only.
+query ITTI nosort
+EXPLAIN (ANALYZE, COSTS FALSE) SELECT id FROM t WHERE id = (SELECT min(id) FROM t)
+----
+0
+Analyze
+cost=12 rows=1
+12
+1
+Filter
+conjuncts=1
+12
+2
+Scan t
+Full scan; touched=1
+3
+
+# VERBOSE spells every resolved SQL/JSON semantic field: RETURNING, wrapper/quotes, and ON behavior.
+# The default JSON_VALUE is therefore visibly distinct from an i32/error variant.
+query ITT nosort
+EXPLAIN (VERBOSE, COSTS FALSE) SELECT JSON_VALUE('{"a":1}', '$.a')
+----
+0
+Result
+output=[json_value('{"a": 1}', '$."a"' returning text null on empty null on error)]
+
+query ITT nosort
+EXPLAIN (VERBOSE, COSTS FALSE) SELECT JSON_VALUE('{"a":1}', '$.a' RETURNING i32 ERROR ON EMPTY NULL ON ERROR)
+----
+0
+Result
+output=[json_value('{"a": 1}', '$."a"' returning i32 error on empty null on error)]
+
+query ITT nosort
+EXPLAIN (VERBOSE, COSTS FALSE) SELECT JSON_QUERY('{"a":1}', '$' RETURNING json WITH CONDITIONAL ARRAY WRAPPER KEEP QUOTES EMPTY OBJECT ON EMPTY ERROR ON ERROR)
+----
+0
+Result
+output=[json_query('{"a": 1}', '$' returning json with conditional array wrapper keep quotes on scalar string empty object on empty error on error)]
+
+# Parenthesized ANALYZE adds actual_cost independently of the estimate columns.
+# names: depth, node, detail, actual_cost
+query ITTI nosort
+EXPLAIN (ANALYZE ON, COSTS FALSE) SELECT v FROM t WHERE id = 1
+----
+0
+Analyze
+cost=4 rows=1
+4
+1
+Filter
+conjuncts=1
+4
+2
+Scan t
+PK bound: id = 1; touched=2
+2
+
+# Inclusive checkpoints cover the complete pipeline: scan, residual filter, expression sort key,
+# and output-emitting Limit root.
+query ITTI nosort
+EXPLAIN (ANALYZE, COSTS FALSE) SELECT v + 1 FROM t WHERE id = 1 ORDER BY v + 1 LIMIT 1
+----
+0
+Analyze
+cost=6 rows=1
+6
+1
+Limit
+limit=1
+6
+2
+Sort
+keys=1, top-k=1
+4
+3
+Filter
+conjuncts=1
+3
+4
+Scan t
+PK bound: id = 1; touched=2
+2
+
+# Float constants use each core's exact shortest round-trip rendering in both the expression and
+# the compact bound. The float-layout ledger entry bounds the presentation exception.
+statement ok
+CREATE TABLE f (x f64 PRIMARY KEY)
+
+statement ok
+INSERT INTO f VALUES (1.25)
+
+# names: depth, node, detail
+query ITT nosort
+EXPLAIN (VERBOSE, COSTS FALSE) SELECT x FROM f WHERE x = f64 '1.25'
+----
+0
+Filter
+filter=(#0 = 1.25); output=[#0]
+1
+Scan f
+PK bound: x = 1.25; touched=1
+
+# UPDATE/DELETE scan details include the exact resolved DML touched-set width.
+query ITT nosort
+EXPLAIN (COSTS FALSE) UPDATE t SET v = v + 1 WHERE id = 1 RETURNING v
+----
+0
+Update t
+sets=1
+1
+Filter
+conjuncts=1
+2
+Scan t
+PK bound: id = 1; touched=2
+
+query ITT nosort
+EXPLAIN (COSTS FALSE) DELETE FROM t WHERE id = 2 RETURNING v
+----
+0
+Delete t
+-
+1
+Filter
+conjuncts=1
+2
+Scan t
+PK bound: id = 2; touched=2
+
+# A writable CTE is rendered without running it. Data-modifying CTEs are always materialized, and
+# their mutation subtree appears at the definition site before the primary query.
+query ITT nosort
+EXPLAIN (COSTS FALSE) WITH u AS (UPDATE t SET v = v + 1 WHERE id = 1 RETURNING id, v) SELECT v FROM u
+----
+0
+WITH
+ctes=1
+1
+CTE u
+materialized
+2
+Update t
+sets=1
+3
+Filter
+conjuncts=1
+4
+Scan t
+PK bound: id = 1; touched=2
+1
+CTE Scan u
+-
+
+# A data-modifying body is planned in its lexical CTE scope, just as execution resolves it: the
+# INSERT source can reference the preceding read-only binding.
+statement ok
+CREATE TABLE wd (id i32 PRIMARY KEY, v i32)
+
+query ITT nosort
+EXPLAIN (COSTS FALSE) WITH q AS (SELECT id, v FROM t WHERE id = 1), i AS (INSERT INTO wd SELECT id, v FROM q RETURNING id) SELECT id FROM i
+----
+0
+WITH
+ctes=2
+1
+CTE q
+inlined
+2
+Filter
+conjuncts=1
+3
+Scan t
+PK bound: id = 1; touched=2
+1
+CTE i
+materialized
+2
+Insert wd
+-
+3
+CTE Scan q
+-
+1
+CTE Scan i
+-
+
+query I nosort
+SELECT count(*) FROM wd
+----
+0
+
+# A data-modifying primary is rendered after the definition list too. Neither write executes.
+query ITT nosort
+EXPLAIN (COSTS FALSE) WITH u AS (UPDATE t SET v = v + 1 WHERE id = 1 RETURNING id) DELETE FROM t WHERE id = 2 RETURNING id
+----
+0
+WITH
+ctes=1
+1
+CTE u
+materialized
+2
+Update t
+sets=1
+3
+Filter
+conjuncts=1
+4
+Scan t
+PK bound: id = 1; touched=2
+1
+Delete t
+-
+2
+Filter
+conjuncts=1
+3
+Scan t
+PK bound: id = 2; touched=1
+
+# Plain EXPLAIN did not run either update.
+query II rowsort
+SELECT id, v FROM t ORDER BY id
+----
+1
+10
+2
+20
+
+# A deliberately skewed secondary-index lookup pins the scan sub-meter, rather than reusing its
+# cardinality estimate: three matching point fetches cost seven below the residual Filter.
+statement ok
+CREATE TABLE ai (id i32 PRIMARY KEY, v i32)
+
+statement ok
+CREATE INDEX ai_v_idx ON ai (v)
+
+statement ok
+INSERT INTO ai VALUES (1, 1), (2, 1), (3, 1), (4, 9)
+
+query ITTI nosort
+EXPLAIN (ANALYZE, COSTS FALSE) SELECT id FROM ai WHERE v = 1
+----
+0
+Analyze
+cost=13 rows=3
+13
+1
+Filter
+conjuncts=1
+13
+2
+Scan ai
+Index bound: using ai_v_idx; touched=2
+7
+
+# The specialized ordered lanes expose the same execution-derived checkpoints: an index-ordered
+# scan that rejects two candidates, a streaming external/top-k sort, a windowed PK prefix, and an
+# ordered index-nested-loop join. These values deliberately differ by stage, preventing a fallback
+# to the root total or the estimate stream.
+statement ok
+CREATE TABLE io (id i32 PRIMARY KEY, v i32, w i32)
+
+statement ok
+CREATE INDEX io_v_idx ON io (v)
+
+statement ok
+INSERT INTO io VALUES (1, 1, 0), (2, 2, 0), (3, 3, 1)
+
+query ITTI nosort
+EXPLAIN (ANALYZE, COSTS FALSE) SELECT id FROM io WHERE w = 1 ORDER BY v LIMIT 1
+----
+0
+Analyze
+cost=11 rows=1
+11
+1
+Limit
+limit=1
+11
+2
+Filter
+conjuncts=1
+10
+3
+Scan io
+Full scan; touched=3; ordered: index order: io_v_idx
+7
+
+statement ok
+CREATE TABLE ss (id i32 PRIMARY KEY, v i32, w i32)
+
+statement ok
+INSERT INTO ss VALUES (1, 1, 0), (2, 2, 0), (3, 3, 1)
+
+query ITTI nosort
+EXPLAIN (ANALYZE, COSTS FALSE) SELECT id FROM ss WHERE w = 1 ORDER BY v LIMIT 1
+----
+0
+Analyze
+cost=8 rows=1
+8
+1
+Limit
+limit=1
+8
+2
+Sort
+keys=1, top-k=1
+7
+3
+Filter
+conjuncts=1
+7
+4
+Scan ss
+Full scan; touched=3
+4
+
+query ITTI nosort
+EXPLAIN (ANALYZE, COSTS FALSE) SELECT row_number() OVER (ORDER BY id) FROM t ORDER BY id LIMIT 1
+----
+0
+Analyze
+cost=4 rows=1
+4
+1
+Limit
+limit=1
+4
+2
+Window
+funcs=1
+3
+3
+Scan t
+Full scan; touched=1; ordered: pk ordered
+2
+
+query ITTI nosort
+EXPLAIN (ANALYZE, COSTS FALSE) SELECT a.id FROM t a JOIN t b ON a.id = b.id ORDER BY a.id LIMIT 1
+----
+0
+Analyze
+cost=7 rows=1
+7
+1
+Limit
+limit=1
+7
+2
+Nested Loop
+inner; on:conjuncts=1; ordered: join pk ordered
+6
+3
+Scan t
+Full scan; touched=1
+3
+3
+Scan t
+Index-nested-loop PK bound: id = join; touched=1
+2
+
+# Outside the streaming LIMIT lane, repeated physical probes are summed into the one inner scan
+# node. The identical self-join labels also pin physical-tree queue order.
+query ITTI nosort
+EXPLAIN (ANALYZE, COSTS FALSE) SELECT a.id FROM t a JOIN t b ON a.id = b.id
+----
+0
+Analyze
+cost=11 rows=2
+11
+1
+Nested Loop
+inner; on:conjuncts=1
+11
+2
+Scan t
+Full scan; touched=1
+3
+2
+Scan t
+Index-nested-loop PK bound: id = join; touched=1
+4
+
+# Same-named operators in sibling query branches retain pre-order attribution rather than being
+# reversed by each branch's inclusive completion checkpoint.
+query ITTI nosort
+EXPLAIN (ANALYZE, COSTS FALSE) SELECT v FROM t WHERE id = 1 UNION ALL SELECT v FROM t WHERE id >= 1
+----
+0
+Analyze
+cost=11 rows=3
+11
+1
+Union
+all
+11
+2
+Filter
+conjuncts=1
+4
+3
+Scan t
+PK bound: id = 1; touched=2
+2
+2
+Filter
+conjuncts=1
+7
+3
+Scan t
+PK bound: id >= 1; touched=2
+3
+
+# UPDATE target attribution separates physical scan work from residual evaluation and root work.
+statement ok
+CREATE TABLE ad (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO ad VALUES (1, 10)
+
+query ITTI nosort
+EXPLAIN (ANALYZE, COSTS FALSE) UPDATE ad SET v = v + 1 WHERE id = 1
+----
+0
+Analyze
+cost=4 rows=1
+4
+1
+Update ad
+sets=1
+4
+2
+Filter
+conjuncts=1
+3
+3
+Scan ad
+PK bound: id = 1; touched=2
+2
+
+# Writable-WITH attribution includes both metadata wrappers and the nested DML root; only ANALYZE
+# executes the update and feeds its RETURNING buffer to the primary query.
+statement ok
+CREATE TABLE aw (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO aw VALUES (1, 10)
+
+query ITTI nosort
+EXPLAIN (ANALYZE, COSTS FALSE) WITH u AS (UPDATE aw SET v = v + 1 WHERE id = 1 RETURNING id) SELECT id FROM u
+----
+0
+Analyze
+cost=7 rows=1
+7
+1
+WITH
+ctes=1
+7
+2
+CTE u
+materialized
+5
+3
+Update aw
+sets=1
+5
+4
+Filter
+conjuncts=1
+3
+5
+Scan aw
+PK bound: id = 1; touched=2
+2
+2
+CTE Scan u
+-
+2
+
+query II nosort
+SELECT id, v FROM aw
+----
+1
+11
+
+# Repeated DML/operator labels in sibling writable CTEs stay in authored pre-order. Their different
+# access paths deliberately produce different costs, so a reversed completion queue is observable.
+statement ok
+CREATE TABLE ax (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO ax VALUES (1, 10), (2, 20)
+
+query ITTI nosort
+EXPLAIN (ANALYZE, COSTS FALSE) WITH a AS (UPDATE ax SET v = v + 1 WHERE id = 1 RETURNING id), b AS (UPDATE ax SET v = 99 WHERE v = 20 RETURNING id) SELECT id FROM b
+----
+0
+Analyze
+cost=13 rows=1
+13
+1
+WITH
+ctes=2
+13
+2
+CTE a
+materialized
+5
+3
+Update ax
+sets=1
+5
+4
+Filter
+conjuncts=1
+3
+5
+Scan ax
+PK bound: id = 1; touched=2
+2
+2
+CTE b
+materialized
+6
+3
+Update ax
+sets=1
+6
+4
+Filter
+conjuncts=1
+5
+5
+Scan ax
+Full scan; touched=2
+3
+2
+CTE Scan b
+-
+2

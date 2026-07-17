@@ -409,11 +409,55 @@ class Parser {
   private parseExplain(): Statement {
     this.advance(); // EXPLAIN
     let analyze = false;
+    let verbose = false;
+    let costs = true;
+    let lane = false;
+    const seen = new Set<string>();
+    let optionList = false;
+    if (this.peek().kind === "lparen") {
+      optionList = true;
+      this.advance();
+      for (;;) {
+        const name = this.peekKeyword();
+        if (name !== "analyze" && name !== "verbose" && name !== "costs" && name !== "lane") {
+          throw engineError(
+            "syntax_error",
+            name === "" ? "expected an EXPLAIN option" : `unrecognized EXPLAIN option: ${name}`,
+          );
+        }
+        this.advance();
+        if (seen.has(name)) {
+          throw engineError("syntax_error", `EXPLAIN option specified more than once: ${name}`);
+        }
+        seen.add(name);
+        let value = true;
+        const bool = this.peekKeyword();
+        if (bool === "true" || bool === "false" || bool === "on" || bool === "off") {
+          this.advance();
+          value = bool === "true" || bool === "on";
+        }
+        if (name === "analyze") analyze = value;
+        else if (name === "verbose") verbose = value;
+        else if (name === "costs") costs = value;
+        else lane = value;
+        if (this.peek().kind === "rparen") {
+          this.advance();
+          break;
+        }
+        if (this.peek().kind !== "comma") {
+          throw engineError("syntax_error", "expected ',' or ')' in EXPLAIN option list");
+        }
+        this.advance();
+      }
+    }
     if (this.peekKeyword() === "analyze") {
+      if (optionList) {
+        throw engineError("syntax_error", "cannot mix EXPLAIN option list with positional ANALYZE");
+      }
       this.advance();
       analyze = true;
     }
-    return { kind: "explain", analyze, inner: this.parseExplainInner() };
+    return { kind: "explain", analyze, verbose, costs, lane, inner: this.parseExplainInner() };
   }
 
   // parseExplainInner parses the statement EXPLAIN wraps — restricted to a query (SELECT / WITH) or a

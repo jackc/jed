@@ -196,6 +196,6 @@ conjuncts=2
 9
 2
 Scan p6a
-PK bound: id > 0
+PK bound: id > 0; touched=3
 2
 3

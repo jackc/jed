@@ -84,7 +84,7 @@ conjuncts=1
 3
 2
 Scan t
-PK bound: id = 1
+PK bound: id = 1; touched=1
 1
 2
 
@@ -99,7 +99,7 @@ sets=1
 3
 1
 Scan t
-Full scan
+Full scan; touched=1
 2
 3
 
@@ -119,7 +119,7 @@ conjuncts=1
 3
 2
 Scan t
-PK bound: id = 2
+PK bound: id = 2; touched=1
 1
 2
 
@@ -139,7 +139,7 @@ conjuncts=1
 5
 2
 Scan t
-Full scan
+Full scan; touched=1
 2
 3
 
@@ -160,7 +160,7 @@ conjuncts=1
 8
 2
 Scan t
-Full scan
+Full scan; touched=1
 2
 3
 
@@ -208,7 +208,7 @@ conjuncts=2
 0
 2
 Scan access_policy
-GIN bound: using access_policy_tags_gin
+GIN bound: using access_policy_tags_gin; touched=3
 0
 0
 
@@ -228,7 +228,7 @@ conjuncts=3
 0
 2
 Scan access_policy
-Index bound: using access_policy_score_idx
+Index bound: using access_policy_score_idx; touched=3
 0
 0
 
@@ -247,7 +247,7 @@ conjuncts=2
 0
 2
 Scan access_policy
-GIN bound: using access_policy_tags_gin
+GIN bound: using access_policy_tags_gin; touched=2
 0
 0
 
@@ -274,7 +274,7 @@ conjuncts=1
 0
 2
 Scan dml_index_plan
-Index bound: using dml_index_plan_v_idx
+Index bound: using dml_index_plan_v_idx; touched=1
 0
 0
 
@@ -293,7 +293,7 @@ conjuncts=1
 0
 2
 Scan dml_index_plan
-Index bound: using dml_index_plan_v_idx
+Index bound: using dml_index_plan_v_idx; touched=1
 0
 0
 
@@ -312,7 +312,7 @@ conjuncts=1
 0
 2
 Scan dml_index_plan
-Index interval set: using dml_index_plan_v_idx; intervals=2
+Index interval set: using dml_index_plan_v_idx; intervals=2; touched=1
 0
 0
 
@@ -331,7 +331,7 @@ conjuncts=1
 0
 2
 Scan dml_index_plan
-Index interval set: using dml_index_plan_v_idx; intervals=2
+Index interval set: using dml_index_plan_v_idx; intervals=2; touched=1
 0
 0
 
@@ -350,7 +350,7 @@ conjuncts=1
 0
 2
 Scan dml_index_plan
-Full scan
+Full scan; touched=1
 0
 0
 
@@ -375,7 +375,7 @@ conjuncts=2
 0
 2
 Scan dml_partial_plan
-Index bound: using dml_partial_plan_v_idx
+Index bound: using dml_partial_plan_v_idx; touched=2
 0
 0
 
@@ -395,7 +395,7 @@ conjuncts=1
 0
 2
 Scan dml_partial_plan
-Full scan
+Full scan; touched=1
 0
 0
 
@@ -424,6 +424,6 @@ conjuncts=2
 0
 2
 Scan dml_cpk
-PK bound: b = 1 and a = 1
+PK bound: b = 1 and a = 1; touched=2
 0
 0

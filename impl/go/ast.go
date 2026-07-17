@@ -128,6 +128,9 @@ const (
 // cost + row count are reported; false ⇒ the plan is rendered without executing the inner statement.
 type explain struct {
 	Analyze bool
+	Verbose bool
+	Costs   bool
+	Lane    bool
 	Inner   *statement
 }
 

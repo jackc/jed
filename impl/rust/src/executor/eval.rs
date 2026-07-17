@@ -2627,7 +2627,7 @@ impl RExpr {
                 child.push(row);
                 let r = env
                     .exec
-                    .exec_query_plan(plan, &child, env.params, env.ctes)?;
+                    .exec_hidden_query_plan(plan, &child, env.params, env.ctes)?;
                 m.charge(r.cost);
                 match kind {
                     SubqueryKind::Scalar => {

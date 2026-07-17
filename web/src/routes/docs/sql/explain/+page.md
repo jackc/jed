@@ -54,8 +54,8 @@ FROM city GROUP BY region;`;
 
 `EXPLAIN` shows **how** jed will run a statement — which access path the planner chose (a full scan,
 a primary-key lookup, a B-tree/GIN/GiST/interval bound), how joins are shaped, and whether an `ORDER BY` is
-served by scan order, a bounded top-k heap, or a full sort. It renders the plan as an ordinary result set with five
-columns:
+served by scan order, a bounded top-k heap, or a full sort. It renders the plan as an ordinary result set. Bare
+`EXPLAIN` has five columns:
 
 - **`depth`** — the plan node's nesting level (0 = the top of the pipeline). The rows are a
   pre-order walk of the plan tree, so they read top-down as execution reads bottom-up.
@@ -66,8 +66,23 @@ columns:
 - **`est_cost`** — cumulative estimated work through that node, using the same deterministic cost
   units as execution.
 
-The plan is a **deterministic** function of the query and the database, so every jed core renders
-the identical plan and estimates. For a one-table query, jed compares the complete scheduled work
+The parenthesized option form controls additional detail and columns:
+
+```sql
+EXPLAIN (VERBOSE, COSTS OFF, LANE ON) SELECT name FROM city WHERE id = 3;
+EXPLAIN (ANALYZE TRUE, COSTS FALSE) SELECT name FROM city WHERE id = 3;
+```
+
+`VERBOSE` replaces compact predicate counts with canonical resolved expressions and appends the
+projection list as `output=[...]`. `COSTS` controls the two estimate columns (on by default), `ANALYZE`
+adds `actual_cost`, and `LANE` adds `streaming`, `buffered`, or `deferred`. Boolean options accept
+`TRUE`/`FALSE` or `ON`/`OFF`; a missing value means true. Exact float bounds are shown with their
+shortest round-trip value rather than a placeholder. SQL/JSON expressions include their resolved
+`RETURNING`, wrapper/quotes, and `ON EMPTY`/`ON ERROR` behavior. Lanes describe the public dispatcher:
+sequence-mutating SELECTs and WITH statements containing DML are buffered writes regardless of shape.
+
+The plan is a **deterministic** function of the query and the database, so every jed core selects
+the identical plan and estimates (with only the ledgered native float-text layout exception). For a one-table query, jed compares the complete scheduled work
 of full, primary-key, ordered B-tree, GIN, GiST, and interval-set paths, including natural ordering,
 the residual/projection, and LIMIT/OFFSET early-out. An `ORDER BY ... LIMIT` may also admit an
 order-only B-tree walk. Exact ties use a fixed access-kind order and then lowercased index name.
@@ -84,7 +99,8 @@ policy.
 
 With no usable scan order, `ORDER BY` is blocking and the scan reads the whole table. A finite LIMIT
 adds `top-k=K` to the Sort: jed retains only `K = OFFSET + LIMIT` rows while preserving the exact
-stable full-sort result. `touched=` reports how many columns the query actually references.
+stable full-sort result. `touched=` reports how many stored columns the statement actually references;
+UPDATE/DELETE include filter and assignment sources plus the storage-reading side of `RETURNING`.
 
 <LiveSql seed={seed} query={fullScan} rows={8} />
 
@@ -178,10 +194,16 @@ discount work the executor still performs.
 Plain `EXPLAIN` only **plans** the statement — it never runs it, so `EXPLAIN DELETE …` deletes
 nothing. `EXPLAIN ANALYZE` also **executes** the statement and reports its **actual** accrued
 [cost](../select/) and row count on an `Analyze` node. Because jed's cost is deterministic, this
-figure is exact and reproducible — not a wall-clock estimate. The `Analyze` row repeats its child's
-planned `est_rows` and `est_cost`; actual figures remain in `detail`, so the two are never conflated.
+figure is exact and reproducible — not a wall-clock estimate. The `actual_cost` column gives inclusive
+measured attribution for every plan node; `est_rows` and `est_cost` remain the independent planner
+estimate columns. Nested query frames keep same-labeled scans distinct, and work from a folded
+uncorrelated expression subquery is included at its containing visible operator and parents.
 
 <LiveSql seed={seed} query={analyze} rows={8} />
 
 > `EXPLAIN ANALYZE` of an `INSERT` / `UPDATE` / `DELETE` **does** run the mutation (and commits it),
 > exactly like PostgreSQL. Use plain `EXPLAIN` to inspect a write's plan without changing any data.
+
+Plain EXPLAIN also supports a data-modifying `WITH`: every `CTE <name>` definition and its complete
+write subtree are displayed in authored order, followed by the primary query or DML subtree, without
+running any of them.
