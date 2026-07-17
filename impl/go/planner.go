@@ -111,6 +111,13 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 			if serr != nil {
 				return nil, serr
 			}
+			relationName := tref.Name
+			if tref.Alias != nil {
+				relationName = *tref.Alias
+			}
+			if err := applySRFColumnAliases(tbl, relationName, tref.ColumnAliases); err != nil {
+				return nil, err
+			}
 			t = tbl
 			srfPlans[i] = sp
 			if lateralEligible {

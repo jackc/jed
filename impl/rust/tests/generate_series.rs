@@ -204,11 +204,6 @@ fn deferred_and_bad_call_errors() {
         .session(SessionOptions::default());
     // SELECT-list SRF is deferred — `generate_series` is not a scalar function.
     assert_eq!(err_code(&mut db, "SELECT generate_series(1, 5)"), "42883");
-    // Column-alias list on a table function is deferred.
-    assert_eq!(
-        err_code(&mut db, "SELECT * FROM generate_series(1, 5) AS g(n)"),
-        "0A000"
-    );
     // Wrong arity / non-integer args: no matching function.
     assert_eq!(
         err_code(&mut db, "SELECT * FROM generate_series(1)"),

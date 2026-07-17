@@ -67,6 +67,10 @@ SELECT * FROM jsonb_to_recordset('{"a":1}') AS t(a i32)
 statement error 42601
 SELECT * FROM jsonb_to_record('{"a":1}')
 
+# A rename-only alias list cannot supply the record's missing types; it is still 42601.
+statement error 42601
+SELECT * FROM jsonb_to_recordset('[{"a":1}]') AS t(a, b)
+
 # A column-definition list is valid ONLY on a record-returning function (else 42601).
 statement error 42601
 SELECT * FROM generate_series(1, 3) AS t(x i32)

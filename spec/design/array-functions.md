@@ -441,7 +441,8 @@ Row order without an `ORDER BY` is **unspecified** (CLAUDE.md §8) — the confo
 the multiset (`rowsort`); PostgreSQL happens to preserve element order, and jed does too, but neither
 is contractual. `unnest` composes with `WHERE` / `ORDER BY` / `LIMIT` / cross-join exactly as
 `generate_series` does, and the output column follows the same **single-column function-alias rule**
-(the alias, else `unnest`).
+(the alias, else `unnest`), unless an explicit column-alias list supplies the name
+(`unnest(xs) AS u(element)` → `u.element`; [grammar.md §35](grammar.md)).
 
 **Cost.** Each produced element charges one **`generated_row`** ([cost.md §3](cost.md)) — the same
 unit `generate_series` charges, guarded so a `max_cost` ceiling aborts a runaway `unnest` (`54P01`)

@@ -325,18 +325,6 @@ test("json_populate non-composite base and array field divergences", () => {
   );
 });
 
-// A rename-only column-alias list `AS g(col)` (no types) on a table function is a deferred 0A000
-// (only the TYPED column-definition list `AS t(col type, …)` — C0 — is parsed). PostgreSQL accepts a
-// rename list on an SRF, so this is a documented divergence. Mirrors
-// impl/rust/tests/json.rs srf_rename_only_column_list_is_deferred.
-test("srf rename-only column list is deferred", () => {
-  const db = dbWith([]);
-  assert.equal(
-    errCode(() => db.execute(`SELECT * FROM jsonb_to_recordset('[{"a":1}]') AS t(a, b)`)),
-    "0A000",
-  );
-});
-
 // The deferred S2 sub-clauses of the SQL/JSON query functions are 0A000 — PASSING (path vars), ON
 // ERROR/EMPTY DEFAULT expr, JSON_QUERY OMIT QUOTES, and JSON_QUERY RETURNING a non-json type.
 // PostgreSQL supports all of these, so each is a documented divergence; the supported subset is

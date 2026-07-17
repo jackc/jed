@@ -456,18 +456,6 @@ func TestJsonPopulateNonCompositeAndComplexFieldDivergences(t *testing.T) {
 	}
 }
 
-// TestSrfRenameOnlyColumnListIsDeferred: a rename-only column-alias list AS g(col) (no types) on a
-// table function is a deferred 0A000 (only the TYPED column-definition list AS t(col type, …) — C0 —
-// is parsed). PostgreSQL accepts a rename list on an SRF, so this is a documented divergence. Mirrors
-// impl/rust/tests/json.rs srf_rename_only_column_list_is_deferred.
-func TestSrfRenameOnlyColumnListIsDeferred(t *testing.T) {
-	t.Parallel()
-	db := memDB().Session(SessionOptions{})
-	if got := errJSON(t, db, `SELECT * FROM jsonb_to_recordset('[{"a":1}]') AS t(a, b)`); got != "0A000" {
-		t.Errorf("rename-only column list: got %s, want 0A000", got)
-	}
-}
-
 // TestJSONQueryFnDeferredClausesAre0A000: the SQL/JSON query functions' deferred sub-clauses (S2,
 // json-sql-functions.md §5) each resolve to 0A000 — PASSING path vars, a DEFAULT-expr behavior,
 // JSON_QUERY OMIT QUOTES, and a JSON_QUERY non-json RETURNING. A per-core test (the oracle corpus is

@@ -3968,6 +3968,34 @@ fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> Box<Table> {
     })
 }
 
+/// Apply a table function's optional rename-only column-alias list (grammar.md §35). Names replace
+/// fixed synthetic output columns left-to-right; a shorter list is a partial rename, while a longer
+/// list is PostgreSQL's 42P10 invalid-column-reference error.
+fn apply_srf_column_aliases(
+    table: &mut Table,
+    relation_name: &str,
+    aliases: Option<&[String]>,
+) -> Result<()> {
+    let Some(aliases) = aliases else {
+        return Ok(());
+    };
+    if aliases.len() > table.columns.len() {
+        return Err(EngineError::new(
+            SqlState::InvalidColumnReference,
+            format!(
+                "table \"{}\" has {} columns available but {} columns specified",
+                relation_name.to_ascii_lowercase(),
+                table.columns.len(),
+                aliases.len()
+            ),
+        ));
+    }
+    for (column, alias) in table.columns.iter_mut().zip(aliases) {
+        column.name = alias.clone();
+    }
+    Ok(())
+}
+
 /// Build one output row for `json[b]_to_record(set)` (R1): map each declared column to the JSON
 /// object's member of that name, coercing it to the column type. A missing member or a JSON null →
 /// SQL NULL; a non-object node → `22023`. (json-table.md §2)

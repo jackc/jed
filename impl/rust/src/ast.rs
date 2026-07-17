@@ -642,9 +642,10 @@ pub struct ReturningClause {
 /// A `subquery` of `Some(body)` instead marks a **derived table** — a parenthesized subquery used
 /// as a relation, `FROM (SELECT …) AS t` (spec/design/grammar.md §42). The alias is then mandatory
 /// (the parser enforces 42601), so `name` and `alias` both carry it and `args` is `None`;
-/// `column_aliases` is the optional column-rename list (`AS t (a, b)`). A derived table is
-/// mechanically an anonymous, always-inlined single-reference CTE — the planner reuses the CTE
-/// synthetic-relation seam.
+/// `column_aliases` is the optional column-rename list (`AS t (a, b)`). On a derived table it
+/// renames the body output; on a fixed-shape table function it renames synthetic output columns
+/// left-to-right (spec/design/grammar.md §35/§42). A derived table is mechanically an anonymous,
+/// always-inlined single-reference CTE — the planner reuses the CTE synthetic-relation seam.
 ///
 /// `values` carries a **VALUES-body** derived table — `FROM (VALUES (e11,…),(e21,…)) AS v(c1,…)`
 /// (spec/design/grammar.md §42): a parenthesized `VALUES` list used as a relation, a computed
@@ -675,7 +676,7 @@ pub struct TableRef {
     pub column_aliases: Option<Vec<String>>,
     /// A FROM-clause **column-definition list** `AS t(col type, …)` (C0, json-table.md §1): the typed
     /// columns a record-returning function (`json[b]_to_record(set)`) declares. Mutually exclusive
-    /// with `column_aliases` (a rename-only list). `None` for an ordinary table / SRF.
+    /// with `column_aliases` (a rename-only list). `None` for an ordinary table / fixed-shape SRF.
     pub column_defs: Option<Vec<TypeFieldDef>>,
     /// A `JSON_TABLE(...)` table source (json-table.md §3, T1) — projects a JSON document into a
     /// relation via the `COLUMNS` clause. When `Some`, the other source fields (`name`/`args`/…) are

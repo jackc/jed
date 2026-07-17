@@ -11904,6 +11904,7 @@ export class Engine {
           ctes,
           ptypes,
         );
+        applySrfColumnAliases(r.table, tref.alias ?? tref.name, tref.columnAliases ?? null);
         t = r.table;
         srf = r.srf;
         lateral = lateralEligible && r.srf.args.some((a) => rexprReferencesOuter(a, 0));
@@ -23112,6 +23113,24 @@ export function srfTable(funcName: string, alias: string | null, colTy: Type): T
     fks: [],
     exclusions: [],
   };
+}
+
+// applySrfColumnAliases applies a table function's optional rename-only column-alias list
+// (grammar.md §35). Names replace fixed synthetic output columns left-to-right; a shorter list is a
+// partial rename, while a longer list is PostgreSQL's 42P10 invalid-column-reference error.
+export function applySrfColumnAliases(
+  table: Table,
+  relationName: string,
+  aliases: string[] | null,
+): void {
+  if (aliases === null) return;
+  if (aliases.length > table.columns.length) {
+    throw engineError(
+      "invalid_column_reference",
+      `table "${relationName.toLowerCase()}" has ${table.columns.length} columns available but ${aliases.length} columns specified`,
+    );
+  }
+  for (let i = 0; i < aliases.length; i++) table.columns[i]!.name = aliases[i]!;
 }
 
 // srfTableCols builds a MULTI-COLUMN synthetic table for a set-returning function (C0,

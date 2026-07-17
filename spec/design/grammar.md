@@ -1942,15 +1942,24 @@ identifier — the resolver dispatches by name.
 after the leading identifier in `table_ref` position marks the function form (a **one-token
 lookahead**, a §8 cross-core determinism surface; a bare table name has no `(` there). The
 arguments are general expressions parsed exactly like a `function_call`'s, minus the `*` /
-`DISTINCT` forms (those are the aggregate/star spellings, not an SRF argument list). The
-optional alias is parsed identically to a base table's.
+`DISTINCT` forms (those are the aggregate/star spellings, not an SRF argument list). The optional
+alias is `table_function_alias ::= "AS"? identifier ("(" identifier ("," identifier)* ")")?`:
+`AS` remains optional, while a parenthesized column-alias list requires the relation alias before it.
 
-**Labeling and the single-column-alias rule.** The relation's **label** is the alias, or the
-function name when there is none. The produced relation has **one column**; its **name**
-follows PostgreSQL's single-column function-alias rule: the alias when one is given
+**Labeling and column aliases.** The relation's **label** is the alias, or the function name when
+there is none. Without a column list, a one-column function follows PostgreSQL's
+single-column function-alias rule: the relation alias also becomes the column name
 (`generate_series(1, 5) AS g` ⇒ column `g`, so `g.g` resolves and `g.generate_series` is
-`42703`), else the function name (`generate_series(1, 5)` ⇒ column `generate_series`, so
-`generate_series.generate_series` resolves). Oracle-verified against PostgreSQL.
+`42703`), while an unaliased function uses its catalog column name (`generate_series`).
+
+An explicit list overrides output names left-to-right: `generate_series(1, 5) AS g(n)` exposes
+the column as `g.n`, and `jsonb_each(doc) AS e(k, v)` exposes `e.k` / `e.v`. It applies to every
+fixed-shape table function, including multi-column SRFs. Fewer aliases than output columns is a
+partial rename and leaves the remaining catalog names intact; more aliases than available columns
+is `42P10` (*invalid column reference*). The list changes names only — never column order, types,
+cardinality, evaluation, or cost. A typed column-definition list (`AS r(c type, …)`) remains the
+separate record-returning-function form ([json-table.md](json-table.md) §1); the parser distinguishes
+it structurally by the type word after the first column name. Oracle-verified against PostgreSQL.
 
 **Composition.** An SRF relation is a first-class FROM item: it joins/cross-joins other
 relations (`t CROSS JOIN generate_series(1, 3)` is the product), and `WHERE` / `ORDER BY` /
@@ -1961,10 +1970,9 @@ generate_series(1, o.n)) FROM t o`), **and** a **column of an earlier sibling FR
 re-evaluates the SRF once per left-hand row (§44). (For the first/only FROM item there is no
 sibling, so an arg sees only `$N`/outer, as before.)
 
-**Deferred narrowings** (each a `0A000` or the relevant error, relaxable later, and shared by both
-SRFs): the **SELECT-list** SRF position (`SELECT generate_series(1, 5)` / `SELECT unnest(…)` — an
-SRF is not a scalar function, `42883`), the **column-alias-list** form `AS g(c1, …)` (`0A000` — a
-`(` after the alias), **`WITH ORDINALITY`**, and `generate_series`'s non-integer variants
+**Deferred narrowings** (each the relevant error, relaxable later, and shared by both SRFs): the
+**SELECT-list** SRF position (`SELECT generate_series(1, 5)` / `SELECT unnest(…)` — an SRF is not a
+scalar function, `42883`), **`WITH ORDINALITY`**, and `generate_series`'s non-integer variants
 (numeric/timestamp). The `generate_series` integer forms and their PostgreSQL edge cases (NULL arg →
 zero rows, step zero → `22023`, overflow → clean stop), and `unnest`'s element-expansion semantics,
 are spec'd in [functions.md](functions.md) §10 and [array-functions.md §9](array-functions.md).

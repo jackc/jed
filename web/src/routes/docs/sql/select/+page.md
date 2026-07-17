@@ -76,9 +76,9 @@ ORDER BY c.category;`;
 FROM (SELECT name, price, CASE WHEN id = 3 THEN 'Joe' END AS nickname FROM product) AS p
 ORDER BY name;`;
 
-	const unnestExample = `SELECT u AS tag
-FROM unnest(ARRAY['red', 'green', 'blue']) AS u
-ORDER BY u;`;
+	const unnestExample = `SELECT colors.tag
+FROM unnest(ARRAY['red', 'green', 'blue']) AS colors(tag)
+ORDER BY colors.tag;`;
 
 	const containmentExample = `SELECT ARRAY[1, 2, 3] @> ARRAY[2]   AS contains,
        ARRAY[2]       <@ ARRAY[1, 2, 3] AS contained_by,
@@ -325,7 +325,10 @@ A `FROM` item can be a set-returning function — a computed row source instead 
 `generate_series(start, stop[, step])` yields an integer series; `unnest(anyarray)` expands an array
 into one row per element (a multidimensional array flattens, a `NULL` element becomes a `NULL` row,
 and a `NULL` or empty array yields no rows). The produced relation has one column, named after the
-function or its alias, and composes with `WHERE` / `ORDER BY` / `LIMIT` / joins like any other:
+function or its alias by default. Add a column-alias list when the output deserves a clearer name:
+`unnest(tags) AS expanded(tag)` exposes `expanded.tag`. Multi-column table functions accept the same
+left-to-right renaming, and a shorter list leaves the remaining output names unchanged. The relation
+composes with `WHERE` / `ORDER BY` / `LIMIT` / joins like any other:
 
 <LiveSql query={unnestExample} rows={6} />
 

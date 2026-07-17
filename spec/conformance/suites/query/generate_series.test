@@ -120,6 +120,25 @@ SELECT g.g FROM generate_series(1, 3) AS g
 2
 3
 
+# An explicit column-alias list overrides the single-column default while leaving the relation
+# label at g. AS is optional in the table-function alias production; this query exercises it.
+# names: n
+# cost: 6
+query I rowsort
+SELECT g.n FROM generate_series(1, 3) g(n)
+----
+1
+2
+3
+
+# The alias-list name replaces, rather than supplements, the alias-only column name.
+statement error 42703
+SELECT g.g FROM generate_series(1, 3) AS g(n)
+
+# More aliases than fixed output columns is invalid_column_reference (PG's table-function rule).
+statement error 42P10
+SELECT * FROM generate_series(1, 3) AS g(n, extra)
+
 # --- CROSS JOIN with a base table: the series is one operand of the product -----------
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, n i32)

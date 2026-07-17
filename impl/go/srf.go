@@ -453,6 +453,25 @@ func srfTable(funcName string, alias *string, colTy dataType) *catTable {
 	}
 }
 
+// applySRFColumnAliases applies a table function's optional rename-only column-alias list
+// (grammar.md §35). Names replace fixed synthetic output columns left-to-right; a shorter list is a
+// partial rename, while a longer list is PostgreSQL's 42P10 invalid-column-reference error.
+func applySRFColumnAliases(table *catTable, relationName string, aliases []string) error {
+	if aliases == nil {
+		return nil
+	}
+	if len(aliases) > len(table.Columns) {
+		return newError(InvalidColumnReference, fmt.Sprintf(
+			"table \"%s\" has %d columns available but %d columns specified",
+			strings.ToLower(relationName), len(table.Columns), len(aliases),
+		))
+	}
+	for i, alias := range aliases {
+		table.Columns[i].Name = alias
+	}
+	return nil
+}
+
 // srfCol is one fixed column of a multi-column SRF synthetic table (its name + type).
 type srfCol struct {
 	name string

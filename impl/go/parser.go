@@ -3114,8 +3114,9 @@ func (p *parser) parseFromClause() (tableRef, []joinClause, error) {
 	return from, joins, nil
 }
 
-// parseTableRef parses `table_ref ::= derived_table derived_alias? | (identifier | table_function)
-// ("AS"? identifier)?` (grammar.md §15/§35/§42). A `(` at the START of a table_ref, when a SELECT
+// parseTableRef parses `table_ref ::= derived_table derived_alias? | table_function
+// table_function_alias? | qualified_table ("AS"? identifier)?` (grammar.md §15/§35/§42). A `(`
+// at the START of a table_ref, when a SELECT
 // follows, begins a DERIVED TABLE — a parenthesized subquery used as a relation (§42); any other
 // leading `(` is a 42601 this slice (no parenthesized-join FROM). Otherwise it is a base table name
 // OR a set-returning function call, a `(` immediately after the leading identifier marking the
@@ -3203,28 +3204,47 @@ func (p *parser) parseTableRef() (tableRef, error) {
 		p.advance()
 		alias = &a
 	}
-	// A `(` after the alias is a FROM-clause list on a table function (a base table never has one
-	// there). The TYPED column-definition list `AS t(col type, …)` (C0, json-table.md §1) — for the
-	// record-returning functions — is parsed here; the rename-only form `AS g(col)` (no type) stays a
-	// deferred narrowing (grammar.md §35).
+	// A `(` after a table-function alias is either the rename-only column-alias list
+	// `AS g(c1, …)` (grammar.md §35) or the typed column-definition list `AS g(c type, …)`
+	// used by record-returning functions (C0, json-table.md §1). A base table's corresponding
+	// list remains a deferred 0A000 narrowing.
+	var columnAliases []string
 	var columnDefs []typeFieldDef
 	if alias != nil && p.peek().Kind == tokLParen {
+		if !isFunc {
+			return tableRef{}, newError(FeatureNotSupported,
+				"column alias list on a base table is not supported yet")
+		}
 		// Disambiguate: a col-def list has `name type`; a rename list has `name ,`/`name )`. With the
 		// cursor still on `(`, the first column name is at offset 1, so a `Word` at offset 2 means a
 		// type follows (col-def list).
-		if p.peekKindAt(2) != tokWord {
-			return tableRef{}, newError(FeatureNotSupported,
-				"column alias list on a table function is not supported yet")
-		}
+		typed := p.peekKindAt(2) == tokWord
 		p.advance() // (
-		defs, err := p.parseFieldDefList()
-		if err != nil {
-			return tableRef{}, err
+		if typed {
+			defs, err := p.parseFieldDefList()
+			if err != nil {
+				return tableRef{}, err
+			}
+			columnDefs = defs
+		} else {
+			for {
+				column, err := p.expectIdentifier()
+				if err != nil {
+					return tableRef{}, err
+				}
+				columnAliases = append(columnAliases, column)
+				if p.peek().Kind != tokComma {
+					break
+				}
+				p.advance()
+			}
+			if err := p.expect(tokRParen); err != nil {
+				return tableRef{}, err
+			}
 		}
-		columnDefs = defs
 	}
 	// An SRF is implicitly lateral; Lateral records only whether the keyword was written.
-	return tableRef{Name: name, DB: dbQualifier, Alias: alias, IsFunc: isFunc, Args: args, ColumnDefs: columnDefs, Lateral: lateral}, nil
+	return tableRef{Name: name, DB: dbQualifier, Alias: alias, IsFunc: isFunc, Args: args, ColumnAliases: columnAliases, ColumnDefs: columnDefs, Lateral: lateral}, nil
 }
 
 // parseJsonTable parses `JSON_TABLE(ctx, path [AS n] COLUMNS (col, …)) [AS alias]` (json-table.md §3,

@@ -78,8 +78,8 @@
 <p>
   Called in <code>FROM</code> position as a computed row source — they <em>expand</em> their
   arguments into a set of rows. <code>generate_series</code> yields an integer series;
-  <code>unnest</code> (polymorphic over <code>anyarray</code>) yields one row per array element. The
-  produced relation has one column named after the function (or its alias).
+  <code>unnest</code> (polymorphic over <code>anyarray</code>) yields one row per array element.
+  Fixed output columns can be renamed with <code>AS relation(column, …)</code>.
 </p>
 <div class="not-prose overflow-x-auto rounded-lg border border-slate-200">
   <table class="w-full border-collapse text-sm">

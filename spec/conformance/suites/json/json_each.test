@@ -66,6 +66,27 @@ a
 b
 2
 
+# A column-alias list renames fixed multi-column SRF outputs left-to-right. A shorter list is a
+# partial rename, leaving the remaining catalog column name intact.
+# names: k, v
+query TT nosort
+SELECT e.k, e.v FROM jsonb_each('{"a": 1, "b": 2}') AS e(k, v) ORDER BY e.k
+----
+a
+1
+b
+2
+
+# names: k, value
+query TT nosort
+SELECT e.k, e.value FROM jsonb_each('{"a": 1}') AS e(k)
+----
+a
+1
+
+statement error 42P10
+SELECT * FROM jsonb_each('{"a": 1}') AS e(k, v, extra)
+
 # Lateral over a stored column: expand each row's jsonb document (implicitly lateral SRF). jed spells
 # the lateral join with CROSS JOIN (a comma-FROM with an SRF is a separate parser limitation).
 statement ok

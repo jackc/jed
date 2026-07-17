@@ -2463,8 +2463,9 @@ class Parser {
     return { from, joins };
   }
 
-  // parseTableRef parses `table_ref ::= derived_table derived_alias? | (identifier |
-  // table_function) ("AS"? identifier)?` (grammar.md §15/§35/§42). A `(` at the START of a
+  // parseTableRef parses `table_ref ::= derived_table derived_alias? | table_function
+  // table_function_alias? | qualified_table ("AS"? identifier)?` (grammar.md §15/§35/§42). A `(`
+  // at the START of a
   // table_ref, when a SELECT follows, begins a DERIVED TABLE — a parenthesized subquery used as a
   // relation (§42); any other leading `(` is a 42601 this slice (no parenthesized-join FROM).
   // Otherwise it is a base table name OR a set-returning function call, a `(` immediately after the
@@ -2529,26 +2530,36 @@ class Parser {
         this.advance();
       }
     }
-    // A `(` after the alias is a FROM-clause list on a table function (a base table never has one
-    // there). The TYPED column-definition list `AS t(col type, …)` (C0, json-table.md §1) — for the
-    // record-returning functions — is parsed here; the rename-only form `AS g(col)` (no type) stays
-    // a deferred narrowing (grammar.md §35).
+    // A `(` after a table-function alias is either the rename-only column-alias list
+    // `AS g(c1, …)` (grammar.md §35) or the typed column-definition list `AS g(c type, …)`
+    // used by record-returning functions (C0, json-table.md §1). A base table's corresponding
+    // list remains a deferred 0A000 narrowing.
+    let columnAliases: string[] | undefined;
     let columnDefs: TypeFieldDef[] | undefined;
     if (alias !== null && this.peek().kind === "lparen") {
+      if (args === null) {
+        throw engineError(
+          "feature_not_supported",
+          "column alias list on a base table is not supported yet",
+        );
+      }
       this.advance(); // (
       // Disambiguate: a col-def list has `name type`; a rename list has `name ,`/`name )`. After the
       // opening `(`, the current token is the first column name, so a `word` in the NEXT slot means a
       // type follows (col-def list).
-      if (this.peekKindAt(1) !== "word") {
-        throw engineError(
-          "feature_not_supported",
-          "column alias list on a table function is not supported yet",
-        );
+      if (this.peekKindAt(1) === "word") {
+        columnDefs = this.parseFieldDefList();
+      } else {
+        columnAliases = [this.expectIdentifier()];
+        while (this.peek().kind === "comma") {
+          this.advance();
+          columnAliases.push(this.expectIdentifier());
+        }
+        this.expect("rparen");
       }
-      columnDefs = this.parseFieldDefList();
     }
     // An SRF is implicitly lateral; `lateral` records only whether the keyword was written.
-    return { name, db, alias, args, columnDefs, lateral };
+    return { name, db, alias, args, columnAliases, columnDefs, lateral };
   }
 
   // parseDerivedTable parses a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42).
@@ -2845,9 +2856,7 @@ class Parser {
   // unary, or keyword-led primary meaning (spec/design/grammar.md §3).
   private atQualifiedColumnRef(): boolean {
     return (
-      this.peekKindAt(0) === "word" &&
-      this.peekKindAt(1) === "dot" &&
-      this.peekKindAt(2) === "word"
+      this.peekKindAt(0) === "word" && this.peekKindAt(1) === "dot" && this.peekKindAt(2) === "word"
     );
   }
 

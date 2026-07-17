@@ -116,7 +116,7 @@ impl Engine {
                 // A table function (SRF) — implicitly lateral. At i>0 its args resolve against the
                 // prefix scope (a sibling column then correlates); at i==0 against `parent` (the
                 // enclosing query / params), unchanged (functions.md §10).
-                let (table, rargs, kind) = if lateral_eligible {
+                let (mut table, rargs, kind) = if lateral_eligible {
                     let prefix = build_prefix_scope(&finalized, &synthetic, parent, self, ctes);
                     self.resolve_srf(
                         &tref.name,
@@ -138,6 +138,11 @@ impl Engine {
                         ptypes,
                     )?
                 };
+                apply_srf_column_aliases(
+                    &mut table,
+                    tref.alias.as_deref().unwrap_or(&tref.name),
+                    tref.column_aliases.as_deref(),
+                )?;
                 lateral_flags
                     .push(lateral_eligible && rargs.iter().any(|a| rexpr_references_outer(a, 0)));
                 synthetic.push(table);

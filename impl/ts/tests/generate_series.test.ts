@@ -104,10 +104,6 @@ test("deferred-form and bad-call errors", () => {
     "42883",
   ); // SELECT-list SRF deferred
   assert.equal(
-    errCode(() => db.execute("SELECT * FROM generate_series(1, 5) AS g(n)")),
-    "0A000",
-  ); // column-alias list
-  assert.equal(
     errCode(() => db.execute("SELECT * FROM generate_series(1)")),
     "42883",
   ); // wrong arity

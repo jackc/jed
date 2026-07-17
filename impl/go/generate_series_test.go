@@ -137,11 +137,10 @@ func TestGenerateSeriesDeferredAndBadCalls(t *testing.T) {
 	cases := []struct {
 		sql, code string
 	}{
-		{"SELECT generate_series(1, 5)", "42883"},                // SELECT-list SRF deferred
-		{"SELECT * FROM generate_series(1, 5) AS g(n)", "0A000"}, // column-alias list deferred
-		{"SELECT * FROM generate_series(1)", "42883"},            // wrong arity
-		{"SELECT * FROM generate_series('a', 5)", "42883"},       // non-integer arg
-		{"SELECT * FROM nope(1, 5)", "42883"},                    // unknown table function
+		{"SELECT generate_series(1, 5)", "42883"},          // SELECT-list SRF deferred
+		{"SELECT * FROM generate_series(1)", "42883"},      // wrong arity
+		{"SELECT * FROM generate_series('a', 5)", "42883"}, // non-integer arg
+		{"SELECT * FROM nope(1, 5)", "42883"},              // unknown table function
 	}
 	for _, c := range cases {
 		if got := genErrCode(t, db, c.sql); got != c.code {

@@ -638,7 +638,8 @@ type returningClause struct {
 // `FROM (SELECT …) [AS] t`, grammar.md §42). A derived table is mechanically an anonymous,
 // always-inlined single-reference CTE: the planner reuses the CTE synthetic-relation seam. Its alias
 // is OPTIONAL (PG 18); when present it is the label and ColumnAliases is the optional column-rename
-// list, when absent Name/Alias are empty and the relation has no qualifier.
+// list, when absent Name/Alias are empty and the relation has no qualifier. On a fixed-shape table
+// function, ColumnAliases renames synthetic output columns left-to-right (grammar.md §35).
 // Values carries a VALUES-body derived table — FROM (VALUES (e11,…),(e21,…)) AS v(c1,…)
 // (spec/design/grammar.md §42): a parenthesized VALUES list used as a relation, a computed
 // relation of literal rows. It is the FROM-position alternative body to Subquery (the two are
@@ -667,7 +668,7 @@ type tableRef struct {
 	ColumnAliases []string
 	// ColumnDefs is a FROM-clause **column-definition list** `AS t(col type, …)` (C0, json-table.md
 	// §1): the typed columns a record-returning function (`json[b]_to_record(set)`) declares. Mutually
-	// exclusive with ColumnAliases (a rename-only list). Nil for an ordinary table / SRF.
+	// exclusive with ColumnAliases (a rename-only list). Nil for an ordinary table / fixed-shape SRF.
 	ColumnDefs []typeFieldDef
 	// JsonTable is a `JSON_TABLE(...)` table source (json-table.md §3, T1) — projects a JSON document
 	// into a relation via the `COLUMNS` clause. When non-nil, the other source fields (`Name`/`Args`/…)

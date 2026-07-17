@@ -659,9 +659,11 @@ group_set      ::= "(" (column_ref ("," column_ref)*)? ")" | column_ref
  * a parenthesized COLUMN-RENAME list "(c1, c2)" renaming the body's output columns left-to-right
  * exactly as a CTE's does (fewer names is a partial rename, more is 42P10); a column list with no
  * preceding alias name is a 42601 syntax error. When absent, the relation has no qualifier (bare
- * columns still resolve). A base table / function alias stays the bare optional form ("orders o" =
- * "orders AS o"); their column-alias-list form "AS g(cols)" remains a deferred 0A000 narrowing
- * (§35).
+ * columns still resolve). A base-table alias stays the bare optional form ("orders o" =
+ * "orders AS o"); its column-alias-list form remains a deferred 0A000 narrowing. A table function
+ * alias may carry a parenthesized COLUMN-RENAME list "AS g(c1, c2)" (§35): names replace fixed
+ * output-column names left-to-right, fewer is a partial rename, and more than the function produces
+ * is 42P10.
  *   LATERAL (../design/grammar.md §44). A derived table or table function may be preceded by the
  * "LATERAL" keyword, letting its body / arguments reference columns of the FROM relations that
  * appear BEFORE it in the same FROM clause (a dependent / correlated join). The keyword precedes
@@ -674,7 +676,7 @@ from_clause    ::= from_item ("," from_item)*
 from_item      ::= table_ref join_clause*
 
 table_ref      ::= "LATERAL"? derived_table derived_alias?
-                 | "LATERAL"? table_function ("AS"? identifier)?
+                 | "LATERAL"? table_function table_function_alias?
                  | qualified_table ("AS"? identifier)?
 
 /* A database-QUALIFIED table name (../design/attached-databases.md §3). jed's FIRST multi-part name
@@ -710,6 +712,8 @@ values_row     ::= "(" expr ("," expr)* ")"
 derived_alias  ::= "AS"? identifier ("(" identifier ("," identifier)* ")")?
 
 table_function ::= identifier "(" expr ("," expr)* ")"
+
+table_function_alias ::= "AS"? identifier ("(" identifier ("," identifier)* ")")?
 
 /* A join_clause is INNER/OUTER JOIN ... (ON <expr> | USING (cols)) (the "INNER" keyword is
  * optional — a bare "JOIN" is INNER), a NATURAL join (a derived condition, no ON/USING), or

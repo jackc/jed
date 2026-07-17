@@ -11,8 +11,9 @@
 # usual evaluation + row_produced, and a max_cost ceiling bounds a runaway unnest (54P01). A
 # non-array argument is 42883. PostgreSQL-oracle-verified (postgres:18). The ARRAY[…] literal args
 # default to i64 (jed's literal typing), so those columns are i64 — value-identical to PG's
-# int4/int8; the '{…}'::i32[] form pins i32. The SELECT-list SRF position, LATERAL, the
-# column-alias-list form, and a bare untyped NULL (42P18) are out of scope (array-functions.md §6).
+# int4/int8; the '{…}'::i32[] form pins i32. A table-function column-alias list explicitly renames
+# the output (`AS u(element)`). The SELECT-list SRF position and a bare untyped NULL (42P18) remain
+# out of scope (array-functions.md §6); WITH ORDINALITY is deferred.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.set_returning, func.unnest, func.array, query.order_by, query.limit, query.cross_join, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_correlated, query.aggregates, query.comparison_order, expr.comparison_value, types.i32, types.i64, types.text, types.array, types.array_multidim, resource.cost_metering, resource.cost_limit
 
 # --- the basic case: one column named unnest, one row per element ---------------------
@@ -97,6 +98,17 @@ c
 # cost: 7
 query I rowsort
 SELECT g.g FROM unnest(ARRAY[10,20,30]) AS g ORDER BY g.g
+----
+10
+20
+30
+
+# An explicit column-alias list replaces the alias-only output name and participates normally in
+# qualified resolution / ORDER BY.
+# names: element
+# cost: 7
+query I nosort
+SELECT u.element FROM unnest(ARRAY[30,10,20]) AS u(element) ORDER BY u.element
 ----
 10
 20

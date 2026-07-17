@@ -880,7 +880,8 @@ export type InsertValue =
 // `FROM (SELECT …) [AS] t` (grammar.md §42), mechanically an anonymous always-inlined
 // single-reference CTE (the planner reuses the CTE synthetic-relation seam). The alias is OPTIONAL
 // (PG 18): present, it is the label and `columnAliases` the optional column-rename list; absent,
-// `name` is "" / `alias` is null and the relation has no qualifier.
+// `name` is "" / `alias` is null and the relation has no qualifier. On a fixed-shape table function,
+// `columnAliases` renames synthetic output columns left-to-right (grammar.md §35).
 // A `values` body instead marks a VALUES-body derived table — FROM (VALUES (e11,…),(e21,…)) AS
 // v(c1,…) (grammar.md §42): a parenthesized VALUES list used as a relation, a computed relation of
 // literal rows. It is the FROM-position alternative body to `subquery` (the two are mutually
@@ -895,7 +896,7 @@ export type InsertValue =
 // to the earlier siblings whether or not this flag is set.
 // `columnDefs` is a FROM-clause **column-definition list** `AS t(col type, …)` (C0, json-table.md
 // §1): the typed columns a record-returning function (`json[b]_to_record(set)`) declares. Mutually
-// exclusive with `columnAliases` (a rename-only list). Absent for an ordinary table / SRF.
+// exclusive with `columnAliases` (a rename-only list). Absent for an ordinary table / fixed-shape SRF.
 // `jsonTable` is a `JSON_TABLE(...)` table source (json-table.md §3, T1) — projects a JSON
 // document into a relation via the COLUMNS clause. When present, the other source fields
 // (`name`/`args`/…) are unused. Implicitly lateral (its `ctx` may reference earlier FROM siblings).
