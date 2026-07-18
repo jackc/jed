@@ -136,6 +136,29 @@ export type ForeignKey = {
   onUpdate: FkAction;
 };
 
+// HostFuncDep is a HOST-FUNCTION DEPENDENCY persisted with an index whose key/predicate expression
+// calls a host scalar function (spec/design/extensibility.md §8.1, format_version 31, delivery step
+// 4). One entry per DISTINCT host-function signature the index's expressions reference; it is the
+// resolved dependency the file records so a reopening binary can detect that the registry now supplies
+// a DIFFERENT implementation (a mismatch makes the index unusable — skipped for reads, refused for
+// writes — never a silent stale-key read). Sorted by (name, arg-type codes) when stored so
+// registration order never leaks (CLAUDE.md §8).
+export type HostFuncDep = {
+  // The (lowercased) SQL function name — the correlation key to a re-resolved hostFunc node.
+  name: string;
+  // The exact scalar argument signature — with `name`, identifies which overload this dependency pins.
+  argTypes: ScalarType[];
+  // The declared scalar result type at CREATE INDEX (recorded for completeness / introspection).
+  result: ScalarType;
+  // The host's stable component identity (HostFunction.componentId) at CREATE INDEX. Required for an
+  // index-backing function; a reopen whose registry supplies a different componentId for this
+  // signature makes the index unusable.
+  componentId: string;
+  // The host's semantic version at CREATE INDEX. A reopen whose registry bumped it forces a rebuild
+  // (the index is unusable meanwhile), never a silent stale-key read.
+  semanticVersion: number;
+};
+
 // IndexKey is one index key element (spec/design/indexes.md §1): a bare column (by ordinal into the
 // table's columns) or an expression over the table's columns (`lower(email)`), carrying its persisted
 // canonical text and the re-parsed (unresolved) AST — the write/plan paths re-resolve it against the
@@ -164,6 +187,14 @@ export type IndexDef = {
   // persisted canonical text + the re-parsed (unresolved) AST — re-resolved against the table per
   // statement, like an expression key. Partial indexes are B-tree only (format_version 27).
   predicate?: { exprText: string; expr: Expr };
+  // hostDeps is the persisted HOST-FUNCTION DEPENDENCY list (spec/design/extensibility.md §8.1,
+  // format_version 31): one entry per distinct host scalar function this index's key/predicate
+  // expressions call, each pinning the component identity + semantic version the index was built
+  // against. undefined / empty for the overwhelmingly common index with no host-function key
+  // (byte-identical to v30 then). On reopen the per-statement re-resolution (Engine.resolveIndex)
+  // compares each against the current registry; a mismatch makes the index unusable. Sorted by
+  // (name, arg-type codes). B-tree only (a GIN/GiST index's keys are plain columns).
+  hostDeps?: HostFuncDep[];
 };
 
 // indexKeyColumn is the column ordinal of a plain column key element, else null (an expression key).

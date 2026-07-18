@@ -5,7 +5,10 @@ package jed
 // (it registers no host code), so it is tested per core (CLAUDE.md §10 — host-API is a sanctioned
 // unit-test category). Mirrors impl/rust/tests/host_functions.rs one-for-one.
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 // hostAdd is host_add(i64, i64) -> i64 — integer sum (strict: never sees NULL).
 func hostAdd() *HostFunction {
@@ -253,4 +256,180 @@ func contains(haystack, needle string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------------------------
+// Delivery step 4 (extensibility.md §8.1 / §14): host scalar functions in PERSISTED INDEXES. An
+// `immutable` host function carrying a component_id + semantic_version may back an expression /
+// partial index; the file records the resolved dependency (format_version 31) and re-checks it on
+// reopen. A missing / different-component / bumped-version function makes the index unusable — skipped
+// for reads (correct heap scan), refused for writes (read-only) — never a silent stale-key read. These
+// cover what the corpus cannot express (host-API registration + on-disk reopen with a *different*
+// registry); they mirror the Rust/TS host-function tests one-for-one.
+// ---------------------------------------------------------------------------------------------
+
+// geoHash is geo_hash(i64) -> i64 — the canonical index-backing host function. component/version pin
+// its identity; Immutable + a component id are the two admission requirements (§8.1).
+func geoHash(component string, version uint32) *HostFunction {
+	return NewHostFunction("geo_hash", []string{"i64"}, "i64",
+		func(args []Value) (Value, error) { return IntValue(args[0].Int * 10), nil }).
+		WithVolatility(VolatilityImmutable).WithCrossCore(true).
+		WithComponentID(component).WithSemanticVersion(version)
+}
+
+// geoIDs runs sql and returns its first column as int64s (the reopen tests read `id`).
+func geoIDs(t *testing.T, q valueQuerier, sql string) []int64 {
+	t.Helper()
+	out, err := queryOutcome(q, sql, nil)
+	if err != nil {
+		t.Fatalf("%q: %v", sql, err)
+	}
+	ids := make([]int64, 0, len(out.Rows))
+	for _, r := range out.Rows {
+		ids = append(ids, r[0].Int)
+	}
+	return ids
+}
+
+// createGeoFile creates a file-backed database with reg registered and runs the setup statements
+// (each autocommits durably), then closes it.
+func createGeoFile(t *testing.T, path string, reg *ExtensionRegistry, stmts ...string) {
+	t.Helper()
+	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true, Extensions: reg})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer db.Close()
+	for _, s := range stmts {
+		if _, err := queryOutcome(db, s, nil); err != nil {
+			t.Fatalf("setup %q: %v", s, err)
+		}
+	}
+}
+
+// openGeoFile reopens a file-backed database (v31 deserialize) with reg registered.
+func openGeoFile(t *testing.T, path string, reg *ExtensionRegistry) *Database {
+	t.Helper()
+	db, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true, Extensions: reg})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	return db
+}
+
+func TestHostFuncVolatileInIndexRejected(t *testing.T) {
+	t.Parallel()
+	// The latent-bug fix: a volatile host function used to leak silently into an index expression (the
+	// immutability gate was purely syntactic and did not see host functions). Now 42P17.
+	volatile := NewHostFunction("geo_hash", []string{"i64"}, "i64",
+		func(args []Value) (Value, error) { return IntValue(args[0].Int * 10), nil }).
+		WithComponentID("com.example/geo_hash") // Volatile by default
+	s := dbExt(t, regWith(t, volatile), "CREATE TABLE t (a i64)")
+	wantErr(t, s, "CREATE INDEX ix ON t (geo_hash(a))", "42P17")
+}
+
+func TestHostFuncUnversionedInIndexRejected(t *testing.T) {
+	t.Parallel()
+	// Immutable but no component identity → cannot persist a sound dependency (42P17).
+	unversioned := NewHostFunction("geo_hash", []string{"i64"}, "i64",
+		func(args []Value) (Value, error) { return IntValue(args[0].Int * 10), nil }).
+		WithVolatility(VolatilityImmutable)
+	s := dbExt(t, regWith(t, unversioned), "CREATE TABLE t (a i64)")
+	wantErr(t, s, "CREATE INDEX ix ON t (geo_hash(a))", "42P17")
+}
+
+func TestHostFuncImmutableVersionedInIndexOK(t *testing.T) {
+	t.Parallel()
+	s := dbExt(t, regWith(t, geoHash("com.example/geo_hash", 1)),
+		"CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+		"INSERT INTO t VALUES (1, 3), (2, 7)",
+		"CREATE INDEX ix ON t (geo_hash(a))")
+	// geo_hash(3) = 30 → row id 1.
+	if got := geoIDs(t, s, "SELECT id FROM t WHERE geo_hash(a) = 30"); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("SELECT id WHERE geo_hash(a)=30 = %v, want [1]", got)
+	}
+}
+
+func TestHostFuncIndexReopenMatchingOK(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "hostfunc_index_match.jed")
+	createGeoFile(t, path, regWith(t, geoHash("com.example/geo_hash", 1)),
+		"CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+		"INSERT INTO t VALUES (1, 3), (2, 7)",
+		"CREATE INDEX ix ON t (geo_hash(a))")
+	// Reopen (v31 deserialize) with the SAME component + version: the dependency matches, so reads use
+	// the index and writes maintain it.
+	db := openGeoFile(t, path, regWith(t, geoHash("com.example/geo_hash", 1)))
+	defer db.Close()
+	if got := geoIDs(t, db, "SELECT id FROM t WHERE geo_hash(a) = 30"); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("matching reopen read = %v, want [1]", got)
+	}
+	if _, err := queryOutcome(db, "INSERT INTO t VALUES (3, 3)", nil); err != nil {
+		t.Fatalf("a write maintaining a matching host-dep index should succeed: %v", err)
+	}
+	if got := geoIDs(t, db, "SELECT id FROM t WHERE geo_hash(a) = 30 ORDER BY id"); len(got) != 2 || got[0] != 1 || got[1] != 3 {
+		t.Fatalf("after insert = %v, want [1 3]", got)
+	}
+}
+
+func TestHostFuncIndexReopenVersionBumpUnusable(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "hostfunc_index_bump.jed")
+	createGeoFile(t, path, regWith(t, geoHash("com.example/geo_hash", 1)),
+		"CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+		"INSERT INTO t VALUES (1, 3), (2, 7)",
+		"CREATE INDEX ix ON t (geo_hash(a))")
+	// Reopen with a BUMPED semantic_version → the index's stored keys are stale.
+	db := openGeoFile(t, path, regWith(t, geoHash("com.example/geo_hash", 2)))
+	defer db.Close()
+	// Reads still correct: a plain read (no index) and one that COULD use the index (skipped → heap
+	// scan) both return the right rows — never a silent stale-key read.
+	if got := geoIDs(t, db, "SELECT id FROM t ORDER BY id"); len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("plain read = %v, want [1 2]", got)
+	}
+	if got := geoIDs(t, db, "SELECT id FROM t WHERE geo_hash(a) = 30"); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("index-skipped read = %v, want [1]", got)
+	}
+	// A write that would maintain the stale index is refused (XX002) — the table is read-only.
+	if _, err := queryOutcome(db, "INSERT INTO t VALUES (3, 3)", nil); errCodeOf(err) != "XX002" {
+		t.Fatalf("write over a version-bumped host-dep index = %v, want XX002", err)
+	}
+}
+
+func TestHostFuncIndexReopenDifferentComponentUnusable(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "hostfunc_index_component.jed")
+	createGeoFile(t, path, regWith(t, geoHash("com.example/geo_hash", 1)),
+		"CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+		"INSERT INTO t VALUES (1, 3)",
+		"CREATE INDEX ix ON t (geo_hash(a))")
+	// Reopen with a DIFFERENT component id for the same name/signature → a different implementation.
+	db := openGeoFile(t, path, regWith(t, geoHash("org.other/geo_hash", 1)))
+	defer db.Close()
+	if got := geoIDs(t, db, "SELECT id FROM t WHERE geo_hash(a) = 30"); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("different-component read = %v, want [1]", got)
+	}
+	if _, err := queryOutcome(db, "INSERT INTO t VALUES (2, 3)", nil); errCodeOf(err) != "XX002" {
+		t.Fatalf("write over a different-component host-dep index = %v, want XX002", err)
+	}
+}
+
+func TestHostFuncIndexReopenMissingFunction(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "hostfunc_index_missing.jed")
+	createGeoFile(t, path, regWith(t, geoHash("com.example/geo_hash", 1)),
+		"CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+		"INSERT INTO t VALUES (1, 3), (2, 7)",
+		"CREATE INDEX ix ON t (geo_hash(a))")
+	// Reopen with NO extensions: the index expression can no longer resolve.
+	db := openGeoFile(t, path, NewExtensionRegistry())
+	defer db.Close()
+	// A read that does not reference the missing function still works (the index is simply unused).
+	if got := geoIDs(t, db, "SELECT id FROM t ORDER BY id"); len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("plain read with missing function = %v, want [1 2]", got)
+	}
+	// A write that would maintain the index needs the missing function → 42883 (resolution fails).
+	if _, err := queryOutcome(db, "INSERT INTO t VALUES (3, 3)", nil); errCodeOf(err) != "42883" {
+		t.Fatalf("write needing the missing function = %v, want 42883", err)
+	}
 }

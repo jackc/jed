@@ -15,7 +15,19 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 30)
+## Version scope (`format_version` 31)
+
+`format_version` **31** — **host-function index dependencies**
+([../design/extensibility.md §8.1](../design/extensibility.md)). An index whose key or partial
+predicate expression calls a host scalar function persists the **resolved dependency** so a reopening
+binary can detect that the registry now supplies a *different* implementation. The per-index
+`index_flags` byte gains **bit2 `has_host_deps`**; when set, immediately after the v27 predicate
+(and after `index_root_page`) comes a `u16 dep_count` followed, per distinct host-function signature
+in ascending `(name, arg-type codes)` order, by: `name` (`u16` length + UTF-8) ‖ `u16 arg_count` ‖
+`arg_count` argument type codes (`u8` each) ‖ result type code (`u8`) ‖ `component_id` (`u16` length +
+UTF-8) ‖ `semantic_version` (`u32`). B-tree only (bit2 with a GIN/GiST kind is `XX001`). An index with
+no host-function key is byte-identical to v30, so a file with no such index moves to v31 by its
+version bytes + meta CRC under the exact-version clean break.
 
 `format_version` **30** — **foreign-key referential actions**
 ([../design/constraints.md §6](../design/constraints.md)). The existing `fk_actions` byte now
@@ -484,7 +496,7 @@ and slot selection):
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`30`** |
+| 4  | 2 | `format_version` (u16) — current = **`31`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -517,7 +529,7 @@ present (copy-on-write never overwrote them). `create` seeds **both** slots with
 `txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit
 then overwrites slot 0).
 
-**Opening (slot selection).** Validate each slot independently (magic, `format_version == 29`,
+**Opening (slot selection).** Validate each slot independently (magic, `format_version == 31`,
 offsets 6–7 reserved == 0, `free_list_head` == 0 or in `[2, page_count)`, `crc32`). Choose the
 **valid** slot with the **highest `txid`**; on a tie, slot 0. Exactly one valid → use it (torn-write
 fallback). Neither valid → `data_corrupted`. The chosen meta's `free_list_head` is followed to load

@@ -50,7 +50,19 @@ type HostFunction struct {
 	volatility   Volatility
 	crossCore    bool
 	cost         int64
-	kernel       HostKernel
+	// componentID is the host's stable COMPONENT IDENTITY (extensibility.md §7, step 4) — a string
+	// naming this function's IMPLEMENTATION independently of its SQL name (e.g. "com.example/geo_hash").
+	// nil (the default) is fine for an ad-hoc-query-only function; it is REQUIRED to use the function in
+	// a PERSISTED index expression (§8.1), where it + semanticVersion form the resolved dependency the
+	// file records and re-checks on reopen (a mismatch makes the dependent index unusable, never a
+	// silent stale-key read).
+	componentID *string
+	// semanticVersion is the host's SEMANTIC VERSION (extensibility.md §7) — bump it whenever a change
+	// to the function's results would invalidate values/keys derived from it. A dependent index persists
+	// the version it was built against; a mismatch on reopen forces a rebuild, never a silent stale-key
+	// read. Default 0.
+	semanticVersion uint32
+	kernel          HostKernel
 }
 
 // NewHostFunction builds a host scalar function with safe defaults — Volatile, not
@@ -78,6 +90,16 @@ func (f *HostFunction) WithCrossCore(b bool) *HostFunction { f.crossCore = b; re
 // non-negative.
 func (f *HostFunction) WithCost(c int64) *HostFunction { f.cost = c; return f }
 
+// WithComponentID declares the COMPONENT IDENTITY (extensibility.md §7, step 4) — a stable string that
+// names this function's implementation independently of its SQL name. Required to use the function in a
+// persisted index expression (§8.1). Default unset (nil).
+func (f *HostFunction) WithComponentID(id string) *HostFunction { f.componentID = &id; return f }
+
+// WithSemanticVersion declares the SEMANTIC VERSION (extensibility.md §7) — bump it when a change to
+// the results would invalidate keys/values derived from the function. A dependent index records this
+// and a mismatch on reopen forces a rebuild, never a silent stale-key read. Default 0.
+func (f *HostFunction) WithSemanticVersion(v uint32) *HostFunction { f.semanticVersion = v; return f }
+
 // hostFuncEntry is a registered host function with its types RESOLVED (the internal form the
 // resolver + evaluator use).
 type hostFuncEntry struct {
@@ -87,7 +109,12 @@ type hostFuncEntry struct {
 	volatility Volatility
 	crossCore  bool
 	cost       int64
-	kernel     HostKernel
+	// componentID / semanticVersion carry the step-4 identity (extensibility.md §7/§8.1): the stable
+	// implementation id + version an index-backing function pins into the file's dependency list. nil
+	// componentID ⇒ the function may NOT back a persisted index expression (42P17 at CREATE INDEX).
+	componentID     *string
+	semanticVersion uint32
+	kernel          HostKernel
 }
 
 // ExtensionRegistry is the immutable set of host extensions supplied at open/create and FROZEN for
@@ -127,13 +154,15 @@ func (r *ExtensionRegistry) RegisterFunction(f *HostFunction) error {
 		}
 	}
 	r.functions = append(r.functions, hostFuncEntry{
-		name:       f.name,
-		argTypes:   argTypes,
-		result:     result,
-		volatility: f.volatility,
-		crossCore:  f.crossCore,
-		cost:       f.cost,
-		kernel:     f.kernel,
+		name:            f.name,
+		argTypes:        argTypes,
+		result:          result,
+		volatility:      f.volatility,
+		crossCore:       f.crossCore,
+		cost:            f.cost,
+		componentID:     f.componentID,
+		semanticVersion: f.semanticVersion,
+		kernel:          f.kernel,
 	})
 	return nil
 }

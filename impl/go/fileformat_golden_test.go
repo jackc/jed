@@ -165,6 +165,23 @@ func partialIndexTableDB(t *testing.T) *Session {
 	return db
 }
 
+// hostfuncIndexTableDB has a HOST-FUNCTION index dependency (v31 — the index_flags bit2 + the
+// persisted dependency list after index_root_page, extensibility.md §8.1): the index t_geo_idx is on
+// geo_hash(a), a host scalar function (i64 -> i64), component "com.example/geo_hash" at semantic
+// version 1. The table is EMPTY (the tree empty, root 0), so the fixture isolates the v31 catalog
+// change. Must match verify.rb's HOSTFUNC_INDEX_TABLE.
+func hostfuncIndexTableDB(t *testing.T) *Session {
+	reg := regWith(t, geoHash("com.example/geo_hash", 1))
+	db, err := CreateDatabase(CreateOptions{PageSize: goldenPageSize, Extensions: reg})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	s := db.Session(SessionOptions{})
+	run(t, s, "CREATE TABLE t (id i64 PRIMARY KEY, a i64)")
+	run(t, s, "CREATE INDEX t_geo_idx ON t (geo_hash(a))")
+	return s
+}
+
 // uniqueTableDB has UNIQUE indexes (v6 — the per-index flags byte, indexes.md §8):
 // t_v_key (a UNIQUE constraint's auto-name) over a nullable column holding two NULLs
 // (NULLS DISTINCT — both stored), the named two-column constraint wv, a CREATE UNIQUE
@@ -970,6 +987,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"unique_table.jed", uniqueTableDB},
 		{"expr_index_table.jed", exprIndexTableDB},
 		{"partial_index_table.jed", partialIndexTableDB},
+		{"hostfunc_index_table.jed", hostfuncIndexTableDB},
 		{"gin_array_table.jed", ginArrayTableDB},
 		{"gin_uuid_table.jed", ginUuidTableDB},
 		{"fk_table.jed", fkTableDB},

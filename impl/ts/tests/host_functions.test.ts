@@ -4,8 +4,17 @@
 // unit-test category). Mirrors impl/rust/tests/host_functions.rs one-for-one.
 
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import { createDatabase, EngineError, ExtensionRegistry } from "../src/lib.ts";
+import {
+  createDatabase,
+  type Database,
+  EngineError,
+  ExtensionRegistry,
+  openDatabase,
+} from "../src/lib.ts";
 import type { HostFunctionSpec } from "../src/lib.ts";
 import { intValue, textValue, type Value } from "../src/value.ts";
 import type { Session } from "../src/shared.ts";
@@ -262,4 +271,172 @@ test("no extensions is unaffected", () => {
     errCodeOf(() => queryOutcome(s2, "SELECT host_add(1, 2)")),
     "42883",
   );
+});
+
+// ---------------------------------------------------------------------------------------------
+// Delivery step 4 (extensibility.md §8.1 / §14): host scalar functions in PERSISTED INDEXES.
+// An `immutable` host function carrying a componentId + semanticVersion may back an expression /
+// partial index; the file records the resolved dependency (format_version 31) and re-checks it on
+// reopen. A missing / different-component / bumped-version function makes the index unusable —
+// skipped for reads (correct heap scan), refused for writes (read-only) — never a silent stale-key
+// read. These cover what the corpus cannot express (host-API registration + on-disk reopen with a
+// *different* registry); they mirror impl/rust/tests/host_functions.rs one-for-one.
+// ---------------------------------------------------------------------------------------------
+
+// geo_hash(i64) -> i64 — the canonical index-backing host function. component/version pin its
+// identity; "immutable" + a componentId are the two admission requirements (§8.1).
+function geoHash(component: string, version: number): HostFunctionSpec {
+  return {
+    name: "geo_hash",
+    argTypes: ["i64"],
+    result: "i64",
+    kernel: (args) => intValue(asInt(args[0]!) * 10n),
+    volatility: "immutable",
+    crossCore: true,
+    componentId: component,
+    semanticVersion: version,
+  };
+}
+
+function tmpFile(name: string): string {
+  return join(mkdtempSync(join(tmpdir(), "jed-hostfunc-")), name);
+}
+
+function createFile(path: string, reg: ExtensionRegistry, stmts: string[]): void {
+  const db = createDatabase({ path, skipFsync: true, extensions: reg });
+  for (const s of stmts) db.execute(s);
+  db.close();
+}
+
+function openFile(path: string, reg: ExtensionRegistry): Database {
+  return openDatabase(path, { skipFsync: true, extensions: reg });
+}
+
+function idsFile(db: Database, sql: string): bigint[] {
+  const o = queryOutcome(db, sql);
+  if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
+  return o.rows.map((r) => asInt(r[0]!));
+}
+
+test("volatile host function in an index is rejected", () => {
+  // The latent-bug fix: a volatile host function used to leak silently into an index expression (the
+  // immutability gate was purely syntactic and did not see host functions). Now 42P17.
+  const volatileGeo: HostFunctionSpec = {
+    name: "geo_hash",
+    argTypes: ["i64"],
+    result: "i64",
+    kernel: (args) => intValue(asInt(args[0]!) * 10n),
+    componentId: "com.example/geo_hash", // volatile by default
+  };
+  const s = dbExt(regWith(volatileGeo), ["CREATE TABLE t (a i64)"]);
+  assert.equal(
+    errCodeOf(() => queryOutcome(s, "CREATE INDEX ix ON t (geo_hash(a))")),
+    "42P17",
+  );
+});
+
+test("unversioned host function in an index is rejected", () => {
+  // Immutable but no component identity → cannot persist a sound dependency (42P17).
+  const unversioned: HostFunctionSpec = {
+    name: "geo_hash",
+    argTypes: ["i64"],
+    result: "i64",
+    kernel: (args) => intValue(asInt(args[0]!) * 10n),
+    volatility: "immutable",
+  };
+  const s = dbExt(regWith(unversioned), ["CREATE TABLE t (a i64)"]);
+  assert.equal(
+    errCodeOf(() => queryOutcome(s, "CREATE INDEX ix ON t (geo_hash(a))")),
+    "42P17",
+  );
+});
+
+test("immutable versioned host function in an index is ok", () => {
+  const s = dbExt(regWith(geoHash("com.example/geo_hash", 1)), [
+    "CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+    "INSERT INTO t VALUES (1, 3), (2, 7)",
+    "CREATE INDEX ix ON t (geo_hash(a))",
+  ]);
+  // geo_hash(3) = 30 → row id 1.
+  assert.deepEqual(
+    rowsOf(s, "SELECT id FROM t WHERE geo_hash(a) = 30").map((r) => asInt(r[0]!)),
+    [1n],
+  );
+});
+
+test("host-dep index reopen with a matching registry is usable", () => {
+  const path = tmpFile("hostfunc_index_match.jed");
+  createFile(path, regWith(geoHash("com.example/geo_hash", 1)), [
+    "CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+    "INSERT INTO t VALUES (1, 3), (2, 7)",
+    "CREATE INDEX ix ON t (geo_hash(a))",
+  ]);
+  // Reopen (v31 deserialize) with the SAME component + version: the dependency matches, so reads use
+  // the index and writes maintain it.
+  const db = openFile(path, regWith(geoHash("com.example/geo_hash", 1)));
+  assert.deepEqual(idsFile(db, "SELECT id FROM t WHERE geo_hash(a) = 30"), [1n]);
+  queryOutcome(db, "INSERT INTO t VALUES (3, 3)");
+  assert.deepEqual(idsFile(db, "SELECT id FROM t WHERE geo_hash(a) = 30 ORDER BY id"), [1n, 3n]);
+  db.close();
+  rmSync(path, { force: true });
+});
+
+test("host-dep index reopen with a bumped version is unusable", () => {
+  const path = tmpFile("hostfunc_index_bump.jed");
+  createFile(path, regWith(geoHash("com.example/geo_hash", 1)), [
+    "CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+    "INSERT INTO t VALUES (1, 3), (2, 7)",
+    "CREATE INDEX ix ON t (geo_hash(a))",
+  ]);
+  // Reopen with a BUMPED semanticVersion → the index's stored keys are stale.
+  const db = openFile(path, regWith(geoHash("com.example/geo_hash", 2)));
+  // Reads still correct: a plain read (no index) and one that COULD use the index (skipped → heap
+  // scan) both return the right rows — never a silent stale-key read.
+  assert.deepEqual(idsFile(db, "SELECT id FROM t ORDER BY id"), [1n, 2n]);
+  assert.deepEqual(idsFile(db, "SELECT id FROM t WHERE geo_hash(a) = 30"), [1n]);
+  // A write that would maintain the stale index is refused (XX002) — the table is read-only.
+  assert.equal(
+    errCodeOf(() => queryOutcome(db, "INSERT INTO t VALUES (3, 3)")),
+    "XX002",
+  );
+  db.close();
+  rmSync(path, { force: true });
+});
+
+test("host-dep index reopen with a different component is unusable", () => {
+  const path = tmpFile("hostfunc_index_component.jed");
+  createFile(path, regWith(geoHash("com.example/geo_hash", 1)), [
+    "CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+    "INSERT INTO t VALUES (1, 3)",
+    "CREATE INDEX ix ON t (geo_hash(a))",
+  ]);
+  // Reopen with a DIFFERENT component id for the same name/signature → a different implementation.
+  const db = openFile(path, regWith(geoHash("org.other/geo_hash", 1)));
+  assert.deepEqual(idsFile(db, "SELECT id FROM t WHERE geo_hash(a) = 30"), [1n]);
+  assert.equal(
+    errCodeOf(() => queryOutcome(db, "INSERT INTO t VALUES (2, 3)")),
+    "XX002",
+  );
+  db.close();
+  rmSync(path, { force: true });
+});
+
+test("host-dep index reopen with the function missing", () => {
+  const path = tmpFile("hostfunc_index_missing.jed");
+  createFile(path, regWith(geoHash("com.example/geo_hash", 1)), [
+    "CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+    "INSERT INTO t VALUES (1, 3), (2, 7)",
+    "CREATE INDEX ix ON t (geo_hash(a))",
+  ]);
+  // Reopen with NO extensions: the index expression can no longer resolve.
+  const db = openFile(path, new ExtensionRegistry());
+  // A read that does not reference the missing function still works (the index is simply unused).
+  assert.deepEqual(idsFile(db, "SELECT id FROM t ORDER BY id"), [1n, 2n]);
+  // A write that would maintain the index needs the missing function → 42883 (resolution fails).
+  assert.equal(
+    errCodeOf(() => queryOutcome(db, "INSERT INTO t VALUES (3, 3)")),
+    "42883",
+  );
+  db.close();
+  rmSync(path, { force: true });
 });

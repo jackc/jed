@@ -15,19 +15,23 @@
 > must stay). §2 is that argument; everything else follows from it.
 >
 > **Status: a framework + proposal — with the §5 dispatch foundation built, composite types (and
-> composite-as-key, §14 step 2) landed, and the host-function injection seam (§14 step 3) shipped.**
-> Three pieces are real: (a) resolution
+> composite-as-key, §14 step 2) landed, the host-function injection seam (§14 step 3) shipped, and
+> host functions in persisted indexes (§14 step 4) landed.** Four pieces are real: (a) resolution
 > for the **built-in** named scalar functions and aggregates is data-driven over the generated catalog
 > tables (§5, all three cores, behaviour-preserving); (b) **composite (row) types have shipped** as a
 > landed feature ([composite.md](composite.md), `format_version` 9 — the *open type* pivot §3 rests
 > on); (c) **host scalar functions over existing types have shipped** (§4.2 / §14 step 3, all three
 > cores): a host registers scalar functions into a frozen `ExtensionRegistry` at open/create and they
 > resolve + evaluate through a registry dispatch arm beside the built-in one — the function *seam* of
-> §5.1, ephemeral (no persisted use). **Everything else here remains a proposal**: the `TypeExpr`
+> §5.1; (d) **host functions may back a persisted expression / partial index** (§7 Model B, §8.1,
+> §14 step 4, `format_version` 31, all three cores): the registry entry carries a `component_id` +
+> `semantic_version`, the index catalog persists the resolved dependency, and reopen re-checks it
+> (read → skip / heap scan; write → refused). Registration is **registry-only, no SQL DDL** (Model B,
+> §7). **Everything else here remains a proposal**: the full `TypeExpr`
 > model (§3), host scalar types (§4.3),
-> the persisted host-type catalog (§6), the extension registration surface (§7), the host-code index
-> connection (§8), host-code cost metering (§9), the host determinism ledger (§10), the graded
-> missing-on-reopen verdict (§11), and the host-extension conformance harness (§12). The doc defines
+> the persisted host-type catalog (§6), host-code cost metering (§9), the host determinism ledger
+> (§10), the *general* graded missing-on-reopen verdict (§11, its index-only form landed with step 4),
+> and the host-extension conformance harness (§12). The doc defines
 > the target shape, ties it to the existing determinism/cost/conformance contracts, and records the
 > open forks (§13) for the maintainer. It is the Phase 9 design referenced by [TODO.md](../../TODO.md).
 > When a section is ratified, make the downstream edits in §15 in the same change.
@@ -461,43 +465,54 @@ is the next free**). Built-in types stay compiled-in and keep their codes. The a
 
 ---
 
-## 7. Registration vs. schema — code at open, catalog in SQL
+## 7. Registration — code at open, dependencies persisted on use (Model B, ✅ landed for functions)
 
-Separate the **executable registry** (host-provided code) from the **database schema** (persisted
-catalog objects). This is the discipline that keeps SQL migrations reproducible and keeps a database
-from silently mutating when a host merely links a newer library.
+> **Decided 2026-07-18: Model B (registry-only), not SQL DDL.** The host declares its extensions
+> **entirely through the host-language `ExtensionRegistry`**; there is **no** `CREATE FUNCTION …
+> LANGUAGE HOST` / `CREATE TYPE … AS HOST` SQL. The realization that settled it: host *code* can
+> never live in SQL anyway (it is host-language code passed through the registry), so a `CREATE
+> FUNCTION` statement could only *name a binding* to an already-registered component — largely
+> redundant with the registry entry. Keeping registration out of SQL also keeps it off the
+> untrusted-query surface entirely (the §9 / CLAUDE.md §9 "host configuration is a host-API act, never
+> SQL" spine), and it *extends* the landed step-3 ephemeral registry rather than reshaping it. The
+> only thing a `CREATE FUNCTION` would have bought over Model B is migration-history legibility of the
+> binding — and A's `VERSION` is only as honest as the host regardless, so A buys **no extra reopen
+> soundness**. `CREATE FUNCTION`/`CREATE TYPE … AS HOST` can be layered on later if migration
+> legibility ever demands it; it is not needed for the soundness goal.
 
-1. **The host supplies an immutable `ExtensionRegistry` in the open/create options** — the codecs,
-   comparators, key-encoders, function kernels, and opclass routines its types/functions name. This
-   registry is **frozen for the database handle's lifetime**: late mutation would invalidate prepared
-   plans, overload resolution, and index assumptions mid-session, so it is fixed at open.
-2. **SQL DDL transactionally binds catalog objects to registered components** — and *only* SQL
-   changes the schema. Registering code alone must **never** silently create a type or function:
+The two moving parts, and how they stay separate:
 
-   ```sql
-   CREATE TYPE geo_point AS HOST 'com.example.geo/point' VERSION 'storage-1';
-   CREATE FUNCTION geo_distance(geo_point, geo_point) RETURNS f64
-     LANGUAGE HOST 'com.example.geo/distance' IMMUTABLE;
-   ```
+1. **The host supplies an immutable `ExtensionRegistry` in the open/create options** — the function
+   kernels (and, later, codecs / comparators / key-encoders / opclass routines) its extensions name,
+   each carrying its **component identity** (below). The registry is **frozen for the database
+   handle's lifetime**: late mutation would invalidate prepared plans, overload resolution, and index
+   assumptions mid-session, so it is fixed at open. The registry *is* the declaration — registering a
+   function makes it resolvable in ad-hoc queries (the step-3 behavior).
 
-   So a migration file — not a linked library version — is the record of what the database contains
-   (the [jed-migrate](../../migrate/design.md) reproducibility contract).
+2. **A persisted schema object records the *resolved dependency* when a host function is baked into
+   it** — and only such a use persists anything. When `CREATE INDEX … (host_fn(col))` (or a partial
+   predicate) admits a host function, the index catalog entry stores the function's resolved
+   dependency (component identity + signature + version — §8.1); on reopen the engine re-checks it
+   against the current registry. Merely linking a newer library never silently mutates the schema
+   (nothing is persisted by registration alone); a *behavioral* change the host forgot to version is
+   the host's own concern, exactly as it would be under a SQL-DDL model.
 
-**Component identity is a five-field tuple, not one "version."** A single "codec version" (the
-previous draft) cannot express that a *storage-format* change requires value migration while a
-*comparator/semantic* change leaves values readable but invalidates indexes. Record, per component:
+**Component identity — the lean two-field form landed for functions.** The full future shape is a
+five-field tuple (`provider/package id · component id · host-ABI version · storage-format version ·
+semantic version`) — the finer split matters for host *types* (§4.3), where a *storage-format* bump
+requires value migration while a *semantic* bump leaves values readable but invalidates indexes. A
+host *function* computes rather than stores, so storage-format is meaningless for it; the two fields
+that bear on sound reopen are what a `HostFunction` carries and what an index dependency persists:
 
-```
-provider/package id · component id · host-ABI version · storage-format version · semantic version
-```
+- **`component_id`** — a stable string (e.g. `"com.example.geo/geo_hash"`) identifying the
+  *implementation* independently of the SQL name. Two registrations of the same name+signature but
+  different `component_id` are different implementations.
+- **`semantic_version`** (`u32`) — bump it when a change to the results would invalidate keys/values
+  derived from the function. A dependent index persists the version it was built against; a mismatch
+  on reopen forces the index unusable (rebuild required), never a silent stale-key read.
 
-- a **storage-format** bump ⇒ stored bytes must be migrated (re-encode);
-- a **semantic** bump (a changed `compare`, a bug-fixed function) ⇒ values stay readable but any
-  **stored key / index / stored expression** built from the old semantics is stale and must be
-  rebuilt (the [compatibility.md](compatibility.md) function-drift problem, §11).
-
-This tuple is what the persisted catalog (§6) stores and what the graded reopen verdict (§11) and the
-index dependency list (§8.1) compare against.
+Both are what the index dependency list (§8.1) stores and what the reopen check (§11) compares
+against. Host *types* (§4.3, later) extend this to the full tuple in the persisted type catalog (§6).
 
 ---
 
@@ -506,7 +521,20 @@ index dependency list (§8.1) compare against.
 Host functions and host types touch indexing in two very different ways. Keep them separate: the
 first is cheap and high-value; the second is the frontier.
 
-### 8.1 Expression & partial indexes over host functions — persist *resolved dependencies*
+### 8.1 Expression & partial indexes over host functions — persist *resolved dependencies* (✅ landed)
+
+> **✅ Landed (all three cores, `format_version` 31, delivery step 4).** An immutable host function
+> carrying a `component_id` + `semantic_version` (§7) may back an expression / partial index; the
+> per-index catalog entry gains a persisted **host-function dependency list** (`index_flags` bit2
+> `has_host_deps` + a `(name, arg types, result, component_id, semantic_version)` tuple per distinct
+> signature — [format.md](../fileformat/format.md)). On every per-statement re-resolution the engine
+> re-checks each dependency against the current registry: a **read** whose candidate index no longer
+> matches silently skips it (a correct heap scan); a **write** that would maintain it is refused
+> (`XX002` on a component/version mismatch, `42883` on a missing function) — the table is read-only
+> for that index until a rebuild, never a silent stale-key read. This also **closed a latent bug**: a
+> host function (even a `volatile` one) previously leaked into an index expression, because the
+> immutability gate was a purely syntactic walk that never saw host functions; now a non-immutable or
+> unversioned host function in an index is `42P17`.
 
 jed already lets an index key or a partial-index predicate be an **immutable** expression
 ([indexes.md §1](indexes.md)), and pushes down `WHERE f(col) = $1` by **syntactic structural match**
@@ -748,10 +776,18 @@ cleanup, not a prerequisite. A suggested sequence:
    functions over container args, and runtime *enforcement* of the `volatility`/`cross_core`
    declarations (recorded but not yet acted on — no host function is constant-folded, and there is no
    runtime taint mechanism yet, matching how `float` is handled at the spec layer, §2).
-4. **Catalog-bound, versioned functions + resolved-dependency persistence** for expression/partial
-   indexes (§7/§8.1) — the soundness fix that lets a host function appear in a persisted index.
+4. **Versioned functions + resolved-dependency persistence** for expression/partial indexes
+   (§7/§8.1) ✅ **landed (all three cores, `format_version` 31)** — the soundness fix that lets an
+   immutable host function back a persisted index. **Model B** (§7): the registry gains
+   `component_id` + `semantic_version` (no SQL DDL); the index catalog persists a per-index
+   host-function dependency list; the per-statement re-resolution re-checks it (read → skip index /
+   heap scan; write → `XX002`/`42883`, read-only). Also closed the latent volatile-host-function leak
+   (`42P17`). Reused `XX002` for the reopen verdict (the minimal per-object §11 verdict for indexes;
+   the full compatibility.md manifest stays step 5). **Deferred:** host functions in `DEFAULT` / `CHECK`
+   / generated columns (lower-risk — they produce no stored keys).
 5. **Opaque host scalar *types*** (Storable/Equatable/Ordered) + **derived `array<host-type>`** (§3.1,
-   §4.3, `type_code 21`, `format_version` 30) + the **graded reopen verdict** (§11).
+   §4.3, `type_code 21`, `format_version` 32 — 31 was taken by step 4) + the **graded reopen verdict**
+   (§11, extended from the step-4 index-only form to all object kinds).
 6. **Keyable** host scalar types (order-preserving encoder + the invariant harness, §3.2/§12).
 7. **Host GIN/GiST opclasses** (§8.2) behind the unified seam.
 8. **Non-default opclass SQL syntax** + richer migration/rebuild tooling.
@@ -768,12 +804,13 @@ When a section here is ratified, update **in the same change** (mirrors [determi
 - **[TODO.md](../../TODO.md)** — the Phase 9 items point here; add the §14 slices (composite-as-key,
   the host-function injection seam, resolved-dependency index persistence, host scalar types tiered
   per §4.3, host opclasses).
-- **[api.md](api.md)** — the `ExtensionRegistry` open/create option (§7), the DDL surface
-  (`CREATE TYPE … AS HOST`, `CREATE FUNCTION … LANGUAGE HOST`), the volatility/cross-core/cost
-  declarations, and the new error codes.
-- **[../fileformat/format.md](../fileformat/format.md)** — `type_code = 21`, the persisted host-type
-  catalog, the host-scalar opaque-framed body, the index resolved-dependency list; bump
-  `format_version` to **30**.
+- **[api.md](api.md)** — the `ExtensionRegistry` open/create option (§7), the **`component_id` /
+  `semantic_version`** builder fields + the index-backing behavior (§14 step 4, ✅ done); the host-type
+  DDL surface is **not applicable** under Model B (§7 — registration is registry-only, no
+  `CREATE FUNCTION … LANGUAGE HOST` / `CREATE TYPE … AS HOST`).
+- **[../fileformat/format.md](../fileformat/format.md)** — the per-index **host-function dependency
+  list** (`index_flags` bit2 + the dep tuple) at **`format_version 31`** (✅ done, §14 step 4); the
+  `type_code = 21` host-type catalog + opaque-framed body come later at `format_version 32` (§14 step 5).
 - **[../functions/catalog.toml](../functions/catalog.toml)** — confirm the runtime function registry
   reuses the entry shape; the `cost` field is already live.
 - **[../errors/registry.toml](../errors/registry.toml)** — `42723` duplicate_function (identical
@@ -800,15 +837,15 @@ When a section here is ratified, update **in the same change** (mirrors [determi
 | §2 | Determinism-ownership is the line that moves | **proposed** (the governing principle) |
 | §3 | The `TypeExpr` model + the capability ladder + the closed container axis | **proposed** (composite arm is **landed**) |
 | §4.1 | Composite types (derived codec, G2 free, self-describing) | **landed as a type**; composite-**as-key** **landed** (§14 step 2, `composite-field-slots` [encoding.md §2.15](encoding.md); array-of-composite element the lone remaining `0A000`) |
-| §4.2 | Host scalar functions (registry, signature overloads, vectorized, cost, volatility) | **landed** (all 3 cores): ephemeral registry + resolve + eval seam, exact-signature overloading, cost charged/gated, strict, wrong-type-caught, 42723. Vectorized ABI, non-strict, container args, volatility/cross-core *enforcement* deferred (§14 step 3) |
+| §4.2 | Host scalar functions (registry, signature overloads, vectorized, cost, volatility) | **landed** (all 3 cores): registry + resolve + eval seam, exact-signature overloading, cost charged/gated, strict, wrong-type-caught, 42723 (§14 step 3); **plus** `component_id`/`semantic_version` + index-backing (§14 step 4). Vectorized ABI, non-strict, container args, cross-core *taint enforcement* still deferred |
 | §4.3 | Host scalar types (Storable→Indexed ladder, `type_code 21`, opaque) | **proposed** |
 | §5 | Dispatch — registry the many, inline the few (§5.1 splits the **seam** from the **dogfood**; function seam first) | **built** for built-in scalar functions + aggregates *and* the **host function injection seam** (§14 step 3, all 3 cores): a host kernel is reached by id through the frozen registry alongside the inlined built-in arms. Type-vtable depth (Fork A) + the type-method seam (step 5) **proposed** |
-| §6 | Persisted host-type catalog + on-disk representation (`type_code 21`, `format_version 30`) | **proposed** |
-| §7 | Registration (ephemeral registry) vs. schema (DDL) + 5-field component identity | **proposed** |
-| §8 | The index connection — expression indexes (resolved-dependency persistence) + opclass registry | **proposed** (§8.1 is the recommended first index connection) |
+| §6 | Persisted host-type catalog + on-disk representation (`type_code 21`, `format_version 32`) | **proposed** (the per-index host-dep list of step 4 landed at `format_version 31`) |
+| §7 | Registration — **Model B (registry-only, no SQL DDL)**; lean `component_id` + `semantic_version` | **landed for functions** (§14 step 4, all 3 cores); the full 5-field tuple + host-type catalog **proposed** |
+| §8 | The index connection — expression indexes (resolved-dependency persistence) + opclass registry | **§8.1 landed** (all 3 cores, `format_version 31`, §14 step 4); §8.2 opclass registry **proposed** |
 | §9 | Cost — cooperative accounting + admission, **not** a sandbox | **proposed** (adopts [cost.md](cost.md) §6) |
 | §10 | Determinism ledger + containment for host code | **proposed** (extends [determinism.md](determinism.md)) |
-| §11 | Graded per-object missing-on-reopen verdict | **proposed** (registers into [compatibility.md](compatibility.md); collation instance **landed**) |
+| §11 | Graded per-object missing-on-reopen verdict | **index-only form landed** (§14 step 4: a host-dep index is skipped for reads / refused for writes on a mismatch, `XX002`/`42883`); the *general* per-object manifest **proposed** (collation instance also **landed**) |
 | §12 | Conformance — host-authored corpus + byte fixtures + the compare/key invariant | **proposed** |
 | §13 | Open forks (type-vtable depth; cross-core stance; host container kinds; host opclasses) | **unresolved** — maintainer's call (F1/F5 recommendations given) |
-| §14 | Delivery order | **proposed** |
+| §14 | Delivery order | **proposed** (steps 1–4 **landed**; step 5 next) |

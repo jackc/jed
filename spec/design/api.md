@@ -1009,12 +1009,12 @@ native mapping (follow-up (a) above) and the same ergonomic surface on the share
 A host may register its own **scalar functions over the built-in types** and expose them to SQL
 (spec/design/extensibility.md §4.2 / §14 step 3). The host builds an **`ExtensionRegistry`**, adds
 functions to it, and passes it in the create/open options; the engine **freezes it for the handle's
-lifetime** and shares it into every session (§7, the reproducibility discipline — code registration
-never mutates schema). This is the *function seam* of extensibility.md §5.1, and it is deliberately
-narrow this slice: **ephemeral** (no persisted use, no `CREATE FUNCTION … LANGUAGE HOST` DDL yet),
-**strict** (a NULL argument short-circuits to NULL before the kernel runs), **exact scalar
-signatures** (no implicit promotion), and **single-row** kernels ("batch-of-one"; the vectorized ABI
-is a follow-on).
+lifetime** and shares it into every session (§7 — registration is a **host-API act, never SQL**:
+there is no `CREATE FUNCTION … LANGUAGE HOST` DDL, which keeps it off the untrusted-query surface).
+This is the *function seam* of extensibility.md §5.1: **strict** (a NULL argument short-circuits to
+NULL before the kernel runs), **exact scalar signatures** (no implicit promotion), and **single-row**
+kernels ("batch-of-one"; the vectorized ABI is a follow-on). Since step 4 an `immutable` host function
+that also declares a **component identity** may back a **persisted index** (below).
 
 - **Register.** A function carries a name, an exact scalar argument signature, a scalar result type,
   a kernel, and three declarations: **`volatility`** (`immutable`/`stable`/`volatile`, recorded
@@ -1032,8 +1032,18 @@ is a follow-on).
   host declares their cost*). A kernel that returns a value not matching its declared result type is
   caught (`22000`), so a misbehaving host cannot leak a wrong-typed value into jed's strict type
   system.
-- **Not stored in the file.** The registry is a *handle* setting; a reopening host brings its own
-  (the ephemeral, no-persisted-use rule). Nothing about a host function is written to disk this slice.
+- **Index-backing (step 4, `format_version` 31).** A function may additionally declare a
+  **`component_id`** (a stable string naming the implementation, e.g. `"com.example/geo_hash"`) and a
+  **`semantic_version`** (`u32`). An `immutable` function carrying both may back an expression /
+  partial index (`CREATE INDEX ON t (geo_hash(a))`); the index persists the resolved dependency and
+  re-checks it on reopen. If the registry then supplies a *different* `component_id` / a *bumped*
+  `semantic_version` for that signature, or the function is absent, the index is **unusable** —
+  reads skip it (a correct heap scan), writes that would maintain it are refused (`XX002` on a
+  mismatch, `42883` when missing) — never a silent stale-key read. A non-`immutable` or unversioned
+  host function in an index is `42P17`.
+- **The registry itself is not stored in the file.** It is a *handle* setting; a reopening host brings
+  its own. Only the *dependency* of a persisted index on a host function is written to disk (the
+  `component_id`/`semantic_version` tuple above), so reopen can verify it.
 
 Same shape across cores (a host function registered identically on every core accrues the **same
 cost** — the defaults match):
@@ -1042,6 +1052,7 @@ cost** — the defaults match):
 |---|---|---|---|
 | build | `let mut r = ExtensionRegistry::new();` | `r := NewExtensionRegistry()` | `const r = new ExtensionRegistry()` |
 | register | `r.register_function(HostFunction::new("f", vec![ScalarType::Int64, ScalarType::Int64], ScalarType::Int64, Box::new(\|a\| Ok(...))).cost(3))?` | `r.RegisterFunction(NewHostFunction("f", []string{"i64","i64"}, "i64", func(a []Value) (Value, error) { ... }).WithCost(3))` | `r.registerFunction({ name: "f", argTypes: ["i64","i64"], result: "i64", kernel: (a) => ..., cost: 3n })` |
+| index-backing | `HostFunction::new(…).volatility(Volatility::Immutable).component_id("com.example/f").semantic_version(1)` | `NewHostFunction(…).WithVolatility(VolatilityImmutable).WithComponentID("com.example/f").WithSemanticVersion(1)` | `{ …, volatility: "immutable", componentId: "com.example/f", semanticVersion: 1 }` |
 | install | `Database::create(CreateOptions { extensions: Arc::new(r), ..Default::default() })` | `CreateDatabase(CreateOptions{Extensions: r})` | `createDatabase({ extensions: r })` |
 
 Then a query calls the function by name: `SELECT f(a, b) FROM t`. The kernel receives the evaluated

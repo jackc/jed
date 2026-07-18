@@ -43,6 +43,19 @@ export interface HostFunctionSpec {
   volatility?: Volatility;
   crossCore?: boolean;
   cost?: bigint;
+  // The COMPONENT IDENTITY (extensibility.md §7, delivery step 4) — a stable string the host chooses
+  // (e.g. "com.example.geo/geo_hash") that names this function's *implementation* independently of its
+  // SQL name. undefined (the default) is fine for an ad-hoc-query-only function; it is REQUIRED to use
+  // the function in a PERSISTED index expression (§8.1), where it + semanticVersion form the resolved
+  // dependency the file records and re-checks on reopen. Two registrations of the same SQL
+  // name+signature but a different componentId are different implementations (a mismatch on reopen
+  // makes a dependent index unusable, never a silent stale-key read).
+  componentId?: string;
+  // The SEMANTIC VERSION (extensibility.md §7) — bump it whenever a change to the function's results
+  // would invalidate values/keys derived from it (a changed formula, a bug fix). A dependent index
+  // persists the version it was built against; a mismatch on reopen forces a rebuild (the index is
+  // unusable meanwhile), never a silent stale-key read. Default 0.
+  semanticVersion?: number;
 }
 
 // A registered host function (the internal, defaults-resolved form).
@@ -53,6 +66,11 @@ interface HostFuncEntry {
   volatility: Volatility;
   crossCore: boolean;
   cost: bigint;
+  // The host's stable component identity at registration, or null for an ad-hoc-query-only function
+  // (extensibility.md §7, step 4). Required to back a persisted index (§8.1).
+  componentId: string | null;
+  // The host's semantic version at registration (extensibility.md §7). Default 0.
+  semanticVersion: number;
   kernel: HostKernel;
 }
 
@@ -96,6 +114,8 @@ export class ExtensionRegistry {
       volatility: spec.volatility ?? "volatile",
       crossCore: spec.crossCore ?? false,
       cost,
+      componentId: spec.componentId ?? null,
+      semanticVersion: spec.semanticVersion ?? 0,
       kernel: spec.kernel,
     });
   }

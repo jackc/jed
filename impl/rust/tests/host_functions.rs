@@ -453,11 +453,17 @@ fn hostfunc_index_reopen_matching_ok() {
     // Reopen (v31 deserialize) with the SAME component + version: the dependency matches, so reads
     // use the index and writes maintain it.
     let mut db = open_file(&path, registry(vec![geo_hash("com.example/geo_hash", 1)]));
-    assert_eq!(ids(&mut db, "SELECT id FROM t WHERE geo_hash(a) = 30"), vec![Value::Int(1)]);
+    assert_eq!(
+        ids(&mut db, "SELECT id FROM t WHERE geo_hash(a) = 30"),
+        vec![Value::Int(1)]
+    );
     db.query_outcome("INSERT INTO t VALUES (3, 3)", &[])
         .expect("a write maintaining a matching host-dep index succeeds");
     assert_eq!(
-        ids(&mut db, "SELECT id FROM t WHERE geo_hash(a) = 30 ORDER BY id"),
+        ids(
+            &mut db,
+            "SELECT id FROM t WHERE geo_hash(a) = 30 ORDER BY id"
+        ),
         vec![Value::Int(1), Value::Int(3)]
     );
     let _ = std::fs::remove_file(&path);
@@ -479,8 +485,14 @@ fn hostfunc_index_reopen_version_bump_unusable() {
     let mut db = open_file(&path, registry(vec![geo_hash("com.example/geo_hash", 2)]));
     // Reads still correct: a plain read (no index) and one that COULD use the index (skipped → heap
     // scan) both return the right rows — never a silent stale-key read.
-    assert_eq!(ids(&mut db, "SELECT id FROM t ORDER BY id"), vec![Value::Int(1), Value::Int(2)]);
-    assert_eq!(ids(&mut db, "SELECT id FROM t WHERE geo_hash(a) = 30"), vec![Value::Int(1)]);
+    assert_eq!(
+        ids(&mut db, "SELECT id FROM t ORDER BY id"),
+        vec![Value::Int(1), Value::Int(2)]
+    );
+    assert_eq!(
+        ids(&mut db, "SELECT id FROM t WHERE geo_hash(a) = 30"),
+        vec![Value::Int(1)]
+    );
     // A write that would maintain the stale index is refused (XX002) — the table is read-only.
     assert_eq!(
         err_code(db.query_outcome("INSERT INTO t VALUES (3, 3)", &[])),
@@ -503,7 +515,10 @@ fn hostfunc_index_reopen_different_component_unusable() {
     );
     // Reopen with a DIFFERENT component id for the same name/signature → a different implementation.
     let mut db = open_file(&path, registry(vec![geo_hash("org.other/geo_hash", 1)]));
-    assert_eq!(ids(&mut db, "SELECT id FROM t WHERE geo_hash(a) = 30"), vec![Value::Int(1)]);
+    assert_eq!(
+        ids(&mut db, "SELECT id FROM t WHERE geo_hash(a) = 30"),
+        vec![Value::Int(1)]
+    );
     assert_eq!(
         err_code(db.query_outcome("INSERT INTO t VALUES (2, 3)", &[])),
         "XX002"
@@ -526,7 +541,10 @@ fn hostfunc_index_reopen_missing_function() {
     // Reopen with NO extensions: the index expression can no longer resolve.
     let mut db = open_file(&path, std::sync::Arc::new(ExtensionRegistry::new()));
     // A read that does not reference the missing function still works (the index is simply unused).
-    assert_eq!(ids(&mut db, "SELECT id FROM t ORDER BY id"), vec![Value::Int(1), Value::Int(2)]);
+    assert_eq!(
+        ids(&mut db, "SELECT id FROM t ORDER BY id"),
+        vec![Value::Int(1), Value::Int(2)]
+    );
     // A write that would maintain the index needs the missing function → 42883 (resolution fails).
     assert_eq!(
         err_code(db.query_outcome("INSERT INTO t VALUES (3, 3)", &[])),

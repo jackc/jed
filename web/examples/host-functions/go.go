@@ -26,9 +26,11 @@ func main() {
 				cents, pct := args[0].Int, args[1].Int
 				return jed.IntValue(cents - cents*pct/100), nil
 			}).
-			WithVolatility(jed.VolatilityImmutable). // same inputs ⇒ same output
-			WithCrossCore(true).                     // results are byte-identical on every core
-			WithCost(2))
+			WithVolatility(jed.VolatilityImmutable).      // same inputs ⇒ same output
+			WithCrossCore(true).                          // results are byte-identical on every core
+			WithCost(2).                                  //
+			WithComponentID("com.example/discount").      // a stable identity for index-backing
+			WithSemanticVersion(1))                       // bump when a formula change invalidates keys
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -42,6 +44,11 @@ func main() {
 	ctx := context.Background()
 	mustExec(db, "CREATE TABLE product (id i32 PRIMARY KEY, name text, price_cents i64)")
 	mustExec(db, "INSERT INTO product VALUES (1, 'Mug', 1250), (2, 'Notebook', 400)")
+
+	// Because discount is IMMUTABLE and carries a component identity, it can back a persisted index.
+	// On reopen, if the registry supplies a different component/version, the index is skipped for
+	// reads (a correct heap scan) and refused for writes — never a silently stale result.
+	mustExec(db, "CREATE INDEX ON product (discount(price_cents, 10))")
 
 	// Call it by name from SQL, exactly like a built-in.
 	rows, err := db.Query(ctx, "SELECT name, discount(price_cents, 15) AS sale FROM product ORDER BY id")

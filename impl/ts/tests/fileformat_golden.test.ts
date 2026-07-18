@@ -8,9 +8,10 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { Engine, execute, loadUnicodeData } from "../src/tooling.ts";
+import { Engine, ExtensionRegistry, execute, loadUnicodeData } from "../src/tooling.ts";
 import { crc32Ieee, loadEngine, toImage } from "../src/format.ts";
 import { scalarT } from "../src/types.ts";
+import { intValue, type Value } from "../src/value.ts";
 import { specPath } from "./tomlmini.ts";
 import { bytesEqual, fillerBytesHex, fillerText } from "./util.ts";
 
@@ -180,6 +181,33 @@ function partialIndexTableDB(): Engine {
   run(db, "CREATE INDEX ON t (amt) WHERE status = 'active'");
   run(db, "CREATE UNIQUE INDEX t_uact ON t (amt) WHERE status = 'active'");
   run(db, "CREATE INDEX ON t (status)");
+  return db;
+}
+
+// hostfuncIndexTableDB has a HOST-FUNCTION index dependency (v31 — the index_flags bit2 + the
+// persisted dependency list after index_root_page, extensibility.md §8.1): the index t_geo_idx is on
+// geo_hash(a), a host scalar function (i64 -> i64), component "com.example/geo_hash" at semantic
+// version 1. The table is EMPTY (the tree empty, root 0), so the fixture isolates the v31 catalog
+// change. Must match verify.rb's HOSTFUNC_INDEX_TABLE.
+function hostfuncIndexTableDB(): Engine {
+  const db = goldenDb();
+  const reg = new ExtensionRegistry();
+  reg.registerFunction({
+    name: "geo_hash",
+    argTypes: ["i64"],
+    result: "i64",
+    kernel: (args: Value[]) => {
+      const a = args[0]!;
+      if (a.kind !== "int") throw new Error("strict + resolved i64 arg");
+      return intValue(a.int * 10n);
+    },
+    volatility: "immutable",
+    componentId: "com.example/geo_hash",
+    semanticVersion: 1,
+  });
+  db.session.extensions = reg;
+  run(db, "CREATE TABLE t (id i64 PRIMARY KEY, a i64)");
+  run(db, "CREATE INDEX t_geo_idx ON t (geo_hash(a))");
   return db;
 }
 
@@ -978,6 +1006,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "unique_table.jed", build: uniqueTableDB },
     { name: "expr_index_table.jed", build: exprIndexTableDB },
     { name: "partial_index_table.jed", build: partialIndexTableDB },
+    { name: "hostfunc_index_table.jed", build: hostfuncIndexTableDB },
     { name: "gin_array_table.jed", build: ginArrayTableDB },
     { name: "gin_uuid_table.jed", build: ginUuidTableDB },
     { name: "fk_table.jed", build: fkTableDB },
@@ -1051,6 +1080,7 @@ test("read goldens reproduces rows", () => {
     { name: "unique_table.jed", build: uniqueTableDB, table: "t" },
     { name: "expr_index_table.jed", build: exprIndexTableDB, table: "t" },
     { name: "partial_index_table.jed", build: partialIndexTableDB, table: "t" },
+    { name: "hostfunc_index_table.jed", build: hostfuncIndexTableDB, table: "t" },
     { name: "gin_array_table.jed", build: ginArrayTableDB, table: "t" },
     { name: "gin_uuid_table.jed", build: ginUuidTableDB, table: "t" },
     { name: "fk_table.jed", build: fkTableDB, table: "c" },

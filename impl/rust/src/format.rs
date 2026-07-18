@@ -4254,7 +4254,9 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         // extensibility.md §8.1. A non-btree index never carries one.
         let has_host_deps = iflags & 0b100 != 0;
         if has_host_deps && kind != IndexKind::Btree {
-            return Err(corrupt("a non-btree index cannot have host-function dependencies"));
+            return Err(corrupt(
+                "a non-btree index cannot have host-function dependencies",
+            ));
         }
         let host_deps = if has_host_deps {
             let dep_count = read_u16(buf, pos)? as usize;

@@ -15,6 +15,127 @@ import (
 // executeDropTable), CREATE/DROP INDEX, CREATE/DROP TYPE, and CREATE/DROP/ALTER SEQUENCE, plus the
 // sequence-definition builders (buildSequenceDef/applySeqAlter/chooseSerialSeqName).
 
+// rexprChildren returns the direct resolved-expression children of node in a deterministic
+// evaluation-tree order — the Go counterpart of Rust's estimator_expression_children: every
+// subexpression the evaluator would recurse into. Used to walk an index key/predicate expression for
+// host-function dependencies (spec/design/extensibility.md §8.1). A leaf returns none.
+func rexprChildren(node *rExpr) []*rExpr {
+	var out []*rExpr
+	add := func(c *rExpr) {
+		if c != nil {
+			out = append(out, c)
+		}
+	}
+	add(node.operand)
+	add(node.lhs)
+	add(node.rhs)
+	add(node.caseEls)
+	for _, arm := range node.caseArms {
+		add(arm.cond)
+		add(arm.result)
+	}
+	for _, a := range node.sargs {
+		add(a)
+	}
+	for _, s := range node.subs {
+		add(s.index)
+		add(s.lower)
+		add(s.upper)
+	}
+	return out
+}
+
+// walkIndexExprHostFuncs invokes visit on every host-function call node (reHostFunc) reachable in a
+// resolved index key/predicate expression, in evaluation-tree order — the shared traversal
+// collectIndexHostDeps + verifyIndexHostDeps both drive (spec/design/extensibility.md §8.1, step 4).
+func walkIndexExprHostFuncs(node *rExpr, visit func(*rExpr) error) error {
+	if node == nil {
+		return nil
+	}
+	if node.kind == reHostFunc {
+		if err := visit(node); err != nil {
+			return err
+		}
+	}
+	for _, child := range rexprChildren(node) {
+		if err := walkIndexExprHostFuncs(child, visit); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// hostDepArgCodes maps a dependency's argument types to their stable on-disk type codes — the
+// tie-break key for the (name, arg-type codes) sort that fixes the on-disk dependency order (§8).
+func hostDepArgCodes(d hostFuncDep) []byte {
+	out := make([]byte, len(d.ArgTypes))
+	for i, a := range d.ArgTypes {
+		out[i] = typeCodeForScalar(a)
+	}
+	return out
+}
+
+// collectIndexHostDeps walks a resolved index key/predicate expression and collects the HOST-FUNCTION
+// dependencies it references (spec/design/extensibility.md §8.1, delivery step 4), enforcing the two
+// admission rules a host function must meet to back a PERSISTED index:
+//   - IMMUTABLE — PostgreSQL requires index-expression functions to be immutable; jed adds it because
+//     a volatile/stable function would make the stored keys meaningless (42P17).
+//   - a component identity — without a stable identity + version the file cannot record a dependency it
+//     can re-check on reopen (42P17, §7). (This also closes the latent leak where any host function —
+//     even a volatile one — silently passed the syntactic immutability walk.)
+//
+// Deduplicated by (name, arg types); the caller sorts for a stable on-disk order.
+func collectIndexHostDeps(node *rExpr, reg *ExtensionRegistry, out *[]hostFuncDep) error {
+	return walkIndexExprHostFuncs(node, func(n *rExpr) error {
+		hf := reg.function(n.index)
+		if hf.volatility != VolatilityImmutable {
+			return newError(InvalidObjectDefinition,
+				"host function "+n.cText+" in an index expression must be IMMUTABLE")
+		}
+		if hf.componentID == nil {
+			return newError(InvalidObjectDefinition,
+				"host function "+n.cText+" used in an index expression must declare a component identity")
+		}
+		for _, d := range *out {
+			if d.Name == hf.name && sameHostSig(d.ArgTypes, hf.argTypes) {
+				return nil // already recorded this signature
+			}
+		}
+		*out = append(*out, hostFuncDep{
+			Name:            hf.name,
+			ArgTypes:        append([]scalarType(nil), hf.argTypes...),
+			Result:          hf.result,
+			ComponentID:     *hf.componentID,
+			SemanticVersion: hf.semanticVersion,
+		})
+		return nil
+	})
+}
+
+// verifyIndexHostDeps verifies a resolved index key/predicate expression's host-function references
+// still match the dependencies persisted with the index (spec/design/extensibility.md §8.1/§11,
+// delivery step 4) — the reopen soundness check. Called on every per-statement re-resolution: if the
+// current registry supplies a DIFFERENT component_id or a BUMPED semantic_version for a signature the
+// index depends on, the stored keys are stale, so this returns XX002, which the READ path swallows
+// (resolveIndex's error → the planner skips the index, a correct heap scan) and a WRITE propagates
+// (the table is read-only until a rebuild). A MISSING function is caught earlier by resolution itself
+// (42883). A no-op for an index that records no host dependency.
+func verifyIndexHostDeps(node *rExpr, reg *ExtensionRegistry, deps []hostFuncDep) error {
+	return walkIndexExprHostFuncs(node, func(n *rExpr) error {
+		hf := reg.function(n.index)
+		for _, d := range deps {
+			if d.Name == hf.name && sameHostSig(d.ArgTypes, hf.argTypes) &&
+				hf.componentID != nil && *hf.componentID == d.ComponentID &&
+				hf.semanticVersion == d.SemanticVersion {
+				return nil
+			}
+		}
+		return newError(CollationVersionMismatch,
+			"index depends on host function "+n.cText+" whose registered component/version no longer "+
+				"matches the file; the index is unusable until it is rebuilt")
+	})
+}
+
 // stmtKind is a short label for a statement kind, for the 25006 read-only-violation message (the
 // message text is informational — never matched; spec/design/conformance.md §2).
 func stmtKind(stmt statement) string {
@@ -1313,6 +1434,26 @@ func (db *engine) resolveIndexWithParams(table *catTable, def indexDef, ptypes *
 			return resolvedIndex{}, err
 		}
 		predicate = node
+	}
+	// Reopen soundness (spec/design/extensibility.md §8.1/§11, step 4): if this index depends on host
+	// functions, verify each still matches the dependency persisted with the index. A mismatch is XX002,
+	// which the read path swallows (resolveIndex's error → the planner skips it and heap-scans) and a
+	// write propagates (the table is read-only until a rebuild). A no-op for the common index that
+	// records no host dependency.
+	if len(def.HostDeps) > 0 {
+		reg := db.session.extensions
+		for i := range keys {
+			if keys[i].Expr != nil {
+				if err := verifyIndexHostDeps(keys[i].Expr, reg, def.HostDeps); err != nil {
+					return resolvedIndex{}, err
+				}
+			}
+		}
+		if predicate != nil {
+			if err := verifyIndexHostDeps(predicate, reg, def.HostDeps); err != nil {
+				return resolvedIndex{}, err
+			}
+		}
 	}
 	return resolvedIndex{Name: def.Name, Unique: def.Unique, Kind: def.Kind, Keys: keys, Predicate: predicate}, nil
 }
@@ -2961,6 +3102,11 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		return outcome{}, newError(UndefinedObject, "access method does not exist: "+ci.Using)
 	}
 	ciKeys := make([]indexKey, 0, len(ci.Keys))
+	// Host-function dependencies this index's key/predicate expressions reference
+	// (spec/design/extensibility.md §8.1, step 4) — collected as each expression resolves, then
+	// persisted so a reopening binary can re-check them. nil for the common index with no host function
+	// (byte-identical to v30 then).
+	var hostDeps []hostFuncDep
 	for _, elem := range ci.Keys {
 		// An EXPRESSION key element (spec/design/indexes.md §1/§2): resolve it against the table's
 		// columns, validate it is immutable + indexable-typed, and store its canonical text
@@ -2980,7 +3126,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			// fall out of the resolver, as for a CHECK).
 			s := singleScope(db, table)
 			pt := &paramTypes{}
-			_, rtype, rerr := resolve(s, *elem.Expr, nil, &aggCtx{collecting: false}, pt)
+			node, rtype, rerr := resolve(s, *elem.Expr, nil, &aggCtx{collecting: false}, pt)
 			if rerr != nil {
 				return outcome{}, rerr
 			}
@@ -3000,6 +3146,12 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			if indexExprNonimmutableCall(*elem.Expr) || tzHazard || pt.nonimmutable {
 				return outcome{}, newError(InvalidObjectDefinition,
 					"functions in index expression must be marked IMMUTABLE")
+			}
+			// Collect + admit any host functions the key expression calls (§8.1, step 4): each must be
+			// IMMUTABLE + carry a component identity, else 42P17 (this also closes the latent leak where a
+			// volatile host function passed the syntactic immutability walk above).
+			if err := collectIndexHostDeps(node, db.session.extensions, &hostDeps); err != nil {
+				return outcome{}, err
 			}
 			// The result type must be key-encodable (a composite result is 0A000).
 			if _, ok := resolvedToKeyType(rtype); !ok {
@@ -3106,7 +3258,8 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		}
 		s := singleScope(db, table)
 		pt := &paramTypes{}
-		if _, err := resolveBooleanFilter(s, &ci.Predicate.Expr, pt); err != nil {
+		pnode, err := resolveBooleanFilter(s, &ci.Predicate.Expr, pt)
+		if err != nil {
 			return outcome{}, err
 		}
 		// Immutability (§9), the same rule an expression key carries: a non-immutable seam/clock/
@@ -3123,6 +3276,11 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		if indexExprNonimmutableCall(ci.Predicate.Expr) || tzHazard || pt.nonimmutable {
 			return outcome{}, newError(InvalidObjectDefinition,
 				"functions in index predicate must be marked IMMUTABLE")
+		}
+		// Collect + admit any host functions the predicate calls (§8.1, step 4), same rule as a key
+		// expression (IMMUTABLE + component identity, else 42P17).
+		if err := collectIndexHostDeps(pnode, db.session.extensions, &hostDeps); err != nil {
+			return outcome{}, err
 		}
 		predicate = &indexKeyExpr{ExprText: ci.Predicate.Text, Expr: ci.Predicate.Expr}
 	}
@@ -3164,7 +3322,15 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		}
 	}
 
-	def := indexDef{Name: name, Keys: ciKeys, Unique: ci.Unique, Kind: kind, Predicate: predicate}
+	// A stable on-disk / cross-core order (CLAUDE.md §8): sort the collected dependencies by (name,
+	// on-disk arg-type codes) so registration order never leaks into the file bytes.
+	slices.SortFunc(hostDeps, func(a, b hostFuncDep) int {
+		if c := strings.Compare(a.Name, b.Name); c != 0 {
+			return c
+		}
+		return bytes.Compare(hostDepArgCodes(a), hostDepArgCodes(b))
+	})
+	def := indexDef{Name: name, Keys: ciKeys, Unique: ci.Unique, Kind: kind, Predicate: predicate, HostDeps: hostDeps}
 	// The build scan (cost.md §3): page_read per table-tree node + storage_row_read per row. The
 	// touched set is the columns the key elements read — an index column for a column key, or every
 	// column an expression key references (which may be variable-width, so a spilled value adds its

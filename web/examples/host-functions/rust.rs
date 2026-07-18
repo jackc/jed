@@ -29,13 +29,20 @@ fn main() -> jed::Result<()> {
         )
         .volatility(Volatility::Immutable) // same inputs ⇒ same output
         .cross_core(true) // results are byte-identical on every core
-        .cost(2),
+        .cost(2)
+        .component_id("com.example/discount") // a stable identity for index-backing
+        .semantic_version(1), // bump when a formula change would invalidate stored index keys
     )?;
 
     let mut db = Database::create(CreateOptions { extensions: Arc::new(registry), ..Default::default() })?;
 
     db.execute("CREATE TABLE product (id i32 PRIMARY KEY, name text, price_cents i64)", &[])?;
     db.execute("INSERT INTO product VALUES (1, 'Mug', 1250), (2, 'Notebook', 400)", &[])?;
+
+    // Because discount is IMMUTABLE and carries a component identity, it can back a persisted index.
+    // On reopen, if the registry supplies a different component/version, the index is skipped for
+    // reads (a correct heap scan) and refused for writes — never a silently stale result.
+    db.execute("CREATE INDEX ON product (discount(price_cents, 10))", &[])?;
 
     // Call it by name from SQL, exactly like a built-in.
     let sql = "SELECT name, discount(price_cents, 15) AS sale FROM product ORDER BY id";

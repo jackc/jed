@@ -164,6 +164,28 @@ type foreignKey struct {
 	OnUpdate   fkAction
 }
 
+// hostFuncDep is a HOST-FUNCTION DEPENDENCY persisted with an index whose key/predicate expression
+// calls a host scalar function (spec/design/extensibility.md §8.1, format_version 31, delivery step
+// 4). One entry per DISTINCT host-function signature the index's expressions reference; it is the
+// RESOLVED dependency the file records so a reopening binary can detect that the registry now supplies
+// a DIFFERENT implementation (a mismatch makes the index unusable — skipped for reads, refused for
+// writes — never a silent stale-key read). Sorted by (Name, ArgTypes) when stored so registration
+// order never leaks (CLAUDE.md §8).
+type hostFuncDep struct {
+	// Name is the (lowercased) SQL function name — the correlation key to a re-resolved reHostFunc node.
+	Name string
+	// ArgTypes is the exact scalar argument signature — with Name, identifies which overload this pins.
+	ArgTypes []scalarType
+	// Result is the declared scalar result type at CREATE INDEX (recorded for completeness).
+	Result scalarType
+	// ComponentID is the host's stable component identity at CREATE INDEX. Required for an
+	// index-backing function; a reopen whose registry supplies a different one makes the index unusable.
+	ComponentID string
+	// SemanticVersion is the host's semantic version at CREATE INDEX. A reopen whose registry bumped it
+	// forces a rebuild (the index unusable meanwhile), never a silent stale-key read.
+	SemanticVersion uint32
+}
+
 // IndexKey is one index key element (spec/design/indexes.md §1): a bare column (by ordinal into
 // the table's columns) or an expression over the table's columns (`lower(email)`), carrying its
 // persisted canonical text and the re-parsed (unresolved) AST — the write/plan paths re-resolve it
@@ -217,6 +239,13 @@ type indexDef struct {
 	// persisted canonical text + the re-parsed (unresolved) AST — re-resolved against the table per
 	// statement, like an expression key (indexKeyExpr). Partial indexes are B-tree only.
 	Predicate *indexKeyExpr
+	// HostDeps are persisted HOST-FUNCTION dependencies (spec/design/extensibility.md §8.1,
+	// format_version 31): one entry per distinct host scalar function this index's key/predicate
+	// expressions call, each pinning the component identity + semantic version the index was built
+	// against. nil for the common index with no host-function key (byte-identical to v30 then). On
+	// reopen the per-statement re-resolution (resolveIndexWithParams) compares each against the current
+	// registry; a mismatch makes the index unusable. Sorted by (Name, ArgTypes).
+	HostDeps []hostFuncDep
 }
 
 // allColumns reports whether every key element is a plain column (no expression key) — the common

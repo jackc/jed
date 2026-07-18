@@ -70,6 +70,7 @@ import {
   type ExclusionOp,
   type FkAction,
   type ForeignKey,
+  type HostFuncDep,
   type IdentityKind,
   type IndexDef,
   type IndexKey,
@@ -170,7 +171,13 @@ import {
   loadedTimeZones as loadedTimeZonesGlobal,
   type TimeZoneInfo,
 } from "./timezone.ts";
-import { crc32Ieee, newTempStorage, pagePayload, recordCompressUnits } from "./format.ts";
+import {
+  crc32Ieee,
+  newTempStorage,
+  pagePayload,
+  recordCompressUnits,
+  typeCodeForScalar,
+} from "./format.ts";
 import { commitDurableAttachment, persistSharedBody, persistTemp } from "./persist.ts";
 import { Decimal, workLinear } from "./decimal.ts";
 import { encodeBool, encodeInt, encodeTerminated } from "./encoding.ts";
@@ -187,6 +194,7 @@ import {
   uniqueViolation,
 } from "./errors.ts";
 import { type PrivilegeSet, Privileges } from "./privileges.ts";
+import type { ExtensionRegistry } from "./extension.ts";
 import { type ScriptSummary, splitStatements } from "./split.ts";
 import type { SharedPaging } from "./paging.ts";
 import {
@@ -5675,6 +5683,19 @@ export class Engine {
         ptypes,
       );
     }
+    // Reopen soundness (extensibility.md §8.1/§11, step 4): if this index depends on host functions,
+    // verify each still matches the dependency persisted with the index. A mismatch is XX002, which
+    // the READ path swallows (buildIndexAccessPredicate try/catch → the planner skips it and heap-
+    // scans) and a WRITE propagates (the table is read-only until a rebuild). A no-op for the common
+    // index that records no host dependency (and for GIN/GiST whose keys are plain columns). A MISSING
+    // function is caught earlier by resolution itself above (42883).
+    if (def.hostDeps && def.hostDeps.length > 0 && this.session.extensions) {
+      const reg = this.session.extensions;
+      for (const k of keys) {
+        if (k.kind === "expr") verifyIndexHostDeps(k.expr, reg, def.hostDeps);
+      }
+      if (predicate) verifyIndexHostDeps(predicate, reg, def.hostDeps);
+    }
     return { name: def.name, unique: def.unique, kind: def.kind, keys, predicate };
   }
 
@@ -7434,6 +7455,11 @@ export class Engine {
     else if (method === "gist") kind = "gist";
     else throw engineError("undefined_object", "access method does not exist: " + ci.using);
     const ciKeys: IndexKey[] = [];
+    // Host-function dependencies this index's key/predicate expressions reference
+    // (spec/design/extensibility.md §8.1, step 4) — collected as each expression resolves, then
+    // persisted so a reopening binary can re-check them. Empty for the common index with no host
+    // function (byte-identical to v30 then).
+    const hostDeps: HostFuncDep[] = [];
     for (const elem of ci.keys) {
       // An EXPRESSION key element (spec/design/indexes.md §1/§2): resolve it against the table's
       // columns, validate it is immutable + indexable-typed, and store its canonical text (persisted,
@@ -7455,7 +7481,7 @@ export class Engine {
         // out of the resolver, as for a CHECK).
         const scope = Scope.single(this, table);
         const pt = new ParamTypes();
-        const { type: rtype } = resolve(
+        const { node, type: rtype } = resolve(
           scope,
           elem.expr,
           null,
@@ -7481,6 +7507,12 @@ export class Engine {
             "feature_not_supported",
             "an index on an expression of this result type is not supported yet",
           );
+        }
+        // Collect + admit any host functions the key expression calls (§8.1, step 4): each must be
+        // IMMUTABLE + carry a component identity, else 42P17 (this also closes the latent leak where a
+        // volatile host function passed the syntactic immutability walk above).
+        if (this.session.extensions) {
+          collectIndexHostDeps(node, this.session.extensions, hostDeps);
         }
         ciKeys.push({ kind: "expr", exprText: elem.text, expr: elem.expr });
         continue;
@@ -7606,7 +7638,7 @@ export class Engine {
       // the Forbidden-context boolean resolve below.
       rejectIndexPredicateStructure(ci.predicate.expr);
       const predPt = new ParamTypes();
-      resolveBooleanFilter(Scope.single(this, table), ci.predicate.expr, predPt);
+      const predNode = resolveBooleanFilter(Scope.single(this, table), ci.predicate.expr, predPt);
       // Immutability (§9), the same rule an expression key carries: a non-immutable seam/clock/sequence
       // call, a timestamptz-dependent subexpression (references a timestamptz column — conservatively
       // fail-closed), or a resolved STABLE node (the runtime text→date cast, ParamTypes.nonimmutable),
@@ -7624,6 +7656,11 @@ export class Engine {
           "invalid_object_definition",
           "functions in index predicate must be marked IMMUTABLE",
         );
+      }
+      // Collect + admit any host functions the predicate calls (§8.1, step 4), same rule as a key
+      // expression (IMMUTABLE + component identity, else 42P17).
+      if (this.session.extensions) {
+        collectIndexHostDeps(predNode, this.session.extensions, hostDeps);
       }
       predicate = { exprText: ci.predicate.text, expr: ci.predicate.expr };
     }
@@ -7671,7 +7708,18 @@ export class Engine {
     // A partial index's predicate is evaluated per row during the build (indexes.md §9), so the columns
     // it references join the touched set — keeping the build cost deterministic + cross-core identical.
     if (predicate) for (const c of checkReferencedColumns(predicate.expr, columns)) mask[c] = true;
-    const def: IndexDef = { name, keys: ciKeys, unique: ci.unique, kind, predicate };
+    // A stable on-disk / cross-core order (CLAUDE.md §8): sort the collected dependencies by (name,
+    // on-disk arg-type codes) so registration order never leaks into the file bytes. undefined when
+    // the index calls no host function, keeping the catalog entry byte-identical to v30.
+    hostDeps.sort(compareHostDeps);
+    const def: IndexDef = {
+      name,
+      keys: ciKeys,
+      unique: ci.unique,
+      kind,
+      predicate,
+      hostDeps: hostDeps.length > 0 ? hostDeps : undefined,
+    };
     // Resolve the index once (column ordinals + resolved expression keys); an env for any expression
     // key (a fresh statement rng — index expressions are immutable, so it is never read).
     const rindex = this.resolveIndex(table, def);
@@ -21730,6 +21778,218 @@ function computeRelMasks(plan: SelectPlan): boolean[][] {
     if (r.derived !== undefined) collectTouchedPlan(r.derived, 1, touched);
   }
   return plan.rels.map((r) => touched.slice(r.offset, r.offset + r.colCount));
+}
+
+// A resolved host-function call node — the hostFunc RExpr variant, carried by collectHostFuncNodes.
+type HostFuncNode = Extract<RExpr, { kind: "hostFunc" }>;
+
+// collectHostFuncNodes appends every hostFunc call node reachable in a resolved expression tree
+// (spec/design/extensibility.md §8.1, delivery step 4). The traversal mirrors collectTouched (every
+// child-bearing RExpr kind). An index key / predicate expression can never contain a
+// subquery/aggregate/window/param (all rejected at CREATE INDEX), but the walk covers every kind for
+// robustness — the analogue of Rust's estimator_expression_children recursion.
+function collectHostFuncNodes(e: RExpr, out: HostFuncNode[]): void {
+  switch (e.kind) {
+    case "hostFunc":
+      out.push(e);
+      for (const a of e.args) collectHostFuncNodes(a, out);
+      return;
+    case "subquery":
+      if (e.lhs !== null) collectHostFuncNodes(e.lhs, out);
+      return;
+    case "inValues":
+      collectHostFuncNodes(e.lhs, out);
+      return;
+    case "quantified":
+      collectHostFuncNodes(e.lhs, out);
+      collectHostFuncNodes(e.array, out);
+      return;
+    case "cast":
+    case "arrayCast":
+    case "neg":
+    case "not":
+    case "isNull":
+    case "isJson":
+    case "jsonCtor":
+      collectHostFuncNodes(e.operand, out);
+      return;
+    case "arith":
+    case "compare":
+    case "and":
+    case "or":
+    case "distinct":
+    case "like":
+    case "regex":
+      collectHostFuncNodes(e.lhs, out);
+      collectHostFuncNodes(e.rhs, out);
+      return;
+    case "jsonGet":
+    case "jsonHasKey":
+    case "jsonDelete":
+      collectHostFuncNodes(e.base, out);
+      collectHostFuncNodes(e.arg, out);
+      return;
+    case "jsonContains":
+    case "jsonConcat":
+      collectHostFuncNodes(e.a, out);
+      collectHostFuncNodes(e.b, out);
+      return;
+    case "casing":
+      collectHostFuncNodes(e.arg, out);
+      return;
+    case "atTimeZone":
+      collectHostFuncNodes(e.zone, out);
+      collectHostFuncNodes(e.value, out);
+      return;
+    case "dateTrunc":
+      collectHostFuncNodes(e.unit, out);
+      collectHostFuncNodes(e.value, out);
+      if (e.zone !== null) collectHostFuncNodes(e.zone, out);
+      return;
+    case "extract":
+      collectHostFuncNodes(e.value, out);
+      return;
+    case "dateConvert":
+      collectHostFuncNodes(e.inner, out);
+      return;
+    case "case":
+      for (const arm of e.arms) {
+        collectHostFuncNodes(arm.cond, out);
+        collectHostFuncNodes(arm.result, out);
+      }
+      collectHostFuncNodes(e.els, out);
+      return;
+    case "greatestLeast":
+    case "coalesce":
+    case "scalarFunc":
+    case "arrayFunc":
+    case "regexFunc":
+    case "rangeFunc":
+    case "rangeCtor":
+    case "rangeOp":
+    case "rangeSetOp":
+    case "variadic":
+    case "jsonBuild":
+    case "jsonSetInsert":
+    case "jsonObjectFromArrays":
+    case "jsonPathFn":
+    case "jsonSqlFn":
+      for (const a of e.args) collectHostFuncNodes(a, out);
+      return;
+    case "row":
+      for (const f of e.fields) collectHostFuncNodes(f, out);
+      return;
+    case "array":
+      for (const el of e.elements) collectHostFuncNodes(el, out);
+      return;
+    case "field":
+      collectHostFuncNodes(e.base, out);
+      return;
+    case "subscript":
+      collectHostFuncNodes(e.base, out);
+      for (const b of rSubscriptBounds(e.subscripts)) collectHostFuncNodes(b, out);
+      return;
+    default: // leaves: column, param, outerColumn, const*, constArray, constRange, dateClock
+  }
+}
+
+// collectIndexHostDeps walks a resolved index key / predicate expression and collects the
+// HOST-FUNCTION DEPENDENCIES it references (spec/design/extensibility.md §8.1, delivery step 4),
+// enforcing the two admission rules a host function must meet to back a PERSISTED index:
+//   - IMMUTABLE — PostgreSQL requires index-expression functions to be immutable; jed adds it because
+//     a volatile/stable function would make the stored keys meaningless (42P17). (This also closes the
+//     latent leak where a volatile host function passed the purely-syntactic immutability walk.)
+//   - a componentId — without a stable identity + version the file cannot record a dependency it can
+//     re-check on reopen (42P17, §7).
+// Deduplicated by (name, argTypes); the caller sorts for a stable on-disk order.
+function collectIndexHostDeps(node: RExpr, reg: ExtensionRegistry, out: HostFuncDep[]): void {
+  const nodes: HostFuncNode[] = [];
+  collectHostFuncNodes(node, nodes);
+  for (const hn of nodes) {
+    const hf = reg.functionAt(hn.id);
+    if (hf.volatility !== "immutable") {
+      throw engineError(
+        "invalid_object_definition",
+        `host function ${hn.name} in an index expression must be IMMUTABLE`,
+      );
+    }
+    if (hf.componentId === null) {
+      throw engineError(
+        "invalid_object_definition",
+        `host function ${hn.name} used in an index expression must declare a component identity`,
+      );
+    }
+    if (!out.some((d) => d.name === hf.name && sameScalarSig(d.argTypes, hf.argTypes))) {
+      out.push({
+        name: hf.name,
+        argTypes: [...hf.argTypes],
+        result: hf.result,
+        componentId: hf.componentId,
+        semanticVersion: hf.semanticVersion,
+      });
+    }
+  }
+}
+
+// verifyIndexHostDeps checks a resolved index key / predicate expression's host-function references
+// still match the dependencies persisted with the index (spec/design/extensibility.md §8.1/§11,
+// delivery step 4) — the reopen soundness check. Called on every per-statement re-resolution: if the
+// current registry supplies a DIFFERENT componentId or a BUMPED semanticVersion for a signature the
+// index depends on, the stored keys are stale, so this throws XX002, which the READ path swallows
+// (buildIndexAccessPredicate try/catch → the planner skips the index, a correct heap scan) and a WRITE
+// propagates (the table is read-only until a rebuild). A MISSING function is caught earlier by
+// resolution itself (42883). A no-op for an index that records no host dependency.
+function verifyIndexHostDeps(node: RExpr, reg: ExtensionRegistry, deps: HostFuncDep[]): void {
+  const nodes: HostFuncNode[] = [];
+  collectHostFuncNodes(node, nodes);
+  for (const hn of nodes) {
+    const hf = reg.functionAt(hn.id);
+    const ok = deps.some(
+      (d) =>
+        d.name === hf.name &&
+        sameScalarSig(d.argTypes, hf.argTypes) &&
+        hf.componentId === d.componentId &&
+        hf.semanticVersion === d.semanticVersion,
+    );
+    if (!ok) {
+      throw engineError(
+        // XX002 — the graded "a versioned dependency no longer matches" reopen verdict, shared with
+        // the collation version-skew case (extensibility.md §11/§15).
+        "collation_version_mismatch",
+        `index depends on host function ${hn.name} whose registered component/version no longer ` +
+          "matches the file; the index is unusable until it is rebuilt",
+      );
+    }
+  }
+}
+
+// sameScalarSig reports whether two scalar argument signatures are identical (arity + per-position
+// type) — the (name, argTypes) correlation key host-function dependencies dedup / match on.
+function sameScalarSig(a: readonly ScalarType[], b: readonly ScalarType[]): boolean {
+  return a.length === b.length && a.every((t, i) => t === b[i]);
+}
+
+// hostDepSortKey renders a dependency's on-disk sort key — its name UTF-8 bytes then its arg-type
+// codes (spec/design/extensibility.md §8.1) — so the persisted list order matches Rust/Go byte for
+// byte (a stable order, CLAUDE.md §8; registration order must never leak). Name comparison is
+// byte-lexicographic (matching Rust's String Ord) via the UTF-8 bytes, then the type-code vector.
+function compareHostDeps(a: HostFuncDep, b: HostFuncDep): number {
+  const an = SQL_BYTE_ENCODER.encode(a.name);
+  const bn = SQL_BYTE_ENCODER.encode(b.name);
+  const nl = Math.min(an.length, bn.length);
+  for (let i = 0; i < nl; i++) {
+    if (an[i]! !== bn[i]!) return an[i]! - bn[i]!;
+  }
+  if (an.length !== bn.length) return an.length - bn.length;
+  const al = a.argTypes.length;
+  const bl = b.argTypes.length;
+  const cl = Math.min(al, bl);
+  for (let i = 0; i < cl; i++) {
+    const ac = typeCodeForScalar(a.argTypes[i]!);
+    const bc = typeCodeForScalar(b.argTypes[i]!);
+    if (ac !== bc) return ac - bc;
+  }
+  return al - bl;
 }
 
 export function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {

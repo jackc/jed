@@ -31,9 +31,9 @@ type, a kernel, and three declarations:
   is **guarded against a session's `max_cost`**, so a heavy host function aborts `54P01` *before its
   kernel runs*. It is how a host function stays inside the [resource-limit](../resource-limits/)
   bound. (Defaults to `1`.)
-- **`volatility`** — `immutable` / `stable` / `volatile` (PostgreSQL's notion). Recorded
-  forward-compat; only `immutable` will later admit constant-folding or backing an index expression.
-  Defaults to `volatile` (the safe assumption: the planner folds nothing).
+- **`volatility`** — `immutable` / `stable` / `volatile` (PostgreSQL's notion). An **`immutable`**
+  function may back a persisted index (below); `stable`/`volatile` may not. Defaults to `volatile`
+  (the safe assumption).
 - **`cross_core`** — whether the function's results are byte-identical on every core. Recorded for the
   determinism ledger; not yet enforced. Defaults to `false`.
 
@@ -57,6 +57,30 @@ Registration itself rejects three mistakes up front: a **negative cost** is `220
 type name** is `42704` (Go and TypeScript name argument types by string), and a **second function
 with an identical `(name, arg-types)` signature** is `42723`.
 
+## Backing an index
+
+An `immutable` host function may be the key (or partial-`WHERE` predicate) of an index —
+`CREATE INDEX ON t (geo_hash(location))` — so a derived value is indexed without any extra machinery.
+Because the same SQL text re-binds to *your* code on reopen, an index like this must be able to tell
+whether the code still matches. So an index-backing function declares two more things:
+
+- **`component_id`** — a stable string naming the *implementation* (e.g. `"com.example/geo_hash"`),
+  independent of the SQL name.
+- **`semantic_version`** — a number you bump whenever a change to the results would invalidate keys
+  built from the old code.
+
+The file records that dependency. On reopen, if your registry supplies a **different `component_id`**,
+a **bumped `semantic_version`**, or **no such function**, the index is treated as **unusable**:
+reads simply skip it (you still get correct rows from a heap scan) and any write that would maintain
+it is refused (`XX002` on a mismatch, `42883` when the function is missing) — never a silently stale
+result. A non-`immutable` or unversioned host function used in an index is rejected up front with
+`42P17`. (Rebuild the index to adopt the new version.)
+
+Registration stays a **host-API act, never SQL** — there is no `CREATE FUNCTION` statement, so an
+untrusted query surface can never register or redefine host code. The registry itself is a handle
+setting a reopening host brings; only the *dependency* of an index on a function is written to the
+file.
+
 ## The boundary
 
 A host kernel is **opaque** to the engine — it may compute anything, and jed cannot know whether it
@@ -66,7 +90,6 @@ owns that decision. The engine's one mechanical defense is the **cost gate** abo
 only a function that declared its cost. That is the whole trade: jed gives you a clean, first-class
 extension seam and a legible line where your code takes over.
 
-This slice is deliberately narrow — **ephemeral** (no persisted use, no `CREATE FUNCTION` DDL yet),
-**strict**, **exact scalar signatures** (no implicit promotion), and **single-row** kernels (the
-vectorized/batched ABI is a follow-on). Host types, non-strict functions, and catalog-bound versioned
-functions come later.
+The surface is still deliberately narrow — **strict**, **exact scalar signatures** (no implicit
+promotion), and **single-row** kernels (the vectorized/batched ABI is a follow-on). Host functions in
+`DEFAULT`/`CHECK` columns, host *types*, and non-strict functions come later.
