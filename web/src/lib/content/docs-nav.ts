@@ -24,7 +24,8 @@ export const DOCS_NAV: readonly DocSection[] = [
       { title: 'Running scripts', href: '/docs/api/scripts/' },
       { title: 'Authorization', href: '/docs/api/authorization/' },
       { title: 'Resource limits', href: '/docs/api/resource-limits/' },
-      { title: 'Session variables', href: '/docs/api/session-variables/' }
+      { title: 'Session variables', href: '/docs/api/session-variables/' },
+      { title: 'Host functions', href: '/docs/api/host-functions/' }
     ]
   },
   {

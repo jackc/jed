@@ -313,6 +313,26 @@ test('the queries API page wires up the idiomatic example for each language', as
   await expect(page.getByTestId('code-ts')).toContainText('jed-ts');
 });
 
+test('the host-functions API page wires up the idiomatic example for each language', async ({
+  page
+}) => {
+  await page.goto('/docs/api/host-functions/');
+  // Default (Rust): build an ExtensionRegistry and register a HostFunction.
+  await expect(page.getByTestId('code-rust')).toBeVisible();
+  await expect(page.getByTestId('code-rust')).toContainText('ExtensionRegistry');
+  await expect(page.getByTestId('code-rust')).toContainText('register_function');
+
+  // Go: NewHostFunction + RegisterFunction on the registry.
+  await page.getByTestId('lang-go').click();
+  await expect(page.getByTestId('code-go')).toContainText('NewHostFunction');
+  await expect(page.getByTestId('code-go')).toContainText('RegisterFunction');
+
+  // TypeScript: the options-object registerFunction against the jed-ts package.
+  await page.getByTestId('lang-ts').click();
+  await expect(page.getByTestId('code-ts')).toContainText('registerFunction');
+  await expect(page.getByTestId('code-ts')).toContainText('jed-ts');
+});
+
 test('the reference pages are generated from the spec', async ({ page }) => {
   await page.goto('/docs/reference/errors/');
   // 54P01 (cost limit) and 23514 (check violation) come straight from spec/errors/registry.toml.
