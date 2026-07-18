@@ -2868,20 +2868,36 @@ pub(crate) fn resolved_to_key_type(rt: &ResolvedType) -> Option<Type> {
 /// One key element's value + encoding type + collation for a row: the column value (a column key)
 /// or the evaluated expression (an expression key — unmetered, `env` for the immutable eval).
 /// Index maintenance is unmetered (cost.md §3), so a throwaway [`Meter`] absorbs the eval charge.
-fn index_key_slot<'a>(
-    key: &'a ResolvedKey,
-    columns: &'a [Column],
-    colls: &'a [Option<std::sync::Arc<Collation>>],
+/// The **bare** order-preserving key bytes for one index-key slot (a column ordinal or an
+/// expression key) of `row`, or `None` when the slot value is SQL-NULL (the caller writes the §2.2
+/// tag: `0x01` NULL for an entry key, or short-circuits to `None` for a uniqueness prefix). A column
+/// key uses the store's resolved [`ColType`] (`col_types[ci]`), so a **composite** column recurses
+/// into its field codec (encoding.md §2.15); an expression key is never composite, so it stays on
+/// the by-name [`encode_typed_key`]. Maintenance eval is unmetered (cost.md §3).
+fn index_slot_key(
+    key: &ResolvedKey,
+    col_types: &[ColType],
+    colls: &[Option<std::sync::Arc<Collation>>],
     row: &Row,
     env: &EvalEnv,
-) -> Result<(Value, &'a Type, Option<&'a Collation>)> {
-    Ok(match key {
-        ResolvedKey::Column(ci) => (row[*ci].clone(), &columns[*ci].ty, colls[*ci].as_deref()),
+) -> Result<Option<Vec<u8>>> {
+    match key {
+        ResolvedKey::Column(ci) => match &row[*ci] {
+            Value::Null => Ok(None),
+            v => Ok(Some(encode_key_ct(
+                &col_types[*ci],
+                v,
+                colls[*ci].as_deref(),
+            )?)),
+        },
         ResolvedKey::Expr(rx, ty, coll) => {
             let mut m = Meter::new(); // maintenance eval is unmetered (cost.md §3)
-            (rx.eval(row, env, &mut m)?, ty, coll.as_deref())
+            match rx.eval(row, env, &mut m)? {
+                Value::Null => Ok(None),
+                v => Ok(Some(encode_typed_key(ty, &v, coll.as_deref())?)),
+            }
         }
-    })
+    }
 }
 
 /// encoding.md §2.2 nullable slot — `0x00` + the type's bare order-preserving key bytes when
@@ -2892,7 +2908,7 @@ fn index_key_slot<'a>(
 /// expression key evaluates against the row (spec/design/indexes.md §4); a referenced spilled
 /// value faults in through the evaluator's `Unfetched` backstop.
 pub(crate) fn index_entry_key(
-    columns: &[Column],
+    col_types: &[ColType],
     colls: &[Option<std::sync::Arc<Collation>>],
     rindex: &ResolvedIndex,
     storage_key: &[u8],
@@ -2901,14 +2917,13 @@ pub(crate) fn index_entry_key(
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     for key in &rindex.keys {
-        let (val, ty, coll) = index_key_slot(key, columns, colls, row, env)?;
-        match val {
-            Value::Null => out.push(0x01),
-            v => {
-                // present tag, then the type's order-preserving key (range-aware §2.11,
-                // collated-text-aware §2.12)
+        match index_slot_key(key, col_types, colls, row, env)? {
+            None => out.push(0x01),
+            Some(bytes) => {
+                // present tag, then the slot's order-preserving key (range-aware §2.11, composite
+                // §2.15, collated-text-aware §2.12)
                 out.push(0x00);
-                out.extend_from_slice(&encode_typed_key(ty, &v, coll)?);
+                out.extend_from_slice(&bytes);
             }
         }
     }
@@ -2941,6 +2956,7 @@ fn index_row_qualifies(rindex: &ResolvedIndex, row: &Row, env: &EvalEnv) -> Resu
 /// element or the partial predicate (B-tree only — GIN/GiST are plain-column, this slice).
 pub(crate) fn index_entry_keys(
     columns: &[Column],
+    col_types: &[ColType],
     colls: &[Option<std::sync::Arc<Collation>>],
     rindex: &ResolvedIndex,
     storage_key: &[u8],
@@ -2952,7 +2968,7 @@ pub(crate) fn index_entry_keys(
     }
     Ok(match rindex.kind {
         IndexKind::Btree => vec![index_entry_key(
-            columns,
+            col_types,
             colls,
             rindex,
             storage_key,
@@ -2971,6 +2987,7 @@ pub(crate) fn index_entry_keys(
 /// index is plain-column.
 pub(crate) fn index_entry_keys_columns(
     columns: &[Column],
+    col_types: &[ColType],
     colls: &[Option<std::sync::Arc<Collation>>],
     def: &IndexDef,
     storage_key: &[u8],
@@ -2987,8 +3004,8 @@ pub(crate) fn index_entry_keys_columns(
                     Value::Null => out.push(0x01),
                     v => {
                         out.push(0x00);
-                        out.extend_from_slice(&encode_typed_key(
-                            &columns[ci].ty,
+                        out.extend_from_slice(&encode_key_ct(
+                            &col_types[ci],
                             v,
                             colls[ci].as_deref(),
                         )?);
@@ -3210,23 +3227,30 @@ pub(crate) fn gin_entries(
 
 /// A row's PRIMARY-KEY STORAGE KEY (spec/design/encoding.md §2.3): the concatenation of the
 /// members' order-preserving encodings in key order. Every keyable type is self-delimiting (the
-/// scalars fixed-width or `0x00`-terminated, a `range` container framed §2.11), so the
-/// concatenation is self-delimiting and `memcmp` equals the tuple's logical order. Each member is
-/// encoded by the shared range-aware [`encode_typed_key`] (so a range PK member recurses into the
-/// element codec, encoding.md §2.11); the tuple carries each member's full `Type` for that reason.
-/// Shared by the INSERT duplicate check and the ON CONFLICT arbiter probe (spec/design/upsert.md §3);
-/// a PK column is NOT NULL, so there is no presence tag and no NULL arm. `float`/`composite`/`array`
-/// PKs are rejected at CREATE TABLE, so those value kinds never reach here. `colls`
-/// (column-ordinal-indexed) selects a text PK member's collated form (§2.12); a non-`C` collated
-/// member can fail the sort-key build (`0A000`), propagated here.
+/// scalars fixed-width or `0x00`-terminated, a `range` container framed §2.11, a `composite`
+/// container framed §2.15), so the concatenation is self-delimiting and `memcmp` equals the tuple's
+/// logical order. Each member is encoded by the resolved-type [`encode_key_ct`] (so a range/array/
+/// composite PK member recurses into its element/field codec); `col_types` is the table's resolved
+/// column types (column-ordinal-indexed, from the store), the vehicle that carries a composite
+/// member's field list (the by-name `Type` cannot — composite.md §2). Shared by the INSERT duplicate
+/// check and the ON CONFLICT arbiter probe (spec/design/upsert.md §3); a PK column is NOT NULL, so
+/// there is no presence tag and no NULL arm at the top level (a composite member's *fields* still
+/// take §2.2 slots, §2.15). `float`/`array`-of-composite PKs are rejected at CREATE TABLE, so those
+/// never reach here. `colls` (column-ordinal-indexed) selects a text PK member's collated form
+/// (§2.12); a non-`C` collated member can fail the sort-key build (`0A000`), propagated here.
 pub(crate) fn encode_pk_key(
     pk: &[(usize, Type)],
+    col_types: &[ColType],
     colls: &[Option<std::sync::Arc<Collation>>],
     row: &Row,
 ) -> Result<Vec<u8>> {
     let mut k = Vec::new();
-    for (i, pk_ty) in pk {
-        k.extend_from_slice(&encode_typed_key(pk_ty, &row[*i], colls[*i].as_deref())?);
+    for (i, _pk_ty) in pk {
+        k.extend_from_slice(&encode_key_ct(
+            &col_types[*i],
+            &row[*i],
+            colls[*i].as_deref(),
+        )?);
     }
     Ok(k)
 }
@@ -3237,7 +3261,7 @@ pub(crate) fn encode_pk_key(
 /// yield the same `Some` prefix. `colls` (column-ordinal-indexed) selects each text column's
 /// collated form (§2.12).
 pub(crate) fn index_prefix_key(
-    columns: &[Column],
+    col_types: &[ColType],
     colls: &[Option<std::sync::Arc<Collation>>],
     rindex: &ResolvedIndex,
     row: &Row,
@@ -3250,14 +3274,13 @@ pub(crate) fn index_prefix_key(
     }
     let mut out = Vec::new();
     for key in &rindex.keys {
-        let (val, ty, coll) = index_key_slot(key, columns, colls, row, env)?;
-        match val {
-            Value::Null => return Ok(None),
-            v => {
-                // present tag, then the type's order-preserving key (range-aware §2.11,
-                // collated-text-aware §2.12)
+        match index_slot_key(key, col_types, colls, row, env)? {
+            None => return Ok(None),
+            Some(bytes) => {
+                // present tag, then the slot's order-preserving key (range-aware §2.11, composite
+                // §2.15, collated-text-aware §2.12)
                 out.push(0x00);
-                out.extend_from_slice(&encode_typed_key(ty, &v, coll)?);
+                out.extend_from_slice(&bytes);
             }
         }
     }
@@ -3366,18 +3389,70 @@ pub(crate) fn encode_typed_key(
         Value::Array(a) => {
             let elem = ty
                 .array_element()
-                .expect("an array key value has an array column type");
+                .expect("an array key value has an array column type")
+                .scalar();
             encode_array_key(elem, a)
         }
         _ => encode_key_value(ty.scalar(), value, coll),
     }
 }
 
+/// The order-preserving key bytes for a value given its **resolved** [`ColType`] — the
+/// composite-aware sibling of [`encode_typed_key`] (which works off the by-name `Type` and so
+/// cannot see a composite's fields). Used at the column-key sites (PK member, index entry/prefix
+/// slot) where the store's resolved `col_types` are on hand; expression keys (never composite) stay
+/// on [`encode_typed_key`]. Scalar/array/range produce byte-identical output to `encode_typed_key`;
+/// the extra arm is `composite` (spec/design/encoding.md §2.15). `value` is non-NULL (callers tag
+/// the §2.2 slot). `coll` selects a text column's collated key form (§2.12); it never applies to a
+/// container element or a composite field (those key by the `C` byte order).
+pub(crate) fn encode_key_ct(
+    ct: &ColType,
+    value: &Value,
+    coll: Option<&Collation>,
+) -> Result<Vec<u8>> {
+    match (ct, value) {
+        (ColType::Composite { fields, .. }, Value::Composite(vals)) => {
+            encode_composite_key(fields, vals)
+        }
+        (ColType::Range(elem), Value::Range(rv)) => {
+            Ok(crate::range::encode_range_key(elem.scalar(), rv))
+        }
+        (ColType::Array(elem), Value::Array(a)) => encode_array_key(elem.scalar(), a),
+        (ColType::Scalar(s), _) => encode_key_value(*s, value, coll),
+        _ => unreachable!("ColType/Value kind mismatch in encode_key_ct (resolver-checked)"),
+    }
+}
+
+/// The order-preserving `composite-field-slots` key for a composite value (encoding.md §2.15) — the
+/// engine's **third** container key, recursing into each field's own key. Reproduces the in-memory
+/// composite sort key (composite.md §5 — lexicographic, NULLs-last per field) under `memcmp`: each
+/// field rides the §2.2 nullable slot (`0x00` present ‖ the field key, or `0x01` NULL). Because a
+/// composite is **fixed-arity** (the field count is a property of the type) it needs no terminator,
+/// so the ordinary §2.2 slot is used (unlike the variable-arity array §2.14 marker set). Every field
+/// key is self-delimiting, so the concatenation is self-delimiting and composes (nested field, index
+/// column + storage-key suffix). Recurses through [`encode_key_ct`] for a nested composite / array /
+/// range field. A composite field carries no `COLLATE`, so field keys use the `C` byte order (coll
+/// `None`).
+pub(crate) fn encode_composite_key(fields: &[ColField], vals: &[Value]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for (f, v) in fields.iter().zip(vals.iter()) {
+        match v {
+            Value::Null => out.push(0x01), // NULL slot — sorts after every present field
+            _ => {
+                out.push(0x00); // present slot
+                out.extend_from_slice(&encode_key_ct(&f.ty, v, None)?);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Whether `ty` is an **array** whose element is a key-encodable scalar — so the array is a valid
 /// `PRIMARY KEY` / index / `UNIQUE` / FK key (encoding.md §2.14, the `array-elements-terminated` rule).
 /// A `float`-element array (`f64[]`/`f32[]`) IS keyable (the §2.8 narrowing lifted — a float at rest is
-/// in-contract); only a composite-element array (composite is not yet keyable) is NOT keyable, the same
-/// narrowing the bare composite scalar key carries.
+/// in-contract); only a **composite**-element array is NOT keyable — the array key admits only scalar
+/// elements, so `array`-of-`composite` stays `0A000` even though the bare `composite` container is now
+/// itself keyable (§2.15).
 pub(crate) fn is_array_keyable(ty: &Type) -> bool {
     ty.array_element().is_some_and(is_keyable_scalar)
 }
@@ -3411,8 +3486,7 @@ pub(crate) fn is_keyable_scalar(ty: &Type) -> bool {
 /// §2.8 lift; the DDL gate rejects only a composite element `0A000`), so the per-element key is
 /// [`encode_key_value`]; an array element key uses the `C` byte order (a collated array-element key is
 /// not a feature this slice).
-pub(crate) fn encode_array_key(elem_ty: &Type, a: &ArrayVal) -> Result<Vec<u8>> {
-    let elem = elem_ty.scalar();
+pub(crate) fn encode_array_key(elem: ScalarType, a: &ArrayVal) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     for e in &a.elements {
         match e {

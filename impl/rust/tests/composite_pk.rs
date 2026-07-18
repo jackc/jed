@@ -145,14 +145,20 @@ fn ddl_errors_match_postgres_and_narrowings() {
     // scalar is keyable): a composite PK with a float member succeeds.
     db.query_outcome("CREATE TABLE fpk (a i32, s f64, PRIMARY KEY (a, s))", &[])
         .unwrap();
-    // The recursive composite container is NOT keyable (composite.md §6), so a composite PK member
-    // is still the 0A000 narrowing.
+    // The `composite` container is now keyable too (the third container key, `composite-field-slots`
+    // encoding.md §2.15 / composite.md §6): a composite-typed PK member of an all-keyable-field type
+    // succeeds. Only a composite that transitively contains an array-of-composite field stays 0A000.
     db.query_outcome("CREATE TYPE addr AS (street text, zip i32)", &[])
+        .unwrap();
+    db.query_outcome("CREATE TABLE cpk (a i32, s addr, PRIMARY KEY (a, s))", &[])
+        .unwrap();
+    assert_eq!(db.table("cpk").unwrap().pk_indices(), vec![0, 1]);
+    db.query_outcome("CREATE TYPE poly AS (name text, pts addr[])", &[])
         .unwrap();
     assert_eq!(
         err_code(
             &mut db,
-            "CREATE TABLE t (a i32, s addr, PRIMARY KEY (a, s))"
+            "CREATE TABLE t (a i32, p poly, PRIMARY KEY (a, p))"
         ),
         "0A000"
     );

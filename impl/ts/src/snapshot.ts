@@ -423,13 +423,16 @@ export class Snapshot {
       // Read every (storage key, row) pair, fully materialized (a spilled non-key value must survive
       // a rewrite; a collated key column never spills — §2.12 narrowing b).
       const store = this.store(table.name);
+      // The resolved column types (parallel to table.columns) — the vehicle a composite PK/index key
+      // encoder needs (encoding.md §2.15) when re-keying under a loaded collation.
+      const colTypes = store.columnTypes();
       const entries: Entry[] = store
         .entriesInKeyOrder()
         .map((e) => ({ key: e.key, row: store.resolveAll(e.row) }));
       // The NEW storage key per row: re-encoded under the loaded collation if the PK moved, else the
       // existing key (unchanged — includes a synthetic-rowid table, which has no PK).
       if (pkSkewed) {
-        for (const e of entries) e.key = encodePkKey(table, table.pk, colls, e.row);
+        for (const e of entries) e.key = encodePkKey(colTypes, table.pk, colls, e.row);
         this.putTable(table, pageSize); // fresh empty store (+ re-register the same table)
         const fresh = this.store(table.name);
         for (const e of entries) fresh.insert(e.key, e.row);
@@ -456,7 +459,7 @@ export class Snapshot {
         }
         const ekeys: Uint8Array[] = [];
         for (const e of entries)
-          ekeys.push(...indexEntryKeysColumns(table.columns, colls, def, e.key, e.row));
+          ekeys.push(...indexEntryKeysColumns(table.columns, colTypes, colls, def, e.key, e.row));
         ekeys.sort(compareBytes);
         const fresh = new TableStore(pagePayload(pageSize), []);
         for (const ek of ekeys) fresh.insert(ek, []);

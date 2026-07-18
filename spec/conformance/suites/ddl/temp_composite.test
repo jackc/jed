@@ -6,15 +6,16 @@
 # tree (ColType) is built against the persistent type catalog when the table is staged and is fully
 # self-contained thereafter (spec/design/composite.md §4), so the temp store needs nothing from the
 # catalog per row — and, like every temp construct, the table makes ZERO writes to the database file
-# (no format_version change). A composite column is storable but never keyable, so it cannot be a
-# PRIMARY KEY (0A000, the same scope-agnostic gate as a persistent table). DROP TYPE of a type a temp
+# (no format_version change). A composite column is a valid PRIMARY KEY on a temp table too (the same
+# scope-agnostic key gate now admits the composite container key, composite-field-slots, encoding.md
+# §2.15). DROP TYPE of a type a temp
 # table references is 2BP01 (the dependency check is scope-aware, matching the persistent case). The
 # composite semantics — ROW(...) construction, record_out rendering, field access, comparison/ordering
 # — are identical to a persistent column (validated against PG in types/composite.test); this suite
 # proves they hold on a temp table. jed-specific (the temp divergences + the
 # host-configured gate cannot be reproduced via the same SQL on PostgreSQL), so it is CROSS-CORE-checked,
 # NOT PostgreSQL-oracle-checked. Format: ../../../design/conformance.md.
-# requires: ddl.temp_table, types.composite, ddl.create_table, ddl.drop_table, ddl.primary_key, dml.insert, dml.insert_column_list, dml.insert_multi_row, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, types.i32, types.text, session.allow_temp_ddl
+# requires: ddl.temp_table, ddl.composite_key, types.composite, ddl.create_table, ddl.drop_table, ddl.primary_key, dml.insert, dml.insert_column_list, dml.insert_multi_row, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, types.i32, types.text, session.allow_temp_ddl
 
 # --- a composite column on a SESSION-LOCAL temp table: storable, rendered, field-accessible ----------
 
@@ -60,10 +61,28 @@ SELECT id FROM person ORDER BY home
 1
 3
 
-# --- a composite column cannot be a PRIMARY KEY (0A000) — the scope-agnostic key gate (§6) ----------
+# --- a composite column IS a valid PRIMARY KEY on a temp table too — the scope-agnostic key gate
+# now admits the composite container key (composite-field-slots, encoding.md §2.15 / composite.md §6),
+# so the same code path keys a temp composite PK. Fully exercised in ddl/composite_key.test. ---------
 
-statement error 0A000
-CREATE TEMP TABLE bad_pk (h addr PRIMARY KEY)
+statement ok
+CREATE TEMP TABLE keyed (h addr PRIMARY KEY)
+
+statement ok
+INSERT INTO keyed VALUES (ROW('Main', 5)), (ROW('Elm', 9))
+
+# a duplicate composite value traps 23505 on the temp table
+statement error 23505
+INSERT INTO keyed VALUES (ROW('Main', 5))
+
+query T nosort
+SELECT (h).street FROM keyed ORDER BY h
+----
+Elm
+Main
+
+statement ok
+DROP TABLE keyed
 
 # --- DROP TYPE of a type a TEMP table references is 2BP01 (the dependency check is scope-aware) ------
 

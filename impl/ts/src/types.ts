@@ -61,6 +61,14 @@ export function isText(t: ScalarType): boolean {
   return t === "text";
 }
 
+// scalarIsKeyable reports whether this scalar has an order-preserving key encoding (encoding.md §2):
+// every scalar EXCEPT json/jsonb/jsonpath (json is never comparable; the jsonb key is authored but
+// deferred, §2.13; jsonpath has no key). Used by the composite key gate (§2.15) and the container
+// element gates. Mirrors the Type-level typeIsKeyableScalar.
+export function scalarIsKeyable(t: ScalarType): boolean {
+  return t !== "json" && t !== "jsonb" && t !== "jsonpath";
+}
+
 // isBool reports whether this is the boolean type (false/true; stored as a bool-byte —
 // spec/design/types.md §9).
 export function isBool(t: ScalarType): boolean {

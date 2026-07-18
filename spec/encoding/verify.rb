@@ -297,6 +297,62 @@ def check_range_file(filename)
   checked
 end
 
+# One composite-key FIELD slot (encoding.md §2.15): `0x01` for a NULL field, else `0x00` present ‖
+# the field's own order-preserving key. `v` is an inline table naming the field's encoding — a scalar
+# (`text`/`bytea`/`i16`/`i32`/`i64`), a NESTED composite (`{ composite = [...] }`, recurses), or
+# `{ null = true }`. A composite field carries no COLLATE, so text keys use the `C` byte order.
+def enc_composite_field(v)
+  return [0x01].pack("C") if v["null"]
+
+  body =
+    if v.key?("text") then enc_terminated(v["text"].b)
+    elsif v.key?("bytea") then enc_terminated([v["bytea"]].pack("H*"))
+    elsif v.key?("i16") then enc_bare(v["i16"], 2)
+    elsif v.key?("i32") then enc_bare(v["i32"], 4)
+    elsif v.key?("i64") then enc_bare(v["i64"], 8)
+    elsif v.key?("composite") then enc_composite(v["composite"])
+    else raise "unknown composite field value #{v.inspect}"
+    end
+  [0x00].pack("C") + body
+end
+
+# The bare `composite-field-slots` key (encoding.md §2.15): the concatenation of each field's §2.2
+# slot, in declaration order. Fixed arity ⇒ no terminator. `fields` is the per-field value list.
+def enc_composite(fields) = fields.map { |f| enc_composite_field(f) }.join.b
+
+# The composite key in a NULLABLE slot (a secondary-index column / a whole-value-NULL member):
+# `0x01` for a whole-value NULL, else `0x00` present ‖ the bare composite key.
+def enc_composite_nullable(c)
+  return [0x01].pack("C") if c["null"]
+
+  [0x00].pack("C") + enc_composite(c["fields"])
+end
+
+# Verify spec/encoding/composite.toml (encoding.md §2.15): the recursive composite container key.
+# The same invariants as the range/array container paths (byte-exact + strict order, minus round-trip
+# — a key is never decoded back to a value). `bare` is the PK body, `nullable` prepends the §2.2 tag,
+# `descending` inverts the whole component.
+def check_composite_file(filename)
+  data = TomlRB.load_file(File.join(__dir__, filename))
+  checked = 0
+  [["bare", ->(c) { enc_composite(c["fields"]) }],
+   ["nullable", ->(c) { enc_composite_nullable(c) }],
+   ["descending", ->(c) { invert(enc_composite_nullable(c)) }]].each do |kind, enc|
+    (data[kind] || []).each do |group|
+      rows = []
+      group["cases"].each do |c|
+        want = c["bytes"]
+        got = hex(enc.call(c))
+        fail!("#{kind} #{group['type']} #{c['label']}: encode=#{got} want=#{want}") unless got == want
+        rows << [c["label"], [want].pack("H*").b]
+        checked += 1
+      end
+      check_order("#{kind} #{group['type']}", rows)
+    end
+  end
+  checked
+end
+
 # Verify spec/encoding/decimal.toml: the same three invariants as the terminated-escape path
 # (byte-exact + strict order, minus round-trip — a key is never decoded back to a value).
 def check_decimal_file(filename)
@@ -480,6 +536,11 @@ def main
   # IEEE bits with the sign-bit / all-bits flip. Its own file: the value is a float string (incl
   # Infinity/-Infinity/NaN), not a fixed-WIDTH integer scalar.
   checked += check_float_file("float.toml")
+
+  # Composite: the composite-field-slots container rule (§2.15) — the third container key, recursing
+  # into each field's key via the §2.2 nullable slot (fixed arity, no terminator). Its own file: a
+  # heterogeneous field-value list per case, not a scalar.
+  checked += check_composite_file("composite.toml")
 
   puts "OK: #{checked} vectors verified (round-trip + byte-exact + order)"
 end

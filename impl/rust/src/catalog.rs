@@ -468,6 +468,46 @@ pub fn resolve_col_type(ty: &Type, types: &HashMap<String, CompositeType>) -> Co
     }
 }
 
+impl ColType {
+    /// The inner scalar type (the `Scalar` arm). A container/composite reaches a scalar-only path
+    /// only after the caller branches on the arm — the resolved-type mirror of [`Type::scalar`].
+    pub fn scalar(&self) -> ScalarType {
+        match self {
+            ColType::Scalar(s) => *s,
+            ColType::Composite { name, .. } => unreachable!(
+                "composite type {name} used where a scalar was expected (spec/design/composite.md)"
+            ),
+            ColType::Array(_) => {
+                unreachable!("array type used where a scalar was expected (spec/design/array.md)")
+            }
+            ColType::Range(_) => {
+                unreachable!("range type used where a scalar was expected (spec/design/ranges.md)")
+            }
+        }
+    }
+
+    /// Whether this resolved type is **key-encodable** (spec/design/encoding.md §2.15,
+    /// spec/design/composite.md §6): every scalar, every `range`, and every scalar-element `array`
+    /// is keyable; a `composite` is keyable **iff every field is** (recursive). The one non-keyable
+    /// inner type is an **array whose element is itself a composite** — the array key admits only
+    /// scalar elements (§2.14), so an `array`-of-`composite` (whether a column or a composite field)
+    /// stays a deferred `0A000` key even now that the bare `composite` container is keyable. The
+    /// recursion terminates: the composite type graph is proven acyclic and depth-bounded
+    /// (`MAX_COMPOSITE_DEPTH`) at `CREATE TYPE` (spec/design/composite.md §3).
+    pub fn keyable(&self) -> bool {
+        match self {
+            // A scalar is keyable unless it is `json`/`jsonb`/`jsonpath` (non-keyable, §2.13).
+            ColType::Scalar(s) => s.is_keyable(),
+            // A range's element is always a keyable scalar subtype (spec/design/ranges.md §2).
+            ColType::Range(_) => true,
+            // A scalar-element array is keyable (`float` included); an array-of-composite is not
+            // (the array key admits only scalar elements, §2.14).
+            ColType::Array(elem) => matches!(**elem, ColType::Scalar(s) if s.is_keyable()),
+            ColType::Composite { fields, .. } => fields.iter().all(|f| f.ty.keyable()),
+        }
+    }
+}
+
 impl Table {
     /// Index of the named column (case-insensitive), if present.
     pub fn column_index(&self, name: &str) -> Option<usize> {

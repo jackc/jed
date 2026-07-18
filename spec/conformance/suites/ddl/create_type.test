@@ -6,11 +6,12 @@
 # composites (a field typed as another composite) are supported by name.
 #
 # Errors: duplicate type 42710, unknown field type 42704, duplicate field 42701, DROP with
-# dependents (RESTRICT) 2BP01, DROP missing 42704 (unless IF EXISTS). The PG-divergent records
-# sit LAST with ledger overrides (conformance.md §5): a composite PRIMARY KEY and DROP ... CASCADE
-# both succeed in PostgreSQL but are 0A000 in jed this slice.
+# dependents (RESTRICT) 2BP01, DROP missing 42704 (unless IF EXISTS). A composite PRIMARY KEY now
+# succeeds (the composite-field-slots container key, encoding.md §2.15 — exercised fully in
+# ddl/composite_key.test); the one PG-divergent record left is DROP ... CASCADE (0A000 in jed,
+# succeeds in PG — a ledger override, conformance.md §5).
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.drop_table, types.composite, types.i32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_key, ddl.drop_table, types.composite, types.i32, types.text, resource.cost_metering
 
 # A composite type is created and lives in the catalog.
 statement ok
@@ -65,10 +66,14 @@ DROP TYPE point
 statement ok
 CREATE TYPE addr AS (street text, zip i32)
 
-# A composite PRIMARY KEY is not supported (the order-preserving composite key encoding is authored
-# but unexercised — composite.md §6). PostgreSQL allows it; jed rejects 0A000.
-statement error 0A000
+# A composite PRIMARY KEY IS supported now — the order-preserving composite key (composite-field-slots,
+# encoding.md §2.15 / composite.md §6) landed as the third container key, matching PostgreSQL. The
+# composite-key surface is exercised in ddl/composite_key.test.
+statement ok
 CREATE TABLE p (home addr PRIMARY KEY)
+
+statement ok
+DROP TABLE p
 
 # DROP TYPE ... CASCADE is not supported (RESTRICT-only this slice). PostgreSQL drops with CASCADE.
 statement error 0A000

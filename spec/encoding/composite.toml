@@ -1,0 +1,65 @@
+# Order-preserving key-encoding vectors for the `composite` container — method
+# `composite-field-slots` (../design/encoding.md §2.15). Composite is the engine's THIRD container
+# key (after `range` §2.11 and `array` §2.14) and, unlike them, FIXED-arity: the field count is a
+# property of the type, so each field simply rides the ordinary §2.2 nullable slot (`0x00` present ‖
+# the field's own order-preserving key, or `0x01` NULL) with NO terminator. The whole key is
+# self-delimiting, so `memcmp` reproduces the composite sort key (composite.md §5 — lexicographic,
+# NULLs-last per field). Keys never round-trip (the row body holds the value), so only encode +
+# byte-exactness + strict order are checked (verify.rb).
+#
+# Each case's `fields` is the per-field value list (declaration order), an inline table per field
+# naming its encoding: `{ text = "…" }`, `{ i16/i32/i64 = N }`, `{ null = true }` (a NULL field), or
+# `{ composite = [ …fields… ] }` (a NESTED composite field — recurses). Groups are in ascending
+# logical (= byte) order, so the order invariant is a walk of the list.
+
+schema_version = 1
+
+# --- addr AS (street text, zip i32) — the worked example (encoding.md §2.15) --------------------
+# The bare PRIMARY-KEY form (no outer presence tag — a PK is NOT NULL): slot(street) ‖ slot(zip).
+# text is `text-terminated-escape` (§2.4), i32 the 4-byte `int-be-signflip` (§2.1). Ascending:
+# '' < 'Elm' < 'Main'; within 'Main', zip 5 < 90210; a present zip sorts before a NULL zip (last).
+[[bare]]
+type = "addr"
+cases = [
+  { label = "('',-1)",       fields = [ { text = "" },     { i32 = -1 } ],    bytes = "000001007fffffff" },
+  { label = "('Elm',100)",   fields = [ { text = "Elm" },  { i32 = 100 } ],   bytes = "00456c6d00010080000064" },
+  { label = "('Main',5)",    fields = [ { text = "Main" }, { i32 = 5 } ],     bytes = "004d61696e00010080000005" },
+  { label = "('Main',90210)",fields = [ { text = "Main" }, { i32 = 90210 } ], bytes = "004d61696e00010080016062" },
+  { label = "('Main',NULL)", fields = [ { text = "Main" }, { null = true } ], bytes = "004d61696e000101" },
+]
+
+# --- line AS (a addr, b addr) — a NESTED composite (recursion) ----------------------------------
+# Each field is itself an `addr`, framed in its own §2.2 slot then the recursive composite body.
+# Ascending: a present first field sorts before a NULL first field (last); within present, by the
+# nested `addr` body (the second nested field's zip breaks the ('Main',1)/('Elm',_) tie).
+[[bare]]
+type = "line"
+cases = [
+  { label = "((Main,1),(Elm,2))", fields = [ { composite = [ { text = "Main" }, { i32 = 1 } ] }, { composite = [ { text = "Elm" }, { i32 = 2 } ] } ], bytes = "00004d61696e000100800000010000456c6d00010080000002" },
+  { label = "((Main,1),(Elm,3))", fields = [ { composite = [ { text = "Main" }, { i32 = 1 } ] }, { composite = [ { text = "Elm" }, { i32 = 3 } ] } ], bytes = "00004d61696e000100800000010000456c6d00010080000003" },
+  { label = "(NULL,(Elm,2))",     fields = [ { null = true },                                    { composite = [ { text = "Elm" }, { i32 = 2 } ] } ], bytes = "010000456c6d00010080000002" },
+]
+
+# --- addr in a NULLABLE slot (a composite secondary-index column / a nested composite member) ---
+# The whole composite rides the §2.2 slot: `0x00` present ‖ the bare key, or `0x01` for a whole-value
+# NULL. A whole-value NULL sorts LAST (present `0x00` < NULL `0x01`).
+[[nullable]]
+type = "addr"
+cases = [
+  { label = "('',-1)",     fields = [ { text = "" },     { i32 = -1 } ],  bytes = "00000001007fffffff" },
+  { label = "('Elm',100)", fields = [ { text = "Elm" },  { i32 = 100 } ], bytes = "0000456c6d00010080000064" },
+  { label = "('Main',5)",  fields = [ { text = "Main" }, { i32 = 5 } ],   bytes = "00004d61696e00010080000005" },
+  { label = "NULL",        null = true,                                   bytes = "01" },
+]
+
+# --- addr descending (the §2.3 whole-key bitwise inversion of the nullable form) ----------------
+# Inverting every byte reverses `memcmp`, so a whole-value NULL (`0xfe`) lifts to FIRST and present
+# values sort in the mirror order.
+[[descending]]
+type = "addr"
+cases = [
+  { label = "NULL",       null = true,                                   bytes = "fe" },
+  { label = "('Main',5)", fields = [ { text = "Main" }, { i32 = 5 } ],   bytes = "ffffb29e9691fffeff7ffffffa" },
+  { label = "('Elm',100)",fields = [ { text = "Elm" },  { i32 = 100 } ], bytes = "ffffba9392fffeff7fffff9b" },
+  { label = "('',-1)",    fields = [ { text = "" },     { i32 = -1 } ],  bytes = "fffffffeff80000000" },
+]

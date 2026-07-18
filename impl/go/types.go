@@ -211,6 +211,16 @@ func (t scalarType) IsJsonb() bool { return t == scalarJsonb }
 // IsJsonPath reports whether this is the jsonpath type.
 func (t scalarType) IsJsonPath() bool { return t == scalarJsonPath }
 
+// IsKeyable reports whether this scalar has an order-preserving key encoding (encoding.md §2): every
+// scalar EXCEPT json/jsonb/jsonpath (json is never comparable; the jsonb key is authored but
+// deferred, §2.13; jsonpath has no key). Used by the composite key gate (§2.15) and the container
+// element gates. Mirrors isKeyableScalarType.
+func (t scalarType) IsKeyable() bool {
+	return t.IsInteger() || t.IsBool() || t.IsText() || t.IsBytea() || t.IsDecimal() ||
+		t.IsUuid() || t.IsTimestamp() || t.IsTimestamptz() || t.IsDate() || t.IsInterval() ||
+		t.IsFloat()
+}
+
 // IsFloat32 reports whether this is the binary32 float type (real).
 func (t scalarType) IsFloat32() bool { return t == scalarFloat32 }
 

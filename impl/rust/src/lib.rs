@@ -161,6 +161,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "ddl.primary_key",
     // Table-level PRIMARY KEY (a, b, ...) — composite keys (constraints.md §3).
     "ddl.composite_primary_key",
+    "ddl.composite_key",
     // CHECK constraints — row predicates enforced at INSERT/UPDATE, 23514 (constraints.md §4).
     "ddl.check",
     // FOREIGN KEY constraints — referential integrity enforced at every write, 23503; referenced

@@ -183,6 +183,32 @@ impl ScalarType {
         matches!(self, ScalarType::Jsonb)
     }
 
+    /// Whether this scalar has an order-preserving **key** encoding (spec/design/encoding.md §2):
+    /// every scalar **except** `json`/`jsonb`/`jsonpath` (json is never comparable; the jsonb key
+    /// is authored but deferred, §2.13; jsonpath has no key). Used by the composite key gate (§2.15)
+    /// and the container-element gates — a composite field or an array element of a non-keyable
+    /// scalar makes the whole key `0A000`. Explicit inclusion so a new scalar opts in deliberately;
+    /// mirrors the `Type`-level [`is_keyable_scalar`](crate::executor::is_keyable_scalar).
+    pub fn is_keyable(self) -> bool {
+        matches!(
+            self,
+            ScalarType::Int16
+                | ScalarType::Int32
+                | ScalarType::Int64
+                | ScalarType::Text
+                | ScalarType::Bool
+                | ScalarType::Decimal
+                | ScalarType::Bytea
+                | ScalarType::Uuid
+                | ScalarType::Timestamp
+                | ScalarType::Timestamptz
+                | ScalarType::Interval
+                | ScalarType::Float32
+                | ScalarType::Float64
+                | ScalarType::Date
+        )
+    }
+
     /// Whether this is the `f32` (binary32) type.
     pub fn is_float32(self) -> bool {
         matches!(self, ScalarType::Float32)

@@ -453,6 +453,34 @@ type colField struct {
 // ScalarColType wraps a scalar type as a (scalar) ColType.
 func scalarColType(s scalarType) colType { return colType{Scalar: s} }
 
+// keyable reports whether this resolved type is key-encodable (encoding.md §2.15, composite.md §6):
+// every scalar (except json/jsonb/jsonpath), every range, and every scalar-element array is keyable;
+// a composite is keyable iff EVERY field is (recursive). The one non-keyable inner type is an array
+// whose element is itself a composite — the array key admits only scalar elements (§2.14) — so an
+// array-of-composite (column or composite field) stays a deferred 0A000 key even now that the bare
+// composite container is keyable. Terminates: the composite type graph is proven acyclic and
+// depth-bounded (MAX_COMPOSITE_DEPTH) at CREATE TYPE (spec/design/composite.md §3).
+func (ct colType) keyable() bool {
+	switch {
+	case ct.Composite:
+		for _, f := range ct.Fields {
+			if !f.Type.keyable() {
+				return false
+			}
+		}
+		return true
+	case ct.RangeElem != nil:
+		// A range's element is always a keyable scalar subtype (spec/design/ranges.md §2).
+		return true
+	case ct.Elem != nil:
+		// A scalar-element array is keyable (float included); an array-of-composite is not.
+		return ct.Elem.Composite == false && ct.Elem.RangeElem == nil && ct.Elem.Elem == nil &&
+			ct.Elem.Scalar.IsKeyable()
+	default:
+		return ct.Scalar.IsKeyable()
+	}
+}
+
 // ResolveColType resolves a catalog Type into a self-contained ColType against the database's
 // composite definitions (keyed by lowercased name, the Snapshot.types map). A composite reference is
 // looked up case-insensitively and recursively resolved; the lookup is guaranteed to succeed because

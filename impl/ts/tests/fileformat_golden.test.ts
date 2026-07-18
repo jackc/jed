@@ -775,6 +775,22 @@ function compositeTypeTableDB(): Engine {
   return db;
 }
 
+// compositeKeyTableDB: a composite-TYPED column used as the PRIMARY KEY (the third container key,
+// composite-field-slots, encoding.md §2.15 / composite.md §6) — distinct from compositePkTableDB (a
+// flat tuple of scalars). The stored key is the per-field §2.2 nullable slots. Rows are INSERTed in
+// ascending composite-key order (lexicographic — street, then zip breaking the 'Main' tie); the tree
+// shape is insertion-order sensitive.
+function compositeKeyTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TYPE addr AS (street text NOT NULL, zip i32 NOT NULL)");
+  run(db, "CREATE TABLE t (id i32, home addr, PRIMARY KEY (home))");
+  run(db, "INSERT INTO t VALUES (1, ROW('', -1))");
+  run(db, "INSERT INTO t VALUES (2, ROW('Elm', 100))");
+  run(db, "INSERT INTO t VALUES (3, ROW('Main', 5))");
+  run(db, "INSERT INTO t VALUES (4, ROW('Main', 90210))");
+  return db;
+}
+
 // arrayCompositeTableDB: a composite type used as an array ELEMENT type (array-of-composite, array.md
 // §12 AC1). The catalog array-column entry carries a composite element descriptor (element_type_code
 // 14 + "addr") and the value body recurses (an array body whose elements are composite bodies). Row
@@ -966,6 +982,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "gin_uuid_table.jed", build: ginUuidTableDB },
     { name: "fk_table.jed", build: fkTableDB },
     { name: "composite_type_table.jed", build: compositeTypeTableDB },
+    { name: "composite_key_table.jed", build: compositeKeyTableDB },
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB },
     { name: "sequence_table.jed", build: sequenceTableDB },
     { name: "serial_table.jed", build: serialTableDB },
@@ -1038,6 +1055,7 @@ test("read goldens reproduces rows", () => {
     { name: "gin_uuid_table.jed", build: ginUuidTableDB, table: "t" },
     { name: "fk_table.jed", build: fkTableDB, table: "c" },
     { name: "composite_type_table.jed", build: compositeTypeTableDB, table: "t" },
+    { name: "composite_key_table.jed", build: compositeKeyTableDB, table: "t" },
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB, table: "t" },
     { name: "sequence_table.jed", build: sequenceTableDB, table: "t" },
     { name: "serial_table.jed", build: serialTableDB, table: "t" },

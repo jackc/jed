@@ -87,13 +87,18 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
     );
   }
   // f64 IS now a key-encodable PK member (the float-order-preserving key, encoding.md §2.8 — every
-  // scalar is keyable); only the recursive composite container is NOT (composite.md §6).
+  // scalar is keyable); and the composite container is keyable too (the third container key,
+  // composite-field-slots, encoding.md §2.15 / composite.md §6). Only a composite transitively
+  // containing an array-of-composite field stays 0A000.
   {
     const db = memDb().session();
     db.execute("CREATE TABLE fpk (a i32, s f64, PRIMARY KEY (a, s))");
     db.execute("CREATE TYPE addr AS (street text, zip i32)");
+    db.execute("CREATE TABLE cpk (a i32, s addr, PRIMARY KEY (a, s))");
+    assert.deepEqual(pkIndices(db.table("cpk")!), [0, 1]);
+    db.execute("CREATE TYPE poly AS (name text, pts addr[])");
     assert.equal(
-      errCode(() => db.execute("CREATE TABLE t (a i32, s addr, PRIMARY KEY (a, s))")),
+      errCode(() => db.execute("CREATE TABLE t (a i32, p poly, PRIMARY KEY (a, p))")),
       "0A000",
     );
   }

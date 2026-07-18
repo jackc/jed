@@ -95,12 +95,15 @@ selects it.
 `CREATE INDEX [name] ON table (column)` builds an ordered B-tree over the column. It accelerates
 equality lookups — `WHERE column = …` — by seeking instead of scanning the whole table. The
 `PRIMARY KEY` is itself an index, and a `UNIQUE` constraint is backed by a unique index. The
-indexed column must be a key-encodable type (the integer widths, `boolean`, `uuid`, `timestamp`,
-`timestamptz`, `date`, `interval`, the variable-width `text`/`bytea`/`numeric`, and a **`range`**
-type — the first *container* key, which sorts by the same total order as `<`/`ORDER BY`), plus
-`f32`/`f64` through jed's byte-pinned total float order. An `interval` key sorts by
+indexed column must be a key-encodable type: the integer widths, `boolean`, `uuid`, `timestamp`,
+`timestamptz`, `date`, `interval`, the variable-width `text`/`bytea`/`numeric`, `f32`/`f64`
+(through jed's byte-pinned total float order), and the three **container** keys — a **`range`**, an
+**`array`** of a key-encodable scalar, and a **composite** (`CREATE TYPE`) whose fields are all
+key-encodable — each sorting by the same total order as `<`/`ORDER BY`. An `interval` key sorts by
 its canonical span, so `INTERVAL '1 mon'` and `INTERVAL '30 days'` index as one value; likewise a
 discrete `range` is stored canonical, so `'[1,4]'::int4range` and `'[1,5)'::int4range` index as one.
+A composite value keys by each field's own key in order (NULLs last per field). The one type that
+still cannot be a key is an **array whose element is a composite**.
 
 The `city` table below indexes its `region` code (`1` = Asia, `2` = Europe). Run the lookup, then
 edit the `WHERE` to `region = 2` — the selective equality chooses the index and narrows the scan to

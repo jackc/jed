@@ -789,6 +789,22 @@ func compositeTypeTableDB(t *testing.T) *Session {
 	return db
 }
 
+// compositeKeyTableDB has a composite-TYPED column as the PRIMARY KEY (the third container key,
+// composite-field-slots, encoding.md §2.15 / composite.md §6) — distinct from compositePkTableDB (a
+// flat tuple of scalar columns). The stored key is the per-field §2.2 nullable slots. Rows are
+// INSERTed in ascending composite-key order (lexicographic — street, then zip breaking the 'Main'
+// tie); the tree shape is insertion-order sensitive.
+func compositeKeyTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	run(t, db, "CREATE TYPE addr AS (street text NOT NULL, zip i32 NOT NULL)")
+	run(t, db, "CREATE TABLE t (id i32, home addr, PRIMARY KEY (home))")
+	run(t, db, "INSERT INTO t VALUES (1, ROW('', -1))")
+	run(t, db, "INSERT INTO t VALUES (2, ROW('Elm', 100))")
+	run(t, db, "INSERT INTO t VALUES (3, ROW('Main', 5))")
+	run(t, db, "INSERT INTO t VALUES (4, ROW('Main', 90210))")
+	return db
+}
+
 // arrayCompositeTableDB has a composite type used as an array ELEMENT type (array-of-composite,
 // array.md §12 AC1): the catalog array-column entry carries a composite element descriptor
 // (element_type_code 14 + "addr") and the value body recurses (an array body whose elements are
@@ -958,6 +974,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"gin_uuid_table.jed", ginUuidTableDB},
 		{"fk_table.jed", fkTableDB},
 		{"composite_type_table.jed", compositeTypeTableDB},
+		{"composite_key_table.jed", compositeKeyTableDB},
 		{"nested_composite_table.jed", nestedCompositeTableDB},
 		{"array_table.jed", arrayTableDB},
 		{"range_table.jed", rangeTableDB},
@@ -1034,6 +1051,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"gin_uuid_table.jed", ginUuidTableDB, "t"},
 		{"fk_table.jed", fkTableDB, "c"},
 		{"composite_type_table.jed", compositeTypeTableDB, "t"},
+		{"composite_key_table.jed", compositeKeyTableDB, "t"},
 		{"nested_composite_table.jed", nestedCompositeTableDB, "t"},
 		{"array_table.jed", arrayTableDB, "t"},
 		{"range_table.jed", rangeTableDB, "t"},

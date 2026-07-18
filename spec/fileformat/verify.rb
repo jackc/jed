@@ -226,6 +226,23 @@ COMPOSITE_TYPE_TABLE = {
              rows: [[1, ["Main", 90210]], [2, ["Oak", nil]]] }]
 }.freeze
 
+# A table whose PRIMARY KEY is a COMPOSITE-TYPED column (the third container key,
+# `composite-field-slots`, ../design/encoding.md §2.15 / composite.md §6) — distinct from the
+# multi-column COMPOSITE_PK_TABLE below (a flat tuple of scalar columns). The stored key is the
+# concatenation of the per-field §2.2 nullable slots: `0x00`‖text-terminated-escape(street) then
+# `0x00`‖int-be-signflip(zip) — a recursive container key, self-delimiting by fixed arity (no
+# terminator). Rows are listed in ascending composite-sort-key order (lexicographic — street, then
+# zip breaking the 'Main' tie); the cores INSERT in this order (the tree shape is order-sensitive).
+# The cores build this via
+#   CREATE TYPE addr AS (street text NOT NULL, zip i32 NOT NULL)
+#   CREATE TABLE t (id i32, home addr, PRIMARY KEY (home))
+#   INSERT (1, ROW('', -1)); (2, ROW('Elm', 100)); (3, ROW('Main', 5)); (4, ROW('Main', 90210))
+COMPOSITE_KEY_TABLE = {
+  types: [ctype("addr", [field("street", "text", not_null: true), field("zip", "i32", not_null: true)])],
+  tables: [{ name: "t", columns: [col("id", "i32"), col("home", "addr", pk: true)],
+             rows: [[1, ["", -1]], [2, ["Elm", 100]], [3, ["Main", 5]], [4, ["Main", 90210]]] }]
+}.freeze
+
 # Nested composite types (a field whose type is another composite — persisted by NAME) used by a
 # stored column. `line` sorts BEFORE `point` but references it, so the two-pass load (collect all,
 # then resolve) is exercised: a single name-ordered pass would meet `line`'s reference before
@@ -1256,6 +1273,8 @@ FIXTURES = [
   { file: "jsonb_table.jed", page_size: 256, tables: [JSONB_TABLE] },
   { file: "composite_type_table.jed", page_size: 256,
     types: COMPOSITE_TYPE_TABLE[:types], tables: COMPOSITE_TYPE_TABLE[:tables] },
+  { file: "composite_key_table.jed", page_size: 256,
+    types: COMPOSITE_KEY_TABLE[:types], tables: COMPOSITE_KEY_TABLE[:tables] },
   { file: "array_composite_table.jed", page_size: 256,
     types: ARRAY_COMPOSITE_TABLE[:types], tables: ARRAY_COMPOSITE_TABLE[:tables] },
   { file: "composite_array_field_table.jed", page_size: 256,
@@ -1440,6 +1459,10 @@ def key_body(type, v, collation = nil)
     return encode_array_key(aelem, v)
   end
 
+  if (cfields = composite_fields(type))
+    return encode_composite_key(cfields, v)
+  end
+
   return collated_sort_key(collation, v) if collation && type == "text"
 
   case type
@@ -1598,6 +1621,25 @@ def encode_array_key(elem, val)
   out << [0x00].pack("C") # terminator — a shorter element list sorts before a longer one
   out << [dims.size].pack("C") # ndim
   dims.each_with_index { |d, i| out << u32(d) << encode_int(4, lbounds[i]) }
+  out
+end
+
+# The composite-field-slots key for a composite value (encoding.md §2.15, the third container key).
+# `fields` is the resolved field list ({name:, type:}), `vals` the per-field values (declaration
+# order). Each field rides the ordinary §2.2 nullable slot — `0x00` present ‖ the field's own
+# order-preserving key, or `0x01` NULL. A composite is FIXED-arity (field count known from the type),
+# so it needs no terminator (unlike the variable-arity array above). Recurses through `key_body` for
+# a nested composite / array / range field; a composite field carries no COLLATE, so the C byte order.
+def encode_composite_key(fields, vals)
+  out = +"".b
+  fields.each_with_index do |f, i|
+    if vals[i].nil?
+      out << [0x01].pack("C") # NULL slot — sorts after every present field
+    else
+      out << [0x00].pack("C") # present slot
+      out << key_body(f[:type], vals[i])
+    end
+  end
   out
 end
 

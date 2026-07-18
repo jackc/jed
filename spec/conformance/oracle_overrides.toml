@@ -335,14 +335,6 @@ file = "types/float.test"
 sql = "CREATE TABLE bad (k f64 PRIMARY KEY)"
 reason = "jed: a float PRIMARY KEY is rejected this slice (0A000), the documented narrowing every non-integer type takes — the float-order-preserving key encoding is authored but unexercised (float.md §10, encoding.md §2.8). PostgreSQL allows a double precision primary key."
 
-# --- composite types: a composite PRIMARY KEY is rejected this slice (composite.md §6). The
-# order-preserving composite key encoding is authored (encoding.md §2.10) but unexercised — the same
-# staged narrowing every non-integer key type takes. PostgreSQL allows a composite primary key.
-[[override]]
-file = "ddl/create_type.test"
-sql = "CREATE TABLE p (home addr PRIMARY KEY)"
-reason = "jed: a composite PRIMARY KEY is rejected this slice (0A000) — the composite key encoding is authored but unexercised (composite.md §6, encoding.md §2.10), the text/decimal/bytea-PK precedent. PostgreSQL allows a composite-typed primary key."
-
 # --- DROP TYPE ... CASCADE is not supported this slice (RESTRICT-only — composite.md §7). PG drops
 # the type and everything depending on it; jed rejects CASCADE 0A000 (RESTRICT is the only behavior).
 [[override]]

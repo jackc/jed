@@ -59,6 +59,7 @@ import type {
 import { cteBodyAsQuery, cteBodyIsDataModifying, emptySeqOptions } from "./ast.ts";
 import {
   type CheckConstraint,
+  type ColField,
   type ColType,
   type Column,
   type CompositeField,
@@ -85,6 +86,8 @@ import {
   seqDataTypePgName,
   seqDataTypeRange,
   primaryKeyIndex,
+  colTypeKeyable,
+  colTypeScalar,
   resolveColType,
 } from "./catalog.ts";
 import { Meter } from "./cost.ts";
@@ -2061,6 +2064,19 @@ export class Engine {
   // composite-element array literal (array-of-composite, array.md §12 AC1).
   colTypeOf(ty: Type): ColType {
     return resolveColType(ty, this.readSnap().types);
+  }
+
+  // typeIsKeyable reports whether a resolved column Type is key-encodable — usable as a PRIMARY KEY /
+  // ordered secondary index / UNIQUE member (spec/design/encoding.md §2). The keyable scalars, the
+  // range container, a scalar-element array (typeIsArrayKeyable), or a composite whose fields are ALL
+  // keyable (recursive, §2.15 — resolved against the current snapshot's type catalog; an
+  // array-of-composite field makes it unkeyable). The single gate every PK / UNIQUE / CREATE INDEX
+  // site calls.
+  typeIsKeyable(ty: Type): boolean {
+    if (ty.kind === "composite") return colTypeKeyable(this.colTypeOf(ty));
+    if (ty.kind === "array") return typeIsArrayKeyable(ty);
+    if (ty.kind === "range") return true;
+    return typeIsKeyableScalar(ty);
   }
 
   // tableNames is the canonical name of every table in the visible snapshot, sorted ascending
@@ -4864,19 +4880,7 @@ export class Engine {
         // recursive composite container. timestamp / timestamptz / date share the i64/i32 int-be-signflip
         // key (timestamp.md §6).
         if (
-          !typeIsInteger(colType) &&
-          !typeIsBoolean(colType) &&
-          !typeIsText(colType) &&
-          !typeIsBytea(colType) &&
-          !typeIsDecimal(colType) &&
-          !typeIsUuid(colType) &&
-          !typeIsTimestamp(colType) &&
-          !typeIsTimestamptz(colType) &&
-          !typeIsDate(colType) &&
-          !typeIsInterval(colType) &&
-          !typeIsFloat(colType) &&
-          !typeIsRange(colType) &&
-          !typeIsArrayKeyable(colType)
+          !this.typeIsKeyable(colType)
         ) {
           throw engineError(
             "feature_not_supported",
@@ -5083,19 +5087,7 @@ export class Engine {
       for (const i of indices) {
         const ty = columns[i]!.type;
         if (
-          !typeIsInteger(ty) &&
-          !typeIsBoolean(ty) &&
-          !typeIsText(ty) &&
-          !typeIsBytea(ty) &&
-          !typeIsDecimal(ty) &&
-          !typeIsUuid(ty) &&
-          !typeIsTimestamp(ty) &&
-          !typeIsTimestamptz(ty) &&
-          !typeIsDate(ty) &&
-          !typeIsInterval(ty) &&
-          !typeIsFloat(ty) &&
-          !typeIsRange(ty) &&
-          !typeIsArrayKeyable(ty)
+          !this.typeIsKeyable(ty)
         ) {
           throw engineError(
             "feature_not_supported",
@@ -5135,19 +5127,7 @@ export class Engine {
       for (const i of indices) {
         const ty = columns[i]!.type;
         if (
-          !typeIsInteger(ty) &&
-          !typeIsBoolean(ty) &&
-          !typeIsText(ty) &&
-          !typeIsBytea(ty) &&
-          !typeIsDecimal(ty) &&
-          !typeIsUuid(ty) &&
-          !typeIsTimestamp(ty) &&
-          !typeIsTimestamptz(ty) &&
-          !typeIsDate(ty) &&
-          !typeIsInterval(ty) &&
-          !typeIsFloat(ty) &&
-          !typeIsRange(ty) &&
-          !typeIsArrayKeyable(ty)
+          !this.typeIsKeyable(ty)
         ) {
           throw engineError(
             "feature_not_supported",
@@ -5704,6 +5684,14 @@ export class Engine {
     return table.indexes.map((d) => this.resolveIndex(table, d, ptypes));
   }
 
+  // colTypesFor resolves the given columns to their self-contained ColTypes against the current
+  // snapshot's composite definitions — the vehicle a composite PK/index key encoder needs (encoding.md
+  // §2.15). Cheap for the common (scalar/container) case; a composite column resolves its field tree.
+  colTypesFor(columns: Column[]): ColType[] {
+    const types = this.readSnap().types;
+    return columns.map((c) => resolveColType(c.type, types));
+  }
+
   // indexEntries is a row's secondary-index entry keys for maintenance (spec/design/indexes.md §4),
   // building the unmetered eval env internally (an index expression is immutable). Callers compute all
   // entries through this before mutating a store.
@@ -5716,6 +5704,7 @@ export class Engine {
   ): Uint8Array[] {
     return indexEntryKeys(
       columns,
+      this.colTypesFor(columns),
       colls,
       rindex,
       storageKey,
@@ -5732,7 +5721,13 @@ export class Engine {
     rindex: ResolvedIndex,
     row: Row,
   ): Uint8Array | null {
-    return indexPrefixKey(columns, colls, rindex, row, this.maintenanceEnv(new StmtRng()));
+    return indexPrefixKey(
+      this.colTypesFor(columns),
+      colls,
+      rindex,
+      row,
+      this.maintenanceEnv(new StmtRng()),
+    );
   }
 
   // arbiterProbeKey is a candidate row's arbiter key for ON CONFLICT (spec/design/upsert.md §3),
@@ -5745,7 +5740,15 @@ export class Engine {
     rindexes: ResolvedIndex[],
     row: Row,
   ): Uint8Array | null {
-    return arbiterKey(arb, table, pk, colls, rindexes, row, this.maintenanceEnv(new StmtRng()));
+    return arbiterKey(
+      arb,
+      this.colTypesFor(table.columns),
+      pk,
+      colls,
+      rindexes,
+      row,
+      this.maintenanceEnv(new StmtRng()),
+    );
   }
 
   // resolveDefaultExprs resolves each column's EXPRESSION default (constraints.md §2) to an
@@ -6299,9 +6302,7 @@ export class Engine {
                 );
               const type = table.columns[ci]!.type;
               if (
-                type.kind === "composite" ||
-                (type.kind === "array" && !typeIsArrayKeyable(type)) ||
-                (type.kind !== "array" && type.kind !== "range" && !typeIsKeyableScalar(type))
+                !this.typeIsKeyable(type)
               )
                 throw engineError(
                   "feature_not_supported",
@@ -6409,19 +6410,7 @@ export class Engine {
               for (const ci of cols) {
                 const ty = table.columns[ci]!.type;
                 if (
-                  !typeIsInteger(ty) &&
-                  !typeIsBoolean(ty) &&
-                  !typeIsText(ty) &&
-                  !typeIsBytea(ty) &&
-                  !typeIsDecimal(ty) &&
-                  !typeIsUuid(ty) &&
-                  !typeIsTimestamp(ty) &&
-                  !typeIsTimestamptz(ty) &&
-                  !typeIsDate(ty) &&
-                  !typeIsInterval(ty) &&
-                  !typeIsFloat(ty) &&
-                  !typeIsRange(ty) &&
-                  !typeIsArrayKeyable(ty)
+                  !this.typeIsKeyable(ty)
                 )
                   throw engineError(
                     "feature_not_supported",
@@ -6694,11 +6683,7 @@ export class Engine {
               );
               if (
                 oldColumn.primaryKey &&
-                (target.type.kind === "composite" ||
-                  (target.type.kind === "array" && !typeIsArrayKeyable(target.type)) ||
-                  (target.type.kind !== "array" &&
-                    target.type.kind !== "range" &&
-                    !typeIsKeyableScalar(target.type)))
+                (!this.typeIsKeyable(target.type))
               )
                 throw engineError(
                   "feature_not_supported",
@@ -6923,7 +6908,7 @@ export class Engine {
         const key = pkRekeyed
           ? table.pk.length === 0
             ? encodeInt("i64", rewriteNextRowid++)
-            : encodePkKey(table, table.pk, colls, row)
+            : encodePkKey(rewriteColTypes!, table.pk, colls, row)
           : entry.key;
         if (pkRekeyed) {
           const hash = Array.from(key).join(",");
@@ -7261,19 +7246,7 @@ export class Engine {
           `multiple primary keys for table ${table.name} are not allowed`,
         );
       if (
-        !typeIsInteger(type) &&
-        !typeIsBoolean(type) &&
-        !typeIsText(type) &&
-        !typeIsBytea(type) &&
-        !typeIsDecimal(type) &&
-        !typeIsUuid(type) &&
-        !typeIsTimestamp(type) &&
-        !typeIsTimestamptz(type) &&
-        !typeIsDate(type) &&
-        !typeIsInterval(type) &&
-        !typeIsFloat(type) &&
-        !typeIsRange(type) &&
-        !typeIsArrayKeyable(type)
+        !this.typeIsKeyable(type)
       )
         throw engineError(
           "feature_not_supported",
@@ -7561,19 +7534,7 @@ export class Engine {
           }
         }
       } else if (
-        !typeIsInteger(ty) &&
-        !typeIsBoolean(ty) &&
-        !typeIsText(ty) &&
-        !typeIsBytea(ty) &&
-        !typeIsDecimal(ty) &&
-        !typeIsUuid(ty) &&
-        !typeIsTimestamp(ty) &&
-        !typeIsTimestamptz(ty) &&
-        !typeIsDate(ty) &&
-        !typeIsInterval(ty) &&
-        !typeIsFloat(ty) &&
-        !typeIsRange(ty) &&
-        !typeIsArrayKeyable(ty)
+        !this.typeIsKeyable(ty)
       ) {
         throw engineError(
           "feature_not_supported",
@@ -7728,7 +7689,7 @@ export class Engine {
       // value; the evaluator's Unfetched backstop also handles it).
       const row = store.resolveInlineColumns(e.row);
       if (def.unique) {
-        const prefix = indexPrefixKey(columns, colls, rindex, row, env);
+        const prefix = indexPrefixKey(store.columnTypes(), colls, rindex, row, env);
         if (prefix !== null) {
           const k = prefix.join(",");
           if (seenPrefixes.has(k)) {
@@ -7737,7 +7698,7 @@ export class Engine {
           seenPrefixes.add(k);
         }
       }
-      entries.push(...indexEntryKeys(columns, colls, rindex, e.key, row, env));
+      entries.push(...indexEntryKeys(columns, store.columnTypes(), colls, rindex, e.key, row, env));
     }
     meter.guard();
 
@@ -9310,7 +9271,7 @@ export class Engine {
       if (pk.length > 0) {
         // The composite key is the concatenation of the members' bare encodings in key order
         // (encoding.md §2.3 — encodePkKey); a single-column key is the one-member case.
-        key = encodePkKey(table, pk, colls, row);
+        key = encodePkKey(colTypes, pk, colls, row);
         // The PK's 23505 reports PostgreSQL's derived auto-name for the PK index,
         // `<table>_pkey` — jed persists/reserves no such relation (constraints.md §5.4).
         const seen = key.join(",");
@@ -9326,7 +9287,7 @@ export class Engine {
       // PK duplicate check (cost.md §3).
       for (let u = 0; u < uniqDefs.length; u++) {
         const def = uniqDefs[u]!;
-        const prefix = indexPrefixKey(table.columns, colls, def, row, env);
+        const prefix = indexPrefixKey(colTypes, colls, def, row, env);
         if (prefix === null) continue;
         const istore = this.lkpIndexStoreScoped(dbScope, def.name.toLowerCase());
         const stored = istore.rangeEntries(uniqueProbeBound(prefix));
@@ -9345,7 +9306,7 @@ export class Engine {
       // final storage key.
       entryPrefixes.push(
         rindexes.map((rindex) =>
-          indexEntryKeys(table.columns, colls, rindex, new Uint8Array(0), row, env),
+          indexEntryKeys(table.columns, colTypes, colls, rindex, new Uint8Array(0), row, env),
         ),
       );
       prepared.push({ key, row });
@@ -9526,7 +9487,7 @@ export class Engine {
 
     let key: Uint8Array | null = null;
     if (pk.length > 0) {
-      key = encodePkKey(table, pk, colls, row);
+      key = encodePkKey(colTypes, pk, colls, row);
       if (readStore.get(key) !== undefined) {
         throw uniqueViolation(table.name, pkeyName(table.name));
       }
@@ -9534,7 +9495,7 @@ export class Engine {
 
     for (const rindex of rindexes) {
       if (!rindex.unique) continue;
-      const prefix = indexPrefixKey(table.columns, colls, rindex, row, maintenanceEnv);
+      const prefix = indexPrefixKey(colTypes, colls, rindex, row, maintenanceEnv);
       if (prefix === null) continue;
       const stored = this.lkpIndexStoreScoped(dbScope, rindex.name.toLowerCase()).rangeEntries(
         uniqueProbeBound(prefix),
@@ -9551,6 +9512,7 @@ export class Engine {
       indexEntries.push(
         indexEntryKeys(
           table.columns,
+          colTypes,
           colls,
           rindex,
           EMPTY_STORAGE_KEY,
@@ -9750,7 +9712,7 @@ export class Engine {
     rindexes: ResolvedIndex[],
     row: Row,
   ): boolean {
-    if (pk.length > 0 && store.get(encodePkKey(table, pk, colls, row)) !== undefined) return true;
+    if (pk.length > 0 && store.get(encodePkKey(store.columnTypes(), pk, colls, row)) !== undefined) return true;
     for (const rindex of rindexes) {
       if (!rindex.unique) continue;
       const prefix = this.indexPrefix(table.columns, colls, rindex, row);
@@ -9939,7 +9901,7 @@ export class Engine {
       if (plan.arb === null) {
         // No-target DO NOTHING: skip on ANY uniqueness conflict (committed OR an earlier planned
         // insert); else insert (upsert.md §2/§3).
-        const pkk = pk.length > 0 ? encodePkKey(table, pk, colls, row) : null;
+        const pkk = pk.length > 0 ? encodePkKey(colTypes, pk, colls, row) : null;
         let conflictHit = this.rowConflictsCommitted(store, table, pk, colls, rindexes, row);
         if (!conflictHit && pkk !== null && insPk.has(pkk.join(","))) conflictHit = true;
         if (!conflictHit) {
@@ -10020,7 +9982,7 @@ export class Engine {
     if (pk.length > 0 && inserts.length > 0) {
       const seen = new Set<string>();
       for (const row of inserts) {
-        const k = encodePkKey(table, pk, colls, row);
+        const k = encodePkKey(colTypes, pk, colls, row);
         const ks = k.join(",");
         if (readStore.get(k) !== undefined || seen.has(ks)) {
           throw uniqueViolation(table.name, pkeyName(table.name));
@@ -10097,7 +10059,7 @@ export class Engine {
     let cunits = 0n;
     const placeholder = new Uint8Array(8);
     for (const row of inserts) {
-      const kb = pk.length > 0 ? encodePkKey(table, pk, colls, row) : placeholder;
+      const kb = pk.length > 0 ? encodePkKey(colTypes, pk, colls, row) : placeholder;
       cunits += BigInt(store.writeCompressUnits(kb, row));
     }
     for (const u of updates) cunits += BigInt(store.writeCompressUnits(u.key, u.newRow));
@@ -10152,7 +10114,7 @@ export class Engine {
     for (let ri = 0; ri < inserts.length; ri++) {
       const row = inserts[ri]!;
       const key =
-        pk.length > 0 ? encodePkKey(table, pk, colls, row) : encodeInt("i64", store.allocRowid());
+        pk.length > 0 ? encodePkKey(colTypes, pk, colls, row) : encodeInt("i64", store.allocRowid());
       for (let k = 0; k < table.indexes.length; k++) {
         for (const p of insertPrefixes[ri]![k]!) indexAdds[k]!.push(concatBytes([p, key]));
       }
@@ -11051,7 +11013,7 @@ export class Engine {
       evalChecks(checks, table.name, resident, env, meter);
       // The row's NEW storage key: recomputed from the post-assignment row when a key member
       // was assigned (re-keying), else the unchanged old key.
-      const newKey = pkChanged ? encodePkKey(table, pkMembers, colls, resident) : e.key;
+      const newKey = pkChanged ? encodePkKey(store.columnTypes(), pkMembers, colls, resident) : e.key;
       updates.push({ key: e.key, newKey, row: resident, oldRow: row });
     }
     this.recordExplainActual("Scan " + upd.table, scanActual);
@@ -19770,17 +19732,26 @@ export function resolvedToKeyType(rt: ResolvedType): Type | null {
 // value (a column key) or the evaluated expression (an expression key — unmetered, env for the
 // immutable eval). Index maintenance is unmetered (cost.md §3), so a throwaway Meter absorbs the
 // eval charge.
-export function indexKeySlot(
+// indexSlotKey returns the BARE order-preserving key bytes for one index-key slot (a column ordinal
+// or an expression key) of row, or null when the slot value is SQL-NULL (the caller writes the §2.2
+// tag). A column key uses the store's resolved ColType (colTypes[col]), so a composite column recurses
+// into its field codec (encoding.md §2.15); an expression key is never composite, so it stays on the
+// by-name encodeTypedKey. Maintenance eval is unmetered (cost.md §3).
+export function indexSlotKey(
   key: ResolvedKey,
-  columns: Column[],
+  colTypes: ColType[],
   colls: (Collation | null)[],
   row: Row,
   env: EvalEnv,
-): { value: Value; type: Type; coll: Collation | null } {
+): Uint8Array | null {
   if (key.kind === "column") {
-    return { value: row[key.column]!, type: columns[key.column]!.type, coll: colls[key.column]! };
+    const v = row[key.column]!;
+    if (v.kind === "null") return null;
+    return encodeColTypeKey(colTypes[key.column]!, v, colls[key.column]!);
   }
-  return { value: evalExpr(key.expr, row, env, new Meter()), type: key.type, coll: key.coll };
+  const v = evalExpr(key.expr, row, env, new Meter());
+  if (v.kind === "null") return null;
+  return encodeTypedKey(key.type, v, key.coll);
 }
 
 // indexEntryKey builds a secondary-index entry key (spec/design/indexes.md §3): each key element as
@@ -19791,7 +19762,7 @@ export function indexKeySlot(
 // 0A000 at insert). An expression key evaluates against the row (§4); a referenced spilled value
 // faults in through the evaluator's Unfetched backstop.
 export function indexEntryKey(
-  columns: Column[],
+  colTypes: ColType[],
   colls: (Collation | null)[],
   rindex: ResolvedIndex,
   storageKey: Uint8Array,
@@ -19800,12 +19771,13 @@ export function indexEntryKey(
 ): Uint8Array {
   const parts: Uint8Array[] = [];
   for (const key of rindex.keys) {
-    const { value, type, coll } = indexKeySlot(key, columns, colls, row, env);
-    if (value.kind === "null") {
+    const b = indexSlotKey(key, colTypes, colls, row, env);
+    if (b === null) {
       parts.push(Uint8Array.of(0x01));
     } else {
-      // present tag, then the type's order-preserving key (range-aware §2.11, collated-text-aware §2.12)
-      parts.push(Uint8Array.of(0x00), encodeTypedKey(type, value, coll));
+      // present tag, then the slot's order-preserving key (range-aware §2.11, composite §2.15,
+      // collated-text-aware §2.12)
+      parts.push(Uint8Array.of(0x00), b);
     }
   }
   parts.push(storageKey);
@@ -19831,6 +19803,7 @@ export function indexRowQualifies(rindex: ResolvedIndex, row: Row, env: EvalEnv)
 // are plain-column, this slice).
 export function indexEntryKeys(
   columns: Column[],
+  colTypes: ColType[],
   colls: (Collation | null)[],
   rindex: ResolvedIndex,
   storageKey: Uint8Array,
@@ -19842,7 +19815,7 @@ export function indexEntryKeys(
     return ginEntries(columns, resolvedIndexColumnOrdinals(rindex), storageKey, row);
   if (rindex.kind === "gist")
     return gistEntries(columns, resolvedIndexColumnOrdinals(rindex), storageKey, row);
-  return [indexEntryKey(columns, colls, rindex, storageKey, row, env)];
+  return [indexEntryKey(colTypes, colls, rindex, storageKey, row, env)];
 }
 
 // indexEntryKeysColumns returns the entry keys for a COLUMN-ONLY index, WITHOUT an eval env
@@ -19852,6 +19825,7 @@ export function indexEntryKeys(
 // the index is plain-column.
 export function indexEntryKeysColumns(
   columns: Column[],
+  colTypes: ColType[],
   colls: (Collation | null)[],
   def: IndexDef,
   storageKey: Uint8Array,
@@ -19865,7 +19839,7 @@ export function indexEntryKeysColumns(
   for (const ci of cols) {
     const v = row[ci]!;
     if (v.kind === "null") parts.push(Uint8Array.of(0x01));
-    else parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v, colls[ci]!));
+    else parts.push(Uint8Array.of(0x00), encodeColTypeKey(colTypes[ci]!, v, colls[ci]!));
   }
   parts.push(storageKey);
   return [concatBytes(parts)];
@@ -20171,60 +20145,24 @@ export function bytesDiff(a: Uint8Array[], b: Uint8Array[]): Uint8Array[] {
 // so the concatenation is self-delimiting and byte comparison equals the tuple's logical order.
 // Shared by the INSERT duplicate check and the ON CONFLICT arbiter probe (upsert.md §3); a PK
 // column is NOT NULL, so there is no presence tag.
+// encodePkKey is a row's PRIMARY-KEY STORAGE KEY (spec/design/encoding.md §2.3): the concatenation
+// of the members' bare encodings in key order. Each member is encoded by the resolved-type
+// encodeColTypeKey (so a range/array/composite member recurses into its element/field codec);
+// colTypes (column-ordinal-indexed, from the store) is the vehicle that carries a composite member's
+// field list — the by-name Type cannot (composite.md §2). Each component is self-delimiting (§2.4/
+// §2.6/§2.11/§2.15), so the concatenation stays self-delimiting and memcmp equals the tuple's logical
+// order. A PK column is NOT NULL, so there is no presence tag at the top level.
 export function encodePkKey(
-  table: Table,
+  colTypes: ColType[],
   pk: number[],
   colls: (Collation | null)[],
   row: Row,
 ): Uint8Array {
   const parts: Uint8Array[] = [];
   for (const i of pk) {
-    const pkv = row[i]!; // non-null: a PK member is NOT NULL
-    if (pkv.kind === "uuid") {
-      parts.push(pkv.bytes.slice());
-    } else if (pkv.kind === "bool") {
-      parts.push(encodeBool(pkv.value));
-    } else if (pkv.kind === "int") {
-      parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.int));
-    } else if (pkv.kind === "timestamp" || pkv.kind === "timestamptz") {
-      parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.micros));
-    } else if (pkv.kind === "date") {
-      parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.days));
-    } else if (pkv.kind === "text") {
-      // text: C terminated-escape (§2.4) or the collated UCA sort key (§2.12).
-      parts.push(collatedTextKey(colls[i]!, pkv.text));
-    } else if (pkv.kind === "bytea") {
-      parts.push(encodeTerminated(pkv.bytes));
-    } else if (pkv.kind === "decimal") {
-      parts.push(pkv.dec.encodeKey());
-    } else if (pkv.kind === "interval") {
-      parts.push(intervalEncodeKey(pkv.iv));
-    } else if (pkv.kind === "f64") {
-      // float: the fixed-width float-order-preserving key (encoding.md §2.8) — NOT the int codec.
-      parts.push(encodeFloat64Key(pkv.value));
-    } else if (pkv.kind === "f32") {
-      parts.push(encodeFloat32Key(pkv.value));
-    } else if (pkv.kind === "range") {
-      // the recursive range-bounds container key (encoding.md §2.11, the first container key)
-      parts.push(encodeTypedKey(table.columns[i]!.type, pkv, null));
-    } else if (pkv.kind === "array") {
-      // the recursive array-elements-terminated container key (encoding.md §2.14, second container key)
-      parts.push(encodeTypedKey(table.columns[i]!.type, pkv, null));
-    } else {
-      throw engineError(
-        "data_corrupted",
-        "a primary key must be an integer, boolean, uuid, text, bytea, decimal, interval, float, range, array, or timestamp value",
-      );
-    }
+    parts.push(encodeColTypeKey(colTypes[i]!, row[i]!, colls[i]!));
   }
-  const total = parts.reduce((acc, b) => acc + b.length, 0);
-  const key = new Uint8Array(total);
-  let off = 0;
-  for (const b of parts) {
-    key.set(b, off);
-    off += b.length;
-  }
-  return key;
+  return concatBytes(parts);
 }
 
 // Arbiter is which uniqueness constraint an ON CONFLICT arbitrates (spec/design/upsert.md §2):
@@ -20299,15 +20237,15 @@ export function sameIntSet(arr: number[], set: Set<number>): boolean {
 // evaluates its key expressions through env (Engine.arbiterProbeKey builds it).
 export function arbiterKey(
   arb: Arbiter,
-  table: Table,
+  colTypes: ColType[],
   pk: number[],
   colls: (Collation | null)[],
   rindexes: ResolvedIndex[],
   row: Row,
   env: EvalEnv,
 ): Uint8Array | null {
-  if (arb.isPK) return encodePkKey(table, pk, colls, row);
-  return indexPrefixKey(table.columns, colls, rindexes[arb.indexPos]!, row, env);
+  if (arb.isPK) return encodePkKey(colTypes, pk, colls, row);
+  return indexPrefixKey(colTypes, colls, rindexes[arb.indexPos]!, row, env);
 }
 
 // indexPrefixKey builds a row's UNIQUENESS PROBE KEY for one unique index
@@ -20316,7 +20254,7 @@ export function arbiterKey(
 // conflicts). Two rows conflict iff they yield the same non-null prefix. An expression key's value
 // enters the probe exactly like a column value (evaluated against the row through env).
 export function indexPrefixKey(
-  columns: Column[],
+  colTypes: ColType[],
   colls: (Collation | null)[],
   rindex: ResolvedIndex,
   row: Row,
@@ -20327,10 +20265,11 @@ export function indexPrefixKey(
   if (!indexRowQualifies(rindex, row, env)) return null;
   const parts: Uint8Array[] = [];
   for (const key of rindex.keys) {
-    const { value, type, coll } = indexKeySlot(key, columns, colls, row, env);
-    if (value.kind === "null") return null;
-    // present tag, then the type's order-preserving key (range-aware §2.11, collated-text-aware §2.12)
-    parts.push(Uint8Array.of(0x00), encodeTypedKey(type, value, coll));
+    const b = indexSlotKey(key, colTypes, colls, row, env);
+    if (b === null) return null; // NULLS DISTINCT: a NULL slot never conflicts
+    // present tag, then the slot's order-preserving key (range-aware §2.11, composite §2.15,
+    // collated-text-aware §2.12)
+    parts.push(Uint8Array.of(0x00), b);
   }
   return concatBytes(parts);
 }
@@ -20395,6 +20334,49 @@ export function encodeTypedKey(ty: Type, value: Value, coll: Collation | null): 
     return encodeArrayKey(typeScalar(ty.elem), value);
   }
   return encodeKeyValue(typeScalar(ty), value, coll);
+}
+
+// encodeColTypeKey is the order-preserving key bytes for a value given its RESOLVED ColType — the
+// composite-aware sibling of encodeTypedKey (which works off the by-name Type and so cannot see a
+// composite's fields). Used at the column-key sites (PK member, index entry/prefix slot) where the
+// store's resolved colTypes are on hand; expression keys (never composite) stay on encodeTypedKey.
+// Scalar/array/range produce byte-identical output to encodeTypedKey; the extra arm is composite
+// (encoding.md §2.15). value is non-NULL (callers tag the §2.2 slot). coll selects a text column's
+// collated key form (§2.12); it never applies to a container element or a composite field.
+export function encodeColTypeKey(ct: ColType, value: Value, coll: Collation | null): Uint8Array {
+  if (ct.kind === "composite") {
+    if (value.kind !== "composite") throw new Error("composite ColType requires a composite value");
+    return encodeCompositeKey(ct.fields, value.fields);
+  }
+  if (ct.kind === "range") {
+    if (value.kind !== "range") throw new Error("range ColType requires a range value");
+    return encodeRangeKey(colTypeScalar(ct.elem), value);
+  }
+  if (ct.kind === "array") {
+    if (value.kind !== "array") throw new Error("array ColType requires an array value");
+    return encodeArrayKey(colTypeScalar(ct.elem), value);
+  }
+  return encodeKeyValue(ct.scalar, value, coll);
+}
+
+// encodeCompositeKey is the composite-field-slots key for a composite value (encoding.md §2.15) — the
+// engine's THIRD container key, recursing into each field's own key. Reproduces the in-memory
+// composite sort key (composite.md §5 — lexicographic, NULLs-last per field) under memcmp: each field
+// rides the §2.2 nullable slot (0x00 present ‖ the field key, or 0x01 NULL). Fixed arity ⇒ no
+// terminator (unlike the variable-arity array §2.14). Recurses via encodeColTypeKey for a nested
+// composite / array / range field; a composite field carries no COLLATE, so the C byte order.
+export function encodeCompositeKey(fields: ColField[], vals: Value[]): Uint8Array {
+  const out: number[] = [];
+  for (let i = 0; i < fields.length; i++) {
+    const v = vals[i]!;
+    if (v.kind === "null") {
+      out.push(0x01); // NULL slot — sorts after every present field
+      continue;
+    }
+    out.push(0x00); // present slot
+    for (const b of encodeColTypeKey(fields[i]!.type, v, null)) out.push(b);
+  }
+  return Uint8Array.from(out);
 }
 
 type HashJoinEntry = { key: Uint8Array; row: number };
@@ -20542,7 +20524,8 @@ export function typeIsKeyableScalar(t: Type): boolean {
 // typeIsArrayKeyable reports whether t is an array whose element is a key-encodable scalar — so the
 // array is a valid PRIMARY KEY / index / UNIQUE / FK key (encoding.md §2.14, array-elements-terminated).
 // A float-element array (f64[]/f32[]) IS keyable (the §2.8 lift); only a composite-element array is
-// NOT keyable (composite is not yet keyable).
+// NOT keyable — the array key admits only scalar elements, so array-of-composite stays 0A000 even
+// though the bare composite container is now itself keyable (§2.15).
 export function typeIsArrayKeyable(t: Type): boolean {
   return t.kind === "array" && typeIsKeyableScalar(t.elem);
 }

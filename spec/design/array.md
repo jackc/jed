@@ -368,10 +368,11 @@ among equal-element-prefix, equal-count arrays exactly as `array_total_cmp` rank
 then per-dimension smaller length, then smaller lower bound).
 
 - **Element gate.** The element must be a **key-encodable scalar** (the same set a scalar key uses —
-  integers, `bool`, `text`, `bytea`, `decimal`, `uuid`, `timestamp`/`timestamptz`/`date`, `interval`);
-  a **`float`-element** array (the §2.8 determinism carve-out) or a **composite-element** array (composite
-  is not yet keyable) is rejected `0A000` at the DDL resolver, the same narrowing the bare
-  `float`/composite scalar key carries. This relaxes the previous blanket array-key `0A000`.
+  integers, `bool`, `text`, `bytea`, `decimal`, `uuid`, `timestamp`/`timestamptz`/`date`, `interval`,
+  and now `float`, the §2.8 carve-out lifted). A **composite-element** array is still rejected `0A000`
+  at the DDL resolver — even though the bare `composite` container is now itself keyable
+  ([encoding.md §2.15](encoding.md)): the array key encoder admits **only scalar elements**, so an
+  `array`-of-`composite` key is a deferred follow-on. This relaxes the previous blanket array-key `0A000`.
 - **Divergence from PG's `ORDER BY`, by design.** The key reproduces jed's *consistent* `array_cmp`
   order (the one its `=`/`<` operators use), which can differ from PostgreSQL's single-column `ORDER BY`
   on the multidim / lower-bound tiebreak — an abbreviated-key artifact jed deliberately avoids (§5). So
@@ -472,7 +473,7 @@ corpus lands.
 | Non-rectangular multidim construction `ARRAY[…]` (mismatched sub-array dims, incl. a NULL sub-array); a `'[l:u]'` literal bound with `u < l` | `2202E` array_subscript_error |
 | Malformed string / out-of-range element on the runtime `text → T[]` cast (§7) | `22P02` / `22003` (per row) |
 | Element-wise `array → array` cast (§7) between scalar element types with no cast between them (PG reports `42846`) | `42804` datatype_mismatch |
-| A **float-element or composite-element** array `PRIMARY KEY`/index/`UNIQUE`/FK (a key-encodable-scalar-element array IS a valid key, §8); nested array (array-of-array); a composite-element `array → array` cast (the composite cast surface stays deferred, §7); a bind parameter into an array type (`$1::T[]`, §4) | `0A000` feature_not_supported |
+| A **composite-element** array `PRIMARY KEY`/index/`UNIQUE`/FK (a key-encodable-*scalar*-element array — `float` included — IS a valid key, §8; the array key admits only scalar elements, so array-of-composite stays deferred even though the bare `composite` container is keyable, encoding.md §2.15); nested array (array-of-array); a composite-element `array → array` cast (the composite cast surface stays deferred, §7); a bind parameter into an array type (`$1::T[]`, §4) | `0A000` feature_not_supported |
 | Corrupt array body (bad `ndim`/length/element) | `XX001` data_corrupted |
 
 `2202E` is registered in [../errors/registry.toml](../errors/registry.toml) (added with the S5
@@ -576,7 +577,7 @@ scalar element is a valid `PRIMARY KEY` / ordered secondary index / `UNIQUE` key
 engine's **second container key**. Byte vectors in [encoding.md §2.14](encoding.md), pinned cross-core
 by `array_pk_table.jed` (`rust == go == ts == ruby`); the 1-D surface is oracle-checked
 (`types/array_key.test`) and the multidim/lower-bound tiebreak (divergent from PG's `ORDER BY`) is
-per-core (`array_key`). A `float`/composite-element array key stays `0A000`. **No `format_version`
+per-core (`array_key`). A composite-element array key stays `0A000` (`float`-element landed). **No `format_version`
 bump** (an array PK is an existing array column marked as a key). With this, **every array follow-on
 has landed**; the remaining arms (nested array-of-array, GIN as a *key*, point-lookup pushdown for a
 container key) are out-of-scope / shared deferrals, not array-specific.

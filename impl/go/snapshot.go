@@ -415,6 +415,9 @@ func (s *snapshot) upgradeCollations(pageSize uint32) (int, error) {
 				colls[i] = s.resolveCollation(c.Collation)
 			}
 		}
+		// The resolved column types (parallel to table.Columns) — the vehicle a composite PK/index
+		// key encoder needs (encoding.md §2.15) when re-keying under a loaded collation.
+		colTypes := s.store(table.Name).colTypes
 		// Read every (storage key, row) pair, fully materialized (a spilled non-key value must
 		// survive a rewrite; a collated key column never spills — §2.12 narrowing b).
 		entries, err := s.store(table.Name).EntriesInKeyOrder()
@@ -432,7 +435,7 @@ func (s *snapshot) upgradeCollations(pageSize uint32) (int, error) {
 		// the existing key (unchanged — includes a synthetic-rowid table, which has no PK).
 		if pkSkewed {
 			for i := range entries {
-				k, err := encodePkKey(table, table.PK, colls, entries[i].Row)
+				k, err := encodePkKey(colTypes, table.PK, colls, entries[i].Row)
 				if err != nil {
 					return 0, err
 				}
@@ -464,7 +467,7 @@ func (s *snapshot) upgradeCollations(pageSize uint32) (int, error) {
 			}
 			var ekeys [][]byte
 			for _, e := range entries {
-				eks, err := indexEntryKeysColumns(table.Columns, colls, def, e.Key, e.Row)
+				eks, err := indexEntryKeysColumns(table.Columns, colTypes, colls, def, e.Key, e.Row)
 				if err != nil {
 					return 0, err
 				}

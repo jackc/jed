@@ -193,18 +193,32 @@ comparable iff they share the **same type id**; any other pair is `42804` at res
     that tests immediate fields for SQL-NULL only, pinned exhaustively (flat all-NULL, partial,
     nested all-NULL, and `NULL + composite` cases).
 
-## 6. Key encoding — authored, deferred
+## 6. Key encoding — the `composite-field-slots` container key (✅ landed)
 
-The order-preserving composite-type key encoding is the concatenation of each field's
-order-preserving encoding, each wrapped in the [encoding.md §2.2](encoding.md) nullable slot,
-recursing for nested composites — i.e. exactly the composition the multi-column composite
-`PRIMARY KEY` already uses ([encoding.md §2.3](encoding.md)). It is **authored**
-([encoding.md §2.10](encoding.md)) but **not exercised** this slice: a composite-typed
-`PRIMARY KEY`, index, or `UNIQUE` column is rejected `0A000` at the DDL resolver (the site that
-already rejects a text/decimal/bytea PK). The narrowing is doubly forced — most field types' own
-key encodings are themselves still deferred, so a composite key containing them could not be
-exercised regardless. Composite **values** remain fully storable, orderable, and groupable via the
-in-memory structural comparator (§5) — no key bytes required.
+A composite-typed column is a valid `PRIMARY KEY` / ordered secondary index / `UNIQUE` key: the
+order-preserving key is the concatenation of each field's order-preserving encoding, each wrapped in
+the [encoding.md §2.2](encoding.md) nullable slot (`0x00` present ‖ the field key, or `0x01` NULL),
+recursing for nested composite / array / range fields — the **third container key**
+([encoding.md §2.15](encoding.md), `composite-field-slots`, after `range` §2.11 and `array` §2.14).
+Because a composite is **fixed-arity** (the field count is a property of the type) it needs no
+terminator — unlike the variable-arity array §2.14 — and each field rides the ordinary §2.2 slot; the
+whole key is self-delimiting, so it composes as a nested field, an index column (outer §2.2 slot +
+storage-key suffix), and a multi-column-PK member. The bytes reproduce the §5 sort key (lexicographic,
+NULLs-last per field) under `memcmp`. Cross-core byte-identity holds **by construction** (every field
+key is already cross-core-identical, §5), pinned by the `composite_key_table.jed` golden and the
+[../encoding/composite.toml](../encoding/composite.toml) vectors.
+
+**Keyability is recursive** — a composite is keyable iff **every** field is keyable. Since every
+scalar, every `range`, and every scalar-element `array` is keyable, the one non-keyable inner type is
+an **array-of-composite** field (the §2.14 array key admits only scalar elements): a composite that
+transitively contains one is `0A000` at CREATE TABLE / CREATE INDEX (a deferred follow-on, §12). The
+DDL gate resolves the column's [`ColType`](../../impl/rust/src/catalog.rs) and walks it, bounded by
+`MAX_COMPOSITE_DEPTH` (§3, and the type graph is proven acyclic at `CREATE TYPE`), so the check and
+the encoder both terminate. Like the other container keys, **point-lookup pushdown stays deferred** (a
+composite PK/index `WHERE k = ROW(…)` full-scans + residual-filters — correct, just unindexed), a
+composite is **not** a GIN element, and a composite **FK** pairing + **array-of-composite** as a key
+are deferred follow-ons. Composite **values** remain storable/orderable/groupable via the in-memory
+structural comparator (§5) whether or not the column is a key.
 
 ## 7. `DROP TYPE` and dependency tracking
 
@@ -256,8 +270,8 @@ and are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle
 1. **Named composites only** — no anonymous `record`-typed columns (`0A000`). The closed→open
    transition is already XL; a `ROW(…)` result still types structurally.
 2. **PG all-fields `IS NULL` / `IS NOT NULL` rule** — adopted as-is (§5).
-3. **Composite-as-key deferred `0A000`** — encoding authored, not exercised (§6); the
-   text/decimal/bytea-PK precedent.
+3. **Composite-as-key** — ✅ landed as the third container key (§6, [encoding.md §2.15](encoding.md));
+   an **array-of-composite** key and a composite **FK** pairing remain deferred `0A000` follow-ons.
 4. **No implicit per-table row types** (divergence) — PG auto-creates a composite type per table
    (`tablename` usable as a type); jed does not. We own our surface (CLAUDE.md §1), and coupling
    the table and type catalogs would complicate `DROP` dependency tracking.
@@ -281,7 +295,7 @@ and are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle
 | `DROP TYPE` of a missing type (no `IF EXISTS`) | `42704` undefined_object |
 | `CREATE TYPE` nesting deeper than `MAX_COMPOSITE_DEPTH` (32) | `54001` statement_too_complex |
 | Corrupt type catalog (dangling/cyclic/over-deep field ref) | `XX001` data_corrupted |
-| Composite `PRIMARY KEY` / index / `UNIQUE`; bare `(a,b)`; anonymous `record`; `ALTER TYPE`; `DROP TYPE … CASCADE` | `0A000` feature_not_supported |
+| A composite `PRIMARY KEY`/index/`UNIQUE` whose type transitively contains an **array-of-composite** field; a composite **FK** pairing; bare `(a,b)`; anonymous `record`; `ALTER TYPE`; `DROP TYPE … CASCADE` | `0A000` feature_not_supported |
 
 ## 12. Delivery (sub-slices)
 
@@ -327,9 +341,13 @@ PG `record_eq`/`record_cmp`), **not** the bare-`ROW` 3VL §5 rule — so `ROW('a
 ANY(ARRAY[ROW('a',NULL)::addr])` is **TRUE** (the array-`=`/AC1 dichotomy, extended to the
 quantifiers), while a whole-element `NULL` still folds to UNKNOWN.
 
+**Composite-as-key landed** (§6, [encoding.md §2.15](encoding.md)) — a composite-typed `PRIMARY KEY`
+/ ordered secondary index / `UNIQUE` column of an all-keyable-field type, the third container key.
+Still deferred `0A000` on the key axis: an **array-of-composite** field as a key, and a composite
+**FK** pairing (which needs composite same-type FK resolution).
+
 **Still narrowed (relaxed in a later slice):** `INSERT … SELECT` into a composite column and
-`UPDATE` of a composite column remain `0A000`; a composite `PRIMARY KEY` / index / `UNIQUE` stays
-`0A000` (§6); `DEFAULT` on a composite column is `0A000`; the runtime (non-literal) text→composite
+`UPDATE` of a composite column remain `0A000`; `DEFAULT` on a composite column is `0A000`; the runtime (non-literal) text→composite
 cast, the `composite::text` cast, the anonymous `ROW(…)::type` structural cast, and the nested
 `ROW(ROW(…),…)`-into-column constructor (a jed extension PG rejects — covered by unit tests, not the
 PG-oracle corpus) are each `0A000` / jed-only. Composite **value** comparison (`WHERE c = ROW(…)`),

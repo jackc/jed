@@ -1,0 +1,114 @@
+# Composite TYPE as a key — a column whose type is a CREATE TYPE … AS (…) row type used as a
+# PRIMARY KEY / ordered secondary index / UNIQUE column (the third container key,
+# `composite-field-slots`, spec/design/encoding.md §2.15 / composite.md §6). Distinct from
+# ddl/composite_pk.test (a flat tuple of scalar COLUMNS). The stored key is the concatenation of
+# each field's own order-preserving key, each in the §2.2 nullable slot; memcmp reproduces the
+# composite sort key (lexicographic, NULLs-last per field) — which matches PostgreSQL record
+# comparison, so this file is oracle-clean (verified against live PG: a composite column IS a valid
+# PRIMARY KEY / UNIQUE, and ORDER BY home returns the same order).
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_key, ddl.unique, ddl.secondary_index, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.insert_column_list, query.select, query.order_by, types.composite, types.i32, types.text, resource.cost_metering
+
+statement ok
+CREATE TYPE addr AS (street text, zip i32)
+
+# --- a composite-typed column as the sole PRIMARY KEY ---------------------------------------------
+statement ok
+CREATE TABLE t (id i32, home addr, PRIMARY KEY (home))
+
+# rows arrive out of composite-sort-key order; '' sorts first, then 'Elm', then the two 'Main's
+# broken by zip (5 < 90210)
+statement ok
+INSERT INTO t VALUES (1, ROW('Main', 90210)), (2, ROW('Elm', 100)), (3, ROW('Main', 5)), (4, ROW('', -1))
+
+# the stored order is the composite sort key: '' < 'Elm' < ('Main',5) < ('Main',90210) => 4,2,3,1
+query I nosort
+SELECT id FROM t ORDER BY home
+----
+4
+2
+3
+1
+
+# a duplicate composite value traps 23505 (uniqueness is over the WHOLE composite value)
+statement error 23505
+INSERT INTO t VALUES (9, ROW('Main', 5))
+
+# a value differing in ANY field is a distinct row
+statement ok
+INSERT INTO t VALUES (5, ROW('Main', 6))
+
+# an in-batch duplicate too (two-phase / all-or-nothing: nothing stored)
+statement error 23505
+INSERT INTO t VALUES (7, ROW('X', 1)), (8, ROW('X', 1))
+
+query I nosort
+SELECT id FROM t ORDER BY (home).street, (home).zip
+----
+4
+2
+3
+5
+1
+
+statement ok
+DROP TABLE t
+
+# (A NESTED composite key — `line AS (a addr, b addr)` — is a jed extension: PostgreSQL rejects it
+# ("data type line has no default operator class for access method btree"), so it is NOT oracle-clean
+# and lives only in the per-core composite_key tests. jed recurses through each nested composite field
+# — encoding.md §2.15.)
+
+# --- a composite UNIQUE constraint --------------------------------------------------------------
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, home addr, UNIQUE (home))
+
+statement ok
+INSERT INTO u VALUES (1, ROW('Main', 5)), (2, ROW('Elm', 9))
+
+statement error 23505
+INSERT INTO u VALUES (3, ROW('Main', 5))
+
+# a value differing in any field is distinct
+statement ok
+INSERT INTO u VALUES (4, ROW('Main', 6))
+
+query I rowsort
+SELECT id FROM u
+----
+1
+2
+4
+
+statement ok
+DROP TABLE u
+
+# --- an ordered secondary index over a composite column (results identical to no index) ----------
+statement ok
+CREATE TABLE s (id i32 PRIMARY KEY, home addr)
+
+statement ok
+CREATE INDEX s_home ON s (home)
+
+statement ok
+INSERT INTO s VALUES (1, ROW('Main', 90210)), (2, ROW('Elm', 100)), (3, ROW('Main', 5))
+
+# a delete + reinsert exercises index maintenance; the rows are unchanged by the index
+statement ok
+DELETE FROM s WHERE id = 2
+
+statement ok
+INSERT INTO s VALUES (4, ROW('Elm', 100))
+
+query I rowsort
+SELECT id FROM s
+----
+1
+3
+4
+
+statement ok
+DROP TABLE s
+
+statement ok
+DROP TYPE addr

@@ -49,6 +49,8 @@ mod collation_host;
 mod comments;
 #[path = "../tests/composite.rs"]
 mod composite;
+#[path = "../tests/composite_key.rs"]
+mod composite_key;
 #[path = "../tests/composite_pk.rs"]
 mod composite_pk;
 #[path = "../tests/compressed_cost.rs"]

@@ -105,9 +105,9 @@ The composite **type** itself is always permanent — `CREATE TYPE` is ordinary 
 temp table only **references** it. The column's storage codec is resolved against the type catalog when
 the table is created and is self-contained thereafter, so a temp table with a composite column still
 makes **zero writes to the file**. `ROW(...)` construction, rendering, field access, and
-comparison/ordering all behave exactly as on a persistent column. Because a composite value is never a
-key, a composite column cannot be a `PRIMARY KEY` (`0A000`). Dropping a type that a temp table still
-references is blocked (`2BP01`), just as for a permanent table.
+comparison/ordering all behave exactly as on a persistent column. A composite column **can** be a
+`PRIMARY KEY` (or a `UNIQUE` / indexed column) on a temp table too, keyed by the composite value.
+Dropping a type that a temp table still references is blocked (`2BP01`), just as for a permanent table.
 
 ## Not yet supported on a temp table
 

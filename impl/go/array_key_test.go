@@ -6,7 +6,8 @@ package jed
 //   (a) the MULTIDIM / CUSTOM-LOWER-BOUND key tiebreak, where jed's consistent array_cmp order
 //       deliberately differs from PostgreSQL's single-column ORDER BY (an abbreviated-key artifact);
 //   (b) the keyable-element gate — a float-element array PRIMARY KEY IS keyable (the §2.8 lift —
-//       f64[]/f32[]); a composite-element array key is still rejected 0A000 (composite not yet keyable).
+//       f64[]/f32[]); a composite-element array key is still rejected 0A000 (the array key admits only
+//       scalar elements, even though the bare composite container is now keyable — §2.15).
 // Mirrors impl/rust/tests/array_key.rs.
 
 import "testing"

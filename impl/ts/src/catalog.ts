@@ -2,7 +2,13 @@
 // functions) to match the boring/explicit style (CLAUDE.md §10).
 
 import type { Expr } from "./ast.ts";
-import { type DecimalTypmod, type ScalarType, type Type, scalarTypeFromName } from "./types.ts";
+import {
+  type DecimalTypmod,
+  type ScalarType,
+  type Type,
+  scalarIsKeyable,
+  scalarTypeFromName,
+} from "./types.ts";
 import type { Value } from "./value.ts";
 
 // Column is a column definition: name, declared type, nullability, primary-key flag, default.
@@ -362,6 +368,36 @@ export type ColField = {
   varcharLen: number | null;
   notNull: boolean;
 };
+
+// colTypeScalar is the inner scalar of a scalar ColType (or an array/range element ColType) — the
+// resolved-type mirror of typeScalar. A composite reaches a scalar-only path only after the caller
+// branches on kind.
+export function colTypeScalar(ct: ColType): ScalarType {
+  if (ct.kind === "scalar") return ct.scalar;
+  throw new Error("non-scalar ColType where a scalar was expected (spec/design/composite.md)");
+}
+
+// colTypeKeyable reports whether this resolved type is key-encodable (encoding.md §2.15,
+// composite.md §6): every scalar (except json/jsonb/jsonpath), every range, and every scalar-element
+// array is keyable; a composite is keyable iff EVERY field is (recursive). The one non-keyable inner
+// type is an array whose element is itself a composite — the array key admits only scalar elements
+// (§2.14) — so an array-of-composite (column or composite field) stays a deferred 0A000 key even now
+// that the bare composite container is keyable. Terminates: the composite type graph is proven
+// acyclic and depth-bounded (MAX_COMPOSITE_DEPTH) at CREATE TYPE (spec/design/composite.md §3).
+export function colTypeKeyable(ct: ColType): boolean {
+  switch (ct.kind) {
+    case "scalar":
+      return scalarIsKeyable(ct.scalar);
+    case "range":
+      // A range's element is always a keyable scalar subtype (spec/design/ranges.md §2).
+      return true;
+    case "array":
+      // A scalar-element array is keyable (float included); an array-of-composite is not.
+      return ct.elem.kind === "scalar" && scalarIsKeyable(ct.elem.scalar);
+    case "composite":
+      return ct.fields.every((f) => colTypeKeyable(f.type));
+  }
+}
 
 // resolveColType resolves a catalog Type into a self-contained ColType against the database's
 // composite definitions (keyed by lowercased name, the Snapshot.types map). A composite reference

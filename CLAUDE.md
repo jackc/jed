@@ -245,11 +245,14 @@ everything else tests against, not a detail discovered during implementation.
     codec/comparator/catalog in every core (the closed `ScalarType` enum is kept *intact inside*
     `Type::Scalar` — it never gains user variants). Composite is the first **container** axis and
     the shared open-`Type` foundation the future `array` axis reuses; **named composites only this
-    slice** (no anonymous `record`), with composite-as-key deferred `0A000` (the precedent that
-    text/bytea/decimal/interval keys have since landed, encoding.md §2.4/§2.5/§2.6/§2.10 — and
-    `float` keys too, §2.8, so **every scalar is now keyable** and the recursive `composite`
-    container is the lone non-key type) and no implicit per-table row types (a documented PG
-    divergence).
+    slice** (no anonymous `record`), and no implicit per-table row types (a documented PG
+    divergence). **Composite-as-key has since landed** (encoding.md §2.15, the recursive
+    `composite-field-slots` rule — the **third container key** after `range` §2.11 and `array` §2.14):
+    a composite-typed `PRIMARY KEY` / ordered index / `UNIQUE` column of an all-keyable-field type,
+    the key a concatenation of per-field §2.2 nullable slots recursing into each field's own key. With
+    text/bytea/decimal/interval/float keys and the array/range/composite containers all keyable, the
+    lone remaining `0A000` key is an **array whose element is itself a composite** (the array key admits
+    only scalar elements).
 - **Three-valued NULL logic.**
 - **An explicit, documented comparison / coercion / promotion matrix** — expressed as
   data, not prose.

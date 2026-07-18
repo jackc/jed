@@ -12,6 +12,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "ddl.primary_key",
   // Table-level PRIMARY KEY (a, b, ...) — composite keys (constraints.md §3).
   "ddl.composite_primary_key",
+  "ddl.composite_key",
   "ddl.check",
   // FOREIGN KEY constraints — referential integrity enforced at every write, 23503; referenced
   // columns must be a parent PK/UNIQUE set (42830); persisted (format_version 11)

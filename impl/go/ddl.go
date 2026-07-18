@@ -200,6 +200,25 @@ func rejectParamsForDDL(params []Value) error {
 // a second primary key traps 42P16 before its members resolve; members resolve
 // left to right (unknown 42703, repeated 42701); then the jed narrowings — the
 // declaration-order rule and the per-member key-type gate — trap 0A000.
+// typeIsKeyable reports whether a resolved column dataType is key-encodable — usable as a PRIMARY KEY
+// / ordered secondary index / UNIQUE member (spec/design/encoding.md §2). The keyable scalars, the
+// range container, a scalar-element array (isArrayKeyable), or a composite whose fields are ALL
+// keyable (recursive, §2.15 — resolved against the current snapshot's type catalog; an
+// array-of-composite field makes it unkeyable). The single gate every PK / UNIQUE / CREATE INDEX site
+// calls.
+func (db *engine) typeIsKeyable(ty dataType) bool {
+	switch {
+	case ty.Comp != nil:
+		return resolveColType(ty, db.readSnap().types).keyable()
+	case ty.Array != nil:
+		return isArrayKeyable(ty)
+	case ty.Range != nil:
+		return true
+	default:
+		return ty.Scalar.IsKeyable()
+	}
+}
+
 func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 	// A session-local temporary table (spec/design/temp-tables.md) is built exactly like a persistent
 	// one but registered into the session temp snapshot at the end (§2), so it makes zero file writes.
@@ -374,22 +393,12 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			// §2.11, the first container key) and the array container (array-elements-terminated
 			// §2.14, the second container key — keyable when its element is a key-encodable scalar,
 			// isArrayKeyable, INCLUDING a float element since the §2.8 lift) — plus float itself
-			// (float-order-preserving §2.8, the last scalar to become keyable). Still 0A000: only a
-			// composite-element array and the recursive composite container.
-			if isComposite || (isArray && !isArrayKeyable(colType)) {
-				// A composite PRIMARY KEY (composite.md §6) or a non-keyable array PRIMARY KEY (a
-				// composite element) is rejected 0A000. colType.CanonicalName() gives the
-				// canonical type name (e.g. addr[], even when declared with an alias).
+			// (float-order-preserving §2.8) — plus the composite container of all-keyable fields
+			// (composite-field-slots §2.15, typeIsKeyable recursing). Still 0A000: an array whose
+			// element is a composite, and a composite transitively containing one.
+			if !db.typeIsKeyable(colType) {
 				return outcome{}, newError(FeatureNotSupported,
 					"a "+colType.CanonicalName()+" primary key is not supported yet")
-			}
-			// A range / keyable array is a container key (encoding.md §2.11/§2.14); every other
-			// keyable column is a scalar, gated here.
-			if !isRange && !isArray {
-				if ty := colType.Scalar; !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsFloat() {
-					return outcome{}, newError(FeatureNotSupported,
-						"a "+ty.CanonicalName()+" primary key is not supported yet")
-				}
 			}
 			if pkSeen {
 				return outcome{}, newError(InvalidTableDefinition,
@@ -591,7 +600,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		}
 		for _, i := range indices {
 			ty := columns[i].Type
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsFloat() && !ty.IsRange() && !isArrayKeyable(ty) {
+			if !db.typeIsKeyable(ty) {
 				return outcome{}, newError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" primary key is not supported yet")
 			}
@@ -635,7 +644,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		}
 		for _, i := range indices {
 			ty := columns[i].Type
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsFloat() && !ty.IsRange() && !isArrayKeyable(ty) {
+			if !db.typeIsKeyable(ty) {
 				return outcome{}, newError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" unique constraint member is not supported yet")
 			}
@@ -1333,24 +1342,36 @@ func (db *engine) indexMaintEnv() *evalEnv {
 	return &evalEnv{exec: db, rng: newStmtRng()}
 }
 
+// colTypesFor resolves the given columns to their self-contained colTypes against the current
+// snapshot's composite definitions — the vehicle a composite PK/index key encoder needs (encoding.md
+// §2.15). Cheap for the common (scalar/container) case; a composite column resolves its field tree.
+func (db *engine) colTypesFor(columns []catColumn) []colType {
+	types := db.readSnap().types
+	out := make([]colType, len(columns))
+	for i, c := range columns {
+		out[i] = resolveColType(c.Type, types)
+	}
+	return out
+}
+
 // indexEntries computes a row's secondary-index entry keys for maintenance (spec/design/indexes.md
 // §4), building the unmetered eval env internally. Returns owned bytes, so callers compute all
 // entries through this &engine call BEFORE the store-mutating writes.
 func (db *engine) indexEntries(columns []catColumn, colls []*Collation, rindex *resolvedIndex, storageKey []byte, row storedRow) ([][]byte, error) {
-	return indexEntryKeys(columns, colls, rindex, storageKey, row, db.indexMaintEnv())
+	return indexEntryKeys(columns, db.colTypesFor(columns), colls, rindex, storageKey, row, db.indexMaintEnv())
 }
 
 // indexPrefix computes a row's uniqueness-probe prefix for one index (spec/design/indexes.md §8),
 // building the unmetered eval env internally (as indexEntries).
 func (db *engine) indexPrefix(columns []catColumn, colls []*Collation, rindex *resolvedIndex, row storedRow) ([]byte, bool, error) {
-	return indexPrefixKey(columns, colls, rindex, row, db.indexMaintEnv())
+	return indexPrefixKey(db.colTypesFor(columns), colls, rindex, row, db.indexMaintEnv())
 }
 
 // arbiterProbeKey computes a candidate row's arbiter key for ON CONFLICT (spec/design/upsert.md §3),
 // building the unmetered eval env internally (an expression-index arbiter evaluates its keys — as
 // indexPrefix).
 func (db *engine) arbiterProbeKey(arb *arbiter, table *catTable, pk []int, colls []*Collation, rindexes []resolvedIndex, row storedRow) ([]byte, bool, error) {
-	return arbiterKey(arb, table, pk, colls, rindexes, row, db.indexMaintEnv())
+	return arbiterKey(arb, db.colTypesFor(table.Columns), pk, colls, rindexes, row, db.indexMaintEnv())
 }
 
 // evalDefault is the value an omitted column or a DEFAULT value slot takes (constraints.md §2):
@@ -1811,7 +1832,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 						return outcome{}, newError(DuplicateColumn, "column "+name+" appears twice in primary key")
 					}
 					ty := table.Columns[ci].Type
-					if ty.IsComposite() || (ty.IsArray() && !isArrayKeyable(ty)) || (!ty.IsArray() && !ty.IsRange() && !isKeyableScalarType(ty.ScalarTy())) {
+					if !db.typeIsKeyable(ty) {
 						return outcome{}, newError(FeatureNotSupported, "a "+ty.CanonicalName()+" primary key is not supported yet")
 					}
 					pk = append(pk, ci)
@@ -1936,7 +1957,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				if err != nil {
 					return outcome{}, err
 				}
-				if oldColumn.PrimaryKey && (target.Type.IsComposite() || (target.Type.IsArray() && !isArrayKeyable(target.Type)) || (!target.Type.IsArray() && !target.Type.IsRange() && !isKeyableScalarType(target.Type.ScalarTy()))) {
+				if oldColumn.PrimaryKey && !db.typeIsKeyable(target.Type) {
 					return outcome{}, newError(FeatureNotSupported, "a "+target.Type.CanonicalName()+" primary key is not supported yet")
 				}
 				if table.Columns[ci].Identity != nil && !target.Type.IsInteger() {
@@ -2175,7 +2196,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 					key = encodeInt(scalarInt64, rewriteNextRowid)
 					rewriteNextRowid++
 				} else {
-					key, err = encodePkKey(&table, table.PK, colls, row)
+					key, err = encodePkKey(rewriteColTypes, table.PK, colls, row)
 				}
 				if err != nil {
 					return outcome{}, err
@@ -2473,7 +2494,7 @@ func (db *engine) buildAlterAddedColumn(table *catTable, def *columnDef, pending
 		if len(table.PK) > 0 {
 			return catColumn{}, newError(InvalidTableDefinition, "multiple primary keys for table "+table.Name+" are not allowed")
 		}
-		if ty.IsComposite() || (ty.IsArray() && !isArrayKeyable(ty)) || (!ty.IsArray() && !ty.IsRange() && !isKeyableScalarType(ty.ScalarTy())) {
+		if !db.typeIsKeyable(ty) {
 			return catColumn{}, newError(FeatureNotSupported, "a "+ty.CanonicalName()+" primary key is not supported yet")
 		}
 	}
@@ -2992,7 +3013,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		ty := columns[idx].Type
 		switch kind {
 		case indexBtree:
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsFloat() && !ty.IsRange() && !isArrayKeyable(ty) {
+			if !db.typeIsKeyable(ty) {
 				return outcome{}, newError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" index column is not supported yet")
 			}

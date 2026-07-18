@@ -284,7 +284,7 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 				return newError(DuplicateColumn, "column "+n+" appears twice in unique constraint")
 			}
 			ty := t.Columns[ci].Type
-			if ty.IsComposite() || (ty.IsArray() && !isArrayKeyable(ty)) || (!ty.IsArray() && !ty.IsRange() && !isKeyableScalarType(ty.ScalarTy())) {
+			if !db.typeIsKeyable(ty) {
 				return newError(FeatureNotSupported, "a unique constraint on "+ty.CanonicalName()+" is not supported yet")
 			}
 			cols = append(cols, ci)

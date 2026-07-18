@@ -153,6 +153,19 @@ fn retype_identity_sequence(
 }
 
 impl Engine {
+    /// Whether a resolved column [`Type`] is **key-encodable** — usable as a `PRIMARY KEY` / ordered
+    /// secondary index / `UNIQUE` member (spec/design/encoding.md §2). The keyable scalars
+    /// ([`is_keyable_scalar`]), the `range` container, a scalar-element `array`
+    /// ([`is_array_keyable`]), or a **composite** whose fields are ALL keyable (recursive, §2.15 —
+    /// resolved against the current snapshot's type catalog; an `array`-of-composite field makes it
+    /// unkeyable). The single gate every PK / UNIQUE / CREATE INDEX site calls.
+    pub(crate) fn type_is_keyable(&self, ty: &Type) -> bool {
+        is_keyable_scalar(ty)
+            || ty.is_range()
+            || is_array_keyable(ty)
+            || (ty.is_composite() && self.read_snap().resolve_col_type(ty).keyable())
+    }
+
     /// Dispatch one parsed statement to its executor. The autocommit transaction handling
     /// (capture / durable commit / rollback-on-error) lives in `execute_stmt_params`.
     pub(crate) fn dispatch_stmt(&mut self, stmt: Statement, params: &[Value]) -> Result<Outcome> {
@@ -518,29 +531,14 @@ impl Engine {
                 // interval (`interval-span-i128` — the 16-byte span key, encoding.md §2.10) — plus
                 // the variable-width `text`/`bytea` (`…-terminated-escape`, encoding.md §2.4/§2.6) and
                 // `decimal` (`decimal-order-preserving` §2.5), all self-delimiting so they compose in
-                // composite keys / index suffixes — plus `float` (`float-order-preserving` §2.8 — the
-                // last scalar to become keyable, so EVERY scalar is now keyable; a float at rest is
-                // in-contract, determinism.md §4) — plus the `range` container (`range-bounds` §2.11,
-                // the first container key) and the `array` container (`array-elements-terminated`
-                // §2.14, the second container key — keyable when its element is a key-encodable scalar,
-                // INCLUDING a `float` element, `is_array_keyable`). Still rejected `0A000`: only a
-                // composite-element array and the recursive composite container. An oversized
-                // text/bytea/decimal/range/array key (one that can't fit a node) trips the existing
-                // RECORD_MAX oversized-item 0A000, mirroring PG's btree key-size limit.
-                if !ty.is_integer()
-                    && !ty.is_bool()
-                    && !ty.is_text()
-                    && !ty.is_bytea()
-                    && !ty.is_decimal()
-                    && !ty.is_uuid()
-                    && !ty.is_timestamp()
-                    && !ty.is_timestamptz()
-                    && !ty.is_date()
-                    && !ty.is_interval()
-                    && !ty.is_float()
-                    && !ty.is_range()
-                    && !is_array_keyable(&ty)
-                {
+                // composite keys / index suffixes — plus `float` (`float-order-preserving` §2.8) — the
+                // `range` container (`range-bounds` §2.11), the `array` container of a keyable scalar
+                // element (`array-elements-terminated` §2.14), and the `composite` container of
+                // all-keyable fields (`composite-field-slots` §2.15, `type_is_keyable` recursing). Still
+                // rejected `0A000`: an array whose element is a composite, and a composite that
+                // transitively contains one. An oversized key (one that can't fit a node) trips the
+                // existing RECORD_MAX oversized-item 0A000, mirroring PG's btree key-size limit.
+                if !self.type_is_keyable(&ty) {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
                         format!("a {} primary key is not supported yet", ty.canonical_name()),
@@ -796,20 +794,7 @@ impl Engine {
             }
             for &i in &indices {
                 let ty = &columns[i].ty;
-                if !ty.is_integer()
-                    && !ty.is_bool()
-                    && !ty.is_text()
-                    && !ty.is_bytea()
-                    && !ty.is_decimal()
-                    && !ty.is_uuid()
-                    && !ty.is_timestamp()
-                    && !ty.is_timestamptz()
-                    && !ty.is_date()
-                    && !ty.is_interval()
-                    && !ty.is_float()
-                    && !ty.is_range()
-                    && !is_array_keyable(ty)
-                {
+                if !self.type_is_keyable(ty) {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
                         format!("a {} primary key is not supported yet", ty.canonical_name()),
@@ -851,20 +836,7 @@ impl Engine {
             }
             for &i in &indices {
                 let ty = &columns[i].ty;
-                if !ty.is_integer()
-                    && !ty.is_bool()
-                    && !ty.is_text()
-                    && !ty.is_bytea()
-                    && !ty.is_decimal()
-                    && !ty.is_uuid()
-                    && !ty.is_timestamp()
-                    && !ty.is_timestamptz()
-                    && !ty.is_date()
-                    && !ty.is_interval()
-                    && !ty.is_float()
-                    && !ty.is_range()
-                    && !is_array_keyable(ty)
-                {
+                if !self.type_is_keyable(ty) {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
                         format!(
@@ -2043,10 +2015,7 @@ impl Engine {
                                 ));
                             }
                             let ty = &table.columns[ci].ty;
-                            if ty.is_composite()
-                                || (ty.is_array() && !is_array_keyable(ty))
-                                || (!ty.is_array() && !ty.is_range() && !is_keyable_scalar(ty))
-                            {
+                            if !self.type_is_keyable(ty) {
                                 return Err(EngineError::new(
                                     SqlState::FeatureNotSupported,
                                     format!(
@@ -2194,20 +2163,7 @@ impl Engine {
                                 }
                                 for &ci in &cols {
                                     let ty = &table.columns[ci].ty;
-                                    if !ty.is_integer()
-                                        && !ty.is_bool()
-                                        && !ty.is_text()
-                                        && !ty.is_bytea()
-                                        && !ty.is_decimal()
-                                        && !ty.is_uuid()
-                                        && !ty.is_timestamp()
-                                        && !ty.is_timestamptz()
-                                        && !ty.is_date()
-                                        && !ty.is_interval()
-                                        && !ty.is_float()
-                                        && !ty.is_range()
-                                        && !is_array_keyable(ty)
-                                    {
+                                    if !self.type_is_keyable(ty) {
                                         return Err(EngineError::new(
                                             SqlState::FeatureNotSupported,
                                             format!(
@@ -2676,13 +2632,7 @@ impl Engine {
                                 temp_scope,
                                 attachment_scope,
                             )?;
-                            if old_column.primary_key
-                                && (target.ty.is_composite()
-                                    || (target.ty.is_array() && !is_array_keyable(&target.ty))
-                                    || (!target.ty.is_array()
-                                        && !target.ty.is_range()
-                                        && !is_keyable_scalar(&target.ty)))
-                            {
+                            if old_column.primary_key && !self.type_is_keyable(&target.ty) {
                                 return Err(EngineError::new(
                                     SqlState::FeatureNotSupported,
                                     format!(
@@ -2974,6 +2924,13 @@ impl Engine {
                 .iter()
                 .map(|&i| (i, table.columns[i].ty.clone()))
                 .collect();
+            // Resolved column types for the NEW table shape (parallel to `table.columns`) — the
+            // vehicle a composite PK key encoder needs when this rewrite re-keys rows (§2.15).
+            let col_types: Vec<ColType> = table
+                .columns
+                .iter()
+                .map(|c| self.read_snap().resolve_col_type(&c.ty))
+                .collect();
             let colls = self.column_collations(&table.columns);
             let mut seen_keys = std::collections::HashSet::new();
             let mut compress_units = 0i64;
@@ -3008,7 +2965,7 @@ impl Engine {
                         *key = crate::encoding::encode_int(ScalarType::Int64, rewrite_next_rowid);
                         rewrite_next_rowid += 1;
                     } else {
-                        *key = encode_pk_key(&pk, &colls, row)?;
+                        *key = encode_pk_key(&pk, &col_types, &colls, row)?;
                     }
                     if !seen_keys.insert(key.clone()) {
                         return Err(EngineError::unique_violation(
@@ -3079,6 +3036,12 @@ impl Engine {
             };
             let checks = self.resolve_checks(&table)?;
             let colls = self.column_collations(&table.columns);
+            // Resolved column types for the new table shape (composite index key vehicle, §2.15).
+            let col_types: Vec<ColType> = table
+                .columns
+                .iter()
+                .map(|c| self.read_snap().resolve_col_type(&c.ty))
+                .collect();
             let mut seen =
                 std::collections::HashMap::<String, std::collections::HashSet<Vec<u8>>>::new();
             let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
@@ -3107,7 +3070,7 @@ impl Engine {
                 {
                     let ri = self.resolve_index(&table, ix)?;
                     if ix.unique {
-                        if let Some(p) = self.index_prefix(&table.columns, &colls, &ri, &row)? {
+                        if let Some(p) = self.index_prefix(&col_types, &colls, &ri, &row)? {
                             let s = seen.entry(ix.name.to_ascii_lowercase()).or_default();
                             if !s.insert(p) {
                                 return Err(EngineError::unique_violation(&table.name, &ix.name));
@@ -3117,7 +3080,14 @@ impl Engine {
                     constraint_entries
                         .entry(ix.name.to_ascii_lowercase())
                         .or_default()
-                        .extend(self.index_entries(&table.columns, &colls, &ri, &key, &row)?);
+                        .extend(self.index_entries(
+                            &table.columns,
+                            &col_types,
+                            &colls,
+                            &ri,
+                            &key,
+                            &row,
+                        )?);
                 }
             }
             for fk in table
@@ -3186,13 +3156,25 @@ impl Engine {
         if rekeyed {
             constraint_entries.clear();
             let colls = self.column_collations(&table.columns);
+            let col_types: Vec<ColType> = table
+                .columns
+                .iter()
+                .map(|c| self.read_snap().resolve_col_type(&c.ty))
+                .collect();
             for ix in &table.indexes {
                 let ri = self.resolve_index(&table, ix)?;
                 let out = constraint_entries
                     .entry(ix.name.to_ascii_lowercase())
                     .or_default();
                 for (key, row) in rewrite_entries.as_ref().unwrap() {
-                    out.extend(self.index_entries(&table.columns, &colls, &ri, key, row)?);
+                    out.extend(self.index_entries(
+                        &table.columns,
+                        &col_types,
+                        &colls,
+                        &ri,
+                        key,
+                        row,
+                    )?);
                 }
                 out.sort();
             }
@@ -3489,20 +3471,7 @@ impl Engine {
                     ),
                 ));
             }
-            if !col.ty.is_integer()
-                && !col.ty.is_bool()
-                && !col.ty.is_text()
-                && !col.ty.is_bytea()
-                && !col.ty.is_decimal()
-                && !col.ty.is_uuid()
-                && !col.ty.is_timestamp()
-                && !col.ty.is_timestamptz()
-                && !col.ty.is_date()
-                && !col.ty.is_interval()
-                && !col.ty.is_float()
-                && !col.ty.is_range()
-                && !is_array_keyable(&col.ty)
-            {
+            if !self.type_is_keyable(&col.ty) {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
                     format!(
@@ -3703,6 +3672,7 @@ impl Engine {
     pub(crate) fn index_entries(
         &self,
         columns: &[Column],
+        col_types: &[ColType],
         colls: &[Option<std::sync::Arc<Collation>>],
         rindex: &ResolvedIndex,
         storage_key: &[u8],
@@ -3716,14 +3686,15 @@ impl Engine {
             rng: &rng,
             ctes: CteCtx::empty(),
         };
-        index_entry_keys(columns, colls, rindex, storage_key, row, &env)
+        index_entry_keys(columns, col_types, colls, rindex, storage_key, row, &env)
     }
 
     /// A row's uniqueness-probe prefix for one index (spec/design/indexes.md §8), building the
-    /// unmetered eval env internally (as [`index_entries`](Self::index_entries)).
+    /// unmetered eval env internally (as [`index_entries`](Self::index_entries)). `col_types` is the
+    /// table's resolved column types (composite index columns key through their field codec, §2.15).
     pub(crate) fn index_prefix(
         &self,
-        columns: &[Column],
+        col_types: &[ColType],
         colls: &[Option<std::sync::Arc<Collation>>],
         rindex: &ResolvedIndex,
         row: &Row,
@@ -3736,7 +3707,7 @@ impl Engine {
             rng: &rng,
             ctes: CteCtx::empty(),
         };
-        index_prefix_key(columns, colls, rindex, row, &env)
+        index_prefix_key(col_types, colls, rindex, row, &env)
     }
 
     /// A candidate row's arbiter key for `ON CONFLICT` (spec/design/upsert.md §3), building the
@@ -3746,8 +3717,8 @@ impl Engine {
         &self,
         arb: &Arbiter,
         pk: &[(usize, Type)],
+        col_types: &[ColType],
         colls: &[Option<std::sync::Arc<Collation>>],
-        columns: &[Column],
         rindexes: &[ResolvedIndex],
         row: &Row,
     ) -> Result<Option<Vec<u8>>> {
@@ -3759,7 +3730,7 @@ impl Engine {
             rng: &rng,
             ctes: CteCtx::empty(),
         };
-        arbiter_key(arb, pk, colls, columns, rindexes, row, &env)
+        arbiter_key(arb, pk, col_types, colls, rindexes, row, &env)
     }
 
     /// Resolve each column's **expression** `DEFAULT` (constraints.md §2) to an `RExpr`, once
@@ -4078,20 +4049,7 @@ impl Engine {
             let ty = &columns[idx].ty;
             match kind {
                 IndexKind::Btree => {
-                    if !ty.is_integer()
-                        && !ty.is_bool()
-                        && !ty.is_text()
-                        && !ty.is_bytea()
-                        && !ty.is_decimal()
-                        && !ty.is_uuid()
-                        && !ty.is_timestamp()
-                        && !ty.is_timestamptz()
-                        && !ty.is_date()
-                        && !ty.is_interval()
-                        && !ty.is_float()
-                        && !ty.is_range()
-                        && !is_array_keyable(ty)
-                    {
+                    if !self.type_is_keyable(ty) {
                         return Err(EngineError::new(
                             SqlState::FeatureNotSupported,
                             format!(
@@ -4361,6 +4319,8 @@ impl Engine {
                 ctes: CteCtx::empty(),
             };
             let store = self.store_scoped(ci.db.as_deref(), &ci.table);
+            // Resolved column types (composite index key vehicle, §2.15).
+            let col_types: Vec<ColType> = store.col_types().to_vec();
             let (table_entries, nodes, slabs) = store.scan_with_units(&mask)?;
             meter.charge(COSTS.page_read * nodes as i64 + COSTS.value_decompress * slabs as i64);
             entries.reserve(table_entries.len());
@@ -4371,13 +4331,13 @@ impl Engine {
                 // read a spilled value; the evaluator's `Unfetched` backstop also handles it).
                 store.resolve_inline_columns(&mut row)?;
                 if def.unique
-                    && let Some(prefix) = index_prefix_key(&columns, &colls, &rindex, &row, &env)?
+                    && let Some(prefix) = index_prefix_key(&col_types, &colls, &rindex, &row, &env)?
                     && !seen_prefixes.insert(prefix)
                 {
                     return Err(EngineError::unique_violation(&ci.table, &def.name));
                 }
                 entries.extend(index_entry_keys(
-                    &columns, &colls, &rindex, &key, &row, &env,
+                    &columns, &col_types, &colls, &rindex, &key, &row, &env,
                 )?);
             }
         }

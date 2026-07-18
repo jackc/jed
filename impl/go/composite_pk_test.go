@@ -110,9 +110,6 @@ func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 		{"CREATE TABLE t (a i32, b i32, PRIMARY KEY (a), PRIMARY KEY (b))", "42P16"},
 		// 42P16 fires BEFORE the second constraint's members resolve (PostgreSQL's order).
 		{"CREATE TABLE t (a i32 PRIMARY KEY, PRIMARY KEY (nosuch))", "42P16"},
-		// Narrowing: every member must be key-encodable. f64 IS now keyable (encoding.md §2.8);
-		// the recursive composite container is NOT (composite.md §6), so a composite member is 0A000.
-		{"CREATE TABLE t (a i32, s addr, PRIMARY KEY (a, s))", "0A000"},
 	}
 	for _, c := range cases {
 		if code := compositeErrCode(t, db, c.sql); code != c.want {
@@ -123,6 +120,21 @@ func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 	// encoding.md §2.8): a composite PK with a float member succeeds.
 	if _, err := queryOutcome(db, "CREATE TABLE fpk (a i32, s f64, PRIMARY KEY (a, s))", nil); err != nil {
 		t.Fatalf("composite PK with f64 member: %v", err)
+	}
+	// The composite container is now keyable too (the third container key, composite-field-slots,
+	// encoding.md §2.15 / composite.md §6): a composite-typed PK member of an all-keyable-field type
+	// succeeds. Only a composite transitively containing an array-of-composite field stays 0A000.
+	if _, err := queryOutcome(db, "CREATE TABLE cpk (a i32, s addr, PRIMARY KEY (a, s))", nil); err != nil {
+		t.Fatalf("composite PK member: %v", err)
+	}
+	if cpk, _ := db.Table("cpk"); !slices.Equal(cpk.PKIndices(), []int{0, 1}) {
+		t.Fatalf("composite-PK-member PKIndices = %v, want [0 1]", func() []int { c, _ := db.Table("cpk"); return c.PKIndices() }())
+	}
+	if _, err := queryOutcome(db, "CREATE TYPE poly AS (name text, pts addr[])", nil); err != nil {
+		t.Fatal(err)
+	}
+	if code := compositeErrCode(t, db, "CREATE TABLE t (a i32, p poly, PRIMARY KEY (a, p))"); code != "0A000" {
+		t.Fatalf("array-of-composite PK member: got %s, want 0A000", code)
 	}
 	// The list order is the KEY order — it may differ from declaration order (the original
 	// 0A000 narrowing was lifted by the v5 catalog reshape, constraints.md §3): the table

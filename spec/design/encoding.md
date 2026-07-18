@@ -314,7 +314,8 @@ flip-sign lands in `[0x800…, 0xFFF…]`; within negatives, "more negative" sor
 
 **Status — EXERCISED.** A `f32`/`f64` is a valid `PRIMARY KEY` / ordered secondary index /
 `UNIQUE` key / FK target — the last scalar to become keyable, so with float lifted **every scalar
-is keyable** and only the recursive `composite` container remains a `0A000` key. A float PK stores
+is keyable** (and, since, the recursive `composite` container §2.15 too — only an
+array-of-composite element now stays `0A000`). A float PK stores
 the bare fixed-width body (a PK is NOT NULL, so no presence tag); an index entry / composite member
 wraps it in the §2.2 nullable slot; a `float`-element **array** (`f64[]`/`f32[]`) is keyable too
 (§2.14). The `(value → bytes)` vectors are in [../encoding/float.toml](../encoding/float.toml) and
@@ -421,8 +422,9 @@ interval PK stores the bare 16-byte span (a PK is NOT NULL, so no presence tag);
 composite member wraps it in the §2.2 nullable slot, and because it is fixed-width it qualifies as a
 **GIN element** too ([gin.md §3](gin.md) — span-equal elements share a term, matching the `@>`/`&&`
 element-equality). The `(value → bytes)` vectors are in [../encoding/interval.toml](../encoding/interval.toml)
-and the on-disk image is pinned by the `interval_pk_table.jed` golden. Only `float` (the determinism
-carve-out §2.8) and the recursive containers composite/array remain `0A000` keys.
+and the on-disk image is pinned by the `interval_pk_table.jed` golden. (`float` §2.8 and the
+containers `array` §2.14 / `composite` §2.15 have since become keyable too; only an
+array-of-composite element now stays `0A000`.)
 
 ### 2.11 Range — `range-bounds` (the first container key)
 
@@ -494,8 +496,8 @@ framing). Point-lookup pushdown stays **deferred** for ranges (a range PK/index 
 full-scans + residual-filters — correct, just unindexed — matching the container precedent), and a
 range is **not** a GIN element. The `(value → bytes)` vectors are in
 [../encoding/range.toml](../encoding/range.toml); the on-disk image is pinned by the
-`range_pk_table.jed` golden. (Array §2.14 and float §2.8 have since landed too, so the recursive
-**composite** container is now the only remaining `0A000` key.)
+`range_pk_table.jed` golden. (Array §2.14, float §2.8, and the recursive **composite** container
+§2.15 have since landed too, so only an array-of-composite element now stays a `0A000` key.)
 
 ### 2.12 Collated text — `text-collated-sortkey` (a key *form*, not a new type)
 
@@ -636,10 +638,12 @@ shape suffix:
    (§2.4/§2.6), `decimal-order-preserving` (§2.5), `uuid-raw16` (§2.7), `bool-byte` (§2.9), the i64/i32
    timestamp/date rule, `interval-span-i128` (§2.10), or `float-order-preserving` (§2.8) — each
    self-delimiting (fixed-width or `0x00`-terminated), so the next marker (or the terminator) follows
-   unambiguously under `memcmp`. The element is a **key-encodable scalar**; a composite element
-   (composite is not yet keyable) makes the whole array `0A000` at the DDL gate, never reaching this
-   rule. A `float` element **is** keyable (the §2.8 narrowing lifted — a float at rest is in-contract,
-   so a `f64[]`/`f32[]` key sorts identically in every core). Array-of-array does not exist
+   unambiguously under `memcmp`. The element is a **key-encodable scalar**; a **composite** element
+   makes the whole array `0A000` at the DDL gate, never reaching this rule — this is the lone
+   deferred key case even though the bare `composite` container is itself now keyable (§2.15): the
+   array element key path admits only scalars, so an `array`-of-`composite` key is a follow-on. A
+   `float` element **is** keyable (the §2.8 narrowing lifted — a float at rest is in-contract, so a
+   `f64[]`/`f32[]` key sorts identically in every core). Array-of-array does not exist
    ([array.md §2](array.md)).
 3. **Shape suffix breaks ties among equal-element-prefix, equal-count arrays.** After the terminator,
    `ndim` then, per dimension, `len_d` (`u32` BE — lengths are ≥ 1, so unsigned big-endian orders them)
@@ -665,8 +669,84 @@ ruby`, via `spec/fileformat/verify.rb`'s independent `encode_array_key`). **Stat
 valid `PRIMARY KEY` / ordered secondary index / `UNIQUE` key / FK target ([array.md §8](array.md)); like
 the other container keys, point-lookup pushdown stays deferred (an array PK/index `WHERE k = …`
 full-scans + residual-filters) and an array is not a GIN *key* (the separate GIN element index is
-unrelated). With `float` keys now exercised (§2.8 — including `float`-element arrays), the recursive
-`composite` container is the only remaining `0A000` key.
+unrelated). With `float` keys now exercised (§2.8 — including `float`-element arrays), the **third**
+container key — `composite` (§2.15) — has since landed too, leaving only an **array-of-composite**
+element (§2.15) as a deferred `0A000` key.
+
+### 2.15 Composite — `composite-field-slots` (the third container key)
+
+`composite` is the engine's **third** container key (after `range` §2.11 and `array` §2.14) — a
+**recursive, fixed-arity** structural type over a heterogeneous field list ([composite.md §2](composite.md)),
+so its key **recurses into each field's own order-preserving key** exactly as `range`/`array` recurse
+into their element. It reproduces the in-memory composite **sort key** ([composite.md §5](composite.md)
+— lexicographic, NULLs-last **per field**) under `memcmp`. Unlike `array`, a composite has a **fixed**
+field count known from its type, so it needs **no terminator** and each field rides the ordinary §2.2
+nullable slot (no custom marker set — the array §2.14 markers exist only because a variable-arity
+`0x00` present tag would collide with its terminator; a composite has neither problem):
+
+```
+per field f (declaration order):
+   present:  0x00 ‖ <field's order-preserving key>   (the §2.2 present slot)
+   NULL:     0x01                                     (the §2.2 NULL slot — no body)
+```
+
+1. **Per-field §2.2 nullable slot.** Field *i*'s slot opens with `0x00` (present) followed by that
+   field's own order-preserving key, or the lone byte `0x01` (SQL-NULL, no body). Because `0x00 <
+   0x01`, a present field sorts **before** a NULL field at the deciding position — the
+   NULLs-last-per-field rule ([compare.toml] `null_ordering`), the same order §2.4's terminator gives
+   a short string. This is exactly the [composite.md §5](composite.md) sort key, so the stored order
+   and the `ORDER BY` / `DISTINCT` / `GROUP BY` order are one fact, not two kept in sync.
+2. **Field key = the field's own order-preserving key.** After the `0x00` present marker comes the
+   field's key — a scalar's §2.1/§2.4/§2.5/… key, or a **nested container** recursing: a nested
+   `composite` field re-enters this rule, an `array` field the §2.14 rule, a `range` field the §2.11
+   rule. A composite text field keys by raw UTF-8 (`text-terminated-escape` §2.4, `C` order) — a
+   composite field carries no `COLLATE`, so no collated-key form (§2.12) applies. Every field key is
+   self-delimiting (fixed-width, `0x00`-terminated, or self-framing container), so the next slot
+   follows unambiguously under `memcmp`.
+3. **Fixed arity ⇒ self-delimiting, no terminator.** The field count is a property of the type, so a
+   reader that knows the composite type knows exactly how many slots to consume; two composites of the
+   **same type** (the only comparable pair, [composite.md §5](composite.md)) compare slot-for-slot.
+   The whole composite key is therefore self-delimiting and **composes** — as a nested composite
+   field, as a secondary-index column (the outer §2.2 slot wraps it, then the storage-key suffix), and
+   as a member of a multi-column PK.
+
+Worked structure for `addr AS (street text, zip i32)`:
+
+| value | encoded key bytes |
+|---|---|
+| `('Main', 90210)` | `00`‖`4D 61 69 6E 00 01`(street) `00`‖`80 01 60 62`(zip, i32 = 90210 + 2³¹) |
+| `('Main', NULL)` | `00`‖`4D 61 69 6E 00 01`(street) `01`(zip NULL) |
+| `('', 1)` | `00`‖`00 01`(empty street) `00`‖`80 00 00 01`(zip) |
+
+So `('Main',90210)` = `00 4D 61 69 6E 00 01 00 80 01 60 62`, and `('Main',90210) < ('Main',NULL)`
+because at the zip slot `0x00`(present) `< 0x01`(NULL). A **whole-value-NULL** composite (only
+reachable as a nullable index column, never a PK) is the lone §2.2 `0x01` tag, no body — distinct from
+a present composite whose every field is NULL (`0x00` ‖ per-field `0x01` slots), exactly as
+[composite.md §5](composite.md)'s `IS NULL` gotcha and the comparator both rank a present all-NULL-fields
+row *before* a whole-NULL one.
+
+The **nullable** slot (a composite secondary index / a nested composite member) is the §2.2 tag
+(`0x00` present ‖ the field-slot bytes above, or `0x01` NULL); **descending** is the §2.3 whole-key
+bitwise inversion — both unchanged. A composite key whose bytes overflow a node trips the existing
+oversized-item `0A000` (§2.4 — keys cannot spill to overflow pages).
+
+**Keyability is recursive.** A composite is a valid key iff **every** field is keyable, checked
+recursively at the DDL gate ([composite.md §6](composite.md)). Since every scalar, every `range`, and
+every scalar-element `array` is keyable, the **one** non-keyable inner type is an **array-of-composite**
+field (§2.14 admits only scalar elements): a composite that transitively contains one is `0A000` at
+CREATE TABLE / CREATE INDEX (a deferred follow-on, the same staged narrowing each key type carried).
+The recursion is depth-bounded by `MAX_COMPOSITE_DEPTH` (32, [composite.md §3](composite.md)) and the
+type graph is proven acyclic at `CREATE TYPE`, so the gate and the encoder both terminate.
+
+**Status — EXERCISED.** A `composite`-typed column of an all-keyable-field type is a valid `PRIMARY
+KEY` / ordered secondary index / `UNIQUE` key. Like the other container keys, point-lookup pushdown
+stays **deferred** (a composite PK/index `WHERE k = …` full-scans + residual-filters — correct, just
+unindexed), a composite is **not** a GIN element, and **array-of-composite** as a key and a composite
+**FK** pairing are deferred follow-ons. The `(value → bytes)` vectors are in
+[../encoding/composite.toml](../encoding/composite.toml); the on-disk image is pinned cross-core by the
+`composite_key_table.jed` golden (`rust == go == ts == ruby`, via `spec/fileformat/verify.rb`'s
+independent `encode_composite_key`). This is jed's **last** `0A000` scalar/container key — with it
+landed, every built-in type is keyable except an array whose element is itself a composite.
 
 ## 3. Where this is used today
 
@@ -701,8 +781,11 @@ the **second container key**, and the first whose key length varies with the val
 same `text` key type, but its body is the column collation's baked UCA sort key rather than the raw
 UTF-8, pinned by the `collation_pk_table.jed` golden. `float` keys (the `float-order-preserving`
 rule §2.8, `float64_pk_table.jed` / `float32_pk_table.jed`) have since landed too — the last scalar
-to become keyable — so **every scalar is now keyable** and only the recursive `composite` container
-stays a `0A000` key.
+to become keyable — so **every scalar is now keyable**. (This §2.3 "composite key" is the
+*multi-column* PK — a flat tuple of scalar columns. The distinct **composite *type* container key**
+— a single column whose type is a `CREATE TYPE … AS (…)` row type — has since landed as the third
+container key, the recursive `composite-field-slots` rule §2.15, `composite_key_table.jed` golden, so
+the only remaining `0A000` key is an array whose element is itself a composite.)
 
 ## 4. NULL ordering — NULL is the largest value (the PostgreSQL model)
 

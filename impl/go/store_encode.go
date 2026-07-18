@@ -874,6 +874,51 @@ func encodeArrayKey(elem scalarType, a *ArrayVal) ([]byte, error) {
 	return out, nil
 }
 
+// encodeColTypeKey is the order-preserving key bytes for a value given its RESOLVED colType — the
+// composite-aware sibling of encodeTypedKey (which works off the by-name dataType and so cannot see a
+// composite's fields). Used at the column-key sites (PK member, index entry/prefix slot) where the
+// store's resolved colTypes are on hand; expression keys (never composite) stay on encodeTypedKey.
+// Scalar/array/range produce byte-identical output to encodeTypedKey; the extra arm is composite
+// (encoding.md §2.15). value is non-NULL (callers tag the §2.2 slot). coll selects a text column's
+// collated key form (§2.12); it never applies to a container element or a composite field.
+func encodeColTypeKey(ct colType, value Value, coll *Collation) ([]byte, error) {
+	switch {
+	case ct.Composite:
+		return encodeCompositeKey(ct.Fields, *value.composite())
+	case ct.RangeElem != nil:
+		return encodeRangeKey(ct.RangeElem.Scalar, value.rangeVal()), nil
+	case ct.Elem != nil:
+		return encodeArrayKey(ct.Elem.Scalar, value.arrayVal())
+	default:
+		return encodeKeyValue(ct.Scalar, value, coll)
+	}
+}
+
+// encodeCompositeKey is the composite-field-slots key for a composite value (encoding.md §2.15) — the
+// engine's THIRD container key, recursing into each field's own key. Reproduces the in-memory
+// composite sort key (composite.md §5 — lexicographic, NULLs-last per field) under memcmp: each field
+// rides the §2.2 nullable slot (0x00 present ‖ the field key, or 0x01 NULL). Fixed arity ⇒ no
+// terminator (unlike the variable-arity array §2.14), so the ordinary §2.2 slot is used. Every field
+// key is self-delimiting, so the concatenation composes (nested field, index column + suffix).
+// Recurses via encodeColTypeKey for a nested composite / array / range field; a composite field
+// carries no COLLATE, so field keys use the C byte order (coll nil).
+func encodeCompositeKey(fields []colField, vals []Value) ([]byte, error) {
+	var out []byte
+	for i, f := range fields {
+		if vals[i].Kind == ValNull {
+			out = append(out, 0x01) // NULL slot — sorts after every present field
+			continue
+		}
+		out = append(out, 0x00) // present slot
+		fb, err := encodeColTypeKey(f.Type, vals[i], nil)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, fb...)
+	}
+	return out, nil
+}
+
 // isKeyableScalarType reports whether a scalar is key-encodable — the element-type gate for
 // isArrayKeyable. With float keys exercised (§2.8) every scalar is keyable; only the recursive
 // composite container is excluded (it is not a ScalarType).
@@ -886,7 +931,8 @@ func isKeyableScalarType(s scalarType) bool {
 // isArrayKeyable reports whether ty is an array whose element is a key-encodable scalar — so the array
 // is a valid PRIMARY KEY / index / UNIQUE / FK key (encoding.md §2.14, array-elements-terminated). A
 // float-element array (f64[]/f32[]) IS keyable (the §2.8 lift); only a composite-element array is NOT
-// keyable (composite is not yet keyable).
+// keyable — the array key admits only scalar elements, so array-of-composite stays 0A000 even though
+// the bare composite container is now itself keyable (§2.15).
 func isArrayKeyable(ty dataType) bool {
 	return ty.Array != nil && ty.Array.isScalar() && isKeyableScalarType(ty.Array.Scalar)
 }

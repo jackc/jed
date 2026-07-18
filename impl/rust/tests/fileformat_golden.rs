@@ -1212,6 +1212,34 @@ fn composite_type_table_db() -> Session {
     db
 }
 
+/// A composite-TYPED column used as the PRIMARY KEY (the third container key,
+/// `composite-field-slots`, encoding.md §2.15 / composite.md §6) — distinct from the multi-column
+/// `composite_pk_table` (a flat tuple of scalars). The stored key is the per-field §2.2 nullable
+/// slots: `0x00`‖text(street) then `0x00`‖i32(zip). Rows are INSERTed in ascending composite-key
+/// order (lexicographic — street, then zip breaking the 'Main' tie); the tree shape is
+/// insertion-order sensitive.
+fn composite_key_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TYPE addr AS (street text NOT NULL, zip i32 NOT NULL)",
+    );
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32, home addr, PRIMARY KEY (home))",
+    );
+    run(&mut db, "INSERT INTO t VALUES (1, ROW('', -1))");
+    run(&mut db, "INSERT INTO t VALUES (2, ROW('Elm', 100))");
+    run(&mut db, "INSERT INTO t VALUES (3, ROW('Main', 5))");
+    run(&mut db, "INSERT INTO t VALUES (4, ROW('Main', 90210))");
+    db
+}
+
 /// A composite type used as an array ELEMENT type (array-of-composite, array.md §12 AC1): the
 /// catalog array-column entry carries a composite element descriptor (`element_type_code` 14 +
 /// "addr") and the value body recurses (an array body whose elements are composite bodies). Row 2's
@@ -1443,6 +1471,7 @@ fn write_matches_goldens() {
         ("gin_uuid_table.jed", gin_uuid_table_db),
         ("fk_table.jed", fk_table_db),
         ("composite_type_table.jed", composite_type_table_db),
+        ("composite_key_table.jed", composite_key_table_db),
         ("nested_composite_table.jed", nested_composite_table_db),
         ("sequence_table.jed", sequence_table_db),
         ("serial_table.jed", serial_table_db),
@@ -1537,6 +1566,7 @@ fn read_goldens_reproduces_rows() {
         ("gin_uuid_table.jed", gin_uuid_table_db, "t"),
         ("fk_table.jed", fk_table_db, "c"),
         ("composite_type_table.jed", composite_type_table_db, "t"),
+        ("composite_key_table.jed", composite_key_table_db, "t"),
         ("nested_composite_table.jed", nested_composite_table_db, "t"),
         ("array_table.jed", array_table_db, "t"),
         ("range_table.jed", range_table_db, "t"),

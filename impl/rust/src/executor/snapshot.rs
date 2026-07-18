@@ -134,6 +134,13 @@ impl Snapshot {
         self.types.get(&name.to_ascii_lowercase())
     }
 
+    /// Resolve a catalog [`Type`] to its self-contained [`ColType`] against this snapshot's composite
+    /// definitions (spec/design/composite.md §4). Used by the DDL keyable-type gate to test a
+    /// composite column's recursive key-encodability (encoding.md §2.15) without touching a store.
+    pub(crate) fn resolve_col_type(&self, ty: &Type) -> ColType {
+        crate::catalog::resolve_col_type(ty, &self.types)
+    }
+
     /// Advance the catalog generation — called by every schema mutator (see `cat_gen`). A SELECT
     /// plan cached against a prior generation is thereby invalidated on the next execute.
     pub(crate) fn bump_cat_gen(&mut self) {
@@ -341,6 +348,9 @@ impl Snapshot {
                 .iter()
                 .map(|&i| (i, table.columns[i].ty.clone()))
                 .collect();
+            // The resolved column types (parallel to `table.columns`) — the vehicle a composite
+            // PK/index key encoder needs (encoding.md §2.15) when re-keying under a loaded collation.
+            let col_types: Vec<ColType> = self.store(&key).col_types().to_vec();
             // Read every (storage key, row) pair, fully materialized (a spilled non-key value must
             // survive a table rewrite). A collated key column never spills (§2.12 narrowing b), so
             // the keys are always inline.
@@ -356,7 +366,7 @@ impl Snapshot {
             // else the existing key (unchanged — includes a synthetic rowid table, which has no PK).
             for (k, row) in &mut entries {
                 if pk_skewed {
-                    *k = encode_pk_key(&pk, &colls, row)?;
+                    *k = encode_pk_key(&pk, &col_types, &colls, row)?;
                 }
             }
             // 2a. Re-key the table store (fresh empty store via `put_table`, then re-insert).
@@ -393,6 +403,7 @@ impl Snapshot {
                 for (k, row) in &entries {
                     ekeys.extend(index_entry_keys_columns(
                         &table.columns,
+                        &col_types,
                         &colls,
                         def,
                         k,

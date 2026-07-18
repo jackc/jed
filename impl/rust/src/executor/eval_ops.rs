@@ -1773,15 +1773,15 @@ pub(crate) fn resolve_arbiter(
 pub(crate) fn arbiter_key(
     arb: &Arbiter,
     pk: &[(usize, Type)],
+    col_types: &[ColType],
     colls: &[Option<std::sync::Arc<Collation>>],
-    columns: &[Column],
     rindexes: &[ResolvedIndex],
     row: &Row,
     env: &EvalEnv,
 ) -> Result<Option<Vec<u8>>> {
     match arb {
-        Arbiter::PrimaryKey => Ok(Some(encode_pk_key(pk, colls, row)?)),
-        Arbiter::Index(i) => index_prefix_key(columns, colls, &rindexes[*i], row, env),
+        Arbiter::PrimaryKey => Ok(Some(encode_pk_key(pk, col_types, colls, row)?)),
+        Arbiter::Index(i) => index_prefix_key(col_types, colls, &rindexes[*i], row, env),
     }
 }
 

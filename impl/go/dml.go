@@ -210,44 +210,57 @@ func resolvedToKeyType(rt resolvedType) (dataType, bool) {
 	}
 }
 
-// indexKeySlot returns one key element's value + encoding type + collation for a row: the column
-// value (a column key) or the evaluated expression (an expression key — unmetered, env for the
-// immutable eval). Index maintenance is unmetered (cost.md §3), so a throwaway meter absorbs the
-// eval charge.
-func indexKeySlot(key resolvedKey, columns []catColumn, colls []*Collation, row storedRow, env *evalEnv) (Value, dataType, *Collation, error) {
+// indexSlotKey returns the BARE order-preserving key bytes for one index-key slot (a column ordinal
+// or an expression key) of row, with present=false when the slot value is SQL-NULL (the caller writes
+// the §2.2 tag). A column key uses the store's resolved colType (colTypes[col]), so a composite column
+// recurses into its field codec (encoding.md §2.15); an expression key is never composite, so it stays
+// on the by-name encodeTypedKey. Maintenance eval is unmetered (cost.md §3).
+func indexSlotKey(key resolvedKey, colTypes []colType, colls []*Collation, row storedRow, env *evalEnv) (present bool, b []byte, err error) {
 	if key.Expr == nil {
-		return row[key.Col], columns[key.Col].Type, colls[key.Col], nil
+		v := row[key.Col]
+		if v.Kind == ValNull {
+			return false, nil, nil
+		}
+		b, err = encodeColTypeKey(colTypes[key.Col], v, colls[key.Col])
+		if err != nil {
+			return false, nil, err
+		}
+		return true, b, nil
 	}
 	v, err := key.Expr.eval(row, env, newMeter()) // maintenance eval is unmetered (cost.md §3)
 	if err != nil {
-		return Value{}, dataType{}, nil, err
+		return false, nil, err
 	}
-	return v, key.Ty, key.Coll, nil
+	if v.Kind == ValNull {
+		return false, nil, nil
+	}
+	b, err = encodeTypedKey(key.Ty, v, key.Coll)
+	if err != nil {
+		return false, nil, err
+	}
+	return true, b, nil
 }
 
 // indexEntryKey builds a secondary-index entry key (spec/design/indexes.md §3): each key element
-// as the encoding.md §2.2 nullable slot — 0x00 + the type's bare order-preserving key bytes when
+// as the encoding.md §2.2 nullable slot — 0x00 + the slot's bare order-preserving key bytes when
 // present, the lone 0x01 for NULL (always tagged, even for a NOT NULL column) — then the row's
 // storage key as the suffix. A column key's value is always resident (a fixed-width type never
 // spills, and a spillable text/bytea would over-fill the entry key, rejected 0A000 at its insert);
 // an expression key evaluates against the row (§4), faulting a referenced spilled value in through
 // the evaluator's Unfetched backstop.
-func indexEntryKey(columns []catColumn, colls []*Collation, rindex *resolvedIndex, storageKey []byte, row storedRow, env *evalEnv) ([]byte, error) {
+func indexEntryKey(colTypes []colType, colls []*Collation, rindex *resolvedIndex, storageKey []byte, row storedRow, env *evalEnv) ([]byte, error) {
 	var out []byte
 	for _, key := range rindex.Keys {
-		val, ty, coll, err := indexKeySlot(key, columns, colls, row, env)
+		present, b, err := indexSlotKey(key, colTypes, colls, row, env)
 		if err != nil {
 			return nil, err
 		}
-		if val.Kind == ValNull {
+		if !present {
 			out = append(out, 0x01)
 			continue
 		}
-		// present tag, then the type's order-preserving key (range-aware §2.11, collated-text-aware §2.12)
-		b, err := encodeTypedKey(ty, val, coll)
-		if err != nil {
-			return nil, err
-		}
+		// present tag, then the slot's order-preserving key (range-aware §2.11, composite §2.15,
+		// collated-text-aware §2.12)
 		out = append(out, 0x00)
 		out = append(out, b...)
 	}
@@ -278,7 +291,7 @@ func indexRowQualifies(rindex *resolvedIndex, row storedRow, env *evalEnv) (bool
 // maintenance uniform (the UPDATE old-set/new-set diff handles a row entering/leaving/moving for
 // free). colls (column-ordinal-indexed) selects each text key column's collated form (§2.12); GIN
 // elements are fixed-width, so a GIN index never collates.
-func indexEntryKeys(columns []catColumn, colls []*Collation, rindex *resolvedIndex, storageKey []byte, row storedRow, env *evalEnv) ([][]byte, error) {
+func indexEntryKeys(columns []catColumn, colTypes []colType, colls []*Collation, rindex *resolvedIndex, storageKey []byte, row storedRow, env *evalEnv) ([][]byte, error) {
 	if ok, err := indexRowQualifies(rindex, row, env); err != nil {
 		return nil, err
 	} else if !ok {
@@ -290,7 +303,7 @@ func indexEntryKeys(columns []catColumn, colls []*Collation, rindex *resolvedInd
 	if rindex.Kind == indexGist {
 		return gistEntries(columns, rindex.columnOrdinals(), storageKey, row), nil
 	}
-	ek, err := indexEntryKey(columns, colls, rindex, storageKey, row, env)
+	ek, err := indexEntryKey(colTypes, colls, rindex, storageKey, row, env)
 	if err != nil {
 		return nil, err
 	}
@@ -302,7 +315,7 @@ func indexEntryKeys(columns []catColumn, colls []*Collation, rindex *resolvedInd
 // no engine to evaluate an expression key. An expression index is C-collated (its keys never
 // change on a collation upgrade), so it is fail-closed 0A000 there; this asserts the index is
 // plain-column and reuses the ordinary builder with a nil env (a column key never touches env).
-func indexEntryKeysColumns(columns []catColumn, colls []*Collation, def indexDef, storageKey []byte, row storedRow) ([][]byte, error) {
+func indexEntryKeysColumns(columns []catColumn, colTypes []colType, colls []*Collation, def indexDef, storageKey []byte, row storedRow) ([][]byte, error) {
 	cols := def.columnOrdinals()
 	if cols == nil {
 		panic("indexEntryKeysColumns called on an expression index")
@@ -312,7 +325,7 @@ func indexEntryKeysColumns(columns []catColumn, colls []*Collation, def indexDef
 		keys[i] = resolvedKey{Col: c}
 	}
 	ri := &resolvedIndex{Name: def.Name, Unique: def.Unique, Kind: def.Kind, Keys: keys}
-	return indexEntryKeys(columns, colls, ri, storageKey, row, nil)
+	return indexEntryKeys(columns, colTypes, colls, ri, storageKey, row, nil)
 }
 
 // gistEntries builds a GiST index's entry keys for one row (spec/design/gist.md §4.1): exactly one
@@ -506,7 +519,7 @@ func bytesDiff(a, b [][]byte) [][]byte {
 // (spec/design/indexes.md §8): the §3 entry key's slot prefix — without the storage-key
 // suffix — or ok=false when any component is NULL (NULLS DISTINCT: such a tuple never
 // conflicts). Two rows conflict iff they yield the same prefix.
-func indexPrefixKey(columns []catColumn, colls []*Collation, rindex *resolvedIndex, row storedRow, env *evalEnv) ([]byte, bool, error) {
+func indexPrefixKey(colTypes []colType, colls []*Collation, rindex *resolvedIndex, row storedRow, env *evalEnv) ([]byte, bool, error) {
 	// A partial index constrains only its qualifying rows (indexes.md §9): a non-qualifying row is
 	// exempt from uniqueness, exactly like a NULL-bearing prefix (ok=false).
 	if ok, err := indexRowQualifies(rindex, row, env); err != nil {
@@ -516,18 +529,15 @@ func indexPrefixKey(columns []catColumn, colls []*Collation, rindex *resolvedInd
 	}
 	var out []byte
 	for _, key := range rindex.Keys {
-		val, ty, coll, err := indexKeySlot(key, columns, colls, row, env)
+		present, b, err := indexSlotKey(key, colTypes, colls, row, env)
 		if err != nil {
 			return nil, false, err
 		}
-		if val.Kind == ValNull {
-			return nil, false, nil
+		if !present {
+			return nil, false, nil // NULLS DISTINCT: a NULL slot never conflicts
 		}
-		// present tag, then the type's order-preserving key (range-aware §2.11, collated-text-aware §2.12)
-		b, err := encodeTypedKey(ty, val, coll)
-		if err != nil {
-			return nil, false, err
-		}
+		// present tag, then the slot's order-preserving key (range-aware §2.11, composite §2.15,
+		// collated-text-aware §2.12)
 		out = append(out, 0x00)
 		out = append(out, b...)
 	}
@@ -554,62 +564,21 @@ func uniqueProbeBound(prefix []byte) keyBound {
 // before any row is produced — so both fire even over an empty source.
 // encodePkKey is a row's PRIMARY-KEY STORAGE KEY (spec/design/encoding.md §2.3): the
 // concatenation of the members' bare encodings in key order. Each component is either
-// fixed-width or self-delimiting (text/bytea terminate, §2.4/§2.6), so the concatenation stays
-// self-delimiting and bytes.Compare equals the tuple's logical order. Shared by the INSERT
-// duplicate check and the ON CONFLICT arbiter probe (upsert.md §3); a PK column is NOT NULL, so
-// there is no presence tag.
-func encodePkKey(table *catTable, pk []int, colls []*Collation, row storedRow) ([]byte, error) {
+// fixed-width or self-delimiting (text/bytea terminate §2.4/§2.6, a range framed §2.11, a composite
+// framed §2.15), so the concatenation stays self-delimiting and bytes.Compare equals the tuple's
+// logical order. Each member is encoded by the resolved-type encodeColTypeKey (so a range/array/
+// composite member recurses into its element/field codec); colTypes (column-ordinal-indexed, from
+// the store) is the vehicle that carries a composite member's field list — the by-name dataType
+// cannot (composite.md §2). Shared by the INSERT duplicate check and the ON CONFLICT arbiter probe
+// (upsert.md §3); a PK column is NOT NULL, so there is no presence tag at the top level.
+func encodePkKey(colTypes []colType, pk []int, colls []*Collation, row storedRow) ([]byte, error) {
 	var key []byte
 	for _, i := range pk {
-		switch {
-		case table.Columns[i].Type.IsUuid():
-			// uuid: the bare 16 bytes (uuid-raw16, encoding.md §2.7).
-			key = append(key, row[i].str()...)
-		case table.Columns[i].Type.IsBool():
-			// boolean: the bare 1-byte bool-byte (encoding.md §2.9).
-			key = append(key, encodeBool(row[i].boolVal())...)
-		case table.Columns[i].Type.IsText():
-			// text: the C …-terminated-escape body (encoding.md §2.4), or the collation's UCA
-			// sort key for a non-C collated column (text-collated-sortkey, §2.12).
-			b, err := collatedTextKey(colls[i], row[i].str())
-			if err != nil {
-				return nil, err
-			}
-			key = append(key, b...)
-		case table.Columns[i].Type.IsBytea():
-			// bytea: the variable-width bytea-terminated-escape body (encoding.md §2.6).
-			key = append(key, encodeTerminated([]byte(row[i].str()))...)
-		case table.Columns[i].Type.IsDecimal():
-			// decimal: the variable-width decimal-order-preserving body (encoding.md §2.5).
-			key = append(key, row[i].decimal().EncodeKey()...)
-		case table.Columns[i].Type.IsInterval():
-			// interval: the fixed 16-byte interval-span-i128 span key (encoding.md §2.10).
-			key = append(key, row[i].interval().EncodeKey()...)
-		case table.Columns[i].Type.IsRange():
-			// range: the recursive range-bounds container key (encoding.md §2.11, the first
-			// container key — empty/±∞/inclusivity framing around the element key).
-			elem, _ := table.Columns[i].Type.RangeElement()
-			key = append(key, encodeRangeKey(elem.ScalarTy(), row[i].rangeVal())...)
-		case table.Columns[i].Type.IsArray():
-			// array: the recursive array-elements-terminated container key (encoding.md §2.14, the
-			// second container key — element markers + terminator + shape suffix).
-			b, err := encodeArrayKey(table.Columns[i].Type.Array.ScalarTy(), row[i].arrayVal())
-			if err != nil {
-				return nil, err
-			}
-			key = append(key, b...)
-		case table.Columns[i].Type.IsFloat():
-			// float: the fixed-width float-order-preserving key (encoding.md §2.8) — NOT the integer
-			// codec (the float bits do not sort numerically as an int).
-			if table.Columns[i].Type.ScalarTy() == scalarFloat32 {
-				key = append(key, encodeFloat32Key(uint32(row[i].Int))...)
-			} else {
-				key = append(key, encodeFloat64Key(uint64(row[i].Int))...)
-			}
-		default:
-			// integers / timestamp / timestamptz / date: the fixed-width key codec.
-			key = append(key, encodeInt(table.Columns[i].Type.ScalarTy(), row[i].Int)...)
+		b, err := encodeColTypeKey(colTypes[i], row[i], colls[i])
+		if err != nil {
+			return nil, err
 		}
+		key = append(key, b...)
 	}
 	return key, nil
 }
@@ -701,16 +670,17 @@ func sameIntSet(s []int, set map[int]struct{}) bool {
 
 // arbiterKey is the arbiter key of a candidate row (spec/design/upsert.md §3): the storage key for
 // a PK arbiter (never NULL), or the unique-index prefix for an index arbiter (the bool is false
-// when a nullable arbiter column is NULL — NULLS DISTINCT, so the row never conflicts).
-func arbiterKey(arb *arbiter, table *catTable, pk []int, colls []*Collation, rindexes []resolvedIndex, row storedRow, env *evalEnv) ([]byte, bool, error) {
+// when a nullable arbiter column is NULL — NULLS DISTINCT, so the row never conflicts). colTypes is
+// the table's resolved column types (composite PK/index columns key through their field codec, §2.15).
+func arbiterKey(arb *arbiter, colTypes []colType, pk []int, colls []*Collation, rindexes []resolvedIndex, row storedRow, env *evalEnv) ([]byte, bool, error) {
 	if arb.isPK {
-		k, err := encodePkKey(table, pk, colls, row)
+		k, err := encodePkKey(colTypes, pk, colls, row)
 		if err != nil {
 			return nil, false, err
 		}
 		return k, true, nil
 	}
-	return indexPrefixKey(table.Columns, colls, &rindexes[arb.indexPos], row, env)
+	return indexPrefixKey(colTypes, colls, &rindexes[arb.indexPos], row, env)
 }
 
 // resolveOnConflict resolves an ON CONFLICT clause (spec/design/upsert.md §2/§5) into a
@@ -835,7 +805,7 @@ func (db *engine) arbiterExisting(arb *arbiter, store *tableStore, table *catTab
 // NULLS DISTINCT: a unique tuple with any NULL component never conflicts.
 func (db *engine) rowConflictsCommitted(store *tableStore, table *catTable, pk []int, colls []*Collation, rindexes []resolvedIndex, row storedRow) (bool, error) {
 	if len(pk) > 0 {
-		k, err := encodePkKey(table, pk, colls, row)
+		k, err := encodePkKey(store.colTypes, pk, colls, row)
 		if err != nil {
 			return false, err
 		}
@@ -1593,7 +1563,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 			// The composite key is the concatenation of the members' bare encodings in key
 			// order (encoding.md §2.3 — encodePkKey); a single-column key is the one-member
 			// case of the same rule.
-			k, err := encodePkKey(table, pk, colls, row)
+			k, err := encodePkKey(store.colTypes, pk, colls, row)
 			if err != nil {
 				return nil, err
 			}
@@ -1620,7 +1590,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 		// existing entry and no earlier row of this batch. Unmetered validation, like the
 		// PK duplicate check (cost.md §3).
 		for u, rindex := range uniq {
-			prefix, ok, err := indexPrefixKey(table.Columns, colls, rindex, row, idxEnv)
+			prefix, ok, err := indexPrefixKey(store.colTypes, colls, rindex, row, idxEnv)
 			if err != nil {
 				return nil, err
 			}
@@ -1650,7 +1620,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 		// appends the final storage key.
 		rowPrefixes := make([][][]byte, len(rindexes))
 		for k := range rindexes {
-			eks, err := indexEntryKeys(table.Columns, colls, &rindexes[k], nil, row, idxEnv)
+			eks, err := indexEntryKeys(table.Columns, store.colTypes, colls, &rindexes[k], nil, row, idxEnv)
 			if err != nil {
 				return nil, err
 			}
@@ -1834,7 +1804,7 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 
 	var key []byte
 	if len(pk) > 0 {
-		key, err = encodePkKey(table, pk, colls, row)
+		key, err = encodePkKey(store.colTypes, pk, colls, row)
 		if err != nil {
 			return nil, err
 		}
@@ -1850,7 +1820,7 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 		if !rindex.Unique {
 			continue
 		}
-		prefix, ok, err := indexPrefixKey(table.Columns, colls, rindex, row, env)
+		prefix, ok, err := indexPrefixKey(store.colTypes, colls, rindex, row, env)
 		if err != nil {
 			return nil, err
 		}
@@ -1877,7 +1847,7 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 	// batch-only outer row dimension is gone, and these owned prefixes become final entries in place.
 	indexEntries := make([][][]byte, len(rindexes))
 	for i := range rindexes {
-		indexEntries[i], err = indexEntryKeys(table.Columns, colls, &rindexes[i], nil, row, env)
+		indexEntries[i], err = indexEntryKeys(table.Columns, store.colTypes, colls, &rindexes[i], nil, row, env)
 		if err != nil {
 			return nil, err
 		}
@@ -2111,7 +2081,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 			// planned insert); else insert (upsert.md §2/§3).
 			var pkk []byte
 			if len(pk) > 0 {
-				k, err := encodePkKey(table, pk, colls, row)
+				k, err := encodePkKey(store.colTypes, pk, colls, row)
 				if err != nil {
 					return 0, nil, err
 				}
@@ -2236,7 +2206,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 	if len(pk) > 0 && len(inserts) > 0 {
 		seen := make(map[string]struct{}, len(inserts))
 		for _, row := range inserts {
-			k, err := encodePkKey(table, pk, colls, row)
+			k, err := encodePkKey(store.colTypes, pk, colls, row)
 			if err != nil {
 				return 0, nil, err
 			}
@@ -2388,7 +2358,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 	for _, row := range inserts {
 		kb := placeholder
 		if len(pk) > 0 {
-			k, err := encodePkKey(table, pk, colls, row)
+			k, err := encodePkKey(store.colTypes, pk, colls, row)
 			if err != nil {
 				return 0, nil, err
 			}
@@ -2472,7 +2442,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 	for i, row := range inserts {
 		var key []byte
 		if len(pk) > 0 {
-			k, err := encodePkKey(table, pk, colls, row)
+			k, err := encodePkKey(store.colTypes, pk, colls, row)
 			if err != nil {
 				return 0, nil, err
 			}
@@ -3579,7 +3549,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 		// was assigned (re-keying), else the unchanged old key.
 		newKey := e.Key
 		if pkChanged {
-			if newKey, err = encodePkKey(table, pkMembers, colls, newRow); err != nil {
+			if newKey, err = encodePkKey(store.colTypes, pkMembers, colls, newRow); err != nil {
 				return outcome{}, err
 			}
 		}
