@@ -64,9 +64,27 @@ export function isText(t: ScalarType): boolean {
 // scalarIsKeyable reports whether this scalar has an order-preserving key encoding (encoding.md §2):
 // every scalar EXCEPT json/jsonb/jsonpath (json is never comparable; the jsonb key is authored but
 // deferred, §2.13; jsonpath has no key). Used by the composite key gate (§2.15) and the container
-// element gates. Mirrors the Type-level typeIsKeyableScalar.
+// element gates. This is an EXPLICIT allowlist, NOT a `!== json/jsonb/jsonpath` denylist, so a future
+// scalar opts in deliberately and stays in lockstep with the Rust `ScalarType::is_keyable` / Go
+// `scalarType.IsKeyable` allowlists and the Type-level typeIsKeyableScalar (a denylist would silently
+// make a new scalar keyable in TS composites while the other cores reject it — a cross-core divergence).
 export function scalarIsKeyable(t: ScalarType): boolean {
-  return t !== "json" && t !== "jsonb" && t !== "jsonpath";
+  return (
+    t === "i16" ||
+    t === "i32" ||
+    t === "i64" ||
+    t === "text" ||
+    t === "boolean" ||
+    t === "decimal" ||
+    t === "bytea" ||
+    t === "uuid" ||
+    t === "timestamp" ||
+    t === "timestamptz" ||
+    t === "date" ||
+    t === "interval" ||
+    t === "f32" ||
+    t === "f64"
+  );
 }
 
 // isBool reports whether this is the boolean type (false/true; stored as a bool-byte —

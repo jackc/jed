@@ -820,7 +820,7 @@ func (db *engine) rowConflictsCommitted(store *tableStore, table *catTable, pk [
 		if !rindex.Unique {
 			continue
 		}
-		prefix, ok, err := db.indexPrefix(table.Columns, colls, rindex, row)
+		prefix, ok, err := db.indexPrefix(store.colTypes, colls, rindex, row)
 		if err != nil {
 			return false, err
 		}
@@ -2099,7 +2099,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 			}
 			if !inBatch {
 				for u, ix := range uniqIdx {
-					prefix, ok, err := db.indexPrefix(table.Columns, colls, &rindexes[ix], row)
+					prefix, ok, err := db.indexPrefix(store.colTypes, colls, &rindexes[ix], row)
 					if err != nil {
 						return 0, nil, err
 					}
@@ -2118,7 +2118,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 				insPk[string(pkk)] = struct{}{}
 			}
 			for u, ix := range uniqIdx {
-				prefix, ok, err := db.indexPrefix(table.Columns, colls, &rindexes[ix], row)
+				prefix, ok, err := db.indexPrefix(store.colTypes, colls, &rindexes[ix], row)
 				if err != nil {
 					return 0, nil, err
 				}
@@ -2131,7 +2131,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 		}
 
 		// Arbiter present (DO UPDATE always; DO NOTHING with a target).
-		ak, ok, err := db.arbiterProbeKey(plan.arb, table, pk, colls, rindexes, row)
+		ak, ok, err := db.arbiterProbeKey(plan.arb, store.colTypes, pk, colls, rindexes, row)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -2240,7 +2240,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 			istore := db.lkpIndexStore(strings.ToLower(def.Name))
 			batch := make(map[string]struct{})
 			for _, newRow := range newRows {
-				prefix, ok, err := db.indexPrefix(table.Columns, colls, rindex, newRow)
+				prefix, ok, err := db.indexPrefix(store.colTypes, colls, rindex, newRow)
 				if err != nil {
 					return 0, nil, err
 				}
@@ -2408,7 +2408,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 	for i, row := range inserts {
 		rp := make([][][]byte, len(rindexes))
 		for k := range rindexes {
-			eks, err := db.indexEntries(table.Columns, colls, &rindexes[k], nil, row)
+			eks, err := db.indexEntries(table.Columns, store.colTypes, colls, &rindexes[k], nil, row)
 			if err != nil {
 				return 0, nil, err
 			}
@@ -2420,11 +2420,11 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 	indexMoves := make([][]indexMove, len(table.Indexes))
 	for _, u := range updates {
 		for k := range rindexes {
-			oldEks, err := db.indexEntries(table.Columns, colls, &rindexes[k], u.key, u.oldRow)
+			oldEks, err := db.indexEntries(table.Columns, store.colTypes, colls, &rindexes[k], u.key, u.oldRow)
 			if err != nil {
 				return 0, nil, err
 			}
-			newEks, err := db.indexEntries(table.Columns, colls, &rindexes[k], u.key, u.newRow)
+			newEks, err := db.indexEntries(table.Columns, store.colTypes, colls, &rindexes[k], u.key, u.newRow)
 			if err != nil {
 				return 0, nil, err
 			}
@@ -3189,7 +3189,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 	toRemove := make([][][]byte, len(rindexes))
 	for k := range rindexes {
 		for _, m := range matched {
-			eks, err := db.indexEntries(table.Columns, colls, &rindexes[k], m.key, m.row)
+			eks, err := db.indexEntries(table.Columns, store.colTypes, colls, &rindexes[k], m.key, m.row)
 			if err != nil {
 				return outcome{}, err
 			}
@@ -3609,7 +3609,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			istore := db.lkpIndexStoreScoped(upd.DB, strings.ToLower(def.Name))
 			batch := make(map[string]struct{})
 			for _, u := range updates {
-				prefix, ok, err := db.indexPrefix(table.Columns, colls, rindex, u.row)
+				prefix, ok, err := db.indexPrefix(store.colTypes, colls, rindex, u.row)
 				if err != nil {
 					return outcome{}, err
 				}
@@ -3789,11 +3789,11 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			// GIN — gin.md §5). Remove old−new, insert new−old: a shared entry is left untouched,
 			// keeping the copy-on-write dirty set byte-identical across cores. Computed via a &db
 			// pass (evaluating any expression key), before the phase-2 writes.
-			oldEks, err := db.indexEntries(table.Columns, colls, &rindexes[k], u.key, u.oldRow)
+			oldEks, err := db.indexEntries(table.Columns, store.colTypes, colls, &rindexes[k], u.key, u.oldRow)
 			if err != nil {
 				return outcome{}, err
 			}
-			newEks, err := db.indexEntries(table.Columns, colls, &rindexes[k], u.newKey, u.row)
+			newEks, err := db.indexEntries(table.Columns, store.colTypes, colls, &rindexes[k], u.newKey, u.row)
 			if err != nil {
 				return outcome{}, err
 			}

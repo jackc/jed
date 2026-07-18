@@ -598,6 +598,15 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 		mask[i] = true
 	}
 	store := db.lkpStoreScoped(dbScope, original.Name)
+	// The resolved column types for the NEW table shape `t` (the vehicle a composite index column's
+	// key encoder needs, encoding.md §2.15). Resolved from t.Columns — NOT store.colTypes, which still
+	// reflects the OLD shape (fewer columns) when this ALTER also adds a column and the rows are the
+	// rewritten new-shape rows — against the main catalog (readSnap), where composite types live for
+	// both main and temp tables (CREATE TYPE is persistent), matching the sibling rewriteColTypes.
+	colTypes := make([]colType, len(t.Columns))
+	for i, c := range t.Columns {
+		colTypes[i] = resolveColType(c.Type, db.readSnap().types)
+	}
 	rows := rewritten
 	if rows == nil {
 		var pages, slabs int
@@ -652,7 +661,7 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 				return nil, err
 			}
 			if ix.Unique {
-				p, ok, err := db.indexPrefix(t.Columns, colls, &ri, row)
+				p, ok, err := db.indexPrefix(colTypes, colls, &ri, row)
 				if err != nil {
 					return nil, err
 				}
@@ -666,7 +675,7 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 					seen[nk][string(p)] = true
 				}
 			}
-			eks, err := db.indexEntries(t.Columns, colls, &ri, e.Key, row)
+			eks, err := db.indexEntries(t.Columns, colTypes, colls, &ri, e.Key, row)
 			if err != nil {
 				return nil, err
 			}

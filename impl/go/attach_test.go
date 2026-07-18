@@ -333,6 +333,52 @@ func TestAttachFileReadWritePersistsAcrossReopen(t *testing.T) {
 	}
 }
 
+// TestAttachFileCompositeColumnDML — DELETE/UPDATE/INSERT index maintenance on an ATTACHED file's
+// composite-column table must resolve the composite column through the ATTACHED file's own type
+// catalog (the store's cached colTypes), NOT the main database's catalog. The main handle here has no
+// `addr` type, so a re-resolution against readSnap() (the colTypesFor regression) would nil-deref;
+// this proves the fix keys through store.colTypes. (Attach is host-API only, so this cannot live in
+// the shared corpus — CLAUDE.md §10.) Mirrored in impl/rust/tests/attach.rs and
+// impl/ts/tests/attach.test.ts.
+func TestAttachFileCompositeColumnDML(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	// A standalone file whose OWN catalog defines the composite type `addr` and an indexed
+	// composite-column table — the type is absent from the main database that attaches it.
+	work := makeFileDB(t, dir, "work.jed", 0,
+		"CREATE TYPE addr AS (street text, zip i32)",
+		"CREATE TABLE loc (id i32 PRIMARY KEY, home addr, note i32)",
+		"CREATE INDEX loc_home ON loc (home)",
+		"INSERT INTO loc VALUES (1, ROW('Main', 5), 100), (2, ROW('Elm', 9), 200), (3, ROW('Oak', 1), 300)")
+
+	db := memDB() // the main database has no `addr` type
+	if err := db.Attach("work", AttachFile(work), false); err != nil {
+		t.Fatalf("attach file read-write: %v", err)
+	}
+	defer db.Detach("work")
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+
+	// Each of these maintains the composite `loc_home` index, encoding the composite `home` column
+	// (§2.15). Before the fix they resolved `addr` against the main catalog and crashed.
+	attachExec(t, s, "DELETE FROM work.loc WHERE id = 2")                   // removes loc_home entries
+	attachExec(t, s, "UPDATE work.loc SET note = 999 WHERE id = 3")         // recomputes loc_home (home unchanged)
+	attachExec(t, s, "INSERT INTO work.loc VALUES (4, ROW('Elm', 9), 400)") // adds a loc_home entry
+
+	rows, err := s.queryValues("SELECT id FROM work.loc ORDER BY id", nil)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	var got []int64
+	for rows.Next() {
+		got = append(got, rows.Row()[0].Int)
+	}
+	rows.Close()
+	if len(got) != 3 || got[0] != 1 || got[1] != 3 || got[2] != 4 {
+		t.Fatalf("ids = %v, want [1 3 4]", got)
+	}
+}
+
 // TestAttachFileOneDurableWriter — a transaction may write at most one FILE-backed database (§5). With
 // a FILE main and a read-write FILE attachment, a block that writes BOTH is 0A000 at COMMIT and commits
 // nothing; writing either one alone succeeds. In-memory attachments never count against the slot.

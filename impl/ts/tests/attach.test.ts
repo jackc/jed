@@ -308,6 +308,40 @@ test("file attach read-write persists across a standalone reopen", () => {
   }
 });
 
+// DELETE/UPDATE/INSERT index maintenance on an ATTACHED file's composite-column table must resolve the
+// composite column through the ATTACHED file's OWN type catalog (the store's cached colTypes), NOT the
+// main database's catalog. The main handle here has no `addr` type, so a re-resolution against
+// readSnap() (the colTypesFor regression) would throw; this proves the fix keys through
+// store.columnTypes(). Attach is host-API only (out of corpus reach — CLAUDE.md §10). Mirrors
+// impl/go/attach_test.go TestAttachFileCompositeColumnDML and impl/rust/tests/attach.rs.
+test("attached file composite-column DML keys through the attached catalog", () => {
+  const dir = tmpDir();
+  try {
+    // A standalone file whose OWN catalog defines the composite type `addr` and an indexed
+    // composite-column table — the type is absent from the main database that attaches it.
+    const work = makeFileDb(dir, "work.jed", 0, [
+      "CREATE TYPE addr AS (street text, zip i32)",
+      "CREATE TABLE loc (id i32 PRIMARY KEY, home addr, note i32)",
+      "CREATE INDEX loc_home ON loc (home)",
+      "INSERT INTO loc VALUES (1, ROW('Main', 5), 100), (2, ROW('Elm', 9), 200), (3, ROW('Oak', 1), 300)",
+    ]);
+    const db = memDb(); // the main database has no `addr` type
+    db.attach("work", attachFile(work), false);
+    const s = db.session();
+    // Each maintains the composite `loc_home` index, encoding the composite `home` column (§2.15).
+    // Before the fix these resolved `addr` against the main catalog and threw.
+    s.execute("DELETE FROM work.loc WHERE id = 2");
+    s.execute("UPDATE work.loc SET note = 999 WHERE id = 3"); // recomputes loc_home (home unchanged)
+    s.execute("INSERT INTO work.loc VALUES (4, ROW('Elm', 9), 400)");
+    assert.deepEqual(intCol(s, "SELECT id FROM work.loc ORDER BY id"), [1n, 3n, 4n]);
+    s.close();
+    db.detach("work");
+    db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // A transaction may write at most one FILE-backed database (§5). With a FILE main and a read-write FILE
 // attachment, a block that writes BOTH is 0A000 at COMMIT and commits nothing; writing either one alone
 // succeeds. In-memory attachments never count against the slot.

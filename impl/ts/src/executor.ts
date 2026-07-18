@@ -5684,19 +5684,16 @@ export class Engine {
     return table.indexes.map((d) => this.resolveIndex(table, d, ptypes));
   }
 
-  // colTypesFor resolves the given columns to their self-contained ColTypes against the current
-  // snapshot's composite definitions — the vehicle a composite PK/index key encoder needs (encoding.md
-  // §2.15). Cheap for the common (scalar/container) case; a composite column resolves its field tree.
-  colTypesFor(columns: Column[]): ColType[] {
-    const types = this.readSnap().types;
-    return columns.map((c) => resolveColType(c.type, types));
-  }
-
   // indexEntries is a row's secondary-index entry keys for maintenance (spec/design/indexes.md §4),
   // building the unmetered eval env internally (an index expression is immutable). Callers compute all
-  // entries through this before mutating a store.
+  // entries through this before mutating a store. colTypes is the table's resolved per-column types —
+  // the store's cached colTypes (store.columnTypes()), NOT a re-resolution against readSnap().types: a
+  // composite column keys through its field codec (encoding.md §2.15), and the store's colTypes were
+  // resolved against the OWNING database's type catalog, so an attached-DB table whose composite type
+  // lives in the attached file keys correctly (a main-catalog re-resolution would miss it).
   private indexEntries(
     columns: Column[],
+    colTypes: ColType[],
     colls: (Collation | null)[],
     rindex: ResolvedIndex,
     storageKey: Uint8Array,
@@ -5704,7 +5701,7 @@ export class Engine {
   ): Uint8Array[] {
     return indexEntryKeys(
       columns,
-      this.colTypesFor(columns),
+      colTypes,
       colls,
       rindex,
       storageKey,
@@ -5714,41 +5711,29 @@ export class Engine {
   }
 
   // indexPrefix is a row's uniqueness-probe prefix for one index (spec/design/indexes.md §8), building
-  // the unmetered eval env internally (as indexEntries).
+  // the unmetered eval env internally (as indexEntries). colTypes is the store's cached per-column
+  // types (see indexEntries).
   private indexPrefix(
-    columns: Column[],
+    colTypes: ColType[],
     colls: (Collation | null)[],
     rindex: ResolvedIndex,
     row: Row,
   ): Uint8Array | null {
-    return indexPrefixKey(
-      this.colTypesFor(columns),
-      colls,
-      rindex,
-      row,
-      this.maintenanceEnv(new StmtRng()),
-    );
+    return indexPrefixKey(colTypes, colls, rindex, row, this.maintenanceEnv(new StmtRng()));
   }
 
   // arbiterProbeKey is a candidate row's arbiter key for ON CONFLICT (spec/design/upsert.md §3),
   // building the unmetered eval env internally (an expression-index arbiter evaluates its keys).
+  // colTypes is the store's cached per-column types (see indexEntries).
   private arbiterProbeKey(
     arb: Arbiter,
-    table: Table,
+    colTypes: ColType[],
     pk: number[],
     colls: (Collation | null)[],
     rindexes: ResolvedIndex[],
     row: Row,
   ): Uint8Array | null {
-    return arbiterKey(
-      arb,
-      this.colTypesFor(table.columns),
-      pk,
-      colls,
-      rindexes,
-      row,
-      this.maintenanceEnv(new StmtRng()),
-    );
+    return arbiterKey(arb, colTypes, pk, colls, rindexes, row, this.maintenanceEnv(new StmtRng()));
   }
 
   // resolveDefaultExprs resolves each column's EXPRESSION default (constraints.md §2) to an
@@ -6964,6 +6949,12 @@ export class Engine {
         meter.charge(COSTS.pageRead * BigInt(all.pages) + COSTS.valueDecompress * BigInt(all.slabs));
       const checks = this.resolveChecks(table),
         colls = this.columnCollations(table.columns),
+        // Resolved column types for the NEW table shape `table` (the composite index key vehicle,
+        // §2.15). From table.columns — NOT store.columnTypes(), which still reflects the OLD shape
+        // (fewer columns) when this ALTER also adds a column and the rows are the rewritten new-shape
+        // rows — against the main catalog (readSnap), where composite types live for both main and temp
+        // tables (CREATE TYPE is persistent), matching the sibling rewriteColTypes.
+        alterColTypes = table.columns.map((c) => resolveColType(c.type, this.readSnap().types)),
         seen = new Map<string, Set<string>>();
       for (const entry of all.entries) {
         meter.guard();
@@ -6977,7 +6968,7 @@ export class Engine {
           if (!addedConstraints.has(k)) continue;
           const ri = this.resolveIndex(table, ix);
           if (ix.unique) {
-            const p = this.indexPrefix(table.columns, colls, ri, row);
+            const p = this.indexPrefix(alterColTypes, colls, ri, row);
             if (p) {
               let s = seen.get(k);
               if (!s) {
@@ -6990,7 +6981,7 @@ export class Engine {
             }
           }
           const es = constraintEntries.get(k) ?? [];
-          es.push(...this.indexEntries(table.columns, colls, ri, entry.key, row));
+          es.push(...this.indexEntries(table.columns, alterColTypes, colls, ri, entry.key, row));
           constraintEntries.set(k, es);
         }
       }
@@ -7051,7 +7042,7 @@ export class Engine {
         const entries: Uint8Array[] = [];
         for (const row of rewriteRows!)
           entries.push(
-            ...this.indexEntries(table.columns, colls, resolved, row.key, row.row),
+            ...this.indexEntries(table.columns, rewriteColTypes!, colls, resolved, row.key, row.row),
           );
         entries.sort(compareBytes);
         constraintEntries.set(index.name.toLowerCase(), entries);
@@ -9715,7 +9706,7 @@ export class Engine {
     if (pk.length > 0 && store.get(encodePkKey(store.columnTypes(), pk, colls, row)) !== undefined) return true;
     for (const rindex of rindexes) {
       if (!rindex.unique) continue;
-      const prefix = this.indexPrefix(table.columns, colls, rindex, row);
+      const prefix = this.indexPrefix(store.columnTypes(), colls, rindex, row);
       if (prefix === null) continue;
       if (
         this.readSnap().indexStore(rindex.name.toLowerCase()).rangeEntries(uniqueProbeBound(prefix))
@@ -9906,7 +9897,7 @@ export class Engine {
         if (!conflictHit && pkk !== null && insPk.has(pkk.join(","))) conflictHit = true;
         if (!conflictHit) {
           for (let u = 0; u < uniqIdx.length; u++) {
-            const prefix = this.indexPrefix(table.columns, colls, rindexes[uniqIdx[u]!]!, row);
+            const prefix = this.indexPrefix(store.columnTypes(), colls, rindexes[uniqIdx[u]!]!, row);
             if (prefix !== null && insPrefixes[u]!.has(prefix.join(","))) {
               conflictHit = true;
               break;
@@ -9916,7 +9907,7 @@ export class Engine {
         if (conflictHit) continue; // skip
         if (pkk !== null) insPk.add(pkk.join(","));
         for (let u = 0; u < uniqIdx.length; u++) {
-          const prefix = this.indexPrefix(table.columns, colls, rindexes[uniqIdx[u]!]!, row);
+          const prefix = this.indexPrefix(store.columnTypes(), colls, rindexes[uniqIdx[u]!]!, row);
           if (prefix !== null) insPrefixes[u]!.add(prefix.join(","));
         }
         inserts.push(row);
@@ -9924,7 +9915,7 @@ export class Engine {
       }
 
       // Arbiter present (DO UPDATE always; DO NOTHING with a target).
-      const ak = this.arbiterProbeKey(plan.arb, table, pk, colls, rindexes, row);
+      const ak = this.arbiterProbeKey(plan.arb, store.columnTypes(), pk, colls, rindexes, row);
       if (ak === null) {
         // A NULL-bearing arbiter key never conflicts (NULLS DISTINCT) — plain insert.
         inserts.push(row);
@@ -10001,7 +9992,7 @@ export class Engine {
         const istore = this.lkpIndexStore(def.name.toLowerCase());
         const batch = new Set<string>();
         for (const newRow of newRows) {
-          const prefix = this.indexPrefix(table.columns, colls, rindexes[ix]!, newRow);
+          const prefix = this.indexPrefix(store.columnTypes(), colls, rindexes[ix]!, newRow);
           if (prefix === null) continue;
           const k = prefix.join(",");
           const conflict =
@@ -10092,7 +10083,7 @@ export class Engine {
     // sets (keys already known).
     const insertPrefixes: Uint8Array[][][] = inserts.map((row) =>
       rindexes.map((rindex) =>
-        this.indexEntries(table.columns, colls, rindex, new Uint8Array(0), row),
+        this.indexEntries(table.columns, store.columnTypes(), colls, rindex, new Uint8Array(0), row),
       ),
     );
     const indexMoves: { removals: Uint8Array[]; insertions: Uint8Array[] }[][] = table.indexes.map(
@@ -10100,8 +10091,8 @@ export class Engine {
     );
     for (const u of updates) {
       for (let k = 0; k < table.indexes.length; k++) {
-        const oldEks = this.indexEntries(table.columns, colls, rindexes[k]!, u.key, u.oldRow);
-        const newEks = this.indexEntries(table.columns, colls, rindexes[k]!, u.key, u.newRow);
+        const oldEks = this.indexEntries(table.columns, store.columnTypes(), colls, rindexes[k]!, u.key, u.oldRow);
+        const newEks = this.indexEntries(table.columns, store.columnTypes(), colls, rindexes[k]!, u.key, u.newRow);
         const removals = bytesDiff(oldEks, newEks);
         const insertions = bytesDiff(newEks, oldEks);
         if (removals.length > 0 || insertions.length > 0)
@@ -10705,7 +10696,7 @@ export class Engine {
     const toRemove: Uint8Array[][] = rindexes.map((rindex) => {
       const acc: Uint8Array[] = [];
       for (const m of matched)
-        acc.push(...this.indexEntries(table.columns, colls, rindex, m.key, m.row));
+        acc.push(...this.indexEntries(table.columns, store.columnTypes(), colls, rindex, m.key, m.row));
       return acc;
     });
     // Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
@@ -11052,7 +11043,7 @@ export class Engine {
         const istore = this.lkpIndexStoreScoped(upd.db, rindex.name.toLowerCase());
         const batch = new Set<string>();
         for (const u of updates) {
-          const prefix = this.indexPrefix(table.columns, colls, rindex, u.row);
+          const prefix = this.indexPrefix(store.columnTypes(), colls, rindex, u.row);
           if (prefix === null) continue;
           const k = prefix.join(",");
           const conflict =
@@ -11175,8 +11166,8 @@ export class Engine {
         // gin.md §5). Remove old−new, insert new−old: a shared entry is left untouched, keeping the
         // copy-on-write dirty set byte-identical across cores. Computed (evaluating any expression
         // key) before the phase-2 writes.
-        const oldEks = this.indexEntries(table.columns, colls, rindexes[k]!, u.key, u.oldRow);
-        const newEks = this.indexEntries(table.columns, colls, rindexes[k]!, u.newKey, u.row);
+        const oldEks = this.indexEntries(table.columns, store.columnTypes(), colls, rindexes[k]!, u.key, u.oldRow);
+        const newEks = this.indexEntries(table.columns, store.columnTypes(), colls, rindexes[k]!, u.newKey, u.row);
         const removals = bytesDiff(oldEks, newEks);
         const insertions = bytesDiff(newEks, oldEks);
         if (removals.length > 0 || insertions.length > 0) {

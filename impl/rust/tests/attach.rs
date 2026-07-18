@@ -339,6 +339,45 @@ fn attach_file_read_write_persists_across_reopen() {
     assert_eq!(tbl.indexes[0].name, "acct_bal");
 }
 
+/// DELETE/UPDATE/INSERT index maintenance on an ATTACHED file's composite-column table must resolve
+/// the composite column through the ATTACHED file's OWN type catalog (the store's cached col_types),
+/// NOT the main database's catalog. The main handle here has no `addr` type; index maintenance keys
+/// through `store.col_types()` scoped by the statement's database, so it stays correct. (This mirrors
+/// the Go/TS regression where the wrappers re-resolved against the main catalog and crashed —
+/// impl/go/attach_test.go TestAttachFileCompositeColumnDML / impl/ts/tests/attach.test.ts.)
+#[test]
+fn attach_file_composite_column_dml() {
+    // A standalone file whose OWN catalog defines the composite type `addr` and an indexed
+    // composite-column table — the type is absent from the main database that attaches it.
+    let work = make_file_db(
+        tmp("work_composite.jed"),
+        0,
+        &[
+            "CREATE TYPE addr AS (street text, zip i32)",
+            "CREATE TABLE loc (id i32 PRIMARY KEY, home addr, note i32)",
+            "CREATE INDEX loc_home ON loc (home)",
+            "INSERT INTO loc VALUES (1, ROW('Main', 5), 100), (2, ROW('Elm', 9), 200), (3, ROW('Oak', 1), 300)",
+        ],
+    );
+    let db = mem_db(); // the main database has no `addr` type
+    db.attach("work", AttachSource::file(&work), false)
+        .expect("attach file read-write");
+    let mut s = db.session(SessionOptions::default());
+    // Each maintains the composite `loc_home` index, encoding the composite `home` column (§2.15).
+    exec(&mut s, "DELETE FROM work.loc WHERE id = 2");
+    exec(&mut s, "UPDATE work.loc SET note = 999 WHERE id = 3"); // recomputes loc_home (home unchanged)
+    exec(
+        &mut s,
+        "INSERT INTO work.loc VALUES (4, ROW('Elm', 9), 400)",
+    );
+    assert_eq!(
+        query_ints(&mut s, "SELECT id FROM work.loc ORDER BY id"),
+        vec![1, 3, 4]
+    );
+    s.close();
+    db.detach("work").expect("detach");
+}
+
 /// A transaction may write at most one FILE-backed database (§5). With a FILE main and a read-write
 /// FILE attachment, a block that writes BOTH is 0A000 at COMMIT and commits nothing; writing either one
 /// alone succeeds. In-memory attachments never count against the slot.

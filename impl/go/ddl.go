@@ -1342,36 +1342,30 @@ func (db *engine) indexMaintEnv() *evalEnv {
 	return &evalEnv{exec: db, rng: newStmtRng()}
 }
 
-// colTypesFor resolves the given columns to their self-contained colTypes against the current
-// snapshot's composite definitions — the vehicle a composite PK/index key encoder needs (encoding.md
-// §2.15). Cheap for the common (scalar/container) case; a composite column resolves its field tree.
-func (db *engine) colTypesFor(columns []catColumn) []colType {
-	types := db.readSnap().types
-	out := make([]colType, len(columns))
-	for i, c := range columns {
-		out[i] = resolveColType(c.Type, types)
-	}
-	return out
-}
-
 // indexEntries computes a row's secondary-index entry keys for maintenance (spec/design/indexes.md
 // §4), building the unmetered eval env internally. Returns owned bytes, so callers compute all
-// entries through this &engine call BEFORE the store-mutating writes.
-func (db *engine) indexEntries(columns []catColumn, colls []*Collation, rindex *resolvedIndex, storageKey []byte, row storedRow) ([][]byte, error) {
-	return indexEntryKeys(columns, db.colTypesFor(columns), colls, rindex, storageKey, row, db.indexMaintEnv())
+// entries through this &engine call BEFORE the store-mutating writes. colTypes is the table's
+// resolved per-column types — the store's cached colTypes (store.colTypes), NOT a re-resolution
+// against readSnap().types: a composite column keys through its field codec (encoding.md §2.15), and
+// the store's colTypes were resolved against the OWNING database's type catalog, so an attached-DB
+// table whose composite type lives in the attached file keys correctly (a main-catalog re-resolution
+// would miss it).
+func (db *engine) indexEntries(columns []catColumn, colTypes []colType, colls []*Collation, rindex *resolvedIndex, storageKey []byte, row storedRow) ([][]byte, error) {
+	return indexEntryKeys(columns, colTypes, colls, rindex, storageKey, row, db.indexMaintEnv())
 }
 
 // indexPrefix computes a row's uniqueness-probe prefix for one index (spec/design/indexes.md §8),
-// building the unmetered eval env internally (as indexEntries).
-func (db *engine) indexPrefix(columns []catColumn, colls []*Collation, rindex *resolvedIndex, row storedRow) ([]byte, bool, error) {
-	return indexPrefixKey(db.colTypesFor(columns), colls, rindex, row, db.indexMaintEnv())
+// building the unmetered eval env internally (as indexEntries). colTypes is the store's cached
+// per-column types (see indexEntries).
+func (db *engine) indexPrefix(colTypes []colType, colls []*Collation, rindex *resolvedIndex, row storedRow) ([]byte, bool, error) {
+	return indexPrefixKey(colTypes, colls, rindex, row, db.indexMaintEnv())
 }
 
 // arbiterProbeKey computes a candidate row's arbiter key for ON CONFLICT (spec/design/upsert.md §3),
 // building the unmetered eval env internally (an expression-index arbiter evaluates its keys — as
-// indexPrefix).
-func (db *engine) arbiterProbeKey(arb *arbiter, table *catTable, pk []int, colls []*Collation, rindexes []resolvedIndex, row storedRow) ([]byte, bool, error) {
-	return arbiterKey(arb, db.colTypesFor(table.Columns), pk, colls, rindexes, row, db.indexMaintEnv())
+// indexPrefix). colTypes is the store's cached per-column types (see indexEntries).
+func (db *engine) arbiterProbeKey(arb *arbiter, colTypes []colType, pk []int, colls []*Collation, rindexes []resolvedIndex, row storedRow) ([]byte, bool, error) {
+	return arbiterKey(arb, colTypes, pk, colls, rindexes, row, db.indexMaintEnv())
 }
 
 // evalDefault is the value an omitted column or a DEFAULT value slot takes (constraints.md §2):
@@ -2261,7 +2255,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			}
 			key := strings.ToLower(ix.Name)
 			for _, entry := range rewriteRows {
-				es, err := db.indexEntries(table.Columns, colls, &ri, entry.Key, entry.Row)
+				es, err := db.indexEntries(table.Columns, rewriteColTypes, colls, &ri, entry.Key, entry.Row)
 				if err != nil {
 					return outcome{}, err
 				}
@@ -3216,7 +3210,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			return outcome{}, err
 		}
 		if def.Unique {
-			prefix, ok, err := db.indexPrefix(columns, colls, &rindex, row)
+			prefix, ok, err := db.indexPrefix(store.colTypes, colls, &rindex, row)
 			if err != nil {
 				return outcome{}, err
 			}
@@ -3227,7 +3221,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 				seenPrefixes[string(prefix)] = true
 			}
 		}
-		eks, err := db.indexEntries(columns, colls, &rindex, e.Key, row)
+		eks, err := db.indexEntries(columns, store.colTypes, colls, &rindex, e.Key, row)
 		if err != nil {
 			return outcome{}, err
 		}
