@@ -61,7 +61,7 @@ import {
 import { NEG_INFINITY, POS_INFINITY, parseTimestamp, parseTimestamptz } from "./timestamp.ts";
 import { DATE_NEG_INFINITY, DATE_POS_INFINITY, dateClockSpecial, parseDate } from "./date.ts";
 import { parseInterval, tsShift } from "./interval.ts";
-import { jsonbIn, validateJson } from "./json.ts";
+import { jsonbIn, jsonbOut, validateJson } from "./json.ts";
 import type { BinaryOp, InsertValue, Literal } from "./ast.ts";
 import type { ColField, ColType } from "./catalog.ts";
 import { rangeForElement } from "./range.ts";
@@ -179,8 +179,7 @@ export function storeValue(
       throw typeError(
         "cannot store an interval value in " + canonicalName(colTy) + " column " + colName,
       );
-    // A json/jsonb value stores into a json/jsonb column verbatim (J1); any other target is a 42804
-    // type mismatch. In J0 no json/jsonb column exists, so this always errors.
+    // A json value stores into a json column verbatim. json → jsonb remains explicit-only.
     case "json":
       if (isJson(colTy)) return v;
       throw typeError(
@@ -188,6 +187,8 @@ export function storeValue(
       );
     case "jsonb":
       if (isJsonb(colTy)) return v;
+      // jsonb → json is an assignment cast (json.md §6.1): store jsonbOut's canonical text.
+      if (isJson(colTy)) return jsonValue(jsonbOut(v.node));
       throw typeError(
         "cannot store a jsonb value in " + canonicalName(colTy) + " column " + colName,
       );

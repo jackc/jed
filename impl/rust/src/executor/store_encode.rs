@@ -240,8 +240,7 @@ pub(crate) fn store_value(
             "cannot store a jsonpath value in {} column {col_name}",
             col_ty.canonical_name()
         ))),
-        // A json/jsonb value stores into a json/jsonb column verbatim (J1); any other target is a
-        // 42804 type mismatch. In J0 no json/jsonb column exists, so this always errors.
+        // A json value stores into a json column verbatim. json → jsonb remains explicit-only.
         Value::Json(s) => {
             if col_ty.is_json() {
                 Ok(Value::Json(s))
@@ -255,6 +254,10 @@ pub(crate) fn store_value(
         Value::Jsonb(n) => {
             if col_ty.is_jsonb() {
                 Ok(Value::Jsonb(n))
+            } else if col_ty.is_json() {
+                // jsonb → json is an assignment cast (json.md §6.1): the textual json column
+                // receives jsonb_out's canonical representation, not the source input spelling.
+                Ok(Value::Json(json::jsonb_out(&n)))
             } else {
                 Err(type_error(format!(
                     "cannot store a jsonb value in {} column {col_name}",

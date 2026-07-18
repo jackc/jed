@@ -50,7 +50,6 @@ import {
   isTimestamp,
   isTimestamptz,
   isUuid,
-  promoteFloat,
   rank,
   scalarT,
 } from "./types.ts";
@@ -352,76 +351,6 @@ export function resolvedTypeOfCol(ty: Type, db: Engine): ResolvedType {
       type: resolvedTypeOfCol(f.type, db),
     })),
   };
-}
-
-// assignableTo reports whether a projected value of type `t` is assignable to a `colTy` column
-// for storage — the FAMILY-level gate INSERT ... SELECT applies up front (spec/design/grammar.md
-// §24), before any row is produced (so it fires even over an empty source). It is the
-// family-level subset of storeValue and MUST agree with it: an integer assigns to an integer or
-// decimal column (int→decimal widens), a decimal only to a decimal column (decimal→int is
-// explicit-CAST only), text to text/uuid/bytea/timestamp/timestamptz (the documented text
-// adaptation — the per-row store then parses, trapping 22P02/22007 on malformed input),
-// boolean→boolean, uuid→uuid, bytea→bytea, a timestamp only to a timestamp column and a
-// timestamptz only to a timestamptz column (the two never cross — they do not even compare,
-// timestamp.md), and a NULL-typed projection to any column (a NOT NULL target then traps 23502
-// per row). A non-assignable pair is a 42804.
-export function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
-  switch (t.kind) {
-    case "null":
-      return true;
-    // A composite source never assigns to a scalar column (the composite-target case is handled
-    // structurally at the call site — spec/design/composite.md §4).
-    case "composite":
-      return false;
-    // An array source never assigns to a scalar column (INSERT ... SELECT into an array column is
-    // deferred — spec/design/array.md §12).
-    case "array":
-      return false;
-    case "int":
-      return isInteger(colTy) || isDecimal(colTy);
-    case "decimal":
-      return isDecimal(colTy);
-    case "float":
-      // A float assigns only to a float column, within-family WIDENING only (f32 → f64 is
-      // lossless/implicit; f64 → f32 is lossy and needs an explicit CAST — float.md §2/§6).
-      // No int/decimal ↔ float storage adaptation (a strict island). storeValue mirrors this.
-      return isFloat(colTy) && promoteFloat(t.ty, colTy) === colTy;
-    case "bool":
-      return isBool(colTy);
-    case "text":
-      return (
-        isText(colTy) ||
-        isUuid(colTy) ||
-        isBytea(colTy) ||
-        isTimestamp(colTy) ||
-        isTimestamptz(colTy) ||
-        isInterval(colTy) ||
-        isDate(colTy)
-      );
-    case "bytea":
-      return isBytea(colTy);
-    case "uuid":
-      return isUuid(colTy);
-    case "timestamp":
-      return isTimestamp(colTy);
-    case "timestamptz":
-      return isTimestamptz(colTy);
-    case "date":
-      return isDate(colTy);
-    case "interval":
-      return isInterval(colTy);
-    // A range source never assigns to a scalar column (a range column is not storable yet — R2).
-    case "range":
-      return false;
-    // A json/jsonb source never assigns to a scalar column (a json/jsonb column is not storable yet —
-    // J1; declaring one is 0A000 this slice, so this is unreachable).
-    case "json":
-    case "jsonb":
-      return false;
-    // A jsonpath value never assigns to a column (a jsonpath column is 0A000 — literal-only).
-    case "jsonpath":
-      return false;
-  }
 }
 
 // rtName is `t`'s type name, for a 42804 assignability message (the integer width is exact).

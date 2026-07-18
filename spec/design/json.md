@@ -221,6 +221,22 @@ where PG observably differs (`json_object_keys` preserves duplicate keys; `json_
 preserves input order — recorded as data in the catalog, not branchy code; see
 [json-sql-functions.md](json-sql-functions.md)).
 
+### 4.1 Storage assignment
+
+Every scalar write path uses the same storage-assignability rule: `INSERT ... SELECT`, constant
+and expression defaults, ordinary `UPDATE`, and `ON CONFLICT DO UPDATE`. `json → json` and
+`jsonb → jsonb` are identities, so textual `json` keeps its verbatim bytes and `jsonb` keeps its
+canonical node tree. `jsonb → json` is the §6.1 **assignment cast**: the storage boundary renders
+the node through `jsonb_out` and stores that canonical text as the `json` value. SQL `NULL` assigns
+to either nullable type normally.
+
+The reverse `json → jsonb` direction remains **explicit-only** (`value::jsonb`): jed does not
+silently discard whitespace, key order, or duplicate keys on assignment. PostgreSQL admits that
+direction as an assignment cast; rejecting it with `42804` is jed's deliberate strict-matrix
+divergence. A bare string literal still adapts through `json_in` / `jsonb_in`, as described in §6.1.
+Composite-column UPDATE, `jsonpath` columns, and the separately documented container-parameter /
+upsert limitations are unaffected by this scalar rule.
+
 ---
 
 ## 5. Comparison / ordering
@@ -282,6 +298,10 @@ preserves input order — recorded as data in the catalog, not branchy code; see
 | `jsonb` | `text` | explicit | `jsonb_out` canonical form |
 | `text` | `json` | explicit | runtime `json_in` (validate, store verbatim) |
 | `text` | `jsonb` | explicit | runtime `jsonb_in` (parse + canonicalize) |
+
+The `jsonb → json` assignment mode applies at every scalar storage boundary (§4.1). The reverse
+row stays explicit-only even though PostgreSQL also admits it in assignment context; this is the
+strict-matrix divergence recorded in §4.1 and the conformance override ledger.
 
 **Literal vs runtime split** (the established jed convention — [casts.toml](../types/casts.toml)
 comment block; [array.md §7](array.md)): a string-**literal** coerced by a named JSON type

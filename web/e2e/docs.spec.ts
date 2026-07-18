@@ -68,6 +68,15 @@ test('the types page autoruns the array cast demo', async ({ page }) => {
   await expect(rows).toContainText('{2,2,-3}');
 });
 
+test('the types page updates json/jsonb through the shared assignment rule', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // Eighth panel = jsonb expression assignment plus jsonb → json assignment from the OLD row.
+  const jsonUpdatePanel = page.getByTestId('live-sql').nth(7);
+  const rows = jsonUpdatePanel.getByTestId('result-rows');
+  await expect(rows).toContainText('{"a": 1, "active": true}');
+  await expect(rows).toContainText('{"a": 1}');
+});
+
 test('the tables page enforces a CHECK constraint live and resets to seed', async ({ page }) => {
   await page.goto('/docs/sql/tables/');
   const panel = page.getByTestId('live-sql');

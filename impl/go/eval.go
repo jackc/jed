@@ -919,37 +919,11 @@ func coerceCase(v Value, toDecimal bool) Value {
 	return v
 }
 
-// requireAssignable: a value assigned to a column must match its family — an integer column
-// takes an integer (or NULL) value; a decimal column takes an integer (int→decimal implicit) or
-// decimal (or NULL) value; a text column takes a text (or NULL) value; a boolean column takes a
-// boolean (or NULL) value. A decimal value into an integer column is NOT assignable (decimal→int
-// is explicit-CAST only). Any cross-family pair is a 42804 type error. Mirrors the INSERT literal
-// type-check, generalized to expressions.
+// requireAssignable applies the authoritative scalar storage-assignment predicate. UPDATE and
+// ON CONFLICT DO UPDATE therefore use the same family gate as INSERT ... SELECT and expression
+// defaults; storeValue performs the value coercion after evaluation.
 func requireAssignable(t resolvedType, colTy scalarType, col string) error {
-	var ok bool
-	switch {
-	case colTy.IsBool():
-		ok = t.kind == rtBool || t.kind == rtNull
-	case colTy.IsInteger():
-		ok = t.kind == rtInt || t.kind == rtNull
-	case colTy.IsDecimal():
-		ok = t.kind == rtInt || t.kind == rtDecimal || t.kind == rtNull
-	case colTy.IsBytea():
-		ok = t.kind == rtBytea || t.kind == rtNull
-	case colTy.IsUuid():
-		ok = t.kind == rtUuid || t.kind == rtNull
-	case colTy.IsTimestamp():
-		ok = t.kind == rtTimestamp || t.kind == rtNull
-	case colTy.IsTimestamptz():
-		ok = t.kind == rtTimestamptz || t.kind == rtNull
-	case colTy.IsInterval():
-		ok = t.kind == rtInterval || t.kind == rtNull
-	case colTy.IsDate():
-		ok = t.kind == rtDate || t.kind == rtNull
-	default: // text
-		ok = t.kind == rtText || t.kind == rtNull
-	}
-	if !ok {
+	if !assignableTo(t, colTy) {
 		return typeError("cannot assign a value to column " + col + " of type " + colTy.CanonicalName())
 	}
 	return nil

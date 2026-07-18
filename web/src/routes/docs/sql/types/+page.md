@@ -37,6 +37,14 @@
   (ARRAY[1, 2, 3]::i32[])::i64[]             AS widen_elements,
   (ARRAY[1.7, 2.2, -2.5]::numeric[])::i32[]  AS round_elements;`;
 
+	const jsonUpdateDemo = `CREATE TABLE docs (id i32 PRIMARY KEY, body jsonb, raw json);
+INSERT INTO docs VALUES (1, '{"a":1}', '{ "a" : 1 }');
+UPDATE docs
+SET body = body || '{"active":true}',
+    raw = body
+WHERE id = 1
+RETURNING body, raw;`;
+
 	const nullDemo = `SELECT
   (NULL = NULL)   AS eq,
   (NULL IS NULL)  AS is_null,
@@ -175,6 +183,16 @@ The element cast follows the scalar matrix exactly — so widening (`i32[] → i
 (rounding half away from zero), and `text[] → i32[]` all work, while an element pair with no scalar
 cast is a type error (`42804`). Like `uuid`/`json → text`, `array → text` is explicit-only: an array
 never silently lands in a `text` column.
+
+## JSON assignment
+
+`json` preserves its input spelling; `jsonb` stores a canonical document. Both can be updated from
+literals, columns, or expressions. Assigning `jsonb` to `json` stores the canonical `jsonb` text,
+while the reverse direction needs an explicit `::jsonb` because it can discard whitespace, key
+order, and duplicate keys. In a multi-column `UPDATE`, every right-hand side reads the old row, so
+`raw = body` below captures the pre-update canonical document:
+
+<LiveSql query={jsonUpdateDemo} rows={1} />
 
 ## Three-valued NULL logic
 

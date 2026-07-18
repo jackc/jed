@@ -997,44 +997,11 @@ pub(crate) fn require_bool(ty: &ResolvedType, msg: &str) -> Result<()> {
     }
 }
 
-/// A value assigned to a column must match its family: an integer column takes an
-/// integer (or NULL) value; a text column takes a text (or NULL) value; a boolean column
-/// takes a boolean (or NULL) value. Any cross-family pair is a 42804 type error. Mirrors
-/// the INSERT literal type-check, generalized to expressions.
+/// Require the authoritative scalar storage-assignment predicate. Keeping the predicate on
+/// [`ResolvedType::assignable_to`] makes UPDATE / ON CONFLICT DO UPDATE use the same family gate as
+/// INSERT ... SELECT and expression defaults; [`store_value`] then performs the value coercion.
 pub(crate) fn require_assignable(ty: &ResolvedType, col_ty: ScalarType, col: &str) -> Result<()> {
-    let ok = if col_ty.is_integer() {
-        matches!(ty, ResolvedType::Int(_) | ResolvedType::Null)
-    } else if col_ty.is_decimal() {
-        // int → decimal is implicit (lossless); decimal → decimal re-scales. A decimal value
-        // into an integer column is NOT assignable (decimal→int is explicit-CAST only).
-        matches!(
-            ty,
-            ResolvedType::Int(_) | ResolvedType::Decimal | ResolvedType::Null
-        )
-    } else if col_ty.is_bool() {
-        matches!(ty, ResolvedType::Bool | ResolvedType::Null)
-    } else if col_ty.is_bytea() {
-        matches!(ty, ResolvedType::Bytea | ResolvedType::Null)
-    } else if col_ty.is_uuid() {
-        matches!(ty, ResolvedType::Uuid | ResolvedType::Null)
-    } else if col_ty.is_timestamp() {
-        matches!(ty, ResolvedType::Timestamp | ResolvedType::Null)
-    } else if col_ty.is_timestamptz() {
-        matches!(ty, ResolvedType::Timestamptz | ResolvedType::Null)
-    } else if col_ty.is_interval() {
-        matches!(ty, ResolvedType::Interval | ResolvedType::Null)
-    } else if col_ty.is_date() {
-        matches!(ty, ResolvedType::Date | ResolvedType::Null)
-    } else if col_ty.is_float() {
-        // A float value assigns to an equal-or-wider float column: f32 → f32/f64
-        // (implicit widening), f64 → f64 only (f64 → f32 is explicit-CAST only).
-        matches!(ty, ResolvedType::Float(st) if st.rank() <= col_ty.rank())
-            || matches!(ty, ResolvedType::Null)
-    } else {
-        // text column
-        matches!(ty, ResolvedType::Text | ResolvedType::Null)
-    };
-    if ok {
+    if ty.assignable_to(col_ty) {
         Ok(())
     } else {
         Err(type_error(format!(

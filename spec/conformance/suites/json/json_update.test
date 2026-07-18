@@ -1,0 +1,170 @@
+# JSON scalar storage assignment (spec/design/json.md §4/§6.1). UPDATE, INSERT ... SELECT,
+# expression defaults, and ON CONFLICT DO UPDATE share one storage-assignability rule: json/jsonb
+# identity assignments preserve their respective representations; jsonb → json is an assignment
+# cast through canonical jsonb_out text; json → jsonb remains explicit-only in jed's strict matrix.
+# UPDATE is two-phase, so a runtime json_in failure leaves every matched row unchanged.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.alter_table, ddl.primary_key, ddl.column_default, ddl.column_default_expr, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_select, dml.update, dml.returning, dml.insert_on_conflict, query.select, query.where_eq, query.order_by, types.i32, types.text, types.jsonb, types.json, types.json_casts, func.jsonb_mutate, func.json_builders
+
+statement ok
+CREATE TABLE ju_docs (id i32 PRIMARY KEY, body jsonb, raw json, source text)
+
+statement ok
+INSERT INTO ju_docs VALUES
+  (1, '{"start":0}', '{ "start" : 0 }', '{"ok":1}'),
+  (2, '{"keep":2}', '{ "keep" : 2 }', '{bad}')
+
+# Literal assignment canonicalizes jsonb but preserves json spelling verbatim.
+query TT nosort
+UPDATE ju_docs
+SET body = '{"z":1,"a":2,"z":3}', raw = '{ "z" : 1, "a" : 2, "z" : 3 }'
+WHERE id = 1
+RETURNING body, raw
+----
+{"a": 2, "z": 3}
+{ "z" : 1, "a" : 2, "z" : 3 }
+
+# Self-column identities work for both JSON types without changing their representation.
+query TT nosort
+UPDATE ju_docs SET body = body, raw = raw WHERE id = 1 RETURNING body, raw
+----
+{"a": 2, "z": 3}
+{ "z" : 1, "a" : 2, "z" : 3 }
+
+# General expressions have the same assignment behavior.
+query TT nosort
+UPDATE ju_docs
+SET body = body || '{"m":[1,2]}', raw = (raw::text)::json
+WHERE id = 1
+RETURNING body, raw
+----
+{"a": 2, "m": [1, 2], "z": 3}
+{ "z" : 1, "a" : 2, "z" : 3 }
+
+# jsonb → json is an assignment cast. The json column receives canonical jsonb_out text.
+query T nosort
+UPDATE ju_docs SET raw = body WHERE id = 1 RETURNING raw
+----
+{"a": 2, "m": [1, 2], "z": 3}
+
+# The reverse direction remains explicit-only: an explicit cast canonicalizes successfully.
+statement ok
+UPDATE ju_docs SET raw = '{ "q": 1, "q": 2, "aa" : 3 }' WHERE id = 1
+
+query T nosort
+UPDATE ju_docs SET body = raw::jsonb WHERE id = 1 RETURNING body
+----
+{"q": 2, "aa": 3}
+
+# A bare json → jsonb assignment is forbidden by jed's strict assignment matrix.
+statement error 42804
+UPDATE ju_docs SET body = raw WHERE id = 1
+
+query TT nosort
+SELECT body, raw FROM ju_docs WHERE id = 1
+----
+{"q": 2, "aa": 3}
+{ "q": 1, "q": 2, "aa" : 3 }
+
+# SQL NULL remains assignable to either JSON type and RETURNING sees the post-update values.
+query TT nosort
+UPDATE ju_docs SET body = NULL, raw = NULL WHERE id = 2 RETURNING body, raw
+----
+NULL
+NULL
+
+# Runtime malformed input is atomic: id 1 would parse, id 2 fails, and neither raw value changes.
+statement error 22P02
+UPDATE ju_docs SET raw = source::json
+
+query IT nosort
+SELECT id, raw FROM ju_docs ORDER BY id
+----
+1
+{ "q": 1, "q": 2, "aa" : 3 }
+2
+NULL
+
+# INSERT ... SELECT uses the same JSON identity and jsonb → json assignment rules.
+statement ok
+CREATE TABLE ju_copy (id i32 PRIMARY KEY, body jsonb, raw json)
+
+statement ok
+INSERT INTO ju_copy SELECT id, body, raw FROM ju_docs
+
+query ITT nosort
+SELECT id, body, raw FROM ju_copy ORDER BY id
+----
+1
+{"q": 2, "aa": 3}
+{ "q": 1, "q": 2, "aa" : 3 }
+2
+NULL
+NULL
+
+statement ok
+CREATE TABLE ju_json_copy (id i32 PRIMARY KEY, raw json)
+
+statement ok
+INSERT INTO ju_json_copy SELECT id, body FROM ju_docs
+
+query IT nosort
+SELECT id, raw FROM ju_json_copy ORDER BY id
+----
+1
+{"q": 2, "aa": 3}
+2
+NULL
+
+# ON CONFLICT DO UPDATE uses the same rule for excluded values.
+statement ok
+CREATE TABLE ju_upsert (id i32 PRIMARY KEY, body jsonb, raw json)
+
+statement ok
+INSERT INTO ju_upsert VALUES (1, '{}', '{}')
+
+query TT nosort
+INSERT INTO ju_upsert VALUES (1, '{"b":2,"a":1}', '{ "z" : 9, "z": 8 }')
+ON CONFLICT (id) DO UPDATE
+SET body = excluded.raw::jsonb, raw = excluded.body
+RETURNING body, raw
+----
+{"z": 8}
+{"a": 1, "b": 2}
+
+# Expression defaults are checked and stored through that same assignment seam. The json default
+# deliberately produces jsonb, exercising the assignment cast at both CREATE and INSERT time.
+statement ok
+CREATE TABLE ju_defaults (
+  id i32 PRIMARY KEY,
+  body jsonb DEFAULT jsonb_build_object('b', 2, 'a', 1),
+  raw json DEFAULT jsonb_build_object('z', 3, 'aa', 4)
+)
+
+query ITT nosort
+INSERT INTO ju_defaults (id) VALUES (1) RETURNING id, body, raw
+----
+1
+{"a": 1, "b": 2}
+{"z": 3, "aa": 4}
+
+# ADD COLUMN materializes its expression default into every existing row through the same storage
+# coercion seam. In disk conformance mode the next record reopens the file, proving the rewrite
+# stored jsonb_out text in the json column rather than jsonb node bytes under a json schema.
+statement ok
+CREATE TABLE ju_alter_defaults (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO ju_alter_defaults VALUES (1), (2)
+
+statement ok
+ALTER TABLE ju_alter_defaults
+ADD COLUMN raw json DEFAULT jsonb_build_object('z', 3, 'aa', 4)
+
+query IT nosort
+SELECT id, raw FROM ju_alter_defaults ORDER BY id
+----
+1
+{"z": 3, "aa": 4}
+2
+{"z": 3, "aa": 4}

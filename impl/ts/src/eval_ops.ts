@@ -60,6 +60,8 @@ import {
   isFloat,
   isInteger,
   isInterval,
+  isJson,
+  isJsonb,
   isText,
   isTimestamp,
   isTimestamptz,
@@ -936,29 +938,58 @@ export function astDeepEqual(a: unknown, b: unknown): boolean {
   return true;
 }
 
-// requireAssignable: a value assigned to a column must match its family — an integer column
-// takes an integer (or NULL); a decimal column takes an integer (int→decimal implicit) or
-// decimal (or NULL); a text column takes a text (or NULL); a boolean column takes a boolean
-// (or NULL). A decimal value into an integer column is NOT assignable (decimal→int is
-// explicit-CAST only). Any cross-family pair is a 42804 type error. Mirrors the INSERT literal
-// type-check, generalized to expressions.
+// assignableTo is the authoritative scalar storage-assignment predicate used by INSERT ...
+// SELECT, expression defaults, UPDATE, and ON CONFLICT DO UPDATE. It is the family-level subset
+// of storeValue: identities for every storable scalar, lossless numeric widening, and jsonb → json
+// assignment rendering. Containers and literal-only jsonpath are handled/rejected separately.
+export function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
+  switch (t.kind) {
+    case "null":
+      return true;
+    case "composite":
+    case "array":
+    case "range":
+    case "jsonpath":
+      return false;
+    case "int":
+      return isInteger(colTy) || isDecimal(colTy);
+    case "decimal":
+      return isDecimal(colTy);
+    case "float":
+      return isFloat(colTy) && promoteFloat(t.ty, colTy) === colTy;
+    case "bool":
+      return isBool(colTy);
+    case "text":
+      return (
+        isText(colTy) ||
+        isUuid(colTy) ||
+        isBytea(colTy) ||
+        isTimestamp(colTy) ||
+        isTimestamptz(colTy) ||
+        isInterval(colTy) ||
+        isDate(colTy)
+      );
+    case "bytea":
+      return isBytea(colTy);
+    case "uuid":
+      return isUuid(colTy);
+    case "timestamp":
+      return isTimestamp(colTy);
+    case "timestamptz":
+      return isTimestamptz(colTy);
+    case "date":
+      return isDate(colTy);
+    case "interval":
+      return isInterval(colTy);
+    case "json":
+      return isJson(colTy);
+    case "jsonb":
+      return isJsonb(colTy) || isJson(colTy);
+  }
+}
+
 export function requireAssignable(t: ResolvedType, colTy: ScalarType, col: string): void {
-  let ok: boolean;
-  if (isInteger(colTy)) ok = t.kind === "int" || t.kind === "null";
-  else if (isDecimal(colTy)) ok = t.kind === "int" || t.kind === "decimal" || t.kind === "null";
-  // A float column accepts a float value of EQUAL OR NARROWER width (f32 → f64 widening is
-  // implicit; f64 → f32 needs an explicit CAST — float.md §6) or NULL. No int/decimal.
-  else if (isFloat(colTy))
-    ok = (t.kind === "float" && promoteFloat(t.ty, colTy) === colTy) || t.kind === "null";
-  else if (isBool(colTy)) ok = t.kind === "bool" || t.kind === "null";
-  else if (isBytea(colTy)) ok = t.kind === "bytea" || t.kind === "null";
-  else if (isUuid(colTy)) ok = t.kind === "uuid" || t.kind === "null";
-  else if (isTimestamp(colTy)) ok = t.kind === "timestamp" || t.kind === "null";
-  else if (isTimestamptz(colTy)) ok = t.kind === "timestamptz" || t.kind === "null";
-  else if (isInterval(colTy)) ok = t.kind === "interval" || t.kind === "null";
-  else if (isDate(colTy)) ok = t.kind === "date" || t.kind === "null";
-  else ok = t.kind === "text" || t.kind === "null";
-  if (!ok) {
+  if (!assignableTo(t, colTy)) {
     throw typeError("cannot assign a value to column " + col + " of type " + canonicalName(colTy));
   }
 }

@@ -249,8 +249,7 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 		}
 		return Value{}, typeError("cannot store a f64 value in " + colTy.CanonicalName() + " column " + colName)
 	case ValJson:
-		// A json value stores into a json column verbatim (J1); any other target is a 42804. In J0
-		// no json column exists, so this always errors.
+		// A json value stores into a json column verbatim. json → jsonb remains explicit-only.
 		if colTy.IsJson() {
 			return v, nil
 		}
@@ -258,6 +257,10 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 	case ValJsonb:
 		if colTy.IsJsonb() {
 			return v, nil
+		}
+		if colTy.IsJson() {
+			// jsonb → json is an assignment cast (json.md §6.1): store jsonbOut's canonical text.
+			return JsonValue(jsonbOut(v.jsonb())), nil
 		}
 		return Value{}, typeError("cannot store a jsonb value in " + colTy.CanonicalName() + " column " + colName)
 	default: // ValBool

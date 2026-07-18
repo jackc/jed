@@ -838,6 +838,16 @@ reason = "jed: comma-separated FROM (the old implicit cross join) is not support
 
 # --- mutation/update.test: the same-column-twice double-assignment code.
 [[override]]
+file = "json/json_update.test"
+sql = "UPDATE ju_docs SET body = raw WHERE id = 1"
+reason = "jed keeps json → jsonb explicit-only: silently assigning a verbatim json value to jsonb would discard whitespace, key order, and duplicate keys, so the strict storage matrix reports 42804 unless `::jsonb` is written (json.md §4.1/§6.1). PostgreSQL admits this direction as an assignment cast and updates the row."
+
+[[override]]
+file = "mutation/update_scalar_assignment.test"
+sql = "UPDATE scalar_assignment SET r = d WHERE id = 1"
+reason = "jed keeps f64 → f32 narrowing explicit-only (42804) even when the runtime value happens to be exactly representable; only f32 → f64 is a lossless assignment widening (float.md §2/§6). PostgreSQL assignment-casts double precision to real and updates the row."
+
+[[override]]
 file = "mutation/update.test"
 sql = "UPDATE t SET a = 1, a = 2 WHERE id = 2"
 reason = "jed: assigning the same column twice in one UPDATE is 42701 (duplicate_column). PostgreSQL reports it as 42601 (syntax error — multiple assignments to same column). Both reject; the SQLSTATE differs. A documented error-class divergence."

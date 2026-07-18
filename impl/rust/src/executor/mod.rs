@@ -1841,11 +1841,12 @@ impl ResolvedType {
     /// Whether a projected value of this type is assignable to a `col_ty` column for storage —
     /// the FAMILY-level gate `INSERT ... SELECT` applies up front (spec/design/grammar.md §24),
     /// before any row is produced (so it fires even over an empty source). It is the
-    /// family-level subset of `store_value` and MUST agree with it: an integer assigns to an
-    /// integer or decimal column (int→decimal widens), a decimal only to a decimal column
+    /// authoritative family-level subset of `store_value` and MUST agree with it: an integer
+    /// assigns to an integer or decimal column (int→decimal widens), a decimal only to a decimal column
     /// (decimal→int is explicit-CAST only), text to text/uuid/bytea/timestamp/timestamptz/interval (the
     /// documented text adaptation — the per-row store then parses, trapping 22P02/22007 on
-    /// malformed input), boolean→boolean, uuid→uuid, bytea→bytea, a timestamp only to a timestamp
+    /// malformed input), boolean→boolean, uuid→uuid, bytea→bytea, JSON identities plus the
+    /// assignment-only jsonb→json rendering cast, a timestamp only to a timestamp
     /// column and a timestamptz only to a timestamptz column (the two never cross — they do not
     /// even compare, timestamp.md), and a NULL-typed projection to any column (a NOT NULL target
     /// then traps 23502 per row). A non-assignable pair is a 42804.
@@ -1876,8 +1877,9 @@ impl ResolvedType {
             ResolvedType::Bytea => col_ty.is_bytea(),
             ResolvedType::Uuid => col_ty.is_uuid(),
             ResolvedType::Json => col_ty.is_json(),
-            ResolvedType::Jsonb => col_ty.is_jsonb(),
-            ResolvedType::JsonPath => matches!(col_ty, ScalarType::JsonPath),
+            ResolvedType::Jsonb => col_ty.is_jsonb() || col_ty.is_json(),
+            // jsonpath columns remain unsupported (literal-only), so it is not storage-assignable.
+            ResolvedType::JsonPath => false,
             ResolvedType::Timestamp => col_ty.is_timestamp(),
             ResolvedType::Timestamptz => col_ty.is_timestamptz(),
             ResolvedType::Interval => col_ty.is_interval(),

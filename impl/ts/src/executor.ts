@@ -330,6 +330,7 @@ import {
 } from "./store.ts";
 import { dateClockIsRelative, dateClockSpecial } from "./date.ts";
 import {
+  assignableTo,
   coerceSetopRows,
   combineSetop,
   exprEqual,
@@ -376,7 +377,6 @@ import {
   aggDetail,
   analyzeRecursiveCte,
   applySeqAlter,
-  assignableTo,
   bindParams,
   buildSequenceDef,
   checkRecursiveColumnTypes,
@@ -5941,7 +5941,7 @@ export class Engine {
     }));
     const typeChangedColumns = original.columns.map(() => false);
     type RowStep =
-      | { kind: "add"; column: Column; defaultExpr: RExpr | null }
+      | { kind: "add"; column: Column; colType: ColType; defaultExpr: RExpr | null }
       | { kind: "drop"; column: number }
       | { kind: "setType"; column: number; value: RExpr };
     const rowSteps: RowStep[] = [];
@@ -6102,6 +6102,7 @@ export class Engine {
             rowSteps.push({
               kind: "add",
               column: col,
+              colType: resolveColType(col.type, snap.types),
               defaultExpr: this.resolveDefaultExprs({
                 ...table,
                 columns: [col],
@@ -6881,9 +6882,19 @@ export class Engine {
         meter.charge(COSTS.storageRowRead);
         const row = [...store.resolveAll(entry.row)];
         for (const step of rowSteps) {
-          if (step.kind === "add")
-            row.push(this.evalDefault(step.column, step.defaultExpr, rng, meter));
-          else if (step.kind === "drop") row.splice(step.column, 1);
+          if (step.kind === "add") {
+            const value = this.evalDefault(step.column, step.defaultExpr, rng, meter);
+            row.push(
+              coerceForStore(
+                value,
+                step.colType,
+                step.column.decimal,
+                step.column.varcharLen,
+                step.column.notNull,
+                step.column.name,
+              ),
+            );
+          } else if (step.kind === "drop") row.splice(step.column, 1);
           else row[step.column] = evalExpr(step.value, row, env, meter);
         }
         row.forEach((value, i) => {

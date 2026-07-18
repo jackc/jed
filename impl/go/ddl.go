@@ -1589,6 +1589,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		kind        int
 		column      int
 		added       catColumn
+		addedType   colType
 		defaultExpr *rExpr
 		value       *rExpr
 	}
@@ -1782,7 +1783,12 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				if err != nil {
 					return outcome{}, err
 				}
-				rowSteps = append(rowSteps, alterRowStep{kind: alterRowAdd, added: captured, defaultExpr: defaults[0]})
+				rowSteps = append(rowSteps, alterRowStep{
+					kind:        alterRowAdd,
+					added:       captured,
+					addedType:   resolveColType(captured.Type, snap.types),
+					defaultExpr: defaults[0],
+				})
 				var inline []alterTableEdit
 				for i := range add.Checks {
 					d := add.Checks[i]
@@ -2164,6 +2170,10 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				switch step.kind {
 				case alterRowAdd:
 					v, err := db.evalDefault(step.added, step.defaultExpr, rng, meter)
+					if err != nil {
+						return outcome{}, err
+					}
+					v, err = coerceForStore(v, step.addedType, step.added.Decimal, step.added.VarcharLen, step.added.NotNull, step.added.Name)
 					if err != nil {
 						return outcome{}, err
 					}

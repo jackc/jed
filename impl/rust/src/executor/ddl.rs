@@ -1510,6 +1510,7 @@ impl Engine {
         enum RowStep {
             Add {
                 column: Column,
+                col_type: ColType,
                 default: Option<RExpr>,
             },
             Drop(usize),
@@ -1756,6 +1757,7 @@ impl Engine {
                             .pop()
                             .unwrap();
                         row_steps.push(RowStep::Add {
+                            col_type: snap.resolve_col_type(&added.ty),
                             column: added,
                             default,
                         });
@@ -2940,10 +2942,21 @@ impl Engine {
                 store.resolve_all(row)?;
                 for step in &row_steps {
                     match step {
-                        RowStep::Add { column, default } => {
+                        RowStep::Add {
+                            column,
+                            col_type,
+                            default,
+                        } => {
                             let value =
                                 self.eval_default(column, default.as_ref(), &rng, &mut meter)?;
-                            row.push(value);
+                            row.push(coerce_for_store(
+                                value,
+                                col_type,
+                                column.decimal,
+                                column.varchar_len,
+                                column.not_null,
+                                &column.name,
+                            )?);
                         }
                         RowStep::Drop(column) => {
                             row.remove(*column);
