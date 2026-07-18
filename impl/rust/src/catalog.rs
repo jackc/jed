@@ -101,6 +101,31 @@ pub enum IndexKind {
     Gist = 2,
 }
 
+/// A **host-function dependency** persisted with an index whose key/predicate expression calls a
+/// host scalar function (spec/design/extensibility.md §8.1, `format_version` 31, delivery step 4).
+/// One entry per *distinct* host-function signature the index's expressions reference; it is the
+/// **resolved dependency** the file records so a reopening binary can detect that the registry now
+/// supplies a *different* implementation (a mismatch makes the index unusable — skipped for reads,
+/// refused for writes — never a silent stale-key read). Sorted by `(name, arg_types)` when stored so
+/// hash-map/registration order never leaks (CLAUDE.md §8).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct HostFuncDep {
+    /// The (lowercased) SQL function name — the correlation key to a re-resolved `HostFunc` node.
+    pub name: String,
+    /// The exact scalar argument signature — with `name`, identifies which overload this dependency
+    /// pins.
+    pub arg_types: Vec<ScalarType>,
+    /// The declared scalar result type at CREATE INDEX (recorded for completeness / introspection).
+    pub result: ScalarType,
+    /// The host's stable component identity (`HostFunction::component_id`) at CREATE INDEX. Required
+    /// for an index-backing function; a reopen whose registry supplies a different `component_id` for
+    /// this signature makes the index unusable.
+    pub component_id: String,
+    /// The host's semantic version at CREATE INDEX. A reopen whose registry bumped it forces a
+    /// rebuild (the index is unusable meanwhile), never a silent stale-key read.
+    pub semantic_version: u32,
+}
+
 /// One index key element (spec/design/indexes.md §1): a bare column (by ordinal into the
 /// table's columns) or an **expression** over the table's columns (`lower(email)`), carrying
 /// its persisted canonical text and the re-parsed (unresolved) AST — the write/plan paths
@@ -148,6 +173,14 @@ pub struct IndexDef {
     /// table per statement, like an expression key ([`IndexKeyExpr`]). Partial indexes are B-tree
     /// only (a GIN/GiST index never carries one).
     pub predicate: Option<IndexKeyExpr>,
+    /// Persisted **host-function dependencies** (spec/design/extensibility.md §8.1, `format_version`
+    /// 31): one entry per distinct host scalar function this index's key/predicate expressions call,
+    /// each pinning the component identity + semantic version the index was built against. Empty for
+    /// the overwhelmingly common index with no host-function key (byte-identical to v30 then). On
+    /// reopen the per-statement re-resolution ([`resolve_index_with_params`](crate::executor::Engine))
+    /// compares each against the current registry; a mismatch makes the index unusable. Sorted by
+    /// `(name, arg_types)`.
+    pub host_deps: Vec<HostFuncDep>,
 }
 
 impl IndexDef {

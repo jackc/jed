@@ -14,8 +14,9 @@
 > disappear) to "**who owns the cross-core determinism contract**" (where it is load-bearing and
 > must stay). §2 is that argument; everything else follows from it.
 >
-> **Status: a framework + proposal — with the §5 dispatch foundation built, composite types landed,
-> and the host-function injection seam (§14 step 3) shipped.** Three pieces are real: (a) resolution
+> **Status: a framework + proposal — with the §5 dispatch foundation built, composite types (and
+> composite-as-key, §14 step 2) landed, and the host-function injection seam (§14 step 3) shipped.**
+> Three pieces are real: (a) resolution
 > for the **built-in** named scalar functions and aggregates is data-driven over the generated catalog
 > tables (§5, all three cores, behaviour-preserving); (b) **composite (row) types have shipped** as a
 > landed feature ([composite.md](composite.md), `format_version` 9 — the *open type* pivot §3 rests
@@ -274,12 +275,14 @@ the host's code. This is why composites are both the safest and the most portabl
 why the type itself **shipped first** ([composite.md](composite.md), `format_version` 9): the open
 `TypeExpr` (§3) is *already real* for composite.
 
-**The one derived-and-cheap indexable custom type — hoist composite-as-key early.** A composite
-`PRIMARY KEY` / index is `0A000` today ([composite.md §6](composite.md); the order-preserving
-encoding is authored at [encoding.md §2.10](encoding.md) but unexercised). Lifting it is the **only
-way to get an indexable custom type with zero host codec and zero determinism transfer** (it is
-derived, G2-free), and it is **independent of the entire host-code registry**. It should therefore
-land *ahead* of the host-scalar ladder, not folded into it (§14).
+**The one derived-and-cheap indexable custom type — composite-as-key, ✅ landed.** A composite
+`PRIMARY KEY` / ordered index / `UNIQUE` over an all-keyable-field type is now supported (the recursive
+`composite-field-slots` encoding, [encoding.md §2.15](encoding.md) — the **third** container key after
+`range` §2.11 and `array` §2.14). It is the **only indexable custom type with zero host codec and zero
+determinism transfer** (derived, G2-free), and it was **independent of the entire host-code registry**,
+so — exactly as this delivery order intended — it landed *ahead* of the host-scalar ladder (§14 step 2),
+byte-identical across all three cores + Ruby. The lone remaining `0A000` key axis is an
+**array-of-composite** element (the array key admits only scalar elements).
 
 ### 4.2 Host-defined scalar functions — no type-system change; high value
 
@@ -729,8 +732,10 @@ cleanup, not a prerequisite. A suggested sequence:
 
 1. **Rewrite this doc against current reality** ✅ (this revision) — ratify `TypeExpr`, component
    identity, and the capability vocabulary.
-2. **Composite-as-key** (§4.1) — the one derived, G2-free, indexable custom type; **independent of the
-   host-code registry**, so it lands earliest.
+2. **Composite-as-key** (§4.1) ✅ **landed (all three cores + Ruby, byte-identical golden)** — the one
+   derived, G2-free, indexable custom type; **independent of the host-code registry**, so it landed
+   earliest, via the recursive `composite-field-slots` key ([encoding.md §2.15](encoding.md)). The lone
+   remaining `0A000` key axis is an array-of-composite element.
 3. **Runtime host scalar *functions* over existing types only** (§4.2), *no persisted use* — the
    function-registry injection seam + signature overloading + volatility/cross-core/cost, batch-of-one.
    ✅ **landed (all three cores)**: an `ExtensionRegistry` a host builds and passes in
@@ -794,7 +799,7 @@ When a section here is ratified, update **in the same change** (mirrors [determi
 | §1 | Catalog frame — jed already has the method-set, inlined | **proposed** (restates existing structure) |
 | §2 | Determinism-ownership is the line that moves | **proposed** (the governing principle) |
 | §3 | The `TypeExpr` model + the capability ladder + the closed container axis | **proposed** (composite arm is **landed**) |
-| §4.1 | Composite types (derived codec, G2 free, self-describing) | **landed as a type**; composite-**as-key** proposed (recommended early) |
+| §4.1 | Composite types (derived codec, G2 free, self-describing) | **landed as a type**; composite-**as-key** **landed** (§14 step 2, `composite-field-slots` [encoding.md §2.15](encoding.md); array-of-composite element the lone remaining `0A000`) |
 | §4.2 | Host scalar functions (registry, signature overloads, vectorized, cost, volatility) | **landed** (all 3 cores): ephemeral registry + resolve + eval seam, exact-signature overloading, cost charged/gated, strict, wrong-type-caught, 42723. Vectorized ABI, non-strict, container args, volatility/cross-core *enforcement* deferred (§14 step 3) |
 | §4.3 | Host scalar types (Storable→Indexed ladder, `type_code 21`, opaque) | **proposed** |
 | §5 | Dispatch — registry the many, inline the few (§5.1 splits the **seam** from the **dogfood**; function seam first) | **built** for built-in scalar functions + aggregates *and* the **host function injection seam** (§14 step 3, all 3 cores): a host kernel is reached by id through the frozen registry alongside the inlined built-in arms. Type-vtable depth (Fork A) + the type-method seam (step 5) **proposed** |

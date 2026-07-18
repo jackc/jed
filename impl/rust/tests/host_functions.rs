@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use jed::value::Value;
 use jed::{
-    CreateOptions, Database, ExtensionRegistry, HostFunction, Outcome, ScalarType, Session,
-    SessionOptions, Volatility,
+    CreateOptions, Database, ExtensionRegistry, HostFunction, OpenOptions, Outcome, ScalarType,
+    Session, SessionOptions, Volatility,
 };
 
 /// `host_add(i64, i64) -> i64` — integer sum (strict: never sees NULL).
@@ -299,4 +299,238 @@ fn no_extensions_is_unaffected() {
             .code(),
         "42883"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Delivery step 4 (extensibility.md §8.1 / §14): host scalar functions in PERSISTED INDEXES.
+// An `immutable` host function carrying a `component_id` + `semantic_version` may back an
+// expression / partial index; the file records the resolved dependency (format_version 31) and
+// re-checks it on reopen. A missing / different-component / bumped-version function makes the index
+// unusable — skipped for reads (correct heap scan), refused for writes (read-only) — never a silent
+// stale-key read. These cover what the corpus cannot express (host-API registration + on-disk reopen
+// with a *different* registry); they must mirror the Go/TS host-function tests one-for-one.
+// ---------------------------------------------------------------------------------------------
+
+/// `geo_hash(i64) -> i64` — the canonical index-backing host function. `component`/`version` pin its
+/// identity; `Immutable` + a `component_id` are the two admission requirements (§8.1).
+fn geo_hash(component: &str, version: u32) -> HostFunction {
+    HostFunction::new(
+        "geo_hash",
+        vec![ScalarType::Int64],
+        ScalarType::Int64,
+        Box::new(|args: &[Value]| -> jed::Result<Value> {
+            let Value::Int(a) = &args[0] else {
+                unreachable!("strict + resolved i64 arg")
+            };
+            Ok(Value::Int(a * 10))
+        }),
+    )
+    .volatility(Volatility::Immutable)
+    .cross_core(true)
+    .component_id(component.to_string())
+    .semantic_version(version)
+}
+
+fn err_code(r: jed::Result<Outcome>) -> String {
+    match r {
+        Ok(_) => panic!("expected an error, got Ok"),
+        Err(e) => e.code().to_string(),
+    }
+}
+
+fn tmp(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
+}
+
+fn create_file(path: &std::path::Path, ext: std::sync::Arc<ExtensionRegistry>, stmts: &[&str]) {
+    let _ = std::fs::remove_file(path);
+    let mut db = Database::create(CreateOptions {
+        path: Some(path.to_path_buf()),
+        skip_fsync: true,
+        extensions: ext,
+        ..Default::default()
+    })
+    .unwrap();
+    for s in stmts {
+        db.query_outcome(s, &[])
+            .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
+    }
+}
+
+fn open_file(path: &std::path::Path, ext: std::sync::Arc<ExtensionRegistry>) -> Database {
+    Database::open_with_options(
+        path,
+        OpenOptions {
+            skip_fsync: true,
+            extensions: ext,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+fn ids(db: &mut Database, sql: &str) -> Vec<Value> {
+    db.query(sql, &[])
+        .unwrap()
+        .map(|r| r.into_iter().next().unwrap())
+        .collect()
+}
+
+#[test]
+fn hostfunc_volatile_in_index_rejected() {
+    // The latent-bug fix: a volatile host function used to leak silently into an index expression
+    // (the immutability gate was purely syntactic and did not see host functions). Now 42P17.
+    let volatile = HostFunction::new(
+        "geo_hash",
+        vec![ScalarType::Int64],
+        ScalarType::Int64,
+        Box::new(|args: &[Value]| {
+            let Value::Int(a) = &args[0] else {
+                unreachable!()
+            };
+            Ok(Value::Int(a * 10))
+        }),
+    )
+    .component_id("com.example/geo_hash"); // Volatile by default
+    let mut db = db_with_ext(registry(vec![volatile]), &["CREATE TABLE t (a i64)"]);
+    assert_eq!(
+        err_code(db.query_outcome("CREATE INDEX ix ON t (geo_hash(a))", &[])),
+        "42P17"
+    );
+}
+
+#[test]
+fn hostfunc_unversioned_in_index_rejected() {
+    // Immutable but no component identity → cannot persist a sound dependency (42P17).
+    let unversioned = HostFunction::new(
+        "geo_hash",
+        vec![ScalarType::Int64],
+        ScalarType::Int64,
+        Box::new(|args: &[Value]| {
+            let Value::Int(a) = &args[0] else {
+                unreachable!()
+            };
+            Ok(Value::Int(a * 10))
+        }),
+    )
+    .volatility(Volatility::Immutable);
+    let mut db = db_with_ext(registry(vec![unversioned]), &["CREATE TABLE t (a i64)"]);
+    assert_eq!(
+        err_code(db.query_outcome("CREATE INDEX ix ON t (geo_hash(a))", &[])),
+        "42P17"
+    );
+}
+
+#[test]
+fn hostfunc_immutable_versioned_in_index_ok() {
+    let mut db = db_with_ext(
+        registry(vec![geo_hash("com.example/geo_hash", 1)]),
+        &[
+            "CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+            "INSERT INTO t VALUES (1, 3), (2, 7)",
+            "CREATE INDEX ix ON t (geo_hash(a))",
+        ],
+    );
+    // geo_hash(3) = 30 → row id 1.
+    assert_eq!(
+        query(&mut db, "SELECT id FROM t WHERE geo_hash(a) = 30"),
+        vec![vec![Value::Int(1)]]
+    );
+}
+
+#[test]
+fn hostfunc_index_reopen_matching_ok() {
+    let path = tmp("hostfunc_index_match.jed");
+    create_file(
+        &path,
+        registry(vec![geo_hash("com.example/geo_hash", 1)]),
+        &[
+            "CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+            "INSERT INTO t VALUES (1, 3), (2, 7)",
+            "CREATE INDEX ix ON t (geo_hash(a))",
+        ],
+    );
+    // Reopen (v31 deserialize) with the SAME component + version: the dependency matches, so reads
+    // use the index and writes maintain it.
+    let mut db = open_file(&path, registry(vec![geo_hash("com.example/geo_hash", 1)]));
+    assert_eq!(ids(&mut db, "SELECT id FROM t WHERE geo_hash(a) = 30"), vec![Value::Int(1)]);
+    db.query_outcome("INSERT INTO t VALUES (3, 3)", &[])
+        .expect("a write maintaining a matching host-dep index succeeds");
+    assert_eq!(
+        ids(&mut db, "SELECT id FROM t WHERE geo_hash(a) = 30 ORDER BY id"),
+        vec![Value::Int(1), Value::Int(3)]
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn hostfunc_index_reopen_version_bump_unusable() {
+    let path = tmp("hostfunc_index_bump.jed");
+    create_file(
+        &path,
+        registry(vec![geo_hash("com.example/geo_hash", 1)]),
+        &[
+            "CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+            "INSERT INTO t VALUES (1, 3), (2, 7)",
+            "CREATE INDEX ix ON t (geo_hash(a))",
+        ],
+    );
+    // Reopen with a BUMPED semantic_version → the index's stored keys are stale.
+    let mut db = open_file(&path, registry(vec![geo_hash("com.example/geo_hash", 2)]));
+    // Reads still correct: a plain read (no index) and one that COULD use the index (skipped → heap
+    // scan) both return the right rows — never a silent stale-key read.
+    assert_eq!(ids(&mut db, "SELECT id FROM t ORDER BY id"), vec![Value::Int(1), Value::Int(2)]);
+    assert_eq!(ids(&mut db, "SELECT id FROM t WHERE geo_hash(a) = 30"), vec![Value::Int(1)]);
+    // A write that would maintain the stale index is refused (XX002) — the table is read-only.
+    assert_eq!(
+        err_code(db.query_outcome("INSERT INTO t VALUES (3, 3)", &[])),
+        "XX002"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn hostfunc_index_reopen_different_component_unusable() {
+    let path = tmp("hostfunc_index_component.jed");
+    create_file(
+        &path,
+        registry(vec![geo_hash("com.example/geo_hash", 1)]),
+        &[
+            "CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+            "INSERT INTO t VALUES (1, 3)",
+            "CREATE INDEX ix ON t (geo_hash(a))",
+        ],
+    );
+    // Reopen with a DIFFERENT component id for the same name/signature → a different implementation.
+    let mut db = open_file(&path, registry(vec![geo_hash("org.other/geo_hash", 1)]));
+    assert_eq!(ids(&mut db, "SELECT id FROM t WHERE geo_hash(a) = 30"), vec![Value::Int(1)]);
+    assert_eq!(
+        err_code(db.query_outcome("INSERT INTO t VALUES (2, 3)", &[])),
+        "XX002"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn hostfunc_index_reopen_missing_function() {
+    let path = tmp("hostfunc_index_missing.jed");
+    create_file(
+        &path,
+        registry(vec![geo_hash("com.example/geo_hash", 1)]),
+        &[
+            "CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+            "INSERT INTO t VALUES (1, 3), (2, 7)",
+            "CREATE INDEX ix ON t (geo_hash(a))",
+        ],
+    );
+    // Reopen with NO extensions: the index expression can no longer resolve.
+    let mut db = open_file(&path, std::sync::Arc::new(ExtensionRegistry::new()));
+    // A read that does not reference the missing function still works (the index is simply unused).
+    assert_eq!(ids(&mut db, "SELECT id FROM t ORDER BY id"), vec![Value::Int(1), Value::Int(2)]);
+    // A write that would maintain the index needs the missing function → 42883 (resolution fails).
+    assert_eq!(
+        err_code(db.query_outcome("INSERT INTO t VALUES (3, 3)", &[])),
+        "42883"
+    );
+    let _ = std::fs::remove_file(&path);
 }

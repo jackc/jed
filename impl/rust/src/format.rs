@@ -19,7 +19,7 @@ use std::sync::atomic::Ordering;
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
     ExclusionConstraint, ExclusionElement, ExclusionOp, FkAction, ForeignKeyConstraint,
-    IdentityKind, IndexDef, IndexKey, IndexKeyExpr, IndexKind, SequenceDef, Table,
+    HostFuncDep, IdentityKind, IndexDef, IndexKey, IndexKeyExpr, IndexKind, SequenceDef, Table,
 };
 use crate::collation::Collation;
 use crate::decimal::Decimal;
@@ -94,7 +94,14 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// appends an exact nonnegative big-endian `i64` count after `root_data_page`; root zero iff count
 /// zero. The count is installed beside the demand-paged skeleton, keeping open off the leaf level.
 /// v30 = three-bit FOREIGN KEY action codes: CASCADE / SET NULL / SET DEFAULT are persisted.
-const FORMAT_VERSION: u16 = 30;
+///
+/// v31 = **host-function index dependencies** (spec/design/extensibility.md §8.1, delivery step 4):
+/// the per-index `index_flags` byte gains bit2 `has_host_deps`, and — only when set — after the v27
+/// predicate a `u16 dep_count` + per dependency `name (u16 len + UTF-8) ‖ arg_count u16 ‖ arg type
+/// codes (u8 each) ‖ result type code (u8) ‖ component_id (u16 len + UTF-8) ‖ semantic_version u32`,
+/// in ascending `(name, arg-type codes)` order. An index with no host-function key is byte-identical
+/// to v30, so a file with no such index moves to v31 only by its version byte + meta CRC.
+const FORMAT_VERSION: u16 = 31;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 pub(crate) const PAGE_HEADER: usize = 16;
@@ -168,7 +175,7 @@ pub(crate) const ROOT_PAGE: u32 = 2;
 
 /// Stable on-disk type code for a scalar type — independent of the in-memory enum
 /// discriminant (which may be reordered). See spec/fileformat/format.md.
-fn type_code_for_scalar(ty: ScalarType) -> u8 {
+pub(crate) fn type_code_for_scalar(ty: ScalarType) -> u8 {
     match ty {
         ScalarType::Int16 => 1,
         ScalarType::Int32 => 2,
@@ -3090,8 +3097,13 @@ fn table_entry_bytes(
                 }
             }
         }
-        // index_flags: bit0 unique (v6), bit1 has_predicate (v27 — a partial index, indexes.md §9).
-        out.push((if idx.unique { 1 } else { 0 }) | (if idx.predicate.is_some() { 2 } else { 0 }));
+        // index_flags: bit0 unique (v6), bit1 has_predicate (v27 — a partial index, indexes.md §9),
+        // bit2 has_host_deps (v31 — a host-function index dependency, extensibility.md §8.1).
+        out.push(
+            (if idx.unique { 1 } else { 0 })
+                | (if idx.predicate.is_some() { 2 } else { 0 })
+                | (if idx.host_deps.is_empty() { 0 } else { 4 }),
+        );
         // v13: index_kind byte (0 = ordered B-tree, 1 = GIN — spec/design/gin.md §7).
         out.push(idx.kind as u8);
         out.extend_from_slice(&root.to_be_bytes());
@@ -3101,6 +3113,26 @@ fn table_entry_bytes(
             let t = p.expr_text.as_bytes();
             out.extend_from_slice(&(t.len() as u16).to_be_bytes());
             out.extend_from_slice(t);
+        }
+        // v31: the host-function dependency list (extensibility.md §8.1), after the predicate — only
+        // when bit2 is set. Already sorted by (name, arg-type codes) at CREATE INDEX (a stable order,
+        // CLAUDE.md §8).
+        if !idx.host_deps.is_empty() {
+            out.extend_from_slice(&(idx.host_deps.len() as u16).to_be_bytes());
+            for dep in &idx.host_deps {
+                let dn = dep.name.as_bytes();
+                out.extend_from_slice(&(dn.len() as u16).to_be_bytes());
+                out.extend_from_slice(dn);
+                out.extend_from_slice(&(dep.arg_types.len() as u16).to_be_bytes());
+                for &a in &dep.arg_types {
+                    out.push(type_code_for_scalar(a));
+                }
+                out.push(type_code_for_scalar(dep.result));
+                let cid = dep.component_id.as_bytes();
+                out.extend_from_slice(&(cid.len() as u16).to_be_bytes());
+                out.extend_from_slice(cid);
+                out.extend_from_slice(&dep.semantic_version.to_be_bytes());
+            }
         }
     }
     // Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS
@@ -4181,8 +4213,9 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
             }
         }
         let iflags = read_u8(buf, pos)?;
-        // bit0 unique (v6), bit1 has_predicate (v27 — a partial index, indexes.md §9); the rest reserved.
-        if iflags & !0b11 != 0 {
+        // bit0 unique (v6), bit1 has_predicate (v27 — a partial index, indexes.md §9), bit2
+        // has_host_deps (v31 — a host-function index dependency, extensibility.md §8.1); the rest reserved.
+        if iflags & !0b111 != 0 {
             return Err(corrupt("reserved index flag set"));
         }
         // v13: index_kind byte (0 = ordered B-tree, 1 = GIN — spec/design/gin.md §7);
@@ -4217,12 +4250,53 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         } else {
             None
         };
+        // v31: the host-function dependency list follows the predicate (bit2 set) —
+        // extensibility.md §8.1. A non-btree index never carries one.
+        let has_host_deps = iflags & 0b100 != 0;
+        if has_host_deps && kind != IndexKind::Btree {
+            return Err(corrupt("a non-btree index cannot have host-function dependencies"));
+        }
+        let host_deps = if has_host_deps {
+            let dep_count = read_u16(buf, pos)? as usize;
+            if dep_count == 0 {
+                return Err(corrupt("has_host_deps index with an empty dependency list"));
+            }
+            let mut deps = Vec::with_capacity(dep_count);
+            for _ in 0..dep_count {
+                let name = read_string(buf, pos)?;
+                let ac = read_u16(buf, pos)? as usize;
+                let mut arg_types = Vec::with_capacity(ac);
+                for _ in 0..ac {
+                    let tc = read_u8(buf, pos)?;
+                    arg_types.push(
+                        scalar_for_type_code(tc)
+                            .ok_or_else(|| corrupt("invalid host-dep argument type code"))?,
+                    );
+                }
+                let rtc = read_u8(buf, pos)?;
+                let result = scalar_for_type_code(rtc)
+                    .ok_or_else(|| corrupt("invalid host-dep result type code"))?;
+                let component_id = read_string(buf, pos)?;
+                let semantic_version = read_u32(buf, pos)?;
+                deps.push(HostFuncDep {
+                    name,
+                    arg_types,
+                    result,
+                    component_id,
+                    semantic_version,
+                });
+            }
+            deps
+        } else {
+            Vec::new()
+        };
         indexes.push(IndexDef {
             name: iname,
             keys,
             unique: iflags & 0b01 != 0,
             kind,
             predicate,
+            host_deps,
         });
     }
     // Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the

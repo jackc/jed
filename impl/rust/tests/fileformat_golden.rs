@@ -272,6 +272,42 @@ fn partial_index_table_db() -> Session {
     db
 }
 
+/// A table with a HOST-FUNCTION index dependency (v31 — the `index_flags` bit2 + the persisted
+/// dependency list after `index_root_page`, extensibility.md §8.1): the index `t_geo_idx` is on
+/// `geo_hash(a)`, a host scalar function (i64 -> i64), component "com.example/geo_hash" at semantic
+/// version 1. The table is EMPTY (the tree empty, root 0), so the fixture isolates the v31 catalog
+/// change. Must match verify.rb's HOSTFUNC_INDEX_TABLE.
+fn hostfunc_index_table_db() -> Session {
+    let mut reg = jed::ExtensionRegistry::new();
+    reg.register_function(
+        jed::HostFunction::new(
+            "geo_hash",
+            vec![ScalarType::Int64],
+            ScalarType::Int64,
+            Box::new(|args: &[Value]| {
+                let Value::Int(a) = &args[0] else {
+                    unreachable!("strict + resolved i64 arg")
+                };
+                Ok(Value::Int(a * 10))
+            }),
+        )
+        .volatility(jed::Volatility::Immutable)
+        .component_id("com.example/geo_hash")
+        .semantic_version(1),
+    )
+    .unwrap();
+    let mut db = Database::create(CreateOptions {
+        page_size: GOLDEN_PAGE_SIZE,
+        extensions: std::sync::Arc::new(reg),
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(&mut db, "CREATE TABLE t (id i64 PRIMARY KEY, a i64)");
+    run(&mut db, "CREATE INDEX t_geo_idx ON t (geo_hash(a))");
+    db
+}
+
 /// Tables with FOREIGN KEY constraints (v11 — spec/design/constraints.md §6): pins the catalog
 /// foreign-key list. Parent `p` (a PK + two UNIQUE constraints, the FK targets); child `c` with
 /// four FKs covering every shape — a named FK to the UNIQUE column (`c_code_fk`), a self-reference
@@ -1467,6 +1503,7 @@ fn write_matches_goldens() {
         ("unique_table.jed", unique_table_db),
         ("expr_index_table.jed", expr_index_table_db),
         ("partial_index_table.jed", partial_index_table_db),
+        ("hostfunc_index_table.jed", hostfunc_index_table_db),
         ("gin_array_table.jed", gin_array_table_db),
         ("gin_uuid_table.jed", gin_uuid_table_db),
         ("fk_table.jed", fk_table_db),

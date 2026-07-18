@@ -25,7 +25,14 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 30 # format_version 30: FK actions use two three-bit fields in the actions byte;
+VERSION = 31 # format_version 31: host-function index dependencies (extensibility.md §8.1) — the
+# per-index index_flags byte gains bit2 has_host_deps, and (only when set) after the v27 predicate a
+# u16 dep_count + per dependency name (u16 len + UTF-8) ‖ arg_count u16 ‖ arg type codes (u8 each) ‖
+# result type code (u8) ‖ component_id (u16 len + UTF-8) ‖ semantic_version u32, in ascending
+# (name, arg-type codes) order. A fixture writes it as `host_deps: [{ name:, arg_types: [codes],
+# result:, component_id:, semantic_version: }]`. An index with no host-function key is byte-identical
+# to v30, so a file with no such index moves to v31 only by its version byte + meta CRC.
+# format_version 30: FK actions use two three-bit fields in the actions byte;
 # format_version 29: deterministic per-column statistics use kind-4 catalog entries;
 # format_version 28: every table catalog entry appends row_count i64 (big-endian
 # two's-complement, restricted to nonnegative values) after root_data_page. The reference derives it
@@ -794,6 +801,26 @@ PARTIAL_INDEX_TABLE = {
 #   CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])
 #   INSERT (1, ARRAY[10,20,30], ARRAY['a','b']); (2, '{40,50}', '{}'); (3, ARRAY[1,NULL,3], NULL)
 #   INSERT (4, ARRAY[ARRAY[10,20],ARRAY[30,40]], '[2:3]={x,y}')
+# A table with a HOST-FUNCTION index dependency (v31 — extensibility.md §8.1): pins the index_flags
+# bit2 has_host_deps + the persisted dependency list (name + signature + component id + semantic
+# version) after index_root_page. The index `t_geo_idx` is on the expression `geo_hash(a)`, where
+# geo_hash is a host scalar function (i64 -> i64), component "com.example/geo_hash" at semantic
+# version 1. The table is EMPTY, so the tree is empty (root 0) — the fixture isolates the v31 catalog
+# change. The cores build this with a registered `geo_hash` host function (Immutable + that component
+# id + version) via
+#   CREATE TABLE t (id i64 PRIMARY KEY, a i64)
+#   CREATE INDEX t_geo_idx ON t (geo_hash(a))
+HOSTFUNC_INDEX_TABLE = {
+  name: "t",
+  columns: [col("id", "i64", pk: true), col("a", "i64")],
+  indexes: [
+    { name: "t_geo_idx", cols: [{ expr: "geo_hash ( a )" }],
+      host_deps: [{ name: "geo_hash", arg_types: [3], result: 3,
+                    component_id: "com.example/geo_hash", semantic_version: 1 }] }
+  ],
+  rows: []
+}.freeze
+
 ARRAY_TABLE = {
   name: "t",
   columns: [col("id", "i32", pk: true), col("xs", "i32[]"), col("tags", "text[]")],
@@ -1259,6 +1286,7 @@ FIXTURES = [
   { file: "unique_table.jed", page_size: 256, tables: [UNIQUE_TABLE] },
   { file: "expr_index_table.jed", page_size: 256, tables: [EXPR_INDEX_TABLE] },
   { file: "partial_index_table.jed", page_size: 256, tables: [PARTIAL_INDEX_TABLE] },
+  { file: "hostfunc_index_table.jed", page_size: 256, tables: [HOSTFUNC_INDEX_TABLE] },
   { file: "gin_array_table.jed", page_size: 256, tables: [GIN_ARRAY_TABLE] },
   { file: "gin_uuid_table.jed", page_size: 256, tables: [GIN_UUID_TABLE] },
   { file: "fk_table.jed", page_size: 256, tables: FK_TABLE[:tables] },
@@ -1917,13 +1945,28 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
         out << u16(c)
       end
     end
-    # index_flags: bit0 unique (v6), bit1 has_predicate (v27 — a partial index, indexes.md §9).
-    out << [(ix[:unique] ? 1 : 0) | (ix[:predicate] ? 2 : 0)].pack("C")
+    # index_flags: bit0 unique (v6), bit1 has_predicate (v27 — a partial index, indexes.md §9),
+    # bit2 has_host_deps (v31 — a host-function index dependency, extensibility.md §8.1).
+    host_deps = ix[:host_deps] || []
+    out << [(ix[:unique] ? 1 : 0) | (ix[:predicate] ? 2 : 0) | (host_deps.empty? ? 0 : 4)].pack("C")
     # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST (gist.md §8).
     out << [{ "gin" => 1, "gist" => 2 }.fetch(ix[:kind], 0)].pack("C")
     out << u32(index_roots[k])
     # v27: a partial index's predicate canonical text (u16 len + UTF-8) after index_root_page.
     out << u16(ix[:predicate].bytesize) << ix[:predicate].b if ix[:predicate]
+    # v31: the host-function dependency list (extensibility.md §8.1) after the predicate — only when
+    # bit2 is set. Already in ascending (name, arg-type codes) order (a fixture writes them sorted).
+    unless host_deps.empty?
+      out << u16(host_deps.size)
+      host_deps.each do |dep|
+        out << u16(dep[:name].bytesize) << dep[:name].b
+        out << u16(dep[:arg_types].size)
+        dep[:arg_types].each { |tc| out << [tc].pack("C") }
+        out << [dep[:result]].pack("C")
+        out << u16(dep[:component_id].bytesize) << dep[:component_id].b
+        out << u32(dep[:semantic_version])
+      end
+    end
   end
   # Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS table,
   # list order), the referenced table name, the referenced-column ordinals (into the PARENT
@@ -3145,12 +3188,14 @@ def decode_table_entry(buf, pos)
       end
     end
     fb, pos = take(buf, pos, 1)
-    # bit0 unique (v6), bit1 has_predicate (v27 — a partial index, indexes.md §9).
-    raise "reserved index flag set (only bit0 unique / bit1 has_predicate defined)" if (fb.getbyte(0) & ~0b11) != 0
+    # bit0 unique (v6), bit1 has_predicate (v27), bit2 has_host_deps (v31 — extensibility.md §8.1).
+    raise "reserved index flag set (only bit0 unique / bit1 has_predicate / bit2 has_host_deps defined)" if (fb.getbyte(0) & ~0b111) != 0
     kb, pos = take(buf, pos, 1) # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST
     raise "reserved index kind (only 0=btree, 1=gin, 2=gist defined — v20)" if kb.getbyte(0) > 2
     has_predicate = (fb.getbyte(0) & 0b10) != 0
     raise "a non-btree index cannot be partial (v27)" if has_predicate && kb.getbyte(0) != 0
+    has_host_deps = (fb.getbyte(0) & 0b100) != 0
+    raise "a non-btree index cannot have host-function dependencies (v31)" if has_host_deps && kb.getbyte(0) != 0
     rb, pos = take(buf, pos, 4)
     # v27: the partial-index predicate canonical text follows index_root_page when bit1 is set.
     predicate = nil
@@ -3158,9 +3203,31 @@ def decode_table_entry(buf, pos)
       pl, pos = take(buf, pos, 2)
       predicate, pos = take(buf, pos, pl.unpack1("n"))
     end
+    # v31: the host-function dependency list follows the predicate when bit2 is set (extensibility.md §8.1).
+    host_deps = []
+    if has_host_deps
+      dc, pos = take(buf, pos, 2)
+      dc.unpack1("n").times do
+        dnl, pos = take(buf, pos, 2)
+        dname, pos = take(buf, pos, dnl.unpack1("n"))
+        ac, pos = take(buf, pos, 2)
+        arg_types = []
+        ac.unpack1("n").times do
+          tcb, pos = take(buf, pos, 1)
+          arg_types << tcb.getbyte(0)
+        end
+        rtcb, pos = take(buf, pos, 1)
+        cidl, pos = take(buf, pos, 2)
+        cid, pos = take(buf, pos, cidl.unpack1("n"))
+        svb, pos = take(buf, pos, 4)
+        host_deps << { name: dname.force_encoding("UTF-8"), arg_types: arg_types,
+                       result: rtcb.getbyte(0), component_id: cid.force_encoding("UTF-8"),
+                       semantic_version: svb.unpack1("N") }
+      end
+    end
     indexes << { name: iname, cols: cols, unique: (fb.getbyte(0) & 1) != 0,
                  kind: { 1 => "gin", 2 => "gist" }.fetch(kb.getbyte(0), "btree"),
-                 root_page: rb.unpack1("N"), predicate: predicate }
+                 root_page: rb.unpack1("N"), predicate: predicate, host_deps: host_deps }
   end
   # Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the
   # actions byte, in name order. An FK owns no B-tree (no root page).

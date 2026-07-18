@@ -4,6 +4,95 @@
 
 use super::*;
 
+/// Walk a resolved index key / predicate expression and collect the **host-function dependencies**
+/// it references (spec/design/extensibility.md §8.1, delivery step 4), enforcing the two admission
+/// rules a host function must meet to back a **persisted** index:
+///   * `IMMUTABLE` — PostgreSQL requires index-expression functions to be immutable; jed adds it
+///     because a `volatile`/`stable` function would make the stored keys meaningless (`42P17`).
+///   * a `component_id` — without a stable identity + version the file cannot record a dependency it
+///     can re-check on reopen (`42P17`, §7). (This is what fixes the latent bug where any host
+///     function — even a volatile one — silently leaked into an index expression.)
+/// Deduplicated by `(name, arg_types)`; the caller sorts for a stable on-disk order.
+fn collect_index_host_deps(
+    node: &RExpr,
+    reg: &crate::extension::ExtensionRegistry,
+    out: &mut Vec<HostFuncDep>,
+) -> Result<()> {
+    if let RExpr::HostFunc { id, name, .. } = node {
+        let hf = reg.function(*id);
+        if hf.volatility != crate::extension::Volatility::Immutable {
+            return Err(EngineError::new(
+                SqlState::InvalidObjectDefinition,
+                format!("host function {name} in an index expression must be IMMUTABLE"),
+            ));
+        }
+        let Some(component_id) = hf.component_id.clone() else {
+            return Err(EngineError::new(
+                SqlState::InvalidObjectDefinition,
+                format!(
+                    "host function {name} used in an index expression must declare a component identity"
+                ),
+            ));
+        };
+        if !out
+            .iter()
+            .any(|d| d.name == hf.name && d.arg_types == hf.arg_types)
+        {
+            out.push(HostFuncDep {
+                name: hf.name.clone(),
+                arg_types: hf.arg_types.clone(),
+                result: hf.result,
+                component_id,
+                semantic_version: hf.semantic_version,
+            });
+        }
+    }
+    for child in estimator_expression_children(node) {
+        collect_index_host_deps(child, reg, out)?;
+    }
+    Ok(())
+}
+
+/// Verify a resolved index key / predicate expression's host-function references still match the
+/// dependencies persisted with the index (spec/design/extensibility.md §8.1/§11, delivery step 4) —
+/// the reopen soundness check. Called on every per-statement re-resolution: if the current registry
+/// supplies a *different* `component_id` or a *bumped* `semantic_version` for a signature the index
+/// depends on, the stored keys are stale, so this returns `XX002`, which the **read** path swallows
+/// (`resolve_index(...).ok()?` → the planner skips the index, a correct heap scan) and a **write**
+/// propagates (the table is read-only until a rebuild). A *missing* function is caught earlier by
+/// resolution itself (`42883`). A no-op for an index that records no host dependency (the common case,
+/// and for GIN/GiST whose keys are plain columns).
+fn verify_index_host_deps(
+    node: &RExpr,
+    reg: &crate::extension::ExtensionRegistry,
+    deps: &[HostFuncDep],
+) -> Result<()> {
+    if let RExpr::HostFunc { id, name, .. } = node {
+        let hf = reg.function(*id);
+        let ok = deps.iter().any(|d| {
+            d.name == hf.name
+                && d.arg_types == hf.arg_types
+                && hf.component_id.as_deref() == Some(d.component_id.as_str())
+                && hf.semantic_version == d.semantic_version
+        });
+        if !ok {
+            return Err(EngineError::new(
+                // XX002 — the graded "a versioned dependency no longer matches" reopen verdict, shared
+                // with the collation version-skew case (extensibility.md §11/§15).
+                SqlState::CollationVersionMismatch,
+                format!(
+                    "index depends on host function {name} whose registered component/version no \
+                     longer matches the file; the index is unusable until it is rebuilt"
+                ),
+            ));
+        }
+    }
+    for child in estimator_expression_children(node) {
+        verify_index_host_deps(child, reg, deps)?;
+    }
+    Ok(())
+}
+
 fn constraint_name_taken(t: &Table, name: &str) -> bool {
     t.checks.iter().any(|c| c.name.eq_ignore_ascii_case(name))
         || t.indexes
@@ -1032,6 +1121,8 @@ impl Engine {
                     unique: true,
                     kind: IndexKind::Btree,
                     predicate: None,
+                    // A PK / UNIQUE constraint index is always plain-column — no host dependency.
+                    host_deps: Vec::new(),
                 },
             );
         }
@@ -1292,6 +1383,8 @@ impl Engine {
                     unique: false,
                     kind: IndexKind::Gist,
                     predicate: None,
+                    // A GiST exclusion-backing index is plain-column — no host dependency.
+                    host_deps: Vec::new(),
                 },
             );
             table.exclusions.push(ExclusionConstraint {
@@ -2227,6 +2320,7 @@ impl Engine {
                                     unique: true,
                                     kind: IndexKind::Btree,
                                     predicate: None,
+                                    host_deps: Vec::new(),
                                 });
                                 table.indexes.sort_by_key(|x| x.name.to_ascii_lowercase());
                                 added_constraints.insert(name.to_ascii_lowercase());
@@ -2436,6 +2530,7 @@ impl Engine {
                                     unique: false,
                                     kind: IndexKind::Gist,
                                     predicate: None,
+                                    host_deps: Vec::new(),
                                 });
                                 table.exclusions.push(ExclusionConstraint {
                                     name: name.clone(),
@@ -3651,6 +3746,22 @@ impl Engine {
                 Some(resolve_boolean_filter(&scope, &p.expr, params)?)
             }
         };
+        // Reopen soundness (extensibility.md §8.1/§11, step 4): if this index depends on host
+        // functions, verify each still matches the dependency persisted with the index. A mismatch is
+        // `XX002`, which the read path swallows (`resolve_index(...).ok()?` → the planner skips it and
+        // heap-scans) and a write propagates (the table is read-only until a rebuild). A no-op for the
+        // common index that records no host dependency.
+        if !def.host_deps.is_empty() {
+            let reg = &self.session.extensions;
+            for k in &keys {
+                if let ResolvedKey::Expr(rexpr, ..) = k {
+                    verify_index_host_deps(rexpr, reg, &def.host_deps)?;
+                }
+            }
+            if let Some(pred) = &predicate {
+                verify_index_host_deps(pred, reg, &def.host_deps)?;
+            }
+        }
         Ok(ResolvedIndex {
             name: def.name.clone(),
             unique: def.unique,
@@ -3991,6 +4102,11 @@ impl Engine {
             }
         };
         let mut ci_keys: Vec<IndexKey> = Vec::with_capacity(ci.keys.len());
+        // Host-function dependencies this index's key/predicate expressions reference
+        // (spec/design/extensibility.md §8.1, step 4) — collected as each expression resolves, then
+        // persisted so a reopening binary can re-check them. Empty for the common index with no host
+        // function (byte-identical to v30 then).
+        let mut host_deps: Vec<HostFuncDep> = Vec::new();
         for elem in &ci.keys {
             // An EXPRESSION key element (spec/design/indexes.md §1/§2): resolve it against the
             // table's columns, validate it is immutable + indexable-typed, and store its canonical
@@ -4019,7 +4135,7 @@ impl Engine {
                     // 42P02 fall out of the resolver, as for a CHECK).
                     let scope = Scope::single(self, table);
                     let mut pt = ParamTypes::default();
-                    let (_node, rtype) =
+                    let (node, rtype) =
                         resolve(&scope, expr, None, &mut AggCtx::Forbidden, &mut pt)?;
                     // Immutability (§2): a non-immutable seam/sequence/current_setting call, a
                     // session-timezone-dependent expression (one that reads or produces a
@@ -4045,6 +4161,11 @@ impl Engine {
                                 .to_string(),
                         ));
                     }
+                    // Collect + admit any host functions the key expression calls (§8.1, step 4):
+                    // each must be IMMUTABLE + carry a component identity, else 42P17 (this also
+                    // closes the latent leak where a volatile host function passed the syntactic
+                    // immutability walk above).
+                    collect_index_host_deps(&node, &self.session.extensions, &mut host_deps)?;
                     ci_keys.push(IndexKey::Expr(IndexKeyExpr {
                         expr_text: text.clone(),
                         expr: expr.clone(),
@@ -4211,7 +4332,7 @@ impl Engine {
                 reject_index_predicate_structure(&pred.expr)?;
                 let scope = Scope::single(self, table);
                 let mut pt = ParamTypes::default();
-                let _node = resolve_boolean_filter(&scope, &pred.expr, &mut pt)?;
+                let node = resolve_boolean_filter(&scope, &pred.expr, &mut pt)?;
                 // Immutability (§9), the same rule an expression key carries: a non-immutable
                 // seam/clock/sequence call, a session-timezone-dependent subexpression (one that
                 // references a `timestamptz` column or produces a `timestamptz` value — conservatively
@@ -4227,12 +4348,27 @@ impl Engine {
                         "functions in index predicate must be marked IMMUTABLE".to_string(),
                     ));
                 }
+                // Collect + admit any host functions the predicate calls (§8.1, step 4), same rule as
+                // a key expression (IMMUTABLE + component identity, else 42P17).
+                collect_index_host_deps(&node, &self.session.extensions, &mut host_deps)?;
                 Some(IndexKeyExpr {
                     expr_text: pred.text.clone(),
                     expr: pred.expr.clone(),
                 })
             }
         };
+        // A stable on-disk / cross-core order (CLAUDE.md §8): sort the collected dependencies by
+        // (name, on-disk arg-type codes) so registration order never leaks into the file bytes.
+        let dep_sort_key = |d: &HostFuncDep| {
+            (
+                d.name.clone(),
+                d.arg_types
+                    .iter()
+                    .map(|t| crate::format::type_code_for_scalar(*t))
+                    .collect::<Vec<u8>>(),
+            )
+        };
+        host_deps.sort_by(|a, b| dep_sort_key(a).cmp(&dep_sort_key(b)));
         // `relation_taken` checks the namespace of the target scope: an attachment's OWN snapshot for an
         // attached table (each attached database is an independent namespace, §3), else the temp-aware
         // implicit namespace.
@@ -4285,6 +4421,7 @@ impl Engine {
             unique: ci.unique,
             kind,
             predicate,
+            host_deps,
         };
         // The build scan (cost.md §3): page_read per table-tree node + storage_row_read per
         // row. The touched set is the columns the key elements read — an index column for a

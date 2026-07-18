@@ -18,8 +18,8 @@ pub(crate) use crate::ast::{
 pub(crate) use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
     ExclusionConstraint, ExclusionElement, ExclusionOp, FkAction, ForeignKeyConstraint,
-    IdentityKind, IndexDef, IndexKey, IndexKeyExpr, IndexKind, SeqDataType, SeqOwner, SequenceDef,
-    Table, resolve_col_type,
+    HostFuncDep, IdentityKind, IndexDef, IndexKey, IndexKeyExpr, IndexKind, SeqDataType, SeqOwner,
+    SequenceDef, Table, resolve_col_type,
 };
 pub(crate) use crate::collation::{self, Collation};
 pub(crate) use crate::cost::{Lifetime, Meter};

@@ -5,9 +5,14 @@
 //
 //   * Functions ONLY (no host types, no host containers) — they touch the function catalog, not the
 //     type catalog, so no `format_version` bump and no persisted-catalog change.
-//   * EPHEMERAL — a host function is reachable from ad-hoc queries while its registry is registered;
-//     it is NOT persisted (no `CREATE FUNCTION … LANGUAGE HOST` DDL, no stored index expression). The
-//     catalog-bound, versioned, index-persistable form is step 4 (§7/§8.1).
+//   * REGISTRY-DECLARED (Model B, extensibility.md §7/§14 step 4) — a host function is declared in
+//     the registry and reachable from ad-hoc queries while registered; there is NO SQL DDL for it.
+//     An `immutable` function that also carries a `component_id` + `semantic_version` may back a
+//     **persisted index expression** (§8.1): the file records the resolved dependency (component id +
+//     signature + version) and re-checks it on reopen — a missing / different-component / bumped-version
+//     function makes the dependent index unusable (skipped for reads, refused for writes), never a
+//     silent stale-key read. A function that is only ever used in ad-hoc queries needs neither
+//     `component_id` nor a bumped version.
 //   * STRICT — a NULL argument short-circuits to a NULL result before the kernel runs (§4.2); the
 //     kernel never sees a NULL. Non-strict host functions are a follow-on.
 //   * EXACT scalar signatures — `(name, [ScalarType]) → ScalarType`. Overload resolution matches the
@@ -60,6 +65,20 @@ pub struct HostFunction {
     pub(crate) cross_core: bool,
     /// The declared static cost weight (cost.md §6 design (a)), charged once per call. Non-negative.
     pub(crate) cost: i64,
+    /// The **component identity** (extensibility.md §7, step 4) — a stable string the host chooses
+    /// (e.g. `"com.example.geo/geo_hash"`) that identifies this function's *implementation*
+    /// independently of its SQL name. `None` (the default) is fine for an ad-hoc-query-only function;
+    /// it is **required** to use the function in a **persisted index expression** (§8.1), where it +
+    /// [`semantic_version`](Self::semantic_version) form the resolved dependency the file records and
+    /// re-checks on reopen. Two registrations of the same SQL name+signature but *different*
+    /// `component_id` are different implementations (a mismatch on reopen makes a dependent index
+    /// unusable, never a silent stale-key read).
+    pub(crate) component_id: Option<String>,
+    /// The **semantic version** (extensibility.md §7) — bump it whenever a change to the function's
+    /// results would invalidate values/keys derived from it (a changed formula, a bug fix). A
+    /// dependent index persists the version it was built against; a mismatch on reopen forces the
+    /// index unusable (rebuild required), never a silent stale-key read. Default `0`.
+    pub(crate) semantic_version: u32,
     pub(crate) kernel: HostKernel,
 }
 
@@ -80,6 +99,8 @@ impl HostFunction {
             volatility: Volatility::Volatile,
             cross_core: false,
             cost: 1,
+            component_id: None,
+            semantic_version: 0,
             kernel,
         }
     }
@@ -101,6 +122,22 @@ impl HostFunction {
     /// non-negative.
     pub fn cost(mut self, weight: i64) -> Self {
         self.cost = weight;
+        self
+    }
+
+    /// Declare the **component identity** (extensibility.md §7, step 4) — a stable string that names
+    /// this function's implementation independently of its SQL name. Required to use the function in a
+    /// persisted index expression (§8.1). Default `None`.
+    pub fn component_id(mut self, id: impl Into<String>) -> Self {
+        self.component_id = Some(id.into());
+        self
+    }
+
+    /// Declare the **semantic version** (extensibility.md §7) — bump it when a change to the results
+    /// would invalidate keys/values derived from the function. A dependent index records this and a
+    /// mismatch on reopen forces a rebuild, never a silent stale-key read. Default `0`.
+    pub fn semantic_version(mut self, v: u32) -> Self {
+        self.semantic_version = v;
         self
     }
 
