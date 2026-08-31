@@ -45,6 +45,13 @@ end
 # Ask devdb for the endpoint rather than reading PGHOST: in a devcontainer the ambient PGHOST
 # points at the `db` compose service, which is not the cluster this stack supervises.
 db_socket, db_port = `#{RbConfig.ruby} #{File.join(__dir__, 'devdb.rb')} info`.chomp.split("\t")
+
+# Point PG* at THIS checkout's cluster for everything the stack starts. Exporting PGPORT (from
+# ports.env) while leaving PGHOST at the ambient value is not a half-measure, it is a wrong one:
+# the pair would name a port on the wrong server, and libpq would look for a socket that cannot
+# exist. Either both move or neither does. Processes outside the stack keep the ambient settings.
+ENV["PGHOST"] = db_socket
+ENV["PGPORT"] = db_port
 puts "  postgres  #{db_socket}  port #{db_port}  (rake db:psql)"
 puts "  web dev   #{ENV['WEB_DEV_URL']} (disabled by default: process-compose process start web)"
 puts "  control   127.0.0.1:#{ENV['PC_PORT_NUM']}"
