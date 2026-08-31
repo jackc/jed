@@ -1,0 +1,145 @@
+# Developing jed
+
+Two supported environments, one command set. Native macOS is the fast inner loop; the
+devcontainer is a Linux compatibility and isolation option. Both run the same mise tasks against
+the same `process-compose.yaml`, so nothing here is specific to one of them except the
+prerequisites in §1.
+
+```
+mise install        # tool versions from mise.toml
+mise run dev:init   # gems, npm deps, this checkout's port block, the wasm target
+mise run dev        # start this checkout's services (the PostgreSQL oracle)
+mise run ci         # the full merge gate
+```
+
+---
+
+## 1. Prerequisites
+
+### Native macOS
+
+[mise](https://mise.jdx.dev) provides Go, Node, Rust, Ruby, Biome, and process-compose. Homebrew
+provides what mise does not:
+
+```sh
+brew install mise postgresql@18 sqlite
+xcode-select --install          # C toolchain: cgo bench baseline, the Node-API lock adapter, Ruby
+```
+
+- **`postgresql@18`** is the differential oracle (§3). Do **not** `brew services start` it — jed
+  runs its own cluster per checkout. The formula is *keg-only*, so `psql` and `pg_isready` are not
+  on your `PATH` after install; `mise.toml` adds the formula's `bin` to `PATH` for this project, so
+  project commands work without linking it globally.
+- **Ruby** is built from source by mise. If the build fails, it is almost always a missing library:
+  `brew install openssl@3 libyaml readline libffi` and retry.
+- The major version tracks `[cluster] pg_major` in `spec/conformance/oracle_profile.toml`. If that
+  ever moves, install the matching formula.
+
+### Devcontainer
+
+Reopen in the container; `.devcontainer/` handles the rest. It installs the same PostgreSQL 18
+server and client, and runs the same per-checkout cluster — it is a Linux shell around this same
+setup, not a second architecture.
+
+---
+
+## 2. Worktrees are the unit of isolation
+
+A git worktree is the native equivalent of a second devcontainer instance. Each one gets:
+
+```
+.dev/                   # gitignored, per-checkout runtime state
+  ports.env             # this checkout's TCP port block + PGHOST/PGPORT
+  postgres/data         # this checkout's PostgreSQL cluster
+```
+
+```sh
+git worktree add ../jed-feature-x feature-x
+cd ../jed-feature-x
+mise run dev:init && mise run dev
+```
+
+Both checkouts can run simultaneously: different ports, independent database state, independent
+process-compose instances. `mise run dev:ports` prints the allocation.
+
+Ports are allocated once per checkout and persisted. Two dormant checkouts may hold the same block
+— harmless until both run, which `dev:ports:ensure` detects and re-allocates around.
+
+**Reference sources** (`references/`, §12 of `CLAUDE.md`) are provisioned per checkout with `rake
+references:setup`, sharing one machine-level mirror. They are a multi-GB download; nothing
+provisions them automatically.
+
+---
+
+## 3. The PostgreSQL oracle
+
+jed's conformance corpus is filled and checked against a live PostgreSQL (`CLAUDE.md` §7). That
+server is **this checkout's own cluster**, not a shared service:
+
+```sh
+mise run dev            # starts it (process-compose supervises)
+rake db:psql            # a shell against it
+rake oracle:status      # declared profile vs the live server
+```
+
+Its configuration is **declared data** — `spec/conformance/oracle_profile.toml`. The corpus is
+calibrated to that profile, so the harness asserts it at connect and aborts on a mismatch rather
+than importing different answers. Consequences worth internalising:
+
+- **Corpus, RQG, and benchmark work need the stack running.** "oracle unreachable" almost always
+  means you have not run `mise run dev` in this checkout.
+- **`PGHOST` and `PGPORT` are a pair.** They come from `.dev/ports.env` via mise. Setting one
+  without the other names a real port on the wrong server, and the error will name a socket path
+  nothing ever created.
+- **Changing a profile value changes what the oracle answers.** Treat it as a spec edit and re-run
+  `rake corpus:check` over the oracle-checkable corpus.
+- When sweeping many corpus files, `rake oracle:reset` between them — a `.test` carrying its own
+  transaction control commits its tables for real, and later files then replay onto a dirty
+  database in a way that looks exactly like a regression.
+
+---
+
+## 4. Everyday commands
+
+| Command | What it does |
+|---|---|
+| `mise run ci` | the full merge gate (spec verification, formatting, lint, tests, process locking) |
+| `mise run test` | conformance corpus on all three cores + unit + CLI + gem + migrate |
+| `mise run verify` | spec data tables and byte fixtures; needs no engine build |
+| `mise run fmt` / `fmt:fix` | formatting across cores, host artifacts, tooling, and web |
+| `mise run dev` | start this checkout's services |
+| `mise run dev:ports` | this checkout's port allocation |
+| `mise run db:init` / `db:psql` | create / open this checkout's cluster |
+| `mise run oracle:status` / `oracle:setup` / `oracle:reset` | the oracle's profile and database |
+| `mise run dev:browsers` | Chromium for the two Playwright suites (~150 MB, not needed by `ci`) |
+
+`rake <task>` remains equally valid and is where the logic lives; `mise.toml` is a thin wrapper so
+one command set works in both environments. `rake -T` lists everything, including tasks with no
+mise wrapper (`bench:*`, `rqg:*`, `stress`, `fuzz`, `mutation`, `references:*`).
+
+Services are managed by process-compose, not bespoke tasks:
+
+```sh
+process-compose process list             # status, scriptable
+process-compose process logs postgres    # logs for one process
+process-compose process start web        # the website dev server (disabled by default)
+process-compose down                     # stop this checkout's stack only
+```
+
+Each checkout runs its own instance on its own control port, which process-compose reads from
+`PC_PORT_NUM`, so these need no flags and never reach another checkout's stack.
+
+---
+
+## 5. Platform notes
+
+- **Benchmarks are not comparable across platforms.** macOS `fsync` goes through `F_FULLFSYNC`,
+  which is far more expensive than Linux `fdatasync`, and the Go core falls back to a full `Sync`
+  off Linux. Durable-write numbers taken on macOS cannot be compared with the Linux figures
+  recorded in `spec/design/benchmarks.md`. Treat Linux as the canonical benchmark platform.
+- **Corpus authoring is platform-independent** — deliberately. The oracle uses PostgreSQL's
+  `builtin` `C.UTF-8` locale provider, which consults no host library, so a macOS cluster and a
+  Linux one answer identically. That is why a native oracle is safe here.
+- **The devcontainer forwards 5173/4173** as fallbacks. With a port allocation (the normal case)
+  the web servers bind the allocated ports instead, which VS Code detects and forwards. Unset
+  `WEB_DEV_PORT` / `WEB_PREVIEW_PORT` to pin them back.

@@ -85,6 +85,11 @@ are **not yet published** to their registries.)
   written. The honesty mechanism is divergence under a shared contract, not implementation
   count.
 
+## Development
+
+Building on jed itself: [DEVELOPMENT.md](DEVELOPMENT.md) — prerequisites for native macOS and the
+devcontainer, the per-checkout PostgreSQL oracle, and the command set (`mise run ci` and friends).
+
 ## Design & internals
 
 - **[CLAUDE.md](CLAUDE.md)** — the Project Design Brief: the standing, load-bearing record

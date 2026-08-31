@@ -29,6 +29,20 @@ process-compose = '1.122.0'
 [env]
 _.file = '.dev/ports.env'
 
+# Homebrew's postgresql@18 is KEG-ONLY: nothing is linked into the prefix bin, so psql,
+# pg_isready, and initdb are not on PATH after `brew install`. The scripts that need the SERVER
+# binaries resolve them explicitly (scripts/lib/pg_bin.rb), but the CLIENT tools are invoked by
+# name from several places — the readiness probe, `rake db:psql`, oracle_setup, and the whole
+# oracle harness — and a bare `psql` failing would take out corpus work, RQG, and benchmarks.
+#
+# Both standard Homebrew prefixes are listed (Apple silicon, then Intel). Neither exists on Linux,
+# where a nonexistent PATH entry is simply ignored, so this is inert in the devcontainer. The major
+# version tracks [cluster] pg_major in spec/conformance/oracle_profile.toml.
+_.path = [
+  '/opt/homebrew/opt/postgresql@18/bin',
+  '/usr/local/opt/postgresql@18/bin',
+]
+
 # --- Tasks: the project's development interface -----------------------------------------------
 #
 # These wrap the Rake surface rather than replacing it (the Rakefile is ~1,400 lines of real Ruby
@@ -103,6 +117,16 @@ run = [
 # --- Per-worktree ports ------------------------------------------------------------------------
 # A git worktree is the native equivalent of a second devcontainer instance; these give it a
 # private TCP port block so several checkouts can serve simultaneously. See scripts/devports.rb.
+
+[tasks."dev:browsers"]
+description = "Install the Chromium build the browser e2e suites drive (impl/ts + web)"
+# Separate from dev:init because it is a ~150 MB download that only the two Playwright suites need
+# — `rake ci` does not. --with-deps installs OS packages via apt and exists only on Linux, so it is
+# applied there and omitted elsewhere; on macOS the browser bundle is self-contained.
+run = '''
+if [ "$(uname -s)" = "Linux" ]; then deps="--with-deps"; else deps=""; fi
+for dir in impl/ts web; do (cd "$dir" && npx playwright install $deps chromium); done
+'''
 
 [tasks.dev]
 description = "Start this checkout's long-running services (PostgreSQL oracle) under process-compose"
