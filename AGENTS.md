@@ -162,8 +162,10 @@ files in the same change.
 - Never run `rake references:setup`, `rake references:update`, or any large
   download on your own initiative.
 - If reference sources are missing, work without them or ask the user.
-- PostgreSQL oracle access is via the preconfigured Unix socket. Do not override
-  `PGHOST`.
+- The PostgreSQL oracle is this checkout's own cluster (`.dev/postgres`), started by
+  `mise run dev` and reached over its Unix socket. `PGHOST`/`PGPORT` come from
+  `.dev/ports.env` via mise — do not override them, and never set one without the
+  other. If the oracle is unreachable, the cluster is probably not running.
 - The oracle's configuration is declared in `spec/conformance/oracle_profile.toml`
   (cluster facts asserted at connect, session GUCs applied per probe). A mismatch
   aborts. Changing a profile value changes what the oracle answers, so treat it as a
@@ -182,8 +184,8 @@ files in the same change.
   automation. Use shell or Make only when clearly better for the job.
 - Long-running services live in `process-compose.yaml`, one-shot work in mise/rake
   tasks. `mise run dev` starts this checkout's stack (its own PostgreSQL cluster
-  under `.dev/postgres`); `mise run dev:ports` shows its allocated ports. The
-  devcontainer's `db` compose service is still the default oracle.
+  under `.dev/postgres`); `mise run dev:ports` shows its allocated ports. Corpus and
+  benchmark work needs that stack running.
 - `mise run <task>` is the entry point, `rake <task>` the implementation: `mise.toml`
   wraps the Rake surface so the same commands work natively, in the devcontainer, and
   in CI. Put new logic in the Rakefile; surface it in `mise.toml` when it should be

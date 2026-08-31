@@ -1,7 +1,7 @@
 //! bench-pg benchmarks PostgreSQL via the sync `postgres` crate
 //! (spec/design/benchmarks.md §6/§7). Unlike libpq, rust-postgres does not read the PG*
-//! env itself, so the connection config is assembled from PGHOST/PGUSER here (the
-//! devcontainer points PGHOST at the Unix socket; a path host uses the socket).
+//! env itself, so the connection config is assembled from PGHOST/PGPORT/PGUSER here (they point
+//! at this checkout's cluster — .dev/ports.env; a path host uses the Unix socket).
 
 use postgres::types::{ToSql, Type};
 use postgres::{Client, NoTls, Statement};
@@ -25,7 +25,11 @@ struct PgEngine {
 fn open(_data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>> {
     let host = std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_string());
     let user = std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_string());
-    let config = format!("host={host} user={user} dbname=jed_bench_{dataset}");
+    // PGPORT matters: the benchmark cluster is per-checkout and listens on a port from this
+    // checkout's allocated block, not 5432. Omitting it silently used the default and looked for a
+    // socket that does not exist.
+    let port = std::env::var("PGPORT").unwrap_or_else(|_| "5432".to_string());
+    let config = format!("host={host} port={port} user={user} dbname=jed_bench_{dataset}");
     let mut client = Client::connect(&config, NoTls)?;
     if dataset == "scratch" {
         // bench-setup created the empty scratch database once; reset it per run.

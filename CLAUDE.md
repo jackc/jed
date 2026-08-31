@@ -861,17 +861,22 @@ still gets its own `references/` worktree, and so keeps the per-checkout ref ind
 
 | Repo | Ref | License | Why it's here |
 |---|---|---|---|
-| `postgres` | `REL_18_STABLE` | PostgreSQL License | Semantic oracle (§1, §7); `numeric.c` is the exact-decimal reference (§8). Pinned to match the live `postgres:18` service in `.devcontainer/docker-compose.yml`. |
+| `postgres` | `REL_18_STABLE` | PostgreSQL License | Semantic oracle (§1, §7); `numeric.c` is the exact-decimal reference (§8). Pinned to match the PG major the oracle profile declares (`spec/conformance/oracle_profile.toml`). |
 | `sqlite` | `master` | Public Domain | The north star (§1); origin of the sqllogictest format (§7). |
 | `duckdb` | `main` | MIT | Embedded DB that also uses sqllogictest — closest living architecture reference (§7). |
 | `bbolt` | `main` | MIT | Single-file store whose single-writer / root-pointer-swap commit model matches §3 / §9. |
 | `sqllogictest-rs` | `main` | MIT / Apache-2.0 | Reference Rust sqllogictest runner — useful for `impl/rust`'s harness (§7). |
 
-PostgreSQL also runs **live** as the `db` service (a queryable oracle), separate from this
-source checkout. The oracle is reached over a **Unix-domain socket** shared into the devcontainer
-(`PGHOST=/var/run/postgresql`, trust auth) — the connection env is preconfigured, so just run bare
-`psql` or `rake corpus:check[<repo-root path>]` and **never override `PGHOST`** (the recurring
-foot-gun). Its **configuration is declared data**, not whatever the nearest server defaults to:
+PostgreSQL also runs **live** as a queryable oracle, separate from this source checkout — and it
+is **this checkout's own cluster**, not a shared server: `.dev/postgres`, created by `rake db:init`
+and supervised by process-compose, identically on native macOS and in the devcontainer (`mise run
+dev` starts it; the retired `db` compose service is what this replaced). One cluster per checkout
+means destructive resets stay local and two checkouts run at once. It is reached over a
+**Unix-domain socket** (trust auth) whose directory and port come from the checkout's allocated
+block and live in `.dev/ports.env`, which mise loads — so bare `psql` or `rake
+corpus:check[<repo-root path>]` just works, and **`PGHOST` and `PGPORT` must never be set
+independently of each other** (one without the other names a real port on the wrong server, and
+libpq then hunts a socket that cannot exist — the recurring foot-gun). Its **configuration is declared data**, not whatever the nearest server defaults to:
 `spec/conformance/oracle_profile.toml` asserts the cluster facts (PG major, locale provider +
 locale, encoding, database) at connect and applies the output-affecting session GUCs (`DateStyle`,
 `IntervalStyle`, `extra_float_digits`, …) in every probe — because those change the oracle's
@@ -881,7 +886,9 @@ locale, encoding, database) at connect and applies the output-affecting session 
 code-point ordering *is* jed's single defined `C` collation — so text ordering agrees by
 construction rather than by hand-written override, and the oracle is tied to PostgreSQL rather
 than to one host's glibc/ICU. Provision it with `rake oracle:setup`; the harness connects to it
-explicitly, so bare `psql` (still the cluster default) is `psql -d jed_oracle` for corpus work. The `db` service name also resolves over TCP, but the socket is the path we use.
+explicitly, so bare `psql` (still the cluster default) is `psql -d jed_oracle` for corpus work. The
+cluster also listens on loopback TCP at `PGPORT` for GUI tools, but the socket is the path the
+harnesses use.
 **CockroachDB** is deliberately **excluded** despite being cited in §7/§8:
 its core is BSL 1.1 (source-available, not OSI-free). For its key-encoding design, read it
 from `spec/encoding/` or an old Apache-2.0 tag rather than vendoring the BSL source.

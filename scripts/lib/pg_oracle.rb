@@ -6,12 +6,14 @@ require "toml-rb"
 # scripts/lib/pg_oracle.rb — the live-PostgreSQL oracle mechanics, extracted verbatim from
 # scripts/oracle_import.rb so the oracle importer AND the RQG firehose (scripts/rqg_gen.rb) share
 # ONE implementation (CLAUDE.md §5: data/logic over duplicated code). This is the entire "run a
-# query against the live `db` service and render it as a sqllogictest `----` block" engine: the
+# query against the live oracle cluster and render it as a sqllogictest `----` block" engine: the
 # psql invocation, the jed→PG type rewrite, the PG-type→coltype-tag map, the `\gdesc` type pass,
 # the newline-fieldsep value pass, and the canonical rowsort.
 #
-# Connection: honors the PGHOST env (the devcontainer points it at the shared Unix socket, faster
-# than localhost TCP; `local all all trust` auth ⇒ no password). NEVER pass -h / set PGHOST.
+# Connection: honors the PGHOST/PGPORT env, which mise loads from this checkout's .dev/ports.env
+# and which point at the cluster process-compose supervises (a Unix socket — faster than localhost
+# TCP; `local all all trust` auth ⇒ no password). NEVER pass -h, and never set one of PGHOST /
+# PGPORT without the other.
 #
 # Profile: the oracle's configuration is DATA, not whatever the nearest server defaults to — see
 # spec/conformance/oracle_profile.toml. Cluster facts (PG major, locale provider/locale, encoding,
@@ -90,9 +92,19 @@ class PgOracle
         out, err, status = Open3.capture3(*psql, "-c", PROFILE_QUERY)
         unless status.success?
           want = profile.fetch("cluster")
-          abort "oracle unreachable (spec/conformance/oracle_profile.toml expects database " \
-                "#{want['database']} on PG #{want['pg_major']}). If the database is simply " \
-                "missing, run `rake oracle:setup`.\n#{err.strip}"
+          # Two different failures reach here and they have different fixes, so name both rather
+          # than guessing: the checkout's cluster is not running (the common one — the oracle is a
+          # supervised service now, not an always-on container), or it is running without the
+          # database the profile declares.
+          abort <<~MSG
+            oracle unreachable — spec/conformance/oracle_profile.toml expects database
+            #{want['database']} on PG #{want['pg_major']} at PGHOST=#{ENV.fetch('PGHOST', '(unset)')} PGPORT=#{ENV.fetch('PGPORT', '(unset)')}
+
+              server not running?    mise run dev      (starts this checkout's cluster)
+              database missing?      rake oracle:setup
+
+            #{err.strip}
+          MSG
         end
 
         major, provider, locale, collate, ctype, encoding, database, us_zones =

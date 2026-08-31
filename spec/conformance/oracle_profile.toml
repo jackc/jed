@@ -54,6 +54,10 @@ encoding = "UTF8"
 # a database's locale is fixed at CREATE time, so matching jed's collation means creating one
 # (`rake oracle:setup`). It also keeps replayed corpus DDL off the default database. The harness
 # names it explicitly (`psql -d`), so it does not depend on the PGDATABASE env.
+#
+# It lives in THIS CHECKOUT's cluster (.dev/postgres, started by `mise run dev`), not a shared
+# server — so a destructive reset, a different PG major, or a half-finished experiment stays local
+# to one checkout (CLAUDE.md §12).
 database = "jed_oracle"
 
 # --- REPORTED: facts that vary per PG build, warned about rather than enforced ---------------

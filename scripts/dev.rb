@@ -46,12 +46,18 @@ end
 # points at the `db` compose service, which is not the cluster this stack supervises.
 db_socket, db_port = `#{RbConfig.ruby} #{File.join(__dir__, 'devdb.rb')} info`.chomp.split("\t")
 
-# Point PG* at THIS checkout's cluster for everything the stack starts. Exporting PGPORT (from
-# ports.env) while leaving PGHOST at the ambient value is not a half-measure, it is a wrong one:
-# the pair would name a port on the wrong server, and libpq would look for a socket that cannot
-# exist. Either both move or neither does. Processes outside the stack keep the ambient settings.
-ENV["PGHOST"] = db_socket
-ENV["PGPORT"] = db_port
+# PGHOST and PGPORT come from the allocation above (devports writes them as a pair, from the same
+# DevPaths source devdb starts the server on), so the loop has already set them. Asserting it here
+# rather than re-assigning keeps ONE source of truth and turns a drift between the two scripts into
+# a loud failure instead of a connection to a socket that does not exist.
+if ENV["PGHOST"] != db_socket || ENV["PGPORT"] != db_port
+  abort <<~MSG
+    dev: the allocation disagrees with the cluster layout.
+      .dev/ports.env: PGHOST=#{ENV['PGHOST'].inspect} PGPORT=#{ENV['PGPORT'].inspect}
+      devdb.rb info:  PGHOST=#{db_socket.inspect} PGPORT=#{db_port.inspect}
+    Run `rake dev:ports:ensure` to regenerate the allocation.
+  MSG
+end
 puts "  postgres  #{db_socket}  port #{db_port}  (rake db:psql)"
 puts "  web dev   #{ENV['WEB_DEV_URL']} (disabled by default: process-compose process start web)"
 puts "  control   127.0.0.1:#{ENV['PC_PORT_NUM']}"

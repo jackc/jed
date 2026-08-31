@@ -15,6 +15,20 @@ ruby = '4.0.5'
 # (CLAUDE.md §14): it never links into a core, it supervises the PostgreSQL oracle.
 process-compose = '1.122.0'
 
+# --- Environment -------------------------------------------------------------------------------
+#
+# This checkout's own service endpoints (scripts/devports.rb). Loading them here is what makes the
+# per-checkout PostgreSQL cluster the DEFAULT: a bare `psql`, `rake corpus:check`, and the bench
+# harnesses all read PGHOST/PGPORT from the environment, so pointing those at .dev/postgres in one
+# place moves every consumer at once — rather than some tools reaching a checkout-local cluster and
+# others a machine-wide one, which is the split-brain the oracle profile exists to prevent.
+#
+# The file is generated per checkout and gitignored; `mise run dev:init` (or dev:ports:ensure)
+# creates it. Its absence is not an error — mise skips a missing file, the vite/playwright configs
+# fall back to their historical ports, and PG* falls back to whatever the shell already had.
+[env]
+_.file = '.dev/ports.env'
+
 # --- Tasks: the project's development interface -----------------------------------------------
 #
 # These wrap the Rake surface rather than replacing it (the Rakefile is ~1,400 lines of real Ruby
@@ -78,9 +92,12 @@ run = [
   "bundle install",
   "npm ci --silent --prefix impl/ts",
   "npm ci --silent --prefix web",
-  # Inert in a devcontainer (its own namespace; the configs fall back to the forwarded 5173/4173
-  # unless .dev/ports.env is sourced) and load-bearing natively, where worktrees share a stack.
   "bundle exec rake dev:ports:ensure",
+  # The WASM bench target (bench/ts/src/bench-wasm.ts drives the core compiled to wasm32-wasip1).
+  # rustup state lives in the container's home, NOT on the persist volume, so a devcontainer
+  # rebuild silently loses this and `rake bench:run` then fails on a cargo target error. It was a
+  # documented manual step; bootstrap is where it belongs. Tolerant of a non-rustup toolchain.
+  "command -v rustup >/dev/null && rustup target add wasm32-wasip1 || echo 'skip: no rustup; add the wasm32-wasip1 target manually for rake bench:*'",
 ]
 
 # --- Per-worktree ports ------------------------------------------------------------------------

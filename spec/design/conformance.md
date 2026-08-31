@@ -314,10 +314,10 @@ Every corpus entry MUST obey:
 
 - The corpus is **predominantly hand-authored.** Integer semantics are small and fully
   known, so the expected output is written directly and reviewed as the contract.
-- **Oracle-import** against the live PostgreSQL service is **available** (`scripts/oracle_import.rb`;
+- **Oracle-import** against the live PostgreSQL cluster is **available** (`scripts/oracle_import.rb`;
   `rake corpus:import[file]` fills a `.test`'s expected rows/error codes from PG, `rake
   corpus:check[file]` re-derives and diffs without writing). It talks **only to the running
-  `db` service**, never the source checkout, so it does **not** trip the §12
+  oracle cluster**, never the source checkout, so it does **not** trip the §12
   reference-provisioning gate, and it is **psql-only** (no `pg` gem — no §14 dependency). It is
   an authoring aid + a standing drift check, **not** a query generator (that is the metamorphic
   generator, §8). It cannot derive `# cost:` (PG has no notion of jed's cost units), so cost
@@ -343,7 +343,9 @@ Every corpus entry MUST obey:
     The builtin provider consults no external library, and its code-point ordering **is** jed's
     single defined `C` collation (types.md §11), so PG and jed agree on text ordering *by
     construction* instead of by hand-written override. `rake oracle:setup` provisions it
-    (a database's locale is fixed at CREATE time, so matching jed means creating one).
+    (a database's locale is fixed at CREATE time, so matching jed means creating one) inside
+    **this checkout's own PostgreSQL cluster** (`.dev/postgres`, started by `mise run dev` —
+    CLAUDE.md §12), so the oracle is per-checkout state rather than shared infrastructure.
     `PgOracle.assert_profile!` checks them **once per process** on first connect and **aborts** on
     a mismatch, so every `corpus:*` / `rqg:*` task inherits the guard for free. `rake
     oracle:status` prints declared-vs-live; `rake oracle:check` is the bare assertion.
@@ -382,7 +384,7 @@ Every corpus entry MUST obey:
   warning, and is recorded in the ledger like any other divergence rather than crashing the import.
 - **Never auto-provision references or run heavy oracles** (CLAUDE.md §12). The *source*
   checkouts and any bulk import remain explicit, user-initiated steps; the live-`db` oracle
-  above is the always-available path that needs no provisioning.
+  above needs only this checkout's own cluster (`mise run dev`), not a provisioning step.
 
 ## 6. Running the corpus
 

@@ -673,9 +673,11 @@ stress/*.stress.toml       # Layer 3 stress workloads (run by `rake stress`)
 scripts/bench_report.rb    # aggregator (rake bench:report)
 ```
 
-PostgreSQL benchmark data lives in the live `db` service (databases `jed_bench_small`,
-`jed_bench_large`, `jed_bench_scratch`), reached over the Unix socket like the oracle
-(`PGHOST=/var/run/postgresql`, trust auth).
+PostgreSQL benchmark data lives in this checkout's own PostgreSQL cluster (databases
+`jed_bench_small`, `jed_bench_large`, `jed_bench_scratch`), reached over its Unix socket like the
+oracle — `PGHOST`/`PGPORT` come from `.dev/ports.env`, trust auth. The cluster must be running
+(`mise run dev`); `rake bench:setup` creates the databases, so they are regenerable rather than
+persistent infrastructure.
 
 The corpus is data, the harnesses are code: each harness parses the same two TOML files
 and runs the same benchmarks; only the engine driver differs per binary (§7). New

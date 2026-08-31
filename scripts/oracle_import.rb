@@ -2,7 +2,7 @@
 
 # scripts/oracle_import.rb — minimal PostgreSQL oracle-import harness (CLAUDE.md §7, TODO.md
 # Phase 8). Fills a sqllogictest `.test`'s expected output from the LIVE `db` PostgreSQL
-# service (.devcontainer/docker-compose.yml) — never the source checkout, so the §12
+# cluster (.dev/postgres, started by `mise run dev`) — never the source checkout, so the §12
 # reference-provisioning gate is sidestepped. psql-only: no `pg` gem, so no §14 dep decision.
 #
 # Model: skeleton-fill, NOT query-gen (that is scripts/rqg_gen.rb, the RQG firehose). The human

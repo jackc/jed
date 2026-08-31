@@ -25,15 +25,13 @@
 # gates dependents instead of a sleep. `db:init` and `db:reset` are the one-shot half.
 
 require "fileutils"
-require "digest"
-require "rbconfig"
+require_relative "lib/dev_paths"
 require_relative "lib/pg_bin"
 require_relative "lib/pg_oracle"
 
-ROOT = File.expand_path("..", __dir__)
-DEV_DIR = File.join(ROOT, ".dev")
-PGDATA = File.join(DEV_DIR, "postgres", "data")
-PORTS_ENV = File.join(DEV_DIR, "ports.env")
+DEV_DIR = DevPaths::DEV_DIR
+PGDATA = DevPaths::PGDATA
+PORTS_ENV = DevPaths::PORTS_ENV
 
 CLUSTER = PgOracle.profile.fetch("cluster")
 MAJOR = CLUSTER.fetch("pg_major")
@@ -49,19 +47,6 @@ def pgport
     abort("devdb: PGPORT missing from #{PORTS_ENV} — re-run `rake dev:ports:ensure`.")
 end
 
-# A Unix socket path is capped by sockaddr_un.sun_path: 104 bytes on macOS, 108 on Linux, and
-# PostgreSQL appends "/.s.PGSQL.<port>" to the directory. A checkout nested a few levels deep under
-# a long home directory blows that limit, and the failure ("could not create socket") points at
-# nothing useful — so measure it and fall back to a short, deterministic /tmp directory.
-SUN_PATH_MAX = RbConfig::CONFIG["host_os"] =~ /darwin/ ? 104 : 108
-
-def socket_dir
-  preferred = File.join(DEV_DIR, "postgres", "run")
-  return preferred if preferred.bytesize + "/.s.PGSQL.#{pgport}".bytesize < SUN_PATH_MAX
-
-  # Deterministic per checkout, so the same tree always gets the same directory.
-  File.join("/tmp", "jed-pg-#{Digest::SHA256.hexdigest(ROOT)[0, 12]}")
-end
 
 def initialized? = File.exist?(File.join(PGDATA, "PG_VERSION"))
 
@@ -79,9 +64,9 @@ def init
     system(*args, out: File::NULL) or abort("devdb: initdb failed")
   end
 
-  FileUtils.mkdir_p(socket_dir)
+  FileUtils.mkdir_p(DevPaths.socket_dir(pgport))
   puts "  data:   #{PGDATA}"
-  puts "  socket: #{socket_dir}"
+  puts "  socket: #{DevPaths.socket_dir(pgport)}"
   puts "  port:   #{pgport}"
 end
 
@@ -96,7 +81,7 @@ end
 # Listens on BOTH the Unix socket (jed's documented oracle path — faster, and what PGHOST points
 # at) and loopback TCP (reachable by GUI tools and anything that cannot use a socket).
 def server_argv
-  [PgBin.tool("postgres", MAJOR), "-D", PGDATA, "-p", pgport, "-k", socket_dir, "-h", "127.0.0.1"]
+  [PgBin.tool("postgres", MAJOR), "-D", PGDATA, "-p", pgport, "-k", DevPaths.socket_dir(pgport), "-h", "127.0.0.1"]
 end
 
 case ARGV[0]
@@ -104,17 +89,17 @@ when "init" then init
 when "serve"
   abort "devdb: cluster not initialized — run `rake db:init`" unless initialized?
 
-  FileUtils.mkdir_p(socket_dir) # a /tmp fallback dir can vanish between boots
+  FileUtils.mkdir_p(DevPaths.socket_dir(pgport)) # a /tmp fallback dir can vanish between boots
   exec(*server_argv)
 when "ready"
-  exec("pg_isready", "-h", socket_dir, "-p", pgport, "-U", "postgres")
+  exec("pg_isready", "-h", DevPaths.socket_dir(pgport), "-p", pgport, "-U", "postgres")
 when "info"
   # The launcher must not report the ambient PGHOST: in a devcontainer that points at the `db`
   # compose service, which is NOT the cluster this stack runs. One definition, printed on request.
-  puts "#{socket_dir}\t#{pgport}"
+  puts "#{DevPaths.socket_dir(pgport)}\t#{pgport}"
 when "psql"
   abort "devdb: cluster not initialized — run `rake db:init`" unless initialized?
-  exec("psql", "-h", socket_dir, "-p", pgport, "-U", "postgres",
+  exec("psql", "-h", DevPaths.socket_dir(pgport), "-p", pgport, "-U", "postgres",
        "-d", CLUSTER.fetch("database"), *ARGV[1..])
 when "reset"
   unless ENV["CONFIRM"] == "yes"

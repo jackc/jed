@@ -2,7 +2,7 @@
 // (spec/design/benchmarks.md §6/§7). The corpus's raw $N SQL runs through sql.unsafe
 // with prepare:true (a named server-side prepared statement); .values() returns rows as
 // arrays so the canonical rendering follows column order. Connection settings come from
-// the PG* env (the devcontainer points PGHOST at the Unix socket).
+// the PG* env (PGHOST/PGPORT point at this checkout's cluster — .dev/ports.env).
 
 import postgres from "postgres";
 
@@ -85,6 +85,9 @@ await mainWith({
   async open(_dataDir: string, dataset: string): Promise<Engine> {
     const sql = postgres({
       host: process.env.PGHOST ?? "localhost",
+      // Explicit: the benchmark cluster is per-checkout and listens on a port from this checkout's
+      // allocated block, not 5432.
+      port: Number(process.env.PGPORT) || 5432,
       user: process.env.PGUSER ?? "postgres",
       database: `jed_bench_${dataset}`,
       max: 1,
