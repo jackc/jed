@@ -10,6 +10,10 @@ rust = '1.92.0'
 "go:golang.org/x/pkgsite/cmd/pkgsite" = "latest"
 "go:mvdan.cc/gofumpt" = "latest"
 ruby = '4.0.5'
+# The process supervisor for long-running development services (process-compose.yaml). Pinned like
+# every other tool so macOS and the devcontainer run the same version. Not an engine dependency
+# (CLAUDE.md §14): it never links into a core, it supervises the PostgreSQL oracle.
+process-compose = '1.122.0'
 
 # --- Tasks: the project's development interface -----------------------------------------------
 #
@@ -82,6 +86,18 @@ run = [
 # --- Per-worktree ports ------------------------------------------------------------------------
 # A git worktree is the native equivalent of a second devcontainer instance; these give it a
 # private TCP port block so several checkouts can serve simultaneously. See scripts/devports.rb.
+
+[tasks.dev]
+description = "Start this checkout's long-running services (PostgreSQL oracle) under process-compose"
+run = "ruby scripts/dev.rb"
+
+[tasks."db:init"]
+description = "Create this checkout's PostgreSQL cluster under .dev/postgres (idempotent)"
+run = "bundle exec rake db:init"
+
+[tasks."db:psql"]
+description = "psql against this checkout's cluster"
+run = "bundle exec rake db:psql"
 
 [tasks."dev:ports"]
 description = "Print this worktree's TCP port allocation"

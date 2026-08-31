@@ -5,17 +5,21 @@
 # design references (CLAUDE.md §7, §8, §12).
 #
 # Storage model (CLAUDE.md §12):
-#   * A bare `--mirror` clone of each repo lives on the persist volume under
+#   * A bare `--mirror` clone of each repo lives OUTSIDE any checkout, under
 #     MIRROR_ROOT. It holds the full history + all branches/tags, is downloaded
 #     once, and survives container rebuilds. It is the canonical copy, shared
-#     across every container for this project.
-#   * Each container checks out a `git worktree` into ./references/<name>. The
-#     worktree shares the mirror's object store (no re-download, no Nx history)
-#     but has its own detached HEAD, so a container can sit on a different
-#     branch/tag without disturbing the mirror or any other container.
+#     across every checkout of this project on the machine.
+#   * Each checkout gets a `git worktree` at ./references/<name>. The worktree
+#     shares the mirror's object store (no re-download, no Nx history) but has
+#     its own detached HEAD, so one checkout can sit on a different branch/tag
+#     without disturbing the mirror or any other checkout.
 #
-# Provisioning a new container is therefore cheap: `git worktree add` against
-# the already-present mirror, no network fetch.
+# Provisioning a new checkout is therefore cheap: `git worktree add` against the
+# already-present mirror, no network fetch.
+#
+# "Checkout" is deliberate: it means a devcontainer instance AND a native git
+# worktree. The two differ only in where the shared mirror lives, which is what
+# default_mirror_root resolves — the per-checkout half is identical either way.
 #
 # Note: the devcontainer sets `safe.bareRepository = explicit` globally, so every
 # command that touches a bare mirror must name it with `--git-dir` AND override
@@ -37,9 +41,25 @@ REFERENCE_REPOS = [
   { name: "sqllogictest-rs", url: "https://github.com/risinglightdb/sqllogictest-rs.git", ref: "main",          license: "MIT / Apache-2.0"  },
 ].freeze
 
-# Canonical mirrors live on the persist volume by default; overridable for use
-# outside the devcontainer.
-MIRROR_ROOT   = ENV.fetch("REFERENCES_MIRROR_DIR", "/persist/shared/references")
+# Where the canonical bare mirrors live. They are machine-level state, not checkout-level: multiple
+# GB, read-only, and identical for every checkout — so they belong outside the tree, and every
+# checkout on the machine shares one copy.
+#
+#   * devcontainer — the shared persist volume, so every container for this project reuses one
+#     download and a rebuild costs nothing.
+#   * native — an XDG data directory under $HOME, where git worktrees of this repo share it the
+#     same way containers share the volume.
+#
+# REFERENCES_MIRROR_DIR overrides both (a second disk, a scratch location, a test).
+def default_mirror_root
+  return "/persist/shared/references" if File.directory?("/persist/shared")
+
+  xdg = ENV["XDG_DATA_HOME"]
+  base = xdg.nil? || xdg.empty? ? File.join(Dir.home, ".local", "share") : xdg
+  File.join(base, "jed", "references")
+end
+
+MIRROR_ROOT   = ENV.fetch("REFERENCES_MIRROR_DIR") { default_mirror_root }
 WORKTREE_ROOT = File.join(__dir__, "references")
 
 def mirror_path(repo)   = File.join(MIRROR_ROOT, "#{repo[:name]}.git")
@@ -394,6 +414,27 @@ namespace :dev do
     task :show do
       sh RbConfig.ruby, "scripts/devports.rb", "show"
     end
+  end
+end
+
+# db — this checkout's own PostgreSQL cluster (scripts/devdb.rb). One cluster per checkout, not
+# databases inside a shared server: destructive resets stay local, two checkouts run at once, and
+# the layout matches the per-instance devcontainer model it replaces. The SERVER runs in the
+# foreground under process-compose (process-compose.yaml); these are the one-shot half.
+namespace :db do
+  desc "Create this checkout's PostgreSQL cluster under .dev/postgres (idempotent)"
+  task :init do
+    sh RbConfig.ruby, "scripts/devdb.rb", "init"
+  end
+
+  desc "psql against this checkout's cluster"
+  task :psql do
+    sh RbConfig.ruby, "scripts/devdb.rb", "psql"
+  end
+
+  desc "Destroy this checkout's cluster and re-init (destructive; CONFIRM=yes)"
+  task :reset do
+    sh RbConfig.ruby, "scripts/devdb.rb", "reset"
   end
 end
 

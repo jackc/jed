@@ -1,0 +1,74 @@
+# process-compose — the long-running half of this checkout's development environment.
+#
+# The division of labour (the native-macOS migration's model, and identical in the devcontainer):
+#
+#   mise             one-shot work: install, init, migrate, build, test
+#   process-compose  long-running work: the PostgreSQL oracle, optionally the website dev server
+#
+# jed is a library: the engine itself needs no supervision, and `rake ci` starts no services. What
+# genuinely needs supervising is the PostgreSQL differential oracle (CLAUDE.md §7) — a real server
+# with a startup delay, a readiness condition, and a lifetime longer than any one command.
+#
+# Note what this file does NOT contain: no hard-coded ports, no per-process environment blocks, no
+# database bootstrap. Ports arrive through the environment (`.dev/ports.env`, exported by the
+# launcher — scripts/dev.rb); binary paths and the socket directory are resolved once inside
+# scripts/devdb.rb, so the supervisor and its readiness probe cannot disagree; and one-shot work
+# (initdb, creating the oracle database) stays in mise/rake tasks this file merely sequences.
+#
+#   mise run dev                             start the stack
+#   process-compose process list             status, scriptable
+#   process-compose process logs postgres    logs for one process
+#   process-compose down                     stop this checkout's stack only
+#
+# Each checkout runs its own instance on its own control port (PC_PORT_NUM, from the allocated
+# block), which process-compose reads from the environment — so the commands above need no flags
+# and never reach another checkout's stack.
+version: "0.5"
+
+processes:
+  # Creates the cluster if this checkout has none, then exits. Making it a dependency rather than a
+  # documented prerequisite is what lets a fresh checkout go straight to `mise run dev`.
+  db-init:
+    command: bundle exec rake db:init
+    availability:
+      restart: "no"
+
+  postgres:
+    command: ruby scripts/devdb.rb serve
+    depends_on:
+      db-init:
+        condition: process_completed_successfully
+    readiness_probe:
+      exec:
+        command: ruby scripts/devdb.rb ready
+      initial_delay_seconds: 1
+      period_seconds: 1
+      failure_threshold: 30
+    availability:
+      restart: on_failure
+      # Bounded: `on_failure` alone retries a PERMANENT error forever (a missing binary, a corrupt
+      # cluster), burying the real message under a restart loop. Five attempts then stop, so the
+      # cause stays on screen.
+      max_restarts: 5
+
+  # Creates the oracle database (spec/conformance/oracle_profile.toml) once the server is up, then
+  # exits. Idempotent, so a restart of the stack is free.
+  oracle-setup:
+    command: bundle exec rake oracle:setup
+    depends_on:
+      postgres:
+        condition: process_healthy
+    availability:
+      restart: "no"
+
+  # The website dev server. Disabled by default: engine work does not need it, and jed is a library
+  # rather than a web app. Start it explicitly when working on /web:
+  #   process-compose process start web
+  web:
+    command: npm run dev --prefix web
+    disabled: true
+    depends_on:
+      postgres:
+        condition: process_healthy
+    availability:
+      restart: on_failure

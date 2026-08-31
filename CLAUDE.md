@@ -320,6 +320,10 @@ implementation. Suggested layout:
                         # A NON-CORE CONSUMER (the cli/ + bench/ precedent, §14): links a core in and
                         # drives it through the public host API; no core depends on it. Bundled by the
                         # CLI as `jed migrate`. See /migrate/design.md.
+process-compose.yaml    # the long-running half of a development checkout (the PostgreSQL oracle).
+                        # mise runs one-shot work (install/init/test); process-compose supervises
+                        # anything that stays alive. `mise run dev` is the launcher. Identical on
+                        # native macOS and in the devcontainer — see §12.
 /web/                   # the jed website: static SvelteKit + Tailwind docs + live in-browser
                         # playground. A NON-CORE tooling module (the bench/ precedent, §14): its
                         # deps never touch a core manifest. Consumes the TS core (impl/ts) via a
@@ -837,13 +841,21 @@ rake references:status   # list repos, pinned ref, current HEAD
 rake references:clean    # remove worktrees, keep the cached mirrors
 ```
 
-**Storage model.** A bare `--mirror` clone of each repo lives on the **persist volume**
-(`/persist/shared/references/<name>.git`, override with `REFERENCES_MIRROR_DIR`): full
-history, downloaded once, shared across every container, survives rebuilds. The browsable
-checkout in `references/<name>` is a **git worktree** of that mirror — it shares the
-object store (no re-download, no duplicated history) but has its own HEAD, so a container
-can check out a different branch/tag locally without disturbing the mirror or other
-containers. Provisioning a fresh container is a cheap `git worktree add`, not a re-clone.
+**Storage model.** A bare `--mirror` clone of each repo lives **outside any checkout**, at a
+**machine-level** path (override with `REFERENCES_MIRROR_DIR`): full history, downloaded once,
+shared by every checkout on the machine, surviving rebuilds. The default resolves per
+environment — the **persist volume** (`/persist/shared/references/<name>.git`) in a devcontainer,
+an **XDG data directory** (`${XDG_DATA_HOME:-~/.local/share}/jed/references/<name>.git`)
+natively. The browsable checkout in `references/<name>` is a **git worktree** of that mirror — it
+shares the object store (no re-download, no duplicated history) but has its own detached HEAD, so
+one checkout can sit on a different branch/tag without disturbing the mirror or any other
+checkout. Provisioning a fresh checkout is a cheap `git worktree add`, not a re-clone.
+
+**"Checkout" means a devcontainer instance *or* a native git worktree**, and the per-checkout half
+is identical either way — only the shared mirror's location differs. This is the one place the
+native-macOS model changes the references design: on a Mac all worktrees are on one filesystem and
+share one home, so the mirror is a home-directory path instead of a Docker volume; each worktree
+still gets its own `references/` worktree, and so keeps the per-checkout ref independence above.
 
 **What's checked out** (all free/OSS licenses):
 

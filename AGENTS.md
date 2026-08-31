@@ -180,6 +180,10 @@ files in the same change.
 - Keep modules flat, well named, and single purpose.
 - Prefer Ruby and Rake for scripts, task orchestration, codegen drivers, and
   automation. Use shell or Make only when clearly better for the job.
+- Long-running services live in `process-compose.yaml`, one-shot work in mise/rake
+  tasks. `mise run dev` starts this checkout's stack (its own PostgreSQL cluster
+  under `.dev/postgres`); `mise run dev:ports` shows its allocated ports. The
+  devcontainer's `db` compose service is still the default oracle.
 - `mise run <task>` is the entry point, `rake <task>` the implementation: `mise.toml`
   wraps the Rake surface so the same commands work natively, in the devcontainer, and
   in CI. Put new logic in the Rakefile; surface it in `mise.toml` when it should be
