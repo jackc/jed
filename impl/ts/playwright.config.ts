@@ -6,15 +6,18 @@
 
 import { defineConfig, devices } from "@playwright/test";
 
+// Must match impl/ts/vite.config.ts — this worktree's allocated port, or the historical default.
+const PORT = Number(process.env.TS_BROWSER_PORT) || 5173;
+
 export default defineConfig({
   testDir: "e2e",
   fullyParallel: false, // OPFS files are origin-scoped; keep runs from racing the exclusive handle
-  use: { baseURL: "http://localhost:5173" },
+  use: { baseURL: `http://localhost:${PORT}` },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
   // Vite serves the demo page + the engine Worker; Playwright starts it and waits for the port.
   webServer: {
     command: "npm run dev:browser",
-    url: "http://localhost:5173",
+    url: `http://localhost:${PORT}`,
     reuseExistingServer: true,
     timeout: 60_000,
   },

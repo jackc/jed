@@ -7,10 +7,15 @@
 
 import { defineConfig } from "vite";
 
+// This worktree's allocated port for the browser-host demo (.dev/ports.env — scripts/devports.rb).
+// Distinct from the website's dev port so the two e2e suites cannot collide; falls back to the
+// historical 5173 when there is no allocation.
+const PORT = Number(process.env.TS_BROWSER_PORT) || 5173;
+
 export default defineConfig({
   root: "browser",
   worker: { format: "es" },
-  server: { port: 5173 },
-  preview: { port: 5173 },
+  server: { port: PORT, strictPort: true },
+  preview: { port: PORT, strictPort: true },
   build: { outDir: "../dist-browser", emptyOutDir: true, target: "esnext" },
 });

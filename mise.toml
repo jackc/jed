@@ -10,3 +10,83 @@ rust = '1.92.0'
 "go:golang.org/x/pkgsite/cmd/pkgsite" = "latest"
 "go:mvdan.cc/gofumpt" = "latest"
 ruby = '4.0.5'
+
+# --- Tasks: the project's development interface -----------------------------------------------
+#
+# These wrap the Rake surface rather than replacing it (the Rakefile is ~1,400 lines of real Ruby
+# — codegen drivers, the conformance walkers, the oracle/RQG tools — and CLAUDE.md §10 prefers Ruby
+# + Rake for exactly that). The point of the wrapper is a SINGLE entry point that behaves the same
+# on native macOS, inside the devcontainer, and in CI: `mise run ci` is `mise run ci` everywhere.
+#
+# `bundle exec` is deliberate: it pins rake + toml-rb to Gemfile.lock rather than to whatever the
+# ambient gem set happens to hold. Add a task here when a workflow should be reachable without
+# knowing it is Rake underneath; keep the implementation in the Rakefile.
+
+[tasks.ci]
+description = "Full merge gate: spec verification, formatting, lint, tests, real-process locking"
+run = "bundle exec rake ci"
+
+[tasks.test]
+description = "Engine test suites: conformance corpus (x3 cores) + unit + CLI + gem + migrate"
+run = "bundle exec rake test"
+
+[tasks.verify]
+description = "Verify the spec data tables and byte fixtures (toolchain-light; no engine build)"
+run = "bundle exec rake verify"
+
+[tasks.conformance]
+description = "Walk the conformance corpus on all three cores"
+run = "bundle exec rake conformance"
+
+[tasks.fmt]
+description = "Check formatting of cores, host artifacts, tooling, and web"
+run = "bundle exec rake fmt"
+
+[tasks."fmt:fix"]
+description = "Rewrite sources with the pinned formatters"
+run = "bundle exec rake fmt:fix"
+
+[tasks.lint]
+description = "Lint the TypeScript core and host/tooling packages with Biome"
+run = "bundle exec rake lint"
+
+# --- Oracle (the live PostgreSQL differential oracle) ------------------------------------------
+# Corpus expectations are calibrated to the profile in spec/conformance/oracle_profile.toml; these
+# provision and inspect the server that has to match it.
+
+[tasks."oracle:setup"]
+description = "Create/verify the oracle database declared in the profile"
+run = "bundle exec rake oracle:setup"
+
+[tasks."oracle:status"]
+description = "Print the declared oracle profile beside the live server's values"
+run = "bundle exec rake oracle:status"
+
+[tasks."oracle:reset"]
+description = "Drop every replayed object from the oracle database"
+run = "bundle exec rake oracle:reset"
+
+# --- Bootstrap ---------------------------------------------------------------------------------
+
+[tasks."dev:init"]
+description = "Bootstrap this checkout: Ruby gems, npm dev deps, and this worktree's port block"
+run = [
+  "bundle install",
+  "npm ci --silent --prefix impl/ts",
+  "npm ci --silent --prefix web",
+  # Inert in a devcontainer (its own namespace; the configs fall back to the forwarded 5173/4173
+  # unless .dev/ports.env is sourced) and load-bearing natively, where worktrees share a stack.
+  "bundle exec rake dev:ports:ensure",
+]
+
+# --- Per-worktree ports ------------------------------------------------------------------------
+# A git worktree is the native equivalent of a second devcontainer instance; these give it a
+# private TCP port block so several checkouts can serve simultaneously. See scripts/devports.rb.
+
+[tasks."dev:ports"]
+description = "Print this worktree's TCP port allocation"
+run = "bundle exec rake dev:ports:show"
+
+[tasks."dev:ports:ensure"]
+description = "Allocate this worktree's port block, re-allocating on collision"
+run = "bundle exec rake dev:ports:ensure"

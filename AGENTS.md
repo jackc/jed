@@ -180,6 +180,10 @@ files in the same change.
 - Keep modules flat, well named, and single purpose.
 - Prefer Ruby and Rake for scripts, task orchestration, codegen drivers, and
   automation. Use shell or Make only when clearly better for the job.
+- `mise run <task>` is the entry point, `rake <task>` the implementation: `mise.toml`
+  wraps the Rake surface so the same commands work natively, in the devcontainer, and
+  in CI. Put new logic in the Rakefile; surface it in `mise.toml` when it should be
+  reachable without knowing Rake is underneath.
 
 ## Website And Docs
 

@@ -373,6 +373,30 @@ task :codegen do
   abort "codegen failed for #{failures.join(', ')}" unless failures.empty?
 end
 
+# dev — per-worktree development state (CLAUDE.md §10). A git worktree is the native equivalent of
+# a second devcontainer instance: same machine, same network stack, so services that used to sit on
+# a well-known port in their own namespace now need distinct ones. `dev:ports:*` allocates a block
+# per worktree and persists it in the gitignored .dev/ports.env; the vite/playwright configs read it
+# and fall back to the historical ports when there is no allocation.
+namespace :dev do
+  namespace :ports do
+    desc "Allocate this worktree's TCP port block if it has none"
+    task :init do
+      sh RbConfig.ruby, "scripts/devports.rb", "init"
+    end
+
+    desc "Allocate, or re-allocate if any port in the current block is in use elsewhere"
+    task :ensure do
+      sh RbConfig.ruby, "scripts/devports.rb", "ensure"
+    end
+
+    desc "Print this worktree's port allocation"
+    task :show do
+      sh RbConfig.ruby, "scripts/devports.rb", "show"
+    end
+  end
+end
+
 # oracle — the DECLARED configuration of the live PostgreSQL oracle
 # (spec/conformance/oracle_profile.toml). The corpus's expected output is filled from a live PG
 # server (CLAUDE.md §7), but "PostgreSQL" is not one behavior: the locale provider, tzdata, and a

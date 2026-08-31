@@ -734,6 +734,13 @@ The design is optimized for AI agents even more than for humans. In practice:
   better choice for the job (a trivial one-liner, or a tool that specifically expects a
   Makefile). Ruby's readability keeps automation legible for agents and humans alike,
   consistent with "boring, explicit code over clever abstraction."
+
+  **`mise run <task>` is the entry point; Rake is the implementation.** `mise.toml` declares
+  thin tasks (`ci`, `test`, `verify`, `fmt`, `lint`, `oracle:*`, `dev:init`) that shell out to
+  `bundle exec rake`, so one command set works natively, inside the devcontainer, and in CI —
+  the convergence the native-macOS work is built on. `rake <task>` remains equally valid and is
+  still where the logic lives; new automation goes in the Rakefile, and a task is surfaced in
+  `mise.toml` when it should be reachable without knowing Rake is underneath.
 - **Spec-first per subsystem.** A subsystem's design doc + the relevant corpus is what an
   agent needs to work it without holding the whole engine in context.
 - **Multiple agent instances; sync through `origin`, not just shared memory.** Several

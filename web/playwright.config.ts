@@ -6,7 +6,9 @@
 
 import { defineConfig, devices } from '@playwright/test';
 
-const PORT = 4173;
+// This worktree's allocated preview port (.dev/ports.env — scripts/devports.rb), or the
+// historical default when there is no allocation.
+const PORT = Number(process.env.WEB_PREVIEW_PORT) || 4173;
 
 export default defineConfig({
   testDir: 'e2e',

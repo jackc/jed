@@ -15,9 +15,16 @@ import { jedSpec } from './plugins/vite-spec.ts';
 //   - `server.fs.allow: ['..']` so the dev server may serve the TS core source ($jed → ../impl/ts/src).
 // Example sources live OUTSIDE src/ (pure build-time data read by the plugin, not app code that
 // svelte-check type-checks): web/examples/<topic>/{rust.rs, go.go, ts.ts}.
+//
+// Ports come from this worktree's allocated block (.dev/ports.env — scripts/devports.rb) when it
+// exists, so several checkouts can serve at once natively; they fall back to the historical
+// 5173/4173 when unset, which is what the devcontainer forwards.
 const examplesDir = fileURLToPath(new URL('./examples', import.meta.url));
 // The canonical spec data tables live at the repo root (../spec), outside /web.
 const specDir = fileURLToPath(new URL('../spec', import.meta.url));
+
+const WEB_DEV_PORT = Number(process.env.WEB_DEV_PORT) || 5173;
+const WEB_PREVIEW_PORT = Number(process.env.WEB_PREVIEW_PORT) || 4173;
 
 export default defineConfig({
   plugins: [tailwindcss(), jedExamples(examplesDir), jedSpec(specDir), sveltekit()],
@@ -26,6 +33,6 @@ export default defineConfig({
   // (or any container's) forwarded port from the host — the default localhost-only bind is not.
   // strictPort: fail loudly if the port is taken rather than silently moving to 5174 (which the
   // devcontainer wouldn't be forwarding), so the forwarded port is deterministic.
-  server: { host: true, port: 5173, strictPort: true, fs: { allow: ['..'] } },
-  preview: { host: true, port: 4173, strictPort: true }
+  server: { host: true, port: WEB_DEV_PORT, strictPort: true, fs: { allow: ['..'] } },
+  preview: { host: true, port: WEB_PREVIEW_PORT, strictPort: true }
 });

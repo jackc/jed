@@ -45,6 +45,11 @@
 /bench/rust/target/
 /bench/ts/node_modules/
 
+# Per-worktree runtime state: the allocated TCP port block (scripts/devports.rb) and, later, this
+# worktree's own PostgreSQL cluster. A git worktree is the native equivalent of a second
+# devcontainer instance, so this is instance-local by definition — never shared, never committed.
+/.dev/
+
 # Personal, machine-local mise overrides (mise.toml IS committed/shared). Git has
 # no knowledge of mise's conventions, so this must be ignored explicitly.
 /mise.local.toml
