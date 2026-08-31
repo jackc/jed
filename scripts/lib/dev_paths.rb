@@ -3,9 +3,9 @@
 # scripts/lib/dev_paths.rb — the filesystem layout of a development checkout's instance-local
 # state, in ONE place because several tools must agree on it exactly:
 #
-#   scripts/devports.rb  writes PGHOST into .dev/ports.env
-#   scripts/devdb.rb     starts the server on that socket and probes it
-#   scripts/dev.rb       reports it
+#   scripts/devenv.rb  writes PGHOST into .dev/derived.env
+#   scripts/devdb.rb   starts the server on that socket and probes it
+#   scripts/dev.rb     reports it
 #
 # If these three ever disagreed the failure would be a connection to a socket that does not exist,
 # which is precisely the bug this module exists to make impossible.
@@ -18,7 +18,10 @@ module DevPaths
 
   ROOT = File.expand_path("../..", __dir__)
   DEV_DIR = File.join(ROOT, ".dev")
-  PORTS_ENV = File.join(DEV_DIR, "ports.env")
+  # Two dotenv files, both loaded by mise (mise.toml [env]) — see scripts/devenv.rb for why they
+  # are separate: port-tamer owns the first and accepts nothing but NAME=<port> in it.
+  PORTS_ENV = File.join(DEV_DIR, "ports.env")     # port-tamer's state: the port assignments
+  DERIVED_ENV = File.join(DEV_DIR, "derived.env") # ours: values computed from them (PGHOST)
   PGDATA = File.join(DEV_DIR, "postgres", "data")
 
   # A Unix socket path is capped by sockaddr_un.sun_path — 104 bytes on macOS, 108 on Linux — and

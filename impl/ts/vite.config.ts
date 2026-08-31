@@ -7,7 +7,7 @@
 
 import { defineConfig } from "vite";
 
-// This worktree's allocated port for the browser-host demo (.dev/ports.env — scripts/devports.rb).
+// This worktree's allocated port for the browser-host demo (port-tamer.toml -> .dev/ports.env).
 // Distinct from the website's dev port so the two e2e suites cannot collide; falls back to the
 // historical 5173 when there is no allocation.
 const PORT = Number(process.env.TS_BROWSER_PORT) || 5173;

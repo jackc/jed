@@ -6,7 +6,7 @@
 
   // The jed website (/web) dev + preview/static-serve ports. These are the FALLBACKS the vite and
   // playwright configs use when this checkout has no port allocation; with one (the normal case —
-  // `mise run dev:init` creates it, and mise.toml loads it) the servers bind the allocated ports
+  // `mise run dev:init` creates it via port-tamer, and mise.toml loads it) the servers bind those
   // instead, which VS Code detects and forwards automatically. The servers bind 0.0.0.0
   // (web/vite.config.ts sets `host: true`; e2e/serve.mjs already does) so forwarding works either
   // way. Unset WEB_DEV_PORT / WEB_PREVIEW_PORT to pin them back to these.

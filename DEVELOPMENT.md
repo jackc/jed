@@ -7,7 +7,7 @@ prerequisites in §1.
 
 ```
 mise install        # tool versions from mise.toml
-mise run dev:init   # gems, npm deps, this checkout's port block, the wasm target
+mise run dev:init   # gems, npm deps, this checkout's ports, the wasm target
 mise run dev        # start this checkout's services (the PostgreSQL oracle)
 mise run ci         # the full merge gate
 ```
@@ -18,8 +18,8 @@ mise run ci         # the full merge gate
 
 ### Native macOS
 
-[mise](https://mise.jdx.dev) provides Go, Node, Rust, Ruby, Biome, and process-compose. Homebrew
-provides what mise does not:
+[mise](https://mise.jdx.dev) provides Go, Node, Rust, Ruby, Biome, process-compose, and
+port-tamer. Homebrew provides what mise does not:
 
 ```sh
 brew install mise postgresql@18 sqlite
@@ -49,7 +49,8 @@ A git worktree is the native equivalent of a second devcontainer instance. Each 
 
 ```
 .dev/                   # gitignored, per-checkout runtime state
-  ports.env             # this checkout's TCP port block + PGHOST/PGPORT
+  ports.env             # this checkout's TCP ports (port-tamer's state file)
+  derived.env           # values computed from them — PGHOST
   postgres/data         # this checkout's PostgreSQL cluster
 ```
 
@@ -62,8 +63,14 @@ mise run dev:init && mise run dev
 Both checkouts can run simultaneously: different ports, independent database state, independent
 process-compose instances. `mise run dev:ports` prints the allocation.
 
-Ports are allocated once per checkout and persisted. Two dormant checkouts may hold the same block
-— harmless until both run, which `dev:ports:ensure` detects and re-allocates around.
+Ports are allocated once per checkout by [port-tamer](https://github.com/jackc/port-tamer) and then
+persisted. `port-tamer.toml` declares which ports a checkout needs (append new entries at the end —
+inserting or reordering renumbers the existing ones); the allocation itself lands in `.dev/`, which
+mise loads. `mise run dev:init` creates it, and `dev:ports:ensure` is idempotent afterwards.
+
+A listening port never moves an existing allocation — it may well belong to this checkout's own
+running services. When two checkouts genuinely collide, move one deliberately: stop its services
+and run `mise run dev:ports:overwrite`.
 
 **Reference sources** (`references/`, §12 of `CLAUDE.md`) are provisioned per checkout with `rake
 references:setup`, sharing one machine-level mirror. They are a multi-GB download; nothing
@@ -88,9 +95,9 @@ than importing different answers. Consequences worth internalising:
 
 - **Corpus, RQG, and benchmark work need the stack running.** "oracle unreachable" almost always
   means you have not run `mise run dev` in this checkout.
-- **`PGHOST` and `PGPORT` are a pair.** They come from `.dev/ports.env` via mise. Setting one
-  without the other names a real port on the wrong server, and the error will name a socket path
-  nothing ever created.
+- **`PGHOST` and `PGPORT` are a pair.** They come from `.dev/` via mise — `PGPORT` from the
+  allocation, `PGHOST` derived from it. Setting one without the other names a real port on the
+  wrong server, and the error will name a socket path nothing ever created.
 - **Changing a profile value changes what the oracle answers.** Treat it as a spec edit and re-run
   `rake corpus:check` over the oracle-checkable corpus.
 - When sweeping many corpus files, `rake oracle:reset` between them — a `.test` carrying its own
@@ -108,7 +115,7 @@ than importing different answers. Consequences worth internalising:
 | `mise run verify` | spec data tables and byte fixtures; needs no engine build |
 | `mise run fmt` / `fmt:fix` | formatting across cores, host artifacts, tooling, and web |
 | `mise run dev` | start this checkout's services |
-| `mise run dev:ports` | this checkout's port allocation |
+| `mise run dev:ports` | this checkout's port allocation, and what is listening on it |
 | `mise run db:init` / `db:psql` | create / open this checkout's cluster |
 | `mise run oracle:status` / `oracle:setup` / `oracle:reset` | the oracle's profile and database |
 | `mise run dev:browsers` | Chromium for the two Playwright suites (~150 MB, not needed by `ci`) |

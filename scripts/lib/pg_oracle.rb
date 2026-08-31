@@ -11,7 +11,7 @@ require "toml-rb"
 # psql invocation, the jed→PG type rewrite, the PG-type→coltype-tag map, the `\gdesc` type pass,
 # the newline-fieldsep value pass, and the canonical rowsort.
 #
-# Connection: honors the PGHOST/PGPORT env, which mise loads from this checkout's .dev/ports.env
+# Connection: honors the PGHOST/PGPORT env, which mise loads from this checkout's .dev/ files
 # and which point at the cluster process-compose supervises (a Unix socket — faster than localhost
 # TCP; `local all all trust` auth ⇒ no password). NEVER pass -h, and never set one of PGHOST /
 # PGPORT without the other.

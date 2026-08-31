@@ -1,7 +1,7 @@
 // bench-pg benchmarks PostgreSQL via pgx (spec/design/benchmarks.md §6/§7). Connection
-// settings come from the standard PG* env — the devcontainer points PGHOST at the Unix
-// socket. Benchmark data lives in the jed_bench_<dataset> databases created by
-// bench-setup.
+// settings come from the standard PG* env, which mise loads from .dev/ — PGHOST is this
+// checkout's cluster socket. Benchmark data lives in the jed_bench_<dataset> databases
+// created by bench-setup.
 package main
 
 import (

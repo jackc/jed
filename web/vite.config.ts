@@ -16,7 +16,7 @@ import { jedSpec } from './plugins/vite-spec.ts';
 // Example sources live OUTSIDE src/ (pure build-time data read by the plugin, not app code that
 // svelte-check type-checks): web/examples/<topic>/{rust.rs, go.go, ts.ts}.
 //
-// Ports come from this worktree's allocated block (.dev/ports.env — scripts/devports.rb) when it
+// Ports come from this worktree's own allocation (port-tamer.toml -> .dev/ports.env) when it
 // exists, so several checkouts can serve at once natively; they fall back to the historical
 // 5173/4173 when unset, which is what the devcontainer forwards.
 const examplesDir = fileURLToPath(new URL('./examples', import.meta.url));

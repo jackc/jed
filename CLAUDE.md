@@ -872,8 +872,9 @@ is **this checkout's own cluster**, not a shared server: `.dev/postgres`, create
 and supervised by process-compose, identically on native macOS and in the devcontainer (`mise run
 dev` starts it; the retired `db` compose service is what this replaced). One cluster per checkout
 means destructive resets stay local and two checkouts run at once. It is reached over a
-**Unix-domain socket** (trust auth) whose directory and port come from the checkout's allocated
-block and live in `.dev/ports.env`, which mise loads — so bare `psql` or `rake
+**Unix-domain socket** (trust auth) whose port comes from the checkout's own allocation
+(`port-tamer.toml` → `.dev/ports.env`) and whose directory is derived from it (`.dev/derived.env`),
+both loaded by mise — so bare `psql` or `rake
 corpus:check[<repo-root path>]` just works, and **`PGHOST` and `PGPORT` must never be set
 independently of each other** (one without the other names a real port on the wrong server, and
 libpq then hunts a socket that cannot exist — the recurring foot-gun). Its **configuration is declared data**, not whatever the nearest server defaults to:

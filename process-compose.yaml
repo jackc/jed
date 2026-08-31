@@ -10,8 +10,8 @@
 # with a startup delay, a readiness condition, and a lifetime longer than any one command.
 #
 # Note what this file does NOT contain: no hard-coded ports, no per-process environment blocks, no
-# database bootstrap. Ports arrive through the environment (`.dev/ports.env`, exported by the
-# launcher — scripts/dev.rb); binary paths and the socket directory are resolved once inside
+# database bootstrap. Ports arrive through the environment (`.dev/`, exported by the launcher —
+# scripts/dev.rb); binary paths and the socket directory are resolved once inside
 # scripts/devdb.rb, so the supervisor and its readiness probe cannot disagree; and one-shot work
 # (initdb, creating the oracle database) stays in mise/rake tasks this file merely sequences.
 #
@@ -20,9 +20,9 @@
 #   process-compose process logs postgres    logs for one process
 #   process-compose down                     stop this checkout's stack only
 #
-# Each checkout runs its own instance on its own control port (PC_PORT_NUM, from the allocated
-# block), which process-compose reads from the environment — so the commands above need no flags
-# and never reach another checkout's stack.
+# Each checkout runs its own instance on its own control port (PC_PORT_NUM, from this checkout's
+# allocation), which process-compose reads from the environment — so the commands above need no
+# flags and never reach another checkout's stack.
 version: "0.5"
 
 processes:

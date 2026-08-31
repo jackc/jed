@@ -675,7 +675,7 @@ scripts/bench_report.rb    # aggregator (rake bench:report)
 
 PostgreSQL benchmark data lives in this checkout's own PostgreSQL cluster (databases
 `jed_bench_small`, `jed_bench_large`, `jed_bench_scratch`), reached over its Unix socket like the
-oracle — `PGHOST`/`PGPORT` come from `.dev/ports.env`, trust auth. The cluster must be running
+oracle — `PGHOST`/`PGPORT` come from `.dev/` via mise, trust auth. The cluster must be running
 (`mise run dev`); `rake bench:setup` creates the databases, so they are regenerable rather than
 persistent infrastructure.
 

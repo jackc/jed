@@ -36,11 +36,12 @@ PORTS_ENV = DevPaths::PORTS_ENV
 CLUSTER = PgOracle.profile.fetch("cluster")
 MAJOR = CLUSTER.fetch("pg_major")
 
-# The port comes from this checkout's allocated block (scripts/devports.rb). No default: guessing
-# would silently collide with another checkout, which is the exact failure the block prevents.
+# The port comes from this checkout's allocation (port-tamer.toml, scripts/devenv.rb). No default:
+# guessing would silently collide with another checkout, which is the exact failure the allocation
+# prevents.
 def pgport
   unless File.exist?(PORTS_ENV)
-    abort "devdb: no port allocation — run `rake dev:ports:init` first (#{PORTS_ENV} is missing)."
+    abort "devdb: no port allocation — run `rake dev:ports:ensure` first (#{PORTS_ENV} is missing)."
   end
 
   File.read(PORTS_ENV)[/^PGPORT=(\d+)$/, 1] ||

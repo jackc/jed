@@ -1,0 +1,57 @@
+# port-tamer — this project's TCP port allocation (https://github.com/jackc/port-tamer).
+#
+# WHY. A git worktree is the native equivalent of a second devcontainer instance: several checkouts
+# of this repo may be developed and served simultaneously on one machine. In a container each
+# instance had its own network namespace, so every service could use the same well-known port;
+# natively they share one, and two worktrees running `vite dev` would collide on 5173.
+#
+# port-tamer assigns each checkout one consecutive group of free ports and writes it to a dotenv
+# file (.dev/ports.env — gitignored, per-checkout state). mise loads that file, which is how a plain
+# shell, a Vite config, and process-compose all see the same numbers. THIS file is the committed
+# declaration of which ports a checkout needs; the allocation itself is not committed.
+#
+# The devcontainer uses it too. It has its own network namespace and so does not NEED distinct
+# ports, but it runs the same per-checkout PostgreSQL cluster, and PGPORT lives here — so the
+# allocation is the single description of where this checkout's services are, on either platform.
+#
+#   mise run dev:ports              show the allocation and whether each port is listening
+#   mise run dev:ports:ensure       allocate on first use; idempotent afterwards
+#   mise run dev:ports:overwrite    deliberately move to a different group (stop services first)
+#
+# A listening port does NOT move an existing allocation — it may well belong to this checkout's own
+# running services. Moving is always the explicit `--overwrite` above.
+#
+# APPEND new entries at the END. Ports are assigned consecutively in the order below, so inserting
+# or reordering renumbers the existing ones — which invalidates the saved allocation and forces
+# every checkout to overwrite. Appending is compatible and costs nothing.
+
+version = 1
+
+# The default range (10000..44999) overlaps the ephemeral ports Linux hands out for client sockets
+# (32768..60999), so the kernel could occupy a port inside an allocated group while its service is
+# down and then break the restart. This range clears both platforms' ephemeral ranges (macOS starts
+# at 49152).
+[allocation]
+minimum = 16000
+maximum = 31000
+
+# web dev server (vite dev, /web)
+[[ports]]
+name = "WEB_DEV_PORT"
+
+# web preview / e2e static server (/web)
+[[ports]]
+name = "WEB_PREVIEW_PORT"
+
+# PostgreSQL oracle cluster (scripts/devdb.rb). PGHOST is derived from this — see scripts/devenv.rb.
+[[ports]]
+name = "PGPORT"
+
+# process-compose control API. The name is process-compose's own: every `process-compose ...`
+# command in this checkout then targets THIS checkout's stack with no flags.
+[[ports]]
+name = "PC_PORT_NUM"
+
+# TS core Browser/OPFS host e2e (vite dev, impl/ts)
+[[ports]]
+name = "TS_BROWSER_PORT"

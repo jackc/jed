@@ -1,7 +1,7 @@
 //! bench-pg benchmarks PostgreSQL via the sync `postgres` crate
 //! (spec/design/benchmarks.md §6/§7). Unlike libpq, rust-postgres does not read the PG*
 //! env itself, so the connection config is assembled from PGHOST/PGPORT/PGUSER here (they point
-//! at this checkout's cluster — .dev/ports.env; a path host uses the Unix socket).
+//! at this checkout's cluster — mise loads them from .dev/; a path host uses the Unix socket).
 
 use postgres::types::{ToSql, Type};
 use postgres::{Client, NoTls, Statement};

@@ -2,7 +2,7 @@
 // (spec/design/benchmarks.md §6/§7). The corpus's raw $N SQL runs through sql.unsafe
 // with prepare:true (a named server-side prepared statement); .values() returns rows as
 // arrays so the canonical rendering follows column order. Connection settings come from
-// the PG* env (PGHOST/PGPORT point at this checkout's cluster — .dev/ports.env).
+// the PG* env (PGHOST/PGPORT point at this checkout's cluster — mise loads them from .dev/).
 
 import postgres from "postgres";
 

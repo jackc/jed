@@ -5,7 +5,7 @@
 #
 # Deliberately thin, and in this exact order:
 #
-#   1. ensure this checkout has a port allocation (and that nothing else is using it);
+#   1. ensure this checkout has a port allocation (and the values derived from it);
 #   2. export it into the environment;
 #   3. exec process-compose.
 #
@@ -20,23 +20,24 @@
 # port, so every `process-compose ...` command in this checkout targets THIS checkout's instance
 # with no flags.
 
-require "fileutils"
 # dev.rb itself needs no gems, but its children do. Requiring the bootstrap here fails fast with
 # ONE actionable message on an un-bootstrapped checkout, rather than letting a child fail and
 # reporting it second-hand.
 require_relative "lib/bundle_setup"
+require_relative "lib/dev_paths"
 
-ROOT = File.expand_path("..", __dir__)
-PORTS_ENV = File.join(ROOT, ".dev", "ports.env")
-
-system(RbConfig.ruby, File.join(__dir__, "devports.rb"), "ensure", out: File::NULL) or
+system(RbConfig.ruby, File.join(__dir__, "devenv.rb"), "ensure") or
   abort("dev: port allocation failed")
 
-File.readlines(PORTS_ENV).each do |line|
-  next if line.start_with?("#") || !line.include?("=")
+# Both files mise would have loaded, in the same order (the derived values come from the
+# allocation, so they are read after it).
+[DevPaths::PORTS_ENV, DevPaths::DERIVED_ENV].each do |file|
+  File.readlines(file).each do |line|
+    next if line.start_with?("#") || !line.include?("=")
 
-  name, value = line.chomp.split("=", 2)
-  ENV[name] = value
+    name, value = line.chomp.split("=", 2)
+    ENV[name] = value
+  end
 end
 
 unless system("command -v process-compose > /dev/null 2>&1")
@@ -60,20 +61,21 @@ end
 
 db_socket, db_port = info.chomp.split("\t")
 
-# PGHOST and PGPORT come from the allocation above (devports writes them as a pair, from the same
-# DevPaths source devdb starts the server on), so the loop has already set them. Asserting it here
-# rather than re-assigning keeps ONE source of truth and turns a drift between the two scripts into
-# a loud failure instead of a connection to a socket that does not exist.
+# PGHOST and PGPORT come from the two files above — PGPORT from port-tamer's allocation, PGHOST
+# derived from it by devenv.rb out of the same DevPaths source devdb starts the server on. They
+# live in separate files, so this is where the pair is checked: asserting rather than re-assigning
+# keeps ONE source of truth and turns a drift between the scripts into a loud failure instead of a
+# connection to a socket that does not exist.
 if ENV["PGHOST"] != db_socket || ENV["PGPORT"] != db_port
   abort <<~MSG
     dev: the allocation disagrees with the cluster layout.
-      .dev/ports.env: PGHOST=#{ENV['PGHOST'].inspect} PGPORT=#{ENV['PGPORT'].inspect}
-      devdb.rb info:  PGHOST=#{db_socket.inspect} PGPORT=#{db_port.inspect}
-    Run `rake dev:ports:ensure` to regenerate the allocation.
+      .dev/*.env:    PGHOST=#{ENV['PGHOST'].inspect} PGPORT=#{ENV['PGPORT'].inspect}
+      devdb.rb info: PGHOST=#{db_socket.inspect} PGPORT=#{db_port.inspect}
+    Run `rake dev:ports:ensure` to regenerate the derived values.
   MSG
 end
 puts "  postgres  #{db_socket}  port #{db_port}  (rake db:psql)"
-puts "  web dev   #{ENV['WEB_DEV_URL']} (disabled by default: process-compose process start web)"
+puts "  web dev   http://127.0.0.1:#{ENV['WEB_DEV_PORT']} (disabled by default: process-compose process start web)"
 puts "  control   127.0.0.1:#{ENV['PC_PORT_NUM']}"
 puts
 # exec replaces the process image WITHOUT running Ruby's at_exit or flushing its buffers. When

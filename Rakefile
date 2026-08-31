@@ -395,24 +395,25 @@ end
 
 # dev — per-worktree development state (CLAUDE.md §10). A git worktree is the native equivalent of
 # a second devcontainer instance: same machine, same network stack, so services that used to sit on
-# a well-known port in their own namespace now need distinct ones. `dev:ports:*` allocates a block
-# per worktree and persists it in the gitignored .dev/ports.env; the vite/playwright configs read it
-# and fall back to the historical ports when there is no allocation.
+# a well-known port in their own namespace now need distinct ones. `dev:ports:*` drives port-tamer
+# (port-tamer.toml declares the names; the allocation lands in the gitignored .dev/ports.env) and
+# writes the values derived from it — scripts/devenv.rb. The vite/playwright configs read the
+# allocation and fall back to the historical ports when there is none.
 namespace :dev do
   namespace :ports do
-    desc "Allocate this worktree's TCP port block if it has none"
-    task :init do
-      sh RbConfig.ruby, "scripts/devports.rb", "init"
-    end
-
-    desc "Allocate, or re-allocate if any port in the current block is in use elsewhere"
+    desc "Allocate this worktree's TCP ports if it has none (idempotent)"
     task :ensure do
-      sh RbConfig.ruby, "scripts/devports.rb", "ensure"
+      sh RbConfig.ruby, "scripts/devenv.rb", "ensure"
     end
 
-    desc "Print this worktree's port allocation"
+    desc "Move this worktree to a different port group (stop its services first)"
+    task :overwrite do
+      sh RbConfig.ruby, "scripts/devenv.rb", "overwrite"
+    end
+
+    desc "Print this worktree's port allocation and whether each port is listening"
     task :show do
-      sh RbConfig.ruby, "scripts/devports.rb", "show"
+      sh RbConfig.ruby, "scripts/devenv.rb", "show"
     end
   end
 end

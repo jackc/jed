@@ -14,20 +14,33 @@ ruby = '4.0.5'
 # every other tool so macOS and the devcontainer run the same version. Not an engine dependency
 # (CLAUDE.md §14): it never links into a core, it supervises the PostgreSQL oracle.
 process-compose = '1.122.0'
+# Per-checkout TCP port allocation (port-tamer.toml -> .dev/ports.env). Same reasoning as
+# process-compose: a development tool, pinned so macOS and the devcontainer allocate identically,
+# never linked into a core. The `github:` backend takes the prebuilt release binary, which is what
+# keeps it independent of the Go toolchain this repo pins (port-tamer's own module needs a newer
+# one than the Go core builds with).
+"github:jackc/port-tamer" = '0.1.0'
 
 # --- Environment -------------------------------------------------------------------------------
 #
-# This checkout's own service endpoints (scripts/devports.rb). Loading them here is what makes the
-# per-checkout PostgreSQL cluster the DEFAULT: a bare `psql`, `rake corpus:check`, and the bench
-# harnesses all read PGHOST/PGPORT from the environment, so pointing those at .dev/postgres in one
-# place moves every consumer at once — rather than some tools reaching a checkout-local cluster and
-# others a machine-wide one, which is the split-brain the oracle profile exists to prevent.
+# This checkout's own service endpoints. Loading them here is what makes the per-checkout
+# PostgreSQL cluster the DEFAULT: a bare `psql`, `rake corpus:check`, and the bench harnesses all
+# read PGHOST/PGPORT from the environment, so pointing those at .dev/postgres in one place moves
+# every consumer at once — rather than some tools reaching a checkout-local cluster and others a
+# machine-wide one, which is the split-brain the oracle profile exists to prevent.
 #
-# The file is generated per checkout and gitignored; `mise run dev:init` (or dev:ports:ensure)
-# creates it. Its absence is not an error — mise skips a missing file, the vite/playwright configs
-# fall back to their historical ports, and PG* falls back to whatever the shell already had.
+# Two files with two owners, and the order matters — derived values are read after the allocation
+# they come from:
+#
+#   .dev/ports.env     port-tamer's state file (port-tamer.toml declares the names). NAME=<port>
+#                      lines only; port-tamer rewrites it canonically and rejects anything else.
+#   .dev/derived.env   what this project computes from that allocation (PGHOST) — scripts/devenv.rb.
+#
+# Both are generated per checkout and gitignored; `mise run dev:init` (or dev:ports:ensure) creates
+# them. Their absence is not an error — mise skips a missing file, the vite/playwright configs fall
+# back to their historical ports, and PG* falls back to whatever the shell already had.
 [env]
-_.file = '.dev/ports.env'
+_.file = ['.dev/ports.env', '.dev/derived.env']
 
 # Homebrew's postgresql@18 is KEG-ONLY: nothing is linked into the prefix bin, so psql,
 # pg_isready, and initdb are not on PATH after `brew install`. The scripts that need the SERVER
@@ -101,7 +114,7 @@ run = "bundle exec rake oracle:reset"
 # --- Bootstrap ---------------------------------------------------------------------------------
 
 [tasks."dev:init"]
-description = "Bootstrap this checkout: Ruby gems, npm dev deps, and this worktree's port block"
+description = "Bootstrap this checkout: Ruby gems, npm dev deps, and this worktree's ports"
 run = [
   "bundle install",
   "npm ci --silent --prefix impl/ts",
@@ -116,7 +129,8 @@ run = [
 
 # --- Per-worktree ports ------------------------------------------------------------------------
 # A git worktree is the native equivalent of a second devcontainer instance; these give it a
-# private TCP port block so several checkouts can serve simultaneously. See scripts/devports.rb.
+# private group of TCP ports so several checkouts can serve simultaneously. The allocation is
+# port-tamer's (port-tamer.toml); scripts/devenv.rb drives it and derives PGHOST.
 
 [tasks."dev:browsers"]
 description = "Install the Chromium build the browser e2e suites drive (impl/ts + web)"
@@ -141,9 +155,13 @@ description = "psql against this checkout's cluster"
 run = "bundle exec rake db:psql"
 
 [tasks."dev:ports"]
-description = "Print this worktree's TCP port allocation"
+description = "Print this worktree's TCP port allocation and whether each port is listening"
 run = "bundle exec rake dev:ports:show"
 
 [tasks."dev:ports:ensure"]
-description = "Allocate this worktree's port block, re-allocating on collision"
+description = "Allocate this worktree's ports if it has none (idempotent)"
 run = "bundle exec rake dev:ports:ensure"
+
+[tasks."dev:ports:overwrite"]
+description = "Move this worktree to a different port group (stop its services first)"
+run = "bundle exec rake dev:ports:overwrite"

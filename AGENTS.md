@@ -163,9 +163,10 @@ files in the same change.
   download on your own initiative.
 - If reference sources are missing, work without them or ask the user.
 - The PostgreSQL oracle is this checkout's own cluster (`.dev/postgres`), started by
-  `mise run dev` and reached over its Unix socket. `PGHOST`/`PGPORT` come from
-  `.dev/ports.env` via mise — do not override them, and never set one without the
-  other. If the oracle is unreachable, the cluster is probably not running.
+  `mise run dev` and reached over its Unix socket. `PGHOST`/`PGPORT` come from `.dev/`
+  via mise (`PGPORT` from port-tamer's allocation, `PGHOST` derived from it) — do not
+  override them, and never set one without the other. If the oracle is unreachable, the
+  cluster is probably not running.
 - The oracle's configuration is declared in `spec/conformance/oracle_profile.toml`
   (cluster facts asserted at connect, session GUCs applied per probe). A mismatch
   aborts. Changing a profile value changes what the oracle answers, so treat it as a
