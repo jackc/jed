@@ -4,6 +4,7 @@
 require "open3"
 require "tmpdir"
 require "timeout"
+require_relative "lib/bundle_setup" # works under Rake and when invoked directly
 require "toml-rb"
 
 ROOT = File.expand_path("..", __dir__)

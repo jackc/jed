@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "open3"
+require_relative "bundle_setup" # gems from Gemfile.lock, whatever the cwd or entry point
 require "toml-rb"
 
 # scripts/lib/pg_oracle.rb — the live-PostgreSQL oracle mechanics, extracted verbatim from

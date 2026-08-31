@@ -21,6 +21,10 @@
 # with no flags.
 
 require "fileutils"
+# dev.rb itself needs no gems, but its children do. Requiring the bootstrap here fails fast with
+# ONE actionable message on an un-bootstrapped checkout, rather than letting a child fail and
+# reporting it second-hand.
+require_relative "lib/bundle_setup"
 
 ROOT = File.expand_path("..", __dir__)
 PORTS_ENV = File.join(ROOT, ".dev", "ports.env")
@@ -44,7 +48,17 @@ end
 
 # Ask devdb for the endpoint rather than reading PGHOST: in a devcontainer the ambient PGHOST
 # points at the `db` compose service, which is not the cluster this stack supervises.
-db_socket, db_port = `#{RbConfig.ruby} #{File.join(__dir__, 'devdb.rb')} info`.chomp.split("\t")
+info = `#{RbConfig.ruby} #{File.join(__dir__, 'devdb.rb')} info`
+# Check the child actually succeeded. Without this a failing devdb (missing gems, missing
+# toolchain) yields empty output, and the mismatch check below then reports "the allocation
+# disagrees with the cluster layout" — pointing at the wrong thing entirely, with the real error
+# scrolled off above.
+unless $?.success?
+  abort "dev: could not read the cluster layout from devdb.rb (see the error above). " \
+        "If this checkout has not been bootstrapped yet, run `mise run dev:init`."
+end
+
+db_socket, db_port = info.chomp.split("\t")
 
 # PGHOST and PGPORT come from the allocation above (devports writes them as a pair, from the same
 # DevPaths source devdb starts the server on), so the loop has already set them. Asserting it here

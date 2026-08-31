@@ -60,6 +60,28 @@ end
 
 def ports_for(base) = ASSIGNMENTS.keys.map { |offset| base + offset }
 
+# The port THIS checkout's own PostgreSQL is running on, or nil.
+#
+# Ports held by our own running services are not a collision — they are the allocation working as
+# intended. Without this check a second `mise run dev` (or any `dev:ports:ensure` while the stack
+# is up) sees its own server holding PGPORT, calls it a conflict, and moves the block: PGHOST and
+# PGPORT then name a port nothing is listening on, and the oracle appears to have randomly stopped
+# working while the server is still happily running on the old one.
+#
+# postmaster.pid is the unambiguous signal — it lives in THIS checkout's PGDATA, and its fourth
+# line is the port the running server bound. A stale file after a crash is harmless: the port is
+# then genuinely free, so the collision check never consults this.
+def own_cluster_port
+  pid_file = File.join(DevPaths::PGDATA, "postmaster.pid")
+  return nil unless File.exist?(pid_file)
+
+  port = File.readlines(pid_file)[3].to_s.strip
+  port.match?(/\A\d+\z/) ? port.to_i : nil
+end
+
+# Is this block in use by our OWN stack rather than another checkout's?
+def own_block?(base) = own_cluster_port == base + 3
+
 def block_free?(base) = ports_for(base).all? { |p| free?(p) }
 
 # Bases are aligned to the block size so two allocations can never partially overlap.
@@ -146,6 +168,8 @@ when "ensure"
   elsif stale?
     write_allocation(base)
     puts "devports: allocation refreshed in place (PORT_BASE=#{base})"
+  elsif own_block?(base)
+    puts "devports: block #{base} is in use by THIS checkout's own stack — keeping it"
   elsif !block_free?(base)
     taken = ports_for(base).reject { |p| free?(p) }
     old = base

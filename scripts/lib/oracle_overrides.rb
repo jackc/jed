@@ -1,10 +1,7 @@
 # frozen_string_literal: true
 
-begin
-  require "toml-rb"
-rescue LoadError
-  # Overrides are optional; without toml-rb the sidecar is simply empty.
-end
+require_relative "bundle_setup"
+require "toml-rb"
 
 # scripts/lib/oracle_overrides.rb — the jed-vs-PG divergence ledger
 # (spec/conformance/oracle_overrides.toml), shared by the oracle importer and the RQG firehose.
@@ -13,6 +10,12 @@ end
 # (divergent) answer, not PG's. The importer leaves a matched record untouched; the firehose
 # classifies a matched divergence as DELIBERATE (log + continue) rather than a candidate bug.
 # Both tools normalize identically so the same ledger entry matches in both.
+#
+# Loading is STRICT. This used to rescue a missing toml-rb and carry on with an empty ledger, on
+# the grounds that overrides are optional. They are not: an empty ledger silently reclassifies
+# every deliberate jed-vs-PG divergence as unledgered, so the importer nags for overrides that
+# already exist and the RQG firehose reports known divergences as candidate bugs. A missing gem
+# should stop the tool, not quietly change what it concludes.
 class OracleOverrides
   PATH = File.expand_path("../../spec/conformance/oracle_overrides.toml", __dir__)
 
@@ -32,7 +35,7 @@ class OracleOverrides
   private
 
   def load_overrides
-    return {} unless defined?(TomlRB) && File.exist?(PATH)
+    return {} unless File.exist?(PATH)
 
     doc = TomlRB.load_file(PATH)
     (doc["override"] || []).each_with_object({}) do |o, h|
