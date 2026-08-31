@@ -108,6 +108,11 @@ module RQG
     # cannot represent an empty/whitespace result cell (a blank line ends the record and every
     # expected line is trim()'d — impl/rust/src/bin/conformance.rs), so such a value in a projected
     # text column would manufacture a false divergence. The §4 look-alike hazard never applies (ASCII).
+    # KEEP THIS POOL PURE ASCII. Ordering would survive non-ASCII fine — the oracle and jed both
+    # order by code point (oracle_profile.toml) — but ILIKE would not: PG folds case per the
+    # database's ctype (full Unicode under builtin C.UTF-8) while jed folds ASCII-only unless a
+    # test loads a JUCD bundle, so a non-ASCII letter would diverge on the LIKE/ILIKE path. Adding
+    # non-ASCII therefore means emitting `# load-collation: unicode` into the generated suites.
     TEXT_POOL = %w[apple Apple banana BANANA cat Cat dog x AB ab z mango Mango ZZ].freeze
 
     module_function

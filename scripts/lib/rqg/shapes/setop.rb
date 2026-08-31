@@ -7,11 +7,19 @@ require_relative "../case"
 module RQG
   module Shapes
     # setop — two SELECTs over the SAME table (so the projected column types match exactly) combined
-    # by UNION [ALL] / INTERSECT [ALL] / EXCEPT [ALL], each with its own WHERE. Always rowsort, never
-    # ORDER BY: set-op dedup/keep is multiset equality (deterministic collation = byte-equal, so it
-    # agrees C-vs-en_US), and the harness compares the multiset order-insensitively — which sidesteps
-    # the one hazard (a set-op ORDER BY is column/ordinal-only, where a text key can't take COLLATE
-    # "C" and would diverge). Projecting only the columns avoids any text-ordering path entirely.
+    # by UNION [ALL] / INTERSECT [ALL] / EXCEPT [ALL], each with its own WHERE.
+    #
+    # Half of the cases carry a trailing ORDER BY (`nosort` — the ordering itself is pinned), half
+    # stay unordered (`rowsort` — the harness compares the multiset). The ordered half was
+    # previously impossible: a set-op ORDER BY is column-name/ordinal-only, with no room for the
+    # `COLLATE "C"` the generator used to need on a text key, so a text ordering would have
+    # diverged from the en_US oracle and the shape omitted ORDER BY entirely. With the oracle on
+    # builtin C.UTF-8 (oracle_profile.toml) a bare key agrees, and the coverage comes back.
+    #
+    # Totality: the key list is EVERY projected column, so the only ties are between rows identical
+    # in all of them — indistinguishable in the output, so the rendered values are deterministic
+    # whatever order the engine puts them in. That holds for the ALL variants too, where a row
+    # satisfying both arms is emitted twice.
     module SetOp
       module_function
 
@@ -38,8 +46,30 @@ module RQG
 
         caps = ddl_caps | Set[SpecData.cap(:insert), SpecData.cap(:insert_multi_row),
                               SpecData.cap(:select), SpecData.cap(OPS[op])] | c1.caps | c2.caps
+
+        if rng.rand < 0.5
+          query += " ORDER BY #{order_keys(rng, proj_cols)}"
+          sortmode = "nosort"
+          caps |= Set[SpecData.cap(:order_by)]
+          caps |= Set[SpecData.cap(:order_by_keys)] if proj_cols.size > 1
+        else
+          sortmode = "rowsort"
+        end
+
         Case.new(seed: seed, shape: "setop", setup: [ddl, insert],
-                 query: query, sortmode: "rowsort", caps: caps)
+                 query: query, sortmode: sortmode, caps: caps)
+      end
+
+      # Every projected column, in a random order, each optionally DESC / NULLS FIRST|LAST. Names
+      # only — a set-op ORDER BY may not reference an expression or a qualified column, and both
+      # arms project the same names, so these resolve against the set operation's output columns.
+      def order_keys(rng, proj_cols)
+        proj_cols.shuffle(random: rng).map do |c|
+          key = c.name
+          key += " DESC" if rng.rand < 0.5
+          key += rng.rand < 0.5 ? " NULLS FIRST" : " NULLS LAST" if rng.rand < 0.4
+          key
+        end.join(", ")
       end
 
       def subset(rng, cols)

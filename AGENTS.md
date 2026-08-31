@@ -164,6 +164,13 @@ files in the same change.
 - If reference sources are missing, work without them or ask the user.
 - PostgreSQL oracle access is via the preconfigured Unix socket. Do not override
   `PGHOST`.
+- The oracle's configuration is declared in `spec/conformance/oracle_profile.toml`
+  (cluster facts asserted at connect, session GUCs applied per probe). A mismatch
+  aborts. Changing a profile value changes what the oracle answers, so treat it as a
+  spec edit and re-run `corpus:check`. `rake oracle:status` shows declared vs live.
+- Corpus probes run against the dedicated `jed_oracle` database (builtin `C.UTF-8`
+  provider, whose ordering is jed's `C` collation). `rake oracle:setup` provisions it;
+  the harness passes `-d`, so bare `psql` is `psql -d jed_oracle` for corpus work.
 
 ## Coding Style
 

@@ -38,7 +38,6 @@ module RQG
       in_list: "expr.in_list",
       like: "expr.like",
       ilike: "expr.ilike",
-      collate: "expr.collate",
       parens: "expr.parens",
       order_by: "query.order_by",
       order_by_keys: "query.order_by_keys",

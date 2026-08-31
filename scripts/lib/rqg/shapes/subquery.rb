@@ -9,8 +9,9 @@ module RQG
     # subquery — a main table filtered by an UNCORRELATED subquery over a second table: IN / NOT IN
     # (integer membership), [NOT] EXISTS, or a scalar comparison against an AGGREGATE subquery (always
     # exactly one row, so no 21000 cardinality risk). The subquery carries its own WHERE over the
-    # second table. Membership/existence use equality + 3VL, which agree in PG and jed; the only
-    # collation-sensitive spot is a text MIN/MAX in a scalar subquery, routed through COLLATE "C".
+    # second table. Membership/existence use equality + 3VL, which agree in PG and jed; a text
+    # MIN/MAX in a scalar subquery is collation-ordered and agrees too (the oracle orders by code
+    # point, as jed does — oracle_profile.toml).
     module Subquery
       module_function
 

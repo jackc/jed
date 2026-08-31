@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "open3"
+require "toml-rb"
 
 # scripts/lib/pg_oracle.rb — the live-PostgreSQL oracle mechanics, extracted verbatim from
 # scripts/oracle_import.rb so the oracle importer AND the RQG firehose (scripts/rqg_gen.rb) share
@@ -12,13 +13,24 @@ require "open3"
 # Connection: honors the PGHOST env (the devcontainer points it at the shared Unix socket, faster
 # than localhost TCP; `local all all trust` auth ⇒ no password). NEVER pass -h / set PGHOST.
 #
+# Profile: the oracle's configuration is DATA, not whatever the nearest server defaults to — see
+# spec/conformance/oracle_profile.toml. Cluster facts (PG major, locale provider/locale, encoding,
+# database) are ASSERTED once per process and abort on mismatch; session settings (DateStyle,
+# IntervalStyle, extra_float_digits, ...) are APPLIED as `SET LOCAL` in every probe's preamble.
+# Both matter for VALUES, not just formatting: an `IntervalStyle = iso_8601` server rewrites every
+# interval expectation, and a cluster initdb'd under a non-US locale parses ambiguous date literals
+# as DMY. Without the pin the corpus is silently calibrated to one machine's defaults.
+#
 # State: a replay PREFIX (`applied` — the statements known to succeed, replayed before each probed
 # body so the body sees the right table state) and a session `tz`. A self-contained consumer (the
 # firehose) builds the prefix per case and resets between cases; the importer accumulates it down a
 # file. Mechanical only — no warnings, no override logic, no file I/O (those stay in the callers).
 class PgOracle
   # No -h here: honor the PGHOST env. Socket connections authenticate via `local all all trust`.
-  PSQL = %w[psql -U postgres -q -A -t -X -v ON_ERROR_STOP=0].freeze
+  # The DATABASE, however, comes from the profile rather than the PGDATABASE env: the corpus is
+  # calibrated to a specific database's locale, so the harness names it instead of inheriting
+  # whatever the shell points at (`PgOracle.psql`). Bare `psql` for humans still follows the env.
+  PSQL_BASE = %w[psql -U postgres -q -A -t -X -v ON_ERROR_STOP=0].freeze
 
   # jed canonical type names -> the PG / SQL-standard spelling PG parses. smallint/integer/bigint
   # need no rewrite; f64/f32 -> double precision/real (the spellings PG's ConstTypename grammar
@@ -46,12 +58,96 @@ class PgOracle
     "jsonpath" => "T",
   }.freeze
 
+  # The declared oracle profile (see the header). Same path idiom as the overrides ledger.
+  PROFILE_PATH = File.expand_path("../../spec/conformance/oracle_profile.toml", __dir__)
+
+  # The cluster facts the profile asserts, in one round-trip. For the libc provider the locale
+  # identifier is datcollate; for builtin/icu it is datlocale.
+  PROFILE_QUERY = <<~SQL
+    SELECT current_setting('server_version_num')::int / 10000,
+           d.datlocprovider,
+           CASE d.datlocprovider WHEN 'c' THEN d.datcollate ELSE coalesce(d.datlocale, '') END,
+           d.datcollate, d.datctype,
+           pg_encoding_to_char(d.encoding),
+           current_database(),
+           (SELECT count(*) FROM pg_timezone_names WHERE name LIKE 'US/%') > 0
+      FROM pg_database d WHERE d.datname = current_database();
+  SQL
+
+  class << self
+    # The parsed profile table. Read once per process.
+    def profile = @profile ||= TomlRB.load_file(PROFILE_PATH)
+
+    # The psql invocation, pinned to the profile's database.
+    def psql = @psql ||= PSQL_BASE + ["-d", profile.fetch("cluster").fetch("database")]
+
+    # The live server's cluster facts, as one round-trip, read once per process. Returns the
+    # same keys the profile's [cluster] declares, plus the raw datcollate/datctype and the
+    # tzdata flag. Aborts if the oracle is unreachable — a confusing downstream parse failure
+    # is worse than saying "the server is not there".
+    def live_cluster
+      @live_cluster ||= begin
+        out, err, status = Open3.capture3(*psql, "-c", PROFILE_QUERY)
+        unless status.success?
+          want = profile.fetch("cluster")
+          abort "oracle unreachable (spec/conformance/oracle_profile.toml expects database " \
+                "#{want['database']} on PG #{want['pg_major']}). If the database is simply " \
+                "missing, run `rake oracle:setup`.\n#{err.strip}"
+        end
+
+        major, provider, locale, collate, ctype, encoding, database, us_zones =
+          out.lines.map(&:chomp).reject(&:empty?).first.to_s.split("|", 8)
+        { "pg_major" => major.to_i, "locale_provider" => provider, "locale" => locale,
+          "datcollate" => collate, "datctype" => ctype, "encoding" => encoding,
+          "database" => database, "tzdata_backward_links" => us_zones == "t" }
+      end
+    end
+
+    # Assert the live oracle matches the declared [cluster] facts. Runs ONCE per process (the
+    # firehose builds a PgOracle per case, so this must not be per-instance). A mismatch aborts:
+    # filling corpus expectations from an undeclared oracle is the failure the profile prevents.
+    # A tzdata difference only WARNS — see the profile's [cluster.tzdata].
+    def assert_profile!
+      return if @profile_checked
+
+      @profile_checked = true # set first: a failure aborts, so this only guards the success path
+      want = profile.fetch("cluster")
+      live = live_cluster
+
+      bad = %w[pg_major locale_provider locale encoding database]
+            .reject { |key| live[key] == want[key] }
+            .map { |key| [key, want[key], live[key]] }
+      # A split collate/ctype is a configuration the profile does not describe.
+      if live["locale_provider"] == "c" && live["datcollate"] != live["datctype"]
+        bad << ["datcollate/datctype", "equal", "#{live['datcollate']}/#{live['datctype']}"]
+      end
+
+      unless bad.empty?
+        abort <<~MSG
+          oracle profile mismatch (spec/conformance/oracle_profile.toml):
+          #{bad.map { |f, w, g| format('  %-19s expected %-14s got %s', f, w.to_s.inspect, g.to_s.inspect) }.join("\n")}
+          The corpus's expected output is calibrated to the declared profile; importing against a
+          different one silently produces different answers. Fix the server, or — if this change is
+          intended — edit the profile and re-run `rake corpus:check` over the corpus.
+        MSG
+      end
+
+      want_links = want.dig("tzdata", "backward_links")
+      got_links = live["tzdata_backward_links"]
+      return if want_links.nil? || got_links == want_links
+
+      warn "WARNING: oracle tzdata backward_links = #{got_links} (profile declares #{want_links}). " \
+           "expr/at_time_zone.test's override depends on this; it may now be a silent no-op."
+    end
+  end
+
   attr_accessor :applied, :tz
 
   def initialize(label: "oracle", tz: "UTC")
     @label = label    # used only in the "sentinels missing" raise message
     @applied = []      # PG-rewritten SQL of statements known to succeed (the replay prefix)
     @tz = tz           # the session zone for the CURRENT probe (`# timezone:` directive)
+    PgOracle.assert_profile!
   end
 
   # Clear the replay prefix and reset the zone — a firehose consumer calls this between cases.
@@ -76,12 +172,10 @@ class PgOracle
   # `\echo` sentinels to stdout (block-buffered), so a merged stream races them out of order.
   # Returns [stdout lines between the sentinels, full stderr string].
   def run(body, fieldsep: nil)
-    args = PSQL.dup
+    args = PgOracle.psql.dup
     args += ["-F", fieldsep] if fieldsep
     script = +"BEGIN;\n"
-    # Pin the session zone to the record's `# timezone:` (default UTC). SET LOCAL is scoped to this
-    # rolled-back transaction (timezones.md §9.4).
-    script << "SET LOCAL TimeZone='#{@tz}';\n"
+    script << session_preamble
     @applied.each { |s| script << s.rstrip << ";\n" unless s.strip.empty? }
     script << "\\echo @@@S\n" << body << "\n\\echo @@@E\n" << "ROLLBACK;\n"
     out, err, = Open3.capture3(*args, stdin_data: script)
@@ -129,7 +223,8 @@ class PgOracle
   # The value pass: fieldsep=newline gives row-major one-value-per-line; NULL is explicit; PG's
   # boolean `t`/`f` are normalized to `true`/`false` (conformance.md §1). Returns the flat values.
   def query_values(pg_sql, is_bool)
-    out, = Open3.capture2e(*(PSQL + ["-P", "null=NULL", "-F", "\n"]), stdin_data: value_script(pg_sql))
+    out, = Open3.capture2e(*(PgOracle.psql + ["-P", "null=NULL", "-F", "\n"]),
+                           stdin_data: value_script(pg_sql))
     s = out.lines.index { |l| l.chomp == "@@@S" }
     e = out.lines.index { |l| l.chomp == "@@@E" }
     vals = out.lines[(s + 1)...e].map(&:chomp)
@@ -146,11 +241,24 @@ class PgOracle
     flat.each_slice(ncol).sort_by { |row| row.join("\x00") }.flatten
   end
 
+  # The `SET LOCAL` preamble every probe shares — the ONE place session state is established
+  # (this file's reason for existing: one implementation, not two). It carries the record's zone
+  # (`# timezone:`, default UTC) plus every declared [session] pin from the profile, so a probe
+  # never inherits a server default that could differ from the calibrated one. SET LOCAL is scoped
+  # to the probe's rolled-back transaction (timezones.md §9.4), so nothing leaks between probes.
+  def session_preamble
+    out = +"SET LOCAL TimeZone='#{@tz}';\n"
+    PgOracle.profile.fetch("session", {}).each do |name, value|
+      out << "SET LOCAL #{name} = '#{value.to_s.gsub("'", "''")}';\n"
+    end
+    out
+  end
+
   private
 
   def value_script(pg_sql)
     script = +"BEGIN;\n"
-    script << "SET LOCAL TimeZone='#{@tz}';\n"
+    script << session_preamble
     @applied.each { |s| script << s.rstrip << ";\n" unless s.strip.empty? }
     script << "\\echo @@@S\n" << pg_sql << ";\n" << "\\echo @@@E\n" << "ROLLBACK;\n"
     script

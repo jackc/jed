@@ -852,7 +852,17 @@ PostgreSQL also runs **live** as the `db` service (a queryable oracle), separate
 source checkout. The oracle is reached over a **Unix-domain socket** shared into the devcontainer
 (`PGHOST=/var/run/postgresql`, trust auth) — the connection env is preconfigured, so just run bare
 `psql` or `rake corpus:check[<repo-root path>]` and **never override `PGHOST`** (the recurring
-foot-gun). The `db` service name also resolves over TCP, but the socket is the path we use.
+foot-gun). Its **configuration is declared data**, not whatever the nearest server defaults to:
+`spec/conformance/oracle_profile.toml` asserts the cluster facts (PG major, locale provider +
+locale, encoding, database) at connect and applies the output-affecting session GUCs (`DateStyle`,
+`IntervalStyle`, `extra_float_digits`, …) in every probe — because those change the oracle's
+*values*, not just its formatting, and an undeclared oracle silently imports different answers
+(`spec/design/conformance.md`; `rake oracle:status`). Corpus probes run against a dedicated
+`jed_oracle` database on PG 17+'s **platform-independent `builtin` `C.UTF-8` provider** — whose
+code-point ordering *is* jed's single defined `C` collation — so text ordering agrees by
+construction rather than by hand-written override, and the oracle is tied to PostgreSQL rather
+than to one host's glibc/ICU. Provision it with `rake oracle:setup`; the harness connects to it
+explicitly, so bare `psql` (still the cluster default) is `psql -d jed_oracle` for corpus work. The `db` service name also resolves over TCP, but the socket is the path we use.
 **CockroachDB** is deliberately **excluded** despite being cited in §7/§8:
 its core is BSL 1.1 (source-available, not OSI-free). For its key-encoding design, read it
 from `spec/encoding/` or an old Apache-2.0 tag rather than vendoring the BSL source.

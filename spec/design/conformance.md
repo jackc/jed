@@ -327,6 +327,44 @@ Every corpus entry MUST obey:
   record is side-effect-free and is not replayed). So a record that *fails* on PG while jed
   runs it (a documented divergence) must sit **LAST** in its file, or it poisons the replay
   prefix of everything after it.
+- **The oracle's configuration is DECLARED, not inherited** —
+  [oracle_profile.toml](../conformance/oracle_profile.toml). "PostgreSQL" is not one behavior: a
+  cluster's **locale provider**, its **tzdata** set, and a dozen **session GUCs** change what the
+  server answers, in *values* and not merely formatting. An `IntervalStyle = iso_8601` server
+  rewrites every interval expectation; a cluster `initdb`'d under a non-US locale gets
+  `DateStyle = ISO, DMY` and reinterprets ambiguous date *literals on input*. Left implicit, the
+  corpus is calibrated to whatever the nearest server happened to default to. The profile splits
+  that into two halves, as data (CLAUDE.md §5):
+  - **`[cluster]` — asserted.** PG major, locale provider + locale, encoding, database. The
+    oracle runs on a dedicated database using PG 17+'s **`builtin` `C.UTF-8`** provider, and that
+    is load-bearing: libc and ICU collations are supplied by the *host*, so glibc, macOS libc, and
+    ICU order the same strings differently and any of them can reorder across a library upgrade —
+    an oracle on one of them is calibrated to one machine's PostgreSQL rather than to PostgreSQL.
+    The builtin provider consults no external library, and its code-point ordering **is** jed's
+    single defined `C` collation (types.md §11), so PG and jed agree on text ordering *by
+    construction* instead of by hand-written override. `rake oracle:setup` provisions it
+    (a database's locale is fixed at CREATE time, so matching jed means creating one).
+    `PgOracle.assert_profile!` checks them **once per process** on first connect and **aborts** on
+    a mismatch, so every `corpus:*` / `rqg:*` task inherits the guard for free. `rake
+    oracle:status` prints declared-vs-live; `rake oracle:check` is the bare assertion.
+    `[cluster.tzdata]` is *reported*, not enforced — tzdata content legitimately varies per PG
+    build, so a flip **warns** and names the override that depends on it.
+  - **`[session]` — applied.** `DateStyle`, `IntervalStyle`, `extra_float_digits`, `bytea_output`,
+    `standard_conforming_strings`, `client_encoding`, `search_path`, `transform_null_equals`,
+    `array_nulls`, `backslash_quote`, `timezone_abbreviations`, and the `lc_*` trio are emitted as
+    `SET LOCAL` in **every** probe's preamble, inside the probe's rolled-back transaction, so a
+    probe never inherits a server default. `TimeZone` is deliberately absent — it is per-record
+    (`# timezone:`) and set from the record itself.
+
+  **Sweeping many files:** reset between them (`rake oracle:reset`). Probes roll back, but a
+  `.test` carrying its own transaction control commits its objects for real, and a later file
+  replaying onto that state fails in a way that looks exactly like a regression.
+
+  `spec/conformance/verify.rb` checks the table is structurally complete (every asserted key
+  present and well-typed, every pin a non-empty string) so a typo cannot make an assertion
+  vacuous; that check is static and needs no server, so it runs inside toolchain-light `rake
+  verify`. **Changing a value in the profile changes what the oracle answers** — treat it as a
+  spec edit and re-run `corpus:check` over the oracle-checkable corpus.
 - **Intentional divergences are a machine-checked ledger.** PostgreSQL is the *default*, not a
   compatibility target (CLAUDE.md §1): where jed deliberately differs — the strict type system,
   a documented narrowing — the divergence is recorded in

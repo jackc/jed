@@ -5,10 +5,15 @@ require_relative "gen"
 module RQG
   # The type-aware boolean-predicate generator — the heart of the firehose. Every node is well-typed
   # by construction (operands of a comparison share a comparable family) so a generated WHERE clause
-  # is one PG and jed BOTH accept and agree on. All text participating in any comparison / ordering
-  # context routes through the single COLLATE "C" chokepoint (`tc`), because jed's default collation
-  # resolves to C while PG's is en_US (testing-ideas.md §4) — forcing C makes PG agree, no false
-  # divergence, no ledger entry.
+  # is one PG and jed BOTH accept and agree on.
+  #
+  # Text needs no special handling. It used to: every text operand was routed through a
+  # COLLATE "C" chokepoint because the oracle database was initdb'd under the libc en_US locale
+  # collation while jed's default is `C`. That was scaffolding for the SERVER's configuration, not
+  # for a semantic difference — and it cost real coverage (see shapes/setop.rb). The oracle now runs
+  # on the platform-independent builtin C.UTF-8 provider, whose ordering IS code-point order
+  # (spec/conformance/oracle_profile.toml), so a bare text comparison agrees with jed by
+  # construction and the generator emits the SQL a user would actually write.
   module Expr
     module_function
 
@@ -64,18 +69,13 @@ module RQG
     def idf(ctx, col, fam)
       ctx.use(:is_distinct_from)
       neg = ctx.chance(0.5) ? "NOT " : ""
-      "#{operand(ctx, col.ref, :text == fam)} IS #{neg}DISTINCT FROM #{rhs(ctx, col, fam)}"
+      "#{col.ref} IS #{neg}DISTINCT FROM #{rhs(ctx, col, fam)}"
     end
 
     def cmp(ctx, col, fam)
       op = comparison_op(ctx, fam)
-      "#{operand(ctx, col.ref, :text == fam)} #{op} #{rhs(ctx, col, fam)}"
+      "#{col.ref} #{op} #{rhs(ctx, col, fam)}"
     end
-
-    # NOTE on collation: COLLATE "C" is applied ONLY to the LHS column operand (always an a_expr
-    # position) — an explicit collation on one operand governs the whole comparison in PostgreSQL,
-    # so this both forces C (agreeing with jed's default) AND stays legal where a literal collation
-    # would not: BETWEEN's bounds are b_expr, which has no COLLATE production (a PG syntax error).
 
     def comparison_op(ctx, fam)
       ops = fam == :boolean ? %w[= <>] : %w[= <> < > <= >=]
@@ -92,28 +92,26 @@ module RQG
       ctx.use(:between)
       lo, hi = order_pair(literal(ctx, fam), literal(ctx, fam), fam)
       neg = ctx.chance(0.25) ? "NOT " : ""
-      # bounds are bare literals (b_expr — no COLLATE); the LHS's explicit C governs the comparison.
-      "#{operand(ctx, col.ref, :text == fam)} #{neg}BETWEEN #{lo} AND #{hi}"
+      "#{col.ref} #{neg}BETWEEN #{lo} AND #{hi}"
     end
 
     def in_list(ctx, col, fam)
       ctx.use(:in_list)
       vals = Array.new(ctx.rand(1..3)) { literal(ctx, fam) }
       neg = ctx.chance(0.25) ? "NOT " : ""
-      "#{operand(ctx, col.ref, :text == fam)} #{neg}IN (#{vals.join(', ')})"
+      "#{col.ref} #{neg}IN (#{vals.join(', ')})"
     end
 
     def like(ctx, col)
       kw = ctx.chance(0.5) ? "LIKE" : "ILIKE"
       ctx.use(kw == "LIKE" ? :like : :ilike)
       neg = ctx.chance(0.25) ? "NOT " : ""
-      "#{operand(ctx, col.ref, true)} #{neg}#{kw} #{RQG::Data.quote(ctx.pick(LIKE_PATTERNS))}"
+      "#{col.ref} #{neg}#{kw} #{RQG::Data.quote(ctx.pick(LIKE_PATTERNS))}"
     end
 
     # --- operands / literals ---------------------------------------------------------------------
 
-    # The right-hand operand of a comparison: a bare literal, or sometimes a bare comparable column
-    # (never collated — the LHS's explicit COLLATE "C" already governs the comparison).
+    # The right-hand operand of a comparison: a bare literal, or sometimes a bare comparable column.
     def rhs(ctx, col, fam)
       others = ctx.columns.reject { |c| c.ref == col.ref }
                   .select { |c| RQG.comparable?(c.family, fam) }
@@ -122,14 +120,6 @@ module RQG
       else
         literal(ctx, fam)
       end
-    end
-
-    # The COLLATE "C" chokepoint — applied ONLY to a text LHS column operand (always an a_expr).
-    def operand(ctx, sql, is_text)
-      return sql unless is_text
-
-      ctx.use(:collate)
-      "#{sql} COLLATE \"C\""
     end
 
     # A bare literal value of the given family.

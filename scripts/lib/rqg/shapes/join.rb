@@ -9,8 +9,8 @@ module RQG
     # join — two aliased tables joined INNER (ON a.id = b.r, an integer FK-like ref) or CROSS, with a
     # WHERE predicate over the combined qualified columns, a qualified/`*` projection, and either a
     # total ORDER BY (a.id, b.id — the unique pair key → nosort, optional LIMIT/OFFSET) or rowsort.
-    # Integer join keys agree in PG and jed; text in WHERE/ORDER BY routes through the COLLATE "C"
-    # chokepoint as in select_where.
+    # Integer join keys agree in PG and jed; text in WHERE/ORDER BY needs no explicit collation
+    # (the oracle orders by code point, as jed does).
     module SelectJoin
       module_function
 
@@ -86,16 +86,12 @@ module RQG
         [proj, "nosort", tail]
       end
 
-      # 0-2 random extra sort keys (qualified, text collated, optional DESC/NULLS) then a.id, b.id.
+      # 0-2 random extra sort keys (qualified, optional DESC/NULLS) then a.id, b.id.
       def order_keys(ctx)
         non_pk = ctx.columns.reject { |c| c.ref.end_with?(".id") }
         keys = subset(ctx, non_pk, allow_empty: true, max: 2).map do |c|
           ctx.use(:order_by_keys)
           key = c.ref
-          if c.family == :text
-            ctx.use(:collate)
-            key += ' COLLATE "C"'
-          end
           key += " DESC" if ctx.chance(0.5)
           key += ctx.chance(0.5) ? " NULLS FIRST" : " NULLS LAST" if ctx.chance(0.4)
           key

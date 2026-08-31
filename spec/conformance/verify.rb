@@ -12,6 +12,9 @@
 #   5. every .test file carries exactly one `# requires:` line
 #   6. every `# cost: N` directive parses as a non-negative integer, and any file using
 #      one declares the `resource.cost_metering` capability (CLAUDE.md §13)
+#   7. the oracle profile (oracle_profile.toml) is structurally complete — every asserted
+#      cluster key present and well-typed, every session pin a non-empty string. Static only:
+#      whether the LIVE oracle matches is PgOracle.assert_profile!'s job, which needs a server.
 #
 # Exit 0 = taxonomy is internally coherent; nonzero = the offending problem.
 
@@ -52,6 +55,50 @@ end
 def parse_max_sql_length_directives(path)
   File.readlines(path, encoding: "UTF-8")
       .filter_map { |l| l[/^#\s*max_sql_length:\s*(\S+)/i, 1] }
+end
+
+# (7) The oracle profile is the declared configuration of the live PostgreSQL oracle
+# (scripts/lib/pg_oracle.rb). This check is STATIC — it proves the table is complete and
+# well-formed so a typo cannot make an assertion silently vacuous. It cannot check the live
+# server; PgOracle.assert_profile! does that at connect time.
+CLUSTER_KEYS = { "pg_major" => Integer, "locale_provider" => String,
+                 "locale" => String, "encoding" => String, "database" => String }.freeze
+
+def check_oracle_profile
+  path = File.join(CONF_DIR, "oracle_profile.toml")
+  fail!("oracle_profile.toml missing") unless File.exist?(path)
+
+  doc = TomlRB.load_file(path)
+  fail!("oracle_profile.toml: schema_version must be 1") unless doc["schema_version"] == 1
+
+  cluster = doc["cluster"] or fail!("oracle_profile.toml: missing [cluster]")
+  CLUSTER_KEYS.each do |key, type|
+    value = cluster[key]
+    fail!("oracle_profile.toml: [cluster] missing #{key}") if value.nil?
+    fail!("oracle_profile.toml: [cluster] #{key} must be #{type}, got #{value.class}") unless value.is_a?(type)
+  end
+  provider = cluster["locale_provider"]
+  unless %w[c b i].include?(provider)
+    fail!("oracle_profile.toml: [cluster] locale_provider must be c|b|i, got #{provider.inspect}")
+  end
+
+  links = cluster.dig("tzdata", "backward_links")
+  unless [true, false].include?(links)
+    fail!("oracle_profile.toml: [cluster.tzdata] backward_links must be a boolean")
+  end
+
+  session = doc["session"] or fail!("oracle_profile.toml: missing [session]")
+  fail!("oracle_profile.toml: [session] is empty") if session.empty?
+  session.each do |name, value|
+    fail!("oracle_profile.toml: [session] #{name} must be a string, got #{value.class}") unless value.is_a?(String)
+    fail!("oracle_profile.toml: [session] #{name} is empty") if value.strip.empty?
+  end
+  # TimeZone is per-record (the `# timezone:` directive), set by PgOracle from the record itself.
+  if session.key?("TimeZone")
+    fail!("oracle_profile.toml: [session] must not pin TimeZone — it is per-record (`# timezone:`)")
+  end
+
+  [cluster, session]
 end
 
 def main
@@ -139,8 +186,13 @@ def main
   orphans = cap_set - required_anywhere
   fail!("orphan capabilities (defined, never required by any test): #{orphans.sort.join(', ')}") unless orphans.empty?
 
+  # (7) the oracle profile table
+  oracle_cluster, oracle_session = check_oracle_profile
+
   puts "OK: #{capabilities.length} capabilities, #{profiles.length} profiles, " \
        "#{tests.length} test files — taxonomy coherent"
+  puts "OK: oracle profile — PG #{oracle_cluster['pg_major']}, provider #{oracle_cluster['locale_provider']}, " \
+       "locale #{oracle_cluster['locale']}, #{oracle_session.length} session pins"
 end
 
 main

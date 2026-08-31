@@ -2,7 +2,7 @@
 # One self-contained {schema, data, query} block per distinct query shape; expected rows are
 # the live PostgreSQL oracle's (jed agreed by construction). Runs on all three cores in rake
 # ci. Do NOT hand-edit — regenerate. See .scratch/testing-ideas.md §1 (the RQG firehose).
-# requires: ddl.create_table, ddl.not_null, ddl.primary_key, dml.insert, dml.insert_multi_row, expr.between, expr.collate, expr.in_list, expr.like, expr.not_equal, expr.parens, query.aggregates, query.comparison_order, query.is_distinct_from, query.is_null, query.order_by, query.select, query.select_star, query.subquery_exists, query.subquery_in, query.subquery_scalar, query.where_eq, types.boolean, types.decimal, types.i16, types.i32, types.i64, types.text
+# requires: ddl.create_table, ddl.not_null, ddl.primary_key, dml.insert, dml.insert_multi_row, expr.between, expr.in_list, expr.like, expr.not_equal, expr.parens, query.aggregates, query.comparison_order, query.is_distinct_from, query.is_null, query.order_by, query.select, query.select_star, query.subquery_exists, query.subquery_in, query.subquery_scalar, query.where_eq, types.boolean, types.decimal, types.i16, types.i32, types.i64, types.text
 
 # --- seed 1 ---
 statement ok
@@ -87,7 +87,7 @@ statement ok
 INSERT INTO s4 VALUES (1, NULL, 376), (2, 'dog', -2), (3, 'ab', 8), (4, 'cat', -448)
 
 query IDIID rowsort
-SELECT * FROM m4 WHERE (id = (SELECT sum(b) FROM s4 WHERE a COLLATE "C" IN ('z', 'Apple', 'mango'))) AND (id BETWEEN -948 AND -692)
+SELECT * FROM m4 WHERE (id = (SELECT sum(b) FROM s4 WHERE a IN ('z', 'Apple', 'mango'))) AND (id BETWEEN -948 AND -692)
 ----
 
 # --- seed 5 ---
@@ -190,7 +190,7 @@ statement ok
 INSERT INTO s10 VALUES (1, 368, 0, 'banana', 'AB'), (2, 0, 547, 'Mango', 'apple'), (3, -815, 5, 'z', 'ZZ'), (4, 32766, 8, 'ab', 'ab'), (5, -10, -7, NULL, 'cat'), (6, 6, 5, 'banana', 'Cat'), (7, -32768, -10, 'apple', 'ab'), (8, 7, 6, NULL, 'Cat')
 
 query TI rowsort
-SELECT a, b FROM m10 WHERE (c >= (SELECT min(a) FROM s10 WHERE d COLLATE "C" NOT IN ('dog', 'apple', 'banana'))) AND (a COLLATE "C" BETWEEN 'Cat' AND 'Apple')
+SELECT a, b FROM m10 WHERE (c >= (SELECT min(a) FROM s10 WHERE d NOT IN ('dog', 'apple', 'banana'))) AND (a BETWEEN 'Cat' AND 'Apple')
 ----
 
 # --- seed 11 ---
@@ -226,7 +226,7 @@ statement ok
 INSERT INTO s12 VALUES (1, FALSE, -6, 'BANANA', NULL), (2, FALSE, -2, 'dog', 5), (3, TRUE, 1, 'BANANA', -9), (4, FALSE, 10, 'z', -8), (5, FALSE, 10, NULL, -2147483647), (6, TRUE, -9, 'AB', NULL), (7, FALSE, NULL, NULL, -1), (8, FALSE, NULL, 'Apple', 8)
 
 query ID nosort
-SELECT id, a FROM m12 WHERE (c = (SELECT count(*) FROM s12 WHERE a IS NOT DISTINCT FROM FALSE)) AND (NOT (d COLLATE "C" NOT LIKE '_')) ORDER BY id
+SELECT id, a FROM m12 WHERE (c = (SELECT count(*) FROM s12 WHERE a IS NOT DISTINCT FROM FALSE)) AND (NOT (d NOT LIKE '_')) ORDER BY id
 ----
 
 # --- seed 13 ---
@@ -418,7 +418,7 @@ statement ok
 INSERT INTO s21 VALUES (1, -8, 'Apple', 0), (2, -9223372036854775807, 'apple', 2147483647), (3, -995, 'x', -10), (4, -10, 'Apple', -7)
 
 query TI nosort
-SELECT a, b FROM m21 WHERE (b > (SELECT count(*) FROM s21 WHERE NOT (c IS DISTINCT FROM -658))) AND (a COLLATE "C" IS NOT DISTINCT FROM 'ZZ') ORDER BY id
+SELECT a, b FROM m21 WHERE (b > (SELECT count(*) FROM s21 WHERE NOT (c IS DISTINCT FROM -658))) AND (a IS NOT DISTINCT FROM 'ZZ') ORDER BY id
 ----
 
 # --- seed 22 ---
@@ -541,3 +541,97 @@ NULL
 Cat
 NULL
 2
+
+# --- seed 26 ---
+statement ok
+CREATE TABLE m26 (id i32 PRIMARY KEY, a boolean NOT NULL, b i16 NOT NULL, c decimal)
+
+statement ok
+CREATE TABLE s26 (id i16 PRIMARY KEY, a i32 NOT NULL, b i16, c i64 NOT NULL)
+
+statement ok
+INSERT INTO m26 VALUES (1, TRUE, 2, NULL), (2, FALSE, 2, 693.28), (3, FALSE, 10, -832.96), (4, FALSE, -153, 692), (5, FALSE, 32767, 331.70), (6, FALSE, -32768, 851.57), (7, TRUE, 815, 510), (8, TRUE, -8, 981)
+
+statement ok
+INSERT INTO s26 VALUES (1, -10, -7, 831), (2, -6, -863, 0), (3, 1, -4, 0), (4, 2147483647, -5, -9223372036854775808), (5, -1, NULL, 7), (6, -2, -6, 274), (7, 9, 42, 1)
+
+query IBID nosort
+SELECT id, a, b, c FROM m26 WHERE (EXISTS (SELECT 1 FROM s26 WHERE b < a)) AND (id IS NOT DISTINCT FROM b) ORDER BY id
+----
+2
+false
+2
+693.28
+
+# --- seed 27 ---
+statement ok
+CREATE TABLE m27 (id i16 PRIMARY KEY, a i16, b i16)
+
+statement ok
+CREATE TABLE s27 (id i32 PRIMARY KEY, a i32, b i64, c i64)
+
+statement ok
+INSERT INTO m27 VALUES (1, -10, NULL), (2, NULL, -284), (3, NULL, -813), (4, NULL, 5), (5, -5, NULL), (6, -849, -10), (7, 32767, -6), (8, -424, NULL)
+
+statement ok
+INSERT INTO s27 VALUES (1, 6, -1, 4), (2, 2147483647, 10, -6), (3, -6, 3, -187), (4, 5, 0, 0), (5, 501, NULL, NULL), (6, 8, -808, 619)
+
+query III rowsort
+SELECT * FROM m27 WHERE id <= (SELECT min(b) FROM s27 WHERE a NOT IN (617))
+----
+
+# --- seed 28 ---
+statement ok
+CREATE TABLE m28 (id i32 PRIMARY KEY, a decimal NOT NULL, b i16, c text)
+
+statement ok
+CREATE TABLE s28 (id i64 PRIMARY KEY, a decimal, b i64)
+
+statement ok
+INSERT INTO m28 VALUES (1, 799.78, NULL, 'apple'), (2, 788, NULL, 'ZZ'), (3, 935, -10, 'ab'), (4, -372.58, 0, 'banana'), (5, -463.86, NULL, 'dog')
+
+statement ok
+INSERT INTO s28 VALUES (1, 29, -2), (2, -349, 10), (3, 321.95, 6), (4, -356.06, -778), (5, -847.92, -2), (6, -395.40, -9223372036854775807), (7, NULL, -9223372036854775808)
+
+query I nosort
+SELECT id FROM m28 WHERE b NOT IN (SELECT id FROM s28 WHERE (b IS NOT DISTINCT FROM -893 OR id <= b)) ORDER BY id
+----
+3
+4
+
+# --- seed 29 ---
+statement ok
+CREATE TABLE m29 (id i16 PRIMARY KEY, a decimal NOT NULL, b i16)
+
+statement ok
+CREATE TABLE s29 (id i32 PRIMARY KEY, a boolean, b i16, c boolean)
+
+statement ok
+INSERT INTO m29 VALUES (1, -836, -10), (2, 35.46, 229), (3, -721.32, -8), (4, -384, NULL), (5, -114.92, -32768)
+
+statement ok
+INSERT INTO s29 VALUES (1, TRUE, 4, FALSE), (2, NULL, 1, FALSE), (3, NULL, -4, NULL), (4, FALSE, -6, FALSE), (5, NULL, -4, FALSE), (6, TRUE, 7, FALSE), (7, TRUE, -9, FALSE)
+
+query IDI nosort
+SELECT id, a, b FROM m29 WHERE (id IN (SELECT id FROM s29 WHERE NOT (a <> c))) AND (b IS NULL) ORDER BY id
+----
+4
+-384
+NULL
+
+# --- seed 30 ---
+statement ok
+CREATE TABLE m30 (id i64 PRIMARY KEY, a i64, b i32)
+
+statement ok
+CREATE TABLE s30 (id i32 PRIMARY KEY, a i32, b boolean NOT NULL, c text)
+
+statement ok
+INSERT INTO m30 VALUES (1, NULL, 1), (2, 3, -332), (3, -9223372036854775808, 1), (4, NULL, 2147483647), (5, -9223372036854775808, 0), (6, 7, 1), (7, -1, 313), (8, NULL, NULL), (9, -1, 968)
+
+statement ok
+INSERT INTO s30 VALUES (1, NULL, TRUE, 'x'), (2, 2, TRUE, 'cat'), (3, -4, FALSE, NULL), (4, 5, TRUE, 'ZZ'), (5, -7, TRUE, NULL), (6, -1, FALSE, 'apple'), (7, NULL, TRUE, 'x'), (8, -6, FALSE, NULL)
+
+query II rowsort
+SELECT id, b FROM m30 WHERE (EXISTS (SELECT 1 FROM s30 WHERE id IS NULL)) AND (b IS NOT NULL)
+----

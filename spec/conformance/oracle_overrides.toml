@@ -884,32 +884,18 @@ file = "types/literals.test"
 sql = "SELECT id FROM t WHERE id = 5000000000"
 reason = "jed: the untyped literal adapts to the i32 column `id`, and 5000000000 fits i64 but not i32, so it traps 22003 at resolve (types.md §6). PostgreSQL types it as int8 and promotes the int4 column, returning an (empty) result with no error. A standing divergence."
 
-# --- types/text.test: the single defined `C`/byte collation (§8) vs the oracle's en_US.utf8, plus
-# the strict-typing / text-PK narrowings.
-[[override]]
-file = "types/text.test"
-sql = "SELECT id FROM t ORDER BY name"
-reason = "jed: text orders by the single defined `C` collation — UTF-8 byte / code-point order (types.md §11, CLAUDE.md §8), so '' < 'Zeta' < 'alice' < 'bob' (uppercase 0x5A before lowercase 0x61). The oracle `db` uses en_US.utf8, a locale collation that folds case and orders differently. A documented collation divergence; jed's committed byte-order rows are kept."
-
-[[override]]
-file = "types/text.test"
-sql = "SELECT id FROM w ORDER BY s"
-reason = "jed: `C`/byte collation orders 'Z'(0x5A) < 'a' < 'aa' < 'ab' < 'b' < '😀' (an astral char sorts after all BMP chars by UTF-8 bytes). The oracle's en_US.utf8 locale collation orders these differently. A documented collation divergence (types.md §11, CLAUDE.md §8)."
-
+# --- types/text.test: the strict-typing / text-PK narrowings.
+#
+# The COLLATION entries that used to live here are gone. They existed because the oracle database
+# was initdb'd under the libc en_US.utf8 LOCALE collation, which folds case and orders unlike jed's
+# single defined `C`/byte collation (types.md §11) — an artifact of the SERVER's configuration, not
+# a jed-vs-PostgreSQL semantic difference. The oracle now runs on the platform-independent builtin
+# C.UTF-8 provider (spec/conformance/oracle_profile.toml), whose ordering IS code-point order, so
+# PostgreSQL and jed agree on these rows by construction and there is nothing to override.
 [[override]]
 file = "types/text.test"
 sql = "SELECT k, n FROM tk WHERE k <> ''"
-reason = "jed: a full scan iterates the text PRIMARY KEY in C/byte (code-point) order — 'Banana'(0x42) < 'app' < 'apple' < 'banana' (encoding.md §2.4, text-terminated-escape) — here filtered to drop the '' key. With no ORDER BY the row order is unspecified (CLAUDE.md §8); PostgreSQL returns heap/insertion order under its en_US.utf8 collation, which differs. jed's committed PK-order rows are kept; the multiset is identical."
-
-[[override]]
-file = "types/text.test"
-sql = "SELECT s FROM astral ORDER BY s"
-reason = "jed: `C`/byte collation = UTF-8 code-point order, so 豈 (U+F900, bytes EF A4 80) sorts before 😀 (U+1F600, bytes F0 9F 98 80). The oracle's en_US.utf8 collation orders them oppositely. This pins jed's UTF-8-not-UTF-16 ordering rule (types.md §11); a documented collation divergence."
-
-[[override]]
-file = "types/text.test"
-sql = "SELECT id FROM w WHERE s < 'b' ORDER BY id"
-reason = "jed: the ordering predicate `s < 'b'` uses the `C`/byte collation, so 'Z'(0x5A) < 'b' is TRUE (id 6 kept) and '😀' > 'b' (id 5 dropped) -> {2,3,4,6}. The oracle's en_US.utf8 collation orders uppercase 'Z' after 'b' and the emoji before it, so it returns {2,3,4,5}. A documented collation divergence (types.md §11, CLAUDE.md §8) — the set differs, not just the order."
+reason = "jed: a full scan iterates the text PRIMARY KEY in C/byte (code-point) order — 'Banana'(0x42) < 'app' < 'apple' < 'banana' (encoding.md §2.4, text-terminated-escape) — here filtered to drop the '' key. With no ORDER BY the row order is unspecified (CLAUDE.md §8); PostgreSQL returns heap/insertion order, which differs. jed's committed PK-order rows are kept; the multiset is identical."
 
 [[override]]
 file = "types/text.test"

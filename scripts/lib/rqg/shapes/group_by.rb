@@ -12,10 +12,9 @@ module RQG
     #
     # Subset-staying: jed's aggregate type rules match PG (sum(i16/i32)→i64, sum(i64)→decimal,
     # avg→decimal, count→i64) so no false divergence. MIN/MAX is restricted to int/decimal/text
-    # (PG ships no min/max for boolean/uuid — a jed extension that would skip), and MIN/MAX(text)
-    # routes through COLLATE "C" (collation-ordered). GROUP BY uses equality (deterministic
-    # collation = byte-equal), so it agrees C-vs-en_US without COLLATE; only ORDER BY of a text
-    # group key needs it.
+    # (PG ships no min/max for boolean/uuid — a jed extension that would skip). Text ordering —
+    # MIN/MAX(text) and an ORDER BY on a text group key — needs no explicit collation: the oracle's
+    # builtin C.UTF-8 ordering is jed's `C` collation (oracle_profile.toml).
     module GroupBy
       module_function
 
@@ -59,12 +58,7 @@ module RQG
 
       def minmax(ctx, col)
         fn = ctx.chance(0.5) ? "min" : "max"
-        arg = col.name
-        if RQG.family(col.type) == :text
-          ctx.use(:collate)
-          arg += ' COLLATE "C"'
-        end
-        "#{fn}(#{arg})"
+        "#{fn}(#{col.name})"
       end
 
       # A HAVING predicate over an aggregate — count-based, plus sum-based when a numeric column exists.
@@ -85,14 +79,7 @@ module RQG
 
         ctx.use(:order_by)
         ctx.use(:order_by_keys) if group_cols.size > 1
-        keys = group_cols.map do |c|
-          if RQG.family(c.type) == :text
-            ctx.use(:collate)
-            "#{c.name} COLLATE \"C\""
-          else
-            c.name
-          end
-        end
+        keys = group_cols.map(&:name)
         [" ORDER BY #{keys.join(', ')}", "nosort"]
       end
 

@@ -2,7 +2,7 @@
 # One self-contained {schema, data, query} block per distinct query shape; expected rows are
 # the live PostgreSQL oracle's (jed agreed by construction). Runs on all three cores in rake
 # ci. Do NOT hand-edit — regenerate. See .scratch/testing-ideas.md §1 (the RQG firehose).
-# requires: ddl.create_table, ddl.not_null, ddl.primary_key, dml.insert, dml.insert_multi_row, expr.between, expr.collate, expr.ilike, expr.in_list, expr.parens, query.column_alias, query.comparison_order, query.distinct, query.is_distinct_from, query.is_null, query.limit, query.offset, query.order_by, query.order_by_keys, query.select, query.select_star, types.boolean, types.decimal, types.i16, types.i32, types.i64, types.text
+# requires: ddl.create_table, ddl.not_null, ddl.primary_key, dml.insert, dml.insert_multi_row, expr.between, expr.ilike, expr.in_list, expr.parens, query.column_alias, query.comparison_order, query.distinct, query.is_distinct_from, query.is_null, query.limit, query.offset, query.order_by, query.order_by_keys, query.select, query.select_star, types.boolean, types.decimal, types.i16, types.i32, types.i64, types.text
 
 # --- seed 1 ---
 statement ok
@@ -81,7 +81,7 @@ statement ok
 INSERT INTO t5 VALUES (1, 543.53, 5, NULL, TRUE), (2, -623.41, 8, NULL, NULL), (3, 850, NULL, NULL, FALSE), (4, -676.83, -3, 'ZZ', TRUE)
 
 query IIB rowsort
-SELECT DISTINCT id, b, d FROM t5 WHERE c COLLATE "C" NOT ILIKE 'a%'
+SELECT DISTINCT id, b, d FROM t5 WHERE c NOT ILIKE 'a%'
 ----
 4
 -3
@@ -162,7 +162,7 @@ statement ok
 INSERT INTO t10 VALUES (1, NULL, 0, NULL), (2, 'apple', 368, -2), (3, 'Apple', 3, 822), (4, 'Mango', NULL, 3), (5, 'AB', -2147483647, NULL), (6, 'x', NULL, -285), (7, NULL, 2, 368), (8, 'Mango', -2147483648, 270), (9, NULL, 2, -815)
 
 query ITII nosort
-SELECT * FROM t10 WHERE (c IS DISTINCT FROM -287 AND b NOT BETWEEN -203 AND 808) ORDER BY a COLLATE "C" NULLS LAST, b NULLS LAST, id
+SELECT * FROM t10 WHERE (c IS DISTINCT FROM -287 AND b NOT BETWEEN -203 AND 808) ORDER BY a NULLS LAST, b NULLS LAST, id
 ----
 5
 AB
@@ -192,7 +192,7 @@ statement ok
 INSERT INTO t12 VALUES (1, -582.74, FALSE, 32766, 'cat'), (2, -581, FALSE, 10, 'dog'), (3, -365.45, NULL, 32766, 'AB'), (4, -665, FALSE, 1, 'Cat'), (5, 395.75, NULL, 0, 'dog')
 
 query IDBIT nosort
-SELECT * FROM t12 WHERE d COLLATE "C" < 'mango' ORDER BY a, b DESC NULLS FIRST, id LIMIT 3 OFFSET 4
+SELECT * FROM t12 WHERE d < 'mango' ORDER BY a, b DESC NULLS FIRST, id LIMIT 3 OFFSET 4
 ----
 5
 395.75
@@ -243,7 +243,7 @@ statement ok
 INSERT INTO t14 VALUES (1, 'ZZ', 0), (2, 'dog', -6), (3, 'z', 10), (4, 'AB', -1), (5, 'BANANA', 3), (6, 'AB', -10), (7, 'mango', 1), (8, NULL, -3)
 
 query ITI nosort
-SELECT * FROM t14 WHERE a COLLATE "C" BETWEEN 'Apple' AND 'ab' ORDER BY id
+SELECT * FROM t14 WHERE a BETWEEN 'Apple' AND 'ab' ORDER BY id
 ----
 1
 ZZ
@@ -357,7 +357,7 @@ statement ok
 INSERT INTO t20 VALUES (1, NULL, 'apple', 214, -1), (2, 'Cat', 'banana', NULL, 32766), (3, 'ZZ', 'ZZ', 0, 867), (4, 'ZZ', 'ZZ', 8, -413), (5, NULL, 'ZZ', 0, 4), (6, 'BANANA', 'banana', NULL, 4)
 
 query ITTII nosort
-SELECT * FROM t20 WHERE id < 162 ORDER BY a COLLATE "C" NULLS FIRST, b COLLATE "C" DESC, id
+SELECT * FROM t20 WHERE id < 162 ORDER BY a NULLS FIRST, b DESC, id
 ----
 1
 NULL
@@ -398,7 +398,7 @@ statement ok
 INSERT INTO t21 VALUES (1, NULL, 0), (2, NULL, 10), (3, 'AB', 765), (4, 'banana', 6), (5, 'apple', -9), (6, 'banana', -1)
 
 query ITI nosort
-SELECT * FROM t21 WHERE a COLLATE "C" ILIKE 'A%' ORDER BY b DESC, id
+SELECT * FROM t21 WHERE a ILIKE 'A%' ORDER BY b DESC, id
 ----
 3
 AB
@@ -455,7 +455,7 @@ statement ok
 INSERT INTO t24 VALUES (1, 1, 'BANANA'), (2, 0, 'ab'), (3, 2, 'Apple'), (4, -135, 'Apple'), (5, 0, 'z'), (6, -7, 'z'), (7, 2147483647, 'AB'), (8, NULL, 'Cat')
 
 query II rowsort
-SELECT DISTINCT id, a FROM t24 WHERE b COLLATE "C" ILIKE '%'
+SELECT DISTINCT id, a FROM t24 WHERE b ILIKE '%'
 ----
 1
 1
@@ -483,4 +483,71 @@ INSERT INTO t25 VALUES (1, 795, 'AB', NULL, 3), (2, -73, 'apple', 2, -6), (3, 7,
 
 query ITI rowsort
 SELECT DISTINCT a, b, d FROM t25 WHERE c BETWEEN 701 AND 986
+----
+
+# --- seed 26 ---
+statement ok
+CREATE TABLE t26 (id i32 PRIMARY KEY, a boolean NOT NULL, b i16 NOT NULL, c decimal)
+
+statement ok
+INSERT INTO t26 VALUES (1, FALSE, 4, NULL), (2, FALSE, 766, -944.12), (3, TRUE, 2, 693.28), (4, FALSE, 10, -832.96), (5, FALSE, -153, 692), (6, FALSE, 32767, 331.70), (7, FALSE, -32768, 851.57)
+
+query ID nosort
+SELECT id, c FROM t26 WHERE c IS NOT NULL ORDER BY b NULLS LAST, id
+----
+7
+851.57
+5
+692
+3
+693.28
+4
+-832.96
+2
+-944.12
+6
+331.70
+
+# --- seed 27 ---
+statement ok
+CREATE TABLE t27 (id i16 PRIMARY KEY, a i16, b i16)
+
+statement ok
+INSERT INTO t27 VALUES (1, 0, -6), (2, 5, NULL), (3, 9, NULL), (4, -284, NULL), (5, -813, NULL)
+
+query II rowsort
+SELECT id AS id_x, a AS a_x FROM t27 WHERE (a IS NULL OR a IS NULL)
+----
+
+# --- seed 28 ---
+statement ok
+CREATE TABLE t28 (id i32 PRIMARY KEY, a decimal NOT NULL, b i16, c text)
+
+statement ok
+INSERT INTO t28 VALUES (1, 804.24, -32767, 'ZZ'), (2, -940.96, -4, 'Mango'), (3, -891.04, -10, 'ab'), (4, -372.58, 0, 'banana'), (5, -463.86, NULL, 'dog'), (6, -13.05, NULL, 'banana'), (7, -749.83, 32766, 'cat'), (8, 541, 10, NULL)
+
+query DT rowsort
+SELECT a, c FROM t28 WHERE id IN (431)
+----
+
+# --- seed 29 ---
+statement ok
+CREATE TABLE t29 (id i16 PRIMARY KEY, a decimal NOT NULL, b i16)
+
+statement ok
+INSERT INTO t29 VALUES (1, -277.94, 10), (2, 998.36, 191), (3, -521, 32766), (4, 403.78, 229)
+
+query IDI nosort
+SELECT * FROM t29 WHERE (id <= 793 AND a IN (-279.06, -404.29, -381.78)) ORDER BY b NULLS LAST, id
+----
+
+# --- seed 30 ---
+statement ok
+CREATE TABLE t30 (id i64 PRIMARY KEY, a i64, b i32)
+
+statement ok
+INSERT INTO t30 VALUES (1, 7, 8), (2, -4, -938), (3, NULL, NULL), (4, 508, 7), (5, NULL, 2147483646)
+
+query III nosort
+SELECT * FROM t30 WHERE NOT (NOT (id IN (-320, 689, 462))) ORDER BY a DESC, b DESC NULLS FIRST, id
 ----

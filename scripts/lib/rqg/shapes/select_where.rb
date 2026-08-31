@@ -9,7 +9,7 @@ module RQG
     # select_where — the Phase-1 surface: a random schema + data, a type-aware WHERE expression tree,
     # a projection, and either a total ORDER BY (nosort, optional LIMIT/OFFSET) or no ORDER BY
     # (rowsort), with an occasional DISTINCT. Everything stays in the PG∩jed-agreeing subset by
-    # construction (Expr's family gating + the COLLATE "C" chokepoint).
+    # construction (Expr's family gating).
     module SelectWhere
       module_function
 
@@ -70,17 +70,13 @@ module RQG
         end.join(", ")
       end
 
-      # 0-2 random sort keys (text collated, optional DESC / NULLS) then the PK as a total-order
-      # tiebreaker — so the result order is fully deterministic and agrees with PG (nosort).
+      # 0-2 random sort keys (optional DESC / NULLS) then the PK as a total-order tiebreaker — so
+      # the result order is fully deterministic and agrees with PG (nosort).
       def order_keys(ctx, table)
         extra = subset(ctx, table.columns.reject(&:pk), allow_empty: true, max: 2)
         keys = extra.map do |c|
           ctx.use(:order_by_keys)
           key = c.name
-          if RQG.family(c.type) == :text
-            ctx.use(:collate)
-            key += ' COLLATE "C"'
-          end
           key += " DESC" if ctx.chance(0.5)
           key += ctx.chance(0.5) ? " NULLS FIRST" : " NULLS LAST" if ctx.chance(0.4)
           key

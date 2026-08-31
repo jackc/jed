@@ -373,6 +373,35 @@ task :codegen do
   abort "codegen failed for #{failures.join(', ')}" unless failures.empty?
 end
 
+# oracle — the DECLARED configuration of the live PostgreSQL oracle
+# (spec/conformance/oracle_profile.toml). The corpus's expected output is filled from a live PG
+# server (CLAUDE.md §7), but "PostgreSQL" is not one behavior: the locale provider, tzdata, and a
+# dozen session GUCs change what it answers — in VALUES, not just formatting. The profile makes
+# that configuration data (§5): cluster facts are ASSERTED at connect (every corpus:*/rqg:* task
+# gets this for free through PgOracle), session settings are APPLIED in each probe's preamble.
+namespace :oracle do
+  desc "Create/verify the oracle database declared in spec/conformance/oracle_profile.toml"
+  task :setup do
+    sh RbConfig.ruby, "scripts/oracle_setup.rb"
+  end
+
+  desc "Drop every replayed object from the oracle database (keeps the database + its locale)"
+  task :reset do
+    sh RbConfig.ruby, "scripts/oracle_setup.rb", "--reset"
+  end
+
+  desc "Print the declared oracle profile beside the live server's values (fails on mismatch)"
+  task :status do
+    sh RbConfig.ruby, "scripts/oracle_status.rb"
+  end
+
+  desc "Assert the live oracle matches the declared profile (exit nonzero on mismatch)"
+  task :check do
+    sh RbConfig.ruby, "-e", 'require "./scripts/lib/pg_oracle"; PgOracle.new(label: "check"); ' \
+                            'puts "OK: live oracle matches spec/conformance/oracle_profile.toml"'
+  end
+end
+
 # corpus — the Phase-8 testing tools (CLAUDE.md §7). These talk to the LIVE `db` PostgreSQL
 # service, never the source checkout, so they do NOT trip the §12 reference-provisioning gate.
 # psql-only (no `pg` gem): no §14 dependency decision.

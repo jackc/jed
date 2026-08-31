@@ -2,7 +2,7 @@
 # One self-contained {schema, data, query} block per distinct query shape; expected rows are
 # the live PostgreSQL oracle's (jed agreed by construction). Runs on all three cores in rake
 # ci. Do NOT hand-edit — regenerate. See .scratch/testing-ideas.md §1 (the RQG firehose).
-# requires: ddl.create_table, ddl.not_null, ddl.primary_key, dml.insert, dml.insert_multi_row, expr.between, expr.collate, expr.ilike, expr.in_list, expr.not_equal, expr.parens, query.aggregates, query.comparison_order, query.group_by, query.having, query.is_distinct_from, query.is_null, query.order_by, query.order_by_keys, query.select, query.where_eq, types.boolean, types.decimal, types.i16, types.i32, types.i64, types.text
+# requires: ddl.create_table, ddl.not_null, ddl.primary_key, dml.insert, dml.insert_multi_row, expr.between, expr.ilike, expr.in_list, expr.not_equal, expr.parens, query.aggregates, query.comparison_order, query.group_by, query.having, query.is_distinct_from, query.is_null, query.order_by, query.order_by_keys, query.select, query.where_eq, types.boolean, types.decimal, types.i16, types.i32, types.i64, types.text
 
 # --- seed 1 ---
 statement ok
@@ -153,7 +153,7 @@ statement ok
 INSERT INTO g7 VALUES (1, TRUE, 'x', 1), (2, FALSE, 'Cat', -32768), (3, FALSE, 'banana', -32767), (4, FALSE, NULL, -7), (5, FALSE, 'dog', -721), (6, FALSE, 'x', 248), (7, TRUE, 'mango', 9), (8, TRUE, 'ab', -1)
 
 query BTID nosort
-SELECT a, b, count(id), avg(id) FROM g7 WHERE c > -979 GROUP BY a, b ORDER BY a, b COLLATE "C"
+SELECT a, b, count(id), avg(id) FROM g7 WHERE c > -979 GROUP BY a, b ORDER BY a, b
 ----
 false
 dog
@@ -235,7 +235,7 @@ statement ok
 INSERT INTO g10 VALUES (1, NULL, 0, NULL), (2, 'apple', 368, -2), (3, 'Apple', 3, 822), (4, 'Mango', NULL, 3), (5, 'AB', -2147483647, NULL), (6, 'x', NULL, -285), (7, NULL, 2, 368), (8, 'Mango', -2147483648, 270), (9, NULL, 2, -815), (10, 'Mango', NULL, NULL), (11, 'banana', -2147483647, NULL)
 
 query TIII nosort
-SELECT a, b, count(*), sum(b) FROM g10 WHERE a IS NOT NULL GROUP BY a, b HAVING sum(c) >= -38 ORDER BY a COLLATE "C", b
+SELECT a, b, count(*), sum(b) FROM g10 WHERE a IS NOT NULL GROUP BY a, b HAVING sum(c) >= -38 ORDER BY a, b
 ----
 Apple
 3
@@ -293,7 +293,7 @@ statement ok
 INSERT INTO g12 VALUES (1, -582.74, FALSE, 32766, 'cat'), (2, -581, FALSE, 10, 'dog'), (3, -365.45, NULL, 32766, 'AB'), (4, -665, FALSE, 1, 'Cat'), (5, 395.75, NULL, 0, 'dog'), (6, -162.02, NULL, -7, 'ab'), (7, -818.97, TRUE, 1, 'banana')
 
 query IDD rowsort
-SELECT id, a, avg(a) FROM g12 WHERE d COLLATE "C" > 'BANANA' GROUP BY id, a
+SELECT id, a, avg(a) FROM g12 WHERE d > 'BANANA' GROUP BY id, a
 ----
 1
 -582.74
@@ -333,7 +333,7 @@ statement ok
 INSERT INTO g14 VALUES (1, 'ZZ', 0), (2, 'dog', -6), (3, 'z', 10), (4, 'AB', -1), (5, 'BANANA', 3), (6, 'AB', -10), (7, 'mango', 1), (8, NULL, -3), (9, 'z', -9), (10, NULL, -5)
 
 query TII rowsort
-SELECT a, b, sum(id) FROM g14 WHERE a COLLATE "C" ILIKE 'cat' GROUP BY a, b HAVING sum(b) >= -47
+SELECT a, b, sum(id) FROM g14 WHERE a ILIKE 'cat' GROUP BY a, b HAVING sum(b) >= -47
 ----
 
 # --- seed 15 ---
@@ -344,7 +344,7 @@ statement ok
 INSERT INTO g15 VALUES (1, 'x', -1, FALSE), (2, 'ZZ', 0, NULL), (3, 'Cat', -9, FALSE), (4, 'dog', 32767, TRUE), (5, 'Cat', 32767, TRUE), (6, 'Cat', NULL, FALSE), (7, 'AB', 9, FALSE), (8, 'banana', 3, TRUE), (9, 'cat', -10, FALSE), (10, 'BANANA', NULL, TRUE), (11, 'ab', -7, FALSE)
 
 query TID nosort
-SELECT a, b, avg(id) FROM g15 WHERE (a COLLATE "C" < 'Apple' AND id IN (-172, -352, 383)) GROUP BY a, b ORDER BY a COLLATE "C", b
+SELECT a, b, avg(id) FROM g15 WHERE (a < 'Apple' AND id IN (-172, -352, 383)) GROUP BY a, b ORDER BY a, b
 ----
 
 # --- seed 16 ---
@@ -355,7 +355,7 @@ statement ok
 INSERT INTO g16 VALUES (1, 10, FALSE, 'z', -5), (2, 2, TRUE, 'banana', 7), (3, 2147483647, FALSE, 'Cat', 877), (4, 2147483647, FALSE, 'AB', 2), (5, -9, FALSE, 'x', -855), (6, -7, FALSE, 'Mango', 473), (7, 2147483647, TRUE, 'mango', -6), (8, -1, FALSE, 'mango', 0)
 
 query ITITD rowsort
-SELECT a, c, count(b), max(c COLLATE "C"), avg(d) FROM g16 WHERE id BETWEEN 318 AND 377 GROUP BY a, c
+SELECT a, c, count(b), max(c), avg(d) FROM g16 WHERE id BETWEEN 318 AND 377 GROUP BY a, c
 ----
 
 # --- seed 17 ---
@@ -399,7 +399,7 @@ statement ok
 INSERT INTO g20 VALUES (1, NULL, 'apple', 214, -1), (2, 'Cat', 'banana', NULL, 32766), (3, 'ZZ', 'ZZ', 0, 867), (4, 'ZZ', 'ZZ', 8, -413), (5, NULL, 'ZZ', 0, 4), (6, 'BANANA', 'banana', NULL, 4), (7, 'mango', 'AB', 4, 0), (8, 'Cat', 'banana', 0, -6)
 
 query ITTT rowsort
-SELECT id, max(b COLLATE "C"), max(b COLLATE "C"), min(a COLLATE "C") FROM g20 WHERE (b COLLATE "C" IS DISTINCT FROM 'apple' AND d IS DISTINCT FROM -65) GROUP BY id HAVING count(*) < 1
+SELECT id, max(b), max(b), min(a) FROM g20 WHERE (b IS DISTINCT FROM 'apple' AND d IS DISTINCT FROM -65) GROUP BY id HAVING count(*) < 1
 ----
 
 # --- seed 21 ---
@@ -468,3 +468,132 @@ banana
 9223372036854775807
 x
 -9
+
+# --- seed 26 ---
+statement ok
+CREATE TABLE g26 (id i32 PRIMARY KEY, a boolean NOT NULL, b i16 NOT NULL, c decimal)
+
+statement ok
+INSERT INTO g26 VALUES (1, FALSE, 4, NULL), (2, FALSE, 766, -944.12), (3, TRUE, 2, 693.28), (4, FALSE, 10, -832.96), (5, FALSE, -153, 692), (6, FALSE, 32767, 331.70), (7, FALSE, -32768, 851.57), (8, TRUE, 815, 510), (9, TRUE, -8, 981)
+
+query IBD rowsort
+SELECT id, a, avg(b) FROM g26 WHERE c IS NOT NULL GROUP BY id, a
+----
+2
+false
+766.0000000000000000
+3
+true
+2.0000000000000000
+4
+false
+10.0000000000000000
+5
+false
+-153.0000000000000000
+6
+false
+32767.000000000000
+7
+false
+-32768.000000000000
+8
+true
+815.0000000000000000
+9
+true
+-8.0000000000000000
+
+# --- seed 27 ---
+statement ok
+CREATE TABLE g27 (id i16 PRIMARY KEY, a i16, b i16)
+
+statement ok
+INSERT INTO g27 VALUES (1, 0, -6), (2, 5, NULL), (3, 9, NULL), (4, -284, NULL), (5, -813, NULL), (6, 5, -5), (7, NULL, -849)
+
+query IIII rowsort
+SELECT id, a, sum(b), min(id) FROM g27 WHERE id IN (-132) GROUP BY id, a
+----
+
+# --- seed 28 ---
+statement ok
+CREATE TABLE g28 (id i32 PRIMARY KEY, a decimal NOT NULL, b i16, c text)
+
+statement ok
+INSERT INTO g28 VALUES (1, 804.24, -32767, 'ZZ'), (2, -940.96, -4, 'Mango'), (3, -891.04, -10, 'ab'), (4, -372.58, 0, 'banana'), (5, -463.86, NULL, 'dog'), (6, -13.05, NULL, 'banana'), (7, -749.83, 32766, 'cat'), (8, 541, 10, NULL), (9, 191.91, 2, NULL), (10, -125.34, NULL, 'BANANA')
+
+query IDIII nosort
+SELECT id, a, count(*), count(*), count(b) FROM g28 WHERE NOT (b IS NOT DISTINCT FROM -47) GROUP BY id, a ORDER BY id, a
+----
+1
+804.24
+1
+1
+1
+2
+-940.96
+1
+1
+1
+3
+-891.04
+1
+1
+1
+4
+-372.58
+1
+1
+1
+5
+-463.86
+1
+1
+0
+6
+-13.05
+1
+1
+0
+7
+-749.83
+1
+1
+1
+8
+541
+1
+1
+1
+9
+191.91
+1
+1
+1
+10
+-125.34
+1
+1
+0
+
+# --- seed 29 ---
+statement ok
+CREATE TABLE g29 (id i16 PRIMARY KEY, a decimal NOT NULL, b i16)
+
+statement ok
+INSERT INTO g29 VALUES (1, -277.94, 10), (2, 998.36, 191), (3, -521, 32766), (4, 403.78, 229), (5, -721.32, -8), (6, -384, NULL)
+
+query DD rowsort
+SELECT a, avg(b) FROM g29 WHERE (id BETWEEN -715 AND 580 AND id NOT BETWEEN -44 AND 490) GROUP BY a
+----
+
+# --- seed 30 ---
+statement ok
+CREATE TABLE g30 (id i64 PRIMARY KEY, a i64, b i32)
+
+statement ok
+INSERT INTO g30 VALUES (1, 7, 8), (2, -4, -938), (3, NULL, NULL), (4, 508, 7), (5, NULL, 2147483646), (6, 1, NULL), (7, 9223372036854775807, -2147483648)
+
+query III rowsort
+SELECT id, b, max(id) FROM g30 WHERE b BETWEEN 438 AND 555 GROUP BY id, b
+----

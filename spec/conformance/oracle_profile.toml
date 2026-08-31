@@ -1,0 +1,119 @@
+# Oracle profile — the DECLARED configuration of the live PostgreSQL oracle
+# (CLAUDE.md §1/§5/§7; scripts/lib/pg_oracle.rb).
+#
+# PostgreSQL is jed's behavioral default (§1), and the corpus's expected output is filled from a
+# live PG server (§7). But "PostgreSQL" is not one behavior: a cluster's locale provider, its
+# tzdata set, and a dozen session GUCs all change what that server answers — in VALUES, not just
+# in formatting. Left implicit, the corpus is calibrated against whatever the nearest server
+# happened to default to, and a differently-configured one silently imports different answers.
+#
+# This file makes that configuration DATA (§5): the cluster facts the harness ASSERTS, and the
+# session settings it APPLIES. `PgOracle` reads both — it aborts on a cluster mismatch and emits
+# the session pins into every probe's `SET LOCAL` preamble.
+#
+# Changing a value here changes what the oracle answers. Treat it as a spec edit: re-run
+# `rake corpus:check` over the oracle-checkable corpus before committing.
+
+schema_version = 1
+
+# --- ASSERTED: cluster/database facts the harness cannot set --------------------------------
+#
+# A mismatch is a hard abort. Importing corpus expectations from an undeclared oracle is the
+# exact failure this file exists to prevent.
+[cluster]
+# PG major version. Deliberately pinned, not a floor: at least one ledger entry is genuinely
+# version-bound (types/decimal.test's numeric(5,7), which PG 18 accepts). The goal is a DECLARED
+# version dependency, not a version-agnostic oracle.
+pg_major = 18
+
+# pg_database.datlocprovider — "c" = libc, "b" = builtin, "i" = icu.
+#
+# "b" (builtin) is load-bearing, not incidental. libc and ICU collations are supplied by the HOST:
+# glibc, macOS libc, and ICU order the same strings differently, and any of them can reorder across
+# a library upgrade (the well-known cause of silent index corruption after an OS upgrade —
+# types.md §11 files it as the reason jed does not use them either). An oracle on a host-supplied
+# collation is calibrated to one machine's PostgreSQL, not to PostgreSQL. PG 17+'s builtin provider
+# consults no external library and is defined by the standard's byte semantics, so it answers
+# identically on every host and every build.
+locale_provider = "b"
+
+# The provider's locale identifier. For "c" this is datcollate (and datctype, asserted equal);
+# for "b"/"i" it is datlocale.
+#
+# C.UTF-8 under the builtin provider is code-point collation + full Unicode ctype — which is
+# exactly jed's model: the single defined `C` collation is UTF-8 byte = code-point order
+# (types.md §11), with casing supplied by the loaded JUCD bundle rather than by the collation.
+# Verified against the live server: ordering agrees with jed on every case the collation override
+# entries used to cover, and casing / LIKE / ILIKE / equality are byte-identical to the previous
+# en_US.utf8 configuration — so this value moves collation ORDERING and nothing else.
+locale = "C.UTF-8"
+
+encoding = "UTF8"
+
+# The database the oracle probes run against. A dedicated database, not the cluster's default:
+# a database's locale is fixed at CREATE time, so matching jed's collation means creating one
+# (`rake oracle:setup`). It also keeps replayed corpus DDL off the default database. The harness
+# names it explicitly (`psql -d`), so it does not depend on the PGDATABASE env.
+database = "jed_oracle"
+
+# --- REPORTED: facts that vary per PG build, warned about rather than enforced ---------------
+[cluster.tzdata]
+# Whether the server's tzdata carries the legacy backward-compatibility zone names (US/Eastern
+# and friends). The postgres:18 image ships without them (487 zones, 0 matching `US/%`), which is
+# what expr/at_time_zone.test's override records. Another PG build usually HAS them, making that
+# override a silent no-op rather than an error — so a flip is a WARNING naming the entry, never a
+# hard failure. jed resolves these links from its own JTZ bundle either way (timezones.md §4).
+backward_links = false
+
+# --- APPLIED: emitted as `SET LOCAL` in every probe's preamble, in this order ----------------
+#
+# Every value below is the measured default of the declared cluster, so pinning them is
+# behavior-preserving — they close the hole where a differently-configured server changes answers,
+# without changing today's. Every key is context=user in pg_settings (settable via SET LOCAL) and
+# is scoped to the probe's BEGIN…ROLLBACK.
+#
+# `TimeZone` is deliberately ABSENT: it is per-record (the `# timezone:` directive) and is set by
+# PgOracle from the record, not from this table.
+[session]
+# Output format AND ambiguous-literal INPUT parsing. initdb derives this from LC_TIME, so a cluster
+# initdb'd under a non-US locale gets "ISO, DMY" and reinterprets ambiguous date literals. The
+# sharpest edge in this table.
+DateStyle = "ISO, MDY"
+
+# Interval rendering. "iso_8601" would rewrite every interval expectation in the corpus.
+IntervalStyle = "postgres"
+
+# Float rendering: 1 = shortest round-trip (the conformance `R` tag, float.md §9).
+extra_float_digits = "1"
+
+# bytea rendering: hex vs the legacy escape form.
+bytea_output = "hex"
+
+# Backslash handling inside string literals.
+standard_conforming_strings = "on"
+
+# Byte-level fidelity of returned values.
+client_encoding = "UTF8"
+
+# Equivalent to the "$user", public default here: the `postgres` role owns no schema of its own,
+# so unqualified corpus DDL lands in public either way. Explicit beats inherited.
+search_path = "public"
+
+# SEMANTIC, not cosmetic: `on` rewrites `expr = NULL` into `expr IS NULL`.
+transform_null_equals = "off"
+
+# NULL handling when parsing array literals.
+array_nulls = "on"
+
+# Backslash-quote handling in string literals.
+backslash_quote = "safe_encoding"
+
+# Timezone abbreviation table used when parsing/rendering zone abbreviations.
+timezone_abbreviations = "Default"
+
+# to_char/to_number formatting and the money type. jed implements NONE of those today (no to_char,
+# no to_number, no money), so these have no consumer in the oracle path — pinned to the
+# locale-independent C so they cannot acquire one silently.
+lc_numeric = "C"
+lc_time = "C"
+lc_monetary = "C"
