@@ -8,22 +8,9 @@ services:
       - devstate-local:/persist/local
       - devstate-shared:/persist/shared
     command: sleep infinity
-    environment:
-      # PostgreSQL connection settings for the differential oracle and the benchmark harnesses.
-      #
-      # PGHOST is deliberately ABSENT. The oracle is no longer a separate `db` service on a shared
-      # socket volume — it is a cluster this checkout owns, under .dev/postgres, created by
-      # `rake db:init` and supervised by process-compose (../process-compose.yaml), exactly as a
-      # native macOS worktree runs it. Its endpoint is per-checkout (the socket directory and port
-      # come from the allocated block), so it cannot be a static container-wide value; it lives in
-      # .dev/ports.env, which mise loads (../mise.toml [env]). Setting PGHOST here would override
-      # that and point every tool at a server this container no longer runs.
-      #
-      # PGUSER/PGDATABASE stay: they are host-independent, and initdb creates the postgres role and
-      # database in the per-checkout cluster just as the old image did. Auth is `local all all
-      # trust`, so no password is needed over the socket.
-      PGUSER: postgres
-      PGDATABASE: postgres
+    # PostgreSQL connection settings come entirely from the checkout-local .dev/*.env files that
+    # mise loads. Keeping PGHOST/PGPORT/PGUSER/PGDATABASE together there makes this container and
+    # native macOS use the same environment instead of layering container-only defaults over it.
 
 volumes:
   # per-container persistence (unique per devcontainer instance via project-name prefix)

@@ -874,7 +874,8 @@ dev` starts it; the retired `db` compose service is what this replaced). One clu
 means destructive resets stay local and two checkouts run at once. It is reached over a
 **Unix-domain socket** (trust auth) whose port comes from the checkout's own allocation
 (`port-tamer.toml` → `.dev/ports.env`) and whose directory is derived from it (`.dev/derived.env`),
-both loaded by mise — so bare `psql` or `rake
+which also supplies the fixed `PGUSER=postgres` / `PGDATABASE=postgres` libpq defaults; both files
+are loaded by mise — so bare `psql` or `rake
 corpus:check[<repo-root path>]` just works, and **`PGHOST` and `PGPORT` must never be set
 independently of each other** (one without the other names a real port on the wrong server, and
 libpq then hunts a socket that cannot exist — the recurring foot-gun). Its **configuration is declared data**, not whatever the nearest server defaults to:

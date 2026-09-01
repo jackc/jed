@@ -34,7 +34,8 @@ process-compose = '1.122.0'
 #
 #   .dev/ports.env     port-tamer's state file (port-tamer.toml declares the names). NAME=<port>
 #                      lines only; port-tamer rewrites it canonically and rejects anything else.
-#   .dev/derived.env   what this project computes from that allocation (PGHOST) — scripts/devenv.rb.
+#   .dev/derived.env   checkout-local PostgreSQL connection defaults (PGHOST, PGUSER, PGDATABASE)
+#                      — scripts/devenv.rb.
 #
 # Both are generated per checkout and gitignored; `mise run dev:init` (or dev:ports:ensure) creates
 # them. Their absence is not an error — mise skips a missing file, the vite/playwright configs fall

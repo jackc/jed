@@ -50,7 +50,7 @@ A git worktree is the native equivalent of a second devcontainer instance. Each 
 ```
 .dev/                   # gitignored, per-checkout runtime state
   ports.env             # this checkout's TCP ports (port-tamer's state file)
-  derived.env           # values computed from them — PGHOST
+  derived.env           # PostgreSQL defaults — PGHOST, PGUSER, PGDATABASE
   postgres/data         # this checkout's PostgreSQL cluster
 ```
 
@@ -97,7 +97,9 @@ than importing different answers. Consequences worth internalising:
   means you have not run `mise run dev` in this checkout.
 - **`PGHOST` and `PGPORT` are a pair.** They come from `.dev/` via mise — `PGPORT` from the
   allocation, `PGHOST` derived from it. Setting one without the other names a real port on the
-  wrong server, and the error will name a socket path nothing ever created.
+  wrong server, and the error will name a socket path nothing ever created. The same generated
+  environment sets `PGUSER=postgres` and `PGDATABASE=postgres`, matching the role and database
+  created by `initdb` on both macOS and in the devcontainer.
 - **Changing a profile value changes what the oracle answers.** Treat it as a spec edit and re-run
   `rake corpus:check` over the oracle-checkable corpus.
 - When sweeping many corpus files, `rake oracle:reset` between them — a `.test` carrying its own
