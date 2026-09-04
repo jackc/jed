@@ -153,6 +153,27 @@ test("text param inference", () => {
   assert.deepStrictEqual(ints(rows(db, "SELECT id FROM t WHERE name = $1", [text("bob")])), [2n]);
 });
 
+test("COALESCE infers params from its common type", () => {
+  // COALESCE resolves its arguments before it knows their common type, then feeds that type back
+  // to bare parameters before binding (grammar.md §51).
+  const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)"]);
+  assert.deepStrictEqual(ints(rows(db, "SELECT COALESCE($1, 10)", [intValue(7n)])), [7n]);
+  assert.deepStrictEqual(ints(rows(db, "SELECT COALESCE(NULL, $1, 10)", [intValue(7n)])), [7n]);
+});
+
+test("CASE infers params from its common result type", () => {
+  // CASE result arms use the same common-type feedback as COALESCE (grammar.md §23).
+  const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)"]);
+  assert.deepStrictEqual(
+    ints(rows(db, "SELECT CASE WHEN true THEN $1 ELSE 10 END", [intValue(7n)])),
+    [7n],
+  );
+  assert.deepStrictEqual(
+    ints(rows(db, "SELECT CASE WHEN false THEN 10 ELSE $1 END", [intValue(7n)])),
+    [7n],
+  );
+});
+
 test("LEAST infers a param from its common type", () => {
   // GREATEST/LEAST note a bare parameter at their unified scalar type, like a comparison operand
   // (grammar.md §52). Source branch A skipped this, so LEAST($1, 10) failed 42P18. A per-core test

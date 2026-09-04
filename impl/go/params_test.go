@@ -169,6 +169,35 @@ func TestTextParamInference(t *testing.T) {
 	}
 }
 
+func TestCoalesceInfersParamsFromCommonType(t *testing.T) {
+	// COALESCE resolves its arguments before it knows their common type, then feeds that type back
+	// to bare parameters before binding (grammar.md §51).
+	t.Parallel()
+	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")
+	rows := queryRows(t, db, "SELECT COALESCE($1, 10)", IntValue(7))
+	if len(rows) != 1 || rows[0][0].Int != 7 {
+		t.Fatalf("first argument: got %v want [[7]]", rows)
+	}
+	rows = queryRows(t, db, "SELECT COALESCE(NULL, $1, 10)", IntValue(7))
+	if len(rows) != 1 || rows[0][0].Int != 7 {
+		t.Fatalf("middle argument: got %v want [[7]]", rows)
+	}
+}
+
+func TestCaseInfersParamsFromCommonResultType(t *testing.T) {
+	// CASE result arms use the same common-type feedback as COALESCE (grammar.md §23).
+	t.Parallel()
+	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")
+	rows := queryRows(t, db, "SELECT CASE WHEN true THEN $1 ELSE 10 END", IntValue(7))
+	if len(rows) != 1 || rows[0][0].Int != 7 {
+		t.Fatalf("THEN arm: got %v want [[7]]", rows)
+	}
+	rows = queryRows(t, db, "SELECT CASE WHEN false THEN 10 ELSE $1 END", IntValue(7))
+	if len(rows) != 1 || rows[0][0].Int != 7 {
+		t.Fatalf("ELSE arm: got %v want [[7]]", rows)
+	}
+}
+
 func TestLeastInfersParamFromCommonType(t *testing.T) {
 	// GREATEST/LEAST note a bare parameter at their unified scalar type, like a comparison operand
 	// (grammar.md §52). Source branch A skipped this, so LEAST($1, 10) failed 42P18. A per-core

@@ -224,6 +224,35 @@ fn text_param_inference() {
 }
 
 #[test]
+fn coalesce_infers_params_from_common_type() {
+    // COALESCE resolves its arguments before it knows their common type, then feeds that type back
+    // to bare parameters before binding (grammar.md §51).
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
+    let first = rows(&mut db, "SELECT COALESCE($1, 10)", &[Value::Int(7)]);
+    assert_eq!(first, vec![vec![Value::Int(7)]]);
+    let middle = rows(&mut db, "SELECT COALESCE(NULL, $1, 10)", &[Value::Int(7)]);
+    assert_eq!(middle, vec![vec![Value::Int(7)]]);
+}
+
+#[test]
+fn case_infers_params_from_common_result_type() {
+    // CASE result arms use the same common-type feedback as COALESCE (grammar.md §23).
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
+    let then_arm = rows(
+        &mut db,
+        "SELECT CASE WHEN true THEN $1 ELSE 10 END",
+        &[Value::Int(7)],
+    );
+    assert_eq!(then_arm, vec![vec![Value::Int(7)]]);
+    let else_arm = rows(
+        &mut db,
+        "SELECT CASE WHEN false THEN 10 ELSE $1 END",
+        &[Value::Int(7)],
+    );
+    assert_eq!(else_arm, vec![vec![Value::Int(7)]]);
+}
+
+#[test]
 fn least_infers_param_from_common_type() {
     // GREATEST/LEAST note a bare parameter at their unified scalar type, like a comparison operand
     // (grammar.md §52). Source branch A skipped this, so LEAST($1, 10) failed 42P18. A per-core

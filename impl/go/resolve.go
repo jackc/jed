@@ -1928,6 +1928,22 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
+		// A bare parameter in a result arm takes the unified scalar type. The first pass had no
+		// result context, so it recorded the occurrence as unresolved; feed the common type back
+		// before statement-wide parameter finalization (api.md §5, grammar.md §23).
+		hint := scalarForParamHint(unified)
+		for _, w := range e.Case.Whens {
+			if w.Result.Kind == exprParam {
+				if err := params.note(int(w.Result.Param)-1, hint); err != nil {
+					return nil, resolvedType{}, err
+				}
+			}
+		}
+		if e.Case.Els != nil && e.Case.Els.Kind == exprParam {
+			if err := params.note(int(e.Case.Els.Param)-1, hint); err != nil {
+				return nil, resolvedType{}, err
+			}
+		}
 		return &rExpr{kind: reCase, caseArms: arms, caseEls: rels, caseDecimal: unified.kind == rtDecimal},
 			unified, nil
 	case exprCoalesce:
@@ -1947,6 +1963,16 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		unified, err := unifyCaseTypes(argTypes, "COALESCE types must be compatible")
 		if err != nil {
 			return nil, resolvedType{}, err
+		}
+		// A bare parameter argument takes COALESCE's unified scalar type. Each argument was
+		// initially resolved without sibling context, so record the derived type now.
+		hint := scalarForParamHint(unified)
+		for _, a := range e.Coalesce {
+			if a.Kind == exprParam {
+				if err := params.note(int(a.Param)-1, hint); err != nil {
+					return nil, resolvedType{}, err
+				}
+			}
 		}
 		return &rExpr{kind: reCoalesce, sargs: args, caseDecimal: unified.kind == rtDecimal},
 			unified, nil

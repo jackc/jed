@@ -32,6 +32,11 @@ You pass **native values**, not engine `Value`s — the ergonomic layer converts
 floats, booleans, strings, byte arrays, and `NULL` all map across. This keeps user data **out of the
 SQL string**, so there is no string-interpolation injection surface.
 
+Each placeholder's static type comes from its SQL context: a compared column, an arithmetic sibling,
+an `INSERT`/`UPDATE` target, a cast, or the common result type of `CASE`, `COALESCE`, `GREATEST`, and
+`LEAST`. For example, `COALESCE($1, 0)` infers an integer parameter. A bare `SELECT $1` has no type
+context and reports `42P18`; write an explicit cast when the surrounding expression cannot supply one.
+
 A note on integers, because it is the one place the type systems differ. jed integers are 64-bit and
 **exact**. In Rust and Go that is the natural integer type. In TypeScript a `number` is a float, so
 jed uses **`bigint`** for integer values — an integer-valued `number` like `1` still binds as an

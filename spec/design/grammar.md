@@ -1248,7 +1248,8 @@ two forms and is the **first deliberately lazy** expression in the engine.
   `1` / `1.5`); a non-numeric family (text/boolean/bytea) must be homogeneous. A **cross-family**
   mix — e.g. an integer `THEN` and a text `ELSE` — is **`42804`** ("CASE types … cannot be
   matched"). Bare integer-literal arms keep their natural width (defaulting to i64), so width
-  differences from PostgreSQL are unobservable (every integer renders under the `I` tag).
+  differences from PostgreSQL are unobservable (every integer renders under the `I` tag). A bare
+  `$N` result arm adopts the unified scalar result type before parameters are bound (§5).
 - **Cost** ([cost.md](cost.md) §3): one `operator_eval` for the CASE node, plus the
   `operator_eval`s of the conditions tested up to the match and of the selected result only
   (the lazy-eval exception). Output name for a bare `SELECT CASE … END` is `?column?` (§8) —
@@ -2734,7 +2735,8 @@ SELECT COALESCE(a, 1 / a) FROM t                          -- a ≠ NULL ⇒ 1/a 
   are dropped (they adapt); an **all-NULL COALESCE is `text`**; the rest must share a family —
   numerics promote (decimal if any arm is decimal, else the widest integer; an integer result
   widens to decimal at eval when the common type is decimal), a non-numeric family must be
-  homogeneous. A cross-family mix is **`42804`** (`COALESCE types must be compatible`).
+  homogeneous. A cross-family mix is **`42804`** (`COALESCE types must be compatible`). A bare
+  `$N` argument adopts the unified scalar result type before parameters are bound (§5).
 - **Where it is legal**: anywhere an expression is — projections, `WHERE`, `GROUP BY`/`HAVING`,
   `ORDER BY`, `CHECK` constraints, expression `DEFAULT`s, and **index expressions**
   ([indexes.md](indexes.md) §9 — immutable iff its arguments are, like any pure combinator;

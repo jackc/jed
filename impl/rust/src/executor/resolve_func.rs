@@ -4690,6 +4690,20 @@ pub(crate) fn resolve(
             result_types.push(ety);
             // Unify the THEN/ELSE result types into the CASE's common type (the render type).
             let unified = unify_case_types(&result_types, "CASE result types must be compatible")?;
+            // A bare parameter in a result arm takes the unified scalar type. The first pass had no
+            // result context, so it recorded the occurrence as unresolved; feed the common type back
+            // before statement-wide parameter finalization (api.md §5, grammar.md §23).
+            let hint = scalar_for_param_hint(&unified);
+            for (_, result) in whens {
+                if let Expr::Param(n) = result {
+                    params.note((*n as usize) - 1, hint)?;
+                }
+            }
+            if let Some(result) = els {
+                if let Expr::Param(n) = &**result {
+                    params.note((*n as usize) - 1, hint)?;
+                }
+            }
             Ok((
                 RExpr::Case {
                     arms,
@@ -4711,6 +4725,14 @@ pub(crate) fn resolve(
                 arg_types.push(aty);
             }
             let unified = unify_case_types(&arg_types, "COALESCE types must be compatible")?;
+            // A bare parameter argument takes COALESCE's unified scalar type. Each argument was
+            // initially resolved without sibling context, so record the derived type now.
+            let hint = scalar_for_param_hint(&unified);
+            for a in args {
+                if let Expr::Param(n) = a {
+                    params.note((*n as usize) - 1, hint)?;
+                }
+            }
             Ok((
                 RExpr::Coalesce {
                     args: rargs,

@@ -1644,6 +1644,14 @@ export function resolve(
         resultTypes.push({ kind: "null" });
       }
       const unified = unifyCaseTypes(resultTypes, "CASE result types must be compatible");
+      // A bare parameter in a result arm takes the unified scalar type. The first pass had no
+      // result context, so it recorded the occurrence as unresolved; feed the common type back
+      // before statement-wide parameter finalization (api.md §5, grammar.md §23).
+      const hint = scalarForParamHint(unified);
+      for (const w of e.whens) {
+        if (w.result.kind === "param") params.note(w.result.index - 1, hint);
+      }
+      if (e.els?.kind === "param") params.note(e.els.index - 1, hint);
       return {
         node: {
           kind: "case",
@@ -1666,6 +1674,12 @@ export function resolve(
         argTypes.push(ra.type);
       }
       const unified = unifyCaseTypes(argTypes, "COALESCE types must be compatible");
+      // A bare parameter argument takes COALESCE's unified scalar type. Each argument was initially
+      // resolved without sibling context, so record the derived type now.
+      const hint = scalarForParamHint(unified);
+      for (const a of e.args) {
+        if (a.kind === "param") params.note(a.index - 1, hint);
+      }
       return {
         node: {
           kind: "coalesce",
