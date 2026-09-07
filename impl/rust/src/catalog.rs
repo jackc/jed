@@ -154,6 +154,20 @@ impl IndexKey {
     }
 }
 
+/// Timezone data consulted by a persisted expression (index-dependencies.md, format 32).
+#[derive(Clone, PartialEq, Eq, Debug, PartialOrd, Ord)]
+pub struct TimeZoneDep {
+    pub name: String,
+    pub version: String,
+    pub checksum: u32,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct TimeZoneDeps {
+    pub dynamic: bool,
+    pub zones: Vec<TimeZoneDep>,
+}
+
 /// One secondary index of a table (spec/design/indexes.md): its (relation-namespace) name
 /// and its key elements in index-key order (columns and/or expressions, duplicates allowed —
 /// PG). The index's B-tree lives in the snapshot's index-store map, keyed by the lowercased
@@ -181,6 +195,7 @@ pub struct IndexDef {
     /// compares each against the current registry; a mismatch makes the index unusable. Sorted by
     /// `(name, arg_types)`.
     pub host_deps: Vec<HostFuncDep>,
+    pub timezone_deps: TimeZoneDeps,
 }
 
 impl IndexDef {

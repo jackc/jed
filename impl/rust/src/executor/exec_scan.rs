@@ -989,7 +989,11 @@ impl Engine {
             Some(scope) => self.attach_read_snap(&scope.to_ascii_lowercase())?,
         };
         let table = rel.table_name.to_ascii_lowercase();
-        snap.table(&table)?;
+        let def = snap.table(&table)?;
+        // A dynamic timezone set can change independently of the catalog generation.
+        if def.indexes.iter().any(|ix| ix.timezone_deps.dynamic) {
+            return None;
+        }
         Some(EstimatorInputSignature {
             database: snap.estimator_identity.clone(),
             cat_gen: snap.cat_gen,

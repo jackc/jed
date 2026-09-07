@@ -195,6 +195,7 @@ export type IndexDef = {
   // compares each against the current registry; a mismatch makes the index unusable. Sorted by
   // (name, arg-type codes). B-tree only (a GIN/GiST index's keys are plain columns).
   hostDeps?: HostFuncDep[];
+  timezoneDeps?: TimeZoneDeps;
 };
 
 // indexKeyColumn is the column ordinal of a plain column key element, else null (an expression key).
@@ -484,3 +485,7 @@ export function primaryKeyIndex(t: Table): number {
   const idxs = pkIndices(t);
   return idxs.length === 1 ? idxs[0]! : -1;
 }
+
+// Timezone dependencies of persisted expressions (index-dependencies.md, format 32).
+export type TimeZoneDep = { name: string; version: string; checksum: number };
+export type TimeZoneDeps = { dynamic: boolean; zones: TimeZoneDep[] };

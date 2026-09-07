@@ -74,6 +74,15 @@ three forms in one key list (`CREATE INDEX ON t (lower(email), a, (b + 1))`).
   effective collation (jed's ordinary text-collation resolution), not a per-key `COLLATE`.
   (Partial (`WHERE`) indexes have **landed** for B-tree — §9.)
 
+**Expression dependencies.** [index-dependencies.md](index-dependencies.md) is the admission and
+lifetime contract for both keys and predicates. A type does not make an expression volatile:
+`timestamptz IS NULL`, comparisons of instants, and explicit-zone conversions are allowed. Session
+casts, clocks, and other mutable state are rejected even when nested in a null test, CASE, or array.
+Named-zone data is pinned per index; a mismatch excludes the index from read planning and refuses
+writes (`XX002`) until a transactional DROP/CREATE rebuild. Epoch extraction and explicit-zone
+`make_timestamptz` receive stronger argument-sensitive admission than PostgreSQL's blanket STABLE
+classification. UTC interval arithmetic retains jed's existing [interval.md](interval.md) contract.
+
 ## 2. DDL semantics (PG-matched, oracle-probed)
 
 **Namespace.** Index names live in the **relation namespace, shared with tables**
@@ -395,9 +404,7 @@ The catalog reshape (v5) + the unique flag (v6)
 - **Partial-index implication is syntactic** (§9): jed uses a partial index only when the
   WHERE AND-chain **contains a conjunct structurally equal to the index predicate**, where
   PG's planner also matches a query predicate that *implies* the index predicate
-  (`amt > 50 ⟹ amt > 0`). A jed miss is a correct full scan. A partial-index predicate
-  that references a `timestamptz` column/value is conservatively `42P17` (the expression-key
-  hazard); and a partial index is used only via the access-predicate bound (no full
+  (`amt > 50 ⟹ amt > 0`). A jed miss is a correct full scan. A partial index is used only via the access-predicate bound (no full
   partial-index scan, and no partial OR/IN / ORDER-BY-skip / INL path this slice).
 - PG's index machinery (btree opclasses, `USING`, collations, opfamilies) is owned
   surface jed does not implement — we own our surface (CLAUDE.md §1).
@@ -489,10 +496,11 @@ the predicate is validated in this order (PG-agreeing, oracle-probed):
 4. a **non-immutable** call (the entropy/clock/sequence seam — `now`/`clock_timestamp`/
    `current_date`/`uuidv4`/`uuidv7`/`nextval`/…), a resolved **STABLE node** (the runtime
    `text → date` cast or a clock-relative date literal,
-   §1), **or** a **`timestamptz`-dependent** subexpression (one that
-   references a `timestamptz` column or produces a `timestamptz` value — the same conservative
-   session-timezone hazard an expression key carries, §1) → **`42P17`** (`functions in index
-   predicate must be marked IMMUTABLE`).
+   §1), or a session-dependent operation → **`42P17`** (`functions in index
+   predicate must be marked IMMUTABLE`). Admission composes the dependencies of every
+   resolved child, as specified in [index-dependencies.md](index-dependencies.md).
+   `timestamptz` columns and results are allowed: `deleted_at IS NULL`, instant comparisons,
+   and explicit-zone operations are safe. Named-zone operations persist their data dependencies.
 
 The predicate is stored as its **canonical text** (the *Check-expression text* form, exactly as
 a `CHECK` / expression key — `format_version` 27, §6) and re-parsed + re-resolved against the
@@ -534,10 +542,7 @@ index-nested-loop paths keep non-partial indexes only this slice (each a documen
 **Divergences from PostgreSQL** (§7): (a) the implication test is **syntactic** — jed uses a
 partial index only when the WHERE literally contains the predicate conjunct, where PG's prover
 also matches an implying predicate (`amt > 50` query ⟹ `amt > 0` index); a jed miss is a correct
-full scan. (b) A predicate that references a `timestamptz` column or value is conservatively
-**`42P17`** (the expression-key hazard, extended to predicates) — so `WHERE deleted_at IS NULL`
-over a `timestamptz deleted_at` is rejected this slice (relaxable; a `timestamp`/`boolean`
-soft-delete marker works). (c) There is no full partial-index scan without a leading equality/range
+full scan. (b) There is no full partial-index scan without a leading equality/range
 access predicate (a follow-on). Each is a relaxable narrowing, recorded here.
 
 **Introspection.** `jed_indexes` gains a `predicate text` column carrying the canonical predicate

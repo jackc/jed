@@ -966,6 +966,9 @@ func resolveTimezone(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 	default:
 		return nil, resolvedType{}, noFuncOverload("timezone")
 	}
+	if err := params.noteIndexZone(zoneR); err != nil {
+		return nil, resolvedType{}, err
+	}
 	return &rExpr{kind: reAtTimeZone, lhs: zoneR, rhs: valueR, atTzToTimestamptz: toTimestamptz}, result, nil
 }
 
@@ -1010,6 +1013,13 @@ func resolveDateTrunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 			return nil, resolvedType{}, noFuncOverload("date_trunc")
 		}
 		sargs = append(sargs, zoneR)
+	}
+	if len(sargs) == 3 {
+		if err := params.noteIndexZone(sargs[2]); err != nil {
+			return nil, resolvedType{}, err
+		}
+	} else {
+		params.nonimmutable = params.nonimmutable || valueT.kind == rtTimestamptz
 	}
 	return &rExpr{kind: reDateTrunc, sargs: sargs}, result, nil
 }
@@ -2826,6 +2836,17 @@ func resolveMakeTimestamp(s *scope, name string, fc *funcCallExpr, ag *aggCtx, p
 		}
 		rargs = append(rargs, r)
 	}
+	if isTz {
+		if len(rargs) == 7 {
+			if err := params.noteIndexZone(rargs[6]); err != nil {
+				return nil, resolvedType{}, err
+			}
+		} else {
+			params.nonimmutable = true
+		}
+	} else {
+		params.nonimmutable = params.nonimmutable || desc.Volatility != "immutable"
+	}
 	sf, result := sfMakeTimestamp, scalarTimestamp
 	if isTz {
 		sf, result = sfMakeTimestamptz, scalarTimestamptz
@@ -2880,6 +2901,8 @@ func resolveScalarFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramType
 	// matches (a host-only name, or a host overload over a signature the built-in name does not
 	// accept).
 	if desc := lookupScalarOverload(name, tys); desc != nil {
+		epoch := name == "date_part" && len(rargs) > 0 && rargs[0].kind == reConstText && strings.EqualFold(rargs[0].cText, "epoch")
+		params.nonimmutable = params.nonimmutable || (desc.Volatility != "immutable" && !epoch)
 		fn := scalarFuncID(name, tys)
 		result := scalarResultType(desc.Result, tys)
 		return &rExpr{kind: reScalarFunc, sfunc: fn, sargs: rargs, result: result}, resolvedTypeOf(result), nil

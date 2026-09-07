@@ -4,6 +4,11 @@
 // (CLAUDE.md §10): scan in primary-key order, three-valued WHERE (only TRUE keeps a
 // row), stable ORDER BY with NULLs last (the PostgreSQL model).
 
+import {
+  mergeTimezoneDeps,
+  validateTimezoneDeps,
+  verifyIndexTimezoneDeps,
+} from "./index_dependencies.ts";
 import type {
   AlterTable,
   AlterSequence,
@@ -71,6 +76,7 @@ import {
   type FkAction,
   type ForeignKey,
   type HostFuncDep,
+  type TimeZoneDeps,
   type IdentityKind,
   type IndexDef,
   type IndexKey,
@@ -5656,6 +5662,8 @@ export class Engine {
     def: IndexDef,
     ptypes: ParamTypes = new ParamTypes(),
   ): ResolvedIndex {
+    ptypes.uncacheable ||= def.timezoneDeps?.dynamic ?? false;
+    verifyIndexTimezoneDeps(def.timezoneDeps);
     const keys: ResolvedKey[] = def.keys.map((k) => {
       if (k.kind === "column") return { kind: "column", column: k.column };
       const scope = Scope.single(this, table);
@@ -7460,6 +7468,7 @@ export class Engine {
     // persisted so a reopening binary can re-check them. Empty for the common index with no host
     // function (byte-identical to v30 then).
     const hostDeps: HostFuncDep[] = [];
+    const timezoneDeps: TimeZoneDeps = { dynamic: false, zones: [] };
     for (const elem of ci.keys) {
       // An EXPRESSION key element (spec/design/indexes.md §1/§2): resolve it against the table's
       // columns, validate it is immutable + indexable-typed, and store its canonical text (persisted,
@@ -7474,13 +7483,12 @@ export class Engine {
         }
         // A subquery is not a deterministic function of the row — 0A000 (the resolver admits an
         // uncorrelated one, so it is rejected here, before resolution).
-        if (indexExprHasSubquery(elem.expr)) {
-          throw engineError("feature_not_supported", "cannot use subquery in index expression");
-        }
+        rejectIndexPredicateStructure(elem.expr);
         // Resolve against the table (an aggregate 42803 / window 42P20 / bind parameter 42P02 fall
         // out of the resolver, as for a CHECK).
         const scope = Scope.single(this, table);
         const pt = new ParamTypes();
+        pt.indexContext = true;
         const { node, type: rtype } = resolve(
           scope,
           elem.expr,
@@ -7488,14 +7496,8 @@ export class Engine {
           { collecting: false, groupKeys: [], specs: [] },
           pt,
         );
-        // Immutability (§2): a non-immutable seam/sequence/current_setting call, a
-        // session-timezone-dependent expression (one that reads or produces a timestamptz —
-        // conservatively fail-closed), or a resolved STABLE node (the runtime text→date cast,
-        // flagged at its birth — ParamTypes.nonimmutable), is 42P17.
-        const refs = checkReferencedColumns(elem.expr, columns);
-        const tzHazard =
-          rtype.kind === "timestamptz" || refs.some((i) => typeIsTimestamptz(columns[i]!.type));
-        if (indexExprNonimmutableCall(elem.expr) || tzHazard || pt.nonimmutable) {
+        // Dependencies accumulate at each resolved operation, through every child.
+        if (pt.nonimmutable) {
           throw engineError(
             "invalid_object_definition",
             "functions in index expression must be marked IMMUTABLE",
@@ -7514,6 +7516,7 @@ export class Engine {
         if (this.session.extensions) {
           collectIndexHostDeps(node, this.session.extensions, hostDeps);
         }
+        mergeTimezoneDeps(timezoneDeps, pt.timezoneDeps);
         ciKeys.push({ kind: "expr", exprText: elem.text, expr: elem.expr });
         continue;
       }
@@ -7638,20 +7641,10 @@ export class Engine {
       // the Forbidden-context boolean resolve below.
       rejectIndexPredicateStructure(ci.predicate.expr);
       const predPt = new ParamTypes();
+      predPt.indexContext = true;
       const predNode = resolveBooleanFilter(Scope.single(this, table), ci.predicate.expr, predPt);
-      // Immutability (§9), the same rule an expression key carries: a non-immutable seam/clock/sequence
-      // call, a timestamptz-dependent subexpression (references a timestamptz column — conservatively
-      // fail-closed), or a resolved STABLE node (the runtime text→date cast, ParamTypes.nonimmutable),
-      // is 42P17.
-      let tzHazard = false;
-      for (const ref of checkReferencedColumns(ci.predicate.expr, columns)) {
-        const sc = typeAsScalar(columns[ref]!.type);
-        if (sc === "timestamptz") {
-          tzHazard = true;
-          break;
-        }
-      }
-      if (indexExprNonimmutableCall(ci.predicate.expr) || tzHazard || predPt.nonimmutable) {
+      // Dependencies accumulate at each resolved operation, through every child.
+      if (predPt.nonimmutable) {
         throw engineError(
           "invalid_object_definition",
           "functions in index predicate must be marked IMMUTABLE",
@@ -7662,6 +7655,7 @@ export class Engine {
       if (this.session.extensions) {
         collectIndexHostDeps(predNode, this.session.extensions, hostDeps);
       }
+      mergeTimezoneDeps(timezoneDeps, predPt.timezoneDeps);
       predicate = { exprText: ci.predicate.text, expr: ci.predicate.expr };
     }
     // relationTaken checks the namespace of the target scope: an attachment's OWN snapshot for an
@@ -7712,6 +7706,7 @@ export class Engine {
     // on-disk arg-type codes) so registration order never leaks into the file bytes. undefined when
     // the index calls no host function, keeping the catalog entry byte-identical to v30.
     hostDeps.sort(compareHostDeps);
+    validateTimezoneDeps(timezoneDeps);
     const def: IndexDef = {
       name,
       keys: ciKeys,
@@ -7719,6 +7714,7 @@ export class Engine {
       kind,
       predicate,
       hostDeps: hostDeps.length > 0 ? hostDeps : undefined,
+      timezoneDeps,
     };
     // Resolve the index once (column ordinals + resolved expression keys); an env for any expression
     // key (a fresh statement rng — index expressions are immutable, so it is never read).
@@ -14248,7 +14244,8 @@ export class Engine {
     }
     if (snap === null) return null;
     const table = rel.tableName.toLowerCase();
-    if (!snap.tables.has(table)) return null;
+    const def = snap.tableByKey(table);
+    if (!def || def.indexes.some((ix) => ix.timezoneDeps?.dynamic)) return null;
     return {
       database: snap.estimatorIdentity,
       catGen: snap.catGen,
@@ -26122,94 +26119,6 @@ export function indexKeyLabel(k: IndexKey, t: Table): string {
   return k.kind === "column" ? t.columns[k.column]!.name : k.exprText;
 }
 
-// indexExprNonimmutableCall reports whether an index-key expression calls a NON-IMMUTABLE built-in
-// (spec/design/indexes.md §2): the entropy/clock seam (`uuidv4`/`uuidv7`/`now`/`clock_timestamp` —
-// `current_timestamp` desugars to `now`) or the sequence functions
-// (`nextval`/`currval`/`setval`/`lastval`) / `current_setting`. Such a function would let the index
-// drift from the table, so it is 42P17 at CREATE INDEX. The walk mirrors checkReferencedColumns
-// (subqueries are already rejected by resolution). The session-timezone hazard (an expression over
-// timestamptz) is handled separately by the caller, so this covers only calls.
-export function indexExprNonimmutableCall(e: Expr): boolean {
-  const isNonimmutable = (name: string): boolean => {
-    switch (name.toLowerCase()) {
-      case "uuidv4":
-      case "uuidv7":
-      case "now":
-      case "clock_timestamp":
-      case "current_date":
-      case "nextval":
-      case "currval":
-      case "setval":
-      case "lastval":
-      case "current_setting":
-        return true;
-      default:
-        return false;
-    }
-  };
-  switch (e.kind) {
-    case "funcCall":
-      return isNonimmutable(e.name) || e.args.some(indexExprNonimmutableCall);
-    case "cast":
-    case "collate":
-      return indexExprNonimmutableCall(e.inner);
-    case "extract":
-      return indexExprNonimmutableCall(e.source);
-    case "unary":
-    case "isNull":
-    case "isJson":
-    case "jsonCtor":
-      return indexExprNonimmutableCall(e.operand);
-    case "jsonExists":
-    case "jsonValue":
-    case "jsonQuery":
-      return indexExprNonimmutableCall(e.ctx) || indexExprNonimmutableCall(e.path);
-    case "binary":
-    case "isDistinct":
-    case "like":
-    case "regex":
-      return indexExprNonimmutableCall(e.lhs) || indexExprNonimmutableCall(e.rhs);
-    case "in":
-      return indexExprNonimmutableCall(e.lhs) || e.list.some(indexExprNonimmutableCall);
-    case "between":
-      return (
-        indexExprNonimmutableCall(e.lhs) ||
-        indexExprNonimmutableCall(e.lo) ||
-        indexExprNonimmutableCall(e.hi)
-      );
-    case "case":
-      return (
-        (e.operand !== null && indexExprNonimmutableCall(e.operand)) ||
-        e.whens.some(
-          (w) => indexExprNonimmutableCall(w.cond) || indexExprNonimmutableCall(w.result),
-        ) ||
-        (e.els !== null && indexExprNonimmutableCall(e.els))
-      );
-    // COALESCE is a pure combinator — immutable iff its arguments are (grammar.md §51).
-    case "coalesce":
-    case "greatestLeast":
-      return e.args.some(indexExprNonimmutableCall);
-    case "row":
-      return e.fields.some(indexExprNonimmutableCall);
-    case "array":
-      return e.elements.some(indexExprNonimmutableCall);
-    case "fieldAccess":
-    case "fieldStar":
-      return indexExprNonimmutableCall(e.base);
-    case "subscript":
-      return (
-        indexExprNonimmutableCall(e.base) ||
-        astSubscriptExprs(e.subscripts).some(indexExprNonimmutableCall)
-      );
-    case "quantified":
-      return indexExprNonimmutableCall(e.lhs) || indexExprNonimmutableCall(e.array);
-    default:
-      // column / qualifiedColumn / literal / typedLiteral / param, and any subquery form (rejected by
-      // resolution before this walk).
-      return false;
-  }
-}
-
 // indexExprHasSubquery reports whether an index-key expression contains a SUBQUERY
 // (spec/design/indexes.md §2): a scalar subquery, EXISTS, IN (subquery), or a quantified subquery.
 // A subquery reads other rows, so it is not a deterministic function of this row — 0A000 at CREATE
@@ -28132,6 +28041,10 @@ export function resolveMakeTimestamp(
     if (!ok) throw noFuncOverload(name);
     rargs.push(r.node);
   }
+  if (isTz) {
+    if (rargs.length === 7) params.noteIndexZone(rargs[6]!);
+    else params.nonimmutable = true;
+  } else params.nonimmutable ||= desc.volatility !== "immutable";
   if (name === "make_date") return scalarFuncNode("make_date", rargs, "date", undefined);
   return isTz
     ? scalarFuncNode("make_timestamptz", rargs, "timestamptz", undefined)
@@ -28207,6 +28120,9 @@ export function resolveScalarFunc(
   } else if (tys.length >= 1 && tys[0].kind === "float") {
     argWidth = tys[0].ty;
   }
+  const epoch = name === "date_part" &&
+    rargs[0]?.kind === "constText" && rargs[0].value.toLowerCase() === "epoch";
+  params.nonimmutable ||= desc.volatility !== "immutable" && !epoch;
   const result = scalarResultType(desc.result, tys);
   return scalarFuncNode(func, rargs, result, argWidth);
 }
@@ -28693,12 +28609,14 @@ export function resolveTimezone(
   // propagates to NULL at eval).
   const zoneOk = zone.type.kind === "text" || zone.type.kind === "null";
   if (zoneOk && value.type.kind === "timestamptz") {
+    params.noteIndexZone(zone.node);
     return {
       node: { kind: "atTimeZone", zone: zone.node, value: value.node, toTimestamptz: false },
       type: { kind: "timestamp" },
     };
   }
   if (zoneOk && value.type.kind === "timestamp") {
+    params.noteIndexZone(zone.node);
     return {
       node: { kind: "atTimeZone", zone: zone.node, value: value.node, toTimestamptz: true },
       type: { kind: "timestamptz" },
@@ -28733,6 +28651,8 @@ export function resolveDateTrunc(
     if (z.type.kind !== "text" && z.type.kind !== "null") throw noFuncOverload("date_trunc");
     zone = z.node;
   }
+  if (zone) params.noteIndexZone(zone);
+  else params.nonimmutable ||= vk === "timestamptz";
   return {
     node: { kind: "dateTrunc", unit: unit.node, value: value.node, zone },
     type: value.type,

@@ -1058,6 +1058,7 @@ pub(crate) fn resolve_timezone(
         (true, ResolvedType::Timestamp) => (true, ResolvedType::Timestamptz),
         _ => return Err(no_func_overload("timezone")),
     };
+    params.note_index_zone(&zone_r)?;
     Ok((
         RExpr::AtTimeZone {
             zone: Box::new(zone_r),
@@ -1106,6 +1107,11 @@ pub(crate) fn resolve_date_trunc(
     } else {
         None
     };
+    if let Some(z) = &zone {
+        params.note_index_zone(z)?;
+    } else {
+        params.nonimmutable |= matches!(result, ResolvedType::Timestamptz);
+    }
     Ok((
         RExpr::DateTrunc {
             unit: Box::new(unit_r),

@@ -117,8 +117,7 @@ A **time-zone-dependent stored key** is the same instance again: a functional in
 the **tzdata version** is the "computation version" and a tzdata bump stales those keys exactly as a
 CLDR reorder stales a collated index — while a *plain* `timestamptz` index is immune, because the
 stored value is UTC and its order uses no tz rule ([timezones.md §2/§8](timezones.md)). Same
-manifest, same verdict — but **latent**, since jed cannot build a tz-derived stored key yet
-([timezones.md §8](timezones.md)).
+dependency policy: format 32 now persists timezone pins for expression and partial indexes ([index-dependencies.md](index-dependencies.md)).
 
 ## 4. The two levers
 
@@ -171,8 +170,7 @@ Every fact a file's interpretation can rest on sits on this ladder, most-portabl
   version, the host loads the data, and skew between them is resolved by the graded verdict (§7/§8).
   Collation's version handling is [collation.md §3/§12](collation.md) (the worked instance, §10 here).
   Tz differs in that its *base type is already version-independent* (UTC instants,
-  [timezones.md §2](timezones.md)), so only *derived* keys reach this tier — and none can be stored
-  yet, so tz's use of this tier is **latent** ([timezones.md §8](timezones.md)).
+  [timezones.md §2](timezones.md)), so only derived expressions reach this tier; expression keys and partial predicates now persist their timezone dependencies ([index-dependencies.md](index-dependencies.md)).
 - **Tier 3 — built-in function semantics in stored expressions.** `DEFAULT`, functional indexes,
   generated columns, views that call built-ins. Gated by function *existence* and *semantics
   version*; read-portable per §4 except VIRTUAL/regular-view positions.
@@ -276,16 +274,13 @@ How each feature registers into the manifest, with its read/write tag and its fa
 - **`DEFAULT expr`** ([constraints.md §2](constraints.md)) — write-time. A missing function ⇒
   table is **read-only** (existing rows read fine; INSERT needing the default fails legibly).
   Constant defaults are folded and depend on nothing.
-- **Functional index** (future, [indexes.md](indexes.md)) — write-time for maintenance,
+- **Functional index** ([indexes.md](indexes.md)) — write-time for maintenance,
   optional for acceleration. Missing/ drifted function ⇒ index **not maintained, not used for
   acceleration**; base table reads via heap-scan; rebuild on re-establishment.
-- **Time-zone-dependent functional index / key** (future, [timezones.md §8](timezones.md)) —
+- **Time-zone-dependent functional index / key** ([timezones.md §8](timezones.md)) —
   write-time; a tzdata-version bump stales keys derived via `AT TIME ZONE 'const'` /
   `date_trunc(…, 'zone')`. Same Tier-2 treatment as collation, with the host-loaded `JTZ` bundle
-  ([timezones.md §4](timezones.md)) once such keys exist: pin one tzdata version per file,
-  version-stamp, degrade to heap-scan + rebuild on migration. **Latent today** — jed cannot build
-  such a key yet ([indexes.md §1](indexes.md)). Plain `timestamptz` keys are immune (UTC, tz-free
-  order), so only zone-derived keys would register here.
+  ([timezones.md §4](timezones.md)). Format 32 pins names, versions, and TZif checksums per index; mismatches exclude it from reads and refuse writes until an atomic rebuild ([index-dependencies.md](index-dependencies.md)). Plain `timestamptz` column keys remain independent of timezone data.
 - **Generated column** (future, [constraints.md](constraints.md)) — **STORED** is write-time
   (value on disk, read-portable); **VIRTUAL** is read-time (computed on read, *not* portable —
   §11). Recommend **STORED-only** (§12).

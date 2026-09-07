@@ -1,3 +1,5 @@
+import type { TimeZoneDeps } from "./catalog.ts";
+import { noteIndexZone } from "./index_dependencies.ts";
 // relOfIndex returns the [label, column-name] of the relation owning a flat row index — used to
 // synthesize a USING/NATURAL join predicate's qualified column references (spec/design/grammar.md
 // §15). The index is known valid (resolution produced it), so the scan always finds an owner.
@@ -935,14 +937,16 @@ export class ParamTypes {
   // execute). A prepared statement's plan cache fills only when this stayed false — flagging at the
   // node's birth is complete regardless of where in the plan tree it lands (spec/design/api.md §2.4).
   uncacheable = false;
-  // nonimmutable is set during resolution when a node is created whose value depends on
-  // statement-execution context rather than its inputs alone: the runtime text→date cast (STABLE —
-  // its input grammar admits the clock-relative specials) and the dateClock clock-relative date
-  // literal ('today'/'now'/…, date.md §6). The expression-index gate consults it to reject such an
-  // expression 42P17 (indexes.md §2), the same way PostgreSQL's stable date_in is unindexable.
-  // Orthogonal to uncacheable: these nodes re-evaluate per execution, so the resolved plan stays
-  // cacheable.
+  // Dependencies accumulate recursively at operation resolution (index-dependencies.md).
+  // Session timezone, clock, entropy, sequences, session variables, and runtime text-to-date
+  // inputs make a persisted expression nonimmutable (42P17). This is separate from plan
+  // cacheability: ordinary queries can evaluate these operations afresh on every execution.
   nonimmutable = false;
+  indexContext = false;
+  timezoneDeps: TimeZoneDeps = { dynamic: false, zones: [] };
+  noteIndexZone(node: RExpr): void {
+    if (this.indexContext) noteIndexZone(this.timezoneDeps, node);
+  }
 
   // note records that $(idx0+1) appears with context type ty (null = no context here). It unifies
   // with any prior inference: equal types agree, two integer widths widen to the wider, an

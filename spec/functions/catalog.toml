@@ -18,6 +18,7 @@ schema_version = 2
 #                 mod, neg, and/or/not, is_null/is_not_null). An operator may be
 #                 OVERLOADED across operand families: e.g. `=` (name "eq") applies
 #                 to both integer×integer and text×text, so there is one [[operator]]
+volatility     = "immutable"
 #                 ROW PER OPERAND-FAMILY SIGNATURE that shares the name+symbol. The
 #                 name is the single AST node (operand types pick the evaluation at
 #                 run time); a row is identified by (name, arg_families). verify.rb
@@ -67,14 +68,9 @@ schema_version = 2
 #                 trailing slot — no required parameter follows a defaulted one, like PG). An
 #                 omitted trailing argument is filled with its default at resolve; the default
 #                 literal ADAPTS to the slot's family (e.g. "0" → f64 for `secs`).
-# volatility      OPTIONAL value-stability class (PostgreSQL's, ../design/functions.md §12),
-#                 absent ⇒ "immutable". "immutable" = same args → same result always (every
-#                 operator + the pure scalar functions); "stable" = fixed within a statement,
-#                 varies across statements (a future now()/the clock seam); "volatile" = may
-#                 differ on every call (uuidv4/uuidv7 — the entropy+clock seam, ../design/
-#                 entropy.md). Marks a call non-foldable for a future constant-folding/CSE pass;
-#                 ADVISORY today (no such pass exists yet — the posture the `cost` field held
-#                 before it went live below).
+# volatility      REQUIRED value-stability class: immutable | stable | volatile.
+#                 Drives persisted-index admission for ordinary resolved scalar overloads;
+#                 argument-sensitive datetime rules live in ../design/index-dependencies.md.
 # variadic        OPTIONAL boolean (scalar functions only — ../design/array-functions.md §12),
 #                 absent ⇒ false. true marks the LAST parameter as VARIADIC (PostgreSQL): the call
 #                 accepts EITHER a SPREAD of trailing arguments — f(a, b, c), each matching the
@@ -105,6 +101,7 @@ schema_version = 2
 # keyword operators with no punctuation symbol. They are the loosest-binding level.
 
 [[operator]]
+volatility     = "immutable"
 name           = "or"
 kind           = "logical"
 arity          = 2
@@ -116,6 +113,7 @@ precedence     = 10
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "and"
 kind           = "logical"
 arity          = 2
@@ -127,6 +125,7 @@ precedence     = 20
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "not"
 kind           = "logical"
 arity          = 1
@@ -152,6 +151,7 @@ errors         = []
 # the SAME operator (the parsers fold `!=` to `<>`), so it needs no catalog row.
 
 [[operator]]
+volatility     = "immutable"
 name           = "eq"
 symbol         = "="
 kind           = "comparison"
@@ -164,6 +164,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ne"
 symbol         = "<>"
 kind           = "comparison"
@@ -176,6 +177,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "lt"
 symbol         = "<"
 kind           = "comparison"
@@ -188,6 +190,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "gt"
 symbol         = ">"
 kind           = "comparison"
@@ -200,6 +203,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "le"
 symbol         = "<="
 kind           = "comparison"
@@ -212,6 +216,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ge"
 symbol         = ">="
 kind           = "comparison"
@@ -236,6 +241,7 @@ errors         = []
 # negation.
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -247,6 +253,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_not_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -269,6 +276,7 @@ errors         = []
 # concatenation (||), and LIKE (../design/types.md §11).
 
 [[operator]]
+volatility     = "immutable"
 name           = "eq"
 symbol         = "="
 kind           = "comparison"
@@ -281,6 +289,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ne"
 symbol         = "<>"
 kind           = "comparison"
@@ -293,6 +302,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "lt"
 symbol         = "<"
 kind           = "comparison"
@@ -305,6 +315,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "gt"
 symbol         = ">"
 kind           = "comparison"
@@ -317,6 +328,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "le"
 symbol         = "<="
 kind           = "comparison"
@@ -329,6 +341,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ge"
 symbol         = ">="
 kind           = "comparison"
@@ -341,6 +354,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -352,6 +366,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_not_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -376,6 +391,7 @@ errors         = []
 # ESCAPE clause and SIMILAR TO remain deferred.
 
 [[operator]]
+volatility     = "immutable"
 name           = "like"
 kind           = "comparison"
 arity          = 2
@@ -391,6 +407,7 @@ errors         = ["22025"]
 # Unicode mappings when one is) both operands before matching, so `_`/length semantics survive.
 # `NOT ILIKE` is its negation (carried by the AST). Same keyword-operator shape as `like`.
 [[operator]]
+volatility     = "immutable"
 name           = "ilike"
 kind           = "comparison"
 arity          = 2
@@ -413,6 +430,7 @@ errors         = ["22025"]
 # comparison level (precedence 35), non-associative. Matching is hand-written per core (a Pike VM,
 # regex.md §4), resolved directly as the AST `Regex` node (like LIKE), not via overload dispatch.
 [[operator]]
+volatility     = "immutable"
 name           = "regex_match"
 symbol         = "~"
 kind           = "comparison"
@@ -425,6 +443,7 @@ precedence     = 35
 errors         = ["2201B"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "regex_imatch"
 symbol         = "~*"
 kind           = "comparison"
@@ -448,6 +467,7 @@ errors         = ["2201B"]
 # `(a = b) = (c = d)`) and `ORDER BY flag`. Boolean⇄integer casts remain deferred (casts.toml).
 
 [[operator]]
+volatility     = "immutable"
 name           = "eq"
 symbol         = "="
 kind           = "comparison"
@@ -460,6 +480,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ne"
 symbol         = "<>"
 kind           = "comparison"
@@ -472,6 +493,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "lt"
 symbol         = "<"
 kind           = "comparison"
@@ -484,6 +506,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "gt"
 symbol         = ">"
 kind           = "comparison"
@@ -496,6 +519,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "le"
 symbol         = "<="
 kind           = "comparison"
@@ -508,6 +532,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ge"
 symbol         = ">="
 kind           = "comparison"
@@ -520,6 +545,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -531,6 +557,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_not_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -551,6 +578,7 @@ errors         = []
 # the integer/text comparisons. No overflow is possible in a comparison, so errors = [].
 
 [[operator]]
+volatility     = "immutable"
 name           = "eq"
 symbol         = "="
 kind           = "comparison"
@@ -563,6 +591,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ne"
 symbol         = "<>"
 kind           = "comparison"
@@ -575,6 +604,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "lt"
 symbol         = "<"
 kind           = "comparison"
@@ -587,6 +617,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "gt"
 symbol         = ">"
 kind           = "comparison"
@@ -599,6 +630,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "le"
 symbol         = "<="
 kind           = "comparison"
@@ -611,6 +643,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ge"
 symbol         = ">="
 kind           = "comparison"
@@ -623,6 +656,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -634,6 +668,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_not_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -655,6 +690,7 @@ errors         = []
 # ops, null_safe for IS [NOT] DISTINCT FROM. No failure is possible, so errors = [].
 
 [[operator]]
+volatility     = "immutable"
 name           = "eq"
 symbol         = "="
 kind           = "comparison"
@@ -667,6 +703,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ne"
 symbol         = "<>"
 kind           = "comparison"
@@ -679,6 +716,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "lt"
 symbol         = "<"
 kind           = "comparison"
@@ -691,6 +729,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "gt"
 symbol         = ">"
 kind           = "comparison"
@@ -703,6 +742,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "le"
 symbol         = "<="
 kind           = "comparison"
@@ -715,6 +755,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ge"
 symbol         = ">="
 kind           = "comparison"
@@ -727,6 +768,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -738,6 +780,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_not_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -760,6 +803,7 @@ errors         = []
 # failure is possible, so errors = [].
 
 [[operator]]
+volatility     = "immutable"
 name           = "eq"
 symbol         = "="
 kind           = "comparison"
@@ -772,6 +816,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ne"
 symbol         = "<>"
 kind           = "comparison"
@@ -784,6 +829,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "lt"
 symbol         = "<"
 kind           = "comparison"
@@ -796,6 +842,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "gt"
 symbol         = ">"
 kind           = "comparison"
@@ -808,6 +855,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "le"
 symbol         = "<="
 kind           = "comparison"
@@ -820,6 +868,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ge"
 symbol         = ">="
 kind           = "comparison"
@@ -832,6 +881,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -843,6 +893,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_not_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -865,6 +916,7 @@ errors         = []
 # equality, null_safe for IS [NOT] DISTINCT FROM. No failure is possible, so errors = [].
 
 [[operator]]
+volatility     = "immutable"
 name           = "eq"
 symbol         = "="
 kind           = "comparison"
@@ -877,6 +929,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ne"
 symbol         = "<>"
 kind           = "comparison"
@@ -889,6 +942,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "lt"
 symbol         = "<"
 kind           = "comparison"
@@ -901,6 +955,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "gt"
 symbol         = ">"
 kind           = "comparison"
@@ -913,6 +968,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "le"
 symbol         = "<="
 kind           = "comparison"
@@ -925,6 +981,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ge"
 symbol         = ">="
 kind           = "comparison"
@@ -937,6 +994,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -948,6 +1006,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_not_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -959,6 +1018,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "eq"
 symbol         = "="
 kind           = "comparison"
@@ -971,6 +1031,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ne"
 symbol         = "<>"
 kind           = "comparison"
@@ -983,6 +1044,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "lt"
 symbol         = "<"
 kind           = "comparison"
@@ -995,6 +1057,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "gt"
 symbol         = ">"
 kind           = "comparison"
@@ -1007,6 +1070,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "le"
 symbol         = "<="
 kind           = "comparison"
@@ -1019,6 +1083,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ge"
 symbol         = ">="
 kind           = "comparison"
@@ -1031,6 +1096,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -1042,6 +1108,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_not_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -1062,6 +1129,7 @@ errors         = []
 # errors = [].
 
 [[operator]]
+volatility     = "immutable"
 name           = "eq"
 symbol         = "="
 kind           = "comparison"
@@ -1074,6 +1142,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ne"
 symbol         = "<>"
 kind           = "comparison"
@@ -1086,6 +1155,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "lt"
 symbol         = "<"
 kind           = "comparison"
@@ -1098,6 +1168,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "gt"
 symbol         = ">"
 kind           = "comparison"
@@ -1110,6 +1181,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "le"
 symbol         = "<="
 kind           = "comparison"
@@ -1122,6 +1194,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ge"
 symbol         = ">="
 kind           = "comparison"
@@ -1134,6 +1207,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -1145,6 +1219,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_not_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -1165,6 +1240,7 @@ errors         = []
 # Same precedence (35) and NULL discipline as the other comparisons; no failure, errors = [].
 
 [[operator]]
+volatility     = "immutable"
 name           = "eq"
 symbol         = "="
 kind           = "comparison"
@@ -1177,6 +1253,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ne"
 symbol         = "<>"
 kind           = "comparison"
@@ -1189,6 +1266,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "lt"
 symbol         = "<"
 kind           = "comparison"
@@ -1201,6 +1279,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "gt"
 symbol         = ">"
 kind           = "comparison"
@@ -1213,6 +1292,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "le"
 symbol         = "<="
 kind           = "comparison"
@@ -1225,6 +1305,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ge"
 symbol         = ">="
 kind           = "comparison"
@@ -1237,6 +1318,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -1248,6 +1330,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_not_distinct_from"
 kind           = "comparison"
 arity          = 2
@@ -1266,6 +1349,7 @@ errors         = []
 # by the grammar, binding at the comparison level (precedence 35).
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_null"
 kind           = "null_test"
 arity          = 1
@@ -1277,6 +1361,7 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "is_not_null"
 kind           = "null_test"
 arity          = 1
@@ -1298,6 +1383,7 @@ errors         = []
 # sign.
 
 [[operator]]
+volatility     = "immutable"
 name           = "add"
 symbol         = "+"
 kind           = "arithmetic"
@@ -1310,6 +1396,7 @@ precedence     = 40
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "sub"
 symbol         = "-"
 kind           = "arithmetic"
@@ -1322,6 +1409,7 @@ precedence     = 40
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "mul"
 symbol         = "*"
 kind           = "arithmetic"
@@ -1334,6 +1422,7 @@ precedence     = 50
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "div"
 symbol         = "/"
 kind           = "arithmetic"
@@ -1351,6 +1440,7 @@ errors         = ["22003", "22012"]
 # catalog function row. PG's mod() is integer/numeric only; jed additionally accepts mod(float), the
 # `%`-over-float extension (float.md §4, oracle_overrides.toml).
 [[operator]]
+volatility     = "immutable"
 name           = "mod"
 symbol         = "%"
 kind           = "arithmetic"
@@ -1366,6 +1456,7 @@ errors         = ["22003", "22012"]
 # has no positive counterpart and traps 22003. Binds tighter than multiplicative.
 
 [[operator]]
+volatility     = "immutable"
 name           = "neg"
 symbol         = "-"
 kind           = "arithmetic"
@@ -1391,6 +1482,7 @@ errors         = ["22003"]
 # sign of a sign-magnitude value, so it can never overflow (errors = []).
 
 [[operator]]
+volatility     = "immutable"
 name           = "add"
 symbol         = "+"
 kind           = "arithmetic"
@@ -1403,6 +1495,7 @@ precedence     = 40
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "sub"
 symbol         = "-"
 kind           = "arithmetic"
@@ -1415,6 +1508,7 @@ precedence     = 40
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "mul"
 symbol         = "*"
 kind           = "arithmetic"
@@ -1427,6 +1521,7 @@ precedence     = 50
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "div"
 symbol         = "/"
 kind           = "arithmetic"
@@ -1439,6 +1534,7 @@ precedence     = 50
 errors         = ["22003", "22012"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "mod"
 symbol         = "%"
 kind           = "arithmetic"
@@ -1451,6 +1547,7 @@ precedence     = 50
 errors         = ["22012"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "neg"
 symbol         = "-"
 kind           = "arithmetic"
@@ -1471,6 +1568,7 @@ errors         = []
 # operator slices (different arg_families). arg_resolution = "none" (one interval type).
 
 [[operator]]
+volatility     = "immutable"
 name           = "add"
 symbol         = "+"
 kind           = "arithmetic"
@@ -1483,6 +1581,7 @@ precedence     = 40
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "sub"
 symbol         = "-"
 kind           = "arithmetic"
@@ -1495,6 +1594,7 @@ precedence     = 40
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "neg"
 symbol         = "-"
 kind           = "arithmetic"
@@ -1517,6 +1617,7 @@ errors         = ["22008"]
 # its order-preserving span key — encoding.md §2.10 — but that is the storage layer, not these ops.)
 
 [[operator]]
+volatility     = "immutable"
 name           = "add"
 symbol         = "+"
 kind           = "arithmetic"
@@ -1529,6 +1630,7 @@ precedence     = 40
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "add"
 symbol         = "+"
 kind           = "arithmetic"
@@ -1541,6 +1643,7 @@ precedence     = 40
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "sub"
 symbol         = "-"
 kind           = "arithmetic"
@@ -1553,6 +1656,7 @@ precedence     = 40
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "add"
 symbol         = "+"
 kind           = "arithmetic"
@@ -1565,6 +1669,7 @@ precedence     = 40
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "add"
 symbol         = "+"
 kind           = "arithmetic"
@@ -1577,6 +1682,7 @@ precedence     = 40
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "sub"
 symbol         = "-"
 kind           = "arithmetic"
@@ -1589,6 +1695,7 @@ precedence     = 40
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "sub"
 symbol         = "-"
 kind           = "arithmetic"
@@ -1601,6 +1708,7 @@ precedence     = 40
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "sub"
 symbol         = "-"
 kind           = "arithmetic"
@@ -1621,6 +1729,7 @@ errors         = ["22008"]
 # factor are not reconciled to one type). Overflow traps 22008; a zero divisor traps 22012.
 
 [[operator]]
+volatility     = "immutable"
 name           = "mul"
 symbol         = "*"
 kind           = "arithmetic"
@@ -1633,6 +1742,7 @@ precedence     = 50
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "mul"
 symbol         = "*"
 kind           = "arithmetic"
@@ -1645,6 +1755,7 @@ precedence     = 50
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "mul"
 symbol         = "*"
 kind           = "arithmetic"
@@ -1657,6 +1768,7 @@ precedence     = 50
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "mul"
 symbol         = "*"
 kind           = "arithmetic"
@@ -1669,6 +1781,7 @@ precedence     = 50
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "div"
 symbol         = "/"
 kind           = "arithmetic"
@@ -1681,6 +1794,7 @@ precedence     = 50
 errors         = ["22008", "22012"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "div"
 symbol         = "/"
 kind           = "arithmetic"
@@ -1709,6 +1823,7 @@ errors         = ["22008", "22012"]
 # but that is the storage layer, not these ops).
 
 [[operator]]
+volatility     = "immutable"
 name           = "add"
 symbol         = "+"
 kind           = "arithmetic"
@@ -1721,6 +1836,7 @@ precedence     = 40
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "add"
 symbol         = "+"
 kind           = "arithmetic"
@@ -1733,6 +1849,7 @@ precedence     = 40
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "sub"
 symbol         = "-"
 kind           = "arithmetic"
@@ -1745,6 +1862,7 @@ precedence     = 40
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "sub"
 symbol         = "-"
 kind           = "arithmetic"
@@ -1757,6 +1875,7 @@ precedence     = 40
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "add"
 symbol         = "+"
 kind           = "arithmetic"
@@ -1769,6 +1888,7 @@ precedence     = 40
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "add"
 symbol         = "+"
 kind           = "arithmetic"
@@ -1781,6 +1901,7 @@ precedence     = 40
 errors         = ["22008"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "sub"
 symbol         = "-"
 kind           = "arithmetic"
@@ -1803,6 +1924,7 @@ errors         = ["22008"]
 # only flips the sign bit (no overflow), but a NaN/Inf operand passes through, so errors = [].
 
 [[operator]]
+volatility     = "immutable"
 name           = "add"
 symbol         = "+"
 kind           = "arithmetic"
@@ -1815,6 +1937,7 @@ precedence     = 40
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "sub"
 symbol         = "-"
 kind           = "arithmetic"
@@ -1827,6 +1950,7 @@ precedence     = 40
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "mul"
 symbol         = "*"
 kind           = "arithmetic"
@@ -1839,6 +1963,7 @@ precedence     = 50
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "div"
 symbol         = "/"
 kind           = "arithmetic"
@@ -1851,6 +1976,7 @@ precedence     = 50
 errors         = ["22003", "22012"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "mod"
 symbol         = "%"
 kind           = "arithmetic"
@@ -1863,6 +1989,7 @@ precedence     = 50
 errors         = ["22012"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "neg"
 symbol         = "-"
 kind           = "arithmetic"
@@ -1894,6 +2021,7 @@ errors         = []
 # — authored as explicit rows rather than an implicit int→decimal coercion (strict typing).
 
 [[operator]]
+volatility     = "immutable"
 name           = "abs"
 kind           = "function"
 arity          = 1
@@ -1904,6 +2032,7 @@ null           = "propagates"
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "abs"
 kind           = "function"
 arity          = 1
@@ -1916,6 +2045,7 @@ errors         = []
 # round's carry can push a value at the integer-digit cap over it (decimal.md §2/§4) —
 # 22003, exactly PG. The integer overloads below cannot (an i64 is at most 19 digits).
 [[operator]]
+volatility     = "immutable"
 name           = "round"
 kind           = "function"
 arity          = 1
@@ -1926,6 +2056,7 @@ null           = "propagates"
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "round"
 kind           = "function"
 arity          = 2
@@ -1936,6 +2067,7 @@ null           = "propagates"
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "round"
 kind           = "function"
 arity          = 1
@@ -1946,6 +2078,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "round"
 kind           = "function"
 arity          = 2
@@ -1967,6 +2100,7 @@ errors         = []
 # precision, a documented result-type divergence (oracle_overrides.toml), value-identical. PG's
 # 2-arg trunc is numeric-only, so trunc(int, int) → numeric matches PG with no override.
 [[operator]]
+volatility     = "immutable"
 name           = "ceil"
 kind           = "function"
 arity          = 1
@@ -1977,6 +2111,7 @@ null           = "propagates"
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "ceil"
 kind           = "function"
 arity          = 1
@@ -1987,6 +2122,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ceiling"
 kind           = "function"
 arity          = 1
@@ -1997,6 +2133,7 @@ null           = "propagates"
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "ceiling"
 kind           = "function"
 arity          = 1
@@ -2007,6 +2144,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "floor"
 kind           = "function"
 arity          = 1
@@ -2017,6 +2155,7 @@ null           = "propagates"
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "floor"
 kind           = "function"
 arity          = 1
@@ -2027,6 +2166,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "trunc"
 kind           = "function"
 arity          = 1
@@ -2037,6 +2177,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "trunc"
 kind           = "function"
 arity          = 1
@@ -2047,6 +2188,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "trunc"
 kind           = "function"
 arity          = 2
@@ -2057,6 +2199,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "trunc"
 kind           = "function"
 arity          = 2
@@ -2088,6 +2231,7 @@ errors         = []
 # arbitrary-precision ln/exp port (../design/float.md §8).
 
 [[operator]]
+volatility     = "immutable"
 name           = "abs"
 kind           = "function"
 arity          = 1
@@ -2098,6 +2242,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ceil"
 kind           = "function"
 arity          = 1
@@ -2110,6 +2255,7 @@ errors         = []
 # ceiling — the alias of ceil; the float overload completes the alias across every family ceil
 # covers (the decimal/integer aliases are with the exact-numeric rows above).
 [[operator]]
+volatility     = "immutable"
 name           = "ceiling"
 kind           = "function"
 arity          = 1
@@ -2120,6 +2266,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "floor"
 kind           = "function"
 arity          = 1
@@ -2130,6 +2277,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "trunc"
 kind           = "function"
 arity          = 1
@@ -2140,6 +2288,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "round"
 kind           = "function"
 arity          = 1
@@ -2150,6 +2299,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "round"
 kind           = "function"
 arity          = 2
@@ -2160,6 +2310,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "sqrt"
 kind           = "function"
 arity          = 1
@@ -2170,6 +2321,7 @@ null           = "propagates"
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "exp"
 kind           = "function"
 arity          = 1
@@ -2180,6 +2332,7 @@ null           = "propagates"
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "ln"
 kind           = "function"
 arity          = 1
@@ -2190,6 +2343,7 @@ null           = "propagates"
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "log10"
 kind           = "function"
 arity          = 1
@@ -2200,6 +2354,7 @@ null           = "propagates"
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "pow"
 kind           = "function"
 arity          = 2
@@ -2216,6 +2371,7 @@ errors         = ["22003"]
 # The EXACT-numeric power(numeric, numeric) is a deferred follow-on (needs a PG-faithful
 # arbitrary-precision exp/ln port — see the §8 deferral note above).
 [[operator]]
+volatility     = "immutable"
 name           = "power"
 kind           = "function"
 arity          = 2
@@ -2240,6 +2396,7 @@ errors         = ["22003"]
 # domain errors trap 2201F; ln/log of a non-positive trap 2201E; exp/power overflow traps 22003.
 
 [[operator]]
+volatility     = "immutable"
 name           = "sqrt"
 kind           = "function"
 arity          = 1
@@ -2250,6 +2407,7 @@ null           = "propagates"
 errors         = ["2201F"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "exp"
 kind           = "function"
 arity          = 1
@@ -2260,6 +2418,7 @@ null           = "propagates"
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "ln"
 kind           = "function"
 arity          = 1
@@ -2272,6 +2431,7 @@ errors         = ["2201E"]
 # log(numeric) and log10(numeric) are base-10 logarithms (PG defines the one-arg `log` as
 # log(10, x)); both reuse the two-arg log kernel with base 10.
 [[operator]]
+volatility     = "immutable"
 name           = "log"
 kind           = "function"
 arity          = 1
@@ -2282,6 +2442,7 @@ null           = "propagates"
 errors         = ["2201E"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "log10"
 kind           = "function"
 arity          = 1
@@ -2293,6 +2454,7 @@ errors         = ["2201E"]
 
 # log(base, x) — logarithm of x in an arbitrary base (PG numeric_log): ln(x) / ln(base).
 [[operator]]
+volatility     = "immutable"
 name           = "log"
 kind           = "function"
 arity          = 2
@@ -2309,6 +2471,7 @@ errors         = ["2201E"]
 # `power(numeric,numeric)` exist), so jed ships both names over the same kernel — mirroring the
 # existing float `pow`/`power` pair.
 [[operator]]
+volatility     = "immutable"
 name           = "power"
 kind           = "function"
 arity          = 2
@@ -2319,6 +2482,7 @@ null           = "propagates"
 errors         = ["2201F", "22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "pow"
 kind           = "function"
 arity          = 2
@@ -2329,6 +2493,7 @@ null           = "propagates"
 errors         = ["2201F", "22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "sin"
 kind           = "function"
 arity          = 1
@@ -2339,6 +2504,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "cos"
 kind           = "function"
 arity          = 1
@@ -2349,6 +2515,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "tan"
 kind           = "function"
 arity          = 1
@@ -2362,6 +2529,7 @@ errors         = []
 # the `R` tag). Unlike sqrt it has NO domain restriction: cbrt of a negative is the negative real
 # root (cbrt(-8) = -2), so errors = [] and a NaN/±Inf operand propagates.
 [[operator]]
+volatility     = "immutable"
 name           = "cbrt"
 kind           = "function"
 arity          = 1
@@ -2391,6 +2559,7 @@ volatility     = "immutable"
 # by a shared literal, so it is IN-CONTRACT (byte-identical cross-core) and NOT in the
 # transcendental ledger — the degrees↔radians pair is exact arithmetic, not a libm call.
 [[operator]]
+volatility     = "immutable"
 name           = "radians"
 kind           = "function"
 arity          = 1
@@ -2404,6 +2573,7 @@ errors         = []
 # float.c literal radians() multiplies by). A SINGLE correctly-rounded IEEE divide by a shared
 # literal, so IN-CONTRACT (byte-identical cross-core), NOT in the transcendental ledger.
 [[operator]]
+volatility     = "immutable"
 name           = "degrees"
 kind           = "function"
 arity          = 1
@@ -2418,6 +2588,7 @@ errors         = []
 # whose magnitude exceeds 1) is OUT OF RANGE → 22003, exactly PG; a NaN operand propagates
 # (NaN, no trap). Boundaries are exact (asin(1) = π/2).
 [[operator]]
+volatility     = "immutable"
 name           = "asin"
 kind           = "function"
 arity          = 1
@@ -2431,6 +2602,7 @@ errors         = ["22003"]
 # [-1, 1] as asin: a finite |x| > 1 (and ±Inf) is OUT OF RANGE → 22003, a NaN operand propagates.
 # acos(1) = 0, acos(-1) = π.
 [[operator]]
+volatility     = "immutable"
 name           = "acos"
 kind           = "function"
 arity          = 1
@@ -2443,6 +2615,7 @@ errors         = ["22003"]
 # atan(x) — the inverse tangent in radians (float.md §8). TRANSCENDENTAL, exempted. NO domain
 # restriction: atan is defined on all of ℝ (atan(±Inf) = ±π/2, atan(NaN) = NaN), so errors = [].
 [[operator]]
+volatility     = "immutable"
 name           = "atan"
 kind           = "function"
 arity          = 1
@@ -2456,6 +2629,7 @@ errors         = []
 # the quadrant (float.md §8). TRANSCENDENTAL, exempted. Two float operands reconciled to one
 # width (arg_resolution = "promote", like pow), result f64; no domain trap (atan2(0, 0) = 0).
 [[operator]]
+volatility     = "immutable"
 name           = "atan2"
 kind           = "function"
 arity          = 2
@@ -2470,6 +2644,7 @@ errors         = []
 # cot(0) = +Infinity (PG-faithful, NOT a trap — cot is in the exempted column, so an Inf result is
 # admissible, unlike the in-contract arithmetic kernel); errors = [].
 [[operator]]
+volatility     = "immutable"
 name           = "cot"
 kind           = "function"
 arity          = 1
@@ -2490,6 +2665,7 @@ errors         = []
 #   atanh      — domain [-1, 1]: a finite |x| > 1 (and ±Inf) → 22003, but atanh(±1) = ±Infinity is
 #                ADMISSIBLE (boundary, no trap); a NaN propagates. errors = ["22003"].
 [[operator]]
+volatility     = "immutable"
 name           = "sinh"
 kind           = "function"
 arity          = 1
@@ -2500,6 +2676,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "cosh"
 kind           = "function"
 arity          = 1
@@ -2510,6 +2687,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "tanh"
 kind           = "function"
 arity          = 1
@@ -2520,6 +2698,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "asinh"
 kind           = "function"
 arity          = 1
@@ -2530,6 +2709,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "acosh"
 kind           = "function"
 arity          = 1
@@ -2540,6 +2720,7 @@ null           = "propagates"
 errors         = ["22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "atanh"
 kind           = "function"
 arity          = 1
@@ -2563,6 +2744,7 @@ errors         = ["22003"]
 # tests x > 0 / x < 0 so a NaN falls through to 0). There is no integer overload (PG resolves
 # sign(int) to float8 via its preferred-type rule, which jed's strict families do not mirror).
 [[operator]]
+volatility     = "immutable"
 name           = "sign"
 kind           = "function"
 arity          = 1
@@ -2573,6 +2755,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "sign"
 kind           = "function"
 arity          = 1
@@ -2589,6 +2772,7 @@ errors         = []
 # cost.md §3), so the cost ceiling bounds a large factorial before the limb work runs (§13). A
 # product over the decimal value cap traps 22003.
 [[operator]]
+volatility     = "immutable"
 name           = "factorial"
 kind           = "function"
 arity          = 1
@@ -2607,6 +2791,7 @@ errors         = ["22003"]
 # Decimal-only (an integer operand is 42883, like sqrt — no implicit int→numeric, a documented PG
 # divergence). result int4 for scale/min_scale, numeric for trim_scale.
 [[operator]]
+volatility     = "immutable"
 name           = "scale"
 kind           = "function"
 arity          = 1
@@ -2617,6 +2802,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "min_scale"
 kind           = "function"
 arity          = 1
@@ -2627,6 +2813,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "trim_scale"
 kind           = "function"
 arity          = 1
@@ -2661,6 +2848,7 @@ errors         = []
 # argument keeps its own family; no promotion). arg_names + arg_defaults carry the
 # named/default data (codegen → the descriptor table the resolver reads).
 [[operator]]
+volatility     = "immutable"
 name           = "make_interval"
 kind           = "function"
 arity          = 7
@@ -3112,6 +3300,7 @@ volatility     = "immutable"
 # outer dimension and is 2202E on incompatible dimensionalities.
 
 [[operator]]
+volatility     = "immutable"
 name           = "array_ndims"
 kind           = "function"
 arity          = 1
@@ -3122,6 +3311,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "array_length"
 kind           = "function"
 arity          = 2
@@ -3132,6 +3322,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "array_lower"
 kind           = "function"
 arity          = 2
@@ -3142,6 +3333,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "array_upper"
 kind           = "function"
 arity          = 2
@@ -3152,6 +3344,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "cardinality"
 kind           = "function"
 arity          = 1
@@ -3162,6 +3355,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "array_dims"
 kind           = "function"
 arity          = 1
@@ -3175,6 +3369,7 @@ errors         = []
 # over an array). STRICT. A multidimensional array is a deferred 0A000 follow-on (like to_jsonb); the
 # optional 2nd `pretty boolean` argument is a deferred follow-on. (json-sql-functions.md §2)
 [[operator]]
+volatility     = "immutable"
 name           = "array_to_json"
 kind           = "function"
 arity          = 1
@@ -3185,6 +3380,7 @@ null           = "propagates"
 errors         = ["0A000"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "array_append"
 kind           = "function"
 arity          = 2
@@ -3195,6 +3391,7 @@ null           = "none"
 errors         = ["22000"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "array_prepend"
 kind           = "function"
 arity          = 2
@@ -3205,6 +3402,7 @@ null           = "none"
 errors         = ["22000"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "array_cat"
 kind           = "function"
 arity          = 2
@@ -3231,6 +3429,7 @@ errors         = ["2202E"]
 # jed's integer-result convention regardless of element type (§3.1).
 
 [[operator]]
+volatility     = "immutable"
 name           = "array_remove"
 kind           = "function"
 arity          = 2
@@ -3241,6 +3440,7 @@ null           = "none"
 errors         = ["0A000"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "array_replace"
 kind           = "function"
 arity          = 3
@@ -3251,6 +3451,7 @@ null           = "none"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "array_position"
 kind           = "function"
 arity          = 2
@@ -3261,6 +3462,7 @@ null           = "none"
 errors         = ["0A000"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "array_position"
 kind           = "function"
 arity          = 3
@@ -3271,6 +3473,7 @@ null           = "none"
 errors         = ["0A000", "22004"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "array_positions"
 kind           = "function"
 arity          = 2
@@ -3293,6 +3496,7 @@ errors         = ["0A000"]
 # errors). Element-type / non-array operands that match no overload are 42883 (text `||` deferred).
 
 [[operator]]
+volatility     = "immutable"
 name           = "concat"
 symbol         = "||"
 kind           = "concat"
@@ -3305,6 +3509,7 @@ precedence     = 37
 errors         = ["2202E"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "concat"
 symbol         = "||"
 kind           = "concat"
@@ -3317,6 +3522,7 @@ precedence     = 37
 errors         = ["22000"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "concat"
 symbol         = "||"
 kind           = "concat"
@@ -3343,6 +3549,7 @@ errors         = ["22000"]
 # regardless of ELEM, so an all-untyped-NULL pair is NOT 42P18 (the type IS determinable).
 
 [[operator]]
+volatility     = "immutable"
 name           = "contains"
 symbol         = "@>"
 kind           = "containment"
@@ -3355,6 +3562,7 @@ precedence     = 37
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "contained_by"
 symbol         = "<@"
 kind           = "containment"
@@ -3367,6 +3575,7 @@ precedence     = 37
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "overlaps"
 symbol         = "&&"
 kind           = "containment"
@@ -3391,6 +3600,7 @@ errors         = []
 # range over the SAME element type (else 42883), matching PG's "operator does not exist".
 
 [[operator]]
+volatility     = "immutable"
 name           = "contains"
 symbol         = "@>"
 kind           = "containment"
@@ -3403,6 +3613,7 @@ precedence     = 37
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "contains"
 symbol         = "@>"
 kind           = "containment"
@@ -3415,6 +3626,7 @@ precedence     = 37
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "contained_by"
 symbol         = "<@"
 kind           = "containment"
@@ -3427,6 +3639,7 @@ precedence     = 37
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "contained_by"
 symbol         = "<@"
 kind           = "containment"
@@ -3439,6 +3652,7 @@ precedence     = 37
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "overlaps"
 symbol         = "&&"
 kind           = "containment"
@@ -3451,6 +3665,7 @@ precedence     = 37
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "strictly_left"
 symbol         = "<<"
 kind           = "containment"
@@ -3463,6 +3678,7 @@ precedence     = 37
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "strictly_right"
 symbol         = ">>"
 kind           = "containment"
@@ -3475,6 +3691,7 @@ precedence     = 37
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "not_extend_right"
 symbol         = "&<"
 kind           = "containment"
@@ -3487,6 +3704,7 @@ precedence     = 37
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "not_extend_left"
 symbol         = "&>"
 kind           = "containment"
@@ -3499,6 +3717,7 @@ precedence     = 37
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "adjacent"
 symbol         = "-|-"
 kind           = "containment"
@@ -3524,6 +3743,7 @@ errors         = []
 # overloaded lower(text)/upper(text). (Earlier jed had only the range forms.)
 
 [[operator]]
+volatility     = "immutable"
 name           = "lower"
 kind           = "function"
 arity          = 1
@@ -3534,6 +3754,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "upper"
 kind           = "function"
 arity          = 1
@@ -3551,6 +3772,7 @@ errors         = []
 # STRICT (null = "propagates"). Pure (the casing tables are jed's own pinned bytes — no host read, no
 # determinism-ledger entry). `initcap` is a deferred follow-on (needs word-boundary titlecasing).
 [[operator]]
+volatility     = "immutable"
 name           = "lower"
 kind           = "function"
 arity          = 1
@@ -3561,6 +3783,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "upper"
 kind           = "function"
 arity          = 1
@@ -3579,6 +3802,7 @@ errors         = []
 # string-functions.md §2); octet_length / bit_length count UTF-8 bytes / bits. Oracle-pinned (pg18).
 #   length(text) → int — the number of characters (code points). length('héllo') = 5.
 [[operator]]
+volatility     = "immutable"
 name           = "length"
 kind           = "function"
 arity          = 1
@@ -3591,6 +3815,7 @@ errors         = []
 # char_length / character_length — SQL-standard aliases of length(text): the same code-point count,
 # same kernel. PG exposes all three (char_length and character_length are the SQL spellings).
 [[operator]]
+volatility     = "immutable"
 name           = "char_length"
 kind           = "function"
 arity          = 1
@@ -3601,6 +3826,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "character_length"
 kind           = "function"
 arity          = 1
@@ -3613,6 +3839,7 @@ errors         = []
 # octet_length(text) → int — the number of BYTES in the UTF-8 encoding (NOT characters):
 # octet_length('héllo') = 6 (é is 2 bytes). The byte counterpart of length.
 [[operator]]
+volatility     = "immutable"
 name           = "octet_length"
 kind           = "function"
 arity          = 1
@@ -3625,6 +3852,7 @@ errors         = []
 # bit_length(text) → int — the number of BITS in the UTF-8 encoding = octet_length × 8.
 # bit_length('héllo') = 48.
 [[operator]]
+volatility     = "immutable"
 name           = "bit_length"
 kind           = "function"
 arity          = 1
@@ -3639,6 +3867,7 @@ errors         = []
 # characters starting at S, with the window [S, S+L) intersected with [1, n]. A start ≤ 0 or past
 # the end clips (substr('alphabet',0,3) = 'al'); a NEGATIVE count is 22011. NULL args propagate.
 [[operator]]
+volatility     = "immutable"
 name           = "substr"
 kind           = "function"
 arity          = 2
@@ -3649,6 +3878,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "substr"
 kind           = "function"
 arity          = 3
@@ -3661,6 +3891,7 @@ errors         = ["22011"]
 # left(text, n int) → text — the first n characters (code points); a NEGATIVE n returns all but the
 # last |n| characters. left('abcde', 2) = 'ab', left('abcde', -2) = 'abc'. NULL args propagate.
 [[operator]]
+volatility     = "immutable"
 name           = "left"
 kind           = "function"
 arity          = 2
@@ -3673,6 +3904,7 @@ errors         = []
 # right(text, n int) → text — the last n characters (code points); a NEGATIVE n returns all but the
 # first |n| characters. right('abcde', 2) = 'de', right('abcde', -2) = 'cde'. NULL args propagate.
 [[operator]]
+volatility     = "immutable"
 name           = "right"
 kind           = "function"
 arity          = 2
@@ -3688,6 +3920,7 @@ errors         = []
 # length ≤ 0 yields ''; an empty fill cannot pad (returns the truncated string); a pathological
 # length traps 54000 (program_limit_exceeded, "requested length too large", as PG). NULL args propagate.
 [[operator]]
+volatility     = "immutable"
 name           = "lpad"
 kind           = "function"
 arity          = 2
@@ -3698,6 +3931,7 @@ null           = "propagates"
 errors         = ["54000"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "lpad"
 kind           = "function"
 arity          = 3
@@ -3710,6 +3944,7 @@ errors         = ["54000"]
 # rpad(text, length int[, fill text]) → text — the right-hand mirror of lpad: pad/truncate on the
 # RIGHT. rpad('hi',5,'xy') = 'hixyx', rpad('hi',1) = 'h'. Same length cap (54000). NULL args propagate.
 [[operator]]
+volatility     = "immutable"
 name           = "rpad"
 kind           = "function"
 arity          = 2
@@ -3720,6 +3955,7 @@ null           = "propagates"
 errors         = ["54000"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "rpad"
 kind           = "function"
 arity          = 3
@@ -3734,6 +3970,7 @@ errors         = ["54000"]
 # space). btrim('xxhixx','x') = 'hi', btrim('  hi  ') = 'hi'. The function form of TRIM(BOTH …).
 # NULL args propagate.
 [[operator]]
+volatility     = "immutable"
 name           = "btrim"
 kind           = "function"
 arity          = 1
@@ -3744,6 +3981,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "btrim"
 kind           = "function"
 arity          = 2
@@ -3756,6 +3994,7 @@ errors         = []
 # ltrim(text[, characters text]) → text — like btrim but trims only the LEADING (left) run. The
 # function form of TRIM(LEADING …). ltrim('xxhixx','x') = 'hixx'. NULL args propagate.
 [[operator]]
+volatility     = "immutable"
 name           = "ltrim"
 kind           = "function"
 arity          = 1
@@ -3766,6 +4005,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "ltrim"
 kind           = "function"
 arity          = 2
@@ -3778,6 +4018,7 @@ errors         = []
 # rtrim(text[, characters text]) → text — like btrim but trims only the TRAILING (right) run. The
 # function form of TRIM(TRAILING …). rtrim('xxhixx','x') = 'xxhi'. NULL args propagate.
 [[operator]]
+volatility     = "immutable"
 name           = "rtrim"
 kind           = "function"
 arity          = 1
@@ -3788,6 +4029,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "rtrim"
 kind           = "function"
 arity          = 2
@@ -3802,6 +4044,7 @@ errors         = []
 # (returns the string unchanged — a cross-core trap: the host string-replace built-ins insert `to`
 # between every character, so this is special-cased, string-functions.md §3). NULL args propagate.
 [[operator]]
+volatility     = "immutable"
 name           = "replace"
 kind           = "function"
 arity          = 3
@@ -3816,6 +4059,7 @@ errors         = []
 # is shorter. A character's FIRST occurrence in `from` wins. translate('12345','143','ax') = 'a2x5'
 # (3 deleted). NULL args propagate.
 [[operator]]
+volatility     = "immutable"
 name           = "translate"
 kind           = "function"
 arity          = 3
@@ -3829,6 +4073,7 @@ errors         = []
 # 'ababab'. An amplifying function: a result whose byte size would exceed PG's MaxAllocSize traps
 # 54000 (program_limit_exceeded), bounding the allocation (CLAUDE.md §13). NULL args propagate.
 [[operator]]
+volatility     = "immutable"
 name           = "repeat"
 kind           = "function"
 arity          = 2
@@ -3841,6 +4086,7 @@ errors         = ["54000"]
 # reverse(text) → text — the characters (code points) in reverse order. reverse('abc') = 'cba'. A
 # code-point reversal (not bytes / UTF-16 units — an astral char stays intact). NULL args propagate.
 [[operator]]
+volatility     = "immutable"
 name           = "reverse"
 kind           = "function"
 arity          = 1
@@ -3854,6 +4100,7 @@ errors         = []
 # occurrence of `substring` in the string, or 0 if absent; an empty substring is 1. The function form
 # of POSITION(substring IN string). strpos('high','ig') = 2. NULL args propagate.
 [[operator]]
+volatility     = "immutable"
 name           = "strpos"
 kind           = "function"
 arity          = 2
@@ -3869,6 +4116,7 @@ errors         = []
 # (a cross-core trap — the host split built-ins split into characters; string-functions.md §3).
 # split_part('a,b,c',',',2) = 'b', split_part('a,b,c',',',-1) = 'c'. NULL args propagate.
 [[operator]]
+volatility     = "immutable"
 name           = "split_part"
 kind           = "function"
 arity          = 3
@@ -3881,6 +4129,7 @@ errors         = ["22023"]
 # starts_with(text, prefix text) → boolean — true iff the string begins with `prefix` (an empty
 # prefix is always true). starts_with('abcde','abc') = true. NULL args propagate.
 [[operator]]
+volatility     = "immutable"
 name           = "starts_with"
 kind           = "function"
 arity          = 2
@@ -3893,6 +4142,7 @@ errors         = []
 # ascii(text) → int — the Unicode CODE POINT of the first character (the full code point, not a
 # UTF-16 unit — ascii('😀') = 128512); the empty string is 0. The inverse of chr. NULL propagates.
 [[operator]]
+volatility     = "immutable"
 name           = "ascii"
 kind           = "function"
 arity          = 1
@@ -3906,6 +4156,7 @@ errors         = []
 # '😀'. A NEGATIVE code point is 22023 ("character number must be positive"); 0 / a value above
 # U+10FFFF / a UTF-16 surrogate (U+D800..U+DFFF) is 54000 (PG's chr error split). NULL propagates.
 [[operator]]
+volatility     = "immutable"
 name           = "chr"
 kind           = "function"
 arity          = 1
@@ -3920,6 +4171,7 @@ errors         = ["22023", "54000"]
 # ASCII alphanumerics and folds ASCII case (deterministic, cross-core; full-Unicode word boundaries
 # are a deferred refinement — string-functions.md §3). NULL propagates.
 [[operator]]
+volatility     = "immutable"
 name           = "initcap"
 kind           = "function"
 arity          = 1
@@ -3934,6 +4186,7 @@ errors         = []
 # PG's to_hex(bigint); a bare literal is i64, so to_hex(-1) is 16 f's — string-functions.md §3). NULL
 # propagates.
 [[operator]]
+volatility     = "immutable"
 name           = "to_hex"
 kind           = "function"
 arity          = 1
@@ -3948,6 +4201,7 @@ errors         = []
 # 'escape' (printable bytes as-is, 0x00 → \000, backslash doubled, high-bit bytes → \nnn octal). An
 # unrecognized format is 22023. The inverse of decode. NULL args propagate. (string-functions.md §3)
 [[operator]]
+volatility     = "immutable"
 name           = "encode"
 kind           = "function"
 arity          = 2
@@ -3962,6 +4216,7 @@ errors         = ["22023"]
 # malformed 'escape' sequence (a lone backslash, or not exactly 3 octal digits ≤ 255) is 22P02 (PG's
 # split). An unrecognized format is 22023. NULL args propagate. (string-functions.md §3)
 [[operator]]
+volatility     = "immutable"
 name           = "decode"
 kind           = "function"
 arity          = 2
@@ -3976,6 +4231,7 @@ errors         = ["22023", "22P02"]
 # an E-string prefix. quote_literal('a''b') = '''a''''b'''. STRICT (NULL → NULL — distinct from
 # quote_nullable). (string-functions.md §3)
 [[operator]]
+volatility     = "immutable"
 name           = "quote_literal"
 kind           = "function"
 arity          = 1
@@ -3990,6 +4246,7 @@ errors         = []
 # doubled. quote_ident('Foo') = '"Foo"'. STRICT. jed quotes by the LEXICAL pattern only (no
 # reserved-keyword quoting — jed has no enumerated keyword set; string-functions.md §3).
 [[operator]]
+volatility     = "immutable"
 name           = "quote_ident"
 kind           = "function"
 arity          = 1
@@ -4004,6 +4261,7 @@ errors         = []
 # string function with the `none` NULL discipline — the eval does NOT short-circuit a NULL argument.
 # (string-functions.md §3)
 [[operator]]
+volatility     = "immutable"
 name           = "quote_nullable"
 kind           = "function"
 arity          = 1
@@ -4259,6 +4517,7 @@ errors         = ["2201B", "22023"]
 volatility     = "immutable"
 
 [[operator]]
+volatility     = "immutable"
 name           = "isempty"
 kind           = "function"
 arity          = 1
@@ -4269,6 +4528,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "lower_inc"
 kind           = "function"
 arity          = 1
@@ -4279,6 +4539,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "upper_inc"
 kind           = "function"
 arity          = 1
@@ -4289,6 +4550,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "lower_inf"
 kind           = "function"
 arity          = 1
@@ -4299,6 +4561,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "upper_inf"
 kind           = "function"
 arity          = 1
@@ -4327,6 +4590,7 @@ errors         = []
 # parallel to the array/range resolvers — NOT the generic family-matched scalar path.
 
 [[operator]]
+volatility     = "immutable"
 name           = "i32range"
 kind           = "function"
 arity          = 2
@@ -4337,6 +4601,7 @@ null           = "none"
 errors         = ["22000", "22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "i32range"
 kind           = "function"
 arity          = 3
@@ -4347,6 +4612,7 @@ null           = "none"
 errors         = ["22000", "22003", "42601"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "i64range"
 kind           = "function"
 arity          = 2
@@ -4357,6 +4623,7 @@ null           = "none"
 errors         = ["22000", "22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "i64range"
 kind           = "function"
 arity          = 3
@@ -4367,6 +4634,7 @@ null           = "none"
 errors         = ["22000", "22003", "42601"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "numrange"
 kind           = "function"
 arity          = 2
@@ -4377,6 +4645,7 @@ null           = "none"
 errors         = ["22000", "22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "numrange"
 kind           = "function"
 arity          = 3
@@ -4387,6 +4656,7 @@ null           = "none"
 errors         = ["22000", "22003", "42601"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "tsrange"
 kind           = "function"
 arity          = 2
@@ -4397,6 +4667,7 @@ null           = "none"
 errors         = ["22000"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "tsrange"
 kind           = "function"
 arity          = 3
@@ -4407,6 +4678,7 @@ null           = "none"
 errors         = ["22000", "42601"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "tstzrange"
 kind           = "function"
 arity          = 2
@@ -4417,6 +4689,7 @@ null           = "none"
 errors         = ["22000"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "tstzrange"
 kind           = "function"
 arity          = 3
@@ -4427,6 +4700,7 @@ null           = "none"
 errors         = ["22000", "42601"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "daterange"
 kind           = "function"
 arity          = 2
@@ -4437,6 +4711,7 @@ null           = "none"
 errors         = ["22000", "22003"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "daterange"
 kind           = "function"
 arity          = 3
@@ -4460,6 +4735,7 @@ errors         = ["22000", "22003", "42601"]
 # row routed through resolve_range_func, which emits the shared RangeSetOp node with op = Merge.
 
 [[operator]]
+volatility     = "immutable"
 name           = "range_union"
 symbol         = "+"
 kind           = "arithmetic"
@@ -4472,6 +4748,7 @@ precedence     = 40
 errors         = ["22000"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "range_difference"
 symbol         = "-"
 kind           = "arithmetic"
@@ -4484,6 +4761,7 @@ precedence     = 40
 errors         = ["22000"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "range_intersect"
 symbol         = "*"
 kind           = "arithmetic"
@@ -4496,6 +4774,7 @@ precedence     = 50
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "range_merge"
 kind           = "function"
 arity          = 2
@@ -4510,6 +4789,7 @@ errors         = []
 # on demand and dispatch to the same kernel (json.md §4). All propagate a SQL NULL input to NULL.
 # jsonb_typeof / json_typeof → the JSON type name (object/array/string/number/boolean/null).
 [[operator]]
+volatility     = "immutable"
 name           = "jsonb_typeof"
 kind           = "function"
 arity          = 1
@@ -4520,6 +4800,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "json_typeof"
 kind           = "function"
 arity          = 1
@@ -4531,6 +4812,7 @@ errors         = []
 
 # jsonb_array_length / json_array_length → the element count of an array; 22023 on a non-array.
 [[operator]]
+volatility     = "immutable"
 name           = "jsonb_array_length"
 kind           = "function"
 arity          = 1
@@ -4541,6 +4823,7 @@ null           = "propagates"
 errors         = ["22023"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "json_array_length"
 kind           = "function"
 arity          = 1
@@ -4553,6 +4836,7 @@ errors         = ["22023"]
 # jsonb_strip_nulls / json_strip_nulls → remove object members whose value is JSON null (recursive;
 # array nulls are kept).
 [[operator]]
+volatility     = "immutable"
 name           = "jsonb_strip_nulls"
 kind           = "function"
 arity          = 1
@@ -4563,6 +4847,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "json_strip_nulls"
 kind           = "function"
 arity          = 1
@@ -4574,6 +4859,7 @@ errors         = []
 
 # jsonb_pretty → an indented (4-space) multi-line render. (PG ships no json_pretty.)
 [[operator]]
+volatility     = "immutable"
 name           = "jsonb_pretty"
 kind           = "function"
 arity          = 1
@@ -4590,6 +4876,7 @@ errors         = []
 # interval, multidim array) are a deferred 0A000 follow-on (json-sql-functions.md §2). to_json + the
 # json[b]_build_* builders + jsonb_set/insert are a follow-on slice.
 [[operator]]
+volatility     = "immutable"
 name           = "to_jsonb"
 kind           = "function"
 arity          = 1
@@ -4603,6 +4890,7 @@ errors         = ["0A000"]
 # output style: no space after ':'/','). STRICT. Same deferred 0A000 sources as to_jsonb. (json-sql-
 # functions.md §2.) A `json` input is canonicalized (a documented divergence — PG keeps it verbatim).
 [[operator]]
+volatility     = "immutable"
 name           = "to_json"
 kind           = "function"
 arity          = 1
@@ -4617,6 +4905,7 @@ errors         = ["0A000"]
 # datetime/uuid/bytea/interval/float sources (which PG renders as a JSON string of their text) are a
 # deferred 0A000 follow-on. Reachable as the JSON_SCALAR(expr) standard syntax (a plain function call).
 [[operator]]
+volatility     = "immutable"
 name           = "json_scalar"
 kind           = "function"
 arity          = 1
@@ -4631,6 +4920,7 @@ errors         = ["0A000"]
 # JSON_SERIALIZE(expr) standard syntax (a plain function call); RETURNING text is the only (default)
 # form (PG 18 has no RETURNING clause here).
 [[operator]]
+volatility     = "immutable"
 name           = "json_serialize"
 kind           = "function"
 arity          = 1
@@ -4641,6 +4931,7 @@ null           = "propagates"
 errors         = []
 
 [[operator]]
+volatility     = "immutable"
 name           = "json_serialize"
 kind           = "function"
 arity          = 1
@@ -4656,6 +4947,7 @@ errors         = []
 # scalar/array compact, a jsonb canonical-spaced, a json verbatim). Same deferred 0A000 element sources
 # as to_jsonb. The VARIADIC array form (json_build_array(VARIADIC arr)) spreads. (json-sql-functions.md §2.)
 [[operator]]
+volatility     = "immutable"
 name           = "jsonb_build_array"
 kind           = "function"
 arity          = 1
@@ -4667,6 +4959,7 @@ null           = "none"
 errors         = ["0A000"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "json_build_array"
 kind           = "function"
 arity          = 1
@@ -4684,6 +4977,7 @@ errors         = ["0A000"]
 # canonical key order); json preserves argument order + duplicate keys and uses PG's " : " / ", "
 # builder spacing. (json-sql-functions.md §2.)
 [[operator]]
+volatility     = "immutable"
 name           = "jsonb_build_object"
 kind           = "function"
 arity          = 1
@@ -4695,6 +4989,7 @@ null           = "none"
 errors         = ["22023", "0A000"]
 
 [[operator]]
+volatility     = "immutable"
 name           = "json_build_object"
 kind           = "function"
 arity          = 1

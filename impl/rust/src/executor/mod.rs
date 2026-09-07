@@ -19,7 +19,7 @@ pub(crate) use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
     ExclusionConstraint, ExclusionElement, ExclusionOp, FkAction, ForeignKeyConstraint,
     HostFuncDep, IdentityKind, IndexDef, IndexKey, IndexKeyExpr, IndexKind, SeqDataType, SeqOwner,
-    SequenceDef, Table, resolve_col_type,
+    SequenceDef, Table, TimeZoneDep, TimeZoneDeps, resolve_col_type,
 };
 pub(crate) use crate::collation::{self, Collation};
 pub(crate) use crate::cost::{Lifetime, Meter};
@@ -51,6 +51,8 @@ pub(crate) use window::*;
 mod access_path;
 mod aggregate;
 mod ddl;
+mod index_dependencies;
+pub(crate) use index_dependencies::*;
 mod dml;
 pub(crate) use dml::CachedInsert;
 mod eval;

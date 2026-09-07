@@ -44,8 +44,8 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   the **host-loaded `JTZ` bundle** (manifest + per-zone **RFC 8536 TZif** sections + alias links,
   byte format in [../tz/README.md](../tz/README.md)), the privileged `db.LoadTimeZoneData` seam, the
   per-core TZif reader, and the single `AT TIME ZONE` consumer — copying collation's host-load model.
-  `timestamptz` is UTC, so plain indexes are tz-immune: **no format change, no skew verdict** until a
-  tz-derived key can be stored (latent into compatibility.md).
+  `timestamptz` is UTC, so plain column indexes need no timezone data. Derived expressions
+  use the persisted pins and rebuild contract in [index-dependencies.md](index-dependencies.md).
 - [storage.md](storage.md) — the storage seam: block interface, page model, and the
   root-pointer-swap commit model (CLAUDE.md §3/§9).
 - [hosts.md](hosts.md) — the formal storage-host (`BlockStore`) interface: the five-method

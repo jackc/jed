@@ -170,6 +170,16 @@ func partialIndexTableDB(t *testing.T) *Session {
 // geo_hash(a), a host scalar function (i64 -> i64), component "com.example/geo_hash" at semantic
 // version 1. The table is EMPTY (the tree empty, root 0), so the fixture isolates the v31 catalog
 // change. Must match verify.rb's HOSTFUNC_INDEX_TABLE.
+func timezoneIndexTableDB(t *testing.T) *Session {
+	if err := LoadTimeZoneData(tzBundleBytes(t)); err != nil {
+		t.Fatal(err)
+	}
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamptz)")
+	run(t, db, "CREATE INDEX t_zone_idx ON t ((ts AT TIME ZONE 'US/Eastern'),(ts AT TIME ZONE 'America/New_York')) WHERE ts IS NOT NULL")
+	return db
+}
+
 func hostfuncIndexTableDB(t *testing.T) *Session {
 	reg := regWith(t, geoHash("com.example/geo_hash", 1))
 	db, err := CreateDatabase(CreateOptions{PageSize: goldenPageSize, Extensions: reg})
@@ -987,6 +997,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"unique_table.jed", uniqueTableDB},
 		{"expr_index_table.jed", exprIndexTableDB},
 		{"partial_index_table.jed", partialIndexTableDB},
+		{"timezone_index_table.jed", timezoneIndexTableDB},
 		{"hostfunc_index_table.jed", hostfuncIndexTableDB},
 		{"gin_array_table.jed", ginArrayTableDB},
 		{"gin_uuid_table.jed", ginUuidTableDB},
@@ -1065,6 +1076,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"unique_table.jed", uniqueTableDB, "t"},
 		{"expr_index_table.jed", exprIndexTableDB, "t"},
 		{"partial_index_table.jed", partialIndexTableDB, "t"},
+		{"timezone_index_table.jed", timezoneIndexTableDB, "t"},
 		{"gin_array_table.jed", ginArrayTableDB, "t"},
 		{"gin_uuid_table.jed", ginUuidTableDB, "t"},
 		{"fk_table.jed", fkTableDB, "c"},

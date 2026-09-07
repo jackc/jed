@@ -13,14 +13,10 @@
 >
 > **The one structural fact that makes tz easier than collation:** `timestamptz` is stored as a UTC
 > `i64` instant and its ordering is integer comparison of those micros — **completely independent of
-> the tz database** (§2). So tz support adds **no on-disk format change, no per-file reference entry,
-> and no version-skew verdict** today: the base type is structurally immune to the
-> tz-data-version-corruption hazard that forced collation's reference-entry + graded-verdict machinery.
-> That machinery becomes relevant only when a *tz-derived key can be stored* — a functional index or a
-> STORED generated column over `AT TIME ZONE 'const'` — neither of which jed can build yet (§8). Until
-> then the hazard is **latent**, and when those features land tz registers into
-> [compatibility.md](compatibility.md)'s manifest exactly as collation already does — not as a bespoke
-> mechanism.
+> the tz database** (§2). Plain column indexes remain timezone-independent. Derived expression
+> keys and partial predicates pin their named timezone dependencies in format 32; mismatches
+> disable their read access paths and refuse writes until an explicit atomic rebuild.
+> [index-dependencies.md](index-dependencies.md) defines admission and lifetime rules.
 >
 > The settled ground this builds on, all in-tree: `timestamptz` is a UTC `i64` instant (the clock-seam
 > micros — [entropy.md §1](entropy.md); the i64-instant key rule, [encoding.md §2](encoding.md)); the
@@ -90,12 +86,10 @@ Collation has no such escape: the comparison function for `text` *is* the versio
 collated index is exposed when the library reorders, which is why collation needs a per-file version pin
 and the graded open-time verdict ([collation.md §3/§12](collation.md)). Here the base type's comparison
 is tz-free, so **none** of the plain timestamp indexes are exposed. The exposure is confined entirely to
-keys that are *derived by applying a zone* and then stored — and jed cannot build one yet (§8).
-
-This means **time-zone support adds nothing to the on-disk format** — **no `format_version` bump, no
-per-file collation-style reference entry, no skew verdict.** `timestamptz` is already a UTC `i64`; the tz
-database lives in the loaded set (§3), not in the file. The collation reference-entry + `XX002` verdict
-half is **deliberately absent here**, latent until derived stored keys exist (§8/§10).
+keys that are *derived by applying a zone* and then stored. Expression keys and partial predicates
+now admit these operations under [index-dependencies.md](index-dependencies.md). Format 32 pins the
+exact zone names, release labels, and TZif checksums used by each index. Plain instant columns and
+indexes still need no timezone metadata.
 
 ## 3. The time-zone database — host-loaded, never the OS
 
@@ -300,21 +294,13 @@ keys** (the comparator is versioned); a tz functional index keeps a stable compa
 **stales the key derived from the row** (the derivation is versioned). Detection and remedy are
 identical — version-stamp and rebuild.
 
-**This is not a new mechanism**, and crucially **it is latent today:**
-
-1. **jed cannot build such an index now.** [indexes.md §1](indexes.md) is "plain column keys only —
-   expression keys rejected," and there is no read-recomputed generated column. The hazard appears only
-   the day expression indexes (or STORED generated columns) land *together with* tz functions.
-2. **The trigger is jed's, not the OS's.** Because §3 host-loads a pinned version, the data shifts only
-   when a host loads a different bundle — discrete, version-stamped, identical across cores — never
-   silently under a host glibc/ICU-style upgrade.
-
-So this slice ships **no** version-pinning machinery — it would have nothing to protect (§2). When the
-triggering features land, tz registers into [compatibility.md](compatibility.md)'s manifest as a Tier-2
-versioned-reference-data capability: at that point a file gains a tzdata-version pin on its tz-derived
-indexes, the open-time graded verdict degrades a skewed such index to read-only heap-scan, and a future
-`db.upgrade_timezones()`-style migration (the [collation.md §12](collation.md) `db.upgrade_collations()`
-analogue) rebuilds it. **Designed, not built** — and explicitly not part of this slice.
+**Persisted derived expressions now carry this protection.** Format 32 stores each index's timezone
+dependencies. Static zone arguments pin their named data; a dynamic zone argument pins the whole
+loaded set. Missing or mismatched data excludes the index from read plans and refuses writes with
+`XX002`. The host can load the intended bundle in a fresh process and rebuild indexes using atomic
+`BEGIN; DROP INDEX; CREATE INDEX; COMMIT`. A failed rebuild can be rolled back without losing the
+old committed index. See [index-dependencies.md](index-dependencies.md) for admission, encoding,
+cache behavior, and the full rebuild procedure.
 
 ### PG's stance (the cautionary detail)
 
@@ -325,8 +311,7 @@ index it directly; you are pushed to the immutable-but-actually-tz-dependent `AT
 the exposed one.) PG built collation *versioning* (`pg_collation.collversion`, mismatch warnings,
 `REINDEX`) but has **no** equivalent tz-version tracking for these expression indexes — so on PG this
 breakage is *less* detectable than the collation one; the admin simply has to know to `REINDEX` after a
-tzdata update. jed should do better (the §8 manifest registration when the feature lands), not inherit
-the silence — but only when there is something to track.
+tzdata update. jed detects this dependency mismatch and requires the explicit rebuild described above.
 
 ## 9. Function / operator surface
 
@@ -558,8 +543,8 @@ the tz database, the load seam, the TZif reader, `AT TIME ZONE`, and the convers
   `date_part` (§9.2) have since landed ([date.md §6](date.md)). Still deferred:
   `text`↔`timestamp`/`timestamptz` casts, `to_char`, `age`, and session-zone rendering (§9, §9.5).
   (`make_timestamptz` landed with the make_timestamp slice — [functions.md §11](functions.md).)
-- **No on-disk change.** No `format_version` bump, no reference entry, no skew verdict (§2); the
-  collation-style version-skew machinery is latent until tz-derived stored keys exist (§8).
+- **Persisted dependencies.** Format 32 adds per-index timezone pins for derived keys and partial
+  predicates ([index-dependencies.md](index-dependencies.md)); plain values keep their UTC encoding.
 - **Session zone drives computation, not rendering (Slice 2).** The session `TimeZone` is the zone a
   `timestamptz` is decomposed *in* (§9.4); a `timestamptz` still *renders* in UTC (§9.5) — the
   rendering follow-on lifts that.

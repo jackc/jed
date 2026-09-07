@@ -57,6 +57,7 @@ pub struct Zone {
     pub name: String,
     pub tzdata_version: String,
     pub data: TzData,
+    pub checksum: u32,
 }
 
 /// The local-time type in effect at an instant (the reader output, §4). `AT TIME ZONE` uses only
@@ -703,6 +704,7 @@ pub fn load_time_zone_data(bytes: &[u8]) -> Result<()> {
                 name: name.clone(),
                 tzdata_version: ver.clone(),
                 data,
+                checksum: crc32_ieee(raw),
             }),
         );
     }
@@ -717,6 +719,7 @@ pub fn load_time_zone_data(bytes: &[u8]) -> Result<()> {
                 name: alias.clone(),
                 tzdata_version: ver.clone(),
                 data: z.data.clone(),
+                checksum: z.checksum,
             });
             set.entry(alias.clone()).or_insert(aliased);
         }
@@ -913,4 +916,18 @@ impl<'a> Reader<'a> {
         let s = self.take(n)?;
         String::from_utf8(s.to_vec()).map_err(|_| corrupt("tz: invalid UTF-8 string"))
     }
+}
+
+/// A single locked snapshot, sorted by exact UTF-8 name, for persisted index dependencies.
+pub(crate) fn index_zone_deps() -> Vec<crate::catalog::TimeZoneDep> {
+    loaded_set()
+        .read()
+        .expect("loaded-timezone lock poisoned")
+        .values()
+        .map(|z| crate::catalog::TimeZoneDep {
+            name: z.name.clone(),
+            version: z.tzdata_version.clone(),
+            checksum: z.checksum,
+        })
+        .collect()
 }

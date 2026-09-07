@@ -1,3 +1,5 @@
+import type { TimeZoneDep } from "./catalog.ts";
+import { compareTextC } from "./value.ts";
 // Time zones: the JTZ bundle codec + an RFC 8536 TZif reader + the engine-global loaded zone set.
 // The cross-core contract for time-zone conversion (spec/design/timezones.md §4/§5): the reader is
 // hand-written per core (CLAUDE.md §5) and byte-identical given identical input — it reads the
@@ -41,6 +43,7 @@ export interface Zone {
   name: string;
   tzdataVersion: string;
   data: TzData;
+  checksum: number;
 }
 
 export interface Offset {
@@ -568,6 +571,7 @@ export function loadTimeZoneData(data: Uint8Array): void {
       name: z.name,
       tzdataVersion: bundle.tzdataVersion,
       data: parseTzif(z.raw),
+      checksum: crc32Ieee(z.raw),
     });
   }
   for (const [name, z] of parsed) {
@@ -580,6 +584,7 @@ export function loadTimeZoneData(data: Uint8Array): void {
         name: l.alias,
         tzdataVersion: bundle.tzdataVersion,
         data: target.data,
+        checksum: target.checksum,
       });
     }
   }
@@ -687,4 +692,10 @@ function fixedAbbrev(utoff: number): string {
   const s = a % 60;
   const p2 = (n: number) => n.toString().padStart(2, "0");
   return s === 0 ? `${sign}${p2(h)}:${p2(m)}` : `${sign}${p2(h)}:${p2(m)}:${p2(s)}`;
+}
+
+export function indexZoneDeps(): TimeZoneDep[] {
+  return [...loadedTz.values()]
+    .map((z) => ({ name: z.name, version: z.tzdataVersion, checksum: z.checksum }))
+    .sort((a, b) => compareTextC(a.name, b.name));
 }

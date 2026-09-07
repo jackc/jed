@@ -106,7 +106,7 @@ def rust_entry(op)
     "        errors: #{rust_slice(op['errors'])},",
     "        arg_names: #{rust_slice(op['arg_names'] || [])},",
     "        arg_defaults: #{rust_slice(op['arg_defaults'] || [])},",
-    "        volatility: #{rust_str(op['volatility'] || 'immutable')},",
+    "        volatility: #{rust_str(op.fetch('volatility'))},",
     "        variadic: #{op['variadic'] ? 'true' : 'false'},",
     "        cost: #{op['cost'] || 0},",
     "    },",
@@ -333,7 +333,7 @@ def go_entry(op)
     ["Errors",        go_slice(op["errors"])],
     ["ArgNames",      go_slice(op["arg_names"] || [])],
     ["ArgDefaults",   go_slice(op["arg_defaults"] || [])],
-    ["Volatility",    go_str(op["volatility"] || "immutable")],
+    ["Volatility",    go_str(op.fetch("volatility"))],
     ["Variadic",      variadic_bool(op)],
     ["Cost",          (op["cost"] || 0).to_s],
   ]
@@ -562,7 +562,7 @@ def ts_entry(op)
   lines << "    errors: #{ts_arr(op['errors'])},"
   lines << "    argNames: #{ts_arr(op['arg_names'] || [])},"
   lines << "    argDefaults: #{ts_arr(op['arg_defaults'] || [])},"
-  lines << "    volatility: #{ts_str(op['volatility'] || 'immutable')},"
+  lines << "    volatility: #{ts_str(op.fetch('volatility'))},"
   lines << "    variadic: #{variadic_bool(op)},"
   lines << "    cost: #{op['cost'] || 0},"
   lines << "  },"

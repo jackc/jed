@@ -20,6 +20,7 @@ use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
     ExclusionConstraint, ExclusionElement, ExclusionOp, FkAction, ForeignKeyConstraint,
     HostFuncDep, IdentityKind, IndexDef, IndexKey, IndexKeyExpr, IndexKind, SequenceDef, Table,
+    TimeZoneDep, TimeZoneDeps,
 };
 use crate::collation::Collation;
 use crate::decimal::Decimal;
@@ -101,7 +102,8 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// codes (u8 each) ‖ result type code (u8) ‖ component_id (u16 len + UTF-8) ‖ semantic_version u32`,
 /// in ascending `(name, arg-type codes)` order. An index with no host-function key is byte-identical
 /// to v30, so a file with no such index moves to v31 only by its version byte + meta CRC.
-const FORMAT_VERSION: u16 = 31;
+// v32: persisted timezone dependencies (spec/design/index-dependencies.md).
+const FORMAT_VERSION: u16 = 32;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 pub(crate) const PAGE_HEADER: usize = 16;
@@ -3102,7 +3104,8 @@ fn table_entry_bytes(
         out.push(
             (if idx.unique { 1 } else { 0 })
                 | (if idx.predicate.is_some() { 2 } else { 0 })
-                | (if idx.host_deps.is_empty() { 0 } else { 4 }),
+                | (if idx.host_deps.is_empty() { 0 } else { 4 })
+                | (if idx.timezone_deps.is_empty() { 0 } else { 8 }),
         );
         // v13: index_kind byte (0 = ordered B-tree, 1 = GIN — spec/design/gin.md §7).
         out.push(idx.kind as u8);
@@ -3132,6 +3135,17 @@ fn table_entry_bytes(
                 out.extend_from_slice(&(cid.len() as u16).to_be_bytes());
                 out.extend_from_slice(cid);
                 out.extend_from_slice(&dep.semantic_version.to_be_bytes());
+            }
+        }
+        if !idx.timezone_deps.is_empty() {
+            out.push(u8::from(idx.timezone_deps.dynamic));
+            out.extend_from_slice(&(idx.timezone_deps.zones.len() as u16).to_be_bytes());
+            for dep in &idx.timezone_deps.zones {
+                for text in [&dep.name, &dep.version] {
+                    out.extend_from_slice(&(text.len() as u16).to_be_bytes());
+                    out.extend_from_slice(text.as_bytes());
+                }
+                out.extend_from_slice(&dep.checksum.to_be_bytes());
             }
         }
     }
@@ -4215,7 +4229,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         let iflags = read_u8(buf, pos)?;
         // bit0 unique (v6), bit1 has_predicate (v27 — a partial index, indexes.md §9), bit2
         // has_host_deps (v31 — a host-function index dependency, extensibility.md §8.1); the rest reserved.
-        if iflags & !0b111 != 0 {
+        if iflags & !0b1111 != 0 {
             return Err(corrupt("reserved index flag set"));
         }
         // v13: index_kind byte (0 = ordered B-tree, 1 = GIN — spec/design/gin.md §7);
@@ -4292,6 +4306,39 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         } else {
             Vec::new()
         };
+        let mut timezone_deps = TimeZoneDeps::default();
+        if iflags & 8 != 0 {
+            if kind != IndexKind::Btree {
+                return Err(corrupt(
+                    "a non-btree index cannot have timezone dependencies",
+                ));
+            }
+            let dynamic = read_u8(buf, pos)?;
+            let count = read_u16(buf, pos)?;
+            if dynamic > 1 || (dynamic == 0 && count == 0) {
+                return Err(corrupt("invalid timezone dependency header"));
+            }
+            timezone_deps.dynamic = dynamic == 1;
+            for _ in 0..count {
+                let name = read_string(buf, pos)?;
+                let version = read_string(buf, pos)?;
+                let checksum = read_u32(buf, pos)?;
+                if name.is_empty()
+                    || version.is_empty()
+                    || timezone_deps
+                        .zones
+                        .last()
+                        .is_some_and(|prev| prev.name >= name)
+                {
+                    return Err(corrupt("invalid timezone dependency order or name/version"));
+                }
+                timezone_deps.zones.push(TimeZoneDep {
+                    name,
+                    version,
+                    checksum,
+                });
+            }
+        }
         indexes.push(IndexDef {
             name: iname,
             keys,
@@ -4299,6 +4346,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
             kind,
             predicate,
             host_deps,
+            timezone_deps,
         });
     }
     // Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the

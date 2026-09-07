@@ -37,6 +37,7 @@ type zone struct {
 	Name          string
 	TzdataVersion string
 	Data          tzData
+	Checksum      uint32
 }
 
 // Offset is the local-time type in effect at an instant (the reader output, §4).
@@ -709,7 +710,7 @@ func LoadTimeZoneData(data []byte) error {
 		if err != nil {
 			return err
 		}
-		parsed[z.Name] = &zone{Name: z.Name, TzdataVersion: bundle.TzdataVersion, Data: td}
+		parsed[z.Name] = &zone{Name: z.Name, TzdataVersion: bundle.TzdataVersion, Data: td, Checksum: crc32IEEE(z.Raw)}
 	}
 	loadedTzMu.Lock()
 	defer loadedTzMu.Unlock()
@@ -721,7 +722,7 @@ func LoadTimeZoneData(data []byte) error {
 	for _, l := range bundle.Links {
 		if z, ok := parsed[l.Target]; ok {
 			if _, exists := loadedTz[l.Alias]; !exists {
-				loadedTz[l.Alias] = &zone{Name: l.Alias, TzdataVersion: bundle.TzdataVersion, Data: z.Data}
+				loadedTz[l.Alias] = &zone{Name: l.Alias, TzdataVersion: bundle.TzdataVersion, Data: z.Data, Checksum: z.Checksum}
 			}
 		}
 	}
@@ -887,4 +888,15 @@ func (r *reader) i64() (int64, error) {
 func (r *reader) skip(n int) error {
 	_, err := r.take(n)
 	return err
+}
+
+func indexZoneDeps() []timeZoneDep {
+	loadedTzMu.RLock()
+	defer loadedTzMu.RUnlock()
+	out := make([]timeZoneDep, 0, len(loadedTz))
+	for _, z := range loadedTz {
+		out = append(out, timeZoneDep{Name: z.Name, Version: z.TzdataVersion, Checksum: z.Checksum})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }

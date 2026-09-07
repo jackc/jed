@@ -85,6 +85,10 @@ files in the same change.
 - Cost is part of conformance: the same query and database state must accrue
   identical cost in every core.
 
+Persisted expression keys and partial-index predicates must use the compositional dependency
+contract in `spec/design/index-dependencies.md`: admit safe operations regardless of type, reject
+session/clock/state dependencies, and pin named timezone data until an explicit atomic rebuild.
+
 ## Type System Rules
 
 - Columns have strict static types; values are not silently reinterpreted.

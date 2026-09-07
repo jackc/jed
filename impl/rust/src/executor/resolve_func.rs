@@ -692,6 +692,15 @@ pub(crate) fn resolve_make_timestamp(
         }
         rargs.push(r);
     }
+    if is_tz {
+        if rargs.len() == 7 {
+            params.note_index_zone(&rargs[6])?;
+        } else {
+            params.nonimmutable = true;
+        }
+    } else {
+        params.nonimmutable |= desc.volatility != "immutable";
+    }
     let (func, result) = if name == "make_date" {
         (ScalarFunc::MakeDate, ScalarType::Date)
     } else if is_tz {
@@ -761,6 +770,11 @@ pub(crate) fn resolve_scalar_func(
     // matches (a host-only name, or a host overload over a signature the built-in name does not
     // accept).
     if let Some(desc) = lookup_scalar_overload(name, &tys) {
+        // Catalog volatility is executable admission data. date_part's epoch overload
+        // is refined by its constant field, without erasing dependencies of either child.
+        let epoch = name == "date_part"
+            && matches!(rargs.first(), Some(RExpr::ConstText(f)) if f.eq_ignore_ascii_case("epoch"));
+        params.nonimmutable |= desc.volatility != "immutable" && !epoch;
         let result = scalar_result_type(desc.result, &tys);
         let func = scalar_func_id(name);
         // Promote float arguments to f64 when the function computes at f64 (every float
@@ -1186,14 +1200,13 @@ pub(crate) struct ParamTypes {
     /// when this stayed false — flagging at the node's birth is complete regardless of where in the
     /// plan tree it lands (spec/design/api.md §2.4).
     pub(crate) uncacheable: bool,
-    /// Set during resolution when a node is created whose value depends on statement-execution
-    /// context rather than its inputs alone: the runtime text→date cast (STABLE — its input
-    /// grammar admits the clock-relative specials) and the `DateClock` clock-relative date
-    /// literal (`'today'`/`'now'`/…, date.md §6). The expression-index gate consults it to reject
-    /// such an expression 42P17 (indexes.md §2), the same way PostgreSQL's stable `date_in` is
-    /// unindexable. Orthogonal to `uncacheable`: these nodes re-evaluate per execution, so the
-    /// resolved plan stays cacheable.
+    /// Dependencies accumulate recursively at operation resolution (index-dependencies.md).
+    /// Session timezone, clock, entropy, sequences, session variables, and runtime text-to-date
+    /// inputs make a persisted expression nonimmutable (42P17). This is separate from plan
+    /// cacheability: ordinary queries can evaluate these operations afresh on every execution.
     pub(crate) nonimmutable: bool,
+    pub(crate) index_context: bool,
+    pub(crate) timezone_deps: TimeZoneDeps,
 }
 
 /// Resolve a date-context string literal naming one of the special values beyond ±infinity
@@ -3703,6 +3716,8 @@ pub(crate) fn resolve(
                 // Validate field-for-type (0A000 / 22023); the value is discarded.
                 extract_field(field, probe)?;
             }
+            params.nonimmutable |=
+                matches!(src_t, ResolvedType::Timestamptz) && !field.eq_ignore_ascii_case("epoch");
             Ok((
                 RExpr::Extract {
                     field: field.clone(),
@@ -3911,6 +3926,8 @@ pub(crate) fn resolve(
                     ResolvedType::Timestamptz if target.is_timestamptz() => Ok((rinner, ity)),
                     ResolvedType::Date if target.is_date() => Ok((rinner, ity)),
                     ResolvedType::Timestamp | ResolvedType::Timestamptz | ResolvedType::Date => {
+                        params.nonimmutable |=
+                            matches!(ity, ResolvedType::Timestamptz) || target.is_timestamptz();
                         Ok((
                             RExpr::DateConvert {
                                 inner: Box::new(rinner),

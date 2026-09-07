@@ -182,8 +182,15 @@ func (db *engine) estimatorInputFor(r *planRel) (estimatorInputSignature, bool) 
 		return estimatorInputSignature{}, false
 	}
 	table := strings.ToLower(r.tableName)
-	if _, ok := snap.table(table); !ok {
+	def, ok := snap.table(table)
+	if !ok {
 		return estimatorInputSignature{}, false
+	}
+	// A dynamic timezone set can change independently of the catalog generation.
+	for _, ix := range def.Indexes {
+		if ix.TimezoneDeps.Dynamic {
+			return estimatorInputSignature{}, false
+		}
 	}
 	return estimatorInputSignature{
 		database: snap.estimatorIdentity,

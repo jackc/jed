@@ -277,6 +277,26 @@ fn partial_index_table_db() -> Session {
 /// `geo_hash(a)`, a host scalar function (i64 -> i64), component "com.example/geo_hash" at semantic
 /// version 1. The table is EMPTY (the tree empty, root 0), so the fixture isolates the v31 catalog
 /// change. Must match verify.rb's HOSTFUNC_INDEX_TABLE.
+fn timezone_index_table_db() -> Session {
+    jed::timezone::load_time_zone_data(include_bytes!("../../../spec/tz/fixtures/tzdata.jtz"))
+        .unwrap();
+    let mut db = Database::create(CreateOptions {
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamptz)",
+    );
+    run(
+        &mut db,
+        "CREATE INDEX t_zone_idx ON t ((ts AT TIME ZONE 'US/Eastern'),(ts AT TIME ZONE 'America/New_York')) WHERE ts IS NOT NULL",
+    );
+    db
+}
+
 fn hostfunc_index_table_db() -> Session {
     let mut reg = jed::ExtensionRegistry::new();
     reg.register_function(
@@ -1503,6 +1523,7 @@ fn write_matches_goldens() {
         ("unique_table.jed", unique_table_db),
         ("expr_index_table.jed", expr_index_table_db),
         ("partial_index_table.jed", partial_index_table_db),
+        ("timezone_index_table.jed", timezone_index_table_db),
         ("hostfunc_index_table.jed", hostfunc_index_table_db),
         ("gin_array_table.jed", gin_array_table_db),
         ("gin_uuid_table.jed", gin_uuid_table_db),
@@ -1599,6 +1620,7 @@ fn read_goldens_reproduces_rows() {
         ("unique_table.jed", unique_table_db, "t"),
         ("expr_index_table.jed", expr_index_table_db, "t"),
         ("partial_index_table.jed", partial_index_table_db, "t"),
+        ("timezone_index_table.jed", timezone_index_table_db, "t"),
         ("gin_array_table.jed", gin_array_table_db, "t"),
         ("gin_uuid_table.jed", gin_uuid_table_db, "t"),
         ("fk_table.jed", fk_table_db, "c"),

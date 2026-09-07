@@ -912,6 +912,7 @@ export function resolve(
         }
         extractField(e.field, probe); // validate field-for-type (0A000 / 22023); value discarded
       }
+      params.nonimmutable ||= src.type.kind === "timestamptz" && e.field.toLowerCase() !== "epoch";
       return {
         node: { kind: "extract", field: e.field, value: src.node },
         type: { kind: "decimal" },
@@ -1209,6 +1210,7 @@ export function resolve(
           return { node: inner.node, type: inner.type };
         }
         if (ik === "timestamp" || ik === "timestamptz" || ik === "date") {
+          params.nonimmutable ||= ik === "timestamptz" || isTimestamptz(target);
           return { node: { kind: "dateConvert", inner: inner.node, to: target }, type: toRt };
         }
         if (ik === "text" && isDate(target)) {

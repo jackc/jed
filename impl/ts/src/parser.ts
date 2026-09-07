@@ -4597,6 +4597,10 @@ function renderToken(t: Token): string {
       return ">=";
     case "colon":
       return ":";
+    case "doubleColon":
+      return "::";
+    case "fatArrow":
+      return "=>";
     case "concat":
       return "||";
     case "contains":
@@ -4643,7 +4647,7 @@ function renderToken(t: Token): string {
       return "!~";
     case "bangTildeStar":
       return "!~*";
-    default: // "eof" — never inside the parentheses
+    case "eof": // never inside the parentheses
       return "";
   }
 }

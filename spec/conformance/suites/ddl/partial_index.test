@@ -6,8 +6,8 @@
 # to the predicate (the syntactic implication gate). The ROWS never change with or without the
 # pushdown (the WHERE stays the residual filter) — only cost does; the `# cost:` lines pin the
 # cross-core index-bound usage (query.index_partial). Rows + error codes AGREE with PostgreSQL
-# (oracle-checked); the jed-specific pieces (the predicate column in jed_indexes, the conservative
-# timestamptz-predicate 42P17, the partial-GIN 0A000, the collation-upgrade 0A000) live in the
+# (oracle-checked); the jed-specific pieces (the predicate column in jed_indexes, the
+# partial-GIN 0A000 and the collation-upgrade 0A000) live in the
 # per-core tests. Format: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.index_partial, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.point_lookup, query.index_partial, query.aggregates, query.subquery_scalar, types.i32, types.text, resource.cost_metering
 

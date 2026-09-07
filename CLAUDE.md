@@ -444,6 +444,10 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   core must be byte-readable by the Go core and vice versa. This single test catches an
   entire class of divergence automatically.
 
+Persisted expression keys and partial-index predicates must use the compositional dependency
+contract in `spec/design/index-dependencies.md`: admit safe operations regardless of type, reject
+session/clock/state dependencies, and pin named timezone data until an explicit atomic rebuild.
+
 ---
 
 ## 9. Storage

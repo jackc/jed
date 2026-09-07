@@ -1,5 +1,5 @@
 // Partial-index behaviors the shared corpus cannot express (a PG divergence — jed's syntactic
-// implication + timestamptz hazard; on-disk byte round-trip; catalog introspection). The PG-agreeing
+// implication; on-disk byte round-trip; catalog introspection). The PG-agreeing
 // behavior (23505 among qualifying rows, error codes, planner rows) lives in the corpus
 // (spec/conformance/suites/ddl/partial_index.test).
 
@@ -82,13 +82,13 @@ test("partial planner gates on the predicate conjunct", () => {
   assert.deepEqual(cells(db, "SELECT id FROM pt WHERE status = 'active' AND amt = 10"), [["1"]]);
 });
 
-// A timestamptz-referencing predicate is 42P17 (the session-tz hazard, a jed divergence); a
+// A session-dependent timestamptz-to-date cast is 42P17; a
 // non-boolean predicate is 42804; a partial GIN index is 0A000.
 test("partial predicate rejections", () => {
   const db = memDb().session();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamptz, a i32, arr i32[])");
   assert.equal(
-    errCode(() => run(db, "CREATE INDEX ON t (a) WHERE ts IS NULL")),
+    errCode(() => run(db, "CREATE INDEX ON t (a) WHERE ts::date IS NULL")),
     "42P17",
   );
   assert.equal(

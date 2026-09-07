@@ -377,14 +377,13 @@ type paramTypes struct {
 	// execute). A prepared statement's plan cache fills only when this stayed false — flagging at the
 	// node's birth is complete regardless of where in the plan tree it lands (spec/design/api.md §2.4).
 	uncacheable bool
-	// nonimmutable is set during resolution when a node is created whose value depends on
-	// statement-execution context rather than its inputs alone: the runtime text→date cast
-	// (STABLE — its input grammar admits the clock-relative specials) and the reDateClock
-	// clock-relative date literal ('today'/'now'/…, date.md §6). The expression-index gate
-	// consults it to reject such an expression 42P17 (indexes.md §2), the same way PostgreSQL's
-	// stable date_in is unindexable. Orthogonal to uncacheable: these nodes re-evaluate per
-	// execution, so the resolved plan stays cacheable.
+	// Dependencies accumulate recursively at operation resolution (index-dependencies.md).
+	// Session timezone, clock, entropy, sequences, session variables, and runtime text-to-date
+	// inputs make a persisted expression nonimmutable (42P17). This is separate from plan
+	// cacheability: ordinary queries can evaluate these operations afresh on every execution.
 	nonimmutable bool
+	indexContext bool
+	timezoneDeps timeZoneDeps
 }
 
 // note records that $(idx0+1) appears with context type ty (nil = no context here). It unifies
@@ -1274,6 +1273,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				return nil, resolvedType{}, err
 			}
 		}
+		params.nonimmutable = params.nonimmutable || (srcT.kind == rtTimestamptz && !strings.EqualFold(e.Extract.Field, "epoch"))
 		return &rExpr{kind: reExtract, cText: e.Extract.Field, operand: srcR}, resolvedType{kind: rtDecimal}, nil
 	case exprCast:
 		// An array cast target `…::T[]` (spec/design/array.md §7). v1 supports only the
@@ -1569,6 +1569,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				ity.kind == rtDate && target.IsDate():
 				return inner, ity, nil
 			case ity.kind == rtTimestamp || ity.kind == rtTimestamptz || ity.kind == rtDate:
+				params.nonimmutable = params.nonimmutable || ity.kind == rtTimestamptz || target == scalarTimestamptz
 				return &rExpr{kind: reDateConvert, operand: inner, result: target}, toRt, nil
 			case ity.kind == rtText && target.IsDate():
 				// The runtime text → date cast (date.md §6): a NON-literal text source (a string

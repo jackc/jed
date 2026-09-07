@@ -531,19 +531,11 @@ The bit work lives in a small per-core `uuid` module (`uuid.rs`/`uuid.go`/`uuid.
 separate from value.rs's text rendering/parsing; the resolver/eval wire it like any scalar
 function. Cost is the uniform one `operator_eval` per call.
 
-**The `volatility` field** (catalog schema_version 2). The catalog grows an optional
-`volatility` column — PostgreSQL's class, `immutable | stable | volatile`, absent ⇒
-`immutable`. Every existing operator/function is `immutable` (and stays so by default, no
-re-authoring); the generators are `volatile`; `now()`/`current_timestamp` (the clock seam) is
-`stable` and `clock_timestamp()` is `volatile` (below).
-It marks a call non-foldable for a future constant-folding/CSE pass. It is **advisory today** —
-no such pass exists yet — the same posture §8's `cost` field held before it went live: the spec
-states the truth at the point the function is added, and the optimizer slice that needs the
-data finds it already there (`cost` has since become live — §8; `volatility` still awaits its
-pass). `verify.rb` validates the value set; `gen_catalog.rb` emits it (default `immutable`) into
-the descriptor table each core reads.
-
-### Current-time functions — `now()` / `current_timestamp` / `clock_timestamp()`
+**The `volatility` field** (catalog schema_version 2) is required on every operator/function row:
+`immutable | stable | volatile`. The resolved ordinary scalar overload uses it for persisted-index
+admission. Specialized datetime syntax refines effects using resolved types and explicit arguments;
+[index-dependencies.md](index-dependencies.md) defines these compositional rules. Future folding/CSE
+must respect the same effects. Adding a catalog row without volatility fails verification.
 
 Three niladic `timestamptz` functions on the host-injected **clock seam**
 ([entropy.md](entropy.md) §5; the seam's micros are exactly timestamptz's internal representation,

@@ -5999,6 +5999,8 @@ func renderToken(t token) string {
 		return "=>"
 	case tokColon:
 		return ":"
+	case tokDoubleColon:
+		return "::"
 	case tokConcat:
 		return "||"
 	case tokContains:

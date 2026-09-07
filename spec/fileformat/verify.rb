@@ -1,3 +1,4 @@
+require "zlib"
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
@@ -25,7 +26,7 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 31 # format_version 31: host-function index dependencies (extensibility.md §8.1) — the
+VERSION = 32 # format_version 32 adds timezone dependencies; v31: host-function index dependencies (extensibility.md §8.1) — the
 # per-index index_flags byte gains bit2 has_host_deps, and (only when set) after the v27 predicate a
 # u16 dep_count + per dependency name (u16 len + UTF-8) ‖ arg_count u16 ‖ arg type codes (u8 each) ‖
 # result type code (u8) ‖ component_id (u16 len + UTF-8) ‖ semantic_version u32, in ascending
@@ -810,6 +811,16 @@ PARTIAL_INDEX_TABLE = {
 # id + version) via
 #   CREATE TABLE t (id i64 PRIMARY KEY, a i64)
 #   CREATE INDEX t_geo_idx ON t (geo_hash(a))
+# A v32 expression + partial index pins two exact names, including an alias, in sorted order.
+TIMEZONE_INDEX_TABLE = {
+  name: "t", columns: [col("id", "i32", pk: true), col("ts", "timestamptz")],
+  indexes: [{ name: "t_zone_idx", cols: [{expr: "ts AT TIME ZONE 'US/Eastern'"}, {expr: "ts AT TIME ZONE 'America/New_York'"}],
+    predicate: "ts IS NOT NULL", timezone_deps: { dynamic: false,
+      zones: %w[America/New_York US/Eastern].map { |name| { name: name, version: "2026a",
+        checksum: Zlib.crc32(File.binread(File.join(__dir__, "../tz/2026a/zones/America/New_York"))) } } } }],
+  rows: []
+}.freeze
+
 HOSTFUNC_INDEX_TABLE = {
   name: "t",
   columns: [col("id", "i64", pk: true), col("a", "i64")],
@@ -1286,6 +1297,7 @@ FIXTURES = [
   { file: "unique_table.jed", page_size: 256, tables: [UNIQUE_TABLE] },
   { file: "expr_index_table.jed", page_size: 256, tables: [EXPR_INDEX_TABLE] },
   { file: "partial_index_table.jed", page_size: 256, tables: [PARTIAL_INDEX_TABLE] },
+  { file: "timezone_index_table.jed", page_size: 256, tables: [TIMEZONE_INDEX_TABLE] },
   { file: "hostfunc_index_table.jed", page_size: 256, tables: [HOSTFUNC_INDEX_TABLE] },
   { file: "gin_array_table.jed", page_size: 256, tables: [GIN_ARRAY_TABLE] },
   { file: "gin_uuid_table.jed", page_size: 256, tables: [GIN_UUID_TABLE] },
@@ -1948,7 +1960,10 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
     # index_flags: bit0 unique (v6), bit1 has_predicate (v27 — a partial index, indexes.md §9),
     # bit2 has_host_deps (v31 — a host-function index dependency, extensibility.md §8.1).
     host_deps = ix[:host_deps] || []
-    out << [(ix[:unique] ? 1 : 0) | (ix[:predicate] ? 2 : 0) | (host_deps.empty? ? 0 : 4)].pack("C")
+    timezone_deps = ix[:timezone_deps]
+    has_timezone_deps = timezone_deps && (timezone_deps[:dynamic] || !timezone_deps[:zones].empty?)
+    out << [(ix[:unique] ? 1 : 0) | (ix[:predicate] ? 2 : 0) | (host_deps.empty? ? 0 : 4) | (has_timezone_deps ? 8 : 0)].pack("C")
+
     # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST (gist.md §8).
     out << [{ "gin" => 1, "gist" => 2 }.fetch(ix[:kind], 0)].pack("C")
     out << u32(index_roots[k])
@@ -1965,6 +1980,14 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
         out << [dep[:result]].pack("C")
         out << u16(dep[:component_id].bytesize) << dep[:component_id].b
         out << u32(dep[:semantic_version])
+      end
+    end
+    if has_timezone_deps
+      out << [timezone_deps[:dynamic] ? 1 : 0].pack("C") << u16(timezone_deps[:zones].size)
+      timezone_deps[:zones].each do |dep|
+        out << u16(dep[:name].bytesize) << dep[:name].b
+        out << u16(dep[:version].bytesize) << dep[:version].b
+        out << u32(dep[:checksum])
       end
     end
   end
@@ -3189,7 +3212,7 @@ def decode_table_entry(buf, pos)
     end
     fb, pos = take(buf, pos, 1)
     # bit0 unique (v6), bit1 has_predicate (v27), bit2 has_host_deps (v31 — extensibility.md §8.1).
-    raise "reserved index flag set (only bit0 unique / bit1 has_predicate / bit2 has_host_deps defined)" if (fb.getbyte(0) & ~0b111) != 0
+    raise "reserved index flag set" if (fb.getbyte(0) & ~0b1111) != 0
     kb, pos = take(buf, pos, 1) # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST
     raise "reserved index kind (only 0=btree, 1=gin, 2=gist defined — v20)" if kb.getbyte(0) > 2
     has_predicate = (fb.getbyte(0) & 0b10) != 0
@@ -3225,9 +3248,28 @@ def decode_table_entry(buf, pos)
                        semantic_version: svb.unpack1("N") }
       end
     end
+    timezone_deps = nil
+    if (fb.getbyte(0) & 8) != 0
+      raise "a non-btree index cannot have timezone dependencies" if kb.getbyte(0) != 0
+      db, pos = take(buf, pos, 1)
+      dc, pos = take(buf, pos, 2)
+      dynamic, count = db.getbyte(0), dc.unpack1("n")
+      raise "invalid timezone dependency header" if dynamic > 1 || (dynamic == 0 && count == 0)
+      timezone_deps = { dynamic: dynamic == 1, zones: [] }
+      count.times do
+        nl, pos = take(buf, pos, 2)
+        dep_name, pos = take(buf, pos, nl.unpack1("n"))
+        vl, pos = take(buf, pos, 2)
+        version, pos = take(buf, pos, vl.unpack1("n"))
+        cb, pos = take(buf, pos, 4)
+        prev = timezone_deps[:zones].last
+        raise "invalid timezone dependency order or name/version" if dep_name.empty? || version.empty? || (prev && prev[:name].b >= dep_name.b)
+        timezone_deps[:zones] << { name: dep_name.force_encoding("UTF-8"), version: version.force_encoding("UTF-8"), checksum: cb.unpack1("N") }
+      end
+    end
     indexes << { name: iname, cols: cols, unique: (fb.getbyte(0) & 1) != 0,
                  kind: { 1 => "gin", 2 => "gist" }.fetch(kb.getbyte(0), "btree"),
-                 root_page: rb.unpack1("N"), predicate: predicate, host_deps: host_deps }
+                 root_page: rb.unpack1("N"), predicate: predicate, host_deps: host_deps, timezone_deps: timezone_deps }
   end
   # Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the
   # actions byte, in name order. An FK owns no B-tree (no root page).
@@ -3814,7 +3856,7 @@ def decode_image(image)
               else
                 read_tree_keys(image, ps, ix[:root_page])
               end
-        { name: ix[:name], cols: ix[:cols], entries: raw.map { |k| k.unpack1("H*") } }
+        { name: ix[:name], cols: ix[:cols], timezone_deps: ix[:timezone_deps], entries: raw.map { |k| k.unpack1("H*") } }
       end
       tables << { name: entry[:name], columns: entry[:columns], pk: entry[:pk],
                   checks: entry[:checks], indexes: indexes, rows: rows }
@@ -3901,11 +3943,11 @@ def expected_tables(fx)
       checks: (t[:checks] || []).map { |ck| { name: ck[:name], expr: ck[:expr] } },
       indexes: (t[:indexes] || []).map do |ix|
         if ix[:kind] == "gist"
-          { name: ix[:name], cols: ix[:cols],
+          { name: ix[:name], cols: ix[:cols], timezone_deps: ix[:timezone_deps],
             entries: gist_leaf_keys_sorted(t, ix).map { |k| k.unpack1("H*") } }
         else
           ent = ix[:kind] == "gin" ? gin_index_entries(t, ix) : index_entries(t, ix)
-          { name: ix[:name], cols: ix[:cols],
+          { name: ix[:name], cols: ix[:cols], timezone_deps: ix[:timezone_deps],
             entries: ent.map { |key, _| key.unpack1("H*") } }
         end
       end,

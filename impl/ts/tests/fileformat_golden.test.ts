@@ -1,3 +1,4 @@
+import { loadTimeZoneData } from "../src/timezone.ts";
 // Golden-file cross-core test (CLAUDE.md §8). The load-bearing honesty test for the
 // on-disk format: this core must (a) READ a checked-in golden into the expected catalog
 // + rows, and (b) WRITE the same logical database to bytes equal to the golden EXACTLY.
@@ -189,6 +190,17 @@ function partialIndexTableDB(): Engine {
 // geo_hash(a), a host scalar function (i64 -> i64), component "com.example/geo_hash" at semantic
 // version 1. The table is EMPTY (the tree empty, root 0), so the fixture isolates the v31 catalog
 // change. Must match verify.rb's HOSTFUNC_INDEX_TABLE.
+function timezoneIndexTableDB(): Engine {
+  loadTimeZoneData(new Uint8Array(readFileSync(specPath("tz/fixtures/tzdata.jtz"))));
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamptz)");
+  run(
+    db,
+    "CREATE INDEX t_zone_idx ON t ((ts AT TIME ZONE 'US/Eastern'),(ts AT TIME ZONE 'America/New_York')) WHERE ts IS NOT NULL",
+  );
+  return db;
+}
+
 function hostfuncIndexTableDB(): Engine {
   const db = goldenDb();
   const reg = new ExtensionRegistry();
@@ -1006,6 +1018,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "unique_table.jed", build: uniqueTableDB },
     { name: "expr_index_table.jed", build: exprIndexTableDB },
     { name: "partial_index_table.jed", build: partialIndexTableDB },
+    { name: "timezone_index_table.jed", build: timezoneIndexTableDB },
     { name: "hostfunc_index_table.jed", build: hostfuncIndexTableDB },
     { name: "gin_array_table.jed", build: ginArrayTableDB },
     { name: "gin_uuid_table.jed", build: ginUuidTableDB },
@@ -1080,6 +1093,7 @@ test("read goldens reproduces rows", () => {
     { name: "unique_table.jed", build: uniqueTableDB, table: "t" },
     { name: "expr_index_table.jed", build: exprIndexTableDB, table: "t" },
     { name: "partial_index_table.jed", build: partialIndexTableDB, table: "t" },
+    { name: "timezone_index_table.jed", build: timezoneIndexTableDB, table: "t" },
     { name: "hostfunc_index_table.jed", build: hostfuncIndexTableDB, table: "t" },
     { name: "gin_array_table.jed", build: ginArrayTableDB, table: "t" },
     { name: "gin_uuid_table.jed", build: ginUuidTableDB, table: "t" },

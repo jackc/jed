@@ -6,7 +6,7 @@ import (
 )
 
 // Partial-index behaviors the shared corpus cannot express (a PG divergence — jed's syntactic
-// implication + timestamptz hazard; on-disk byte round-trip; catalog introspection). The PG-agreeing
+// implication; on-disk byte round-trip; catalog introspection). The PG-agreeing
 // behavior (23505 among qualifying rows, error codes, planner rows) lives in the corpus
 // (spec/conformance/suites/ddl/partial_index.test).
 
@@ -71,13 +71,13 @@ func TestPartialPlannerGatesOnPredicateConjunct(t *testing.T) {
 	}
 }
 
-// A timestamptz-referencing predicate is 42P17 (the session-tz hazard, a jed divergence); a
+// A session-dependent timestamptz-to-date cast is 42P17; a
 // non-boolean predicate is 42804; a partial GIN index is 0A000.
 func TestPartialPredicateRejections(t *testing.T) {
 	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamptz, a i32, arr i32[])")
-	if code := errCode(t, db, "CREATE INDEX ON t (a) WHERE ts IS NULL"); code != "42P17" {
+	if code := errCode(t, db, "CREATE INDEX ON t (a) WHERE ts::date IS NULL"); code != "42P17" {
 		t.Fatalf("timestamptz predicate: want 42P17, got %s", code)
 	}
 	if code := errCode(t, db, "CREATE INDEX ON t (a) WHERE a"); code != "42804" {

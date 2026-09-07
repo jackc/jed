@@ -1123,6 +1123,7 @@ impl Engine {
                     predicate: None,
                     // A PK / UNIQUE constraint index is always plain-column — no host dependency.
                     host_deps: Vec::new(),
+                    timezone_deps: TimeZoneDeps::default(),
                 },
             );
         }
@@ -1385,6 +1386,7 @@ impl Engine {
                     predicate: None,
                     // A GiST exclusion-backing index is plain-column — no host dependency.
                     host_deps: Vec::new(),
+                    timezone_deps: TimeZoneDeps::default(),
                 },
             );
             table.exclusions.push(ExclusionConstraint {
@@ -2321,6 +2323,7 @@ impl Engine {
                                     kind: IndexKind::Btree,
                                     predicate: None,
                                     host_deps: Vec::new(),
+                                    timezone_deps: TimeZoneDeps::default(),
                                 });
                                 table.indexes.sort_by_key(|x| x.name.to_ascii_lowercase());
                                 added_constraints.insert(name.to_ascii_lowercase());
@@ -2531,6 +2534,7 @@ impl Engine {
                                     kind: IndexKind::Gist,
                                     predicate: None,
                                     host_deps: Vec::new(),
+                                    timezone_deps: TimeZoneDeps::default(),
                                 });
                                 table.exclusions.push(ExclusionConstraint {
                                     name: name.clone(),
@@ -3721,6 +3725,8 @@ impl Engine {
         def: &IndexDef,
         params: &mut ParamTypes,
     ) -> Result<ResolvedIndex> {
+        params.uncacheable |= def.timezone_deps.dynamic;
+        verify_index_timezone_deps(&def.timezone_deps)?;
         let mut keys = Vec::with_capacity(def.keys.len());
         for k in &def.keys {
             match k {
@@ -4107,6 +4113,7 @@ impl Engine {
         // persisted so a reopening binary can re-check them. Empty for the common index with no host
         // function (byte-identical to v30 then).
         let mut host_deps: Vec<HostFuncDep> = Vec::new();
+        let mut timezone_deps = TimeZoneDeps::default();
         for elem in &ci.keys {
             // An EXPRESSION key element (spec/design/indexes.md §1/§2): resolve it against the
             // table's columns, validate it is immutable + indexable-typed, and store its canonical
@@ -4125,29 +4132,15 @@ impl Engine {
                     }
                     // A subquery is not a deterministic function of the row — 0A000 (the resolver
                     // admits an uncorrelated one, so it is rejected here, before resolution).
-                    if index_expr_has_subquery(expr) {
-                        return Err(EngineError::new(
-                            SqlState::FeatureNotSupported,
-                            "cannot use subquery in index expression".to_string(),
-                        ));
-                    }
+                    reject_index_predicate_structure(expr)?;
                     // Resolve against the table (an aggregate 42803 / window 42P20 / bind parameter
                     // 42P02 fall out of the resolver, as for a CHECK).
                     let scope = Scope::single(self, table);
-                    let mut pt = ParamTypes::default();
+                    let mut pt = ParamTypes::for_index();
                     let (node, rtype) =
                         resolve(&scope, expr, None, &mut AggCtx::Forbidden, &mut pt)?;
-                    // Immutability (§2): a non-immutable seam/sequence/current_setting call, a
-                    // session-timezone-dependent expression (one that reads or produces a
-                    // `timestamptz` — conservatively fail-closed), or a resolved STABLE node (the
-                    // runtime text→date cast, flagged at its birth — `ParamTypes::nonimmutable`),
-                    // is 42P17.
-                    let refs = check_referenced_columns(expr, &columns);
-                    let tz_hazard = matches!(rtype, ResolvedType::Timestamptz)
-                        || refs
-                            .iter()
-                            .any(|&i| columns[i].ty.as_scalar() == Some(ScalarType::Timestamptz));
-                    if index_expr_nonimmutable_call(expr) || tz_hazard || pt.nonimmutable {
+                    // Dependencies accumulate at each resolved operation, through every child.
+                    if pt.nonimmutable {
                         return Err(EngineError::new(
                             SqlState::InvalidObjectDefinition,
                             "functions in index expression must be marked IMMUTABLE".to_string(),
@@ -4166,6 +4159,7 @@ impl Engine {
                     // closes the latent leak where a volatile host function passed the syntactic
                     // immutability walk above).
                     collect_index_host_deps(&node, &self.session.extensions, &mut host_deps)?;
+                    timezone_deps.merge(&pt.timezone_deps);
                     ci_keys.push(IndexKey::Expr(IndexKeyExpr {
                         expr_text: text.clone(),
                         expr: expr.clone(),
@@ -4331,18 +4325,10 @@ impl Engine {
                 // 42804 rejections then fall out of the Forbidden-context boolean resolve below.
                 reject_index_predicate_structure(&pred.expr)?;
                 let scope = Scope::single(self, table);
-                let mut pt = ParamTypes::default();
+                let mut pt = ParamTypes::for_index();
                 let node = resolve_boolean_filter(&scope, &pred.expr, &mut pt)?;
-                // Immutability (§9), the same rule an expression key carries: a non-immutable
-                // seam/clock/sequence call, a session-timezone-dependent subexpression (one that
-                // references a `timestamptz` column or produces a `timestamptz` value — conservatively
-                // fail-closed), or a resolved STABLE node (the runtime text→date cast,
-                // `ParamTypes::nonimmutable`), is 42P17.
-                let refs = check_referenced_columns(&pred.expr, &columns);
-                let tz_hazard = refs
-                    .iter()
-                    .any(|&i| columns[i].ty.as_scalar() == Some(ScalarType::Timestamptz));
-                if index_expr_nonimmutable_call(&pred.expr) || tz_hazard || pt.nonimmutable {
+                // Dependencies accumulate at each resolved operation, through every child.
+                if pt.nonimmutable {
                     return Err(EngineError::new(
                         SqlState::InvalidObjectDefinition,
                         "functions in index predicate must be marked IMMUTABLE".to_string(),
@@ -4351,6 +4337,7 @@ impl Engine {
                 // Collect + admit any host functions the predicate calls (§8.1, step 4), same rule as
                 // a key expression (IMMUTABLE + component identity, else 42P17).
                 collect_index_host_deps(&node, &self.session.extensions, &mut host_deps)?;
+                timezone_deps.merge(&pt.timezone_deps);
                 Some(IndexKeyExpr {
                     expr_text: pred.text.clone(),
                     expr: pred.expr.clone(),
@@ -4415,6 +4402,7 @@ impl Engine {
             }
         };
 
+        timezone_deps.validate()?;
         let def = IndexDef {
             name,
             keys: ci_keys,
@@ -4422,6 +4410,7 @@ impl Engine {
             kind,
             predicate,
             host_deps,
+            timezone_deps,
         };
         // The build scan (cost.md §3): page_read per table-tree node + storage_row_read per
         // row. The touched set is the columns the key elements read — an index column for a
@@ -5015,9 +5004,8 @@ mod expr_index_tests {
         .unwrap();
         let e = execute(&mut db, "CREATE INDEX ON t ((uuidv4()))").unwrap_err();
         assert_eq!(e.code(), "42P17", "seam function rejected");
-        // A timestamptz-dependent EXPRESSION is also non-immutable (its value depends on the
-        // session time zone) — conservatively fail-closed (indexes.md §2).
-        let e2 = execute(&mut db, "CREATE INDEX ON t ((ts + interval '1 hour'))").unwrap_err();
+        // A cast that consults the session timezone is nonimmutable (index-dependencies.md).
+        let e2 = execute(&mut db, "CREATE INDEX ON t ((ts::date))").unwrap_err();
         assert_eq!(e2.code(), "42P17", "timestamptz expression rejected");
         // A bare `(ts)` normalizes to a plain column key — a timestamptz COLUMN is indexable.
         execute(&mut db, "CREATE INDEX ON t ((ts))").expect("bare (ts) is a column key");
@@ -5043,7 +5031,7 @@ mod expr_index_tests {
 #[cfg(test)]
 mod partial_index_tests {
     //! Partial-index behaviors the shared corpus cannot express (a PG divergence — jed's syntactic
-    //! implication + timestamptz hazard; on-disk byte round-trip; catalog introspection). The
+    //! implication; on-disk byte round-trip; catalog introspection). The
     //! PG-agreeing behavior (23505 among qualifying rows, error codes, planner rows) lives in the
     //! corpus (spec/conformance/suites/ddl/partial_index.test).
     use crate::{Engine, Outcome, execute};
@@ -5142,8 +5130,7 @@ mod partial_index_tests {
         assert_eq!(ids, vec![1], "only the active amt=10 row");
     }
 
-    // A timestamptz-referencing predicate is conservatively 42P17 (the session-tz hazard, extended
-    // from expression keys — a documented jed divergence, indexes.md §9). A non-boolean predicate is
+    // A session-dependent timestamptz-to-date cast is 42P17; a non-boolean predicate is
     // 42804; a partial GIN index is 0A000.
     #[test]
     fn predicate_rejections() {
@@ -5153,7 +5140,7 @@ mod partial_index_tests {
             "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamptz, a i32, arr i32[])",
         )
         .unwrap();
-        let tz = execute(&mut db, "CREATE INDEX ON t (a) WHERE ts IS NULL").unwrap_err();
+        let tz = execute(&mut db, "CREATE INDEX ON t (a) WHERE ts::date IS NULL").unwrap_err();
         assert_eq!(tz.code(), "42P17", "timestamptz predicate rejected");
         let nb = execute(&mut db, "CREATE INDEX ON t (a) WHERE a").unwrap_err();
         assert_eq!(nb.code(), "42804", "non-boolean predicate rejected");

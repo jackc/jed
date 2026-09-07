@@ -1399,6 +1399,10 @@ func (db *engine) resolveIndex(table *catTable, def indexDef) (resolvedIndex, er
 }
 
 func (db *engine) resolveIndexWithParams(table *catTable, def indexDef, ptypes *paramTypes) (resolvedIndex, error) {
+	ptypes.uncacheable = ptypes.uncacheable || def.TimezoneDeps.Dynamic
+	if err := verifyIndexTimezoneDeps(def.TimezoneDeps); err != nil {
+		return resolvedIndex{}, err
+	}
 	keys := make([]resolvedKey, 0, len(def.Keys))
 	for _, k := range def.Keys {
 		if k.Expr == nil {
@@ -3107,6 +3111,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 	// persisted so a reopening binary can re-check them. nil for the common index with no host function
 	// (byte-identical to v30 then).
 	var hostDeps []hostFuncDep
+	var timezoneDeps timeZoneDeps
 	for _, elem := range ci.Keys {
 		// An EXPRESSION key element (spec/design/indexes.md §1/§2): resolve it against the table's
 		// columns, validate it is immutable + indexable-typed, and store its canonical text
@@ -3119,31 +3124,19 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			}
 			// A subquery is not a deterministic function of the row — 0A000 (the resolver admits an
 			// uncorrelated one, so it is rejected here, before resolution).
-			if indexExprHasSubquery(*elem.Expr) {
-				return outcome{}, newError(FeatureNotSupported, "cannot use subquery in index expression")
+			if err := rejectIndexPredicateStructure(*elem.Expr); err != nil {
+				return outcome{}, err
 			}
 			// Resolve against the table (an aggregate 42803 / window 42P20 / bind parameter 42P02
 			// fall out of the resolver, as for a CHECK).
 			s := singleScope(db, table)
-			pt := &paramTypes{}
+			pt := &paramTypes{indexContext: true}
 			node, rtype, rerr := resolve(s, *elem.Expr, nil, &aggCtx{collecting: false}, pt)
 			if rerr != nil {
 				return outcome{}, rerr
 			}
-			// Immutability (§2): a non-immutable seam/sequence/current_setting call, a session-
-			// timezone-dependent expression (one that reads or produces a timestamptz — conservatively
-			// fail-closed), or a resolved STABLE node (the runtime text→date cast, flagged at its
-			// birth — resolve.go paramTypes.nonimmutable), is 42P17.
-			tzHazard := rtype.kind == rtTimestamptz
-			if !tzHazard {
-				for _, ref := range checkReferencedColumns(*elem.Expr, columns) {
-					if s, ok := columns[ref].Type.AsScalar(); ok && s == scalarTimestamptz {
-						tzHazard = true
-						break
-					}
-				}
-			}
-			if indexExprNonimmutableCall(*elem.Expr) || tzHazard || pt.nonimmutable {
+			// Dependencies accumulate at each resolved operation, through every child.
+			if pt.nonimmutable {
 				return outcome{}, newError(InvalidObjectDefinition,
 					"functions in index expression must be marked IMMUTABLE")
 			}
@@ -3158,6 +3151,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 				return outcome{}, newError(FeatureNotSupported,
 					"an index on an expression of this result type is not supported yet")
 			}
+			timezoneDeps.merge(pt.timezoneDeps)
 			ciKeys = append(ciKeys, indexKey{Expr: &indexKeyExpr{ExprText: elem.Text, Expr: *elem.Expr}})
 			continue
 		}
@@ -3257,23 +3251,13 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			return outcome{}, err
 		}
 		s := singleScope(db, table)
-		pt := &paramTypes{}
+		pt := &paramTypes{indexContext: true}
 		pnode, err := resolveBooleanFilter(s, &ci.Predicate.Expr, pt)
 		if err != nil {
 			return outcome{}, err
 		}
-		// Immutability (§9), the same rule an expression key carries: a non-immutable seam/clock/
-		// sequence call, a timestamptz-dependent subexpression (references a timestamptz column —
-		// conservatively fail-closed), or a resolved STABLE node (the runtime text→date cast,
-		// paramTypes.nonimmutable), is 42P17.
-		tzHazard := false
-		for _, ref := range checkReferencedColumns(ci.Predicate.Expr, columns) {
-			if sc, ok := columns[ref].Type.AsScalar(); ok && sc == scalarTimestamptz {
-				tzHazard = true
-				break
-			}
-		}
-		if indexExprNonimmutableCall(ci.Predicate.Expr) || tzHazard || pt.nonimmutable {
+		// Dependencies accumulate at each resolved operation, through every child.
+		if pt.nonimmutable {
 			return outcome{}, newError(InvalidObjectDefinition,
 				"functions in index predicate must be marked IMMUTABLE")
 		}
@@ -3282,6 +3266,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		if err := collectIndexHostDeps(pnode, db.session.extensions, &hostDeps); err != nil {
 			return outcome{}, err
 		}
+		timezoneDeps.merge(pt.timezoneDeps)
 		predicate = &indexKeyExpr{ExprText: ci.Predicate.Text, Expr: ci.Predicate.Expr}
 	}
 	// relationExistsScoped checks the namespace of the target scope: an attachment's OWN snapshot for an
@@ -3330,7 +3315,10 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		}
 		return bytes.Compare(hostDepArgCodes(a), hostDepArgCodes(b))
 	})
-	def := indexDef{Name: name, Keys: ciKeys, Unique: ci.Unique, Kind: kind, Predicate: predicate, HostDeps: hostDeps}
+	if err := timezoneDeps.validate(); err != nil {
+		return outcome{}, err
+	}
+	def := indexDef{Name: name, Keys: ciKeys, Unique: ci.Unique, Kind: kind, Predicate: predicate, HostDeps: hostDeps, TimezoneDeps: timezoneDeps}
 	// The build scan (cost.md §3): page_read per table-tree node + storage_row_read per row. The
 	// touched set is the columns the key elements read — an index column for a column key, or every
 	// column an expression key references (which may be variable-width, so a spilled value adds its

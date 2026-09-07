@@ -245,7 +245,8 @@ type indexDef struct {
 	// against. nil for the common index with no host-function key (byte-identical to v30 then). On
 	// reopen the per-statement re-resolution (resolveIndexWithParams) compares each against the current
 	// registry; a mismatch makes the index unusable. Sorted by (Name, ArgTypes).
-	HostDeps []hostFuncDep
+	HostDeps     []hostFuncDep
+	TimezoneDeps timeZoneDeps
 }
 
 // allColumns reports whether every key element is a plain column (no expression key) — the common
@@ -580,4 +581,15 @@ func (t *catTable) PrimaryKeyIndex() int {
 		return idxs[0]
 	}
 	return -1
+}
+
+// Timezone dependencies of persisted expressions (index-dependencies.md, format 32).
+type timeZoneDep struct {
+	Name     string
+	Version  string
+	Checksum uint32
+}
+type timeZoneDeps struct {
+	Dynamic bool
+	Zones   []timeZoneDep
 }

@@ -45,6 +45,11 @@ INSERT INTO orders VALUES
 WHERE status = 'active' AND customer = 10
 ORDER BY id;`;
 
+	const nullSeed = `CREATE TABLE accounts (id int PRIMARY KEY, email text, deleted_at timestamptz);
+CREATE UNIQUE INDEX active_email ON accounts (email) WHERE deleted_at IS NULL;
+INSERT INTO accounts VALUES (1, 'ada@example.com', NULL), (2, 'ada@example.com', '2024-01-01 00:00:00+00');`;
+	const nullQuery = `SELECT id FROM accounts WHERE deleted_at IS NULL AND email = 'ada@example.com';`;
+
 	const ginSeed = `CREATE TABLE post (
   id    i32 PRIMARY KEY,
   title text NOT NULL,
@@ -172,6 +177,37 @@ the table's own columns and must be **immutable** — jed rejects a non-boolean 
 `42804`, and an aggregate / window / subquery / bind-parameter / non-immutable predicate with the
 same codes an expression key uses. Implication matching is **syntactic** (as in PostgreSQL): jed
 uses the index when the `WHERE` restates the predicate, not when it merely implies it.
+
+### Timestamps and timezone data
+
+A `timestamptz` column can participate in any admitted immutable expression, including a soft-delete
+predicate:
+
+```sql
+CREATE TABLE accounts (id int PRIMARY KEY, email text, deleted_at timestamptz);
+CREATE UNIQUE INDEX active_email ON accounts (email) WHERE deleted_at IS NULL;
+```
+
+<LiveSql seed={nullSeed} query={nullQuery} rows={4} />
+
+Instant comparisons and explicit-zone conversions are allowed. A cast such as `deleted_at::date`
+reads the session timezone and is rejected with `42P17`; `(deleted_at AT TIME ZONE 'UTC')::date`
+is safe. The same rules compose through CASE, COALESCE, arrays, and nested function calls.
+
+Named zones must be loaded when the index is created. jed stores their version and checksum with
+the index; a computed zone argument pins the entire loaded zone set. If the loaded data differs,
+reads skip that index and writes to its table fail with `XX002`. After loading the desired timezone
+bundle in a fresh process, rebuild the affected index using a transaction:
+
+```sql
+BEGIN;
+DROP INDEX local_day;
+CREATE INDEX local_day ON events (((created_at AT TIME ZONE 'America/New_York')::date));
+COMMIT;
+```
+
+If rebuilding fails, `ROLLBACK` preserves the old committed index. These dependency records use
+file format 32; plain timestamp values and column indexes require no timezone data.
 
 ## GIN indexes for arrays (`USING gin`)
 

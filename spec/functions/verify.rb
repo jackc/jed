@@ -44,8 +44,7 @@
 #      string array of integer literals, length ≤ arity, filling only TRAILING slots. Across
 #      a function's overloads a parameter name maps to one position (so named→slot resolution
 #      is overload-independent).
-#  14. OPTIONAL volatility (functions.md §12): if present, one of immutable|stable|volatile.
-#      Absent ⇒ immutable. Marks a call non-foldable for a future constant-folding pass.
+#  14. Required volatility: immutable|stable|volatile (persisted-index admission).
 #  15. OPTIONAL variadic (array-functions.md §12): if present, a boolean; true only on a scalar
 #      function with non-empty arg_families and no arg_defaults.
 #  16. OPTIONAL cost (functions.md §8): if present, a positive integer — the per-operator
@@ -235,10 +234,8 @@ def main
       end
     end
 
-    # (14) optional volatility class (functions.md §12); absent ⇒ immutable.
-    if op.key?("volatility")
-      fail!("operator #{id}: volatility #{op['volatility'].inspect} not in (#{VOLATILITIES.to_a.join('|')})") unless VOLATILITIES.include?(op["volatility"])
-    end
+    # (14) explicit volatility class (index-dependencies.md).
+    fail!("operator #{id}: volatility #{op['volatility'].inspect} not in (#{VOLATILITIES.to_a.join('|')})") unless VOLATILITIES.include?(op["volatility"])
 
     # (15) optional VARIADIC flag (array-functions.md §12); absent ⇒ false. A boolean; true is
     # valid only on a scalar function (kind = "function") with a non-empty arg_families (the last
