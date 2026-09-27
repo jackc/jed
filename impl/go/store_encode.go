@@ -1042,7 +1042,12 @@ func (db *engine) fkProbeHits(probe fkProbe, parentTable string) (bool, error) {
 // whose child IS the table being mutated (so its deleted/updated rows must not count). parent is
 // the referenced table's catalog. Unmetered validation.
 func (db *engine) fkChildReferences(childTable string, fk *foreignKey, parent *catTable, target []byte, exclude map[string]struct{}) (bool, error) {
-	entries, err := db.readSnap().store(childTable).EntriesInKeyOrder()
+	store := db.readSnap().store(childTable)
+	mask := make([]bool, len(store.colTypes))
+	for _, column := range fk.Columns {
+		mask[column] = true
+	}
+	entries, err := store.EntriesInKeyOrder()
 	if err != nil {
 		return false, err
 	}
@@ -1053,7 +1058,13 @@ func (db *engine) fkChildReferences(childTable string, fk *foreignKey, parent *c
 		if _, skip := exclude[string(e.Key)]; skip {
 			continue
 		}
-		probe, ok, err := buildFkProbe(fk, parent, parentColls, e.Row, fk.Columns)
+		// Persisted child rows can hold deferred values, including inline text.
+		// Resolve only the FK columns; unrelated payloads must stay deferred.
+		row, err := store.resolveColumns(e.Row, mask)
+		if err != nil {
+			return false, err
+		}
+		probe, ok, err := buildFkProbe(fk, parent, parentColls, row, fk.Columns)
 		if err != nil {
 			return false, err
 		}

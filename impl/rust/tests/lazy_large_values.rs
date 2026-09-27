@@ -12,6 +12,62 @@ use jed::{CreateOptions, Database, OpenOptions, Outcome, Session, SessionOptions
 
 const PAGE_SIZE: u32 = 256;
 
+/// SQL results belong in foreign_key_*child.test. This physical check proves a reverse FK
+/// scan never fetches an unrelated overflow payload, even when that payload is corrupt.
+#[test]
+fn reverse_foreign_key_leaves_unrelated_payloads_deferred() {
+    let path = tmp("jed_lazy_fk.jed");
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::create(CreateOptions {
+            path: Some(path.clone()),
+            skip_fsync: true,
+            page_size: PAGE_SIZE,
+            ..Default::default()
+        })
+        .unwrap()
+        .session(SessionOptions::default());
+        db.query_outcome("CREATE TABLE p (id text PRIMARY KEY)", &[])
+            .unwrap();
+        db.query_outcome("INSERT INTO p VALUES ('keep'),('delete'),('update')", &[])
+            .unwrap();
+        seed(&mut db);
+        db.query_outcome(
+            "ALTER TABLE t ADD COLUMN pid text DEFAULT 'keep' REFERENCES p(id)",
+            &[],
+        )
+        .unwrap();
+    }
+    corrupt_overflow_payloads(&path);
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
+    db.query_outcome("DELETE FROM p WHERE id='delete'", &[])
+        .unwrap();
+    db.query_outcome("UPDATE p SET id='updated' WHERE id='update'", &[])
+        .unwrap();
+    assert_eq!(
+        db.query_outcome("DELETE FROM p WHERE id='keep'", &[])
+            .unwrap_err()
+            .code(),
+        "23503"
+    );
+    assert_eq!(
+        db.query_outcome("SELECT body FROM t WHERE id=1", &[])
+            .unwrap_err()
+            .code(),
+        "XX001"
+    );
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
 /// Incompressible filler (spec/fileformat/format.md "Fixtures") — see overflow_cost.rs.
 const ALPHA64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 

@@ -1512,10 +1512,17 @@ impl Engine {
         // `target` is in the parent's stored-key byte space, so the child probe encodes a collated
         // parent key column with the PARENT's collation (§2.12).
         let parent_colls = self.column_collations(&parent.columns);
-        for (k, row) in self.read_snap().store(child_table).iter_entries()? {
+        let store = self.read_snap().store(child_table);
+        let mut mask = vec![false; store.col_types().len()];
+        for &column in &fk.columns {
+            mask[column] = true;
+        }
+        for (k, mut row) in store.iter_entries()? {
             if exclude.contains(&k) {
                 continue;
             }
+            // Persisted child rows may defer even inline values. Leave unrelated payloads deferred.
+            store.resolve_columns(&mut row, &mask)?;
             if let Some(probe) = fk_probe(fk, parent, &parent_colls, &row, &fk.columns)? {
                 if probe.bytes() == target {
                     return Ok(true);

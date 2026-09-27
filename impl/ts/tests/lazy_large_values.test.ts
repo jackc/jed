@@ -20,6 +20,39 @@ import { memDb } from "./mem_db.ts";
 const PAGE_SIZE = 256;
 const PAGE_OVERFLOW = 4; // page_type for an overflow slab (large-values.md §12)
 
+// SQL results belong in foreign_key_*child.test. This physical check proves a reverse FK
+// scan never fetches an unrelated overflow payload, even when that payload is corrupt.
+test("lazy: reverse foreign key leaves unrelated payloads deferred", () => {
+  const dir = mkdtempSync(join(tmpdir(), "jed-lazy-fk-"));
+  const path = join(dir, "fk.jed");
+  try {
+    let db = createDatabase({ path, pageSize: PAGE_SIZE, skipFsync: true });
+    db.execute("CREATE TABLE p (id text PRIMARY KEY)");
+    db.execute("INSERT INTO p VALUES ('keep'),('delete'),('update')");
+    seed(db);
+    db.execute("ALTER TABLE t ADD COLUMN pid text DEFAULT 'keep' REFERENCES p(id)");
+    db.close();
+    corruptOverflowPayloads(path);
+    db = openDatabase(path, { skipFsync: true });
+    try {
+      db.execute("DELETE FROM p WHERE id='delete'");
+      db.execute("UPDATE p SET id='updated' WHERE id='update'");
+      assert.equal(
+        errCode(() => db.execute("DELETE FROM p WHERE id='keep'")),
+        "23503",
+      );
+      assert.equal(
+        errCode(() => db.execute("SELECT body FROM t WHERE id=1")),
+        "XX001",
+      );
+    } finally {
+      db.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // One row per stored form at ps=256 (RECORD_MAX 114, cap 240, v7): id 1 external-plain
 // (incompressible 600-char filler → a 3-page chain), id 2 external-compressed (half filler /
 // half run → the ~212-byte block spills to a 1-page chain), id 3 inline-compressed (a

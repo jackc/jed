@@ -588,6 +588,13 @@ O(child rows) per parent mutation; an opt-in backing index on FK columns is a fo
 slice ([../../TODO.md](../../TODO.md)). When more than one FK is violated, the reported one is
 deterministic: referencing tables in ascending lowercased-name order, then FKs in name order.
 
+The reverse scan resolves the child's FK columns through the child store before encoding a
+probe. Persisted rows may defer even small inline values, as well as compressed or external
+values ([lazy-record.md](lazy-record.md)); key encoders accept only materialized values.
+Resolve only the local FK-column mask, after excluding rows absent from the end state, on a
+private row copy. Unrelated payloads stay deferred, shared snapshots stay immutable, and
+decoding or I/O failures propagate normally. This remains unmetered validation (§6.11).
+
 ### 6.6 Referential actions
 
 The grammar and executor support the full `ON DELETE` / `ON UPDATE` action set:
@@ -641,7 +648,8 @@ and compression work **does** accrue to the originating statement's cost and to 
   step 6), the same divergence `UNIQUE` carries ([indexes.md §7](indexes.md)).
 - **NO ACTION equals RESTRICT.** PostgreSQL can defer `NO ACTION` while `RESTRICT` is immediate;
   jed has no deferred-constraint machinery, so both inspect the statement's final action closure
-  (§6.6).
+  (§6.6). Both use the same `23503` violation in jed; PostgreSQL 18 uses `23001` for a
+  `RESTRICT` violation. This preserves the single validation/error path for the two actions.
 - **No DETAIL line.** The `23503` message is a single line in jed's house style (no PG `DETAIL: Key
   (…)=(…) is …` second line); the code matches.
 - **Constraint namespace only.** An FK name lives in the per-table **constraint** namespace (with

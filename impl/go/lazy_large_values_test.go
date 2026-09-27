@@ -21,6 +21,38 @@ import (
 
 const lazyPageSize = 256
 
+// SQL results belong in foreign_key_*child.test. This physical check proves a reverse FK
+// scan never fetches an unrelated overflow payload, even when that payload is corrupt.
+func TestLazyForeignKeyLeavesUnrelatedPayloadsDeferred(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "lazy_fk.jed")
+	db, err := create(path, databaseOptions{PageSize: lazyPageSize, noSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, "CREATE TABLE p (id text PRIMARY KEY)")
+	mustExec(t, db, "INSERT INTO p VALUES ('keep'),('delete'),('update')")
+	lazySeed(t, db)
+	mustExec(t, db, "ALTER TABLE t ADD COLUMN pid text DEFAULT 'keep' REFERENCES p(id)")
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	corruptOverflowPayloads(t, path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mustExec(t, db, "DELETE FROM p WHERE id='delete'")
+	mustExec(t, db, "UPDATE p SET id='updated' WHERE id='update'")
+	if got := fkErr(t, db, "DELETE FROM p WHERE id='keep'"); got != "23503" {
+		t.Fatalf("referenced parent: got %s, want 23503", got)
+	}
+	if got := fkErr(t, db, "SELECT body FROM t WHERE id=1"); got != "XX001" {
+		t.Fatalf("touching corrupt payload: got %s, want XX001", got)
+	}
+}
+
 // lazySeed creates one row per stored form at ps=256 (RECORD_MAX 114, cap 240): id 1
 // external-plain (incompressible 600-char filler → a 3-page chain), id 2 external-compressed
 // (half filler / half run → the ~212-byte block spills to a 1-page chain), id 3

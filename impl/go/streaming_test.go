@@ -961,11 +961,11 @@ func TestPreparedQueryMatchesStreamed(t *testing.T) {
 	s := db.Session(SessionOptions{})
 	defer s.Close()
 	for _, sql := range []string{
-		"SELECT id, v FROM t LIMIT 5",                                                   // streaming (LIMIT short-circuit)
-		"SELECT id, v FROM t ORDER BY id LIMIT 7",                                       // streaming (PK-ordered)
-		"SELECT v FROM t ORDER BY v LIMIT 6",                                            // buffered (non-PK sort, top-N)
-		"SELECT count(*) FROM t",                                                        // buffered (aggregate)
-		"SELECT DISTINCT v FROM t ORDER BY v",                                           // buffered (DISTINCT + sort)
+		"SELECT id, v FROM t LIMIT 5",             // streaming (LIMIT short-circuit)
+		"SELECT id, v FROM t ORDER BY id LIMIT 7", // streaming (PK-ordered)
+		"SELECT v FROM t ORDER BY v LIMIT 6",      // buffered (non-PK sort, top-N)
+		"SELECT count(*) FROM t",                  // buffered (aggregate)
+		"SELECT DISTINCT v FROM t ORDER BY v",     // buffered (DISTINCT + sort)
 		"SELECT v FROM t WHERE id <= 3 UNION SELECT v FROM t WHERE id >= 98 ORDER BY v", // deferred (set op)
 		"WITH x AS (SELECT id, v FROM t WHERE v > 500) SELECT id, v FROM x ORDER BY id", // deferred (WITH)
 	} {

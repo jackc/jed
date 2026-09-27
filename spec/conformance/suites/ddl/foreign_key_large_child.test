@@ -1,0 +1,56 @@
+# Reverse FK probes over inline-compressed, external-plain, and external-compressed child values.
+# Sixteen copies of each 600-byte key force the child's first text column through these forms
+# at the default page size. Each parent row fits without spilling; storage is row-dependent.
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.insert_select, dml.delete, dml.update, query.select, query.order_by, types.i32, types.text
+
+statement ok
+CREATE TABLE large_parents (id i32 PRIMARY KEY, k text UNIQUE)
+
+statement ok
+CREATE TABLE large_children (id i32 PRIMARY KEY, k text REFERENCES large_parents(k), pad1 text, pad2 text, pad3 text, pad4 text, pad5 text, pad6 text, pad7 text, pad8 text, pad9 text, pad10 text, pad11 text, pad12 text, pad13 text, pad14 text, pad15 text)
+
+statement ok
+INSERT INTO large_parents VALUES (1,'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'),(2,'kvZXGQ3QheSyO0bIiLWvcrXOByiBIcIQbei1YCYitwhiR6f8M5GkQJpc147SHSydS/QyQIUX6tsgnwU/3/lVHzn8NXQ3A1l07v4AO/55PxHAmICzws6rbWirfGKPl9CYysEaWXWMzTIL2ryT9u1IflxwmJ1vsL4U/wc5DiMXam2yUuEKdIwhBZHGt2JljzYDaIZHJn7udT/VrecQPVWDZOD8kc2+/xVtpHgw0Fb9xeDscpkUOhFhCrdmUjpbDw2dwzhQdLZqtKYtYEcCP98b1Ht+BtBq0cKDV0pjeqI4xCr98tXnMiRqLyzMKeYES5P8P9ni6SuCSKFF7EwkCGLqJQvlhaDlzQJkBLNs72QVxt9cx9wc95h8UPdemKOY8IujvZAWGTCBTkxj6DN19kpWjsz3ddiufNDoli0Tju5z9PNHSPDJwvJ49ECiub2KVupk+vwfBMwWttMwRG9bpzIvgTUjIiWdvUPjiHcUiFLwGqqicaLUbjwj4Krjfu36DikieYZUy5uvk6+ZJyY+GjNhGTX4EanP1G1a2fa3wJCcxbUr/iLuvG/d3OIpJef43Uh3XFs7cqzQHP855QEFLCyPqnjH'),(3,'kvZXGQ3QheSyO0bIiLWvcrXOByiBIcIQbei1YCYitwhiR6f8M5GkQJpc147SHSydS/QyQIUX6tsgnwU/3/lVHzn8NXQ3A1l07v4AO/55PxHAmICzws6rbWirfGKPl9CYysEaWXWMzTIL2ryT9u1IflxwmJ1vsL4U/wc5DiMXam2yUuEKdIwhBZHGt2JljzYDaIZHJn7udT/VrecQPVWDZOD8kc2+/xVtpHgw0Fb9xeDscpkUOhFhCrdmUjpbDw2dwzhQdLZqtKYtYEcCP98b1Ht+BtBq0cKDV0pjeqI4xCr9yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'),(4,'unused'),(5,'rekey')
+
+statement ok
+INSERT INTO large_children SELECT id,k,k,k,k,k,k,k,k,k,k,k,k,k,k,k,k FROM large_parents WHERE id<4
+
+statement ok
+DELETE FROM large_parents WHERE id=4
+
+statement ok
+UPDATE large_parents SET k='changed' WHERE id=5
+
+statement error 23503
+DELETE FROM large_parents WHERE id=1
+
+statement error 23503
+UPDATE large_parents SET k='orphan' WHERE id=1
+
+statement error 23503
+DELETE FROM large_parents WHERE id=2
+
+statement error 23503
+UPDATE large_parents SET k='orphan' WHERE id=2
+
+statement error 23503
+DELETE FROM large_parents WHERE id=3
+
+statement error 23503
+UPDATE large_parents SET k='orphan' WHERE id=3
+
+# Every failed statement left both tables intact.
+query I nosort
+SELECT id FROM large_parents ORDER BY id
+----
+1
+2
+3
+5
+
+query I nosort
+SELECT id FROM large_children ORDER BY id
+----
+1
+2
+3

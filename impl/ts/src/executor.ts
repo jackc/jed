@@ -7391,9 +7391,14 @@ export class Engine {
     // target is in the parent's stored-key byte space, so the child probe encodes a collated parent
     // key column with the PARENT's collation (§2.12).
     const parentColls = this.columnCollations(parent.columns);
-    for (const e of this.readSnap().store(childTable).entriesInKeyOrder()) {
+    const store = this.readSnap().store(childTable);
+    const mask = store.columnTypes().map(() => false);
+    for (const column of fk.columns) mask[column] = true;
+    for (const e of store.entriesInKeyOrder()) {
       if (exclude.has(e.key.join(","))) continue;
-      const probe = fkProbe(fk, parent, parentColls, e.row, fk.columns);
+      // Persisted child rows may defer even inline values. Leave unrelated payloads deferred.
+      const row = store.resolveColumns(e.row, mask);
+      const probe = fkProbe(fk, parent, parentColls, row, fk.columns);
       if (probe !== null && bytesEq(fkProbeBytes(probe), target)) return true;
     }
     return false;

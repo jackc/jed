@@ -1,0 +1,107 @@
+# Regression: a reverse FK probe must materialize persisted child key values.
+# Run in memory AND disk modes (disk reopens before every statement).
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.unique, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.delete, dml.update, query.select, query.order_by, types.i32, types.text
+
+statement ok
+CREATE TABLE entries (family_id text NOT NULL, id text NOT NULL, PRIMARY KEY(family_id,id))
+
+statement ok
+CREATE TABLE attachments (family_id text NOT NULL, id text NOT NULL, entry_id text, data text NOT NULL, PRIMARY KEY(family_id,id), FOREIGN KEY(family_id,entry_id) REFERENCES entries(family_id,id))
+
+statement ok
+INSERT INTO entries VALUES ('family','delete-me'),('family','keep-me'),('family','update-me')
+
+statement ok
+INSERT INTO attachments VALUES ('family','kept-file','keep-me','receipt'),('family','null-file',NULL,'nullable')
+
+# A different entry's attachment must not prevent deletion or re-keying.
+statement ok
+DELETE FROM entries WHERE family_id='family' AND id='delete-me'
+
+statement ok
+UPDATE entries SET id='updated' WHERE family_id='family' AND id='update-me'
+
+# Actual references must still enforce 23503, without panicking.
+statement error 23503
+DELETE FROM entries WHERE family_id='family' AND id='keep-me'
+
+statement error 23503
+UPDATE entries SET id='cannot-change' WHERE family_id='family' AND id='keep-me'
+
+query TT nosort
+SELECT family_id,id FROM entries ORDER BY id
+----
+family
+keep-me
+family
+updated
+
+# MATCH SIMPLE: the remaining NULL child must not block its parent's deletion.
+statement ok
+DELETE FROM attachments WHERE id='kept-file'
+
+statement ok
+DELETE FROM entries WHERE id='keep-me'
+
+query T nosort
+SELECT id FROM entries ORDER BY id
+----
+updated
+
+# Child ordinals differ from parent ordinals and REFERENCES order differs from UNIQUE order.
+# Explicit RESTRICT takes the same reverse-probe path as the default NO ACTION above.
+# Its 23503 versus PostgreSQL 18's 23001 is ledgered in oracle_overrides.toml.
+statement ok
+CREATE TABLE codes (id i32 PRIMARY KEY, tenant text, code text, UNIQUE(tenant,code))
+
+statement ok
+CREATE TABLE uses (id i32 PRIMARY KEY, payload text, code text, tenant text, FOREIGN KEY(code,tenant) REFERENCES codes(code,tenant) ON DELETE RESTRICT ON UPDATE RESTRICT)
+
+statement ok
+INSERT INTO codes VALUES (1,'family','used'),(2,'family','unused'),(3,'family','rekey')
+
+statement ok
+INSERT INTO uses VALUES (1,'payload','used','family'),(2,'nullable',NULL,'family')
+
+statement ok
+DELETE FROM codes WHERE id=2
+
+statement ok
+UPDATE codes SET code='changed' WHERE id=3
+
+statement error 23503
+DELETE FROM codes WHERE id=1
+
+statement error 23503
+UPDATE codes SET code='orphan' WHERE id=1
+
+query IT nosort
+SELECT id,code FROM codes ORDER BY id
+----
+1
+used
+3
+changed
+
+# Self-references are checked against the end state, including new local-column values.
+statement ok
+CREATE TABLE nodes (id text PRIMARY KEY, parent text REFERENCES nodes(id))
+
+statement ok
+INSERT INTO nodes VALUES ('root',NULL),('leaf','root'),('self','self')
+
+statement error 23503
+DELETE FROM nodes WHERE id='root'
+
+statement error 23503
+UPDATE nodes SET id='orphan' WHERE id='self'
+
+statement ok
+DELETE FROM nodes WHERE id='self'
+
+statement ok
+DELETE FROM nodes
+
+query T nosort
+SELECT id FROM nodes ORDER BY id
+----

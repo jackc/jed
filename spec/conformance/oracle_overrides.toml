@@ -1166,3 +1166,15 @@ reason = "jed: `julian` is a DEFERRED extract field on every source type (0A000 
 file = "ddl/foreign_key_actions.test"
 sql = "DELETE FROM sibling_p WHERE id = 1 RETURNING id"
 reason = "jed: generated FK write actions run to closure before sibling NO ACTION/RESTRICT checks, so z_write cascades the only child row and a_check sees no orphan. PostgreSQL runs the alphabetically earlier immediate a_check trigger first and raises 23503. This follows jed's documented no-deferrability rule: NO ACTION equals RESTRICT and both inspect the statement's final action closure (constraints.md §6.6/§6.7)."
+
+# The unified NO ACTION/RESTRICT validation path also retains one violation code (23503).
+# PostgreSQL 18 distinguishes RESTRICT with 23001 (constraints.md §6.7).
+[[override]]
+file = "ddl/foreign_key_lazy_child.test"
+sql = "DELETE FROM codes WHERE id=1"
+reason = "jed: NO ACTION and RESTRICT share final action-closure validation and its 23503 error; PostgreSQL 18 raises 23001 for RESTRICT. The single validation/error path is the documented simplification in constraints.md §6.7."
+
+[[override]]
+file = "ddl/foreign_key_lazy_child.test"
+sql = "UPDATE codes SET code='orphan' WHERE id=1"
+reason = "jed: NO ACTION and RESTRICT share final action-closure validation and its 23503 error; PostgreSQL 18 raises 23001 for RESTRICT. The single validation/error path is the documented simplification in constraints.md §6.7."
