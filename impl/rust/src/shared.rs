@@ -356,7 +356,7 @@ impl Storage {
         can_reuse: bool,
     ) -> Result<()> {
         if self.path.is_some() {
-            self.paging.pager().begin_commit()?;
+            self.paging.pager().check_commit()?;
         }
         let write = snap.incremental_image(
             self.page_size,
@@ -388,6 +388,7 @@ impl Storage {
         // walk, which re-locks the pager itself.
         {
             let mut pager = self.paging.pager();
+            pager.begin_commit()?;
             pager.reserve(write.page_count)?;
             for (index, bytes) in &write.pages {
                 pager.write_block(*index, bytes)?;
@@ -441,6 +442,7 @@ impl Storage {
         let plan = crate::format::plan_shared_commit(self.page_size, snap.txid, &write)?;
         {
             let mut pager = self.paging.pager();
+            pager.begin_commit()?;
             pager.refresh_allocated_pages()?;
             pager.reserve(plan.page_count)?;
             for (index, bytes) in write.pages.iter().chain(plan.auxiliary.iter()) {
@@ -1042,7 +1044,7 @@ impl Shared {
                     .as_ref()
                     .is_some_and(|coordinator| coordinator.state() == LeaseState::Shared);
                 if shared {
-                    att.storage.paging.pager().begin_commit()?;
+                    att.storage.paging.pager().check_commit()?;
                     let write = snap.incremental_image(
                         att.storage.page_size,
                         att.storage.page_count,
@@ -1057,7 +1059,7 @@ impl Shared {
                             .as_ref()
                             .expect("shared attachment has coordinator"),
                     );
-                    if result.is_err() {
+                    if result.is_err() && att.storage.paging.pager().commit_requires_reopen() {
                         att.coordinator
                             .as_ref()
                             .expect("shared attachment has coordinator")
@@ -1202,7 +1204,7 @@ impl Shared {
         let mut st = self.storage.lock().expect("storage lock not poisoned");
         let can_reuse = !shared && oldest >= st.free_gen_txid;
         if shared && st.path.is_some() {
-            st.paging.pager().begin_commit()?;
+            st.paging.pager().check_commit()?;
             let write = snap.incremental_image(
                 st.page_size,
                 st.page_count,
@@ -1217,7 +1219,7 @@ impl Shared {
                     .as_ref()
                     .expect("shared state has coordinator"),
             );
-            if result.is_err() {
+            if result.is_err() && st.paging.pager().commit_requires_reopen() {
                 self.coordinator
                     .as_ref()
                     .expect("shared state has coordinator")

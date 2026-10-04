@@ -53,12 +53,22 @@ func zeroBytes(b []byte) bool {
 func manifestInlineCapacity(ps int) int   { return (ps - 64) / 12 }
 func manifestOverflowCapacity(ps int) int { return (ps - 32) / 12 }
 
-// beginValidatedCommit must precede incrementalImage, which assigns page ids.
-// Any failure leaves commitInProgress set and prohibits another writer until a
-// fresh open revalidates the file. Read-only use does not issue recovery syncs.
-func (p *pager) beginValidatedCommit() error {
-	if p.poisoned || p.commitInProgress {
+// Check before serialization, which can fault inherited pages. A failed writer
+// must not do more storage work; a serialization error does not start a commit.
+func (p *pager) checkValidatedCommit() error {
+	if p.commitRequiresReopen() {
 		return newError(IoError, "database writer requires reopen after failed commit")
+	}
+	return nil
+}
+
+func (p *pager) commitRequiresReopen() bool { return p.poisoned || p.commitInProgress }
+
+// Begin only after serialization succeeds, before the first reserve/write. A
+// stabilization or later commit failure requires recovery through a fresh open.
+func (p *pager) beginValidatedCommit() error {
+	if err := p.checkValidatedCommit(); err != nil {
+		return err
 	}
 	p.commitInProgress = true
 	if p.recoverySync {

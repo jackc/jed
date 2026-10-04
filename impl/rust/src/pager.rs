@@ -173,15 +173,26 @@ impl Pager {
         }
     }
 
-    /// A writer resumed after a process-only crash can see unsynced cache bytes. Stabilize its
-    /// selected generation before it can overwrite either the fallback slot or reusable pages.
-    pub(crate) fn begin_commit(&mut self) -> Result<()> {
-        if self.poisoned || self.commit_in_progress {
+    /// Reject failed writers before serialization can fault inherited pages. Serialization
+    /// errors discard the working snapshot without starting a storage commit.
+    pub(crate) fn check_commit(&self) -> Result<()> {
+        if self.commit_requires_reopen() {
             return Err(EngineError::new(
                 SqlState::IoError,
                 "storage commit failed; close and reopen before writing",
             ));
         }
+        Ok(())
+    }
+
+    pub(crate) fn commit_requires_reopen(&self) -> bool {
+        self.poisoned || self.commit_in_progress
+    }
+
+    /// Begin after serialization succeeds, before the first reserve/write. A writer resumed
+    /// after a process-only crash must stabilize its adopted generation before changing storage.
+    pub(crate) fn begin_commit(&mut self) -> Result<()> {
+        self.check_commit()?;
         self.commit_in_progress = true;
         if self.needs_stabilize {
             self.sync()?;

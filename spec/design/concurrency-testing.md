@@ -411,6 +411,8 @@ write for append-only allocation, or use actor action `open-exclusive` for deter
 cover validated-COW manifest recovery, pinned readers, a killed and replaced writer, foreign-root
 adoption, and continued commits. `cow_reuse` updates 400 rows repeatedly across exclusive
 writer handoffs, exercising multi-page manifests, free-list planning, and bounded page reuse.
+`cow_serialization_error` rejects oversized catalogs without poisoning exclusive/shared
+writers or file attachments, including explicit commits that encoded dirty rows before failing.
 
 The corpus, not per-core copies, covers:
 

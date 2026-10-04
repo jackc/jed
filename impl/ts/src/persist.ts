@@ -35,7 +35,7 @@ export function persistImpl(
   canReclaim?: boolean,
   canReuse = true,
 ): IncrementalWrite {
-  if (db.paging !== null && db.persistHook !== null) db.paging.beginDurableCommit();
+  if (db.paging !== null && db.persistHook !== null) db.paging.checkDurableCommit();
   const write = incrementalImage(
     snap,
     db.pageSize,
@@ -66,10 +66,9 @@ export function persistSharedBody(
   publishMeta: () => void;
 } {
   const paging = db.paging;
-  paging?.beginDurableCommit();
+  paging?.checkDurableCommit();
   const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages, db.paging, false);
   if (paging === null) return { write, publishMeta: () => {} };
-  paging.refreshAllocatedPages();
   const overflowCount = Math.ceil(
     Math.max(0, write.pages.length - manifestInlineCapacity(db.pageSize)) /
       manifestOverflowCapacity(db.pageSize),
@@ -79,6 +78,8 @@ export function persistSharedBody(
     throw engineError("program_limit_exceeded", "database page limit exceeded");
   const ids = Array.from({ length: overflowCount }, (_, i) => write.pageCount + i);
   const manifest = buildCommitManifest(db.pageSize, snap.txid, write.pages, ids);
+  paging.beginDurableCommit();
+  paging.refreshAllocatedPages();
   paging.reserve(pageCount);
   for (const pg of [...write.pages, ...manifest.pages]) paging.writeBlock(pg.index, pg.bytes);
   return {
@@ -109,6 +110,7 @@ function commitFile(
   canReuse: boolean,
 ): void {
   const paging = db.paging!;
+  paging.beginDurableCommit();
   // Preallocate ahead of the high-water so the body sync carries no file-growth journaling (pager.md §7).
   paging.reserve(write.pageCount);
   for (const pg of write.pages) {

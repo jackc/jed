@@ -2519,8 +2519,10 @@ export class Engine {
         if (att.storage.path !== null) {
           ws.txid = (this.attachedCommitted.get(name)?.txid ?? 0n) + 1n; // alternating meta slot + reopen
           if (att.coordinator?.state === "shared") {
+            let bodyWritten = false;
             try {
               const pending = persistSharedBody(att.storage, ws);
+              bodyWritten = true;
               att.coordinator.lockCommitExclusive();
               try {
                 pending.publishMeta();
@@ -2529,7 +2531,8 @@ export class Engine {
               }
               ws.demoteCleanLeaves();
             } catch (error) {
-              att.coordinator.state = "poisoned";
+              if (bodyWritten || att.storage.paging?.commitRequiresReopen())
+                att.coordinator.state = "poisoned";
               throw error;
             }
           } else {

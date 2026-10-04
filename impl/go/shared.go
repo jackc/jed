@@ -544,7 +544,7 @@ func (c *sharedCore) persist(snap *snapshot) error {
 	canReuse := !shared && oldest >= c.storage.freeGenTxid
 	if shared && c.storage.path != "" {
 		err := c.storage.commitShared(snap, c.coordinator)
-		if err != nil {
+		if err != nil && c.storage.paging.commitRequiresReopen() {
 			c.coordinator.setLease(leasePoisoned)
 		}
 		return err
@@ -555,7 +555,7 @@ func (c *sharedCore) persist(snap *snapshot) error {
 func (st *storage) commitShared(snap *snapshot, coordinator *fileCoordinator) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if err := st.paging.withPager(func(p *pager) error { return p.beginValidatedCommit() }); err != nil {
+	if err := st.paging.withPager(func(p *pager) error { return p.checkValidatedCommit() }); err != nil {
 		return err
 	}
 	write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, false, st.paging)
@@ -567,6 +567,9 @@ func (st *storage) commitShared(snap *snapshot, coordinator *fileCoordinator) er
 		return err
 	}
 	if err := st.paging.withPager(func(p *pager) error {
+		if err := p.beginValidatedCommit(); err != nil {
+			return err
+		}
 		if err := p.refreshAllocatedPages(); err != nil {
 			return err
 		}
@@ -618,7 +621,7 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool) erro
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.path != "" {
-		if err := st.paging.withPager(func(p *pager) error { return p.beginValidatedCommit() }); err != nil {
+		if err := st.paging.withPager(func(p *pager) error { return p.checkValidatedCommit() }); err != nil {
 			return err
 		}
 	}
@@ -635,9 +638,12 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool) erro
 // commitFile writes body pages before planning reclamation so the reachability
 // walk sees the new catalog. It allocates the free-list and manifest together,
 // then publishes the alternate meta and syncs once. Caller holds st.mu and has
-// begun the validated commit before assigning dirty-node page ids.
+// checked writer admission before assigning dirty-node page ids.
 func (st *storage) commitFile(snap *snapshot, write incrementalWrite, canReclaim, canReuse bool) error {
 	if err := st.paging.withPager(func(p *pager) error {
+		if err := p.beginValidatedCommit(); err != nil {
+			return err
+		}
 		if err := p.reserve(write.pageCount); err != nil {
 			return err
 		}

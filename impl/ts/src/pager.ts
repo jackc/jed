@@ -225,10 +225,21 @@ export class Pager {
     if (identity !== this.acknowledgedMeta) this.adoptedNeedsSync = needsSync;
   }
 
-  beginDurableCommit(): void {
-    if (this.durableCommitActive) {
+  // Check before serialization can fault inherited pages; an encoding error leaves
+  // the storage handle usable because no durable commit has begun.
+  checkDurableCommit(): void {
+    if (this.commitRequiresReopen()) {
       throw engineError("io_error", "database has an incomplete durable commit; close and reopen");
     }
+  }
+
+  commitRequiresReopen(): boolean {
+    return this.durableCommitActive;
+  }
+
+  // Begin after serialization succeeds, before any reserve/write or recovery sync.
+  beginDurableCommit(): void {
+    this.checkDurableCommit();
     this.durableCommitActive = true;
     this.validatedMeta = null;
     this.validatedPages = null;

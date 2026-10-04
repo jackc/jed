@@ -1,0 +1,177 @@
+schema_version = 1
+name = "validated-cow-serialization-error"
+description = "Serialization errors leave exclusive/shared writers and file attachments usable; failed explicit commits discard already encoded dirty rows."
+requires = ["file.shared_process"]
+fixture = "fileformat/fixtures/cow_inline.jed"
+byte_identical = true
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "open-exclusive"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE wide (c0 i32, c1 i32, c2 i32, c3 i32, c4 i32, c5 i32, c6 i32, c7 i32, c8 i32, c9 i32, c10 i32, c11 i32, c12 i32, c13 i32, c14 i32, c15 i32, c16 i32, c17 i32, c18 i32, c19 i32, c20 i32, c21 i32, c22 i32, c23 i32, c24 i32, c25 i32, c26 i32, c27 i32, c28 i32, c29 i32, c30 i32, c31 i32, c32 i32, c33 i32, c34 i32, c35 i32, c36 i32, c37 i32, c38 i32, c39 i32)"
+expect_error = "0A000"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "UPDATE t SET v = 21 WHERE id = 1"
+
+[[step]]
+actor = "a"
+command = "write_open"
+
+[[step]]
+actor = "a"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (2, 999)"
+
+[[step]]
+actor = "a"
+command = "write_exec"
+sql = "CREATE TABLE wide (c0 i32, c1 i32, c2 i32, c3 i32, c4 i32, c5 i32, c6 i32, c7 i32, c8 i32, c9 i32, c10 i32, c11 i32, c12 i32, c13 i32, c14 i32, c15 i32, c16 i32, c17 i32, c18 i32, c19 i32, c20 i32, c21 i32, c22 i32, c23 i32, c24 i32, c25 i32, c26 i32, c27 i32, c28 i32, c29 i32, c30 i32, c31 i32, c32 i32, c33 i32, c34 i32, c35 i32, c36 i32, c37 i32, c38 i32, c39 i32)"
+
+[[step]]
+actor = "a"
+command = "write_commit"
+expect_error = "0A000"
+
+[[step]]
+actor = "a"
+command = "write_rollback"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id, v FROM t ORDER BY id"
+expect = "1:21"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "UPDATE t SET v = 22 WHERE id = 1"
+
+[[step]]
+actor = "a"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "open"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE wide (c0 i32, c1 i32, c2 i32, c3 i32, c4 i32, c5 i32, c6 i32, c7 i32, c8 i32, c9 i32, c10 i32, c11 i32, c12 i32, c13 i32, c14 i32, c15 i32, c16 i32, c17 i32, c18 i32, c19 i32, c20 i32, c21 i32, c22 i32, c23 i32, c24 i32, c25 i32, c26 i32, c27 i32, c28 i32, c29 i32, c30 i32, c31 i32, c32 i32, c33 i32, c34 i32, c35 i32, c36 i32, c37 i32, c38 i32, c39 i32)"
+expect_error = "0A000"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "UPDATE t SET v = 23 WHERE id = 1"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT id, v FROM t ORDER BY id"
+expect = "1:23"
+
+[[step]]
+actor = "b"
+command = "write_open"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (2, 999)"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "CREATE TABLE wide (c0 i32, c1 i32, c2 i32, c3 i32, c4 i32, c5 i32, c6 i32, c7 i32, c8 i32, c9 i32, c10 i32, c11 i32, c12 i32, c13 i32, c14 i32, c15 i32, c16 i32, c17 i32, c18 i32, c19 i32, c20 i32, c21 i32, c22 i32, c23 i32, c24 i32, c25 i32, c26 i32, c27 i32, c28 i32, c29 i32, c30 i32, c31 i32, c32 i32, c33 i32, c34 i32, c35 i32, c36 i32, c37 i32, c38 i32, c39 i32)"
+
+[[step]]
+actor = "b"
+command = "write_commit"
+expect_error = "0A000"
+
+[[step]]
+actor = "b"
+command = "write_rollback"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "UPDATE t SET v = 24 WHERE id = 1"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id, v FROM t ORDER BY id"
+expect = "1:24"
+
+[[step]]
+actor = "a"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create"
+path = "host"
+
+[[step]]
+actor = "a"
+command = "attach"
+name = "aux"
+path = "shared"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE aux.wide (c0 i32, c1 i32, c2 i32, c3 i32, c4 i32, c5 i32, c6 i32, c7 i32, c8 i32, c9 i32, c10 i32, c11 i32, c12 i32, c13 i32, c14 i32, c15 i32, c16 i32, c17 i32, c18 i32, c19 i32, c20 i32, c21 i32, c22 i32, c23 i32, c24 i32, c25 i32, c26 i32, c27 i32, c28 i32, c29 i32, c30 i32, c31 i32, c32 i32, c33 i32, c34 i32, c35 i32, c36 i32, c37 i32, c38 i32, c39 i32)"
+expect_error = "0A000"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "UPDATE aux.t SET v = 25 WHERE id = 1"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT id, v FROM t ORDER BY id"
+expect = "1:25"
+
+[[step]]
+actor = "a"
+command = "close"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "open-exclusive"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id, v FROM t ORDER BY id"
+expect = "1:25"
+
+[[step]]
+actor = "a"
+command = "close"

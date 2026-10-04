@@ -87,6 +87,12 @@ func (s *sharedPaging) withPager(fn func(*pager) error) error {
 	return fn(s.pgr)
 }
 
+func (s *sharedPaging) commitRequiresReopen() bool {
+	s.pagerMu.Lock()
+	defer s.pagerMu.Unlock()
+	return s.pgr.commitRequiresReopen()
+}
+
 // close closes the backing file (Engine.Close).
 func (s *sharedPaging) close() error {
 	s.pagerMu.Lock()

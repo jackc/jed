@@ -203,6 +203,27 @@ test("failed final barrier poisons the writer and leaves a recoverable generatio
   assert.equal(count(store.image()), 2n);
 });
 
+test("serialization errors leave local and recovered writers usable without storage work", () => {
+  for (const recovered of [false, true]) {
+    const initial = setup();
+    const { store } = initial;
+    const db = recovered ? openStore(store) : initial.db;
+    const before = store.image();
+    store.reset();
+    const columns = Array.from({ length: 40 }, (_, i) => `c${i} i32`).join(",");
+    assert.throws(
+      () => execute(db, `CREATE TABLE wide (${columns})`),
+      (error: unknown) => error instanceof EngineError && error.code() === "0A000",
+    );
+    assert.deepEqual(store.events, []);
+    assert.deepEqual(store.image(), before);
+    execute(db, "INSERT INTO t VALUES (2, 'after serialization error')");
+    assert.equal(count(store.image()), 2n);
+    assert.equal(store.events.filter((event) => event === "sync").length, recovered ? 2 : 1);
+    if (recovered) assert.equal(store.events[0], "sync");
+  }
+});
+
 test("meta checksum covers descriptor entries and zero padding", () => {
   const { db, store } = setup();
   execute(db, "INSERT INTO t VALUES (2, 'new')");

@@ -585,7 +585,8 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   the former body-sync/meta-sync pair. Recovery validates the manifest and dirty pages before
   accepting a root; the free list excludes all current commit dependencies, including orphan
   writes and manifest pages. Adopted recovery/foreign generations are stabilized before new
-  writes, and I/O failures poison the storage handle until reopen. File-growth and recovery
+  writes, and I/O failures poison the storage handle until reopen. Serialization errors before
+  storage work discard the transaction without poisoning the handle. File-growth and recovery
   barriers remain additional; this is one barrier for steady-state commits. No WAL, body redo,
   or new host durability primitive. The same v33 bytes and protocol bind Rust, Go, TypeScript,
   and shared-file access. [spec/design/validated-cow.md](spec/design/validated-cow.md).

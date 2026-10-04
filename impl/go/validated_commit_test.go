@@ -87,6 +87,38 @@ func TestValidatedCommitUsesOneBarrierAndPoisonsFailedWriter(t *testing.T) {
 	}
 }
 
+func TestSerializationErrorLeavesWriterUsable(t *testing.T) {
+	for _, recovered := range []bool{false, true} {
+		t.Run(fmt.Sprintf("recovered=%v", recovered), func(t *testing.T) {
+			image, err := newSnapshot().ToImage(256, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			db, rec, base := recordedCommitEngine(t, image)
+			mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
+			if recovered {
+				db, rec, _ = recordedCommitEngine(t, base.buf)
+			}
+			rec.ops = nil
+			columns := make([]string, 40)
+			for i := range columns {
+				columns[i] = fmt.Sprintf("c%d i32", i)
+			}
+			_, err = execute(db, "CREATE TABLE wide ("+strings.Join(columns, ",")+")")
+			if e, ok := err.(*EngineError); !ok || e.Code() != "0A000" {
+				t.Fatalf("expected serialization size error, got %v", err)
+			}
+			if len(rec.ops) != 0 {
+				t.Fatalf("serialization failure mutated storage: %v", rec.ops)
+			}
+			mustExec(t, db, "INSERT INTO t VALUES (1)")
+			if recovered && rec.ops[0].kind != opSync {
+				t.Fatal("successful successor must still stabilize the adopted generation first")
+			}
+		})
+	}
+}
+
 func TestValidatedManifestRejectsStaleChecksummedBodyAndBrokenChain(t *testing.T) {
 	prior, ops, priorIDs, postIDs := recordFatCommit(t)
 	complete := applyCrash(prior, ops, len(ops), -1, 0)

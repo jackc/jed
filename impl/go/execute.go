@@ -257,7 +257,7 @@ func (db *engine) commitTx() (outcome, error) {
 				var err error
 				if att.coordinator != nil && att.coordinator.lease() == leaseShared {
 					err = att.storage.commitShared(ws, att.coordinator)
-					if err != nil {
+					if err != nil && att.storage.paging.commitRequiresReopen() {
 						att.coordinator.setLease(leasePoisoned)
 					}
 				} else {

@@ -187,6 +187,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   process/reuse byte parity, and real durable Go benchmarks (1.60–1.65× in the measured Linux cases).
   → [validated COW](spec/design/validated-cow.md),
   [experiment report](spec/design/durable-commit-experiments.md). _(size: L)_
+  - [x] **Recover from serialization-only commit errors** — defer the storage commit guard until
+    encoding succeeds; retain writer/coordinator usability across exclusive, shared, and attachment
+    paths, with shared process coverage and fault-device checks for zero storage mutations.
   - [ ] **macOS measurements** — run the existing pure-Go `F_BARRIERFSYNC`/`F_FULLFSYNC` probe
     and the production validated-COW benchmarks on Mac hardware; Linux cannot establish Apple
     hardware durability or latency. Retain the existing full durable-completion guarantee.
