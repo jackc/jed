@@ -963,3 +963,6 @@ pub(crate) fn execute_params(db: &mut Engine, sql: &str, params: &[Value]) -> Re
     let stmt = db.parse(sql)?;
     db.execute_stmt_params(stmt, params)
 }
+
+#[cfg(test)]
+mod validated_cow_tests;

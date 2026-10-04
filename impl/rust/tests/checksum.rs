@@ -75,11 +75,13 @@ fn seed(path: &std::path::Path) {
         sql.push_str(&format!(", ({id}, 'row{id}')"));
     }
     db.query_outcome(&sql, &[]).unwrap();
+    let checkpoint = db.to_image(PAGE_SIZE, db.txid()).unwrap();
     drop(db);
+    std::fs::write(path, checkpoint).unwrap();
 }
 
 #[test]
-fn corrupting_any_body_page_is_caught_or_inert_never_silent() {
+fn corrupting_checkpoint_body_page_is_caught_or_inert_never_silent() {
     let path = tmp("jed_checksum_seed.jed");
     let cpath = tmp("jed_checksum_corrupt.jed");
     let _ = std::fs::remove_file(&path);

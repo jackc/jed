@@ -108,26 +108,28 @@ lands in the storage layer as a **root-pointer swap**:
    write set), leaving committed pages untouched. New/modified pages are written to
    *unused* page slots — committed pages are never overwritten in place while readers may
    be reading them (copy-on-write discipline).
-3. **Commit** = `sync()` the new pages durably, then atomically publish the new root
-   pointer in the meta page (a single small write), then `sync()` again. The root swap is
-   the only globally-exclusive moment — the short commit lock of §3.
+3. **Commit (v33)** = write new body pages and their content manifest, publish the alternate
+   meta slot, then execute one durable `sync()`. Recovery validates the manifest before
+   accepting that root. The meta publication and final barrier use the short commit lock.
+   [Validated COW](validated-cow.md) specifies the protocol, recovery, and reuse proof.
 4. After commit, the pages the old root referenced but the new one does not become free for
    reuse. **Not MVCC** (CLAUDE.md §3): exactly one committed version plus one writer's
    pending set — no version chains, no per-row timestamps, no vacuum. Page reclamation is
    free-list bookkeeping, not version GC.
 
-This is the bbolt model (single writer, copy-on-write pages, meta-page root swap), kept as
-a reference checkout for exactly this reason (CLAUDE.md §12). The atomicity of step 3
-depends on the meta-page write being all-or-nothing; the format reserves **two meta slots**
-(with a checksum) so a torn write during publish can always fall back to the previous valid
-meta — detail specified in [../fileformat/format.md](../fileformat/format.md).
+The single-writer COW root-swap model began with bbolt-style ordered publication. Since v33,
+**two checksummed meta slots plus explicit dependency validation** permit one commit barrier.
+A meta page need not be atomically written: a torn page, incomplete manifest, or missing dirty
+page rejects that candidate, preserving the preceding complete snapshot. The free list
+protects every dependency of that preceding manifest, including orphan writes. Details are
+in [validated-cow.md](validated-cow.md) and [../fileformat/format.md](../fileformat/format.md).
 
 > **Status (P6.1, `format_version` 2): incremental copy-on-write has landed.** A commit now
 > writes only the **dirty** pages a mutation introduced — the path the copy-on-write B-tree
 > copied (root→leaf), plus the rewritten catalog chain — to fresh **appended** slots, then
 > publishes the new root by writing the **alternate meta slot** (`txid & 1`) and `sync`ing.
-> The two meta slots, the checksum, the root pointer, and the **write-ordering rule** (body
-> pages + `sync()`, *then* meta + `sync()`) carried forward from step-5b unchanged; P6.1
+> The two meta slots, checksum, root pointer, and original two-barrier ordering carried
+> forward from step-5b; v33 replaces that ordering with validated COW. P6.1
 > activated the **slot alternation** the whole-image writer had stubbed (both slots = same
 > `txid`). Each table's rows are now a per-table **on-disk B-tree** (interior + leaf node
 > pages) whose node layout and **size-driven split/merge** are a §8 byte contract
@@ -140,8 +142,9 @@ meta — detail specified in [../fileformat/format.md](../fileformat/format.md).
 > **reclaimed in-commit** each commit, so the file stays bounded within a session too. **Open now
 > reads only the interior spine** — the two reasons it used to touch every leaf are both gone (v25
 > dropped the free-list reachability walk; v28 persists the exact per-table row count in the
-> checksum-protected catalog, replacing the former eager leaf sum), making open
-> O(interior spine) rather than O(file). Demand paging / the bounded buffer pool (P6.4,
+> checksum-protected catalog, replacing the former eager leaf sum), making tree loading
+> O(interior spine) rather than O(file). V33 recovery also hashes the latest dirty-page set;
+> a large last transaction therefore increases open work. Demand paging / the bounded buffer pool (P6.4,
 > [pager.md](pager.md)), overflow pages for over-large values, and LZ4 compression (both v3,
 > [large-values.md](large-values.md)) have **also landed**, as have spilling hash JOIN,
 > aggregate and DISTINCT ([spill.md](spill.md)). Complete query-memory admission remains
@@ -153,14 +156,13 @@ meta — detail specified in [../fileformat/format.md](../fileformat/format.md).
 > The **host API** ([api.md](api.md)): the durability recipe is now a **dirty-page write +
 > alternate-meta-slot publish + `fsync`** (replacing the step-5b temp-file + atomic-`rename`
 > whole-file swap, which only worked because the whole file was rewritten). Atomicity comes
-> from the meta-slot alternation + the checksum + the write ordering, exactly as this section
-> describes. `commit` is **explicit** and `close` does not auto-flush (api.md §2).
+> from meta-slot alternation, manifest validation, and the final durable barrier. `commit` is **explicit** and `close` does not auto-flush (api.md §2).
 >
 > **Durable-commit preallocation ([pager.md](pager.md) §7).** That per-commit `fsync` was made
 > ~3× cheaper without changing the model: the block seam **preallocates file growth geometrically**
 > (≈doubling, floored at 16 KiB and capped at a 1 MiB chunk — real, durably-allocated zero blocks
 > ahead of the committed `page_count`, SSD-target page-aligned writes, CLAUDE.md §9) and the body+meta
-> barrier uses **`fdatasync`**, so a steady-state commit overwrites already-allocated space and pays no
+> barrier uses the host's durable data-sync primitive (**`fdatasync`** on Linux), so a steady-state commit overwrites already-allocated space and pays no
 > ext4 file-growth metadata journaling. A small database's file stays proportional to its data (no
 > fixed 1 MiB minimum); a large one still grows in 1 MiB chunks. Byte- and cost-neutral (the slack is
 > unreferenced trailing zeros the loader ignores; `create`'s from-scratch image is **not**
@@ -369,55 +371,33 @@ sits so the options stay open (CLAUDE.md §9).
 
 ## 7. Fault injection & crash-recovery testing
 
-The crash-safety claims of §4 — **body pages + `sync()`, *then* the alternate meta slot + `sync()`**,
-backed by the **two checksummed meta slots** ([../fileformat/format.md](../fileformat/format.md)) — are
-the load-bearing reliability property: a crash at *any* point in a commit must leave the file readable
-as a **valid snapshot**, never corrupt. A golden fixture with a hand-corrupted checksum
-(`torn_meta_slot{0,1}.jed`) tests the *post-hoc* fallback, but it cannot exercise the **actual commit
-points** — mid-body, between the body and meta syncs, mid-meta-write. The **fault-injection seam** does.
+The crash-safety claim is the [v33 validated-COW protocol](validated-cow.md): body pages,
+manifest overflow, alternate meta, then one durable sync. No write-order assumption is made
+about unsynchronized pages. A recovered candidate must bind every new dependency by checksum;
+the previous snapshot and its manifest dependencies remain untouched until commit succeeds.
 
-**The seam.** The pager (§2) carries an optional **one-shot fault**, armed only by tests, that simulates
-a crash at a chosen point in the commit write sequence (`persist`):
+The pager's per-core test seam can fail or tear a selected body write (including manifest
+pages), the meta write, or the final sync. A write-through seam alone does **not** model
+power loss: at final-sync failure it can expose all unsynced data. Fault-device tests must
+also discard or reorder pending writes and persist partial pages. In particular, make the
+new meta durable while withholding one body page, and replace a dependency with an older
+page whose own CRC remains valid. Both must recover the preceding snapshot.
 
-- **`BodyWrite(n)`** — fail on the *n*-th write to a **body** page (a clean crash mid-body, before the
-  body `sync()`).
-- **`MetaWrite`** — let the body write + `sync()` complete, then fail on the **meta-slot** write (a crash
-  *between* the body sync and the meta sync — the critical window §4 protects).
-- **`Sync(n)`** — fail on the *n*-th `sync()` since arming (`1` = body barrier, `2` = meta barrier).
+Shared Ruby-authored manifest fixtures and SQL recovery-and-continue corpus entries pin
+cross-core outcomes. Per-core fault-device tests cover the internal write/sync boundaries,
+poisoned handles, and a process crash followed by resumed writing and another power failure.
+Real-process corpus scenarios cover foreign generation adoption, pinned readers, and
+continued commits after a killed writer. The test mechanism is internal; the bytes, valid
+recovery outcomes, and inability to continue on a poisoned storage handle are contracts.
 
-Pages **0 and 1 are always the meta slots** and every body/catalog page is **≥ 2**
-([../fileformat/format.md](../fileformat/format.md)), so `MetaWrite` is identified by the page **index**
-(`< 2`), never by counting body pages — stable regardless of how many pages a commit dirties. A write
-fault may additionally **tear** the page: write `k` leading bytes before failing, simulating a partial
-(torn) page write — the case the meta checksum exists to catch.
+| Interrupted point | Recovery requirement |
+|---|---|
+| Body/manifest write, meta not written | Prior snapshot |
+| Torn alternate meta | Prior snapshot |
+| Complete new meta, any dependency absent/torn/stale | Prior snapshot |
+| Complete new meta and all dependencies | New snapshot permitted, even before acknowledgment |
+| Successful final durable sync | New snapshot durable |
 
-**Not a §8 byte contract.** Like the buffer pool (pager.md §3) and the `fdatasync` flavor (pager.md §7),
-the seam is **per-core internal machinery, realized idiomatically** — the Rust core gates it behind
-`#[cfg(test)]` (zero production footprint); Go/TS carry an inert `None`/`nil` field checked on the write
-path. What is a **cross-core contract is the recovery *outcome***, asserted identically in all three
-cores' per-core tests (not the corpus — a crash mid-commit is not SQL-level deterministic, like P5.3
-concurrency and `$N`).
-
-**The recovery matrix (the invariant: recover to a valid snapshot — prior *or* new — never corruption).**
-
-| Injected crash point | Durable result | Reopen yields |
-|---|---|---|
-| `BodyWrite(1)` (mid-body, unsynced) | new body pages partial/unreferenced; prior meta intact | **prior** snapshot, fully readable |
-| `BodyWrite(1)` torn (partial page) | a torn body page, unreferenced by the prior meta | **prior** snapshot (the torn page is never read) |
-| `Sync(1)` (before body durable) | body written-through but unsynced; meta not written | **prior** snapshot |
-| `MetaWrite` (body durable, meta not written) | new body durable but unreferenced; prior meta intact | **prior** snapshot |
-| `MetaWrite` torn (partial meta page) | the published slot's checksum fails | **prior** snapshot (checksum → fall back to the other slot) |
-| `Sync(2)` (meta written, unsynced) | the new meta is written-through | a **valid** snapshot (atomicity holds either way; see below) |
-| no fault (baseline) | full commit | **new** snapshot |
-
-After any recovery-to-prior, a follow-on test **continues committing** (insert/delete churn) to confirm
-the **free-list** (§6 — v25 persisted + reclaimed in-commit) is correct after a crash — reuse stays
-torn-write-safe and the file does not corrupt or grow unbounded.
-
-**Write-through fidelity caveat.** The seam writes through to the real file (it does not model "unsynced
-bytes are lost on power loss"). For every point *before* the meta is written this is exactly faithful —
-the prior meta references only prior pages, so unreferenced new bytes are inert. At the **`Sync(2)`**
-boundary (meta written, not yet synced) a real power loss could lose the meta (→ prior) or keep it
-(→ new); write-through deterministically yields **new**. Both are *valid* — that boundary tests
-**atomicity** (never a half-published state), and the loss-direction is already covered by the
-`MetaWrite` / `Sync(1)` rows, so the matrix is complete without modeling unsynced-data loss.
+After recovery to either valid generation, further writes first stabilize any adopted
+unacknowledged/foreign state, then continue under the same reuse rules. Read-only recovery
+performs no sync. Allocation growth syncs are separate, amortized operations.

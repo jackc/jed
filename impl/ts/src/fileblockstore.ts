@@ -16,6 +16,7 @@ import {
   writeSync,
 } from "node:fs";
 import type { BlockStore } from "./blockstore.ts";
+import { engineError } from "./errors.ts";
 
 export class FileBlockStore implements BlockStore {
   private fd: number;
@@ -37,7 +38,12 @@ export class FileBlockStore implements BlockStore {
   }
 
   writeAt(offset: number, bytes: Uint8Array): void {
-    writeSync(this.fd, bytes, 0, bytes.length, offset);
+    let done = 0;
+    while (done < bytes.length) {
+      const count = writeSync(this.fd, bytes, done, bytes.length - done, offset + done);
+      if (count <= 0) throw engineError("io_error", "file write made no progress");
+      done += count;
+    }
   }
 
   sync(): void {
@@ -58,7 +64,7 @@ export class FileBlockStore implements BlockStore {
       // before a later in-region commit relies on it (else the per-commit data-only sync would have to
       // flush that metadata, defeating the durable-commit win — spec/design/pager.md §7).
       const zeros = new Uint8Array(bytes - cur);
-      writeSync(this.fd, zeros, 0, zeros.length, cur);
+      this.writeAt(cur, zeros);
       if (!this.noSync) fsyncSync(this.fd); // fsync=off skips the durable-grow barrier too (dev/testing).
     } else if (bytes < cur) {
       ftruncateSync(this.fd, bytes); // truncate; no barrier needed

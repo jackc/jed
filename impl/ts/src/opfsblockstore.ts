@@ -10,6 +10,7 @@
 // (the parity test drives it in Node with a fake handle — hosts.md §5).
 
 import type { BlockStore } from "./blockstore.ts";
+import { engineError } from "./errors.ts";
 
 // SyncAccessHandle is the structural subset of the DOM FileSystemSyncAccessHandle that OpfsBlockStore
 // uses (spec/design/hosts.md §5). Declaring our own interface (rather than depending on the DOM lib
@@ -57,7 +58,13 @@ export class OpfsBlockStore implements BlockStore {
   }
 
   writeAt(offset: number, bytes: Uint8Array): void {
-    this.handle.write(bytes, { at: offset });
+    let done = 0;
+    while (done < bytes.length) {
+      const count = this.handle.write(bytes.subarray(done), { at: offset + done });
+      if (count <= 0 || count > bytes.length - done)
+        throw engineError("io_error", "OPFS write made invalid progress");
+      done += count;
+    }
   }
 
   sync(): void {
@@ -76,7 +83,7 @@ export class OpfsBlockStore implements BlockStore {
       // write + sync need not re-allocate (hosts.md §5 / §2.1). OPFS forgoes the file hosts'
       // metadata-free win, which the §2.1 contract calls correct, just slower.
       const zeros = new Uint8Array(bytes - cur);
-      this.handle.write(zeros, { at: cur });
+      this.writeAt(cur, zeros);
       this.handle.flush();
     } else if (bytes < cur) {
       this.handle.truncate(bytes); // shrink; no barrier needed

@@ -1,13 +1,14 @@
 # Durability experiments
 
-Research prototypes, not a shipped storage mode. See the
-[design and results](../../spec/design/durable-commit-experiments.md).
+The original research prototypes remain alongside the production validated-COW benchmark
+below. See the [research record](../../spec/design/durable-commit-experiments.md) and
+[production design](../../spec/design/validated-cow.md).
 
 `experiment.rs` runs as an in-crate Rust test so the real SQL engine, pager, and
 format remain private. It captures the production COW allocator's exact writes
 for SQL UPDATE transactions, then times identical write sets through:
 
-- Current body-sync / meta-sync COW.
+- The former body-sync / meta-sync COW (two-barrier control).
 - `wal.rs`, external full-page redo journal.
 - `wal.rs`, the same journal in a reserved in-file extent.
 - `cow.rs`, final-address COW with two validating commit manifests.
@@ -67,3 +68,52 @@ For macOS, the separate [pure-Go syscall probe](macos_sync_probe/README.md)
 implements the no-format-change barrier/full-sync proposal and the fdatasync
 side investigation. It cross-compiles on Linux; execute it on a Mac for actual
 timings.
+
+## Production validated COW benchmark
+
+Run the actual Go SQL commit path with durable synchronization enabled:
+
+```sh
+mise run bench:durable_commit
+```
+
+The task uses a Go build overlay to include `production_go_bench_test.go` without
+editing the core directory. It records six samples of 256 commits for each of
+one-row and 64-row updates over a 512-row table. `JED_DURABILITY_COMMITS` and
+`JED_DURABILITY_REPEATS` override those counts. `JED_DURABILITY_BENCH_DIR` selects
+an existing persistent filesystem location; by default the task creates a
+checkout-local `bench/results/production-durability-<timestamp>-<pid>` directory.
+The images are removed after every sample; `run.log` is retained.
+
+These timings include SQL parsing/execution, page allocation/reclamation,
+checksumming, writes, real flushes, and file growth. Initialization and final
+reopen verification are outside the timer. Each final image is reopened and every
+row's accumulated update count is checked. Counters include the full flush and
+zero allocation done by file growth. No artificial flush delay is used.
+
+The [six-run Linux comparison](results/production-go-linux-v33.csv) used Go 1.27.1,
+Linux/ext4 on `/dev/mapper/ubuntu--vg-ubuntu--lv`, Intel Core Ultra 9 285K, default
+8192-byte pages, and the same persistent-filesystem directory for both revisions.
+The baseline was master `4f1a3b27530b8af1d1ff64380ddda00bb34069d2`; copy this same
+benchmark source to `impl/go/production_durability_bench_test.go` in an archive or
+checkout of that commit, set `JED_DURABILITY_BENCH_DIR`, and run:
+
+```sh
+go test -run '^$' -bench BenchmarkProductionDurableCommit -benchtime=256x -count=6
+```
+
+The captured comparison alternated revision order between paired runs. It retains
+all samples, including a contended first 64-row sample. Median time per commit:
+
+| Rows updated | Master, two flushes | Validated COW | Speedup |
+| --- | ---: | ---: | ---: |
+| 1 | 3.677 ms | 2.292 ms | 1.60× |
+| 64 | 3.880 ms | 2.349 ms | 1.65× |
+
+Both revisions wrote identical application byte counts in these workloads:
+41,248 and 42,368 bytes per commit respectively. Their manifests fit within the
+meta page. Including one growth event per 256-commit sample, flushes fell from
+2.00390625 to 1.00390625 per commit. Larger dirty sets spill manifest records to
+additional pages, so this is not a universal zero-byte-overhead claim. Timings
+are workstation observations, not a macOS measurement or a hardware-independent
+performance guarantee. See the [production design](../../spec/design/validated-cow.md).

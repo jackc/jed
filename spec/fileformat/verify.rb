@@ -26,7 +26,8 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 32 # format_version 32 adds timezone dependencies; v31: host-function index dependencies (extensibility.md §8.1) — the
+VERSION = 33 # v33: full-page meta CRC and validated-COW inline/overflow manifests.
+# format_version 32 adds timezone dependencies; v31: host-function index dependencies (extensibility.md §8.1) — the
 # per-index index_flags byte gains bit2 has_host_deps, and (only when set) after the v27 predicate a
 # u16 dep_count + per dependency name (u16 len + UTF-8) ‖ arg_count u16 ‖ arg type codes (u8 each) ‖
 # result type code (u8) ‖ component_id (u16 len + UTF-8) ‖ semantic_version u32, in ascending
@@ -1258,7 +1259,39 @@ COLLATION_SKEW_TWIN_TABLE = {
              rows: [[1, "a"], [2, "Z"], [3, "ä"], [4, "b"]] }]
 }.freeze
 
-FIXTURES = [
+COW_OLD_TABLE = { name: "t", columns: [col("id", "i32", pk: true), col("v", "i32")],
+                  rows: [[1, 10]] }.freeze
+COW_NEW_TABLE = COW_OLD_TABLE.merge(rows: [[1, 20]]).freeze
+
+# These encode commit history, not a from-scratch image. Body pages 2/3 retain the
+# preceding root; the new leaf/catalog are at 4/5. Extra *orphan* writes deliberately
+# exercise dependencies that a root-reachability walk alone cannot protect.
+COW_FIXTURES = [
+  ["inline", :valid, 0],
+  ["overflow", :valid, 37],
+  ["empty_tail", :empty_tail, 15],
+  ["torn_body", :torn_body, 0],
+  ["stale_body", :stale_body, 0],
+  ["stale_orphan", :stale_orphan, 37],
+  ["torn_meta", :torn_meta, 0],
+  ["torn_manifest", :torn_manifest, 37],
+  ["wrong_manifest_txid", :wrong_manifest_txid, 37],
+  ["manifest_cycle", :manifest_cycle, 37],
+  ["duplicate_entry", :duplicate_entry, 0],
+  ["out_of_bounds", :out_of_bounds, 0],
+  ["missing_root", :missing_root, 0],
+  ["root_manifest", :root_manifest, 37],
+  ["free_head_manifest", :free_head_manifest, 37],
+  ["invalid_free_list", :invalid_free_list, 0],
+  ["bad_padding", :bad_padding, 0]
+].map do |name, mutation, orphans|
+  accepted = [:valid, :empty_tail].include?(mutation)
+  { file: "cow_#{name}.jed", page_size: 256, tables: [accepted ? COW_NEW_TABLE : COW_OLD_TABLE],
+    cow: mutation, cow_orphans: orphans, expected_txid: accepted ? 2 : 1,
+    expected_open_error: mutation == :invalid_free_list ? "invalid free-list entry" : nil }
+end.freeze
+
+FIXTURES = ([
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
   { file: "compressed_table.jed", page_size: 256, tables: [COMPRESSED_TABLE] },
@@ -1340,7 +1373,7 @@ FIXTURES = [
   # Torn-write fallback: same image as pk_table, with one meta slot's CRC smashed.
   { file: "torn_meta_slot0.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
   { file: "torn_meta_slot1.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 1 }
-].freeze
+] + COW_FIXTURES).freeze
 
 # --- primitives -------------------------------------------------------------
 
@@ -1366,6 +1399,24 @@ end
 # the byte stream, so checksumming the concatenation matches the cores' streaming page_crc exactly.
 def page_crc(page)
   crc32(page.byteslice(0, 12) + page.byteslice(PAGE_HEADER, page.bytesize - PAGE_HEADER))
+end
+
+def meta_crc(page)
+  crc32(page.byteslice(0, 32) + page.byteslice(36, page.bytesize - 36))
+end
+
+# CRC-64/ECMA-182: unreflected, init = xorout = 0. Deliberately independent
+# bit-at-a-time reference; production cores may use byte tables or acceleration.
+def crc64(data, crc = 0)
+  data.each_byte do |byte|
+    crc ^= byte << 56
+    8.times do
+      top = crc & 0x8000000000000000
+      crc = (crc << 1) & 0xFFFFFFFFFFFFFFFF
+      crc ^= 0x42F0E1EBA9EA3693 unless top.zero?
+    end
+  end
+  crc
 end
 
 # int-be-signflip: add bias 2^(bits-1), emit unsigned big-endian (encoding.md).
@@ -2712,13 +2763,14 @@ end
 
 def write_meta(image, ps, slot, page_size, txid, root, page_count)
   off = slot * ps
+  image[off, ps] = "\x00".b * ps
   image[off, 4] = MAGIC
   image[off + 4, 2] = u16(VERSION)
   image[off + 8, 4] = u32(page_size)
   image[off + 12, 8] = u64(txid)
   image[off + 20, 4] = u32(root)
   image[off + 24, 4] = u32(page_count)
-  image[off + 32, 4] = u32(crc32(image[off, 32]))
+  image[off + 32, 4] = u32(meta_crc(image.byteslice(off, ps)))
 end
 
 def write_page(image, ps, index, type, item_count, next_page, payload)
@@ -2895,7 +2947,7 @@ end
 # A from-scratch image (format.md "Allocation & incremental commit"): the special case where
 # every node is dirty — data B-trees post-order (per table, name order) from page 2, then the
 # catalog chain, then both meta slots at txid 1.
-def build_image(types, sequences, tables, page_size, collations = [])
+def build_image(types, sequences, tables, page_size, collations = [], start_page: ROOT_PAGE)
   ps = page_size
   cap = ps - PAGE_HEADER
   # Composite types in scope for the recursive value codec, keyed by lowercased name (§4).
@@ -2908,7 +2960,7 @@ def build_image(types, sequences, tables, page_size, collations = [])
   data_pages = {} # index => [page_type, item_count, payload]
   root_data = Array.new(sorted.size, 0)
   index_roots = Array.new(sorted.size) { [] }
-  next_index = ROOT_PAGE
+  next_index = start_page
   sorted.each_with_index do |t, ti|
     pairs = table_entries(t).map do |key, row|
       forms, comps, size = plan_record(t, key, row, cap)
@@ -2963,11 +3015,116 @@ end
 
 # The bytes a fixture should contain (applying any torn-slot corruption).
 def fixture_image(fx)
+  return cow_fixture_image(fx) if fx[:cow]
+
   image = build_image(fx[:types] || [], fx[:sequences] || [], fx[:tables], fx[:page_size],
                       fx[:collations] || [])
   if fx[:corrupt_slot]
     off = fx[:corrupt_slot] * fx[:page_size] + 35 # last CRC byte of that slot
     image.setbyte(off, image.getbyte(off) ^ 0xFF)
+  end
+  image
+end
+
+def refresh_meta_crc(image, ps, slot)
+  off = slot * ps
+  image[off + 32, 4] = u32(meta_crc(image.byteslice(off, ps)))
+end
+
+def refresh_body_crc(image, ps, index)
+  off = index * ps
+  image[off + 12, 4] = u32(page_crc(image.byteslice(off, ps)))
+end
+
+def refresh_manifest_chain_digest(image, ps, chain)
+  digest = chain.reduce(0) { |crc, index| crc64(u32(index) + image.byteslice(index * ps, ps), crc) }
+  image[48, 8] = u64(digest)
+  refresh_meta_crc(image, ps, 0)
+end
+
+def cow_fixture_image(fx)
+  ps = fx[:page_size]
+  old = build_image([], [], [COW_OLD_TABLE], ps)
+  old_count = old.bytesize / ps
+  fresh = build_image([], [], [COW_NEW_TABLE], ps, [], start_page: old_count)
+  root = fresh.byteslice(20, 4).unpack1("N")
+  image = old + fresh.byteslice(old.bytesize, fresh.bytesize - old.bytesize)
+  dirty = (old_count...(image.bytesize / ps)).to_a
+  fx[:cow_orphans].times do |i|
+    index = image.bytesize / ps
+    image << "\x00".b * ps
+    write_page(image, ps, index, PAGE_OVERFLOW, 1, 0, [i + 1].pack("C"))
+    dirty << index
+  end
+  entries = dirty.map { |index| u32(index) + u64(crc64(image.byteslice(index * ps, ps))) }
+  inline_count = [entries.length, (ps - 64) / 12].min
+  overflow_count = (entries.length - inline_count + (ps - 32) / 12 - 1) / ((ps - 32) / 12)
+  overflow_count += 1 if fx[:cow] == :empty_tail
+  chain = Array.new(overflow_count) { |i| image.bytesize / ps + i }
+  image << "\x00".b * (overflow_count * ps)
+  remaining = entries.drop(inline_count)
+  chain.each_with_index do |index, ordinal|
+    chunk = remaining.shift((ps - 32) / 12)
+    payload = u64(2) + u32(ordinal) + u32(0) + chunk.join.b
+    write_page(image, ps, index, 8, chunk.length, chain[ordinal + 1] || 0, payload)
+  end
+  write_meta(image, ps, 0, ps, 2, root, image.bytesize / ps)
+  image[36, 12] = u32(chain.first || 0) + u32(entries.length) + u32(chain.length)
+  image[64, inline_count * 12] = entries.first(inline_count).join.b
+  refresh_manifest_chain_digest(image, ps, chain)
+
+  # Reseal outer checksums for malformed-but-checksummed structural cases. This
+  # prevents a test from passing merely because it rejected an unrelated CRC.
+  case fx[:cow]
+  when :torn_body
+    image.setbyte(old_count * ps + 31, image.getbyte(old_count * ps + 31) ^ 0x40)
+  when :stale_body
+    image[old_count * ps, ps] = old.byteslice(2 * ps, ps)
+  when :stale_orphan
+    index = dirty.last
+    image.setbyte(index * ps + 16, 0xFE)
+    refresh_body_crc(image, ps, index)
+  when :torn_meta
+    image.setbyte(63, image.getbyte(63) ^ 0x80)
+  when :torn_manifest
+    index = chain.last
+    image.setbyte(index * ps + 32, image.getbyte(index * ps + 32) ^ 0x80)
+  when :wrong_manifest_txid
+    image[chain.first * ps + 16, 8] = u64(1)
+    refresh_body_crc(image, ps, chain.first)
+    refresh_manifest_chain_digest(image, ps, chain)
+  when :manifest_cycle
+    image[chain.last * ps + 8, 4] = u32(chain.first)
+    refresh_body_crc(image, ps, chain.last)
+    refresh_manifest_chain_digest(image, ps, chain)
+  when :duplicate_entry
+    image[76, 12] = image.byteslice(64, 12)
+    refresh_meta_crc(image, ps, 0)
+  when :out_of_bounds
+    image[76, 4] = u32(image.bytesize / ps)
+    refresh_meta_crc(image, ps, 0)
+  when :missing_root
+    image[40, 4] = u32(1)
+    image[76, 12] = "\x00".b * 12
+    refresh_meta_crc(image, ps, 0)
+  when :root_manifest
+    image[20, 4] = u32(chain.first)
+    refresh_meta_crc(image, ps, 0)
+  when :free_head_manifest
+    image[28, 4] = u32(chain.first)
+    refresh_meta_crc(image, ps, 0)
+  when :invalid_free_list
+    index = image.bytesize / ps
+    image << "\x00".b * ps
+    write_page(image, ps, index, 7, 1, 0, u32(old_count))
+    image[24, 4] = u32(index + 1)
+    image[28, 4] = u32(index)
+    image[40, 4] = u32(entries.length + 1)
+    image[64 + entries.length * 12, 12] = u32(index) + u64(crc64(image.byteslice(index * ps, ps)))
+    refresh_meta_crc(image, ps, 0)
+  when :bad_padding
+    image.setbyte(ps - 1, 1)
+    refresh_meta_crc(image, ps, 0)
   end
   image
 end
@@ -2995,10 +3152,87 @@ def read_meta(image, ps, slot)
   return nil unless m.byteslice(0, 4) == MAGIC
   return nil unless m.byteslice(4, 2).unpack1("n") == VERSION
   return nil unless m.getbyte(6).zero? && m.getbyte(7).zero?
-  return nil unless m.byteslice(28, 4) == "\x00\x00\x00\x00".b
-  return nil unless crc32(m.byteslice(0, 32)) == m.byteslice(32, 4).unpack1("N")
+  return nil unless m.byteslice(8, 4).unpack1("N") == ps
+  return nil unless meta_crc(m) == m.byteslice(32, 4).unpack1("N")
 
-  { txid: m.byteslice(12, 8).unpack1("Q>"), root_page: m.byteslice(20, 4).unpack1("N") }
+  meta = { txid: m.byteslice(12, 8).unpack1("Q>"), root_page: m.byteslice(20, 4).unpack1("N"),
+           page_count: m.byteslice(24, 4).unpack1("N"), free_head: m.byteslice(28, 4).unpack1("N") }
+  return nil unless meta[:page_count] >= 3 && meta[:page_count] <= image.bytesize / ps
+  return nil unless (2...meta[:page_count]).cover?(meta[:root_page])
+  return nil unless meta[:free_head].zero? || (2...meta[:page_count]).cover?(meta[:free_head])
+  return nil unless valid_manifest?(image, ps, m, meta)
+
+  meta
+end
+
+def valid_manifest?(image, ps, m, meta)
+  head, count, chain_count = m.byteslice(36, 12).unpack("N3")
+  digest = m.byteslice(48, 8).unpack1("Q>")
+  return false unless m.byteslice(56, 8) == "\x00".b * 8
+  return false if count + chain_count > meta[:page_count] - 2
+  return false unless (chain_count.zero? && head.zero? && digest.zero?) ||
+                      (chain_count.positive? && head >= 2 && head < meta[:page_count])
+  return false if count.zero? && (!chain_count.zero? || !head.zero? || !digest.zero?)
+
+  inline = [count, (ps - 64) / 12].min
+  refs = m.byteslice(64, inline * 12).unpack("NQ>" * inline).each_slice(2).to_a
+  return false unless m.byteslice(64 + inline * 12, ps - 64 - inline * 12).bytes.all?(&:zero?)
+  chain = []
+  chain_digest = 0
+  remaining = count - inline
+  page = head
+  chain_count.times do |ordinal|
+    return false unless page >= 2 && page < meta[:page_count] && !chain.include?(page)
+    block = image.byteslice(page * ps, ps)
+    return false unless block.getbyte(0) == 8 && block.byteslice(1, 3) == "\x00".b * 3
+    return false unless page_crc(block) == block.byteslice(12, 4).unpack1("N")
+    return false unless block.byteslice(16, 8).unpack1("Q>") == meta[:txid]
+    return false unless block.byteslice(24, 4).unpack1("N") == ordinal
+    return false unless block.byteslice(28, 4) == "\x00".b * 4
+    entries = block.byteslice(4, 4).unpack1("N")
+    return false unless entries == [remaining, (ps - 32) / 12].min
+    refs.concat(block.byteslice(32, entries * 12).unpack("NQ>" * entries).each_slice(2).to_a)
+    return false unless block.byteslice(32 + entries * 12, ps - 32 - entries * 12).bytes.all?(&:zero?)
+    chain_digest = crc64(u32(page) + block, chain_digest)
+    chain << page
+    page = block.byteslice(8, 4).unpack1("N")
+    remaining -= entries
+  end
+  return false unless page.zero? && remaining.zero? && chain_digest == digest
+  ids = refs.map(&:first)
+  return false unless ids == ids.sort.uniq && (ids & chain).empty?
+  return false if count.positive? && !ids.include?(meta[:root_page])
+  return false if count.positive? && meta[:free_head].positive? && !ids.include?(meta[:free_head])
+  return false unless refs.all? do |index, expected|
+    next false unless index >= 2 && index < meta[:page_count]
+    block = image.byteslice(index * ps, ps)
+    (1..7).cover?(block.getbyte(0)) && page_crc(block) == block.byteslice(12, 4).unpack1("N") &&
+      crc64(block) == expected
+  end
+  meta[:protected] = ids + chain
+  true
+end
+
+# Logical free-list checks follow candidate selection, like catalog decoding. They
+# reject the selected database rather than falling back to hide semantic corruption.
+def validate_free_list!(image, ps, meta)
+  seen = []
+  free_pages = []
+  page = meta[:free_head]
+  until page.zero?
+    raise "invalid free-list chain" unless page >= 2 && page < meta[:page_count] && !seen.include?(page)
+    block = image.byteslice(page * ps, ps)
+    raise "invalid free-list page" unless block.getbyte(0) == 7 && page_crc(block) == block.byteslice(12, 4).unpack1("N")
+    entries = block.byteslice(4, 4).unpack1("N")
+    raise "invalid free-list count" if entries > (ps - 16) / 4
+    free_pages.concat(block.byteslice(16, entries * 4).unpack("N*"))
+    seen << page
+    page = block.byteslice(8, 4).unpack1("N")
+  end
+  unless free_pages == free_pages.sort.uniq && free_pages.all? { |id| id >= 2 && id < meta[:page_count] } &&
+         (free_pages & (meta[:protected] + seen)).empty?
+    raise "invalid free-list entry"
+  end
 end
 
 def select_meta(image, ps)
@@ -3807,6 +4041,7 @@ end
 def decode_image(image)
   ps = image.byteslice(8, 4).unpack1("N")
   meta = select_meta(image, ps)
+  validate_free_list!(image, ps, meta)
   types = []
   sequences = []
   collations = []
@@ -4049,6 +4284,7 @@ end
 
 def verify
   fail!("CRC32 self-test failed") unless crc32("123456789") == 0xCBF43926
+  fail!("CRC64 self-test failed") unless crc64("123456789") == 0x6C40DF5F0B497347
 
   FIXTURES.each do |fx|
     path = File.join(fixtures_dir, fx[:file])
@@ -4061,7 +4297,23 @@ def verify
             "(disk #{on_disk.bytesize}B vs reference #{reference.bytesize}B)")
     end
 
+    if fx[:expected_open_error]
+      # Completeness selects the newer root, then semantic free-list validation
+      # rejects it; falling back here would conceal a different corruption class.
+      fail!("#{fx[:file]}: manifest did not select new root") unless select_meta(on_disk, fx[:page_size])[:txid] == 2
+      begin
+        decode_image(on_disk)
+      rescue RuntimeError => error
+        fail!("#{fx[:file]}: wrong decode error: #{error.message}") unless error.message == fx[:expected_open_error]
+      else
+        fail!("#{fx[:file]}: accepted malformed logical contents")
+      end
+      next
+    end
     decoded = decode_image(on_disk)
+    if fx[:expected_txid] && select_meta(on_disk, fx[:page_size])[:txid] != fx[:expected_txid]
+      fail!("#{fx[:file]}: recovery selected the wrong generation")
+    end
     want = expected_tables(fx)
     fail!("#{fx[:file]}: decoded #{decoded[:tables].size} tables, expected #{want.size}") unless decoded[:tables].size == want.size
     decoded[:tables].each_with_index do |t, i|

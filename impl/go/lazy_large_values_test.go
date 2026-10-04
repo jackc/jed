@@ -73,6 +73,7 @@ func lazySeed(t *testing.T, db dbHandle) {
 // checksum-inconsistent corruption is instead caught at open (crash_recovery_test.go's checksum case).
 func corruptOverflowPayloads(t *testing.T, path string) {
 	t.Helper()
+	checkpointTestFile(t, path)
 	bytes, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)

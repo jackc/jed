@@ -90,6 +90,12 @@ def run_scenario(path, first_core, second_core)
   raise "#{path}: schema_version must be 1" unless data["schema_version"] == 1
   name = data.fetch("name")
   Dir.mktmpdir("jed-process-") do |dir|
+    if fixture = data["fixture"]
+      fixture_path = File.expand_path(fixture, File.join(ROOT, "spec"))
+      fixture_root = File.join(ROOT, "spec/fileformat/fixtures/")
+      raise "fixture must name a file-format golden" unless fixture_path.start_with?(fixture_root)
+      File.binwrite(File.join(dir, "shared.jed"), File.binread(fixture_path))
+    end
     actors = {}
     begin
       data.fetch("step").each_with_index do |step, index|
@@ -132,14 +138,30 @@ def run_scenario(path, first_core, second_core)
       actors.each_value(&:cleanup)
     end
     puts "PASS #{name} #{first_core}->#{second_core}"
+    if data["byte_identical"]
+      image = File.binread(File.join(dir, "shared.jed"))
+      ps = image.byteslice(8, 4).unpack1("N")
+      # Successful final commits have complete meta candidates; trim unreferenced
+      # preallocation, which is not part of the logical file byte contract.
+      page_count = [0, ps].map { |offset| image.byteslice(offset + 24, 4).unpack1("N") }.max
+      if data["max_page_count"] && page_count > data["max_page_count"]
+        raise "page reuse did not bound growth: #{page_count} > #{data['max_page_count']}"
+      end
+      image.byteslice(0, ps * page_count)
+    end
   end
 end
 
 failures = []
 Dir[File.join(CORPUS, "*.process.toml")].sort.each do |path|
+  reference = nil
   CORES.product(CORES).each do |first, second|
     begin
-      run_scenario(path, first, second)
+      image = run_scenario(path, first, second)
+      if image
+        reference ||= image
+        raise "final incremental bytes differ across core pairings" unless image == reference
+      end
     rescue => error
       warn "FAIL #{File.basename(path)} #{first}->#{second}: #{error.message}"
       failures << [path, first, second]

@@ -12,10 +12,23 @@ byte-readable by another. Because this format is **fully deterministic**, that i
 as golden-file tests — each core must (a) read a checked-in golden into the expected state,
 and (b) write the same logical database to bytes that equal the golden *exactly*. Then
 `rust-bytes == golden == go-bytes == ts-bytes` by construction, so each core reads the
-other's output. A fourth independent encoder/decoder (the Ruby reference in
+other's output. Incremental recovery fixtures additionally encode commit history, so their
+reader/fallback outcomes and production histories' cross-core byte equality are checked separately.
+A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 32)
+## Version scope (`format_version` 33)
+
+`format_version` **33** — **validated copy-on-write commit**
+([../design/validated-cow.md](../design/validated-cow.md)). Meta CRC-32 now covers the entire
+meta page except its own field. A 64-byte meta header introduces a dirty-page manifest:
+sorted `(page u32, CRC64 u64)` entries begin at byte 64, overflowing into ordinary allocated
+`page_type = 8` pages when necessary. Recovery validates all listed page identities before
+choosing a candidate root. Commit writes body, manifest overflow, and alternate meta, then
+executes one durable barrier. The preceding manifest's full dependency set remains protected
+from reuse. No WAL or body redo copy is introduced. Fresh whole-file images use zero manifest
+fields; all existing golden meta checksums change. Readers accept only the exact current
+version; old binaries cannot overlap this format rollout.
 
 `format_version` **32** — **timezone dependencies in persisted indexes**
 ([../design/index-dependencies.md](../design/index-dependencies.md)). `index_flags` gains bit3
@@ -499,21 +512,26 @@ leafOverhead(N, cols) = 4·N + 4·(K+1) + F·(1 + ceil(N/8)) + V·(1 + 4·N)
 
 ## Meta page (pages 0 and 1)
 
-Two slots for torn-write-safe atomic publish (the bbolt model — storage.md §4). Fields
-(layout unchanged from v1 except `format_version` and the now-active meaning of `root_page`
-and slot selection):
+Two slots for torn-write-safe publication, with dirty-page validation since v33
+([../design/validated-cow.md](../design/validated-cow.md)). All multibyte fields are big-endian.
 
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`31`** |
+| 4  | 2 | `format_version` (u16) — current = **`33`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
 | 20 | 4 | `root_page` (u32) — the **catalog chain head** (relocatable; ≥ 2) |
-| 24 | 4 | `page_count` (u32) — total pages in the file |
+| 24 | 4 | `page_count` (u32) — committed logical high-water; physical preallocation may extend beyond it |
 | 28 | 4 | `free_list_head` (u32) — **new in v25**: the first free-list page (`page_type 7`), or `0` for an empty free-list. A non-zero head must satisfy `2 ≤ head < page_count` (else `XX001`). Replaces the v24 reserved-zero field; a reader loads the free-list from this chain instead of reconstructing it (*Reclamation* below) |
-| 32 | 4 | `crc32` (u32) — CRC-32/IEEE over meta bytes `[0, 32)` (excludes this field and the zero-fill tail) |
+| 32 | 4 | `crc32` (u32) — CRC-32/IEEE of `[0, 32)` concatenated with `[36, page_size)` |
+| 36 | 4 | `manifest_head` (u32) — first manifest overflow page, or 0 |
+| 40 | 4 | `manifest_entries` (u32) — total dirty body/free-list entries, including inline entries |
+| 44 | 4 | `manifest_pages` (u32) — number of overflow-chain pages |
+| 48 | 8 | `manifest_crc64` (u64) — identity of the complete overflow chain; 0 when no chain |
+| 56 | 8 | reserved (0) |
+| 64 | variable | first `min(manifest_entries, floor((page_size - 64) / 12))` entries, then zero padding |
 
 `page_size` lives at a fixed offset so a reader can learn it before it knows where page 1
 begins (page 1 starts at byte `page_size`).
@@ -539,21 +557,74 @@ present (copy-on-write never overwrote them). `create` seeds **both** slots with
 `txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit
 then overwrites slot 0).
 
-**Opening (slot selection).** Validate each slot independently (magic, `format_version == 31`,
-offsets 6–7 reserved == 0, `free_list_head` == 0 or in `[2, page_count)`, `crc32`). Choose the
-**valid** slot with the **highest `txid`**; on a tie, slot 0. Exactly one valid → use it (torn-write
-fallback). Neither valid → `data_corrupted`. The chosen meta's `free_list_head` is followed to load
-the free-list (*Reclamation* below) — no reachability walk.
+**Opening (slot selection).** Validate each candidate's magic, exact version 33, fixed page size,
+reserved fields, full-page CRC, page-count bounds, root and free-list bounds, and manifest below.
+Choose the fully validated candidate with highest `txid`; ties prefer slot 0. A structurally invalid,
+torn, or dependency-mismatched candidate permits trying the other slot. Neither valid → `XX001`.
+An actual host I/O error propagates rather than silently selecting an older snapshot. Load the chosen
+meta's persisted free list after selection. Recovery reads the latest dirty set as well as the usual
+catalog/interior skeleton; it does not walk every inherited leaf. Logical catalog and free-list
+validation follows candidate selection. A malformed selected free-list (cycle, out-of-range or
+non-increasing entries, or entries overlapping its own chain or protected manifest dependencies)
+is `XX001`; it does not retry an older candidate. This is the same distinction as a checksum-valid
+catalog with invalid logical contents. Manifest validation proves the expected bytes reached
+storage; it is not a semantic validation of the entire database.
+
+### Commit manifest (v33)
+
+An entry is `page_index u32` followed by `expected_crc64 u64`. Entries are globally strictly
+increasing by page index, unique, and within `[2, page_count)`. Nonempty manifests include the
+catalog root and any nonzero free-list head. Referenced pages must have type 1–7 and a valid
+ordinary page CRC-32; a manifest page cannot be a dirty-body entry. The digest is CRC-64/ECMA-182 of
+the **complete encoded body page**, including its existing CRC-32 field. Unlike checking that
+page's self-CRC, this binds the content expected by this transaction and rejects an older but
+internally checksum-valid page at a reused address.
+
+CRC-64/ECMA-182 uses unreflected polynomial `0x42F0E1EBA9EA3693`, initial register 0, and final
+XOR 0; `crc64("123456789") = 0x6C40DF5F0B497347`. Chunked updates must equal hashing the
+concatenation. Neither checksum is authentication. CRC-64 is independent of the body page's
+CRC-32, so hashing the full page does not collapse into a fixed CRC residue.
+
+Inline capacity is `I = floor((page_size - 64) / 12)` and is filled maximally. Remaining
+entries occupy a `page_type = 8` chain with this layout:
+
+| offset | size | field |
+|---|---|---|
+| 0 | 16 | ordinary body header: type 8, zero reserved bytes, entry count, next page, CRC-32 |
+| 16 | 8 | transaction id; must equal the owning meta's `txid` |
+| 24 | 4 | zero-based chain ordinal |
+| 28 | 4 | reserved (0) |
+| 32 | variable | up to `O = floor((page_size - 32) / 12)` entries; zero padding |
+
+Chain page ids are unique, within `[2, page_count)`, and disjoint from all dirty-page entries.
+Every non-final link points to the next chain page; the final link is zero, and the visited count
+is exactly `manifest_pages`. Entries fill each page to `min(O, remaining)`; monotone allocation
+can leave empty trailing pages, whose headers and zero tails remain validated. The owning meta's
+`manifest_crc64` is CRC-64 of the concatenated `page_id u32 || complete_encoded_page` for each
+chain page in chain order. This binds stale chains, pointer changes, and every header and padding byte.
+Counts and bounds are checked before allocation or dereferencing; cycles and surplus entries fail.
+
+Zero dirty entries denote a **bootstrap** whole-file image and require all descriptor fields
+and bytes after 64 to be zero. Nonzero entries with no overflow require head, page count, and chain
+digest zero. Nonzero overflow count requires a nonzero head. All unused bytes are zero. A candidate
+with a complete manifest is accepted only after every expected page digest matches.
+
+Allocation is specified in [validated-cow.md §2](../design/validated-cow.md#2-reuse-proof-and-deterministic-allocation):
+reserve manifest pages from safe free pages before high-water, replan free-list pages with those
+ids excluded, and monotonically increase reservation until enough capacity exists. The persisted
+free list excludes all pages this commit writes (body, free-list, and manifest). This is necessary
+even for newly written pages no longer reachable from the live root. Recovery stabilization and
+poisoned-handle behavior are part of the durable protocol, not additional on-disk fields.
 
 ## Page header (catalog and B-tree pages, 16 bytes — v7)
 
 | offset | size | field |
 |---|---|---|
-| 0 | 1 | `page_type` (u8) — `1` = catalog, `2` = B-tree **leaf**, `3` = B-tree **interior**, `4` = overflow; `5` = GiST **leaf**, `6` = GiST **interior** (**new in v20** — a persisted R-tree node, [../design/gist.md §4.1](../design/gist.md): a leaf entry is `bound_len u16 ‖ encode_range_body(bound) ‖ skey_len u16 ‖ skey`, an interior entry `bound_len u16 ‖ encode_range_body(union) ‖ child_page u32`); `7` = **free-list** (**new in v25** — a persisted free-list chunk, `item_count` free page indices as big-endian `u32`s, `next_page` the next chunk — *Free-list page* below) |
+| 0 | 1 | `page_type` (u8) — `1` = catalog, `2` = B-tree **leaf**, `3` = B-tree **interior**, `4` = overflow; `5` = GiST **leaf**, `6` = GiST **interior**; `7` = **free-list**; `8` = **commit manifest overflow** (v33, above) |
 | 1 | 1 | reserved (0) |
 | 2 | 2 | reserved (0) |
 | 4 | 4 | `item_count` (u32) — entries (catalog) / keys `N` (B-tree node) on this page |
-| 8 | 4 | `next_page` (u32) — **catalog / overflow only**: next page of the chain, or 0. B-tree nodes write `0` here (a node is reached by a child pointer, not a chain). |
+| 8 | 4 | `next_page` (u32) — catalog / overflow / free-list / manifest: next page of the chain, or 0. B-tree nodes write `0` here. |
 | 12 | 4 | `crc32` (u32) — **new in v7**: CRC-32/IEEE over the page bytes *excluding this field* — i.e. `[0, 12)` then `[16, page_size)`, covering the header, the payload, and the zero-fill tail |
 
 The payload follows at offset **16** and is zero-filled to `page_size`.
@@ -1340,8 +1411,8 @@ value (pathological: a huge key, or very many columns at a tiny page) remains a 
 ## Allocation & incremental commit
 
 A commit materializes the writer's new committed `Snapshot` (transactions.md §2) by writing
-only its **dirty** pages, then publishing the new root. The §2 atomicity rests on a fixed
-**write ordering** (storage.md §4):
+only its **dirty** pages, then publishing the new root. Atomicity uses validated COW
+([../design/validated-cow.md](../design/validated-cow.md)), without assuming persistence order:
 
 1. **Allocate** a page index to each dirty page. A page is **dirty** iff it was newly built by
    this transaction's copy-on-write — i.e. it has no on-disk page id yet. Clean nodes (shared
@@ -1360,25 +1431,19 @@ only its **dirty** pages, then publishing the new root. The §2 atomicity rests 
      (v5), in the catalog's index order (lowercased-name ascending), post-order each.
    - Then the **catalog chain** (always rewritten fresh: it carries the possibly-moved
      `root_data_page` of every table), as consecutive pages.
-   - Then (v25) the **free-list pages** encoding the free entries this commit did not consume
-     — allocated from the **high-water** (never from the free-list they carry), so a from-scratch
-     image with an empty free-list writes none (*Free-list page* below).
-3. **`sync()`** — every body page is durable.
-4. **Write the meta** to slot `txid & 1` (new `txid`, new `root_page` = the new catalog head,
-   new `page_count`, new `free_list_head`).
-5. **`sync()`** — the meta is durable; the commit is **published**.
+   - Then the **free-list pages**, allocated from safe remaining free pages before high-water;
+     prospective manifest page ids are reserved first by the monotone planner described above.
+3. Write **manifest overflow pages**, if the dirty body/free-list identities exceed inline capacity.
+4. **Write the meta** to slot `txid & 1`, with new root/high-water/free-list and inline manifest.
+5. **`sync()`** — body, manifest, and meta are durable; publish the in-process snapshot.
 
-A crash between steps 3 and 5 leaves the prior meta valid (its body pages are intact — copy-on-
-write never overwrote them), so the database opens at the prior snapshot; the freshly written
-body pages are simply unreferenced. A torn meta write at step 4 is caught by the meta checksum and
-falls back to the other slot. Either way the file is never corrupt — it is always a valid
-snapshot, the new one or the immediately prior one (storage.md §4, transactions.md §9). **Bit-rot
-of an at-rest body page** — distinct from a crash — is caught separately by the **per-page
-checksum** (v7, *Page header* above): the page's CRC fails to verify the instant it is parsed, so
-a damaged catalog/node/overflow page surfaces as `XX001` rather than wrong rows. This is
-**verified at each of steps 1–5** by the fault-injection seam (storage.md §7): a test-only one-shot
-crash/tear armed on the pager, exercising mid-body, between-syncs, and torn-meta-write points with a
-cross-core recovery matrix.
+Recovery validates the candidate meta, complete manifest, and expected contents of every
+new body page. Incomplete/torn/stale dependencies select the preceding valid candidate, whose
+pages remain protected by the free-list invariant. The highest valid candidate may have survived
+without acknowledgment. Corruption of a latest dependency after acknowledgment is indistinguishable
+from incomplete persistence and may likewise select the preceding snapshot. Inherited body pages
+retain their ordinary CRC-on-read protection. Fault-device tests must vary persistence order and
+tear page writes; a write-through-only test is insufficient (storage.md §7).
 
 ### Free-list page (`page_type = 7`, v25)
 
@@ -1502,6 +1567,17 @@ x ^= x << 5` (all modulo 2³²), emitting per step the character `ALPHA64[x mod 
 `ALPHA64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"` (for `text`) or the
 byte `x mod 256` (for `bytea`). High-entropy output has no 4-byte repeats for the encoder to match,
 so compression never wins *store-smaller* and the value stays plain — deterministically.
+
+The `cow_*.jed` fixtures additionally encode incremental commit history. `cow_inline`,
+`cow_overflow`, and `cow_empty_tail` select the new `(id, v) = (1, 20)` state; the malformed,
+torn, and stale variants select the preceding `(1, 10)` state. The two-page overflow case
+includes dirty orphan pages, so validation cannot substitute a live-root walk for the manifest.
+Structural mutations have their enclosing checksums recomputed to test the actual invariant.
+Shared `suites/storage/cow_*.test` entries read and continue writing from every recovered state. The
+separate `cow_invalid_free_list.jed` negative fixture has a complete descriptor but a free-list
+entry that would overwrite its own recovery dependency: Ruby and all cores reject it with `XX001`
+after selecting the new candidate. The SQL fixture harness cannot express failed open, so each
+core's loader test reads this same negative golden.
 
 The "highest `txid` wins" selection (vs. the torn-write fallback), the **slot alternation**
 across consecutive commits, and the **incremental dirty-page-only write** are covered by

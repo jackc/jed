@@ -140,7 +140,18 @@ fn page_crc(page: &[u8]) -> u32 {
 /// one) from the per-page checksum: a checksum-*inconsistent* corruption is instead caught at open
 /// (the dedicated test in checksum.rs). Any read of the chain's bytes still yields garbage.
 fn corrupt_overflow_payloads(path: &std::path::Path) {
-    let mut bytes = std::fs::read(path).unwrap();
+    // A checkpoint has no incremental dirty-page descriptor: isolate inherited lazy decoding.
+    let db = Database::open_with_options(
+        path,
+        OpenOptions {
+            skip_fsync: true,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
+    let mut bytes = db.to_image(PAGE_SIZE, db.txid()).unwrap();
+    drop(db);
     let ps = PAGE_SIZE as usize;
     let pages = bytes.len() / ps;
     let mut corrupted = 0;

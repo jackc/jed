@@ -713,6 +713,35 @@ namespace :bench do
     puts "Durability experiment output: #{dir}/run.log"
   end
 
+  desc "Measure production durable SQL commits, including checksums, growth and all flushes (Go)"
+  task :durable_commit do
+    require "json"
+    require "tmpdir"
+    commits = Integer(ENV.fetch("JED_DURABILITY_COMMITS", "256"))
+    repeats = Integer(ENV.fetch("JED_DURABILITY_REPEATS", "6"))
+    abort "commits and repeats must be positive" unless commits.positive? && repeats.positive?
+    dir = File.expand_path(ENV.fetch("JED_DURABILITY_BENCH_DIR") do
+      "bench/results/production-durability-#{Time.now.utc.strftime('%Y%m%d-%H%M%S')}-#{Process.pid}"
+    end)
+    FileUtils.mkdir_p(dir)
+    Dir.mktmpdir("jed-production-durability-") do |temp|
+      overlay = File.join(temp, "overlay.json")
+      File.write(overlay, JSON.generate("Replace" => {
+        File.join(GO_DIR, "production_durability_bench_test.go") => File.join(__dir__, "bench/durability/production_go_bench_test.go")
+      }))
+      env = { "JED_DURABILITY_BENCH_DIR" => dir }
+      cmd = ["go", "test", "-overlay", overlay, "-run", "^$", "-bench", "BenchmarkProductionDurableCommit",
+             "-benchtime=#{commits}x", "-count=#{repeats}"]
+      File.open(File.join(dir, "run.log"), "w") do |log|
+        IO.popen(env, cmd, chdir: GO_DIR, err: [:child, :out]) do |pipe|
+          pipe.each_line { |line| $stdout.print(line); log.write(line); log.flush }
+        end
+      end
+      abort "production durability benchmark failed; see #{dir}/run.log" unless $?.success?
+    end
+    puts "Production durability output: #{dir}/run.log"
+  end
+
   BENCH_GO_BINS = %w[bench-jed bench-pg bench-sqlite bench-sqlite-cgo].freeze
   BENCH_RUST_BINS = %w[bench-jed bench-pg bench-sqlite].freeze
   BENCH_TS_BINS = %w[bench-jed bench-pg bench-sqlite].freeze

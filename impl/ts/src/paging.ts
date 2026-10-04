@@ -93,6 +93,26 @@ export class SharedPaging {
     this.pager.refreshAllocatedPages();
   }
 
+  adoptCommit(txid: bigint, checksum: number, needsSync: boolean): void {
+    this.pager.adoptCommit(txid, checksum, needsSync);
+  }
+
+  beginDurableCommit(): void {
+    this.pager.beginDurableCommit();
+  }
+  finishDurableCommit(txid: bigint, checksum: number): void {
+    this.pager.finishDurableCommit(txid, checksum);
+  }
+  cachedValidation(meta: Uint8Array): Set<number> | null {
+    return this.pager.cachedValidation(meta);
+  }
+  cacheValidation(meta: Uint8Array, pages: Set<number>): void {
+    this.pager.cacheValidation(meta, pages);
+  }
+  physicalPages(): number {
+    return this.pager.physicalPages();
+  }
+
   // armFault arms a one-shot commit fault on the backing pager — the fault-injection seam
   // (spec/design/storage.md §7), used by the crash-recovery tests. Testing only.
   armFault(fault: CommitFault): void {

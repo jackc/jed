@@ -20,10 +20,15 @@ fn run() -> Result<(), EngineError> {
     let action = args.next().expect("usage: process_actor create|open PATH");
     let path = PathBuf::from(args.next().expect("usage: process_actor create|open PATH"));
     let timeout = args.next().and_then(|s| s.parse().ok()).unwrap_or(5000);
+    let locking = if action == "open-exclusive" {
+        Locking::Exclusive
+    } else {
+        Locking::Shared
+    };
     let mut database = if action == "create" {
         Database::create(CreateOptions {
             path: Some(path),
-            locking: Locking::Shared,
+            locking,
             file_lock_timeout_ms: timeout,
             ..CreateOptions::default()
         })?
@@ -31,7 +36,7 @@ fn run() -> Result<(), EngineError> {
         Database::open_with_options(
             path,
             OpenOptions {
-                locking: Locking::Shared,
+                locking,
                 file_lock_timeout_ms: timeout,
                 ..OpenOptions::default()
             },

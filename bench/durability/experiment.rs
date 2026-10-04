@@ -457,7 +457,7 @@ fn baseline(dev: &mut impl Device) -> (u64, Write) {
         .filter_map(|slot| {
             let bytes = dev.read((slot * PAGE) as u64, PAGE).unwrap();
             let crc = u32::from_be_bytes(bytes[32..36].try_into().unwrap());
-            if crate::format::crc32_ieee(&bytes[..32]) != crc {
+            if crate::format::meta_crc(&bytes) != crc {
                 return None;
             }
             let txid = u64::from_be_bytes(bytes[12..20].try_into().unwrap());
@@ -545,7 +545,13 @@ fn simply_removing_body_sync_can_publish_an_unreadable_sql_database() {
     bytes.resize(trace.data_bytes, 0);
     // Valid new root persisted; fresh body did not. Meta checksum alone still accepts it.
     let meta = &trace.commits[0].meta;
-    bytes[meta.offset as usize..meta.offset as usize + PAGE].copy_from_slice(&meta.bytes);
+    // Simulate the former unvalidated protocol by clearing v33's descriptor. This negative
+    // control intentionally bypasses the now-production one-barrier recovery validation.
+    let mut unvalidated = meta.bytes.clone();
+    unvalidated[36..].fill(0);
+    let crc = crate::format::meta_crc(&unvalidated);
+    unvalidated[32..36].copy_from_slice(&crc.to_be_bytes());
+    bytes[meta.offset as usize..meta.offset as usize + PAGE].copy_from_slice(&unvalidated);
     let result =
         Engine::from_image(&bytes).and_then(|mut db| crate::execute(&mut db, "SELECT * FROM t"));
     assert!(

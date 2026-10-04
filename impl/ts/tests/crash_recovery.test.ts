@@ -1,6 +1,6 @@
 // Crash-recovery tests driven by the fault-injection seam (spec/design/storage.md §7). These verify
-// the §4 commit atomicity at the actual commit points — mid-body, before the body sync, between the
-// body and meta syncs, and a torn meta write — which the static torn_meta_slot*.jed goldens (a
+// the §4 commit atomicity at the actual commit points — mid-body, before the final sync, before meta
+// publication, and a torn meta write — which the static torn_meta_slot*.jed goldens (a
 // post-hoc byte corruption) cannot reach. The invariant under test: a crash anywhere in a commit
 // leaves the file readable as a valid snapshot (the prior one, or — at the last barrier — the new
 // one), never corrupt; and the free-list reconstruction (P6.2) stays correct after a recovery. This
@@ -92,9 +92,9 @@ test("a torn body page recovers the prior snapshot", () => {
   }
 });
 
-// sync #1 — the body-durability barrier fails. The body is written-through but unsynced and the meta
-// is never written, so the prior meta still governs and the prior snapshot reopens.
-test("crash before the body sync recovers the prior snapshot", () => {
+// The sole durability barrier fails after body, descriptor, and meta writes. This process-only
+// fault retains all bytes, so recovery validates and accepts the complete unacknowledged generation.
+test("crash before the final sync can recover the complete new snapshot", () => {
   const dir = tmpDir();
   try {
     const path = join(dir, "crash_body_sync.jed");
@@ -102,18 +102,17 @@ test("crash before the body sync recovers the prior snapshot", () => {
     insertWithFault(db, { point: "sync", n: 1 });
 
     const db2 = open(path);
-    assert.equal(db2.txid, prior);
-    assert.deepEqual(idsSorted(db2), [1n, 2n]);
+    assert.equal(db2.txid, prior + 1n);
+    assert.deepEqual(idsSorted(db2), [1n, 2n, 3n]);
     close(db2);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-// meta_write — the critical between-syncs window (§4): the body is fully written AND synced, then the
-// publish (the meta-slot write) crashes. The new body pages are durable but unreferenced; the prior
-// meta slot is untouched, so the file reopens at the prior snapshot.
-test("crash between the body and meta syncs recovers the prior snapshot", () => {
+// meta_write — body and descriptor are written but not yet synchronized; publication crashes.
+// The prior meta remains untouched and its validation dependencies remain intact.
+test("crash before meta publication recovers the prior snapshot", () => {
   const dir = tmpDir();
   try {
     const path = join(dir, "crash_between_syncs.jed");
@@ -121,7 +120,7 @@ test("crash between the body and meta syncs recovers the prior snapshot", () => 
     insertWithFault(db, { point: "meta_write" });
 
     const db2 = open(path);
-    assert.equal(db2.txid, prior, "durable-but-unreferenced body → prior snapshot");
+    assert.equal(db2.txid, prior, "unreferenced body → prior snapshot");
     assert.deepEqual(idsSorted(db2), [1n, 2n]);
     close(db2);
   } finally {
@@ -149,7 +148,7 @@ test("a torn meta write falls back to the prior snapshot", () => {
   }
 });
 
-// sync #2 — the meta is written, then its durability barrier fails. Atomicity holds either way: a real
+// The meta is written, then the final durability barrier fails. Atomicity holds either way: a real
 // power loss could keep the meta (→ new) or lose it (→ prior); the seam writes through, so the reopen
 // deterministically yields the new snapshot. Both are valid — assert a consistent, fully readable
 // snapshot that is exactly one of the two (never a half-published state).
@@ -158,7 +157,7 @@ test("crash before the meta sync is atomic (a valid snapshot either way)", () =>
   try {
     const path = join(dir, "crash_meta_sync.jed");
     const { db, prior } = seed(path);
-    insertWithFault(db, { point: "sync", n: 2 });
+    insertWithFault(db, { point: "sync", n: 1 });
 
     const db2 = open(path);
     if (db2.txid === prior) {
@@ -182,7 +181,7 @@ test("recovery then free-list reuse stays consistent", () => {
     const path = join(dir, "recovery_then_reuse.jed");
     const { db, prior } = seed(path);
 
-    // Crash between the syncs → reopen at the prior two-row snapshot.
+    // Crash before meta publication → reopen at the prior two-row snapshot.
     insertWithFault(db, { point: "meta_write" });
     let db2 = open(path);
     assert.equal(db2.txid, prior);

@@ -271,15 +271,10 @@ impl Engine {
 
     /// Durably publish `snap` to the backing file via an **incremental** copy-on-write commit
     /// (spec/fileformat/format.md *Allocation & incremental commit*; transactions.md §9) — the
-    /// synchronous-commit chokepoint. Write the dirty pages this transaction introduced — reusing
-    /// free-list pages a prior root abandoned before extending the file (P6.2) — `sync`, write the
-    /// **alternate** meta slot (`snap.txid & 1`), `sync`. Clean pages are never rewritten. A crash
-    /// between the two syncs leaves the prior meta — and thus the prior snapshot — intact (its pages
-    /// were not overwritten: a reused free page is reachable from no live snapshot). An in-memory
-    /// database (no path) is a **no-op success**: it does not mutate `self`, and the committed swap
-    /// happens in `commit_tx` only after this returns Ok. `page_count` / `free_pages` advance only
-    /// after both syncs succeed, so a write failure leaves `self`, `committed`, and the file's prior
-    /// meta untouched (the working snapshot is then discarded). The `synchronous=off` mode gates here.
+    /// synchronous-commit chokepoint. Write dirty body and manifest pages, publish the alternate
+    /// meta slot, then sync once. Recovery validates the complete commit before selecting it.
+    /// All prior commit dependencies remain protected by the persisted free list until this
+    /// commit succeeds. On any incomplete commit, further writes require closing and reopening.
     pub(crate) fn persist(&mut self, snap: &Snapshot) -> Result<()> {
         // An in-memory database has no paging context — a no-op success (the committed swap happens
         // in `commit_tx` after this returns Ok). Compute the dirty-page set + meta before locking the
@@ -287,6 +282,11 @@ impl Engine {
         if self.paging.is_none() {
             return Ok(());
         }
+        self.paging
+            .as_ref()
+            .expect("paging present")
+            .pager()
+            .begin_commit()?;
         let ps = self.page_size as usize;
         let cap = ps - crate::format::PAGE_HEADER;
         let free = self.free_pages.clone();
@@ -316,47 +316,39 @@ impl Engine {
         // `plan_free_list`. A file is never reopened concurrently by this bare-`Engine` handle.
         let can_reclaim = self.open_streams.load(std::sync::atomic::Ordering::Relaxed) == 0;
         let paging = self.paging.clone().expect("paging present");
-        let (fl_pages, head, persisted, new_page_count, new_live, new_gen) =
-            crate::format::plan_free_list(
-                snap,
-                &paging,
-                write.root_page,
-                &write.pages,
-                &write.free_remaining,
-                write.page_count,
-                self.live_at_compaction,
-                self.free_gen_txid,
-                cap,
-                ps,
-                can_reclaim,
-                true,
-            )?;
-        let meta = crate::format::meta_page(
-            self.page_size,
-            snap.txid,
+        let plan = crate::format::plan_free_list(
+            snap,
+            &paging,
             write.root_page,
-            new_page_count,
-            head,
-        );
+            &write.pages,
+            &write.free_remaining,
+            write.page_count,
+            self.live_at_compaction,
+            self.free_gen_txid,
+            cap,
+            ps,
+            can_reclaim,
+            true,
+        )?;
         {
             let mut pager = paging.pager();
-            pager.reserve(new_page_count)?;
-            for (index, bytes) in &fl_pages {
+            pager.reserve(plan.page_count)?;
+            for (index, bytes) in &plan.auxiliary {
                 pager.write_block(*index, bytes)?;
             }
-            pager.sync()?; // every body page (tree/catalog/free-list) durable before the meta
-            pager.write_block((snap.txid & 1) as u32, &meta)?;
-            pager.sync()?; // the commit is published
+            pager.write_block((snap.txid & 1) as u32, &plan.meta)?;
+            pager.sync()?;
+            pager.finish_commit(&plan.meta);
         }
         // Invalidate rewritten pages AFTER the pager guard drops (pool-then-pager order, paging.rs):
         // evicts a stale pool decode of any free page this commit reused for new content.
-        for (index, _) in write.pages.iter().chain(fl_pages.iter()) {
+        for (index, _) in write.pages.iter().chain(plan.auxiliary.iter()) {
             paging.invalidate(*index);
         }
-        self.page_count = new_page_count;
-        self.free_pages = persisted;
-        self.live_at_compaction = new_live;
-        self.free_gen_txid = new_gen;
+        self.page_count = plan.page_count;
+        self.free_pages = plan.persisted;
+        self.live_at_compaction = plan.live;
+        self.free_gen_txid = plan.generation;
         Ok(())
     }
 

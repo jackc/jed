@@ -244,3 +244,26 @@ test("OPFS host: create rejects an invalid page size before touching the handle 
     "a rejected create leaves the handle untouched (write-in-place safety)",
   );
 });
+
+test("OPFS short writes are completed during bootstrap, growth, and commit", () => {
+  class ShortWritingHandle extends FakeSyncAccessHandle {
+    write(buffer: Uint8Array, opts: { at: number }): number {
+      return super.write(buffer.subarray(0, 17), opts);
+    }
+  }
+  const normal = runOpfsHost(256, WORKLOAD);
+  const handle = new ShortWritingHandle();
+  const db = createOpfsWithHandle(handle, { pageSize: 256 });
+  for (const sql of WORKLOAD) execute(db, sql);
+  closeOpfs(db);
+  assert.ok(bytesEqual(handle.bytes(), normal));
+});
+
+test("OPFS zero-progress write fails rather than acknowledging incomplete bytes", () => {
+  class StoppedHandle extends FakeSyncAccessHandle {
+    write(_buffer: Uint8Array, _opts: { at: number }): number {
+      return 0;
+    }
+  }
+  assert.throws(() => createOpfsWithHandle(new StoppedHandle()), /58030/);
+});

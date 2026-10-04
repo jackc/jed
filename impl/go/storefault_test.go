@@ -90,10 +90,10 @@ func (r *recordingStore) close() error { return r.base.close() }
 //   - The boundary op ops[cut], if a write, is TORN to its first tearBytes bytes (tearBytes < 0 ⇒
 //     not applied at all); ops[cut+1:] are entirely lost.
 //
-// The barrier rule is what keeps the model sound: jed writes the meta page only AFTER the body sync,
-// so the meta op is always post-sync while every body write it references is pre-sync (barriered) —
-// applyCrash therefore can never fabricate the impossible "new meta published but a body page it
-// points at went missing" state. Every image it produces is a real possible post-crash file.
+// Writes are unordered until their sync returns. Validated COW deliberately
+// allows a new meta to persist before its body; dependency validation must then
+// reject that candidate and preserve the preceding committed snapshot.
+
 func applyCrash(prior []byte, ops []storeOp, cut, tearBytes int, dropMask uint64) []byte {
 	img := make([]byte, len(prior))
 	copy(img, prior)

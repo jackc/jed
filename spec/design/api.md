@@ -465,18 +465,20 @@ batches many statements into one commit.
 
 **Crash-safe commit recipe** (identical across cores):
 
-1. Write the **dirty body pages** (the copy-on-write tree path + the rewritten catalog chain)
-   to their page slots.
-2. `sync` the file, so the body pages are durable **before** the meta swap that references them.
-3. Write the **alternate meta slot** (`txid & 1`) with the new `txid`, `root_page`, and CRC.
-4. `sync` again, committing the atomic root swap.
+1. Write dirty tree, catalog, overflow, and free-list pages to their final locations.
+2. Write any manifest overflow pages; small manifests fit inline in the existing meta page.
+3. Write the alternate meta slot (`txid & 1`) containing the new root and the manifest of
+   expected page identities.
+4. Execute one durable `sync`, then publish the committed snapshot and acknowledge success.
 
-At every instant the on-disk root is either the previous valid meta slot or the new one — never
-a torn mix — because the body pages are durable before the meta swap and the highest-`txid` valid
-slot wins on open. The loader validates each meta slot's CRC **and** every body page's per-page
-CRC (v7), so residual corruption surfaces as `XX001`, never silent bad data; the target is
-SSD/POSIX ([storage.md](storage.md) §1) and the fsync timing is refined by the pager's
-preallocation + `fdatasync` path (pager.md §7).
+On open, validate the newest meta's complete manifest and dirty-page contents before adopting
+its root; an incomplete candidate falls back to the preceding valid generation. Adopted recovery
+or foreign-process generations are stabilized before further writes. Growth can add an amortized
+allocation barrier. A write/sync failure poisons the storage handle: close and reopen to determine
+the committed outcome before continuing. The same rule applies to attachments and uncoordinated
+file handles. [Validated COW](validated-cow.md) specifies the recovery/reuse proof and the v33
+format break. Corruption of an acknowledged dependency can also cause recovery to select the
+preceding snapshot, because it cannot be distinguished from incomplete persistence.
 
 `create` writes its initial empty image from scratch (with `txid` starting at 1), filling **both**
 meta slots; every commit thereafter is incremental and alternates the slot.

@@ -401,6 +401,17 @@ supplies a small test-only actor binary that accepts create/open/begin/query/com
 named fault-hook commands over stdin and returns framed results over stdout. The shared Ruby driver
 owns scheduling, deadlines, process kill, and transcript comparison.
 
+A scenario may specify `fixture = "fileformat/fixtures/<name>.jed"` to seed the shared
+file from an independently authored recovery image before actors open it. With
+`byte_identical = true`, the driver compares the final incremental image across all nine
+Rust/Go/Node pairings, excluding unreferenced physical preallocation. Scenarios that request
+byte equality explicitly fix the allocation mode: keep two processes present through every
+write for append-only allocation, or use actor action `open-exclusive` for deterministic reuse.
+`max_page_count` additionally bounds logical file growth. `cow_overflow` and `cow_stale_orphan`
+cover validated-COW manifest recovery, pinned readers, a killed and replaced writer, foreign-root
+adoption, and continued commits. `cow_reuse` updates 400 rows repeatedly across exclusive
+writer handoffs, exercising multi-page manifests, free-list planning, and bounded page reuse.
+
 The corpus, not per-core copies, covers:
 
 - first-rollout/unknown-marker failure, join, alone→shared→alone transitions, and open/writer timeout;

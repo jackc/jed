@@ -116,11 +116,16 @@ func TestTornBodyPageRecoversPrior(t *testing.T) {
 	}
 }
 
-// faultSync(1) — the body-durability barrier fails. The body is written-through but unsynced and the
-// meta is never written, so the prior meta still governs and the prior snapshot reopens.
-func TestCrashBeforeBodySyncRecoversPrior(t *testing.T) {
+// An adopted manifest may still live only in the OS cache after a process crash.
+// The first writer must establish its durability before changing any pages.
+
+func TestCrashBeforeRecoverySyncRecoversPrior(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "crash_body_sync.jed")
 	db, prior := seedTwoRows(t, path)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = reopen(t, path)
 	insertWithFault(t, db, commitFault{point: faultSync, n: 1, tearBytes: -1})
 
 	db = reopen(t, path)
@@ -170,14 +175,14 @@ func TestTornMetaWriteFallsBackToPrior(t *testing.T) {
 	}
 }
 
-// faultSync(2) — the meta is written, then its durability barrier fails. Atomicity holds either way: a
+// faultSync(1) — the meta is written, then its durability barrier fails. Atomicity holds either way: a
 // real power loss could keep the meta (→ new) or lose it (→ prior); the seam writes through, so the
 // reopen deterministically yields the new snapshot. Both are valid — assert a consistent, fully
 // readable snapshot that is exactly one of the two (never a half-published state).
 func TestCrashBeforeMetaSyncIsAtomic(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "crash_meta_sync.jed")
 	db, prior := seedTwoRows(t, path)
-	insertWithFault(t, db, commitFault{point: faultSync, n: 2, tearBytes: -1})
+	insertWithFault(t, db, commitFault{point: faultSync, n: 1, tearBytes: -1})
 
 	db = reopen(t, path)
 	defer db.Close()

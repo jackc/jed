@@ -32,7 +32,7 @@ func recordFatCommit(tb testing.TB) (prior []byte, ops []storeOp, priorIDs, post
 	const (
 		pageSize = 256
 		k        = 8                                      // prior rows: 1..k
-		m        = 40                                     // committed rows: k+1..k+m
+		m        = 80                                     // committed rows: k+1..k+m
 		pad      = "padpadpadpadpadpadpadpadpadpadpadpad" // ~36 chars → ~3 rows/leaf at ps 256
 	)
 	path := filepath.Join(tb.TempDir(), "torn_seed.jed")
@@ -127,7 +127,7 @@ func assertRecovers(tb testing.TB, image []byte, priorIDs, postIDs []int64, what
 func TestTornWriteCommitSweepIsAtomic(t *testing.T) {
 	prior, ops, priorIDs, postIDs := recordFatCommit(t)
 	if len(ops) < 4 {
-		t.Fatalf("expected a fat op log (many body writes + 2 syncs + meta), got %d ops", len(ops))
+		t.Fatalf("expected a fat op log (many body writes + manifest + meta + sync), got %d ops", len(ops))
 	}
 
 	// Clean prefixes: a crash that durably landed exactly ops[0:cut] (cut = 0..len).
@@ -153,41 +153,23 @@ func TestTornWriteCommitSweepIsAtomic(t *testing.T) {
 	}
 }
 
-// TestTornWriteInFlightSubsetsAreAtomic checks the harder real-device case: between the two syncs no
-// barrier orders the body writes, so a crash may land an ARBITRARY subset of them (not just a
-// prefix). Every subset, with the meta page never yet published, must still recover the prior
-// snapshot — confirming no body page is ever wrongly referenced by the prior root (the P6.2
-// copy-on-write-to-free-pages torn-safety property).
+// A crash may persist the new meta and manifest while losing arbitrary body
+// writes. Validate their exact dependency checksums before selecting that root.
 func TestTornWriteInFlightSubsetsAreAtomic(t *testing.T) {
 	prior, ops, priorIDs, postIDs := recordFatCommit(t)
-
-	// Cut just before the body sync: every op so far is an un-barriered body write.
-	bodySync := -1
+	finalSync := -1
 	for i, op := range ops {
 		if op.kind == opSync {
-			bodySync = i
-			break
+			finalSync = i
 		}
 	}
-	if bodySync < 2 {
-		t.Fatalf("expected several body writes before the first sync, got bodySync=%d", bodySync)
+	if finalSync < 2 {
+		t.Fatalf("missing final barrier: %d", finalSync)
 	}
-	cut := bodySync // ops[0:cut] are all body writes, none barriered (lastSync = -1)
-	if cut > 10 {
-		cut = 10 // keep the subset enumeration (2^cut) bounded
+	for mask := uint64(0); mask < 1024; mask++ {
+		img := applyCrash(prior, ops, finalSync, -1, mask)
+		assertRecovers(t, img, priorIDs, postIDs, fmt.Sprintf("meta-first subset mask=%b", mask))
 	}
-	for mask := uint64(0); mask < (uint64(1) << uint(cut)); mask++ {
-		img := applyCrash(prior, ops, cut, -1, mask)
-		// No meta written ⇒ the prior root still governs; every body subset must recover the prior snapshot.
-		ids, err := guardedScanIDs(img)
-		if err != nil {
-			t.Fatalf("in-flight body subset mask=%b failed to open: %v", mask, err)
-		}
-		if !equalIDs(ids, priorIDs) {
-			t.Fatalf("in-flight body subset mask=%b recovered %v, want prior %v", mask, ids, priorIDs)
-		}
-	}
-	_ = postIDs
 }
 
 // FuzzCommitCrash is the explorer (testing-ideas.md §3: Go explores, the intrinsic oracle judges):

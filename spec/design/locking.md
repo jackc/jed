@@ -58,7 +58,7 @@ back to a PID file, mtime lease, or best-effort stale-lock recovery.
    the locks. Wall-clock time controls only how long a caller waits, never ownership.
 7. **The uncontended foreground coordination path is unchanged.** Once one process holds the
    presence-exclusive lease, reads do not pread meta, writes do not acquire OS gates, and commits use
-   the existing v30 allocator and durability recipe. The background probe still makes the Rust
+   the v33 allocator and validated-COW durability recipe. The background probe still makes the Rust
    process multithreaded and can change glibc allocator performance even though it adds no foreground
    coordination work (§9.3).
 8. **Only protocol participants may overlap.** A pre-protocol jed binary or any other process that
@@ -224,8 +224,8 @@ successful `presence EX` is therefore a real proof that no foreign process has a
 An alone process pins its current in-process committed snapshot exactly as today. A shared process:
 
 1. takes `commit SH`;
-2. positioned-reads both meta slots directly (never through the buffer pool), validates CRCs, and picks
-   the highest valid `txid`;
+2. positioned-reads both meta slots directly (never through the buffer pool), validates CRCs and a newly observed generation's complete manifest and dirty-page
+   dependencies, and picks the highest fully valid `txid`;
 3. if `txid` advanced, reloads the catalog/interior skeleton, updates pager `page_count`, and
    invalidates persistent plans for that database;
 4. pins that snapshot in the existing in-process reader registry;
@@ -239,7 +239,10 @@ Since co-resident writers never overwrite body pages, the referenced pages remai
 An alone write uses only the existing local writer gate. A shared write holds `writer EX` for the whole
 transaction. After acquiring it, and before making the working snapshot, it performs the same
 `commit SH` meta refresh as a read begin. This produces one global serialization order for writers with
-no merge/retry semantics. Rollback discards staging and releases `writer EX`.
+no merge/retry semantics. An adopted foreign generation is stabilized with a durable sync
+before its first subsequent write; readable kernel-cache contents after a process crash are not
+proof of durability ([validated-cow.md §3](validated-cow.md#3-process-crashes-failure-and-shared-access)).
+Rollback discards staging and releases `writer EX`.
 
 Writer-gate waiting uses the session `lock_timeout_ms` (default `0` = wait without a deadline) and
 fails `55P03 lock_not_available` on expiry. Waiting is host work and uses a monotonic clock; it is not
@@ -256,15 +259,15 @@ While `presence` is SH, a writer must use the deliberately conservative path:
   the fallback meta or become reclaimable when a process is later proven alone;
 - never truncate or replace the file.
 
-The writer may write and sync its appended body pages without `commit EX`. For the short publish
-window it takes `commit EX`, writes and syncs the alternate meta slot, publishes the same snapshot to
-its local core, then releases `commit EX` and `writer EX`. A begin that won `commit SH` first adopts the
+The writer may write its appended body and manifest pages without `commit EX`. For the publish
+window it takes `commit EX`, writes the alternate meta slot and executes the single final durable
+sync, publishes the same snapshot to its local core, then releases `commit EX` and `writer EX`. A begin that won `commit SH` first adopts the
 old meta; one that wins afterward adopts the new meta. This preserves the existing “readers block only
 during commit” model across processes.
 
-An I/O error after meta write has an indeterminate commit outcome, as with any durable database. The
+A write/sync error has an indeterminate commit outcome, as with any durable database. The
 handle becomes poisoned and retains its gates until close; recovery on the next open chooses the
-highest CRC-valid meta. It must never continue writing from an assumed prior root.
+highest meta whose complete manifest and dependencies validate. It must never continue writing from an assumed prior root.
 
 ## 6. Reclamation, compaction, and buffers
 

@@ -1,0 +1,100 @@
+schema_version = 1
+name = "validated-cow-overflow-handoff"
+description = "Recover a shared manifest fixture, preserve a pinned reader, replace a killed writer, and compare incremental bytes across cores."
+requires = ["file.shared_process"]
+fixture = "fileformat/fixtures/cow_overflow.jed"
+byte_identical = true
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "open"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT v FROM t ORDER BY id"
+expect = "20"
+
+[[step]]
+actor = "a"
+command = "read_open"
+
+[[step]]
+actor = "a"
+command = "read_query_i64"
+sql = "SELECT v FROM t ORDER BY id"
+expect = "20"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "UPDATE t SET v = 30 WHERE id = 1"
+
+[[step]]
+actor = "a"
+command = "read_query_i64"
+sql = "SELECT v FROM t ORDER BY id"
+expect = "20"
+
+[[step]]
+actor = "a"
+command = "read_close"
+
+[[step]]
+actor = "b"
+command = "kill"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "UPDATE t SET v = 40 WHERE id = 1"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT v FROM t ORDER BY id"
+expect = "40"
+
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "5000"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (2, 50)"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "UPDATE t SET v = 60 WHERE id = 1"
+
+[[step]]
+actor = "b"
+command = "write_commit"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT v FROM t ORDER BY id"
+expect = "60,50"
+
+[[step]]
+actor = "a"
+command = "close"
+
+[[step]]
+actor = "b"
+command = "close"

@@ -31,10 +31,14 @@ func run() error {
 	}
 	var db *jed.Database
 	var err error
+	locking := jed.LockingShared
+	if os.Args[1] == "open-exclusive" {
+		locking = jed.LockingExclusive
+	}
 	if os.Args[1] == "create" {
-		db, err = jed.CreateDatabase(jed.CreateOptions{Path: os.Args[2], Locking: jed.LockingShared, FileLockTimeoutMs: &timeout})
+		db, err = jed.CreateDatabase(jed.CreateOptions{Path: os.Args[2], Locking: locking, FileLockTimeoutMs: &timeout})
 	} else {
-		db, err = jed.OpenDatabaseWithOptions(os.Args[2], jed.OpenOptions{Locking: jed.LockingShared, FileLockTimeoutMs: &timeout})
+		db, err = jed.OpenDatabaseWithOptions(os.Args[2], jed.OpenOptions{Locking: locking, FileLockTimeoutMs: &timeout})
 	}
 	if err != nil {
 		return err

@@ -74,8 +74,13 @@ type pager struct {
 	fault *commitFault
 	// bodyWrites/syncs count body-page writes (index ≥ 2) and sync() calls since the fault was armed,
 	// driving faultBodyWrite / faultSync respectively.
-	bodyWrites uint32
-	syncs      uint32
+	bodyWrites        uint32
+	syncs             uint32
+	validatedMeta     []byte
+	manifestProtected map[uint32]bool
+	recoverySync      bool
+	commitInProgress  bool
+	poisoned          bool
 }
 
 // faultPoint selects a point in the commit write sequence at which the fault-injection seam
@@ -85,9 +90,9 @@ type pager struct {
 type faultPoint int
 
 const (
-	faultBodyWrite faultPoint = iota // the nth write to a body page (index ≥ 2), before the body sync
-	faultMetaWrite                   // the meta-slot write (index < 2): the publish, after the body is synced
-	faultSync                        // the nth sync() since arming (1 = body barrier, 2 = meta barrier)
+	faultBodyWrite faultPoint = iota // the nth write to a body page (index ≥ 2), before publication
+	faultMetaWrite                   // the meta-slot write (index < 2): the publish, after the body and manifest writes
+	faultSync                        // the nth sync() since arming (final commit or adopted-generation barrier)
 )
 
 // commitFault is a one-shot crash/tear the pager simulates at a chosen commit point (storage.md §7).
@@ -127,8 +132,8 @@ func pagerFromStore(store blockStore) (*pager, error) {
 		return nil, err
 	}
 	pageSize := binary.BigEndian.Uint32(header[8:12])
-	if pageSize == 0 {
-		return nil, newError(DataCorrupted, "zero page size in meta header")
+	if !pageSizeValid(int(pageSize)) {
+		return nil, newError(DataCorrupted, "invalid page size in meta header")
 	}
 	// The allocation high-water is the current file length in pages — already past the committed
 	// pageCount if a prior session preallocated slack (reused for free on this session's growth).
@@ -161,7 +166,15 @@ func (p *pager) refreshAllocatedPages() error {
 // writeBlock writes one page (bytes) at block index. Overwrites in place — persist always reserves
 // the high-water first, so the target is already-allocated space (a reused free page, or a
 // preallocated slot past the old high-water). bytes is one page wide.
-func (p *pager) writeBlock(index uint32, bytes []byte) error {
+func (p *pager) writeBlock(index uint32, bytes []byte) (err error) {
+	if p.poisoned {
+		return newError(IoError, "database writer requires reopen after failed commit")
+	}
+	defer func() {
+		if err != nil {
+			p.poisoned = true
+		}
+	}()
 	if err := p.faultOnWrite(index, bytes); err != nil {
 		return err
 	}
@@ -215,7 +228,15 @@ func (p *pager) faultOnWrite(index uint32, bytes []byte) error {
 // unreferenced zeros past the committed pageCount, so a crash before the next commit publishes simply
 // ignores them. The preallocation policy is host-independent and stays here; the durable grow itself —
 // real zero blocks + a full fsync — is the host's setSize, the metadata barrier (hosts.md §2.1/§3).
-func (p *pager) reserve(minPages uint32) error {
+func (p *pager) reserve(minPages uint32) (err error) {
+	if p.poisoned {
+		return newError(IoError, "database writer requires reopen after failed commit")
+	}
+	defer func() {
+		if err != nil {
+			p.poisoned = true
+		}
+	}()
 	if minPages <= p.allocatedPages {
 		return nil
 	}
@@ -242,12 +263,18 @@ func (p *pager) reserve(minPages uint32) error {
 	return nil
 }
 
-// sync is the metadata-free durability barrier — the host's data-only sync (fdatasync). Called twice
-// per commit — body pages, then the meta — to honour the body-before-meta write-ordering rule
-// (format.md, file.go persist). Data-only (not a full fsync) so an overwrite into the preallocated
-// region (reserve) flushes only the data, never a file-size/inode-timestamp metadata journal
-// (spec/design/pager.md §7).
-func (p *pager) sync() error {
+// sync requests durable completion of all prior writes. A validated-COW commit
+// uses one final barrier; an adopted descriptor gets one additional barrier
+// before the first new writer, since readable OS-cache bytes may not be durable.
+func (p *pager) sync() (err error) {
+	if p.poisoned {
+		return newError(IoError, "database writer requires reopen after failed commit")
+	}
+	defer func() {
+		if err != nil {
+			p.poisoned = true
+		}
+	}()
 	if p.fault != nil && p.fault.point == faultSync {
 		p.syncs++
 		if p.syncs == p.fault.n {
