@@ -180,6 +180,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > The path to a **larger-than-RAM file that does not fall over** (CLAUDE.md §9): no
 > full-residency assumption above the storage seam.
 
+- [ ] **Durable commit latency** — Rust experiments compare external/embedded WAL and
+  validated COW manifests with real SQL page traces, checkpoint-inclusive benchmarks, and
+  crash models; a pure-Go macOS probe compares `F_BARRIERFSYNC` + `F_FULLFSYNC` with two full
+  flushes. Measure on Mac hardware before choosing a production slice; any new recovery
+  format needs shared fixtures, all cores, and the process-locking/reuse contract.
+  → [experiment report](spec/design/durable-commit-experiments.md). _(size: L)_
+
 - [x] **Shared multi-process file access** — ✅ **landed** ([locking.md](spec/design/locking.md)). The stable `protocol-v1` bundle, alone fast path, global writer, commit/meta gate, append-only shared commits, foreign-plan invalidation, independently coordinated file attachments, and Rust↔Go↔Node real-process matrix are implemented. The independent TypeScript engine uses the narrow first-party `impl/ts/native-lock` Node-API adapter; the full Rust wrapper remains a workload-dependent reach experiment. `locking = auto` is shared on capable local hosts. Pre-protocol binaries still require a one-time drain. → [locking.md](spec/design/locking.md), [benchmarks.md §7.3](spec/design/benchmarks.md)
   - [ ] **Node prebuilt distribution matrix** — ship no-install-script Node-API-8 artifacts for Linux glibc/musl x64+arm64, macOS x64+arm64, and Windows x64 with SHA-256/provenance and packaging tests. Source/dev builds already use `rake ts:lock_build`; missing production artifacts fail closed `0A000`.
   - [ ] **Expanded shared-file fault/platform matrix** — extend the landed real-process handoff, timeout, pinned-reader, killed-writer, and attachment scenarios with deterministic body-sync/meta-publish fault hooks, compaction continuity once compaction exists, symlink/hard-link process lanes, and every supported Windows/macOS packaging lane.

@@ -695,6 +695,24 @@ namespace :bench do
     sh RbConfig.ruby, "scripts/spill_bench.rb", *[args[:rows], args[:width], args[:budget]].take_while { |arg| !arg.nil? }
   end
 
+  desc "Test and measure experimental Rust durability protocols (no production format changes)"
+  task :durability do
+    dir = ENV.fetch("JED_DURABILITY_DIR") do
+      File.expand_path("bench/results/durability-#{Time.now.utc.strftime('%Y%m%d-%H%M%S')}-#{Process.pid}")
+    end
+    FileUtils.mkdir_p(dir)
+    env = { "JED_DURABILITY_DIR" => dir }
+    cmd = %w[cargo test --release --manifest-path impl/rust/Cargo.toml --lib durability_experiment]
+    sh(env, *cmd)
+    File.open(File.join(dir, "run.log"), "w") do |log|
+      IO.popen(env, [*cmd, "--", "--ignored", "--nocapture"], err: [:child, :out]) do |pipe|
+        pipe.each_line { |line| $stdout.print(line); log.write(line); log.flush }
+      end
+    end
+    abort "durability benchmark failed; see #{dir}/run.log" unless $?.success?
+    puts "Durability experiment output: #{dir}/run.log"
+  end
+
   BENCH_GO_BINS = %w[bench-jed bench-pg bench-sqlite bench-sqlite-cgo].freeze
   BENCH_RUST_BINS = %w[bench-jed bench-pg bench-sqlite].freeze
   BENCH_TS_BINS = %w[bench-jed bench-pg bench-sqlite].freeze
