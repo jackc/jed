@@ -55,6 +55,7 @@ mod index_dependencies;
 pub(crate) use index_dependencies::*;
 mod dml;
 pub(crate) use dml::CachedInsert;
+mod blocking_spill;
 mod eval;
 mod exec_emit;
 mod exec_scan;
@@ -208,6 +209,12 @@ pub(crate) struct SelectResult {
 /// identical units at the identical sites, so a fully-drained query observes the same rows + total
 /// cost (streaming.md §6).
 pub(crate) enum Emitter {
+    Spool {
+        rows: crate::spill_buffer::SpoolReader,
+        remaining: usize,
+        mode: EmitMode,
+        charged: bool,
+    },
     /// The general blocking path's intermediate buffer, windowed to `[start, end)`. Each emitted
     /// row charges `row_produced`; in [`EmitMode::Project`] it additionally evaluates the projection
     /// list (charging its `operator_eval`s), and in [`EmitMode::Identity`] the buffer rows are

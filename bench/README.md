@@ -4,6 +4,17 @@ Compares the three jed cores (Rust, Go, TS) against each other and against Postg
 and SQLite on a shared, language-neutral benchmark corpus. **Canonical design:
 [spec/design/benchmarks.md](../spec/design/benchmarks.md).**
 
+`mise run bench:spill` runs the separate Linux spill workload from
+`corpus/spill.toml`: JOIN, GROUP BY, DISTINCT and ordered-set aggregation over 32,768 wide rows with a
+1 MiB `work_mem` and page cache. Each query runs in a fresh process, drains its
+cursor, and records elapsed time, peak RSS, result checksum, and deterministic cost.
+The driver compares unlimited, forced-spill and default-budget execution across all three cores
+and fails if their results or costs differ. Setup is excluded from query memory
+and timings. Input exceeds the operator budget; this does not assert that it
+exceeds physical machine RAM or that `work_mem` caps process RSS.
+Use `rake 'bench:spill[rows,payload_bytes,work_mem]'` to change scale; raw results
+and workload metadata go into `bench/results/spill-<timestamp>/`.
+
 ```
 rake bench:setup     # generate benchmark databases (once; fingerprint-gated)
 rake bench:run       # run every harness binary, then print the comparison table + HTML

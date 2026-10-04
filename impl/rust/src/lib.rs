@@ -61,6 +61,7 @@ mod regex;
 mod seam;
 mod shared;
 mod spill;
+mod spill_buffer;
 mod split;
 mod sqlstate;
 mod storage;

@@ -6,10 +6,10 @@
 // (no dependency — CLAUDE.md §14); the run file's bytes are a per-core internal codec, never the §8
 // on-disk format (spill.md §6).
 
-import { closeSync, openSync, readSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, openSync, readSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { engineError } from "./errors.ts";
-import type { SpillByteReader, SpillRun, SpillSink } from "./spill.ts";
+import type { SpillByteReader, SpillRun, SpillSink, SpillScratch } from "./spill.ts";
 
 // A unique-per-process counter for spill file names (combined with the process id), so concurrent
 // sorters never collide. Internal — it never affects results (spill.md §6).
@@ -23,6 +23,17 @@ export class FileSpillSink implements SpillSink {
 
   constructor(dir: string) {
     this.dir = dir;
+  }
+
+  createScratch(): SpillScratch {
+    for (;;) {
+      const path = join(this.dir, `jed-spill-${process.pid}-${spillSeq++}.tmp`);
+      try {
+        return new FileScratch(path, openSync(path, "wx+", 0o600));
+      } catch (e) {
+        if (!isAlreadyExists(e)) throw spillIoError(e);
+      }
+    }
   }
 
   writeRun(bytes: Uint8Array): SpillRun {
@@ -145,6 +156,56 @@ class FileSpillReader implements SpillByteReader {
       unlinkSync(this.path);
     } catch {
       // best-effort cleanup
+    }
+  }
+}
+
+// One descriptor per spool/map, independent of row count and partition skew.
+class FileScratch implements SpillScratch {
+  size = 0;
+  private closed = false;
+  private path: string;
+  private fd: number;
+  constructor(path: string, fd: number) {
+    this.path = path;
+    this.fd = fd;
+  }
+  read(position: number, length: number): Uint8Array {
+    const bytes = new Uint8Array(length);
+    let done = 0;
+    try {
+      while (done < length) {
+        const n = readSync(this.fd, bytes, done, length - done, position + done);
+        if (n === 0) throw new Error("unexpected EOF in spill scratch");
+        done += n;
+      }
+      return bytes;
+    } catch (e) {
+      throw spillIoError(e);
+    }
+  }
+  write(position: number, bytes: Uint8Array): void {
+    let done = 0;
+    try {
+      while (done < bytes.length) {
+        const n = writeSync(this.fd, bytes, done, bytes.length - done, position + done);
+        if (n === 0) throw new Error("short write in spill scratch");
+        done += n;
+      }
+      this.size = Math.max(this.size, position + bytes.length);
+    } catch (e) {
+      throw spillIoError(e);
+    }
+  }
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    try {
+      closeSync(this.fd);
+    } finally {
+      try {
+        unlinkSync(this.path);
+      } catch {}
     }
   }
 }

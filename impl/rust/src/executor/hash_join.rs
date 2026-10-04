@@ -95,7 +95,7 @@ impl HashJoinTable {
     }
 }
 
-fn hash_join_row_key(
+pub(crate) fn hash_join_row_key(
     row: &Row,
     indices: &[usize],
     types: &[&Type],
@@ -128,7 +128,7 @@ fn hash_join_row_key(
     Ok(Some(out))
 }
 
-fn hash_join_fnv1a(key: &[u8]) -> u64 {
+pub(crate) fn hash_join_fnv1a(key: &[u8]) -> u64 {
     let mut hash = 14_695_981_039_346_656_037_u64;
     for byte in key {
         hash ^= u64::from(*byte);

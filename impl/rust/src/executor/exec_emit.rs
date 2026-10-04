@@ -295,6 +295,7 @@ impl Engine {
         // fast-path below — they all require `!is_agg` — so this front-position placement is only for
         // clarity, mirroring the Go core's ordering.)
         if meter.is_unmetered()
+            && (!self.blocking_spill_eligible(plan) || self.bounded_whole_aggregate(plan))
             && self.explain_actual.borrow().is_none()
             && self.vectorized_agg_eligible(plan)
         {
@@ -362,6 +363,9 @@ impl Engine {
         // a LIMIT. The join drives/probes the outer in PK order so the output is already ordered — the
         // sort is elided and the loop short-circuits a top-N.
         if plan.phys.join_pk_ordered {
+            if self.blocking_spill_eligible(plan) {
+                return self.exec_blocking_spill(plan, &env, meter);
+            }
             return Ok(Emitter::Final {
                 rows: if plan.phys.join_steps.len() + 1 == plan.rels.len() && plan.rels.len() >= 3 {
                     self.exec_streaming_nway_join(plan, &env, meter, params, outer, stmt_rng)?
@@ -396,6 +400,10 @@ impl Engine {
             if let Some(em) = self.project_columnar(plan, &env, params, outer, meter)? {
                 return Ok(em);
             }
+        }
+
+        if self.blocking_spill_eligible(plan) {
+            return self.exec_blocking_spill(plan, &env, meter);
         }
 
         // Materialize each relation once, in primary-key order (base tables drain a ScanSource — the

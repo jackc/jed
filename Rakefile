@@ -690,6 +690,11 @@ end
 # of `rake ci`: timings are environment-relative and nondeterministic. Answers are still checked —
 # every result carries a cross-engine checksum and bench:report fails on any disagreement.
 namespace :bench do
+  desc "Compare bounded JOIN/aggregate/DISTINCT with unlimited work_mem (rows,width,budget bytes)"
+  task :spill, [:rows, :width, :budget] do |_, args|
+    sh RbConfig.ruby, "scripts/spill_bench.rb", *[args[:rows], args[:width], args[:budget]].take_while { |arg| !arg.nil? }
+  end
+
   BENCH_GO_BINS = %w[bench-jed bench-pg bench-sqlite bench-sqlite-cgo].freeze
   BENCH_RUST_BINS = %w[bench-jed bench-pg bench-sqlite].freeze
   BENCH_TS_BINS = %w[bench-jed bench-pg bench-sqlite].freeze
@@ -913,6 +918,14 @@ end
 # record's rows/error/cost must be IDENTICAL in both modes; the disk pass is what caught the window-
 # operand touched-set divergence the in-memory pass could not see.
 namespace :conformance do
+  desc "Run the shared SQL corpus on all cores with forced file spill (bytes, optional path filter)"
+  task :spill, [:bytes, :filter] do |_, args|
+    env = { "JED_CONFORMANCE_WORK_MEM" => args[:bytes] || "256" }
+    env["JED_CONFORMANCE_FILTER"] = args[:filter] if args[:filter]
+    sh env, "cargo", "run", "--release", "--quiet", "--bin", "conformance", "--manifest-path", RUST_MANIFEST, "--", "disk"
+    sh env, "go", "run", "./cmd/conformance", "disk", chdir: GO_DIR
+    sh env, "node", "src/bin/conformance.ts", "disk", chdir: TS_DIR
+  end
   desc "Walk the conformance corpus on the Rust core, both storage modes (release — debug overflows depth_limit)"
   task :rust do
     puts "conformance: rust (memory)"
@@ -971,7 +984,7 @@ task unit: %w[unit:rust unit:go unit:ts]
 # the inner dev loop; `rake ci` is the SUPERSET that wraps it with the static/spec/metamorphic
 # gates below.
 desc "Engine test suites: conformance corpus (×3 cores) + per-core unit tests + CLI + Ruby-gem + migrate tests"
-task test: %w[conformance unit cli:test ruby:test migrate:test]
+task test: %w[conformance conformance:spill unit cli:test ruby:test migrate:test]
 
 # ci — the full merge gate, a SUPERSET of `rake test`. Adds the checks that aren't example-based
 # tests: spec-data + byte-fixture verification + codegen-drift (`verify`), the formatter gate

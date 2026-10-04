@@ -16,6 +16,53 @@ is the permanent blocking-sort top-k lane: one million fixed
 rows, K=100, cross-engine checksum equality, and the scan-dominated timing/memory payoff. This document is the
 canonical record for the `bench/` subsystem.
 
+**Blocking spill result (2026-10-04).** `mise run bench:spill` drives the shared
+`bench/corpus/spill.toml` workload through independent Rust, Go and TypeScript
+workers. It creates 32,768 rows with a 2,048-byte text payload (about 66 MiB logical
+input), then runs JOIN, high-cardinality GROUP BY, DISTINCT and a single-group
+ordered-set aggregate in separate processes. The page cache is 1 MiB; each query
+runs with unlimited, 1 MiB and default 256 MiB `work_mem`. Setup runs separately,
+answers stream into an FNV checksum, and GNU time records peak process RSS.
+This is larger than the **operator budget**, not a claim that the dataset exceeds
+physical machine RAM. RSS includes the runtime, allocator retention and other
+owners; it is not the logical spill threshold.
+
+All **36 current results** (four queries × three cores × three budgets) agree on
+rows, checksum and exact cost. The same signatures agree with the pre-change
+`c361db72` baseline. At 1 MiB, before → after cold-query samples were:
+
+| Core | Workload | Elapsed ms | Peak RSS MiB |
+|---|---|---:|---:|
+| Go | hash JOIN | 231 → 1,140 | 282.1 → 16.2 |
+| Go | GROUP BY | 202 → 1,446 | 208.6 → 17.3 |
+| Go | DISTINCT | 210 → 1,013 | 184.9 → 17.0 |
+| Go | ordered set | 104 → 810 | 174.6 → 16.7 |
+| Rust | hash JOIN | 291 → 658 | 271.2 → 12.2 |
+| Rust | GROUP BY | 281 → 866 | 235.7 → 11.4 |
+| Rust | DISTINCT | 246 → 762 | 220.6 → 11.3 |
+| Rust | ordered set | 124 → 389 | 152.2 → 10.9 |
+| TypeScript | hash JOIN | 1,145 → 6,403 | 492.9 → 311.1 |
+| TypeScript | GROUP BY | 1,239 → 6,681 | 445.6 → 260.3 |
+| TypeScript | DISTINCT | 1,180 → 5,133 | 427.5 → 263.5 |
+| TypeScript | ordered set | 330 → 3,217 | 411.4 → 262.6 |
+
+Spilling trades scratch I/O for substantially lower retained memory. The runtime
+cost remains identical because scratch work is internal and unmetered. Fitting
+256 MiB budgets also have measurable overhead in native aggregation: Go GROUP BY
+207 → 321 ms (205 → 319 MiB RSS), Rust GROUP BY 273 → 360 ms (236 → 249 MiB), and
+Rust ordered-set 121 → 197 ms (152 → 220 MiB). These are single fresh-process
+samples, not stable throughput medians; resident accumulator representation and
+scratch throughput remain optimization opportunities. Constant-state packed
+aggregation retains its existing fast path.
+
+The run used Linux x86-64 on an Intel Core Ultra 9 285K, Rust 1.99.0, Go 1.27.1,
+and Node 26.10.0. Raw baseline/current JSONL and workload metadata are retained
+under `bench/results/spill-20261004/{before,after}/`. The shared forced-spill SQL
+corpus is a separate gating check (`rake conformance:spill`, also in `rake ci`);
+timings and RSS remain diagnostics. In-memory/OPFS/WASI scratch limitations,
+upstream materializers, final scalar values, result collectors and whole-query
+admission are documented in [spill.md](spill.md) and [memory.md](memory.md).
+
 **Native Node wrapper experiment (2026-07-16).** `impl/node` and
 `bench/ts/src/bench-node-rust.ts` provide a Node-API wrapper around the safe Rust core and run all 53
 jed lanes against the pure TypeScript core. The same-host control run also included the native Rust

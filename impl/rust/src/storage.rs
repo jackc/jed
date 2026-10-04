@@ -318,11 +318,12 @@ impl TableStore {
         let mut pages = self.node_count();
         let mut slabs = 0usize;
         if crate::format::any_spillable_masked(&self.col_types, mask) {
-            for (k, row) in self.iter_entries()? {
-                let u = crate::format::record_scan_units(&self.col_types, &k, &row, self.cap, mask);
+            self.scan_range(&KeyBound::unbounded(), &mut |k, row| {
+                let u = crate::format::record_scan_units(&self.col_types, k, row, self.cap, mask);
                 pages += u.pages;
                 slabs += u.decompress;
-            }
+                Ok(true)
+            })?;
         }
         Ok((pages, slabs))
     }
@@ -336,11 +337,12 @@ impl TableStore {
         let mut pages = self.overlap_node_count(b);
         let mut slabs = 0usize;
         if crate::format::any_spillable_masked(&self.col_types, mask) {
-            for (k, row) in self.range_entries(b)? {
-                let u = crate::format::record_scan_units(&self.col_types, &k, &row, self.cap, mask);
+            self.scan_range(b, &mut |k, row| {
+                let u = crate::format::record_scan_units(&self.col_types, k, row, self.cap, mask);
                 pages += u.pages;
                 slabs += u.decompress;
-            }
+                Ok(true)
+            })?;
         }
         Ok((pages, slabs))
     }

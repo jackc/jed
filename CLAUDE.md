@@ -495,8 +495,10 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   seam-foundation-first; P6.4) and **streaming + spill-to-disk operators** (sort / hash join /
   aggregate / DISTINCT bounded by a memory budget, spilling when exceeded — the **`ORDER BY`
   external merge sort + its streaming single-table feed have landed**, [spec/design/spill.md](spec/design/spill.md),
-  bounded by the `work_mem` handle setting; the **deterministic in-memory hash JOIN has landed** and
-  its grace-hash spill, spilling hash aggregate, and spilling `DISTINCT` are follow-ons), and **lazy
+  bounded by the `work_mem` handle setting; **hash JOIN, aggregate, and DISTINCT also spill** using
+  bounded row spools and disk hash partitions. Ordered partition replay preserves probe/bucket
+  order, aggregate fold order, and cost. Upstream window/CTE/index materialization and final
+  scalar/result admission remain separate memory owners, not a whole-query memory ceiling), and **lazy
   record decode** (a faulted leaf stays its **compact on-disk bytes**,
   decoding each column **on demand** for the query's touched set instead of materializing every
   value into an inflated `Value` tree — **design landed**, [spec/design/lazy-record.md](spec/design/lazy-record.md),

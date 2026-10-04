@@ -46,7 +46,10 @@ This allowance **does not cover all scalar kernels or all query memory**. In
 particular, existing inputs, concatenation/replacement, arrays/JSON, decoded rows,
 join/aggregate/distinct tables, result buffers, and pending writes are not covered
 by this first reservation surface. It must not be advertised as a whole-query
-memory cap. `work_mem` remains the sort spill threshold; `temp_buffers` remains
+memory cap. `work_mem` controls sort, hash JOIN, aggregate, and DISTINCT spilling;
+their row/state spools preserve evaluation order and costs ([spill.md](spill.md)).
+Upstream materialized producers, window partitions, final scalar values, and
+host/result collectors remain separate allocation owners. `temp_buffers` remains
 the session-local committed temp-storage cap. Neither is a whole-query heap cap.
 
 ## Decided contract: whole-query memory (not yet implemented)

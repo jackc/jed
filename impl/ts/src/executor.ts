@@ -211,6 +211,7 @@ import {
 } from "./parser.ts";
 import { type KeyBound, type PNode, colAt, compareBytes, unboundedBound } from "./pmap.ts";
 import { type RowCompare, SortedRows, type SpillSink, Sorter } from "./spill.ts";
+import { RowSpool, SpillMap, SpillMultiMap, SpillSet, SpoolSorter, sortSpool } from "./blocking.ts";
 import { type Entry, type Row, TableStore } from "./storage.ts";
 import {
   type DecimalTypmod,
@@ -546,7 +547,9 @@ export type Emitter = {
   end: number;
   mode: EmitMode;
   // Set only for "sorted": the streaming-sort output pull iterator, positioned past the OFFSET.
-  sorted?: SortedRows;
+  sorted?: Pick<SortedRows, "next" | "close">;
+  sortedIdentity?: boolean;
+  sortedFinal?: boolean;
   // Set only for "columnar" (the projectColumnar fast path, packed-leaf.md §11 Track A2/A3): `cols` are
   // the pre-gathered dense per-column lanes (indexed by table ordinal) and `projCols` the projection's
   // column indices into them; emission builds output row j as [cols[projCols[0]][l], …] where l = sel[j]
@@ -567,7 +570,7 @@ export function finalEmitter(rows: Value[][]): Emitter {
 // sortedEmitter wraps the streaming external sort's output (positioned past the OFFSET, with `remaining`
 // windowed rows still to emit) as a "sorted" Emitter — emission pulls + projects + charges rowProduced
 // per row, so the output array is never built (spec/design/streaming.md §4/§7).
-export function sortedEmitter(sorted: SortedRows, remaining: number): Emitter {
+export function sortedEmitter(sorted: Pick<SortedRows, "next" | "close">, remaining: number): Emitter {
   return { rows: [], start: 0, end: remaining, mode: "sorted", sorted };
 }
 
@@ -14427,7 +14430,8 @@ export class Engine {
     // first (scan-order) occurrence, then the LIMIT/OFFSET window the DISTINCT rows. The sort is
     // elided; the projection is charged per scanned filtered row (the §3 asymmetry).
     const distinct = plan.distinct;
-    const seen = new Set<string>();
+    const seen = new SpillSet(this.session.workMem, this.spillSink);
+    try {
     let passed = 0n;
     const processRow = (rawRow: Row, guarded: boolean): boolean => {
         if (!guarded) meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
@@ -14619,6 +14623,7 @@ export class Engine {
       rows: out,
       cost: meter.accrued,
     };
+    } finally { seen.close(); }
   }
 
   // windowTopNEligible reports whether a plain (non-grouped) window query can serve its LIMIT with a
@@ -14893,7 +14898,7 @@ export class Engine {
     // in-memory SortedRows. The metered costs (storageRowRead per scanned row, rowProduced per windowed
     // output) are identical to the Sorter path; the sort itself is unmetered like every sort (cost.md §3).
     let total: bigint;
-    let sorted: SortedRows;
+    let sorted: Pick<SortedRows, "next" | "close">;
     if (plan.order.some((k) => k.collation !== null)) {
       const rows: Row[] = [];
       if (!empty) {
@@ -14925,6 +14930,7 @@ export class Engine {
       const keeper = useTopK ? new TopKKeeper(plan.phys.topK!, plan.order, false) : null;
       const sorter = useTopK ? null : this.newSorterFor(plan.order);
       let survivorCount = 0n;
+      try {
       if (!empty) {
         // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
         store.scanRange(bound, (_key, rawRow) => {
@@ -14947,6 +14953,10 @@ export class Engine {
       }
       total = survivorCount;
       sorted = keeper !== null ? new SortedRows(keeper.finish(), null) : sorter!.finish();
+      } catch (error) {
+        sorter?.close();
+        throw error;
+      }
     }
 
     // LIMIT / OFFSET window over the sort's total row count (known without materializing the output).
@@ -15232,7 +15242,7 @@ export class Engine {
   // when a spillSink is present — a durable host that can spill to disk sets one (the Node file host
   // uses an OS-temp FileSpillSink, independent of the database path); an in-memory or OPFS database
   // leaves it null and sorts fully resident (spill.md §2/§4).
-  private newSorterFor(order: OrderSlot[]): Sorter {
+  private newSorterFor(order: OrderSlot[]): Sorter | SpoolSorter {
     const compare: RowCompare = (a, b) => {
       for (const k of order) {
         const c = keyCmp(a[k.idx]!, b[k.idx]!, k.descending, k.nullsFirst);
@@ -15240,6 +15250,8 @@ export class Engine {
       }
       return 0;
     };
+    if (this.session.workMem > 0 && this.spillSink?.createScratch !== undefined)
+      return new SpoolSorter(compare, this.session.workMem, this.spillSink);
     return new Sorter(compare, this.session.workMem, this.spillSink);
   }
 
@@ -15524,9 +15536,11 @@ export class Engine {
         for (let i = 0; i < em.end; i++) {
           const row = sorted.next();
           if (row === null) break;
-          meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
-          meter.charge(COSTS.rowProduced);
-          out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
+          if (!em.sortedFinal) {
+            meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
+            meter.charge(COSTS.rowProduced);
+          }
+          out.push(em.sortedIdentity ? row : plan.projections.map((p) => evalExpr(p, row, env, meter)));
         }
         return out;
       } finally {
@@ -16026,6 +16040,625 @@ export class Engine {
     return running;
   }
 
+  // File-backed blocking execution retains the eager plan's phase boundaries, while every
+  // intermediate row sequence and keyed state owner can release its rows to scratch.
+  private boundedBlockingEligible(plan: SelectPlan): boolean {
+    if (this.spillSink?.createScratch === undefined || this.session.workMem <= 0) return false;
+    if (streamingScanEligible(plan)) return false;
+    if (plan.rels.length <= 1 && !plan.isAgg && !plan.distinct) return false;
+    return true;
+  }
+
+  private execBoundedBlocking(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+  ): Emitter {
+    if (
+      plan.rels.length >= 3 &&
+      (plan.phys.relationOrder.length !== plan.rels.length ||
+        plan.phys.joinSteps.length + 1 !== plan.rels.length)
+    ) {
+      plan = {
+        ...plan,
+        phys: {
+          ...plan.phys,
+          relationOrder: plan.rels.map((_, i) => i),
+          joinSteps: plan.joins.map((_, i) => ({
+            onIndices: [i],
+            hashJoin: i === 0 ? plan.phys.hashJoin : null,
+          })),
+        },
+      };
+    }
+    const sink = this.spillSink!;
+    const budget = this.session.workMem;
+    const resources: { close(): void }[] = [];
+    const spool = (): RowSpool => {
+      const s = new RowSpool(budget, sink);
+      resources.push(s);
+      return s;
+    };
+    const map = (): SpillMap => {
+      const m = new SpillMap(budget, sink);
+      resources.push(m);
+      return m;
+    };
+    let transferred = false;
+    const profileStart = meter.accrued;
+    let filterWork = 0n;
+    let outputWork = 0n;
+    let passed = 0n;
+    const emitJoin = (row: Row, out: RowSpool, streaming: boolean): boolean => {
+      if (!streaming) {
+        out.push(row);
+        return false;
+      }
+      if (plan.filter !== null) {
+        const before = meter.accrued;
+        const keep = isTrue(evalExpr(plan.filter, row, env, meter));
+        filterWork += meter.accrued - before;
+        if (!keep) return false;
+      }
+      if (++passed <= (plan.offset ?? 0n)) return false;
+      meter.guard();
+      const before = meter.accrued;
+      meter.charge(COSTS.rowProduced);
+      out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
+      outputWork += meter.accrued - before;
+      return plan.limit !== null && BigInt(out.length) >= plan.limit;
+    };
+    try {
+      const relations: RowSpool[] = [];
+      const relWork: bigint[] = [];
+      const scanOrder =
+        plan.phys.joinPkOrdered && plan.rels.length === 2
+          ? [physicalRelOrdinal(plan, 0), physicalRelOrdinal(plan, 1)]
+          : plan.rels.map((_, i) => i);
+      for (const ordinal of scanOrder) {
+        const rel = plan.rels[ordinal]!;
+        const out = spool();
+        const before = meter.accrued;
+        if (rel.lateral === true || plan.phys.relINLBounds[ordinal] !== null) {
+          relations[ordinal] = out;
+          relWork[ordinal] = 0n;
+          continue;
+        }
+        if (
+          rel.srf !== undefined ||
+          rel.cte !== undefined ||
+          rel.derived !== undefined ||
+          needsEagerScan(plan.phys.relBounds[ordinal])
+        ) {
+          const materialized = this.materializeRel(
+            plan,
+            ordinal,
+            env.outer,
+            [],
+            env,
+            params,
+            meter,
+          );
+          for (const row of materialized) out.push(row);
+          relations[ordinal] = out;
+          relWork[ordinal] = meter.accrued - before;
+          continue;
+        }
+        const store = this.lkpStoreScoped(rel.db, rel.tableName);
+        const rb = plan.phys.relBounds[ordinal];
+        const bound =
+          rb?.kind === "pk" ? buildKeyBound(rb.pk, params, env.outer, []) : unboundedBound();
+        if (bound !== null) {
+          const units = store.overlapScanUnits(bound, plan.relMasks[ordinal]!);
+          meter.charge(
+            COSTS.valueDecompress * BigInt(units.slabs) + COSTS.pageRead * BigInt(units.pages),
+          );
+          store.scanRange(bound, (_key, raw) => {
+            meter.guard();
+            meter.charge(COSTS.storageRowRead);
+            const resolved = store.resolveColumns(raw, plan.relMasks[ordinal]!);
+            out.push(resolved.map((v, c) => (plan.relMasks[ordinal]![c] ? v : nullValue())));
+            return true;
+          });
+        }
+        relations[ordinal] = out;
+        relWork[ordinal] = meter.accrued - before;
+      }
+      const dynamicRows = (ordinal: number, logical: Row): Row[] | null => {
+        const rel = plan.rels[ordinal]!;
+        if (!rel.lateral && plan.phys.relINLBounds[ordinal] === null) return null;
+        const before = meter.accrued;
+        const result = rel.lateral
+          ? this.materializeRel(plan, ordinal, [...env.outer, logical], [], env, params, meter)
+          : this.materializeRel(plan, ordinal, env.outer, logical, env, params, meter);
+        relWork[ordinal] = relWork[ordinal]! + meter.accrued - before;
+        return result;
+      };
+      let rows = relations[0] ?? spool();
+      if (plan.rels.length === 0) rows.push([]);
+      if (plan.rels.length === 2 && plan.phys.hashJoin === null) {
+        const outer = physicalRelOrdinal(plan, 0);
+        const inner = physicalRelOrdinal(plan, 1);
+        const matchedRight = map();
+        const next = spool();
+        const kind = plan.joins[0]!.kind;
+        joinedRows: for (const left of plan.phys.joinPkOrdered && plan.limit === 0n
+          ? []
+          : relations[outer]!) {
+          let matched = false;
+          let ordinal = 0;
+          for (const right of dynamicRows(inner, placePhysicalRelationRow(plan, outer, left)) ??
+            relations[inner]!) {
+            const combined = combinePhysicalRelationRows(plan, outer, left, inner, right);
+            const on = plan.joins[0]!.on;
+            if (on === null || isTrue(evalExpr(on, combined, env, meter))) {
+              matched = true;
+              if (kind === "right" || kind === "full") matchedRight.set(String(ordinal), []);
+              if (emitJoin(combined, next, plan.phys.joinPkOrdered)) break joinedRows;
+            }
+            ordinal++;
+          }
+          if (!matched && (kind === "left" || kind === "full"))
+            next.push(placePhysicalRelationRow(plan, outer, left));
+        }
+        if (kind === "right" || kind === "full") {
+          let ordinal = 0;
+          for (const right of relations[inner]!)
+            if (matchedRight.get(String(ordinal++)) === undefined)
+              next.push(placePhysicalRelationRow(plan, inner, right));
+        }
+        matchedRight.close();
+        for (const rel of relations) rel.close();
+        rows = next;
+      }
+      if (plan.rels.length === 2 && plan.phys.hashJoin !== null) {
+        const hp = plan.phys.hashJoin!;
+        const outer = physicalRelOrdinal(plan, 0);
+        const inner = physicalRelOrdinal(plan, 1);
+        const build = new SpillMultiMap(budget, sink);
+        resources.push(build);
+        const buildIndices = hp.keys.map((k) => k.right - plan.rels[inner]!.offset);
+        const probeIndices = hp.keys.map((k) => k.left - plan.rels[outer]!.offset);
+        const types = hp.keys.map((k) => k.type);
+        for (const row of plan.phys.joinPkOrdered && plan.limit === 0n ? [] : relations[inner]!) {
+          const key = hashJoinRowKey(row, buildIndices, types, COSTS.hashBuild, meter);
+          if (key !== null) build.append(hashJoinFnv1a(key).toString(), [byteaValue(key), ...row]);
+        }
+        const joined = spool();
+        joinedRows: for (const left of plan.phys.joinPkOrdered && plan.limit === 0n
+          ? []
+          : relations[outer]!) {
+          const key = hashJoinRowKey(left, probeIndices, types, COSTS.hashProbe, meter);
+          let matched = false;
+          // Match-key comparisons form a separate phase before residual ON evaluation, as on the
+          // resident path. Replaying a bucket costs no SQL work and avoids a full match-index vector.
+          if (key !== null) {
+            for (const candidate of build.get(hashJoinFnv1a(key).toString())) {
+              const encoded = (candidate[0]! as { bytes: Uint8Array }).bytes;
+              meter.guard();
+              meter.charge(
+                COSTS.hashProbe * BigInt(Math.max(1, Math.min(encoded.length, key.length))),
+              );
+            }
+            for (const candidate of build.get(hashJoinFnv1a(key).toString())) {
+              const encoded = (candidate[0]! as { bytes: Uint8Array }).bytes;
+              if (!bytesEq(encoded, key)) continue;
+              const combined = combinePhysicalRelationRows(
+                plan,
+                outer,
+                left,
+                inner,
+                candidate.slice(1),
+              );
+              const on = plan.joins[0]!.on;
+              if (on === null || isTrue(evalExpr(on, combined, env, meter))) {
+                matched = true;
+                if (emitJoin(combined, joined, plan.phys.joinPkOrdered)) break joinedRows;
+              }
+            }
+          }
+          if (!matched && plan.joins[0]!.kind === "left")
+            joined.push(placePhysicalRelationRow(plan, outer, left));
+        }
+        rows = joined;
+        for (const rel of relations) rel.close();
+        build.close();
+      }
+      if (plan.rels.length >= 3) {
+        const driver = plan.phys.relationOrder[0]!;
+        rows = spool();
+        for (const row of relations[driver]!)
+          rows.push(placePhysicalRelationRow(plan, driver, row));
+        relations[driver]!.close();
+        for (let position = 0; position < plan.phys.joinSteps.length; position++) {
+          const step = plan.phys.joinSteps[position]!;
+          const inner = plan.phys.relationOrder[position + 1]!;
+          if (step.hashJoin === null) {
+            const next = spool();
+            const matchedRight = map();
+            const kind = step.onIndices.reduce<JoinKind>((current, i) => {
+              const candidate = plan.joins[i]!.kind;
+              return candidate === "left" || candidate === "right" || candidate === "full"
+                ? candidate
+                : current;
+            }, "inner");
+            const streaming =
+              plan.phys.joinPkOrdered && position + 1 === plan.phys.joinSteps.length;
+            joinedRows: for (const left of streaming && plan.limit === 0n ? [] : rows) {
+              let matched = false;
+              let ordinal = 0;
+              for (const right of dynamicRows(inner, left) ?? relations[inner]!) {
+                const combined = left.slice();
+                combined.splice(plan.rels[inner]!.offset, right.length, ...right);
+                let keep = true;
+                for (const index of step.onIndices) {
+                  const on = plan.joins[index]!.on;
+                  if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) {
+                    keep = false;
+                    break;
+                  }
+                }
+                if (keep) {
+                  matched = true;
+                  if (kind === "right" || kind === "full") matchedRight.set(String(ordinal), []);
+                  if (emitJoin(combined, next, streaming)) break joinedRows;
+                }
+                ordinal++;
+              }
+              if (!matched && (kind === "left" || kind === "full")) next.push(left);
+            }
+            if (kind === "right" || kind === "full") {
+              let ordinal = 0;
+              for (const right of relations[inner]!)
+                if (matchedRight.get(String(ordinal++)) === undefined)
+                  next.push(placePhysicalRelationRow(plan, inner, right));
+            }
+            rows.close();
+            rows = next;
+            matchedRight.close();
+            relations[inner]!.close();
+            if (position + 1 < plan.phys.joinSteps.length)
+              this.recordExplainActualParent("Nested Loop", meter.accrued);
+            continue;
+          }
+          const hp = step.hashJoin!;
+          const build = new SpillMultiMap(budget, sink);
+          resources.push(build);
+          const matchedRight = map();
+          const types = hp.keys.map((k) => k.type);
+          const buildIndices = hp.keys.map((k) => k.right - plan.rels[inner]!.offset);
+          const probeIndices = hp.keys.map((k) => k.left);
+          let ordinal = 0;
+          for (const row of relations[inner]!) {
+            const key = hashJoinRowKey(row, buildIndices, types, COSTS.hashBuild, meter);
+            if (key !== null)
+              build.append(hashJoinFnv1a(key).toString(), [
+                byteaValue(key),
+                intValue(BigInt(ordinal)),
+                ...row,
+              ]);
+            ordinal++;
+          }
+          const kind = step.onIndices.reduce<JoinKind>((current, i) => {
+            const candidate = plan.joins[i]!.kind;
+            return candidate === "left" || candidate === "right" || candidate === "full"
+              ? candidate
+              : current;
+          }, "inner");
+          const next = spool();
+          const streaming = plan.phys.joinPkOrdered && position + 1 === plan.phys.joinSteps.length;
+          joinedRows: for (const left of streaming && plan.limit === 0n ? [] : rows) {
+            const key = hashJoinRowKey(left, probeIndices, types, COSTS.hashProbe, meter);
+            let matched = false;
+            if (key !== null) {
+              const hash = hashJoinFnv1a(key).toString();
+              for (const candidate of build.get(hash)) {
+                const encoded = (candidate[0]! as { bytes: Uint8Array }).bytes;
+                meter.guard();
+                meter.charge(
+                  COSTS.hashProbe * BigInt(Math.max(1, Math.min(encoded.length, key.length))),
+                );
+              }
+              for (const candidate of build.get(hash)) {
+                if (!bytesEq((candidate[0]! as { bytes: Uint8Array }).bytes, key)) continue;
+                const combined = left.slice();
+                combined.splice(
+                  plan.rels[inner]!.offset,
+                  candidate.length - 2,
+                  ...candidate.slice(2),
+                );
+                let keep = true;
+                for (const index of step.onIndices) {
+                  const on = plan.joins[index]!.on;
+                  if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) {
+                    keep = false;
+                    break;
+                  }
+                }
+                if (keep) {
+                  matched = true;
+                  if (emitJoin(combined, next, streaming)) break joinedRows;
+                  if (kind === "right" || kind === "full")
+                    matchedRight.set((candidate[1]! as { int: bigint }).int.toString(), []);
+                }
+              }
+            }
+            if (!matched && (kind === "left" || kind === "full")) next.push(left);
+          }
+          if (kind === "right" || kind === "full") {
+            ordinal = 0;
+            for (const right of relations[inner]!) {
+              if (matchedRight.get(String(ordinal++)) === undefined)
+                next.push(placePhysicalRelationRow(plan, inner, right));
+            }
+          }
+          rows.close();
+          rows = next;
+          relations[inner]!.close();
+          build.close();
+          matchedRight.close();
+          if (position + 1 < plan.phys.joinSteps.length)
+            this.recordExplainActualParent("Hash Join", meter.accrued);
+        }
+      }
+      const ordinals =
+        plan.phys.relationOrder.length === plan.rels.length
+          ? plan.phys.relationOrder
+          : plan.rels.map((_, i) => i);
+      for (const ordinal of ordinals) {
+        const node = selectActualRelNode(plan.rels[ordinal]!);
+        if (selectActualRootNode(plan) !== node) this.recordExplainActual(node, relWork[ordinal]!);
+      }
+      const joinNode =
+        (plan.rels.length === 2 ? plan.phys.hashJoin : plan.phys.joinSteps.at(-1)?.hashJoin) == null
+          ? "Nested Loop"
+          : "Hash Join";
+      if (plan.rels.length > 1 && selectActualRootNode(plan) !== joinNode)
+        this.recordExplainActualParent(
+          joinNode,
+          plan.phys.joinPkOrdered
+            ? meter.accrued - profileStart - filterWork - outputWork
+            : meter.accrued,
+        );
+      if (
+        plan.phys.joinPkOrdered &&
+        plan.filter !== null &&
+        selectActualRootNode(plan) !== "Filter"
+      )
+        this.recordExplainActualParent("Filter", meter.accrued - profileStart - outputWork);
+      if (!plan.phys.joinPkOrdered && plan.filter !== null) {
+        const filtered = spool();
+        for (const row of rows)
+          if (isTrue(evalExpr(plan.filter, row, env, meter))) filtered.push(row);
+        rows.close();
+        rows = filtered;
+        if (selectActualRootNode(plan) !== "Filter")
+          this.recordExplainActualParent("Filter", meter.accrued);
+      }
+      const applyWindow = (input: RowSpool): RowSpool => {
+        const materialized = Array.from(input);
+        input.close();
+        applyWindowStage(materialized, plan.windowSpecs, plan.windowKeys, env, meter);
+        const out = spool();
+        for (const row of materialized) out.push(row);
+        if (selectActualRootNode(plan) !== "Window")
+          this.recordExplainActualParent("Window", meter.accrued);
+        return out;
+      };
+      if (plan.hasWindow && !plan.isAgg) rows = applyWindow(rows);
+      if (plan.isAgg) {
+        if (plan.groupExprs.length > 0) {
+          const extended = spool();
+          for (const original of rows) {
+            meter.guard();
+            const row = original.slice();
+            for (const expr of plan.groupExprs) row.push(evalExpr(expr, row, env, meter));
+            extended.push(row);
+          }
+          rows.close();
+          rows = extended;
+        }
+        const grouped = spool();
+        for (const gset of plan.groupSets) {
+          const states = map();
+          const seen = map();
+          const unique = map();
+          const collections = new SpillMultiMap(budget, sink);
+          resources.push(collections);
+          const order = spool();
+          const fresh = (): Acc[] => plan.aggSpecs.map((s) => newAccFromSpec(s));
+          if (gset.keyCols.length === 0) {
+            states.set("", encodeBlockingAccs([], fresh()));
+            order.push([]);
+          }
+          for (const row of rows) {
+            meter.guard();
+            const keys = gset.keyCols.map((index) => row[index]!);
+            const key = distinctRowKey(keys);
+            const previous = states.get(key);
+            const accs =
+              previous === undefined ? fresh() : decodeBlockingAccs(previous, plan.aggSpecs).accs;
+            if (previous === undefined) order.push(keys);
+            for (let si = 0; si < plan.aggSpecs.length; si++) {
+              const spec = plan.aggSpecs[si]!;
+              if (spec.filter != null && !isTrue(evalExpr(spec.filter, row, env, meter))) continue;
+              meter.charge(COSTS.aggregateAccumulate);
+              const collectionKey = blockingCollectionKey(key, si);
+              if (spec.hypo != null) {
+                collections.append(
+                  collectionKey,
+                  spec.hypo.keys.map((expr) => evalExpr(expr, row, env, meter)),
+                );
+                continue;
+              }
+              const value =
+                spec.operand === null ? nullValue() : evalExpr(spec.operand, row, env, meter);
+              if (spec.distinct) {
+                if (value.kind === "null") continue;
+                const dk = `${key.length}:${key}${si}:${distinctRowKey([value])}`;
+                if (seen.get(dk) !== undefined) continue;
+                seen.set(dk, []);
+              }
+              if (
+                !foldBlockingCollection(
+                  accs[si]!,
+                  spec,
+                  value,
+                  collectionKey,
+                  collections,
+                  unique,
+                  meter,
+                )
+              )
+                foldAcc(accs[si]!, value, meter);
+            }
+            // The first-occurrence spool owns the original key representation; accumulator
+            // state does not duplicate a wide key on every update or count it twice in the map.
+            states.set(key, encodeBlockingAccs([], accs));
+          }
+          for (const keys of order) {
+            const key = distinctRowKey(keys);
+            const group = decodeBlockingAccs(states.get(key)!, plan.aggSpecs);
+            const row = gset.slotSrc.map((src) => (src < 0 ? nullValue() : keys[src]!));
+            for (let si = 0; si < group.accs.length; si++)
+              row.push(
+                finalizeBlockingCollection(
+                  group.accs[si]!,
+                  plan.aggSpecs[si]!,
+                  blockingCollectionKey(key, si),
+                  collections,
+                  row,
+                  env,
+                  budget,
+                  sink,
+                ),
+              );
+            for (const positions of plan.groupingSpecs)
+              row.push(intValue(groupingValue(positions, gset.mask)));
+            grouped.push(row);
+          }
+          states.close();
+          seen.close();
+          unique.close();
+          order.close();
+          collections.close();
+        }
+        rows.close();
+        rows = grouped;
+        if (plan.having !== null) {
+          const filtered = spool();
+          for (const row of rows)
+            if (isTrue(evalExpr(plan.having, row, env, meter))) filtered.push(row);
+          rows.close();
+          rows = filtered;
+        }
+        if (selectActualRootNode(plan) !== "Aggregate")
+          this.recordExplainActualParent("Aggregate", meter.accrued);
+        if (plan.hasWindow) rows = applyWindow(rows);
+      }
+      if (!plan.phys.joinPkOrdered && plan.order.length > 0) {
+        if (plan.orderExprs.length > 0) {
+          const extended = spool();
+          for (const original of rows) {
+            const row = original.slice();
+            for (const expr of plan.orderExprs) row.push(evalExpr(expr, row, env, meter));
+            extended.push(row);
+          }
+          rows.close();
+          rows = extended;
+        }
+        const collated = plan.order.filter((order) => order.collation !== null);
+        let baseWidth = 0;
+        if (collated.length > 0) {
+          const decorated = spool();
+          for (const row of rows) {
+            baseWidth = row.length;
+            decorated.push([
+              ...row,
+              ...collated.map((order) => {
+                const value = row[order.idx]!;
+                return value.kind === "text"
+                  ? byteaValue(collationSortKey(order.collation!, value.text))
+                  : nullValue();
+              }),
+            ]);
+          }
+          rows.close();
+          rows = decorated;
+        }
+        const sorted = sortSpool(
+          rows,
+          (a, b) => {
+            let collatedIndex = baseWidth;
+            for (const order of plan.order) {
+              const index = order.collation === null ? order.idx : collatedIndex++;
+              const cmp = keyCmp(a[index]!, b[index]!, order.descending, order.nullsFirst);
+              if (cmp !== 0) return cmp;
+            }
+            return 0;
+          },
+          budget,
+          sink,
+        );
+        resources.push(sorted);
+        rows.close();
+        rows = sorted;
+        if (selectActualRootNode(plan) !== "Sort")
+          this.recordExplainActualParent("Sort", meter.accrued);
+      }
+      if (plan.distinct) {
+        const seen = map();
+        const unique = spool();
+        for (const row of rows) {
+          const projected = plan.projections.map((p) => evalExpr(p, row, env, meter));
+          const key = distinctRowKey(projected);
+          if (seen.get(key) === undefined) {
+            seen.set(key, []);
+            unique.push(projected);
+          }
+        }
+        seen.close();
+        rows.close();
+        rows = unique;
+        if (selectActualRootNode(plan) !== "Distinct")
+          this.recordExplainActualParent("Distinct", meter.accrued);
+      }
+      const total = BigInt(rows.length);
+      const start = plan.phys.joinPkOrdered
+        ? 0n
+        : (plan.offset ?? 0n) < total
+          ? (plan.offset ?? 0n)
+          : total;
+      const remaining =
+        plan.limit !== null && plan.limit < total - start ? plan.limit : total - start;
+      const iterator = rows[Symbol.iterator]();
+      for (let i = 0n; i < start; i++) iterator.next();
+      const sorted = {
+        next: (): Row | null => {
+          const next = iterator.next();
+          return next.done ? null : next.value;
+        },
+        close: (): void => {
+          iterator.return?.(undefined);
+          for (const resource of resources) resource.close();
+        },
+      };
+      transferred = true;
+      return {
+        rows: [],
+        start: 0,
+        end: Number(remaining),
+        mode: "sorted",
+        sorted,
+        sortedIdentity: plan.distinct || plan.phys.joinPkOrdered,
+        sortedFinal: plan.phys.joinPkOrdered,
+      };
+    } finally {
+      if (!transferred) for (const resource of resources) resource.close();
+    }
+  }
+
   // execSelectEmit runs a SelectPlan's blocking part and returns an Emitter describing how to emit its
   // output rows (spec/design/streaming.md §4, S4): the scan / join / WHERE / window / ORDER BY / GROUP
   // BY / DISTINCT all run here (charging their cost into meter), producing either a windowed buffer
@@ -16034,6 +16667,20 @@ export class Engine {
   // (a bufferedRows generator, the query() path). The env's StmtRng threads the per-statement entropy
   // through both the blocking part and the (possibly deferred) projection (streaming.md §6).
   execSelectEmit(plan: SelectPlan, env: EvalEnv, meter: Meter, params: Value[]): Emitter {
+    // The packed whole-table fold already has one finite accumulator and no retained input.
+    // Keep that fast path when its touched-column gate proves it will not gather rows.
+    if (
+      meter.isUnmetered() &&
+      this.explainActualProfile === null &&
+      plan.groupKeys.length === 0 &&
+      this.vectorizedAggEligible(plan)
+    ) {
+      const store = this.lkpStoreScoped(plan.rels[0]!.db, plan.rels[0]!.tableName);
+      if (store.isFileBacked() && !store.anySpillableTouched(plan.relMasks[0]!))
+        return this.execVectorizedAgg(plan, env, meter, params);
+    }
+    if (this.boundedBlockingEligible(plan))
+      return this.execBoundedBlocking(plan, env, meter, params);
     // Vectorized single-table aggregate (the PAX/vectorization program's executor track): a
     // SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window / ORDER BY, either whole-table or
     // grouped by a single integer column, folds columnar / int64-bucketed instead of the row-at-a-time
@@ -28894,4 +29541,284 @@ export function naturalCommonCols(rels: ScopeRel[], seg: number, k: number): str
     }
   }
   return out;
+}
+
+// Finite aggregate state is encoded as ordinary values so scratch reuses the row codec.
+function encodeBlockingAccs(keys: Value[], accs: Acc[]): Row {
+  const row: Row = [intValue(BigInt(keys.length)), ...keys];
+  for (const a of accs)
+    row.push(
+      intValue(a.count),
+      intValue(a.sumInt),
+      decimalValue(a.sumDec),
+      boolValue(a.seen),
+      a.cur ?? nullValue(),
+      float64Value(a.floatTotal),
+      boolValue(a.floatNaN),
+      boolValue(a.floatPosInf),
+      boolValue(a.floatNegInf),
+    );
+  return row;
+}
+function decodeBlockingAccs(row: Row, specs: AggSpec[]): { keys: Value[]; accs: Acc[] } {
+  const n = Number((row[0]! as { int: bigint }).int);
+  const keys = row.slice(1, n + 1);
+  const accs = specs.map((s, i) => {
+    const at = n + 1 + i * 9;
+    const a = newAccFromSpec(s);
+    a.count = (row[at]! as { int: bigint }).int;
+    a.sumInt = (row[at + 1]! as { int: bigint }).int;
+    a.sumDec = (row[at + 2]! as { dec: Decimal }).dec;
+    a.seen = (row[at + 3]! as { value: boolean }).value;
+    a.cur = row[at + 4]!.kind === "null" ? null : row[at + 4]!;
+    a.floatTotal = (row[at + 5]! as { value: number }).value;
+    a.floatNaN = (row[at + 6]! as { value: boolean }).value;
+    a.floatPosInf = (row[at + 7]! as { value: boolean }).value;
+    a.floatNegInf = (row[at + 8]! as { value: boolean }).value;
+    return a;
+  });
+  return { keys, accs };
+}
+
+function blockingCollectionKey(group: string, ordinal: number): string {
+  return `${group.length}:${group}${ordinal}:`;
+}
+function foldBlockingCollection(
+  a: Acc,
+  spec: AggSpec,
+  value: Value,
+  key: string,
+  collections: SpillMultiMap,
+  unique: SpillMap,
+  meter: Meter,
+): boolean {
+  if (
+    a.plan === "mode" ||
+    a.plan === "percentileDisc" ||
+    a.plan === "percentileCont" ||
+    a.plan === "orderedSetContInterval"
+  ) {
+    if (value.kind !== "null")
+      collections.append(key, [
+        a.plan === "percentileCont" ? float64Value(percentileInputF64(value)) : value,
+      ]);
+    return true;
+  }
+  if (a.plan === "jsonAgg" || a.plan === "jsonObjectAgg") {
+    // Run the existing one-row fold for its conversion, validation, charge and failure order;
+    // move only that row's contribution into scratch, never serialize a growing accumulator.
+    const single = newAccFromSpec(spec);
+    foldAcc(single, value, meter);
+    a.seen = single.seen;
+    if (a.plan === "jsonAgg") {
+      for (const node of single.jsonNodes) collections.append(key, [jsonbValue(node)]);
+    } else {
+      const pair = single.jsonPairs[0]!;
+      const uniqueKey = key + pair[0];
+      if (a.jsonUnique) {
+        if (unique.get(uniqueKey) !== undefined)
+          throw engineError("duplicate_json_object_key_value", "duplicate JSON object key value");
+        unique.set(uniqueKey, []);
+      }
+      collections.append(key, [textValue(pair[0]), pair[1]]);
+    }
+    return true;
+  }
+  return false;
+}
+
+function finalizeBlockingCollection(
+  a: Acc,
+  spec: AggSpec,
+  key: string,
+  collections: SpillMultiMap,
+  synthetic: Row,
+  env: EvalEnv,
+  budget: number,
+  sink: SpillSink,
+): Value {
+  if (spec.hypo != null) {
+    const hp = spec.hypo;
+    const hyp = hp.args.map((arg) =>
+      evalExpr(arg, synthetic, env, env.exec.session.scratchMeter()),
+    );
+    let count = 0;
+    let before = 0;
+    let le = 0;
+    let distinct = 0;
+    const seen = new SpillMap(budget, sink);
+    try {
+      for (const tuple of collections.get(key)) {
+        count++;
+        const cmp = hypoCmp(tuple, hyp, hp.sorts);
+        if (cmp < 0) {
+          before++;
+          le++;
+          if (a.plan === "hypoDenseRank") {
+            const dk = distinctRowKey(tuple);
+            if (seen.get(dk) === undefined) {
+              seen.set(dk, []);
+              distinct++;
+            }
+          }
+        } else if (cmp === 0) le++;
+      }
+    } finally {
+      seen.close();
+    }
+    switch (a.plan) {
+      case "hypoRank":
+        return intValue(BigInt(before + 1));
+      case "hypoDenseRank":
+        return intValue(BigInt(distinct + 1));
+      case "hypoPercentRank":
+        return float64Value(count === 0 ? 0 : before / count);
+      case "hypoCumeDist":
+        return float64Value((le + 1) / (count + 1));
+      default:
+        throw new Error("hypothetical aggregate plan required");
+    }
+  }
+  if (a.plan === "jsonAgg") {
+    if (!a.seen) return nullValue();
+    if (a.jsonAsJson) {
+      let output = "[";
+      let separator = "";
+      for (const row of collections.get(key)) {
+        output += separator + jsonbOut((row[0]! as { node: JsonNode }).node);
+        separator = ", ";
+      }
+      return jsonValue(output + "]");
+    }
+    const elements: JsonNode[] = [];
+    for (const row of collections.get(key)) elements.push((row[0]! as { node: JsonNode }).node);
+    return jsonbValue({ kind: "array", elements });
+  }
+  if (a.plan === "jsonObjectAgg") {
+    if (!a.seen) return nullValue();
+    if (a.jsonAsJson) {
+      let output = "{ ";
+      let separator = "";
+      for (const pair of collections.get(key)) {
+        const name = (pair[0]! as { text: string }).text;
+        output +=
+          separator +
+          `${jsonCompactOut({ kind: "string", value: name })} : ${elemJsonText(pair[1]!)}`;
+        separator = ", ";
+      }
+      return jsonValue(output + " }");
+    }
+    const input = new RowSpool(budget, sink);
+    let sorted: RowSpool | null = null;
+    try {
+      // Conversion visits every input pair in input order, including overwritten duplicates.
+      for (const pair of collections.get(key))
+        input.push([pair[0]!, jsonbValue(valueToNode(pair[1]!))]);
+      sorted = sortSpool(
+        input,
+        (x, y) => {
+          const a = new TextEncoder().encode((x[0]! as { text: string }).text);
+          const b = new TextEncoder().encode((y[0]! as { text: string }).text);
+          return a.length - b.length || cmpBytes(a, b);
+        },
+        budget,
+        sink,
+      );
+      const members: JsonMember[] = [];
+      for (const pair of sorted) {
+        const member = {
+          key: (pair[0]! as { text: string }).text,
+          value: (pair[1]! as { node: JsonNode }).node,
+        };
+        if (members.at(-1)?.key === member.key) members[members.length - 1] = member;
+        else members.push(member);
+      }
+      return jsonbValue({ kind: "object", members });
+    } finally {
+      input.close();
+      sorted?.close();
+    }
+  }
+  if (
+    a.plan !== "mode" &&
+    a.plan !== "percentileDisc" &&
+    a.plan !== "percentileCont" &&
+    a.plan !== "orderedSetContInterval"
+  )
+    return finalizeAcc(a);
+  if (spec.osaFrac != null)
+    a.osaFrac = evalExpr(spec.osaFrac, synthetic, env, env.exec.session.scratchMeter());
+  const input = new RowSpool(budget, sink);
+  let sorted: RowSpool | null = null;
+  try {
+    for (const row of collections.get(key)) {
+      const value = row[0]!;
+      input.push(
+        a.osaCollation == null
+          ? row
+          : [value, byteaValue(collationSortKey(a.osaCollation, (value as { text: string }).text))],
+      );
+    }
+    sorted = sortSpool(
+      input,
+      (x, y) =>
+        dirCmp(
+          a.osaCollation == null
+            ? valueCmp(x[0]!, y[0]!)
+            : cmpBytes(
+                (x[1]! as { bytes: Uint8Array }).bytes,
+                (y[1]! as { bytes: Uint8Array }).bytes,
+              ),
+          a.osaDesc === true,
+        ),
+      budget,
+      sink,
+    );
+    input.close();
+    const n = sorted.length;
+    if (a.plan === "mode") {
+      let best: Value = nullValue();
+      let run: Value = nullValue();
+      let bestCount = 0;
+      let runCount = 0;
+      for (const row of sorted) {
+        if (runCount > 0 && valueCmp(run, row[0]!) === 0) runCount++;
+        else {
+          run = row[0]!;
+          runCount = 1;
+        }
+        if (runCount > bestCount) {
+          best = run;
+          bestCount = runCount;
+        }
+      }
+      return best;
+    }
+    const at = (ordinal: number): Value => {
+      let index = 0;
+      for (const row of sorted!) if (index++ === ordinal) return row[0]!;
+      throw new Error("percentile ordinal exceeds its input");
+    };
+    return finalizePercentile(a.osaFrac, n === 0, (p) => {
+      if (a.plan === "percentileDisc")
+        return at(Math.min(n - 1, Math.max(0, Math.ceil(p * n) - 1)));
+      const position = p * (n - 1);
+      const first = Math.floor(position);
+      const second = Math.ceil(position);
+      const lower = at(first);
+      if (a.plan === "orderedSetContInterval")
+        return first === second
+          ? lower
+          : intervalValue(
+              intervalLerp(expectInterval(lower), expectInterval(at(second)), position - first),
+            );
+      const lo = (lower as { value: number }).value;
+      return first === second
+        ? float64Value(lo)
+        : float64Value(lo + (position - first) * ((at(second) as { value: number }).value - lo));
+    });
+  } finally {
+    input.close();
+    sorted?.close();
+  }
 }

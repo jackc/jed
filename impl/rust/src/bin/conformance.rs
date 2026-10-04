@@ -32,6 +32,10 @@ fn main() -> ExitCode {
     let mut files = Vec::new();
     collect_tests(&suites, &mut files);
     files.sort();
+    if let Ok(filter) = std::env::var("JED_CONFORMANCE_FILTER") {
+        files.retain(|path| path.to_string_lossy().contains(&filter));
+        assert!(!files.is_empty(), "JED_CONFORMANCE_FILTER matched no tests");
+    }
 
     // `--rebaseline` rewrites each `# cost: N` directive in place to the cost this core
     // actually accrues, then exits — the tool for re-baselining the corpus after a
@@ -729,6 +733,13 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
             sess = db.session(jed::SessionOptions::default());
         }
         // This record consumes any pending assertions (so they never leak forward).
+        if let Ok(bytes) = std::env::var("JED_CONFORMANCE_WORK_MEM") {
+            sess.set_work_mem(
+                bytes
+                    .parse()
+                    .expect("JED_CONFORMANCE_WORK_MEM must be nonnegative bytes"),
+            );
+        }
         let expected_cost = pending_cost.take();
         let expected_names = pending_names.take();
         let expected_types = pending_types.take();

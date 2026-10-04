@@ -31,10 +31,11 @@ everywhere" real rather than retrofitted (CLAUDE.md §9).
   Most of the Phase-6 path has **landed**: incremental COW commit (dirty pages only; large
   write sets stage to disk pages, not all RAM — §4), B-tree interior pages (replacing the
   step-5b flat record chain — §6), and demand paging / a bounded **buffer pool** (resident
-  set = a cache of pages with eviction — [pager.md](pager.md), §6). Still deferred (none
-  foreclosed): the **spill-to-disk** blocking operators beyond sort (hash join / aggregate /
-  DISTINCT under a memory budget — the `ORDER BY` external merge sort has landed,
-  [spill.md](spill.md); the others are follow-ons). **Binding rule for present work:** no code
+  set = a cache of pages with eviction — [pager.md](pager.md), §6). Sort, hash JOIN,
+  aggregate and DISTINCT now **spill to disk** under `work_mem` ([spill.md](spill.md));
+  source spools and streaming cost prepasses avoid direct scan materialization.
+  Whole-query admission and other allocation owners remain in [memory.md](memory.md).
+  **Binding rule for present work:** no code
   above the storage seam may assume full residency — no "load = whole file into one buffer," no
   operator that requires its whole input/output in RAM. The whole-image serializer now survives
   only as `create`'s from-scratch write and the golden generator (§4), not the commit path.
@@ -142,9 +143,9 @@ meta — detail specified in [../fileformat/format.md](../fileformat/format.md).
 > checksum-protected catalog, replacing the former eager leaf sum), making open
 > O(interior spine) rather than O(file). Demand paging / the bounded buffer pool (P6.4,
 > [pager.md](pager.md)), overflow pages for over-large values, and LZ4 compression (both v3,
-> [large-values.md](large-values.md)) have **also landed**. **Still deferred** (later Phase-6 items,
-> none foreclosed): the spill-to-disk hash join / aggregate / DISTINCT operators
-> ([spill.md](spill.md)). The
+> [large-values.md](large-values.md)) have **also landed**, as have spilling hash JOIN,
+> aggregate and DISTINCT ([spill.md](spill.md)). Complete query-memory admission remains
+> separate ([memory.md](memory.md)). The
 > whole-image `to_image` survives as the **from-scratch** serializer used by
 > `create`'s initial write and the golden fixtures (the special case where every node is
 > dirty); the live commit path is the incremental one.

@@ -13,6 +13,17 @@ implementation (CLAUDE.md §2), the only thing that says two cores agree is that
 produce identical results on the same shared, declarative tests. Everything here is in
 service of that: one format, deterministic expected output, machine-legible failures.
 
+`rake conformance:spill[bytes,filter]` runs the same sequential corpus on file-backed
+handles in all three cores with a forced `work_mem` threshold (default 256 bytes).
+It is part of `rake test` and `rake ci`. Each record retains the ordinary disk-mode
+reopen and receives the threshold again, so small SQL fixtures exercise scratch while
+checking their existing rows, types, errors, and exact costs. The harness-only
+`JED_CONFORMANCE_WORK_MEM` override also accepts zero for an unlimited comparison;
+`JED_CONFORMANCE_FILTER` restricts file paths and rejects an empty selection. These
+environment variables belong to the tooling, never to the built-in SQL engine.
+The forced run complements internal spill/cleanup/retained-state assertions; a corpus
+pass alone cannot prove that an implementation actually spilled.
+
 Two sibling formats cover concurrency that a one-handle SQL transcript cannot express:
 `# format: concurrency` files model named in-process sessions, while
 `process/*.process.toml` drives real Rust/Go/Node processes over one file. The latter is the planned

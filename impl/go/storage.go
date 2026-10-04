@@ -254,14 +254,14 @@ func (s *tableStore) OverlapNodeCount(b keyBound) int { return s.rows.overlapNod
 func (s *tableStore) ScanUnits(mask []bool) (pages, slabs int, err error) {
 	pages = s.NodeCount()
 	if anySpillableMasked(s.colTypes, mask) {
-		entries, err := s.EntriesInKeyOrder()
-		if err != nil {
-			return 0, 0, err
-		}
-		for _, e := range entries {
-			p, d := recordScanUnits(s.colTypes, e.Key, e.Row, s.cap, mask)
+		err := s.ScanRange(unboundedBound(), func(key []byte, row storedRow) (bool, error) {
+			p, d := recordScanUnits(s.colTypes, key, row, s.cap, mask)
 			pages += p
 			slabs += d
+			return true, nil
+		})
+		if err != nil {
+			return 0, 0, err
 		}
 	}
 	return pages, slabs, nil
@@ -275,14 +275,14 @@ func (s *tableStore) ScanUnits(mask []bool) (pages, slabs int, err error) {
 func (s *tableStore) OverlapScanUnits(b keyBound, mask []bool) (pages, slabs int, err error) {
 	pages = s.OverlapNodeCount(b)
 	if anySpillableMasked(s.colTypes, mask) {
-		entries, err := s.RangeEntries(b)
-		if err != nil {
-			return 0, 0, err
-		}
-		for _, e := range entries {
-			p, d := recordScanUnits(s.colTypes, e.Key, e.Row, s.cap, mask)
+		err := s.ScanRange(b, func(key []byte, row storedRow) (bool, error) {
+			p, d := recordScanUnits(s.colTypes, key, row, s.cap, mask)
 			pages += p
 			slabs += d
+			return true, nil
+		})
+		if err != nil {
+			return 0, 0, err
 		}
 	}
 	return pages, slabs, nil

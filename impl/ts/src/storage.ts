@@ -223,11 +223,12 @@ export class TableStore {
     let pages = this.nodeCount();
     let slabs = 0;
     if (anySpillableMasked(this.colTypes, mask)) {
-      for (const e of this.entriesInKeyOrder()) {
-        const u = recordScanUnits(this.colTypes, e.key, e.row, this.cap, mask);
+      this.scanRange(unboundedBound(), (key, row) => {
+        const u = recordScanUnits(this.colTypes, key, row, this.cap, mask);
         pages += u.pages;
         slabs += u.decompress;
-      }
+        return true;
+      });
     }
     return { pages, slabs };
   }
@@ -241,11 +242,12 @@ export class TableStore {
     let pages = this.overlapNodeCount(b);
     let slabs = 0;
     if (anySpillableMasked(this.colTypes, mask)) {
-      for (const e of this.rangeEntries(b)) {
-        const u = recordScanUnits(this.colTypes, e.key, e.row, this.cap, mask);
+      this.scanRange(b, (key, row) => {
+        const u = recordScanUnits(this.colTypes, key, row, this.cap, mask);
         pages += u.pages;
         slabs += u.decompress;
-      }
+        return true;
+      });
     }
     return { pages, slabs };
   }

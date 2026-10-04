@@ -10,7 +10,7 @@
 // only (no dependency — CLAUDE.md §14).
 
 import { Decimal } from "./decimal.ts";
-import { jsonbIn, jsonbOut } from "./json.ts";
+import { jsonbIn, jsonbOut, type JsonNode } from "./json.ts";
 import type { Row } from "./storage.ts";
 import {
   type Value,
@@ -32,7 +32,16 @@ import {
 export interface SpillSink {
   // writeRun persists one sorted run's bytes and returns a handle to read it back.
   writeRun(bytes: Uint8Array): SpillRun;
+  // Repeatable positional scratch for bounded blocking operators.
+  createScratch?(): SpillScratch;
 }
+export interface SpillScratch {
+  size: number;
+  read(position: number, length: number): Uint8Array;
+  write(position: number, bytes: Uint8Array): void;
+  close(): void;
+}
+
 // SpillRun is one written run; open() streams it back exactly once (the merge opens each run once).
 export interface SpillRun {
   open(): SpillByteReader;
@@ -64,7 +73,9 @@ function valueBytes(v: Value): number {
   const base = 24;
   switch (v.kind) {
     case "text":
-      return base + v.text.length;
+    case "json":
+    case "jsonpath":
+      return base + v.text.length * 2;
     case "bytea":
     case "uuid":
       return base + v.bytes.length;
@@ -72,6 +83,20 @@ function valueBytes(v: Value): number {
       return base + v.dec.toCodec()[2].length * 2;
     case "unfetched":
       return base + (v.ref.comp?.length ?? 0);
+    case "array":
+      return (
+        base +
+        v.dims.length * 16 +
+        v.elements.reduce((sum, element) => sum + valueBytes(element), 0)
+      );
+    case "range":
+      return (
+        base +
+        (v.lower === null ? 0 : valueBytes(v.lower)) +
+        (v.upper === null ? 0 : valueBytes(v.upper))
+      );
+    case "jsonb":
+      return base + jsonNodeBytes(v.node);
     case "composite": {
       let n = base;
       for (const f of v.fields) n += valueBytes(f);
@@ -82,7 +107,28 @@ function valueBytes(v: Value): number {
   }
 }
 
-function rowBytes(row: Row): number {
+function jsonNodeBytes(node: JsonNode): number {
+  switch (node.kind) {
+    case "string":
+      return 24 + node.value.length * 2;
+    case "number":
+      return 24 + node.dec.toCodec()[2].length * 2;
+    case "array":
+      return 24 + node.elements.reduce((sum, child) => sum + jsonNodeBytes(child), 0);
+    case "object":
+      return (
+        24 +
+        node.members.reduce(
+          (sum, member) => sum + member.key.length * 2 + jsonNodeBytes(member.value),
+          0,
+        )
+      );
+    default:
+      return 24;
+  }
+}
+
+export function rowBytes(row: Row): number {
   let n = 8;
   for (const v of row) n += valueBytes(v);
   return n;
@@ -136,6 +182,18 @@ export class Sorter {
     this.runs.push(this.sink!.writeRun(w.result()));
     this.buf = [];
     this.bufBytes = 0;
+  }
+
+  close(): void {
+    for (const run of this.runs) {
+      try {
+        run.open().close();
+      } catch {
+        /* preserve the original failure */
+      }
+    }
+    this.runs = [];
+    this.buf = [];
   }
 
   // finish returns the rows in ORDER BY order. With no spilled run this is the unchanged in-memory
@@ -481,8 +539,10 @@ function writeValue(w: ByteWriter, v: Value): void {
       w.bytesField(new TextEncoder().encode(jsonbOut(v.node)));
       break;
     case "jsonpath":
-      // jsonpath is literal-only (non-storable), so it never rides a spilling sort.
-      throw new Error("a jsonpath value never reaches the spill codec");
+      // A derived/CTE input can carry this non-storable value through a blocking operator.
+      w.u8(22);
+      w.bytesField(new TextEncoder().encode(v.text));
+      break;
     case "unfetched":
       // An untouched large-value reference rides along to the output unread (spill.md §4); spill it
       // opaquely so it round-trips, never resolving it. The same pass-through covers an
@@ -531,11 +591,13 @@ function readValue(r: SpillByteReader): Value {
     case 0:
       return { kind: "null" };
     case 1:
-      return { kind: "int", int: r.u64() };
+      return { kind: "int", int: BigInt.asIntN(64, r.u64()) };
     case 2:
       return { kind: "bool", value: r.byte() !== 0 };
     case 3:
       return { kind: "text", text: new TextDecoder().decode(r.bytes(readU32(r))) };
+    case 22:
+      return { kind: "jsonpath", text: new TextDecoder().decode(r.bytes(readU32(r))) };
     case 4: {
       const neg = r.byte() !== 0;
       const scale = readU32(r);
@@ -549,11 +611,11 @@ function readValue(r: SpillByteReader): Value {
     case 6:
       return { kind: "uuid", bytes: r.bytes(16) };
     case 7:
-      return { kind: "timestamp", micros: r.u64() };
+      return { kind: "timestamp", micros: BigInt.asIntN(64, r.u64()) };
     case 8:
-      return { kind: "timestamptz", micros: r.u64() };
+      return { kind: "timestamptz", micros: BigInt.asIntN(64, r.u64()) };
     case 17:
-      return { kind: "date", days: r.u64() };
+      return { kind: "date", days: BigInt.asIntN(64, r.u64()) };
     case 9:
       // A reloaded deferred value carries SENTINEL handles (the run file cannot carry runtime
       // handles): it rides the sort output UNREAD by contract (spill.md §4), and touching one stays
@@ -638,7 +700,7 @@ function readValue(r: SpillByteReader): Value {
       const ndim = readU32(r);
       const dims: number[] = new Array(ndim);
       const lbounds: number[] = new Array(ndim);
-      let n = 1;
+      let n = ndim === 0 ? 0 : 1;
       for (let d = 0; d < ndim; d++) {
         dims[d] = readU32(r);
         lbounds[d] = readU32(r) | 0;
@@ -664,4 +726,29 @@ function readValue(r: SpillByteReader): Value {
     default:
       throw new Error("bad spill value tag");
   }
+}
+
+// The same internal value codec serves repeatable operator spools.
+export function encodeSpillRow(row: Row): Uint8Array {
+  const writer = new ByteWriter();
+  writeRow(writer, row);
+  return writer.result();
+}
+export function decodeSpillRow(bytes: Uint8Array): Row {
+  let position = 0;
+  const reader: SpillByteReader = {
+    byte: () => bytes[position++]!,
+    bytes: (n) => {
+      const out = bytes.slice(position, position + n);
+      position += n;
+      return out;
+    },
+    u64: () => {
+      const n = new DataView(bytes.buffer, bytes.byteOffset + position, 8).getBigInt64(0, true);
+      position += 8;
+      return n;
+    },
+    close: () => {},
+  };
+  return readRow(reader);
 }

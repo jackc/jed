@@ -372,7 +372,7 @@ func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, plabels, resu
 			offset:   offset,
 			limit:    sp.limit,
 			distinct: sp.distinct,
-			seen:     make(map[string]bool),
+			seen:     newBoundedMap(snap),
 			done:     empty || (sp.limit != nil && *sp.limit == 0),
 		}
 		if !cur.done {
@@ -419,7 +419,7 @@ type streamingCursor struct {
 	offset   int64
 	limit    *int64
 	distinct bool
-	seen     map[string]bool
+	seen     *boundedMap
 	passed   int64 // survivors past the filter+dedup so far (OFFSET runs against this)
 	produced int64 // output rows produced so far (the LIMIT short-circuit runs against this)
 	done     bool  // scan exhausted, LIMIT window full, or empty bound — then nextRow is a no-op
@@ -486,10 +486,16 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 				}
 				projected[i] = v
 			}
-			if key := distinctRowKey(projected); c.seen[key] {
+			key := distinctRowKey(projected)
+			_, had, err := c.seen.get(key)
+			if err != nil {
+				return nil, false, err
+			}
+			if had {
 				continue
-			} else {
-				c.seen[key] = true
+			}
+			if err = c.seen.put(key, nil); err != nil {
+				return nil, false, err
 			}
 			c.passed++
 			if c.passed <= c.offset {
@@ -521,7 +527,12 @@ func (c *streamingCursor) costAccrued() int64 { return c.meter.Accrued }
 
 // close marks the cursor done; the pinned snapshot is owned by eng/scan and reclaimed by the GC, and
 // the watermark deregister (if any) lives on the Rows (streaming.md §5). Idempotent.
-func (c *streamingCursor) close() { c.done = true }
+func (c *streamingCursor) close() {
+	c.done = true
+	if c.seen != nil {
+		c.seen.close()
+	}
+}
 
 // tryBufferedQuery tries to serve stmt as a lazy BUFFERED query (spec/design/streaming.md §4, S4) — the
 // bufferedScanCursor is the lazy BUFFERED pull pipeline behind a Query Rows cursor for a plan with a
@@ -596,10 +607,16 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 			return nil, false, nil
 		}
 		c.idx++
+		if c.em.precharged {
+			return row, true, nil
+		}
 		if err := c.meter.Guard(); err != nil { // enforce the cost ceiling / cancellation per produced row
 			return nil, false, err
 		}
 		c.meter.Charge(costs.RowProduced)
+		if c.em.identity {
+			return row, true, nil
+		}
 		env := &evalEnv{exec: c.eng, params: c.params, outer: nil, rng: c.rng, ctes: cteCtx{}}
 		projected := make([]Value, len(c.plan.projections))
 		for i, p := range c.plan.projections {
@@ -833,7 +850,8 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 	// project EVERY scanned filtered row (the dedup key), drop a value already in `seen` keeping the
 	// first (scan-order) occurrence, then the LIMIT/OFFSET window the DISTINCT rows. The sort is
 	// elided; the projection is charged per scanned filtered row (the §3 asymmetry).
-	seen := make(map[string]bool)
+	seen := newBoundedMap(db)
+	defer seen.close()
 	var passed int64
 	visitRow := func(row storedRow, guarded bool) (bool, error) {
 		if !guarded {
@@ -872,10 +890,16 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 				projected[i] = v
 			}
 			distinctWork += meter.Accrued - before
-			if key := distinctRowKey(projected); seen[key] {
-				return true, nil // a duplicate of an already-emitted/seen value
-			} else {
-				seen[key] = true
+			key := distinctRowKey(projected)
+			_, had, err := seen.get(key)
+			if err != nil {
+				return false, err
+			}
+			if had {
+				return true, nil
+			}
+			if err = seen.put(key, nil); err != nil {
+				return false, err
 			}
 			passed++
 			if passed <= offset {
@@ -1423,6 +1447,7 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 			t = newTopKKeeper(*plan.phys.topK, plan.order, false)
 		} else {
 			s = db.newSorterFor(plan.order)
+			defer s.close()
 		}
 		var survivorCount int64
 		if !empty {

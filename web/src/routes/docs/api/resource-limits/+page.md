@@ -58,6 +58,10 @@ inside their algorithms. A cost ceiling can reject the work before its allocatio
 
 The scalar allowance is **not a whole-query or process-memory cap**. Other scalar kernels,
 input values, decoded rows, join/aggregate/distinct state, result collectors and pending writes
-still need general memory admission. `work_mem` controls sort spilling and `temp_buffers`
-limits retained temporary storage; neither is a total heap limit. Hosts exposing arbitrary
+still need general memory admission. On native file hosts, `work_mem` controls
+sort, hash JOIN, aggregation, and DISTINCT spilling. Their scratch storage preserves
+results and deterministic costs; in-memory and OPFS databases remain resident.
+Upstream window/CTE/index buffers and final scalar results have separate memory
+requirements. `temp_buffers` limits retained temporary storage. These settings are
+not total heap limits. Hosts exposing arbitrary
 untrusted SQL must account for these remaining allocations and host-retained results.

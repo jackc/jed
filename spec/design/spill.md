@@ -21,12 +21,11 @@ The blocking operators are `ORDER BY` (sort), `GROUP BY`/aggregate (hash aggrega
 (hash dedup), and a hash `JOIN`. Each must, in principle, see more than one row at once, so each
 is a candidate to bound by a **work-memory budget** and spill the overflow to disk.
 
-**This slice lands the first and most canonical one: `ORDER BY` via an external merge sort**
-([§4](#4-external-merge-sort-the-order-by-operator)), plus the **streaming scan→sort feed** that
-keeps a single-table `ORDER BY` from materializing its input at all
-([§5](#5-streaming-the-input-the-single-table-feed)). The other three are sequenced as
-follow-ons ([§7](#7-slicing--follow-ons)) because each needs a *different* algorithm (a spilling
-hash table; the join form now has its in-memory operator and still needs grace-hash partitioning).
+`ORDER BY` uses an external merge sort ([§4](#4-external-merge-sort-the-order-by-operator))
+and a streaming scan feed ([§5](#5-streaming-the-input-the-single-table-feed)). Hash JOIN,
+aggregation and DISTINCT use bounded repeatable row spools and ordered disk hash
+partitions ([§7](#7-blocking-hash-operators-ordered-partition-replay)). Input spools,
+hash state, aggregate collections, and output order are separate bounded owners.
 
 The blocking sort also has a results-identical **bounded top-k** rule for `ORDER BY ... LIMIT`
 ([§4.1](#41-bounded-top-k-before-spill)): finite windows that fit the budget avoid creating runs.
@@ -81,7 +80,11 @@ merge sort**:
    buffer by the order keys and **spill** it as one **sorted run** to a temporary file, then
    clear the buffer. Repeat. Each run is internally sorted; runs are produced in input order
    (run 0 is the first chunk of input, run 1 the next, …).
-3. At `finish`, if no run ever spilled, just stable-sort the buffer in memory and return it (the
+3. Compact adjacent runs at binary size levels as they are produced. Equal-level runs
+   merge with a two-source reader, preserving their original input order. At most one
+   run per cardinality bit remains (64 in native cores; 53 for TS exact numbers),
+   bounding both run metadata and final open descriptors independently of row count.
+4. At `finish`, if no run ever spilled, just stable-sort the buffer in memory and return it (the
    unchanged fast path — the dominant RAM-sized case). Otherwise stable-sort the final partial
    buffer and **k-way merge** all runs + that buffer with a min-heap, emitting rows in sorted
    order without ever holding more than one row per run plus the heap.
@@ -140,10 +143,9 @@ its touched columns resolved, the `WHERE` applied, and a survivor pushed into th
 spills as it fills. The full input is **never** resident; peak memory is one run plus the merge
 heap.
 
-For a **join / multi-table** `ORDER BY`, the existing materialize → nested-loop → `WHERE` pipeline
-runs unchanged (the join itself materializes its base tables — bounding *that* is the deferred hash
-JOIN item, [§7](#7-slicing--follow-ons)), then the filtered rows drain into the same `Sorter`, which
-still bounds the sort. Either way `finish` yields the sorted rows, which are then windowed
+For a **join / multi-table** `ORDER BY`, the bounded hash pipeline in §7 spools
+intermediate rows before sorting; remaining materialized producers retain their source
+contract and transfer their rows into downstream spill storage. Either way `finish` yields the sorted rows, which are then windowed
 (`LIMIT`/`OFFSET`) and projected by streaming the merge — the output is not re-materialized either
 (the `OFFSET` clamp uses the sorter's known total row count, not a materialized length).
 
@@ -178,7 +180,73 @@ This is the load-bearing simplification, identical in spirit to the buffer pool'
   position) tie-break, never by hashmap iteration or spill-file path; the spill I/O is unmetered,
   so timing never enters cost (CLAUDE.md §8/§10).
 
-## 7. Slicing & follow-ons
+## 7. Blocking hash operators: ordered partition replay
+
+The spill implementation must bound **all operator-owned input and state**, not merely
+the hash directory. A build table backed by a resident copy of every source row is not
+a bounded join. The same rule applies to post-WHERE rows, grouping keys, dedup keys,
+and intermediate join output. A repeatable row spool keeps a budgeted resident prefix,
+then writes source-order rows to private scratch storage. Reading or replaying scratch
+does not charge storage/page/row costs again.
+
+### JOIN
+
+Partition the build side by its canonical hash, retaining build order within each
+partition. Probe in the selected plan's original probe order. A fitting partition may
+use a resident hash table; an oversized or skewed partition must be processed with a
+bounded record-at-a-time fallback, never loaded wholesale. Full hash collisions still
+compare the complete canonical key. NULL keys never match. Candidate enumeration is
+a stream, not a vector proportional to the number of duplicate matches.
+
+This is an ordered grace-hash variant: replay the appropriate build partition for
+each original-order probe instead of emitting partition-order join results. It trades
+additional unmetered scratch I/O for preserving the established probe/bucket sequence,
+residual-ON evaluation, outer-join null extension, and LIMIT behavior. Repartitioning
+must terminate even for one hot key; bounded replay is the terminal skew fallback.
+
+### GROUP BY and DISTINCT
+
+Aggregation processes grouping sets, input rows, and aggregate operands in their
+existing order. A disk-backed keyed state store evicts accumulator state rather than
+reordering the fold by hash partition. This is necessary because decimal work, integer
+overflow, FILTER short-circuiting, and failures in other groups are observable. A
+group retains its first-occurrence ordinal; finalization follows that ordinal and
+grouping-set order. Empty grouping sets retain their pre-created grand-total group.
+
+DISTINCT uses the same partitioned exact-key lookup discipline, retaining the first
+occurrence. Aggregate DISTINCT includes the group and aggregate ordinal in the key;
+duplicates and NULLs skip the fold while retaining the existing operand/accumulate
+charges. Disk hash equality must use value-canonical keys, including decimal scale,
+floating zero/NaN, NULL, and recursive container equality.
+
+Finite accumulator state and growing accumulator collections are different owners.
+Spilling a group directory does not bound a single group's ordered-set, hypothetical,
+JSON, or string/array state. Such collections need their own replayable scratch or
+external ordering. A final scalar value and values retained by a materializing host
+API remain subject to the separate admission work in [memory.md](memory.md); `work_mem`
+is not a whole-query or process-RSS ceiling.
+
+### Resource and correctness gates
+
+- Every spool, partition, and output sort has a bounded resident buffer. Metadata and
+  open descriptors must not grow once per row or run: use a fixed partition directory
+  and bounded merge fan-in. The working bound allows a current record and fixed I/O
+  buffers in addition to `work_mem`; one large value is not split by this threshold.
+- Scratch uses the existing host target and private exclusive creation. All normal,
+  early-LIMIT, evaluator-error, cost-abort, and I/O-error paths release scratch.
+  Creation/read/write failure is `58030`, never permission to fall back to resident data.
+- Scan, expression evaluation, build/probe, and fold work is charged exactly once at its
+  original logical position. Scratch reads, writes, key lookup, and state eviction add
+  no new cost units. Per-node EXPLAIN actual costs remain unchanged.
+- The same SQL corpus runs in ordinary and forced-spill file modes, asserting rows,
+  types, errors, and existing costs. Internal tests additionally prove actual spill,
+  peak retained state, skew/collision handling, and cleanup; equal rows alone are not
+  evidence of a bounded operator.
+- Larger-than-work-memory benchmarks stream their answers and record checksums,
+  elapsed time, budget, input size, and process peak RSS. They do not describe a small
+  forced-spill fixture as evidence that a dataset exceeds physical machine RAM.
+
+## 8. Slicing & follow-ons
 
 Sequenced so the canonical operator lands first on a frozen budget seam:
 
@@ -190,20 +258,19 @@ Sequenced so the canonical operator lands first on a frozen budget seam:
   timing, LIMIT 0, overflow, and the excluded blocking shapes are corpus-pinned; per-core tests assert
   both the no-run and fallback-to-run paths.
 
-Deferred follow-ons (none foreclosed; each its own slice with the same invariance contract):
+- **Hash JOIN, aggregate and DISTINCT spill ✅.** Ordered partition replay (§7),
+  bounded input/intermediate/output spools, external ordering and finite descriptor
+  counts. Hash probes retain full-key collision checks and original candidate order.
+  Group state preserves global fold order; aggregate DISTINCT membership spills too.
+  Ordered-set and hypothetical collections use scratch and bounded replay/sorting;
+  JSON aggregates assemble their final scalar after replay. Direct scans and their
+  cost prepasses stream. The shared forced-spill corpus joins `rake test`/`rake ci`;
+  `rake bench:spill` measures wide inputs larger than `work_mem`.
 
-- **Spilling hash aggregate (`GROUP BY` / aggregate).** Bound the group hash table by `work_mem`,
-  spilling partitions when exceeded (a grace-style partitioned aggregation that preserves the
-  first-occurrence group order the in-memory path emits). The aggregate path's group rows are
-  already *reduced* data (one row per group), so today's in-memory sort of the group rows stays —
-  bounding the *group table* is this follow-on.
-- **Spilling `DISTINCT`.** Same shape: bound the dedup set, spill partitions, preserve
-  first-occurrence order. (A sort-based dedup would change that order, so it must be a partitioned
-  hash, not the merge sort above.)
-- **Grace-hash `JOIN` spill.** The deterministic in-memory hash-join operator exists; bound its
-  right/build side by `work_mem` with grace-hash partitioning while preserving its left-probe/right-
-  bucket row sequence and cost. This is the item that bounds a *join's* input materialization
-  ([§5](#5-streaming-the-input-the-single-table-feed)).
+Remaining allocation owners are explicit: upstream materialized CTE/derived/SRF/index
+producers and window partitions, final scalar values, materialized host results, and
+pending writes. Their admission belongs to [memory.md](memory.md); operator spilling
+does not imply that arbitrary SQL has a whole-query memory bound.
 
 A later refinement, also not foreclosed: routing the spill files through a host **storage seam**
 abstraction (storage.md §2) so the browser/OPFS host spills too, rather than the direct stdlib

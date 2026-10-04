@@ -26,6 +26,67 @@ fn run(db: &mut Session, sql: &str) -> (Vec<Vec<Value>>, i64) {
     }
 }
 
+#[test]
+fn blocking_spill_cursor_cleanup_and_failure_paths() {
+    let dir = tmp("blocking_spill_scratch");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = tmp("blocking_spill_cleanup.jed");
+    let _ = std::fs::remove_file(&path);
+    let db = Database::create(CreateOptions {
+        path: Some(path.clone()),
+        skip_fsync: true,
+        ..Default::default()
+    })
+    .unwrap();
+    db.set_spill_dir_for_test(dir.clone());
+    let mut session = db.session(SessionOptions::default());
+    seed(&mut session, 96);
+    session.set_work_mem(64);
+    let sql = "SELECT k, sum(id), count(DISTINCT s) FROM t GROUP BY k ORDER BY k";
+    let mut cursor = session.query(sql, &[]).unwrap();
+    assert!(cursor.next().is_some());
+    assert!(
+        std::fs::read_dir(&dir).unwrap().count() > 0,
+        "the lazy output owns actual scratch"
+    );
+    cursor.close();
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    drop(cursor);
+    let fail = session
+        .query_outcome("SELECT k, sum(100 / (id - 50)) FROM t GROUP BY k", &[])
+        .unwrap_err();
+    assert_eq!(fail.code(), "22012");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    session.set_max_cost(80);
+    assert!(session.query_outcome(sql, &[]).is_err());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    session.set_max_cost(0);
+    // Host ceilings pin the exact failure point, including bucket-comparison charges before ON.
+    for ceiling in [1, 2, 10, 30, 90, 150, 300] {
+        let mut outcomes = Vec::new();
+        for work_mem in [0, 64] {
+            session.set_work_mem(work_mem);
+            session.set_max_cost(ceiling);
+            let mut cursor = session.query(sql, &[]).unwrap();
+            let rows: Vec<_> = cursor.by_ref().collect();
+            let cost = cursor.cost();
+            let error = cursor.error().err().map(|e| e.code().to_string());
+            cursor.close();
+            outcomes.push((rows, cost, error));
+        }
+        assert_eq!(
+            outcomes[0], outcomes[1],
+            "work_mem changed ceiling {ceiling}"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+    drop(session);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// Populate `t(id i32 PK, k i32, s text)` with `n` rows whose `k` is deliberately unsorted and
 /// has many duplicates + a repeating NULL (to exercise the stable-sort tie-break and NULL ordering),
 /// and a variable-length `s` (so a spilled run carries variable-width values).

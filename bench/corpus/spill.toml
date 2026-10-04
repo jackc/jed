@@ -1,0 +1,12 @@
+# Standalone larger-than-work-memory workload (scripts/spill_bench.rb).
+# One persisted input; setup and every measured query run in separate processes.
+rows = 32768
+payload_bytes = 2048
+work_mem = 1048576
+cache_bytes = 1048576
+
+[queries]
+hash_join = "SELECT a.k, b.s FROM wide a JOIN wide b ON a.k = b.k ORDER BY a.k"
+aggregate = "SELECT s, count(*), sum(v) FROM wide GROUP BY s ORDER BY s"
+distinct = "SELECT DISTINCT s FROM wide ORDER BY s"
+ordered_set = "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY s) FROM wide"

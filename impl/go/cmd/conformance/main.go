@@ -50,6 +50,19 @@ func run() int {
 		return nil
 	})
 	sort.Strings(files)
+	if filter := os.Getenv("JED_CONFORMANCE_FILTER"); filter != "" {
+		var selected []string
+		for _, path := range files {
+			if strings.Contains(path, filter) {
+				selected = append(selected, path)
+			}
+		}
+		files = selected
+		if len(files) == 0 {
+			fmt.Fprintln(os.Stderr, "JED_CONFORMANCE_FILTER matched no tests")
+			return 1
+		}
+	}
 
 	supported := map[string]bool{}
 	for _, c := range jed.SupportedCapabilities {
@@ -904,6 +917,13 @@ func runFile(text string, disk bool) error {
 			}
 		}
 		// This record consumes any pending assertions (so they never leak forward).
+		if bytes := os.Getenv("JED_CONFORMANCE_WORK_MEM"); bytes != "" {
+			budget, err := strconv.Atoi(bytes)
+			if err != nil || budget < 0 {
+				return fmt.Errorf("JED_CONFORMANCE_WORK_MEM must be nonnegative bytes")
+			}
+			sess.SetWorkMem(budget)
+		}
 		expectedCost := pendingCost
 		expectedNames := pendingNames
 		expectedTypes := pendingTypes

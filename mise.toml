@@ -108,6 +108,14 @@ run = "bundle exec rake lint"
 description = "Create/verify the oracle database declared in the profile"
 run = "bundle exec rake oracle:setup"
 
+[tasks."conformance:spill"]
+description = "Shared corpus on all three cores with forced file spill"
+run = "bundle exec rake conformance:spill"
+
+[tasks."bench:spill"]
+description = "Larger-than-work-memory JOIN, aggregate, and DISTINCT benchmark"
+run = "bundle exec rake bench:spill"
+
 [tasks."oracle:status"]
 description = "Print the declared oracle profile beside the live server's values"
 run = "bundle exec rake oracle:status"

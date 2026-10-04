@@ -1,0 +1,270 @@
+# Shared semantic workload for ordinary and forced-spill file execution (spill.md §7).
+# A tiny host work_mem exercises skewed JOIN buckets, many groups, aggregate DISTINCT,
+# grouping sets, canonical decimal/NULL equality, and stable downstream ordering.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.aggregates, query.group_by, query.aggregate_distinct, query.aggregate_filter, query.having, query.grouping_sets, query.order_by_grouping, query.distinct, query.join_inner, query.join_left, query.order_by, query.order_by_keys, query.limit, query.hash_join, types.i32, types.decimal, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE spill_left (id integer PRIMARY KEY, k integer, n decimal, s text)
+
+statement ok
+CREATE TABLE spill_right (id integer PRIMARY KEY, k integer, v integer)
+
+statement ok
+INSERT INTO spill_left VALUES (1, 2, 1.00, 'é'), (2, 1, 1.0, 'a'), (3, 2, 2.00, 'é'), (4, NULL, NULL, NULL), (5, 1, 2.0, 'a'), (6, 3, 3.00, 'z'), (7, 2, 1.000, 'é'), (8, 4, 4.0, 'b'), (9, 1, NULL, 'a'), (10, NULL, 1.0, NULL), (11, 5, 5.0, 'q'), (12, 6, 6.0, 'p')
+
+statement ok
+INSERT INTO spill_right VALUES (1, 2, 30), (2, 2, 20), (3, 2, 10), (4, 1, 40), (5, 1, 50), (6, NULL, 60), (7, 7, 70), (8, 3, 80), (9, 4, 90), (10, 5, 100), (11, 6, 110), (12, 2, 120)
+
+# Streaming DISTINCT still stops at its ordered window; spill cannot turn it into
+# an eager full scan. The seen set has its own bounded backing in this lane.
+# cost: 3
+query I nosort
+SELECT DISTINCT id FROM spill_left ORDER BY id LIMIT 1
+----
+1
+
+# cost: 603
+query III nosort
+SELECT l.id, r.id, r.v FROM spill_left l JOIN spill_right r ON l.k = r.k AND r.v > l.id ORDER BY l.id, r.id LIMIT 14 OFFSET 2
+----
+1
+3
+10
+1
+12
+120
+2
+4
+40
+2
+5
+50
+3
+1
+30
+3
+2
+20
+3
+3
+10
+3
+12
+120
+5
+4
+40
+5
+5
+50
+6
+8
+80
+7
+1
+30
+7
+2
+20
+7
+3
+10
+
+# cost: 476
+query II nosort
+SELECT l.id, r.id FROM spill_left l LEFT JOIN spill_right r ON l.k = r.k AND r.v < 40 ORDER BY l.id, r.id
+----
+1
+1
+1
+2
+1
+3
+2
+NULL
+3
+1
+3
+2
+3
+3
+4
+NULL
+5
+NULL
+6
+NULL
+7
+1
+7
+2
+7
+3
+8
+NULL
+9
+NULL
+10
+NULL
+11
+NULL
+12
+NULL
+
+# cost: 68
+query IIIII nosort
+SELECT k, count(*), count(DISTINCT n), sum(id), sum(DISTINCT id) FROM spill_left GROUP BY k ORDER BY k NULLS FIRST
+----
+NULL
+2
+1
+14
+14
+1
+3
+2
+16
+16
+2
+3
+2
+11
+11
+3
+1
+1
+6
+6
+4
+1
+1
+8
+8
+5
+1
+1
+11
+11
+6
+1
+1
+12
+12
+
+# cost: 32
+query ID nosort
+SELECT k, avg(n) FROM spill_left GROUP BY k ORDER BY k
+----
+1
+1.5000000000000000
+2
+1.3333333333333333
+3
+3.0000000000000000
+4
+4.0000000000000000
+5
+5.0000000000000000
+6
+6.0000000000000000
+NULL
+1.00000000000000000000
+
+# cost: 361
+query III nosort
+SELECT l.k, count(*), sum(r.v) FROM spill_left l JOIN spill_right r ON l.k = r.k GROUP BY l.k ORDER BY l.k
+----
+1
+6
+270
+2
+12
+540
+3
+1
+80
+4
+1
+90
+5
+1
+100
+6
+1
+110
+
+# cost: 18
+query T nosort
+SELECT DISTINCT s FROM spill_left ORDER BY s NULLS FIRST LIMIT 5 OFFSET 1
+----
+a
+b
+p
+q
+z
+
+# cost: 20
+query D nosort
+SELECT DISTINCT n FROM spill_left ORDER BY n NULLS FIRST
+----
+NULL
+1.00
+2.00
+3.00
+4.0
+5.0
+6.0
+
+# cost: 45
+query III nosort
+SELECT k, count(*), GROUPING(k) FROM spill_left GROUP BY GROUPING SETS ((k), ()) ORDER BY GROUPING(k), k NULLS FIRST
+----
+NULL
+2
+0
+1
+3
+0
+2
+3
+0
+3
+1
+0
+4
+1
+0
+5
+1
+0
+6
+1
+0
+NULL
+12
+1
+
+# cost: 56
+query II nosort
+SELECT k, count(DISTINCT n) FILTER (WHERE id > 3) FROM spill_left GROUP BY k HAVING count(*) > 1 ORDER BY k NULLS FIRST
+----
+NULL
+1
+1
+1
+2
+1
+
+# cost: 2
+query III nosort
+SELECT count(*), count(DISTINCT n), sum(id) FROM spill_left WHERE id < 0
+----
+0
+0
+NULL
+
+statement error 22012
+SELECT DISTINCT 1 / (id - 12) FROM spill_left
+
+statement error 22012
+SELECT k, sum(1 / (id - 12)) FROM spill_left GROUP BY k

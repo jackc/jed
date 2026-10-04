@@ -51,15 +51,35 @@ fn value_bytes(v: &Value) -> usize {
     // A `Value` enum slot is ~24 bytes; add the heap payload for the variable-width variants.
     const BASE: usize = 24;
     BASE + match v {
-        Value::Text(s) => s.len(),
+        Value::Text(s) | Value::Json(s) | Value::JsonPath(s) => s.len(),
         Value::Bytea(b) => b.len(),
         Value::Decimal(d) => d.to_codec().2.len() * 2,
         Value::Unfetched(Unfetched::InlineComp { comp, .. }) => comp.len(),
+        Value::Unfetched(Unfetched::Inline { block, .. }) => block.len(),
+        Value::Composite(fields) => fields.iter().map(value_bytes).sum(),
+        Value::Array(a) => a.elements.iter().map(value_bytes).sum(),
+        Value::Range(r) => {
+            r.lower.as_deref().map_or(0, value_bytes) + r.upper.as_deref().map_or(0, value_bytes)
+        }
+        Value::Jsonb(node) => json_bytes(node),
         _ => 0,
     }
 }
 
-fn row_bytes(row: &Row) -> usize {
+fn json_bytes(node: &json::JsonNode) -> usize {
+    24 + match node {
+        json::JsonNode::String(s) => s.len(),
+        json::JsonNode::Number(d) => d.to_codec().2.len() * 2,
+        json::JsonNode::Array(values) => values.iter().map(json_bytes).sum(),
+        json::JsonNode::Object(members) => members
+            .iter()
+            .map(|(key, v)| key.len() + json_bytes(v))
+            .sum(),
+        _ => 0,
+    }
+}
+
+pub(crate) fn row_bytes(row: &Row) -> usize {
     8 + row.iter().map(value_bytes).sum::<usize>()
 }
 
@@ -77,6 +97,7 @@ pub(crate) struct Sorter {
     buf_bytes: usize,
     /// Spilled sorted runs, in input order (run 0 = the first chunk of input — spill.md §6).
     runs: Vec<PathBuf>,
+    run_levels: Vec<usize>,
     /// The total rows pushed (the count `LIMIT`/`OFFSET` windows against — spill.md §5).
     total: usize,
 }
@@ -92,6 +113,7 @@ impl Sorter {
             buf: Vec::new(),
             buf_bytes: 0,
             runs: Vec::new(),
+            run_levels: Vec::new(),
             total: 0,
         }
     }
@@ -157,8 +179,34 @@ impl Sorter {
             return Err(io_error(e));
         }
         self.runs.push(path);
+        self.run_levels.push(0);
         self.buf.clear();
         self.buf_bytes = 0;
+        // Binary compaction merges adjacent equally sized run generations. At most one run per
+        // machine-word bit survives: descriptor and run metadata counts never scale with rows.
+        while self.run_levels.len() >= 2 {
+            let n = self.run_levels.len();
+            if self.run_levels[n - 1] != self.run_levels[n - 2] {
+                break;
+            }
+            let level = self.run_levels[n - 1] + 1;
+            let sources = vec![
+                Source::open_file(self.runs[n - 2].clone())?,
+                Source::open_file(self.runs[n - 1].clone())?,
+            ];
+            let count = sources
+                .iter()
+                .map(|s| match s {
+                    Source::File { remaining, .. } => *remaining,
+                    _ => 0,
+                })
+                .sum();
+            let merged = merge_pair_to_file(sources, count, self.keys.clone(), dir)?;
+            self.runs.truncate(n - 2);
+            self.run_levels.truncate(n - 2);
+            self.runs.push(merged);
+            self.run_levels.push(level);
+        }
         Ok(())
     }
 
@@ -176,9 +224,8 @@ impl Sorter {
         // Sources: each spilled run, then the final in-memory buffer last (it holds the latest input
         // positions, so it is the highest source index — the tie-break that reproduces input order).
         let mut sources: Vec<Source> = Vec::with_capacity(self.runs.len() + 1);
-        let runs = std::mem::take(&mut self.runs);
-        for path in runs {
-            sources.push(Source::open_file(path)?);
+        for path in &self.runs {
+            sources.push(Source::open_file(path.clone())?);
         }
         sources.push(Source::Mem(std::mem::take(&mut self.buf).into_iter()));
         let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(sources.len());
@@ -191,19 +238,54 @@ impl Sorter {
                 });
             }
         }
+        self.runs.clear();
         Ok(SortedRows::Merge(Merger { sources, heap }))
     }
+}
+
+fn merge_pair_to_file(
+    mut sources: Vec<Source>,
+    count: u64,
+    keys: Arc<Vec<SortKey>>,
+    dir: &std::path::Path,
+) -> Result<PathBuf> {
+    let mut heap = BinaryHeap::new();
+    for (source, src) in sources.iter_mut().enumerate() {
+        if let Some(row) = src.next()? {
+            heap.push(HeapItem {
+                row,
+                source,
+                keys: keys.clone(),
+            });
+        }
+    }
+    let mut merger = Merger { sources, heap };
+    let (path, file) = create_spill_file(dir)?;
+    let mut writer = BufWriter::new(file);
+    let result = (|| -> Result<()> {
+        write_u64(&mut writer, count).map_err(io_error)?;
+        while let Some(row) = merger.next()? {
+            write_row(&mut writer, &row).map_err(io_error)?;
+        }
+        writer.flush().map_err(io_error)
+    })();
+    drop(writer);
+    if let Err(err) = result {
+        let _ = fs::remove_file(&path);
+        return Err(err);
+    }
+    Ok(path)
 }
 
 /// Securely create one run in the host scratch directory. The OS temp directory can be shared by
 /// mutually untrusted users, so creation must be exclusive and the initial Unix mode private; a
 /// predictable pid/counter name is then only an identifier, never an overwrite primitive.
-fn create_spill_file(dir: &std::path::Path) -> Result<(PathBuf, File)> {
+pub(crate) fn create_spill_file(dir: &std::path::Path) -> Result<(PathBuf, File)> {
     loop {
         let seq = SPILL_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
         let path = dir.join(format!("jed-spill-{}-{}.tmp", std::process::id(), seq));
         let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
+        opts.read(true).write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -241,11 +323,17 @@ impl SortedRows {
 /// buffer.
 enum Source {
     File {
-        reader: BufReader<File>,
+        reader: Option<BufReader<File>>,
         path: PathBuf,
         remaining: u64,
     },
     Mem(std::vec::IntoIter<Row>),
+}
+
+impl Drop for Source {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
 }
 
 impl Source {
@@ -254,7 +342,7 @@ impl Source {
         let mut reader = BufReader::new(file);
         let remaining = read_u64(&mut reader).map_err(io_error)?;
         Ok(Source::File {
-            reader,
+            reader: Some(reader),
             path,
             remaining,
         })
@@ -270,18 +358,23 @@ impl Source {
             } => {
                 if *remaining == 0 {
                     // Exhausted — delete the run file eagerly so a long merge never holds them all.
+                    drop(reader.take());
                     let _ = fs::remove_file(&*path);
                     return Ok(None);
                 }
                 *remaining -= 1;
-                Ok(Some(read_row(reader).map_err(io_error)?))
+                Ok(Some(
+                    read_row(reader.as_mut().expect("a live run owns a reader"))
+                        .map_err(io_error)?,
+                ))
             }
         }
     }
 
     /// Best-effort cleanup of an undrained run file (a `LIMIT` may stop the merge early).
-    fn cleanup(&self) {
-        if let Source::File { path, .. } = self {
+    fn cleanup(&mut self) {
+        if let Source::File { path, reader, .. } = self {
+            drop(reader.take());
             let _ = fs::remove_file(path);
         }
     }
@@ -314,7 +407,7 @@ impl Drop for Merger {
     fn drop(&mut self) {
         // A `LIMIT` (or an error) can stop the merge before every run is drained — delete any run
         // files still on disk so the spill never leaks temp files (spill.md §4).
-        for s in &self.sources {
+        for s in &mut self.sources {
             s.cleanup();
         }
     }
@@ -370,7 +463,7 @@ fn write_bytes<W: Write>(w: &mut W, b: &[u8]) -> io::Result<()> {
     w.write_all(b)
 }
 
-fn write_row<W: Write>(w: &mut W, row: &Row) -> io::Result<()> {
+pub(crate) fn write_row<W: Write>(w: &mut W, row: &Row) -> io::Result<()> {
     write_u32(w, row.len() as u32)?;
     for v in row {
         write_value(w, v)?;
@@ -509,8 +602,11 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
             w.write_all(&[20])?;
             write_bytes(w, json::jsonb_out(n).as_bytes())
         }
-        // jsonpath is literal-only (non-storable), so it never rides a spilling sort.
-        Value::JsonPath(_) => unreachable!("a jsonpath value never reaches the spill codec"),
+        // Non-storable values can still be carried by derived/CTE relation spools.
+        Value::JsonPath(source) => {
+            w.write_all(&[22])?;
+            write_bytes(w, source.as_bytes())
+        }
         // An untouched large-value reference rides along to the output unread (spill.md §4); spill
         // it opaquely (the pointer/inline block) so it round-trips, never resolving it. The same
         // pass-through covers an inline-deferred value (lazy-record.md §5a) — tag 21: write just its
@@ -574,7 +670,7 @@ fn read_bytes<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     Ok(b)
 }
 
-fn read_row<R: Read>(r: &mut R) -> io::Result<Row> {
+pub(crate) fn read_row<R: Read>(r: &mut R) -> io::Result<Row> {
     let ncols = read_u32(r)? as usize;
     let mut row = Vec::with_capacity(ncols);
     for _ in 0..ncols {
@@ -593,6 +689,9 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
             String::from_utf8(read_bytes(r)?)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad utf-8 in spill"))?,
         ),
+        22 => Value::JsonPath(String::from_utf8(read_bytes(r)?).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "bad jsonpath utf-8 in spill")
+        })?),
         4 => {
             let neg = read_u8(r)? != 0;
             let scale = read_u32(r)?;
@@ -677,7 +776,7 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
             let ndim = read_u32(r)? as usize;
             let mut dims = Vec::with_capacity(ndim);
             let mut lbounds = Vec::with_capacity(ndim);
-            let mut n = 1usize;
+            let mut n = usize::from(ndim != 0);
             for _ in 0..ndim {
                 let len = read_u32(r)? as usize;
                 let lb = read_u32(r)? as i32;
@@ -739,4 +838,46 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
             ));
         }
     })
+}
+
+#[cfg(test)]
+mod bounded_run_tests {
+    use super::*;
+
+    #[test]
+    fn retained_inline_slice_accounts_for_its_entire_backing_block() {
+        let block = Arc::new(vec![0u8; 65536]);
+        let value = Value::Unfetched(Unfetched::Inline {
+            block,
+            off: 10,
+            len: 1,
+            ty: crate::value::TypeRef::sentinel(),
+        });
+        assert!(row_bytes(&vec![value]) >= 65536);
+    }
+
+    #[test]
+    fn spilling_sort_bounds_run_metadata_and_merge_descriptors() {
+        let mut sort = Sorter::new(vec![(0, false, false, None)], 1, Some(std::env::temp_dir()));
+        for i in 0..2048 {
+            sort.push(vec![Value::Int(i % 7), Value::Int(i)]).unwrap();
+            assert!(sort.runs.len() <= usize::BITS as usize);
+            assert!(sort.buf.is_empty());
+        }
+        let mut rows = sort.finish().unwrap();
+        if let SortedRows::Merge(merge) = &rows {
+            assert!(merge.sources.len() <= usize::BITS as usize + 1);
+        }
+        let mut previous = (-1i64, -1i64);
+        let mut count = 0;
+        while let Some(row) = rows.next().unwrap() {
+            let (Value::Int(key), Value::Int(position)) = (&row[0], &row[1]) else {
+                unreachable!()
+            };
+            assert!(*key > previous.0 || (*key == previous.0 && *position > previous.1));
+            previous = (*key, *position);
+            count += 1;
+        }
+        assert_eq!(count, 2048);
+    }
 }

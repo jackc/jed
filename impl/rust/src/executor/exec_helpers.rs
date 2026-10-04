@@ -208,7 +208,7 @@ pub(crate) struct StreamingScan {
     pub(crate) offset: i64,
     pub(crate) limit: Option<i64>,
     pub(crate) distinct: bool,
-    pub(crate) seen: std::collections::HashSet<Vec<Value>>,
+    pub(crate) seen: crate::spill_buffer::SeenRows,
     /// Survivors past the filter+dedup so far (the `OFFSET` runs against this), like
     /// `exec_streaming_scan`'s `passed`.
     pub(crate) passed: i64,
@@ -230,6 +230,7 @@ impl crate::cursor::RowStream for StreamingScan {
             && self.produced >= l
         {
             self.done = true;
+            self.seen.clear();
             return Ok(None);
         }
         let env = EvalEnv {
@@ -245,6 +246,7 @@ impl crate::cursor::RowStream for StreamingScan {
                 Some(row) => row,
                 None => {
                     self.done = true;
+                    self.seen.clear();
                     return Ok(None);
                 }
             };
@@ -270,7 +272,7 @@ impl crate::cursor::RowStream for StreamingScan {
                 for p in &self.plan.projections {
                     projected.push(p.eval(&row, &env, &mut self.meter)?);
                 }
-                if !self.seen.insert(projected.clone()) {
+                if !self.seen.insert(projected.clone())? {
                     continue;
                 }
                 self.passed += 1;
@@ -303,6 +305,7 @@ impl crate::cursor::RowStream for StreamingScan {
         // The pinned snapshot is owned by `self.engine` / `self.scan` and released on `Drop`; mark
         // done so any further `next_row` is a no-op (streaming.md §5, idempotent).
         self.done = true;
+        self.seen.clear();
     }
 }
 
@@ -332,6 +335,12 @@ pub(crate) struct BufferedScan {
 
 /// The lazy emission state of a [`BufferedScan`] (spec/design/streaming.md §4).
 pub(crate) enum BufState {
+    Spool {
+        rows: crate::spill_buffer::SpoolReader,
+        remaining: usize,
+        project: bool,
+        charged: bool,
+    },
     /// The blocking part has not run yet — the first `next_row` runs it (streaming.md §4).
     Pending,
     /// The general blocking buffer, windowed to `[idx, end)`. Each emission charges `row_produced`;
@@ -387,6 +396,17 @@ impl crate::cursor::RowStream for BufferedScan {
                 &mut self.meter,
             )?;
             self.state = match emitter {
+                Emitter::Spool {
+                    rows,
+                    remaining,
+                    mode,
+                    charged,
+                } => BufState::Spool {
+                    rows,
+                    remaining,
+                    project: matches!(mode, EmitMode::Project),
+                    charged,
+                },
                 Emitter::Buffer {
                     rows,
                     start,
@@ -418,6 +438,40 @@ impl crate::cursor::RowStream for BufferedScan {
             };
         }
         match &mut self.state {
+            BufState::Spool {
+                rows,
+                remaining,
+                project,
+                charged,
+            } => {
+                if *remaining == 0 {
+                    self.state = BufState::Done;
+                    return Ok(None);
+                }
+                let row = rows.next()?.expect("spool cardinality");
+                *remaining -= 1;
+                if !*charged {
+                    self.meter.guard()?;
+                    self.meter.charge(COSTS.row_produced);
+                }
+                if !*project {
+                    return Ok(Some(row));
+                }
+                let env = EvalEnv {
+                    exec: &self.engine,
+                    params: &self.params,
+                    outer: &[],
+                    rng: &self.rng,
+                    ctes: CteCtx::empty(),
+                };
+                Ok(Some(
+                    self.plan
+                        .projections
+                        .iter()
+                        .map(|p| p.eval(&row, &env, &mut self.meter))
+                        .collect::<Result<Row>>()?,
+                ))
+            }
             BufState::Done => Ok(None),
             BufState::Pending => unreachable!("the blocking part ran above"),
             // Already projected + charged — hand the next row out (no further cost).

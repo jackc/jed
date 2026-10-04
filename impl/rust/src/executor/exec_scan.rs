@@ -21,7 +21,7 @@ fn process_streaming_row(
     meter: &mut Meter,
     offset: i64,
     passed: &mut i64,
-    seen: &mut std::collections::HashSet<Vec<Value>>,
+    seen: &mut crate::spill_buffer::SeenRows,
     out: &mut Vec<Vec<Value>>,
     actual: &mut StreamingActual,
     guarded: bool,
@@ -54,7 +54,7 @@ fn process_streaming_row(
             projected.push(p.eval(row, env, meter)?);
         }
         actual.distinct += meter.accrued - before;
-        if !seen.insert(projected.clone()) {
+        if !seen.insert(projected.clone())? {
             return Ok(true);
         }
         *passed += 1;
@@ -103,7 +103,7 @@ fn scan_stream_table_interval(
     meter: &mut Meter,
     offset: i64,
     passed: &mut i64,
-    seen: &mut std::collections::HashSet<Vec<Value>>,
+    seen: &mut crate::spill_buffer::SeenRows,
     out: &mut Vec<Vec<Value>>,
     actual: &mut StreamingActual,
     can_pull: bool,
@@ -144,7 +144,8 @@ impl Engine {
         let offset = plan.offset.unwrap_or(0);
         let mut out: Vec<Vec<Value>> = Vec::new();
         let mut passed = 0i64;
-        let mut seen = std::collections::HashSet::new();
+        let mut seen =
+            crate::spill_buffer::SeenRows::new(self.session.work_mem, self.spill_dir.clone());
         let can_pull = plan.limit != Some(0);
         let profile_start = meter.accrued;
         let mut actual = StreamingActual::default();
@@ -919,7 +920,10 @@ impl Engine {
                 offset,
                 limit,
                 distinct,
-                seen: std::collections::HashSet::new(),
+                seen: crate::spill_buffer::SeenRows::new(
+                    self.session.work_mem,
+                    self.spill_dir.clone(),
+                ),
                 passed: 0,
                 produced: 0,
                 done,
@@ -2089,6 +2093,37 @@ impl Engine {
         let mut meter = self.session.new_meter();
         let emitter = self.exec_select_emit(plan, outer, params, ctes, &stmt_rng, &mut meter)?;
         let out_rows = match emitter {
+            Emitter::Spool {
+                mut rows,
+                remaining,
+                mode,
+                charged,
+            } => {
+                let env = EvalEnv {
+                    exec: self,
+                    params,
+                    outer,
+                    rng: &stmt_rng,
+                    ctes,
+                };
+                let mut out = Vec::new();
+                for _ in 0..remaining {
+                    let row = rows.next()?.expect("spool cardinality");
+                    if !charged {
+                        meter.guard()?;
+                        meter.charge(COSTS.row_produced);
+                    }
+                    out.push(match mode {
+                        EmitMode::Identity => row,
+                        EmitMode::Project => plan
+                            .projections
+                            .iter()
+                            .map(|p| p.eval(&row, &env, &mut meter))
+                            .collect::<Result<Row>>()?,
+                    });
+                }
+                out
+            }
             // Already projected + charged (the special input-streaming paths) — hand the rows out.
             Emitter::Final { rows } => rows,
             // The streaming sort's lazy output: pull every windowed row from the `SortedRows`

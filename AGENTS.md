@@ -132,8 +132,11 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   binaries cannot overlap safely and must be drained once during first rollout.
 - Replication, where relevant, is block-delta shipping at the block seam, not a
   WAL.
-- The deterministic hash JOIN is currently in-memory; grace-hash partitioning is
-  the remaining spill slice and must preserve probe/bucket order and cost.
+- Blocking hash JOIN, aggregation, and DISTINCT use bounded row spools and disk
+  hash partitions under `work_mem` on native file hosts. Ordered partition replay
+  preserves probe/bucket order, aggregate fold order, and cost. Upstream window,
+  CTE/index materialization and final scalar/result admission remain separate
+  memory owners; this is not a whole-query memory ceiling (spill.md, memory.md).
 
 ## Safety And Resource Boundaries
 

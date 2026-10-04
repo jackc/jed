@@ -32,8 +32,32 @@ const defaultWorkMem = 256 * 1024 * 1024
 func valueBytes(v Value) int {
 	const base = 24
 	switch v.Kind {
-	case ValText, ValBytea, ValUuid:
+	case ValText, ValBytea, ValUuid, ValJson, ValJsonPath:
 		return base + len(v.str())
+	case ValJsonb:
+		return base + len(jsonbOut(v.jsonb()))
+	case ValComposite:
+		n := base
+		for _, x := range *v.composite() {
+			n += valueBytes(x)
+		}
+		return n
+	case ValArray:
+		n := base + 8*v.arrayVal().Ndim()
+		for _, x := range v.arrayVal().Elements {
+			n += valueBytes(x)
+		}
+		return n
+	case ValRange:
+		n := base
+		r := v.rangeVal()
+		if r.Lower != nil {
+			n += valueBytes(*r.Lower)
+		}
+		if r.Upper != nil {
+			n += valueBytes(*r.Upper)
+		}
+		return n
 	case ValDecimal:
 		if v.decimal() != nil {
 			_, _, g := v.decimal().ToCodec()
@@ -74,17 +98,26 @@ func cmpRows(keys []orderSlot, a, b storedRow) int {
 // in-memory database (spillDir == "") or unlimited budget keeps everything resident and just
 // stable-sorts at the end.
 type sorter struct {
-	keys     []orderSlot
-	budget   int    // 0 ⇒ unlimited (never spill)
-	spillDir string // "" ⇒ never spill (in-memory database)
-	buf      []storedRow
-	bufBytes int
-	runs     []string // spilled run file paths, in input order (run 0 = first chunk — spill.md §6)
-	total    int
+	keys      []orderSlot
+	budget    int    // 0 ⇒ unlimited (never spill)
+	spillDir  string // "" ⇒ never spill (in-memory database)
+	buf       []storedRow
+	bufBytes  int
+	runLevels []uint8  // binary compaction levels; at most 64 live runs
+	runs      []string // spilled run file paths, in input order (run 0 = first chunk — spill.md §6)
+	total     int
 }
 
 func newSorter(keys []orderSlot, budget int, spillDir string) *sorter {
 	return &sorter{keys: keys, budget: budget, spillDir: spillDir}
+}
+
+func (s *sorter) close() {
+	for _, path := range s.runs {
+		_ = os.Remove(path)
+	}
+	s.runs = nil
+	s.buf = nil
 }
 
 func (s *sorter) canSpill() bool { return s.spillDir != "" && s.budget > 0 }
@@ -134,10 +167,81 @@ func (s *sorter) spillRun() error {
 		return ioError(err)
 	}
 	s.runs = append(s.runs, path)
+	s.runLevels = append(s.runLevels, 0)
 	keep = true
-	s.buf = s.buf[:0]
+	s.buf = nil
 	s.bufBytes = 0
+	for len(s.runs) > 1 {
+		n := len(s.runs)
+		if s.runLevels[n-1] != s.runLevels[n-2] {
+			break
+		}
+		merged, err := s.mergeRunPair(s.runs[n-2], s.runs[n-1])
+		if err != nil {
+			return err
+		}
+		level := s.runLevels[n-1] + 1
+		s.runs = append(s.runs[:n-2], merged)
+		s.runLevels = append(s.runLevels[:n-2], level)
+	}
 	return nil
+}
+
+// Binary compaction bounds both the final merge fan-in and the run directory.
+// Merges join adjacent input intervals, retaining the old stable tie-break.
+func (s *sorter) mergeRunPair(left, right string) (string, error) {
+	a, err := openRunSource(left)
+	if err != nil {
+		return "", err
+	}
+	defer a.close()
+	b, err := openRunSource(right)
+	if err != nil {
+		return "", err
+	}
+	defer b.close()
+	f, err := os.CreateTemp(s.spillDir, "jed-spill-merge-*.tmp")
+	if err != nil {
+		return "", ioError(err)
+	}
+	path := f.Name()
+	keep := false
+	defer func() {
+		_ = f.Close()
+		if !keep {
+			_ = os.Remove(path)
+		}
+	}()
+	w := bufio.NewWriter(f)
+	spillWriteU64(w, a.remaining+b.remaining)
+	ar, ah, err := a.next()
+	if err != nil {
+		return "", err
+	}
+	br, bh, err := b.next()
+	if err != nil {
+		return "", err
+	}
+	for ah || bh {
+		if ah && (!bh || cmpRows(s.keys, ar, br) <= 0) {
+			spillWriteRow(w, ar)
+			ar, ah, err = a.next()
+		} else {
+			spillWriteRow(w, br)
+			br, bh, err = b.next()
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+	if err = w.Flush(); err != nil {
+		return "", ioError(err)
+	}
+	if err = f.Close(); err != nil {
+		return "", ioError(err)
+	}
+	keep = true
+	return path, nil
 }
 
 // finish returns the rows in ORDER BY order. With no spilled run this is the unchanged in-memory
@@ -146,7 +250,9 @@ func (s *sorter) spillRun() error {
 func (s *sorter) finish() (*sortedRows, error) {
 	s.sortBuf()
 	if len(s.runs) == 0 {
-		return &sortedRows{mem: s.buf}, nil
+		rows := s.buf
+		s.buf = nil
+		return &sortedRows{mem: rows}, nil
 	}
 	// Sources: each spilled run, then the final in-memory buffer last (the latest input positions →
 	// the highest source index, the tie-break that reproduces input order — spill.md §6).
@@ -176,12 +282,18 @@ func (s *sorter) finish() (*sortedRows, error) {
 		}
 	}
 	heap.Init(h)
+	s.runs = nil
+	s.buf = nil
 	return &sortedRows{merge: &merger{sources: sources, heap: h}}, nil
 }
 
 // sortedRows is the sorted output stream (spec/design/spill.md §4). The window/projection loop pulls
 // rows one at a time, so neither the input nor the output is re-materialized in the spill case.
 type sortedRows struct {
+	stream interface {
+		next() (storedRow, bool, error)
+		close()
+	}
 	mem    []storedRow // set for the no-spill case
 	memPos int
 	merge  *merger // set for the spill case
@@ -189,6 +301,9 @@ type sortedRows struct {
 
 // next returns the next row in sort order, or ok=false at the end.
 func (r *sortedRows) next() (storedRow, bool, error) {
+	if r.stream != nil {
+		return r.stream.next()
+	}
 	if r.merge != nil {
 		return r.merge.next()
 	}
@@ -203,6 +318,9 @@ func (r *sortedRows) next() (storedRow, bool, error) {
 // close releases any spill run files still open (a LIMIT can stop the merge before every run is
 // drained — spill.md §4). A no-op for the in-memory case.
 func (r *sortedRows) close() {
+	if r.stream != nil {
+		r.stream.close()
+	}
 	if r.merge != nil {
 		for _, s := range r.merge.sources {
 			s.close()
@@ -382,6 +500,15 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 	case ValUuid:
 		_ = w.WriteByte(6)
 		_, _ = w.Write([]byte(v.str())) // exactly 16 bytes
+	case ValFloat32:
+		_ = w.WriteByte(13)
+		spillWriteU64(w, uint64(v.Int))
+	case ValFloat64:
+		_ = w.WriteByte(14)
+		spillWriteU64(w, uint64(v.Int))
+	case ValDate:
+		_ = w.WriteByte(17)
+		spillWriteU64(w, uint64(v.Int))
 	case ValTimestamp:
 		_ = w.WriteByte(7)
 		spillWriteU64(w, uint64(v.Int))
@@ -461,8 +588,9 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 		_ = w.WriteByte(20)
 		spillWriteBytes(w, []byte(jsonbOut(v.jsonb())))
 	case ValJsonPath:
-		// jsonpath is literal-only (non-storable), so it never rides a spilling sort.
-		panic("BUG: a jsonpath value never reaches the spill codec")
+		// Derived/CTE rows may carry a non-storable jsonpath through a blocking operator.
+		_ = w.WriteByte(22)
+		spillWriteBytes(w, []byte(v.str()))
 	case ValUnfetched:
 		// An untouched large-value reference rides along to the output unread (spill.md §4); spill
 		// it opaquely so it round-trips, never resolving it. The same pass-through covers an
@@ -581,6 +709,16 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 			return Value{}, err
 		}
 		return UuidValue(u[:]), nil
+	case 13, 14, 17:
+		n, err := spillReadU64(r)
+		kind := ValFloat32
+		if tag == 14 {
+			kind = ValFloat64
+		}
+		if tag == 17 {
+			kind = ValDate
+		}
+		return Value{Kind: kind, Int: int64(n)}, err
 	case 7:
 		n, err := spillReadU64(r)
 		return TimestampValue(int64(n)), err
@@ -616,6 +754,9 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 		}
 		raw, err := spillReadU32(r)
 		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternalComp, FirstPage: first, StoredLen: stored, RawLen: raw}}, err
+	case 22:
+		body, err := spillReadBytes(r)
+		return JsonPathValue(string(body)), err
 	case 21:
 		body, err := spillReadBytes(r)
 		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: 0x00, Comp: body}}, err
@@ -652,6 +793,9 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 		dims := make([]int, ndim)
 		lbounds := make([]int32, ndim)
 		n := 1
+		if ndim == 0 {
+			n = 0
+		}
 		for d := 0; d < int(ndim); d++ {
 			ln, err := spillReadU32(r)
 			if err != nil {

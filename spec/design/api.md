@@ -156,10 +156,13 @@ their idiomatic options structs (`locking`, `file_lock_timeout_ms` / `Locking`, 
 
 **Work-memory budget — a handle setting ([spill.md](spill.md) §3).** `open`'s `opts.work_mem`
 (Rust `OpenOptions { work_mem }` / Go `OpenOptions { WorkMem }` / TS `{ workMem }`; default
-**`DEFAULT_WORK_MEM = 256 MiB`**) bounds the memory a single **blocking operator** — currently the
-`ORDER BY` external merge sort (spill.md §4) — may hold resident before it **spills to disk**, so a
-query over larger-than-RAM data never materializes its whole input in the executor's heap
-(CLAUDE.md §9). It is PostgreSQL's `work_mem`, stated in the same unit (**bytes**), and like
+**`DEFAULT_WORK_MEM = 256 MiB`**) bounds resident row/state buffers before **spilling to disk**:
+`ORDER BY` external sorting, hash JOIN, grouping/aggregate state, and DISTINCT
+([spill.md](spill.md) §4/§7). Direct table inputs and scan-cost prepasses stream;
+upstream CTE/index/window materialization, final scalar values and result collectors
+remain separate owners. The estimate allows a current record and fixed I/O/partition
+metadata beyond the threshold; it is not a total heap cap. It is PostgreSQL's
+`work_mem`, stated in the same unit (**bytes**), and like
 `cache_bytes` / `max_cost` it is a **handle** setting (not stored in the file) that **never changes
 what a query observes** — results and cost are invariant to it (spill.md §6), it only changes *when*
 an operator spills. `db.set_work_mem(bytes)` / `SetWorkMem` / `setWorkMem` sets it on an open handle

@@ -1,3 +1,4 @@
+import { SpillSet } from "./blocking.ts";
 import type { ActiveTx, SessionOptions, TxStatus } from "./snapshot.ts";
 import { LifetimeBudget, Meter } from "./cost.ts";
 import { Seam } from "./seam.ts";
@@ -574,42 +575,46 @@ export function* streamRows(
   if (empty || sp.limit === 0n) return;
   const offset = sp.offset ?? 0n;
   const distinct = sp.distinct;
-  const seen = new Set<string>();
-  let passed = 0n;
-  let produced = 0n;
-  // A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else forward.
-  const input =
-    point === null ? store.scanRowsIter(bound, sp.phys.pkReverse) : pointRows(store, point);
-  for (const rawRow of input) {
-    meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
-    meter.charge(COSTS.storageRowRead);
-    // Materialize the touched columns left unfetched by the lazy load (large-values.md §14); the chain
-    // reads were already metered in the up-front block (cost.md §3).
-    const row = store.resolveColumns(rawRow, sp.relMasks[0]!);
-    if (sp.filter !== null && !isTrue(evalExpr(sp.filter, row, env, meter))) continue;
-    if (distinct) {
-      // DISTINCT (cost.md §3): project EVERY scanned filtered row (the dedup key, charged even for a
-      // duplicate — the §3 asymmetry), drop a value already seen, then OFFSET/LIMIT window the survivors.
-      const tuple = sp.projections.map((p) => evalExpr(p, row, env, meter));
-      const key = distinctRowKey(tuple);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      passed += 1n;
-      if (passed <= offset) continue;
-      meter.charge(COSTS.rowProduced);
-      produced += 1n;
-      yield tuple;
-    } else {
-      passed += 1n;
-      if (passed <= offset) continue;
-      meter.charge(COSTS.rowProduced);
-      produced += 1n;
-      yield sp.projections.map((p) => evalExpr(p, row, env, meter));
+  const seen = new SpillSet(env.exec.session.workMem, env.exec.spillSink);
+  try {
+    let passed = 0n;
+    let produced = 0n;
+    // A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else forward.
+    const input =
+      point === null ? store.scanRowsIter(bound, sp.phys.pkReverse) : pointRows(store, point);
+    for (const rawRow of input) {
+      meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+      meter.charge(COSTS.storageRowRead);
+      // Materialize the touched columns left unfetched by the lazy load (large-values.md §14); the chain
+      // reads were already metered in the up-front block (cost.md §3).
+      const row = store.resolveColumns(rawRow, sp.relMasks[0]!);
+      if (sp.filter !== null && !isTrue(evalExpr(sp.filter, row, env, meter))) continue;
+      if (distinct) {
+        // DISTINCT (cost.md §3): project EVERY scanned filtered row (the dedup key, charged even for a
+        // duplicate — the §3 asymmetry), drop a value already seen, then OFFSET/LIMIT window the survivors.
+        const tuple = sp.projections.map((p) => evalExpr(p, row, env, meter));
+        const key = distinctRowKey(tuple);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        passed += 1n;
+        if (passed <= offset) continue;
+        meter.charge(COSTS.rowProduced);
+        produced += 1n;
+        yield tuple;
+      } else {
+        passed += 1n;
+        if (passed <= offset) continue;
+        meter.charge(COSTS.rowProduced);
+        produced += 1n;
+        yield sp.projections.map((p) => evalExpr(p, row, env, meter));
+      }
+      // The LIMIT short-circuit (cost.md §3): once the window is full, stop WITHOUT pulling another row —
+      // so no further leaf is faulted (the streaming early-exit win). The check is after the yield, so the
+      // for-of pulls the next row only when another is actually needed.
+      if (sp.limit !== null && produced >= sp.limit) return;
     }
-    // The LIMIT short-circuit (cost.md §3): once the window is full, stop WITHOUT pulling another row —
-    // so no further leaf is faulted (the streaming early-exit win). The check is after the yield, so the
-    // for-of pulls the next row only when another is actually needed.
-    if (sp.limit !== null && produced >= sp.limit) return;
+  } finally {
+    seen.close();
   }
 }
 
@@ -653,9 +658,11 @@ export function* bufferedRows(
       for (let i = 0; i < em.end; i++) {
         const row = sorted.next();
         if (row === null) break;
-        meter.guard(); // enforce the cost ceiling / cancellation per produced row (CLAUDE.md §13)
-        meter.charge(COSTS.rowProduced);
-        yield plan.projections.map((p) => evalExpr(p, row, env, meter));
+        if (!em.sortedFinal) {
+          meter.guard(); // enforce the cost ceiling / cancellation per produced row (CLAUDE.md §13)
+          meter.charge(COSTS.rowProduced);
+        }
+        yield em.sortedIdentity ? row : plan.projections.map((p) => evalExpr(p, row, env, meter));
       }
     } finally {
       sorted.close();

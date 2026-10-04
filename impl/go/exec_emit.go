@@ -62,15 +62,17 @@ const (
 //     projection, no full-width row) at lane position sel[j] (or j when sel is nil) and charges
 //     row_produced per row (packed-leaf.md §11 Track A2/A3).
 type emitter struct {
-	src      []storedRow // emitProject: unprojected rows
-	final    [][]Value   // emitIdentity / emitFinal: already-projected rows
-	sorted   *sortedRows // emitSorted: the streaming-sort output pull iterator (positioned past OFFSET)
-	cols     [][]Value   // emitColumnar: the dense per-column lanes (indexed by table ordinal)
-	projCols []int       // emitColumnar: projection column indices into cols (one per output column)
-	sel      []int32     // emitColumnar: optional A3 selection vector — output row j → lane position sel[j]
-	start    int64
-	end      int64
-	mode     emitMode
+	precharged bool        // the limited join projection accrued during blocking work
+	identity   bool        // emitSorted stream already projected by DISTINCT
+	src        []storedRow // emitProject: unprojected rows
+	final      [][]Value   // emitIdentity / emitFinal: already-projected rows
+	sorted     *sortedRows // emitSorted: the streaming-sort output pull iterator (positioned past OFFSET)
+	cols       [][]Value   // emitColumnar: the dense per-column lanes (indexed by table ordinal)
+	projCols   []int       // emitColumnar: projection column indices into cols (one per output column)
+	sel        []int32     // emitColumnar: optional A3 selection vector — output row j → lane position sel[j]
+	start      int64
+	end        int64
+	mode       emitMode
 }
 
 func logicalJoinRowWidth(plan *selectPlan) int {
@@ -286,10 +288,18 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 			if !ok {
 				break
 			}
+			if em.precharged {
+				out = append(out, row)
+				continue
+			}
 			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
 				return nil, err
 			}
 			meter.Charge(costs.RowProduced)
+			if em.identity {
+				out = append(out, row)
+				continue
+			}
 			projected := make([]Value, len(plan.projections))
 			for j, p := range plan.projections {
 				v, perr := p.eval(row, env, meter)
@@ -364,6 +374,21 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 // blocking part and the (possibly deferred) projection (streaming.md §6).
 func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []Value, ctes cteCtx, rng *stmtRng, meter *costMeter) (emitter, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
+	// The whole-table packed-leaf fold owns only running scalar accumulators.
+	// Keep it ahead of spilling when it accepts the plan; grouped and declined
+	// row/gather paths continue through the bounded operator pipeline below.
+	if meter.unmetered() && db.explainActual == nil && db.vectorizedAggEligible(plan) && len(plan.groupSets) == 1 && len(plan.groupSets[0].keyCols) == 0 {
+		rows, ok, err := db.aggColumnar(plan, &plan.groupSets[0], env, meter)
+		if err != nil {
+			return emitter{}, err
+		}
+		if ok {
+			return db.emitAggSyntheticRows(plan, rows, env, meter)
+		}
+	}
+	if db.boundedBlockingEligible(plan) {
+		return db.execBoundedBlocking(plan, env, meter)
+	}
 
 	// Vectorized single-table aggregate (batch.go, the PAX/vectorization program's executor track): a
 	// SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window / ORDER BY, either whole-table

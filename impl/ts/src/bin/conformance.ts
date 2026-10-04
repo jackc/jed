@@ -704,6 +704,13 @@ function runFile(text: string, disk: boolean): void {
         db = dbHandle.session();
       }
       // This record consumes any pending assertions (so they never leak forward).
+      if (process.env.JED_CONFORMANCE_WORK_MEM !== undefined) {
+        const budget = Number(process.env.JED_CONFORMANCE_WORK_MEM);
+        if (!Number.isSafeInteger(budget) || budget < 0) {
+          throw new Error("JED_CONFORMANCE_WORK_MEM must be nonnegative bytes");
+        }
+        db.setWorkMem(budget);
+      }
       const expectedCost = pendingCost;
       const expectedNames = pendingNames;
       const expectedTypes = pendingTypes;
@@ -1188,8 +1195,14 @@ function main(): number {
 
   const suites = suitesDir();
   const files = readdirSync(suites, { recursive: true })
-    .filter((f): f is string => typeof f === "string" && f.endsWith(".test"))
+    .filter(
+      (f): f is string =>
+        typeof f === "string" &&
+        f.endsWith(".test") &&
+        f.includes(process.env.JED_CONFORMANCE_FILTER ?? ""),
+    )
     .sort();
+  if (files.length === 0) throw new Error("JED_CONFORMANCE_FILTER matched no tests");
 
   const supported = new Set(SUPPORTED_CAPABILITIES);
 
