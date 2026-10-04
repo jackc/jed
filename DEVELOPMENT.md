@@ -51,6 +51,7 @@ A git worktree is the native equivalent of a second devcontainer instance. Each 
 .dev/                   # gitignored, per-checkout runtime state
   ports.env             # this checkout's TCP ports (port-tamer's state file)
   derived.env           # PostgreSQL defaults — PGHOST, PGUSER, PGDATABASE
+  go-build/             # Go build cache (unless GOCACHE is explicitly set)
   postgres/data         # this checkout's PostgreSQL cluster
 ```
 
@@ -67,6 +68,10 @@ Ports are allocated once per checkout by [port-tamer](https://github.com/jackc/p
 persisted. `port-tamer.toml` declares which ports a checkout needs (append new entries at the end —
 inserting or reordering renumbers the existing ones); the allocation itself lands in `.dev/`, which
 mise loads. `mise run dev:init` creates it, and `dev:ports:ensure` is idempotent afterwards.
+
+Go builds default to `.dev/go-build` through both mise and Rake, so sandboxed CI does not need
+write access to the home-directory cache. An explicit `GOCACHE` takes precedence; if it names a
+read-only location, unset it to use the checkout default or point it at a writable cache.
 
 A listening port never moves an existing allocation — it may well belong to this checkout's own
 running services. When two checkouts genuinely collide, move one deliberately: stop its services

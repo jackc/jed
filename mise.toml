@@ -42,6 +42,10 @@ process-compose = '1.122.0'
 # back to their historical ports, and PG* falls back to whatever the shell already had.
 [env]
 _.file = ['.dev/ports.env', '.dev/derived.env']
+# Keep Go builds inside the writable checkout in sandboxed environments. An explicit cache
+# remains authoritative (for example, a shared CI cache). Rake supplies the same default when
+# invoked without mise.
+GOCACHE = "{{ get_env(name='GOCACHE', default=config_root ~ '/.dev/go-build') }}"
 
 # Homebrew's postgresql@18 is KEG-ONLY: nothing is linked into the prefix bin, so psql,
 # pg_isready, and initdb are not on PATH after `brew install`. The scripts that need the SERVER

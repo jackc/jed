@@ -29,6 +29,10 @@ require "bundler/setup" # load the gems pinned in Gemfile.lock (rake, toml-rb)
 require "digest"        # lockfile content hashing for the npm bootstrap staleness check
 require "fileutils"
 
+# Go's home-directory cache can be read-only in a sandbox. Match mise's checkout-local default
+# for bare rake invocations too; preserve an explicitly configured shared/CI cache.
+ENV["GOCACHE"] ||= File.join(__dir__, ".dev", "go-build")
+
 # Each entry is one reference repo. `ref` is the branch/tag checked out into the
 # worktree; it is explicit (not auto-detected) per CLAUDE.md's "boring, explicit"
 # preference. PostgreSQL is pinned to REL_18_STABLE to match the live `postgres:18`
