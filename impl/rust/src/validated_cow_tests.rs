@@ -197,6 +197,43 @@ fn host_read_errors_do_not_silently_select_an_older_commit() {
 }
 
 #[test]
+fn serialization_error_leaves_writer_usable_without_storage_work() {
+    for recovered in [false, true] {
+        let (device, mut db) = seeded(2);
+        execute(&mut db, "UPDATE t SET v=1").unwrap();
+        if recovered {
+            drop(db);
+            db = open(&device);
+        }
+        let before = device.lock().unwrap().cache.clone();
+        {
+            let mut d = device.lock().unwrap();
+            d.writes.clear();
+            d.syncs = 0;
+        }
+        let columns = (0..40)
+            .map(|i| format!("c{i} i32"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            execute(&mut db, &format!("CREATE TABLE wide ({columns})"))
+                .unwrap_err()
+                .code(),
+            "0A000"
+        );
+        {
+            let d = device.lock().unwrap();
+            assert!(d.writes.is_empty());
+            assert_eq!(d.syncs, 0);
+            assert_eq!(d.cache, before);
+        }
+        execute(&mut db, "UPDATE t SET v=2").unwrap();
+        assert_eq!(values(&db), vec![2, 2]);
+        assert_eq!(device.lock().unwrap().syncs, if recovered { 2 } else { 1 });
+    }
+}
+
+#[test]
 fn page_limit_is_rejected_before_wrapping_into_metadata() {
     let seed = Engine::new();
     let result = seed

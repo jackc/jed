@@ -286,7 +286,7 @@ impl Engine {
             .as_ref()
             .expect("paging present")
             .pager()
-            .begin_commit()?;
+            .check_commit()?;
         let ps = self.page_size as usize;
         let cap = ps - crate::format::PAGE_HEADER;
         let free = self.free_pages.clone();
@@ -307,6 +307,7 @@ impl Engine {
         {
             let paging = self.paging.as_ref().expect("paging present");
             let mut pager = paging.pager();
+            pager.begin_commit()?;
             pager.reserve(write.page_count)?;
             for (index, bytes) in &write.pages {
                 pager.write_block(*index, bytes)?;

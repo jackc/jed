@@ -115,6 +115,7 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
 - Durable commits use v33 validated COW: body writes, content manifest, alternate meta,
   then one durable barrier. Protect every current manifest dependency from reuse; stabilize
   recovered/foreign generations before further writes; poison storage on I/O failure.
+  Serialization errors before storage work discard the transaction without poisoning the handle.
   Follow `spec/design/validated-cow.md` and the shared byte format. No WAL or redo copies.
 - Key encoding must preserve logical order in raw byte order.
 - Do not assume on-disk page bytes are plaintext-comparable; leave room for the

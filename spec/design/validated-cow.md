@@ -118,6 +118,13 @@ assumed prior root. Close and reopen through recovery. Shared-file failure retai
 coordinator gates until close, as [locking.md](locking.md) requires. This applies to the
 alone, uncoordinated, attachment, and shared commit paths, not just co-resident writers.
 
+Writer admission rejects an already failed handle before serialization can read inherited
+pages. Serialization and shared-manifest planning run before starting the storage commit:
+an encoding/size error discards the working snapshot without poisoning the pager or coordinator.
+Only after preparation succeeds does the writer arm the commit guard and stabilize any adopted
+generation, before its first allocation or write. A failed stabilization or any later failure
+keeps the guard armed until reopen. Ordinary SQL transaction rollback rules still apply.
+
 The lock-bundle protocol does not change: pages 0 and 1 remain the discovery location,
 one global writer remains, and co-resident commits never reuse body pages. A transaction
 begin takes `commit SH`, reads both meta pages directly, and validates a newly observed

@@ -189,7 +189,7 @@ func (db *engine) persist(snap *snapshot) error {
 	if db.paging == nil {
 		return nil
 	}
-	if err := db.paging.withPager(func(p *pager) error { return p.beginValidatedCommit() }); err != nil {
+	if err := db.paging.withPager(func(p *pager) error { return p.checkValidatedCommit() }); err != nil {
 		return err
 	}
 	write, err := snap.incrementalImage(db.pageSize, db.pageCount, db.freePages, true, db.paging)

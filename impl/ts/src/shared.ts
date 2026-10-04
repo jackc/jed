@@ -408,8 +408,10 @@ class SharedCore {
     const oldest = this.oldestLiveVersion(snap.txid);
     const coordinator = this.coordinator;
     if (coordinator !== null && coordinator.state === "shared" && this.storage.path !== null) {
+      let bodyWritten = false;
       try {
         const pending = persistSharedBody(this.storage, snap);
+        bodyWritten = true;
         coordinator.lockCommitExclusive();
         try {
           pending.publishMeta();
@@ -417,7 +419,8 @@ class SharedCore {
           coordinator.unlockCommit();
         }
       } catch (error) {
-        coordinator.state = "poisoned";
+        if (bodyWritten || this.storage.paging?.commitRequiresReopen())
+          coordinator.state = "poisoned";
         throw error;
       }
       return;

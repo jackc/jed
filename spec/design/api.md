@@ -476,7 +476,8 @@ its root; an incomplete candidate falls back to the preceding valid generation. 
 or foreign-process generations are stabilized before further writes. Growth can add an amortized
 allocation barrier. A write/sync failure poisons the storage handle: close and reopen to determine
 the committed outcome before continuing. The same rule applies to attachments and uncoordinated
-file handles. [Validated COW](validated-cow.md) specifies the recovery/reuse proof and the v33
+file handles. A serialization/size error before storage work leaves the handle usable after
+discarding the failed transaction; it does not require reopen. [Validated COW](validated-cow.md) specifies the recovery/reuse proof and the v33
 format break. Corruption of an acknowledged dependency can also cause recovery to select the
 preceding snapshot, because it cannot be distinguished from incomplete persistence.
 

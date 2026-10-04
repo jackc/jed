@@ -269,6 +269,10 @@ A write/sync error has an indeterminate commit outcome, as with any durable data
 handle becomes poisoned and retains its gates until close; recovery on the next open chooses the
 highest meta whose complete manifest and dependencies validate. It must never continue writing from an assumed prior root.
 
+Serialization or manifest-planning errors before storage work do not poison the coordinator.
+The failed transaction can be discarded and its writer gate released normally. Storage commit
+admission begins only after that preparation succeeds, before stabilization or page writes.
+
 ## 6. Reclamation, compaction, and buffers
 
 - **Free-page reuse and free-list persistence** require `presence EX` plus the existing local

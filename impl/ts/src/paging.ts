@@ -97,6 +97,12 @@ export class SharedPaging {
     this.pager.adoptCommit(txid, checksum, needsSync);
   }
 
+  checkDurableCommit(): void {
+    this.pager.checkDurableCommit();
+  }
+  commitRequiresReopen(): boolean {
+    return this.pager.commitRequiresReopen();
+  }
   beginDurableCommit(): void {
     this.pager.beginDurableCommit();
   }
