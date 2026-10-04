@@ -172,7 +172,7 @@ end
 # they are reproducible across contributors; this task is what makes the pins load-bearing.
 # Without a check, formatting silently drifts from the pinned tools (it had, in BOTH the Rust
 # and Go cores, before this gate). The pins, one per surface:
-#   rust              — rustfmt (ships with rust 1.92.0, mise-pinned); `cargo fmt`.
+#   rust              — rustfmt (ships with the mise-pinned Rust toolchain); `cargo fmt`.
 #   go                — gofumpt (mise-pinned go tool); a stricter SUPERSET of gofmt (its output
 #                       is always gofmt-clean too), chosen because mise already pins it.
 #   impl/ts, impl/node, bench/ts, migrate/ts — biome (mise-pinned; biome.json at repo root).

@@ -1,15 +1,15 @@
 [tools]
-biome = '2.5.0'
-go = '1.26.3'
-node = '24.16.0'
-rust = '1.92.0'
+biome = "2.5.15"
+go = "1.27.1"
+node = "26.10.0"
+rust = "1.99.0"
 "go:github.com/go-critic/go-critic/cmd/gocritic" = "latest"
 "go:github.com/gordonklaus/ineffassign" = "latest"
 "go:github.com/mdempsky/unconvert" = "latest"
 "go:golang.org/x/tools/cmd/goimports" = "latest"
 "go:golang.org/x/pkgsite/cmd/pkgsite" = "latest"
 "go:mvdan.cc/gofumpt" = "latest"
-ruby = '4.0.5'
+ruby = "4.0.7"
 # The process supervisor for long-running development services (process-compose.yaml). Pinned like
 # every other tool so macOS and the devcontainer run the same version. Not an engine dependency
 # (CLAUDE.md §14): it never links into a core, it supervises the PostgreSQL oracle.
