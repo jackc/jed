@@ -103,7 +103,10 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// in ascending `(name, arg-type codes)` order. An index with no host-function key is byte-identical
 /// to v30, so a file with no such index moves to v31 only by its version byte + meta CRC.
 // v32: persisted timezone dependencies (spec/design/index-dependencies.md).
-const FORMAT_VERSION: u16 = 32;
+// v33: full-page meta CRC and inline/overflow validated-COW manifest.
+const FORMAT_VERSION: u16 = 33;
+#[path = "commit_manifest.rs"]
+mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 pub(crate) const PAGE_HEADER: usize = 16;
@@ -366,6 +369,10 @@ fn crc32_extend(crc: u32, data: &[u8]) -> u32 {
 /// `content_hash` (spec/collation/README.md §3), hence `pub`.
 pub fn crc32_ieee(data: &[u8]) -> u32 {
     crc32_extend(0, data)
+}
+
+pub(crate) fn meta_crc(page: &[u8]) -> u32 {
+    crc32_extend(crc32_extend(0, &page[..32]), &page[36..])
 }
 
 /// The per-page checksum (v7, spec/fileformat/format.md *Page header*): CRC-32/IEEE over a body
@@ -1530,6 +1537,7 @@ pub(crate) struct IncrementalWrite {
 /// page is torn-write-safe: it left the free-list only here, becoming part of the new committed
 /// version, so it is reachable from no fallback snapshot.
 struct PageAlloc<'a> {
+    exhausted: bool,
     free: &'a [u32],
     cursor: usize,
     next: u32,
@@ -1550,7 +1558,11 @@ impl PageAlloc<'_> {
             p
         } else {
             let p = self.next;
-            self.next += 1;
+            if let Some(next) = self.next.checked_add(1) {
+                self.next = next;
+            } else {
+                self.exhausted = true;
+            }
             p
         }
     }
@@ -1585,6 +1597,7 @@ impl Snapshot {
         // watermark defers reuse (`reuse` false), in which case only the high-water is drawn and the whole
         // free-list carries through unconsumed for persistence (`PageAlloc::reuse`, transactions.md §8).
         let mut alloc = PageAlloc {
+            exhausted: false,
             free,
             cursor: 0,
             next: start_page,
@@ -1700,6 +1713,12 @@ impl Snapshot {
             ));
         }
 
+        if alloc.exhausted {
+            return Err(EngineError::new(
+                SqlState::ProgramLimitExceeded,
+                "database page limit exceeded",
+            ));
+        }
         Ok(IncrementalWrite {
             pages,
             root_page: cat_root,
@@ -1727,11 +1746,11 @@ fn serialize_free_list(
     cap: usize,
     ps: usize,
     next: u32,
-) -> (Vec<(u32, Vec<u8>)>, u32, Vec<u32>, u32) {
+) -> Result<(Vec<(u32, Vec<u8>)>, u32, Vec<u32>, u32)> {
     // Nothing worth persisting when it would take the whole list to hold itself (empty, or a lone
     // page): leave the residue in RAM, reclaimed at the next compaction (a bounded transient leak).
     if persist.len() < 2 {
-        return (Vec::new(), 0, persist.to_vec(), next);
+        return Ok((Vec::new(), 0, persist.to_vec(), next));
     }
     let per = (cap / 4).max(1);
     // Draw free-list pages (from `safe`, then the high-water) until they hold every entry that then
@@ -1752,7 +1771,12 @@ fn serialize_free_list(
             safe_drawn += 1;
         } else {
             fl_ids.push(hw);
-            hw += 1;
+            hw = hw.checked_add(1).ok_or_else(|| {
+                EngineError::new(
+                    SqlState::ProgramLimitExceeded,
+                    "database page limit exceeded",
+                )
+            })?;
         }
     }
     // The persisted list is `persist` minus the pages drawn from it (the first `safe_drawn` fl_ids).
@@ -1780,17 +1804,26 @@ fn serialize_free_list(
             make_page(ps, PAGE_FREELIST, chunk.len() as u32, next_page, &payload),
         ));
     }
-    (pages, fl_ids[0], persisted, hw)
+    Ok((pages, fl_ids[0], persisted, hw))
 }
 
 /// Read a persisted free-list (v25) by following the `page_type 7` chain from `head` (meta offset
 /// 28) through the pager, collecting every free page index. `head == 0` is an empty free-list. The
 /// inverse of the free-list serialization in [`Snapshot::incremental_image`]; replaces the v24
 /// reconstruct-on-open reachability walk (spec/fileformat/format.md *Reclamation*).
-fn read_free_list(paging: &SharedPaging, head: u32) -> Result<Vec<u32>> {
+fn read_free_list(
+    paging: &SharedPaging,
+    head: u32,
+    page_count: u32,
+    protected: &HashSet<u32>,
+) -> Result<Vec<u32>> {
+    let mut chain = HashSet::new();
     let mut free = Vec::new();
     let mut p = head;
     while p != 0 {
+        if p < ROOT_PAGE || p >= page_count || !chain.insert(p) {
+            return Err(corrupt("invalid free-list chain"));
+        }
         let block = paging.pager().read_block(p)?;
         let page = parse_page(&block)?;
         if page.page_type != PAGE_FREELIST {
@@ -1798,9 +1831,20 @@ fn read_free_list(paging: &SharedPaging, head: u32) -> Result<Vec<u32>> {
         }
         let mut pos = 0usize;
         for _ in 0..page.item_count {
-            free.push(read_u32(page.payload, &mut pos)?);
+            let id = read_u32(page.payload, &mut pos)?;
+            if id < ROOT_PAGE
+                || id >= page_count
+                || free.last().is_some_and(|last| id <= *last)
+                || protected.contains(&id)
+            {
+                return Err(corrupt("invalid free-list entry"));
+            }
+            free.push(id);
         }
         p = page.next_page;
+    }
+    if free.iter().any(|p| chain.contains(p)) {
+        return Err(corrupt("free list contains its own chain"));
     }
     Ok(free)
 }
@@ -1936,24 +1980,36 @@ impl Engine {
             return Err(corrupt("invalid page size"));
         }
 
-        // Select the live meta from slots 0 and 1 (highest valid txid; the lone valid slot on a torn
-        // write), read as individual blocks through the pager.
         let meta = {
             let mut pg = paging.pager();
-            let b0 = pg.read_block(0)?;
-            let b1 = pg.read_block(1)?;
-            match (parse_meta(&b0), parse_meta(&b1)) {
-                (Some(a), Some(b)) => {
-                    if b.txid > a.txid {
-                        b
-                    } else {
-                        a
-                    }
+            let blocks = [pg.read_block(0)?, pg.read_block(1)?];
+            let mut candidates: Vec<_> = blocks
+                .iter()
+                .filter_map(|b| parse_meta(b).map(|m| (m, b)))
+                .collect();
+            candidates.sort_by(|a, b| b.0.txid.cmp(&a.0.txid));
+            let mut selected = None;
+            for (mut m, bytes) in candidates {
+                let physical = pg.allocated_pages();
+                let protected = if let Some(pages) = pg.cached_validation(bytes) {
+                    Some(pages)
+                } else {
+                    commit_manifest::validate(bytes, physical, |id| pg.read_block(id))?
+                        .map(Arc::new)
+                };
+                if let Some(protected) = protected {
+                    pg.cache_validation(bytes, Arc::clone(&protected));
+                    m.protected = protected;
+                    pg.adopt_generation(
+                        m.txid,
+                        u32::from_be_bytes(bytes[32..36].try_into().unwrap()),
+                        bytes[40..44] != [0; 4],
+                    );
+                    selected = Some(m);
+                    break;
                 }
-                (Some(a), None) => a,
-                (None, Some(b)) => b,
-                (None, None) => return Err(corrupt("no valid meta page")),
             }
+            selected.ok_or_else(|| corrupt("no complete valid meta page"))?
         };
 
         let mut snap = Snapshot::default();
@@ -2092,7 +2148,12 @@ impl Engine {
         db.page_count = meta.page_count;
         // v25: load the free-list directly from the persisted chain (meta offset 28) — no
         // reachability walk (spec/fileformat/format.md *Reclamation*).
-        db.free_pages = read_free_list(&paging, meta.free_list_head)?;
+        db.free_pages = read_free_list(
+            &paging,
+            meta.free_list_head,
+            meta.page_count,
+            &meta.protected,
+        )?;
         // Every persisted free page is dead at the committed version (the free-list is "as of" meta.txid),
         // so its reuse generation is meta.txid: at open oldest_live == committed and any later reader pins
         // ≥ the committed version, so reuse is safe (transactions.md §8, the free-list generation gate).
@@ -2259,7 +2320,7 @@ pub(crate) fn plan_free_list(
     ps: usize,
     can_reclaim: bool,
     can_reuse: bool,
-) -> Result<(Vec<(u32, Vec<u8>)>, u32, Vec<u32>, u32, u32, u64)> {
+) -> Result<CommitPlan> {
     const MIN_COMPACT_PAGES: u32 = 16; // don't churn a tiny store
     // `live_at_compaction == 0` is the shared-file handoff sentinel: co-resident commits deliberately
     // persisted no free list, so the first proven-alone commit reconstructs immediately even for a
@@ -2288,9 +2349,93 @@ pub(crate) fn plan_free_list(
     // the same hazard as data-page reuse. When the watermark defers reuse the chain must grow the
     // high-water instead (empty `safe`), exactly as the data allocator does.
     let safe: &[u32] = if can_reuse { free_remaining } else { &[] };
-    let (pages, head, persisted, new_pc) =
-        serialize_free_list(&persist_list, safe, cap, ps, page_count);
-    Ok((pages, head, persisted, new_pc, new_live, new_gen))
+    let mut n = 0;
+    loop {
+        let mut next = page_count;
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            ids.push(if let Some(id) = safe.get(i) {
+                *id
+            } else {
+                let id = next;
+                next = next.checked_add(1).ok_or_else(|| {
+                    EngineError::new(
+                        SqlState::ProgramLimitExceeded,
+                        "database page limit exceeded",
+                    )
+                })?;
+                id
+            });
+        }
+        let reserved: HashSet<_> = ids.iter().copied().collect();
+        let persist: Vec<_> = persist_list
+            .iter()
+            .copied()
+            .filter(|id| !reserved.contains(id))
+            .collect();
+        let remaining: Vec<_> = safe
+            .iter()
+            .copied()
+            .filter(|id| !reserved.contains(id))
+            .collect();
+        let (pages, head, persisted, new_pc) =
+            serialize_free_list(&persist, &remaining, cap, ps, next)?;
+        let needed = commit_manifest::overflow_needed(ps, written.len() + pages.len());
+        if needed > n {
+            n = needed;
+            continue;
+        }
+        let base = meta_page(ps as u32, snap.txid, cat_root, new_pc, head);
+        let (meta, overflow) = commit_manifest::encode(base, written, &pages, &ids);
+        let mut auxiliary = pages;
+        auxiliary.extend(overflow);
+        return Ok(CommitPlan {
+            auxiliary,
+            meta,
+            persisted,
+            page_count: new_pc,
+            live: new_live,
+            generation: new_gen,
+        });
+    }
+}
+
+pub(crate) struct CommitPlan {
+    pub auxiliary: Vec<(u32, Vec<u8>)>,
+    pub meta: Vec<u8>,
+    pub persisted: Vec<u32>,
+    pub page_count: u32,
+    pub live: u32,
+    pub generation: u64,
+}
+
+pub(crate) fn plan_shared_commit(
+    page_size: u32,
+    txid: u64,
+    write: &IncrementalWrite,
+) -> Result<CommitPlan> {
+    let n = commit_manifest::overflow_needed(page_size as usize, write.pages.len());
+    let end = write.page_count.checked_add(n as u32).ok_or_else(|| {
+        EngineError::new(
+            SqlState::ProgramLimitExceeded,
+            "database page limit exceeded",
+        )
+    })?;
+    let ids: Vec<_> = (write.page_count..end).collect();
+    let (meta, auxiliary) = commit_manifest::encode(
+        meta_page(page_size, txid, write.root_page, end, 0),
+        &write.pages,
+        &[],
+        &ids,
+    );
+    Ok(CommitPlan {
+        auxiliary,
+        meta,
+        persisted: Vec::new(),
+        page_count: end,
+        live: 0,
+        generation: txid,
+    })
 }
 
 /// Add every node page of a resident B+tree to `reached`: an interior/leaf node's own set-once page,
@@ -3261,8 +3406,7 @@ fn pack(sizes: &[usize], cap: usize) -> Result<Vec<Vec<usize>>> {
     Ok(groups)
 }
 
-/// One meta slot's full `page_size` bytes (the 36-byte header + its CRC, zero-padded): its only
-/// content. `to_image` copies it into both slots; an incremental commit pwrites it to the alternate
+/// One bootstrap meta slot's full `page_size` bytes (v33 fixed 64-byte header, zero descriptor). `to_image` copies it into both slots; an incremental commit pwrites it to the alternate
 /// slot (`file.rs`). Single-sources the meta byte layout (spec/fileformat/format.md).
 pub(crate) fn meta_page(
     page_size: u32,
@@ -3280,7 +3424,7 @@ pub(crate) fn meta_page(
     p[24..28].copy_from_slice(&page_count.to_be_bytes());
     // v25: offset 28 is the persisted free-list head (0 = empty); through v24 it was reserved 0.
     p[28..32].copy_from_slice(&free_list_head.to_be_bytes());
-    let crc = crc32_ieee(&p[0..32]);
+    let crc = meta_crc(&p);
     p[32..36].copy_from_slice(&crc.to_be_bytes());
     p
 }
@@ -3331,6 +3475,7 @@ fn write_page(
 
 /// A validated meta slot's salient fields.
 struct Meta {
+    protected: Arc<HashSet<u32>>,
     txid: u64,
     root_page: u32,
     /// On-disk page high-water — the next free page an incremental commit appends at (P6.1 part B).
@@ -3343,7 +3488,7 @@ struct Meta {
 /// Validate a standalone meta block; None if it is not a valid meta. Shared by `read_meta` (whole
 /// image) and the demand-paged loader (which reads meta slots 0/1 as individual blocks).
 fn parse_meta(m: &[u8]) -> Option<Meta> {
-    if m.len() < 36 {
+    if m.len() < 64 || u32::from_be_bytes(m[8..12].try_into().unwrap()) as usize != m.len() {
         return None;
     }
     if m[0..4] != MAGIC {
@@ -3356,7 +3501,7 @@ fn parse_meta(m: &[u8]) -> Option<Meta> {
         return None;
     }
     let stored = u32::from_be_bytes([m[32], m[33], m[34], m[35]]);
-    if crc32_ieee(&m[0..32]) != stored {
+    if meta_crc(m) != stored {
         return None;
     }
     let page_count = u32::from_be_bytes(m[24..28].try_into().unwrap());
@@ -3365,7 +3510,12 @@ fn parse_meta(m: &[u8]) -> Option<Meta> {
     if free_list_head != 0 && (free_list_head < ROOT_PAGE || free_list_head >= page_count) {
         return None;
     }
+    let root_page = u32::from_be_bytes(m[20..24].try_into().unwrap());
+    if root_page < ROOT_PAGE || root_page >= page_count {
+        return None;
+    }
     Some(Meta {
+        protected: Arc::new(HashSet::new()),
         txid: u64::from_be_bytes(m[12..20].try_into().unwrap()),
         root_page: u32::from_be_bytes(m[20..24].try_into().unwrap()),
         page_count,
@@ -3385,12 +3535,21 @@ fn read_meta(image: &[u8], ps: usize, slot: usize) -> Option<Meta> {
 /// Pick the valid meta slot with the highest txid (tie → slot 0); the lone valid
 /// slot on a torn write; error if neither is valid (spec/fileformat/format.md).
 fn select_meta(image: &[u8], ps: usize) -> Result<Meta> {
-    match (read_meta(image, ps, 0), read_meta(image, ps, 1)) {
-        (Some(a), Some(b)) => Ok(if b.txid > a.txid { b } else { a }),
-        (Some(a), None) => Ok(a),
-        (None, Some(b)) => Ok(b),
-        (None, None) => Err(corrupt("no valid meta page")),
+    let mut candidates: Vec<_> = (0..2)
+        .filter_map(|slot| read_meta(image, ps, slot).map(|m| (m, slot)))
+        .collect();
+    candidates.sort_by(|a, b| b.0.txid.cmp(&a.0.txid));
+    for (mut meta, slot) in candidates {
+        if let Some(protected) = commit_manifest::validate(
+            &image[slot * ps..(slot + 1) * ps],
+            (image.len() / ps) as u32,
+            |id| Ok(image[id as usize * ps..(id as usize + 1) * ps].to_vec()),
+        )? {
+            meta.protected = Arc::new(protected);
+            return Ok(meta);
+        }
     }
+    Err(corrupt("no complete valid meta page"))
 }
 
 /// A parsed page: header fields + a borrowed payload slice.

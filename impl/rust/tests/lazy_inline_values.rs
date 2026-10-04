@@ -327,7 +327,18 @@ fn untouched_corrupt_inline_body_defers_its_error() {
     // page CRC so the corruption is checksum-valid (isolating the failure to decode time).
     {
         let ps = jed::DEFAULT_PAGE_SIZE as usize;
-        let mut bytes = std::fs::read(&path).unwrap();
+        // Isolate inherited page decoding from v33 incremental commit recovery.
+        let db = Database::open_with_options(
+            &path,
+            OpenOptions {
+                skip_fsync: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .session(SessionOptions::default());
+        let mut bytes = db.to_image(ps as u32, db.txid()).unwrap();
+        drop(db);
         let needle = marker.as_bytes();
         let at = bytes
             .windows(needle.len())

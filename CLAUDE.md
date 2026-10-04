@@ -579,6 +579,16 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   the goldens and the deterministic cost depend on (the §14 analysis, recorded in
   large-values.md §6); the work is metered by the `value_compress`/`value_decompress` cost
   units (§13).
+- **Validated COW durable commits (format v33).** Dirty body pages are written once, with
+  CRC-64/ECMA-182 identities recorded inline in the alternate meta page and, for large
+  transactions, in reusable manifest overflow pages. A single final durable barrier replaces
+  the former body-sync/meta-sync pair. Recovery validates the manifest and dirty pages before
+  accepting a root; the free list excludes all current commit dependencies, including orphan
+  writes and manifest pages. Adopted recovery/foreign generations are stabilized before new
+  writes, and I/O failures poison the storage handle until reopen. File-growth and recovery
+  barriers remain additional; this is one barrier for steady-state commits. No WAL, body redo,
+  or new host durability primitive. The same v33 bytes and protocol bind Rust, Go, TypeScript,
+  and shared-file access. [spec/design/validated-cow.md](spec/design/validated-cow.md).
 - On-disk format and key encoding are spec'd with byte fixtures (§8). **Status:** the
   single-file on-disk format is authored in `spec/fileformat/format.md` and is now the
   **page-backed copy-on-write B+tree** (`format_version` 24 — the B+tree reshape,
@@ -633,14 +643,14 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   and **on-disk free-list persistence + continuous within-session reclamation**
   (`format_version` 25 — meta offset 28 `free_list_head` + a new `page_type 7` free-list page; open
   reads the persisted free-list instead of the reachability walk, and a file commit reclaims its fresh
-  orphans in-commit under the reader watermark, `spec/design/storage.md` §6). **Open now reads only
+  orphans in-commit under the reader watermark, `spec/design/storage.md` §6). **Tree loading reads only
   the interior spine** — with v25's free-list persistence, v28 removes the last reason open touched
   every leaf by persisting an exact nonnegative signed-i64 row count in each table catalog entry.
   The catalog loader checks `(root_data_page == 0) == (row_count == 0)` and installs the count beside
   the skeleton; `read_skeleton` classifies each interior's children by the B+tree same-depth invariant
   (resolve only the first child, reference leaf siblings as `OnDisk` without reading them). Counts
-  follow the persistent root through DML and snapshot rollback, so open is O(interior spine), not
-  O(file) (`spec/design/storage.md` §6; the no-PK synthetic-rowid table is the lone leaf-faulting
+  follow the persistent root through DML and snapshot rollback. V33 opening adds validation of
+  the last transaction's dirty-page set to that O(interior spine) work, without an O(file) walk (`spec/design/storage.md` §6; the no-PK synthetic-rowid table is the lone leaf-faulting
   exception). The from-scratch whole-image
   serializer survives as `create`'s initial write and the golden generator.
 - **Host file API (Phase 7).** The embedding surface (`spec/design/api.md`) `open`s/`create`s

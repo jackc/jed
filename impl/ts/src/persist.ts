@@ -9,6 +9,13 @@
 
 import type { Engine, Snapshot } from "./executor.ts";
 import {
+  buildCommitManifest,
+  manifestInlineCapacity,
+  manifestOverflowCapacity,
+  metaChecksum,
+} from "./commit_manifest.ts";
+import { engineError } from "./errors.ts";
+import {
   incrementalImage,
   type IncrementalWrite,
   metaPage,
@@ -17,22 +24,18 @@ import {
   ROOT_PAGE,
 } from "./format.ts";
 
-// persistImpl durably publishes snap to the backing store via an incremental commit. Two branches
-// (v25). A FILE store (commitFile): write the dirty tree + catalog, then — in the same commit, before
-// the meta — plan and serialize the persisted page_type 7 free-list (which reclaims this commit's fresh
-// orphans, planFreeList), then the alternate meta slot. Without in-commit reclamation a short
-// open→commit→close session would leak orphans forever (open no longer reconstructs the free-list). An
-// IN-MEMORY store (commitInMemory): write the dirty pages + a head-0 meta (both no-ops on a
-// MemoryBlockStore's sync), then a POST-commit RAM compaction (maybeCompact) — never reopened, so it
-// need not be in-commit. A crash between the syncs leaves the prior meta intact (reused pages are dead
-// at the fallback snapshot). `canReclaim` is the caller's watermark decision; when omitted (the bare
-// persistHook), it defaults to "no open streaming cursor" (db.openStreams === 0).
+// Durable stores write body, free-list, descriptor, and alternate meta, then synchronize once.
+// Recovery checks every descriptor dependency before selecting that meta. The committed free list
+// excludes all descriptor dependencies, preserving the previous candidate during the next commit.
+// Memory stores retain their RAM free list and post-commit compaction without descriptor overhead.
+// canReclaim is the caller's reader-watermark decision (default: no open streaming cursor).
 export function persistImpl(
   db: Engine,
   snap: Snapshot,
   canReclaim?: boolean,
   canReuse = true,
 ): IncrementalWrite {
+  if (db.paging !== null && db.persistHook !== null) db.paging.beginDurableCommit();
   const write = incrementalImage(
     snap,
     db.pageSize,
@@ -52,9 +55,9 @@ export function persistImpl(
 }
 
 // Shared-process commit is deliberately append-only (locking.md §5.3): it never consumes the
-// persisted free list, rewrites its chain, truncates, or replaces the file. Body pages become durable
-// first; the caller owns commit EX only for publishMeta, keeping reader admission blocked for the
-// shortest window.
+// persisted free list, rewrites its chain, truncates, or replaces the file. Body and overflow
+// descriptor writes happen before commit EX; meta publication and the single durability barrier
+// stay inside commit EX so another process cannot adopt an unacknowledged live writer's generation.
 export function persistSharedBody(
   db: Engine,
   snap: Snapshot,
@@ -62,20 +65,30 @@ export function persistSharedBody(
   write: IncrementalWrite;
   publishMeta: () => void;
 } {
-  const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages, db.paging, false);
   const paging = db.paging;
+  paging?.beginDurableCommit();
+  const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages, db.paging, false);
   if (paging === null) return { write, publishMeta: () => {} };
   paging.refreshAllocatedPages();
-  paging.reserve(write.pageCount);
-  for (const pg of write.pages) paging.writeBlock(pg.index, pg.bytes);
-  paging.sync();
+  const overflowCount = Math.ceil(
+    Math.max(0, write.pages.length - manifestInlineCapacity(db.pageSize)) /
+      manifestOverflowCapacity(db.pageSize),
+  );
+  const pageCount = write.pageCount + overflowCount;
+  if (pageCount > 0xffff_ffff)
+    throw engineError("program_limit_exceeded", "database page limit exceeded");
+  const ids = Array.from({ length: overflowCount }, (_, i) => write.pageCount + i);
+  const manifest = buildCommitManifest(db.pageSize, snap.txid, write.pages, ids);
+  paging.reserve(pageCount);
+  for (const pg of [...write.pages, ...manifest.pages]) paging.writeBlock(pg.index, pg.bytes);
   return {
     write,
     publishMeta: () => {
-      const meta = metaPage(db.pageSize, snap.txid, write.rootPage, write.pageCount, 0);
+      const meta = metaPage(db.pageSize, snap.txid, write.rootPage, pageCount, 0, manifest);
       paging.writeBlock(Number(snap.txid & 1n), meta);
       paging.sync();
-      db.pageCount = write.pageCount;
+      paging.finishDurableCommit(snap.txid, metaChecksum(meta));
+      db.pageCount = pageCount;
       db.freePages = [];
       // Zero is the orphan sentinel: the first later alone commit rebuilds the free list instead of
       // trusting reachability facts from before a co-resident interval.
@@ -85,11 +98,9 @@ export function persistSharedBody(
   };
 }
 
-// commitFile is the FILE branch of persistImpl (v25). Write the tree + catalog first (unsynced) so the
-// in-commit reachability walk can read the new catalog back through the pager (read-your-writes); then
-// planFreeList serializes the persisted free-list (drawn from freeRemaining, so persisting never grows
-// the file). One sync covers every body page (tree/catalog/free-list), then the alternate meta slot +
-// a second sync — the same crash-recovery ordering the fault-injection matrix asserts (storage.md §7).
+// Write tree/catalog first so reclamation can read the new catalog. Joint allocation then reserves
+// descriptor and free-list pages from the prior safe free set, protecting every new write from reuse.
+// The inline/overflow descriptor hashes those body pages and the single final sync publishes them.
 function commitFile(
   db: Engine,
   snap: Snapshot,
@@ -122,10 +133,27 @@ function commitFile(
     paging.writeBlock(pg.index, pg.bytes);
     paging.invalidate(pg.index);
   }
-  paging.sync(); // every body page (tree/catalog/free-list) durable before the meta
-  const meta = metaPage(db.pageSize, snap.txid, write.rootPage, plan.newPageCount, plan.head);
+  const manifest = buildCommitManifest(
+    db.pageSize,
+    snap.txid,
+    [...write.pages, ...plan.pages],
+    plan.manifestIds,
+  );
+  for (const pg of manifest.pages) {
+    paging.writeBlock(pg.index, pg.bytes);
+    paging.invalidate(pg.index);
+  }
+  const meta = metaPage(
+    db.pageSize,
+    snap.txid,
+    write.rootPage,
+    plan.newPageCount,
+    plan.head,
+    manifest,
+  );
   paging.writeBlock(Number(snap.txid & 1n), meta);
-  paging.sync(); // the commit is published
+  paging.sync(); // one durability barrier covers body + descriptor + meta
+  paging.finishDurableCommit(snap.txid, metaChecksum(meta));
   db.pageCount = plan.newPageCount;
   db.freePages = plan.persisted;
   db.liveAtCompaction = plan.newLive;

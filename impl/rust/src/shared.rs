@@ -346,19 +346,18 @@ impl Storage {
     /// (spec/fileformat/format.md; transactions.md §9) — the same recipe [`Shared::persist`] uses for
     /// the MAIN domain, factored out so a host-attached FILE database (attached-databases.md §5, Slice 2)
     /// commits durably through it too: write the dirty pages this commit introduced (reusing free-list
-    /// pages first), `sync`, publish the alternate meta slot (`snap.txid & 1`), `sync`. A crash between
-    /// the two syncs leaves the prior meta intact (copy-on-write: reused pages are reachable from no live
-    /// snapshot). `page_count`/`free_pages` advance only after both syncs succeed. For an IN-MEMORY store
-    /// the store's `sync` is a no-op — the file commit minus durability (bplus-reshape.md B3). Runs under
-    /// the caller's writer gate. `can_reclaim` gates within-session compaction (v25: on for the
-    /// file/main domain — it persists the free-list and reclaims within-session rather than
-    /// reconstructing on open).
+    /// pages first), write the validated meta and sync once. Accounting advances only after the
+    /// barrier succeeds. Ephemeral memory stores retain their existing RAM reclamation path.
+    /// Runs under the caller's writer gate; reclamation and reuse obey the reader watermark.
     pub(crate) fn commit_durable(
         &mut self,
         snap: &Snapshot,
         can_reclaim: bool,
         can_reuse: bool,
     ) -> Result<()> {
+        if self.path.is_some() {
+            self.paging.pager().begin_commit()?;
+        }
         let write = snap.incremental_image(
             self.page_size,
             self.page_count,
@@ -373,14 +372,8 @@ impl Storage {
         }
     }
 
-    /// The FILE branch of [`commit_durable`] (v25): write the dirty tree + catalog, then — in the same
-    /// commit, before the meta — plan and serialize the persisted `page_type 7` free-list (which
-    /// reclaims this commit's fresh orphans, `plan_free_list`), then the alternate meta slot. The
-    /// free-list walk reads the just-written catalog back through the pager, so the tree+catalog write
-    /// and the free-list write are two body blocks under one `sync` (the body barrier), then the meta
-    /// under a second `sync` — the same crash-recovery ordering the fault-injection matrix asserts
-    /// (storage.md §7). A crash between the syncs leaves the prior meta intact (reused pages are dead at
-    /// the fallback snapshot).
+    /// File commit: write body pages so the reclamation walk can read the new catalog, then
+    /// jointly allocate free-list/manifest pages. Publish the validated meta and sync once.
     fn commit_file(
         &mut self,
         snap: &Snapshot,
@@ -400,47 +393,39 @@ impl Storage {
                 pager.write_block(*index, bytes)?;
             }
         }
-        let (fl_pages, head, persisted, new_page_count, new_live, new_gen) =
-            crate::format::plan_free_list(
-                snap,
-                &self.paging,
-                write.root_page,
-                &write.pages,
-                &write.free_remaining,
-                write.page_count,
-                self.live_at_compaction,
-                self.free_gen_txid,
-                cap,
-                ps,
-                can_reclaim,
-                can_reuse,
-            )?;
-        let meta = crate::format::meta_page(
-            self.page_size,
-            snap.txid,
+        let plan = crate::format::plan_free_list(
+            snap,
+            &self.paging,
             write.root_page,
-            new_page_count,
-            head,
-        );
+            &write.pages,
+            &write.free_remaining,
+            write.page_count,
+            self.live_at_compaction,
+            self.free_gen_txid,
+            cap,
+            ps,
+            can_reclaim,
+            can_reuse,
+        )?;
         {
             let mut pager = self.paging.pager();
-            pager.reserve(new_page_count)?;
-            for (index, bytes) in &fl_pages {
+            pager.reserve(plan.page_count)?;
+            for (index, bytes) in &plan.auxiliary {
                 pager.write_block(*index, bytes)?;
             }
-            pager.sync()?; // every body page (tree/catalog/free-list) durable before the meta
-            pager.write_block((snap.txid & 1) as u32, &meta)?;
-            pager.sync()?; // the commit is published
+            pager.write_block((snap.txid & 1) as u32, &plan.meta)?;
+            pager.sync()?;
+            pager.finish_commit(&plan.meta);
         }
         // Invalidate rewritten pages AFTER the pager guard drops (pool-then-pager order, paging.rs):
         // evicts a stale pool decode of any free page this commit reused for new content.
-        for (index, _) in write.pages.iter().chain(fl_pages.iter()) {
+        for (index, _) in write.pages.iter().chain(plan.auxiliary.iter()) {
             self.paging.invalidate(*index);
         }
-        self.page_count = new_page_count;
-        self.free_pages = persisted;
-        self.live_at_compaction = new_live;
-        self.free_gen_txid = new_gen;
+        self.page_count = plan.page_count;
+        self.free_pages = plan.persisted;
+        self.live_at_compaction = plan.live;
+        self.free_gen_txid = plan.generation;
         Ok(())
     }
 
@@ -453,30 +438,24 @@ impl Storage {
         write: crate::format::IncrementalWrite,
         coordinator: &FileCoordinator,
     ) -> Result<()> {
-        let meta = crate::format::meta_page(
-            self.page_size,
-            snap.txid,
-            write.root_page,
-            write.page_count,
-            0,
-        );
+        let plan = crate::format::plan_shared_commit(self.page_size, snap.txid, &write)?;
         {
             let mut pager = self.paging.pager();
             pager.refresh_allocated_pages()?;
-            pager.reserve(write.page_count)?;
-            for (index, bytes) in &write.pages {
+            pager.reserve(plan.page_count)?;
+            for (index, bytes) in write.pages.iter().chain(plan.auxiliary.iter()) {
                 pager.write_block(*index, bytes)?;
             }
-            pager.sync()?;
         }
         let commit = coordinator.lock_commit_exclusive()?;
         {
             let mut pager = self.paging.pager();
-            pager.write_block((snap.txid & 1) as u32, &meta)?;
+            pager.write_block((snap.txid & 1) as u32, &plan.meta)?;
             pager.sync()?;
+            pager.finish_commit(&plan.meta);
         }
         drop(commit);
-        self.page_count = write.page_count;
+        self.page_count = plan.page_count;
         self.free_pages.clear();
         // Force the first later alone commit to reconstruct the reclaimable set.
         self.live_at_compaction = 0;
@@ -1063,6 +1042,7 @@ impl Shared {
                     .as_ref()
                     .is_some_and(|coordinator| coordinator.state() == LeaseState::Shared);
                 if shared {
+                    att.storage.paging.pager().begin_commit()?;
                     let write = snap.incremental_image(
                         att.storage.page_size,
                         att.storage.page_count,
@@ -1202,11 +1182,8 @@ impl Shared {
     /// into its `MemoryBlockStore`, whose `sync` is a no-op — the file commit minus durability, one
     /// code path. Called from [`Session::publish`] under the writer gate, so the
     /// `page_count`/`free_pages` mutation is single-writer. Writes the dirty pages this commit
-    /// introduced (reusing reconstruct-on-open free-list pages first), `sync`s, publishes the
-    /// alternate meta slot (`snap.txid & 1`), `sync`s. A crash between the two syncs leaves the prior
-    /// meta intact (copy-on-write: reused pages are reachable from no live snapshot). `page_count` /
-    /// `free_pages` advance only after both syncs succeed, so a write failure leaves the file's prior
-    /// meta and this accounting untouched (the working snapshot is then discarded by the caller).
+    /// introduced, their validation descriptor, and the alternate meta, then syncs once. The
+    /// published root and allocator accounting advance only after successful durability.
     fn persist(&self, snap: &Snapshot) -> Result<()> {
         // The reader-liveness watermark (transactions.md §8) gates two things at the main-domain commit:
         //   - can_reclaim (oldest_live == the new version, i.e. no reader live at an older version) lets the
@@ -1225,6 +1202,7 @@ impl Shared {
         let mut st = self.storage.lock().expect("storage lock not poisoned");
         let can_reuse = !shared && oldest >= st.free_gen_txid;
         if shared && st.path.is_some() {
+            st.paging.pager().begin_commit()?;
             let write = snap.incremental_image(
                 st.page_size,
                 st.page_count,

@@ -87,6 +87,11 @@ export class Pager {
   private fault: CommitFault | null = null;
   private bodyWrites = 0;
   private syncs = 0;
+  private durableCommitActive = false;
+  private adoptedNeedsSync = false;
+  private acknowledgedMeta = "";
+  private validatedMeta: Uint8Array | null = null;
+  private validatedPages: Set<number> | null = null;
 
   private constructor(store: BlockStore, pageSize: number, allocatedPages: number) {
     this.store = store;
@@ -140,7 +145,7 @@ export class Pager {
       8,
       false,
     );
-    if (pageSize === 0) {
+    if (pageSize < 256 || pageSize > 65536 || (pageSize & (pageSize - 1)) !== 0) {
       throw engineError("data_corrupted", "zero page size in meta header");
     }
     // The allocation high-water is the current file length in pages — already past the committed
@@ -197,9 +202,9 @@ export class Pager {
     this.allocatedPages = Math.floor(this.store.size() / this.pageSize);
   }
 
-  // sync is the metadata-free durability barrier — the host's data-only sync (fdatasync). Called twice
-  // per commit — body pages, then the meta — to honour the body-before-meta write-ordering rule
-  // (format.md, file.ts persistImpl). Data-only (not a full fsync) so an overwrite into the
+  // sync is the host durability barrier. Validated COW uses one final sync for body, descriptor,
+  // and meta together (format.md). A recovered generation also syncs once before its first write.
+  // The native host uses its data-integrity primitive so an overwrite into the
   // preallocated region (reserve) flushes only the data, never a file-size/inode-timestamp metadata
   // journal (spec/design/pager.md §7).
   sync(): void {
@@ -211,6 +216,48 @@ export class Pager {
       }
     }
     this.store.sync();
+  }
+
+  // A recovered descriptor can represent a complete but unacknowledged transaction. Make that
+  // generation durable before any successor overwrites its fallback or relies on inherited pages.
+  adoptCommit(txid: bigint, checksum: number, needsSync: boolean): void {
+    const identity = `${txid}:${checksum}`;
+    if (identity !== this.acknowledgedMeta) this.adoptedNeedsSync = needsSync;
+  }
+
+  beginDurableCommit(): void {
+    if (this.durableCommitActive) {
+      throw engineError("io_error", "database has an incomplete durable commit; close and reopen");
+    }
+    this.durableCommitActive = true;
+    this.validatedMeta = null;
+    this.validatedPages = null;
+    if (this.adoptedNeedsSync) {
+      this.sync();
+      this.adoptedNeedsSync = false;
+    }
+  }
+
+  finishDurableCommit(txid: bigint, checksum: number): void {
+    this.acknowledgedMeta = `${txid}:${checksum}`;
+    this.adoptedNeedsSync = false;
+    this.durableCommitActive = false;
+  }
+
+  cachedValidation(meta: Uint8Array): Set<number> | null {
+    const cached = this.validatedMeta;
+    if (cached === null || cached.length !== meta.length) return null;
+    for (let i = 0; i < meta.length; i++) if (cached[i] !== meta[i]) return null;
+    return this.validatedPages;
+  }
+
+  cacheValidation(meta: Uint8Array, pages: Set<number>): void {
+    this.validatedMeta = meta.slice();
+    this.validatedPages = pages;
+  }
+
+  physicalPages(): number {
+    return Math.floor(this.store.size() / this.pageSize);
   }
 
   // close releases the backing store (close()).

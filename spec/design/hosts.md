@@ -100,8 +100,8 @@ which it already does.
   (§4).
 - **`write_at` is *staged*, not durable.** It may land in an OS page cache; only `sync()`
   guarantees durability. The commit recipe (storage.md §4) relies on this exactly: write all
-  dirty body pages, `sync()`, write the meta slot, `sync()` — the two barriers are the only
-  durability points.
+  dirty body pages and their manifest, write the alternate meta slot, then `sync()`. Recovery
+  validates the dirty-page identities instead of requiring an earlier ordering barrier (v33).
 - **There are two durability barriers, and the *caller* picks — it is not a host flavor.** The
   engine deliberately separates a **data-only** barrier from a **metadata** barrier, because on
   ext4 a write+barrier into a *growing* file drags the inode-size/extent journal into the flush
@@ -110,9 +110,9 @@ which it already does.
   something the host chooses blindly:
   - **`sync()` is the data-only barrier (`fdatasync`).** It makes every prior `write_at` into
     already-allocated space durable, *without* flushing a file-size/inode-timestamp metadata
-    journal. This is the per-commit chokepoint — called twice per commit (body pages, then the
-    meta slot; storage.md §4) — and steady-state commits overwrite preallocated space, so it is
-    metadata-free.
+    journal. This is the per-commit chokepoint — called once after body, manifest, and meta
+    writes (v33, storage.md §4). Recovery/foreign-generation stabilization adds a barrier before
+    new writes when required; steady-state commits overwrite preallocated space.
   - **`set_size` is the metadata barrier (full `fsync`)** — see the next bullet; growth is the
     only metadata change the engine makes, so the full barrier is bundled there.
   The *realization* is per-core (not a cross-core byte contract, like the buffer pool and the

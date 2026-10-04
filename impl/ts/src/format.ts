@@ -38,7 +38,17 @@ import {
 import { parseExpression } from "./parser.ts";
 import { type Collation, loadedCollation } from "./collation.ts";
 import { Decimal } from "./decimal.ts";
-import { crc32Ieee, crc32Update } from "./crc32.ts";
+import { crc32Update } from "./crc32.ts";
+import {
+  type CommitManifest,
+  type CommitMeta,
+  manifestInlineCapacity,
+  manifestOverflowCapacity,
+  metaChecksum,
+  parseCommitMeta,
+  validateCommitMeta,
+  writeManifestMeta,
+} from "./commit_manifest.ts";
 import { decodeInt, decodeIntAt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
 import { encodeTypedKey, Engine, Snapshot } from "./executor.ts";
@@ -113,7 +123,7 @@ import {
   STATISTICS_SAMPLE_ROWS,
 } from "./estimator_constants.ts";
 
-const FORMAT_VERSION = 32; // 32 = timezone index dependencies (index-dependencies.md); 31 = host-function index dependencies (spec/design/extensibility.md §8.1, delivery step 4): the per-index index_flags byte gains bit2 has_host_deps, and — only when set — after the v27 predicate a u16 dep_count + per dependency name (u16 len + UTF-8) ‖ arg_count u16 ‖ arg type codes (u8 each) ‖ result type code (u8) ‖ component_id (u16 len + UTF-8) ‖ semantic_version u32, in ascending (name, arg-type codes) order. An index with no host-function key is byte-identical to v30, so a file with no such index moves to v31 only by its version byte + meta CRC. 30 = three-bit FOREIGN KEY action codes for CASCADE / SET NULL / SET DEFAULT; 29 = deterministic per-column statistics (kind 4; spec/design/statistics.md); 28 = exact table row count: each table catalog entry appends a nonnegative i64 row_count after root_data_page, with (root_data_page == 0) == (row_count == 0); on-disk format version (27 = partial-index predicates — spec/design/indexes.md §9: the per-index index_flags byte gains bit1 has_predicate, and (only when set) a u16 length + the canonical predicate text (the *Check-expression text* form) follows index_root_page; on load a partial predicate re-parses that text (XX001 on failure, like a stored CHECK) and a non-btree index with bit1 set is data_corrupted. B-tree only. A non-partial index is byte-identical to v26, so a file with no partial index moves to v27 only by its version byte + meta CRC. 26 = expression index keys — spec/design/indexes.md §1/§6: a per-index key element is a u16 column ordinal OR the 0xFFFF sentinel (never a valid ordinal, col_count ≤ 65535) + a u16 length + the expression's canonical UTF-8 text (the *Check-expression text* form, re-parsed on load — XX001 on failure, like a stored CHECK; a GIN/GiST index with a non-column key is data_corrupted). Only the index-list changes; a plain column index is byte-identical to v6, so a file with no expression index moves to v26 only by its version byte + meta CRC. 25 = on-disk free-list persistence — spec/fileformat/format.md; storage.md §6: meta offset 28 becomes free_list_head (0 = empty), and a page_type 7 free-list page persists the unconsumed free-list so open reads it directly instead of reconstructing it by walking every leaf; paired with continuous within-session reclamation. A from-scratch image (create/goldens) has an EMPTY free-list, so free_list_head = 0 and no page_type 7 page: every golden's only v25 change is its version byte + meta CRC. 24 = the B+tree reshape — spec/design/bplus-reshape.md, spec/fileformat/format.md "The per-table data B+tree": records live ONLY in leaves; an INTERIOR page (page_type 3) is a record-free routing skeleton — N+1 child pointers (u32 BE) ‖ an N-entry END-OFFSET separator directory (u32 BE) ‖ the separator key blob. A separator is a COPY of a boundary key (a leaf split copies the right half's first key up; an interior split pushes its median separator up; leaf merges remove the parent separator, interior merges pull it down — the regenerated "Fan-out" byte contract). The LEAF column regions gain a leading flags byte (reserved 0 — the dictionary door) and split by column CLASS: a FIXED-WIDTH column region is a null bitmap (ceil(N/8), MSB-first, set = NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled); a VARIABLE-WIDTH region is an N-entry end-offset value directory + the v23 tagged codec bytes with NULL a ZERO-LENGTH SPAN — the presence tag 0x01 never appears inside a v24 leaf (the single-value codec elsewhere — catalog defaults, overflow content, composite/array element bodies — is byte-unchanged). Directories throughout drop the redundant leading zero (N end offsets, not N+1 prefix sums). record_size is restated as key_len + Σ value_size (fixed → width, NULL variable → 0; the v23 phantom 2+ is dropped); RECORD_MAX keeps its value (C − max(12, 12+16K))/2, re-derived leaf-only. 23 = PAX leaf layout — a B-tree LEAF page stored its records COLUMN-MAJOR (key directory ‖ key blob ‖ column directory ‖ per column a value directory + tagged bodies, NULL = a 0x01 byte); interior pages stayed row-major and carried full records. 22 = varchar(n) length limits — spec/design/types.md §15: a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints — spec/design/gist.md §7/§8, GX3: a per-table exclusion list after the foreign-key list, each entry the constraint name + its backing GiST index name + a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes — spec/design/gist.md GX1: a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encodeRangeBody(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encodeRangeBody(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index moves to v20 only by its version byte. 19 = storable json/jsonb columns — spec/design/json.md, slice J1/J1b: a column type can be json (type_code 18) or jsonb (type_code 19), plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + unsigned LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+const FORMAT_VERSION = 33; // 33 = validated COW commit descriptors; 32 = timezone index dependencies (index-dependencies.md); 31 = host-function index dependencies (spec/design/extensibility.md §8.1, delivery step 4): the per-index index_flags byte gains bit2 has_host_deps, and — only when set — after the v27 predicate a u16 dep_count + per dependency name (u16 len + UTF-8) ‖ arg_count u16 ‖ arg type codes (u8 each) ‖ result type code (u8) ‖ component_id (u16 len + UTF-8) ‖ semantic_version u32, in ascending (name, arg-type codes) order. An index with no host-function key is byte-identical to v30, so a file with no such index moves to v31 only by its version byte + meta CRC. 30 = three-bit FOREIGN KEY action codes for CASCADE / SET NULL / SET DEFAULT; 29 = deterministic per-column statistics (kind 4; spec/design/statistics.md); 28 = exact table row count: each table catalog entry appends a nonnegative i64 row_count after root_data_page, with (root_data_page == 0) == (row_count == 0); on-disk format version (27 = partial-index predicates — spec/design/indexes.md §9: the per-index index_flags byte gains bit1 has_predicate, and (only when set) a u16 length + the canonical predicate text (the *Check-expression text* form) follows index_root_page; on load a partial predicate re-parses that text (XX001 on failure, like a stored CHECK) and a non-btree index with bit1 set is data_corrupted. B-tree only. A non-partial index is byte-identical to v26, so a file with no partial index moves to v27 only by its version byte + meta CRC. 26 = expression index keys — spec/design/indexes.md §1/§6: a per-index key element is a u16 column ordinal OR the 0xFFFF sentinel (never a valid ordinal, col_count ≤ 65535) + a u16 length + the expression's canonical UTF-8 text (the *Check-expression text* form, re-parsed on load — XX001 on failure, like a stored CHECK; a GIN/GiST index with a non-column key is data_corrupted). Only the index-list changes; a plain column index is byte-identical to v6, so a file with no expression index moves to v26 only by its version byte + meta CRC. 25 = on-disk free-list persistence — spec/fileformat/format.md; storage.md §6: meta offset 28 becomes free_list_head (0 = empty), and a page_type 7 free-list page persists the unconsumed free-list so open reads it directly instead of reconstructing it by walking every leaf; paired with continuous within-session reclamation. A from-scratch image (create/goldens) has an EMPTY free-list, so free_list_head = 0 and no page_type 7 page: every golden's only v25 change is its version byte + meta CRC. 24 = the B+tree reshape — spec/design/bplus-reshape.md, spec/fileformat/format.md "The per-table data B+tree": records live ONLY in leaves; an INTERIOR page (page_type 3) is a record-free routing skeleton — N+1 child pointers (u32 BE) ‖ an N-entry END-OFFSET separator directory (u32 BE) ‖ the separator key blob. A separator is a COPY of a boundary key (a leaf split copies the right half's first key up; an interior split pushes its median separator up; leaf merges remove the parent separator, interior merges pull it down — the regenerated "Fan-out" byte contract). The LEAF column regions gain a leading flags byte (reserved 0 — the dictionary door) and split by column CLASS: a FIXED-WIDTH column region is a null bitmap (ceil(N/8), MSB-first, set = NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled); a VARIABLE-WIDTH region is an N-entry end-offset value directory + the v23 tagged codec bytes with NULL a ZERO-LENGTH SPAN — the presence tag 0x01 never appears inside a v24 leaf (the single-value codec elsewhere — catalog defaults, overflow content, composite/array element bodies — is byte-unchanged). Directories throughout drop the redundant leading zero (N end offsets, not N+1 prefix sums). record_size is restated as key_len + Σ value_size (fixed → width, NULL variable → 0; the v23 phantom 2+ is dropped); RECORD_MAX keeps its value (C − max(12, 12+16K))/2, re-derived leaf-only. 23 = PAX leaf layout — a B-tree LEAF page stored its records COLUMN-MAJOR (key directory ‖ key blob ‖ column directory ‖ per column a value directory + tagged bodies, NULL = a 0x01 byte); interior pages stayed row-major and carried full records. 22 = varchar(n) length limits — spec/design/types.md §15: a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints — spec/design/gist.md §7/§8, GX3: a per-table exclusion list after the foreign-key list, each entry the constraint name + its backing GiST index name + a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes — spec/design/gist.md GX1: a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encodeRangeBody(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encodeRangeBody(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index moves to v20 only by its version byte. 19 = storable json/jsonb columns — spec/design/json.md, slice J1/J1b: a column type can be json (type_code 18) or jsonb (type_code 19), plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + unsigned LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const RECORD_MAX_RESERVE = 12; // bytes reserved inside RECORD_MAX beyond the per-column term — independent of PAGE_HEADER (format.md "Why the record cap"). Historically the two-key interior node's 3 child pointers (4·3); since v24 the value is kept as the K=0 floor of the leaf-only re-derivation (a two-record index leaf is exactly 2·(C−12)/2 + 4·2 + 4 = C).
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -2323,6 +2333,8 @@ class PageAlloc {
 
   take(): number {
     if (this.reuse && this.cursor < this.free.length) return this.free[this.cursor++]!;
+    if (this.next >= 0xffff_ffff)
+      throw engineError("program_limit_exceeded", "database page limit exceeded");
     return this.next++;
   }
 
@@ -2688,16 +2700,36 @@ function collectTreePages(n: PNode | null, reached: Set<number>): void {
 // offset 28) through the pager, collecting every free page index. head === 0 is an empty free-list. The
 // inverse of the serialization in serializeFreeList; replaces the v24 reconstruct-on-open reachability
 // walk (spec/fileformat/format.md *Reclamation*).
-function readFreeList(paging: SharedPaging, head: number): number[] {
+function readFreeList(
+  paging: SharedPaging,
+  head: number,
+  pageCount: number,
+  protectedPages: Set<number>,
+): number[] {
   const free: number[] = [];
+  const chain = new Set<number>();
+  let previous = 1;
   for (let p = head; p !== 0; ) {
+    if (p < ROOT_PAGE || p >= pageCount || chain.has(p))
+      throw engineError("data_corrupted", "invalid free-list chain");
+    chain.add(p);
     const pg = parsePage(paging.readBlock(p));
     if (pg.pageType !== PAGE_FREELIST)
       throw engineError("data_corrupted", "expected a free-list page");
+    if (pg.itemCount > Math.floor(pg.payload.length / 4))
+      throw engineError("data_corrupted", "invalid free-list item count");
     const cur = { pos: 0 };
-    for (let i = 0; i < pg.itemCount; i++) free.push(readU32(pg.payload, cur));
+    for (let i = 0; i < pg.itemCount; i++) {
+      const id = readU32(pg.payload, cur);
+      if (id <= previous || id >= pageCount || protectedPages.has(id))
+        throw engineError("data_corrupted", "invalid or protected free page");
+      free.push(id);
+      previous = id;
+    }
     p = pg.nextPage;
   }
+  for (const id of free)
+    if (chain.has(id)) throw engineError("data_corrupted", "free-list page frees itself");
   return free;
 }
 
@@ -2740,6 +2772,8 @@ function serializeFreeList(
       flIds.push(safe[si++]!);
       safeDrawn++;
     } else {
+      if (hw >= 0xffff_ffff)
+        throw engineError("program_limit_exceeded", "database page limit exceeded");
       flIds.push(hw++);
     }
   }
@@ -2790,6 +2824,7 @@ export function planFreeList(
   newPageCount: number;
   newLive: number;
   newGen: bigint;
+  manifestIds: number[];
 } {
   const MIN_COMPACT_PAGES = 16; // don't churn a tiny store
   // liveAtCompaction=0 is the shared-mode orphan sentinel: a co-resident commit deliberately
@@ -2816,15 +2851,45 @@ export function planFreeList(
   // hazard as data-page reuse. When the watermark defers reuse the chain must grow the high-water instead
   // (empty `safe`), exactly as the data allocator does.
   const safe = canReuse ? freeRemaining : [];
-  const s = serializeFreeList(persistList, safe, ps - PAGE_HEADER, ps, pageCount);
-  return {
-    pages: s.pages,
-    head: s.head,
-    persisted: s.persisted,
-    newPageCount: s.newNext,
-    newLive,
-    newGen,
-  };
+  // Joint allocation is monotone: reserve descriptor overflow pages first, then encode the free
+  // list with those reservations removed. Growing the reservation can shrink the free-list chain,
+  // so a final descriptor may have empty tail pages; never release/reallocate them in this trial.
+  let manifestCount = 0;
+  for (;;) {
+    const reused = Math.min(manifestCount, safe.length);
+    const manifestIds = safe.slice(0, reused);
+    let next = pageCount;
+    for (let i = reused; i < manifestCount; i++) {
+      if (next >= 0xffff_ffff)
+        throw engineError("program_limit_exceeded", "database page limit exceeded");
+      manifestIds.push(next++);
+    }
+    const reserved = new Set(manifestIds);
+    const s = serializeFreeList(
+      persistList.filter((p) => !reserved.has(p)),
+      safe.slice(reused),
+      ps - PAGE_HEADER,
+      ps,
+      next,
+    );
+    const required = Math.ceil(
+      Math.max(0, written.length + s.pages.length - manifestInlineCapacity(ps)) /
+        manifestOverflowCapacity(ps),
+    );
+    if (required > manifestCount) {
+      manifestCount = required;
+      continue;
+    }
+    return {
+      pages: s.pages,
+      head: s.head,
+      persisted: s.persisted,
+      newPageCount: s.newNext,
+      newLive,
+      newGen,
+      manifestIds,
+    };
+  }
 }
 
 // loadEnginePaged opens a file-backed database demand-paged (spec/design/pager.md, P6.4b): it loads
@@ -2841,11 +2906,29 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
 
   // Select the live meta from slots 0 and 1 (highest valid txid; the lone valid slot on a torn write),
   // read as individual blocks through the pager.
-  const a = parseMeta(paging.readBlock(0));
-  const b = parseMeta(paging.readBlock(1));
-  let mt: Meta | null = a;
-  if (b && (mt === null || b.txid > mt.txid)) mt = b;
-  if (mt === null) throw engineError("data_corrupted", "no valid meta page");
+  const physicalPages = paging.physicalPages();
+  const blocks = [paging.readBlock(0), paging.readBlock(1)];
+  const candidates = blocks
+    .map((bytes) => ({ bytes, meta: parseCommitMeta(bytes, pageSize, physicalPages) }))
+    .filter(
+      (candidate): candidate is { bytes: Uint8Array; meta: CommitMeta } => candidate.meta !== null,
+    )
+    .sort((a, b) => (a.meta.txid > b.meta.txid ? -1 : a.meta.txid < b.meta.txid ? 1 : 0));
+  let selected: { bytes: Uint8Array; meta: CommitMeta } | undefined;
+  let protectedPages = new Set<number>();
+  for (const candidate of candidates) {
+    const validated =
+      paging.cachedValidation(candidate.bytes) ??
+      validateCommitMeta(candidate.meta, pageSize, (p) => paging.readBlock(p));
+    if (validated !== null) {
+      paging.cacheValidation(candidate.bytes, validated);
+      selected = candidate;
+      protectedPages = validated;
+      break;
+    }
+  }
+  if (selected === undefined) throw engineError("data_corrupted", "no valid meta page");
+  const mt = selected.meta;
 
   const snap = new Snapshot(mt.txid);
   const statisticsExpected = new Map<string, readonly [number, number]>();
@@ -2957,7 +3040,7 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
   db.pageCount = mt.pageCount;
   // v25: load the free-list directly from the persisted chain (meta offset 28) — no reachability walk
   // (spec/fileformat/format.md *Reclamation*).
-  db.freePages = readFreeList(paging, mt.freeListHead);
+  db.freePages = readFreeList(paging, mt.freeListHead, mt.pageCount, protectedPages);
   // Every persisted free page is dead at the committed version (the free-list is "as of" mt.txid), so its
   // reuse generation is mt.txid: at open oldest_live == committed and any later reader pins ≥ the committed
   // version, so reuse is safe (transactions.md §8, the free-list generation gate).
@@ -2971,6 +3054,7 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
   // Stores created in a LATER session bind this same pager at creation (Snapshot.storePaging), so
   // they join the post-commit residency flip like the loaded stores attached above.
   snap.storePaging = paging;
+  paging.adoptCommit(mt.txid, metaChecksum(selected.bytes), mt.dirtyCount !== 0);
   return db;
 }
 
@@ -3049,16 +3133,16 @@ function readSeparators(payload: Uint8Array, cur: Cursor, n: number): Uint8Array
   return keys;
 }
 
-// metaPage is one meta slot's full pageSize bytes (the 36-byte header + its CRC, zero-padded): its
-// only content. toImage copies it into both slots; an incremental commit pwrites it to the alternate
-// slot (file.ts). Single-sources the meta byte layout (spec/fileformat/format.md). Reserved bytes are
-// left zero and are covered by the CRC over [0, 32).
+// metaPage encodes one v33 meta slot, including inline commit-descriptor entries and a CRC32 over
+// the entire page except its own field. Bootstrap images omit the descriptor and seed both slots;
+// incremental durable commits publish their descriptor in the alternate slot.
 export function metaPage(
   pageSize: number,
   txid: bigint,
   root: number,
   pageCount: number,
   freeListHead: number,
+  manifest?: CommitManifest,
 ): Uint8Array {
   const p = new Uint8Array(pageSize);
   const dv = new DataView(p.buffer);
@@ -3072,7 +3156,7 @@ export function metaPage(
   dv.setUint32(20, root, false);
   dv.setUint32(24, pageCount, false);
   dv.setUint32(28, freeListHead, false); // v25: the persisted free-list head (0 = empty)
-  dv.setUint32(32, crc32Ieee(p.subarray(0, 32)), false);
+  writeManifestMeta(p, manifest);
   return p;
 }
 
@@ -3123,34 +3207,6 @@ function writePage(
   payload: Uint8Array,
 ): void {
   image.set(makePage(ps, pageType, itemCount, nextPage, payload), index * ps);
-}
-
-// meta holds a validated meta slot's salient fields. pageCount is the on-disk page high-water — the
-// next free page an incremental commit appends at (P6.1 part B). freeListHead is the persisted
-// free-list head (v25 — meta offset 28): the first page_type 7 page, or 0 for an empty free-list.
-type Meta = { txid: bigint; rootPage: number; pageCount: number; freeListHead: number };
-
-// parseMeta validates a standalone meta block; null if it is not a valid meta. Shared by the
-// demand-paged loader (which reads meta slots 0/1 as individual blocks — since B3 the ONLY loader;
-// the whole-image readMeta/selectMeta/readPage/pageBlock readers went with the eager readTree path).
-function parseMeta(block: Uint8Array): Meta | null {
-  if (block.length < 36) return null;
-  const dv = new DataView(block.buffer, block.byteOffset, block.byteLength);
-  if (!(block[0] === 0x4a && block[1] === 0x45 && block[2] === 0x44 && block[3] === 0x42))
-    return null;
-  if (dv.getUint16(4, false) !== FORMAT_VERSION) return null;
-  if (block[6] !== 0 || block[7] !== 0) return null;
-  if (crc32Ieee(block.subarray(0, 32)) !== dv.getUint32(32, false)) return null;
-  const pageCount = dv.getUint32(24, false);
-  // v25: offset 28 is the free-list head — 0 (empty) or a real body page in [2, pageCount).
-  const freeListHead = dv.getUint32(28, false);
-  if (freeListHead !== 0 && (freeListHead < ROOT_PAGE || freeListHead >= pageCount)) return null;
-  return {
-    txid: dv.getBigUint64(12, false),
-    rootPage: dv.getUint32(20, false),
-    pageCount,
-    freeListHead,
-  };
 }
 
 // Page is a parsed page: header fields + a borrowed payload slice.

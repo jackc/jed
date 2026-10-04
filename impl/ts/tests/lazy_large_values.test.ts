@@ -31,7 +31,11 @@ test("lazy: reverse foreign key leaves unrelated payloads deferred", () => {
     db.execute("INSERT INTO p VALUES ('keep'),('delete'),('update')");
     seed(db);
     db.execute("ALTER TABLE t ADD COLUMN pid text DEFAULT 'keep' REFERENCES p(id)");
+    // A fully flushed snapshot image isolates lazy value decoding from v33 recovery validation,
+    // which deliberately reads every newest-generation dirty page before accepting its descriptor.
+    const checkpoint = db.toImage(PAGE_SIZE, 1n);
     db.close();
+    writeFileSync(path, checkpoint);
     corruptOverflowPayloads(path);
     db = openDatabase(path, { skipFsync: true });
     try {
@@ -122,7 +126,11 @@ test("lazy: chains are read only when touched", () => {
   try {
     let db = createDatabase({ path, pageSize: PAGE_SIZE, skipFsync: true });
     seed(db);
+    // A fully flushed snapshot image isolates lazy value decoding from v33 recovery validation,
+    // which deliberately reads every newest-generation dirty page before accepting its descriptor.
+    const checkpoint = db.toImage(PAGE_SIZE, 1n);
     db.close();
+    writeFileSync(path, checkpoint);
     corruptOverflowPayloads(path);
 
     // Open walks live chains by headers only — corrupt payloads are invisible.

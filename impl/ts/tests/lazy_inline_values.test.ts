@@ -211,7 +211,11 @@ test("untouched corrupt inline body defers its error (read-on-touch)", () => {
     const filedb = createDatabase({ path, skipFsync: true });
     filedb.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)");
     filedb.execute(`INSERT INTO t VALUES (1, '${marker}', 42), (2, 'clean', 7)`);
+    // Use a flushed snapshot image so this test isolates lazy decoding of inherited bytes from
+    // validated-COW's eager check of the newest commit's write identities.
+    const checkpoint = filedb.toImage(DEFAULT_PAGE_SIZE, 1n);
     filedb.close();
+    writeFileSync(path, checkpoint);
 
     // Corrupt the first content byte of the marker body to 0xFF (an invalid UTF-8 lead byte),
     // leaving the length prefix intact so the skip-walk advances identically, then repair the page

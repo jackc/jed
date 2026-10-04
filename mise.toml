@@ -88,6 +88,10 @@ run = "bundle exec rake verify"
 description = "Test and benchmark experimental one-flush Rust commit protocols"
 run = "bundle exec rake bench:durability"
 
+[tasks."bench:durable_commit"]
+description = "Benchmark production durable SQL commits on Go with real storage flushes"
+run = "bundle exec rake bench:durable_commit"
+
 [tasks.conformance]
 description = "Walk the conformance corpus on all three cores"
 run = "bundle exec rake conformance"

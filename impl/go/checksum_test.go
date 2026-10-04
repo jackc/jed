@@ -89,6 +89,7 @@ func TestCorruptingAnyBodyPageIsCaughtOrInertNeverSilent(t *testing.T) {
 	cpath := filepath.Join(dir, "corrupt.jed")
 	seedChecksum(t, path)
 
+	checkpointTestFile(t, path)
 	want, err := scanChecksum(path)
 	if err != nil {
 		t.Fatalf("the intact file must scan cleanly: %v", err)
@@ -133,5 +134,25 @@ func TestCorruptingAnyBodyPageIsCaughtOrInertNeverSilent(t *testing.T) {
 	// protected; a floor of 4 guarantees detection fired across page kinds, not just one.
 	if detected < 4 {
 		t.Fatalf("expected live pages across kinds to be detected, got %d", detected)
+	}
+}
+
+// These corruption tests target inherited page checks and deferred decoding,
+// independently of the latest-commit manifest's intentional fallback behavior.
+func checkpointTestFile(t *testing.T, path string) {
+	t.Helper()
+	db, err := openWithOptions(path, OpenOptions{SkipFsync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	image, err := db.ToImage(db.pageSize, db.Txid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, image, 0o600); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -18,13 +18,14 @@ if (action === undefined || path === undefined) {
   throw new Error("usage: process_actor.ts create|open PATH [timeout_ms]");
 }
 const fileLockTimeoutMs = timeoutText === undefined ? 5000 : Number(timeoutText);
+const locking = action === "open-exclusive" ? "exclusive" : "shared";
 
 let database: Database;
 try {
   database =
     action === "create"
-      ? createDatabase({ path, locking: "shared", fileLockTimeoutMs })
-      : openDatabase(path, { locking: "shared", fileLockTimeoutMs });
+      ? createDatabase({ path, locking, fileLockTimeoutMs })
+      : openDatabase(path, { locking, fileLockTimeoutMs });
 } catch (error) {
   replyError(error);
   process.exit(1);

@@ -207,6 +207,8 @@ func TestLazyUntouchedCorruptInlineBodyDefersError(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	checkpointTestFile(t, path)
+
 	// Corrupt the first content byte of the marker body to 0xFF (an invalid UTF-8 lead byte),
 	// leaving the length prefix intact so the skip-walk advances identically, then repair the page
 	// CRC so the corruption is checksum-valid (isolating the failure to decode time).

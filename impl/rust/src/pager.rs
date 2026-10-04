@@ -13,6 +13,8 @@
 
 use crate::blockstore::BlockStore;
 use crate::error::{EngineError, Result, SqlState};
+use std::collections::HashSet;
+use std::sync::Arc;
 
 /// The **maximum** file-growth step — ~1 MiB worth of pages. The file grows *geometrically*
 /// (≈doubling its current size — [`Pager::reserve`]), so a small database's file stays proportional to
@@ -56,6 +58,12 @@ pub(crate) struct Pager {
     /// allocated_pages)` are unreferenced trailing zeros (no byte-contract impact — past the
     /// high-water).
     allocated_pages: u32,
+    validation: Option<(Vec<u8>, Arc<HashSet<u32>>)>,
+    acknowledged: Option<(u64, u32)>,
+    adopted: Option<(u64, u32)>,
+    needs_stabilize: bool,
+    commit_in_progress: bool,
+    poisoned: bool,
     /// The armed one-shot commit fault — the **fault-injection seam** (spec/design/storage.md §7),
     /// `#[cfg(test)]` so it is **entirely absent from a production build** (zero footprint). `None`
     /// unless a test armed one with [`arm_fault`](Pager::arm_fault).
@@ -77,12 +85,11 @@ pub(crate) struct Pager {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FaultPoint {
     /// The `n`-th write to a **body** page (index ≥ 2), 1-based, counted since the fault was armed —
-    /// a clean crash mid-body, before the body `sync()`.
+    /// a clean crash mid-body, before publication.
     BodyWrite(u32),
-    /// The write to a **meta** slot (index < 2) — the publish, after the body is written and synced
-    /// (the critical between-syncs window §4 protects).
+    /// The write to a **meta** slot (index < 2), after body/manifest writes and before the flush.
     MetaWrite,
-    /// The `n`-th `sync()` since the fault was armed (`1` = body barrier, `2` = meta barrier).
+    /// The `n`-th `sync()` since arming (steady-state `1` = final commit barrier).
     Sync(u32),
 }
 
@@ -118,7 +125,7 @@ impl Pager {
         }
         let header = store.read_at(0, 12)?;
         let page_size = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
-        if page_size == 0 {
+        if !(256..=65536).contains(&page_size) || !page_size.is_power_of_two() {
             return Err(corrupt("zero page size in meta header"));
         }
         // The allocation high-water is the current file length in pages — already past the committed
@@ -128,6 +135,12 @@ impl Pager {
             store,
             page_size,
             allocated_pages,
+            validation: None,
+            acknowledged: None,
+            adopted: None,
+            needs_stabilize: false,
+            commit_in_progress: false,
+            poisoned: false,
             #[cfg(test)]
             fault: None,
             #[cfg(test)]
@@ -135,6 +148,59 @@ impl Pager {
             #[cfg(test)]
             syncs: 0,
         })
+    }
+
+    pub(crate) fn allocated_pages(&self) -> u32 {
+        self.allocated_pages
+    }
+
+    pub(crate) fn cached_validation(&self, meta: &[u8]) -> Option<Arc<HashSet<u32>>> {
+        self.validation
+            .as_ref()
+            .filter(|(bytes, _)| bytes == meta)
+            .map(|(_, pages)| Arc::clone(pages))
+    }
+
+    pub(crate) fn cache_validation(&mut self, meta: &[u8], pages: Arc<HashSet<u32>>) {
+        self.validation = Some((meta.to_vec(), pages));
+    }
+
+    pub(crate) fn adopt_generation(&mut self, txid: u64, crc: u32, descriptor: bool) {
+        let generation = Some((txid, crc));
+        if self.adopted != generation {
+            self.adopted = generation;
+            self.needs_stabilize = descriptor && self.acknowledged != generation;
+        }
+    }
+
+    /// A writer resumed after a process-only crash can see unsynced cache bytes. Stabilize its
+    /// selected generation before it can overwrite either the fallback slot or reusable pages.
+    pub(crate) fn begin_commit(&mut self) -> Result<()> {
+        if self.poisoned || self.commit_in_progress {
+            return Err(EngineError::new(
+                SqlState::IoError,
+                "storage commit failed; close and reopen before writing",
+            ));
+        }
+        self.commit_in_progress = true;
+        if self.needs_stabilize {
+            self.sync()?;
+            self.needs_stabilize = false;
+            self.acknowledged = self.adopted;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_commit(&mut self, meta: &[u8]) {
+        self.validation = None;
+        let generation = Some((
+            u64::from_be_bytes(meta[12..20].try_into().unwrap()),
+            u32::from_be_bytes(meta[32..36].try_into().unwrap()),
+        ));
+        self.acknowledged = generation;
+        self.adopted = generation;
+        self.needs_stabilize = false;
+        self.commit_in_progress = false;
     }
 
     /// Arm a one-shot commit fault (the **fault-injection seam**, spec/design/storage.md §7) and
@@ -176,9 +242,17 @@ impl Pager {
     /// [`reserve`](Pager::reserve)s the high-water first, so the target is already-allocated space
     /// (a reused free page, or a preallocated slot past the old high-water). `bytes` is one page wide.
     pub(crate) fn write_block(&mut self, index: u32, bytes: &[u8]) -> Result<()> {
-        self.fault_on_write(index, bytes)?;
-        self.store
-            .write_at(index as u64 * self.page_size as u64, bytes)
+        if self.poisoned {
+            return Err(EngineError::new(SqlState::IoError, "storage is poisoned"));
+        }
+        let result = self.fault_on_write(index, bytes).and_then(|()| {
+            self.store
+                .write_at(index as u64 * self.page_size as u64, bytes)
+        });
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
     }
 
     /// The fault-injection seam's write hook (spec/design/storage.md §7). In a non-test build this is
@@ -243,19 +317,23 @@ impl Pager {
             // ≈double, clamped to [floor, cap]; saturate rather than wrap at the u32 page ceiling.
             target = target.saturating_add(target.clamp(floor, cap));
         }
-        self.store.set_size(target as u64 * self.page_size as u64)?;
+        if let Err(e) = self.store.set_size(target as u64 * self.page_size as u64) {
+            self.poisoned = true;
+            return Err(e);
+        }
         self.allocated_pages = target;
         Ok(())
     }
 
-    /// Metadata-free durability barrier — the host's data-only [`sync`](BlockStore::sync)
-    /// (`fdatasync`). Called twice per commit — body pages, then the meta — to honour the
-    /// body-before-meta write-ordering rule (format.md, file.rs `persist`). Data-only, not a full
-    /// `fsync`, so an overwrite into the preallocated region ([`Pager::reserve`]) flushes only the
-    /// data, never a file-size/inode-timestamp metadata journal (spec/design/pager.md §7).
+    /// The host durability barrier. A validated COW commit calls this once after writing its
+    /// body, manifest, and meta; an adopted generation needs one additional stabilization call.
+    /// Preallocated storage avoids a separate file-growth metadata flush in steady state.
     pub(crate) fn sync(&mut self) -> Result<()> {
-        self.fault_on_sync()?;
-        self.store.sync()
+        let result = self.fault_on_sync().and_then(|()| self.store.sync());
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
     }
 
     /// The fault-injection seam's `sync()` hook (spec/design/storage.md §7) — a no-op in a non-test

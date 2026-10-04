@@ -1,15 +1,16 @@
 # Durable commit experiments
 
-Status: research prototypes, **not a change to the production format or durability
-contract**. The user explicitly scoped implementation to one core. The Rust
-experiments live in `bench/durability`; they use dirty-page writes captured from
-the real SQL engine. No new dependency is required.
+Status: historical research record, followed by the production v33 implementation in
+[validated-cow.md](validated-cow.md). These initial experiments were scoped to one core;
+the Rust prototypes live in `bench/durability` and use dirty-page writes captured from
+the real SQL engine. No new dependency is required. The measurements below describe
+the pre-v33 implementation; the production comparison is linked from the new design.
 
-The current recipe is body writes, durable barrier, alternate meta write, durable
+The pre-v33 recipe was body writes, durable barrier, alternate meta write, durable
 barrier. A checksum on the meta alone cannot justify removing the first barrier:
 the meta may reach storage before the body. The experiments compare:
 
-1. The current two-barrier recipe, with preallocated files.
+1. The previous two-barrier recipe, with preallocated files.
 2. A checksummed full-page redo WAL in a separate file, one barrier per commit,
    including the cost of periodic checkpoints and safe journal reuse.
 3. The same redo protocol in a reserved region of the database file.

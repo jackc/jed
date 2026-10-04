@@ -181,83 +181,30 @@ func (db *engine) writeFullImage(noSync bool) error {
 	return nil
 }
 
-// persist durably publishes snap to the backing file via an incremental copy-on-write commit
-// (spec/fileformat/format.md *Allocation & incremental commit*; transactions.md §9) — the
-// synchronous-commit chokepoint. Write the dirty pages this transaction introduced — reusing free-list
-// pages a prior root abandoned before extending the file (P6.2) — Sync, write the alternate meta slot
-// (snap.txid & 1), Sync. Clean pages are never rewritten. A crash between the two syncs leaves the
-// prior meta — and thus the prior snapshot — intact (its pages were not overwritten: a reused free page
-// is reachable from no live snapshot). An in-memory database (no path) is a no-op success: it does not
-// mutate db, and the committed swap happens in commitTx only after this returns nil. db.pageCount /
-// db.freePages advance only after both syncs succeed, so a write failure leaves db, committed, and the
-// file's prior meta untouched (the working snapshot is then discarded). The future synchronous=off mode
-// gates here.
+// persist publishes a single-handle file transaction through validated COW. Dirty
+// body pages and their checksummed manifest precede the alternating meta write;
+// one final sync makes the complete dependency set durable. Recovery validates
+// those dependencies before adopting a root, without a separate body barrier.
 func (db *engine) persist(snap *snapshot) error {
-	// An in-memory database has no paging context — a no-op success (the committed swap happens in
-	// commitTx after this returns nil).
 	if db.paging == nil {
 		return nil
 	}
-	ps := int(db.pageSize)
-	cap := ps - pageHeader
-	// A bare single-handle engine has no cross-session reader registry (oldest_live == committed), so
-	// reuse is always safe (transactions.md §8): the shared-core path is the one that gates reuse.
+	if err := db.paging.withPager(func(p *pager) error { return p.beginValidatedCommit() }); err != nil {
+		return err
+	}
 	write, err := snap.incrementalImage(db.pageSize, db.pageCount, db.freePages, true, db.paging)
 	if err != nil {
 		return err
 	}
-	// v25: write the dirty tree + catalog first (unsynced), so the in-commit reachability walk can read
-	// the new catalog back through the pager (read-your-writes) — the free-list persisted this commit
-	// thus reclaims this commit's fresh orphans (planFreeList); a short open→commit→close session no
-	// longer leaks them (open no longer reconstructs the free-list). Preallocate ahead of the high-water
-	// so the body fdatasync carries no file-growth journaling (spec/design/pager.md §7).
-	if err := db.paging.withPager(func(p *pager) error {
-		if err := p.reserve(write.pageCount); err != nil {
-			return err
-		}
-		for _, pg := range write.pages {
-			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
-				return err
-			}
-			db.paging.pool.invalidate(pg.index)
-		}
-		return nil
-	}); err != nil {
+	st := storage{
+		pageSize: db.pageSize, pageCount: db.pageCount, freePages: db.freePages,
+		paging: db.paging, liveAtCompaction: db.liveAtCompaction, freeGenTxid: db.freeGenTxid,
+	}
+	if err := st.commitFile(snap, write, db.openStreams == 0, true); err != nil {
 		return err
 	}
-	// Watermark-gated by this handle's live streaming cursors; periodic (~2×-live) inside planFreeList.
-	canReclaim := db.openStreams == 0
-	flPages, head, persisted, newPC, newLive, newGen, err := planFreeList(
-		snap, db.paging, write.rootPage, write.pages, write.freeRemaining, write.pageCount, db.liveAtCompaction, db.freeGenTxid, cap, ps, canReclaim, true,
-	)
-	if err != nil {
-		return err
-	}
-	meta := metaPage(db.pageSize, snap.txid, write.rootPage, newPC, head)
-	if err := db.paging.withPager(func(p *pager) error {
-		if err := p.reserve(newPC); err != nil {
-			return err
-		}
-		for _, pg := range flPages {
-			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
-				return err
-			}
-			db.paging.pool.invalidate(pg.index)
-		}
-		if err := p.sync(); err != nil { // every body page (tree/catalog/free-list) durable before the meta
-			return err
-		}
-		if err := p.writeBlock(uint32(snap.txid&1), meta); err != nil {
-			return err
-		}
-		return p.sync() // the commit is published
-	}); err != nil {
-		return err
-	}
-	db.pageCount = newPC
-	db.freePages = persisted
-	db.liveAtCompaction = newLive
-	db.freeGenTxid = newGen
+	db.pageCount, db.freePages = st.pageCount, st.freePages
+	db.liveAtCompaction, db.freeGenTxid = st.liveAtCompaction, st.freeGenTxid
 	return nil
 }
 

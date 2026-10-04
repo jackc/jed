@@ -273,8 +273,9 @@ budget — a *query-operator* memory bound, distinct from this *storage* page ca
 
 ## 7. Durable-commit preallocation (the metadata-free body sync)
 
-The `synchronous=on` commit chokepoint (transactions.md §9) is two `fsync`s — body pages, then
-the alternate meta slot. Measured on ext4 (the dev/CI host, 2026-06-13), each of those was
+V33 [validated COW](validated-cow.md) uses one final durable barrier after body, manifest,
+and meta writes. The preallocation policy below remains useful and unchanged. The measurements
+in this section describe the preceding two-barrier protocol: body pages, then alternate meta. Measured on ext4 (the dev/CI host, 2026-06-13), each of those was
 **~4.3 ms** when the commit **grew the file**: appending pages past the high-water drags ext4's
 **metadata journaling** (the inode size + extent/block-allocation change) into the flush. With the
 free-list draining only on reopen (P6.2), a long write session appends fresh pages on essentially
@@ -304,7 +305,7 @@ growing file still pays the size-metadata journal; only **both together** win:
   region changes no file metadata (size fixed, blocks already allocated), and `fdatasync` skips
   the inode-timestamp flush `fsync` forces — so the body and meta syncs become **metadata-free**.
 
-Steady state is therefore **two metadata-free `fdatasync`s ≈ 2.8 ms** per commit. **Measured
+Before v33, steady state was **two metadata-free `fdatasync`s ≈ 2.8 ms** per commit. **Measured
 result (all three cores):** the `insert_commit_durable` benchmark fell from **~9.0 ms → ~2.5–3.1 ms**
 p50 (~2.7–2.9×), at PostgreSQL's order of magnitude (jed pays two syncs to PG's one).
 
@@ -326,7 +327,7 @@ p50 (~2.7–2.9×), at PostgreSQL's order of magnitude (jed pays two syncs to PG
   still-deferred step on top of this.
 
 **Per-core realization (not a byte contract — like the pool, §3).** `fdatasync` is the metadata-free
-barrier in each core, chosen idiomatically: Rust `File::sync_data()`, TS Node `fs.fdatasyncSync`, Go
+barrier on Linux in each core, chosen idiomatically: Rust `File::sync_data()`, TS Node `fs.fdatasyncSync`, Go
 `syscall.Fdatasync` (pure Go, no cgo — CLAUDE.md §2) behind a `linux` build tag with a full-`Sync`
 fallback for platforms lacking it (still correct, just without the optimization). The preallocation
 floor/cap and the geometric `reserve` logic are identical across cores (pure integer arithmetic on

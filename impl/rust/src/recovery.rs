@@ -1,6 +1,6 @@
 //! Crash-recovery tests driven by the **fault-injection seam** (spec/design/storage.md §7). These
-//! verify the §4 commit atomicity at the **actual commit points** — mid-body, before the body sync,
-//! between the body and meta syncs, and a torn meta write — which the static `torn_meta_slot*.jed`
+//! verify commit atomicity at the **actual commit points** — mid-body, before the final sync,
+//! before meta publication, and a torn meta write — which the static `torn_meta_slot*.jed`
 //! goldens (a post-hoc byte corruption) cannot reach. The invariant under test: a crash **anywhere**
 //! in a commit leaves the file readable as a **valid snapshot** (the prior one, or — at the last
 //! barrier — the new one), never corrupt; and the free-list reconstruction (P6.2) stays correct after
@@ -79,38 +79,35 @@ fn torn_body_page_recovers_prior() {
     db.close().unwrap();
 }
 
-/// `Sync(1)` — the body-durability barrier fails. The body pages are written-through but unsynced and
-/// the meta is never written, so the prior meta still governs and the prior snapshot reopens.
+/// A failed durability barrier poisons the handle, even though its complete cache state may be
+/// recoverable. A second write on that handle must fail without touching storage.
 #[test]
-fn crash_before_body_sync_recovers_prior() {
+fn failed_sync_requires_reopen() {
     let path = tmp("jed_crash_body_sync.jed");
-    let (mut db, prior) = seeded(&path);
+    let (mut db, _) = seeded(&path);
     assert!(insert_with_fault(&mut db, Fault::new(FaultPoint::Sync(1), None)).is_err());
-    db.close().unwrap();
-
-    let db = Engine::open(&path).unwrap();
-    assert_eq!(db.txid(), prior);
-    assert_eq!(ids(&db), vec![1, 2]);
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(
+        execute(&mut db, "INSERT INTO t VALUES (4)")
+            .unwrap_err()
+            .code(),
+        "58030"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
     db.close().unwrap();
 }
 
-/// `MetaWrite` — the critical between-syncs window (§4): the body is fully written **and synced**, then
-/// the publish (the meta-slot write) crashes. The new body pages are durable but unreferenced; the
-/// prior meta slot is untouched, so the file reopens at the prior snapshot. No corruption despite a
-/// fully-durable new body on disk.
+/// `MetaWrite`: the body is fully written, then metadata publication fails. The prior meta is
+/// untouched; whether the new body reached durable storage or only cache, recovery uses the prior root.
 #[test]
-fn crash_between_syncs_recovers_prior() {
+fn crash_before_meta_recovers_prior() {
     let path = tmp("jed_crash_between_syncs.jed");
     let (mut db, prior) = seeded(&path);
     assert!(insert_with_fault(&mut db, Fault::new(FaultPoint::MetaWrite, None)).is_err());
     db.close().unwrap();
 
     let db = Engine::open(&path).unwrap();
-    assert_eq!(
-        db.txid(),
-        prior,
-        "durable-but-unreferenced body → prior snapshot"
-    );
+    assert_eq!(db.txid(), prior, "unreferenced body → prior snapshot");
     assert_eq!(ids(&db), vec![1, 2]);
     db.close().unwrap();
 }
@@ -137,7 +134,7 @@ fn torn_meta_write_falls_back_to_prior() {
     db.close().unwrap();
 }
 
-/// `Sync(2)` — the meta is written, then its durability barrier fails. Atomicity holds either way: a
+/// `Sync(1)` — the meta is written, then its durability barrier fails. Atomicity holds either way: a
 /// real power loss could keep the meta (→ new) or lose it (→ prior); the seam writes through, so the
 /// reopen deterministically yields the **new** snapshot. Both are valid — the test asserts a
 /// consistent, fully-readable snapshot that is exactly one of the two (never a half-published state).
@@ -145,7 +142,7 @@ fn torn_meta_write_falls_back_to_prior() {
 fn crash_before_meta_sync_is_atomic() {
     let path = tmp("jed_crash_meta_sync.jed");
     let (mut db, prior) = seeded(&path);
-    assert!(insert_with_fault(&mut db, Fault::new(FaultPoint::Sync(2), None)).is_err());
+    assert!(insert_with_fault(&mut db, Fault::new(FaultPoint::Sync(1), None)).is_err());
     db.close().unwrap();
 
     let db = Engine::open(&path).unwrap();
@@ -167,7 +164,7 @@ fn recovery_then_free_list_reuse_stays_consistent() {
     let path = tmp("jed_recovery_then_reuse.jed");
     let (mut db, prior) = seeded(&path);
 
-    // Crash between the syncs → reopen at the prior two-row snapshot.
+    // Crash before metadata publication → reopen at the prior two-row snapshot.
     assert!(insert_with_fault(&mut db, Fault::new(FaultPoint::MetaWrite, None)).is_err());
     db.close().unwrap();
     let mut db = Engine::open(&path).unwrap();

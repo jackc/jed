@@ -527,15 +527,9 @@ type storage struct {
 	spillDir    string // host scratch directory for external-sort runs; independent of path, "" when unavailable
 }
 
-// persist durably publishes snap to the backing store via an incremental copy-on-write commit
-// (file.go persist, transactions.md §9) — the publish chokepoint for every host (bplus-reshape.md
-// B3): a file-backed core pwrites + fdatasyncs; an in-memory core packs the same dirty pages into
-// its memoryBlockStore, whose sync is a no-op — the file commit minus durability, one code path.
-// Called from Session.publish under the writer gate, so the pageCount/freePages mutation is
-// single-writer. Writes the dirty pages this commit introduced (reusing reconstruct-on-open
-// free-list pages first), Syncs, publishes the alternate meta slot (snap.txid & 1), Syncs. A
-// crash between the two syncs leaves the prior meta intact (copy-on-write: reused pages are reachable
-// from no live snapshot). pageCount/freePages advance only after both syncs succeed.
+// persist is the synchronous commit chokepoint. File commits write the dirty
+// pages and validated-COW descriptor, then publish meta and perform one sync.
+// The reader watermark and presence lease still govern reuse and reclamation.
 func (c *sharedCore) persist(snap *snapshot) error {
 	// The reader-liveness watermark (transactions.md §8) gates two things at the main-domain commit:
 	//   - canReclaim (oldest_live == the new version, i.e. no reader live at an older version) lets the
@@ -561,16 +555,22 @@ func (c *sharedCore) persist(snap *snapshot) error {
 func (st *storage) commitShared(snap *snapshot, coordinator *fileCoordinator) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	if err := st.paging.withPager(func(p *pager) error { return p.beginValidatedCommit() }); err != nil {
+		return err
+	}
 	write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, false, st.paging)
 	if err != nil {
 		return err
 	}
-	meta := metaPage(st.pageSize, snap.txid, write.rootPage, write.pageCount, 0)
+	plan, err := planSharedValidatedCommit(st.pageSize, snap, write)
+	if err != nil {
+		return err
+	}
 	if err := st.paging.withPager(func(p *pager) error {
 		if err := p.refreshAllocatedPages(); err != nil {
 			return err
 		}
-		if err := p.reserve(write.pageCount); err != nil {
+		if err := p.reserve(plan.pageCount); err != nil {
 			return err
 		}
 		for _, pg := range write.pages {
@@ -578,7 +578,12 @@ func (st *storage) commitShared(snap *snapshot, coordinator *fileCoordinator) er
 				return err
 			}
 		}
-		return p.sync()
+		for _, pg := range plan.pages {
+			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
+				return err
+			}
+		}
+		return nil
 	}); err != nil {
 		return err
 	}
@@ -586,40 +591,37 @@ func (st *storage) commitShared(snap *snapshot, coordinator *fileCoordinator) er
 		return err
 	}
 	err = st.paging.withPager(func(p *pager) error {
-		if err := p.writeBlock(uint32(snap.txid&1), meta); err != nil {
+		if err := p.writeBlock(uint32(snap.txid&1), plan.meta); err != nil {
 			return err
 		}
-		return p.sync()
+		if err := p.sync(); err != nil {
+			return err
+		}
+		p.finishValidatedCommit(plan.meta)
+		return nil
 	})
 	coordinator.unlockCommit()
 	if err != nil {
 		return err
 	}
-	st.pageCount = write.pageCount
+	st.pageCount = plan.pageCount
 	st.freePages = nil
 	st.liveAtCompaction = 0
 	st.freeGenTxid = snap.txid
 	return nil
 }
 
-// commitDurable durably publishes snap into this storage via an incremental copy-on-write commit
-// (spec/fileformat/format.md; transactions.md §9) — the same recipe sharedCore.persist uses for the
-// MAIN domain, factored out so a host-attached FILE database (attached-databases.md §5, Slice 2)
-// commits durably through it too: write the dirty pages this commit introduced (reusing free-list
-// pages first), Sync, publish the alternate meta slot (snap.txid & 1), Sync. A crash between the two
-// syncs leaves the prior meta intact (copy-on-write: reused pages are reachable from no live
-// snapshot). pageCount/freePages advance only after both syncs succeed. For an IN-MEMORY store the
-// meta write + Sync are byte-store operations whose sync is a no-op — the file commit minus
-// durability (bplus-reshape.md B3). Runs under the caller's writer gate (single-writer page
-// accounting). canReclaim gates within-session compaction (recomputing the free-list); canReuse gates
-// whether THIS commit draws from the existing free-list — the reader-liveness watermark defers reuse of a
-// page a still-open reader on an older snapshot could observe (transactions.md §8). When canReuse is
-// false the free-list is left untouched (allocate from the high-water) but still persisted, so it is
-// reused as soon as the pins drain. An attached-database commit passes canReuse = true (its reuse is gated
-// at its own call site by hasLiveReaders — attached-databases.md §5).
+// commitDurable serializes the writer and gates allocation through the reader
+// watermark. Files use validated COW; memory stores retain their no-op barriers.
+// The same path serves the main database and writable file attachments.
 func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	if st.path != "" {
+		if err := st.paging.withPager(func(p *pager) error { return p.beginValidatedCommit() }); err != nil {
+			return err
+		}
+	}
 	write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, canReuse, st.paging)
 	if err != nil {
 		return err
@@ -630,19 +632,11 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool) erro
 	return st.commitInMemory(snap, write, canReclaim)
 }
 
-// commitFile is the FILE branch of commitDurable (v25): write the dirty tree + catalog, then — in the
-// same commit, before the meta — plan and serialize the persisted page_type 7 free-list (which reclaims
-// this commit's fresh orphans, planFreeList), then the alternate meta slot. The free-list walk reads the
-// just-written catalog back through the pager, so the tree+catalog write and the free-list write are two
-// body blocks under one sync (the body barrier), then the meta under a second sync — the same
-// crash-recovery ordering the fault-injection matrix asserts (storage.md §7). A crash between the syncs
-// leaves the prior meta intact (reused pages are dead at the fallback snapshot). Caller holds st.mu.
+// commitFile writes body pages before planning reclamation so the reachability
+// walk sees the new catalog. It allocates the free-list and manifest together,
+// then publishes the alternate meta and syncs once. Caller holds st.mu and has
+// begun the validated commit before assigning dirty-node page ids.
 func (st *storage) commitFile(snap *snapshot, write incrementalWrite, canReclaim, canReuse bool) error {
-	ps := int(st.pageSize)
-	cap := ps - pageHeader
-	// Write the dirty tree + catalog first (unsynced) so the reachability walk can read the new catalog
-	// back (the pager writes through — read-your-writes). Preallocate ahead of the high-water so the body
-	// fdatasync carries no file-growth metadata journaling (spec/design/pager.md §7).
 	if err := st.paging.withPager(func(p *pager) error {
 		if err := p.reserve(write.pageCount); err != nil {
 			return err
@@ -657,37 +651,33 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, canReclaim
 	}); err != nil {
 		return err
 	}
-	flPages, head, persisted, newPC, newLive, newGen, err := planFreeList(
-		snap, st.paging, write.rootPage, write.pages, write.freeRemaining, write.pageCount, st.liveAtCompaction, st.freeGenTxid, cap, ps, canReclaim, canReuse,
-	)
+	plan, err := planValidatedCommit(snap, st.paging, write, st.pageSize, st.liveAtCompaction, st.freeGenTxid, canReclaim, canReuse)
 	if err != nil {
 		return err
 	}
-	meta := metaPage(st.pageSize, snap.txid, write.rootPage, newPC, head)
 	if err := st.paging.withPager(func(p *pager) error {
-		if err := p.reserve(newPC); err != nil {
+		if err := p.reserve(plan.pageCount); err != nil {
 			return err
 		}
-		for _, pg := range flPages {
+		for _, pg := range plan.pages {
 			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
 				return err
 			}
 			st.paging.pool.invalidate(pg.index)
 		}
-		if err := p.sync(); err != nil { // every body page (tree/catalog/free-list) durable before the meta
+		if err := p.writeBlock(uint32(snap.txid&1), plan.meta); err != nil {
 			return err
 		}
-		if err := p.writeBlock(uint32(snap.txid&1), meta); err != nil {
+		if err := p.sync(); err != nil {
 			return err
 		}
-		return p.sync() // the commit is published
+		p.finishValidatedCommit(plan.meta)
+		return nil
 	}); err != nil {
 		return err
 	}
-	st.pageCount = newPC
-	st.freePages = persisted
-	st.liveAtCompaction = newLive
-	st.freeGenTxid = newGen
+	st.pageCount, st.freePages = plan.pageCount, plan.free
+	st.liveAtCompaction, st.freeGenTxid = plan.live, plan.generation
 	return nil
 }
 

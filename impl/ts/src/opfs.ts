@@ -47,14 +47,15 @@ export function createOpfsWithHandle(handle: SyncAccessHandle, opts: DatabaseOpt
   // Lay down the whole from-scratch image in place (write-in-place create — hosts.md §5). toImage seeds
   // both meta slots and validates the page size; every later commit is incremental (persistImpl).
   const bytes = toImage(db.committed, db.pageSize, db.committed.txid);
-  handle.write(bytes, { at: 0 });
-  handle.flush();
+  const store = new OpfsBlockStore(handle);
+  store.writeAt(0, bytes);
+  store.sync();
   db.pageCount = Math.floor(bytes.length / db.pageSize);
   // Adopt the just-written handle as the open pager + buffer pool, so later commits write through the
   // seam without re-acquiring (spec/design/pager.md). Pager.fromStore reads the page size from the meta
   // header just written.
   db.paging = new SharedPaging(
-    Pager.fromStore(new OpfsBlockStore(handle)),
+    Pager.fromStore(store),
     cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize),
   );
   // Tables built in this session bind this pager at creation (Snapshot.storePaging), so their
