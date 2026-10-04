@@ -1747,3 +1747,33 @@ both the native allocation and the per-input-position O(|program|) match work. A
 cross-core constant (§8) — pinned in `impl/go/spec_constants_test.go` and the
 [../conformance/suites/resource/regex_program_limit.test](../conformance/suites/resource/regex_program_limit.test)
 boundary entry (gated by `resource.regex_program_limit`; jed-specific, **not** oracle-checked).
+
+## 8. Result-amplifying scalars and decimal transcendental work
+
+`repeat`, `lpad`, and `rpad` retain their one `operator_eval`. After strict NULL
+handling and the existing structural limit checks, they charge `scalar_byte` for
+input UTF-8 bytes (`s`, plus `fill` for padding), guard, determine the exact output
+UTF-8 bytes without allocating a character array or result, charge those output
+bytes, and guard again **before** allocating. Non-positive lengths/counts and an
+empty repeat input return empty without byte charges. Padding still rejects a
+requested character length above `0x3fffffff`, even with empty fill. All three
+also reject output UTF-8 bytes above that cap (`54000`). Products are checked
+before multiplication. Truncation and empty fill charge their actual output,
+not the requested length. Default fill is one ASCII space. Strict NULL and
+unselected CASE arms perform no byte work. These rules include nested calls,
+projections, predicates, writes, RETURNING, and prepared execution.
+
+Decimal `sqrt`, `exp`, `ln`, `log`, `log10`, `power`, and `pow` retain their
+`operator_eval` and charge `decimal_transcend` inside their exact kernels.
+Each charged step uses `D = 32 + sum(precision(arg) + scale(arg)) + abs(rscale)`
+and `W = ceil(D/4)^2`; square-root steps multiply W by the bit length of D.
+The arguments are the step's current operands, not the original SQL operands.
+Charge and guard before the kernel entry's work and before each series or
+repeated-squaring iteration. Range-reduction square roots and preliminary
+logarithm estimates use the same meter. This deliberately conservative logical
+work measure is independent of the host limb representation and wall clock.
+The exact charge sites are specified alongside the kernels in decimal.md.
+
+Cost is a work budget, **not a memory limit**. Independent allocation budgets
+are specified in [memory.md](memory.md). Both cost counters saturate at i64 MAX;
+no amount of charged work can wrap a counter and disable a ceiling.

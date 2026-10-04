@@ -467,6 +467,8 @@ fn cost_schedule_matches_spec() {
             "constraint_check" => COSTS.constraint_check,
             "value_compress" => COSTS.value_compress,
             "value_decompress" => COSTS.value_decompress,
+            "scalar_byte" => COSTS.scalar_byte,
+            "decimal_transcend" => COSTS.decimal_transcend,
             "decimal_work" => COSTS.decimal_work,
             "row_produced" => COSTS.row_produced,
             "operator_eval" => COSTS.operator_eval,

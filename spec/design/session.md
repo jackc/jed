@@ -803,3 +803,10 @@ Not one slice — a sequence of vertical slices (CLAUDE.md §10), each independe
 - **Per-statement setting overrides** — an options object on `execute`/`prepare` overriding a
   session setting for one call (the [api.md §8](api.md) "per-call override stays open" note),
   unchanged by this doc.
+
+### Scalar allocation envelope
+
+`max_scalar_bytes` is a nontransactional host session setting (64 MiB default).
+Each statement receives a fresh shared scalar reservation account; frozen cursors
+retain theirs. The host may change the setting for subsequent statements; SQL
+cannot raise it. See [memory.md](memory.md) for coverage and `54P04` semantics.

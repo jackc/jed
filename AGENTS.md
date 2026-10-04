@@ -137,6 +137,16 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
 
 ## Safety And Resource Boundaries
 
+**Resource enforcement status.** Cost ceilings are work limits, not memory limits.
+`repeat`/padding have proportional UTF-8 work charges and pre-allocation byte checks;
+exact decimal transcendentals charge guarded internal steps. A finite 64 MiB default
+`max_scalar_bytes` allowance bounds their cumulative logical output/scratch allocation
+per statement (`54P04`), including internal meters and frozen cursors. Full query-memory
+admission is specified in `spec/design/memory.md` but not yet implemented for all scalars,
+row/result buffers, blocking operators and pending writes. Resource-exhaustion resistance
+remains a requirement; do not claim the current cost/scalar limits are a whole-engine
+memory guarantee. Host extensions remain outside these guarantees.
+
 - Untrusted SQL must be safe to run against the built-in surface.
 - Core languages and dependencies must preserve memory safety.
 - Built-ins must be pure and side-effect-free: no filesystem, network, process,

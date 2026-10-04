@@ -55,7 +55,7 @@ var estimatorAccessPathOrder = [...]string{
 	"full",
 }
 
-const estimatorUnitCount = 24
+const estimatorUnitCount = 26
 const (
 	estimatorUnitStorageRowRead      = 0
 	estimatorUnitStatisticsValue     = 1
@@ -81,6 +81,8 @@ const (
 	estimatorUnitWindowResult        = 21
 	estimatorUnitVarlenCompare       = 22
 	estimatorUnitWindowFrameStep     = 23
+	estimatorUnitScalarByte          = 24
+	estimatorUnitDecimalTranscend    = 25
 )
 
 var estimatorUnitIDs = [...]string{
@@ -108,9 +110,13 @@ var estimatorUnitIDs = [...]string{
 	"window_result",
 	"varlen_compare",
 	"window_frame_step",
+	"scalar_byte",
+	"decimal_transcend",
 }
 
 var estimatorUnitWeights = [...]int64{
+	1,
+	1,
 	1,
 	1,
 	1,

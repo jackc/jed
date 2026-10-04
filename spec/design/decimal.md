@@ -330,6 +330,26 @@ or ±Infinity to produce.
 (`sqrt(4.0)` → `2.0000000000000000`, matching PG). Mixed integer/decimal arguments
 (`power(2.0, 3)`) need an explicit cast — a deferred follow-on.
 
-**Cost.** Each call charges one `operator_eval` (like the other scalar functions), structural and
-cross-core. The internal work is bounded by the chosen result scale; finer per-work metering is a
-deferred follow-on.
+**Cost and allocation.** Each SQL call charges one `operator_eval` plus the guarded
+`decimal_transcend` work in cost.md §8. The exact step sites are:
+
+| Site | rscale | Current operands |
+|---|---|---|
+| Each public numeric entry (`sqrt`, `exp`, `ln`, `log10`, binary log/power) | 0 | its arguments |
+| Nonzero, nonnegative square-root kernel before scaling/isqrt | requested rscale | input |
+| Exponential kernel before range reduction and initial Taylor terms | requested rscale | input |
+| Each nonzero exponential Taylor term, before accumulation/multiply/divide | local rscale | result, term, reduced input |
+| Each compensating exponential square | requested rscale | result |
+| Logarithm kernel entry | requested rscale | input |
+| Each logarithm range-reduction root | local root rscale | current input (square-root rule) |
+| Each logarithm series iteration, including the final zero term | local rscale | result, running power, squared ratio |
+| Each integer-power loop after shifting a nonzero mask | result rscale | current base product, result |
+
+Only the square-root-kernel step uses the extra bit-length multiplier. Single-arg
+`log` routes to `log10`, which calls binary log with base 10; both entry steps
+charge. Preliminary ln/log10 estimates and the integer-exponent guard call the
+same metered kernels. Checks and successful steps charge before doing work and
+reserve `8 * D` bytes from the shared scalar allowance ([memory.md](memory.md)).
+Cost or allocation errors propagate through all recursive helpers; no numerical
+fallback swallows a resource failure. Direct value-only Decimal methods retain
+their existing API; SQL uses the metered entry points.

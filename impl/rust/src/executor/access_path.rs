@@ -285,7 +285,7 @@ impl Engine {
         // planning step, NOT metered (cost.md §3) — evaluate `Q` on a scratch meter. `Q` is a
         // `query_row` is empty for a constant bound and the combined left row for a sibling INL.
         let qv = match query {
-            Some(q) => q.eval(query_row, env, &mut Meter::new())?,
+            Some(q) => q.eval(query_row, env, &mut env.exec.session.scratch_meter())?,
             None => return Ok((Vec::new(), (0, 0))),
         };
         // Each term is the element's order-preserving key encoding (gin.md §4) — the SAME bytes the
@@ -448,7 +448,7 @@ impl Engine {
         // Extracting a constant or once-per-outer sibling query is a planning step, NOT metered
         // (cost.md §3), and uses a scratch meter.
         let qv = match query {
-            Some(q) => q.eval(query_row, env, &mut Meter::new())?,
+            Some(q) => q.eval(query_row, env, &mut env.exec.session.scratch_meter())?,
             None => return Ok((Vec::new(), (0, 0))),
         };
         // Form the resident-tree search query from the constant, handling the strategy-specific

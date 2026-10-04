@@ -2161,3 +2161,9 @@ func (s *Session) UpgradeCollations() (int, error) {
 	s.gateHeld = false
 	return n, err
 }
+
+// MaxScalarBytes is the cumulative scalar-allocation budget per statement.
+func (s *Session) MaxScalarBytes() int64 { return s.engine.MaxScalarBytes() }
+
+// SetMaxScalarBytes sets that budget; non-positive values restore the finite default.
+func (s *Session) SetMaxScalarBytes(b int64) { s.engine.SetMaxScalarBytes(b) }

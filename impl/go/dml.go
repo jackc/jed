@@ -227,7 +227,7 @@ func indexSlotKey(key resolvedKey, colTypes []colType, colls []*Collation, row s
 		}
 		return true, b, nil
 	}
-	v, err := key.Expr.eval(row, env, newMeter()) // maintenance eval is unmetered (cost.md §3)
+	v, err := key.Expr.eval(row, env, env.exec.session.scratchMeter()) // maintenance eval is unmetered (cost.md §3)
 	if err != nil {
 		return false, nil, err
 	}
@@ -276,7 +276,7 @@ func indexRowQualifies(rindex *resolvedIndex, row storedRow, env *evalEnv) (bool
 	if rindex.Predicate == nil {
 		return true, nil
 	}
-	v, err := rindex.Predicate.eval(row, env, newMeter())
+	v, err := rindex.Predicate.eval(row, env, env.exec.session.scratchMeter())
 	if err != nil {
 		return false, err
 	}

@@ -222,6 +222,10 @@ test("cost schedule matches spec/cost/schedule.toml", () => {
         return COSTS.valueCompress;
       case "value_decompress":
         return COSTS.valueDecompress;
+      case "scalar_byte":
+        return COSTS.scalarByte;
+      case "decimal_transcend":
+        return COSTS.decimalTranscend;
       case "decimal_work":
         return COSTS.decimalWork;
       case "row_produced":

@@ -3,11 +3,12 @@ use jed::{CreateOptions, Database, SessionOptions};
 fn main() -> jed::Result<()> {
     let mut db = Database::create(CreateOptions { path: Some("app.jed".into()), ..Default::default() })?;
 
-    // Serve untrusted queries through a session bounded TWO ways:
+    // Serve untrusted queries through a session with independent work and scalar-allocation limits:
     //   max_cost          — a per-STATEMENT ceiling: one runaway query aborts 54P01.
     //   lifetime_max_cost — a per-SESSION budget: the session's cumulative cost is capped, so a
     //                       flood of cheap queries can't burn unbounded CPU. It aborts 54P02.
     let mut untrusted = db.session(SessionOptions {
+        max_scalar_bytes: 8 * 1024 * 1024, // covered scalar allocations; not total heap
         max_cost: 10_000,
         lifetime_max_cost: 3, // tiny, for illustration
         ..SessionOptions::default()

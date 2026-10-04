@@ -29,8 +29,8 @@ type, a kernel, and three declarations:
 
 - **`cost`** — a non-negative static weight, charged once per call. This is the load-bearing one: it
   is **guarded against a session's `max_cost`**, so a heavy host function aborts `54P01` *before its
-  kernel runs*. It is how a host function stays inside the [resource-limit](../resource-limits/)
-  bound. (Defaults to `1`.)
+  kernel runs*. This admits the declared work under the [cost ceiling](../resource-limits/); the host
+  remains responsible for the kernel's actual work and memory use. (Defaults to `1`.)
 - **`volatility`** — `immutable` / `stable` / `volatile` (PostgreSQL's notion). An **`immutable`**
   function may back a persisted index (below); `stable`/`volatile` may not. Defaults to `volatile`
   (the safe assumption).

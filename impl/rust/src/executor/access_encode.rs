@@ -2891,7 +2891,7 @@ fn index_slot_key(
             )?)),
         },
         ResolvedKey::Expr(rx, ty, coll) => {
-            let mut m = Meter::new(); // maintenance eval is unmetered (cost.md §3)
+            let mut m = env.exec.session.scratch_meter(); // maintenance eval is unmetered (cost.md §3)
             match rx.eval(row, env, &mut m)? {
                 Value::Null => Ok(None),
                 v => Ok(Some(encode_typed_key(ty, &v, coll.as_deref())?)),
@@ -2939,7 +2939,7 @@ fn index_row_qualifies(rindex: &ResolvedIndex, row: &Row, env: &EvalEnv) -> Resu
     match &rindex.predicate {
         None => Ok(true),
         Some(pred) => {
-            let mut m = Meter::new(); // maintenance eval is unmetered (cost.md §3)
+            let mut m = env.exec.session.scratch_meter(); // maintenance eval is unmetered (cost.md §3)
             Ok(matches!(pred.eval(row, env, &mut m)?, Value::Bool(true)))
         }
     }

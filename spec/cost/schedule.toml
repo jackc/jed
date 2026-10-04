@@ -16,6 +16,9 @@
 
 schema_version = 1
 
+[limits]
+default_scalar_bytes = 67108864
+
 # field doc -------------------------------------------------------------------
 # id      stable snake_case unit name; the codegen handle (a named field on the
 #         per-language CostSchedule).
@@ -355,3 +358,15 @@ event  = "one frame row folded into a frame-sensitive window function's accumula
 # never changes correctness or the result. Charged at the identical per-frame-row point in every
 # core (§8/§13). Defined now; fires only once frame-sensitive functions land (S3) — row_number
 # (S0) is frame-insensitive and never charges it.
+
+[[unit]]
+id     = "scalar_byte"
+weight = 1
+event  = "one UTF-8 input or output byte of repeat/lpad/rpad, reserved before traversal or allocation"
+# cost.md: input bytes are charged before scanning; exact result bytes before construction.
+
+[[unit]]
+id     = "decimal_transcend"
+weight = 1
+event  = "one logical digit-group work unit in a decimal transcendental kernel step"
+# cost.md: guarded before each range-reduction/series/squaring step, including estimates.

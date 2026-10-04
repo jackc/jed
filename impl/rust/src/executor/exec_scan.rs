@@ -707,6 +707,8 @@ impl Engine {
         let src = &self.session;
         let dst = &mut e.session;
         dst.max_cost = src.max_cost;
+        dst.max_scalar_bytes = src.max_scalar_bytes;
+        dst.scalar_bytes = src.scalar_bytes.clone();
         dst.lifetime_max_cost = src.lifetime_max_cost;
         dst.lifetime_total = src.lifetime_total.clone(); // shared gauge — streaming cost counts (§5)
         dst.cancel = src.cancel.clone();

@@ -44,7 +44,7 @@ export const ESTIMATOR_ACCESS_PATH_ORDER = [
   "full",
 ] as const;
 
-export const ESTIMATOR_UNIT_COUNT = 24;
+export const ESTIMATOR_UNIT_COUNT = 26;
 export const UNIT_STORAGE_ROW_READ = 0;
 export const UNIT_STATISTICS_VALUE = 1;
 export const UNIT_PAGE_READ = 2;
@@ -69,6 +69,8 @@ export const UNIT_REGEX_STEP = 20;
 export const UNIT_WINDOW_RESULT = 21;
 export const UNIT_VARLEN_COMPARE = 22;
 export const UNIT_WINDOW_FRAME_STEP = 23;
+export const UNIT_SCALAR_BYTE = 24;
+export const UNIT_DECIMAL_TRANSCEND = 25;
 export const ESTIMATOR_UNIT_IDS = [
   "storage_row_read",
   "statistics_value",
@@ -94,8 +96,12 @@ export const ESTIMATOR_UNIT_IDS = [
   "window_result",
   "varlen_compare",
   "window_frame_step",
+  "scalar_byte",
+  "decimal_transcend",
 ] as const;
 export const ESTIMATOR_UNIT_WEIGHTS = [
+  1n,
+  1n,
   1n,
   1n,
   1n,

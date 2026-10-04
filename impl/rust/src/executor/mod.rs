@@ -678,6 +678,8 @@ impl Drop for OpenStreamGuard {
 /// [`SessionState::set_clock_source`], not here.)
 #[derive(Clone, Debug)]
 pub struct SessionOptions {
+    /// Cumulative scalar allocation bytes per statement; zero restores the finite default.
+    pub max_scalar_bytes: i64,
     /// Execution-cost ceiling (CLAUDE.md §13); `0` ⇒ unlimited (the default).
     pub max_cost: i64,
     /// Per-session cumulative cost budget (spec/design/session.md §5.4); `0` ⇒ unlimited (the
@@ -727,6 +729,7 @@ pub struct SessionOptions {
 impl Default for SessionOptions {
     fn default() -> Self {
         SessionOptions {
+            max_scalar_bytes: crate::costs::DEFAULT_SCALAR_BYTES,
             max_cost: 0,
             lifetime_max_cost: 0,
             max_sql_length: DEFAULT_MAX_SQL_LENGTH,
@@ -769,6 +772,8 @@ impl TxStatus {
 /// its long-lived default session; [`Engine::session`] mints additional independent ones that run
 /// sequentially on a single-threaded handle (by swapping into the default slot for a call).
 pub struct SessionState {
+    pub(crate) max_scalar_bytes: i64,
+    pub(crate) scalar_bytes: std::rc::Rc<std::cell::Cell<i64>>,
     /// The open transaction, if any. `None` is autocommit between statements (transactions.md
     /// §4.1); a single-statement autocommit write opens one implicitly for its duration. The
     /// `Idle`/`Open`/`Failed` status (session.md §2.2) is derived from this ([`TxStatus::of`]).
@@ -915,6 +920,26 @@ impl Default for SessionState {
 }
 
 impl SessionState {
+    /// Legacy unreported evaluation cost still shares the statement's scalar admission.
+    pub(crate) fn scratch_meter(&self) -> Meter {
+        let mut m = Meter::new();
+        m.scalar_limit = self.max_scalar_bytes;
+        m.scalar_bytes = self.scalar_bytes.clone();
+        m
+    }
+
+    /// Set cumulative scalar allocation bytes per statement; non-positive restores the default.
+    pub fn set_max_scalar_bytes(&mut self, bytes: i64) {
+        self.max_scalar_bytes = bytes;
+    }
+    pub fn max_scalar_bytes(&self) -> i64 {
+        if self.max_scalar_bytes > 0 {
+            self.max_scalar_bytes
+        } else {
+            crate::costs::DEFAULT_SCALAR_BYTES
+        }
+    }
+
     /// A fresh default session: no open transaction, default settings, empty sequence state.
     pub fn new() -> Self {
         SessionState::with_options(SessionOptions::default())
@@ -927,6 +952,8 @@ impl SessionState {
         privileges.set_default_table(opts.default_privileges);
         SessionState {
             tx: None,
+            max_scalar_bytes: opts.max_scalar_bytes,
+            scalar_bytes: std::rc::Rc::new(std::cell::Cell::new(0)),
             max_cost: opts.max_cost,
             lifetime_max_cost: opts.lifetime_max_cost,
             lifetime_total: std::rc::Rc::new(std::cell::Cell::new(0)),
@@ -1023,14 +1050,17 @@ impl SessionState {
     /// `max_cost` ceiling (`54P01`) plus a handle to the session's cumulative total + budget (`54P02`).
     /// Every statement's meter is minted here, so all execution cost live-charges into the cumulative.
     pub(crate) fn new_meter(&self) -> Meter {
-        Meter::for_session(
+        let mut meter = Meter::for_session(
             self.max_cost,
             Lifetime {
                 total: self.lifetime_total.clone(),
                 limit: self.lifetime_max_cost,
             },
             self.cancel.clone(),
-        )
+        );
+        meter.scalar_limit = self.max_scalar_bytes;
+        meter.scalar_bytes = self.scalar_bytes.clone();
+        meter
     }
     /// Set the maximum input SQL length in bytes; `0` ⇒ unlimited.
     pub fn set_max_sql_length(&mut self, bytes: usize) {

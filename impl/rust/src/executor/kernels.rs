@@ -8,7 +8,19 @@ use super::*;
 /// (cyclically), on the left if `left` else the right; a string longer than `len` is truncated to
 /// its first `len` characters; an empty `fill` cannot pad (returns the truncated string); `len ≤ 0`
 /// is empty. A `len` above `MAX_RESULT_CHARS` traps `54000`. Matches PostgreSQL's lpad/rpad.
-pub(crate) fn pad_chars(s: &str, len: i64, fill: &str, left: bool) -> Result<String> {
+fn text_prefix_bytes(s: &str, chars: i64) -> usize {
+    s.char_indices()
+        .nth(chars as usize)
+        .map_or(s.len(), |(i, _)| i)
+}
+
+pub(crate) fn pad_chars(
+    s: &str,
+    len: i64,
+    fill: &str,
+    left: bool,
+    meter: &mut Meter,
+) -> Result<String> {
     if len > MAX_RESULT_CHARS {
         return Err(EngineError::new(
             SqlState::ProgramLimitExceeded,
@@ -18,27 +30,45 @@ pub(crate) fn pad_chars(s: &str, len: i64, fill: &str, left: bool) -> Result<Str
     if len <= 0 {
         return Ok(String::new());
     }
-    let schars: Vec<char> = s.chars().collect();
-    let slen = schars.len() as i64;
-    if slen >= len {
-        // longer (or equal) string truncates to its first `len` characters
-        return Ok(schars[..len as usize].iter().collect());
+    meter.charge(COSTS.scalar_byte * (s.len() + fill.len()) as i64);
+    meter.guard()?;
+    let prefix = text_prefix_bytes(s, len);
+    let need = len - s[..prefix].chars().count() as i64;
+    let (mut cycles, mut tail) = (0i64, 0usize);
+    let mut size = prefix as i64;
+    if need > 0 && !fill.is_empty() {
+        let flen = fill.chars().count() as i64;
+        cycles = need / flen;
+        tail = text_prefix_bytes(fill, need % flen);
+        if cycles > (MAX_RESULT_CHARS - size - tail as i64) / fill.len() as i64 {
+            return Err(EngineError::new(
+                SqlState::ProgramLimitExceeded,
+                "requested length too large",
+            ));
+        }
+        size += cycles * fill.len() as i64 + tail as i64;
     }
-    let fchars: Vec<char> = fill.chars().collect();
-    if fchars.is_empty() {
-        // empty fill cannot pad — return the string unchanged (it is shorter than len)
-        return Ok(s.to_string());
+    if size > MAX_RESULT_CHARS {
+        return Err(EngineError::new(
+            SqlState::ProgramLimitExceeded,
+            "requested length too large",
+        ));
     }
-    let need = (len - slen) as usize;
-    let mut pad = String::with_capacity(need);
-    for i in 0..need {
-        pad.push(fchars[i % fchars.len()]);
+    meter.charge(COSTS.scalar_byte * size);
+    meter.guard()?;
+    meter.reserve_scalar(size)?;
+    let mut out = String::with_capacity(size as usize);
+    if !left {
+        out.push_str(&s[..prefix]);
     }
-    Ok(if left {
-        format!("{pad}{s}")
-    } else {
-        format!("{s}{pad}")
-    })
+    for _ in 0..cycles {
+        out.push_str(fill);
+    }
+    out.push_str(&fill[..tail]);
+    if left {
+        out.push_str(&s[..prefix]);
+    }
+    Ok(out)
 }
 
 /// `btrim`/`ltrim`/`rtrim` over CODE POINTS (string-functions.md §3): remove from the chosen end(s)
@@ -86,19 +116,22 @@ pub(crate) fn translate_chars(s: &str, from: &str, to: &str) -> String {
 /// `repeat(s, n)` (string-functions.md §3): concatenate `s` `n` times; `n ≤ 0` is empty. The result's
 /// byte size is bounded at `MAX_RESULT_CHARS` (PG's MaxAllocSize) — an over-large `n·|s|` traps `54000`
 /// (program_limit_exceeded), the untrusted-query backstop. Matches PostgreSQL's repeat.
-pub(crate) fn repeat_text(s: &str, n: i64) -> Result<String> {
-    if n <= 0 {
+pub(crate) fn repeat_text(s: &str, n: i64, meter: &mut Meter) -> Result<String> {
+    if n <= 0 || s.is_empty() {
         return Ok(String::new());
     }
-    let too_large = (s.len() as i64)
-        .checked_mul(n)
-        .is_none_or(|total| total > MAX_RESULT_CHARS);
-    if too_large {
+    if n > MAX_RESULT_CHARS / s.len() as i64 {
         return Err(EngineError::new(
             SqlState::ProgramLimitExceeded,
             "requested length too large",
         ));
     }
+    meter.charge(COSTS.scalar_byte * s.len() as i64);
+    meter.guard()?;
+    let size = n * s.len() as i64;
+    meter.charge(COSTS.scalar_byte * size);
+    meter.guard()?;
+    meter.reserve_scalar(size)?;
     Ok(s.repeat(n as usize))
 }
 

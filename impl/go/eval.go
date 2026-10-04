@@ -2825,7 +2825,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if len(vals) > 2 {
 				fill = vals[2].str()
 			}
-			r, err := padChars(vals[0].str(), vals[1].Int, fill, true)
+			r, err := padChars(vals[0].str(), vals[1].Int, fill, true, m)
 			if err != nil {
 				return Value{}, err
 			}
@@ -2836,7 +2836,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if len(vals) > 2 {
 				fill = vals[2].str()
 			}
-			r, err := padChars(vals[0].str(), vals[1].Int, fill, false)
+			r, err := padChars(vals[0].str(), vals[1].Int, fill, false, m)
 			if err != nil {
 				return Value{}, err
 			}
@@ -2875,7 +2875,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return TextValue(translateChars(vals[0].str(), vals[1].str(), vals[2].str())), nil
 		case sfRepeat:
 			// repeat(text, n) → text — concatenate the string n times.
-			r, err := repeatText(vals[0].str(), vals[1].Int)
+			r, err := repeatText(vals[0].str(), vals[1].Int, m)
 			if err != nil {
 				return Value{}, err
 			}
@@ -3116,15 +3116,15 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			var err error
 			switch e.sfunc {
 			case sfSqrt:
-				r, err = a.DecSqrt()
+				r, err = a.decSqrtMetered(m)
 			case sfExp:
-				r, err = a.DecExp()
+				r, err = a.decExpMetered(m)
 			case sfLn:
-				r, err = a.DecLn()
+				r, err = a.decLnMetered(m)
 			case sfLog10:
-				r, err = a.DecLog10()
+				r, err = a.decLog10Metered(m)
 			default: // sfPow
-				r, err = decPower(a, *vals[1].decimal())
+				r, err = decPowerMetered(a, *vals[1].decimal(), m)
 			}
 			if err != nil {
 				return Value{}, err
@@ -3136,9 +3136,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			var r Decimal
 			var err error
 			if len(vals) > 1 {
-				r, err = decLog(a, *vals[1].decimal())
+				r, err = decLogMetered(a, *vals[1].decimal(), m)
 			} else {
-				r, err = a.DecLog10()
+				r, err = a.decLog10Metered(m)
 			}
 			if err != nil {
 				return Value{}, err

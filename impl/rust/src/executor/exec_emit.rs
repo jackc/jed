@@ -899,7 +899,11 @@ impl Engine {
                             && let Some(osa) = &plan.agg_specs[si].osa
                             && let Some(fe) = &osa.frac
                         {
-                            *frac = Some(fe.eval(&srow, &env, &mut Meter::new())?);
+                            *frac = Some(fe.eval(
+                                &srow,
+                                &env,
+                                &mut env.exec.session.scratch_meter(),
+                            )?);
                         }
                         // A hypothetical-set aggregate is finalized here (not via `Acc::finalize`)
                         // because it needs the spec's per-key sort specs: evaluate the hypothetical
@@ -913,7 +917,7 @@ impl Engine {
                             let hyp = hp
                                 .args
                                 .iter()
-                                .map(|a| a.eval(&srow, &env, &mut Meter::new()))
+                                .map(|a| a.eval(&srow, &env, &mut env.exec.session.scratch_meter()))
                                 .collect::<Result<Vec<Value>>>()?;
                             finalize_hypothetical(*kind, rows, &hyp, &hp.sorts)?
                         } else {

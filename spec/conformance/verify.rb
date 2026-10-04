@@ -157,6 +157,12 @@ def main
       end
     end
 
+    scalar_limits = File.readlines(path).filter_map { |l| l[/^#\s*max_scalar_bytes:\s*(\S+)/, 1] }
+    unless scalar_limits.empty?
+      scalar_limits.each { |tok| fail!("#{rel}: invalid max_scalar_bytes #{tok}") unless tok.match?(/\A\d+\z/) }
+      fail!("#{rel}: max_scalar_bytes requires resource.scalar_memory") unless reqs.include?("resource.scalar_memory")
+    end
+
     # (6) max_sql_length directives: each is a non-negative integer, and the file must require
     # the input-size capability (so cores lacking the gate skip it — conformance.md §3).
     max_sql_lengths = parse_max_sql_length_directives(path)

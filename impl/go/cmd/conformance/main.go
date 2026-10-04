@@ -782,6 +782,7 @@ func runFile(text string, disk bool) error {
 	var pendingAllowDDL *bool
 	var pendingAllowTempDDL *bool
 	var pendingTempBuffers *int
+	var pendingScalarBytes *int64
 	var pendingVars []varPair
 	var pendingTimezone *string
 	for i < len(lines) {
@@ -871,6 +872,8 @@ func runFile(text string, disk bool) error {
 				pendingAllowDDL = &a
 			} else if a, ok := parseAllowTempDDLDirective(line); ok {
 				pendingAllowTempDDL = &a
+			} else if n, ok := parseMaxCostDirective(strings.Replace(line, "max_scalar_bytes:", "max_cost:", 1)); ok {
+				pendingScalarBytes = &n
 			} else if n, ok := parseTempBuffersDirective(line); ok {
 				pendingTempBuffers = &n
 			} else if vars, ok := parseSetDirective(line); ok {
@@ -974,6 +977,12 @@ func runFile(text string, disk bool) error {
 		if pendingTempBuffers != nil {
 			tempBuffers = *pendingTempBuffers
 		}
+		scalarBytes := int64(0)
+		if pendingScalarBytes != nil {
+			scalarBytes = *pendingScalarBytes
+		}
+		sess.SetMaxScalarBytes(scalarBytes)
+		pendingScalarBytes = nil
 		sess.SetTempBuffers(tempBuffers)
 		pendingTempBuffers = nil
 		// Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each

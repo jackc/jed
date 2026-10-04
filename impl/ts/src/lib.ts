@@ -694,6 +694,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // Cost ceiling — a caller-set `max_cost` aborts a query (54P01) the instant accrued cost
   // reaches it; the `# max_cost:` directive runs a record under a ceiling (cost.md §6).
   "resource.cost_limit",
+  "resource.scalar_memory",
   // Nesting-depth limit — a fixed MAX_EXPR_DEPTH checked in the parser aborts deeply-nested input
   // with 54001 before it can overflow the native stack (CLAUDE.md §13; cost.md §7).
   "resource.depth_limit",

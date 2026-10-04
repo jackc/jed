@@ -903,14 +903,24 @@ from `spec/encoding/` or an old Apache-2.0 tag rather than vendoring the BSL sou
 
 ## 13. Untrusted queries: safe to run
 
+**Resource enforcement status.** Cost ceilings are work limits, not memory limits.
+`repeat`/padding have proportional UTF-8 work charges and pre-allocation byte checks;
+exact decimal transcendentals charge guarded internal steps. A finite 64 MiB default
+`max_scalar_bytes` allowance bounds their cumulative logical output/scratch allocation
+per statement (`54P04`), including internal meters and frozen cursors. Full query-memory
+admission is specified in `spec/design/memory.md` but not yet implemented for all scalars,
+row/result buffers, blocking operators and pending writes. Resource-exhaustion resistance
+remains a requirement; do not claim the current cost/scalar limits are a whole-engine
+memory guarantee. Host extensions remain outside these guarantees.
+
 **A fundamental project requirement: untrusted SQL is safe to run.** A first-class use case
 is a host exposing an ad-hoc query surface to its own users, so a query supplied by an
-adversary — not just a careless one — **cannot do bad things**. "Bad things" is concrete and
+adversary — not just a careless one — **must not do bad things**. "Bad things" is concrete and
 bounded: it cannot violate memory safety, it cannot reach outside the database (no
 filesystem, network, process, environment, or clock access beyond the sanctioned seams), and
-it cannot exhaust resources. This is a **standing guarantee about the engine and its
-built-in surface**, not a feature toggled on per query — every core upholds it by
-construction. Its concrete vehicle is a configured **session** (`spec/design/session.md`):
+resource use must be bounded. This is a **standing requirement for the engine and its
+built-in surface**; the enforcement status and remaining memory coverage are stated above.
+Its concrete vehicle is a configured **session** (`spec/design/session.md`):
 a host serves untrusted SQL through a session granted only the privileges it needs
 (`default_privileges = {SELECT}` + per-table `grant`) + per-statement-`max_cost`-capped +
 `lifetime_max_cost`-budgeted. It rests on **three guarantees**, each below:
@@ -921,10 +931,10 @@ a host serves untrusted SQL through a session granted only the privileges it nee
    bad things**: the built-in catalog is **pure and side-effect-free** (no I/O, no host
    reach, no nondeterminism outside the §10 entropy/clock seam). There is simply nothing in
    the surface to abuse.
-3. **Bounded resources** — execution cannot consume unbounded resources: a **deterministic
-   cost meter + ceiling** bounds work, and a **fixed parser nesting-depth limit** bounds
-   native-stack recursion. The two are independent gates (one strikes during execution, the
-   other before any cost is metered).
+3. **Bounded resources** — a **deterministic cost meter + ceiling** bounds metered work,
+   a **fixed parser nesting-depth limit** bounds native-stack recursion, and the finite
+   scalar allowance bounds the covered allocations. Complete query-memory enforcement
+   remains required under memory.md; these independent gates do not yet cover every heap owner.
 
 **Scope boundary — host/application-supplied functions are excluded.** This guarantee covers
 the engine and its built-in surface *only*. The moment a host registers an

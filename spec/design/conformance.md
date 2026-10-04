@@ -538,3 +538,9 @@ the signature, so finer trimming is left to the author. A fixed synthetic case g
 
 Further SQLancer oracles remain open (TODO.md Phase 8): **PQS** (pivoted query synthesis — needs an
 in-harness expression evaluator) and broader NoREC/TLP relations as new optimizations land.
+
+### Scalar allocation directive
+
+`# max_scalar_bytes: N` sets the finite scalar allowance for the next record only;
+zero restores the 64 MiB default. Requires `resource.scalar_memory`. Memory errors
+are jed-specific; successful scalar values remain PostgreSQL-comparable.

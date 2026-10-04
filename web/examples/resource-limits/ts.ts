@@ -2,11 +2,15 @@ import { createDatabase, EngineError } from 'jed-ts';
 
 const db = createDatabase({ path: 'app.jed' });
 
-// Serve untrusted queries through a session bounded TWO ways:
+// Serve untrusted queries through a session with independent work and scalar-allocation limits:
 //   maxCost         — a per-STATEMENT ceiling: one runaway query aborts 54P01.
 //   lifetimeMaxCost — a per-SESSION budget: the session's cumulative cost is capped, so a flood of
 //                     cheap queries can't burn unbounded CPU. It aborts 54P02.
-const untrusted = db.session({ maxCost: 10000n, lifetimeMaxCost: 3n });
+const untrusted = db.session({
+  maxCost: 10000n,
+  lifetimeMaxCost: 3n,
+  maxScalarBytes: 8n * 1024n * 1024n
+});
 
 // Each statement accrues into the session's running total; read it with lifetimeCost().
 untrusted.execute('SELECT 1'); // cost 1 — cumulative 1

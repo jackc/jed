@@ -5,6 +5,8 @@
 // hand-written (§5 forbids codegenning those). Regenerate with `rake codegen`;
 // `rake verify` fails if this file is stale. Reasoning: ../../../spec/design/cost.md.
 
+pub const DEFAULT_SCALAR_BYTES: i64 = 67108864;
+
 /// The deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
 pub struct CostSchedule {
     pub storage_row_read: i64,
@@ -31,6 +33,8 @@ pub struct CostSchedule {
     pub window_result: i64,
     pub varlen_compare: i64,
     pub window_frame_step: i64,
+    pub scalar_byte: i64,
+    pub decimal_transcend: i64,
 }
 
 /// The canonical cost schedule — weights accrued per unit during query execution.
@@ -59,4 +63,6 @@ pub const COSTS: CostSchedule = CostSchedule {
     window_result: 1,
     varlen_compare: 1,
     window_frame_step: 1,
+    scalar_byte: 1,
+    decimal_transcend: 1,
 };

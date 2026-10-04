@@ -1501,3 +1501,7 @@ capabilities = [
   "query.values",
   "query.lateral",
 ]
+
+[[capability]]
+id = "resource.scalar_memory"
+description = "Finite per-statement cumulative scalar-allocation budget, checked before repeat/padding output and decimal-transcendental scratch allocation (54P04); memory.md. Host setting max_scalar_bytes and per-record corpus directive."

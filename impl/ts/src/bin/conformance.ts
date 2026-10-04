@@ -569,6 +569,7 @@ function runFile(text: string, disk: boolean): void {
     const pendingRevokes: PrivDelta[] = [];
     let pendingAllowDdl: boolean | null = null;
     let pendingAllowTempDdl: boolean | null = null;
+    let pendingScalarBytes: bigint | null = null;
     let pendingTempBuffers: number | null = null;
     const pendingVars: Array<[string, string]> = [];
     let pendingTimezone: string | null = null;
@@ -636,6 +637,9 @@ function runFile(text: string, disk: boolean): void {
         const rv = parseRevokeDirective(line);
         const ad = parseAllowDdlDirective(line);
         const atd = parseAllowTempDdlDirective(line);
+        const sb = /^#\s*max_scalar_bytes:/.test(line)
+          ? parseMaxCostDirective(line.replace("max_scalar_bytes:", "max_cost:"))
+          : null;
         const tb = parseTempBuffersDirective(line);
         const sv = parseSetDirective(line);
         const tz = parseTimezoneDirective(line);
@@ -663,6 +667,8 @@ function runFile(text: string, disk: boolean): void {
           pendingAllowDdl = ad;
         } else if (atd !== null) {
           pendingAllowTempDdl = atd;
+        } else if (sb !== null) {
+          pendingScalarBytes = sb;
         } else if (tb !== null) {
           pendingTempBuffers = tb;
         } else if (sv !== null) {
@@ -746,6 +752,8 @@ function runFile(text: string, disk: boolean): void {
       pendingAllowTempDdl = null;
       // Apply the per-record temp-storage budget (temp-tables.md §7); absent ⇒ unlimited (0), so a
       // `# temp_buffers:` directive never leaks past its record. Mirrors `# max_cost:`.
+      db.setMaxScalarBytes(pendingScalarBytes ?? 0n);
+      pendingScalarBytes = null;
       db.setTempBuffers(pendingTempBuffers ?? 0);
       pendingTempBuffers = null;
       // Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each

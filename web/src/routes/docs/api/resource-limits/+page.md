@@ -10,9 +10,9 @@
 # Resource limits
 
 jed meters the **execution cost** of every query deterministically — the same query against the same
-database always costs the same, on every core. Two ceilings turn that meter into the resource half of
-the "untrusted SQL is safe to run" guarantee (the [Authorization](../authorization/) page is
-the privilege half). Pair them and you can hand an adversary a query surface.
+database always costs the same, on every core. Cost ceilings bound metered work; a separate
+scalar allocation budget rejects large repeat/padding results and decimal scratch allocations
+before construction. These are independent limits, with the coverage described below.
 
 ## Two ceilings
 
@@ -40,3 +40,24 @@ Both default to `0` (unlimited). A statement aborts at whichever ceiling it reac
 This is the clean "this session has a total compute allowance" model for a multi-tenant or
 untrusted-query host: a session granted only the privileges it needs, capped per statement, and
 budgeted over its lifetime.
+
+## Scalar allocation budget
+
+`max_scalar_bytes` defaults to **64 MiB per statement**. Set it through session options or
+`set_max_scalar_bytes(bytes)` / `SetMaxScalarBytes(bytes)` / `setMaxScalarBytes(bytes)`.
+Non-positive values restore the finite default. A reservation above it fails with **`54P04`**;
+exact equality is allowed. The budget resets for each statement and accumulates across nested
+calls, rows, subqueries and CTEs. A cursor keeps its original budget until it closes.
+
+This budget covers the exact UTF-8 output bytes of **`repeat`, `lpad`, `rpad`**, and logical
+scratch reservations in **decimal `sqrt`, `exp`, `ln`, `log`, `log10`, `power`, `pow`**.
+The string functions also charge input/output byte work before construction; decimals charge
+inside their algorithms. A cost ceiling can reject the work before its allocation budget is used.
+
+## Memory coverage
+
+The scalar allowance is **not a whole-query or process-memory cap**. Other scalar kernels,
+input values, decoded rows, join/aggregate/distinct state, result collectors and pending writes
+still need general memory admission. `work_mem` controls sort spilling and `temp_buffers`
+limits retained temporary storage; neither is a total heap limit. Hosts exposing arbitrary
+untrusted SQL must account for these remaining allocations and host-retained results.

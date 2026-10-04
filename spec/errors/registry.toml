@@ -674,6 +674,13 @@ name = "temp_storage_limit_exceeded"
 class = "program limit exceeded"
 template = "temporary table storage exceeded the limit of {limit} bytes"
 
+# Deterministic scalar allocation admission; independent of execution cost.
+[[error]]
+code = "54P04"
+name = "scalar_memory_limit_exceeded"
+class = "program limit exceeded"
+template = "scalar allocations exceeded the limit of {limit} bytes"
+
 # --- invalid object state (class 55) ----------------------------------------
 # currval/lastval before nextval has defined the value in this session
 # (../design/sequences.md §6).

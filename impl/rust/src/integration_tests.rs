@@ -198,3 +198,6 @@ mod writable_cte;
 
 #[path = "../tests/index_dependencies.rs"]
 mod index_dependencies;
+
+#[path = "../tests/scalar_memory.rs"]
+mod scalar_memory;

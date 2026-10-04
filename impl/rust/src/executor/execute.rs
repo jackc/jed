@@ -436,6 +436,13 @@ impl Engine {
     /// **unlimited** (never spill). It never changes what a query observes (results + cost are
     /// invariant — spill.md §6), only when an operator spills; an in-memory database ignores it (no
     /// file to spill to). A handle setting, not stored in the file (mirrors `set_max_cost`).
+    /// Cumulative scalar allocation budget per statement; non-positive restores the default.
+    pub fn set_max_scalar_bytes(&mut self, bytes: i64) {
+        self.session.set_max_scalar_bytes(bytes);
+    }
+    pub fn max_scalar_bytes(&self) -> i64 {
+        self.session.max_scalar_bytes()
+    }
     pub fn set_work_mem(&mut self, bytes: usize) {
         self.session.work_mem = bytes;
     }
@@ -668,6 +675,7 @@ impl Engine {
         params: &[Value],
         insert_cache: Option<&std::cell::RefCell<Option<CachedInsert>>>,
     ) -> Result<Outcome> {
+        self.session.scalar_bytes = std::rc::Rc::new(std::cell::Cell::new(0));
         match stmt {
             Statement::Begin { writable } => return self.begin_tx(writable),
             Statement::Commit => return self.commit_tx(),
@@ -1119,7 +1127,8 @@ impl Engine {
     /// / `54P02` (lifetime budget) / `42501` (privilege). Reads only — transaction control must still
     /// work in a failed block, and a write is gated inside `dispatch_stmt` on the materialized
     /// fall-through. The three checks are pure, so the fall-through re-running them is harmless.
-    pub(crate) fn gate_read_lanes(&self, stmt: &Statement) -> Result<()> {
+    pub(crate) fn gate_read_lanes(&mut self, stmt: &Statement) -> Result<()> {
+        self.session.scalar_bytes = std::rc::Rc::new(std::cell::Cell::new(0));
         if self.tx_failed() {
             return Err(EngineError::new(
                 SqlState::InFailedSqlTransaction,

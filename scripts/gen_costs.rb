@@ -32,6 +32,8 @@ end
 
 # --- shared field access -----------------------------------------------------
 
+def scalar_limit = TomlRB.load_file(SCHEDULE).fetch("limits").fetch("default_scalar_bytes")
+
 def units
   schedule = TomlRB.load_file(SCHEDULE)
   us = schedule["unit"] || []
@@ -58,6 +60,8 @@ def rust_file(us)
     // accrual sites that CONSUME these weights (executor / evaluator / storage reads) are
     // hand-written (§5 forbids codegenning those). Regenerate with `rake codegen`;
     // `rake verify` fails if this file is stale. Reasoning: ../../../spec/design/cost.md.
+
+    pub const DEFAULT_SCALAR_BYTES: i64 = #{scalar_limit};
 
     /// The deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
     pub struct CostSchedule {
@@ -92,6 +96,8 @@ def go_file(us)
 
     package jed
 
+    const defaultScalarBytes int64 = #{scalar_limit}
+
     // CostSchedule holds the deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
     type costSchedule struct {
     #{fields}
@@ -116,6 +122,8 @@ def ts_file(us)
     // accrual sites that CONSUME these weights (executor / evaluator / storage reads) are
     // hand-written (§5 forbids codegenning those). Regenerate with `rake codegen`;
     // `rake verify` fails if this file is stale. Reasoning: ../../../spec/design/cost.md.
+
+    export const DEFAULT_SCALAR_BYTES = #{scalar_limit}n;
 
     // The deterministic cost-unit weights, mirroring spec/cost/schedule.toml. Weights are
     // bigint for i64 parity with the Rust/Go cores (a number is f64 — CLAUDE.md §8).

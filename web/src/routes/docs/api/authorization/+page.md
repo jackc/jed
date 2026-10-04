@@ -14,9 +14,8 @@ the **session**. A host serving untrusted queries configures a privilege envelop
 enforces it mechanically: any operation the envelope withholds fails with **`42501`** at name
 resolution, before it runs.
 
-This is the concrete form of jed's "untrusted SQL is safe to run" guarantee — pair it with the
-[resource limits](../resource-limits/) (`max_cost` and `lifetime_max_cost`) and you can hand an
-adversary a query surface.
+Pair authorization with the [resource limits](../resource-limits/) for metered work and
+covered scalar allocations. Review their memory coverage before exposing arbitrary SQL.
 
 ## The model
 

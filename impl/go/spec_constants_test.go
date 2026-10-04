@@ -400,6 +400,10 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 			return costs.ValueCompress
 		case "value_decompress":
 			return costs.ValueDecompress
+		case "scalar_byte":
+			return costs.ScalarByte
+		case "decimal_transcend":
+			return costs.DecimalTranscend
 		case "decimal_work":
 			return costs.DecimalWork
 		case "row_produced":

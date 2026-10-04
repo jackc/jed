@@ -36,6 +36,8 @@ def main
   # (1) schema_version
   fail!("schedule.toml: schema_version must be 1") unless schedule["schema_version"] == 1
 
+  fail!("invalid default_scalar_bytes") unless schedule.dig("limits", "default_scalar_bytes").is_a?(Integer) && schedule.dig("limits", "default_scalar_bytes") > 0
+
   # (2) at least one unit
   units = schedule["unit"] || []
   fail!("schedule.toml: no [[unit]] entries") if units.empty?

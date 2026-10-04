@@ -62,10 +62,9 @@ CREATE TABLE temp (id i32 PRIMARY KEY);     -- a persistent table called "temp"
 Temp tables retain rows across statements, which the per-statement cost ceiling does not bound — so
 a session carries a `temp_buffers` budget (in bytes; the host sets it, default 32 MiB, `0` means
 unlimited). A write that would push the session's total temp storage past the budget is rejected
-with error `54P03` and rolled back, leaving the already-committed rows intact. This makes a temp
-table a safe, bounded scratch space for untrusted SQL — paired with the per-statement
-[cost limit](../../api/resource-limits/), a query can be given scratch space without risking
-unbounded memory.
+with error `54P03` and rolled back, leaving the already-committed rows intact. This bounds retained temp storage. Configure the
+[execution and scalar limits](../../api/resource-limits/) separately; transient query memory
+and pending writes still need broader memory admission.
 
 ## Indexes
 

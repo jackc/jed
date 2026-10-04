@@ -20,6 +20,7 @@
 //     partial cost counts automatically and the cumulative is session state that survives a
 //     transaction rollback.
 
+import { DEFAULT_SCALAR_BYTES } from "./costs.ts";
 import { engineError } from "./errors.ts";
 
 // LifetimeBudget is the session lifetime-budget handle a Meter carries (spec/design/session.md
@@ -48,6 +49,19 @@ export class LifetimeBudget {
 // bigint for i64 parity with the Rust/Go cores — a number is f64, which loses integer precision
 // above 2^53 and would silently diverge (CLAUDE.md §8).
 export class Meter {
+  private ceilingHit = 0;
+  scalarBytes = { used: 0n };
+  scalarLimit = DEFAULT_SCALAR_BYTES;
+  reserveScalar(bytes: bigint): void {
+    const limit = this.scalarLimit > 0n ? this.scalarLimit : DEFAULT_SCALAR_BYTES;
+    if (bytes > limit - this.scalarBytes.used)
+      throw engineError(
+        "scalar_memory_limit_exceeded",
+        `scalar allocations exceeded the limit of ${limit} bytes`,
+      );
+    this.scalarBytes.used += bytes;
+  }
+
   // Total cost accrued so far FOR THIS STATEMENT (CLAUDE.md §13) — the figure reported on Outcome
   // and asserted by the `# cost:` directive.
   accrued: bigint = 0n;
@@ -70,8 +84,18 @@ export class Meter {
   // cumulative total (live), so partial cost of an aborted statement counts. Enforcement is NOT here:
   // guard() does the comparisons at the work loops, so the cross-core accrual count is untouched.
   charge(units: bigint): void {
-    this.accrued += units;
-    if (this.lifetime !== undefined) this.lifetime.total += units;
+    if (this.ceilingHit === 0) {
+      const stmt = this.limit > 0n && units >= this.limit - this.accrued;
+      const l = this.lifetime;
+      const life = l !== undefined && l.limit > 0n && units >= l.limit - l.total;
+      if (stmt) this.ceilingHit = 1;
+      if (life && l !== undefined && (!stmt || l.limit - l.total < this.limit - this.accrued))
+        this.ceilingHit = 2;
+    }
+
+    this.accrued = saturatingCostAdd(this.accrued, units);
+    if (this.lifetime !== undefined)
+      this.lifetime.total = saturatingCostAdd(this.lifetime.total, units);
   }
 
   // isUnmetered reports whether NO cost ceiling is armed — no per-statement maxCost and no session
@@ -104,6 +128,7 @@ export class Meter {
     if (stmtOver && lifeOver && l !== undefined) {
       pickLife = l.total - l.limit > this.accrued - this.limit;
     }
+    if (this.ceilingHit !== 0) pickLife = this.ceilingHit === 2;
     if (pickLife && l !== undefined) {
       throw engineError(
         "session_cost_limit_exceeded",
@@ -115,4 +140,9 @@ export class Meter {
       `query exceeded the cost limit of ${this.limit} (accrued ${this.accrued})`,
     );
   }
+}
+
+function saturatingCostAdd(a: bigint, b: bigint): bigint {
+  const n = a + b;
+  return n > 9223372036854775807n ? 9223372036854775807n : n;
 }

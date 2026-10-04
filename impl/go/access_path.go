@@ -1723,7 +1723,7 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 	// Extract the query's terms (extract_query_terms) — a pure planning step, NOT metered (cost.md
 	// §3): evaluate Q on a scratch meter. queryRow is nil for an ordinary constant bound and the
 	// combined left-hand row for an index-nested-loop sibling bound.
-	qv, err := query.eval(queryRow, env, &costMeter{})
+	qv, err := query.eval(queryRow, env, env.exec.session.scratchMeter())
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -1878,7 +1878,7 @@ func (db *engine) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExp
 		return nil, 0, 0, nil
 	}
 	// Extracting the constant or once-per-outer sibling query is a planning step, NOT metered.
-	qv, err := query.eval(queryRow, env, &costMeter{})
+	qv, err := query.eval(queryRow, env, env.exec.session.scratchMeter())
 	if err != nil {
 		return nil, 0, 0, err
 	}

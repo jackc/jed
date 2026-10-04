@@ -1476,6 +1476,12 @@ export class Session {
   get workMem(): number {
     return this.engine.session.workMem;
   }
+  setMaxScalarBytes(bytes: bigint): void {
+    this.engine.session.maxScalarBytes = bytes;
+  }
+  get maxScalarBytes(): bigint {
+    return this.engine.session.scalarLimit();
+  }
   setWorkMem(bytes: number): void {
     this.engine.session.workMem = bytes;
   }

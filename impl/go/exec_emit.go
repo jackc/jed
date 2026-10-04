@@ -988,7 +988,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					// (aggregates.md §13/§17) — so it may reference grouping columns. Unmetered
 					// (the finalize step, like the sort), via a scratch meter. mode has none.
 					if fe := plan.aggSpecs[si].osaFrac; fe != nil {
-						fv, ferr := fe.eval(srow, env, &costMeter{})
+						fv, ferr := fe.eval(srow, env, env.exec.session.scratchMeter())
 						if ferr != nil {
 							return emitter{}, ferr
 						}
@@ -1001,7 +1001,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					if hp := plan.aggSpecs[si].hypo; hp != nil {
 						hyp := make([]Value, len(hp.args))
 						for ai, arg := range hp.args {
-							av, aerr := arg.eval(srow, env, &costMeter{})
+							av, aerr := arg.eval(srow, env, env.exec.session.scratchMeter())
 							if aerr != nil {
 								return emitter{}, aerr
 							}

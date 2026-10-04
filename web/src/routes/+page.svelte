@@ -113,8 +113,9 @@ ORDER BY score DESC;`;
     <div class="rounded-lg border border-slate-200 bg-white p-4">
       <h3 class="font-semibold text-jed-ink">Running untrusted SQL</h3>
       <p class="mt-1 text-sm text-slate-600">
-        Let your users write and run their own queries. An adversarial query still cannot corrupt
-        memory, reach the host, or exhaust resources.
+        Let your users write and run their own queries with memory-safe cores, pure built-ins, and
+        configurable work and scalar-allocation budgets.
+        <a href="/docs/api/resource-limits/">See resource coverage and remaining memory limits.</a>
       </p>
     </div>
     <div class="rounded-lg border border-slate-200 bg-white p-4">

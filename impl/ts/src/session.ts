@@ -26,10 +26,12 @@ import type { Value } from "./value.ts";
 import type { Row } from "./storage.ts";
 import { isTrue, nullValue } from "./value.ts";
 import { evalExpr } from "./eval.ts";
-import { COSTS } from "./costs.ts";
+import { COSTS, DEFAULT_SCALAR_BYTES } from "./costs.ts";
 import type { TableStore } from "./storage.ts";
 import type { KeyBound } from "./pmap.ts";
 export class SessionState {
+  maxScalarBytes: bigint;
+  scalarBytes = { used: 0n };
   // The open transaction, or null under autocommit (transactions.md §4.1); the Idle/Open/Failed
   // status (session.md §2.2) is derived from this.
   tx: ActiveTx | null;
@@ -118,6 +120,7 @@ export class SessionState {
 
   constructor(opts: SessionOptions = {}) {
     this.tx = null;
+    this.maxScalarBytes = opts.maxScalarBytes ?? 0n;
     this.maxCost = opts.maxCost ?? 0n;
     this.fkActionDepth = 0;
     this.lifetime = new LifetimeBudget(opts.lifetimeMaxCost ?? 0n);
@@ -161,6 +164,8 @@ export class SessionState {
     const frozen = Object.create(SessionState.prototype) as SessionState;
     frozen.tx = null;
     frozen.maxCost = source.maxCost;
+    frozen.maxScalarBytes = source.maxScalarBytes;
+    frozen.scalarBytes = source.scalarBytes;
     frozen.fkActionDepth = source.fkActionDepth;
     frozen.lifetime = source.lifetime;
     frozen.maxSqlLength = source.maxSqlLength;
@@ -203,6 +208,9 @@ export class SessionState {
   inTransaction(): boolean {
     return this.tx !== null;
   }
+  scalarLimit(): bigint {
+    return this.maxScalarBytes > 0n ? this.maxScalarBytes : DEFAULT_SCALAR_BYTES;
+  }
   setMaxCost(limit: bigint): void {
     this.maxCost = limit;
   }
@@ -224,8 +232,17 @@ export class SessionState {
   // newMeter builds the Meter for a statement run on this session: the per-statement maxCost ceiling
   // (54P01) plus the shared LifetimeBudget (54P02) the meter live-charges into. Every statement's
   // meter is minted here, so all execution cost accrues into the cumulative.
+  scratchMeter(): Meter {
+    const m = new Meter();
+    m.scalarLimit = this.maxScalarBytes;
+    m.scalarBytes = this.scalarBytes;
+    return m;
+  }
   newMeter(): Meter {
-    return new Meter(this.maxCost, this.lifetime);
+    const meter = new Meter(this.maxCost, this.lifetime);
+    meter.scalarLimit = this.maxScalarBytes;
+    meter.scalarBytes = this.scalarBytes;
+    return meter;
   }
   setMaxSqlLength(bytes: number): void {
     this.maxSqlLength = bytes;

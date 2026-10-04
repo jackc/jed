@@ -17,7 +17,7 @@ is picked by argument families, the result type by the catalog `result` code, th
 name, and **NULL propagates** at eval (`null = "propagates"` — any NULL argument → NULL,
 short-circuited before the kernel runs). No new resolved-expression node is needed — they
 ride `RExpr::ScalarFunc` / `reScalarFunc` / `scalarFunc` like `abs`/`round`. Each charges one
-`operator_eval` (the uniform per-call weight) plus its arguments' own costs.
+`operator_eval` (the uniform per-call weight) plus its arguments' own costs; repeat/padding additionally charge input/output UTF-8 byte work (cost.md §8).
 
 PostgreSQL is the behavioral default (CLAUDE.md §1) and every one of these is oracle-pinned
 against `postgres:18` — they live on the comparable surface, so the corpus rows are imported
@@ -124,9 +124,9 @@ single space), truncating a longer string to its first `length` characters:
 **Resource bound (CLAUDE.md §13).** `lpad`/`rpad` (and `repeat`) *amplify* — a small input can
 request a huge output — so a `length` above `MAX_RESULT_CHARS` (PostgreSQL's `MaxAllocSize`,
 `0x3FFFFFFF`) traps **`54000`** (`program_limit_exceeded`, *"requested length too large"*), exactly
-PostgreSQL's behavior, bounding the allocation an untrusted query can demand. (Per-character cost
-metering so the `max_cost` ceiling also bounds a sub-cap-but-still-large pad is a deferred follow-on;
-the hard cap is the backstop.)
+PostgreSQL's requested-character backstop. In addition, the UTF-8 result byte size
+is checked against the same cap before construction. Input/output byte work is charged
+and guarded, then output bytes are admitted against `max_scalar_bytes` (cost.md §8, memory.md).
 
 ### `rpad(text, length [, fill]) → text`
 
@@ -334,3 +334,13 @@ The PostgreSQL quoting helpers for building SQL text.
   central list — grammar.md), so jed quotes only by the **lexical** safety pattern: `quote_ident
   ('select') = 'select'`. The oracle corpus exercises the non-keyword cases (which match
   PostgreSQL); keyword-aware quoting is a deferred refinement, recorded here.
+
+## Resource admission for result amplification
+
+`repeat`, `lpad`, and `rpad` charge their input and exact output UTF-8 byte work
+and guard before constructing output (cost.md §8). They reserve output bytes from
+the statement's finite `max_scalar_bytes` allowance (memory.md), including nested
+calls and repeated rows. Padding also checks the UTF-8 output byte cap, so astral
+characters cannot multiply the old character cap into a multi-gigabyte allocation.
+The byte cap and `54P04` budget are deliberate safety limits; returned values and
+character/truncation semantics below the limits continue to match PostgreSQL.

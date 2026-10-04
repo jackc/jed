@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Scalar value kernels: string/text builtins, numeric helpers, and literal parsing/coercion. This
@@ -26,33 +27,64 @@ const maxResultChars int64 = 0x3FFFFFFF
 // fill (cyclically), on the left if left else the right; a string longer than length is truncated
 // to its first length characters; an empty fill cannot pad (returns the truncated string); a
 // length ≤ 0 is empty. A length above maxResultChars traps 54000. Matches PostgreSQL's lpad/rpad.
-func padChars(s string, length int64, fill string, left bool) (string, error) {
+func textPrefixBytes(s string, chars int64) int {
+	for i := range s {
+		if chars == 0 {
+			return i
+		}
+		chars--
+	}
+	return len(s)
+}
+
+func padChars(s string, length int64, fill string, left bool, m *costMeter) (string, error) {
 	if length > maxResultChars {
 		return "", newError(ProgramLimitExceeded, "requested length too large")
 	}
 	if length <= 0 {
 		return "", nil
 	}
-	runes := []rune(s)
-	slen := int64(len(runes))
-	if slen >= length {
-		return string(runes[:length]), nil
+	m.Charge(costs.ScalarByte * int64(len(s)+len(fill)))
+	if err := m.Guard(); err != nil {
+		return "", err
 	}
-	frunes := []rune(fill)
-	if len(frunes) == 0 {
-		return s, nil
+	prefix := textPrefixBytes(s, length)
+	slen := int64(utf8.RuneCountInString(s[:prefix]))
+	need := length - slen
+	cycles, tail := int64(0), 0
+	size := int64(prefix)
+	if need > 0 && len(fill) > 0 {
+		flen := int64(utf8.RuneCountInString(fill))
+		cycles = need / flen
+		tail = textPrefixBytes(fill, need%flen)
+		if cycles > (maxResultChars-size-int64(tail))/int64(len(fill)) {
+			return "", newError(ProgramLimitExceeded, "requested length too large")
+		}
+		size += cycles*int64(len(fill)) + int64(tail)
 	}
-	need := int(length - slen)
-	flen := len(frunes)
-	var b strings.Builder
-	for i := 0; i < need; i++ {
-		b.WriteRune(frunes[i%flen])
+	if size > maxResultChars {
+		return "", newError(ProgramLimitExceeded, "requested length too large")
 	}
-	pad := b.String()
+	m.Charge(costs.ScalarByte * size)
+	if err := m.Guard(); err != nil {
+		return "", err
+	}
+	if err := m.ReserveScalar(size); err != nil {
+		return "", err
+	}
+	var out strings.Builder
+	out.Grow(int(size))
+	if !left {
+		out.WriteString(s[:prefix])
+	}
+	for i := int64(0); i < cycles; i++ {
+		out.WriteString(fill)
+	}
+	out.WriteString(fill[:tail])
 	if left {
-		return pad + s, nil
+		out.WriteString(s[:prefix])
 	}
-	return s + pad, nil
+	return out.String(), nil
 }
 
 // trimChars is btrim/ltrim/rtrim over CODE POINTS (string-functions.md §3): remove from the chosen
@@ -120,12 +152,24 @@ func translateChars(s, from, to string) string {
 // repeatText is repeat(s, n) (string-functions.md §3): concatenate s n times; n ≤ 0 is empty. The
 // result's byte size is bounded at maxResultChars (PG's MaxAllocSize) — an over-large n·len(s) traps
 // 54000 (program_limit_exceeded). Matches PostgreSQL's repeat.
-func repeatText(s string, n int64) (string, error) {
+func repeatText(s string, n int64, m *costMeter) (string, error) {
 	if n <= 0 || len(s) == 0 {
 		return "", nil
 	}
 	if n > maxResultChars/int64(len(s)) {
 		return "", newError(ProgramLimitExceeded, "requested length too large")
+	}
+	m.Charge(costs.ScalarByte * int64(len(s)))
+	if err := m.Guard(); err != nil {
+		return "", err
+	}
+	size := n * int64(len(s))
+	m.Charge(costs.ScalarByte * size)
+	if err := m.Guard(); err != nil {
+		return "", err
+	}
+	if err := m.ReserveScalar(size); err != nil {
+		return "", err
 	}
 	return strings.Repeat(s, int(n)), nil
 }

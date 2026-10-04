@@ -651,20 +651,40 @@ export const MAX_RESULT_CHARS = 0x3fffffffn;
 // `fill` (cyclically), on the left if `left` else the right; a string longer than `length` is
 // truncated to its first `length` characters; an empty fill cannot pad (returns the truncated
 // string); a length ≤ 0 is empty. A length above MAX_RESULT_CHARS traps 54000. Matches PG lpad/rpad.
-export function padChars(s: string, length: bigint, fill: string, left: boolean): string {
+function textPrefix(s: string, count: number): { end: number; chars: number; bytes: number } {
+  let end = 0, chars = 0, bytes = 0;
+  for (const c of s) {
+    if (chars === count) break;
+    end += c.length;
+    chars++;
+    const cp = c.codePointAt(0)!;
+    bytes += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+  }
+  return { end, chars, bytes };
+}
+
+export function padChars(s: string, length: bigint, fill: string, left: boolean, meter: Meter): string {
   if (length > MAX_RESULT_CHARS)
     throw engineError("program_limit_exceeded", "requested length too large");
   if (length <= 0n) return "";
-  const chars = [...s];
-  const slen = BigInt(chars.length);
-  if (slen >= length) return chars.slice(0, Number(length)).join("");
-  const fchars = [...fill];
-  if (fchars.length === 0) return s;
-  const need = Number(length - slen);
-  const flen = fchars.length;
-  let pad = "";
-  for (let i = 0; i < need; i++) pad += fchars[i % flen];
-  return left ? pad + s : s + pad;
+  const sb = textPrefix(s, Infinity), fb = textPrefix(fill, Infinity);
+  meter.charge(COSTS.scalarByte * BigInt(sb.bytes + fb.bytes));
+  meter.guard();
+  const prefix = textPrefix(s, Number(length));
+  const need = Number(length) - prefix.chars;
+  let cycles = 0, tail = { end: 0, chars: 0, bytes: 0 };
+  if (need > 0 && fb.chars > 0) {
+    cycles = Math.floor(need / fb.chars);
+    tail = textPrefix(fill, need % fb.chars);
+  }
+  const size = BigInt(prefix.bytes) + BigInt(cycles) * BigInt(fb.bytes) + BigInt(tail.bytes);
+  if (size > MAX_RESULT_CHARS)
+    throw engineError("program_limit_exceeded", "requested length too large");
+  meter.charge(COSTS.scalarByte * size);
+  meter.guard();
+  meter.reserveScalar(size);
+  const pad = fill.repeat(cycles) + fill.slice(0, tail.end);
+  return left ? pad + s.slice(0, prefix.end) : s.slice(0, prefix.end) + pad;
 }
 
 // trimChars is btrim/ltrim/rtrim over CODE POINTS (string-functions.md §3): remove from the chosen
@@ -706,11 +726,17 @@ export function translateChars(s: string, from: string, to: string): string {
 // repeatText is repeat(s, n) (string-functions.md §3): concatenate s n times; n ≤ 0 is empty. The
 // result's byte size is bounded at MAX_RESULT_CHARS (PG's MaxAllocSize, a UTF-8-byte cap matching
 // Rust/Go) — an over-large n·bytes traps 54000. Matches PostgreSQL's repeat.
-export function repeatText(s: string, n: bigint): string {
+export function repeatText(s: string, n: bigint, meter: Meter): string {
   if (n <= 0n || s.length === 0) return "";
-  const bytes = BigInt(utf8ByteLength(s));
+  const bytes = BigInt(textPrefix(s, Infinity).bytes);
   if (n > MAX_RESULT_CHARS / bytes)
     throw engineError("program_limit_exceeded", "requested length too large");
+  meter.charge(COSTS.scalarByte * bytes);
+  meter.guard();
+  const size = n * bytes;
+  meter.charge(COSTS.scalarByte * size);
+  meter.guard();
+  meter.reserveScalar(size);
   return s.repeat(Number(n));
 }
 
@@ -1365,6 +1391,8 @@ export class Engine {
   // spill). It never changes what a query observes (results + cost are invariant — spill.md §6),
   // only when an operator spills; an in-memory database ignores it. A handle setting, not stored in
   // the file (mirrors setMaxCost).
+  setMaxScalarBytes(bytes: bigint): void { this.session.maxScalarBytes = bytes; }
+  get maxScalarBytes(): bigint { return this.session.scalarLimit(); }
   setWorkMem(bytes: number): void {
     this.session.workMem = bytes;
   }
@@ -2271,6 +2299,7 @@ export class Engine {
     params: Value[],
     insertHolder: InsertCacheHolder | null = null,
   ): Outcome {
+    this.session.scalarBytes = { used: 0n };
     switch (stmt.kind) {
       case "begin":
         return this.beginTx(stmt.writable);
@@ -2714,6 +2743,7 @@ export class Engine {
   // pure, so a read that falls through to the materialized path re-running them is harmless (identical
   // result). (CLAUDE.md §13 — the safe-total-query contract.)
   gateReadLanes(stmt: Statement): void {
+    this.session.scalarBytes = { used: 0n };
     if (this.session.tx?.failed) {
       throw engineError(
         "in_failed_sql_transaction",
@@ -8348,7 +8378,7 @@ export class Engine {
     // Extract the query's terms (extract_query_terms) — a pure planning step, NOT metered (cost.md
     // §3): evaluate Q on a scratch meter. queryRow is empty for a constant bound and the combined
     // left row for a sibling INL.
-    const qv = evalExpr(query, queryRow, env, new Meter());
+    const qv = evalExpr(query, queryRow, env, env.exec.session.scratchMeter());
     // Each term is the element's order-preserving key encoding (gin.md §4) — the SAME bytes the
     // entries carry, so a term doubles as its posting-list prefix below. Encoding now lets us dedup
     // distinct terms by bytes (a bijection: byte-dedup == value-dedup, byte-sort == value-sort)
@@ -8475,7 +8505,7 @@ export class Engine {
     const store = this.lkpStore(tableName);
     if (query === null) return { entries: [], pages: 0, slabs: 0 };
     // Extracting a constant or once-per-outer sibling query is a planning step, NOT metered.
-    const qv = evalExpr(query, queryRow, env, new Meter());
+    const qv = evalExpr(query, queryRow, env, env.exec.session.scratchMeter());
     // Form the resident-tree search query from the constant, handling strategy-specific degenerate
     // cases. A NULL query is never TRUE for any row (all strategies).
     let gq: GistQuery;
@@ -16464,7 +16494,7 @@ export class Engine {
             ) {
               const fe = plan.aggSpecs[si]!.osaFrac;
               if (fe !== undefined && fe !== null) {
-                a.osaFrac = evalExpr(fe, srow, env, new Meter());
+                a.osaFrac = evalExpr(fe, srow, env, env.exec.session.scratchMeter());
               }
             }
             // A hypothetical-set aggregate is finalized INLINE here (not via finalizeAcc) because it
@@ -16473,7 +16503,7 @@ export class Engine {
             // among the buffered key tuples (aggregates.md §19).
             const hp = plan.aggSpecs[si]!.hypo;
             if (hp !== undefined && hp !== null) {
-              const hyp = hp.args.map((arg) => evalExpr(arg, srow, env, new Meter()));
+              const hyp = hp.args.map((arg) => evalExpr(arg, srow, env, env.exec.session.scratchMeter()));
               srow.push(finalizeHypothetical(a.plan, a.hypoRows!, hyp, hp.sorts));
               continue;
             }
@@ -19801,7 +19831,7 @@ export function indexSlotKey(
     if (v.kind === "null") return null;
     return encodeColTypeKey(colTypes[key.column]!, v, colls[key.column]!);
   }
-  const v = evalExpr(key.expr, row, env, new Meter());
+  const v = evalExpr(key.expr, row, env, env.exec.session.scratchMeter());
   if (v.kind === "null") return null;
   return encodeTypedKey(key.type, v, key.coll);
 }
@@ -19842,7 +19872,7 @@ export function indexEntryKey(
 // key expression's — cost.md §3), so a throwaway Meter absorbs its charge.
 export function indexRowQualifies(rindex: ResolvedIndex, row: Row, env: EvalEnv): boolean {
   if (rindex.predicate === undefined) return true;
-  return isTrue(evalExpr(rindex.predicate, row, env, new Meter()));
+  return isTrue(evalExpr(rindex.predicate, row, env, env.exec.session.scratchMeter()));
 }
 
 // indexEntryKeys returns the index entries a row contributes (spec/design/gin.md §4/§5): exactly

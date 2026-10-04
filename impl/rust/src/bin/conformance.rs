@@ -608,6 +608,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
     let mut pending_revokes: Vec<(jed::PrivilegeSet, String)> = Vec::new();
     let mut pending_allow_ddl: Option<bool> = None;
     let mut pending_allow_temp_ddl: Option<bool> = None;
+    let mut pending_scalar_bytes: Option<i64> = None;
     let mut pending_temp_buffers: Option<usize> = None;
     let mut pending_vars: Vec<(String, String)> = Vec::new();
     let mut pending_timezone: Option<String> = None;
@@ -681,6 +682,12 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                 pending_allow_ddl = Some(a);
             } else if let Some(a) = parse_allow_temp_ddl_directive(rest) {
                 pending_allow_temp_ddl = Some(a);
+            } else if let Some(n) = rest
+                .trim_start()
+                .strip_prefix("max_scalar_bytes:")
+                .and_then(|s| s.trim().parse::<i64>().ok())
+            {
+                pending_scalar_bytes = Some(n);
             } else if let Some(n) = parse_temp_buffers_directive(rest) {
                 pending_temp_buffers = Some(n);
             } else if let Some(vars) = parse_set_directive(rest) {
@@ -771,6 +778,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
         }
         // Apply the per-record temp-storage budget (temp-tables.md §7); absent ⇒ unlimited (`0`), so a
         // `# temp_buffers:` directive never leaks past its record. Mirrors `# max_cost:`.
+        sess.set_max_scalar_bytes(pending_scalar_bytes.take().unwrap_or(0));
         sess.set_temp_buffers(pending_temp_buffers.take().unwrap_or(0));
         // Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
         // pending `# set:` pair, so a directive decorates only its record and never leaks forward.

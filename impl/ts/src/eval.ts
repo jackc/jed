@@ -1413,14 +1413,14 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const s = (vals[0] as { text: string }).text;
         const length = (vals[1] as { int: bigint }).int;
         const fill = vals.length > 2 ? (vals[2] as { text: string }).text : " ";
-        return textValue(padChars(s, length, fill, true));
+        return textValue(padChars(s, length, fill, true, m));
       }
       if (e.func === "rpad") {
         // rpad(text, length[, fill]) → text — pad/truncate on the RIGHT (default fill a space).
         const s = (vals[0] as { text: string }).text;
         const length = (vals[1] as { int: bigint }).int;
         const fill = vals.length > 2 ? (vals[2] as { text: string }).text : " ";
-        return textValue(padChars(s, length, fill, false));
+        return textValue(padChars(s, length, fill, false, m));
       }
       if (e.func === "btrim") {
         // btrim(text[, chars]) → text — trim `chars`-set characters from both ends.
@@ -1458,7 +1458,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (e.func === "repeat") {
         // repeat(text, n) → text — concatenate the string n times.
         const s = (vals[0] as { text: string }).text;
-        return textValue(repeatText(s, (vals[1] as { int: bigint }).int));
+        return textValue(repeatText(s, (vals[1] as { int: bigint }).int, m));
       }
       if (e.func === "reverse") {
         // reverse(text) → text — the code points in reverse order. [...s] splits by code point
@@ -1686,21 +1686,21 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const a = (v0 as { dec: Decimal }).dec;
         switch (e.func) {
           case "sqrt":
-            return decimalValue(a.decSqrt());
+            return decimalValue(a.decSqrt(m));
           case "exp":
-            return decimalValue(a.decExp());
+            return decimalValue(a.decExp(m));
           case "ln":
-            return decimalValue(a.decLn());
+            return decimalValue(a.decLn(m));
           case "log10":
-            return decimalValue(a.decLog10());
+            return decimalValue(a.decLog10(m));
           case "log": {
             const num = vals.length > 1 ? (vals[1] as { dec: Decimal }).dec : null;
-            return decimalValue(num ? Decimal.decLog(a, num) : a.decLog10());
+            return decimalValue(num ? Decimal.decLog(a, num, m) : a.decLog10(m));
           }
           default: {
             // pow (the catalog `power(decimal,decimal)`, renamed to "pow" at resolve)
             const exp = (vals[1] as { dec: Decimal }).dec;
-            return decimalValue(Decimal.decPower(a, exp));
+            return decimalValue(Decimal.decPower(a, exp, m));
           }
         }
       }

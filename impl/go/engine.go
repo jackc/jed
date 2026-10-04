@@ -109,7 +109,10 @@ type estimatorTouchedRelation struct {
 // construction (use the setter for the 0 ⇒ unlimited form); a zero MaxCost IS unlimited (the
 // genuine default). The entropy/clock seam is injected via Session.SetRandomSource/SetClockSource.
 type SessionOptions struct {
-	MaxCost int64
+	// MaxScalarBytes bounds cumulative covered scalar allocations per statement; non-positive
+	// values restore the finite 64 MiB default (spec/design/memory.md).
+	MaxScalarBytes int64
+	MaxCost        int64
 	// LifetimeMaxCost is the per-session cumulative cost budget (spec/design/session.md §5.4); 0 ⇒
 	// unlimited (the default). Bounds the whole session: the instant the session's running total
 	// reaches it, the in-flight statement aborts 54P02 (and once spent, every further statement is
@@ -194,6 +197,9 @@ type sessionState struct {
 	// unlimited. Bounds every statement run on this session: its Meter aborts 54P01 the instant
 	// accrued cost reaches it. The primary guard for untrusted queries.
 	maxCost int64
+	// All meters and frozen cursors of one statement share this allocation account.
+	scalarBytes    *int64
+	maxScalarBytes int64
 	// fkActionDepth bounds recursive generated referential-action statements (§6.6).
 	fkActionDepth int
 	// fkDeferredChecks holds inbound NO ACTION/RESTRICT probes until the outermost generated
@@ -322,6 +328,7 @@ func newSessionWithOptions(opts SessionOptions) sessionState {
 	}
 	s := sessionState{
 		maxCost:         opts.MaxCost,
+		maxScalarBytes:  opts.MaxScalarBytes,
 		lifetimeMaxCost: opts.LifetimeMaxCost,
 		lifetimeTotal:   new(int64),
 		maxSQLLength:    opts.MaxSQLLength,
@@ -1207,7 +1214,10 @@ func (s *sessionState) LifetimeCost() int64 { return *s.lifetimeTotal }
 // (54P01) plus a handle to the session's cumulative total + budget (54P02). Every statement's meter
 // is minted here, so all execution cost live-charges into the cumulative.
 func (s *sessionState) newMeter() *costMeter {
-	return &costMeter{Limit: s.maxCost, lifetimeTotal: s.lifetimeTotal, lifetimeLimit: s.lifetimeMaxCost, cancel: s.cancel}
+	if s.scalarBytes == nil {
+		s.scalarBytes = new(int64)
+	}
+	return &costMeter{scalarBytes: s.scalarBytes, scalarLimit: s.maxScalarBytes, Limit: s.maxCost, lifetimeTotal: s.lifetimeTotal, lifetimeLimit: s.lifetimeMaxCost, cancel: s.cancel}
 }
 
 // MaxSQLLength / SetMaxSQLLength — the input-SQL byte limit (0 ⇒ unlimited).
@@ -1474,4 +1484,25 @@ func (db *engine) Collations() []collationInfo {
 		}
 	}
 	return out
+}
+
+// MaxScalarBytes is the finite cumulative scalar-allocation budget per statement (memory.md).
+func (s *sessionState) MaxScalarBytes() int64 {
+	if s.maxScalarBytes <= 0 {
+		return defaultScalarBytes
+	}
+	return s.maxScalarBytes
+}
+
+// SetMaxScalarBytes sets the scalar budget; non-positive values restore the finite default.
+func (s *sessionState) SetMaxScalarBytes(bytes int64) { s.maxScalarBytes = bytes }
+func (db *engine) MaxScalarBytes() int64              { return db.session.MaxScalarBytes() }
+func (db *engine) SetMaxScalarBytes(bytes int64)      { db.session.SetMaxScalarBytes(bytes) }
+
+// scratchMeter keeps legacy unreported evaluation cost while sharing scalar admission.
+func (s *sessionState) scratchMeter() *costMeter {
+	if s.scalarBytes == nil {
+		s.scalarBytes = new(int64)
+	}
+	return &costMeter{scalarBytes: s.scalarBytes, scalarLimit: s.maxScalarBytes, cancel: s.cancel}
 }

@@ -8,6 +8,8 @@
 //! fixtures. Always **finite** (no NaN/±Infinity) and **normalized** (no high zero limbs, no
 //! negative zero). Rounding is **half away from zero** (spec/design/decimal.md §3).
 
+use crate::cost::Meter;
+use crate::costs::COSTS;
 use crate::error::{EngineError, Result, SqlState};
 
 /// Limb base: 10^9 (a `u32` limb holds 9 decimal digits; products fit `u64`).
@@ -702,7 +704,7 @@ impl Decimal {
     /// (rscale may be negative — PG explicitly allows rounding before the point during ln's input
     /// reduction). Computed as `floor(√self · 10^kc)` via an exact big-integer square root, then
     /// rounded to `rscale`. Traps 2201F on a negative operand.
-    fn sqrt_var(&self, rscale: i64) -> Result<Decimal> {
+    fn sqrt_var(&self, rscale: i64, mut m: Option<&mut Meter>) -> Result<Decimal> {
         if self.is_zero() {
             return Ok(Decimal::zero(rscale.max(0) as u32));
         }
@@ -714,6 +716,7 @@ impl Decimal {
         }
         // Compute floor(√v · 10^kc) with kc ≥ rscale+1 guard digits, ensuring the scaled value
         // `v · 10^(2·kc)` is an exact integer (E = 2·kc − scale ≥ 0).
+        decimal_math_step(m.as_deref_mut(), rscale, true, &[self])?;
         let s = self.scale as i64;
         let mut kc = rscale.max(0) + 1;
         if 2 * kc < s {
@@ -728,17 +731,19 @@ impl Decimal {
 
     /// `sqrt(numeric)` (PG `numeric_sqrt`): choose rscale for ≥ MIN_SIG_DIGITS significant digits
     /// (never below the input dscale), then call `sqrt_var`.
-    pub fn dec_sqrt(&self) -> Result<Decimal> {
+    pub fn dec_sqrt_metered(&self, mut m: Option<&mut Meter>) -> Result<Decimal> {
+        decimal_math_step(m.as_deref_mut(), 0, false, &[self])?;
         // sweight = floor(weight·DEC_DIGITS / 2) + 1 (DEC_DIGITS = 4 even ⇒ the division is exact).
         let sweight = self.nbase_weight() * DEC_DIGITS / 2 + 1;
         let mut rscale = MIN_SIG_DIGITS - sweight;
         rscale = rscale.max(self.scale as i64).max(0).min(MAX_DISPLAY_SCALE);
-        self.sqrt_var(rscale)?.check_cap()
+        self.sqrt_var(rscale, m.as_deref_mut())?.check_cap()
     }
 
     /// PG `exp_var(arg, result, rscale)`: e^self to `rscale` fractional digits via a range-reduced
     /// Taylor series. Traps 22003 on overflow (a true result outside the numeric format).
-    fn exp_var(&self, rscale: i64) -> Result<Decimal> {
+    fn exp_var(&self, rscale: i64, mut m: Option<&mut Meter>) -> Result<Decimal> {
+        decimal_math_step(m.as_deref_mut(), rscale, false, &[self])?;
         let mut x = self.clone();
         let mut val = self.to_f64_estimate();
         // Overflow / underflow guard (PG: fabs(val) >= NUMERIC_MAX_RESULT_SCALE·3 = 6000).
@@ -773,6 +778,7 @@ impl Decimal {
         let mut ni = 2i64;
         elem = elem.div_var_int(ni, local_rscale)?;
         while !elem.is_zero() {
+            decimal_math_step(m.as_deref_mut(), local_rscale, false, &[&result, &elem, &x])?;
             result = result.add_uncapped(&elem);
             elem = elem.mul_var(&x, local_rscale);
             ni += 1;
@@ -783,6 +789,7 @@ impl Decimal {
         let mut k = ndiv2;
         while k > 0 {
             k -= 1;
+            decimal_math_step(m.as_deref_mut(), rscale, false, &[&result])?;
             let lr = (sig_digits - result.nbase_weight() * 2 * DEC_DIGITS).max(0);
             result = result.mul_var(&result, lr);
         }
@@ -790,18 +797,20 @@ impl Decimal {
     }
 
     /// `exp(numeric)` (PG `numeric_exp`): choose rscale, then call `exp_var`.
-    pub fn dec_exp(&self) -> Result<Decimal> {
+    pub fn dec_exp_metered(&self, mut m: Option<&mut Meter>) -> Result<Decimal> {
+        decimal_math_step(m.as_deref_mut(), 0, false, &[self])?;
         let mut val = self.to_f64_estimate() * 0.434294481903252;
         val = val.clamp(-(MAX_RESULT_SCALE as f64), MAX_RESULT_SCALE as f64);
         let mut rscale = MIN_SIG_DIGITS - (val as i64);
         rscale = rscale.max(self.scale as i64).max(0).min(MAX_DISPLAY_SCALE);
-        self.exp_var(rscale)?.check_cap()
+        self.exp_var(rscale, m.as_deref_mut())?.check_cap()
     }
 
     /// PG `ln_var(arg, result, rscale)`: the natural log of self (> 0) to `rscale` fractional
     /// digits. Reduces self into (0.9, 1.1) by repeated `sqrt`, then sums the `atanh` series
     /// `2·(z + z³/3 + z⁵/5 + …)` with `z = (x−1)/(x+1)`. The caller guarantees self > 0.
-    fn ln_var(&self, rscale: i64) -> Decimal {
+    fn ln_var(&self, rscale: i64, mut m: Option<&mut Meter>) -> Result<Decimal> {
+        decimal_math_step(m.as_deref_mut(), rscale, false, &[self])?;
         let nine_tenths = Decimal::from_digits_scale(false, "9", 1); // 0.9
         let eleven_tenths = Decimal::from_digits_scale(false, "11", 1); // 1.1
         let two = Decimal::from_i64(2);
@@ -811,17 +820,13 @@ impl Decimal {
         let mut nsqrt = 0i64;
         while x.cmp_value(&nine_tenths) != std::cmp::Ordering::Greater {
             let local_rscale = rscale - x.nbase_weight() * DEC_DIGITS / 2 + 8;
-            x = x
-                .sqrt_var(local_rscale)
-                .expect("ln reduces a positive value");
+            x = x.sqrt_var(local_rscale, m.as_deref_mut())?;
             fact = fact.mul_var(&two, 0);
             nsqrt += 1;
         }
         while x.cmp_value(&eleven_tenths) != std::cmp::Ordering::Less {
             let local_rscale = rscale - x.nbase_weight() * DEC_DIGITS / 2 + 8;
-            x = x
-                .sqrt_var(local_rscale)
-                .expect("ln reduces a positive value");
+            x = x.sqrt_var(local_rscale, m.as_deref_mut())?;
             fact = fact.mul_var(&two, 0);
             nsqrt += 1;
         }
@@ -836,6 +841,7 @@ impl Decimal {
         let zsq = result.mul_var(&result, local_rscale); // z²
         let mut ni = 1i64;
         loop {
+            decimal_math_step(m.as_deref_mut(), local_rscale, false, &[&result, &xx, &zsq])?;
             ni += 2;
             xx = xx.mul_var(&zsq, local_rscale);
             let elem = xx.div_var_int(ni, local_rscale).expect("ni != 0");
@@ -847,7 +853,7 @@ impl Decimal {
                 break;
             }
         }
-        result.mul_var(&fact, rscale)
+        Ok(result.mul_var(&fact, rscale))
     }
 
     /// Deterministic PG `estimate_ln_dweight(var)` — an estimate of `trunc(log10(|ln(var)|))`
@@ -855,9 +861,9 @@ impl Decimal {
     /// libm: branch 1 (0.9 ≤ var ≤ 1.1) is the exact decimal weight of `var − 1`; branch 2 is the
     /// decimal weight of a low-precision exact `ln`, adjusted from floor to trunc-toward-zero
     /// (`dweight + 1` when negative). `var > 0` (caller-guaranteed); returns 0 otherwise.
-    fn estimate_ln_dweight(&self) -> i64 {
+    fn estimate_ln_dweight(&self, mut m: Option<&mut Meter>) -> Result<i64> {
         if self.is_zero() || self.neg {
-            return 0;
+            return Ok(0);
         }
         let nine_tenths = Decimal::from_digits_scale(false, "9", 1);
         let eleven_tenths = Decimal::from_digits_scale(false, "11", 1);
@@ -866,37 +872,43 @@ impl Decimal {
         {
             let x = self.sub_uncapped(&Decimal::from_i64(1));
             if x.is_zero() {
-                return 0;
+                return Ok(0);
             }
             // floor(log10(|x|)) — PG's branch 1 (x.weight·DEC_DIGITS + floor(log10(digits[0]))).
-            return x.precision() as i64 - 1 - x.scale as i64;
+            return Ok(x.precision() as i64 - 1 - x.scale as i64);
         }
         // |ln(self)| ≥ ln(1.1) ≈ 0.095 here, so a 20-digit guard captures its MSD position.
-        let t = self.ln_var(20);
+        let t = self.ln_var(20, m.as_deref_mut())?;
         if t.is_zero() {
-            return 0;
+            return Ok(0);
         }
         let dw = t.precision() as i64 - 1 - t.scale as i64; // floor(log10(|ln(self)|))
-        if dw < 0 { dw + 1 } else { dw }
+        Ok(if dw < 0 { dw + 1 } else { dw })
     }
 
     /// `ln(numeric)` (PG `numeric_ln`): choose rscale from the dweight estimate, then `ln_var`.
-    pub fn dec_ln(&self) -> Result<Decimal> {
+    pub fn dec_ln_metered(&self, mut m: Option<&mut Meter>) -> Result<Decimal> {
+        decimal_math_step(m.as_deref_mut(), 0, false, &[self])?;
         if self.is_zero() {
             return Err(log_zero());
         }
         if self.neg {
             return Err(log_negative());
         }
-        let ln_dweight = self.estimate_ln_dweight();
+        let ln_dweight = self.estimate_ln_dweight(m.as_deref_mut())?;
         let mut rscale = MIN_SIG_DIGITS - ln_dweight;
         rscale = rscale.max(self.scale as i64).max(0).min(MAX_DISPLAY_SCALE);
-        self.ln_var(rscale).check_cap()
+        self.ln_var(rscale, m.as_deref_mut())?.check_cap()
     }
 
     /// `log(base, num)` (PG `numeric_log` / `log_var`): logarithm of `num` in base `base`,
     /// `= ln(num) / ln(base)`. Both operands must be > 0 (else 2201E). Chooses its own rscale.
-    pub fn dec_log(base: &Decimal, num: &Decimal) -> Result<Decimal> {
+    pub fn dec_log_metered(
+        base: &Decimal,
+        num: &Decimal,
+        mut m: Option<&mut Meter>,
+    ) -> Result<Decimal> {
+        decimal_math_step(m.as_deref_mut(), 0, false, &[base, num])?;
         // ln_var(base) is formed first in PG, so a bad base reports first.
         for v in [base, num] {
             if v.is_zero() {
@@ -906,8 +918,8 @@ impl Decimal {
                 return Err(log_negative());
             }
         }
-        let ln_base_dweight = base.estimate_ln_dweight();
-        let ln_num_dweight = num.estimate_ln_dweight();
+        let ln_base_dweight = base.estimate_ln_dweight(m.as_deref_mut())?;
+        let ln_num_dweight = num.estimate_ln_dweight(m.as_deref_mut())?;
         let result_dweight = ln_num_dweight - ln_base_dweight;
         let mut rscale = MIN_SIG_DIGITS - result_dweight;
         rscale = rscale
@@ -917,20 +929,26 @@ impl Decimal {
             .min(MAX_DISPLAY_SCALE);
         let ln_base_rscale = (rscale + result_dweight - ln_base_dweight + 8).max(0);
         let ln_num_rscale = (rscale + result_dweight - ln_num_dweight + 8).max(0);
-        let ln_base = base.ln_var(ln_base_rscale);
-        let ln_num = num.ln_var(ln_num_rscale);
+        let ln_base = base.ln_var(ln_base_rscale, m.as_deref_mut())?;
+        let ln_num = num.ln_var(ln_num_rscale, m.as_deref_mut())?;
         ln_num.div_var(&ln_base, rscale)?.check_cap()
     }
 
     /// `log(numeric)` / `log10(numeric)` — base-10 logarithm (PG defines one-arg `log` as
     /// `log(10, x)`).
-    pub fn dec_log10(&self) -> Result<Decimal> {
-        Decimal::dec_log(&Decimal::from_i64(10), self)
+    pub fn dec_log10_metered(&self, mut m: Option<&mut Meter>) -> Result<Decimal> {
+        decimal_math_step(m.as_deref_mut(), 0, false, &[self])?;
+        Decimal::dec_log_metered(&Decimal::from_i64(10), self, m.as_deref_mut())
     }
 
     /// PG `power_var_int(base, exp, exp_dscale)`: base^exp for an integer exp, by binary
     /// exponentiation with a per-multiplication rscale that keeps a fixed significant-digit count.
-    fn power_var_int(base: &Decimal, exp: i32, exp_dscale: u32) -> Result<Decimal> {
+    fn power_var_int(
+        base: &Decimal,
+        exp: i32,
+        exp_dscale: u32,
+        mut m: Option<&mut Meter>,
+    ) -> Result<Decimal> {
         // Estimate the decimal weight of the result, f ≈ exp · log10(|base|) (PG uses libm log10
         // on the leading-digit MAGNITUDE; jed computes log10(|base|) = ln(|base|)/ln(10) exactly —
         // deterministic). The MAGNITUDE matters: the binary-exponentiation muls below carry the
@@ -939,7 +957,7 @@ impl Decimal {
             0.0
         } else {
             base.abs()
-                .log10_estimate()
+                .log10_estimate(m.as_deref_mut())?
                 .mul_exact(&Decimal::from_i64(exp as i64))
                 .to_f64_estimate()
         };
@@ -972,7 +990,7 @@ impl Decimal {
         }
         let mut sig_digits = 1 + rscale + fi;
         // Guard for the multiplication error, ≈ log(|exp|) extra digits (PG: (int)log(fabs(exp))).
-        sig_digits += int_ln_floor(exp.unsigned_abs() as u64) + 8;
+        sig_digits += int_ln_floor(exp.unsigned_abs() as u64, m.as_deref_mut())? + 8;
         let neg = exp < 0;
         let mut mask = exp.unsigned_abs();
         let mut base_prod = base.clone();
@@ -986,6 +1004,7 @@ impl Decimal {
             mask >>= 1;
             mask > 0
         } {
+            decimal_math_step(m.as_deref_mut(), rscale, false, &[&base_prod, &result])?;
             let lr = (sig_digits - 2 * base_prod.nbase_weight() * DEC_DIGITS)
                 .min(2 * base_prod.scale as i64)
                 .max(0);
@@ -1017,9 +1036,9 @@ impl Decimal {
 
     /// PG `power_var(base, exp, result)`: base^exp for a general (possibly non-integer) exponent.
     /// Integer exponents route to `power_var_int`; otherwise computes `exp(exp · ln(base))`.
-    fn power_var(base: &Decimal, exp: &Decimal) -> Result<Decimal> {
+    fn power_var(base: &Decimal, exp: &Decimal, mut m: Option<&mut Meter>) -> Result<Decimal> {
         if let Some(iexp) = exp.to_i32_if_integer() {
-            return Decimal::power_var_int(base, iexp, exp.scale);
+            return Decimal::power_var_int(base, iexp, exp.scale, m.as_deref_mut());
         }
         // 0 ^ non-integer = 0 (0 ^ negative was rejected by the caller).
         if base.is_zero() {
@@ -1033,10 +1052,10 @@ impl Decimal {
                 "a negative number raised to a non-integer power yields a complex result",
             ));
         }
-        let ln_dweight = base.estimate_ln_dweight();
+        let ln_dweight = base.estimate_ln_dweight(m.as_deref_mut())?;
         // Low-precision exp·ln(base) to estimate the result weight (and a crude overflow exit).
         let mut local_rscale = (8 - ln_dweight).max(0);
-        let mut ln_base = base.ln_var(local_rscale);
+        let mut ln_base = base.ln_var(local_rscale, m.as_deref_mut())?;
         let mut ln_num = ln_base.mul_var(exp, local_rscale);
         let mut val = ln_num.to_f64_estimate();
         if val.abs() > MAX_RESULT_SCALE as f64 * 3.01 {
@@ -1055,14 +1074,19 @@ impl Decimal {
             .min(MAX_DISPLAY_SCALE);
         let sig_digits = (rscale + vi).max(0);
         local_rscale = (sig_digits - ln_dweight + 8).max(0);
-        ln_base = base.ln_var(local_rscale);
+        ln_base = base.ln_var(local_rscale, m.as_deref_mut())?;
         ln_num = ln_base.mul_var(exp, local_rscale);
-        ln_num.exp_var(rscale)?.check_cap()
+        ln_num.exp_var(rscale, m.as_deref_mut())?.check_cap()
     }
 
     /// `power(base, exp)` over numeric (PG `numeric_power`, finite path): the domain checks plus
     /// `power_var`. `0 ^ negative` traps 2201F.
-    pub fn dec_power(base: &Decimal, exp: &Decimal) -> Result<Decimal> {
+    pub fn dec_power_metered(
+        base: &Decimal,
+        exp: &Decimal,
+        mut m: Option<&mut Meter>,
+    ) -> Result<Decimal> {
+        decimal_math_step(m.as_deref_mut(), 0, false, &[base, exp])?;
         let sign1 = if base.is_zero() {
             0
         } else if base.neg {
@@ -1083,31 +1107,31 @@ impl Decimal {
                 "zero raised to a negative power is undefined",
             ));
         }
-        Decimal::power_var(base, exp)
+        Decimal::power_var(base, exp, m.as_deref_mut())
     }
 
     /// `log10(self) = ln(self)/ln(10)` to a ~30-digit guard — the deterministic, libm-free
     /// replacement for PG `power_var_int`'s `log10(double)` result-weight estimate. `self > 0`.
-    fn log10_estimate(&self) -> Decimal {
+    fn log10_estimate(&self, mut m: Option<&mut Meter>) -> Result<Decimal> {
         let guard = 30;
-        let ln_self = self.ln_var(guard);
-        let ln_ten = Decimal::from_i64(10).ln_var(guard);
-        ln_self.div_var(&ln_ten, guard).expect("ln(10) is positive")
+        let ln_self = self.ln_var(guard, m.as_deref_mut())?;
+        let ln_ten = Decimal::from_i64(10).ln_var(guard, m.as_deref_mut())?;
+        ln_self.div_var(&ln_ten, guard)
     }
 }
 
 /// `floor(ln(n))` for `n >= 1`, computed deterministically via the exact `ln` (no libm) — PG's
 /// `(int)log(fabs(exp))` guard term in `power_var_int`. `n == 0` → 0.
-fn int_ln_floor(n: u64) -> i64 {
+fn int_ln_floor(n: u64, mut m: Option<&mut Meter>) -> Result<i64> {
     if n <= 1 {
-        return 0; // ln(1) = 0; ln(0) is never reached (exp != 0 in the guard)
+        return Ok(0); // ln(1) = 0; ln(0) is never reached (exp != 0 in the guard)
     }
     // ln(n) ≥ 0; trunc-to-scale-0 of a 12-digit-guard ln is its floor for any non-boundary n.
-    Decimal::from_i64(n as i64)
-        .ln_var(12)
+    Ok(Decimal::from_i64(n as i64)
+        .ln_var(12, m.as_deref_mut())?
         .trunc_to_scale(0)
         .to_i64_round()
-        .unwrap_or(0)
+        .unwrap_or(0))
 }
 
 /// `floor(√n)` for a magnitude `n` (base-10⁹ LSB-first), via Newton's method on big integers
@@ -1806,5 +1830,51 @@ mod tests {
 
         // A final result genuinely over the cap still traps 22003 (PG's make_result).
         assert_eq!(over.check_cap().unwrap_err().code(), "22003");
+    }
+}
+
+fn decimal_math_step(
+    m: Option<&mut Meter>,
+    scale: i64,
+    sqrt: bool,
+    args: &[&Decimal],
+) -> Result<()> {
+    let Some(m) = m else {
+        return Ok(());
+    };
+    let digits = 32
+        + scale.abs()
+        + args
+            .iter()
+            .map(|a| a.precision() as i64 + a.scale as i64)
+            .sum::<i64>();
+    let groups = (digits + 3) / 4;
+    let mut work = groups * groups;
+    if sqrt {
+        work *= (64 - (digits as u64).leading_zeros()) as i64;
+    }
+    m.charge(COSTS.decimal_transcend * work);
+    m.guard()?;
+    m.reserve_scalar(8 * digits)
+}
+
+impl Decimal {
+    pub fn dec_sqrt(&self) -> Result<Decimal> {
+        self.dec_sqrt_metered(None)
+    }
+    pub fn dec_exp(&self) -> Result<Decimal> {
+        self.dec_exp_metered(None)
+    }
+    pub fn dec_ln(&self) -> Result<Decimal> {
+        self.dec_ln_metered(None)
+    }
+    pub fn dec_log10(&self) -> Result<Decimal> {
+        self.dec_log10_metered(None)
+    }
+    pub fn dec_log(base: &Decimal, num: &Decimal) -> Result<Decimal> {
+        Self::dec_log_metered(base, num, None)
+    }
+    pub fn dec_power(base: &Decimal, exp: &Decimal) -> Result<Decimal> {
+        Self::dec_power_metered(base, exp, None)
     }
 }

@@ -60,16 +60,17 @@ browser — the same engine, no file. Create one by calling the unified create c
 
 ## Running untrusted queries
 
-jed is built to evaluate **untrusted, user-supplied SQL** safely: a query — even a hostile one —
-cannot reach outside the database, corrupt memory, or exhaust resources. The built-in function
-surface is pure (no filesystem, network, process, or clock access beyond a host-injected seam), and
-three limits bound the work any one statement can do. Two are caller-set **per-session settings** you
-configure on the session that serves untrusted queries — pass them when you mint it, or set them on
-the session:
+jed's built-in surface is pure: SQL cannot access the filesystem, network, processes, or
+clock beyond the sanctioned host seam. Configure the session's work and input limits before
+serving untrusted SQL. The scalar allocation budget below covers specific expanding kernels;
+[resource limits](../resource-limits/) explains the remaining memory coverage.
 
 - **Cost ceiling — `set_max_cost(limit)`** / `SetMaxCost` / `setMaxCost`. Bounds the deterministic
   *execution* cost; a query that reaches the ceiling aborts with `54P01`. `0` (the default) is
   unlimited.
+- **Scalar allocation — `set_max_scalar_bytes(bytes)`** / `SetMaxScalarBytes` / `setMaxScalarBytes`.
+  Limits cumulative repeat/padding output and decimal-transcendental scratch reservations per
+  statement; default **64 MiB**, non-positive restores the default, over-budget fails `54P04`.
 - **Input size — `set_max_sql_length(bytes)`** / `SetMaxSQLLength` / `setMaxSqlLength`. Bounds the
   *input SQL length* (in bytes), rejecting an over-long statement with `54000` before it is parsed —
   so a giant query can't exhaust parse memory. The default is **1 MiB**; `0` is unlimited. Because

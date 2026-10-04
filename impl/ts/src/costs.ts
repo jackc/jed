@@ -5,6 +5,8 @@
 // hand-written (§5 forbids codegenning those). Regenerate with `rake codegen`;
 // `rake verify` fails if this file is stale. Reasoning: ../../../spec/design/cost.md.
 
+export const DEFAULT_SCALAR_BYTES = 67108864n;
+
 // The deterministic cost-unit weights, mirroring spec/cost/schedule.toml. Weights are
 // bigint for i64 parity with the Rust/Go cores (a number is f64 — CLAUDE.md §8).
 export interface CostSchedule {
@@ -32,6 +34,8 @@ export interface CostSchedule {
   windowResult: bigint;
   varlenCompare: bigint;
   windowFrameStep: bigint;
+  scalarByte: bigint;
+  decimalTranscend: bigint;
 }
 
 // The canonical cost schedule — weights accrued per unit during query execution.
@@ -60,4 +64,6 @@ export const COSTS: CostSchedule = {
   windowResult: 1n,
   varlenCompare: 1n,
   windowFrameStep: 1n,
+  scalarByte: 1n,
+  decimalTranscend: 1n,
 };

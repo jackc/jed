@@ -46,6 +46,9 @@ pub struct Lifetime {
 /// reported on `Outcome`, while the session cumulative is updated live through [`Lifetime`].
 #[derive(Default)]
 pub struct Meter {
+    ceiling_hit: u8,
+    pub(crate) scalar_bytes: Rc<Cell<i64>>,
+    pub(crate) scalar_limit: i64,
     /// Total cost accrued so far **for this statement** (CLAUDE.md §13) — the figure reported on
     /// `Outcome` and asserted by the `# cost:` directive. `i64` mirrors the engine's native integer;
     /// the per-statement ceiling compares against this counter.
@@ -70,6 +73,23 @@ pub struct Meter {
 }
 
 impl Meter {
+    /// Admit cumulative logical scalar allocation before constructing it. Zero uses the default.
+    pub fn reserve_scalar(&mut self, bytes: i64) -> Result<()> {
+        let limit = if self.scalar_limit > 0 {
+            self.scalar_limit
+        } else {
+            crate::costs::DEFAULT_SCALAR_BYTES
+        };
+        if bytes > limit - self.scalar_bytes.get() {
+            return Err(EngineError::new(
+                SqlState::ScalarMemoryLimitExceeded,
+                format!("scalar allocations exceeded the limit of {limit} bytes"),
+            ));
+        }
+        self.scalar_bytes.set(self.scalar_bytes.get() + bytes);
+        Ok(())
+    }
+
     /// A fresh meter with zero accrued cost, no ceiling, and no session context.
     pub fn new() -> Self {
         Meter::default()
@@ -80,6 +100,9 @@ impl Meter {
     /// Used where there is no session cumulative to thread (tests, isolated build scans).
     pub fn with_limit(limit: i64) -> Self {
         Meter {
+            ceiling_hit: 0,
+            scalar_bytes: Rc::new(Cell::new(0)),
+            scalar_limit: crate::costs::DEFAULT_SCALAR_BYTES,
             accrued: 0,
             limit,
             lifetime: None,
@@ -95,6 +118,9 @@ impl Meter {
     /// statement at the next `guard`.
     pub fn for_session(limit: i64, lifetime: Lifetime, cancel: Option<CancellationToken>) -> Self {
         Meter {
+            ceiling_hit: 0,
+            scalar_bytes: Rc::new(Cell::new(0)),
+            scalar_limit: crate::costs::DEFAULT_SCALAR_BYTES,
             accrued: 0,
             limit,
             lifetime: Some(lifetime),
@@ -109,9 +135,29 @@ impl Meter {
     /// cross-core accrual count is untouched.
     #[inline]
     pub fn charge(&mut self, units: i64) {
-        self.accrued += units;
+        if self.ceiling_hit == 0 {
+            let stmt = self.limit > 0 && units >= self.limit - self.accrued;
+            let life = self
+                .lifetime
+                .as_ref()
+                .is_some_and(|l| l.limit > 0 && units >= l.limit - l.total.get());
+            if stmt {
+                self.ceiling_hit = 1;
+            }
+            if life
+                && (!stmt
+                    || self
+                        .lifetime
+                        .as_ref()
+                        .is_some_and(|l| l.limit - l.total.get() < self.limit - self.accrued))
+            {
+                self.ceiling_hit = 2;
+            }
+        }
+
+        self.accrued = self.accrued.saturating_add(units);
         if let Some(l) = &self.lifetime {
-            l.total.set(l.total.get() + units);
+            l.total.set(l.total.get().saturating_add(units));
         }
     }
 
@@ -165,12 +211,15 @@ impl Meter {
         // Pick the ceiling reached first. Both counters grow in lockstep, so the one crossed at the
         // lower accrued value has the larger excess by the time this guard fires; a tie breaks to the
         // per-statement ceiling.
-        let pick_life = if stmt_over && life_over {
+        let mut pick_life = if stmt_over && life_over {
             let (total, limit) = life.expect("life_over implies a budget");
             (total - limit) > (self.accrued - self.limit)
         } else {
             life_over
         };
+        if self.ceiling_hit != 0 {
+            pick_life = self.ceiling_hit == 2;
+        }
         if pick_life {
             let (total, limit) = life.expect("pick_life implies a budget");
             Err(EngineError::new(
@@ -186,5 +235,28 @@ impl Meter {
                 ),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+    #[test]
+    fn saturation_keeps_first_crossed_ceiling() {
+        let total = Rc::new(Cell::new(i64::MAX - 2));
+        let mut m = Meter::for_session(
+            i64::MAX,
+            Lifetime {
+                total: total.clone(),
+                limit: i64::MAX - 1,
+            },
+            None,
+        );
+        m.charge(i64::MAX);
+        assert_eq!(m.accrued, i64::MAX);
+        assert_eq!(total.get(), i64::MAX);
+        assert_eq!(m.guard().unwrap_err().code(), "54P02");
+        m.charge(10);
+        assert_eq!(m.accrued, i64::MAX);
     }
 }

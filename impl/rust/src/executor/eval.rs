@@ -1871,25 +1871,25 @@ impl RExpr {
                         let Value::Decimal(d) = &vals[0] else {
                             unreachable!()
                         };
-                        Ok(Value::Decimal(d.dec_sqrt()?))
+                        Ok(Value::Decimal(d.dec_sqrt_metered(Some(m))?))
                     }
                     ScalarFunc::Exp if matches!(&vals[0], Value::Decimal(_)) => {
                         let Value::Decimal(d) = &vals[0] else {
                             unreachable!()
                         };
-                        Ok(Value::Decimal(d.dec_exp()?))
+                        Ok(Value::Decimal(d.dec_exp_metered(Some(m))?))
                     }
                     ScalarFunc::Ln if matches!(&vals[0], Value::Decimal(_)) => {
                         let Value::Decimal(d) = &vals[0] else {
                             unreachable!()
                         };
-                        Ok(Value::Decimal(d.dec_ln()?))
+                        Ok(Value::Decimal(d.dec_ln_metered(Some(m))?))
                     }
                     ScalarFunc::Log10 if matches!(&vals[0], Value::Decimal(_)) => {
                         let Value::Decimal(d) = &vals[0] else {
                             unreachable!()
                         };
-                        Ok(Value::Decimal(d.dec_log10()?))
+                        Ok(Value::Decimal(d.dec_log10_metered(Some(m))?))
                     }
                     // `log` is decimal-only (no float `log` in the catalog): 1-arg = base-10 log,
                     // 2-arg = log(base, num) in an arbitrary base.
@@ -1898,9 +1898,9 @@ impl RExpr {
                             unreachable!("resolver restricts log to decimal operands")
                         };
                         match vals.get(1) {
-                            None => Ok(Value::Decimal(a.dec_log10()?)),
+                            None => Ok(Value::Decimal(a.dec_log10_metered(Some(m))?)),
                             Some(Value::Decimal(num)) => {
-                                Ok(Value::Decimal(Decimal::dec_log(a, num)?))
+                                Ok(Value::Decimal(Decimal::dec_log_metered(a, num, Some(m))?))
                             }
                             Some(_) => unreachable!("resolver restricts log's args to decimal"),
                         }
@@ -1912,7 +1912,11 @@ impl RExpr {
                         let Value::Decimal(exp) = &vals[1] else {
                             unreachable!("resolver restricts power's args to decimal")
                         };
-                        Ok(Value::Decimal(Decimal::dec_power(base, exp)?))
+                        Ok(Value::Decimal(Decimal::dec_power_metered(
+                            base,
+                            exp,
+                            Some(m),
+                        )?))
                     }
                     // pi() — the constant π, no operand (float.md §8). In-contract: the same f64
                     // literal in every core.
@@ -2335,7 +2339,7 @@ impl RExpr {
                             Some(_) => unreachable!("resolver restricts lpad fill to text"),
                             None => " ",
                         };
-                        Ok(Value::Text(pad_chars(s, len, fill, true)?))
+                        Ok(Value::Text(pad_chars(s, len, fill, true, m)?))
                     }
                     // rpad(text, length[, fill]) → text — pad/truncate on the RIGHT.
                     ScalarFunc::Rpad => {
@@ -2349,7 +2353,7 @@ impl RExpr {
                             Some(_) => unreachable!("resolver restricts rpad fill to text"),
                             None => " ",
                         };
-                        Ok(Value::Text(pad_chars(s, len, fill, false)?))
+                        Ok(Value::Text(pad_chars(s, len, fill, false, m)?))
                     }
                     // btrim(text[, chars]) → text — trim `chars`-set characters from both ends.
                     ScalarFunc::Btrim => {
@@ -2418,7 +2422,7 @@ impl RExpr {
                             Value::Text(s) => s,
                             _ => unreachable!("resolver restricts repeat to text"),
                         };
-                        Ok(Value::Text(repeat_text(s, int_value(&vals[1]))?))
+                        Ok(Value::Text(repeat_text(s, int_value(&vals[1]), m)?))
                     }
                     // reverse(text) → text — the code points in reverse order.
                     ScalarFunc::Reverse => match &vals[0] {

@@ -76,10 +76,10 @@ are **not yet published** to their registries.)
 - **SQLite's deployment model, PostgreSQL's behavior, a full SQL engine.** Embeddable
   single-file storage like SQLite, observable semantics modeled on PostgreSQL, and a broad
   SQL feature set with a rich, strict type system.
-- **Untrusted SQL is safe to run** ([CLAUDE.md §13](CLAUDE.md)). A query supplied by an
-  adversary cannot corrupt memory (every core is memory-safe), cannot reach the host (no
-  built-in does I/O or escapes the engine), and cannot exhaust resources (a deterministic
-  cost meter + ceiling, a per-session cost budget, and a parser depth limit bound the work).
+- **Resource controls for untrusted SQL** ([CLAUDE.md §13](CLAUDE.md)). Memory-safe cores
+  and pure built-ins prevent memory corruption and host access. Deterministic cost budgets,
+  parser limits, and a finite scalar-allocation allowance bound their documented surfaces.
+  Whole-query memory admission remains in progress; see [memory coverage](spec/design/memory.md).
 - **No reference implementation.** jed is implemented natively in multiple languages **in
   lockstep**, so every spec ambiguity becomes a failing cross-core test the day it is
   written. The honesty mechanism is divergence under a shared contract, not implementation

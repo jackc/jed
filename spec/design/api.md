@@ -1062,3 +1062,15 @@ Go `error`, a TS `throw`), exactly the surrounding idiom. Because a host kernel 
 engine, host functions are **outside** the built-in untrusted-query safety guarantee (CLAUDE.md §13):
 a host that exposes them to untrusted SQL owns that decision; the cost gate is the one mechanical
 defense, and it binds only a function that declared its cost.
+
+### Scalar allocation setting
+
+Session options accept `max_scalar_bytes` (Rust i64), `MaxScalarBytes` (Go int64),
+or `maxScalarBytes` (TypeScript bigint). The matching setters/getters are
+`set_max_scalar_bytes` / `max_scalar_bytes`, `SetMaxScalarBytes` / `MaxScalarBytes`,
+and `setMaxScalarBytes` / `maxScalarBytes`. Default: 64 MiB; non-positive restores
+that finite default. It is independent of max_cost, and cannot be weakened from
+SQL. `54P04` rejects a reservation **above** the allowance before allocation;
+exact equality is allowed. See memory.md for the cumulative per-statement model,
+covered scalar kernels, frozen cursor behavior, and the broader memory contract
+that is designed but not yet implemented.

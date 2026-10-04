@@ -1,6 +1,9 @@
 package jed
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 // Deterministic cost meter (CLAUDE.md §13).
 //
@@ -28,6 +31,11 @@ import "fmt"
 // pointer through the executor and the recursive expression evaluator; the accrued
 // (per-statement) total is reported on outcome, while the session cumulative is updated live.
 type costMeter struct {
+	ceilingHit uint8 // first crossed ceiling: 1 statement, 2 lifetime
+
+	scalarBytes *int64
+	scalarLimit int64
+
 	// Accrued is the total cost so far FOR THIS STATEMENT (CLAUDE.md §13) — the figure reported
 	// on outcome and asserted by the `# cost:` directive. i64 mirrors the engine's native
 	// integer; the per-statement ceiling compares against this counter.
@@ -55,7 +63,7 @@ type costMeter struct {
 
 // NewMeter returns a fresh meter with zero accrued cost, no ceiling, and no session context.
 func newMeter() *costMeter {
-	return &costMeter{}
+	return &costMeter{scalarLimit: defaultScalarBytes}
 }
 
 // unmetered reports that no enforcement is armed — no per-statement ceiling, no session lifetime
@@ -71,7 +79,7 @@ func (m *costMeter) unmetered() bool {
 // (limit <= 0 ⇒ unlimited), with no session lifetime budget. The ceiling is the session's
 // max_cost (spec/design/api.md §8). Used where there is no session cumulative to thread.
 func newMeterWithLimit(limit int64) *costMeter {
-	return &costMeter{Limit: limit}
+	return &costMeter{Limit: limit, scalarLimit: defaultScalarBytes}
 }
 
 // Charge adds units of cost. The single accrual chokepoint. Accrues into both the per-statement
@@ -80,9 +88,20 @@ func newMeterWithLimit(limit int64) *costMeter {
 // is NOT here: Guard does the comparisons at the work loops, so the cross-core accrual count is
 // untouched.
 func (m *costMeter) Charge(units int64) {
-	m.Accrued += units
+	if m.ceilingHit == 0 {
+		stmt := m.Limit > 0 && units >= m.Limit-m.Accrued
+		life := m.lifetimeTotal != nil && m.lifetimeLimit > 0 && units >= m.lifetimeLimit-*m.lifetimeTotal
+		if stmt {
+			m.ceilingHit = 1
+		}
+		if life && (!stmt || m.lifetimeLimit-*m.lifetimeTotal < m.Limit-m.Accrued) {
+			m.ceilingHit = 2
+		}
+	}
+
+	m.Accrued = saturatingCostAdd(m.Accrued, units)
 	if m.lifetimeTotal != nil {
-		*m.lifetimeTotal += units
+		*m.lifetimeTotal = saturatingCostAdd(*m.lifetimeTotal, units)
 	}
 }
 
@@ -113,6 +132,9 @@ func (m *costMeter) Guard() error {
 	if stmtOver && lifeOver {
 		pickLife = (*m.lifetimeTotal - m.lifetimeLimit) > (m.Accrued - m.Limit)
 	}
+	if m.ceilingHit != 0 {
+		pickLife = m.ceilingHit == 2
+	}
 	if pickLife {
 		return newError(SessionCostLimitExceeded, fmt.Sprintf(
 			"session exceeded the lifetime cost limit of %d (accrued %d)", m.lifetimeLimit, *m.lifetimeTotal,
@@ -121,4 +143,28 @@ func (m *costMeter) Guard() error {
 	return newError(CostLimitExceeded, fmt.Sprintf(
 		"query exceeded the cost limit of %d (accrued %d)", m.Limit, m.Accrued,
 	))
+}
+
+func saturatingCostAdd(a, b int64) int64 {
+	if b > math.MaxInt64-a {
+		return math.MaxInt64
+	}
+	return a + b
+}
+
+// ReserveScalar admits cumulative logical scalar allocation before constructing it.
+// Zero means the finite default; a host cannot accidentally disable this backstop.
+func (m *costMeter) ReserveScalar(bytes int64) error {
+	if m.scalarBytes == nil {
+		m.scalarBytes = new(int64)
+	}
+	limit := m.scalarLimit
+	if limit <= 0 {
+		limit = defaultScalarBytes
+	}
+	if bytes > limit-*m.scalarBytes {
+		return newError(ScalarMemoryLimitExceeded, fmt.Sprintf("scalar allocations exceeded the limit of %d bytes", limit))
+	}
+	*m.scalarBytes += bytes
+	return nil
 }

@@ -2634,6 +2634,13 @@ impl Session {
         self.engine.session.lock_timeout_ms()
     }
     /// Set the work-memory budget in bytes; `0` ⇒ unlimited.
+    /// Cumulative scalar allocation budget per statement; non-positive restores the default.
+    pub fn set_max_scalar_bytes(&mut self, bytes: i64) {
+        self.engine.session.set_max_scalar_bytes(bytes);
+    }
+    pub fn max_scalar_bytes(&self) -> i64 {
+        self.engine.session.max_scalar_bytes()
+    }
     pub fn set_work_mem(&mut self, bytes: usize) {
         self.engine.session.set_work_mem(bytes);
     }

@@ -998,6 +998,7 @@ export type ActiveTx = {
 // Passed to (db.newSession). An absent field takes its default. The entropy/clock seam is injected
 // via Session.setRandomSource / setClockSource, not here.
 export type SessionOptions = {
+  maxScalarBytes?: bigint;
   maxCost?: bigint;
   // The per-session cumulative cost budget (spec/design/session.md §5.4); absent ⇒ unlimited (the
   // default). Bounds the whole session: the instant the session's running total reaches it, the

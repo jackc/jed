@@ -7,6 +7,8 @@
 
 package jed
 
+const defaultScalarBytes int64 = 67108864
+
 // CostSchedule holds the deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
 type costSchedule struct {
 	StorageRowRead      int64
@@ -33,6 +35,8 @@ type costSchedule struct {
 	WindowResult        int64
 	VarlenCompare       int64
 	WindowFrameStep     int64
+	ScalarByte          int64
+	DecimalTranscend    int64
 }
 
 // Costs is the canonical cost schedule — weights accrued per unit during query execution.
@@ -61,4 +65,6 @@ var costs = costSchedule{
 	WindowResult:        1,
 	VarlenCompare:       1,
 	WindowFrameStep:     1,
+	ScalarByte:          1,
+	DecimalTranscend:    1,
 }
