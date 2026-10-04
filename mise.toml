@@ -84,6 +84,10 @@ run = "bundle exec rake test"
 description = "Verify the spec data tables and byte fixtures (toolchain-light; no engine build)"
 run = "bundle exec rake verify"
 
+[tasks."bench:durability"]
+description = "Test and benchmark experimental one-flush Rust commit protocols"
+run = "bundle exec rake bench:durability"
+
 [tasks.conformance]
 description = "Walk the conformance corpus on all three cores"
 run = "bundle exec rake conformance"

@@ -3,6 +3,10 @@
 //! private internal modules. Cargo's auto-discovery is off (autotests = false); this is the seam.
 #![cfg(test)]
 
+// Opt-in durability research runs against real engine page writes without a production API.
+#[path = "../../../bench/durability/experiment.rs"]
+mod durability_experiment;
+
 #[path = "../tests/alter_table.rs"]
 mod alter_table;
 #[path = "../tests/api.rs"]
