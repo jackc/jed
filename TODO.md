@@ -180,6 +180,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > The path to a **larger-than-RAM file that does not fall over** (CLAUDE.md §9): no
 > full-residency assumption above the storage seam.
 
+- [x] **Skip unchanged-domain commits** — empty/read-only writable transactions, temp-only and
+  attachment-only publication, and zero-row DML without side effects across all three cores.
+  → [transactions.md §2.1](spec/design/transactions.md).
+
 - [x] **Durable commit latency — validated COW implementation** — production v33 across Rust,
   Go, and TypeScript: inline/overflow manifests, one steady-state durable barrier, protected
   dependency reuse, recovery/foreign-generation stabilization, and poisoned-writer rejection.

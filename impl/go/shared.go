@@ -1828,25 +1828,32 @@ func (s *Session) refreshCommitted() {
 // any host, bplus-reshape.md B3) and the root is stored only on success, so a persist I/O failure
 // leaves the shared committed state (and this session's version) unchanged and surfaces the error.
 func (s *Session) publish() error {
+	changes := s.engine.commitChanges
+	if !changes.main && !changes.attached {
+		return nil
+	}
 	if err := s.core.checkCoordinatorPIDs(); err != nil {
 		return err
 	}
 	snap := s.engine.committed
-	snap.txid = s.baseVersion + 1 // advance the shared version on every commit
-	if err := s.core.persist(snap); err != nil {
-		return err // durable before publish; nothing is stored on failure
+	if changes.main {
+		snap.txid = s.baseVersion + 1 // main-domain version and reclamation watermark
+		if err := s.core.persist(snap); err != nil {
+			return err // durable before publish; nothing is stored on failure
+		}
+		if afterPersistHook != nil { // test seam (nil in production): the persist→publish window, where a
+			afterPersistHook() // reader can still pin the prior committed version — the reuse-gate race point (§8).
+		}
+		// The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids to
+		// every dirty node it wrote, so the committed tree can shed its leaf payloads — clean leaves
+		// demote to OnDisk references faulted back through the pool on next touch. The session's own
+		// committed base (the same snapshot pointer) takes the flipped shape too, so a long-lived
+		// writer sheds residency as well (read-your-writes for the NEXT statement re-faults — one read
+		// path).
+		snap.demoteCleanLeaves()
+		s.engine.committed = snap
+		s.baseVersion++
 	}
-	if afterPersistHook != nil { // test seam (nil in production): the persist→publish window, where a
-		afterPersistHook() // reader can still pin the prior committed version — the reuse-gate race point (§8).
-	}
-	// The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids to
-	// every dirty node it wrote, so the committed tree can shed its leaf payloads — clean leaves
-	// demote to OnDisk references faulted back through the pool on next touch. The session's own
-	// committed base (the same snapshot pointer) takes the flipped shape too, so a long-lived
-	// writer sheds residency as well (read-your-writes for the NEXT statement re-faults — one read
-	// path).
-	snap.demoteCleanLeaves()
-	s.engine.committed = snap
 	// The N-root commit (attached-databases.md §5): publish the new main root TOGETHER with the current
 	// attached roots in one atomic Store, so a reader pins a consistent cross-database snapshot. commitTx
 	// already adopted each dirtied attachment's working root into engine.attachedCommitted (and packed it
@@ -1858,7 +1865,6 @@ func (s *Session) publish() error {
 	s.core.liveMu.Lock()
 	s.core.roots.Store(&roots{committed: snap, attached: s.engine.attachedCommitted})
 	s.core.liveMu.Unlock()
-	s.baseVersion++
 	return nil
 }
 

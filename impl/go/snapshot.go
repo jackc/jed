@@ -31,6 +31,8 @@ type snapshot struct {
 	// nextval (a data write on the nextval path), only by sequence DDL — a SELECT plan binds no
 	// sequence.
 	catGen uint64
+	// dataGen tracks sequence/statistics metadata mutations, independently of plan validity.
+	dataGen uint64
 	// estimatorIdentity is this database domain's cache-identity token. Transaction/snapshot clones
 	// share it; a fresh create/open/attachment gets a fresh token. It is deliberately opaque and
 	// never serialized or exposed to planning/EXPLAIN (estimator.md §6).
@@ -169,7 +171,29 @@ func (s *snapshot) clone() *snapshot {
 		}
 		statistics[table] = copyColumns
 	}
-	return &snapshot{txid: s.txid, catGen: s.catGen, estimatorIdentity: s.estimatorIdentity, estimatorBaseRevision: s.estimatorBaseRevision, estimatorRevisions: estimatorRevisions, statistics: statistics, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees, storePaging: s.storePaging}
+	return &snapshot{txid: s.txid, catGen: s.catGen, dataGen: s.dataGen, estimatorIdentity: s.estimatorIdentity, estimatorBaseRevision: s.estimatorBaseRevision, estimatorRevisions: estimatorRevisions, statistics: statistics, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees, storePaging: s.storePaging}
+}
+
+// changedSince refines candidate dirty domains without reading rows or serializing. A cloned
+// working tree shares every unmodified root; metadata generations cover non-tree mutations.
+func (s *snapshot) changedSince(base *snapshot) bool {
+	if s.catGen != base.catGen || s.dataGen != base.dataGen || s.defaultCollation != base.defaultCollation {
+		return true
+	}
+	return storesChanged(s.stores, base.stores) || storesChanged(s.indexStores, base.indexStores)
+}
+
+func storesChanged(stores, base map[string]*tableStore) bool {
+	if len(stores) != len(base) {
+		return true
+	}
+	for name, store := range stores {
+		old := base[name]
+		if old == nil || store.nextRowid != old.nextRowid || store.treeRoot() != old.treeRoot() {
+			return true
+		}
+	}
+	return false
 }
 
 // freezeMutationGenerations publishes every table/index root as immutable private runtime state.
@@ -188,6 +212,7 @@ func (s *snapshot) columnStatistics(table string, column int) *columnStatistics 
 }
 
 func (s *snapshot) putColumnStatistics(table string, column int, statistics *columnStatistics) {
+	s.dataGen++
 	key := strings.ToLower(table)
 	if s.statistics[key] == nil {
 		s.statistics[key] = make(map[int]*columnStatistics)
@@ -222,14 +247,19 @@ func (s *snapshot) statisticsSorted() []sortedColumnStatistics {
 }
 
 func (s *snapshot) markStatisticsStale(table string) {
+	s.dataGen++
 	for _, statistics := range s.statistics[strings.ToLower(table)] {
 		statistics.Stale = true
 	}
 }
 
-func (s *snapshot) clearStatistics(table string) { delete(s.statistics, strings.ToLower(table)) }
+func (s *snapshot) clearStatistics(table string) {
+	s.dataGen++
+	delete(s.statistics, strings.ToLower(table))
+}
 
 func (s *snapshot) clearColumnStatistics(table string, column int) {
+	s.dataGen++
 	key := strings.ToLower(table)
 	delete(s.statistics[key], column)
 	if len(s.statistics[key]) == 0 {
@@ -572,11 +602,13 @@ func (s *snapshot) sequence(name string) *sequenceDef {
 // putSequence registers a sequence (CREATE SEQUENCE). The lower-cased name is the key. The caller
 // has already validated the option set and checked the relation namespace for a collision.
 func (s *snapshot) putSequence(seq *sequenceDef) {
+	s.dataGen++
 	s.sequences[strings.ToLower(seq.Name)] = seq
 }
 
 // removeSequence removes a sequence (DROP SEQUENCE). The caller has checked it exists.
 func (s *snapshot) removeSequence(key string) {
+	s.dataGen++
 	delete(s.sequences, key)
 }
 

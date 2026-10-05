@@ -1320,22 +1320,27 @@ export class Session {
   // updated only on success, so a persist I/O failure throws and leaves the shared committed state (and
   // this session's version) unchanged. In-memory persist is a no-op.
   private publish(): void {
+    const changes = this.engine.commitChanges;
+    if (!changes.main && !changes.attached) return;
     this.core.checkPid();
     const snap = this.engine.committed;
-    snap.txid = this.baseVersion + 1n; // advance the shared version on every commit
-    this.core.persist(snap); // durable before publish (packs into the byte store, any host)
-    if (afterPersistHook !== null) {
-      // The persist→publish window (test seam; §8 fallback-reader race point). core.committed is still the
-      // PRIOR published root here — a reader pinned inside the hook gets that fallback version.
-      afterPersistHook(this.core.committed.txid, this.core.storage.freeGenTxid);
+    if (changes.main) {
+      snap.txid = this.baseVersion + 1n; // main-domain reclamation watermark
+      this.core.persist(snap); // durable before publish (packs into the byte store, any host)
+      if (afterPersistHook !== null) {
+        // The persist→publish window (test seam; §8 fallback-reader race point). core.committed is still the
+        // PRIOR published root here — a reader pinned inside the hook gets that fallback version.
+        afterPersistHook(this.core.committed.txid, this.core.storage.freeGenTxid);
+      }
+      // The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids to
+      // every dirty node it wrote, so the committed tree can shed its leaf payloads — clean leaves
+      // demote to OnDisk references faulted back through the pool on next touch. The session's own
+      // committed base IS this snapshot (one object, single-threaded), so a long-lived writer sheds
+      // residency too (read-your-writes for the NEXT statement re-faults — one read path).
+      snap.demoteCleanLeaves();
+      this.engine.committed = snap;
+      this.baseVersion += 1n;
     }
-    // The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids to
-    // every dirty node it wrote, so the committed tree can shed its leaf payloads — clean leaves
-    // demote to OnDisk references faulted back through the pool on next touch. The session's own
-    // committed base IS this snapshot (one object, single-threaded), so a long-lived writer sheds
-    // residency too (read-your-writes for the NEXT statement re-faults — one read path).
-    snap.demoteCleanLeaves();
-    this.engine.committed = snap;
     this.core.committed = snap;
     // The N-root commit (attached-databases.md §5): publish the new attached roots the commit adopted
     // (commitTx already packed each dirtied attachment's working root into its in-RAM store and adopted
@@ -1343,7 +1348,6 @@ export class Session {
     // cross-database snapshot. An unchanged attachment carries its prior root through; an empty map
     // (nothing attached) is the pre-attachment single-root publish.
     this.core.attached = this.engine.attachedCommitted;
-    this.baseVersion += 1n;
   }
 
   // begin opens an explicit transaction block on this session (spec/design/session.md §2.2 — the

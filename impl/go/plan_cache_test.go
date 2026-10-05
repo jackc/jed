@@ -562,12 +562,11 @@ func TestPlanCacheEstimatorRevisionRelevantAndUnrelated(t *testing.T) {
 		t.Fatalf("refilled vs fresh EXPLAIN = %v / %v", got, want)
 	}
 
-	// P9 conservatively advances the target revision even for a successful zero-row disposition,
-	// retaining its facts as stale.
+	// A zero-row disposition preserves both the statistics and the cached plan.
 	beforeNoop := stmt.sc.p.Load().sp
 	mustExec(t, db, "INSERT INTO a VALUES (1, 99) ON CONFLICT DO NOTHING")
-	if _, _ = drainQ(t, db, stmt, IntValue(10)); stmt.sc.p.Load().sp == beforeNoop {
-		t.Fatal("ON CONFLICT DO NOTHING did not conservatively invalidate the target")
+	if _, _ = drainQ(t, db, stmt, IntValue(10)); stmt.sc.p.Load().sp != beforeNoop {
+		t.Fatal("ON CONFLICT DO NOTHING invalidated an unchanged target")
 	}
 	for _, step := range []struct {
 		sql   string

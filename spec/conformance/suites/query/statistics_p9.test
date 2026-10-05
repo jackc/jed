@@ -3,7 +3,7 @@
 # stale after DML. The integer estimator consumes NULL/NDV/MCV/histogram facts without planning-time
 # leaf reads. jed_statistics is jed-owned introspection and EXPLAIN is jed-owned plan output, so this
 # file is cross-core checked rather than PostgreSQL-oracle imported.
-# requires: maintenance.analyze, introspect.statistics, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.alter_table, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, query.logical_connectives, expr.in_list, expr.between, expr.case, query.order_by, query.explain, query.qualified_table, session.privileges, session.allow_ddl, types.i32, types.text, types.decimal, types.array, types.jsonb, resource.cost_metering
+# requires: maintenance.analyze, introspect.statistics, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.alter_table, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.update, query.select, query.where_eq, query.comparison_order, query.logical_connectives, expr.in_list, expr.between, expr.case, query.order_by, query.explain, query.qualified_table, session.privileges, session.allow_ddl, types.i32, types.text, types.decimal, types.array, types.jsonb, resource.cost_metering
 
 statement ok
 CREATE TABLE p9_stats (id i32 PRIMARY KEY, skew i32, label text)
@@ -111,7 +111,7 @@ SELECT count(*) FROM p9_stats WHERE skew NOT BETWEEN NULL AND 0
 ----
 1
 
-# Even a successful zero-row DML conservatively marks every retained target fact stale.
+# A successful zero-row DML preserves every retained target fact.
 statement ok
 DELETE FROM p9_stats WHERE id = 999
 
@@ -119,9 +119,13 @@ query TB nosort
 SELECT column_name, is_stale FROM jed_statistics ORDER BY column_name
 ----
 label
-true
+false
 skew
-true
+false
+
+# A real row rewrite marks facts stale, even when the assigned value is unchanged.
+statement ok
+UPDATE p9_stats SET skew = skew WHERE id = 1
 
 # A selective refresh replaces only label; skew remains stale and available to the estimator.
 statement ok

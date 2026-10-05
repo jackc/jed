@@ -559,6 +559,10 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   and the key as a handle setting the engine never persists. When it lands, the crypto comes
   from a **vetted library, never a hand-rolled algorithm** — the dependency policy (§14), the
   build gate.
+- Writable commits persist only changed database domains. Empty/read-only work in a writable
+  transaction and temporary-only changes do not rewrite main, advance its txid, or issue a
+  durability barrier. Attachment-only commits publish their roots independently of main; zero-row
+  DML without other effects preserves statistics and does not persist (transactions.md §2.1).
 - **Replication — block-shipping, no WAL (`spec/design/replication.md`).** A door kept open,
   not built; the architecture is **decided**: replicate by shipping the **per-commit
   page-delta** (the dirty pages + meta swap §3's commit already produces), in `txid` order, as

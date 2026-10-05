@@ -456,6 +456,11 @@ leaves up to the root, plus the small rewritten catalog chain — and publishes 
 writing the **alternate meta slot** (`txid & 1`). The whole-image serializer survives only as
 `create`'s initial from-scratch write and the golden generator; it is no longer the commit path.
 
+Unchanged writable commits do not advance `txid`/`version` or issue database writes/barriers
+(transactions.md §2.1). These accessors report main's generation, not a version of the entire
+attachment set: attachment-only commits can change attached roots while main's generation stays
+unchanged. Each durable attachment advances its own recorded txid when it changes.
+
 The recipe below is the **`synchronous=on`** durable-commit path (§2.2, transactions.md §9): it
 fires at **every** durable commit — each autocommit write statement and each explicit `COMMIT`
 alike. Under `synchronous=off` the commit is visible immediately and the `fsync` is **batched /

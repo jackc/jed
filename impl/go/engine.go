@@ -18,7 +18,9 @@ import (
 // commit swaps committed := working (rollback drops working, since committed was never touched).
 // Every write — autocommit included — runs as a transaction, which unifies the two paths.
 type engine struct {
-	committed *snapshot
+	// commitChanges survives the inner commit so the shared session persists only changed domains.
+	commitChanges struct{ main, attached bool }
+	committed     *snapshot
 	// explainActual is non-nil only while EXPLAIN ANALYZE executes its inner statement. Execution
 	// records exact operator sub-meter snapshots here; ordinary statements pay only this nil check.
 	explainActual *actualCostProfile
@@ -409,7 +411,7 @@ type activeTx struct {
 	mainDirty bool
 	// tempDirty is whether this transaction mutated the SESSION-LOCAL TEMP snapshot — set by the temp
 	// write funnels. With mainDirty it decides whether COMMIT persists the main image (a pure-temp
-	// commit skips it; an empty block still persists, preserving prior behavior).
+	// commit skips it; unchanged domains are refined by snapshot.changedSince).
 	tempDirty bool
 	// attachWorking is the transaction's working copy of a host-attached database's snapshot
 	// (attached-databases.md §5), keyed by lowercased attachment name — the attachment analogue of
@@ -1422,37 +1424,56 @@ func (db *engine) LoadedCollations() []collationInfo {
 // idempotent (no skew ⇒ a no-op returning 0). Persisted by the next explicit Commit. Returns the
 // number of collations re-pinned.
 func (db *engine) UpgradeCollations() (int, error) {
-	work := db.committed.clone()
+	work := db.readSnap().clone()
 	n, err := work.upgradeCollations(db.pageSize)
 	if err != nil {
 		return 0, err
 	}
-	if n > 0 {
-		work.freezeMutationGenerations()
-		db.committed = work
+	if db.session.tx != nil {
+		if n > 0 {
+			db.session.tx.working = work
+			db.session.tx.mainDirty = true
+		}
+	} else {
+		db.commitChanges.main, db.commitChanges.attached = n > 0, false
+		if n > 0 {
+			work.freezeMutationGenerations()
+			db.committed = work
+		}
 	}
 	return n, nil
 }
 
 func (db *engine) SetDefaultCollation(name string) error {
-	if name == "C" {
-		db.committed.defaultCollation = ""
-		return nil
-	}
-	if db.committed.resolveCollation(name) == nil {
+	work := db.readSnap().clone()
+	if name != "C" && work.resolveCollation(name) == nil {
 		return newError(UndefinedObject, fmt.Sprintf("collation %q does not exist", name))
 	}
-	db.committed.defaultCollation = name
+	value := name
+	if value == "C" {
+		value = ""
+	}
+	changed := work.defaultCollation != value
+	work.defaultCollation = value
+	if db.session.tx != nil {
+		db.session.tx.working = work
+		db.session.tx.mainDirty = db.session.tx.mainDirty || changed
+	} else {
+		db.commitChanges.main, db.commitChanges.attached = changed, false
+		if changed {
+			db.committed = work
+		}
+	}
 	return nil
 }
 
 // DefaultCollation returns the per-database default collation name — "C" unless SetDefaultCollation
 // moved it (db.DefaultCollation, spec/design/collation.md §1).
 func (db *engine) DefaultCollation() string {
-	if db.committed.defaultCollation == "" {
+	if db.readSnap().defaultCollation == "" {
 		return "C"
 	}
-	return db.committed.defaultCollation
+	return db.readSnap().defaultCollation
 }
 
 // Collations introspects the collations THIS DATABASE references (db.Collations,

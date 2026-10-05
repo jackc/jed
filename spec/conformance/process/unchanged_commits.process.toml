@@ -1,0 +1,82 @@
+schema_version = 1
+name = "unchanged-writable-commits"
+description = "Empty and zero-row shared writers release the global gate without advancing durable metadata; the next writer refreshes and commits normally."
+requires = ["file.shared_process"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY)"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open"
+
+[[step]]
+actor = "a"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "50"
+expect_error = "55P03"
+
+[[step]]
+actor = "a"
+command = "write_commit"
+
+[[step]]
+actor = "a"
+command = "txid"
+expect = "2"
+
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "5000"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "DELETE FROM t WHERE id = 999"
+
+[[step]]
+actor = "b"
+command = "write_commit"
+
+[[step]]
+actor = "b"
+command = "txid"
+expect = "2"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t VALUES (1)"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT id FROM t"
+expect = "1"
+
+[[step]]
+actor = "b"
+command = "txid"
+expect = "3"
+
+[[step]]
+actor = "a"
+command = "close"
+
+[[step]]
+actor = "b"
+command = "close"

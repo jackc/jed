@@ -1085,6 +1085,7 @@ const ZERO_STORAGE_KEY = new Uint8Array(8);
 const EMPTY_STORAGE_KEY = new Uint8Array(0);
 
 export class Engine {
+  commitChanges = { main: false, attached: false };
   // The last committed, immutable state — what fresh readers (and autocommit reads) see.
   committed: Snapshot;
   // core is the shared core this engine's session belongs to (attached-databases.md §5), or null for a
@@ -2195,20 +2196,26 @@ export class Engine {
   // collation (else 42704). Persisted as the is_default flag on that collation's reference entry at
   // the next commit (the entry is emitted because the default references it — §5).
   setDefaultCollation(name: string): void {
-    if (name === "C") {
-      this.committed.defaultCollation = null;
-      return;
-    }
-    if (this.committed.resolveCollation(name) === undefined) {
+    const work = this.readSnap().clone();
+    if (name !== "C" && work.resolveCollation(name) === undefined) {
       throw engineError("undefined_object", `collation "${name}" does not exist`);
     }
-    this.committed.defaultCollation = name;
+    const value = name === "C" ? null : name;
+    const changed = work.defaultCollation !== value;
+    work.defaultCollation = value;
+    if (this.session.tx !== null) {
+      this.session.tx.working = work;
+      this.session.tx.mainDirty ||= changed;
+    } else {
+      this.commitChanges = { main: changed, attached: false };
+      if (changed) this.committed = work;
+    }
   }
 
   // defaultCollation returns the per-database default collation name — "C" unless setDefaultCollation
   // moved it (db.defaultCollation, spec/design/collation.md §1).
   defaultCollation(): string {
-    return this.committed.defaultCollation ?? "C";
+    return this.readSnap().defaultCollation ?? "C";
   }
 
   // upgradeCollations adopts a newly-loaded Unicode version for this database's skewed collations
@@ -2221,11 +2228,19 @@ export class Engine {
   // idempotent (no skew ⇒ a no-op returning 0). Persisted by the next explicit commit. Returns the
   // number of collations re-pinned.
   upgradeCollations(): number {
-    const work = this.committed.clone();
+    const work = this.readSnap().clone();
     const n = work.upgradeCollations(this.pageSize);
-    if (n > 0) {
-      work.freezeMutationGenerations();
-      this.committed = work;
+    if (this.session.tx !== null) {
+      if (n > 0) {
+        this.session.tx.working = work;
+        this.session.tx.mainDirty = true;
+      }
+    } else {
+      this.commitChanges = { main: n > 0, attached: false };
+      if (n > 0) {
+        work.freezeMutationGenerations();
+        this.committed = work;
+      }
     }
     return n;
   }
@@ -2446,6 +2461,7 @@ export class Engine {
   // persistHook, §9), then swap it in as committed. A durable-write failure leaves committed untouched
   // and rethrows. Returns to autocommit.
   commitTx(): Outcome {
+    this.commitChanges = { main: false, attached: false };
     const tx = this.session.tx;
     if (tx === null) return { kind: "statement", cost: 0n, rowsAffected: null };
     this.session.tx = null;
@@ -2457,6 +2473,13 @@ export class Engine {
       return { kind: "statement", cost: 0n, rowsAffected: null };
     }
     const working = tx.working;
+    // A requested writable store need not have been mutated. Refine before counting file writers.
+    tx.mainDirty = tx.mainDirty && working.changedSince(this.committed);
+    tx.tempDirty = tx.tempDirty && tx.tempWorking.changedSince(this.session.tempCommitted);
+    for (const name of tx.attachDirty ?? []) {
+      if (!tx.attachWorking!.get(name)!.changedSince(this.attachedCommitted.get(name)!))
+        tx.attachDirty!.delete(name);
+    }
     // One durable writer per transaction (attached-databases.md §5): at most one FILE-backed database —
     // MAIN or an attached file — may be written per tx (any number of in-memory attachments + session
     // temp are free). Checked here, before any durable page is written (the shared-core main persist is
@@ -2468,12 +2491,8 @@ export class Engine {
         "a transaction may modify at most one durable database",
       );
     }
-    // Persist the main image when it changed; a transaction that touched ONLY session-local temp tables
-    // skips it entirely so a temp table makes ZERO file writes (spec/design/temp-tables.md §2). An empty
-    // block (no kind dirty) still persists, preserving prior behavior. Temp state is adopted regardless
-    // — never serialized, only swapped into the in-memory committed temp snapshot.
-    const pureTemp = !tx.mainDirty && tx.tempDirty;
-    if (!pureTemp) {
+    // Only changed main state persists; temp and attachments are independent domains.
+    if (tx.mainDirty) {
       // The txid advances for a durable database, signalled by the presence of a persistHook (the file
       // and OPFS hosts set one; an in-memory database has none and stays at txid 0). Keyed on persistHook,
       // not `path`: the OPFS host is durable but has no filesystem path (it leaves `path` null so the
@@ -2548,6 +2567,7 @@ export class Engine {
       }
       this.attachedCommitted = na;
     }
+    this.commitChanges = { main: tx.mainDirty, attached: (tx.attachDirty?.size ?? 0) > 0 };
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
@@ -8887,7 +8907,7 @@ export class Engine {
           ctx,
           meter,
         );
-    this.markEstimatorMutation(ins.db, ins.table);
+    if (rowsIn.length > 0) this.markEstimatorMutation(ins.db, ins.table);
     return dmlOutcome(
       plan.returning?.names ?? null,
       plan.returning?.types ?? null,
@@ -9091,7 +9111,7 @@ export class Engine {
         ctx,
         meter,
       );
-      this.markEstimatorMutation(ins.db, ins.table);
+      if (affected > 0) this.markEstimatorMutation(ins.db, ins.table);
       return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, affected, meter.accrued);
     }
 
@@ -9243,7 +9263,7 @@ export class Engine {
           ctx,
           meter,
         );
-    this.markEstimatorMutation(ins.db, ins.table);
+    if (affected > 0) this.markEstimatorMutation(ins.db, ins.table);
     return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, affected, meter.accrued);
   }
 
@@ -10804,7 +10824,7 @@ export class Engine {
       const istore = this.writeIndexStoreScoped(del.db, def.name.toLowerCase());
       for (const ek of toRemove[kx]!) istore.remove(ek);
     }
-    this.markEstimatorMutation(del.db, del.table);
+    if (matched.length > 0) this.markEstimatorMutation(del.db, del.table);
     this.applyFkDeleteActions(
       table,
       matched.map((m) => m.row),
@@ -11315,7 +11335,7 @@ export class Engine {
         }
       }
     }
-    this.markEstimatorMutation(upd.db, upd.table);
+    if (updates.length > 0) this.markEstimatorMutation(upd.db, upd.table);
     this.applyFkUpdateActions(table, updates, meter, this.mainDmlTarget(upd.db, upd.table));
     return dmlOutcome(
       ret?.names ?? null,

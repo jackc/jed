@@ -193,10 +193,15 @@ default Session ──────────────── Session ◀─�
 **The lazy-gate lifecycle (the unified, PG-like rule).** A session does not hold the write gate for
 its life; it acquires it only to write, mirroring a PostgreSQL backend:
 
+Writable completion publishes only changed main/attachment domains (transactions.md §2.1).
+Empty, SELECT-only, and temp-only writable blocks leave main's version and durable bytes unchanged.
+An attachment-only commit publishes its roots without persisting main. Writer-gate/pin cleanup
+always runs, including when no publication is needed.
+
 - **Autocommit read** — pins the *latest* committed snapshot for that one statement; no gate. (Each
   autocommit statement sees the newest committed state, PG-faithful.)
 - **Autocommit write** — acquires the gate → captures committed as a working set → applies →
-  publishes at the next version (the §3 commit window) → **releases** the gate. Per-statement, so an
+  publishes changed roots (advancing main’s version only when main changed) → **releases** the gate. Per-statement, so an
   idle writable session holds nothing and never starves other writers.
 - **`BEGIN`** — pins one snapshot for the block and registers it in the watermark; acquires the gate
   **lazily on the block's first write** (or eagerly at `BEGIN READ WRITE`), holding it until

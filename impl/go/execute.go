@@ -184,6 +184,7 @@ func (db *engine) restoreSessionState(tx *activeTx) {
 // txid 0), make it durable (the single persist chokepoint, §9), then swap it in as committed. A
 // durable-write failure leaves committed untouched and propagates. Returns to autocommit.
 func (db *engine) commitTx() (outcome, error) {
+	db.commitChanges.main, db.commitChanges.attached = false, false
 	tx := db.session.tx
 	if tx == nil {
 		return outcome{Kind: outcomeStatement, Cost: 0}, nil
@@ -197,6 +198,14 @@ func (db *engine) commitTx() (outcome, error) {
 		return outcome{Kind: outcomeStatement, Cost: 0}, nil
 	}
 	working := tx.working
+	// Write-store access is only a candidate mutation. Refine before the durable-writer check.
+	tx.mainDirty = tx.mainDirty && working.changedSince(db.committed)
+	tx.tempDirty = tx.tempDirty && tx.tempWorking.changedSince(db.session.tempCommitted)
+	for name := range tx.attachDirty {
+		if !tx.attachWorking[name].changedSince(db.attachedCommitted[name]) {
+			delete(tx.attachDirty, name)
+		}
+	}
 	// One durable writer per transaction (attached-databases.md §5): at most one FILE-backed database —
 	// MAIN or an attached file — may be written per tx (any number of in-memory attachments + session
 	// temp are free). Checked here, before any durable page is written (in the shared-core path the main
@@ -205,12 +214,8 @@ func (db *engine) commitTx() (outcome, error) {
 	if err := db.checkOneDurableWriter(tx); err != nil {
 		return outcome{}, err
 	}
-	// Persist the main image when it changed; a transaction that touched ONLY session-local temp tables
-	// skips it entirely so a temp table makes ZERO file writes (temp-tables.md §2). An empty block (no
-	// kind dirty) still persists, preserving prior behavior. Temp state is adopted regardless — never
-	// serialized, only swapped into the in-memory committed temp snapshot.
-	pureTemp := !tx.mainDirty && tx.tempDirty
-	if !pureTemp {
+	// Only a changed main domain enters persistence. Temp and attachments commit independently.
+	if tx.mainDirty {
 		if db.path != "" {
 			working.txid = db.committed.txid + 1
 		}
@@ -277,6 +282,8 @@ func (db *engine) commitTx() (outcome, error) {
 		}
 		db.attachedCommitted = na
 	}
+	db.commitChanges.main = tx.mainDirty
+	db.commitChanges.attached = len(tx.attachDirty) > 0
 	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 

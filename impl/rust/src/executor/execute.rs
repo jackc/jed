@@ -562,17 +562,32 @@ impl Engine {
     /// that collation's reference entry at the next `commit` (the entry is emitted because the default
     /// references it — §5).
     pub fn set_default_collation(&mut self, name: &str) -> Result<()> {
-        if name == "C" {
-            self.committed.set_default_collation(None);
-            return Ok(());
-        }
-        if self.committed.resolve_collation(name).is_none() {
+        let mut work = self.read_snap().clone();
+        if name != "C" && work.resolve_collation(name).is_none() {
             return Err(EngineError::new(
                 SqlState::UndefinedObject,
                 format!("collation \"{name}\" does not exist"),
             ));
         }
-        self.committed.set_default_collation(Some(name.to_string()));
+        let value = if name == "C" {
+            None
+        } else {
+            Some(name.to_string())
+        };
+        let changed = work.default_collation != value;
+        work.set_default_collation(value);
+        if let Some(tx) = self.session.tx.as_mut() {
+            tx.working = work;
+            tx.main_dirty |= changed;
+        } else {
+            self.commit_changes = CommitChanges {
+                main: changed,
+                attached: false,
+            };
+            if changed {
+                self.committed = work;
+            }
+        }
         Ok(())
     }
 
@@ -587,10 +602,21 @@ impl Engine {
     /// change is persisted by the next explicit [`Engine::commit`]. Returns the number of collations
     /// re-pinned.
     pub fn upgrade_collations(&mut self) -> Result<usize> {
-        let mut work = self.committed.clone();
+        let mut work = self.read_snap().clone();
         let n = work.upgrade_collations(self.page_size)?;
-        if n > 0 {
-            self.committed = work;
+        if let Some(tx) = self.session.tx.as_mut() {
+            if n > 0 {
+                tx.working = work;
+                tx.main_dirty = true;
+            }
+        } else {
+            self.commit_changes = CommitChanges {
+                main: n > 0,
+                attached: false,
+            };
+            if n > 0 {
+                self.committed = work;
+            }
         }
         Ok(n)
     }
@@ -598,7 +624,7 @@ impl Engine {
     /// The per-database default collation name — `"C"` (byte order) unless `set_default_collation`
     /// moved it (`db.DefaultCollation`, spec/design/collation.md §1).
     pub fn default_collation(&self) -> String {
-        self.committed
+        self.read_snap()
             .default_collation()
             .unwrap_or("C")
             .to_string()
@@ -843,7 +869,8 @@ impl Engine {
     /// the §3 short commit window. A durable-write failure leaves `committed` untouched and
     /// propagates (the commit failed; the working set is discarded). Returns to autocommit.
     pub(crate) fn commit_tx(&mut self) -> Result<Outcome> {
-        let tx = match self.session.tx.take() {
+        self.commit_changes = CommitChanges::default();
+        let mut tx = match self.session.tx.take() {
             None => {
                 return Ok(Outcome::Statement {
                     cost: 0,
@@ -862,6 +889,12 @@ impl Engine {
                 rows_affected: None,
             });
         }
+        // Writable-store access alone does not prove a mutation. Refine before counting files.
+        tx.main_dirty = tx.main_dirty && tx.working.changed_since(&self.committed);
+        tx.temp_dirty =
+            tx.temp_dirty && tx.temp_working.changed_since(&self.session.temp_committed);
+        tx.attach_dirty
+            .retain(|name| tx.attach_working[name].changed_since(&self.attached_committed[name]));
         let main_dirty = tx.main_dirty;
         let temp_dirty = tx.temp_dirty;
         let mut temp_working = tx.temp_working;
@@ -889,13 +922,8 @@ impl Engine {
                 ));
             }
         }
-        // Persist the main image when it changed; a transaction that touched ONLY session-local temp
-        // tables skips it entirely so a temp table makes ZERO file writes (spec/design/temp-tables.md
-        // §2). An empty block (no kind dirty) still persists, preserving prior behavior. Temp state is
-        // adopted regardless — it is never serialized, only swapped into the in-memory committed temp
-        // snapshot.
-        let pure_temp = !main_dirty && temp_dirty;
-        if !pure_temp {
+        // Persist only changed main state; temp and attachments are independent domains.
+        if main_dirty {
             // The txid is the durable commit counter (spec/design/api.md §2): it advances only on a
             // file-backed commit. An in-memory commit swaps the snapshot but leaves txid unchanged
             // (an in-memory database stays at txid 0 — there is nothing to recover).
@@ -945,6 +973,10 @@ impl Engine {
             }
             self.attached_committed = na;
         }
+        self.commit_changes = CommitChanges {
+            main: main_dirty,
+            attached: !attach_dirty.is_empty(),
+        };
         Ok(Outcome::Statement {
             cost: 0,
             rows_affected: None,

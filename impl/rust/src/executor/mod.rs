@@ -327,6 +327,8 @@ pub struct Snapshot {
     /// NOT bumped by sequence `nextval` (a data write on the nextval path), only by sequence DDL — a
     /// SELECT plan binds no sequence.
     pub(crate) cat_gen: u64,
+    // Sequence/statistics metadata mutation generation; runtime-only and cloned transactionally.
+    data_gen: u64,
     /// Opaque, non-persisted identity for this database domain. Snapshot/transaction clones share
     /// it; every fresh create/open/attachment gets a new token (estimator.md §6).
     pub(crate) estimator_identity: std::sync::Arc<EstimatorDatabaseIdentity>,
@@ -414,6 +416,13 @@ pub(crate) struct FkDependent {
     pub dropped_name: String,
 }
 
+/// Changed domains handed from the executor commit to shared publication.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CommitChanges {
+    pub main: bool,
+    pub attached: bool,
+}
+
 /// The database handle: the last **committed** `Snapshot` plus, while a transaction is open, the
 /// writer's working snapshot (CLAUDE.md §3, spec/design/transactions.md §2). Reads run against the
 /// *visible* snapshot — the open transaction's `working` if any, else `committed`; a write mutates
@@ -421,6 +430,7 @@ pub(crate) struct FkDependent {
 /// `committed` was never touched). Every write — autocommit included — runs as a transaction, which
 /// unifies the two paths.
 pub struct Engine {
+    pub(crate) commit_changes: CommitChanges,
     /// The last committed, immutable state — what fresh readers (and autocommit reads) see.
     pub(crate) committed: Snapshot,
     /// The **default session** (spec/design/session.md §2.1): the per-connection state this handle
@@ -1215,7 +1225,7 @@ pub(crate) struct ActiveTx {
     main_dirty: bool,
     /// Whether this transaction mutated the **session-local temp** snapshot — set by
     /// [`Engine::temp_working_mut`]. With `main_dirty` it decides whether COMMIT persists the main
-    /// image (a pure-temp commit skips it; an empty block still persists, preserving prior behavior).
+    /// image; candidate domains are refined against their base snapshots before persistence.
     temp_dirty: bool,
     /// The transaction's working copy of each host-attached database's snapshot
     /// (attached-databases.md §5), keyed by lowercased attachment name — the attachment analogue of

@@ -1059,7 +1059,9 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		if err != nil {
 			return outcome{}, err
 		}
-		db.markEstimatorMutation(ins.DB, ins.Table)
+		if affected > 0 {
+			db.markEstimatorMutation(ins.DB, ins.Table)
+		}
 		return dmlOutcome(retNames, retTypes, returned, affected, meter.Accrued), nil
 	}
 
@@ -1226,7 +1228,9 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	if err != nil {
 		return outcome{}, err
 	}
-	db.markEstimatorMutation(ins.DB, ins.Table)
+	if affected > 0 {
+		db.markEstimatorMutation(ins.DB, ins.Table)
+	}
 	return dmlOutcome(retNames, retTypes, returned, affected, meter.Accrued), nil
 }
 
@@ -1466,7 +1470,9 @@ func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCt
 	if err != nil {
 		return outcome{}, err
 	}
-	db.markEstimatorMutation(ins.DB, ins.Table)
+	if affected > 0 {
+		db.markEstimatorMutation(ins.DB, ins.Table)
+	}
 	return dmlOutcome(plan.retNames, plan.retTypes, returned, affected, meter.Accrued), nil
 }
 
@@ -3212,7 +3218,9 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 			}
 		}
 	}
-	db.markEstimatorMutation(del.DB, del.Table)
+	if len(matched) > 0 {
+		db.markEstimatorMutation(del.DB, del.Table)
+	}
 	deletedRows := make([]storedRow, len(matched))
 	for i := range matched {
 		deletedRows[i] = matched[i].row
@@ -3878,7 +3886,9 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			}
 		}
 	}
-	db.markEstimatorMutation(upd.DB, upd.Table)
+	if len(updates) > 0 {
+		db.markEstimatorMutation(upd.DB, upd.Table)
+	}
 	fkUpdates := make([]fkUpdateTransition, len(updates))
 	for i := range updates {
 		fkUpdates[i] = fkUpdateTransition{newRow: updates[i].row, oldRow: updates[i].oldRow}

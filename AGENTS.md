@@ -117,6 +117,10 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   recovered/foreign generations before further writes; poison storage on I/O failure.
   Serialization errors before storage work discard the transaction without poisoning the handle.
   Follow `spec/design/validated-cow.md` and the shared byte format. No WAL or redo copies.
+- Writable commits persist only changed database domains. Empty/read-only work in a writable
+  transaction and temporary-only changes do not rewrite main, advance its txid, or issue a
+  durability barrier. Attachment-only commits publish their roots independently of main; zero-row
+  DML without other effects preserves statistics and does not persist (transactions.md §2.1).
 - Key encoding must preserve logical order in raw byte order.
 - Do not assume on-disk page bytes are plaintext-comparable; leave room for the
   encryption-at-rest design.

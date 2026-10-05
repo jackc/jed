@@ -47,6 +47,8 @@ export class Snapshot {
   // and estimator revision (spec/design/api.md §2.4). NOT bumped by sequence nextval (a data write on
   // the nextval path), only by sequence DDL — a SELECT plan binds no sequence.
   catGen: bigint = 0n;
+  // Runtime-only sequence/statistics mutation generation, cloned with the working snapshot.
+  private dataGen = 0n;
   // Exact, opaque prepared-cache identity/revision tokens (estimator.md §6). They are never
   // serialized or rendered. A clone shares them until a relevant table mutation replaces its
   // revision; a fresh create/open/attachment starts with a fresh database identity.
@@ -141,6 +143,7 @@ export class Snapshot {
     // GiST trees are never mutated in place — only replaced wholesale — so a shallow Map copy is safe.
     c.gistTrees = new Map(this.gistTrees);
     c.catGen = this.catGen;
+    c.dataGen = this.dataGen;
     c.estimatorIdentity = this.estimatorIdentity;
     c.estimatorBaseRevision = this.estimatorBaseRevision;
     c.estimatorRevisions = new Map(this.estimatorRevisions);
@@ -162,6 +165,33 @@ export class Snapshot {
     // The temp domain's paging is shared by reference (one pool per domain), like a store's paging.
     c.storePaging = this.storePaging;
     return c;
+  }
+
+  // Refine candidate dirty domains using runtime metadata and shared roots, never row scans.
+  changedSince(base: Snapshot): boolean {
+    const storesChanged = (
+      stores: Map<string, TableStore>,
+      old: Map<string, TableStore>,
+    ): boolean => {
+      if (stores.size !== old.size) return true;
+      for (const [name, store] of stores) {
+        const before = old.get(name);
+        if (
+          before === undefined ||
+          store.nextSyntheticRowid() !== before.nextSyntheticRowid() ||
+          store.treeRoot() !== before.treeRoot()
+        )
+          return true;
+      }
+      return false;
+    };
+    return (
+      this.catGen !== base.catGen ||
+      this.dataGen !== base.dataGen ||
+      this.defaultCollation !== base.defaultCollation ||
+      storesChanged(this.stores, base.stores) ||
+      storesChanged(this.indexStores, base.indexStores)
+    );
   }
 
   // Publish every table/index root as immutable private runtime state. This is O(number of stores),
@@ -194,6 +224,7 @@ export class Snapshot {
   }
 
   putColumnStatistics(table: string, column: number, statistics: ColumnStatistics): void {
+    this.dataGen++;
     const key = table.toLowerCase();
     let columns = this.statistics.get(key);
     if (columns === undefined) {
@@ -204,16 +235,19 @@ export class Snapshot {
   }
 
   markStatisticsStale(table: string): void {
+    this.dataGen++;
     const columns = this.statistics.get(table.toLowerCase());
     if (columns === undefined) return;
     for (const statistics of columns.values()) statistics.stale = true;
   }
 
   clearStatistics(table: string): void {
+    this.dataGen++;
     this.statistics.delete(table.toLowerCase());
   }
 
   clearColumnStatistics(table: string, column: number): void {
+    this.dataGen++;
     const key = table.toLowerCase();
     const columns = this.statistics.get(key);
     if (columns === undefined) return;
@@ -341,11 +375,13 @@ export class Snapshot {
   // putSequence registers a sequence (CREATE SEQUENCE). Lower-cased name is the key. The caller has
   // already validated the option set and checked the relation namespace for a collision.
   putSequence(seq: SequenceDef): void {
+    this.dataGen++;
     this.sequences.set(seq.name.toLowerCase(), seq);
   }
 
   // removeSequence removes a sequence (DROP SEQUENCE). The caller has checked it exists.
   removeSequence(key: string): void {
+    this.dataGen++;
     this.sequences.delete(key);
   }
 

@@ -2267,7 +2267,7 @@ impl Session {
         }
     }
 
-    /// End the open block (spec/design/session.md §2.4). `commit`: a clean writable block publishes
+    /// End the open block (spec/design/session.md §2.4). `commit`: a changed writable block publishes
     /// its working set at the next version; a failed/read-only block publishes nothing (a failed
     /// COMMIT is a ROLLBACK, PostgreSQL). Either way the gate is released and any pin deregistered.
     fn end_block(&mut self, commit: bool) -> Result<Outcome> {
@@ -2320,21 +2320,28 @@ impl Session {
     /// (and this session's version) unchanged and surfaces the error to the caller. In-memory persist
     /// is a no-op.
     fn publish(&mut self) -> Result<()> {
+        let changes = self.engine.commit_changes;
+        if !changes.main && !changes.attached {
+            return Ok(());
+        }
         self.shared.check_coordinator_pids()?;
         let mut snap = self.engine.committed.clone();
-        snap.txid = self.base_version + 1; // advance the shared version on every commit
-        self.shared.persist(&snap)?; // durable before publish (packs into the byte store, any host)
-        #[cfg(test)]
-        if let Some(hook) = AFTER_PERSIST_HOOK.lock().expect("hook lock").as_ref() {
-            hook(); // the persist→publish window (test seam; §8 fallback-reader race point)
+        if changes.main {
+            snap.txid = self.base_version + 1; // main-domain reclamation watermark
+            self.shared.persist(&snap)?; // durable before publish (packs into the byte store, any host)
+            #[cfg(test)]
+            if let Some(hook) = AFTER_PERSIST_HOOK.lock().expect("hook lock").as_ref() {
+                hook(); // the persist→publish window (test seam; §8 fallback-reader race point)
+            }
+            // The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids
+            // to every dirty node it wrote, so the committed tree can shed its leaf payloads — clean
+            // leaves demote to `OnDisk` references faulted back through the pool on next touch. The
+            // session's own committed base takes the same flipped shape, so a long-lived writer sheds
+            // residency too (read-your-writes for the NEXT statement re-faults — one read path).
+            snap.demote_clean_leaves();
+            self.engine.committed = snap.clone();
+            self.base_version += 1;
         }
-        // The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids
-        // to every dirty node it wrote, so the committed tree can shed its leaf payloads — clean
-        // leaves demote to `OnDisk` references faulted back through the pool on next touch. The
-        // session's own committed base takes the same flipped shape, so a long-lived writer sheds
-        // residency too (read-your-writes for the NEXT statement re-faults — one read path).
-        snap.demote_clean_leaves();
-        self.engine.committed = snap.clone();
         // The N-root commit (attached-databases.md §5): publish the new main root TOGETHER with the
         // current attached roots in one atomic swap. `commit_tx` already adopted each dirtied
         // attachment's working root into `engine.attached_committed` (and packed it into the attachment's
@@ -2342,7 +2349,6 @@ impl Session {
         // attached) is byte-for-byte the pre-attachment single-root publish.
         self.shared
             .publish(Arc::new(snap), self.engine.attached_committed.clone());
-        self.base_version += 1;
         Ok(())
     }
 
@@ -3427,3 +3433,7 @@ mod reclaim_watermark_tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+#[cfg(test)]
+#[path = "unchanged_commit_tests.rs"]
+mod unchanged_commit_tests;

@@ -140,7 +140,7 @@ func (db *engine) vectorizedAggEligible(plan *selectPlan) bool {
 		if len(gset.slotSrc) != 1 || gset.slotSrc[0] != 0 {
 			return false
 		}
-		store := db.lkpStore(rel.tableName)
+		store := db.lkpStoreScoped(rel.db, rel.tableName)
 		if store == nil {
 			return false
 		}
@@ -312,7 +312,7 @@ func (db *engine) emitAggSyntheticRows(plan *selectPlan, srows []storedRow, env 
 // scanned row), aggregate_accumulate (× survivors), and row_produced as the row path.
 func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv, meter *costMeter) ([]storedRow, bool, error) {
 	rel := &plan.rels[0]
-	store := db.lkpStore(rel.tableName)
+	store := db.lkpStoreScoped(rel.db, rel.tableName)
 	if store == nil {
 		return nil, false, nil
 	}
@@ -565,7 +565,7 @@ func (db *engine) vectorizedProjectEligible(plan *selectPlan) bool {
 // exactly the emitProject drive over a bare-column projection.
 func (db *engine) projectColumnar(plan *selectPlan, env *evalEnv, meter *costMeter) (emitter, bool, error) {
 	rel := &plan.rels[0]
-	store := db.lkpStore(rel.tableName)
+	store := db.lkpStoreScoped(rel.db, rel.tableName)
 	if store == nil {
 		return emitter{}, false, nil
 	}

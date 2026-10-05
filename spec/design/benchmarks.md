@@ -1282,3 +1282,14 @@ P6b adds `order_only_index_limit` and `gist_range_select`, and treats `gin_conta
 `interval_set_pk` as affected selector lanes. Together they cover order-only B-tree, GiST, GIN, and
 interval-set choices across every native core; timings remain observational and checksum equality is
 the benchmark gate.
+
+### Unchanged writable commit regression
+
+`go test -C impl/go -run '^$' -bench BenchmarkWritableNoopCommit -benchtime=300x -count=3`
+measures empty and SELECT-only `Database.Update` callbacks with fsync enabled, alongside a real
+UPDATE control. It uses each benchmark's temporary file; it requires no PostgreSQL service.
+At baseline `4239d359`, the Linux/amd64 local three-sample medians were 39.1 µs empty,
+40.7 µs SELECT-only, and 60.4 µs actual UPDATE. With unchanged-domain commit suppression they
+were 1.48 µs, 4.43 µs, and 59.1 µs respectively. These are local filesystem measurements,
+not predictions for macOS/APFS. Storage regression tests separately require zero writes/barriers
+for unchanged domains; timings are not conformance assertions.

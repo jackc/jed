@@ -16,6 +16,7 @@ func main() {
 
 	ctx := context.Background()
 
+	// Empty or SELECT-only writable transactions commit without database writes or fsync.
 	// Update runs a read-write transaction: it mints a session, runs the callback, commits on success,
 	// and rolls back if the callback returns an error — so the two writes are atomic. View is the
 	// read-only sibling. (For an explicit block spanning calls, mint a Session with db.Session(...)

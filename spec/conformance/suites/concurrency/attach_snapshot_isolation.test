@@ -12,9 +12,8 @@
 #   - a read session pins ONE cross-database snapshot for its life and is unaffected by a later
 #     commit to the attachment (main and the attachment move together — a reader never sees main at
 #     version N but the attachment at version N-1, or vice versa);
-#   - an attachment-only commit still advances the shared version and is held back by a live reader,
-#     so `expect version` / `expect oldest_live` track attachment writes exactly like main writes
-#     (every commit bumps committed.txid — the N-root commit publishes one atomic roots swap);
+#   - commits changing main advance its version; attachment-only commits preserve it (covered
+#     by unchanged_commits.test), while all pinned attachment roots remain protected;
 #   - a write through a read handle to an attachment table is 25006 and does not poison the handle.
 #
 # A core that has not wired the `# attach:` directive into its concurrency runner does not declare
@@ -42,7 +41,7 @@ open r read
 expect oldest_live 1
 
 # --- a second writer commits version 2 (a new row in BOTH main and the attachment) while r stays
-#     pinned. An attachment write advances the shared version just like a main write. --------------
+#     pinned. Main changes advance its version; all roots publish atomically. --------------
 open w2 write
 on w2 statement ok
 INSERT INTO m VALUES (2)

@@ -465,8 +465,7 @@ fn estimator_revision_tracks_relevant_relations() {
     );
     assert_eq!(cached_explain(&s, &stmt), cached_explain(&s, &fresh));
 
-    // Cover each distinct row-mutation executor path. P9 conservatively advances the target
-    // revision even for a successful zero-row disposition, retaining its facts as stale.
+    // A zero-row disposition preserves statistics and the plan; real mutation paths invalidate.
     let before_noop = {
         let cache = stmt.cache().borrow();
         std::rc::Rc::clone(&cache.as_ref().unwrap().plan)
@@ -478,7 +477,7 @@ fn estimator_revision_tracks_relevant_relations() {
     let _ = drain(&mut s, &stmt, &[Value::Int(10)]);
     {
         let cache = stmt.cache().borrow();
-        assert!(!std::rc::Rc::ptr_eq(
+        assert!(std::rc::Rc::ptr_eq(
             &cache.as_ref().unwrap().plan,
             &before_noop
         ));

@@ -9,6 +9,10 @@ measurements remain in [durable-commit-experiments.md](durable-commit-experiment
 
 ## 1. Commit and recovery
 
+An unchanged database domain never enters this protocol, including recovered-generation
+stabilization. A no-op writable transaction does no writes or barriers; the next actual write
+still performs every required stabilization and commit barrier (transactions.md §2.1).
+
 An ordinary incremental commit performs:
 
 1. Allocate and encode dirty tree, overflow, catalog, and free-list pages while preserving
