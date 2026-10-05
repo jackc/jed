@@ -49,8 +49,8 @@ test("corrupting any body page is caught or inert, never silent", () => {
     // Publish the same logical contents once more. v33 can reject a damaged newest descriptor and
     // recover the preceding complete generation; both now have the same rows. Corruption of inherited
     // live pages still fails XX001 when read, rather than being mistaken for an incomplete commit.
-    execute(db, "BEGIN");
-    execute(db, "COMMIT");
+    // A metadata mutation is required: an empty writable transaction no longer publishes.
+    execute(db, "ANALYZE t");
     close(db);
 
     const want = scanChecksum(path);

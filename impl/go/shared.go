@@ -1327,9 +1327,9 @@ func (c *sharedCore) canCompactCommitted() bool {
 
 // precheckBudgets checks every limited domain of a multi-root commit before any domain
 // writes a page (memory.md §8.3): attachments commit before main, so a later domain's 54P06 must not
-// follow an earlier domain's pack and compaction. main is the working main snapshot (persisted at
-// publish, whether or not it is dirty) and mainTxid the version publish will give it; attached the
-// dirtied attachments' working snapshots.
+// follow an earlier domain's pack and compaction. main is the working main snapshot persisted at
+// publish (nil when main is unchanged and does not persist, transactions.md §2.1) and mainTxid the
+// version publish will give it; attached the dirtied attachments' working snapshots.
 func (c *sharedCore) precheckBudgets(main *snapshot, mainTxid uint64, mainStagesRows bool, attached []budgetDomain) error {
 	canCompact := c.canCompactCommitted()
 	// By name, so which domain a 54P06 names never depends on map iteration order.
@@ -1344,6 +1344,9 @@ func (c *sharedCore) precheckBudgets(main *snapshot, mainTxid uint64, mainStages
 		if err := att.storage.precheckBudget(d.snap, true, budget); err != nil {
 			return err
 		}
+	}
+	if main == nil {
+		return nil
 	}
 	oldest := c.oldestLiveVersion(mainTxid)
 	c.storage.mu.Lock()
@@ -2469,25 +2472,34 @@ func (s *Session) publish() error {
 	// Taken first, so any failure below drops the staged attachment commits unadopted.
 	staged := s.engine.stagedAttachments
 	s.engine.stagedAttachments = nil
+	// Only changed domains publish (transactions.md §2.1): an unchanged commit writes nothing and keeps
+	// main's version.
+	changes := s.engine.commitChanges
+	if !changes.main && !changes.attached {
+		return nil
+	}
 	if err := s.core.checkCoordinatorPIDs(); err != nil {
 		return err
 	}
 	snap := s.engine.committed
-	snap.txid = s.baseVersion + 1 // advance the shared version on every commit
-	if err := s.core.persist(snap, s.engine.commitStagesRows); err != nil {
-		return err // durable before publish; nothing is stored on failure
+	if changes.main {
+		snap.txid = s.baseVersion + 1 // main-domain version and reclamation watermark
+		if err := s.core.persist(snap, s.engine.commitStagesRows); err != nil {
+			return err // durable before publish; nothing is stored on failure
+		}
+		if afterPersistHook != nil { // test seam (nil in production): the persist→publish window, where a
+			afterPersistHook() // reader can still pin the prior committed version — the reuse-gate race point (§8).
+		}
+		// The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids to
+		// every dirty node it wrote, so the committed tree can shed its leaf payloads — clean leaves
+		// demote to OnDisk references faulted back through the pool on next touch. The session's own
+		// committed base (the same snapshot pointer) takes the flipped shape too, so a long-lived
+		// writer sheds residency as well (read-your-writes for the NEXT statement re-faults — one read
+		// path).
+		snap.demoteCleanLeaves()
+		s.engine.committed = snap
+		s.baseVersion++
 	}
-	if afterPersistHook != nil { // test seam (nil in production): the persist→publish window, where a
-		afterPersistHook() // reader can still pin the prior committed version — the reuse-gate race point (§8).
-	}
-	// The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids to
-	// every dirty node it wrote, so the committed tree can shed its leaf payloads — clean leaves
-	// demote to OnDisk references faulted back through the pool on next touch. The session's own
-	// committed base (the same snapshot pointer) takes the flipped shape too, so a long-lived
-	// writer sheds residency as well (read-your-writes for the NEXT statement re-faults — one read
-	// path).
-	snap.demoteCleanLeaves()
-	s.engine.committed = snap
 	// The N-root commit (attached-databases.md §5): publish the new main root TOGETHER with the current
 	// attached roots in one atomic Store, so a reader pins a consistent cross-database snapshot. commitTx
 	// already adopted each dirtied attachment's working root into engine.attachedCommitted (and staged its
@@ -2500,7 +2512,6 @@ func (s *Session) publish() error {
 	s.core.roots.Store(&roots{committed: snap, attached: s.engine.attachedCommitted})
 	s.core.liveMu.Unlock()
 	s.core.adoptAttachments(staged, s.engine.attachedCommitted)
-	s.baseVersion++
 	return nil
 }
 

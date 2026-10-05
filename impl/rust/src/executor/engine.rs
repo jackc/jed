@@ -35,6 +35,7 @@ impl Engine {
             core: None,
             attached_committed: HashMap::new(),
             estimator_touched: HashSet::new(),
+            commit_changes: CommitChanges::default(),
             explain_actual: std::cell::RefCell::new(None),
         }
     }
@@ -65,6 +66,7 @@ impl Engine {
             core: None,
             attached_committed: HashMap::new(),
             estimator_touched: HashSet::new(),
+            commit_changes: CommitChanges::default(),
             explain_actual: std::cell::RefCell::new(None),
         }
     }

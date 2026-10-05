@@ -221,7 +221,7 @@ The existing model generalizes with one genuinely new constraint.
   database"*) — the honest, forward-compatible narrowing (§11). The slot counts only **writable**
   file databases: a **read-only** attachment (§4) can never be written, so it never occupies the slot —
   attach as many read-only reference files as you like beside the one writable database.
-- **Commit publishes N roots.** Commit fsyncs the one durable writer's dirty pages per `synchronous`
+- **Commit publishes N roots.** Unchanged domains do not persist or advance their txid; an attachment-only commit leaves main untouched (transactions.md §2.1). Commit fsyncs the one durable writer's dirty pages per `synchronous`
   (transactions.md §9), then swaps **every** touched attachment's committed root (file root(s) + each
   in-memory root) — the two-root swap of temp-tables.md §5 widened to N. Because ≤1 root is durable,
   there is no multi-file crash window. Rollback discards every attachment's working root.

@@ -1,0 +1,24 @@
+# mode<TAB>main commit delta<TAB>SQL (statements separated by semicolons)
+# Host regression data: runners also assert write/sync counts and exact unchanged file bytes.
+tx	0	;
+tx	0	SELECT 1
+tx	0	SELECT * FROM t WHERE id = 999
+auto	0	UPDATE t SET v = 2 WHERE id = 999
+auto	0	DELETE FROM t WHERE id = 999
+auto	0	INSERT INTO t SELECT 2, 2 WHERE false
+auto	0	INSERT INTO t VALUES (1, 5) ON CONFLICT DO NOTHING
+auto	0	DROP TABLE IF EXISTS absent
+tx	0	UPDATE t SET v = 2 WHERE id = 999; DELETE FROM t WHERE id = 999
+tx	0	CREATE TEMP TABLE tt (id i32 PRIMARY KEY); INSERT INTO tt VALUES (1); UPDATE tt SET id = 2 WHERE id = 1
+auto	0	DELETE FROM tt
+script	0	SELECT 1; SELECT 2
+tx	1	UPDATE t SET v = v WHERE id = 1
+tx	1	SELECT nextval('s')
+auto	1	INSERT INTO t SELECT 1, nextval('s')::i32 ON CONFLICT DO NOTHING
+auto	1	ANALYZE t
+auto	0	UPDATE t SET v = 2 WHERE id = 999
+auto	0	DELETE FROM t WHERE id = 999
+tx	1	UPDATE t SET v = 2 WHERE id = 1; UPDATE t SET v = 1 WHERE id = 1
+rollback	0	UPDATE t SET v = 3 WHERE id = 1
+failed	0	UPDATE t SET v = 4 WHERE id = 1; SELECT * FROM absent
+tx	1	WITH changed AS (UPDATE t SET v = 2 WHERE id = 1 RETURNING id) SELECT id FROM changed WHERE false

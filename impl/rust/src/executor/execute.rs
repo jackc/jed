@@ -581,17 +581,32 @@ impl Engine {
     /// that collation's reference entry at the next `commit` (the entry is emitted because the default
     /// references it — §5).
     pub fn set_default_collation(&mut self, name: &str) -> Result<()> {
-        if name == "C" {
-            self.committed.set_default_collation(None);
-            return Ok(());
-        }
-        if self.committed.resolve_collation(name).is_none() {
+        let mut work = self.read_snap().clone();
+        if name != "C" && work.resolve_collation(name).is_none() {
             return Err(EngineError::new(
                 SqlState::UndefinedObject,
                 format!("collation \"{name}\" does not exist"),
             ));
         }
-        self.committed.set_default_collation(Some(name.to_string()));
+        let value = if name == "C" {
+            None
+        } else {
+            Some(name.to_string())
+        };
+        let changed = work.default_collation != value;
+        work.set_default_collation(value);
+        if let Some(tx) = self.session.tx.as_mut() {
+            tx.working = work;
+            tx.main_dirty |= changed;
+        } else {
+            self.commit_changes = CommitChanges {
+                main: changed,
+                attached: false,
+            };
+            if changed {
+                self.committed = work;
+            }
+        }
         Ok(())
     }
 
@@ -606,10 +621,21 @@ impl Engine {
     /// change is persisted by the next explicit [`Engine::commit`]. Returns the number of collations
     /// re-pinned.
     pub fn upgrade_collations(&mut self) -> Result<usize> {
-        let mut work = self.committed.clone();
+        let mut work = self.read_snap().clone();
         let n = work.upgrade_collations(self.page_size)?;
-        if n > 0 {
-            self.committed = work;
+        if let Some(tx) = self.session.tx.as_mut() {
+            if n > 0 {
+                tx.working = work;
+                tx.main_dirty = true;
+            }
+        } else {
+            self.commit_changes = CommitChanges {
+                main: n > 0,
+                attached: false,
+            };
+            if n > 0 {
+                self.committed = work;
+            }
         }
         Ok(n)
     }
@@ -617,7 +643,7 @@ impl Engine {
     /// The per-database default collation name — `"C"` (byte order) unless `set_default_collation`
     /// moved it (`db.DefaultCollation`, spec/design/collation.md §1).
     pub fn default_collation(&self) -> String {
-        self.committed
+        self.read_snap()
             .default_collation()
             .unwrap_or("C")
             .to_string()
@@ -862,7 +888,8 @@ impl Engine {
     /// propagates (the commit failed; the working set is discarded). Returns to autocommit.
     pub(crate) fn commit_tx(&mut self) -> Result<Outcome> {
         self.staged_attachments.clear();
-        let tx = match self.session.tx.take() {
+        self.commit_changes = CommitChanges::default();
+        let mut tx = match self.session.tx.take() {
             None => {
                 return Ok(Outcome::Statement {
                     cost: 0,
@@ -881,27 +908,32 @@ impl Engine {
                 rows_affected: None,
             });
         }
+        // Writable-store access alone does not prove a mutation (transactions.md §2.1). Refine before
+        // the budget precheck and the durable-writer count, so an unchanged domain is neither checked
+        // nor persisted.
+        tx.main_dirty = tx.main_dirty && tx.working.changed_since(&self.committed);
+        tx.temp_dirty =
+            tx.temp_dirty && tx.temp_working.changed_since(&self.session.temp_committed);
+        tx.attach_dirty
+            .retain(|name| tx.attach_working[name].changed_since(&self.attached_committed[name]));
         // A multi-root commit packs session temp and attachments before main persists at publish:
         // check every in-memory budget first, so a later domain's 54P06 discards the whole
         // transaction — session state restored as on ROLLBACK — before any domain has packed a page
-        // (memory.md §8.3). Main persists the working set, or its unchanged base when only temp
-        // changed.
+        // (memory.md §8.3). An unchanged main does not persist, so it has no budget to check.
         if tx.temp_dirty || !tx.attach_dirty.is_empty() {
             if let Some(c) = &self.core {
-                let pure_temp = !tx.main_dirty && tx.temp_dirty;
                 let attached: Vec<(&str, &Snapshot)> = tx
                     .attach_dirty
                     .iter()
                     .filter_map(|name| tx.attach_working.get(name).map(|ws| (name.as_str(), ws)))
                     .collect();
-                let mut main = if pure_temp {
-                    self.committed.clone()
-                } else {
-                    tx.working.clone()
-                };
-                main.txid = c.committed_version() + 1;
-                let main_stages_rows = !pure_temp && tx.working.staged_bytes() != 0;
-                if let Err(e) = c.precheck_budgets(&main, main_stages_rows, &attached) {
+                let main = tx.main_dirty.then(|| {
+                    let mut main = tx.working.clone();
+                    main.txid = c.committed_version() + 1;
+                    main
+                });
+                let main_stages_rows = tx.main_dirty && tx.working.staged_bytes() != 0;
+                if let Err(e) = c.precheck_budgets(main.as_ref(), main_stages_rows, &attached) {
                     drop(attached);
                     self.restore_session_state(tx);
                     return Err(e);
@@ -935,12 +967,6 @@ impl Engine {
                 ));
             }
         }
-        // Persist the main image when it changed; a transaction that touched ONLY session-local temp
-        // tables skips it entirely so a temp table makes ZERO file writes (spec/design/temp-tables.md
-        // §2). An empty block (no kind dirty) still persists, preserving prior behavior. Temp state is
-        // adopted regardless — it is never serialized, only swapped into the in-memory committed temp
-        // snapshot.
-        let pure_temp = !main_dirty && temp_dirty;
         // A dirty session-local temp domain stages its working snapshot into its store (compact packed
         // leaves; a spill to the host scratch directory once it outgrows `temp_buffers`) BEFORE the main
         // persist, and adopts the page accounting only after it — so a failed temp write (a scratch-file
@@ -955,7 +981,11 @@ impl Engine {
             _ => None,
         };
         self.commit_stages_rows = false;
-        if !pure_temp {
+        // Only a changed main domain persists (transactions.md §2.1): a transaction that touched ONLY
+        // session-local temp tables makes ZERO file writes (spec/design/temp-tables.md §2), and an empty
+        // block makes none at all. Temp state is adopted regardless — it is never serialized into main,
+        // only swapped into the in-memory committed temp snapshot.
+        if main_dirty {
             // The txid is the durable commit counter (spec/design/api.md §2): it advances only on a
             // file-backed commit. An in-memory commit swaps the snapshot but leaves txid unchanged
             // (an in-memory database stays at txid 0 — there is nothing to recover).
@@ -1023,6 +1053,10 @@ impl Engine {
             self.attached_committed = na;
             self.staged_attachments = staged;
         }
+        self.commit_changes = CommitChanges {
+            main: main_dirty,
+            attached: !attach_dirty.is_empty(),
+        };
         Ok(Outcome::Statement {
             cost: 0,
             rows_affected: None,

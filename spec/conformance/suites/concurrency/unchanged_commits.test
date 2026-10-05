@@ -1,0 +1,56 @@
+# No-op and attachment-only commits leave main's version and watermark unchanged.
+# The pinned reader still protects all its attachment roots; gate release is independent of I/O.
+# format: concurrency
+# requires: txn.shared, txn.read_handle, txn.watermark, attach.in_memory, harness.attach, ddl.create_table, ddl.primary_key, dml.insert, dml.delete, query.select, query.aggregates, types.i32
+# attach: a
+
+open w write
+on w statement ok
+CREATE TABLE t (id i32 PRIMARY KEY)
+on w statement ok
+CREATE TABLE a.t (id i32 PRIMARY KEY)
+commit w
+expect version 1
+
+open r read
+open empty write
+commit empty
+expect version 1
+expect oldest_live 1
+
+open w2 write
+on w2 query I nosort
+SELECT 1
+----
+1
+on w2 statement ok
+DELETE FROM t WHERE id = 999
+on w2 statement ok
+INSERT INTO a.t VALUES (1)
+commit w2
+expect version 1
+expect oldest_live 1
+
+on r query I rowsort
+SELECT id FROM a.t
+----
+
+open fresh read
+on fresh query I rowsort
+SELECT id FROM a.t
+----
+1
+on fresh query I nosort
+SELECT count(*) FROM a.t
+----
+1
+close fresh
+
+open w3 write
+on w3 statement ok
+INSERT INTO t VALUES (2)
+commit w3
+expect version 2
+expect oldest_live 1
+close r
+expect oldest_live 2

@@ -143,8 +143,9 @@ not executed.
 nothing for them: no `page_read`, `storage_row_read`, WHERE, assignment, CHECK, or RETURNING
 evaluation. No row is affected, so no per-row volatile assignment (`nextval`) runs, no referential
 action fires, and RETURNING yields an empty result. Uncorrelated subqueries in the WHERE, SET list, and
-RETURNING list still fold once and are charged, as for any mutation. The statement still succeeds, so
-the target's statistics are marked stale like any zero-row DML ([statistics.md](statistics.md) §2).
+RETURNING list still fold once and are charged, as for any mutation. Like any zero-row
+DML, it leaves the target's statistics fresh and changes no persistent state, so it publishes nothing
+([statistics.md](statistics.md) §2, [transactions.md](transactions.md) §2.1).
 Previously such a mutation scanned its selected path and evaluated the WHERE per scanned row; a
 provably empty key bound already charged nothing and is unchanged.
 

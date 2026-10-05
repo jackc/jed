@@ -520,10 +520,14 @@ class SharedCore {
   // precheckBudgets checks every limited domain — in-memory (memory.md §8.3) or durable (§8.7) — of a
   // multi-root commit before any domain writes a page: attachments commit before main, so a later
   // domain's 54P06 must not follow an earlier domain's pack, compaction, or durable write. main is the
-  // working main snapshot (persisted at publish, whether or not it is dirty); attached the dirtied
-  // attachments' working snapshots.
+  // working main snapshot persisted at publish (null when main is unchanged and does not persist,
+  // transactions.md §2.1); attached the dirtied attachments' working snapshots.
   // Attachments are visited in name order, so which domain a 54P06 names never depends on set order.
-  precheckBudgets(main: Snapshot, mainStagesRows: boolean, attached: [string, Snapshot][]): void {
+  precheckBudgets(
+    main: Snapshot | null,
+    mainStagesRows: boolean,
+    attached: [string, Snapshot][],
+  ): void {
     const canCompact = this.canCompactCommitted();
     const sorted = [...attached].sort((a, b) => compareFilePaths(a[0], b[0])); // UTF-8 byte order
     for (const [name, snap] of sorted) {
@@ -537,6 +541,8 @@ class SharedCore {
         stagesRows: snap.stagedBytes() !== 0,
       });
     }
+    // An unchanged main does not persist, so it has no budget to check (transactions.md §2.1).
+    if (main === null) return;
     const oldest = this.oldestLiveVersion(this.committed.txid + 1n);
     precheckBudget(this.storage, main, oldest >= this.storage.freeGenTxid, {
       name: "main",
@@ -1611,23 +1617,30 @@ export class Session {
     // Taken first, so any failure below drops the staged attachment commits unadopted.
     const staged = this.engine.stagedAttachments;
     this.engine.stagedAttachments = [];
+    // Only changed domains publish (transactions.md §2.1): an unchanged commit writes nothing and keeps
+    // main's version.
+    const changes = this.engine.commitChanges;
+    if (!changes.main && !changes.attached) return;
     this.core.checkPid();
     const snap = this.engine.committed;
-    snap.txid = this.baseVersion + 1n; // advance the shared version on every commit
-    // durable before publish (packs into the byte store, any host)
-    this.core.persist(snap, this.engine.commitStagesRows);
-    if (afterPersistHook !== null) {
-      // The persist→publish window (test seam; §8 fallback-reader race point). core.committed is still the
-      // PRIOR published root here — a reader pinned inside the hook gets that fallback version.
-      afterPersistHook(this.core.committed.txid, this.core.storage.freeGenTxid);
+    if (changes.main) {
+      snap.txid = this.baseVersion + 1n; // main-domain version and reclamation watermark
+      // durable before publish (packs into the byte store, any host)
+      this.core.persist(snap, this.engine.commitStagesRows);
+      if (afterPersistHook !== null) {
+        // The persist→publish window (test seam; §8 fallback-reader race point). core.committed is still the
+        // PRIOR published root here — a reader pinned inside the hook gets that fallback version.
+        afterPersistHook(this.core.committed.txid, this.core.storage.freeGenTxid);
+      }
+      // The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids to
+      // every dirty node it wrote, so the committed tree can shed its leaf payloads — clean leaves
+      // demote to OnDisk references faulted back through the pool on next touch. The session's own
+      // committed base IS this snapshot (one object, single-threaded), so a long-lived writer sheds
+      // residency too (read-your-writes for the NEXT statement re-faults — one read path).
+      snap.demoteCleanLeaves();
+      this.engine.committed = snap;
+      this.baseVersion += 1n;
     }
-    // The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids to
-    // every dirty node it wrote, so the committed tree can shed its leaf payloads — clean leaves
-    // demote to OnDisk references faulted back through the pool on next touch. The session's own
-    // committed base IS this snapshot (one object, single-threaded), so a long-lived writer sheds
-    // residency too (read-your-writes for the NEXT statement re-faults — one read path).
-    snap.demoteCleanLeaves();
-    this.engine.committed = snap;
     this.core.committed = snap;
     // The N-root commit (attached-databases.md §5): publish the new attached roots the commit adopted
     // (commitTx already staged each dirtied attachment's working root into its in-RAM store and adopted
@@ -1637,7 +1650,6 @@ export class Session {
     // single-root publish.
     this.core.attached = this.engine.attachedCommitted;
     this.core.adoptAttachments(staged, this.engine.attachedCommitted);
-    this.baseVersion += 1n;
   }
 
   // begin opens an explicit transaction block on this session (spec/design/session.md §2.2 — the

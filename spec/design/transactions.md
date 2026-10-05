@@ -80,7 +80,7 @@ Transaction          = read:  { snapshot: ref<Snapshot> }                 # no w
   root — it cannot mutate (§4.3). Many may be open at once.
 - **Commit** (of a write tx) publishes `working` — `committed := working`, **a single pointer
   swap** (the §3 short commit window) — makes it durable per the `synchronous` setting (§9),
-  releases the write lock, and bumps `txid`. Committing a read tx is a no-op.
+  releases the write lock, and bumps `txid` when that database changed. Committing a read tx is a no-op.
 - **Rollback** drops the pending root (`working` discarded) and releases the write lock. For a
   read tx it just releases the snapshot.
 - A `Rows` cursor captures its transaction's `Snapshot` and is thereby stable for its life and
@@ -90,6 +90,35 @@ Transaction          = read:  { snapshot: ref<Snapshot> }                 # no w
 This is the bbolt model (a read tx is a `View`, a write tx is an `Update` owning its own root;
 commit swaps the meta root), here realized in memory first ([storage.md](storage.md) §4,
 CLAUDE.md §12).
+
+### 2.1 Commits without persistent mutations
+
+A successful writable transaction with no mutations to main or attachments finishes without
+serializing a database, writing commit metadata, issuing a durability barrier, or advancing a
+database's `txid`. This applies to explicit blocks, scoped host callbacks, scripts, and autocommit.
+The transaction still finishes normally: release writer gates and pins, retain successful session
+state, and adopt any session-local temporary changes. Read-only mode still enforces restrictions
+and avoids writer contention.
+
+Track mutations per database domain, not by statement kind or affected-row count. Catalog,
+sequence, row/index, and persisted statistics mutations count; `SELECT nextval(...)` may write,
+and a zero-row write may have sequence or writable-CTE side effects. A zero-row DML operation
+without such effects does not invalidate statistics or persist. Merely requesting a writable
+store is not a mutation. Empty/SELECT-only blocks and temp-only work leave main unchanged.
+An actual rewrite (including an UPDATE assigning the existing value), or mutations subsequently
+undone by further SQL, may still commit: transaction-wide value equality is not required.
+
+Commit reports main and attachment changes separately to shared publication. Only changed domains
+are packed/persisted; attachment-only work publishes the attached roots without rewriting main or
+advancing main's version. A main version remains the main-domain reclamation watermark; attachment
+reuse continues to require the existing conservative absence of any live reader. The one-durable-
+writer check counts changed file domains. No-op completion must not enter validated COW, including
+recovered-generation stabilization; the next actual write still performs all required barriers.
+
+Detection must not scan rows, fault pages, or serialize an image for comparison. The current cores
+use catalog/data-metadata generations and structurally shared table/index roots (plus rowid state)
+to refine the transaction's candidate dirty domains. Generations are runtime-only and clone with
+the working snapshot; this changes neither the file format nor SQL cost charges.
 
 ## 3. The persistent ordered map
 

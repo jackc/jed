@@ -61,9 +61,10 @@ analyzed non-NULL NDV estimate and is absent for a distribution-ineligible type.
 
 `ANALYZE t(cols)` replaces those columns' facts and marks each replacement fresh. Existing facts for
 unlisted columns stay untouched. A successful INSERT/UPDATE/DELETE against a table with any facts
-retains all facts but marks them stale; the mark is transactional and persisted. Conservative
-marking after a successful statement that affected zero rows is legal and canonical: every current
-top-level DML target is marked stale once on successful completion. ANALYZE itself advances the
+retains all facts but marks them stale when it changes rows; the mark is transactional and persisted.
+A zero-row disposition preserves the facts and estimator revision. Sequence or other-domain effects
+still commit independently (transactions.md §2.1). Each changed target is marked once per statement.
+ANALYZE itself advances the
 relation's existing estimator-revision token once, so a committed prepared plan cannot retain a
 pre-ANALYZE plan. Ordinary DML already advances that token and therefore replans against current row
 count plus retained stale facts.

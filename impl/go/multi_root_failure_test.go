@@ -101,11 +101,16 @@ func TestFailedMainPersistLeavesInMemoryAttachmentIntact(t *testing.T) {
 
 	// Nothing published: a fresh session sees the attachment's prior root.
 	assertAttachmentRows(t, db, expectedRows(func(int64) int64 { return 0 }))
-	// Main now refuses writes until reopened, but each attempt still stages attachment pages before
-	// main's persist fails. They must never land on pages the published root uses.
+	// Main now refuses writes until reopened, but each attempt that also changes main still stages
+	// attachment pages before main's persist fails. They must never land on pages the published root
+	// uses. (An attachment-only commit would not persist main at all, transactions.md §2.1.)
 	for k := 0; k < 4; k++ {
-		_, err := queryOutcome(s, fmt.Sprintf("UPDATE a.t SET v = %d WHERE id %% 7 = %d", 10+k, k), nil)
-		wantCode(t, err, "58030")
+		if err := s.Begin(true); err != nil {
+			t.Fatal(err)
+		}
+		mustExec(t, s, fmt.Sprintf("UPDATE a.t SET v = %d WHERE id %% 7 = %d", 10+k, k))
+		mustExec(t, s, fmt.Sprintf("INSERT INTO t VALUES (%d)", 10+k))
+		wantCode(t, s.Commit(), "58030")
 		assertAttachmentRows(t, db, expectedRows(func(int64) int64 { return 0 }))
 	}
 }

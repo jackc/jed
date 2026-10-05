@@ -184,6 +184,7 @@ func (db *engine) restoreSessionState(tx *activeTx) {
 // durable-write failure leaves committed untouched and propagates. Returns to autocommit.
 func (db *engine) commitTx() (outcome, error) {
 	db.stagedAttachments = nil
+	db.commitChanges.main, db.commitChanges.attached = false, false
 	tx := db.session.tx
 	if tx == nil {
 		return outcome{Kind: outcomeStatement, Cost: 0}, nil
@@ -196,29 +197,37 @@ func (db *engine) commitTx() (outcome, error) {
 		db.restoreSessionState(tx)
 		return outcome{Kind: outcomeStatement, Cost: 0}, nil
 	}
+	working := tx.working
+	// Write-store access is only a candidate mutation (transactions.md §2.1). Refine before the budget
+	// precheck and the durable-writer check, so an unchanged domain is neither checked nor persisted.
+	tx.mainDirty = tx.mainDirty && working.changedSince(db.committed)
+	tx.tempDirty = tx.tempDirty && tx.tempWorking.changedSince(db.session.tempCommitted)
+	for name := range tx.attachDirty {
+		if !tx.attachWorking[name].changedSince(db.attachedCommitted[name]) {
+			delete(tx.attachDirty, name)
+		}
+	}
 	// A multi-root commit packs session temp and attachments before main persists at publish: check
 	// every storage budget first (in-memory and file, memory.md §8.3/§8.7), so a later domain's 54P06
 	// discards the whole transaction — session state restored as on ROLLBACK — before any domain has
-	// packed a page. Main persists the working set, or its unchanged base when only temp changed.
+	// packed a page. An unchanged main does not persist, so it has no budget to check.
 	if (tx.tempDirty || len(tx.attachDirty) > 0) && db.core != nil {
-		pureTemp := !tx.mainDirty && tx.tempDirty
 		attached := make([]budgetDomain, 0, len(tx.attachDirty))
 		for name := range tx.attachDirty {
 			if ws := tx.attachWorking[name]; ws != nil {
 				attached = append(attached, budgetDomain{name: name, snap: ws})
 			}
 		}
-		main := tx.working
-		if pureTemp {
-			main = db.committed
+		var main *snapshot
+		if tx.mainDirty {
+			main = working
 		}
-		mainStagesRows := !pureTemp && tx.working.stagedBytes() != 0
+		mainStagesRows := tx.mainDirty && working.stagedBytes() != 0
 		if err := db.core.precheckBudgets(main, db.core.committedVersion()+1, mainStagesRows, attached); err != nil {
 			db.restoreSessionState(tx)
 			return outcome{}, err
 		}
 	}
-	working := tx.working
 	// One durable writer per transaction (attached-databases.md §5): at most one FILE-backed database —
 	// MAIN or an attached file — may be written per tx (any number of in-memory attachments + session
 	// temp are free). Checked here, before any durable page is written (in the shared-core path the main
@@ -227,11 +236,6 @@ func (db *engine) commitTx() (outcome, error) {
 	if err := db.checkOneDurableWriter(tx); err != nil {
 		return outcome{}, err
 	}
-	// Persist the main image when it changed; a transaction that touched ONLY session-local temp tables
-	// skips it entirely so a temp table makes ZERO file writes (temp-tables.md §2). An empty block (no
-	// kind dirty) still persists, preserving prior behavior. Temp state is adopted regardless — never
-	// serialized, only swapped into the in-memory committed temp snapshot.
-	pureTemp := !tx.mainDirty && tx.tempDirty
 	// A dirty session-local temp domain stages its working snapshot into its store (compact packed
 	// leaves; a spill to the host scratch directory once it outgrows tempBuffers) BEFORE the main
 	// persist, and adopts the page accounting only after it — so a failed temp write (a scratch-file I/O
@@ -246,7 +250,11 @@ func (db *engine) commitTx() (outcome, error) {
 		tempStaged = &staged
 	}
 	db.commitStagesRows = false
-	if !pureTemp {
+	// Only a changed main domain enters persistence (transactions.md §2.1): a transaction that touched
+	// ONLY session-local temp tables makes ZERO file writes (temp-tables.md §2), and an empty block makes
+	// none at all. Temp state is adopted regardless — never serialized into main, only swapped into the
+	// in-memory committed temp snapshot.
+	if tx.mainDirty {
 		if db.path != "" {
 			working.txid = db.committed.txid + 1
 		}
@@ -349,6 +357,8 @@ func (db *engine) commitTx() (outcome, error) {
 		db.attachedCommitted = na
 		db.stagedAttachments = staged
 	}
+	db.commitChanges.main = tx.mainDirty
+	db.commitChanges.attached = len(tx.attachDirty) > 0
 	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 

@@ -23,7 +23,7 @@ false
 v
 false
 
-# A zero-row UPDATE marks working facts stale, and rollback restores the committed fresh facts.
+# A zero-row UPDATE preserves fresh facts in both the working and committed snapshots.
 statement ok
 BEGIN
 
@@ -34,9 +34,9 @@ query TB nosort
 SELECT column_name, is_stale FROM jed_statistics ORDER BY column_name
 ----
 id
-true
+false
 v
-true
+false
 
 statement ok
 ROLLBACK

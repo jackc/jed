@@ -19,7 +19,14 @@ session) or on a session you've minted. For finer control, the explicit `begin` 
 `rollback` form lives on a **session** — mint one with `db.session(...)` and drive the block across
 calls.
 
+A writable transaction that makes no persistent changes commits without rewriting the database or
+issuing an fsync. This includes empty transactions, SELECT-only work, and zero-row writes without
+other effects. Temporary-only changes stay in the session; attachment-only changes persist only the
+changed attached database. A query that advances a sequence still writes, even if it returns no rows.
+The read-only `view` helper remains useful for enforcing access restrictions and avoiding writer contention.
+
 <CodeTabs topic="transactions" />
+
 
 ## Isolation
 

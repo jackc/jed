@@ -512,7 +512,9 @@ impl Engine {
                         &mut meter,
                     )?,
                 };
-                self.mark_estimator_mutation(db.as_deref(), &table);
+                if affected > 0 {
+                    self.mark_estimator_mutation(db.as_deref(), &table);
+                }
                 Ok(match (ret_nodes, returned) {
                     (Some((_, names, types)), Some(rows)) => Outcome::Query {
                         column_names: names,
@@ -667,7 +669,9 @@ impl Engine {
                     ctx,
                     &mut meter,
                 )?;
-                self.mark_estimator_mutation(db.as_deref(), &table);
+                if affected > 0 {
+                    self.mark_estimator_mutation(db.as_deref(), &table);
+                }
                 Ok(match (ret_nodes, returned) {
                     (Some((_, names, types)), Some(rows)) => Outcome::Query {
                         column_names: names,
@@ -1024,7 +1028,9 @@ impl Engine {
                 (rows_in.len() as i64, returned)
             }
         };
-        self.mark_estimator_mutation(ins.db.as_deref(), &ins.table);
+        if affected > 0 {
+            self.mark_estimator_mutation(ins.db.as_deref(), &ins.table);
+        }
         Ok(match (&plan.returning, returned) {
             (Some((_, names, types)), Some(rows)) => Outcome::Query {
                 column_names: names.clone(),
@@ -3001,7 +3007,9 @@ impl Engine {
                 istore.remove(ek)?;
             }
         }
-        self.mark_estimator_mutation(del.db.as_deref(), &del.table);
+        if !matched.is_empty() {
+            self.mark_estimator_mutation(del.db.as_deref(), &del.table);
+        }
         self.apply_fk_delete_actions(
             &fk_parent,
             &matched,
@@ -3700,7 +3708,9 @@ impl Engine {
                 }
             }
         }
-        self.mark_estimator_mutation(upd.db.as_deref(), &upd.table);
+        if !updates.is_empty() {
+            self.mark_estimator_mutation(upd.db.as_deref(), &upd.table);
+        }
         self.apply_fk_update_actions(
             &fk_parent,
             &updates,

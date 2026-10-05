@@ -1031,10 +1031,10 @@ test("batch streaming scan storage errors match the row kernel", () => {
       seed,
       "INSERT INTO t SELECT g, CASE WHEN g % 10 = 0 THEN NULL ELSE g END FROM generate_series(1, 300) AS g",
     );
-    // Publish the same contents once more, so a damaged newest generation cannot recover to an older,
-    // different root (the checksum.test.ts seed).
-    execute(seed, "BEGIN");
-    execute(seed, "COMMIT");
+    // Publish the same rows once more, so a damaged newest generation cannot recover to an older,
+    // different root (the checksum.test.ts seed). A metadata mutation is required: an empty writable
+    // transaction no longer publishes (transactions.md §2.1).
+    execute(seed, "ANALYZE t");
     close(seed);
     const clean = readFileSync(path);
     // Separate copies: each handle locks its own file.

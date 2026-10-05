@@ -111,7 +111,7 @@ SELECT count(*) FROM p9_stats WHERE skew NOT BETWEEN NULL AND 0
 ----
 1
 
-# Even a successful zero-row DML conservatively marks every retained target fact stale.
+# A successful zero-row DML preserves every retained target fact.
 statement ok
 DELETE FROM p9_stats WHERE id = 999
 
@@ -119,9 +119,13 @@ query TB nosort
 SELECT column_name, is_stale FROM jed_statistics ORDER BY column_name
 ----
 label
-true
+false
 skew
-true
+false
+
+# A real row rewrite marks facts stale, even when the assigned value is unchanged.
+statement ok
+UPDATE p9_stats SET skew = skew WHERE id = 1
 
 # A selective refresh replaces only label; skew remains stale and available to the estimator.
 statement ok
@@ -276,7 +280,7 @@ SELECT count(*) FROM p9_decimal WHERE v BETWEEN 1 AND 2.0
 3
 
 # A mutation that reads nothing — a proven WHERE contradiction (planner.md §3.1) or a provably empty
-# key bound — is still a successful DML statement, so it marks its target's facts stale too.
+# key bound — affects zero rows, so like any zero-row DML it leaves its target's facts fresh.
 statement ok
 CREATE TABLE p9_empty (id i32 PRIMARY KEY, v i32)
 
@@ -292,7 +296,7 @@ DELETE FROM p9_empty WHERE v > 30 AND v < 20
 query B nosort
 SELECT is_stale FROM jed_statistics WHERE table_name = 'p9_empty'
 ----
-true
+false
 
 statement ok
 ANALYZE p9_empty (v)
@@ -303,4 +307,4 @@ UPDATE p9_empty SET v = 0 WHERE id = NULL
 query B nosort
 SELECT is_stale FROM jed_statistics WHERE table_name = 'p9_empty'
 ----
-true
+false

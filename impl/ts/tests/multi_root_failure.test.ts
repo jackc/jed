@@ -96,10 +96,14 @@ test("failed main persist leaves an in-memory attachment intact", () => {
       attachmentRows(db),
       expected(() => 0n),
     );
-    // Main now refuses writes until reopened, but each attempt still stages attachment pages before
-    // main's persist fails. They must never land on pages the published root uses.
+    // Main now refuses writes until reopened, but each attempt that also changes main still stages
+    // attachment pages before main's persist fails. They must never land on pages the published root
+    // uses. (An attachment-only commit would not persist main at all, transactions.md §2.1.)
     for (let k = 0; k < 4; k++) {
-      assertCode(() => s.execute(`UPDATE a.t SET v = ${10 + k} WHERE id % 7 = ${k}`), "58030");
+      s.begin(true);
+      s.execute(`UPDATE a.t SET v = ${10 + k} WHERE id % 7 = ${k}`);
+      s.execute(`INSERT INTO t VALUES (${10 + k})`);
+      assertCode(() => s.commit(), "58030");
       assert.deepEqual(
         attachmentRows(db),
         expected(() => 0n),

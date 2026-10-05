@@ -119,6 +119,10 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   Follow `spec/design/validated-cow.md` and the shared byte format. No WAL or redo copies.
 - Meta offset 56 (v34) holds the exact live page count; every commit advances it by an exact
   delta, and the file form of `max_storage_bytes` limits it (memory.md §8.7).
+- Writable commits persist only changed database domains. Empty/read-only work in a writable
+  transaction and temporary-only changes do not rewrite main, advance its txid, or issue a
+  durability barrier. Attachment-only commits publish their roots independently of main; zero-row
+  DML without other effects preserves statistics and does not persist (transactions.md §2.1).
 - Key encoding must preserve logical order in raw byte order.
 - Do not assume on-disk page bytes are plaintext-comparable; leave room for the
   encryption-at-rest design.

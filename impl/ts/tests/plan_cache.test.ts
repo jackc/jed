@@ -362,15 +362,14 @@ test("plan cache: estimator revision tracks relevant relations only", () => {
   assert.equal(refilled.cost, freshRun.cost, "refilled and fresh actual cost must match");
   assert.deepEqual(cachedExplain(db, stmt), cachedExplain(db, fresh));
 
-  // P9 conservatively advances the target revision even for a successful zero-row disposition,
-  // retaining its facts as stale.
+  // A zero-row disposition preserves both the statistics and the cached plan.
   const beforeNoop = cacheOf(stmt)!.sp;
   execute(db, "INSERT INTO a VALUES (1, 99) ON CONFLICT DO NOTHING");
   drain(db, stmt, [intValue(10n)]);
-  assert.notEqual(
+  assert.equal(
     cacheOf(stmt)!.sp,
     beforeNoop,
-    "ON CONFLICT DO NOTHING did not conservatively invalidate the target",
+    "ON CONFLICT DO NOTHING invalidated an unchanged target",
   );
   for (const [sql, param] of [
     ["UPDATE a SET v = 11 WHERE id = 1", 11n],

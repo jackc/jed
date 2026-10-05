@@ -1626,11 +1626,12 @@ impl Shared {
 
     /// Check every limited in-memory domain of a multi-root commit before any domain writes a page
     /// (memory.md §8.3): attachments commit before main, so a later domain's `54P06` must not follow an
-    /// earlier domain's pack and compaction. `main` is the working main snapshot (persisted at publish,
-    /// whether or not it is dirty); `attached` the dirtied attachments' working snapshots.
+    /// earlier domain's pack and compaction. `main` is the working main snapshot persisted at publish
+    /// (`None` when main is unchanged and does not persist, transactions.md §2.1); `attached` the
+    /// dirtied attachments' working snapshots.
     pub(crate) fn precheck_budgets(
         &self,
-        main: &Snapshot,
+        main: Option<&Snapshot>,
         main_stages_rows: bool,
         attached: &[(&str, &Snapshot)],
     ) -> Result<()> {
@@ -1659,6 +1660,10 @@ impl Shared {
                 )?;
             }
         }
+        // An unchanged main does not persist, so it has no budget to check (transactions.md §2.1).
+        let Some(main) = main else {
+            return Ok(());
+        };
         let prev = Arc::clone(
             &self
                 .roots
@@ -2974,7 +2979,7 @@ impl Session {
         }
     }
 
-    /// End the open block (spec/design/session.md §2.4). `commit`: a clean writable block publishes
+    /// End the open block (spec/design/session.md §2.4). `commit`: a changed writable block publishes
     /// its working set at the next version; a failed/read-only block publishes nothing (a failed
     /// COMMIT is a ROLLBACK, PostgreSQL). Either way the gate is released and any pin deregistered.
     fn end_block(&mut self, commit: bool) -> Result<Outcome> {
@@ -3032,22 +3037,31 @@ impl Session {
     fn publish(&mut self) -> Result<()> {
         // Taken first, so any failure below drops the staged attachment commits unadopted.
         let staged = std::mem::take(&mut self.engine.staged_attachments);
+        // Only changed domains publish (transactions.md §2.1): an unchanged commit writes nothing and
+        // keeps main's version.
+        let changes = self.engine.commit_changes;
+        if !changes.main && !changes.attached {
+            return Ok(());
+        }
         self.shared.check_coordinator_pids()?;
         let mut snap = self.engine.committed.clone();
-        snap.txid = self.base_version + 1; // advance the shared version on every commit
-        // durable before publish (packs into the byte store, any host)
-        self.shared.persist(&snap, self.engine.commit_stages_rows)?;
-        #[cfg(test)]
-        if let Some(hook) = AFTER_PERSIST_HOOK.lock().expect("hook lock").as_ref() {
-            hook(); // the persist→publish window (test seam; §8 fallback-reader race point)
+        if changes.main {
+            snap.txid = self.base_version + 1; // main-domain version and reclamation watermark
+            // durable before publish (packs into the byte store, any host)
+            self.shared.persist(&snap, self.engine.commit_stages_rows)?;
+            #[cfg(test)]
+            if let Some(hook) = AFTER_PERSIST_HOOK.lock().expect("hook lock").as_ref() {
+                hook(); // the persist→publish window (test seam; §8 fallback-reader race point)
+            }
+            // The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids
+            // to every dirty node it wrote, so the committed tree can shed its leaf payloads — clean
+            // leaves demote to `OnDisk` references faulted back through the pool on next touch. The
+            // session's own committed base takes the same flipped shape, so a long-lived writer sheds
+            // residency too (read-your-writes for the NEXT statement re-faults — one read path).
+            snap.demote_clean_leaves();
+            self.engine.committed = snap.clone();
+            self.base_version += 1;
         }
-        // The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids
-        // to every dirty node it wrote, so the committed tree can shed its leaf payloads — clean
-        // leaves demote to `OnDisk` references faulted back through the pool on next touch. The
-        // session's own committed base takes the same flipped shape, so a long-lived writer sheds
-        // residency too (read-your-writes for the NEXT statement re-faults — one read path).
-        snap.demote_clean_leaves();
-        self.engine.committed = snap.clone();
         // The N-root commit (attached-databases.md §5): publish the new main root TOGETHER with the
         // current attached roots in one atomic swap. `commit_tx` already adopted each dirtied
         // attachment's working root into `engine.attached_committed` (and staged its pages into the
@@ -3058,7 +3072,6 @@ impl Session {
             .publish(Arc::new(snap), self.engine.attached_committed.clone());
         self.shared
             .adopt_attachments(staged, &self.engine.attached_committed);
-        self.base_version += 1;
         Ok(())
     }
 
@@ -4262,15 +4275,20 @@ mod multi_root_failure_tests {
 
         // Nothing published: a fresh session sees the attachment's prior root.
         assert_eq!(attachment_rows(&db).unwrap(), expected(|_| 0));
-        // Main now refuses writes until reopened, but each attempt still stages attachment pages
-        // before main's persist fails. They must never land on pages the published root uses.
+        // Main now refuses writes until reopened, but each attempt that also changes main still
+        // stages attachment pages before main's persist fails. They must never land on pages the
+        // published root uses. (An attachment-only commit would not persist main at all,
+        // transactions.md §2.1.)
         for k in 0..4 {
-            let err = s
-                .execute(
-                    &format!("UPDATE a.t SET v = {} WHERE id % 7 = {k}", 10 + k),
-                    &[],
-                )
-                .unwrap_err();
+            s.begin(true).unwrap();
+            s.execute(
+                &format!("UPDATE a.t SET v = {} WHERE id % 7 = {k}", 10 + k),
+                &[],
+            )
+            .unwrap();
+            s.execute(&format!("INSERT INTO t VALUES ({})", 10 + k), &[])
+                .unwrap();
+            let err = s.commit().unwrap_err();
             assert_eq!(err.code(), "58030", "{err:?}");
             assert_eq!(attachment_rows(&db).unwrap(), expected(|_| 0));
         }
@@ -4506,3 +4524,7 @@ mod temp_spill_internal_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+#[path = "unchanged_commit_tests.rs"]
+mod unchanged_commit_tests;

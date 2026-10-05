@@ -899,7 +899,11 @@ export interface AttachmentCore {
   // precheck of every limited in-memory domain before any domain packs a page.
   committedAttachment(name: string): Snapshot | undefined;
   canCompactCommitted(): boolean;
-  precheckBudgets(main: Snapshot, mainStagesRows: boolean, attached: [string, Snapshot][]): void;
+  precheckBudgets(
+    main: Snapshot | null,
+    mainStagesRows: boolean,
+    attached: [string, Snapshot][],
+  ): void;
 }
 
 // isReservedScope reports whether a database qualifier names one of the two implicit reserved scopes

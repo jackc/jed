@@ -6,6 +6,32 @@
 use super::*;
 
 impl Snapshot {
+    /// Refine candidate dirty domains without scanning rows or faulting pages. The transaction's
+    /// clone keeps every unchanged tree root shared, including before the first durable commit.
+    pub(crate) fn changed_since(&self, base: &Snapshot) -> bool {
+        fn stores_changed(
+            stores: &HashMap<String, TableStore>,
+            base: &HashMap<String, TableStore>,
+        ) -> bool {
+            stores.len() != base.len()
+                || stores.iter().any(|(name, store)| {
+                    base.get(name).is_none_or(|old| {
+                        store.next_rowid() != old.next_rowid()
+                            || match (store.tree_root(), old.tree_root()) {
+                                (None, None) => false,
+                                (Some(a), Some(b)) => !std::sync::Arc::ptr_eq(a, b),
+                                _ => true,
+                            }
+                    })
+                })
+        }
+        self.cat_gen != base.cat_gen
+            || self.data_gen != base.data_gen
+            || self.default_collation != base.default_collation
+            || stores_changed(&self.stores, &base.stores)
+            || stores_changed(&self.index_stores, &base.index_stores)
+    }
+
     /// Exact relation revision used only for prepared-plan cache validation (estimator.md §6).
     pub(crate) fn estimator_revision(&self, name: &str) -> std::sync::Arc<EstimatorRevision> {
         let key = name.to_ascii_lowercase();
@@ -65,6 +91,7 @@ impl Snapshot {
         column: usize,
         statistics: ColumnStatistics,
     ) {
+        self.data_gen += 1;
         let all = std::sync::Arc::make_mut(&mut self.statistics);
         all.entry(table.to_ascii_lowercase())
             .or_default()
@@ -72,6 +99,7 @@ impl Snapshot {
     }
 
     pub(crate) fn mark_statistics_stale(&mut self, table: &str) {
+        self.data_gen += 1;
         let all = std::sync::Arc::make_mut(&mut self.statistics);
         if let Some(columns) = all.get_mut(&table.to_ascii_lowercase()) {
             for statistics in columns.values_mut() {
@@ -81,10 +109,12 @@ impl Snapshot {
     }
 
     pub(crate) fn clear_statistics(&mut self, table: &str) {
+        self.data_gen += 1;
         std::sync::Arc::make_mut(&mut self.statistics).remove(&table.to_ascii_lowercase());
     }
 
     pub(crate) fn clear_column_statistics(&mut self, table: &str, column: usize) {
+        self.data_gen += 1;
         let key = table.to_ascii_lowercase();
         let all = std::sync::Arc::make_mut(&mut self.statistics);
         if let Some(columns) = all.get_mut(&key) {
@@ -184,11 +214,13 @@ impl Snapshot {
     /// Register a sequence (CREATE SEQUENCE). Lower-cased name is the key. The caller has already
     /// validated the option set and checked the relation namespace for a collision.
     pub(crate) fn put_sequence(&mut self, seq: SequenceDef) {
+        self.data_gen += 1;
         std::sync::Arc::make_mut(&mut self.sequences).insert(seq.name.to_ascii_lowercase(), seq);
     }
 
     /// Remove a sequence (DROP SEQUENCE). The caller has checked it exists.
     pub(crate) fn remove_sequence(&mut self, key: &str) {
+        self.data_gen += 1;
         std::sync::Arc::make_mut(&mut self.sequences).remove(key);
     }
 
