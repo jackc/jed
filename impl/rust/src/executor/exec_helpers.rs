@@ -301,6 +301,10 @@ impl crate::cursor::RowStream for StreamingScan {
         self.meter.accrued
     }
 
+    fn query_account(&self) -> crate::cost::QueryAccount {
+        self.meter.query.clone()
+    }
+
     fn close(&mut self) {
         // The pinned snapshot is owned by `self.engine` / `self.scan` and released on `Drop`; mark
         // done so any further `next_row` is a no-op (streaming.md §5, idempotent).
@@ -474,8 +478,15 @@ impl crate::cursor::RowStream for BufferedScan {
             }
             BufState::Done => Ok(None),
             BufState::Pending => unreachable!("the blocking part ran above"),
-            // Already projected + charged — hand the next row out (no further cost).
-            BufState::Final { iter } => Ok(iter.next()),
+            // Already projected + charged — hand the next row out (no further cost); it leaves engine
+            // ownership, so its query-memory charge is released (memory.md §5.3).
+            BufState::Final { iter } => {
+                let row = iter.next();
+                if let Some(r) = &row {
+                    self.meter.release_row(r);
+                }
+                Ok(row)
+            }
             // The streaming sort's lazy output: pull the next windowed row, charge `row_produced`,
             // and project it (streaming.md §4/§7). Disjoint-field borrows: `sorted`/`remaining` come
             // from `self.state`, distinct from `self.meter`/`self.engine`/`self.plan`/`self.rng`/
@@ -531,7 +542,9 @@ impl crate::cursor::RowStream for BufferedScan {
                     }
                     Ok(Some(out))
                 } else {
-                    Ok(Some(std::mem::take(&mut rows[i])))
+                    let row = std::mem::take(&mut rows[i]);
+                    self.meter.release_row(&row);
+                    Ok(Some(row))
                 }
             }
             // Columnar projection (packed-leaf.md §11 Track A2/A3): gather this row from the dense lanes —
@@ -567,6 +580,10 @@ impl crate::cursor::RowStream for BufferedScan {
 
     fn cost(&self) -> i64 {
         self.meter.accrued
+    }
+
+    fn query_account(&self) -> crate::cost::QueryAccount {
+        self.meter.query.clone()
     }
 
     fn close(&mut self) {
@@ -632,13 +649,23 @@ impl crate::cursor::RowStream for DeferredResult {
             self.state = DeferredState::Yielding(r.rows.into_iter());
         }
         match &mut self.state {
-            DeferredState::Yielding(iter) => Ok(iter.next()),
+            DeferredState::Yielding(iter) => {
+                let row = iter.next();
+                if let Some(r) = &row {
+                    self.engine.session.query_account().release_row(r);
+                }
+                Ok(row)
+            }
             DeferredState::Pending | DeferredState::Done => Ok(None),
         }
     }
 
     fn cost(&self) -> i64 {
         self.cost
+    }
+
+    fn query_account(&self) -> crate::cost::QueryAccount {
+        self.engine.session.query_account()
     }
 
     fn close(&mut self) {

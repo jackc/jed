@@ -60,6 +60,9 @@ impl Engine {
                 env.ctes,
                 meter,
             )?;
+            // Spool residency is operator state bounded by work_mem (memory.md §4 Q2): the rows leave
+            // the query-memory row account as they enter the spool.
+            meter.release_rows_masked(&rows, &plan.rel_masks[ri]);
             for row in rows {
                 out.push(row)?;
             }
@@ -383,6 +386,7 @@ impl Engine {
                         plan, inner, env.params, env.outer, &left, env.rng, env.ctes, meter,
                     )?;
                     rel_work[inner] += meter.accrued - before;
+                    meter.release_rows_masked(&generated, &plan.rel_masks[inner]);
                     let mut spool = self.blocking_spool();
                     for row in generated {
                         spool.push(row)?;
@@ -476,9 +480,17 @@ impl Engine {
     ) -> Result<RowSpool> {
         // Window partition state remains an upstream materialization owner. Other blocking stages
         // resume bounded processing as soon as the window releases its complete row buffer.
+        // While materialized it is a query-memory row buffer (memory.md §5.1): pre-projection rows
+        // under the touched mask, or projected-shape group rows for a grouped window.
+        let mask = if plan.is_agg {
+            Vec::new()
+        } else {
+            plan.memory_mask(meter)
+        };
         let mut scan = rows.into_reader()?;
         let mut materialized = Vec::new();
         while let Some(row) = scan.next()? {
+            meter.admit_row_masked(&row, &mask)?;
             materialized.push(row);
         }
         apply_window_stage(
@@ -488,6 +500,7 @@ impl Engine {
             env,
             meter,
         )?;
+        meter.release_rows_masked(&materialized, &mask);
         let mut out = self.blocking_spool();
         for row in materialized {
             out.push(row)?;
@@ -576,6 +589,7 @@ impl Engine {
                             plan, inner, env.params, &outer, &left, env.rng, env.ctes, meter,
                         )?;
                         rel_work[inner] += meter.accrued - before;
+                        meter.release_rows_masked(&generated, &plan.rel_masks[inner]);
                         let mut spool = self.blocking_spool();
                         for row in generated {
                             spool.push(row)?;

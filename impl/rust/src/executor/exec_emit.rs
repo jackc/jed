@@ -57,10 +57,13 @@ impl Engine {
         meter: &mut Meter,
     ) -> Result<Vec<Row>> {
         let driver = plan.phys.relation_order[0];
-        let mut running: Vec<Row> = materialized[driver]
-            .iter()
-            .map(|row| place_physical_relation_row(plan, driver, row))
-            .collect();
+        let mask = plan.memory_mask(meter);
+        let mut running: Vec<Row> = Vec::with_capacity(materialized[driver].len());
+        for row in &materialized[driver] {
+            let placed = place_physical_relation_row(plan, driver, row);
+            meter.admit_row_masked(&placed, &mask)?;
+            running.push(placed);
+        }
         for (position, step) in plan.phys.join_steps.iter().take(step_count).enumerate() {
             let inner = plan.phys.relation_order[position + 1];
             let inner_inl = plan.phys.rel_inl_bounds[inner].is_some();
@@ -139,6 +142,7 @@ impl Engine {
                         }
                     }
                     if keep {
+                        meter.admit_row_masked(&combined, &mask)?;
                         next.push(combined);
                         left_matched = true;
                         if emit_right {
@@ -147,7 +151,12 @@ impl Engine {
                     }
                 }
                 if emit_left && !left_matched {
+                    meter.admit_row_masked(left, &mask)?;
                     next.push(left.clone());
+                }
+                // A per-left-row INL / LATERAL re-materialization is consumed (memory.md §5.3).
+                if inner_inl || inner_lateral {
+                    meter.release_rows_masked(candidates, &plan.rel_masks[inner]);
                 }
             }
             if emit_right {
@@ -158,9 +167,12 @@ impl Engine {
                     let mut combined = vec![Value::Null; logical_join_row_width(plan)];
                     let offset = plan.rels[inner].offset;
                     combined[offset..offset + right.len()].clone_from_slice(right);
+                    meter.admit_row_masked(&combined, &mask)?;
                     next.push(combined);
                 }
             }
+            // The step's input rows are consumed once its output is built (memory.md §5.3).
+            meter.release_rows_masked(&running, &mask);
             running = next;
             if position + 1 < plan.phys.join_steps.len()
                 && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
@@ -208,6 +220,7 @@ impl Engine {
             None
         };
 
+        let mask = plan.memory_mask(meter);
         let mut out = Vec::new();
         for outer_row in outer_rows {
             let candidates: Vec<Row> = if inner_inl {
@@ -251,8 +264,13 @@ impl Engine {
                     Some(pred) => pred.eval(&combined, env, meter)?.is_true(),
                 };
                 if keep {
+                    meter.admit_row_masked(&combined, &mask)?;
                     out.push(combined);
                 }
+            }
+            // A per-outer-row INL re-materialization is consumed (memory.md §5.3).
+            if inner_inl {
+                meter.release_rows_masked(&candidates, &plan.rel_masks[inner_ordinal]);
             }
         }
         Ok(out)
@@ -415,6 +433,7 @@ impl Engine {
         // An INDEX-NESTED-LOOP relation (cost.md §3 "JOIN") likewise depends on the left-hand row
         // (its bound seeks per outer row), so it is not materialized up front either — a placeholder
         // holds its slot and the join loop re-materializes it per left row.
+        let mem_mask = plan.memory_mask(meter);
         let mut materialized: Vec<Vec<Row>> = Vec::with_capacity(plan.rels.len());
         let mut rel_work = vec![0i64; plan.rels.len()];
         for (ri, rel) in plan.rels.iter().enumerate() {
@@ -477,6 +496,7 @@ impl Engine {
             )?;
         } else {
             running = if plan.rels.is_empty() {
+                meter.admit_row(&[])?;
                 vec![Vec::new()]
             } else {
                 std::mem::take(&mut materialized[0])
@@ -520,6 +540,7 @@ impl Engine {
                                 Some(pred) => pred.eval(&combined, &env, meter)?.is_true(),
                             };
                             if keep {
+                                meter.admit_row_masked(&combined, &mem_mask)?;
                                 next.push(combined);
                                 left_matched = true;
                             }
@@ -527,9 +548,13 @@ impl Engine {
                         if emit_left && !left_matched {
                             let mut combined = left.clone();
                             combined.resize(combined.len() + right_pad, Value::Null);
+                            meter.admit_row_masked(&combined, &mem_mask)?;
                             next.push(combined);
                         }
+                        // The per-left-row re-materialization is consumed (memory.md §5.3).
+                        meter.release_rows_masked(&right_rows, &plan.rel_masks[k + 1]);
                     }
+                    meter.release_rows_masked(&running, &mem_mask);
                     running = next;
                     continue;
                 }
@@ -563,6 +588,7 @@ impl Engine {
                                 Some(pred) => pred.eval(&combined, &env, meter)?.is_true(),
                             };
                             if keep {
+                                meter.admit_row_masked(&combined, &mem_mask)?;
                                 next.push(combined);
                                 left_matched = true;
                             }
@@ -570,9 +596,13 @@ impl Engine {
                         if emit_left && !left_matched {
                             let mut combined = left.clone();
                             combined.resize(combined.len() + right_pad, Value::Null);
+                            meter.admit_row_masked(&combined, &mem_mask)?;
                             next.push(combined);
                         }
+                        // The per-left-row re-materialization is consumed (memory.md §5.3).
+                        meter.release_rows_masked(&right_rows, &plan.rel_masks[k + 1]);
                     }
+                    meter.release_rows_masked(&running, &mem_mask);
                     running = next;
                     continue;
                 }
@@ -598,6 +628,7 @@ impl Engine {
                             let mut combined = left.clone();
                             combined.extend_from_slice(&right_rows[ri]);
                             if pred.eval(&combined, &env, meter)?.is_true() {
+                                meter.admit_row_masked(&combined, &mem_mask)?;
                                 next.push(combined);
                                 left_matched = true;
                             }
@@ -605,9 +636,11 @@ impl Engine {
                         if emit_left && !left_matched {
                             let mut combined = left.clone();
                             combined.resize(combined.len() + right_pad, Value::Null);
+                            meter.admit_row_masked(&combined, &mem_mask)?;
                             next.push(combined);
                         }
                     }
+                    meter.release_rows_masked(&running, &mem_mask);
                     running = next;
                     continue;
                 }
@@ -622,6 +655,7 @@ impl Engine {
                             Some(pred) => pred.eval(&combined, &env, meter)?.is_true(),
                         };
                         if keep {
+                            meter.admit_row_masked(&combined, &mem_mask)?;
                             next.push(combined);
                             left_matched = true;
                             right_matched[ri] = true;
@@ -630,6 +664,7 @@ impl Engine {
                     if emit_left && !left_matched {
                         let mut combined = left.clone();
                         combined.resize(combined.len() + right_pad, Value::Null);
+                        meter.admit_row_masked(&combined, &mem_mask)?;
                         next.push(combined);
                     }
                 }
@@ -638,12 +673,19 @@ impl Engine {
                         if !right_matched[ri] {
                             let mut combined: Row = vec![Value::Null; left_pad];
                             combined.extend_from_slice(right);
+                            meter.admit_row_masked(&combined, &mem_mask)?;
                             next.push(combined);
                         }
                     }
                 }
+                meter.release_rows_masked(&running, &mem_mask);
                 running = next;
             }
+        }
+        // The join phase is complete: its relation buffers are consumed (memory.md §5.3). A relation
+        // moved into `running` left an empty buffer here.
+        for (ri, rows) in materialized.iter().enumerate() {
+            meter.release_rows_masked(rows, &plan.rel_masks[ri]);
         }
 
         // Scan labels can repeat (self joins), while the optimizer may render relations in physical
@@ -696,6 +738,8 @@ impl Engine {
             };
             if keep {
                 rows.push(row);
+            } else {
+                meter.release_row_masked(&row, &mem_mask);
             }
         }
         if plan.filter.is_some()
@@ -741,7 +785,13 @@ impl Engine {
             // The evaluation is metered per node (cost.md §3); empty for a column/ordinal-only ORDER BY.
             materialize_order_exprs(&mut rows, &plan.order_exprs, &env, meter)?;
             if let Some(k) = plan.phys.top_k {
+                // Rows the top-k selection drops are discarded (memory.md §5.3): release the input,
+                // then re-reserve the kept rows (never more than was released).
+                meter.release_rows_masked(&rows, &mem_mask);
                 rows = top_k_rows(rows, &plan.order, k)?;
+                for row in &rows {
+                    meter.admit_row_masked(row, &mem_mask)?;
+                }
             } else {
                 sort_rows(&mut rows, &plan.order)?;
             }
@@ -813,6 +863,7 @@ impl Engine {
                     meter.guard()?;
                     for ge in &plan.group_exprs {
                         let v = ge.eval(row, &env, meter)?;
+                        meter.admit_value(&v)?;
                         row.push(v);
                     }
                 }
@@ -936,9 +987,12 @@ impl Engine {
                     for positions in &plan.grouping_specs {
                         srow.push(Value::Int(grouping_value(positions, gset.mask)));
                     }
+                    meter.admit_row(&srow)?;
                     group_rows.push(srow);
                 }
             }
+            // Aggregation consumed the post-WHERE rows (memory.md §5.3).
+            meter.release_rows_masked(&rows, &mem_mask);
             // HAVING: filter the grouped rows (after aggregation, before ORDER BY). The
             // predicate is evaluated against each group's synthetic row (charging its
             // operator_evals per group); only a TRUE result keeps the group. A dropped group
@@ -948,6 +1002,8 @@ impl Engine {
                 for srow in group_rows {
                     if h.eval(&srow, &env, meter)?.is_true() {
                         kept.push(srow);
+                    } else {
+                        meter.release_row(&srow);
                     }
                 }
                 group_rows = kept;
@@ -1002,9 +1058,11 @@ impl Engine {
                         out.push(p.eval(srow, &env, meter)?);
                     }
                     if seen.insert(out.clone()) {
+                        meter.admit_row(&out)?;
                         distinct_rows.push(out);
                     }
                 }
+                meter.release_rows(&group_rows);
                 if select_actual_root_node(plan) != "Distinct"
                     && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
                 {
@@ -1043,9 +1101,11 @@ impl Engine {
                     out.push(p.eval(row, &env, meter)?);
                 }
                 if seen.insert(out.clone()) {
+                    meter.admit_row(&out)?;
                     distinct_rows.push(out);
                 }
             }
+            meter.release_rows_masked(&rows, &mem_mask);
             if select_actual_root_node(plan) != "Distinct"
                 && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
             {

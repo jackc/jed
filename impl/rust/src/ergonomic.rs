@@ -505,6 +505,7 @@ fn rows_with(q: impl FnOnce(&[Value]) -> Result<Rows>, params: impl Params) -> R
     let names: Rc<[String]> = Rc::from(rows.column_names().to_vec());
     let mut out = Vec::new();
     while let Some(values) = rows.next() {
+        rows.admit_collected(&values)?;
         out.push(Row {
             names: names.clone(),
             values,

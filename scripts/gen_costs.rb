@@ -34,6 +34,9 @@ end
 
 def scalar_limit = TomlRB.load_file(SCHEDULE).fetch("limits").fetch("default_scalar_bytes")
 
+# The logical query-memory size schedule (spec/design/memory.md §3).
+def mem(key) = TomlRB.load_file(SCHEDULE).fetch("memory").fetch(key)
+
 def units
   schedule = TomlRB.load_file(SCHEDULE)
   us = schedule["unit"] || []
@@ -62,6 +65,12 @@ def rust_file(us)
     // `rake verify` fails if this file is stale. Reasoning: ../../../spec/design/cost.md.
 
     pub const DEFAULT_SCALAR_BYTES: i64 = #{scalar_limit};
+
+    /// Logical query-memory size schedule (spec/design/memory.md §3).
+    pub const MEMORY_ROW: i64 = #{mem('row')};
+    pub const MEMORY_VALUE: i64 = #{mem('value')};
+    pub const MEMORY_ARRAY_DIM: i64 = #{mem('array_dim')};
+    pub const MEMORY_DECIMAL_GROUP: i64 = #{mem('decimal_group')};
 
     /// The deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
     pub struct CostSchedule {
@@ -98,6 +107,14 @@ def go_file(us)
 
     const defaultScalarBytes int64 = #{scalar_limit}
 
+    // Logical query-memory size schedule (spec/design/memory.md §3).
+    const (
+    	memoryRow          int64 = #{mem('row')}
+    	memoryValue        int64 = #{mem('value')}
+    	memoryArrayDim     int64 = #{mem('array_dim')}
+    	memoryDecimalGroup int64 = #{mem('decimal_group')}
+    )
+
     // CostSchedule holds the deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
     type costSchedule struct {
     #{fields}
@@ -124,6 +141,13 @@ def ts_file(us)
     // `rake verify` fails if this file is stale. Reasoning: ../../../spec/design/cost.md.
 
     export const DEFAULT_SCALAR_BYTES = #{scalar_limit}n;
+
+    // Logical query-memory size schedule (spec/design/memory.md §3). Plain numbers: the
+    // query-memory account is a live byte counter well inside 2^53.
+    export const MEMORY_ROW = #{mem('row')};
+    export const MEMORY_VALUE = #{mem('value')};
+    export const MEMORY_ARRAY_DIM = #{mem('array_dim')};
+    export const MEMORY_DECIMAL_GROUP = #{mem('decimal_group')};
 
     // The deterministic cost-unit weights, mirroring spec/cost/schedule.toml. Weights are
     // bigint for i64 parity with the Rust/Go cores (a number is f64 — CLAUDE.md §8).

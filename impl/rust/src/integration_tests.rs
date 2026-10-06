@@ -202,6 +202,10 @@ mod writable_cte;
 
 #[path = "../tests/index_dependencies.rs"]
 mod index_dependencies;
+#[path = "../tests/memory_sizes.rs"]
+mod memory_sizes;
+#[path = "../tests/query_memory.rs"]
+mod query_memory;
 
 #[path = "../tests/scalar_memory.rs"]
 mod scalar_memory;

@@ -5,6 +5,19 @@
 use super::explain_exec::{select_actual_rel_node, select_actual_root_node};
 use super::*;
 
+/// Re-measure a charged projected result that becomes relation rows under the relation's touched
+/// mask (memory.md §5.2): the masked measure never exceeds the full one, so this only releases.
+pub(crate) fn rebase_rows_masked(meter: &mut Meter, rows: &[Row], mask: &[bool]) {
+    if meter.query_memory_active() {
+        let full: i64 = rows.iter().map(|r| crate::memsize::row_bytes(r)).sum();
+        let masked: i64 = rows
+            .iter()
+            .map(|r| crate::memsize::row_bytes_masked(r, mask))
+            .sum();
+        meter.release_query(full - masked);
+    }
+}
+
 #[derive(Default)]
 struct StreamingActual {
     filter: i64,
@@ -63,6 +76,7 @@ fn process_streaming_row(
         }
         meter.charge(COSTS.row_produced);
         actual.output += COSTS.row_produced;
+        meter.admit_row(&projected)?; // the buffered result collector (memory.md §5.1)
         out.push(projected);
     } else {
         *passed += 1;
@@ -76,6 +90,7 @@ fn process_streaming_row(
             projected.push(p.eval(row, env, meter)?);
         }
         actual.output += meter.accrued - before;
+        meter.admit_row(&projected)?; // the buffered result collector (memory.md §5.1)
         out.push(projected);
     }
     Ok(plan.limit.is_none_or(|limit| (out.len() as i64) < limit))
@@ -612,6 +627,7 @@ impl Engine {
         // storage_row_read per scanned row and the WHERE operator_evals — the streaming-scan feed,
         // minus the projection (the window stage runs before projection). Stop the instant `cap`
         // survivors are in hand: a genuine early-out, so the window fold sees only the prefix it needs.
+        let mem_mask = plan.memory_mask(meter);
         let mut rows: Vec<Row> = Vec::new();
         if !empty && limit > 0 {
             let mut visit = |_key: &[u8], row: &Row| -> Result<bool> {
@@ -638,6 +654,7 @@ impl Engine {
                 if !keep {
                     return Ok(true);
                 }
+                meter.admit_row_masked(row, &mem_mask)?; // a row buffer (memory.md §5.1)
                 rows.push(row.clone());
                 Ok((rows.len() as i64) < cap) // stop once the OFFSET+LIMIT window is filled
             };
@@ -710,6 +727,8 @@ impl Engine {
         dst.max_cost = src.max_cost;
         dst.max_scalar_bytes = src.max_scalar_bytes;
         dst.scalar_bytes = src.scalar_bytes.clone();
+        dst.max_query_memory_bytes = src.max_query_memory_bytes;
+        dst.query_bytes = src.query_bytes.clone();
         dst.lifetime_max_cost = src.lifetime_max_cost;
         dst.lifetime_total = src.lifetime_total.clone(); // shared gauge — streaming cost counts (§5)
         dst.cancel = src.cancel.clone();
@@ -1204,6 +1223,7 @@ impl Engine {
                     projected.push(p.eval(&row, env, meter)?);
                 }
                 output_work += meter.accrued - before;
+                meter.admit_row(&projected)?; // the buffered result collector (memory.md §5.1)
                 out.push(projected);
                 // Stop once a LIMIT window is filled (a top-N over the index order).
                 Ok(match limit {
@@ -1523,6 +1543,7 @@ impl Engine {
         let limit = plan.limit;
         let offset = plan.offset.unwrap_or(0);
         let mut out: Vec<Vec<Value>> = Vec::new();
+        let mut inl_rows: Vec<Row> = Vec::new();
         if limit != Some(0) {
             let hash_table = plan
                 .phys
@@ -1540,13 +1561,14 @@ impl Engine {
                 .transpose()?;
             let mut passed: i64 = 0;
             'outer: for left in &left_rows {
-                let inner_rows;
+                // The previous outer row's INL re-materialization is consumed (memory.md §5.3).
+                meter.release_rows_masked(&inl_rows, &plan.rel_masks[inner_ordinal]);
                 let hash_rows;
                 let current_right = if right_inl {
                     let outer_logical =
                         super::exec_emit::place_physical_relation_row(plan, outer_ordinal, left);
                     before = meter.accrued;
-                    inner_rows = self.materialize_rel(
+                    inl_rows = self.materialize_rel(
                         plan,
                         inner_ordinal,
                         params,
@@ -1557,7 +1579,7 @@ impl Engine {
                         meter,
                     )?;
                     *rel_work.entry(inner_ordinal).or_default() += meter.accrued - before;
-                    &inner_rows
+                    &inl_rows
                 } else if let Some(table) = &hash_table {
                     hash_rows = table
                         .probe(plan.phys.hash_join.as_ref().unwrap(), left, meter)?
@@ -1609,6 +1631,7 @@ impl Engine {
                         projected.push(p.eval(&combined, env, meter)?);
                     }
                     output_work += meter.accrued - before;
+                    meter.admit_row(&projected)?; // the buffered result collector (memory.md §5.1)
                     out.push(projected);
                     // Stop the whole nested loop once the LIMIT window is filled.
                     if let Some(l) = limit
@@ -1640,6 +1663,10 @@ impl Engine {
                 profile.record_parent("Filter".to_string(), through_join + filter_work);
             }
         }
+        // The join's relation buffers are consumed (memory.md §5.3).
+        meter.release_rows_masked(&inl_rows, &plan.rel_masks[inner_ordinal]);
+        meter.release_rows_masked(&left_rows, &plan.rel_masks[outer_ordinal]);
+        meter.release_rows_masked(&right_rows, &plan.rel_masks[inner_ordinal]);
         Ok(SelectResult {
             column_names: plan.column_names.clone(),
             column_types: plan.column_types.clone(),
@@ -1708,9 +1735,11 @@ impl Engine {
         let offset = plan.offset.unwrap_or(0);
         let mut passed = 0i64;
         let mut rows = Vec::new();
+        let mut inl_rows: Vec<Row> = Vec::new();
         if limit != Some(0) {
             'outer: for left in &running {
-                let inl_rows;
+                // The previous left row's INL re-materialization is consumed (memory.md §5.3).
+                meter.release_rows_masked(&inl_rows, &plan.rel_masks[inner]);
                 let hash_rows;
                 let candidates = if inner_inl {
                     let before = meter.accrued;
@@ -1770,6 +1799,7 @@ impl Engine {
                         projected.push(projection.eval(&combined, env, meter)?);
                     }
                     output_work += meter.accrued - before;
+                    meter.admit_row(&projected)?; // the buffered result collector (memory.md §5.1)
                     rows.push(projected);
                     if limit.is_some_and(|limit| rows.len() as i64 >= limit) {
                         break 'outer;
@@ -1797,6 +1827,12 @@ impl Engine {
             if plan.filter.is_some() {
                 profile.record_parent("Filter".to_string(), through_join + filter_work);
             }
+        }
+        // The join's input buffers are consumed (memory.md §5.3).
+        meter.release_rows_masked(&inl_rows, &plan.rel_masks[inner]);
+        meter.release_rows_masked(&running, &plan.memory_mask(meter));
+        for (ordinal, buffer) in materialized.iter().enumerate() {
+            meter.release_rows_masked(buffer, &plan.rel_masks[ordinal]);
         }
         Ok(SelectResult {
             column_names: plan.column_names.clone(),
@@ -1846,10 +1882,16 @@ impl Engine {
         };
         // A set-returning relation is generated, not scanned (functions.md §10): produce its rows,
         // charging generated_row per element (its args read `outer` — implicitly lateral, §44).
+        // Every relation row is a query-memory row buffer entry under the relation's touched mask
+        // (memory.md §3/§5.1). The two unbounded generators admit as they produce; the remaining
+        // producers are bounded by an existing input value or the catalog and admit their output.
+        let mask = &plan.rel_masks[ri];
         if let Some(srf) = &rel.srf {
-            return match srf.kind {
-                SrfKind::GenerateSeries => self.generate_series_rows(srf, &env, meter),
-                SrfKind::Unnest => self.unnest_rows(srf, &env, meter),
+            let rows = match srf.kind {
+                SrfKind::GenerateSeries => {
+                    return self.generate_series_rows(srf, &env, meter, mask);
+                }
+                SrfKind::Unnest => return self.unnest_rows(srf, &env, meter, mask),
                 SrfKind::JsonbArrayElements
                 | SrfKind::JsonbArrayElementsText
                 | SrfKind::JsonbObjectKeys
@@ -1864,7 +1906,11 @@ impl Engine {
                 SrfKind::JedIndexes => self.jed_indexes_rows(srf, meter),
                 SrfKind::JedConstraints => self.jed_constraints_rows(srf, meter),
                 SrfKind::JedStatistics => self.jed_statistics_rows(srf, meter),
-            };
+            }?;
+            for row in &rows {
+                meter.admit_row_masked(row, mask)?;
+            }
+            return Ok(rows);
         }
         // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
         // MATERIALIZED CTE reads its buffer (charging cte_scan_row, guarded so a runaway scan aborts
@@ -1877,6 +1923,10 @@ impl Engine {
                         meter.guard()?;
                         meter.charge(COSTS.cte_scan_row);
                     }
+                    // The reference copies the CTE buffer into its own relation rows.
+                    for row in buf {
+                        meter.admit_row_masked(row, mask)?;
+                    }
                     buf.to_vec()
                 }
                 CteMode::Inline => {
@@ -1887,6 +1937,9 @@ impl Engine {
                     };
                     let r = self.exec_query_plan(plan, outer, params, env.ctes)?;
                     meter.charge(r.cost);
+                    // The body's charged result becomes this relation's rows (memory.md §5.2),
+                    // re-measured under the relation's touched mask.
+                    rebase_rows_masked(meter, &r.rows, mask);
                     r.rows
                 }
             };
@@ -1898,6 +1951,7 @@ impl Engine {
         if let Some(dp) = &rel.derived {
             let r = self.exec_query_plan(dp, outer, params, env.ctes)?;
             meter.charge(r.cost);
+            rebase_rows_masked(meter, &r.rows, mask);
             return Ok(r.rows);
         }
         // A base table: scan in primary-key order via a ScanSource (the page_read block + per-row
@@ -2068,6 +2122,7 @@ impl Engine {
         let mut src = ScanSource::new(rows, node_count as i64);
         let mut table_rows: Vec<Row> = Vec::new();
         while let Some(row) = src.next(meter)? {
+            meter.admit_row_masked(&row, mask)?; // a materialized relation row (memory.md §5.1)
             table_rows.push(row);
         }
         Ok(table_rows)
@@ -2113,14 +2168,17 @@ impl Engine {
                         meter.guard()?;
                         meter.charge(COSTS.row_produced);
                     }
-                    out.push(match mode {
+                    let o = match mode {
                         EmitMode::Identity => row,
                         EmitMode::Project => plan
                             .projections
                             .iter()
                             .map(|p| p.eval(&row, &env, &mut meter))
                             .collect::<Result<Row>>()?,
-                    });
+                    };
+                    // Spool residency is operator state; the collected result is a row buffer.
+                    meter.admit_row(&o)?;
+                    out.push(o);
                 }
                 out
             }
@@ -2151,6 +2209,7 @@ impl Engine {
                     for p in &plan.projections {
                         o.push(p.eval(&row, &env, &mut meter)?);
                     }
+                    meter.admit_row(&o)?; // the buffered result collector (memory.md §5.1)
                     out.push(o);
                 }
                 out
@@ -2165,6 +2224,10 @@ impl Engine {
                 mode,
             } => match mode {
                 EmitMode::Identity => {
+                    // Rows outside the LIMIT/OFFSET window are discarded; the windowed rows transfer
+                    // into the result (memory.md §5.2/§5.3).
+                    meter.release_rows(&rows[..start]);
+                    meter.release_rows(&rows[end..]);
                     let mut out = Vec::with_capacity(end - start);
                     for row in rows.drain(start..end) {
                         meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
@@ -2189,8 +2252,17 @@ impl Engine {
                         for p in &plan.projections {
                             o.push(p.eval(row, &env, &mut meter)?);
                         }
+                        meter.admit_row(&o)?; // the buffered result collector (memory.md §5.1)
                         out.push(o);
                     }
+                    // The projecting drive consumed its source buffer: pre-projection rows under the
+                    // touched mask, or an aggregate's group rows (memory.md §5.3).
+                    let mask = if plan.is_agg {
+                        Vec::new()
+                    } else {
+                        plan.memory_mask(&meter)
+                    };
+                    meter.release_rows_masked(&rows, &mask);
                     out
                 }
             },
@@ -2217,6 +2289,7 @@ impl Engine {
                     for &c in &proj_cols {
                         o.push(cols[c][l].clone());
                     }
+                    meter.admit_row(&o)?; // the buffered result collector (memory.md §5.1)
                     out.push(o);
                 }
                 out
@@ -2431,7 +2504,13 @@ impl Engine {
         // the row path. Declines (None) to the row path below for an in-memory store or a spillable
         // touched column. Cost-neutral by construction (agg_columnar charges the identical scan block).
         let srows = match self.agg_columnar(plan, gset, env, meter)? {
-            Some(srows) => srows,
+            Some(srows) => {
+                // Dense lanes are operator state; the group rows are a row buffer (memory.md §5.4).
+                for r in &srows {
+                    meter.admit_row(r)?;
+                }
+                srows
+            }
             None => {
                 // Row path: scan the single base relation through the same path the eager executor
                 // uses, so the page_read / value_decompress / storage_row_read block is charged
@@ -2448,6 +2527,8 @@ impl Engine {
                     env.ctes,
                     meter,
                 )?;
+                // The same row-buffer accounting as the scalar aggregate branch (memory.md §5).
+                let mask = &plan.rel_masks[0];
                 let survivors: Vec<Row> = match &plan.filter {
                     None => rows,
                     Some(f) => {
@@ -2455,13 +2536,15 @@ impl Engine {
                         for r in rows {
                             if f.eval(&r, env, meter)?.is_true() {
                                 out.push(r);
+                            } else {
+                                meter.release_row_masked(&r, mask);
                             }
                         }
                         out
                     }
                 };
                 let src = LaneSrc::Rows(&survivors);
-                if gset.key_cols.is_empty() {
+                let srows = if gset.key_cols.is_empty() {
                     vec![fold_agg_whole(
                         &plan.agg_specs,
                         &src,
@@ -2476,7 +2559,12 @@ impl Engine {
                         survivors.len(),
                         meter,
                     )?
+                };
+                for r in &srows {
+                    meter.admit_row(r)?;
                 }
+                meter.release_rows_masked(&survivors, mask);
+                srows
             }
         };
 

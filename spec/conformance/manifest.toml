@@ -1505,3 +1505,7 @@ capabilities = [
 [[capability]]
 id = "resource.scalar_memory"
 description = "Finite per-statement cumulative scalar-allocation budget, checked before repeat/padding output and decimal-transcendental scratch allocation (54P04); memory.md. Host setting max_scalar_bytes and per-record corpus directive."
+
+[[capability]]
+id = "resource.query_memory"
+description = "Live per-statement logical query-memory budget over row buffers and engine result collectors (54P05); memory.md §2-§5. Host setting max_query_memory_bytes (unlimited by default) and the per-record `# max_query_memory_bytes:` corpus directive."

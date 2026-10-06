@@ -1,0 +1,337 @@
+# Live query-memory admission over row buffers and result collectors (memory.md §2-§5, Q1).
+# A jed-specific resource contract, not a PostgreSQL limit. Each budget is the exact peak of
+# logical row bytes (ROW 32 + Σ VALUE 32 + payload) the statement holds; the record below it at
+# budget - 1 fails 54P05. Pre-projection relation rows count only their touched columns' payloads
+# (memory.md §3), which keeps the thresholds identical in the memory and disk storage modes. The
+# blocking-operator shapes whose lane differs between those modes live in query_memory_eager.test.
+# requires: query.select, ddl.create_table, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, dml.returning, types.text, query.cross_join, query.comma_from, query.join_left, query.join_inner, query.lateral, query.set_returning, query.values, query.derived_table, query.union, query.intersect, query.cte, query.cte_recursive, query.window, query.window_ranking, query.subquery_scalar, query.subquery_exists, query.subquery_correlated, query.aggregates, query.order_by, query.limit, func.casing, resource.query_memory
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v text, pad text)
+
+statement ok
+INSERT INTO t VALUES (1, 'a', 'xxxxxxxxxx'), (2, 'bb', 'yyyyyyyyyy'), (3, NULL, 'zzzzzzzzzz')
+
+statement ok
+CREATE TABLE u (k i32 PRIMARY KEY, w text)
+
+statement ok
+INSERT INTO u VALUES (1, 'p'), (2, 'qq')
+
+statement ok
+CREATE TABLE n (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO n SELECT g FROM generate_series(1, 6) g
+
+statement ok
+CREATE TABLE sink (id i32 PRIMARY KEY, v text)
+
+# Cross join: relation a (id touched) 3×128 = 384, relation b (v touched) 129+130+128 = 387, and
+# nine combined rows of 224 + len(b.v) = 2025, all live when the join completes.
+# max_query_memory_bytes: 2796
+query IT rowsort
+SELECT a.id, b.v FROM t a, t b
+----
+1
+NULL
+1
+a
+1
+bb
+2
+NULL
+2
+a
+2
+bb
+3
+NULL
+3
+a
+3
+bb
+
+# max_query_memory_bytes: 2795
+statement error 54P05
+SELECT a.id, b.v FROM t a, t b
+
+# A primary-key bound shrinks relation a to one row: 128 + 387 + 3 combined rows (675).
+# max_query_memory_bytes: 1190
+query IT rowsort
+SELECT a.id, b.v FROM t a CROSS JOIN t b WHERE a.id = 1
+----
+1
+NULL
+1
+a
+1
+bb
+
+# max_query_memory_bytes: 1189
+statement error 54P05
+SELECT a.id, b.v FROM t a CROSS JOIN t b WHERE a.id = 1
+
+# A non-hashable join condition is a nested loop in both storage modes.
+# max_query_memory_bytes: 966
+query IT rowsort
+SELECT t.id, u.w FROM t JOIN u ON t.id = u.k + 1
+----
+2
+p
+3
+qq
+
+# max_query_memory_bytes: 965
+statement error 54P05
+SELECT t.id, u.w FROM t JOIN u ON t.id = u.k + 1
+
+# Index-nested-loop LEFT JOIN: each per-row probe of u is released after its left row.
+# max_query_memory_bytes: 963
+query IT rowsort
+SELECT t.id, u.w FROM t LEFT JOIN u ON t.id = u.k
+----
+1
+p
+2
+qq
+3
+NULL
+
+# max_query_memory_bytes: 962
+statement error 54P05
+SELECT t.id, u.w FROM t LEFT JOIN u ON t.id = u.k
+
+# LATERAL re-materialization per left row is released after that row.
+# max_query_memory_bytes: 704
+query II rowsort
+SELECT x.k, y.g FROM u x, LATERAL generate_series(1, x.k) y(g)
+----
+1
+1
+2
+1
+2
+2
+
+# max_query_memory_bytes: 703
+statement error 54P05
+SELECT x.k, y.g FROM u x, LATERAL generate_series(1, x.k) y(g)
+
+# A set-returning function admits each generated row: 3 × (32 + 32).
+# max_query_memory_bytes: 192
+query I nosort
+SELECT g FROM generate_series(1, 3) g
+----
+1
+2
+3
+
+# max_query_memory_bytes: 191
+statement error 54P05
+SELECT g FROM generate_series(1, 3) g
+
+# max_query_memory_bytes: 195
+query IT rowsort
+SELECT * FROM (VALUES (1, 'x'), (2, 'yy')) v(a, b)
+----
+1
+x
+2
+yy
+
+# max_query_memory_bytes: 194
+statement error 54P05
+SELECT * FROM (VALUES (1, 'x'), (2, 'yy')) v(a, b)
+
+# Set operations: the left arm's relation (387) and its output (195) are the peak.
+# max_query_memory_bytes: 582
+query T rowsort
+SELECT v FROM t UNION SELECT w FROM u
+----
+NULL
+a
+bb
+p
+qq
+
+# max_query_memory_bytes: 581
+statement error 54P05
+SELECT v FROM t UNION SELECT w FROM u
+
+# max_query_memory_bytes: 582
+query T rowsort
+SELECT v FROM t INTERSECT SELECT w FROM u
+----
+
+# max_query_memory_bytes: 581
+statement error 54P05
+SELECT v FROM t INTERSECT SELECT w FROM u
+
+# A materialized CTE: its buffer (291), the reference's copy, and the collected result.
+# max_query_memory_bytes: 873
+query IT rowsort
+WITH c AS MATERIALIZED (SELECT id, v FROM t) SELECT * FROM c
+----
+1
+a
+2
+bb
+3
+NULL
+
+# max_query_memory_bytes: 872
+statement error 54P05
+WITH c AS MATERIALIZED (SELECT id, v FROM t) SELECT * FROM c
+
+# max_query_memory_bytes: 960
+query I nosort
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n FROM r
+----
+1
+2
+3
+4
+5
+
+# max_query_memory_bytes: 959
+statement error 54P05
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n FROM r
+
+# A window result appended to each buffered row: 387 + 3 × 32.
+# max_query_memory_bytes: 483
+query ITI nosort
+SELECT id, v, row_number() OVER (ORDER BY id) FROM t
+----
+1
+a
+1
+2
+bb
+2
+3
+NULL
+3
+
+# max_query_memory_bytes: 482
+statement error 54P05
+SELECT id, v, row_number() OVER (ORDER BY id) FROM t
+
+# Correlated subqueries release their result once used: the outer primary-key-ordered scan
+# streams, so the peak is one inner execution, independent of the outer row count.
+# max_query_memory_bytes: 128
+query II nosort
+SELECT id, (SELECT count(*) FROM t i WHERE i.id <= o.id % 3) FROM n o ORDER BY id DESC
+----
+6
+0
+5
+2
+4
+1
+3
+0
+2
+2
+1
+1
+
+# max_query_memory_bytes: 127
+statement error 54P05
+SELECT id, (SELECT count(*) FROM t i WHERE i.id <= o.id % 3) FROM n o ORDER BY id DESC
+
+# max_query_memory_bytes: 384
+query IB nosort
+SELECT id, EXISTS (SELECT 1 FROM t i WHERE i.id = o.id % 4) FROM n o ORDER BY id DESC
+----
+6
+true
+5
+true
+4
+false
+3
+true
+2
+true
+1
+true
+
+# max_query_memory_bytes: 383
+statement error 54P05
+SELECT id, EXISTS (SELECT 1 FROM t i WHERE i.id = o.id % 4) FROM n o ORDER BY id DESC
+
+# A streaming lane hands each row to the host and holds no row buffer.
+# max_query_memory_bytes: 1
+query IT nosort
+SELECT id, v FROM t ORDER BY id DESC LIMIT 2
+----
+3
+NULL
+2
+bb
+
+# INSERT ... SELECT: the source relation (387) and its projected rows (291). A failed
+# statement writes nothing.
+# max_query_memory_bytes: 677
+statement error 54P05
+INSERT INTO sink SELECT id, v FROM t
+
+# max_query_memory_bytes: 678
+statement ok
+INSERT INTO sink SELECT id, v FROM t
+
+query I nosort
+SELECT count(*) FROM sink
+----
+3
+
+# RETURNING rows are a buffered result.
+# max_query_memory_bytes: 196
+statement error 54P05
+INSERT INTO sink VALUES (10, 'abc'), (11, 'de') RETURNING id, v
+
+# max_query_memory_bytes: 197
+query IT nosort
+INSERT INTO sink VALUES (10, 'abc'), (11, 'de') RETURNING id, v
+----
+10
+abc
+11
+de
+
+# max_query_memory_bytes: 196
+statement error 54P05
+UPDATE sink SET v = upper(v) WHERE id >= 10 RETURNING id, v
+
+# max_query_memory_bytes: 197
+query IT rowsort
+UPDATE sink SET v = upper(v) WHERE id >= 10 RETURNING id, v
+----
+10
+ABC
+11
+DE
+
+# max_query_memory_bytes: 97
+statement error 54P05
+DELETE FROM sink WHERE id = 2 RETURNING *
+
+# max_query_memory_bytes: 98
+query IT nosort
+DELETE FROM sink WHERE id = 2 RETURNING *
+----
+2
+bb
+
+query IT rowsort
+SELECT id, v FROM sink
+----
+1
+a
+10
+ABC
+11
+DE
+3
+NULL

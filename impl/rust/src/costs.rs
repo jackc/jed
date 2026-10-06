@@ -7,6 +7,12 @@
 
 pub const DEFAULT_SCALAR_BYTES: i64 = 67108864;
 
+/// Logical query-memory size schedule (spec/design/memory.md §3).
+pub const MEMORY_ROW: i64 = 32;
+pub const MEMORY_VALUE: i64 = 32;
+pub const MEMORY_ARRAY_DIM: i64 = 16;
+pub const MEMORY_DECIMAL_GROUP: i64 = 4;
+
 /// The deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
 pub struct CostSchedule {
     pub storage_row_read: i64,

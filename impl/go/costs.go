@@ -9,6 +9,14 @@ package jed
 
 const defaultScalarBytes int64 = 67108864
 
+// Logical query-memory size schedule (spec/design/memory.md §3).
+const (
+	memoryRow          int64 = 32
+	memoryValue        int64 = 32
+	memoryArrayDim     int64 = 16
+	memoryDecimalGroup int64 = 4
+)
+
 // CostSchedule holds the deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
 type costSchedule struct {
 	StorageRowRead      int64

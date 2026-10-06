@@ -40,6 +40,79 @@ pub struct Lifetime {
     pub limit: i64,
 }
 
+/// Releases that exceeded their account's balance — always an engine accounting bug. Read by the
+/// conformance harness's whole-corpus accounting mode (`rake conformance:query_memory`).
+pub static QUERY_MEMORY_UNDERFLOWS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A statement's live query-memory account (spec/design/memory.md §2): the shared running total and
+/// the budget (`limit <= 0` ⇒ unlimited). Cloned into every meter of the statement and into the
+/// cursor that outlives it, so all of them reserve against one total.
+#[derive(Clone, Default)]
+pub(crate) struct QueryAccount {
+    pub(crate) used: Rc<Cell<i64>>,
+    pub(crate) limit: i64,
+}
+
+impl QueryAccount {
+    #[inline]
+    pub(crate) fn active(&self) -> bool {
+        self.limit > 0
+    }
+
+    /// Reserve `bytes`, or fail `54P05` when `used + bytes > limit` (equality allowed).
+    pub(crate) fn reserve(&self, bytes: i64) -> Result<()> {
+        if self.limit <= 0 {
+            return Ok(());
+        }
+        if bytes > self.limit - self.used.get() {
+            return Err(EngineError::new(
+                SqlState::QueryMemoryLimitExceeded,
+                format!("query memory exceeded the limit of {} bytes", self.limit),
+            ));
+        }
+        self.used.set(self.used.get() + bytes);
+        Ok(())
+    }
+
+    /// Return `bytes`; never errors, never below zero.
+    pub(crate) fn release(&self, bytes: i64) {
+        if self.limit <= 0 {
+            return;
+        }
+        let used = self.used.get();
+        if bytes > used {
+            // An accounting bug (a release without its reservation). Clamp, and count it so the
+            // conformance harness's accounting mode can fail the record that caused it.
+            QUERY_MEMORY_UNDERFLOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.used.set((used - bytes).max(0));
+    }
+
+    /// Admit a projected row (memory.md §5.1).
+    pub(crate) fn admit_row(&self, row: &[crate::value::Value]) -> Result<()> {
+        if !self.active() {
+            return Ok(());
+        }
+        self.reserve(crate::memsize::row_bytes(row))
+    }
+
+    /// Release a projected row leaving engine ownership (memory.md §5.3).
+    pub(crate) fn release_row(&self, row: &[crate::value::Value]) {
+        if self.active() {
+            self.release(crate::memsize::row_bytes(row));
+        }
+    }
+
+    /// The bytes of a buffer of projected rows, or `0` when unlimited (nothing is measured).
+    pub(crate) fn measure_rows(&self, rows: &[Vec<crate::value::Value>]) -> i64 {
+        if !self.active() {
+            return 0;
+        }
+        rows.iter().map(|r| crate::memsize::row_bytes(r)).sum()
+    }
+}
+
 /// Accrues deterministic execution cost and enforces an optional per-statement ceiling **and** an
 /// optional per-session budget (CLAUDE.md §13; spec/design/session.md §5.4). Threaded by `&mut`
 /// through the executor and the recursive expression evaluator; the accrued (per-statement) total is
@@ -49,6 +122,9 @@ pub struct Meter {
     ceiling_hit: u8,
     pub(crate) scalar_bytes: Rc<Cell<i64>>,
     pub(crate) scalar_limit: i64,
+    /// The statement's live query-memory account (spec/design/memory.md §2), shared by every meter
+    /// of the statement like `scalar_bytes`; an unlimited account never computes a size.
+    pub(crate) query: QueryAccount,
     /// Total cost accrued so far **for this statement** (CLAUDE.md §13) — the figure reported on
     /// `Outcome` and asserted by the `# cost:` directive. `i64` mirrors the engine's native integer;
     /// the per-statement ceiling compares against this counter.
@@ -90,6 +166,85 @@ impl Meter {
         Ok(())
     }
 
+    /// Whether the statement has a finite query-memory budget (spec/design/memory.md §2). Every
+    /// admission site tests this first, so the unlimited default computes no sizes.
+    #[inline]
+    pub fn query_memory_active(&self) -> bool {
+        self.query.active()
+    }
+
+    /// Reserve `bytes` of live query memory, or fail `54P05` (equality allowed).
+    pub fn reserve_query(&mut self, bytes: i64) -> Result<()> {
+        self.query.reserve(bytes)
+    }
+
+    /// Return `bytes` of live query memory; never errors, never below zero.
+    pub fn release_query(&mut self, bytes: i64) {
+        self.query.release(bytes);
+    }
+
+    /// Admit a projected row appended to a row buffer (memory.md §5.1).
+    #[inline]
+    pub fn admit_row(&mut self, row: &[crate::value::Value]) -> Result<()> {
+        if !self.query_memory_active() {
+            return Ok(());
+        }
+        self.reserve_query(crate::memsize::row_bytes(row))
+    }
+
+    /// Admit a pre-projection row under the plan's touched mask (memory.md §3).
+    #[inline]
+    pub fn admit_row_masked(&mut self, row: &[crate::value::Value], mask: &[bool]) -> Result<()> {
+        if !self.query_memory_active() {
+            return Ok(());
+        }
+        self.reserve_query(crate::memsize::row_bytes_masked(row, mask))
+    }
+
+    /// Admit a value appended to a buffered row (memory.md §5.1).
+    #[inline]
+    pub fn admit_value(&mut self, v: &crate::value::Value) -> Result<()> {
+        if !self.query_memory_active() {
+            return Ok(());
+        }
+        self.reserve_query(crate::memsize::value_bytes(v))
+    }
+
+    /// Release a discarded projected row.
+    #[inline]
+    pub fn release_row(&mut self, row: &[crate::value::Value]) {
+        if self.query_memory_active() {
+            self.release_query(crate::memsize::row_bytes(row));
+        }
+    }
+
+    /// Release a discarded pre-projection row under the plan's touched mask.
+    #[inline]
+    pub fn release_row_masked(&mut self, row: &[crate::value::Value], mask: &[bool]) {
+        if self.query_memory_active() {
+            self.release_query(crate::memsize::row_bytes_masked(row, mask));
+        }
+    }
+
+    /// Release a whole discarded buffer of projected rows.
+    pub fn release_rows(&mut self, rows: &[Vec<crate::value::Value>]) {
+        if self.query_memory_active() {
+            let n = rows.iter().map(|r| crate::memsize::row_bytes(r)).sum();
+            self.release_query(n);
+        }
+    }
+
+    /// Release a whole discarded buffer of pre-projection rows under the touched mask.
+    pub fn release_rows_masked(&mut self, rows: &[Vec<crate::value::Value>], mask: &[bool]) {
+        if self.query_memory_active() {
+            let n = rows
+                .iter()
+                .map(|r| crate::memsize::row_bytes_masked(r, mask))
+                .sum();
+            self.release_query(n);
+        }
+    }
+
     /// A fresh meter with zero accrued cost, no ceiling, and no session context.
     pub fn new() -> Self {
         Meter::default()
@@ -103,6 +258,7 @@ impl Meter {
             ceiling_hit: 0,
             scalar_bytes: Rc::new(Cell::new(0)),
             scalar_limit: crate::costs::DEFAULT_SCALAR_BYTES,
+            query: QueryAccount::default(),
             accrued: 0,
             limit,
             lifetime: None,
@@ -121,6 +277,7 @@ impl Meter {
             ceiling_hit: 0,
             scalar_bytes: Rc::new(Cell::new(0)),
             scalar_limit: crate::costs::DEFAULT_SCALAR_BYTES,
+            query: QueryAccount::default(),
             accrued: 0,
             limit,
             lifetime: Some(lifetime),

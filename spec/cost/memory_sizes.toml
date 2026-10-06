@@ -1,0 +1,211 @@
+# Query-memory logical size vectors — CANONICAL DATA (spec/design/memory.md §3).
+#
+# Each core runs `setup` (optional, one statement per array element) and then `sql` on a fresh
+# in-memory database. `sql` returns exactly one row. With `measure = "value"` the row has exactly
+# one column and the vector asserts value_bytes of that value; with `measure = "row"` it asserts
+# row_bytes of the whole row (all slots touched — it is a projected row). The schedule constants
+# live in schedule.toml [memory]: ROW 32, VALUE 32, ARRAY_DIM 16, DECIMAL_GROUP 4.
+#
+# Test-time only (CLAUDE.md §5): every core's unit test reads this file; no core parses it at
+# runtime.
+
+schema_version = 1
+
+# --- fixed-width scalars and NULL: a bare VALUE -------------------------------
+[[vector]]
+sql = "SELECT NULL::i32"
+measure = "value"
+bytes = 32
+
+[[vector]]
+sql = "SELECT 7::i16"
+measure = "value"
+bytes = 32
+
+[[vector]]
+sql = "SELECT 9223372036854775807::i64"
+measure = "value"
+bytes = 32
+
+[[vector]]
+sql = "SELECT true"
+measure = "value"
+bytes = 32
+
+[[vector]]
+sql = "SELECT 1.5::f64"
+measure = "value"
+bytes = 32
+
+[[vector]]
+sql = "SELECT '2024-02-29'::date"
+measure = "value"
+bytes = 32
+
+[[vector]]
+sql = "SELECT '2024-02-29 12:34:56'::timestamp"
+measure = "value"
+bytes = 32
+
+[[vector]]
+sql = "SELECT '2024-02-29 12:34:56+00'::timestamptz"
+measure = "value"
+bytes = 32
+
+[[vector]]
+sql = "SELECT '1 year 2 days 3 seconds'::interval"
+measure = "value"
+bytes = 32
+
+[[vector]]
+sql = "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid"
+measure = "value"
+bytes = 32
+
+# --- text-like: UTF-8 bytes ----------------------------------------------------
+[[vector]]
+sql = "SELECT ''::text"
+measure = "value"
+bytes = 32
+
+[[vector]]
+sql = "SELECT 'abc'::text"
+measure = "value"
+bytes = 35
+
+[[vector]]
+sql = "SELECT 'héllo'::text"
+measure = "value"
+bytes = 38
+
+[[vector]]
+sql = "SELECT '🙂x'::text"
+measure = "value"
+bytes = 37
+
+[[vector]]
+sql = "SELECT '\\x00ff10'::bytea"
+measure = "value"
+bytes = 35
+
+# json is verbatim text, including its whitespace.
+[[vector]]
+sql = "SELECT '{\"a\":  1}'::json"
+measure = "value"
+bytes = 41
+
+# jsonpath measures its canonical normalized text: `$."a"` (5 bytes).
+[[vector]]
+sql = "SELECT '$.a'::jsonpath"
+measure = "value"
+bytes = 37
+
+# --- decimal: DECIMAL_GROUP per base-10^4 digit group of the canonical codec ----
+# The codec (format.md) groups the unscaled magnitude's decimal digits by four from the right:
+# ceil(digits / 4) groups, none for zero. 12345.678 → 12345678 → 2 groups.
+[[vector]]
+sql = "SELECT 0::decimal"
+measure = "value"
+bytes = 32
+
+[[vector]]
+sql = "SELECT 1::decimal"
+measure = "value"
+bytes = 36
+
+[[vector]]
+sql = "SELECT 12345.678::decimal"
+measure = "value"
+bytes = 40
+
+[[vector]]
+sql = "SELECT 123456789.0::decimal"
+measure = "value"
+bytes = 44
+
+[[vector]]
+sql = "SELECT -0.00001::decimal"
+measure = "value"
+bytes = 36
+
+# --- jsonb: one VALUE per node + key bytes + string bytes + number groups ------
+[[vector]]
+sql = "SELECT 'null'::jsonb"
+measure = "value"
+bytes = 32
+
+[[vector]]
+sql = "SELECT '{\"a\": 1}'::jsonb"
+measure = "value"
+bytes = 69
+
+[[vector]]
+sql = "SELECT '[1, \"xy\", null, true]'::jsonb"
+measure = "value"
+bytes = 166
+
+# --- arrays: ARRAY_DIM per dimension + each element ----------------------------
+[[vector]]
+sql = "SELECT '{}'::i32[]"
+measure = "value"
+bytes = 32
+
+[[vector]]
+sql = "SELECT ARRAY[1, 2, 3]"
+measure = "value"
+bytes = 144
+
+[[vector]]
+sql = "SELECT '[0:1]={5,6}'::i64[]"
+measure = "value"
+bytes = 112
+
+[[vector]]
+sql = "SELECT ARRAY['a', NULL]"
+measure = "value"
+bytes = 113
+
+# --- ranges: each present bound ------------------------------------------------
+[[vector]]
+sql = "SELECT 'empty'::i32range"
+measure = "value"
+bytes = 32
+
+[[vector]]
+sql = "SELECT '[1,5)'::i32range"
+measure = "value"
+bytes = 96
+
+[[vector]]
+sql = "SELECT '[1,)'::i32range"
+measure = "value"
+bytes = 64
+
+[[vector]]
+sql = "SELECT '[1.5,2)'::numrange"
+measure = "value"
+bytes = 104
+
+# --- composites: each field ----------------------------------------------------
+[[vector]]
+setup = ["CREATE TYPE mem_pt AS (x i32, label text)"]
+sql = "SELECT '(1,ab)'::mem_pt"
+measure = "value"
+bytes = 98
+
+[[vector]]
+setup = ["CREATE TYPE mem_pt AS (x i32, label text)"]
+sql = "SELECT '(,)'::mem_pt"
+measure = "value"
+bytes = 96
+
+# --- rows: ROW + each slot -----------------------------------------------------
+[[vector]]
+sql = "SELECT 1, 'ab', NULL"
+measure = "row"
+bytes = 130
+
+[[vector]]
+sql = "SELECT ARRAY['é'], '{\"k\": \"v\"}'::jsonb"
+measure = "row"
+bytes = 180

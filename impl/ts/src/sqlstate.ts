@@ -87,6 +87,7 @@ export type SqlState =
   | "session_cost_limit_exceeded" // 54P02 — session exceeded the lifetime cost limit of {limit} (accrued {cost})
   | "temp_storage_limit_exceeded" // 54P03 — temporary table storage exceeded the limit of {limit} bytes
   | "scalar_memory_limit_exceeded" // 54P04 — scalar allocations exceeded the limit of {limit} bytes
+  | "query_memory_limit_exceeded" // 54P05 — query memory exceeded the limit of {limit} bytes
   | "object_not_in_prerequisite_state" // 55000 — {detail}
   | "object_in_use" // 55006 — {detail}
   | "lock_not_available" // 55P03 — could not obtain the database writer lock
@@ -175,6 +176,7 @@ const CODES: Record<SqlState, string> = {
   session_cost_limit_exceeded: "54P02",
   temp_storage_limit_exceeded: "54P03",
   scalar_memory_limit_exceeded: "54P04",
+  query_memory_limit_exceeded: "54P05",
   object_not_in_prerequisite_state: "55000",
   object_in_use: "55006",
   lock_not_available: "55P03",
@@ -279,6 +281,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "54P02", name: "session_cost_limit_exceeded", class: "program limit exceeded" },
   { code: "54P03", name: "temp_storage_limit_exceeded", class: "program limit exceeded" },
   { code: "54P04", name: "scalar_memory_limit_exceeded", class: "program limit exceeded" },
+  { code: "54P05", name: "query_memory_limit_exceeded", class: "program limit exceeded" },
   { code: "55000", name: "object_not_in_prerequisite_state", class: "object not in prerequisite state" },
   { code: "55006", name: "object_in_use", class: "object not in prerequisite state" },
   { code: "55P03", name: "lock_not_available", class: "object not in prerequisite state" },

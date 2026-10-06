@@ -2094,11 +2094,11 @@ impl Session {
         // The dispatch fall-through handles transaction control (a nested BEGIN's 25001 must NOT
         // poison) and self-poisons on a regular statement error, so its nuanced poisoning is left
         // intact — only the lazy-lane reads above, which bypass it, are poisoned here.
-        Ok(Rows::from_outcome(self.dispatch(
-            ast.clone(),
-            params,
-            insert_cache,
-        )?))
+        let outcome = self.dispatch(ast.clone(), params, insert_cache)?;
+        Ok(Rows::from_outcome(
+            outcome,
+            self.engine.session.query_account(),
+        ))
     }
 
     fn refresh_initial_read(&mut self) -> Result<()> {
@@ -2620,6 +2620,14 @@ impl Session {
     }
     pub fn max_scalar_bytes(&self) -> i64 {
         self.engine.session.max_scalar_bytes()
+    }
+    /// Live query-memory budget per statement (spec/design/memory.md §2); non-positive restores the
+    /// default, unlimited. Over-budget fails `54P05`.
+    pub fn set_max_query_memory_bytes(&mut self, bytes: i64) {
+        self.engine.session.set_max_query_memory_bytes(bytes);
+    }
+    pub fn max_query_memory_bytes(&self) -> i64 {
+        self.engine.session.max_query_memory_bytes()
     }
     pub fn set_work_mem(&mut self, bytes: usize) {
         self.engine.session.set_work_mem(bytes);

@@ -2448,6 +2448,7 @@ impl Engine {
             for node in nodes {
                 vals.push(node.eval(&combined, &env, meter)?);
             }
+            meter.admit_row(&vals)?; // a RETURNING result row (memory.md §5.1)
             out.push(vals);
         }
         Ok(out)

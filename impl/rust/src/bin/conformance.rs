@@ -613,6 +613,16 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
     let mut pending_allow_ddl: Option<bool> = None;
     let mut pending_allow_temp_ddl: Option<bool> = None;
     let mut pending_scalar_bytes: Option<i64> = None;
+    let mut pending_query_memory: Option<i64> = None;
+    // The whole-corpus accounting mode (`rake conformance:query_memory`): a budget applied to every
+    // record without its own directive, so every query shape exercises the accounting.
+    let query_memory_default: i64 = std::env::var("JED_CONFORMANCE_QUERY_MEMORY")
+        .ok()
+        .map(|v| {
+            v.parse()
+                .expect("JED_CONFORMANCE_QUERY_MEMORY must be integer bytes")
+        })
+        .unwrap_or(0);
     let mut pending_temp_buffers: Option<usize> = None;
     let mut pending_vars: Vec<(String, String)> = Vec::new();
     let mut pending_timezone: Option<String> = None;
@@ -692,6 +702,12 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                 .and_then(|s| s.trim().parse::<i64>().ok())
             {
                 pending_scalar_bytes = Some(n);
+            } else if let Some(n) = rest
+                .trim_start()
+                .strip_prefix("max_query_memory_bytes:")
+                .and_then(|s| s.trim().parse::<i64>().ok())
+            {
+                pending_query_memory = Some(n);
             } else if let Some(n) = parse_temp_buffers_directive(rest) {
                 pending_temp_buffers = Some(n);
             } else if let Some(vars) = parse_set_directive(rest) {
@@ -790,6 +806,13 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
         // Apply the per-record temp-storage budget (temp-tables.md §7); absent ⇒ unlimited (`0`), so a
         // `# temp_buffers:` directive never leaks past its record. Mirrors `# max_cost:`.
         sess.set_max_scalar_bytes(pending_scalar_bytes.take().unwrap_or(0));
+        // `# max_query_memory_bytes:` (memory.md §2) decorates only its record; absent ⇒ unlimited,
+        // or the whole-corpus accounting budget of `JED_CONFORMANCE_QUERY_MEMORY`.
+        sess.set_max_query_memory_bytes(
+            pending_query_memory.take().unwrap_or(query_memory_default),
+        );
+        let underflows_before =
+            jed::tooling::QUERY_MEMORY_UNDERFLOWS.load(std::sync::atomic::Ordering::Relaxed);
         sess.set_temp_buffers(pending_temp_buffers.take().unwrap_or(0));
         // Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
         // pending `# set:` pair, so a directive decorates only its record and never leaks forward.
@@ -879,6 +902,13 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                 assert_types(expected_types.as_deref(), outcome.column_types(), &sql)?;
             }
             other => return Err(format!("unknown record kind '{other}'")),
+        }
+        if jed::tooling::QUERY_MEMORY_UNDERFLOWS.load(std::sync::atomic::Ordering::Relaxed)
+            != underflows_before
+        {
+            return Err(format!(
+                "query-memory accounting released more than it reserved (memory.md §5)\n  record: {trimmed}"
+            ));
         }
     }
     Ok(())

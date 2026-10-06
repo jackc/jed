@@ -2670,7 +2670,10 @@ impl RExpr {
                     .exec
                     .exec_hidden_query_plan(plan, &child, env.params, env.ctes)?;
                 m.charge(r.cost);
-                match kind {
+                // The charged result is consumed by this expression and released once it has been
+                // used (memory.md §5.3).
+                let held = m.query.measure_rows(&r.rows);
+                let out = match kind {
                     SubqueryKind::Scalar => {
                         if r.rows.len() > 1 {
                             return Err(EngineError::new(
@@ -2723,7 +2726,9 @@ impl RExpr {
                         };
                         quantified_membership(*op, *all, &lv, &Value::Array(arr), m)
                     }
-                }
+                };
+                m.release_query(held);
+                out
             }
             // A folded uncorrelated `IN (subquery)` — the list is constant; test membership per row.
             RExpr::InValues { lhs, list, negated } => {

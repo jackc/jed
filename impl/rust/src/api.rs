@@ -99,7 +99,7 @@ impl Rows {
     /// drains-and-discards such a `Rows` and returns the tag, so `query` on a statement that produces
     /// no rows is valid, not a `42601` (the effect-then-error bug this removes — a write reached here
     /// after `dispatch` already committed it; spec/design/api.md §11).
-    pub(crate) fn from_outcome(outcome: Outcome) -> Rows {
+    pub(crate) fn from_outcome(outcome: Outcome, account: crate::cost::QueryAccount) -> Rows {
         match outcome {
             Outcome::Query {
                 column_names,
@@ -109,7 +109,7 @@ impl Rows {
             } => Rows {
                 column_names: std::rc::Rc::from(column_names),
                 column_types: std::rc::Rc::from(column_types),
-                cursor: Cursor::buffered(rows, cost),
+                cursor: Cursor::buffered(rows, cost, account),
                 rows_affected: None,
                 error: None,
                 on_error: None,
@@ -121,7 +121,7 @@ impl Rows {
             } => Rows {
                 column_names: std::rc::Rc::from(Vec::new()),
                 column_types: std::rc::Rc::from(Vec::new()),
-                cursor: Cursor::buffered(Vec::new(), cost),
+                cursor: Cursor::buffered(Vec::new(), cost, account),
                 rows_affected,
                 error: None,
                 on_error: None,
@@ -195,6 +195,19 @@ impl Rows {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// Admit a row an engine-owned collector appends while draining this cursor (spec/design/memory.md
+    /// §5.1), against the statement's query-memory budget. A `54P05` here is a statement failure: it
+    /// fires the block-poison hook like a mid-drain error.
+    pub(crate) fn admit_collected(&mut self, row: &[Value]) -> Result<()> {
+        let r = self.cursor.query_account().admit_row(row);
+        if r.is_err()
+            && let Some(hook) = self.on_error.take()
+        {
+            hook();
+        }
+        r
     }
 
     /// Release the read snapshot the cursor pins (spec/design/streaming.md §5): drops the watermark
@@ -496,11 +509,8 @@ impl Engine {
         // The fall-through handles transaction control (a nested BEGIN's 25001 must NOT poison) and
         // self-poisons on a regular statement error (`execute_stmt_params`), so its nuanced poisoning
         // is left intact — only the lazy-lane reads above, which bypass it, are poisoned here.
-        Ok(Rows::from_outcome(self.execute_stmt_params_cached(
-            ast.clone(),
-            params,
-            insert_cache,
-        )?))
+        let outcome = self.execute_stmt_params_cached(ast.clone(), params, insert_cache)?;
+        Ok(Rows::from_outcome(outcome, self.session.query_account()))
     }
 
     /// Run a multi-statement `sql` **script** on the default session (spec/design/session.md §4.2):

@@ -7,6 +7,13 @@
 
 export const DEFAULT_SCALAR_BYTES = 67108864n;
 
+// Logical query-memory size schedule (spec/design/memory.md §3). Plain numbers: the
+// query-memory account is a live byte counter well inside 2^53.
+export const MEMORY_ROW = 32;
+export const MEMORY_VALUE = 32;
+export const MEMORY_ARRAY_DIM = 16;
+export const MEMORY_DECIMAL_GROUP = 4;
+
 // The deterministic cost-unit weights, mirroring spec/cost/schedule.toml. Weights are
 // bigint for i64 parity with the Rust/Go cores (a number is f64 — CLAUDE.md §8).
 export interface CostSchedule {

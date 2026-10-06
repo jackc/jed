@@ -19,6 +19,15 @@ schema_version = 1
 [limits]
 default_scalar_bytes = 67108864
 
+# Logical query-memory size schedule (../design/memory.md §3). Representation-independent:
+# row_bytes = row + Σ value_bytes; value_bytes = value + payload. Cross-checked by the shared
+# vectors in memory_sizes.toml. The max_query_memory_bytes budget itself defaults to unlimited.
+[memory]
+row = 32
+value = 32
+array_dim = 16
+decimal_group = 4
+
 # field doc -------------------------------------------------------------------
 # id      stable snake_case unit name; the codegen handle (a named field on the
 #         per-language CostSchedule).

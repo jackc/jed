@@ -4,6 +4,14 @@
 
 use super::*;
 
+/// A `WITH`'s CTE buffers die with the statement part that materialized them (memory.md §5.3) —
+/// essential for a nested `WITH` re-run per outer row.
+fn release_cte_buffers(acct: &crate::cost::QueryAccount, buffers: &[Vec<Row>]) {
+    for buf in buffers {
+        acct.release(acct.measure_rows(buf));
+    }
+}
+
 impl Engine {
     /// Run a SELECT as a top-level statement: `run_select`, then wrap as a query Outcome
     /// (the projection types are internal — only `INSERT ... SELECT` consumes them).
@@ -275,6 +283,7 @@ impl Engine {
         let mut subquery_cost: i64 = 0;
         self.fold_uncorrelated_in_plan(&mut plan, &bound, ctx, &mut subquery_cost)?;
         let mut r = self.exec_query_plan(&plan, &[], &bound, ctx)?;
+        release_cte_buffers(&self.session.query_account(), &buffers);
         r.cost += subquery_cost + total_cost;
         if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
             profile.record_parent("WITH".to_string(), r.cost);
@@ -375,6 +384,10 @@ impl Engine {
         };
         let anchor_types = anchor_plan.column_types().to_vec();
         let rhs_types = rt.plan.column_types().to_vec();
+        // Query-memory row accounting (memory.md §5): each term's result is charged by its own
+        // execution; a kept row's result copy is admitted, a duplicate is released, and a consumed
+        // working table is released when the next iteration replaces it.
+        let acct = self.session.query_account();
 
         // Evaluate the anchor: its rows seed both the result and the first working table.
         let ar = {
@@ -391,19 +404,26 @@ impl Engine {
         let mut working: Vec<Row> = Vec::new();
         for row in ar.rows {
             if rt.union_all || seen.insert(row.clone()) {
+                acct.admit_row(&row)?;
                 result.push(row.clone());
                 working.push(row);
+            } else {
+                acct.release_row(&row);
             }
         }
 
         // The recursive term scans the WORKING table through the CTE's own buffer slot (`ci`); the
         // earlier CTEs keep their full buffers. Build the buffer vec once and swap slot `ci` per
-        // iteration.
+        // iteration. The copy of the earlier buffers is itself a row buffer.
         let mut rhs_buffers: Vec<Vec<Row>> = prior_buffers.to_vec();
+        for buf in prior_buffers {
+            acct.reserve(acct.measure_rows(buf))?;
+        }
         rhs_buffers.push(Vec::new()); // slot `ci`
         debug_assert_eq!(rhs_buffers.len(), ci + 1);
 
         while !working.is_empty() {
+            acct.release(acct.measure_rows(&rhs_buffers[ci]));
             rhs_buffers[ci] = std::mem::take(&mut working);
             let rr = {
                 let view =
@@ -414,13 +434,21 @@ impl Engine {
             *total_cost += rr.cost;
             guard(*total_cost)?;
             let mut new_rows = rr.rows;
+            let before = acct.measure_rows(&new_rows);
             coerce_setop_rows(&mut new_rows, &rhs_types, &anchor_types);
+            acct.reserve(acct.measure_rows(&new_rows) - before)?;
             for row in new_rows {
                 if rt.union_all || seen.insert(row.clone()) {
+                    acct.admit_row(&row)?;
                     result.push(row.clone());
                     working.push(row);
+                } else {
+                    acct.release_row(&row);
                 }
             }
+        }
+        for buf in &rhs_buffers {
+            acct.release(acct.measure_rows(buf));
         }
         Ok(result)
     }
@@ -584,6 +612,7 @@ impl Engine {
         {
             profile.record(node, outcome.cost());
         }
+        release_cte_buffers(&self.session.query_account(), &buffers);
         let outcome = add_outcome_cost(outcome, total_cost);
         if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
             profile.record_parent("WITH".to_string(), outcome.cost());
@@ -758,6 +787,7 @@ impl Engine {
         let view = CteCtxView::extend(inherited, &wp.modes, &wp.bindings, &buffers);
         let ctx = view.ctx();
         let mut r = self.exec_query_plan(&wp.body, outer, params, ctx)?;
+        release_cte_buffers(&self.session.query_account(), &buffers);
         r.cost += total_cost;
         if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
             profile.record_parent("WITH".to_string(), r.cost);
@@ -948,6 +978,7 @@ impl Engine {
                 };
                 out.push(v);
             }
+            meter.admit_row(&out)?; // a materialized relation row (memory.md §5.1)
             rows.push(out);
         }
         if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
@@ -979,10 +1010,17 @@ impl Engine {
         // equal). Integer width promotion needs none (every integer is i64).
         let mut left_rows = left.rows;
         let mut right_rows = right.rows;
+        // Both arms arrive charged (memory.md §5.2). Coercion growth is reserved; rows the combine
+        // or the LIMIT/OFFSET window drops are released (§5.3).
+        let acct = self.session.query_account();
+        let before = acct.measure_rows(&left_rows) + acct.measure_rows(&right_rows);
         coerce_setop_rows(&mut left_rows, &left.column_types, &plan.column_types);
         coerce_setop_rows(&mut right_rows, &right.column_types, &plan.column_types);
+        let coerced = acct.measure_rows(&left_rows) + acct.measure_rows(&right_rows);
+        acct.reserve(coerced - before)?;
 
         let mut rows = combine_setop(plan.op, plan.all, left_rows, right_rows);
+        acct.release(coerced - acct.measure_rows(&rows));
         let cost = left.cost + right.cost;
         let root_node = if plan.limit.is_some() || plan.offset.is_some() {
             "Limit"
@@ -1014,6 +1052,7 @@ impl Engine {
             Some(lim) if lim < (len - start) as i64 => start + lim as usize,
             _ => len,
         };
+        acct.release(acct.measure_rows(&rows[..start]) + acct.measure_rows(&rows[end..]));
         let rows = rows[start..end].to_vec();
         if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
             profile.record_parent(root_node.to_string(), cost);

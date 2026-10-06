@@ -99,7 +99,7 @@ impl Engine {
         let mut r = ExplainRender::with_estimates(estimates);
         r.verbose = verbose;
         self.render_explain(&mut r, &inner, 0)?;
-        Ok(self.explain_outcome(r.rows, analyze, costs, lane, &inner))
+        self.explain_outcome(r.rows, analyze, costs, lane, &inner)
     }
 
     /// Render the plan AND run the inner statement, reporting the inner's ACTUAL accrued cost + row
@@ -139,6 +139,11 @@ impl Engine {
             Outcome::Statement { rows_affected, .. } => rows_affected.unwrap_or(0),
             Outcome::Query { rows, .. } => rows.len() as i64,
         };
+        // The analyzed statement's result is counted, then discarded (memory.md §5.3).
+        if let Outcome::Query { rows, .. } = &inner_out {
+            let acct = self.session.query_account();
+            acct.release(acct.measure_rows(rows));
+        }
         let inner_cost = inner_out.cost();
         body.actual = explain_actual_costs(&estimates, inner_cost);
         profile.apply(&body.rows, &body.frame_depths, &mut body.actual);
@@ -173,7 +178,7 @@ impl Engine {
                 actual_cost,
             ]);
         }
-        Ok(self.explain_outcome(r.rows, true, costs, lane, &inner_for_output))
+        self.explain_outcome(r.rows, true, costs, lane, &inner_for_output)
     }
 
     /// Wrap rendered plan rows as a query Outcome, charging the EXPLAIN's own cost — one
@@ -185,7 +190,7 @@ impl Engine {
         costs: bool,
         with_lane: bool,
         inner: &Statement,
-    ) -> Outcome {
+    ) -> Result<Outcome> {
         let mut meter = self.session.new_meter();
         meter.charge(COSTS.row_produced * rows.len() as i64);
         let mut column_names = vec![
@@ -222,13 +227,16 @@ impl Engine {
                 }
                 out
             })
-            .collect();
-        Outcome::Query {
+            .collect::<Vec<_>>();
+        for row in &rows {
+            meter.admit_row(row)?; // the EXPLAIN result rows (memory.md §5.1)
+        }
+        Ok(Outcome::Query {
             column_names,
             column_types,
             rows,
             cost: meter.accrued,
-        }
+        })
     }
 
     fn explain_lane(&self, inner: &Statement) -> String {

@@ -35,7 +35,9 @@ pub(crate) fn materialize_order_exprs(
     for row in rows.iter_mut() {
         let mut vals = Vec::with_capacity(order_exprs.len());
         for oe in order_exprs {
-            vals.push(oe.eval(row, env, meter)?);
+            let v = oe.eval(row, env, meter)?;
+            meter.admit_value(&v)?; // an appended slot grows the buffered row (memory.md §5.1)
+            vals.push(v);
         }
         row.extend(vals);
     }
@@ -468,7 +470,9 @@ pub(crate) fn apply_window_stage(
         for row in rows.iter_mut() {
             let mut kv = Vec::with_capacity(window_keys.len());
             for ke in window_keys {
-                kv.push(ke.eval(row, env, meter)?);
+                let v = ke.eval(row, env, meter)?;
+                meter.admit_value(&v)?; // an appended slot grows the buffered row (memory.md §5.1)
+                kv.push(v);
             }
             row.extend(kv);
         }
@@ -883,7 +887,9 @@ pub(crate) fn apply_window_stage(
             }
         }
         for (i, row) in rows.iter_mut().enumerate() {
-            row.push(std::mem::replace(&mut results[i], Value::Null));
+            let v = std::mem::replace(&mut results[i], Value::Null);
+            meter.admit_value(&v)?; // each appended window result (memory.md §5.1)
+            row.push(v);
         }
     }
     Ok(())

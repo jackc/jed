@@ -29,6 +29,9 @@ pub(crate) trait RowStream {
     fn next_row(&mut self) -> Result<Option<Vec<Value>>>;
     /// The cost accrued so far — final once the stream is drained (streaming.md §6).
     fn cost(&self) -> i64;
+    /// The statement's query-memory account (spec/design/memory.md §2), so an engine-owned collector
+    /// draining this stream reserves against the same budget.
+    fn query_account(&self) -> crate::cost::QueryAccount;
     /// Release the pinned read snapshot (streaming.md §5). Idempotent.
     fn close(&mut self);
 }
@@ -40,6 +43,9 @@ pub(crate) enum Cursor {
     Buffered {
         iter: std::vec::IntoIter<Vec<Value>>,
         cost: i64,
+        /// The statement's query-memory account; each yielded row leaves engine ownership and is
+        /// released from it (memory.md §5.3).
+        account: crate::cost::QueryAccount,
     },
     /// A lazy pull pipeline (S3, streaming.md §4): scan → resolve → `WHERE` → project, one row per
     /// `next_row`, accruing cost as it is pulled. Owns its pinned snapshot.
@@ -48,10 +54,15 @@ pub(crate) enum Cursor {
 
 impl Cursor {
     /// A cursor over an already-materialized result (the buffered shape).
-    pub(crate) fn buffered(rows: Vec<Vec<Value>>, cost: i64) -> Cursor {
+    pub(crate) fn buffered(
+        rows: Vec<Vec<Value>>,
+        cost: i64,
+        account: crate::cost::QueryAccount,
+    ) -> Cursor {
         Cursor::Buffered {
             iter: rows.into_iter(),
             cost,
+            account,
         }
     }
 
@@ -65,7 +76,13 @@ impl Cursor {
     /// (streaming.md §6).
     pub(crate) fn next_row(&mut self) -> Result<Option<Vec<Value>>> {
         match self {
-            Cursor::Buffered { iter, .. } => Ok(iter.next()),
+            Cursor::Buffered { iter, account, .. } => {
+                let row = iter.next();
+                if let Some(r) = &row {
+                    account.release_row(r);
+                }
+                Ok(row)
+            }
             Cursor::Streaming(s) => s.next_row(),
         }
     }
@@ -76,6 +93,14 @@ impl Cursor {
         match self {
             Cursor::Buffered { cost, .. } => *cost,
             Cursor::Streaming(s) => s.cost(),
+        }
+    }
+
+    /// The statement's query-memory account (spec/design/memory.md §2).
+    pub(crate) fn query_account(&self) -> crate::cost::QueryAccount {
+        match self {
+            Cursor::Buffered { account, .. } => account.clone(),
+            Cursor::Streaming(s) => s.query_account(),
         }
     }
 

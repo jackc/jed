@@ -975,6 +975,7 @@ impl Engine {
         srf: &SrfPlan,
         env: &EvalEnv,
         meter: &mut Meter,
+        mask: &[bool],
     ) -> Result<Vec<Row>> {
         let eval_int = |e: &RExpr, m: &mut Meter| -> Result<Option<i64>> {
             match e.eval(&[], env, m)? {
@@ -1009,7 +1010,9 @@ impl Engine {
             }
             meter.guard()?;
             meter.charge(COSTS.generated_row);
-            out.push(vec![Value::Int(cur)]);
+            let row = vec![Value::Int(cur)];
+            meter.admit_row_masked(&row, mask)?; // a materialized relation row (memory.md §5.1)
+            out.push(row);
             // i64 overflow while stepping ends the series cleanly, matching PostgreSQL.
             match cur.checked_add(step) {
                 Some(next) => cur = next,
@@ -1152,6 +1155,7 @@ impl Engine {
         srf: &SrfPlan,
         env: &EvalEnv,
         meter: &mut Meter,
+        mask: &[bool],
     ) -> Result<Vec<Row>> {
         let arr = match srf.args[0].eval(&[], env, meter)? {
             // A NULL array → zero rows (PG; the `empty_on_null` discipline).
@@ -1163,7 +1167,9 @@ impl Engine {
         for e in arr.elements {
             meter.guard()?;
             meter.charge(COSTS.generated_row);
-            out.push(vec![e]);
+            let row = vec![e];
+            meter.admit_row_masked(&row, mask)?; // a materialized relation row (memory.md §5.1)
+            out.push(row);
         }
         Ok(out)
     }

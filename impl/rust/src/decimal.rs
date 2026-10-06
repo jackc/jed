@@ -484,6 +484,21 @@ impl Decimal {
         (self.neg, self.scale, mag_to_nbase4(&self.limbs))
     }
 
+    /// The number of base-10^4 groups `to_codec` would emit — `ceil(digits / 4)` of the unscaled
+    /// magnitude, `0` for zero — without allocating them (the query-memory size schedule,
+    /// spec/design/memory.md §3).
+    pub fn codec_group_count(&self) -> usize {
+        let Some(&top) = self.limbs.last() else {
+            return 0;
+        };
+        let top_digits = if top == 0 {
+            1
+        } else {
+            top.ilog10() as usize + 1
+        };
+        (9 * (self.limbs.len() - 1) + top_digits).div_ceil(4)
+    }
+
     /// Inverse of `to_codec` (used on load). `neg` is forced false for zero by normalize.
     pub fn from_codec(neg: bool, scale: u32, groups: &[u16]) -> Decimal {
         Decimal::from_parts(neg, scale, mag_from_nbase4(groups))

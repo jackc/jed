@@ -443,6 +443,13 @@ impl Engine {
     pub fn max_scalar_bytes(&self) -> i64 {
         self.session.max_scalar_bytes()
     }
+    /// Live query-memory budget per statement; non-positive restores the default, unlimited.
+    pub fn set_max_query_memory_bytes(&mut self, bytes: i64) {
+        self.session.set_max_query_memory_bytes(bytes);
+    }
+    pub fn max_query_memory_bytes(&self) -> i64 {
+        self.session.max_query_memory_bytes()
+    }
     pub fn set_work_mem(&mut self, bytes: usize) {
         self.session.work_mem = bytes;
     }
@@ -675,7 +682,7 @@ impl Engine {
         params: &[Value],
         insert_cache: Option<&std::cell::RefCell<Option<CachedInsert>>>,
     ) -> Result<Outcome> {
-        self.session.scalar_bytes = std::rc::Rc::new(std::cell::Cell::new(0));
+        self.session.reset_statement_memory();
         match stmt {
             Statement::Begin { writable } => return self.begin_tx(writable),
             Statement::Commit => return self.commit_tx(),
@@ -1128,7 +1135,7 @@ impl Engine {
     /// work in a failed block, and a write is gated inside `dispatch_stmt` on the materialized
     /// fall-through. The three checks are pure, so the fall-through re-running them is harmless.
     pub(crate) fn gate_read_lanes(&mut self, stmt: &Statement) -> Result<()> {
-        self.session.scalar_bytes = std::rc::Rc::new(std::cell::Cell::new(0));
+        self.session.reset_statement_memory();
         if self.tx_failed() {
             return Err(EngineError::new(
                 SqlState::InFailedSqlTransaction,

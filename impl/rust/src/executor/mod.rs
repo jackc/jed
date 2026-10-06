@@ -687,6 +687,9 @@ impl Drop for OpenStreamGuard {
 pub struct SessionOptions {
     /// Cumulative scalar allocation bytes per statement; zero restores the finite default.
     pub max_scalar_bytes: i64,
+    /// Live logical query-memory budget per statement (spec/design/memory.md §2); `0` ⇒ unlimited
+    /// (the default). Over-budget fails `54P05`.
+    pub max_query_memory_bytes: i64,
     /// Execution-cost ceiling (CLAUDE.md §13); `0` ⇒ unlimited (the default).
     pub max_cost: i64,
     /// Per-session cumulative cost budget (spec/design/session.md §5.4); `0` ⇒ unlimited (the
@@ -737,6 +740,7 @@ impl Default for SessionOptions {
     fn default() -> Self {
         SessionOptions {
             max_scalar_bytes: crate::costs::DEFAULT_SCALAR_BYTES,
+            max_query_memory_bytes: 0,
             max_cost: 0,
             lifetime_max_cost: 0,
             max_sql_length: DEFAULT_MAX_SQL_LENGTH,
@@ -781,6 +785,10 @@ impl TxStatus {
 pub struct SessionState {
     pub(crate) max_scalar_bytes: i64,
     pub(crate) scalar_bytes: std::rc::Rc<std::cell::Cell<i64>>,
+    /// The live query-memory budget (`<= 0` ⇒ unlimited) and the current statement's account,
+    /// replaced at each statement start like `scalar_bytes` (spec/design/memory.md §2).
+    pub(crate) max_query_memory_bytes: i64,
+    pub(crate) query_bytes: std::rc::Rc<std::cell::Cell<i64>>,
     /// The open transaction, if any. `None` is autocommit between statements (transactions.md
     /// §4.1); a single-statement autocommit write opens one implicitly for its duration. The
     /// `Idle`/`Open`/`Failed` status (session.md §2.2) is derived from this ([`TxStatus::of`]).
@@ -932,6 +940,7 @@ impl SessionState {
         let mut m = Meter::new();
         m.scalar_limit = self.max_scalar_bytes;
         m.scalar_bytes = self.scalar_bytes.clone();
+        m.query = self.query_account();
         m
     }
 
@@ -945,6 +954,30 @@ impl SessionState {
         } else {
             crate::costs::DEFAULT_SCALAR_BYTES
         }
+    }
+
+    /// Set the live query-memory budget per statement (spec/design/memory.md §2); non-positive
+    /// restores the default, unlimited.
+    pub fn set_max_query_memory_bytes(&mut self, bytes: i64) {
+        self.max_query_memory_bytes = bytes;
+    }
+    /// The live query-memory budget, or `0` for unlimited.
+    pub fn max_query_memory_bytes(&self) -> i64 {
+        self.max_query_memory_bytes.max(0)
+    }
+
+    /// The current statement's query-memory account (spec/design/memory.md §2).
+    pub(crate) fn query_account(&self) -> crate::cost::QueryAccount {
+        crate::cost::QueryAccount {
+            used: self.query_bytes.clone(),
+            limit: self.max_query_memory_bytes,
+        }
+    }
+
+    /// Start a statement's scalar allowance and query-memory account afresh.
+    pub(crate) fn reset_statement_memory(&mut self) {
+        self.scalar_bytes = std::rc::Rc::new(std::cell::Cell::new(0));
+        self.query_bytes = std::rc::Rc::new(std::cell::Cell::new(0));
     }
 
     /// A fresh default session: no open transaction, default settings, empty sequence state.
@@ -961,6 +994,8 @@ impl SessionState {
             tx: None,
             max_scalar_bytes: opts.max_scalar_bytes,
             scalar_bytes: std::rc::Rc::new(std::cell::Cell::new(0)),
+            max_query_memory_bytes: opts.max_query_memory_bytes,
+            query_bytes: std::rc::Rc::new(std::cell::Cell::new(0)),
             max_cost: opts.max_cost,
             lifetime_max_cost: opts.lifetime_max_cost,
             lifetime_total: std::rc::Rc::new(std::cell::Cell::new(0)),
@@ -1067,6 +1102,7 @@ impl SessionState {
         );
         meter.scalar_limit = self.max_scalar_bytes;
         meter.scalar_bytes = self.scalar_bytes.clone();
+        meter.query = self.query_account();
         meter
     }
     /// Set the maximum input SQL length in bytes; `0` ⇒ unlimited.
@@ -4748,6 +4784,19 @@ pub(crate) struct SelectPlan {
     /// (optimize.rs); default (zero-valued) when resolve hands the plan over
     /// (spec/design/planner.md §4).
     phys: PhysicalPlan,
+}
+
+impl SelectPlan {
+    /// The touched mask over the logical combined row (each relation's mask concatenated in column
+    /// order) — how query memory measures a pre-projection row (spec/design/memory.md §3). Empty when
+    /// the meter is unlimited, since no measurement will run.
+    pub(crate) fn memory_mask(&self, meter: &Meter) -> Vec<bool> {
+        if meter.query_memory_active() {
+            self.rel_masks.concat()
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 /// The physical/access-path half of a [`SelectPlan`]: every field is the output of one discrete

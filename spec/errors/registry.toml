@@ -681,6 +681,15 @@ name = "scalar_memory_limit_exceeded"
 class = "program limit exceeded"
 template = "scalar allocations exceeded the limit of {limit} bytes"
 
+# Deterministic live query-memory admission (spec/design/memory.md §2): logical row/value bytes
+# held by a statement exceeded the host-set max_query_memory_bytes budget. Independent of cost
+# (54P01) and of the cumulative scalar allowance (54P04).
+[[error]]
+code = "54P05"
+name = "query_memory_limit_exceeded"
+class = "program limit exceeded"
+template = "query memory exceeded the limit of {limit} bytes"
+
 # --- invalid object state (class 55) ----------------------------------------
 # currval/lastval before nextval has defined the value in this session
 # (../design/sequences.md §6).

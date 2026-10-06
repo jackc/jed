@@ -555,3 +555,11 @@ in-harness expression evaluator) and broader NoREC/TLP relations as new optimiza
 `# max_scalar_bytes: N` sets the finite scalar allowance for the next record only;
 zero restores the 64 MiB default. Requires `resource.scalar_memory`. Memory errors
 are jed-specific; successful scalar values remain PostgreSQL-comparable.
+
+### Query-memory directive
+
+`# max_query_memory_bytes: N` sets the live query-memory budget
+([memory.md](memory.md) §2) for the next record only; absent or zero is unlimited.
+Requires `resource.query_memory`. The logical size schedule is cross-core
+identical, so a record may pin an exact `54P05` threshold (a passing record at
+`N`, a failing one at `N - 1`).
