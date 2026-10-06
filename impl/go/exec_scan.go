@@ -587,6 +587,8 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 		}
 		row := c.em.final[c.idx]
 		c.idx++
+		// It leaves engine ownership, so its query-memory charge is released (memory.md §5.3).
+		c.meter.releaseRow(row)
 		return row, true, nil
 	case emitSorted:
 		// The streaming sort's lazy output: pull the next windowed row, charge row_produced, and
@@ -639,6 +641,7 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 			return nil, false, err
 		}
 		c.meter.Charge(costs.RowProduced)
+		c.meter.releaseRow(row) // it leaves engine ownership (memory.md §5.3)
 		return row, true, nil
 	case emitColumnar:
 		// Columnar projection (packed-leaf.md §11 Track A2/A3): gather this row from the dense lanes — a
@@ -825,6 +828,8 @@ func (c *deferredCursor) nextRow() ([]Value, bool, error) {
 	}
 	row := c.rows[c.idx]
 	c.idx++
+	// The row leaves engine ownership: release its query-memory charge (memory.md §5.3).
+	c.eng.session.queryAccount().releaseRow(row)
 	return row, true, nil
 }
 
@@ -907,6 +912,9 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 			}
 			meter.Charge(costs.RowProduced)
 			outputWork += costs.RowProduced
+			if err := meter.admitRow(projected); err != nil { // the buffered result collector (memory.md §5.1)
+				return false, err
+			}
 			out = append(out, projected)
 		} else {
 			passed++
@@ -924,6 +932,9 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 				projected[i] = v
 			}
 			outputWork += meter.Accrued - before
+			if err := meter.admitRow(projected); err != nil { // the buffered result collector (memory.md §5.1)
+				return false, err
+			}
 			out = append(out, projected)
 		}
 		// Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every
@@ -1180,6 +1191,7 @@ func (db *engine) execWindowTopN(plan *selectPlan, env *evalEnv, meter *costMete
 	// storage_row_read per scanned row and the WHERE operator_evals — the streaming-scan feed, minus
 	// the projection (the window stage runs before projection). Stop the instant `cap` survivors are in
 	// hand: a genuine early-out, so the window fold sees only the prefix it needs.
+	memMask := plan.memoryMask(meter)
 	var rows []storedRow
 	if !empty && limit > 0 {
 		visit := func(_ []byte, row storedRow) (bool, error) {
@@ -1201,6 +1213,9 @@ func (db *engine) execWindowTopN(plan *selectPlan, env *evalEnv, meter *costMete
 				if !v.IsTrue() {
 					return true, nil
 				}
+			}
+			if err := meter.admitRowMasked(row, memMask); err != nil { // a row buffer (memory.md §5.1)
+				return false, err
 			}
 			rows = append(rows, row)
 			return int64(len(rows)) < capN, nil // stop once the OFFSET+LIMIT window is filled
@@ -1319,6 +1334,9 @@ func (db *engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *
 				projected[i] = v
 			}
 			outputWork += meter.Accrued - before
+			if err := meter.admitRow(projected); err != nil { // the buffered result collector (memory.md §5.1)
+				return false, err
+			}
 			out = append(out, projected)
 			// Stop once a LIMIT window is filled (a top-N over the index order).
 			if plan.limit != nil {
@@ -1635,18 +1653,23 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 		offset = *plan.offset
 	}
 	out := make([][]Value, 0)
+	var inlRows []storedRow
 	if plan.limit == nil || *plan.limit > 0 {
 		var passed int64
 	outerLoop:
 		for _, left := range leftRows {
+			// The previous outer row's INL re-materialization is consumed (memory.md §5.3).
+			releaseRowsMasked(meter, inlRows, plan.relMasks[innerOrdinal])
+			inlRows = nil
 			innerRows := rightRows
 			if rightINL {
 				outerLogical := placePhysicalRelationRow(plan, outerOrdinal, left)
 				before = meter.Accrued
-				innerRows, err = db.materializeRel(plan, innerOrdinal, params, outer, outerLogical, rng, env.ctes, meter)
+				inlRows, err = db.materializeRel(plan, innerOrdinal, params, outer, outerLogical, rng, env.ctes, meter)
 				if err != nil {
 					return selectResult{}, err
 				}
+				innerRows = inlRows
 				relWork[innerOrdinal] += meter.Accrued - before
 			} else if hashTable != nil {
 				innerRows, err = hashTable.probe(plan.phys.hashJoin, left, meter)
@@ -1696,6 +1719,9 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 					projected[j] = v
 				}
 				outputWork += meter.Accrued - before
+				if err := meter.admitRow(projected); err != nil { // the buffered result collector (memory.md §5.1)
+					return selectResult{}, err
+				}
 				out = append(out, projected)
 				// Stop the whole nested loop once the LIMIT window is filled.
 				if plan.limit != nil && int64(len(out)) >= *plan.limit {
@@ -1704,6 +1730,10 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 			}
 		}
 	}
+	// The join's relation buffers are consumed (memory.md §5.3).
+	releaseRowsMasked(meter, inlRows, plan.relMasks[innerOrdinal])
+	releaseRowsMasked(meter, leftRows, plan.relMasks[outerOrdinal])
+	releaseRowsMasked(meter, rightRows, plan.relMasks[innerOrdinal])
 	totalWork := meter.Accrued - profileStart
 	for _, ordinal := range []int{outerOrdinal, innerOrdinal} {
 		node := selectActualRelNode(plan.rels[ordinal])
@@ -1763,16 +1793,21 @@ func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *c
 	}
 	var passed int64
 	var out [][]Value
+	var inlRows []storedRow
 	if plan.limit == nil || *plan.limit > 0 {
 	outerLoop:
 		for _, left := range running {
+			// The previous left row's INL re-materialization is consumed (memory.md §5.3).
+			releaseRowsMasked(meter, inlRows, plan.relMasks[inner])
+			inlRows = nil
 			candidates := innerRows
 			if plan.phys.relINLBounds[inner] != nil {
 				before := meter.Accrued
-				candidates, err = db.materializeRel(plan, inner, params, outer, left, rng, env.ctes, meter)
+				inlRows, err = db.materializeRel(plan, inner, params, outer, left, rng, env.ctes, meter)
 				if err != nil {
 					return selectResult{}, err
 				}
+				candidates = inlRows
 				relWork[inner] += meter.Accrued - before
 			} else if table != nil {
 				candidates, err = table.probe(step.hashJoin, left, meter)
@@ -1828,12 +1863,21 @@ func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *c
 					}
 				}
 				outputWork += meter.Accrued - before
+				if err := meter.admitRow(projected); err != nil { // the buffered result collector (memory.md §5.1)
+					return selectResult{}, err
+				}
 				out = append(out, projected)
 				if plan.limit != nil && int64(len(out)) >= *plan.limit {
 					break outerLoop
 				}
 			}
 		}
+	}
+	// The join's input buffers are consumed (memory.md §5.3).
+	releaseRowsMasked(meter, inlRows, plan.relMasks[inner])
+	releaseRowsMasked(meter, running, plan.memoryMask(meter))
+	for ordinal, buffer := range materialized {
+		releaseRowsMasked(meter, buffer, plan.relMasks[ordinal])
 	}
 	for _, ordinal := range plan.phys.relationOrder {
 		db.explainActual.record(selectActualRelNode(plan.rels[ordinal]), relWork[ordinal])
@@ -1879,30 +1923,46 @@ func rowsFromValues(in [][]Value) []storedRow {
 func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer []storedRow, left storedRow, rng *stmtRng, ctes cteCtx, meter *costMeter) ([]storedRow, error) {
 	rel := plan.rels[ri]
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
+	// Every relation row is a query-memory row buffer entry under the relation's touched mask
+	// (memory.md §3/§5.1). The two unbounded generators admit as they produce; the remaining
+	// producers are bounded by an existing input value or the catalog and admit their output.
+	mask := plan.relMasks[ri]
 	// A set-returning relation is generated, not scanned (functions.md §10): produce its rows,
 	// charging generated_row per element (its args read outer — implicitly lateral, §44).
 	if rel.srf != nil {
+		var rows []storedRow
+		var err error
 		switch rel.srf.kind {
 		case srfGenerateSeries:
-			return db.generateSeriesRows(rel.srf, env, meter)
+			return db.generateSeriesRows(rel.srf, env, meter, mask)
 		case srfUnnest:
-			return db.unnestRows(rel.srf, env, meter)
+			return db.unnestRows(rel.srf, env, meter, mask)
 		case srfJsonbArrayElements, srfJsonbArrayElementsText, srfJsonbObjectKeys, srfJsonObjectKeys, srfJsonbEach, srfJsonbEachText, srfJSONRecord, srfJSONRecordset, srfJsonbPathQuery:
-			return db.jsonSrfRows(rel.srf, env, meter)
+			rows, err = db.jsonSrfRows(rel.srf, env, meter)
 		case srfJsonTable:
-			return db.jsonTableRows(rel.srf, env, meter)
+			rows, err = db.jsonTableRows(rel.srf, env, meter)
 		case srfJedTables:
-			return db.jedTablesRows(rel.srf, meter)
+			rows, err = db.jedTablesRows(rel.srf, meter)
 		case srfJedColumns:
-			return db.jedColumnsRows(rel.srf, meter)
+			rows, err = db.jedColumnsRows(rel.srf, meter)
 		case srfJedIndexes:
-			return db.jedIndexesRows(rel.srf, meter)
+			rows, err = db.jedIndexesRows(rel.srf, meter)
 		case srfJedConstraints:
-			return db.jedConstraintsRows(rel.srf, meter)
+			rows, err = db.jedConstraintsRows(rel.srf, meter)
 		case srfJedStatistics:
-			return db.jedStatisticsRows(rel.srf, meter)
+			rows, err = db.jedStatisticsRows(rel.srf, meter)
 		}
-		return nil, nil
+		if err != nil {
+			return nil, err
+		}
+		if meter.queryMemoryActive() {
+			for _, row := range rows {
+				if err := meter.admitRowMasked(row, mask); err != nil {
+					return nil, err
+				}
+			}
+		}
+		return rows, nil
 	}
 	// A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a MATERIALIZED
 	// CTE reads its buffer (charging cte_scan_row, guarded so a runaway scan aborts 54P01); an INLINE
@@ -1918,6 +1978,14 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 				}
 				meter.Charge(costs.CteScanRow)
 			}
+			// The reference copies the CTE buffer into its own relation rows.
+			if meter.queryMemoryActive() {
+				for _, row := range buf {
+					if err := meter.admitRowMasked(row, mask); err != nil {
+						return nil, err
+					}
+				}
+			}
 			return append([]storedRow(nil), buf...), nil
 		case cteInline:
 			// Only a plain (query) CTE is ever inlined; a data-modifying CTE is always materialized
@@ -1928,6 +1996,9 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 				return nil, err
 			}
 			meter.Charge(r.cost)
+			// The body's charged result becomes this relation's rows (memory.md §5.2), re-measured
+			// under the relation's touched mask.
+			rebaseRowsMasked(meter, r.rows, mask)
 			return rowsFromValues(r.rows), nil
 		}
 		return nil, nil
@@ -1941,6 +2012,7 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 			return nil, err
 		}
 		meter.Charge(r.cost)
+		rebaseRowsMasked(meter, r.rows, mask)
 		return rowsFromValues(r.rows), nil
 	}
 	// A base table: scan in primary-key order via a scanSource (the page_read block + per-row
@@ -2107,9 +2179,27 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 		if !ok {
 			break
 		}
+		if err := meter.admitRowMasked(row, mask); err != nil { // a materialized relation row (memory.md §5.1)
+			return nil, err
+		}
 		tableRows = append(tableRows, row)
 	}
 	return tableRows, nil
+}
+
+// rebaseRowsMasked re-measures a charged projected result that becomes relation rows under the
+// relation's touched mask (memory.md §5.2): the masked measure never exceeds the full one, so this
+// only releases.
+func rebaseRowsMasked(meter *costMeter, rows [][]Value, mask []bool) {
+	if !meter.queryMemoryActive() {
+		return
+	}
+	var full, masked int64
+	for _, r := range rows {
+		full += memRowBytes(r)
+		masked += memRowBytesMasked(r, mask)
+	}
+	meter.releaseQuery(full - masked)
 }
 
 func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []Value, ctes cteCtx) (selectResult, error) {

@@ -1078,5 +1078,22 @@ and `setMaxScalarBytes` / `maxScalarBytes`. Default: 64 MiB; non-positive restor
 that finite default. It is independent of max_cost, and cannot be weakened from
 SQL. `54P04` rejects a reservation **above** the allowance before allocation;
 exact equality is allowed. See memory.md for the cumulative per-statement model,
-covered scalar kernels, frozen cursor behavior, and the broader memory contract
-that is designed but not yet implemented.
+covered scalar kernels, and frozen cursor behavior.
+
+### Query memory setting
+
+Session options accept `max_query_memory_bytes` (Rust i64), `MaxQueryMemoryBytes`
+(Go int64), or `maxQueryMemoryBytes` (TypeScript bigint). The matching
+setters/getters are `set_max_query_memory_bytes` / `max_query_memory_bytes`,
+`SetMaxQueryMemoryBytes` / `MaxQueryMemoryBytes`, and `setMaxQueryMemoryBytes` /
+`maxQueryMemoryBytes`. Default: **unlimited**; a positive value is a live
+per-statement budget in logical bytes, and non-positive restores unlimited (the
+getter reports `0`). It is independent of `max_cost`, `max_scalar_bytes`, and
+`work_mem`, and cannot be changed from SQL. A reservation above the budget fails
+`54P05`; exact equality is allowed. The budget is a deterministic guardrail over
+the owners memory.md §4 lists as covered (today: row buffers and engine result
+collectors, slice Q1), not a heap or RSS limit. A cursor keeps the budget of the
+statement that opened it; the engine-owned materializing helpers (Rust
+`query_rows`, TypeScript `Statement.all()`) admit every row they collect against
+it, while rows a host pulls one at a time from a cursor — including through Go's
+iterators — are the host's memory.

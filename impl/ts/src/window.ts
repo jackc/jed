@@ -417,7 +417,11 @@ export function materializeOrderExprs(
     // them across statements. A synthetic group row is already private; the extra copy is harmless.
     const row = rows[i]!.slice();
     const vals: Value[] = [];
-    for (const oe of orderExprs) vals.push(evalExpr(oe, row, env, meter));
+    for (const oe of orderExprs) {
+      const v = evalExpr(oe, row, env, meter);
+      meter.admitValue(v); // an appended slot grows the buffered row (memory.md §5.1)
+      vals.push(v);
+    }
     for (const v of vals) row.push(v);
     rows[i] = row;
   }
@@ -449,7 +453,11 @@ export function applyWindowStage(
     for (let i = 0; i < n; i++) {
       const row = rows[i]!;
       const kv: Value[] = [];
-      for (const ke of windowKeys) kv.push(evalExpr(ke, row, env, meter));
+      for (const ke of windowKeys) {
+        const v = evalExpr(ke, row, env, meter);
+        meter.admitValue(v); // an appended slot grows the buffered row (memory.md §5.1)
+        kv.push(v);
+      }
       for (const v of kv) row.push(v);
     }
   }
@@ -850,7 +858,11 @@ export function applyWindowStage(
         }
       }
     }
-    for (let i = 0; i < n; i++) rows[i]!.push(results[i]!);
+    for (let i = 0; i < n; i++) {
+      const v = results[i]!;
+      meter.admitValue(v); // each appended window result (memory.md §5.1)
+      rows[i]!.push(v);
+    }
   }
 }
 

@@ -79,6 +79,10 @@ serving untrusted SQL. The scalar allocation budget below covers specific expand
 - **Scalar allocation — `set_max_scalar_bytes(bytes)`** / `SetMaxScalarBytes` / `setMaxScalarBytes`.
   Limits cumulative repeat/padding output and decimal-transcendental scratch reservations per
   statement; default **64 MiB**, non-positive restores the default, over-budget fails `54P04`.
+- **Query memory — `set_max_query_memory_bytes(bytes)`** / `SetMaxQueryMemoryBytes` /
+  `setMaxQueryMemoryBytes`. Bounds the logical bytes of rows a statement holds at once (row
+  buffers and result collectors); **unlimited** by default, non-positive restores unlimited,
+  over-budget fails `54P05`.
 - **Input size — `set_max_sql_length(bytes)`** / `SetMaxSQLLength` / `setMaxSqlLength`. Bounds the
   *input SQL length* (in bytes), rejecting an over-long statement with `54000` before it is parsed —
   so a giant query can't exhaust parse memory. The default is **1 MiB**; `0` is unlimited. Because

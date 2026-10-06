@@ -255,6 +255,7 @@ func (db *engine) runWith(wq *withQuery, params []Value) (selectResult, error) {
 	if err != nil {
 		return selectResult{}, err
 	}
+	releaseCteBuffers(db.session.queryAccount(), buffers)
 	r.cost += subqueryCost + totalCost
 	db.explainActual.recordParent("WITH", r.cost)
 	return r, nil
@@ -349,20 +350,36 @@ func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
 		seen[k] = true
 		return true
 	}
+	// Query-memory row accounting (memory.md §5): each term's result is charged by its own execution;
+	// a kept row's result copy is admitted, a duplicate is released, and a consumed working table is
+	// released when the next iteration replaces it.
+	acct := db.session.queryAccount()
 	var result, working []storedRow
 	for _, row := range ar.rows {
 		if keep(row) {
+			if err := acct.admitRow(row); err != nil {
+				return nil, err
+			}
 			result = append(result, row)
 			working = append(working, row)
+		} else {
+			acct.releaseRow(row)
 		}
 	}
 
 	// The recursive term scans the WORKING table through the CTE's own buffer slot (ci); the earlier
-	// CTEs keep their full buffers. Build the buffer vec once and swap slot ci per iteration.
+	// CTEs keep their full buffers. Build the buffer vec once and swap slot ci per iteration. The copy
+	// of the earlier buffers is itself a row buffer.
 	rhsBuffers := make([][]storedRow, ci+1)
 	copy(rhsBuffers, priorBuffers)
+	for _, buf := range priorBuffers {
+		if err := acct.reserve(measureRows(acct, buf)); err != nil {
+			return nil, err
+		}
+	}
 
 	for len(working) > 0 {
+		acct.release(measureRows(acct, rhsBuffers[ci]))
 		rhsBuffers[ci] = working
 		working = nil
 		ctx := inherited.extend(modes[:ci+1], bindings[:ci+1], rhsBuffers)
@@ -375,16 +392,39 @@ func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
 		if err := guard(*totalCost); err != nil {
 			return nil, err
 		}
+		before := measureRows(acct, rr.rows)
 		coerceSetopRows(rr.rows, rhsTypes, anchorTypes)
+		if err := acct.reserve(measureRows(acct, rr.rows) - before); err != nil {
+			return nil, err
+		}
 		for _, vrow := range rr.rows {
 			row := storedRow(vrow)
 			if keep(row) {
+				if err := acct.admitRow(row); err != nil {
+					return nil, err
+				}
 				result = append(result, row)
 				working = append(working, row)
+			} else {
+				acct.releaseRow(row)
 			}
 		}
 	}
+	for _, buf := range rhsBuffers {
+		acct.release(measureRows(acct, buf))
+	}
 	return result, nil
+}
+
+// releaseCteBuffers releases a WITH's CTE buffers, which die with the statement part that
+// materialized them (memory.md §5.3) — essential for a nested WITH re-run per outer row.
+func releaseCteBuffers(acct queryAccount, buffers [][]storedRow) {
+	if !acct.active() {
+		return
+	}
+	for _, buf := range buffers {
+		acct.release(measureRows(acct, buf))
+	}
 }
 
 // executeWithDml runs a data-modifying WITH statement (spec/design/writable-cte.md): a WITH
@@ -531,6 +571,7 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 	case wq.Body.Delete != nil:
 		db.explainActual.record("Delete "+wq.Body.Delete.Table, out.Cost)
 	}
+	releaseCteBuffers(db.session.queryAccount(), buffers)
 	out = addOutcomeCost(out, totalCost)
 	db.explainActual.recordParent("WITH", out.Cost)
 	return out, nil
@@ -1290,6 +1331,7 @@ func (db *engine) execWithPlan(wp *withPlan, outer []storedRow, params []Value, 
 	if err != nil {
 		return selectResult{}, err
 	}
+	releaseCteBuffers(db.session.queryAccount(), buffers)
 	r.cost += totalCost
 	db.explainActual.recordParent("WITH", r.cost)
 	return r, nil
@@ -1364,10 +1406,19 @@ func (db *engine) execSetOpPlan(plan *setOpPlan, outer []storedRow, params []Val
 		return selectResult{}, err
 	}
 
+	// Both arms arrive charged (memory.md §5.2). Coercion growth is reserved; rows the combine or the
+	// LIMIT/OFFSET window drops are released (§5.3).
+	acct := db.session.queryAccount()
+	before := measureRows(acct, left.rows) + measureRows(acct, right.rows)
 	coerceSetopRows(left.rows, left.columnTypes, plan.columnTypes)
 	coerceSetopRows(right.rows, right.columnTypes, plan.columnTypes)
+	coerced := measureRows(acct, left.rows) + measureRows(acct, right.rows)
+	if err := acct.reserve(coerced - before); err != nil {
+		return selectResult{}, err
+	}
 
 	rows := combineSetop(plan.op, plan.all, left.rows, right.rows)
+	acct.release(coerced - measureRows(acct, rows))
 	cost := left.cost + right.cost
 	rootNode := setOpNodeName(plan.op)
 	if plan.limit != nil || plan.offset != nil {
@@ -1399,6 +1450,7 @@ func (db *engine) execSetOpPlan(plan *setOpPlan, outer []storedRow, params []Val
 	if plan.limit != nil && *plan.limit < n-start {
 		end = start + *plan.limit
 	}
+	acct.release(measureRows(acct, rows[:start]) + measureRows(acct, rows[end:]))
 	rows = rows[start:end]
 	db.explainActual.recordParent(rootNode, cost)
 
@@ -1498,6 +1550,9 @@ func (db *engine) execValuesPlan(plan *valuesPlan, outer []storedRow, params []V
 				v = DecimalValue(decimalFromInt64(v.Int))
 			}
 			out[ci] = v
+		}
+		if err := meter.admitRow(out); err != nil { // a materialized relation row (memory.md §5.1)
+			return selectResult{}, err
 		}
 		rows = append(rows, out)
 	}

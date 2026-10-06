@@ -1,3 +1,4 @@
+import type { QueryAccount } from "./cost.ts";
 import type { Value } from "./value.ts";
 
 // Cursor is the pull source a Rows cursor drives (spec/design/streaming.md §4).
@@ -26,6 +27,9 @@ export interface RowSource {
   nextRow(): Value[] | undefined;
   // cost is the cost accrued so far — final once the source is drained (streaming.md §6).
   cost(): bigint;
+  // queryAccount is the statement's query-memory account (spec/design/memory.md §2), so an
+  // engine-owned collector draining this source reserves against the same budget.
+  queryAccount(): QueryAccount;
   // close releases the pinned read snapshot (streaming.md §5). Idempotent.
   close(): void;
 }
@@ -37,12 +41,19 @@ export class Cursor {
     this.source = source;
   }
 
-  // buffered wraps an already-materialized result (the buffered shape).
-  static buffered(rows: Value[][], cost: bigint): Cursor {
+  // buffered wraps an already-materialized result (the buffered shape). Each yielded row leaves engine
+  // ownership and is released from the statement's query-memory account (memory.md §5.3).
+  static buffered(rows: Value[][], cost: bigint, account: QueryAccount): Cursor {
     let i = 0;
     return new Cursor({
-      nextRow: () => (i < rows.length ? rows[i++]! : undefined),
+      nextRow: () => {
+        if (i >= rows.length) return undefined;
+        const row = rows[i++]!;
+        account.releaseRow(row);
+        return row;
+      },
       cost: () => cost,
+      queryAccount: () => account,
       close: () => {},
     });
   }
@@ -62,6 +73,11 @@ export class Cursor {
   // (streaming.md §6); for the buffered shape it is final immediately.
   cost(): bigint {
     return this.source.cost();
+  }
+
+  // queryAccount is the statement's query-memory account (spec/design/memory.md §2).
+  queryAccount(): QueryAccount {
+    return this.source.queryAccount();
   }
 
   // close releases any pinned read snapshot (streaming.md §5). Idempotent. A no-op for the buffered

@@ -123,6 +123,7 @@ func (db *engine) execCostedTwoRelationJoin(plan *selectPlan, env *evalEnv, mete
 		}
 	}
 
+	mask := plan.memoryMask(meter)
 	var out []storedRow
 	for _, outerRow := range outerRows {
 		candidates := innerRows
@@ -151,7 +152,14 @@ func (db *engine) execCostedTwoRelationJoin(plan *selectPlan, env *evalEnv, mete
 					continue
 				}
 			}
+			if err := meter.admitRowMasked(combined, mask); err != nil {
+				return nil, err
+			}
 			out = append(out, combined)
+		}
+		// A per-outer-row INL re-materialization is consumed (memory.md §5.3).
+		if innerINL {
+			releaseRowsMasked(meter, candidates, plan.relMasks[innerOrdinal])
 		}
 	}
 	return out, nil
@@ -172,9 +180,13 @@ func physicalStepKind(plan *selectPlan, step physicalJoinStep) joinKind {
 
 func (db *engine) execCostedNWayJoin(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value, outerStack []storedRow, materialized [][]storedRow, relWork []int64, stepCount int) ([]storedRow, error) {
 	driver := plan.phys.relationOrder[0]
+	mask := plan.memoryMask(meter)
 	running := make([]storedRow, len(materialized[driver]))
 	for i, row := range materialized[driver] {
 		running[i] = placePhysicalRelationRow(plan, driver, row)
+		if err := meter.admitRowMasked(running[i], mask); err != nil {
+			return nil, err
+		}
 	}
 	for position := 0; position < stepCount; position++ {
 		step := plan.phys.joinSteps[position]
@@ -236,6 +248,9 @@ func (db *engine) execCostedNWayJoin(plan *selectPlan, env *evalEnv, meter *cost
 					}
 				}
 				if keep {
+					if err := meter.admitRowMasked(combined, mask); err != nil {
+						return nil, err
+					}
 					next = append(next, combined)
 					leftMatched = true
 					if emitRight {
@@ -244,16 +259,29 @@ func (db *engine) execCostedNWayJoin(plan *selectPlan, env *evalEnv, meter *cost
 				}
 			}
 			if emitLeft && !leftMatched {
+				if err := meter.admitRowMasked(left, mask); err != nil {
+					return nil, err
+				}
 				next = append(next, append(storedRow(nil), left...))
+			}
+			// A per-left-row INL / LATERAL re-materialization is consumed (memory.md §5.3).
+			if plan.phys.relINLBounds[inner] != nil || plan.rels[inner].lateral {
+				releaseRowsMasked(meter, candidates, plan.relMasks[inner])
 			}
 		}
 		if emitRight {
 			for ri, right := range innerRows {
 				if !rightMatched[ri] {
-					next = append(next, placePhysicalRelationRow(plan, inner, right))
+					combined := placePhysicalRelationRow(plan, inner, right)
+					if err := meter.admitRowMasked(combined, mask); err != nil {
+						return nil, err
+					}
+					next = append(next, combined)
 				}
 			}
 		}
+		// The step's input rows are consumed once its output is built (memory.md §5.3).
+		releaseRowsMasked(meter, running, mask)
 		running = next
 		if position+1 < len(plan.phys.joinSteps) {
 			node := "Nested Loop"
@@ -288,7 +316,12 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 			if !ok {
 				break
 			}
+			// Spool / sorter residency is operator state; the collected result is a row buffer
+			// (memory.md §5.1).
 			if em.precharged {
+				if err := meter.admitRow(row); err != nil {
+					return nil, err
+				}
 				out = append(out, row)
 				continue
 			}
@@ -297,6 +330,9 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 			}
 			meter.Charge(costs.RowProduced)
 			if em.identity {
+				if err := meter.admitRow(row); err != nil {
+					return nil, err
+				}
 				out = append(out, row)
 				continue
 			}
@@ -308,10 +344,17 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 				}
 				projected[j] = v
 			}
+			if err := meter.admitRow(projected); err != nil {
+				return nil, err
+			}
 			out = append(out, projected)
 		}
 		return out, nil
 	case emitIdentity:
+		// Rows outside the LIMIT/OFFSET window are discarded; the windowed rows transfer into the
+		// result (memory.md §5.2/§5.3).
+		releaseRows(meter, em.final[:em.start])
+		releaseRows(meter, em.final[em.end:])
 		out := make([][]Value, 0, em.end-em.start)
 		for _, row := range em.final[em.start:em.end] {
 			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
@@ -340,6 +383,9 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 			for k, c := range em.projCols {
 				projected[k] = em.cols[c][li]
 			}
+			if err := meter.admitRow(projected); err != nil {
+				return nil, err
+			}
 			out = append(out, projected)
 		}
 		return out, nil
@@ -359,8 +405,18 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 				}
 				projected[i] = v
 			}
+			if err := meter.admitRow(projected); err != nil {
+				return nil, err
+			}
 			out = append(out, projected)
 		}
+		// The projecting drive consumed its source buffer: pre-projection rows under the touched
+		// mask, or an aggregate's group rows (memory.md §5.3).
+		var mask []bool
+		if !plan.isAgg {
+			mask = plan.memoryMask(meter)
+		}
+		releaseRowsMasked(meter, em.src, mask)
 		return out, nil
 	}
 }
@@ -383,7 +439,11 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			return emitter{}, err
 		}
 		if ok {
-			return db.emitAggSyntheticRows(plan, rows, env, meter)
+			// Dense lanes are operator state; the group rows are a row buffer (memory.md §5.4).
+			if err := admitAggRows(rows, meter); err != nil {
+				return emitter{}, err
+			}
+			return emitAggSyntheticRows(plan, rows), nil
 		}
 	}
 	if db.boundedBlockingEligible(plan) {
@@ -501,6 +561,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// An INDEX-NESTED-LOOP relation (cost.md §3 "JOIN") likewise depends on the left-hand row (its
 	// bound seeks per outer row), so it is not materialized up front either — a placeholder (nil)
 	// holds its slot and the join loop re-materializes it per left row.
+	memMask := plan.memoryMask(meter)
 	materialized := make([][]storedRow, len(plan.rels))
 	relWork := make([]int64, len(plan.rels))
 	for ri, rel := range plan.rels {
@@ -541,9 +602,15 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			return emitter{}, err
 		}
 	} else {
-		running = []storedRow{{}}
 		if len(plan.rels) > 0 {
+			// The first relation's buffer moves into running (its charge transfers with it).
 			running = materialized[0]
+			materialized[0] = nil
+		} else {
+			if err := meter.admitRow(nil); err != nil {
+				return emitter{}, err
+			}
+			running = []storedRow{{}}
 		}
 		for k := range plan.joins {
 			on := plan.joins[k].on
@@ -584,6 +651,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 							keep = v.IsTrue()
 						}
 						if keep {
+							if err := meter.admitRowMasked(combined, memMask); err != nil {
+								return emitter{}, err
+							}
 							next = append(next, combined)
 							leftMatched = true
 						}
@@ -594,9 +664,15 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 						for i := 0; i < rightPad; i++ {
 							combined = append(combined, NullValue())
 						}
+						if err := meter.admitRowMasked(combined, memMask); err != nil {
+							return emitter{}, err
+						}
 						next = append(next, combined)
 					}
+					// The per-left-row re-materialization is consumed (memory.md §5.3).
+					releaseRowsMasked(meter, rightRows, plan.relMasks[k+1])
 				}
+				releaseRowsMasked(meter, running, memMask)
 				running = next
 				continue
 			}
@@ -628,6 +704,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 							keep = v.IsTrue()
 						}
 						if keep {
+							if err := meter.admitRowMasked(combined, memMask); err != nil {
+								return emitter{}, err
+							}
 							next = append(next, combined)
 							leftMatched = true
 						}
@@ -638,9 +717,15 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 						for i := 0; i < rightPad; i++ {
 							combined = append(combined, NullValue())
 						}
+						if err := meter.admitRowMasked(combined, memMask); err != nil {
+							return emitter{}, err
+						}
 						next = append(next, combined)
 					}
+					// The per-left-row re-materialization is consumed (memory.md §5.3).
+					releaseRowsMasked(meter, rightRows, plan.relMasks[k+1])
 				}
+				releaseRowsMasked(meter, running, memMask)
 				running = next
 				continue
 			}
@@ -668,6 +753,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 							return emitter{}, err
 						}
 						if v.IsTrue() {
+							if err := meter.admitRowMasked(combined, memMask); err != nil {
+								return emitter{}, err
+							}
 							next = append(next, combined)
 							leftMatched = true
 						}
@@ -677,9 +765,13 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 						for i := 0; i < rightPad; i++ {
 							combined = append(combined, NullValue())
 						}
+						if err := meter.admitRowMasked(combined, memMask); err != nil {
+							return emitter{}, err
+						}
 						next = append(next, combined)
 					}
 				}
+				releaseRowsMasked(meter, running, memMask)
 				running = next
 				continue
 			}
@@ -699,6 +791,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 						keep = v.IsTrue()
 					}
 					if keep {
+						if err := meter.admitRowMasked(combined, memMask); err != nil {
+							return emitter{}, err
+						}
 						next = append(next, combined)
 						leftMatched = true
 						rightMatched[ri] = true
@@ -709,6 +804,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					combined = append(combined, left...)
 					for i := 0; i < rightPad; i++ {
 						combined = append(combined, NullValue())
+					}
+					if err := meter.admitRowMasked(combined, memMask); err != nil {
+						return emitter{}, err
 					}
 					next = append(next, combined)
 				}
@@ -721,12 +819,21 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 							combined = append(combined, NullValue())
 						}
 						combined = append(combined, right...)
+						if err := meter.admitRowMasked(combined, memMask); err != nil {
+							return emitter{}, err
+						}
 						next = append(next, combined)
 					}
 				}
 			}
+			releaseRowsMasked(meter, running, memMask)
 			running = next
 		}
+	}
+	// The join phase is complete: its relation buffers are consumed (memory.md §5.3). A relation
+	// moved into running left an empty buffer here.
+	for ri, rows := range materialized {
+		releaseRowsMasked(meter, rows, plan.relMasks[ri])
 	}
 
 	// Scan labels can repeat (self joins), while the optimizer may render relations in physical
@@ -773,6 +880,8 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		}
 		if keep {
 			rows = append(rows, row)
+		} else {
+			meter.releaseRowMasked(row, memMask)
 		}
 	}
 	if plan.filter != nil {
@@ -811,10 +920,18 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			return emitter{}, err
 		}
 		if plan.phys.topK != nil {
+			// Rows the top-k selection drops are discarded (memory.md §5.3): release the input, then
+			// re-reserve the kept rows (never more than was released).
+			releaseRowsMasked(meter, rows, memMask)
 			var err error
 			rows, err = topKRows(rows, plan.order, *plan.phys.topK)
 			if err != nil {
 				return emitter{}, err
+			}
+			for _, row := range rows {
+				if err := meter.admitRowMasked(row, memMask); err != nil {
+					return emitter{}, err
+				}
 			}
 		} else {
 			if err := sortRows(rows, plan.order); err != nil {
@@ -904,6 +1021,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					v, gerr := ge.eval(rows[ri], env, meter)
 					if gerr != nil {
 						return emitter{}, gerr
+					}
+					if err := meter.admitValue(v); err != nil {
+						return emitter{}, err
 					}
 					rows[ri] = append(rows[ri], v)
 				}
@@ -1048,9 +1168,14 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 				for _, positions := range plan.groupingSpecs {
 					srow = append(srow, IntValue(groupingValue(positions, gset.mask)))
 				}
+				if err := meter.admitRow(srow); err != nil {
+					return emitter{}, err
+				}
 				groupRows = append(groupRows, srow)
 			}
 		}
+		// Aggregation consumed the post-WHERE rows (memory.md §5.3).
+		releaseRowsMasked(meter, rows, memMask)
 		// HAVING: filter the grouped rows (after aggregation, before ORDER BY). The predicate is
 		// evaluated against each group's synthetic row (charging its operator_evals per group);
 		// only a TRUE result keeps the group. A dropped group charges no row_produced (§8).
@@ -1063,6 +1188,8 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 				}
 				if v.IsTrue() {
 					kept = append(kept, srow)
+				} else {
+					meter.releaseRow(srow)
 				}
 			}
 			groupRows = kept
@@ -1115,9 +1242,13 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 				}
 				if key := distinctRowKey(projected); !seen[key] {
 					seen[key] = true
+					if err := meter.admitRow(projected); err != nil {
+						return emitter{}, err
+					}
 					distinctRows = append(distinctRows, projected)
 				}
 			}
+			releaseRows(meter, groupRows)
 			if selectActualRootNode(plan) != "Distinct" {
 				db.explainActual.recordParent("Distinct", meter.Accrued)
 			}
@@ -1149,9 +1280,13 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			}
 			if key := distinctRowKey(projected); !seen[key] {
 				seen[key] = true
+				if err := meter.admitRow(projected); err != nil {
+					return emitter{}, err
+				}
 				distinctRows = append(distinctRows, projected)
 			}
 		}
+		releaseRowsMasked(meter, rows, memMask)
 		if selectActualRootNode(plan) != "Distinct" {
 			db.explainActual.recordParent("Distinct", meter.Accrued)
 		}

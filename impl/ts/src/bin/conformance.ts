@@ -22,6 +22,7 @@ import {
   type Privilege,
   PrivilegeSet,
   privilegeFromName,
+  queryMemoryUnderflows,
   queryOutcome,
   render,
   seededRandomSource,
@@ -300,6 +301,24 @@ function parseCostDirective(line: string): bigint | null {
 // ceiling to run the next record under, or null if not a max_cost directive. Mirrors `# cost:`,
 // but instead of asserting the accrued cost it bounds it: the record is expected to abort with
 // 54P01 once accrued cost reaches N (CLAUDE.md §13; spec/design/cost.md §6).
+// parseQueryMemoryDirective parses `# max_query_memory_bytes: N` (memory.md §2) — any integer; a
+// non-positive value is unlimited.
+function parseQueryMemoryDirective(line: string): bigint | null {
+  const m = line.match(/^#\s*max_query_memory_bytes:\s*(-?\d+)\s*$/);
+  return m ? BigInt(m[1]!) : null;
+}
+
+// parseQueryMemoryEnv reads the whole-corpus accounting budget JED_CONFORMANCE_QUERY_MEMORY (integer
+// bytes); absent ⇒ 0 (unlimited).
+function parseQueryMemoryEnv(): bigint {
+  const v = process.env.JED_CONFORMANCE_QUERY_MEMORY;
+  if (v === undefined) return 0n;
+  if (!/^-?\d+$/.test(v.trim())) {
+    throw new Error("JED_CONFORMANCE_QUERY_MEMORY must be integer bytes");
+  }
+  return BigInt(v.trim());
+}
+
 function parseMaxCostDirective(line: string): bigint | null {
   const m = line.match(/^#\s*max_cost:\s*(\S+)/);
   if (!m) return null;
@@ -570,6 +589,10 @@ function runFile(text: string, disk: boolean): void {
     let pendingAllowDdl: boolean | null = null;
     let pendingAllowTempDdl: boolean | null = null;
     let pendingScalarBytes: bigint | null = null;
+    let pendingQueryMemory: bigint | null = null;
+    // The whole-corpus accounting mode: a budget applied to every record without its own directive,
+    // so every query shape exercises the accounting (memory.md §5).
+    const queryMemoryDefault = parseQueryMemoryEnv();
     let pendingTempBuffers: number | null = null;
     const pendingVars: Array<[string, string]> = [];
     let pendingTimezone: string | null = null;
@@ -640,6 +663,7 @@ function runFile(text: string, disk: boolean): void {
         const sb = /^#\s*max_scalar_bytes:/.test(line)
           ? parseMaxCostDirective(line.replace("max_scalar_bytes:", "max_cost:"))
           : null;
+        const qm = parseQueryMemoryDirective(line);
         const tb = parseTempBuffersDirective(line);
         const sv = parseSetDirective(line);
         const tz = parseTimezoneDirective(line);
@@ -669,6 +693,8 @@ function runFile(text: string, disk: boolean): void {
           pendingAllowTempDdl = atd;
         } else if (sb !== null) {
           pendingScalarBytes = sb;
+        } else if (qm !== null) {
+          pendingQueryMemory = qm;
         } else if (tb !== null) {
           pendingTempBuffers = tb;
         } else if (sv !== null) {
@@ -761,6 +787,11 @@ function runFile(text: string, disk: boolean): void {
       // `# temp_buffers:` directive never leaks past its record. Mirrors `# max_cost:`.
       db.setMaxScalarBytes(pendingScalarBytes ?? 0n);
       pendingScalarBytes = null;
+      // `# max_query_memory_bytes:` (memory.md §2) decorates only its record; absent ⇒ unlimited, or
+      // the whole-corpus accounting budget of JED_CONFORMANCE_QUERY_MEMORY.
+      db.setMaxQueryMemoryBytes(pendingQueryMemory ?? queryMemoryDefault);
+      pendingQueryMemory = null;
+      const underflowsBefore = queryMemoryUnderflows.count;
       db.setTempBuffers(pendingTempBuffers ?? 0);
       pendingTempBuffers = null;
       // Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
@@ -844,6 +875,11 @@ function runFile(text: string, disk: boolean): void {
         assertTypes(expectedTypes, outcome.kind === "query" ? outcome.columnTypes : [], sql);
       } else {
         throw new Error(`unknown record kind "${fields[0]}"`);
+      }
+      if (queryMemoryUnderflows.count !== underflowsBefore) {
+        throw new Error(
+          `query-memory accounting released more than it reserved (memory.md §5)\n  record: ${line}`,
+        );
       }
     }
   } finally {

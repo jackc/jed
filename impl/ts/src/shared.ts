@@ -1139,7 +1139,8 @@ export class Session {
     // The dispatch fall-through handles transaction control (a nested BEGIN's 25001 must NOT poison) and
     // self-poisons on a regular statement error (executeStmtParams), so its nuanced poisoning is left
     // intact — only the lazy-lane reads above, which bypass it, are poisoned here.
-    return rowsFromOutcome(this.dispatch(stmt, params, insertHolder));
+    const outcome = this.dispatch(stmt, params, insertHolder);
+    return rowsFromOutcome(outcome, this.engine.session.queryAccount);
   }
 
   // executeCancelable runs a statement under an AbortSignal (spec/design/api.md §11.4): if the signal
@@ -1484,6 +1485,16 @@ export class Session {
   }
   get maxScalarBytes(): bigint {
     return this.engine.session.scalarLimit();
+  }
+  // setMaxQueryMemoryBytes sets the live query-memory budget per statement (spec/design/memory.md §2);
+  // non-positive restores the default, unlimited. Over-budget fails 54P05. A cursor already open keeps
+  // the budget it opened with.
+  setMaxQueryMemoryBytes(bytes: bigint): void {
+    this.engine.session.setMaxQueryMemoryBytes(bytes);
+  }
+  // maxQueryMemoryBytes is the live query-memory budget, or 0n for unlimited.
+  get maxQueryMemoryBytes(): bigint {
+    return this.engine.session.queryMemoryLimitSetting();
   }
   setWorkMem(bytes: number): void {
     this.engine.session.workMem = bytes;

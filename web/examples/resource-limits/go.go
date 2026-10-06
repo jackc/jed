@@ -17,11 +17,16 @@ func main() {
 
 	ctx := context.Background()
 
-	// Serve untrusted queries through a session with independent work and scalar-allocation limits:
+	// Serve untrusted queries through a session with independent work and memory limits:
 	//   MaxCost         — a per-STATEMENT ceiling: one runaway query aborts 54P01.
 	//   LifetimeMaxCost — a per-SESSION budget: the session's cumulative cost is capped, so a flood
 	//                     of cheap queries can't burn unbounded CPU. It aborts 54P02.
-	untrusted := db.Session(jed.SessionOptions{MaxCost: 10000, LifetimeMaxCost: 3, MaxScalarBytes: 8 * 1024 * 1024})
+	untrusted := db.Session(jed.SessionOptions{
+		MaxCost:             10000,
+		LifetimeMaxCost:     3,
+		MaxScalarBytes:      8 * 1024 * 1024,  // covered scalar allocations; not total heap
+		MaxQueryMemoryBytes: 64 * 1024 * 1024, // rows held at once (54P05); not total heap
+	})
 	defer untrusted.Close()
 
 	// Each statement accrues into the session's running total; read it with LifetimeCost().

@@ -191,13 +191,13 @@ func vectorizedSpecEligible(spec *aggSpec) bool {
 	}
 }
 
-// execVectorizedAgg runs a vectorizedAggEligible plan and returns a fully-formed, already-projected
-// result (emitter{mode: emitFinal}): one row for a whole-table grand total, or one per group for a
-// single-key GROUP BY. It reuses the scalar scan + WHERE for exact cost + survivor determination,
-// folds each aggregate over the survivors with a columnar kernel (whole-table) or per-group through
-// acc.fold (grouped), then produces the output rows exactly as the emitProject drive would (Guard,
-// row_produced, projection eval) under the query's LIMIT/OFFSET window. Only runs on the unmetered
-// lane (the caller gates).
+// execVectorizedAgg runs a vectorizedAggEligible plan and returns its synthetic group rows as an
+// emitProject buffer (emitAggSyntheticRows): one row for a whole-table grand total, or one per group
+// for a single-key GROUP BY. It reuses the scalar scan + WHERE for exact cost + survivor
+// determination, folds each aggregate over the survivors with a columnar kernel (whole-table) or
+// per-group through acc.fold (grouped); the emitter drive then produces the output rows (Guard,
+// row_produced, projection eval) under the query's LIMIT/OFFSET window, exactly as for a scalar
+// aggregate result. Only runs on the unmetered lane (the caller gates).
 func (db *engine) execVectorizedAgg(plan *selectPlan, outer []storedRow, params []Value, ctes cteCtx, rng *stmtRng, meter *costMeter) (emitter, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
 	gset := &plan.groupSets[0]
@@ -214,7 +214,11 @@ func (db *engine) execVectorizedAgg(plan *selectPlan, outer []storedRow, params 
 			return emitter{}, err
 		}
 		if ok {
-			return db.emitAggSyntheticRows(plan, srows, env, meter)
+			// Dense lanes are operator state; the group rows are a row buffer (memory.md §5.4).
+			if err := admitAggRows(srows, meter); err != nil {
+				return emitter{}, err
+			}
+			return emitAggSyntheticRows(plan, srows), nil
 		}
 	}
 
@@ -229,6 +233,8 @@ func (db *engine) execVectorizedAgg(plan *selectPlan, outer []storedRow, params 
 	// WHERE: evaluate the residual predicate per scanned row through the ordinary evaluator, so its
 	// operator_eval charges and its 3VL survivor test (keep iff TRUE — the same IsTrue as the scalar
 	// WHERE loop) are byte-identical. Filter in place: survivors is a prefix of rows.
+	// The same row-buffer accounting as the scalar aggregate branch (memory.md §5).
+	mask := plan.relMasks[0]
 	survivors := rows
 	if plan.filter != nil {
 		survivors = rows[:0]
@@ -239,6 +245,8 @@ func (db *engine) execVectorizedAgg(plan *selectPlan, outer []storedRow, params 
 			}
 			if v.IsTrue() {
 				survivors = append(survivors, r)
+			} else {
+				meter.releaseRowMasked(r, mask)
 			}
 		}
 	}
@@ -266,35 +274,37 @@ func (db *engine) execVectorizedAgg(plan *selectPlan, outer []storedRow, params 
 			return emitter{}, err
 		}
 	}
-	return db.emitAggSyntheticRows(plan, srows, env, meter)
+	if err := admitAggRows(srows, meter); err != nil {
+		return emitter{}, err
+	}
+	releaseRowsMasked(meter, survivors, mask)
+	return emitAggSyntheticRows(plan, srows), nil
+}
+
+// admitAggRows admits the finalized synthetic group rows of a vectorized aggregate as a row buffer
+// (memory.md §5.1).
+func admitAggRows(srows []storedRow, meter *costMeter) error {
+	if !meter.queryMemoryActive() {
+		return nil
+	}
+	for _, r := range srows {
+		if err := meter.admitRow(r); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // emitAggSyntheticRows emits the synthetic grouped rows (a whole-table grand total or one per group)
-// under the query's LIMIT/OFFSET window, exactly as the emitProject drive does: for each windowed row,
-// Guard, row_produced, then the projection list (charging its operator_evals). Only emitted rows are
-// projected + charged (the §3 asymmetry). Returned as emitFinal — already projected + charged — so
-// neither the eager nor the lazy drive charges again; aggWindowBounds mirrors the execSelectEmit
-// windowBounds closure (clamped in the i64 domain). Shared verbatim by the row (foldAggBatch) and
-// columnar (aggColumnar) fold paths, so emission + cost are identical either way.
-func (db *engine) emitAggSyntheticRows(plan *selectPlan, srows []storedRow, env *evalEnv, meter *costMeter) (emitter, error) {
+// under the query's LIMIT/OFFSET window as an emitProject buffer: the drive charges Guard, row_produced,
+// then the projection list per windowed row (the §3 asymmetry — only emitted rows are projected +
+// charged), exactly as for a scalar aggregate result, and the eager drive admits each output row and
+// releases the group rows (memory.md §5). aggWindowBounds mirrors the execSelectEmit windowBounds
+// closure (clamped in the i64 domain). Shared verbatim by the row (foldAggBatch) and columnar
+// (aggColumnar) fold paths, so emission + cost are identical either way.
+func emitAggSyntheticRows(plan *selectPlan, srows []storedRow) emitter {
 	start, end := aggWindowBounds(plan, int64(len(srows)))
-	out := make([][]Value, 0, end-start)
-	for _, srow := range srows[start:end] {
-		if gerr := meter.Guard(); gerr != nil {
-			return emitter{}, gerr
-		}
-		meter.Charge(costs.RowProduced)
-		projected := make([]Value, len(plan.projections))
-		for i, p := range plan.projections {
-			v, perr := p.eval(srow, env, meter)
-			if perr != nil {
-				return emitter{}, perr
-			}
-			projected[i] = v
-		}
-		out = append(out, projected)
-	}
-	return emitter{final: out, mode: emitFinal}, nil
+	return emitter{src: srows, start: start, end: end, mode: emitProject}
 }
 
 // aggColumnar runs the A2/A3 columnar gather for a vectorized aggregate (packed-leaf.md §11 Track

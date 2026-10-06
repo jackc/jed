@@ -222,9 +222,9 @@ floating zero/NaN, NULL, and recursive container equality.
 Finite accumulator state and growing accumulator collections are different owners.
 Spilling a group directory does not bound a single group's ordered-set, hypothetical,
 JSON, or string/array state. Such collections need their own replayable scratch or
-external ordering. A final scalar value and values retained by a materializing host
-API remain subject to the separate admission work in [memory.md](memory.md); `work_mem`
-is not a whole-query or process-RSS ceiling.
+external ordering. A final scalar value remains subject to scalar admission, and a
+materializing host API's collected rows to the query-memory account
+([memory.md](memory.md) §5); `work_mem` is not a whole-query or process-RSS ceiling.
 
 ### Resource and correctness gates
 
@@ -267,10 +267,14 @@ Sequenced so the canonical operator lands first on a frozen budget seam:
   cost prepasses stream. The shared forced-spill corpus joins `rake test`/`rake ci`;
   `rake bench:spill` measures wide inputs larger than `work_mem`.
 
-Remaining allocation owners are explicit: upstream materialized CTE/derived/SRF/index
-producers and window partitions, final scalar values, materialized host results, and
-pending writes. Their admission belongs to [memory.md](memory.md); operator spilling
-does not imply that arbitrary SQL has a whole-query memory bound.
+Remaining allocation owners are explicit. Upstream materialized CTE/derived/SRF/index
+producers, the window stage's buffer, and materialized host results are row buffers
+charged by the query-memory account (`max_query_memory_bytes`, [memory.md](memory.md)
+§5, slice Q1). Operator state — spools, hash tables, sorter buffers, accumulator
+collections — is slice Q2, and pending writes slice Q3; until those land, operator
+spilling does not imply that arbitrary SQL has a whole-query memory bound. Spools are
+charged only by `work_mem`: rows a materialized relation hands to a spool leave the
+query-memory account as they enter it.
 
 A later refinement, also not foreclosed: routing the spill files through a host **storage seam**
 abstraction (storage.md §2) so the browser/OPFS host spills too, rather than the direct stdlib

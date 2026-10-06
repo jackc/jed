@@ -934,7 +934,7 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 // an i64 overflow while stepping STOPS the series cleanly (no trap). Each generated element
 // charges one generated_row AT THE SOURCE, guarded so a max_cost ceiling aborts a runaway series
 // (54P01) mid-generation before the whole thing materializes (CLAUDE.md §13).
-func (db *engine) generateSeriesRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]storedRow, error) {
+func (db *engine) generateSeriesRows(sp *srfPlan, env *evalEnv, m *costMeter, mask []bool) ([]storedRow, error) {
 	evalInt := func(e *rExpr) (int64, bool, error) {
 		v, err := e.eval(nil, env, m)
 		if err != nil {
@@ -987,7 +987,11 @@ func (db *engine) generateSeriesRows(sp *srfPlan, env *evalEnv, m *costMeter) ([
 			return nil, err
 		}
 		m.Charge(costs.GeneratedRow)
-		out = append(out, storedRow{IntValue(cur)})
+		row := storedRow{IntValue(cur)}
+		if err := m.admitRowMasked(row, mask); err != nil { // a materialized relation row (memory.md §5.1)
+			return nil, err
+		}
+		out = append(out, row)
 		// i64 overflow while stepping ends the series cleanly, matching PostgreSQL.
 		next := cur + step
 		if (step > 0 && next < cur) || (step < 0 && next > cur) {
@@ -1542,7 +1546,7 @@ func evalJtExists(item *JsonNode, c *jtColExists) (Value, error) {
 // flattens; a NULL element is produced as a NULL row). Each produced element charges one generated_row AT
 // THE SOURCE, guarded so a max_cost ceiling aborts a runaway unnest (54P01) mid-generation, exactly like
 // generate_series (CLAUDE.md §13).
-func (db *engine) unnestRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]storedRow, error) {
+func (db *engine) unnestRows(sp *srfPlan, env *evalEnv, m *costMeter, mask []bool) ([]storedRow, error) {
 	v, err := sp.args[0].eval(nil, env, m)
 	if err != nil {
 		return nil, err
@@ -1558,7 +1562,11 @@ func (db *engine) unnestRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]storedR
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
-			out = append(out, storedRow{e})
+			row := storedRow{e}
+			if err := m.admitRowMasked(row, mask); err != nil { // a materialized relation row (memory.md §5.1)
+				return nil, err
+			}
+			out = append(out, row)
 		}
 		return out, nil
 	default:

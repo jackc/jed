@@ -24,6 +24,14 @@ environment variables belong to the tooling, never to the built-in SQL engine.
 The forced run complements internal spill/cleanup/retained-state assertions; a corpus
 pass alone cannot prove that an implementation actually spilled.
 
+`rake conformance:query_memory[bytes,filter]` walks the corpus on all three cores in
+both storage modes with the query-memory account ([memory.md](memory.md)) active: every
+record without its own `# max_query_memory_bytes:` directive runs under the harness-only
+`JED_CONFORMANCE_QUERY_MEMORY` budget (default 2⁴⁰ bytes). Rows, types, errors, and costs
+must be unchanged, and each runner fails a record during which the engine released more
+query memory than it had reserved — an accounting-site bug no single threshold record
+would reveal. It is part of `rake test` and `rake ci`.
+
 Two sibling formats cover concurrency that a one-handle SQL transcript cannot express:
 `# format: concurrency` files model named in-process sessions, while
 `process/*.process.toml` drives real Rust/Go/Node processes over one file. The latter is the planned

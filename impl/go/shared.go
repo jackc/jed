@@ -1645,7 +1645,7 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *i
 	if err != nil {
 		return nil, err
 	}
-	return rowsFromOutcome(out), nil
+	return rowsFromOutcome(out, s.engine.session.queryAccount()), nil
 }
 
 func (s *Session) refreshInitialRead() error {
@@ -2163,3 +2163,11 @@ func (s *Session) MaxScalarBytes() int64 { return s.engine.MaxScalarBytes() }
 
 // SetMaxScalarBytes sets that budget; non-positive values restore the finite default.
 func (s *Session) SetMaxScalarBytes(b int64) { s.engine.SetMaxScalarBytes(b) }
+
+// MaxQueryMemoryBytes is the live query-memory budget per statement (spec/design/memory.md §2), or
+// 0 for unlimited (the default).
+func (s *Session) MaxQueryMemoryBytes() int64 { return s.engine.MaxQueryMemoryBytes() }
+
+// SetMaxQueryMemoryBytes sets the live query-memory budget per statement; non-positive restores the
+// default, unlimited. Over-budget fails 54P05. An open cursor keeps the budget it opened with.
+func (s *Session) SetMaxQueryMemoryBytes(b int64) { s.engine.SetMaxQueryMemoryBytes(b) }

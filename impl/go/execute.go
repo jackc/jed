@@ -44,7 +44,7 @@ func (db *engine) ExecuteStmtParams(stmt statement, params []Value) (outcome, er
 // dispatch. The slot may be consulted inside a transaction and filled when the target signature
 // still matches committed state; working DDL makes the executor's committed-base guard refuse it.
 func (db *engine) executeStmtParamsCached(stmt statement, params []Value, ic *insertStmtCache) (outcome, error) {
-	db.session.scalarBytes = new(int64)
+	db.session.resetStatementMemory()
 	switch {
 	case stmt.Begin != nil:
 		return db.beginTx(stmt.Begin.Writable, stmt.Begin.ModeSet)

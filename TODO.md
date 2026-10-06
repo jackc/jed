@@ -209,7 +209,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   rule. → [attached-databases.md](spec/design/attached-databases.md) _(size: L; deps: N-root commit
   (done); §9/§13)_
 - [x] **Blocking sort and hash-operator spill** — `ORDER BY`, hash `JOIN`, `GROUP BY`/aggregate and `DISTINCT` use bounded row/state buffers under `work_mem` on native file hosts. Ordered disk hash partitions preserve JOIN candidate order, aggregate fold order, first occurrence and exact costs; direct scan feeds and cost prepasses stream. Aggregate DISTINCT and growing ordered-set/hypothetical collections spill, with bounded external ordering and descriptor counts. Shared forced-spill corpus checks run in CI; `rake bench:spill` checks wide-input results/costs and measures RSS. → [spill.md](spec/design/spill.md)
-  - [ ] **Remaining query-memory owners** — admission for upstream materialized CTE/derived/SRF/index producers, window partitions, final scalar values, result collectors and pending writes; host scratch support for OPFS/WASI. `work_mem` is an operator threshold, not a whole-query memory ceiling. → [memory.md](spec/design/memory.md), [hosts.md](spec/design/hosts.md)
+  - [ ] **Remaining query-memory owners** — Q1 (row buffers, result collectors) has landed; operator state (Q2), pending writes (Q3), storage budgets (Q4), remaining scalar kernels, and host scratch support for OPFS/WASI remain. `work_mem` is an operator threshold, not a whole-query memory ceiling. → [memory.md](spec/design/memory.md), [hosts.md](spec/design/hosts.md)
 - [x] **Point-lookup, cold-read, and INSERT performance work** — the measured point-lookup,
   checksum/PAX/buffer-pool, concurrent-fault, and INSERT execution/tree slices have landed; final
   timings, allocation evidence, checksums, and decisions live in
@@ -335,7 +335,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   cumulative scalar allocation allowance (`max_scalar_bytes`, `54P04`), shared across
   internal meters and frozen cursors. See [cost.md §8](spec/design/cost.md) and
   [memory.md](spec/design/memory.md).
-- [ ] Complete the whole-query live-memory contract in memory.md: remaining scalar/codec
-  allocations, decoded rows and result collectors, CTE/blocking operators and spill,
-  transaction-owned pending writes, and database-owned storage/cache budgets. Until then
-  public docs must distinguish the implemented scalar allowance from a full heap limit.
+- [x] **Q1 — rows.** Live, opt-in `max_query_memory_bytes` account (`54P05`, unlimited by
+  default) over row buffers and engine result collectors, in deterministic logical bytes
+  from the shared schedule (`spec/cost/schedule.toml` `[memory]`, vectors in
+  `spec/cost/memory_sizes.toml`); exact thresholds pinned by `resource/query_memory*.test`;
+  `rake conformance:query_memory` runs the whole corpus with accounting active. See
+  [memory.md](spec/design/memory.md) §2–§5.
+- [ ] **Q2 — operator state.** Charge hash-join tables, group/DISTINCT/dedup sets and
+  keys, aggregate accumulator collections (JSON aggregates, ordered-set, hypothetical),
+  sort buffers and top-k heaps, window partition state, and spill spools' resident
+  buffers; spill-capable operators release as they spill, and in-memory databases (which
+  never spill) fail at the gate. → [memory.md](spec/design/memory.md) §4
+- [ ] **Q3 — pending writes.** A transaction-owned account for staged writes that
+  survives statement boundaries and releases at commit/rollback.
+- [ ] **Q4 — storage.** Database-owned accounts for page caches and committed in-memory
+  storage.
+- [ ] Remaining scalar/codec allocations (concatenation, array/JSON construction) under the
+  scalar allowance. Until Q2–Q4 land, public docs must distinguish the implemented budgets
+  from a full heap limit.

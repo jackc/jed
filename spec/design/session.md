@@ -254,6 +254,8 @@ because they have different conformance contracts**:
 | `idle_in_transaction_timeout` | A — envelope | `0` (off) | auto-rollback of an idle open txn (`25P03`, §2.2) | ordered schedule *(deferred, §11)* |
 | `lock_timeout_ms` | A — envelope | `0` (no deadline) | shared cross-process writer-gate wait (`55P03`, locking.md §5.2) | real-process coordination suite |
 | `work_mem` | A — envelope | 256 MiB | *when* an operator spills (never results) | invariant (spill.md §6) |
+| `max_scalar_bytes` | A — envelope | 64 MiB | cumulative scalar allocation per statement (`54P04`) | `# max_scalar_bytes:` |
+| `max_query_memory_bytes` | A — envelope | `0` (unlimited) | live row-buffer memory per statement (`54P05`, memory.md) | `# max_query_memory_bytes:` |
 | session variables | B — semantic | empty | `current_setting()` / `SHOW` results | `# set:` |
 | `time_zone` | B — semantic | `UTC` | `timestamptz`↔`date`/`text` casts, `AT TIME ZONE` | `# timezone:` |
 | random / clock source | B — semantic | OS draws | generator values (entropy.md) | `# seed:` / `# clock:` (existing) |
@@ -810,3 +812,14 @@ Not one slice — a sequence of vertical slices (CLAUDE.md §10), each independe
 Each statement receives a fresh shared scalar reservation account; frozen cursors
 retain theirs. The host may change the setting for subsequent statements; SQL
 cannot raise it. See [memory.md](memory.md) for coverage and `54P04` semantics.
+
+### Query memory envelope
+
+`max_query_memory_bytes` is a nontransactional host session setting, **unlimited
+by default** — like `max_cost`, a host serving untrusted SQL opts in. Each
+statement receives a fresh live account shared by all of its internal meters; a
+cursor retains its statement's account until closed. Over-budget fails
+`54P05 query_memory_limit_exceeded`, an ordinary statement failure. The untrusted
+envelope is therefore `default_privileges = {SELECT}` + per-table `grant` +
+`max_cost` + `lifetime_max_cost` + `max_query_memory_bytes`. See
+[memory.md](memory.md) for the size schedule and the covered owners.

@@ -4,7 +4,7 @@
 
 <svelte:head>
 	<title>Resource limits — jed</title>
-	<meta name="description" content="Bound what an untrusted jed query can consume: a per-statement cost ceiling (max_cost, 54P01) and a per-session cumulative cost budget (lifetime_max_cost, 54P02)." />
+	<meta name="description" content="Bound what an untrusted jed query can consume: a per-statement cost ceiling (max_cost, 54P01), a per-session cumulative cost budget (lifetime_max_cost, 54P02), and scalar and query-memory budgets (54P04, 54P05)." />
 </svelte:head>
 
 # Resource limits
@@ -12,7 +12,8 @@
 jed meters the **execution cost** of every query deterministically — the same query against the same
 database always costs the same, on every core. Cost ceilings bound metered work; a separate
 scalar allocation budget rejects large repeat/padding results and decimal scratch allocations
-before construction. These are independent limits, with the coverage described below.
+before construction; and an opt-in query-memory budget bounds the rows a statement holds at
+once. These are independent limits, with the coverage described below.
 
 ## Two ceilings
 
@@ -54,14 +55,30 @@ scratch reservations in **decimal `sqrt`, `exp`, `ln`, `log`, `log10`, `power`, 
 The string functions also charge input/output byte work before construction; decimals charge
 inside their algorithms. A cost ceiling can reject the work before its allocation budget is used.
 
+## Query memory budget
+
+`max_query_memory_bytes` bounds the **rows a statement holds at once**: materialized relations,
+join results, grouped and `DISTINCT` rows, set-operation and CTE buffers, `RETURNING` results, and
+the rows the engine's own collect-everything helpers (Rust `query_rows`, TypeScript
+`Statement.all()`) gather. It is **unlimited by default** — like `max_cost`, a host serving untrusted
+SQL opts in. Set it through session options or `set_max_query_memory_bytes(bytes)` /
+`SetMaxQueryMemoryBytes(bytes)` / `setMaxQueryMemoryBytes(bytes)`; non-positive values restore
+unlimited. A statement that would exceed it fails with **`54P05`**; exact equality is allowed.
+
+The budget counts **logical bytes** from a fixed schedule — 32 bytes per row and per value, plus
+the UTF-8 length of text, the length of bytea, and similar payloads — not the runtime's actual
+allocations. That makes the limit deterministic: the same query aborts at the same row on every
+core. Rows released along the way (filtered out, consumed by the next stage, handed to your cursor)
+give their bytes back, and a streaming query that hands each row to you as it is produced holds
+almost nothing. A cursor keeps its statement's budget until it closes.
+
 ## Memory coverage
 
-The scalar allowance is **not a whole-query or process-memory cap**. Other scalar kernels,
-input values, decoded rows, join/aggregate/distinct state, result collectors and pending writes
-still need general memory admission. On native file hosts, `work_mem` controls
-sort, hash JOIN, aggregation, and DISTINCT spilling. Their scratch storage preserves
-results and deterministic costs; in-memory and OPFS databases remain resident.
-Upstream window/CTE/index buffers and final scalar results have separate memory
-requirements. `temp_buffers` limits retained temporary storage. These settings are
-not total heap limits. Hosts exposing arbitrary
-untrusted SQL must account for these remaining allocations and host-retained results.
+These budgets are **guardrails, not a process-memory cap**. Still uncovered: operator state
+(hash-join tables, sort buffers, `DISTINCT`/group sets, `json_agg`-style
+accumulators), writes pending in an open transaction, page caches, and scalar kernels beyond
+the ones listed above. On native file hosts, `work_mem` controls sort, hash JOIN, aggregation,
+and DISTINCT spilling. Their scratch storage preserves results and deterministic costs;
+in-memory and OPFS databases remain resident. `temp_buffers` limits retained temporary storage.
+Hosts exposing arbitrary untrusted SQL should combine these settings with process-level memory
+limits and account for host-retained results.

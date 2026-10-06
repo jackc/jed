@@ -4,6 +4,7 @@
 // import cycle). Thin wrappers over the parser + executor — the conformance contract still binds.
 
 import type { Statement } from "./ast.ts";
+import type { QueryAccount } from "./cost.ts";
 import { throwIfAborted } from "./cancel.ts";
 import { Cursor } from "./cursor.ts";
 import {
@@ -123,6 +124,18 @@ export class Rows implements Iterable<Value[]> {
     this.onErr = hook;
   }
 
+  // admitCollected admits a row an engine-owned collector appends while draining this cursor
+  // (spec/design/memory.md §5.1), against the statement's query-memory budget. A 54P05 here is a
+  // statement failure: it fires the block-poison hook like a mid-drain error.
+  admitCollected(row: Value[]): void {
+    try {
+      this.cursor.queryAccount().admitRow(row);
+    } catch (e) {
+      this.fireErr();
+      throw e;
+    }
+  }
+
   // fireErr fires the drain-time error hook exactly once (the iterator short-circuits after, so it
   // cannot double-fire).
   private fireErr(): void {
@@ -182,17 +195,23 @@ export class Rows implements Iterable<Value[]> {
   }
 }
 
-// rowsFromOutcome wraps a materialized outcome as a Rows. It is TOTAL: a non-query statement is
+// rowsFromOutcome wraps a materialized outcome as a Rows, carrying the statement's query-memory account
+// (spec/design/memory.md §2) so each yielded row is released from it. It is TOTAL: a non-query statement is
 // observably a Rows with no output columns — an empty buffered cursor seeded with the accrued cost,
 // carrying the statement's command tag (rows-affected). This is the single exec/query seam: the
 // exec-side path (Statement.run) drains-and-discards such a Rows and returns the tag, so "query on a
 // statement that produces no rows" is valid, not a 42601 (the effect-then-error bug this removes — a
 // write reached here after dispatch already committed it; spec/design/api.md §11).
-export function rowsFromOutcome(out: Outcome): Rows {
+export function rowsFromOutcome(out: Outcome, account: QueryAccount): Rows {
   if (out.kind === "query") {
-    return new Rows(out.columnNames, out.columnTypes, Cursor.buffered(out.rows, out.cost), null);
+    return new Rows(
+      out.columnNames,
+      out.columnTypes,
+      Cursor.buffered(out.rows, out.cost, account),
+      null,
+    );
   }
-  return new Rows([], [], Cursor.buffered([], out.cost), out.rowsAffected);
+  return new Rows([], [], Cursor.buffered([], out.cost, account), out.rowsAffected);
 }
 
 // prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4): a standalone
@@ -263,7 +282,8 @@ function queryStmt(
   // control) self-poisons in executeStmtParams's block branch with the right nuance (a nested BEGIN's
   // 25001 must NOT poison), so it is left intact — only the lazy-lane reads above, which bypass it, are
   // poisoned by the catch.
-  return rowsFromOutcome(db.executeStmtParams(stmt, params, insertHolder));
+  const outcome = db.executeStmtParams(stmt, params, insertHolder);
+  return rowsFromOutcome(outcome, db.session.queryAccount);
 }
 
 // querySql is an alias for query, symmetric with the Rust/Go QuerySQL naming (api.md §6).
@@ -302,7 +322,8 @@ export class Transaction {
   // query runs a query within this transaction, returning a row cursor over the total query seam (a
   // non-query statement is a Rows with no output columns, carrying the command tag).
   query(sql: string, params: Value[] = []): Rows {
-    return rowsFromOutcome(this.db.executeStmtParams(this.db.parse(sql), params));
+    const outcome = this.db.executeStmtParams(this.db.parse(sql), params);
+    return rowsFromOutcome(outcome, this.db.session.queryAccount);
   }
 
   // prepareStatement parses sql once into a reusable PreparedStatement (spec/design/api.md §2.4): a
@@ -324,7 +345,8 @@ export class Transaction {
   // SELECT lane), but it still threads the independent INSERT cache so a row-only block whose visible
   // schema matches committed state can fill and reuse immutable DML resolution (api.md §2.4).
   queryPrepared(stmt: PreparedStatement, params: Value[] = []): Rows {
-    return rowsFromOutcome(this.db.executeStmtParams(stmt.ast, params, stmt.icHolder));
+    const outcome = this.db.executeStmtParams(stmt.ast, params, stmt.icHolder);
+    return rowsFromOutcome(outcome, this.db.session.queryAccount);
   }
 
   // executeCancelable runs a statement within this transaction under an AbortSignal (spec/design/

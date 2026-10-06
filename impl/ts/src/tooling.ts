@@ -27,6 +27,8 @@ export type { Outcome } from "./executor.ts";
 export { Engine } from "./executor.ts";
 export { loadEngine, toImage } from "./format.ts";
 export { create, open, commit, rollback, close } from "./file.ts";
+// Query-memory accounting underflows (spec/design/memory.md) — the conformance harness's check.
+export { queryMemoryUnderflows } from "./cost.ts";
 import { query } from "./api.ts";
 export {
   begin,

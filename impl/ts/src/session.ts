@@ -1,6 +1,6 @@
 import { SpillSet } from "./blocking.ts";
 import type { ActiveTx, SessionOptions, TxStatus } from "./snapshot.ts";
-import { LifetimeBudget, Meter } from "./cost.ts";
+import { LifetimeBudget, Meter, newQueryAccount, type QueryAccount } from "./cost.ts";
 import { Seam } from "./seam.ts";
 import type { ExtensionRegistry } from "./extension.ts";
 import type { SequenceDef } from "./catalog.ts";
@@ -33,6 +33,10 @@ import type { KeyBound } from "./pmap.ts";
 export class SessionState {
   maxScalarBytes: bigint;
   scalarBytes = { used: 0n };
+  // The live query-memory budget per statement (spec/design/memory.md §2; <= 0n ⇒ unlimited, the
+  // default) and the current statement's account, replaced at each statement start like scalarBytes.
+  maxQueryMemoryBytes: bigint;
+  queryAccount: QueryAccount;
   // The open transaction, or null under autocommit (transactions.md §4.1); the Idle/Open/Failed
   // status (session.md §2.2) is derived from this.
   tx: ActiveTx | null;
@@ -122,6 +126,8 @@ export class SessionState {
   constructor(opts: SessionOptions = {}) {
     this.tx = null;
     this.maxScalarBytes = opts.maxScalarBytes ?? 0n;
+    this.maxQueryMemoryBytes = opts.maxQueryMemoryBytes ?? 0n;
+    this.queryAccount = newQueryAccount(this.maxQueryMemoryBytes);
     this.maxCost = opts.maxCost ?? 0n;
     this.fkActionDepth = 0;
     this.lifetime = new LifetimeBudget(opts.lifetimeMaxCost ?? 0n);
@@ -167,6 +173,8 @@ export class SessionState {
     frozen.maxCost = source.maxCost;
     frozen.maxScalarBytes = source.maxScalarBytes;
     frozen.scalarBytes = source.scalarBytes;
+    frozen.maxQueryMemoryBytes = source.maxQueryMemoryBytes;
+    frozen.queryAccount = source.queryAccount;
     frozen.fkActionDepth = source.fkActionDepth;
     frozen.lifetime = source.lifetime;
     frozen.maxSqlLength = source.maxSqlLength;
@@ -212,6 +220,21 @@ export class SessionState {
   scalarLimit(): bigint {
     return this.maxScalarBytes > 0n ? this.maxScalarBytes : DEFAULT_SCALAR_BYTES;
   }
+  // setMaxQueryMemoryBytes sets the live query-memory budget per statement (spec/design/memory.md
+  // §2); non-positive restores the default, unlimited. A cursor already open keeps its own account.
+  setMaxQueryMemoryBytes(bytes: bigint): void {
+    this.maxQueryMemoryBytes = bytes;
+    this.queryAccount = newQueryAccount(bytes);
+  }
+  // queryMemoryLimitSetting is the live query-memory budget, or 0n for unlimited.
+  queryMemoryLimitSetting(): bigint {
+    return this.maxQueryMemoryBytes > 0n ? this.maxQueryMemoryBytes : 0n;
+  }
+  // resetStatementMemory starts a statement's scalar allowance and query-memory account afresh.
+  resetStatementMemory(): void {
+    this.scalarBytes = { used: 0n };
+    this.queryAccount = newQueryAccount(this.maxQueryMemoryBytes);
+  }
   setMaxCost(limit: bigint): void {
     this.maxCost = limit;
   }
@@ -237,12 +260,14 @@ export class SessionState {
     const m = new Meter();
     m.scalarLimit = this.maxScalarBytes;
     m.scalarBytes = this.scalarBytes;
+    m.query = this.queryAccount;
     return m;
   }
   newMeter(): Meter {
     const meter = new Meter(this.maxCost, this.lifetime);
     meter.scalarLimit = this.maxScalarBytes;
     meter.scalarBytes = this.scalarBytes;
+    meter.query = this.queryAccount;
     return meter;
   }
   setMaxSqlLength(bytes: number): void {
@@ -645,8 +670,12 @@ export function* bufferedRows(
 ): Generator<Value[]> {
   const em = engine.execSelectEmit(plan, env, meter, params);
   if (em.mode === "final") {
-    // Already projected + charged — hand each row out (no further cost).
-    for (const row of em.rows) yield row;
+    // Already projected + charged — hand each row out (no further cost); it leaves engine ownership,
+    // so its query-memory charge is released (memory.md §5.3).
+    for (const row of em.rows) {
+      meter.releaseRow(row);
+      yield row;
+    }
     return;
   }
   if (em.mode === "sorted") {
@@ -688,8 +717,12 @@ export function* bufferedRows(
   for (let i = em.start; i < em.end; i++) {
     meter.guard(); // enforce the cost ceiling / cancellation per produced row (CLAUDE.md §13)
     meter.charge(COSTS.rowProduced);
-    if (em.mode === "identity") yield em.rows[i]!;
-    else yield plan.projections.map((p) => evalExpr(p, em.rows[i]!, env, meter));
+    if (em.mode === "identity") {
+      // A pre-projected buffer row leaves engine ownership (memory.md §5.3).
+      const row = em.rows[i]!;
+      meter.releaseRow(row);
+      yield row;
+    } else yield plan.projections.map((p) => evalExpr(p, em.rows[i]!, env, meter));
   }
 }
 

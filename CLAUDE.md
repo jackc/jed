@@ -505,8 +505,9 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   external merge sort + its streaming single-table feed have landed**, [spec/design/spill.md](spec/design/spill.md),
   bounded by the `work_mem` handle setting; **hash JOIN, aggregate, and DISTINCT also spill** using
   bounded row spools and disk hash partitions. Ordered partition replay preserves probe/bucket
-  order, aggregate fold order, and cost. Upstream window/CTE/index materialization and final
-  scalar/result admission remain separate memory owners, not a whole-query memory ceiling), and **lazy
+  order, aggregate fold order, and cost. Upstream window/CTE/index materialization and result
+  buffers are charged by the separate query-memory account (`max_query_memory_bytes`, memory.md
+  Q1), so `work_mem` stays an operator threshold, not a whole-query memory ceiling), and **lazy
   record decode** (a faulted leaf stays its **compact on-disk bytes**,
   decoding each column **on demand** for the query's touched set instead of materializing every
   value into an inflated `Value` tree — **design landed**, [spec/design/lazy-record.md](spec/design/lazy-record.md),
@@ -924,11 +925,15 @@ from `spec/encoding/` or an old Apache-2.0 tag rather than vendoring the BSL sou
 `repeat`/padding have proportional UTF-8 work charges and pre-allocation byte checks;
 exact decimal transcendentals charge guarded internal steps. A finite 64 MiB default
 `max_scalar_bytes` allowance bounds their cumulative logical output/scratch allocation
-per statement (`54P04`), including internal meters and frozen cursors. Full query-memory
-admission is specified in `spec/design/memory.md` but not yet implemented for all scalars,
-row/result buffers, blocking operators and pending writes. Resource-exhaustion resistance
-remains a requirement; do not claim the current cost/scalar limits are a whole-engine
-memory guarantee. Host extensions remain outside these guarantees.
+per statement (`54P04`), including internal meters and frozen cursors. A live, opt-in
+`max_query_memory_bytes` account (unlimited by default; `54P05`) bounds row buffers and
+engine result collectors — relation materialization, join outputs, grouped/DISTINCT rows,
+set operations, CTE/recursive-CTE buffers, RETURNING/EXPLAIN results — in deterministic
+logical bytes (slice Q1 of `spec/design/memory.md`). Operator state (hash tables, sort
+buffers, accumulators, spill spools), pending writes, and storage caches are still uncovered
+(Q2–Q4), as are remaining scalar kernels. These are guardrails, not heap caps: resource-
+exhaustion resistance remains a requirement; do not claim the current limits are a
+whole-engine memory guarantee. Host extensions remain outside these guarantees.
 
 **A fundamental project requirement: untrusted SQL is safe to run.** A first-class use case
 is a host exposing an ad-hoc query surface to its own users, so a query supplied by an
@@ -940,7 +945,8 @@ built-in surface**; the enforcement status and remaining memory coverage are sta
 Its concrete vehicle is a configured **session** (`spec/design/session.md`):
 a host serves untrusted SQL through a session granted only the privileges it needs
 (`default_privileges = {SELECT}` + per-table `grant`) + per-statement-`max_cost`-capped +
-`lifetime_max_cost`-budgeted. It rests on **three guarantees**, each below:
+`lifetime_max_cost`-budgeted + `max_query_memory_bytes`-bounded. It rests on **three
+guarantees**, each below:
 
 1. **Memory safety** — a crafted query cannot corrupt memory (every core is a memory-safe
    language).
@@ -949,9 +955,10 @@ a host serves untrusted SQL through a session granted only the privileges it nee
    reach, no nondeterminism outside the §10 entropy/clock seam). There is simply nothing in
    the surface to abuse.
 3. **Bounded resources** — a **deterministic cost meter + ceiling** bounds metered work,
-   a **fixed parser nesting-depth limit** bounds native-stack recursion, and the finite
-   scalar allowance bounds the covered allocations. Complete query-memory enforcement
-   remains required under memory.md; these independent gates do not yet cover every heap owner.
+   a **fixed parser nesting-depth limit** bounds native-stack recursion, the finite
+   scalar allowance bounds the covered allocations, and the opt-in query-memory account
+   bounds live row buffers. Complete query-memory enforcement remains required under
+   memory.md; these independent gates do not yet cover every heap owner.
 
 **Scope boundary — host/application-supplied functions are excluded.** This guarantee covers
 the engine and its built-in surface *only*. The moment a host registers an

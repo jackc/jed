@@ -23,7 +23,10 @@ func (db *engine) boundedBlockingEligible(p *selectPlan) bool {
 	if len(p.rels) == 1 && !p.isAgg && !p.distinct {
 		return false
 	}
-	return true
+	// A join takes the bounded lane only when it hashes or is a multi-step physical join — the same
+	// predicate as the Rust core's blocking_spill_eligible. The lane choice must be mirrored across
+	// cores because a lane determines which rows are query-memory row buffers (memory.md §5.4).
+	return p.isAgg || p.distinct || p.phys.hashJoin != nil || len(p.phys.joinSteps) > 0
 }
 
 func (db *engine) scanBlockingRel(p *selectPlan, i int, env *evalEnv, m *costMeter, out *rowSpool) error {
@@ -33,6 +36,9 @@ func (db *engine) scanBlockingRel(p *selectPlan, i int, env *evalEnv, m *costMet
 		if err != nil {
 			return err
 		}
+		// Spool residency is operator state bounded by work_mem (memory.md §4 Q2): the rows leave the
+		// query-memory row account as they enter the spool.
+		releaseRowsMasked(m, rows, p.relMasks[i])
 		for _, row := range rows {
 			if err := out.push(row); err != nil {
 				return err
@@ -534,13 +540,27 @@ func (db *engine) execBoundedBlocking(p *selectPlan, env *evalEnv, m *costMeter)
 		}
 	}
 	window := func(input *rowSpool) (*rowSpool, error) {
+		// While materialized the window input is a query-memory row buffer (memory.md §5.1):
+		// pre-projection rows under the touched mask, or projected-shape group rows for a grouped
+		// window.
+		var mask []bool
+		if !p.isAgg {
+			mask = p.memoryMask(m)
+		}
 		var rs []storedRow
-		if err := input.each(func(r storedRow) error { rs = append(rs, r); return nil }); err != nil {
+		if err := input.each(func(r storedRow) error {
+			if err := m.admitRowMasked(r, mask); err != nil {
+				return err
+			}
+			rs = append(rs, r)
+			return nil
+		}); err != nil {
 			return nil, err
 		}
 		if err := applyWindowStage(rs, p.windowSpecs, p.windowKeys, env, m); err != nil {
 			return nil, err
 		}
+		releaseRowsMasked(m, rs, mask)
 		out := spool()
 		for _, r := range rs {
 			if err := out.push(r); err != nil {
@@ -1084,6 +1104,7 @@ func (db *engine) blockingDynamicRight(p *selectPlan, inner int, left storedRow,
 	if err != nil {
 		return nil, err
 	}
+	releaseRowsMasked(m, rows, p.relMasks[inner])
 	out := newRowSpool(db)
 	for _, row := range rows {
 		if err := out.push(row); err != nil {

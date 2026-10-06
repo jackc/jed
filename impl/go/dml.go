@@ -2565,6 +2565,9 @@ func (db *engine) projectReturning(nodes []*rExpr, rows []storedRow, others []st
 			}
 			vals = append(vals, v)
 		}
+		if err := meter.admitRow(vals); err != nil { // a RETURNING result row (memory.md §5.1)
+			return nil, err
+		}
 		out = append(out, vals)
 	}
 	return out, nil

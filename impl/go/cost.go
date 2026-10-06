@@ -3,6 +3,7 @@ package jed
 import (
 	"fmt"
 	"math"
+	"sync/atomic"
 )
 
 // Deterministic cost meter (CLAUDE.md §13).
@@ -35,6 +36,9 @@ type costMeter struct {
 
 	scalarBytes *int64
 	scalarLimit int64
+	// query is the statement's live query-memory account (spec/design/memory.md §2), shared by
+	// every meter of the statement like scalarBytes; an unlimited account never computes a size.
+	query queryAccount
 
 	// Accrued is the total cost so far FOR THIS STATEMENT (CLAUDE.md §13) — the figure reported
 	// on outcome and asserted by the `# cost:` directive. i64 mirrors the engine's native
@@ -167,4 +171,142 @@ func (m *costMeter) ReserveScalar(bytes int64) error {
 	}
 	*m.scalarBytes += bytes
 	return nil
+}
+
+// queryMemoryUnderflows counts releases that exceeded their account's balance — always an engine
+// accounting bug. Read by the conformance harness's whole-corpus accounting mode
+// (QueryMemoryUnderflows).
+var queryMemoryUnderflows atomic.Uint64
+
+// QueryMemoryUnderflows reports how many query-memory releases have exceeded their account's
+// balance in this process (spec/design/memory.md §5) — an engine accounting bug detector for the
+// conformance harness. Always 0 in a correct engine.
+func QueryMemoryUnderflows() uint64 { return queryMemoryUnderflows.Load() }
+
+// queryAccount is a statement's live query-memory account (spec/design/memory.md §2): the shared
+// running total and the budget (limit <= 0 ⇒ unlimited). Copied into every meter of the statement
+// and into the cursor that outlives it, so all of them reserve against one total.
+type queryAccount struct {
+	used  *int64
+	limit int64
+}
+
+// active reports whether the account has a finite budget. Every admission site tests this first,
+// so the unlimited default computes no sizes.
+func (a queryAccount) active() bool { return a.limit > 0 && a.used != nil }
+
+// reserve adds bytes, or fails 54P05 when used + bytes > limit (equality allowed).
+func (a queryAccount) reserve(bytes int64) error {
+	if !a.active() {
+		return nil
+	}
+	if bytes > a.limit-*a.used {
+		return newError(QueryMemoryLimitExceeded, fmt.Sprintf("query memory exceeded the limit of %d bytes", a.limit))
+	}
+	*a.used += bytes
+	return nil
+}
+
+// release returns bytes; never errors, never below zero. A release larger than the balance is an
+// accounting bug: it clamps and is counted for the conformance harness.
+func (a queryAccount) release(bytes int64) {
+	if !a.active() {
+		return
+	}
+	if bytes > *a.used {
+		queryMemoryUnderflows.Add(1)
+		*a.used = 0
+		return
+	}
+	*a.used -= bytes
+}
+
+// admitRow admits a projected row (memory.md §5.1).
+func (a queryAccount) admitRow(row []Value) error {
+	if !a.active() {
+		return nil
+	}
+	return a.reserve(memRowBytes(row))
+}
+
+// releaseRow releases a projected row leaving engine ownership (memory.md §5.3).
+func (a queryAccount) releaseRow(row []Value) {
+	if a.active() {
+		a.release(memRowBytes(row))
+	}
+}
+
+// measureRows is the bytes of a buffer of projected rows under account a, or 0 when unlimited
+// (nothing is measured).
+func measureRows[R ~[]Value](a queryAccount, rows []R) int64 {
+	if !a.active() {
+		return 0
+	}
+	var n int64
+	for _, r := range rows {
+		n += memRowBytes(r)
+	}
+	return n
+}
+
+// queryMemoryActive reports whether the statement has a finite query-memory budget.
+func (m *costMeter) queryMemoryActive() bool { return m.query.active() }
+
+// releaseQuery returns bytes of live query memory; never errors, never below zero.
+func (m *costMeter) releaseQuery(bytes int64) { m.query.release(bytes) }
+
+// admitRow admits a projected row appended to a row buffer (memory.md §5.1).
+func (m *costMeter) admitRow(row []Value) error {
+	if !m.query.active() {
+		return nil
+	}
+	return m.query.reserve(memRowBytes(row))
+}
+
+// admitRowMasked admits a pre-projection row under the plan's touched mask (memory.md §3).
+func (m *costMeter) admitRowMasked(row []Value, mask []bool) error {
+	if !m.query.active() {
+		return nil
+	}
+	return m.query.reserve(memRowBytesMasked(row, mask))
+}
+
+// admitValue admits a value appended to a buffered row (memory.md §5.1).
+func (m *costMeter) admitValue(v Value) error {
+	if !m.query.active() {
+		return nil
+	}
+	return m.query.reserve(memValueBytes(v))
+}
+
+// releaseRow releases a discarded projected row.
+func (m *costMeter) releaseRow(row []Value) {
+	if m.query.active() {
+		m.query.release(memRowBytes(row))
+	}
+}
+
+// releaseRowMasked releases a discarded pre-projection row under the plan's touched mask.
+func (m *costMeter) releaseRowMasked(row []Value, mask []bool) {
+	if m.query.active() {
+		m.query.release(memRowBytesMasked(row, mask))
+	}
+}
+
+// releaseRows releases a whole discarded buffer of projected rows.
+func releaseRows[R ~[]Value](m *costMeter, rows []R) {
+	if m.query.active() {
+		m.query.release(measureRows(m.query, rows))
+	}
+}
+
+// releaseRowsMasked releases a whole discarded buffer of pre-projection rows under the touched mask.
+func releaseRowsMasked[R ~[]Value](m *costMeter, rows []R, mask []bool) {
+	if m.query.active() {
+		var n int64
+		for _, r := range rows {
+			n += memRowBytesMasked(r, mask)
+		}
+		m.query.release(n)
+	}
 }

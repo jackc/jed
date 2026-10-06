@@ -22,6 +22,88 @@
 
 import { DEFAULT_SCALAR_BYTES } from "./costs.ts";
 import { engineError } from "./errors.ts";
+import { rowBytes, rowBytesMasked, valueBytes } from "./memsize.ts";
+import type { Value } from "./value.ts";
+
+// queryMemoryUnderflows counts releases that exceeded their account's balance — always an engine
+// accounting bug. Read by the conformance harness's whole-corpus accounting mode
+// (JED_CONFORMANCE_QUERY_MEMORY), which fails the record that caused it.
+export const queryMemoryUnderflows = { count: 0 };
+
+// QueryAccount is a statement's live query-memory account (spec/design/memory.md §2): the running
+// total and the budget (limit <= 0 ⇒ unlimited). Shared BY REFERENCE by every meter of the statement
+// and by the cursor that outlives it, so all of them reserve against one total. Plain numbers: the
+// logical bytes stay far below 2^53 (a huge limit is clamped to Number.MAX_SAFE_INTEGER).
+export class QueryAccount {
+  used = 0;
+  readonly limit: number;
+
+  constructor(limit = 0) {
+    this.limit = limit;
+  }
+
+  // active reports whether the statement has a finite budget. Every admission site tests this first,
+  // so the unlimited default computes no sizes.
+  active(): boolean {
+    return this.limit > 0;
+  }
+
+  // reserve adds bytes, or throws 54P05 when used + bytes > limit (equality allowed).
+  reserve(bytes: number): void {
+    if (this.limit <= 0) return;
+    if (bytes > this.limit - this.used) {
+      throw engineError(
+        "query_memory_limit_exceeded",
+        `query memory exceeded the limit of ${this.limit} bytes`,
+      );
+    }
+    this.used += bytes;
+  }
+
+  // release returns bytes; never throws, never below zero. A release past the balance is an
+  // accounting bug (a release without its reservation): clamp, and count it.
+  release(bytes: number): void {
+    if (this.limit <= 0) return;
+    if (bytes > this.used) {
+      queryMemoryUnderflows.count++;
+      this.used = 0;
+      return;
+    }
+    this.used -= bytes;
+  }
+
+  // admitRow admits a projected row (memory.md §5.1).
+  admitRow(row: Value[]): void {
+    if (this.limit > 0) this.reserve(rowBytes(row));
+  }
+
+  // releaseRow releases a projected row leaving engine ownership (memory.md §5.3).
+  releaseRow(row: Value[]): void {
+    if (this.limit > 0) this.release(rowBytes(row));
+  }
+
+  // measureRows is the bytes of a buffer of projected rows, or 0 when unlimited (nothing measured).
+  measureRows(rows: Value[][]): number {
+    if (this.limit <= 0) return 0;
+    let n = 0;
+    for (let i = 0; i < rows.length; i++) n += rowBytes(rows[i]!);
+    return n;
+  }
+}
+
+// UNLIMITED_QUERY_ACCOUNT is the default account of a meter with no session context: unlimited, so it
+// is never mutated (every method returns before touching `used`).
+export const UNLIMITED_QUERY_ACCOUNT = new QueryAccount(0);
+
+// newQueryAccount starts a statement's account for the host setting: non-positive ⇒ the shared
+// unlimited account (never mutated, so no allocation on the default path); a huge value clamps to
+// Number.MAX_SAFE_INTEGER.
+export function newQueryAccount(bytes: bigint): QueryAccount {
+  if (bytes <= 0n) return UNLIMITED_QUERY_ACCOUNT;
+  return new QueryAccount(
+    bytes > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(bytes),
+  );
+}
 
 // LifetimeBudget is the session lifetime-budget handle a Meter carries (spec/design/session.md
 // §5.4): a SHARED object holding the session's cumulative cost total plus the budget. The meter
@@ -60,6 +142,60 @@ export class Meter {
         `scalar allocations exceeded the limit of ${limit} bytes`,
       );
     this.scalarBytes.used += bytes;
+  }
+
+  // The statement's live query-memory account (spec/design/memory.md §2), shared by every meter of
+  // the statement like scalarBytes; an unlimited account never computes a size.
+  query: QueryAccount = UNLIMITED_QUERY_ACCOUNT;
+
+  // queryMemoryActive reports whether the statement has a finite query-memory budget. Every admission
+  // site tests this first, so the unlimited default computes no sizes.
+  queryMemoryActive(): boolean {
+    return this.query.limit > 0;
+  }
+  // reserveQuery reserves bytes of live query memory, or throws 54P05 (equality allowed).
+  reserveQuery(bytes: number): void {
+    this.query.reserve(bytes);
+  }
+  // releaseQuery returns bytes of live query memory; never throws, never below zero.
+  releaseQuery(bytes: number): void {
+    this.query.release(bytes);
+  }
+  // admitRow admits a projected row appended to a row buffer (memory.md §5.1).
+  admitRow(row: Value[]): void {
+    if (this.query.limit > 0) this.query.reserve(rowBytes(row));
+  }
+  // admitRowMasked admits a pre-projection row under the plan's touched mask (memory.md §3).
+  admitRowMasked(row: Value[], mask: boolean[]): void {
+    if (this.query.limit > 0) this.query.reserve(rowBytesMasked(row, mask));
+  }
+  // admitValue admits a value appended to a buffered row (memory.md §5.1).
+  admitValue(v: Value): void {
+    if (this.query.limit > 0) this.query.reserve(valueBytes(v));
+  }
+  // releaseRow releases a discarded projected row.
+  releaseRow(row: Value[]): void {
+    if (this.query.limit > 0) this.query.release(rowBytes(row));
+  }
+  // releaseRowMasked releases a discarded pre-projection row under the plan's touched mask.
+  releaseRowMasked(row: Value[], mask: boolean[]): void {
+    if (this.query.limit > 0) this.query.release(rowBytesMasked(row, mask));
+  }
+  // releaseRows releases a whole discarded buffer of projected rows.
+  releaseRows(rows: Value[][]): void {
+    if (this.query.limit > 0) {
+      let n = 0;
+      for (let i = 0; i < rows.length; i++) n += rowBytes(rows[i]!);
+      this.query.release(n);
+    }
+  }
+  // releaseRowsMasked releases a whole discarded buffer of pre-projection rows under the mask.
+  releaseRowsMasked(rows: Value[][], mask: boolean[]): void {
+    if (this.query.limit > 0) {
+      let n = 0;
+      for (let i = 0; i < rows.length; i++) n += rowBytesMasked(rows[i]!, mask);
+      this.query.release(n);
+    }
   }
 
   // Total cost accrued so far FOR THIS STATEMENT (CLAUDE.md §13) — the figure reported on Outcome

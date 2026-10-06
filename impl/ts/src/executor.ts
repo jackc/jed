@@ -97,7 +97,7 @@ import {
   colTypeScalar,
   resolveColType,
 } from "./catalog.ts";
-import { Meter } from "./cost.ts";
+import { Meter, type QueryAccount } from "./cost.ts";
 import { optimizeSelect } from "./optimize.ts";
 import {
   type Collation,
@@ -109,6 +109,7 @@ import {
   sortKey as collationSortKey,
 } from "./collation.ts";
 import { COSTS } from "./costs.ts";
+import { rowBytes, rowBytesMasked } from "./memsize.ts";
 import { collectColumnStatistics, type ColumnStatistics } from "./statistics.ts";
 import {
   andSelectivity,
@@ -560,6 +561,37 @@ export type Emitter = {
   projCols?: number[];
   sel?: number[];
 };
+
+// rebaseRowsMasked re-measures a charged projected result that becomes relation rows under the
+// relation's touched mask (memory.md §5.2): the masked measure never exceeds the full one, so this only
+// releases.
+export function rebaseRowsMasked(meter: Meter, rows: Row[], mask: boolean[]): void {
+  if (!meter.queryMemoryActive()) return;
+  let full = 0;
+  let masked = 0;
+  for (const r of rows) {
+    full += rowBytes(r);
+    masked += rowBytesMasked(r, mask);
+  }
+  meter.releaseQuery(full - masked);
+}
+
+// releaseCteBuffers releases a WITH's CTE buffers, which die with the statement part that materialized
+// them (memory.md §5.3) — essential for a nested WITH re-run per outer row.
+function releaseCteBuffers(acct: QueryAccount, buffers: Row[][]): void {
+  if (!acct.active()) return;
+  for (const buf of buffers) acct.release(acct.measureRows(buf));
+}
+
+// memoryMask is the touched mask over the logical combined row (each relation's mask concatenated in
+// column order) — how query memory measures a pre-projection row (spec/design/memory.md §3). Empty
+// when the meter is unlimited, since no measurement will run.
+export function memoryMask(plan: SelectPlan, meter: Meter): boolean[] {
+  if (!meter.queryMemoryActive()) return [];
+  const out: boolean[] = [];
+  for (const m of plan.relMasks) for (const b of m) out.push(b);
+  return out;
+}
 
 // finalEmitter wraps an already-projected-and-charged result (the special input-streaming paths) as a
 // "final" Emitter — emission hands the rows out with no further charge (spec/design/streaming.md §4).
@@ -1396,6 +1428,14 @@ export class Engine {
   // the file (mirrors setMaxCost).
   setMaxScalarBytes(bytes: bigint): void { this.session.maxScalarBytes = bytes; }
   get maxScalarBytes(): bigint { return this.session.scalarLimit(); }
+  // setMaxQueryMemoryBytes sets the live query-memory budget per statement (spec/design/memory.md §2);
+  // non-positive restores the default, unlimited. Over-budget fails 54P05.
+  setMaxQueryMemoryBytes(bytes: bigint): void {
+    this.session.setMaxQueryMemoryBytes(bytes);
+  }
+  get maxQueryMemoryBytes(): bigint {
+    return this.session.queryMemoryLimitSetting();
+  }
   setWorkMem(bytes: number): void {
     this.session.workMem = bytes;
   }
@@ -2302,7 +2342,7 @@ export class Engine {
     params: Value[],
     insertHolder: InsertCacheHolder | null = null,
   ): Outcome {
-    this.session.scalarBytes = { used: 0n };
+    this.session.resetStatementMemory();
     switch (stmt.kind) {
       case "begin":
         return this.beginTx(stmt.writable);
@@ -2749,7 +2789,7 @@ export class Engine {
   // pure, so a read that falls through to the materialized path re-running them is harmless (identical
   // result). (CLAUDE.md §13 — the safe-total-query contract.)
   gateReadLanes(stmt: Statement): void {
-    this.session.scalarBytes = { used: 0n };
+    this.session.resetStatementMemory();
     if (this.session.tx?.failed) {
       throw engineError(
         "in_failed_sql_transaction",
@@ -3956,6 +3996,11 @@ export class Engine {
       innerOut.kind === "statement"
         ? BigInt(innerOut.rowsAffected ?? 0) // a DML statement without RETURNING
         : BigInt(innerOut.rows.length);
+    // The analyzed statement's result is counted, then discarded (memory.md §5.3).
+    if (innerOut.kind === "query") {
+      const acct = this.session.queryAccount;
+      acct.release(acct.measureRows(innerOut.rows));
+    }
     body.setActualCosts(explainActualCosts(estimates, innerOut.cost));
     const used = new Map<string, number>();
     const cteUsed = new Map<string, number>();
@@ -4072,17 +4117,19 @@ export class Engine {
       columnTypes.push("text");
     }
     const lane = ex.lane ? this.explainLane(ex.inner) : "";
+    const outRows = rows.map((row) => {
+      const out = [intValue(BigInt(row.depth)), textValue(row.node), textValue(row.detail)];
+      if (ex.costs) out.push(intValue(row.estRows), intValue(row.estCost));
+      if (ex.analyze) out.push(intValue(row.actualCost));
+      if (ex.lane) out.push(textValue(lane));
+      return out;
+    });
+    for (const row of outRows) meter.admitRow(row); // the EXPLAIN result rows (memory.md §5.1)
     return {
       kind: "query",
       columnNames,
       columnTypes,
-      rows: rows.map((row) => {
-        const out = [intValue(BigInt(row.depth)), textValue(row.node), textValue(row.detail)];
-        if (ex.costs) out.push(intValue(row.estRows), intValue(row.estCost));
-        if (ex.analyze) out.push(intValue(row.actualCost));
-        if (ex.lane) out.push(textValue(lane));
-        return out;
-      }),
+      rows: outRows,
       cost: meter.accrued,
     };
   }
@@ -10281,7 +10328,9 @@ export class Engine {
       meter.guard();
       meter.charge(COSTS.rowProduced);
       const combined = row.concat(others !== null ? others[i]! : row.map(() => nullValue()));
-      out.push(nodes.map((node) => evalExpr(node, combined, env, meter)));
+      const vals = nodes.map((node) => evalExpr(node, combined, env, meter));
+      meter.admitRow(vals); // a RETURNING result row (memory.md §5.1)
+      out.push(vals);
     });
     return out;
   }
@@ -11564,6 +11613,7 @@ export class Engine {
     const subqueryCost = { value: 0n };
     this.foldUncorrelatedInPlan(plan, bound, ctx, subqueryCost);
     const r = this.execQueryPlan(plan, [], bound, ctx);
+    releaseCteBuffers(this.session.queryAccount, buffers);
     const result = { ...r, cost: r.cost + subqueryCost.value + totalCost };
     this.recordExplainActualParent("WITH", result.cost);
     return result;
@@ -11657,6 +11707,10 @@ export class Engine {
     };
     const anchorTypes = anchorPlan.columnTypes;
     const rhsTypes = rt.plan.columnTypes;
+    // Query-memory row accounting (memory.md §5): each term's result is charged by its own execution;
+    // a kept row's result copy is admitted, a duplicate is released, and a consumed working table is
+    // released when the next iteration replaces it.
+    const acct = this.session.queryAccount;
 
     // Evaluate the anchor: its rows seed both the result and the first working table.
     const ar = this.execQueryPlan(
@@ -11682,17 +11736,23 @@ export class Engine {
     let working: Row[] = [];
     for (const row of ar.rows) {
       if (keep(row)) {
+        acct.admitRow(row);
         result.push(row);
         working.push(row);
+      } else {
+        acct.releaseRow(row);
       }
     }
 
     // The recursive term scans the WORKING table through the CTE's own buffer slot (ci); the earlier
-    // CTEs keep their full buffers. Build the buffer array once and swap slot ci per iteration.
+    // CTEs keep their full buffers. Build the buffer array once and swap slot ci per iteration. The
+    // copy of the earlier buffers is itself a row buffer.
     const rhsBuffers: Row[][] = priorBuffers.slice(0, ci);
+    for (const buf of rhsBuffers) acct.reserve(acct.measureRows(buf));
     rhsBuffers.push([]); // slot ci
 
     while (working.length > 0) {
+      acct.release(acct.measureRows(rhsBuffers[ci]!));
       rhsBuffers[ci] = working;
       working = [];
       const rr = this.execQueryPlan(
@@ -11708,14 +11768,20 @@ export class Engine {
       );
       totalCost.value += rr.cost;
       guard(totalCost.value);
+      const beforeCoerce = acct.measureRows(rr.rows);
       coerceSetopRows(rr.rows, rhsTypes, anchorTypes);
+      acct.reserve(acct.measureRows(rr.rows) - beforeCoerce);
       for (const row of rr.rows) {
         if (keep(row)) {
+          acct.admitRow(row);
           result.push(row);
           working.push(row);
+        } else {
+          acct.releaseRow(row);
         }
       }
     }
+    for (const buf of rhsBuffers) acct.release(acct.measureRows(buf));
     return result;
   }
 
@@ -11855,6 +11921,7 @@ export class Engine {
       this.recordExplainActual("Update " + body.table, outcome.cost);
     else if (body.kind === "delete")
       this.recordExplainActual("Delete " + body.table, outcome.cost);
+    releaseCteBuffers(this.session.queryAccount, buffers);
     outcome = addOutcomeCost(outcome, totalCost.value);
     this.recordExplainActualParent("WITH", outcome.cost);
     return outcome;
@@ -11997,6 +12064,7 @@ export class Engine {
     );
     const ctx = extendCteCtx(inherited, plan.modes, plan.bindings, buffers);
     const r = this.execQueryPlan(plan.body, outer, params, ctx);
+    releaseCteBuffers(this.session.queryAccount, buffers);
     r.cost += totalCost;
     this.recordExplainActualParent("WITH", r.cost);
     return r;
@@ -12068,10 +12136,17 @@ export class Engine {
     const left = this.execQueryPlan(plan.lhs, outer, params, ctes);
     const right = this.execQueryPlan(plan.rhs, outer, params, ctes);
 
+    // Both arms arrive charged (memory.md §5.2). Coercion growth is reserved; rows the combine or the
+    // LIMIT/OFFSET window drops are released (§5.3).
+    const acct = this.session.queryAccount;
+    const beforeCoerce = acct.measureRows(left.rows) + acct.measureRows(right.rows);
     coerceSetopRows(left.rows, left.columnTypes, plan.columnTypes);
     coerceSetopRows(right.rows, right.columnTypes, plan.columnTypes);
+    const coerced = acct.measureRows(left.rows) + acct.measureRows(right.rows);
+    acct.reserve(coerced - beforeCoerce);
 
     let rows = combineSetop(plan.op, plan.all, left.rows, right.rows);
+    acct.release(coerced - acct.measureRows(rows));
     const cost = left.cost + right.cost;
     const rootNode =
       plan.limit !== null || plan.offset !== null
@@ -12090,6 +12165,11 @@ export class Engine {
     const n = BigInt(rows.length);
     const start = plan.offset === null ? 0n : plan.offset < n ? plan.offset : n;
     const end = plan.limit !== null && plan.limit < n - start ? start + plan.limit : n;
+    if (acct.active()) {
+      acct.release(
+        acct.measureRows(rows.slice(0, Number(start))) + acct.measureRows(rows.slice(Number(end))),
+      );
+    }
     rows = rows.slice(Number(start), Number(end));
     this.recordExplainActualParent(rootNode, cost);
 
@@ -12201,6 +12281,7 @@ export class Engine {
         }
         out.push(v);
       }
+      meter.admitRow(out); // a materialized relation row (memory.md §5.1)
       rows.push(out);
     }
     this.recordExplainActualParent("Values", meter.accrued);
@@ -13847,7 +13928,7 @@ export class Engine {
     return out;
   }
 
-  private generateSeriesRows(srf: SrfPlan, env: EvalEnv, meter: Meter): Row[] {
+  private generateSeriesRows(srf: SrfPlan, env: EvalEnv, meter: Meter, mask: boolean[]): Row[] {
     const evalInt = (e: RExpr): bigint | null => {
       const v = evalExpr(e, [], env, meter);
       if (v.kind === "int") return v.int;
@@ -13868,7 +13949,9 @@ export class Engine {
       if (!inRange) break;
       meter.guard();
       meter.charge(COSTS.generatedRow);
-      out.push([intValue(cur)]);
+      const row = [intValue(cur)];
+      meter.admitRowMasked(row, mask); // a materialized relation row (memory.md §5.1)
+      out.push(row);
       // i64 overflow while stepping ends the series cleanly, matching PostgreSQL (and Rust/Go).
       const next = cur + step;
       if (next > 9223372036854775807n || next < -9223372036854775808n) break;
@@ -13883,7 +13966,7 @@ export class Engine {
   // zero rows; otherwise one row per element in flattened row-major order (a multidimensional array flattens;
   // a NULL element is produced as a NULL row). Each produced element charges one generatedRow AT THE SOURCE,
   // guarded so a maxCost ceiling aborts a runaway unnest (54P01) mid-generation, exactly like generate_series.
-  private unnestRows(srf: SrfPlan, env: EvalEnv, meter: Meter): Row[] {
+  private unnestRows(srf: SrfPlan, env: EvalEnv, meter: Meter, mask: boolean[]): Row[] {
     const v = evalExpr(srf.args[0]!, [], env, meter);
     // A NULL array → zero rows (PG; the empty_on_null discipline).
     if (v.kind === "null") return [];
@@ -13892,7 +13975,9 @@ export class Engine {
     for (const e of v.elements) {
       meter.guard();
       meter.charge(COSTS.generatedRow);
-      out.push([e]);
+      const row = [e];
+      meter.admitRowMasked(row, mask); // a materialized relation row (memory.md §5.1)
+      out.push(row);
     }
     return out;
   }
@@ -14062,6 +14147,10 @@ export class Engine {
     e.tempStorage = null;
     e.openStreams = 0;
     e.estimatorTouched = new Set();
+    // Not profiling EXPLAIN ANALYZE: the lane gates test `explainActualProfile === null`, so leaving it
+    // undefined would silently disable the vectorized/columnar lanes on every cursor — a lane choice
+    // that must match the other cores (memory.md §5.4).
+    e.explainActualProfile = null;
     return e;
   }
 
@@ -14201,6 +14290,7 @@ export class Engine {
           return r.done ? undefined : r.value;
         },
         cost: () => meter.accrued,
+        queryAccount: () => meter.query,
         close: () => {
           gen.return(undefined);
         },
@@ -14232,6 +14322,7 @@ export class Engine {
         return r.done ? undefined : r.value;
       },
       cost: () => meter.accrued,
+      queryAccount: () => meter.query,
       close: () => {
         gen.return(undefined);
       },
@@ -14382,9 +14473,13 @@ export class Engine {
           done = true;
           return undefined;
         }
-        return rows[idx++]!;
+        // The row leaves engine ownership: release its query-memory charge (memory.md §5.3).
+        const row = rows[idx++]!;
+        snap.session.queryAccount.releaseRow(row);
+        return row;
       },
       cost: () => cost,
+      queryAccount: () => snap.session.queryAccount,
       close: () => {
         done = true;
         rows = [];
@@ -14461,14 +14556,17 @@ export class Engine {
           if (passed <= offset) return true;
           meter.charge(COSTS.rowProduced);
           outputWork += COSTS.rowProduced;
+          meter.admitRow(tuple); // the buffered result collector (memory.md §5.1)
           out.push(tuple);
         } else {
           passed += 1n;
           if (passed <= offset) return true;
           const before = meter.accrued;
           meter.charge(COSTS.rowProduced);
-          out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
+          const projected = plan.projections.map((p) => evalExpr(p, row, env, meter));
           outputWork += meter.accrued - before;
+          meter.admitRow(projected); // the buffered result collector (memory.md §5.1)
+          out.push(projected);
         }
         // Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every survivor
         // after OFFSET, in primary-key scan order).
@@ -14744,6 +14842,7 @@ export class Engine {
     // storageRowRead per scanned row and the WHERE operator_evals — the streaming-scan feed, minus the
     // projection (the window stage runs before projection). Stop the instant `cap` survivors are in
     // hand: a genuine early-out, so the window fold sees only the prefix it needs.
+    const memMask = memoryMask(plan, meter);
     const rows: Row[] = [];
     if (!empty && limit !== 0n) {
       const visit = (_key: Uint8Array, rawRow: Row): boolean => {
@@ -14756,6 +14855,7 @@ export class Engine {
           filterWork += meter.accrued - before;
           if (!keep) return true;
         }
+        meter.admitRowMasked(row, memMask); // a row buffer (memory.md §5.1)
         rows.push(row);
         return BigInt(rows.length) < cap; // stop once the OFFSET+LIMIT window is filled
       };
@@ -14836,8 +14936,10 @@ export class Engine {
         if (passed <= offset) return true;
         const before = meter.accrued;
         meter.charge(COSTS.rowProduced);
-        out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
+        const projected = plan.projections.map((p) => evalExpr(p, row, env, meter));
         outputWork += meter.accrued - before;
+        meter.admitRow(projected); // the buffered result collector (memory.md §5.1)
+        out.push(projected);
         // Stop once a LIMIT window is filled (a top-N over the index order).
         return limit === null ? true : BigInt(out.length) < limit;
       });
@@ -15023,6 +15125,7 @@ export class Engine {
     const limit = plan.limit;
     const offset = plan.offset ?? 0n;
     const out: Value[][] = [];
+    let inlRows: Row[] = [];
     if (limit !== 0n) {
       const hashTable =
         plan.phys.hashJoin === null
@@ -15037,11 +15140,13 @@ export class Engine {
       let passed = 0n;
       // biome-ignore lint/suspicious/noLabelVar: `outer` is a loop label for the nested-join break/continue, not a variable.
       outer: for (const left of leftRows) {
+        // The previous outer row's INL re-materialization is consumed (memory.md §5.3).
+        meter.releaseRowsMasked(inlRows, plan.relMasks[innerOrdinal]!);
         let innerRows = rightRows;
         if (rightINL) {
           const outerLogical = placePhysicalRelationRow(plan, outerOrdinal, left);
           before = meter.accrued;
-          innerRows = this.materializeRel(
+          inlRows = this.materializeRel(
             plan,
             innerOrdinal,
             outer,
@@ -15050,6 +15155,7 @@ export class Engine {
             params,
             meter,
           );
+          innerRows = inlRows;
           relWork.set(
             innerOrdinal,
             (relWork.get(innerOrdinal) ?? 0n) + meter.accrued - before,
@@ -15081,12 +15187,20 @@ export class Engine {
           meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
           before = meter.accrued;
           meter.charge(COSTS.rowProduced);
-          out.push(plan.projections.map((p) => evalExpr(p, combined, env, meter)));
+          const projected = plan.projections.map((p) => evalExpr(p, combined, env, meter));
           outputWork += meter.accrued - before;
+          meter.admitRow(projected); // the buffered result collector (memory.md §5.1)
+          out.push(projected);
           // Stop the whole nested loop once the LIMIT window is filled.
           if (limit !== null && BigInt(out.length) >= limit) break outer;
         }
       }
+    }
+    // The join's relation buffers are consumed (memory.md §5.3).
+    if (meter.queryMemoryActive()) {
+      meter.releaseRowsMasked(inlRows, plan.relMasks[innerOrdinal]!);
+      meter.releaseRowsMasked(leftRows, plan.relMasks[outerOrdinal]!);
+      meter.releaseRowsMasked(rightRows, plan.relMasks[innerOrdinal]!);
     }
     const totalWork = meter.accrued - profileStart;
     for (const ordinal of [outerOrdinal, innerOrdinal]) {
@@ -15152,13 +15266,17 @@ export class Engine {
     const offset = plan.offset ?? 0n;
     let passed = 0n;
     const rows: Value[][] = [];
+    let inlRows: Row[] = [];
     if (limit !== 0n) {
       // biome-ignore lint/suspicious/noLabelVar: `outerRows` labels the final nested-loop exit.
       outerRows: for (const left of running) {
+        // The previous left row's INL re-materialization is consumed (memory.md §5.3).
+        meter.releaseRowsMasked(inlRows, plan.relMasks[inner]!);
         let candidates = innerRows;
         if (innerINL) {
           const before = meter.accrued;
-          candidates = this.materializeRel(plan, inner, outer, left, env, params, meter);
+          inlRows = this.materializeRel(plan, inner, outer, left, env, params, meter);
+          candidates = inlRows;
           relWork[inner] = relWork[inner]! + meter.accrued - before;
         } else if (hashTable !== null) {
           candidates = hashTable
@@ -15188,10 +15306,22 @@ export class Engine {
           meter.guard();
           const before = meter.accrued;
           meter.charge(COSTS.rowProduced);
-          rows.push(plan.projections.map((projection) => evalExpr(projection, combined, env, meter)));
+          const projected = plan.projections.map((projection) =>
+            evalExpr(projection, combined, env, meter),
+          );
           outputWork += meter.accrued - before;
+          meter.admitRow(projected); // the buffered result collector (memory.md §5.1)
+          rows.push(projected);
           if (limit !== null && BigInt(rows.length) >= limit) break outerRows;
         }
+      }
+    }
+    // The join's input buffers are consumed (memory.md §5.3).
+    if (meter.queryMemoryActive()) {
+      meter.releaseRowsMasked(inlRows, plan.relMasks[inner]!);
+      meter.releaseRowsMasked(running, memoryMask(plan, meter));
+      for (let ordinal = 0; ordinal < materialized.length; ordinal++) {
+        meter.releaseRowsMasked(materialized[ordinal]!, plan.relMasks[ordinal]!);
       }
     }
     for (const ordinal of plan.phys.relationOrder)
@@ -15276,14 +15406,19 @@ export class Engine {
   ): Row[] {
     const rel = plan.rels[ri]!;
     const env: EvalEnv = { ...baseEnv, outer };
+    // Every relation row is a query-memory row buffer entry under the relation's touched mask
+    // (memory.md §3/§5.1). The two unbounded generators admit as they produce; the remaining producers
+    // are bounded by an existing input value or the catalog and admit their output.
+    const mask = plan.relMasks[ri]!;
     // A set-returning relation is generated, not scanned (functions.md §10): produce its rows,
     // charging generated_row per element (its args read outer — implicitly lateral, §44).
     if (rel.srf !== undefined) {
+      let srfRows: Row[];
       switch (rel.srf.kind) {
         case "unnest":
-          return this.unnestRows(rel.srf, env, meter);
+          return this.unnestRows(rel.srf, env, meter, mask);
         case "generate_series":
-          return this.generateSeriesRows(rel.srf, env, meter);
+          return this.generateSeriesRows(rel.srf, env, meter, mask);
         case "jsonb_array_elements":
         case "jsonb_array_elements_text":
         case "jsonb_object_keys":
@@ -15292,20 +15427,29 @@ export class Engine {
         case "jsonb_each_text":
         case "json_record":
         case "jsonb_path_query":
-          return this.jsonSrfRows(rel.srf, env, meter);
+          srfRows = this.jsonSrfRows(rel.srf, env, meter);
+          break;
         case "json_table":
-          return this.jsonTableRows(rel.srf, env, meter);
+          srfRows = this.jsonTableRows(rel.srf, env, meter);
+          break;
         case "jed_tables":
-          return this.jedTablesRows(rel.srf, meter);
+          srfRows = this.jedTablesRows(rel.srf, meter);
+          break;
         case "jed_columns":
-          return this.jedColumnsRows(rel.srf, meter);
+          srfRows = this.jedColumnsRows(rel.srf, meter);
+          break;
         case "jed_indexes":
-          return this.jedIndexesRows(rel.srf, meter);
+          srfRows = this.jedIndexesRows(rel.srf, meter);
+          break;
         case "jed_constraints":
-          return this.jedConstraintsRows(rel.srf, meter);
+          srfRows = this.jedConstraintsRows(rel.srf, meter);
+          break;
         case "jed_statistics":
-          return this.jedStatisticsRows(rel.srf, meter);
+          srfRows = this.jedStatisticsRows(rel.srf, meter);
+          break;
       }
+      for (const row of srfRows) meter.admitRowMasked(row, mask);
+      return srfRows;
     }
     // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a MATERIALIZED
     // CTE reads its buffer (charging cte_scan_row, guarded so a runaway scan aborts 54P01); an INLINE
@@ -15318,6 +15462,8 @@ export class Engine {
           meter.guard();
           meter.charge(COSTS.cteScanRow);
         }
+        // The reference copies the CTE buffer into its own relation rows.
+        for (const row of buf) meter.admitRowMasked(row, mask);
         return buf.slice();
       }
       // Only a plain (query) CTE is ever inlined; a data-modifying CTE is always materialized
@@ -15328,6 +15474,9 @@ export class Engine {
       }
       const r = this.execQueryPlan(src.plan, outer, params, env.ctes);
       meter.charge(r.cost);
+      // The body's charged result becomes this relation's rows (memory.md §5.2), re-measured under
+      // the relation's touched mask.
+      rebaseRowsMasked(meter, r.rows, mask);
       return r.rows;
     }
     // A DERIVED TABLE runs its body in place (grammar.md §42), charging its intrinsic cost — no
@@ -15336,6 +15485,7 @@ export class Engine {
     if (rel.derived !== undefined) {
       const r = this.execQueryPlan(rel.derived, outer, params, env.ctes);
       meter.charge(r.cost);
+      rebaseRowsMasked(meter, r.rows, mask);
       return r.rows;
     }
     // A base table: scan in primary-key order via a scanSource (the page_read block + per-row
@@ -15486,6 +15636,7 @@ export class Engine {
     meter.charge(COSTS.valueDecompress * BigInt(slabs));
     const tableRows: Row[] = [];
     for (const row of scanSource(rows, nodeCount, meter)) {
+      meter.admitRowMasked(row, mask); // a materialized relation row (memory.md §5.1)
       tableRows.push(row);
     }
     return tableRows;
@@ -15543,7 +15694,13 @@ export class Engine {
             meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
             meter.charge(COSTS.rowProduced);
           }
-          out.push(em.sortedIdentity ? row : plan.projections.map((p) => evalExpr(p, row, env, meter)));
+          const o = em.sortedIdentity
+            ? row
+            : plan.projections.map((p) => evalExpr(p, row, env, meter));
+          // Sort/spool residency is operator state; the collected result is a row buffer (memory.md
+          // §5.1).
+          meter.admitRow(o);
+          out.push(o);
         }
         return out;
       } finally {
@@ -15563,17 +15720,37 @@ export class Engine {
         meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
         meter.charge(COSTS.rowProduced);
         const l = sel === undefined ? j : sel[j]!;
-        out.push(projCols.map((c) => cols[c]![l]!));
+        const o = projCols.map((c) => cols[c]![l]!);
+        meter.admitRow(o); // the buffered result collector (memory.md §5.1)
+        out.push(o);
       }
       return out;
     }
     const out: Value[][] = [];
+    if (em.mode === "identity") {
+      // Rows outside the LIMIT/OFFSET window are discarded; the windowed rows transfer into the result
+      // (memory.md §5.2/§5.3).
+      if (meter.queryMemoryActive()) {
+        meter.releaseRows(em.rows.slice(0, em.start));
+        meter.releaseRows(em.rows.slice(em.end));
+      }
+      for (let i = em.start; i < em.end; i++) {
+        meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
+        meter.charge(COSTS.rowProduced);
+        out.push(em.rows[i]!);
+      }
+      return out;
+    }
     for (let i = em.start; i < em.end; i++) {
       meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
       meter.charge(COSTS.rowProduced);
-      if (em.mode === "identity") out.push(em.rows[i]!);
-      else out.push(plan.projections.map((p) => evalExpr(p, em.rows[i]!, env, meter)));
+      const o = plan.projections.map((p) => evalExpr(p, em.rows[i]!, env, meter));
+      meter.admitRow(o); // the buffered result collector (memory.md §5.1)
+      out.push(o);
     }
+    // The projecting drive consumed its source buffer: pre-projection rows under the touched mask, or
+    // an aggregate's group rows (memory.md §5.3).
+    meter.releaseRowsMasked(em.rows, plan.isAgg ? [] : memoryMask(plan, meter));
     return out;
   }
 
@@ -15729,24 +15906,34 @@ export class Engine {
     // the row path below for an in-memory store or a spillable touched column. Cost-neutral by
     // construction (aggColumnar charges the identical scan block).
     let srows = this.aggColumnar(plan, gset, env, params, meter);
-    if (srows === null) {
+    if (srows !== null) {
+      // Dense lanes are operator state; the group rows are a row buffer (memory.md §5.4).
+      for (const r of srows) meter.admitRow(r);
+    } else {
       // Row path: scan the single base relation through the same path the eager executor uses (so the
       // pageRead / valueDecompress / storageRowRead block is charged identically — materializeRel), then
       // apply the residual WHERE per scanned row through the ordinary evaluator (its operatorEval charges
       // + 3VL survivor test byte-identical to the scalar WHERE loop).
       const rows = this.materializeRel(plan, 0, env.outer, [], env, params, meter);
+      // The same row-buffer accounting as the scalar aggregate branch (memory.md §5).
+      const mask = plan.relMasks[0]!;
       let survivors: Row[];
       if (plan.filter === null) {
         survivors = rows;
       } else {
         survivors = [];
-        for (const r of rows) if (isTrue(evalExpr(plan.filter, r, env, meter))) survivors.push(r);
+        for (const r of rows) {
+          if (isTrue(evalExpr(plan.filter, r, env, meter))) survivors.push(r);
+          else meter.releaseRowMasked(r, mask);
+        }
       }
       const at: LaneAt = (j, col) => survivors[j]![col]!;
       srows =
         gset.keyCols.length === 0
           ? [foldAggWhole(plan.aggSpecs, at, survivors.length, meter)]
           : groupByIntKey(plan.aggSpecs, gset.keyCols[0]!, at, survivors.length, meter);
+      for (const r of srows) meter.admitRow(r);
+      meter.releaseRowsMasked(survivors, mask);
     }
 
     // LIMIT/OFFSET window over the synthetic rows, mirroring the scalar branch's windowBounds (clamped in
@@ -15902,6 +16089,7 @@ export class Engine {
           meter,
         );
     const on = plan.joins[0]!.on;
+    const mask = memoryMask(plan, meter);
     const out: Row[] = [];
     for (const outerRow of outerRows) {
       let candidates = innerRows;
@@ -15931,8 +16119,13 @@ export class Engine {
           innerOrdinal,
           innerRow,
         );
-        if (on === null || isTrue(evalExpr(on, combined, env, meter))) out.push(combined);
+        if (on === null || isTrue(evalExpr(on, combined, env, meter))) {
+          meter.admitRowMasked(combined, mask);
+          out.push(combined);
+        }
       }
+      // A per-outer-row INL re-materialization is consumed (memory.md §5.3).
+      if (innerINL) meter.releaseRowsMasked(candidates, plan.relMasks[innerOrdinal]!);
     }
     return out;
   }
@@ -15947,9 +16140,13 @@ export class Engine {
     stepCount: number,
   ): Row[] {
     const driver = plan.phys.relationOrder[0]!;
-    let running = materialized[driver]!.map((row) =>
-      placePhysicalRelationRow(plan, driver, row),
-    );
+    const mask = memoryMask(plan, meter);
+    let running: Row[] = [];
+    for (const row of materialized[driver]!) {
+      const placed = placePhysicalRelationRow(plan, driver, row);
+      meter.admitRowMasked(placed, mask);
+      running.push(placed);
+    }
     for (let position = 0; position < stepCount; position++) {
       const step = plan.phys.joinSteps[position]!;
       const inner = plan.phys.relationOrder[position + 1]!;
@@ -16015,6 +16212,7 @@ export class Engine {
             }
           }
           if (keep) {
+            meter.admitRowMasked(combined, mask);
             next.push(combined);
             leftMatched = true;
             if (!innerINL && !innerLateral) {
@@ -16022,16 +16220,24 @@ export class Engine {
             }
           }
         }
-        if (emitLeft && !leftMatched) next.push(left);
+        if (emitLeft && !leftMatched) {
+          meter.admitRowMasked(left, mask);
+          next.push(left);
+        }
+        // A per-left-row INL / LATERAL re-materialization is consumed (memory.md §5.3).
+        if (innerINL || innerLateral) meter.releaseRowsMasked(candidates, plan.relMasks[inner]!);
       }
       if (emitRight) {
         for (let index = 0; index < innerRows.length; index++) {
           if (rightMatched[index]) continue;
           const combined = Array.from({ length: logicalJoinRowWidth(plan) }, () => nullValue());
           combined.splice(plan.rels[inner]!.offset, innerRows[index]!.length, ...innerRows[index]!);
+          meter.admitRowMasked(combined, mask);
           next.push(combined);
         }
       }
+      // The step's input rows are consumed once its output is built (memory.md §5.3).
+      meter.releaseRowsMasked(running, mask);
       running = next;
       if (position + 1 < plan.phys.joinSteps.length) {
         this.recordExplainActualParent(
@@ -16049,7 +16255,12 @@ export class Engine {
     if (this.spillSink?.createScratch === undefined || this.session.workMem <= 0) return false;
     if (streamingScanEligible(plan)) return false;
     if (plan.rels.length <= 1 && !plan.isAgg && !plan.distinct) return false;
-    return true;
+    // A join takes the bounded lane only when it owns join state (a hash table or physical join
+    // steps); a plain nested loop stays on the eager path — the lane choice every core mirrors, so a
+    // query-memory threshold never depends on the core (memory.md §5.4).
+    return (
+      plan.isAgg || plan.distinct || plan.phys.hashJoin !== null || plan.phys.joinSteps.length > 0
+    );
   }
 
   private execBoundedBlocking(
@@ -16143,6 +16354,9 @@ export class Engine {
             params,
             meter,
           );
+          // Spool residency is operator state bounded by workMem (memory.md §4 Q2): the rows leave the
+          // query-memory row account as they enter the spool.
+          meter.releaseRowsMasked(materialized, plan.relMasks[ordinal]!);
           for (const row of materialized) out.push(row);
           relations[ordinal] = out;
           relWork[ordinal] = meter.accrued - before;
@@ -16176,6 +16390,9 @@ export class Engine {
           ? this.materializeRel(plan, ordinal, [...env.outer, logical], [], env, params, meter)
           : this.materializeRel(plan, ordinal, env.outer, logical, env, params, meter);
         relWork[ordinal] = relWork[ordinal]! + meter.accrued - before;
+        // The per-row re-materialization feeds bounded join state (memory.md §4 Q2): its rows leave
+        // the query-memory row account at once.
+        meter.releaseRowsMasked(result, plan.relMasks[ordinal]!);
         return result;
       };
       let rows = relations[0] ?? spool();
@@ -16440,9 +16657,18 @@ export class Engine {
           this.recordExplainActualParent("Filter", meter.accrued);
       }
       const applyWindow = (input: RowSpool): RowSpool => {
-        const materialized = Array.from(input);
+        // Window partition state remains an upstream materialization owner. While materialized it is a
+        // query-memory row buffer (memory.md §5.1): pre-projection rows under the touched mask, or
+        // projected-shape group rows for a grouped window.
+        const mask = plan.isAgg ? [] : memoryMask(plan, meter);
+        const materialized: Row[] = [];
+        for (const row of input) {
+          meter.admitRowMasked(row, mask);
+          materialized.push(row);
+        }
         input.close();
         applyWindowStage(materialized, plan.windowSpecs, plan.windowKeys, env, meter);
+        meter.releaseRowsMasked(materialized, mask);
         const out = spool();
         for (const row of materialized) out.push(row);
         if (selectActualRootNode(plan) !== "Window")
@@ -16789,6 +17015,7 @@ export class Engine {
     // An INDEX-NESTED-LOOP relation (cost.md §3 "JOIN") likewise depends on the left-hand row (its
     // bound seeks per outer row), so it is not materialized up front either — an empty placeholder
     // holds its slot and the join loop re-materializes it per left row.
+    const memMask = memoryMask(plan, meter);
     const materialized: Row[][] = [];
     const relWork = new Array<bigint>(plan.rels.length).fill(0n);
     for (let ri = 0; ri < plan.rels.length; ri++) {
@@ -16832,7 +17059,14 @@ export class Engine {
     } else if (plan.phys.relationOrder.length === 2) {
       running = this.execCostedTwoRelationJoin(plan, env, meter, params, materialized, relWork);
     } else {
-      running = plan.rels.length === 0 ? [[]] : materialized[0]!;
+      if (plan.rels.length === 0) {
+        meter.admitRow([]); // the FROM-less virtual row (memory.md §5.1)
+        running = [[]];
+      } else {
+        // The first relation's rows move into `running`, carrying their charge (memory.md §5.2).
+        running = materialized[0]!;
+        materialized[0] = [];
+      }
       for (let k = 0; k < plan.joins.length; k++) {
       const on = plan.joins[k]!.on;
       const kind = plan.joins[k]!.kind;
@@ -16865,12 +17099,20 @@ export class Engine {
           for (const right of rightRows) {
             const combined = left.concat(right);
             if (on === null || isTrue(evalExpr(on, combined, env, meter))) {
+              meter.admitRowMasked(combined, memMask);
               next.push(combined);
               leftMatched = true;
             }
           }
-          if (emitLeft && !leftMatched) next.push(left.concat(nullRow(rightPad)));
+          if (emitLeft && !leftMatched) {
+            const combined = left.concat(nullRow(rightPad));
+            meter.admitRowMasked(combined, memMask);
+            next.push(combined);
+          }
+          // The per-left-row re-materialization is consumed (memory.md §5.3).
+          meter.releaseRowsMasked(rightRows, plan.relMasks[k + 1]!);
         }
+        meter.releaseRowsMasked(running, memMask);
         running = next;
         continue;
       }
@@ -16889,12 +17131,20 @@ export class Engine {
           for (const right of rightRows) {
             const combined = left.concat(right);
             if (on === null || isTrue(evalExpr(on, combined, env, meter))) {
+              meter.admitRowMasked(combined, memMask);
               next.push(combined);
               leftMatched = true;
             }
           }
-          if (emitLeft && !leftMatched) next.push(left.concat(nullRow(rightPad)));
+          if (emitLeft && !leftMatched) {
+            const combined = left.concat(nullRow(rightPad));
+            meter.admitRowMasked(combined, memMask);
+            next.push(combined);
+          }
+          // The per-left-row re-materialization is consumed (memory.md §5.3).
+          meter.releaseRowsMasked(rightRows, plan.relMasks[k + 1]!);
         }
+        meter.releaseRowsMasked(running, memMask);
         running = next;
         continue;
       }
@@ -16916,12 +17166,18 @@ export class Engine {
           for (const ri of candidates) {
             const combined = left.concat(rightRows[ri]!);
             if (isTrue(evalExpr(on!, combined, env, meter))) {
+              meter.admitRowMasked(combined, memMask);
               next.push(combined);
               leftMatched = true;
             }
           }
-          if (emitLeft && !leftMatched) next.push(left.concat(nullRow(rightPad)));
+          if (emitLeft && !leftMatched) {
+            const combined = left.concat(nullRow(rightPad));
+            meter.admitRowMasked(combined, memMask);
+            next.push(combined);
+          }
         }
+        meter.releaseRowsMasked(running, memMask);
         running = next;
         continue;
       }
@@ -16931,19 +17187,36 @@ export class Engine {
         for (let ri = 0; ri < rightRows.length; ri++) {
           const combined = left.concat(rightRows[ri]!);
           if (on === null || isTrue(evalExpr(on, combined, env, meter))) {
+            meter.admitRowMasked(combined, memMask);
             next.push(combined);
             leftMatched = true;
             rightMatched[ri] = true;
           }
         }
-        if (emitLeft && !leftMatched) next.push(left.concat(nullRow(rightPad)));
+        if (emitLeft && !leftMatched) {
+          const combined = left.concat(nullRow(rightPad));
+          meter.admitRowMasked(combined, memMask);
+          next.push(combined);
+        }
       }
       if (emitRight) {
         for (let ri = 0; ri < rightRows.length; ri++) {
-          if (!rightMatched[ri]) next.push(nullRow(leftPad).concat(rightRows[ri]!));
+          if (!rightMatched[ri]) {
+            const combined = nullRow(leftPad).concat(rightRows[ri]!);
+            meter.admitRowMasked(combined, memMask);
+            next.push(combined);
+          }
         }
       }
+        meter.releaseRowsMasked(running, memMask);
         running = next;
+      }
+    }
+    // The join phase is complete: its relation buffers are consumed (memory.md §5.3). A relation moved
+    // into `running` left an empty buffer here.
+    if (meter.queryMemoryActive()) {
+      for (let ri = 0; ri < materialized.length; ri++) {
+        meter.releaseRowsMasked(materialized[ri]!, plan.relMasks[ri]!);
       }
     }
 
@@ -16980,6 +17253,7 @@ export class Engine {
     let rows: Row[] = [];
     for (const row of running) {
       if (plan.filter === null || isTrue(evalExpr(plan.filter, row, env, meter))) rows.push(row);
+      else meter.releaseRowMasked(row, memMask);
     }
     if (plan.filter !== null) {
       if (selectActualRootNode(plan) !== "Filter")
@@ -17010,8 +17284,13 @@ export class Engine {
       // appended column and the slot-based sort below is unchanged — the window-key precedent. The
       // evaluation is metered per node (cost.md §3); a no-op for a column/ordinal-only ORDER BY.
       materializeOrderExprs(rows, plan.orderExprs, env, meter);
-      if (plan.phys.topK !== null) rows = topKRows(rows, plan.order, plan.phys.topK);
-      else sortRows(rows, plan.order);
+      if (plan.phys.topK !== null) {
+        // Rows the top-k selection drops are discarded (memory.md §5.3): release the input, then
+        // re-reserve the kept rows (never more than was released).
+        meter.releaseRowsMasked(rows, memMask);
+        rows = topKRows(rows, plan.order, plan.phys.topK);
+        for (const row of rows) meter.admitRowMasked(row, memMask);
+      } else sortRows(rows, plan.order);
       if (selectActualRootNode(plan) !== "Sort")
         this.recordExplainActualParent("Sort", meter.accrued);
     }
@@ -17066,7 +17345,11 @@ export class Engine {
         for (let ri = 0; ri < rows.length; ri++) {
           meter.guard();
           const row = rows[ri]!.slice();
-          for (const ge of plan.groupExprs) row.push(evalExpr(ge, row, env, meter));
+          for (const ge of plan.groupExprs) {
+            const v = evalExpr(ge, row, env, meter);
+            meter.admitValue(v); // an appended slot grows the buffered row (memory.md §5.1)
+            row.push(v);
+          }
           rows[ri] = row;
         }
       }
@@ -17162,14 +17445,21 @@ export class Engine {
           for (const positions of plan.groupingSpecs) {
             srow.push(intValue(groupingValue(positions, gset.mask)));
           }
+          meter.admitRow(srow);
           groupRows.push(srow);
         }
       }
+      // Aggregation consumed the post-WHERE rows (memory.md §5.3).
+      meter.releaseRowsMasked(rows, memMask);
       // HAVING: filter the grouped rows (after aggregation, before ORDER BY). The predicate is
       // evaluated against each group's synthetic row (charging its operatorEvals per group);
       // only a TRUE result keeps the group. A dropped group charges no rowProduced (§8).
       if (plan.having !== null) {
-        groupRows = groupRows.filter((srow) => isTrue(evalExpr(plan.having!, srow, env, meter)));
+        groupRows = groupRows.filter((srow) => {
+          if (isTrue(evalExpr(plan.having!, srow, env, meter))) return true;
+          meter.releaseRow(srow);
+          return false;
+        });
       }
       if (selectActualRootNode(plan) !== "Aggregate")
         this.recordExplainActualParent("Aggregate", meter.accrued);
@@ -17204,9 +17494,11 @@ export class Engine {
           const key = distinctRowKey(tuple);
           if (!seen.has(key)) {
             seen.add(key);
+            meter.admitRow(tuple);
             distinctRows.push(tuple);
           }
         }
+        meter.releaseRows(groupRows);
         if (selectActualRootNode(plan) !== "Distinct")
           this.recordExplainActualParent("Distinct", meter.accrued);
         // The dedup already projected every grouped row (the §3 asymmetry, charged above), so emission
@@ -17230,9 +17522,11 @@ export class Engine {
         const key = distinctRowKey(tuple);
         if (!seen.has(key)) {
           seen.add(key);
+          meter.admitRow(tuple);
           distinctRows.push(tuple);
         }
       }
+      meter.releaseRowsMasked(rows, memMask);
       if (selectActualRootNode(plan) !== "Distinct")
         this.recordExplainActualParent("Distinct", meter.accrued);
       // LIMIT / OFFSET applies to the DISTINCT rows; only the emitted rows charge rowProduced

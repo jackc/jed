@@ -148,7 +148,7 @@ func (db *engine) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *i
 	if err != nil {
 		return nil, err
 	}
-	return rowsFromOutcome(out), nil
+	return rowsFromOutcome(out, db.session.queryAccount()), nil
 }
 
 // Rows is a cursor over a statement's rows (spec/design/api.md §4). It walks the pull source (cursor.go)
@@ -199,11 +199,11 @@ type Rows struct {
 // single exec/query seam: the exec-side path (Exec) drains-and-discards such a Rows and returns the
 // tag, so "Query on a statement that produces no rows" is valid, not a 42601 (the effect-then-error
 // bug this removes — a write reached here after dispatch already committed it; spec/design/api.md §11).
-func rowsFromOutcome(out outcome) *Rows {
+func rowsFromOutcome(out outcome, acct queryAccount) *Rows {
 	return &Rows{
 		columnNames:  out.ColumnNames,
 		columnTypes:  out.ColumnTypes,
-		cursor:       bufferedCursor(out.Rows, out.Cost),
+		cursor:       bufferedCursor(out.Rows, out.Cost, acct),
 		rowsAffected: out.RowsAffected,
 		hasAffected:  out.HasRowsAffected,
 	}

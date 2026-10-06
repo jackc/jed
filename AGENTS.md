@@ -140,8 +140,9 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
 - Blocking hash JOIN, aggregation, and DISTINCT use bounded row spools and disk
   hash partitions under `work_mem` on native file hosts. Ordered partition replay
   preserves probe/bucket order, aggregate fold order, and cost. Upstream window,
-  CTE/index materialization and final scalar/result admission remain separate
-  memory owners; this is not a whole-query memory ceiling (spill.md, memory.md).
+  CTE/index materialization and result buffers are charged by the separate
+  query-memory account (memory.md Q1); `work_mem` is not a whole-query memory
+  ceiling (spill.md, memory.md).
 
 ## Safety And Resource Boundaries
 
@@ -149,11 +150,15 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
 `repeat`/padding have proportional UTF-8 work charges and pre-allocation byte checks;
 exact decimal transcendentals charge guarded internal steps. A finite 64 MiB default
 `max_scalar_bytes` allowance bounds their cumulative logical output/scratch allocation
-per statement (`54P04`), including internal meters and frozen cursors. Full query-memory
-admission is specified in `spec/design/memory.md` but not yet implemented for all scalars,
-row/result buffers, blocking operators and pending writes. Resource-exhaustion resistance
-remains a requirement; do not claim the current cost/scalar limits are a whole-engine
-memory guarantee. Host extensions remain outside these guarantees.
+per statement (`54P04`), including internal meters and frozen cursors. A live, opt-in
+`max_query_memory_bytes` account (unlimited by default; `54P05`) bounds row buffers and
+engine result collectors — relation materialization, join outputs, grouped/DISTINCT rows,
+set operations, CTE/recursive-CTE buffers, RETURNING/EXPLAIN results — in deterministic
+logical bytes (slice Q1 of `spec/design/memory.md`). Operator state (hash tables, sort
+buffers, accumulators, spill spools), pending writes, and storage caches are still uncovered
+(Q2–Q4), as are remaining scalar kernels. These are guardrails, not heap caps: resource-
+exhaustion resistance remains a requirement; do not claim the current limits are a
+whole-engine memory guarantee. Host extensions remain outside these guarantees.
 
 - Untrusted SQL must be safe to run against the built-in surface.
 - Core languages and dependencies must preserve memory safety.

@@ -999,6 +999,9 @@ export type ActiveTx = {
 // via Session.setRandomSource / setClockSource, not here.
 export type SessionOptions = {
   maxScalarBytes?: bigint;
+  // The live logical query-memory budget per statement (spec/design/memory.md §2); absent or
+  // non-positive ⇒ unlimited (the default). Over-budget fails 54P05.
+  maxQueryMemoryBytes?: bigint;
   maxCost?: bigint;
   // The per-session cumulative cost budget (spec/design/session.md §5.4); absent ⇒ unlimited (the
   // default). Bounds the whole session: the instant the session's running total reaches it, the

@@ -34,11 +34,14 @@ type bufCursor struct {
 	rows [][]Value
 	idx  int
 	cost int64
+	// acct is the statement's query-memory account; each yielded row leaves engine ownership and is
+	// released from it (memory.md §5.3).
+	acct queryAccount
 }
 
 // bufferedCursor wraps an already-materialized result.
-func bufferedCursor(rows [][]Value, cost int64) cursor {
-	return &bufCursor{rows: rows, cost: cost}
+func bufferedCursor(rows [][]Value, cost int64, acct queryAccount) cursor {
+	return &bufCursor{rows: rows, cost: cost, acct: acct}
 }
 
 func (c *bufCursor) nextRow() ([]Value, bool, error) {
@@ -47,6 +50,7 @@ func (c *bufCursor) nextRow() ([]Value, bool, error) {
 	}
 	row := c.rows[c.idx]
 	c.idx++
+	c.acct.releaseRow(row)
 	return row, true, nil
 }
 

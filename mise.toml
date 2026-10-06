@@ -120,6 +120,10 @@ run = "bundle exec rake oracle:setup"
 description = "Shared corpus on all three cores with forced file spill"
 run = "bundle exec rake conformance:spill"
 
+[tasks."conformance:query_memory"]
+description = "Shared corpus on all three cores with query-memory accounting active"
+run = "bundle exec rake conformance:query_memory"
+
 [tasks."bench:spill"]
 description = "Larger-than-work-memory JOIN, aggregate, and DISTINCT benchmark"
 run = "bundle exec rake bench:spill"

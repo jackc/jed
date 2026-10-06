@@ -106,7 +106,7 @@ a runtime how large its objects are.
 row_bytes(row)   = ROW (32) + Σ value_bytes(v)
 value_bytes(v)   = VALUE (32) + payload(v)
 
-payload(NULL, boolean, integers, floats, uuid, date, time, timestamp,
+payload(NULL, boolean, integers, floats, uuid, date, timestamp,
         timestamptz, interval)           = 0
 payload(text | json | jsonpath)          = UTF-8 byte length of the text
 payload(bytea)                           = byte length
@@ -148,7 +148,7 @@ It is filled in by owner class:
 | Slice | Owner | Status |
 |---|---|---|
 | Q1 | **Rows** — row buffers of statement execution and engine result collectors | implemented |
-| Q2 | **Operator state** — hash-join tables, group/distinct/dedup sets and keys, aggregate accumulators (`array_agg`, `string_agg`, JSON aggregates, ordered-set and hypothetical buffers), sort buffers and top-k heaps, window partition/frame state, spill spools' resident buffers, recursive-CTE dedup sets | planned |
+| Q2 | **Operator state** — hash-join tables, group/distinct/dedup sets and keys, aggregate accumulators (`json_agg`/`jsonb_agg` and the other JSON aggregates, ordered-set and hypothetical buffers), sort buffers and top-k heaps, window partition/frame state, spill spools' resident buffers, recursive-CTE dedup sets | planned |
 | Q3 | **Pending writes** — a transaction-owned account for staged inserts/updates/deletes, surviving statement boundaries and released at commit/rollback | planned |
 | Q4 | **Storage** — database-owned accounts for page caches and committed in-memory storage | planned |
 
@@ -188,8 +188,9 @@ appended, at:
   index-bounded row; each row of `generate_series` and `unnest` as it is generated;
   the whole output of the other set-returning functions (JSON producers,
   `JSON_TABLE`, `jed_*` catalog functions), which are bounded by an existing value
-  or the catalog, once produced; each row of a `VALUES` body; and each row a
-  materialized CTE reference copies from the CTE's buffer. A derived table or an
+  or the catalog, once produced; each row of a `VALUES` body; each row a
+  materialized CTE reference copies from the CTE's buffer; and each prefix row the
+  window-top-N lane collects. A derived table or an
   inline CTE body arrives charged as a projected result and is re-measured under the
   relation mask (the difference is released).
 - **Joins**: each combined row a join step keeps, each NULL-extended row (LEFT,
@@ -203,9 +204,12 @@ appended, at:
   projecting drive, a spool drive, a sorted drive, and a columnar drive), each
   output row a streaming/bounded lane collects into a buffered result (the
   bounded streaming scan, index-order scan, two-table and N-way join top-N), each
-  `RETURNING` row, each `EXPLAIN` output row, and each window-top-N prefix row.
-- **Collectors**: each row an engine-owned materializing host API (`query_rows`
-  in Rust; its Go and TypeScript equivalents) appends while draining a cursor.
+  `RETURNING` row, and each `EXPLAIN` output row.
+- **Collectors**: each row an engine-owned materializing host API appends while
+  draining a cursor — Rust `query_rows` (and `query_map`/`query_row` over it) and
+  TypeScript `Statement.all()`. Go has no such helper: its iterators hand each row
+  to the host, whose collection is the host's memory. A `54P05` here fails the
+  statement and poisons an open block like a mid-drain error.
 - **Recursive CTE**: each kept row's copy into the CTE result (the working-table
   row itself transfers), and a copy of the earlier CTEs' buffers taken for the
   recursive term.
@@ -231,9 +235,10 @@ Releases recompute the released rows' bytes with the measurement that reserved
 them:
 
 - **Filters** release each discarded row when it is discarded: a WHERE reject and
-  a HAVING reject immediately; the rows outside an identity emission's
-  LIMIT/OFFSET window, and the rows a set operation's combine or window drops,
-  once that step completes. A top-k selection releases its whole input and then
+  a HAVING reject immediately; the rows outside the LIMIT/OFFSET window when the
+  materialized drive emits an identity (DISTINCT) buffer, and the rows a set
+  operation's combine or window drops, once that step completes (a lazily driven
+  cursor keeps its buffer, and its charge, until it is exhausted). A top-k selection releases its whole input and then
   re-admits the kept rows (never more than it released).
 - **Stage hand-off** releases a whole source buffer once the stage that consumed it
   completes: a join step's input rows after its output is built; all materialized
@@ -271,7 +276,10 @@ bounded-spill lane) but never on the core.
 - A **streaming lane** that hands each row to the host as it is produced (the pull
   scan) holds no row buffer and reserves nothing for its output; a lazily driven
   projecting, sorted, spool, or columnar emission reserves nothing for rows it
-  hands to the host either.
+  hands to the host either. A lazily driven projecting buffer stays charged until
+  the cursor is exhausted (the materialized drive releases it after its last row),
+  so the same statement may have different thresholds through a lazy cursor and
+  through the internal materialized path — each mirrored across cores.
 - The **columnar and vectorized lanes** gather dense column lanes that are
   operator state (Q2); they charge their group rows and collected output.
 - The **streaming external sort** lane's input (the sorter's buffer or the

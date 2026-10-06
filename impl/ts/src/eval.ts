@@ -1984,6 +1984,10 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       m.charge(COSTS.operatorEval);
       const r = env.runSubquery(e.plan, [...env.outer, row]);
       m.charge(r.cost);
+      // The charged result is consumed by this expression and released once it has been used
+      // (memory.md §5.3).
+      const held = m.query.measureRows(r.rows);
+      let out: Value;
       if (e.subKind === "scalar") {
         if (r.rows.length > 1) {
           throw engineError(
@@ -1992,23 +1996,24 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           );
         }
         // 0 rows -> NULL (the static type was settled at resolve).
-        return r.rows.length === 0 ? nullValue() : r.rows[0]![0]!;
-      }
-      if (e.subKind === "exists") {
+        out = r.rows.length === 0 ? nullValue() : r.rows[0]![0]!;
+      } else if (e.subKind === "exists") {
         // EXISTS ignores the select list entirely and is never NULL.
-        return { kind: "bool", value: r.rows.length > 0 !== e.negated };
-      }
-      if (e.subKind === "quantified") {
+        out = { kind: "bool", value: r.rows.length > 0 !== e.negated };
+      } else if (e.subKind === "quantified") {
         // A correlated quantified subquery (array-functions.md §11.6): gather the body's single
         // column into an array and run the SAME 3VL fold as the array form.
         const lv = evalExpr(e.lhs!, row, env, m);
         const elements = r.rows.map((rr) => rr[0]!);
-        return quantifiedMembership(e.op!, e.all!, lv, arrayValue(elements), m);
+        out = quantifiedMembership(e.op!, e.all!, lv, arrayValue(elements), m);
+      } else {
+        // in
+        const lv = evalExpr(e.lhs!, row, env, m);
+        const list = r.rows.map((rr) => rr[0]!);
+        out = inMembership(lv, list, e.negated, m);
       }
-      // in
-      const lv = evalExpr(e.lhs!, row, env, m);
-      const list = r.rows.map((rr) => rr[0]!);
-      return inMembership(lv, list, e.negated, m);
+      m.releaseQuery(held);
+      return out;
     }
     case "inValues": {
       // A folded uncorrelated `IN (subquery)` — the list is constant; test membership per row.

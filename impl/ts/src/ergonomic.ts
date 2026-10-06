@@ -199,7 +199,11 @@ export class Statement {
   all(...params: JsParam[]): Row[] {
     const rows = this.handle.queryPrepared(this.prepared(), bindParams(params));
     const out: Row[] = [];
-    for (const values of rows) out.push(rowObject(values, rows.columnNames));
+    for (const values of rows) {
+      // The engine-owned collector charges each collected row (spec/design/memory.md §5.1).
+      rows.admitCollected(values);
+      out.push(rowObject(values, rows.columnNames));
+    }
     return out;
   }
 

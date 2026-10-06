@@ -67,7 +67,20 @@ def main
   missing = (REQUIRED_UNIT_IDS - ids.to_set).to_a
   fail!("schedule.toml: missing required unit id(s): #{missing.join(', ')}") unless missing.empty?
 
-  puts "OK: #{units.length} cost units — schedule coherent"
+  # (6) the query-memory size vectors (../design/memory.md §3) are well-formed
+  sizes = TomlRB.load_file(File.join(COST_DIR, "memory_sizes.toml"))
+  fail!("memory_sizes.toml: schema_version must be 1") unless sizes["schema_version"] == 1
+  vectors = sizes["vector"] || []
+  fail!("memory_sizes.toml: no [[vector]] entries") if vectors.empty?
+  vectors.each do |v|
+    fail!("memory_sizes.toml: vector sql must be a SELECT string") unless v["sql"].is_a?(String) && v["sql"].start_with?("SELECT")
+    fail!("memory_sizes.toml: #{v['sql']}: measure must be value or row") unless %w[value row].include?(v["measure"])
+    fail!("memory_sizes.toml: #{v['sql']}: bytes must be a positive integer") unless v["bytes"].is_a?(Integer) && v["bytes"].positive?
+    setup = v.fetch("setup", [])
+    fail!("memory_sizes.toml: #{v['sql']}: setup must be an array of strings") unless setup.is_a?(Array) && setup.all?(String)
+  end
+
+  puts "OK: #{units.length} cost units, #{vectors.length} memory size vectors — schedule coherent"
 end
 
 main

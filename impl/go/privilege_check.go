@@ -485,7 +485,7 @@ func (db *engine) alterTableTargetsTemp(at *alterTable) bool {
 // a write keeps its existing gating inside dispatch); the three checks are pure, so a read that falls
 // through to the materialized path re-running them is harmless (identical result).
 func (db *engine) gateReadLanes(stmt statement) error {
-	db.session.scalarBytes = new(int64)
+	db.session.resetStatementMemory()
 	if db.session.tx != nil && db.session.tx.failed {
 		return newError(InFailedSqlTransaction,
 			"current transaction is aborted, commands ignored until end of transaction block")

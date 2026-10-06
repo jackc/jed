@@ -3551,17 +3551,23 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return Value{}, err
 		}
 		m.Charge(r.cost)
+		// The charged result is consumed by this expression and released once it has been used
+		// (memory.md §5.3).
+		held := measureRows(m.query, r.rows)
 		switch e.subKind {
 		case sqScalar:
 			if len(r.rows) > 1 {
 				return Value{}, newError(CardinalityViolation, "more than one row returned by a subquery used as an expression")
 			}
-			if len(r.rows) == 0 {
-				return NullValue(), nil // 0 rows -> NULL (the static type was settled at resolve)
+			v := NullValue() // 0 rows -> NULL (the static type was settled at resolve)
+			if len(r.rows) == 1 {
+				v = r.rows[0][0]
 			}
-			return r.rows[0][0], nil
+			m.releaseQuery(held)
+			return v, nil
 		case sqExists:
 			// EXISTS ignores the select list entirely and is never NULL.
+			m.releaseQuery(held)
 			return BoolValue((len(r.rows) > 0) != e.negated), nil
 		case sqQuantified:
 			// A correlated quantified subquery (array-functions.md §11.6): gather the body's single
@@ -3574,7 +3580,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			for i, rr := range r.rows {
 				elems[i] = rr[0]
 			}
-			return quantifiedMembership(e.op, e.quantAll, lv, ArrayValue(elems), m)
+			v, qerr := quantifiedMembership(e.op, e.quantAll, lv, ArrayValue(elems), m)
+			m.releaseQuery(held)
+			return v, qerr
 		default: // sqIn
 			lv, lerr := e.lhs.eval(row, env, m)
 			if lerr != nil {
@@ -3584,7 +3592,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			for i, rr := range r.rows {
 				list[i] = rr[0]
 			}
-			return inMembership(lv, list, e.negated, m)
+			v, ierr := inMembership(lv, list, e.negated, m)
+			m.releaseQuery(held)
+			return v, ierr
 		}
 	case reInValues:
 		// A folded uncorrelated `IN (subquery)` — the list is constant; test membership per row.

@@ -973,6 +973,23 @@ namespace :conformance do
     sh env, "go", "run", "./cmd/conformance", "disk", chdir: GO_DIR
     sh env, "node", "src/bin/conformance.ts", "disk", chdir: TS_DIR
   end
+
+  # The whole-corpus query-memory accounting mode (spec/design/memory.md §5): every record without
+  # its own `# max_query_memory_bytes:` runs under a huge but ACTIVE budget, so every query shape
+  # exercises the reserve/release sites; each core's runner fails a record whose releases exceed
+  # its reservations. Results, errors and costs must be unchanged. Both storage modes, since the
+  # eager and bounded-spill lanes account differently.
+  desc "Run the shared SQL corpus on all cores with query-memory accounting active (bytes, optional path filter)"
+  task :query_memory, [:bytes, :filter] do |_, args|
+    env = { "JED_CONFORMANCE_QUERY_MEMORY" => args[:bytes] || "1099511627776" }
+    env["JED_CONFORMANCE_FILTER"] = args[:filter] if args[:filter]
+    %w[memory disk].each do |mode|
+      extra = mode == "disk" ? ["disk"] : []
+      sh env, "cargo", "run", "--release", "--quiet", "--bin", "conformance", "--manifest-path", RUST_MANIFEST, "--", *extra
+      sh env, "go", "run", "./cmd/conformance", *extra, chdir: GO_DIR
+      sh env, "node", "src/bin/conformance.ts", *extra, chdir: TS_DIR
+    end
+  end
   desc "Walk the conformance corpus on the Rust core, both storage modes (release — debug overflows depth_limit)"
   task :rust do
     puts "conformance: rust (memory)"
@@ -1030,8 +1047,8 @@ task unit: %w[unit:rust unit:go unit:ts]
 # conformance corpus on all three cores + each core's unit suite + the CLI golden tests. This is
 # the inner dev loop; `rake ci` is the SUPERSET that wraps it with the static/spec/metamorphic
 # gates below.
-desc "Engine test suites: conformance corpus (×3 cores) + per-core unit tests + CLI + Ruby-gem + migrate tests"
-task test: %w[conformance conformance:spill unit cli:test ruby:test migrate:test]
+desc "Engine test suites: conformance corpus (×3 cores; plain, forced-spill, query-memory accounting) + per-core unit tests + CLI + Ruby-gem + migrate tests"
+task test: %w[conformance conformance:spill conformance:query_memory unit cli:test ruby:test migrate:test]
 
 # ci — the full merge gate, a SUPERSET of `rake test`. Adds the checks that aren't example-based
 # tests: spec-data + byte-fixture verification + codegen-drift (`verify`), the formatter gate

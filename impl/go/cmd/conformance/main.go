@@ -796,6 +796,17 @@ func runFile(text string, disk bool) error {
 	var pendingAllowTempDDL *bool
 	var pendingTempBuffers *int
 	var pendingScalarBytes *int64
+	var pendingQueryMemory *int64
+	// The whole-corpus accounting mode (`rake conformance:query_memory`): a budget applied to every
+	// record without its own directive, so every query shape exercises the accounting.
+	var queryMemoryDefault int64
+	if v := os.Getenv("JED_CONFORMANCE_QUERY_MEMORY"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return fmt.Errorf("JED_CONFORMANCE_QUERY_MEMORY must be integer bytes")
+		}
+		queryMemoryDefault = n
+	}
 	var pendingVars []varPair
 	var pendingTimezone *string
 	for i < len(lines) {
@@ -887,6 +898,8 @@ func runFile(text string, disk bool) error {
 				pendingAllowTempDDL = &a
 			} else if n, ok := parseMaxCostDirective(strings.Replace(line, "max_scalar_bytes:", "max_cost:", 1)); ok {
 				pendingScalarBytes = &n
+			} else if n, ok := parseMaxCostDirective(strings.Replace(line, "max_query_memory_bytes:", "max_cost:", 1)); ok {
+				pendingQueryMemory = &n
 			} else if n, ok := parseTempBuffersDirective(line); ok {
 				pendingTempBuffers = &n
 			} else if vars, ok := parseSetDirective(line); ok {
@@ -1003,6 +1016,15 @@ func runFile(text string, disk bool) error {
 		}
 		sess.SetMaxScalarBytes(scalarBytes)
 		pendingScalarBytes = nil
+		// `# max_query_memory_bytes:` (memory.md §2) decorates only its record; absent ⇒ unlimited, or
+		// the whole-corpus accounting budget of JED_CONFORMANCE_QUERY_MEMORY.
+		queryMemory := queryMemoryDefault
+		if pendingQueryMemory != nil {
+			queryMemory = *pendingQueryMemory
+		}
+		sess.SetMaxQueryMemoryBytes(queryMemory)
+		pendingQueryMemory = nil
+		underflowsBefore := jed.QueryMemoryUnderflows()
 		sess.SetTempBuffers(tempBuffers)
 		pendingTempBuffers = nil
 		// Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
@@ -1104,6 +1126,9 @@ func runFile(text string, disk bool) error {
 			}
 		default:
 			return fmt.Errorf("unknown record kind %q", fields[0])
+		}
+		if jed.QueryMemoryUnderflows() != underflowsBefore {
+			return fmt.Errorf("query-memory accounting released more than it reserved (memory.md §5)\n  record: %s", line)
 		}
 	}
 	return nil

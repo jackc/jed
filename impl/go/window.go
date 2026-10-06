@@ -466,6 +466,9 @@ func materializeOrderExprs(rows []storedRow, orderExprs []*rExpr, env *evalEnv, 
 			if err != nil {
 				return err
 			}
+			if err := meter.admitValue(v); err != nil { // an appended slot grows the buffered row (memory.md §5.1)
+				return err
+			}
 			vals[k] = v
 		}
 		rows[i] = append(rows[i], vals...)
@@ -492,6 +495,9 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 			for k, ke := range windowKeys {
 				v, err := ke.eval(rows[i], env, meter)
 				if err != nil {
+					return err
+				}
+				if err := meter.admitValue(v); err != nil { // an appended slot grows the buffered row (memory.md §5.1)
 					return err
 				}
 				kv[k] = v
@@ -1011,6 +1017,9 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 			}
 		}
 		for i := range rows {
+			if err := meter.admitValue(results[i]); err != nil { // each appended window result (memory.md §5.1)
+				return err
+			}
 			rows[i] = append(rows[i], results[i])
 		}
 	}

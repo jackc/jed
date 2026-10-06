@@ -1513,6 +1513,22 @@ func magDivMod(num, den []uint32) ([]uint32, []uint32) {
 	return magTrim(quo), rem
 }
 
+// codecGroupCount is the number of base-10^4 groups the canonical codec (magToNbase4) would emit —
+// ceil(digits / 4) of the unscaled magnitude, 0 for zero — without allocating them (the
+// query-memory size schedule, spec/design/memory.md §3).
+func (d *Decimal) codecGroupCount() int {
+	if len(d.Limbs) == 0 {
+		return 0
+	}
+	top := d.Limbs[len(d.Limbs)-1]
+	topDigits := 1
+	for top >= 10 {
+		top /= 10
+		topDigits++
+	}
+	return (9*(len(d.Limbs)-1) + topDigits + 3) / 4
+}
+
 // magToNbase4 converts LSB-first base-10^9 limbs to MS-first base-10^4 groups. Zero → empty.
 func magToNbase4(limbs []uint32) []uint16 {
 	if len(limbs) == 0 {

@@ -1,8 +1,9 @@
 # Query-memory admission on the eager blocking lane (memory.md §5). On a file-backed database
 # aggregates, DISTINCT, and multi-way joins take the bounded-spill lane, whose spools are operator
 # state (Q2) bounded by work_mem instead — so these exact thresholds hold only in memory mode.
-# skip: disk — blocking operators take the bounded-spill lane on file-backed databases
-# requires: query.select, ddl.create_table, dml.insert, dml.insert_multi_row, dml.insert_select, types.text, query.comma_from, query.set_returning, query.distinct, query.aggregates, query.aggregate_distinct, query.group_by, query.having, query.order_by, query.limit, resource.query_memory
+# skip: disk — blocking operators take the bounded-spill lane on file-backed databases, and a
+# transaction cannot span the disk-mode per-record reopen
+# requires: txn.explicit, txn.failed_state, query.select, ddl.create_table, dml.insert, dml.insert_multi_row, dml.insert_select, types.text, query.comma_from, query.set_returning, query.distinct, query.aggregates, query.aggregate_distinct, query.group_by, query.having, query.order_by, query.limit, resource.query_memory
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v text, pad text)
@@ -115,3 +116,26 @@ SELECT a.id, b.k, c.id FROM t a, u b, n c WHERE c.id = a.id + b.k
 # max_query_memory_bytes: 10367
 statement error 54P05
 SELECT a.id, b.k, c.id FROM t a, u b, n c WHERE c.id = a.id + b.k
+
+# A 54P05 is an ordinary statement failure: inside an explicit block it fails the transaction,
+# and the block's earlier writes are discarded.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO n VALUES (100)
+
+# max_query_memory_bytes: 2795
+statement error 54P05
+SELECT a.id, b.v FROM t a, t b
+
+statement error 25P02
+SELECT 1
+
+statement ok
+ROLLBACK
+
+query I nosort
+SELECT count(*) FROM n
+----
+6

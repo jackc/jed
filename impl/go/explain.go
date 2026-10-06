@@ -81,7 +81,7 @@ func (db *engine) executeExplain(ex *explain, params []Value) (outcome, error) {
 	if err := db.renderExplain(&r, ex.Inner, 0); err != nil {
 		return outcome{}, err
 	}
-	return db.explainOutcome(r.rows, ex), nil
+	return db.explainOutcome(r.rows, ex)
 }
 
 // executeExplainAnalyze renders the plan AND runs the inner statement, reporting the inner's ACTUAL
@@ -117,6 +117,11 @@ func (db *engine) executeExplainAnalyze(ex *explain, params []Value) (outcome, e
 	if innerOut.Kind == outcomeStatement {
 		actualRows = innerOut.RowsAffected // a DML statement without RETURNING
 	}
+	// The analyzed statement's result is counted, then discarded (memory.md §5.3).
+	if innerOut.Kind == outcomeQuery {
+		acct := db.session.queryAccount()
+		acct.release(measureRows(acct, innerOut.Rows))
+	}
 	body.actual = explainActualCosts(estimates, innerOut.Cost)
 	profile.apply(body.rows, body.frameDepths, body.actual)
 	for i := range body.rows {
@@ -132,7 +137,7 @@ func (db *engine) executeExplainAnalyze(ex *explain, params []Value) (outcome, e
 		shifted := append([]Value{IntValue(row[0].Int + 1)}, row[1:]...)
 		r.rows = append(r.rows, shifted)
 	}
-	return db.explainOutcome(r.rows, ex), nil
+	return db.explainOutcome(r.rows, ex)
 }
 
 type actualCostKey struct {
@@ -286,7 +291,7 @@ func explainActualCosts(estimates []planEstimate, total int64) []int64 {
 
 // explainOutcome wraps rendered plan rows as a query outcome, charging the EXPLAIN's own cost — one
 // row_produced per emitted plan row (a deterministic function of the plan-row count).
-func (db *engine) explainOutcome(rows [][]Value, ex *explain) outcome {
+func (db *engine) explainOutcome(rows [][]Value, ex *explain) (outcome, error) {
 	meter := db.session.newMeter()
 	meter.Charge(costs.RowProduced * int64(len(rows)))
 	names := []string{"depth", "node", "detail"}
@@ -320,13 +325,18 @@ func (db *engine) explainOutcome(rows [][]Value, ex *explain) outcome {
 		names = append(names, "lane")
 		types = append(types, "text")
 	}
+	for _, row := range outRows {
+		if err := meter.admitRow(row); err != nil { // the EXPLAIN result rows (memory.md §5.1)
+			return outcome{}, err
+		}
+	}
 	return outcome{
 		Kind:        outcomeQuery,
 		ColumnNames: names,
 		ColumnTypes: types,
 		Rows:        outRows,
 		Cost:        meter.Accrued,
-	}
+	}, nil
 }
 
 func (db *engine) explainLane(inner *statement) string {

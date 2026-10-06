@@ -112,7 +112,10 @@ type SessionOptions struct {
 	// MaxScalarBytes bounds cumulative covered scalar allocations per statement; non-positive
 	// values restore the finite 64 MiB default (spec/design/memory.md).
 	MaxScalarBytes int64
-	MaxCost        int64
+	// MaxQueryMemoryBytes is the live logical query-memory budget per statement
+	// (spec/design/memory.md §2); non-positive ⇒ unlimited (the default). Over-budget fails 54P05.
+	MaxQueryMemoryBytes int64
+	MaxCost             int64
 	// LifetimeMaxCost is the per-session cumulative cost budget (spec/design/session.md §5.4); 0 ⇒
 	// unlimited (the default). Bounds the whole session: the instant the session's running total
 	// reaches it, the in-flight statement aborts 54P02 (and once spent, every further statement is
@@ -200,6 +203,11 @@ type sessionState struct {
 	// All meters and frozen cursors of one statement share this allocation account.
 	scalarBytes    *int64
 	maxScalarBytes int64
+	// queryBytes is the current statement's live query-memory total and maxQueryMemoryBytes its
+	// budget (<= 0 ⇒ unlimited), replaced at each statement start like scalarBytes
+	// (spec/design/memory.md §2). A frozen cursor's session copy keeps its statement's account.
+	queryBytes          *int64
+	maxQueryMemoryBytes int64
 	// fkActionDepth bounds recursive generated referential-action statements (§6.6).
 	fkActionDepth int
 	// fkDeferredChecks holds inbound NO ACTION/RESTRICT probes until the outermost generated
@@ -327,18 +335,19 @@ func newSessionWithOptions(opts SessionOptions) sessionState {
 		opts.WorkMem = defaultWorkMem
 	}
 	s := sessionState{
-		maxCost:         opts.MaxCost,
-		maxScalarBytes:  opts.MaxScalarBytes,
-		lifetimeMaxCost: opts.LifetimeMaxCost,
-		lifetimeTotal:   new(int64),
-		maxSQLLength:    opts.MaxSQLLength,
-		lockTimeoutMs:   opts.LockTimeoutMs,
-		workMem:         opts.WorkMem,
-		privileges:      newPrivileges(),
-		allowDDL:        true,
-		tempBuffers:     defaultTempBuffers,
-		tempCommitted:   newSnapshot(),
-		vars:            map[string]string{},
+		maxCost:             opts.MaxCost,
+		maxScalarBytes:      opts.MaxScalarBytes,
+		maxQueryMemoryBytes: opts.MaxQueryMemoryBytes,
+		lifetimeMaxCost:     opts.LifetimeMaxCost,
+		lifetimeTotal:       new(int64),
+		maxSQLLength:        opts.MaxSQLLength,
+		lockTimeoutMs:       opts.LockTimeoutMs,
+		workMem:             opts.WorkMem,
+		privileges:          newPrivileges(),
+		allowDDL:            true,
+		tempBuffers:         defaultTempBuffers,
+		tempCommitted:       newSnapshot(),
+		vars:                map[string]string{},
 	}
 	if opts.DefaultPrivileges != nil {
 		s.privileges.SetDefaultTable(*opts.DefaultPrivileges)
@@ -1217,7 +1226,7 @@ func (s *sessionState) newMeter() *costMeter {
 	if s.scalarBytes == nil {
 		s.scalarBytes = new(int64)
 	}
-	return &costMeter{scalarBytes: s.scalarBytes, scalarLimit: s.maxScalarBytes, Limit: s.maxCost, lifetimeTotal: s.lifetimeTotal, lifetimeLimit: s.lifetimeMaxCost, cancel: s.cancel}
+	return &costMeter{scalarBytes: s.scalarBytes, scalarLimit: s.maxScalarBytes, query: s.queryAccount(), Limit: s.maxCost, lifetimeTotal: s.lifetimeTotal, lifetimeLimit: s.lifetimeMaxCost, cancel: s.cancel}
 }
 
 // MaxSQLLength / SetMaxSQLLength — the input-SQL byte limit (0 ⇒ unlimited).
@@ -1499,10 +1508,36 @@ func (s *sessionState) SetMaxScalarBytes(bytes int64) { s.maxScalarBytes = bytes
 func (db *engine) MaxScalarBytes() int64              { return db.session.MaxScalarBytes() }
 func (db *engine) SetMaxScalarBytes(bytes int64)      { db.session.SetMaxScalarBytes(bytes) }
 
+// MaxQueryMemoryBytes is the live query-memory budget per statement, or 0 for unlimited
+// (spec/design/memory.md §2).
+func (s *sessionState) MaxQueryMemoryBytes() int64 { return max(s.maxQueryMemoryBytes, 0) }
+
+// SetMaxQueryMemoryBytes sets the live query-memory budget per statement; non-positive restores the
+// default, unlimited.
+func (s *sessionState) SetMaxQueryMemoryBytes(bytes int64) { s.maxQueryMemoryBytes = bytes }
+
+func (db *engine) MaxQueryMemoryBytes() int64 { return db.session.MaxQueryMemoryBytes() }
+
+func (db *engine) SetMaxQueryMemoryBytes(bytes int64) { db.session.SetMaxQueryMemoryBytes(bytes) }
+
+// queryAccount is the current statement's query-memory account (spec/design/memory.md §2).
+func (s *sessionState) queryAccount() queryAccount {
+	if s.queryBytes == nil {
+		s.queryBytes = new(int64)
+	}
+	return queryAccount{used: s.queryBytes, limit: s.maxQueryMemoryBytes}
+}
+
+// resetStatementMemory starts a statement's scalar allowance and query-memory account afresh.
+func (s *sessionState) resetStatementMemory() {
+	s.scalarBytes = new(int64)
+	s.queryBytes = new(int64)
+}
+
 // scratchMeter keeps legacy unreported evaluation cost while sharing scalar admission.
 func (s *sessionState) scratchMeter() *costMeter {
 	if s.scalarBytes == nil {
 		s.scalarBytes = new(int64)
 	}
-	return &costMeter{scalarBytes: s.scalarBytes, scalarLimit: s.maxScalarBytes, cancel: s.cancel}
+	return &costMeter{scalarBytes: s.scalarBytes, scalarLimit: s.maxScalarBytes, query: s.queryAccount(), cancel: s.cancel}
 }

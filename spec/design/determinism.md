@@ -86,8 +86,12 @@ deliberately keeps **inside** the deterministic contract by paying for it elsewh
 - **Resource / memory limits.** Most engines let "out of memory / too deep" be
   environment-dependent. jed does **not**: [cost.md](cost.md)'s *logical* cost units
   (page-reads, rows, operator-evals — never bytes or wall-clock) make the ceiling
-  deterministic and cross-core (CLAUDE.md §13). A limit hit is part of G1/G2, not an
-  exception.
+  deterministic and cross-core (CLAUDE.md §13). The memory budgets follow suit: the
+  scalar allowance and the query-memory account ([memory.md](memory.md)) charge
+  *logical* bytes from a shared size schedule at mirrored sites, never runtime object
+  sizes, so a `54P04`/`54P05` abort is a pure function of the query, the database, and
+  the host's settings (including which execution lane those settings select). A limit
+  hit is part of G1/G2, not an exception.
 - **Collation / Unicode version.** The ICU-version-dependent-ordering trap
   ([types.md](types.md) §11) is exactly an exception jed refuses: it ships one fixed `C`
   collation precisely so ordering is table-free and version-independent. Linguistic collation

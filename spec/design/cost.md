@@ -1774,6 +1774,7 @@ logarithm estimates use the same meter. This deliberately conservative logical
 work measure is independent of the host limb representation and wall clock.
 The exact charge sites are specified alongside the kernels in decimal.md.
 
-Cost is a work budget, **not a memory limit**. Independent allocation budgets
-are specified in [memory.md](memory.md). Both cost counters saturate at i64 MAX;
+Cost is a work budget, **not a memory limit**. Independent allocation budgets —
+the cumulative scalar allowance (`54P04`) and the live query-memory account
+(`54P05`) — are specified in [memory.md](memory.md). Both cost counters saturate at i64 MAX;
 no amount of charged work can wrap a counter and disable a ceiling.
