@@ -177,8 +177,8 @@ everything else tests against, not a detail discovered during implementation.
   fixed-width integers (with *defined* overflow behavior), an **exact `decimal`**,
   `text` (one defined collation/encoding to start), `boolean`, `timestamp` /
   `timestamptz`, `bytea`, **`uuid`** (a fixed 16-byte value), and **`json`/`jsonb`** —
-  the committed XL headline feature, now **designed spec-first** (the implementation is the
-  remaining work): the type pair + the `jsonb` binary value format (with a reserved
+  the committed XL headline feature, ✅ **landed in all three cores** (all non-deferred slices,
+  oracle-clean; designed spec-first): the type pair + the `jsonb` binary value format (with a reserved
   column-level **string-dictionary** door) in [spec/design/json.md](spec/design/json.md),
   the first-class **`jsonpath`** type + the SQL/JSON path language in
   [spec/design/jsonpath.md](spec/design/jsonpath.md), the ~100-function/operator surface +
@@ -188,7 +188,8 @@ everything else tests against, not a detail discovered during implementation.
   PG-faithful (numbers are exact `decimal`, never float; `jsonb` keys canonical so no
   iteration-order leak), with the divergences deliberate and ledgered (the `like_regex`
   flag subset, `jsonb`-as-key and the dictionary builder deferred). Stable type codes 18
-  (`json`), 19 (`jsonb`), 20 (`jsonpath`); the slice ladder is in [TODO.md](TODO.md).
+  (`json`), 19 (`jsonb`), 20 (`jsonpath`); the deferred `0A000` follow-ons are in
+  [TODO.md](TODO.md).
   - **First implemented step — signed integers only:** `i16` / `smallint` (16-bit),
     `i32` / `int` / `integer` (32-bit), `i64` / `bigint` (64-bit). Canonical names state
     width in **bits** under the **`i`/`f` prefix** (`i16`/`i32`/`i64`, `f32`/`f64` — the
@@ -199,9 +200,9 @@ everything else tests against, not a detail discovered during implementation.
     8-bit `i8` stays free (the same property that lets a future `int8range` alias `i64range`
     without colliding with `i8range` — `spec/design/types.md` §2). The old jed names
     `i16`/`i32`/`i64`/`f32`/`f64` are a **clean break** — no longer accepted.
-    Two's-complement, with trap-on-overflow (§8). Every other scalar above is explicitly
-    **deferred** to a later slice. The float/decimal/collation decisions in §8 do not bind
-    step 1.
+    Two's-complement, with trap-on-overflow (§8). That was step 1; every scalar listed above
+    has since landed (plus `date`, `interval`, and `f32`/`f64`) — [TODO.md](TODO.md) tracks the
+    remaining per-type follow-ons.
   - **Beyond scalars — the `array` container is the second open-`Type` axis**
     (`spec/design/array.md`, `i32[]`, `ARRAY[1,2,3]`, `'{1,2,3}'::i32[]`). An array is a
     *container* layered over the element type, not a scalar — its own value codec, comparison
@@ -406,16 +407,23 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
 - **Float formatting** — every language prints `f64` differently. Decision bias: keep
   binary floats **out of the comparison and text-output paths entirely**; lean on exact
   `decimal`. This aligns with "a real type system" and kills the worst offender. ✅ `decimal`
-  has landed (`spec/design/decimal.md`) as that exact path; binary `float` stays deferred.
+  has landed (`spec/design/decimal.md`) as that exact path. Binary `f32`/`f64` has since landed
+  too (`spec/design/float.md`) as the **first type narrowly exempted from byte-identity**: each
+  core renders with its native shortest round-trip formatter, and the corpus `R` tag compares
+  within a tolerance (the `float-render-layout` entry in the determinism ledger).
 - **Decimal rounding** — ✅ **decided: round half away from zero** (PostgreSQL `numeric`;
   `0.125 → 0.13`, `2.5 → 3`), one mode engine-wide, applied to scale coercion / casts /
   division (`spec/design/decimal.md` §3). Result **scale** follows PG's per-operator rules
   (add/sub `max(s1,s2)`, mul `s1+s2`, div `select_div_scale`; §4).
 - **NaN / infinity ordering** — for `decimal`: **excluded**, the type is always finite (no
   float source; `x/0` traps `22012`), so there is no NaN/∞ to order (a documented PG
-  divergence — `spec/design/decimal.md` §2). Revisit only if a binary `float` type lands.
-- **Collation** — start with ONE defined collation (byte/codepoint order is simplest);
-  ICU-style collation is an explicit later feature.
+  divergence — `spec/design/decimal.md` §2). For `f32`/`f64`: NaN and ±Infinity are
+  first-class values under PostgreSQL's total `float8` order (`-Inf < finite < +Inf < NaN`,
+  `NaN = NaN`, `-0 = +0`; `spec/design/float.md` §3).
+- **Collation** — the baseline is ONE defined collation, `C` (UTF-8 code-point order). ✅
+  **Linguistic collation has landed** as a jed-owned UCA (UTS #10) executor in every core, over
+  host-loaded Unicode-data bundles, not ICU — so no library-version drift
+  (`spec/design/collation.md`).
 - **Integer overflow** — defined wrap vs. trap.
 - **Iteration-order leaks** — no hashmap iteration order may leak into the result *multiset*,
   values, types, names, errors, or cost. **Row sequence, however, is defined only by `ORDER
