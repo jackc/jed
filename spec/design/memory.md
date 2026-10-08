@@ -535,8 +535,9 @@ are checked once the statement completes. Thresholds are pinned by
 
 ## 8. Q4: storage
 
-> **Status: Q4a implemented** in all three cores. The cache rules in §8.6 record
-> contracts the pager already keeps and add nothing to enforce.
+> **Status: Q4a implemented** in all three cores; **Q4b** (the public docs) landed.
+> The cache rules in §8.6 record contracts the pager already keeps and add nothing
+> to enforce.
 
 Q1–Q3 charge memory that a **session** owns: a statement's buffers and state, and
 its transaction's staged writes. Storage memory outlives every statement and is
@@ -776,7 +777,7 @@ bounded overshoot of at most one extra page per resident leaf.
   `rake conformance:query_memory` also records each record's final in-memory
   `storage_bytes` and fails unless all cores agree. That cross-core check is what
   backs the §8.4 claim, the same way peak balances back Q1–Q3.
-- **Q4b — documentation only.** Public docs ([resource-limits](../../web/src/routes/docs/api/resource-limits/+page.md))
+- **Q4b — documentation only (landed).** Public docs ([resource-limits](../../web/src/routes/docs/api/resource-limits/+page.md))
   describe the cache rules of §8.6 and the B/2–B sizing note of §8.2. No engine
   change.
 - **Follow-ons:** the file-backed size cap on live pages (§8.7); bounding the

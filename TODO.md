@@ -367,6 +367,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   cross-core storage comparison in `rake conformance:query_memory` back it. Thresholds pinned by
   `resource/storage_memory.test` and `concurrency/storage_watermark.test`. Page caches stay
   evict-only under `cache_bytes`. See [memory.md](spec/design/memory.md) §8.
+  - [x] _Q4b:_ the resource-limits web page documents the §8.6 cache rules (evict-only,
+    live-reference overshoot, the interior skeleton and GiST tree outside `cache_bytes`) and the
+    B/2–B sizing note.
   - [ ] _follow-on:_ a file-backed database-size cap over the **live** page count (§8.7 — the
     high-water is co-residence-timing-dependent under shared access); bounding the interior
     skeleton and resident GiST R-tree once they page.

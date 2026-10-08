@@ -105,6 +105,30 @@ does a commit that only deletes rows or drops objects, so a full database can al
 up. A read session that predates the last commit can keep dead pages from being reclaimed; closing
 it frees them for the next commit.
 
+## Page cache
+
+A file-backed database holds its table data in a **page cache** of leaf pages read from the file,
+bounded by the `cache_bytes` / `CacheBytes` / `cacheBytes` open option (default **256 MiB**). The
+budget becomes a page count, `max(1, cache_bytes / page_size)`, so a budget smaller than one page
+still keeps one page cached. When the cache is full, jed evicts a page; it can always read that page
+back from the file. Because of that, **the cache never fails a query**, and its size never changes a
+query's results or cost. It is a memory and speed setting, not a limit an untrusted query can hit.
+
+The budget bounds the cached pages, with two qualifications:
+
+- **Pages in use stay alive.** An evicted page is not freed while a query or open cursor is still
+  reading it: at most one root-to-leaf path per running query, plus each open cursor's current page.
+  So the cache can briefly hold a few pages over its budget with many concurrent readers.
+- **Some structures are not in the cache.** The interior pages of every table and index tree stay in
+  memory. They are a small fraction of a tree's pages, since each one routes to many leaves. The
+  index tree of a GiST index also stays in memory, and grows with the number of indexed rows. `cache_bytes` does not bound these. On a
+  file-backed database they grow with the file, so bound them by bounding what is stored. On an
+  in-memory database they are part of the pages `max_storage_bytes` counts.
+
+An in-memory database ignores `cache_bytes`: all of its pages stay in memory, and `max_storage_bytes`
+is the limit for them. The `storage_bytes(name)` gauge also works on a file-backed database, where it
+reports the file's page high-water times its page size. There is no limit on that number yet.
+
 ## Memory coverage
 
 These budgets are **guardrails, not a process-memory cap**. The query-memory budget covers row
@@ -112,8 +136,8 @@ buffers and operator state: hash-join tables, group, `DISTINCT`, and set-operati
 `json_agg`-style and ordered-set accumulators, window partitions, sort buffers and top-k heaps,
 the resident part of spilling operators, and the writes pending in an open transaction. The
 storage limit covers an in-memory database's committed pages. A file-backed database's page cache
-is bounded by its `cache_bytes` open option, which evicts pages and never fails a query. Still
-uncovered: a size cap for file-backed databases and scalar kernels beyond the ones listed above. On native file hosts,
+is bounded by its `cache_bytes` open option, which evicts pages and never fails a query (see the
+page cache section above). Still uncovered: a size cap for file-backed databases and scalar kernels beyond the ones listed above. On native file hosts,
 sort, hash JOIN, aggregation, and DISTINCT spill when they exceed `work_mem` — and also when the
 query-memory budget would otherwise reject them, so a large sort or aggregate spills rather than
 fails and releases its charge as it spills. Row buffers that cannot spill, such as a derived
