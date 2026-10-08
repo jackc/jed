@@ -398,5 +398,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [x] _S3:_ escaping renders: `encode`, `quote_*`, array → text, and jsonb → text/json
     (`resource/scalar_output_render.test`). Casts to text from `bytea`, composites, and ranges join
     when those casts land.
-  - [ ] _follow-on:_ the `jsonpath_step` unit ([jsonpath.md §7](spec/design/jsonpath.md)), designed
-    but unimplemented, so path evaluation's sub-value copies are uncharged.
+  - [x] _follow-on:_ jsonpath metering ([jsonpath.md §7](spec/design/jsonpath.md)): `jsonpath_compile`
+    per compiled byte and `jsonpath_step` per step application, emitted item, member examined, and
+    comparison pair (`resource/jsonpath_cost.test`). The Rust evaluator now borrows items instead of
+    deep-copying them.

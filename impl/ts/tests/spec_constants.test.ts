@@ -226,6 +226,10 @@ test("cost schedule matches spec/cost/schedule.toml", () => {
         return COSTS.scalarByte;
       case "decimal_transcend":
         return COSTS.decimalTranscend;
+      case "jsonpath_compile":
+        return COSTS.jsonpathCompile;
+      case "jsonpath_step":
+        return COSTS.jsonpathStep;
       case "decimal_work":
         return COSTS.decimalWork;
       case "row_produced":

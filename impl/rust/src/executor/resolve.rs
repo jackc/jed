@@ -966,20 +966,27 @@ pub(crate) fn resolve_jsonpath_args(
     Ok((ctx, path))
 }
 
-/// Recompile a `jsonpath` value's canonical text and evaluate it over a `jsonb` context value (the
-/// shared kernel of the jsonpath query functions). A NULL context or path yields `None` (→ SQL NULL).
-pub(crate) fn eval_jsonpath(ctx: &Value, path: &Value) -> Result<Option<Vec<JsonNode>>> {
+/// The context node and compiled path of a jsonpath call (the shared front of the jsonpath query
+/// functions). A NULL context or path yields `None` (→ SQL NULL). A `jsonb` context is borrowed and
+/// a `json` one parsed; recompiling the path's canonical text charges `jsonpath_compile`
+/// (jsonpath.md §7). The caller evaluates with [`crate::jsonpath::eval`].
+pub(crate) fn jsonpath_operands<'v>(
+    ctx: &'v Value,
+    path: &Value,
+    m: &mut Meter,
+) -> Result<Option<(Cow<'v, JsonNode>, crate::jsonpath::JsonPath)>> {
     let node = match ctx {
         Value::Null => return Ok(None),
-        _ => json_arg_node(ctx)?,
+        Value::Jsonb(n) => Cow::Borrowed(n),
+        Value::Json(s) => Cow::Owned(json::parse_preserving(s)?),
+        _ => unreachable!("resolver restricts a json/jsonb function argument to json/jsonb"),
     };
     let text = match path {
         Value::Null => return Ok(None),
         Value::JsonPath(s) => s,
         _ => unreachable!("resolver restricts a jsonpath argument to jsonpath"),
     };
-    let compiled = crate::jsonpath::JsonPath::compile(text)?;
-    Ok(Some(crate::jsonpath::eval(&compiled, &node)?))
+    Ok(Some((node, crate::jsonpath::compile_metered(text, m)?)))
 }
 
 /// Extract a `text[]` value into `Vec<Option<String>>`, preserving NULL elements — `None` if the

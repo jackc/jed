@@ -1114,11 +1114,11 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 		if path.Kind == ValNull {
 			return nil, nil
 		}
-		compiled, err := compile(path.str())
+		compiled, err := compileMetered(path.str(), m)
 		if err != nil {
 			return nil, err
 		}
-		seq, err := compiled.Eval(node)
+		seq, err := compiled.Eval(node, m)
 		if err != nil {
 			return nil, err
 		}
@@ -1336,11 +1336,11 @@ func (db *engine) jsonTableRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stor
 		return nil, err
 	}
 	// The root path → the sequence of row items (a structural error here yields no rows).
-	root, err := compile(plan.rootPath)
+	root, err := compileMetered(plan.rootPath, m)
 	if err != nil {
 		return nil, err
 	}
-	items, err := root.Eval(node)
+	items, err := root.Eval(node, m)
 	if err != nil {
 		if isSQLJSONError(err) {
 			return nil, nil
@@ -1432,7 +1432,7 @@ func expandJtLevel(cols []jtCol, items []JsonNode, env *evalEnv, m *costMeter) (
 				}
 				local = append(local, jtAssign{idx: c.idx, v: v})
 			case *jtColExists:
-				v, err := evalJtExists(item, c)
+				v, err := evalJtExists(item, c, m)
 				if err != nil {
 					return nil, err
 				}
@@ -1471,11 +1471,11 @@ func expandJtNested(children []*jtColNested, item *JsonNode, env *evalEnv, m *co
 	}
 	var union [][]jtAssign
 	for _, child := range children {
-		p, err := compile(child.path)
+		p, err := compileMetered(child.path, m)
 		if err != nil {
 			return nil, err
 		}
-		childSeq, err := p.Eval(*item)
+		childSeq, err := p.Eval(*item, m)
 		if err != nil {
 			if isSQLJSONError(err) {
 				childSeq = nil
@@ -1498,11 +1498,11 @@ func expandJtNested(children []*jtColNested, item *JsonNode, env *evalEnv, m *co
 // evalJtRegular evaluates a regular JSON_TABLE column over a row item — JSON_VALUE (scalar) /
 // JSON_QUERY (json/jsonb) semantics, with the column's wrapper / ON EMPTY / ON ERROR.
 func evalJtRegular(item *JsonNode, c *jtColRegular, env *evalEnv, m *costMeter) (Value, error) {
-	p, err := compile(c.path)
+	p, err := compileMetered(c.path, m)
 	if err != nil {
 		return Value{}, err
 	}
-	seq, err := p.Eval(*item)
+	seq, err := p.Eval(*item, m)
 	if err != nil {
 		if isSQLJSONError(err) {
 			return applyJSONBehavior(c.onError, err, c.returning, env, m)
@@ -1519,13 +1519,13 @@ func evalJtRegular(item *JsonNode, c *jtColRegular, env *evalEnv, m *costMeter) 
 
 // evalJtExists evaluates an EXISTS JSON_TABLE column over a row item — JSON_EXISTS, coerced to the
 // column type (a NON-empty sequence is true; a structural error honors ON ERROR, default FALSE).
-func evalJtExists(item *JsonNode, c *jtColExists) (Value, error) {
-	p, err := compile(c.path)
+func evalJtExists(item *JsonNode, c *jtColExists, m *costMeter) (Value, error) {
+	p, err := compileMetered(c.path, m)
 	if err != nil {
 		return Value{}, err
 	}
 	var exists bool
-	seq, err := p.Eval(*item)
+	seq, err := p.Eval(*item, m)
 	if err != nil {
 		if isSQLJSONError(err) {
 			switch c.onError {

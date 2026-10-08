@@ -52,6 +52,8 @@ type costSchedule struct {
 	WindowFrameStep     int64
 	ScalarByte          int64
 	DecimalTranscend    int64
+	JsonpathCompile     int64
+	JsonpathStep        int64
 }
 
 // Costs is the canonical cost schedule — weights accrued per unit during query execution.
@@ -82,4 +84,6 @@ var costs = costSchedule{
 	WindowFrameStep:     1,
 	ScalarByte:          1,
 	DecimalTranscend:    1,
+	JsonpathCompile:     1,
+	JsonpathStep:        1,
 }

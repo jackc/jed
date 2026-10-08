@@ -14,7 +14,11 @@
 // whole-word check (next char is not alphanumeric/`_`), the quoted-string JSON escapes, and the
 // member-key JSON-string escaping all match the Rust version.
 
-import { engineError, type EngineError } from "./errors.ts";
+import { EngineError, engineError } from "./errors.ts";
+import type { Meter } from "./cost.ts";
+import { COSTS } from "./costs.ts";
+import { workLinear } from "./decimal.ts";
+import { utf8Length } from "./memsize.ts";
 import { MAX_JSON_DEPTH, jsonbIn, jsonCompactOut, jsonNodeCmp, type JsonNode } from "./json.ts";
 
 // A subscript index: a non-negative integer literal or the `last` sentinel.
@@ -622,29 +626,60 @@ export function compile(src: string): JsonPath {
 // Evaluation (jsonpath.md §3-4) — the lax/strict ordered jsonb-item sequence (P1b structural subset).
 // ---------------------------------------------------------------------------------------------
 
+// compileMetered compiles a path for evaluation, charging jsonpath_compile for each UTF-8 byte of
+// the text first (jsonpath.md §7). Every evaluation compiles its path; there is no cache.
+export function compileMetered(src: string, m: Meter): JsonPath {
+  m.charge(COSTS.jsonpathCompile * BigInt(utf8Length(src)));
+  m.guard();
+  return compile(src);
+}
+
+// chargeSteps charges n units of jsonpath_step and guards (jsonpath.md §7).
+function chargeSteps(m: Meter, n: number): void {
+  m.charge(COSTS.jsonpathStep * BigInt(n));
+  m.guard();
+}
+
+// emit appends item to a step's output sequence, charging its one unit first (§7 rule 2).
+function emit(out: JsonNode[], item: JsonNode, m: Meter): void {
+  chargeSteps(m, 1);
+  out.push(item);
+}
+
+function codePoints(s: string): number {
+  let n = 0;
+  for (const _ of s) n++;
+  return n;
+}
+
 // eval evaluates a compiled path over a jsonb context item → the ordered SQL/JSON sequence
 // (jsonpath.md §3). Each accessor is a `seq → seq` map applied left to right. `lax` (default)
 // auto-unwraps arrays (§4.1) and suppresses structural navigation failures (§4.2); `strict` raises.
-// The P1b structural subset (no filters / item methods / arithmetic — those are still `0A000` at
-// compile). Port of impl/rust/src/jsonpath.rs `eval`.
-export function evalPath(path: JsonPath, ctx: JsonNode): JsonNode[] {
+// Metered by jsonpath_step (§7). Port of impl/rust/src/jsonpath.rs `eval`.
+export function evalPath(path: JsonPath, ctx: JsonNode, m: Meter): JsonNode[] {
   if (path.body.kind === "path") {
-    return evalSteps(path.body.steps, ctx, ctx, path.strict);
+    return evalSteps(path.body.steps, ctx, ctx, path.strict, m);
   }
   // A top-level predicate → a single item: its truth value as a boolean, or JSON null when unknown
   // (§4.4).
-  const truth = evalPred(path.body.pred, ctx, ctx, path.strict);
+  const truth = evalPred(path.body.pred, ctx, ctx, path.strict, m);
   return [truth === null ? { kind: "null" } : { kind: "bool", value: truth }];
 }
 
 // evalSteps evaluates an accessor-step sequence over a seed item, with `root` as the document `$`
 // (for a filter's `$`-rooted operand). Port of impl/rust/src/jsonpath.rs `eval_steps`.
-function evalSteps(steps: Step[], seed: JsonNode, root: JsonNode, strict: boolean): JsonNode[] {
+function evalSteps(
+  steps: Step[],
+  seed: JsonNode,
+  root: JsonNode,
+  strict: boolean,
+  m: Meter,
+): JsonNode[] {
   let seq: JsonNode[] = [seed];
   for (const step of steps) {
     const next: JsonNode[] = [];
     for (const item of seq) {
-      applyStep(step, item, strict, root, next);
+      applyStep(step, item, strict, root, next, m);
     }
     seq = next;
   }
@@ -657,30 +692,32 @@ function applyStep(
   strict: boolean,
   root: JsonNode,
   out: JsonNode[],
+  m: Meter,
 ): void {
   switch (step.kind) {
     case "member": {
       // lax: a member accessor on an array unwraps it ONE level first (§4.1.1).
       if (!strict && item.kind === "array") {
         for (const e of item.elements) {
-          memberAccess(e, step.key, strict, out);
+          memberAccess(e, step.key, strict, out, m);
         }
         return;
       }
-      memberAccess(item, step.key, strict, out);
+      memberAccess(item, step.key, strict, out, m);
       return;
     }
     case "wildcardMember": {
       if (!strict && item.kind === "array") {
         for (const e of item.elements) {
-          wildcardMember(e, strict, out);
+          wildcardMember(e, strict, out, m);
         }
         return;
       }
-      wildcardMember(item, strict, out);
+      wildcardMember(item, strict, out, m);
       return;
     }
     case "subscripts": {
+      chargeSteps(m, 1);
       // [i] on a non-array: lax treats the item as a singleton array (§4.1.2); strict raises.
       let elems: JsonNode[];
       if (item.kind === "array") {
@@ -694,20 +731,21 @@ function applyStep(
         );
       }
       for (const sub of step.subs) {
-        subscript(elems, sub, strict, out);
+        subscript(elems, sub, strict, out, m);
       }
       return;
     }
     case "wildcardElement": {
+      chargeSteps(m, 1);
       // [*] on a non-array: lax → the singleton item; strict raises.
       if (item.kind === "array") {
         for (const e of item.elements) {
-          out.push(e);
+          emit(out, e, m);
         }
         return;
       }
       if (!strict) {
-        out.push(item);
+        emit(out, item, m);
         return;
       }
       throw engineError(
@@ -721,11 +759,11 @@ function applyStep(
       // it ONE level first, testing each element (§4.1.1); a nested array element is tested as-is.
       if (!strict && item.kind === "array") {
         for (const e of item.elements) {
-          filterItem(step.pred, e, root, strict, out);
+          filterItem(step.pred, e, root, strict, out, m);
         }
         return;
       }
-      filterItem(step.pred, item, root, strict, out);
+      filterItem(step.pred, item, root, strict, out, m);
       return;
     }
   }
@@ -737,44 +775,54 @@ function filterItem(
   root: JsonNode,
   strict: boolean,
   out: JsonNode[],
+  m: Meter,
 ): void {
-  if (evalPred(pred, item, root, strict) === true) {
-    out.push(item);
+  chargeSteps(m, 1);
+  if (evalPred(pred, item, root, strict, m) === true) {
+    emit(out, item, m);
   }
 }
 
 // evalPred evaluates a filter predicate to a Kleene truth value (`true`/`false`/`null` = unknown).
 // Port of impl/rust/src/jsonpath.rs `eval_pred` (the Rust `Option<bool>`: Some(true)/Some(false)/None
-// → true/false/null here).
-function evalPred(pred: Pred, current: JsonNode, root: JsonNode, strict: boolean): boolean | null {
+// → true/false/null here). Both operands of &&/|| are always evaluated (no short-circuit), so their
+// cost is fixed (§7).
+function evalPred(
+  pred: Pred,
+  current: JsonNode,
+  root: JsonNode,
+  strict: boolean,
+  m: Meter,
+): boolean | null {
   switch (pred.kind) {
     case "or": {
-      const x = evalPred(pred.a, current, root, strict);
-      const y = evalPred(pred.b, current, root, strict);
+      const x = evalPred(pred.a, current, root, strict, m);
+      const y = evalPred(pred.b, current, root, strict, m);
       if (x === true || y === true) return true;
       if (x === false && y === false) return false;
       return null;
     }
     case "and": {
-      const x = evalPred(pred.a, current, root, strict);
-      const y = evalPred(pred.b, current, root, strict);
+      const x = evalPred(pred.a, current, root, strict, m);
+      const y = evalPred(pred.b, current, root, strict, m);
       if (x === false || y === false) return false;
       if (x === true && y === true) return true;
       return null;
     }
     case "not": {
-      const x = evalPred(pred.p, current, root, strict);
+      const x = evalPred(pred.p, current, root, strict, m);
       return x === null ? null : !x;
     }
     case "compare":
-      return evalCompare(pred.lhs, pred.op, pred.rhs, current, root, strict);
+      return evalCompare(pred.lhs, pred.op, pred.rhs, current, root, strict, m);
   }
 }
 
-// evalCompare is the existential comparison (§4.4) over every pair `(a in lhs-seq, b in rhs-seq)`.
-// An operand navigation error → null (unknown). lax: any true pair → true, else any incomparable
-// pair → unknown, else false (so an empty operand is false). strict: any incomparable pair →
-// unknown, even beside a true pair.
+// evalCompare is the existential comparison (§4.4) over every pair `(a in lhs-seq, b in rhs-seq)`,
+// left outer. An operand navigation error → null (unknown). lax: any true pair → true, else any
+// incomparable pair → unknown, else false (so an empty operand is false). strict: any incomparable
+// pair → unknown, even beside a true pair. Each tested pair charges its unit plus a SQL comparison's
+// size extra (§7 rule 4).
 function evalCompare(
   lhs: FiltExpr,
   op: CmpOp,
@@ -782,9 +830,11 @@ function evalCompare(
   current: JsonNode,
   root: JsonNode,
   strict: boolean,
+  m: Meter,
 ): boolean | null {
-  const ls = evalFiltExpr(lhs, current, root, strict);
-  const rs = evalFiltExpr(rhs, current, root, strict);
+  // Both operands are evaluated, left then right, even when the left one fails to navigate.
+  const ls = evalFiltExpr(lhs, current, root, strict, m);
+  const rs = evalFiltExpr(rhs, current, root, strict, m);
   if (ls === null || rs === null) {
     return null;
   }
@@ -792,6 +842,15 @@ function evalCompare(
   let anyUnknown = false;
   for (const a of ls) {
     for (const b of rs) {
+      chargeSteps(m, 1);
+      if (a.kind === "string" && b.kind === "string") {
+        const w = Math.max(Math.min(codePoints(a.value), codePoints(b.value)), 1);
+        m.charge(COSTS.varlenCompare * BigInt(w - 1));
+        m.guard();
+      } else if (a.kind === "number" && b.kind === "number") {
+        m.charge(COSTS.decimalWork * BigInt(workLinear(a.dec, b.dec) - 1));
+        m.guard();
+      }
       const r = compareNodes(a, op, b);
       if (r === null) {
         if (strict) return null;
@@ -808,12 +867,14 @@ function evalCompare(
 
 // evalFiltExpr evaluates a filter operand to its jsonb-item sequence (a `@`/`$` path) or a singleton
 // literal. `null` is a navigation error, which makes the comparison unknown rather than propagating
-// (§4.2: filter operands never raise, even in strict).
+// (§4.2: filter operands never raise, even in strict). A cost, budget, or cancellation error still
+// propagates (§7): only SQL/JSON (class 22) errors are navigation errors.
 function evalFiltExpr(
   e: FiltExpr,
   current: JsonNode,
   root: JsonNode,
   strict: boolean,
+  m: Meter,
 ): JsonNode[] | null {
   if (e.kind === "lit") {
     return [e.node];
@@ -821,9 +882,10 @@ function evalFiltExpr(
   const seed = e.fromRoot ? root : current;
   let seq: JsonNode[];
   try {
-    seq = evalSteps(e.steps, seed, root, strict);
-  } catch {
-    return null;
+    seq = evalSteps(e.steps, seed, root, strict, m);
+  } catch (err) {
+    if (err instanceof EngineError && err.code().startsWith("22")) return null;
+    throw err;
   }
   if (strict) {
     return seq;
@@ -875,11 +937,21 @@ function compareNodes(a: JsonNode, op: CmpOp, b: JsonNode): boolean | null {
   }
 }
 
-function memberAccess(item: JsonNode, key: string, strict: boolean, out: JsonNode[]): void {
+// memberAccess is `.key` on one item (§7 rules 1–3): one unit for the application, one per member
+// examined (stored order, up to and including the first match), and one for the emitted value.
+function memberAccess(
+  item: JsonNode,
+  key: string,
+  strict: boolean,
+  out: JsonNode[],
+  m: Meter,
+): void {
+  chargeSteps(m, 1);
   if (item.kind === "object") {
-    const member = item.members.find((m) => m.key === key);
-    if (member !== undefined) {
-      out.push(member.value);
+    const i = item.members.findIndex((member) => member.key === key);
+    chargeSteps(m, i < 0 ? item.members.length : i + 1);
+    if (i >= 0) {
+      emit(out, item.members[i]!.value, m);
     } else if (strict) {
       throw engineError(
         "sql_json_item_cannot_be_cast_to_target_type",
@@ -898,10 +970,11 @@ function memberAccess(item: JsonNode, key: string, strict: boolean, out: JsonNod
   // lax: a member accessor on a non-object/non-array contributes no item.
 }
 
-function wildcardMember(item: JsonNode, strict: boolean, out: JsonNode[]): void {
+function wildcardMember(item: JsonNode, strict: boolean, out: JsonNode[], m: Meter): void {
+  chargeSteps(m, 1);
   if (item.kind === "object") {
-    for (const m of item.members) {
-      out.push(m.value);
+    for (const member of item.members) {
+      emit(out, member.value, m);
     }
     return;
   }
@@ -917,12 +990,18 @@ function resolveIndex(i: Index, len: number): number {
   return i.kind === "number" ? i.value : len - 1;
 }
 
-function subscript(elems: JsonNode[], sub: Subscript, strict: boolean, out: JsonNode[]): void {
+function subscript(
+  elems: JsonNode[],
+  sub: Subscript,
+  strict: boolean,
+  out: JsonNode[],
+  m: Meter,
+): void {
   const len = elems.length;
   if (sub.kind === "index") {
     const i = resolveIndex(sub.index, len);
     if (i >= 0 && i < len) {
-      out.push(elems[i]!);
+      emit(out, elems[i]!, m);
     } else if (strict) {
       throw engineError("invalid_sql_json_subscript", "jsonpath array subscript is out of bounds");
     }
@@ -933,7 +1012,7 @@ function subscript(elems: JsonNode[], sub: Subscript, strict: boolean, out: Json
   const from = Math.max(resolveIndex(sub.from, len), 0);
   const to = Math.min(resolveIndex(sub.to, len), len - 1);
   for (let i = from; i <= to; i++) {
-    out.push(elems[i]!);
+    emit(out, elems[i]!, m);
   }
 }
 

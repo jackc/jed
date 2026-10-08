@@ -392,3 +392,15 @@ id     = "decimal_transcend"
 weight = 1
 event  = "one logical digit-group work unit in a decimal transcendental kernel step"
 # cost.md: guarded before each range-reduction/series/squaring step, including estimates.
+
+[[unit]]
+id     = "jsonpath_compile"
+weight = 1
+event  = "one UTF-8 byte of a jsonpath's source text, charged before each compile"
+# ../design/jsonpath.md §7: every evaluation compiles its path; a literal compiled at resolve is unmetered.
+
+[[unit]]
+id     = "jsonpath_step"
+weight = 1
+event  = "one unit of jsonpath evaluation: a step application, an emitted item, a member examined, or a comparison pair"
+# ../design/jsonpath.md §7: guarded as it accrues; connectives and roots are free.

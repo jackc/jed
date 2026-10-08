@@ -326,16 +326,39 @@ func writeFiltExpr(e *jpFiltExpr, out *strings.Builder) {
 // Evaluation (jsonpath.md §3-4) — the lax/strict ordered jsonb-item sequence (P1b structural subset).
 // ---------------------------------------------------------------------------------------------
 
+// compileMetered compiles a path for evaluation, charging jsonpath_compile for each byte of the text
+// first (jsonpath.md §7). Every evaluation compiles its path; there is no cache.
+func compileMetered(src string, m *costMeter) (jsonPath, error) {
+	m.Charge(costs.JsonpathCompile * int64(len(src)))
+	if err := m.Guard(); err != nil {
+		return jsonPath{}, err
+	}
+	return compile(src)
+}
+
+// chargeSteps charges n units of jsonpath_step and guards (jsonpath.md §7).
+func chargeSteps(m *costMeter, n int64) error {
+	m.Charge(costs.JsonpathStep * n)
+	return m.Guard()
+}
+
+// emit appends item to a step's output sequence, charging its one unit first (§7 rule 2).
+func emit(out []JsonNode, item *JsonNode, m *costMeter) ([]JsonNode, error) {
+	if err := chargeSteps(m, 1); err != nil {
+		return nil, err
+	}
+	return append(out, *item), nil
+}
+
 // Eval evaluates a compiled path over a jsonb context item → the ordered SQL/JSON sequence
 // (jsonpath.md §3). Each accessor is a `seq → seq` map applied left to right. lax (the default)
 // auto-unwraps arrays (§4.1) and suppresses structural navigation failures (§4.2); strict raises.
-// The P1b structural subset (no filters / item methods / arithmetic — those are still 0A000 at
-// compile).
-func (jp jsonPath) Eval(ctx JsonNode) ([]JsonNode, error) {
+// Metered by jsonpath_step (§7).
+func (jp jsonPath) Eval(ctx JsonNode, m *costMeter) ([]JsonNode, error) {
 	if jp.Pred != nil {
 		// A top-level predicate → a single item: its truth value as a boolean, or JSON null when
 		// unknown (§4.4).
-		v, err := evalPred(jp.Pred, &ctx, &ctx, jp.Strict)
+		v, err := evalPred(jp.Pred, &ctx, &ctx, jp.Strict, m)
 		if err != nil {
 			return nil, err
 		}
@@ -344,18 +367,18 @@ func (jp jsonPath) Eval(ctx JsonNode) ([]JsonNode, error) {
 		}
 		return []JsonNode{{Kind: JBool, B: *v}}, nil
 	}
-	return evalSteps(jp.Path, &ctx, &ctx, jp.Strict)
+	return evalSteps(jp.Path, &ctx, &ctx, jp.Strict, m)
 }
 
 // evalSteps evaluates an accessor-step sequence over a seed item, with root as the document `$` (for
 // a filter's `$`-rooted operand).
-func evalSteps(steps []jpStep, seed, root *JsonNode, strict bool) ([]JsonNode, error) {
+func evalSteps(steps []jpStep, seed, root *JsonNode, strict bool, m *costMeter) ([]JsonNode, error) {
 	seq := []JsonNode{*seed}
 	for i := range steps {
 		var next []JsonNode
 		for j := range seq {
 			var err error
-			next, err = applyStep(&steps[i], &seq[j], strict, root, next)
+			next, err = applyStep(&steps[i], &seq[j], strict, root, next, m)
 			if err != nil {
 				return nil, err
 			}
@@ -365,34 +388,37 @@ func evalSteps(steps []jpStep, seed, root *JsonNode, strict bool) ([]JsonNode, e
 	return seq, nil
 }
 
-func applyStep(step *jpStep, item *JsonNode, strict bool, root *JsonNode, out []JsonNode) ([]JsonNode, error) {
+func applyStep(step *jpStep, item *JsonNode, strict bool, root *JsonNode, out []JsonNode, m *costMeter) ([]JsonNode, error) {
 	switch step.kind {
 	case jpMember:
 		// lax: a member accessor on an array unwraps it ONE level first (§4.1.1).
 		if !strict && item.Kind == JArray {
 			for k := range item.Arr {
 				var err error
-				out, err = memberAccess(&item.Arr[k], step.key, strict, out)
+				out, err = memberAccess(&item.Arr[k], step.key, strict, out, m)
 				if err != nil {
 					return nil, err
 				}
 			}
 			return out, nil
 		}
-		return memberAccess(item, step.key, strict, out)
+		return memberAccess(item, step.key, strict, out, m)
 	case jpWildcardMember:
 		if !strict && item.Kind == JArray {
 			for k := range item.Arr {
 				var err error
-				out, err = wildcardMember(&item.Arr[k], strict, out)
+				out, err = wildcardMember(&item.Arr[k], strict, out, m)
 				if err != nil {
 					return nil, err
 				}
 			}
 			return out, nil
 		}
-		return wildcardMember(item, strict, out)
+		return wildcardMember(item, strict, out, m)
 	case jpSubscripts:
+		if err := chargeSteps(m, 1); err != nil {
+			return nil, err
+		}
 		// [i] on a non-array: lax treats the item as a singleton array (§4.1.2); strict raises.
 		var elems []JsonNode
 		if item.Kind == JArray {
@@ -405,19 +431,28 @@ func applyStep(step *jpStep, item *JsonNode, strict bool, root *JsonNode, out []
 		}
 		for i := range step.subs {
 			var err error
-			out, err = subscript(elems, &step.subs[i], strict, out)
+			out, err = subscript(elems, &step.subs[i], strict, out, m)
 			if err != nil {
 				return nil, err
 			}
 		}
 		return out, nil
 	case jpWildcardElement:
+		if err := chargeSteps(m, 1); err != nil {
+			return nil, err
+		}
 		// [*] on a non-array: lax → the singleton item; strict raises.
 		if item.Kind == JArray {
-			return append(out, item.Arr...), nil
+			for k := range item.Arr {
+				var err error
+				if out, err = emit(out, &item.Arr[k], m); err != nil {
+					return nil, err
+				}
+			}
+			return out, nil
 		}
 		if !strict {
-			return append(out, *item), nil
+			return emit(out, item, m)
 		}
 		return nil, newError(InvalidSqlJsonSubscript,
 			"jsonpath wildcard array accessor can only be applied to an array")
@@ -428,38 +463,42 @@ func applyStep(step *jpStep, item *JsonNode, strict bool, root *JsonNode, out []
 		if !strict && item.Kind == JArray {
 			for k := range item.Arr {
 				var err error
-				out, err = filterItem(step.pred, &item.Arr[k], root, strict, out)
+				out, err = filterItem(step.pred, &item.Arr[k], root, strict, out, m)
 				if err != nil {
 					return nil, err
 				}
 			}
 			return out, nil
 		}
-		return filterItem(step.pred, item, root, strict, out)
+		return filterItem(step.pred, item, root, strict, out, m)
 	}
 }
 
-func filterItem(pred *jpPred, item, root *JsonNode, strict bool, out []JsonNode) ([]JsonNode, error) {
-	ok, err := evalPred(pred, item, root, strict)
+func filterItem(pred *jpPred, item, root *JsonNode, strict bool, out []JsonNode, m *costMeter) ([]JsonNode, error) {
+	if err := chargeSteps(m, 1); err != nil {
+		return nil, err
+	}
+	ok, err := evalPred(pred, item, root, strict, m)
 	if err != nil {
 		return nil, err
 	}
 	if isTrue(ok) {
-		return append(out, *item), nil
+		return emit(out, item, m)
 	}
 	return out, nil
 }
 
 // evalPred evaluates a filter predicate to a Kleene truth value (a *bool: &true / &false / nil =
-// unknown — mirroring the Rust Option<bool>).
-func evalPred(pred *jpPred, current, root *JsonNode, strict bool) (*bool, error) {
+// unknown — mirroring the Rust Option<bool>). Both operands of &&/|| are always evaluated (no
+// short-circuit), so their cost is fixed (§7).
+func evalPred(pred *jpPred, current, root *JsonNode, strict bool, m *costMeter) (*bool, error) {
 	switch pred.kind {
 	case jpPredOr:
-		x, err := evalPred(pred.left, current, root, strict)
+		x, err := evalPred(pred.left, current, root, strict, m)
 		if err != nil {
 			return nil, err
 		}
-		y, err := evalPred(pred.right, current, root, strict)
+		y, err := evalPred(pred.right, current, root, strict, m)
 		if err != nil {
 			return nil, err
 		}
@@ -472,11 +511,11 @@ func evalPred(pred *jpPred, current, root *JsonNode, strict bool) (*bool, error)
 			return nil, nil
 		}
 	case jpPredAnd:
-		x, err := evalPred(pred.left, current, root, strict)
+		x, err := evalPred(pred.left, current, root, strict, m)
 		if err != nil {
 			return nil, err
 		}
-		y, err := evalPred(pred.right, current, root, strict)
+		y, err := evalPred(pred.right, current, root, strict, m)
 		if err != nil {
 			return nil, err
 		}
@@ -489,7 +528,7 @@ func evalPred(pred *jpPred, current, root *JsonNode, strict bool) (*bool, error)
 			return nil, nil
 		}
 	case jpPredNot:
-		v, err := evalPred(pred.left, current, root, strict)
+		v, err := evalPred(pred.left, current, root, strict, m)
 		if err != nil {
 			return nil, err
 		}
@@ -498,7 +537,7 @@ func evalPred(pred *jpPred, current, root *JsonNode, strict bool) (*bool, error)
 		}
 		return boolPtr(!*v), nil
 	default: // jpPredCompare
-		return evalCompare(&pred.cmpLeft, pred.cmpOp, &pred.cmpRight, current, root, strict)
+		return evalCompare(&pred.cmpLeft, pred.cmpOp, &pred.cmpRight, current, root, strict, m)
 	}
 }
 
@@ -507,13 +546,21 @@ func isFalse(b *bool) bool { return b != nil && !*b }
 
 func boolPtr(b bool) *bool { return &b }
 
-// evalCompare is the existential comparison (§4.4) over every pair (a in lhs-seq, b in rhs-seq). An
-// operand navigation error → nil (unknown). lax: any true pair → true, else any incomparable pair →
-// unknown, else false (so an empty operand is false). strict: any incomparable pair → unknown, even
-// beside a true pair.
-func evalCompare(l *jpFiltExpr, op jpCmpOp, r *jpFiltExpr, current, root *JsonNode, strict bool) (*bool, error) {
-	ls, lok := evalFiltExpr(l, current, root, strict)
-	rs, rok := evalFiltExpr(r, current, root, strict)
+// evalCompare is the existential comparison (§4.4) over every pair (a in lhs-seq, b in rhs-seq), left
+// outer. An operand navigation error → nil (unknown). lax: any true pair → true, else any incomparable
+// pair → unknown, else false (so an empty operand is false). strict: any incomparable pair → unknown,
+// even beside a true pair. Each tested pair charges its unit plus a SQL comparison's size extra (§7
+// rule 4).
+func evalCompare(l *jpFiltExpr, op jpCmpOp, r *jpFiltExpr, current, root *JsonNode, strict bool, m *costMeter) (*bool, error) {
+	// Both operands are evaluated, left then right, even when the left one fails to navigate.
+	ls, lok, err := evalFiltExpr(l, current, root, strict, m)
+	if err != nil {
+		return nil, err
+	}
+	rs, rok, err := evalFiltExpr(r, current, root, strict, m)
+	if err != nil {
+		return nil, err
+	}
 	if !lok || !rok {
 		return nil, nil
 	}
@@ -521,7 +568,24 @@ func evalCompare(l *jpFiltExpr, op jpCmpOp, r *jpFiltExpr, current, root *JsonNo
 	anyUnknown := false
 	for i := range ls {
 		for j := range rs {
-			c := compareNodes(&ls[i], op, &rs[j])
+			if err := chargeSteps(m, 1); err != nil {
+				return nil, err
+			}
+			a, b := &ls[i], &rs[j]
+			switch {
+			case a.Kind == JString && b.Kind == JString:
+				w := min(utf8.RuneCountInString(a.S), utf8.RuneCountInString(b.S))
+				m.Charge(costs.VarlenCompare * int64(max(w, 1)-1))
+				if err := m.Guard(); err != nil {
+					return nil, err
+				}
+			case a.Kind == JNumber && b.Kind == JNumber:
+				m.Charge(costs.DecimalWork * (workLinear(a.Num, b.Num) - 1))
+				if err := m.Guard(); err != nil {
+					return nil, err
+				}
+			}
+			c := compareNodes(a, op, b)
 			switch {
 			case c == nil && strict:
 				return nil, nil
@@ -546,21 +610,25 @@ func evalCompare(l *jpFiltExpr, op jpCmpOp, r *jpFiltExpr, current, root *JsonNo
 
 // evalFiltExpr evaluates a filter operand to its jsonb-item sequence (a `@`/`$` path) or a singleton
 // literal. ok=false is a navigation error, which makes the comparison unknown rather than
-// propagating (§4.2: filter operands never raise, even in strict).
-func evalFiltExpr(e *jpFiltExpr, current, root *JsonNode, strict bool) (seq []JsonNode, ok bool) {
+// propagating (§4.2: filter operands never raise, even in strict). A cost, budget, or cancellation
+// error still propagates (§7): only SQL/JSON (class 22) errors are navigation errors.
+func evalFiltExpr(e *jpFiltExpr, current, root *JsonNode, strict bool, m *costMeter) (seq []JsonNode, ok bool, err error) {
 	if e.kind == jpFiltLit {
-		return []JsonNode{e.lit}, true
+		return []JsonNode{e.lit}, true, nil
 	}
 	seed := current
 	if e.fromRoot {
 		seed = root
 	}
-	seq, err := evalSteps(e.steps, seed, root, strict)
+	seq, err = evalSteps(e.steps, seed, root, strict, m)
 	if err != nil {
-		return nil, false
+		if isSQLJSONError(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
 	}
 	if strict {
-		return seq, true
+		return seq, true, nil
 	}
 	// lax: an array-valued operand item is unwrapped ONE level, so the existential comparison
 	// ranges over its elements (§4.1.4).
@@ -572,7 +640,7 @@ func evalFiltExpr(e *jpFiltExpr, current, root *JsonNode, strict bool) (seq []Js
 			out = append(out, seq[i])
 		}
 	}
-	return out, true
+	return out, true, nil
 }
 
 // compareNodes compares two jsonb items under a jsonpath operator (§4.4; a *bool: &v / nil =
@@ -611,12 +679,23 @@ func compareNodes(a *JsonNode, op jpCmpOp, b *JsonNode) *bool {
 	}
 }
 
-func memberAccess(item *JsonNode, key string, strict bool, out []JsonNode) ([]JsonNode, error) {
+// memberAccess is `.key` on one item (§7 rules 1–3): one unit for the application, one per member
+// examined (stored order, up to and including the first match), and one for the emitted value.
+func memberAccess(item *JsonNode, key string, strict bool, out []JsonNode, m *costMeter) ([]JsonNode, error) {
+	if err := chargeSteps(m, 1); err != nil {
+		return nil, err
+	}
 	if item.Kind == JObject {
 		for i := range item.Obj {
 			if item.Obj[i].Key == key {
-				return append(out, item.Obj[i].Val), nil
+				if err := chargeSteps(m, int64(i+1)); err != nil {
+					return nil, err
+				}
+				return emit(out, &item.Obj[i].Val, m)
 			}
+		}
+		if err := chargeSteps(m, int64(len(item.Obj))); err != nil {
+			return nil, err
 		}
 		if strict {
 			return nil, newError(SqlJsonItemCannotBeCastToTargetType,
@@ -633,10 +712,16 @@ func memberAccess(item *JsonNode, key string, strict bool, out []JsonNode) ([]Js
 	return out, nil
 }
 
-func wildcardMember(item *JsonNode, strict bool, out []JsonNode) ([]JsonNode, error) {
+func wildcardMember(item *JsonNode, strict bool, out []JsonNode, m *costMeter) ([]JsonNode, error) {
+	if err := chargeSteps(m, 1); err != nil {
+		return nil, err
+	}
 	if item.Kind == JObject {
 		for i := range item.Obj {
-			out = append(out, item.Obj[i].Val)
+			var err error
+			if out, err = emit(out, &item.Obj[i].Val, m); err != nil {
+				return nil, err
+			}
 		}
 		return out, nil
 	}
@@ -647,7 +732,7 @@ func wildcardMember(item *JsonNode, strict bool, out []JsonNode) ([]JsonNode, er
 	return out, nil
 }
 
-func subscript(elems []JsonNode, sub *jpSubscript, strict bool, out []JsonNode) ([]JsonNode, error) {
+func subscript(elems []JsonNode, sub *jpSubscript, strict bool, out []JsonNode, m *costMeter) ([]JsonNode, error) {
 	length := int64(len(elems))
 	resolve := func(idx jpIndex) int64 {
 		if idx.last {
@@ -665,14 +750,18 @@ func subscript(elems []JsonNode, sub *jpSubscript, strict bool, out []JsonNode) 
 			to = length - 1
 		}
 		for i := from; i <= to; i++ {
-			out = append(out, elems[i])
+			var err error
+			if out, err = emit(out, &elems[i], m); err != nil {
+				return nil, err
+			}
 		}
 		return out, nil
 	}
 	i := resolve(sub.a)
 	if i >= 0 && i < length {
-		out = append(out, elems[i])
-	} else if strict {
+		return emit(out, &elems[i], m)
+	}
+	if strict {
 		return nil, newError(InvalidSqlJsonSubscript,
 			"jsonpath array subscript is out of bounds")
 	}

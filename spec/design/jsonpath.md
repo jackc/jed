@@ -295,16 +295,53 @@ not produce exactly one boolean item, `jsonb_path_match` raises `22038` but `@@`
 
 ## 7. Cost units
 
-Two new cost units ([../cost/](../cost/) / `gen_costs.rb`), the regex precedent:
+> **Status: landed** in all three cores (`resource/jsonpath_cost.test`). Before it, path
+> evaluation charged only one `operator_eval` per final result item. A filter that compares
+> every element against a `$`-rooted operand does work quadratic in the document for linear
+> cost, and the Rust evaluator copied the whole document for every such operand.
 
-- **`jsonpath_compile`** — one unit per emitted program step, charged once at compile (the
-  `regex_compile` model; a stored `jsonpath` recompiled on load charges it on first use).
-- **`jsonpath_step`** — one unit per evaluated step per input item (the `regex_step` model),
-  so the metered cost is proportional to the path-evaluation work and a `max_cost` ceiling
-  aborts a pathological fan-out deterministically.
+Two units in `spec/cost/schedule.toml`, both weight 1. The cost of `(path, document)` is
+deterministic and identical across cores (CLAUDE.md §13). It is defined over the §3 sequence
+semantics, not over any core's representation.
 
-The cost of `(path, document)` is fully deterministic and identical across cores (CLAUDE.md
-§13).
+**`jsonpath_compile`: one unit per UTF-8 byte of the text being compiled,** charged and guarded
+before each compile. For a `jsonpath` value that is its stored canonical text (`'$.a'` is held
+as `$."a"`, 5 bytes); for a `JSON_TABLE` path it is the path literal as written. Every evaluation compiles its path, and the evaluators keep no cache. So a
+long stored path joined against many rows pays for every pair, the way `varlen_compare` does.
+A `'…'::jsonpath` literal is compiled at resolve, which is unmetered (cost.md §3); evaluating
+it compiles it again and charges.
+
+**`jsonpath_step`: path-evaluation work,** each charge guarded as it accrues:
+
+1. **Applying a step.** Applying a step to an item charges 1. Under lax unwrapping (§4.1), an
+   accessor or filter applied to an array is applied to each element instead, and each element
+   charges 1; the array itself does not. A lax subscript on a non-array (the singleton rule)
+   is one application.
+2. **Emitting items.** Each item a step emits charges 1, so `[*]` over N elements charges N.
+3. **Member lookup.** `.key` charges 1 for each member it examines: members in stored order
+   up to and including the first match, or all of them when the key is absent. Stored order is
+   canonical for `jsonb` and input order for a `json` context (§5), so the count is the same in
+   every core. `.*` emits every member and pays through rule 2.
+4. **Comparisons.** Each `(a, b)` pair an existential comparison (§4.4) tests charges 1, plus
+   the extra a SQL comparison of the same values would charge: two strings
+   `varlen_compare × (W − 1)`, with W the shorter length in code points, and two numbers
+   `decimal_work × (work_linear(a, b) − 1)` ([cost.md](cost.md) §3). Pairs are tested
+   left operand outer, right operand inner. Lax stops at the first true pair and strict at the
+   first unknown pair, so untested pairs charge nothing. Both operands are always evaluated,
+   left then right, and charge their own steps. A literal operand charges nothing, and
+   neither does the lax unwrapping of an array-valued operand item (§4.1): it only changes
+   which pairs exist.
+5. **Connectives and roots.** `&&`, `||`, `!`, seeding `$` or `@`, and producing a top-level
+   predicate's single item charge nothing. Both operands of `&&` and `||` are always evaluated;
+   there is no short-circuit.
+
+A cost-ceiling, lifetime-budget, or cancellation error raised inside a filter operand
+propagates. Only SQL/JSON navigation errors make a comparison unknown (§4.2).
+
+Results are not charged here. The query functions copy their result items out of the
+document: `jsonb_path_query` rows charge `generated_row` (§5.2), `jsonb_path_query_array` and a
+wrapped `JSON_QUERY` charge their built array as growth kernels (cost.md §8.1), and the other
+results are single sub-values of the document. Existence tests and matches copy nothing.
 
 ---
 

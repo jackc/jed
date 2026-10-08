@@ -404,6 +404,10 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 			return costs.ScalarByte
 		case "decimal_transcend":
 			return costs.DecimalTranscend
+		case "jsonpath_compile":
+			return costs.JsonpathCompile
+		case "jsonpath_step":
+			return costs.JsonpathStep
 		case "decimal_work":
 			return costs.DecimalWork
 		case "row_produced":

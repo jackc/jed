@@ -46,6 +46,8 @@ pub struct CostSchedule {
     pub window_frame_step: i64,
     pub scalar_byte: i64,
     pub decimal_transcend: i64,
+    pub jsonpath_compile: i64,
+    pub jsonpath_step: i64,
 }
 
 /// The canonical cost schedule — weights accrued per unit during query execution.
@@ -76,4 +78,6 @@ pub const COSTS: CostSchedule = CostSchedule {
     window_frame_step: 1,
     scalar_byte: 1,
     decimal_transcend: 1,
+    jsonpath_compile: 1,
+    jsonpath_step: 1,
 };

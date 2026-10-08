@@ -9,9 +9,12 @@
 //! `42601`. The compiled program is a pure function of the source — kept byte-identical cross-core by
 //! the conformance suite (CLAUDE.md §5: a hand-written parser, never codegenned).
 
+use crate::cost::Meter;
+use crate::costs::COSTS;
 use crate::error::{EngineError, Result};
 use crate::json::{JsonNode, MAX_JSON_DEPTH};
 use crate::sqlstate::SqlState;
+use std::borrow::Cow;
 
 /// A compiled jsonpath.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -298,78 +301,107 @@ fn write_filt_expr(e: &FiltExpr, out: &mut String) {
 // Evaluation (jsonpath.md §3-4) — the lax/strict ordered jsonb-item sequence (P1b structural subset).
 // ---------------------------------------------------------------------------------------------
 
+/// Compile a path for evaluation, charging `jsonpath_compile` for each source byte first
+/// (jsonpath.md §7). Every evaluation compiles its path; there is no cache.
+pub fn compile_metered(src: &str, m: &mut Meter) -> Result<JsonPath> {
+    m.charge(COSTS.jsonpath_compile * src.len() as i64);
+    m.guard()?;
+    JsonPath::compile(src)
+}
+
+/// Charge `n` units of `jsonpath_step` and guard (jsonpath.md §7).
+fn charge_steps(m: &mut Meter, n: i64) -> Result<()> {
+    m.charge(COSTS.jsonpath_step * n);
+    m.guard()
+}
+
+/// Emit `item` onto a step's output sequence, charging its one unit first (§7 rule 2).
+fn emit<'d>(out: &mut Vec<&'d JsonNode>, item: &'d JsonNode, m: &mut Meter) -> Result<()> {
+    charge_steps(m, 1)?;
+    out.push(item);
+    Ok(())
+}
+
 /// Evaluate a compiled path over a jsonb context item → the ordered SQL/JSON sequence
 /// (jsonpath.md §3). Each accessor is a `seq → seq` map applied left to right. `lax` (default)
 /// auto-unwraps arrays (§4.1) and suppresses structural navigation failures (§4.2); `strict` raises.
-/// The P1b structural subset (no filters / item methods / arithmetic — those are still `0A000` at
-/// compile).
-pub fn eval(path: &JsonPath, ctx: &JsonNode) -> Result<Vec<JsonNode>> {
+/// Items borrow from the document, so a caller copies only the ones it returns; a top-level
+/// predicate's synthesized boolean is the one owned item. Metered by `jsonpath_step` (§7).
+pub fn eval<'d>(
+    path: &JsonPath,
+    ctx: &'d JsonNode,
+    m: &mut Meter,
+) -> Result<Vec<Cow<'d, JsonNode>>> {
     match &path.body {
-        PathBody::Path(steps) => eval_steps(steps, ctx, ctx, path.strict),
+        PathBody::Path(steps) => Ok(eval_steps(steps, ctx, ctx, path.strict, m)?
+            .into_iter()
+            .map(Cow::Borrowed)
+            .collect()),
         // A top-level predicate → a single item: its truth value as a boolean, or JSON null when
         // unknown (§4.4).
         PathBody::Predicate(pred) => {
-            let truth = eval_pred(pred, ctx, ctx, path.strict)?;
-            Ok(vec![truth.map_or(JsonNode::Null, JsonNode::Bool)])
+            let truth = eval_pred(pred, ctx, ctx, path.strict, m)?;
+            Ok(vec![Cow::Owned(
+                truth.map_or(JsonNode::Null, JsonNode::Bool),
+            )])
         }
     }
 }
 
 /// Evaluate an accessor-step sequence over a seed item, with `root` as the document `$` (for a
 /// filter's `$`-rooted operand).
-fn eval_steps(
+fn eval_steps<'d>(
     steps: &[Step],
-    seed: &JsonNode,
-    root: &JsonNode,
+    seed: &'d JsonNode,
+    root: &'d JsonNode,
     strict: bool,
-) -> Result<Vec<JsonNode>> {
-    let mut seq = vec![seed.clone()];
+    m: &mut Meter,
+) -> Result<Vec<&'d JsonNode>> {
+    let mut seq = vec![seed];
     for step in steps {
         let mut next = Vec::new();
         for item in &seq {
-            apply_step(step, item, strict, root, &mut next)?;
+            apply_step(step, item, strict, root, &mut next, m)?;
         }
         seq = next;
     }
     Ok(seq)
 }
 
-fn apply_step(
+fn apply_step<'d>(
     step: &Step,
-    item: &JsonNode,
+    item: &'d JsonNode,
     strict: bool,
-    root: &JsonNode,
-    out: &mut Vec<JsonNode>,
+    root: &'d JsonNode,
+    out: &mut Vec<&'d JsonNode>,
+    m: &mut Meter,
 ) -> Result<()> {
     match step {
         Step::Member(key) => {
             // lax: a member accessor on an array unwraps it ONE level first (§4.1.1).
             if !strict && let JsonNode::Array(elems) = item {
                 for e in elems {
-                    member_access(e, key, strict, out)?;
+                    member_access(e, key, strict, out, m)?;
                 }
                 return Ok(());
             }
-            member_access(item, key, strict, out)
+            member_access(item, key, strict, out, m)
         }
         Step::WildcardMember => {
             if !strict && let JsonNode::Array(elems) = item {
                 for e in elems {
-                    wildcard_member(e, strict, out)?;
+                    wildcard_member(e, strict, out, m)?;
                 }
                 return Ok(());
             }
-            wildcard_member(item, strict, out)
+            wildcard_member(item, strict, out, m)
         }
         Step::Subscripts(subs) => {
+            charge_steps(m, 1)?;
             // [i] on a non-array: lax treats the item as a singleton array (§4.1.2); strict raises.
-            let singleton;
-            let elems: &[JsonNode] = match item {
+            let elems: &'d [JsonNode] = match item {
                 JsonNode::Array(e) => e,
-                _ if !strict => {
-                    singleton = [item.clone()];
-                    &singleton
-                }
+                _ if !strict => std::slice::from_ref(item),
                 _ => {
                     return Err(EngineError::new(
                         SqlState::InvalidSqlJsonSubscript,
@@ -378,21 +410,21 @@ fn apply_step(
                 }
             };
             for sub in subs {
-                subscript(elems, sub, strict, out)?;
+                subscript(elems, sub, strict, out, m)?;
             }
             Ok(())
         }
         Step::WildcardElement => {
+            charge_steps(m, 1)?;
             // [*] on a non-array: lax → the singleton item; strict raises.
             match item {
                 JsonNode::Array(e) => {
-                    out.extend(e.iter().cloned());
+                    for elem in e {
+                        emit(out, elem, m)?;
+                    }
                     Ok(())
                 }
-                _ if !strict => {
-                    out.push(item.clone());
-                    Ok(())
-                }
+                _ if !strict => emit(out, item, m),
                 _ => Err(EngineError::new(
                     SqlState::InvalidSqlJsonSubscript,
                     "jsonpath wildcard array accessor can only be applied to an array",
@@ -405,41 +437,43 @@ fn apply_step(
         Step::Filter(pred) => {
             if !strict && let JsonNode::Array(elems) = item {
                 for e in elems {
-                    filter_item(pred, e, root, strict, out)?;
+                    filter_item(pred, e, root, strict, out, m)?;
                 }
                 return Ok(());
             }
-            filter_item(pred, item, root, strict, out)
+            filter_item(pred, item, root, strict, out, m)
         }
     }
 }
 
-fn filter_item(
+fn filter_item<'d>(
     pred: &Pred,
-    item: &JsonNode,
-    root: &JsonNode,
+    item: &'d JsonNode,
+    root: &'d JsonNode,
     strict: bool,
-    out: &mut Vec<JsonNode>,
+    out: &mut Vec<&'d JsonNode>,
+    m: &mut Meter,
 ) -> Result<()> {
-    if eval_pred(pred, item, root, strict)? == Some(true) {
-        out.push(item.clone());
+    charge_steps(m, 1)?;
+    if eval_pred(pred, item, root, strict, m)? == Some(true) {
+        emit(out, item, m)?;
     }
     Ok(())
 }
 
 /// Evaluate a filter predicate to a Kleene truth value (`Some(true)`/`Some(false)`/`None` = unknown).
+/// Both operands of `&&`/`||` are always evaluated (no short-circuit), so their cost is fixed (§7).
 fn eval_pred(
     pred: &Pred,
     current: &JsonNode,
     root: &JsonNode,
     strict: bool,
+    m: &mut Meter,
 ) -> Result<Option<bool>> {
     Ok(match pred {
         Pred::Or(a, b) => {
-            let (x, y) = (
-                eval_pred(a, current, root, strict)?,
-                eval_pred(b, current, root, strict)?,
-            );
+            let x = eval_pred(a, current, root, strict, m)?;
+            let y = eval_pred(b, current, root, strict, m)?;
             match (x, y) {
                 (Some(true), _) | (_, Some(true)) => Some(true),
                 (Some(false), Some(false)) => Some(false),
@@ -447,25 +481,24 @@ fn eval_pred(
             }
         }
         Pred::And(a, b) => {
-            let (x, y) = (
-                eval_pred(a, current, root, strict)?,
-                eval_pred(b, current, root, strict)?,
-            );
+            let x = eval_pred(a, current, root, strict, m)?;
+            let y = eval_pred(b, current, root, strict, m)?;
             match (x, y) {
                 (Some(false), _) | (_, Some(false)) => Some(false),
                 (Some(true), Some(true)) => Some(true),
                 _ => None,
             }
         }
-        Pred::Not(p) => eval_pred(p, current, root, strict)?.map(|b| !b),
-        Pred::Compare(l, op, r) => eval_compare(l, *op, r, current, root, strict)?,
+        Pred::Not(p) => eval_pred(p, current, root, strict, m)?.map(|b| !b),
+        Pred::Compare(l, op, r) => eval_compare(l, *op, r, current, root, strict, m)?,
     })
 }
 
-/// Existential comparison (§4.4) over every pair `(a in lhs-seq, b in rhs-seq)`. An operand
-/// navigation error → `None` (unknown). lax: any true pair → true, else any incomparable pair →
-/// unknown, else false (so an empty operand is false). strict: any incomparable pair → unknown, even
-/// beside a true pair.
+/// Existential comparison (§4.4) over every pair `(a in lhs-seq, b in rhs-seq)`, left outer. An
+/// operand navigation error → `None` (unknown). lax: any true pair → true, else any incomparable
+/// pair → unknown, else false (so an empty operand is false). strict: any incomparable pair →
+/// unknown, even beside a true pair. Each tested pair charges its unit plus a SQL comparison's size
+/// extra (§7 rule 4).
 fn eval_compare(
     l: &FiltExpr,
     op: CmpOp,
@@ -473,17 +506,31 @@ fn eval_compare(
     current: &JsonNode,
     root: &JsonNode,
     strict: bool,
+    m: &mut Meter,
 ) -> Result<Option<bool>> {
-    let (Some(ls), Some(rs)) = (
-        eval_filt_expr(l, current, root, strict),
-        eval_filt_expr(r, current, root, strict),
-    ) else {
+    // Both operands are evaluated, left then right, even when the left one fails to navigate.
+    let ls = eval_filt_expr(l, current, root, strict, m)?;
+    let rs = eval_filt_expr(r, current, root, strict, m)?;
+    let (Some(ls), Some(rs)) = (ls, rs) else {
         return Ok(None);
     };
     let mut found = false;
     let mut any_unknown = false;
     for a in &ls {
         for b in &rs {
+            charge_steps(m, 1)?;
+            match (*a, *b) {
+                (JsonNode::String(x), JsonNode::String(y)) => {
+                    let w = x.chars().count().min(y.chars().count()).max(1);
+                    m.charge(COSTS.varlen_compare * (w as i64 - 1));
+                    m.guard()?;
+                }
+                (JsonNode::Number(x), JsonNode::Number(y)) => {
+                    m.charge(COSTS.decimal_work * (crate::decimal::work_linear(x, y) as i64 - 1));
+                    m.guard()?;
+                }
+                _ => {}
+            }
             match compare_nodes(a, op, b) {
                 Some(true) if !strict => return Ok(Some(true)),
                 Some(true) => found = true,
@@ -503,33 +550,39 @@ fn eval_compare(
 }
 
 /// Evaluate a filter operand to its jsonb-item sequence (a `@`/`$` path) or a singleton literal.
-/// `None` is a navigation error, which makes the comparison unknown rather than propagating (§4.2:
-/// filter operands never raise, even in strict).
-fn eval_filt_expr(
-    e: &FiltExpr,
-    current: &JsonNode,
-    root: &JsonNode,
+/// `Ok(None)` is a navigation error, which makes the comparison unknown rather than propagating
+/// (§4.2: filter operands never raise, even in strict). A cost, budget, or cancellation error still
+/// propagates (§7): only SQL/JSON (class 22) errors are navigation errors.
+fn eval_filt_expr<'x>(
+    e: &'x FiltExpr,
+    current: &'x JsonNode,
+    root: &'x JsonNode,
     strict: bool,
-) -> Option<Vec<JsonNode>> {
+    m: &mut Meter,
+) -> Result<Option<Vec<&'x JsonNode>>> {
     match e {
         FiltExpr::Path { from_root, steps } => {
             let seed = if *from_root { root } else { current };
-            let seq = eval_steps(steps, seed, root, strict).ok()?;
+            let seq = match eval_steps(steps, seed, root, strict, m) {
+                Ok(seq) => seq,
+                Err(err) if err.code().starts_with("22") => return Ok(None),
+                Err(err) => return Err(err),
+            };
             if strict {
-                return Some(seq);
+                return Ok(Some(seq));
             }
             // lax: an array-valued operand item is unwrapped ONE level, so the existential
             // comparison ranges over its elements (§4.1.4).
             let mut out = Vec::with_capacity(seq.len());
             for item in seq {
                 match item {
-                    JsonNode::Array(elems) => out.extend(elems),
+                    JsonNode::Array(elems) => out.extend(elems.iter()),
                     other => out.push(other),
                 }
             }
-            Some(out)
+            Ok(Some(out))
         }
-        FiltExpr::Lit(n) => Some(vec![n.clone()]),
+        FiltExpr::Lit(n) => Ok(Some(vec![n])),
     }
 }
 
@@ -557,11 +610,22 @@ fn compare_nodes(a: &JsonNode, op: CmpOp, b: &JsonNode) -> Option<bool> {
     })
 }
 
-fn member_access(item: &JsonNode, key: &str, strict: bool, out: &mut Vec<JsonNode>) -> Result<()> {
+/// `.key` on one item (§7 rules 1–3): one unit for the application, one per member examined (stored
+/// order, up to and including the first match), and one for the emitted value.
+fn member_access<'d>(
+    item: &'d JsonNode,
+    key: &str,
+    strict: bool,
+    out: &mut Vec<&'d JsonNode>,
+    m: &mut Meter,
+) -> Result<()> {
+    charge_steps(m, 1)?;
     match item {
-        JsonNode::Object(m) => {
-            if let Some((_, v)) = m.iter().find(|(k, _)| k == key) {
-                out.push(v.clone());
+        JsonNode::Object(members) => {
+            let found = members.iter().position(|(k, _)| k == key);
+            charge_steps(m, found.map_or(members.len(), |i| i + 1) as i64)?;
+            if let Some(i) = found {
+                emit(out, &members[i].1, m)?;
             } else if strict {
                 return Err(EngineError::new(
                     SqlState::SqlJsonItemCannotBeCastToTargetType,
@@ -580,10 +644,18 @@ fn member_access(item: &JsonNode, key: &str, strict: bool, out: &mut Vec<JsonNod
     }
 }
 
-fn wildcard_member(item: &JsonNode, strict: bool, out: &mut Vec<JsonNode>) -> Result<()> {
+fn wildcard_member<'d>(
+    item: &'d JsonNode,
+    strict: bool,
+    out: &mut Vec<&'d JsonNode>,
+    m: &mut Meter,
+) -> Result<()> {
+    charge_steps(m, 1)?;
     match item {
-        JsonNode::Object(m) => {
-            out.extend(m.iter().map(|(_, v)| v.clone()));
+        JsonNode::Object(members) => {
+            for (_, v) in members {
+                emit(out, v, m)?;
+            }
             Ok(())
         }
         _ if strict => Err(EngineError::new(
@@ -594,11 +666,12 @@ fn wildcard_member(item: &JsonNode, strict: bool, out: &mut Vec<JsonNode>) -> Re
     }
 }
 
-fn subscript(
-    elems: &[JsonNode],
+fn subscript<'d>(
+    elems: &'d [JsonNode],
     sub: &Subscript,
     strict: bool,
-    out: &mut Vec<JsonNode>,
+    out: &mut Vec<&'d JsonNode>,
+    m: &mut Meter,
 ) -> Result<()> {
     let len = elems.len() as i64;
     let resolve = |i: &Index| -> i64 {
@@ -611,7 +684,7 @@ fn subscript(
         Subscript::Index(idx) => {
             let i = resolve(idx);
             if i >= 0 && i < len {
-                out.push(elems[i as usize].clone());
+                emit(out, &elems[i as usize], m)?;
             } else if strict {
                 return Err(EngineError::new(
                     SqlState::InvalidSqlJsonSubscript,
@@ -625,7 +698,7 @@ fn subscript(
             let to = resolve(b).min(len - 1);
             let mut i = from;
             while i <= to {
-                out.push(elems[i as usize].clone());
+                emit(out, &elems[i as usize], m)?;
                 i += 1;
             }
         }

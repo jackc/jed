@@ -58,6 +58,7 @@ import type {
   Resolved,
   ResolvedType,
 } from "./executor.ts";
+import type { Meter } from "./cost.ts";
 import { type EngineError, engineError } from "./errors.ts";
 import { exprEqual, resolveTypeAndTypmod, scalarForParamHint, unifyCaseTypes } from "./eval_ops.ts";
 import { coerceStringToArray, overflow, typeError } from "./store.ts";
@@ -113,6 +114,7 @@ import { parseInterval } from "./interval.ts";
 import { jsonCompactOut, jsonbIn, jsonbOut, parsePreservingJson, validateJson } from "./json.ts";
 import {
   compile as jsonPathCompile,
+  compileMetered as jsonPathCompileMetered,
   evalPath as jsonPathEval,
   render as jsonPathRender,
 } from "./jsonpath.ts";
@@ -2318,13 +2320,14 @@ export function jsonArgNode(v: Value): JsonNode {
 // evalJsonpath recompiles a `jsonpath` value's canonical text and evaluates it over a `jsonb` context
 // value (the shared kernel of the jsonpath query functions). A NULL context or path yields `null`
 // (→ SQL NULL / zero rows). Port of impl/rust/src/executor.rs `eval_jsonpath`.
-export function evalJsonpath(ctx: Value, path: Value): JsonNode[] | null {
+export function evalJsonpath(ctx: Value, path: Value, m: Meter): JsonNode[] | null {
   if (ctx.kind === "null" || path.kind === "null") return null;
   const node = jsonArgNode(ctx);
   if (path.kind !== "jsonpath") {
     throw new Error("resolver restricts a jsonpath argument to jsonpath");
   }
-  return jsonPathEval(jsonPathCompile(path.text), node);
+  // Compiling and evaluating are metered (jsonpath.md §7).
+  return jsonPathEval(jsonPathCompileMetered(path.text, m), node, m);
 }
 
 // jsonPredKindMatches reports whether a parsed JSON node matches an `IS JSON [kind]` predicate's kind

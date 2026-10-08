@@ -72,7 +72,7 @@ pub const ACCESS_PATH_ORDER: [&str; 7] = [
     "full",
 ];
 
-pub const ESTIMATOR_UNIT_COUNT: usize = 26;
+pub const ESTIMATOR_UNIT_COUNT: usize = 28;
 pub const UNIT_STORAGE_ROW_READ: usize = 0;
 pub const UNIT_STATISTICS_VALUE: usize = 1;
 pub const UNIT_PAGE_READ: usize = 2;
@@ -99,6 +99,8 @@ pub const UNIT_VARLEN_COMPARE: usize = 22;
 pub const UNIT_WINDOW_FRAME_STEP: usize = 23;
 pub const UNIT_SCALAR_BYTE: usize = 24;
 pub const UNIT_DECIMAL_TRANSCEND: usize = 25;
+pub const UNIT_JSONPATH_COMPILE: usize = 26;
+pub const UNIT_JSONPATH_STEP: usize = 27;
 pub const ESTIMATOR_UNIT_IDS: [&str; ESTIMATOR_UNIT_COUNT] = [
     "storage_row_read",
     "statistics_value",
@@ -126,9 +128,13 @@ pub const ESTIMATOR_UNIT_IDS: [&str; ESTIMATOR_UNIT_COUNT] = [
     "window_frame_step",
     "scalar_byte",
     "decimal_transcend",
+    "jsonpath_compile",
+    "jsonpath_step",
 ];
 #[rustfmt::skip]
 pub const ESTIMATOR_UNIT_WEIGHTS: [i64; ESTIMATOR_UNIT_COUNT] = [
+    1,
+    1,
     1,
     1,
     1,

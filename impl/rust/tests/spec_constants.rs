@@ -469,6 +469,8 @@ fn cost_schedule_matches_spec() {
             "value_decompress" => COSTS.value_decompress,
             "scalar_byte" => COSTS.scalar_byte,
             "decimal_transcend" => COSTS.decimal_transcend,
+            "jsonpath_compile" => COSTS.jsonpath_compile,
+            "jsonpath_step" => COSTS.jsonpath_step,
             "decimal_work" => COSTS.decimal_work,
             "row_produced" => COSTS.row_produced,
             "operator_eval" => COSTS.operator_eval,

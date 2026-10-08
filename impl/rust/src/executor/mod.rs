@@ -40,6 +40,7 @@ pub(crate) use crate::value::{
     ArrayVal, RangeVal, ThreeValued, Value, and3, from3, not3, or3, parse_bytea_hex, parse_uuid,
     render_uuid,
 };
+pub(crate) use std::borrow::Cow;
 pub(crate) use std::collections::{BTreeSet, HashMap, HashSet};
 pub(crate) use std::sync::LazyLock;
 
@@ -4372,7 +4373,7 @@ fn json_node_as_returning(
 #[allow(clippy::too_many_arguments)]
 fn eval_json_sql_result(
     kind: JsonSqlKind,
-    seq: Vec<JsonNode>,
+    seq: Vec<Cow<'_, JsonNode>>,
     returning: ScalarType,
     decimal: Option<DecimalTypmod>,
     wrapper: JsonWrapper,
@@ -4406,7 +4407,7 @@ fn eval_json_sql_result(
                     meter,
                 );
             }
-            let item = &seq[0];
+            let item = seq[0].as_ref();
             // JSON_VALUE requires a SCALAR item (PG 2203F otherwise).
             if matches!(item, JsonNode::Array(_) | JsonNode::Object(_)) {
                 return apply_json_behavior(
@@ -4437,13 +4438,16 @@ fn eval_json_sql_result(
                 JsonWrapper::Conditional => seq.len() != 1,
                 JsonWrapper::Without => false,
             };
+            let array = |seq: Vec<Cow<JsonNode>>| {
+                JsonNode::Array(seq.into_iter().map(Cow::into_owned).collect())
+            };
             let node = match wrapper {
-                JsonWrapper::Unconditional => JsonNode::Array(seq),
+                JsonWrapper::Unconditional => array(seq),
                 JsonWrapper::Conditional => {
                     if seq.len() == 1 {
-                        seq.into_iter().next().unwrap()
+                        seq.into_iter().next().unwrap().into_owned()
                     } else {
-                        JsonNode::Array(seq)
+                        array(seq)
                     }
                 }
                 JsonWrapper::Without => {
@@ -4468,7 +4472,7 @@ fn eval_json_sql_result(
                             meter,
                         );
                     }
-                    seq.into_iter().next().unwrap()
+                    seq.into_iter().next().unwrap().into_owned()
                 }
             };
             // A wrapper nests the items one level (json.md §6.4) — not a SQL/JSON error, so it is
@@ -4563,7 +4567,7 @@ fn jt_compile_path(path: Option<&str>, name: &str) -> Result<String> {
 /// parent→child LEFT OUTER product with sibling NESTED paths UNIONed, json-table.md §3.3).
 fn expand_jt_level(
     cols: &[JtCol],
-    items: &[JsonNode],
+    items: &[Cow<'_, JsonNode>],
     env: &EvalEnv,
     meter: &mut Meter,
 ) -> Result<Vec<JtAssign>> {
@@ -4598,7 +4602,7 @@ fn expand_jt_level(
                     path,
                     on_error,
                 } => {
-                    let v = eval_jt_exists(item, path, *returning, *on_error)?;
+                    let v = eval_jt_exists(item, path, *returning, *on_error, meter)?;
                     local.push((*idx, v));
                 }
                 JtCol::Nested { .. } => {}
@@ -4634,8 +4638,13 @@ fn expand_jt_nested(
     let mut union: Vec<JtAssign> = Vec::new();
     for child in children {
         if let JtCol::Nested { path, columns } = child {
-            let p = crate::jsonpath::JsonPath::compile(path)?;
-            let child_seq = crate::jsonpath::eval(&p, item).unwrap_or_default();
+            let p = crate::jsonpath::compile_metered(path, meter)?;
+            // A navigation error yields no child rows; a cost abort propagates (jsonpath.md §7).
+            let child_seq = match crate::jsonpath::eval(&p, item, meter) {
+                Ok(seq) => seq,
+                Err(e) if is_sqljson_error(&e) => Vec::new(),
+                Err(e) => return Err(e),
+            };
             union.extend(expand_jt_level(columns, &child_seq, env, meter)?);
         }
     }
@@ -4660,8 +4669,8 @@ fn eval_jt_regular(
     env: &EvalEnv,
     meter: &mut Meter,
 ) -> Result<Value> {
-    let p = crate::jsonpath::JsonPath::compile(path)?;
-    let seq = match crate::jsonpath::eval(&p, item) {
+    let p = crate::jsonpath::compile_metered(path, meter)?;
+    let seq = match crate::jsonpath::eval(&p, item, meter) {
         Ok(s) => s,
         Err(e) if is_sqljson_error(&e) => {
             return apply_json_behavior(on_error, e, returning, env, meter);
@@ -4686,9 +4695,10 @@ fn eval_jt_exists(
     path: &str,
     returning: ScalarType,
     on_error: JsonOnBehavior,
+    meter: &mut Meter,
 ) -> Result<Value> {
-    let p = crate::jsonpath::JsonPath::compile(path)?;
-    let exists = match crate::jsonpath::eval(&p, item) {
+    let p = crate::jsonpath::compile_metered(path, meter)?;
+    let exists = match crate::jsonpath::eval(&p, item, meter) {
         Ok(seq) => !seq.is_empty(),
         Err(e) if is_sqljson_error(&e) => match on_error {
             JsonOnBehavior::Error => return Err(e),

@@ -3545,7 +3545,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		seq, ok, err := evalJsonpath(ctx, path)
+		seq, ok, err := evalJsonpath(ctx, path, m)
 		if err != nil {
 			return Value{}, err
 		}
@@ -3604,7 +3604,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if cv.Kind == ValNull || pv.Kind == ValNull {
 			return NullValue(), nil
 		}
-		seq, ok, err := evalJsonpath(cv, pv)
+		seq, ok, err := evalJsonpath(cv, pv, m)
 		if err != nil {
 			// A SQL/JSON (data-exception) error is caught by ON ERROR; anything else (a cost abort,
 			// etc.) propagates.

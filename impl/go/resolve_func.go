@@ -2081,8 +2081,8 @@ func resolveJsonpathArgs(s *scope, name string, args []*exprNode, ag *aggCtx, pa
 
 // evalJsonpath recompiles a `jsonpath` value's canonical text and evaluates it over a `jsonb`
 // context value (the shared kernel of the jsonpath query functions). A NULL context or path yields
-// ok=false (→ SQL NULL / zero rows).
-func evalJsonpath(ctx, path Value) ([]JsonNode, bool, error) {
+// ok=false (→ SQL NULL / zero rows). Compiling and evaluating are metered (jsonpath.md §7).
+func evalJsonpath(ctx, path Value, m *costMeter) ([]JsonNode, bool, error) {
 	if ctx.Kind == ValNull || path.Kind == ValNull {
 		return nil, false, nil
 	}
@@ -2091,11 +2091,11 @@ func evalJsonpath(ctx, path Value) ([]JsonNode, bool, error) {
 		return nil, false, err
 	}
 	// The resolver restricts a jsonpath argument to jsonpath (its canonical text in Str).
-	compiled, err := compile(path.str())
+	compiled, err := compileMetered(path.str(), m)
 	if err != nil {
 		return nil, false, err
 	}
-	seq, err := compiled.Eval(node)
+	seq, err := compiled.Eval(node, m)
 	if err != nil {
 		return nil, false, err
 	}

@@ -1929,10 +1929,9 @@ Rules for both classes:
 
 **Follow-ons.** New constructing kernels (text `||`, `concat`, `format`,
 `string_agg`, `array_fill`) join this table when they land. Path evaluation
-inside jsonpath (`jsonb_path_query`, `@?`, `JSON_QUERY`) copies matched sub-values
-with no per-step charge; that is the unimplemented `jsonpath_step` unit
-([jsonpath.md](jsonpath.md) §7), a separate slice. The S2 charge on
-`jsonb_path_query_array` covers only the collected result.
+inside jsonpath (`jsonb_path_query`, `@?`, `JSON_QUERY`) is metered separately by the
+`jsonpath_compile` and `jsonpath_step` units ([jsonpath.md](jsonpath.md) §7). The S2
+charge on `jsonb_path_query_array` covers only the collected result.
 
 Cost is a work budget, **not a memory limit**. Independent allocation budgets —
 the cumulative scalar allowance (`54P04`) and the live query-memory account

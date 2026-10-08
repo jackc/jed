@@ -168,8 +168,7 @@ bytes until commit/rollback, each statement's account opens holding them, and th
 every statement. A database-owned, opt-in `max_storage_bytes` (unlimited by default; `54P06`)
 bounds an in-memory database's or attachment's committed pages, checked at commit before any write
 (slice Q4a); file-backed page caches stay evict-only under `cache_bytes` and never fail a query.
-A file-backed size cap and jsonpath evaluation (the unimplemented `jsonpath_step` unit) are still
-uncovered. These are guardrails, not heap caps: resource-
+A file-backed size cap is still uncovered. These are guardrails, not heap caps: resource-
 exhaustion resistance remains a requirement; do not claim the current limits are a
 whole-engine memory guarantee. Host extensions remain outside these guarantees.
 

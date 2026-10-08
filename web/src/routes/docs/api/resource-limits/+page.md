@@ -67,6 +67,11 @@ text). Instead they charge one cost unit per byte they build (32 per array eleme
 plus its contents), which lets `max_cost` stop a query that doubles a value over and over. A value
 built only from constants, such as `ARRAY[1, 2, 3]` in a `WHERE` clause, costs nothing extra.
 
+jsonpath queries (`jsonb_path_query`, `@?`, `JSON_QUERY`, `JSON_TABLE`, and the rest) are metered
+by the work the path does: each byte of the path compiled, each step applied, each item produced,
+each object member searched, and each comparison a filter makes. A filter that compares every
+array element against every other element therefore costs in proportion to the pairs it tests.
+
 ## Query memory budget
 
 `max_query_memory_bytes` bounds the **rows and operator state a statement holds at once**:

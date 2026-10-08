@@ -855,21 +855,22 @@ impl RExpr {
                 m.charge(COSTS.operator_eval);
                 let ctx = args[0].eval(row, env, m)?;
                 let path = args[1].eval(row, env, m)?;
-                let seq = match eval_jsonpath(&ctx, &path)? {
-                    None => return Ok(Value::Null),
-                    Some(s) => s,
+                let Some((node, compiled)) = jsonpath_operands(&ctx, &path, m)? else {
+                    return Ok(Value::Null);
                 };
+                let seq = crate::jsonpath::eval(&compiled, &node, m)?;
                 // Charge per produced item so a runaway `[*]` fan-out stays cost-proportional.
                 m.charge(COSTS.operator_eval * seq.len() as i64);
                 m.guard()?;
                 match kind {
                     JsonPathFnKind::Exists => Ok(Value::Bool(!seq.is_empty())),
-                    JsonPathFnKind::QueryFirst => {
-                        Ok(seq.into_iter().next().map_or(Value::Null, Value::Jsonb))
-                    }
+                    JsonPathFnKind::QueryFirst => Ok(seq
+                        .into_iter()
+                        .next()
+                        .map_or(Value::Null, |n| Value::Jsonb(n.into_owned()))),
                     JsonPathFnKind::QueryArray => {
                         // Wrapping the items in an array can deepen the result (json.md §6.4).
-                        let out = JsonNode::Array(seq);
+                        let out = JsonNode::Array(seq.into_iter().map(Cow::into_owned).collect());
                         json::check_depth(&out)?;
                         let out = Value::Jsonb(out);
                         // A growth kernel (cost.md §8.1), free over constant operands.
@@ -880,20 +881,24 @@ impl RExpr {
                     }
                     // jsonb_path_match: the path must produce EXACTLY one boolean item (or a JSON
                     // null — an unknown predicate — which is SQL NULL).
-                    JsonPathFnKind::Match => match seq.as_slice() {
-                        [JsonNode::Bool(b)] => Ok(Value::Bool(*b)),
-                        [JsonNode::Null] => Ok(Value::Null),
-                        _ => Err(EngineError::new(
-                            SqlState::SingletonSqlJsonItemRequired,
-                            "single boolean result is expected",
-                        )),
-                    },
+                    JsonPathFnKind::Match => {
+                        match seq.iter().map(|n| n.as_ref()).collect::<Vec<_>>()[..] {
+                            [JsonNode::Bool(b)] => Ok(Value::Bool(*b)),
+                            [JsonNode::Null] => Ok(Value::Null),
+                            _ => Err(EngineError::new(
+                                SqlState::SingletonSqlJsonItemRequired,
+                                "single boolean result is expected",
+                            )),
+                        }
+                    }
                     // @@ is PostgreSQL's silent match form: suppress a non-singleton/non-boolean
                     // result to SQL NULL.
-                    JsonPathFnKind::MatchSilent => match seq.as_slice() {
-                        [JsonNode::Bool(b)] => Ok(Value::Bool(*b)),
-                        _ => Ok(Value::Null),
-                    },
+                    JsonPathFnKind::MatchSilent => {
+                        match seq.iter().map(|n| n.as_ref()).collect::<Vec<_>>()[..] {
+                            [JsonNode::Bool(b)] => Ok(Value::Bool(*b)),
+                            _ => Ok(Value::Null),
+                        }
+                    }
                 }
             }
             // A SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY (json-sql-functions.md
@@ -914,11 +919,18 @@ impl RExpr {
                 if matches!(cv, Value::Null) || matches!(pv, Value::Null) {
                     return Ok(Value::Null);
                 }
-                let seq = match eval_jsonpath(&cv, &pv) {
-                    Ok(Some(s)) => s,
+                // A SQL/JSON (data-exception) error — from a malformed json context or from path
+                // navigation — is caught by ON ERROR; anything else (a cost abort, etc.) propagates.
+                let (node, compiled) = match jsonpath_operands(&cv, &pv, m) {
+                    Ok(Some(ops)) => ops,
                     Ok(None) => return Ok(Value::Null),
-                    // A SQL/JSON (data-exception) error is caught by ON ERROR; anything else (a cost
-                    // abort, etc.) propagates.
+                    Err(e) if is_sqljson_error(&e) => {
+                        return apply_json_behavior(*on_error, e, *returning, env, m);
+                    }
+                    Err(e) => return Err(e),
+                };
+                let seq = match crate::jsonpath::eval(&compiled, &node, m) {
+                    Ok(s) => s,
                     Err(e) if is_sqljson_error(&e) => {
                         return apply_json_behavior(*on_error, e, *returning, env, m);
                     }

@@ -311,6 +311,7 @@ import {
 } from "./value.ts";
 import {
   compile as jsonPathCompile,
+  compileMetered as jsonPathCompileMetered,
   evalPath as jsonPathEval,
   render as jsonPathRender,
 } from "./jsonpath.ts";
@@ -13803,11 +13804,13 @@ export class Engine {
     if (ctx.kind === "null") return [];
     const node = jsonArgNode(ctx);
     // The root path → the sequence of row items (a structural error here yields no rows).
-    const root = jsonPathCompile(plan.rootPath);
+    const root = jsonPathCompileMetered(plan.rootPath, meter);
+    // A navigation error yields no rows; a cost abort propagates (jsonpath.md §7).
     let items: JsonNode[];
     try {
-      items = jsonPathEval(root, node);
-    } catch {
+      items = jsonPathEval(root, node, meter);
+    } catch (e) {
+      if (!isSqljsonError(e)) throw e;
       items = [];
     }
     // Expand the column tree over the root sequence → sparse rows, then materialize.
@@ -14254,8 +14257,8 @@ export class Engine {
         if (path.kind !== "jsonpath") {
           throw new Error("resolver restricts the path argument to jsonpath");
         }
-        const compiled = jsonPathCompile(path.text);
-        for (const item of jsonPathEval(compiled, node)) {
+        const compiled = jsonPathCompileMetered(path.text, meter);
+        for (const item of jsonPathEval(compiled, node, meter)) {
           meter.guard();
           meter.charge(COSTS.generatedRow);
           out.push([jsonbValue(item)]);
@@ -25298,7 +25301,7 @@ export function expandJtLevel(
           break;
         }
         case "exists": {
-          const v = evalJtExists(item, col.path, col.returning, col.onError);
+          const v = evalJtExists(item, col.path, col.returning, col.onError, meter);
           local.push([col.idx, v]);
           break;
         }
@@ -25329,11 +25332,13 @@ export function expandJtNested(
   if (children.length === 0) return [[]];
   const union: JtAssign[] = [];
   for (const child of children) {
-    const p = jsonPathCompile(child.path);
+    const p = jsonPathCompileMetered(child.path, meter);
+    // A navigation error yields no child rows; a cost abort propagates (jsonpath.md §7).
     let childSeq: JsonNode[];
     try {
-      childSeq = jsonPathEval(p, item);
-    } catch {
+      childSeq = jsonPathEval(p, item, meter);
+    } catch (e) {
+      if (!isSqljsonError(e)) throw e;
       childSeq = [];
     }
     union.push(...expandJtLevel(child.columns, childSeq, env, meter));
@@ -25357,10 +25362,10 @@ export function evalJtRegular(
   env: EvalEnv,
   meter: Meter,
 ): Value {
-  const p = jsonPathCompile(path);
+  const p = jsonPathCompileMetered(path, meter);
   let seq: JsonNode[];
   try {
-    seq = jsonPathEval(p, item);
+    seq = jsonPathEval(p, item, meter);
   } catch (e) {
     if (isSqljsonError(e)) {
       return applyJsonBehavior(onError, e, returning, env, meter);
@@ -25380,11 +25385,12 @@ export function evalJtExists(
   path: string,
   returning: ScalarType,
   onError: JsonOnBehavior,
+  meter: Meter,
 ): Value {
-  const p = jsonPathCompile(path);
+  const p = jsonPathCompileMetered(path, meter);
   let exists: boolean;
   try {
-    exists = jsonPathEval(p, item).length > 0;
+    exists = jsonPathEval(p, item, meter).length > 0;
   } catch (e) {
     if (isSqljsonError(e)) {
       switch (onError) {

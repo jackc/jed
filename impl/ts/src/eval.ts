@@ -1977,7 +1977,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       m.charge(COSTS.operatorEval);
       const ctx = evalExpr(e.args[0]!, row, env, m);
       const path = evalExpr(e.args[1]!, row, env, m);
-      const seq = evalJsonpath(ctx, path);
+      const seq = evalJsonpath(ctx, path, m);
       if (seq === null) return nullValue();
       // Charge per produced item so a runaway `[*]` fan-out stays cost-proportional.
       m.charge(COSTS.operatorEval * BigInt(seq.length));
@@ -2025,7 +2025,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (cv.kind === "null" || pv.kind === "null") return nullValue();
       let seq: JsonNode[] | null;
       try {
-        seq = evalJsonpath(cv, pv);
+        seq = evalJsonpath(cv, pv, m);
       } catch (err) {
         // A SQL/JSON (data-exception) error is caught by ON ERROR; anything else (a cost abort,
         // etc.) propagates.

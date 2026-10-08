@@ -70,20 +70,20 @@ SELECT jsonb_set(j, '{b}', j), jsonb_object(ARRAY['k', s]) FROM t
 {"k": "q\"x"}
 
 # jsonb_path_query_array collects its items into a new array: [1] → payload 36.
-# cost: 41
+# cost: 46
 query T nosort
 SELECT jsonb_path_query_array(j, '$.*') FROM t
 ----
 [1]
 
 # JSON_QUERY is charged only when a wrapper builds the array; the unwrapped result is an extraction.
-# cost: 41
+# cost: 49
 query T nosort
 SELECT JSON_QUERY(j, '$.a' WITH WRAPPER) FROM t
 ----
 [1]
 
-# cost: 5
+# cost: 6
 query T nosort
 SELECT JSON_QUERY(j, '$') FROM t
 ----

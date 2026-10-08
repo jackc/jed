@@ -1,0 +1,104 @@
+# jsonpath evaluation metering (spec/design/jsonpath.md §7). jsonpath_compile charges one unit per
+# byte of the compiled text (a jsonpath value's canonical text: '$.a' is held as '$."a"'), at every
+# evaluation. jsonpath_step charges each step application (after lax unwrapping), each emitted item,
+# each object member a `.key` lookup examines, and each comparison pair tested, plus a SQL
+# comparison's size extra. The query function still charges one operator_eval per result item.
+# jed-SPECIFIC resource contract (PostgreSQL has no cost meter).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.set_returning, query.aggregates, func.json_agg, types.jsonb, types.jsonpath, func.jsonb_path, expr.jsonpath_filter, expr.json_query_fns, func.json_table, types.i32, resource.cost_metering, resource.cost_limit
+
+statement ok
+CREATE TABLE d (id i32 PRIMARY KEY, j jsonb)
+
+statement ok
+INSERT INTO d VALUES (1, '{"a": [1, 2, 3], "b": {"x": "hi"}, "s": "abc"}')
+
+# '$': 1 compile byte, no steps, one result item. Scan 3 + call 1 + 1 + item 1.
+# cost: 6
+query B nosort
+SELECT jsonb_path_exists(j, '$') FROM d
+----
+true
+
+# '$."a"[*]' is 8 bytes. `.a` applies once, examines 1 member (a sorts first), emits 1; `[*]` applies
+# once and emits 3: 7 steps, then 3 result items.
+# cost: 130
+query T nosort
+SELECT jsonb_path_query_array(j, '$.a[*]') FROM d
+----
+[1, 2, 3]
+
+# A missing key examines every member (3) and emits nothing.
+# cost: 14
+query B nosort
+SELECT jsonb_path_exists(j, '$.zz') FROM d
+----
+false
+
+# lax unwrapping: `.x` on the array is applied to each of its 3 elements, which emit nothing.
+# cost: 19
+query B nosort
+SELECT jsonb_path_exists(j, '$.a.x') FROM d
+----
+false
+
+# A filter applies once per item and tests one pair against the literal for each.
+# cost: 109
+query T nosort
+SELECT jsonb_path_query_array(j, '$.a[*] ? (@ > 1)') FROM d
+----
+[2, 3]
+
+# A $-rooted operand is re-evaluated for every item, and the pairs are tested left outer; lax stops at
+# the first true pair, so item k tests k pairs.
+# cost: 179
+query T nosort
+SELECT jsonb_path_query_array(j, '$.a[*] ? (@ == $.a[*])') FROM d
+----
+[1, 2, 3]
+
+# strict stops at the first unknown pair: a number against a string is incomparable.
+# cost: 43
+query T nosort
+SELECT jsonb_path_query_array(j, 'strict $.a[*] ? (@ == "x")') FROM d
+----
+[]
+
+# Comparing strings adds varlen_compare for the shorter length beyond one code point (3 - 1 = 2).
+# cost: 31
+query B nosort
+SELECT jsonb_path_exists(j, '$.s ? (@ == "abd")') FROM d
+----
+false
+
+# && and || evaluate both sides.
+# cost: 51
+query B nosort
+SELECT jsonb_path_exists(j, '$.a[*] ? (@ == 1 || @ == 2)') FROM d
+----
+true
+
+# JSON_TABLE meters its row path and each column path per row item.
+# cost: 29
+query II rowsort
+SELECT t.v, t.w FROM d, JSON_TABLE(d.j, '$.a[*]' COLUMNS (v i32 PATH '$', w i32 PATH '$')) t
+----
+1
+1
+2
+2
+3
+3
+
+# The quadratic filter: every element against every element of a 1000-element array. The cost tracks
+# the roughly N²/2 pairs tested, so a cost ceiling stops it, and the abort raised inside the operand's
+# evaluation propagates instead of making the comparison unknown.
+# max_cost: 100000
+statement error 54P01
+SELECT jsonb_path_exists(a, '$[*] ? (@ == $[*])') FROM (SELECT jsonb_agg(g) AS a FROM generate_series(1, 1000) g) s
+
+# The same filter over 50 elements completes.
+# cost: 4195
+query B nosort
+SELECT jsonb_path_exists(a, '$[*] ? (@ == $[*])') FROM (SELECT jsonb_agg(g) AS a FROM generate_series(1, 50) g) s
+----
+true

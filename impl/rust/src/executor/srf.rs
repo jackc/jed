@@ -609,8 +609,13 @@ impl Engine {
         }
         let node = json_arg_node(&ctx)?;
         // The root path → the sequence of row items (a structural error here yields no rows).
-        let root = crate::jsonpath::JsonPath::compile(&plan.root_path)?;
-        let items = crate::jsonpath::eval(&root, &node).unwrap_or_default();
+        let root = crate::jsonpath::compile_metered(&plan.root_path, meter)?;
+        // A navigation error yields no rows; a cost abort propagates (jsonpath.md §7).
+        let items = match crate::jsonpath::eval(&root, &node, meter) {
+            Ok(items) => items,
+            Err(e) if e.code().starts_with("22") => Vec::new(),
+            Err(e) => return Err(e),
+        };
         // Expand the column tree over the root sequence → sparse rows, then materialize.
         let sparse = expand_jt_level(&plan.columns, &items, env, meter)?;
         let mut out = Vec::with_capacity(sparse.len());
@@ -1115,11 +1120,11 @@ impl Engine {
                     Value::JsonPath(s) => s,
                     _ => unreachable!("resolver restricts the path argument to jsonpath"),
                 };
-                let compiled = crate::jsonpath::JsonPath::compile(text)?;
-                for item in crate::jsonpath::eval(&compiled, &node)? {
+                let compiled = crate::jsonpath::compile_metered(text, meter)?;
+                for item in crate::jsonpath::eval(&compiled, &node, meter)? {
                     meter.guard()?;
                     meter.charge(COSTS.generated_row);
-                    out.push(vec![Value::Jsonb(item)]);
+                    out.push(vec![Value::Jsonb(item.into_owned())]);
                 }
             }
             // json[b]_to_record / _recordset (R1): map members → the col-def columns by name.
