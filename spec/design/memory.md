@@ -10,7 +10,7 @@ accounts and one database-owned account (§8):
 |---|---|---|---|---|
 | Scalar allocation | `max_scalar_bytes` | 64 MiB | cumulative churn, never refunded | `54P04` |
 | Query memory | `max_query_memory_bytes` | unlimited | live logical bytes, released when dropped; opens holding the transaction's pending writes (§7) | `54P05` |
-| Committed storage *(designed, §8)* | `max_storage_bytes` (database) | unlimited | an in-memory domain's `page_count × page_size`, checked at commit | `54P06` |
+| Committed storage (§8) | `max_storage_bytes` (database) | unlimited | an in-memory domain's `page_count × page_size`, checked at commit | `54P06` |
 
 All are **guardrails, not heap caps.** They bound logical bytes computed from a
 shared, representation-independent schedule (or, for committed storage, the
@@ -162,7 +162,7 @@ It is filled in by owner class:
 | Q1 | **Rows** — row buffers of statement execution and engine result collectors | implemented |
 | Q2 | **Operator state** — hash-join tables, group/distinct/dedup sets and keys, aggregate accumulators (`json_agg`/`jsonb_agg` and the other JSON aggregates, ordered-set and hypothetical buffers), sort buffers and top-k heaps, window partition state, columnar lanes, spill spools' resident buffers, recursive-CTE dedup sets | implemented (§6) |
 | Q3 | **Pending writes** — the stored bytes a transaction stages, surviving statement boundaries and released at commit/rollback | implemented (§7) |
-| Q4 | **Storage** — database-owned: committed in-memory storage under `max_storage_bytes`; page caches stay under `cache_bytes`, evict-only | designed (§8) |
+| Q4 | **Storage** — database-owned: committed in-memory storage under `max_storage_bytes`; page caches stay under `cache_bytes`, evict-only | Q4a implemented (§8) |
 
 Q2 operators that can spill charge only their resident portion and release it as
 they spill — when their residency exceeds `work_mem`, and also when the account
@@ -535,8 +535,8 @@ are checked once the statement completes. Thresholds are pinned by
 
 ## 8. Q4: storage
 
-> **Status: designed, not built.** Q4a below is the next slice; the cache rules in
-> §8.6 record contracts the pager already keeps and add nothing to enforce.
+> **Status: Q4a implemented** in all three cores. The cache rules in §8.6 record
+> contracts the pager already keeps and add nothing to enforce.
 
 Q1–Q3 charge memory that a **session** owns: a statement's buffers and state, and
 its transaction's staged writes. Storage memory outlives every statement and is
@@ -565,9 +565,9 @@ the session can make the *database* hold.
 `max_storage_bytes` is a **database setting**, not a session setting. It is fixed
 when an in-memory database is created (`create(opts)` with no `path`, Rust
 `CreateOptions { max_storage_bytes }`, Go `CreateOptions.MaxStorageBytes`, TS
-`maxStorageBytes`) or when an in-memory database is attached (an attach option on
-`db.attach(name, memory(), …)`, [attached-databases.md](attached-databases.md)
-§4). It can be changed on an open handle with
+`maxStorageBytes`) or when an in-memory database is attached (an option on the in-memory attach source,
+Rust `AttachSource::memory().max_storage_bytes(n)`,
+[attached-databases.md](attached-databases.md) §4). It can be changed on an open handle with
 `set_max_storage_bytes` / `SetMaxStorageBytes` / `setMaxStorageBytes`, which takes
 the target database name (`main` or an attachment) for attachments. Every session
 on the handle shares it. It is not persisted, not transactional, and not reachable
@@ -605,41 +605,63 @@ limit with this in mind, and the public docs must say so.
 
 ### 8.3 Admission
 
+> **Status: implemented (Q4a).** The repair exemption, the watermark rule, and the
+> multi-root precheck below were refined while building it.
+
 The check runs **once per commit** of an in-memory domain, after the commit has
 planned its page allocation (dirty pages packed, ids assigned from the free list
 first, then the high-water mark) and **before any page is written to the store or
 the root is published**. The predicted post-commit `page_count` gives the exact
-new `storage_bytes`, with no one-commit lag. The commit is rejected when:
+new `storage_bytes`, with no one-commit lag. A plan is admitted when any of these
+holds, tried in this order:
 
-```
-storage_bytes(after) > max_storage_bytes  and  page_count(after) > page_count(before)
-```
+1. **It fits:** the domain is unlimited, or the plan does not raise the high-water
+   (`page_count(after) ≤ page_count(before)`, so a limit lowered below the current
+   size still admits commits that fit in free pages), or
+   `page_count(after) × page_size ≤ max_storage_bytes`.
+2. **It fits after a forced compaction.** Periodic compaction can leave a domain
+   at its limit with dead pages not yet on the free list. So the commit runs one
+   forced compaction of the **committed** snapshot — the same reachability walk,
+   from the last commit's catalog root plus the pages it wrote (which cover a GiST
+   R-tree), without the periodic trigger — and, when that freed anything new,
+   discards the plan's page assignment and re-plans against the larger free list.
+   Compacting the committed version is safe when **no live reader pins an older
+   version**: a reader *at* that version keeps every page the walk keeps. If an
+   older version is pinned (a read session or streaming cursor that predates the
+   last commit), there is no forced compaction; closing the old readers is the
+   remedy. The walk is O(pages), but it only runs on a commit that would otherwise
+   fail.
+3. **The repair exemption:** the commit stages no record version (§7.1 — pure
+   `DELETE`s and drops; `UPDATE`, upserts, and FK actions that write rows all
+   stage) and rewrites no more catalog pages than the last commit did. Copy-on-write
+   needs fresh pages for a delete's new path *before* the old path is dead, so
+   without this rule a database at its limit could never delete its way back. The
+   catalog clause keeps empty-object DDL (`CREATE TABLE` with no rows) from growing
+   the database through the exemption. Such a commit can leave the domain over its
+   limit by the pages it rewrote; the next commit's forced compaction reclaims the
+   old path. That is bounded guardrail overshoot.
 
-The second clause is the **shrink-and-repair exemption**: a commit that does not
-raise the high-water mark always succeeds, even when the domain is already over a
-limit that was lowered at runtime. Rejecting it would only block the deletes that
-fix the problem.
-
-**Forced compaction before rejection.** Periodic compaction can leave a domain at
-its limit with an empty free list, so a `DELETE` or `DROP TABLE` that rewrites a
-root→leaf path would need fresh pages and would be refused. Before rejecting, the
-commit therefore runs one forced compaction whenever the watermark allows
-reclamation (`can_reclaim`, [transactions.md](transactions.md) §8). This is the same reachability walk
-over the last committed snapshot, without the `16`-page / `2×` trigger. It
-re-plans the allocation and checks again. If the watermark blocks reclamation,
-because an older version is still pinned by a read session or an open streaming
-cursor, the commit is rejected; closing the old readers is the remedy. The forced
-walk is O(pages), but it only runs on a commit that would otherwise fail.
+Otherwise the commit fails.
 
 **Failure.** `54P06 storage_limit_exceeded`, "storage of database \"main\" exceeded
 the limit of N bytes", naming the domain. Because nothing has been written yet, the
 transaction is discarded like a serialization-only commit error, and the handle
-stays usable without poisoning ([validated-cow.md](validated-cow.md)). An autocommit statement commits nothing. A
-`COMMIT` of an explicit block fails and the transaction ends rolled back, matching
-PostgreSQL, where a failed `COMMIT` does not leave the transaction open. In a
-multi-root commit ([attached-databases.md](attached-databases.md) §5), every
-in-memory domain is checked **before any root is published**, so a rejection in
-one attachment publishes none.
+stays usable without poisoning ([validated-cow.md](validated-cow.md)). An autocommit
+statement commits nothing. A `COMMIT` of an explicit block fails and the
+transaction ends rolled back, matching PostgreSQL, where a failed `COMMIT` does not
+leave the transaction open. A forced compaction that ran before the rejection
+stays in effect; it only changed which dead pages the free list holds.
+
+**Multi-root commits.** A transaction that also dirties session temp tables or
+in-memory attachments packs those domains before main persists
+([attached-databases.md](attached-databases.md) §5), and packing a domain runs its
+post-commit compaction. So when any such domain is dirty, **every limited in-memory
+domain is prechecked before any domain packs a page**: attachments by name, then
+main, each planned (with any forced compaction), checked, and its plan's page
+assignment discarded; the real commit then re-plans the same allocation. A
+rejection in any domain discards the whole transaction like a `ROLLBACK`, temp
+changes and session sequence state included, and leaves every other domain's store
+untouched.
 
 **Ordering with the other gates.** Cost, `54P05`, and the Q3 end-of-statement check
 (§7.3) all run *during or at the end of* the statement, before the commit starts.
@@ -655,12 +677,11 @@ point is a pure function of the sequence of operations, because each input is:
 - **Page allocation.** The copy-on-write commit serializer is deterministic, and
   so is the order it reuses free-list pages in. In-memory stores already share the
   file serializer.
-- **The compaction schedule.** Today the `MIN_COMPACT_PAGES = 16` floor and the
-  `2 × live_at_compaction` trigger are constants mirrored by hand in each core.
-  Q4a **promotes them to shared spec constants** in
-  [../fileformat/format.md](../fileformat/format.md) *Reclamation*, codegen'd like
-  the cost schedule. They also become observable through `54P03`, which already
-  depends on them.
+- **The compaction schedule.** The `16`-page floor and the `2 × live` trigger
+  are shared data: `[reclamation]` in `spec/cost/schedule.toml`
+  (`compact_min_pages`, `compact_growth`), codegen'd into every core like the cost
+  schedule. They were hand-mirrored constants before Q4a, though `54P03` already
+  depended on them.
 - **The reader watermark.** Which versions are pinned depends on the order of
   commits and pin points, and that order is the deterministic schedule the
   concurrency corpus already uses (CLAUDE.md §7). An in-memory database cannot be

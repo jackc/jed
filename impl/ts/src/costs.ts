@@ -15,6 +15,10 @@ export const MEMORY_ARRAY_DIM = 16;
 export const MEMORY_DECIMAL_GROUP = 4;
 export const MEMORY_ENTRY = 32;
 
+// Within-session compaction trigger (spec/design/memory.md §8.4).
+export const COMPACT_MIN_PAGES = 16;
+export const COMPACT_GROWTH = 2;
+
 // The deterministic cost-unit weights, mirroring spec/cost/schedule.toml. Weights are
 // bigint for i64 parity with the Rust/Go cores (a number is f64 — CLAUDE.md §8).
 export interface CostSchedule {

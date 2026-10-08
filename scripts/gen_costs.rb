@@ -37,6 +37,9 @@ def scalar_limit = TomlRB.load_file(SCHEDULE).fetch("limits").fetch("default_sca
 # The logical query-memory size schedule (spec/design/memory.md §3).
 def mem(key) = TomlRB.load_file(SCHEDULE).fetch("memory").fetch(key)
 
+# The within-session compaction trigger (spec/design/memory.md §8.4).
+def reclaim(key) = TomlRB.load_file(SCHEDULE).fetch("reclamation").fetch(key)
+
 def units
   schedule = TomlRB.load_file(SCHEDULE)
   us = schedule["unit"] || []
@@ -72,6 +75,10 @@ def rust_file(us)
     pub const MEMORY_ARRAY_DIM: i64 = #{mem('array_dim')};
     pub const MEMORY_DECIMAL_GROUP: i64 = #{mem('decimal_group')};
     pub const MEMORY_ENTRY: i64 = #{mem('entry')};
+
+    /// Within-session compaction trigger (spec/design/memory.md §8.4).
+    pub const COMPACT_MIN_PAGES: u32 = #{reclaim('compact_min_pages')};
+    pub const COMPACT_GROWTH: u64 = #{reclaim('compact_growth')};
 
     /// The deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
     pub struct CostSchedule {
@@ -117,6 +124,12 @@ def go_file(us)
     	memoryEntry        int64 = #{mem('entry')}
     )
 
+    // Within-session compaction trigger (spec/design/memory.md §8.4).
+    const (
+    	compactMinPages uint32 = #{reclaim('compact_min_pages')}
+    	compactGrowth   uint64 = #{reclaim('compact_growth')}
+    )
+
     // CostSchedule holds the deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
     type costSchedule struct {
     #{fields}
@@ -151,6 +164,10 @@ def ts_file(us)
     export const MEMORY_ARRAY_DIM = #{mem('array_dim')};
     export const MEMORY_DECIMAL_GROUP = #{mem('decimal_group')};
     export const MEMORY_ENTRY = #{mem('entry')};
+
+    // Within-session compaction trigger (spec/design/memory.md §8.4).
+    export const COMPACT_MIN_PAGES = #{reclaim('compact_min_pages')};
+    export const COMPACT_GROWTH = #{reclaim('compact_growth')};
 
     // The deterministic cost-unit weights, mirroring spec/cost/schedule.toml. Weights are
     // bigint for i64 parity with the Rust/Go cores (a number is f64 — CLAUDE.md §8).

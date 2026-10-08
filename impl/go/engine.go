@@ -82,6 +82,10 @@ type engine struct {
 	// compaction (persistTemp → maybeCompact) must NOT reclaim pages — it could free one the cursor still
 	// faults. Incremented when a streaming Rows opens, decremented on Close (single-threaded per handle).
 	openStreams int
+	// commitStagesRows is whether the last commitTx staged any record version into main (memory.md
+	// §8.3): a commit that stages none — pure deletes and drops — may exceed max_storage_bytes so a full
+	// database can be repaired. Read by Session.publish, which persists main after commitTx.
+	commitStagesRows bool
 	// core is the shared core this engine's session belongs to (attached-databases.md §5), or nil for a
 	// bare/transient engine (a test engine, a snapshotEngine, committedEngine — none of which see
 	// attachments). It is the engine's route to the core-owned attachment registry (core.attachments)

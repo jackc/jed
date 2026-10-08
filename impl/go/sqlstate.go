@@ -171,6 +171,8 @@ const (
 	ScalarMemoryLimitExceeded
 	// QueryMemoryLimitExceeded is 54P05 — query memory exceeded the limit of {limit} bytes.
 	QueryMemoryLimitExceeded
+	// StorageLimitExceeded is 54P06 — storage of database "{database}" exceeded the limit of {limit} bytes.
+	StorageLimitExceeded
 	// ObjectNotInPrerequisiteState is 55000 — {detail}.
 	ObjectNotInPrerequisiteState
 	// ObjectInUse is 55006 — {detail}.
@@ -350,6 +352,8 @@ func (s SqlState) Code() string {
 		return "54P04"
 	case QueryMemoryLimitExceeded:
 		return "54P05"
+	case StorageLimitExceeded:
+		return "54P06"
 	case ObjectNotInPrerequisiteState:
 		return "55000"
 	case ObjectInUse:
@@ -462,6 +466,7 @@ var errorDescs = []errorDesc{
 	{Code: "54P03", Name: "temp_storage_limit_exceeded", Class: "program limit exceeded"},
 	{Code: "54P04", Name: "scalar_memory_limit_exceeded", Class: "program limit exceeded"},
 	{Code: "54P05", Name: "query_memory_limit_exceeded", Class: "program limit exceeded"},
+	{Code: "54P06", Name: "storage_limit_exceeded", Class: "program limit exceeded"},
 	{Code: "55000", Name: "object_not_in_prerequisite_state", Class: "object not in prerequisite state"},
 	{Code: "55006", Name: "object_in_use", Class: "object not in prerequisite state"},
 	{Code: "55P03", Name: "lock_not_available", Class: "object not in prerequisite state"},

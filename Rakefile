@@ -953,21 +953,22 @@ task :fuzz, [:time] do |_, args|
 end
 
 # Compare the per-record query-memory peaks the three conformance runners wrote for one storage mode
-# (rake conformance:query_memory): each line is file<TAB>record-ordinal<TAB>peak. A record a core did
+# (rake conformance:query_memory): each line is file<TAB>record-ordinal<TAB>peak<TAB>main-storage-bytes
+# (memory.md §8.4 — the cross-core check of in-memory page allocation and compaction). A record a core did
 # not run (a capability skip) is compared only among the cores that ran it.
 def query_memory_peak_mismatches(mode, paths)
   tables = paths.transform_values do |path|
     next {} unless File.exist?(path)
     File.readlines(path, chomp: true).to_h do |line|
-      file, ordinal, peak = line.split("\t")
-      [[file, ordinal.to_i], peak.to_i]
+      file, ordinal, peak, storage = line.split("\t")
+      [[file, ordinal.to_i], "peak=#{peak} storage=#{storage}"]
     end
   end
   keys = tables.values.flat_map(&:keys).uniq.sort
   keys.filter_map do |key|
     seen = tables.filter_map { |core, table| [core, table[key]] if table.key?(key) }.to_h
     next if seen.values.uniq.size <= 1
-    "#{mode} #{key[0]} record #{key[1]}: " + seen.map { |core, peak| "#{core}=#{peak}" }.join(" ")
+    "#{mode} #{key[0]} record #{key[1]}: " + seen.map { |core, peak| "#{core}: #{peak}" }.join("; ")
   end
 end
 
@@ -1002,7 +1003,9 @@ namespace :conformance do
   # Each core also writes every record's PEAK balance (JED_CONFORMANCE_QUERY_MEMORY_PEAKS) — the
   # minimal budget under which that record passes — and the task fails unless the three cores agree
   # on every record's peak in each mode: the whole corpus becomes the cross-core check of the
-  # reserve/release sites, not only the records that pin a threshold (memory.md §8).
+  # reserve/release sites, not only the records that pin a threshold (memory.md §9). Each line also
+  # carries main's committed storage bytes after the record, so the same comparison checks that the
+  # cores allocate and compact pages identically — the basis of the 54P06 limit (memory.md §8.4).
   desc "Run the shared SQL corpus on all cores with query-memory accounting active (bytes, optional path filter)"
   task :query_memory, [:bytes, :filter] do |_, args|
     require "tmpdir"

@@ -1509,3 +1509,7 @@ description = "Finite per-statement cumulative scalar-allocation budget, checked
 [[capability]]
 id = "resource.query_memory"
 description = "Live per-statement logical query-memory budget over row buffers, engine result collectors (Q1), and operator state (Q2: hash/group/dedup tables, retained aggregate inputs, window partitions, sort state, columnar lanes, spill structures), and a transaction's pending writes (Q3: the stored bytes of every staged record version, held until commit/rollback) (54P05); memory.md §2-§7. On a file-backed database, spill-capable structures spill when the budget rejects them (memory.md §6.6). Host setting max_query_memory_bytes (unlimited by default) and the per-record `# max_query_memory_bytes:` corpus directive; `# work_mem:` pins the spill threshold a disk-mode budget depends on."
+
+[[capability]]
+id = "resource.storage_memory"
+description = "Database-owned committed-storage limit for in-memory databases and in-memory attachments (Q4a, 54P06); memory.md §8. A commit that would raise page_count × page_size past max_storage_bytes first compacts the committed snapshot, then fails before writing; a commit that does not raise the high-water, or stages no record version without growing the catalog, is admitted. Host create/attach options and setter, and the file-level `# max_storage_bytes: N [database]` corpus action."

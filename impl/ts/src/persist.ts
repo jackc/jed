@@ -14,36 +14,165 @@ import {
   manifestOverflowCapacity,
   metaChecksum,
 } from "./commit_manifest.ts";
+import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "./costs.ts";
 import { engineError } from "./errors.ts";
 import {
+  catalogPageCount,
   incrementalImage,
   type IncrementalWrite,
   metaPage,
   planFreeList,
   reachablePages,
   ROOT_PAGE,
+  unassignPages,
 } from "./format.ts";
+
+// StorageBudget is the max_storage_bytes state of one storage domain (memory.md §8.1–§8.3): the limit,
+// plus what the last successful in-memory commit wrote, so a commit that would exceed the limit can
+// first compact the committed snapshot (its catalog root and written pages — the latter cover a GiST
+// R-tree, which reachablePages cannot see).
+export type StorageBudget = {
+  // Positive: the limit in bytes over pageCount × pageSize. Zero or negative: unlimited.
+  limit: bigint;
+  // The catalog root the last commit wrote; 0 before the first commit (nothing to reclaim yet).
+  lastCatRoot: number;
+  // The pages the last commit wrote.
+  lastWritten: number[];
+  // How many catalog pages the last commit wrote (the catalog is rewritten whole every commit).
+  lastCatalogPages: number;
+};
+
+// BudgetCtx is the budget context of one in-memory domain's commit (memory.md §8.3): its name (for the
+// 54P06 message), its committed snapshot (what a forced compaction rebuilds the free list from),
+// whether the reader watermark allows compacting that snapshot (no live reader pins an older version),
+// and whether the commit stages any record version (one that stages none and does not grow the catalog
+// is admitted over the limit — the repair exemption).
+export type BudgetCtx = {
+  name: string;
+  prev: Snapshot;
+  canCompact: boolean;
+  stagesRows: boolean;
+};
+
+// storageBytes is the committed-storage measure (memory.md §8.2): the logical high-water times the page
+// size — deterministic, not RSS.
+export function storageBytes(db: Engine): bigint {
+  return BigInt(db.pageCount) * BigInt(db.pageSize);
+}
+
+// recordBudget remembers a successful in-memory commit's catalog root and written pages.
+function recordBudget(db: Engine, write: IncrementalWrite): void {
+  db.storageBudget.lastCatRoot = write.rootPage;
+  db.storageBudget.lastWritten = write.pages.map((pg) => pg.index);
+  db.storageBudget.lastCatalogPages = catalogPageCount(write.pages);
+}
+
+// planInMemory plans an in-memory commit's page allocation under the domain's max_storage_bytes limit
+// (memory.md §8.3), before any page is written. Without a budget context (a temp domain, which
+// temp_buffers bounds) or under an unlimited limit this is the plain incremental plan. A plan that raises
+// the high-water past the limit first compacts the committed snapshot when the watermark allows, then
+// re-plans; if it still does not fit the commit fails 54P06 (unless the repair exemption admits it).
+function planInMemory(
+  db: Engine,
+  snap: Snapshot,
+  reuse: boolean,
+  budget: BudgetCtx | null,
+): IncrementalWrite {
+  const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages, db.paging, reuse);
+  if (budget === null || fits(db, write)) return write;
+  if (budget.canCompact && forceCompact(db, budget.prev)) {
+    // Planning assigned set-once page ids to the dirty nodes; clear them so the re-plan draws from the
+    // enlarged free list.
+    unassignPages(snap, write.pages);
+    const replanned = incrementalImage(
+      snap,
+      db.pageSize,
+      db.pageCount,
+      db.freePages,
+      db.paging,
+      true,
+    );
+    if (fits(db, replanned)) return replanned;
+    return admitRepair(db, replanned, budget);
+  }
+  return admitRepair(db, write, budget);
+}
+
+// fits reports whether write is admitted (memory.md §8.3): an unlimited domain, a commit that does not
+// raise the high-water (the shrink-and-repair exemption), or one whose new high-water fits.
+function fits(db: Engine, write: IncrementalWrite): boolean {
+  const limit = db.storageBudget.limit;
+  return (
+    limit <= 0n ||
+    write.pageCount <= db.pageCount ||
+    BigInt(write.pageCount) * BigInt(db.pageSize) <= limit
+  );
+}
+
+// admitRepair is the repair exemption (memory.md §8.3): copy-on-write needs fresh pages before the ones
+// a delete frees are dead, so a commit that stages no record version and does not grow the catalog —
+// pure deletes and drops — is admitted over the limit; anything else fails 54P06.
+function admitRepair(db: Engine, write: IncrementalWrite, budget: BudgetCtx): IncrementalWrite {
+  if (!budget.stagesRows && catalogPageCount(write.pages) <= db.storageBudget.lastCatalogPages) {
+    return write;
+  }
+  throw engineError(
+    "storage_limit_exceeded",
+    `storage of database "${budget.name}" exceeded the limit of ${db.storageBudget.limit} bytes`,
+  );
+}
+
+// forceCompact is the forced compaction of memory.md §8.3: rebuild the free list from the committed
+// snapshot prev (the last commit's catalog root and written pages), ignoring the periodic trigger.
+// Returns whether it freed any page the free list did not already hold.
+function forceCompact(db: Engine, prev: Snapshot): boolean {
+  const budget = db.storageBudget;
+  if (budget.lastCatRoot === 0 || db.paging === null) return false; // no commit yet: nothing orphaned
+  const reached = reachablePages(prev, db.paging, budget.lastCatRoot);
+  for (const p of budget.lastWritten) reached.add(p);
+  const free: number[] = [];
+  for (let p = ROOT_PAGE; p < db.pageCount; p++) if (!reached.has(p)) free.push(p);
+  if (free.length <= db.freePages.length) return false;
+  db.freePages = free;
+  db.liveAtCompaction = reached.size;
+  db.freeGenTxid = prev.txid;
+  return true;
+}
+
+// precheckBudget checks an in-memory domain's budget ahead of a multi-root commit (memory.md §8.3), so a
+// rejection in a domain committed later publishes no domain's pages: plan (with any forced compaction),
+// then release the plan's page ids. The real commit re-plans the same allocation. A durable or unlimited
+// domain checks nothing.
+export function precheckBudget(
+  db: Engine,
+  snap: Snapshot,
+  reuse: boolean,
+  budget: BudgetCtx,
+): void {
+  if (db.persistHook !== null || db.paging === null || db.storageBudget.limit <= 0n) return;
+  const write = planInMemory(db, snap, reuse, budget);
+  unassignPages(snap, write.pages);
+}
 
 // Durable stores write body, free-list, descriptor, and alternate meta, then synchronize once.
 // Recovery checks every descriptor dependency before selecting that meta. The committed free list
 // excludes all descriptor dependencies, preserving the previous candidate during the next commit.
 // Memory stores retain their RAM free list and post-commit compaction without descriptor overhead.
 // canReclaim is the caller's reader-watermark decision (default: no open streaming cursor).
+// budget is the main domain's committed-storage context (memory.md §8.3), checked only for an
+// in-memory store.
 export function persistImpl(
   db: Engine,
   snap: Snapshot,
   canReclaim?: boolean,
   canReuse = true,
+  budget: BudgetCtx | null = null,
 ): IncrementalWrite {
   if (db.paging !== null && db.persistHook !== null) db.paging.checkDurableCommit();
-  const write = incrementalImage(
-    snap,
-    db.pageSize,
-    db.pageCount,
-    db.freePages,
-    db.paging,
-    canReuse,
-  );
+  const write =
+    db.paging !== null && db.persistHook === null
+      ? planInMemory(db, snap, canReuse, budget)
+      : incrementalImage(snap, db.pageSize, db.pageCount, db.freePages, db.paging, canReuse);
   if (db.paging === null) return write; // a bare engine with no byte store: nothing to write
   const reclaim = canReclaim ?? db.openStreams === 0;
   // DURABLE (file or OPFS — both reopened, both set a persistHook; the OPFS host leaves `path` null, so
@@ -183,6 +312,7 @@ function commitInMemory(
   paging.writeBlock(Number(snap.txid & 1n), meta);
   paging.sync();
   db.pageCount = write.pageCount;
+  recordBudget(db, write);
   db.freePages = write.freeRemaining;
   maybeCompact(db, snap, write.rootPage, write.pages, canReclaim);
 }
@@ -222,8 +352,9 @@ export function maybeCompact(
   canReclaim: boolean,
 ): void {
   if (!db.reclaimWithinSession || !canReclaim || db.paging === null) return;
-  const minCompactPages = 16; // don't churn a tiny store
-  if (db.pageCount <= minCompactPages || db.pageCount <= 2 * db.liveAtCompaction) return;
+  // The trigger constants are shared data (memory.md §8.4).
+  if (db.pageCount <= COMPACT_MIN_PAGES || db.pageCount <= COMPACT_GROWTH * db.liveAtCompaction)
+    return;
   const reached = reachablePages(snap, db.paging, catRoot);
   for (const w of written) reached.add(w.index);
   const free: number[] = [];
@@ -243,10 +374,16 @@ export function maybeCompact(
 // only the temp byte store is touched, so the zero-file-write invariant (temp-tables.md §2, D1) is
 // preserved by construction. Assigns page ids on snap in place; the caller adopts snap as the committed
 // temp state afterward. canReclaim is the caller's cursor watermark (no open streaming cursor may hold an
-// older temp tree).
-export function persistTemp(db: Engine, snap: Snapshot, canReclaim: boolean): void {
+// older temp tree). budget is an in-memory attachment's committed-storage context (memory.md §8.3);
+// null for a session temp domain, which temp_buffers bounds instead.
+export function persistTemp(
+  db: Engine,
+  snap: Snapshot,
+  canReclaim: boolean,
+  budget: BudgetCtx | null = null,
+): void {
   if (db.paging === null) return;
-  const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages, db.paging);
+  const write = planInMemory(db, snap, true, budget);
   db.paging.reserve(write.pageCount);
   for (const pg of write.pages) {
     db.paging.writeBlock(pg.index, pg.bytes);
@@ -256,6 +393,7 @@ export function persistTemp(db: Engine, snap: Snapshot, canReclaim: boolean): vo
   }
   // No meta write, no sync: never reopened, no durability barrier.
   db.pageCount = write.pageCount;
+  recordBudget(db, write);
   db.freePages = write.freeRemaining;
   snap.demoteCleanLeaves();
   maybeCompact(db, snap, write.rootPage, write.pages, canReclaim);

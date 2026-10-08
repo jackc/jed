@@ -194,6 +194,28 @@ func (db *engine) commitTx() (outcome, error) {
 		db.restoreSessionState(tx)
 		return outcome{Kind: outcomeStatement, Cost: 0}, nil
 	}
+	// A multi-root commit packs session temp and attachments before main persists at publish: check
+	// every in-memory budget first, so a later domain's 54P06 discards the whole transaction — session
+	// state restored as on ROLLBACK — before any domain has packed a page (memory.md §8.3). Main
+	// persists the working set, or its unchanged base when only temp changed.
+	if (tx.tempDirty || len(tx.attachDirty) > 0) && db.core != nil {
+		pureTemp := !tx.mainDirty && tx.tempDirty
+		attached := make([]budgetDomain, 0, len(tx.attachDirty))
+		for name := range tx.attachDirty {
+			if ws := tx.attachWorking[name]; ws != nil {
+				attached = append(attached, budgetDomain{name: name, snap: ws})
+			}
+		}
+		main := tx.working
+		if pureTemp {
+			main = db.committed
+		}
+		mainStagesRows := !pureTemp && tx.working.stagedBytes() != 0
+		if err := db.core.precheckBudgets(main, db.core.committedVersion()+1, mainStagesRows, attached); err != nil {
+			db.restoreSessionState(tx)
+			return outcome{}, err
+		}
+	}
 	working := tx.working
 	// One durable writer per transaction (attached-databases.md §5): at most one FILE-backed database —
 	// MAIN or an attached file — may be written per tx (any number of in-memory attachments + session
@@ -208,11 +230,14 @@ func (db *engine) commitTx() (outcome, error) {
 	// kind dirty) still persists, preserving prior behavior. Temp state is adopted regardless — never
 	// serialized, only swapped into the in-memory committed temp snapshot.
 	pureTemp := !tx.mainDirty && tx.tempDirty
+	db.commitStagesRows = false
 	if !pureTemp {
 		if db.path != "" {
 			working.txid = db.committed.txid + 1
 		}
-		// Published writes are no longer pending (memory.md §7).
+		// Published writes are no longer pending (memory.md §7). Whether any were staged decides the
+		// repair exemption of the main commit's storage budget (memory.md §8.3).
+		db.commitStagesRows = working.stagedBytes() != 0
 		working.clearStaged()
 		if err := db.persist(working); err != nil { // no-op for an in-memory database
 			return outcome{}, err
@@ -224,7 +249,7 @@ func (db *engine) commitTx() (outcome, error) {
 	// (compact packed leaves + within-session compaction) before it is adopted — zero main-file writes
 	// (temp-tables.md §6). Compaction is safe iff no streaming cursor holds an older temp tree.
 	if tx.tempDirty && db.tempStorage != nil {
-		if err := db.tempStorage.persistTemp(tx.tempWorking, db.openStreams == 0); err != nil {
+		if err := db.tempStorage.persistTemp(tx.tempWorking, db.openStreams == 0, nil); err != nil {
 			return outcome{}, err
 		}
 	}
@@ -251,6 +276,7 @@ func (db *engine) commitTx() (outcome, error) {
 			if att == nil {
 				continue // detached mid-transaction (unreachable under the writer gate) — nothing to persist
 			}
+			stagesRows := ws.stagedBytes() != 0
 			ws.clearStaged()
 			if att.isFile() {
 				// Advance the version for the alternating meta slot + reopen (like the main file commit).
@@ -264,13 +290,13 @@ func (db *engine) commitTx() (outcome, error) {
 				} else {
 					// A local reader pins every attached root, so reuse is safe only once that common
 					// watermark has drained.
-					err = att.storage.commitDurable(ws, canReclaim, canReclaim)
+					err = att.storage.commitDurable(ws, canReclaim, canReclaim, nil)
 				}
 				if err != nil {
 					return outcome{}, err
 				}
 				ws.demoteCleanLeaves() // post-commit residency flip (bplus-reshape.md B4), like Session.publish
-			} else if err := att.storage.persistTemp(ws, canReclaim); err != nil {
+			} else if err := att.storage.persistTemp(ws, canReclaim, db.core.attachmentBudget(name, stagesRows)); err != nil {
 				return outcome{}, err
 			}
 			ws.freezeMutationGenerations()

@@ -868,6 +868,33 @@ impl Engine {
                 rows_affected: None,
             });
         }
+        // A multi-root commit packs session temp and attachments before main persists at publish:
+        // check every in-memory budget first, so a later domain's 54P06 discards the whole
+        // transaction — session state restored as on ROLLBACK — before any domain has packed a page
+        // (memory.md §8.3). Main persists the working set, or its unchanged base when only temp
+        // changed.
+        if tx.temp_dirty || !tx.attach_dirty.is_empty() {
+            if let Some(c) = &self.core {
+                let pure_temp = !tx.main_dirty && tx.temp_dirty;
+                let attached: Vec<(&str, &Snapshot)> = tx
+                    .attach_dirty
+                    .iter()
+                    .filter_map(|name| tx.attach_working.get(name).map(|ws| (name.as_str(), ws)))
+                    .collect();
+                let mut main = if pure_temp {
+                    self.committed.clone()
+                } else {
+                    tx.working.clone()
+                };
+                main.txid = c.committed_version() + 1;
+                let main_stages_rows = !pure_temp && tx.working.staged_bytes() != 0;
+                if let Err(e) = c.precheck_budgets(&main, main_stages_rows, &attached) {
+                    drop(attached);
+                    self.restore_session_state(tx);
+                    return Err(e);
+                }
+            }
+        }
         let main_dirty = tx.main_dirty;
         let temp_dirty = tx.temp_dirty;
         let mut temp_working = tx.temp_working;
@@ -901,6 +928,7 @@ impl Engine {
         // adopted regardless — it is never serialized, only swapped into the in-memory committed temp
         // snapshot.
         let pure_temp = !main_dirty && temp_dirty;
+        self.commit_stages_rows = false;
         if !pure_temp {
             // The txid is the durable commit counter (spec/design/api.md §2): it advances only on a
             // file-backed commit. An in-memory commit swaps the snapshot but leaves txid unchanged
@@ -909,6 +937,7 @@ impl Engine {
                 working.txid = self.committed.txid + 1;
             }
             // Published writes are no longer pending (memory.md §7).
+            self.commit_stages_rows = working.staged_bytes() != 0;
             working.clear_staged();
             self.persist(&working)?; // no-op for an in-memory database
             self.committed = working;
@@ -919,7 +948,7 @@ impl Engine {
         if temp_dirty {
             let can_reclaim = self.open_streams.load(std::sync::atomic::Ordering::Relaxed) == 0;
             if let Some(ts) = self.temp_storage.as_mut() {
-                ts.persist_temp(&mut temp_working, can_reclaim)?;
+                ts.persist_temp(&mut temp_working, can_reclaim, None)?;
             }
         }
         // Adopt the transaction's temp changes into the committed temp snapshot (temp-tables.md §5) — the
@@ -944,11 +973,12 @@ impl Engine {
                 let Some(mut ws) = attach_working.remove(name) else {
                     continue;
                 };
+                let stages_rows = ws.staged_bytes() != 0;
                 ws.clear_staged();
                 if let Some(c) = &core {
                     // A detached-mid-transaction attachment (unreachable under the writer gate) no-ops.
                     let base_txid = self.attached_committed.get(name).map_or(0, |a| a.txid);
-                    c.commit_attachment(name, &mut ws, base_txid, can_reclaim)?;
+                    c.commit_attachment(name, &mut ws, base_txid, can_reclaim, stages_rows)?;
                 }
                 na.insert(name.clone(), std::sync::Arc::new(ws));
             }

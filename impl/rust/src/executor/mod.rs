@@ -491,6 +491,10 @@ pub struct Engine {
     /// (via an `OpenStreamGuard` bundled into the cursor's pin) — hence the `Arc<AtomicUsize>`: the guard
     /// outlives the `&mut self` borrow that built the cursor.
     pub(crate) open_streams: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Whether the last `commit_tx` staged any record version into main (memory.md §8.3): a commit
+    /// that stages none — pure deletes and drops — may exceed `max_storage_bytes` so a full database
+    /// can be repaired. Read by the shared core's publish, which persists main after `commit_tx`.
+    pub(crate) commit_stages_rows: bool,
     /// The shared core this engine's session belongs to (attached-databases.md §5), or `None` for a
     /// bare/transient engine (a test [`Engine::new`], a `snapshot_engine`, a `from_snapshot` read view —
     /// none of which commit attachments). It is the engine's route to the core-owned attachment registry

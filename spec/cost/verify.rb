@@ -37,6 +37,10 @@ def main
   fail!("schedule.toml: schema_version must be 1") unless schedule["schema_version"] == 1
 
   fail!("invalid default_scalar_bytes") unless schedule.dig("limits", "default_scalar_bytes").is_a?(Integer) && schedule.dig("limits", "default_scalar_bytes") > 0
+  %w[compact_min_pages compact_growth].each do |key|
+    v = schedule.dig("reclamation", key)
+    fail!("invalid [reclamation] #{key}") unless v.is_a?(Integer) && v.positive?
+  end
 
   %w[row value array_dim decimal_group entry].each do |key|
     v = schedule.dig("memory", key)

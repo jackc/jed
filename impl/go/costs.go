@@ -18,6 +18,12 @@ const (
 	memoryEntry        int64 = 32
 )
 
+// Within-session compaction trigger (spec/design/memory.md §8.4).
+const (
+	compactMinPages uint32 = 16
+	compactGrowth   uint64 = 2
+)
+
 // CostSchedule holds the deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
 type costSchedule struct {
 	StorageRowRead      int64

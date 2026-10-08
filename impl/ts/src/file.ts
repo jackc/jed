@@ -27,7 +27,12 @@ import { loadEnginePaged, toImage } from "./format.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager } from "./pager.ts";
 import { persistImpl } from "./persist.ts";
-import { buildInMemory, Database, registerFileAttachOpener } from "./shared.ts";
+import {
+  buildInMemory,
+  Database,
+  fileStorageLimitError,
+  registerFileAttachOpener,
+} from "./shared.ts";
 import { FileSpillSink } from "./spillfile.ts";
 import { FileCoordinator } from "./coordinator.ts";
 
@@ -60,6 +65,11 @@ export type CreateOptions = {
   // the host supplies, FROZEN for the handle's lifetime and shared into every session. Not stored in
   // the file — a host reopens with its own registry (the ephemeral, no-persisted-use rule of §14).
   extensions?: ExtensionRegistry;
+  // The committed-storage limit of an IN-MEMORY database in bytes (spec/design/memory.md §8): a commit
+  // that would raise pageCount × pageSize past it fails 54P06. Zero, negative, or absent is unlimited
+  // (the default). Not stored anywhere; Database.setMaxStorageBytes changes it. A positive value with a
+  // path is 0A000 (the file form is deferred, memory.md §8.7).
+  maxStorageBytes?: bigint;
 };
 
 // create makes a new file-backed database at path with opts (the page size is locked into the
@@ -217,6 +227,8 @@ registerFileAttachOpener((source, readOnly) => {
 // create constructor for both backings; the in-memory-specific constructors are removed.
 export function createDatabase(opts: CreateOptions = {}): Database {
   const pageSize = opts.pageSize || DEFAULT_PAGE_SIZE;
+  const maxStorageBytes = opts.maxStorageBytes ?? 0n;
+  if (opts.path !== undefined && maxStorageBytes > 0n) throw fileStorageLimitError();
   if (opts.path !== undefined) {
     const coordinator = FileCoordinator.create(opts.path, opts.locking, opts.fileLockTimeoutMs);
     try {
@@ -231,7 +243,7 @@ export function createDatabase(opts: CreateOptions = {}): Database {
     }
   }
   // in-memory never fsyncs; skipFsync is a no-op
-  return buildInMemory(pageSize, opts.extensions ?? null);
+  return buildInMemory(pageSize, opts.extensions ?? null, maxStorageBytes);
 }
 
 // openDatabase opens an existing file-backed database at path with optional open settings and returns

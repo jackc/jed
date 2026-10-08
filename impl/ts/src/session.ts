@@ -825,6 +825,12 @@ export interface AttachmentCore {
   attachments: Map<string, Attachment>;
   hasLiveReaders(): boolean;
   mainIsDurable(): boolean;
+  // The committed-storage budget hooks (memory.md §8.3): an attachment's published committed root,
+  // whether the reader watermark allows compacting the committed snapshots, and the multi-root
+  // precheck of every limited in-memory domain before any domain packs a page.
+  committedAttachment(name: string): Snapshot | undefined;
+  canCompactCommitted(): boolean;
+  precheckBudgets(main: Snapshot, mainStagesRows: boolean, attached: [string, Snapshot][]): void;
 }
 
 // isReservedScope reports whether a database qualifier names one of the two implicit reserved scopes

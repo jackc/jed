@@ -53,6 +53,7 @@ package jed
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -525,12 +526,64 @@ type storage struct {
 	readOnly    bool   // opened read-only (api.md §2.1): every session is then read-only, a write is 25006. Always false in-memory.
 	path        string // the backing file path; "" for an in-memory database (surfaced by Database.Path / Session.Path)
 	spillDir    string // host scratch directory for external-sort runs; independent of path, "" when unavailable
+	// budget is the committed-storage budget of an in-memory domain (memory.md §8, Q4a).
+	budget storageBudget
+}
+
+// storageBudget is the max_storage_bytes state of one in-memory domain (memory.md §8.1–§8.3): the
+// limit, plus what the last successful commit wrote, so a commit that would exceed the limit can first
+// compact the committed snapshot (its catalog root and written pages — the latter cover a GiST R-tree,
+// which reachablePages cannot see).
+type storageBudget struct {
+	// limit is the limit in bytes over pageCount × pageSize when positive; zero or negative is unlimited.
+	limit int64
+	// lastCatRoot is the catalog root the last commit wrote; 0 before the first commit (nothing to
+	// reclaim yet).
+	lastCatRoot uint32
+	// lastWritten is the pages the last commit wrote.
+	lastWritten []uint32
+	// lastCatalogPages is how many catalog pages the last commit wrote (the catalog is rewritten whole
+	// every commit).
+	lastCatalogPages int
+}
+
+// record remembers a successful in-memory commit's catalog root and written pages.
+func (b *storageBudget) record(write incrementalWrite) {
+	b.lastCatRoot = write.rootPage
+	b.lastWritten = make([]uint32, len(write.pages))
+	for i, pg := range write.pages {
+		b.lastWritten[i] = pg.index
+	}
+	b.lastCatalogPages = catalogPageCount(write.pages)
+}
+
+// budgetCtx is the budget context of one in-memory domain's commit (memory.md §8.3): its name (for the
+// 54P06 message), its committed snapshot (what a forced compaction rebuilds the free list from), and
+// whether the reader watermark allows compacting that snapshot — no live reader pins an older version.
+type budgetCtx struct {
+	name       string
+	prev       *snapshot
+	canCompact bool
+	// stagesRows is whether the commit stages any record version; one that stages none and does not
+	// grow the catalog is admitted over the limit (the repair exemption, memory.md §8.3).
+	stagesRows bool
+}
+
+// budgetDomain is one dirtied attachment's working snapshot, as precheckBudgets takes it.
+type budgetDomain struct {
+	name string
+	snap *snapshot
+}
+
+// errFileStorageLimit is the 0A000 for a committed-storage limit on a file backing (memory.md §8.7).
+func errFileStorageLimit() error {
+	return newError(FeatureNotSupported, "max_storage_bytes applies only to in-memory databases")
 }
 
 // persist is the synchronous commit chokepoint. File commits write the dirty
 // pages and validated-COW descriptor, then publish meta and perform one sync.
 // The reader watermark and presence lease still govern reuse and reclamation.
-func (c *sharedCore) persist(snap *snapshot) error {
+func (c *sharedCore) persist(snap *snapshot, stagesRows bool) error {
 	// The reader-liveness watermark (transactions.md §8) gates two things at the main-domain commit:
 	//   - canReclaim (oldest_live == the new version, i.e. no reader live at an older version) lets the
 	//     periodic COMPACT recompute the free-list (freeing this commit's fresh orphans);
@@ -549,7 +602,13 @@ func (c *sharedCore) persist(snap *snapshot) error {
 		}
 		return err
 	}
-	return c.storage.commitDurable(snap, canReclaim, canReuse)
+	budget := &budgetCtx{
+		name:       "main",
+		prev:       c.roots.Load().committed,
+		canCompact: c.canCompactCommitted(),
+		stagesRows: stagesRows,
+	}
+	return c.storage.commitDurable(snap, canReclaim, canReuse, budget)
 }
 
 func (st *storage) commitShared(snap *snapshot, coordinator *fileCoordinator) error {
@@ -617,20 +676,24 @@ func (st *storage) commitShared(snap *snapshot, coordinator *fileCoordinator) er
 // commitDurable serializes the writer and gates allocation through the reader
 // watermark. Files use validated COW; memory stores retain their no-op barriers.
 // The same path serves the main database and writable file attachments.
-func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool) error {
+// An in-memory commit is admitted against the domain's max_storage_bytes budget first (memory.md
+// §8.3); budget is nil for a domain without one (a file attachment).
+func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budget *budgetCtx) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.path != "" {
 		if err := st.paging.withPager(func(p *pager) error { return p.checkValidatedCommit() }); err != nil {
 			return err
 		}
+		write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, canReuse, st.paging)
+		if err != nil {
+			return err
+		}
+		return st.commitFile(snap, write, canReclaim, canReuse)
 	}
-	write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, canReuse, st.paging)
+	write, err := st.planInMemory(snap, canReuse, budget)
 	if err != nil {
 		return err
-	}
-	if st.path != "" {
-		return st.commitFile(snap, write, canReclaim, canReuse)
 	}
 	return st.commitInMemory(snap, write, canReclaim)
 }
@@ -714,8 +777,116 @@ func (st *storage) commitInMemory(snap *snapshot, write incrementalWrite, canRec
 		return err
 	}
 	st.pageCount = write.pageCount
+	st.budget.record(write)
 	st.freePages = write.freeRemaining
 	return st.maybeCompact(snap, write.rootPage, write.pages, canReclaim)
+}
+
+// planInMemory plans an in-memory commit's page allocation under the domain's max_storage_bytes limit
+// (memory.md §8.3), before any page is written. Without a budget context (a temp domain, which
+// temp_buffers bounds) or under an unlimited limit this is the plain incremental plan. A plan that
+// raises the high-water past the limit first compacts the committed snapshot when the watermark
+// allows, then re-plans; if it still does not fit the commit fails 54P06. Caller holds st.mu.
+func (st *storage) planInMemory(snap *snapshot, reuse bool, budget *budgetCtx) (incrementalWrite, error) {
+	write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, reuse, st.paging)
+	if err != nil {
+		return incrementalWrite{}, err
+	}
+	if budget == nil || st.fits(write) {
+		return write, nil
+	}
+	if budget.canCompact {
+		freed, err := st.forceCompact(budget.prev)
+		if err != nil {
+			return incrementalWrite{}, err
+		}
+		if freed {
+			// Planning assigned set-once page ids to the dirty nodes; clear them so the re-plan draws
+			// from the enlarged free list.
+			snap.unassignPages(write.pages)
+			write, err = snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, true, st.paging)
+			if err != nil {
+				return incrementalWrite{}, err
+			}
+			if st.fits(write) {
+				return write, nil
+			}
+		}
+	}
+	return st.admitRepair(write, budget)
+}
+
+// admitRepair is the repair exemption (memory.md §8.3): copy-on-write needs fresh pages before the
+// ones a delete frees are dead, so a commit that stages no record version and does not grow the
+// catalog — pure deletes and drops — is admitted over the limit; anything else fails 54P06.
+func (st *storage) admitRepair(write incrementalWrite, budget *budgetCtx) (incrementalWrite, error) {
+	if !budget.stagesRows && catalogPageCount(write.pages) <= st.budget.lastCatalogPages {
+		return write, nil
+	}
+	return incrementalWrite{}, newError(StorageLimitExceeded,
+		`storage of database "`+budget.name+`" exceeded the limit of `+strconv.FormatInt(st.budget.limit, 10)+` bytes`)
+}
+
+// fits reports whether write is admitted (memory.md §8.3): an unlimited domain, a commit that does
+// not raise the high-water (the shrink-and-repair exemption), or one whose new high-water fits.
+func (st *storage) fits(write incrementalWrite) bool {
+	return st.budget.limit <= 0 ||
+		write.pageCount <= st.pageCount ||
+		uint64(write.pageCount)*uint64(st.pageSize) <= uint64(st.budget.limit)
+}
+
+// forceCompact is the forced compaction of memory.md §8.3: rebuild the free list from the committed
+// snapshot prev (the last commit's catalog root and written pages), ignoring the periodic trigger.
+// Reports whether it freed any page the free list did not already hold. Caller holds st.mu.
+func (st *storage) forceCompact(prev *snapshot) (bool, error) {
+	if st.budget.lastCatRoot == 0 {
+		return false, nil // no commit yet: nothing has been orphaned
+	}
+	reached, err := prev.reachablePages(st.paging, st.budget.lastCatRoot)
+	if err != nil {
+		return false, err
+	}
+	for _, p := range st.budget.lastWritten {
+		reached[p] = true
+	}
+	var free []uint32
+	for p := rootPage; p < st.pageCount; p++ {
+		if !reached[p] {
+			free = append(free, p)
+		}
+	}
+	if len(free) <= len(st.freePages) {
+		return false, nil
+	}
+	st.freePages = free
+	st.liveAtCompaction = uint32(len(reached))
+	st.freeGenTxid = prev.txid
+	return true, nil
+}
+
+// precheckBudget checks an in-memory domain's budget ahead of a multi-root commit (memory.md §8.3), so
+// a rejection in a domain committed later publishes no domain's pages: plan (with any forced
+// compaction), then release the plan's page ids. The real commit re-plans the same allocation.
+func (st *storage) precheckBudget(snap *snapshot, reuse bool, budget *budgetCtx) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.path != "" || st.budget.limit <= 0 {
+		return nil
+	}
+	write, err := st.planInMemory(snap, reuse, budget)
+	if err != nil {
+		return err
+	}
+	snap.unassignPages(write.pages)
+	return nil
+}
+
+// storageBytes is the committed-storage measure (memory.md §8.2): the logical high-water times the
+// page size.
+func (st *storage) storageBytes() int64 {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return int64(st.pageCount) * int64(st.pageSize)
 }
 
 // close releases a file-backed storage's open pager (closing the underlying file); a no-op for an
@@ -799,8 +970,8 @@ func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, written []dirtyP
 	if !st.reclaimWithinSession || !canReclaim {
 		return nil
 	}
-	const minCompactPages = 16 // don't churn a tiny store
-	if st.pageCount <= minCompactPages || uint64(st.pageCount) <= 2*uint64(st.liveAtCompaction) {
+	// The trigger constants are shared data (memory.md §8.4).
+	if st.pageCount <= compactMinPages || uint64(st.pageCount) <= compactGrowth*uint64(st.liveAtCompaction) {
 		return nil
 	}
 	reached, err := snap.reachablePages(st.paging, catRoot)
@@ -830,14 +1001,15 @@ func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, written []dirtyP
 // temp byte store is touched, so the zero-file-write invariant (temp-tables.md §2, D1) is preserved by
 // construction. Assigns page ids on snap in place; the caller adopts snap as the committed temp state
 // afterward. canReclaim is the caller's cursor watermark (no open streaming cursor may hold an older
-// temp tree).
-func (st *storage) persistTemp(snap *snapshot, canReclaim bool) error {
+// temp tree). budget is an in-memory attachment's max_storage_bytes context (memory.md §8.3); nil for a
+// temp domain, which temp_buffers bounds instead.
+func (st *storage) persistTemp(snap *snapshot, canReclaim bool, budget *budgetCtx) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	// A temp domain (and an in-memory attachment) is session-local / driven by one goroutine, so its only
 	// reader is the session's own streaming cursor — gated synchronously by canReclaim (openStreams). There
 	// is no cross-thread pin-registration race, so reuse is always safe here (transactions.md §8).
-	write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, true, st.paging)
+	write, err := st.planInMemory(snap, true, budget)
 	if err != nil {
 		return err
 	}
@@ -858,9 +1030,82 @@ func (st *storage) persistTemp(snap *snapshot, canReclaim bool) error {
 		return err
 	}
 	st.pageCount = write.pageCount
+	st.budget.record(write)
 	st.freePages = write.freeRemaining
 	snap.demoteCleanLeaves()
 	return st.maybeCompact(snap, write.rootPage, write.pages, canReclaim)
+}
+
+// attachmentBudget is the budget context of in-memory attachment name's commit (memory.md §8.3), or
+// nil when it has no published root. Its committed root and the watermark are read before the commit
+// packs: the forced compaction rebuilds the free list from that root.
+func (c *sharedCore) attachmentBudget(name string, stagesRows bool) *budgetCtx {
+	prev := c.roots.Load().attached[name]
+	if prev == nil {
+		return nil
+	}
+	return &budgetCtx{name: name, prev: prev, canCompact: c.canCompactCommitted(), stagesRows: stagesRows}
+}
+
+// withStorage resolves the storage of database name (`main` or an attachment, case-insensitive;
+// 42704 otherwise — the session-local temp domain is not an attachment).
+func (c *sharedCore) withStorage(name string) (*storage, error) {
+	lname := strings.ToLower(name)
+	if lname == "main" {
+		return c.storage, nil
+	}
+	if lname != "temp" {
+		if att := c.attachment(lname); att != nil {
+			return att.storage, nil
+		}
+	}
+	return nil, newError(UndefinedObject, `database "`+name+`" is not attached`)
+}
+
+// committedVersion is the current published committed version (the monotonic commit counter).
+func (c *sharedCore) committedVersion() uint64 { return c.roots.Load().committed.txid }
+
+// canCompactCommitted reports whether the committed snapshots may be compacted now (memory.md §8.3):
+// no live reader pins a version older than the currently committed one. A reader AT that version keeps
+// every page the compaction keeps; one pinned earlier could still fault a page it would free.
+func (c *sharedCore) canCompactCommitted() bool {
+	committed := c.committedVersion()
+	c.liveMu.Lock()
+	defer c.liveMu.Unlock()
+	for v := range c.live {
+		if v < committed {
+			return false
+		}
+	}
+	return true
+}
+
+// precheckBudgets checks every limited in-memory domain of a multi-root commit before any domain
+// writes a page (memory.md §8.3): attachments commit before main, so a later domain's 54P06 must not
+// follow an earlier domain's pack and compaction. main is the working main snapshot (persisted at
+// publish, whether or not it is dirty) and mainTxid the version publish will give it; attached the
+// dirtied attachments' working snapshots.
+func (c *sharedCore) precheckBudgets(main *snapshot, mainTxid uint64, mainStagesRows bool, attached []budgetDomain) error {
+	canCompact := c.canCompactCommitted()
+	// By name, so which domain a 54P06 names never depends on map iteration order.
+	sort.Slice(attached, func(i, j int) bool { return attached[i].name < attached[j].name })
+	for _, d := range attached {
+		prev := c.roots.Load().attached[d.name]
+		att := c.attachment(d.name)
+		if prev == nil || att == nil {
+			continue
+		}
+		budget := &budgetCtx{name: d.name, prev: prev, canCompact: canCompact, stagesRows: d.snap.stagedBytes() != 0}
+		if err := att.storage.precheckBudget(d.snap, true, budget); err != nil {
+			return err
+		}
+	}
+	oldest := c.oldestLiveVersion(mainTxid)
+	c.storage.mu.Lock()
+	canReuse := oldest >= c.storage.freeGenTxid
+	c.storage.mu.Unlock()
+	budget := &budgetCtx{name: "main", prev: c.roots.Load().committed, canCompact: canCompact, stagesRows: mainStagesRows}
+	return c.storage.precheckBudget(main, canReuse, budget)
 }
 
 // readOnlyMode reports whether this core is a read-only file-backed database (a write is 25006).
@@ -937,6 +1182,7 @@ type AttachSource struct {
 	path              string // the file path, when file is true
 	locking           Locking
 	fileLockTimeoutMs *uint64
+	maxStorageBytes   int64 // the in-memory attachment's committed-storage limit (memory.md §8.1); <= 0 is unlimited
 }
 
 // AttachFileOptions controls one file attachment's independent coordination domain.
@@ -958,6 +1204,14 @@ func AttachFile(path string) AttachSource { return AttachFileWithOptions(path, A
 // AttachFileWithOptions returns a coordinated file attachment source with explicit lock settings.
 func AttachFileWithOptions(path string, opts AttachFileOptions) AttachSource {
 	return AttachSource{file: true, path: path, locking: opts.Locking, fileLockTimeoutMs: opts.FileLockTimeoutMs}
+}
+
+// WithMaxStorageBytes returns the source with an in-memory attachment's committed-storage limit set to
+// bytes (spec/design/memory.md §8.1); zero or negative is unlimited. A positive limit on a file source
+// is 0A000 at attach.
+func (s AttachSource) WithMaxStorageBytes(bytes int64) AttachSource {
+	s.maxStorageBytes = bytes
+	return s
 }
 
 // CreateOptions are the settings for creating a fresh database (spec/design/api.md §2.1). Path
@@ -982,6 +1236,11 @@ type CreateOptions struct {
 	// session. nil ⇒ no extensions. Not stored in the file — a host reopens with its own registry
 	// (the ephemeral, no-persisted-use rule of §14 step 3).
 	Extensions *ExtensionRegistry
+	// MaxStorageBytes is the committed-storage limit of an IN-MEMORY database in bytes
+	// (spec/design/memory.md §8): a commit that would raise pageCount × pageSize past it fails 54P06.
+	// Zero or negative is unlimited (the default). Not stored anywhere; Database.SetMaxStorageBytes
+	// changes it. A positive value with a Path is 0A000 (the file form is deferred, memory.md §8.7).
+	MaxStorageBytes int64
 }
 
 // CreateDatabase makes a fresh database — in-memory (opts.Path == "") or file-backed (opts.Path set)
@@ -997,7 +1256,11 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 	if opts.Path == "" {
 		db := newInMemoryWithPageSize(pageSize)
 		db.core.extensions = opts.Extensions // frozen at create, shared into every session (§7)
+		db.core.storage.budget.limit = opts.MaxStorageBytes
 		return db, nil
+	}
+	if opts.MaxStorageBytes > 0 {
+		return nil, errFileStorageLimit()
 	}
 	coordinator, path, err := prepareCreateCoordinator(opts.Path, opts.Locking, opts.FileLockTimeoutMs)
 	if err != nil {
@@ -1098,6 +1361,35 @@ func (s *Database) OldestLiveTxid() uint64 {
 	return oldest
 }
 
+// SetMaxStorageBytes sets the committed-storage limit of database name — `main` or an attachment — in
+// bytes (spec/design/memory.md §8.1); zero or negative is unlimited. Shared by every session on the
+// handle and checked at each later commit. A positive limit on a file-backed database is 0A000; a name
+// that is not attached is 42704.
+func (db *Database) SetMaxStorageBytes(name string, bytes int64) error {
+	st, err := db.core.withStorage(name)
+	if err != nil {
+		return err
+	}
+	if st.path != "" && bytes > 0 {
+		return errFileStorageLimit()
+	}
+	st.mu.Lock()
+	st.budget.limit = bytes
+	st.mu.Unlock()
+	return nil
+}
+
+// StorageBytes is the committed storage of database name — `main` or an attachment — in bytes: its
+// logical page high-water times its page size (spec/design/memory.md §8.2/§8.6). Deterministic; not
+// RSS. A name that is not attached is 42704.
+func (db *Database) StorageBytes(name string) (int64, error) {
+	st, err := db.core.withStorage(name)
+	if err != nil {
+		return 0, err
+	}
+	return st.storageBytes(), nil
+}
+
 // Attach adds a database named `name` to this handle, reachable by the database qualifier `name.table`
 // (spec/design/attached-databases.md §4). Attaching is a HOST-API act, never SQL — an untrusted,
 // SQL-only session cannot attach anything (the pure-SQL safety spine, §4/§13). `source` is either
@@ -1112,6 +1404,9 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 	lname := strings.ToLower(name)
 	if lname == "" {
 		return newError(DuplicateObject, "attachment name must not be empty")
+	}
+	if source.file && source.maxStorageBytes > 0 {
+		return errFileStorageLimit()
 	}
 	// Open a file source BEFORE taking the writer gate (an open may block on I/O and can fail): a
 	// standalone engine over the file, whose committed snapshot + storage identity become the attachment.
@@ -1182,6 +1477,7 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 		// A fresh in-memory attachment: an empty root whose NEW stores attach to its own paging (the same
 		// seam session-local temp uses — a snapshot's storePaging is "the paging new stores bind to").
 		st = newAttachedStorage(c.pageSize())
+		st.budget.limit = source.maxStorageBytes
 		empty := newSnapshot()
 		empty.storePaging = st.paging
 		root = empty
@@ -1833,7 +2129,7 @@ func (s *Session) publish() error {
 	}
 	snap := s.engine.committed
 	snap.txid = s.baseVersion + 1 // advance the shared version on every commit
-	if err := s.core.persist(snap); err != nil {
+	if err := s.core.persist(snap, s.engine.commitStagesRows); err != nil {
 		return err // durable before publish; nothing is stored on failure
 	}
 	if afterPersistHook != nil { // test seam (nil in production): the persist→publish window, where a
@@ -2044,6 +2340,7 @@ func (s *Session) SetDefaultCollation(name string) error {
 	s.refreshCommitted()
 	err := s.engine.SetDefaultCollation(name)
 	if err == nil {
+		s.engine.commitStagesRows = false // a catalog-only change stages no record version (memory.md §8.3)
 		err = s.publish()
 	}
 	s.core.releaseWriter()
@@ -2151,6 +2448,10 @@ func (s *Session) UpgradeCollations() (int, error) {
 	s.refreshCommitted()
 	n, err := s.engine.UpgradeCollations()
 	if err == nil && n > 0 {
+		// The rebuilt keys are this commit's staged writes: they decide the storage budget's repair
+		// exemption and are no longer pending once published (memory.md §7/§8.3).
+		s.engine.commitStagesRows = s.engine.committed.stagedBytes() != 0
+		s.engine.committed.clearStaged()
 		err = s.publish()
 	}
 	s.core.releaseWriter()

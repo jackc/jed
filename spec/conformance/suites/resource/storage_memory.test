@@ -1,0 +1,191 @@
+# Committed storage (memory.md §8, Q4a): a database-owned max_storage_bytes limits an in-memory
+# database's page_count × page_size. A commit that would raise the high-water past the limit first
+# compacts the committed snapshot, then fails 54P06 and commits nothing. A commit that does not raise
+# the high-water, or that stages no record version and does not grow the catalog (pure deletes and
+# drops), is admitted — so a full database can always be repaired. A jed-specific resource contract,
+# not a PostgreSQL limit. The limit is a file-level ACTION (`# max_storage_bytes: N [database]`) set on
+# the handle from that point on. Pages are 8192 bytes; a t row holds a 1000-byte value, so a batch of
+# ten rows fills about one and a half leaves.
+# skip: disk — max_storage_bytes applies only to in-memory databases
+# attach: aux
+# requires: harness.attach, attach.in_memory, query.qualified_table, txn.explicit, query.select, query.aggregates, query.set_returning, ddl.create_table, ddl.drop_table, ddl.temp_table, dml.insert, dml.insert_select, dml.delete, types.text, resource.storage_memory
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v text)
+
+# Twenty pages.
+# max_storage_bytes: 163840
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(0, 9) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(10, 19) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(20, 29) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(30, 39) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(40, 49) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(50, 59) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(60, 69) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(70, 79) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(80, 89) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(90, 99) g
+
+# The eleventh batch cannot fit even after compaction: the autocommit write commits nothing.
+statement error 54P06
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(100, 109) g
+
+query I nosort
+SELECT count(*) FROM t
+----
+100
+
+# An explicit block stages freely; its COMMIT fails and ends the transaction rolled back.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(100, 109) g
+
+statement error 54P06
+COMMIT
+
+query I nosort
+SELECT count(*) FROM t
+----
+100
+
+# A pure delete is admitted at the limit (the repair exemption).
+statement ok
+DELETE FROM t WHERE id >= 50
+
+query I nosort
+SELECT count(*) FROM t
+----
+50
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(50, 59) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(60, 69) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(70, 79) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(80, 89) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(90, 99) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(100, 109) g
+
+statement error 54P06
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(110, 119) g
+
+# Unlimited again: the same batch commits.
+# max_storage_bytes: 0
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(110, 119) g
+
+# An attached in-memory database has its own limit, independent of main's (six pages).
+# max_storage_bytes: 49152 aux
+
+statement ok
+CREATE TABLE aux.a (id i32 PRIMARY KEY, v text)
+
+statement ok
+INSERT INTO aux.a SELECT g, repeat('y', 1000) FROM generate_series(1, 5) g
+
+statement error 54P06
+INSERT INTO aux.a SELECT g, repeat('y', 1000) FROM generate_series(6, 20) g
+
+# A multi-root commit rejected in the attachment publishes neither database.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (1000, 'z')
+
+statement ok
+INSERT INTO aux.a SELECT g, repeat('y', 1000) FROM generate_series(6, 20) g
+
+statement error 54P06
+COMMIT
+
+query II nosort
+SELECT (SELECT count(*) FROM t), (SELECT count(*) FROM aux.a)
+----
+120
+5
+
+# Main's limit is checked before the attachment packs, too. A limit below main's current size still
+# admits commits that fit in its free pages; this one needs fresh pages.
+# max_storage_bytes: 0 aux
+
+# max_storage_bytes: 8192
+
+statement ok
+INSERT INTO t VALUES (2000, 'fits in free pages')
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO aux.a VALUES (6, 'w')
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(1000, 1199) g
+
+statement error 54P06
+COMMIT
+
+query II nosort
+SELECT (SELECT count(*) FROM t), (SELECT count(*) FROM aux.a)
+----
+121
+5
+
+# Session temp changes in the same transaction are discarded with it: main is checked before the
+# temp domain packs.
+statement ok
+CREATE TEMP TABLE scratch (id i32)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO scratch VALUES (1)
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(1000, 1199) g
+
+statement error 54P06
+COMMIT
+
+query I nosort
+SELECT count(*) FROM scratch
+----
+0
+
+# Dropping a table stages nothing and shrinks the catalog: admitted over the limit.
+statement ok
+DROP TABLE t

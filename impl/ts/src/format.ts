@@ -39,6 +39,7 @@ import { parseExpression } from "./parser.ts";
 import { type Collation, loadedCollation } from "./collation.ts";
 import { Decimal } from "./decimal.ts";
 import { crc32Update } from "./crc32.ts";
+import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "./costs.ts";
 import {
   type CommitManifest,
   type CommitMeta,
@@ -2699,6 +2700,32 @@ export function reachablePages(snap: Snapshot, paging: SharedPaging, catRoot: nu
   return reached;
 }
 
+// catalogPageCount is how many of pages are catalog pages (memory.md §8.3's repair exemption compares
+// a commit's rewritten catalog with the last one's).
+export function catalogPageCount(pages: { index: number; bytes: Uint8Array }[]): number {
+  let n = 0;
+  for (const pg of pages) if (pg.bytes[0] === PAGE_CATALOG) n++;
+  return n;
+}
+
+// unassignPages undoes incrementalImage's page assignment for a plan that will not be written, so the
+// snapshot can be planned again (memory.md §8.3). pages is the discarded plan's writes.
+export function unassignPages(snap: Snapshot, pages: { index: number; bytes: Uint8Array }[]): void {
+  const assigned = new Set<number>();
+  for (const pg of pages) assigned.add(pg.index);
+  for (const st of snap.stores.values()) unassignTreePages(st.treeRoot(), assigned);
+  for (const ist of snap.indexStores.values()) unassignTreePages(ist.treeRoot(), assigned);
+}
+
+// unassignTreePages clears the page ids a discarded plan assigned: a node whose id is in assigned was
+// dirty before the plan, so it returns to page 0 and its resident children are visited; a node with
+// any other id is clean and its subtree untouched.
+function unassignTreePages(n: PNode | null, assigned: Set<number>): void {
+  if (n === null || n.page === 0 || !assigned.has(n.page)) return;
+  n.page = 0;
+  for (const c of n.children) if (c.node !== null) unassignTreePages(c.node, assigned);
+}
+
 // collectTreePages adds every node page of a resident B+tree to reached: an interior/leaf node's own
 // set-once page, and each OnDisk child leaf's page (walked without faulting it — the page id is on the
 // child ref). A page-0 node is a dirty node not yet persisted (never on a committed tree at compaction
@@ -2843,13 +2870,13 @@ export function planFreeList(
   newGen: bigint;
   manifestIds: number[];
 } {
-  const MIN_COMPACT_PAGES = 16; // don't churn a tiny store
   // liveAtCompaction=0 is the shared-mode orphan sentinel: a co-resident commit deliberately
   // persisted no reusable free list, so the first proven-alone commit must reconstruct regardless
-  // of the ordinary periodic threshold.
+  // of the ordinary periodic threshold. The trigger constants are shared data (memory.md §8.4).
   const compact =
     canReclaim &&
-    (liveAtCompaction === 0 || (pageCount > MIN_COMPACT_PAGES && pageCount > 2 * liveAtCompaction));
+    (liveAtCompaction === 0 ||
+      (pageCount > COMPACT_MIN_PAGES && pageCount > COMPACT_GROWTH * liveAtCompaction));
   let persistList = freeRemaining;
   let newLive = liveAtCompaction;
   let newGen = genTxid;

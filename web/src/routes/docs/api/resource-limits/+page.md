@@ -4,7 +4,7 @@
 
 <svelte:head>
 	<title>Resource limits — jed</title>
-	<meta name="description" content="Bound what an untrusted jed query can consume: a per-statement cost ceiling (max_cost, 54P01), a per-session cumulative cost budget (lifetime_max_cost, 54P02), and scalar and query-memory budgets (54P04, 54P05)." />
+	<meta name="description" content="Bound what an untrusted jed query can consume: a per-statement cost ceiling (max_cost, 54P01), a per-session cumulative cost budget (lifetime_max_cost, 54P02), scalar and query-memory budgets (54P04, 54P05), and an in-memory storage limit (54P06)." />
 </svelte:head>
 
 # Resource limits
@@ -12,8 +12,9 @@
 jed meters the **execution cost** of every query deterministically — the same query against the same
 database always costs the same, on every core. Cost ceilings bound metered work; a separate
 scalar allocation budget rejects large repeat/padding results and decimal scratch allocations
-before construction; and an opt-in query-memory budget bounds the rows a statement holds at
-once. These are independent limits, with the coverage described below.
+before construction; an opt-in query-memory budget bounds the rows a statement holds at
+once; and an opt-in storage limit bounds how much an in-memory database keeps. These are
+independent limits, with the coverage described below.
 
 ## Two ceilings
 
@@ -83,13 +84,36 @@ every statement they must still fit, so a long transaction of many small `INSERT
 much a transaction writes, not how much it ends up holding. Temporary tables are bounded by
 `temp_buffers` instead.
 
+## Storage limit
+
+`max_storage_bytes` bounds how much an **in-memory database keeps** once its transactions commit —
+the one thing the per-statement and per-transaction budgets cannot see, since many small committed
+transactions each fit them. It belongs to the database rather than to a session, so every session
+shares it. Set it when you create an in-memory database (`max_storage_bytes` / `MaxStorageBytes` /
+`maxStorageBytes` in the create options), on an in-memory attachment's source, or later with
+`set_max_storage_bytes(name, bytes)` / `SetMaxStorageBytes(name, bytes)` /
+`setMaxStorageBytes(name, bytes)`, where `name` is `main` or an attachment. It is **unlimited by
+default**; non-positive values restore unlimited. A file-backed database rejects a limit with `0A000`.
+
+The limit counts the database's pages: its page high-water times its page size, which the
+`storage_bytes(name)` / `StorageBytes(name)` / `storageBytes(name)` gauge reports. A commit that would
+raise it past the limit fails with **`54P06`** and commits nothing, after first reclaiming any dead
+pages. jed keeps freed pages for reuse and reclaims them in batches, so a database under a limit of
+B bytes reliably holds about B/2 bytes of live pages and may hold up to B. A commit that fits in
+freed pages always succeeds, even when a lowered limit is already below the current size, and so
+does a commit that only deletes rows or drops objects, so a full database can always be cleaned
+up. A read session that predates the last commit can keep dead pages from being reclaimed; closing
+it frees them for the next commit.
+
 ## Memory coverage
 
 These budgets are **guardrails, not a process-memory cap**. The query-memory budget covers row
 buffers and operator state: hash-join tables, group, `DISTINCT`, and set-operation tables,
 `json_agg`-style and ordered-set accumulators, window partitions, sort buffers and top-k heaps,
-the resident part of spilling operators, and the writes pending in an open transaction. Still
-uncovered: page caches and scalar kernels beyond the ones listed above. On native file hosts,
+the resident part of spilling operators, and the writes pending in an open transaction. The
+storage limit covers an in-memory database's committed pages. A file-backed database's page cache
+is bounded by its `cache_bytes` open option, which evicts pages and never fails a query. Still
+uncovered: a size cap for file-backed databases and scalar kernels beyond the ones listed above. On native file hosts,
 sort, hash JOIN, aggregation, and DISTINCT spill when they exceed `work_mem` — and also when the
 query-memory budget would otherwise reject them, so a large sort or aggregate spills rather than
 fails and releases its charge as it spills. Row buffers that cannot spill, such as a derived

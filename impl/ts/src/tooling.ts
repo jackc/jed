@@ -46,15 +46,21 @@ export {
 // actually use (CLAUDE.md §10: tests assert on the real `query` seam, not a parallel exec path). A
 // cursor carrying output columns is a query; a no-column cursor IS a non-query statement (the total-
 // `query` contract). Cost + rows-affected are read after the drain (a streaming cursor accrues cost as
-// it is pulled), and the pin is released via close().
+// it is pulled), and the pin is released via close() — on a mid-drain error too, so a failed read
+// never leaves a reader pinned in the watermark (JS has no destructor to release it later).
 export function drainOutcome(rows: Rows): Outcome {
   const columnNames = rows.columnNames;
   const columnTypes = rows.columnTypes;
   const collected: Value[][] = [];
-  for (const row of rows) collected.push(row);
-  const cost = rows.cost;
-  const rowsAffected = rows.rowsAffected;
-  rows.close();
+  let cost: bigint;
+  let rowsAffected: number | null;
+  try {
+    for (const row of rows) collected.push(row);
+    cost = rows.cost;
+    rowsAffected = rows.rowsAffected;
+  } finally {
+    rows.close();
+  }
   if (columnNames.length > 0) {
     return { kind: "query", columnNames, columnTypes, rows: collected, cost };
   }

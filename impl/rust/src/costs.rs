@@ -14,6 +14,10 @@ pub const MEMORY_ARRAY_DIM: i64 = 16;
 pub const MEMORY_DECIMAL_GROUP: i64 = 4;
 pub const MEMORY_ENTRY: i64 = 32;
 
+/// Within-session compaction trigger (spec/design/memory.md §8.4).
+pub const COMPACT_MIN_PAGES: u32 = 16;
+pub const COMPACT_GROWTH: u64 = 2;
+
 /// The deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
 pub struct CostSchedule {
     pub storage_row_read: i64,

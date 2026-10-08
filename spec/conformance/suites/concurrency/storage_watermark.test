@@ -1,0 +1,68 @@
+# A pinned reader holds back the committed-storage limit's forced compaction (memory.md §8.3/§8.4).
+# A commit that would raise an in-memory database past max_storage_bytes first compacts the committed
+# snapshot — but only when no live reader pins a version older than the committed one, since that
+# reader could still fault a page the compaction would free. Deterministic on every core: which
+# versions are pinned is fixed by the schedule. Twenty 8192-byte pages; a t row holds a 1000-byte
+# value.
+# format: concurrency
+# max_storage_bytes: 163840
+# requires: txn.shared, txn.read_handle, txn.watermark, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_select, dml.delete, query.select, query.aggregates, query.set_returning, types.text, resource.storage_memory
+
+open w write
+on w statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v text)
+on w statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(0, 9) g
+on w statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(10, 19) g
+on w statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(20, 29) g
+on w statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(30, 39) g
+on w statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(40, 49) g
+on w statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(50, 59) g
+on w statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(60, 69) g
+on w statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(70, 79) g
+on w statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(80, 89) g
+on w statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(90, 99) g
+commit w
+
+# r pins the full database's version; the delete is admitted over the limit (it stages nothing).
+open r read
+open w2 write
+on w2 statement ok
+DELETE FROM t WHERE id >= 50
+commit w2
+
+# The delete's orphans are reclaimable only by compacting past r's version: the insert is refused.
+open w3 write
+on w3 statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(50, 59) g
+on w3 statement error 54P06
+COMMIT
+rollback w3
+
+on r query I nosort
+SELECT count(*) FROM t
+----
+100
+
+# Once r closes, the same insert compacts and fits.
+close r
+open w4 write
+on w4 statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(50, 59) g
+commit w4
+
+open r2 read
+on r2 query I nosort
+SELECT count(*) FROM t
+----
+60
+close r2

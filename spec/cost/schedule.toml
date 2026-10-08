@@ -30,6 +30,16 @@ decimal_group = 4
 # One hash/dedup/group/state-map entry's fixed overhead (memory.md §6.1, Q2 operator state).
 entry = 32
 
+# Within-session compaction trigger for never-reopened in-RAM stores (in-memory databases and
+# attachments, session temp domains) and the in-commit file reclamation (format.md *Reclamation*;
+# temp-tables.md §6). A store's page_count is observable through the deterministic storage budgets
+# (temp_buffers 54P03, max_storage_bytes 54P06 — memory.md §8.4), so the schedule is shared data:
+# compaction runs once page_count > compact_min_pages and page_count > compact_growth × the live
+# page count at the last compaction.
+[reclamation]
+compact_min_pages = 16
+compact_growth = 2
+
 # field doc -------------------------------------------------------------------
 # id      stable snake_case unit name; the codegen handle (a named field on the
 #         per-language CostSchedule).

@@ -88,6 +88,11 @@ watermark are asserted over an attachment exactly as over main (Slice 1b-3). Gat
 `harness.attach` + `attach.in_memory`, so a core that has not wired the directive into its
 concurrency runner skips the file before parsing (§4.4).
 
+A concurrency file may likewise carry **`# max_storage_bytes: N [database]`** (memory.md §8.1),
+applied to the shared handle when it is built, after the `# attach:` directives and in file order. It
+is how a schedule pins the reader watermark's hold on the committed-storage limit's forced compaction
+(`storage_watermark.test`). Gated by `resource.storage_memory`.
+
 ### 4.1 Directives
 
 Operations are scoped to a named **session**; control and assertion directives are new.

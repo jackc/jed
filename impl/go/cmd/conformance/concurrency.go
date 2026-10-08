@@ -40,37 +40,49 @@ func memDB() *jed.Database {
 	return db
 }
 
-// scheduleDB builds the shared handle a schedule runs against, attaching a fresh empty read-write
-// in-memory database for each name (spec/design/attached-databases.md §6, the file-level `# attach:`
-// directive — the same host-API action the sequential runner applies, gated by harness.attach). The
-// attachments are Database-scoped, so every session the schedule opens sees them (a reader pins the
-// whole roots — main + attached — in one lock-free Load, §5); this is what lets a schedule assert
-// cross-database snapshot isolation and the watermark over an attachment. Attaching is host-API, never
-// SQL, so it happens here before any session opens, not as a schedule step.
-func scheduleDB(attaches []string) *jed.Database {
+// scheduleDB builds the shared handle a schedule runs against, applying the file's handle-setup
+// directives in file order (parseAttaches): each `# attach: <name>` attaches a fresh empty read-write
+// in-memory database (spec/design/attached-databases.md §6 — the same host-API action the sequential
+// runner applies, gated by harness.attach), and each `# max_storage_bytes: N [database]` sets that
+// database's committed-storage limit (memory.md §8.1). The attachments are Database-scoped, so every
+// session the schedule opens sees them (a reader pins the whole roots — main + attached — in one
+// lock-free Load, §5); this is what lets a schedule assert cross-database snapshot isolation and the
+// watermark over an attachment. Attaching is host-API, never SQL, so it happens here before any
+// session opens, not as a schedule step.
+func scheduleDB(header []string) *jed.Database {
 	db := memDB()
-	for _, name := range attaches {
-		if err := db.Attach(name, jed.AttachMemory(), false); err != nil {
-			panic("concurrency # attach: " + name + ": " + err.Error())
+	for _, line := range header {
+		if name, ok := parseAttachDirective(line); ok {
+			if err := db.Attach(name, jed.AttachMemory(), false); err != nil {
+				panic("concurrency # attach: " + name + ": " + err.Error())
+			}
+		} else if bytes, name, ok := parseMaxStorageBytesDirective(line); ok {
+			if err := db.SetMaxStorageBytes(name, bytes); err != nil {
+				panic("concurrency # max_storage_bytes: " + name + ": " + err.Error())
+			}
 		}
 	}
 	return db
 }
 
-// parseAttaches collects every file-level `# attach: <name>` directive in a concurrency file, in
-// order — the databases to attach to the shared handle before the schedule runs.
+// parseAttaches collects a concurrency file's handle-setup directives, in order — each `# attach:
+// <name>` (a database to attach) and `# max_storage_bytes: N [database]` (a committed-storage limit,
+// memory.md §8.1) — applied to the shared handle before the schedule runs. Reuses the sequential
+// runner's parsers, so both runners honor the directives identically (attached-databases.md §6).
 func parseAttaches(text string) []string {
-	var names []string
+	var header []string
 	for _, line := range strings.Split(text, "\n") {
 		t := strings.TrimSpace(line)
 		if !strings.HasPrefix(t, "#") {
 			continue
 		}
-		if name, ok := parseAttachDirective(t); ok {
-			names = append(names, name)
+		_, isAttach := parseAttachDirective(t)
+		_, _, isLimit := parseMaxStorageBytesDirective(t)
+		if isAttach || isLimit {
+			header = append(header, t)
 		}
 	}
-	return names
+	return header
 }
 
 // isConcurrencyFormat reports whether text opts into the schedule format via a
@@ -382,8 +394,8 @@ func runConcurrencyFile(text string) error {
 // instant the holder commits/rolls back. That is the equivalent serial order, identical to what a
 // threaded run consistent with the schedule must produce. `gateHolder` is the live writer's sid (the
 // single-writer gate), and `blockedSid` is the at-most-one writer queued on it.
-func runScheduleSequential(steps []cStep, attaches []string) error {
-	db := scheduleDB(attaches)
+func runScheduleSequential(steps []cStep, header []string) error {
+	db := scheduleDB(header)
 	sessions := map[string]*cSession{}
 	gateHolder := "" // the live writer holding the single-writer gate, "" if free
 	blockedSid := "" // a writer queued on the gate (Layer 2 `blocks`), "" if none

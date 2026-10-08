@@ -1706,6 +1706,48 @@ func (s *snapshot) reachablePages(paging *sharedPaging, catRoot uint32) (map[uin
 	return reached, nil
 }
 
+// catalogPageCount is how many of pages are catalog pages (memory.md §8.3's repair exemption compares
+// a commit's rewritten catalog with the last one's).
+func catalogPageCount(pages []dirtyPage) int {
+	n := 0
+	for _, pg := range pages {
+		if len(pg.bytes) > 0 && pg.bytes[0] == pageCatalog {
+			n++
+		}
+	}
+	return n
+}
+
+// unassignPages undoes incrementalImage's page assignment for a plan that will not be written, so the
+// snapshot can be planned again (memory.md §8.3). pages is the discarded plan's writes.
+func (s *snapshot) unassignPages(pages []dirtyPage) {
+	assigned := make(map[uint32]bool, len(pages))
+	for _, pg := range pages {
+		assigned[pg.index] = true
+	}
+	for _, st := range s.stores {
+		unassignTreePages(st.treeRoot(), assigned)
+	}
+	for _, ist := range s.indexStores {
+		unassignTreePages(ist.treeRoot(), assigned)
+	}
+}
+
+// unassignTreePages clears the page ids a discarded incremental plan assigned: a node whose id is in
+// assigned was dirty before the plan, so it returns to page 0 and its resident children are visited; a
+// node with any other id is clean and its subtree untouched.
+func unassignTreePages(n *pnode, assigned map[uint32]bool) {
+	if n == nil || n.page == 0 || !assigned[n.page] {
+		return
+	}
+	n.page = 0
+	for _, c := range n.children {
+		if c.node != nil {
+			unassignTreePages(c.node, assigned)
+		}
+	}
+}
+
 // collectTreePages adds every node page of a resident B+tree to reached: an interior/leaf node's own
 // set-once page, and each OnDisk child leaf's page (walked without faulting it — the page id is on the
 // childRef). A page-0 node is a dirty node not yet persisted (never on a committed tree at compaction
@@ -1859,10 +1901,10 @@ func serializeFreeList(persist, safe []uint32, cap, ps int, next uint32) ([]dirt
 // manifest allocator reserves any pages. Current body writes include transaction
 // orphans and remain protected even when they are unreachable from the new root.
 func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot uint32, written []dirtyPage, freeRemaining []uint32, pageCount, liveAtCompaction uint32, genTxid uint64, canReclaim bool) ([]uint32, uint32, uint64, error) {
-	const minCompactPages = 16 // don't churn a tiny store
 	// liveAtCompaction==0 is the shared-file handoff sentinel: reconstruct on the first proven-alone
-	// commit even when the file is still below the ordinary amortization threshold.
-	compact := canReclaim && (liveAtCompaction == 0 || (pageCount > minCompactPages && uint64(pageCount) > 2*uint64(liveAtCompaction)))
+	// commit even when the file is still below the ordinary amortization threshold. The trigger
+	// constants are shared data (memory.md §8.4).
+	compact := canReclaim && (liveAtCompaction == 0 || (pageCount > compactMinPages && uint64(pageCount) > compactGrowth*uint64(liveAtCompaction)))
 	persistList := freeRemaining
 	newLive := liveAtCompaction
 	newGen := genTxid

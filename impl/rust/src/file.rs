@@ -73,6 +73,11 @@ pub struct CreateOptions {
     /// session. Default empty (no extensions). Not stored in the file — a host reopens with its own
     /// registry (the ephemeral, no-persisted-use rule of §14 step 3).
     pub extensions: Arc<ExtensionRegistry>,
+    /// The committed-storage limit of an **in-memory** database in bytes (spec/design/memory.md §8):
+    /// a commit that would raise `page_count × page_size` past it fails `54P06`. Zero or negative is
+    /// unlimited (the default). Not stored anywhere; [`Database::set_max_storage_bytes`] changes it.
+    /// A positive value with a `path` is `0A000` (the file form is deferred, memory.md §8.7).
+    pub max_storage_bytes: i64,
 }
 
 impl Default for CreateOptions {
@@ -84,6 +89,7 @@ impl Default for CreateOptions {
             locking: Locking::Auto,
             file_lock_timeout_ms: DEFAULT_FILE_LOCK_TIMEOUT_MS,
             extensions: Arc::new(ExtensionRegistry::default()),
+            max_storage_bytes: 0,
         }
     }
 }

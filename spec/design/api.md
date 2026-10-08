@@ -1102,3 +1102,21 @@ statement that opened it; the engine-owned materializing helpers (Rust
 `query_rows`, TypeScript `Statement.all()`) admit every row they collect against
 it, while rows a host pulls one at a time from a cursor — including through Go's
 iterators — are the host's memory.
+
+### Committed storage setting
+
+`max_storage_bytes` limits an **in-memory** database's committed storage, measured
+as its logical page high-water times its page size (memory.md §8). It belongs to
+the database, not a session: set it with `CreateOptions { max_storage_bytes }`
+(Rust i64) / `CreateOptions.MaxStorageBytes` (Go int64) / `maxStorageBytes` (TS)
+on an in-memory `create`, with the in-memory attach source's option (Rust
+`AttachSource::memory().max_storage_bytes(n)` and its Go/TS equivalents), or later
+with `set_max_storage_bytes(name, n)` / `SetMaxStorageBytes` / `setMaxStorageBytes`,
+where `name` is `main` or an attachment. Every session on the handle shares it. The
+read-only gauge `storage_bytes(name)` / `StorageBytes` / `storageBytes` reports the
+measure for any backing. Default: **unlimited**; non-positive restores it. A positive
+limit on a file-backed database or file attachment is `0A000`; a name that is not
+attached is `42704`. A commit that would raise the high-water past the limit fails
+`54P06` and commits nothing, after one forced compaction; commits that fit in free
+pages, and pure deletes and drops, are always admitted. Not persisted, not
+transactional, and not reachable from SQL.

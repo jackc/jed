@@ -37,12 +37,15 @@ thread_local! {
 /// Record the peak query-memory balance of record `ordinal` of the current file, when the peak mode
 /// is on. Every core writes the same `file<TAB>ordinal<TAB>peak` lines, so a diff of the three
 /// outputs is the cross-core check of every record's minimal passing budget (memory.md §8).
-fn record_peak(ordinal: usize) {
+/// Each line also carries the main database's committed storage after the record (memory.md §8.4):
+/// the cross-core check that in-memory page allocation and compaction agree record by record.
+fn record_peak(ordinal: usize, db: &Database) {
     use std::io::Write;
     PEAK_SINK.with(|sink| {
         if let Some((out, rel)) = sink.borrow_mut().as_mut() {
             let peak = jed::tooling::QUERY_MEMORY_PEAK.load(std::sync::atomic::Ordering::Relaxed);
-            writeln!(out, "{rel}\t{ordinal}\t{peak}").expect("write query-memory peaks");
+            let storage = db.storage_bytes("main").expect("main is always present");
+            writeln!(out, "{rel}\t{ordinal}\t{peak}\t{storage}").expect("write query-memory peaks");
         }
     });
 }
@@ -269,6 +272,17 @@ fn parse_attach_directive(rest: &str) -> Option<String> {
         return None;
     }
     Some(body.to_string())
+}
+
+/// Parse a `# max_storage_bytes: N [database]` directive (spec/design/memory.md §8.1): an ACTION that
+/// sets the committed-storage limit of `main` (or the named attachment) on the running handle from
+/// this point of the file on. In-memory backings only, so such files are `# skip: disk`.
+fn parse_max_storage_bytes_directive(rest: &str) -> Option<(i64, String)> {
+    let body = rest.trim_start().strip_prefix("max_storage_bytes:")?.trim();
+    let mut parts = body.split_whitespace();
+    let bytes = parts.next()?.parse().ok()?;
+    let name = parts.next().unwrap_or("main").to_string();
+    Some((bytes, name))
 }
 
 fn parse_fixture_directive(rest: &str) -> Option<String> {
@@ -721,6 +735,11 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                     .map_err(|e| format!("attach {name:?}: {}", e.message))?;
                 continue;
             }
+            if let Some((bytes, name)) = parse_max_storage_bytes_directive(rest) {
+                db.set_max_storage_bytes(&name, bytes)
+                    .map_err(|e| format!("max_storage_bytes {name:?}: {}", e.message))?;
+                continue;
+            }
             // `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh `Engine::new()`
             // above — appears in the header before any record (spec/design/conformance.md).
             if let Some(rel) = parse_fixture_directive(rest) {
@@ -980,7 +999,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
             }
             other => return Err(format!("unknown record kind '{other}'")),
         }
-        record_peak(record_ordinal);
+        record_peak(record_ordinal, &db);
         if jed::tooling::QUERY_MEMORY_UNDERFLOWS.load(std::sync::atomic::Ordering::Relaxed)
             != underflows_before
         {
@@ -1633,29 +1652,38 @@ fn end_session(kind: &str, sess: Session) -> Result<(), String> {
 /// attachment. Attaching is host-API, never SQL, so it happens here before any session opens, not as
 /// a schedule step. An attach failure is a corpus authoring error (a reserved/duplicate name), so it
 /// panics rather than threading an error out of every call site.
-fn schedule_db(attaches: &[String]) -> Database {
+fn schedule_db(header: &[String]) -> Database {
     let db = Database::create(CreateOptions::default()).unwrap();
-    for name in attaches {
-        db.attach(name, jed::AttachSource::memory(), false)
-            .unwrap_or_else(|e| panic!("concurrency # attach: {name}: {}", e.message));
+    for rest in header {
+        if let Some(name) = parse_attach_directive(rest) {
+            db.attach(&name, jed::AttachSource::memory(), false)
+                .unwrap_or_else(|e| panic!("concurrency # attach: {name}: {}", e.message));
+        } else if let Some((bytes, name)) = parse_max_storage_bytes_directive(rest) {
+            db.set_max_storage_bytes(&name, bytes).unwrap_or_else(|e| {
+                panic!("concurrency # max_storage_bytes: {name}: {}", e.message)
+            });
+        }
     }
     db
 }
 
-/// Collect every file-level `# attach: <name>` directive in a concurrency file, in order — the
-/// databases to attach to the shared handle before the schedule runs. Reuses the sequential runner's
-/// `parse_attach_directive`, so both runners honor the directive identically (attached-databases.md §6).
+/// Collect a concurrency file's handle-setup directives, in order — each `# attach: <name>` (a
+/// database to attach) and `# max_storage_bytes: N [database]` (a committed-storage limit, memory.md
+/// §8.1) — applied to the shared handle before the schedule runs. Reuses the sequential runner's
+/// parsers, so both runners honor the directives identically (attached-databases.md §6).
 fn parse_attaches(text: &str) -> Vec<String> {
-    let mut names = Vec::new();
+    let mut header = Vec::new();
     for line in text.lines() {
         let t = line.trim();
         if let Some(rest) = t.strip_prefix('#') {
-            if let Some(name) = parse_attach_directive(rest) {
-                names.push(name);
+            if parse_attach_directive(rest).is_some()
+                || parse_max_storage_bytes_directive(rest).is_some()
+            {
+                header.push(rest.to_string());
             }
         }
     }
-    names
+    header
 }
 
 /// Run one `# format: concurrency` file in the canonical stepped-SEQUENTIAL mode.

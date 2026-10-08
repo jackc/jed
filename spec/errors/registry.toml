@@ -690,6 +690,16 @@ name = "query_memory_limit_exceeded"
 class = "program limit exceeded"
 template = "query memory exceeded the limit of {limit} bytes"
 
+# Deterministic committed-storage admission (spec/design/memory.md §8, Q4a): a commit would raise an
+# in-memory database's (or in-memory attachment's) page high-water past the host-set
+# max_storage_bytes limit, even after a forced compaction. Checked before any page is written, so the
+# transaction commits nothing. Distinct from temp_buffers (54P03), which bounds session temp storage.
+[[error]]
+code = "54P06"
+name = "storage_limit_exceeded"
+class = "program limit exceeded"
+template = "storage of database \"{database}\" exceeded the limit of {limit} bytes"
+
 # --- invalid object state (class 55) ----------------------------------------
 # currval/lastval before nextval has defined the value in this session
 # (../design/sequences.md §6).

@@ -168,6 +168,8 @@ pub enum SqlState {
     ScalarMemoryLimitExceeded,
     /// 54P05 — query memory exceeded the limit of {limit} bytes
     QueryMemoryLimitExceeded,
+    /// 54P06 — storage of database "{database}" exceeded the limit of {limit} bytes
+    StorageLimitExceeded,
     /// 55000 — {detail}
     ObjectNotInPrerequisiteState,
     /// 55006 — {detail}
@@ -270,6 +272,7 @@ impl SqlState {
             SqlState::TempStorageLimitExceeded => "54P03",
             SqlState::ScalarMemoryLimitExceeded => "54P04",
             SqlState::QueryMemoryLimitExceeded => "54P05",
+            SqlState::StorageLimitExceeded => "54P06",
             SqlState::ObjectNotInPrerequisiteState => "55000",
             SqlState::ObjectInUse => "55006",
             SqlState::LockNotAvailable => "55P03",
@@ -373,6 +376,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "54P03", name: "temp_storage_limit_exceeded", class: "program limit exceeded" },
     ErrorDesc { code: "54P04", name: "scalar_memory_limit_exceeded", class: "program limit exceeded" },
     ErrorDesc { code: "54P05", name: "query_memory_limit_exceeded", class: "program limit exceeded" },
+    ErrorDesc { code: "54P06", name: "storage_limit_exceeded", class: "program limit exceeded" },
     ErrorDesc { code: "55000", name: "object_not_in_prerequisite_state", class: "object not in prerequisite state" },
     ErrorDesc { code: "55006", name: "object_in_use", class: "object not in prerequisite state" },
     ErrorDesc { code: "55P03", name: "lock_not_available", class: "object not in prerequisite state" },

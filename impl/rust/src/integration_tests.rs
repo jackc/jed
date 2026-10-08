@@ -206,6 +206,8 @@ mod index_dependencies;
 mod memory_sizes;
 #[path = "../tests/query_memory.rs"]
 mod query_memory;
+#[path = "../tests/storage_memory.rs"]
+mod storage_memory;
 
 #[path = "../tests/scalar_memory.rs"]
 mod scalar_memory;

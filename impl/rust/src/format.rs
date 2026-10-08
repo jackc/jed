@@ -2353,14 +2353,14 @@ pub(crate) fn plan_free_list(
     can_reclaim: bool,
     can_reuse: bool,
 ) -> Result<CommitPlan> {
-    const MIN_COMPACT_PAGES: u32 = 16; // don't churn a tiny store
+    use crate::costs::{COMPACT_GROWTH, COMPACT_MIN_PAGES}; // shared data (memory.md §8.4)
     // `live_at_compaction == 0` is the shared-file handoff sentinel: co-resident commits deliberately
     // persisted no free list, so the first proven-alone commit reconstructs immediately even for a
     // small file. Ordinary stores retain the amortized >16-page / >2× trigger.
     let compact = can_reclaim
         && (live_at_compaction == 0
-            || (page_count > MIN_COMPACT_PAGES
-                && (page_count as u64) > 2 * live_at_compaction as u64));
+            || (page_count > COMPACT_MIN_PAGES
+                && (page_count as u64) > COMPACT_GROWTH * live_at_compaction as u64));
     let (persist_list, new_live, new_gen) = if compact {
         let mut reached = reachable_pages(snap, paging, cat_root)?;
         for (index, _) in written {
@@ -2474,6 +2474,44 @@ pub(crate) fn plan_shared_commit(
 /// and each `OnDisk` child leaf's page (walked without faulting it — the page id is on the child). A
 /// page-0 node is a dirty node not yet persisted (never on a committed tree at compaction time); it is
 /// skipped so page 0 (a meta slot) is never marked.
+/// How many of `pages` are catalog pages (memory.md §8.3's repair exemption compares a commit's
+/// rewritten catalog with the last one's).
+pub(crate) fn catalog_page_count(pages: &[(u32, Vec<u8>)]) -> usize {
+    pages
+        .iter()
+        .filter(|(_, bytes)| bytes.first() == Some(&PAGE_CATALOG))
+        .count()
+}
+
+/// Clear the page ids a discarded incremental plan assigned (memory.md §8.3): a node whose id is in
+/// `assigned` was dirty before the plan, so it returns to page 0 and its resident children are
+/// visited; a node with any other id is clean and its subtree untouched.
+fn unassign_tree_pages(node: &Node, assigned: &HashSet<u32>) {
+    let page = node.page.load(std::sync::atomic::Ordering::Acquire);
+    if page == 0 || !assigned.contains(&page) {
+        return;
+    }
+    node.page.store(0, std::sync::atomic::Ordering::Release);
+    for child in &node.children {
+        if let Child::Resident(n) = child {
+            unassign_tree_pages(n, assigned);
+        }
+    }
+}
+
+impl Snapshot {
+    /// Undo [`Snapshot::incremental_image`]'s page assignment for a plan that will not be written,
+    /// so the snapshot can be planned again (memory.md §8.3). `pages` is the discarded plan's writes.
+    pub(crate) fn unassign_pages(&self, pages: &[(u32, Vec<u8>)]) {
+        let assigned: HashSet<u32> = pages.iter().map(|(index, _)| *index).collect();
+        for st in self.stores_iter().chain(self.index_stores_iter()) {
+            if let Some(root) = st.tree_root() {
+                unassign_tree_pages(root, &assigned);
+            }
+        }
+    }
+}
+
 fn collect_tree_pages(node: &Node, reached: &mut HashSet<u32>) {
     let page = node.page.load(std::sync::atomic::Ordering::Acquire);
     if page != 0 {

@@ -193,7 +193,12 @@ import {
   recordCompressUnits,
   typeCodeForScalar,
 } from "./format.ts";
-import { commitDurableAttachment, persistSharedBody, persistTemp } from "./persist.ts";
+import {
+  commitDurableAttachment,
+  persistSharedBody,
+  persistTemp,
+  type StorageBudget,
+} from "./persist.ts";
 import { Decimal, workLinear } from "./decimal.ts";
 import { encodeBool, encodeInt, encodeTerminated } from "./encoding.ts";
 import {
@@ -1227,6 +1232,14 @@ export class Engine {
   // compaction (persistTemp → maybeCompact) must NOT reclaim pages — it could free one the cursor still
   // faults. Incremented when a streaming Rows opens (shared.ts), decremented on Close.
   openStreams: number;
+  // storageBudget is this storage domain's committed-storage limit (memory.md §8.1, Q4a) plus what its
+  // last successful in-memory commit wrote, for the forced compaction and the repair exemption (§8.3).
+  // Only an in-memory main / in-memory attachment is checked against it (persist.ts planInMemory).
+  storageBudget: StorageBudget;
+  // commitStagesRows is whether the last commitTx staged any record version into main (memory.md
+  // §8.3): a commit that stages none — pure deletes and drops — may exceed max_storage_bytes so a full
+  // database can be repaired. Read by Session.publish, which persists main after commitTx.
+  commitStagesRows: boolean;
   // Per-top-level-statement de-duplication for transactional estimator-revision advances.
   private estimatorTouched = new Set<string>();
   // Inbound NO ACTION/RESTRICT probes deferred until the outermost recursive action closure has
@@ -1255,6 +1268,8 @@ export class Engine {
     this.freeGenTxid = 0n;
     this.tempStorage = null;
     this.openStreams = 0;
+    this.storageBudget = { limit: 0n, lastCatRoot: 0, lastWritten: [], lastCatalogPages: 0 };
+    this.commitStagesRows = false;
   }
 
   // setMaxCost sets the execution-cost ceiling for statements run on this handle (CLAUDE.md §13;
@@ -2511,6 +2526,26 @@ export class Engine {
       this.restoreSessionState(tx);
       return { kind: "statement", cost: 0n, rowsAffected: null };
     }
+    // A multi-root commit packs session temp and attachments before main persists at publish: check
+    // every in-memory budget first, so a later domain's 54P06 discards the whole transaction — session
+    // state restored as on ROLLBACK — before any domain has packed a page (memory.md §8.3). Main
+    // persists the working set, or its unchanged base when only temp changed.
+    if (this.core !== null && (tx.tempDirty || (tx.attachDirty?.size ?? 0) > 0)) {
+      const pureTemp = !tx.mainDirty && tx.tempDirty;
+      const attached: [string, Snapshot][] = [];
+      for (const name of tx.attachDirty ?? []) {
+        const ws = tx.attachWorking?.get(name);
+        if (ws !== undefined) attached.push([name, ws]);
+      }
+      const main = pureTemp ? this.committed : tx.working;
+      const mainStagesRows = !pureTemp && tx.working.stagedBytes() !== 0;
+      try {
+        this.core.precheckBudgets(main, mainStagesRows, attached);
+      } catch (e) {
+        this.restoreSessionState(tx);
+        throw e;
+      }
+    }
     const working = tx.working;
     // One durable writer per transaction (attached-databases.md §5): at most one FILE-backed database —
     // MAIN or an attached file — may be written per tx (any number of in-memory attachments + session
@@ -2528,6 +2563,7 @@ export class Engine {
     // block (no kind dirty) still persists, preserving prior behavior. Temp state is adopted regardless
     // — never serialized, only swapped into the in-memory committed temp snapshot.
     const pureTemp = !tx.mainDirty && tx.tempDirty;
+    this.commitStagesRows = false;
     if (!pureTemp) {
       // The txid advances for a durable database, signalled by the presence of a persistHook (the file
       // and OPFS hosts set one; an in-memory database has none and stays at txid 0). Keyed on persistHook,
@@ -2536,7 +2572,9 @@ export class Engine {
       // value and reuse the same meta slot. For the file and in-memory hosts the two are equivalent
       // (path and persistHook are set or unset together), so this is observably identical there.
       if (this.persistHook !== null) working.txid = this.committed.txid + 1n;
-      // Published writes are no longer pending (memory.md §7).
+      // Published writes are no longer pending (memory.md §7). Whether any were staged decides the
+      // committed-storage repair exemption at publish (memory.md §8.3), so capture it first.
+      this.commitStagesRows = working.stagedBytes() !== 0;
       working.clearStaged();
       // persistHook (if any) throws on an I/O failure before committed is swapped, so committed is
       // left untouched (the commit failed; the working snapshot is discarded).
@@ -2566,10 +2604,12 @@ export class Engine {
     if (tx.attachDirty !== undefined && tx.attachDirty.size > 0 && this.core !== null) {
       const na = new Map(this.attachedCommitted);
       const canReclaim = !this.core.hasLiveReaders();
+      const canCompact = this.core.canCompactCommitted();
       for (const name of tx.attachDirty) {
         const att = this.core.attachments.get(name);
         if (att === undefined) continue; // detached mid-transaction (unreachable) — nothing to persist
         const ws = tx.attachWorking!.get(name)!;
+        const stagesRows = ws.stagedBytes() !== 0;
         ws.clearStaged();
         // A FILE attachment commits DURABLY (dirty pages + alternating meta slot + fsync, its own page
         // space); an in-memory one packs persist_temp-style (NO fsync). At most one file attachment is
@@ -2599,7 +2639,11 @@ export class Engine {
             commitDurableAttachment(att.storage, ws, canReclaim, canReclaim);
           }
         } else {
-          persistTemp(att.storage, ws, canReclaim);
+          // The budget's forced compaction rebuilds the free list from the attachment's committed
+          // root (memory.md §8.3).
+          const prev = this.core.committedAttachment(name);
+          const budget = prev === undefined ? null : { name, prev, canCompact, stagesRows };
+          persistTemp(att.storage, ws, canReclaim, budget);
         }
         ws.freezeMutationGenerations();
         na.set(name, ws);

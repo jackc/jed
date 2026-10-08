@@ -82,7 +82,13 @@ import {
   Statement as ErgoStatement,
 } from "./ergonomic.ts";
 import { engineError } from "./errors.ts";
-import { persistImpl, persistSharedBody } from "./persist.ts";
+import {
+  type BudgetCtx,
+  persistImpl,
+  persistSharedBody,
+  precheckBudget,
+  storageBytes,
+} from "./persist.ts";
 import type { Statement } from "./ast.ts";
 
 // afterPersistHook is a test-only seam (null in production, a single null-check per commit): it fires in
@@ -397,7 +403,9 @@ class SharedCore {
   // minus durability, one code path. Called from Session.publish; pageCount/freePages on the storage
   // engine advance only after both syncs succeed, so a write failure leaves the file's prior meta
   // untouched.
-  persist(snap: Snapshot): void {
+  // stagesRows is whether the commit staged any record version (the committed-storage repair
+  // exemption, memory.md §8.3).
+  persist(snap: Snapshot, stagesRows: boolean): void {
     // The reader-liveness watermark (transactions.md §8) gates two things at the main-domain commit:
     //   - canReclaim (oldest_live == the new version, i.e. no reader live at an older version) lets the
     //     periodic COMPACT recompute the free-list (freeing this commit's fresh orphans);
@@ -425,7 +433,71 @@ class SharedCore {
       }
       return;
     }
-    persistImpl(this.storage, snap, oldest === snap.txid, oldest >= this.storage.freeGenTxid);
+    const budget: BudgetCtx = {
+      name: "main",
+      prev: this.committed,
+      canCompact: this.canCompactCommitted(),
+      stagesRows,
+    };
+    persistImpl(
+      this.storage,
+      snap,
+      oldest === snap.txid,
+      oldest >= this.storage.freeGenTxid,
+      budget,
+    );
+  }
+
+  // committedAttachment is the published committed root of attachment name (lowercased), if attached.
+  committedAttachment(name: string): Snapshot | undefined {
+    return this.attached.get(name);
+  }
+
+  // canCompactCommitted reports whether the committed snapshots may be compacted now (memory.md §8.3):
+  // no live reader pins a version older than the currently committed one. A reader AT that version
+  // keeps every page the compaction keeps; one pinned earlier could still fault a page it would free.
+  canCompactCommitted(): boolean {
+    return this.oldest() >= this.committed.txid;
+  }
+
+  // precheckBudgets checks every limited in-memory domain of a multi-root commit before any domain
+  // writes a page (memory.md §8.3): attachments commit before main, so a later domain's 54P06 must not
+  // follow an earlier domain's pack and compaction. main is the working main snapshot (persisted at
+  // publish, whether or not it is dirty); attached the dirtied attachments' working snapshots.
+  // Attachments are visited in name order, so which domain a 54P06 names never depends on set order.
+  precheckBudgets(main: Snapshot, mainStagesRows: boolean, attached: [string, Snapshot][]): void {
+    const canCompact = this.canCompactCommitted();
+    const sorted = [...attached].sort((a, b) => compareFilePaths(a[0], b[0])); // UTF-8 byte order
+    for (const [name, snap] of sorted) {
+      const prev = this.attached.get(name);
+      const att = this.attachments.get(name);
+      if (prev === undefined || att === undefined) continue;
+      precheckBudget(att.storage, snap, true, {
+        name,
+        prev,
+        canCompact,
+        stagesRows: snap.stagedBytes() !== 0,
+      });
+    }
+    const oldest = this.oldestLiveVersion(this.committed.txid + 1n);
+    precheckBudget(this.storage, main, oldest >= this.storage.freeGenTxid, {
+      name: "main",
+      prev: this.committed,
+      canCompact,
+      stagesRows: mainStagesRows,
+    });
+  }
+
+  // storageFor returns the storage Engine of database name — main or an attachment, case-insensitive;
+  // the session-local temp domain and an unknown name are 42704.
+  storageFor(name: string): Engine {
+    const lname = name.toLowerCase();
+    if (lname === "main") return this.storage;
+    const att = lname === "temp" ? undefined : this.attachments.get(lname);
+    if (att === undefined) {
+      throw engineError("undefined_object", `database "${name}" is not attached`);
+    }
+    return att.storage;
   }
 
   // hasLiveReaders reports whether any cross-session reader currently pins a committed snapshot (the
@@ -477,16 +549,28 @@ class SharedCore {
 // (spec/design/attached-databases.md §4). A MEMORY source is a fresh, empty in-memory database
 // (Slice 1b); a FILE source opens an existing single-file jed database on disk (Slice 2). Build one with
 // attachMemory() or attachFile(path).
+// maxStorageBytes limits an in-memory attachment's committed storage (spec/design/memory.md §8.1);
+// zero, negative, or absent is unlimited. A positive limit on a file source is 0A000 at attach.
 export type AttachSource = {
   file: boolean;
   path?: string;
   locking?: "auto" | "shared" | "exclusive" | "none";
   fileLockTimeoutMs?: number;
+  maxStorageBytes?: bigint;
 };
 
-// attachMemory returns a source for a fresh, empty in-memory attachment (attached-databases.md §6).
-export function attachMemory(): AttachSource {
-  return { file: false };
+// attachMemory returns a source for a fresh, empty in-memory attachment (attached-databases.md §6),
+// optionally with a committed-storage limit (memory.md §8.1).
+export function attachMemory(options: Pick<AttachSource, "maxStorageBytes"> = {}): AttachSource {
+  return { file: false, ...options };
+}
+
+// fileStorageLimitError is the 0A000 for a committed-storage limit on a file backing (memory.md §8.7).
+export function fileStorageLimitError(): Error {
+  return engineError(
+    "feature_not_supported",
+    "max_storage_bytes applies only to in-memory databases",
+  );
 }
 
 // attachFile returns a source for a file-backed attachment: an existing single-file jed database at path
@@ -594,6 +678,7 @@ export class Database {
     let storage: Engine;
     let root: Snapshot;
     let coordinator: FileCoordinatorHost | null = null;
+    if (source.file && (source.maxStorageBytes ?? 0n) > 0n) throw fileStorageLimitError();
     if (source.file) {
       if (fileAttachOpener === null) {
         // A pure in-memory build (no node/OPFS host imported) has no file layer to reach.
@@ -617,6 +702,7 @@ export class Database {
         throw engineError("duplicate_object", `database "${name}" already exists`);
       }
       storage = newAttachedStorage(c.pageSize);
+      storage.storageBudget.limit = source.maxStorageBytes ?? 0n;
       // The fresh attachment's committed root: an empty snapshot whose NEW stores attach to its own paging
       // (the same storePaging seam session-local temp uses — a snapshot's storePaging is "the paging new
       // stores bind to").
@@ -943,6 +1029,23 @@ export class Database {
   get pageCount(): number {
     return this.core.storage.pageCount;
   }
+  // setMaxStorageBytes sets the committed-storage limit of database name — main or an attachment — in
+  // bytes (spec/design/memory.md §8.1); zero or negative is unlimited. Shared by every session on the
+  // handle and checked at each later commit. A positive limit on a file-backed database is 0A000; a name
+  // that is not attached is 42704.
+  setMaxStorageBytes(name: string, bytes: bigint): void {
+    const st = this.core.storageFor(name);
+    if (st.persistHook !== null && bytes > 0n) throw fileStorageLimitError();
+    st.storageBudget.limit = bytes;
+  }
+
+  // storageBytes is the committed storage of database name — main or an attachment — in bytes: its
+  // logical page high-water times its page size (spec/design/memory.md §8.2/§8.6). Deterministic; not
+  // RSS.
+  storageBytes(name: string): bigint {
+    return storageBytes(this.core.storageFor(name));
+  }
+
   // path is the backing file path for a file-backed database; null in-memory.
   get path(): string | null {
     return this.core.storage.path;
@@ -995,12 +1098,16 @@ export class Database {
 // from-scratch image, read/written through the same pager + Packed path as a file (loadEngine is the
 // paged open over a memory store). txid 0 is the pre-first-commit version (the same committed version
 // an in-memory core always started at); the first commit publishes txid 1 into the alternate meta slot.
+// maxStorageBytes is the database's committed-storage limit (memory.md §8.1); <= 0n is unlimited.
 export function buildInMemory(
   pageSize: number,
   extensions: ExtensionRegistry | null = null,
+  maxStorageBytes = 0n,
 ): Database {
   const image = toImageBytes(new Snapshot(0n), pageSize, 0n);
-  return Database.fromEngine(loadEngine(image), null, extensions);
+  const engine = loadEngine(image);
+  engine.storageBudget.limit = maxStorageBytes;
+  return Database.fromEngine(engine, null, extensions);
 }
 
 // Access is the access mode a Session was minted with (spec/design/session.md §2.4/§5.1). Distinct
@@ -1324,7 +1431,8 @@ export class Session {
     this.core.checkPid();
     const snap = this.engine.committed;
     snap.txid = this.baseVersion + 1n; // advance the shared version on every commit
-    this.core.persist(snap); // durable before publish (packs into the byte store, any host)
+    // durable before publish (packs into the byte store, any host)
+    this.core.persist(snap, this.engine.commitStagesRows);
     if (afterPersistHook !== null) {
       // The persist→publish window (test seam; §8 fallback-reader race point). core.committed is still the
       // PRIOR published root here — a reader pinned inside the hook gets that fallback version.
@@ -1614,6 +1722,8 @@ export class Session {
     try {
       this.refreshCommitted();
       this.engine.setDefaultCollation(name);
+      // No commitTx ran: this commit stages no record version (memory.md §8.3).
+      this.engine.commitStagesRows = false;
       this.publish();
     } finally {
       this.releaseGate();
@@ -1633,7 +1743,16 @@ export class Session {
     try {
       this.refreshCommitted();
       const n = this.engine.upgradeCollations();
-      this.publish();
+      // Nothing was skewed ⇒ no state change, so there is no new version to publish (mirrors the
+      // engine, which only swaps in the rebuilt snapshot when n > 0, and the Rust/Go sessions).
+      if (n > 0) {
+        // No commitTx ran: the rebuilt index entries are this commit's staged writes. They decide the
+        // repair exemption (memory.md §8.3) and must not stay pending in the published snapshot (§7).
+        const committed = this.engine.committed;
+        this.engine.commitStagesRows = committed.stagedBytes() !== 0;
+        committed.clearStaged();
+        this.publish();
+      }
       return n;
     } finally {
       this.releaseGate();

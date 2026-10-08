@@ -365,6 +365,31 @@ func parseAttachDirective(line string) (string, bool) {
 	return body, true
 }
 
+// parseMaxStorageBytesDirective parses a `# max_storage_bytes: N [database]` line
+// (spec/design/memory.md §8.1): an ACTION that sets the committed-storage limit of `main` (or the
+// named attachment) on the running handle from this point of the file on. In-memory backings only, so
+// such files are `# skip: disk`. Returns the limit and database name, or ok false if not this
+// directive.
+func parseMaxStorageBytesDirective(line string) (int64, string, bool) {
+	body, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "max_storage_bytes:")
+	if !ok {
+		return 0, "", false
+	}
+	parts := strings.Fields(body)
+	if len(parts) == 0 {
+		return 0, "", false
+	}
+	bytes, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, "", false
+	}
+	name := "main"
+	if len(parts) > 1 {
+		name = parts[1]
+	}
+	return bytes, name, true
+}
+
 func parseRequires(text string) []string {
 	for _, line := range strings.Split(text, "\n") {
 		t := strings.TrimSpace(line)
@@ -743,8 +768,10 @@ var (
 
 // recordPeak writes the peak query-memory balance of record ordinal of the current file when the
 // peak mode is on. Every core writes the same file<TAB>ordinal<TAB>peak lines, so a diff of the three
-// outputs checks every record's minimal passing budget across cores (memory.md §8).
-func recordPeak(ordinal int) {
+// outputs checks every record's minimal passing budget across cores (memory.md §8). Each line also
+// carries the main database's committed storage after the record (memory.md §8.4): the cross-core
+// check that in-memory page allocation and compaction agree record by record.
+func recordPeak(ordinal int, db *jed.Database) {
 	if peakSink == nil {
 		path := os.Getenv("JED_CONFORMANCE_QUERY_MEMORY_PEAKS")
 		if path == "" {
@@ -756,7 +783,11 @@ func recordPeak(ordinal int) {
 		}
 		peakSink = f
 	}
-	fmt.Fprintf(peakSink, "%s\t%d\t%d\n", peakRel, ordinal, jed.QueryMemoryPeak())
+	storage, err := db.StorageBytes("main")
+	if err != nil {
+		panic(fmt.Sprintf("main is always present: %v", err))
+	}
+	fmt.Fprintf(peakSink, "%s\t%d\t%d\t%d\n", peakRel, ordinal, jed.QueryMemoryPeak(), storage)
 }
 
 func runFile(text string, disk bool) error {
@@ -898,6 +929,15 @@ func runFile(text string, disk bool) error {
 			if name, ok := parseAttachDirective(line); ok {
 				if err := db.Attach(name, jed.AttachMemory(), false); err != nil {
 					return fmt.Errorf("attach %q: %w", name, err)
+				}
+				i++
+				continue
+			}
+			// `# max_storage_bytes: N [database]` (file-level) sets the committed-storage limit of main or
+			// an attachment on the running handle (memory.md §8.1), sticky from this point of the file on.
+			if bytes, name, ok := parseMaxStorageBytesDirective(line); ok {
+				if err := db.SetMaxStorageBytes(name, bytes); err != nil {
+					return fmt.Errorf("max_storage_bytes %q: %w", name, err)
 				}
 				i++
 				continue
@@ -1192,7 +1232,7 @@ func runFile(text string, disk bool) error {
 		default:
 			return fmt.Errorf("unknown record kind %q", fields[0])
 		}
-		recordPeak(recordOrdinal)
+		recordPeak(recordOrdinal, db)
 		if jed.QueryMemoryUnderflows() != underflowsBefore {
 			return fmt.Errorf("query-memory accounting released more than it reserved (memory.md §5)\n  record: %s", line)
 		}

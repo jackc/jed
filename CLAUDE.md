@@ -937,7 +937,10 @@ release their charge as they spill; they also spill, instead of failing, when th
 a reservation, so a budget below `work_mem` spills earlier rather than aborting. The same budget
 holds a transaction's pending writes (slice Q3): every record version it stages reserves its stored
 bytes until commit/rollback, each statement's account opens holding them, and they must fit after
-every statement. Storage caches are still uncovered (Q4), as are remaining scalar kernels. These are guardrails, not heap caps: resource-
+every statement. A database-owned, opt-in `max_storage_bytes` (unlimited by default; `54P06`)
+bounds an in-memory database's or attachment's committed pages, checked at commit before any write
+(slice Q4a); file-backed page caches stay evict-only under `cache_bytes` and never fail a query.
+A file-backed size cap and the remaining scalar kernels are still uncovered. These are guardrails, not heap caps: resource-
 exhaustion resistance remains a requirement; do not claim the current limits are a
 whole-engine memory guarantee. Host extensions remain outside these guarantees.
 

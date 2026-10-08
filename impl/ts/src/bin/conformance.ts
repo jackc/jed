@@ -150,16 +150,28 @@ function parseAttachDirective(line: string): string | null {
   return body === "" ? null : body;
 }
 
+// parseMaxStorageBytesDirective parses a file-level `# max_storage_bytes: N [database]` line
+// (spec/design/memory.md §8.1): an ACTION that sets the committed-storage limit of `main` (or the named
+// attachment) on the running handle from this point of the file on. In-memory backings only, so such
+// files are # skip: disk. Returns [bytes, database], or null if not this directive.
+function parseMaxStorageBytesDirective(line: string): [bigint, string] | null {
+  const rest = line.replace(/^#/, "").trim();
+  if (!rest.startsWith("max_storage_bytes:")) return null;
+  const parts = rest.slice("max_storage_bytes:".length).trim().split(/\s+/);
+  if (parts[0] === undefined || !/^-?\d+$/.test(parts[0])) return null;
+  return [BigInt(parts[0]), parts[1] ?? "main"];
+}
+
 // openFixture opens the pre-built database image named by a `# fixture:` directive (path relative to
 // spec/). The harness acts as the host: it first loads jed's pinned production bundle so any
 // referenced collation resolves on open (a skewed pin still resolves — to a DIFFERENT version, which
 // is the point), then reconstructs the database in memory via loadEngine. The handle is read-WRITE
 // so a write against a skewed table exercises the real XX002 guard (collation.md §12), not a
 // read-only-handle error.
-function openFixture(rel: string): Session {
+function openFixture(rel: string): Database {
   const bundle = join(repoRoot(), "spec", "collation", "fixtures", "unicode.jucd");
   if (existsSync(bundle)) loadUnicodeData(readFileSync(bundle)); // idempotent: the set is engine-global
-  return Database.fromImage(readFileSync(join(repoRoot(), "spec", rel))).session();
+  return Database.fromImage(readFileSync(join(repoRoot(), "spec", rel)));
 }
 
 function parseRequires(text: string): string[] {
@@ -574,11 +586,14 @@ let peakRel = "";
 
 // recordPeak appends the peak query-memory balance of record `ordinal` of the current file when the
 // peak mode is on. Every core writes the same file<TAB>ordinal<TAB>peak lines, so a diff of the three
-// outputs checks every record's minimal passing budget across cores (memory.md §8).
-function recordPeak(ordinal: number): void {
+// outputs checks every record's minimal passing budget across cores (memory.md §8). Each line also
+// carries the main database's committed storage after the record (memory.md §8.4): the cross-core check
+// that in-memory page allocation and compaction agree record by record.
+function recordPeak(ordinal: number, db: Database): void {
   const path = process.env.JED_CONFORMANCE_QUERY_MEMORY_PEAKS;
   if (path === undefined || path === "") return;
-  appendFileSync(path, `${peakRel}\t${ordinal}\t${queryMemoryPeak.value}\n`);
+  const storage = db.storageBytes("main");
+  appendFileSync(path, `${peakRel}\t${ordinal}\t${queryMemoryPeak.value}\t${storage}\n`);
 }
 
 function runFile(text: string, disk: boolean): void {
@@ -660,7 +675,8 @@ function runFile(text: string, disk: boolean): void {
         // above — appears in the header before any record (spec/design/conformance.md).
         const fx = parseFixtureDirective(line);
         if (fx !== null) {
-          db = openFixture(fx);
+          attachDb = openFixture(fx);
+          db = attachDb.session();
           onTemp = false; // the handle is now the fixture image, not the reopenable temp file
           c.i++;
           continue;
@@ -673,6 +689,14 @@ function runFile(text: string, disk: boolean): void {
         const at = parseAttachDirective(line);
         if (at !== null) {
           attachDb.attach(at, attachMemory(), false);
+          c.i++;
+          continue;
+        }
+        // `# max_storage_bytes: N [database]` (file-level ACTION) sets the committed-storage limit of
+        // `main` or the named attachment on the running handle, sticky from here on (memory.md §8.1).
+        const msb = parseMaxStorageBytesDirective(line);
+        if (msb !== null) {
+          attachDb.setMaxStorageBytes(msb[1], msb[0]);
           c.i++;
           continue;
         }
@@ -922,7 +946,7 @@ function runFile(text: string, disk: boolean): void {
       } else {
         throw new Error(`unknown record kind "${fields[0]}"`);
       }
-      recordPeak(recordOrdinal);
+      recordPeak(recordOrdinal, attachDb);
       if (queryMemoryUnderflows.count !== underflowsBefore) {
         throw new Error(
           `query-memory accounting released more than it reserved (memory.md §5)\n  record: ${line}`,
@@ -946,19 +970,20 @@ function runFile(text: string, disk: boolean): void {
 // The result grammar (statement / query, sortmodes, the R float tag) is reused verbatim from the
 // sequential runner (runFile) — only the session control + state assertions are new.
 
-// parseAttaches collects every file-level `# attach: <name>` directive in a concurrency file, in
-// order — the databases to attach to the shared handle before the schedule runs. Reuses the
-// sequential runner's parseAttachDirective, so a schedule declares an attachment exactly the way a
-// sequential file does.
+// parseAttaches collects a concurrency file's handle-setup directives, in order — each `# attach:
+// <name>` (a database to attach) and `# max_storage_bytes: N [database]` (a committed-storage limit,
+// memory.md §8.1) — applied to the shared handle before the schedule runs. Reuses the sequential
+// runner's parsers, so both runners honor the directives identically (attached-databases.md §6).
 function parseAttaches(text: string): string[] {
-  const names: string[] = [];
+  const header: string[] = [];
   for (const raw of text.split("\n")) {
     const t = raw.trim();
     if (!t.startsWith("#")) continue;
-    const name = parseAttachDirective(t);
-    if (name !== null) names.push(name);
+    if (parseAttachDirective(t) !== null || parseMaxStorageBytesDirective(t) !== null) {
+      header.push(t);
+    }
   }
-  return names;
+  return header;
 }
 
 // scheduleDatabase builds the shared handle a schedule runs against, attaching a fresh empty
@@ -968,9 +993,17 @@ function parseAttaches(text: string): string[] {
 // (a reader pins the WHOLE roots — main + attached — in one lock-free Load, §5); this is what lets a
 // schedule assert cross-database snapshot isolation and the watermark over an attachment. Attaching is
 // host-API, never SQL, so it happens here before any session opens, not as a schedule step.
-function scheduleDatabase(attaches: string[]): Database {
+function scheduleDatabase(header: string[]): Database {
   const db = createDatabase({});
-  for (const name of attaches) db.attach(name, attachMemory(), false); // throws on error
+  for (const line of header) {
+    const name = parseAttachDirective(line);
+    if (name !== null) {
+      db.attach(name, attachMemory(), false); // throws on error
+      continue;
+    }
+    const msb = parseMaxStorageBytesDirective(line);
+    if (msb !== null) db.setMaxStorageBytes(msb[1], msb[0]); // throws on error
+  }
   return db;
 }
 
