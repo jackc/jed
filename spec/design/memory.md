@@ -4,17 +4,19 @@ Cost is a deterministic work allowance, not a memory limit. A large value can
 allocate substantial memory before another row or expression is visited, and a
 join can copy one large value into many rows for a handful of cost units. Memory
 admission therefore runs **independently of cost**, through two per-statement
-accounts:
+accounts and one database-owned account (§8):
 
 | Account | Setting | Default | Model | Error |
 |---|---|---|---|---|
 | Scalar allocation | `max_scalar_bytes` | 64 MiB | cumulative churn, never refunded | `54P04` |
 | Query memory | `max_query_memory_bytes` | unlimited | live logical bytes, released when dropped; opens holding the transaction's pending writes (§7) | `54P05` |
+| Committed storage *(designed, §8)* | `max_storage_bytes` (database) | unlimited | an in-memory domain's `page_count × page_size`, checked at commit | `54P06` |
 
-Both are **guardrails, not heap caps.** They bound logical bytes computed from a
-shared, representation-independent schedule, so an abort is deterministic and
+All are **guardrails, not heap caps.** They bound logical bytes computed from a
+shared, representation-independent schedule (or, for committed storage, the
+logical page count), so an abort is deterministic and
 cross-core identical ([determinism.md](determinism.md) §3: a limit hit is part of
-G1/G2, not a ledger exception). Neither equals process RSS, and both allow bounded
+G1/G2, not a ledger exception). None equals process RSS, and all allow bounded
 overshoot: a row may be constructed before it is admitted, and a base relation's
 storage read may decode before its rows are admitted one by one. Hosts bound
 deployment memory with these accounts, `work_mem`, `temp_buffers`, the page-pool
@@ -160,7 +162,7 @@ It is filled in by owner class:
 | Q1 | **Rows** — row buffers of statement execution and engine result collectors | implemented |
 | Q2 | **Operator state** — hash-join tables, group/distinct/dedup sets and keys, aggregate accumulators (`json_agg`/`jsonb_agg` and the other JSON aggregates, ordered-set and hypothetical buffers), sort buffers and top-k heaps, window partition state, columnar lanes, spill spools' resident buffers, recursive-CTE dedup sets | implemented (§6) |
 | Q3 | **Pending writes** — the stored bytes a transaction stages, surviving statement boundaries and released at commit/rollback | implemented (§7) |
-| Q4 | **Storage** — database-owned accounts for page caches and committed in-memory storage | planned |
+| Q4 | **Storage** — database-owned: committed in-memory storage under `max_storage_bytes`; page caches stay under `cache_bytes`, evict-only | designed (§8) |
 
 Q2 operators that can spill charge only their resident portion and release it as
 they spill — when their residency exceeds `work_mem`, and also when the account
@@ -531,7 +533,235 @@ buffers that feed them (INSERT … SELECT keeps its source rows charged), and th
 are checked once the statement completes. Thresholds are pinned by
 `resource/query_memory_pending.test`.
 
-## 8. Rollout gates
+## 8. Q4: storage
+
+> **Status: designed, not built.** Q4a below is the next slice; the cache rules in
+> §8.6 record contracts the pager already keeps and add nothing to enforce.
+
+Q1–Q3 charge memory that a **session** owns: a statement's buffers and state, and
+its transaction's staged writes. Storage memory outlives every statement and is
+shared by every session on the handle, so it cannot go on
+`max_query_memory_bytes`. Charging committed pages to whichever session commits
+would make one session's budget depend on what other sessions stored. Q4 therefore
+uses **database-owned** accounts, and splits storage into two classes with opposite
+contracts:
+
+| Class | Owners | Bound | On exhaustion | Contract |
+|---|---|---|---|---|
+| **Committed storage** — non-refaultable bytes the database *is* | the `MemoryBlockStore` of an in-memory database and of each in-memory attachment | `max_storage_bytes` (new, §8.1) | the growing commit fails `54P06` | deterministic, cross-core (§8.4) |
+| **Caches** — refaultable copies of durable pages | the file-backed leaf pool | `cache_bytes` (existing, [pager.md](pager.md) §3) | evict; **never fails** | none; residency is unobservable (§8.6) |
+
+Session-local temp domains are neither. A session owns them, and `temp_buffers`
+already bounds them with the same page basis ([temp-tables.md](temp-tables.md) §7),
+so Q4 does not count them again.
+
+The hazard Q4a closes: an untrusted session on an in-memory database can commit
+many small, cheap transactions. Each one fits `max_cost` and Q3's per-transaction
+bound, yet together they grow the database's RAM without limit. Q4a bounds what
+the session can make the *database* hold.
+
+### 8.1 The setting
+
+`max_storage_bytes` is a **database setting**, not a session setting. It is fixed
+when an in-memory database is created (`create(opts)` with no `path`, Rust
+`CreateOptions { max_storage_bytes }`, Go `CreateOptions.MaxStorageBytes`, TS
+`maxStorageBytes`) or when an in-memory database is attached (an attach option on
+`db.attach(name, memory(), …)`, [attached-databases.md](attached-databases.md)
+§4). It can be changed on an open handle with
+`set_max_storage_bytes` / `SetMaxStorageBytes` / `setMaxStorageBytes`, which takes
+the target database name (`main` or an attachment) for attachments. Every session
+on the handle shares it. It is not persisted, not transactional, and not reachable
+from SQL. A positive value is the limit in bytes; **zero or negative means
+unlimited, which is the default**, for the same reason Q1 has no finite default
+(§2): a finite default would reject RAM-sized workloads that run today. This
+retires the provisional `memory_limit` `CreateOptions` knob in TODO.md and gives it
+the `max_*_bytes` name its siblings use.
+
+Q4a covers **in-memory backings only**. Setting the limit on a file-backed database
+or file attachment is `0A000`. The file form of the limit (a database-size cap, the
+analog of SQLite's `max_page_count`) is a different measure, and §8.7 explains why
+it stays deferred rather than reusing this one.
+
+### 8.2 Measure
+
+```
+storage_bytes(domain) = page_count × page_size
+```
+
+`page_count` is the domain's **logical high-water mark**: meta slots, live pages,
+and pages on the free list, everything the byte store holds. The free pages count
+because an in-memory store keeps them allocated for reuse. This is the
+`temp_buffers` basis, taken over unchanged
+([temp-tables.md](temp-tables.md) §7), and it is honest in the same way: it charges
+interior nodes, page headers, and space left sparse after deletes, which a
+record-byte sum would miss. It is **not** the physical buffer length, which also
+includes geometric preallocation slack that is outside the byte contract
+([pager.md](pager.md) §7).
+
+Within-session compaction ([temp-tables.md](temp-tables.md) §6; `maybe_compact`)
+keeps `page_count` between `live` and roughly `2 × live`. So a limit of B bytes
+reliably holds about B/2 bytes of live pages and may hold up to B. Hosts size the
+limit with this in mind, and the public docs must say so.
+
+### 8.3 Admission
+
+The check runs **once per commit** of an in-memory domain, after the commit has
+planned its page allocation (dirty pages packed, ids assigned from the free list
+first, then the high-water mark) and **before any page is written to the store or
+the root is published**. The predicted post-commit `page_count` gives the exact
+new `storage_bytes`, with no one-commit lag. The commit is rejected when:
+
+```
+storage_bytes(after) > max_storage_bytes  and  page_count(after) > page_count(before)
+```
+
+The second clause is the **shrink-and-repair exemption**: a commit that does not
+raise the high-water mark always succeeds, even when the domain is already over a
+limit that was lowered at runtime. Rejecting it would only block the deletes that
+fix the problem.
+
+**Forced compaction before rejection.** Periodic compaction can leave a domain at
+its limit with an empty free list, so a `DELETE` or `DROP TABLE` that rewrites a
+root→leaf path would need fresh pages and would be refused. Before rejecting, the
+commit therefore runs one forced compaction whenever the watermark allows
+reclamation (`can_reclaim`, [transactions.md](transactions.md) §8). This is the same reachability walk
+over the last committed snapshot, without the `16`-page / `2×` trigger. It
+re-plans the allocation and checks again. If the watermark blocks reclamation,
+because an older version is still pinned by a read session or an open streaming
+cursor, the commit is rejected; closing the old readers is the remedy. The forced
+walk is O(pages), but it only runs on a commit that would otherwise fail.
+
+**Failure.** `54P06 storage_limit_exceeded`, "storage of database \"main\" exceeded
+the limit of N bytes", naming the domain. Because nothing has been written yet, the
+transaction is discarded like a serialization-only commit error, and the handle
+stays usable without poisoning ([validated-cow.md](validated-cow.md)). An autocommit statement commits nothing. A
+`COMMIT` of an explicit block fails and the transaction ends rolled back, matching
+PostgreSQL, where a failed `COMMIT` does not leave the transaction open. In a
+multi-root commit ([attached-databases.md](attached-databases.md) §5), every
+in-memory domain is checked **before any root is published**, so a rejection in
+one attachment publishes none.
+
+**Ordering with the other gates.** Cost, `54P05`, and the Q3 end-of-statement check
+(§7.3) all run *during or at the end of* the statement, before the commit starts.
+So an autocommit write that breaks both budgets reports the earlier of them,
+`54P01`/`54P02`/`54P05`, and the commit never runs. `54P06` is only ever reported
+by a statement that has otherwise succeeded.
+
+### 8.4 Determinism
+
+`54P06` sits inside the contract, like `54P03` and unlike cache residency. Its trip
+point is a pure function of the sequence of operations, because each input is:
+
+- **Page allocation.** The copy-on-write commit serializer is deterministic, and
+  so is the order it reuses free-list pages in. In-memory stores already share the
+  file serializer.
+- **The compaction schedule.** Today the `MIN_COMPACT_PAGES = 16` floor and the
+  `2 × live_at_compaction` trigger are constants mirrored by hand in each core.
+  Q4a **promotes them to shared spec constants** in
+  [../fileformat/format.md](../fileformat/format.md) *Reclamation*, codegen'd like
+  the cost schedule. They also become observable through `54P03`, which already
+  depends on them.
+- **The reader watermark.** Which versions are pinned depends on the order of
+  commits and pin points, and that order is the deterministic schedule the
+  concurrency corpus already uses (CLAUDE.md §7). An in-memory database cannot be
+  shared across processes, so no timing-dependent co-residence state enters the
+  measure (§8.7).
+
+The limit itself never changes results or cost; it only decides whether a commit
+is admitted.
+
+### 8.5 Interaction with Q3 and the scalar allowance
+
+The three gates do not overlap. Q3 bounds what one transaction stages before
+commit, per session. Q4 bounds what the database keeps after commit, per database.
+The scalar allowance bounds churn within a statement. When a transaction commits,
+its staged bytes leave Q3 and its pages arrive in Q4. For an untrusted surface over
+an in-memory database, the host sets `max_query_memory_bytes` (per-session work and
+staging) and `max_storage_bytes` (what everyone together may store). Neither one
+substitutes for the other.
+
+### 8.6 Caches: evict, never fail
+
+Cache residency is unobservable by contract ([pager.md](pager.md) §3/§5): two cores
+with different resident sets return identical results and cost. A cache account
+therefore **may never produce an error**. If an evictable page could abort a
+query, residency, and with it eviction timing, thread scheduling, and CLOCK's hand
+position, would become part of the observable surface. So a cache's only response
+to pressure is eviction, and `cache_bytes` remains its account. Q4 adds no new
+check here. It records what `cache_bytes` does and does not bound, so the docs can
+state it accurately:
+
+- **Bounded:** the clean leaf pages in the file-backed pool, at
+  `max(1, cache_bytes / page_size)` leaves.
+- **Overshoot by live references:** an evicted leaf stays alive while a traversal
+  or cursor still references it. This is at most one root→leaf path per active
+  traversal plus each open streaming cursor's current leaf: concurrent readers ×
+  tree height. It is guardrail overshoot.
+- **Not bounded by `cache_bytes`:** the **interior skeleton**, always resident and
+  roughly `page_count / fan-out` pages ([pager.md](pager.md) §1); the **resident
+  GiST R-tree**, eager on both backings and proportional to indexed rows
+  ([gist.md](gist.md) §4); and in-memory databases' pinned pool, which caches the
+  committed storage of §8.1 and is accounted there. For in-memory domains,
+  `max_storage_bytes` bounds the skeleton and the GiST tree indirectly, because
+  both are proportional to page counts it limits. For file-backed databases they
+  are bounded by file size until interior paging and GiST demand paging land
+  (pager.md §6, gist.md §11).
+
+The handle gains one read-only **deterministic gauge**, `storage_bytes(name)`
+(Rust/Go/TS idiomatic spellings, like `resident_leaves`). It reports §8.2's measure
+for in-memory domains and `page_count × page_size` for file-backed ones. In both
+cases it is the logical committed high-water mark, not RSS, so a host can watch
+growth against its limit before it is hit.
+
+### 8.7 Why the file form is deferred
+
+For a file-backed database, `page_count × page_size` is not deterministic under
+shared multi-process access. While another process is co-resident, commits are
+append-only (`free_list_head = 0`, [locking.md](locking.md)). Co-residence is
+detected by a background probe, so how much the file grows depends on timing that
+no single handle's operation sequence fixes. A file-size cap therefore needs a
+different measure: the **live** page count (reachable pages), which is a function
+of the committed trees alone and does not depend on reuse, watermark, or
+co-residence. It also needs an exact incremental orphan count per commit. The GiST
+whole-tree rewrite makes that count non-trivial today. The cap answers a different
+need (disk use, analogous to `53100 disk_full`) from Q4's (RAM), so it is a
+separate follow-on and not foreclosed. Rejecting the setting on a file database
+with `0A000` keeps that door open: a later file form can adopt the same option
+name with a stated measure, instead of silently reinterpreting an accepted value.
+
+### 8.8 Not covered
+
+Q4 leaves these outside every account: the interior skeleton and GiST R-tree of
+file-backed databases (§8.6), the catalog (proportional to schema size; DDL is
+gated by `allow_ddl`), persisted statistics (bounded by the statistics target,
+[statistics.md](statistics.md)), host-owned prepared statements and their plan
+caches, and per-core representation overhead beyond the logical page bytes. A
+core may hold a faulted in-memory leaf as a copy of its store block, which is
+bounded overshoot of at most one extra page per resident leaf.
+
+### 8.9 Slices
+
+- **Q4a — committed in-memory storage.** The setting (§8.1), measure, admission,
+  and forced compaction (§8.2–§8.3), the `54P06` registry entry, the promoted
+  compaction constants (§8.4), and the `storage_bytes` gauge (§8.6), in all three
+  cores. Corpus: a database-level `# max_storage_bytes: N` directive (applied at
+  `create`, in-memory mode only; capability `resource.storage_memory`) and
+  `resource/storage_memory.test`, which pins exact trip points, the
+  shrink-and-repair exemption, and `DELETE` recovery through forced compaction. A
+  concurrency-format entry pins the watermark case: a pinned reader blocks
+  reclamation, so a commit is rejected `54P06` and succeeds once the reader closes.
+  Per-core tests cover the host API: setting on `create`/`attach`, the runtime
+  setter, `0A000` on file backings, and multi-root rejection publishing nothing.
+  `rake conformance:query_memory` also records each record's final in-memory
+  `storage_bytes` and fails unless all cores agree. That cross-core check is what
+  backs the §8.4 claim, the same way peak balances back Q1–Q3.
+- **Q4b — documentation only.** Public docs ([resource-limits](../../web/src/routes/docs/api/resource-limits/+page.md))
+  describe the cache rules of §8.6 and the B/2–B sizing note of §8.2. No engine
+  change.
+- **Follow-ons:** the file-backed size cap on live pages (§8.7); bounding the
+  interior skeleton and GiST tree under `cache_bytes` once they page.
+
+## 9. Rollout gates
 
 Each slice lands in all three cores together with: corpus entries pinning exact
 `54P05` thresholds for its owners (`# max_query_memory_bytes: N`, capability

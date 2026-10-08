@@ -209,7 +209,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   rule. → [attached-databases.md](spec/design/attached-databases.md) _(size: L; deps: N-root commit
   (done); §9/§13)_
 - [x] **Blocking sort and hash-operator spill** — `ORDER BY`, hash `JOIN`, `GROUP BY`/aggregate and `DISTINCT` use bounded row/state buffers under `work_mem` on native file hosts. Ordered disk hash partitions preserve JOIN candidate order, aggregate fold order, first occurrence and exact costs; direct scan feeds and cost prepasses stream. Aggregate DISTINCT and growing ordered-set/hypothetical collections spill, with bounded external ordering and descriptor counts. Shared forced-spill corpus checks run in CI; `rake bench:spill` checks wide-input results/costs and measures RSS. → [spill.md](spec/design/spill.md)
-  - [ ] **Remaining query-memory owners** — Q1 (row buffers, result collectors), Q2 (operator state), and Q3 (pending writes) have landed; storage budgets (Q4), remaining scalar kernels, and host scratch support for OPFS/WASI remain. `work_mem` is an operator threshold, not a whole-query memory ceiling. → [memory.md](spec/design/memory.md), [hosts.md](spec/design/hosts.md)
+  - [ ] **Remaining query-memory owners** — Q1 (row buffers, result collectors), Q2 (operator state), and Q3 (pending writes) have landed; storage budgets (Q4a, designed — memory.md §8), remaining scalar kernels, and host scratch support for OPFS/WASI remain. `work_mem` is an operator threshold, not a whole-query memory ceiling. → [memory.md](spec/design/memory.md), [hosts.md](spec/design/hosts.md)
 - [x] **Point-lookup, cold-read, and INSERT performance work** — the measured point-lookup,
   checksum/PAX/buffer-pool, concurrent-fault, and INSERT execution/tree slices have landed; final
   timings, allocation evidence, checksums, and decisions live in
@@ -232,8 +232,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   `create(opts)` (fresh, either backing; `opts.path` absent → in-memory) and `open(path, opts)`
   (existing file); Go's exported `OpenDatabaseWithOptions`/`OpenOptions` closed the last open-surface
   divergence. Host-API only, byte-neutral. → [api.md §2.1.1](spec/design/api.md)
-  - [ ] _follow-on:_ the anticipated create-time knobs as new `CreateOptions` fields (`memory_limit`
-    first — the in-memory twin of `cache_bytes`; then a spill `temp_dir`, then a thread count);
+  - [ ] _follow-on:_ the anticipated create-time knobs as new `CreateOptions` fields
+    (`max_storage_bytes` first — the in-memory storage limit, designed as memory.md §8 / Q4a; then a spill `temp_dir`, then a thread count);
     optionally sweep the async OPFS/browser host (`createOpfs`/`OpfsDatabase.create`) into the
     unified `create(opts)` shape.
 - [ ] **Storage hosts** — the five-method `BlockStore` byte device, host catalog, and decoration layering (encryption codec above the seam, replication tee below) authored in [hosts.md](spec/design/hosts.md). **Landed:** the per-core `FileBlockStore`s, the Node `fs` host, and the **Browser/OPFS host** (`FileSystemSyncAccessHandle` → engine in a Web Worker, file-host parity vs goldens, gated Playwright e2e). **Open:** OPFS disk-spill and running the real-browser e2e inside `rake ci`. → [hosts.md §3/§5/§7](spec/design/hosts.md)
@@ -358,8 +358,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   `resource/query_memory_pending.test`. See [memory.md](spec/design/memory.md) §7.
   - [ ] _follow-on:_ a within-statement check (today a statement's own writes are checked once it
     completes, like `temp_buffers`), and a net-residency measure (today a rewrite charges again).
-- [ ] **Q4 — storage.** Database-owned accounts for page caches and committed in-memory
-  storage.
+- [ ] **Q4a — committed in-memory storage.** ⏳ **Designed, not built**
+  ([memory.md §8](spec/design/memory.md)): a database-owned `max_storage_bytes` (create/attach
+  option + handle setter, unlimited by default, in-memory backings only — `0A000` on files) over
+  `page_count × page_size`, checked at commit before any write; a commit that raises the
+  high-water past the limit fails `54P06` after one forced compaction. Promotes the compaction
+  trigger constants to shared spec data; adds a `storage_bytes` gauge, a `# max_storage_bytes:`
+  corpus directive, and a cross-core final-`storage_bytes` comparison. Page caches stay
+  evict-only under `cache_bytes` (§8.6). _(size: M–L; ×3 cores)_
+  - [ ] _follow-on:_ a file-backed database-size cap over the **live** page count (§8.7 — the
+    high-water is co-residence-timing-dependent under shared access); bounding the interior
+    skeleton and resident GiST R-tree once they page.
 - [ ] Remaining scalar/codec allocations (concatenation, array/JSON construction) under the
   scalar allowance. Until Q4 lands, public docs must distinguish the implemented budgets
   from a full heap limit.
