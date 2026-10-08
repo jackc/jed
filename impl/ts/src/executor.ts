@@ -324,6 +324,8 @@ import {
   jsonbOut,
   makeObject as jsonMakeObject,
   nodeToText,
+  pretty as jsonPretty,
+  prettySize as jsonPrettySize,
 } from "./json.ts";
 import { elementScalar, encodeRangeKey, rangeByName, rangeOverlaps } from "./range.ts";
 import {
@@ -814,6 +816,30 @@ export function chargeOutput(meter: Meter, out: Value): void {
   if (out.kind === "null") return;
   meter.charge(COSTS.scalarByte * BigInt(payloadBytes(out)));
   meter.guard();
+}
+
+// growthResult returns a growth kernel's result after charging it, unless every operand is constant
+// (cost.md §8.1).
+export function growthResult(meter: Meter, args: RExpr[], out: Value): Value {
+  if (!args.every(rexprIsConstant)) chargeOutput(meter, out);
+  return out;
+}
+
+// jsonbPrettyText is jsonb_pretty(j) (json-sql-functions.md §2): an amplifier, because indentation
+// grows with depth times node count (cost.md §8.1). The input payload is charged, then the exact
+// rendering size is computed, capped at MAX_RESULT_CHARS (54000), charged, and reserved before
+// rendering.
+export function jsonbPrettyText(arg: Value, meter: Meter): string {
+  meter.charge(COSTS.scalarByte * BigInt(payloadBytes(arg)));
+  meter.guard();
+  const node = jsonArgNode(arg);
+  const size = jsonPrettySize(node);
+  if (size > MAX_RESULT_CHARS)
+    throw engineError("program_limit_exceeded", "requested length too large");
+  meter.charge(COSTS.scalarByte * size);
+  meter.guard();
+  meter.reserveScalar(size);
+  return jsonPretty(node);
 }
 
 // replaceText is replace(s, from, to) (string-functions.md §3): replace every non-overlapping
@@ -25084,6 +25110,7 @@ export function evalJsonSqlResult(
   wrapper: JsonWrapper,
   onEmpty: JsonOnBehavior,
   onError: JsonOnBehavior,
+  constant: boolean,
   env: EvalEnv,
   meter: Meter,
 ): Value {
@@ -25138,6 +25165,9 @@ export function evalJsonSqlResult(
       }
     }
     case "query": {
+      // Whether a wrapper built an array: then JSON_QUERY is a growth kernel (cost.md §8.1).
+      const wrapped =
+        wrapper === "unconditional" || (wrapper === "conditional" && seq.length !== 1);
       let node: JsonNode;
       switch (wrapper) {
         case "unconditional":
@@ -25175,7 +25205,10 @@ export function evalJsonSqlResult(
       // A wrapper nests the items one level (json.md §6.4) — not a SQL/JSON error, so it is raised
       // regardless of ON ERROR.
       jsonCheckDepth(node);
-      return jsonNodeAsReturning(node, returning, env, meter);
+      const out = jsonNodeAsReturning(node, returning, env, meter);
+      // constant: the context and path are both constant operands (cost.md §8.1).
+      if (wrapped && !constant) chargeOutput(meter, out);
+      return out;
     }
   }
 }
@@ -25335,7 +25368,8 @@ export function evalJtRegular(
     throw e;
   }
   const kind: JsonSqlKind = query ? "query" : "value";
-  return evalJsonSqlResult(kind, seq, returning, decimal, wrapper, onEmpty, onError, env, meter);
+  // A JSON_TABLE row item is never a constant operand, so a wrapped column charges its array.
+  return evalJsonSqlResult(kind, seq, returning, decimal, wrapper, onEmpty, onError, false, env, meter);
 }
 
 // evalJtExists evaluates an `EXISTS` `JSON_TABLE` column over a row item — JSON_EXISTS, coerced to

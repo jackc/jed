@@ -195,6 +195,44 @@ func allConstant(args []*rExpr) bool {
 	return true
 }
 
+// growthResult returns a growth kernel's result after charging it, unless every operand is constant
+// (cost.md §8.1).
+func growthResult(m *costMeter, args []*rExpr, out Value) (Value, error) {
+	if !allConstant(args) {
+		if err := chargeOutput(m, out); err != nil {
+			return Value{}, err
+		}
+	}
+	return out, nil
+}
+
+// jsonbPrettyText is jsonb_pretty(j) (json-sql-functions.md §2): an amplifier, because indentation
+// grows with depth times node count (cost.md §8.1). The input payload is charged, then the exact
+// rendering size is computed, capped at maxResultChars (54000), charged, and reserved before
+// rendering.
+func jsonbPrettyText(arg Value, m *costMeter) (string, error) {
+	m.Charge(costs.ScalarByte * memPayloadBytes(arg))
+	if err := m.Guard(); err != nil {
+		return "", err
+	}
+	node, err := jsonArgNode(arg)
+	if err != nil {
+		return "", err
+	}
+	size := jsonPrettySize(&node)
+	if size > maxResultChars {
+		return "", newError(ProgramLimitExceeded, "requested length too large")
+	}
+	m.Charge(costs.ScalarByte * size)
+	if err := m.Guard(); err != nil {
+		return "", err
+	}
+	if err := m.ReserveScalar(size); err != nil {
+		return "", err
+	}
+	return jsonPretty(&node), nil
+}
+
 // replaceText is replace(s, from, to) (string-functions.md §3): replace every non-overlapping
 // occurrence of from; an empty from matches nothing (PostgreSQL; strings.ReplaceAll would instead
 // splice to between every character). An amplifier (cost.md §8.1): the input scan is charged, then

@@ -668,7 +668,12 @@ impl RExpr {
                         // Wrapping a non-array operand can deepen the result (json.md §6.4).
                         let out = json::concat(na, nb);
                         json::check_depth(&out)?;
-                        Ok(Value::Jsonb(out))
+                        let out = Value::Jsonb(out);
+                        // A growth kernel (cost.md §8.1), free over constant operands.
+                        if !(rexpr_is_constant(a) && rexpr_is_constant(b)) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
                     }
                     (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                     _ => unreachable!("resolver guarantees jsonb operands for ||"),
@@ -753,7 +758,12 @@ impl RExpr {
                 };
                 // Inserting a document inside another can deepen the result (json.md §6.4).
                 json::check_depth(&out)?;
-                Ok(Value::Jsonb(out))
+                let out = Value::Jsonb(out);
+                // A growth kernel (cost.md §8.1), free over constant operands.
+                if !args.iter().all(rexpr_is_constant) {
+                    charge_output(m, &out)?;
+                }
+                Ok(out)
             }
             // json_object / jsonb_object (json-sql-functions.md §2): build an object from text array(s).
             RExpr::JsonObjectFromArrays { json, args } => {
@@ -797,7 +807,7 @@ impl RExpr {
                 m.charge(COSTS.operator_eval * pairs.len() as i64);
                 m.guard()?;
                 // A NULL key → 22004; a NULL value → JSON null, else a JSON string of its text.
-                if *json {
+                let out = if *json {
                     let mut parts = Vec::with_capacity(pairs.len());
                     for (k, v) in &pairs {
                         let key = k.as_ref().ok_or_else(object_key_null)?;
@@ -811,7 +821,7 @@ impl RExpr {
                             val
                         ));
                     }
-                    Ok(Value::Json(format!("{{{}}}", parts.join(", "))))
+                    Value::Json(format!("{{{}}}", parts.join(", ")))
                 } else {
                     let mut members = Vec::with_capacity(pairs.len());
                     for (k, v) in pairs {
@@ -822,8 +832,13 @@ impl RExpr {
                         };
                         members.push((key, node));
                     }
-                    Ok(Value::Jsonb(json::make_object(members)))
+                    Value::Jsonb(json::make_object(members))
+                };
+                // A growth kernel (cost.md §8.1), free over constant operands.
+                if !args.iter().all(rexpr_is_constant) {
+                    charge_output(m, &out)?;
                 }
+                Ok(out)
             }
             // A scalar jsonpath query function (P2, jsonpath.md §5). STRICT: a NULL ctx/path → NULL.
             RExpr::JsonPathFn { kind, args } => {
@@ -846,7 +861,12 @@ impl RExpr {
                         // Wrapping the items in an array can deepen the result (json.md §6.4).
                         let out = JsonNode::Array(seq);
                         json::check_depth(&out)?;
-                        Ok(Value::Jsonb(out))
+                        let out = Value::Jsonb(out);
+                        // A growth kernel (cost.md §8.1), free over constant operands.
+                        if !args.iter().all(rexpr_is_constant) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
                     }
                     // jsonb_path_match: the path must produce EXACTLY one boolean item (or a JSON
                     // null — an unknown predicate — which is SQL NULL).
@@ -896,8 +916,10 @@ impl RExpr {
                 };
                 m.charge(COSTS.operator_eval * seq.len() as i64);
                 m.guard()?;
+                let constant = rexpr_is_constant(ctx) && rexpr_is_constant(path);
                 eval_json_sql_result(
-                    *kind, seq, *returning, *decimal, *wrapper, *on_empty, *on_error, env, m,
+                    *kind, seq, *returning, *decimal, *wrapper, *on_empty, *on_error, constant,
+                    env, m,
                 )
             }
             RExpr::And(l, r) => {
@@ -2282,15 +2304,17 @@ impl RExpr {
                             &node,
                         ))))
                     }
-                    ScalarFunc::JsonbPretty => {
-                        let node = json_arg_node(&vals[0])?;
-                        Ok(Value::Text(json::pretty(&node)))
-                    }
+                    ScalarFunc::JsonbPretty => Ok(Value::Text(jsonb_pretty_text(&vals[0], m)?)),
                     ScalarFunc::ToJsonb => {
                         // An array of json/jsonb elements nests them one level (json.md §6.4).
                         let out = value_to_node(&vals[0])?;
                         json::check_depth(&out)?;
-                        Ok(Value::Jsonb(out))
+                        let out = Value::Jsonb(out);
+                        // A growth kernel (cost.md §8.1), free over constant operands.
+                        if !args.iter().all(rexpr_is_constant) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
                     }
                     // JSON_SCALAR(v) → the value's JSON scalar as `json` (number/boolean/string). The
                     // datetime/uuid/bytea/interval/float sources are a deferred 0A000 follow-on.
@@ -2307,21 +2331,38 @@ impl RExpr {
                                 ));
                             }
                         };
-                        Ok(Value::Json(json::json_compact_out(&node)))
+                        let out = Value::Json(json::json_compact_out(&node));
+                        // A growth kernel: escaping can expand a string (cost.md §8.1).
+                        if !args.iter().all(rexpr_is_constant) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
                     }
                     // JSON_SERIALIZE(v) → the value's text serialization: json verbatim, jsonb canonical.
-                    ScalarFunc::JsonSerialize => Ok(Value::Text(match &vals[0] {
-                        Value::Json(s) => s.clone(),
-                        Value::Jsonb(n) => json::jsonb_out(n),
-                        _ => unreachable!("resolver restricts JSON_SERIALIZE to json/jsonb"),
-                    })),
+                    ScalarFunc::JsonSerialize => {
+                        let out = Value::Text(match &vals[0] {
+                            Value::Json(s) => s.clone(),
+                            Value::Jsonb(n) => json::jsonb_out(n),
+                            _ => unreachable!("resolver restricts JSON_SERIALIZE to json/jsonb"),
+                        });
+                        // A growth kernel (cost.md §8.1), free over constant operands.
+                        if !args.iter().all(rexpr_is_constant) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
+                    }
                     // to_json → the value's `json` image: a jsonb input renders canonical-spaced, a
                     // json input verbatim, everything else the compact to_jsonb render (PG's
                     // datum_to_json). This is the same per-type rule the json builders embed.
                     ScalarFunc::ToJson => {
                         let out = elem_json_text(&vals[0])?;
                         json::check_text_depth(&out)?;
-                        Ok(Value::Json(out))
+                        let out = Value::Json(out);
+                        // A growth kernel (cost.md §8.1), free over constant operands.
+                        if !args.iter().all(rexpr_is_constant) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
                     }
                     // length(text) → i32 — the number of characters (Unicode code points). Rust
                     // String is UTF-8, so `chars()` yields one item per code point (string-functions.md §3).
@@ -2547,7 +2588,10 @@ impl RExpr {
                 // The builders are growth kernels (cost.md §8.1), free over constant operands.
                 if matches!(
                     func,
-                    ArrayFunc::ArrayAppend | ArrayFunc::ArrayPrepend | ArrayFunc::ArrayCat
+                    ArrayFunc::ArrayAppend
+                        | ArrayFunc::ArrayPrepend
+                        | ArrayFunc::ArrayCat
+                        | ArrayFunc::ArrayToJson
                 ) && !args.iter().all(rexpr_is_constant)
                 {
                     charge_output(m, &out)?;
@@ -2644,7 +2688,7 @@ impl RExpr {
                 };
                 m.charge(COSTS.operator_eval * vals.len() as i64);
                 m.guard()?;
-                match kind {
+                let out = match kind {
                     JsonBuildKind::Array => {
                         if *json {
                             let mut parts = Vec::with_capacity(vals.len());
@@ -2654,7 +2698,7 @@ impl RExpr {
                             // The builders nest their arguments one level (json.md §6.4).
                             let out = format!("[{}]", parts.join(", "));
                             json::check_text_depth(&out)?;
-                            Ok(Value::Json(out))
+                            Value::Json(out)
                         } else {
                             let mut nodes = Vec::with_capacity(vals.len());
                             for v in &vals {
@@ -2662,7 +2706,7 @@ impl RExpr {
                             }
                             let out = JsonNode::Array(nodes);
                             json::check_depth(&out)?;
-                            Ok(Value::Jsonb(out))
+                            Value::Jsonb(out)
                         }
                     }
                     JsonBuildKind::Object => {
@@ -2684,7 +2728,7 @@ impl RExpr {
                             }
                             let out = format!("{{{}}}", parts.join(", "));
                             json::check_text_depth(&out)?;
-                            Ok(Value::Json(out))
+                            Value::Json(out)
                         } else {
                             let mut members = Vec::with_capacity(vals.len() / 2);
                             for (i, pair) in vals.chunks_exact(2).enumerate() {
@@ -2693,10 +2737,15 @@ impl RExpr {
                             }
                             let out = json::make_object(members);
                             json::check_depth(&out)?;
-                            Ok(Value::Jsonb(out))
+                            Value::Jsonb(out)
                         }
                     }
+                };
+                // A growth kernel (cost.md §8.1), free over constant operands.
+                if !args.iter().all(rexpr_is_constant) {
+                    charge_output(m, &out)?;
                 }
+                Ok(out)
             }
             // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
             // Push the current row onto the outer-row stack, run the inner plan against it, fold

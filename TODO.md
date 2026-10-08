@@ -393,9 +393,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   full heap limit.
   - [x] _S1:_ `ARRAY[…]`, array `||`/append/prepend/cat; `replace`, `regexp_replace`,
     `array_replace` (`resource/scalar_output.test`).
-  - [ ] _S2:_ JSON construction (jsonb `||`, `jsonb_set`/`insert`, the build/ctor functions,
-    `to_json[b]`, `array_to_json`, `json_scalar`/`json_serialize`, `jsonb_path_query_array`) and
-    `jsonb_pretty`.
+  - [x] _S2:_ JSON construction (jsonb `||`, `jsonb_set`/`insert`, the build/ctor functions,
+    `to_json[b]`, `array_to_json`, `json_scalar`/`json_serialize`, `jsonb_path_query_array`, the
+    `JSON_QUERY` wrapper) and `jsonb_pretty` (`resource/scalar_output_json.test`).
   - [ ] _S3:_ escaping renders: `encode`, `quote_*`, and casts to text from containers, JSON, and
     `bytea`.
   - [ ] _follow-on:_ the `jsonpath_step` unit ([jsonpath.md §7](spec/design/jsonpath.md)), designed

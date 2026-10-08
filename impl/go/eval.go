@@ -1722,7 +1722,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err := checkJSONDepth(&out); err != nil {
 			return Value{}, err
 		}
-		return JsonbValue(out), nil
+		return growthResult(m, []*rExpr{e.lhs, e.rhs}, JsonbValue(out))
 	case reJsonDelete:
 		// `jsonb - text|int|text[]` / `jsonb #- text[]` mutation deletes (json-sql-functions.md §1,
 		// J6). One operator_eval; STRICT — a NULL base or argument yields SQL NULL.
@@ -2761,11 +2761,11 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			stripped := jsonStripNulls(&node)
 			return JsonValue(jsonCompactOut(&stripped)), nil
 		case sfJsonbPretty:
-			node, err := jsonArgNode(vals[0])
+			r, err := jsonbPrettyText(vals[0], m)
 			if err != nil {
 				return Value{}, err
 			}
-			return TextValue(jsonPretty(&node)), nil
+			return TextValue(r), nil
 		case sfToJsonb:
 			// to_jsonb(anyelement) → the JSON image of the value (json-sql-functions.md §2). STRICT:
 			// the NULL-input case is handled by the blanket propagation above.
@@ -2777,7 +2777,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err := checkJSONDepth(&node); err != nil {
 				return Value{}, err
 			}
-			return JsonbValue(node), nil
+			return growthResult(m, e.sargs, JsonbValue(node))
 		case sfToJson:
 			// to_json(anyelement) → the value's `json` image (json-sql-functions.md §2): a jsonb input
 			// renders canonical-spaced, a json input verbatim, everything else the compact to_jsonb
@@ -2790,7 +2790,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err := checkJSONTextDepth(s); err != nil {
 				return Value{}, err
 			}
-			return JsonValue(s), nil
+			return growthResult(m, e.sargs, JsonValue(s))
 		case sfJsonScalar:
 			// JSON_SCALAR(v) → the value's JSON scalar as `json`, rendered compact (json-sql-functions.md
 			// §5): an integer/decimal → a JSON number, a boolean → a JSON boolean, text → a JSON string.
@@ -2809,16 +2809,17 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			default:
 				return Value{}, newError(FeatureNotSupported, "JSON_SCALAR of this type is not supported yet")
 			}
-			return JsonValue(jsonCompactOut(&node)), nil
+			// A growth kernel: escaping can expand a string (cost.md §8.1).
+			return growthResult(m, e.sargs, JsonValue(jsonCompactOut(&node)))
 		case sfJsonSerialize:
 			// JSON_SERIALIZE(v) → the value's text serialization (json-sql-functions.md §5): a json input
 			// is its verbatim text, a jsonb input its canonical render (jsonbOut). STRICT: the NULL-input
 			// case is handled by the blanket propagation above.
 			switch vals[0].Kind {
 			case ValJson:
-				return TextValue(vals[0].str()), nil
+				return growthResult(m, e.sargs, TextValue(vals[0].str()))
 			case ValJsonb:
-				return TextValue(jsonbOut(vals[0].jsonb())), nil
+				return growthResult(m, e.sargs, TextValue(jsonbOut(vals[0].jsonb())))
 			default:
 				panic("BUG: resolver restricts JSON_SERIALIZE to json/jsonb")
 			}
@@ -3210,7 +3211,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return Value{}, err
 		}
 		// The builders are growth kernels (cost.md §8.1), free over constant operands.
-		if (e.afunc == afAppend || e.afunc == afPrepend || e.afunc == afCat) && !allConstant(e.sargs) {
+		if (e.afunc == afAppend || e.afunc == afPrepend || e.afunc == afCat || e.afunc == afToJson) && !allConstant(e.sargs) {
 			if err := chargeOutput(m, out); err != nil {
 				return Value{}, err
 			}
@@ -3343,7 +3344,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				if err := checkJSONTextDepth(out); err != nil {
 					return Value{}, err
 				}
-				return JsonValue(out), nil
+				return growthResult(m, e.sargs, JsonValue(out))
 			}
 			nodes := make([]JsonNode, len(vals))
 			for i := range vals {
@@ -3357,7 +3358,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err := checkJSONDepth(&out); err != nil {
 				return Value{}, err
 			}
-			return JsonbValue(out), nil
+			return growthResult(m, e.sargs, JsonbValue(out))
 		default: // jbObject
 			if len(vals)%2 != 0 {
 				return Value{}, newError(InvalidParameterValue,
@@ -3380,7 +3381,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				if err := checkJSONTextDepth(out); err != nil {
 					return Value{}, err
 				}
-				return JsonValue(out), nil
+				return growthResult(m, e.sargs, JsonValue(out))
 			}
 			members := make([]JsonMember, 0, len(vals)/2)
 			for i := 0; i < len(vals); i += 2 {
@@ -3398,7 +3399,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err := checkJSONDepth(&out); err != nil {
 				return Value{}, err
 			}
-			return JsonbValue(out), nil
+			return growthResult(m, e.sargs, JsonbValue(out))
 		}
 	case reJsonObject:
 		// json_object / jsonb_object (json-sql-functions.md §2): build an object from text array(s).
@@ -3453,7 +3454,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				}
 				parts = append(parts, jsonCompactOut(&JsonNode{Kind: JString, S: *p.key})+" : "+val)
 			}
-			return JsonValue("{" + strings.Join(parts, ", ") + "}"), nil
+			return growthResult(m, e.sargs, JsonValue("{"+strings.Join(parts, ", ")+"}"))
 		}
 		members := make([]JsonMember, 0, len(pairs))
 		for _, p := range pairs {
@@ -3466,7 +3467,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			members = append(members, JsonMember{Key: *p.key, Val: node})
 		}
-		return JsonbValue(makeObject(members)), nil
+		return growthResult(m, e.sargs, JsonbValue(makeObject(members)))
 	case reJsonSetInsert:
 		// jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL argument
 		// (or a NULL path element) → SQL NULL. One operator_eval; the args charge their own.
@@ -3520,7 +3521,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err := checkJSONDepth(&out); err != nil {
 			return Value{}, err
 		}
-		return JsonbValue(out), nil
+		return growthResult(m, e.sargs, JsonbValue(out))
 	case reJsonPathFn:
 		// A scalar jsonpath query function (P2, jsonpath.md §5). STRICT: a NULL ctx/path → NULL.
 		m.Charge(costs.OperatorEval)
@@ -3574,7 +3575,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err := checkJSONDepth(&out); err != nil {
 				return Value{}, err
 			}
-			return JsonbValue(out), nil
+			return growthResult(m, e.sargs, JsonbValue(out))
 		}
 	case reJsonSqlFn:
 		// A SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY (json-sql-functions.md §5,
@@ -3608,7 +3609,8 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
-		return evalJSONSqlResult(e.jsKind, seq, e.result, e.jsWrapper, e.jsOnEmpty, e.jsOnError, env, m)
+		constant := rexprIsConstant(e.sargs[0]) && rexprIsConstant(e.sargs[1])
+		return evalJSONSqlResult(e.jsKind, seq, e.result, e.jsWrapper, e.jsOnEmpty, e.jsOnError, constant, env, m)
 	case reSubquery:
 		// A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
 		// Push the current row onto the outer-row stack, run the inner plan, fold its accrued

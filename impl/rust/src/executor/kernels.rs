@@ -200,6 +200,28 @@ pub(crate) fn regexp_replace_text(
     Ok(crate::regex::replace_build(orig_chars, repl, &found, size))
 }
 
+/// `jsonb_pretty(j)` (json-sql-functions.md §2): an amplifier, because indentation grows with depth
+/// times node count (cost.md §8.1). The input payload is charged, then the exact rendering size is
+/// computed, capped at `MAX_RESULT_CHARS` (`54000`), charged, and reserved before rendering.
+pub(crate) fn jsonb_pretty_text(arg: &Value, meter: &mut Meter) -> Result<String> {
+    meter.charge(COSTS.scalar_byte * crate::memsize::payload_bytes(arg));
+    meter.guard()?;
+    let node = json_arg_node(arg)?;
+    let size = json::pretty_size(&node);
+    if size > MAX_RESULT_CHARS {
+        return Err(EngineError::new(
+            SqlState::ProgramLimitExceeded,
+            "requested length too large",
+        ));
+    }
+    meter.charge(COSTS.scalar_byte * size);
+    meter.guard()?;
+    meter.reserve_scalar(size)?;
+    let out = json::pretty(&node);
+    debug_assert_eq!(out.len() as i64, size, "pretty_size disagrees with pretty");
+    Ok(out)
+}
+
 /// `split_part(s, delim, n)` (string-functions.md §3): split `s` on the substring `delim` and return
 /// the n-th field (1-based; a negative n counts from the end). Out of range → `''`; `n = 0` traps
 /// `22023`. An EMPTY `delim` treats the whole string as one field (str::split would otherwise split

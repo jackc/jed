@@ -1473,6 +1473,48 @@ func jsonPretty(node *JsonNode) string {
 	return b.String()
 }
 
+// jsonPrettySize is the exact UTF-8 byte length of jsonPretty's rendering, computed without building
+// it: the jsonb_pretty amplifier sizes its output before allocating (spec/design/cost.md §8.1).
+// Mirrors writePrettyJSON: brackets, a newline plus four spaces per level before each member and the
+// close, commas, and ": " plus the escaped key per object member. Each scalar and key is rendered on
+// its own to measure it; that scratch is bounded by the input.
+func jsonPrettySize(node *JsonNode) int64 {
+	return jsonPrettySizeAt(node, 0)
+}
+
+func jsonPrettySizeAt(node *JsonNode, indent int64) int64 {
+	// The open bracket, then the close on its own line at this container's indent.
+	shell := 1 + 1 + 4*indent + 1
+	// Before each member: a comma after the first, then a newline and the member's indent.
+	lead := func(i int) int64 {
+		n := 1 + 4*(indent+1)
+		if i > 0 {
+			n++
+		}
+		return n
+	}
+	switch node.Kind {
+	case JObject:
+		size := shell
+		for i := range node.Obj {
+			var key strings.Builder
+			writeJSONString(node.Obj[i].Key, &key)
+			size += lead(i) + int64(key.Len()) + 2 + jsonPrettySizeAt(&node.Obj[i].Val, indent+1)
+		}
+		return size
+	case JArray:
+		size := shell
+		for i := range node.Arr {
+			size += lead(i) + jsonPrettySizeAt(&node.Arr[i], indent+1)
+		}
+		return size
+	default:
+		var b strings.Builder
+		writeJSONNode(node, &b)
+		return int64(b.Len())
+	}
+}
+
 func writePrettyJSON(node *JsonNode, indent int, out *strings.Builder) {
 	switch node.Kind {
 	case JObject:

@@ -1136,6 +1136,45 @@ pub fn pretty(node: &JsonNode) -> String {
     s
 }
 
+/// The exact UTF-8 byte length of [`pretty`]'s rendering, computed without building it: the
+/// `jsonb_pretty` amplifier sizes its output before allocating (spec/design/cost.md §8.1). Mirrors
+/// [`write_pretty`]: brackets, a newline plus four spaces per level before each member and the close,
+/// commas, and `": "` plus the escaped key per object member. Each scalar and key is rendered on its
+/// own to measure it; that scratch is bounded by the input.
+pub fn pretty_size(node: &JsonNode) -> i64 {
+    pretty_size_at(node, 0)
+}
+
+fn pretty_size_at(node: &JsonNode, indent: i64) -> i64 {
+    // The open bracket, then the close on its own line at this container's indent.
+    let shell = 1 + 1 + 4 * indent + 1;
+    // Before each member: a comma after the first, then a newline and the member's indent.
+    let lead = |i: usize| (i > 0) as i64 + 1 + 4 * (indent + 1);
+    match node {
+        JsonNode::Object(members) => {
+            let mut size = shell;
+            for (i, (k, v)) in members.iter().enumerate() {
+                let mut key = String::new();
+                write_json_string(k, &mut key);
+                size += lead(i) + key.len() as i64 + 2 + pretty_size_at(v, indent + 1);
+            }
+            size
+        }
+        JsonNode::Array(elems) => {
+            let mut size = shell;
+            for (i, e) in elems.iter().enumerate() {
+                size += lead(i) + pretty_size_at(e, indent + 1);
+            }
+            size
+        }
+        scalar => {
+            let mut s = String::new();
+            write_node(scalar, &mut s);
+            s.len() as i64
+        }
+    }
+}
+
 fn write_pretty(node: &JsonNode, indent: usize, out: &mut String) {
     // PG `jsonb_pretty` ALWAYS multi-lines a container (even an empty one: `{` newline, then the
     // close at the container's own indent → `{\n}` / `{\n    }`), and renders scalars inline.

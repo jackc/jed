@@ -14,6 +14,7 @@
 
 import { Decimal, EXP_LIMIT, decimalFromParts } from "./decimal.ts";
 import { type EngineError, engineError } from "./errors.ts";
+import { utf8Length } from "./memsize.ts";
 
 // JsonNode is a `jsonb` node — the in-memory canonical tree (spec/design/json.md §2). Object members
 // are kept in canonical key order (shorter key first, ties bytewise) with duplicates removed
@@ -1222,6 +1223,52 @@ export function pretty(node: JsonNode): string {
   const parts: string[] = [];
   writePretty(node, 0, parts);
   return parts.join("");
+}
+
+// prettySize is the exact UTF-8 byte length of pretty's rendering, computed without building it: the
+// jsonb_pretty amplifier sizes its output before allocating (spec/design/cost.md §8.1). Mirrors
+// writePretty: brackets, a newline plus four spaces per level before each member and the close,
+// commas, and ": " plus the escaped key per object member. Each scalar and key is rendered on its own
+// to measure it; that scratch is bounded by the input.
+export function prettySize(node: JsonNode): bigint {
+  return BigInt(prettySizeAt(node, 0));
+}
+
+function renderedLength(write: (out: string[]) => void): number {
+  const out: string[] = [];
+  write(out);
+  let n = 0;
+  for (const part of out) n += utf8Length(part);
+  return n;
+}
+
+function prettySizeAt(node: JsonNode, indent: number): number {
+  // The open bracket, then the close on its own line at this container's indent.
+  const shell = 1 + 1 + 4 * indent + 1;
+  // Before each member: a comma after the first, then a newline and the member's indent.
+  const lead = (i: number): number => (i > 0 ? 1 : 0) + 1 + 4 * (indent + 1);
+  switch (node.kind) {
+    case "object": {
+      let size = shell;
+      node.members.forEach((m, i) => {
+        size +=
+          lead(i) +
+          renderedLength((out) => writeJsonString(m.key, out)) +
+          2 +
+          prettySizeAt(m.value, indent + 1);
+      });
+      return size;
+    }
+    case "array": {
+      let size = shell;
+      node.elements.forEach((e, i) => {
+        size += lead(i) + prettySizeAt(e, indent + 1);
+      });
+      return size;
+    }
+    default:
+      return renderedLength((out) => writeNode(node, out));
+  }
 }
 
 function writePretty(node: JsonNode, indent: number, out: string[]): void {

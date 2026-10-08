@@ -52,15 +52,16 @@ exact equality is allowed. The budget resets for each statement and accumulates 
 calls, rows, subqueries and CTEs. A cursor keeps its original budget until it closes.
 
 This budget covers the functions where one call can multiply its input by an amount an argument
-controls: the exact output bytes of **`repeat`, `lpad`, `rpad`, `replace`, `regexp_replace`**
-(UTF-8) and **`array_replace`**, and logical scratch reservations in **decimal `sqrt`, `exp`,
+controls: the exact output bytes of **`repeat`, `lpad`, `rpad`, `replace`, `regexp_replace`,
+`jsonb_pretty`** (UTF-8) and **`array_replace`**, and logical scratch reservations in **decimal `sqrt`, `exp`,
 `ln`, `log`, `log10`, `power`, `pow`**. These functions also charge their input and output bytes
 as cost before they build anything; decimals charge inside their algorithms. A cost ceiling can
 reject the work before its allocation budget is used.
 
-Functions that only combine their inputs, such as `ARRAY[…]`, `array_append`, `array_cat`, and
-array `||`, do not use this budget, so large bulk statements are not capped by it. Instead they
-charge one cost unit per byte they build (32 per array element plus its contents), which lets
+Functions that only combine their inputs, such as `ARRAY[…]`, `array_append`, `array_cat`, array
+`||`, and the JSON builders (`jsonb_build_object`, `to_jsonb`, `jsonb_set`, jsonb `||`, and the
+like), do not use this budget, so large bulk statements are not capped by it. Instead they charge
+one cost unit per byte they build (32 per array element or JSON node plus its contents), which lets
 `max_cost` stop a query that doubles a value over and over. An array built only from constants,
 such as `ARRAY[1, 2, 3]` in a `WHERE` clause, costs nothing extra.
 

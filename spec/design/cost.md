@@ -1793,8 +1793,8 @@ The exact charge sites are specified alongside the kernels in decimal.md.
 
 ### 8.1 Output-constructing kernels
 
-> **Status: S1 implemented** in all three cores (`resource/scalar_output.test`). S2 and S3
-> are designed, not built.
+> **Status: S1 and S2 implemented** in all three cores (`resource/scalar_output.test`,
+> `resource/scalar_output_json.test`). S3 is designed, not built.
 
 The `repeat`/pad rule generalizes. A kernel that **builds** a variable-width value
 can produce bytes that no earlier charge paid for. It can combine operands
@@ -1838,7 +1838,7 @@ existing members.
 | `replace(s, from, to)` | amplifier | S1 | UTF-8 bytes of `s` | UTF-8 bytes of the result |
 | `regexp_replace` | amplifier | S1 | none beyond `regex_step` | UTF-8 bytes of the result |
 | `array_replace(a, old, new)` | amplifier | S1 | `payload(a)` | `payload(result)` |
-| jsonb `\|\|`, `jsonb_set`, `jsonb_insert`, `jsonb_build_array`/`_object`, `json_build_array`/`_object`, `JSON_ARRAY`, `JSON_OBJECT`, `jsonb_object(text[], …)`, `to_json`, `to_jsonb`, `array_to_json`, `json_scalar`, `json_serialize`, `jsonb_path_query_array` | growth | S2 | — | `payload(result)` |
+| jsonb `\|\|`, `jsonb_set`, `jsonb_insert`, `json[b]_build_array`/`_object` (spread or `VARIADIC`), `json[b]_object(text[] [, text[]])`, `to_json`, `to_jsonb`, `array_to_json`, `JSON_SCALAR`, `JSON_SERIALIZE`, `jsonb_path_query_array`, `JSON_QUERY` when a wrapper builds an array | growth | S2 | — | `payload(result)` |
 | `jsonb_pretty` | amplifier | S2 | `payload(jsonb)` | UTF-8 bytes of the result |
 | `encode`, `quote_literal`, `quote_ident`, `quote_nullable`; casts to `text` from array, composite, range, `json`, `jsonb`, `bytea` | growth | S3 | — | UTF-8 bytes of the result |
 
@@ -1859,8 +1859,13 @@ The amplifiers' exact sizes:
   matched elements `e`. Elements that compare equal can still differ in payload, for
   example decimals of different scale.
 - `jsonb_pretty`: the UTF-8 length of the rendering, computed by walking the tree
-  with the renderer's exact whitespace rules. Indentation makes the output grow with
-  depth times node count, which is why this kernel is an amplifier.
+  with the renderer's exact whitespace rules. A container contributes its brackets,
+  a newline plus `4 × depth` spaces before each member and before the close, a
+  comma between members, and `": "` plus the escaped key for each object member.
+  Each scalar contributes its own rendered length; a core may render scalars one at
+  a time to measure them, since each is bounded by its input. Indentation makes the
+  output grow with depth times node count (depth ≤ `MAX_JSON_DEPTH`,
+  [json.md](json.md) §6.4), which is why this kernel is an amplifier.
 
 `replace`, `regexp_replace`, and `jsonb_pretty` also reject a size above
 `MAX_RESULT_CHARS` with `54000`, before the output charge, like `repeat`.

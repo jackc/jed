@@ -1234,7 +1234,9 @@ func jsonNodeAsReturning(node JsonNode, returning scalarType, env *evalEnv, m *c
 
 // evalJSONSqlResult applies the SQL/JSON query-function semantics (JSON_VALUE / JSON_QUERY) to an
 // evaluated sequence. (JSON_EXISTS is handled inline — non-empty → true.)
-func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning scalarType, wrapper jsonWrapper, onEmpty, onError jsonOnBehavior, env *evalEnv, m *costMeter) (Value, error) {
+// constant reports that the context and path are both constant operands, so a wrapped JSON_QUERY
+// result is free like any constant growth kernel (cost.md §8.1).
+func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning scalarType, wrapper jsonWrapper, onEmpty, onError jsonOnBehavior, constant bool, env *evalEnv, m *costMeter) (Value, error) {
 	switch kind {
 	case jsExists:
 		return BoolValue(len(seq) > 0), nil
@@ -1265,6 +1267,8 @@ func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning scalarType, w
 		}
 		return v, nil
 	default: // jsQuery
+		// Whether a wrapper built an array: then JSON_QUERY is a growth kernel (cost.md §8.1).
+		wrapped := wrapper == jWUnconditional || (wrapper == jWConditional && len(seq) != 1)
 		var node JsonNode
 		switch wrapper {
 		case jWUnconditional:
@@ -1291,7 +1295,16 @@ func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning scalarType, w
 		if err := checkJSONDepth(&node); err != nil {
 			return Value{}, err
 		}
-		return jsonNodeAsReturning(node, returning, env, m)
+		out, err := jsonNodeAsReturning(node, returning, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if wrapped && !constant {
+			if err := chargeOutput(m, out); err != nil {
+				return Value{}, err
+			}
+		}
+		return out, nil
 	}
 }
 
@@ -1500,7 +1513,8 @@ func evalJtRegular(item *JsonNode, c *jtColRegular, env *evalEnv, m *costMeter) 
 	if c.query {
 		kind = jsQuery
 	}
-	return evalJSONSqlResult(kind, seq, c.returning, c.wrapper, c.onEmpty, c.onError, env, m)
+	// A JSON_TABLE row item is never a constant operand, so a wrapped column charges its array.
+	return evalJSONSqlResult(kind, seq, c.returning, c.wrapper, c.onEmpty, c.onError, false, env, m)
 }
 
 // evalJtExists evaluates an EXISTS JSON_TABLE column over a row item — JSON_EXISTS, coerced to the

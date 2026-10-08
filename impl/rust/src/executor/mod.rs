@@ -4378,6 +4378,7 @@ fn eval_json_sql_result(
     wrapper: JsonWrapper,
     on_empty: JsonOnBehavior,
     on_error: JsonOnBehavior,
+    constant: bool,
     env: &EvalEnv,
     meter: &mut Meter,
 ) -> Result<Value> {
@@ -4430,6 +4431,12 @@ fn eval_json_sql_result(
             }
         }
         JsonSqlKind::Query => {
+            // Whether a wrapper built an array: then JSON_QUERY is a growth kernel (cost.md §8.1).
+            let wrapped = match wrapper {
+                JsonWrapper::Unconditional => true,
+                JsonWrapper::Conditional => seq.len() != 1,
+                JsonWrapper::Without => false,
+            };
             let node = match wrapper {
                 JsonWrapper::Unconditional => JsonNode::Array(seq),
                 JsonWrapper::Conditional => {
@@ -4467,7 +4474,11 @@ fn eval_json_sql_result(
             // A wrapper nests the items one level (json.md §6.4) — not a SQL/JSON error, so it is
             // raised regardless of ON ERROR.
             json::check_depth(&node)?;
-            json_node_as_returning(node, returning, env, meter)
+            let out = json_node_as_returning(node, returning, env, meter)?;
+            if wrapped && !constant {
+                charge_output(meter, &out)?;
+            }
+            Ok(out)
         }
     }
 }
@@ -4662,8 +4673,9 @@ fn eval_jt_regular(
     } else {
         JsonSqlKind::Value
     };
+    // A JSON_TABLE row item is never a constant operand, so a wrapped column charges its array.
     eval_json_sql_result(
-        kind, seq, returning, decimal, wrapper, on_empty, on_error, env, meter,
+        kind, seq, returning, decimal, wrapper, on_empty, on_error, false, env, meter,
     )
 }
 
