@@ -111,8 +111,15 @@ fn main() -> ExitCode {
         // session state — session-local temp tables, a spanning transaction, a sticky lifetime budget,
         // or a pre-built fixture image (spec/design/conformance.md §3). These are `# skip: disk` and
         // covered by the memory pass only; none exercises the on-disk faulted read path anyway.
-        if disk && (is_conc || parse_skip_disk(&text)) {
+        if disk && (is_conc || parse_skip(&text, "disk")) {
             println!("SKIP {rel}  (disk-mode)");
+            skipped += 1;
+            continue;
+        }
+        // A file whose contract only holds on a file-backed database (`# skip: memory` — e.g. the
+        // bounded-spill lane, which an in-memory database never takes) runs in the disk pass only.
+        if !disk && parse_skip(&text, "memory") {
+            println!("SKIP {rel}  (memory-mode)");
             skipped += 1;
             continue;
         }
@@ -269,18 +276,19 @@ fn parse_fixture_directive(rest: &str) -> Option<String> {
     (!body.is_empty()).then(|| body.to_string())
 }
 
-/// Whether a file carries a `# skip: disk[ — free-text reason]` directive (spec/design/conformance.md
-/// §3) — it opts out of the on-disk reopen pass because its session state (temp tables, a spanning
-/// transaction, a sticky `lifetime_max_cost` budget) or its pre-built `# fixture:` image cannot
-/// survive a per-record reopen. Honored only in disk mode; the memory pass ignores it. The first
-/// whitespace token after `skip:` is the mode; any trailing text is a documentary reason.
-fn parse_skip_disk(text: &str) -> bool {
+/// Whether a file carries a `# skip: <mode>[ — free-text reason]` directive (spec/design/conformance.md
+/// §3). `# skip: disk` opts out of the on-disk reopen pass because its session state (temp tables, a
+/// spanning transaction, a sticky `lifetime_max_cost` budget) or its pre-built `# fixture:` image
+/// cannot survive a per-record reopen; `# skip: memory` opts out of the in-memory pass because its
+/// contract holds only on a file-backed database. The first whitespace token after `skip:` is the
+/// mode; any trailing text is a documentary reason.
+fn parse_skip(text: &str, mode: &str) -> bool {
     text.lines().any(|line| {
         line.trim()
             .strip_prefix('#')
             .and_then(|rest| rest.trim_start().strip_prefix("skip:"))
             .and_then(|v| v.split_whitespace().next())
-            == Some("disk")
+            == Some(mode)
     })
 }
 
@@ -472,6 +480,18 @@ fn parse_allow_temp_ddl_directive(rest: &str) -> Option<bool> {
         "off" | "false" | "no" => Some(false),
         _ => None,
     }
+}
+
+/// Parse a `# work_mem: N` directive body (spec/design/spill.md §3): the work-memory budget in bytes
+/// (`0` ⇒ unlimited, never spill) the next record runs under. It overrides `JED_CONFORMANCE_WORK_MEM`,
+/// so a record whose result depends on when operators spill (a query-memory threshold in the
+/// bounded-spill lane) pins it. Per-record, like `# max_cost:`.
+fn parse_work_mem_directive(rest: &str) -> Option<usize> {
+    rest.trim_start()
+        .strip_prefix("work_mem:")?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Parse a `# temp_buffers: N` directive body (spec/design/temp-tables.md §7): the per-session
@@ -667,6 +687,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
         })
         .unwrap_or(0);
     let mut pending_temp_buffers: Option<usize> = None;
+    let mut pending_work_mem: Option<usize> = None;
     let mut pending_vars: Vec<(String, String)> = Vec::new();
     let mut pending_timezone: Option<String> = None;
 
@@ -753,6 +774,8 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                 pending_query_memory = Some(n);
             } else if let Some(n) = parse_temp_buffers_directive(rest) {
                 pending_temp_buffers = Some(n);
+            } else if let Some(n) = parse_work_mem_directive(rest) {
+                pending_work_mem = Some(n);
             } else if let Some(vars) = parse_set_directive(rest) {
                 pending_vars.extend(vars);
             } else if let Some(z) = parse_timezone_directive(rest) {
@@ -792,13 +815,15 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
             sess = db.session(jed::SessionOptions::default());
         }
         // This record consumes any pending assertions (so they never leak forward).
-        if let Ok(bytes) = std::env::var("JED_CONFORMANCE_WORK_MEM") {
-            sess.set_work_mem(
+        // `# work_mem:` pins this record's budget; otherwise the forced-spill override
+        // (`JED_CONFORMANCE_WORK_MEM`), otherwise the default — set every record so none leaks forward.
+        sess.set_work_mem(pending_work_mem.take().unwrap_or_else(|| {
+            std::env::var("JED_CONFORMANCE_WORK_MEM").map_or(jed::DEFAULT_WORK_MEM, |bytes| {
                 bytes
                     .parse()
-                    .expect("JED_CONFORMANCE_WORK_MEM must be nonnegative bytes"),
-            );
-        }
+                    .expect("JED_CONFORMANCE_WORK_MEM must be nonnegative bytes")
+            })
+        }));
         let expected_cost = pending_cost.take();
         let expected_names = pending_names.take();
         let expected_types = pending_types.take();

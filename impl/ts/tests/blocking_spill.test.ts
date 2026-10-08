@@ -4,10 +4,17 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { RowSpool, SpillMap, SpillMultiMap, sortSpool } from "../src/blocking.ts";
+import { RowSpool, SpillMap, SpillMultiMap, SpoolSorter, sortSpool } from "../src/blocking.ts";
+import { QueryAccount, StateCharge } from "../src/cost.ts";
 import { EngineError, createDatabase, queryOutcome, render, type Engine } from "../src/tooling.ts";
 import { FileSpillSink } from "../src/spillfile.ts";
-import { decodeSpillRow, encodeSpillRow, type SpillScratch, type SpillSink } from "../src/spill.ts";
+import {
+  decodeSpillRow,
+  encodeSpillRow,
+  Sorter,
+  type SpillScratch,
+  type SpillSink,
+} from "../src/spill.ts";
 import { arrayValue, intValue, textValue } from "../src/value.ts";
 
 class CountedSink implements SpillSink {
@@ -197,4 +204,66 @@ test("spool and skewed bucket replay stay streaming with bounded descriptors", (
 test("scratch codec preserves signed values and empty recursive arrays", () => {
   const row = [intValue(-123n), arrayValue([]), arrayValue([intValue(-1n)])];
   assert.deepEqual(decodeSpillRow(encodeSpillRow(row)), row);
+});
+
+// An account well below work_mem makes each spill structure spill on its first rejected reservation
+// instead of throwing 54P05; the rejected element is uncharged, nothing stays charged once spilled,
+// and every element is still readable in order (memory.md §6.6).
+test("rejected reservations spill instead of failing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "jed-blocking-test-"));
+  const sink = new CountedSink(dir);
+  const budget = 1 << 30;
+  const charged = () => {
+    const acct = new QueryAccount(200);
+    return { acct, charge: new StateCharge(acct) };
+  };
+  const int = (row: readonly unknown[]) => Number((row[0] as { int: bigint }).int);
+  const compare = (a: readonly unknown[], b: readonly unknown[]) => int(a) - int(b);
+  const row = (i: number) => [intValue(BigInt(i)), textValue("x".repeat(40))];
+  const s = charged();
+  const spool = new RowSpool(budget, sink, s.charge);
+  const m = charged();
+  const map = new SpillMap(budget, sink, m.charge);
+  const h = charged();
+  const buckets = new SpillMultiMap(budget, sink, h.charge);
+  const so = charged();
+  const sorter = new Sorter(compare, budget, sink, so.charge);
+  const ss = charged();
+  const spoolSorter = new SpoolSorter(compare, budget, sink, ss.charge);
+  try {
+    for (let i = 0; i < 100; i++) {
+      spool.push(row(i));
+      map.set(`key:${i}`, row(i), 8);
+      buckets.append("hot", row(i));
+      sorter.push([intValue(BigInt(i % 7)), intValue(BigInt(i))]);
+      spoolSorter.push([intValue(BigInt(i % 7)), intValue(BigInt(i))]);
+      assert.ok(so.acct.used <= 200 && ss.acct.used <= 200);
+    }
+    for (const { acct } of [s, m, h]) assert.equal(acct.used, 0);
+    let count = 0;
+    for (const r of spool) assert.equal(int(r), count++);
+    assert.equal(count, 100);
+    assert.equal(int(map.get("key:42")!), 42);
+    count = 0;
+    for (const r of buckets.get("hot")) assert.equal(int(r), count++);
+    assert.equal(count, 100);
+    for (const sorted of [sorter.finish(), spoolSorter.finish()]) {
+      let previous = [-1, -1];
+      count = 0;
+      for (let r = sorted.next(); r !== null; r = sorted.next()) {
+        const key = int(r);
+        const position = Number((r[1] as { int: bigint }).int);
+        assert.ok(key > previous[0]! || (key === previous[0] && position > previous[1]!));
+        previous = [key, position];
+        count++;
+      }
+      assert.equal(count, 100);
+      sorted.close();
+    }
+  } finally {
+    spool.close();
+    map.close();
+    buckets.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

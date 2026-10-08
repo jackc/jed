@@ -349,9 +349,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   every record's peak across cores in memory, disk, and forced-spill modes. See
   [memory.md](spec/design/memory.md) §6.
   - [ ] _follow-on:_ the transient owners §6.8 leaves out (collation sort-key decorations,
-    window-frame operand caches, merge-heap heads); and a budget-aware spill trigger, so a
-    spill-capable operator spills early instead of failing `54P05` when the account, not
-    `work_mem`, is the binding limit (today the account never forces a spill).
+    window-frame operand caches, merge-heap heads). (The budget-aware spill trigger has landed:
+    a spill-capable structure spills when the account rejects it — memory.md §6.6.)
 - [ ] **Q3 — pending writes.** A transaction-owned account for staged writes that
   survives statement boundaries and releases at commit/rollback.
 - [ ] **Q4 — storage.** Database-owned accounts for page caches and committed in-memory

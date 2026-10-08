@@ -63,15 +63,17 @@ impl RowSpool {
     pub(crate) fn len(&self) -> usize {
         self.total
     }
-    /// Append `row`. While resident it reserves its `row_bytes`; a rejected reservation returns `54P05`
-    /// for the lane's [`crate::cost::Meter::cost_first`] (memory.md §6.6/§6.7).
+    /// Append `row`. While resident it reserves its `row_bytes`. The spool spills when its residency
+    /// exceeds `work_mem` or when the account rejects the reservation — the rejected row is never
+    /// charged and goes to scratch with the resident rows (memory.md §6.6).
     pub(crate) fn push(&mut self, row: Row) -> Result<()> {
+        let mut rejected = false;
         if self.file.is_none() {
             let bytes = row_bytes(&row);
-            self.charge.reserve_direct(bytes as i64)?;
+            rejected = !self.charge.try_reserve_direct(bytes as i64);
             self.bytes = self.bytes.saturating_add(bytes);
         }
-        if self.file.is_none() && self.bytes > self.budget {
+        if self.file.is_none() && (rejected || self.bytes > self.budget) {
             let (path, file) = create_spill_file(&self.dir)?;
             let mut file = BufWriter::new(file);
             self.scratch = Some(Arc::new(Scratch { path }));
@@ -218,8 +220,9 @@ impl SeenRows {
             _ => Self::Memory(std::collections::HashSet::new(), charge),
         }
     }
-    /// Whether `row` is new; a new row reserves its entry, and a rejected reservation returns `54P05`
-    /// for the caller's [`crate::cost::Meter::cost_first`].
+    /// Whether `row` is new; a new row reserves its entry. A rejected reservation spills a
+    /// spill-capable set (memory.md §6.6) and returns `54P05` from an in-memory one, for the caller's
+    /// [`crate::cost::Meter::cost_first`].
     pub(crate) fn insert(&mut self, row: Row) -> Result<bool> {
         match self {
             Self::Memory(seen, charge) => {
@@ -298,13 +301,15 @@ impl StateMap {
                 Some(old) => value_len - key_bytes(&old),
                 None => crate::costs::MEMORY_ENTRY + key_len + value_len,
             };
+            // A growth the account rejects spills the map, the new entry with it, uncharged.
+            let mut rejected = false;
             if delta > 0 {
-                self.charge.reserve_direct(delta)?;
+                rejected = !self.charge.try_reserve_direct(delta);
             } else {
                 self.charge.release(-delta);
             }
             self.bytes = usize::try_from(self.bytes as i64 + delta).unwrap_or(0);
-            if self.bytes <= self.budget {
+            if !rejected && self.bytes <= self.budget {
                 return Ok(());
             }
             let (path, file) = create_spill_file(&self.dir)?;
@@ -387,11 +392,12 @@ impl HashRows {
 
     pub(crate) fn push(&mut self, hash: u64, row: Row) -> Result<()> {
         if self.disk.is_none() {
+            // A row the account rejects spills the table, the row with it, uncharged.
             let bytes = hash_row_bytes(&row);
-            self.charge.reserve_direct(bytes)?;
+            let rejected = !self.charge.try_reserve_direct(bytes);
             self.bytes = self.bytes.saturating_add(bytes as usize);
             Arc::make_mut(self.memory.entry(hash).or_default()).push(row);
-            if self.bytes <= self.budget {
+            if !rejected && self.bytes <= self.budget {
                 return Ok(());
             }
             let (path, file) = create_spill_file(&self.dir)?;
@@ -574,6 +580,54 @@ mod tests {
         assert!(path.exists(), "reader keeps the single scratch file alive");
         drop(scan);
         assert!(!path.exists());
+    }
+
+    /// An account well below `work_mem` makes each structure spill on its first rejected reservation
+    /// instead of failing `54P05`; the rejected element is uncharged, nothing stays charged once
+    /// spilled, and every element is still readable (memory.md §6.6).
+    #[test]
+    fn rejected_reservations_spill_instead_of_failing() {
+        use crate::cost::QueryAccount;
+        let budget = 1 << 30;
+        let account = || QueryAccount {
+            used: std::rc::Rc::new(std::cell::Cell::new(0)),
+            limit: 200,
+        };
+        let row = |i: i64| vec![Value::Int(i), Value::Text("x".repeat(40))];
+
+        let acct = account();
+        let mut spool = RowSpool::new(budget, std::env::temp_dir(), StateCharge::new(acct.clone()));
+        for i in 0..100 {
+            spool.push(row(i)).unwrap();
+            assert!(acct.used.get() <= acct.limit);
+        }
+        assert!(spool.scratch.is_some() && spool.rows.is_empty());
+        assert_eq!(acct.used.get(), 0);
+        let mut reader = spool.reader().unwrap();
+        for i in 0..100 {
+            assert_eq!(reader.next().unwrap().unwrap()[0], Value::Int(i));
+        }
+
+        let acct = account();
+        let mut state = StateMap::new(budget, std::env::temp_dir(), StateCharge::new(acct.clone()));
+        for i in 0..100 {
+            state.put(vec![Value::Int(i)], row(i)).unwrap();
+        }
+        assert!(state.disk.is_some() && state.memory.is_empty());
+        assert_eq!(acct.used.get(), 0);
+        assert_eq!(state.get(&vec![Value::Int(42)]).unwrap(), Some(row(42)));
+
+        let acct = account();
+        let mut rows = HashRows::new(budget, std::env::temp_dir(), StateCharge::new(acct.clone()));
+        for i in 0..100 {
+            rows.push(7, row(i)).unwrap();
+        }
+        assert!(rows.disk.is_some() && rows.memory.is_empty());
+        assert_eq!(acct.used.get(), 0);
+        let mut scan = rows.reader(7).unwrap();
+        for i in 0..100 {
+            assert_eq!(scan.next().unwrap(), Some(row(i)));
+        }
     }
 
     #[test]

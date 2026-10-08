@@ -31,9 +31,11 @@ query-memory account ([memory.md](memory.md)) active: every record without its o
 `JED_CONFORMANCE_QUERY_MEMORY` budget (default 2⁴⁰ bytes). Rows, types, errors, and costs
 must be unchanged, and each runner fails a record during which the engine released more
 query memory than it had reserved — an accounting-site bug no single threshold record
-would reveal. Each runner also writes every record's **peak** balance (its minimal passing
-budget) to `JED_CONFORMANCE_QUERY_MEMORY_PEAKS` as `file<TAB>record-ordinal<TAB>peak`, and
-the task fails unless the three cores agree on every record in every pass. It is part of
+would reveal. Each runner also writes every record's **peak** balance to
+`JED_CONFORMANCE_QUERY_MEMORY_PEAKS` as `file<TAB>record-ordinal<TAB>peak`, and the task
+fails unless the three cores agree on every record in every pass. In memory mode the peak is
+the record's minimal passing budget; on disk it is an upper bound, since spill-capable
+structures also spill when a smaller budget rejects them (memory.md §6.6). It is part of
 `rake test` and `rake ci`.
 
 The Rust runner's `JED_CONFORMANCE_QUERY_MEMORY_PROBE` mode re-baselines pinned thresholds:
@@ -283,8 +285,11 @@ file-level **`# skip: disk[ — reason]`** directive (honored only in disk mode;
 ignores it). This is sound: none of these exercise the on-disk faulted read path. They are:
 session-local **temp tables**, an explicit **transaction** spanning records, a sticky
 **`# lifetime_max_cost:`** budget, and a pre-built **`# fixture:`** image. Concurrency-format files
-(§1) are likewise memory-only (the schedule driver is not a single reopenable handle). `rake
-conformance` runs both modes on all three cores; `rake ci` gates on both.
+(§1) are likewise memory-only (the schedule driver is not a single reopenable handle).
+Conversely, a file whose contract holds **only on a file-backed database** — budget-aware spilling,
+which an in-memory database never does ([memory.md](memory.md) §6.6) — opts out of the memory pass
+with **`# skip: memory[ — reason]`**. `rake conformance` runs both modes on all three cores; `rake
+ci` gates on both.
 
 ## 4. Determinism rules
 
@@ -580,3 +585,11 @@ are jed-specific; successful scalar values remain PostgreSQL-comparable.
 Requires `resource.query_memory`. The logical size schedule is cross-core
 identical, so a record may pin an exact `54P05` threshold (a passing record at
 `N`, a failing one at `N - 1`).
+
+### Work-memory directive
+
+`# work_mem: N` sets the work-memory budget ([spill.md](spill.md) §3) for the next
+record only, in bytes; zero is unlimited (never spill). It overrides the forced-spill
+`JED_CONFORMANCE_WORK_MEM` override, and absent restores the handle default. On a
+file-backed database a query-memory threshold can depend on when operators spill, so
+such a record pins `work_mem` to keep its threshold fixed across the forced-spill passes.

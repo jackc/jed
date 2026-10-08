@@ -55,12 +55,14 @@ export class RowSpool implements Iterable<Row> {
       writeRecord(this.file, row);
       return;
     }
+    // The spool spills when its residency exceeds work_mem or when the account rejects the row — the
+    // rejected row is never charged and goes to scratch with the resident rows (memory.md §6.6).
     const bytes = rowBytes(row);
-    this.charge.reserveDirect(bytes);
+    const rejected = !this.charge.tryReserveDirect(bytes);
     this.length++;
     this.rows.push(row);
     this.bytes += bytes;
-    if (this.bytes > this.budget) {
+    if (rejected || this.bytes > this.budget) {
       this.file = this.sink.createScratch!();
       for (const buffered of this.rows) writeRecord(this.file, buffered);
       this.rows = [];
@@ -151,11 +153,13 @@ export class SpillMap {
     if (this.file === null) {
       const old = this.memory.get(key);
       const delta = old === undefined ? MEMORY_ENTRY + keyLen + valueLen : valueLen - old.valueLen;
-      if (delta > 0) this.charge.reserveDirect(delta);
+      // A growth the account rejects spills the map, the new entry with it, uncharged (memory.md §6.6).
+      let rejected = false;
+      if (delta > 0) rejected = !this.charge.tryReserveDirect(delta);
       else this.charge.release(-delta);
       this.memory.set(key, { value, keyLen: old?.keyLen ?? keyLen, valueLen });
       this.bytes += delta;
-      if (this.bytes <= this.budget) return;
+      if (!rejected && this.bytes <= this.budget) return;
       this.file = this.sink.createScratch!();
       this.file.write(0, new Uint8Array(PARTITIONS * 8));
       // The entries left memory: the map's whole resident charge goes with them.
@@ -224,12 +228,13 @@ export class SpillMultiMap {
   // the logical stored row (memory.md §6.6) — by default the row itself.
   append(key: string, row: Row, bytes = hashRowBytes(row)): void {
     if (this.file === null) {
-      this.charge.reserveDirect(bytes);
+      // A row the account rejects spills the table, the row with it, uncharged (memory.md §6.6).
+      const rejected = !this.charge.tryReserveDirect(bytes);
       const rows = this.memory.get(key);
       if (rows === undefined) this.memory.set(key, [row]);
       else rows.push(row);
       this.bytes += bytes;
-      if (this.bytes <= this.budget) return;
+      if (!rejected && this.bytes <= this.budget) return;
       this.file = this.sink.createScratch!();
       this.file.write(0, u64(0));
       // The rows left memory: the table's whole resident charge goes with them.
@@ -335,12 +340,14 @@ export class SpoolSorter {
     return out;
   }
   push(row: Row): void {
+    // The chunk spills when it exceeds work_mem or when the account rejects the row — the rejected row
+    // is never charged and leaves with the run (memory.md §6.6).
     const bytes = rowBytes(row);
-    this.charge.reserveDirect(bytes);
+    const rejected = !this.charge.tryReserveDirect(bytes);
     this.total++;
     this.chunk.push(row);
     this.bytes += bytes;
-    if (this.bytes > this.budget) {
+    if (rejected || this.bytes > this.budget) {
       this.flush();
       // The run left memory: its rows' charge goes with it (memory.md §6.4/§6.6).
       this.charge.releaseAll();

@@ -96,8 +96,9 @@ even at a site whose own charge is not guarded, such as `EXPLAIN`'s per-row char
 `54P01`/`54P02` instead. An engine-owned collector whose admission is rejected
 likewise consults its cursor's cost guard (for a finished buffered result, the
 guard of the statement's final cost). A successful reservation adds no guard
-point, so enabling a budget that is never exceeded cannot change whether, or
-where, a cost ceiling aborts.
+point, and neither does a rejection a spill structure absorbs by spilling (§6.6),
+so enabling a budget that never fails cannot change whether, or where, a cost
+ceiling aborts.
 `54P05` is an ordinary statement failure: writes roll back and an explicit
 transaction enters the failed state.
 
@@ -160,10 +161,10 @@ It is filled in by owner class:
 | Q4 | **Storage** — database-owned accounts for page caches and committed in-memory storage | planned |
 
 Q2 operators that can spill charge only their resident portion and release it as
-they spill; an operator without spill support (or a database with no scratch
-target — every in-memory database) fails at the gate instead. A single value too
-large to admit fails even when its containing operator can spill. The account
-never triggers a spill: `work_mem` alone decides when an operator spills (§6.6).
+they spill — when their residency exceeds `work_mem`, and also when the account
+rejects a reservation (§6.6). An operator without spill support (or a database with
+no scratch target — every in-memory database) fails at the gate instead, as does any
+row buffer or value outside a spill structure.
 
 Q3 is necessary because a per-statement account cannot see many small INSERTs
 inside `BEGIN`; Q4 because page caches and committed in-memory storage outlive any
@@ -366,7 +367,8 @@ The single-table streaming-sort lane holds its survivors as sort state instead o
 a row buffer:
 
 - **External sorter.** Each survivor pushed into the sorter reserves its
-  `row_bytes`. A run written to scratch releases the rows it held. The final
+  `row_bytes`. A run written to scratch releases the rows it held; a survivor whose
+  reservation is rejected is written with the run, uncharged (§6.6). The final
   in-memory run stays charged while the sorted output is emitted.
 - **Collated survivor buffer** (a collated `ORDER BY`, which sorts in memory):
   each survivor reserves its `row_bytes` as it is collected. A collated top-k
@@ -405,10 +407,13 @@ row in every core:
 | Hash row table (spilled hash-join build, retained aggregate inputs) | `ENTRY + row_bytes(row)` |
 
 An insert reserves its element's bytes; replacing a resident state-map value
-reserves the growth (or releases the shrinkage) of `key_bytes(value)`. When a
-structure's resident bytes then **exceed `work_mem`**, it spills: its elements move
-to scratch and its whole resident charge is released. A spilled structure
-reserves nothing further. A structure's remaining charge is released when it is
+reserves the growth (or releases the shrinkage) of `key_bytes(value)`. A structure
+**spills** when its resident bytes then **exceed `work_mem`**, or when **the account
+rejects the reservation**: its elements, including the new one, move to scratch and
+its whole resident charge is released. A rejected element is never charged, and a
+rejection a structure absorbs this way raises no error. A spilled structure reserves
+nothing further; a sorter, which starts a new run after writing one, keeps reserving
+and spills each run the same way. A structure's remaining charge is released when it is
 discarded — a spool or map feeding a stage when that stage completes, and the
 lane's final output spool when its emission completes (§6.4).
 
@@ -426,11 +431,19 @@ Because the measures depend on what each element holds, the bounded-spill lane's
 | Probe matches / right-match set | a per-left-row spool of matched build rows / `[int match ordinal]` |
 | Finalization | ordered-set sorter rows `[value]` or `[value, bytea collation key]`; percentile spool of sorted rows; `json_object_agg` sorter rows `[int UTF-8 length, text key, jsonb]`; dense-rank distinct set of key tuples |
 
-So a spill-capable operator's charge is bounded by `work_mem` plus one element,
-and the account never forces a spill: a budget below `work_mem` fails `54P05`
-where spilling would have succeeded. A host that wants spilling to keep a query
-alive under a budget sets `work_mem` well below `max_query_memory_bytes`. An
-in-memory database never spills, so its structures charge everything they hold.
+So a spill-capable operator's charge is bounded by `work_mem` plus one element
+and by what the account has left: a budget below `work_mem` makes its operators
+spill earlier instead of failing. Only owners that cannot spill — row buffers
+(§5), the eager lane's operator state, top-k heaps, collated sort buffers,
+columnar lanes — fail `54P05`. Rejection-driven spilling is deterministic for the
+same reason `work_mem` spilling is: the account's balance at every reservation is
+cross-core identical (§5), so every core rejects, and spills, at the same element.
+Each structure spills only itself; it never evicts another owner's charge. The
+trigger applies only where `work_mem` spilling does — a file-backed database with a
+positive `work_mem`. `work_mem = 0` (never spill) and every in-memory database keep
+their structures resident, which charge everything they hold. A deliberately small
+budget can therefore turn a query into a long sequence of tiny spills; that costs
+scratch I/O and time, but no metered cost (spill.md §6) and no change in results.
 
 ### 6.7 Cost wins
 

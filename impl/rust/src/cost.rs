@@ -67,19 +67,27 @@ impl QueryAccount {
 
     /// Reserve `bytes`, or fail `54P05` when `used + bytes > limit` (equality allowed).
     pub(crate) fn reserve(&self, bytes: i64) -> Result<()> {
-        if self.limit <= 0 {
+        if self.try_reserve(bytes) {
             return Ok(());
         }
+        Err(EngineError::new(
+            SqlState::QueryMemoryLimitExceeded,
+            format!("query memory exceeded the limit of {} bytes", self.limit),
+        ))
+    }
+
+    /// Reserve `bytes` if they fit; `false` (nothing reserved) when `used + bytes > limit`.
+    pub(crate) fn try_reserve(&self, bytes: i64) -> bool {
+        if self.limit <= 0 {
+            return true;
+        }
         if bytes > self.limit - self.used.get() {
-            return Err(EngineError::new(
-                SqlState::QueryMemoryLimitExceeded,
-                format!("query memory exceeded the limit of {} bytes", self.limit),
-            ));
+            return false;
         }
         let used = self.used.get() + bytes;
         self.used.set(used);
         QUERY_MEMORY_PEAK.fetch_max(used, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        true
     }
 
     /// Return `bytes`; never errors, never below zero.
@@ -160,6 +168,18 @@ impl StateCharge {
         self.acct.reserve(bytes)?;
         self.held += bytes;
         Ok(())
+    }
+
+    /// Reserve `bytes` straight against the account if they fit, for a spill-capable structure: `false`
+    /// (nothing reserved) tells it to spill instead of failing `54P05` (memory.md §6.6).
+    pub(crate) fn try_reserve_direct(&mut self, bytes: i64) -> bool {
+        if !self.acct.try_reserve(bytes) {
+            return false;
+        }
+        if self.acct.active() {
+            self.held += bytes;
+        }
+        true
     }
 
     /// Return `bytes` of this structure's charge.

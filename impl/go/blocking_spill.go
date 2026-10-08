@@ -30,16 +30,15 @@ func newRowSpool(db *engine) *rowSpool {
 	return &rowSpool{budget: db.session.workMem, dir: db.spillDir, charge: newStateCharge(db.session.queryAccount())}
 }
 
-// push appends row. While resident it reserves its row_bytes; a rejected reservation returns 54P05
-// for the lane's costFirst (memory.md §6.6/§6.7).
+// push appends row. While resident it reserves its row_bytes. The spool spills when its residency
+// exceeds work_mem or when the account rejects the reservation — the rejected row is never charged
+// and goes to scratch with the resident rows (memory.md §6.6).
 func (s *rowSpool) push(row storedRow) error {
 	if s.file == nil {
 		bytes := rowBytes(row)
-		if err := s.charge.reserveDirect(int64(bytes)); err != nil {
-			return err
-		}
+		rejected := !s.charge.tryReserveDirect(int64(bytes))
 		s.bytes += bytes
-		if s.bytes > s.budget {
+		if rejected || s.bytes > s.budget {
 			f, err := os.CreateTemp(s.dir, "jed-spill-rows-*.tmp")
 			if err != nil {
 				return ioError(err)
@@ -232,15 +231,20 @@ func (m *stateMap) put(key []Value, value storedRow) error {
 	} else {
 		delta = memoryEntry + memKeyBytes(key) + memKeyBytes(value)
 	}
+	// A growth the account rejects spills a spill-capable map, the new entry with it, uncharged
+	// (memory.md §6.6); a map that cannot spill returns the 54P05 for the caller's costFirst.
+	rejected := false
 	if delta > 0 {
-		if err := m.charge.reserveDirect(delta); err != nil {
+		if m.canSpill() {
+			rejected = !m.charge.tryReserveDirect(delta)
+		} else if err := m.charge.reserveDirect(delta); err != nil {
 			return err
 		}
 	} else {
 		m.charge.release(-delta)
 	}
 	m.bytes += delta
-	if !m.canSpill() || m.bytes <= int64(m.budget) {
+	if !m.canSpill() || (!rejected && m.bytes <= int64(m.budget)) {
 		return nil
 	}
 	d, err := newDiskBuckets(m.dir)
@@ -262,8 +266,8 @@ func (m *stateMap) put(key []Value, value storedRow) error {
 	return nil
 }
 
-// insert adds key as a membership entry, reporting whether it was new. A rejected reservation
-// returns 54P05 for the caller's costFirst.
+// insert adds key as a membership entry, reporting whether it was new. A rejected reservation spills
+// a spill-capable map and returns 54P05 from one that cannot spill, for the caller's costFirst.
 func (m *stateMap) insert(key []Value) (bool, error) {
 	_, had, err := m.get(key)
 	if err != nil || had {
@@ -312,13 +316,12 @@ func (h *hashRows) push(hash uint64, row storedRow) error {
 	if h.disk != nil {
 		return h.disk.append(hash, nil, row)
 	}
+	// A row the account rejects spills the table, the row with it, uncharged (memory.md §6.6).
 	bytes := memHashRowBytes(row)
-	if err := h.charge.reserveDirect(bytes); err != nil {
-		return err
-	}
+	rejected := !h.charge.tryReserveDirect(bytes)
 	h.bytes += bytes
 	h.mem[hash] = append(h.mem[hash], row)
-	if h.bytes <= int64(h.budget) {
+	if !rejected && h.bytes <= int64(h.budget) {
 		return nil
 	}
 	d, err := newDiskBuckets(h.dir)

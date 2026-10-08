@@ -104,20 +104,22 @@ impl Sorter {
     }
 
     /// Push one row into the sorter. Spills the current run to disk when the in-memory buffer
-    /// exceeds the budget (file-backed databases only).
-    /// A rejected query-memory reservation returns `54P05` for the caller to pass through
+    /// exceeds the budget, or when the account rejects the row's reservation — the rejected row is
+    /// never charged and leaves with the run (file-backed databases only, memory.md §6.6). A sorter
+    /// that cannot spill returns the `54P05` for the caller to pass through
     /// [`crate::cost::Meter::cost_first`] (memory.md §6.7).
     pub(crate) fn push(&mut self, row: Row) -> Result<()> {
-        if self.can_spill() || self.charge.active() {
+        let mut rejected = false;
+        if self.can_spill() {
             let bytes = row_bytes(&row);
-            self.charge.reserve_direct(bytes as i64)?;
-            if self.can_spill() {
-                self.buf_bytes += bytes;
-            }
+            rejected = !self.charge.try_reserve_direct(bytes as i64);
+            self.buf_bytes += bytes;
+        } else if self.charge.active() {
+            self.charge.reserve_direct(row_bytes(&row) as i64)?;
         }
         self.total += 1;
         self.buf.push(row);
-        if self.can_spill() && self.buf_bytes > self.budget {
+        if self.can_spill() && (rejected || self.buf_bytes > self.budget) {
             self.spill_run()?;
         }
         Ok(())
@@ -876,5 +878,40 @@ mod bounded_run_tests {
             count += 1;
         }
         assert_eq!(count, 2048);
+    }
+
+    /// An account below `work_mem` makes the sorter write a run whenever it rejects a row, instead of
+    /// failing `54P05`; the output is still the stable sort (memory.md §6.4/§6.6).
+    #[test]
+    fn rejected_reservations_write_runs_instead_of_failing() {
+        let acct = crate::cost::QueryAccount {
+            used: std::rc::Rc::new(std::cell::Cell::new(0)),
+            limit: 1000,
+        };
+        let mut sort = Sorter::new(
+            vec![(0, false, false, None)],
+            1 << 30,
+            Some(std::env::temp_dir()),
+            StateCharge::new(acct.clone()),
+        );
+        for i in 0..200 {
+            sort.push(vec![Value::Int(i % 7), Value::Int(i)]).unwrap();
+            assert!(acct.used.get() <= acct.limit);
+        }
+        assert!(!sort.runs.is_empty());
+        let mut rows = sort.finish().unwrap();
+        let mut previous = (-1i64, -1i64);
+        let mut count = 0;
+        while let Some(row) = rows.next().unwrap() {
+            let (Value::Int(key), Value::Int(position)) = (&row[0], &row[1]) else {
+                unreachable!()
+            };
+            assert!(*key > previous.0 || (*key == previous.0 && *position > previous.1));
+            previous = (*key, *position);
+            count += 1;
+        }
+        assert_eq!(count, 200);
+        drop(rows);
+        assert_eq!(acct.used.get(), 0);
     }
 }

@@ -155,8 +155,9 @@ test("a rejected collector admission reports a reached cost ceiling", () => {
 
 // Spill-capable operator state charges only its resident portion (memory.md §6.6): on a file-backed
 // database the bounded-spill lane's structures release their charge as they spill, so a budget that a
-// fully resident DISTINCT exceeds is enough once workMem makes it spill — and the account itself never
-// forces the spill. Disk-only behavior, so it lives here rather than in the corpus.
+// fully resident DISTINCT exceeds is enough once workMem makes it spill — and the account forces that
+// spill itself when workMem would not. Only workMem = 0 (never spill) fails. Disk-only behavior and
+// host-observed peaks, so it lives here rather than in the corpus.
 test("spilling operator state releases its charge", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-query-memory-spill-"));
   const db = createDatabase({ path: join(dir, "query_memory_spill.jed"), skipFsync: true });
@@ -180,7 +181,11 @@ test("spilling operator state releases its charge", () => {
     s.setWorkMem(4096);
     const outcome = queryOutcome(s, sql);
     assert.equal(outcome.kind === "query" ? outcome.rows.length : -1, 300);
+    // With a workMem the resident DISTINCT fits, the rejected reservation spills it instead.
     s.setWorkMem(1 << 30);
+    const resident2 = queryOutcome(s, sql);
+    assert.equal(resident2.kind === "query" ? resident2.rows.length : -1, 300);
+    s.setWorkMem(0);
     assert.throws(() => queryOutcome(s, sql), is54P05);
   } finally {
     s.close();

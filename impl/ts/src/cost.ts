@@ -54,15 +54,20 @@ export class QueryAccount {
 
   // reserve adds bytes, or throws 54P05 when used + bytes > limit (equality allowed).
   reserve(bytes: number): void {
-    if (this.limit <= 0) return;
-    if (bytes > this.limit - this.used) {
-      throw engineError(
-        "query_memory_limit_exceeded",
-        `query memory exceeded the limit of ${this.limit} bytes`,
-      );
-    }
+    if (this.tryReserve(bytes)) return;
+    throw engineError(
+      "query_memory_limit_exceeded",
+      `query memory exceeded the limit of ${this.limit} bytes`,
+    );
+  }
+
+  // tryReserve adds bytes if they fit; false (nothing reserved) when used + bytes > limit.
+  tryReserve(bytes: number): boolean {
+    if (this.limit <= 0) return true;
+    if (bytes > this.limit - this.used) return false;
     this.used += bytes;
     if (this.used > queryMemoryPeak.value) queryMemoryPeak.value = this.used;
+    return true;
   }
 
   // release returns bytes; never throws, never below zero. A release past the balance is an
@@ -126,6 +131,15 @@ export class StateCharge {
     if (this.acct.limit <= 0) return;
     this.acct.reserve(bytes);
     this.held += bytes;
+  }
+
+  // tryReserveDirect reserves bytes straight against the account if they fit, for a spill-capable
+  // structure: false (nothing reserved) tells it to spill instead of throwing 54P05 (memory.md §6.6).
+  tryReserveDirect(bytes: number): boolean {
+    if (this.acct.limit <= 0) return true;
+    if (!this.acct.tryReserve(bytes)) return false;
+    this.held += bytes;
+    return true;
   }
 
   // release returns bytes of this structure's charge.

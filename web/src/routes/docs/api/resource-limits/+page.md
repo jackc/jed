@@ -80,10 +80,11 @@ These budgets are **guardrails, not a process-memory cap**. The query-memory bud
 buffers and operator state: hash-join tables, group, `DISTINCT`, and set-operation tables,
 `json_agg`-style and ordered-set accumulators, window partitions, sort buffers and top-k heaps,
 and the resident part of spilling operators. Still uncovered: writes pending in an open
-transaction, page caches, and scalar kernels beyond the ones listed above. A spilling operator
-releases its charge as it spills, but the budget never forces a spill: to let a large sort or
-aggregate spill rather than fail, set `work_mem` well below the query-memory budget. On native file hosts, `work_mem` controls sort, hash JOIN, aggregation,
-and DISTINCT spilling. Their scratch storage preserves results and deterministic costs;
+transaction, page caches, and scalar kernels beyond the ones listed above. On native file hosts,
+sort, hash JOIN, aggregation, and DISTINCT spill when they exceed `work_mem` — and also when the
+query-memory budget would otherwise reject them, so a large sort or aggregate spills rather than
+fails and releases its charge as it spills. Row buffers that cannot spill, such as a derived
+table's result, still fail at the budget; `work_mem = 0` disables spilling entirely. Spill scratch storage preserves results and deterministic costs;
 in-memory and OPFS databases remain resident. `temp_buffers` limits retained temporary storage.
 Hosts exposing arbitrary untrusted SQL should combine these settings with process-level memory
 limits and account for host-retained results.

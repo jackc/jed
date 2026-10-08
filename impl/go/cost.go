@@ -209,17 +209,25 @@ func (a queryAccount) active() bool { return a.limit > 0 && a.used != nil }
 
 // reserve adds bytes, or fails 54P05 when used + bytes > limit (equality allowed).
 func (a queryAccount) reserve(bytes int64) error {
-	if !a.active() {
+	if a.tryReserve(bytes) {
 		return nil
 	}
+	return newError(QueryMemoryLimitExceeded, fmt.Sprintf("query memory exceeded the limit of %d bytes", a.limit))
+}
+
+// tryReserve adds bytes if they fit; false (nothing reserved) when used + bytes > limit.
+func (a queryAccount) tryReserve(bytes int64) bool {
+	if !a.active() {
+		return true
+	}
 	if bytes > a.limit-*a.used {
-		return newError(QueryMemoryLimitExceeded, fmt.Sprintf("query memory exceeded the limit of %d bytes", a.limit))
+		return false
 	}
 	*a.used += bytes
 	if *a.used > queryMemoryPeak.Load() {
 		queryMemoryPeak.Store(*a.used)
 	}
-	return nil
+	return true
 }
 
 // release returns bytes; never errors, never below zero. A release larger than the balance is an
@@ -379,6 +387,19 @@ func (c *stateCharge) reserveDirect(bytes int64) error {
 	}
 	c.held += bytes
 	return nil
+}
+
+// tryReserveDirect reserves bytes straight against the account if they fit, for a spill-capable
+// structure: false (nothing reserved) tells it to spill instead of failing 54P05 (memory.md §6.6).
+func (c *stateCharge) tryReserveDirect(bytes int64) bool {
+	if !c.active() {
+		return true
+	}
+	if !c.acct.tryReserve(bytes) {
+		return false
+	}
+	c.held += bytes
+	return true
 }
 
 // release returns bytes of this structure's charge.

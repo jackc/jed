@@ -302,3 +302,102 @@ func TestBlockingSortCompactsRunsAndSpillCollisionOrder(t *testing.T) {
 	s.close()
 	assertNoBlockingScratch(t, dir)
 }
+
+// TestRejectedReservationsSpillInsteadOfFailing: an account well below work_mem makes each spill
+// structure spill on its first rejected reservation instead of failing 54P05; the rejected element
+// is uncharged, nothing stays charged once spilled, and every element is still readable
+// (memory.md §6.6).
+func TestRejectedReservationsSpillInsteadOfFailing(t *testing.T) {
+	dir := t.TempDir()
+	db := &engine{spillDir: dir, session: newSession()}
+	db.session.workMem = 1 << 30
+	account := func() (queryAccount, *stateCharge) {
+		acct := queryAccount{used: new(int64), limit: 200}
+		return acct, newStateCharge(acct)
+	}
+	row := func(i int) storedRow { return storedRow{IntValue(int64(i)), TextValue(strings.Repeat("x", 40))} }
+
+	acct, charge := account()
+	spool := newRowSpool(db)
+	spool.charge = charge
+	defer spool.close()
+	acct2, charge2 := account()
+	state := newStateMapCharged(db, charge2)
+	defer state.close()
+	acct3, charge3 := account()
+	rows := newHashRows(db)
+	rows.charge = charge3
+	defer rows.close()
+	acct4, charge4 := account()
+	sorter := newSorter([]orderSlot{{idx: 0}}, db.session.workMem, dir, charge4)
+	defer sorter.close()
+	for i := 0; i < 100; i++ {
+		if err := spool.push(row(i)); err != nil {
+			t.Fatal(err)
+		}
+		if err := state.put([]Value{IntValue(int64(i))}, row(i)); err != nil {
+			t.Fatal(err)
+		}
+		if err := rows.push(7, row(i)); err != nil {
+			t.Fatal(err)
+		}
+		if err := sorter.push(storedRow{IntValue(int64(i % 7)), IntValue(int64(i))}); err != nil {
+			t.Fatal(err)
+		}
+		if *acct4.used > acct4.limit {
+			t.Fatal("sorter charge exceeded the account")
+		}
+	}
+	if spool.file == nil || state.disk == nil || rows.disk == nil || len(sorter.runs) == 0 {
+		t.Fatal("did not spill on rejection")
+	}
+	if *acct.used != 0 || *acct2.used != 0 || *acct3.used != 0 {
+		t.Fatal("a spilled structure kept a charge")
+	}
+	var seen int
+	if err := spool.each(func(r storedRow) error {
+		if r[0].Int != int64(seen) {
+			t.Fatalf("spool order %v want %d", r, seen)
+		}
+		seen++
+		return nil
+	}); err != nil || seen != 100 {
+		t.Fatalf("spool replay %d %v", seen, err)
+	}
+	if r, ok, err := state.get([]Value{IntValue(42)}); err != nil || !ok || r[0].Int != 42 {
+		t.Fatalf("state lookup %v %v %v", r, ok, err)
+	}
+	seen = 0
+	if err := rows.each(7, func(r storedRow) error {
+		if r[0].Int != int64(seen) {
+			t.Fatalf("hash rows order %v want %d", r, seen)
+		}
+		seen++
+		return nil
+	}); err != nil || seen != 100 {
+		t.Fatalf("hash rows replay %d %v", seen, err)
+	}
+	sorted, err := sorter.finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sorted.close()
+	key, position, count := int64(-1), int64(-1), 0
+	for {
+		r, ok, err := sorted.next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			break
+		}
+		if r[0].Int < key || (r[0].Int == key && r[1].Int < position) {
+			t.Fatal("rejection runs broke the stable sort")
+		}
+		key, position = r[0].Int, r[1].Int
+		count++
+	}
+	if count != 100 {
+		t.Fatalf("sorted %d rows", count)
+	}
+}

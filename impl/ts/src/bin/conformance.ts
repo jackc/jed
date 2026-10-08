@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import process from "node:process";
 import { loadedCollation, loadUnicodeData } from "../collation.ts";
+import { DEFAULT_WORK_MEM } from "../spill.ts";
 import { loadTimeZoneData, resolveZone } from "../timezone.ts";
 import {
   advancingClock,
@@ -442,6 +443,17 @@ function parseAllowTempDdlDirective(line: string): boolean | null {
   return null;
 }
 
+// parseWorkMemDirective parses a `# work_mem: N` directive line (spec/design/spill.md §3): the
+// work-memory budget in bytes (0 ⇒ unlimited, never spill) the next record runs under. It overrides
+// JED_CONFORMANCE_WORK_MEM, so a record whose result depends on when operators spill (a query-memory
+// threshold in the bounded-spill lane) pins it. Per-record, like `# max_cost:`.
+function parseWorkMemDirective(line: string): number | null {
+  const m = line.match(/^#\s*work_mem:\s*(\S+)/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isSafeInteger(n) && n >= 0 ? n : null;
+}
+
 // parseTempBuffersDirective parses a `# temp_buffers: N` directive line (spec/design/temp-tables.md
 // §7): the per-session temp-table storage budget (bytes) to run the next record under (0 ⇒ unlimited).
 // Mirrors `# max_cost:` — per-record, reset after.
@@ -616,6 +628,7 @@ function runFile(text: string, disk: boolean): void {
     // so every query shape exercises the accounting (memory.md §5).
     const queryMemoryDefault = parseQueryMemoryEnv();
     let pendingTempBuffers: number | null = null;
+    let pendingWorkMem: number | null = null;
     const pendingVars: Array<[string, string]> = [];
     let pendingTimezone: string | null = null;
     while (c.i < lines.length) {
@@ -687,6 +700,7 @@ function runFile(text: string, disk: boolean): void {
           : null;
         const qm = parseQueryMemoryDirective(line);
         const tb = parseTempBuffersDirective(line);
+        const wm = parseWorkMemDirective(line);
         const sv = parseSetDirective(line);
         const tz = parseTimezoneDirective(line);
         const sd = parseSeedDirective(line);
@@ -719,6 +733,8 @@ function runFile(text: string, disk: boolean): void {
           pendingQueryMemory = qm;
         } else if (tb !== null) {
           pendingTempBuffers = tb;
+        } else if (wm !== null) {
+          pendingWorkMem = wm;
         } else if (sv !== null) {
           pendingVars.push(...sv);
         } else if (tz !== null) {
@@ -752,13 +768,19 @@ function runFile(text: string, disk: boolean): void {
         db = dbHandle.session();
       }
       // This record consumes any pending assertions (so they never leak forward).
-      if (process.env.JED_CONFORMANCE_WORK_MEM !== undefined) {
-        const budget = Number(process.env.JED_CONFORMANCE_WORK_MEM);
-        if (!Number.isSafeInteger(budget) || budget < 0) {
+      // `# work_mem:` pins this record's budget; otherwise the forced-spill override
+      // (JED_CONFORMANCE_WORK_MEM), otherwise the default — set every record so none leaks forward.
+      let workMem = DEFAULT_WORK_MEM;
+      if (pendingWorkMem !== null) {
+        workMem = pendingWorkMem;
+        pendingWorkMem = null;
+      } else if (process.env.JED_CONFORMANCE_WORK_MEM !== undefined) {
+        workMem = Number(process.env.JED_CONFORMANCE_WORK_MEM);
+        if (!Number.isSafeInteger(workMem) || workMem < 0) {
           throw new Error("JED_CONFORMANCE_WORK_MEM must be nonnegative bytes");
         }
-        db.setWorkMem(budget);
       }
+      db.setWorkMem(workMem);
       const expectedCost = pendingCost;
       const expectedNames = pendingNames;
       const expectedTypes = pendingTypes;
@@ -1226,19 +1248,20 @@ function runConcurrencyFile(text: string): void {
   }
 }
 
-// parseSkipDisk reports whether a file carries a `# skip: disk[ — free-text reason]` directive
-// (spec/design/conformance.md §3) — it opts out of the on-disk reopen pass because its session state
-// (temp tables, a spanning transaction, a sticky lifetime_max_cost budget) or its pre-built
-// `# fixture:` image cannot survive a per-record reopen. Honored only in disk mode. The first
-// whitespace token after `skip:` is the mode; any trailing text is a documentary reason.
-function parseSkipDisk(text: string): boolean {
+// parseSkip reports whether a file carries a `# skip: <mode>[ — free-text reason]` directive
+// (spec/design/conformance.md §3). `# skip: disk` opts out of the on-disk reopen pass because its
+// session state (temp tables, a spanning transaction, a sticky lifetime_max_cost budget) or its
+// pre-built `# fixture:` image cannot survive a per-record reopen; `# skip: memory` opts out of the
+// in-memory pass because its contract holds only on a file-backed database. The first whitespace
+// token after `skip:` is the mode; any trailing text is a documentary reason.
+function parseSkip(text: string, mode: string): boolean {
   for (const line of text.split("\n")) {
     const t = line.trim();
     if (!t.startsWith("#")) continue;
     const rest = t.slice(1).trimStart();
     if (rest.startsWith("skip:")) {
       const first = rest.slice(5).trim().split(/\s+/)[0];
-      if (first === "disk") return true;
+      if (first === mode) return true;
     }
   }
   return false;
@@ -1285,8 +1308,15 @@ function main(): number {
     // session-local temp tables, a spanning transaction, a sticky lifetime budget, or a pre-built
     // fixture image (spec/design/conformance.md §3). These are `# skip: disk` and covered by the memory
     // pass only; none exercises the on-disk faulted read path anyway.
-    if (disk && (isConc || parseSkipDisk(text))) {
+    if (disk && (isConc || parseSkip(text, "disk"))) {
       console.log(`SKIP ${rel}  (disk-mode)`);
+      skipped++;
+      continue;
+    }
+    // A file whose contract only holds on a file-backed database (`# skip: memory` — e.g. the
+    // bounded-spill lane, which an in-memory database never takes) runs in the disk pass only.
+    if (!disk && parseSkip(text, "memory")) {
+      console.log(`SKIP ${rel}  (memory-mode)`);
       skipped++;
       continue;
     }

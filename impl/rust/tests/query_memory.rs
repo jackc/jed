@@ -100,8 +100,9 @@ fn rejected_collector_admission_reports_a_reached_cost_ceiling() {
 
 /// Spill-capable operator state charges only its resident portion (memory.md §6.6): on a file-backed
 /// database the bounded-spill lane's structures release their charge as they spill, so a budget that
-/// a fully resident DISTINCT exceeds is enough once `work_mem` makes it spill — and the account itself
-/// never forces the spill. Disk-only behavior, so it lives here rather than in the corpus.
+/// a fully resident DISTINCT exceeds is enough once `work_mem` makes it spill — and the account forces
+/// that spill itself when `work_mem` would not. Only `work_mem = 0` (never spill) fails. Disk-only
+/// behavior and host-observed peaks, so it lives here rather than in the corpus.
 #[test]
 fn spilling_operator_state_releases_its_charge() {
     let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("query_memory_spill.jed");
@@ -141,7 +142,13 @@ fn spilling_operator_state_releases_its_charge() {
         jed::Outcome::Query { rows, .. } => assert_eq!(rows.len(), 300),
         other => panic!("expected rows, got {other:?}"),
     }
+    // With a work_mem the resident DISTINCT fits, the rejected reservation spills it instead.
     s.set_work_mem(1 << 30);
+    match s.query_outcome(sql, &[]).unwrap() {
+        jed::Outcome::Query { rows, .. } => assert_eq!(rows.len(), 300),
+        other => panic!("expected rows, got {other:?}"),
+    }
+    s.set_work_mem(0);
     let err = s.query_outcome(sql, &[]).err().expect("54P05");
     assert_eq!(err.code(), "54P05");
     drop(s);

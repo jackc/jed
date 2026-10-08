@@ -107,17 +107,22 @@ export class Sorter {
     return this.sink !== null && this.budget > 0;
   }
 
-  // push adds one row, spilling the current run when the in-memory buffer exceeds the budget. A rejected
-  // query-memory reservation throws 54P05 for the caller's Meter.costFirst (memory.md §6.7).
+  // push adds one row, spilling the current run when the in-memory buffer exceeds the budget or when the
+  // account rejects the row's reservation — the rejected row is never charged and leaves with the run
+  // (memory.md §6.6). A sorter that cannot spill throws the 54P05 for the caller's Meter.costFirst
+  // (memory.md §6.7).
   push(row: Row): void {
-    if (this.canSpill() || this.charge.active()) {
+    let rejected = false;
+    if (this.canSpill()) {
       const bytes = rowBytes(row);
-      this.charge.reserveDirect(bytes);
-      if (this.canSpill()) this.bufBytes += bytes;
+      rejected = !this.charge.tryReserveDirect(bytes);
+      this.bufBytes += bytes;
+    } else if (this.charge.active()) {
+      this.charge.reserveDirect(rowBytes(row));
     }
     this.total += 1;
     this.buf.push(row);
-    if (this.canSpill() && this.bufBytes > this.budget) this.spillRun();
+    if (this.canSpill() && (rejected || this.bufBytes > this.budget)) this.spillRun();
   }
 
   private sortBuf(): void {

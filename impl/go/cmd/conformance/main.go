@@ -99,8 +99,15 @@ func run() int {
 		// session state — session-local temp tables, a spanning transaction, a sticky lifetime budget, or
 		// a pre-built fixture image (spec/design/conformance.md §3). These are gated with `# skip: disk`
 		// and covered by the memory pass only; none exercises the on-disk faulted read path anyway.
-		if disk && (isConc || parseSkipDisk(text)) {
+		if disk && (isConc || parseSkip(text, "disk")) {
 			fmt.Printf("SKIP %s  (disk-mode)\n", rel)
+			skipped++
+			continue
+		}
+		// A file whose contract only holds on a file-backed database (`# skip: memory` — e.g. the
+		// bounded-spill lane, which an in-memory database never takes) runs in the disk pass only.
+		if !disk && parseSkip(text, "memory") {
+			fmt.Printf("SKIP %s  (memory-mode)\n", rel)
 			skipped++
 			continue
 		}
@@ -130,21 +137,22 @@ func run() int {
 	return 0
 }
 
-// parseSkipDisk reports whether a file carries a `# skip: disk` directive (spec/design/conformance.md
-// §3) — it opts out of the on-disk reopen pass because its session state (temp tables, a spanning
-// transaction, a sticky lifetime_max_cost budget) or its pre-built `# fixture:` image cannot survive a
-// per-record reopen. Honored only in disk mode; the memory pass ignores it.
-func parseSkipDisk(text string) bool {
+// parseSkip reports whether a file carries a `# skip: <mode>` directive (spec/design/conformance.md
+// §3). `# skip: disk` opts out of the on-disk reopen pass because its session state (temp tables, a
+// spanning transaction, a sticky lifetime_max_cost budget) or its pre-built `# fixture:` image cannot
+// survive a per-record reopen; `# skip: memory` opts out of the in-memory pass because its contract
+// holds only on a file-backed database.
+func parseSkip(text, mode string) bool {
 	for _, line := range strings.Split(text, "\n") {
 		t := strings.TrimSpace(line)
 		if !strings.HasPrefix(t, "#") {
 			continue
 		}
 		rest := strings.TrimSpace(strings.TrimPrefix(t, "#"))
-		// `# skip: disk[ — free-text reason]` — the first whitespace-delimited token after `skip:` is the
-		// mode; any trailing text is a documentary reason.
+		// `# skip: <mode>[ — free-text reason]` — the first whitespace-delimited token after `skip:` is
+		// the mode; any trailing text is a documentary reason.
 		if v, ok := strings.CutPrefix(rest, "skip:"); ok {
-			if fields := strings.Fields(v); len(fields) > 0 && fields[0] == "disk" {
+			if fields := strings.Fields(v); len(fields) > 0 && fields[0] == mode {
 				return true
 			}
 		}
@@ -556,6 +564,22 @@ func parseAllowTempDDLDirective(line string) (bool, bool) {
 	}
 }
 
+// parseWorkMemDirective parses a `# work_mem: N` directive line (spec/design/spill.md §3): the
+// work-memory budget in bytes (0 ⇒ unlimited, never spill) the next record runs under. It overrides
+// JED_CONFORMANCE_WORK_MEM, so a record whose result depends on when operators spill (a query-memory
+// threshold in the bounded-spill lane) pins it. Per-record, like `# max_cost:`.
+func parseWorkMemDirective(line string) (int, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "work_mem:")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(rest))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
 // parseTempBuffersDirective parses a `# temp_buffers: N` directive line (spec/design/temp-tables.md
 // §7): the per-session temp-table storage budget (bytes) to run the next record under (0 ⇒ unlimited).
 // Mirrors `# max_cost:` — per-record, reset after — so a record can set a small budget and assert that
@@ -770,6 +794,8 @@ func runFile(text string, disk bool) error {
 	// # set:/privilege resets). Re-minted whenever a `# fixture:` swaps the underlying database, or (disk
 	// mode) whenever the file is reopened before a record.
 	sess := db.Session(jed.SessionOptions{})
+	// The handle's default work_mem, restored on every record without `# work_mem:` or the override.
+	defaultWorkMem := sess.WorkMem()
 	// onTemp tracks whether db/sess still point at the reopenable temp-file handle (a `# fixture:` swap
 	// flips it off — but fixtures are `# skip: disk`, so that never coexists with disk mode).
 	onTemp := disk
@@ -821,6 +847,7 @@ func runFile(text string, disk bool) error {
 	var pendingAllowDDL *bool
 	var pendingAllowTempDDL *bool
 	var pendingTempBuffers *int
+	var pendingWorkMem *int
 	var pendingScalarBytes *int64
 	var pendingQueryMemory *int64
 	recordOrdinal := 0
@@ -929,6 +956,8 @@ func runFile(text string, disk bool) error {
 				pendingQueryMemory = &n
 			} else if n, ok := parseTempBuffersDirective(line); ok {
 				pendingTempBuffers = &n
+			} else if n, ok := parseWorkMemDirective(line); ok {
+				pendingWorkMem = &n
 			} else if vars, ok := parseSetDirective(line); ok {
 				pendingVars = append(pendingVars, vars...)
 			} else if z, ok := parseTimezoneDirective(line); ok {
@@ -957,13 +986,20 @@ func runFile(text string, disk bool) error {
 			}
 		}
 		// This record consumes any pending assertions (so they never leak forward).
-		if bytes := os.Getenv("JED_CONFORMANCE_WORK_MEM"); bytes != "" {
+		// `# work_mem:` pins this record's budget; otherwise the forced-spill override
+		// (JED_CONFORMANCE_WORK_MEM), otherwise the default — set every record so none leaks forward.
+		workMem := defaultWorkMem
+		if pendingWorkMem != nil {
+			workMem = *pendingWorkMem
+			pendingWorkMem = nil
+		} else if bytes := os.Getenv("JED_CONFORMANCE_WORK_MEM"); bytes != "" {
 			budget, err := strconv.Atoi(bytes)
 			if err != nil || budget < 0 {
 				return fmt.Errorf("JED_CONFORMANCE_WORK_MEM must be nonnegative bytes")
 			}
-			sess.SetWorkMem(budget)
+			workMem = budget
 		}
+		sess.SetWorkMem(workMem)
 		expectedCost := pendingCost
 		expectedNames := pendingNames
 		expectedTypes := pendingTypes

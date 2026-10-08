@@ -79,22 +79,24 @@ func (s *sorter) close() {
 
 func (s *sorter) canSpill() bool { return s.spillDir != "" && s.budget > 0 }
 
-// push adds one row, spilling the current run when the in-memory buffer exceeds the budget. A
-// rejected query-memory reservation returns 54P05 for the caller to pass through costMeter.costFirst
-// (memory.md §6.7).
+// push adds one row, spilling the current run when the in-memory buffer exceeds the budget or when
+// the account rejects the row's reservation — the rejected row is never charged and leaves with the
+// run (memory.md §6.6). A sorter that cannot spill returns the 54P05 for the caller to pass through
+// costMeter.costFirst (memory.md §6.7).
 func (s *sorter) push(row storedRow) error {
-	if s.canSpill() || s.charge.active() {
+	rejected := false
+	if s.canSpill() {
 		bytes := rowBytes(row)
-		if err := s.charge.reserveDirect(int64(bytes)); err != nil {
+		rejected = !s.charge.tryReserveDirect(int64(bytes))
+		s.bufBytes += bytes
+	} else if s.charge.active() {
+		if err := s.charge.reserveDirect(int64(rowBytes(row))); err != nil {
 			return err
-		}
-		if s.canSpill() {
-			s.bufBytes += bytes
 		}
 	}
 	s.total++
 	s.buf = append(s.buf, row)
-	if s.canSpill() && s.bufBytes > s.budget {
+	if s.canSpill() && (rejected || s.bufBytes > s.budget) {
 		return s.spillRun()
 	}
 	return nil

@@ -106,8 +106,9 @@ func TestQueryMemoryBudgetStaysWithCursor(t *testing.T) {
 
 // Spill-capable operator state charges only its resident portion (memory.md §6.6): on a file-backed
 // database the bounded-spill lane's structures release their charge as they spill, so a budget that
-// a fully resident DISTINCT exceeds is enough once work_mem makes it spill — and the account itself
-// never forces the spill. Disk-only behavior, so it lives here rather than in the corpus.
+// a fully resident DISTINCT exceeds is enough once work_mem makes it spill — and the account forces
+// that spill itself when work_mem would not. Only work_mem = 0 (never spill) fails. Disk-only
+// behavior and host-observed peaks, so it lives here rather than in the corpus.
 func TestQueryMemorySpillingOperatorStateReleasesItsCharge(t *testing.T) {
 	dir := t.TempDir()
 	db, err := CreateDatabase(CreateOptions{Path: filepath.Join(dir, "query_memory_spill.jed"), SkipFsync: true})
@@ -142,8 +143,14 @@ func TestQueryMemorySpillingOperatorStateReleasesItsCharge(t *testing.T) {
 	if err != nil || len(out.Rows) != 300 {
 		t.Fatalf("spilling DISTINCT under its peak budget: %d rows, %v", len(out.Rows), err)
 	}
+	// With a work_mem the resident DISTINCT fits, the rejected reservation spills it instead.
 	s.SetWorkMem(1 << 30)
+	out, err = queryOutcome(s, sql, nil)
+	if err != nil || len(out.Rows) != 300 {
+		t.Fatalf("resident-work_mem DISTINCT under the spilling budget: %d rows, %v", len(out.Rows), err)
+	}
+	s.SetWorkMem(0)
 	if _, err := queryOutcome(s, sql, nil); err == nil || err.(*EngineError).Code() != "54P05" {
-		t.Fatalf("resident DISTINCT under the spilling budget: want 54P05, got %v", err)
+		t.Fatalf("never-spill DISTINCT under the spilling budget: want 54P05, got %v", err)
 	}
 }
