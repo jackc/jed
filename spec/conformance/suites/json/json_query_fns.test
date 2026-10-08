@@ -89,3 +89,13 @@ SELECT JSON_VALUE('[1, 2]', 'strict $[*]' ERROR ON ERROR)
 
 statement error 22034
 SELECT JSON_QUERY('[1, 2, 3]', '$[*]' ERROR ON ERROR)
+
+# Lax unwraps an array context before a filter (jsonpath.md §4.1): the filter tests each element.
+# Strict tests the array as a whole, which never equals a scalar.
+query BBTT nosort
+SELECT JSON_EXISTS(jsonb '[1, 2, 3]', '$ ? (@ == 2)'), JSON_EXISTS(jsonb '[1, 2, 3]', 'strict $ ? (@ == 2)'), JSON_VALUE(jsonb '[1, 2, 3]', '$ ? (@ == 2)'), JSON_QUERY(jsonb '[1, 2, 3]', '$ ? (@ > 1)' WITH WRAPPER)
+----
+true
+false
+2
+[2, 3]

@@ -717,12 +717,29 @@ function applyStep(
     }
     case "filter": {
       // `?(predicate)` — keep the current item when the predicate is definitely TRUE (§4). The
-      // predicate's `@` is the item, `$` is the document root.
-      if (evalPred(step.pred, item, root, strict) === true) {
-        out.push(item);
+      // predicate's `@` is the item, `$` is the document root. lax: a filter on an array unwraps
+      // it ONE level first, testing each element (§4.1.1); a nested array element is tested as-is.
+      if (!strict && item.kind === "array") {
+        for (const e of item.elements) {
+          filterItem(step.pred, e, root, strict, out);
+        }
+        return;
       }
+      filterItem(step.pred, item, root, strict, out);
       return;
     }
+  }
+}
+
+function filterItem(
+  pred: Pred,
+  item: JsonNode,
+  root: JsonNode,
+  strict: boolean,
+  out: JsonNode[],
+): void {
+  if (evalPred(pred, item, root, strict) === true) {
+    out.push(item);
   }
 }
 
@@ -788,11 +805,26 @@ function evalFiltExpr(e: FiltExpr, current: JsonNode, root: JsonNode, strict: bo
     return [e.node];
   }
   const seed = e.fromRoot ? root : current;
+  let seq: JsonNode[];
   try {
-    return evalSteps(e.steps, seed, root, strict);
+    seq = evalSteps(e.steps, seed, root, strict);
   } catch {
     return [];
   }
+  if (strict) {
+    return seq;
+  }
+  // lax: an array-valued operand item is unwrapped ONE level, so the existential comparison ranges
+  // over its elements (§4.1.4).
+  const out: JsonNode[] = [];
+  for (const item of seq) {
+    if (item.kind === "array") {
+      for (const e of item.elements) out.push(e);
+    } else {
+      out.push(item);
+    }
+  }
+  return out;
 }
 
 // compareNodes compares two jsonb scalars under a jsonpath operator. Only same-type number/string

@@ -420,16 +420,31 @@ func applyStep(step *jpStep, item *JsonNode, strict bool, root *JsonNode, out []
 			"jsonpath wildcard array accessor can only be applied to an array")
 	default: // jpFilter
 		// `?(predicate)` — keep the current item when the predicate is definitely TRUE (§4). The
-		// predicate's `@` is the item, `$` is the document root.
-		ok, err := evalPred(step.pred, item, root, strict)
-		if err != nil {
-			return nil, err
+		// predicate's `@` is the item, `$` is the document root. lax: a filter on an array unwraps
+		// it ONE level first, testing each element (§4.1.1); a nested array element is tested as-is.
+		if !strict && item.Kind == JArray {
+			for k := range item.Arr {
+				var err error
+				out, err = filterItem(step.pred, &item.Arr[k], root, strict, out)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return out, nil
 		}
-		if ok != nil && *ok {
-			return append(out, *item), nil
-		}
-		return out, nil
+		return filterItem(step.pred, item, root, strict, out)
 	}
+}
+
+func filterItem(pred *jpPred, item, root *JsonNode, strict bool, out []JsonNode) ([]JsonNode, error) {
+	ok, err := evalPred(pred, item, root, strict)
+	if err != nil {
+		return nil, err
+	}
+	if isTrue(ok) {
+		return append(out, *item), nil
+	}
+	return out, nil
 }
 
 // evalPred evaluates a filter predicate to a Kleene truth value (a *bool: &true / &false / nil =
@@ -531,7 +546,20 @@ func evalFiltExpr(e *jpFiltExpr, current, root *JsonNode, strict bool) []JsonNod
 	if err != nil {
 		return nil
 	}
-	return seq
+	if strict {
+		return seq
+	}
+	// lax: an array-valued operand item is unwrapped ONE level, so the existential comparison
+	// ranges over its elements (§4.1.4).
+	out := make([]JsonNode, 0, len(seq))
+	for i := range seq {
+		if seq[i].Kind == JArray {
+			out = append(out, seq[i].Arr...)
+		} else {
+			out = append(out, seq[i])
+		}
+	}
+	return out
 }
 
 // compareNodes compares two jsonb scalars under a jsonpath operator (a *bool: &v / nil = unknown).

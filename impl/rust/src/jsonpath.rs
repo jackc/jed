@@ -400,14 +400,31 @@ fn apply_step(
             }
         }
         // `?(predicate)` — keep the current item when the predicate is definitely TRUE (§4). The
-        // predicate's `@` is the item, `$` is the document root.
+        // predicate's `@` is the item, `$` is the document root. lax: a filter on an array unwraps
+        // it ONE level first, testing each element (§4.1.1); a nested array element is tested as-is.
         Step::Filter(pred) => {
-            if eval_pred(pred, item, root, strict)? == Some(true) {
-                out.push(item.clone());
+            if !strict && let JsonNode::Array(elems) = item {
+                for e in elems {
+                    filter_item(pred, e, root, strict, out)?;
+                }
+                return Ok(());
             }
-            Ok(())
+            filter_item(pred, item, root, strict, out)
         }
     }
+}
+
+fn filter_item(
+    pred: &Pred,
+    item: &JsonNode,
+    root: &JsonNode,
+    strict: bool,
+    out: &mut Vec<JsonNode>,
+) -> Result<()> {
+    if eval_pred(pred, item, root, strict)? == Some(true) {
+        out.push(item.clone());
+    }
+    Ok(())
 }
 
 /// Evaluate a filter predicate to a Kleene truth value (`Some(true)`/`Some(false)`/`None` = unknown).
@@ -485,7 +502,20 @@ fn eval_filt_expr(
             let seed = if *from_root { root } else { current };
             // A navigation error inside a filter operand → no items (the comparison is just unknown),
             // never propagated (§4.2: filter operands never raise, even in strict).
-            Ok(eval_steps(steps, seed, root, strict).unwrap_or_default())
+            let seq = eval_steps(steps, seed, root, strict).unwrap_or_default();
+            if strict {
+                return Ok(seq);
+            }
+            // lax: an array-valued operand item is unwrapped ONE level, so the existential
+            // comparison ranges over its elements (§4.1.4).
+            let mut out = Vec::with_capacity(seq.len());
+            for item in seq {
+                match item {
+                    JsonNode::Array(elems) => out.extend(elems),
+                    other => out.push(other),
+                }
+            }
+            Ok(out)
         }
         FiltExpr::Lit(n) => Ok(vec![n.clone()]),
     }

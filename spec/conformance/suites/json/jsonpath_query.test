@@ -147,3 +147,94 @@ SELECT '$.a == 1'::jsonpath, '$.a > 1 && $.b < 2'::jsonpath
 ----
 ($."a" == 1)
 ($."a" > 1 && $."b" < 2)
+
+# Lax auto-unwraps an array one level before a FILTER step (jsonpath.md §4.1 rule 1), exactly as
+# it does before a member accessor: `$ ? (…)` over an array context tests each element, not the
+# array. Strict does not unwrap — the filter's @ is the whole array, and comparing an array to a
+# scalar is unknown, so nothing passes.
+query BBBB nosort
+SELECT jsonb_path_exists('[1]', '$ ? (@ == 1)'), jsonb_path_exists('[1]', 'strict $ ? (@ == 1)'), '[1]'::jsonb @? '$ ? (@ == 1)', '[1]'::jsonb @? 'strict $ ? (@ == 1)'
+----
+true
+false
+true
+false
+
+query T nosort
+SELECT * FROM jsonb_path_query('[1, 2, 3]', '$ ? (@ >= 2)')
+----
+2
+3
+
+query TT nosort
+SELECT jsonb_path_query_first('[3, 1, 2]', '$ ? (@ < 3)'), jsonb_path_query_first('[3, 1, 2]', 'strict $ ? (@ < 3)')
+----
+1
+NULL
+
+# The strict filter sees the whole array: @[0] is its first element. In lax each element is the
+# filter's @, and [0] on a scalar is that scalar (§4.1 rule 2).
+query TT nosort
+SELECT jsonb_path_query_array('[1, 2]', '$ ? (@[0] == 1)'), jsonb_path_query_array('[1, 2]', 'strict $ ? (@[0] == 1)')
+----
+[1]
+[[1, 2]]
+
+# The filter unwrap is ONE level: a nested array element becomes the filter's @ as-is. A comparison
+# operand is unwrapped one level too (lax), so [1] satisfies @ == 1 but [[1]] does not.
+query T nosort
+SELECT * FROM jsonb_path_query('[1, 2, [1], [[1]]]', '$ ? (@ == 1)')
+----
+1
+[1]
+
+# Strict compares an array operand as an array (unknown), so only the scalar 1 passes the [*] form.
+query TT nosort
+SELECT jsonb_path_query_array('[1, 2, [1]]', 'strict $ ? (@ == 1)'), jsonb_path_query_array('[1, 2, [1]]', 'strict $[*] ? (@ == 1)')
+----
+[]
+[1]
+
+# A filter after other steps unwraps the array the steps produce.
+query TTT nosort
+SELECT jsonb_path_query_array('{"a": [1, 2, 3]}', '$.a ? (@ > 1)'), jsonb_path_query_array('{"a": [1, 2, 3]}', 'strict $.a ? (@ > 1)'), jsonb_path_query_array('{"a": [[1, 2], 3]}', '$.a ? (@ > 1)')
+----
+[2, 3]
+[]
+[[1, 2], 3]
+
+query TT nosort
+SELECT jsonb_path_query_array('[{"b": [1, 2]}, {"b": [3]}]', '$.b ? (@ > 1)'), jsonb_path_query_array('[[1, 2], [3, 4]]', '$[0] ? (@ > 1)')
+----
+[2, 3]
+[2]
+
+# Chained filters, and accessor steps after a filter.
+query TT nosort
+SELECT jsonb_path_query_array('[1, 2, 3]', '$ ? (@ > 1) ? (@ < 3)'), jsonb_path_query_array('[{"a": 1}, {"a": 2}]', '$ ? (@.a > 1).a')
+----
+[2]
+[2]
+
+# An empty array: lax has no element to test; strict tests the empty array itself, which is not 1.
+query TT nosort
+SELECT jsonb_path_query_array('[]', '$ ? (@ == 1)'), jsonb_path_query_array('[]', 'strict $ ? (@ == 1)')
+----
+[]
+[]
+
+# A comparison operand that evaluates to an array is unwrapped one level in lax (existential over
+# its elements); strict compares the array itself (unknown). A `$`-rooted operand unwraps too.
+query TTT nosort
+SELECT jsonb_path_query_array('[{"a": [1, 2]}, {"a": [3]}]', '$ ? (@.a == 2)'), jsonb_path_query_array('[{"a": [1, 2]}, {"a": [3]}]', 'strict $[*] ? (@.a == 2)'), jsonb_path_query_array('[1, [2]]', '$ ? (@ == $[1])')
+----
+[{"a": [1, 2]}]
+[]
+[[2]]
+
+# The same operand unwrap applies to a top-level predicate.
+query BB nosort
+SELECT jsonb_path_match('[1, 2]', '$ == 2'), '{"a": [1, 2]}'::jsonb @@ '$.a == 2'
+----
+true
+true

@@ -100,3 +100,25 @@ blue
 red
 2
 green
+
+# A filtered root path over an array: lax unwraps it, so each passing element is a row; strict
+# tests the whole array and yields no rows.
+query I nosort
+SELECT * FROM JSON_TABLE(jsonb '[1, 2, 3]', '$ ? (@ >= 2)' COLUMNS (v i32 PATH '$')) AS jt
+----
+2
+3
+
+query I nosort
+SELECT count(*)::i32 FROM JSON_TABLE(jsonb '[1, 2, 3]', 'strict $ ? (@ >= 2)' COLUMNS (v i32 PATH '$')) AS jt
+----
+0
+
+# A filtered column path unwraps the array it filters.
+query IT nosort
+SELECT * FROM JSON_TABLE(jsonb '[{"id": 1, "xs": [1, 5]}, {"id": 2, "xs": [2]}]', '$[*]' COLUMNS (id i32 PATH '$.id', big jsonb PATH '$.xs ? (@ > 2)')) AS jt
+----
+1
+5
+2
+NULL

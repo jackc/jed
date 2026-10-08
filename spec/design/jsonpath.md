@@ -105,6 +105,8 @@ items. This single abstraction unifies accessors, methods, filters, and the quer
   - `[i]` selects element `i` (negative / `last` allowed); `[i to j]` a contiguous slice;
     `[*]` all elements; on a non-array, lax treats the item as a singleton array (§4.1),
     strict raises.
+  - `?(predicate)` keeps each item for which the predicate is definitely true (in lax,
+    unwrapping an array item one level first — §4.1).
   - `.method()` maps each item through the method (§3.1).
 - **Result.** The query functions (§5) interpret the final sequence: exists = non-empty;
   query = one row per item; query_first = first or NULL; match = the sequence must be a
@@ -141,17 +143,28 @@ Lax differs from strict in exactly two ways: **automatic array unwrapping** and
 
 ### 4.1 Automatic unwrapping (lax only)
 
-1. **Member accessor on an array.** In lax, `.key` / `.*` applied to an array first **unwraps
-   it one level** — the accessor is applied to each element and the results concatenated.
-   (`lax $.a` over `[{"a":1},{"a":2}]` → `1, 2`.) Strict: a member accessor on an array is a
+Unwrapping is **one level**, applied to each item *before* the step that unwraps it — PG does not
+transitively flatten nested arrays in one shot (an element that is itself an array reaches the step
+as-is).
+
+1. **Member accessor or filter on an array.** In lax, `.key` / `.*` / `?(…)` applied to an array
+   first **unwraps it one level** — the step is applied to each element and the results
+   concatenated. (`lax $.a` over `[{"a":1},{"a":2}]` → `1, 2`; `lax $ ? (@ == 1)` over `[1,2]` →
+   `1`, and over `[1]` the filter tests `1`, not `[1]`.) Strict: a member accessor on an array is a
+   structural error, and a filter tests the array itself as `@` (`strict $ ? (@[0] == 1)` over
+   `[1,2]` → `[1,2]`). A filter is unwrapped wherever it appears — after `$`, after another step
+   (`$.a ? (…)`), or after another filter.
+2. **Element accessor on a non-array.** In lax, `[i]` / `[*]` on a non-array treats the item as a
+   **singleton array** `[item]` first (`lax $[0]` over a scalar → the scalar). Strict: a
    structural error.
-2. **Element accessor on a non-array.** In lax, `[i]` / `[*]` on a non-array treats the item
-   as a **singleton array** `[item]` first (`lax $[0]` over a scalar → the scalar). Strict: a
-   structural error.
-3. **`.size()` on a non-array** is `1` in lax (the implicit singleton); strict requires an
-   array.
-4. Unwrapping is **one level**, applied *before* each accessor step (PG does not transitively
-   flatten nested arrays in one shot).
+3. **`.size()` on a non-array** is `1` in lax (the implicit singleton); strict requires an array.
+4. **Comparison operands.** In lax, each `@`/`$`-rooted operand of a predicate comparison (inside a
+   filter or a top-level predicate) evaluates to a sequence whose array items are **unwrapped one
+   level** before the existential comparison, so `lax $ ? (@.a == 2)` keeps `{"a":[1,2]}` and
+   `lax $ == 2` over `[1,2]` is true. Combined with rule 1, `lax $ ? (@ == 1)` over
+   `[1,2,[1],[[1]]]` → `1, [1]`: the filter hands `[1]` to the predicate as `@`, whose operand
+   unwrap reaches `1`; `[[1]]` unwraps only to `[1]`, which is not comparable to a scalar. Strict:
+   an array operand is compared as an array — not comparable to a scalar, so unknown.
 
 ### 4.2 Structural-error suppression (lax only)
 
