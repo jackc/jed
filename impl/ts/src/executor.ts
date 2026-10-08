@@ -115,6 +115,7 @@ import {
   keyBytes,
   rowBytes,
   rowBytesMasked,
+  payloadBytes,
   utf8Length,
   valueBytes,
 } from "./memsize.ts";
@@ -335,7 +336,13 @@ import {
   type GistStrategy,
   gistSearch,
 } from "./gist.ts";
-import { compileRegex, type RegexProgram } from "./regex.ts";
+import {
+  compileRegex,
+  replaceBuild,
+  replaceMatches,
+  replaceSize,
+  type RegexProgram,
+} from "./regex.ts";
 
 // Outcome is the result of executing one statement: a bare statement (CREATE, INSERT,
 // UPDATE, DELETE) or a query result set. cost is the deterministic execution cost accrued
@@ -799,6 +806,58 @@ export function repeatText(s: string, n: bigint, meter: Meter): string {
   meter.guard();
   meter.reserveScalar(size);
   return s.repeat(Number(n));
+}
+
+// chargeOutput charges a growth kernel's constructed result (spec/design/cost.md §8.1):
+// scalar_byte × payload(result), guarded before the value is returned. A NULL result charges nothing.
+export function chargeOutput(meter: Meter, out: Value): void {
+  if (out.kind === "null") return;
+  meter.charge(COSTS.scalarByte * BigInt(payloadBytes(out)));
+  meter.guard();
+}
+
+// replaceText is replace(s, from, to) (string-functions.md §3): replace every non-overlapping
+// occurrence of from; an empty from matches nothing (PostgreSQL; String.replaceAll would instead
+// splice to between every character). An amplifier (cost.md §8.1): the input scan is charged, then
+// the exact UTF-8 result size is computed from the match count, capped at MAX_RESULT_CHARS (54000),
+// charged, and reserved before the result is built. Matches of well-formed strings fall on code-point
+// boundaries, so counting them in UTF-16 gives Rust's and Go's UTF-8 count.
+export function replaceText(s: string, from: string, to: string, meter: Meter): string {
+  const sb = BigInt(utf8Length(s));
+  meter.charge(COSTS.scalarByte * sb);
+  meter.guard();
+  let count = 0n;
+  if (from !== "") {
+    for (let i = s.indexOf(from); i >= 0; i = s.indexOf(from, i + from.length)) count++;
+  }
+  const size = sb + count * BigInt(utf8Length(to) - utf8Length(from));
+  if (size > MAX_RESULT_CHARS)
+    throw engineError("program_limit_exceeded", "requested length too large");
+  meter.charge(COSTS.scalarByte * size);
+  meter.guard();
+  meter.reserveScalar(size);
+  return count === 0n ? s : s.replaceAll(from, to);
+}
+
+// regexpReplaceText is regexp_replace (regex.md §8): run the whole search, then size the result
+// exactly, cap it at MAX_RESULT_CHARS (54000), charge and reserve it, and splice it from the recorded
+// matches. An amplifier (cost.md §8.1); the search's regex_steps are its input charge.
+export function regexpReplaceText(
+  prog: RegexProgram,
+  matchCps: number[],
+  origCps: number[],
+  repl: number[],
+  global: boolean,
+  meter: Meter,
+): string {
+  const found = replaceMatches(prog, matchCps, global, meter);
+  const size = replaceSize(origCps, repl, found);
+  if (size > MAX_RESULT_CHARS)
+    throw engineError("program_limit_exceeded", "requested length too large");
+  meter.charge(COSTS.scalarByte * size);
+  meter.guard();
+  meter.reserveScalar(size);
+  return replaceBuild(origCps, repl, found);
 }
 
 // splitPart is split_part(s, delim, n) (string-functions.md §3): split s on the substring delim and

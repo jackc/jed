@@ -328,8 +328,8 @@ The following rules cover additional units:
 
 - fixed structural calls such as `timezone` and `sequence_advance` count once per estimated
   invocation when the corresponding built-in runs;
-- `decimal_work`, `collate`, `varlen_compare`, and regex size extras are zero without admitted
-  value-size facts; constant operands may compute their exact structural work;
+- `decimal_work`, `collate`, `varlen_compare`, regex size extras, and `scalar_byte` (the
+  output-constructing kernels of [cost.md](cost.md) §8) are zero without admitted value-size facts; constant operands may compute their exact structural work;
 - constant regex compilation may count its exact compiled-program work; a parameter pattern uses
   no extra until statistics/model data define one;
 - `hash_build`/`hash_probe` use exact encoded bytes for fixed-width keys and

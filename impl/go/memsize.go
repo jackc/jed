@@ -8,6 +8,12 @@ package jed
 // codegen'd from spec/cost/schedule.toml [memory] (costs.go); the shared vectors in
 // spec/cost/memory_sizes.toml pin the measurement (memory_sizes_test.go).
 
+// memPayloadBytes is payload(v) = value_bytes(v) − VALUE: the logical bytes an output-constructing
+// kernel charges as scalar_byte (spec/design/cost.md §8.1).
+func memPayloadBytes(v Value) int64 {
+	return memValueBytes(v) - memoryValue
+}
+
 // memValueBytes is value_bytes(v) = VALUE + payload(v).
 func memValueBytes(v Value) int64 {
 	switch v.Kind {

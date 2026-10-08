@@ -383,8 +383,9 @@ event  = "one frame row folded into a frame-sensitive window function's accumula
 [[unit]]
 id     = "scalar_byte"
 weight = 1
-event  = "one UTF-8 input or output byte of repeat/lpad/rpad, reserved before traversal or allocation"
-# cost.md: input bytes are charged before scanning; exact result bytes before construction.
+event  = "one logical input or output byte of an output-constructing kernel (repeat/pad, replace, array/JSON construction, renders)"
+# cost.md §8/§8.1: amplifiers charge input bytes before scanning and exact result bytes before
+# construction; growth kernels charge payload(result) right after construction.
 
 [[unit]]
 id     = "decimal_transcend"

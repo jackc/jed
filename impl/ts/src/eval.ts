@@ -40,6 +40,7 @@ import {
   I64_MIN,
   applyJsonBehavior,
   buildNestedArray,
+  chargeOutput,
   chrText,
   coerceCaseValue,
   coerceDecimal,
@@ -85,7 +86,10 @@ import {
   parseIntLiteral,
   quoteIdentText,
   quoteLiteralText,
+  regexpReplaceText,
   repeatText,
+  replaceText,
+  rexprIsConstant,
   rightChars,
   splitPart,
   substrChars,
@@ -166,7 +170,6 @@ import {
   regexpCount,
   regexpMatch,
   regexpNthMatch,
-  regexpReplace,
 } from "./regex.ts";
 import type { RegexProgram } from "./regex.ts";
 import { NEG_INFINITY, POS_INFINITY, makeTimestamp } from "./timestamp.ts";
@@ -251,7 +254,10 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       m.charge(COSTS.operatorEval);
       const elems: Value[] = new Array(e.elements.length);
       for (let i = 0; i < e.elements.length; i++) elems[i] = evalExpr(e.elements[i]!, row, env, m);
-      return e.nested ? buildNestedArray(elems) : arrayValue(elems);
+      const out = e.nested ? buildNestedArray(elems) : arrayValue(elems);
+      // A growth kernel (cost.md §8.1), free when every element is constant.
+      if (!e.elements.every(rexprIsConstant)) chargeOutput(m, out);
+      return out;
     }
     case "constArray":
       // A folded array constant (shape preserved) — return it directly.
@@ -887,7 +893,10 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       switch (e.func) {
         case "replace": {
           const repl = Array.from(replacement, (ch) => ch.codePointAt(0) as number);
-          return { kind: "text", text: regexpReplace(prog, matchCps, origCps, repl, global, m) };
+          return {
+            kind: "text",
+            text: regexpReplaceText(prog, matchCps, origCps, repl, global, m),
+          };
         }
         case "match": {
           const groups = regexpMatch(prog, matchCps, origCps, m);
@@ -1451,12 +1460,11 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         return textValue(trimChars(s, set, false, true));
       }
       if (e.func === "replace") {
-        // replace(text, from, to) → text — substring replace-all; empty `from` is a no-op
-        // (String.replaceAll would otherwise splice `to` between every character — §3).
+        // replace(text, from, to) → text — substring replace-all; empty `from` is a no-op.
         const s = (vals[0] as { text: string }).text;
         const from = (vals[1] as { text: string }).text;
         const to = (vals[2] as { text: string }).text;
-        return textValue(from === "" ? s : s.replaceAll(from, to));
+        return textValue(replaceText(s, from, to, m));
       }
       if (e.func === "translate") {
         // translate(text, from, to) → text — per-character map/delete.
@@ -1726,7 +1734,14 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       m.charge(COSTS.operatorEval);
       const vals: Value[] = [];
       for (const a of e.args) vals.push(evalExpr(a, row, env, m));
-      return evalArrayFunc(e.func, vals);
+      const out = evalArrayFunc(e.func, vals, m);
+      // The builders are growth kernels (cost.md §8.1), free over constant operands.
+      if (
+        (e.func === "array_append" || e.func === "array_prepend" || e.func === "array_cat") &&
+        !e.args.every(rexprIsConstant)
+      )
+        chargeOutput(m, out);
+      return out;
     }
     case "rangeFunc": {
       // A polymorphic range accessor (spec/design/range-functions.md §1, RF1). One operator_eval per

@@ -58,11 +58,16 @@ impl RExpr {
                 for e in elems {
                     vals.push(e.eval(row, env, m)?);
                 }
-                if *nested {
-                    build_nested_array(vals)
+                let out = if *nested {
+                    build_nested_array(vals)?
                 } else {
-                    Ok(Value::Array(ArrayVal::one_dim(vals)))
+                    Value::Array(ArrayVal::one_dim(vals))
+                };
+                // A growth kernel (cost.md §8.1), free when every element is constant.
+                if !elems.iter().all(rexpr_is_constant) {
+                    charge_output(m, &out)?;
                 }
+                Ok(out)
             }
             // A folded array constant (shape preserved) — return it directly.
             RExpr::ConstArray(a) => Ok(Value::Array((**a).clone())),
@@ -1265,9 +1270,14 @@ impl RExpr {
                 match func {
                     RegexFunc::Replace => {
                         let repl: Vec<char> = replacement.unwrap().chars().collect();
-                        let out =
-                            prog.regexp_replace(&match_chars, &orig_chars, &repl, global, m)?;
-                        Ok(Value::Text(out))
+                        Ok(Value::Text(regexp_replace_text(
+                            prog,
+                            &match_chars,
+                            &orig_chars,
+                            &repl,
+                            global,
+                            m,
+                        )?))
                     }
                     RegexFunc::Match => match prog.regexp_match(&match_chars, &orig_chars, m)? {
                         None => Ok(Value::Null),
@@ -2423,13 +2433,7 @@ impl RExpr {
                             (Value::Text(s), Value::Text(f), Value::Text(t)) => (s, f, t),
                             _ => unreachable!("resolver restricts replace to text"),
                         };
-                        // An empty `from` matches nothing in PostgreSQL; Rust's str::replace would
-                        // instead splice `to` at every boundary, so guard it (string-functions.md §3).
-                        Ok(Value::Text(if from.is_empty() {
-                            s.clone()
-                        } else {
-                            s.replace(from.as_str(), to)
-                        }))
+                        Ok(Value::Text(replace_text(s, from, to, m)?))
                     }
                     // translate(text, from, to) → text — per-character map/delete.
                     ScalarFunc::Translate => {
@@ -2539,7 +2543,16 @@ impl RExpr {
                 for a in args {
                     vals.push(a.eval(row, env, m)?);
                 }
-                eval_array_func(func, &vals)
+                let out = eval_array_func(func, &vals, m)?;
+                // The builders are growth kernels (cost.md §8.1), free over constant operands.
+                if matches!(
+                    func,
+                    ArrayFunc::ArrayAppend | ArrayFunc::ArrayPrepend | ArrayFunc::ArrayCat
+                ) && !args.iter().all(rexpr_is_constant)
+                {
+                    charge_output(m, &out)?;
+                }
+                Ok(out)
             }
             RExpr::RangeFunc { func, args } => {
                 m.charge(COSTS.operator_eval);

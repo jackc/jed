@@ -1,0 +1,232 @@
+# Output-constructing kernels (spec/design/cost.md §8.1, memory.md §1), slice S1. Growth kernels
+# (ARRAY[…] and the array builders) charge scalar_byte × payload(result) to cost after building it
+# and never reserve the scalar allowance; constant-only operands are free, like a literal. Amplifiers
+# (replace, regexp_replace, array_replace) charge their input scan, then size, charge, and reserve
+# their exact output before building it, even over constants. payload is memory.md §3's measure: UTF-8
+# bytes for text, 16 per dimension plus 32 + payload per element for an array.
+# jed-SPECIFIC resource contract (PostgreSQL has no cost meter or scalar allowance).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, query.aggregates, func.array, func.regexp_replace, types.array, types.i32, types.text, resource.cost_metering, resource.cost_limit, resource.scalar_memory
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32[], s text)
+
+statement ok
+INSERT INTO t VALUES (1, ARRAY[1, 2], 'banana')
+
+# === Growth kernels ===
+
+# Constant operands are free: no scalar_byte for the constructors or the ||.
+# cost: 5
+query I nosort
+SELECT cardinality(ARRAY[1, 2] || ARRAY[3])
+----
+3
+
+# The baseline scan for the column cases below.
+# cost: 3
+query T nosort
+SELECT a FROM t
+----
+{1,2}
+
+# A column operand makes || a growth kernel: payload({1,2,7}) = 16 + 3 × 32 = 112 over the baseline.
+# cost: 116
+query T nosort
+SELECT a || 7 FROM t
+----
+{1,2,7}
+
+# ARRAY[…] over a column: payload({1,2}) = 16 + 2 × 32 = 80, plus the subscripts' own evals.
+# cost: 86
+query T nosort
+SELECT ARRAY[a[1], a[2]] FROM t
+----
+{1,2}
+
+# Text elements carry their bytes: payload({banana,x}) = 16 + (32 + 6) + (32 + 1) = 87.
+# cost: 91
+query T nosort
+SELECT ARRAY[s, 'x'] FROM t
+----
+{banana,x}
+
+# Growth kernels never reserve the allowance, so a tiny budget still admits them.
+# max_scalar_bytes: 1
+query T nosort
+SELECT array_cat(a, a) FROM t
+----
+{1,2,1,2}
+
+# A NULL result charges nothing (array_cat of two NULLs is NULL).
+# cost: 4
+query T nosort
+SELECT array_cat(NULL::i32[], NULL::i32[]) FROM t
+----
+NULL
+
+# The geometric-growth hole: each CTE doubles the array, and its bytes are charged, so cost tracks the
+# bytes built (4 + 8 + 16 elements here), not the number of steps.
+# cost: 954
+query I nosort
+WITH a1 AS (SELECT a || a AS v FROM t), a2 AS (SELECT v || v AS v FROM a1), a3 AS (SELECT v || v AS v FROM a2) SELECT cardinality(v) FROM a3
+----
+16
+
+# === replace ===
+
+# Charged even over constants: input 6 + output 12 bytes.
+# cost: 20
+query T nosort
+SELECT replace('banana', 'a', 'xyz')
+----
+bxyznxyznxyz
+
+# The exact output size is reserved; equality is allowed.
+# max_scalar_bytes: 12
+query T nosort
+SELECT replace(s, 'a', 'xyz') FROM t
+----
+bxyznxyznxyz
+
+# max_scalar_bytes: 11
+statement error 54P04
+SELECT replace(s, 'a', 'xyz') FROM t
+
+# The actual result, not the input: deleting every match reserves 3 bytes.
+# max_scalar_bytes: 3
+query T nosort
+SELECT replace(s, 'a', '') FROM t
+----
+bnn
+
+# An empty `from` matches nothing; the result is the input's 6 bytes.
+# max_scalar_bytes: 6
+query T nosort
+SELECT replace(s, '', 'xyz') FROM t
+----
+banana
+
+# UTF-8 bytes, not characters: 'é' (2 bytes) becomes a 4-byte emoji.
+# max_scalar_bytes: 3
+statement error 54P04
+SELECT replace('é', 'é', '🙂')
+
+# max_scalar_bytes: 4
+query T nosort
+SELECT replace('é', 'é', '🙂')
+----
+🙂
+
+# Cumulative with the other amplifiers: repeat reserves 3, then replace reserves 6.
+# max_scalar_bytes: 8
+statement error 54P04
+SELECT replace(repeat('a', 3), 'a', 'bb')
+
+# max_scalar_bytes: 9
+query T nosort
+SELECT replace(repeat('a', 3), 'a', 'bb')
+----
+bbbbbb
+
+# The same hole through recursion: each step doubles the string, and the output charge makes the cost
+# grow with the bytes built (2 + 4 + … + 512 here).
+# cost: 1612
+query I nosort
+WITH RECURSIVE r(n, v) AS (SELECT 1, 'a' UNION ALL SELECT n + 1, replace(v, 'a', 'aa') FROM r WHERE n < 10) SELECT max(length(v)) FROM r
+----
+512
+
+# ...so a cost ceiling stops thirty doublings long before they build half a gigabyte.
+# max_cost: 100000
+statement error 54P01
+WITH RECURSIVE r(n, v) AS (SELECT 1, 'a' UNION ALL SELECT n + 1, replace(v, 'a', 'aa') FROM r WHERE n < 30) SELECT max(length(v)) FROM r
+
+# ...and so does the default allowance on an unlimited handle, since replace is an amplifier.
+statement error 54P04
+WITH RECURSIVE r(n, v) AS (SELECT 1, 'a' UNION ALL SELECT n + 1, replace(v, 'a', 'aa') FROM r WHERE n < 30) SELECT max(length(v)) FROM r
+
+# A result above the structural cap is 54000, checked before the output is charged or reserved.
+statement error 54000
+SELECT replace(repeat('a', 1000), 'a', repeat('b', 2000000))
+
+# Cost wins: the output charge reaches the ceiling before the allowance is consulted.
+# max_cost: 10
+# max_scalar_bytes: 1
+statement error 54P01
+SELECT replace('banana', 'a', 'xyz')
+
+# === regexp_replace ===
+
+# Back-references are sized exactly: 'b<anan><anan>a' is 14 bytes.
+# max_scalar_bytes: 14
+query T nosort
+SELECT regexp_replace(s, '(an)', '<\1\1>', 'g') FROM t
+----
+b<anan><anan>a
+
+# max_scalar_bytes: 13
+statement error 54P04
+SELECT regexp_replace(s, '(an)', '<\1\1>', 'g') FROM t
+
+# The whole match (\&) and a literal backslash (\\): 'a[b\]c' is 6 bytes.
+# max_scalar_bytes: 6
+query T nosort
+SELECT regexp_replace('abc', 'b', '[\&\\]')
+----
+a[b\]c
+
+# Global empty matches emit the character after each one: '-a-b-c-' is 7 bytes.
+# max_scalar_bytes: 7
+query T nosort
+SELECT regexp_replace('abc', 'x*', '-', 'g')
+----
+-a-b-c-
+
+# max_scalar_bytes: 6
+statement error 54P04
+SELECT regexp_replace('abc', 'x*', '-', 'g')
+
+# Only the first match without 'g', and multibyte groups count their UTF-8 bytes: 'hééllo' is 8.
+# max_scalar_bytes: 8
+query T nosort
+SELECT regexp_replace('héllo', '(é)', '\1\1')
+----
+hééllo
+
+# max_scalar_bytes: 7
+statement error 54P04
+SELECT regexp_replace('héllo', '(é)', '\1\1')
+
+# The regex search cost is unchanged; the output adds its bytes ('bXana', 5).
+# cost: 37
+query T nosort
+SELECT regexp_replace('banana', 'an', 'X')
+----
+bXana
+
+# === array_replace ===
+
+# Charged even over constants: input payload 16 + 3 × 32 = 112, output 112.
+# cost: 227
+query T nosort
+SELECT array_replace(ARRAY[1, 1, 1], 1, 2)
+----
+{2,2,2}
+
+# Each match is resized: 16 + 2 × 33 = 82 in, 82 + 2 × (35 − 33) = 86 out.
+# max_scalar_bytes: 86
+query T nosort
+SELECT array_replace(ARRAY['a', 'a'], 'a', 'xyz')
+----
+{xyz,xyz}
+
+# max_scalar_bytes: 85
+statement error 54P04
+SELECT array_replace(ARRAY['a', 'a'], 'a', 'xyz')
+
+# A NULL array is NULL and charges nothing.
+# max_scalar_bytes: 1
+query T nosort
+SELECT array_replace(NULL::i32[], 1, 2)
+----
+NULL

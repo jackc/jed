@@ -973,48 +973,36 @@ impl Program {
         Ok(Some(groups))
     }
 
-    /// `regexp_replace(source, pattern, replacement, …)` (regex.md §8). Replaces the first match (or
-    /// all when `global`) by the replacement TEMPLATE (`\1`..`\9` = capture group, `\&` = whole
-    /// match, `\\` = literal backslash). Non-matched text and captured substrings come from
-    /// `orig_input` (original case); the VM matches over `match_input` (possibly case-folded).
-    pub fn regexp_replace(
+    /// The matches `regexp_replace(source, pattern, replacement, …)` (regex.md §8) replaces: the first
+    /// match, or every non-overlapping match when `global`. Each entry is a match's capture slots. The
+    /// VM matches over `match_input` (possibly case-folded); this is the kernel's whole search, so it
+    /// charges every `regex_step` the replacement costs. [`replace_size`] and [`replace_build`] then
+    /// size and splice from these slots without searching again (cost.md §8.1).
+    pub fn replace_matches(
         &self,
         match_input: &[char],
-        orig_input: &[char],
-        replacement: &[char],
         global: bool,
         m: &mut Meter,
-    ) -> Result<String> {
-        let mut out = String::new();
+    ) -> Result<Vec<Vec<i64>>> {
+        let mut found = Vec::new();
         let mut pos = 0usize;
         loop {
             let Some(saves) = self.search(match_input, pos, m)? else {
                 break;
             };
-            let s = saves[0] as usize;
-            let e = saves[1] as usize;
-            out.extend(orig_input[pos..s].iter());
-            splice_replacement(&mut out, replacement, &saves, orig_input);
+            let (s, e) = (saves[0] as usize, saves[1] as usize);
+            found.push(saves);
             if !global {
-                out.extend(orig_input[e..].iter());
-                return Ok(out);
+                break;
             }
-            if e > s {
-                pos = e;
-            } else {
-                // Empty match: emit the char at `e` (if any) and advance past it, so a pattern that
-                // can match empty (`a*`) cannot loop forever — the PG global rule.
-                if e < orig_input.len() {
-                    out.push(orig_input[e]);
-                }
-                pos = e + 1;
-            }
-            if pos > orig_input.len() {
-                return Ok(out);
+            // Empty match: the next search starts past the char at `e`, so a pattern that can match
+            // empty (`a*`) cannot loop forever — the PG global rule.
+            pos = if e > s { e } else { e + 1 };
+            if pos > match_input.len() {
+                break;
             }
         }
-        out.extend(orig_input[pos..].iter());
-        Ok(out)
+        Ok(found)
     }
 
     /// Count the non-overlapping matches at or after code-point position `start` (`regexp_count`,
@@ -1075,9 +1063,22 @@ fn slice_group(orig: &[char], start: i64, end: i64) -> Option<String> {
     Some(orig[start as usize..end as usize].iter().collect())
 }
 
-/// Append a replacement template to `out`, expanding `\1`..`\9` (capture group), `\&` (whole match),
-/// `\\` (literal backslash), and `\<other>` (the literal `<other>`). A trailing lone `\` is literal.
-fn splice_replacement(out: &mut String, repl: &[char], saves: &[i64], orig: &[char]) {
+/// One piece of an expanded replacement template: a literal char, or the `[start, end)` span of
+/// `orig` a capture group or the whole match selected.
+enum Piece {
+    Char(char),
+    Span(usize, usize),
+}
+
+/// Walk a replacement template, expanding `\1`..`\9` (capture group), `\&` (whole match), `\\`
+/// (literal backslash), and `\<other>` (the literal `<other>`). A trailing lone `\` is literal, and
+/// an unset or absent group expands to nothing. Sizing and building share this walk so they cannot
+/// disagree.
+fn for_each_piece(repl: &[char], saves: &[i64], mut f: impl FnMut(Piece)) {
+    // An unset (`-1`) group expands to nothing.
+    let span = |start: i64, end: i64| {
+        (start >= 0 && end >= 0).then(|| Piece::Span(start as usize, end as usize))
+    };
     let mut i = 0;
     while i < repl.len() {
         let c = repl[i];
@@ -1086,23 +1087,67 @@ fn splice_replacement(out: &mut String, repl: &[char], saves: &[i64], orig: &[ch
             if let Some(d) = n.to_digit(10) {
                 let g = d as usize;
                 if 2 * g + 1 < saves.len() {
-                    if let Some(s) = slice_group(orig, saves[2 * g], saves[2 * g + 1]) {
-                        out.push_str(&s);
+                    if let Some(p) = span(saves[2 * g], saves[2 * g + 1]) {
+                        f(p);
                     }
                 }
             } else if n == '&' {
-                if let Some(s) = slice_group(orig, saves[0], saves[1]) {
-                    out.push_str(&s);
+                if let Some(p) = span(saves[0], saves[1]) {
+                    f(p);
                 }
             } else {
-                out.push(n); // \\ -> \, and \<other> -> <other>
+                f(Piece::Char(n));
             }
             i += 2;
         } else {
-            out.push(c);
+            f(Piece::Char(c));
             i += 1;
         }
     }
+}
+
+/// The text spans and pieces of a replacement, in output order: unmatched source text from `orig`,
+/// each match's expanded template, and, for an empty match, the char after it.
+fn for_each_output(orig: &[char], repl: &[char], found: &[Vec<i64>], mut f: impl FnMut(Piece)) {
+    let mut pos = 0usize;
+    for saves in found {
+        let (s, e) = (saves[0] as usize, saves[1] as usize);
+        f(Piece::Span(pos, s));
+        for_each_piece(repl, saves, &mut f);
+        if e > s {
+            pos = e;
+        } else {
+            if e < orig.len() {
+                f(Piece::Char(orig[e]));
+            }
+            pos = e + 1;
+        }
+    }
+    if pos <= orig.len() {
+        f(Piece::Span(pos, orig.len()));
+    }
+}
+
+/// The exact UTF-8 byte length of `regexp_replace`'s result for the matches
+/// [`Program::replace_matches`] found, computed without building it (cost.md §8.1).
+pub fn replace_size(orig: &[char], repl: &[char], found: &[Vec<i64>]) -> i64 {
+    let mut size = 0i64;
+    for_each_output(orig, repl, found, |p| match p {
+        Piece::Char(c) => size += c.len_utf8() as i64,
+        Piece::Span(a, b) => size += orig[a..b].iter().map(|c| c.len_utf8() as i64).sum::<i64>(),
+    });
+    size
+}
+
+/// Build `regexp_replace`'s result of `size` bytes from the matches [`Program::replace_matches`]
+/// found.
+pub fn replace_build(orig: &[char], repl: &[char], found: &[Vec<i64>], size: i64) -> String {
+    let mut out = String::with_capacity(size as usize);
+    for_each_output(orig, repl, found, |p| match p {
+        Piece::Char(c) => out.push(c),
+        Piece::Span(a, b) => out.extend(orig[a..b].iter()),
+    });
+    out
 }
 
 #[cfg(test)]

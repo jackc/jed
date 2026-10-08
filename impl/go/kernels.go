@@ -174,6 +174,80 @@ func repeatText(s string, n int64, m *costMeter) (string, error) {
 	return strings.Repeat(s, int(n)), nil
 }
 
+// chargeOutput charges a growth kernel's constructed result (spec/design/cost.md §8.1):
+// scalar_byte × payload(result), guarded before the value is returned. A NULL result charges nothing.
+func chargeOutput(m *costMeter, out Value) error {
+	if out.Kind == ValNull {
+		return nil
+	}
+	m.Charge(costs.ScalarByte * memPayloadBytes(out))
+	return m.Guard()
+}
+
+// allConstant reports whether every operand is constant (rexprIsConstant), so a growth kernel over
+// them is free (cost.md §8.1).
+func allConstant(args []*rExpr) bool {
+	for _, a := range args {
+		if !rexprIsConstant(a) {
+			return false
+		}
+	}
+	return true
+}
+
+// replaceText is replace(s, from, to) (string-functions.md §3): replace every non-overlapping
+// occurrence of from; an empty from matches nothing (PostgreSQL; strings.ReplaceAll would instead
+// splice to between every character). An amplifier (cost.md §8.1): the input scan is charged, then
+// the exact UTF-8 result size is computed from the match count, capped at maxResultChars (54000),
+// charged, and reserved before the result is built.
+func replaceText(s, from, to string, m *costMeter) (string, error) {
+	m.Charge(costs.ScalarByte * int64(len(s)))
+	if err := m.Guard(); err != nil {
+		return "", err
+	}
+	var count int64
+	if from != "" {
+		count = int64(strings.Count(s, from))
+	}
+	size := int64(len(s)) + count*(int64(len(to))-int64(len(from)))
+	if size > maxResultChars {
+		return "", newError(ProgramLimitExceeded, "requested length too large")
+	}
+	m.Charge(costs.ScalarByte * size)
+	if err := m.Guard(); err != nil {
+		return "", err
+	}
+	if err := m.ReserveScalar(size); err != nil {
+		return "", err
+	}
+	if count == 0 {
+		return s, nil
+	}
+	return strings.ReplaceAll(s, from, to), nil
+}
+
+// regexpReplaceText is regexp_replace (regex.md §8): run the whole search, then size the result
+// exactly, cap it at maxResultChars (54000), charge and reserve it, and splice it from the recorded
+// matches. An amplifier (cost.md §8.1); the search's regex_steps are its input charge.
+func regexpReplaceText(prog *regexProgram, matchRunes, origRunes, repl []rune, global bool, m *costMeter) (string, error) {
+	found, err := prog.replaceMatches(matchRunes, global, m)
+	if err != nil {
+		return "", err
+	}
+	size := replaceSize(origRunes, repl, found)
+	if size > maxResultChars {
+		return "", newError(ProgramLimitExceeded, "requested length too large")
+	}
+	m.Charge(costs.ScalarByte * size)
+	if err := m.Guard(); err != nil {
+		return "", err
+	}
+	if err := m.ReserveScalar(size); err != nil {
+		return "", err
+	}
+	return replaceBuild(origRunes, repl, found, size), nil
+}
+
 // splitPart is split_part(s, delim, n) (string-functions.md §3): split s on the substring delim and
 // return the n-th field (1-based; a negative n counts from the end). An out-of-range field is empty;
 // n = 0 traps 22023. An EMPTY delim treats the whole string as one field (strings.Split would

@@ -1791,6 +1791,138 @@ logarithm estimates use the same meter. This deliberately conservative logical
 work measure is independent of the host limb representation and wall clock.
 The exact charge sites are specified alongside the kernels in decimal.md.
 
+### 8.1 Output-constructing kernels
+
+> **Status: S1 implemented** in all three cores (`resource/scalar_output.test`). S2 and S3
+> are designed, not built.
+
+The `repeat`/pad rule generalizes. A kernel that **builds** a variable-width value
+can produce bytes that no earlier charge paid for. It can combine operands
+(`s || s` doubles a value that was read once), or expand one
+(`replace(s, 'a', s)`). A recursive CTE, or a chain of CTEs, applies such a kernel
+over and over, so a few cost units can grow a value geometrically. Before this
+rule, 20 recursive steps of `replace(s, 'a', 'aa')` built a 512 KiB string for 159
+units, and 30 steps would build 512 MiB for about 240. Covered kernels therefore
+charge `scalar_byte` for each byte of their **output**, measured as
+`payload(result)` from the memory schedule ([memory.md](memory.md) §3). That is
+UTF-8 bytes for text (the measure `repeat` and the pad functions already charge),
+the byte length for `bytea`, element headers plus element payloads for arrays,
+and node headers plus contents for `jsonb`. Every core already implements this
+measure for the query-memory account, and `spec/cost/memory_sizes.toml` pins it.
+
+Covered kernels fall into two classes.
+
+**Growth kernels: charge after construction.** The result is at most a small
+constant multiple of the operands' payloads, so building it before measuring it is
+bounded overshoot. After the kernel builds a non-NULL result, it charges
+`scalar_byte × payload(result)` and guards before returning. Growth kernels
+reserve **nothing** against the scalar allowance. They are the bulk constructors
+of ordinary work, such as `UPDATE t SET tags = array_append(tags, x)` over a large
+table, and the allowance is a cumulative per-statement total with a finite
+default, so it would reject that work by default. The values they leave in
+buffered rows are counted by the query-memory account ([memory.md](memory.md)
+§2).
+
+**Amplifiers: size, charge, and reserve before construction.** A single call can
+multiply its input by a factor that an operand controls. The kernel charges its
+input scan, guards, computes the exact output size without building the output,
+applies any structural cap, charges `scalar_byte × size`, guards, reserves `size`
+against the scalar allowance ([memory.md](memory.md) §1), and only then builds.
+`repeat`, `lpad`, `rpad` (above) and the decimal transcendental kernels are the
+existing members.
+
+| Kernel | Class | Slice | Input charge | Output size |
+|---|---|---|---|---|
+| `ARRAY[…]` constructor | growth | S1 | — | `payload(array)` |
+| array `\|\|`, `array_append`, `array_prepend`, `array_cat` | growth | S1 | — | `payload(array)` |
+| `replace(s, from, to)` | amplifier | S1 | UTF-8 bytes of `s` | UTF-8 bytes of the result |
+| `regexp_replace` | amplifier | S1 | none beyond `regex_step` | UTF-8 bytes of the result |
+| `array_replace(a, old, new)` | amplifier | S1 | `payload(a)` | `payload(result)` |
+| jsonb `\|\|`, `jsonb_set`, `jsonb_insert`, `jsonb_build_array`/`_object`, `json_build_array`/`_object`, `JSON_ARRAY`, `JSON_OBJECT`, `jsonb_object(text[], …)`, `to_json`, `to_jsonb`, `array_to_json`, `json_scalar`, `json_serialize`, `jsonb_path_query_array` | growth | S2 | — | `payload(result)` |
+| `jsonb_pretty` | amplifier | S2 | `payload(jsonb)` | UTF-8 bytes of the result |
+| `encode`, `quote_literal`, `quote_ident`, `quote_nullable`; casts to `text` from array, composite, range, `json`, `jsonb`, `bytea` | growth | S3 | — | UTF-8 bytes of the result |
+
+The amplifiers' exact sizes:
+
+- `replace`: `len(s) + count × (len(to) − len(from))` in UTF-8 bytes, where `count`
+  is the number of non-overlapping leftmost matches of `from`. An empty `from`
+  matches nothing, so the size is `len(s)`. Counting the same matches in UTF-16 (TS)
+  gives the same `count`, because matches of well-formed strings fall on code-point
+  boundaries in both encodings.
+- `regexp_replace`: the kernel first runs its whole search, recording every match's
+  capture slots. That is the search the kernel already performs, and it charges the
+  same `regex_step`s. The size is the UTF-8 length of the unmatched spans plus each
+  match's expanded replacement (literal characters, `\1`–`\9`, `\&`, `\\`). The
+  build then splices from the recorded matches without searching again, so
+  regex cost is unchanged.
+- `array_replace`: `payload(a) + Σ (value_bytes(new) − value_bytes(e))` over the
+  matched elements `e`. Elements that compare equal can still differ in payload, for
+  example decimals of different scale.
+- `jsonb_pretty`: the UTF-8 length of the rendering, computed by walking the tree
+  with the renderer's exact whitespace rules. Indentation makes the output grow with
+  depth times node count, which is why this kernel is an amplifier.
+
+`replace`, `regexp_replace`, and `jsonb_pretty` also reject a size above
+`MAX_RESULT_CHARS` with `54000`, before the output charge, like `repeat`.
+
+Rules for both classes:
+
+- A NULL result, whether from strict NULL short-circuiting or from the kernel
+  itself, charges nothing. So do unselected `CASE` arms.
+- A growth kernel whose operands are all **constant** charges nothing. Constant
+  means built only from literals, parameters, and pure operations over them: no
+  column, outer column, subquery, statement clock, or host function. This is the
+  `rexpr_is_constant` predicate that GIN admission ([gin.md](gin.md) §6) and the
+  estimator already share. Such a result is fixed by the statement and its
+  parameters, the way a literal is, so it cannot grow from row to row. Without
+  this rule, `x = ANY(ARRAY[1, 2, 3])` would pay for the array's 112 bytes on every
+  row it filters. Each kernel decides on its own operands: in
+  `array_append(ARRAY[1], col)`, the inner constructor is free and
+  `array_append` is charged. Amplifiers are charged even with constant operands,
+  because `replace('aaaa', 'a', '<long literal>')` multiplies the statement text.
+- The charge comes on top of the kernel's existing `operator_eval` (and
+  `regex_step`, and so on). It applies wherever the kernel runs: projections,
+  predicates, writes, `RETURNING`, index expressions, generated actions, and
+  prepared execution.
+- Cost wins. Every charge is guarded before the amplifier reserves, so when both
+  gates reject a step, `54P01`/`54P02` is reported, not `54P04`.
+- The estimator counts no `scalar_byte` for these sites, as for `repeat` and the
+  pad functions: they are size extras without admitted value-size facts
+  ([estimator.md](estimator.md) §8.2).
+
+**Not covered**, and why:
+
+- `ROW(…)`: a composite is a named type with a fixed field list, so growth by
+  nesting needs a deeper type for each level. That requires DDL, and the composite
+  nesting limit (§7b) bounds it. Row-value comparisons build transient rows on
+  every evaluation, and charging them would tax keyset predicates such as
+  `(a, b) > (1, 'x')` for no protection.
+- Results that are an operand or part of one: substrings, trims, `split_part`,
+  subscripts and slices, jsonb extraction (`->`, `->>`, `#>`, `#>>`),
+  `jsonb_strip_nulls`, `array_remove`, jsonb `-`, `CASE`, `COALESCE`,
+  `GREATEST`/`LEAST`.
+- Kernels whose output stays within a constant multiple of the original input no
+  matter how often they are applied: `translate` (each character maps to at most
+  one character of at most 4 bytes), `upper`/`lower`/`initcap`, `reverse`,
+  `decode`.
+- Renders of fixed-width or decimal values (casts to `text` from integer, float,
+  decimal, uuid, and date/time types, `to_hex`, `chr`): bounded by a constant or by
+  a digit count that `decimal_work` already charges.
+- Parsing text into an array, `json`, `jsonb`, composite, or range: the result is
+  bounded by the input text, and getting back to text for another round needs a
+  covered renderer.
+- Aggregates (`json_agg`, `jsonb_object_agg`, …): each input came from a charged
+  row, and the retained inputs are Q2 operator state ([memory.md](memory.md) §6).
+- Set-returning functions: each row they produce charges `generated_row`.
+- Host functions: outside the engine's guarantees (CLAUDE.md §13).
+
+**Follow-ons.** New constructing kernels (text `||`, `concat`, `format`,
+`string_agg`, `array_fill`) join this table when they land. Path evaluation
+inside jsonpath (`jsonb_path_query`, `@?`, `JSON_QUERY`) copies matched sub-values
+with no per-step charge; that is the unimplemented `jsonpath_step` unit
+([jsonpath.md](jsonpath.md) §7), a separate slice. The S2 charge on
+`jsonb_path_query_array` covers only the collected result.
+
 Cost is a work budget, **not a memory limit**. Independent allocation budgets —
 the cumulative scalar allowance (`54P04`) and the live query-memory account
 (`54P05`) — are specified in [memory.md](memory.md). Both cost counters saturate at i64 MAX;

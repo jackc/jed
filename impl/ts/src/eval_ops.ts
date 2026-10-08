@@ -28,7 +28,8 @@ import {
 } from "./value.ts";
 import { checkDepth as jsonCheckDepth, jsonCompactOut } from "./json.ts";
 import { type QueryAccount, StateCharge } from "./cost.ts";
-import { entryBytes } from "./memsize.ts";
+import { entryBytes, payloadBytes, valueBytes } from "./memsize.ts";
+import { COSTS } from "./costs.ts";
 import {
   arraySubscriptErr,
   distinctRowKey,
@@ -81,7 +82,7 @@ import {
 } from "./types.ts";
 import { Decimal, MAX_PRECISION, MAX_SCALE } from "./decimal.ts";
 import type { Expr, OrderKey, SetOpKind, TypeMod } from "./ast.ts";
-export function evalArrayFunc(func: ArrayFuncName, vals: Value[]): Value {
+export function evalArrayFunc(func: ArrayFuncName, vals: Value[], m: Meter): Value {
   switch (func) {
     case "array_ndims": {
       const a = vals[0]!;
@@ -121,7 +122,7 @@ export function evalArrayFunc(func: ArrayFuncName, vals: Value[]): Value {
     case "array_remove":
       return arrayRemoveValue(vals[0]!, vals[1]!);
     case "array_replace":
-      return arrayReplaceValue(vals[0]!, vals[1]!, vals[2]!);
+      return arrayReplaceValue(vals[0]!, vals[1]!, vals[2]!, m);
     case "array_position":
       return arrayPositionValue(vals[0]!, vals[1]!, vals.length > 2 ? vals[2]! : null);
     case "array_positions":
@@ -338,8 +339,19 @@ export function arrayRemoveValue(arr: Value, elem: Value): Value {
 // arrayReplaceValue is array_replace(a, from, to) (array-functions.md §8): substitute every element
 // NOT DISTINCT FROM `from` with `to`. Works on any dimensionality (the shape is preserved). NULL
 // array → NULL.
-export function arrayReplaceValue(arr: Value, from: Value, to: Value): Value {
+export function arrayReplaceValue(arr: Value, from: Value, to: Value, m: Meter): Value {
   if (arr.kind !== "array") return nullValue();
+  // An amplifier (cost.md §8.1): every match can become a large `to`, so charge the input scan, then
+  // size, charge, and reserve the result before building it.
+  const input = BigInt(payloadBytes(arr));
+  m.charge(COSTS.scalarByte * input);
+  m.guard();
+  const toBytes = valueBytes(to);
+  let size = input;
+  for (const e of arr.elements) if (notDistinct(e, from)) size += BigInt(toBytes - valueBytes(e));
+  m.charge(COSTS.scalarByte * size);
+  m.guard();
+  m.reserveScalar(size);
   const elements = arr.elements.map((e) => (notDistinct(e, from) ? to : e));
   return {
     kind: "array",

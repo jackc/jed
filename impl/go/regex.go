@@ -13,6 +13,7 @@ package jed
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // maxRegexProgram is the maximum compiled-program size, in instructions (regex.md §6, cost.md §7c).
@@ -963,44 +964,40 @@ func (p *regexProgram) regexpMatch(matchInput, origInput []rune, m *costMeter) (
 	return groups, true, nil
 }
 
-// regexpReplace is regexp_replace(source, pattern, replacement, …) (regex.md §8). Replaces the first
-// match (or all when global) by the replacement TEMPLATE (\1..\9 = capture group, \& = whole match,
-// \\ = literal backslash). Non-matched text and captured substrings come from origInput (original
-// case); the VM matches over matchInput (possibly case-folded).
-func (p *regexProgram) regexpReplace(matchInput, origInput, replacement []rune, global bool, m *costMeter) (string, error) {
-	var out []rune
+// replaceMatches finds the matches regexp_replace(source, pattern, replacement, …) (regex.md §8)
+// replaces: the first match, or every non-overlapping match when global. Each entry is a match's
+// capture slots. The VM matches over matchInput (possibly case-folded); this is the kernel's whole
+// search, so it charges every regex_step the replacement costs. replaceSize and replaceBuild then size
+// and splice from these slots without searching again (cost.md §8.1).
+func (p *regexProgram) replaceMatches(matchInput []rune, global bool, m *costMeter) ([][]int64, error) {
+	var found [][]int64
 	pos := 0
 	for {
 		saves, err := p.search(matchInput, pos, m)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		if saves == nil {
 			break
 		}
 		s := int(saves[0])
 		e := int(saves[1])
-		out = append(out, origInput[pos:s]...)
-		out = spliceReplacement(out, replacement, saves, origInput)
+		found = append(found, saves)
 		if !global {
-			out = append(out, origInput[e:]...)
-			return string(out), nil
+			break
 		}
+		// Empty match: the next search starts past the char at e, so a pattern that can match empty
+		// (a*) cannot loop forever — the PG global rule.
 		if e > s {
 			pos = e
 		} else {
-			// Empty match: emit the char at `e` (if any) and advance past it (the PG global rule).
-			if e < len(origInput) {
-				out = append(out, origInput[e])
-			}
 			pos = e + 1
 		}
-		if pos > len(origInput) {
-			return string(out), nil
+		if pos > len(matchInput) {
+			break
 		}
 	}
-	out = append(out, origInput[pos:]...)
-	return string(out), nil
+	return found, nil
 }
 
 // regexpCount counts the non-overlapping matches at or after code-point position `start`
@@ -1069,10 +1066,16 @@ func sliceGroup(orig []rune, start, end int64) *string {
 	return &s
 }
 
-// spliceReplacement appends a replacement template to out, expanding \1..\9 (capture group), \&
-// (whole match), \\ (literal backslash), and \<other> (the literal <other>). A trailing lone \ is
-// literal.
-func spliceReplacement(out, repl []rune, saves []int64, orig []rune) []rune {
+// forEachPiece walks a replacement template, expanding \1..\9 (capture group), \& (whole match), \\
+// (literal backslash), and \<other> (the literal <other>). A trailing lone \ is literal, and an unset
+// or absent group expands to nothing. Each piece is a literal rune (lo < 0) or the [lo, hi) span of
+// the original input. Sizing and building share this walk so they cannot disagree.
+func forEachPiece(repl []rune, saves []int64, f func(r rune, lo, hi int)) {
+	span := func(start, end int64) {
+		if start >= 0 && end >= 0 {
+			f(0, int(start), int(end))
+		}
+	}
 	for i := 0; i < len(repl); i++ {
 		c := repl[i]
 		if c == '\\' && i+1 < len(repl) {
@@ -1081,21 +1084,71 @@ func spliceReplacement(out, repl []rune, saves []int64, orig []rune) []rune {
 			case n >= '0' && n <= '9':
 				g := int(n - '0')
 				if 2*g+1 < len(saves) {
-					if grp := sliceGroup(orig, saves[2*g], saves[2*g+1]); grp != nil {
-						out = append(out, []rune(*grp)...)
-					}
+					span(saves[2*g], saves[2*g+1])
 				}
 			case n == '&':
-				if grp := sliceGroup(orig, saves[0], saves[1]); grp != nil {
-					out = append(out, []rune(*grp)...)
-				}
+				span(saves[0], saves[1])
 			default:
-				out = append(out, n) // \\ -> \, and \<other> -> <other>
+				f(n, -1, -1) // \\ -> \, and \<other> -> <other>
 			}
 			i++
 		} else {
-			out = append(out, c)
+			f(c, -1, -1)
 		}
 	}
-	return out
+}
+
+// forEachOutput walks the pieces of a replacement in output order: unmatched source text, each match's
+// expanded template, and, for an empty match, the rune after it.
+func forEachOutput(orig, repl []rune, found [][]int64, f func(r rune, lo, hi int)) {
+	pos := 0
+	for _, saves := range found {
+		s := int(saves[0])
+		e := int(saves[1])
+		f(0, pos, s)
+		forEachPiece(repl, saves, f)
+		if e > s {
+			pos = e
+		} else {
+			if e < len(orig) {
+				f(orig[e], -1, -1)
+			}
+			pos = e + 1
+		}
+	}
+	if pos <= len(orig) {
+		f(0, pos, len(orig))
+	}
+}
+
+// replaceSize is the exact UTF-8 byte length of regexp_replace's result for the matches replaceMatches
+// found, computed without building it (cost.md §8.1).
+func replaceSize(orig, repl []rune, found [][]int64) int64 {
+	var size int64
+	forEachOutput(orig, repl, found, func(r rune, lo, hi int) {
+		if lo < 0 {
+			size += int64(utf8.RuneLen(r))
+			return
+		}
+		for _, c := range orig[lo:hi] {
+			size += int64(utf8.RuneLen(c))
+		}
+	})
+	return size
+}
+
+// replaceBuild builds regexp_replace's result of size bytes from the matches replaceMatches found.
+func replaceBuild(orig, repl []rune, found [][]int64, size int64) string {
+	var b strings.Builder
+	b.Grow(int(size))
+	forEachOutput(orig, repl, found, func(r rune, lo, hi int) {
+		if lo < 0 {
+			b.WriteRune(r)
+			return
+		}
+		for _, c := range orig[lo:hi] {
+			b.WriteRune(c)
+		}
+	})
+	return b.String()
 }

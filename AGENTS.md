@@ -147,10 +147,13 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
 ## Safety And Resource Boundaries
 
 **Resource enforcement status.** Cost ceilings are work limits, not memory limits.
-`repeat`/padding have proportional UTF-8 work charges and pre-allocation byte checks;
-exact decimal transcendentals charge guarded internal steps. A finite 64 MiB default
-`max_scalar_bytes` allowance bounds their cumulative logical output/scratch allocation
-per statement (`54P04`), including internal meters and frozen cursors. A live, opt-in
+Amplifiers (`repeat`/padding, `replace`, `regexp_replace`, `array_replace`) charge their input
+and exact output bytes and check them before allocating; exact decimal transcendentals charge
+guarded internal steps. A finite 64 MiB default `max_scalar_bytes` allowance bounds their
+cumulative logical output/scratch allocation per statement (`54P04`), including internal meters
+and frozen cursors. Growth kernels (`ARRAY[…]` and the array builders so far) charge their output
+bytes to cost instead, so a cost ceiling bounds geometric growth through recursion
+(`spec/design/cost.md` §8.1). A live, opt-in
 `max_query_memory_bytes` account (unlimited by default; `54P05`) bounds row buffers and
 engine result collectors — relation materialization, join outputs, grouped/DISTINCT rows,
 set operations, CTE/recursive-CTE buffers, RETURNING/EXPLAIN results (slice Q1) — and
@@ -165,7 +168,8 @@ bytes until commit/rollback, each statement's account opens holding them, and th
 every statement. A database-owned, opt-in `max_storage_bytes` (unlimited by default; `54P06`)
 bounds an in-memory database's or attachment's committed pages, checked at commit before any write
 (slice Q4a); file-backed page caches stay evict-only under `cache_bytes` and never fail a query.
-A file-backed size cap and the remaining scalar kernels are still uncovered. These are guardrails, not heap caps: resource-
+A file-backed size cap, JSON construction and escaping renders (cost.md §8.1 slices S2–S3),
+and jsonpath evaluation are still uncovered. These are guardrails, not heap caps: resource-
 exhaustion resistance remains a requirement; do not claim the current limits are a
 whole-engine memory guarantee. Host extensions remain outside these guarantees.
 

@@ -38,6 +38,12 @@ export function utf8Length(s: string): number {
   return n;
 }
 
+// payloadBytes is payload(v) = value_bytes(v) − VALUE: the logical bytes an output-constructing
+// kernel charges as scalar_byte (spec/design/cost.md §8.1).
+export function payloadBytes(v: Value): number {
+  return valueBytes(v) - MEMORY_VALUE;
+}
+
 // valueBytes is value_bytes(v) = VALUE + payload(v). A hole (undefined — never a touched slot) is a
 // bare node, like NULL.
 export function valueBytes(v: Value | undefined): number {

@@ -109,7 +109,7 @@ func countNulls(vals []Value, wantNulls bool) int {
 // (spec/design/array-functions.md §3). The introspectors propagate NULL and return NULL for an
 // out-of-shape request; the builders are non-strict (a NULL array argument is the identity/empty,
 // NOT a propagated NULL). The resolver guarantees the array operand is an array or NULL.
-func evalArrayFunc(fn arrayFunc, vals []Value) (Value, error) {
+func evalArrayFunc(fn arrayFunc, vals []Value, m *costMeter) (Value, error) {
 	switch fn {
 	case afNdims:
 		if vals[0].Kind == ValNull {
@@ -157,7 +157,7 @@ func evalArrayFunc(fn arrayFunc, vals []Value) (Value, error) {
 	case afRemove:
 		return arrayRemoveValue(vals[0], vals[1])
 	case afReplace:
-		return arrayReplaceValue(vals[0], vals[1], vals[2])
+		return arrayReplaceValue(vals[0], vals[1], vals[2], m)
 	case afPosition:
 		var start *Value
 		if len(vals) > 2 {
@@ -441,11 +441,32 @@ func arrayRemoveValue(arr, elem Value) (Value, error) {
 // arrayReplaceValue is array_replace(a, from, to) (array-functions.md §8): substitute every element
 // NOT DISTINCT FROM `from` with `to`. Works on any dimensionality (the shape is preserved). NULL
 // array → NULL.
-func arrayReplaceValue(arr, from, to Value) (Value, error) {
+func arrayReplaceValue(arr, from, to Value, m *costMeter) (Value, error) {
 	if arr.Kind == ValNull {
 		return NullValue(), nil
 	}
 	a := arr.arrayVal()
+	// An amplifier (cost.md §8.1): every match can become a large `to`, so charge the input scan,
+	// then size, charge, and reserve the result before building it.
+	input := memPayloadBytes(arr)
+	m.Charge(costs.ScalarByte * input)
+	if err := m.Guard(); err != nil {
+		return Value{}, err
+	}
+	toBytes := memValueBytes(to)
+	size := input
+	for _, e := range a.Elements {
+		if notDistinct(e, from) {
+			size += toBytes - memValueBytes(e)
+		}
+	}
+	m.Charge(costs.ScalarByte * size)
+	if err := m.Guard(); err != nil {
+		return Value{}, err
+	}
+	if err := m.ReserveScalar(size); err != nil {
+		return Value{}, err
+	}
 	elements := make([]Value, len(a.Elements))
 	for i, e := range a.Elements {
 		if notDistinct(e, from) {
@@ -1184,10 +1205,22 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			elems[i] = v
 		}
+		var out Value
 		if e.nested {
-			return buildNestedArray(elems)
+			var err error
+			if out, err = buildNestedArray(elems); err != nil {
+				return Value{}, err
+			}
+		} else {
+			out = ArrayValue(elems)
 		}
-		return ArrayValue(elems), nil
+		// A growth kernel (cost.md §8.1), free when every element is constant.
+		if !allConstant(e.sargs) {
+			if err := chargeOutput(m, out); err != nil {
+				return Value{}, err
+			}
+		}
+		return out, nil
 	case reConstArray:
 		// A folded array constant (shape preserved) — return it directly.
 		return arrayValueOf(e.cArray), nil
@@ -2068,7 +2101,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		}
 		switch e.rxFunc {
 		case rxReplace:
-			out, err := prog.regexpReplace(matchRunes, origRunes, []rune(replacement), global, m)
+			out, err := regexpReplaceText(prog, matchRunes, origRunes, []rune(replacement), global, m)
 			if err != nil {
 				return Value{}, err
 			}
@@ -2862,13 +2895,12 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			return TextValue(trimChars(vals[0].str(), set, false, true)), nil
 		case sfReplace:
-			// replace(text, from, to) → text — substring replace-all; empty `from` is a no-op
-			// (strings.ReplaceAll would otherwise splice `to` between every character — §3).
-			from := vals[1].str()
-			if from == "" {
-				return TextValue(vals[0].str()), nil
+			// replace(text, from, to) → text — substring replace-all; empty `from` is a no-op.
+			r, err := replaceText(vals[0].str(), vals[1].str(), vals[2].str(), m)
+			if err != nil {
+				return Value{}, err
 			}
-			return TextValue(strings.ReplaceAll(vals[0].str(), from, vals[2].str())), nil
+			return TextValue(r), nil
 		case sfTranslate:
 			// translate(text, from, to) → text — per-character map/delete.
 			return TextValue(translateChars(vals[0].str(), vals[1].str(), vals[2].str())), nil
@@ -3173,7 +3205,17 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			vals[i] = v
 		}
-		return evalArrayFunc(e.afunc, vals)
+		out, err := evalArrayFunc(e.afunc, vals, m)
+		if err != nil {
+			return Value{}, err
+		}
+		// The builders are growth kernels (cost.md §8.1), free over constant operands.
+		if (e.afunc == afAppend || e.afunc == afPrepend || e.afunc == afCat) && !allConstant(e.sargs) {
+			if err := chargeOutput(m, out); err != nil {
+				return Value{}, err
+			}
+		}
+		return out, nil
 	case reRangeFunc:
 		// A polymorphic range accessor (spec/design/range-functions.md §1). One operator_eval per
 		// call; arguments charge their own. STRICT — the NULL short-circuit lives in the kernel.

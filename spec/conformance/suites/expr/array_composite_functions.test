@@ -83,7 +83,7 @@ SELECT array_remove('{"(a,1)",NULL}'::addr[], NULL::addr),
 
 # array_position / array_positions / array_replace over composite elements.
 # names: array_position, array_positions, array_replace
-# cost: 8
+# cost: 234
 query ITT nosort
 SELECT array_position('{"(a,1)","(b,2)"}'::addr[], '(b,2)'::addr),
        array_positions('{"(a,1)","(b,2)","(a,1)"}'::addr[], '(a,1)'::addr),

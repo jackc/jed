@@ -39,6 +39,10 @@ heap counter or a process RSS ceiling. The covered allocations are:
 - Decimal transcendental working storage: `8 * D` logical bytes for each charged
   kernel step, with D defined in cost.md §8. This conservative reservation is
   representation-independent, not a measurement of the runtime allocator.
+- The exact output size of the other **amplifiers** ([cost.md](cost.md) §8.1):
+  `replace`, `regexp_replace`, and `array_replace` (slice S1), and `jsonb_pretty`
+  (S2). Each is sized before it builds anything: UTF-8 bytes for text, and the §3
+  `payload` for an array.
 
 A reservation succeeds if `used + bytes <= limit`, implemented by comparing
 `bytes <= limit - used` to avoid overflow. Successful reservations accumulate;
@@ -60,8 +64,16 @@ before reserving output/scratch bytes; when both gates reject that step, the cos
 error wins. An allocation failure is an ordinary SQL statement failure: writes are
 rolled back and an explicit transaction enters the failed state.
 
-The allowance does not cover concatenation/replacement, array/JSON construction,
-or other scalar kernels yet; those remain scalar-admission follow-ons.
+Only amplifiers reserve, meaning kernels where one call can multiply its input by
+an operand-controlled factor. **Growth kernels** do not: array and JSON
+construction, concatenation, and escaping renders. Their result is at most a small
+constant multiple of their operands, and they are the bulk constructors of
+ordinary statements, so a cumulative allowance with a finite default would reject
+large but legitimate work. They charge their output bytes to **cost** instead
+([cost.md](cost.md) §8.1), which closes the geometric-growth hole under
+`max_cost`. The values they leave in buffered rows are counted by the
+query-memory account (§2). The kernel list, the slices (S1 arrays and replacement,
+S2 JSON, S3 renders), and what stays uncovered are in cost.md §8.1.
 
 ## 2. Query memory account
 

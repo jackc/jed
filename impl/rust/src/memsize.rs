@@ -36,6 +36,12 @@ pub(crate) fn value_bytes(v: &Value) -> i64 {
     }
 }
 
+/// `payload(v) = value_bytes(v) − VALUE`: the logical bytes an output-constructing kernel charges
+/// as `scalar_byte` (spec/design/cost.md §8.1).
+pub(crate) fn payload_bytes(v: &Value) -> i64 {
+    value_bytes(v) - MEMORY_VALUE
+}
+
 /// One `VALUE` per jsonb node plus its string/key bytes and number groups.
 fn jsonb_bytes(node: &JsonNode) -> i64 {
     MEMORY_VALUE

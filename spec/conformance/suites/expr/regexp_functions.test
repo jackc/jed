@@ -19,7 +19,7 @@ INSERT INTO one VALUES (1)
 # Cost (cost.md §3): operatorEval + regex_compile (pattern 'o' = 7 instructions, once) + regex_step
 # (16 — one search over 'foobar') + 1 scanned + 1 page + 1 produced = 1+1+1+7+16+1.
 # names: regexp_replace
-# cost: 27
+# cost: 33
 query T nosort
 SELECT regexp_replace('foobar', 'o', 'X') FROM one
 ----

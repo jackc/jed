@@ -28,7 +28,7 @@ pub(crate) fn count_nulls<'a>(vals: impl Iterator<Item = &'a Value>, want_nulls:
 /// out-of-shape request; the builders are non-strict (a NULL array argument is the identity/empty,
 /// NOT a propagated NULL). The resolver guarantees the array operand is an array or NULL, so the
 /// `_` arms are genuinely unreachable.
-pub(crate) fn eval_array_func(func: &ArrayFunc, vals: &[Value]) -> Result<Value> {
+pub(crate) fn eval_array_func(func: &ArrayFunc, vals: &[Value], m: &mut Meter) -> Result<Value> {
     match func {
         ArrayFunc::ArrayNdims => match &vals[0] {
             Value::Null => Ok(Value::Null),
@@ -87,7 +87,7 @@ pub(crate) fn eval_array_func(func: &ArrayFunc, vals: &[Value]) -> Result<Value>
         ArrayFunc::ArrayPrepend => array_extend(&vals[1], &vals[0], false),
         ArrayFunc::ArrayCat => array_cat_values(&vals[0], &vals[1]),
         ArrayFunc::ArrayRemove => array_remove_value(&vals[0], &vals[1]),
-        ArrayFunc::ArrayReplace => array_replace_value(&vals[0], &vals[1], &vals[2]),
+        ArrayFunc::ArrayReplace => array_replace_value(&vals[0], &vals[1], &vals[2], m),
         ArrayFunc::ArrayPosition => array_position_value(&vals[0], &vals[1], vals.get(2)),
         ArrayFunc::ArrayPositions => array_positions_value(&vals[0], &vals[1]),
         ArrayFunc::Contains => array_contains_value(&vals[0], &vals[1]),
@@ -314,12 +314,33 @@ pub(crate) fn array_remove_value(arr: &Value, elem: &Value) -> Result<Value> {
 /// array_replace(a, from, to) (array-functions.md §8): substitute every element NOT DISTINCT FROM
 /// `from` with `to`. Works on **any** dimensionality — the shape (dims/lbounds) is preserved and
 /// only matching element values change. NULL array → NULL.
-pub(crate) fn array_replace_value(arr: &Value, from: &Value, to: &Value) -> Result<Value> {
+pub(crate) fn array_replace_value(
+    arr: &Value,
+    from: &Value,
+    to: &Value,
+    m: &mut Meter,
+) -> Result<Value> {
     let a = match arr {
         Value::Null => return Ok(Value::Null),
         Value::Array(a) => a,
         _ => unreachable!("array_replace: array operand"),
     };
+    // An amplifier (cost.md §8.1): every match can become a large `to`, so charge the input scan,
+    // then size, charge, and reserve the result before building it.
+    let input = crate::memsize::payload_bytes(arr);
+    m.charge(COSTS.scalar_byte * input);
+    m.guard()?;
+    let to_bytes = crate::memsize::value_bytes(to);
+    let size = a
+        .elements
+        .iter()
+        .filter(|e| not_distinct(e, from))
+        .fold(input, |size, e| {
+            size + to_bytes - crate::memsize::value_bytes(e)
+        });
+    m.charge(COSTS.scalar_byte * size);
+    m.guard()?;
+    m.reserve_scalar(size)?;
     let elements = a
         .elements
         .iter()

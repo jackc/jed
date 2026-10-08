@@ -135,6 +135,71 @@ pub(crate) fn repeat_text(s: &str, n: i64, meter: &mut Meter) -> Result<String> 
     Ok(s.repeat(n as usize))
 }
 
+/// Charge a growth kernel's constructed result (spec/design/cost.md §8.1): `scalar_byte ×
+/// payload(result)`, guarded before the value is returned. A NULL result charges nothing.
+pub(crate) fn charge_output(meter: &mut Meter, out: &Value) -> Result<()> {
+    if matches!(out, Value::Null) {
+        return Ok(());
+    }
+    meter.charge(COSTS.scalar_byte * crate::memsize::payload_bytes(out));
+    meter.guard()
+}
+
+/// `replace(s, from, to)` (string-functions.md §3): replace every non-overlapping occurrence of
+/// `from`; an empty `from` matches nothing (PostgreSQL; Rust's `str::replace` would instead splice
+/// `to` at every boundary). An amplifier (cost.md §8.1): the input scan is charged, then the exact
+/// UTF-8 result size is computed from the match count, capped at `MAX_RESULT_CHARS` (`54000`),
+/// charged, and reserved before the result is built.
+pub(crate) fn replace_text(s: &str, from: &str, to: &str, meter: &mut Meter) -> Result<String> {
+    meter.charge(COSTS.scalar_byte * s.len() as i64);
+    meter.guard()?;
+    let count = if from.is_empty() {
+        0
+    } else {
+        s.matches(from).count() as i64
+    };
+    let size = s.len() as i64 + count * (to.len() as i64 - from.len() as i64);
+    if size > MAX_RESULT_CHARS {
+        return Err(EngineError::new(
+            SqlState::ProgramLimitExceeded,
+            "requested length too large",
+        ));
+    }
+    meter.charge(COSTS.scalar_byte * size);
+    meter.guard()?;
+    meter.reserve_scalar(size)?;
+    Ok(if count == 0 {
+        s.to_string()
+    } else {
+        s.replace(from, to)
+    })
+}
+
+/// `regexp_replace` (regex.md §8): run the whole search, then size the result exactly, cap it at
+/// `MAX_RESULT_CHARS` (`54000`), charge and reserve it, and splice it from the recorded matches. An
+/// amplifier (cost.md §8.1); the search's `regex_step`s are its input charge.
+pub(crate) fn regexp_replace_text(
+    prog: &crate::regex::Program,
+    match_chars: &[char],
+    orig_chars: &[char],
+    repl: &[char],
+    global: bool,
+    meter: &mut Meter,
+) -> Result<String> {
+    let found = prog.replace_matches(match_chars, global, meter)?;
+    let size = crate::regex::replace_size(orig_chars, repl, &found);
+    if size > MAX_RESULT_CHARS {
+        return Err(EngineError::new(
+            SqlState::ProgramLimitExceeded,
+            "requested length too large",
+        ));
+    }
+    meter.charge(COSTS.scalar_byte * size);
+    meter.guard()?;
+    meter.reserve_scalar(size)?;
+    Ok(crate::regex::replace_build(orig_chars, repl, &found, size))
+}
+
 /// `split_part(s, delim, n)` (string-functions.md §3): split `s` on the substring `delim` and return
 /// the n-th field (1-based; a negative n counts from the end). Out of range → `''`; `n = 0` traps
 /// `22023`. An EMPTY `delim` treats the whole string as one field (str::split would otherwise split

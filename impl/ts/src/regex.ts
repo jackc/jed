@@ -809,42 +809,32 @@ export function regexpMatch(
   return groups;
 }
 
-// regexpReplace is regexp_replace(source, pattern, replacement, …) (regex.md §8). Replaces the first
-// match (or all when global) by the replacement TEMPLATE (\1..\9 = capture group, \& = whole match,
-// \\ = literal backslash). Non-matched text and captured substrings come from origInput (original
-// case); the VM matches over matchInput (possibly case-folded).
-export function regexpReplace(
+// replaceMatches finds the matches regexp_replace(source, pattern, replacement, …) (regex.md §8)
+// replaces: the first match, or every non-overlapping match when global. Each entry is a match's
+// capture slots. The VM matches over matchInput (possibly case-folded); this is the kernel's whole
+// search, so it charges every regex_step the replacement costs. replaceSize and replaceBuild then size
+// and splice from these slots without searching again (cost.md §8.1).
+export function replaceMatches(
   p: RegexProgram,
   matchInput: number[],
-  origInput: number[],
-  replacement: number[],
   global: boolean,
   m: Meter,
-): string {
-  const out: number[] = [];
+): number[][] {
+  const found: number[][] = [];
   let pos = 0;
   for (;;) {
     const saves = regexSearch(p, matchInput, pos, m);
     if (saves === null) break;
     const s = saves[0];
     const e = saves[1];
-    for (let i = pos; i < s; i++) out.push(origInput[i]);
-    spliceReplacement(out, replacement, saves, origInput);
-    if (!global) {
-      for (let i = e; i < origInput.length; i++) out.push(origInput[i]);
-      return String.fromCodePoint(...out);
-    }
-    if (e > s) {
-      pos = e;
-    } else {
-      // Empty match: emit the char at `e` (if any) and advance past it (the PG global rule).
-      if (e < origInput.length) out.push(origInput[e]);
-      pos = e + 1;
-    }
-    if (pos > origInput.length) return String.fromCodePoint(...out);
+    found.push(saves);
+    if (!global) break;
+    // Empty match: the next search starts past the char at `e`, so a pattern that can match empty
+    // (`a*`) cannot loop forever — the PG global rule.
+    pos = e > s ? e : e + 1;
+    if (pos > matchInput.length) break;
   }
-  for (let i = pos; i < origInput.length; i++) out.push(origInput[i]);
-  return String.fromCodePoint(...out);
+  return found;
 }
 
 // regexpCount counts the non-overlapping matches at or after code-point position `start`
@@ -898,29 +888,86 @@ function sliceGroup(orig: number[], start: number, end: number): string | null {
   return String.fromCodePoint(...orig.slice(start, end));
 }
 
-// spliceReplacement appends a replacement template to out, expanding \1..\9 (capture group), \&
-// (whole match), \\ (literal backslash), and \<other> (the literal <other>). A trailing lone \ is
-// literal.
-function spliceReplacement(out: number[], repl: number[], saves: number[], orig: number[]): void {
+// A piece of an expanded replacement: a literal code point (lo < 0), or the [lo, hi) span of the
+// original input.
+type PieceFn = (cp: number, lo: number, hi: number) => void;
+
+// forEachPiece walks a replacement template, expanding \1..\9 (capture group), \& (whole match), \\
+// (literal backslash), and \<other> (the literal <other>). A trailing lone \ is literal, and an unset
+// or absent group expands to nothing. Sizing and building share this walk so they cannot disagree.
+function forEachPiece(repl: number[], saves: number[], f: PieceFn): void {
+  const span = (start: number, end: number): void => {
+    if (start >= 0 && end >= 0) f(0, start, end);
+  };
   for (let i = 0; i < repl.length; i++) {
     const c = repl[i];
     if (c === 0x5c /* \ */ && i + 1 < repl.length) {
       const n = repl[i + 1];
       if (n >= 0x30 && n <= 0x39 /* 0-9 */) {
         const g = n - 0x30;
-        if (2 * g + 1 < saves.length) {
-          const grp = sliceGroup(orig, saves[2 * g], saves[2 * g + 1]);
-          if (grp !== null) for (const cp of grp) out.push(cp.codePointAt(0) as number);
-        }
+        if (2 * g + 1 < saves.length) span(saves[2 * g], saves[2 * g + 1]);
       } else if (n === 0x26 /* & */) {
-        const grp = sliceGroup(orig, saves[0], saves[1]);
-        if (grp !== null) for (const cp of grp) out.push(cp.codePointAt(0) as number);
+        span(saves[0], saves[1]);
       } else {
-        out.push(n); // \\ -> \, and \<other> -> <other>
+        f(n, -1, -1); // \\ -> \, and \<other> -> <other>
       }
       i++;
     } else {
-      out.push(c);
+      f(c, -1, -1);
     }
   }
+}
+
+// forEachOutput walks the pieces of a replacement in output order: unmatched source text, each match's
+// expanded template, and, for an empty match, the code point after it.
+function forEachOutput(orig: number[], repl: number[], found: number[][], f: PieceFn): void {
+  let pos = 0;
+  for (const saves of found) {
+    const s = saves[0];
+    const e = saves[1];
+    f(0, pos, s);
+    forEachPiece(repl, saves, f);
+    if (e > s) {
+      pos = e;
+    } else {
+      if (e < orig.length) f(orig[e], -1, -1);
+      pos = e + 1;
+    }
+  }
+  if (pos <= orig.length) f(0, pos, orig.length);
+}
+
+function cpUtf8Len(cp: number): number {
+  return cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+}
+
+// replaceSize is the exact UTF-8 byte length of regexp_replace's result for the matches replaceMatches
+// found, computed without building it (cost.md §8.1).
+export function replaceSize(orig: number[], repl: number[], found: number[][]): bigint {
+  let size = 0;
+  forEachOutput(orig, repl, found, (cp, lo, hi) => {
+    if (lo < 0) size += cpUtf8Len(cp);
+    else for (let i = lo; i < hi; i++) size += cpUtf8Len(orig[i]);
+  });
+  return BigInt(size);
+}
+
+// replaceBuild builds regexp_replace's result from the matches replaceMatches found. Code points are
+// converted in bounded chunks: spreading a large array into String.fromCodePoint overflows the stack.
+export function replaceBuild(orig: number[], repl: number[], found: number[][]): string {
+  const parts: string[] = [];
+  let chunk: number[] = [];
+  const push = (cp: number): void => {
+    chunk.push(cp);
+    if (chunk.length === 8192) {
+      parts.push(String.fromCodePoint(...chunk));
+      chunk = [];
+    }
+  };
+  forEachOutput(orig, repl, found, (cp, lo, hi) => {
+    if (lo < 0) push(cp);
+    else for (let i = lo; i < hi; i++) push(orig[i]);
+  });
+  parts.push(String.fromCodePoint(...chunk));
+  return parts.join("");
 }
