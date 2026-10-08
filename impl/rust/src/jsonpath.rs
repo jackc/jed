@@ -306,11 +306,11 @@ fn write_filt_expr(e: &FiltExpr, out: &mut String) {
 pub fn eval(path: &JsonPath, ctx: &JsonNode) -> Result<Vec<JsonNode>> {
     match &path.body {
         PathBody::Path(steps) => eval_steps(steps, ctx, ctx, path.strict),
-        // A top-level predicate → a single boolean item: TRUE iff the predicate is definitely true
-        // (unknown / false both render as `false`, matching PG's jsonb_path_query).
+        // A top-level predicate → a single item: its truth value as a boolean, or JSON null when
+        // unknown (§4.4).
         PathBody::Predicate(pred) => {
-            let truth = eval_pred(pred, ctx, ctx, path.strict)? == Some(true);
-            Ok(vec![JsonNode::Bool(truth)])
+            let truth = eval_pred(pred, ctx, ctx, path.strict)?;
+            Ok(vec![truth.map_or(JsonNode::Null, JsonNode::Bool)])
         }
     }
 }
@@ -462,8 +462,10 @@ fn eval_pred(
     })
 }
 
-/// Existential comparison (§4): true if SOME pair `(a in lhs-seq, b in rhs-seq)` compares true. An
-/// empty operand or all-incomparable pairs → `None` (unknown); else `Some(false)`.
+/// Existential comparison (§4.4) over every pair `(a in lhs-seq, b in rhs-seq)`. An operand
+/// navigation error → `None` (unknown). lax: any true pair → true, else any incomparable pair →
+/// unknown, else false (so an empty operand is false). strict: any incomparable pair → unknown, even
+/// beside a true pair.
 fn eval_compare(
     l: &FiltExpr,
     op: CmpOp,
@@ -472,39 +474,49 @@ fn eval_compare(
     root: &JsonNode,
     strict: bool,
 ) -> Result<Option<bool>> {
-    let ls = eval_filt_expr(l, current, root, strict)?;
-    let rs = eval_filt_expr(r, current, root, strict)?;
-    if ls.is_empty() || rs.is_empty() {
+    let (Some(ls), Some(rs)) = (
+        eval_filt_expr(l, current, root, strict),
+        eval_filt_expr(r, current, root, strict),
+    ) else {
         return Ok(None);
-    }
+    };
+    let mut found = false;
     let mut any_unknown = false;
     for a in &ls {
         for b in &rs {
             match compare_nodes(a, op, b) {
-                Some(true) => return Ok(Some(true)),
+                Some(true) if !strict => return Ok(Some(true)),
+                Some(true) => found = true,
                 Some(false) => {}
+                None if strict => return Ok(None),
                 None => any_unknown = true,
             }
         }
     }
-    Ok(if any_unknown { None } else { Some(false) })
+    Ok(if found {
+        Some(true)
+    } else if any_unknown {
+        None
+    } else {
+        Some(false)
+    })
 }
 
 /// Evaluate a filter operand to its jsonb-item sequence (a `@`/`$` path) or a singleton literal.
+/// `None` is a navigation error, which makes the comparison unknown rather than propagating (§4.2:
+/// filter operands never raise, even in strict).
 fn eval_filt_expr(
     e: &FiltExpr,
     current: &JsonNode,
     root: &JsonNode,
     strict: bool,
-) -> Result<Vec<JsonNode>> {
+) -> Option<Vec<JsonNode>> {
     match e {
         FiltExpr::Path { from_root, steps } => {
             let seed = if *from_root { root } else { current };
-            // A navigation error inside a filter operand → no items (the comparison is just unknown),
-            // never propagated (§4.2: filter operands never raise, even in strict).
-            let seq = eval_steps(steps, seed, root, strict).unwrap_or_default();
+            let seq = eval_steps(steps, seed, root, strict).ok()?;
             if strict {
-                return Ok(seq);
+                return Some(seq);
             }
             // lax: an array-valued operand item is unwrapped ONE level, so the existential
             // comparison ranges over its elements (§4.1.4).
@@ -515,14 +527,16 @@ fn eval_filt_expr(
                     other => out.push(other),
                 }
             }
-            Ok(out)
+            Some(out)
         }
-        FiltExpr::Lit(n) => Ok(vec![n.clone()]),
+        FiltExpr::Lit(n) => Some(vec![n.clone()]),
     }
 }
 
-/// Compare two jsonb scalars under a jsonpath operator. Only same-type number/string compare by
-/// order; booleans / nulls compare only by `==`/`!=`; any other (mixed-type) pair is `None` (unknown).
+/// Compare two jsonb items under a jsonpath operator (§4.4). Same-type scalars compare by their
+/// order (numbers numerically, strings by code point, `false < true`, `null = null`) under every
+/// operator. null against any other item is `!=` and nothing else. Any other pair (mixed non-null
+/// types, or two arrays/objects) is `None` (unknown).
 fn compare_nodes(a: &JsonNode, op: CmpOp, b: &JsonNode) -> Option<bool> {
     use std::cmp::Ordering;
     let ord: Ordering = match (a, b) {
@@ -530,18 +544,16 @@ fn compare_nodes(a: &JsonNode, op: CmpOp, b: &JsonNode) -> Option<bool> {
         (JsonNode::String(x), JsonNode::String(y)) => x.cmp(y),
         (JsonNode::Bool(x), JsonNode::Bool(y)) => x.cmp(y),
         (JsonNode::Null, JsonNode::Null) => Ordering::Equal,
-        _ => return None, // mixed types are not comparable
+        (JsonNode::Null, _) | (_, JsonNode::Null) => return Some(op == CmpOp::Ne),
+        _ => return None, // mixed types and containers are not comparable
     };
-    // Booleans / nulls support only equality; ordering on them is unknown.
-    let order_ok = matches!((a, b), (JsonNode::Number(_), _) | (JsonNode::String(_), _));
     Some(match op {
         CmpOp::Eq => ord == Ordering::Equal,
         CmpOp::Ne => ord != Ordering::Equal,
-        CmpOp::Lt if order_ok => ord == Ordering::Less,
-        CmpOp::Le if order_ok => ord != Ordering::Greater,
-        CmpOp::Gt if order_ok => ord == Ordering::Greater,
-        CmpOp::Ge if order_ok => ord != Ordering::Less,
-        _ => return None, // an order comparison on bool/null is unknown
+        CmpOp::Lt => ord == Ordering::Less,
+        CmpOp::Le => ord != Ordering::Greater,
+        CmpOp::Gt => ord == Ordering::Greater,
+        CmpOp::Ge => ord != Ordering::Less,
     })
 }
 

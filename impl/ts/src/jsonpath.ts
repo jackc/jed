@@ -631,10 +631,10 @@ export function evalPath(path: JsonPath, ctx: JsonNode): JsonNode[] {
   if (path.body.kind === "path") {
     return evalSteps(path.body.steps, ctx, ctx, path.strict);
   }
-  // A top-level predicate → a single boolean item: TRUE iff the predicate is definitely true
-  // (unknown / false both render as `false`, matching PG's jsonb_path_query).
-  const truth = evalPred(path.body.pred, ctx, ctx, path.strict) === true;
-  return [{ kind: "bool", value: truth }];
+  // A top-level predicate → a single item: its truth value as a boolean, or JSON null when unknown
+  // (§4.4).
+  const truth = evalPred(path.body.pred, ctx, ctx, path.strict);
+  return [truth === null ? { kind: "null" } : { kind: "bool", value: truth }];
 }
 
 // evalSteps evaluates an accessor-step sequence over a seed item, with `root` as the document `$`
@@ -771,8 +771,10 @@ function evalPred(pred: Pred, current: JsonNode, root: JsonNode, strict: boolean
   }
 }
 
-// evalCompare is the existential comparison (§4): true if SOME pair `(a in lhs-seq, b in rhs-seq)`
-// compares true. An empty operand or all-incomparable pairs → null (unknown); else false.
+// evalCompare is the existential comparison (§4.4) over every pair `(a in lhs-seq, b in rhs-seq)`.
+// An operand navigation error → null (unknown). lax: any true pair → true, else any incomparable
+// pair → unknown, else false (so an empty operand is false). strict: any incomparable pair →
+// unknown, even beside a true pair.
 function evalCompare(
   lhs: FiltExpr,
   op: CmpOp,
@@ -783,24 +785,36 @@ function evalCompare(
 ): boolean | null {
   const ls = evalFiltExpr(lhs, current, root, strict);
   const rs = evalFiltExpr(rhs, current, root, strict);
-  if (ls.length === 0 || rs.length === 0) {
+  if (ls === null || rs === null) {
     return null;
   }
+  let found = false;
   let anyUnknown = false;
   for (const a of ls) {
     for (const b of rs) {
       const r = compareNodes(a, op, b);
-      if (r === true) return true;
-      if (r === null) anyUnknown = true;
+      if (r === null) {
+        if (strict) return null;
+        anyUnknown = true;
+      } else if (r) {
+        if (!strict) return true;
+        found = true;
+      }
     }
   }
+  if (found) return true;
   return anyUnknown ? null : false;
 }
 
 // evalFiltExpr evaluates a filter operand to its jsonb-item sequence (a `@`/`$` path) or a singleton
-// literal. A navigation error inside a filter operand → no items (the comparison is just unknown),
-// never propagated (§4.2: filter operands never raise, even in strict).
-function evalFiltExpr(e: FiltExpr, current: JsonNode, root: JsonNode, strict: boolean): JsonNode[] {
+// literal. `null` is a navigation error, which makes the comparison unknown rather than propagating
+// (§4.2: filter operands never raise, even in strict).
+function evalFiltExpr(
+  e: FiltExpr,
+  current: JsonNode,
+  root: JsonNode,
+  strict: boolean,
+): JsonNode[] | null {
   if (e.kind === "lit") {
     return [e.node];
   }
@@ -809,7 +823,7 @@ function evalFiltExpr(e: FiltExpr, current: JsonNode, root: JsonNode, strict: bo
   try {
     seq = evalSteps(e.steps, seed, root, strict);
   } catch {
-    return [];
+    return null;
   }
   if (strict) {
     return seq;
@@ -827,28 +841,23 @@ function evalFiltExpr(e: FiltExpr, current: JsonNode, root: JsonNode, strict: bo
   return out;
 }
 
-// compareNodes compares two jsonb scalars under a jsonpath operator. Only same-type number/string
-// compare by order; booleans / nulls compare only by `==`/`!=`; any other (mixed-type) pair is null
-// (unknown). Number comparison reuses the json comparator (jsonNodeCmp); string is its UTF-8 byte
-// order — both via jsonNodeCmp on same-type operands.
+// compareNodes compares two jsonb items under a jsonpath operator (§4.4). Same-type scalars compare
+// by their order (numbers numerically, strings by UTF-8 byte order, false < true, null = null —
+// jsonNodeCmp on same-type operands) under every operator. null against any other item is `!=` and
+// nothing else. Any other pair (mixed non-null types, or two arrays/objects) is null (unknown).
 function compareNodes(a: JsonNode, op: CmpOp, b: JsonNode): boolean | null {
-  // Same-type only; mixed types are not comparable.
   let ord: number;
-  let orderOk: boolean;
-  if (a.kind === "number" && b.kind === "number") {
-    ord = jsonNodeCmp(a, b);
-    orderOk = true;
-  } else if (a.kind === "string" && b.kind === "string") {
-    ord = jsonNodeCmp(a, b);
-    orderOk = true;
-  } else if (a.kind === "bool" && b.kind === "bool") {
-    ord = jsonNodeCmp(a, b);
-    orderOk = false; // booleans support only equality
-  } else if (a.kind === "null" && b.kind === "null") {
+  if (a.kind === "null" && b.kind === "null") {
     ord = 0;
-    orderOk = false; // nulls support only equality
+  } else if (a.kind === "null" || b.kind === "null") {
+    return op === "ne";
+  } else if (
+    a.kind === b.kind &&
+    (a.kind === "number" || a.kind === "string" || a.kind === "bool")
+  ) {
+    ord = jsonNodeCmp(a, b);
   } else {
-    return null; // mixed types are not comparable
+    return null; // mixed types and containers are not comparable
   }
   switch (op) {
     case "eq":
@@ -856,13 +865,13 @@ function compareNodes(a: JsonNode, op: CmpOp, b: JsonNode): boolean | null {
     case "ne":
       return ord !== 0;
     case "lt":
-      return orderOk ? ord < 0 : null;
+      return ord < 0;
     case "le":
-      return orderOk ? ord <= 0 : null;
+      return ord <= 0;
     case "gt":
-      return orderOk ? ord > 0 : null;
+      return ord > 0;
     case "ge":
-      return orderOk ? ord >= 0 : null;
+      return ord >= 0;
   }
 }
 

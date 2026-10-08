@@ -3528,9 +3528,13 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			return JsonbValue(seq[0]), nil
 		case jpfMatch:
-			// jsonb_path_match: the path must produce EXACTLY one boolean item.
+			// jsonb_path_match: the path must produce EXACTLY one boolean item (or a JSON null — an
+			// unknown predicate — which is SQL NULL).
 			if len(seq) == 1 && seq[0].Kind == JBool {
 				return BoolValue(seq[0].B), nil
+			}
+			if len(seq) == 1 && seq[0].Kind == JNull {
+				return NullValue(), nil
 			}
 			return Value{}, newError(SingletonSqlJsonItemRequired, "single boolean result is expected")
 		case jpfMatchSilent:

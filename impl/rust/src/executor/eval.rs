@@ -843,9 +843,11 @@ impl RExpr {
                         json::check_depth(&out)?;
                         Ok(Value::Jsonb(out))
                     }
-                    // jsonb_path_match: the path must produce EXACTLY one boolean item.
+                    // jsonb_path_match: the path must produce EXACTLY one boolean item (or a JSON
+                    // null — an unknown predicate — which is SQL NULL).
                     JsonPathFnKind::Match => match seq.as_slice() {
                         [JsonNode::Bool(b)] => Ok(Value::Bool(*b)),
+                        [JsonNode::Null] => Ok(Value::Null),
                         _ => Err(EngineError::new(
                             SqlState::SingletonSqlJsonItemRequired,
                             "single boolean result is expected",

@@ -333,13 +333,16 @@ func writeFiltExpr(e *jpFiltExpr, out *strings.Builder) {
 // compile).
 func (jp jsonPath) Eval(ctx JsonNode) ([]JsonNode, error) {
 	if jp.Pred != nil {
-		// A top-level predicate → a single boolean item: TRUE iff the predicate is definitely true
-		// (unknown / false both render as `false`, matching PG's jsonb_path_query).
+		// A top-level predicate → a single item: its truth value as a boolean, or JSON null when
+		// unknown (§4.4).
 		v, err := evalPred(jp.Pred, &ctx, &ctx, jp.Strict)
 		if err != nil {
 			return nil, err
 		}
-		return []JsonNode{{Kind: JBool, B: isTrue(v)}}, nil
+		if v == nil {
+			return []JsonNode{{Kind: JNull}}, nil
+		}
+		return []JsonNode{{Kind: JBool, B: *v}}, nil
 	}
 	return evalSteps(jp.Path, &ctx, &ctx, jp.Strict)
 }
@@ -504,50 +507,60 @@ func isFalse(b *bool) bool { return b != nil && !*b }
 
 func boolPtr(b bool) *bool { return &b }
 
-// evalCompare is the existential comparison (§4): true if SOME pair (a in lhs-seq, b in rhs-seq)
-// compares true. An empty operand or all-incomparable pairs → nil (unknown); else &false.
+// evalCompare is the existential comparison (§4.4) over every pair (a in lhs-seq, b in rhs-seq). An
+// operand navigation error → nil (unknown). lax: any true pair → true, else any incomparable pair →
+// unknown, else false (so an empty operand is false). strict: any incomparable pair → unknown, even
+// beside a true pair.
 func evalCompare(l *jpFiltExpr, op jpCmpOp, r *jpFiltExpr, current, root *JsonNode, strict bool) (*bool, error) {
-	ls := evalFiltExpr(l, current, root, strict)
-	rs := evalFiltExpr(r, current, root, strict)
-	if len(ls) == 0 || len(rs) == 0 {
+	ls, lok := evalFiltExpr(l, current, root, strict)
+	rs, rok := evalFiltExpr(r, current, root, strict)
+	if !lok || !rok {
 		return nil, nil
 	}
+	found := false
 	anyUnknown := false
 	for i := range ls {
 		for j := range rs {
 			c := compareNodes(&ls[i], op, &rs[j])
 			switch {
+			case c == nil && strict:
+				return nil, nil
 			case c == nil:
 				anyUnknown = true
-			case *c:
+			case *c && !strict:
 				return boolPtr(true), nil
+			case *c:
+				found = true
 			}
 		}
 	}
-	if anyUnknown {
+	switch {
+	case found:
+		return boolPtr(true), nil
+	case anyUnknown:
 		return nil, nil
+	default:
+		return boolPtr(false), nil
 	}
-	return boolPtr(false), nil
 }
 
 // evalFiltExpr evaluates a filter operand to its jsonb-item sequence (a `@`/`$` path) or a singleton
-// literal.
-func evalFiltExpr(e *jpFiltExpr, current, root *JsonNode, strict bool) []JsonNode {
+// literal. ok=false is a navigation error, which makes the comparison unknown rather than
+// propagating (§4.2: filter operands never raise, even in strict).
+func evalFiltExpr(e *jpFiltExpr, current, root *JsonNode, strict bool) (seq []JsonNode, ok bool) {
 	if e.kind == jpFiltLit {
-		return []JsonNode{e.lit}
+		return []JsonNode{e.lit}, true
 	}
 	seed := current
 	if e.fromRoot {
 		seed = root
 	}
-	// A navigation error inside a filter operand → no items (the comparison is just unknown),
-	// never propagated (§4.2: filter operands never raise, even in strict).
 	seq, err := evalSteps(e.steps, seed, root, strict)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	if strict {
-		return seq
+		return seq, true
 	}
 	// lax: an array-valued operand item is unwrapped ONE level, so the existential comparison
 	// ranges over its elements (§4.1.4).
@@ -559,12 +572,13 @@ func evalFiltExpr(e *jpFiltExpr, current, root *JsonNode, strict bool) []JsonNod
 			out = append(out, seq[i])
 		}
 	}
-	return out
+	return out, true
 }
 
-// compareNodes compares two jsonb scalars under a jsonpath operator (a *bool: &v / nil = unknown).
-// Only same-type number/string compare by order; booleans/nulls compare only by `==`/`!=`; any other
-// (mixed-type) pair is nil (unknown).
+// compareNodes compares two jsonb items under a jsonpath operator (§4.4; a *bool: &v / nil =
+// unknown). Same-type scalars compare by their order (numbers numerically, strings by code point,
+// false < true, null = null) under every operator. null against any other item is `!=` and nothing
+// else. Any other pair (mixed non-null types, or two arrays/objects) is nil (unknown).
 func compareNodes(a *JsonNode, op jpCmpOp, b *JsonNode) *bool {
 	var ord int
 	switch {
@@ -576,34 +590,25 @@ func compareNodes(a *JsonNode, op jpCmpOp, b *JsonNode) *bool {
 		ord = cmpInt(boolRank(a.B), boolRank(b.B))
 	case a.Kind == JNull && b.Kind == JNull:
 		ord = 0
+	case a.Kind == JNull || b.Kind == JNull:
+		return boolPtr(op == jpCmpNe)
 	default:
-		return nil // mixed types are not comparable
+		return nil // mixed types and containers are not comparable
 	}
-	// Booleans / nulls support only equality; ordering on them is unknown.
-	orderOK := a.Kind == JNumber || a.Kind == JString
 	switch op {
 	case jpCmpEq:
 		return boolPtr(ord == 0)
 	case jpCmpNe:
 		return boolPtr(ord != 0)
 	case jpCmpLt:
-		if orderOK {
-			return boolPtr(ord < 0)
-		}
+		return boolPtr(ord < 0)
 	case jpCmpLe:
-		if orderOK {
-			return boolPtr(ord <= 0)
-		}
+		return boolPtr(ord <= 0)
 	case jpCmpGt:
-		if orderOK {
-			return boolPtr(ord > 0)
-		}
-	case jpCmpGe:
-		if orderOK {
-			return boolPtr(ord >= 0)
-		}
+		return boolPtr(ord > 0)
+	default: // jpCmpGe
+		return boolPtr(ord >= 0)
 	}
-	return nil // an order comparison on bool/null is unknown
 }
 
 func memberAccess(item *JsonNode, key string, strict bool, out []JsonNode) ([]JsonNode, error) {

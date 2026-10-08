@@ -199,6 +199,31 @@ A malformed regex pattern is the existing **`2201B`**. `starts with` is a plain 
 on string items (no regex). `is unknown` tests whether a predicate evaluated to the third
 truth value.
 
+### 4.4 Predicate truth values
+
+A predicate is three-valued: **true**, **false**, or **unknown**. A comparison `l op r` is
+existential over every pair `(a, b)` of items from the two operand sequences (each a `@`/`$` path's
+items, unwrapped one level in lax — §4.1 rule 4 — or a single literal):
+
+1. **Operand errors.** A navigation error while evaluating an operand (possible only in strict: a
+   missing member, an out-of-range subscript, an accessor on the wrong type) makes the comparison
+   **unknown**; it never propagates (§4.2). In lax the same navigation produces an **empty**
+   sequence instead, and an empty operand makes the comparison **false** — so
+   `lax $ ? (!(@.a == 1))` keeps an item that has no `a`, and `strict` does not.
+2. **Pairs.** Two scalars of the same type compare by that type's order — numbers numerically,
+   strings by code point, `false < true`, and `null` equal to `null` — under every operator
+   (`true > false` and `null <= null` are true). `null` against any other item, including an array
+   or object, is **definite**: `!=`/`<>` is true and every other operator false. Every other pair
+   — scalars of different non-null types, or two arrays/objects — is **unknown**.
+3. **Combining pairs.** **Lax:** true if any pair is true; otherwise unknown if any pair is unknown;
+   otherwise false. **Strict:** unknown if any pair is unknown, even when another pair is true;
+   otherwise true if any pair is true; otherwise false.
+4. **Connectives.** `&&`, `||`, and `!` are Kleene (`unknown || true` is true, `unknown && false`
+   is false, `!unknown` is unknown).
+5. **Results.** A filter keeps an item only when its predicate is true. A top-level predicate
+   yields one item: `true`, `false`, or JSON `null` for unknown; `jsonb_path_match` and `@@` turn
+   that `null` into SQL NULL.
+
 ---
 
 ## 5. Path query functions
@@ -211,7 +236,7 @@ context, a `jsonpath`, and optional `vars jsonb` + `silent boolean` trailing arg
 | function | kind | result | semantics |
 |---|---|---|---|
 | `jsonb_path_exists(jsonb, jsonpath [, vars, silent])` | scalar | `boolean` | sequence non-empty |
-| `jsonb_path_match(jsonb, jsonpath [, vars, silent])` | scalar | `boolean` | sequence must be a single boolean (`22038` otherwise unless silent) |
+| `jsonb_path_match(jsonb, jsonpath [, vars, silent])` | scalar | `boolean` | sequence must be a single boolean, or a single JSON `null` → SQL NULL (`22038` otherwise unless silent) |
 | `jsonb_path_query(jsonb, jsonpath [, vars, silent])` | **SRF** | setof `jsonb` | one row per sequence item |
 | `jsonb_path_query_array(jsonb, jsonpath [, vars, silent])` | scalar | `jsonb` | wrap the sequence in a JSON array |
 | `jsonb_path_query_first(jsonb, jsonpath [, vars, silent])` | scalar | `jsonb` | first item, or NULL if empty |
@@ -341,8 +366,8 @@ After the `jsonb` foundation ([json.md §12](json.md), J0–J2):
     `$.a > 1 && $.b < 2`) — the same predicate grammar as a filter, rooted at the document.
     `jsonb_path_match(ctx, path)` requires the path to produce **exactly one boolean** item (else
     `22038`); `ctx @@ path` is its PostgreSQL-compatible silent form and returns SQL NULL for that
-    error. A top-level predicate always produces one boolean, with an unknown result rendering as
-    `false`. A top-level predicate, queried, yields the boolean as a single item;
+    error. A top-level predicate produces one item — `true`, `false`, or JSON `null` when unknown
+    (§4.4), which `jsonb_path_match` and `@@` return as SQL NULL. A top-level predicate, queried, yields the boolean as a single item;
     it renders parenthesized (`($."a" == 1)`), which round-trips through compile. Capability
     `expr.jsonpath_match`. **Still deferred (`0A000`):** item methods, arithmetic, the §4.3
     Pike-VM `like_regex` / `starts with` / `is unknown` predicates, and `$name` variables —

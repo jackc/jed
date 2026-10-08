@@ -110,7 +110,7 @@ SELECT jsonb_path_match('{"a": 1}', '$.a == 1'), jsonb_path_match('{"a": 1}', '$
 true
 false
 
-# A missing member makes the comparison unknown → jsonb_path_match returns false.
+# A missing member in lax is an empty operand, which makes the comparison false (not unknown).
 query B nosort
 SELECT jsonb_path_match('{}', '$.a == 1')
 ----
@@ -238,3 +238,85 @@ SELECT jsonb_path_match('[1, 2]', '$ == 2'), '{"a": [1, 2]}'::jsonb @@ '$.a == 2
 ----
 true
 true
+
+# Predicate truth values (jsonpath.md §4.4). An empty operand (lax: a missing member) makes a
+# comparison FALSE, so its negation passes; a strict navigation error makes it UNKNOWN, and so does
+# its negation.
+query TT nosort
+SELECT jsonb_path_query_array('[{"b": 1}, {"a": 1}]', '$[*] ? (!(@.a == 1))'), jsonb_path_query_array('[{"b": 1}, {"a": 1}]', 'strict $[*] ? (!(@.a == 1))')
+----
+[{"b": 1}]
+[]
+
+# A top-level predicate yields true, false, or JSON null for unknown.
+query TTT nosort
+SELECT jsonb_path_query_first('{"a": 1}', '$.b == 1'), jsonb_path_query_first('{"a": 1}', 'strict $.b == 1'), jsonb_path_query_first('1', '$ == "a"')
+----
+false
+null
+null
+
+# Unknown connectives are Kleene: unknown || true is true, unknown && false is false.
+query TT nosort
+SELECT jsonb_path_query_first('{"a": 1}', 'strict $.b == 1 || $.a == 1'), jsonb_path_query_first('{"a": 1}', 'strict $.b == 1 && $.a == 2')
+----
+true
+false
+
+# jsonb_path_match and @@ return SQL NULL for an unknown predicate (a JSON null result).
+query BBBB nosort
+SELECT jsonb_path_match('1', '$ == "a"'), jsonb_path_match('{"a": 1}', 'strict $.b == 1'), '[1, "a"]'::jsonb @@ '$[*] == "b"', jsonb_path_match('null', '$')
+----
+NULL
+NULL
+NULL
+NULL
+
+statement error 22038
+SELECT jsonb_path_match('[null]', 'strict $')
+
+# Lax: any true pair makes the existential comparison true, even beside an incomparable pair.
+# Strict: any incomparable pair makes it unknown, even beside a true pair.
+query TTT nosort
+SELECT jsonb_path_query_first('[1, "a"]', '$[*] == 1'), jsonb_path_query_first('[1, "a"]', 'strict $[*] == 1'), jsonb_path_query_first('["a", 1]', 'strict $[*] == 1')
+----
+true
+null
+null
+
+query TT nosort
+SELECT jsonb_path_query_array('[[1, "a"], [1]]', '$[*] ? (@[*] == 1)'), jsonb_path_query_array('[[1, "a"], [1]]', 'strict $[*] ? (@[*] == 1)')
+----
+[1, 1]
+[[1]]
+
+# null against a non-null item is never unknown: == and the ordering operators are false, != is
+# true — even when the other item is an array or object.
+query TTTT nosort
+SELECT jsonb_path_query_array('[1, null, "a"]', '$[*] ? (!(@ == null))'), jsonb_path_query_array('[1, null, "a"]', '$[*] ? (@ != null)'), jsonb_path_query_first('null', '$ < 1'), jsonb_path_query_first('[1]', 'strict $ == null')
+----
+[1, "a"]
+[1, "a"]
+false
+false
+
+query TTT nosort
+SELECT jsonb_path_query_first('null', '$ <= null'), jsonb_path_query_first('null', '$ < null'), jsonb_path_query_first('{}', '$ != null')
+----
+true
+false
+true
+
+# Booleans order false < true, so the ordering operators apply to them.
+query TT nosort
+SELECT jsonb_path_query_array('[true, false]', '$[*] ? (@ > false)'), jsonb_path_query_array('[true, false]', '$[*] ? (@ <= false)')
+----
+[true]
+[false]
+
+# Arrays and objects are not comparable to each other or to scalars other than null.
+query TT nosort
+SELECT jsonb_path_query_first('{"a": 1}', '$ == $'), jsonb_path_query_first('[[1]]', '$ == 1')
+----
+null
+null

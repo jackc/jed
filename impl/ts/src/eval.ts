@@ -1950,9 +1950,13 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           return jsonbValue(out);
         }
         case "match": {
-          // jsonb_path_match: the path must produce EXACTLY one boolean item.
+          // jsonb_path_match: the path must produce EXACTLY one boolean item (or a JSON null —
+          // an unknown predicate — which is SQL NULL).
           if (seq.length === 1 && seq[0]!.kind === "bool") {
             return boolValue(seq[0]!.value);
+          }
+          if (seq.length === 1 && seq[0]!.kind === "null") {
+            return nullValue();
           }
           throw engineError(
             "singleton_sql_json_item_required",
