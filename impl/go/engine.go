@@ -208,6 +208,8 @@ type sessionState struct {
 	// (spec/design/memory.md §2). A frozen cursor's session copy keeps its statement's account.
 	queryBytes          *int64
 	maxQueryMemoryBytes int64
+	// queryFloor is the pending-write balance the current statement's account opened with (memory.md §7).
+	queryFloor int64
 	// fkActionDepth bounds recursive generated referential-action statements (§6.6).
 	fkActionDepth int
 	// fkDeferredChecks holds inbound NO ACTION/RESTRICT probes until the outermost generated
@@ -1525,13 +1527,34 @@ func (s *sessionState) queryAccount() queryAccount {
 	if s.queryBytes == nil {
 		s.queryBytes = new(int64)
 	}
-	return queryAccount{used: s.queryBytes, limit: s.maxQueryMemoryBytes}
+	return queryAccount{used: s.queryBytes, limit: s.maxQueryMemoryBytes, floor: s.queryFloor}
 }
 
-// resetStatementMemory starts a statement's scalar allowance and query-memory account afresh.
+// resetStatementMemory starts a statement's scalar allowance and query-memory account afresh. Under a
+// finite budget the account opens holding the transaction's pending writes, so the statement's own
+// reservations must fit beside them (spec/design/memory.md §7).
 func (s *sessionState) resetStatementMemory() {
 	s.scalarBytes = new(int64)
 	s.queryBytes = new(int64)
+	s.queryFloor = 0
+	if s.maxQueryMemoryBytes > 0 {
+		s.queryFloor = s.pendingWriteBytes()
+		*s.queryBytes = s.queryFloor
+	}
+}
+
+// pendingWriteBytes is the stored bytes the open transaction's working snapshots (main and attached
+// databases) have staged — its pending writes (memory.md §7). Session-local temp tables are bounded by
+// tempBuffers instead. Zero with no open transaction.
+func (s *sessionState) pendingWriteBytes() int64 {
+	if s.tx == nil {
+		return 0
+	}
+	sum := s.tx.working.stagedBytes()
+	for _, ws := range s.tx.attachWorking {
+		sum = saturatingCostAdd(sum, ws.stagedBytes())
+	}
+	return sum
 }
 
 // scratchMeter keeps legacy unreported evaluation cost while sharing scalar admission.

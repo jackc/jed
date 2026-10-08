@@ -1092,7 +1092,9 @@ getter reports `0`). It is independent of `max_cost`, `max_scalar_bytes`, and
 `work_mem`, and cannot be changed from SQL. A reservation above the budget fails
 `54P05`; exact equality is allowed. The budget is a deterministic guardrail over
 the owners memory.md §4 lists as covered (today: row buffers and engine result
-collectors, slice Q1, and operator state, slice Q2), not a heap or RSS limit. On a
+collectors, slice Q1; operator state, slice Q2; and a transaction's pending
+writes, slice Q3 — each statement's account opens holding them, and they must
+fit after every statement), not a heap or RSS limit. On a
 file-backed database with a positive `work_mem`, a spill-capable operator whose
 reservation the budget rejects spills instead of failing (memory.md §6.6), and a
 spilling operator releases its charge as it spills. A cursor keeps the budget of the

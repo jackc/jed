@@ -934,8 +934,10 @@ partitions, sort state, columnar lanes, and spill structures' resident elements 
 in deterministic logical bytes (`spec/design/memory.md`). Spill structures measure their
 `work_mem` residency on the same schedule, so they spill at the same row in every core and
 release their charge as they spill; they also spill, instead of failing, when the account rejects
-a reservation, so a budget below `work_mem` spills earlier rather than aborting. Pending writes and storage caches are still uncovered
-(Q3–Q4), as are remaining scalar kernels. These are guardrails, not heap caps: resource-
+a reservation, so a budget below `work_mem` spills earlier rather than aborting. The same budget
+holds a transaction's pending writes (slice Q3): every record version it stages reserves its stored
+bytes until commit/rollback, each statement's account opens holding them, and they must fit after
+every statement. Storage caches are still uncovered (Q4), as are remaining scalar kernels. These are guardrails, not heap caps: resource-
 exhaustion resistance remains a requirement; do not claim the current limits are a
 whole-engine memory guarantee. Host extensions remain outside these guarantees.
 

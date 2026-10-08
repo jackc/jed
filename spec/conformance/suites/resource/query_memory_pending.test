@@ -1,0 +1,201 @@
+# Pending writes (memory.md §7, Q3): every record version a transaction stages into a table or index
+# reserves its stored bytes — the on-disk record plus any out-of-line payload — against the session's
+# query-memory budget until the transaction commits or rolls back. Each statement opens its account
+# holding the pending bytes, and after each statement the pending bytes alone must fit the budget. A
+# jed-specific resource contract, not a PostgreSQL limit. Here a t row stores 21 bytes with a 10-byte
+# text value and 31 bytes with a 20-byte one.
+# skip: disk — a transaction and the attached in-memory database cannot span the disk-mode
+# per-record reopen
+# attach: aux
+# requires: harness.attach, attach.in_memory, query.qualified_table, txn.explicit, txn.failed_state, query.select, ddl.create_table, ddl.secondary_index, dml.insert, dml.insert_select, dml.update, query.aggregates, query.set_returning, types.text, types.json, func.json_agg, resource.query_memory
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v text)
+
+statement ok
+CREATE TABLE a (id i32 PRIMARY KEY, j json)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (1, 'aaaaaaaaaa')
+
+statement ok
+INSERT INTO t VALUES (2, 'bbbbbbbbbbbbbbbbbbbb')
+
+# The block holds 21 + 31 pending bytes, so SELECT 1's virtual row (32) fits only beside them.
+# max_query_memory_bytes: 84
+query I nosort
+SELECT 1
+----
+1
+
+# Rewriting a row stages a new version, charged again: the pending bytes are cumulative.
+statement ok
+UPDATE t SET v = 'cccccccccc' WHERE id = 1
+
+# max_query_memory_bytes: 105
+query I nosort
+SELECT 1
+----
+1
+
+# max_query_memory_bytes: 104
+statement error 54P05
+SELECT 1
+
+statement ok
+ROLLBACK
+
+query I nosort
+SELECT count(*) FROM t
+----
+0
+
+# A write statement's own pending bytes are checked when it completes.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (1, 'aaaaaaaaaa')
+
+statement ok
+INSERT INTO t VALUES (2, 'bbbbbbbbbbbbbbbbbbbb')
+
+# max_query_memory_bytes: 73
+statement ok
+INSERT INTO t VALUES (3, 'cccccccccc')
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (1, 'aaaaaaaaaa')
+
+statement ok
+INSERT INTO t VALUES (2, 'bbbbbbbbbbbbbbbbbbbb')
+
+# max_query_memory_bytes: 72
+statement error 54P05
+INSERT INTO t VALUES (3, 'cccccccccc')
+
+# The failed block commits nothing.
+statement ok
+COMMIT
+
+query I nosort
+SELECT count(*) FROM t
+----
+0
+
+# A commit releases the pending bytes.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (1, 'aaaaaaaaaa')
+
+statement ok
+INSERT INTO t VALUES (2, 'bbbbbbbbbbbbbbbbbbbb')
+
+statement ok
+COMMIT
+
+# max_query_memory_bytes: 32
+query I nosort
+SELECT 1
+----
+1
+
+# An autocommit write is its own transaction: its pending bytes must fit before it commits.
+# max_query_memory_bytes: 21
+statement ok
+INSERT INTO t VALUES (3, 'cccccccccc')
+
+# max_query_memory_bytes: 20
+statement error 54P05
+INSERT INTO t VALUES (4, 'dddddddddd')
+
+query I nosort
+SELECT count(*) FROM t
+----
+3
+
+# A value stored out of line counts its overflow-chain payload.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO a SELECT 1, json_agg(x) FROM generate_series(1, 3000) x
+
+# The 16893-byte json text compresses to an overflow chain: 12165 pending bytes in all.
+# max_query_memory_bytes: 12197
+query I nosort
+SELECT 1
+----
+1
+
+# max_query_memory_bytes: 12196
+statement error 54P05
+SELECT 1
+
+statement ok
+ROLLBACK
+
+# Each index entry a write stages is a record of its own.
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, v text)
+
+statement ok
+CREATE INDEX u_v ON u (v)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO u VALUES (1, 'aaaaaaaaaa')
+
+# The row's 21 bytes and the u_v entry's 17 (its encoded key).
+# max_query_memory_bytes: 70
+query I nosort
+SELECT 1
+----
+1
+
+# max_query_memory_bytes: 69
+statement error 54P05
+SELECT 1
+
+statement ok
+ROLLBACK
+
+# Writes to an attached database are pending too, beside the main database's.
+statement ok
+CREATE TABLE aux.t (id i32 PRIMARY KEY, v text)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (5, 'aaaaaaaaaa')
+
+statement ok
+INSERT INTO aux.t VALUES (1, 'aaaaaaaaaa')
+
+# 21 pending bytes in each database.
+# max_query_memory_bytes: 74
+query I nosort
+SELECT 1
+----
+1
+
+# max_query_memory_bytes: 73
+statement error 54P05
+SELECT 1
+
+statement ok
+ROLLBACK

@@ -690,6 +690,37 @@ impl Engine {
         Ok(())
     }
 
+    /// The budgets checked after each successful statement, before an autocommit write commits:
+    /// the temp-storage budget (`54P03`, temp-tables.md §7), then the pending writes against the
+    /// query-memory budget (`54P05`, memory.md §7).
+    pub(crate) fn check_statement_budgets(&self, cost: i64) -> Result<()> {
+        self.check_temp_budget()?;
+        self.check_pending_writes(cost)
+    }
+
+    /// Enforce the query-memory budget on the open transaction's pending writes after a statement
+    /// (spec/design/memory.md §7): the stored bytes its working snapshots have staged must fit
+    /// `max_query_memory_bytes`, or the statement fails `54P05` — after a reached cost ceiling, which
+    /// wins (memory.md §2). The balance counts toward the statement's peak either way.
+    pub(crate) fn check_pending_writes(&self, cost: i64) -> Result<()> {
+        let limit = self.session.max_query_memory_bytes;
+        if limit <= 0 {
+            return Ok(());
+        }
+        let pending = self.session.pending_write_bytes();
+        crate::cost::QUERY_MEMORY_PEAK.fetch_max(pending, std::sync::atomic::Ordering::Relaxed);
+        if pending <= limit {
+            return Ok(());
+        }
+        if let Some(e) = self.session.finished_cost_guard(cost) {
+            return Err(e);
+        }
+        Err(EngineError::new(
+            SqlState::QueryMemoryLimitExceeded,
+            format!("query memory exceeded the limit of {limit} bytes"),
+        ))
+    }
+
     /// The committed snapshot, immutable (spec/design/transactions.md §2). Exposed for the host
     /// `Transaction`/read surfaces and for the on-disk serializer.
     pub(crate) fn committed(&self) -> &Snapshot {

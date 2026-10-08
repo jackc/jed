@@ -326,6 +326,40 @@ func (db *engine) checkLifetimeAdmission() error {
 	return nil
 }
 
+// checkStatementBudgets runs the budgets checked after each successful statement, before an autocommit
+// write commits: the temp-storage budget (54P03, temp-tables.md §7), then the pending writes against
+// the query-memory budget (54P05, memory.md §7).
+func (db *engine) checkStatementBudgets(cost int64) error {
+	if err := db.checkTempBudget(); err != nil {
+		return err
+	}
+	return db.checkPendingWrites(cost)
+}
+
+// checkPendingWrites enforces the query-memory budget on the open transaction's pending writes after a
+// statement (spec/design/memory.md §7): the stored bytes its working snapshots have staged must fit
+// maxQueryMemoryBytes, or the statement fails 54P05 — after a reached cost ceiling, which wins
+// (memory.md §2). The balance counts toward the statement's peak either way.
+func (db *engine) checkPendingWrites(cost int64) error {
+	limit := db.session.maxQueryMemoryBytes
+	if limit <= 0 {
+		return nil
+	}
+	pending := db.session.pendingWriteBytes()
+	if pending > queryMemoryPeak.Load() {
+		queryMemoryPeak.Store(pending)
+	}
+	if pending <= limit {
+		return nil
+	}
+	m := db.session.newMeter()
+	m.Accrued = cost
+	if err := m.Guard(); err != nil {
+		return err
+	}
+	return newError(QueryMemoryLimitExceeded, fmt.Sprintf("query memory exceeded the limit of %d bytes", limit))
+}
+
 // checkTempBudget enforces the per-session temp-table storage budget (tempBuffers, spec/design/
 // temp-tables.md §7) — the §13 gate on RETAINED temp bytes. Checked after each temp-writing statement:
 // if the session's temp footprint (byte-identical on-disk record bytes, summed over every temp table +

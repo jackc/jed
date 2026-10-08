@@ -62,7 +62,8 @@ materialized relations, join results, grouped and `DISTINCT` rows, set-operation
 `RETURNING` results, and the rows the engine's own collect-everything helpers (Rust `query_rows`,
 TypeScript `Statement.all()`) gather — plus the working state of the operators that produce them:
 hash-join tables, group and dedup tables, aggregate inputs such as `json_agg`'s, window
-partitions, and sort buffers. It is **unlimited by default** — like `max_cost`, a host serving untrusted
+partitions, and sort buffers. It also holds the writes an open transaction has staged but not yet
+committed (see below). It is **unlimited by default** — like `max_cost`, a host serving untrusted
 SQL opts in. Set it through session options or `set_max_query_memory_bytes(bytes)` /
 `SetMaxQueryMemoryBytes(bytes)` / `setMaxQueryMemoryBytes(bytes)`; non-positive values restore
 unlimited. A statement that would exceed it fails with **`54P05`**; exact equality is allowed.
@@ -74,13 +75,21 @@ core. Rows released along the way (filtered out, consumed by the next stage, han
 give their bytes back, and a streaming query that hands each row to you as it is produced holds
 almost nothing. A cursor keeps its statement's budget until it closes.
 
+Uncommitted writes count against the same budget. Every row version and index entry a transaction
+writes reserves its stored size — its on-disk record plus any value stored out of line — until the
+transaction commits or rolls back. Each statement starts with those bytes already counted, and after
+every statement they must still fit, so a long transaction of many small `INSERT`s fails with
+`54P05` instead of growing without bound. Rewriting the same row counts again: the budget bounds how
+much a transaction writes, not how much it ends up holding. Temporary tables are bounded by
+`temp_buffers` instead.
+
 ## Memory coverage
 
 These budgets are **guardrails, not a process-memory cap**. The query-memory budget covers row
 buffers and operator state: hash-join tables, group, `DISTINCT`, and set-operation tables,
 `json_agg`-style and ordered-set accumulators, window partitions, sort buffers and top-k heaps,
-and the resident part of spilling operators. Still uncovered: writes pending in an open
-transaction, page caches, and scalar kernels beyond the ones listed above. On native file hosts,
+the resident part of spilling operators, and the writes pending in an open transaction. Still
+uncovered: page caches and scalar kernels beyond the ones listed above. On native file hosts,
 sort, hash JOIN, aggregation, and DISTINCT spill when they exceed `work_mem` — and also when the
 query-memory budget would otherwise reject them, so a large sort or aggregate spills rather than
 fails and releases its charge as it spills. Row buffers that cannot spill, such as a derived

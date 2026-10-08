@@ -901,6 +901,9 @@ type RecordPlan = {
   comp: (Uint8Array | null)[];
   size: number;
   compressUnits: number;
+  // external is the bytes externalized values occupy on their overflow chains — the raw payload of an
+  // external-plain value, the compressed block of an external-compressed one.
+  external: number;
 };
 
 // planDispositions decides each column's on-disk disposition (large-values.md §3/§12/§13;
@@ -931,6 +934,7 @@ function planDispositions(
     comp: new Array<Uint8Array | null>(colTypes.length).fill(null),
     size: 0,
     compressUnits: 0,
+    external: 0,
   };
   const cur = inline.slice();
   let size = key.length + inline.reduce((a, b) => a + b, 0);
@@ -943,15 +947,14 @@ function planDispositions(
   // encoded size first, ties by ascending index (Array.prototype.sort is stable, ES2019+).
   // Every attempt is metered (ceil(raw/capacity) value_compress slabs) whether or not
   // store-smaller adopts it.
+  // Each spillable, non-NULL value's raw payload length (0 otherwise) — the compress threshold's
+  // input, and an external-plain value's chain payload in pass 2.
+  const payloadLen = colTypes.map((ty, i) =>
+    isSpillable(ty) && row[i]!.kind !== "null" ? valuePayload(ty, row[i]!).length : 0,
+  );
   let cand: number[] = [];
   for (let i = 0; i < colTypes.length; i++) {
-    if (
-      isSpillable(colTypes[i]!) &&
-      row[i]!.kind !== "null" &&
-      valuePayload(colTypes[i]!, row[i]!).length >= S_COMPRESS
-    ) {
-      cand.push(i);
-    }
+    if (payloadLen[i]! >= S_COMPRESS) cand.push(i);
   }
   cand.sort((a, b) => inline[b]! - inline[a]!);
   for (const i of cand) {
@@ -982,6 +985,7 @@ function planDispositions(
     if (size <= max) break;
     const compressed = plan.disp[i] === "inlineComp";
     const ptr = compressed ? EXTERNAL_COMP_PTR_LEN : EXTERNAL_PTR_LEN;
+    plan.external += compressed ? plan.comp[i]!.length : payloadLen[i]!;
     plan.disp[i] = compressed ? "externalComp" : "external";
     size = size - cur[i]! + ptr;
     cur[i] = ptr;
@@ -1002,6 +1006,19 @@ export function recordSize(
   capacity: number,
 ): number {
   return planDispositions(colTypes, key, row, capacity).size;
+}
+
+// recordFootprint returns a record's on-disk record size (the split weight) and its stored bytes —
+// that size plus the overflow-chain payload of its externalized values (memory.md §7, the
+// pending-write measure).
+export function recordFootprint(
+  colTypes: ColType[],
+  key: Uint8Array,
+  row: Row,
+  capacity: number,
+): [number, number] {
+  const plan = planDispositions(colTypes, key, row, capacity);
+  return [plan.size, plan.size + plan.external];
 }
 
 // recordScanUnits returns the per-record units a scan's up-front cost block charges beyond the

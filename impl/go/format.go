@@ -2132,6 +2132,9 @@ type recordPlan struct {
 	comp          [][]byte
 	size          int
 	compressUnits int
+	// external is the bytes externalized values occupy on their overflow chains — the raw payload of
+	// an external-plain value, the compressed block of an external-compressed one.
+	external int
 }
 
 // planDispositions decides each column's on-disk disposition (large-values.md §3/§12/§13;
@@ -2172,10 +2175,16 @@ func planDispositions(colTypes []colType, key []byte, row storedRow, capacity in
 	// Pass 1 — compress (lz4.md): spillable, non-NULL, payload ≥ sCompress; largest inline-plain
 	// encoded size first, ties by ascending index. Every attempt is metered (ceil(raw/capacity)
 	// value_compress slabs) whether or not store-smaller adopts it.
+	// Each spillable, non-NULL value's raw payload length (0 otherwise) — the compress threshold's
+	// input, and an external-plain value's chain payload in pass 2.
+	payloadLen := make([]int, len(colTypes))
 	cand := make([]int, 0, len(colTypes))
 	for i, ty := range colTypes {
-		if isSpillable(ty) && !row[i].IsNull() && len(valuePayload(ty, row[i])) >= sCompress {
-			cand = append(cand, i)
+		if isSpillable(ty) && !row[i].IsNull() {
+			payloadLen[i] = len(valuePayload(ty, row[i]))
+			if payloadLen[i] >= sCompress {
+				cand = append(cand, i)
+			}
 		}
 	}
 	sort.SliceStable(cand, func(a, b int) bool { return inline[cand[a]] > inline[cand[b]] })
@@ -2219,6 +2228,9 @@ func planDispositions(colTypes []colType, key []byte, row storedRow, capacity in
 		if plan.disp[i] == dispInlineComp {
 			ptr = externalCompPtrLen
 			next = dispExternalComp
+			plan.external += len(plan.comp[i])
+		} else {
+			plan.external += payloadLen[i]
 		}
 		plan.disp[i] = next
 		size = size - cur[i] + ptr
@@ -2236,6 +2248,14 @@ func planDispositions(colTypes []colType, key []byte, row storedRow, capacity in
 // boundaries match serialized pages.
 func recordSize(colTypes []colType, key []byte, row storedRow, capacity int) int {
 	return planDispositions(colTypes, key, row, capacity).size
+}
+
+// recordFootprint returns a record's on-disk record size (the split weight) and its stored bytes —
+// that size plus the overflow-chain payload of its externalized values (memory.md §7, the
+// pending-write measure).
+func recordFootprint(colTypes []colType, key []byte, row storedRow, capacity int) (size, stored int) {
+	plan := planDispositions(colTypes, key, row, capacity)
+	return plan.size, plan.size + plan.external
 }
 
 // recordScanUnits returns the per-record units a scan's up-front cost block charges beyond the

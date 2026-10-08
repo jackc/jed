@@ -256,6 +256,31 @@ func (s *snapshot) bumpEstimatorRevision(name string) {
 	s.estimatorRevisions[strings.ToLower(name)] = &estimatorRevision{}
 }
 
+// stagedBytes is the stored bytes every store of this snapshot has staged since its last publication
+// — a working snapshot's pending writes (spec/design/memory.md §7).
+func (s *snapshot) stagedBytes() int64 {
+	var sum int64
+	for _, store := range s.stores {
+		sum = saturatingCostAdd(sum, store.stagedBytes())
+	}
+	for _, store := range s.indexStores {
+		sum = saturatingCostAdd(sum, store.stagedBytes())
+	}
+	return sum
+}
+
+// clearStaged clears every store's staged bytes: this working snapshot is being published by a
+// commit (memory.md §7). A working snapshot owns its store clones, so this never touches committed
+// state.
+func (s *snapshot) clearStaged() {
+	for _, store := range s.stores {
+		store.clearStaged()
+	}
+	for _, store := range s.indexStores {
+		store.clearStaged()
+	}
+}
+
 // demoteCleanLeaves demotes every store's clean, persisted resident leaves to OnDisk references —
 // the post-commit residency flip over the whole snapshot (bplus-reshape.md B4), run after a
 // successful persist so the published committed tree is the skeletal `interiors + OnDisk leaves`

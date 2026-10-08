@@ -31,7 +31,7 @@ import type { Value } from "./value.ts";
 export const queryMemoryUnderflows = { count: 0 };
 
 // queryMemoryPeak is the highest balance any account has reached since the conformance harness last
-// reset it — the minimal passing maxQueryMemoryBytes of the record just run (memory.md §7).
+// reset it — the minimal passing maxQueryMemoryBytes of the record just run (memory.md §8).
 export const queryMemoryPeak = { value: 0 };
 
 // QueryAccount is a statement's live query-memory account (spec/design/memory.md §2): the running
@@ -40,6 +40,9 @@ export const queryMemoryPeak = { value: 0 };
 // logical bytes stay far below 2^53 (a huge limit is clamped to Number.MAX_SAFE_INTEGER).
 export class QueryAccount {
   used = 0;
+  // floor is the balance the account opened with — its transaction's pending writes (memory.md §7).
+  // The statement's releases return only what it reserved, so none may take used below it.
+  floor = 0;
   readonly limit: number;
 
   constructor(limit = 0) {
@@ -70,13 +73,14 @@ export class QueryAccount {
     return true;
   }
 
-  // release returns bytes; never throws, never below zero. A release past the balance is an
-  // accounting bug (a release without its reservation): clamp, and count it.
+  // release returns bytes; never throws, never below the opening balance (floor). A release past the
+  // statement's own balance is an accounting bug (a release without its reservation): clamp, and
+  // count it.
   release(bytes: number): void {
     if (this.limit <= 0) return;
-    if (bytes > this.used) {
+    if (bytes > this.used - this.floor) {
       queryMemoryUnderflows.count++;
-      this.used = 0;
+      this.used = Math.min(this.floor, this.used);
       return;
     }
     this.used -= bytes;

@@ -148,6 +148,11 @@ pub struct TableStore {
     /// and for a table created in-session (fully resident until the file is reopened); attached by
     /// the demand-paged file load. `Arc` so a snapshot clone shares the one pool per database.
     paging: Option<Arc<SharedPaging>>,
+    /// The stored bytes ([`crate::format::record_footprint`]) of every record version written since
+    /// this store was last published — the transaction's pending writes (spec/design/memory.md §7).
+    /// Cumulative: a rewrite charges again. It travels with the store, so discarding a working
+    /// snapshot discards it too; a commit clears it before publishing.
+    staged: i64,
 }
 
 impl TableStore {
@@ -162,6 +167,7 @@ impl TableStore {
             col_types: Arc::new(col_types),
             shape,
             paging: None,
+            staged: 0,
         }
     }
 
@@ -175,15 +181,17 @@ impl TableStore {
     /// This row's on-disk record size — the weight the page-backed B-tree splits on. Accounts for
     /// out-of-line spill at `cap` (an externalized value weighs its pointer, not its full body —
     /// spec/design/large-values.md §12), so split points match the serialized pages.
-    fn weight(&self, key: &[u8], row: &Row) -> u32 {
-        crate::format::record_size(&self.col_types, key, row, self.cap) as u32
+    /// Also returns the record's stored bytes, the pending-write measure (memory.md §7).
+    fn weight(&self, key: &[u8], row: &Row) -> (u32, i64) {
+        let (size, stored) = crate::format::record_footprint(&self.col_types, key, row, self.cap);
+        (size as u32, stored as i64)
     }
 
     /// Insert a row under its encoded key. Returns `Ok(false)` if the key already exists
     /// (primary-key uniqueness); the caller decides how to surface that. May fault the target leaf
     /// through the buffer pool (an I/O error then propagates).
     pub fn insert(&mut self, key: Vec<u8>, row: Row) -> Result<bool> {
-        let w = self.weight(&key, &row); // full `&self` borrow — taken before the leaf source
+        let (w, stored) = self.weight(&key, &row); // full `&self` borrow — before the leaf source
         let src = make_src(&self.paging, &self.col_types);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         if self.rows.get(&key, src_ref)?.is_some() {
@@ -191,7 +199,18 @@ impl TableStore {
         }
         self.rows
             .insert(key, row, w, self.cap, self.shape, src_ref)?;
+        self.staged = self.staged.saturating_add(stored);
         Ok(true)
+    }
+
+    /// The stored bytes written since this store was last published (memory.md §7).
+    pub(crate) fn staged_bytes(&self) -> i64 {
+        self.staged
+    }
+
+    /// Forget the staged bytes — the store is being published by a commit (memory.md §7).
+    pub(crate) fn clear_staged(&mut self) {
+        self.staged = 0;
     }
 
     /// Allocate the next monotonic rowid (for a table with no primary key) and
@@ -218,11 +237,12 @@ impl TableStore {
     /// key order and the rowid counter are untouched. The caller only replaces keys it
     /// just found, so the overwrite always lands on a present key. May fault the target leaf.
     pub fn replace(&mut self, key: &[u8], row: Row) -> Result<()> {
-        let w = self.weight(key, &row);
+        let (w, stored) = self.weight(key, &row);
         let src = make_src(&self.paging, &self.col_types);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         self.rows
             .insert(key.to_vec(), row, w, self.cap, self.shape, src_ref)?;
+        self.staged = self.staged.saturating_add(stored);
         Ok(())
     }
 

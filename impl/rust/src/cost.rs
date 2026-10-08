@@ -57,6 +57,9 @@ pub static QUERY_MEMORY_PEAK: std::sync::atomic::AtomicI64 = std::sync::atomic::
 pub(crate) struct QueryAccount {
     pub(crate) used: Rc<Cell<i64>>,
     pub(crate) limit: i64,
+    /// The balance the account opened with — its transaction's pending writes (memory.md §7). The
+    /// statement's releases return only what it reserved, so none may take `used` below this.
+    pub(crate) floor: i64,
 }
 
 impl QueryAccount {
@@ -90,18 +93,20 @@ impl QueryAccount {
         true
     }
 
-    /// Return `bytes`; never errors, never below zero.
+    /// Return `bytes`; never errors, never below the opening balance (`floor`).
     pub(crate) fn release(&self, bytes: i64) {
         if self.limit <= 0 {
             return;
         }
         let used = self.used.get();
-        if bytes > used {
+        if bytes > used - self.floor {
             // An accounting bug (a release without its reservation). Clamp, and count it so the
             // conformance harness's accounting mode can fail the record that caused it.
             QUERY_MEMORY_UNDERFLOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.used.set(self.floor.min(used));
+            return;
         }
-        self.used.set((used - bytes).max(0));
+        self.used.set(used - bytes);
     }
 
     /// Admit a projected row (memory.md §5.1).
@@ -522,6 +527,26 @@ impl Meter {
 #[cfg(test)]
 mod resource_tests {
     use super::*;
+
+    /// A statement's account opens holding its transaction's pending writes (memory.md §7): a
+    /// release past the statement's own reservations is an accounting bug, clamped at that floor and
+    /// counted.
+    #[test]
+    fn release_never_dips_into_the_pending_write_floor() {
+        let acct = QueryAccount {
+            used: Rc::new(Cell::new(30)),
+            limit: 100,
+            floor: 30,
+        };
+        acct.reserve(20).unwrap();
+        let before = QUERY_MEMORY_UNDERFLOWS.load(std::sync::atomic::Ordering::Relaxed);
+        acct.release(25);
+        assert_eq!(acct.used.get(), 30);
+        assert!(QUERY_MEMORY_UNDERFLOWS.load(std::sync::atomic::Ordering::Relaxed) > before);
+        acct.reserve(10).unwrap();
+        acct.release(10);
+        assert_eq!(acct.used.get(), 30);
+    }
     #[test]
     fn saturation_keeps_first_crossed_ceiling() {
         let total = Rc::new(Cell::new(i64::MAX - 2));

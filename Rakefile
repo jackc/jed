@@ -1002,7 +1002,7 @@ namespace :conformance do
   # Each core also writes every record's PEAK balance (JED_CONFORMANCE_QUERY_MEMORY_PEAKS) — the
   # minimal budget under which that record passes — and the task fails unless the three cores agree
   # on every record's peak in each mode: the whole corpus becomes the cross-core check of the
-  # reserve/release sites, not only the records that pin a threshold (memory.md §7).
+  # reserve/release sites, not only the records that pin a threshold (memory.md §8).
   desc "Run the shared SQL corpus on all cores with query-memory accounting active (bytes, optional path filter)"
   task :query_memory, [:bytes, :filter] do |_, args|
     require "tmpdir"

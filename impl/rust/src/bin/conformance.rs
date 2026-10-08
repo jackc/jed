@@ -36,7 +36,7 @@ thread_local! {
 
 /// Record the peak query-memory balance of record `ordinal` of the current file, when the peak mode
 /// is on. Every core writes the same `file<TAB>ordinal<TAB>peak` lines, so a diff of the three
-/// outputs is the cross-core check of every record's minimal passing budget (memory.md §7).
+/// outputs is the cross-core check of every record's minimal passing budget (memory.md §8).
 fn record_peak(ordinal: usize) {
     use std::io::Write;
     PEAK_SINK.with(|sink| {

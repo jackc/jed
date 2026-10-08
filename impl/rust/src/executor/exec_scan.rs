@@ -744,6 +744,7 @@ impl Engine {
         dst.scalar_bytes = src.scalar_bytes.clone();
         dst.max_query_memory_bytes = src.max_query_memory_bytes;
         dst.query_bytes = src.query_bytes.clone();
+        dst.query_floor = src.query_floor;
         dst.lifetime_max_cost = src.lifetime_max_cost;
         dst.lifetime_total = src.lifetime_total.clone(); // shared gauge — streaming cost counts (§5)
         dst.cancel = src.cancel.clone();

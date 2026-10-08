@@ -255,6 +255,23 @@ export class Snapshot {
     }
   }
 
+  // stagedBytes is the stored bytes every store of this snapshot has staged since its last publication
+  // — a working snapshot's pending writes (spec/design/memory.md §7).
+  stagedBytes(): number {
+    let sum = 0;
+    for (const store of this.stores.values()) sum += store.stagedBytes();
+    for (const store of this.indexStores.values()) sum += store.stagedBytes();
+    return sum;
+  }
+
+  // clearStaged clears every store's staged bytes: this working snapshot is being published by a
+  // commit (memory.md §7). A working snapshot owns its store clones, so this never touches committed
+  // state.
+  clearStaged(): void {
+    for (const store of this.stores.values()) store.clearStaged();
+    for (const store of this.indexStores.values()) store.clearStaged();
+  }
+
   // demoteCleanLeaves demotes every store's clean, persisted resident leaves to OnDisk references —
   // the post-commit residency flip over the whole snapshot (bplus-reshape.md B4), run after a
   // successful persist so the published committed tree is the skeletal `interiors + OnDisk leaves`

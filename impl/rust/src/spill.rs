@@ -887,6 +887,7 @@ mod bounded_run_tests {
         let acct = crate::cost::QueryAccount {
             used: std::rc::Rc::new(std::cell::Cell::new(0)),
             limit: 1000,
+            floor: 0,
         };
         let mut sort = Sorter::new(
             vec![(0, false, false, None)],

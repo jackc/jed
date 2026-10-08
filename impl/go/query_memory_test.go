@@ -154,3 +154,25 @@ func TestQueryMemorySpillingOperatorStateReleasesItsCharge(t *testing.T) {
 		t.Fatalf("never-spill DISTINCT under the spilling budget: want 54P05, got %v", err)
 	}
 }
+
+// A statement's account opens holding its transaction's pending writes (memory.md §7): a release past
+// the statement's own reservations is an accounting bug, clamped at that floor and counted.
+func TestQueryMemoryReleaseNeverDipsIntoThePendingWriteFloor(t *testing.T) {
+	used := int64(30)
+	acct := queryAccount{used: &used, limit: 100, floor: 30}
+	if err := acct.reserve(20); err != nil {
+		t.Fatal(err)
+	}
+	before := queryMemoryUnderflows.Load()
+	acct.release(25)
+	if used != 30 || queryMemoryUnderflows.Load() != before+1 {
+		t.Fatalf("over-release: used %d, underflows %d (was %d)", used, queryMemoryUnderflows.Load(), before)
+	}
+	if err := acct.reserve(10); err != nil {
+		t.Fatal(err)
+	}
+	acct.release(10)
+	if used != 30 || queryMemoryUnderflows.Load() != before+1 {
+		t.Fatalf("matched release: used %d, underflows %d", used, queryMemoryUnderflows.Load())
+	}
+}

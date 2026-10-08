@@ -1197,9 +1197,30 @@ impl Snapshot {
         })
     }
 
-    /// Every table with its store, as `(lowercased key, table, store)` tuples, for the on-disk
-    /// serializer (spec/fileformat/format.md). The serializer sorts by the lowercased key so
-    /// hash-map iteration order never leaks (CLAUDE.md §8).
+    /// The stored bytes every store of this snapshot has staged since its last publication — a
+    /// working snapshot's pending writes (spec/design/memory.md §7).
+    pub(crate) fn staged_bytes(&self) -> i64 {
+        self.stores
+            .values()
+            .chain(self.index_stores.values())
+            .fold(0i64, |sum, store| sum.saturating_add(store.staged_bytes()))
+    }
+
+    /// Clear every store's staged bytes: this working snapshot is being published by a commit
+    /// (memory.md §7). Copies a store map only when one of its stores staged something.
+    pub(crate) fn clear_staged(&mut self) {
+        if self.stores.values().any(|s| s.staged_bytes() != 0) {
+            for store in std::sync::Arc::make_mut(&mut self.stores).values_mut() {
+                store.clear_staged();
+            }
+        }
+        if self.index_stores.values().any(|s| s.staged_bytes() != 0) {
+            for store in std::sync::Arc::make_mut(&mut self.index_stores).values_mut() {
+                store.clear_staged();
+            }
+        }
+    }
+
     /// Demote every store's clean, persisted resident leaves to `OnDisk` references — the
     /// post-commit residency flip over the whole snapshot (bplus-reshape.md B4), run after a
     /// successful persist so the published committed tree is the skeletal `interiors + OnDisk
@@ -1214,6 +1235,9 @@ impl Snapshot {
         }
     }
 
+    /// Every table with its store, as `(lowercased key, table, store)` tuples, for the on-disk
+    /// serializer (spec/fileformat/format.md). The serializer sorts by the lowercased key so
+    /// hash-map iteration order never leaks (CLAUDE.md §8).
     pub(crate) fn catalog_and_stores(&self) -> Vec<(&str, &Table, &TableStore)> {
         self.tables
             .iter()

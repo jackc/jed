@@ -9,7 +9,7 @@ accounts:
 | Account | Setting | Default | Model | Error |
 |---|---|---|---|---|
 | Scalar allocation | `max_scalar_bytes` | 64 MiB | cumulative churn, never refunded | `54P04` |
-| Query memory | `max_query_memory_bytes` | unlimited | live logical bytes, released when dropped | `54P05` |
+| Query memory | `max_query_memory_bytes` | unlimited | live logical bytes, released when dropped; opens holding the transaction's pending writes (§7) | `54P05` |
 
 Both are **guardrails, not heap caps.** They bound logical bytes computed from a
 shared, representation-independent schedule, so an abort is deterministic and
@@ -82,7 +82,9 @@ The account is **live**: a reservation adds bytes, a release returns them. A
 reservation succeeds if `used + bytes <= limit` (equality allowed, overflow-safe as
 in §1); otherwise the statement fails with `54P05 query_memory_limit_exceeded`
 ("query memory exceeded the limit of N bytes"). Only reservations can fail; a
-release never errors and never takes `used` below zero.
+release never errors and never takes `used` below the balance the account opened
+with (zero, or the transaction's pending writes, §7) — a release past it is an
+accounting bug, clamped and counted by the conformance runners.
 
 Scope and lifetime follow the scalar allowance: one account per SQL statement,
 shared by every internal meter of that statement (subqueries, CTE parts, set-op
@@ -157,7 +159,7 @@ It is filled in by owner class:
 |---|---|---|
 | Q1 | **Rows** — row buffers of statement execution and engine result collectors | implemented |
 | Q2 | **Operator state** — hash-join tables, group/distinct/dedup sets and keys, aggregate accumulators (`json_agg`/`jsonb_agg` and the other JSON aggregates, ordered-set and hypothetical buffers), sort buffers and top-k heaps, window partition state, columnar lanes, spill spools' resident buffers, recursive-CTE dedup sets | implemented (§6) |
-| Q3 | **Pending writes** — a transaction-owned account for staged inserts/updates/deletes, surviving statement boundaries and released at commit/rollback | planned |
+| Q3 | **Pending writes** — the stored bytes a transaction stages, surviving statement boundaries and released at commit/rollback | implemented (§7) |
 | Q4 | **Storage** — database-owned accounts for page caches and committed in-memory storage | planned |
 
 Q2 operators that can spill charge only their resident portion and release it as
@@ -298,8 +300,8 @@ bounded-spill lane) but never on the core.
 
 Q1 bounds row-buffer amplification — cross joins, set-returning functions,
 recursive CTE output, wide projections of large values, and materialized
-results. Operator state is Q2 (§6); a single base relation's storage read before
-its rows are admitted and pending writes remain outside the account.
+results. Operator state is Q2 (§6) and pending writes are Q3 (§7); a single base
+relation's storage read before its rows are admitted remains outside the account.
 
 ## 6. Q2: operator state
 
@@ -465,7 +467,71 @@ that partition or permute an already-charged buffer, and the per-row key
 encodings a hash probe computes and discards. They are bounded by charged state
 times a small factor; they are guardrail overshoot, not unbounded growth.
 
-## 7. Rollout gates
+## 7. Q3: pending writes
+
+A write transaction stages its changes in memory until it commits
+([transactions.md](transactions.md) §2), and they outlive the statement that made
+them, so a per-statement account cannot see them: a block of many small INSERTs
+would grow without bound. Q3 charges them to the same budget,
+`max_query_memory_bytes`: a session's balance is its transaction's pending writes
+plus the current statement's live account.
+
+### 7.1 Measure
+
+Every record version a write stages into a table or an index — by any path:
+INSERT, UPDATE, upsert, a foreign-key action, an index build, a table rewrite —
+adds its **stored bytes**:
+
+```
+stored_bytes(record) = record_size + Σ chain_payload(externalized value)
+```
+
+`record_size` is the record's on-disk size ([format.md](../fileformat/format.md)
+*Record*, the B+tree's split weight). An externalized value's chain payload is its
+raw bytes when stored external-plain and its compressed block when stored
+external-compressed ([large-values.md](large-values.md) §2). Each secondary, GIN,
+or GiST index entry is a record of its own. Both terms are fixed by the file
+format's byte contract, so for a given page size the measure is cross-core
+identical and independent of leaf state and of in-memory versus file backing. A
+delete stages nothing.
+
+The balance is **cumulative** within a transaction: replacing a row stages a new
+version, charged again, though the pending set keeps only the latest. Q3 bounds a
+transaction's write volume, not the net residency of its dirty pages. Dirty-page
+amplification — a small update decodes a whole leaf — stays outside the account;
+it is bounded by the page reads the write performed, which `max_cost` meters.
+
+### 7.2 Lifetime
+
+The bytes belong to the transaction's working snapshots, the main database's and
+each attached database's ([attached-databases.md](attached-databases.md) §5), and
+travel with them. A rollback, a failed block's COMMIT, or a failed autocommit
+statement discards them; a commit releases them. Session-local temp tables are
+excluded, since `temp_buffers` bounds them ([temp-tables.md](temp-tables.md) §7).
+Bytes are tracked whether or not a budget is active, so a budget set in the middle
+of a transaction sees the writes already staged.
+
+### 7.3 Admission
+
+Under a finite budget:
+
+- **Each statement's account opens holding the transaction's pending bytes**, so
+  its reservations (§5, §6) must fit beside them.
+- **After each successful statement** — every statement inside an explicit block,
+  and an autocommit write before it commits — the transaction's pending bytes alone
+  must fit the budget, or the statement fails `54P05`. Cost wins (§2): a statement
+  that has reached `max_cost` or the lifetime budget reports `54P01`/`54P02`
+  instead. The failure is an ordinary statement failure: an autocommit write
+  commits nothing, and an explicit block enters the failed state.
+
+Both count toward the statement's peak, so in memory mode a record's peak is still
+its minimal passing budget. Like `temp_buffers`, the check runs at the statement
+boundary: within one statement, writes are bounded by `max_cost` and by the Q1
+buffers that feed them (INSERT … SELECT keeps its source rows charged), and they
+are checked once the statement completes. Thresholds are pinned by
+`resource/query_memory_pending.test`.
+
+## 8. Rollout gates
 
 Each slice lands in all three cores together with: corpus entries pinning exact
 `54P05` thresholds for its owners (`# max_query_memory_bytes: N`, capability

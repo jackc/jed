@@ -722,11 +722,11 @@ impl Engine {
                 // signature, so row-only blocks may fill while working DDL cannot.
                 self.dispatch_stmt_cached(stmt, params, insert_cache, true)
             };
-            // Enforce the temp-storage budget after a successful temp write (temp-tables.md §7): an
-            // over-budget statement (session-local `temp_buffers`) becomes a `54P03` error, which
-            // aborts the block (the staged temp rows roll back at ROLLBACK). A no-op for non-temp
-            // statements.
-            let result = result.and_then(|out| self.check_temp_budget().map(|()| out));
+            // Enforce the post-statement budgets (temp storage, pending writes): an over-budget
+            // statement becomes an error, which aborts the block (its staged rows roll back at
+            // ROLLBACK).
+            let result =
+                result.and_then(|out| self.check_statement_budgets(out.cost()).map(|()| out));
             if result.is_ok() {
                 // Land any nextval advances into the block's working snapshot; COMMIT publishes
                 // them, ROLLBACK discards them with the rest of the working set (sequences.md §5).
@@ -770,10 +770,9 @@ impl Engine {
         });
         match self.dispatch_stmt_cached(stmt, params, insert_cache, true) {
             Ok(outcome) => {
-                // Enforce the temp-storage budget before committing (temp-tables.md §7): if this
-                // (implicit) transaction's temp write pushed the session over `temp_buffers`, discard
-                // the transaction (rolling back the over-budget temp + main changes) and surface 54P03.
-                if let Err(e) = self.check_temp_budget() {
+                // Enforce the post-statement budgets before committing: an over-budget implicit
+                // transaction is discarded (rolling back its temp + main changes) and commits nothing.
+                if let Err(e) = self.check_statement_budgets(outcome.cost()) {
                     if let Some(tx) = self.session.tx.take() {
                         self.restore_session_state(tx);
                     }
@@ -909,6 +908,8 @@ impl Engine {
             if self.path.is_some() {
                 working.txid = self.committed.txid + 1;
             }
+            // Published writes are no longer pending (memory.md §7).
+            working.clear_staged();
             self.persist(&working)?; // no-op for an in-memory database
             self.committed = working;
         }
@@ -943,6 +944,7 @@ impl Engine {
                 let Some(mut ws) = attach_working.remove(name) else {
                     continue;
                 };
+                ws.clear_staged();
                 if let Some(c) = &core {
                     // A detached-mid-transaction attachment (unreachable under the writer gate) no-ops.
                     let base_txid = self.attached_committed.get(name).map_or(0, |a| a.txid);

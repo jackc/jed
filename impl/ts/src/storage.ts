@@ -21,8 +21,8 @@ import {
   anySpillableMasked,
   leafShape,
   recordCompressUnits,
+  recordFootprint,
   recordScanUnits,
-  recordSize,
 } from "./format.ts";
 import { isInteger } from "./types.ts";
 
@@ -69,6 +69,11 @@ export class TableStore {
   // table created in-session (fully resident until the file is reopened); attached by the demand-paged
   // file load. Shared (reference) — a snapshot clone shares the one pool per database.
   private paging: SharedPaging | null;
+  // staged is the stored bytes (recordFootprint) of every record version written since this store was
+  // last published — the transaction's pending writes (spec/design/memory.md §7). Cumulative: a
+  // rewrite charges again. It travels with the store, so discarding a working snapshot discards it
+  // too; a commit clears it before publishing.
+  private staged = 0;
 
   constructor(
     cap: number,
@@ -89,7 +94,25 @@ export class TableStore {
   // invalidating its private mutation generation, so a later INSERT path-copies before it can reuse
   // a dirty suffix (transactions.md §3). The shared paging context is shared, not copied.
   clone(): TableStore {
-    return new TableStore(this.cap, this.colTypes, this.rows.clone(), this.nextRowid, this.paging);
+    const store = new TableStore(
+      this.cap,
+      this.colTypes,
+      this.rows.clone(),
+      this.nextRowid,
+      this.paging,
+    );
+    store.staged = this.staged;
+    return store;
+  }
+
+  // stagedBytes is the stored bytes written since this store was last published (memory.md §7).
+  stagedBytes(): number {
+    return this.staged;
+  }
+
+  // clearStaged forgets the staged bytes — the store is being published by a commit (memory.md §7).
+  clearStaged(): void {
+    this.staged = 0;
   }
 
   freezeMutationGeneration(): void {
@@ -110,8 +133,9 @@ export class TableStore {
   // weight is this row's on-disk record size — the weight the page-backed B-tree splits on. Accounts
   // for out-of-line spill at cap (an externalized value weighs its pointer, not its full body —
   // large-values.md §12), so split points match the serialized pages.
-  private weight(key: Uint8Array, row: Row): number {
-    return recordSize(this.colTypes, key, row, this.cap);
+  // It also returns the record's stored bytes, the pending-write measure (memory.md §7).
+  private weight(key: Uint8Array, row: Row): [number, number] {
+    return recordFootprint(this.colTypes, key, row, this.cap);
   }
 
   // insert adds a row under its encoded key. Returns false if the key already exists
@@ -120,7 +144,9 @@ export class TableStore {
   insert(key: Uint8Array, row: Row): boolean {
     const src = this.leafSrc();
     if (this.rows.get(key, src) !== undefined) return false;
-    this.rows.insert(key, row, this.weight(key, row), this.cap, this.shape, src);
+    const [weight, stored] = this.weight(key, row);
+    this.rows.insert(key, row, weight, this.cap, this.shape, src);
+    this.staged += stored;
     return true;
   }
 
@@ -145,7 +171,9 @@ export class TableStore {
   // replace overwrites the row stored at an existing key (UPDATE). The key is
   // unchanged, so key order and the rowid counter are untouched. May fault the target leaf.
   replace(key: Uint8Array, row: Row): void {
-    this.rows.insert(key, row, this.weight(key, row), this.cap, this.shape, this.leafSrc());
+    const [weight, stored] = this.weight(key, row);
+    this.rows.insert(key, row, weight, this.cap, this.shape, this.leafSrc());
+    this.staged += stored;
   }
 
   // remove deletes the row at key (DELETE). Returns whether a row was present. May fault leaves the

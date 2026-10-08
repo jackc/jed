@@ -189,7 +189,7 @@ func QueryMemoryUnderflows() uint64 { return queryMemoryUnderflows.Load() }
 var queryMemoryPeak atomic.Int64
 
 // QueryMemoryPeak reports the highest query-memory balance reached since ResetQueryMemoryPeak — the
-// conformance harness's per-record peak mode compares it across cores (spec/design/memory.md §7).
+// conformance harness's per-record peak mode compares it across cores (spec/design/memory.md §8).
 func QueryMemoryPeak() int64 { return queryMemoryPeak.Load() }
 
 // ResetQueryMemoryPeak zeroes the peak before the harness runs a record.
@@ -201,6 +201,9 @@ func ResetQueryMemoryPeak() { queryMemoryPeak.Store(0) }
 type queryAccount struct {
 	used  *int64
 	limit int64
+	// floor is the balance the account opened with — its transaction's pending writes (memory.md §7).
+	// The statement's releases return only what it reserved, so none may take used below it.
+	floor int64
 }
 
 // active reports whether the account has a finite budget. Every admission site tests this first,
@@ -230,15 +233,16 @@ func (a queryAccount) tryReserve(bytes int64) bool {
 	return true
 }
 
-// release returns bytes; never errors, never below zero. A release larger than the balance is an
-// accounting bug: it clamps and is counted for the conformance harness.
+// release returns bytes; never errors, never below the opening balance (floor). A release larger than
+// the statement's own balance is an accounting bug: it clamps and is counted for the conformance
+// harness.
 func (a queryAccount) release(bytes int64) {
 	if !a.active() {
 		return
 	}
-	if bytes > *a.used {
+	if bytes > *a.used-a.floor {
 		queryMemoryUnderflows.Add(1)
-		*a.used = 0
+		*a.used = min(a.floor, *a.used)
 		return
 	}
 	*a.used -= bytes

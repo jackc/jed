@@ -120,6 +120,23 @@ test("the account admits up to its limit and counts an over-release", () => {
   assert.equal(queryMemoryUnderflows.count, before + 1);
 });
 
+// A statement's account opens holding its transaction's pending writes (memory.md §7): a release
+// past the statement's own reservations is an accounting bug, clamped at that floor and counted.
+test("a release never dips into the pending-write floor", () => {
+  const acct = new QueryAccount(100);
+  acct.floor = 30;
+  acct.used = 30;
+  acct.reserve(20);
+  const before = queryMemoryUnderflows.count;
+  acct.release(25);
+  assert.equal(acct.used, 30);
+  assert.equal(queryMemoryUnderflows.count, before + 1);
+  acct.reserve(10);
+  acct.release(10);
+  assert.equal(acct.used, 30);
+  assert.equal(queryMemoryUnderflows.count, before + 1);
+});
+
 test("a rejected collector admission reports a reached cost ceiling", () => {
   const db = memDb();
   const s = db.session();

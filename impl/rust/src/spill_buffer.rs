@@ -592,6 +592,7 @@ mod tests {
         let account = || QueryAccount {
             used: std::rc::Rc::new(std::cell::Cell::new(0)),
             limit: 200,
+            floor: 0,
         };
         let row = |i: i64| vec![Value::Int(i), Value::Text("x".repeat(40))];
 

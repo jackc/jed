@@ -97,7 +97,7 @@ import {
   colTypeScalar,
   resolveColType,
 } from "./catalog.ts";
-import { Meter, type QueryAccount, StateCharge } from "./cost.ts";
+import { Meter, type QueryAccount, queryMemoryPeak, StateCharge } from "./cost.ts";
 import { optimizeSelect } from "./optimize.ts";
 import {
   type Collation,
@@ -2395,10 +2395,9 @@ export class Engine {
         // The INSERT cache's visible-vs-committed signature guard permits row-only blocks to fill
         // while preventing working DDL from publishing a plan.
         const outcome = this.dispatchStmt(stmt, params, insertHolder, true);
-        // Enforce the temp-storage budget after a successful temp write (temp-tables.md §7): an
-        // over-budget statement (session-local tempBuffers) throws 54P03, which aborts the block (the
-        // staged temp rows roll back at ROLLBACK). A no-op for non-temp statements.
-        this.checkTempBudget();
+        // Enforce the post-statement budgets (temp storage, pending writes): an over-budget statement
+        // throws, which aborts the block (its staged rows roll back at ROLLBACK).
+        this.checkStatementBudgets(outcome.cost);
         // Land any nextval advances into the block's working snapshot; COMMIT publishes them,
         // ROLLBACK discards them with the rest of the working set (sequences.md §5).
         this.flushPendingSequences();
@@ -2429,10 +2428,9 @@ export class Engine {
     let outcome: Outcome;
     try {
       outcome = this.dispatchStmt(stmt, params, insertHolder, true);
-      // Enforce the temp-storage budget before committing (temp-tables.md §7): an over-budget temp
-      // write in this implicit transaction (session-local tempBuffers) is discarded (rolling back temp
-      // + main) and surfaces 54P03.
-      this.checkTempBudget();
+      // Enforce the post-statement budgets before committing: an over-budget implicit transaction is
+      // discarded (rolling back its temp + main changes) and commits nothing.
+      this.checkStatementBudgets(outcome.cost);
     } catch (e) {
       // The statement failed before any flush, so session state is untouched; restore from the
       // captured copy anyway to keep the discard path uniform (sequences.md §6).
@@ -2538,6 +2536,8 @@ export class Engine {
       // value and reuse the same meta slot. For the file and in-memory hosts the two are equivalent
       // (path and persistHook are set or unset together), so this is observably identical there.
       if (this.persistHook !== null) working.txid = this.committed.txid + 1n;
+      // Published writes are no longer pending (memory.md §7).
+      working.clearStaged();
       // persistHook (if any) throws on an I/O failure before committed is swapped, so committed is
       // left untouched (the commit failed; the working snapshot is discarded).
       if (this.persistHook !== null) this.persistHook(this, working);
@@ -2570,6 +2570,7 @@ export class Engine {
         const att = this.core.attachments.get(name);
         if (att === undefined) continue; // detached mid-transaction (unreachable) — nothing to persist
         const ws = tx.attachWorking!.get(name)!;
+        ws.clearStaged();
         // A FILE attachment commits DURABLY (dirty pages + alternating meta slot + fsync, its own page
         // space); an in-memory one packs persist_temp-style (NO fsync). At most one file attachment is
         // dirty here (the one-durable-writer check above), so ≤1 fsync path runs.
@@ -2664,6 +2665,32 @@ export class Engine {
         `session exceeded the lifetime cost limit of ${limit} (accrued ${total})`,
       );
     }
+  }
+
+  // checkStatementBudgets runs the budgets checked after each successful statement, before an
+  // autocommit write commits: the temp-storage budget (54P03, temp-tables.md §7), then the pending
+  // writes against the query-memory budget (54P05, memory.md §7).
+  private checkStatementBudgets(cost: bigint): void {
+    this.checkTempBudget();
+    this.checkPendingWrites(cost);
+  }
+
+  // checkPendingWrites enforces the query-memory budget on the open transaction's pending writes after a
+  // statement (spec/design/memory.md §7): the stored bytes its working snapshots have staged must fit
+  // maxQueryMemoryBytes, or the statement throws 54P05 — after a reached cost ceiling, which wins
+  // (memory.md §2). The balance counts toward the statement's peak either way.
+  private checkPendingWrites(cost: bigint): void {
+    const limit = this.session.queryAccount.limit;
+    if (limit <= 0) return;
+    const pending = this.session.pendingWriteBytes();
+    if (pending > queryMemoryPeak.value) queryMemoryPeak.value = pending;
+    if (pending <= limit) return;
+    const ceiling = this.session.finishedCostGuard(cost);
+    if (ceiling !== null) throw ceiling;
+    throw engineError(
+      "query_memory_limit_exceeded",
+      `query memory exceeded the limit of ${limit} bytes`,
+    );
   }
 
   // checkTempBudget enforces the per-session temp-table storage budget (tempBuffers, spec/design/

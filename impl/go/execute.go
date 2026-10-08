@@ -75,11 +75,10 @@ func (db *engine) executeStmtParamsCached(stmt statement, params []Value, ic *in
 		} else {
 			out, err = db.dispatchStmtCached(stmt, params, ic, true)
 		}
-		// Enforce the temp-storage budget after a successful temp write (temp-tables.md §7): an
-		// over-budget statement (session-local tempBuffers) becomes a 54P03 error, which aborts the
-		// block (the staged temp rows roll back at ROLLBACK). A no-op for non-temp statements.
+		// Enforce the post-statement budgets (temp storage, pending writes): an over-budget statement
+		// becomes an error, which aborts the block (its staged rows roll back at ROLLBACK).
 		if err == nil {
-			err = db.checkTempBudget()
+			err = db.checkStatementBudgets(out.Cost)
 		}
 		if err != nil {
 			db.session.tx.failed = true
@@ -107,11 +106,10 @@ func (db *engine) executeStmtParamsCached(stmt statement, params []Value, ic *in
 	}
 	db.session.tx = db.newTx(true)
 	out, err := db.dispatchStmtCached(stmt, params, ic, true)
-	// Enforce the temp-storage budget before committing (temp-tables.md §7): an over-budget temp write
-	// in this implicit transaction (session-local tempBuffers) is discarded (rolling back the temp +
-	// main changes) and surfaces 54P03.
+	// Enforce the post-statement budgets before committing: an over-budget implicit transaction is
+	// discarded (rolling back its temp + main changes) and commits nothing.
 	if err == nil {
-		err = db.checkTempBudget()
+		err = db.checkStatementBudgets(out.Cost)
 	}
 	if err != nil {
 		// The statement failed before any flush, so session state is untouched; restore from the
@@ -214,6 +212,8 @@ func (db *engine) commitTx() (outcome, error) {
 		if db.path != "" {
 			working.txid = db.committed.txid + 1
 		}
+		// Published writes are no longer pending (memory.md §7).
+		working.clearStaged()
 		if err := db.persist(working); err != nil { // no-op for an in-memory database
 			return outcome{}, err
 		}
@@ -251,6 +251,7 @@ func (db *engine) commitTx() (outcome, error) {
 			if att == nil {
 				continue // detached mid-transaction (unreachable under the writer gate) — nothing to persist
 			}
+			ws.clearStaged()
 			if att.isFile() {
 				// Advance the version for the alternating meta slot + reopen (like the main file commit).
 				ws.txid = db.attachedCommitted[name].txid + 1

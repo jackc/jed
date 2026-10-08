@@ -231,10 +231,28 @@ export class SessionState {
   queryMemoryLimitSetting(): bigint {
     return this.maxQueryMemoryBytes > 0n ? this.maxQueryMemoryBytes : 0n;
   }
-  // resetStatementMemory starts a statement's scalar allowance and query-memory account afresh.
+  // resetStatementMemory starts a statement's scalar allowance and query-memory account afresh. Under a
+  // finite budget the account opens holding the transaction's pending writes, so the statement's own
+  // reservations must fit beside them (spec/design/memory.md §7).
   resetStatementMemory(): void {
     this.scalarBytes = { used: 0n };
     this.queryAccount = newQueryAccount(this.maxQueryMemoryBytes);
+    if (this.queryAccount.limit > 0) {
+      this.queryAccount.floor = this.pendingWriteBytes();
+      this.queryAccount.used = this.queryAccount.floor;
+    }
+  }
+  // pendingWriteBytes is the stored bytes the open transaction's working snapshots (main and attached
+  // databases) have staged — its pending writes (memory.md §7). Session-local temp tables are bounded
+  // by tempBuffers instead. Zero with no open transaction.
+  pendingWriteBytes(): number {
+    const tx = this.tx;
+    if (tx === null) return 0;
+    let sum = tx.working.stagedBytes();
+    if (tx.attachWorking !== undefined) {
+      for (const ws of tx.attachWorking.values()) sum += ws.stagedBytes();
+    }
+    return sum;
   }
   setMaxCost(limit: bigint): void {
     this.maxCost = limit;

@@ -963,6 +963,9 @@ struct RecordPlan {
     disp: Vec<Disp>,
     size: usize,
     compress_units: usize,
+    /// The bytes externalized values occupy on their overflow chains — the raw payload of an
+    /// external-plain value, the compressed block of an external-compressed one.
+    external: usize,
 }
 
 /// Decide each column's on-disk disposition for a record (spec/design/large-values.md §3/§12/§13;
@@ -1000,17 +1003,25 @@ fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usiz
             disp,
             size,
             compress_units,
+            external: 0,
         };
     }
     // Pass 1 — compress (lz4.md): spillable, non-NULL, payload ≥ S_COMPRESS; largest
     // inline-plain encoded size first, ties by ascending index. Every attempt is metered
     // (ceil(raw/cap) value_compress slabs) whether or not store-smaller adopts it.
-    let mut cand: Vec<usize> = (0..row.len())
-        .filter(|&i| {
-            is_spillable(&col_types[i])
-                && !matches!(row[i], Value::Null)
-                && value_payload(&col_types[i], &row[i]).len() >= S_COMPRESS
+    // Each spillable, non-NULL value's raw payload length (0 otherwise) — the compress threshold's
+    // input, and an external-plain value's chain payload in pass 2.
+    let payload_len: Vec<usize> = (0..row.len())
+        .map(|i| {
+            if is_spillable(&col_types[i]) && !matches!(row[i], Value::Null) {
+                value_payload(&col_types[i], &row[i]).len()
+            } else {
+                0
+            }
         })
+        .collect();
+    let mut cand: Vec<usize> = (0..row.len())
+        .filter(|&i| payload_len[i] >= S_COMPRESS)
         .collect();
     cand.sort_by(|&a, &b| inline[b].cmp(&inline[a]).then(a.cmp(&b)));
     for i in cand {
@@ -1031,6 +1042,7 @@ fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usiz
             disp,
             size,
             compress_units,
+            external: 0,
         };
     }
     // Pass 2 — externalize: anything whose current encoded size beats its pointer, largest
@@ -1046,13 +1058,20 @@ fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usiz
         })
         .collect();
     cand.sort_by(|&a, &b| cur[b].cmp(&cur[a]).then(a.cmp(&b)));
+    let mut external = 0usize;
     for i in cand {
         if size <= max {
             break;
         }
         let (ptr, next) = match std::mem::replace(&mut disp[i], Disp::Inline) {
-            Disp::InlineComp(c) => (EXTERNAL_COMP_PTR_LEN, Disp::ExternalComp(c)),
-            _ => (EXTERNAL_PTR_LEN, Disp::External),
+            Disp::InlineComp(c) => {
+                external += c.len();
+                (EXTERNAL_COMP_PTR_LEN, Disp::ExternalComp(c))
+            }
+            _ => {
+                external += payload_len[i];
+                (EXTERNAL_PTR_LEN, Disp::External)
+            }
         };
         disp[i] = next;
         size = size - cur[i] + ptr;
@@ -1062,6 +1081,7 @@ fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usiz
         disp,
         size,
         compress_units,
+        external,
     }
 }
 
@@ -1072,6 +1092,18 @@ fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usiz
 /// in-memory node boundaries match the serialized pages.
 pub(crate) fn record_size(col_types: &[ColType], key: &[u8], row: &Row, cap: usize) -> usize {
     plan_dispositions(col_types, key, row, cap).size
+}
+
+/// A record's on-disk record size (the split weight) and its **stored bytes** — that size plus the
+/// overflow-chain payload of its externalized values (memory.md §7, the pending-write measure).
+pub(crate) fn record_footprint(
+    col_types: &[ColType],
+    key: &[u8],
+    row: &Row,
+    cap: usize,
+) -> (usize, usize) {
+    let plan = plan_dispositions(col_types, key, row, cap);
+    (plan.size, plan.size + plan.external)
 }
 
 /// The per-record units a scan's up-front cost block charges for this record beyond the B-tree
