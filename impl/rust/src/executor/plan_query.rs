@@ -137,7 +137,12 @@ impl Engine {
                     let CteSource::Query(anchor_ref) = &bindings[i].source else {
                         unreachable!("the anchor binding was just pushed as a query source")
                     };
-                    check_recursive_column_types(anchor_ref, &rhs_plan, &bindings[i].name)?;
+                    check_recursive_column_types(
+                        anchor_ref,
+                        &rhs_plan,
+                        &bindings[i].name,
+                        union_all,
+                    )?;
                     bindings[i].recursive = Some(RecursiveTerm {
                         plan: rhs_plan,
                         union_all,
@@ -837,6 +842,13 @@ impl Engine {
             .zip(rhs.column_types().iter())
             .map(|(l, r)| unify_setop_column(l, r, so.op))
             .collect::<Result<_>>()?;
+        // Every form but UNION ALL matches rows, so each column needs an equality operator (42883
+        // for json / jsonpath, as PostgreSQL).
+        if !(so.op == SetOpKind::Union && so.all) {
+            for t in &column_types {
+                require_setop_equality(t)?;
+            }
+        }
         let column_names = lhs.column_names().to_vec();
 
         // Trailing ORDER BY resolves keys by OUTPUT column name (no relation scope after a set
@@ -953,8 +965,8 @@ impl Engine {
 
     /// Execute a resolved VALUES-body relation (spec/design/grammar.md §42): evaluate each row's
     /// values as constants over an EMPTY environment (no local row, no outer row — non-`LATERAL`),
-    /// coerce each to the unified column type (the only runtime change is int → decimal, the
-    /// set-operation rule), and emit the rows. Charges `row_produced` per row plus each value's
+    /// coerce each to the unified column type (the only runtime changes are int → decimal and
+    /// f32 → f64, the set-operation rule), and emit the rows. Charges `row_produced` per row plus each value's
     /// `operator_eval` (the evaluator) — the derived table's intrinsic cost (cost.md §3), folded
     /// into the caller's meter via `exec_query_plan`.
     pub(crate) fn exec_values_plan(
@@ -980,12 +992,9 @@ impl Engine {
             let mut out = Vec::with_capacity(plan.column_types.len());
             for (ci, e) in row.iter().enumerate() {
                 let v = e.eval(&[], &env, &mut meter)?;
-                // Int → decimal where the column unified to decimal (the set-operation rule); every
-                // other unified type is a value no-op (int-width promotion is free — all ints are i64).
-                let v = match (&plan.column_types[ci], &v) {
-                    (ResolvedType::Decimal, Value::Int(n)) => Value::Decimal(Decimal::from_i64(*n)),
-                    _ => v,
-                };
+                // Widen to the column's unified type (the set-operation rule): int → decimal,
+                // f32 → f64; every other unified type is a value no-op.
+                let v = widen_to_unified(v, &plan.column_types[ci]);
                 out.push(v);
             }
             meter.admit_row(&out)?; // a materialized relation row (memory.md §5.1)

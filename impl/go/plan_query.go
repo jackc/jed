@@ -119,7 +119,7 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, inherited []*cteBi
 			if err != nil {
 				return nil, err
 			}
-			if err := checkRecursiveColumnTypes(&bindings[bi].plan, &rhsPlan, lname); err != nil {
+			if err := checkRecursiveColumnTypes(&bindings[bi].plan, &rhsPlan, lname, unionAll); err != nil {
 				return nil, err
 			}
 			bindings[bi].recursive = &recursiveTerm{plan: rhsPlan, unionAll: unionAll}
@@ -1095,7 +1095,7 @@ func selectExprs(s *selectStmt) []exprNode {
 // assignable to them — a literal adapts, an equal type passes, a WIDER type is 42804 (matching
 // PostgreSQL). Mechanically the would-be UNION unified type must EQUAL the anchor type; any widening
 // of the anchor is the error. An arity mismatch is 42601, like a plain UNION.
-func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string) error {
+func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string, unionAll bool) error {
 	a := anchor.columnTypes()
 	r := recursive.columnTypes()
 	if len(a) != len(r) {
@@ -1111,6 +1111,11 @@ func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string) error 
 				"recursive query %q column %d has type %s in non-recursive term but type %s overall",
 				name, i+1, rtName(a[i]), rtName(unified),
 			))
+		}
+		if !unionAll {
+			if err := requireSetopEquality(a[i]); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -1192,6 +1197,12 @@ func typeFromResolved(rt resolvedType) (dataType, error) {
 		return scalarT(scalarDate), nil
 	case rtInterval:
 		return scalarT(scalarInterval), nil
+	case rtJson:
+		return scalarT(scalarJson), nil
+	case rtJsonb:
+		return scalarT(scalarJsonb), nil
+	case rtJsonPath:
+		return scalarT(scalarJsonPath), nil
 	case rtComposite:
 		if rt.comp != nil && rt.comp.named {
 			return compositeT(rt.comp.name), nil
@@ -1204,6 +1215,12 @@ func typeFromResolved(rt resolvedType) (dataType, error) {
 			return dataType{}, err
 		}
 		return arrayT(elem), nil
+	case rtRange:
+		elem, err := typeFromResolved(*rt.elem)
+		if err != nil {
+			return dataType{}, err
+		}
+		return rangeT(elem), nil
 	default:
 		return dataType{}, newError(FeatureNotSupported, "unsupported CTE column type")
 	}
@@ -1378,6 +1395,15 @@ func (db *engine) planSetOp(so *setOp, parent *scope, ctes []*cteBinding, ptypes
 		}
 		columnTypes[i] = t
 	}
+	// Every form but UNION ALL matches rows, so each column needs an equality operator (42883 for
+	// json / jsonpath, as PostgreSQL).
+	if so.Op != setOpUnion || !so.All {
+		for _, t := range columnTypes {
+			if err := requireSetopEquality(t); err != nil {
+				return nil, err
+			}
+		}
+	}
 	columnNames := lhs.columnNames()
 
 	order := make([]orderSlot, 0, len(so.OrderBy))
@@ -1543,8 +1569,8 @@ func (db *engine) planValues(rows [][]*exprNode, parent *scope, ctes []*cteBindi
 
 // execValuesPlan executes a resolved VALUES-body relation (spec/design/grammar.md §42): evaluate
 // each row's values as constants over an EMPTY environment (no local row, no outer row —
-// non-LATERAL), coerce each to the unified column type (the only runtime change is int -> decimal,
-// the set-operation rule), and emit the rows. Charges row_produced per row plus each value's
+// non-LATERAL), coerce each to the unified column type (the only runtime changes are int ->
+// decimal and f32 -> f64, the set-operation rule), and emit the rows. Charges row_produced per row plus each value's
 // operator_eval (the evaluator) — the derived table's intrinsic cost (cost.md §3), folded into the
 // caller's meter via execQueryPlan.
 func (db *engine) execValuesPlan(plan *valuesPlan, outer []storedRow, params []Value, ctes cteCtx) (selectResult, error) {
@@ -1562,12 +1588,9 @@ func (db *engine) execValuesPlan(plan *valuesPlan, outer []storedRow, params []V
 			if err != nil {
 				return selectResult{}, err
 			}
-			// Int -> decimal where the column unified to decimal (the set-operation rule); every
-			// other unified type is a value no-op (int-width promotion is free — all ints are i64).
-			if plan.columnTypes[ci].kind == rtDecimal && v.Kind == ValInt {
-				v = DecimalValue(decimalFromInt64(v.Int))
-			}
-			out[ci] = v
+			// Widen to the column's unified type (the set-operation rule): int → decimal, f32 →
+			// f64; every other unified type is a value no-op.
+			out[ci] = widenToUnified(v, plan.columnTypes[ci])
 		}
 		if err := meter.admitRow(out); err != nil { // a materialized relation row (memory.md §5.1)
 			return selectResult{}, err
@@ -1591,68 +1614,53 @@ func setopName(op setOpKind) string {
 }
 
 // unifySetopColumn unifies one output column's type across the two operands of a set operation
-// (spec/design/grammar.md §25, types.md §4): integer widths promote to the widest; integer with
-// decimal -> decimal; a NULL-typed operand takes the other's type (an all-NULL column stays NULL —
-// PostgreSQL would call a top-level one text, but the type is never observed in output); a
-// same-family non-numeric pair gives that type; anything else is 42804. The set of unifiable pairs
-// mirrors the comparability matrix (compare.toml).
+// (spec/design/grammar.md §25, commonType); a pair with no common type is 42804. An all-NULL column
+// stays rtNull (PostgreSQL would call a top-level one text, but the type is never observed in
+// output).
 func unifySetopColumn(a, b resolvedType, op setOpKind) (resolvedType, error) {
-	switch {
-	case a.kind == rtNull && b.kind == rtNull:
-		return resolvedType{kind: rtNull}, nil
-	case a.kind == rtNull:
-		return b, nil
-	case b.kind == rtNull:
-		return a, nil
-	case a.kind == rtInt && b.kind == rtInt:
-		return resolvedType{kind: rtInt, intTy: promote(a, b)}, nil
-	case (a.kind == rtInt || a.kind == rtDecimal) && (b.kind == rtInt || b.kind == rtDecimal):
-		// at least one decimal (both-int handled above) -> decimal
-		return resolvedType{kind: rtDecimal}, nil
-	case a.kind == b.kind:
-		return a, nil
-	default:
-		return resolvedType{}, newError(DatatypeMismatch, fmt.Sprintf(
-			"%s types %s and %s cannot be matched", setopName(op), rtName(a), rtName(b),
-		))
+	if t, ok := commonType(a, b); ok {
+		return t, nil
 	}
+	return resolvedType{}, newError(DatatypeMismatch, fmt.Sprintf(
+		"%s types %s and %s cannot be matched", setopName(op), rtName(a), rtName(b),
+	))
 }
 
 // unifyValuesColumn unifies two row value types for the SAME VALUES-body column
-// (spec/design/grammar.md §42), the set-operation rule (§25): integer widths widen, int+decimal ->
-// decimal, anything + NULL keeps the other, and a same-type scalar pair (text, bool, bytea, uuid, a
-// timestamp / timestamptz, an interval, a same-width float) unifies to itself; any other pair —
-// including a composite or array column across rows (a deferred edge) — is 42804. Enumerated
-// EXPLICITLY (not a generic same-kind passthrough) so all three cores compute byte-identical
-// results (CLAUDE.md §8).
+// (spec/design/grammar.md §42) by the set-operation rule (§25, commonType); a pair with no common
+// type is 42804.
 func unifyValuesColumn(a, b resolvedType) (resolvedType, error) {
-	switch {
-	case a.kind == rtNull && b.kind == rtNull:
-		return resolvedType{kind: rtNull}, nil
-	case a.kind == rtNull:
-		return b, nil
-	case b.kind == rtNull:
-		return a, nil
-	case a.kind == rtInt && b.kind == rtInt:
-		return resolvedType{kind: rtInt, intTy: promote(a, b)}, nil
-	case (a.kind == rtInt || a.kind == rtDecimal) && (b.kind == rtInt || b.kind == rtDecimal):
-		return resolvedType{kind: rtDecimal}, nil
-	case a.kind == rtText && b.kind == rtText,
-		a.kind == rtBool && b.kind == rtBool,
-		a.kind == rtBytea && b.kind == rtBytea,
-		a.kind == rtUuid && b.kind == rtUuid,
-		a.kind == rtTimestamp && b.kind == rtTimestamp,
-		a.kind == rtTimestamptz && b.kind == rtTimestamptz,
-		a.kind == rtDate && b.kind == rtDate,
-		a.kind == rtInterval && b.kind == rtInterval,
-		a.kind == rtFloat32 && b.kind == rtFloat32,
-		a.kind == rtFloat64 && b.kind == rtFloat64:
-		return a, nil
-	default:
-		return resolvedType{}, newError(DatatypeMismatch, fmt.Sprintf(
-			"VALUES types %s and %s cannot be matched", rtName(a), rtName(b),
-		))
+	if t, ok := commonType(a, b); ok {
+		return t, nil
 	}
+	return resolvedType{}, newError(DatatypeMismatch, fmt.Sprintf(
+		"VALUES types %s and %s cannot be matched", rtName(a), rtName(b),
+	))
+}
+
+// requireSetopEquality: a set operation that MATCHES rows (every form but UNION ALL, and a UNION
+// recursive CTE) needs an equality operator on each output column (spec/design/grammar.md §25). json
+// and jsonpath ship none — nor does an array or composite containing one — so such a column is
+// 42883, exactly PostgreSQL's "could not identify an equality operator". The comparability matrix
+// decides it.
+func requireSetopEquality(t resolvedType) error {
+	if classifyComparable(t, t) != nil {
+		return newError(UndefinedFunction, "could not identify an equality operator for type "+rtName(t))
+	}
+	return nil
+}
+
+// widenToUnified widens one value to a unified column type — the value side of commonType: an
+// integer becomes a decimal (scale 0) and an f32 becomes the exact f64; every other unification is a
+// value no-op (integer-width promotion is free — all integers are i64).
+func widenToUnified(v Value, to resolvedType) Value {
+	switch {
+	case to.kind == rtDecimal && v.Kind == ValInt:
+		return DecimalValue(decimalFromInt64(v.Int))
+	case to.kind == rtFloat64 && v.Kind == ValFloat32:
+		return Float64Value(float64(v.F32()))
+	}
+	return v
 }
 
 // scalarForParamHint is the scalar type to note a bind parameter at, given its VALUES column's
@@ -1711,17 +1719,18 @@ func scalarForParamHint(rt resolvedType) *scalarType {
 	}
 }
 
-// coerceSetopRows converts each row's values in place to the unified set-operation column types —
-// the only runtime change is integer -> decimal (a NULL stays NULL; integer-width promotion is a
-// value no-op since every integer is i64). Same conversion coerceCase uses for CASE.
+// coerceSetopRows converts each row's values in place to the unified set-operation column types
+// (widenToUnified — integer → decimal, f32 → f64; a NULL stays NULL). Only columns whose type
+// actually changed are touched.
 func coerceSetopRows(rows [][]Value, from, to []resolvedType) {
 	for i := range to {
-		if from[i].kind == rtInt && to[i].kind == rtDecimal {
-			for r := range rows {
-				if rows[r][i].Kind == ValInt {
-					rows[r][i] = DecimalValue(decimalFromInt64(rows[r][i].Int))
-				}
-			}
+		widens := (from[i].kind == rtInt && to[i].kind == rtDecimal) ||
+			(from[i].kind == rtFloat32 && to[i].kind == rtFloat64)
+		if !widens {
+			continue
+		}
+		for r := range rows {
+			rows[r][i] = widenToUnified(rows[r][i], to[i])
 		}
 	}
 }

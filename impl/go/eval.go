@@ -803,113 +803,96 @@ func arrayGetSlice(a *ArrayVal, los, his []*int64) Value {
 	return arrayValueOf(&ArrayVal{Dims: newDims, Lbounds: lbounds, Elements: elements})
 }
 
-// unifyCaseTypes unifies a CASE's result-arm types (the THEN results + the ELSE, or rtNull for an
-// implicit ELSE) — or a COALESCE's argument types (spec/design/grammar.md §51, the identical
-// rule) — into one common type (spec/design/grammar.md §23): NULL-typed arms are dropped (they
-// adapt); an all-NULL CASE/COALESCE is text (PostgreSQL). The non-NULL arms must share a family —
-// all numeric unify to decimal if any is decimal, else the widest integer (the promotion tower);
-// otherwise they must all be the same non-numeric family (text/boolean/bytea). A cross-family mix
-// is 42804, with the caller's form-specific message.
-func unifyCaseTypes(arms []resolvedType, mismatch string) (resolvedType, error) {
-	nonNull := make([]resolvedType, 0, len(arms))
-	for _, t := range arms {
-		if t.kind != rtNull {
-			nonNull = append(nonNull, t)
+// commonType is the common type of two operand types at one unification position — a set-operation
+// or VALUES output column, a CASE result arm, a COALESCE / GREATEST / LEAST argument
+// (spec/design/grammar.md §25 "Column types"). The ONE pairwise rule every unifying construct folds,
+// so they cannot drift:
+//
+//   - a NULL-typed side takes the other side's type;
+//   - integer widths promote to the widest, integer with decimal → decimal;
+//   - float widths promote to the widest (f32 with f64 → f64; float never meets int/decimal);
+//   - two arrays unify element-wise when the elements differ only in integer width (a value no-op —
+//     every integer is one i64); any other element difference fails;
+//   - otherwise the two types must be IDENTICAL (structural equality: same element for an array or
+//     range, same named composite or same anonymous shape) — identical types ALWAYS unify, whatever
+//     the family (json, jsonb, jsonpath, date, interval, ranges, composites, …).
+//
+// ok=false is the caller's 42804. Only the int→decimal and f32→f64 widenings change a value; the
+// callers apply them.
+func commonType(a, b resolvedType) (resolvedType, bool) {
+	switch {
+	case a.kind == rtNull:
+		return b, true
+	case b.kind == rtNull:
+		return a, true
+	case a.kind == rtInt && b.kind == rtInt:
+		return resolvedType{kind: rtInt, intTy: promote(a, b)}, true
+	case (a.kind == rtInt || a.kind == rtDecimal) && (b.kind == rtInt || b.kind == rtDecimal):
+		return resolvedType{kind: rtDecimal}, true
+	case isFloatKind(a.kind) && isFloatKind(b.kind):
+		if a.kind == rtFloat64 || b.kind == rtFloat64 {
+			return resolvedType{kind: rtFloat64}, true
 		}
+		return resolvedType{kind: rtFloat32}, true
+	case a.kind == rtArray && b.kind == rtArray:
+		elem, ok := commonArrayElement(*a.elem, *b.elem)
+		if !ok {
+			return resolvedType{}, false
+		}
+		return resolvedType{kind: rtArray, elem: &elem}, true
+	case resolvedTypeEqual(a, b):
+		return a, true
+	default:
+		return resolvedType{}, false
 	}
-	if len(nonNull) == 0 {
-		// Every arm is NULL/untyped — PostgreSQL types the CASE as text.
-		return resolvedType{kind: rtText}, nil
-	}
-	allNumeric, anyDecimal := true, false
-	for _, t := range nonNull {
-		if t.kind != rtInt && t.kind != rtDecimal {
-			allNumeric = false
-		}
-		if t.kind == rtDecimal {
-			anyDecimal = true
-		}
-	}
-	if allNumeric {
-		if anyDecimal {
-			return resolvedType{kind: rtDecimal}, nil
-		}
-		// All integer: the widest via the promotion tower (width is unobservable in output —
-		// every integer renders under the `I` tag — but the fold keeps the type precise).
-		acc := nonNull[0]
-		for _, t := range nonNull[1:] {
-			acc = resolvedType{kind: rtInt, intTy: promote(acc, t)}
-		}
-		return acc, nil
-	}
-	// Non-numeric: every arm must be the same family as the first (cross-family is 42804).
-	first := nonNull[0]
-	for _, t := range nonNull[1:] {
-		if t.kind != first.kind {
-			return resolvedType{}, typeError(mismatch)
-		}
-	}
-	return first, nil
 }
 
-// unifyMinmaxTypes finds GREATEST/LEAST's common type (grammar.md §52). Unlike unifyCaseTypes this
-// must yield a type the fold can ORDER, so it (a) promotes numerics like CASE, (b) promotes float
-// widths to the widest (the float island — never mixes with int/decimal), and (c) requires
-// STRUCTURAL equality for every other family (so i32range and i64range do not unify). The caller
-// gates the result through classifyComparable, so a non-orderable common type (json/jsonpath)
-// still fails there.
-func unifyMinmaxTypes(types []resolvedType, name string) (resolvedType, error) {
-	nonNull := make([]resolvedType, 0, len(types))
-	for _, t := range types {
-		if t.kind != rtNull {
-			nonNull = append(nonNull, t)
+// commonArrayElement is the common element type of two arrays (commonType's array arm): integer
+// widths promote (a value no-op), anything else must be identical. An element-wise int→decimal or
+// f32→f64 widening would have to rewrite every element, so it is not unified (a deferred narrowing —
+// grammar.md §25).
+func commonArrayElement(x, y resolvedType) (resolvedType, bool) {
+	switch {
+	case x.kind == rtInt && y.kind == rtInt:
+		return resolvedType{kind: rtInt, intTy: promote(x, y)}, true
+	case x.kind == rtArray && y.kind == rtArray:
+		elem, ok := commonArrayElement(*x.elem, *y.elem)
+		if !ok {
+			return resolvedType{}, false
 		}
+		return resolvedType{kind: rtArray, elem: &elem}, true
+	case resolvedTypeEqual(x, y):
+		return x, true
+	default:
+		return resolvedType{}, false
 	}
-	if len(nonNull) == 0 {
-		// Every argument is NULL/untyped — an all-unknown GREATEST/LEAST is text (PostgreSQL).
+}
+
+// unifyCaseTypes unifies a CASE's result-arm types — or a COALESCE's (grammar.md §51) or
+// GREATEST/LEAST's (§52) argument types — into one common type by folding commonType; NULL-typed
+// arms are skipped, an all-NULL list is text (PostgreSQL's unknown rule), and a pair with no common
+// type is 42804 with the caller's form-specific mismatch message.
+func unifyCaseTypes(arms []resolvedType, mismatch string) (resolvedType, error) {
+	var acc resolvedType
+	have := false
+	for _, t := range arms {
+		if t.kind == rtNull {
+			continue
+		}
+		if !have {
+			acc, have = t, true
+			continue
+		}
+		u, ok := commonType(acc, t)
+		if !ok {
+			return resolvedType{}, typeError(mismatch)
+		}
+		acc = u
+	}
+	if !have {
 		return resolvedType{kind: rtText}, nil
 	}
-	allNumeric, anyDecimal := true, false
-	for _, t := range nonNull {
-		if t.kind != rtInt && t.kind != rtDecimal {
-			allNumeric = false
-		}
-		if t.kind == rtDecimal {
-			anyDecimal = true
-		}
-	}
-	if allNumeric {
-		if anyDecimal {
-			return resolvedType{kind: rtDecimal}, nil
-		}
-		acc := nonNull[0]
-		for _, t := range nonNull[1:] {
-			acc = resolvedType{kind: rtInt, intTy: promote(acc, t)}
-		}
-		return acc, nil
-	}
-	allFloat := true
-	for _, t := range nonNull {
-		if !isFloatKind(t.kind) {
-			allFloat = false
-		}
-	}
-	if allFloat {
-		kind := nonNull[0].kind
-		for _, t := range nonNull[1:] {
-			if t.kind == rtFloat64 {
-				kind = rtFloat64
-			}
-		}
-		return resolvedType{kind: kind}, nil
-	}
-	first := nonNull[0]
-	for _, t := range nonNull[1:] {
-		if !resolvedTypeEqual(first, t) {
-			return resolvedType{}, typeError(strings.ToUpper(name) + " types must be compatible")
-		}
-	}
-	return first, nil
+	return acc, nil
 }
 
 // coerceCase coerces a CASE arm's value to the unified result type. The only runtime coercion

@@ -36,6 +36,7 @@ import { type EngineError, engineError } from "./errors.ts";
 import type { DecimalTypmod, ScalarType, Type } from "./types.ts";
 import {
   arrayT,
+  rangeT,
   canonicalName,
   compositeT,
   isBool,
@@ -77,7 +78,7 @@ import type {
   WithQuery,
 } from "./ast.ts";
 import { cteBodyAsQuery, cteBodyIsDataModifying, forEachGroupExpr } from "./ast.ts";
-import { unifySetopColumn } from "./eval_ops.ts";
+import { requireSetopEquality, unifySetopColumn } from "./eval_ops.ts";
 import type { Value } from "./value.ts";
 import { render, renderFloat } from "./value.ts";
 import { storeValue } from "./store.ts";
@@ -809,6 +810,7 @@ export function checkRecursiveColumnTypes(
   anchor: QueryPlan,
   recursive: QueryPlan,
   name: string,
+  unionAll: boolean,
 ): void {
   const a = anchor.columnTypes;
   const r = recursive.columnTypes;
@@ -823,6 +825,7 @@ export function checkRecursiveColumnTypes(
         `recursive query "${name}" column ${i + 1} has type ${rtName(a[i]!)} in non-recursive term but type ${rtName(unified)} overall`,
       );
     }
+    if (!unionAll) requireSetopEquality(a[i]!);
   }
 }
 
@@ -918,9 +921,7 @@ export function typeFromResolved(rt: ResolvedType): Type {
     case "array":
       return arrayT(typeFromResolved(rt.elem));
     case "range":
-      // A range-typed CTE column is deferred (range columns are not storable yet — R2); the value
-      // itself works in expression position, just not as a materialized column type.
-      throw engineError("feature_not_supported", "a range column in a CTE is not supported yet");
+      return rangeT(typeFromResolved(rt.elem));
   }
 }
 

@@ -676,37 +676,66 @@ pub(crate) fn array_get_slice(a: &ArrayVal, bounds: &[(Option<i64>, Option<i64>)
     })
 }
 
-/// Unify a CASE's result-arm types — or a COALESCE's argument types (grammar.md §51, the
-/// identical rule) — into one common type; a cross-family mix is 42804 with the caller's
-/// form-specific `mismatch` message.
+/// The common type of two operand types at one unification position — a set-operation or VALUES
+/// output column, a CASE result arm, a COALESCE / GREATEST / LEAST argument (spec/design/grammar.md
+/// §25 "Column types"). The ONE pairwise rule every unifying construct folds, so they cannot drift:
+///
+/// - a NULL-typed side takes the other side's type;
+/// - integer widths promote to the widest, integer with `decimal` → `decimal`;
+/// - float widths promote to the widest (`f32` with `f64` → `f64`; float never meets int/decimal);
+/// - two arrays unify element-wise when the elements differ only in integer width (a value no-op —
+///   every integer is one `i64`); any other element difference is `None`;
+/// - otherwise the two types must be IDENTICAL (structural equality: same element for an array or
+///   range, same named composite or same anonymous shape) — identical types ALWAYS unify, whatever
+///   the family (`json`, `jsonb`, `jsonpath`, `date`, `interval`, ranges, composites, …).
+///
+/// `None` is the caller's `42804`. Only the int→decimal and f32→f64 widenings change a value; the
+/// callers apply them.
+pub(crate) fn common_type(a: &ResolvedType, b: &ResolvedType) -> Option<ResolvedType> {
+    use ResolvedType::*;
+    match (a, b) {
+        (Null, x) | (x, Null) => Some(x.clone()),
+        (Int(_), Int(_)) => Some(Int(promote(a, b))),
+        (Decimal, Decimal) | (Int(_), Decimal) | (Decimal, Int(_)) => Some(Decimal),
+        (Float(x), Float(y)) => Some(Float(
+            if *x == ScalarType::Float64 || *y == ScalarType::Float64 {
+                ScalarType::Float64
+            } else {
+                ScalarType::Float32
+            },
+        )),
+        (Array(x), Array(y)) => common_array_element(x, y).map(|e| Array(Box::new(e))),
+        _ if a == b => Some(a.clone()),
+        _ => None,
+    }
+}
+
+/// The common element type of two arrays (`common_type`'s array arm): integer widths promote (a
+/// value no-op), anything else must be identical. An element-wise int→decimal or f32→f64 widening
+/// would have to rewrite every element, so it is not unified (a deferred narrowing — grammar.md §25).
+fn common_array_element(x: &ResolvedType, y: &ResolvedType) -> Option<ResolvedType> {
+    use ResolvedType::*;
+    match (x, y) {
+        (Int(_), Int(_)) => Some(Int(promote(x, y))),
+        (Array(a), Array(b)) => common_array_element(a, b).map(|e| Array(Box::new(e))),
+        _ if x == y => Some(x.clone()),
+        _ => None,
+    }
+}
+
+/// Unify a CASE's result-arm types — or a COALESCE's (grammar.md §51) or GREATEST/LEAST's (§52)
+/// argument types — into one common type by folding `common_type`; NULL-typed arms are skipped, an
+/// all-NULL list is `text` (PostgreSQL's unknown rule), and a pair with no common type is 42804 with
+/// the caller's form-specific `mismatch` message.
 pub(crate) fn unify_case_types(arms: &[ResolvedType], mismatch: &str) -> Result<ResolvedType> {
-    let non_null: Vec<&ResolvedType> = arms.iter().filter(|t| **t != ResolvedType::Null).collect();
-    let Some(&first) = non_null.first() else {
-        // Every arm is NULL/untyped — PostgreSQL types the CASE as text.
-        return Ok(ResolvedType::Text);
-    };
-    let all_numeric = non_null
-        .iter()
-        .all(|t| matches!(t, ResolvedType::Int(_) | ResolvedType::Decimal));
-    if all_numeric {
-        if non_null.iter().any(|t| **t == ResolvedType::Decimal) {
-            return Ok(ResolvedType::Decimal);
-        }
-        // All integer: the widest via the promotion tower (width is unobservable in output —
-        // every integer renders under the `I` tag — but the fold keeps the type precise).
-        let mut acc = first.clone();
-        for t in &non_null[1..] {
-            acc = ResolvedType::Int(promote(&acc, t));
-        }
-        return Ok(acc);
+    let mut acc: Option<ResolvedType> = None;
+    for t in arms.iter().filter(|t| **t != ResolvedType::Null) {
+        acc = Some(match acc {
+            None => t.clone(),
+            Some(u) => common_type(&u, t).ok_or_else(|| type_error(mismatch))?,
+        });
     }
-    // Non-numeric: every arm must be the same family as the first (cross-family is 42804).
-    for t in &non_null[1..] {
-        if std::mem::discriminant(*t) != std::mem::discriminant(first) {
-            return Err(type_error(mismatch));
-        }
-    }
-    Ok(first.clone())
+    Ok(acc.unwrap_or(ResolvedType::Text))
 }
 
 /// Coerce a CASE arm's value to the unified result type. The only runtime coercion needed is
@@ -729,44 +758,18 @@ pub(crate) fn setop_name(op: SetOpKind) -> &'static str {
     }
 }
 
-/// Unify one output column's type across the two operands of a set operation
-/// (spec/design/grammar.md §25, types.md §4): integer widths promote to the widest; integer with
-/// decimal -> decimal; a NULL-typed operand takes the other's type (an all-NULL column stays NULL
-/// — PostgreSQL would call a top-level one `text`, but the type is never observed in output); a
-/// same-family non-numeric pair gives that type; anything else is 42804. The set of unifiable
-/// pairs mirrors the comparability matrix (compare.toml).
-/// Unify two row value types for the SAME VALUES-body column (spec/design/grammar.md §42), the
-/// set-operation rule (§25): integer widths widen, `int`+`decimal` → `decimal`, anything + `NULL`
-/// keeps the other, and a same-type scalar pair (`text`, `bool`, `bytea`, `uuid`, a `timestamp` /
-/// `timestamptz`, an `interval`, a same-width `float`) unifies to itself; any other pair — including
-/// a composite or array column across rows (a deferred edge) — is 42804. Enumerated EXPLICITLY (not
-/// a generic `a == b`) so all three cores compute byte-identical results (CLAUDE.md §8).
+/// Unify two row value types for the SAME VALUES-body column (spec/design/grammar.md §42) by the
+/// set-operation rule (§25, `common_type`); a pair with no common type is 42804.
 pub(crate) fn unify_values_column(a: &ResolvedType, b: &ResolvedType) -> Result<ResolvedType> {
-    use ResolvedType::*;
-    Ok(match (a, b) {
-        (Null, Null) => Null,
-        (Null, x) | (x, Null) => x.clone(),
-        (Int(_), Int(_)) => Int(promote(a, b)),
-        (Decimal, Decimal) | (Int(_), Decimal) | (Decimal, Int(_)) => Decimal,
-        (Text, Text) => Text,
-        (Bool, Bool) => Bool,
-        (Bytea, Bytea) => Bytea,
-        (Uuid, Uuid) => Uuid,
-        (Timestamp, Timestamp) => Timestamp,
-        (Timestamptz, Timestamptz) => Timestamptz,
-        (Date, Date) => Date,
-        (Interval, Interval) => Interval,
-        (Float(x), Float(y)) if x == y => Float(*x),
-        _ => {
-            return Err(EngineError::new(
-                SqlState::DatatypeMismatch,
-                format!(
-                    "VALUES types {} and {} cannot be matched",
-                    a.type_name(),
-                    b.type_name()
-                ),
-            ));
-        }
+    common_type(a, b).ok_or_else(|| {
+        EngineError::new(
+            SqlState::DatatypeMismatch,
+            format!(
+                "VALUES types {} and {} cannot be matched",
+                a.type_name(),
+                b.type_name()
+            ),
+        )
     })
 }
 
@@ -795,54 +798,75 @@ pub(crate) fn scalar_for_param_hint(rt: &ResolvedType) -> Option<ScalarType> {
     }
 }
 
+/// Unify one output column's type across the two operands of a set operation (spec/design/grammar.md
+/// §25, `common_type`); a pair with no common type is 42804. An all-NULL column stays NULL (PostgreSQL
+/// would call a top-level one `text`, but the type is never observed in output).
 pub(crate) fn unify_setop_column(
     a: &ResolvedType,
     b: &ResolvedType,
     op: SetOpKind,
 ) -> Result<ResolvedType> {
-    use ResolvedType::*;
-    let out = match (a, b) {
-        (Null, Null) => Null,
-        (Null, x) | (x, Null) => x.clone(),
-        (Int(_), Int(_)) => Int(promote(a, b)),
-        (Decimal, Decimal) | (Int(_), Decimal) | (Decimal, Int(_)) => Decimal,
-        (Text, Text) => Text,
-        (Bool, Bool) => Bool,
-        (Bytea, Bytea) => Bytea,
-        (Uuid, Uuid) => Uuid,
-        (Timestamp, Timestamp) => Timestamp,
-        (Timestamptz, Timestamptz) => Timestamptz,
-        (Date, Date) => Date,
-        _ => {
-            return Err(EngineError::new(
-                SqlState::DatatypeMismatch,
-                format!(
-                    "{} types {} and {} cannot be matched",
-                    setop_name(op),
-                    a.type_name(),
-                    b.type_name()
-                ),
-            ));
-        }
-    };
-    Ok(out)
+    common_type(a, b).ok_or_else(|| {
+        EngineError::new(
+            SqlState::DatatypeMismatch,
+            format!(
+                "{} types {} and {} cannot be matched",
+                setop_name(op),
+                a.type_name(),
+                b.type_name()
+            ),
+        )
+    })
 }
 
-/// Convert each row's values in place to the unified set-operation column types — the only runtime
-/// change is integer -> decimal (a NULL stays NULL; integer-width promotion is a value no-op since
-/// every integer is i64). Same conversion `coerce_case` uses for CASE.
+/// A set operation that MATCHES rows (every form but `UNION ALL`, and a `UNION` recursive CTE) needs
+/// an equality operator on each output column (spec/design/grammar.md §25). `json` and `jsonpath`
+/// ship none — nor does an array or composite containing one — so such a column is 42883, exactly
+/// PostgreSQL's "could not identify an equality operator". The comparability matrix decides it.
+pub(crate) fn require_setop_equality(t: &ResolvedType) -> Result<()> {
+    crate::executor::resolve::classify_comparable(t, t).map_err(|_| {
+        EngineError::new(
+            SqlState::UndefinedFunction,
+            format!(
+                "could not identify an equality operator for type {}",
+                t.type_name()
+            ),
+        )
+    })
+}
+
+/// Widen one value to a unified column type — the value side of `common_type`: an integer becomes a
+/// `decimal` (scale 0) and an `f32` becomes the exact `f64`; every other unification is a value
+/// no-op (integer-width promotion is free — all integers are `i64`).
+pub(crate) fn widen_to_unified(v: Value, to: &ResolvedType) -> Value {
+    match (to, v) {
+        (ResolvedType::Decimal, Value::Int(n)) => Value::Decimal(Decimal::from_i64(n)),
+        (ResolvedType::Float(ScalarType::Float64), Value::Float32(f)) => Value::Float64(f as f64),
+        (_, v) => v,
+    }
+}
+
+/// Convert each row's values in place to the unified set-operation column types (`widen_to_unified`
+/// — integer → decimal, f32 → f64; a NULL stays NULL). Only columns whose type actually changed are
+/// touched.
 pub(crate) fn coerce_setop_rows(
     rows: &mut [Vec<Value>],
     from: &[ResolvedType],
     to: &[ResolvedType],
 ) {
     for (i, (f, t)) in from.iter().zip(to.iter()).enumerate() {
-        if matches!(f, ResolvedType::Int(_)) && *t == ResolvedType::Decimal {
+        let widens = matches!(
+            (f, t),
+            (ResolvedType::Int(_), ResolvedType::Decimal)
+                | (
+                    ResolvedType::Float(ScalarType::Float32),
+                    ResolvedType::Float(ScalarType::Float64)
+                )
+        );
+        if widens {
             for row in rows.iter_mut() {
-                if let Value::Int(n) = &row[i] {
-                    let n = *n;
-                    row[i] = Value::Decimal(Decimal::from_i64(n));
-                }
+                let v = std::mem::replace(&mut row[i], Value::Null);
+                row[i] = widen_to_unified(v, t);
             }
         }
     }

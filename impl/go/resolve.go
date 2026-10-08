@@ -1929,6 +1929,13 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
+		// A mixed-width float CASE is f64: widen the f32 arms (an ordinary cast, like GREATEST).
+		if unified.kind == rtFloat64 {
+			for i := range arms {
+				arms[i].result = widenFloatToF64(arms[i].result, resultTypes[i])
+			}
+			rels = widenFloatToF64(rels, resultTypes[len(resultTypes)-1])
+		}
 		// A bare parameter in a result arm takes the unified scalar type. The first pass had no
 		// result context, so it recorded the occurrence as unresolved; feed the common type back
 		// before statement-wide parameter finalization (api.md §5, grammar.md §23).
@@ -1965,6 +1972,12 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
+		// A mixed-width float COALESCE is f64: widen the f32 arguments (as CASE).
+		if unified.kind == rtFloat64 {
+			for i, t := range argTypes {
+				args[i] = widenFloatToF64(args[i], t)
+			}
+		}
 		// A bare parameter argument takes COALESCE's unified scalar type. Each argument was
 		// initially resolved without sibling context, so record the derived type now.
 		hint := scalarForParamHint(unified)
@@ -1979,10 +1992,9 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			unified, nil
 	case exprGreatestLeast:
 		// GREATEST/LEAST(a, b, …) (grammar.md §52): each argument resolves in the same agg context,
-		// and the argument types unify to one common ORDERABLE type. The winner is chosen by that
-		// type's total order at eval, so — unlike CASE/COALESCE, which never compare — the common
-		// type must actually be comparable and mixed-width floats must be widened; hence
-		// unifyMinmaxTypes (not the CASE unifier) plus the classifyComparable gate.
+		// and the argument types unify by CASE's rule (unifyCaseTypes). The winner is chosen by the
+		// unified type's total order at eval, so — unlike CASE/COALESCE, which never compare — the
+		// common type must also be orderable: the classifyComparable gate below.
 		name := "least"
 		if e.Greatest {
 			name = "greatest"
@@ -1997,7 +2009,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			args = append(args, ra)
 			argTypes = append(argTypes, aty)
 		}
-		unified, err := unifyMinmaxTypes(argTypes, name)
+		unified, err := unifyCaseTypes(argTypes, strings.ToUpper(name)+" types must be compatible")
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -2020,9 +2032,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		// cost stays observable) so the comparator sees one width.
 		if unified.kind == rtFloat64 {
 			for i, t := range argTypes {
-				if t.kind == rtFloat32 {
-					args[i] = &rExpr{kind: reCast, operand: args[i], result: scalarFloat64}
-				}
+				args[i] = widenFloatToF64(args[i], t)
 			}
 		}
 		// Text arguments derive one comparison collation (42P21/42P22 on conflict — §52).
@@ -2574,4 +2584,14 @@ func satAdd1(n int64) int64 {
 		return math.MaxInt64
 	}
 	return n + 1
+}
+
+// widenFloatToF64 wraps an f32-typed node in an f32 → f64 cast (an ordinary cast, whose cost stays
+// observable) — how CASE / COALESCE / GREATEST / LEAST widen a mixed-width float set to its unified
+// f64. Any other node is returned unchanged.
+func widenFloatToF64(node *rExpr, t resolvedType) *rExpr {
+	if t.kind == rtFloat32 {
+		return &rExpr{kind: reCast, operand: node, result: scalarFloat64}
+	}
+	return node
 }

@@ -3257,11 +3257,13 @@ fn count_sublink_self_refs(s: &Select, name: &str) -> usize {
 /// non-recursive (anchor) term, and the recursive term's columns must be assignable to them — a
 /// literal adapts, an equal type passes, a WIDER type is `42804` (matching PostgreSQL). Mechanically
 /// the would-be UNION unified type must EQUAL the anchor type; any widening of the anchor is the
-/// error. An arity mismatch is `42601`, like a plain UNION.
+/// error. An arity mismatch is `42601`, like a plain UNION. A `UNION` (not `UNION ALL`) recursive
+/// CTE dedups its rows, so each column also needs an equality operator (42883 for json/jsonpath).
 fn check_recursive_column_types(
     anchor: &QueryPlan,
     recursive: &QueryPlan,
     name: &str,
+    union_all: bool,
 ) -> Result<()> {
     let a = anchor.column_types();
     let r = recursive.column_types();
@@ -3283,6 +3285,9 @@ fn check_recursive_column_types(
                     unified.type_name(),
                 ),
             ));
+        }
+        if !union_all {
+            require_setop_equality(at)?;
         }
     }
     Ok(())
@@ -3703,14 +3708,7 @@ fn type_from_resolved(rt: &ResolvedType) -> Result<Type> {
             }
         },
         ResolvedType::Array(elem) => Type::Array(Box::new(type_from_resolved(elem)?)),
-        // A range-typed CTE column is deferred (range columns are not storable yet — R2); the
-        // value itself works in expression position, just not as a materialized column type.
-        ResolvedType::Range(_) => {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "a range column in a CTE is not supported yet",
-            ));
-        }
+        ResolvedType::Range(elem) => Type::Range(Box::new(type_from_resolved(elem)?)),
     })
 }
 

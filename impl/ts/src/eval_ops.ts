@@ -29,7 +29,15 @@ import {
 import { checkDepth as jsonCheckDepth, jsonCompactOut } from "./json.ts";
 import { type QueryAccount, StateCharge } from "./cost.ts";
 import { entryBytes } from "./memsize.ts";
-import { arraySubscriptErr, distinctRowKey, promote, rtName, valueToNode } from "./executor.ts";
+import {
+  arraySubscriptErr,
+  distinctRowKey,
+  promote,
+  resolvedTypeEqual,
+  rtName,
+  valueToNode,
+} from "./executor.ts";
+import { classifyComparable } from "./kernels.ts";
 import type { DecimalTypmod, ScalarType } from "./types.ts";
 import {
   finalizeRange,
@@ -618,44 +626,69 @@ export function arrayGetSlice(
   };
 }
 
-// unifyCaseTypes unifies a CASE's result-arm types (the THEN results + the ELSE, or "null" for an
-// implicit ELSE) — or a COALESCE's argument types (spec/design/grammar.md §51, the identical
-// rule) — into one common type (spec/design/grammar.md §23): NULL-typed arms are dropped (they
-// adapt); an all-NULL CASE/COALESCE is text (PostgreSQL). The non-NULL arms must share a family —
-// all numeric unify to decimal if any is decimal, else the widest integer (the promotion tower);
-// otherwise they must all be the same non-numeric family (text/boolean/bytea). A cross-family mix
-// is 42804, with the caller's form-specific message.
+// unifyCaseTypes unifies a CASE's result-arm types — or a COALESCE's (grammar.md §51) or
+// GREATEST/LEAST's (§52) argument types — into one common type by folding commonType; NULL-typed
+// arms are skipped, an all-NULL list is text (PostgreSQL's unknown rule), and a pair with no common
+// type is 42804 with the caller's form-specific mismatch message.
 export function unifyCaseTypes(arms: ResolvedType[], mismatch: string): ResolvedType {
-  const nonNull = arms.filter((t) => t.kind !== "null");
-  if (nonNull.length === 0) return { kind: "text" }; // every arm NULL/untyped → text
-  let allNumeric = true;
-  let anyDecimal = false;
-  for (const t of nonNull) {
-    if (t.kind !== "int" && t.kind !== "decimal") allNumeric = false;
-    if (t.kind === "decimal") anyDecimal = true;
+  let acc: ResolvedType | null = null;
+  for (const t of arms) {
+    if (t.kind === "null") continue;
+    if (acc === null) {
+      acc = t;
+      continue;
+    }
+    const u = commonType(acc, t);
+    if (u === null) throw typeError(mismatch);
+    acc = u;
   }
-  if (allNumeric) {
-    if (anyDecimal) return { kind: "decimal" };
-    // All integer: the widest via the promotion tower (width is unobservable in output — every
-    // integer renders under the `I` tag — but the fold keeps the type precise).
-    let acc = nonNull[0]!;
-    for (const t of nonNull.slice(1)) acc = { kind: "int", ty: promote(acc, t) };
-    return acc;
+  return acc ?? { kind: "text" };
+}
+
+// commonType is the common type of two operand types at one unification position — a set-operation
+// or VALUES output column, a CASE result arm, a COALESCE / GREATEST / LEAST argument
+// (spec/design/grammar.md §25 "Column types"). The ONE pairwise rule every unifying construct folds,
+// so they cannot drift:
+//
+//   - a NULL-typed side takes the other side's type;
+//   - integer widths promote to the widest, integer with decimal → decimal;
+//   - float widths promote to the widest (f32 with f64 → f64; float never meets int/decimal);
+//   - two arrays unify element-wise when the elements differ only in integer width (a value no-op —
+//     every integer is one bigint); any other element difference fails;
+//   - otherwise the two types must be IDENTICAL (structural equality: same element for an array or
+//     range, same named composite or same anonymous shape) — identical types ALWAYS unify, whatever
+//     the family (json, jsonb, jsonpath, date, interval, ranges, composites, …).
+//
+// null is the caller's 42804. Only the int→decimal and f32→f64 widenings change a value; the callers
+// apply them.
+export function commonType(a: ResolvedType, b: ResolvedType): ResolvedType | null {
+  if (a.kind === "null") return b;
+  if (b.kind === "null") return a;
+  if (a.kind === "int" && b.kind === "int") return { kind: "int", ty: promote(a, b) };
+  if ((a.kind === "int" || a.kind === "decimal") && (b.kind === "int" || b.kind === "decimal")) {
+    return { kind: "decimal" };
   }
-  // All float: the widest via the float tower (f32 + f64 → f64). A float mixed with a
-  // non-float arm is a cross-family 42804 (caught by the same-family check below — float is a strict
-  // island, no int/decimal reconciliation, float.md §6).
-  if (nonNull.every((t) => t.kind === "float")) {
-    let acc = (nonNull[0] as { kind: "float"; ty: ScalarType }).ty;
-    for (const t of nonNull.slice(1)) acc = promoteFloat(acc, (t as { ty: ScalarType }).ty);
-    return { kind: "float", ty: acc };
+  if (a.kind === "float" && b.kind === "float") {
+    return { kind: "float", ty: promoteFloat(a.ty, b.ty) };
   }
-  // Non-numeric: every arm must be the same family as the first (cross-family is 42804).
-  const first = nonNull[0]!;
-  for (const t of nonNull.slice(1)) {
-    if (t.kind !== first.kind) throw typeError(mismatch);
+  if (a.kind === "array" && b.kind === "array") {
+    const elem = commonArrayElement(a.elem, b.elem);
+    return elem === null ? null : { kind: "array", elem };
   }
-  return first;
+  return resolvedTypeEqual(a, b) ? a : null;
+}
+
+// commonArrayElement is the common element type of two arrays (commonType's array arm): integer
+// widths promote (a value no-op), anything else must be identical. An element-wise int→decimal or
+// f32→f64 widening would have to rewrite every element, so it is not unified (a deferred narrowing —
+// grammar.md §25).
+function commonArrayElement(x: ResolvedType, y: ResolvedType): ResolvedType | null {
+  if (x.kind === "int" && y.kind === "int") return { kind: "int", ty: promote(x, y) };
+  if (x.kind === "array" && y.kind === "array") {
+    const elem = commonArrayElement(x.elem, y.elem);
+    return elem === null ? null : { kind: "array", elem };
+  }
+  return resolvedTypeEqual(x, y) ? x : null;
 }
 
 // coerceCaseValue coerces a CASE arm's value to the unified result type. The only runtime
@@ -672,41 +705,12 @@ export function setopName(op: SetOpKind): string {
   return op === "union" ? "UNION" : op === "intersect" ? "INTERSECT" : "EXCEPT";
 }
 
-// unifySetopColumn unifies one output column's type across the two operands of a set operation
-// (spec/design/grammar.md §25, types.md §4): integer widths promote to the widest; integer with
-// decimal -> decimal; a NULL-typed operand takes the other's type (an all-NULL column stays "null"
-// — PostgreSQL would call a top-level one text, but the type is never observed in output); a
-// same-family non-numeric pair gives that type; anything else is 42804. The set of unifiable pairs
-// mirrors the comparability matrix (compare.toml).
 // unifyValuesColumn unifies two row value types for the SAME VALUES-body column
-// (spec/design/grammar.md §42), the set-operation rule (§25): integer widths widen, int+decimal ->
-// decimal, anything + NULL keeps the other, and a same-type scalar pair (text, boolean, bytea, uuid,
-// a timestamp / timestamptz, an interval, a same-width float) unifies to itself; any other pair —
-// including a composite or array column across rows (a deferred edge) — is 42804. Enumerated
-// EXPLICITLY (not a generic same-kind passthrough) so all three cores compute byte-identical
-// results (CLAUDE.md §8).
+// (spec/design/grammar.md §42) by the set-operation rule (§25, commonType); a pair with no common
+// type is 42804.
 export function unifyValuesColumn(a: ResolvedType, b: ResolvedType): ResolvedType {
-  if (a.kind === "null" && b.kind === "null") return { kind: "null" };
-  if (a.kind === "null") return b;
-  if (b.kind === "null") return a;
-  if (a.kind === "int" && b.kind === "int") return { kind: "int", ty: promote(a, b) };
-  if ((a.kind === "int" || a.kind === "decimal") && (b.kind === "int" || b.kind === "decimal")) {
-    return { kind: "decimal" };
-  }
-  if (a.kind === "float" && b.kind === "float" && a.ty === b.ty) return a;
-  if (
-    a.kind === b.kind &&
-    (a.kind === "text" ||
-      a.kind === "bool" ||
-      a.kind === "bytea" ||
-      a.kind === "uuid" ||
-      a.kind === "timestamp" ||
-      a.kind === "timestamptz" ||
-      a.kind === "interval" ||
-      a.kind === "date")
-  ) {
-    return a;
-  }
+  const t = commonType(a, b);
+  if (t !== null) return t;
   throw engineError(
     "datatype_mismatch",
     `VALUES types ${rtName(a)} and ${rtName(b)} cannot be matched`,
@@ -751,46 +755,56 @@ export function scalarForParamHint(rt: ResolvedType): ScalarType | null {
   }
 }
 
+// unifySetopColumn unifies one output column's type across the two operands of a set operation
+// (spec/design/grammar.md §25, commonType); a pair with no common type is 42804. An all-NULL column
+// stays "null" (PostgreSQL would call a top-level one text, but the type is never observed in
+// output).
 export function unifySetopColumn(a: ResolvedType, b: ResolvedType, op: SetOpKind): ResolvedType {
-  if (a.kind === "null" && b.kind === "null") return { kind: "null" };
-  if (a.kind === "null") return b;
-  if (b.kind === "null") return a;
-  if (a.kind === "int" && b.kind === "int") return { kind: "int", ty: promote(a, b) };
-  if ((a.kind === "int" || a.kind === "decimal") && (b.kind === "int" || b.kind === "decimal")) {
-    // at least one decimal (both-int handled above) -> decimal
-    return { kind: "decimal" };
-  }
-  // Two floats unify to the widest (the float tower — f32 + f64 → f64; the narrower
-  // operand's rows are widened in coerceSetopRows). float never reconciles with int/decimal.
-  if (a.kind === "float" && b.kind === "float")
-    return { kind: "float", ty: promoteFloat(a.ty, b.ty) };
-  if (a.kind === b.kind) return a;
+  const t = commonType(a, b);
+  if (t !== null) return t;
   throw engineError(
     "datatype_mismatch",
     `${setopName(op)} types ${rtName(a)} and ${rtName(b)} cannot be matched`,
   );
 }
 
-// coerceSetopRows converts each row's values in place to the unified set-operation column types —
-// the only runtime change is integer -> decimal (a NULL stays NULL; integer-width promotion is a
-// value no-op since every integer is bigint). Same conversion coerceCaseValue uses for CASE.
+// requireSetopEquality: a set operation that MATCHES rows (every form but UNION ALL, and a UNION
+// recursive CTE) needs an equality operator on each output column (spec/design/grammar.md §25). json
+// and jsonpath ship none — nor does an array or composite containing one — so such a column is
+// 42883, exactly PostgreSQL's "could not identify an equality operator". The comparability matrix
+// decides it.
+export function requireSetopEquality(t: ResolvedType): void {
+  try {
+    classifyComparable(t, t);
+  } catch {
+    throw engineError(
+      "undefined_function",
+      `could not identify an equality operator for type ${rtName(t)}`,
+    );
+  }
+}
+
+// widenToUnified widens one value to a unified column type — the value side of commonType: an
+// integer becomes a decimal (scale 0) and an f32 becomes the exact f64; every other unification is a
+// value no-op (integer-width promotion is free — all integers are bigint).
+export function widenToUnified(v: Value, to: ResolvedType): Value {
+  if (to.kind === "decimal" && v.kind === "int") return decimalValue(Decimal.fromBigInt(v.int));
+  if (to.kind === "float" && to.ty === "f64" && v.kind === "f32") return float64Value(v.value);
+  return v;
+}
+
+// coerceSetopRows converts each row's values in place to the unified set-operation column types
+// (widenToUnified — integer → decimal, f32 → f64; a NULL stays NULL). Only columns whose type
+// actually changed are touched.
 export function coerceSetopRows(rows: Value[][], from: ResolvedType[], to: ResolvedType[]): void {
   for (let i = 0; i < to.length; i++) {
-    if (from[i]!.kind === "int" && to[i]!.kind === "decimal") {
-      for (const row of rows) {
-        const v = row[i]!;
-        if (v.kind === "int") row[i] = decimalValue(Decimal.fromBigInt(v.int));
-      }
-    }
-    // f32 → f64 widening (lossless): the column unified to f64 but this operand is
-    // f32, so its values become f64 Values (the number is already an exact binary64).
+    const f = from[i]!;
     const t = to[i]!;
-    if (from[i]!.kind === "float" && t.kind === "float" && t.ty === "f64") {
-      for (const row of rows) {
-        const v = row[i]!;
-        if (v.kind === "f32") row[i] = float64Value(v.value);
-      }
-    }
+    const widens =
+      (f.kind === "int" && t.kind === "decimal") ||
+      (f.kind === "float" && f.ty === "f32" && t.kind === "float" && t.ty === "f64");
+    if (!widens) continue;
+    for (const row of rows) row[i] = widenToUnified(row[i]!, t);
   }
 }
 

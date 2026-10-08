@@ -1294,9 +1294,11 @@ layer then consumes those materialized rows and does **only set-membership work*
 the NULL-safe value-canonical key, take the multiset union / intersection / difference, emit the
 representative rows — which is **unmetered**, exactly like `DISTINCT` dedup (above), the
 `ORDER BY` sort, and the `LIMIT`/`OFFSET` slice. The trailing `ORDER BY` and `LIMIT`/`OFFSET` of a
-set operation are likewise unmetered (§ "What is NOT metered"). The integer→`decimal` value
-conversion that type unification may apply before keying (§25) is structural, like a JOIN's
-NULL-extension, and charges nothing. **No new cost unit** is introduced.
+set operation are likewise unmetered (§ "What is NOT metered"). The integer→`decimal` and
+`f32`→`f64` value conversions that type unification may apply before keying (grammar.md §25) are
+structural, like a JOIN's NULL-extension, and charge nothing — as do the same conversions on a
+`VALUES`-body column. (A `CASE`/`COALESCE`/`GREATEST`/`LEAST` mixed-width float arm is instead
+wrapped in an ordinary `f32 → f64` cast, whose `operator_eval` is charged when that arm evaluates.) **No new cost unit** is introduced.
 
 This **follows the `INSERT … SELECT` precedent** (§24, where the wrapping statement adds nothing
 to the embedded `SELECT`'s cost), not the single-`SELECT` shape. A deliberate consequence: the

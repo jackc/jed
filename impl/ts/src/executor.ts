@@ -370,8 +370,10 @@ import {
   resolveTypeAndTypmod,
   scalarForParamHint,
   setopName,
+  requireSetopEquality,
   unifySetopColumn,
   unifyValuesColumn,
+  widenToUnified,
 } from "./eval_ops.ts";
 import {
   coerceStringLiteral,
@@ -11585,7 +11587,7 @@ export class Engine {
         if (anchorSrc.kind !== "query") {
           throw new Error("the anchor binding was just pushed as a query source");
         }
-        checkRecursiveColumnTypes(anchorSrc.plan, rhsPlan, lname);
+        checkRecursiveColumnTypes(anchorSrc.plan, rhsPlan, lname, shape.unionAll);
         bindings[bi]!.recursive = { plan: rhsPlan, unionAll: shape.unionAll };
         continue;
       }
@@ -12186,6 +12188,9 @@ export class Engine {
     const columnTypes = lhs.columnTypes.map((l, i) =>
       unifySetopColumn(l, rhs.columnTypes[i]!, so.op),
     );
+    // Every form but UNION ALL matches rows, so each column needs an equality operator (42883 for
+    // json / jsonpath, as PostgreSQL).
+    if (so.op !== "union" || !so.all) for (const t of columnTypes) requireSetopEquality(t);
     const columnNames = lhs.columnNames;
     const order: OrderSlot[] = so.orderBy.map((key) => {
       const idx = resolveSetopOrderKey(key, columnNames);
@@ -12342,8 +12347,8 @@ export class Engine {
 
   // execValuesPlan executes a resolved VALUES-body relation (spec/design/grammar.md §42): evaluate
   // each row's values as constants over an EMPTY environment (no local row, no outer row —
-  // non-LATERAL), coerce each to the unified column type (the only runtime change is int → decimal,
-  // the set-operation rule), and emit the rows. Charges rowProduced per row plus each value's
+  // non-LATERAL), coerce each to the unified column type (the only runtime changes are int →
+  // decimal and f32 → f64, the set-operation rule), and emit the rows. Charges rowProduced per row plus each value's
   // operatorEval (the evaluator) — the derived table's intrinsic cost (cost.md §3), folded into the
   // caller's meter via execQueryPlan.
   private execValuesPlan(
@@ -12368,13 +12373,9 @@ export class Engine {
       meter.charge(COSTS.rowProduced);
       const out: Value[] = [];
       for (let ci = 0; ci < plan.columnTypes.length; ci++) {
-        let v = evalExpr(row[ci]!, [], env, meter);
-        // int → decimal where the column unified to decimal (the set-operation rule); every other
-        // unified type is a value no-op (int-width promotion is free — all ints are bigint).
-        if (plan.columnTypes[ci]!.kind === "decimal" && v.kind === "int") {
-          v = decimalValue(Decimal.fromBigInt(v.int));
-        }
-        out.push(v);
+        // Widen to the column's unified type (the set-operation rule): int → decimal, f32 → f64;
+        // every other unified type is a value no-op.
+        out.push(widenToUnified(evalExpr(row[ci]!, [], env, meter), plan.columnTypes[ci]!));
       }
       meter.admitRow(out); // a materialized relation row (memory.md §5.1)
       rows.push(out);
@@ -23806,6 +23807,9 @@ export function distinctValueKey(v: Value): string {
       // The i64 UTC-instant micros under a distinct 'z' tag: offsets are normalized to UTC
       // at parse, so +00 and +05-of-the-same-instant bucket together.
       return "z" + v.micros.toString();
+    case "date":
+      // The i32 day count under a distinct 'D' tag (date.md §4 — one value per calendar day).
+      return "D" + v.days.toString();
     case "interval":
       // The canonical 128-bit span as a decimal string under a distinct 'v' tag, so
       // span-equal intervals ('1 mon' / '30 days' / '720:00:00') collapse to one DISTINCT/

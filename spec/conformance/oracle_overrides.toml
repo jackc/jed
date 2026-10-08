@@ -1178,3 +1178,71 @@ reason = "jed: NO ACTION and RESTRICT share final action-closure validation and 
 file = "ddl/foreign_key_lazy_child.test"
 sql = "UPDATE codes SET code='orphan' WHERE id=1"
 reason = "jed: NO ACTION and RESTRICT share final action-closure validation and its 23503 error; PostgreSQL 18 raises 23001 for RESTRICT. The single validation/error path is the documented simplification in constraints.md §6.7."
+
+# --- type unification (setops/unify_types.test, grammar.md §25): a pair with no common type is
+# 42804 in jed where PostgreSQL reports 42846 for a same-category unconvertible pair; and jed
+# unifies array elements only across integer widths (no per-element int -> decimal rewrite).
+[[override]]
+file = "setops/unify_types.test"
+sql = "SELECT x FROM (VALUES ('1'::json), ('1'::jsonb)) v(x)"
+reason = "jed reports an unconvertible pair at a type-unification position as 42804 datatype_mismatch (grammar.md §25 — jed's standing convention for an unconvertible pair, types.md §9); PostgreSQL rejects the same pair as 42846 cannot_coerce (\"could not convert type\"). Both reject; only the SQLSTATE differs."
+
+[[override]]
+file = "setops/unify_types.test"
+sql = "SELECT x FROM (VALUES ('[1,2)'::int4range), ('[1,2)'::int8range)) v(x)"
+reason = "jed reports an unconvertible pair at a type-unification position as 42804 datatype_mismatch (grammar.md §25 — jed's standing convention for an unconvertible pair, types.md §9); PostgreSQL rejects the same pair as 42846 cannot_coerce (\"could not convert type\"). Both reject; only the SQLSTATE differs."
+
+[[override]]
+file = "setops/unify_types.test"
+sql = "SELECT x FROM (VALUES (ARRAY[1::i32]), (ARRAY['a'::text])) v(x)"
+reason = "jed reports an unconvertible pair at a type-unification position as 42804 datatype_mismatch (grammar.md §25 — jed's standing convention for an unconvertible pair, types.md §9); PostgreSQL rejects the same pair as 42846 cannot_coerce (\"could not convert type\"). Both reject; only the SQLSTATE differs."
+
+[[override]]
+file = "setops/unify_types.test"
+sql = "SELECT x FROM (VALUES ('(main,1)'::uaddr), ('(main,1)'::uaddr2)) v(x)"
+reason = "jed reports an unconvertible pair at a type-unification position as 42804 datatype_mismatch (grammar.md §25 — jed's standing convention for an unconvertible pair, types.md §9); PostgreSQL rejects the same pair as 42846 cannot_coerce (\"could not convert type\"). Both reject; only the SQLSTATE differs."
+
+[[override]]
+file = "setops/unify_types.test"
+sql = "SELECT '1'::json UNION ALL SELECT '1'::jsonb"
+reason = "jed reports an unconvertible pair at a type-unification position as 42804 datatype_mismatch (grammar.md §25 — jed's standing convention for an unconvertible pair, types.md §9); PostgreSQL rejects the same pair as 42846 cannot_coerce (\"could not convert type\"). Both reject; only the SQLSTATE differs."
+
+[[override]]
+file = "setops/unify_types.test"
+sql = "SELECT ARRAY[1::i32] UNION ALL SELECT ARRAY['a'::text]"
+reason = "jed reports an unconvertible pair at a type-unification position as 42804 datatype_mismatch (grammar.md §25 — jed's standing convention for an unconvertible pair, types.md §9); PostgreSQL rejects the same pair as 42846 cannot_coerce (\"could not convert type\"). Both reject; only the SQLSTATE differs."
+
+[[override]]
+file = "setops/unify_types.test"
+sql = "SELECT '[1,2)'::int4range UNION ALL SELECT '[1,2)'::int8range"
+reason = "jed reports an unconvertible pair at a type-unification position as 42804 datatype_mismatch (grammar.md §25 — jed's standing convention for an unconvertible pair, types.md §9); PostgreSQL rejects the same pair as 42846 cannot_coerce (\"could not convert type\"). Both reject; only the SQLSTATE differs."
+
+[[override]]
+file = "setops/unify_types.test"
+sql = "SELECT '(main,1)'::uaddr UNION ALL SELECT '(main,1)'::uaddr2"
+reason = "jed reports an unconvertible pair at a type-unification position as 42804 datatype_mismatch (grammar.md §25 — jed's standing convention for an unconvertible pair, types.md §9); PostgreSQL rejects the same pair as 42846 cannot_coerce (\"could not convert type\"). Both reject; only the SQLSTATE differs."
+
+[[override]]
+file = "setops/unify_types.test"
+sql = "SELECT CASE WHEN true THEN ARRAY[1::i32] ELSE ARRAY['a'::text] END"
+reason = "jed reports an unconvertible pair at a type-unification position as 42804 datatype_mismatch (grammar.md §25 — jed's standing convention for an unconvertible pair, types.md §9); PostgreSQL rejects the same pair as 42846 cannot_coerce (\"could not convert type\"). Both reject; only the SQLSTATE differs."
+
+[[override]]
+file = "setops/unify_types.test"
+sql = "SELECT COALESCE('[1,2)'::int4range, '[1,2)'::int8range)"
+reason = "jed reports an unconvertible pair at a type-unification position as 42804 datatype_mismatch (grammar.md §25 — jed's standing convention for an unconvertible pair, types.md §9); PostgreSQL rejects the same pair as 42846 cannot_coerce (\"could not convert type\"). Both reject; only the SQLSTATE differs."
+
+[[override]]
+file = "setops/unify_types.test"
+sql = "SELECT COALESCE('(main,1)'::uaddr, '(main,1)'::uaddr2)"
+reason = "jed reports an unconvertible pair at a type-unification position as 42804 datatype_mismatch (grammar.md §25 — jed's standing convention for an unconvertible pair, types.md §9); PostgreSQL rejects the same pair as 42846 cannot_coerce (\"could not convert type\"). Both reject; only the SQLSTATE differs."
+
+[[override]]
+file = "setops/unify_types.test"
+sql = "SELECT COALESCE('1'::json, '1'::jsonb)"
+reason = "jed reports an unconvertible pair at a type-unification position as 42804 datatype_mismatch (grammar.md §25 — jed's standing convention for an unconvertible pair, types.md §9); PostgreSQL rejects the same pair as 42846 cannot_coerce (\"could not convert type\"). Both reject; only the SQLSTATE differs."
+
+[[override]]
+file = "setops/unify_types.test"
+sql = "SELECT x FROM (VALUES (ARRAY[1::i32]), (ARRAY[1.5])) v(x)"
+reason = "jed unifies array element types only across integer widths, the one widening that leaves every element value untouched (grammar.md §25 'Deliberate narrowing'); an i32[] with a decimal[] would need a per-element int -> decimal rewrite, so it is 42804. PostgreSQL unifies the pair to numeric[] and returns {1}, {1.5}. Deferred, not foreclosed."

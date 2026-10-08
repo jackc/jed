@@ -311,8 +311,11 @@ simple form `CASE x WHEN v THEN r … END` compares an operand for equality per 
 way to substitute a default (`coalesce(nickname, name)`) or make an empty aggregate count as zero
 (`coalesce(sum(x), 0)`). `CASE` and `COALESCE` both evaluate lazily, left to right, exactly as far
 as needed — a `1/0` in an unreached branch or argument never runs — and the branch/argument types
-must unify to one common type (numerics promote; mixing, say, an integer and a text branch is an
-error).
+must unify to one common type (numerics promote, `f32` with `f64` is `f64`, and identical types of
+any kind — `jsonb`, ranges, arrays, composites — always unify; mixing, say, an integer and a text
+branch is an error). `UNION`/`INTERSECT`/`EXCEPT` and `VALUES` columns unify by the same rule; the
+deduplicating set operations (all but `UNION ALL`) also need an equality operator, so they reject a
+`json` or `jsonpath` column — use `jsonb`, or `UNION ALL`.
 
 `GREATEST(a, b, …)` / `LEAST(a, b, …)` are the variadic maximum / minimum — handy to clamp a value
 (`least(price, 10.00)`) or take a row-wise max across columns. `NULL` arguments are **ignored**

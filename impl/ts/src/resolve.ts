@@ -103,7 +103,6 @@ import {
   isTimestamptz,
   isUuid,
   promoteFloat,
-  rank,
   roundToWidth,
   scalarTypeFromName,
   typeIsText,
@@ -1646,6 +1645,13 @@ export function resolve(
         resultTypes.push({ kind: "null" });
       }
       const unified = unifyCaseTypes(resultTypes, "CASE result types must be compatible");
+      // A mixed-width float CASE is f64: widen the f32 arms (an ordinary cast, like GREATEST).
+      if (unified.kind === "float") {
+        arms.forEach((arm, i) => {
+          arm.result = widenTo(arm.result, resultTypes[i]!, unified.ty);
+        });
+        els = widenTo(els, resultTypes[resultTypes.length - 1]!, unified.ty);
+      }
       // A bare parameter in a result arm takes the unified scalar type. The first pass had no
       // result context, so it recorded the occurrence as unresolved; feed the common type back
       // before statement-wide parameter finalization (api.md §5, grammar.md §23).
@@ -1676,6 +1682,12 @@ export function resolve(
         argTypes.push(ra.type);
       }
       const unified = unifyCaseTypes(argTypes, "COALESCE types must be compatible");
+      // A mixed-width float COALESCE is f64: widen the f32 arguments (as CASE).
+      if (unified.kind === "float") {
+        args.forEach((a, i) => {
+          args[i] = widenTo(a, argTypes[i]!, unified.ty);
+        });
+      }
       // A bare parameter argument takes COALESCE's unified scalar type. Each argument was initially
       // resolved without sibling context, so record the derived type now.
       const hint = scalarForParamHint(unified);
@@ -1702,35 +1714,7 @@ export function resolve(
       const name = e.greatest ? "greatest" : "least";
       const resolved = e.args.map((a) => resolve(scope, a, null, ag, params));
       const types = resolved.map((r) => r.type);
-      const nonNull = types.filter((t) => t.kind !== "null");
-      let unified: ResolvedType;
-      if (nonNull.length === 0) {
-        unified = { kind: "text" };
-      } else if (nonNull.every((t) => t.kind === "int" || t.kind === "decimal")) {
-        if (nonNull.some((t) => t.kind === "decimal")) {
-          unified = { kind: "decimal" };
-        } else {
-          let ty = (nonNull[0] as { kind: "int"; ty: ScalarType }).ty;
-          for (const t of nonNull.slice(1)) {
-            const next = (t as { kind: "int"; ty: ScalarType }).ty;
-            if (rank(next) > rank(ty)) ty = next;
-          }
-          unified = { kind: "int", ty };
-        }
-      } else if (nonNull.every((t) => t.kind === "float")) {
-        let ty = (nonNull[0] as { kind: "float"; ty: ScalarType }).ty;
-        for (const t of nonNull.slice(1)) {
-          ty = promoteFloat(ty, (t as { kind: "float"; ty: ScalarType }).ty);
-        }
-        unified = { kind: "float", ty };
-      } else {
-        unified = nonNull[0]!;
-        for (const t of nonNull.slice(1)) {
-          if (!resolvedTypeEqual(unified, t)) {
-            throw typeError(`${name.toUpperCase()} types must be compatible`);
-          }
-        }
-      }
+      const unified = unifyCaseTypes(types, `${name.toUpperCase()} types must be compatible`);
       classifyComparable(unified, unified);
       // A bare parameter takes the unified scalar type (like CASE/COALESCE — grammar.md §42).
       const hint = scalarForParamHint(unified);
@@ -1740,9 +1724,7 @@ export function resolve(
       // A mixed-width float set unifies to f64; widen the f32 arguments (an ordinary cast, whose
       // cost stays observable) so the comparator sees one width.
       const args = resolved.map((r) =>
-        unified.kind === "float" && r.type.kind === "float"
-          ? widenFloatTo(r.node, r.type.ty, unified.ty)
-          : r.node,
+        unified.kind === "float" ? widenTo(r.node, r.type, unified.ty) : r.node,
       );
       // Text arguments derive one comparison collation (42P21/42P22 on conflict — §52).
       let collation: Collation | null = null;
@@ -3197,4 +3179,11 @@ export function minScaleOf(d: Decimal): number {
   let t = d.scale;
   while (t > 0 && d.roundToScale(t - 1).cmpValue(d) === 0) t--;
   return t;
+}
+
+// widenTo widens a float-typed node to the unified float width (an ordinary cast, whose cost stays
+// observable) — how CASE / COALESCE / GREATEST / LEAST widen a mixed-width float set to its unified
+// f64. A non-float node (a NULL arm) is returned unchanged.
+function widenTo(node: RExpr, t: ResolvedType, to: ScalarType): RExpr {
+  return t.kind === "float" ? widenFloatTo(node, t.ty, to) : node;
 }

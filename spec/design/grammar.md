@@ -1240,14 +1240,16 @@ two forms and is the **first deliberately lazy** expression in the engine.
   no-short-circuit cost rule ([cost.md](cost.md) §3), and it stays deterministic because the
   order is fixed.
 - **Result-arm type unification.** The `THEN` results and the `ELSE` (or NULL for an implicit
-  ELSE) unify to one **common type** — the CASE's output type. The rule: NULL-typed arms are
-  dropped (they adapt); an **all-NULL CASE is `text`** (PostgreSQL — verified against the live
-  oracle); the remaining arms must share a family — all numeric unify to `decimal` if any is
-  decimal else the widest integer (the promotion tower), and a numeric integer result widens to
-  decimal at eval when the common type is decimal (so `CASE WHEN c THEN 1 ELSE 1.5 END` renders
-  `1` / `1.5`); a non-numeric family (text/boolean/bytea) must be homogeneous. A **cross-family**
-  mix — e.g. an integer `THEN` and a text `ELSE` — is **`42804`** ("CASE types … cannot be
-  matched"). Bare integer-literal arms keep their natural width (defaulting to i64), so width
+  ELSE) unify to one **common type** — the CASE's output type — by folding the **common-type rule
+  of §25** (the same function set operations and `VALUES` use). NULL-typed arms are dropped (they
+  adapt); an **all-NULL CASE is `text`** (PostgreSQL — verified against the live oracle); numerics
+  promote (decimal if any arm is decimal, else the widest integer), and an integer result widens
+  to decimal at eval when the common type is decimal (so `CASE WHEN c THEN 1 ELSE 1.5 END` renders
+  `1` / `1.5`); mixed float widths unify to `f64`, each `f32` arm wrapped in an ordinary `f32 →
+  f64` cast (as `GREATEST`, §52); any other arms must be **identical types** — and identical types
+  always unify (`json`, `jsonpath`, ranges, arrays, composites, …). A pair with no common type —
+  e.g. an integer `THEN` and a text `ELSE`, or `i32range` and `i64range` — is **`42804`** ("CASE
+  types … cannot be matched"). Bare integer-literal arms keep their natural width (defaulting to i64), so width
   differences from PostgreSQL are unobservable (every integer renders under the `I` tag). A bare
   `$N` result arm adopts the unified scalar result type before parameters are bound (§5).
 - **Cost** ([cost.md](cost.md) §3): one `operator_eval` for the CASE node, plus the
@@ -1345,22 +1347,58 @@ operands. The output column **names** are the left operand's (the right operand'
 aliases are discarded). For a chain, "left" is the leftmost `SELECT` — names propagate up the
 left spine.
 
-**Column types — unified per position, full PG fidelity.** Each output column's type is the
-fold of the operands' types at that position ([cost.md](cost.md) §3 records the same lattice as a
-cross-core contract):
+**Column types — unified per position, the ONE common-type rule.** Each output column's type is the
+fold of the operands' types at that position under a single pairwise **common-type** rule. The same
+rule — the same per-core function — also unifies a `VALUES`-body column across rows (§42), a `CASE`'s
+result arms (§23), and a `COALESCE`/`GREATEST`/`LEAST` argument list (§51/§52), so the constructs
+cannot drift apart. The pair `(X, Y)` unifies to:
 
-- integer widths **promote** to the widest (`i16` < `i32` < `i64`);
-- integer and `decimal` unify to **`decimal`** (oracle: `int2 ∪ int4` → `integer`, `int4 ∪ int8`
-  → `bigint`, `int ∪ numeric` → `numeric`);
-- a column that is **`NULL`-typed in every operand** unifies to **`text`** (PostgreSQL's
-  unknown-literal resolution — oracle: `(SELECT NULL) UNION (SELECT NULL)` → `text`); a `NULL`
-  type alongside any concrete type takes the concrete type;
-- otherwise the operands must share a base type (`text`/`boolean`/`bytea`/`uuid`/`timestamp`/
-  `timestamptz`), giving that type;
+- **`Y` when `X` is `NULL`-typed** (and vice versa): a `NULL` alongside a concrete type takes the
+  concrete type;
+- integer widths **promoted** to the widest (`i16` < `i32` < `i64`), and integer with `decimal` →
+  **`decimal`** (oracle: `int2 ∪ int4` → `integer`, `int4 ∪ int8` → `bigint`, `int ∪ numeric` →
+  `numeric`);
+- float widths **promoted** to the widest: `f32 ∪ f64` → **`f64`** (oracle: `float4 ∪ float8` →
+  `double precision`). Float never meets integer/`decimal` — that pair stays `42804`, the float
+  island ([float.md](float.md) §6; PostgreSQL would promote to `double precision`);
+- two **arrays** element-wise, when their elements differ **only in integer width** (`i32[] ∪
+  i64[]` → `i64[]`, a value no-op);
+- otherwise **the type itself, when `X` and `Y` are identical** — structurally equal: the same
+  scalar, the same element for an array/range, the same named composite (or the same anonymous
+  shape). **Identical types always unify, whatever the family**: `json`, `jsonb`, `jsonpath`,
+  `date`, `interval`, `f32`, arrays (`json[]` included), every range, every composite (oracle: each
+  such pair is accepted by PostgreSQL in `VALUES`, `UNION ALL`, `CASE`, and `COALESCE`);
 - any other pairing is **`42804`** (PostgreSQL: "UNION types `X` and `Y` cannot be matched").
+  `json ∪ jsonb`, `i32range ∪ i64range`, `i32[] ∪ text[]`, two different named composites, and a
+  named composite with an anonymous `ROW(…)` are all `42804` — PostgreSQL rejects each too, as
+  `42846` "could not convert type" for the same-category pairs (jed's standing `42804` convention for
+  an unconvertible pair — types.md §9).
 
-When the unified type is `decimal`, an integer operand's **values are converted** to `decimal`
-(scale 0) *before* rows are matched — this is load-bearing for correctness, not just for the
+A column that is **`NULL`-typed in every operand** stays untyped in a set operation (PostgreSQL
+resolves it to `text` — the type is not observed in output, see `setops/types.test`); an all-`NULL`
+`CASE`/`COALESCE`/`GREATEST`/`LEAST` is `text`.
+
+**Deliberate narrowing — element-wise array widening that rewrites elements.** PostgreSQL unifies
+array element types by its full coercion lattice (`int[] ∪ numeric[]` → `numeric[]`, `float4[] ∪
+float8[]` → `float8[]`). jed unifies array elements only across integer widths, the one widening
+that leaves every element value untouched; a pair whose unification would convert each element
+(int → `decimal`, `f32` → `f64`, inside an array or a composite field) is `42804` — deferred, not
+foreclosed (recorded in the override ledger). Likewise an anonymous `ROW(…)` unifies only with an
+identically-shaped anonymous `ROW(…)` (PostgreSQL types every anonymous record as `record`).
+
+**Matching needs equality.** Unifying is not matching: every set operation except `UNION ALL` —
+`UNION`, `INTERSECT`, `EXCEPT`, `INTERSECT ALL`, `EXCEPT ALL`, and a `UNION` recursive CTE
+([recursive-cte.md](recursive-cte.md)) — compares rows, so each unified column type must have an
+**equality operator**. `json` and `jsonpath` have none (PostgreSQL ships no btree/hash operator class
+— [json.md](json.md) §5), nor does an array or composite that contains one, so such a column is
+**`42883`** ("could not identify an equality operator for type json" — PostgreSQL's code and
+wording), decided by the comparability matrix. `UNION ALL`, `VALUES`, `CASE`, and `COALESCE` never
+compare, so `json` flows through them freely.
+
+**Value conversion.** When the unified type is `decimal`, an integer operand's **values are
+converted** to `decimal` (scale 0), and when it is `f64` an `f32` operand's values are widened
+exactly to `f64` (oracle: `SELECT 1.1::float4 UNION ALL SELECT 2.5::float8` → `1.100000023841858`)
+— both *before* rows are matched — this is load-bearing for correctness, not just for the
 output type tag: the engine's row identity keys an `int` and a `decimal` value distinctly, so
 without the conversion `SELECT 1 … INTERSECT SELECT 1.0 …` would wrongly find no match. Each
 value keeps its **own** display scale (unconstrained `numeric`, the per-value model of
@@ -2294,11 +2332,12 @@ always-inlined single-reference CTE — so the alias rules, the column-rename li
 - **Shape and column typing.** Every row must have the **same arity** (`42601`,
   `VALUES lists must all be the same length` — the §12 rule). The relation has one column per value;
   its **default names are `column1`, `column2`, …** (PostgreSQL), overridable by the alias's
-  column-rename list. Each **column's type unifies across the rows** exactly like a set operation
-  (§25): `int`-widths widen, `int`+`decimal` → `decimal`, anything + `NULL` keeps the other, an
-  all-`NULL` column is `text` (unknown→text); an incompatible pair is **`42804`**
-  (`datatype_mismatch`). The unified column type then coerces each row's value (the only runtime
-  change is `int`→`decimal`, as for a set operation).
+  column-rename list. Each **column's type unifies across the rows** by the set operation's
+  common-type rule (§25): `int`-widths widen, `int`+`decimal` → `decimal`, `f32`+`f64` → `f64`,
+  anything + `NULL` keeps the other, identical types always unify (`jsonb`, `json`, ranges,
+  arrays, composites, …), an all-`NULL` column is `text` (unknown→text); a pair with no common type
+  is **`42804`** (`datatype_mismatch`). The unified column type then coerces each row's value (the
+  only runtime changes are `int`→`decimal` and `f32`→`f64`, as for a set operation).
 - **No trailing `ORDER BY` / `LIMIT` on the body (a deferred narrowing).** `(VALUES … ORDER BY 1)` is
   `42601` (a leftover token). Order/limit the *outer* query instead (`FROM (VALUES …) v ORDER BY x`).
   A documented PG divergence (PG accepts a VALUES query's trailing clauses), recorded in the override
@@ -2731,11 +2770,12 @@ SELECT COALESCE(a, 1 / a) FROM t                          -- a ≠ NULL ⇒ 1/a 
   value, which is returned; later arguments are **never evaluated** — `COALESCE(1, 1/0)` is `1`,
   no `22012` — and each evaluated argument is evaluated exactly once. Required by PostgreSQL
   semantics, deterministic because the order is fixed.
-- **Argument type unification — exactly CASE's result-arm rule** (§23). NULL-typed arguments
-  are dropped (they adapt); an **all-NULL COALESCE is `text`**; the rest must share a family —
+- **Argument type unification — exactly CASE's result-arm rule** (§23, the §25 common-type
+  fold). NULL-typed arguments are dropped (they adapt); an **all-NULL COALESCE is `text`**;
   numerics promote (decimal if any arm is decimal, else the widest integer; an integer result
-  widens to decimal at eval when the common type is decimal), a non-numeric family must be
-  homogeneous. A cross-family mix is **`42804`** (`COALESCE types must be compatible`). A bare
+  widens to decimal at eval when the common type is decimal), mixed float widths widen to `f64`,
+  and any other arguments must be identical types. A pair with no common type is **`42804`**
+  (`COALESCE types must be compatible`). A bare
   `$N` argument adopts the unified scalar result type before parameters are bound (§5).
 - **Where it is legal**: anywhere an expression is — projections, `WHERE`, `GROUP BY`/`HAVING`,
   `ORDER BY`, `CHECK` constraints, expression `DEFAULT`s, and **index expressions**
@@ -2778,15 +2818,15 @@ SELECT GREATEST(low, NULL, high)                 -- NULLs are skipped; = GREATES
   be, to be compared): `GREATEST(1, 1/0)` **traps `22012`**, unlike the lazy `COALESCE(1, 1/0)`.
   So `GREATEST`/`LEAST` are *not* on the sanctioned short-circuit list; they are eager like an
   ordinary scalar function.
-- **Argument type unification — CASE's result-arm rule, plus an orderability gate.** NULL-typed
-  arguments are dropped; an **all-NULL `GREATEST`/`LEAST` is `text`** (PostgreSQL's all-unknown
-  rule); the rest unify to one common type — numerics promote (decimal if any argument is decimal,
-  else the widest integer; an integer winner widens to decimal at eval), **float widths promote to
-  the widest** (the mixed-width `f32`/`f64` set widens to `f64` so the comparator sees one width),
-  and any other family must be **structurally equal** (same element type for `array`/`range`, same
-  shape for `composite`). This is like CASE (§23) but is **not** the CASE unifier: because the fold
-  compares its winner, the common type must actually be **orderable**, so the resolved type is
-  gated through the comparability matrix — a **non-orderable** type (`json`/`jsonpath`, which ship
+- **Argument type unification — CASE's result-arm rule, plus an orderability gate.** The
+  arguments unify by exactly CASE's fold of the §25 common-type rule: NULL-typed arguments are
+  dropped; an **all-NULL `GREATEST`/`LEAST` is `text`** (PostgreSQL's all-unknown rule); numerics
+  promote (decimal if any argument is decimal, else the widest integer; an integer winner widens
+  to decimal at eval), **float widths promote to the widest** (the mixed-width `f32`/`f64` set
+  widens to `f64` so the comparator sees one width), arrays unify across element integer widths,
+  and any other family must be **identical** (same element type for `range`, same shape for
+  `composite`). Because the fold compares its winner, the common type must additionally be
+  **orderable**, so the resolved type is gated through the comparability matrix — a **non-orderable** type (`json`/`jsonpath`, which ship
   no ordering operator) is **`42883`**, and a cross-family or structurally-mismatched pair
   (including `i32range` × `i64range`, or `float` × `int`/`decimal` — the float island) is
   **`42804`** (`GREATEST/LEAST types must be compatible`). The winner is the max (`GREATEST`) or
