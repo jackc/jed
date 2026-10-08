@@ -21,7 +21,7 @@
 //     transaction rollback.
 
 import { DEFAULT_SCALAR_BYTES } from "./costs.ts";
-import { engineError } from "./errors.ts";
+import { EngineError, engineError } from "./errors.ts";
 import { rowBytes, rowBytesMasked, valueBytes } from "./memsize.ts";
 import type { Value } from "./value.ts";
 
@@ -31,7 +31,7 @@ import type { Value } from "./value.ts";
 export const queryMemoryUnderflows = { count: 0 };
 
 // queryMemoryPeak is the highest balance any account has reached since the conformance harness last
-// reset it — the minimal passing maxQueryMemoryBytes of the record just run (memory.md §6).
+// reset it — the minimal passing maxQueryMemoryBytes of the record just run (memory.md §7).
 export const queryMemoryPeak = { value: 0 };
 
 // QueryAccount is a statement's live query-memory account (spec/design/memory.md §2): the running
@@ -93,6 +93,54 @@ export class QueryAccount {
     let n = 0;
     for (let i = 0; i < rows.length; i++) n += rowBytes(rows[i]!);
     return n;
+  }
+}
+
+// StateCharge is the query-memory charge an operator-state structure holds (spec/design/memory.md §6):
+// the bytes it has reserved against the statement's account and not yet returned. It is released
+// explicitly at the structure's spec'd release point (TS has no destructors, so every owner names that
+// point). Inert (and free) when the account is unlimited.
+export class StateCharge {
+  readonly acct: QueryAccount;
+  held = 0;
+
+  constructor(acct: QueryAccount = UNLIMITED_QUERY_ACCOUNT) {
+    this.acct = acct;
+  }
+
+  // active reports whether the account has a finite budget — callers skip measuring otherwise.
+  active(): boolean {
+    return this.acct.limit > 0;
+  }
+
+  // reserve reserves bytes through meter, so a rejection consults the cost guard first (memory.md §6.7).
+  reserve(meter: Meter, bytes: number): void {
+    if (this.acct.limit <= 0) return;
+    meter.reserveQuery(bytes);
+    this.held += bytes;
+  }
+
+  // reserveDirect reserves bytes straight against the account, for a structure with no meter in reach;
+  // the caller wraps the operation in Meter.costFirst (memory.md §6.7).
+  reserveDirect(bytes: number): void {
+    if (this.acct.limit <= 0) return;
+    this.acct.reserve(bytes);
+    this.held += bytes;
+  }
+
+  // release returns bytes of this structure's charge.
+  release(bytes: number): void {
+    if (this.acct.limit <= 0) return;
+    this.acct.release(bytes);
+    this.held -= bytes;
+  }
+
+  // releaseAll returns everything this structure still holds.
+  releaseAll(): void {
+    if (this.held !== 0) {
+      this.acct.release(this.held);
+      this.held = 0;
+    }
   }
 }
 
@@ -173,6 +221,22 @@ export class Meter {
   // releaseQuery returns bytes of live query memory; never throws, never below zero.
   releaseQuery(bytes: number): void {
     this.query.release(bytes);
+  }
+  // costFirst runs `fn` — work that reserves without this meter (a spill structure, sorter, or top-k
+  // heap reserving through its StateCharge, memory.md §6.7) — and applies the cost-wins rule to a 54P05
+  // it raises: the cost guard is consulted first, so a step that already reached a cost ceiling reports
+  // the cost error. Sound at any point on the error's way out, because accrued cost only grows.
+  costFirst<T>(fn: () => T): T {
+    try {
+      return fn();
+    } catch (e) {
+      if (e instanceof EngineError && e.state === "query_memory_limit_exceeded") this.guard();
+      throw e;
+    }
+  }
+  // stateCharge is a fresh operator-state charge against this statement's account (memory.md §6).
+  stateCharge(): StateCharge {
+    return new StateCharge(this.query);
   }
   // admitRow admits a projected row appended to a row buffer (memory.md §5.1).
   admitRow(row: Value[]): void {

@@ -45,13 +45,17 @@ Two scope refinements, both mirroring the buffer pool ([pager.md](pager.md) §1)
   tree resident. The spill path is for **file-backed** databases. (The conformance harness's
   default in-memory handle therefore never spills, which is why this whole subsystem is
   result/cost-invariant for the corpus — [§6](#6-determinism--cost-invariance).)
-- **The budget bounds one operator, deterministically by a cheap estimate.** A row's memory is
-  estimated by a per-value size estimate (a fixed base per value plus its variable payload —
-  text/bytea length, decimal digit groups), summed over the row. The estimate need not be the
-  exact heap footprint: it only decides *spill timing*, which is invisible to results and cost
-  ([§6](#6-determinism--cost-invariance)), so a cheap deterministic estimate is enough. The
-  default budget (`DEFAULT_WORK_MEM = 256 MiB`, matching the buffer-pool default) is sized so a
-  RAM-sized sort stays fully in memory; a host bounds a hostile/large sort by lowering it.
+- **The budget bounds one operator, deterministically by the logical size schedule.** A row's
+  resident memory is its `row_bytes` from the shared query-memory schedule
+  ([memory.md](memory.md) §3/§6.6 — a fixed base per row and value plus the variable payload:
+  text/bytea length, decimal digit groups, container elements), a state-map entry
+  `ENTRY + key + value`. It is not the exact heap footprint; spill *timing* stays invisible to
+  results and cost ([§6](#6-determinism--cost-invariance)), but because every core measures the
+  same logical bytes, every core spills at the same input row — which keeps the query-memory
+  charge of spill structures (charged on the same measure) cross-core identical. Rows enter a
+  sorter or spill structure with their untouched slots NULLed. The default budget
+  (`DEFAULT_WORK_MEM = 256 MiB`, matching the buffer-pool default) is sized so a RAM-sized sort
+  stays fully in memory; a host bounds a hostile/large sort by lowering it.
 
 ## 3. The budget API
 
@@ -270,11 +274,12 @@ Sequenced so the canonical operator lands first on a frozen budget seam:
 Remaining allocation owners are explicit. Upstream materialized CTE/derived/SRF/index
 producers, the window stage's buffer, and materialized host results are row buffers
 charged by the query-memory account (`max_query_memory_bytes`, [memory.md](memory.md)
-§5, slice Q1). Operator state — spools, hash tables, sorter buffers, accumulator
-collections — is slice Q2, and pending writes slice Q3; until those land, operator
-spilling does not imply that arbitrary SQL has a whole-query memory bound. Spools are
-charged only by `work_mem`: rows a materialized relation hands to a spool leave the
-query-memory account as they enter it.
+§5, slice Q1). Operator state — spools, state maps, hash row tables, sorter runs, top-k
+heaps, accumulator collections — is charged by the same account (slice Q2,
+[memory.md](memory.md) §6): each structure charges its resident elements and releases them
+as it spills, so a spilling operator's charge stays within `work_mem` plus one element.
+Rows a materialized relation hands to a spool leave the row account and enter the spool's
+charge. Pending writes (slice Q3) remain outside the account.
 
 A later refinement, also not foreclosed: routing the spill files through a host **storage seam**
 abstraction (storage.md §2) so the browser/OPFS host spills too, rather than the direct stdlib

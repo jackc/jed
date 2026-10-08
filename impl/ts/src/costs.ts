@@ -13,6 +13,7 @@ export const MEMORY_ROW = 32;
 export const MEMORY_VALUE = 32;
 export const MEMORY_ARRAY_DIM = 16;
 export const MEMORY_DECIMAL_GROUP = 4;
+export const MEMORY_ENTRY = 32;
 
 // The deterministic cost-unit weights, mirroring spec/cost/schedule.toml. Weights are
 // bigint for i64 parity with the Rust/Go cores (a number is f64 — CLAUDE.md §8).

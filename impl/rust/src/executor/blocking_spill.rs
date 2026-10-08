@@ -18,11 +18,45 @@ impl Engine {
         store.is_file_backed()
             && !crate::format::any_spillable_masked(store.col_types(), &plan.rel_masks[0])
     }
+    // Every spill structure charges its resident elements to the statement's query-memory account
+    // (memory.md §6.6) and returns them on spill or when discarded — a spool or map feeding a stage is
+    // discarded (dropped) when that stage completes.
     fn blocking_spool(&self) -> RowSpool {
-        RowSpool::new(self.session.work_mem, self.spill_dir.clone().unwrap())
+        RowSpool::new(
+            self.session.work_mem,
+            self.spill_dir.clone().unwrap(),
+            crate::cost::StateCharge::new(self.session.query_account()),
+        )
     }
     fn blocking_map(&self) -> StateMap {
-        StateMap::new(self.session.work_mem, self.spill_dir.clone().unwrap())
+        StateMap::new(
+            self.session.work_mem,
+            self.spill_dir.clone().unwrap(),
+            crate::cost::StateCharge::new(self.session.query_account()),
+        )
+    }
+    fn blocking_hash_rows(&self) -> HashRows {
+        HashRows::new(
+            self.session.work_mem,
+            self.spill_dir.clone().unwrap(),
+            crate::cost::StateCharge::new(self.session.query_account()),
+        )
+    }
+    /// Spool a materialized relation's rows: they leave the Q1 row account and enter spool residency
+    /// with their untouched slots NULLed (memory.md §5.3/§6.1).
+    fn spool_materialized(
+        &self,
+        rows: Vec<Row>,
+        mask: &[bool],
+        meter: &mut Meter,
+    ) -> Result<RowSpool> {
+        meter.release_rows_masked(&rows, mask);
+        let mut spool = self.blocking_spool();
+        for mut row in rows {
+            super::exec_scan::null_untouched(&mut row, mask);
+            spool.push(row)?;
+        }
+        Ok(spool)
     }
 
     pub(crate) fn blocking_spill_eligible(&self, plan: &SelectPlan) -> bool {
@@ -60,13 +94,10 @@ impl Engine {
                 env.ctes,
                 meter,
             )?;
-            // Spool residency is operator state bounded by work_mem (memory.md §4 Q2): the rows leave
+            // Spool residency is operator state bounded by work_mem (memory.md §6.6): the rows leave
             // the query-memory row account as they enter the spool.
-            meter.release_rows_masked(&rows, &plan.rel_masks[ri]);
-            for row in rows {
-                out.push(row)?;
-            }
-            return Ok(out);
+            drop(out);
+            return self.spool_materialized(rows, &plan.rel_masks[ri], meter);
         }
         let store = self.store_scoped(rel.db.as_deref(), &rel.table_name);
         let bound = match &plan.phys.rel_bounds[ri] {
@@ -110,7 +141,19 @@ impl Engine {
         Ok(out)
     }
 
+    /// The bounded-spill lane. Its spill structures reserve without the meter in reach, so a rejected
+    /// reservation is passed through [`Meter::cost_first`] here (memory.md §6.7).
     pub(crate) fn exec_blocking_spill(
+        &self,
+        plan: &SelectPlan,
+        env: &EvalEnv,
+        meter: &mut Meter,
+    ) -> Result<Emitter> {
+        let result = self.exec_blocking_spill_lane(plan, env, meter);
+        meter.cost_first(result)
+    }
+
+    fn exec_blocking_spill_lane(
         &self,
         plan: &SelectPlan,
         env: &EvalEnv,
@@ -386,12 +429,8 @@ impl Engine {
                         plan, inner, env.params, env.outer, &left, env.rng, env.ctes, meter,
                     )?;
                     rel_work[inner] += meter.accrued - before;
-                    meter.release_rows_masked(&generated, &plan.rel_masks[inner]);
-                    let mut spool = self.blocking_spool();
-                    for row in generated {
-                        spool.push(row)?;
-                    }
-                    spool.into_reader()?
+                    self.spool_materialized(generated, &plan.rel_masks[inner], meter)?
+                        .into_reader()?
                 } else if let Some(table) = &table {
                     table.probe(&left, meter)?.into_reader()?
                 } else {
@@ -589,12 +628,8 @@ impl Engine {
                             plan, inner, env.params, &outer, &left, env.rng, env.ctes, meter,
                         )?;
                         rel_work[inner] += meter.accrued - before;
-                        meter.release_rows_masked(&generated, &plan.rel_masks[inner]);
-                        let mut spool = self.blocking_spool();
-                        for row in generated {
-                            spool.push(row)?;
-                        }
-                        spool.into_reader()?
+                        self.spool_materialized(generated, &plan.rel_masks[inner], meter)?
+                            .into_reader()?
                     } else if let Some(table) = &table {
                         table.probe(&left, meter)?.into_reader()?
                     } else {
@@ -685,8 +720,7 @@ impl Engine {
             let mut keys = self.blocking_spool();
             let mut seen = self.blocking_map();
             let mut unique = self.blocking_map();
-            let mut collections =
-                HashRows::new(self.session.work_mem, self.spill_dir.clone().unwrap());
+            let mut collections = self.blocking_hash_rows();
             let fresh = |ordinal: usize| -> Row {
                 let mut state = vec![Value::Int(ordinal as i64)];
                 state.extend(
@@ -1159,6 +1193,7 @@ struct SpillHashTable {
     types: Vec<Type>,
     budget: usize,
     dir: std::path::PathBuf,
+    acct: crate::cost::QueryAccount,
 }
 impl SpillHashTable {
     fn build(
@@ -1174,7 +1209,7 @@ impl SpillHashTable {
         let types: Vec<&Type> = hash.keys.iter().map(|k| &k.ty).collect();
         let dir = engine.spill_dir.clone().unwrap();
         let budget = engine.session.work_mem;
-        let mut entries = HashRows::new(budget, dir.clone());
+        let mut entries = engine.blocking_hash_rows();
         let mut build = rows.reader()?;
         while let Some(row) = build.next()? {
             if let Some(key) =
@@ -1192,10 +1227,15 @@ impl SpillHashTable {
             types: hash.keys.iter().map(|k| k.ty.clone()).collect(),
             budget,
             dir,
+            acct: engine.session.query_account(),
         })
     }
     fn probe(&self, left: &Row, meter: &mut Meter) -> Result<RowSpool> {
-        let mut matches = RowSpool::new(self.budget, self.dir.clone());
+        let mut matches = RowSpool::new(
+            self.budget,
+            self.dir.clone(),
+            crate::cost::StateCharge::new(self.acct.clone()),
+        );
         if let Some(key) = hash_join_row_key(
             left,
             &self.left_indices,
@@ -1324,7 +1364,7 @@ mod tests {
         };
         let hash = hash_join_fnv1a(&key(2));
         let dir = std::env::temp_dir();
-        let mut entries = HashRows::new(1, dir.clone());
+        let mut entries = HashRows::new(1, dir.clone(), crate::cost::StateCharge::default());
         // Force distinct complete keys into the same full-hash bucket; a one-byte budget means
         // every record is backed by scratch, including the duplicate matches for one hot key.
         for (n, ordinal) in [(1, 10), (2, 20), (2, 21)] {
@@ -1344,6 +1384,7 @@ mod tests {
             types: vec![ty],
             budget: 1,
             dir,
+            acct: crate::cost::QueryAccount::default(),
         };
         let mut meter = Meter::new();
         let mut matches = table

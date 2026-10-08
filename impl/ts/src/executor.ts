@@ -97,7 +97,7 @@ import {
   colTypeScalar,
   resolveColType,
 } from "./catalog.ts";
-import { Meter, type QueryAccount } from "./cost.ts";
+import { Meter, type QueryAccount, StateCharge } from "./cost.ts";
 import { optimizeSelect } from "./optimize.ts";
 import {
   type Collation,
@@ -108,8 +108,16 @@ import {
   serializeTable,
   sortKey as collationSortKey,
 } from "./collation.ts";
-import { COSTS } from "./costs.ts";
-import { rowBytes, rowBytesMasked } from "./memsize.ts";
+import { COSTS, MEMORY_ENTRY, MEMORY_ROW, MEMORY_VALUE } from "./costs.ts";
+import {
+  entryBytes,
+  entryBytesAt,
+  keyBytes,
+  rowBytes,
+  rowBytesMasked,
+  utf8Length,
+  valueBytes,
+} from "./memsize.ts";
 import { collectColumnStatistics, type ColumnStatistics } from "./statistics.ts";
 import {
   andSelectivity,
@@ -212,7 +220,7 @@ import {
 } from "./parser.ts";
 import { type KeyBound, type PNode, colAt, compareBytes, unboundedBound } from "./pmap.ts";
 import { type RowCompare, SortedRows, type SpillSink, Sorter } from "./spill.ts";
-import { RowSpool, SpillMap, SpillMultiMap, SpillSet, SpoolSorter, sortSpool } from "./blocking.ts";
+import { RowSpool, SpillMap, SpillMultiMap, SpillSet, SpoolSorter } from "./blocking.ts";
 import { type Entry, type Row, TableStore } from "./storage.ts";
 import {
   type DecimalTypmod,
@@ -560,7 +568,16 @@ export type Emitter = {
   cols?: Value[][];
   projCols?: number[];
   sel?: number[];
+  // The gathered lanes' query-memory charge (memory.md §6.5), returned when the emission completes.
+  columnarCharge?: StateCharge;
 };
+
+// nullUntouched is a copy of `row` with each untouched slot (!mask[i]) replaced by NULL, so a row
+// entering sort or spill state holds only what the plan reads and measures in full
+// (spec/design/memory.md §6.1). Slots past the mask (appended values) are kept.
+export function nullUntouched(row: Row, mask: boolean[]): Row {
+  return row.map((value, i) => (i < mask.length && !mask[i] ? nullValue() : value));
+}
 
 // rebaseRowsMasked re-measures a charged projected result that becomes relation rows under the
 // relation's touched mask (memory.md §5.2): the masked measure never exceeds the full one, so this only
@@ -11724,12 +11741,16 @@ export class Engine {
 
     // For UNION (distinct) a seen set drops rows duplicating any already-emitted row, keyed by the
     // NULL-safe distinctRowKey the set operators use.
+    // The UNION dedup set is operator state (memory.md §6.2): an entry per kept row, reserved before
+    // its result copy, returned when the recursive CTE completes.
     const seen = new Set<string>();
+    const seenCharge = new StateCharge(acct);
     const keep = (row: Row): boolean => {
       if (rt.unionAll) return true;
       const k = distinctRowKey(row);
       if (seen.has(k)) return false;
       seen.add(k);
+      if (seenCharge.active()) seenCharge.reserveDirect(entryBytes(row));
       return true;
     };
     const result: Row[] = [];
@@ -11782,6 +11803,7 @@ export class Engine {
       }
     }
     for (const buf of rhsBuffers) acct.release(acct.measureRows(buf));
+    seenCharge.releaseAll();
     return result;
   }
 
@@ -12145,7 +12167,7 @@ export class Engine {
     const coerced = acct.measureRows(left.rows) + acct.measureRows(right.rows);
     acct.reserve(coerced - beforeCoerce);
 
-    let rows = combineSetop(plan.op, plan.all, left.rows, right.rows);
+    let rows = combineSetop(plan.op, plan.all, left.rows, right.rows, acct);
     acct.release(coerced - acct.measureRows(rows));
     const cost = left.cost + right.cost;
     const rootNode =
@@ -14534,7 +14556,7 @@ export class Engine {
     // first (scan-order) occurrence, then the LIMIT/OFFSET window the DISTINCT rows. The sort is
     // elided; the projection is charged per scanned filtered row (the §3 asymmetry).
     const distinct = plan.distinct;
-    const seen = new SpillSet(this.session.workMem, this.spillSink);
+    const seen = new SpillSet(this.session.workMem, this.spillSink, meter.stateCharge());
     try {
     let passed = 0n;
     const processRow = (rawRow: Row, guarded: boolean): boolean => {
@@ -14556,8 +14578,8 @@ export class Engine {
           const tuple = plan.projections.map((p) => evalExpr(p, row, env, meter));
           distinctWork += meter.accrued - before;
           const key = distinctRowKey(tuple);
-          if (seen.has(key)) return true; // a duplicate of an already-emitted/seen value
-          seen.add(key);
+          // A duplicate of an already-emitted/seen value; a new one reserves its entry (memory.md §6.2).
+          if (!meter.costFirst(() => seen.insert(key, tuple))) return true;
           passed += 1n;
           if (passed <= offset) return true;
           meter.charge(COSTS.rowProduced);
@@ -14715,6 +14737,7 @@ export class Engine {
         }
       }
     }
+    seen.release(); // the scan ended (memory.md §6.2)
     const totalWork = meter.accrued - profileStart;
     const scanWork = totalWork - filterWork - distinctWork - outputWork;
     const scanNode = "Scan " + plan.rels[0]!.tableName;
@@ -15010,60 +15033,75 @@ export class Engine {
     // output) are identical to the Sorter path; the sort itself is unmetered like every sort (cost.md §3).
     let total: bigint;
     let sorted: Pick<SortedRows, "next" | "close">;
+    const mask = plan.relMasks[0]!;
     if (plan.order.some((k) => k.collation !== null)) {
       const rows: Row[] = [];
+      // The collated survivor buffer is sort state (memory.md §6.4).
+      const charge = meter.stateCharge();
       if (!empty) {
         // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
         store.scanRange(bound, (_key, rawRow) => {
           meter.guard();
           meter.charge(COSTS.storageRowRead);
-          const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
+          const row = store.resolveColumns(rawRow, mask);
           if (plan.filter !== null) {
             const before = meter.accrued;
             const keep = isTrue(evalExpr(plan.filter, row, env, meter));
             filterWork += meter.accrued - before;
             if (!keep) return true;
           }
-          rows.push(row);
+          const owned = nullUntouched(row, mask);
+          if (charge.active()) charge.reserve(meter, rowBytes(owned));
+          rows.push(owned);
           return true;
         });
       }
       total = BigInt(rows.length);
-      const retained = plan.phys.topK === null ? rows : topKRows(rows, plan.order, plan.phys.topK);
-      if (plan.phys.topK === null) sortRows(retained, plan.order);
-      sorted = new SortedRows(retained, null);
+      let retained = rows;
+      if (plan.phys.topK !== null) {
+        // The selection discards rows: release the buffer, re-reserve the kept rows.
+        charge.releaseAll();
+        retained = topKRows(rows, plan.order, plan.phys.topK);
+        if (charge.active()) for (const row of retained) charge.reserve(meter, rowBytes(row));
+      } else sortRows(retained, plan.order);
+      sorted = new SortedRows(retained, null, charge);
     } else {
       // Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits: every
       // in-range row is read (charging storageRowRead), its touched columns resolved (large-values.md
       // §14), the WHERE applied (charging operator_eval), and a survivor pushed into the sorter, which
       // spills when it exceeds the budget.
       const useTopK = plan.phys.topK !== null && this.streamingTopKFits(plan, plan.phys.topK);
-      const keeper = useTopK ? new TopKKeeper(plan.phys.topK!, plan.order, false) : null;
+      const keeper = useTopK
+        ? new TopKKeeper(plan.phys.topK!, plan.order, false).withCharge(meter.stateCharge())
+        : null;
       const sorter = useTopK ? null : this.newSorterFor(plan.order);
       let survivorCount = 0n;
       try {
-      if (!empty) {
-        // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
-        store.scanRange(bound, (_key, rawRow) => {
-          meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
-          meter.charge(COSTS.storageRowRead);
-          const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
-          if (plan.filter !== null) {
-            const before = meter.accrued;
-            const keep = isTrue(evalExpr(plan.filter, row, env, meter));
-            filterWork += meter.accrued - before;
-            if (!keep) return true;
-          }
-          survivorCount++;
-          if (keeper !== null) {
-            keeper.push(row.map((value, i) => (plan.relMasks[0]![i] ? value : nullValue())));
-          }
-          else sorter!.push(row);
-          return true; // never stop early — the sort must see every row
-        });
-      }
-      total = survivorCount;
-      sorted = keeper !== null ? new SortedRows(keeper.finish(), null) : sorter!.finish();
+        if (!empty) {
+          // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
+          store.scanRange(bound, (_key, rawRow) => {
+            meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+            meter.charge(COSTS.storageRowRead);
+            const row = store.resolveColumns(rawRow, mask);
+            if (plan.filter !== null) {
+              const before = meter.accrued;
+              const keep = isTrue(evalExpr(plan.filter, row, env, meter));
+              filterWork += meter.accrued - before;
+              if (!keep) return true;
+            }
+            survivorCount++;
+            // Sort state holds only the touched columns (memory.md §6.1); a structure reserving
+            // without the meter reports a reached cost ceiling first (§6.7).
+            const owned = nullUntouched(row, mask);
+            meter.costFirst(() => (keeper !== null ? keeper.push(owned) : sorter!.push(owned)));
+            return true; // never stop early — the sort must see every row
+          });
+        }
+        total = survivorCount;
+        if (keeper !== null) {
+          const kept = keeper.finishCharged();
+          sorted = new SortedRows(kept.rows, null, kept.charge);
+        } else sorted = sorter!.finish();
       } catch (error) {
         sorter?.close();
         throw error;
@@ -15201,6 +15239,7 @@ export class Engine {
           if (limit !== null && BigInt(out.length) >= limit) break outer;
         }
       }
+      hashTable?.release(); // the join step completed (memory.md §6.2)
     }
     // The join's relation buffers are consumed (memory.md §5.3).
     if (meter.queryMemoryActive()) {
@@ -15322,6 +15361,7 @@ export class Engine {
         }
       }
     }
+    hashTable?.release(); // the join step completed (memory.md §6.2)
     // The join's input buffers are consumed (memory.md §5.3).
     if (meter.queryMemoryActive()) {
       meter.releaseRowsMasked(inlRows, plan.relMasks[inner]!);
@@ -15381,6 +15421,7 @@ export class Engine {
   // when a spillSink is present — a durable host that can spill to disk sets one (the Node file host
   // uses an OS-temp FileSpillSink, independent of the database path); an in-memory or OPFS database
   // leaves it null and sorts fully resident (spill.md §2/§4).
+  // Its resident run is sort state charged to the statement's query-memory account (memory.md §6.4).
   private newSorterFor(order: OrderSlot[]): Sorter | SpoolSorter {
     const compare: RowCompare = (a, b) => {
       for (const k of order) {
@@ -15389,9 +15430,10 @@ export class Engine {
       }
       return 0;
     };
+    const charge = new StateCharge(this.session.queryAccount);
     if (this.session.workMem > 0 && this.spillSink?.createScratch !== undefined)
-      return new SpoolSorter(compare, this.session.workMem, this.spillSink);
-    return new Sorter(compare, this.session.workMem, this.spillSink);
+      return new SpoolSorter(compare, this.session.workMem, this.spillSink, charge);
+    return new Sorter(compare, this.session.workMem, this.spillSink, charge);
   }
 
   // materializeRel materializes one FROM relation ri into its rows, given the current outer-row stack
@@ -15730,6 +15772,7 @@ export class Engine {
         meter.admitRow(o); // the buffered result collector (memory.md §5.1)
         out.push(o);
       }
+      em.columnarCharge?.releaseAll(); // the emission completed (memory.md §6.5)
       return out;
     }
     const out: Value[][] = [];
@@ -15824,6 +15867,14 @@ export class Engine {
         COSTS.valueDecompress * BigInt(slabs) +
         COSTS.storageRowRead * BigInt(rowCount),
     );
+    // The gathered lanes are operator state, reserved once the bulk gather completes (memory.md §6.5)
+    // and returned when the emission completes.
+    const charge = meter.stateCharge();
+    if (charge.active()) {
+      let bytes = 0;
+      for (const lane of cols) bytes += keyBytes(lane);
+      charge.reserve(meter, bytes);
+    }
 
     // A3: apply the WHERE predicate over the lanes into a selection vector (undefined ⇒ all rows survive).
     let sel: number[] | undefined;
@@ -15833,7 +15884,16 @@ export class Engine {
       nEmit = sel.length;
     }
 
-    return { rows: [], start: 0, end: nEmit, mode: "columnar", cols, projCols, sel };
+    return {
+      rows: [],
+      start: 0,
+      end: nEmit,
+      mode: "columnar",
+      cols,
+      projCols,
+      sel,
+      columnarCharge: charge,
+    };
   }
 
   // vectorizedAggEligible reports whether plan is a shape execVectorizedAgg specializes: a single-base-
@@ -16014,6 +16074,10 @@ export class Engine {
     let nsurv = 0;
     let rowCount = 0;
     let pages = 0;
+    // The group table (memory.md §6.2): the whole-table group's entry up front, a grouped entry as each
+    // group is created; returned after the last group is finalized.
+    const charge = meter.stateCharge();
+    if (!grouped && charge.active()) charge.reserve(meter, entryBytes([]));
 
     if (doScan) {
       const visit = (n: PNode, i: number): void => {
@@ -16031,6 +16095,7 @@ export class Engine {
           if (kv.kind === "int") {
             const g = index.get(kv.int);
             if (g === undefined) {
+              if (charge.active()) charge.reserve(meter, entryBytes([kv]));
               gi = groups.length;
               index.set(kv.int, gi);
               groups.push({ key: kv, accs: plan.aggSpecs.map((s) => newAccFromSpec(s)) });
@@ -16040,6 +16105,7 @@ export class Engine {
           } else {
             // A NULL integer key buckets into one sentinel group (matching the scalar/lane path).
             if (nullGi < 0) {
+              if (charge.active()) charge.reserve(meter, entryBytes([nullValue()]));
               nullGi = groups.length;
               groups.push({ key: nullValue(), accs: plan.aggSpecs.map((s) => newAccFromSpec(s)) });
             }
@@ -16067,9 +16133,11 @@ export class Engine {
     meter.charge(COSTS.pageRead * BigInt(pages) + COSTS.storageRowRead * BigInt(rowCount));
     meter.charge(COSTS.aggregateAccumulate * BigInt(nsurv) * BigInt(plan.aggSpecs.length));
 
-    return grouped
+    const srows = grouped
       ? groups.map(({ key, accs }) => [key, ...accs.map((a) => finalizeAcc(a))])
       : [whole.map((a) => finalizeAcc(a))];
+    charge.releaseAll();
+    return srows;
   }
 
   private execCostedTwoRelationJoin(
@@ -16133,6 +16201,7 @@ export class Engine {
       // A per-outer-row INL re-materialization is consumed (memory.md §5.3).
       if (innerINL) meter.releaseRowsMasked(candidates, plan.relMasks[innerOrdinal]!);
     }
+    hashTable?.release(); // the join step completed (memory.md §6.2)
     return out;
   }
 
@@ -16242,8 +16311,10 @@ export class Engine {
           next.push(combined);
         }
       }
-      // The step's input rows are consumed once its output is built (memory.md §5.3).
+      // The step's input rows are consumed once its output is built (memory.md §5.3), and its hash
+      // table with them (§6.2).
       meter.releaseRowsMasked(running, mask);
+      hashTable?.release();
       running = next;
       if (position + 1 < plan.phys.joinSteps.length) {
         this.recordExplainActualParent(
@@ -16269,7 +16340,23 @@ export class Engine {
     );
   }
 
+  // The bounded-spill lane. Its spill structures reserve without the meter in reach, so a rejected
+  // reservation is passed through Meter.costFirst here (memory.md §6.7).
   private execBoundedBlocking(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+  ): Emitter {
+    return meter.costFirst(() => this.execBoundedBlockingLane(plan, env, meter, params));
+  }
+
+  // Every spill structure of the lane charges its resident elements to the statement's query-memory
+  // account (memory.md §6.6) and returns them on spill or when discarded: a spool or map feeding a stage
+  // is released when that stage completes, and the final output spool when its emission completes. The
+  // release points mirror the other cores' structure lifetimes, so the account's balance at every
+  // reservation — and every spill — is cross-core identical.
+  private execBoundedBlockingLane(
     plan: SelectPlan,
     env: EvalEnv,
     meter: Meter,
@@ -16294,14 +16381,20 @@ export class Engine {
     }
     const sink = this.spillSink!;
     const budget = this.session.workMem;
+    const acct = this.session.queryAccount;
     const resources: { close(): void }[] = [];
     const spool = (): RowSpool => {
-      const s = new RowSpool(budget, sink);
+      const s = new RowSpool(budget, sink, new StateCharge(acct));
       resources.push(s);
       return s;
     };
     const map = (): SpillMap => {
-      const m = new SpillMap(budget, sink);
+      const m = new SpillMap(budget, sink, new StateCharge(acct));
+      resources.push(m);
+      return m;
+    };
+    const hashRows = (): SpillMultiMap => {
+      const m = new SpillMultiMap(budget, sink, new StateCharge(acct));
       resources.push(m);
       return m;
     };
@@ -16309,35 +16402,17 @@ export class Engine {
     const profileStart = meter.accrued;
     let filterWork = 0n;
     let outputWork = 0n;
-    let passed = 0n;
-    const emitJoin = (row: Row, out: RowSpool, streaming: boolean): boolean => {
-      if (!streaming) {
-        out.push(row);
-        return false;
-      }
-      if (plan.filter !== null) {
-        const before = meter.accrued;
-        const keep = isTrue(evalExpr(plan.filter, row, env, meter));
-        filterWork += meter.accrued - before;
-        if (!keep) return false;
-      }
-      if (++passed <= (plan.offset ?? 0n)) return false;
-      meter.guard();
-      const before = meter.accrued;
-      meter.charge(COSTS.rowProduced);
-      out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
-      outputWork += meter.accrued - before;
-      return plan.limit !== null && BigInt(out.length) >= plan.limit;
-    };
+    const n = plan.rels.length;
     try {
       const relations: RowSpool[] = [];
       const relWork: bigint[] = [];
       const scanOrder =
-        plan.phys.joinPkOrdered && plan.rels.length === 2
+        plan.phys.joinPkOrdered && n === 2
           ? [physicalRelOrdinal(plan, 0), physicalRelOrdinal(plan, 1)]
           : plan.rels.map((_, i) => i);
       for (const ordinal of scanOrder) {
         const rel = plan.rels[ordinal]!;
+        const mask = plan.relMasks[ordinal]!;
         const out = spool();
         const before = meter.accrued;
         if (rel.lateral === true || plan.phys.relINLBounds[ordinal] !== null) {
@@ -16360,10 +16435,10 @@ export class Engine {
             params,
             meter,
           );
-          // Spool residency is operator state bounded by workMem (memory.md §4 Q2): the rows leave the
-          // query-memory row account as they enter the spool.
-          meter.releaseRowsMasked(materialized, plan.relMasks[ordinal]!);
-          for (const row of materialized) out.push(row);
+          // Spool residency is operator state bounded by workMem (memory.md §6.6): the rows leave the
+          // query-memory row account and enter the spool with their untouched slots NULLed.
+          meter.releaseRowsMasked(materialized, mask);
+          for (const row of materialized) out.push(nullUntouched(row, mask));
           relations[ordinal] = out;
           relWork[ordinal] = meter.accrued - before;
           continue;
@@ -16373,22 +16448,24 @@ export class Engine {
         const bound =
           rb?.kind === "pk" ? buildKeyBound(rb.pk, params, env.outer, []) : unboundedBound();
         if (bound !== null) {
-          const units = store.overlapScanUnits(bound, plan.relMasks[ordinal]!);
+          const units = store.overlapScanUnits(bound, mask);
           meter.charge(
             COSTS.valueDecompress * BigInt(units.slabs) + COSTS.pageRead * BigInt(units.pages),
           );
           store.scanRange(bound, (_key, raw) => {
             meter.guard();
             meter.charge(COSTS.storageRowRead);
-            const resolved = store.resolveColumns(raw, plan.relMasks[ordinal]!);
-            out.push(resolved.map((v, c) => (plan.relMasks[ordinal]![c] ? v : nullValue())));
+            out.push(nullUntouched(store.resolveColumns(raw, mask), mask));
             return true;
           });
         }
         relations[ordinal] = out;
         relWork[ordinal] = meter.accrued - before;
       }
-      const dynamicRows = (ordinal: number, logical: Row): Row[] | null => {
+      // A LATERAL or index-nested-loop relation is re-materialized per left row; its rows leave the
+      // query-memory row account and enter a per-row spool, discarded once the left row is joined
+      // (memory.md §5.3/§6.6). null for an ordinary relation.
+      const dynamicRows = (ordinal: number, logical: Row): RowSpool | null => {
         const rel = plan.rels[ordinal]!;
         if (!rel.lateral && plan.phys.relINLBounds[ordinal] === null) return null;
         const before = meter.accrued;
@@ -16396,129 +16473,95 @@ export class Engine {
           ? this.materializeRel(plan, ordinal, [...env.outer, logical], [], env, params, meter)
           : this.materializeRel(plan, ordinal, env.outer, logical, env, params, meter);
         relWork[ordinal] = relWork[ordinal]! + meter.accrued - before;
-        // The per-row re-materialization feeds bounded join state (memory.md §4 Q2): its rows leave
-        // the query-memory row account at once.
-        meter.releaseRowsMasked(result, plan.relMasks[ordinal]!);
-        return result;
+        const mask = plan.relMasks[ordinal]!;
+        meter.releaseRowsMasked(result, mask);
+        const rows = new RowSpool(budget, sink, new StateCharge(acct));
+        for (const row of result) rows.push(nullUntouched(row, mask));
+        return rows;
       };
-      let rows = relations[0] ?? spool();
-      if (plan.rels.length === 0) rows.push([]);
-      if (plan.rels.length === 2 && plan.phys.hashJoin === null) {
-        const outer = physicalRelOrdinal(plan, 0);
-        const inner = physicalRelOrdinal(plan, 1);
-        const matchedRight = map();
-        const next = spool();
-        const kind = plan.joins[0]!.kind;
-        joinedRows: for (const left of plan.phys.joinPkOrdered && plan.limit === 0n
-          ? []
-          : relations[outer]!) {
-          let matched = false;
-          let ordinal = 0;
-          for (const right of dynamicRows(inner, placePhysicalRelationRow(plan, outer, left)) ??
-            relations[inner]!) {
-            const combined = combinePhysicalRelationRows(plan, outer, left, inner, right);
-            const on = plan.joins[0]!.on;
-            if (on === null || isTrue(evalExpr(on, combined, env, meter))) {
-              matched = true;
-              if (kind === "right" || kind === "full") matchedRight.set(String(ordinal), []);
-              if (emitJoin(combined, next, plan.phys.joinPkOrdered)) break joinedRows;
-            }
-            ordinal++;
-          }
-          if (!matched && (kind === "left" || kind === "full"))
-            next.push(placePhysicalRelationRow(plan, outer, left));
-        }
-        if (kind === "right" || kind === "full") {
-          let ordinal = 0;
-          for (const right of relations[inner]!)
-            if (matchedRight.get(String(ordinal++)) === undefined)
-              next.push(placePhysicalRelationRow(plan, inner, right));
-        }
-        matchedRight.close();
-        for (const rel of relations) rel.close();
-        rows = next;
-      }
-      if (plan.rels.length === 2 && plan.phys.hashJoin !== null) {
-        const hp = plan.phys.hashJoin!;
-        const outer = physicalRelOrdinal(plan, 0);
-        const inner = physicalRelOrdinal(plan, 1);
-        const build = new SpillMultiMap(budget, sink);
-        resources.push(build);
+      // A bounded hash table over an inner relation: each build row with a non-NULL key is resident as
+      // ENTRY + row_bytes([key, row-composite]) (memory.md §6.6), in the shape every core stores.
+      const buildHashTable = (hp: HashJoinPlan, inner: number): SpillMultiMap => {
+        const table = hashRows();
         const buildIndices = hp.keys.map((k) => k.right - plan.rels[inner]!.offset);
-        const probeIndices = hp.keys.map((k) => k.left - plan.rels[outer]!.offset);
         const types = hp.keys.map((k) => k.type);
-        for (const row of plan.phys.joinPkOrdered && plan.limit === 0n ? [] : relations[inner]!) {
+        for (const row of relations[inner]!) {
           const key = hashJoinRowKey(row, buildIndices, types, COSTS.hashBuild, meter);
-          if (key !== null) build.append(hashJoinFnv1a(key).toString(), [byteaValue(key), ...row]);
+          if (key === null) continue;
+          table.append(
+            hashJoinFnv1a(key).toString(),
+            [byteaValue(key), ...row],
+            MEMORY_ENTRY + MEMORY_ROW + 2 * MEMORY_VALUE + key.length + keyBytes(row),
+          );
         }
-        const joined = spool();
-        joinedRows: for (const left of plan.phys.joinPkOrdered && plan.limit === 0n
-          ? []
-          : relations[outer]!) {
-          const key = hashJoinRowKey(left, probeIndices, types, COSTS.hashProbe, meter);
-          let matched = false;
-          // Match-key comparisons form a separate phase before residual ON evaluation, as on the
-          // resident path. Replaying a bucket costs no SQL work and avoids a full match-index vector.
-          if (key !== null) {
-            for (const candidate of build.get(hashJoinFnv1a(key).toString())) {
-              const encoded = (candidate[0]! as { bytes: Uint8Array }).bytes;
-              meter.guard();
-              meter.charge(
-                COSTS.hashProbe * BigInt(Math.max(1, Math.min(encoded.length, key.length))),
-              );
-            }
-            for (const candidate of build.get(hashJoinFnv1a(key).toString())) {
-              const encoded = (candidate[0]! as { bytes: Uint8Array }).bytes;
-              if (!bytesEq(encoded, key)) continue;
-              const combined = combinePhysicalRelationRows(
-                plan,
-                outer,
-                left,
-                inner,
-                candidate.slice(1),
-              );
-              const on = plan.joins[0]!.on;
-              if (on === null || isTrue(evalExpr(on, combined, env, meter))) {
-                matched = true;
-                if (emitJoin(combined, joined, plan.phys.joinPkOrdered)) break joinedRows;
-              }
-            }
-          }
-          if (!matched && plan.joins[0]!.kind === "left")
-            joined.push(placePhysicalRelationRow(plan, outer, left));
+        return table;
+      };
+      // Probe a bounded hash table with a full-width left row: the matching build rows, in build order,
+      // collected into a per-row spool (charged while resident, discarded once the left row is joined).
+      const probeHashTable = (hp: HashJoinPlan, table: SpillMultiMap, left: Row): RowSpool => {
+        const matches = new RowSpool(budget, sink, new StateCharge(acct));
+        const types = hp.keys.map((k) => k.type);
+        const key = hashJoinRowKey(
+          left,
+          hp.keys.map((k) => k.left),
+          types,
+          COSTS.hashProbe,
+          meter,
+        );
+        if (key === null) return matches;
+        for (const entry of table.get(hashJoinFnv1a(key).toString())) {
+          const stored = (entry[0]! as { bytes: Uint8Array }).bytes;
+          meter.guard();
+          meter.charge(COSTS.hashProbe * BigInt(Math.max(1, Math.min(stored.length, key.length))));
+          if (bytesEq(stored, key)) matches.push(entry.slice(1));
         }
-        rows = joined;
-        for (const rel of relations) rel.close();
-        build.close();
-      }
-      if (plan.rels.length >= 3) {
-        const driver = plan.phys.relationOrder[0]!;
-        rows = spool();
+        return matches;
+      };
+      const physical =
+        plan.phys.relationOrder.length === n && (n === 2 || plan.phys.joinSteps.length + 1 === n);
+      const joinOrder = physical ? plan.phys.relationOrder : plan.rels.map((_, i) => i);
+      // The join steps, in the physical relation order: the driver's rows are placed full-width, then
+      // each step joins the running rows with one inner relation (nested loop or bounded hash).
+      const joinSteps = (count: number): RowSpool => {
+        const driver = joinOrder[0]!;
+        let running = spool();
         for (const row of relations[driver]!)
-          rows.push(placePhysicalRelationRow(plan, driver, row));
+          running.push(placePhysicalRelationRow(plan, driver, row));
         relations[driver]!.close();
-        for (let position = 0; position < plan.phys.joinSteps.length; position++) {
-          const step = plan.phys.joinSteps[position]!;
-          const inner = plan.phys.relationOrder[position + 1]!;
-          if (step.hashJoin === null) {
-            const next = spool();
-            const matchedRight = map();
-            const kind = step.onIndices.reduce<JoinKind>((current, i) => {
-              const candidate = plan.joins[i]!.kind;
-              return candidate === "left" || candidate === "right" || candidate === "full"
-                ? candidate
-                : current;
-            }, "inner");
-            const streaming =
-              plan.phys.joinPkOrdered && position + 1 === plan.phys.joinSteps.length;
-            joinedRows: for (const left of streaming && plan.limit === 0n ? [] : rows) {
+        for (let position = 0; position < count; position++) {
+          const inner = joinOrder[position + 1]!;
+          const nway = physical && n >= 3;
+          const onIndices = nway ? plan.phys.joinSteps[position]!.onIndices : [position];
+          const hp = nway
+            ? plan.phys.joinSteps[position]!.hashJoin
+            : position === 0
+              ? plan.phys.hashJoin
+              : null;
+          const table = hp === null ? null : buildHashTable(hp, inner);
+          const emitLeft = onIndices.some((i) => {
+            const kind = plan.joins[i]!.kind;
+            return kind === "left" || kind === "full";
+          });
+          const emitRight = onIndices.some((i) => {
+            const kind = plan.joins[i]!.kind;
+            return kind === "right" || kind === "full";
+          });
+          // The hash table replaces its build input, unless unmatched build rows are emitted later.
+          if (table !== null && !emitRight) relations[inner]!.close();
+          const rightMatches = map();
+          const next = spool();
+          for (const left of running) {
+            const owned =
+              dynamicRows(inner, left) ??
+              (table === null ? null : probeHashTable(hp!, table, left));
+            try {
               let matched = false;
               let ordinal = 0;
-              for (const right of dynamicRows(inner, left) ?? relations[inner]!) {
+              for (const right of owned ?? relations[inner]!) {
                 const combined = left.slice();
                 combined.splice(plan.rels[inner]!.offset, right.length, ...right);
                 let keep = true;
-                for (const index of step.onIndices) {
+                for (const index of onIndices) {
                   const on = plan.joins[index]!.on;
                   if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) {
                     keep = false;
@@ -16526,108 +16569,102 @@ export class Engine {
                   }
                 }
                 if (keep) {
+                  next.push(combined);
                   matched = true;
-                  if (kind === "right" || kind === "full") matchedRight.set(String(ordinal), []);
-                  if (emitJoin(combined, next, streaming)) break joinedRows;
+                  if (emitRight) rightMatches.insert(String(ordinal), MEMORY_VALUE);
                 }
                 ordinal++;
               }
-              if (!matched && (kind === "left" || kind === "full")) next.push(left);
+              if (emitLeft && !matched) next.push(left);
+            } finally {
+              // The left row was joined: its per-row candidates are discarded.
+              owned?.close();
             }
-            if (kind === "right" || kind === "full") {
-              let ordinal = 0;
-              for (const right of relations[inner]!)
-                if (matchedRight.get(String(ordinal++)) === undefined)
-                  next.push(placePhysicalRelationRow(plan, inner, right));
+          }
+          if (emitRight) {
+            let ordinal = 0;
+            for (const right of relations[inner]!) {
+              if (rightMatches.get(String(ordinal)) === undefined)
+                next.push(placePhysicalRelationRow(plan, inner, right));
+              ordinal++;
             }
-            rows.close();
-            rows = next;
-            matchedRight.close();
-            relations[inner]!.close();
-            if (position + 1 < plan.phys.joinSteps.length)
-              this.recordExplainActualParent("Nested Loop", meter.accrued);
-            continue;
           }
-          const hp = step.hashJoin!;
-          const build = new SpillMultiMap(budget, sink);
-          resources.push(build);
-          const matchedRight = map();
-          const types = hp.keys.map((k) => k.type);
-          const buildIndices = hp.keys.map((k) => k.right - plan.rels[inner]!.offset);
-          const probeIndices = hp.keys.map((k) => k.left);
-          let ordinal = 0;
-          for (const row of relations[inner]!) {
-            const key = hashJoinRowKey(row, buildIndices, types, COSTS.hashBuild, meter);
-            if (key !== null)
-              build.append(hashJoinFnv1a(key).toString(), [
-                byteaValue(key),
-                intValue(BigInt(ordinal)),
-                ...row,
-              ]);
-            ordinal++;
-          }
-          const kind = step.onIndices.reduce<JoinKind>((current, i) => {
-            const candidate = plan.joins[i]!.kind;
-            return candidate === "left" || candidate === "right" || candidate === "full"
-              ? candidate
-              : current;
-          }, "inner");
-          const next = spool();
-          const streaming = plan.phys.joinPkOrdered && position + 1 === plan.phys.joinSteps.length;
-          joinedRows: for (const left of streaming && plan.limit === 0n ? [] : rows) {
-            const key = hashJoinRowKey(left, probeIndices, types, COSTS.hashProbe, meter);
-            let matched = false;
-            if (key !== null) {
-              const hash = hashJoinFnv1a(key).toString();
-              for (const candidate of build.get(hash)) {
-                const encoded = (candidate[0]! as { bytes: Uint8Array }).bytes;
-                meter.guard();
-                meter.charge(
-                  COSTS.hashProbe * BigInt(Math.max(1, Math.min(encoded.length, key.length))),
-                );
-              }
-              for (const candidate of build.get(hash)) {
-                if (!bytesEq((candidate[0]! as { bytes: Uint8Array }).bytes, key)) continue;
+          // The step completed: its inputs, match set, and hash table are discarded.
+          relations[inner]!.close();
+          running.close();
+          rightMatches.close();
+          table?.close();
+          running = next;
+          if (nway && position + 1 < plan.phys.joinSteps.length)
+            this.recordExplainActualParent(hp === null ? "Nested Loop" : "Hash Join", meter.accrued);
+        }
+        return running;
+      };
+      let rows: RowSpool;
+      if (plan.phys.joinPkOrdered) {
+        // Streaming top-N: every step but the last completes, then the final step streams its
+        // filtered, projected rows into the output spool and stops once the LIMIT window fills.
+        const running = joinSteps(n - 2);
+        const nway = n >= 3;
+        const inner = joinOrder[n - 1]!;
+        const hp = nway ? plan.phys.joinSteps[n - 2]!.hashJoin : plan.phys.hashJoin;
+        const onIndices = nway ? plan.phys.joinSteps[n - 2]!.onIndices : [0];
+        const table =
+          hp !== null && (nway || plan.limit !== 0n) ? buildHashTable(hp, inner) : null;
+        if (table !== null) relations[inner]!.close();
+        const output = spool();
+        let passed = 0n;
+        if (plan.limit !== 0n) {
+          // biome-ignore lint/suspicious/noLabelVar: `probe` labels the top-N exit.
+          probe: for (const left of running) {
+            const owned =
+              dynamicRows(inner, left) ??
+              (table === null ? null : probeHashTable(hp!, table, left));
+            try {
+              for (const right of owned ?? relations[inner]!) {
                 const combined = left.slice();
-                combined.splice(
-                  plan.rels[inner]!.offset,
-                  candidate.length - 2,
-                  ...candidate.slice(2),
-                );
+                combined.splice(plan.rels[inner]!.offset, right.length, ...right);
                 let keep = true;
-                for (const index of step.onIndices) {
+                for (const index of onIndices) {
                   const on = plan.joins[index]!.on;
                   if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) {
                     keep = false;
                     break;
                   }
                 }
-                if (keep) {
-                  matched = true;
-                  if (emitJoin(combined, next, streaming)) break joinedRows;
-                  if (kind === "right" || kind === "full")
-                    matchedRight.set((candidate[1]! as { int: bigint }).int.toString(), []);
+                if (!keep) continue;
+                if (plan.filter !== null) {
+                  const before = meter.accrued;
+                  const pass = isTrue(evalExpr(plan.filter, combined, env, meter));
+                  filterWork += meter.accrued - before;
+                  if (!pass) continue;
                 }
+                if (++passed <= (plan.offset ?? 0n)) continue;
+                meter.guard();
+                const before = meter.accrued;
+                meter.charge(COSTS.rowProduced);
+                const projected = plan.projections.map((p) => evalExpr(p, combined, env, meter));
+                outputWork += meter.accrued - before;
+                output.push(projected);
+                if (plan.limit !== null && BigInt(output.length) >= plan.limit) break probe;
               }
-            }
-            if (!matched && (kind === "left" || kind === "full")) next.push(left);
-          }
-          if (kind === "right" || kind === "full") {
-            ordinal = 0;
-            for (const right of relations[inner]!) {
-              if (matchedRight.get(String(ordinal++)) === undefined)
-                next.push(placePhysicalRelationRow(plan, inner, right));
+            } finally {
+              owned?.close();
             }
           }
-          rows.close();
-          rows = next;
-          relations[inner]!.close();
-          build.close();
-          matchedRight.close();
-          if (position + 1 < plan.phys.joinSteps.length)
-            this.recordExplainActualParent("Hash Join", meter.accrued);
+          running.close();
         }
-      }
+        // The join completed: its remaining inputs and hash table are discarded.
+        table?.close();
+        relations[inner]!.close();
+        running.close();
+        rows = output;
+      } else if (n >= 2) {
+        rows = joinSteps(n - 1);
+      } else if (n === 0) {
+        rows = spool();
+        rows.push([]);
+      } else rows = relations[0]!;
       const ordinals =
         plan.phys.relationOrder.length === plan.rels.length
           ? plan.phys.relationOrder
@@ -16653,13 +16690,15 @@ export class Engine {
         selectActualRootNode(plan) !== "Filter"
       )
         this.recordExplainActualParent("Filter", meter.accrued - profileStart - outputWork);
-      if (!plan.phys.joinPkOrdered && plan.filter !== null) {
+      if (!plan.phys.joinPkOrdered) {
+        // The WHERE pass always copies its survivors into a fresh spool (every row without a WHERE).
         const filtered = spool();
         for (const row of rows)
-          if (isTrue(evalExpr(plan.filter, row, env, meter))) filtered.push(row);
+          if (plan.filter === null || isTrue(evalExpr(plan.filter, row, env, meter)))
+            filtered.push(row);
         rows.close();
         rows = filtered;
-        if (selectActualRootNode(plan) !== "Filter")
+        if (plan.filter !== null && selectActualRootNode(plan) !== "Filter")
           this.recordExplainActualParent("Filter", meter.accrued);
       }
       const applyWindow = (input: RowSpool): RowSpool => {
@@ -16672,11 +16711,11 @@ export class Engine {
           meter.admitRowMasked(row, mask);
           materialized.push(row);
         }
-        input.close();
         applyWindowStage(materialized, plan.windowSpecs, plan.windowKeys, env, meter);
         meter.releaseRowsMasked(materialized, mask);
         const out = spool();
         for (const row of materialized) out.push(row);
+        input.close(); // the window stage completed (memory.md §6.6)
         if (selectActualRootNode(plan) !== "Window")
           this.recordExplainActualParent("Window", meter.accrued);
         return out;
@@ -16696,15 +16735,18 @@ export class Engine {
         }
         const grouped = spool();
         for (const gset of plan.groupSets) {
+          // Per grouping set: the group states (keyed by the group key, valued in the packed shape
+          // every core measures), the first-occurrence key spool, the DISTINCT-aggregate and unique-key
+          // sets, and the retained aggregate inputs (memory.md §6.6).
           const states = map();
+          const order = spool();
           const seen = map();
           const unique = map();
-          const collections = new SpillMultiMap(budget, sink);
-          resources.push(collections);
-          const order = spool();
+          const collections = hashRows();
           const fresh = (): Acc[] => plan.aggSpecs.map((s) => newAccFromSpec(s));
           if (gset.keyCols.length === 0) {
-            states.set("", encodeBlockingAccs([], fresh()));
+            const accs = fresh();
+            states.set("", encodeBlockingAccs([], accs), 0, packedStateBytes(accs));
             order.push([]);
           }
           for (const row of rows) {
@@ -16731,9 +16773,9 @@ export class Engine {
                 spec.operand === null ? nullValue() : evalExpr(spec.operand, row, env, meter);
               if (spec.distinct) {
                 if (value.kind === "null") continue;
+                // The entry is (group ordinal, aggregate ordinal, value).
                 const dk = `${key.length}:${key}${si}:${distinctRowKey([value])}`;
-                if (seen.get(dk) !== undefined) continue;
-                seen.set(dk, []);
+                if (!seen.insert(dk, 2 * MEMORY_VALUE + valueBytes(value))) continue;
               }
               if (
                 !foldBlockingCollection(
@@ -16749,8 +16791,13 @@ export class Engine {
                 foldAcc(accs[si]!, value, meter);
             }
             // The first-occurrence spool owns the original key representation; accumulator
-            // state does not duplicate a wide key on every update or count it twice in the map.
-            states.set(key, encodeBlockingAccs([], accs));
+            // state does not duplicate a wide key on every update.
+            states.set(
+              key,
+              encodeBlockingAccs([], accs),
+              previous === undefined ? keyBytes(keys) : 0,
+              packedStateBytes(accs),
+            );
           }
           for (const keys of order) {
             const key = distinctRowKey(keys);
@@ -16767,6 +16814,7 @@ export class Engine {
                   env,
                   budget,
                   sink,
+                  acct,
                 ),
               );
             for (const positions of plan.groupingSpecs)
@@ -16793,52 +16841,50 @@ export class Engine {
         if (plan.hasWindow) rows = applyWindow(rows);
       }
       if (!plan.phys.joinPkOrdered && plan.order.length > 0) {
-        if (plan.orderExprs.length > 0) {
-          const extended = spool();
-          for (const original of rows) {
-            const row = original.slice();
-            for (const expr of plan.orderExprs) row.push(evalExpr(expr, row, env, meter));
-            extended.push(row);
-          }
-          rows.close();
-          rows = extended;
+        // Finish expression evaluation for every row before collation decoration can fail.
+        const extended = spool();
+        for (const original of rows) {
+          const row = original.slice();
+          for (const expr of plan.orderExprs) row.push(evalExpr(expr, row, env, meter));
+          extended.push(row);
         }
-        const collated = plan.order.filter((order) => order.collation !== null);
-        let baseWidth = 0;
-        if (collated.length > 0) {
-          const decorated = spool();
-          for (const row of rows) {
-            baseWidth = row.length;
-            decorated.push([
-              ...row,
-              ...collated.map((order) => {
-                const value = row[order.idx]!;
-                return value.kind === "text"
-                  ? byteaValue(collationSortKey(order.collation!, value.text))
-                  : nullValue();
-              }),
-            ]);
-          }
-          rows.close();
-          rows = decorated;
-        }
-        const sorted = sortSpool(
-          rows,
+        rows.close();
+        // Each sorter row carries every ORDER BY key appended: a collated text key as its sort-key
+        // bytes, any other key as a copy of its value.
+        const keyCount = plan.order.length;
+        const sorter = new SpoolSorter(
           (a, b) => {
-            let collatedIndex = baseWidth;
-            for (const order of plan.order) {
-              const index = order.collation === null ? order.idx : collatedIndex++;
-              const cmp = keyCmp(a[index]!, b[index]!, order.descending, order.nullsFirst);
+            const base = a.length - keyCount;
+            for (let i = 0; i < keyCount; i++) {
+              const order = plan.order[i]!;
+              const cmp = keyCmp(a[base + i]!, b[base + i]!, order.descending, order.nullsFirst);
               if (cmp !== 0) return cmp;
             }
             return 0;
           },
           budget,
           sink,
+          new StateCharge(acct),
         );
-        resources.push(sorted);
-        rows.close();
-        rows = sorted;
+        resources.push(sorter);
+        for (const row of extended) {
+          const decorated = row.slice();
+          for (const order of plan.order) {
+            const value = row[order.idx]!;
+            decorated.push(
+              order.collation !== null && value.kind === "text"
+                ? byteaValue(collationSortKey(order.collation, value.text))
+                : value,
+            );
+          }
+          sorter.push(decorated);
+        }
+        extended.close();
+        const sorted = sorter.finishSpool();
+        rows = spool();
+        for (const row of sorted) rows.push(row);
+        sorted.close();
+        sorter.close(); // the sorted output was consumed (memory.md §6.4)
         if (selectActualRootNode(plan) !== "Sort")
           this.recordExplainActualParent("Sort", meter.accrued);
       }
@@ -16847,14 +16893,10 @@ export class Engine {
         const unique = spool();
         for (const row of rows) {
           const projected = plan.projections.map((p) => evalExpr(p, row, env, meter));
-          const key = distinctRowKey(projected);
-          if (seen.get(key) === undefined) {
-            seen.set(key, []);
-            unique.push(projected);
-          }
+          if (seen.insert(distinctRowKey(projected), keyBytes(projected))) unique.push(projected);
         }
-        seen.close();
         rows.close();
+        seen.close();
         rows = unique;
         if (selectActualRootNode(plan) !== "Distinct")
           this.recordExplainActualParent("Distinct", meter.accrued);
@@ -16869,6 +16911,7 @@ export class Engine {
         plan.limit !== null && plan.limit < total - start ? plan.limit : total - start;
       const iterator = rows[Symbol.iterator]();
       for (let i = 0n; i < start; i++) iterator.next();
+      // The output spool stays charged until its emission completes (close — memory.md §6.6).
       const sorted = {
         next: (): Row | null => {
           const next = iterator.next();
@@ -17184,6 +17227,7 @@ export class Engine {
           }
         }
         meter.releaseRowsMasked(running, memMask);
+        table.release(); // the join step completed (memory.md §6.2)
         running = next;
         continue;
       }
@@ -17362,11 +17406,20 @@ export class Engine {
       let groupRows: Value[][] = [];
       for (const gset of plan.groupSets) {
         const index = new Map<string, number>();
-        const groups: { keys: Value[]; accs: Acc[]; seen: (Set<string> | null)[] }[] = [];
+        // Per group: key, accumulators, DISTINCT sets, and the group's query-memory charge — its
+        // entry plus everything its accumulators retain (memory.md §6.2/§6.3).
+        const groups: {
+          keys: Value[];
+          accs: Acc[];
+          seen: (Set<string> | null)[];
+          charge: number;
+        }[] = [];
         // An empty grouping set (the () / whole-table grand total) is one pre-created group, so it
         // emits ONE row even over zero input; a non-empty set over empty input emits nothing.
         if (gset.keyCols.length === 0) {
-          groups.push({ keys: [], accs: newAccs(), seen: newSeen() });
+          const entry = meter.queryMemoryActive() ? entryBytes([]) : 0;
+          meter.reserveQuery(entry);
+          groups.push({ keys: [], accs: newAccs(), seen: newSeen(), charge: entry });
           index.set("", 0);
         }
         for (const row of rows) {
@@ -17375,12 +17428,15 @@ export class Engine {
           const k = distinctRowKey(keys);
           let gi = index.get(k);
           if (gi === undefined) {
+            const entry = meter.queryMemoryActive() ? entryBytes(keys) : 0;
+            meter.reserveQuery(entry);
             gi = groups.length;
             index.set(k, gi);
-            groups.push({ keys, accs: newAccs(), seen: newSeen() });
+            groups.push({ keys, accs: newAccs(), seen: newSeen(), charge: entry });
           }
-          const accs = groups[gi]!.accs;
-          const seen = groups[gi]!.seen;
+          const group = groups[gi]!;
+          const accs = group.accs;
+          const seen = group.seen;
           plan.aggSpecs.forEach((spec, i) => {
             // FILTER (WHERE cond): a row for which the filter is not TRUE (FALSE or NULL) contributes
             // nothing to THIS aggregate — its operand is not evaluated and it is not accumulated
@@ -17397,6 +17453,11 @@ export class Engine {
             if (spec.hypo !== undefined && spec.hypo !== null) {
               const hp = spec.hypo;
               const tuple = hp.keys.map((k) => evalExpr(k, row, env, meter));
+              if (meter.queryMemoryActive()) {
+                const bytes = rowBytes(tuple);
+                meter.reserveQuery(bytes);
+                group.charge += bytes;
+              }
               accs[i]!.hypoRows!.push(tuple);
               return;
             }
@@ -17410,8 +17471,13 @@ export class Engine {
               const dk = distinctRowKey([v]);
               if (dedup.has(dk)) return;
               dedup.add(dk);
+              if (meter.queryMemoryActive()) {
+                const bytes = entryBytes([v]);
+                meter.reserveQuery(bytes);
+                group.charge += bytes;
+              }
             }
-            foldAcc(accs[i]!, v, meter);
+            group.charge += foldAccCharged(accs[i]!, v, meter);
           });
         }
         // Build one synthetic row per group of this set: each master grouping column's value (NULL
@@ -17451,6 +17517,8 @@ export class Engine {
           for (const positions of plan.groupingSpecs) {
             srow.push(intValue(groupingValue(positions, gset.mask)));
           }
+          // The finalized group's operator state gives way to its row (memory.md §6.2).
+          meter.releaseQuery(g.charge);
           meter.admitRow(srow);
           groupRows.push(srow);
         }
@@ -17495,15 +17563,22 @@ export class Engine {
         // Set iteration (no order leak — CLAUDE.md §8/§10).
         const seen = new Set<string>();
         const distinctRows: Value[][] = [];
+        let seenCharge = 0; // the dedup set's entries (memory.md §6.2)
         for (const srow of groupRows) {
           const tuple = plan.projections.map((p) => evalExpr(p, srow, env, meter));
           const key = distinctRowKey(tuple);
           if (!seen.has(key)) {
             seen.add(key);
+            if (meter.queryMemoryActive()) {
+              const bytes = entryBytes(tuple);
+              meter.reserveQuery(bytes);
+              seenCharge += bytes;
+            }
             meter.admitRow(tuple);
             distinctRows.push(tuple);
           }
         }
+        meter.releaseQuery(seenCharge);
         meter.releaseRows(groupRows);
         if (selectActualRootNode(plan) !== "Distinct")
           this.recordExplainActualParent("Distinct", meter.accrued);
@@ -17523,15 +17598,22 @@ export class Engine {
       // deterministic source iteration, never from Set iteration (no order leak — §8/§10).
       const seen = new Set<string>();
       const distinctRows: Value[][] = [];
+      let seenCharge = 0; // the dedup set's entries (memory.md §6.2)
       for (const row of rows) {
         const tuple = plan.projections.map((p) => evalExpr(p, row, env, meter));
         const key = distinctRowKey(tuple);
         if (!seen.has(key)) {
           seen.add(key);
+          if (meter.queryMemoryActive()) {
+            const bytes = entryBytes(tuple);
+            meter.reserveQuery(bytes);
+            seenCharge += bytes;
+          }
           meter.admitRow(tuple);
           distinctRows.push(tuple);
         }
       }
+      meter.releaseQuery(seenCharge);
       meter.releaseRowsMasked(rows, memMask);
       if (selectActualRootNode(plan) !== "Distinct")
         this.recordExplainActualParent("Distinct", meter.accrued);
@@ -21421,6 +21503,9 @@ export class HashJoinTable {
   private readonly entries = new Map<bigint, HashJoinEntry[]>();
   private readonly hash: HashJoinHash;
   private readonly probeOffset: number;
+  // The table's query-memory charge: entry_bytes(build key) per entry (memory.md §6.2), returned by
+  // release() at the end of its join step.
+  private readonly charge: StateCharge;
 
   constructor(
     plan: HashJoinPlan,
@@ -21432,11 +21517,13 @@ export class HashJoinTable {
   ) {
     this.hash = hash;
     this.probeOffset = probeOffset;
+    this.charge = meter.stateCharge();
     const indices = plan.keys.map((key) => key.right - buildOffset);
     const types = plan.keys.map((key) => key.type);
     for (let row = 0; row < rows.length; row++) {
       const encoded = hashJoinRowKey(rows[row]!, indices, types, COSTS.hashBuild, meter);
       if (encoded === null) continue;
+      if (this.charge.active()) this.charge.reserve(meter, entryBytesAt(rows[row]!, indices));
       const hash = this.hash(encoded);
       const bucket = this.entries.get(hash) ?? [];
       bucket.push({ key: encoded, row });
@@ -21461,6 +21548,11 @@ export class HashJoinTable {
       if (bytesEq(entry.key, encoded)) rows.push(entry.row);
     }
     return rows;
+  }
+
+  // release returns the table's charge — its join step completed (memory.md §6.2).
+  release(): void {
+    this.charge.releaseAll();
   }
 }
 
@@ -26086,6 +26178,35 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
   }
 }
 
+// accRetainedBytes is the query-memory bytes folding `v` makes the accumulator retain (memory.md
+// §6.3): the input of a JSON / ordered-set aggregate, nothing for a fixed-size running value.
+// Hypothetical-set and DISTINCT-set retention is charged by the fold loop, which owns those buffers.
+export function accRetainedBytes(a: Acc, v: Value): number {
+  switch (a.plan) {
+    case "jsonAgg":
+      return a.jsonStrict && v.kind === "null" ? 0 : valueBytes(v);
+    case "jsonObjectAgg":
+      return v.kind === "composite" ? keyBytes(v.fields) : 0;
+    case "mode":
+    case "percentileDisc":
+    case "percentileCont":
+    case "orderedSetContInterval":
+      return v.kind === "null" ? 0 : valueBytes(v);
+    default:
+      return 0;
+  }
+}
+
+// foldAccCharged is foldAcc, then a reservation of what the fold retained (memory.md §6.3). It returns
+// the bytes reserved, which the caller adds to the accumulator's running charge and releases when the
+// accumulator is discarded.
+export function foldAccCharged(a: Acc, v: Value, m: Meter): number {
+  const bytes = m.queryMemoryActive() ? accRetainedBytes(a, v) : 0;
+  foldAcc(a, v, m);
+  if (bytes > 0) m.reserveQuery(bytes);
+  return bytes;
+}
+
 // unfoldAcc removes one input value — the inverse of foldAcc — used ONLY by the sliding-window
 // optimization (window.md §5.2/§8) for the exactly-invertible COUNT / COUNT(*) (integer counters:
 // add-then-remove is exact and order-independent). Every other accumulator is never un-folded — a
@@ -29883,6 +30004,44 @@ function decodeBlockingAccs(row: Row, specs: AggSpec[]): { keys: Value[]; accs: 
   return { keys, accs };
 }
 
+// packedStateBytes is key_bytes of a group's state in the packed shape every core's bounded lane
+// stores (memory.md §6.6): the group ordinal, then one composite per aggregate holding its fixed-size
+// running value (count; sum + seen; avg sum + count; the five float-fold fields; min/max current;
+// the JSON aggregates' seen flag; nothing for an ordered-set or hypothetical-set aggregate, whose
+// inputs are retained in the collections table).
+function packedStateBytes(accs: Acc[]): number {
+  let n = MEMORY_VALUE;
+  for (const a of accs) {
+    n += MEMORY_VALUE;
+    switch (a.plan) {
+      case "countStar":
+      case "count":
+      case "jsonAgg":
+      case "jsonObjectAgg":
+        n += MEMORY_VALUE;
+        break;
+      case "sumInt":
+        n += 2 * MEMORY_VALUE;
+        break;
+      case "sumDecimal":
+      case "avg":
+        n += valueBytes(decimalValue(a.sumDec)) + MEMORY_VALUE;
+        break;
+      case "sumFloat":
+      case "avgFloat":
+        n += 5 * MEMORY_VALUE;
+        break;
+      case "min":
+      case "max":
+        n += valueBytes(a.cur ?? nullValue());
+        break;
+      default:
+        break;
+    }
+  }
+  return n;
+}
+
 function blockingCollectionKey(group: string, ordinal: number): string {
   return `${group.length}:${group}${ordinal}:`;
 }
@@ -29918,11 +30077,9 @@ function foldBlockingCollection(
     } else {
       const pair = single.jsonPairs[0]!;
       const uniqueKey = key + pair[0];
-      if (a.jsonUnique) {
-        if (unique.get(uniqueKey) !== undefined)
-          throw engineError("duplicate_json_object_key_value", "duplicate JSON object key value");
-        unique.set(uniqueKey, []);
-      }
+      // The unique-key entry is (group ordinal, aggregate ordinal, key text).
+      if (a.jsonUnique && !unique.insert(uniqueKey, 3 * MEMORY_VALUE + utf8Length(pair[0])))
+        throw engineError("duplicate_json_object_key_value", "duplicate JSON object key value");
       collections.append(key, [textValue(pair[0]), pair[1]]);
     }
     return true;
@@ -29930,6 +30087,9 @@ function foldBlockingCollection(
   return false;
 }
 
+// finalizeBlockingCollection finalizes one aggregate of a bounded-lane group from its retained inputs.
+// Its sorters, spools, and dedup set are charged to `acct` while resident and released when the
+// aggregate is finalized (memory.md §6.4/§6.6).
 function finalizeBlockingCollection(
   a: Acc,
   spec: AggSpec,
@@ -29939,6 +30099,7 @@ function finalizeBlockingCollection(
   env: EvalEnv,
   budget: number,
   sink: SpillSink,
+  acct: QueryAccount,
 ): Value {
   if (spec.hypo != null) {
     const hp = spec.hypo;
@@ -29949,7 +30110,7 @@ function finalizeBlockingCollection(
     let before = 0;
     let le = 0;
     let distinct = 0;
-    const seen = new SpillMap(budget, sink);
+    const seen = new SpillMap(budget, sink, new StateCharge(acct));
     try {
       for (const tuple of collections.get(key)) {
         count++;
@@ -29957,13 +30118,8 @@ function finalizeBlockingCollection(
         if (cmp < 0) {
           before++;
           le++;
-          if (a.plan === "hypoDenseRank") {
-            const dk = distinctRowKey(tuple);
-            if (seen.get(dk) === undefined) {
-              seen.set(dk, []);
-              distinct++;
-            }
-          }
+          if (a.plan === "hypoDenseRank" && seen.insert(distinctRowKey(tuple), keyBytes(tuple)))
+            distinct++;
         } else if (cmp === 0) le++;
       }
     } finally {
@@ -30011,35 +30167,42 @@ function finalizeBlockingCollection(
       }
       return jsonValue(output + " }");
     }
-    const input = new RowSpool(budget, sink);
+    // Sorter rows are (key byte length, key, value image), ordered by the first two.
+    const sorter = new SpoolSorter(
+      (x, y) => {
+        const a = new TextEncoder().encode((x[1]! as { text: string }).text);
+        const b = new TextEncoder().encode((y[1]! as { text: string }).text);
+        return a.length - b.length || cmpBytes(a, b);
+      },
+      budget,
+      sink,
+      new StateCharge(acct),
+    );
     let sorted: RowSpool | null = null;
     try {
       // Conversion visits every input pair in input order, including overwritten duplicates.
-      for (const pair of collections.get(key))
-        input.push([pair[0]!, jsonbValue(valueToNode(pair[1]!))]);
-      sorted = sortSpool(
-        input,
-        (x, y) => {
-          const a = new TextEncoder().encode((x[0]! as { text: string }).text);
-          const b = new TextEncoder().encode((y[0]! as { text: string }).text);
-          return a.length - b.length || cmpBytes(a, b);
-        },
-        budget,
-        sink,
-      );
+      for (const pair of collections.get(key)) {
+        const name = (pair[0]! as { text: string }).text;
+        sorter.push([
+          intValue(BigInt(utf8Length(name))),
+          pair[0]!,
+          jsonbValue(valueToNode(pair[1]!)),
+        ]);
+      }
+      sorted = sorter.finishSpool();
       const members: JsonMember[] = [];
-      for (const pair of sorted) {
+      for (const row of sorted) {
         const member = {
-          key: (pair[0]! as { text: string }).text,
-          value: (pair[1]! as { node: JsonNode }).node,
+          key: (row[1]! as { text: string }).text,
+          value: (row[2]! as { node: JsonNode }).node,
         };
         if (members.at(-1)?.key === member.key) members[members.length - 1] = member;
         else members.push(member);
       }
       return jsonbValue({ kind: "object", members });
     } finally {
-      input.close();
       sorted?.close();
+      sorter.close();
     }
   }
   if (
@@ -30051,34 +30214,31 @@ function finalizeBlockingCollection(
     return finalizeAcc(a);
   if (spec.osaFrac != null)
     a.osaFrac = evalExpr(spec.osaFrac, synthetic, env, env.exec.session.scratchMeter());
-  const input = new RowSpool(budget, sink);
+  // The WITHIN GROUP sort; a collated key carries its sort-key bytes appended.
+  const sorter = new SpoolSorter(
+    (x, y) =>
+      dirCmp(
+        a.osaCollation == null
+          ? valueCmp(x[0]!, y[0]!)
+          : cmpBytes((x[1]! as { bytes: Uint8Array }).bytes, (y[1]! as { bytes: Uint8Array }).bytes),
+        a.osaDesc === true,
+      ),
+    budget,
+    sink,
+    new StateCharge(acct),
+  );
   let sorted: RowSpool | null = null;
+  let ordered: RowSpool | null = null;
   try {
     for (const row of collections.get(key)) {
       const value = row[0]!;
-      input.push(
+      sorter.push(
         a.osaCollation == null
           ? row
           : [value, byteaValue(collationSortKey(a.osaCollation, (value as { text: string }).text))],
       );
     }
-    sorted = sortSpool(
-      input,
-      (x, y) =>
-        dirCmp(
-          a.osaCollation == null
-            ? valueCmp(x[0]!, y[0]!)
-            : cmpBytes(
-                (x[1]! as { bytes: Uint8Array }).bytes,
-                (y[1]! as { bytes: Uint8Array }).bytes,
-              ),
-          a.osaDesc === true,
-        ),
-      budget,
-      sink,
-    );
-    input.close();
-    const n = sorted.length;
+    sorted = sorter.finishSpool();
     if (a.plan === "mode") {
       let best: Value = nullValue();
       let run: Value = nullValue();
@@ -30097,9 +30257,14 @@ function finalizeBlockingCollection(
       }
       return best;
     }
+    // The percentiles read their sorted input by position from a spool (charged while resident).
+    const input = new RowSpool(budget, sink, new StateCharge(acct));
+    ordered = input;
+    for (const row of sorted) input.push(row);
+    const n = input.length;
     const at = (ordinal: number): Value => {
       let index = 0;
-      for (const row of sorted!) if (index++ === ordinal) return row[0]!;
+      for (const row of input) if (index++ === ordinal) return row[0]!;
       throw new Error("percentile ordinal exceeds its input");
     };
     return finalizePercentile(a.osaFrac, n === 0, (p) => {
@@ -30121,7 +30286,8 @@ function finalizeBlockingCollection(
         : float64Value(lo + (position - first) * ((at(second) as { value: number }).value - lo));
     });
   } finally {
-    input.close();
+    ordered?.close();
     sorted?.close();
+    sorter.close();
   }
 }

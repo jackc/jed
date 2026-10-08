@@ -1,6 +1,7 @@
 package jed
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sync/atomic"
@@ -188,7 +189,7 @@ func QueryMemoryUnderflows() uint64 { return queryMemoryUnderflows.Load() }
 var queryMemoryPeak atomic.Int64
 
 // QueryMemoryPeak reports the highest query-memory balance reached since ResetQueryMemoryPeak — the
-// conformance harness's per-record peak mode compares it across cores (spec/design/memory.md §6).
+// conformance harness's per-record peak mode compares it across cores (spec/design/memory.md §7).
 func QueryMemoryPeak() int64 { return queryMemoryPeak.Load() }
 
 // ResetQueryMemoryPeak zeroes the peak before the harness runs a record.
@@ -337,4 +338,82 @@ func releaseRowsMasked[R ~[]Value](m *costMeter, rows []R, mask []bool) {
 		}
 		m.query.release(n)
 	}
+}
+
+// stateCharge is the query-memory charge an operator-state structure holds (spec/design/memory.md
+// §6): the bytes it has reserved against the statement's account and not yet returned. Go has no
+// destructors, so every owner calls releaseAll at its spec'd release point (and on its error paths
+// where the statement continues). Inert (and free) when the account is unlimited; the zero value is
+// an inert charge.
+type stateCharge struct {
+	acct queryAccount
+	held int64
+}
+
+func newStateCharge(acct queryAccount) *stateCharge { return &stateCharge{acct: acct} }
+
+// active reports whether the account has a finite budget — callers skip measuring otherwise.
+func (c *stateCharge) active() bool { return c != nil && c.acct.active() }
+
+// reserve reserves bytes through meter, so a rejection consults the cost guard first (memory.md
+// §6.7).
+func (c *stateCharge) reserve(meter *costMeter, bytes int64) error {
+	if !c.active() {
+		return nil
+	}
+	if err := meter.reserveQuery(bytes); err != nil {
+		return err
+	}
+	c.held += bytes
+	return nil
+}
+
+// reserveDirect reserves bytes straight against the account, for a structure with no meter in
+// reach. The caller passes the outcome through costMeter.costFirst (memory.md §6.7).
+func (c *stateCharge) reserveDirect(bytes int64) error {
+	if !c.active() {
+		return nil
+	}
+	if err := c.acct.reserve(bytes); err != nil {
+		return err
+	}
+	c.held += bytes
+	return nil
+}
+
+// release returns bytes of this structure's charge.
+func (c *stateCharge) release(bytes int64) {
+	if !c.active() {
+		return
+	}
+	c.acct.release(bytes)
+	c.held -= bytes
+}
+
+// releaseAll returns everything this structure still holds.
+func (c *stateCharge) releaseAll() {
+	if c != nil && c.held != 0 {
+		c.acct.release(c.held)
+		c.held = 0
+	}
+}
+
+// stateCharge returns a fresh operator-state charge against this statement's account (memory.md §6).
+func (m *costMeter) stateCharge() *stateCharge { return newStateCharge(m.query) }
+
+// costFirst applies the cost-wins rule to a reservation made without this meter (a spill structure,
+// sorter, or top-k heap reserving through its stateCharge, memory.md §6.7): a 54P05 first consults
+// the cost guard, so a step that already reached a cost ceiling reports the cost error. Sound at any
+// point on the error's way out, because accrued cost only grows and nothing is charged in between.
+func (m *costMeter) costFirst(err error) error {
+	if err == nil {
+		return nil
+	}
+	var e *EngineError
+	if errors.As(err, &e) && e.State == QueryMemoryLimitExceeded {
+		if cerr := m.Guard(); cerr != nil {
+			return cerr
+		}
+	}
+	return err
 }

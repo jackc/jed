@@ -27,6 +27,8 @@ import {
   textValue,
 } from "./value.ts";
 import { jsonCompactOut } from "./json.ts";
+import { type QueryAccount, StateCharge } from "./cost.ts";
+import { entryBytes } from "./memsize.ts";
 import { arraySubscriptErr, distinctRowKey, promote, rtName, valueToNode } from "./executor.ts";
 import type { DecimalTypmod, ScalarType } from "./types.ts";
 import {
@@ -800,78 +802,65 @@ export function combineSetop(
   all: boolean,
   left: Value[][],
   right: Value[][],
+  acct: QueryAccount,
 ): Value[][] {
   if (op === "union" && all) return left.concat(right);
+  // The dedup / count tables are operator state (memory.md §6.2): one entry_bytes per distinct
+  // right-arm row of INTERSECT/EXCEPT (built first), then per row a distinct UNION/INTERSECT/EXCEPT
+  // keeps — all returned when the combine completes.
+  const charge = new StateCharge(acct);
+  const entry = (row: Value[]): void => {
+    if (charge.active()) charge.reserveDirect(entryBytes(row));
+  };
+  const out: Value[][] = [];
   if (op === "union") {
     const seen = new Set<string>();
-    const out: Value[][] = [];
     for (const row of left.concat(right)) {
       const k = distinctRowKey(row);
       if (!seen.has(k)) {
         seen.add(k);
+        entry(row);
         out.push(row);
       }
     }
-    return out;
-  }
-  if (op === "intersect" && all) {
+  } else if (all) {
+    // INTERSECT ALL / EXCEPT ALL: a count per distinct right-arm row.
     const counts = new Map<string, number>();
     for (const row of right) {
       const k = distinctRowKey(row);
-      counts.set(k, (counts.get(k) ?? 0) + 1);
+      const c = counts.get(k);
+      if (c === undefined) entry(row);
+      counts.set(k, (c ?? 0) + 1);
     }
-    const out: Value[][] = [];
     for (const row of left) {
       const k = distinctRowKey(row);
       const c = counts.get(k) ?? 0;
       if (c > 0) {
         counts.set(k, c - 1);
-        out.push(row);
-      }
+        if (op === "intersect") out.push(row);
+      } else if (op === "except") out.push(row);
     }
-    return out;
-  }
-  if (op === "intersect") {
+  } else {
+    // INTERSECT / EXCEPT (distinct): one copy per distinct left key present in (absent from) the right.
     const rightSet = new Set<string>();
-    for (const row of right) rightSet.add(distinctRowKey(row));
-    const emitted = new Set<string>();
-    const out: Value[][] = [];
-    for (const row of left) {
-      const k = distinctRowKey(row);
-      if (rightSet.has(k) && !emitted.has(k)) {
-        emitted.add(k);
-        out.push(row);
-      }
-    }
-    return out;
-  }
-  if (op === "except" && all) {
-    const counts = new Map<string, number>();
     for (const row of right) {
       const k = distinctRowKey(row);
-      counts.set(k, (counts.get(k) ?? 0) + 1);
+      if (!rightSet.has(k)) {
+        entry(row);
+        rightSet.add(k);
+      }
     }
-    const out: Value[][] = [];
+    const emitted = new Set<string>();
     for (const row of left) {
       const k = distinctRowKey(row);
-      const c = counts.get(k) ?? 0;
-      if (c > 0) counts.set(k, c - 1);
-      else out.push(row);
-    }
-    return out;
-  }
-  // EXCEPT, distinct
-  const rightSet = new Set<string>();
-  for (const row of right) rightSet.add(distinctRowKey(row));
-  const emitted = new Set<string>();
-  const out: Value[][] = [];
-  for (const row of left) {
-    const k = distinctRowKey(row);
-    if (!rightSet.has(k) && !emitted.has(k)) {
-      emitted.add(k);
-      out.push(row);
+      if (rightSet.has(k) === (op === "intersect") && !emitted.has(k)) {
+        emitted.add(k);
+        entry(row);
+        out.push(row);
+      }
     }
   }
+  charge.releaseAll();
   return out;
 }
 

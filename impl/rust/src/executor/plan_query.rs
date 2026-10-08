@@ -400,10 +400,16 @@ impl Engine {
 
         // For UNION (distinct) a `seen` set drops rows duplicating any already-emitted row.
         let mut seen: HashSet<Row> = HashSet::new();
+        // The UNION dedup set is operator state (memory.md §6.2): an entry per kept row, reserved
+        // before its result copy, returned when the recursive CTE completes.
+        let mut seen_charge = crate::cost::StateCharge::new(acct.clone());
         let mut result: Vec<Row> = Vec::new();
         let mut working: Vec<Row> = Vec::new();
         for row in ar.rows {
             if rt.union_all || seen.insert(row.clone()) {
+                if !rt.union_all && seen_charge.active() {
+                    seen_charge.reserve_direct(crate::memsize::entry_bytes(&row))?;
+                }
                 acct.admit_row(&row)?;
                 result.push(row.clone());
                 working.push(row);
@@ -439,6 +445,9 @@ impl Engine {
             acct.reserve(acct.measure_rows(&new_rows) - before)?;
             for row in new_rows {
                 if rt.union_all || seen.insert(row.clone()) {
+                    if !rt.union_all && seen_charge.active() {
+                        seen_charge.reserve_direct(crate::memsize::entry_bytes(&row))?;
+                    }
                     acct.admit_row(&row)?;
                     result.push(row.clone());
                     working.push(row);
@@ -450,6 +459,7 @@ impl Engine {
         for buf in &rhs_buffers {
             acct.release(acct.measure_rows(buf));
         }
+        seen_charge.release_all();
         Ok(result)
     }
 
@@ -1019,7 +1029,7 @@ impl Engine {
         let coerced = acct.measure_rows(&left_rows) + acct.measure_rows(&right_rows);
         acct.reserve(coerced - before)?;
 
-        let mut rows = combine_setop(plan.op, plan.all, left_rows, right_rows);
+        let mut rows = combine_setop(plan.op, plan.all, left_rows, right_rows, &acct)?;
         acct.release(coerced - acct.measure_rows(&rows));
         let cost = left.cost + right.cost;
         let root_node = if plan.limit.is_some() || plan.offset.is_some() {

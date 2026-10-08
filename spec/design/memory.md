@@ -155,16 +155,15 @@ It is filled in by owner class:
 | Slice | Owner | Status |
 |---|---|---|
 | Q1 | **Rows** — row buffers of statement execution and engine result collectors | implemented |
-| Q2 | **Operator state** — hash-join tables, group/distinct/dedup sets and keys, aggregate accumulators (`json_agg`/`jsonb_agg` and the other JSON aggregates, ordered-set and hypothetical buffers), sort buffers and top-k heaps, window partition/frame state, spill spools' resident buffers, recursive-CTE dedup sets | planned |
+| Q2 | **Operator state** — hash-join tables, group/distinct/dedup sets and keys, aggregate accumulators (`json_agg`/`jsonb_agg` and the other JSON aggregates, ordered-set and hypothetical buffers), sort buffers and top-k heaps, window partition state, columnar lanes, spill spools' resident buffers, recursive-CTE dedup sets | implemented (§6) |
 | Q3 | **Pending writes** — a transaction-owned account for staged inserts/updates/deletes, surviving statement boundaries and released at commit/rollback | planned |
 | Q4 | **Storage** — database-owned accounts for page caches and committed in-memory storage | planned |
 
-Q2 operators that can spill must charge only their resident portion and release it
-as they spill; an operator without spill support (or a host with no scratch
-target) fails at the gate instead. A single value too large to admit fails even
-when its containing operator can spill. Until Q2 lands, `work_mem` remains the
-only bound on spill-capable operator state, and in-memory databases (which never
-spill) leave operator state unbounded by this account.
+Q2 operators that can spill charge only their resident portion and release it as
+they spill; an operator without spill support (or a database with no scratch
+target — every in-memory database) fails at the gate instead. A single value too
+large to admit fails even when its containing operator can spill. The account
+never triggers a spill: `work_mem` alone decides when an operator spills (§6.6).
 
 Q3 is necessary because a per-statement account cannot see many small INSERTs
 inside `BEGIN`; Q4 because page caches and committed in-memory storage outlive any
@@ -287,20 +286,173 @@ bounded-spill lane) but never on the core.
   the cursor is exhausted (the materialized drive releases it after its last row),
   so the same statement may have different thresholds through a lazy cursor and
   through the internal materialized path — each mirrored across cores.
-- The **columnar and vectorized lanes** gather dense column lanes that are
-  operator state (Q2); they charge their group rows and collected output.
+- The **columnar and vectorized lanes** charge their group rows and collected
+  output as Q1 buffers; their gathered lanes and group tables are operator state
+  (§6.2, §6.5).
 - The **streaming external sort** lane's input (the sorter's buffer or the
-  collated survivor buffer) is sort state (Q2).
+  collated survivor buffer) is sort state (§6.4).
 - The **bounded-spill lane** (file-backed aggregation, DISTINCT, and multi-way or
-  hash joins) holds its rows in spools (Q2); its window stage materializes its
+  hash joins) holds its rows in spools (§6.6); its window stage materializes its
   rows as a Q1 buffer while the window runs.
 
-Q1 therefore bounds row-buffer amplification — cross joins, set-returning
-functions, recursive CTE output, wide projections of large values, and
-materialized results — but not operator state, a single base relation's storage
-read before its rows are admitted, or pending writes.
+Q1 bounds row-buffer amplification — cross joins, set-returning functions,
+recursive CTE output, wide projections of large values, and materialized
+results. Operator state is Q2 (§6); a single base relation's storage read before
+its rows are admitted and pending writes remain outside the account.
 
-## 6. Rollout gates
+## 6. Q2: operator state
+
+**Operator state** is what an operator holds *besides* its row buffers: the
+lookup structures, accumulators, and resident run/spool contents that grow with
+its input. Q2 charges it to the same live account, measured with the same
+schedule, at sites mirrored in every core — so a `54P05` raised by operator state
+is as cross-core identical as one raised by a row buffer. Q2 adds no charge to a
+Q1 row buffer and re-measures nothing Q1 already holds: an in-place sort of a
+charged buffer, or an index into one, is not separate state.
+
+### 6.1 Measures
+
+```
+key_bytes(values)   = Σ value_bytes(v)                (no ROW header)
+entry_bytes(values) = ENTRY (32) + key_bytes(values)  one hash/dedup/group entry
+```
+
+`ENTRY` is `[memory] entry` in `spec/cost/schedule.toml`. Rows that enter sort
+state or a spill structure have their untouched slots (§3) replaced by NULL
+first, so they are measured in full with `row_bytes` and the measurement is
+again independent of leaf state and core.
+
+### 6.2 Hash, group, and dedup tables
+
+Each is reserved as the entry is inserted and released when its owner completes.
+
+| Owner | Reserve | Release |
+|---|---|---|
+| Hash-join build table (two-relation, N-way, and bounded-lane eager steps) | `entry_bytes(build key)` per build row whose key has no NULL, after its `hash_build` charge | with the step's input rows, once the step's output is built (§5.3) |
+| Group table, per grouping set (eager and vectorized paths) | `entry_bytes(group key)` when a group is created, before the creating row is folded; the whole-table (`()`) group reserves `ENTRY` when pre-created | each group with its accumulator state (below), when the group is finalized — after its synthetic row is built, before that row is admitted |
+| `SELECT DISTINCT` dedup set (eager, grouped, and streaming-scan DISTINCT) | `entry_bytes(projected row)` per first occurrence, before the kept row is admitted | when the DISTINCT pass completes (the streaming scan: when the scan ends) |
+| Set-operation dedup (`UNION`, `INTERSECT`, `EXCEPT`, distinct and `ALL`) | `entry_bytes(row)` per distinct right-arm row of an `INTERSECT`/`EXCEPT` (its set or count table, built first), then per row a `UNION`/`INTERSECT`/`EXCEPT` (distinct) keeps | when the combine completes |
+| Recursive-CTE `UNION` dedup set | `entry_bytes(row)` per kept row, before its result copy is admitted | when the recursive CTE completes |
+| Window partition table, per shared partition/sort group | `entry_bytes(partition key)` per partition, when created | when the window stage completes (after its results are appended) |
+
+A **vectorized** group table (the single-integer-key and whole-table lanes) follows
+the same rule but finalizes every group before admitting any group row, so it
+releases all of its entries after the last group is finalized.
+
+### 6.3 Aggregate accumulators
+
+Accumulators that keep a fixed-size running value (`count`, `sum`, `avg`,
+`min`/`max`, the float folds, `bool`/`bit` folds) are covered by their group's
+entry. Accumulators that **retain their inputs** reserve each retained input, after
+it is folded:
+
+| Accumulator | Per retained input |
+|---|---|
+| `json_agg`, `jsonb_agg` (and `_strict`, which retains no NULL) | `value_bytes(argument)` |
+| `json_object_agg`, `jsonb_object_agg` (and `_unique`, `_strict`) | `value_bytes(key) + value_bytes(value)` |
+| `mode`, `percentile_disc`, `percentile_cont` (non-NULL inputs) | `value_bytes(argument)` |
+| `rank`, `dense_rank`, `percent_rank`, `cume_dist` (hypothetical-set) | `row_bytes(WITHIN GROUP key tuple)` |
+| any `DISTINCT` aggregate's value set | `entry_bytes([argument])` per newly seen non-NULL value |
+
+A grouped accumulator's charge belongs to its group and is released with it
+(§6.2). A **window** aggregate's accumulator is released when the accumulator is
+discarded: at the end of each partition's running pass, after each row's result
+under a re-folded frame (`EXCLUDE`, `FILTER`), and when a moving frame rebuilds
+it.
+
+### 6.4 Sort state
+
+The single-table streaming-sort lane holds its survivors as sort state instead of
+a row buffer:
+
+- **External sorter.** Each survivor pushed into the sorter reserves its
+  `row_bytes`. A run written to scratch releases the rows it held. The final
+  in-memory run stays charged while the sorted output is emitted.
+- **Collated survivor buffer** (a collated `ORDER BY`, which sorts in memory):
+  each survivor reserves its `row_bytes` as it is collected. A collated top-k
+  selection then releases the whole buffer and re-reserves the rows it keeps.
+- **Top-k heap.** A survivor the heap retains reserves its `row_bytes`; the row it
+  evicts (if any) is released after the newcomer is reserved. A survivor the heap
+  rejects, and every survivor under `LIMIT 0`, reserves nothing.
+
+The sorted output's remaining charge is released when its emission completes —
+after the last windowed row is collected by the materialized drive, or when a
+lazy cursor is exhausted or closed. The bounded-spill lane's sorters (its
+`ORDER BY` and its ordered-set finalization) follow the same sorter rule, and
+their output transfers into a spool (§6.6). The eager executor's in-place sort of a
+charged buffer adds nothing.
+
+### 6.5 Columnar lanes
+
+The columnar projection lane gathers the touched columns of a file-backed relation
+into dense lanes in one bulk read. Once the gather completes it reserves
+`key_bytes` of every gathered value (the bounded overshoot of a bulk read, like a
+base relation's storage read, §5), and releases them when its emission completes
+(as in §6.4). The columnar aggregate lane folds during the tree walk without
+gathering lanes; it holds only its group table (§6.2).
+
+### 6.6 Spill-capable structures and `work_mem`
+
+The bounded-spill lane (and the file-backed streaming DISTINCT) keeps operator
+state in three spill-capable structures. Each measures its **residency with this
+schedule** — the same number it charges — so a spill happens at the same input
+row in every core:
+
+| Structure | Resident measure per element |
+|---|---|
+| Row spool | `row_bytes(row)` |
+| Keyed state map (groups, dedup sets) | `ENTRY + key_bytes(key) + key_bytes(value)` |
+| Hash row table (spilled hash-join build, retained aggregate inputs) | `ENTRY + row_bytes(row)` |
+
+An insert reserves its element's bytes; replacing a resident state-map value
+reserves the growth (or releases the shrinkage) of `key_bytes(value)`. When a
+structure's resident bytes then **exceed `work_mem`**, it spills: its elements move
+to scratch and its whole resident charge is released. A spilled structure
+reserves nothing further. A structure's remaining charge is released when it is
+discarded — a spool or map feeding a stage when that stage completes, and the
+lane's final output spool when its emission completes (§6.4).
+
+Because the measures depend on what each element holds, the bounded-spill lane's
+**element shapes are part of the contract**:
+
+| Structure | Element |
+|---|---|
+| Stage spools | relation rows (untouched slots NULL), physically placed driver and combined join rows, NULL-extended rows, post-WHERE rows (the WHERE pass always copies into a new spool, filter or not), group rows, and `ORDER BY` rows decorated with every order-expression value and then every order key (a collated key as `bytea` of its sort key) |
+| Group state map | key: the group-key values; value: `[int ordinal, composite(packed) per aggregate]`, packed as `count` → `[int]`, integer `sum` → `[int, bool seen]`, decimal `sum` → `[decimal, bool]`, `avg` → `[decimal, int count]`, float `sum`/`avg` → `[f64, int, bool, bool, bool]`, `min`/`max` → `[value or NULL]`, JSON aggregates → `[bool seen]`, ordered-set and hypothetical → `[]` |
+| Group key spool | the group-key values, one row per group in creation order |
+| `DISTINCT`-aggregate set / object-agg unique set | `[int ordinal, int aggregate index, value]` / `[int ordinal, int aggregate index, text key]` |
+| Retained aggregate inputs (hash rows, keyed by `ordinal × aggregates + index`) | `json_agg` → `[jsonb node]`; `json_object_agg` → `[text key, value]`; ordered-set → `[value]` (`percentile_cont`: `[f64]`); hypothetical → the key tuple |
+| Spilled hash-join build | `[bytea encoded key, composite(build row)]` (the key encoding is the §8 byte contract) |
+| Probe matches / right-match set | a per-left-row spool of matched build rows / `[int match ordinal]` |
+| Finalization | ordered-set sorter rows `[value]` or `[value, bytea collation key]`; percentile spool of sorted rows; `json_object_agg` sorter rows `[int UTF-8 length, text key, jsonb]`; dense-rank distinct set of key tuples |
+
+So a spill-capable operator's charge is bounded by `work_mem` plus one element,
+and the account never forces a spill: a budget below `work_mem` fails `54P05`
+where spilling would have succeeded. A host that wants spilling to keep a query
+alive under a budget sets `work_mem` well below `max_query_memory_bytes`. An
+in-memory database never spills, so its structures charge everything they hold.
+
+### 6.7 Cost wins
+
+A Q2 reservation follows §2: when it is rejected, the statement meter's cost guard
+is consulted first, so a step that has already reached `max_cost` or the lifetime
+budget reports `54P01`/`54P02`. A structure that reserves with no meter in reach
+(a spill structure, sorter, or top-k heap) returns its `54P05` to the operator,
+which consults the guard before reporting it — equivalent, since accrued cost only
+grows and nothing is charged on the error's way out. The set-operation combine and
+the recursive CTE run between their parts' meters and reserve against the account
+directly, as their Q1 reservations do.
+
+### 6.8 Not covered
+
+Q2 leaves these transient, input-proportional allocations outside the account:
+collation sort-key decorations (computed from already-charged text), a window
+frame's cached operand values, merge-heap heads of spilled runs, the index lists
+that partition or permute an already-charged buffer, and the per-row key
+encodings a hash probe computes and discards. They are bounded by charged state
+times a small factor; they are guardrail overshoot, not unbounded growth.
+
+## 7. Rollout gates
 
 Each slice lands in all three cores together with: corpus entries pinning exact
 `54P05` thresholds for its owners (`# max_query_memory_bytes: N`, capability
@@ -310,7 +462,8 @@ which owners are covered; `max_query_memory_bytes` must not be described as a
 process or heap limit.
 
 `rake conformance:query_memory` runs the whole corpus with accounting active in
-both storage modes. Each core records every record's **peak balance** (its minimal
-passing budget) and the task fails unless all cores agree on every record — the
-whole corpus, not only the records that pin a threshold, is the cross-core check
-of the reserve and release sites.
+both storage modes, and once more on disk with `work_mem` forced low so every
+spill-capable structure spills. Each core records every record's **peak balance**
+(its minimal passing budget) and the task fails unless all cores agree on every
+record — the whole corpus, not only the records that pin a threshold, is the
+cross-core check of the reserve and release sites.

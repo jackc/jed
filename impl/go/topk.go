@@ -59,6 +59,10 @@ type topKKeeper struct {
 	nextPos   uint64
 	collated  bool
 	selection topKHeap
+	// charge is the retained rows' query-memory charge when the heap is sort state (the
+	// streaming-sort lane, memory.md §6.4); nil (inert) for the eager top-k selection, whose rows
+	// are Q1 buffer rows. A rejected reservation returns 54P05 from push for the caller's costFirst.
+	charge *stateCharge
 }
 
 func newTopKKeeper(k int64, order []orderSlot, collated bool) *topKKeeper {
@@ -81,10 +85,22 @@ func (t *topKKeeper) push(row storedRow) error {
 		return nil
 	}
 	if int64(t.selection.Len()) < t.k {
+		if t.charge.active() {
+			if err := t.charge.reserveDirect(memRowBytes(item.row)); err != nil {
+				return err
+			}
+		}
 		heap.Push(&t.selection, item)
 		return nil
 	}
 	if compareTopKItems(item, t.selection.items[0], t.selection.order, t.collated) < 0 {
+		if t.charge.active() {
+			// The newcomer is reserved before the evicted row is released (memory.md §6.4).
+			if err := t.charge.reserveDirect(memRowBytes(item.row)); err != nil {
+				return err
+			}
+			t.charge.release(memRowBytes(t.selection.items[0].row))
+		}
 		t.selection.items[0] = item
 		heap.Fix(&t.selection, 0)
 	}

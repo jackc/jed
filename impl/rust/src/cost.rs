@@ -120,6 +120,77 @@ impl QueryAccount {
     }
 }
 
+/// The query-memory charge an operator-state structure holds (spec/design/memory.md §6): the bytes it
+/// has reserved against the statement's account and not yet returned. Released explicitly at the
+/// structure's spec'd release point; dropping it returns whatever is still held, so an error path
+/// never strands a charge. Inert (and free) when the account is unlimited.
+#[derive(Default)]
+pub(crate) struct StateCharge {
+    acct: QueryAccount,
+    held: i64,
+}
+
+impl StateCharge {
+    pub(crate) fn new(acct: QueryAccount) -> Self {
+        StateCharge { acct, held: 0 }
+    }
+
+    /// Whether the account has a finite budget — callers skip measuring otherwise.
+    #[inline]
+    pub(crate) fn active(&self) -> bool {
+        self.acct.active()
+    }
+
+    /// Reserve `bytes` through `meter` (so a rejection consults the cost guard first, memory.md §6.7).
+    pub(crate) fn reserve(&mut self, meter: &mut Meter, bytes: i64) -> Result<()> {
+        if !self.acct.active() {
+            return Ok(());
+        }
+        meter.reserve_query(bytes)?;
+        self.held += bytes;
+        Ok(())
+    }
+
+    /// Reserve `bytes` straight against the account, for a structure with no meter in reach. The
+    /// caller wraps the outcome in [`Meter::cost_first`] (memory.md §6.7).
+    pub(crate) fn reserve_direct(&mut self, bytes: i64) -> Result<()> {
+        if !self.acct.active() {
+            return Ok(());
+        }
+        self.acct.reserve(bytes)?;
+        self.held += bytes;
+        Ok(())
+    }
+
+    /// Return `bytes` of this structure's charge.
+    pub(crate) fn release(&mut self, bytes: i64) {
+        if !self.acct.active() {
+            return;
+        }
+        self.acct.release(bytes);
+        self.held -= bytes;
+    }
+
+    /// Return everything this structure still holds.
+    pub(crate) fn release_all(&mut self) {
+        if self.held != 0 {
+            self.acct.release(self.held);
+            self.held = 0;
+        }
+    }
+
+    /// The bytes currently held.
+    pub(crate) fn held(&self) -> i64 {
+        self.held
+    }
+}
+
+impl Drop for StateCharge {
+    fn drop(&mut self) {
+        self.release_all();
+    }
+}
+
 /// Accrues deterministic execution cost and enforces an optional per-statement ceiling **and** an
 /// optional per-session budget (CLAUDE.md §13; spec/design/session.md §5.4). Threaded by `&mut`
 /// through the executor and the recursive expression evaluator; the accrued (per-statement) total is
@@ -195,6 +266,25 @@ impl Meter {
     /// Return `bytes` of live query memory; never errors, never below zero.
     pub fn release_query(&mut self, bytes: i64) {
         self.query.release(bytes);
+    }
+
+    /// Apply the cost-wins rule to a reservation made without this meter (a spill structure or sorter
+    /// reserving through its [`StateCharge`], memory.md §6.7): a `54P05` first consults the cost guard,
+    /// so a step that already reached a cost ceiling reports the cost error. Sound at any point on the
+    /// error's way out, because accrued cost only grows and nothing is charged in between.
+    pub(crate) fn cost_first<T>(&mut self, r: Result<T>) -> Result<T> {
+        match r {
+            Err(e) if e.state == SqlState::QueryMemoryLimitExceeded => {
+                self.guard()?;
+                Err(e)
+            }
+            r => r,
+        }
+    }
+
+    /// A fresh operator-state charge against this statement's account (memory.md §6).
+    pub(crate) fn state_charge(&self) -> StateCharge {
+        StateCharge::new(self.query.clone())
     }
 
     /// Admit a projected row appended to a row buffer (memory.md §5.1).

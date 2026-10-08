@@ -1002,7 +1002,7 @@ namespace :conformance do
   # Each core also writes every record's PEAK balance (JED_CONFORMANCE_QUERY_MEMORY_PEAKS) — the
   # minimal budget under which that record passes — and the task fails unless the three cores agree
   # on every record's peak in each mode: the whole corpus becomes the cross-core check of the
-  # reserve/release sites, not only the records that pin a threshold (memory.md §6).
+  # reserve/release sites, not only the records that pin a threshold (memory.md §7).
   desc "Run the shared SQL corpus on all cores with query-memory accounting active (bytes, optional path filter)"
   task :query_memory, [:bytes, :filter] do |_, args|
     require "tmpdir"
@@ -1010,8 +1010,10 @@ namespace :conformance do
     env["JED_CONFORMANCE_FILTER"] = args[:filter] if args[:filter]
     Dir.mktmpdir("jed-query-memory-peaks") do |dir|
       mismatches = []
-      { "memory" => {}, "disk" => {} }.each do |mode, mode_env|
-        extra = mode == "disk" ? ["disk"] : []
+      # The third pass forces every spill-capable structure on disk to spill (work_mem 256), so the
+      # spill transitions' releases are cross-checked too (memory.md §6.6).
+      { "memory" => {}, "disk" => {}, "disk-spill" => { "JED_CONFORMANCE_WORK_MEM" => "256" } }.each do |mode, mode_env|
+        extra = mode.start_with?("disk") ? ["disk"] : []
         peaks = %w[rust go ts].to_h { |core| [core, File.join(dir, "#{mode}-#{core}.tsv")] }
         sh env.merge(mode_env, "JED_CONFORMANCE_QUERY_MEMORY_PEAKS" => peaks["rust"]),
            "cargo", "run", "--release", "--quiet", "--bin", "conformance", "--manifest-path", RUST_MANIFEST, "--", *extra

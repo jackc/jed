@@ -12,6 +12,7 @@ pub const MEMORY_ROW: i64 = 32;
 pub const MEMORY_VALUE: i64 = 32;
 pub const MEMORY_ARRAY_DIM: i64 = 16;
 pub const MEMORY_DECIMAL_GROUP: i64 = 4;
+pub const MEMORY_ENTRY: i64 = 32;
 
 /// The deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
 pub struct CostSchedule {

@@ -7,6 +7,9 @@ pub(crate) struct HashJoinTable {
     entries: HashMap<u64, Vec<HashJoinEntry>>,
     hash: fn(&[u8]) -> u64,
     probe_offset: usize,
+    /// The table's query-memory charge: `entry_bytes(build key)` per entry (memory.md §6.2), returned
+    /// when the table is dropped at the end of its join step.
+    charge: crate::cost::StateCharge,
 }
 
 struct HashJoinEntry {
@@ -44,6 +47,7 @@ impl HashJoinTable {
             entries: HashMap::new(),
             hash,
             probe_offset,
+            charge: meter.state_charge(),
         };
         let indices: Vec<usize> = plan
             .keys
@@ -56,6 +60,10 @@ impl HashJoinTable {
             else {
                 continue;
             };
+            if table.charge.active() {
+                let bytes = crate::memsize::entry_bytes_at(row, &indices);
+                table.charge.reserve(meter, bytes)?;
+            }
             let hash = (table.hash)(&key);
             table.entries.entry(hash).or_default().push(HashJoinEntry {
                 key,

@@ -23,8 +23,9 @@ CREATE TABLE n (id i32 PRIMARY KEY)
 statement ok
 INSERT INTO n SELECT g FROM generate_series(1, 6) g
 
-# DISTINCT keeps the first-occurrence projected rows (195) beside the post-WHERE relation (387).
-# max_query_memory_bytes: 582
+# DISTINCT keeps the first-occurrence projected rows (195) and their dedup entries (ENTRY 32 + key:
+# 195, memory.md §6.2) beside the post-WHERE relation (387).
+# max_query_memory_bytes: 777
 query T rowsort
 SELECT DISTINCT v FROM t
 ----
@@ -32,21 +33,22 @@ NULL
 a
 bb
 
-# max_query_memory_bytes: 581
+# max_query_memory_bytes: 776
 statement error 54P05
 SELECT DISTINCT v FROM t
 
-# max_query_memory_bytes: 582
+# max_query_memory_bytes: 777
 query T nosort
 SELECT DISTINCT v FROM t ORDER BY v LIMIT 1
 ----
 a
 
-# max_query_memory_bytes: 581
+# max_query_memory_bytes: 776
 statement error 54P05
 SELECT DISTINCT v FROM t ORDER BY v LIMIT 1
 
-# Group rows (291) are admitted before the aggregate input (387) is released.
+# Group rows (291) are admitted before the aggregate input (387) is released; each group's entry
+# (memory.md §6.2) is released as the group is finalized, so the entries (195) never stack on top.
 # max_query_memory_bytes: 678
 query TI rowsort
 SELECT v, count(*) FROM t GROUP BY v
@@ -78,13 +80,15 @@ NULL
 statement error 54P05
 SELECT v, count(*) FROM t GROUP BY v HAVING count(*) > 0 ORDER BY v
 
-# max_query_memory_bytes: 451
+# The whole-table group's entry (32) and the DISTINCT value set's two entries (65 + 66, memory.md
+# §6.3) sit beside the aggregate input (387).
+# max_query_memory_bytes: 550
 query I nosort
 SELECT count(DISTINCT v) FROM t
 ----
 2
 
-# max_query_memory_bytes: 450
+# max_query_memory_bytes: 549
 statement error 54P05
 SELECT count(DISTINCT v) FROM t
 

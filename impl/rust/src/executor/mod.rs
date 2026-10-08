@@ -256,6 +256,8 @@ pub(crate) enum Emitter {
         sel: Option<Vec<i32>>,
         start: usize,
         end: usize,
+        /// The gathered lanes' query-memory charge (memory.md §6.5), returned when emission completes.
+        charge: crate::cost::StateCharge,
     },
 }
 

@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::collation::Collation;
+use crate::cost::StateCharge;
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::key_cmp;
@@ -44,43 +45,12 @@ pub(crate) type SortKey = (usize, bool, bool, Option<Arc<Collation>>);
 /// with the process id; the value is internal (it never affects results — spill.md §6).
 static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// A cheap, deterministic estimate of a row's resident bytes (spill.md §2): a fixed base per value
-/// plus its variable payload. It need not be the exact heap footprint — it only decides spill
-/// *timing*, invisible to results and cost — so a cheap estimate is enough.
-fn value_bytes(v: &Value) -> usize {
-    // A `Value` enum slot is ~24 bytes; add the heap payload for the variable-width variants.
-    const BASE: usize = 24;
-    BASE + match v {
-        Value::Text(s) | Value::Json(s) | Value::JsonPath(s) => s.len(),
-        Value::Bytea(b) => b.len(),
-        Value::Decimal(d) => d.to_codec().2.len() * 2,
-        Value::Unfetched(Unfetched::InlineComp { comp, .. }) => comp.len(),
-        Value::Unfetched(Unfetched::Inline { block, .. }) => block.len(),
-        Value::Composite(fields) => fields.iter().map(value_bytes).sum(),
-        Value::Array(a) => a.elements.iter().map(value_bytes).sum(),
-        Value::Range(r) => {
-            r.lower.as_deref().map_or(0, value_bytes) + r.upper.as_deref().map_or(0, value_bytes)
-        }
-        Value::Jsonb(node) => json_bytes(node),
-        _ => 0,
-    }
-}
-
-fn json_bytes(node: &json::JsonNode) -> usize {
-    24 + match node {
-        json::JsonNode::String(s) => s.len(),
-        json::JsonNode::Number(d) => d.to_codec().2.len() * 2,
-        json::JsonNode::Array(values) => values.iter().map(json_bytes).sum(),
-        json::JsonNode::Object(members) => members
-            .iter()
-            .map(|(key, v)| key.len() + json_bytes(v))
-            .sum(),
-        _ => 0,
-    }
-}
-
+/// A row's resident bytes for the `work_mem` spill decision: the shared logical size schedule of
+/// spec/design/memory.md §3 — the same number the query-memory account charges for sort and spill
+/// state (§6.6), so every core spills at the same input row. Rows reach a sorter or spill structure
+/// with their untouched slots NULLed (§6.1), so no lazy reference hides a backing block here.
 pub(crate) fn row_bytes(row: &Row) -> usize {
-    8 + row.iter().map(value_bytes).sum::<usize>()
+    usize::try_from(crate::memsize::row_bytes(row)).unwrap_or(usize::MAX)
 }
 
 /// The external merge sorter (spec/design/spill.md §4). Push rows, then `finish` to read them back
@@ -100,12 +70,21 @@ pub(crate) struct Sorter {
     run_levels: Vec<usize>,
     /// The total rows pushed (the count `LIMIT`/`OFFSET` windows against — spill.md §5).
     total: usize,
+    /// The query-memory charge of the resident run (memory.md §6.4): reserved per pushed row, returned
+    /// when a run spills, and handed to the [`SortedRows`] at `finish` so it is returned when the
+    /// sorted output's emission completes.
+    charge: StateCharge,
 }
 
 impl Sorter {
     /// A sorter over the `keys`, bounded by `budget` bytes, spilling into `spill_dir` (or `None` =
     /// never spill, the in-memory database / unlimited case).
-    pub(crate) fn new(keys: Vec<SortKey>, budget: usize, spill_dir: Option<PathBuf>) -> Sorter {
+    pub(crate) fn new(
+        keys: Vec<SortKey>,
+        budget: usize,
+        spill_dir: Option<PathBuf>,
+        charge: StateCharge,
+    ) -> Sorter {
         Sorter {
             keys: Arc::new(keys),
             budget,
@@ -115,6 +94,7 @@ impl Sorter {
             runs: Vec::new(),
             run_levels: Vec::new(),
             total: 0,
+            charge,
         }
     }
 
@@ -125,11 +105,17 @@ impl Sorter {
 
     /// Push one row into the sorter. Spills the current run to disk when the in-memory buffer
     /// exceeds the budget (file-backed databases only).
+    /// A rejected query-memory reservation returns `54P05` for the caller to pass through
+    /// [`crate::cost::Meter::cost_first`] (memory.md §6.7).
     pub(crate) fn push(&mut self, row: Row) -> Result<()> {
-        self.total += 1;
-        if self.can_spill() {
-            self.buf_bytes += row_bytes(&row);
+        if self.can_spill() || self.charge.active() {
+            let bytes = row_bytes(&row);
+            self.charge.reserve_direct(bytes as i64)?;
+            if self.can_spill() {
+                self.buf_bytes += bytes;
+            }
         }
+        self.total += 1;
         self.buf.push(row);
         if self.can_spill() && self.buf_bytes > self.budget {
             self.spill_run()?;
@@ -182,6 +168,8 @@ impl Sorter {
         self.run_levels.push(0);
         self.buf.clear();
         self.buf_bytes = 0;
+        // The run left memory: its rows' charge goes with it (memory.md §6.4/§6.6).
+        self.charge.release_all();
         // Binary compaction merges adjacent equally sized run generations. At most one run per
         // machine-word bit survives: descriptor and run metadata counts never scale with rows.
         while self.run_levels.len() >= 2 {
@@ -216,9 +204,11 @@ impl Sorter {
     pub(crate) fn finish(mut self) -> Result<SortedRows> {
         let keys = self.keys.clone();
         self.buf.sort_by(|a, b| Sorter::cmp_rows(&keys, a, b));
+        let charge = std::mem::take(&mut self.charge);
         if self.runs.is_empty() {
             return Ok(SortedRows::InMemory(
                 std::mem::take(&mut self.buf).into_iter(),
+                charge,
             ));
         }
         // Sources: each spilled run, then the final in-memory buffer last (it holds the latest input
@@ -239,7 +229,7 @@ impl Sorter {
             }
         }
         self.runs.clear();
-        Ok(SortedRows::Merge(Merger { sources, heap }))
+        Ok(SortedRows::Merge(Merger { sources, heap }, charge))
     }
 }
 
@@ -302,10 +292,10 @@ pub(crate) fn create_spill_file(dir: &std::path::Path) -> Result<(PathBuf, File)
 /// The sorted output stream (spec/design/spill.md §4). The window/projection loop pulls rows one at
 /// a time, so neither the input nor the output is re-materialized in the spill case.
 pub(crate) enum SortedRows {
-    /// No spill: the in-memory stable-sorted buffer.
-    InMemory(std::vec::IntoIter<Row>),
-    /// Spilled: a k-way merge of the run files + the final buffer.
-    Merge(Merger),
+    /// No spill: the in-memory stable-sorted buffer, and its query-memory charge (memory.md §6.4).
+    InMemory(std::vec::IntoIter<Row>, StateCharge),
+    /// Spilled: a k-way merge of the run files + the final buffer, and the final buffer's charge.
+    Merge(Merger, StateCharge),
 }
 
 impl SortedRows {
@@ -313,8 +303,16 @@ impl SortedRows {
     /// this returns `Result`.
     pub(crate) fn next(&mut self) -> Result<Option<Row>> {
         match self {
-            SortedRows::InMemory(it) => Ok(it.next()),
-            SortedRows::Merge(m) => m.next(),
+            SortedRows::InMemory(it, _) => Ok(it.next()),
+            SortedRows::Merge(m, _) => m.next(),
+        }
+    }
+
+    /// Return the sort state's remaining query-memory charge — the emission completed (memory.md
+    /// §6.4). Dropping the rows does the same; this names the spec'd release point.
+    pub(crate) fn release(&mut self) {
+        match self {
+            SortedRows::InMemory(_, charge) | SortedRows::Merge(_, charge) => charge.release_all(),
         }
     }
 }
@@ -845,27 +843,26 @@ mod bounded_run_tests {
     use super::*;
 
     #[test]
-    fn retained_inline_slice_accounts_for_its_entire_backing_block() {
-        let block = Arc::new(vec![0u8; 65536]);
-        let value = Value::Unfetched(Unfetched::Inline {
-            block,
-            off: 10,
-            len: 1,
-            ty: crate::value::TypeRef::sentinel(),
-        });
-        assert!(row_bytes(&vec![value]) >= 65536);
+    fn residency_is_the_logical_size_schedule() {
+        let row = vec![Value::Int(1), Value::Text("abc".into()), Value::Null];
+        assert_eq!(row_bytes(&row) as i64, crate::memsize::row_bytes(&row));
     }
 
     #[test]
     fn spilling_sort_bounds_run_metadata_and_merge_descriptors() {
-        let mut sort = Sorter::new(vec![(0, false, false, None)], 1, Some(std::env::temp_dir()));
+        let mut sort = Sorter::new(
+            vec![(0, false, false, None)],
+            1,
+            Some(std::env::temp_dir()),
+            StateCharge::default(),
+        );
         for i in 0..2048 {
             sort.push(vec![Value::Int(i % 7), Value::Int(i)]).unwrap();
             assert!(sort.runs.len() <= usize::BITS as usize);
             assert!(sort.buf.is_empty());
         }
         let mut rows = sort.finish().unwrap();
-        if let SortedRows::Merge(merge) = &rows {
+        if let SortedRows::Merge(merge, _) = &rows {
             assert!(merge.sources.len() <= usize::BITS as usize + 1);
         }
         let mut previous = (-1i64, -1i64);

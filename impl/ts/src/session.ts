@@ -28,6 +28,7 @@ import type { Row } from "./storage.ts";
 import { isTrue, nullValue } from "./value.ts";
 import { evalExpr } from "./eval.ts";
 import { COSTS, DEFAULT_SCALAR_BYTES } from "./costs.ts";
+import { entryBytes } from "./memsize.ts";
 import type { TableStore } from "./storage.ts";
 import type { KeyBound } from "./pmap.ts";
 export class SessionState {
@@ -527,6 +528,9 @@ export type LaneAt = (j: number, col: number) => Value;
 // to the unmetered lane (no per-row guard to preserve).
 export function foldAggWhole(specs: AggSpec[], at: LaneAt, nsurv: number, meter: Meter): Value[] {
   const accs = specs.map((s) => newAccFromSpec(s));
+  // The whole-table group's entry (memory.md §6.2), returned once the group is finalized.
+  const charge = meter.stateCharge();
+  if (charge.active()) charge.reserve(meter, entryBytes([]));
   specs.forEach((spec, si) => {
     meter.charge(COSTS.aggregateAccumulate * BigInt(nsurv));
     const oc = operandCol(spec);
@@ -534,7 +538,9 @@ export function foldAggWhole(specs: AggSpec[], at: LaneAt, nsurv: number, meter:
       foldAcc(accs[si]!, oc === null ? nullValue() : at(j, oc), meter);
     }
   });
-  return accs.map((a) => finalizeAcc(a));
+  const out = accs.map((a) => finalizeAcc(a));
+  charge.releaseAll();
+  return out;
 }
 
 // groupByIntKey buckets `nsurv` survivors from `at` by their single INTEGER group-key column and folds
@@ -555,6 +561,9 @@ export function groupByIntKey(
   const groups: { key: Value; accs: Acc[] }[] = [];
   const index = new Map<bigint, number>();
   let nullGi = -1;
+  // The group table's entries (memory.md §6.2): all groups are finalized before any group row is
+  // admitted, so the whole table is returned after the last finalize.
+  const charge = meter.stateCharge();
 
   meter.charge(COSTS.aggregateAccumulate * BigInt(nsurv) * BigInt(specs.length));
   for (let j = 0; j < nsurv; j++) {
@@ -563,6 +572,7 @@ export function groupByIntKey(
     if (kv.kind === "int") {
       const g = index.get(kv.int);
       if (g === undefined) {
+        if (charge.active()) charge.reserve(meter, entryBytes([kv]));
         gi = groups.length;
         index.set(kv.int, gi);
         groups.push({ key: kv, accs: specs.map((s) => newAccFromSpec(s)) });
@@ -573,6 +583,7 @@ export function groupByIntKey(
       // A NULL integer key (the only other case for an integer column) buckets into one sentinel
       // group, exactly as the scalar path groups all NULLs together.
       if (nullGi < 0) {
+        if (charge.active()) charge.reserve(meter, entryBytes([nullValue()]));
         nullGi = groups.length;
         groups.push({ key: nullValue(), accs: specs.map((s) => newAccFromSpec(s)) });
       }
@@ -585,11 +596,13 @@ export function groupByIntKey(
     });
   }
 
-  return groups.map((g) => {
+  const out = groups.map((g) => {
     const srow: Value[] = [g.key];
     for (const a of g.accs) srow.push(finalizeAcc(a));
     return srow;
   });
+  charge.releaseAll();
+  return out;
 }
 
 // streamRows is the lazy pull pipeline behind a streaming cursor (spec/design/streaming.md §3/§4, S3):
@@ -615,7 +628,7 @@ export function* streamRows(
   if (empty || sp.limit === 0n) return;
   const offset = sp.offset ?? 0n;
   const distinct = sp.distinct;
-  const seen = new SpillSet(env.exec.session.workMem, env.exec.spillSink);
+  const seen = new SpillSet(env.exec.session.workMem, env.exec.spillSink, meter.stateCharge());
   try {
     let passed = 0n;
     let produced = 0n;
@@ -634,8 +647,8 @@ export function* streamRows(
         // duplicate — the §3 asymmetry), drop a value already seen, then OFFSET/LIMIT window the survivors.
         const tuple = sp.projections.map((p) => evalExpr(p, row, env, meter));
         const key = distinctRowKey(tuple);
-        if (seen.has(key)) continue;
-        seen.add(key);
+        // A new value reserves its dedup entry until the scan ends (memory.md §6.2).
+        if (!meter.costFirst(() => seen.insert(key, tuple))) continue;
         passed += 1n;
         if (passed <= offset) continue;
         meter.charge(COSTS.rowProduced);
@@ -721,11 +734,16 @@ export function* bufferedRows(
     const cols = em.cols!;
     const projCols = em.projCols!;
     const sel = em.sel;
-    for (let j = em.start; j < em.end; j++) {
-      meter.guard(); // enforce the cost ceiling / cancellation per produced row (CLAUDE.md §13)
-      meter.charge(COSTS.rowProduced);
-      const l = sel === undefined ? j : sel[j]!;
-      yield projCols.map((c) => cols[c]![l]!);
+    try {
+      for (let j = em.start; j < em.end; j++) {
+        meter.guard(); // enforce the cost ceiling / cancellation per produced row (CLAUDE.md §13)
+        meter.charge(COSTS.rowProduced);
+        const l = sel === undefined ? j : sel[j]!;
+        yield projCols.map((c) => cols[c]![l]!);
+      }
+    } finally {
+      // Exhausted or closed: the lanes' charge is returned with them (memory.md §6.5).
+      em.columnarCharge?.releaseAll();
     }
     return;
   }

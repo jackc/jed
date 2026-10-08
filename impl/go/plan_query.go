@@ -354,9 +354,18 @@ func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
 	// a kept row's result copy is admitted, a duplicate is released, and a consumed working table is
 	// released when the next iteration replaces it.
 	acct := db.session.queryAccount()
+	// The UNION dedup set is operator state (memory.md §6.2): an entry per kept row, reserved before
+	// its result copy, returned when the recursive CTE completes.
+	seenCharge := newStateCharge(acct)
+	defer seenCharge.releaseAll()
 	var result, working []storedRow
 	for _, row := range ar.rows {
 		if keep(row) {
+			if !rt.unionAll && seenCharge.active() {
+				if err := seenCharge.reserveDirect(memEntryBytes(row)); err != nil {
+					return nil, err
+				}
+			}
 			if err := acct.admitRow(row); err != nil {
 				return nil, err
 			}
@@ -400,6 +409,11 @@ func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
 		for _, vrow := range rr.rows {
 			row := storedRow(vrow)
 			if keep(row) {
+				if !rt.unionAll && seenCharge.active() {
+					if err := seenCharge.reserveDirect(memEntryBytes(row)); err != nil {
+						return nil, err
+					}
+				}
 				if err := acct.admitRow(row); err != nil {
 					return nil, err
 				}
@@ -413,6 +427,7 @@ func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
 	for _, buf := range rhsBuffers {
 		acct.release(measureRows(acct, buf))
 	}
+	seenCharge.releaseAll()
 	return result, nil
 }
 
@@ -1417,7 +1432,10 @@ func (db *engine) execSetOpPlan(plan *setOpPlan, outer []storedRow, params []Val
 		return selectResult{}, err
 	}
 
-	rows := combineSetop(plan.op, plan.all, left.rows, right.rows)
+	rows, err := combineSetop(plan.op, plan.all, left.rows, right.rows, acct)
+	if err != nil {
+		return selectResult{}, err
+	}
 	acct.release(coerced - measureRows(acct, rows))
 	cost := left.cost + right.cost
 	rootNode := setOpNodeName(plan.op)
@@ -1714,33 +1732,56 @@ func coerceSetopRows(rows [][]Value, from, to []resolvedType) {
 // key is its FIRST occurrence scanning the LEFT operand then the right, and emitted rows keep that
 // left-then-right scan order — deterministic and identical across cores. (A later ORDER BY
 // re-sorts; without one, output order is unspecified and the corpus compares rowsort.)
-func combineSetop(op setOpKind, all bool, left, right [][]Value) [][]Value {
+func combineSetop(op setOpKind, all bool, left, right [][]Value, acct queryAccount) ([][]Value, error) {
+	// The dedup / count tables are operator state (memory.md §6.2): one entry_bytes per distinct
+	// right-arm row of INTERSECT/EXCEPT (built first), then per row a distinct UNION/INTERSECT/EXCEPT
+	// keeps — all returned when the combine completes.
+	charge := newStateCharge(acct)
+	defer charge.releaseAll()
+	entry := func(row []Value) error {
+		if charge.active() {
+			return charge.reserveDirect(memEntryBytes(row))
+		}
+		return nil
+	}
 	switch {
 	case op == setOpUnion && all:
 		out := make([][]Value, 0, len(left)+len(right))
 		out = append(out, left...)
 		out = append(out, right...)
-		return out
+		return out, nil
 	case op == setOpUnion:
 		seen := make(map[string]bool)
 		out := make([][]Value, 0)
 		for _, row := range left {
 			if k := distinctRowKey(row); !seen[k] {
 				seen[k] = true
+				if err := entry(row); err != nil {
+					return nil, err
+				}
 				out = append(out, row)
 			}
 		}
 		for _, row := range right {
 			if k := distinctRowKey(row); !seen[k] {
 				seen[k] = true
+				if err := entry(row); err != nil {
+					return nil, err
+				}
 				out = append(out, row)
 			}
 		}
-		return out
+		return out, nil
 	case op == setOpIntersect && all:
 		counts := make(map[string]int)
 		for _, row := range right {
-			counts[distinctRowKey(row)]++
+			k := distinctRowKey(row)
+			if _, ok := counts[k]; !ok {
+				if err := entry(row); err != nil {
+					return nil, err
+				}
+			}
+			counts[k]++
 		}
 		out := make([][]Value, 0)
 		for _, row := range left {
@@ -1750,11 +1791,17 @@ func combineSetop(op setOpKind, all bool, left, right [][]Value) [][]Value {
 				out = append(out, row)
 			}
 		}
-		return out
+		return out, nil
 	case op == setOpIntersect:
 		rightSet := make(map[string]bool)
 		for _, row := range right {
-			rightSet[distinctRowKey(row)] = true
+			k := distinctRowKey(row)
+			if !rightSet[k] {
+				if err := entry(row); err != nil {
+					return nil, err
+				}
+				rightSet[k] = true
+			}
 		}
 		emitted := make(map[string]bool)
 		out := make([][]Value, 0)
@@ -1762,14 +1809,23 @@ func combineSetop(op setOpKind, all bool, left, right [][]Value) [][]Value {
 			k := distinctRowKey(row)
 			if rightSet[k] && !emitted[k] {
 				emitted[k] = true
+				if err := entry(row); err != nil {
+					return nil, err
+				}
 				out = append(out, row)
 			}
 		}
-		return out
+		return out, nil
 	case op == setOpExcept && all:
 		counts := make(map[string]int)
 		for _, row := range right {
-			counts[distinctRowKey(row)]++
+			k := distinctRowKey(row)
+			if _, ok := counts[k]; !ok {
+				if err := entry(row); err != nil {
+					return nil, err
+				}
+			}
+			counts[k]++
 		}
 		out := make([][]Value, 0)
 		for _, row := range left {
@@ -1780,11 +1836,17 @@ func combineSetop(op setOpKind, all bool, left, right [][]Value) [][]Value {
 				out = append(out, row)
 			}
 		}
-		return out
+		return out, nil
 	default: // EXCEPT, distinct
 		rightSet := make(map[string]bool)
 		for _, row := range right {
-			rightSet[distinctRowKey(row)] = true
+			k := distinctRowKey(row)
+			if !rightSet[k] {
+				if err := entry(row); err != nil {
+					return nil, err
+				}
+				rightSet[k] = true
+			}
 		}
 		emitted := make(map[string]bool)
 		out := make([][]Value, 0)
@@ -1792,10 +1854,13 @@ func combineSetop(op setOpKind, all bool, left, right [][]Value) [][]Value {
 			k := distinctRowKey(row)
 			if !rightSet[k] && !emitted[k] {
 				emitted[k] = true
+				if err := entry(row); err != nil {
+					return nil, err
+				}
 				out = append(out, row)
 			}
 		}
-		return out
+		return out, nil
 	}
 }
 

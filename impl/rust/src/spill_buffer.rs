@@ -7,7 +7,9 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::cost::StateCharge;
 use crate::error::{EngineError, Result, SqlState};
+use crate::memsize::{hash_row_bytes, key_bytes, map_entry_bytes};
 use crate::spill::{create_spill_file, read_row, row_bytes, write_row};
 use crate::storage::Row;
 
@@ -32,6 +34,10 @@ pub(crate) struct RowSpool {
     scratch: Option<Arc<Scratch>>,
     file: Option<RefCell<BufWriter<File>>>,
     total: usize,
+    /// The resident rows' query-memory charge (memory.md §6.6): `row_bytes` per resident row, returned
+    /// when the spool spills, and otherwise when the spool (or the reader it was consumed into) is
+    /// discarded.
+    charge: StateCharge,
 }
 
 impl Drop for RowSpool {
@@ -42,7 +48,7 @@ impl Drop for RowSpool {
 }
 
 impl RowSpool {
-    pub(crate) fn new(budget: usize, dir: PathBuf) -> Self {
+    pub(crate) fn new(budget: usize, dir: PathBuf, charge: StateCharge) -> Self {
         Self {
             budget,
             dir,
@@ -51,13 +57,20 @@ impl RowSpool {
             scratch: None,
             file: None,
             total: 0,
+            charge,
         }
     }
     pub(crate) fn len(&self) -> usize {
         self.total
     }
+    /// Append `row`. While resident it reserves its `row_bytes`; a rejected reservation returns `54P05`
+    /// for the lane's [`crate::cost::Meter::cost_first`] (memory.md §6.6/§6.7).
     pub(crate) fn push(&mut self, row: Row) -> Result<()> {
-        self.bytes = self.bytes.saturating_add(row_bytes(&row));
+        if self.file.is_none() {
+            let bytes = row_bytes(&row);
+            self.charge.reserve_direct(bytes as i64)?;
+            self.bytes = self.bytes.saturating_add(bytes);
+        }
         if self.file.is_none() && self.bytes > self.budget {
             let (path, file) = create_spill_file(&self.dir)?;
             let mut file = BufWriter::new(file);
@@ -67,6 +80,8 @@ impl RowSpool {
             }
             self.rows = Arc::new(Vec::new());
             self.file = Some(RefCell::new(file));
+            // The rows left memory: the spool's whole resident charge goes with them.
+            self.charge.release_all();
         }
         if let Some(file) = &mut self.file {
             write_row(file.get_mut(), &row).map_err(io_error)?;
@@ -80,31 +95,47 @@ impl RowSpool {
         if let Some(file) = &self.file {
             file.borrow_mut().flush().map_err(io_error)?;
         }
-        match &self.scratch {
-            Some(scratch) => Ok(SpoolReader::File {
+        let reader = match &self.scratch {
+            Some(scratch) => SpoolReaderInner::File {
                 file: BufReader::new(File::open(&scratch.path).map_err(io_error)?),
                 scratch: scratch.clone(),
                 remaining: self.total,
-            }),
-            None => Ok(SpoolReader::Shared {
+            },
+            None => SpoolReaderInner::Shared {
                 rows: self.rows.clone(),
                 position: 0,
-            }),
-        }
+            },
+        };
+        Ok(SpoolReader {
+            inner: reader,
+            charge: StateCharge::default(),
+        })
     }
+    /// Consume the spool into its reader, which takes over the resident charge (returned when the
+    /// reader is discarded — memory.md §6.6).
     pub(crate) fn into_reader(mut self) -> Result<SpoolReader> {
+        let charge = std::mem::take(&mut self.charge);
         if self.scratch.is_some() {
-            self.reader()
+            let mut reader = self.reader()?;
+            reader.charge = charge;
+            Ok(reader)
         } else {
-            Ok(match Arc::try_unwrap(std::mem::take(&mut self.rows)) {
-                Ok(rows) => SpoolReader::Memory(rows.into_iter()),
-                Err(rows) => SpoolReader::Shared { rows, position: 0 },
-            })
+            let inner = match Arc::try_unwrap(std::mem::take(&mut self.rows)) {
+                Ok(rows) => SpoolReaderInner::Memory(rows.into_iter()),
+                Err(rows) => SpoolReaderInner::Shared { rows, position: 0 },
+            };
+            Ok(SpoolReader { inner, charge })
         }
     }
 }
 
-pub(crate) enum SpoolReader {
+pub(crate) struct SpoolReader {
+    inner: SpoolReaderInner,
+    /// The consumed spool's resident charge (memory.md §6.6), returned when the reader is discarded.
+    charge: StateCharge,
+}
+
+enum SpoolReaderInner {
     Memory(std::vec::IntoIter<Row>),
     Shared {
         rows: Arc<Vec<Row>>,
@@ -117,17 +148,23 @@ pub(crate) enum SpoolReader {
     },
 }
 impl SpoolReader {
+    /// Return the consumed spool's charge now — the reader is discarded at this stage boundary or its
+    /// emission completed (memory.md §6.6).
+    pub(crate) fn release(&mut self) {
+        self.charge.release_all();
+    }
+
     pub(crate) fn next(&mut self) -> Result<Option<Row>> {
-        match self {
-            Self::Memory(rows) => Ok(rows.next()),
-            Self::Shared { rows, position } => {
+        match &mut self.inner {
+            SpoolReaderInner::Memory(rows) => Ok(rows.next()),
+            SpoolReaderInner::Shared { rows, position } => {
                 let row = rows.get(*position).cloned();
                 if row.is_some() {
                     *position += 1;
                 }
                 Ok(row)
             }
-            Self::File {
+            SpoolReaderInner::File {
                 file,
                 remaining,
                 scratch,
@@ -154,6 +191,8 @@ pub(crate) struct StateMap {
     memory: HashMap<Row, Row>,
     disk: Option<(Arc<Scratch>, File)>,
     heads: Box<[u64; 4096]>,
+    /// The resident entries' query-memory charge (memory.md §6.6), returned on spill or discard.
+    charge: StateCharge,
 }
 
 impl Drop for StateMap {
@@ -165,29 +204,49 @@ impl Drop for StateMap {
     }
 }
 
+/// A DISTINCT dedup set: an in-memory set (an in-memory database or unlimited `work_mem`), or a
+/// spill-capable [`StateMap`]. Either way each first occurrence reserves `entry_bytes(row)` while
+/// resident (memory.md §6.2/§6.6).
 pub(crate) enum SeenRows {
-    Memory(std::collections::HashSet<Row>),
+    Memory(std::collections::HashSet<Row>, StateCharge),
     Spill(StateMap),
 }
 impl SeenRows {
-    pub(crate) fn new(budget: usize, dir: Option<PathBuf>) -> Self {
+    pub(crate) fn new(budget: usize, dir: Option<PathBuf>, charge: StateCharge) -> Self {
         match dir {
-            Some(dir) if budget > 0 => Self::Spill(StateMap::new(budget, dir)),
-            _ => Self::Memory(std::collections::HashSet::new()),
+            Some(dir) if budget > 0 => Self::Spill(StateMap::new(budget, dir, charge)),
+            _ => Self::Memory(std::collections::HashSet::new(), charge),
         }
     }
+    /// Whether `row` is new; a new row reserves its entry, and a rejected reservation returns `54P05`
+    /// for the caller's [`crate::cost::Meter::cost_first`].
     pub(crate) fn insert(&mut self, row: Row) -> Result<bool> {
         match self {
-            Self::Memory(seen) => Ok(seen.insert(row)),
+            Self::Memory(seen, charge) => {
+                let bytes = if charge.active() {
+                    map_entry_bytes(&row, &[])
+                } else {
+                    0
+                };
+                if !seen.insert(row) {
+                    return Ok(false);
+                }
+                charge.reserve_direct(bytes)?;
+                Ok(true)
+            }
             Self::Spill(seen) => seen.insert(row),
         }
     }
-    pub(crate) fn clear(&mut self) {
-        *self = Self::Memory(std::collections::HashSet::new());
+    /// Return the set's charge — the DISTINCT pass completed (memory.md §6.2).
+    pub(crate) fn release(&mut self) {
+        match self {
+            Self::Memory(_, charge) => charge.release_all(),
+            Self::Spill(map) => map.charge.release_all(),
+        }
     }
 }
 impl StateMap {
-    pub(crate) fn new(budget: usize, dir: PathBuf) -> Self {
+    pub(crate) fn new(budget: usize, dir: PathBuf, charge: StateCharge) -> Self {
         Self {
             budget,
             dir,
@@ -195,8 +254,10 @@ impl StateMap {
             memory: HashMap::new(),
             disk: None,
             heads: Box::new([0; 4096]),
+            charge,
         }
     }
+
     fn hash(key: &Row) -> u64 {
         // Value::Hash already implements decimal scale, float NaN/zero, interval and recursive
         // container equality. The hash chooses an internal partition and is never observable.
@@ -229,17 +290,20 @@ impl StateMap {
     }
     pub(crate) fn put(&mut self, key: Row, value: Row) -> Result<()> {
         if self.disk.is_none() {
-            let key_bytes = row_bytes(&key);
-            let value_bytes = row_bytes(&value);
-            let old = self.memory.insert(key, value);
-            if let Some(old) = old {
-                self.bytes = self
-                    .bytes
-                    .saturating_sub(row_bytes(&old))
-                    .saturating_add(value_bytes);
+            // Residency is the logical schedule, and the same number is charged (memory.md §6.6): a new
+            // entry `ENTRY + key + value`, a replaced value its growth (or shrinkage).
+            let key_len = key_bytes(&key);
+            let value_len = key_bytes(&value);
+            let delta = match self.memory.insert(key, value) {
+                Some(old) => value_len - key_bytes(&old),
+                None => crate::costs::MEMORY_ENTRY + key_len + value_len,
+            };
+            if delta > 0 {
+                self.charge.reserve_direct(delta)?;
             } else {
-                self.bytes = self.bytes.saturating_add(32 + key_bytes + value_bytes);
+                self.charge.release(-delta);
             }
+            self.bytes = usize::try_from(self.bytes as i64 + delta).unwrap_or(0);
             if self.bytes <= self.budget {
                 return Ok(());
             }
@@ -253,6 +317,8 @@ impl StateMap {
                 .1
                 .write_all(&[0])
                 .map_err(io_error)?;
+            // The entries left memory: the map's whole resident charge goes with them.
+            self.charge.release_all();
             for (key, value) in std::mem::take(&mut self.memory) {
                 self.append(key, value)?;
             }
@@ -293,6 +359,8 @@ pub(crate) struct HashRows {
     disk: Option<(Arc<Scratch>, File)>,
     heads: Box<[u64; 4096]>,
     tails: Box<[u64; 4096]>,
+    /// The resident rows' query-memory charge (memory.md §6.6), returned on spill or discard.
+    charge: StateCharge,
 }
 
 impl Drop for HashRows {
@@ -304,7 +372,7 @@ impl Drop for HashRows {
     }
 }
 impl HashRows {
-    pub(crate) fn new(budget: usize, dir: PathBuf) -> Self {
+    pub(crate) fn new(budget: usize, dir: PathBuf, charge: StateCharge) -> Self {
         Self {
             budget,
             dir,
@@ -313,11 +381,15 @@ impl HashRows {
             disk: None,
             heads: Box::new([0; 4096]),
             tails: Box::new([0; 4096]),
+            charge,
         }
     }
+
     pub(crate) fn push(&mut self, hash: u64, row: Row) -> Result<()> {
         if self.disk.is_none() {
-            self.bytes = self.bytes.saturating_add(32 + row_bytes(&row));
+            let bytes = hash_row_bytes(&row);
+            self.charge.reserve_direct(bytes)?;
+            self.bytes = self.bytes.saturating_add(bytes as usize);
             Arc::make_mut(self.memory.entry(hash).or_default()).push(row);
             if self.bytes <= self.budget {
                 return Ok(());
@@ -331,6 +403,8 @@ impl HashRows {
                 .1
                 .write_all(&[0])
                 .map_err(io_error)?;
+            // The rows left memory: the table's whole resident charge goes with them.
+            self.charge.release_all();
             for (hash, rows) in std::mem::take(&mut self.memory) {
                 for row in rows.iter() {
                     self.append(hash, row.clone())?;
@@ -427,7 +501,7 @@ mod tests {
     #[test]
     fn spilling_spool_replays_bounded_rows_and_owns_cursor_cleanup() {
         let dir = std::env::temp_dir();
-        let mut spool = RowSpool::new(64, dir);
+        let mut spool = RowSpool::new(64, dir, StateCharge::default());
         for i in 0..2048 {
             spool
                 .push(vec![Value::Int(i), Value::Array(ArrayVal::empty())])
@@ -451,7 +525,7 @@ mod tests {
 
     #[test]
     fn spilling_state_map_retains_no_resident_key_directory() {
-        let mut state = StateMap::new(64, std::env::temp_dir());
+        let mut state = StateMap::new(64, std::env::temp_dir(), StateCharge::default());
         for i in 0..4096 {
             state
                 .put(vec![Value::Int(i)], vec![Value::Int(i * 3)])
@@ -479,7 +553,7 @@ mod tests {
 
     #[test]
     fn spilling_hash_rows_bounds_hot_keys_collisions_and_descriptors() {
-        let mut rows = HashRows::new(64, std::env::temp_dir());
+        let mut rows = HashRows::new(64, std::env::temp_dir(), StateCharge::default());
         for i in 0..4096 {
             // Same directory slot, different full hash. The reader must skip the other chain's
             // payload and retain insertion order for the hot key, even when every record spills.
@@ -504,7 +578,7 @@ mod tests {
 
     #[test]
     fn scratch_read_failures_return_io_error_and_cleanup() {
-        let mut spool = RowSpool::new(1, std::env::temp_dir());
+        let mut spool = RowSpool::new(1, std::env::temp_dir(), StateCharge::default());
         spool.push(vec![Value::Int(123)]).unwrap();
         let mut reader = spool.reader().unwrap();
         let path = spool.scratch.as_ref().unwrap().path.clone();

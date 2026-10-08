@@ -562,7 +562,7 @@ let peakRel = "";
 
 // recordPeak appends the peak query-memory balance of record `ordinal` of the current file when the
 // peak mode is on. Every core writes the same file<TAB>ordinal<TAB>peak lines, so a diff of the three
-// outputs checks every record's minimal passing budget across cores (memory.md §6).
+// outputs checks every record's minimal passing budget across cores (memory.md §7).
 function recordPeak(ordinal: number): void {
   const path = process.env.JED_CONFORMANCE_QUERY_MEMORY_PEAKS;
   if (path === undefined || path === "") return;

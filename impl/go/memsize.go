@@ -104,3 +104,39 @@ func (p *selectPlan) memoryMask(meter *costMeter) []bool {
 	}
 	return mask
 }
+
+// memKeyBytes is key_bytes(values) = Σ value_bytes — a key or state tuple with no ROW header
+// (memory.md §6.1).
+func memKeyBytes(values []Value) int64 {
+	var n int64
+	for _, v := range values {
+		n += memValueBytes(v)
+	}
+	return n
+}
+
+// memEntryBytes is entry_bytes(values) = ENTRY + key_bytes — one hash/dedup/group entry
+// (memory.md §6.1).
+func memEntryBytes(values []Value) int64 {
+	return memoryEntry + memKeyBytes(values)
+}
+
+// memEntryBytesAt is entry_bytes of the key at indices of row, without copying the key out.
+func memEntryBytesAt(row []Value, indices []int) int64 {
+	n := memoryEntry
+	for _, i := range indices {
+		n += memValueBytes(row[i])
+	}
+	return n
+}
+
+// memMapEntryBytes is a spill-capable keyed state map's resident measure of one element
+// (memory.md §6.6): ENTRY + key_bytes(key) + key_bytes(value).
+func memMapEntryBytes(key, value []Value) int64 {
+	return memoryEntry + memKeyBytes(key) + memKeyBytes(value)
+}
+
+// memHashRowBytes is a spill-capable hash row table's resident measure of one row (memory.md §6.6).
+func memHashRowBytes(row []Value) int64 {
+	return memoryEntry + memRowBytes(row)
+}

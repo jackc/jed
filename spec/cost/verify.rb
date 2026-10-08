@@ -38,7 +38,7 @@ def main
 
   fail!("invalid default_scalar_bytes") unless schedule.dig("limits", "default_scalar_bytes").is_a?(Integer) && schedule.dig("limits", "default_scalar_bytes") > 0
 
-  %w[row value array_dim decimal_group].each do |key|
+  %w[row value array_dim decimal_group entry].each do |key|
     v = schedule.dig("memory", key)
     fail!("invalid [memory] #{key}") unless v.is_a?(Integer) && v.positive?
   end

@@ -258,12 +258,20 @@ func (db *engine) execVectorizedAgg(plan *selectPlan, outer []storedRow, params 
 	var srows []storedRow
 	if len(gset.keyCols) == 0 {
 		accs := newAccsForSpecs(plan.aggSpecs)
+		// The whole-table group's entry (memory.md §6.2), returned once the group is finalized.
+		charge := meter.stateCharge()
+		if charge.active() {
+			if err := charge.reserve(meter, memEntryBytes(nil)); err != nil {
+				return emitter{}, err
+			}
+		}
 		for i := range plan.aggSpecs {
 			if ferr := foldAggBatch(accs[i], &plan.aggSpecs[i], survivors, meter); ferr != nil {
 				return emitter{}, ferr
 			}
 		}
 		srow, ferr := finalizeGroup(nil, accs)
+		charge.releaseAll()
 		if ferr != nil {
 			return emitter{}, ferr
 		}
@@ -391,6 +399,15 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 	if plan.filter != nil {
 		scratch = make(storedRow, len(mask))
 	}
+	// The group table (memory.md §6.2): the whole-table group's entry up front, a grouped entry as
+	// each group is created; returned after the last group is finalized.
+	charge := meter.stateCharge()
+	defer charge.releaseAll()
+	if !grouped && charge.active() {
+		if err := charge.reserve(meter, memEntryBytes(nil)); err != nil {
+			return nil, false, err
+		}
+	}
 
 	nsurv := 0
 	rowCount, nodes := 0, 0
@@ -425,6 +442,11 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 				var gi int
 				if kv.Kind == ValNull {
 					if nullGI < 0 {
+						if charge.active() {
+							if err := charge.reserve(meter, memEntryBytes([]Value{NullValue()})); err != nil {
+								return err
+							}
+						}
 						nullGI = len(groups)
 						groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs)})
 					}
@@ -432,6 +454,11 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 				} else if g, ok := groupIdx[kv.Int]; ok {
 					gi = g
 				} else {
+					if charge.active() {
+						if err := charge.reserve(meter, memEntryBytes([]Value{IntValue(kv.Int)})); err != nil {
+							return err
+						}
+					}
 					gi = len(groups)
 					groupIdx[kv.Int] = gi
 					groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs)})
@@ -474,12 +501,14 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 			}
 			out = append(out, srow)
 		}
+		charge.releaseAll()
 		return out, true, nil
 	}
 	srow, e := finalizeGroup(nil, accs)
 	if e != nil {
 		return nil, false, e
 	}
+	charge.releaseAll()
 	return []storedRow{srow}, true, nil
 }
 
@@ -627,6 +656,18 @@ func (db *engine) projectColumnar(plan *selectPlan, env *evalEnv, meter *costMet
 	// value_decompress × slabs (0 here), storage_row_read × rowCount. On the unmetered lane (the caller
 	// gates) this bulk charge reproduces the scanSource's per-row accrual (Guard is a no-op).
 	meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs) + costs.StorageRowRead*int64(rowCount))
+	// The gathered lanes are operator state, reserved once the bulk gather completes (memory.md §6.5)
+	// and returned when the emission completes.
+	charge := meter.stateCharge()
+	if charge.active() {
+		var bytes int64
+		for _, lane := range cols {
+			bytes += memKeyBytes(lane)
+		}
+		if err := charge.reserve(meter, bytes); err != nil {
+			return emitter{}, false, err
+		}
+	}
 
 	// A3: apply the WHERE predicate over the lanes into a selection vector (nil ⇒ all rows survive). The
 	// emitColumnar drive emits len(sel) rows, mapping output row j to lane position sel[j].
@@ -635,13 +676,14 @@ func (db *engine) projectColumnar(plan *selectPlan, env *evalEnv, meter *costMet
 	if plan.filter != nil {
 		s, err := filterColumnar(plan.filter, cols, mask, rowCount, env, meter)
 		if err != nil {
+			charge.releaseAll()
 			return emitter{}, false, err
 		}
 		sel = s
 		nEmit = int64(len(sel))
 	}
 
-	return emitter{cols: cols, projCols: projCols, sel: sel, start: 0, end: nEmit, mode: emitColumnar}, true, nil
+	return emitter{cols: cols, projCols: projCols, sel: sel, start: 0, end: nEmit, mode: emitColumnar, colCharge: charge}, true, nil
 }
 
 // aggWindowBounds computes the LIMIT/OFFSET [start,end) window over n synthetic rows, mirroring the
@@ -706,6 +748,10 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 	var groups []vgroup
 	index := make(map[int64]int)
 	nullGI := -1
+	// The group table's entries (memory.md §6.2): all groups are finalized before any group row is
+	// admitted, so the whole table is returned after the last finalize.
+	charge := meter.stateCharge()
+	defer charge.releaseAll()
 
 	meter.Charge(costs.AggregateAccumulate * int64(len(survivors)) * int64(len(plan.aggSpecs)))
 	for _, r := range survivors {
@@ -713,6 +759,11 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 		var gi int
 		if kv.Kind == ValNull {
 			if nullGI < 0 {
+				if charge.active() {
+					if err := charge.reserve(meter, memEntryBytes([]Value{NullValue()})); err != nil {
+						return nil, err
+					}
+				}
 				nullGI = len(groups)
 				groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs)})
 			}
@@ -720,6 +771,11 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 		} else {
 			var ok bool
 			if gi, ok = index[kv.Int]; !ok {
+				if charge.active() {
+					if err := charge.reserve(meter, memEntryBytes([]Value{kv})); err != nil {
+						return nil, err
+					}
+				}
 				gi = len(groups)
 				index[kv.Int] = gi
 				groups = append(groups, vgroup{key: kv, accs: newAccsForSpecs(plan.aggSpecs)})
@@ -749,6 +805,7 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 		}
 		out = append(out, srow)
 	}
+	charge.releaseAll()
 	return out, nil
 }
 

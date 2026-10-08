@@ -144,8 +144,10 @@ yy
 statement error 54P05
 SELECT * FROM (VALUES (1, 'x'), (2, 'yy')) v(a, b)
 
-# Set operations: the left arm's relation (387) and its output (195) are the peak.
-# max_query_memory_bytes: 582
+# Set operations: UNION's peak is the combine — both arms' rows (195 + 131) plus its five dedup
+# entries (ENTRY 32 + key: 326, memory.md §6.2). INTERSECT's left arm (relation 387 + output 195) stays
+# above its combine.
+# max_query_memory_bytes: 652
 query T rowsort
 SELECT v FROM t UNION SELECT w FROM u
 ----
@@ -155,7 +157,7 @@ bb
 p
 qq
 
-# max_query_memory_bytes: 581
+# max_query_memory_bytes: 651
 statement error 54P05
 SELECT v FROM t UNION SELECT w FROM u
 
@@ -198,8 +200,8 @@ WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELE
 statement error 54P05
 WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n FROM r
 
-# A window result appended to each buffered row: 387 + 3 × 32.
-# max_query_memory_bytes: 483
+# A window result appended to each buffered row: 387 + 3 × 32, plus the one partition's entry (32).
+# max_query_memory_bytes: 515
 query ITI nosort
 SELECT id, v, row_number() OVER (ORDER BY id) FROM t
 ----
@@ -213,7 +215,7 @@ bb
 NULL
 3
 
-# max_query_memory_bytes: 482
+# max_query_memory_bytes: 514
 statement error 54P05
 SELECT id, v, row_number() OVER (ORDER BY id) FROM t
 

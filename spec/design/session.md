@@ -255,7 +255,7 @@ because they have different conformance contracts**:
 | `lock_timeout_ms` | A — envelope | `0` (no deadline) | shared cross-process writer-gate wait (`55P03`, locking.md §5.2) | real-process coordination suite |
 | `work_mem` | A — envelope | 256 MiB | *when* an operator spills (never results) | invariant (spill.md §6) |
 | `max_scalar_bytes` | A — envelope | 64 MiB | cumulative scalar allocation per statement (`54P04`) | `# max_scalar_bytes:` |
-| `max_query_memory_bytes` | A — envelope | `0` (unlimited) | live row-buffer memory per statement (`54P05`, memory.md) | `# max_query_memory_bytes:` |
+| `max_query_memory_bytes` | A — envelope | `0` (unlimited) | live row-buffer and operator-state memory per statement (`54P05`, memory.md) | `# max_query_memory_bytes:` |
 | session variables | B — semantic | empty | `current_setting()` / `SHOW` results | `# set:` |
 | `time_zone` | B — semantic | `UTC` | `timestamptz`↔`date`/`text` casts, `AT TIME ZONE` | `# timezone:` |
 | random / clock source | B — semantic | OS draws | generator values (entropy.md) | `# seed:` / `# clock:` (existing) |

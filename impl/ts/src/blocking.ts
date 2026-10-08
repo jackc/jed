@@ -1,13 +1,18 @@
 // Bounded, repeatable intermediate rows and partitioned state for blocking operators.
 // Scratch is query-private and unmetered. Record traversal never determines SQL visitation:
 // callers retain input order, and lookups compare the complete canonical key.
-import {
-  decodeSpillRow,
-  encodeSpillRow,
-  rowBytes,
-  type SpillScratch,
-  type SpillSink,
-} from "./spill.ts";
+//
+// Each structure measures its residency with the shared logical size schedule and charges the same
+// number to the statement's query-memory account (spec/design/memory.md §6.6), so a spill happens at
+// the same input row in every core: a row spool `row_bytes(row)`, a keyed state map `ENTRY +
+// key_bytes(key) + key_bytes(value)`, a hash row table `ENTRY + row_bytes(row)`. An insert reserves its
+// element's bytes; a spill releases the whole resident charge, after which the structure reserves
+// nothing. TS has no destructors, so every owner releases (or closes) a structure at the point it is
+// discarded. A rejected reservation throws 54P05 for the lane's Meter.costFirst (§6.7).
+import { StateCharge } from "./cost.ts";
+import { MEMORY_ENTRY } from "./costs.ts";
+import { hashRowBytes, keyBytes, rowBytes } from "./memsize.ts";
+import { decodeSpillRow, encodeSpillRow, type SpillScratch, type SpillSink } from "./spill.ts";
 import type { Row } from "./storage.ts";
 
 function u64(value: number): Uint8Array {
@@ -35,24 +40,33 @@ export class RowSpool implements Iterable<Row> {
   private file: SpillScratch | null = null;
   private budget: number;
   private sink: SpillSink;
+  // The resident rows' query-memory charge: row_bytes per resident row, returned when the spool spills,
+  // and otherwise when the spool is discarded (release / close).
+  private charge: StateCharge;
   length = 0;
-  constructor(budget: number, sink: SpillSink) {
+  constructor(budget: number, sink: SpillSink, charge: StateCharge = new StateCharge()) {
     this.budget = budget;
     this.sink = sink;
+    this.charge = charge;
   }
   push(row: Row): void {
-    this.length++;
     if (this.file !== null) {
+      this.length++;
       writeRecord(this.file, row);
       return;
     }
+    const bytes = rowBytes(row);
+    this.charge.reserveDirect(bytes);
+    this.length++;
     this.rows.push(row);
-    this.bytes += rowBytes(row);
+    this.bytes += bytes;
     if (this.bytes > this.budget) {
       this.file = this.sink.createScratch!();
       for (const buffered of this.rows) writeRecord(this.file, buffered);
       this.rows = [];
       this.bytes = 0;
+      // The rows left memory: the spool's whole resident charge goes with them.
+      this.charge.releaseAll();
     }
   }
   *[Symbol.iterator](): Generator<Row> {
@@ -67,10 +81,16 @@ export class RowSpool implements Iterable<Row> {
       at += 8 + length;
     }
   }
+  // release returns the resident charge now — the spool (or its reader) is discarded at this stage
+  // boundary; the rows stay readable until close.
+  release(): void {
+    this.charge.releaseAll();
+  }
   close(): void {
     this.rows = [];
     this.file?.close();
     this.file = null;
+    this.charge.releaseAll();
   }
 }
 
@@ -89,14 +109,18 @@ function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
 // hashes to one partition. Existing keys replace a value pointer, so repeated updates never grow
 // a resident directory or a chain of stale versions. A single value can exceed work_mem.
 export class SpillMap {
-  private memory = new Map<string, Row>();
+  // Each resident entry keeps its measured key and value bytes, so a replacement charges the growth.
+  private memory = new Map<string, { value: Row; keyLen: number; valueLen: number }>();
   private bytes = 0;
   private file: SpillScratch | null = null;
   private sink: SpillSink;
   private budget: number;
-  constructor(budget: number, sink: SpillSink) {
+  // The resident entries' query-memory charge, returned on spill or discard.
+  private charge: StateCharge;
+  constructor(budget: number, sink: SpillSink, charge: StateCharge = new StateCharge()) {
     this.budget = budget;
     this.sink = sink;
+    this.charge = charge;
   }
   private find(key: Uint8Array): { bucket: number; node: number } {
     const file = this.file!;
@@ -116,25 +140,38 @@ export class SpillMap {
     return { bucket, node: 0 };
   }
   get(key: string): Row | undefined {
-    if (this.file === null) return this.memory.get(key);
+    if (this.file === null) return this.memory.get(key)?.value;
     const { node } = this.find(textEncoder.encode(key));
     return node === 0 ? undefined : readRecord(this.file, numberAt(this.file, node + 8));
   }
-  set(key: string, value: Row): void {
+  // set stores `value` under the canonical `key`. keyLen is key_bytes of the logical key row and
+  // valueLen key_bytes of the logical value (memory.md §6.6): a new entry is resident as ENTRY + keyLen
+  // + valueLen, a replaced value as its growth (or shrinkage).
+  set(key: string, value: Row, keyLen = 0, valueLen = keyBytes(value)): void {
     if (this.file === null) {
       const old = this.memory.get(key);
-      this.bytes += rowBytes(value) - (old === undefined ? 0 : rowBytes(old));
-      if (old === undefined) this.bytes += key.length * 2 + 48;
-      this.memory.set(key, value);
+      const delta = old === undefined ? MEMORY_ENTRY + keyLen + valueLen : valueLen - old.valueLen;
+      if (delta > 0) this.charge.reserveDirect(delta);
+      else this.charge.release(-delta);
+      this.memory.set(key, { value, keyLen: old?.keyLen ?? keyLen, valueLen });
+      this.bytes += delta;
       if (this.bytes <= this.budget) return;
       this.file = this.sink.createScratch!();
       this.file.write(0, new Uint8Array(PARTITIONS * 8));
-      for (const [k, v] of this.memory) this.write(k, v);
+      // The entries left memory: the map's whole resident charge goes with them.
+      this.charge.releaseAll();
+      for (const [k, v] of this.memory) this.write(k, v.value);
       this.memory.clear();
       this.bytes = 0;
       return;
     }
     this.write(key, value);
+  }
+  // insert adds `key` with an empty value unless present; reports whether it was new.
+  insert(key: string, keyLen: number): boolean {
+    if (this.get(key) !== undefined) return false;
+    this.set(key, [], keyLen, 0);
+    return true;
   }
   private write(key: string, value: Row): void {
     const file = this.file!;
@@ -153,38 +190,50 @@ export class SpillMap {
     file.write(at + 32, bytes);
     file.write(bucket, u64(at));
   }
+  // release returns the resident charge now — the map is discarded at this stage boundary.
+  release(): void {
+    this.charge.releaseAll();
+  }
   close(): void {
     this.memory.clear();
     this.file?.close();
     this.file = null;
+    this.charge.releaseAll();
   }
 }
 
 // An insertion-ordered multimap used for hash JOIN buckets. Row chains are external immediately;
 // the bounded map holds only first/last offsets. A skewed bucket never becomes a match-index array.
 export class SpillMultiMap {
+  // The disk-chain index (used only once spilled): uncharged, since a spilled table reserves nothing.
   private index: SpillMap;
   private file: SpillScratch | null = null;
   private memory = new Map<string, Row[]>();
   private bytes = 0;
   private budget: number;
   private sink: SpillSink;
-  constructor(budget: number, sink: SpillSink) {
+  // The resident rows' query-memory charge, returned on spill or discard.
+  private charge: StateCharge;
+  constructor(budget: number, sink: SpillSink, charge: StateCharge = new StateCharge()) {
     this.budget = budget;
     this.sink = sink;
+    this.charge = charge;
     this.index = new SpillMap(budget, sink);
   }
-  append(key: string, row: Row): void {
+  // append adds `row` to the bucket `key`. `bytes` is the row's resident measure, ENTRY + row_bytes of
+  // the logical stored row (memory.md §6.6) — by default the row itself.
+  append(key: string, row: Row, bytes = hashRowBytes(row)): void {
     if (this.file === null) {
+      this.charge.reserveDirect(bytes);
       const rows = this.memory.get(key);
-      if (rows === undefined) {
-        this.memory.set(key, [row]);
-        this.bytes += key.length * 2 + 48;
-      } else rows.push(row);
-      this.bytes += rowBytes(row);
+      if (rows === undefined) this.memory.set(key, [row]);
+      else rows.push(row);
+      this.bytes += bytes;
       if (this.bytes <= this.budget) return;
       this.file = this.sink.createScratch!();
       this.file.write(0, u64(0));
+      // The rows left memory: the table's whole resident charge goes with them.
+      this.charge.releaseAll();
       for (const [k, bucket] of this.memory) for (const r of bucket) this.appendDisk(k, r);
       this.memory.clear();
       this.bytes = 0;
@@ -219,11 +268,16 @@ export class SpillMultiMap {
       at = next;
     }
   }
+  // release returns the resident charge now — the table is discarded at this stage boundary.
+  release(): void {
+    this.charge.releaseAll();
+  }
   close(): void {
     this.memory.clear();
     this.index.close();
     this.file?.close();
     this.file = null;
+    this.charge.releaseAll();
   }
 }
 
@@ -237,11 +291,22 @@ export class SpoolSorter {
   private levels: (RowSpool | undefined)[] = [];
   private chunk: Row[] = [];
   private bytes = 0;
+  // The query-memory charge of the resident chunk (memory.md §6.4): reserved per pushed row, returned
+  // when a run spills. The final chunk stays charged — logically the sorter's final in-memory run, even
+  // though finishSpool writes it out to merge — until the owner releases it when the sorted output's
+  // emission completes (release / the finish() handle's close). The internal run spools are uncharged.
+  private charge: StateCharge;
   total = 0;
-  constructor(compare: (a: Row, b: Row) => number, budget: number, sink: SpillSink) {
+  constructor(
+    compare: (a: Row, b: Row) => number,
+    budget: number,
+    sink: SpillSink,
+    charge: StateCharge = new StateCharge(),
+  ) {
     this.compare = compare;
     this.budget = budget;
     this.sink = sink;
+    this.charge = charge;
   }
   private fresh(): RowSpool {
     const spool = new RowSpool(this.budget, this.sink);
@@ -270,10 +335,16 @@ export class SpoolSorter {
     return out;
   }
   push(row: Row): void {
+    const bytes = rowBytes(row);
+    this.charge.reserveDirect(bytes);
     this.total++;
     this.chunk.push(row);
-    this.bytes += rowBytes(row);
-    if (this.bytes > this.budget) this.flush();
+    this.bytes += bytes;
+    if (this.bytes > this.budget) {
+      this.flush();
+      // The run left memory: its rows' charge goes with it (memory.md §6.4/§6.6).
+      this.charge.releaseAll();
+    }
   }
   private flush(): void {
     this.chunk.sort(this.compare);
@@ -312,14 +383,20 @@ export class SpoolSorter {
       close: () => {
         iterator.return(undefined);
         out.close();
+        this.charge.releaseAll();
       },
     };
+  }
+  // release returns the final run's charge — the sorted output's emission completed.
+  release(): void {
+    this.charge.releaseAll();
   }
   close(): void {
     for (const spool of this.owned) spool.close();
     this.owned.clear();
     this.levels = [];
     this.chunk = [];
+    this.charge.releaseAll();
   }
 }
 export function sortSpool(
@@ -337,22 +414,35 @@ export function sortSpool(
   }
 }
 
+// SpillSet is a DISTINCT dedup set: an in-memory set (no scratch or unlimited work_mem), or a
+// spill-capable SpillMap. Either way each first occurrence reserves its entry, ENTRY + key_bytes(row),
+// while resident (memory.md §6.2/§6.6).
 export class SpillSet {
   private resident: Set<string> | null;
   private disk: SpillMap | null;
-  constructor(budget: number, sink: SpillSink | null) {
-    this.disk = budget > 0 && sink?.createScratch !== undefined ? new SpillMap(budget, sink) : null;
+  private charge: StateCharge;
+  constructor(budget: number, sink: SpillSink | null, charge: StateCharge = new StateCharge()) {
+    this.charge = charge;
+    this.disk =
+      budget > 0 && sink?.createScratch !== undefined ? new SpillMap(budget, sink, charge) : null;
     this.resident = this.disk === null ? new Set<string>() : null;
   }
-  has(key: string): boolean {
-    return this.disk === null ? this.resident!.has(key) : this.disk.get(key) !== undefined;
+  // insert adds `row` under its canonical `key` and reports whether it was new; a rejected reservation
+  // throws 54P05 for the caller's Meter.costFirst.
+  insert(key: string, row: Row): boolean {
+    if (this.disk !== null) return this.disk.insert(key, keyBytes(row));
+    if (this.resident!.has(key)) return false;
+    this.resident!.add(key);
+    if (this.charge.active()) this.charge.reserveDirect(MEMORY_ENTRY + keyBytes(row));
+    return true;
   }
-  add(key: string): void {
-    if (this.disk === null) this.resident!.add(key);
-    else this.disk.set(key, []);
+  // release returns the set's charge — the DISTINCT pass completed (memory.md §6.2).
+  release(): void {
+    this.charge.releaseAll();
   }
   close(): void {
     this.resident?.clear();
     this.disk?.close();
+    this.charge.releaseAll();
   }
 }

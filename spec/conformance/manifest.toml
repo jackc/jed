@@ -1508,4 +1508,4 @@ description = "Finite per-statement cumulative scalar-allocation budget, checked
 
 [[capability]]
 id = "resource.query_memory"
-description = "Live per-statement logical query-memory budget over row buffers and engine result collectors (54P05); memory.md §2-§5. Host setting max_query_memory_bytes (unlimited by default) and the per-record `# max_query_memory_bytes:` corpus directive."
+description = "Live per-statement logical query-memory budget over row buffers, engine result collectors (Q1), and operator state (Q2: hash/group/dedup tables, retained aggregate inputs, window partitions, sort state, columnar lanes, spill structures) (54P05); memory.md §2-§6. Host setting max_query_memory_bytes (unlimited by default) and the per-record `# max_query_memory_bytes:` corpus directive."

@@ -9,8 +9,10 @@
 // one query while the database file is unchanged — not the §8 on-disk record format. Node stdlib I/O
 // only (no dependency — CLAUDE.md §14).
 
+import { StateCharge } from "./cost.ts";
 import { Decimal } from "./decimal.ts";
-import { jsonbIn, jsonbOut, type JsonNode } from "./json.ts";
+import { jsonbIn, jsonbOut } from "./json.ts";
+import { rowBytes } from "./memsize.ts";
 import type { Row } from "./storage.ts";
 import {
   type Value,
@@ -66,78 +68,13 @@ export const DEFAULT_WORK_MEM = 256 * 1024 * 1024;
 // keyCmp (which would form a cycle with executor.ts).
 export type RowCompare = (a: Row, b: Row) => number;
 
-// valueBytes is a cheap, deterministic estimate of a value's resident bytes (spill.md §2): a fixed
-// base plus the variable-width payload. It need not be exact — it only decides spill timing, which is
-// invisible to results and cost.
-function valueBytes(v: Value): number {
-  const base = 24;
-  switch (v.kind) {
-    case "text":
-    case "json":
-    case "jsonpath":
-      return base + v.text.length * 2;
-    case "bytea":
-    case "uuid":
-      return base + v.bytes.length;
-    case "decimal":
-      return base + v.dec.toCodec()[2].length * 2;
-    case "unfetched":
-      return base + (v.ref.comp?.length ?? 0);
-    case "array":
-      return (
-        base +
-        v.dims.length * 16 +
-        v.elements.reduce((sum, element) => sum + valueBytes(element), 0)
-      );
-    case "range":
-      return (
-        base +
-        (v.lower === null ? 0 : valueBytes(v.lower)) +
-        (v.upper === null ? 0 : valueBytes(v.upper))
-      );
-    case "jsonb":
-      return base + jsonNodeBytes(v.node);
-    case "composite": {
-      let n = base;
-      for (const f of v.fields) n += valueBytes(f);
-      return n;
-    }
-    default:
-      return base;
-  }
-}
-
-function jsonNodeBytes(node: JsonNode): number {
-  switch (node.kind) {
-    case "string":
-      return 24 + node.value.length * 2;
-    case "number":
-      return 24 + node.dec.toCodec()[2].length * 2;
-    case "array":
-      return 24 + node.elements.reduce((sum, child) => sum + jsonNodeBytes(child), 0);
-    case "object":
-      return (
-        24 +
-        node.members.reduce(
-          (sum, member) => sum + member.key.length * 2 + jsonNodeBytes(member.value),
-          0,
-        )
-      );
-    default:
-      return 24;
-  }
-}
-
-export function rowBytes(row: Row): number {
-  let n = 8;
-  for (const v of row) n += valueBytes(v);
-  return n;
-}
-
 // Sorter is the external merge sorter (spec/design/spill.md §4). Push rows, then finish to read them
 // back in ORDER BY order. Bounds resident memory to budget bytes by spilling sorted runs; an
 // in-memory database (spillDir === null) or unlimited budget keeps everything resident and just
-// stable-sorts at the end.
+// stable-sorts at the end. A row's resident bytes are the shared logical size schedule rowBytes
+// (spec/design/memory.md §3) — the same number the query-memory account charges for sort state (§6.4),
+// so every core spills at the same input row. Rows reach a sorter with their untouched slots NULLed
+// (§6.1), so no lazy reference hides a backing block.
 export class Sorter {
   private compare: RowCompare;
   private budget: number;
@@ -147,23 +84,38 @@ export class Sorter {
   // Spilled runs, in input order (run 0 = first chunk — spill.md §6).
   private runs: SpillRun[] = [];
   total = 0;
+  // The query-memory charge of the resident run (memory.md §6.4): reserved per pushed row, returned when
+  // a run spills, and handed to the SortedRows at finish so it is returned when the sorted output's
+  // emission completes.
+  private charge: StateCharge;
 
   // compare orders rows; budget is the work-memory bound in bytes (0 ⇒ unlimited); sink persists
   // spilled runs, or null for an in-memory / OPFS database (never spill — spill.md §2).
-  constructor(compare: RowCompare, budget: number, sink: SpillSink | null) {
+  constructor(
+    compare: RowCompare,
+    budget: number,
+    sink: SpillSink | null,
+    charge: StateCharge = new StateCharge(),
+  ) {
     this.compare = compare;
     this.budget = budget;
     this.sink = sink;
+    this.charge = charge;
   }
 
   private canSpill(): boolean {
     return this.sink !== null && this.budget > 0;
   }
 
-  // push adds one row, spilling the current run when the in-memory buffer exceeds the budget.
+  // push adds one row, spilling the current run when the in-memory buffer exceeds the budget. A rejected
+  // query-memory reservation throws 54P05 for the caller's Meter.costFirst (memory.md §6.7).
   push(row: Row): void {
+    if (this.canSpill() || this.charge.active()) {
+      const bytes = rowBytes(row);
+      this.charge.reserveDirect(bytes);
+      if (this.canSpill()) this.bufBytes += bytes;
+    }
     this.total += 1;
-    if (this.canSpill()) this.bufBytes += rowBytes(row);
     this.buf.push(row);
     if (this.canSpill() && this.bufBytes > this.budget) this.spillRun();
   }
@@ -182,6 +134,8 @@ export class Sorter {
     this.runs.push(this.sink!.writeRun(w.result()));
     this.buf = [];
     this.bufBytes = 0;
+    // The run left memory: its rows' charge goes with it (memory.md §6.4/§6.6).
+    this.charge.releaseAll();
   }
 
   close(): void {
@@ -194,6 +148,7 @@ export class Sorter {
     }
     this.runs = [];
     this.buf = [];
+    this.charge.releaseAll();
   }
 
   // finish returns the rows in ORDER BY order. With no spilled run this is the unchanged in-memory
@@ -201,7 +156,7 @@ export class Sorter {
   // buffer and k-way-merges it with the runs.
   finish(): SortedRows {
     this.sortBuf();
-    if (this.runs.length === 0) return new SortedRows(this.buf, null);
+    if (this.runs.length === 0) return new SortedRows(this.buf, null, this.charge);
     // Sources: each spilled run, then the final in-memory buffer last (the latest input positions →
     // the highest source index, the tie-break that reproduces input order — spill.md §6).
     const sources: MergeSource[] = [];
@@ -212,7 +167,7 @@ export class Sorter {
       throw e;
     }
     sources.push(new MemSource(this.buf));
-    return new SortedRows(null, new Merger(sources, this.compare));
+    return new SortedRows(null, new Merger(sources, this.compare), this.charge);
   }
 }
 
@@ -222,9 +177,13 @@ export class SortedRows {
   private mem: Row[] | null;
   private merge: Merger | null;
   private pos = 0;
-  constructor(mem: Row[] | null, merge: Merger | null) {
+  // The sort state's query-memory charge (memory.md §6.4): the final in-memory run, returned when the
+  // sorted output's emission completes (close).
+  private charge: StateCharge;
+  constructor(mem: Row[] | null, merge: Merger | null, charge: StateCharge = new StateCharge()) {
     this.mem = mem;
     this.merge = merge;
+    this.charge = charge;
   }
 
   // next returns the next row in sort order, or null at the end.
@@ -235,9 +194,11 @@ export class SortedRows {
   }
 
   // close releases any spill run files still open (a LIMIT can stop the merge before every run is
-  // drained — spill.md §4). A no-op for the in-memory case.
+  // drained — spill.md §4), and returns the sort state's charge — the emission completed (memory.md
+  // §6.4).
   close(): void {
     this.merge?.close();
+    this.charge.releaseAll();
   }
 }
 

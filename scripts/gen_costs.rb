@@ -71,6 +71,7 @@ def rust_file(us)
     pub const MEMORY_VALUE: i64 = #{mem('value')};
     pub const MEMORY_ARRAY_DIM: i64 = #{mem('array_dim')};
     pub const MEMORY_DECIMAL_GROUP: i64 = #{mem('decimal_group')};
+    pub const MEMORY_ENTRY: i64 = #{mem('entry')};
 
     /// The deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
     pub struct CostSchedule {
@@ -113,6 +114,7 @@ def go_file(us)
     	memoryValue        int64 = #{mem('value')}
     	memoryArrayDim     int64 = #{mem('array_dim')}
     	memoryDecimalGroup int64 = #{mem('decimal_group')}
+    	memoryEntry        int64 = #{mem('entry')}
     )
 
     // CostSchedule holds the deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
@@ -148,6 +150,7 @@ def ts_file(us)
     export const MEMORY_VALUE = #{mem('value')};
     export const MEMORY_ARRAY_DIM = #{mem('array_dim')};
     export const MEMORY_DECIMAL_GROUP = #{mem('decimal_group')};
+    export const MEMORY_ENTRY = #{mem('entry')};
 
     // The deterministic cost-unit weights, mirroring spec/cost/schedule.toml. Weights are
     // bigint for i64 parity with the Rust/Go cores (a number is f64 — CLAUDE.md §8).

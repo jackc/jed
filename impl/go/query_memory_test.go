@@ -6,7 +6,10 @@ package jed
 // (The Go API has no engine-owned materializing collector — every row iterator yields to the host —
 // so there is no collector admission to pin here.)
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 func TestQueryMemorySettingDefaultsToUnlimited(t *testing.T) {
 	s := dbWith(t)
@@ -38,10 +41,15 @@ func TestQueryMemorySettingDefaultsToUnlimited(t *testing.T) {
 // A buffered result's rows leave the engine's account as the cursor yields them (memory.md §5.3).
 func TestQueryMemoryBufferedRowsReleasedOnYield(t *testing.T) {
 	s := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1), (2)")
-	// A streaming scan holds no row buffer: a budget of one byte suffices.
-	s.SetMaxQueryMemoryBytes(1)
+	// The columnar projection lane gathers the id column (2 values × 32 = 64 bytes of lane state,
+	// memory.md §6.5), held until its emission completes; the yielded rows are the host's own memory.
+	s.SetMaxQueryMemoryBytes(64)
 	if out, err := queryOutcome(s, "SELECT id FROM t", nil); err != nil || len(out.Rows) != 2 {
-		t.Fatalf("streaming scan under a 1-byte budget: %v", err)
+		t.Fatalf("columnar scan under its lane budget: %v", err)
+	}
+	s.SetMaxQueryMemoryBytes(63)
+	if _, err := queryOutcome(s, "SELECT id FROM t", nil); err == nil || err.(*EngineError).Code() != "54P05" {
+		t.Fatalf("columnar scan one byte under its lane budget: want 54P05, got %v", err)
 	}
 	// EXPLAIN's rows are a materialized result admitted against the statement's account.
 	s.SetMaxQueryMemoryBytes(1 << 20)
@@ -93,5 +101,49 @@ func TestQueryMemoryBudgetStaysWithCursor(t *testing.T) {
 	}
 	if !eqInts(got, 2, 1) {
 		t.Fatalf("old cursor rows %v, want [2 1]", got)
+	}
+}
+
+// Spill-capable operator state charges only its resident portion (memory.md §6.6): on a file-backed
+// database the bounded-spill lane's structures release their charge as they spill, so a budget that
+// a fully resident DISTINCT exceeds is enough once work_mem makes it spill — and the account itself
+// never forces the spill. Disk-only behavior, so it lives here rather than in the corpus.
+func TestQueryMemorySpillingOperatorStateReleasesItsCharge(t *testing.T) {
+	dir := t.TempDir()
+	db, err := CreateDatabase(CreateOptions{Path: filepath.Join(dir, "query_memory_spill.jed"), SkipFsync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.setSpillDirForTest(dir)
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, s text)")
+	mustExec(t, s, "INSERT INTO t SELECT g, repeat('x', g) FROM generate_series(1, 300) g")
+	const sql = "SELECT DISTINCT s FROM t"
+	peak := func(workMem int) int64 {
+		s.SetWorkMem(workMem)
+		s.SetMaxQueryMemoryBytes(1 << 40)
+		ResetQueryMemoryPeak()
+		if _, err := queryOutcome(s, sql, nil); err != nil {
+			t.Fatal(err)
+		}
+		return QueryMemoryPeak()
+	}
+	resident := peak(1 << 30)
+	spilling := peak(4096)
+	if spilling >= resident/4 {
+		t.Fatalf("spilling peak %d vs resident %d", spilling, resident)
+	}
+	// The spilling run fits a budget the resident run exceeds.
+	s.SetMaxQueryMemoryBytes(spilling)
+	s.SetWorkMem(4096)
+	out, err := queryOutcome(s, sql, nil)
+	if err != nil || len(out.Rows) != 300 {
+		t.Fatalf("spilling DISTINCT under its peak budget: %d rows, %v", len(out.Rows), err)
+	}
+	s.SetWorkMem(1 << 30)
+	if _, err := queryOutcome(s, sql, nil); err == nil || err.(*EngineError).Code() != "54P05" {
+		t.Fatalf("resident DISTINCT under the spilling budget: want 54P05, got %v", err)
 	}
 }

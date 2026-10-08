@@ -62,14 +62,15 @@ const (
 //     projection, no full-width row) at lane position sel[j] (or j when sel is nil) and charges
 //     row_produced per row (packed-leaf.md §11 Track A2/A3).
 type emitter struct {
-	precharged bool        // the limited join projection accrued during blocking work
-	identity   bool        // emitSorted stream already projected by DISTINCT
-	src        []storedRow // emitProject: unprojected rows
-	final      [][]Value   // emitIdentity / emitFinal: already-projected rows
-	sorted     *sortedRows // emitSorted: the streaming-sort output pull iterator (positioned past OFFSET)
-	cols       [][]Value   // emitColumnar: the dense per-column lanes (indexed by table ordinal)
-	projCols   []int       // emitColumnar: projection column indices into cols (one per output column)
-	sel        []int32     // emitColumnar: optional A3 selection vector — output row j → lane position sel[j]
+	precharged bool         // the limited join projection accrued during blocking work
+	identity   bool         // emitSorted stream already projected by DISTINCT
+	src        []storedRow  // emitProject: unprojected rows
+	final      [][]Value    // emitIdentity / emitFinal: already-projected rows
+	sorted     *sortedRows  // emitSorted: the streaming-sort output pull iterator (positioned past OFFSET)
+	cols       [][]Value    // emitColumnar: the dense per-column lanes (indexed by table ordinal)
+	projCols   []int        // emitColumnar: projection column indices into cols (one per output column)
+	sel        []int32      // emitColumnar: optional A3 selection vector — output row j → lane position sel[j]
+	colCharge  *stateCharge // emitColumnar: the gathered lanes' query-memory charge (memory.md §6.5), returned when emission completes
 	start      int64
 	end        int64
 	mode       emitMode
@@ -121,6 +122,7 @@ func (db *engine) execCostedTwoRelationJoin(plan *selectPlan, env *evalEnv, mete
 		if err != nil {
 			return nil, err
 		}
+		defer table.release() // the join phase completed (memory.md §6.2)
 	}
 
 	mask := plan.memoryMask(meter)
@@ -280,8 +282,10 @@ func (db *engine) execCostedNWayJoin(plan *selectPlan, env *evalEnv, meter *cost
 				}
 			}
 		}
-		// The step's input rows are consumed once its output is built (memory.md §5.3).
+		// The step's input rows are consumed once its output is built (memory.md §5.3), and with them
+		// the step's hash table (§6.2).
 		releaseRowsMasked(meter, running, mask)
+		table.release()
 		running = next
 		if position+1 < len(plan.phys.joinSteps) {
 			node := "Nested Loop"
@@ -388,6 +392,7 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 			}
 			out = append(out, projected)
 		}
+		em.colCharge.releaseAll() // the emission completed (memory.md §6.5)
 		return out, nil
 	default: // emitProject
 		env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
@@ -772,6 +777,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					}
 				}
 				releaseRowsMasked(meter, running, memMask)
+				table.release() // the join step completed (memory.md §6.2)
 				running = next
 				continue
 			}
@@ -982,6 +988,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			keys []Value
 			accs []*acc
 			seen []map[string]bool
+			// charge is the group's query-memory charge — its entry plus everything its accumulators
+			// retain (memory.md §6.2/§6.3), released when the group is finalized.
+			charge int64
 		}
 		newSeen := func() []map[string]bool {
 			s := make([]map[string]bool, len(plan.aggSpecs))
@@ -1037,7 +1046,14 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			// An empty grouping set (the () / whole-table grand total) is one pre-created group, so it
 			// emits ONE row even over zero input; a non-empty set over empty input emits nothing.
 			if len(gset.keyCols) == 0 {
-				groups = append(groups, group{keys: nil, accs: newAccs(), seen: newSeen()})
+				var entry int64
+				if meter.queryMemoryActive() {
+					entry = memEntryBytes(nil)
+				}
+				if err := meter.reserveQuery(entry); err != nil {
+					return emitter{}, err
+				}
+				groups = append(groups, group{keys: nil, accs: newAccs(), seen: newSeen(), charge: entry})
 				index[""] = 0
 			}
 			for _, row := range rows {
@@ -1051,9 +1067,16 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 				k := distinctRowKey(keys)
 				gi, ok := index[k]
 				if !ok {
+					var entry int64
+					if meter.queryMemoryActive() {
+						entry = memEntryBytes(keys)
+					}
+					if err := meter.reserveQuery(entry); err != nil {
+						return emitter{}, err
+					}
 					gi = len(groups)
 					index[k] = gi
-					groups = append(groups, group{keys: keys, accs: newAccs(), seen: newSeen()})
+					groups = append(groups, group{keys: keys, accs: newAccs(), seen: newSeen(), charge: entry})
 				}
 				for i, spec := range plan.aggSpecs {
 					// FILTER (WHERE cond): a row for which the filter is not TRUE (FALSE or NULL)
@@ -1085,6 +1108,13 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 							}
 							tuple[ki] = kv
 						}
+						if meter.queryMemoryActive() {
+							bytes := memRowBytes(tuple)
+							if err := meter.reserveQuery(bytes); err != nil {
+								return emitter{}, err
+							}
+							groups[gi].charge += bytes
+						}
 						a := groups[gi].accs[i]
 						a.hypoRows = append(a.hypoRows, tuple)
 						continue
@@ -1109,8 +1139,15 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 							continue
 						}
 						seen[dk] = true
+						if meter.queryMemoryActive() {
+							bytes := memEntryBytes([]Value{v})
+							if err := meter.reserveQuery(bytes); err != nil {
+								return emitter{}, err
+							}
+							groups[gi].charge += bytes
+						}
 					}
-					if ferr := groups[gi].accs[i].fold(v, meter); ferr != nil {
+					if ferr := groups[gi].accs[i].foldCharged(v, meter, &groups[gi].charge); ferr != nil {
 						return emitter{}, ferr
 					}
 				}
@@ -1168,6 +1205,8 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 				for _, positions := range plan.groupingSpecs {
 					srow = append(srow, IntValue(groupingValue(positions, gset.mask)))
 				}
+				// The finalized group's operator state gives way to its row (memory.md §6.2).
+				meter.releaseQuery(g.charge)
 				if err := meter.admitRow(srow); err != nil {
 					return emitter{}, err
 				}
@@ -1231,6 +1270,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			// sort, never map iteration (no map-order leak — CLAUDE.md §8/§10).
 			seen := make(map[string]bool)
 			var distinctRows [][]Value
+			var seenCharge int64 // the dedup set's entries (memory.md §6.2)
 			for _, srow := range groupRows {
 				projected := make([]Value, len(plan.projections))
 				for i, p := range plan.projections {
@@ -1242,12 +1282,20 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 				}
 				if key := distinctRowKey(projected); !seen[key] {
 					seen[key] = true
+					if meter.queryMemoryActive() {
+						bytes := memEntryBytes(projected)
+						if err := meter.reserveQuery(bytes); err != nil {
+							return emitter{}, err
+						}
+						seenCharge += bytes
+					}
 					if err := meter.admitRow(projected); err != nil {
 						return emitter{}, err
 					}
 					distinctRows = append(distinctRows, projected)
 				}
 			}
+			meter.releaseQuery(seenCharge)
 			releaseRows(meter, groupRows)
 			if selectActualRootNode(plan) != "Distinct" {
 				db.explainActual.recordParent("Distinct", meter.Accrued)
@@ -1269,6 +1317,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		// CLAUDE.md §8/§10).
 		seen := make(map[string]bool)
 		var distinctRows [][]Value
+		var seenCharge int64 // the dedup set's entries (memory.md §6.2)
 		for _, row := range rows {
 			projected := make([]Value, len(plan.projections))
 			for i, p := range plan.projections {
@@ -1280,12 +1329,20 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			}
 			if key := distinctRowKey(projected); !seen[key] {
 				seen[key] = true
+				if meter.queryMemoryActive() {
+					bytes := memEntryBytes(projected)
+					if err := meter.reserveQuery(bytes); err != nil {
+						return emitter{}, err
+					}
+					seenCharge += bytes
+				}
 				if err := meter.admitRow(projected); err != nil {
 					return emitter{}, err
 				}
 				distinctRows = append(distinctRows, projected)
 			}
 		}
+		meter.releaseQuery(seenCharge)
 		releaseRowsMasked(meter, rows, memMask)
 		if selectActualRootNode(plan) != "Distinct" {
 			db.explainActual.recordParent("Distinct", meter.Accrued)

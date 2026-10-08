@@ -544,6 +544,49 @@ func (a *acc) fold(v Value, m *costMeter) error {
 	return nil
 }
 
+// retainedBytes is the query-memory bytes folding v makes this accumulator retain (memory.md §6.3):
+// the input of a JSON / ordered-set aggregate, nothing for a fixed-size running value.
+// Hypothetical-set and DISTINCT-set retention is charged by the fold loop, which owns those buffers.
+func (a *acc) retainedBytes(v Value) int64 {
+	switch a.plan {
+	case planJsonbAgg, planJsonAgg, planJsonbAggStrict, planJsonAggStrict:
+		if a.jsonStrict && v.IsNull() {
+			return 0
+		}
+		return memValueBytes(v)
+	case planJsonbObjectAgg, planJsonObjectAgg, planJsonbObjectAggUnique, planJsonObjectAggUnique:
+		if v.Kind == ValComposite && v.composite() != nil {
+			return memKeyBytes(*v.composite())
+		}
+		return 0
+	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
+		if v.IsNull() {
+			return 0
+		}
+		return memValueBytes(v)
+	}
+	return 0
+}
+
+// foldCharged is fold, then a reservation of what the fold retained (memory.md §6.3), added to
+// *charge — the caller's running total for this accumulator, released when it is discarded.
+func (a *acc) foldCharged(v Value, m *costMeter, charge *int64) error {
+	var bytes int64
+	if m.queryMemoryActive() {
+		bytes = a.retainedBytes(v)
+	}
+	if err := a.fold(v, m); err != nil {
+		return err
+	}
+	if bytes > 0 {
+		if err := m.reserveQuery(bytes); err != nil {
+			return err
+		}
+		*charge += bytes
+	}
+	return nil
+}
+
 // unfold removes one input value — the inverse of fold — used ONLY by the sliding-window
 // optimization (window.md §5.2/§8) for the exactly-invertible COUNT / COUNT(*) (integer counters:
 // add-then-remove is exact and order-independent). Every other accumulator is never un-folded — a

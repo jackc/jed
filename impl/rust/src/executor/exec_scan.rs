@@ -5,6 +5,16 @@
 use super::explain_exec::{select_actual_rel_node, select_actual_root_node};
 use super::*;
 
+/// Replace each untouched slot (`!mask[i]`) with NULL, so a row entering sort or spill state holds
+/// only what the plan reads and measures in full (spec/design/memory.md §6.1).
+pub(crate) fn null_untouched(row: &mut [Value], mask: &[bool]) {
+    for (value, touched) in row.iter_mut().zip(mask) {
+        if !*touched {
+            *value = Value::Null;
+        }
+    }
+}
+
 /// Re-measure a charged projected result that becomes relation rows under the relation's touched
 /// mask (memory.md §5.2): the masked measure never exceeds the full one, so this only releases.
 pub(crate) fn rebase_rows_masked(meter: &mut Meter, rows: &[Row], mask: &[bool]) {
@@ -67,7 +77,8 @@ fn process_streaming_row(
             projected.push(p.eval(row, env, meter)?);
         }
         actual.distinct += meter.accrued - before;
-        if !seen.insert(projected.clone())? {
+        let inserted = seen.insert(projected.clone());
+        if !meter.cost_first(inserted)? {
             return Ok(true);
         }
         *passed += 1;
@@ -159,8 +170,11 @@ impl Engine {
         let offset = plan.offset.unwrap_or(0);
         let mut out: Vec<Vec<Value>> = Vec::new();
         let mut passed = 0i64;
-        let mut seen =
-            crate::spill_buffer::SeenRows::new(self.session.work_mem, self.spill_dir.clone());
+        let mut seen = crate::spill_buffer::SeenRows::new(
+            self.session.work_mem,
+            self.spill_dir.clone(),
+            meter.state_charge(),
+        );
         let can_pull = plan.limit != Some(0);
         let profile_start = meter.accrued;
         let mut actual = StreamingActual::default();
@@ -455,6 +469,7 @@ impl Engine {
                 }
             }
         }
+        seen.release(); // the scan ended (memory.md §6.2)
         if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
             let total = meter.accrued - profile_start;
             let scan = total - actual.filter - actual.distinct - actual.output;
@@ -929,6 +944,7 @@ impl Engine {
             let offset = plan.offset.unwrap_or(0);
             let distinct = plan.distinct;
             let done = empty || limit == Some(0);
+            let seen_charge = meter.state_charge();
             let stream = StreamingScan {
                 engine: snap,
                 plan,
@@ -942,6 +958,7 @@ impl Engine {
                 seen: crate::spill_buffer::SeenRows::new(
                     self.session.work_mem,
                     self.spill_dir.clone(),
+                    seen_charge,
                 ),
                 passed: 0,
                 produced: 0,
@@ -1313,6 +1330,8 @@ impl Engine {
         // unmetered like every sort (cost.md §3).
         let (total, mut sorted) = if plan.order.iter().any(|(_, _, _, c)| c.is_some()) {
             let mut rows: Vec<Row> = Vec::new();
+            // The collated survivor buffer is sort state (memory.md §6.4).
+            let mut charge = meter.state_charge();
             if !empty {
                 // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
                 store.scan_range(&bound, &mut |_key, row| {
@@ -1336,18 +1355,33 @@ impl Engine {
                         None => true,
                     };
                     if keep {
-                        rows.push(resolved.unwrap_or_else(|| row.clone()));
+                        let mut owned = resolved.unwrap_or_else(|| row.clone());
+                        null_untouched(&mut owned, &plan.rel_masks[0]);
+                        if charge.active() {
+                            charge.reserve(meter, crate::memsize::row_bytes(&owned))?;
+                        }
+                        rows.push(owned);
                     }
                     Ok(true)
                 })?;
             }
             let total = rows.len() as i64;
             if let Some(k) = plan.phys.top_k {
+                // The selection discards rows: release the buffer, re-reserve the kept rows.
+                charge.release_all();
                 rows = top_k_rows(rows, &plan.order, k)?;
+                if charge.active() {
+                    for row in &rows {
+                        charge.reserve(meter, crate::memsize::row_bytes(row))?;
+                    }
+                }
             } else {
                 sort_rows(&mut rows, &plan.order)?;
             }
-            (total, crate::spill::SortedRows::InMemory(rows.into_iter()))
+            (
+                total,
+                crate::spill::SortedRows::InMemory(rows.into_iter(), charge),
+            )
         } else {
             // Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never
             // short-circuits: every in-range row is read (charging storage_row_read), its touched
@@ -1358,8 +1392,10 @@ impl Engine {
                 .phys
                 .top_k
                 .is_some_and(|k| self.streaming_top_k_fits(plan, k));
-            let mut keeper =
-                use_top_k.then(|| TopKKeeper::new(plan.phys.top_k.unwrap(), &plan.order, false));
+            let mut keeper = use_top_k.then(|| {
+                TopKKeeper::new(plan.phys.top_k.unwrap(), &plan.order, false)
+                    .with_charge(meter.state_charge())
+            });
             let mut sorter = (!use_top_k).then(|| self.new_sorter(&plan.order));
             let mut total = 0i64;
             if !empty {
@@ -1387,22 +1423,21 @@ impl Engine {
                     if keep {
                         total += 1;
                         let mut owned = resolved.unwrap_or_else(|| row.clone());
-                        if let Some(k) = &mut keeper {
-                            for (value, touched) in owned.iter_mut().zip(&plan.rel_masks[0]) {
-                                if !*touched {
-                                    *value = Value::Null;
-                                }
-                            }
-                            k.push(owned)?;
+                        // Sort state holds only the touched columns (memory.md §6.1).
+                        null_untouched(&mut owned, &plan.rel_masks[0]);
+                        let pushed = if let Some(k) = &mut keeper {
+                            k.push(owned)
                         } else {
-                            sorter.as_mut().unwrap().push(owned)?;
-                        }
+                            sorter.as_mut().unwrap().push(owned)
+                        };
+                        meter.cost_first(pushed)?;
                     }
                     Ok(true) // never stop early — the sort must see every row
                 })?;
             }
             let sorted = if let Some(k) = keeper {
-                crate::spill::SortedRows::InMemory(k.finish().into_iter())
+                let (rows, charge) = k.finish_charged();
+                crate::spill::SortedRows::InMemory(rows.into_iter(), charge)
             } else {
                 sorter.unwrap().finish()?
             };
@@ -1851,6 +1886,7 @@ impl Engine {
             order.to_vec(),
             self.session.work_mem,
             self.spill_dir.clone(),
+            crate::cost::StateCharge::new(self.session.query_account()),
         )
     }
 
@@ -2180,6 +2216,7 @@ impl Engine {
                     meter.admit_row(&o)?;
                     out.push(o);
                 }
+                rows.release(); // the emission completed (memory.md §6.6)
                 out
             }
             // Already projected + charged (the special input-streaming paths) — hand the rows out.
@@ -2212,6 +2249,7 @@ impl Engine {
                     meter.admit_row(&o)?; // the buffered result collector (memory.md §5.1)
                     out.push(o);
                 }
+                sorted.release(); // the emission completed (memory.md §6.4)
                 out
             }
             // The general blocking buffer: window it, charging `row_produced` per emitted row (and,
@@ -2276,6 +2314,7 @@ impl Engine {
                 sel,
                 start,
                 end,
+                mut charge,
             } => {
                 let mut out = Vec::with_capacity(end - start);
                 for j in start..end {
@@ -2292,6 +2331,7 @@ impl Engine {
                     meter.admit_row(&o)?; // the buffered result collector (memory.md §5.1)
                     out.push(o);
                 }
+                charge.release_all(); // the emission completed (memory.md §6.5)
                 out
             }
         };
@@ -2375,6 +2415,9 @@ impl Engine {
             row_count = rc;
             pages = p;
         }
+        // The gathered lanes are operator state, reserved once the bulk gather completes (memory.md
+        // §6.5) and returned when the emission completes.
+        let mut charge = meter.state_charge();
         // Charge the scan cost block identically to materialize_rel + ScanSource: page_read × nodes,
         // value_decompress × slabs (0 here), storage_row_read × row_count. On the unmetered lane (the caller
         // gates) this bulk charge reproduces the per-row accrual (guard is a no-op).
@@ -2383,6 +2426,14 @@ impl Engine {
                 + COSTS.value_decompress * slabs as i64
                 + COSTS.storage_row_read * row_count as i64,
         );
+
+        if charge.active() {
+            let bytes = cols
+                .iter()
+                .map(|lane| crate::memsize::key_bytes(lane))
+                .sum();
+            charge.reserve(&mut *meter, bytes)?;
+        }
 
         // A3: apply the WHERE predicate over the lanes into a selection vector (None ⇒ all rows survive).
         let (sel, n_emit) = match &plan.filter {
@@ -2400,6 +2451,7 @@ impl Engine {
             sel,
             start: 0,
             end: n_emit,
+            charge,
         }))
     }
 
@@ -2505,7 +2557,7 @@ impl Engine {
         // touched column. Cost-neutral by construction (agg_columnar charges the identical scan block).
         let srows = match self.agg_columnar(plan, gset, env, meter)? {
             Some(srows) => {
-                // Dense lanes are operator state; the group rows are a row buffer (memory.md §5.4).
+                // The fold's group table is operator state (memory.md §6.2); the group rows are a row buffer.
                 for r in &srows {
                     meter.admit_row(r)?;
                 }
@@ -2668,6 +2720,12 @@ impl Engine {
             Vec::new()
         };
         let mut nsurv = 0usize;
+        // The group table (memory.md §6.2): the whole-table group's entry up front, a grouped entry as
+        // each group is created; returned after the last group is finalized.
+        let mut charge = meter.state_charge();
+        if !grouped && charge.active() {
+            charge.reserve(meter, crate::memsize::entry_bytes(&[]))?;
+        }
 
         let (row_count, pages) = if do_scan {
             let mut visit = |node: &crate::pmap::Node, i: usize| -> Result<()> {
@@ -2687,6 +2745,12 @@ impl Engine {
                         Value::Int(k) => match index.get(&k) {
                             Some(&g) => g,
                             None => {
+                                if charge.active() {
+                                    charge.reserve(
+                                        meter,
+                                        crate::memsize::entry_bytes(&[Value::Int(k)]),
+                                    )?;
+                                }
                                 let g = groups.len();
                                 index.insert(k, g);
                                 groups.push((
@@ -2701,6 +2765,12 @@ impl Engine {
                         _ => match null_gi {
                             Some(g) => g,
                             None => {
+                                if charge.active() {
+                                    charge.reserve(
+                                        meter,
+                                        crate::memsize::entry_bytes(&[Value::Null]),
+                                    )?;
+                                }
                                 let g = groups.len();
                                 null_gi = Some(g);
                                 groups.push((
@@ -2756,6 +2826,7 @@ impl Engine {
                     .collect::<Result<Vec<_>>>()?,
             ]
         };
+        charge.release_all();
         Ok(Some(srows))
     }
 }

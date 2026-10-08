@@ -34,6 +34,11 @@ pub(crate) fn fold_agg_whole(
     meter: &mut Meter,
 ) -> Result<Vec<Value>> {
     let mut accs: Vec<Acc> = specs.iter().map(Acc::from_spec).collect();
+    // The whole-table group's entry (memory.md §6.2), returned once the group is finalized.
+    let mut charge = meter.state_charge();
+    if charge.active() {
+        charge.reserve(meter, crate::memsize::entry_bytes(&[]))?;
+    }
     for (si, spec) in specs.iter().enumerate() {
         meter.charge(COSTS.aggregate_accumulate * nsurv as i64);
         let oc = operand_col(spec);
@@ -45,7 +50,9 @@ pub(crate) fn fold_agg_whole(
             accs[si].fold(v, meter)?;
         }
     }
-    accs.into_iter().map(Acc::finalize).collect()
+    let out = accs.into_iter().map(Acc::finalize).collect();
+    charge.release_all();
+    out
 }
 
 /// Bucket `nsurv` survivors from `src` by their single INTEGER group-key column and fold each aggregate
@@ -66,6 +73,9 @@ pub(crate) fn group_by_int_key(
     let mut groups: Vec<(Value, Vec<Acc>)> = Vec::new();
     let mut index: HashMap<i64, usize> = HashMap::new();
     let mut null_gi: Option<usize> = None;
+    // The group table's entries (memory.md §6.2): all groups are finalized before any group row is
+    // admitted, so the whole table is returned after the last finalize.
+    let mut charge = meter.state_charge();
 
     meter.charge(COSTS.aggregate_accumulate * nsurv as i64 * specs.len() as i64);
     for j in 0..nsurv {
@@ -74,6 +84,12 @@ pub(crate) fn group_by_int_key(
             Value::Int(k) => match index.get(k) {
                 Some(&g) => g,
                 None => {
+                    if charge.active() {
+                        charge.reserve(
+                            meter,
+                            crate::memsize::entry_bytes(std::slice::from_ref(kv)),
+                        )?;
+                    }
                     let g = groups.len();
                     index.insert(*k, g);
                     groups.push((kv.clone(), specs.iter().map(Acc::from_spec).collect()));
@@ -85,6 +101,9 @@ pub(crate) fn group_by_int_key(
             _ => match null_gi {
                 Some(g) => g,
                 None => {
+                    if charge.active() {
+                        charge.reserve(meter, crate::memsize::entry_bytes(&[Value::Null]))?;
+                    }
                     let g = groups.len();
                     null_gi = Some(g);
                     groups.push((Value::Null, specs.iter().map(Acc::from_spec).collect()));
@@ -102,7 +121,7 @@ pub(crate) fn group_by_int_key(
         }
     }
 
-    groups
+    let out = groups
         .into_iter()
         .map(|(key, accs)| {
             let mut srow: Vec<Value> = Vec::with_capacity(1 + accs.len());
@@ -112,7 +131,9 @@ pub(crate) fn group_by_int_key(
             }
             Ok(srow)
         })
-        .collect()
+        .collect();
+    charge.release_all();
+    out
 }
 
 /// A prepared statement's memoized scan plan (spec/design/api.md §2.4): the resolved [`SelectPlan`]
@@ -230,7 +251,7 @@ impl crate::cursor::RowStream for StreamingScan {
             && self.produced >= l
         {
             self.done = true;
-            self.seen.clear();
+            self.seen.release(); // the scan ended (memory.md §6.2)
             return Ok(None);
         }
         let env = EvalEnv {
@@ -246,7 +267,7 @@ impl crate::cursor::RowStream for StreamingScan {
                 Some(row) => row,
                 None => {
                     self.done = true;
-                    self.seen.clear();
+                    self.seen.release(); // the scan ended (memory.md §6.2)
                     return Ok(None);
                 }
             };
@@ -272,7 +293,8 @@ impl crate::cursor::RowStream for StreamingScan {
                 for p in &self.plan.projections {
                     projected.push(p.eval(&row, &env, &mut self.meter)?);
                 }
-                if !self.seen.insert(projected.clone())? {
+                let inserted = self.seen.insert(projected.clone());
+                if !self.meter.cost_first(inserted)? {
                     continue;
                 }
                 self.passed += 1;
@@ -313,7 +335,7 @@ impl crate::cursor::RowStream for StreamingScan {
         // The pinned snapshot is owned by `self.engine` / `self.scan` and released on `Drop`; mark
         // done so any further `next_row` is a no-op (streaming.md §5, idempotent).
         self.done = true;
-        self.seen.clear();
+        self.seen.release(); // the scan ended (memory.md §6.2)
     }
 }
 
@@ -382,6 +404,8 @@ pub(crate) enum BufState {
         sel: Option<Vec<i32>>,
         idx: usize,
         end: usize,
+        /// The lanes' query-memory charge (memory.md §6.5), returned at exhaustion or close.
+        charge: crate::cost::StateCharge,
     },
     /// The buffer is exhausted (or the cursor was closed) — every further `next_row` is `None`.
     Done,
@@ -436,12 +460,14 @@ impl crate::cursor::RowStream for BufferedScan {
                     sel,
                     start,
                     end,
+                    charge,
                 } => BufState::Columnar {
                     cols,
                     proj_cols,
                     sel,
                     idx: start,
                     end,
+                    charge,
                 },
             };
         }
@@ -497,6 +523,8 @@ impl crate::cursor::RowStream for BufferedScan {
             // `self.params` the projection reads.
             BufState::Sorted { sorted, remaining } => {
                 if *remaining == 0 {
+                    // Exhausted: the sort state's charge is returned (memory.md §6.4).
+                    sorted.release();
                     return Ok(None);
                 }
                 let row = sorted
@@ -561,8 +589,11 @@ impl crate::cursor::RowStream for BufferedScan {
                 sel,
                 idx,
                 end,
+                ..
             } => {
                 if *idx >= *end {
+                    // Exhausted: the lanes' charge is returned with them (memory.md §6.5).
+                    self.state = BufState::Done;
                     return Ok(None);
                 }
                 let j = *idx;

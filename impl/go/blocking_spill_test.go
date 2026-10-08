@@ -78,14 +78,14 @@ func TestBlockingSpoolAndHashStateStayBounded(t *testing.T) {
 	db.session.workMem = 128
 	spool := newRowSpool(db)
 	defer spool.close()
-	state := newBoundedMap(db)
+	state := newStateMap(db)
 	defer state.close()
 	for i := 0; i < 500; i++ {
 		row := storedRow{IntValue(int64(i)), TextValue(strings.Repeat("x", 40))}
 		if err := spool.push(row); err != nil {
 			t.Fatal(err)
 		}
-		if err := state.put(fmt.Sprint(i), row); err != nil {
+		if err := state.put([]Value{IntValue(int64(i))}, row); err != nil {
 			t.Fatal(err)
 		}
 		if spool.bytes > 128 || state.bytes > 128 {
@@ -99,7 +99,7 @@ func TestBlockingSpoolAndHashStateStayBounded(t *testing.T) {
 		t.Fatal("spilled owners retained resident input")
 	}
 	for i := 0; i < 500; i++ {
-		r, ok, err := state.get(fmt.Sprint(i))
+		r, ok, err := state.get([]Value{IntValue(int64(i))})
 		if err != nil || !ok || r[0].Int != int64(i) {
 			t.Fatalf("state %d: %v %v %v", i, r, ok, err)
 		}
@@ -128,29 +128,36 @@ func TestBlockingVariableAggregatesSpill(t *testing.T) {
 	db.session.workMem = 128
 	for _, plan := range []aggPlan{planPercentileDisc, planMode, planJsonbAgg, planJsonbObjectAgg} {
 		t.Run(fmt.Sprint(plan), func(t *testing.T) {
-			values := &boundedJoinTable{mem: make(map[uint64][]hashJoinEntry), budget: 128, dir: dir}
-			defer values.close()
-			seen := newBoundedMap(db)
-			defer seen.close()
+			collections := newHashRows(db)
+			defer collections.close()
 			spec := aggSpec{plan: plan}
-			a := newAccFromSpec(spec)
-			key := []byte("one group")
+			state := blockingAccRow(newAccFromSpec(spec))
 			for i := 0; i < 300; i++ {
 				v := IntValue(int64(i))
 				if plan == planJsonbObjectAgg {
 					v = CompositeValue([]Value{TextValue(fmt.Sprint(i % 17)), v})
 				}
-				handled, err := blockingFoldCollection(a, spec, v, key, values, seen, &costMeter{})
-				if err != nil || !handled {
-					t.Fatalf("fold: %v %v", handled, err)
+				a := blockingAccFromRow(spec, state)
+				if err := a.fold(v, &costMeter{}); err != nil {
+					t.Fatalf("fold: %v", err)
 				}
+				if err := blockingRetain(a, 0, collections); err != nil {
+					t.Fatalf("retain: %v", err)
+				}
+				state = blockingAccRow(a)
 			}
-			if values.disk == nil || len(values.mem) != 0 {
+			if collections.disk == nil || len(collections.mem) != 0 {
 				t.Fatal("one group retained its growing collection in memory")
 			}
-			fraction := Float64Value(.5)
-			a.osaFrac = &fraction
-			v, err := db.blockingFinalizeCollection(a, spec, key, values, seen, nil, &evalEnv{exec: db})
+			a := blockingAccFromRow(spec, state)
+			var v Value
+			var err error
+			if plan == planPercentileDisc || plan == planMode {
+				fraction := Float64Value(.5)
+				v, err = db.blockingOrderedSet(a, &fraction, collections, 0)
+			} else {
+				v, err = db.finalizeSpilledAcc(a, spec, nil, collections, 0, &evalEnv{exec: db})
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -160,8 +167,10 @@ func TestBlockingVariableAggregatesSpill(t *testing.T) {
 			if plan == planMode && v.Int != 0 {
 				t.Fatalf("stable mode: %v", v)
 			}
-			values.close()
-			seen.close()
+			if plan == planJsonbObjectAgg && len(v.jsonb().Obj) != 17 {
+				t.Fatalf("object members: %v", jsonbOut(v.jsonb()))
+			}
+			collections.close()
 			assertNoBlockingScratch(t, dir)
 		})
 	}
@@ -233,7 +242,7 @@ func TestBlockingSpillFailuresAndEarlyCursorClose(t *testing.T) {
 
 func TestBlockingSortCompactsRunsAndSpillCollisionOrder(t *testing.T) {
 	dir := t.TempDir()
-	s := newSorter([]orderSlot{{idx: 0}}, 1, dir)
+	s := newSorter([]orderSlot{{idx: 0}}, 1, dir, nil)
 	defer s.close()
 	for i := 0; i < 1000; i++ {
 		if err := s.push(storedRow{IntValue(int64(i % 7)), IntValue(int64(i))}); err != nil {

@@ -485,6 +485,9 @@ pub(crate) fn apply_window_stage(
     let mut spec_group = vec![0usize; specs.len()];
     let mut group_cache: Vec<(Vec<Vec<usize>>, Vec<Vec<Option<Vec<u8>>>>)> =
         Vec::with_capacity(groups.len());
+    // The partition tables are operator state (memory.md §6.2): one entry per partition, held until
+    // the window stage completes.
+    let mut part_charge = meter.state_charge();
     for (gi, group) in groups.iter().enumerate() {
         let rep = &specs[group[0]];
         for &si in group {
@@ -499,6 +502,9 @@ pub(crate) fn apply_window_stage(
             let pi = match index.get(&key) {
                 Some(&p) => p,
                 None => {
+                    if part_charge.active() {
+                        part_charge.reserve(meter, crate::memsize::entry_bytes(&key))?;
+                    }
                     let p = partitions.len();
                     index.insert(key, p);
                     partitions.push(Vec::new());
@@ -712,6 +718,9 @@ pub(crate) fn apply_window_stage(
                             groups.push((s, np));
                         }
                         let mut acc = Acc::new(aggplan);
+                        // What the running accumulator retains (memory.md §6.3), returned at the end
+                        // of the partition's pass.
+                        let mut acc_charge = 0i64;
                         for &(start, end) in &groups {
                             for k in start..end {
                                 meter.charge(COSTS.window_frame_step);
@@ -719,7 +728,7 @@ pub(crate) fn apply_window_stage(
                                     continue; // FILTER excludes this row from the running fold
                                 }
                                 let v = opval(k, meter)?;
-                                acc.fold(v, meter)?;
+                                acc.fold_charged(v, meter, &mut acc_charge)?;
                             }
                             let out = acc.clone().finalize()?;
                             for &ri in &ordered[start..end] {
@@ -728,6 +737,7 @@ pub(crate) fn apply_window_stage(
                                 results[ri] = out.clone();
                             }
                         }
+                        meter.release_query(acc_charge);
                     } else {
                         // EXPLICIT frame (window.md §5.2/§6). The sorted partition makes the frame
                         // bounds [lo, hi) monotonic non-decreasing in `pos`, so a NO-EXCLUDE
@@ -771,6 +781,7 @@ pub(crate) fn apply_window_stage(
                             for pos in 0..np {
                                 let (lo, hi) = ctx.bounds(pos, &spec.frame)?;
                                 let mut acc = Acc::new(aggplan);
+                                let mut acc_charge = 0i64;
                                 for k in lo..hi {
                                     if ctx.is_excluded(pos, k, exclude) {
                                         continue;
@@ -780,11 +791,12 @@ pub(crate) fn apply_window_stage(
                                         continue;
                                     }
                                     let v = eval_at(k, meter, &mut vals)?;
-                                    acc.fold(v, meter)?;
+                                    acc.fold_charged(v, meter, &mut acc_charge)?;
                                 }
                                 meter.guard()?;
                                 meter.charge(COSTS.window_result);
                                 results[ordered[pos]] = acc.finalize()?;
+                                meter.release_query(acc_charge);
                             }
                         } else {
                             // SLIDING (monotone carry). `removable` aggregates un-fold the left edge;
@@ -792,6 +804,7 @@ pub(crate) fn apply_window_stage(
                             // `lo`, so it only ever adds — the universal byte-identical case).
                             let removable = matches!(aggplan, AggPlan::CountStar | AggPlan::Count);
                             let mut acc = Acc::new(aggplan);
+                            let mut acc_charge = 0i64;
                             let mut cur_lo = 0usize;
                             let mut cur_hi = 0usize;
                             for pos in 0..np {
@@ -799,10 +812,12 @@ pub(crate) fn apply_window_stage(
                                 if !removable && lo > cur_lo {
                                     // Left edge advanced over a non-invertible aggregate ⇒ rebuild.
                                     acc = Acc::new(aggplan);
+                                    meter.release_query(acc_charge);
+                                    acc_charge = 0;
                                     for k in lo..hi {
                                         meter.charge(COSTS.window_frame_step);
                                         let v = eval_at(k, meter, &mut vals)?;
-                                        acc.fold(v, meter)?;
+                                        acc.fold_charged(v, meter, &mut acc_charge)?;
                                     }
                                 } else {
                                     // Un-fold rows leaving on the left (invertible only; empty when
@@ -818,7 +833,7 @@ pub(crate) fn apply_window_stage(
                                     for k in add_lo..hi {
                                         meter.charge(COSTS.window_frame_step);
                                         let v = eval_at(k, meter, &mut vals)?;
-                                        acc.fold(v, meter)?;
+                                        acc.fold_charged(v, meter, &mut acc_charge)?;
                                     }
                                 }
                                 cur_lo = lo;
@@ -827,6 +842,7 @@ pub(crate) fn apply_window_stage(
                                 meter.charge(COSTS.window_result);
                                 results[ordered[pos]] = acc.clone().finalize()?;
                             }
+                            meter.release_query(acc_charge);
                         }
                     }
                 }
@@ -892,6 +908,7 @@ pub(crate) fn apply_window_stage(
             row.push(v);
         }
     }
+    part_charge.release_all();
     Ok(())
 }
 
@@ -1071,6 +1088,9 @@ pub(crate) struct TopKKeeper {
     collated: bool,
     order: Vec<crate::spill::SortKey>,
     items: Vec<TopKItem>,
+    /// The retained rows' query-memory charge when the heap is sort state (the streaming-sort lane,
+    /// memory.md §6.4); inert for the eager top-k selection, whose rows are Q1 buffer rows.
+    charge: crate::cost::StateCharge,
 }
 
 impl TopKKeeper {
@@ -1081,7 +1101,16 @@ impl TopKKeeper {
             collated,
             order: order.to_vec(),
             items: Vec::new(),
+            charge: crate::cost::StateCharge::default(),
         }
+    }
+
+    /// Charge the retained rows to `charge` (memory.md §6.4): a retained row reserves its `row_bytes`,
+    /// an evicted row is released after its replacement is reserved. A rejected reservation returns
+    /// `54P05` from `push` for the caller's [`crate::cost::Meter::cost_first`].
+    pub(crate) fn with_charge(mut self, charge: crate::cost::StateCharge) -> Self {
+        self.charge = charge;
+        self
     }
 
     fn cmp(&self, a: &TopKItem, b: &TopKItem) -> std::cmp::Ordering {
@@ -1110,9 +1139,19 @@ impl TopKKeeper {
             return Ok(());
         }
         if self.items.len() < self.k {
+            if self.charge.active() {
+                self.charge
+                    .reserve_direct(crate::memsize::row_bytes(&item.row))?;
+            }
             self.items.push(item);
             self.sift_up(self.items.len() - 1);
         } else if self.cmp(&item, &self.items[0]).is_lt() {
+            if self.charge.active() {
+                self.charge
+                    .reserve_direct(crate::memsize::row_bytes(&item.row))?;
+                let evicted = crate::memsize::row_bytes(&self.items[0].row);
+                self.charge.release(evicted);
+            }
             self.items[0] = item;
             self.sift_down(0);
         }
@@ -1149,7 +1188,13 @@ impl TopKKeeper {
         }
     }
 
-    pub(crate) fn finish(mut self) -> Vec<Row> {
+    pub(crate) fn finish(self) -> Vec<Row> {
+        self.finish_charged().0
+    }
+
+    /// [`finish`](Self::finish), handing back the retained rows' charge with them.
+    pub(crate) fn finish_charged(mut self) -> (Vec<Row>, crate::cost::StateCharge) {
+        let charge = std::mem::take(&mut self.charge);
         let collated = self.collated;
         let order = self.order;
         self.items.sort_by(|a, b| {
@@ -1160,7 +1205,10 @@ impl TopKKeeper {
             };
             by_key.then_with(|| a.pos.cmp(&b.pos))
         });
-        self.items.into_iter().map(|item| item.row).collect()
+        (
+            self.items.into_iter().map(|item| item.row).collect(),
+            charge,
+        )
     }
 }
 

@@ -57,27 +57,32 @@ inside their algorithms. A cost ceiling can reject the work before its allocatio
 
 ## Query memory budget
 
-`max_query_memory_bytes` bounds the **rows a statement holds at once**: materialized relations,
-join results, grouped and `DISTINCT` rows, set-operation and CTE buffers, `RETURNING` results, and
-the rows the engine's own collect-everything helpers (Rust `query_rows`, TypeScript
-`Statement.all()`) gather. It is **unlimited by default** — like `max_cost`, a host serving untrusted
+`max_query_memory_bytes` bounds the **rows and operator state a statement holds at once**:
+materialized relations, join results, grouped and `DISTINCT` rows, set-operation and CTE buffers,
+`RETURNING` results, and the rows the engine's own collect-everything helpers (Rust `query_rows`,
+TypeScript `Statement.all()`) gather — plus the working state of the operators that produce them:
+hash-join tables, group and dedup tables, aggregate inputs such as `json_agg`'s, window
+partitions, and sort buffers. It is **unlimited by default** — like `max_cost`, a host serving untrusted
 SQL opts in. Set it through session options or `set_max_query_memory_bytes(bytes)` /
 `SetMaxQueryMemoryBytes(bytes)` / `setMaxQueryMemoryBytes(bytes)`; non-positive values restore
 unlimited. A statement that would exceed it fails with **`54P05`**; exact equality is allowed.
 
-The budget counts **logical bytes** from a fixed schedule — 32 bytes per row and per value, plus
-the UTF-8 length of text, the length of bytea, and similar payloads — not the runtime's actual
-allocations. That makes the limit deterministic: the same query aborts at the same row on every
+The budget counts **logical bytes** from a fixed schedule — 32 bytes per row, per value, and per
+hash-table entry, plus the UTF-8 length of text, the length of bytea, and similar payloads — not
+the runtime's actual allocations. That makes the limit deterministic: the same query aborts at the same row on every
 core. Rows released along the way (filtered out, consumed by the next stage, handed to your cursor)
 give their bytes back, and a streaming query that hands each row to you as it is produced holds
 almost nothing. A cursor keeps its statement's budget until it closes.
 
 ## Memory coverage
 
-These budgets are **guardrails, not a process-memory cap**. Still uncovered: operator state
-(hash-join tables, sort buffers, `DISTINCT`/group sets, `json_agg`-style
-accumulators), writes pending in an open transaction, page caches, and scalar kernels beyond
-the ones listed above. On native file hosts, `work_mem` controls sort, hash JOIN, aggregation,
+These budgets are **guardrails, not a process-memory cap**. The query-memory budget covers row
+buffers and operator state: hash-join tables, group, `DISTINCT`, and set-operation tables,
+`json_agg`-style and ordered-set accumulators, window partitions, sort buffers and top-k heaps,
+and the resident part of spilling operators. Still uncovered: writes pending in an open
+transaction, page caches, and scalar kernels beyond the ones listed above. A spilling operator
+releases its charge as it spills, but the budget never forces a spill: to let a large sort or
+aggregate spill rather than fail, set `work_mem` well below the query-memory budget. On native file hosts, `work_mem` controls sort, hash JOIN, aggregation,
 and DISTINCT spilling. Their scratch storage preserves results and deterministic costs;
 in-memory and OPFS databases remain resident. `temp_buffers` limits retained temporary storage.
 Hosts exposing arbitrary untrusted SQL should combine these settings with process-level memory

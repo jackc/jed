@@ -32,12 +32,15 @@ fn query_rows_collector_is_admitted() {
         .unwrap();
     s.execute("INSERT INTO t SELECT g FROM generate_series(1, 100) g", &[])
         .unwrap();
-    s.set_max_query_memory_bytes(64 * 100);
-    // A streaming scan holds no row buffer; draining it by hand is the host's own memory.
+    // The columnar projection lane gathers the id column (100 values × 32 = 3200 bytes of lane state,
+    // memory.md §6.5), held until its emission completes.
+    s.set_max_query_memory_bytes(3200);
+    // Draining by hand: the lane is the engine's, the rows are the host's own memory.
     assert_eq!(s.query("SELECT id FROM t", &[]).unwrap().count(), 100);
-    // The engine-owned collector charges each collected row (32 + 32 bytes): 100 rows need 6400.
+    // The engine-owned collector also charges each collected row (32 + 32 bytes): 3200 + 6400.
+    s.set_max_query_memory_bytes(3200 + 64 * 100);
     assert_eq!(s.query_rows("SELECT id FROM t", ()).unwrap().len(), 100);
-    s.set_max_query_memory_bytes(64 * 100 - 1);
+    s.set_max_query_memory_bytes(3200 + 64 * 100 - 1);
     let err = s.query_rows("SELECT id FROM t", ()).err().expect("54P05");
     assert_eq!(err.code(), "54P05");
 }
@@ -93,4 +96,55 @@ fn rejected_collector_admission_reports_a_reached_cost_ceiling() {
     // Below the ceiling the memory error stands.
     s.set_max_cost(cost + 1);
     assert_eq!(s.query_rows(sql, ()).err().expect("54P05").code(), "54P05");
+}
+
+/// Spill-capable operator state charges only its resident portion (memory.md §6.6): on a file-backed
+/// database the bounded-spill lane's structures release their charge as they spill, so a budget that
+/// a fully resident DISTINCT exceeds is enough once `work_mem` makes it spill — and the account itself
+/// never forces the spill. Disk-only behavior, so it lives here rather than in the corpus.
+#[test]
+fn spilling_operator_state_releases_its_charge() {
+    let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("query_memory_spill.jed");
+    let _ = std::fs::remove_file(&path);
+    let db = Database::create(CreateOptions {
+        path: Some(path.clone()),
+        skip_fsync: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut s = db.session(SessionOptions::default());
+    s.execute("CREATE TABLE t (id i32 PRIMARY KEY, s text)", &[])
+        .unwrap();
+    s.execute(
+        "INSERT INTO t SELECT g, repeat('x', g) FROM generate_series(1, 300) g",
+        &[],
+    )
+    .unwrap();
+    let sql = "SELECT DISTINCT s FROM t";
+    let peak = |s: &mut jed::Session, work_mem: usize| -> i64 {
+        s.set_work_mem(work_mem);
+        s.set_max_query_memory_bytes(1 << 40);
+        jed::tooling::QUERY_MEMORY_PEAK.store(0, std::sync::atomic::Ordering::Relaxed);
+        s.query_outcome(sql, &[]).unwrap();
+        jed::tooling::QUERY_MEMORY_PEAK.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let resident = peak(&mut s, 1 << 30);
+    let spilling = peak(&mut s, 4096);
+    assert!(
+        spilling < resident / 4,
+        "spilling peak {spilling} vs resident {resident}"
+    );
+    // The spilling run fits a budget the resident run exceeds.
+    s.set_max_query_memory_bytes(spilling);
+    s.set_work_mem(4096);
+    match s.query_outcome(sql, &[]).unwrap() {
+        jed::Outcome::Query { rows, .. } => assert_eq!(rows.len(), 300),
+        other => panic!("expected rows, got {other:?}"),
+    }
+    s.set_work_mem(1 << 30);
+    let err = s.query_outcome(sql, &[]).err().expect("54P05");
+    assert_eq!(err.code(), "54P05");
+    drop(s);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
 }

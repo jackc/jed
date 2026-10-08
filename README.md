@@ -79,8 +79,8 @@ are **not yet published** to their registries.)
 - **Resource controls for untrusted SQL** ([CLAUDE.md §13](CLAUDE.md)). Memory-safe cores
   and pure built-ins prevent memory corruption and host access. Deterministic cost budgets,
   parser limits, a finite scalar-allocation allowance, and an opt-in live query-memory budget
-  over row buffers bound their documented surfaces. Whole-query memory admission (operator
-  state, pending writes, caches) remains in progress; see [memory coverage](spec/design/memory.md).
+  over row buffers and operator state bound their documented surfaces. Whole-query memory
+  admission (pending writes, caches) remains in progress; see [memory coverage](spec/design/memory.md).
 - **No reference implementation.** jed is implemented natively in multiple languages **in
   lockstep**, so every spec ambiguity becomes a failing cross-core test the day it is
   written. The honesty mechanism is divergence under a shared contract, not implementation

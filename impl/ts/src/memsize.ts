@@ -7,7 +7,13 @@
 // pin the measurement (tests/memory_sizes.test.ts). Plain numbers: the live account stays far below
 // 2^53.
 
-import { MEMORY_ARRAY_DIM, MEMORY_DECIMAL_GROUP, MEMORY_ROW, MEMORY_VALUE } from "./costs.ts";
+import {
+  MEMORY_ARRAY_DIM,
+  MEMORY_DECIMAL_GROUP,
+  MEMORY_ENTRY,
+  MEMORY_ROW,
+  MEMORY_VALUE,
+} from "./costs.ts";
 import type { JsonNode } from "./json.ts";
 import type { Value } from "./value.ts";
 
@@ -109,4 +115,35 @@ export function rowBytesMasked(row: Value[], mask: boolean[]): number {
     n += i < mask.length && !mask[i] ? MEMORY_VALUE : valueBytes(row[i]);
   }
   return n;
+}
+
+// keyBytes is key_bytes(values) = Σ value_bytes — a key or state tuple with no ROW header (memory.md
+// §6.1).
+export function keyBytes(values: Value[]): number {
+  let n = 0;
+  for (let i = 0; i < values.length; i++) n += valueBytes(values[i]);
+  return n;
+}
+
+// entryBytes is entry_bytes(values) = ENTRY + key_bytes — one hash/dedup/group entry (memory.md §6.1).
+export function entryBytes(values: Value[]): number {
+  return MEMORY_ENTRY + keyBytes(values);
+}
+
+// entryBytesAt is entry_bytes of the key at `indices` of `row`, without copying the key out.
+export function entryBytesAt(row: Value[], indices: number[]): number {
+  let n = MEMORY_ENTRY;
+  for (const i of indices) n += valueBytes(row[i]);
+  return n;
+}
+
+// mapEntryBytes is a spill-capable structure's resident measure of one keyed state-map element
+// (memory.md §6.6).
+export function mapEntryBytes(key: Value[], value: Value[]): number {
+  return MEMORY_ENTRY + keyBytes(key) + keyBytes(value);
+}
+
+// hashRowBytes is a spill-capable hash row table's resident measure of one row (memory.md §6.6).
+export function hashRowBytes(row: Value[]): number {
+  return MEMORY_ENTRY + rowBytes(row);
 }

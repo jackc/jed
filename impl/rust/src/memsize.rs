@@ -6,7 +6,9 @@
 //! constants are codegen'd from spec/cost/schedule.toml `[memory]`; the shared vectors in
 //! spec/cost/memory_sizes.toml pin the measurement (tests/memory_sizes.rs).
 
-use crate::costs::{MEMORY_ARRAY_DIM, MEMORY_DECIMAL_GROUP, MEMORY_ROW, MEMORY_VALUE};
+use crate::costs::{
+    MEMORY_ARRAY_DIM, MEMORY_DECIMAL_GROUP, MEMORY_ENTRY, MEMORY_ROW, MEMORY_VALUE,
+};
 use crate::json::JsonNode;
 use crate::value::Value;
 
@@ -70,4 +72,29 @@ pub(crate) fn row_bytes_masked(row: &[Value], mask: &[bool]) -> i64 {
                 }
             })
             .sum::<i64>()
+}
+
+/// `key_bytes(values) = Σ value_bytes` — a key or state tuple with no ROW header (memory.md §6.1).
+pub(crate) fn key_bytes(values: &[Value]) -> i64 {
+    values.iter().map(value_bytes).sum()
+}
+
+/// `entry_bytes(values) = ENTRY + key_bytes` — one hash/dedup/group entry (memory.md §6.1).
+pub(crate) fn entry_bytes(values: &[Value]) -> i64 {
+    MEMORY_ENTRY + key_bytes(values)
+}
+
+/// `entry_bytes` of the key at `indices` of `row`, without copying the key out.
+pub(crate) fn entry_bytes_at(row: &[Value], indices: &[usize]) -> i64 {
+    MEMORY_ENTRY + indices.iter().map(|&i| value_bytes(&row[i])).sum::<i64>()
+}
+
+/// A spill-capable structure's resident measure of one keyed state-map element (memory.md §6.6).
+pub(crate) fn map_entry_bytes(key: &[Value], value: &[Value]) -> i64 {
+    MEMORY_ENTRY + key_bytes(key) + key_bytes(value)
+}
+
+/// A spill-capable hash row table's resident measure of one row (memory.md §6.6).
+pub(crate) fn hash_row_bytes(row: &[Value]) -> i64 {
+    MEMORY_ENTRY + row_bytes(row)
 }

@@ -20,7 +20,7 @@ import type {
   WindowSpec,
 } from "./executor.ts";
 import type { FrameExclusion } from "./ast.ts";
-import type { Meter } from "./cost.ts";
+import { type Meter, StateCharge } from "./cost.ts";
 import {
   cloneAcc,
   cmpBytes,
@@ -28,12 +28,13 @@ import {
   distinctRowKey,
   evalExpr,
   finalizeAcc,
-  foldAcc,
+  foldAccCharged,
   newAcc,
   storeValue,
   unfoldAcc,
 } from "./executor.ts";
 import { COSTS } from "./costs.ts";
+import { entryBytes, rowBytes } from "./memsize.ts";
 import { engineError } from "./errors.ts";
 import { sortKey as collationSortKey } from "./collation.ts";
 import { intervalCmp } from "./interval.ts";
@@ -468,6 +469,9 @@ export function applyWindowStage(
   const groups = groupWindowSpecs(specs);
   const specGroup = new Array<number>(specs.length).fill(0);
   const cache: Array<{ partitions: number[][]; collKeys: (Uint8Array | null)[][] | null }> = [];
+  // The partition tables are operator state (memory.md §6.2): one entry per partition, held until the
+  // window stage completes.
+  let partCharge = 0;
   for (let gi = 0; gi < groups.length; gi++) {
     const group = groups[gi]!;
     const rep = specs[group[0]!]!;
@@ -481,6 +485,11 @@ export function applyWindowStage(
       const k = distinctRowKey(keyVals);
       let pi = index.get(k);
       if (pi === undefined) {
+        if (meter.queryMemoryActive()) {
+          const bytes = entryBytes(keyVals);
+          meter.reserveQuery(bytes);
+          partCharge += bytes;
+        }
         pi = partitions.length;
         index.set(k, pi);
         partitions.push([]);
@@ -672,6 +681,9 @@ export function applyWindowStage(
               spec.aggJsonAsJson ?? false,
               spec.aggJsonStrict ?? false,
             );
+            // What the running accumulator retains (memory.md §6.3), returned at the end of the
+            // partition's pass.
+            let accCharge = 0;
             for (const [start, end] of groups) {
               for (let k = start; k < end; k++) {
                 // The frame fold work (window.md §8) — metered so a running aggregate over a large
@@ -681,7 +693,7 @@ export function applyWindowStage(
                 const v = hasOperand
                   ? evalExpr(spec.args[0]!, rows[ordered[k]!]!, env, meter)
                   : nullValue();
-                foldAcc(acc, v, meter);
+                accCharge += foldAccCharged(acc, v, meter);
               }
               // Snapshot the running accumulator for this peer group's frame [0, end).
               const out = finalizeAcc(cloneAcc(acc));
@@ -692,6 +704,7 @@ export function applyWindowStage(
                 results[ri] = out;
               }
             }
+            meter.releaseQuery(accCharge);
           } else {
             // EXPLICIT frame (window.md §5.2/§6). The sorted partition makes the frame bounds
             // [lo, hi) monotonic non-decreasing in pos, so a NO-EXCLUDE aggregate CARRIES one
@@ -730,15 +743,17 @@ export function applyWindowStage(
                   spec.aggJsonAsJson ?? false,
                   spec.aggJsonStrict ?? false,
                 );
+                let accCharge = 0;
                 for (let k = lo; k < hi; k++) {
                   if (ctx.isExcluded(pos, k, exclude)) continue;
                   meter.charge(COSTS.windowFrameStep);
                   if (!filterPass(k)) continue;
-                  foldAcc(acc, evalAt(k), meter);
+                  accCharge += foldAccCharged(acc, evalAt(k), meter);
                 }
                 meter.guard();
                 meter.charge(COSTS.windowResult);
                 results[ordered[pos]!] = finalizeAcc(acc);
+                meter.releaseQuery(accCharge);
               }
             } else {
               // SLIDING (monotone carry). removable aggregates un-fold the left edge; the rest
@@ -750,6 +765,7 @@ export function applyWindowStage(
                 spec.aggJsonAsJson ?? false,
                 spec.aggJsonStrict ?? false,
               );
+              let accCharge = 0;
               let curLo = 0;
               let curHi = 0;
               for (let pos = 0; pos < np; pos++) {
@@ -762,9 +778,11 @@ export function applyWindowStage(
                     spec.aggJsonAsJson ?? false,
                     spec.aggJsonStrict ?? false,
                   );
+                  meter.releaseQuery(accCharge);
+                  accCharge = 0;
                   for (let k = lo; k < hi; k++) {
                     meter.charge(COSTS.windowFrameStep);
-                    foldAcc(acc, evalAt(k), meter);
+                    accCharge += foldAccCharged(acc, evalAt(k), meter);
                   }
                 } else {
                   // Un-fold rows leaving on the left (invertible only; empty when lo === curLo) …
@@ -777,7 +795,7 @@ export function applyWindowStage(
                   const addLo = Math.max(curHi, lo);
                   for (let k = addLo; k < hi; k++) {
                     meter.charge(COSTS.windowFrameStep);
-                    foldAcc(acc, evalAt(k), meter);
+                    accCharge += foldAccCharged(acc, evalAt(k), meter);
                   }
                 }
                 curLo = lo;
@@ -786,6 +804,7 @@ export function applyWindowStage(
                 meter.charge(COSTS.windowResult);
                 results[ordered[pos]!] = finalizeAcc(cloneAcc(acc));
               }
+              meter.releaseQuery(accCharge);
             }
           }
           break;
@@ -864,6 +883,7 @@ export function applyWindowStage(
       rows[i]!.push(v);
     }
   }
+  meter.releaseQuery(partCharge);
 }
 
 // sortRows sorts rows by the ORDER BY keys (spec/design/grammar.md §10). The all-C fast path is a
@@ -979,11 +999,22 @@ export class TopKKeeper {
   private readonly collated: boolean;
   private nextPos = 0n;
   private items: TopKItem[] = [];
+  // The retained rows' query-memory charge when the heap is sort state (the streaming-sort lane,
+  // memory.md §6.4); inert for the eager top-k selection, whose rows are Q1 buffer rows.
+  private charge: StateCharge = new StateCharge();
 
   constructor(k: bigint, order: OrderSlot[], collated: boolean) {
     this.k = k;
     this.order = order;
     this.collated = collated;
+  }
+
+  // withCharge charges the retained rows to `charge` (memory.md §6.4): a retained row reserves its
+  // row_bytes, an evicted row is released after its replacement is reserved. A rejected reservation
+  // throws 54P05 from push for the caller's Meter.costFirst.
+  withCharge(charge: StateCharge): this {
+    this.charge = charge;
+    return this;
   }
 
   private compare(a: TopKItem, b: TopKItem): number {
@@ -1003,9 +1034,14 @@ export class TopKKeeper {
     // A collated LIMIT 0 still decorates every input row, preserving the full sort's trap point.
     if (this.k === 0n) return;
     if (BigInt(this.items.length) < this.k) {
+      if (this.charge.active()) this.charge.reserveDirect(rowBytes(item.row));
       this.items.push(item);
       this.siftUp(this.items.length - 1);
     } else if (this.compare(item, this.items[0]!) < 0) {
+      if (this.charge.active()) {
+        this.charge.reserveDirect(rowBytes(item.row));
+        this.charge.release(rowBytes(this.items[0]!.row));
+      }
       this.items[0] = item;
       this.siftDown(0);
     }
@@ -1038,6 +1074,11 @@ export class TopKKeeper {
   finish(): Row[] {
     this.items.sort((a, b) => this.compare(a, b));
     return this.items.map((item) => item.row);
+  }
+
+  // finishCharged is finish, handing back the retained rows' charge with them.
+  finishCharged(): { rows: Row[]; charge: StateCharge } {
+    return { rows: this.finish(), charge: this.charge };
   }
 }
 

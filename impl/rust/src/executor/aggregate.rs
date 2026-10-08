@@ -287,6 +287,50 @@ impl Acc {
         Ok(())
     }
 
+    /// The query-memory bytes folding `value` makes this accumulator retain (memory.md §6.3): the input
+    /// of a JSON / ordered-set aggregate, nothing for a fixed-size running value. Hypothetical-set and
+    /// DISTINCT-set retention is charged by the fold loop, which owns those buffers.
+    pub(crate) fn retained_bytes(&self, value: &Value) -> i64 {
+        match self {
+            Acc::JsonAgg { strict, .. } => {
+                if *strict && matches!(value, Value::Null) {
+                    0
+                } else {
+                    crate::memsize::value_bytes(value)
+                }
+            }
+            Acc::JsonObjectAgg { .. } => match value {
+                Value::Composite(fields) => crate::memsize::key_bytes(fields),
+                _ => 0,
+            },
+            Acc::OrderedSet { .. } if !matches!(value, Value::Null) => {
+                crate::memsize::value_bytes(value)
+            }
+            _ => 0,
+        }
+    }
+
+    /// [`Acc::fold`], then reserve what the fold retained (memory.md §6.3), adding it to `charge` — the
+    /// caller's running total for this accumulator, released when the accumulator is discarded.
+    pub(crate) fn fold_charged(
+        &mut self,
+        value: Value,
+        m: &mut Meter,
+        charge: &mut i64,
+    ) -> Result<()> {
+        let bytes = if m.query_memory_active() {
+            self.retained_bytes(&value)
+        } else {
+            0
+        };
+        self.fold(value, m)?;
+        if bytes > 0 {
+            m.reserve_query(bytes)?;
+            *charge += bytes;
+        }
+        Ok(())
+    }
+
     /// Un-fold one input value — the inverse of `fold` — used ONLY by the sliding-window
     /// optimization (window.md §5.2/§8) for the exactly-invertible COUNT / COUNT(*) (integer
     /// counters: add-then-remove is exact and order-independent). Every other accumulator is

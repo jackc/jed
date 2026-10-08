@@ -856,8 +856,19 @@ pub(crate) fn combine_setop(
     all: bool,
     left: Vec<Vec<Value>>,
     right: Vec<Vec<Value>>,
-) -> Vec<Vec<Value>> {
-    match (op, all) {
+    acct: &crate::cost::QueryAccount,
+) -> Result<Vec<Vec<Value>>> {
+    // The dedup / count tables are operator state (memory.md §6.2): one `entry_bytes` per distinct
+    // right-arm row of INTERSECT/EXCEPT (built first), then per row a distinct UNION/INTERSECT/EXCEPT
+    // keeps — all returned when the combine completes.
+    let mut charge = crate::cost::StateCharge::new(acct.clone());
+    let entry = |charge: &mut crate::cost::StateCharge, row: &[Value]| -> Result<()> {
+        if charge.active() {
+            charge.reserve_direct(crate::memsize::entry_bytes(row))?;
+        }
+        Ok(())
+    };
+    let out = match (op, all) {
         // UNION ALL: every left row then every right row, no dedup.
         (SetOpKind::Union, true) => {
             let mut rows = left;
@@ -870,6 +881,7 @@ pub(crate) fn combine_setop(
             let mut out = Vec::new();
             for row in left.into_iter().chain(right) {
                 if seen.insert(row.clone()) {
+                    entry(&mut charge, &row)?;
                     out.push(row);
                 }
             }
@@ -879,6 +891,9 @@ pub(crate) fn combine_setop(
         (SetOpKind::Intersect, true) => {
             let mut counts: HashMap<Vec<Value>, usize> = HashMap::new();
             for row in right {
+                if !counts.contains_key(&row) {
+                    entry(&mut charge, &row)?;
+                }
                 *counts.entry(row).or_insert(0) += 1;
             }
             let mut out = Vec::new();
@@ -894,11 +909,18 @@ pub(crate) fn combine_setop(
         }
         // INTERSECT: one copy per distinct left key also present in the right.
         (SetOpKind::Intersect, false) => {
-            let right_set: HashSet<Vec<Value>> = right.into_iter().collect();
+            let mut right_set: HashSet<Vec<Value>> = HashSet::new();
+            for row in right {
+                if !right_set.contains(&row) {
+                    entry(&mut charge, &row)?;
+                    right_set.insert(row);
+                }
+            }
             let mut emitted: HashSet<Vec<Value>> = HashSet::new();
             let mut out = Vec::new();
             for row in left {
                 if right_set.contains(&row) && emitted.insert(row.clone()) {
+                    entry(&mut charge, &row)?;
                     out.push(row);
                 }
             }
@@ -908,6 +930,9 @@ pub(crate) fn combine_setop(
         (SetOpKind::Except, true) => {
             let mut counts: HashMap<Vec<Value>, usize> = HashMap::new();
             for row in right {
+                if !counts.contains_key(&row) {
+                    entry(&mut charge, &row)?;
+                }
                 *counts.entry(row).or_insert(0) += 1;
             }
             let mut out = Vec::new();
@@ -921,17 +946,26 @@ pub(crate) fn combine_setop(
         }
         // EXCEPT: one copy per distinct left key absent from the right.
         (SetOpKind::Except, false) => {
-            let right_set: HashSet<Vec<Value>> = right.into_iter().collect();
+            let mut right_set: HashSet<Vec<Value>> = HashSet::new();
+            for row in right {
+                if !right_set.contains(&row) {
+                    entry(&mut charge, &row)?;
+                    right_set.insert(row);
+                }
+            }
             let mut emitted: HashSet<Vec<Value>> = HashSet::new();
             let mut out = Vec::new();
             for row in left {
                 if !right_set.contains(&row) && emitted.insert(row.clone()) {
+                    entry(&mut charge, &row)?;
                     out.push(row);
                 }
             }
             out
         }
-    }
+    };
+    charge.release_all();
+    Ok(out)
 }
 
 /// Resolve a trailing ORDER BY key for a set operation against the OUTPUT column names (the left

@@ -928,10 +928,13 @@ exact decimal transcendentals charge guarded internal steps. A finite 64 MiB def
 per statement (`54P04`), including internal meters and frozen cursors. A live, opt-in
 `max_query_memory_bytes` account (unlimited by default; `54P05`) bounds row buffers and
 engine result collectors — relation materialization, join outputs, grouped/DISTINCT rows,
-set operations, CTE/recursive-CTE buffers, RETURNING/EXPLAIN results — in deterministic
-logical bytes (slice Q1 of `spec/design/memory.md`). Operator state (hash tables, sort
-buffers, accumulators, spill spools), pending writes, and storage caches are still uncovered
-(Q2–Q4), as are remaining scalar kernels. These are guardrails, not heap caps: resource-
+set operations, CTE/recursive-CTE buffers, RETURNING/EXPLAIN results (slice Q1) — and
+operator state — hash-join, group, and dedup tables, retained aggregate inputs, window
+partitions, sort state, columnar lanes, and spill structures' resident elements (slice Q2) —
+in deterministic logical bytes (`spec/design/memory.md`). Spill structures measure their
+`work_mem` residency on the same schedule, so they spill at the same row in every core and
+release their charge as they spill. Pending writes and storage caches are still uncovered
+(Q3–Q4), as are remaining scalar kernels. These are guardrails, not heap caps: resource-
 exhaustion resistance remains a requirement; do not claim the current limits are a
 whole-engine memory guarantee. Host extensions remain outside these guarantees.
 

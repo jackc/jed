@@ -25,15 +25,21 @@ The forced run complements internal spill/cleanup/retained-state assertions; a c
 pass alone cannot prove that an implementation actually spilled.
 
 `rake conformance:query_memory[bytes,filter]` walks the corpus on all three cores in
-both storage modes with the query-memory account ([memory.md](memory.md)) active: every
-record without its own `# max_query_memory_bytes:` directive runs under the harness-only
+both storage modes, and once more on disk with `work_mem` forced to 256 bytes, with the
+query-memory account ([memory.md](memory.md)) active: every record without its own
+`# max_query_memory_bytes:` directive runs under the harness-only
 `JED_CONFORMANCE_QUERY_MEMORY` budget (default 2⁴⁰ bytes). Rows, types, errors, and costs
 must be unchanged, and each runner fails a record during which the engine released more
 query memory than it had reserved — an accounting-site bug no single threshold record
 would reveal. Each runner also writes every record's **peak** balance (its minimal passing
 budget) to `JED_CONFORMANCE_QUERY_MEMORY_PEAKS` as `file<TAB>record-ordinal<TAB>peak`, and
-the task fails unless the three cores agree on every record in both modes. It is part of
+the task fails unless the three cores agree on every record in every pass. It is part of
 `rake test` and `rake ci`.
+
+The Rust runner's `JED_CONFORMANCE_QUERY_MEMORY_PROBE` mode re-baselines pinned thresholds:
+records expected to succeed run under the accounting budget instead of their own (so their
+peak is recorded), while records expected to fail keep their pins and the file's state
+evolves exactly as in a normal walk.
 
 Two sibling formats cover concurrency that a one-handle SQL transcript cannot express:
 `# format: concurrency` files model named in-process sessions, while

@@ -516,6 +516,10 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 		collKeys   [][][]byte
 	}
 	cache := make([]groupShared, len(groups))
+	// The partition tables are operator state (memory.md §6.2): one entry per partition, held until
+	// the window stage completes.
+	partCharge := meter.stateCharge()
+	defer partCharge.releaseAll()
 	for gi, group := range groups {
 		rep := specs[group[0]]
 		for _, si := range group {
@@ -534,6 +538,11 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 			k := distinctRowKey(key)
 			pi, ok := index[k]
 			if !ok {
+				if partCharge.active() {
+					if err := partCharge.reserve(meter, memEntryBytes(key)); err != nil {
+						return err
+					}
+				}
 				pi = len(partitions)
 				index[k] = pi
 				partitions = append(partitions, nil)
@@ -767,6 +776,9 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 						groups = append(groups, span{s, np})
 					}
 					a := newAcc(spec.aggPlan)
+					// What the running accumulator retains (memory.md §6.3), returned at the end of
+					// the partition's pass.
+					var accCharge int64
 					for _, g := range groups {
 						for k := g.start; k < g.end; k++ {
 							// The frame fold work (window.md §8) — metered so a running aggregate over
@@ -783,7 +795,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 							if err != nil {
 								return err
 							}
-							if err := a.fold(v, meter); err != nil {
+							if err := a.foldCharged(v, meter, &accCharge); err != nil {
 								return err
 							}
 						}
@@ -801,6 +813,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 							results[ri] = out
 						}
 					}
+					meter.releaseQuery(accCharge)
 				} else {
 					// EXPLICIT frame (window.md §5.2/§6). The sorted partition makes the frame bounds
 					// [lo, hi) monotonic non-decreasing in pos, so a NO-EXCLUDE aggregate CARRIES one
@@ -843,6 +856,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 								return err
 							}
 							a := newAcc(spec.aggPlan)
+							var accCharge int64
 							for k := lo; k < hi; k++ {
 								if ctx.isExcluded(pos, k, exclude) {
 									continue
@@ -859,7 +873,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 								if err != nil {
 									return err
 								}
-								if err := a.fold(v, meter); err != nil {
+								if err := a.foldCharged(v, meter, &accCharge); err != nil {
 									return err
 								}
 							}
@@ -872,12 +886,14 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 								return err
 							}
 							results[ordered[pos]] = out
+							meter.releaseQuery(accCharge)
 						}
 					} else {
 						// SLIDING (monotone carry). removable aggregates un-fold the left edge; the rest
 						// rebuild when lo advances (an expanding frame never advances lo, so it only adds).
 						removable := spec.aggPlan == planCountStar || spec.aggPlan == planCount
 						a := newAcc(spec.aggPlan)
+						var accCharge int64
 						curLo, curHi := 0, 0
 						for pos := 0; pos < np; pos++ {
 							lo, hi, err := ctx.bounds(pos, spec.frame)
@@ -887,13 +903,15 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 							if !removable && lo > curLo {
 								// Left edge advanced over a non-invertible aggregate ⇒ rebuild over [lo, hi).
 								a = newAcc(spec.aggPlan)
+								meter.releaseQuery(accCharge)
+								accCharge = 0
 								for k := lo; k < hi; k++ {
 									meter.Charge(costs.WindowFrameStep)
 									v, err := evalAt(k)
 									if err != nil {
 										return err
 									}
-									if err := a.fold(v, meter); err != nil {
+									if err := a.foldCharged(v, meter, &accCharge); err != nil {
 										return err
 									}
 								}
@@ -922,7 +940,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 									if err != nil {
 										return err
 									}
-									if err := a.fold(v, meter); err != nil {
+									if err := a.foldCharged(v, meter, &accCharge); err != nil {
 										return err
 									}
 								}
@@ -938,6 +956,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 							}
 							results[ordered[pos]] = out
 						}
+						meter.releaseQuery(accCharge)
 					}
 				}
 			case planFirstValue, planLastValue, planNthValue:
@@ -1023,6 +1042,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 			rows[i] = append(rows[i], results[i])
 		}
 	}
+	partCharge.releaseAll()
 	return nil
 }
 

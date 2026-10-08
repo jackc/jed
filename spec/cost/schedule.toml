@@ -27,6 +27,8 @@ row = 32
 value = 32
 array_dim = 16
 decimal_group = 4
+# One hash/dedup/group/state-map entry's fixed overhead (memory.md §6.1, Q2 operator state).
+entry = 32
 
 # field doc -------------------------------------------------------------------
 # id      stable snake_case unit name; the codegen handle (a named field on the

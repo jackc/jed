@@ -26,60 +26,12 @@ import (
 // it. A handle setting, never stored in the file.
 const defaultWorkMem = 256 * 1024 * 1024
 
-// valueBytes is a cheap, deterministic estimate of a value's resident bytes (spill.md §2): a fixed
-// base plus the variable-width payload. It need not be exact — it only decides spill timing, which
-// is invisible to results and cost.
-func valueBytes(v Value) int {
-	const base = 24
-	switch v.Kind {
-	case ValText, ValBytea, ValUuid, ValJson, ValJsonPath:
-		return base + len(v.str())
-	case ValJsonb:
-		return base + len(jsonbOut(v.jsonb()))
-	case ValComposite:
-		n := base
-		for _, x := range *v.composite() {
-			n += valueBytes(x)
-		}
-		return n
-	case ValArray:
-		n := base + 8*v.arrayVal().Ndim()
-		for _, x := range v.arrayVal().Elements {
-			n += valueBytes(x)
-		}
-		return n
-	case ValRange:
-		n := base
-		r := v.rangeVal()
-		if r.Lower != nil {
-			n += valueBytes(*r.Lower)
-		}
-		if r.Upper != nil {
-			n += valueBytes(*r.Upper)
-		}
-		return n
-	case ValDecimal:
-		if v.decimal() != nil {
-			_, _, g := v.decimal().ToCodec()
-			return base + len(g)*2
-		}
-		return base
-	case ValUnfetched:
-		if v.unfetched() != nil {
-			return base + len(v.unfetched().Comp)
-		}
-		return base
-	default:
-		return base
-	}
-}
-
+// rowBytes is a row's resident bytes for the work_mem spill decision: the shared logical size
+// schedule of spec/design/memory.md §3 — the same number the query-memory account charges for sort
+// and spill state (§6.6), so every core spills at the same input row. Rows reach a sorter or spill
+// structure with their untouched slots NULLed (§6.1), so no lazy reference hides a backing block.
 func rowBytes(row storedRow) int {
-	n := 8
-	for _, v := range row {
-		n += valueBytes(v)
-	}
-	return n
+	return int(memRowBytes(row))
 }
 
 // cmpRows is the stable comparator over the ORDER BY keys: the first non-equal key decides; a full
@@ -106,10 +58,14 @@ type sorter struct {
 	runLevels []uint8  // binary compaction levels; at most 64 live runs
 	runs      []string // spilled run file paths, in input order (run 0 = first chunk — spill.md §6)
 	total     int
+	// charge is the query-memory charge of the resident run (memory.md §6.4): reserved per pushed
+	// row, returned when a run spills, and handed to the sortedRows at finish so it is returned when
+	// the sorted output's emission completes.
+	charge *stateCharge
 }
 
-func newSorter(keys []orderSlot, budget int, spillDir string) *sorter {
-	return &sorter{keys: keys, budget: budget, spillDir: spillDir}
+func newSorter(keys []orderSlot, budget int, spillDir string, charge *stateCharge) *sorter {
+	return &sorter{keys: keys, budget: budget, spillDir: spillDir, charge: charge}
 }
 
 func (s *sorter) close() {
@@ -118,16 +74,25 @@ func (s *sorter) close() {
 	}
 	s.runs = nil
 	s.buf = nil
+	s.charge.releaseAll()
 }
 
 func (s *sorter) canSpill() bool { return s.spillDir != "" && s.budget > 0 }
 
-// push adds one row, spilling the current run when the in-memory buffer exceeds the budget.
+// push adds one row, spilling the current run when the in-memory buffer exceeds the budget. A
+// rejected query-memory reservation returns 54P05 for the caller to pass through costMeter.costFirst
+// (memory.md §6.7).
 func (s *sorter) push(row storedRow) error {
-	s.total++
-	if s.canSpill() {
-		s.bufBytes += rowBytes(row)
+	if s.canSpill() || s.charge.active() {
+		bytes := rowBytes(row)
+		if err := s.charge.reserveDirect(int64(bytes)); err != nil {
+			return err
+		}
+		if s.canSpill() {
+			s.bufBytes += bytes
+		}
 	}
+	s.total++
 	s.buf = append(s.buf, row)
 	if s.canSpill() && s.bufBytes > s.budget {
 		return s.spillRun()
@@ -171,6 +136,8 @@ func (s *sorter) spillRun() error {
 	keep = true
 	s.buf = nil
 	s.bufBytes = 0
+	// The run left memory: its rows' charge goes with it (memory.md §6.4/§6.6).
+	s.charge.releaseAll()
 	for len(s.runs) > 1 {
 		n := len(s.runs)
 		if s.runLevels[n-1] != s.runLevels[n-2] {
@@ -249,10 +216,12 @@ func (s *sorter) mergeRunPair(left, right string) (string, error) {
 // and k-way-merges it with the runs.
 func (s *sorter) finish() (*sortedRows, error) {
 	s.sortBuf()
+	charge := s.charge
+	s.charge = nil
 	if len(s.runs) == 0 {
 		rows := s.buf
 		s.buf = nil
-		return &sortedRows{mem: rows}, nil
+		return &sortedRows{mem: rows, charge: charge}, nil
 	}
 	// Sources: each spilled run, then the final in-memory buffer last (the latest input positions →
 	// the highest source index, the tie-break that reproduces input order — spill.md §6).
@@ -263,6 +232,7 @@ func (s *sorter) finish() (*sortedRows, error) {
 			for _, o := range sources {
 				o.close()
 			}
+			charge.releaseAll()
 			return nil, err
 		}
 		sources = append(sources, src)
@@ -275,6 +245,7 @@ func (s *sorter) finish() (*sortedRows, error) {
 			for _, o := range sources {
 				o.close()
 			}
+			charge.releaseAll()
 			return nil, err
 		}
 		if ok {
@@ -284,7 +255,7 @@ func (s *sorter) finish() (*sortedRows, error) {
 	heap.Init(h)
 	s.runs = nil
 	s.buf = nil
-	return &sortedRows{merge: &merger{sources: sources, heap: h}}, nil
+	return &sortedRows{merge: &merger{sources: sources, heap: h}, charge: charge}, nil
 }
 
 // sortedRows is the sorted output stream (spec/design/spill.md §4). The window/projection loop pulls
@@ -297,6 +268,17 @@ type sortedRows struct {
 	mem    []storedRow // set for the no-spill case
 	memPos int
 	merge  *merger // set for the spill case
+	// charge is the sort (or spool) state's remaining query-memory charge (memory.md §6.4/§6.6),
+	// returned by release when the emission completes, or by close.
+	charge *stateCharge
+}
+
+// release returns the sorted output's remaining query-memory charge — the emission completed
+// (memory.md §6.4). close does the same; this names the spec'd release point.
+func (r *sortedRows) release() {
+	if r != nil {
+		r.charge.releaseAll()
+	}
 }
 
 // next returns the next row in sort order, or ok=false at the end.
@@ -318,6 +300,7 @@ func (r *sortedRows) next() (storedRow, bool, error) {
 // close releases any spill run files still open (a LIMIT can stop the merge before every run is
 // drained — spill.md §4). A no-op for the in-memory case.
 func (r *sortedRows) close() {
+	r.charge.releaseAll()
 	if r.stream != nil {
 		r.stream.close()
 	}

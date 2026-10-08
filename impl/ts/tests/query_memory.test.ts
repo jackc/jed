@@ -3,9 +3,12 @@
 // themselves are pinned in spec/conformance/suites/resource/query_memory.test.
 
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { QueryAccount, queryMemoryUnderflows } from "../src/cost.ts";
-import { EngineError } from "../src/tooling.ts";
+import { EngineError, createDatabase, queryMemoryPeak, queryOutcome } from "../src/tooling.ts";
 import { memDb } from "./mem_db.ts";
 
 const is54P05 = (e: unknown): boolean => e instanceof EngineError && e.code() === "54P05";
@@ -35,14 +38,17 @@ test("the engine-owned all() collector is admitted", () => {
   try {
     s.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
     s.execute("INSERT INTO t SELECT g FROM generate_series(1, 100) g");
-    s.setMaxQueryMemoryBytes(64n * 100n);
-    // A streaming scan holds no row buffer; draining it by hand is the host's own memory.
+    // The columnar projection lane gathers the id column (100 values × 32 = 3200 bytes of lane state,
+    // memory.md §6.5), held until its emission completes.
+    s.setMaxQueryMemoryBytes(3200n);
+    // Draining by hand: the lane is the engine's, the rows are the host's own memory.
     let n = 0;
     for (const _ of s.query("SELECT id FROM t")) n++;
     assert.equal(n, 100);
-    // The engine-owned collector charges each collected row (32 + 32 bytes): 100 rows need 6400.
+    // The engine-owned collector also charges each collected row (32 + 32 bytes): 3200 + 6400.
+    s.setMaxQueryMemoryBytes(3200n + 64n * 100n);
     assert.equal(s.all("SELECT id FROM t").length, 100);
-    s.setMaxQueryMemoryBytes(64n * 100n - 1n);
+    s.setMaxQueryMemoryBytes(3200n + 64n * 100n - 1n);
     assert.throws(() => s.all("SELECT id FROM t"), is54P05);
   } finally {
     s.close();
@@ -144,5 +150,41 @@ test("a rejected collector admission reports a reached cost ceiling", () => {
   } finally {
     s.close();
     db.close();
+  }
+});
+
+// Spill-capable operator state charges only its resident portion (memory.md §6.6): on a file-backed
+// database the bounded-spill lane's structures release their charge as they spill, so a budget that a
+// fully resident DISTINCT exceeds is enough once workMem makes it spill — and the account itself never
+// forces the spill. Disk-only behavior, so it lives here rather than in the corpus.
+test("spilling operator state releases its charge", () => {
+  const dir = mkdtempSync(join(tmpdir(), "jed-query-memory-spill-"));
+  const db = createDatabase({ path: join(dir, "query_memory_spill.jed"), skipFsync: true });
+  const s = db.session();
+  try {
+    s.execute("CREATE TABLE t (id i32 PRIMARY KEY, s text)");
+    s.execute("INSERT INTO t SELECT g, repeat('x', g) FROM generate_series(1, 300) g");
+    const sql = "SELECT DISTINCT s FROM t";
+    const peak = (workMem: number): number => {
+      s.setWorkMem(workMem);
+      s.setMaxQueryMemoryBytes(1n << 40n);
+      queryMemoryPeak.value = 0;
+      queryOutcome(s, sql);
+      return queryMemoryPeak.value;
+    };
+    const resident = peak(1 << 30);
+    const spilling = peak(4096);
+    assert.ok(spilling < resident / 4, `spilling peak ${spilling} vs resident ${resident}`);
+    // The spilling run fits a budget the resident run exceeds.
+    s.setMaxQueryMemoryBytes(BigInt(spilling));
+    s.setWorkMem(4096);
+    const outcome = queryOutcome(s, sql);
+    assert.equal(outcome.kind === "query" ? outcome.rows.length : -1, 300);
+    s.setWorkMem(1 << 30);
+    assert.throws(() => queryOutcome(s, sql), is54P05);
+  } finally {
+    s.close();
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });

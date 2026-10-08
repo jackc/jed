@@ -372,7 +372,7 @@ func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, plabels, resu
 			offset:   offset,
 			limit:    sp.limit,
 			distinct: sp.distinct,
-			seen:     newBoundedMap(snap),
+			seen:     newStateMapCharged(snap, meter.stateCharge()),
 			done:     empty || (sp.limit != nil && *sp.limit == 0),
 		}
 		if !cur.done {
@@ -419,10 +419,10 @@ type streamingCursor struct {
 	offset   int64
 	limit    *int64
 	distinct bool
-	seen     *boundedMap
-	passed   int64 // survivors past the filter+dedup so far (OFFSET runs against this)
-	produced int64 // output rows produced so far (the LIMIT short-circuit runs against this)
-	done     bool  // scan exhausted, LIMIT window full, or empty bound — then nextRow is a no-op
+	seen     *stateMap // the DISTINCT dedup set (memory.md §6.2), returned when the scan ends
+	passed   int64     // survivors past the filter+dedup so far (OFFSET runs against this)
+	produced int64     // output rows produced so far (the LIMIT short-circuit runs against this)
+	done     bool      // scan exhausted, LIMIT window full, or empty bound — then nextRow is a no-op
 }
 
 func (c *streamingCursor) nextRow() ([]Value, bool, error) {
@@ -433,6 +433,7 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 	// further leaf is faulted (the streaming early-exit win; cost.md §3 "LIMIT short-circuit").
 	if c.limit != nil && c.produced >= *c.limit {
 		c.done = true
+		c.seen.release() // the scan ended (memory.md §6.2)
 		return nil, false, nil
 	}
 	for {
@@ -449,6 +450,7 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 		}
 		if !ok {
 			c.done = true
+			c.seen.release() // the scan ended (memory.md §6.2)
 			return nil, false, nil
 		}
 		if err := c.meter.Guard(); err != nil { // enforce the cost ceiling / cancellation per scanned row
@@ -486,16 +488,12 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 				}
 				projected[i] = v
 			}
-			key := distinctRowKey(projected)
-			_, had, err := c.seen.get(key)
-			if err != nil {
+			inserted, err := c.seen.insert(projected)
+			if err = c.meter.costFirst(err); err != nil {
 				return nil, false, err
 			}
-			if had {
+			if !inserted {
 				continue
-			}
-			if err = c.seen.put(key, nil); err != nil {
-				return nil, false, err
 			}
 			c.passed++
 			if c.passed <= c.offset {
@@ -650,6 +648,7 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 		// `sel` (the A3 filter's survivors) maps output row j to lane position sel[j].
 		if c.idx >= c.em.end {
 			c.done = true
+			c.em.colCharge.releaseAll() // exhausted: the lanes' charge is returned (memory.md §6.5)
 			return nil, false, nil
 		}
 		j := c.idx
@@ -700,6 +699,9 @@ func (c *bufferedScanCursor) close() {
 	c.done = true
 	if c.ran && c.em.mode == emitSorted && c.em.sorted != nil {
 		c.em.sorted.close()
+	}
+	if c.ran && c.em.mode == emitColumnar {
+		c.em.colCharge.releaseAll()
 	}
 }
 
@@ -855,7 +857,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 	// project EVERY scanned filtered row (the dedup key), drop a value already in `seen` keeping the
 	// first (scan-order) occurrence, then the LIMIT/OFFSET window the DISTINCT rows. The sort is
 	// elided; the projection is charged per scanned filtered row (the §3 asymmetry).
-	seen := newBoundedMap(db)
+	seen := newStateMapCharged(db, meter.stateCharge())
 	defer seen.close()
 	var passed int64
 	visitRow := func(row storedRow, guarded bool) (bool, error) {
@@ -895,16 +897,12 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 				projected[i] = v
 			}
 			distinctWork += meter.Accrued - before
-			key := distinctRowKey(projected)
-			_, had, err := seen.get(key)
-			if err != nil {
+			inserted, err := seen.insert(projected)
+			if err = meter.costFirst(err); err != nil {
 				return false, err
 			}
-			if had {
+			if !inserted {
 				return true, nil
-			}
-			if err = seen.put(key, nil); err != nil {
-				return false, err
 			}
 			passed++
 			if passed <= offset {
@@ -1413,6 +1411,8 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 	var sorted *sortedRows
 	if collated {
 		var rows []storedRow
+		// The collated survivor buffer is sort state (memory.md §6.4).
+		charge := meter.stateCharge()
 		if !empty {
 			err := store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
 				if err := meter.Guard(); err != nil {
@@ -1434,6 +1434,13 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 					keep = v.IsTrue()
 				}
 				if keep {
+					// Sort state holds only the touched columns (memory.md §6.1).
+					row = topKPruneUntouched(row, plan.relMasks[0])
+					if charge.active() {
+						if err := charge.reserve(meter, memRowBytes(row)); err != nil {
+							return false, err
+						}
+					}
 					rows = append(rows, row)
 				}
 				return true, nil
@@ -1444,15 +1451,24 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 		}
 		total = int64(len(rows))
 		if plan.phys.topK != nil {
+			// The selection discards rows: release the buffer, re-reserve the kept rows.
+			charge.releaseAll()
 			var err error
 			rows, err = topKRows(rows, plan.order, *plan.phys.topK)
 			if err != nil {
 				return emitter{}, err
 			}
+			if charge.active() {
+				for _, row := range rows {
+					if err := charge.reserve(meter, memRowBytes(row)); err != nil {
+						return emitter{}, err
+					}
+				}
+			}
 		} else if err := sortRows(rows, plan.order); err != nil {
 			return emitter{}, err
 		}
-		sorted = &sortedRows{mem: rows}
+		sorted = &sortedRows{mem: rows, charge: charge}
 	} else {
 		// Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits:
 		// every in-range row is read (charging storage_row_read), its touched columns resolved
@@ -1463,6 +1479,7 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 		var s *sorter
 		if useTopK {
 			t = newTopKKeeper(*plan.phys.topK, plan.order, false)
+			t.charge = meter.stateCharge()
 		} else {
 			s = db.newSorterFor(plan.order)
 			defer s.close()
@@ -1490,15 +1507,16 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 				}
 				if keep {
 					survivorCount++
+					// Sort state holds only the touched columns (memory.md §6.1).
+					row = topKPruneUntouched(row, plan.relMasks[0])
+					var pushed error
 					if useTopK {
-						row = topKPruneUntouched(row, plan.relMasks[0])
-						if err := t.push(row); err != nil {
-							return false, err
-						}
+						pushed = t.push(row)
 					} else {
-						if err := s.push(row); err != nil {
-							return false, err
-						}
+						pushed = s.push(row)
+					}
+					if err := meter.costFirst(pushed); err != nil {
+						return false, err
 					}
 				}
 				return true, nil // never stop early — the sort must see every row
@@ -1509,7 +1527,7 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 		}
 		total = survivorCount
 		if useTopK {
-			sorted = &sortedRows{mem: t.finish()}
+			sorted = &sortedRows{mem: t.finish(), charge: t.charge}
 		} else {
 			var err error
 			sorted, err = s.finish()
@@ -1583,14 +1601,15 @@ func (db *engine) streamingTopKFits(plan *selectPlan, k int64) bool {
 }
 
 // topKPruneUntouched releases variable payloads the logical touched set proves no downstream
-// filter/order/projection can read. It never mutates a stored shared row.
+// filter/order/projection can read. It never mutates a stored shared row. Every row entering sort or
+// spill state passes through it, so that state is measured in full (memory.md §6.1).
 func topKPruneUntouched(row storedRow, mask []bool) storedRow {
 	for _, touched := range mask {
 		if !touched {
 			out := make(storedRow, len(row))
 			copy(out, row)
 			for i := range out {
-				if !mask[i] {
+				if i < len(mask) && !mask[i] {
 					out[i] = NullValue()
 				}
 			}
@@ -1730,6 +1749,7 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 			}
 		}
 	}
+	hashTable.release() // the join completed (memory.md §6.2)
 	// The join's relation buffers are consumed (memory.md §5.3).
 	releaseRowsMasked(meter, inlRows, plan.relMasks[innerOrdinal])
 	releaseRowsMasked(meter, leftRows, plan.relMasks[outerOrdinal])
@@ -1873,6 +1893,7 @@ func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *c
 			}
 		}
 	}
+	table.release() // the join completed (memory.md §6.2)
 	// The join's input buffers are consumed (memory.md §5.3).
 	releaseRowsMasked(meter, inlRows, plan.relMasks[inner])
 	releaseRowsMasked(meter, running, plan.memoryMask(meter))
@@ -1899,7 +1920,7 @@ func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *c
 // the database path, so read-only filesystems remain readable; in-memory hosts leave it empty and
 // never spill (spill.md §2/§4).
 func (db *engine) newSorterFor(order []orderSlot) *sorter {
-	return newSorter(order, db.session.workMem, db.spillDir)
+	return newSorter(order, db.session.workMem, db.spillDir, newStateCharge(db.session.queryAccount()))
 }
 
 // rowsFromValues reinterprets a result-row slice ([][]Value) as a join-feed buffer ([]Row). Row is

@@ -1092,7 +1092,9 @@ getter reports `0`). It is independent of `max_cost`, `max_scalar_bytes`, and
 `work_mem`, and cannot be changed from SQL. A reservation above the budget fails
 `54P05`; exact equality is allowed. The budget is a deterministic guardrail over
 the owners memory.md §4 lists as covered (today: row buffers and engine result
-collectors, slice Q1), not a heap or RSS limit. A cursor keeps the budget of the
+collectors, slice Q1, and operator state, slice Q2), not a heap or RSS limit. It
+never forces a spill: `work_mem` alone decides spilling, and a spilling operator
+releases its charge as it spills. A cursor keeps the budget of the
 statement that opened it; the engine-owned materializing helpers (Rust
 `query_rows`, TypeScript `Statement.all()`) admit every row they collect against
 it, while rows a host pulls one at a time from a cursor — including through Go's

@@ -15,6 +15,7 @@ const (
 	memoryValue        int64 = 32
 	memoryArrayDim     int64 = 16
 	memoryDecimalGroup int64 = 4
+	memoryEntry        int64 = 32
 )
 
 // CostSchedule holds the deterministic cost-unit weights, mirroring spec/cost/schedule.toml.

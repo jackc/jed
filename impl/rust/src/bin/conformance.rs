@@ -36,7 +36,7 @@ thread_local! {
 
 /// Record the peak query-memory balance of record `ordinal` of the current file, when the peak mode
 /// is on. Every core writes the same `file<TAB>ordinal<TAB>peak` lines, so a diff of the three
-/// outputs is the cross-core check of every record's minimal passing budget (memory.md §6).
+/// outputs is the cross-core check of every record's minimal passing budget (memory.md §7).
 fn record_peak(ordinal: usize) {
     use std::io::Write;
     PEAK_SINK.with(|sink| {
@@ -656,6 +656,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
     let mut pending_scalar_bytes: Option<i64> = None;
     let mut pending_query_memory: Option<i64> = None;
     let mut record_ordinal = 0usize;
+    let probe_query_memory = std::env::var("JED_CONFORMANCE_QUERY_MEMORY_PROBE").is_ok();
     // The whole-corpus accounting mode (`rake conformance:query_memory`): a budget applied to every
     // record without its own directive, so every query shape exercises the accounting.
     let query_memory_default: i64 = std::env::var("JED_CONFORMANCE_QUERY_MEMORY")
@@ -850,9 +851,16 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
         sess.set_max_scalar_bytes(pending_scalar_bytes.take().unwrap_or(0));
         // `# max_query_memory_bytes:` (memory.md §2) decorates only its record; absent ⇒ unlimited,
         // or the whole-corpus accounting budget of `JED_CONFORMANCE_QUERY_MEMORY`.
-        sess.set_max_query_memory_bytes(
-            pending_query_memory.take().unwrap_or(query_memory_default),
-        );
+        // The probe mode (`JED_CONFORMANCE_QUERY_MEMORY_PROBE`, the threshold re-baseliner) runs every
+        // record expected to SUCCEED under the accounting budget instead of its own, recording its true
+        // peak; a record expected to fail keeps its pin, so state evolves exactly as in a normal walk.
+        let pinned = pending_query_memory.take();
+        let expects_error = trimmed.starts_with("statement error");
+        sess.set_max_query_memory_bytes(if probe_query_memory && !expects_error {
+            query_memory_default
+        } else {
+            pinned.unwrap_or(query_memory_default)
+        });
         let underflows_before =
             jed::tooling::QUERY_MEMORY_UNDERFLOWS.load(std::sync::atomic::Ordering::Relaxed);
         jed::tooling::QUERY_MEMORY_PEAK.store(0, std::sync::atomic::Ordering::Relaxed);

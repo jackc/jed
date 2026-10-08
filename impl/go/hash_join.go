@@ -12,6 +12,16 @@ type hashJoinTable struct {
 	entries     map[uint64][]hashJoinEntry
 	hash        func([]byte) uint64
 	probeOffset int
+	// charge is the table's query-memory charge: entry_bytes(build key) per entry (memory.md §6.2),
+	// returned by release when the join step completes.
+	charge *stateCharge
+}
+
+// release returns the table's query-memory charge — its join step completed (memory.md §6.2).
+func (t *hashJoinTable) release() {
+	if t != nil {
+		t.charge.releaseAll()
+	}
 }
 
 type hashJoinEntry struct {
@@ -24,7 +34,7 @@ func newHashJoinTable(plan *hashJoinPlan, buildOffset, probeOffset int, rows []s
 }
 
 func newHashJoinTableWithHash(plan *hashJoinPlan, buildOffset, probeOffset int, rows []storedRow, meter *costMeter, hasher func([]byte) uint64) (*hashJoinTable, error) {
-	t := &hashJoinTable{entries: make(map[uint64][]hashJoinEntry), hash: hasher, probeOffset: probeOffset}
+	t := &hashJoinTable{entries: make(map[uint64][]hashJoinEntry), hash: hasher, probeOffset: probeOffset, charge: meter.stateCharge()}
 	for _, row := range rows {
 		indices := make([]int, len(plan.keys))
 		types := make([]dataType, len(plan.keys))
@@ -38,6 +48,11 @@ func newHashJoinTableWithHash(plan *hashJoinPlan, buildOffset, probeOffset int, 
 		}
 		if !present {
 			continue
+		}
+		if t.charge.active() {
+			if err := t.charge.reserve(meter, memEntryBytesAt(row, indices)); err != nil {
+				return nil, err
+			}
 		}
 		h := t.hash(encoded)
 		t.entries[h] = append(t.entries[h], hashJoinEntry{key: encoded, row: row})
