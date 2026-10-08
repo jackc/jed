@@ -183,6 +183,17 @@ var queryMemoryUnderflows atomic.Uint64
 // conformance harness. Always 0 in a correct engine.
 func QueryMemoryUnderflows() uint64 { return queryMemoryUnderflows.Load() }
 
+// queryMemoryPeak is the highest balance any account has reached since the conformance harness last
+// reset it — the minimal passing max_query_memory_bytes of the record just run.
+var queryMemoryPeak atomic.Int64
+
+// QueryMemoryPeak reports the highest query-memory balance reached since ResetQueryMemoryPeak — the
+// conformance harness's per-record peak mode compares it across cores (spec/design/memory.md §6).
+func QueryMemoryPeak() int64 { return queryMemoryPeak.Load() }
+
+// ResetQueryMemoryPeak zeroes the peak before the harness runs a record.
+func ResetQueryMemoryPeak() { queryMemoryPeak.Store(0) }
+
 // queryAccount is a statement's live query-memory account (spec/design/memory.md §2): the shared
 // running total and the budget (limit <= 0 ⇒ unlimited). Copied into every meter of the statement
 // and into the cursor that outlives it, so all of them reserve against one total.
@@ -204,6 +215,9 @@ func (a queryAccount) reserve(bytes int64) error {
 		return newError(QueryMemoryLimitExceeded, fmt.Sprintf("query memory exceeded the limit of %d bytes", a.limit))
 	}
 	*a.used += bytes
+	if *a.used > queryMemoryPeak.Load() {
+		queryMemoryPeak.Store(*a.used)
+	}
 	return nil
 }
 

@@ -952,6 +952,25 @@ task :fuzz, [:time] do |_, args|
   GO_FUZZ_TARGETS.each { |name| Rake::Task["fuzz:one"].execute(Rake::TaskArguments.new(%i[name time], [name, time])) }
 end
 
+# Compare the per-record query-memory peaks the three conformance runners wrote for one storage mode
+# (rake conformance:query_memory): each line is file<TAB>record-ordinal<TAB>peak. A record a core did
+# not run (a capability skip) is compared only among the cores that ran it.
+def query_memory_peak_mismatches(mode, paths)
+  tables = paths.transform_values do |path|
+    next {} unless File.exist?(path)
+    File.readlines(path, chomp: true).to_h do |line|
+      file, ordinal, peak = line.split("\t")
+      [[file, ordinal.to_i], peak.to_i]
+    end
+  end
+  keys = tables.values.flat_map(&:keys).uniq.sort
+  keys.filter_map do |key|
+    seen = tables.filter_map { |core, table| [core, table[key]] if table.key?(key) }.to_h
+    next if seen.values.uniq.size <= 1
+    "#{mode} #{key[0]} record #{key[1]}: " + seen.map { |core, peak| "#{core}=#{peak}" }.join(" ")
+  end
+end
+
 # conformance — the §7 contract: every core walks the hand-authored corpus
 # (spec/conformance/suites) and must produce identical pass/fail. This is the spine of the
 # project (CLAUDE.md §7/§10) — the example-based truth `rake test`/`rake ci` rest on. Each
@@ -979,15 +998,34 @@ namespace :conformance do
   # exercises the reserve/release sites; each core's runner fails a record whose releases exceed
   # its reservations. Results, errors and costs must be unchanged. Both storage modes, since the
   # eager and bounded-spill lanes account differently.
+  #
+  # Each core also writes every record's PEAK balance (JED_CONFORMANCE_QUERY_MEMORY_PEAKS) — the
+  # minimal budget under which that record passes — and the task fails unless the three cores agree
+  # on every record's peak in each mode: the whole corpus becomes the cross-core check of the
+  # reserve/release sites, not only the records that pin a threshold (memory.md §6).
   desc "Run the shared SQL corpus on all cores with query-memory accounting active (bytes, optional path filter)"
   task :query_memory, [:bytes, :filter] do |_, args|
+    require "tmpdir"
     env = { "JED_CONFORMANCE_QUERY_MEMORY" => args[:bytes] || "1099511627776" }
     env["JED_CONFORMANCE_FILTER"] = args[:filter] if args[:filter]
-    %w[memory disk].each do |mode|
-      extra = mode == "disk" ? ["disk"] : []
-      sh env, "cargo", "run", "--release", "--quiet", "--bin", "conformance", "--manifest-path", RUST_MANIFEST, "--", *extra
-      sh env, "go", "run", "./cmd/conformance", *extra, chdir: GO_DIR
-      sh env, "node", "src/bin/conformance.ts", *extra, chdir: TS_DIR
+    Dir.mktmpdir("jed-query-memory-peaks") do |dir|
+      mismatches = []
+      { "memory" => {}, "disk" => {} }.each do |mode, mode_env|
+        extra = mode == "disk" ? ["disk"] : []
+        peaks = %w[rust go ts].to_h { |core| [core, File.join(dir, "#{mode}-#{core}.tsv")] }
+        sh env.merge(mode_env, "JED_CONFORMANCE_QUERY_MEMORY_PEAKS" => peaks["rust"]),
+           "cargo", "run", "--release", "--quiet", "--bin", "conformance", "--manifest-path", RUST_MANIFEST, "--", *extra
+        sh env.merge(mode_env, "JED_CONFORMANCE_QUERY_MEMORY_PEAKS" => peaks["go"]),
+           "go", "run", "./cmd/conformance", *extra, chdir: GO_DIR
+        sh env.merge(mode_env, "JED_CONFORMANCE_QUERY_MEMORY_PEAKS" => peaks["ts"]),
+           "node", "src/bin/conformance.ts", *extra, chdir: TS_DIR
+        mismatches.concat(query_memory_peak_mismatches(mode, peaks))
+      end
+      unless mismatches.empty?
+        warn mismatches.first(50).join("\n")
+        abort "query-memory peaks disagree across cores on #{mismatches.size} record(s)"
+      end
+      puts "query-memory peaks: all cores agree"
     end
   end
   desc "Walk the conformance corpus on the Rust core, both storage modes (release — debug overflows depth_limit)"

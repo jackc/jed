@@ -131,7 +131,7 @@ pub mod tooling {
     // `Database::table` / `Session::table`).
     pub use crate::catalog::{CompositeType, IndexKey, IndexKeyExpr, Table};
     /// Query-memory accounting underflows (spec/design/memory.md) — the conformance harness's check.
-    pub use crate::cost::QUERY_MEMORY_UNDERFLOWS;
+    pub use crate::cost::{QUERY_MEMORY_PEAK, QUERY_MEMORY_UNDERFLOWS};
     pub use crate::types::{ScalarType, Type};
 
     pub mod collation {

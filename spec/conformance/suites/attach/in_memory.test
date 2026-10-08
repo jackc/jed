@@ -199,3 +199,15 @@ SELECT name, qty FROM mydb.item WHERE id = 1
 ----
 apple
 10
+
+# The integer-only shapes take the columnar projection and vectorized-aggregate lanes, which must
+# also resolve mydb.item in the attachment, not the shadowing temp table.
+query I nosort
+SELECT qty FROM mydb.item WHERE id = 1
+----
+10
+
+query I nosort
+SELECT sum(qty) FROM mydb.item WHERE id = 1
+----
+10

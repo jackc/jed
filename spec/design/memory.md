@@ -308,3 +308,9 @@ Each slice lands in all three cores together with: corpus entries pinning exact
 per-core tests for host-API collectors and cursor lifetimes. Documentation states
 which owners are covered; `max_query_memory_bytes` must not be described as a
 process or heap limit.
+
+`rake conformance:query_memory` runs the whole corpus with accounting active in
+both storage modes. Each core records every record's **peak balance** (its minimal
+passing budget) and the task fails unless all cores agree on every record — the
+whole corpus, not only the records that pin a threshold, is the cross-core check
+of the reserve and release sites.

@@ -30,7 +30,10 @@ record without its own `# max_query_memory_bytes:` directive runs under the harn
 `JED_CONFORMANCE_QUERY_MEMORY` budget (default 2⁴⁰ bytes). Rows, types, errors, and costs
 must be unchanged, and each runner fails a record during which the engine released more
 query memory than it had reserved — an accounting-site bug no single threshold record
-would reveal. It is part of `rake test` and `rake ci`.
+would reveal. Each runner also writes every record's **peak** balance (its minimal passing
+budget) to `JED_CONFORMANCE_QUERY_MEMORY_PEAKS` as `file<TAB>record-ordinal<TAB>peak`, and
+the task fails unless the three cores agree on every record in both modes. It is part of
+`rake test` and `rake ci`.
 
 Two sibling formats cover concurrency that a one-handle SQL transcript cannot express:
 `# format: concurrency` files model named in-process sessions, while

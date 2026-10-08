@@ -30,6 +30,10 @@ import type { Value } from "./value.ts";
 // (JED_CONFORMANCE_QUERY_MEMORY), which fails the record that caused it.
 export const queryMemoryUnderflows = { count: 0 };
 
+// queryMemoryPeak is the highest balance any account has reached since the conformance harness last
+// reset it — the minimal passing maxQueryMemoryBytes of the record just run (memory.md §6).
+export const queryMemoryPeak = { value: 0 };
+
 // QueryAccount is a statement's live query-memory account (spec/design/memory.md §2): the running
 // total and the budget (limit <= 0 ⇒ unlimited). Shared BY REFERENCE by every meter of the statement
 // and by the cursor that outlives it, so all of them reserve against one total. Plain numbers: the
@@ -58,6 +62,7 @@ export class QueryAccount {
       );
     }
     this.used += bytes;
+    if (this.used > queryMemoryPeak.value) queryMemoryPeak.value = this.used;
   }
 
   // release returns bytes; never throws, never below zero. A release past the balance is an

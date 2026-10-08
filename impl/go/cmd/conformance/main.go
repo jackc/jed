@@ -92,6 +92,7 @@ func run() int {
 			continue
 		}
 
+		peakRel = rel
 		isConc := isConcurrencyFormat(text)
 		// Disk mode cannot run a file whose semantics can't survive a per-record REOPEN: the
 		// concurrency driver (multi-session schedule on one Database), or a file carrying reopen-fragile
@@ -709,6 +710,31 @@ func assertTypes(expected []string, actual []string, sql string) error {
 
 // runFile runs all records in one .test file against a fresh database, driving the public single-handle
 // *Database (its default autocommit session — the back-compat bridge, spec/design/session.md §2.1).
+// peakSink is the open output of JED_CONFORMANCE_QUERY_MEMORY_PEAKS (the per-record query-memory
+// peak mode, rake conformance:query_memory), or nil; peakRel is the file being walked.
+var (
+	peakSink *os.File
+	peakRel  string
+)
+
+// recordPeak writes the peak query-memory balance of record ordinal of the current file when the
+// peak mode is on. Every core writes the same file<TAB>ordinal<TAB>peak lines, so a diff of the three
+// outputs checks every record's minimal passing budget across cores (memory.md §6).
+func recordPeak(ordinal int) {
+	if peakSink == nil {
+		path := os.Getenv("JED_CONFORMANCE_QUERY_MEMORY_PEAKS")
+		if path == "" {
+			return
+		}
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			panic(fmt.Sprintf("open JED_CONFORMANCE_QUERY_MEMORY_PEAKS: %v", err))
+		}
+		peakSink = f
+	}
+	fmt.Fprintf(peakSink, "%s\t%d\t%d\n", peakRel, ordinal, jed.QueryMemoryPeak())
+}
+
 func runFile(text string, disk bool) error {
 	// In DISK mode the file is backed by a temp .jed image reopened before every record (below), so each
 	// committed read faults from disk; in MEMORY mode it is a fresh in-memory Database. tmpPath is "" in
@@ -797,6 +823,7 @@ func runFile(text string, disk bool) error {
 	var pendingTempBuffers *int
 	var pendingScalarBytes *int64
 	var pendingQueryMemory *int64
+	recordOrdinal := 0
 	// The whole-corpus accounting mode (`rake conformance:query_memory`): a budget applied to every
 	// record without its own directive, so every query shape exercises the accounting.
 	var queryMemoryDefault int64
@@ -1025,6 +1052,8 @@ func runFile(text string, disk bool) error {
 		sess.SetMaxQueryMemoryBytes(queryMemory)
 		pendingQueryMemory = nil
 		underflowsBefore := jed.QueryMemoryUnderflows()
+		jed.ResetQueryMemoryPeak()
+		recordOrdinal++
 		sess.SetTempBuffers(tempBuffers)
 		pendingTempBuffers = nil
 		// Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
@@ -1127,6 +1156,7 @@ func runFile(text string, disk bool) error {
 		default:
 			return fmt.Errorf("unknown record kind %q", fields[0])
 		}
+		recordPeak(recordOrdinal)
 		if jed.QueryMemoryUnderflows() != underflowsBefore {
 			return fmt.Errorf("query-memory accounting released more than it reserved (memory.md §5)\n  record: %s", line)
 		}

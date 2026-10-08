@@ -4,7 +4,14 @@
 // sqllogictest-style records against a fresh Engine and compare output. Files needing
 // a capability the core does not declare are SKIPPED (not failed). Needs no TOML.
 
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import process from "node:process";
@@ -22,6 +29,7 @@ import {
   type Privilege,
   PrivilegeSet,
   privilegeFromName,
+  queryMemoryPeak,
   queryMemoryUnderflows,
   queryOutcome,
   render,
@@ -548,6 +556,19 @@ function assertTypes(expected: string[] | null, actual: string[], sql: string): 
 }
 
 // runFile runs all records in one .test file against a fresh database.
+// The file being walked, for JED_CONFORMANCE_QUERY_MEMORY_PEAKS (the per-record query-memory peak
+// mode, rake conformance:query_memory).
+let peakRel = "";
+
+// recordPeak appends the peak query-memory balance of record `ordinal` of the current file when the
+// peak mode is on. Every core writes the same file<TAB>ordinal<TAB>peak lines, so a diff of the three
+// outputs checks every record's minimal passing budget across cores (memory.md §6).
+function recordPeak(ordinal: number): void {
+  const path = process.env.JED_CONFORMANCE_QUERY_MEMORY_PEAKS;
+  if (path === undefined || path === "") return;
+  appendFileSync(path, `${peakRel}\t${ordinal}\t${queryMemoryPeak.value}\n`);
+}
+
 function runFile(text: string, disk: boolean): void {
   // In DISK mode the file is backed by a temp .jed image reopened before every record (below), so each
   // committed read faults from disk; in MEMORY mode it is a fresh in-memory Database
@@ -590,6 +611,7 @@ function runFile(text: string, disk: boolean): void {
     let pendingAllowTempDdl: boolean | null = null;
     let pendingScalarBytes: bigint | null = null;
     let pendingQueryMemory: bigint | null = null;
+    let recordOrdinal = 0;
     // The whole-corpus accounting mode: a budget applied to every record without its own directive,
     // so every query shape exercises the accounting (memory.md §5).
     const queryMemoryDefault = parseQueryMemoryEnv();
@@ -792,6 +814,8 @@ function runFile(text: string, disk: boolean): void {
       db.setMaxQueryMemoryBytes(pendingQueryMemory ?? queryMemoryDefault);
       pendingQueryMemory = null;
       const underflowsBefore = queryMemoryUnderflows.count;
+      queryMemoryPeak.value = 0;
+      recordOrdinal++;
       db.setTempBuffers(pendingTempBuffers ?? 0);
       pendingTempBuffers = null;
       // Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
@@ -876,6 +900,7 @@ function runFile(text: string, disk: boolean): void {
       } else {
         throw new Error(`unknown record kind "${fields[0]}"`);
       }
+      recordPeak(recordOrdinal);
       if (queryMemoryUnderflows.count !== underflowsBefore) {
         throw new Error(
           `query-memory accounting released more than it reserved (memory.md §5)\n  record: ${line}`,
@@ -1253,6 +1278,7 @@ function main(): number {
       skipped++;
       continue;
     }
+    peakRel = rel;
     const isConc = isConcurrencyFormat(text);
     // Disk mode cannot run a file whose semantics can't survive a per-record REOPEN: the concurrency
     // driver (multi-session schedule on one Database), or a file carrying reopen-fragile session state —

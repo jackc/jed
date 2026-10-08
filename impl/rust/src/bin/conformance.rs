@@ -27,6 +27,26 @@ use std::sync::mpsc::{self, Receiver, Sender};
 #[cfg(test)]
 use std::thread::{self, JoinHandle};
 
+thread_local! {
+    /// The peak sink of `JED_CONFORMANCE_QUERY_MEMORY_PEAKS` (the per-record query-memory peak mode,
+    /// `rake conformance:query_memory`): the open output and the file being walked.
+    static PEAK_SINK: std::cell::RefCell<Option<(std::io::BufWriter<std::fs::File>, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record the peak query-memory balance of record `ordinal` of the current file, when the peak mode
+/// is on. Every core writes the same `file<TAB>ordinal<TAB>peak` lines, so a diff of the three
+/// outputs is the cross-core check of every record's minimal passing budget (memory.md §6).
+fn record_peak(ordinal: usize) {
+    use std::io::Write;
+    PEAK_SINK.with(|sink| {
+        if let Some((out, rel)) = sink.borrow_mut().as_mut() {
+            let peak = jed::tooling::QUERY_MEMORY_PEAK.load(std::sync::atomic::Ordering::Relaxed);
+            writeln!(out, "{rel}\t{ordinal}\t{peak}").expect("write query-memory peaks");
+        }
+    });
+}
+
 fn main() -> ExitCode {
     let suites = suites_dir();
     let mut files = Vec::new();
@@ -102,11 +122,32 @@ fn main() -> ExitCode {
         // single-handle runner. Both share the result grammar; only the driver differs. The binary
         // always runs the canonical stepped-SEQUENTIAL mode; the stepped-threaded mode is exercised
         // by `cargo test` (the concurrency_threaded_tests below).
+        if let Ok(path) = std::env::var("JED_CONFORMANCE_QUERY_MEMORY_PEAKS") {
+            PEAK_SINK.with(|sink| {
+                let mut sink = sink.borrow_mut();
+                let out = match sink.take() {
+                    Some((out, _)) => out,
+                    None => std::io::BufWriter::new(
+                        std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)
+                            .expect("open JED_CONFORMANCE_QUERY_MEMORY_PEAKS"),
+                    ),
+                };
+                *sink = Some((out, rel.to_string()));
+            });
+        }
         let outcome = if is_conc {
             run_concurrency_file(&text)
         } else {
             run_file(&text, disk)
         };
+        PEAK_SINK.with(|sink| {
+            if let Some((out, _)) = sink.borrow_mut().as_mut() {
+                std::io::Write::flush(out).expect("flush query-memory peaks");
+            }
+        });
         match outcome {
             Ok(()) => {
                 println!("PASS {rel}");
@@ -614,6 +655,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
     let mut pending_allow_temp_ddl: Option<bool> = None;
     let mut pending_scalar_bytes: Option<i64> = None;
     let mut pending_query_memory: Option<i64> = None;
+    let mut record_ordinal = 0usize;
     // The whole-corpus accounting mode (`rake conformance:query_memory`): a budget applied to every
     // record without its own directive, so every query shape exercises the accounting.
     let query_memory_default: i64 = std::env::var("JED_CONFORMANCE_QUERY_MEMORY")
@@ -813,6 +855,8 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
         );
         let underflows_before =
             jed::tooling::QUERY_MEMORY_UNDERFLOWS.load(std::sync::atomic::Ordering::Relaxed);
+        jed::tooling::QUERY_MEMORY_PEAK.store(0, std::sync::atomic::Ordering::Relaxed);
+        record_ordinal += 1;
         sess.set_temp_buffers(pending_temp_buffers.take().unwrap_or(0));
         // Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
         // pending `# set:` pair, so a directive decorates only its record and never leaks forward.
@@ -903,6 +947,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
             }
             other => return Err(format!("unknown record kind '{other}'")),
         }
+        record_peak(record_ordinal);
         if jed::tooling::QUERY_MEMORY_UNDERFLOWS.load(std::sync::atomic::Ordering::Relaxed)
             != underflows_before
         {
