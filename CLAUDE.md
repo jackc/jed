@@ -775,15 +775,11 @@ The design is optimized for AI agents even more than for humans. In practice:
 - **Multiple agent instances; sync through `origin`, not just shared memory.** Several
   Claude instances run in **separate devcontainers** that share the project memory directory
   and `project-status.md` (one `/persist` volume) but **not** a git working tree — each
-  container's checkout drifts independently. `origin`
-  (`git@edi.jackchristensen.com:repos/jed.git`) is a **private hub** every container can
-  reach, so it is the propagation path. Standing convention (a deliberate, scoped exception
-  to the harness "push only when the user asks" default — it covers *feature branches to this
-  private origin only*, never `master` mid-slice and never a public remote): **push a feature
-  branch to `origin` promptly** — `git push -u origin <branch>` right after the first commit,
-  then `git push` after each subsequent one — so the work is fetchable everywhere and backed
-  up. **Merge to `master` only when green** (`rake ci` / verify) and **push `master`
-  immediately on merge**, so the master tip is never left local-only. **`master` keeps a
+  container's checkout drifts independently. `origin` is the **public GitHub repository**
+  (`https://github.com/jackc/jed`) — the **only** upstream (the former private hub is gone), so
+  it is the propagation path, and anything pushed there is published. **There is no standing
+  push exception:** push a branch or `master` only when the user asks (the harness default).
+  **Merge to `master` only when green** (`rake ci` / verify). **`master` keeps a
   strictly linear history — no merge bubbles, ever.** A merge into `master` must be
   fast-forward-only; integrate by **rebasing the feature branch onto the current `master`
   tip** (then ff), or equivalently **squash-merge** or **cherry-pick**. Whatever the
