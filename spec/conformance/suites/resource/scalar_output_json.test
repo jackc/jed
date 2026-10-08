@@ -98,7 +98,7 @@ SELECT jsonb_build_array(j, j, j) FROM t
 
 # The geometric-growth hole: each recursive step nests two copies of the previous document, and the
 # output charge makes the cost grow with the nodes built (2^10 leaves here).
-# cost: 206126
+# cost: 230646
 query I nosort
 WITH RECURSIVE r(n, v) AS (SELECT 1, j FROM t UNION ALL SELECT n + 1, jsonb_build_array(v, v) FROM r WHERE n < 11) SELECT max(length(v::text)) FROM r
 ----

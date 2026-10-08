@@ -1,0 +1,99 @@
+# Output-constructing kernels (spec/design/cost.md §8.1), slice S3: escaping renders. encode, the
+# quote_* functions, array → text, and jsonb → text/json are growth kernels: escaping or hex can expand
+# their input, so they charge scalar_byte × the rendered UTF-8 bytes after rendering, never reserve the
+# scalar allowance, and are free over constant operands.
+# jed-SPECIFIC resource contract (PostgreSQL has no cost meter or scalar allowance).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, query.aggregates, types.array, types.bytea, types.json, types.jsonb, types.varchar_length, types.i32, types.text, cast.array, cast.explicit, cast.operator, resource.cost_metering, resource.cost_limit, resource.scalar_memory
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, b bytea, s text, n text, a text[], j jsonb, js json)
+
+statement ok
+INSERT INTO t VALUES (1, '\x6162', 'it''s', NULL, ARRAY['x"y', 'z'], '{"k": "a\"b"}', '{"k": 1}')
+
+# The baseline scan for the column cases below.
+# cost: 3
+query I nosort
+SELECT id FROM t
+----
+1
+
+# encode charges its rendered bytes: hex '6162' is 4, base64 'YWI=' is 4, escape 'ab' is 2.
+# cost: 16
+query TTT nosort
+SELECT encode(b, 'hex'), encode(b, 'base64'), encode(b, 'escape') FROM t
+----
+6162
+YWI=
+ab
+
+# Constant operands are free.
+# cost: 2
+query T nosort
+SELECT encode('\x6162'::bytea, 'hex')
+----
+6162
+
+# quote_literal doubles the quote: 'it''s' is 7 bytes; quote_ident adds quotes: "it's" is 6.
+# cost: 18
+query TT nosort
+SELECT quote_literal(s), quote_ident(s) FROM t
+----
+'it''s'
+"it's"
+
+# quote_nullable of a NULL column builds the 4-byte text NULL.
+# cost: 8
+query T nosort
+SELECT quote_nullable(n) FROM t
+----
+NULL
+
+# array → text escapes its elements: {"x\"y",z} is 10 bytes.
+# cost: 14
+query T nosort
+SELECT a::text FROM t
+----
+{"x\"y",z}
+
+# jsonb → text and → json render the canonical form: {"k": "a\"b"} is 13 bytes each.
+# cost: 31
+query TT nosort
+SELECT j::text, j::json FROM t
+----
+{"k": "a\"b"}
+{"k": "a\"b"}
+
+# A varchar(n) target is charged for the full 13-byte render it truncates.
+# cost: 17
+query T nosort
+SELECT j::varchar(3) FROM t
+----
+{"k
+
+# json → text returns the stored text unchanged, so it is not charged.
+# cost: 4
+query T nosort
+SELECT js::text FROM t
+----
+{"k": 1}
+
+# Renders never reserve the allowance, so a tiny budget still admits them.
+# max_scalar_bytes: 1
+query T nosort
+SELECT quote_literal(s) FROM t
+----
+'it''s'
+
+# The geometric-growth hole: quote_literal doubles every quote, so each recursive step more than
+# doubles the string, and the output charge makes the cost grow with the bytes built.
+# cost: 3156
+query I nosort
+WITH RECURSIVE r(i, v) AS (SELECT 1, s FROM t UNION ALL SELECT i + 1, quote_literal(v) FROM r WHERE i < 10) SELECT max(length(v)) FROM r
+----
+1537
+
+# ...so a cost ceiling stops thirty rounds long before they build gigabytes.
+# max_cost: 100000
+statement error 54P01
+WITH RECURSIVE r(i, v) AS (SELECT 1, s FROM t UNION ALL SELECT i + 1, quote_literal(v) FROM r WHERE i < 30) SELECT max(length(v)) FROM r

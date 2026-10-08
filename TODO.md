@@ -384,19 +384,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ a file-backed database-size cap over the **live** page count (§8.7 — the
     high-water is co-residence-timing-dependent under shared access); bounding the interior
     skeleton and resident GiST R-tree once they page.
-- [ ] **Output-constructing kernels** ([cost.md §8.1](spec/design/cost.md)). Growth kernels
+- [x] **Output-constructing kernels** ([cost.md §8.1](spec/design/cost.md)). Growth kernels
   (array/JSON construction, concatenation, escaping renders) charge `scalar_byte × payload(result)`
   to cost after construction, which closes the geometric-growth hole (a recursive CTE doubling a
   value for a few units). Amplifiers (`replace`, `regexp_replace`, `array_replace`,
   `jsonb_pretty`) size their output first, then charge it and reserve it against the scalar
-  allowance. Until all slices land, public docs must distinguish the implemented budgets from a
-  full heap limit.
+  allowance. Public docs must still distinguish the implemented budgets from a full heap limit.
   - [x] _S1:_ `ARRAY[…]`, array `||`/append/prepend/cat; `replace`, `regexp_replace`,
     `array_replace` (`resource/scalar_output.test`).
   - [x] _S2:_ JSON construction (jsonb `||`, `jsonb_set`/`insert`, the build/ctor functions,
     `to_json[b]`, `array_to_json`, `json_scalar`/`json_serialize`, `jsonb_path_query_array`, the
     `JSON_QUERY` wrapper) and `jsonb_pretty` (`resource/scalar_output_json.test`).
-  - [ ] _S3:_ escaping renders: `encode`, `quote_*`, and casts to text from containers, JSON, and
-    `bytea`.
+  - [x] _S3:_ escaping renders: `encode`, `quote_*`, array → text, and jsonb → text/json
+    (`resource/scalar_output_render.test`). Casts to text from `bytea`, composites, and ranges join
+    when those casts land.
   - [ ] _follow-on:_ the `jsonpath_step` unit ([jsonpath.md §7](spec/design/jsonpath.md)), designed
     but unimplemented, so path evaluation's sub-value copies are uncharged.

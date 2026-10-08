@@ -926,7 +926,7 @@ Amplifiers (`repeat`/padding, `replace`, `regexp_replace`, `array_replace`, `jso
 and exact output bytes and check them before allocating; exact decimal transcendentals charge
 guarded internal steps. A finite 64 MiB default `max_scalar_bytes` allowance bounds their
 cumulative logical output/scratch allocation per statement (`54P04`), including internal meters
-and frozen cursors. Growth kernels (`ARRAY[…]`, the array builders, and JSON construction) charge their output
+and frozen cursors. Growth kernels (`ARRAY[…]`, the array builders, JSON construction, and escaping renders) charge their output
 bytes to cost instead, so a cost ceiling bounds geometric growth through recursion
 (`spec/design/cost.md` §8.1). A live, opt-in
 `max_query_memory_bytes` account (unlimited by default; `54P05`) bounds row buffers and
@@ -943,8 +943,8 @@ bytes until commit/rollback, each statement's account opens holding them, and th
 every statement. A database-owned, opt-in `max_storage_bytes` (unlimited by default; `54P06`)
 bounds an in-memory database's or attachment's committed pages, checked at commit before any write
 (slice Q4a); file-backed page caches stay evict-only under `cache_bytes` and never fail a query.
-A file-backed size cap, escaping renders (cost.md §8.1 slice S3), and jsonpath evaluation
-are still uncovered. These are guardrails, not heap caps: resource-
+A file-backed size cap and jsonpath evaluation (the unimplemented `jsonpath_step` unit) are still
+uncovered. These are guardrails, not heap caps: resource-
 exhaustion resistance remains a requirement; do not claim the current limits are a
 whole-engine memory guarantee. Host extensions remain outside these guarantees.
 

@@ -289,6 +289,14 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const v = evalExpr(e.operand, row, env, m);
       if (v.kind === "null") return nullValue();
       const out = evalCast(v, e.target, e.typmod);
+      // Rendering jsonb to text/json is a growth kernel: escapes can expand strings (cost.md §8.1).
+      // The full render is charged, before any varchar(n) truncation below.
+      if (
+        v.kind === "jsonb" &&
+        (out.kind === "text" || out.kind === "json") &&
+        !rexprIsConstant(e.operand)
+      )
+        chargeOutput(m, out);
       // A varchar(n) cast target silently truncates the resulting text to n code points (the
       // explicit-cast rule, spec/design/types.md §15) — applied after any *→text conversion.
       if (e.varcharLen !== null && out.kind === "text") {
@@ -304,8 +312,12 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const v = evalExpr(e.operand, row, env, m);
       if (v.kind === "null") return nullValue();
       if (e.toElem === null) {
-        // array → text: render via array_out (PG-byte-exact §7).
-        return textValue(arrayOut(v as { dims: number[]; lbounds: number[]; elements: Value[] }));
+        // array → text: render via array_out (PG-byte-exact §7). A growth kernel: element quoting
+        // can expand strings (cost.md §8.1).
+        const out = textValue(
+          arrayOut(v as { dims: number[]; lbounds: number[]; elements: Value[] }),
+        );
+        return growthResult(m, [e.operand], out);
       }
       if (v.kind === "text") {
         // runtime text → T[]: coerce the per-row string via array_in against the target element
@@ -1145,9 +1157,11 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // (string-functions.md §3).
       if (e.func === "quote_nullable") {
         const v = evalExpr(e.args[0]!, row, env, m);
-        return textValue(
+        const out = textValue(
           v.kind === "null" ? "NULL" : quoteLiteralText((v as { text: string }).text),
         );
+        // A growth kernel: quoting doubles every quote (cost.md §8.1).
+        return growthResult(m, e.args, out);
       }
       const vals: Value[] = [];
       for (const a of e.args) {
@@ -1531,7 +1545,8 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // encode(bytea, format) → text — hex / base64 / escape.
         const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
         const fmt = (vals[1] as { text: string }).text;
-        return textValue(encodeBytea(bytes, fmt));
+        // A growth kernel: hex doubles its input (cost.md §8.1).
+        return growthResult(m, e.args, textValue(encodeBytea(bytes, fmt)));
       }
       if (e.func === "decode") {
         // decode(text, format) → bytea — parse hex / base64 / escape back to bytes.
@@ -1540,12 +1555,21 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         return byteaValue(decodeText(s, fmt));
       }
       if (e.func === "quote_literal") {
-        // quote_literal(text) → text — wrap as a SQL string literal.
-        return textValue(quoteLiteralText((vals[0] as { text: string }).text));
+        // quote_literal(text) → text — wrap as a SQL string literal. A growth kernel: quoting
+        // doubles every quote (cost.md §8.1).
+        return growthResult(
+          m,
+          e.args,
+          textValue(quoteLiteralText((vals[0] as { text: string }).text)),
+        );
       }
       if (e.func === "quote_ident") {
-        // quote_ident(text) → text — wrap as a SQL identifier.
-        return textValue(quoteIdentText((vals[0] as { text: string }).text));
+        // quote_ident(text) → text — wrap as a SQL identifier; a growth kernel like quote_literal.
+        return growthResult(
+          m,
+          e.args,
+          textValue(quoteIdentText((vals[0] as { text: string }).text)),
+        );
       }
       if (e.func === "pi") {
         // pi() — the constant π, no operand (float.md §8). In-contract: Math.PI is the same f64

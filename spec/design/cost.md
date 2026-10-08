@@ -1793,8 +1793,8 @@ The exact charge sites are specified alongside the kernels in decimal.md.
 
 ### 8.1 Output-constructing kernels
 
-> **Status: S1 and S2 implemented** in all three cores (`resource/scalar_output.test`,
-> `resource/scalar_output_json.test`). S3 is designed, not built.
+> **Status: S1–S3 implemented** in all three cores (`resource/scalar_output.test`,
+> `resource/scalar_output_json.test`, `resource/scalar_output_render.test`).
 
 The `repeat`/pad rule generalizes. A kernel that **builds** a variable-width value
 can produce bytes that no earlier charge paid for. It can combine operands
@@ -1840,7 +1840,7 @@ existing members.
 | `array_replace(a, old, new)` | amplifier | S1 | `payload(a)` | `payload(result)` |
 | jsonb `\|\|`, `jsonb_set`, `jsonb_insert`, `json[b]_build_array`/`_object` (spread or `VARIADIC`), `json[b]_object(text[] [, text[]])`, `to_json`, `to_jsonb`, `array_to_json`, `JSON_SCALAR`, `JSON_SERIALIZE`, `jsonb_path_query_array`, `JSON_QUERY` when a wrapper builds an array | growth | S2 | — | `payload(result)` |
 | `jsonb_pretty` | amplifier | S2 | `payload(jsonb)` | UTF-8 bytes of the result |
-| `encode`, `quote_literal`, `quote_ident`, `quote_nullable`; casts to `text` from array, composite, range, `json`, `jsonb`, `bytea` | growth | S3 | — | UTF-8 bytes of the result |
+| `encode`, `quote_literal`, `quote_ident`, `quote_nullable`; casts from an array to `text`, and from `jsonb` to `text` or `json` | growth | S3 | — | UTF-8 bytes of the result |
 
 The amplifiers' exact sizes:
 
@@ -1891,6 +1891,8 @@ Rules for both classes:
   prepared execution.
 - Cost wins. Every charge is guarded before the amplifier reserves, so when both
   gates reject a step, `54P01`/`54P02` is reported, not `54P04`.
+- A cast to `varchar(n)` is charged for the full render, before the length
+  truncates it, since the render is what was built.
 - The estimator counts no `scalar_byte` for these sites, as for `repeat` and the
   pad functions: they are size extras without admitted value-size facts
   ([estimator.md](estimator.md) §8.2).
@@ -1913,6 +1915,10 @@ Rules for both classes:
 - Renders of fixed-width or decimal values (casts to `text` from integer, float,
   decimal, uuid, and date/time types, `to_hex`, `chr`): bounded by a constant or by
   a digit count that `decimal_work` already charges.
+- Casts that return their input's text unchanged (`json` to `text`), and renders
+  that jed does not implement yet (casts to `text` from `bytea`, composites, and
+  ranges). The missing renders join the table when they land: each escapes its
+  input, so each can grow it.
 - Parsing text into an array, `json`, `jsonb`, composite, or range: the result is
   bounded by the input text, and getting back to text for another round needs a
   covered renderer.

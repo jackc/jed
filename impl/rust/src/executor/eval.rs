@@ -264,17 +264,22 @@ impl RExpr {
                     }
                     // jsonb → text / json renders the canonical form (jsonb_out); jsonb → jsonb is
                     // the identity.
-                    Value::Jsonb(n) => {
-                        if target.is_text() {
-                            Ok(Value::Text(json::jsonb_out(&n)))
-                        } else if target.is_json() {
-                            Ok(Value::Json(json::jsonb_out(&n)))
-                        } else if target.is_jsonb() {
-                            Ok(Value::Jsonb(n))
+                    // Rendering is a growth kernel: escapes can expand strings (cost.md §8.1). The
+                    // full render is charged, before any varchar(n) truncation below.
+                    Value::Jsonb(n) if target.is_text() || target.is_json() => {
+                        let text = json::jsonb_out(&n);
+                        let out = if target.is_text() {
+                            Value::Text(text)
                         } else {
-                            unreachable!("resolver rejects this jsonb cast target")
+                            Value::Json(text)
+                        };
+                        if !rexpr_is_constant(inner) {
+                            charge_output(m, &out)?;
                         }
+                        Ok(out)
                     }
+                    Value::Jsonb(n) if target.is_jsonb() => Ok(Value::Jsonb(n)),
+                    Value::Jsonb(_) => unreachable!("resolver rejects this jsonb cast target"),
                     Value::Unfetched(_) => {
                         panic!("BUG: unfetched large value escaped the storage layer")
                     }
@@ -300,7 +305,12 @@ impl RExpr {
                     Value::Null => Ok(Value::Null),
                     // array → text: render via `array_out` (PG-byte-exact §7).
                     Value::Array(a) if to_elem.is_none() => {
-                        Ok(Value::Text(crate::value::array_out(&a)))
+                        let out = Value::Text(crate::value::array_out(&a));
+                        // A growth kernel: element quoting can expand strings (cost.md §8.1).
+                        if !rexpr_is_constant(inner) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
                     }
                     // runtime text → T[]: coerce the per-row string via `array_in` against the
                     // target element ColType (22P02 malformed / 2202E inverted bound — the same
@@ -1655,11 +1665,16 @@ impl RExpr {
                 // argument yields the text 'NULL', not a propagated NULL, so it must run before
                 // the strict short-circuit loop below (string-functions.md §3).
                 if matches!(func, ScalarFunc::QuoteNullable) {
-                    return Ok(Value::Text(match args[0].eval(row, env, m)? {
+                    let out = Value::Text(match args[0].eval(row, env, m)? {
                         Value::Null => "NULL".to_string(),
                         Value::Text(s) => quote_literal_text(&s),
                         _ => unreachable!("resolver restricts quote_nullable to text"),
-                    }));
+                    });
+                    // A growth kernel: quoting doubles every quote (cost.md §8.1).
+                    if !args.iter().all(rexpr_is_constant) {
+                        charge_output(m, &out)?;
+                    }
+                    return Ok(out);
                 }
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
@@ -2547,7 +2562,12 @@ impl RExpr {
                             (Value::Bytea(b), Value::Text(f)) => (b, f),
                             _ => unreachable!("resolver restricts encode to (bytea, text)"),
                         };
-                        Ok(Value::Text(encode_bytea(bytes, fmt)?))
+                        let out = Value::Text(encode_bytea(bytes, fmt)?);
+                        // A growth kernel: hex doubles its input (cost.md §8.1).
+                        if !args.iter().all(rexpr_is_constant) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
                     }
                     // decode(text, format) → bytea — parse hex / base64 / escape back to bytes.
                     ScalarFunc::Decode => {
@@ -2558,15 +2578,25 @@ impl RExpr {
                         Ok(Value::Bytea(decode_text(s, fmt)?))
                     }
                     // quote_literal(text) → text — wrap as a SQL string literal.
-                    ScalarFunc::QuoteLiteral => match &vals[0] {
-                        Value::Text(s) => Ok(Value::Text(quote_literal_text(s))),
-                        _ => unreachable!("resolver restricts quote_literal to text"),
-                    },
-                    // quote_ident(text) → text — wrap as a SQL identifier.
-                    ScalarFunc::QuoteIdent => match &vals[0] {
-                        Value::Text(s) => Ok(Value::Text(quote_ident_text(s))),
-                        _ => unreachable!("resolver restricts quote_ident to text"),
-                    },
+                    // quote_ident(text) → text — wrap as a SQL identifier. Both are growth kernels:
+                    // quoting doubles every quote (cost.md §8.1).
+                    ScalarFunc::QuoteLiteral | ScalarFunc::QuoteIdent => {
+                        let s = match &vals[0] {
+                            Value::Text(s) => s,
+                            _ => {
+                                unreachable!("resolver restricts quote_literal/quote_ident to text")
+                            }
+                        };
+                        let out = Value::Text(if matches!(func, ScalarFunc::QuoteLiteral) {
+                            quote_literal_text(s)
+                        } else {
+                            quote_ident_text(s)
+                        });
+                        if !args.iter().all(rexpr_is_constant) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
+                    }
                     // quote_nullable is handled by the non-strict pre-check above (it returns before
                     // the strict short-circuit loop), so it never reaches this match.
                     ScalarFunc::QuoteNullable => {

@@ -1298,6 +1298,13 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
+		// Rendering jsonb to text/json is a growth kernel: escapes can expand strings (cost.md §8.1).
+		// The full render is charged, before any varchar(n) truncation below.
+		if v.Kind == ValJsonb && (out.Kind == ValText || out.Kind == ValJson) && !rexprIsConstant(e.operand) {
+			if err := chargeOutput(m, out); err != nil {
+				return Value{}, err
+			}
+		}
 		// A varchar(n) cast target silently truncates the resulting text to n code points (the
 		// explicit-cast rule, spec/design/types.md §15) — applied after any *→text conversion.
 		if e.varchar != nil && out.Kind == ValText {
@@ -1317,8 +1324,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return NullValue(), nil
 		}
 		if e.castElem == nil {
-			// array → text: render via array_out (PG-byte-exact §7).
-			return TextValue(arrayOut(v.arrayVal())), nil
+			// array → text: render via array_out (PG-byte-exact §7). A growth kernel: element quoting
+			// can expand strings (cost.md §8.1).
+			return growthResult(m, []*rExpr{e.operand}, TextValue(arrayOut(v.arrayVal())))
 		}
 		if v.Kind == ValText {
 			// runtime text → T[]: coerce the per-row string via array_in against the target element
@@ -2475,10 +2483,12 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			if v.Kind == ValNull {
-				return TextValue("NULL"), nil
+			out := TextValue("NULL")
+			if v.Kind != ValNull {
+				out = TextValue(quoteLiteralText(v.str()))
 			}
-			return TextValue(quoteLiteralText(v.str())), nil
+			// A growth kernel: quoting doubles every quote (cost.md §8.1).
+			return growthResult(m, e.sargs, out)
 		}
 		vals := make([]Value, 0, len(e.sargs))
 		for _, a := range e.sargs {
@@ -2962,7 +2972,8 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			return TextValue(r), nil
+			// A growth kernel: hex doubles its input (cost.md §8.1).
+			return growthResult(m, e.sargs, TextValue(r))
 		case sfDecode:
 			// decode(text, format) → bytea — parse hex / base64 / escape back to bytes.
 			r, err := decodeText(vals[0].str(), vals[1].str())
@@ -2971,11 +2982,12 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			return ByteaValue(r), nil
 		case sfQuoteLiteral:
-			// quote_literal(text) → text — wrap as a SQL string literal.
-			return TextValue(quoteLiteralText(vals[0].str())), nil
+			// quote_literal(text) → text — wrap as a SQL string literal. A growth kernel: quoting
+			// doubles every quote (cost.md §8.1).
+			return growthResult(m, e.sargs, TextValue(quoteLiteralText(vals[0].str())))
 		case sfQuoteIdent:
-			// quote_ident(text) → text — wrap as a SQL identifier.
-			return TextValue(quoteIdentText(vals[0].str())), nil
+			// quote_ident(text) → text — wrap as a SQL identifier; a growth kernel like quote_literal.
+			return growthResult(m, e.sargs, TextValue(quoteIdentText(vals[0].str())))
 		case sfPi:
 			// pi() — the constant π, no operand (float.md §8). In-contract: math.Pi is the same
 			// f64 literal in every core.
