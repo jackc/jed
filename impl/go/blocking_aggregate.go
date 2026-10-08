@@ -363,6 +363,10 @@ func (db *engine) finalizeSpilledAcc(a *acc, spec aggSpec, srow storedRow, colle
 				return NullValue(), err
 			}
 			out.WriteByte(']')
+			// The aggregate nests each input one level (json.md §6.4).
+			if err := checkJSONTextDepth(out.String()); err != nil {
+				return NullValue(), err
+			}
 			return JsonValue(out.String()), nil
 		}
 		var nodes []JsonNode
@@ -370,7 +374,11 @@ func (db *engine) finalizeSpilledAcc(a *acc, spec aggSpec, srow storedRow, colle
 		if err != nil {
 			return NullValue(), err
 		}
-		return JsonbValue(JsonNode{Kind: JArray, Arr: nodes}), nil
+		arr := JsonNode{Kind: JArray, Arr: nodes}
+		if err := checkJSONDepth(&arr); err != nil {
+			return NullValue(), err
+		}
+		return JsonbValue(arr), nil
 	case planJsonbObjectAgg, planJsonObjectAgg, planJsonbObjectAggUnique, planJsonObjectAggUnique:
 		if !a.seen {
 			return NullValue(), nil
@@ -398,6 +406,9 @@ func (db *engine) finalizeSpilledAcc(a *acc, spec aggSpec, srow storedRow, colle
 				return NullValue(), err
 			}
 			out.WriteString(" }")
+			if err := checkJSONTextDepth(out.String()); err != nil {
+				return NullValue(), err
+			}
 			return JsonValue(out.String()), nil
 		}
 		// Convert every input value in original order before sorting/dedup, including overwritten
@@ -437,7 +448,11 @@ func (db *engine) finalizeSpilledAcc(a *acc, spec aggSpec, srow storedRow, colle
 			}
 			members = append(members, JsonMember{Key: key, Val: *row[2].jsonb()})
 		}
-		return JsonbValue(makeObject(members)), nil
+		out := makeObject(members)
+		if err := checkJSONDepth(&out); err != nil {
+			return NullValue(), err
+		}
+		return JsonbValue(out), nil
 	}
 	return a.finalize()
 }

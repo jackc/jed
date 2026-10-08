@@ -2724,7 +2724,11 @@ class Parser {
         this.expectIdentifier();
       }
       this.expectKeyword("columns");
+      // Each NESTED level is one more nesting level of the statement (cost.md §7, json.md §6.4): a
+      // deep NESTED chain recurses in the parser and the planner.
+      this.deepen();
       const columns = this.parseJtColumns();
+      this.undeepen();
       return { kind: "nested", path, columns };
     }
     const name = this.expectIdentifier();

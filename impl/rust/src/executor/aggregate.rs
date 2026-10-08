@@ -406,6 +406,8 @@ impl Acc {
                     Value::Null
                 } else {
                     let arr = JsonNode::Array(nodes);
+                    // The aggregate nests each input one level (json.md §6.4).
+                    json::check_depth(&arr)?;
                     // Both json_agg and jsonb_agg render the spaced canonical form (PG joins the
                     // element texts with ", "); the json variant is just typed `json`. (A json input
                     // element is canonicalized by `value_to_node`, a documented divergence from PG's
@@ -435,13 +437,18 @@ impl Acc {
                         ));
                     }
                     // PG's json_object_agg PADS the braces (`{ … }`) — distinct from json_build_object.
-                    Value::Json(format!("{{ {} }}", parts.join(", ")))
+                    let out = format!("{{ {} }}", parts.join(", "));
+                    // The aggregate nests each value one level (json.md §6.4).
+                    json::check_text_depth(&out)?;
+                    Value::Json(out)
                 } else {
                     let mut members = Vec::with_capacity(pairs.len());
                     for (k, v) in pairs {
                         members.push((k, value_to_node(&v)?));
                     }
-                    Value::Jsonb(json::make_object(members))
+                    let out = json::make_object(members);
+                    json::check_depth(&out)?;
+                    Value::Jsonb(out)
                 }
             }
             Acc::OrderedSet {

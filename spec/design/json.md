@@ -334,10 +334,111 @@ them too).
 | `json`/`jsonb` `PRIMARY KEY` / index / `UNIQUE` (`json` always; `jsonb` until the key slice) | `0A000` feature_not_supported |
 | corrupt jsonb body (bad node tag, or reserved `0x5`/flag bits before the dictionary slice) | `XX001` data_corrupted |
 | (reserved for the SQL/JSON **path** surface — [jsonpath.md](jsonpath.md)) invalid JSON text | `22032` invalid_json_text |
+| a document (or a constructor result) nested deeper than `MAX_JSON_DEPTH` (§6.4) | `54001` statement_too_complex |
+| a stored `jsonb` body nested deeper than `MAX_JSON_DEPTH` (§6.4) | `XX001` data_corrupted |
 
-`22P02`, `42883`, `0A000`, `XX001` are already registered. `22032` (and the rest of the
+`22P02`, `42883`, `0A000`, `XX001`, `54001` are already registered. `22032` (and the rest of the
 `2203x` SQL/JSON class) is registered by the path surface — see
 [jsonpath.md §error-codes](jsonpath.md) and [json-sql-functions.md](json-sql-functions.md).
+
+### 6.4 Nesting-depth limit — `MAX_JSON_DEPTH = 256` (landed)
+
+A JSON document is a tree, and every core walks it **recursively**: the text parser, the `jsonb`
+body codec (encode and decode), the comparator (§5), `jsonb_out`/`jsonb_pretty`, containment
+(`@>`), the mutators, `memsize`, and (in Rust) the derived `Clone`/`Drop`/`Hash` of the node
+type. Each walk recurses once per nesting level, so an untrusted, deeply nested document —
+`rpad(repeat('[', 200000), 400000, ']')::jsonb` is 400 KB, well under every input cap —
+**overflows the native call stack** (a Rust `SIGABRT`, an uncoded V8 `RangeError`, and a Go
+goroutine stack that grows toward its 1 GB ceiling). The cost ceiling cannot catch it: the parse
+happens inside a single `operator_eval`. This is the fourth native-stack gate in the
+[cost.md §7](cost.md) family (expressions §7, composite types §7b, regex programs §7c), and it
+follows the same rule: **bound the depth where trees are produced**, so every reader is safe
+without its own guard.
+
+**Depth.** A document's depth is the largest number of containers (arrays or objects) on any
+root-to-leaf path. A scalar is depth 0, `[]` and `{}` are depth 1, and `[[1]]` and `{"a": [1]}`
+are depth 2. **A depth of `MAX_JSON_DEPTH = 256` is allowed; 257 is rejected.**
+
+**Invariant.** No `json` or `jsonb` value deeper than 256 is ever produced. Every recursive walk
+over a value therefore recurses at most 256 levels.
+
+**The gates (producers):**
+
+1. **Text parse → `54001`.** The one RFC 8259 parser behind `jsonb_in`, `json_in` validation,
+   and the on-demand structural parse of a `json` value (§4) counts depth as it reads. It raises
+   `54001` at the **opening bracket of level 257**, before it parses anything inside it. This
+   covers literals, `text`→`json`/`jsonb` casts, `json`→`jsonb`, `JSON()`, and `to_jsonb(json)`.
+   The parser reads left to right and stops at the first error. A syntax error before the
+   257th opening bracket is `22P02`, and a syntax error after it is never reached. Every core
+   reports the same error for the same input.
+2. **Constructors → `54001`.** An operation that places an existing value *inside* a new
+   container can return a deeper document than its inputs. Each one checks its result:
+   `json[b]_build_array` / `json[b]_build_object`, `to_json[b]` / `array_to_json` (an array of
+   JSON elements; a composite with JSON fields too, once composite sources land), `json[b]_agg[_strict]` and
+   `json[b]_object_agg[_unique]`, `jsonb || jsonb` (which wraps a non-array operand in an
+   array), `jsonb_set` / `jsonb_insert` (which insert a document at a path inside another),
+   `jsonb_path_query_array`, and `JSON_QUERY … WITH [CONDITIONAL] WRAPPER`. A `jsonb` result is
+   checked with a depth walk that stops after level 257. A textual `json` result is checked
+   with a non-recursive bracket scan of the produced text. Operations that only select or remove
+   parts of a document (`->`, `#>`, `-`, `#-`, `jsonb_strip_nulls`, the path-query results,
+   `JSON_TABLE`, the record functions) can never return a deeper document, so they need no check.
+3. **On-disk `jsonb` decode → `XX001`.** A conformant engine never writes a `jsonb` body deeper
+   than 256, so a deeper body means the file was tampered with or corrupted. The decoder carries
+   a depth counter in both construct and skip mode ([lazy-record.md](lazy-record.md) §6), and the
+   counter stops descent at level 257 **before** recursing. This is the same rule as the
+   composite-catalog `XX001` ([cost.md §7b](cost.md)). A `json` body is verbatim text with no
+   decode recursion. A crafted deep `json` body is returned as-is by `json_out`, and any
+   structural use re-parses it through gate 1 (`54001`).
+
+**The `jsonpath` compiler** has its own nesting, separate from document depth. Filters inside
+filters (`@ ? (@ ? (…))`), parenthesized predicate groups, `!(…)`, and long `&&` / `||` chains
+(which build a left-deep tree) all recurse when compiled, rendered, and evaluated. The compiler
+counts nesting the way the SQL parser does ([cost.md §7](cost.md)): **+1** for each filter `?(`,
+each parenthesized group, each `!`, and each `&&` / `||` step. It checks the count against the
+same `MAX_JSON_DEPTH = 256` and raises `54001`. A `jsonpath` is literal-only (no storable column,
+§7), so the compiler is its only producer. Evaluating a path walks its steps **iteratively**, not
+recursively by document depth, so a deep document needs no extra guard there.
+
+**Why `256`, and why a fixed number.** PostgreSQL bounds JSON nesting only through
+`check_stack_depth()`. It raises the same `54001` ("stack depth limit exceeded"), but the point
+depends on `max_stack_depth` and frame sizes. On the pinned oracle (2 MB) `jsonb_in` accepts
+10 000 levels and rejects 20 000. That threshold is non-deterministic and differs across cores.
+jed uses a fixed logical limit that is identical in Rust, Go, and TS (CLAUDE.md §8). It is sized
+for the weakest core's stack. Measured on a default Node stack *with nothing else on it*, the
+TS core's heaviest document walk (`@>` containment) overflows below ~2 000 levels and object
+parsing below ~4 000. A statement already at the expression limit (§7, 256 levels) can use about
+half of that stack. 256 JSON levels keeps a better-than-2× margin in that worst case. It is the
+same constant as `MAX_EXPR_DEPTH`, twice serde_json's default recursion limit (128), and far
+deeper than real documents nest. Rejecting a 257-deep document that PostgreSQL accepts is a
+**documented divergence** (the *overriding reason*: cross-core determinism and the weakest
+core's stack, CLAUDE.md §1/§8/§13). The jsonpath `54001` likewise diverges from PostgreSQL, which
+raises `42601` ("memory exhausted") only after about 10 000 nested parentheses, when its
+generated parser's stack runs out.
+
+**Determinism and cost.** The check is a structural bound, not metered work. It charges no cost
+units and fires the same way under any `max_cost`. The `54001` message is
+`json nesting depth exceeds the maximum of 256` (documents and constructor results) or
+`jsonpath nesting depth exceeds the maximum of 256` (path literals). The `XX001` message is
+`jsonb nesting depth exceeds the maximum of 256`.
+
+**Neighbouring recursive text inputs (checked with this gate).**
+- **`array_in`** (`'{{{…}}}'::i32[]`) parses the brace tree recursively *before* checking
+  `MAXDIM = 6`. It now rejects the **7th** nested `{` as soon as it reads it, with the same
+  `22P02` an over-`MAXDIM` literal already raises ([array.md](array.md) §12). So it never
+  recurses more than seven levels, and the observable error is unchanged.
+- **`record_in`** recurses only into a *composite-typed* field, so its depth is bounded by
+  `MAX_COMPOSITE_DEPTH` (cost.md §7b). Extra parentheses in a scalar field are just a malformed
+  token (`22P02`). No change.
+- **`JSON_TABLE … NESTED PATH … COLUMNS (…)`** is SQL grammar. Each `NESTED` level adds one to the
+  SQL parser's nesting counter (`MAX_EXPR_DEPTH`, cost.md §7), so a 20 000-deep `NESTED` chain
+  is `54001` at parse time instead of overflowing the parser and planner.
+
+**Conformance.** [../conformance/suites/resource/json_depth_limit.test](../conformance/suites/resource/json_depth_limit.test)
+tests both sides of the limit in every core: 256 levels pass through each walk (parse, store,
+compare, render, `@>`, mutate, aggregate), and 257 is `54001` at each gate. It also covers
+`jsonpath`, array literals, and `JSON_TABLE`. It is gated by `resource.json_depth_limit`. The
+limit is jed-specific, so the suite is **not** oracle-checked. The on-disk `XX001` case can only
+be produced with a crafted file, so it is a per-core unit test (CLAUDE.md §10).
 
 ---
 

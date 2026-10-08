@@ -100,6 +100,75 @@ pub fn key_cmp(a: &str, b: &str) -> Ordering {
 // Parsing (RFC 8259). `jsonb_in` canonicalizes; `json_in` validates and stores verbatim.
 // ---------------------------------------------------------------------------------------------
 
+/// The maximum nesting depth of a `json`/`jsonb` document (spec/design/json.md §6.4): the largest
+/// number of containers (arrays/objects) on any root-to-leaf path — a scalar is depth 0, `[]` depth 1.
+/// Every producer (the text parser, the constructors, the on-disk decoder) enforces it, so every
+/// recursive walk over a node (compare, render, codec, `Clone`/`Drop`) is bounded by it. A fixed,
+/// cross-core constant sized for the weakest core's native stack; also bounds jsonpath nesting.
+pub const MAX_JSON_DEPTH: usize = 256;
+
+/// `54001` statement_too_complex — a document (or constructor result) deeper than
+/// [`MAX_JSON_DEPTH`] (spec/design/json.md §6.4).
+pub fn too_deep() -> EngineError {
+    EngineError::new(
+        SqlState::StatementTooComplex,
+        format!("json nesting depth exceeds the maximum of {MAX_JSON_DEPTH}"),
+    )
+}
+
+/// Enforce [`MAX_JSON_DEPTH`] on a constructed `jsonb` node — the constructor gate (json.md §6.4):
+/// an operation that nests existing values inside a new container checks its result. The walk
+/// stops one level past the limit, so it never recurses deeper than `MAX_JSON_DEPTH + 1`.
+pub fn check_depth(node: &JsonNode) -> Result<()> {
+    if exceeds_depth(node, MAX_JSON_DEPTH) {
+        return Err(too_deep());
+    }
+    Ok(())
+}
+
+/// Whether `node` nests more than `budget` containers deep.
+fn exceeds_depth(node: &JsonNode, budget: usize) -> bool {
+    match node {
+        JsonNode::Array(elems) => budget == 0 || elems.iter().any(|e| exceeds_depth(e, budget - 1)),
+        JsonNode::Object(members) => {
+            budget == 0 || members.iter().any(|(_, v)| exceeds_depth(v, budget - 1))
+        }
+        _ => false,
+    }
+}
+
+/// Enforce [`MAX_JSON_DEPTH`] on a constructed textual `json` value (json.md §6.4) — a
+/// NON-recursive bracket scan of well-formed JSON text (brackets inside strings are skipped).
+pub fn check_text_depth(text: &str) -> Result<()> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &b in text.as_bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > MAX_JSON_DEPTH {
+                    return Err(too_deep());
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn malformed(detail: &str) -> EngineError {
     EngineError::new(
         SqlState::InvalidTextRepresentation,
@@ -137,6 +206,9 @@ struct Parser<'a> {
     /// When true (jsonb), objects dedup last-wins and sort keys; when false (json validation /
     /// on-demand parse), members are kept in input order with duplicates.
     canonicalize: bool,
+    /// The current container nesting depth (spec/design/json.md §6.4): entering the
+    /// `MAX_JSON_DEPTH + 1`-th `[`/`{` aborts `54001` before parsing anything inside it.
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -145,6 +217,7 @@ impl<'a> Parser<'a> {
             buf,
             pos: 0,
             canonicalize,
+            depth: 0,
         }
     }
 
@@ -172,11 +245,30 @@ impl<'a> Parser<'a> {
         self.buf.get(self.pos).copied()
     }
 
+    /// Enter one container level, enforcing [`MAX_JSON_DEPTH`] (json.md §6.4).
+    fn descend(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > MAX_JSON_DEPTH {
+            return Err(too_deep());
+        }
+        Ok(())
+    }
+
     fn parse_value(&mut self) -> Result<JsonNode> {
         match self.peek() {
             None => Err(malformed("unexpected end of input")),
-            Some(b'{') => self.parse_object(),
-            Some(b'[') => self.parse_array(),
+            Some(b'{') => {
+                self.descend()?;
+                let node = self.parse_object()?;
+                self.depth -= 1;
+                Ok(node)
+            }
+            Some(b'[') => {
+                self.descend()?;
+                let node = self.parse_array()?;
+                self.depth -= 1;
+                Ok(node)
+            }
             Some(b'"') => Ok(JsonNode::String(self.parse_string()?)),
             Some(b't') => {
                 self.expect_keyword("true")?;

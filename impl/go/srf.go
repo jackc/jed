@@ -1286,6 +1286,11 @@ func evalJSONSqlResult(kind jsonSqlKind, seq []JsonNode, returning scalarType, w
 			}
 			node = seq[0]
 		}
+		// A wrapper nests the items one level (json.md §6.4) — not a SQL/JSON error, so it is raised
+		// regardless of ON ERROR.
+		if err := checkJSONDepth(&node); err != nil {
+			return Value{}, err
+		}
 		return jsonNodeAsReturning(node, returning, env, m)
 	}
 }

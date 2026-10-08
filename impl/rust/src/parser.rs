@@ -3061,7 +3061,11 @@ impl Parser {
                 self.expect_identifier()?;
             }
             self.expect_keyword("columns")?;
+            // Each NESTED level is one more nesting level of the statement (cost.md §7,
+            // json.md §6.4): a deep NESTED chain recurses in the parser and the planner.
+            self.deepen()?;
             let columns = self.parse_jt_columns()?;
+            self.undeepen();
             return Ok(JtColumn::Nested { path, columns });
         }
         let name = self.expect_identifier()?;

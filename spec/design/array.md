@@ -584,7 +584,9 @@ container key) are out-of-scope / shared deferrals, not array-specific.
 
 **Known gap — the `MAXDIM = 6` bound is enforced only on the literal path.** A `'{{…}}'` **text
 literal** nested beyond 6 dimensions is rejected by `array_in` (`22P02`; pinned in
-`conformance/suites/types/array_multidim.test`, ledgered against PostgreSQL's `54000`), but the
+`conformance/suites/types/array_multidim.test`, ledgered against PostgreSQL's `54000`). The parser
+rejects the 7th nested brace as soon as it reads it, so even a 200 000-deep literal never recurses
+past seven levels ([json.md §6.4](json.md)). But the
 **`ARRAY[…]` constructor does NOT yet bound dimensionality** — a 7-D constructor currently *builds
 and stores* a 7-D value, in violation of the `ndim ≤ 6` invariant declared in §4. PostgreSQL
 rejects a >6-D constructor with `54000` (`program_limit_exceeded`). Bounding the constructor (and

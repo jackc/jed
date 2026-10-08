@@ -669,6 +669,10 @@ func (a *acc) finalize() (Value, error) {
 			return NullValue(), nil
 		}
 		arr := JsonNode{Kind: JArray, Arr: a.jsonNodes}
+		// The aggregate nests each input one level (json.md §6.4).
+		if err := checkJSONDepth(&arr); err != nil {
+			return NullValue(), err
+		}
 		// Both json_agg and jsonb_agg render the SPACED canonical form (PG joins the element texts
 		// with ", "); the json variant is just typed `json` carrying that same text. (A json input
 		// element is canonicalized by valueToNode — a documented divergence from PG's verbatim.)
@@ -697,7 +701,12 @@ func (a *acc) finalize() (Value, error) {
 			}
 			// PG's json_object_agg PADS the braces (`{ … }`) — distinct from json_build_object, which
 			// does NOT pad.
-			return JsonValue("{ " + strings.Join(parts, ", ") + " }"), nil
+			out := "{ " + strings.Join(parts, ", ") + " }"
+			// The aggregate nests each value one level (json.md §6.4).
+			if err := checkJSONTextDepth(out); err != nil {
+				return NullValue(), err
+			}
+			return JsonValue(out), nil
 		}
 		members := make([]JsonMember, 0, len(a.objPairs))
 		for _, p := range a.objPairs {
@@ -707,7 +716,11 @@ func (a *acc) finalize() (Value, error) {
 			}
 			members = append(members, JsonMember{Key: p.key, Val: node})
 		}
-		return JsonbValue(makeObject(members)), nil
+		out := makeObject(members)
+		if err := checkJSONDepth(&out); err != nil {
+			return NullValue(), err
+		}
+		return JsonbValue(out), nil
 	case planMode, planPercentileDisc, planPercentileCont, planPercentileContInterval:
 		return a.finalizeOrderedSet()
 	case planHypoRank, planHypoDenseRank, planHypoPercentRank, planHypoCumeDist:

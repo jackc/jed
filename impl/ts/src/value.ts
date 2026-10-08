@@ -749,7 +749,7 @@ export function parseArrayLiteral(input: string): ArrayInResult {
     p.skipWs();
   }
 
-  const node = p.parseNode();
+  const node = p.parseNode(0);
   if (node === null) return malformed;
   p.skipWs();
   if (!p.atEnd()) return malformed; // trailing junk
@@ -760,7 +760,7 @@ export function parseArrayLiteral(input: string): ArrayInResult {
     return { ok: true, value: { dims: [], lbounds: [], tokens: [] } };
   }
   const dims = nodeDims(node);
-  if (dims === null || dims.length > 6) return malformed;
+  if (dims === null || dims.length > ARRAY_MAXDIM) return malformed;
   const tokens: (string | null)[] = [];
   flattenNodes(node, tokens);
   let lbounds: number[];
@@ -773,6 +773,10 @@ export function parseArrayLiteral(input: string): ArrayInResult {
   }
   return { ok: true, value: { dims, lbounds, tokens } };
 }
+
+// ARRAY_MAXDIM is PostgreSQL's MAXDIM — the most dimensions an array literal may have
+// (spec/design/array.md §7).
+const ARRAY_MAXDIM = 6;
 
 // ArrParser is a string cursor for parseArrayLiteral.
 class ArrParser {
@@ -809,9 +813,13 @@ class ArrParser {
     return Number.isInteger(n) ? n : null;
   }
   // parseNode parses one element: a nested `{…}` (a braced level) or a scalar token (a leaf).
-  parseNode(): ArrNode | null {
+  // `depth` is the number of enclosing braces: a brace past ARRAY_MAXDIM is rejected as it is read —
+  // the same malformed result the post-parse dimension check gives — so the recursion never exceeds
+  // ARRAY_MAXDIM + 1 levels on a deeply nested literal (spec/design/json.md §6.4).
+  parseNode(depth: number): ArrNode | null {
     this.skipWs();
     if (this.peek() === "{") {
+      if (depth >= ARRAY_MAXDIM) return null;
       this.bump(); // {
       this.skipWs();
       const children: ArrNode[] = [];
@@ -820,7 +828,7 @@ class ArrParser {
         return { children, isLeaf: false };
       }
       for (;;) {
-        const child = this.parseNode();
+        const child = this.parseNode(depth + 1);
         if (child === null) return null;
         children.push(child);
         this.skipWs();

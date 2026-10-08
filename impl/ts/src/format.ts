@@ -115,7 +115,7 @@ import {
   jsonValue,
   jsonbValue,
 } from "./value.ts";
-import type { JsonNode } from "./json.ts";
+import { type JsonNode, MAX_JSON_DEPTH } from "./json.ts";
 import type { ColumnStatistics, StatisticsValue } from "./statistics.ts";
 import {
   STATISTICS_HISTOGRAM_BOUNDS,
@@ -555,6 +555,13 @@ function jsonbBodyBytes(node: JsonNode): Uint8Array {
 // nonzero flag nibble, the reserved NTAG_STRING_DICT (no dictionary slice yet), or an unknown kind
 // is XX001 data_corrupted (spec/design/json.md §3.1/§6.3).
 function decodeJsonbBody(buf: Uint8Array, cur: Cursor, mode: DecodeMode): JsonNode {
+  return decodeJsonbNode(buf, cur, mode, 0);
+}
+
+// decodeJsonbNode is decodeJsonbBody at container nesting `depth`. A conformant engine never writes a
+// body deeper than MAX_JSON_DEPTH, so entering a deeper container is XX001 — checked BEFORE
+// recursing, which bounds this decoder's own native recursion (spec/design/json.md §6.4).
+function decodeJsonbNode(buf: Uint8Array, cur: Cursor, mode: DecodeMode, depth: number): JsonNode {
   const tag = readU8(buf, cur);
   if ((tag & 0xf0) !== 0) {
     throw engineError("data_corrupted", "jsonb node tag has a reserved flag bit set");
@@ -584,15 +591,17 @@ function decodeJsonbBody(buf: Uint8Array, cur: Cursor, mode: DecodeMode): JsonNo
         "jsonb string-dictionary reference before the dictionary slice",
       );
     case NTAG_ARRAY: {
+      const inner = jsonbDescend(depth);
       const count = readUvarint(buf, cur);
       const elements: JsonNode[] = [];
       for (let i = 0; i < count; i++) {
-        const e = decodeJsonbBody(buf, cur, mode);
+        const e = decodeJsonbNode(buf, cur, mode, inner);
         if (mode === "construct") elements.push(e);
       }
       return { kind: "array", elements };
     }
     case NTAG_OBJECT: {
+      const inner = jsonbDescend(depth);
       const count = readUvarint(buf, cur);
       const members: { key: string; value: JsonNode }[] = [];
       for (let i = 0; i < count; i++) {
@@ -612,7 +621,7 @@ function decodeJsonbBody(buf: Uint8Array, cur: Cursor, mode: DecodeMode): JsonNo
           throw engineError("data_corrupted", "jsonb object key is not a string node");
         }
         const key = decodeJsonbString(buf, cur, mode);
-        const value = decodeJsonbBody(buf, cur, mode);
+        const value = decodeJsonbNode(buf, cur, mode, inner);
         if (mode === "construct") members.push({ key, value });
       }
       return { kind: "object", members };
@@ -620,6 +629,18 @@ function decodeJsonbBody(buf: Uint8Array, cur: Cursor, mode: DecodeMode): JsonNo
     default:
       throw engineError("data_corrupted", "unknown jsonb node tag");
   }
+}
+
+// jsonbDescend enters one jsonb container level while decoding: the new depth, or XX001 past
+// MAX_JSON_DEPTH (spec/design/json.md §6.4 gate 3).
+function jsonbDescend(depth: number): number {
+  if (depth >= MAX_JSON_DEPTH) {
+    throw engineError(
+      "data_corrupted",
+      `jsonb nesting depth exceeds the maximum of ${MAX_JSON_DEPTH}`,
+    );
+  }
+  return depth + 1;
 }
 
 // decodeJsonbString reads a NTAG_STRING payload (varint len ‖ UTF-8 bytes) after its tag has been

@@ -492,6 +492,13 @@ func encodeJsonbBody(node *JsonNode, out []byte) []byte {
 // flag nibble, the reserved ntagStringDict (no dictionary slice yet), or an unknown kind is XX001
 // data_corrupted (spec/design/json.md §3.1/§6.3).
 func decodeJsonbBody(buf []byte, pos *int, mode decodeMode) (JsonNode, error) {
+	return decodeJsonbNode(buf, pos, mode, 0)
+}
+
+// decodeJsonbNode is decodeJsonbBody at container nesting depth. A conformant engine never writes a
+// body deeper than maxJSONDepth, so entering a deeper container is XX001 — checked BEFORE recursing,
+// which bounds this decoder's own recursion (spec/design/json.md §6.4).
+func decodeJsonbNode(buf []byte, pos *int, mode decodeMode, depth int) (JsonNode, error) {
 	tag, err := readU8(buf, pos)
 	if err != nil {
 		return JsonNode{}, err
@@ -527,6 +534,10 @@ func decodeJsonbBody(buf []byte, pos *int, mode decodeMode) (JsonNode, error) {
 	case ntagStringDict:
 		return JsonNode{}, newError(DataCorrupted, "jsonb string-dictionary reference before the dictionary slice")
 	case ntagArray:
+		depth, err := jsonbDescend(depth)
+		if err != nil {
+			return JsonNode{}, err
+		}
 		count, err := readUvarint(buf, pos)
 		if err != nil {
 			return JsonNode{}, err
@@ -536,7 +547,7 @@ func decodeJsonbBody(buf []byte, pos *int, mode decodeMode) (JsonNode, error) {
 			elems = make([]JsonNode, 0, minCap(count))
 		}
 		for i := uint64(0); i < count; i++ {
-			child, err := decodeJsonbBody(buf, pos, mode)
+			child, err := decodeJsonbNode(buf, pos, mode, depth)
 			if err != nil {
 				return JsonNode{}, err
 			}
@@ -546,6 +557,10 @@ func decodeJsonbBody(buf []byte, pos *int, mode decodeMode) (JsonNode, error) {
 		}
 		return JsonNode{Kind: JArray, Arr: elems}, nil
 	case ntagObject:
+		depth, err := jsonbDescend(depth)
+		if err != nil {
+			return JsonNode{}, err
+		}
 		count, err := readUvarint(buf, pos)
 		if err != nil {
 			return JsonNode{}, err
@@ -575,7 +590,7 @@ func decodeJsonbBody(buf []byte, pos *int, mode decodeMode) (JsonNode, error) {
 			if err != nil {
 				return JsonNode{}, err
 			}
-			val, err := decodeJsonbBody(buf, pos, mode)
+			val, err := decodeJsonbNode(buf, pos, mode, depth)
 			if err != nil {
 				return JsonNode{}, err
 			}
@@ -587,6 +602,16 @@ func decodeJsonbBody(buf []byte, pos *int, mode decodeMode) (JsonNode, error) {
 	default:
 		return JsonNode{}, newError(DataCorrupted, "unknown jsonb node tag")
 	}
+}
+
+// jsonbDescend enters one jsonb container level while decoding: the new depth, or XX001 past
+// maxJSONDepth (spec/design/json.md §6.4 gate 3).
+func jsonbDescend(depth int) (int, error) {
+	if depth >= maxJSONDepth {
+		return 0, newError(DataCorrupted,
+			fmt.Sprintf("jsonb nesting depth exceeds the maximum of %d", maxJSONDepth))
+	}
+	return depth + 1, nil
 }
 
 // minCap bounds a decoded count's preallocation (the Rust .min(1024) guard) so a corrupt huge count

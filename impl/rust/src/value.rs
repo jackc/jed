@@ -1240,7 +1240,7 @@ pub fn parse_array_literal(input: &str) -> Result<ParsedArray, ArrayInError> {
     }
 
     // The brace structure.
-    let node = p.parse_node()?;
+    let node = p.parse_node(0)?;
     p.skip_ws();
     if p.i != p.chars.len() {
         return Err(ArrayInError::Malformed); // trailing junk
@@ -1324,9 +1324,15 @@ impl ArrParser<'_> {
     }
 
     /// Parse one element: a nested `{…}` (→ `Node::Arr`) or a scalar token (→ `Node::Leaf`).
-    fn parse_node(&mut self) -> Result<Node, ArrayInError> {
+    /// `depth` is the number of enclosing braces: a brace past `ARRAY_MAXDIM` is rejected as it is
+    /// read — the same `Malformed` the post-parse dimension check gives — so the recursion never
+    /// exceeds `ARRAY_MAXDIM + 1` levels on a deeply nested literal (spec/design/json.md §6.4).
+    fn parse_node(&mut self, depth: usize) -> Result<Node, ArrayInError> {
         self.skip_ws();
         if self.peek() == Some('{') {
+            if depth >= ARRAY_MAXDIM {
+                return Err(ArrayInError::Malformed);
+            }
             self.bump(); // {
             self.skip_ws();
             let mut children = Vec::new();
@@ -1335,7 +1341,7 @@ impl ArrParser<'_> {
                 return Ok(Node::Arr(children));
             }
             loop {
-                children.push(self.parse_node()?);
+                children.push(self.parse_node(depth + 1)?);
                 self.skip_ws();
                 match self.peek() {
                     Some(',') => {

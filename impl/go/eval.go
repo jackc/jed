@@ -176,6 +176,10 @@ func evalArrayFunc(fn arrayFunc, vals []Value) (Value, error) {
 		if err != nil {
 			return NullValue(), err
 		}
+		// An array of json/jsonb elements nests them one level (json.md §6.4).
+		if err := checkJSONDepth(&node); err != nil {
+			return NullValue(), err
+		}
 		return JsonValue(jsonCompactOut(&node)), nil
 	case afContains:
 		return arrayContainsValue(vals[0], vals[1])
@@ -1696,8 +1700,13 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if av.Kind == ValNull || bv.Kind == ValNull {
 			return NullValue(), nil
 		}
-		// resolver guarantees jsonb operands for ||.
-		return JsonbValue(jsonConcat(av.jsonb(), bv.jsonb())), nil
+		// resolver guarantees jsonb operands for ||. Wrapping a non-array operand can deepen the
+		// result (json.md §6.4).
+		out := jsonConcat(av.jsonb(), bv.jsonb())
+		if err := checkJSONDepth(&out); err != nil {
+			return Value{}, err
+		}
+		return JsonbValue(out), nil
 	case reJsonDelete:
 		// `jsonb - text|int|text[]` / `jsonb #- text[]` mutation deletes (json-sql-functions.md §1,
 		// J6). One operator_eval; STRICT — a NULL base or argument yields SQL NULL.
@@ -2748,6 +2757,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
+			// An array of json/jsonb elements nests them one level (json.md §6.4).
+			if err := checkJSONDepth(&node); err != nil {
+				return Value{}, err
+			}
 			return JsonbValue(node), nil
 		case sfToJson:
 			// to_json(anyelement) → the value's `json` image (json-sql-functions.md §2): a jsonb input
@@ -2756,6 +2769,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// NULL-input case is handled by the blanket propagation above.
 			s, err := elemJsonText(vals[0])
 			if err != nil {
+				return Value{}, err
+			}
+			if err := checkJSONTextDepth(s); err != nil {
 				return Value{}, err
 			}
 			return JsonValue(s), nil
@@ -3297,7 +3313,12 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 					}
 					parts[i] = s
 				}
-				return JsonValue("[" + strings.Join(parts, ", ") + "]"), nil
+				// The builders nest their arguments one level (json.md §6.4).
+				out := "[" + strings.Join(parts, ", ") + "]"
+				if err := checkJSONTextDepth(out); err != nil {
+					return Value{}, err
+				}
+				return JsonValue(out), nil
 			}
 			nodes := make([]JsonNode, len(vals))
 			for i := range vals {
@@ -3307,7 +3328,11 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				}
 				nodes[i] = node
 			}
-			return JsonbValue(JsonNode{Kind: JArray, Arr: nodes}), nil
+			out := JsonNode{Kind: JArray, Arr: nodes}
+			if err := checkJSONDepth(&out); err != nil {
+				return Value{}, err
+			}
+			return JsonbValue(out), nil
 		default: // jbObject
 			if len(vals)%2 != 0 {
 				return Value{}, newError(InvalidParameterValue,
@@ -3326,7 +3351,11 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 					}
 					parts = append(parts, jsonCompactOut(&JsonNode{Kind: JString, S: key})+" : "+valText)
 				}
-				return JsonValue("{" + strings.Join(parts, ", ") + "}"), nil
+				out := "{" + strings.Join(parts, ", ") + "}"
+				if err := checkJSONTextDepth(out); err != nil {
+					return Value{}, err
+				}
+				return JsonValue(out), nil
 			}
 			members := make([]JsonMember, 0, len(vals)/2)
 			for i := 0; i < len(vals); i += 2 {
@@ -3340,7 +3369,11 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				}
 				members = append(members, JsonMember{Key: key, Val: node})
 			}
-			return JsonbValue(makeObject(members)), nil
+			out := makeObject(members)
+			if err := checkJSONDepth(&out); err != nil {
+				return Value{}, err
+			}
+			return JsonbValue(out), nil
 		}
 	case reJsonObject:
 		// json_object / jsonb_object (json-sql-functions.md §2): build an object from text array(s).
@@ -3458,6 +3491,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
+		// Inserting a document inside another can deepen the result (json.md §6.4).
+		if err := checkJSONDepth(&out); err != nil {
+			return Value{}, err
+		}
 		return JsonbValue(out), nil
 	case reJsonPathFn:
 		// A scalar jsonpath query function (P2, jsonpath.md §5). STRICT: a NULL ctx/path → NULL.
@@ -3503,7 +3540,12 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			return NullValue(), nil
 		default: // jpfQueryArray
-			return JsonbValue(JsonNode{Kind: JArray, Arr: seq}), nil
+			// Wrapping the items in an array can deepen the result (json.md §6.4).
+			out := JsonNode{Kind: JArray, Arr: seq}
+			if err := checkJSONDepth(&out); err != nil {
+				return Value{}, err
+			}
+			return JsonbValue(out), nil
 		}
 	case reJsonSqlFn:
 		// A SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY (json-sql-functions.md §5,

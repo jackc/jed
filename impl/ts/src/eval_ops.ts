@@ -26,7 +26,7 @@ import {
   nullValue,
   textValue,
 } from "./value.ts";
-import { jsonCompactOut } from "./json.ts";
+import { checkDepth as jsonCheckDepth, jsonCompactOut } from "./json.ts";
 import { type QueryAccount, StateCharge } from "./cost.ts";
 import { entryBytes } from "./memsize.ts";
 import { arraySubscriptErr, distinctRowKey, promote, rtName, valueToNode } from "./executor.ts";
@@ -123,7 +123,10 @@ export function evalArrayFunc(func: ArrayFuncName, vals: Value[]): Value {
       // a multidimensional array propagates the to_jsonb 0A000.
       const a = vals[0]!;
       if (a.kind === "null") return nullValue();
-      return jsonValue(jsonCompactOut(valueToNode(a)));
+      // An array of json/jsonb elements nests them one level (json.md §6.4).
+      const node = valueToNode(a);
+      jsonCheckDepth(node);
+      return jsonValue(jsonCompactOut(node));
     }
     case "contains":
       return arrayContainsValue(vals[0]!, vals[1]!);

@@ -89,8 +89,10 @@ serving untrusted SQL. The scalar allocation budget below covers specific expand
   jed parses one statement per call, this also bounds the parse tree's size (a million-column
   `SELECT` is just bytes).
 
-Three further limits are fixed engine constants (no configuration): a statement may not nest
+Four further limits are fixed engine constants (no configuration): a statement may not nest
 expressions/subqueries more than **256** deep (`54001`), a single identifier may not exceed
-**63 bytes** (`42622`), and a composite type may not nest more than **32** composites deep
-(`54001` at `CREATE TYPE` — a chain of small `CREATE TYPE`s that the input-size cap can't see).
-Each limit is deterministic and identical across the Rust, Go, and TypeScript cores.
+**63 bytes** (`42622`), a composite type may not nest more than **32** composites deep
+(`54001` at `CREATE TYPE` — a chain of small `CREATE TYPE`s that the input-size cap can't see),
+and a `json`/`jsonb` document or `jsonpath` may not nest more than **256** levels deep (`54001`
+when it is parsed or built — a short string such as `repeat('[', 100000)` can't overflow the
+stack). Each limit is deterministic and identical across the Rust, Go, and TypeScript cores.

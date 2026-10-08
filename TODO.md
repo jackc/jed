@@ -330,6 +330,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ## Resource admission follow-through
 
+- [x] **JSON nesting-depth limit.** A fixed `MAX_JSON_DEPTH = 256` bounds every `json`/`jsonb`
+  document where it is produced: the text parser and every nesting constructor (builders,
+  aggregates, `to_json[b]`/`array_to_json`, `||`, `jsonb_set`/`jsonb_insert`,
+  `jsonb_path_query_array`, the `JSON_QUERY` wrapper) raise `54001`, and the on-disk `jsonb`
+  decoder raises `XX001`. The jsonpath compiler bounds its own nesting at the same 256,
+  `JSON_TABLE NESTED PATH` counts toward `MAX_EXPR_DEPTH`, and `array_in` stops at the 7th brace.
+  This closes the native-stack crash from untrusted deeply nested JSON. See
+  [json.md §6.4](spec/design/json.md) and `resource/json_depth_limit.test`.
+  - [ ] _follow-on:_ when jsonpath `.**` lands, keep its recursive descent bounded by document
+    depth; when a storable `jsonpath` column lands, its decoder must re-run the compiler's
+    nesting gate (`XX001` on a crafted body).
 - [x] Proportional UTF-8 work charging and pre-allocation byte guards for repeat/padding;
   guarded decimal transcendental entry/series/range-reduction/power steps; finite 64 MiB
   cumulative scalar allocation allowance (`max_scalar_bytes`, `54P04`), shared across

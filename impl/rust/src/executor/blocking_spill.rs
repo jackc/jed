@@ -1028,6 +1028,8 @@ impl Engine {
                         out.push_str(&json::jsonb_out(&node));
                     }
                     out.push(']');
+                    // The aggregate nests each input one level (json.md §6.4).
+                    json::check_text_depth(&out)?;
                     Ok(Value::Json(out))
                 } else {
                     let mut nodes = Vec::new();
@@ -1037,7 +1039,9 @@ impl Engine {
                         };
                         nodes.push(node);
                     }
-                    Ok(Value::Jsonb(JsonNode::Array(nodes)))
+                    let out = JsonNode::Array(nodes);
+                    json::check_depth(&out)?;
+                    Ok(Value::Jsonb(out))
                 }
             }
             Acc::JsonObjectAgg {
@@ -1065,6 +1069,7 @@ impl Engine {
                         out.push_str(&elem_json_text(&value)?);
                     }
                     out.push_str(" }");
+                    json::check_text_depth(&out)?;
                     Ok(Value::Json(out))
                 } else {
                     // Convert every input value in original order before sorting/dedup, including
@@ -1099,7 +1104,9 @@ impl Engine {
                         }
                         members.push((key, value));
                     }
-                    Ok(Value::Jsonb(JsonNode::Object(members)))
+                    let out = JsonNode::Object(members);
+                    json::check_depth(&out)?;
+                    Ok(Value::Jsonb(out))
                 }
             }
             other => other.finalize(),

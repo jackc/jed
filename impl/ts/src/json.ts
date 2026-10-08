@@ -134,6 +134,68 @@ export function keyCmp(a: string, b: string): number {
 // verbatim.
 // ---------------------------------------------------------------------------------------------
 
+// MAX_JSON_DEPTH is the maximum nesting depth of a `json`/`jsonb` document (spec/design/json.md
+// §6.4): the largest number of containers (arrays/objects) on any root-to-leaf path — a scalar is
+// depth 0, `[]` depth 1. Every producer (the text parser, the constructors, the on-disk decoder)
+// enforces it, so every recursive walk over a node (compare, render, codec, containment) is bounded
+// by it — a deeply nested untrusted document would otherwise overflow V8's call stack as an uncoded
+// RangeError. A fixed, cross-core constant sized for the weakest core's native stack; it also
+// bounds jsonpath program nesting.
+export const MAX_JSON_DEPTH = 256;
+
+// tooDeep is `54001` statement_too_complex — a document (or constructor result) deeper than
+// MAX_JSON_DEPTH (spec/design/json.md §6.4).
+export function tooDeep(): EngineError {
+  return engineError(
+    "statement_too_complex",
+    `json nesting depth exceeds the maximum of ${MAX_JSON_DEPTH}`,
+  );
+}
+
+// checkDepth enforces MAX_JSON_DEPTH on a constructed `jsonb` node — the constructor gate (json.md
+// §6.4): an operation that nests existing values inside a new container checks its result. The walk
+// stops one level past the limit, so it never recurses deeper than MAX_JSON_DEPTH + 1.
+export function checkDepth(node: JsonNode): void {
+  if (exceedsDepth(node, MAX_JSON_DEPTH)) throw tooDeep();
+}
+
+// exceedsDepth reports whether `node` nests more than `budget` containers deep.
+function exceedsDepth(node: JsonNode, budget: number): boolean {
+  if (node.kind === "array") {
+    return budget === 0 || node.elements.some((e) => exceedsDepth(e, budget - 1));
+  }
+  if (node.kind === "object") {
+    return budget === 0 || node.members.some((m) => exceedsDepth(m.value, budget - 1));
+  }
+  return false;
+}
+
+// checkTextDepth enforces MAX_JSON_DEPTH on a constructed textual `json` value (json.md §6.4) — a
+// NON-recursive bracket scan of well-formed JSON text (brackets inside strings are skipped). Scans
+// UTF-16 code units: every structural character is ASCII, and a surrogate never equals one.
+export function checkTextDepth(text: string): void {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === 0x5c /* \ */) escaped = true;
+      else if (c === 0x22 /* " */) inString = false;
+      continue;
+    }
+    if (c === 0x22 /* " */) {
+      inString = true;
+    } else if (c === 0x5b /* [ */ || c === 0x7b /* { */) {
+      depth++;
+      if (depth > MAX_JSON_DEPTH) throw tooDeep();
+    } else if (c === 0x5d /* ] */ || c === 0x7d /* } */) {
+      if (depth > 0) depth--;
+    }
+  }
+}
+
 function malformed(detail: string): Error {
   return engineError(
     "invalid_text_representation",
@@ -179,6 +241,9 @@ class JsonParser {
   // canonicalize: when true (jsonb), objects dedup last-wins and sort keys; when false (json
   // validation / on-demand parse), members are kept in input order with duplicates.
   private canonicalize: boolean;
+  // depth: the current container nesting depth (spec/design/json.md §6.4) — entering the
+  // MAX_JSON_DEPTH + 1-th `[`/`{` aborts 54001 before parsing anything inside it.
+  private depth = 0;
 
   constructor(buf: Uint8Array, canonicalize: boolean) {
     this.buf = buf;
@@ -210,11 +275,27 @@ class JsonParser {
     return this.pos < this.buf.length ? this.buf[this.pos]! : -1;
   }
 
+  // descend enters one container level, enforcing MAX_JSON_DEPTH (json.md §6.4).
+  private descend(): void {
+    this.depth++;
+    if (this.depth > MAX_JSON_DEPTH) throw tooDeep();
+  }
+
   private parseValue(): JsonNode {
     const c = this.peek();
     if (c === -1) throw malformed("unexpected end of input");
-    if (c === 0x7b /* { */) return this.parseObject();
-    if (c === 0x5b /* [ */) return this.parseArray();
+    if (c === 0x7b /* { */) {
+      this.descend();
+      const node = this.parseObject();
+      this.depth--;
+      return node;
+    }
+    if (c === 0x5b /* [ */) {
+      this.descend();
+      const node = this.parseArray();
+      this.depth--;
+      return node;
+    }
     if (c === 0x22 /* " */) return { kind: "string", value: this.parseString() };
     if (c === 0x74 /* t */) {
       this.expectKeyword("true");

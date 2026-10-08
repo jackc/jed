@@ -51,9 +51,12 @@ pub(crate) fn eval_array_func(func: &ArrayFunc, vals: &[Value]) -> Result<Value>
         // a multidimensional array propagates the to_jsonb 0A000.
         ArrayFunc::ArrayToJson => match &vals[0] {
             Value::Null => Ok(Value::Null),
-            _ => Ok(Value::Json(json::json_compact_out(&value_to_node(
-                &vals[0],
-            )?))),
+            _ => {
+                // An array of json/jsonb elements nests them one level (json.md §6.4).
+                let node = value_to_node(&vals[0])?;
+                json::check_depth(&node)?;
+                Ok(Value::Json(json::json_compact_out(&node)))
+            }
         },
         // array_length / array_lower / array_upper (anyarray, dim): propagate either NULL arg,
         // and return NULL for an empty array or an out-of-range dimension.

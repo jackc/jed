@@ -149,6 +149,89 @@ func jsonbValueEqual(a, b *JsonNode) bool { return a.Cmp(b) == 0 }
 // verbatim.
 // ---------------------------------------------------------------------------------------------
 
+// maxJSONDepth is the maximum nesting depth of a `json`/`jsonb` document (spec/design/json.md §6.4):
+// the largest number of containers (arrays/objects) on any root-to-leaf path — a scalar is depth 0,
+// `[]` depth 1. Every producer (the text parser, the constructors, the on-disk decoder) enforces it,
+// so every recursive walk over a node (compare, render, codec) is bounded by it. A fixed, cross-core
+// constant sized for the weakest core's native stack; also bounds jsonpath nesting.
+const maxJSONDepth = 256
+
+// jsonTooDeep is `54001` statement_too_complex — a document (or constructor result) deeper than
+// maxJSONDepth (spec/design/json.md §6.4).
+func jsonTooDeep() error {
+	return newError(StatementTooComplex,
+		"json nesting depth exceeds the maximum of "+strconv.Itoa(maxJSONDepth))
+}
+
+// checkJSONDepth enforces maxJSONDepth on a constructed `jsonb` node — the constructor gate
+// (json.md §6.4): an operation that nests existing values inside a new container checks its result.
+// The walk stops one level past the limit, so it never recurses deeper than maxJSONDepth + 1.
+func checkJSONDepth(node *JsonNode) error {
+	if jsonExceedsDepth(node, maxJSONDepth) {
+		return jsonTooDeep()
+	}
+	return nil
+}
+
+// jsonExceedsDepth reports whether node nests more than budget containers deep.
+func jsonExceedsDepth(node *JsonNode, budget int) bool {
+	switch node.Kind {
+	case JArray:
+		if budget == 0 {
+			return true
+		}
+		for i := range node.Arr {
+			if jsonExceedsDepth(&node.Arr[i], budget-1) {
+				return true
+			}
+		}
+	case JObject:
+		if budget == 0 {
+			return true
+		}
+		for i := range node.Obj {
+			if jsonExceedsDepth(&node.Obj[i].Val, budget-1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// checkJSONTextDepth enforces maxJSONDepth on a constructed textual `json` value (json.md §6.4) —
+// a NON-recursive bracket scan of well-formed JSON text (brackets inside strings are skipped).
+func checkJSONTextDepth(text string) error {
+	depth := 0
+	inString, escaped := false, false
+	for i := 0; i < len(text); i++ {
+		b := text[i]
+		if inString {
+			if escaped {
+				escaped = false
+			} else if b == '\\' {
+				escaped = true
+			} else if b == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch b {
+		case '"':
+			inString = true
+		case '[', '{':
+			depth++
+			if depth > maxJSONDepth {
+				return jsonTooDeep()
+			}
+		case ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		}
+	}
+	return nil
+}
+
 func jsonMalformed(detail string) error {
 	return newError(InvalidTextRepresentation, "invalid input syntax for type json: "+detail)
 }
@@ -183,6 +266,18 @@ type jsonParser struct {
 	// canonicalize: when true (jsonb), objects dedup last-wins and sort keys; when false (json
 	// validation / on-demand parse), members are kept in input order with duplicates.
 	canonicalize bool
+	// depth is the current container nesting depth (spec/design/json.md §6.4): entering the
+	// maxJSONDepth+1-th `[`/`{` aborts 54001 before parsing anything inside it.
+	depth int
+}
+
+// descend enters one container level, enforcing maxJSONDepth (json.md §6.4).
+func (p *jsonParser) descend() error {
+	p.depth++
+	if p.depth > maxJSONDepth {
+		return jsonTooDeep()
+	}
+	return nil
 }
 
 // parseDocument parses a full JSON document: one value, surrounded by optional whitespace, nothing
@@ -226,9 +321,19 @@ func (p *jsonParser) parseValue() (JsonNode, error) {
 	}
 	switch {
 	case c == '{':
-		return p.parseObject()
+		if err := p.descend(); err != nil {
+			return JsonNode{}, err
+		}
+		node, err := p.parseObject()
+		p.depth--
+		return node, err
 	case c == '[':
-		return p.parseArray()
+		if err := p.descend(); err != nil {
+			return JsonNode{}, err
+		}
+		node, err := p.parseArray()
+		p.depth--
+		return node, err
 	case c == '"':
 		s, err := p.parseString()
 		if err != nil {

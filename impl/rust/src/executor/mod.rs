@@ -4466,6 +4466,9 @@ fn eval_json_sql_result(
                     seq.into_iter().next().unwrap()
                 }
             };
+            // A wrapper nests the items one level (json.md §6.4) — not a SQL/JSON error, so it is
+            // raised regardless of ON ERROR.
+            json::check_depth(&node)?;
             json_node_as_returning(node, returning, env, meter)
         }
     }

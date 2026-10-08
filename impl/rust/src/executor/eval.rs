@@ -659,7 +659,12 @@ impl RExpr {
                 let bv = b.eval(row, env, m)?;
                 m.guard()?;
                 match (&av, &bv) {
-                    (Value::Jsonb(na), Value::Jsonb(nb)) => Ok(Value::Jsonb(json::concat(na, nb))),
+                    (Value::Jsonb(na), Value::Jsonb(nb)) => {
+                        // Wrapping a non-array operand can deepen the result (json.md §6.4).
+                        let out = json::concat(na, nb);
+                        json::check_depth(&out)?;
+                        Ok(Value::Jsonb(out))
+                    }
                     (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
                     _ => unreachable!("resolver guarantees jsonb operands for ||"),
                 }
@@ -741,6 +746,8 @@ impl RExpr {
                         json::insert_path(&node, &path, &value_node, flag)?
                     }
                 };
+                // Inserting a document inside another can deepen the result (json.md §6.4).
+                json::check_depth(&out)?;
                 Ok(Value::Jsonb(out))
             }
             // json_object / jsonb_object (json-sql-functions.md §2): build an object from text array(s).
@@ -830,7 +837,12 @@ impl RExpr {
                     JsonPathFnKind::QueryFirst => {
                         Ok(seq.into_iter().next().map_or(Value::Null, Value::Jsonb))
                     }
-                    JsonPathFnKind::QueryArray => Ok(Value::Jsonb(JsonNode::Array(seq))),
+                    JsonPathFnKind::QueryArray => {
+                        // Wrapping the items in an array can deepen the result (json.md §6.4).
+                        let out = JsonNode::Array(seq);
+                        json::check_depth(&out)?;
+                        Ok(Value::Jsonb(out))
+                    }
                     // jsonb_path_match: the path must produce EXACTLY one boolean item.
                     JsonPathFnKind::Match => match seq.as_slice() {
                         [JsonNode::Bool(b)] => Ok(Value::Bool(*b)),
@@ -2262,7 +2274,12 @@ impl RExpr {
                         let node = json_arg_node(&vals[0])?;
                         Ok(Value::Text(json::pretty(&node)))
                     }
-                    ScalarFunc::ToJsonb => Ok(Value::Jsonb(value_to_node(&vals[0])?)),
+                    ScalarFunc::ToJsonb => {
+                        // An array of json/jsonb elements nests them one level (json.md §6.4).
+                        let out = value_to_node(&vals[0])?;
+                        json::check_depth(&out)?;
+                        Ok(Value::Jsonb(out))
+                    }
                     // JSON_SCALAR(v) → the value's JSON scalar as `json` (number/boolean/string). The
                     // datetime/uuid/bytea/interval/float sources are a deferred 0A000 follow-on.
                     ScalarFunc::JsonScalar => {
@@ -2289,7 +2306,11 @@ impl RExpr {
                     // to_json → the value's `json` image: a jsonb input renders canonical-spaced, a
                     // json input verbatim, everything else the compact to_jsonb render (PG's
                     // datum_to_json). This is the same per-type rule the json builders embed.
-                    ScalarFunc::ToJson => Ok(Value::Json(elem_json_text(&vals[0])?)),
+                    ScalarFunc::ToJson => {
+                        let out = elem_json_text(&vals[0])?;
+                        json::check_text_depth(&out)?;
+                        Ok(Value::Json(out))
+                    }
                     // length(text) → i32 — the number of characters (Unicode code points). Rust
                     // String is UTF-8, so `chars()` yields one item per code point (string-functions.md §3).
                     ScalarFunc::Length => match &vals[0] {
@@ -2615,13 +2636,18 @@ impl RExpr {
                             for v in &vals {
                                 parts.push(elem_json_text(v)?);
                             }
-                            Ok(Value::Json(format!("[{}]", parts.join(", "))))
+                            // The builders nest their arguments one level (json.md §6.4).
+                            let out = format!("[{}]", parts.join(", "));
+                            json::check_text_depth(&out)?;
+                            Ok(Value::Json(out))
                         } else {
                             let mut nodes = Vec::with_capacity(vals.len());
                             for v in &vals {
                                 nodes.push(value_to_node(v)?);
                             }
-                            Ok(Value::Jsonb(JsonNode::Array(nodes)))
+                            let out = JsonNode::Array(nodes);
+                            json::check_depth(&out)?;
+                            Ok(Value::Jsonb(out))
                         }
                     }
                     JsonBuildKind::Object => {
@@ -2641,14 +2667,18 @@ impl RExpr {
                                     elem_json_text(&pair[1])?
                                 ));
                             }
-                            Ok(Value::Json(format!("{{{}}}", parts.join(", "))))
+                            let out = format!("{{{}}}", parts.join(", "));
+                            json::check_text_depth(&out)?;
+                            Ok(Value::Json(out))
                         } else {
                             let mut members = Vec::with_capacity(vals.len() / 2);
                             for (i, pair) in vals.chunks_exact(2).enumerate() {
                                 let key = object_key_text(&pair[0], 2 * i + 1)?;
                                 members.push((key, value_to_node(&pair[1])?));
                             }
-                            Ok(Value::Jsonb(json::make_object(members)))
+                            let out = json::make_object(members);
+                            json::check_depth(&out)?;
+                            Ok(Value::Jsonb(out))
                         }
                     }
                 }

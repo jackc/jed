@@ -1578,8 +1578,9 @@ once at each point the AST gains a level: every binary-operator chain step (`OR`
 additive/multiplicative loops), every unary (`NOT`, unary `-`), every postfix
 (`::`cast / `[…]`subscript / `.field`), every re-entry into a fresh expression (parenthesized
 sub-expression, `ARRAY`/`ROW`/function-argument/`CASE`/subscript-index operand), every nested
-**scalar subquery / `EXISTS` / `IN (SELECT …)`**, and every **set-operation** branch
-(`UNION`/`INTERSECT`/`EXCEPT` chain). When the counter exceeds **`MAX_EXPR_DEPTH = 256`** the
+**scalar subquery / `EXISTS` / `IN (SELECT …)`**, every **set-operation** branch
+(`UNION`/`INTERSECT`/`EXCEPT` chain), and every **`JSON_TABLE … NESTED PATH … COLUMNS`** level
+([json.md §6.4](json.md)). When the counter exceeds **`MAX_EXPR_DEPTH = 256`** the
 parser aborts with **`54001` `statement_too_complex`** ([../errors/registry.toml](../errors/registry.toml)).
 
 Why enforce in the **parser** and not the evaluator: the parser is the *first* pass and the
@@ -1747,6 +1748,20 @@ both the native allocation and the per-input-position O(|program|) match work. A
 cross-core constant (§8) — pinned in `impl/go/spec_constants_test.go` and the
 [../conformance/suites/resource/regex_program_limit.test](../conformance/suites/resource/regex_program_limit.test)
 boundary entry (gated by `resource.regex_program_limit`; jed-specific, **not** oracle-checked).
+
+## 7d. JSON document and jsonpath nesting-depth limit (landed)
+
+The **fifth** structural-complexity trigger of `54001`. JSON documents nest arbitrarily, and every
+core walks them recursively (parser, `jsonb` codec, comparator, renderers, containment, mutators).
+A 400 KB string like `rpad(repeat('[', 200000), 400000, ']')` crashed the Rust core and raised an
+uncoded `RangeError` in TS. Neither §7 nor §7a sees it, because the depth lives inside a *value*,
+not in the statement's syntax tree. The full design is [json.md §6.4](json.md): a fixed
+**`MAX_JSON_DEPTH = 256`** is enforced where documents are produced. The text parser and every
+constructor that nests values in a new container raise `54001`. A stored `jsonb` body deeper than
+the limit is `XX001` (a crafted file, like §7b's catalog check). The jsonpath compiler counts its
+own nesting against the same 256 (`54001`). A deterministic cross-core constant (§8), pinned by
+[../conformance/suites/resource/json_depth_limit.test](../conformance/suites/resource/json_depth_limit.test)
+(gated by `resource.json_depth_limit`; jed-specific, **not** oracle-checked).
 
 ## 8. Result-amplifying scalars and decimal transcendental work
 

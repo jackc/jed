@@ -132,6 +132,8 @@ import { not3, or3, valueCmp } from "./window.ts";
 import type { JsonMember, JsonNode } from "./json.ts";
 import {
   arrayLength as jsonArrayLength,
+  checkDepth as jsonCheckDepth,
+  checkTextDepth as jsonCheckTextDepth,
   concat as jsonConcatKernel,
   contains as jsonContainsKernel,
   deleteIndex as jsonDeleteIndex,
@@ -599,7 +601,10 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (av.kind === "null" || bv.kind === "null") return nullValue();
       if (av.kind !== "jsonb" || bv.kind !== "jsonb")
         throw new Error("resolver guarantees jsonb operands for ||");
-      return jsonbValue(jsonConcatKernel(av.node, bv.node));
+      // Wrapping a non-array operand can deepen the result (json.md §6.4).
+      const out = jsonConcatKernel(av.node, bv.node);
+      jsonCheckDepth(out);
+      return jsonbValue(out);
     }
     case "jsonDelete": {
       // `jsonb - text|int|text[]` / `jsonb #- text[]` mutation deletes (json-sql-functions.md §1,
@@ -1331,13 +1336,18 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (e.func === "to_jsonb") {
         // to_jsonb(anyelement) → the JSON image of the value (json-sql-functions.md §2). STRICT:
         // the NULL-input case is handled by the blanket propagation above.
-        return jsonbValue(valueToNode(vals[0]!));
+        // An array of json/jsonb elements nests them one level (json.md §6.4).
+        const out = valueToNode(vals[0]!);
+        jsonCheckDepth(out);
+        return jsonbValue(out);
       }
       if (e.func === "to_json") {
         // to_json(anyelement) → the value's `json` image: a jsonb input renders canonical-spaced, a
         // json input verbatim, everything else the compact to_jsonb render (PG's datum_to_json) —
         // the same per-type rule the json builders embed. STRICT (NULL handled above).
-        return jsonValue(elemJsonText(vals[0]!));
+        const out = elemJsonText(vals[0]!);
+        jsonCheckTextDepth(out);
+        return jsonValue(out);
       }
       if (e.func === "json_scalar") {
         // JSON_SCALAR(v) → the value's JSON scalar as `json` (number/boolean/string), rendered
@@ -1794,10 +1804,15 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         if (e.json) {
           // json_build_array → a `json` value: each element's own json text image (a json arg
           // verbatim, a jsonb arg spaced, else compact), joined `, ` inside `[...]`.
-          return jsonValue(`[${vals.map(elemJsonText).join(", ")}]`);
+          // The builders nest their arguments one level (json.md §6.4).
+          const out = `[${vals.map(elemJsonText).join(", ")}]`;
+          jsonCheckTextDepth(out);
+          return jsonValue(out);
         }
         // jsonb_build_array → a jsonb value: each argument's valueToNode image, canonical render.
-        return jsonbValue({ kind: "array", elements: vals.map(valueToNode) });
+        const out: JsonNode = { kind: "array", elements: vals.map(valueToNode) };
+        jsonCheckDepth(out);
+        return jsonbValue(out);
       }
       // object
       if (vals.length % 2 !== 0) {
@@ -1817,7 +1832,9 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
             `${jsonCompactOut({ kind: "string", value: key })} : ${elemJsonText(vals[i + 1]!)}`,
           );
         }
-        return jsonValue(`{${parts.join(", ")}}`);
+        const out = `{${parts.join(", ")}}`;
+        jsonCheckTextDepth(out);
+        return jsonValue(out);
       }
       // jsonb_build_object → a jsonb object: (key, valueToNode) members, last-wins dedup + canonical
       // key sort via makeObject.
@@ -1826,7 +1843,9 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const key = objectKeyText(vals[i]!, i + 1);
         members.push({ key, value: valueToNode(vals[i + 1]!) });
       }
-      return jsonbValue(jsonMakeObject(members));
+      const out = jsonMakeObject(members);
+      jsonCheckDepth(out);
+      return jsonbValue(out);
     }
     case "jsonSetInsert": {
       // jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL argument
@@ -1859,6 +1878,8 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         e.mode === "set"
           ? jsonSetPathKernel(node, path, valueNode, flag)
           : jsonInsertPathKernel(node, path, valueNode, flag);
+      // Inserting a document inside another can deepen the result (json.md §6.4).
+      jsonCheckDepth(out);
       return jsonbValue(out);
     }
     case "jsonObjectFromArrays": {
@@ -1922,8 +1943,12 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           return boolValue(seq.length > 0);
         case "queryFirst":
           return seq.length > 0 ? jsonbValue(seq[0]!) : nullValue();
-        case "queryArray":
-          return jsonbValue({ kind: "array", elements: seq });
+        case "queryArray": {
+          // Wrapping the items in an array can deepen the result (json.md §6.4).
+          const out: JsonNode = { kind: "array", elements: seq };
+          jsonCheckDepth(out);
+          return jsonbValue(out);
+        }
         case "match": {
           // jsonb_path_match: the path must produce EXACTLY one boolean item.
           if (seq.length === 1 && seq[0]!.kind === "bool") {

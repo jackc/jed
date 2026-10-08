@@ -10,7 +10,7 @@
 //! the conformance suite (CLAUDE.md §5: a hand-written parser, never codegenned).
 
 use crate::error::{EngineError, Result};
-use crate::json::JsonNode;
+use crate::json::{JsonNode, MAX_JSON_DEPTH};
 use crate::sqlstate::SqlState;
 
 /// A compiled jsonpath.
@@ -112,6 +112,7 @@ impl JsonPath {
         let mut p = Parser {
             s: src.as_bytes(),
             i: 0,
+            depth: 0,
         };
         p.skip_ws();
         // Optional mode word: `strict` / `lax` (default lax).
@@ -625,9 +626,26 @@ fn is_member_cont(c: u8) -> bool {
 struct Parser<'a> {
     s: &'a [u8],
     i: usize,
+    /// The program nesting depth (spec/design/json.md §6.4): +1 per filter `?(`, parenthesized
+    /// group, `!`, and `&&`/`||` chain step, bounded by [`MAX_JSON_DEPTH`] → `54001`. Bounding it at
+    /// the compiler bounds every derived walk (render, evaluate, `Clone`/`Drop`).
+    depth: usize,
 }
 
 impl Parser<'_> {
+    /// Descend one program nesting level, enforcing [`MAX_JSON_DEPTH`] (json.md §6.4). The caller
+    /// restores it on the success path (an error aborts the whole compile).
+    fn deepen(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > MAX_JSON_DEPTH {
+            return Err(EngineError::new(
+                SqlState::StatementTooComplex,
+                format!("jsonpath nesting depth exceeds the maximum of {MAX_JSON_DEPTH}"),
+            ));
+        }
+        Ok(())
+    }
+
     fn peek(&self) -> Option<u8> {
         self.s.get(self.i).copied()
     }
@@ -830,7 +848,9 @@ impl Parser<'_> {
                     if !self.eat(b'(') {
                         return Err(malformed("expected `(` after `?`"));
                     }
+                    self.deepen()?;
                     let pred = self.parse_pred()?;
+                    self.depth -= 1;
                     self.skip_ws();
                     if !self.eat(b')') {
                         return Err(malformed("expected `)` after a filter predicate"));
@@ -846,12 +866,17 @@ impl Parser<'_> {
     /// Parse a filter predicate (P1b comparison subset): `||` over `&&` over `!` / `(…)` / comparison.
     fn parse_pred(&mut self) -> Result<Pred> {
         let mut left = self.parse_and()?;
+        // Each `||` step deepens the left-deep tree by one level (json.md §6.4).
+        let mut steps = 0;
         loop {
             self.skip_ws();
             if self.eat_op(b"||") {
+                self.deepen()?;
+                steps += 1;
                 let right = self.parse_and()?;
                 left = Pred::Or(Box::new(left), Box::new(right));
             } else {
+                self.depth -= steps;
                 return Ok(left);
             }
         }
@@ -859,12 +884,17 @@ impl Parser<'_> {
 
     fn parse_and(&mut self) -> Result<Pred> {
         let mut left = self.parse_not()?;
+        // Each `&&` step deepens the left-deep tree by one level (json.md §6.4).
+        let mut steps = 0;
         loop {
             self.skip_ws();
             if self.eat_op(b"&&") {
+                self.deepen()?;
+                steps += 1;
                 let right = self.parse_not()?;
                 left = Pred::And(Box::new(left), Box::new(right));
             } else {
+                self.depth -= steps;
                 return Ok(left);
             }
         }
@@ -877,7 +907,9 @@ impl Parser<'_> {
             if !self.eat(b'(') {
                 return Err(malformed("expected `(` after `!`"));
             }
+            self.deepen()?;
             let inner = self.parse_pred()?;
+            self.depth -= 1;
             self.skip_ws();
             if !self.eat(b')') {
                 return Err(malformed("expected `)` after `!(`"));
@@ -886,7 +918,9 @@ impl Parser<'_> {
         }
         if self.peek() == Some(b'(') {
             self.i += 1;
+            self.deepen()?;
             let inner = self.parse_pred()?;
+            self.depth -= 1;
             self.skip_ws();
             if !self.eat(b')') {
                 return Err(malformed("expected `)` in predicate"));

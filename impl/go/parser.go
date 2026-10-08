@@ -3362,10 +3362,16 @@ func (p *parser) parseJtColumn() (jtColumn, error) {
 		if err := p.expectKeyword("columns"); err != nil {
 			return nil, err
 		}
+		// Each NESTED level is one more nesting level of the statement (cost.md §7, json.md §6.4):
+		// a deep NESTED chain recurses in the parser and the planner.
+		if err := p.deepen(); err != nil {
+			return nil, err
+		}
 		columns, err := p.parseJtColumns()
 		if err != nil {
 			return nil, err
 		}
+		p.undeepen()
 		return &jtColumnNested{Path: path, Columns: columns}, nil
 	}
 	name, err := p.expectIdentifier()

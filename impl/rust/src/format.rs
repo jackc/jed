@@ -28,7 +28,7 @@ use crate::encoding::{decode_int, encode_nullable};
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{ColumnStatistics, Engine, Snapshot, StatisticsValue};
 use crate::interval::Interval;
-use crate::json::JsonNode;
+use crate::json::{self, JsonNode};
 use crate::pager::Pager;
 use crate::paging::SharedPaging;
 use crate::pmap::{Child, Node};
@@ -626,6 +626,18 @@ fn encode_jsonb_body(node: &JsonNode, out: &mut Vec<u8>) {
 /// walked identically (every tag / varint / recursion) but no [`JsonNode`] is built — the
 /// returned node is an unobserved placeholder, discarded by the caller (lazy-record.md §6).
 fn decode_jsonb_body(buf: &[u8], pos: &mut usize, mode: DecodeMode) -> Result<JsonNode> {
+    decode_jsonb_node(buf, pos, mode, 0)
+}
+
+/// [`decode_jsonb_body`] at container nesting `depth`. A conformant engine never writes a body
+/// deeper than [`json::MAX_JSON_DEPTH`], so entering a deeper container is `XX001` — checked
+/// BEFORE recursing, which bounds this decoder's own native recursion (spec/design/json.md §6.4).
+fn decode_jsonb_node(
+    buf: &[u8],
+    pos: &mut usize,
+    mode: DecodeMode,
+    depth: usize,
+) -> Result<JsonNode> {
     let tag = read_u8(buf, pos)?;
     if tag & 0xf0 != 0 {
         return Err(corrupt("jsonb node tag has a reserved flag bit set"));
@@ -648,6 +660,7 @@ fn decode_jsonb_body(buf: &[u8], pos: &mut usize, mode: DecodeMode) -> Result<Js
             "jsonb string-dictionary reference before the dictionary slice",
         )),
         x if x == NTAG_ARRAY => {
+            let depth = jsonb_descend(depth)?;
             let count = read_uvarint(buf, pos)? as usize;
             let mut elems = if mode.constructs() {
                 Vec::with_capacity(count.min(1024))
@@ -655,7 +668,7 @@ fn decode_jsonb_body(buf: &[u8], pos: &mut usize, mode: DecodeMode) -> Result<Js
                 Vec::new()
             };
             for _ in 0..count {
-                let e = decode_jsonb_body(buf, pos, mode)?;
+                let e = decode_jsonb_node(buf, pos, mode, depth)?;
                 if mode.constructs() {
                     elems.push(e);
                 }
@@ -663,6 +676,7 @@ fn decode_jsonb_body(buf: &[u8], pos: &mut usize, mode: DecodeMode) -> Result<Js
             Ok(JsonNode::Array(elems))
         }
         x if x == NTAG_OBJECT => {
+            let depth = jsonb_descend(depth)?;
             let count = read_uvarint(buf, pos)? as usize;
             let mut members = if mode.constructs() {
                 Vec::with_capacity(count.min(1024))
@@ -684,7 +698,7 @@ fn decode_jsonb_body(buf: &[u8], pos: &mut usize, mode: DecodeMode) -> Result<Js
                     }
                     _ => return Err(corrupt("jsonb object key is not a string node")),
                 };
-                let val = decode_jsonb_body(buf, pos, mode)?;
+                let val = decode_jsonb_node(buf, pos, mode, depth)?;
                 if mode.constructs() {
                     // Construct mode always yields a key (skip returns None and is never here).
                     members.push((key.expect("construct mode yields a jsonb key"), val));
@@ -694,6 +708,18 @@ fn decode_jsonb_body(buf: &[u8], pos: &mut usize, mode: DecodeMode) -> Result<Js
         }
         _ => Err(corrupt("unknown jsonb node tag")),
     }
+}
+
+/// Enter one `jsonb` container level while decoding: the new depth, or `XX001` past
+/// [`json::MAX_JSON_DEPTH`] (spec/design/json.md §6.4 gate 3).
+fn jsonb_descend(depth: usize) -> Result<usize> {
+    if depth >= json::MAX_JSON_DEPTH {
+        return Err(corrupt(&format!(
+            "jsonb nesting depth exceeds the maximum of {}",
+            json::MAX_JSON_DEPTH
+        )));
+    }
+    Ok(depth + 1)
 }
 
 /// Read a `NTAG_STRING` payload (`varint len ‖ UTF-8 bytes`) after its tag has been consumed.
@@ -6306,6 +6332,34 @@ mod tests {
                         "self-resolution equals context resolution"
                     );
                 }
+            }
+        }
+    }
+
+    /// A stored `jsonb` body deeper than `MAX_JSON_DEPTH` can only come from a crafted or corrupt
+    /// file — every producer rejects one (spec/design/json.md §6.4). The decoder rejects it `XX001`
+    /// before recursing, in both decode modes (a 200 000-deep body would otherwise overflow the
+    /// stack), and still decodes a body exactly at the limit.
+    #[test]
+    fn jsonb_decode_rejects_over_deep_body() {
+        // `depth` nested one-element arrays around a JSON null: `06 01` per level, then `00`.
+        let body = |depth: usize| {
+            let mut b = [NTAG_ARRAY, 1].repeat(depth);
+            b.push(NTAG_NULL);
+            b
+        };
+        for mode in [DecodeMode::Construct, DecodeMode::Skip] {
+            let ok = body(json::MAX_JSON_DEPTH);
+            let mut pos = 0;
+            decode_jsonb_body(&ok, &mut pos, mode).expect("a body at the limit decodes");
+            assert_eq!(pos, ok.len());
+            for depth in [json::MAX_JSON_DEPTH + 1, 200_000] {
+                let err = decode_jsonb_body(&body(depth), &mut 0, mode).unwrap_err();
+                assert_eq!(err.code(), "XX001", "depth {depth}");
+                assert_eq!(
+                    err.message,
+                    "jsonb nesting depth exceeds the maximum of 256"
+                );
             }
         }
     }

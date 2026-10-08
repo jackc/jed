@@ -125,7 +125,9 @@ and derived-table paths already share:
 - **`name type EXISTS [PATH p]`** — `JSON_EXISTS` of `p` per row, coerced to `type`
   (typically `boolean`/`i32`).
 - **`NESTED [PATH] p [AS n] COLUMNS (…)`** — recursively expand a child path relative to the
-  current row item.
+  current row item. Each `NESTED` level adds one to the SQL parser's nesting counter
+  (`MAX_EXPR_DEPTH`, [cost.md §7](cost.md); [json.md §6.4](json.md)), so a deep `NESTED` chain is
+  `54001` at parse time.
 
 **The default plan (T1) — parent→child LEFT OUTER, sibling NESTED paths UNIONed:**
 

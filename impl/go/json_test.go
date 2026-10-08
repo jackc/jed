@@ -499,3 +499,46 @@ func TestJSONTableDeferredFeaturesAre0A000(t *testing.T) {
 		t.Errorf("unknown column type: got %s, want 42704", got)
 	}
 }
+
+// deepJsonbBody is a crafted jsonb body nested depth containers deep (spec/design/json.md §2): each
+// level a one-member container (an array, or an object keyed "a"), the innermost an empty array.
+func deepJsonbBody(depth int, object bool) []byte {
+	var buf []byte
+	for i := 0; i < depth-1; i++ {
+		if object {
+			buf = append(buf, ntagObject, 1, ntagString, 1, 'a')
+		} else {
+			buf = append(buf, ntagArray, 1)
+		}
+	}
+	return append(buf, ntagArray, 0)
+}
+
+// TestJsonbDecodeDepthLimit pins the on-disk decoder's nesting gate (spec/design/json.md §6.4 gate
+// 3) — the case the corpus cannot express, since no conformant engine writes such a body: a jsonb
+// body maxJSONDepth deep decodes, one level deeper is XX001 data_corrupted, in both the construct
+// and the skip (lazy-record.md §6) mode.
+func TestJsonbDecodeDepthLimit(t *testing.T) {
+	if maxJSONDepth != 256 {
+		t.Fatalf("maxJSONDepth = %d, want 256", maxJSONDepth)
+	}
+	for _, object := range []bool{false, true} {
+		for _, mode := range []decodeMode{decodeConstruct, decodeSkip} {
+			ok := deepJsonbBody(maxJSONDepth, object)
+			pos := 0
+			if _, err := decodeJsonbBody(ok, &pos, mode); err != nil {
+				t.Fatalf("object=%v mode=%d: depth %d should decode, got %v", object, mode, maxJSONDepth, err)
+			}
+			if pos != len(ok) {
+				t.Fatalf("object=%v mode=%d: decoded %d of %d bytes", object, mode, pos, len(ok))
+			}
+			pos = 0
+			_, err := decodeJsonbBody(deepJsonbBody(maxJSONDepth+1, object), &pos, mode)
+			ee, isEngine := err.(*EngineError)
+			if !isEngine || ee.Code() != "XX001" ||
+				ee.Message != "jsonb nesting depth exceeds the maximum of 256" {
+				t.Fatalf("object=%v mode=%d: depth %d = %v, want XX001 nesting depth", object, mode, maxJSONDepth+1, err)
+			}
+		}
+	}
+}

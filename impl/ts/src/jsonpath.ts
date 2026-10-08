@@ -15,7 +15,7 @@
 // member-key JSON-string escaping all match the Rust version.
 
 import { engineError, type EngineError } from "./errors.ts";
-import { jsonbIn, jsonCompactOut, jsonNodeCmp, type JsonNode } from "./json.ts";
+import { MAX_JSON_DEPTH, jsonbIn, jsonCompactOut, jsonNodeCmp, type JsonNode } from "./json.ts";
 
 // A subscript index: a non-negative integer literal or the `last` sentinel.
 export type Index = { kind: "number"; value: number } | { kind: "last" };
@@ -105,10 +105,27 @@ function isAsciiWhitespace(c: string): boolean {
 class Parser {
   private readonly s: string;
   private i: number;
+  // depth: the program nesting depth (spec/design/json.md §6.4) — +1 per filter `?(`, parenthesized
+  // group, `!`, and `&&`/`||` chain step, bounded by MAX_JSON_DEPTH → 54001. Bounding it at the
+  // compiler bounds every derived walk (render, evaluate).
+  private depth: number;
 
   constructor(src: string) {
     this.s = src;
     this.i = 0;
+    this.depth = 0;
+  }
+
+  // deepen descends one program nesting level, enforcing MAX_JSON_DEPTH (json.md §6.4). The caller
+  // restores it on the success path (an error aborts the whole compile).
+  private deepen(): void {
+    this.depth += 1;
+    if (this.depth > MAX_JSON_DEPTH) {
+      throw engineError(
+        "statement_too_complex",
+        `jsonpath nesting depth exceeds the maximum of ${MAX_JSON_DEPTH}`,
+      );
+    }
   }
 
   private peek(): string | undefined {
@@ -270,7 +287,9 @@ class Parser {
         if (!this.eat("(")) {
           throw malformed("expected `(` after `?`");
         }
+        this.deepen();
         const pred = this.parsePred();
+        this.depth -= 1;
         this.skipWs();
         if (!this.eat(")")) {
           throw malformed("expected `)` after a filter predicate");
@@ -286,12 +305,17 @@ class Parser {
   // Parse a filter predicate (P1b comparison subset): `||` over `&&` over `!` / `(…)` / comparison.
   private parsePred(): Pred {
     let left = this.parseAnd();
+    // Each `||` step deepens the left-deep tree by one level (json.md §6.4).
+    let steps = 0;
     for (;;) {
       this.skipWs();
       if (this.eatOp("||")) {
+        this.deepen();
+        steps += 1;
         const right = this.parseAnd();
         left = { kind: "or", a: left, b: right };
       } else {
+        this.depth -= steps;
         return left;
       }
     }
@@ -299,12 +323,17 @@ class Parser {
 
   private parseAnd(): Pred {
     let left = this.parseNot();
+    // Each `&&` step deepens the left-deep tree by one level (json.md §6.4).
+    let steps = 0;
     for (;;) {
       this.skipWs();
       if (this.eatOp("&&")) {
+        this.deepen();
+        steps += 1;
         const right = this.parseNot();
         left = { kind: "and", a: left, b: right };
       } else {
+        this.depth -= steps;
         return left;
       }
     }
@@ -317,7 +346,9 @@ class Parser {
       if (!this.eat("(")) {
         throw malformed("expected `(` after `!`");
       }
+      this.deepen();
       const inner = this.parsePred();
+      this.depth -= 1;
       this.skipWs();
       if (!this.eat(")")) {
         throw malformed("expected `)` after `!(`");
@@ -326,7 +357,9 @@ class Parser {
     }
     if (this.peek() === "(") {
       this.i += 1;
+      this.deepen();
       const inner = this.parsePred();
+      this.depth -= 1;
       this.skipWs();
       if (!this.eat(")")) {
         throw malformed("expected `)` in predicate");

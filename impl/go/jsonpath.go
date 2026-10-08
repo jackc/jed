@@ -698,6 +698,21 @@ func isMemberCont(c byte) bool {
 type jpParser struct {
 	s []byte
 	i int
+	// depth is the program nesting depth (spec/design/json.md §6.4): +1 per filter `?(`,
+	// parenthesized group, `!`, and `&&`/`||` chain step, bounded by maxJSONDepth → 54001. Bounding
+	// it at the compiler bounds every derived walk (render, evaluate).
+	depth int
+}
+
+// deepen descends one program nesting level, enforcing maxJSONDepth (json.md §6.4). The caller
+// restores it on the success path (an error aborts the whole compile).
+func (p *jpParser) deepen() error {
+	p.depth++
+	if p.depth > maxJSONDepth {
+		return newError(StatementTooComplex,
+			"jsonpath nesting depth exceeds the maximum of "+strconv.Itoa(maxJSONDepth))
+	}
+	return nil
 }
 
 func (p *jpParser) peek() (byte, bool) {
@@ -922,10 +937,14 @@ func (p *jpParser) parseSteps() ([]jpStep, error) {
 			if !p.eat('(') {
 				return nil, jpMalformed("expected `(` after `?`")
 			}
+			if err := p.deepen(); err != nil {
+				return nil, err
+			}
 			pred, err := p.parsePred()
 			if err != nil {
 				return nil, err
 			}
+			p.depth--
 			p.skipWs()
 			if !p.eat(')') {
 				return nil, jpMalformed("expected `)` after a filter predicate")
@@ -945,15 +964,22 @@ func (p *jpParser) parsePred() (*jpPred, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Each `||` step deepens the left-deep tree by one level (json.md §6.4).
+	steps := 0
 	for {
 		p.skipWs()
 		if p.eatOp("||") {
+			if err := p.deepen(); err != nil {
+				return nil, err
+			}
+			steps++
 			right, err := p.parseAnd()
 			if err != nil {
 				return nil, err
 			}
 			left = &jpPred{kind: jpPredOr, left: left, right: right}
 		} else {
+			p.depth -= steps
 			return left, nil
 		}
 	}
@@ -964,15 +990,22 @@ func (p *jpParser) parseAnd() (*jpPred, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Each `&&` step deepens the left-deep tree by one level (json.md §6.4).
+	steps := 0
 	for {
 		p.skipWs()
 		if p.eatOp("&&") {
+			if err := p.deepen(); err != nil {
+				return nil, err
+			}
+			steps++
 			right, err := p.parseNot()
 			if err != nil {
 				return nil, err
 			}
 			left = &jpPred{kind: jpPredAnd, left: left, right: right}
 		} else {
+			p.depth -= steps
 			return left, nil
 		}
 	}
@@ -985,10 +1018,14 @@ func (p *jpParser) parseNot() (*jpPred, error) {
 		if !p.eat('(') {
 			return nil, jpMalformed("expected `(` after `!`")
 		}
+		if err := p.deepen(); err != nil {
+			return nil, err
+		}
 		inner, err := p.parsePred()
 		if err != nil {
 			return nil, err
 		}
+		p.depth--
 		p.skipWs()
 		if !p.eat(')') {
 			return nil, jpMalformed("expected `)` after `!(`")
@@ -997,10 +1034,14 @@ func (p *jpParser) parseNot() (*jpPred, error) {
 	}
 	if c, ok := p.peek(); ok && c == '(' {
 		p.i++
+		if err := p.deepen(); err != nil {
+			return nil, err
+		}
 		inner, err := p.parsePred()
 		if err != nil {
 			return nil, err
 		}
+		p.depth--
 		p.skipWs()
 		if !p.eat(')') {
 			return nil, jpMalformed("expected `)` in predicate")

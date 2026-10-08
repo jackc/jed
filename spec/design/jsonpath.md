@@ -296,6 +296,14 @@ class, at resolve), **`2201B`** for a malformed `like_regex` pattern, **`0A000`*
 unsupported `s`/`m`/`x` regex flags (§4.3), and **`22P02`** for malformed JSON in the
 `json_in`/`jsonb_in` document-input path ([json.md §6.3](json.md)).
 
+**Nesting limit — `54001`.** The compiler counts program nesting (+1 per filter `?(`,
+parenthesized predicate group, `!`, and `&&`/`||` chain step) and rejects a path past
+`MAX_JSON_DEPTH = 256` with **`54001`** (`statement_too_complex`), the same gate as SQL
+expressions ([cost.md §7](cost.md)), so the compile, render, and evaluation walks are
+stack-safe. PostgreSQL raises `42601` ("memory exhausted") only after about 10 000 nested
+parentheses, when its generated parser runs out of stack. jed's fixed limit is a documented
+divergence ([json.md §6.4](json.md)).
+
 ---
 
 ## 9. Delivery — vertical slices

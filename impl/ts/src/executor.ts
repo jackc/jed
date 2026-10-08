@@ -317,6 +317,8 @@ import {
   type JsonMember,
   type JsonNode,
   type PathSetMode,
+  checkDepth as jsonCheckDepth,
+  checkTextDepth as jsonCheckTextDepth,
   jsonCompactOut,
   jsonbOut,
   makeObject as jsonMakeObject,
@@ -25107,6 +25109,9 @@ export function evalJsonSqlResult(
           break;
         }
       }
+      // A wrapper nests the items one level (json.md §6.4) — not a SQL/JSON error, so it is raised
+      // regardless of ON ERROR.
+      jsonCheckDepth(node);
       return jsonNodeAsReturning(node, returning, env, meter);
     }
   }
@@ -26337,6 +26342,8 @@ export function finalizeAcc(a: Acc): Value {
       // PG divergence, B4).
       if (!a.seen) return nullValue();
       const arr: JsonNode = { kind: "array", elements: a.jsonNodes };
+      // The aggregate nests each input one level (json.md §6.4).
+      jsonCheckDepth(arr);
       if (a.jsonAsJson) return jsonValue(jsonbOut(arr));
       return jsonbValue(arr);
     }
@@ -26350,13 +26357,18 @@ export function finalizeAcc(a: Acc): Value {
           ([k, v]) => `${jsonCompactOut({ kind: "string", value: k })} : ${elemJsonText(v)}`,
         );
         // PG's json_object_agg PADS the braces (`{ … }`).
-        return jsonValue(`{ ${parts.join(", ")} }`);
+        const out = `{ ${parts.join(", ")} }`;
+        // The aggregate nests each value one level (json.md §6.4).
+        jsonCheckTextDepth(out);
+        return jsonValue(out);
       }
       const members: JsonMember[] = a.jsonPairs.map(([k, v]) => ({
         key: k,
         value: valueToNode(v),
       }));
-      return jsonbValue(jsonMakeObject(members));
+      const out = jsonMakeObject(members);
+      jsonCheckDepth(out);
+      return jsonbValue(out);
     }
     case "mode":
     case "percentileDisc":
@@ -30218,11 +30230,16 @@ function finalizeBlockingCollection(
         output += separator + jsonbOut((row[0]! as { node: JsonNode }).node);
         separator = ", ";
       }
-      return jsonValue(output + "]");
+      output += "]";
+      // The aggregate nests each input one level (json.md §6.4).
+      jsonCheckTextDepth(output);
+      return jsonValue(output);
     }
     const elements: JsonNode[] = [];
     for (const row of collections.get(key)) elements.push((row[0]! as { node: JsonNode }).node);
-    return jsonbValue({ kind: "array", elements });
+    const out: JsonNode = { kind: "array", elements };
+    jsonCheckDepth(out);
+    return jsonbValue(out);
   }
   if (a.plan === "jsonObjectAgg") {
     if (!a.seen) return nullValue();
@@ -30236,7 +30253,9 @@ function finalizeBlockingCollection(
           `${jsonCompactOut({ kind: "string", value: name })} : ${elemJsonText(pair[1]!)}`;
         separator = ", ";
       }
-      return jsonValue(output + " }");
+      output += " }";
+      jsonCheckTextDepth(output);
+      return jsonValue(output);
     }
     // Sorter rows are (key byte length, key, value image), ordered by the first two.
     const sorter = new SpoolSorter(
@@ -30270,7 +30289,9 @@ function finalizeBlockingCollection(
         if (members.at(-1)?.key === member.key) members[members.length - 1] = member;
         else members.push(member);
       }
-      return jsonbValue({ kind: "object", members });
+      const out: JsonNode = { kind: "object", members };
+      jsonCheckDepth(out);
+      return jsonbValue(out);
     } finally {
       sorted?.close();
       sorter.close();

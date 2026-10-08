@@ -1315,6 +1315,9 @@ type arrNode struct {
 	children []arrNode
 }
 
+// arrayMaxDim is the PostgreSQL maximum array dimensionality (`MAXDIM`).
+const arrayMaxDim = 6
+
 // parseArrayLiteral is the PG array_in (spec/design/array.md §7) — the inverse of arrayOut. It parses
 // an optional dimension prefix `[l1:u1][l2:u2]…=`, then a (possibly nested) brace structure `{…}`,
 // returning the shape (Dims/Lbounds) and flattened row-major raw element tokens (without coercion).
@@ -1365,7 +1368,7 @@ func parseArrayLiteral(input string) (*parsedArray, arrayInErr) {
 		p.skipSpace()
 	}
 
-	node, err := p.parseNode()
+	node, err := p.parseNode(0)
 	if err != arrayOK {
 		return nil, err
 	}
@@ -1387,7 +1390,7 @@ func parseArrayLiteral(input string) (*parsedArray, arrayInErr) {
 	if derr != arrayOK {
 		return nil, derr
 	}
-	if len(dims) > 6 {
+	if len(dims) > arrayMaxDim {
 		return nil, arrayMalformed
 	}
 	var tokens []*string
@@ -1447,10 +1450,16 @@ func (p *arrParser) parseInt() (int64, bool) {
 	return n, true
 }
 
-// parseNode parses one element: a nested `{…}` (a braced level) or a scalar token (a leaf).
-func (p *arrParser) parseNode() (arrNode, arrayInErr) {
+// parseNode parses one element: a nested `{…}` (a braced level) or a scalar token (a leaf). depth is
+// the number of enclosing braces: a brace past arrayMaxDim is rejected as it is read — the same
+// arrayMalformed the post-parse dimension check gives — so the recursion never exceeds
+// arrayMaxDim+1 levels on a deeply nested literal (spec/design/json.md §6.4).
+func (p *arrParser) parseNode(depth int) (arrNode, arrayInErr) {
 	p.skipSpace()
 	if c, ok := p.peek(); ok && c == '{' {
+		if depth >= arrayMaxDim {
+			return arrNode{}, arrayMalformed
+		}
 		p.i++ // {
 		p.skipSpace()
 		var children []arrNode
@@ -1459,7 +1468,7 @@ func (p *arrParser) parseNode() (arrNode, arrayInErr) {
 			return arrNode{children: children}, arrayOK
 		}
 		for {
-			child, err := p.parseNode()
+			child, err := p.parseNode(depth + 1)
 			if err != arrayOK {
 				return arrNode{}, err
 			}

@@ -633,6 +633,11 @@ var SupportedCapabilities = []string{
 	// pattern aborts 54001 at compile, projectively, protecting the unlimited handle where the
 	// regex_compile cost ceiling cannot (CLAUDE.md §13; cost.md §7c, regex.md §6).
 	"resource.regex_program_limit",
+	// JSON nesting-depth limit — a fixed maxJSONDepth (256) bounds every json/jsonb document at its
+	// producers (the text parser, the constructors → 54001; the jsonb decoder → XX001) and the
+	// jsonpath compiler's nesting (54001), keeping every recursive walk stack-safe (CLAUDE.md §13;
+	// json.md §6.4).
+	"resource.json_depth_limit",
 	// Pure built-in surface — no function/operator or statement reaches the host (filesystem,
 	// network, process, environment) or adds nondeterminism outside the entropy seam; escape-hatch
 	// calls are 42883 and escape-hatch statements 42601 (CLAUDE.md §13; functions.md §13).

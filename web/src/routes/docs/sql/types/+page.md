@@ -194,6 +194,11 @@ order, and duplicate keys. In a multi-column `UPDATE`, every right-hand side rea
 
 <LiveSql query={jsonUpdateDemo} rows={1} />
 
+A JSON document may nest at most **256** arrays/objects deep. Parsing a deeper document, or
+building one with `jsonb_build_array`, `jsonb_agg`, `||`, `jsonb_set`, and the like, fails with
+`54001`. PostgreSQL's limit depends on its stack size and is much higher (about 10 000 levels by
+default). jed's fixed limit is the same in every core.
+
 ## Three-valued NULL logic
 
 Comparisons with `NULL` yield `NULL` (unknown), not `false` — three-valued logic, as in PostgreSQL.

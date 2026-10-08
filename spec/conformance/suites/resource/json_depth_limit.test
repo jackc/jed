@@ -1,0 +1,300 @@
+# JSON nesting-depth limit (CLAUDE.md §13; spec/design/json.md §6.4, cost.md §7). A json/jsonb
+# document may nest at most MAX_JSON_DEPTH = 256 containers (arrays/objects) deep: a scalar is
+# depth 0, `[]` depth 1, `[[1]]` depth 2. Every core walks a document RECURSIVELY (the parser, the
+# jsonb codec, the comparator, the renderers, containment, the mutators), so an untrusted deeply
+# nested document — `rpad(repeat('[', 200000), 400000, ']')::jsonb` is only 400 KB — would
+# overflow the native call stack: a Rust SIGABRT, an uncoded V8 RangeError. The cost ceiling
+# cannot catch it (the parse is one operator_eval), so the depth is bounded where documents are
+# PRODUCED, and every reader is transitively stack-safe:
+#   1. the text parser (jsonb_in, json_in validation, the json on-demand parse) aborts 54001 at
+#      the opening bracket of level 257, before parsing what is inside it;
+#   2. every constructor that nests existing values inside a new container (the builders, to_jsonb
+#      of an array, the aggregates, `||`, jsonb_set/jsonb_insert, jsonb_path_query_array, the
+#      JSON_QUERY wrapper) checks its result → 54001;
+#   3. the on-disk jsonb decoder rejects a deeper body as XX001 (a crafted file — per-core unit
+#      tests, the corpus cannot write one).
+# The jsonpath compiler bounds its own nesting (filters, parenthesized groups, `!`, `&&`/`||`
+# steps) against the same 256 → 54001; JSON_TABLE NESTED PATH levels count toward the SQL
+# parser's MAX_EXPR_DEPTH; a '{{{…}}}' array literal stops at the 7th brace (22P02, MAXDIM 6).
+#
+# The limit is a fixed, cross-core-IDENTICAL constant, unlike PostgreSQL's runtime stack probe
+# (`check_stack_depth`, the same 54001, which accepts ~10 000 levels on the oracle) — a documented
+# divergence for determinism and the weakest core's stack (CLAUDE.md §1/§8). jed-SPECIFIC, so NOT
+# oracle-checked. Every just-under-the-limit record below is PostgreSQL-agreeing.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_select, query.select, query.where_eq, query.order_by, query.aggregates, query.window, types.i32, types.text, types.array, types.jsonb, types.json, types.jsonb_compare, types.json_casts, types.jsonpath, func.jsonb_access, func.jsonb_contains, func.jsonb_mutate, func.json_processing, func.to_jsonb, func.json_builders, func.json_set, func.json_agg, func.json_object_agg, func.jsonb_path, expr.jsonpath_filter, expr.json_query_fns, func.json_table, resource.json_depth_limit
+
+# === The text parser: depth 256 is accepted, 257 aborts 54001. ===
+
+query IIT
+SELECT jsonb_array_length(rpad(repeat('[', 256), 512, ']')::jsonb), length(rpad(repeat('[', 256), 512, ']')::jsonb::text), json_typeof(rpad(repeat('[', 256), 512, ']')::json)
+----
+1
+512
+array
+
+statement error 54001
+SELECT rpad(repeat('[', 257), 514, ']')::jsonb
+
+statement error 54001
+SELECT rpad(repeat('[', 257), 514, ']')::json
+
+# Objects count the same way: {"a":{"a":…1}} 256 deep is fine, 257 is not.
+query T
+SELECT jsonb_typeof(replace(rpad(repeat('{"a":', 256), 1536, '}'), ':}', ':1}')::jsonb #> '{a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a}')
+----
+object
+
+statement error 54001
+SELECT replace(rpad(repeat('{"a":', 257), 1542, '}'), ':}', ':1}')::jsonb
+
+# The original crash: a 200 000-deep document, 400 KB of input.
+statement error 54001
+SELECT jsonb_array_length(rpad(repeat('[', 200000), 400000, ']')::jsonb)
+
+statement error 54001
+SELECT json_typeof(rpad(repeat('[', 200000), 400000, ']')::json)
+
+# The parser reads left to right: a malformed tail AFTER the 257th bracket is never reached (54001),
+# while a syntax error BEFORE it is 22P02.
+statement error 54001
+SELECT rpad(repeat('[', 300), 301, 'x')::jsonb
+
+statement error 22P02
+SELECT lpad(repeat('[', 300), 302, '[x')::jsonb
+
+# === Every reader walks a depth-256 document safely (stored, so the disk pass round-trips it). ===
+
+statement ok
+CREATE TABLE jd (id i32 PRIMARY KEY, j jsonb, t json)
+
+statement ok
+INSERT INTO jd SELECT 1, rpad(repeat('[', 256), 512, ']')::jsonb, rpad(repeat('[', 256), 512, ']')::json
+
+statement ok
+INSERT INTO jd SELECT 2, rpad(repeat('[', 255), 510, ']')::jsonb, rpad(repeat('[', 255), 510, ']')::json
+
+statement ok
+INSERT INTO jd SELECT 3, replace(rpad(repeat('{"a":', 256), 1536, '}'), ':}', ':1}')::jsonb, replace(rpad(repeat('{"a":', 256), 1536, '}'), ':}', ':1}')::json
+
+query IIII
+SELECT id, length(j::text), length(t::text), length(jsonb_pretty(j)) FROM jd ORDER BY j
+----
+2
+510
+510
+260099
+1
+512
+512
+262143
+3
+1793
+1537
+264449
+
+query IIB rowsort
+SELECT a.id, b.id, a.j @> b.j FROM jd a, jd b WHERE a.id <> b.id
+----
+1
+2
+true
+1
+3
+false
+2
+1
+false
+2
+3
+false
+3
+1
+false
+3
+2
+false
+
+query BBBB rowsort
+SELECT j = j, j < '{}'::jsonb, jsonb_strip_nulls(j) = j, (j #- '{0}') = j FROM jd
+----
+true
+true
+true
+false
+true
+true
+true
+false
+true
+false
+true
+true
+
+query TTB
+SELECT jsonb_set(j, '{0}', '1'), j #- '{0}', j -> 0 -> 0 = j #> '{0,0}' FROM jd WHERE id = 1
+----
+[1]
+[]
+true
+
+# === Constructors: a result nested one level past the limit aborts 54001. ===
+
+query I
+SELECT jsonb_array_length(jsonb_build_array(j)) FROM jd WHERE id = 2
+----
+1
+
+statement error 54001
+SELECT jsonb_build_array(j) FROM jd WHERE id = 1
+
+statement error 54001
+SELECT jsonb_build_object('k', j) FROM jd WHERE id = 3
+
+query I
+SELECT length(json_build_array(t)::text) FROM jd WHERE id = 2
+----
+512
+
+statement error 54001
+SELECT json_build_array(t) FROM jd WHERE id = 1
+
+statement error 54001
+SELECT json_build_object('k', t) FROM jd WHERE id = 1
+
+query I
+SELECT jsonb_array_length(to_jsonb(ARRAY[j])) FROM jd WHERE id = 2
+----
+1
+
+statement error 54001
+SELECT to_jsonb(ARRAY[j]) FROM jd WHERE id = 1
+
+statement error 54001
+SELECT to_json(ARRAY[j]) FROM jd WHERE id = 1
+
+statement error 54001
+SELECT array_to_json(ARRAY[j]) FROM jd WHERE id = 1
+
+# `||` concatenates two arrays without nesting (still 256 deep), but wraps a non-array operand.
+query I
+SELECT jsonb_array_length(j || '[1]'::jsonb) FROM jd WHERE id = 1
+----
+2
+
+statement error 54001
+SELECT j || '[1]'::jsonb FROM jd WHERE id = 3
+
+# jsonb_set / jsonb_insert place a whole document inside another.
+statement error 54001
+SELECT jsonb_set(j, '{0}', j) FROM jd WHERE id = 1
+
+statement error 54001
+SELECT jsonb_insert(j, '{0}', j) FROM jd WHERE id = 1
+
+query I
+SELECT jsonb_array_length(jsonb_set('[0]'::jsonb, '{0}', j)) FROM jd WHERE id = 2
+----
+1
+
+# The aggregates nest each input one level.
+query I
+SELECT jsonb_array_length(jsonb_agg(j)) FROM jd WHERE id = 2
+----
+1
+
+statement error 54001
+SELECT jsonb_agg(j) FROM jd WHERE id = 1
+
+statement error 54001
+SELECT json_agg(t) FROM jd WHERE id = 1
+
+statement error 54001
+SELECT jsonb_object_agg('k', j) FROM jd WHERE id = 1
+
+statement error 54001
+SELECT json_object_agg('k', t) FROM jd WHERE id = 1
+
+# The same check on the window-aggregate finalize path.
+query I
+SELECT jsonb_array_length(jsonb_agg(j) OVER ()) FROM jd WHERE id = 2
+----
+1
+
+statement error 54001
+SELECT jsonb_agg(j) OVER () FROM jd WHERE id = 1
+
+statement error 54001
+SELECT json_agg(t) OVER () FROM jd WHERE id = 1
+
+# A path query that wraps its items in an array; the depth error is not a SQL/JSON error, so the
+# JSON_QUERY default NULL ON ERROR does not swallow it.
+query I
+SELECT jsonb_array_length(jsonb_path_query_array(j, '$')) FROM jd WHERE id = 2
+----
+1
+
+statement error 54001
+SELECT jsonb_path_query_array(j, '$') FROM jd WHERE id = 1
+
+statement error 54001
+SELECT JSON_QUERY(j, '$' WITH WRAPPER) FROM jd WHERE id = 1
+
+# === jsonpath: the compiler bounds the program's nesting at 256 too. ===
+# Nested filters (each `?(` is one level): 256 compile and evaluate, 257 abort.
+
+query B
+SELECT jsonb_path_exists('1', '$ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1)')
+----
+true
+
+statement error 54001
+SELECT '$ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ ? (@ == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1) == 1)'::jsonpath
+
+# A parenthesized group is one level and the filter's own `?(` another: 255 groups fit inside it.
+query B
+SELECT jsonb_path_exists('1', '$ ? ((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((@ == 1))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))')
+----
+true
+
+statement error 54001
+SELECT '$ ? (((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((@ == 1)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))'::jsonpath
+
+# Each `&&` / `||` step deepens the left-deep predicate tree by one.
+query B
+SELECT jsonb_path_exists('1', '$ ? (@ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1)')
+----
+true
+
+statement error 54001
+SELECT jsonb_path_exists('1', '$ ? (@ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1 && @ == 1)')
+
+query B
+SELECT jsonb_path_exists('1', '$ ? (!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(@ == 1))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))')
+----
+false
+
+statement error 54001
+SELECT '$ ? (!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(!(@ == 1)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))'::jsonpath
+
+# === JSON_TABLE NESTED PATH levels count toward the SQL parser's nesting limit (MAX_EXPR_DEPTH). ===
+
+query I
+SELECT count(*) FROM JSON_TABLE('[1]'::jsonb, '$[*]' COLUMNS (a i32 PATH '$', NESTED PATH '$' COLUMNS (b i32 PATH '$', NESTED PATH '$' COLUMNS (c i32 PATH '$')))) AS jt
+----
+1
+
+statement error 54001
+SELECT count(*) FROM JSON_TABLE('[1]'::jsonb, '$[*]' COLUMNS (a i32 PATH '$', NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (NESTED PATH '$' COLUMNS (b i32 PATH '$')))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))) AS jt
+
+# === Array text input stops at the 7th brace (MAXDIM 6) instead of recursing. ===
+
+query T
+SELECT '{{{{{{1}}}}}}'::i32[]
+----
+{{{{{{1}}}}}}
+
+statement error 22P02
+SELECT '{{{{{{{1}}}}}}}'::i32[]
+
+statement error 22P02
+SELECT rpad(repeat('{', 200000), 400000, '}')::i32[]
