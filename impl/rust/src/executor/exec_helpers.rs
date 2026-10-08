@@ -305,6 +305,10 @@ impl crate::cursor::RowStream for StreamingScan {
         self.meter.query.clone()
     }
 
+    fn guard_cost(&self) -> Result<()> {
+        self.meter.guard()
+    }
+
     fn close(&mut self) {
         // The pinned snapshot is owned by `self.engine` / `self.scan` and released on `Drop`; mark
         // done so any further `next_row` is a no-op (streaming.md §5, idempotent).
@@ -586,6 +590,10 @@ impl crate::cursor::RowStream for BufferedScan {
         self.meter.query.clone()
     }
 
+    fn guard_cost(&self) -> Result<()> {
+        self.meter.guard()
+    }
+
     fn close(&mut self) {
         // The pinned snapshot is owned by `self.engine` and released on `Drop`; mark done so any
         // further `next_row` is a no-op (streaming.md §5, idempotent).
@@ -666,6 +674,13 @@ impl crate::cursor::RowStream for DeferredResult {
 
     fn query_account(&self) -> crate::cost::QueryAccount {
         self.engine.session.query_account()
+    }
+
+    fn guard_cost(&self) -> Result<()> {
+        match self.engine.session.finished_cost_guard(self.cost) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     fn close(&mut self) {

@@ -173,9 +173,16 @@ impl Meter {
         self.query.active()
     }
 
-    /// Reserve `bytes` of live query memory, or fail `54P05` (equality allowed).
+    /// Reserve `bytes` of live query memory, or fail `54P05` (equality allowed). A rejected
+    /// reservation consults the meter's cost guard first, so a step that has already reached a cost
+    /// ceiling reports the cost error (spec/design/memory.md §2) — even where the charging site
+    /// itself does not guard. A successful reservation adds no guard point.
     pub fn reserve_query(&mut self, bytes: i64) -> Result<()> {
-        self.query.reserve(bytes)
+        if let Err(e) = self.query.reserve(bytes) {
+            self.guard()?;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Return `bytes` of live query memory; never errors, never below zero.

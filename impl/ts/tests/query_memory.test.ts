@@ -113,3 +113,36 @@ test("the account admits up to its limit and counts an over-release", () => {
   assert.equal(free.used, 0);
   assert.equal(queryMemoryUnderflows.count, before + 1);
 });
+
+test("a rejected collector admission reports a reached cost ceiling", () => {
+  const db = memDb();
+  const s = db.session();
+  const is = (code: string) => (e: unknown) => e instanceof EngineError && e.code() === code;
+  try {
+    s.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
+    s.execute("INSERT INTO t SELECT g FROM generate_series(1, 100) g");
+    // A streaming scan holds no row buffer; only the collector charges (64 bytes per row).
+    const sql = "SELECT id FROM t LIMIT 1000";
+    const rows = s.query(sql);
+    for (const _ of rows) {
+      // drain
+    }
+    const cost = rows.cost;
+    // At the exact ceiling the scan's next guard aborts once every row is out — with or without an
+    // ample budget, which adds no guard point of its own.
+    s.setMaxCost(cost);
+    assert.throws(() => s.all(sql), is("54P01"));
+    s.setMaxQueryMemoryBytes(64n * 100n);
+    assert.throws(() => s.all(sql), is("54P01"));
+    // When the last row's admission is rejected — right after its charge reached the ceiling and
+    // before the scan's next guard — the reached ceiling wins.
+    s.setMaxQueryMemoryBytes(64n * 100n - 1n);
+    assert.throws(() => s.all(sql), is("54P01"));
+    // Below the ceiling the memory error stands.
+    s.setMaxCost(cost + 1n);
+    assert.throws(() => s.all(sql), is("54P05"));
+  } finally {
+    s.close();
+    db.close();
+  }
+});

@@ -1140,7 +1140,7 @@ export class Session {
     // self-poisons on a regular statement error (executeStmtParams), so its nuanced poisoning is left
     // intact — only the lazy-lane reads above, which bypass it, are poisoned here.
     const outcome = this.dispatch(stmt, params, insertHolder);
-    return rowsFromOutcome(outcome, this.engine.session.queryAccount);
+    return rowsFromOutcome(outcome, this.engine.session);
   }
 
   // executeCancelable runs a statement under an AbortSignal (spec/design/api.md §11.4): if the signal

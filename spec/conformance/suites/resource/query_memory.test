@@ -4,7 +4,7 @@
 # budget - 1 fails 54P05. Pre-projection relation rows count only their touched columns' payloads
 # (memory.md §3), which keeps the thresholds identical in the memory and disk storage modes. The
 # blocking-operator shapes whose lane differs between those modes live in query_memory_eager.test.
-# requires: query.select, ddl.create_table, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, dml.returning, types.text, query.cross_join, query.comma_from, query.join_left, query.join_inner, query.lateral, query.set_returning, query.values, query.derived_table, query.union, query.intersect, query.cte, query.cte_recursive, query.window, query.window_ranking, query.subquery_scalar, query.subquery_exists, query.subquery_correlated, query.aggregates, query.order_by, query.limit, func.casing, resource.query_memory
+# requires: query.select, ddl.create_table, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, dml.returning, types.text, query.cross_join, query.comma_from, query.join_left, query.join_inner, query.lateral, query.set_returning, query.values, query.derived_table, query.union, query.intersect, query.cte, query.cte_recursive, query.window, query.window_ranking, query.subquery_scalar, query.subquery_exists, query.subquery_correlated, query.aggregates, query.order_by, query.limit, func.casing, query.explain, resource.cost_limit, resource.query_memory
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v text, pad text)
@@ -335,3 +335,36 @@ ABC
 DE
 3
 NULL
+
+# Cost wins: a rejected reservation consults the statement's cost guard, so a step that has
+# already reached max_cost fails 54P01 rather than 54P05 — even where the charge itself is
+# unguarded (EXPLAIN's per-row charge) or the generator admits right after charging its row. A
+# budget that is never exceeded adds no guard: EXPLAIN's unguarded charge still completes.
+# max_query_memory_bytes: 1
+statement error 54P05
+EXPLAIN SELECT 1
+
+# max_cost: 1
+# max_query_memory_bytes: 1
+statement error 54P01
+EXPLAIN SELECT 1
+
+# max_query_memory_bytes: 1
+statement error 54P05
+SELECT g FROM generate_series(1, 3) g
+
+# max_cost: 1
+# max_query_memory_bytes: 1
+statement error 54P01
+SELECT g FROM generate_series(1, 3) g
+
+# max_cost: 1
+# max_query_memory_bytes: 1048576
+query ITTII nosort
+EXPLAIN SELECT 1
+----
+0
+Result
+-
+1
+1

@@ -89,8 +89,15 @@ shared by every internal meter of that statement (subqueries, CTE parts, set-op
 arms, recursive terms, generated actions). A statement after an error starts
 fresh. A streaming or buffered cursor keeps its statement's account until it is
 closed, so rows it still holds stay charged while the host drains it; a later
-statement on the same session gets its own account. When a reservation and a cost
-guard reject the same step, the cost error wins (cost is guarded first, as in §1).
+statement on the same session gets its own account. **Cost wins:** a rejected
+reservation consults the statement meter's cost guard before reporting `54P05` —
+even at a site whose own charge is not guarded, such as `EXPLAIN`'s per-row charge
+— so a step that has already reached `max_cost` or the lifetime budget fails
+`54P01`/`54P02` instead. An engine-owned collector whose admission is rejected
+likewise consults its cursor's cost guard (for a finished buffered result, the
+guard of the statement's final cost). A successful reservation adds no guard
+point, so enabling a budget that is never exceeded cannot change whether, or
+where, a cost ceiling aborts.
 `54P05` is an ordinary statement failure: writes roll back and an explicit
 transaction enters the failed state.
 

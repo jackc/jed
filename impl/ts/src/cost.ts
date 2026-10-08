@@ -153,9 +153,17 @@ export class Meter {
   queryMemoryActive(): boolean {
     return this.query.limit > 0;
   }
-  // reserveQuery reserves bytes of live query memory, or throws 54P05 (equality allowed).
+  // reserveQuery reserves bytes of live query memory, or throws 54P05 (equality allowed). A rejected
+  // reservation consults the meter's cost guard first, so a step that has already reached a cost
+  // ceiling reports the cost error (memory.md §2) — even where the charging site itself does not
+  // guard. A successful reservation adds no guard point.
   reserveQuery(bytes: number): void {
-    this.query.reserve(bytes);
+    try {
+      this.query.reserve(bytes);
+    } catch (e) {
+      this.guard();
+      throw e;
+    }
   }
   // releaseQuery returns bytes of live query memory; never throws, never below zero.
   releaseQuery(bytes: number): void {
@@ -163,15 +171,15 @@ export class Meter {
   }
   // admitRow admits a projected row appended to a row buffer (memory.md §5.1).
   admitRow(row: Value[]): void {
-    if (this.query.limit > 0) this.query.reserve(rowBytes(row));
+    if (this.query.limit > 0) this.reserveQuery(rowBytes(row));
   }
   // admitRowMasked admits a pre-projection row under the plan's touched mask (memory.md §3).
   admitRowMasked(row: Value[], mask: boolean[]): void {
-    if (this.query.limit > 0) this.query.reserve(rowBytesMasked(row, mask));
+    if (this.query.limit > 0) this.reserveQuery(rowBytesMasked(row, mask));
   }
   // admitValue admits a value appended to a buffered row (memory.md §5.1).
   admitValue(v: Value): void {
-    if (this.query.limit > 0) this.query.reserve(valueBytes(v));
+    if (this.query.limit > 0) this.reserveQuery(valueBytes(v));
   }
   // releaseRow releases a discarded projected row.
   releaseRow(row: Value[]): void {

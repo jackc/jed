@@ -30,6 +30,9 @@ export interface RowSource {
   // queryAccount is the statement's query-memory account (spec/design/memory.md §2), so an
   // engine-owned collector draining this source reserves against the same budget.
   queryAccount(): QueryAccount;
+  // guardCost runs the statement's cost guard, consulted when a collector's admission is rejected so
+  // a reached cost ceiling wins over the memory error (spec/design/memory.md §2).
+  guardCost(): void;
   // close releases the pinned read snapshot (streaming.md §5). Idempotent.
   close(): void;
 }
@@ -43,7 +46,13 @@ export class Cursor {
 
   // buffered wraps an already-materialized result (the buffered shape). Each yielded row leaves engine
   // ownership and is released from the statement's query-memory account (memory.md §5.3).
-  static buffered(rows: Value[][], cost: bigint, account: QueryAccount): Cursor {
+  // costCeiling is the finished statement's cost-guard verdict (null when no ceiling was reached).
+  static buffered(
+    rows: Value[][],
+    cost: bigint,
+    account: QueryAccount,
+    costCeiling: unknown = null,
+  ): Cursor {
     let i = 0;
     return new Cursor({
       nextRow: () => {
@@ -54,6 +63,9 @@ export class Cursor {
       },
       cost: () => cost,
       queryAccount: () => account,
+      guardCost: () => {
+        if (costCeiling !== null) throw costCeiling;
+      },
       close: () => {},
     });
   }
@@ -78,6 +90,11 @@ export class Cursor {
   // queryAccount is the statement's query-memory account (spec/design/memory.md §2).
   queryAccount(): QueryAccount {
     return this.source.queryAccount();
+  }
+
+  // guardCost runs the statement's cost guard (spec/design/memory.md §2).
+  guardCost(): void {
+    this.source.guardCost();
   }
 
   // close releases any pinned read snapshot (streaming.md §5). Idempotent. A no-op for the buffered

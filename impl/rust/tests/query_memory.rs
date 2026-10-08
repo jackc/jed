@@ -65,3 +65,32 @@ fn query_memory_budget_stays_with_cursor() {
     assert!(old.next().is_none());
     old.error().unwrap();
 }
+
+#[test]
+fn rejected_collector_admission_reports_a_reached_cost_ceiling() {
+    let db = Database::create(CreateOptions::default()).unwrap();
+    let mut s = db.session(SessionOptions::default());
+    s.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+        .unwrap();
+    s.execute("INSERT INTO t SELECT g FROM generate_series(1, 100) g", &[])
+        .unwrap();
+    // A streaming scan holds no row buffer; only the collector charges (64 bytes per row).
+    let sql = "SELECT id FROM t LIMIT 1000";
+    let mut drained = s.query(sql, &[]).unwrap();
+    while drained.next().is_some() {}
+    let cost = drained.cost();
+    drop(drained);
+    // At the exact ceiling the scan's next guard aborts once every row is out — with or without an
+    // ample budget, which adds no guard point of its own.
+    s.set_max_cost(cost);
+    assert_eq!(s.query_rows(sql, ()).err().expect("54P01").code(), "54P01");
+    s.set_max_query_memory_bytes(64 * 100);
+    assert_eq!(s.query_rows(sql, ()).err().expect("54P01").code(), "54P01");
+    // When the last row's admission is rejected — right after its charge reached the ceiling and
+    // before the scan's next guard — the reached ceiling wins.
+    s.set_max_query_memory_bytes(64 * 100 - 1);
+    assert_eq!(s.query_rows(sql, ()).err().expect("54P01").code(), "54P01");
+    // Below the ceiling the memory error stands.
+    s.set_max_cost(cost + 1);
+    assert_eq!(s.query_rows(sql, ()).err().expect("54P05").code(), "54P05");
+}

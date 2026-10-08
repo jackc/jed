@@ -4,7 +4,7 @@
 // import cycle). Thin wrappers over the parser + executor — the conformance contract still binds.
 
 import type { Statement } from "./ast.ts";
-import type { QueryAccount } from "./cost.ts";
+import type { SessionState } from "./session.ts";
 import { throwIfAborted } from "./cancel.ts";
 import { Cursor } from "./cursor.ts";
 import {
@@ -129,7 +129,13 @@ export class Rows implements Iterable<Value[]> {
   // statement failure: it fires the block-poison hook like a mid-drain error.
   admitCollected(row: Value[]): void {
     try {
-      this.cursor.queryAccount().admitRow(row);
+      try {
+        this.cursor.queryAccount().admitRow(row);
+      } catch (e) {
+        // A rejected admission reports a reached cost ceiling instead (memory.md §2).
+        this.cursor.guardCost();
+        throw e;
+      }
     } catch (e) {
       this.fireErr();
       throw e;
@@ -202,16 +208,18 @@ export class Rows implements Iterable<Value[]> {
 // exec-side path (Statement.run) drains-and-discards such a Rows and returns the tag, so "query on a
 // statement that produces no rows" is valid, not a 42601 (the effect-then-error bug this removes — a
 // write reached here after dispatch already committed it; spec/design/api.md §11).
-export function rowsFromOutcome(out: Outcome, account: QueryAccount): Rows {
+export function rowsFromOutcome(out: Outcome, session: SessionState): Rows {
+  const account = session.queryAccount;
+  const ceiling = session.finishedCostGuard(out.cost);
   if (out.kind === "query") {
     return new Rows(
       out.columnNames,
       out.columnTypes,
-      Cursor.buffered(out.rows, out.cost, account),
+      Cursor.buffered(out.rows, out.cost, account, ceiling),
       null,
     );
   }
-  return new Rows([], [], Cursor.buffered([], out.cost, account), out.rowsAffected);
+  return new Rows([], [], Cursor.buffered([], out.cost, account, ceiling), out.rowsAffected);
 }
 
 // prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4): a standalone
@@ -283,7 +291,7 @@ function queryStmt(
   // 25001 must NOT poison), so it is left intact — only the lazy-lane reads above, which bypass it, are
   // poisoned by the catch.
   const outcome = db.executeStmtParams(stmt, params, insertHolder);
-  return rowsFromOutcome(outcome, db.session.queryAccount);
+  return rowsFromOutcome(outcome, db.session);
 }
 
 // querySql is an alias for query, symmetric with the Rust/Go QuerySQL naming (api.md §6).
@@ -323,7 +331,7 @@ export class Transaction {
   // non-query statement is a Rows with no output columns, carrying the command tag).
   query(sql: string, params: Value[] = []): Rows {
     const outcome = this.db.executeStmtParams(this.db.parse(sql), params);
-    return rowsFromOutcome(outcome, this.db.session.queryAccount);
+    return rowsFromOutcome(outcome, this.db.session);
   }
 
   // prepareStatement parses sql once into a reusable PreparedStatement (spec/design/api.md §2.4): a
@@ -346,7 +354,7 @@ export class Transaction {
   // schema matches committed state can fill and reuse immutable DML resolution (api.md §2.4).
   queryPrepared(stmt: PreparedStatement, params: Value[] = []): Rows {
     const outcome = this.db.executeStmtParams(stmt.ast, params, stmt.icHolder);
-    return rowsFromOutcome(outcome, this.db.session.queryAccount);
+    return rowsFromOutcome(outcome, this.db.session);
   }
 
   // executeCancelable runs a statement within this transaction under an AbortSignal (spec/design/

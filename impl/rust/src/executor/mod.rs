@@ -974,6 +974,19 @@ impl SessionState {
         }
     }
 
+    /// The cost-guard verdict of a finished statement that accrued `cost` (memory.md §2): a fresh
+    /// session meter at that cost reports a reached `max_cost` or lifetime budget. Computed only when
+    /// a query-memory budget is active — the one consumer, a collector's admission, is inert
+    /// otherwise.
+    pub(crate) fn finished_cost_guard(&self, cost: i64) -> Option<EngineError> {
+        if self.max_query_memory_bytes <= 0 {
+            return None;
+        }
+        let mut meter = self.new_meter();
+        meter.accrued = cost;
+        meter.guard().err()
+    }
+
     /// Start a statement's scalar allowance and query-memory account afresh.
     pub(crate) fn reset_statement_memory(&mut self) {
         self.scalar_bytes = std::rc::Rc::new(std::cell::Cell::new(0));

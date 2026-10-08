@@ -249,6 +249,20 @@ func measureRows[R ~[]Value](a queryAccount, rows []R) int64 {
 	return n
 }
 
+// reserveQuery reserves bytes of live query memory, or fails 54P05. A rejected reservation consults
+// the meter's cost guard first, so a step that has already reached a cost ceiling reports the cost
+// error (memory.md §2) — even where the charging site itself does not guard. A successful
+// reservation adds no guard point.
+func (m *costMeter) reserveQuery(bytes int64) error {
+	if err := m.query.reserve(bytes); err != nil {
+		if cerr := m.Guard(); cerr != nil {
+			return cerr
+		}
+		return err
+	}
+	return nil
+}
+
 // queryMemoryActive reports whether the statement has a finite query-memory budget.
 func (m *costMeter) queryMemoryActive() bool { return m.query.active() }
 
@@ -260,7 +274,7 @@ func (m *costMeter) admitRow(row []Value) error {
 	if !m.query.active() {
 		return nil
 	}
-	return m.query.reserve(memRowBytes(row))
+	return m.reserveQuery(memRowBytes(row))
 }
 
 // admitRowMasked admits a pre-projection row under the plan's touched mask (memory.md §3).
@@ -268,7 +282,7 @@ func (m *costMeter) admitRowMasked(row []Value, mask []bool) error {
 	if !m.query.active() {
 		return nil
 	}
-	return m.query.reserve(memRowBytesMasked(row, mask))
+	return m.reserveQuery(memRowBytesMasked(row, mask))
 }
 
 // admitValue admits a value appended to a buffered row (memory.md §5.1).
@@ -276,7 +290,7 @@ func (m *costMeter) admitValue(v Value) error {
 	if !m.query.active() {
 		return nil
 	}
-	return m.query.reserve(memValueBytes(v))
+	return m.reserveQuery(memValueBytes(v))
 }
 
 // releaseRow releases a discarded projected row.

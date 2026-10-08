@@ -32,6 +32,9 @@ pub(crate) trait RowStream {
     /// The statement's query-memory account (spec/design/memory.md §2), so an engine-owned collector
     /// draining this stream reserves against the same budget.
     fn query_account(&self) -> crate::cost::QueryAccount;
+    /// The statement's cost guard, run before a collector admits a row so a reached cost ceiling
+    /// wins over a memory rejection (spec/design/memory.md §2).
+    fn guard_cost(&self) -> Result<()>;
     /// Release the pinned read snapshot (streaming.md §5). Idempotent.
     fn close(&mut self);
 }
@@ -46,6 +49,9 @@ pub(crate) enum Cursor {
         /// The statement's query-memory account; each yielded row leaves engine ownership and is
         /// released from it (memory.md §5.3).
         account: crate::cost::QueryAccount,
+        /// The finished statement's cost-guard verdict (memory.md §2), checked before a collector
+        /// admits a row.
+        cost_ceiling: Option<crate::error::EngineError>,
     },
     /// A lazy pull pipeline (S3, streaming.md §4): scan → resolve → `WHERE` → project, one row per
     /// `next_row`, accruing cost as it is pulled. Owns its pinned snapshot.
@@ -58,11 +64,13 @@ impl Cursor {
         rows: Vec<Vec<Value>>,
         cost: i64,
         account: crate::cost::QueryAccount,
+        cost_ceiling: Option<crate::error::EngineError>,
     ) -> Cursor {
         Cursor::Buffered {
             iter: rows.into_iter(),
             cost,
             account,
+            cost_ceiling,
         }
     }
 
@@ -101,6 +109,17 @@ impl Cursor {
         match self {
             Cursor::Buffered { account, .. } => account.clone(),
             Cursor::Streaming(s) => s.query_account(),
+        }
+    }
+
+    /// Run the statement's cost guard (spec/design/memory.md §2).
+    pub(crate) fn guard_cost(&self) -> Result<()> {
+        match self {
+            Cursor::Buffered { cost_ceiling, .. } => match cost_ceiling {
+                Some(e) => Err(e.clone()),
+                None => Ok(()),
+            },
+            Cursor::Streaming(s) => s.guard_cost(),
         }
     }
 

@@ -263,6 +263,21 @@ export class SessionState {
     m.query = this.queryAccount;
     return m;
   }
+  // finishedCostGuard is the cost-guard verdict of a finished statement that accrued cost (memory.md
+  // §2): a fresh session meter at that cost reports a reached max_cost or lifetime budget. Computed
+  // only when a query-memory budget is active — its one consumer, a collector's rejected admission, is
+  // inert otherwise.
+  finishedCostGuard(cost: bigint): unknown {
+    if (this.queryAccount.limit <= 0) return null;
+    const meter = this.newMeter();
+    meter.accrued = cost;
+    try {
+      meter.guard();
+    } catch (e) {
+      return e;
+    }
+    return null;
+  }
   newMeter(): Meter {
     const meter = new Meter(this.maxCost, this.lifetime);
     meter.scalarLimit = this.maxScalarBytes;

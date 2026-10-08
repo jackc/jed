@@ -14291,6 +14291,7 @@ export class Engine {
         },
         cost: () => meter.accrued,
         queryAccount: () => meter.query,
+        guardCost: () => meter.guard(),
         close: () => {
           gen.return(undefined);
         },
@@ -14323,6 +14324,7 @@ export class Engine {
       },
       cost: () => meter.accrued,
       queryAccount: () => meter.query,
+      guardCost: () => meter.guard(),
       close: () => {
         gen.return(undefined);
       },
@@ -14480,6 +14482,10 @@ export class Engine {
       },
       cost: () => cost,
       queryAccount: () => snap.session.queryAccount,
+      guardCost: () => {
+        const e = snap.session.finishedCostGuard(cost);
+        if (e !== null) throw e;
+      },
       close: () => {
         done = true;
         rows = [];

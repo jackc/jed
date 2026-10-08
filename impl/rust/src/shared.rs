@@ -2095,9 +2095,11 @@ impl Session {
         // poison) and self-poisons on a regular statement error, so its nuanced poisoning is left
         // intact — only the lazy-lane reads above, which bypass it, are poisoned here.
         let outcome = self.dispatch(ast.clone(), params, insert_cache)?;
+        let cost_ceiling = self.engine.session.finished_cost_guard(outcome.cost());
         Ok(Rows::from_outcome(
             outcome,
             self.engine.session.query_account(),
+            cost_ceiling,
         ))
     }
 
