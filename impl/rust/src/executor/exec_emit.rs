@@ -302,6 +302,10 @@ impl Engine {
             rng: stmt_rng,
             ctes,
         };
+        // A WHERE contradiction (planner.md §3.1) skips every scan lane: the eager pipeline below
+        // runs over an empty FROM (materialize_rel reads nothing), so aggregates still see their
+        // empty input.
+        let fast = !plan.where_contradiction();
 
         // Vectorized single-table aggregate (batch, the PAX/vectorization program's executor track): a
         // SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window / ORDER BY, either
@@ -312,7 +316,8 @@ impl Engine {
         // the general aggregate branch runs unchanged. (An aggregate plan skips every streaming
         // fast-path below — they all require `!is_agg` — so this front-position placement is only for
         // clarity, mirroring the Go core's ordering.)
-        if meter.is_unmetered()
+        if fast
+            && meter.is_unmetered()
             && (!self.blocking_spill_eligible(plan) || self.bounded_whole_aggregate(plan))
             && self.explain_actual.borrow().is_none()
             && self.vectorized_agg_eligible(plan)
@@ -325,7 +330,7 @@ impl Engine {
         // This covers PK and compatible ordered-index intervals plus GIN/GiST candidate sets (whose
         // gather remains complete). Generalized bounds reach this dispatch from BufferedScan's first
         // pull; the older full/contiguous-PK shape also has a direct pull cursor.
-        if streaming_scan_eligible(plan) {
+        if fast && streaming_scan_eligible(plan) {
             return Ok(Emitter::Final {
                 rows: self.exec_streaming_scan(plan, &env, meter, params)?.rows,
             });
@@ -334,7 +339,9 @@ impl Engine {
         // Streaming secondary-index-order scan (cost.md §3 "secondary-index order"): compatible
         // bounded plans were caught above, so this fallback handles the no-bound LIMIT shape. Walk
         // the ordering index + point-lookup; the eager sort is elided.
-        if let Some(io) = &plan.phys.index_order {
+        if let Some(io) = &plan.phys.index_order
+            && fast
+        {
             return Ok(Emitter::Final {
                 rows: self.exec_index_order_scan(plan, io, &env, meter)?.rows,
             });
@@ -347,7 +354,8 @@ impl Engine {
         // (file-backed databases). DISTINCT/aggregate/join take the eager path below, and an
         // incompatible index bound does not stream through this sorter. Results + cost are identical
         // to the eager sort (the sort is unmetered — cost.md §3; spill.md §6).
-        if !plan.order.is_empty()
+        if fast
+            && !plan.order.is_empty()
             && !plan.phys.pk_ordered
             && plan.order_exprs.is_empty() // a materialized expression key takes the eager path below
             && plan.rels.len() == 1
@@ -380,7 +388,7 @@ impl Engine {
         // two-table INNER/CROSS join whose ORDER BY the OUTER relation's PK scan order satisfies, with
         // a LIMIT. The join drives/probes the outer in PK order so the output is already ordered — the
         // sort is elided and the loop short-circuits a top-N.
-        if plan.phys.join_pk_ordered {
+        if fast && plan.phys.join_pk_ordered {
             if self.blocking_spill_eligible(plan) {
                 return self.exec_blocking_spill(plan, &env, meter);
             }
@@ -399,7 +407,7 @@ impl Engine {
         // answerable from the first OFFSET+LIMIT PK-scan rows (a backward window over the PK-ordered
         // scan) scans only that prefix instead of the whole table — the window analog of the streaming
         // LIMIT short-circuit. Ineligible window queries fall through to the eager materialize below.
-        if self.window_top_n_eligible(plan) {
+        if fast && self.window_top_n_eligible(plan) {
             return self.exec_window_top_n(plan, &env, meter, params);
         }
 
@@ -411,7 +419,8 @@ impl Engine {
         // path. Gated to the unmetered lane (so a metered query's per-eval guards stay the row path's) and
         // to file-backed stores with no spillable touched column (project_columnar declines otherwise,
         // falling through to the identical-cost row path). Cost-neutral by construction.
-        if meter.is_unmetered()
+        if fast
+            && meter.is_unmetered()
             && self.explain_actual.borrow().is_none()
             && vectorized_project_eligible(plan)
         {
@@ -420,7 +429,7 @@ impl Engine {
             }
         }
 
-        if self.blocking_spill_eligible(plan) {
+        if fast && self.blocking_spill_eligible(plan) {
             return self.exec_blocking_spill(plan, &env, meter);
         }
 
@@ -496,8 +505,13 @@ impl Engine {
             )?;
         } else {
             running = if plan.rels.is_empty() {
-                meter.admit_row(&[])?;
-                vec![Vec::new()]
+                // (A FROM-less contradiction produces no virtual row either.)
+                if fast {
+                    meter.admit_row(&[])?;
+                    vec![Vec::new()]
+                } else {
+                    Vec::new()
+                }
             } else {
                 std::mem::take(&mut materialized[0])
             };
@@ -730,9 +744,12 @@ impl Engine {
 
         // WHERE over the combined rows (consume `running`, no extra clone). A WHERE arithmetic
         // can trap (22003/22012); each surviving combined row's filter accrues operator_eval.
+        // After a pushdown only the residual remains (planner.md §3.2); the pushed conjuncts
+        // already ran as each relation was read.
+        let filter = plan.post_join_filter();
         let mut rows: Vec<Row> = Vec::new();
         for row in running {
-            let keep = match &plan.filter {
+            let keep = match &filter {
                 None => true,
                 Some(f) => f.eval(&row, &env, meter)?.is_true(),
             };
@@ -742,7 +759,7 @@ impl Engine {
                 meter.release_row_masked(&row, &mem_mask);
             }
         }
-        if plan.filter.is_some()
+        if filter.is_some()
             && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
         {
             if select_actual_root_node(plan) != "Filter" {

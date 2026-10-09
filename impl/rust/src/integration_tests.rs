@@ -195,6 +195,8 @@ mod update;
 mod values_body;
 #[path = "../tests/variables.rs"]
 mod variables;
+#[path = "../tests/where_rewrite.rs"]
+mod where_rewrite;
 #[path = "../tests/window_persisted.rs"]
 mod window_persisted;
 #[path = "../tests/work_mem_options.rs"]

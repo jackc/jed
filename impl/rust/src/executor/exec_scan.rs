@@ -883,7 +883,10 @@ impl Engine {
             // Resolve the scan bound (the PK pushdown, if any) and the up-front cost block — identical
             // to `exec_streaming_scan`. An empty bound (e.g. `pk = NULL`) admits no row.
             let reverse = plan.phys.pk_reverse;
+            // A WHERE contradiction (planner.md §3.1) admits no row: no page, no row, no charge —
+            // the lane is kept and simply produces nothing (the empty point feed below).
             let point = match &plan.phys.rel_bounds[0] {
+                _ if plan.where_contradiction() => CompletePkPoint::Empty,
                 Some(ScanBound::Pk(bp)) => build_complete_pk_point(bp, &bound_params, &[], &[]),
                 _ => CompletePkPoint::NotPoint,
             };
@@ -1575,6 +1578,8 @@ impl Engine {
             rows
         };
         let on = &plan.joins[0].on;
+        // After a pushdown only the residual WHERE remains over the joined rows (planner.md §3.2).
+        let post_join_filter = plan.post_join_filter();
 
         let limit = plan.limit;
         let offset = plan.offset.unwrap_or(0);
@@ -1643,7 +1648,7 @@ impl Engine {
                         continue;
                     }
                     // The residual WHERE over the combined row (per surviving pair).
-                    let pass = match &plan.filter {
+                    let pass = match &post_join_filter {
                         Some(f) => {
                             before = meter.accrued;
                             let pass = f.eval(&combined, env, meter)?.is_true();
@@ -1695,7 +1700,7 @@ impl Engine {
             if root != join_node {
                 profile.record_parent(join_node.to_string(), through_join);
             }
-            if plan.filter.is_some() && root != "Filter" {
+            if post_join_filter.is_some() && root != "Filter" {
                 profile.record_parent("Filter".to_string(), through_join + filter_work);
             }
         }
@@ -1766,6 +1771,8 @@ impl Engine {
             .as_ref()
             .map(|hash| HashJoinTable::build(hash, plan.rels[inner].offset, 0, inner_rows, meter))
             .transpose()?;
+        // After a pushdown only the residual WHERE remains over the joined rows (planner.md §3.2).
+        let post_join_filter = plan.post_join_filter();
 
         let limit = plan.limit;
         let offset = plan.offset.unwrap_or(0);
@@ -1811,7 +1818,7 @@ impl Engine {
                     if !keep {
                         continue;
                     }
-                    let pass = match &plan.filter {
+                    let pass = match &post_join_filter {
                         Some(filter) => {
                             let before = meter.accrued;
                             let pass = filter.eval(&combined, env, meter)?.is_true();
@@ -1860,7 +1867,7 @@ impl Engine {
                 .to_string(),
                 through_join,
             );
-            if plan.filter.is_some() {
+            if post_join_filter.is_some() {
                 profile.record_parent("Filter".to_string(), through_join + filter_work);
             }
         }
@@ -1910,6 +1917,11 @@ impl Engine {
         meter: &mut Meter,
     ) -> Result<Vec<Row>> {
         let rel = &plan.rels[ri];
+        // A WHERE contradiction (planner.md §3.1) reads no relation: nothing is scanned, generated,
+        // or run, and nothing is charged.
+        if plan.where_contradiction() {
+            return Ok(Vec::new());
+        }
         let env = EvalEnv {
             exec: self,
             params,
@@ -2157,8 +2169,16 @@ impl Engine {
         }
         meter.charge(COSTS.value_decompress * slabs as i64);
         let mut src = ScanSource::new(rows, node_count as i64);
+        // The relation's pushed WHERE conjuncts (planner.md §3.2) run on each admitted row, after its
+        // storage_row_read and before it is admitted to the join: a failing row never enters it.
+        let pushed = plan.pushed_local_filter(ri);
         let mut table_rows: Vec<Row> = Vec::new();
         while let Some(row) = src.next(meter)? {
+            if let Some(f) = pushed
+                && !f.eval(&row, &env, meter)?.is_true()
+            {
+                continue;
+            }
             meter.admit_row_masked(&row, mask)?; // a materialized relation row (memory.md §5.1)
             table_rows.push(row);
         }

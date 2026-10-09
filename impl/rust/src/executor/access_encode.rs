@@ -554,6 +554,45 @@ pub(crate) fn estimator_predicate_selectivity(
     }
 }
 
+/// The relation-aware selectivity of an AND over the flattened `conjuncts` (none itself an AND):
+/// the AND arm of [`estimator_predicate_selectivity_with_statistics`], also used for a post-join
+/// residual chain (rewrite.rs `FilterChain`).
+pub(crate) fn estimator_conjunction_selectivity_with_statistics(
+    conjuncts: &[&RExpr],
+    rel: &ScopeRel<'_>,
+    catalog: &Engine,
+) -> crate::estimator::Selectivity {
+    use crate::estimator::Selectivity;
+    if estimator_conjunction_contradictory(conjuncts) {
+        return Selectivity::Zero;
+    }
+    let mut used = vec![false; conjuncts.len()];
+    let mut result = Selectivity::All;
+    for i in 0..conjuncts.len() {
+        if used[i] {
+            continue;
+        }
+        let paired = ((i + 1)..conjuncts.len())
+            .find(|j| !used[*j] && estimator_paired_range(conjuncts[i], conjuncts[*j]));
+        if let Some(j) = paired {
+            used[j] = true;
+            let range =
+                statistics_paired_range_selectivity(conjuncts[i], conjuncts[j], rel, catalog)
+                    .unwrap_or_else(|| {
+                        Selectivity::fraction(crate::estimator_constants::SELECTIVITY_PAIRED_RANGE)
+                    });
+            result = result.and(range);
+        } else {
+            result = result.and(estimator_predicate_selectivity_with_statistics(
+                Some(conjuncts[i]),
+                rel,
+                catalog,
+            ));
+        }
+    }
+    result
+}
+
 /// P9 relation-aware refinement of the structural predicate program. Unsupported leaves retain the
 /// standing defaults byte-for-byte; supported bare-column leaves use the relation's snapshot facts.
 pub(crate) fn estimator_predicate_selectivity_with_statistics(
@@ -569,38 +608,7 @@ pub(crate) fn estimator_predicate_selectivity_with_statistics(
         RExpr::And(..) => {
             let mut conjuncts = Vec::new();
             estimator_flatten_boolean(expr, true, &mut conjuncts);
-            if estimator_conjunction_contradictory(&conjuncts) {
-                return Selectivity::Zero;
-            }
-            let mut used = vec![false; conjuncts.len()];
-            let mut result = Selectivity::All;
-            for i in 0..conjuncts.len() {
-                if used[i] {
-                    continue;
-                }
-                let paired = ((i + 1)..conjuncts.len())
-                    .find(|j| !used[*j] && estimator_paired_range(conjuncts[i], conjuncts[*j]));
-                if let Some(j) = paired {
-                    used[j] = true;
-                    let range = statistics_paired_range_selectivity(
-                        conjuncts[i],
-                        conjuncts[j],
-                        rel,
-                        catalog,
-                    )
-                    .unwrap_or_else(|| {
-                        Selectivity::fraction(crate::estimator_constants::SELECTIVITY_PAIRED_RANGE)
-                    });
-                    result = result.and(range);
-                } else {
-                    result = result.and(estimator_predicate_selectivity_with_statistics(
-                        Some(conjuncts[i]),
-                        rel,
-                        catalog,
-                    ));
-                }
-            }
-            result
+            estimator_conjunction_selectivity_with_statistics(&conjuncts, rel, catalog)
         }
         RExpr::Or(..) => {
             if let Some(estimate) =
@@ -644,7 +652,7 @@ pub(crate) fn estimator_predicate_selectivity_with_statistics(
     }
 }
 
-fn estimator_flatten_boolean<'a>(expr: &'a RExpr, and: bool, out: &mut Vec<&'a RExpr>) {
+pub(crate) fn estimator_flatten_boolean<'a>(expr: &'a RExpr, and: bool, out: &mut Vec<&'a RExpr>) {
     match (and, expr) {
         (true, RExpr::And(lhs, rhs)) | (false, RExpr::Or(lhs, rhs)) => {
             estimator_flatten_boolean(lhs, and, out);
@@ -654,7 +662,7 @@ fn estimator_flatten_boolean<'a>(expr: &'a RExpr, and: bool, out: &mut Vec<&'a R
     }
 }
 
-fn estimator_literal(expr: &RExpr) -> bool {
+pub(crate) fn estimator_literal(expr: &RExpr) -> bool {
     matches!(
         expr,
         RExpr::ConstInt(_)
@@ -697,13 +705,13 @@ fn estimator_equality_parts(expr: &RExpr) -> Option<(&RExpr, &RExpr)> {
     None
 }
 
-struct EstimatorComparison<'a> {
-    operand: &'a RExpr,
+pub(crate) struct EstimatorComparison<'a> {
+    pub(crate) operand: &'a RExpr,
     literal: &'a RExpr,
     op: CmpOp,
 }
 
-fn estimator_comparison_parts(expr: &RExpr) -> Option<EstimatorComparison<'_>> {
+pub(crate) fn estimator_comparison_parts(expr: &RExpr) -> Option<EstimatorComparison<'_>> {
     let RExpr::Compare { op, lhs, rhs, .. } = expr else {
         return None;
     };
@@ -732,7 +740,7 @@ fn estimator_comparison_parts(expr: &RExpr) -> Option<EstimatorComparison<'_>> {
 
 // Compare resolved, same-kind plan-time literals by their SQL total order. Open/unsupported
 // literal kinds return None: missing a proof is safe, inventing one is not.
-fn estimator_literal_cmp(a: &RExpr, b: &RExpr) -> Option<std::cmp::Ordering> {
+pub(crate) fn estimator_literal_cmp(a: &RExpr, b: &RExpr) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (RExpr::ConstInt(x), RExpr::ConstInt(y)) => Some(x.cmp(y)),
         (RExpr::ConstBool(x), RExpr::ConstBool(y)) => Some(x.cmp(y)),
@@ -754,7 +762,7 @@ fn estimator_literal_cmp(a: &RExpr, b: &RExpr) -> Option<std::cmp::Ordering> {
     }
 }
 
-fn estimator_comparison_satisfied(order: std::cmp::Ordering, op: CmpOp) -> bool {
+pub(crate) fn estimator_comparison_satisfied(order: std::cmp::Ordering, op: CmpOp) -> bool {
     use std::cmp::Ordering;
     match op {
         CmpOp::Eq => order == Ordering::Equal,
@@ -801,7 +809,7 @@ fn estimator_comparisons_contradict(
     })
 }
 
-fn estimator_conjunction_contradictory(conjuncts: &[&RExpr]) -> bool {
+pub(crate) fn estimator_conjunction_contradictory(conjuncts: &[&RExpr]) -> bool {
     let mut comparisons = Vec::with_capacity(conjuncts.len());
     for conjunct in conjuncts {
         let Some(comparison) = estimator_comparison_parts(conjunct) else {

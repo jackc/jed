@@ -85,6 +85,8 @@ mod exec_helpers;
 pub(crate) use exec_helpers::*;
 mod access_encode;
 pub(crate) use access_encode::*;
+mod rewrite;
+pub(crate) use rewrite::*;
 mod engine;
 mod snapshot;
 mod statistics;
@@ -4852,6 +4854,11 @@ pub(crate) struct SelectPlan {
     /// bug, not a slow plan — so it is computed by the resolve half (`compute_rel_masks`), never by
     /// a physical rule (spec/design/planner.md §2).
     rel_masks: Vec<Vec<bool>>,
+    /// The stage-2 WHERE rewrite (rewrite.rs; spec/design/planner.md §3): a proven contradiction,
+    /// or the per-relation pushed filters plus the post-join residual. `None` when no rewrite fired.
+    /// `filter` above stays the COMPLETE WHERE — the input every access-path detector and estimator
+    /// rule reads; execution evaluates `post_join_filter()` over joined rows.
+    pushdown: Option<WherePushdown>,
     /// The plan's physical / access-path decisions — set ONLY by the `optimize_select` pass
     /// (optimize.rs); default (zero-valued) when resolve hands the plan over
     /// (spec/design/planner.md §4).

@@ -1,0 +1,172 @@
+# WHERE predicate pushdown through joins (spec/design/planner.md §3.2). In a multi-relation SELECT,
+# each top-level WHERE conjunct that references exactly one base table — one no outer join
+# NULL-extends — and is structurally non-trapping (comparisons, IS [NOT] NULL, IS [NOT] DISTINCT
+# FROM, and AND/OR/NOT over bare columns, literals and parameters) runs as that table's rows are
+# read, before they enter the join. Only the remaining conjuncts are re-applied to the joined rows.
+# The rows are unchanged; the cost moves: a pushed conjunct charges its operator_eval once per row
+# its scan admits instead of once per joined row, and the rows it rejects never reach ON, hash, or
+# the residual (cost.md §3 "JOIN"). Results here are ordinary PostgreSQL semantics; the `# cost:`
+# pins are jed's cross-core contract. All units weigh 1; every table is one leaf page.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.join_left, query.join_right, query.join_full, query.cross_join, query.join_pushdown, query.hash_join, query.where_pushdown, query.subquery_scalar, query.subquery_exists, query.aggregates, query.is_null, query.is_distinct_from, expr.arithmetic, null.three_valued, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE a (id i32 PRIMARY KEY, k i32, v i32)
+
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, k i32, w i32)
+
+statement ok
+CREATE TABLE c (id i32 PRIMARY KEY, k i32)
+
+statement ok
+INSERT INTO a VALUES (1, 1, 10), (2, 2, 20), (3, 3, NULL), (4, 9, 40)
+
+statement ok
+INSERT INTO b VALUES (11, 1, 5), (12, 2, NULL), (13, 2, 7), (14, 7, 0), (15, 8, 1)
+
+statement ok
+INSERT INTO c VALUES (21, 1), (22, 2), (23, 3)
+
+# INNER: `a.v >= 20` runs on a's 4 rows and keeps 2; `b.w IS NOT NULL` runs on b's 5 rows and keeps
+# 4; only the cross-relation `a.v > b.w` stays residual. a: 1 page + 4 rows + 4 filter = 9; b: 1 + 5
+# + 5 = 11; nested-loop ON over 2 x 4 pairs = 8; the residual on the one ON match = 1; 1 produced.
+# cost: 30
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.v >= 20 AND b.w IS NOT NULL AND a.v > b.w ORDER BY a.id, b.id
+----
+2
+13
+
+# CROSS: every conjunct is single-relation, so nothing is left to apply after the product.
+# `a.id <= 2` also bounds a's PK scan (and is rechecked as its pushed filter): 1 page + 2 rows + 2.
+# b: 1 + 5 + 5. The 2 x 2 product has no ON and no residual; 4 produced.
+# cost: 20
+query II nosort
+SELECT a.id, b.id FROM a CROSS JOIN b WHERE a.id <= 2 AND b.w > 4 ORDER BY a.id, b.id
+----
+1
+11
+1
+13
+2
+11
+2
+13
+
+# LEFT: a single-relation OR over the PRESERVED side is pushed; a3's NULL-extension survives.
+# cost: 62
+query II nosort
+SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k WHERE a.v IS NULL OR a.v < 15 ORDER BY a.id, b.id
+----
+1
+11
+3
+NULL
+
+# LEFT: a conjunct on the NULL-EXTENDED side is never pushed — `b.w IS NULL` must still see the
+# NULL-extended rows of a3/a4 (pushing it would turn them into matches of b12 or drop them).
+# cost: 82
+query II nosort
+SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k WHERE b.w IS NULL ORDER BY a.id, b.id
+----
+2
+12
+3
+NULL
+4
+NULL
+
+# A null-rejecting conjunct on the nullable side is not pushed either; it simply stays residual.
+# cost: 81
+query II nosort
+SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k WHERE b.w > 4 ORDER BY a.id, b.id
+----
+1
+11
+2
+13
+
+# RIGHT: the right relation is preserved (pushed); the left is NULL-extended (residual).
+# cost: 32
+query II nosort
+SELECT a.id, b.id FROM a RIGHT JOIN b ON a.k = b.k WHERE b.w > 0 AND a.v IS NULL ORDER BY b.id
+----
+NULL
+15
+
+# FULL: both sides are NULL-extended, so nothing is pushed.
+# cost: 41
+query II nosort
+SELECT a.id, b.id FROM a FULL JOIN b ON a.k = b.k WHERE b.w IS NULL ORDER BY a.id, b.id
+----
+2
+12
+3
+NULL
+4
+NULL
+
+# Three relations: each conjunct is pushed to its own relation.
+# cost: 35
+query III nosort
+SELECT a.id, b.id, c.id FROM a JOIN b ON a.k = b.k JOIN c ON b.k = c.k WHERE a.v IS NOT NULL AND b.w <> 7 AND c.id <= 22 ORDER BY a.id
+----
+1
+11
+21
+
+# Arithmetic can trap, so `a.v + 0 > 15` is not pushed: it stays residual over the joined rows.
+# cost: 39
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.v + 0 > 15 ORDER BY a.id, b.id
+----
+2
+12
+2
+13
+
+# Kleene connectives and IS [NOT] DISTINCT FROM push as one filter per relation; a cross-relation OR
+# stays residual.
+# cost: 45
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE NOT (b.w IS DISTINCT FROM 7) OR a.v = 10 ORDER BY a.id, b.id
+----
+1
+11
+2
+13
+
+# cost: 29
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE NOT (b.w IS DISTINCT FROM 7) AND a.v IS DISTINCT FROM 10 ORDER BY a.id, b.id
+----
+2
+13
+
+# Aggregates consume the filtered join unchanged.
+# cost: 37
+query II nosort
+SELECT count(*), sum(b.w) FROM a JOIN b ON a.k = b.k WHERE a.v < 100 AND b.w >= 0
+----
+2
+12
+
+# An uncorrelated subquery conjunct is never pushed; it is folded once before execution and the
+# residual sees the folded value (it is not re-run per joined row): EXISTS folds to TRUE, max(k) to 3.
+# cost: 31
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.v >= 20 AND EXISTS (SELECT 1 FROM c WHERE c.id = 22) ORDER BY a.id, b.id
+----
+2
+12
+2
+13
+
+# cost: 43
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE b.w > (SELECT max(k) FROM c) AND a.v < 100 ORDER BY a.id, b.id
+----
+1
+11
+2
+13

@@ -435,10 +435,13 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 // blocking part and the (possibly deferred) projection (streaming.md §6).
 func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []Value, ctes cteCtx, rng *stmtRng, meter *costMeter) (emitter, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
+	// A WHERE contradiction (planner.md §3.1) skips every scan lane: the eager pipeline below runs
+	// over an empty FROM (materializeRel reads nothing), so aggregates still see their empty input.
+	fast := !plan.whereContradiction()
 	// The whole-table packed-leaf fold owns only running scalar accumulators.
 	// Keep it ahead of spilling when it accepts the plan; grouped and declined
 	// row/gather paths continue through the bounded operator pipeline below.
-	if meter.unmetered() && db.explainActual == nil && db.vectorizedAggEligible(plan) && len(plan.groupSets) == 1 && len(plan.groupSets[0].keyCols) == 0 {
+	if fast && meter.unmetered() && db.explainActual == nil && db.vectorizedAggEligible(plan) && len(plan.groupSets) == 1 && len(plan.groupSets[0].keyCols) == 0 {
 		rows, ok, err := db.aggColumnar(plan, &plan.groupSets[0], env, meter)
 		if err != nil {
 			return emitter{}, err
@@ -451,7 +454,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			return emitAggSyntheticRows(plan, rows), nil
 		}
 	}
-	if db.boundedBlockingEligible(plan) {
+	if fast && db.boundedBlockingEligible(plan) {
 		return db.execBoundedBlocking(plan, env, meter)
 	}
 
@@ -462,7 +465,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// deterministic abort row stays the scalar path's; results and accrued cost are byte-identical
 	// either way (the conformance corpus proves both). Ineligible / metered ⇒ this is skipped and the
 	// general aggregate branch runs unchanged.
-	if meter.unmetered() && db.explainActual == nil && db.vectorizedAggEligible(plan) {
+	if fast && meter.unmetered() && db.explainActual == nil && db.vectorizedAggEligible(plan) {
 		return db.execVectorizedAgg(plan, outer, params, ctes, rng, meter)
 	}
 
@@ -474,7 +477,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// path. Gated to the unmetered lane (so a metered query's per-eval Guards stay the row path's) and to
 	// file-backed stores with no spillable touched column (projectColumnar declines otherwise, falling
 	// through to the identical-cost row path). Cost-neutral by construction.
-	if meter.unmetered() && db.explainActual == nil && db.vectorizedProjectEligible(plan) {
+	if fast && meter.unmetered() && db.explainActual == nil && db.vectorizedProjectEligible(plan) {
 		em, ok, err := db.projectColumnar(plan, env, meter)
 		if err != nil {
 			return emitter{}, err
@@ -492,7 +495,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// (functions.md §10); the streaming reader assumes a table store.
 	// A pkOrdered DISTINCT streams too: the dedup runs in scan order (the sort elided), so it
 	// short-circuits a top-N like the non-DISTINCT case. A no-ORDER-BY DISTINCT keeps the eager path.
-	if streamingScanEligible(plan) {
+	if fast && streamingScanEligible(plan) {
 		res, err := db.execStreamingScan(plan, env, meter, params)
 		if err != nil {
 			return emitter{}, err
@@ -503,7 +506,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// Streaming secondary-index-order scan (cost.md §3 "secondary-index order"): compatible bounded
 	// plans were caught above, so this fallback handles the no-bound LIMIT shape. Walk the ordering
 	// index + point-lookup; the eager sort is elided.
-	if plan.phys.indexOrder != nil {
+	if fast && plan.phys.indexOrder != nil {
 		res, err := db.execIndexOrderScan(plan, plan.phys.indexOrder, env, meter)
 		if err != nil {
 			return emitter{}, err
@@ -518,7 +521,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// join take the eager path below, and an incompatible index bound does not stream through this
 	// sorter. Results + cost are identical to the eager sort (the sort is unmetered —
 	// cost.md §3; spill.md §6).
-	if len(plan.order) > 0 && !plan.phys.pkOrdered && len(plan.orderExprs) == 0 && len(plan.rels) == 1 && len(plan.joins) == 0 &&
+	if fast && len(plan.order) > 0 && !plan.phys.pkOrdered && len(plan.orderExprs) == 0 && len(plan.rels) == 1 && len(plan.joins) == 0 &&
 		!plan.isAgg && !plan.hasWindow && !plan.distinct &&
 		!plan.phys.relBounds[0].needsEagerScan() &&
 		plan.rels[0].srf == nil &&
@@ -536,7 +539,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// INNER/CROSS join whose ORDER BY the OUTER relation's PK scan order satisfies, with a LIMIT. The
 	// join drives/probes the outer in PK order so the output is already ordered — the sort is elided
 	// and the loop short-circuits a top-N.
-	if plan.phys.joinPkOrdered {
+	if fast && plan.phys.joinPkOrdered {
 		var res selectResult
 		var err error
 		if len(plan.rels) >= 3 && len(plan.phys.joinSteps)+1 == len(plan.rels) {
@@ -554,7 +557,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// answerable from the first OFFSET+LIMIT PK-scan rows (a backward window over the PK-ordered scan)
 	// scans only that prefix instead of the whole table — the window analog of the streaming LIMIT
 	// short-circuit. Ineligible window queries fall through to the eager whole-table materialize below.
-	if db.windowTopNEligible(plan) {
+	if fast && db.windowTopNEligible(plan) {
 		return db.execWindowTopN(plan, env, meter, params)
 	}
 
@@ -611,7 +614,8 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			// The first relation's buffer moves into running (its charge transfers with it).
 			running = materialized[0]
 			materialized[0] = nil
-		} else {
+		} else if fast {
+			// (A FROM-less contradiction produces no virtual row either.)
 			if err := meter.admitRow(nil); err != nil {
 				return emitter{}, err
 			}
@@ -873,12 +877,14 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	}
 
 	// WHERE over the combined rows. A WHERE arithmetic can trap (22003/22012); each surviving
-	// combined row's filter accrues operator_eval.
+	// combined row's filter accrues operator_eval. After a pushdown only the residual remains
+	// (planner.md §3.2); the pushed conjuncts already ran as each relation was read.
+	filter := plan.postJoinFilter()
 	var rows []storedRow
 	for _, row := range running {
 		keep := true
-		if plan.filter != nil {
-			v, err := plan.filter.eval(row, env, meter)
+		if filter != nil {
+			v, err := filter.eval(row, env, meter)
 			if err != nil {
 				return emitter{}, err
 			}
@@ -890,7 +896,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			meter.releaseRowMasked(row, memMask)
 		}
 	}
-	if plan.filter != nil {
+	if filter != nil {
 		if selectActualRootNode(plan) != "Filter" {
 			db.explainActual.recordParent("Filter", meter.Accrued)
 		}

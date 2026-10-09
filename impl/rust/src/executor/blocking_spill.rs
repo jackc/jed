@@ -116,6 +116,7 @@ impl Engine {
         meter.charge(COSTS.value_decompress * slabs as i64);
         meter.guard()?;
         meter.charge(COSTS.page_read * pages as i64);
+        let pushed = plan.pushed_local_filter(ri);
         let mut first = true;
         store.scan_range(&bound, &mut |_, row| {
             if !first {
@@ -125,6 +126,13 @@ impl Engine {
             meter.charge(COSTS.storage_row_read);
             let mut row = row.clone();
             store.resolve_columns(&mut row, mask)?;
+            // The relation's pushed WHERE conjuncts (planner.md §3.2), exactly as materialize_rel
+            // runs them.
+            if let Some(f) = pushed
+                && !f.eval(&row, env, meter)?.is_true()
+            {
+                return Ok(true);
+            }
             // Untouched lazy values can retain an entire leaf block through an Arc. They are not
             // SQL inputs to this plan, so release them before the row enters operator residency.
             for (value, touched) in row.iter_mut().zip(mask) {
@@ -223,10 +231,12 @@ impl Engine {
                 }
             }
         }
+        // After a pushdown only the residual remains (planner.md §3.2).
+        let filter = plan.post_join_filter();
         let mut filtered = self.blocking_spool();
         let mut scan = rows.into_reader()?;
         while let Some(row) = scan.next()? {
-            if match &plan.filter {
+            if match &filter {
                 Some(f) => f.eval(&row, env, meter)?.is_true(),
                 None => true,
             } {
@@ -235,7 +245,7 @@ impl Engine {
         }
         drop(scan);
         rows = filtered;
-        if plan.filter.is_some() && root != "Filter" {
+        if filter.is_some() && root != "Filter" {
             if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
                 profile.record_parent("Filter".to_string(), meter.accrued);
             }
@@ -420,6 +430,8 @@ impl Engine {
         let mut filter_work = 0i64;
         let mut output_work = 0i64;
         let mut passed = 0i64;
+        // After a pushdown only the residual WHERE remains over the joined rows (planner.md §3.2).
+        let post_join_filter = plan.post_join_filter();
         if plan.limit != Some(0) {
             let mut scan = rows.into_reader()?;
             'probe: while let Some(left) = scan.next()? {
@@ -452,7 +464,7 @@ impl Engine {
                     if !keep {
                         continue;
                     }
-                    if let Some(filter) = &plan.filter {
+                    if let Some(filter) = &post_join_filter {
                         let before = meter.accrued;
                         keep = filter.eval(&combined, env, meter)?.is_true();
                         filter_work += meter.accrued - before;
@@ -497,7 +509,7 @@ impl Engine {
             if nway || root != join {
                 profile.record_parent(join.to_string(), through_join);
             }
-            if plan.filter.is_some() && (nway || root != "Filter") {
+            if post_join_filter.is_some() && (nway || root != "Filter") {
                 profile.record_parent("Filter".to_string(), through_join + filter_work);
             }
         }

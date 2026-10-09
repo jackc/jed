@@ -208,7 +208,8 @@ row. A row is always released under the measurement that reserved it.
 appended, at:
 
 - **Relation materialization** (eager SELECT path): each scanned base-table or
-  index-bounded row; each row of `generate_series` and `unnest` as it is generated;
+  index-bounded row that passes the relation's pushed WHERE filter, if any
+  ([planner.md](planner.md) §3.2 — a rejected row is never reserved); each row of `generate_series` and `unnest` as it is generated;
   the whole output of the other set-returning functions (JSON producers,
   `JSON_TABLE`, `jed_*` catalog functions), which are bounded by an existing value
   or the catalog, once produced; each row of a `VALUES` body; each row a
@@ -236,7 +237,8 @@ appended, at:
 - **Recursive CTE**: each kept row's copy into the CTE result (the working-table
   row itself transfers), and a copy of the earlier CTEs' buffers taken for the
   recursive term.
-- **The FROM-less virtual row**: one bare `ROW` (32 bytes).
+- **The FROM-less virtual row**: one bare `ROW` (32 bytes), absent under a WHERE
+  contradiction ([planner.md](planner.md) §3.1), which also reserves no relation row.
 
 `value_bytes` is reserved for each value **appended** to a buffered row:
 materialized window keys, window function results, materialized ORDER BY

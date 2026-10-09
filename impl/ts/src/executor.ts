@@ -100,6 +100,14 @@ import {
 import { Meter, type QueryAccount, queryMemoryPeak, StateCharge } from "./cost.ts";
 import { optimizeSelect } from "./optimize.ts";
 import {
+  type WherePushdown,
+  postJoinFilter,
+  pushedFilter,
+  refreshWhereResidual,
+  rewriteWhere,
+  whereContradiction,
+} from "./rewrite.ts";
+import {
   type Collation,
   foldLowerSimple,
   loadedCollationTables,
@@ -3496,7 +3504,18 @@ export class Engine {
     return rows;
   }
 
+  // estimateRelation estimates one FROM relation as the executor reads it. A WHERE contradiction
+  // reads no relation (planner.md §3.1), so its whole rendered subtree estimates zero.
   private estimateRelation(sp: SelectPlan, index: number, ctx: EstimateCteContext | null): EstimatedPlan {
+    const plan = this.estimateRelationRead(sp, index, ctx);
+    if (whereContradiction(sp)) {
+      const root = emptyPlanEstimate();
+      return { root, nodes: plan.nodes.map((_, i) => (i === 0 ? root : emptyPlanEstimate())) };
+    }
+    return plan;
+  }
+
+  private estimateRelationRead(sp: SelectPlan, index: number, ctx: EstimateCteContext | null): EstimatedPlan {
     const rel = sp.rels[index]!;
     if (rel.derived !== undefined) {
       const body = this.estimateQueryPlan(rel.derived, ctx);
@@ -3533,6 +3552,22 @@ export class Engine {
         BigInt(indexStore.nodeCount()),
         saturatingEstimateMultiply(estimate.rows, BigInt(tableStore.height())),
       );
+    }
+    // A pushed WHERE filter (planner.md §3.2) runs on every row the access path delivers. Its
+    // logical selectivity applies once to the relation's logical population; the delivered rows
+    // are that, capped by the scan rows — except an index-nested-loop inner, whose per-call scan
+    // is bounded by the join key rather than the filter, so the filter scales those rows.
+    const pushed = pushedFilter(sp, index).glob;
+    if (pushed !== null) {
+      const scanRows = estimate.rows;
+      const selectivity = this.estimatePredicateSelectivityWithStatistics(sp, pushed);
+      estimate.logicalRows = estimateSelectivity(selectivity, estimate.logicalRows);
+      if (inl !== null) {
+        estimate.rows = estimateSelectivity(selectivity, scanRows);
+      } else {
+        estimate.rows = estimate.logicalRows < scanRows ? estimate.logicalRows : scanRows;
+      }
+      addPlanUnit(estimate, UNIT_OPERATOR_EVAL, saturatingEstimateMultiply(estimatorOperatorNodes(pushed), scanRows));
     }
     return leafEstimatedPlan(estimate);
   }
@@ -3656,10 +3691,11 @@ export class Engine {
     let deliveredRows = fullRows;
     if (n === sp.rels.length && sp.phys.joinPkOrdered && sp.limit !== null) {
       const target = saturatingEstimateAdd(sp.limit, sp.offset ?? 0n);
+      const postFilter = postJoinFilter(sp);
       const postFilterRows =
-        sp.filter === null
+        postFilter === null
           ? fullRows
-          : estimateSelectivity(this.estimatePredicateSelectivityWithStatistics(sp, sp.filter), fullRows);
+          : estimateSelectivity(this.estimatePredicateSelectivityWithStatistics(sp, postFilter), fullRows);
       if (target === 0n) {
         outerCalls = 0n;
         deliveredRows = 0n;
@@ -3771,9 +3807,10 @@ export class Engine {
     let deliveredRows = fullRows;
     if (sp.phys.joinPkOrdered && sp.limit !== null) {
       const target = saturatingEstimateAdd(sp.limit, sp.offset ?? 0n);
-      const postFilterRows = sp.filter === null
+      const postFilter = postJoinFilter(sp);
+      const postFilterRows = postFilter === null
         ? fullRows
-        : estimateSelectivity(this.estimatePredicateSelectivityWithStatistics(sp, sp.filter), fullRows);
+        : estimateSelectivity(this.estimatePredicateSelectivityWithStatistics(sp, postFilter), fullRows);
       if (target === 0n) {
         outerCalls = 0n;
         deliveredRows = 0n;
@@ -3839,7 +3876,11 @@ export class Engine {
   }
 
   private estimateSelectPlan(sp: SelectPlan, ctx: EstimateCteContext | null): EstimatedPlan {
-    let plan = sp.rels.length === 0 ? leafEstimatedPlan(emptyPlanEstimate(1n)) : this.estimateJoinTree(sp, sp.rels.length, ctx);
+    // A FROM-less SELECT reads one virtual row, unless a WHERE contradiction removes it
+    // (planner.md §3.1).
+    let plan = sp.rels.length === 0
+      ? leafEstimatedPlan(emptyPlanEstimate(whereContradiction(sp) ? 0n : 1n))
+      : this.estimateJoinTree(sp, sp.rels.length, ctx);
     if (sp.limit !== null && !sp.distinct && (streamingScanEligible(sp) || sp.phys.indexOrder !== null || this.windowTopNEligible(sp))) {
       const target = saturatingEstimateAdd(sp.limit, sp.offset ?? 0n);
       const cap = sp.filter === null
@@ -3847,17 +3888,18 @@ export class Engine {
         : this.requiredEstimateInput(this.estimatePredicateSelectivityWithStatistics(sp, sp.filter), target, plan.root.rows);
       this.capStreamingScanEstimate(plan, sp, cap);
     }
-    if (sp.filter !== null) {
+    const filter = postJoinFilter(sp);
+    if (filter !== null) {
       const inputRows = plan.root.rows;
       const logicalRows = estimateSelectivity(
-        this.estimatePredicateSelectivityWithStatistics(sp, sp.filter),
+        this.estimatePredicateSelectivityWithStatistics(sp, filter),
         plan.root.logicalRows,
       );
       const rows = logicalRows > plan.root.rows ? plan.root.rows : logicalRows;
       const local = Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n);
-      local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(estimatorOperatorNodes(sp.filter), inputRows);
+      local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(estimatorOperatorNodes(filter), inputRows);
       plan = wrapEstimatedPlan(plan, rows, logicalRows, local);
-      this.addExpressionSubqueries(plan.root, sp.filter, inputRows, ctx);
+      this.addExpressionSubqueries(plan.root, filter, inputRows, ctx);
       plan.nodes[0] = plan.root;
     }
     if (sp.isAgg) {
@@ -4707,12 +4749,11 @@ export class Engine {
       r.emit(d, "Aggregate", aggDetail(sp, r.verbose));
       d++;
     }
-    if (sp.filter !== null) {
-      r.emit(
-        d,
-        "Filter",
-        r.verbose ? `filter=${renderRExpr(sp.filter)}` : `conjuncts=${conjunctCount(sp.filter)}`,
-      );
+    const filter = postJoinFilter(sp);
+    if (filter !== null) {
+      let detail = r.verbose ? `filter=${renderRExpr(filter)}` : `conjuncts=${conjunctCount(filter)}`;
+      if (whereContradiction(sp)) detail += "; contradiction";
+      r.emit(d, "Filter", detail);
       d++;
     }
     this.renderFrom(r, sp, d, orderNote);
@@ -4862,11 +4903,15 @@ export class Engine {
     // bound in the access-path label (cost.md §3 "JOIN").
     const inl = sp.phys.relINLBounds[i] !== null;
     const bound = inl ? sp.phys.relINLBounds[i]! : sp.phys.relBounds[i]!;
-    r.emit(
-      depth,
-      "Scan " + rel.tableName,
-      withNote(this.scanDetail(rel.tableName, bound, inl, sp.relMasks[i]!), note),
-    );
+    let detail = this.scanDetail(rel.tableName, bound, inl, sp.relMasks[i]!);
+    // A pushed WHERE filter (planner.md §3.2) runs inside the scan, so it renders on the Scan.
+    const pushed = pushedFilter(sp, i).glob;
+    if (pushed !== null) {
+      detail += r.verbose
+        ? `; filter=${renderRExpr(pushed)}`
+        : `; filter:conjuncts=${conjunctCount(pushed)}`;
+    }
+    r.emit(depth, "Scan " + rel.tableName, withNote(detail, note));
   }
 
   // renderSetOpPlan emits a set operation: any trailing Limit / Sort on the combined result, the
@@ -13319,6 +13364,7 @@ export class Engine {
       limit: sel.limit,
       offset: sel.offset,
       relMasks: [],
+      pushdown: null,
       phys: {
         hashJoin: null,
         joinSteps: [],
@@ -13335,9 +13381,10 @@ export class Engine {
     };
     plan.relMasks = computeRelMasks(plan);
     // ——— Stage 2: logical rewrite rules (spec/design/planner.md §3) ———
-    // No rewrite rules exist yet; the first (predicate pushdown / simplification, TODO.md) lands
-    // here as pure plan→plan transforms. foldUncorrelatedInPlan is NOT a planner rewrite — it
-    // executes subqueries and needs bound params, so it stays post-bind in the statement drivers.
+    // The WHERE rewrite (contradiction detection, then pushdown) is a pure plan→plan transform.
+    // foldUncorrelatedInPlan is NOT a planner rewrite — it executes subqueries and needs bound
+    // params, so it stays post-bind in the statement drivers.
+    rewriteWhere(plan);
     //
     // ——— Stage 3: physical/access-path selection (spec/design/planner.md §4) ———
     optimizeSelect(plan, scope.rels, this.readSnap(), this);
@@ -14439,10 +14486,11 @@ export class Engine {
       // Resolve the scan bound (the PK pushdown, if any) and the up-front cost block. An empty bound
       // (e.g. pk = NULL) admits no row.
       let keyB: KeyBound = unboundedBound();
-      let empty = false;
+      // A WHERE contradiction (planner.md §3.1) admits no row: no page, no row, no charge.
+      let empty = whereContradiction(sp);
       const sb = sp.phys.relBounds[0]!;
       let point: CompletePkPoint = { kind: "notPoint" };
-      if (sb !== null && sb.kind === "pk") {
+      if (!empty && sb !== null && sb.kind === "pk") {
         point = buildCompletePkPoint(sb.pk, bound, [], []);
         if (point.kind === "empty") empty = true;
         else if (point.kind === "notPoint") {
@@ -15327,6 +15375,8 @@ export class Engine {
     params: Value[],
     outer: Row[],
   ): SelectResult {
+    // After a pushdown only the residual WHERE remains over joined rows (planner.md §3.2).
+    const residual = postJoinFilter(plan);
     const profileStart = meter.accrued;
     const relWork = new Map<number, bigint>();
     let filterWork = 0n;
@@ -15399,9 +15449,9 @@ export class Engine {
           // INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).
           if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) continue;
           // The residual WHERE over the combined row (per surviving pair).
-          if (plan.filter !== null) {
+          if (residual !== null) {
             before = meter.accrued;
-            const keep = isTrue(evalExpr(plan.filter, combined, env, meter));
+            const keep = isTrue(evalExpr(residual, combined, env, meter));
             filterWork += meter.accrued - before;
             if (!keep) continue;
           }
@@ -15436,7 +15486,7 @@ export class Engine {
     const joinNode = plan.phys.hashJoin === null ? "Nested Loop" : "Hash Join";
     if (selectActualRootNode(plan) !== joinNode)
       this.recordExplainActualParent(joinNode, throughJoin);
-    if (plan.filter !== null && selectActualRootNode(plan) !== "Filter")
+    if (residual !== null && selectActualRootNode(plan) !== "Filter")
       this.recordExplainActualParent("Filter", throughJoin + filterWork);
     return {
       columnNames: plan.columnNames,
@@ -15456,6 +15506,8 @@ export class Engine {
     params: Value[],
     outer: Row[],
   ): SelectResult {
+    // After a pushdown only the residual WHERE remains over joined rows (planner.md §3.2).
+    const residual = postJoinFilter(plan);
     const profileStart = meter.accrued;
     let filterWork = 0n;
     let outputWork = 0n;
@@ -15519,9 +15571,9 @@ export class Engine {
             }
           }
           if (!keep) continue;
-          if (plan.filter !== null) {
+          if (residual !== null) {
             const before = meter.accrued;
-            const keep = isTrue(evalExpr(plan.filter, combined, env, meter));
+            const keep = isTrue(evalExpr(residual, combined, env, meter));
             filterWork += meter.accrued - before;
             if (!keep) continue;
           }
@@ -15556,7 +15608,7 @@ export class Engine {
       step.hashJoin === null ? "Nested Loop" : "Hash Join",
       throughJoin,
     );
-    if (plan.filter !== null)
+    if (residual !== null)
       this.recordExplainActualParent("Filter", throughJoin + filterWork);
     return {
       columnNames: plan.columnNames,
@@ -15632,6 +15684,9 @@ export class Engine {
     meter: Meter,
   ): Row[] {
     const rel = plan.rels[ri]!;
+    // A WHERE contradiction (planner.md §3.1) reads no relation: nothing is scanned, generated, or
+    // run, and nothing is charged.
+    if (whereContradiction(plan)) return [];
     const env: EvalEnv = { ...baseEnv, outer };
     // Every relation row is a query-memory row buffer entry under the relation's touched mask
     // (memory.md §3/§5.1). The two unbounded generators admit as they produce; the remaining producers
@@ -15861,8 +15916,12 @@ export class Engine {
       rows[i] = store.resolveColumns(rows[i]!, plan.relMasks[ri]!);
     }
     meter.charge(COSTS.valueDecompress * BigInt(slabs));
+    // The relation's pushed WHERE conjuncts (planner.md §3.2) run on each admitted row, after its
+    // storage_row_read and before it is admitted to the join: a failing row never enters it.
+    const pushed = pushedFilter(plan, ri).local;
     const tableRows: Row[] = [];
     for (const row of scanSource(rows, nodeCount, meter)) {
+      if (pushed !== null && !isTrue(evalExpr(pushed, row, env, meter))) continue;
       meter.admitRowMasked(row, mask); // a materialized relation row (memory.md §5.1)
       tableRows.push(row);
     }
@@ -16582,6 +16641,8 @@ export class Engine {
     let filterWork = 0n;
     let outputWork = 0n;
     const n = plan.rels.length;
+    // After a pushdown only the residual WHERE remains over joined rows (planner.md §3.2).
+    const residual = postJoinFilter(plan);
     try {
       const relations: RowSpool[] = [];
       const relWork: bigint[] = [];
@@ -16626,6 +16687,8 @@ export class Engine {
         const rb = plan.phys.relBounds[ordinal];
         const bound =
           rb?.kind === "pk" ? buildKeyBound(rb.pk, params, env.outer, []) : unboundedBound();
+        // The relation's pushed WHERE conjuncts (planner.md §3.2), exactly as materializeRel runs them.
+        const pushed = pushedFilter(plan, ordinal).local;
         if (bound !== null) {
           const units = store.overlapScanUnits(bound, mask);
           meter.charge(
@@ -16634,7 +16697,9 @@ export class Engine {
           store.scanRange(bound, (_key, raw) => {
             meter.guard();
             meter.charge(COSTS.storageRowRead);
-            out.push(nullUntouched(store.resolveColumns(raw, mask), mask));
+            const row = store.resolveColumns(raw, mask);
+            if (pushed !== null && !isTrue(evalExpr(pushed, row, env, meter))) return true;
+            out.push(nullUntouched(row, mask));
             return true;
           });
         }
@@ -16812,9 +16877,9 @@ export class Engine {
                   }
                 }
                 if (!keep) continue;
-                if (plan.filter !== null) {
+                if (residual !== null) {
                   const before = meter.accrued;
-                  const pass = isTrue(evalExpr(plan.filter, combined, env, meter));
+                  const pass = isTrue(evalExpr(residual, combined, env, meter));
                   filterWork += meter.accrued - before;
                   if (!pass) continue;
                 }
@@ -16865,7 +16930,7 @@ export class Engine {
         );
       if (
         plan.phys.joinPkOrdered &&
-        plan.filter !== null &&
+        residual !== null &&
         selectActualRootNode(plan) !== "Filter"
       )
         this.recordExplainActualParent("Filter", meter.accrued - profileStart - outputWork);
@@ -16873,11 +16938,11 @@ export class Engine {
         // The WHERE pass always copies its survivors into a fresh spool (every row without a WHERE).
         const filtered = spool();
         for (const row of rows)
-          if (plan.filter === null || isTrue(evalExpr(plan.filter, row, env, meter)))
+          if (residual === null || isTrue(evalExpr(residual, row, env, meter)))
             filtered.push(row);
         rows.close();
         rows = filtered;
-        if (plan.filter !== null && selectActualRootNode(plan) !== "Filter")
+        if (residual !== null && selectActualRootNode(plan) !== "Filter")
           this.recordExplainActualParent("Filter", meter.accrued);
       }
       const applyWindow = (input: RowSpool): RowSpool => {
@@ -17124,9 +17189,13 @@ export class Engine {
   // (a bufferedRows generator, the query() path). The env's StmtRng threads the per-statement entropy
   // through both the blocking part and the (possibly deferred) projection (streaming.md §6).
   execSelectEmit(plan: SelectPlan, env: EvalEnv, meter: Meter, params: Value[]): Emitter {
+    // A WHERE contradiction (planner.md §3.1) skips every scan lane: the eager pipeline below runs
+    // over an empty FROM (materializeRel reads nothing), so aggregates still see their empty input.
+    const fast = !whereContradiction(plan);
     // The packed whole-table fold already has one finite accumulator and no retained input.
     // Keep that fast path when its touched-column gate proves it will not gather rows.
     if (
+      fast &&
       meter.isUnmetered() &&
       this.explainActualProfile === null &&
       plan.groupKeys.length === 0 &&
@@ -17136,7 +17205,7 @@ export class Engine {
       if (store.isFileBacked() && !store.anySpillableTouched(plan.relMasks[0]!))
         return this.execVectorizedAgg(plan, env, meter, params);
     }
-    if (this.boundedBlockingEligible(plan))
+    if (fast && this.boundedBlockingEligible(plan))
       return this.execBoundedBlocking(plan, env, meter, params);
     // Vectorized single-table aggregate (the PAX/vectorization program's executor track): a
     // SUM/COUNT/MIN/MAX/AVG with no DISTINCT / FILTER / HAVING / window / ORDER BY, either whole-table or
@@ -17147,6 +17216,7 @@ export class Engine {
     // unchanged. (An aggregate plan skips every streaming fast-path below — they all require !isAgg — so
     // this front-position placement is only for clarity, mirroring the Go/Rust cores' ordering.)
     if (
+      fast &&
       meter.isUnmetered() &&
       this.explainActualProfile === null &&
       this.vectorizedAggEligible(plan)
@@ -17157,14 +17227,14 @@ export class Engine {
     // Bounded streaming scan (spec/design/cost.md §3): a single-table query whose chosen access path
     // supplies its observable order stops row fetch/filter/project work at the LIMIT window. GIN/GiST
     // candidate gathering remains complete.
-    if (streamingScanEligible(plan)) {
+    if (fast && streamingScanEligible(plan)) {
       return finalEmitter(this.execStreamingScan(plan, env, meter, params).rows);
     }
 
     // Streaming secondary-index-order scan (cost.md §3 "secondary-index order"): compatible bounded
     // plans were caught above, so this fallback handles the no-bound LIMIT shape. Walk the ordering
     // index + point-lookup; the eager sort is elided.
-    if (plan.phys.indexOrder !== null) {
+    if (fast && plan.phys.indexOrder !== null) {
       return finalEmitter(this.execIndexOrderScan(plan, plan.phys.indexOrder, env, meter).rows);
     }
 
@@ -17176,6 +17246,7 @@ export class Engine {
     // sorter. Results + cost are identical to the eager sort (the sort is unmetered —
     // cost.md §3; spill.md §6).
     if (
+      fast &&
       plan.order.length > 0 &&
       !plan.phys.pkOrdered &&
       plan.orderExprs.length === 0 && // a materialized expression key takes the eager path below
@@ -17202,7 +17273,7 @@ export class Engine {
     // INNER/CROSS join whose ORDER BY the OUTER relation's PK scan order satisfies, with a LIMIT. The
     // join drives/probes the outer in PK order so the output is already ordered — the sort is elided
     // and the loop short-circuits a top-N.
-    if (plan.phys.joinPkOrdered) {
+    if (fast && plan.phys.joinPkOrdered) {
       const result =
         plan.phys.joinSteps.length + 1 === plan.rels.length && plan.rels.length >= 3
           ? this.execStreamingNWayJoin(plan, env, meter, params, env.outer)
@@ -17214,7 +17285,7 @@ export class Engine {
     // answerable from the first OFFSET+LIMIT PK-scan rows (a backward window over the PK-ordered scan)
     // scans only that prefix instead of the whole table — the window analog of the streaming LIMIT
     // short-circuit. Ineligible window queries fall through to the eager materialize below.
-    if (this.windowTopNEligible(plan)) {
+    if (fast && this.windowTopNEligible(plan)) {
       return this.execWindowTopN(plan, env, meter, params);
     }
 
@@ -17227,6 +17298,7 @@ export class Engine {
     // with no spillable touched column (projectColumnar declines otherwise, falling through to the
     // identical-cost row path). Cost-neutral by construction.
     if (
+      fast &&
       meter.isUnmetered() &&
       this.explainActualProfile === null &&
       vectorizedProjectEligible(plan)
@@ -17288,8 +17360,12 @@ export class Engine {
       running = this.execCostedTwoRelationJoin(plan, env, meter, params, materialized, relWork);
     } else {
       if (plan.rels.length === 0) {
-        meter.admitRow([]); // the FROM-less virtual row (memory.md §5.1)
-        running = [[]];
+        if (fast) {
+          meter.admitRow([]); // the FROM-less virtual row (memory.md §5.1)
+          running = [[]];
+        } else {
+          running = []; // a FROM-less contradiction produces no virtual row either
+        }
       } else {
         // The first relation's rows move into `running`, carrying their charge (memory.md §5.2).
         running = materialized[0]!;
@@ -17478,13 +17554,15 @@ export class Engine {
     }
 
     // WHERE over the combined rows. A WHERE arithmetic can throw (22003/22012); each surviving
-    // combined row's filter accrues operator_eval.
+    // combined row's filter accrues operator_eval. After a pushdown only the residual remains
+    // (planner.md §3.2); the pushed conjuncts already ran as each relation was read.
+    const filter = postJoinFilter(plan);
     let rows: Row[] = [];
     for (const row of running) {
-      if (plan.filter === null || isTrue(evalExpr(plan.filter, row, env, meter))) rows.push(row);
+      if (filter === null || isTrue(evalExpr(filter, row, env, meter))) rows.push(row);
       else meter.releaseRowMasked(row, memMask);
     }
-    if (plan.filter !== null) {
+    if (filter !== null) {
       if (selectActualRootNode(plan) !== "Filter")
         this.recordExplainActualParent("Filter", meter.accrued);
     }
@@ -17894,6 +17972,9 @@ export class Engine {
     if (sp.filter !== null) {
       const before = cost.value;
       sp.filter = this.foldUncorrelatedInRExpr(sp.filter, bound, ctes, cost);
+      // The fold replaces a folded conjunct node (Go overwrites it in place), so the pushdown's
+      // residual is re-derived from the folded WHERE (planner.md §3.2).
+      refreshWhereResidual(sp);
       this.recordExplainActualFolded(frame, "Filter", cost.value - before);
     }
     if (sp.having !== null) sp.having = this.foldUncorrelatedInRExpr(sp.having, bound, ctes, cost);
@@ -19405,7 +19486,7 @@ function estimatorPredicateSelectivityWithStatistics(
   }
 }
 
-function estimatorFlattenBoolean(expr: RExpr, kind: "and" | "or", out: RExpr[]): void {
+export function estimatorFlattenBoolean(expr: RExpr, kind: "and" | "or", out: RExpr[]): void {
   if (expr.kind === kind) {
     estimatorFlattenBoolean(expr.lhs, kind, out);
     estimatorFlattenBoolean(expr.rhs, kind, out);
@@ -19414,7 +19495,7 @@ function estimatorFlattenBoolean(expr: RExpr, kind: "and" | "or", out: RExpr[]):
   }
 }
 
-function estimatorLiteral(expr: RExpr): boolean {
+export function estimatorLiteral(expr: RExpr): boolean {
   return expr.kind.startsWith("const"); // parameters are a separate non-literal node kind
 }
 
@@ -19429,13 +19510,13 @@ function estimatorEqualityParts(expr: RExpr): { operand: RExpr; literal: RExpr }
   return null;
 }
 
-type EstimatorComparison = {
+export type EstimatorComparison = {
   operand: RExpr;
   literal: RExpr;
   op: "eq" | "lt" | "le" | "gt" | "ge";
 };
 
-function estimatorComparisonParts(expr: RExpr): EstimatorComparison | null {
+export function estimatorComparisonParts(expr: RExpr): EstimatorComparison | null {
   if (
     expr.kind !== "compare" ||
     (expr.op !== "eq" &&
@@ -19461,7 +19542,7 @@ function estimatorComparisonParts(expr: RExpr): EstimatorComparison | null {
 
 // Compare resolved, same-kind plan-time literals by their SQL total order. Open/unsupported
 // literal kinds return null: missing a proof is safe, inventing one is not.
-function estimatorLiteralCmp(a: RExpr, b: RExpr): number | null {
+export function estimatorLiteralCmp(a: RExpr, b: RExpr): number | null {
   if (a.kind !== b.kind) return null;
   switch (a.kind) {
     case "constInt": {
@@ -19520,7 +19601,7 @@ function estimatorLiteralCmp(a: RExpr, b: RExpr): number | null {
   }
 }
 
-function estimatorComparisonSatisfied(order: number, op: EstimatorComparison["op"]): boolean {
+export function estimatorComparisonSatisfied(order: number, op: EstimatorComparison["op"]): boolean {
   switch (op) {
     case "eq":
       return order === 0;
@@ -19571,7 +19652,7 @@ function estimatorBoundsContradict(
   return order !== null && (order > 0 || (order === 0 && (lowerOp === "gt" || upperOp === "lt")));
 }
 
-function estimatorConjunctionContradictory(conjuncts: RExpr[]): boolean {
+export function estimatorConjunctionContradictory(conjuncts: RExpr[]): boolean {
   const comparisons: EstimatorComparison[] = [];
   for (const conjunct of conjuncts) {
     const comparison = estimatorComparisonParts(conjunct);
@@ -25513,6 +25594,11 @@ export type SelectPlan = {
   // not a slow plan — so it is computed by the resolve half (computeRelMasks), never by a physical
   // rule (spec/design/planner.md §2).
   relMasks: boolean[][];
+  // pushdown is the stage-2 WHERE rewrite (rewrite.ts; spec/design/planner.md §3): a proven
+  // contradiction, or the per-relation pushed filters plus the post-join residual. null when no
+  // rewrite fired. filter above stays the COMPLETE WHERE — the input every access-path detector
+  // and estimator rule reads; execution evaluates postJoinFilter() over joined rows.
+  pushdown: WherePushdown | null;
   // phys is the plan's physical / access-path decisions — set ONLY by the optimizeSelect pass
   // (optimize.ts); zero-valued when resolve hands the plan over (spec/design/planner.md §4).
   phys: PhysicalPlan;
@@ -25530,7 +25616,7 @@ function selectActualRootNode(sp: SelectPlan): string {
   if (sp.distinct) return "Distinct";
   if (sp.hasWindow) return "Window";
   if (sp.isAgg) return "Aggregate";
-  if (sp.filter !== null) return "Filter";
+  if (postJoinFilter(sp) !== null) return "Filter";
   if (sp.rels.length > 1) {
     const last = sp.phys.joinSteps.at(-1);
     return (sp.rels.length === 2 && sp.phys.hashJoin !== null) || last?.hashJoin != null

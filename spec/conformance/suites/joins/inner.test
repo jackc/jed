@@ -4,7 +4,7 @@
 # PostgreSQL inner-join semantics). Qualified (t.col) and bare column references both resolve
 # through the FROM scope. Eligible bare equalities use hash join; other predicates retain nested
 # loop. Cost is the CROSS-CORE contract of cost.md §3.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_inner, query.table_alias, query.qualified_column, query.hash_join, expr.arithmetic, types.i32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_inner, query.table_alias, query.qualified_column, query.hash_join, expr.arithmetic, types.i32, types.text, resource.cost_metering, query.where_pushdown
 
 statement ok
 CREATE TABLE a (id i32 PRIMARY KEY, k i32)
@@ -44,11 +44,11 @@ SELECT a.id FROM a INNER JOIN b ON a.k = b.k ORDER BY a.id, b.id
 2
 2
 
-# WHERE applies AFTER the join, to the combined rows. The ON produces 3 matched rows; WHERE
-# `b.label = 'twenty'` evaluates on each and keeps one. Its ordinary operator_eval and
-# varlen_compare work composes with the selected nested-loop ON and output cost.
+# A WHERE conjunct on one relation runs as that relation is read (planner.md §3.2): `b.label =
+# 'twenty'` evaluates on each b row and keeps one, so only that row reaches the join. Its ordinary
+# operator_eval and varlen_compare work composes with the selected nested-loop ON and output cost.
 # names: id, k
-# cost: 42
+# cost: 35
 query II nosort
 SELECT a.id, b.k FROM a JOIN b ON a.k = b.k WHERE b.label = 'twenty' ORDER BY a.id
 ----

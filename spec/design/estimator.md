@@ -356,7 +356,7 @@ Join candidates count their different repetition shapes explicitly:
   bucket-verification candidates.
 
 For an eligible ordered join top-N, let `T = OFFSET + LIMIT`, let `J` be the estimated post-ON,
-post-WHERE rows before the window, and let `L` be the rows in the physical left subtree presented
+post-residual-WHERE rows before the window (pushed filters already shaped the inputs, §8.3), and let `L` be the rows in the physical left subtree presented
 to the final join step. When `T > 0` and `J > T`, the estimated number of left rows whose final join
 runs are started is `min(L, ceil(T * L / J))`; `J = 0` conservatively starts all `L`, and `T = 0`
 starts none. The multiply/divide uses quotient/remainder saturation, never float arithmetic. This
@@ -392,7 +392,18 @@ complete candidate pipeline rather than by blindly adding immutable logical-node
 The following attribution rules close the remaining current-plan shapes:
 
 - a residual `Filter` applies the complete predicate once to the logical input population, caps the
-  result by rows physically delivered by its child, and adds expression work for the child rows;
+  result by rows physically delivered by its child, and adds expression work for the child rows. In
+  a join with a stage-2 pushdown ([planner.md](planner.md) §3.2) the Filter's predicate is the
+  residual only (no Filter node when it is empty);
+- a pushed filter `F` belongs to its base relation's Scan node. With the selected access path's scan
+  rows `S` and logical rows `N`, the Scan adds `nodes(F) × S` `operator_eval`, its logical rows become
+  the statistics-aware selectivity of `F` applied to `N`, and its delivered rows become
+  `min(that, S)` — except an index-nested-loop inner, whose per-call `S` is bounded by the join key
+  rather than by `F`, so its delivered rows are `F`'s selectivity applied to `S`. The repetition by
+  outer rows then applies as for any INL inner;
+- a WHERE contradiction ([planner.md](planner.md) §3.1) estimates every relation subtree — base
+  scans, SRFs, CTE references, derived bodies — at zero rows, zero logical rows, and zero units, and a
+  FROM-less `Result` at zero rows; the pipeline above estimates normally over that empty input;
 - a nested-loop join adds both input scans once and ON work over its saturated candidate pairs; an
   index-nested-loop repeats the selected inner access work by outer rows; a hash join adds its fixed
   build/probe work and ON recheck work over estimated bucket candidates;

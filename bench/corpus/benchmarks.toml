@@ -243,6 +243,69 @@ setup_sql = [
   "INSERT INTO hash_ref_right SELECT g, g % 500 FROM generate_series(1, 2500) AS g"
 ]
 
+# Stage-2 WHERE pushdown (query.where_pushdown) and its results-identical residual reference. Each
+# 4,000-row input keeps 2% of its rows (flag = 1). The expression ON key keeps nested loop in both
+# forms, so the pushed form runs ON over 80 × 80 = 6,400 pairs while the `+ 0` reference — whose
+# arithmetic conjuncts never move — runs ON over all 16M pairs before filtering.
+[[bench]]
+name = "where_pushdown_join"
+description = "Single-table WHERE conjuncts run inside each scan: 80×80 nested-loop pairs instead of 4,000×4,000"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM pd_left l JOIN pd_right r ON l.k + 0 = r.k WHERE l.flag = 1 AND r.flag = 1"
+warmup = 2
+iterations = 20
+seed = 4271
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS pd_right",
+  "DROP TABLE IF EXISTS pd_left",
+  "CREATE TABLE pd_left (id bigint PRIMARY KEY, k bigint, flag bigint)",
+  "CREATE TABLE pd_right (id bigint PRIMARY KEY, k bigint, flag bigint)",
+  "INSERT INTO pd_left SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 4000) AS g",
+  "INSERT INTO pd_right SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 4000) AS g"
+]
+
+[[bench]]
+name = "where_pushdown_join_residual"
+description = "Residual reference for where_pushdown_join: `+ 0` conjuncts stay above the 16M-pair nested loop"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM pd_ref_left l JOIN pd_ref_right r ON l.k + 0 = r.k WHERE l.flag + 0 = 1 AND r.flag + 0 = 1"
+warmup = 1
+iterations = 3
+seed = 4272
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS pd_ref_right",
+  "DROP TABLE IF EXISTS pd_ref_left",
+  "CREATE TABLE pd_ref_left (id bigint PRIMARY KEY, k bigint, flag bigint)",
+  "CREATE TABLE pd_ref_right (id bigint PRIMARY KEY, k bigint, flag bigint)",
+  "INSERT INTO pd_ref_left SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 4000) AS g",
+  "INSERT INTO pd_ref_right SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 4000) AS g"
+]
+
+# Stage-2 WHERE contradiction (query.where_contradiction): the empty literal range is proven at plan
+# time, so jed reads none of the 100k rows; PostgreSQL scans them.
+[[bench]]
+name = "where_contradiction"
+description = "Provably empty `v > 100 AND v < 50` over 100k rows: no relation is read"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM contradiction_orders WHERE v > 100 AND v < 50"
+warmup = 100
+iterations = 5000
+seed = 4273
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS contradiction_orders",
+  "CREATE TABLE contradiction_orders (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO contradiction_orders SELECT g, g % 1000 FROM generate_series(1, 100000) AS g"
+]
+
 # P7 reverse-orientation INL and its results-identical nested-loop reference. The indexed 50k-row
 # relation deliberately appears first in SQL. Costed two-relation search reverses the physical
 # order so the 250-row driver is left and the PK relation becomes the per-row bound inner; wrapping

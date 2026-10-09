@@ -79,6 +79,14 @@
 #              the equivalent sibling <@ indexed-column spelling defeats the bound.
 #   gist_inl — GiST range @> and fixed-width scalar = sibling operands bound the inner; equivalent
 #              <@ and paired-inequality spellings defeat the bounds.
+#   where_pushdown — single-relation WHERE conjuncts over a join run as their (preserved) base
+#              relation is read (planner.md §3.2); writing each column as `col + 0` makes the conjunct
+#              arithmetic, which never moves, so it is applied to the joined rows instead. INNER, LEFT,
+#              RIGHT, FULL and three-relation shapes over NULL-bearing data must match by-construction
+#              rows — a conjunct wrongly pushed to a NULL-extended side changes the answer.
+#   contradiction — a provably-never-TRUE bare-column literal AND-chain reads no relation
+#              (planner.md §3.1); the same predicate over `col + 0` is not proven and scans. Both must be
+#              empty (an ungrouped COUNT returns 0), and satisfiable near-miss ranges must match.
 #   tlp      — Ternary-Logic Partitioning (SQLancer): for ANY predicate p, every row is in exactly
 #              one of `WHERE p` (TRUE) / `WHERE NOT p` (FALSE) / `WHERE p IS NULL` (UNKNOWN), so the
 #              three partitions UNION ALL must reconstruct the whole table (and COUNT over the whole
@@ -290,6 +298,18 @@ JOIN_COMM_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_
                    query.comparison_order query.order_by query.order_by_keys query.qualified_column
                    query.where_eq query.join_inner query.cross_join expr.comparison_value
                    types.i32].freeze
+
+WHERE_PUSHDOWN_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                        query.where_eq query.comparison_order query.logical_connectives query.order_by
+                        query.order_by_keys query.qualified_column query.join_inner query.join_left
+                        query.join_right query.join_full query.cross_join query.is_null
+                        query.is_distinct_from query.where_pushdown expr.arithmetic expr.between
+                        expr.comparison_value null.three_valued types.i32].freeze
+CONTRADICTION_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                       query.where_eq query.comparison_order query.logical_connectives query.order_by
+                       query.aggregates query.qualified_column query.join_inner
+                       query.where_contradiction expr.arithmetic expr.comparison_value
+                       null.three_valued types.i32 types.text types.boolean].freeze
 
 # The default relation note describes the NoREC pair (an optimized form vs a non-optimizable
 # rewrite). TLP overrides it with its own partition-reconstruction note (it is not an opt pair).
@@ -2366,6 +2386,160 @@ def gen_join_comm(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: WHERE pushdown through joins ---------------------------------------------------
+# One single-relation predicate template: [sql over column expression c, 3VL evaluator]. The
+# evaluator returns true / false / nil (UNKNOWN) for a value x (nil = SQL NULL).
+WHERE_PUSHDOWN_TEMPLATES = [
+  lambda { |c, r| k = r.rand(-3..12); ["#{c} > #{k}", ->(x) { x.nil? ? nil : x > k }] },
+  lambda { |c, r| k = r.rand(-3..12); ["#{c} <= #{k}", ->(x) { x.nil? ? nil : x <= k }] },
+  lambda { |c, _| ["#{c} IS NULL", lambda(&:nil?)] },
+  lambda { |c, _| ["#{c} IS NOT NULL", ->(x) { !x.nil? }] },
+  lambda { |c, r| k = r.rand(0..10); ["(#{c} = #{k} OR #{c} IS NULL)", ->(x) { x.nil? || x == k }] },
+  lambda { |c, r| k = r.rand(0..10); ["NOT (#{c} = #{k})", ->(x) { x.nil? ? nil : x != k }] },
+  lambda { |c, r| k = r.rand(0..10); ["#{c} IS DISTINCT FROM #{k}", ->(x) { x.nil? || x != k }] },
+  lambda { |c, r| k = r.rand(0..10); ["#{c} IS NOT DISTINCT FROM #{k}", ->(x) { x == k }] },
+  lambda do |c, r|
+    lo = r.rand(0..6)
+    hi = lo + r.rand(0..5)
+    ["#{c} BETWEEN #{lo} AND #{hi}", ->(x) { x.nil? ? nil : x.between?(lo, hi) }]
+  end,
+  lambda do |c, r|
+    k1 = r.rand(0..10)
+    k2 = r.rand(0..10)
+    ["#{c} IN (#{k1}, #{k2})", ->(x) { x.nil? ? nil : [k1, k2].include?(x) }]
+  end,
+].freeze
+
+def gen_where_pushdown(seed)
+  rng = Random.new(seed)
+  val = -> { rng.rand < 0.2 ? nil : rng.rand(0..10) }
+  a = (1..20).to_a.sample(6, random: rng).sort.map { |id| [id, rng.rand(1..5), val.call] }
+  b = (101..120).to_a.sample(6, random: rng).sort.map { |id| [id, rng.rand(2..6), val.call] }
+  c = (201..220).to_a.sample(4, random: rng).sort.map { |id| [id, rng.rand(1..6)] }
+  lit = ->(x) { x.nil? ? "NULL" : x.to_s }
+  # NULLs sort last (CLAUDE.md §8): order key per nullable id.
+  nkey = ->(x) { x.nil? ? [1, 0] : [0, x] }
+  flat = lambda do |rows|
+    rows.sort_by { |r| r.flat_map { |x| nkey.call(x) } }.flat_map { |r| r.map { |x| lit.call(x) } }
+  end
+  pick = lambda do |col|
+    sql, fn = WHERE_PUSHDOWN_TEMPLATES.sample(random: rng).call(col, rng)
+    [sql, fn, sql.gsub(col, "#{col} + 0")]
+  end
+
+  out = header(seed, WHERE_PUSHDOWN_REQ, "WHERE pushdown through joins (pushed vs residual conjuncts)")
+  stmt(out, "CREATE TABLE a (id i32 PRIMARY KEY, k i32, v i32)")
+  stmt(out, "CREATE TABLE b (id i32 PRIMARY KEY, k i32, w i32)")
+  stmt(out, "CREATE TABLE c (id i32 PRIMARY KEY, k i32)")
+  stmt(out, "INSERT INTO a VALUES #{a.map { |id, k, v| "(#{id}, #{k}, #{lit.call(v)})" }.join(', ')}")
+  stmt(out, "INSERT INTO b VALUES #{b.map { |id, k, w| "(#{id}, #{k}, #{lit.call(w)})" }.join(', ')}")
+  stmt(out, "INSERT INTO c VALUES #{c.map { |id, k| "(#{id}, #{k})" }.join(', ')}")
+
+  # Logical join rows as [a_row_or_nil, b_row_or_nil] for each join kind.
+  matched = a.flat_map { |ar| b.select { |br| br[1] == ar[1] }.map { |br| [ar, br] } }
+  left = a.flat_map { |ar| (m = b.select { |br| br[1] == ar[1] }).empty? ? [[ar, nil]] : m.map { |br| [ar, br] } }
+  right_only = b.reject { |br| a.any? { |ar| ar[1] == br[1] } }.map { |br| [nil, br] }
+  left_only = a.reject { |ar| b.any? { |br| br[1] == ar[1] } }.map { |ar| [ar, nil] }
+  shapes = [
+    ["INNER", "JOIN", matched],
+    ["LEFT", "LEFT JOIN", left],
+    ["RIGHT", "RIGHT JOIN", matched + right_only],
+    ["FULL", "FULL JOIN", matched + left_only + right_only],
+  ]
+  shapes.each do |title, join, rows|
+    pa_sql, pa, pa_scan = pick.call("a.v")
+    pb_sql, pb, pb_scan = pick.call("b.w")
+    exp = rows.select { |ar, br| pa.call(ar&.at(2)) == true && pb.call(br&.at(2)) == true }
+              .map { |ar, br| [ar&.first, br&.first] }
+    sql = ->(pred) { "SELECT a.id, b.id FROM a #{join} b ON a.k = b.k WHERE #{pred} ORDER BY a.id, b.id" }
+    out << "# #{title}: a single-relation conjunct per side (pushed only where the side is preserved)"
+    q(out, "II", sql.call("#{pa_sql} AND #{pb_sql}"), flat.call(exp))
+    out << "# the same conjuncts over `+ 0` are never pushed — MUST match"
+    q(out, "II", sql.call("#{pa_scan} AND #{pb_scan}"), flat.call(exp))
+  end
+
+  # A residual cross-relation conjunct beside pushed single-relation ones.
+  pa_sql, pa, pa_scan = pick.call("a.v")
+  exp = matched.select { |ar, br| pa.call(ar[2]) == true && !ar[2].nil? && !br[2].nil? && ar[2] <= br[2] }
+               .map { |ar, br| [ar.first, br.first] }
+  out << "# INNER with a pushed conjunct and a residual cross-relation conjunct"
+  q(out, "II", "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE #{pa_sql} AND a.v <= b.w ORDER BY a.id, b.id",
+    flat.call(exp))
+  out << "# unpushed spelling — MUST match"
+  q(out, "II", "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE #{pa_scan} AND a.v + 0 <= b.w ORDER BY a.id, b.id",
+    flat.call(exp))
+
+  # Three relations, each with its own conjunct.
+  pa_sql, pa, pa_scan = pick.call("a.v")
+  pb_sql, pb, pb_scan = pick.call("b.w")
+  pc_sql, pc, pc_scan = pick.call("c.k")
+  exp = matched.flat_map { |ar, br| c.select { |cr| cr[1] == br[1] }.map { |cr| [ar, br, cr] } }
+               .select { |ar, br, cr| pa.call(ar[2]) == true && pb.call(br[2]) == true && pc.call(cr[1]) == true }
+               .map { |ar, br, cr| [ar.first, br.first, cr.first] }
+  three = lambda do |pred|
+    "SELECT a.id, b.id, c.id FROM a JOIN b ON a.k = b.k JOIN c ON b.k = c.k WHERE #{pred} ORDER BY a.id, b.id, c.id"
+  end
+  out << "# three relations, one conjunct each"
+  q(out, "III", three.call("#{pa_sql} AND #{pb_sql} AND #{pc_sql}"), flat.call(exp))
+  out << "# unpushed spelling — MUST match"
+  q(out, "III", three.call("#{pa_scan} AND #{pb_scan} AND #{pc_scan}"), flat.call(exp))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: WHERE contradiction ------------------------------------------------------------
+def gen_contradiction(seed)
+  rng = Random.new(seed)
+  rows = (1..30).to_a.sample(8, random: rng).sort.map do |id|
+    [id, rng.rand < 0.2 ? nil : rng.rand(-5..15), %w[p q r s].sample(random: rng)]
+  end
+  ids = ->(sel) { sel.map { |id, _, _| id.to_s } }
+  lit = ->(x) { x.nil? ? "NULL" : x.to_s }
+
+  out = header(seed, CONTRADICTION_REQ, "WHERE contradiction (proven-empty vs scanned)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, x i32, s text)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, x, s| "(#{id}, #{lit.call(x)}, '#{s}')" }.join(', ')}")
+
+  lo = rng.rand(-5..10)
+  hi = lo + rng.rand(0..5)
+  k1 = rng.rand(-5..15)
+  k2 = k1 + rng.rand(1..4)
+  sv = %w[p q r s].sample(2, random: rng)
+  contradictions = [
+    "x > #{hi} AND x < #{lo}",
+    "x >= #{hi + 1} AND x <= #{hi}",
+    "x = #{k1} AND x = #{k2}",
+    "x = #{k1} AND x > #{k1}",
+    "x = NULL",
+    "s = '#{sv[0]}' AND s = '#{sv[1]}'",
+  ]
+  contradictions.each do |pred|
+    # `x + 0` / `(s = 'v') = true` keep the predicate but hide the bare column from the proof.
+    scan = pred.gsub(/\bx /, "x + 0 ").gsub(/\bs = ('\w')/) { "(s = #{Regexp.last_match(1)}) = true" }
+    out << "# proven contradiction: `#{pred}` reads nothing"
+    q(out, "I", "SELECT id FROM t WHERE #{pred} ORDER BY id", [])
+    out << "# unproven spelling scans — MUST also be empty"
+    q(out, "I", "SELECT id FROM t WHERE #{scan} ORDER BY id", [])
+    out << "# an ungrouped aggregate still returns its row"
+    q(out, "I", "SELECT count(*) FROM t WHERE #{pred}", ["0"])
+    q(out, "I", "SELECT count(*) FROM t AS u JOIN t ON u.id = t.id WHERE #{pred.gsub(/\b(x|s) /) { "t.#{Regexp.last_match(1)} " }}", ["0"])
+  end
+
+  near = [
+    ["x >= #{lo} AND x <= #{lo}", ->(x) { !x.nil? && x == lo }],
+    ["x > #{lo} AND x < #{hi + 2}", ->(x) { !x.nil? && x > lo && x < hi + 2 }],
+    ["x = #{k1} AND x >= #{k1}", ->(x) { !x.nil? && x == k1 }],
+  ]
+  near.each do |pred, fn|
+    exp = ids.call(rows.select { |_, x, _| fn.call(x) })
+    out << "# satisfiable near miss `#{pred}`"
+    q(out, "I", "SELECT id FROM t WHERE #{pred} ORDER BY id", exp)
+    q(out, "I", "SELECT id FROM t WHERE #{pred.gsub(/\bx /, 'x + 0 ')} ORDER BY id", exp)
+  end
+
+  out.join("\n") + "\n"
+end
+
 SCENARIOS = {
   "pushdown" => method(:gen_pushdown),
   "composite_pk" => method(:gen_composite_pk),
@@ -2405,6 +2579,8 @@ SCENARIOS = {
   "predicate" => method(:gen_predicate),
   "setop_logic" => method(:gen_setop_logic),
   "join_comm" => method(:gen_join_comm),
+  "where_pushdown" => method(:gen_where_pushdown),
+  "contradiction" => method(:gen_contradiction),
 }.freeze
 
 # Run one core's harness once; return {basename => "PASS"/"FAIL"/"SKIP"} and the detail line per

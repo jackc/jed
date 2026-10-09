@@ -3,8 +3,8 @@
 > How a SELECT becomes an executable plan, and where each optimization lives. The planner
 > is a **deterministic rule engine** whose cost-based single-relation and join choices have
 > landed: it resolves
-> the query into a **logical plan**, applies **rewrite rules** (none exist yet — §3), and
-> then runs **physical/access-path selection** — a fixed, ordered list of discrete rules,
+> the query into a **logical plan**, applies **rewrite rules** (WHERE contradiction detection and
+> WHERE pushdown — §3), and then runs **physical/access-path selection** — a fixed, ordered list of discrete rules,
 > each a single function owning its gate and its action. This doc is the contract all three
 > cores implement in lockstep (CLAUDE.md §2). It exists because the passes used to be fused
 > into one `planSelect` function per core; the observable behavior — which plan is chosen,
@@ -18,7 +18,7 @@ A query statement moves through these stages, per core:
 ```
 parse                    → AST
 resolve                  → the LOGICAL plan     (stage 1 — planSelect's body)
-rewrite rules            → logical plan         (stage 2 — empty today, §3)
+rewrite rules            → logical plan         (stage 2 — rewriteWhere, §3)
 physical selection       → physical decisions   (stage 3 — optimizeSelect, §4)
 —— the planner ends here ——
 bind params              → values for $N
@@ -31,6 +31,7 @@ Entry points (each core spells the same decomposition in its own convention):
 | stage | Go | Rust | TS |
 |---|---|---|---|
 | resolve → logical plan | `planSelect` (planner.go) | `plan_select` (executor/planner.rs) | `planSelect` (executor.ts) |
+| WHERE rewrite | `rewriteWhere` (rewrite.go) | `rewrite_where` (executor/rewrite.rs) | `rewriteWhere` (rewrite.ts) |
 | physical selection | `optimizeSelect` (optimize.go) | `optimize_select` (executor/optimize.rs) | `optimizeSelect` (optimize.ts) |
 | access-path mechanisms | access_path.go | executor/access_encode.rs | executor.ts (`detect*`) |
 
@@ -66,26 +67,113 @@ scan ([large-values.md §14](large-values.md)) and a cost input (cost.md §3 "th
 set"); a wrong mask is a disk-mode NULL-folding bug, not a slow plan. It therefore lives
 with resolution, not with the rules.
 
-## 3. Stage 2 — rewrite rules (empty)
+## 3. Stage 2 — rewrite rules
 
-There are **no rewrite rules yet**; the stage is a documented seam in each core's
-`planSelect` (a fixed position between logical-plan assembly and `optimizeSelect`), not a
-no-op driver function. The first occupant introduces the driver — expected: **predicate
-pushdown + simplification** (TODO.md), pushing WHERE conjuncts into derived tables / CTEs /
-through joins, and detecting contradictions.
+Stage 2 sits at a fixed position in each core's `planSelect`, after the logical plan and its
+`relMasks` annotation are complete and before `optimizeSelect`. Its one driver, `rewriteWhere`, runs
+contradiction detection (§3.1) and, when that does not fire, WHERE pushdown (§3.2). It records its
+decision in a `pushdown` annotation of the plan and **never rewrites `filter`**: the complete WHERE
+remains the input every access-path detector, index-nested-loop detector, touched-set walk, and
+selectivity rule reads, so bounds and estimates see exactly the predicates they saw before. Execution
+reads the annotation: a contradiction reads nothing, a pushed filter runs inside its relation's scan,
+and only the **residual** (`postJoinFilter`) is evaluated over joined rows.
 
-The contract a rewrite rule must meet before it lands:
+The contract every rewrite rule meets:
 
 - **Plan→plan and pure** — it transforms the logical plan before parameters are bound; it
-  never executes anything.
-- **Results-identical** — the same rows and the same errors, on every core.
-- **Cost-identical, or an explicitly decided cost change.** This is the sharp constraint:
-  cost is an observable cross-core contract (CLAUDE.md §13, cost.md §1). Textbook rewrites
-  — constant folding, CSE, short-circuiting — **drop `operator_eval` charges**, so each
-  such rule needs an explicit cost decision recorded here and the affected `# cost:`
-  corpus entries re-pinned in the same change; never a silent apply.
+  never executes anything and never reads a parameter value.
+- **Results-identical, and never a new error.** The same rows on every core. A rewrite may
+  evaluate an expression on rows the unrewritten plan would not reach only when that expression is
+  structurally unable to trap; it may skip evaluations the unrewritten plan performs — exactly as a
+  scan bound already does — so an error that plan would raise can go unraised. Error visitation, and
+  the point where a cost ceiling aborts (54P01), are defined by the selected (rewritten) plan, as for
+  every physical choice ([estimator.md](estimator.md) §1).
+- **Cost-identical, or an explicitly decided cost change.** Cost is an observable cross-core
+  contract (CLAUDE.md §13, cost.md §1). Textbook rewrites — constant folding, CSE,
+  short-circuiting — **drop `operator_eval` charges**, so each rule records its cost decision here
+  and re-pins the affected `# cost:` corpus entries in the same change; never a silent apply.
 - **A NoREC relation in the same change** ([conformance.md §8](conformance.md)) — the
   metamorphic sweep does not discover new optimizations on its own.
+
+General constant folding, CSE, and redundant-recheck elimination remain unimplemented; each would
+need its own cost decision under this contract.
+
+### 3.1 Contradiction detection (`query.where_contradiction`)
+
+Flatten the WHERE's top-level AND-chain (nested ANDs included; an OR, NOT, or any other node is one
+opaque conjunct). The WHERE is a **contradiction** when any of these plan-time proofs holds:
+
+1. a conjunct is the literal `FALSE` or a literal `NULL`;
+2. a conjunct is a comparison (`= < <= > >=`) between two literals that is never TRUE — either side
+   NULL, or a same-kind literal pair whose order fails the operator; text literals are compared only
+   by `=` (byte identity — every jed collation is deterministic, [collation.md](collation.md) §6),
+   never by ordering, which a collation may decide;
+3. among the conjuncts that compare a **bare column** with a literal, the estimator's contradiction
+   inventory ([estimator.md](estimator.md) §7.1) finds a NULL literal or two comparisons on the same
+   column with no common value (`x > 5 AND x < 3`, `x = 1 AND x = 2`, `x = 1 AND x > 1`), under the
+   same literal comparison and text-equality restriction as rule 2.
+
+Rule 3 deliberately admits only bare columns: a column has one value per row, while a structurally
+equal expression may not (`random() > 0.9 AND random() < 0.1` can be TRUE). Parameters are never
+proven (planning is pre-bind), nor are disjunctions or non-column operands; a missed proof only
+forgoes the optimization. Contradictions over a scan key's parameters remain the runtime empty-bound
+rule of cost.md §3.
+
+**Cost decision.** A contradictory SELECT reads **no relation**: no base table page or row, no SRF
+generated row, no `cte_scan_row`, no derived or inlined-CTE body, and no FROM-less virtual row. Nothing
+is charged for them. Everything above the FROM runs over the empty input exactly as it would over an
+empty table: an ungrouped aggregate produces its one row (its `row_produced`), HAVING is evaluated
+once on it, GROUP BY/window/DISTINCT/ORDER BY produce nothing. Uncorrelated expression subqueries are
+still folded once before execution, as for any query. Each set-operation arm and each subquery is its
+own SELECT and is judged independently. The streaming pull lane keeps its lane and simply produces
+nothing. Mutations retain their existing runtime empty-bound behavior; a DML contradiction rule is a
+follow-on.
+
+### 3.2 WHERE pushdown (`query.where_pushdown`)
+
+In a SELECT with at least two FROM relations and no contradiction, each top-level WHERE conjunct, in
+source order, is **pushed** to relation `i` when all of these hold:
+
+- it references at least one column, and every column it references belongs to relation `i` (an
+  outer reference makes it unsafe, below);
+- relation `i` is a non-lateral **base table** (not an SRF, catalog relation, CTE reference, or
+  derived table — pushing into those bodies is a follow-on);
+- no outer join NULL-extends relation `i`: for the left-deep FROM, `joins[k]` LEFT marks
+  `rels[k+1]`, RIGHT marks every `rels[0..k]`, FULL marks both;
+- the conjunct is **pushdown-safe**: a tree of AND/OR/NOT over comparisons (`= <> < <= > >=`, except a
+  collated ordering comparison), IS [NOT] NULL, IS [NOT] DISTINCT FROM, and bare boolean columns, whose
+  operands are bare columns, literals, and parameters. Every such node is structurally unable to
+  trap and reads only the current row, so evaluating it on a row the join would have discarded can
+  neither raise an error nor change a value. Casts, arithmetic, functions, CASE, subqueries, and
+  outer references stay in the residual.
+
+The conjuncts pushed to a relation form its **pushed filter**; all other conjuncts form the
+**residual**. Each is rebuilt as the **left-deep AND of its conjuncts in source order** (so a filter of
+`n` conjuncts has `n − 1` AND nodes; the original WHERE's AND nodes are not charged anywhere).
+Ordinary column slots are unchanged in the plan's copy; execution evaluates a copy rebased to the
+relation's own row.
+
+**Execution.** The pushed filter runs wherever the relation's rows are read — the materialized scan,
+the per-outer-row index-nested-loop fetch, and the bounded spill lane — on each row the access path
+admits, after its `storage_row_read` and before it is admitted to the query-memory row account or
+reaches a join: a row that is not TRUE is dropped there. The residual, when present, is evaluated on
+each joined row exactly where the complete WHERE used to be; when every conjunct was pushed there is
+no post-join filter at all.
+
+**Cost decision.** A pushed conjunct charges its `operator_eval` (and size-scaled comparison units)
+once per **admitted base row** — repeated per outer row for an index-nested-loop inner — instead of
+once per **surviving joined row**; rows it rejects never reach the ON predicate, hash build/probe,
+the residual, or the row account. The residual charges as the old WHERE did, over joined rows. The
+rule is unconditional (PostgreSQL's choice), so the change is usually a reduction but is not
+monotone: when a join discards more rows than it multiplies, evaluating the conjunct on every base
+row can cost more than evaluating it on the few joined survivors. The estimator models the split
+([estimator.md](estimator.md) §8.3), so cost-based join search sees it, and the actual meter remains
+authoritative. Because only non-trapping conjuncts move, pushdown never raises an error the
+unrewritten plan would not; it can leave unraised an ON-predicate error on a pair whose base row the
+pushed filter rejected — the same narrowing a scan bound already performs.
+
+EXPLAIN renders a pushed filter on its Scan and the residual as the Filter node
+([explain.md](explain.md) §5).
 
 ## 4. Stage 3 — physical/access-path selection: the rule inventory
 
@@ -156,7 +244,8 @@ fixed-policy shape uses the structural selector, whose precedence is:
 6. Else: **full scan**.
 
 Whatever the bound, the WHERE stays the **residual filter** — a bound only narrows which
-rows are scanned, so a superset bound is always sound.
+rows are scanned, so a superset bound is always sound. (In a join, the conjuncts §3.2 pushes to the
+relation are rechecked by its scan and the rest after the join; every conjunct is still evaluated.)
 
 ### 5.1 Consumer policies over one bound inventory
 
@@ -295,7 +384,8 @@ its final join step eligible for N-way streaming top-N.
 
 ## 7. Where future passes plug in
 
-- **Predicate pushdown + simplification** (TODO.md) — the first stage-2 rewrite rules,
-  under the §3 contract.
+- **Further stage-2 rewrites** (TODO.md) — pushdown into derived tables / CTE bodies, ON-clause
+  pushdown, DML contradictions, constant folding — each under the §3 contract with its own cost
+  decision.
 - **New physical rules** (the hash join above and later access paths tracked in TODO.md) land as
   discrete rule functions in the §4 inventory, each with its NoREC relation.

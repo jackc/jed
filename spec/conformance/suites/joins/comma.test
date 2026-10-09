@@ -6,7 +6,7 @@
 # `FROM t, LATERAL (…)` (a lateral item still sees earlier comma items). Cost is the CROSS-JOIN
 # contract of cost.md §3 (JOIN): storage_row_read per materialized row (sum of cardinalities), NO
 # ON operator_eval for a comma cross, WHERE per surviving combined row, row_produced per emitted row.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.order_by, query.order_by_keys, query.comma_from, query.cross_join, query.join_inner, query.index_nested_loop, query.qualified_column, query.derived_table, query.lateral, query.subquery_correlated, expr.arithmetic, types.i32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.order_by, query.order_by_keys, query.comma_from, query.cross_join, query.join_inner, query.index_nested_loop, query.qualified_column, query.derived_table, query.lateral, query.subquery_correlated, expr.arithmetic, types.i32, resource.cost_metering, query.where_pushdown
 
 statement ok
 CREATE TABLE a (id i32 PRIMARY KEY, k i32)
@@ -56,10 +56,11 @@ query II nosort
 SELECT a.id, e.id FROM a, e
 ----
 
-# WHERE applies after the product. 6 combined rows, `a.k = 20` evaluated on each (6) keeps the two
-# b-pairs of a row 2. 3 + 2 materialize + 2 page + 6 WHERE + 2 produced.
+# A single-relation WHERE conjunct runs as its relation is read (planner.md §3.2): `a.k = 20` is
+# evaluated on a's 3 rows (3) and keeps row 2, whose product with b leaves nothing residual.
+# 3 + 2 materialize + 2 page + 3 filter + 2 produced.
 # names: k, w
-# cost: 15
+# cost: 12
 query II nosort
 SELECT a.k, b.w FROM a, b WHERE a.k = 20 ORDER BY b.w
 ----
@@ -144,9 +145,9 @@ SELECT a.id, b.id, c.id FROM a, b JOIN c ON b.id = c.id ORDER BY a.id, b.id
 2
 
 # SELECT * expands across the comma items in FROM order, each in catalog order: a(id, k) then
-# b(id, w). a row 1 crossed with both b rows.
+# b(id, w). a row 1 crossed with both b rows; `a.id = 1` bounds a and is rechecked by its scan.
 # names: id, k, id, w
-# cost: 9
+# cost: 8
 query IIII nosort
 SELECT * FROM a, b WHERE a.id = 1 ORDER BY b.id
 ----
@@ -165,7 +166,7 @@ SELECT k FROM a, c
 
 # A qualified column from either comma item resolves. a.id = 1 keeps a's one row crossed with c.
 # names: k, k
-# cost: 9
+# cost: 8
 query II nosort
 SELECT a.k, c.k FROM a, c WHERE a.id = 1 ORDER BY c.k
 ----

@@ -2,7 +2,7 @@
 # PostgreSQL-oracle-imported because PG requires the btree_gist extension for the DDL; the equality
 # rows are ordinary PG semantics. It also pins that a regular B-tree sibling bound wins when both
 # access methods index the same scalar column.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gist_scalar_index, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.join_left, query.cross_join, query.qualified_column, query.table_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.limit, query.explain, query.index_nested_loop, query.gist_scalar_scan, query.gist_index_nested_loop, query.order_by_join_scan, query.order_by_join_inl, types.i32, null.three_valued, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gist_scalar_index, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.join_left, query.cross_join, query.qualified_column, query.table_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.limit, query.explain, query.index_nested_loop, query.gist_scalar_scan, query.gist_index_nested_loop, query.order_by_join_scan, query.order_by_join_inl, types.i32, null.three_valued, resource.cost_metering, query.where_pushdown
 
 statement ok
 CREATE TABLE room_probe (id i32 PRIMARY KEY, room i32)
@@ -59,8 +59,10 @@ NULL
 4
 NULL
 
-# WHERE-derived bound plus a residual reject.
-# cost: 42
+# WHERE-derived conjuncts plus a pushed reject. `s.id > 2` moves to seat's scan, which changes the
+# estimates enough that a full nested loop now wins the estimate over the GiST INL (estimator.md §1:
+# estimates choose the plan; the actual cost is whatever the chosen plan runs).
+# cost: 51
 query II nosort
 SELECT p.id, s.id
 FROM room_probe p CROSS JOIN seat s

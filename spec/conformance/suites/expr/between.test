@@ -5,7 +5,7 @@
 # Both bounds parse at the additive level, so the structural AND is not the logical connective
 # and `x BETWEEN a AND b AND c` is `(x BETWEEN a AND b) AND c`. Verified against PostgreSQL 18.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.logical_connectives, expr.between, expr.comparison_value, types.i16, types.i32, types.text, null.three_valued, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.logical_connectives, expr.between, expr.comparison_value, types.i16, types.i32, types.text, null.three_valued, resource.cost_metering, query.where_contradiction
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32)
@@ -39,9 +39,9 @@ true
 NULL
 
 # G19 — REVERSED bounds. BETWEEN does NOT reorder its bounds: `a BETWEEN 20 AND 10` is
-# `a >= 20 AND a <= 10`, which no value can satisfy, so it is empty. 4 scanned + 3 interior nodes
-# per row (12) + 0 produced + 1 page = 17.
-# cost: 17
+# `a >= 20 AND a <= 10`, which no value can satisfy, so it is empty. The planner proves that
+# contradiction from the literals (planner.md §3.1) and reads nothing: cost 0.
+# cost: 0
 query I nosort
 SELECT id FROM t WHERE a BETWEEN 20 AND 10 ORDER BY id
 ----

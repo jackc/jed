@@ -212,6 +212,9 @@ var SupportedCapabilities = []string{
 	"attach.in_memory",
 	"query.correlated_pushdown",
 	"query.join_pushdown",
+	// Stage-2 WHERE rewrites (spec/design/planner.md §3): contradiction detection and join pushdown.
+	"query.where_pushdown",
+	"query.where_contradiction",
 	"query.index_nested_loop",
 	"query.hash_join",
 	"query.gin_index_nested_loop",

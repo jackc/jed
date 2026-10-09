@@ -84,6 +84,19 @@ sort candidates — and the per-core spill tests prove this fixed-width K create
 smaller `work_mem` falls back to the existing external sorter. Timings remain non-gating; checksum,
 corpus results/costs, and the no-run/fallback invariants are the correctness proof.
 
+**Stage-2 WHERE rewrite result (2026-10-08).** The new `where_pushdown_join` /
+`where_pushdown_join_residual` pair counts the same join of two 4,000-row inputs whose single-table
+conjuncts keep 2% of each side; an expression ON key keeps nested loop in both, and the reference
+spells the conjuncts as `flag + 0 = 1`, which never moves. Pushed, the ON runs over 80 × 80 pairs
+instead of 16M. Median per-query time was **1.67 ms pushed vs 1.47 s residual Go** (Go before the
+change: 1.49 s for the pushed spelling), **2.11 ms vs 2.13 s Rust**, and **2.45 ms vs 2.25 s
+TypeScript**. `where_contradiction` (`v > 100 AND v < 50` over 100k rows) went from **5.08 ms to
+0.57 µs Go** and runs in about 1 µs Rust and 3 µs TypeScript, because no relation is read. Every core,
+before and after, returned the same per-lane checksums (`e4d18600a94a2e49`, `971902921dcf5248`,
+`73b79e622788756d`); the PostgreSQL lane was not re-run in this environment. Timings remain
+non-gating; the shared corpus pins, oracle-checked rows, and the `where_pushdown` / `contradiction`
+NoREC relations are the correctness proof.
+
 **GiST sibling-INL result (2026-07-13).** The permanent `gist_inl` /
 `gist_inl_nested_fallback` pair joins ten scalar probes to 50,000 inner rows and returns the same
 500-row result per iteration (checksum `342dce43410acbad`). The bare equality uses jed's scalar GiST

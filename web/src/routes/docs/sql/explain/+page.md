@@ -40,6 +40,10 @@ FROM city c JOIN trip t ON c.zone = t.city_id;`;
 FROM city c
 JOIN trip t ON c.id = t.city_id
 JOIN region r ON r.id = c.region;`;
+	const pushdown = `EXPLAIN SELECT c.name, t.id
+FROM city c JOIN trip t ON c.zone = t.city_id
+WHERE c.zone < 8 AND t.id > 2;`;
+	const contradiction = `EXPLAIN SELECT name FROM city WHERE zone > 5 AND zone < 3;`;
 	const aggregate = `EXPLAIN SELECT region, count(*)
 FROM city GROUP BY region;`;
 	const analyze = `EXPLAIN ANALYZE SELECT name FROM city WHERE id = 3;`;
@@ -182,6 +186,25 @@ materializes the selected left subtree and streams only the final join step, so 
 discount work the executor still performs.
 
 <LiveSql seed={seed} query={nwayJoin} rows={11} />
+
+## Pushed filters and contradictions
+
+Before choosing access paths, jed rewrites the `WHERE` in two ways. In a join, a condition that
+mentions only one base table — and only non-trapping comparisons, `IS [NOT] NULL`, `IS [NOT] DISTINCT
+FROM`, and `AND`/`OR`/`NOT` over columns, literals, and parameters — runs **inside that table's scan**,
+so rejected rows never reach the join. EXPLAIN shows it on the `Scan` as `filter:conjuncts=N`
+(`VERBOSE` spells the expression), and the `Filter` node above the join keeps only what still needs
+both sides (it disappears when nothing is left). Conditions on the NULL-extended side of an outer join
+stay above the join, where they see the NULL-extended rows.
+
+<LiveSql seed={seed} query={pushdown} rows={8} />
+
+If the `WHERE`'s literals rule out every row — `zone > 5 AND zone < 3`, `x = 1 AND x = 2`,
+`WHERE false` — the statement reads no table at all. The plan keeps its shape, the `Filter` detail
+ends in `contradiction`, and every scan estimates (and costs) zero. An ungrouped aggregate still returns
+its one row.
+
+<LiveSql seed={seed} query={contradiction} rows={4} />
 
 ## Aggregation
 

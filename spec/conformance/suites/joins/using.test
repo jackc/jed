@@ -6,7 +6,7 @@
 # side: the left for INNER/LEFT, the right for RIGHT. `FULL JOIN ... USING` (whose merge is a
 # COALESCE) is a deferred 0A000 narrowing, and a type-mismatched USING column is jed's strict-
 # comparison 42804 — both documented divergences from PostgreSQL in oracle_overrides.toml.
-# requires: ddl.create_table, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_using, query.join_inner, query.join_left, query.join_right, query.qualified_column, query.hash_join, types.i32, types.text, resource.cost_metering
+# requires: ddl.create_table, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_using, query.join_inner, query.join_left, query.join_right, query.qualified_column, query.hash_join, types.i32, types.text, resource.cost_metering, query.where_pushdown
 
 statement ok
 CREATE TABLE a (k i32, x i32)
@@ -68,9 +68,9 @@ SELECT a.k, b.k, x, y FROM a JOIN b USING(k) ORDER BY a.k
 30
 300
 
-# WHERE on the merged column filters after the join.
+# WHERE on the merged column (`a.k` for an INNER USING) is pushed to a's scan (planner.md §3.2).
 # names: x, y
-# cost: 20
+# cost: 15
 query II nosort
 SELECT x, y FROM a JOIN b USING(k) WHERE k = 3
 ----

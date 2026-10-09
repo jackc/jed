@@ -167,11 +167,23 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ### Planner infrastructure
 
-- [ ] **Predicate pushdown + simplification** — push WHERE conjuncts into derived tables / CTEs /
-  through joins to the earliest relation, and detect contradictions (`x > 5 AND x < 3` → a provably
-  empty scan). **Caveat:** plan-time **constant folding** / CSE removes `operator_eval` charges and so
-  changes the observable cost — each such rewrite needs an explicit cost decision (the framing above),
-  not a silent apply. _(size: M–L; ×3 cores; +NoREC)_
+- [x] **Predicate pushdown + contradiction detection** — the planner's first stage-2 rewrites
+  ([planner.md §3](spec/design/planner.md)), all three cores, each with its explicit cost decision.
+  **Contradiction** (`query.where_contradiction`): a top-level AND-chain proven never TRUE from
+  plan-time literals (literal FALSE/NULL, a false literal comparison, bare-column literal ranges or
+  equalities with no common value) reads no relation and charges nothing for it; the pipeline above
+  runs over the empty input. **Pushdown** (`query.where_pushdown`): a structurally non-trapping
+  single-base-table conjunct on a preserved side of a join runs as that table's rows are read (per
+  admitted row, before the join and the row account); only the residual is applied to joined rows.
+  EXPLAIN shows pushed filters on their Scan; the estimator models both; NoREC `where_pushdown` and
+  `contradiction` relations.
+  - [ ] _follow-on:_ push WHERE conjuncts **into derived tables / CTE bodies** (and SRF/catalog
+    relations), and push single-side **ON** conjuncts (the inner side of LEFT, either side of INNER).
+  - [ ] _follow-on:_ broader safe-conjunct gate (non-trapping casts/functions via a catalog
+    `traps` classification), contradiction proofs for UPDATE/DELETE, and parameter-time proofs.
+  - [ ] _follow-on:_ plan-time **constant folding** / CSE / eliding a pushed recheck that its own
+    access bound already guarantees — each removes `operator_eval` charges, so each needs its own
+    explicit cost decision (the framing above), not a silent apply.
 
 ---
 

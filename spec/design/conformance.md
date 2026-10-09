@@ -508,6 +508,13 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   **join_inl_topn** — an outer-PK-ordered join LIMIT combines with a PK/secondary-index sibling
   bound, defeated by wrapping both the inner key and outer order key in `+ 0`; both spellings must
   produce the same total-order window;
+  **where_pushdown** — single-relation WHERE conjuncts over INNER/LEFT/RIGHT/FULL and three-relation
+  joins run inside their preserved base relation's scan ([planner.md §3.2](planner.md)), defeated by
+  writing each column as `col + 0` (arithmetic never moves), over NULL-bearing data where a conjunct
+  wrongly pushed to a NULL-extended side changes the answer; **contradiction** — a plan-time-proven
+  empty bare-column literal AND-chain reads nothing ([planner.md §3.1](planner.md)) and must agree with
+  the unproven `col + 0` spelling (empty rows, a zero ungrouped COUNT), plus satisfiable near-miss
+  ranges;
   **gin_inl** — a GIN `@>` query from an earlier sibling is compared with the equivalent reversed
   `<@` spelling that defeats the sibling bound, including NULL/empty query arrays;
   **gist_inl** — GiST range `@>` and scalar `=` sibling bounds are compared with equivalent `<@`

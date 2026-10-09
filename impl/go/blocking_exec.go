@@ -129,6 +129,7 @@ func (db *engine) scanBlockingRel(p *selectPlan, i int, env *evalEnv, m *costMet
 		return nil, err
 	}
 	m.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs))
+	_, pushed := p.pushedFilter(i)
 	err = store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
 		if err := m.Guard(); err != nil {
 			return false, err
@@ -137,6 +138,16 @@ func (db *engine) scanBlockingRel(p *selectPlan, i int, env *evalEnv, m *costMet
 		row, err := store.resolveColumns(row, p.relMasks[i])
 		if err != nil {
 			return false, err
+		}
+		// The relation's pushed WHERE conjuncts (planner.md §3.2), exactly as materializeRel runs them.
+		if pushed != nil {
+			v, err := pushed.eval(row, env, m)
+			if err != nil {
+				return false, err
+			}
+			if !v.IsTrue() {
+				return true, nil
+			}
 		}
 		// Untouched lazy values must not pin source-page payloads in the spool.
 		return true, out.push(topKPruneUntouched(row, p.relMasks[i]))
@@ -325,8 +336,8 @@ func (db *engine) execBoundedBlockingLane(p *selectPlan, env *evalEnv, m *costMe
 	// the pass completes.
 	filtered := own.spool()
 	err := rows.each(func(row storedRow) error {
-		if p.filter != nil {
-			v, err := p.filter.eval(row, env, m)
+		if p.postJoinFilter() != nil {
+			v, err := p.postJoinFilter().eval(row, env, m)
 			if err != nil {
 				return err
 			}
@@ -341,7 +352,7 @@ func (db *engine) execBoundedBlockingLane(p *selectPlan, env *evalEnv, m *costMe
 	}
 	rows.close()
 	rows = filtered
-	if p.filter != nil && root != "Filter" {
+	if p.postJoinFilter() != nil && root != "Filter" {
 		db.explainActual.recordParent("Filter", m.Accrued)
 	}
 	if p.hasWindow && !p.isAgg {
@@ -823,9 +834,9 @@ func (db *engine) boundedJoinTopN(p *selectPlan, own *blockingOwner, env *evalEn
 						}
 					}
 				}
-				if p.filter != nil {
+				if p.postJoinFilter() != nil {
 					before := m.Accrued
-					v, err := p.filter.eval(combined, env, m)
+					v, err := p.postJoinFilter().eval(combined, env, m)
 					filterWork += m.Accrued - before
 					if err != nil {
 						return err
@@ -880,7 +891,7 @@ func (db *engine) boundedJoinTopN(p *selectPlan, own *blockingOwner, env *evalEn
 	if nway || root != node {
 		db.explainActual.recordParent(node, through)
 	}
-	if p.filter != nil && (nway || root != "Filter") {
+	if p.postJoinFilter() != nil && (nway || root != "Filter") {
 		db.explainActual.recordParent("Filter", through+filterWork)
 	}
 	return output, nil

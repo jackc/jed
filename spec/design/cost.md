@@ -396,7 +396,9 @@ an equality ends the prefix: its range may bind, but a later member cannot (no s
   the range cursor.
 - **A provably empty range charges nothing.** A `pk = NULL` (3VL-unknown) or contradictory bounds
   (`pk > 5 AND pk < 5`) admit no key, so the scan reads no page and no row — `page_read` 0,
-  `storage_row_read` 0, and a mutation deletes/updates nothing. (A point-lookup *miss* on an
+  `storage_row_read` 0, and a mutation deletes/updates nothing. For a SELECT, a WHERE whose literals
+  contradict on any bare column (key or not) is proven at plan time and reads no relation at all
+  ([planner.md](planner.md) §3.1). (A point-lookup *miss* on an
   existing key range — `pk = 99` where 99 isn't stored — still visits the leaf it would live in,
   so it charges that path's `page_read` but reads no row.)
 
@@ -1030,10 +1032,16 @@ is pinned here because, with no reference implementation, the count is a cross-c
   iteration order — running/left side outer in PK order, right side inner in PK order, left-deep —
   is fixed so the per-combination evals accrue in the same sequence in every core (a §8 surface;
   it fixes the cost-ceiling abort point even though only the total is asserted today).
-- **WHERE `operator_eval`** is charged per **surviving combined row** (post-join), and
-  **`row_produced`** per emitted output row (post-`LIMIT`/`OFFSET`) — both unchanged; the combined
-  row is simply wider. Join materialization buffering, physical control flow, and row
-  concatenation are **unmetered**, like the `ORDER BY` sort and the `LIMIT` slice.
+- **WHERE `operator_eval`** is split by the stage-2 pushdown ([planner.md](planner.md) §3.2). A
+  **pushed** conjunct — single base relation, preserved side, structurally non-trapping — is charged
+  per row its relation's access path admits (after that row's `storage_row_read`; per fetched row of
+  each per-outer-row INL probe), as the left-deep AND of that relation's pushed conjuncts in source
+  order; a row it rejects reaches no ON, hash, residual, or row-account work. The **residual** — the
+  left-deep AND of every other conjunct in source order — is charged per **surviving combined row**
+  (post-join); with no residual there is no post-join WHERE charge. **`row_produced`** is per emitted
+  output row (post-`LIMIT`/`OFFSET`); the combined row is simply wider. Join materialization
+  buffering, physical control flow, and row concatenation are **unmetered**, like the `ORDER BY`
+  sort and the `LIMIT` slice.
 
 **Nested-loop worked example.** Tables `a` (3 rows), `b` (2 rows), each small enough to be a single
 leaf page; `SELECT * FROM a JOIN b ON a.k + 0 = b.k`, with 2 pairs surviving. The expression key
@@ -1044,13 +1052,19 @@ WHERE; `*` is bare-column projection; 2 emitted rows → 2 `row_produced`. **Tot
 `CROSS JOIN` of the same tables emits all 6 pairs and evaluates no `ON`: 1 + 3 + 1 + 2 + 0 + 6 =
 **13**.
 
+**Pushdown worked example.** Add `WHERE a.v > 0` to the INNER join above, where one of `a`'s three
+rows has `v ≤ 0` and both surviving pairs pass. The conjunct is pushed to `a`: each of `a`'s 3 rows
+charges its one node (3), the rejected row never joins, so the `ON` runs over 2 × 2 = 4 pairs (8), and
+no residual remains: (1 + 3 + 3) + (1 + 2) + 8 + 2 = **20**. Without pushdown the `ON` would run over
+6 pairs (12) and the WHERE over the 2 survivors (2): 4 + 3 + 12 + 2 + 2 = 23.
+
 **Nested-loop OUTER joins charge identically — only the produced-row count grows.** `LEFT`/`RIGHT`/
 `FULL [OUTER] JOIN` ([grammar.md](grammar.md) §15) evaluate the `ON` over the **same**
 `|running| × |right|`
 candidate set (so the `ON` `operator_eval` count is unchanged from an INNER join of the same tables);
 a row that matches nothing is then **NULL-extended on the absent side and added to the surviving set
 without re-evaluating `ON`** — the NULL-extension itself is unmetered, like row concatenation. Those
-NULL-extended rows are ordinary surviving combined rows, so they incur WHERE `operator_eval` and
+NULL-extended rows are ordinary surviving combined rows, so they incur residual WHERE `operator_eval` and
 `row_produced` exactly like matched rows. For the expression-key example with one match and two
 unmatched left rows: materialization is 7, ON is 12, and 3 rows emit → **22** (the INNER form emits
 one row → **20**; the +2 is the preserved-left rows).

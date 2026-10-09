@@ -1,0 +1,173 @@
+# WHERE contradiction detection (spec/design/planner.md §3.1). When the WHERE's top-level AND-chain
+# is provably never TRUE from plan-time literals alone, the SELECT reads no relation: no page, row,
+# generated row, CTE reference, or derived body is charged, while the pipeline above still runs over
+# the empty input (so an ungrouped aggregate returns its one row). The proofs are a literal FALSE or
+# NULL conjunct, a false literal-vs-literal comparison, a bare column compared with a NULL literal,
+# and bare-column literal comparisons with no common value (text by equality only). Results are
+# ordinary PostgreSQL semantics; the `# cost:` pins are jed's cross-core contract. `t` is one leaf.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.limit, query.distinct, query.group_by, query.having, query.aggregates, query.qualified_column, query.join_inner, query.join_left, query.select_no_from, query.derived_table, query.subquery_scalar, query.subquery_correlated, query.window, query.where_contradiction, query.union, expr.arithmetic, types.i32, types.text, types.boolean, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, x i32, s text)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 'a'), (2, 5, 'b'), (3, NULL, 'c'), (4, 0, 'd')
+
+# An empty range on one column reads nothing.
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE x > 5 AND x < 3
+----
+
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE x > 5 AND x < 5
+----
+
+# Conflicting equalities.
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE x = 1 AND x = 2
+----
+
+# A touching closed range is satisfiable: the scan runs (1 page + 4 rows + 3 nodes x 4 rows) and
+# produces one row.
+# cost: 18
+query I nosort
+SELECT id FROM t WHERE x >= 5 AND x <= 5
+----
+2
+
+# A comparison with NULL is never TRUE.
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE x = NULL
+----
+
+# Text equality is byte identity, so two different equality literals contradict.
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE s = 'a' AND s = 'b'
+----
+
+# Text ORDERING is not proven (a collation may order it), so this empty range still scans.
+# cost: 17
+query I nosort
+SELECT id FROM t WHERE s > 'b' AND s < 'a'
+----
+
+# Literal FALSE / NULL conjuncts and false literal comparisons.
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE false
+----
+
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE NULL
+----
+
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE 1 = 0
+----
+
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE 2 < 1
+----
+
+# A TRUE literal comparison is not folded away: it is still evaluated per row.
+# cost: 18
+query I nosort
+SELECT id FROM t WHERE 1 = 1 AND x = 1
+----
+1
+
+# Nothing is read, so the row that would trap `1 / x` is never evaluated.
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE x > 5 AND x < 3 AND 1 / x = 1
+----
+
+# Aggregates run over the empty input: the whole-table group still produces its one row.
+# cost: 1
+query II nosort
+SELECT count(*), sum(x) FROM t WHERE x > 5 AND x < 3
+----
+0
+NULL
+
+# cost: 0
+query II nosort
+SELECT x, count(*) FROM t WHERE x > 5 AND x < 3 GROUP BY x
+----
+
+# cost: 2
+query I nosort
+SELECT count(*) FROM t WHERE false HAVING count(*) = 0
+----
+0
+
+# cost: 0
+query II nosort
+SELECT id, row_number() OVER (ORDER BY id) FROM t WHERE x = 1 AND x = 5
+----
+
+# cost: 0
+query I nosort
+SELECT DISTINCT x FROM t WHERE x = 0 AND x = 1
+----
+
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE x > 5 AND x < 3 ORDER BY id LIMIT 1
+----
+
+# Joins read neither side, whichever side owns the contradiction — including the NULL-extended side
+# of a LEFT JOIN, whose extended rows fail the WHERE too.
+# cost: 0
+query II nosort
+SELECT a.id, b.id FROM t a JOIN t b ON a.id = b.id WHERE a.x = 1 AND a.x = 2
+----
+
+# cost: 0
+query II nosort
+SELECT a.id, b.id FROM t a LEFT JOIN t b ON a.id = b.id + 100 WHERE b.x > 5 AND b.x < 3
+----
+
+# A derived table's body and a correlated select-list subquery never run.
+# cost: 0
+query I nosort
+SELECT d.x FROM (SELECT x FROM t) d WHERE d.x > 5 AND d.x < 3
+----
+
+# cost: 0
+query II nosort
+SELECT id, (SELECT count(*) FROM t i WHERE i.id <= o.id) FROM t o WHERE o.x > 5 AND o.x < 3
+----
+
+# A FROM-less SELECT has no virtual row either.
+# cost: 0
+query I nosort
+SELECT 1 WHERE false
+----
+
+# Each set-operation arm is its own SELECT: only the contradictory arm skips its scan.
+# cost: 4
+query I nosort
+SELECT id FROM t WHERE x > 5 AND x < 3 UNION ALL SELECT id FROM t WHERE id = 2
+----
+2
+
+# Not proven: a contradiction under OR, or over a non-column operand. These scan normally.
+# cost: 26
+query I nosort
+SELECT id FROM t WHERE (x > 5 AND x < 3) OR x = 1
+----
+1
+
+# cost: 25
+query I nosort
+SELECT id FROM t WHERE x + 0 > 5 AND x + 0 < 3
+----

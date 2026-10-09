@@ -1,0 +1,383 @@
+# EXPLAIN of the planner's stage-2 WHERE rewrites (spec/design/planner.md §3; explain.md §5). A
+# pushed filter runs inside its relation's scan, so it renders on that Scan (`filter:conjuncts=N`,
+# VERBOSE `filter=<expr>`) and its work is part of the Scan's estimate and actual cost; the Filter
+# node carries only the post-join residual and disappears when nothing is left. A contradiction keeps
+# the plan shape, appends `; contradiction` to the Filter detail, and estimates and charges every
+# relation subtree at zero. This rendering is jed-specific and not oracle-imported.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.join_left, query.cross_join, query.join_pushdown, query.hash_join, query.index_nested_loop, query.where_pushdown, query.where_contradiction, query.aggregates, query.select_no_from, query.is_null, query.explain, query.explain_analyze, maintenance.analyze, expr.arithmetic, null.three_valued, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE a (id i32 PRIMARY KEY, k i32, v i32)
+
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, k i32, w i32)
+
+statement ok
+INSERT INTO a VALUES (1, 1, 10), (2, 2, 20), (3, 3, NULL), (4, 9, 40)
+
+statement ok
+INSERT INTO b VALUES (11, 1, 5), (12, 2, NULL), (13, 2, 7), (14, 7, 0), (15, 8, 1)
+
+# One pushed conjunct per side; the cross-relation conjunct is the residual Filter.
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.v >= 20 AND b.w IS NOT NULL AND a.v > b.w ORDER BY a.id, b.id
+----
+0
+Sort
+keys=2
+1
+30
+1
+Filter
+conjuncts=1
+1
+29
+2
+Nested Loop
+inner; on:conjuncts=1
+1
+28
+3
+Scan a
+Full scan; touched=3; filter:conjuncts=1
+2
+9
+3
+Scan b
+Full scan; touched=3; filter:conjuncts=1
+4
+11
+
+# VERBOSE spells each pushed filter in global column slots, left-deep in source order.
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.v >= 20 AND b.w > 0 AND a.v < 50 AND a.v > b.w ORDER BY a.id, b.id
+----
+0
+Sort
+keys=2; output=[#0, #3]
+1
+32
+1
+Filter
+filter=(#2 > #5)
+1
+31
+2
+Nested Loop
+inner; on=(#1 = #4)
+1
+30
+3
+Scan a
+Full scan; touched=3; filter=((#2 >= 20) and (#2 < 50))
+1
+17
+3
+Scan b
+Full scan; touched=3; filter=(#5 > 0)
+2
+11
+
+# Nothing remains after the product, so there is no Filter node. The PK bound and the pushed recheck
+# of the same conjunct coexist on a's Scan.
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id FROM a CROSS JOIN b WHERE a.id <= 2 AND b.w > 4 ORDER BY a.id, b.id
+----
+0
+Sort
+keys=2
+4
+20
+1
+Nested Loop
+cross
+4
+16
+2
+Scan a
+PK bound: id <= 2; touched=1; filter:conjuncts=1
+2
+5
+2
+Scan b
+Full scan; touched=2; filter:conjuncts=1
+2
+11
+
+# The NULL-extended side of a LEFT JOIN keeps its conjunct in the residual.
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k WHERE b.w IS NULL AND a.v > 0 ORDER BY a.id, b.id
+----
+0
+Sort
+keys=2
+1
+64
+1
+Filter
+conjuncts=1
+1
+63
+2
+Hash Join
+left; keys=1; on:conjuncts=1
+2
+61
+3
+Scan a
+Full scan; touched=3; filter:conjuncts=1
+2
+9
+3
+Scan b
+Full scan; touched=3
+5
+6
+
+# A trapping conjunct is never pushed: `100 / b.w` stays residual and only meets joined rows, so the
+# unmatched b row with w = 0 is never divided. (PostgreSQL evaluates restriction clauses at the base
+# scan and raises 22012 here; jed moves only non-trapping conjuncts, so it never introduces an error.)
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE 100 / b.w > 0 ORDER BY a.id, b.id
+----
+0
+Sort
+keys=2
+1
+34
+1
+Filter
+conjuncts=1
+1
+33
+2
+Nested Loop
+inner; on:conjuncts=1
+1
+31
+3
+Scan a
+Full scan; touched=2
+4
+5
+3
+Scan b
+Full scan; touched=3
+5
+6
+
+# cost: 39
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE 100 / b.w > 0 ORDER BY a.id, b.id
+----
+1
+11
+2
+13
+
+# ANALYZE attributes the pushed filter's work to the Scan that runs it.
+query ITTIII nosort
+EXPLAIN ANALYZE SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.v >= 20 AND b.w IS NOT NULL ORDER BY a.id, b.id
+----
+0
+Analyze
+cost=29 rows=1
+1
+29
+29
+1
+Sort
+keys=2
+1
+29
+29
+2
+Nested Loop
+inner; on:conjuncts=1
+1
+28
+28
+3
+Scan a
+Full scan; touched=3; filter:conjuncts=1
+2
+9
+9
+3
+Scan b
+Full scan; touched=3; filter:conjuncts=1
+4
+11
+11
+
+# An index-nested-loop inner evaluates its pushed filter on each per-outer-row fetch.
+statement ok
+CREATE TABLE o (id i32 PRIMARY KEY, bid i32)
+
+statement ok
+INSERT INTO o VALUES (1, 11), (2, 12), (3, 13), (4, 99)
+
+query ITTIII nosort
+EXPLAIN ANALYZE SELECT o.id, b.id FROM o JOIN b ON b.id = o.bid WHERE b.w > 0 ORDER BY o.id
+----
+0
+Analyze
+cost=19 rows=2
+4
+25
+19
+1
+Sort
+keys=1
+4
+25
+19
+2
+Nested Loop
+inner; on:conjuncts=1
+4
+21
+17
+3
+Scan o
+Full scan; touched=2
+4
+5
+5
+3
+Scan b
+Index-nested-loop PK bound: id = join; touched=2; filter:conjuncts=1
+4
+12
+10
+
+# --- contradictions -------------------------------------------------------------------------
+
+query ITTII nosort
+EXPLAIN SELECT a.id FROM a WHERE a.v > 30 AND a.v < 20
+----
+0
+Filter
+conjuncts=2; contradiction
+0
+0
+1
+Scan a
+Full scan; touched=2
+0
+0
+
+query ITTIII nosort
+EXPLAIN ANALYZE SELECT count(*) FROM a WHERE a.v > 30 AND a.v < 20
+----
+0
+Analyze
+cost=1 rows=1
+1
+1
+1
+1
+Aggregate
+groups=0 aggs=1
+1
+1
+1
+2
+Filter
+conjuncts=2; contradiction
+0
+0
+0
+3
+Scan a
+Full scan; touched=1
+0
+0
+0
+
+query ITTIII nosort
+EXPLAIN ANALYZE SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE b.w = 1 AND b.w = 2
+----
+0
+Analyze
+cost=0 rows=0
+0
+0
+0
+1
+Filter
+conjuncts=2; contradiction
+0
+0
+0
+2
+Hash Join
+inner; keys=1; on:conjuncts=1
+0
+0
+0
+3
+Scan a
+Full scan; touched=2
+0
+0
+0
+3
+Scan b
+Full scan; touched=3
+0
+0
+0
+
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT 1 WHERE false
+----
+0
+Filter
+filter=false; contradiction; output=[1]
+0
+0
+1
+Result
+-
+0
+0
+
+# --- statistics-aware residual estimates ---------------------------------------------------
+# After ANALYZE, a residual that references one relation (`a.v + 0 > 15` is arithmetic, so it is
+# not pushed) still estimates with that relation's column statistics, beside a pushed conjunct and
+# a cross-relation residual conjunct.
+statement ok
+ANALYZE a
+
+statement ok
+ANALYZE b
+
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE b.w IS NOT NULL AND a.v + 0 > 15 AND a.v + 0 < 35 AND a.id <> b.id ORDER BY a.id, b.id
+----
+0
+Sort
+keys=2; output=[#0, #3]
+0
+60
+1
+Filter
+filter=((((#2 + 0) > 15) and ((#2 + 0) < 35)) and (#0 <> #3))
+0
+60
+2
+Nested Loop
+inner; on=(#1 = #4)
+4
+32
+3
+Scan a
+Full scan; touched=3
+4
+5
+3
+Scan b
+Full scan; touched=3; filter=(#5 is not null)
+4
+11

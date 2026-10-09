@@ -1,7 +1,7 @@
 # Two-table join top-N combined with index-nested-loop (cost.md §3): ORDER BY the forward outer PK
 # preserves the eager INL nested-loop order, while LIMIT stops opening later per-outer inner bounds.
 # A started PK/index bound is materialized completely; only later outer-row probes disappear.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.cross_join, query.qualified_column, query.table_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.limit, query.offset, query.index_nested_loop, query.order_by_join_scan, query.order_by_join_inl, types.i32, null.three_valued, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.cross_join, query.qualified_column, query.table_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.limit, query.offset, query.index_nested_loop, query.order_by_join_scan, query.order_by_join_inl, types.i32, null.three_valued, resource.cost_metering, query.where_pushdown
 
 statement ok
 CREATE TABLE o (id i32 PRIMARY KEY, k i32)
@@ -64,9 +64,9 @@ SELECT o.id, i.id FROM o JOIN i ON i.id = o.k AND i.v > 20 ORDER BY o.id LIMIT 2
 5
 4
 
-# Residual WHERE rejection stops after the second hit: outer 6 + inner 4 + two ON + two WHERE +
-# one produced = 15.
-# cost: 15
+# The inner-only WHERE conjunct runs on each INL fetch (planner.md §3.2), so the rejected first hit
+# never reaches ON: outer 6 + inner 4 + two pushed filters + one ON + one produced = 14.
+# cost: 14
 query II nosort
 SELECT o.id, i.id FROM o JOIN i ON i.id = o.k WHERE i.v > 20 ORDER BY o.id LIMIT 1
 ----

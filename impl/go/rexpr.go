@@ -1555,6 +1555,11 @@ type selectPlan struct {
 	// bug, not a slow plan — so it is computed by the resolve half (computeRelMasks), never by a
 	// physical rule (spec/design/planner.md §2).
 	relMasks [][]bool
+	// pushdown is the stage-2 WHERE rewrite (rewrite.go; spec/design/planner.md §3): a proven
+	// contradiction, or the per-relation pushed filters plus the post-join residual. nil when no
+	// rewrite fired. filter above stays the COMPLETE WHERE — the input every access-path detector
+	// and estimator rule reads; execution evaluates postJoinFilter() over joined rows.
+	pushdown *wherePushdown
 	// phys is the plan's physical / access-path decisions — set ONLY by the optimizeSelect pass
 	// (optimize.go); zero-valued when resolve hands the plan over (spec/design/planner.md §4).
 	phys physicalPlan

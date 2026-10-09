@@ -323,10 +323,11 @@ func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, plabels, resu
 		// Resolve the scan bound (the PK pushdown, if any) and the up-front cost block. An empty bound
 		// (e.g. pk = NULL) admits no row.
 		b := unboundedBound()
-		empty := false
+		// A WHERE contradiction (planner.md §3.1) admits no row: no page, no row, no charge.
+		empty := sp.whereContradiction()
 		var pointKey []byte
 		isPoint := false
-		if sp.phys.relBounds[0] != nil && sp.phys.relBounds[0].pk != nil {
+		if !empty && sp.phys.relBounds[0] != nil && sp.phys.relBounds[0].pk != nil {
 			pointKey, isPoint, empty = db.buildCompletePKPoint(sp.phys.relBounds[0].pk, bound, nil, nil)
 			if !isPoint {
 				b, empty = db.buildKeyBound(sp.phys.relBounds[0].pk, bound, nil, nil)
@@ -1709,9 +1710,9 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 					}
 				}
 				// The residual WHERE over the combined row (per surviving pair).
-				if plan.filter != nil {
+				if plan.postJoinFilter() != nil {
 					before = meter.Accrued
-					v, err := plan.filter.eval(combined, env, meter)
+					v, err := plan.postJoinFilter().eval(combined, env, meter)
 					filterWork += meter.Accrued - before
 					if err != nil {
 						return selectResult{}, err
@@ -1769,7 +1770,7 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 	if selectActualRootNode(plan) != joinNode {
 		db.explainActual.recordParent(joinNode, throughJoin)
 	}
-	if plan.filter != nil && selectActualRootNode(plan) != "Filter" {
+	if plan.postJoinFilter() != nil && selectActualRootNode(plan) != "Filter" {
 		db.explainActual.recordParent("Filter", throughJoin+filterWork)
 	}
 	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
@@ -1855,9 +1856,9 @@ func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *c
 				if !keep {
 					continue
 				}
-				if plan.filter != nil {
+				if plan.postJoinFilter() != nil {
 					before := meter.Accrued
-					v, err := plan.filter.eval(combined, env, meter)
+					v, err := plan.postJoinFilter().eval(combined, env, meter)
 					filterWork += meter.Accrued - before
 					if err != nil {
 						return selectResult{}, err
@@ -1909,7 +1910,7 @@ func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *c
 		joinNode = "Hash Join"
 	}
 	db.explainActual.recordParent(joinNode, throughJoin)
-	if plan.filter != nil {
+	if plan.postJoinFilter() != nil {
 		db.explainActual.recordParent("Filter", throughJoin+filterWork)
 	}
 	return selectResult{columnNames: append([]string(nil), plan.columnNames...), columnTypes: append([]resolvedType(nil), plan.columnTypes...), rows: out, cost: meter.Accrued}, nil
@@ -1943,6 +1944,11 @@ func rowsFromValues(in [][]Value) []storedRow {
 // outerColumn, so the two are observably identical).
 func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer []storedRow, left storedRow, rng *stmtRng, ctes cteCtx, meter *costMeter) ([]storedRow, error) {
 	rel := plan.rels[ri]
+	// A WHERE contradiction (planner.md §3.1) reads no relation: nothing is scanned, generated, or
+	// run, and nothing is charged.
+	if plan.whereContradiction() {
+		return nil, nil
+	}
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
 	// Every relation row is a query-memory row buffer entry under the relation's touched mask
 	// (memory.md §3/§5.1). The two unbounded generators admit as they produce; the remaining
@@ -2191,6 +2197,9 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 	}
 	meter.Charge(costs.ValueDecompress * int64(slabs))
 	src := &scanSource{rows: rows, nodeCount: nodeCount}
+	// The relation's pushed WHERE conjuncts (planner.md §3.2) run on each admitted row, after its
+	// storage_row_read and before it is admitted to the join: a failing row never enters it.
+	_, pushed := plan.pushedFilter(ri)
 	var tableRows []storedRow
 	for {
 		row, ok, err := src.next(env, meter)
@@ -2199,6 +2208,15 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 		}
 		if !ok {
 			break
+		}
+		if pushed != nil {
+			v, err := pushed.eval(row, env, meter)
+			if err != nil {
+				return nil, err
+			}
+			if !v.IsTrue() {
+				continue
+			}
 		}
 		if err := meter.admitRowMasked(row, mask); err != nil { // a materialized relation row (memory.md §5.1)
 			return nil, err

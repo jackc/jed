@@ -711,10 +711,13 @@ func (db *engine) renderSelectPlan(r *explainRender, sp *selectPlan, depth int) 
 		r.emit(d, "Aggregate", aggDetail(sp, r.verbose))
 		d++
 	}
-	if sp.filter != nil {
-		detail := fmt.Sprintf("conjuncts=%d", conjunctCount(sp.filter))
+	if filter := sp.postJoinFilter(); filter != nil {
+		detail := fmt.Sprintf("conjuncts=%d", conjunctCount(filter))
 		if r.verbose {
-			detail = "filter=" + renderRExpr(sp.filter)
+			detail = "filter=" + renderRExpr(filter)
+		}
+		if sp.whereContradiction() {
+			detail += "; contradiction"
 		}
 		r.emit(d, "Filter", detail)
 		d++
@@ -756,7 +759,7 @@ func selectActualRootNode(sp *selectPlan) string {
 	if sp.isAgg {
 		return "Aggregate"
 	}
-	if sp.filter != nil {
+	if sp.postJoinFilter() != nil {
 		return "Filter"
 	}
 	if len(sp.rels) > 1 {
@@ -916,7 +919,16 @@ func (db *engine) renderRelLeaf(r *explainRender, sp *selectPlan, i, depth int, 
 		if sp.phys.relINLBounds[i] != nil {
 			bound, inl = sp.phys.relINLBounds[i], true
 		}
-		r.emit(depth, "Scan "+rel.tableName, withNote(db.scanDetail(rel.tableName, bound, inl, sp.relMasks[i]), note))
+		detail := db.scanDetail(rel.tableName, bound, inl, sp.relMasks[i])
+		// A pushed WHERE filter (planner.md §3.2) runs inside the scan, so it renders on the Scan.
+		if pushed, _ := sp.pushedFilter(i); pushed != nil {
+			if r.verbose {
+				detail += "; filter=" + renderRExpr(pushed)
+			} else {
+				detail += fmt.Sprintf("; filter:conjuncts=%d", conjunctCount(pushed))
+			}
+		}
+		r.emit(depth, "Scan "+rel.tableName, withNote(detail, note))
 		return nil
 	}
 }

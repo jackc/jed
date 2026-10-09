@@ -1,7 +1,7 @@
 # GiST range_ops sibling-bound index-nested-loop (gist.md §5.1; cost.md §3 "JOIN"). The range
 # query is built once per outer row, the resident tree descends, candidates return in storage-key
 # order, and &&/@> remain residual always-recheck predicates.
-# requires: ddl.create_table, ddl.primary_key, ddl.gist_index, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.join_left, query.cross_join, query.qualified_column, query.table_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.limit, query.index_nested_loop, query.gist_scan, query.gist_index_nested_loop, query.order_by_join_scan, query.order_by_join_inl, types.i32, types.range, func.range_constructors, func.range_operators, null.three_valued, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.gist_index, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.join_left, query.cross_join, query.qualified_column, query.table_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.limit, query.index_nested_loop, query.gist_scan, query.gist_index_nested_loop, query.order_by_join_scan, query.order_by_join_inl, types.i32, types.range, func.range_constructors, func.range_operators, null.three_valued, resource.cost_metering, query.where_pushdown
 
 statement ok
 CREATE TABLE gist_probe (id i32 PRIMARY KEY, q int4range)
@@ -102,8 +102,8 @@ ORDER BY p.id, s.id
 5
 4
 
-# WHERE-derived CROSS bound and residual conjuncts.
-# cost: 40
+# WHERE-derived CROSS bound; the single-relation conjuncts are pushed to their scans.
+# cost: 29
 query II nosort
 SELECT p.id, s.id
 FROM gist_probe p CROSS JOIN gist_slot s

@@ -24,7 +24,7 @@ pub(crate) fn select_actual_root_node(sp: &SelectPlan) -> String {
     if sp.is_agg {
         return "Aggregate".to_string();
     }
-    if sp.filter.is_some() {
+    if sp.has_post_join_filter() {
         return "Filter".to_string();
     }
     if sp.rels.len() > 1 {
@@ -727,12 +727,15 @@ impl Engine {
             r.emit(d, "Aggregate", agg_detail(sp, r.verbose));
             d += 1;
         }
-        if let Some(f) = &sp.filter {
-            let detail = if r.verbose {
-                format!("filter={}", render_rexpr(f))
+        if let Some(f) = sp.post_join_filter() {
+            let mut detail = if r.verbose {
+                format!("filter={}", f.render())
             } else {
-                format!("conjuncts={}", conjunct_count(f))
+                format!("conjuncts={}", f.conjunct_count())
             };
+            if sp.where_contradiction() {
+                detail.push_str("; contradiction");
+            }
             r.emit(d, "Filter", detail);
             d += 1;
         }
@@ -943,7 +946,15 @@ impl Engine {
                 Some(b) => (Some(b), true),
                 None => (sp.phys.rel_bounds[i].as_ref(), false),
             };
-            let detail = self.scan_detail(&rel.table_name, bound, inl, &sp.rel_masks[i]);
+            let mut detail = self.scan_detail(&rel.table_name, bound, inl, &sp.rel_masks[i]);
+            // A pushed WHERE filter (planner.md §3.2) runs inside the scan, so it renders on the Scan.
+            if let Some(pushed) = sp.pushed_filter(i) {
+                if r.verbose {
+                    detail.push_str(&format!("; filter={}", render_rexpr(pushed)));
+                } else {
+                    detail.push_str(&format!("; filter:conjuncts={}", conjunct_count(pushed)));
+                }
+            }
             r.emit(
                 depth,
                 format!("Scan {}", rel.table_name),

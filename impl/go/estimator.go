@@ -1445,7 +1445,20 @@ func (db *engine) estimateCatalogRows(srf *srfPlan) int64 {
 	return rows
 }
 
+// estimateRelation estimates one FROM relation as the executor reads it. A WHERE contradiction
+// reads no relation (planner.md §3.1), so its whole rendered subtree estimates zero.
 func (db *engine) estimateRelation(sp *selectPlan, index int, ctx *estimateCTECtx) estimatedPlan {
+	plan := db.estimateRelationRead(sp, index, ctx)
+	if sp.whereContradiction() {
+		plan.root = planEstimate{}
+		for i := range plan.nodes {
+			plan.nodes[i] = planEstimate{}
+		}
+	}
+	return plan
+}
+
+func (db *engine) estimateRelationRead(sp *selectPlan, index int, ctx *estimateCTECtx) estimatedPlan {
 	rel := sp.rels[index]
 	switch {
 	case rel.derived != nil:
@@ -1492,6 +1505,21 @@ func (db *engine) estimateRelation(sp *selectPlan, index int, ctx *estimateCTECt
 					)
 				}
 			}
+		}
+		// A pushed WHERE filter (planner.md §3.2) runs on every row the access path delivers. Its
+		// logical selectivity applies once to the relation's logical population; the delivered rows
+		// are that, capped by the scan rows — except an index-nested-loop inner, whose per-call scan
+		// is bounded by the join key rather than the filter, so the filter scales those rows.
+		if pushed, _ := sp.pushedFilter(index); pushed != nil {
+			scanRows := estimate.rows
+			selectivity := db.estimatePredicateSelectivityWithStatistics(sp, pushed)
+			estimate.logicalRows = estimateSelectivity(selectivity, estimate.logicalRows)
+			if index < len(sp.phys.relINLBounds) && sp.phys.relINLBounds[index] != nil {
+				estimate.rows = estimateSelectivity(selectivity, scanRows)
+			} else {
+				estimate.rows = min64(estimate.logicalRows, scanRows)
+			}
+			addPlanUnit(&estimate, estimatorUnitOperatorEval, satEstimateMul(estimatorOperatorNodes(pushed), scanRows))
 		}
 		return leafEstimatedPlan(estimate)
 	}
@@ -1643,8 +1671,8 @@ func (db *engine) estimateNWayJoinTree(sp *selectPlan, n int, ctx *estimateCTECt
 			target = satEstimateAdd(target, *sp.offset)
 		}
 		postFilterRows := fullRows
-		if sp.filter != nil {
-			postFilterRows = estimateSelectivity(db.estimatePredicateSelectivityWithStatistics(sp, sp.filter), fullRows)
+		if filter := sp.postJoinFilter(); filter != nil {
+			postFilterRows = estimateSelectivity(db.estimatePredicateSelectivityWithStatistics(sp, filter), fullRows)
 		}
 		switch {
 		case target == 0:
@@ -1725,8 +1753,8 @@ func (db *engine) estimateTwoRelationJoin(sp *selectPlan, ctx *estimateCTECtx) e
 			target = satEstimateAdd(target, *sp.offset)
 		}
 		postFilterRows := fullRows
-		if sp.filter != nil {
-			postFilterRows = estimateSelectivity(db.estimatePredicateSelectivityWithStatistics(sp, sp.filter), fullRows)
+		if filter := sp.postJoinFilter(); filter != nil {
+			postFilterRows = estimateSelectivity(db.estimatePredicateSelectivityWithStatistics(sp, filter), fullRows)
 		}
 		switch {
 		case target == 0:
@@ -1781,7 +1809,12 @@ func (db *engine) estimateTwoRelationJoin(sp *selectPlan, ctx *estimateCTECtx) e
 func (db *engine) estimateSelectPlan(sp *selectPlan, ctx *estimateCTECtx) estimatedPlan {
 	var plan estimatedPlan
 	if len(sp.rels) == 0 {
-		plan = leafEstimatedPlan(planEstimate{rows: 1, logicalRows: 1})
+		// One virtual row, unless a WHERE contradiction removes it (planner.md §3.1).
+		rows := int64(1)
+		if sp.whereContradiction() {
+			rows = 0
+		}
+		plan = leafEstimatedPlan(planEstimate{rows: rows, logicalRows: rows})
 	} else {
 		plan = db.estimateJoinTree(sp, len(sp.rels), ctx)
 	}
@@ -1797,17 +1830,17 @@ func (db *engine) estimateSelectPlan(sp *selectPlan, ctx *estimateCTECtx) estima
 		db.capStreamingScanEstimate(&plan, sp, cap)
 	}
 
-	if sp.filter != nil {
+	if filter := sp.postJoinFilter(); filter != nil {
 		inputRows := plan.root.rows
-		logicalRows := estimateSelectivity(db.estimatePredicateSelectivityWithStatistics(sp, sp.filter), plan.root.logicalRows)
+		logicalRows := estimateSelectivity(db.estimatePredicateSelectivityWithStatistics(sp, filter), plan.root.logicalRows)
 		rows := logicalRows
 		if rows > plan.root.rows {
 			rows = plan.root.rows
 		}
 		var local [estimatorUnitCount]int64
-		local[estimatorUnitOperatorEval] = satEstimateMul(estimatorOperatorNodes(sp.filter), inputRows)
+		local[estimatorUnitOperatorEval] = satEstimateMul(estimatorOperatorNodes(filter), inputRows)
 		plan = wrapEstimatedPlan(plan, rows, logicalRows, local)
-		db.addExpressionSubqueries(&plan.root, sp.filter, inputRows, ctx)
+		db.addExpressionSubqueries(&plan.root, filter, inputRows, ctx)
 		plan.nodes[0] = plan.root
 	}
 

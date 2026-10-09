@@ -413,10 +413,25 @@ test('the explain page shows a bounded N-way physical join tree', async ({ page 
   await expect(panel.getByTestId('result-rows')).toContainText('Scan region');
 });
 
+test('the explain page shows a WHERE conjunct pushed into its scan', async ({ page }) => {
+  await page.goto('/docs/sql/explain/');
+  // Ninth panel = a join whose single-table conjuncts run inside each table's scan (planner.md §3.2).
+  const panel = page.getByTestId('live-sql').nth(8);
+  await expect(panel.getByTestId('result-rows')).toContainText('filter:conjuncts=1');
+  await expect(panel.getByTestId('result-rows')).not.toContainText('Filter');
+});
+
+test('the explain page shows a proven WHERE contradiction', async ({ page }) => {
+  await page.goto('/docs/sql/explain/');
+  // Tenth panel = `zone > 5 AND zone < 3`: nothing is read (planner.md §3.1).
+  const panel = page.getByTestId('live-sql').nth(9);
+  await expect(panel.getByTestId('result-rows')).toContainText('conjuncts=2; contradiction');
+});
+
 test('the explain page runs EXPLAIN ANALYZE with a deterministic cost', async ({ page }) => {
   await page.goto('/docs/sql/explain/');
-  // Tenth panel = EXPLAIN ANALYZE: the Analyze root reports the real accrued cost + row count.
-  const panel = page.getByTestId('live-sql').nth(9);
+  // Twelfth panel = EXPLAIN ANALYZE: the Analyze root reports the real accrued cost + row count.
+  const panel = page.getByTestId('live-sql').nth(11);
   await expect(panel.getByTestId('result-rows')).toContainText('Analyze');
   await expect(panel.getByTestId('result-rows')).toContainText('cost=');
 });

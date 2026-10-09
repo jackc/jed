@@ -1224,14 +1224,15 @@ impl Engine {
             limit: sel.limit,
             offset: sel.offset,
             rel_masks: Vec::new(),
+            pushdown: None,
             phys: PhysicalPlan::default(),
         };
         plan.rel_masks = compute_rel_masks(&plan);
         // ——— Stage 2: logical rewrite rules (spec/design/planner.md §3) ———
-        // No rewrite rules exist yet; the first (predicate pushdown / simplification, TODO.md)
-        // lands here as pure plan→plan transforms. fold_uncorrelated_in_plan is NOT a planner
-        // rewrite — it executes subqueries and needs bound params, so it stays post-bind in
-        // run_query_expr.
+        // The WHERE rewrite (contradiction detection, then pushdown) is a pure plan→plan transform.
+        // fold_uncorrelated_in_plan is NOT a planner rewrite — it executes subqueries and needs
+        // bound params, so it stays post-bind in run_query_expr.
+        rewrite_where(&mut plan);
         //
         // ——— Stage 3: physical/access-path selection (spec/design/planner.md §4) ———
         self.optimize_select(&mut plan, &scope);

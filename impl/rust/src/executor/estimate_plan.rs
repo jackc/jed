@@ -63,6 +63,43 @@ fn required_estimate_input(
     lo
 }
 
+fn merge_expression_owner(
+    a: std::result::Result<Option<usize>, ()>,
+    b: std::result::Result<Option<usize>, ()>,
+) -> std::result::Result<Option<usize>, ()> {
+    match (a, b) {
+        (Ok(Some(a)), Ok(Some(b))) if a == b => Ok(Some(a)),
+        (Ok(Some(a)), Ok(None)) | (Ok(None), Ok(Some(a))) => Ok(Some(a)),
+        (Ok(None), Ok(None)) => Ok(None),
+        _ => Err(()),
+    }
+}
+
+/// The one relation a predicate's bare columns belong to (`Ok(None)`: none; `Err`: several).
+fn estimate_expression_owner(
+    sp: &SelectPlan,
+    expr: &RExpr,
+) -> std::result::Result<Option<usize>, ()> {
+    match expr {
+        RExpr::Column(global) => Ok(sp
+            .rels
+            .iter()
+            .position(|rel| *global >= rel.offset && *global < rel.offset + rel.col_count)),
+        RExpr::Compare { lhs, rhs, .. }
+        | RExpr::Distinct { lhs, rhs, .. }
+        | RExpr::And(lhs, rhs)
+        | RExpr::Or(lhs, rhs) => merge_expression_owner(
+            estimate_expression_owner(sp, lhs),
+            estimate_expression_owner(sp, rhs),
+        ),
+        RExpr::Not(child) | RExpr::IsNull { operand: child, .. } => {
+            estimate_expression_owner(sp, child)
+        }
+        RExpr::InValues { lhs, .. } => estimate_expression_owner(sp, lhs),
+        _ => Ok(None),
+    }
+}
+
 impl Engine {
     fn cap_streaming_scan_estimate(
         &self,
@@ -180,33 +217,43 @@ impl Engine {
         sp: &SelectPlan,
         expr: &RExpr,
     ) -> Option<ScopeRel<'a>> {
-        fn merge(
-            a: std::result::Result<Option<usize>, ()>,
-            b: std::result::Result<Option<usize>, ()>,
-        ) -> std::result::Result<Option<usize>, ()> {
-            match (a, b) {
-                (Ok(Some(a)), Ok(Some(b))) if a == b => Ok(Some(a)),
-                (Ok(Some(a)), Ok(None)) | (Ok(None), Ok(Some(a))) => Ok(Some(a)),
-                (Ok(None), Ok(None)) => Ok(None),
-                _ => Err(()),
-            }
+        self.estimate_plan_rel_scope(&sp.rels[estimate_expression_owner(sp, expr).ok()??])
+    }
+
+    /// `estimate_predicate_selectivity_with_statistics` of a post-join WHERE chain — the left-deep
+    /// AND of its conjuncts (rewrite.rs `FilterChain`), recursing exactly as that function does on
+    /// the equivalent `RExpr::And` tree.
+    fn estimate_chain_selectivity(
+        &self,
+        sp: &SelectPlan,
+        chain: &FilterChain<'_>,
+    ) -> crate::estimator::Selectivity {
+        self.estimate_conjunct_prefix_selectivity(sp, &chain.conjuncts)
+    }
+
+    fn estimate_conjunct_prefix_selectivity(
+        &self,
+        sp: &SelectPlan,
+        conjuncts: &[&RExpr],
+    ) -> crate::estimator::Selectivity {
+        let (last, prefix) = conjuncts
+            .split_last()
+            .expect("a filter chain has at least one conjunct");
+        if prefix.is_empty() {
+            return self.estimate_predicate_selectivity_with_statistics(sp, Some(last));
         }
-        fn owner(sp: &SelectPlan, expr: &RExpr) -> std::result::Result<Option<usize>, ()> {
-            match expr {
-                RExpr::Column(global) => Ok(sp
-                    .rels
-                    .iter()
-                    .position(|rel| *global >= rel.offset && *global < rel.offset + rel.col_count)),
-                RExpr::Compare { lhs, rhs, .. }
-                | RExpr::Distinct { lhs, rhs, .. }
-                | RExpr::And(lhs, rhs)
-                | RExpr::Or(lhs, rhs) => merge(owner(sp, lhs), owner(sp, rhs)),
-                RExpr::Not(child) | RExpr::IsNull { operand: child, .. } => owner(sp, child),
-                RExpr::InValues { lhs, .. } => owner(sp, lhs),
-                _ => Ok(None),
-            }
+        // An AND node: the cross-relation column-equality rule never applies; a single-relation AND
+        // takes the relation-aware conjunction program; otherwise AND the two sides.
+        let owner = conjuncts.iter().try_fold(None, |acc, c| {
+            merge_expression_owner(Ok(acc), estimate_expression_owner(sp, c))
+        });
+        if let Ok(Some(ri)) = owner
+            && let Some(rel) = self.estimate_plan_rel_scope(&sp.rels[ri])
+        {
+            return estimator_conjunction_selectivity_with_statistics(conjuncts, &rel, self);
         }
-        self.estimate_plan_rel_scope(&sp.rels[owner(sp, expr).ok()??])
+        self.estimate_conjunct_prefix_selectivity(sp, prefix)
+            .and(self.estimate_predicate_selectivity_with_statistics(sp, Some(last)))
     }
 
     fn estimate_predicate_selectivity_with_statistics(
@@ -341,7 +388,25 @@ impl Engine {
         })
     }
 
+    /// Estimate one FROM relation as the executor reads it. A WHERE contradiction reads no relation
+    /// (planner.md §3.1), so its whole rendered subtree estimates zero.
     fn estimate_relation(
+        &self,
+        sp: &SelectPlan,
+        index: usize,
+        ctx: Option<&EstimateCteCtx>,
+    ) -> EstimatedPlan {
+        let mut plan = self.estimate_relation_read(sp, index, ctx);
+        if sp.where_contradiction() {
+            plan.root = PlanEstimate::empty(0);
+            for node in &mut plan.nodes {
+                *node = PlanEstimate::empty(0);
+            }
+        }
+        plan
+    }
+
+    fn estimate_relation_read(
         &self,
         sp: &SelectPlan,
         index: usize,
@@ -396,6 +461,24 @@ impl Engine {
                     sat_mul(estimate.rows, table_store.height() as i64),
                 );
             }
+        }
+        // A pushed WHERE filter (planner.md §3.2) runs on every row the access path delivers. Its
+        // logical selectivity applies once to the relation's logical population; the delivered rows
+        // are that, capped by the scan rows — except an index-nested-loop inner, whose per-call scan
+        // is bounded by the join key rather than the filter, so the filter scales those rows.
+        if let Some(pushed) = sp.pushed_filter(index) {
+            let scan_rows = estimate.rows;
+            let selectivity = self.estimate_predicate_selectivity_with_statistics(sp, Some(pushed));
+            estimate.logical_rows = estimate_rows(&selectivity, estimate.logical_rows);
+            if sp.phys.rel_inl_bounds[index].is_some() {
+                estimate.rows = estimate_rows(&selectivity, scan_rows);
+            } else {
+                estimate.rows = estimate.logical_rows.min(scan_rows);
+            }
+            estimate.add_unit(
+                UNIT_OPERATOR_EVAL,
+                sat_mul(estimator_operator_nodes(Some(pushed)), scan_rows),
+            );
         }
         EstimatedPlan::leaf(estimate)
     }
@@ -581,11 +664,8 @@ impl Engine {
         if n == sp.rels.len() && sp.phys.join_pk_ordered {
             if let Some(limit) = sp.limit {
                 let target = sat_add(limit, sp.offset.unwrap_or(0));
-                let post_filter_rows = sp.filter.as_ref().map_or(full_rows, |filter| {
-                    estimate_rows(
-                        &self.estimate_predicate_selectivity_with_statistics(sp, Some(filter)),
-                        full_rows,
-                    )
+                let post_filter_rows = sp.post_join_filter().map_or(full_rows, |filter| {
+                    estimate_rows(&self.estimate_chain_selectivity(sp, &filter), full_rows)
                 });
                 if target == 0 {
                     outer_calls = 0;
@@ -698,11 +778,8 @@ impl Engine {
         if sp.phys.join_pk_ordered {
             if let Some(limit) = sp.limit {
                 let target = sat_add(limit, sp.offset.unwrap_or(0));
-                let post_filter_rows = sp.filter.as_ref().map_or(full_rows, |filter| {
-                    estimate_rows(
-                        &self.estimate_predicate_selectivity_with_statistics(sp, Some(filter)),
-                        full_rows,
-                    )
+                let post_filter_rows = sp.post_join_filter().map_or(full_rows, |filter| {
+                    estimate_rows(&self.estimate_chain_selectivity(sp, &filter), full_rows)
                 });
                 if target == 0 {
                     outer_calls = 0;
@@ -770,7 +847,12 @@ impl Engine {
 
     fn estimate_select_plan(&self, sp: &SelectPlan, ctx: Option<&EstimateCteCtx>) -> EstimatedPlan {
         let mut plan = if sp.rels.is_empty() {
-            EstimatedPlan::leaf(PlanEstimate::empty(1))
+            // One virtual row, unless a WHERE contradiction removes it (planner.md §3.1).
+            EstimatedPlan::leaf(PlanEstimate::empty(if sp.where_contradiction() {
+                0
+            } else {
+                1
+            }))
         } else {
             self.estimate_join_tree(sp, sp.rels.len(), ctx)
         };
@@ -792,18 +874,23 @@ impl Engine {
             }
         }
 
-        if let Some(filter) = &sp.filter {
+        if let Some(filter) = sp.post_join_filter() {
             let input_rows = plan.root.rows;
             let logical_rows = estimate_rows(
-                &self.estimate_predicate_selectivity_with_statistics(sp, Some(filter)),
+                &self.estimate_chain_selectivity(sp, &filter),
                 plan.root.logical_rows,
             );
             let rows = logical_rows.min(plan.root.rows);
             let mut local = [0; ESTIMATOR_UNIT_COUNT];
-            local[UNIT_OPERATOR_EVAL] =
-                sat_mul(estimator_operator_nodes(Some(filter)), plan.root.rows);
+            local[UNIT_OPERATOR_EVAL] = sat_mul(filter.operator_nodes(), plan.root.rows);
             plan = EstimatedPlan::wrap(plan, rows, logical_rows, local);
-            self.add_expression_subqueries(&mut plan.root, Some(filter), input_rows, ctx);
+            // An AND node holds no subquery, so the chain's subqueries are its conjuncts' in order.
+            self.add_expression_list_subqueries(
+                &mut plan.root,
+                filter.conjuncts.iter().copied(),
+                input_rows,
+                ctx,
+            );
             plan.nodes[0] = plan.root.clone();
         }
 
