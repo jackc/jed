@@ -88,6 +88,9 @@ export class Pager {
   private bodyWrites = 0;
   private syncs = 0;
   private durableCommitActive = false;
+  // poisoned refuses every later commit: the storage this pager reads is gone or unknown (a failed
+  // compaction after its rename, api.md §2.6), so the handle must be closed and reopened.
+  private poisoned = false;
   private adoptedNeedsSync = false;
   private acknowledgedMeta = "";
   private validatedMeta: Uint8Array | null = null;
@@ -234,7 +237,27 @@ export class Pager {
   }
 
   commitRequiresReopen(): boolean {
-    return this.durableCommitActive;
+    return this.poisoned || this.durableCommitActive;
+  }
+
+  // swapStore replaces the byte backing and returns the old one (compaction, spec/design/api.md §2.6):
+  // the caller closes a file before renaming its replacement over it by swapping in a ClosedBlockStore,
+  // and swaps the reopened old file back if the rename fails.
+  swapStore(store: BlockStore): BlockStore {
+    const old = this.store;
+    this.store = store;
+    return old;
+  }
+
+  // skipsSync reports whether the backing skips its durability barrier (fsync=off).
+  skipsSync(): boolean {
+    return this.store.skipsSync?.() ?? false;
+  }
+
+  // poison refuses every later commit: the storage this pager reads is gone or unknown, so the handle
+  // must be closed and reopened (a failed compaction after its rename, api.md §2.6).
+  poison(): void {
+    this.poisoned = true;
   }
 
   // Begin after serialization succeeds, before any reserve/write or recovery sync.

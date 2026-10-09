@@ -427,6 +427,11 @@ func (c *sharedCore) tryDowngrade(coord *fileCoordinator) error {
 func (c *sharedCore) tryUpgrade(coord *fileCoordinator, attachment string) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	return c.tryUpgradeLocked(coord, attachment)
+}
+
+// tryUpgradeLocked is tryUpgrade for a caller already holding the local writer gate (writeMu).
+func (c *sharedCore) tryUpgradeLocked(coord *fileCoordinator, attachment string) error {
 	c.liveMu.Lock()
 	defer c.liveMu.Unlock()
 	if err := coord.lockTransition(); err != nil {
@@ -915,6 +920,54 @@ func (st *storage) storageBytes() int64 {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return int64(st.pageCount) * int64(st.pageSize)
+}
+
+// compact replaces this domain's storage with the from-scratch image of snap at txid (host
+// compaction, spec/design/api.md §2.6) and returns the committed snapshot reloaded from it. A file is
+// rewritten through compactFile; an in-memory domain swaps in a new memoryBlockStore. The caller holds
+// the writer gate and the reader watermark lock. The image has no free list and no garbage, so the
+// page accounting restarts from it, and the storage budget forgets the last commit's pages (none of
+// them is dead now).
+func (st *storage) compact(snap *snapshot, txid uint64) (*snapshot, error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if err := st.paging.withPager(func(p *pager) error { return p.checkValidatedCommit() }); err != nil {
+		return nil, err
+	}
+	capacity := st.paging.capacity()
+	var paging *sharedPaging
+	if st.path != "" {
+		var err error
+		paging, err = compactFile(st.path, snap, st.pageSize, txid, st.paging, capacity)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		image, err := snap.ToImage(st.pageSize, txid)
+		if err != nil {
+			return nil, err
+		}
+		p, err := pagerFromStore(&memoryBlockStore{buf: image}) // image is fresh: no defensive copy
+		if err != nil {
+			return nil, err
+		}
+		paging = newSharedPaging(p, capacity)
+	}
+	// A file's old pager is already closed and poisoned here, so a failed reload leaves the handle
+	// needing a reopen; an in-memory domain keeps its old store untouched.
+	loaded, err := loadEngineSharedPaging(paging)
+	if err != nil {
+		return nil, err
+	}
+	st.paging = paging
+	st.pageCount = loaded.pageCount
+	st.freePages = loaded.freePages
+	st.liveAtCompaction = loaded.liveAtCompaction
+	st.freeGenTxid = loaded.freeGenTxid
+	st.budget.lastCatRoot = 0
+	st.budget.lastWritten = nil
+	st.budget.lastCatalogPages = 0
+	return loaded.committed, nil
 }
 
 // close releases a file-backed storage's open pager (closing the underlying file); a no-op for an
@@ -1632,6 +1685,98 @@ func (db *Database) Detach(name string) error {
 		att.coordinator.close()
 	}
 	return err
+}
+
+// Compact compacts database name — `main` or an attachment, case-insensitive — returning its dead
+// space (spec/design/api.md §2.6): it rewrites the database as the garbage-free from-scratch image of
+// its committed snapshot at the next version and swaps the storage atomically (a file through temp
+// file + rename, an in-memory database by replacing its byte store). Rows, catalog, and later results
+// and costs are unchanged. Never waits: 42704 for a name that is not attached, 25006 for a read-only
+// database, and 55006 while a write transaction or reader is open on this handle or another process
+// has the file open. A host-API act — not metered and not reachable from SQL.
+func (db *Database) Compact(name string) error {
+	c := db.core
+	lname := strings.ToLower(name)
+	var readOnly bool
+	if lname == "main" {
+		readOnly = c.readOnlyMode()
+	} else {
+		att := c.attachment(lname)
+		if att == nil || lname == "temp" {
+			return newError(UndefinedObject, `database "`+name+`" is not attached`)
+		}
+		readOnly = att.mode == attachReadOnly
+	}
+	if readOnly {
+		return newError(ReadOnlySqlTransaction, `cannot compact read-only database "`+name+`"`)
+	}
+	// Compaction never waits for the writer gate (api.md §2.6).
+	if !c.writeMu.TryLock() {
+		return newError(ObjectInUse, `cannot compact database "`+name+`" while a write transaction is open`)
+	}
+	defer c.writeMu.Unlock()
+	return c.compactLocked(lname, name)
+}
+
+// compactLocked compacts database lname (`main` or an attachment) under the writer gate the caller
+// holds (spec/design/api.md §2.6): require presence-exclusive coordination and a drained reader
+// watermark, then rewrite the storage at the next version and publish the reloaded root while still
+// holding the watermark lock, so no reader pins in between.
+func (c *sharedCore) compactLocked(lname, name string) error {
+	main := lname == "main"
+	st := c.storage
+	coord := c.coordinator
+	attachmentName := ""
+	if !main {
+		att := c.attachment(lname)
+		if att == nil {
+			return newError(UndefinedObject, `database "`+name+`" is not attached`)
+		}
+		st, coord, attachmentName = att.storage, att.coordinator, lname
+	}
+	if coord != nil {
+		if err := coord.checkPID(); err != nil {
+			return err
+		}
+		if coord.lease() == leaseShared {
+			// A peer may have closed since the probe last looked: retry the upgrade now.
+			if err := c.tryUpgradeLocked(coord, attachmentName); err != nil {
+				return err
+			}
+		}
+		switch coord.lease() {
+		case leaseShared:
+			return newError(ObjectInUse, `cannot compact database "`+name+`" while another process has it open`)
+		case leasePoisoned:
+			return newError(IoError, "shared-file coordinator is poisoned")
+		}
+	}
+	c.liveMu.Lock()
+	defer c.liveMu.Unlock()
+	if len(c.live) > 0 {
+		return newError(ObjectInUse, `cannot compact database "`+name+`" while a reader is open`)
+	}
+	rt := c.roots.Load()
+	prev := rt.committed
+	if !main {
+		prev = rt.attached[lname]
+	}
+	compacted, err := st.compact(prev, prev.txid+1)
+	if err != nil {
+		return err
+	}
+	if main {
+		c.roots.Store(&roots{committed: compacted, attached: rt.attached})
+	} else {
+		attached := make(map[string]*snapshot, len(rt.attached))
+		for key, root := range rt.attached {
+			attached[key] = root
+		}
+		attached[lname] = compacted
+		c.roots.Store(&roots{committed: rt.committed, attached: attached})
+	}
+	c.planEpoch.Add(1)
+	return nil
 }
 
 // committedEngine builds a transient read engine over the latest committed snapshot for catalog

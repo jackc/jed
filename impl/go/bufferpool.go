@@ -176,6 +176,11 @@ func (p *bufferPool) invalidateLocked(page uint32) {
 	}
 }
 
+// capacityPages is the most pages the pool holds at once (fixed at construction).
+func (p *bufferPool) capacityPages() int {
+	return p.capacity
+}
+
 // resident is the number of pages currently resident — the bound the pool enforces (≤ capacity).
 func (p *bufferPool) resident() int {
 	p.mu.Lock()

@@ -447,6 +447,80 @@ sessions work for both **in-memory and file-backed** databases (the file-backed 
 thread-safe pager + watermark-gated reclamation, session.md §2.4); the single-handle surface
 (§2.1–§2.4) is unchanged and remains the default.
 
+### 2.6 Compaction (`compact`)
+
+The free list ([storage.md](storage.md) §6) lets jed reuse dead pages, but the page high-water never
+goes down, so a file that grew and then shrank logically keeps its peak size. **`compact(name)`**
+gives that space back: it rewrites one database as the garbage-free **from-scratch image** of its
+committed snapshot ([../fileformat/format.md](../fileformat/format.md) *From-scratch image*) and
+replaces the old storage with it. This is the SQLite `VACUUM` / PostgreSQL `VACUUM FULL` flavor:
+one pass reclaims every dead page and lays the trees out contiguously. A host calls it explicitly;
+the engine never compacts a file on its own, and SQL cannot reach it (like `attach`, it is a
+host-API act — CLAUDE.md §13).
+
+| core | spelling |
+|---|---|
+| Rust | `db.compact(name: &str) -> Result<()>` |
+| Go | `db.Compact(name string) error` |
+| TS | `db.compact(name: string): void` |
+
+`name` is `main` or an attached database (attached-databases.md §4), case-insensitive. Compaction
+works on both backings: a file is rewritten as described below, and an in-memory database (or
+in-memory attachment) swaps its `MemoryBlockStore` for the compact image, releasing its dead pages
+from RAM and lowering `storage_bytes` (memory.md §8).
+
+**Preconditions, checked in this order (nothing is written when one fails):**
+
+1. `name` must be `main` or a current attachment — otherwise `42704` (`temp` is session-local and
+   is not a compaction target).
+2. The database must be writable — a read-only handle (`main`) or a read-only attachment is
+   `25006`.
+3. The host must support replacing the database atomically. The browser OPFS host does not yet,
+   so compaction there is `0A000` (a follow-on — [hosts.md](hosts.md) §7).
+4. Nothing else may be using the database (`55006 object_in_use`). Compaction **never waits**:
+   - the handle's writer gate must be free (no session holds an open write transaction);
+   - no reader may be pinned (the reader watermark is drained — no open read session, read-only
+     transaction, or streaming cursor on this handle, transactions.md §8);
+   - under shared file coordination, no other process may have the file open: compaction needs the
+     presence-exclusive lease (locking.md §6). If this handle is in the shared state only because a
+     peer has since closed, compaction first retries the upgrade itself.
+   A host that sees `55006` closes its cursors and sessions (or waits for the peer process) and
+   retries.
+
+**What it does.** Holding the writer gate and the reader-watermark lock (so no reader can pin while
+the storage is swapped), compaction serializes the committed snapshot at **`txid + 1`** into a fresh
+image and installs it:
+
+- **File:** the image is streamed page by page to the sibling temp file `<path>.jedtmp` (the same
+  name `create` uses), given the old file's permission bits, and synced. The old file handle is
+  closed, the temp file is atomically renamed over the database path, and the directory is synced
+  (the `create` recipe, §3). The pager then reopens the new file with a cold buffer pool of the
+  same `cache_bytes` budget. `path` is resolved through symlinks first, so a symlinked database
+  stays a symlink to the compacted file. The coordination bundle (`<path>.lock/`) is untouched, so
+  no other process can join while the database inode is replaced (locking.md §3.1).
+- **In-memory:** the image becomes a new `MemoryBlockStore`; the old store is released.
+
+Afterwards the database's page count is exactly its from-scratch image size, its free list is empty,
+the file is exactly `page_count × page_size` bytes (no preallocation slack), and its version (for
+`main`, `db.version()`) has advanced by one. The rows, catalog, sequences, statistics, and every
+later query's results **and cost** are unchanged: compaction renumbers pages but keeps every tree
+node as it was, so the logical page accesses a query makes are the same. It does not repack
+half-empty leaves. Prepared statements stay valid and replan lazily. Compaction is a host operation:
+it is not metered and no session's cost or memory account is charged.
+
+**Crash safety.** Until the rename, the old file is intact and is what a crash leaves; a crash may
+also leave a stale `<path>.jedtmp`, which `open` ignores and the next compaction overwrites. After
+the rename the new file is complete and durable (with `skip_fsync`, only across a process crash —
+§2.1). If the rename itself fails, the old file is reopened and the handle carries on unchanged. If
+reopening the new file fails, the handle is poisoned — later statements fail and the host must close
+and reopen it, exactly as after a commit I/O failure (§3).
+
+**Limits.** The rewrite needs free disk space for a second copy of the live data. File ownership
+is not preserved (only the permission bits). With `locking = none`, excluding other processes is the
+host's job, as for every other write; a hard-linked file (allowed only uncoordinated) keeps its other
+names pointing at the old inode. A rewrite that keeps the page size is the only form today; changing
+`page_size` during compaction is a possible follow-on.
+
 ## 3. Persistence & durability
 
 The on-disk model is the **page-backed copy-on-write B-tree** with **incremental commit**

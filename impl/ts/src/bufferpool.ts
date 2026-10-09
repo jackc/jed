@@ -18,7 +18,9 @@ type Slot = { page: number; node: PNode; referenced: boolean };
 
 // A bounded CLOCK cache from page id to a decoded leaf node.
 export class BufferPool {
-  private capacity: number;
+  // capacity is the most pages the pool holds at once (carried over to the replacement pool when
+  // compaction reopens the database, spec/design/api.md §2.6).
+  readonly capacity: number;
   private slots: Slot[] = [];
   private index = new Map<number, number>();
   private hand = 0;

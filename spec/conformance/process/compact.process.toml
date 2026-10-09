@@ -1,0 +1,106 @@
+schema_version = 1
+name = "compaction-presence-and-continuity"
+description = "Compaction refuses while a peer process or a reader holds the file, then rewrites it so a later process joins the compacted image (api.md §2.6, locking.md §6)."
+requires = ["file.shared_process"]
+byte_identical = true
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY, pad text)"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 300) FROM generate_series(1, 2000) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "DELETE FROM t WHERE id > 100"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open"
+
+# Another process has the file open: compaction needs presence EX and never waits.
+[[step]]
+actor = "a"
+command = "compact"
+expect_error = "55006"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "100"
+
+[[step]]
+actor = "b"
+command = "close"
+
+# A pinned local reader also refuses it.
+[[step]]
+actor = "a"
+command = "read_open"
+
+[[step]]
+actor = "a"
+command = "compact"
+expect_error = "55006"
+
+[[step]]
+actor = "a"
+command = "read_close"
+
+# The peer has closed: compaction regains presence EX itself and rewrites the file.
+[[step]]
+actor = "a"
+command = "compact"
+
+[[step]]
+actor = "a"
+command = "page_count"
+expect = "9"
+
+[[step]]
+actor = "a"
+command = "txid"
+expect = "5"
+
+# A new process joins through the unchanged lock bundle and sees the compacted file.
+[[step]]
+actor = "b"
+command = "start"
+argument = "open"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "100"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (5000, 'tail')"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT count(*), max(id) FROM t"
+expect = "101:5000"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "close"

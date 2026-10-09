@@ -2099,6 +2099,32 @@ function pack(sizes: number[], capacity: number): number[][] {
 // the form callers/tests holding a Engine use).
 export function toImage(src: Engine | Snapshot, pageSize: number, txid: bigint): Uint8Array {
   const snap = src instanceof Snapshot ? src : src.committed;
+  const chunks: Uint8Array[] = [];
+  const pageCount = writeImage(snap, pageSize, txid, (index, page) => {
+    chunks[index] = page;
+  });
+  const image = new Uint8Array(pageCount * pageSize);
+  for (let index = 0; index < pageCount; index++) {
+    const page = chunks[index];
+    if (page !== undefined) image.set(page, index * pageSize);
+  }
+  return image;
+}
+
+// PageSinkFn receives one full page of a from-scratch image: its page index and its pageSize bytes.
+export type PageSinkFn = (index: number, page: Uint8Array) => void;
+
+// writeImage streams a snapshot's from-scratch image (the bytes toImage returns) to sink one full page
+// at a time and returns the image's page count. Pages arrive in no particular index order; both meta
+// slots arrive last. The sink sees each page exactly once, so a file sink writes the image in bounded
+// memory — host compaction (Database.compact, spec/design/api.md §2.6) relies on this to rewrite a
+// larger-than-RAM file without a whole-image buffer.
+export function writeImage(
+  snap: Snapshot,
+  pageSize: number,
+  txid: bigint,
+  sink: PageSinkFn,
+): number {
   const ps = pageSize;
   if (ps < MIN_PAGE_SIZE) {
     throw engineError("feature_not_supported", "page size too small for the format");
@@ -2114,10 +2140,10 @@ export function toImage(src: Engine | Snapshot, pageSize: number, txid: bigint):
   // Tables in ascending lowercased-name order (no map-iteration order leak).
   const keys = [...snap.tables.keys()].sort();
 
-  // Serialize each table's B-tree post-order, body pages allocated from page 2. Each BodyPage is
-  // (index, pageType, itemCount, payload); children precede their parent so parent child-pointers
+  // Serialize each table's B-tree post-order, body pages allocated from page 2. Each page is emitted
+  // to the sink as soon as its bytes are final; children precede their parent so parent child-pointers
   // reference already-allocated pages (format.md).
-  const body: BodyPage[] = [];
+  const body = new PageSink(ps, sink);
   const rootDataPage: number[] = new Array(keys.length).fill(0);
   const indexRoots: number[][] = keys.map(() => []);
   let nextIndex = ROOT_PAGE;
@@ -2190,39 +2216,46 @@ export function toImage(src: Engine | Snapshot, pageSize: number, txid: bigint):
   const catGroups = pack(entrySizes, capacity);
   const pageCount = catRoot + catGroups.length;
 
-  const image = new Uint8Array(pageCount * ps);
-
-  // Meta: both slots hold the current meta (a fresh from-scratch image has no distinct prior
-  // version; slot alternation is the live incremental-commit path — format.md).
-  writeMeta(image, ps, 0, pageSize, txid, catRoot, pageCount);
-  writeMeta(image, ps, 1, pageSize, txid, catRoot, pageCount);
-
-  // B-tree node + overflow pages.
-  for (const bp of body) {
-    writePage(image, ps, bp.index, bp.pageType, bp.itemCount, bp.nextPage, bp.payload);
-  }
-
   // Catalog chain.
   for (let gi = 0; gi < catGroups.length; gi++) {
     const group = catGroups[gi]!;
     const index = catRoot + gi;
     const next = gi + 1 < catGroups.length ? index + 1 : 0;
     const parts = group.map((ei) => catEntries[ei]!);
-    writePage(image, ps, index, PAGE_CATALOG, group.length, next, concat(parts));
+    body.page(index, PAGE_CATALOG, group.length, next, concat(parts));
   }
 
-  return image;
+  // Meta last: both slots hold the current meta (a fresh from-scratch image has no distinct prior
+  // version; slot alternation is the live incremental-commit path — format.md). A from-scratch image
+  // has an empty free-list, so free_list_head = 0 (v25).
+  const meta = metaPage(pageSize, txid, catRoot, pageCount, 0);
+  sink(0, meta);
+  sink(1, meta);
+  return pageCount;
 }
 
-// BodyPage is one serialized page awaiting write: its index, type, key count, chain link, payload.
-// nextPage is 0 for B-tree nodes and the chain link for overflow pages (large-values.md §12).
-type BodyPage = {
-  index: number;
-  pageType: number;
-  itemCount: number;
-  nextPage: number;
-  payload: Uint8Array;
-};
+// PageSink is the from-scratch serializer's page output: it builds each page's full bytes (makePage,
+// the single source of the page layout) and hands them to the caller's sink. nextPage is 0 for B-tree
+// nodes and the chain link for overflow pages (large-values.md §12).
+class PageSink {
+  private ps: number;
+  private sink: PageSinkFn;
+
+  constructor(ps: number, sink: PageSinkFn) {
+    this.ps = ps;
+    this.sink = sink;
+  }
+
+  page(
+    index: number,
+    pageType: number,
+    itemCount: number,
+    nextPage: number,
+    payload: Uint8Array,
+  ): void {
+    this.sink(index, makePage(this.ps, pageType, itemCount, nextPage, payload));
+  }
+}
 
 // gistColOpclasses are the per-column opclasses of a GiST index (spec/design/gist.md §5/§6/§7): one
 // per indexed column — range_ops over a range column (its element ColType the codec key), the scalar
@@ -2247,26 +2280,18 @@ function serializeGistIndex(
   istore: TableStore,
   ops: GistOpclass[],
   nextIndex: number,
-  body: BodyPage[],
+  body: PageSink,
 ): { index: number; next: number } {
   const keys = istore.entriesInKeyOrder().map((e) => e.key);
   if (keys.length === 0) return { index: 0, next: nextIndex };
   const tree = buildGistFromLeafKeys(ops, keys);
   let n = nextIndex;
   const { pages, root } = serializeGistTree(tree, ops, () => n++);
-  for (const p of pages) {
-    body.push({
-      index: p.pageNo,
-      pageType: p.pageType,
-      itemCount: p.itemCount,
-      nextPage: 0,
-      payload: p.payload,
-    });
-  }
+  for (const p of pages) body.page(p.pageNo, p.pageType, p.itemCount, 0, p.payload);
   return { index: root, next: n };
 }
 
-// serializeNode serializes one node and its subtree post-order, appending each to `body`, and
+// serializeNode serializes one node and its subtree post-order, emitting each page to `body`, and
 // returns this node's assigned page index and the next free index. A leaf's payload is its records;
 // an interior's is its N+1 child pointers (big-endian u32) then its N records (format.md). A node
 // whose payload would exceed the page is an oversized record (over RECORD_MAX) → feature_not_supported.
@@ -2275,7 +2300,7 @@ function serializeNode(
   store: TableStore,
   capacity: number,
   nextIndex: number,
-  body: BodyPage[],
+  body: PageSink,
 ): { index: number; next: number } {
   const colTypes = store.columnTypes();
   const childPages: number[] = [];
@@ -2319,16 +2344,8 @@ function serializeNode(
       "a record larger than the per-row limit is not supported",
     );
   }
-  body.push({ index, pageType, itemCount: nodeLen(n), nextPage: 0, payload });
-  for (const o of ovf) {
-    body.push({
-      index: o.index,
-      pageType: PAGE_OVERFLOW,
-      itemCount: o.itemCount,
-      nextPage: o.nextPage,
-      payload: o.payload,
-    });
-  }
+  body.page(index, pageType, nodeLen(n), 0, payload);
+  for (const o of ovf) body.page(o.index, PAGE_OVERFLOW, o.itemCount, o.nextPage, o.payload);
   return { index, next: nextIndex };
 }
 
@@ -3245,33 +3262,6 @@ export function makePage(
   // The per-page checksum (v7) is computed last, over every byte but its own field at [12,16).
   dv.setUint32(12, pageCrc(p), false);
   return p;
-}
-
-// writeMeta writes a meta slot into image (the whole-image path; metaPage is the single source). A
-// from-scratch image has an empty free-list, so free_list_head = 0 (v25).
-function writeMeta(
-  image: Uint8Array,
-  ps: number,
-  slot: number,
-  pageSize: number,
-  txid: bigint,
-  root: number,
-  pageCount: number,
-): void {
-  image.set(metaPage(pageSize, txid, root, pageCount, 0), slot * ps);
-}
-
-// writePage writes a catalog/data page into image (the whole-image path; makePage is the single source).
-function writePage(
-  image: Uint8Array,
-  ps: number,
-  index: number,
-  pageType: number,
-  itemCount: number,
-  nextPage: number,
-  payload: Uint8Array,
-): void {
-  image.set(makePage(ps, pageType, itemCount, nextPage, payload), index * ps);
 }
 
 // Page is a parsed page: header fields + a borrowed payload slice.

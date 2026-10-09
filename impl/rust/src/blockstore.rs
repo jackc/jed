@@ -44,6 +44,11 @@ pub(crate) trait BlockStore: Send {
     /// back as zero **and** the allocation is durable, so a later in-region `write_at` + data-only
     /// `sync` need not flush a file-growth journal. Truncation (`bytes < size`) needs no barrier.
     fn set_size(&mut self, bytes: u64) -> Result<()>;
+    /// Whether [`sync`](BlockStore::sync) skips its durability barrier (`fsync=off`, api.md §2.1),
+    /// so a compaction rewriting this store's file (api.md §2.6) applies the same setting.
+    fn skips_sync(&self) -> bool {
+        false
+    }
 }
 
 /// The **file** storage host (spec/design/hosts.md §4): a `std::fs::File`, safe positioned reads on
@@ -71,6 +76,10 @@ impl FileBlockStore {
 }
 
 impl BlockStore for FileBlockStore {
+    fn skips_sync(&self) -> bool {
+        self.no_sync
+    }
+
     fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; len];
         file_read_exact_at(&mut self.file, &mut buf, offset).map_err(io_error)?;
@@ -151,6 +160,42 @@ fn file_read_exact_at(file: &mut File, buf: &mut [u8], offset: u64) -> std::io::
 fn file_read_exact_at(file: &mut File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     file.seek(SeekFrom::Start(offset))?;
     file.read_exact(buf)
+}
+
+/// The store a pager holds after compaction closed its file (spec/design/api.md §2.6): the database
+/// now lives in a replacement store, so any snapshot still bound to this pager fails closed with
+/// `58030` instead of reading pages of the old layout.
+pub(crate) struct ClosedBlockStore;
+
+impl ClosedBlockStore {
+    fn error() -> EngineError {
+        EngineError::new(
+            SqlState::IoError,
+            "database storage was replaced by compaction; close and reopen the handle",
+        )
+    }
+}
+
+impl BlockStore for ClosedBlockStore {
+    fn read_at(&mut self, _offset: u64, _len: usize) -> Result<Vec<u8>> {
+        Err(Self::error())
+    }
+
+    fn write_at(&mut self, _offset: u64, _bytes: &[u8]) -> Result<()> {
+        Err(Self::error())
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        Err(Self::error())
+    }
+
+    fn size(&mut self) -> Result<u64> {
+        Err(Self::error())
+    }
+
+    fn set_size(&mut self, _bytes: u64) -> Result<()> {
+        Err(Self::error())
+    }
 }
 
 /// The pure in-memory storage host (bplus-reshape.md B3): a growable byte vector with the same

@@ -12,6 +12,7 @@
 // observes — so each core realizes it idiomatically (like P5.3's per-core concurrency). JS is
 // single-threaded, so unlike the Rust/Go cores this needs no lock between the read and commit paths.
 
+import type { BlockStore } from "./blockstore.ts";
 import type { ColType } from "./catalog.ts";
 import type { PNode } from "./pmap.ts";
 import { BufferPool } from "./bufferpool.ts";
@@ -117,6 +118,25 @@ export class SharedPaging {
   }
   physicalPages(): number {
     return this.pager.physicalPages();
+  }
+
+  // swapStore / skipsSync / poison reach the pager for host compaction (spec/design/api.md §2.6): the
+  // old file is closed by swapping in a ClosedBlockStore (and swapped back if the rename fails), the
+  // rewrite applies the handle's fsync=off setting, and a pager whose file was replaced refuses commits.
+  swapStore(store: BlockStore): BlockStore {
+    return this.pager.swapStore(store);
+  }
+  skipsSync(): boolean {
+    return this.pager.skipsSync();
+  }
+  poison(): void {
+    this.pager.poison();
+  }
+
+  // capacity is the pool's leaf-page capacity — carried over to the replacement pool when compaction
+  // reopens the database (spec/design/api.md §2.6).
+  capacity(): number {
+    return this.pool.capacity;
   }
 
   // armFault arms a one-shot commit fault on the backing pager — the fault-injection seam

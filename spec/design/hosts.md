@@ -323,8 +323,10 @@ as it crosses. See the two docs for the full designs.
   - **Deferred OPFS follow-ons** (none foreclosed): disk-spill for OPFS (the `ORDER BY` external merge
     sort currently stays resident for OPFS — `db.path` is null so the `SpillSink` is unset; an
     OPFS-backed `SpillSink` is the path); read-only multi-handle via `createSyncAccessHandle({ mode })`
-    (not portable yet); and running the real-browser e2e in CI (needs a headless-Chromium binary, today
-    outside `rake ci`).
+    (not portable yet); running the real-browser e2e in CI (needs a headless-Chromium binary, today
+    outside `rake ci`); and **compaction** ([api.md](api.md) §2.6), which is `0A000` on OPFS until a
+    crash-safe whole-file replace is designed for it (a sibling OPFS file plus a swap the engine can
+    recover from — OPFS offers no atomic rename-over-existing contract the file host's recipe relies on).
 - **Shared multi-process file coordination** — ✅ **landed
   ([locking.md](locking.md))**: the five-file OS-lock bundle, append-only contended commit,
   and presence-EX uncontended lease run in Rust, Go, and Node. Rust/Go need no dependency; Node uses

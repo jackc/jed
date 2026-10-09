@@ -163,6 +163,14 @@ impl<T> BufferPool<T> {
         result
     }
 
+    /// The most pages the pool holds at once.
+    pub(crate) fn capacity(&self) -> usize {
+        self.state
+            .lock()
+            .expect("buffer pool mutex poisoned")
+            .capacity
+    }
+
     /// The number of pages currently resident — the bound the pool enforces (`≤ capacity`), surfaced
     /// publicly via [`crate::Engine::resident_leaves`] (P6.4c, spec/design/pager.md §3).
     pub(crate) fn resident(&self) -> usize {

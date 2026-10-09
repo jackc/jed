@@ -255,30 +255,31 @@ sits so the options stay open (CLAUDE.md §9).
   truncation, and compaction require presence-EX proof of aloneness plus the existing in-process
   watermark. The bundle, rather than the replaceable database inode, remains locked across future
   `to_image` compaction (locking.md §3–§6).
-- **File compaction / shrink (returning space to the OS)** — ⏳ **approach decided, not built.**
-  The free-list (above) recycles dead space for *jed*, but it never gives it back: `page_count` is
-  a monotonic high-water (plus the pager.md §7 preallocation slack), so the file is **grow-only** —
-  insert-a-lot-then-delete leaves it permanently at its peak size. (This is the SQLite/PostgreSQL
-  default too — both reuse freed space and shrink only under an explicit `VACUUM`.) **The decided
-  shrink mechanism is `to_image`-based whole-image compaction:** re-serialize the committed
-  snapshot through the existing from-scratch `to_image` serializer — the **garbage-free packed
-  image** `create` already writes ([../fileformat/format.md](../fileformat/format.md) *From-scratch
-  image*) — into a fresh file, atomically swap it in (the `create` temp-file + `fsync` + atomic
-  `rename` + dir `fsync` recipe, [api.md](api.md) §3), and re-adopt the pager on the new, minimal
-  file. One pass reclaims **all** dead space and **defragments** (the SQLite `VACUUM` / PostgreSQL
-  `VACUUM FULL` flavor), and it is **crash-safe for free** — the atomic rename is all-or-nothing,
-  so a crash leaves the prior file intact (the property `create` and the step-5b whole-image era
-  relied on). It is **host-invoked / explicit, not automatic-per-commit** — a per-commit
+- **File compaction / shrink (returning space to the OS)** — ✅ **landed (all three cores;
+  host API [api.md](api.md) §2.6).** The free-list (above) recycles dead space for *jed*, but it
+  never gives it back: `page_count` is a monotonic high-water (plus the pager.md §7 preallocation
+  slack), so the file is **grow-only** — insert-a-lot-then-delete leaves it at its peak size. (This
+  is the SQLite/PostgreSQL default too — both reuse freed space and shrink only under an explicit
+  `VACUUM`.) The host-invoked **`compact(name)`** re-serializes the committed snapshot at `txid + 1`
+  through the from-scratch serializer — the **garbage-free packed image** `create` writes
+  ([../fileformat/format.md](../fileformat/format.md) *From-scratch image*) — streaming it page by
+  page into `<path>.jedtmp` (never a whole-image buffer, so a larger-than-RAM file compacts in
+  bounded memory), then atomically swaps it in (the `create` temp-file + `fsync` + atomic `rename` +
+  dir `fsync` recipe, [api.md](api.md) §3) and re-adopts the pager on the new, minimal file. One
+  pass reclaims **all** dead space and **defragments** (the SQLite `VACUUM` / PostgreSQL `VACUUM
+  FULL` flavor), and it is **crash-safe for free** — the atomic rename is all-or-nothing, so a crash
+  leaves the prior file intact. It is **explicit, not automatic-per-commit** — a per-commit
   truncation would fight the §9/pager.md §7 preallocation (truncate → regrow → re-`fsync` churn) —
-  and, being a writer operation that replaces the file under any demand-paging readers, it is gated
-  on the reader-liveness watermark (transactions.md §8) like any reclamation. It **needs nothing
-  new at the seam** (§2, [hosts.md](hosts.md)): the compact image is written through the block
-  device and simply ends smaller — the file shrinks because the fresh image is smaller, not by an
-  in-place truncate. A lighter **in-place trailing-free truncation** — lower `page_count` and
-  `set_size` down when the top pages `[k, page_count)` are all free (the PG-plain-`VACUUM` /
+  and it **never waits**: a held writer gate, any pinned reader (the watermark, transactions.md §8),
+  or another process holding the file (locking.md §6) is `55006`. Compaction renumbers pages but
+  keeps every tree node, so later results **and costs** are unchanged. It **needs nothing new at
+  the seam** (§2, [hosts.md](hosts.md)) beyond the host's atomic rename — which is why the OPFS host
+  is `0A000` for now. An in-memory database compacts by replacing its `MemoryBlockStore` with the
+  image. A lighter **in-place trailing-free truncation** — lower `page_count` and `set_size` down
+  when the top pages `[k, page_count)` are all free (the PG-plain-`VACUUM` /
   SQLite-`incremental_vacuum` flavor) — stays open as a cheaper *partial* complement: no rewrite,
   but it reclaims only *trailing* free space and must be sequenced against the two-meta-slot
-  fallback (§4/§7) and the watermark. Tracked in [../../TODO.md](../../TODO.md) Phase 6.
+  fallback (§4/§7) and the watermark. Tracked in [../../TODO.md](../../TODO.md).
 - **Buffer pool / demand paging** — ✅ **landed (P6.4)** ([pager.md](pager.md)). The resident
   set is a **bounded cache of pages** with eviction instead of the whole file (CLAUDE.md §9), so
   a database far larger than RAM is served by paging the working set in on demand through the

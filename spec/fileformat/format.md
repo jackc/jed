@@ -1501,7 +1501,8 @@ loads the committed root and registers its pin under one lock, and publish takes
 watermark can never miss a reader mid-registration.
 
 **From-scratch image (`to_image`).** A clean, garbage-free image of a snapshot — used by
-`create`'s initial write and by the **golden tests / Ruby reference** — is the special case
+`create`'s initial write, by host compaction (written at the compacted snapshot's `txid + 1`,
+[../design/api.md](../design/api.md) §2.6), and by the **golden tests / Ruby reference** — is the special case
 where *every* node is dirty: allocate and write the whole tree (post-order per table, in
 name order; each table's tree then its index trees in catalog order) starting at page 2,
 then the catalog chain, then both meta slots at `txid = 1`. Its free-list is **empty**, so

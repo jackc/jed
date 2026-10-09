@@ -31,6 +31,10 @@ export class FileBlockStore implements BlockStore {
     this.noSync = noSync;
   }
 
+  skipsSync(): boolean {
+    return this.noSync;
+  }
+
   readAt(offset: number, len: number): Uint8Array {
     const buf = new Uint8Array(len);
     readSync(this.fd, buf, 0, len, offset);

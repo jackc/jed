@@ -8,22 +8,27 @@
 import "./crc32_node.ts";
 
 import {
+  chmodSync,
   closeSync,
   existsSync,
   fsyncSync,
   openSync,
+  realpathSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname } from "node:path";
 
+import { ClosedBlockStore } from "./blockstore.ts";
 import { FileBlockStore } from "./fileblockstore.ts";
-import { DEFAULT_PAGE_SIZE, Engine } from "./executor.ts";
+import { DEFAULT_PAGE_SIZE, Engine, type Snapshot } from "./executor.ts";
 import { engineError } from "./errors.ts";
 import type { ExtensionRegistry } from "./extension.ts";
-import { loadEnginePaged, toImage } from "./format.ts";
+import { loadEnginePaged, toImage, writeImage } from "./format.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager } from "./pager.ts";
 import { persistImpl } from "./persist.ts";
@@ -32,6 +37,7 @@ import {
   Database,
   fileStorageLimitError,
   registerFileAttachOpener,
+  registerFileCompactor,
 } from "./shared.ts";
 import { FileSpillSink } from "./spillfile.ts";
 import { FileCoordinator } from "./coordinator.ts";
@@ -218,6 +224,115 @@ registerFileAttachOpener((source, readOnly) => {
     throw error;
   }
 });
+
+// compactFile rewrites the file database at path as the from-scratch image of snap at txid and reopens
+// it (host compaction, spec/design/api.md §2.6). The caller holds the writer gate with the reader
+// watermark drained, so nothing else reads old while its file is swapped.
+//
+// The image streams page by page into the sibling temp file, which takes the old file's permission bits
+// and is synced. Then old's file is closed (a ClosedBlockStore takes its place, so a stale snapshot fails
+// closed rather than reading the new layout), the temp file is renamed over the real path, and the
+// directory is synced. A failure before the rename leaves the old file and old exactly as they were. If
+// the rename fails, the old file is reopened into old. If reopening the new file fails, old stays closed
+// and poisoned, so the handle must be reopened. Returns the replacement paging context, a pool of
+// capacity leaves over the new file.
+export function compactFile(
+  path: string,
+  snap: Snapshot,
+  pageSize: number,
+  txid: bigint,
+  old: SharedPaging,
+  capacity: number,
+): SharedPaging {
+  const noSync = old.skipsSync();
+  let real: string;
+  try {
+    // Rename over the real file, never over a symlink naming it (the symlink keeps pointing at it).
+    real = realpathSync(path);
+  } catch (e) {
+    throw ioError(e);
+  }
+  const tmp = real + ".jedtmp";
+  try {
+    const fd = openSync(tmp, "w");
+    try {
+      writeImage(snap, pageSize, txid, (index, page) => {
+        const offset = index * pageSize;
+        let done = 0;
+        while (done < page.length) {
+          const count = writeSync(fd, page, done, page.length - done, offset + done);
+          if (count <= 0) throw engineError("io_error", "file write made no progress");
+          done += count;
+        }
+      });
+      chmodSync(tmp, statSync(real).mode & 0o7777);
+      if (!noSync) fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  } catch (e) {
+    removeQuietly(tmp);
+    if (e instanceof Error && e.name === "EngineError") throw e;
+    throw ioError(e);
+  }
+
+  // Close the old file before the rename: Windows cannot replace a file that is still open.
+  const closing = old.swapStore(new ClosedBlockStore());
+  try {
+    closing.close();
+  } catch {
+    // The descriptor is released either way; a close error loses nothing the rename needs.
+  }
+  try {
+    renameSync(tmp, real);
+  } catch (e) {
+    removeQuietly(tmp);
+    try {
+      old.swapStore(new FileBlockStore(openSync(real, "r+"), noSync));
+    } catch {
+      old.poison();
+    }
+    throw ioError(e);
+  }
+  old.poison();
+  if (!noSync) {
+    // Best-effort, as in writeAtomic: not every platform can fsync a directory.
+    try {
+      const dfd = openSync(dirname(real), "r");
+      try {
+        fsyncSync(dfd);
+      } finally {
+        closeSync(dfd);
+      }
+    } catch {
+      // directory fsync unsupported on this platform — acceptable (api.md §3)
+    }
+  }
+  let fd: number;
+  try {
+    fd = openSync(real, "r+");
+  } catch (e) {
+    throw ioError(e);
+  }
+  try {
+    return new SharedPaging(Pager.fromStore(new FileBlockStore(fd, noSync)), capacity);
+  } catch (e) {
+    closeSync(fd);
+    throw e;
+  }
+}
+
+// Register the Node file host as the file compactor (spec/design/api.md §2.6), the same injection as the
+// attach opener above: shared.ts stays browser-clean and reaches compactFile only through this hook.
+registerFileCompactor(compactFile);
+
+function removeQuietly(path: string): void {
+  try {
+    if (existsSync(path)) unlinkSync(path);
+  } catch {
+    // best-effort cleanup
+  }
+}
 
 // createDatabase makes a fresh database — in-memory (opts.path absent) or file-backed (opts.path set)
 // — and returns the host Database handle with its default session (spec/design/api.md §2.1/§2.1.1). A

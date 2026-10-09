@@ -97,6 +97,12 @@ impl SharedPaging {
         self.pool.invalidate(page);
     }
 
+    /// The pool's leaf-page capacity — carried over to the replacement pool when compaction
+    /// reopens the database (spec/design/api.md §2.6).
+    pub(crate) fn capacity(&self) -> usize {
+        self.pool.capacity()
+    }
+
     /// The number of leaf pages currently resident in the pool — the gauge the public
     /// [`crate::Engine::resident_leaves`] reports and the `cache_pages` budget bounds (P6.4c,
     /// spec/design/pager.md §3).

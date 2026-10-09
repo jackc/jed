@@ -430,6 +430,83 @@ fn write_atomic(path: &Path, bytes: &[u8], no_sync: bool) -> Result<()> {
     Ok(())
 }
 
+/// Rewrite the file database at `path` as the from-scratch image of `snap` at `txid` and reopen it
+/// (host compaction, spec/design/api.md §2.6). The caller holds the writer gate and the reader
+/// watermark lock, so nothing else reads `old` while its file is swapped.
+///
+/// The image streams page by page into the sibling temp file, which takes the old file's permission
+/// bits and is synced. Then `old`'s file is closed (a [`ClosedBlockStore`] takes its place, so a
+/// stale snapshot fails closed rather than reading the new layout), the temp file is renamed over
+/// the real path, and the directory is synced. A failure before the rename leaves the old file and
+/// `old` exactly as they were. If the rename fails, the old file is reopened into `old`. If reopening
+/// the new file fails, `old` stays closed and poisoned, so the handle must be reopened. Returns the
+/// replacement paging context, a pool of `capacity` leaves over the new file.
+pub(crate) fn compact_file(
+    path: &Path,
+    snap: &Snapshot,
+    page_size: u32,
+    txid: u64,
+    old: &SharedPaging,
+    capacity: usize,
+) -> Result<Arc<SharedPaging>> {
+    use crate::blockstore::ClosedBlockStore;
+    use std::io::{Seek, SeekFrom};
+
+    let no_sync = old.pager().skips_sync();
+    // Rename over the real file, never over a symlink naming it (the symlink keeps pointing at it).
+    let path = fs::canonicalize(path).map_err(io_error)?;
+    let tmp = tmp_path(&path);
+    let written = (|| {
+        let mut file = File::create(&tmp).map_err(io_error)?;
+        snap.write_image(page_size, txid, &mut |index, page| {
+            file.seek(SeekFrom::Start(index as u64 * page_size as u64))
+                .map_err(io_error)?;
+            file.write_all(page).map_err(io_error)
+        })?;
+        let permissions = fs::metadata(&path).map_err(io_error)?.permissions();
+        fs::set_permissions(&tmp, permissions).map_err(io_error)?;
+        if !no_sync {
+            file.sync_all().map_err(io_error)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+
+    // Close the old file before the rename: Windows cannot replace a file that is still open.
+    drop(old.pager().swap_store(Box::new(ClosedBlockStore)));
+    if let Err(error) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        match fs::OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => {
+                drop(
+                    old.pager()
+                        .swap_store(Box::new(FileBlockStore::new(file, no_sync))),
+                );
+            }
+            Err(_) => old.pager().poison(),
+        }
+        return Err(io_error(error));
+    }
+    old.pager().poison();
+    if !no_sync {
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Ok(d) = File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(io_error)?;
+    let pager = Pager::from_store(Box::new(FileBlockStore::new(file, no_sync)))?;
+    Ok(SharedPaging::new(pager, capacity))
+}
+
 /// The sibling temp path used during an atomic commit. A single writer (CLAUDE.md §3) means no
 /// two commits race for it.
 fn tmp_path(path: &Path) -> PathBuf {

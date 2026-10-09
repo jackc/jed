@@ -51,6 +51,8 @@ mod collation;
 mod collation_host;
 #[path = "../tests/comments.rs"]
 mod comments;
+#[path = "../tests/compact.rs"]
+mod compact;
 #[path = "../tests/composite.rs"]
 mod composite;
 #[path = "../tests/composite_key.rs"]

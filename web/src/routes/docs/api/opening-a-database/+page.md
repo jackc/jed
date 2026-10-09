@@ -59,6 +59,26 @@ Node uses a small first-party native helper solely for OS file locks because Nod
 builds do not load the helper. A missing platform artifact fails closed instead of using PID or mtime
 leases.
 
+## Reclaiming space (compaction)
+
+jed reuses the pages that deletes and updates free, but a file never shrinks by itself: after a big
+delete it keeps its peak size. To give that space back, compact the database:
+`db.compact("main")` (Rust), `db.Compact("main")` (Go), or `db.compact("main")` (TypeScript). Pass
+an attachment's name to compact that database instead.
+
+Compaction rewrites the committed data as a fresh, contiguous file next to the original
+(`<path>.jedtmp`), syncs it, and atomically renames it into place, so a crash at any point leaves
+either the old file or the new one, never a mix. Afterwards the file is exactly as large as its live
+data. The database version advances by one; rows, query results, query costs, and prepared
+statements are unchanged. An in-memory database compacts too, which lowers its `storage_bytes`.
+
+Compaction is an explicit maintenance step and never waits. It fails with `55006` while anything
+else is using the database — an open write transaction, a read session or open cursor on the
+handle, or another process with the file open — so close those and retry. A read-only database is
+`25006`, and the browser (OPFS) host does not support compaction yet (`0A000`). The rewrite needs
+free disk space for a second copy of the live data, and keeps the file's permission bits but not
+its owner.
+
 ## In-memory databases
 
 Every example on the **SQL** pages of these docs runs against an in-memory database, right in your

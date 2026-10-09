@@ -787,17 +787,41 @@ func pageSizeValid(ps int) bool {
 }
 
 // ToImage serializes this snapshot's whole state to one on-disk image (format.md). pageSize
-// is recorded in the meta page; txid is written into both meta slots.
+// is recorded in the meta page; txid is written into both meta slots. A collecting sink over
+// writeImage.
 func (s *snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	ps := int(pageSize)
+	var image []byte
+	_, err := s.writeImage(pageSize, txid, func(index uint32, page []byte) error {
+		off := int(index) * ps
+		if len(image) < off+ps {
+			image = append(image, make([]byte, off+ps-len(image))...)
+		}
+		copy(image[off:off+ps], page)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return image, nil
+}
+
+// writeImage streams this snapshot's from-scratch image (the bytes ToImage returns) to sink one full
+// page at a time, as (page index, page bytes), and returns the image's page count. Pages arrive in no
+// particular index order; both meta slots arrive last. The sink sees each page exactly once, so a
+// file sink writes the image in bounded memory — host compaction (Database.Compact,
+// spec/design/api.md §2.6) relies on this to rewrite a larger-than-RAM file without a whole-image
+// buffer.
+func (s *snapshot) writeImage(pageSize uint32, txid uint64, sink func(index uint32, page []byte) error) (uint32, error) {
+	ps := int(pageSize)
 	if ps < minPageSize {
-		return nil, newError(FeatureNotSupported, "page size too small for the format")
+		return 0, newError(FeatureNotSupported, "page size too small for the format")
 	}
 	if ps > maxPageSize {
-		return nil, newError(FeatureNotSupported, "page size too large for the format")
+		return 0, newError(FeatureNotSupported, "page size too large for the format")
 	}
 	if ps&(ps-1) != 0 {
-		return nil, newError(FeatureNotSupported, "page size must be a power of two")
+		return 0, newError(FeatureNotSupported, "page size must be a power of two")
 	}
 	capacity := ps - pageHeader
 
@@ -808,18 +832,19 @@ func (s *snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	}
 	sort.Strings(keys)
 
-	// Serialize each table's B-tree post-order, body pages allocated from page 2. Each entry is
-	// (index, page_type, item_count, payload); children precede their parent so parent child-pointers
-	// reference already-allocated pages (format.md).
-	var body []bodyPage
+	// Serialize each table's B-tree post-order, body pages allocated from page 2. Each page is emitted
+	// to the sink as soon as its bytes are final; children precede their parent so parent child-pointers
+	// reference already-allocated pages (format.md). nextPage is 0 for B-tree nodes and the chain link
+	// for overflow pages (large-values.md §12).
+	body := &pageSink{ps: ps, sink: sink}
 	rootDataPage := make([]uint32, len(keys))
 	indexRoots := make([][]uint32, len(keys))
 	nextIndex := rootPage
 	for ti, k := range keys {
 		if root := s.stores[k].treeRoot(); root != nil {
-			rp, np, err := serializeNode(root, s.stores[k], capacity, nextIndex, &body)
+			rp, np, err := serializeNode(root, s.stores[k], capacity, nextIndex, body)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 			rootDataPage[ti] = rp
 			nextIndex = np
@@ -833,16 +858,18 @@ func (s *snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 				// §4.1). Serialize the canonical tree, allocating from the same counter.
 				gpages, root, err := serializeGistIndex(s, s.tables[k], idx, func() uint32 { p := nextIndex; nextIndex++; return p })
 				if err != nil {
-					return nil, err
+					return 0, err
 				}
 				for _, p := range gpages {
-					body = append(body, bodyPage{index: p.pageNo, pageType: p.pageType, itemCount: p.itemCount, nextPage: 0, payload: p.payload})
+					if err := body.page(p.pageNo, p.pageType, p.itemCount, 0, p.payload); err != nil {
+						return 0, err
+					}
 				}
 				r = root
 			} else if istore := s.indexStores[strings.ToLower(idx.Name)]; istore.treeRoot() != nil {
-				rp, np, err := serializeNode(istore.treeRoot(), istore, capacity, nextIndex, &body)
+				rp, np, err := serializeNode(istore.treeRoot(), istore, capacity, nextIndex, body)
 				if err != nil {
-					return nil, err
+					return 0, err
 				}
 				r = rp
 				nextIndex = np
@@ -868,7 +895,7 @@ func (s *snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	// (spec/design/collation.md §2/§5).
 	refColls, err := s.referencedCollations()
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	for _, c := range refColls {
 		catEntries = append(catEntries, append([]byte{3}, collationEntryBytes(c, s.defaultCollation == c.Name)...))
@@ -887,21 +914,9 @@ func (s *snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	}
 	catGroups, err := pack(entrySizes, capacity)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	pageCount := catRoot + uint32(len(catGroups))
-
-	image := make([]byte, int(pageCount)*ps)
-
-	// Meta: both slots hold the current meta (a fresh from-scratch image has no distinct prior
-	// version; slot alternation is the live incremental-commit path — format.md).
-	writeMeta(image, ps, 0, pageSize, txid, catRoot, pageCount)
-	writeMeta(image, ps, 1, pageSize, txid, catRoot, pageCount)
-
-	// B-tree node + overflow pages.
-	for _, bp := range body {
-		writePage(image, ps, int(bp.index), bp.pageType, bp.itemCount, bp.nextPage, bp.payload)
-	}
 
 	// Catalog chain.
 	for gi, group := range catGroups {
@@ -914,20 +929,34 @@ func (s *snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 		for _, ei := range group {
 			payload = append(payload, catEntries[ei]...)
 		}
-		writePage(image, ps, int(index), pageCatalog, uint32(len(group)), next, payload)
+		if err := body.page(index, pageCatalog, uint32(len(group)), next, payload); err != nil {
+			return 0, err
+		}
 	}
 
-	return image, nil
+	// Meta last: both slots hold the current meta (a fresh from-scratch image has no distinct prior
+	// version; slot alternation is the live incremental-commit path — format.md). A from-scratch image
+	// has an empty free-list, so free_list_head = 0 (v25).
+	meta := metaPage(pageSize, txid, catRoot, pageCount, 0)
+	if err := sink(0, meta); err != nil {
+		return 0, err
+	}
+	if err := sink(1, meta); err != nil {
+		return 0, err
+	}
+	return pageCount, nil
 }
 
-// bodyPage is one serialized page awaiting write: its index, type, key count, chain link, payload.
-// nextPage is 0 for B-tree nodes and the chain link for overflow pages (large-values.md §12).
-type bodyPage struct {
-	index     uint32
-	pageType  byte
-	itemCount uint32
-	nextPage  uint32
-	payload   []byte
+// pageSink is the from-scratch serializer's page output: it builds each page's full bytes (makePage,
+// the single source of the page layout) and hands them to the caller's sink.
+type pageSink struct {
+	ps   int
+	sink func(index uint32, page []byte) error
+}
+
+// page emits one catalog/B-tree/overflow page.
+func (b *pageSink) page(index uint32, pageType byte, itemCount, nextPage uint32, payload []byte) error {
+	return b.sink(index, makePage(b.ps, pageType, itemCount, nextPage, payload))
 }
 
 // serializeGistIndex builds a GiST index's canonical R-tree from its leaf-key store and serializes it
@@ -963,11 +992,11 @@ func serializeGistIndex(s *snapshot, table *catTable, idx indexDef, alloc func()
 	return pages, root, nil
 }
 
-// serializeNode serializes one node and its subtree post-order, appending each to *body, and returns
+// serializeNode serializes one node and its subtree post-order, emitting each page to body, and returns
 // this node's assigned page index and the next free index. A leaf's payload is its records; an
 // interior's is its N+1 child pointers (big-endian u32) then its N records (format.md). A node whose
 // payload would exceed the page is an oversized record (over RECORD_MAX) — feature_not_supported.
-func serializeNode(n *pnode, store *tableStore, capacity int, nextIndex uint32, body *[]bodyPage) (uint32, uint32, error) {
+func serializeNode(n *pnode, store *tableStore, capacity int, nextIndex uint32, body *pageSink) (uint32, uint32, error) {
 	colTypes := store.colTypes
 	childPages := make([]uint32, len(n.children))
 	for i, c := range n.children {
@@ -1027,9 +1056,13 @@ func serializeNode(n *pnode, store *tableStore, capacity int, nextIndex uint32, 
 	if len(payload) > capacity {
 		return 0, 0, newError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
 	}
-	*body = append(*body, bodyPage{index: index, pageType: pageType, itemCount: uint32(n.keyLen()), payload: payload})
+	if err := body.page(index, pageType, uint32(n.keyLen()), 0, payload); err != nil {
+		return 0, 0, err
+	}
 	for _, o := range ovf {
-		*body = append(*body, bodyPage{index: o.index, pageType: pageOverflow, itemCount: o.itemCount, nextPage: o.nextPage, payload: o.payload})
+		if err := body.page(o.index, pageOverflow, o.itemCount, o.nextPage, o.payload); err != nil {
+			return 0, 0, err
+		}
 	}
 	return index, nextIndex, nil
 }
@@ -3575,19 +3608,6 @@ func makePage(ps int, pageType byte, itemCount, nextPage uint32, payload []byte)
 	// The per-page checksum (v7) is computed last, over every byte but its own field at [12,16).
 	binary.BigEndian.PutUint32(p[12:], pageCRC(p))
 	return p
-}
-
-// writeMeta writes a meta slot into image (the whole-image path; metaPage is the single source). A
-// from-scratch image has an empty free-list, so free_list_head = 0 (v25).
-func writeMeta(image []byte, ps, slot int, pageSize uint32, txid uint64, root, pageCount uint32) {
-	off := slot * ps
-	copy(image[off:off+ps], metaPage(pageSize, txid, root, pageCount, 0))
-}
-
-// writePage writes a catalog/data page into image (the whole-image path; makePage is the single source).
-func writePage(image []byte, ps, index int, pageType byte, itemCount, nextPage uint32, payload []byte) {
-	off := index * ps
-	copy(image[off:off+ps], makePage(ps, pageType, itemCount, nextPage, payload))
 }
 
 // meta holds a validated meta slot's salient fields.

@@ -80,6 +80,12 @@ func run() error {
 			err = writer.Commit()
 		case "WRITE_ROLLBACK":
 			err = writer.Rollback()
+		case "COMPACT":
+			name := argument
+			if name == "" {
+				name = "main"
+			}
+			err = db.Compact(name)
 		case "TXID":
 			value = strconv.FormatUint(db.Txid(), 10)
 		case "PAGE_COUNT":

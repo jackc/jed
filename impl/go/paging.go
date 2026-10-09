@@ -100,6 +100,12 @@ func (s *sharedPaging) close() error {
 	return s.pgr.close()
 }
 
+// capacity is the pool's leaf-page capacity — carried over to the replacement pool when compaction
+// reopens the database (spec/design/api.md §2.6).
+func (s *sharedPaging) capacity() int {
+	return s.pool.capacityPages()
+}
+
 // residentLeaves is the number of leaf pages currently resident in the pool — the bound the
 // demand-paging tests assert stays below the budget even for a database far larger than it. P6.4c
 // promotes it to the public memory-budget surface.

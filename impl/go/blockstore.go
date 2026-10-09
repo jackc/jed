@@ -123,6 +123,39 @@ func (s *fileBlockStore) close() error {
 	return s.f.Close()
 }
 
+// skipsSync reports whether sync skips its durability barrier (fsync=off, api.md §2.1), so a
+// compaction rewriting this store's file (api.md §2.6) applies the same setting.
+func (s *fileBlockStore) skipsSync() bool { return s.noSync }
+
+// syncSkipper is the optional blockStore extension a host implements when its sync can be turned off
+// (the file host's fsync=off). A store without it always syncs.
+type syncSkipper interface {
+	skipsSync() bool
+}
+
+// closedBlockStore is the store a pager holds after compaction closed its file (spec/design/api.md
+// §2.6): the database now lives in a replacement store, so any snapshot still bound to this pager
+// fails closed with 58030 instead of reading pages of the old layout.
+type closedBlockStore struct{}
+
+func errStorageReplaced() error {
+	return newError(IoError, "database storage was replaced by compaction; close and reopen the handle")
+}
+
+func (closedBlockStore) readAt(off int64, length int) ([]byte, error) {
+	return nil, errStorageReplaced()
+}
+
+func (closedBlockStore) writeAt(off int64, p []byte) error { return errStorageReplaced() }
+
+func (closedBlockStore) sync() error { return errStorageReplaced() }
+
+func (closedBlockStore) size() (int64, error) { return 0, errStorageReplaced() }
+
+func (closedBlockStore) setSize(n int64) error { return errStorageReplaced() }
+
+func (closedBlockStore) close() error { return nil }
+
 // memoryBlockStore is the pure in-memory storage host (bplus-reshape.md B3): a growable byte slice
 // with the same positioned-read/write and zero-fill growth semantics as a file host, but with no
 // durability work to do. It is the block-device building block for both in-memory databases (B3) and,

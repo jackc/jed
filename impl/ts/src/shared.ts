@@ -82,6 +82,9 @@ import {
   Statement as ErgoStatement,
 } from "./ergonomic.ts";
 import { engineError } from "./errors.ts";
+import { MemoryBlockStore } from "./memoryblockstore.ts";
+import { Pager } from "./pager.ts";
+import { SharedPaging } from "./paging.ts";
 import {
   adoptStaged,
   type BudgetCtx,
@@ -232,6 +235,15 @@ class SharedCore {
       this.writerActive = false;
       throw error;
     }
+  }
+
+  // tryAcquireLocalWriter claims the in-process writer flag only if it is free right now, with no
+  // coordination work (compaction never waits and does its own coordination — spec/design/api.md §2.6).
+  // Released by releaseWriter.
+  tryAcquireLocalWriter(): boolean {
+    if (this.writerActive) return false;
+    this.writerActive = true;
+    return true;
   }
 
   releaseWriter(): void {
@@ -390,6 +402,47 @@ class SharedCore {
     } finally {
       coordinator.unlockTransition();
     }
+  }
+
+  // compactLocked compacts database lname (`main` or an attachment) under the local writer flag the
+  // caller holds (spec/design/api.md §2.6): require presence-exclusive coordination and a drained reader
+  // watermark, then rewrite the storage at the next version and publish the reloaded root. JS is
+  // single-threaded, so no reader can pin between the check and the publish.
+  compactLocked(lname: string, name: string): void {
+    const main = lname === "main";
+    const coordinator = main
+      ? this.coordinator
+      : (this.attachments.get(lname)?.coordinator ?? null);
+    if (coordinator !== null) {
+      coordinator.checkPid();
+      // A peer may have closed since the probe last looked: retry the upgrade now.
+      if (coordinator.state === "shared") this.tryUpgrade(coordinator, main ? null : lname);
+      if (coordinator.state === "shared") {
+        throw engineError(
+          "object_in_use",
+          `cannot compact database "${name}" while another process has it open`,
+        );
+      }
+      if (coordinator.state === "poisoned") {
+        throw engineError("io_error", "shared-file coordinator is poisoned");
+      }
+    }
+    if (this.live.size > 0) {
+      throw engineError(
+        "object_in_use",
+        `cannot compact database "${name}" while a reader is open`,
+      );
+    }
+    const prev = main ? this.committed : this.attached.get(lname)!;
+    const compacted = compactStorage(this.storageFor(lname), prev, prev.txid + 1n);
+    if (main) {
+      this.committed = compacted;
+    } else {
+      const attached = new Map(this.attached);
+      attached.set(lname, compacted);
+      this.attached = attached;
+    }
+    this.planEpoch++;
   }
 
   // pageSize is the byte store's page size (fixed into the file/image at creation). Minted sessions
@@ -567,6 +620,62 @@ class SharedCore {
     for (const v of this.live.keys()) if (v < oldest) oldest = v;
     return oldest;
   }
+}
+
+// compactStorage replaces storage st with the from-scratch image of snap at txid (host compaction,
+// spec/design/api.md §2.6) and returns the committed snapshot reloaded from it. A file is rewritten
+// through the host's registered file compactor (file.ts compactFile); an in-memory domain swaps in a new
+// MemoryBlockStore. The image has no free list and no garbage, so the page accounting restarts from it,
+// and the storage budget forgets the last commit's pages (none of them is dead now).
+function compactStorage(st: Engine, snap: Snapshot, txid: bigint): Snapshot {
+  const old = st.paging;
+  if (old === null) throw engineError("io_error", "database storage is closed");
+  old.checkDurableCommit();
+  const capacity = old.capacity();
+  let paging: SharedPaging;
+  if (st.path !== null) {
+    paging = fileCompactor!(st.path, snap, st.pageSize, txid, old, capacity);
+  } else {
+    const image = toImageBytes(snap, st.pageSize, txid);
+    paging = new SharedPaging(Pager.fromStore(new MemoryBlockStore(image)), capacity);
+  }
+  // A file's old pager is already closed and poisoned here, so a failed reload leaves the handle
+  // needing a reopen; an in-memory domain keeps its old store untouched.
+  let loaded: Engine;
+  try {
+    loaded = loadEnginePaged(paging);
+  } catch (error) {
+    paging.close();
+    throw error;
+  }
+  st.paging = paging;
+  st.pageCount = loaded.pageCount;
+  st.freePages = loaded.freePages;
+  st.liveAtCompaction = loaded.liveAtCompaction;
+  st.freeGenTxid = loaded.freeGenTxid;
+  st.storageBudget.lastCatRoot = 0;
+  st.storageBudget.lastWritten = [];
+  st.storageBudget.lastCatalogPages = 0;
+  return loaded.committed;
+}
+
+// fileCompactor is the host-injected file rewrite behind Database.compact (spec/design/api.md §2.6): the
+// Node host (file.ts) registers compactFile at load, so shared.ts stays browser-clean. null until a host
+// registers one; a file-backed storage cannot exist without file.ts, which registers it.
+type FileCompactor = (
+  path: string,
+  snap: Snapshot,
+  pageSize: number,
+  txid: bigint,
+  old: SharedPaging,
+  capacity: number,
+) => SharedPaging;
+let fileCompactor: FileCompactor | null = null;
+
+// registerFileCompactor installs the host file rewrite that Database.compact uses for a file-backed
+// database (called once, at file.ts module load).
+export function registerFileCompactor(fn: FileCompactor): void {
+  fileCompactor = fn;
 }
 
 // AttachSource selects the backing for a database attached via Database.attach
@@ -783,6 +892,54 @@ export class Database {
     // in-memory attachment). No live reader can still fault it — detach-in-use was rejected above.
     att.storage.paging?.close();
     att.coordinator?.close();
+  }
+
+  // compact compacts database name — `main` or an attachment, case-insensitive — returning its dead
+  // space (spec/design/api.md §2.6): rewrite it as the garbage-free from-scratch image of its committed
+  // snapshot at the next version and swap the storage atomically (a file through temp file + rename, an
+  // in-memory database by replacing its byte store). Rows, catalog, and later results and costs are
+  // unchanged. Never waits: 42704 for a name that is not attached, 25006 for a read-only database, 0A000
+  // on a host that cannot replace a file atomically (OPFS), and 55006 while a write transaction or reader
+  // is open on this handle or another process has the file open. Not metered and not reachable from SQL.
+  compact(name: string): void {
+    const c = this.core;
+    const lname = name.toLowerCase();
+    let storage: Engine;
+    let readOnly: boolean;
+    if (lname === "main") {
+      storage = c.storage;
+      readOnly = c.readOnly;
+    } else {
+      const att = lname === "temp" ? undefined : c.attachments.get(lname);
+      if (att === undefined) {
+        throw engineError("undefined_object", `database "${name}" is not attached`);
+      }
+      storage = att.storage;
+      readOnly = att.readOnly;
+    }
+    if (readOnly) {
+      throw engineError("read_only_sql_transaction", `cannot compact read-only database "${name}"`);
+    }
+    // A durable store without a path is the OPFS host (opfs.ts leaves path null), which has no atomic
+    // file replace yet (hosts.md §5).
+    const durable = storage.path !== null || storage.persistHook !== null;
+    if (durable && (storage.path === null || fileCompactor === null)) {
+      throw engineError(
+        "feature_not_supported",
+        `cannot compact database "${name}": its storage host cannot replace the file atomically`,
+      );
+    }
+    if (!c.tryAcquireLocalWriter()) {
+      throw engineError(
+        "object_in_use",
+        `cannot compact database "${name}" while a write transaction is open`,
+      );
+    }
+    try {
+      c.compactLocked(lname, name);
+    } finally {
+      c.releaseWriter();
+    }
   }
 
   // readSession opens a READ ONLY session over a consistent snapshot (spec/design/session.md §2.4,

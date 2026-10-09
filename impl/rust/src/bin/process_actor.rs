@@ -108,6 +108,13 @@ fn run() -> Result<(), EngineError> {
                 .expect("WRITE_OPEN precedes WRITE_ROLLBACK")
                 .rollback()
                 .map(|_| String::new()),
+            "COMPACT" => database
+                .compact(if argument.is_empty() {
+                    "main"
+                } else {
+                    argument
+                })
+                .map(|_| String::new()),
             "TXID" => Ok(database.txid().to_string()),
             "PAGE_COUNT" => Ok(database.page_count().to_string()),
             "CLOSE" => {

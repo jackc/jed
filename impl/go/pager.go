@@ -292,6 +292,27 @@ func injectedCrash() error {
 	return newError(IoError, "injected commit crash (fault injection)")
 }
 
+// swapStore replaces the byte backing, returning the old one (compaction, spec/design/api.md §2.6):
+// the caller closes a file before renaming its replacement over it by swapping in a closedBlockStore,
+// and swaps the reopened old file back if the rename fails.
+func (p *pager) swapStore(store blockStore) blockStore {
+	old := p.store
+	p.store = store
+	return old
+}
+
+// skipsSync reports whether the backing skips its durability barrier (fsync=off).
+func (p *pager) skipsSync() bool {
+	s, ok := p.store.(syncSkipper)
+	return ok && s.skipsSync()
+}
+
+// poison refuses every later commit: the storage this pager reads is gone or unknown, so the handle
+// must be closed and reopened (a failed compaction after its rename, api.md §2.6).
+func (p *pager) poison() {
+	p.poisoned = true
+}
+
 // close releases the backing store (Engine.Close).
 func (p *pager) close() error {
 	return p.store.close()

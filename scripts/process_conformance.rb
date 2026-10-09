@@ -9,7 +9,8 @@ require "toml-rb"
 
 ROOT = File.expand_path("..", __dir__)
 CORPUS = File.join(ROOT, "spec/conformance/process")
-CORES = %w[rust go node].freeze
+# JED_PROCESS_CORES=rust,go narrows the pairings while a core is being brought up; CI runs all three.
+CORES = (ENV["JED_PROCESS_CORES"]&.split(",") || %w[rust go node]).freeze
 START_TIMEOUT = 15
 COMMAND_TIMEOUT = 10
 
@@ -170,4 +171,4 @@ Dir[File.join(CORPUS, "*.process.toml")].sort.each do |path|
 end
 
 abort "process conformance failed (#{failures.length} pairing(s))" unless failures.empty?
-puts "\nprocess conformance OK (Rust, Go, and Node pairings)"
+puts "\nprocess conformance OK (#{CORES.join(", ")} pairings)"

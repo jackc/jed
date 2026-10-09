@@ -588,6 +588,12 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   the goldens and the deterministic cost depend on (the §14 analysis, recorded in
   large-values.md §6); the work is metered by the `value_compress`/`value_decompress` cost
   units (§13).
+- **Compaction — ✅ built ([api.md](spec/design/api.md) §2.6).** The host-invoked `compact(name)`
+  returns a database's dead pages: it streams the from-scratch image of the committed snapshot (at
+  `txid + 1`) into `<path>.jedtmp` in bounded memory and atomically renames it into place (in memory: a
+  fresh `MemoryBlockStore`). It never waits — a held writer gate, a pinned reader, or another process
+  holding the file is `55006` (locking.md §6) — and is results- and cost-neutral (pages are renumbered,
+  tree nodes kept). OPFS compaction and in-place trailing truncation remain follow-ons.
 - **Validated COW durable commits (format v33).** Dirty body pages are written once, with
   CRC-64/ECMA-182 identities recorded inline in the alternate meta page and, for large
   transactions, in reusable manifest overflow pages. A single final durable barrier replaces

@@ -1314,6 +1314,31 @@ impl Snapshot {
     /// commit reuses `serialize_node` but writes only the dirty path; storage.md §4.)
     pub fn to_image(&self, page_size: u32, txid: u64) -> Result<Vec<u8>> {
         let ps = page_size as usize;
+        let mut image: Vec<u8> = Vec::new();
+        self.write_image(page_size, txid, &mut |index, page| {
+            let off = index as usize * ps;
+            if image.len() < off + ps {
+                image.resize(off + ps, 0);
+            }
+            image[off..off + ps].copy_from_slice(page);
+            Ok(())
+        })?;
+        Ok(image)
+    }
+
+    /// Stream this snapshot's from-scratch image (the bytes [`to_image`](Snapshot::to_image)
+    /// returns) to `sink` one full page at a time, as `(page index, page bytes)`, and return the
+    /// image's page count. Pages arrive in no particular index order; both meta slots arrive last.
+    /// The sink sees each page exactly once, so a file sink writes the image in bounded memory —
+    /// host compaction ([`crate::Database::compact`], spec/design/api.md §2.6) relies on this to
+    /// rewrite a larger-than-RAM file without a whole-image buffer.
+    pub(crate) fn write_image(
+        &self,
+        page_size: u32,
+        txid: u64,
+        sink: &mut dyn FnMut(u32, &[u8]) -> Result<()>,
+    ) -> Result<u32> {
+        let ps = page_size as usize;
         if ps < MIN_PAGE_SIZE {
             return Err(EngineError::new(
                 SqlState::FeatureNotSupported,
@@ -1338,11 +1363,11 @@ impl Snapshot {
         let mut tables = self.catalog_and_stores();
         tables.sort_by(|a, b| a.0.cmp(b.0));
 
-        // Serialize each table's B-tree post-order, body pages allocated from page 2. Each entry
-        // is `(index, page_type, item_count, next_page, payload)`; children precede their parent so
+        // Serialize each table's B-tree post-order, body pages allocated from page 2. Each page is
+        // emitted to the sink as soon as its bytes are final; children precede their parent so
         // parent child-pointers reference already-allocated pages (format.md). `next_page` is `0`
         // for B-tree nodes and the chain link for overflow pages (large-values.md §12).
-        let mut body: Vec<(u32, u8, u32, u32, Vec<u8>)> = Vec::new();
+        let mut body = PageSink { ps, sink };
         let mut root_data_page = vec![0u32; tables.len()];
         let mut index_roots: Vec<Vec<u32>> = vec![Vec::new(); tables.len()];
         let mut next_index = ROOT_PAGE;
@@ -1366,7 +1391,7 @@ impl Snapshot {
                         serialize_gist_index(self, table, idx, &mut alloc)?
                     };
                     for p in gpages {
-                        body.push((p.page_no, p.page_type, p.item_count, 0, p.payload));
+                        body.page(p.page_no, p.page_type, p.item_count, 0, &p.payload)?;
                     }
                     root
                 } else {
@@ -1427,26 +1452,6 @@ impl Snapshot {
         let cat_groups = pack(&entry_sizes, cap)?;
         let page_count = cat_root + cat_groups.len() as u32;
 
-        let mut image = vec![0u8; page_count as usize * ps];
-
-        // Meta: both slots hold the current meta (a fresh from-scratch image has no distinct prior
-        // version; slot alternation is the live incremental-commit path — format.md).
-        write_meta(&mut image, ps, 0, page_size, txid, cat_root, page_count);
-        write_meta(&mut image, ps, 1, page_size, txid, cat_root, page_count);
-
-        // B-tree node + overflow pages.
-        for (index, page_type, item_count, next_page, payload) in &body {
-            write_page(
-                &mut image,
-                ps,
-                *index,
-                *page_type,
-                *item_count,
-                *next_page,
-                payload,
-            );
-        }
-
         // Catalog chain.
         for (gi, group) in cat_groups.iter().enumerate() {
             let index = cat_root + gi as u32;
@@ -1459,18 +1464,38 @@ impl Snapshot {
             for &ei in group {
                 payload.extend_from_slice(&cat_entries[ei]);
             }
-            write_page(
-                &mut image,
-                ps,
-                index,
-                PAGE_CATALOG,
-                group.len() as u32,
-                next,
-                &payload,
-            );
+            body.page(index, PAGE_CATALOG, group.len() as u32, next, &payload)?;
         }
 
-        Ok(image)
+        // Meta last: both slots hold the current meta (a fresh from-scratch image has no distinct
+        // prior version; slot alternation is the live incremental-commit path — format.md).
+        let meta = meta_page(page_size, txid, cat_root, page_count, 0);
+        (body.sink)(0, &meta)?;
+        (body.sink)(1, &meta)?;
+        Ok(page_count)
+    }
+}
+
+/// The from-scratch serializer's page output: builds each page's full bytes (`make_page`, the
+/// single source of the page layout) and hands them to the caller's sink.
+struct PageSink<'a> {
+    ps: usize,
+    sink: &'a mut dyn FnMut(u32, &[u8]) -> Result<()>,
+}
+
+impl PageSink<'_> {
+    fn page(
+        &mut self,
+        index: u32,
+        page_type: u8,
+        item_count: u32,
+        next_page: u32,
+        payload: &[u8],
+    ) -> Result<()> {
+        (self.sink)(
+            index,
+            &make_page(self.ps, page_type, item_count, next_page, payload),
+        )
     }
 }
 
@@ -1484,7 +1509,7 @@ fn serialize_node(
     store: &TableStore,
     cap: usize,
     next_index: &mut u32,
-    body: &mut Vec<(u32, u8, u32, u32, Vec<u8>)>,
+    body: &mut PageSink<'_>,
 ) -> Result<u32> {
     let col_types = store.col_types();
     let mut child_pages = Vec::with_capacity(node.children.len());
@@ -1541,9 +1566,15 @@ fn serialize_node(
             "a record larger than the per-row limit is not supported",
         ));
     }
-    body.push((index, page_type, n, 0, payload));
+    body.page(index, page_type, n, 0, &payload)?;
     for o in ovf {
-        body.push((o.index, PAGE_OVERFLOW, o.item_count, o.next_page, o.payload));
+        body.page(
+            o.index,
+            PAGE_OVERFLOW,
+            o.item_count,
+            o.next_page,
+            &o.payload,
+        )?;
     }
     Ok(index)
 }
@@ -3542,6 +3573,7 @@ fn make_page(ps: usize, page_type: u8, item_count: u32, next_page: u32, payload:
 
 /// Write a meta slot into `image` (the whole-image path; `meta_page` is the single source). A
 /// from-scratch image has an empty free-list, so `free_list_head = 0` (v25).
+#[cfg(test)]
 fn write_meta(
     image: &mut [u8],
     ps: usize,
@@ -3553,20 +3585,6 @@ fn write_meta(
 ) {
     let off = slot * ps;
     image[off..off + ps].copy_from_slice(&meta_page(page_size, txid, root_page, page_count, 0));
-}
-
-/// Write a catalog / data page into `image` (the whole-image path; `make_page` is the single source).
-fn write_page(
-    image: &mut [u8],
-    ps: usize,
-    index: u32,
-    page_type: u8,
-    item_count: u32,
-    next_page: u32,
-    payload: &[u8],
-) {
-    let off = index as usize * ps;
-    image[off..off + ps].copy_from_slice(&make_page(ps, page_type, item_count, next_page, payload));
 }
 
 /// A validated meta slot's salient fields.

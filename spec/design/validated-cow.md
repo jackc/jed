@@ -55,7 +55,7 @@ recovery can select the preceding snapshot in that case too. The checksum guaran
 accidental corruption/torn-write detection, not authentication or immunity to collisions.
 
 Whole-file `create` and `to_image` write **bootstrap meta** with zero manifest fields;
-the same rule applies to the specified future atomic file-compaction operation. They already publish a complete independently durable image; they need no
+the same rule applies to atomic file compaction ([api.md](api.md) §2.6), which writes the image at `txid + 1`. They already publish a complete independently durable image; they need no
 incremental dependency manifest. Both slots carry the same bootstrap root. The exact-version
 format break rejects all pre-v33 readers/writers; there is no mixed-version migration.
 

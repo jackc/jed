@@ -5,9 +5,12 @@
 // (FileBlockStore, fileblockstore.ts), OPFS (OpfsBlockStore, opfsblockstore.ts), an
 // encrypting/replicating wrap, even a pure in-memory buffer — be a thin adapter that cannot drift.
 //
-// This module holds ONLY the interface, so it imports no `node:*` and is browser-bundle-clean: the
-// pager and OpfsBlockStore type-import `BlockStore` from here without dragging the Node `fs` host in
-// (the host impls live in their own modules — the same interface/impl split as spill.ts/spillfile.ts).
+// This module holds the interface plus the host-free ClosedBlockStore, so it imports no `node:*` and is
+// browser-bundle-clean: the pager and OpfsBlockStore type-import `BlockStore` from here without dragging
+// the Node `fs` host in (the host impls live in their own modules — the same interface/impl split as
+// spill.ts/spillfile.ts).
+
+import { engineError } from "./errors.ts";
 
 // BlockStore is the byte backing for one database file (spec/design/hosts.md §1/§2). The pager converts
 // a page index to a byte offset (offset = index × pageSize) and drives this device; the host knows only
@@ -31,4 +34,43 @@ export interface BlockStore {
   setSize(bytes: number): void;
   // close releases the backing (the OS file descriptor). Lifecycle, not part of the §2 data surface.
   close(): void;
+  // skipsSync reports whether sync skips its durability barrier (fsync=off, api.md §2.1), so a
+  // compaction rewriting this store's file (api.md §2.6) applies the same setting. Absent means false.
+  skipsSync?(): boolean;
+}
+
+// ClosedBlockStore is the store a pager holds after compaction closed its file (spec/design/api.md
+// §2.6): the database now lives in a replacement store, so any snapshot still bound to this pager fails
+// closed with 58030 instead of reading pages of the old layout.
+export class ClosedBlockStore implements BlockStore {
+  readAt(_offset: number, _len: number): Uint8Array {
+    throw closedError();
+  }
+
+  writeAt(_offset: number, _bytes: Uint8Array): void {
+    throw closedError();
+  }
+
+  sync(): void {
+    throw closedError();
+  }
+
+  size(): number {
+    throw closedError();
+  }
+
+  setSize(_bytes: number): void {
+    throw closedError();
+  }
+
+  close(): void {
+    // Nothing to release: the file was closed when this store took its place.
+  }
+}
+
+function closedError(): Error {
+  return engineError(
+    "io_error",
+    "database storage was replaced by compaction; close and reopen the handle",
+  );
 }

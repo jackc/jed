@@ -150,6 +150,25 @@ impl Pager {
         })
     }
 
+    /// Replace the byte backing, returning the old one (compaction, spec/design/api.md §2.6): the
+    /// caller closes a file before renaming its replacement over it by swapping in a
+    /// [`ClosedBlockStore`](crate::blockstore::ClosedBlockStore), and swaps the reopened old file
+    /// back if the rename fails.
+    pub(crate) fn swap_store(&mut self, store: Box<dyn BlockStore>) -> Box<dyn BlockStore> {
+        std::mem::replace(&mut self.store, store)
+    }
+
+    /// Whether the backing skips its durability barrier (`fsync=off`).
+    pub(crate) fn skips_sync(&self) -> bool {
+        self.store.skips_sync()
+    }
+
+    /// Refuse every later commit: the storage this pager reads is gone or unknown, so the handle
+    /// must be closed and reopened (a failed compaction after its rename, api.md §2.6).
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
     pub(crate) fn allocated_pages(&self) -> u32 {
         self.allocated_pages
     }

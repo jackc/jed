@@ -77,6 +77,9 @@ for await (const line of createInterface({ input: process.stdin, crlfDelay: Infi
       case "WRITE_ROLLBACK":
         writer!.rollback();
         break;
+      case "COMPACT":
+        database.compact(argument || "main");
+        break;
       case "TXID":
         value = database.txid.toString();
         break;

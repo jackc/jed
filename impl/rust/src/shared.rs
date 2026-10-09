@@ -769,6 +769,40 @@ impl Storage {
         self.free_gen_txid = snap.txid; // the recomputed list is proven dead at snap.txid (the §8 gate)
         Ok(())
     }
+
+    /// Replace this domain's storage with the from-scratch image of `snap` at `txid` (host
+    /// compaction, spec/design/api.md §2.6) and return the committed snapshot reloaded from it. A
+    /// file is rewritten through [`crate::file::compact_file`]; an in-memory domain swaps in a new
+    /// `MemoryBlockStore`. The caller holds the writer gate and the reader watermark lock. The image
+    /// has no free list and no garbage, so the page accounting restarts from it, and the storage
+    /// budget forgets the last commit's pages (none of them is dead now).
+    pub(crate) fn compact(&mut self, snap: &Snapshot, txid: u64) -> Result<Snapshot> {
+        self.paging.pager().check_commit()?;
+        let capacity = self.paging.capacity();
+        let paging = match &self.path {
+            Some(path) => {
+                crate::file::compact_file(path, snap, self.page_size, txid, &self.paging, capacity)?
+            }
+            None => {
+                let image = snap.to_image(self.page_size, txid)?;
+                let store = crate::blockstore::MemoryBlockStore::new(image);
+                let pager = crate::pager::Pager::from_store(Box::new(store))?;
+                crate::paging::SharedPaging::new(pager, capacity)
+            }
+        };
+        // A file's old pager is already closed and poisoned here, so a failed reload leaves the
+        // handle needing a reopen; an in-memory domain keeps its old store untouched.
+        let engine = Engine::open_shared_paging(Arc::clone(&paging))?;
+        self.paging = paging;
+        self.page_count = engine.page_count;
+        self.free_pages = engine.free_pages.clone();
+        self.live_at_compaction = engine.live_at_compaction;
+        self.free_gen_txid = engine.free_gen_txid;
+        self.budget.last_cat_root = 0;
+        self.budget.last_written.clear();
+        self.budget.last_catalog_pages = 0;
+        Ok(engine.committed)
+    }
 }
 
 /// The thread-safe core shared by every [`Database`] clone (CLAUDE.md §3). Holds the published
@@ -1172,25 +1206,116 @@ impl Shared {
 
     fn try_upgrade(&self, coordinator: &FileCoordinator, attachment: Option<&str>) -> Result<()> {
         self.acquire_local_writer();
-        let result = (|| {
-            let _live = self.live.lock().expect("live lock not poisoned");
-            let _transition = coordinator.lock_transition()?;
-            let Some(_arrival) = coordinator.try_arrival_exclusive()? else {
-                return Ok(());
-            };
-            if coordinator.try_upgrade_presence()? {
-                let _commit = coordinator.lock_commit_shared()?;
-                if let Some(name) = attachment {
-                    self.reload_attachment_from_pager(name)?;
-                } else {
-                    self.reload_from_pager()?;
-                }
-                coordinator.set_state(LeaseState::Alone);
-            }
-            Ok(())
-        })();
+        let result = self.try_upgrade_locked(coordinator, attachment);
         self.release_local_writer();
         result
+    }
+
+    /// [`try_upgrade`](Self::try_upgrade) for a caller already holding the local writer barrier.
+    fn try_upgrade_locked(
+        &self,
+        coordinator: &FileCoordinator,
+        attachment: Option<&str>,
+    ) -> Result<()> {
+        let _live = self.live.lock().expect("live lock not poisoned");
+        let _transition = coordinator.lock_transition()?;
+        let Some(_arrival) = coordinator.try_arrival_exclusive()? else {
+            return Ok(());
+        };
+        if coordinator.try_upgrade_presence()? {
+            let _commit = coordinator.lock_commit_shared()?;
+            if let Some(name) = attachment {
+                self.reload_attachment_from_pager(name)?;
+            } else {
+                self.reload_from_pager()?;
+            }
+            coordinator.set_state(LeaseState::Alone);
+        }
+        Ok(())
+    }
+
+    /// Claim the in-process writer barrier only if it is free right now (compaction never waits —
+    /// spec/design/api.md §2.6).
+    fn try_acquire_local_writer(&self) -> bool {
+        let mut active = self.writer_active.lock().expect("writer lock not poisoned");
+        if *active {
+            return false;
+        }
+        *active = true;
+        true
+    }
+
+    /// Compact database `lname` (`main` or an attachment) under the local writer barrier the caller
+    /// holds (spec/design/api.md §2.6): require presence-exclusive coordination and a drained reader
+    /// watermark, then rewrite the storage at the next version and publish the reloaded root while
+    /// still holding the watermark lock, so no reader pins in between.
+    fn compact_locked(&self, lname: &str, name: &str) -> Result<()> {
+        let main = lname == "main";
+        let coordinator = if main {
+            self.coordinator.clone()
+        } else {
+            self.attachments
+                .lock()
+                .expect("attachments lock not poisoned")
+                .get(lname)
+                .and_then(|attachment| attachment.coordinator.clone())
+        };
+        if let Some(coordinator) = &coordinator {
+            coordinator.check_pid()?;
+            if coordinator.state() == LeaseState::Shared {
+                // A peer may have closed since the probe last looked: retry the upgrade now.
+                self.try_upgrade_locked(coordinator, if main { None } else { Some(lname) })?;
+            }
+            match coordinator.state() {
+                LeaseState::Alone | LeaseState::Exclusive => {}
+                LeaseState::Shared => {
+                    return Err(EngineError::new(
+                        SqlState::ObjectInUse,
+                        format!(
+                            "cannot compact database \"{name}\" while another process has it open"
+                        ),
+                    ));
+                }
+                LeaseState::Poisoned => {
+                    return Err(EngineError::new(
+                        SqlState::IoError,
+                        "shared-file coordinator is poisoned",
+                    ));
+                }
+            }
+        }
+        let live = self.live.lock().expect("live lock not poisoned");
+        if live.oldest().is_some() {
+            return Err(EngineError::new(
+                SqlState::ObjectInUse,
+                format!("cannot compact database \"{name}\" while a reader is open"),
+            ));
+        }
+        let prev = if main {
+            Arc::clone(
+                &self
+                    .roots
+                    .read()
+                    .expect("roots lock not poisoned")
+                    .committed,
+            )
+        } else {
+            self.committed_attachment(lname)
+                .expect("attachment exists (checked by compact)")
+        };
+        let compacted = self.with_storage(lname, |st| st.compact(&prev, prev.txid + 1))?;
+        let mut roots = self.roots.write().expect("roots lock not poisoned");
+        if main {
+            roots.committed = Arc::new(compacted);
+        } else {
+            roots
+                .attached
+                .insert(lname.to_string(), Arc::new(compacted));
+        }
+        drop(roots);
+        drop(live);
+        self.plan_epoch.fetch_add(1, Ordering::Release);
+        Ok(())
     }
 
     /// Pin the committed root (an `Arc` clone under a momentary read lock) — returns the file
@@ -1900,6 +2025,51 @@ impl Database {
     /// high-water times its page size (spec/design/memory.md §8.2/§8.6). Deterministic; not RSS.
     pub fn storage_bytes(&self, name: &str) -> Result<i64> {
         self.0.with_storage(name, |st| Ok(st.storage_bytes()))
+    }
+
+    /// Compact database `name` — `main` or an attachment — returning its dead space (spec/design/
+    /// api.md §2.6): rewrite it as the garbage-free from-scratch image of its committed snapshot at the
+    /// next version and swap the storage atomically (a file through temp file + rename, an in-memory
+    /// database by replacing its byte store). Rows, catalog, and later results and costs are unchanged.
+    /// Never waits: `42704` for a name that is not attached, `25006` for a read-only database, and
+    /// `55006` while a write transaction or reader is open on this handle or another process has the
+    /// file open. Not metered and not reachable from SQL.
+    pub fn compact(&self, name: &str) -> Result<()> {
+        let lname = name.to_ascii_lowercase();
+        let read_only = if lname == "main" {
+            self.0.read_only()
+        } else {
+            match self
+                .0
+                .attachments
+                .lock()
+                .expect("attachments lock not poisoned")
+                .get(&lname)
+            {
+                Some(attachment) if lname != "temp" => attachment.mode == AttachMode::ReadOnly,
+                _ => {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedObject,
+                        format!("database \"{name}\" is not attached"),
+                    ));
+                }
+            }
+        };
+        if read_only {
+            return Err(EngineError::new(
+                SqlState::ReadOnlySqlTransaction,
+                format!("cannot compact read-only database \"{name}\""),
+            ));
+        }
+        if !self.0.try_acquire_local_writer() {
+            return Err(EngineError::new(
+                SqlState::ObjectInUse,
+                format!("cannot compact database \"{name}\" while a write transaction is open"),
+            ));
+        }
+        let result = self.0.compact_locked(&lname, name);
+        self.0.release_local_writer();
+        result
     }
 
     /// The backing file path for a file-backed database; `None` in-memory.

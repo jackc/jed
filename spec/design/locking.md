@@ -282,10 +282,13 @@ admission begins only after that preparation succeeds, before stabilization or p
 - **Buffer pools remain valid while shared** because foreign processes append body pages. Meta is read
   directly. When an alone writer later reuses a page, the ordinary commit invalidation removes any
   stale local decode of that page before the new root is published.
-- **Whole-file compaction** requires `presence EX`, the local watermark drained, and the local writer
-  gate. The stable lock bundle remains locked while the database file handle is closed, a fresh image
-  is atomically renamed into place, and the pager reopens the replacement. A new process cannot join
-  through the rename because `presence EX` lives on the unchanged bundle.
+- **Whole-file compaction** ([api.md](api.md) §2.6) requires `presence EX`, the local watermark
+  drained, and the local writer gate; it fails `55006` rather than waiting for any of them. A handle
+  in the shared state first retries the presence upgrade (a peer may have just closed). The stable
+  lock bundle remains locked while the database file handle is closed, a fresh image is atomically
+  renamed into place, and the pager reopens the replacement. A new process cannot join through the
+  rename because `presence EX` lives on the unchanged bundle; a joiner waits up to its
+  `file_lock_timeout_ms` and then sees only the compacted file.
 - **Trailing truncation** has the same aloneness rule. Shared commits never lower `page_count`.
 - **Attachments** coordinate independently per file. The existing one-durable-writer-per-transaction
   rule remains until the super-journal slice. Because the current BEGIN surface does not declare which
