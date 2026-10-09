@@ -137,7 +137,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > relation order, access paths, and nested-loop / index-nested-loop / hash algorithms through a
 > bounded left-deep search. Exact row counts and explicit deterministic column statistics are
 > transactional and persisted; `EXPLAIN` makes the selected plan and its estimates
-> corpus-assertable. Mutations and hard-fenced join shapes retain their documented fixed policies.
+> corpus-assertable. UPDATE/DELETE targets use the same costed access choice; hard-fenced join shapes
+> retain their documented fixed policies.
 > **The load-bearing constraint:** cost is **observable and a cross-core contract** (§8; the
 > `# cost:` corpus directive), so (a) any plan change that changes which plan runs changes the metered
 > cost — it must recompute *identically* in all three cores and re-pin the affected `# cost:` entries;
@@ -156,8 +157,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   transactional v29 `ANALYZE` statistics. The canonical contracts are
   [estimator.md](spec/design/estimator.md), [statistics.md](spec/design/statistics.md),
   [planner.md](spec/design/planner.md), and [explain.md](spec/design/explain.md).
-  - [ ] _follow-on:_ cost-based `UPDATE`/`DELETE` access policy, with mutation visitation/error order
-    decided and re-pinned explicitly.
+  - [x] _follow-on:_ cost-based `UPDATE`/`DELETE` access policy — the target scan takes the
+    estimated-cheapest inventory candidate with the canonical tie order; the selected path's
+    emission order is the phase-one visitation (error and `nextval`) order
+    ([estimator.md §9.3](spec/design/estimator.md), `dml.costed_access`).
   - [ ] _follow-on:_ parameter-sensitive/custom prepared plans; planning remains pre-bind today.
   - [ ] _follow-on:_ statistics quality — pattern selectivity, extended/multi-column correlation,
     configurable targets, MCV-aware join skew, automatic analyze, and distribution facts for

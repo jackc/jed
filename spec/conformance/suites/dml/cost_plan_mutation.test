@@ -1,0 +1,253 @@
+# Cost-based UPDATE/DELETE access-path selection (estimator.md §9.3, planner.md §5.5). A mutation
+# target estimates every legal candidate in the shared inventory with SELECT's scan-plus-residual
+# estimate and takes the cheapest; an exact tie keeps the canonical kind/name order. The selected
+# path's natural emission order is the phase-1 visitation order, so it decides which row's error is
+# reported first and the order of per-row volatile assignments. The complete WHERE is always the
+# residual filter, so the affected rows never depend on the chosen path.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.gist_index, ddl.sequence, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.returning, dml.costed_access, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.index_range, query.index_mutation, query.gin_scan, query.gist_scan, query.explain, dml.explain, func.sequence, expr.arithmetic, error.overflow_trap, error.division_by_zero, resource.cost_metering, types.i32, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators
+
+statement ok
+CREATE TABLE m (id i32 PRIMARY KEY, a i32, b i32, x i32)
+
+statement ok
+CREATE INDEX m_a ON m (a)
+
+statement ok
+CREATE INDEX m_b ON m (b)
+
+statement ok
+INSERT INTO m VALUES (1, 10, 5, 0)
+
+# One row: the full scan costs less than an index descent plus a table point fetch, so the mutation
+# leaves the usable m_a bound — the former fixed policy always took any index bound.
+# names: depth, node, detail, est_rows, est_cost
+# types: i32, text, text, i64, i64
+query ITTII nosort
+EXPLAIN DELETE FROM m WHERE a = 10
+----
+0
+Delete m
+-
+1
+3
+1
+Filter
+conjuncts=1
+1
+3
+2
+Scan m
+Full scan; touched=1
+1
+2
+
+# Full scan: page_read 1 + storage_row_read 1 + filter 1. The m_a bound would add a table fetch.
+# cost: 3
+statement ok
+UPDATE m SET x = x WHERE a = 10
+
+statement ok
+INSERT INTO m VALUES (2, 11, 4, 1), (3, 12, 3, 2), (4, 13, 2, 3), (5, 14, 1, 4), (6, 15, 0, 5)
+
+# A PK range competes with a paired range on m_b. The former policy always took the PK bound; the
+# m_b bound's narrower paired-range estimate wins now.
+query ITTII nosort
+EXPLAIN UPDATE m SET x = x + 1 WHERE id > 0 AND b >= 1 AND b <= 2
+----
+0
+Update m
+sets=1
+1
+8
+1
+Filter
+conjuncts=3
+1
+8
+2
+Scan m
+Index bound: using m_b; touched=3
+1
+3
+
+# m_b: index page 1 + two table fetches 2 + storage_row_read 2 + filter 5×2 + assignment 1×2 = 17.
+# The former PK bound read all six rows and evaluated the filter six times.
+# cost: 17
+statement ok
+UPDATE m SET x = x + 1 WHERE id > 0 AND b >= 1 AND b <= 2
+
+query IIII rowsort
+SELECT id, a, b, x FROM m
+----
+1
+10
+5
+0
+2
+11
+4
+1
+3
+12
+3
+2
+4
+13
+2
+4
+5
+14
+1
+5
+6
+15
+0
+5
+
+# Visitation follows the selected m_b order (b ascending), not storage-key order. Both matching
+# rows fail below with different errors; the first visited row's error is the statement's error.
+statement ok
+UPDATE m SET x = 0 WHERE id = 4
+
+statement ok
+UPDATE m SET x = 1 WHERE id = 5
+
+# id=4 has x=0 (22012 under 2147483647 / x); id=5 has x=1 (22003 after + x). m_b visits id=5 first.
+statement error 22003
+UPDATE m SET x = 2147483647 / x + x WHERE id > 0 AND b >= 1 AND b <= 2
+
+# The same predicate spelled to defeat m_b scans in storage-key order and reaches id=4 first.
+statement error 22012
+UPDATE m SET x = 2147483647 / x + x WHERE id > 0 AND b + 0 >= 1 AND b + 0 <= 2
+
+# Both failed statements wrote nothing.
+query IIII rowsort
+SELECT id, a, b, x FROM m
+----
+1
+10
+5
+0
+2
+11
+4
+1
+3
+12
+3
+2
+4
+13
+2
+0
+5
+14
+1
+1
+6
+15
+0
+5
+
+# Per-row volatile assignments follow the same visitation order: m_b reaches id=5 before id=4.
+statement ok
+CREATE SEQUENCE m_seq
+
+query II rowsort
+UPDATE m SET x = nextval('m_seq') WHERE id > 0 AND b >= 1 AND b <= 2 RETURNING id, x
+----
+4
+2
+5
+1
+
+# DELETE uses the same selector.
+query ITTII nosort
+EXPLAIN DELETE FROM m WHERE id > 0 AND b >= 1 AND b <= 2
+----
+0
+Delete m
+-
+1
+8
+1
+Filter
+conjuncts=3
+1
+8
+2
+Scan m
+Index bound: using m_b; touched=2
+1
+3
+
+# m_b: index page 1 + two table fetches 2 + storage_row_read 2 + filter 5×2 = 15.
+# cost: 15
+statement ok
+DELETE FROM m WHERE id > 0 AND b >= 1 AND b <= 2
+
+query IIII rowsort
+SELECT id, a, b, x FROM m
+----
+1
+10
+5
+0
+2
+11
+4
+1
+3
+12
+3
+2
+6
+15
+0
+5
+
+# GIN and GiST bounds compete on estimated cost; with no estimate difference the canonical order
+# (GiST before GIN) breaks the tie, replacing the former mutation-only GIN-before-GiST precedence.
+statement ok
+CREATE TABLE g (id i32 PRIMARY KEY, tags i32[], span i32range)
+
+statement ok
+CREATE INDEX g_tags ON g USING gin (tags)
+
+statement ok
+CREATE INDEX g_span ON g USING gist (span)
+
+statement ok
+INSERT INTO g VALUES (1, '{1,2}', '[1,4)'), (2, '{2,3}', '[2,6)'), (3, '{1,3}', '[5,9)'), (4, '{4}', '[0,2)'), (5, '{1}', '[3,7)'), (6, '{2,4}', '[6,8)')
+
+query ITTII nosort
+EXPLAIN DELETE FROM g WHERE tags @> ARRAY[1] AND span && i32range(3, 4)
+----
+0
+Delete g
+-
+1
+9
+1
+Filter
+conjuncts=2
+1
+9
+2
+Scan g
+GiST bound: using g_span; touched=2
+1
+4
+
+# g_span gathers the three overlapping spans (ids 1, 2, 5); the residual keeps ids 1 and 5.
+# cost: 25
+statement ok
+DELETE FROM g WHERE tags @> ARRAY[1] AND span && i32range(3, 4)
+
+query I rowsort
+SELECT id FROM g
+----
+2
+3
+4
+6

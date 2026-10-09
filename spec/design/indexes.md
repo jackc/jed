@@ -250,8 +250,8 @@ For a one-base-relation SELECT, the planner chooses the minimum complete-pipelin
 among the PK candidate, every eligible B-tree/GiST/GIN/interval candidate, and full scan; exact ties
 use kind then lowest lowercased index name ([estimator.md §9.1](estimator.md)). Eligible
 multi-relation SELECTs feed the same access inventories into the bounded join search. UPDATE/DELETE
-retain the fixed consumer policies in [planner.md §5.1](planner.md) until their mutation-specific
-slice.
+choose their target path from the same inventory by the same estimate and tie order
+([estimator.md §9.3](estimator.md)).
 
 #### 5.1 The access predicate — equality prefix + optional trailing range
 

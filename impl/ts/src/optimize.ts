@@ -37,7 +37,6 @@ import {
   physicalRelOrdinal,
   relationColumnRange,
   scanBoundHasStorageOrder,
-  SELECT_SCAN_BOUND_POLICY,
   selectCostedScanCandidate,
   selectLegacyScanCandidate,
 } from "./executor.ts";
@@ -231,8 +230,8 @@ function ruleScanBounds(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot, eng:
     );
     plan.phys.relEstimates[i] = estimates;
     return rels.length === 1
-      ? selectCostedScanCandidate(candidates, estimates, SELECT_SCAN_BOUND_POLICY)
-      : selectLegacyScanCandidate(candidates, SELECT_SCAN_BOUND_POLICY);
+      ? selectCostedScanCandidate(candidates, estimates)
+      : selectLegacyScanCandidate(candidates);
   });
 }
 

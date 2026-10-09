@@ -521,6 +521,10 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   empty bare-column literal AND-chain reads nothing ([planner.md §3.1](planner.md)) and must agree with
   the unproven `col + 0` spelling (empty rows, a zero ungrouped COUNT), plus satisfiable near-miss
   ranges;
+  **cost_plan_dml** — UPDATE/DELETE whose WHERE admits competing PK, B-tree, GIN, GiST, and
+  interval-set bounds take the estimated-cheapest one ([estimator.md §9.3](estimator.md)), including
+  an indexed-column update and a PK rekey; an identically seeded table whose predicates use `col + 0`
+  or reversed opclass operators full-scans, and both must reach the same end state;
   **gin_inl** — a GIN `@>` query from an earlier sibling is compared with the equivalent reversed
   `<@` spelling that defeats the sibling bound, including NULL/empty query arrays;
   **gist_inl** — GiST range `@>` and scalar `=` sibling bounds are compared with equivalent `<@`

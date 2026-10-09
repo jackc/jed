@@ -221,8 +221,8 @@ relation scanned by a **`SELECT`, `UPDATE`, or `DELETE`**, if the `WHERE` AND-ch
 constant** (`Q` a literal/`$N`-param array, `c` a literal/`$N`-param scalar), the plan bounds the scan through the GIN
 index. **`UPDATE`/`DELETE` apply the identical bound to their target-row scan** (the gather +
 residual filter that finds the rows to rewrite/remove), so the same conjunct that bounds a
-`SELECT` bounds the mutation — only the GiST/GIN precedence differs: after PK and ordered B-tree,
-a mutation tries **GIN before GiST**, then the point-set fallbacks. The bound is over the
+`SELECT` bounds the mutation, chosen against the other candidates by the same estimate and
+canonical tie order ([estimator.md §9.3](estimator.md)). The bound is over the
 **pre-mutation** index
 state (the `WHERE` evaluates against the old row), so the candidate set is exactly the rows the
 full scan would have matched; phase 2 then rewrites/removes them and maintains every index

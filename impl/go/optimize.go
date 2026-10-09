@@ -230,7 +230,7 @@ func (db *engine) ruleScanBounds(plan *selectPlan, rels []scopeRel) {
 		candidates := inventoryScanCandidates(plan.accessPredicate(), rel, db)
 		producesRows := len(rels) == 1 && !plan.isAgg && !plan.distinct && plan.limit == nil && plan.offset == nil && !plan.hasWindow
 		plan.phys.relEstimates[i] = db.estimateScanCandidates(candidates, rel, producesRows)
-		legacy := selectLegacyScanCandidate(candidates, selectScanBoundPolicy)
+		legacy := selectLegacyScanCandidate(candidates)
 		if len(rels) == 1 {
 			plan.phys.relBounds[i] = selectCostedScanCandidate(candidates, plan.phys.relEstimates[i], legacy)
 		} else {

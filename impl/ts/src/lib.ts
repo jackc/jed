@@ -284,6 +284,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.interval_set",
   "query.bounded_limit_streaming",
   "query.index_mutation",
+  "dml.costed_access",
   "query.limit_short_circuit",
   "query.order_by_pk_scan",
   "query.order_by_index_scan",

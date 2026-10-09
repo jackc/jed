@@ -487,24 +487,11 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 	}
 }
 
-// scanBoundPolicy is the consumer-specific eligibility/precedence part of LEGACY access-path
-// selection. Inventory is policy-free and complete. SELECT and mutation scans differ only in their
-// established GiST/GIN precedence: mutations try GIN before GiST while SELECT tries GiST before GIN.
-type scanBoundPolicy struct {
-	orderedIndex  bool
-	indexSet      bool
-	gistBeforeGin bool
-}
-
-var (
-	selectScanBoundPolicy   = scanBoundPolicy{orderedIndex: true, indexSet: true, gistBeforeGin: true}
-	mutationScanBoundPolicy = scanBoundPolicy{orderedIndex: true, indexSet: true}
-)
-
 // detectScanBound picks one SELECT relation's scan bound (cost.md §3; indexes.md §5). It is the
-// SELECT-policy wrapper over the shared inventory + behavior-neutral legacy selector.
+// fixed-policy wrapper over the shared inventory + behavior-neutral legacy selector, used by the
+// SELECT barrier boundaries that have not moved to cost selection.
 func detectScanBound(filter *rExpr, rel scopeRel, db *engine) *scanBound {
-	return detectScanBoundWithPolicy(filter, rel, db, selectScanBoundPolicy)
+	return selectLegacyScanCandidate(inventoryScanCandidates(filter, rel, db))
 }
 
 // inventoryScanCandidates enumerates EVERY legal base access path in estimator.toml's canonical
@@ -583,50 +570,38 @@ func namedScanCandidate(candidates []scanCandidate, kind scanCandidateKind, name
 	return nil
 }
 
-// selectLegacyScanCandidate reproduces the pre-P3 fixed policy exactly. Its order deliberately is
-// NOT the inventory's canonical cost-tie order in two cases: a clipped same-key interval set replaces
-// its broader contiguous PK/index bound, and mutations put GIN before GiST. Returning nil selects the
-// explicit full candidate while preserving the physical plan's existing nil spelling.
-func selectLegacyScanCandidate(candidates []scanCandidate, policy scanBoundPolicy) *scanBound {
-	if policy.indexSet {
-		if c := firstScanCandidate(candidates, scanCandidatePKInterval); c != nil && len(c.bound.pkSet.clip) > 0 {
-			return c.bound
-		}
+// selectLegacyScanCandidate reproduces the pre-P3 fixed SELECT policy exactly for the barrier
+// shapes that have not moved to cost selection. Its order deliberately is NOT the inventory's
+// canonical cost-tie order in one case: a clipped same-key interval set replaces its broader
+// contiguous PK/index bound. Returning nil selects the explicit full candidate while preserving the
+// physical plan's existing nil spelling.
+func selectLegacyScanCandidate(candidates []scanCandidate) *scanBound {
+	if c := firstScanCandidate(candidates, scanCandidatePKInterval); c != nil && len(c.bound.pkSet.clip) > 0 {
+		return c.bound
 	}
 	if c := firstScanCandidate(candidates, scanCandidatePK); c != nil {
 		return c.bound
 	}
-	if policy.orderedIndex {
-		for _, c := range candidates {
-			if c.identity.kind != scanCandidateBtree {
-				continue
-			}
-			if policy.indexSet {
-				if set := namedScanCandidate(candidates, scanCandidateIndexInterval, c.identity.indexName); set != nil && len(set.bound.indexSet.clip) > 0 {
-					return set.bound
-				}
-			}
-			return c.bound
+	for _, c := range candidates {
+		if c.identity.kind != scanCandidateBtree {
+			continue
 		}
-	}
-	firstOpclass := scanCandidateGist
-	secondOpclass := scanCandidateGin
-	if !policy.gistBeforeGin {
-		firstOpclass, secondOpclass = secondOpclass, firstOpclass
-	}
-	if c := firstScanCandidate(candidates, firstOpclass); c != nil {
+		if set := namedScanCandidate(candidates, scanCandidateIndexInterval, c.identity.indexName); set != nil && len(set.bound.indexSet.clip) > 0 {
+			return set.bound
+		}
 		return c.bound
 	}
-	if c := firstScanCandidate(candidates, secondOpclass); c != nil {
+	if c := firstScanCandidate(candidates, scanCandidateGist); c != nil {
 		return c.bound
 	}
-	if policy.indexSet {
-		if c := firstScanCandidate(candidates, scanCandidatePKInterval); c != nil {
-			return c.bound
-		}
-		if c := firstScanCandidate(candidates, scanCandidateIndexInterval); c != nil {
-			return c.bound
-		}
+	if c := firstScanCandidate(candidates, scanCandidateGin); c != nil {
+		return c.bound
+	}
+	if c := firstScanCandidate(candidates, scanCandidatePKInterval); c != nil {
+		return c.bound
+	}
+	if c := firstScanCandidate(candidates, scanCandidateIndexInterval); c != nil {
+		return c.bound
 	}
 	return nil
 }
@@ -657,12 +632,6 @@ func selectCostedScanCandidate(candidates []scanCandidate, estimates []candidate
 // B-tree candidates and index interval sets emit their named index order instead.
 func scanBoundHasStorageOrder(bound *scanBound) bool {
 	return bound == nil || bound.pk != nil || bound.pkSet != nil || bound.gin != nil || bound.gist != nil
-}
-
-// detectScanBoundWithPolicy is the compatibility entry point used by legacy SELECT boundaries and
-// UPDATE/DELETE. P6a calls the costed wrapper directly for eligible SELECT relations.
-func detectScanBoundWithPolicy(filter *rExpr, rel scopeRel, db *engine, policy scanBoundPolicy) *scanBound {
-	return selectLegacyScanCandidate(inventoryScanCandidates(filter, rel, db), policy)
 }
 
 func (db *engine) buildIndexIntervalSetPlan(filter *rExpr, rel scopeRel, idx indexDef) *indexKeySetPlan {
@@ -702,16 +671,20 @@ func (db *engine) buildIndexIntervalSetPlan(filter *rExpr, rel scopeRel, idx ind
 	return &indexKeySetPlan{nameKey: strings.ToLower(idx.Name), colType: ty, coll: coll, tailTypes: tail, specs: specs, clip: clip}
 }
 
-// planMutationScan selects an UPDATE/DELETE target access path through the same inventory as SELECT,
-// using the mutation eligibility policy. It runs after uncorrelated filter folding, matching the old
-// inline executor timing. EXPLAIN calls the same function on its resolved (unfolded) filter.
+// planMutationScan selects an UPDATE/DELETE target access path by cost (estimator.md §9.3): every
+// legal candidate in the shared inventory is estimated over the same visible snapshot the scan reads,
+// and the lowest scan-plus-residual estimate wins, the first in canonical kind/name order on an
+// exact tie. Mutation-only work (assignments, checks, writes, RETURNING) is per affected row and
+// identical across candidates, so it cannot change the winner and is not added. Execution calls this
+// after uncorrelated filter folding; EXPLAIN calls it on its resolved (unfolded) filter.
 func (db *engine) planMutationScan(scope *string, table *catTable, filter *rExpr) mutationScanPlan {
 	plan := mutationScanPlan{filter: filter, scope: scope}
 	if filter == nil {
 		return plan
 	}
 	rel := scopeRel{label: strings.ToLower(table.Name), table: table, offset: 0, db: scope}
-	plan.bound = detectScanBoundWithPolicy(filter, rel, db, mutationScanBoundPolicy)
+	candidates := inventoryScanCandidates(filter, rel, db)
+	plan.bound = selectCostedScanCandidate(candidates, db.estimateScanCandidates(candidates, rel, false), selectLegacyScanCandidate(candidates))
 	return plan
 }
 

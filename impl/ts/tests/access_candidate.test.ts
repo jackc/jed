@@ -8,10 +8,8 @@ import {
   Engine,
   estimateScanCandidates,
   inventoryScanCandidates,
-  MUTATION_SCAN_BOUND_POLICY,
   renderScanCandidateIdentity,
   selectLegacyScanCandidate,
-  SELECT_SCAN_BOUND_POLICY,
   type RExpr,
   type ScopeRel,
   type SelectPlan,
@@ -126,14 +124,13 @@ test("scan candidate inventory is complete, canonical, and legacy-neutral", () =
   assert.equal(fullEstimate.cost, fullActual.cost, "exact full-scan estimate equals actual cost");
   // Direct >= conjuncts clip the OR unions. Preserve the old exception where the clipped PK set
   // replaces the broader contiguous PK bound.
-  assert.equal(selectLegacyScanCandidate(candidates, SELECT_SCAN_BOUND_POLICY)?.kind, "pkSet");
+  assert.equal(selectLegacyScanCandidate(candidates)?.kind, "pkSet");
   const indexClipFilter = plannedInventoryFilter(
     db,
     "SELECT id FROM inventory WHERE (a = 1 OR a = 2) AND a >= 0 AND (b = 1 OR b = 2) AND b >= 0",
   );
   const indexClipBound = selectLegacyScanCandidate(
     inventoryScanCandidates(indexClipFilter, rel, internals.readSnap(), db),
-    SELECT_SCAN_BOUND_POLICY,
   );
   assert(indexClipBound?.kind === "indexSet");
   assert.equal(indexClipBound.indexSet.nameKey, "a_btree");
@@ -143,12 +140,9 @@ test("scan candidate inventory is complete, canonical, and legacy-neutral", () =
     "SELECT id FROM inventory WHERE tags @> ARRAY[1] AND span && i32range(1, 3)",
   );
   const opclassCandidates = inventoryScanCandidates(opclassFilter, rel, internals.readSnap(), db);
-  const selectBound = selectLegacyScanCandidate(opclassCandidates, SELECT_SCAN_BOUND_POLICY);
+  const selectBound = selectLegacyScanCandidate(opclassCandidates);
   assert(selectBound?.kind === "gist");
   assert.equal(selectBound.gist.nameKey, "a_gist");
-  const mutationBound = selectLegacyScanCandidate(opclassCandidates, MUTATION_SCAN_BOUND_POLICY);
-  assert(mutationBound?.kind === "gin");
-  assert.equal(mutationBound.gin.nameKey, "a_gin");
 });
 
 function plannedInventoryFilter(db: Engine, sql: string): RExpr {

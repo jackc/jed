@@ -85,8 +85,8 @@ The estimator selects among full, PK, ordered B-tree, GiST, GIN, both interval f
 secondary-index ORDER-BY/top-N alternatives by comparing the complete scheduled single-relation
 pipeline. A plain LIMIT can therefore change the access winner when early-out changes metered work;
 unmetered sorting still contributes no private planner weight. Bounded join search selects eligible
-multi-relation SELECT pipelines; hard-fenced inputs and UPDATE/DELETE retain their staged policies
-([estimator.md §9–§10](estimator.md)).
+multi-relation SELECT pipelines, and UPDATE/DELETE choose their target scan from the same estimate;
+hard-fenced inputs retain their staged policies ([estimator.md §9–§10](estimator.md)).
 
 - **`storage_row_read`** is charged once per row pulled from a store, at the top of the
   executor scan loop, **before** the filter runs — in `SELECT`, `DELETE`, and `UPDATE`.
@@ -475,7 +475,8 @@ per-relation pushdown seam. Every eligible B-tree contributes an access candidat
 (indexes.md §5.1; the same const-source rule as above — literal / `$N` / correlated outer / sibling
 column, type-matched). For a one-base-relation SELECT, P6a compares all such candidates against the
 PK and full paths by estimated scheduled cost; exact ties use PK, then lowercased index name, then
-full scan. Joins and UPDATE/DELETE retain their fixed consumer policies for now. Gated by the
+full scan. UPDATE/DELETE use the same comparison ([estimator.md §9.3](estimator.md)); joins search
+their own candidates. Gated by the
 `ddl.secondary_index` capability (a leading/trailing-column **range** by
 `query.index_range`, a **multi-column equality prefix** by `query.index_prefix`), pinned
 cross-core in `spec/conformance/suites/query/index_scan.test` (and `index_range.test` /
@@ -556,8 +557,8 @@ combine remain complete and charge every `page_read`/`gin_entry`; only candidate
 `storage_row_read`, residual evaluation, and output after the window disappear. **Narrowings this
 slice** (gin.md §6): ordinary bounds require a constant query operand; join INL additionally admits
 a bare earlier-sibling operand; operators remain `@>`/`&&`/`= ANY`/`=` only. A **GIN-bounded
-`UPDATE`/`DELETE`** accrues this same scan block in place of its full-scan block (after PK and any
-ordered B-tree bound, mutation precedence tries GIN before GiST); so a
+`UPDATE`/`DELETE`** accrues this same scan block in place of its full-scan block when the costed
+mutation selector ([estimator.md §9.3](estimator.md)) chooses it; so a
 `DELETE … WHERE col @> Q` costs the matching `SELECT`'s scan minus the `row_produced` a bare mutation
 omits (a `RETURNING` clause restores it plus its projection units), and the phase-2 rewrite/remove +
 index maintenance are unmetered writes ("What is NOT metered" below).

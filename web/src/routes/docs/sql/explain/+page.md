@@ -142,7 +142,10 @@ On a **composite** index over `(a, b, …)` the candidate bound extends to a **m
 on the leading columns, optionally followed by a range on the next (`a = 1 AND b > 3`). The `WHERE`
 always stays the residual filter, so the rows are identical to a full scan — only the work drops.
 The same `Index bound` detail appears below an `Update` or `Delete` root when a write's target scan
-uses that index; an indexed `IN` list appears as an `Index interval set`.
+uses that index; an indexed `IN` list appears as an `Index interval set`. An `UPDATE` or `DELETE`
+chooses its target scan by the same estimate as a one-table `SELECT`, so the two show the same bound
+for the same `WHERE`. The chosen scan also fixes the order in which a write visits rows: when several
+rows would raise an error, the first one visited — in that scan's order — is the one reported.
 
 ## OR / IN key intervals
 

@@ -84,6 +84,19 @@ sort candidates — and the per-core spill tests prove this fixed-width K create
 smaller `work_mem` falls back to the existing external sorter. Timings remain non-gating; checksum,
 corpus results/costs, and the no-run/fallback invariants are the correctness proof.
 
+**Cost-selected mutation result (2026-10-09).** `costed_update` runs
+`UPDATE orders SET amount = amount + 1 WHERE id > $1 AND customer_id = $2` on the 1M-row `large`
+dataset, rolled back each iteration, with `$1` in 1..1000 so the PK range admits nearly every row.
+The former fixed mutation policy always took the PK bound and rechecked ~1M rows; the costed
+selector ([estimator.md §9.3](estimator.md)) takes the ~10-row `orders_customer_idx` gather. Mean
+per-statement time: **210.7 ms → 0.25–0.32 ms Go**, **252.0 ms → 0.41 ms Rust**, **604.5 ms → 0.71 ms
+TypeScript**, with identical before/after checksums. On the already index-bound mutation lanes,
+estimating every candidate at each execution (mutations have no prepared-plan cache) adds about 5%
+on Go and TypeScript and nothing measurable on Rust: `secondary_update` 0.282/0.284 → 0.297/0.300 ms
+Go, 0.373 → 0.370 ms Rust, 0.681 → 0.715 ms TypeScript; `secondary_pointset_delete` 1.92 → 1.95 ms Go,
+3.54 → 3.73 ms Rust (single runs, within this machine's run-to-run spread). The PostgreSQL lane was
+not re-run.
+
 **Derived-table and ON pushdown result (2026-10-09).** `derived_pushdown_pk` reads
 `SELECT … FROM (SELECT id, v FROM t) d WHERE d.id = 50000` over 100k rows; moved into the body, the
 conjunct seeks t's primary key, while the `derived_pushdown_pk_residual` reference spells it

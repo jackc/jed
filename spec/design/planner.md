@@ -267,7 +267,7 @@ then takes the unoptimized path (full scan, eager sort), which is always correct
 
 | # | rule | gate (summary) | sets | cost contract |
 |---|---|---|---|---|
-| 1 | **scan bounds** | per base relation (not SRF/derived): inventory and estimate every legal path; one-base-relation and eligible cost-searched SELECT relations consume the complete inventory, while fixed barrier inputs and mutations retain §5.1's explicit staged boundaries | `relBounds[i]` | cost.md §3 "bounded scan", "index-bounded scan", "GIN-bounded scan", "GiST-bounded scan", "canonical interval sets" |
+| 1 | **scan bounds** | per base relation (not SRF/derived): inventory and estimate every legal path; one-base-relation and eligible cost-searched SELECT relations and UPDATE/DELETE targets consume the complete inventory, while fixed barrier inputs retain §5.1's explicit staged boundary | `relBounds[i]` | cost.md §3 "bounded scan", "index-bounded scan", "GIN-bounded scan", "GiST-bounded scan", "canonical interval sets" |
 | 2 | **index-nested-loop** | a join inner base relation (INNER/CROSS/LEFT right side, not lateral/CTE) with a PK / leading B-tree comparison or GIN/GiST query operand from a bare **earlier sibling** column in ON or WHERE | `relINLBounds[i]` | cost.md §3 "JOIN" (per-outer-row seek/gather) |
 | 3 | **hash join** | exactly two non-lateral inputs; INNER/LEFT ON contains one or more same-type, key-encodable bare-column equalities across the inputs; no inner INL; every remaining ON conjunct is a non-trapping leaf equality/inequality | `hashJoin` | cost.md §3 "hash JOIN" (`hash_build`/`hash_probe`; ON only for bucket candidates) |
 | 4 | **ORDER BY via PK scan order** | single base relation, non-aggregate, column-only keys: the ORDER BY is a one-direction PK prefix (ASC) or the full PK (DESC ⇒ reverse scan), collation-matching the stored key | `pkOrdered`, `pkReverse` | cost.md §3 "ORDER BY satisfied by primary-key order" (sort elided; with LIMIT, a top-N) |
@@ -308,8 +308,9 @@ internals.
 ## 5. Access-path inventory and staged selection (rule 1)
 
 For each base relation, the access-path machinery inventories every legal candidate. The cost
-selector chooses from the complete set for eligible one-base-relation SELECTs (§5.2); every
-fixed-policy shape uses the structural selector, whose precedence is:
+selector chooses from the complete set for eligible one-base-relation SELECTs (§5.2) and for
+UPDATE/DELETE targets (§5.5); every fixed-policy shape uses the structural selector, whose precedence
+is:
 
 1. **PK tuple bound** (maximal equality prefix plus optional next-member range) — the row's own key;
    no second tree.
@@ -353,29 +354,28 @@ Each candidate carries these explicit planning facts:
 Inventory order is the canonical total access-path order: PK, ordered B-tree, GiST, GIN, PK interval,
 ordered-index interval, full. Index-bearing candidates of the same kind sort by raw UTF-8 bytes of
 their already-lowercased catalog name. Catalog container or map iteration must not affect this order.
-This order is the cost selector's equal-estimate tie-break; the fixed mutation/barrier selector
-below deliberately preserves two older precedence exceptions and does not simply take the
-inventory's first element.
+This order is the cost selector's equal-estimate tie-break; the fixed barrier selector below
+deliberately preserves one older precedence exception and does not simply take the inventory's
+first element.
 
 - **SELECT** admits PK, ordered B-tree, GiST, GIN, PK interval-set, and ordered-index interval-set
   candidates in the §5 order.
-- **UPDATE/DELETE** admit PK, ordered B-tree, GIN, GiST, PK interval-set, and ordered-index interval-set.
-  Their established GIN-before-GiST order is preserved (unlike SELECT's GiST-before-GIN order), and
-  interval sets remain the last resort after every contiguous/opclass bound except for the
-  same-key clipping case above. A host-attached target's inventory admits only full scan and routes
-  it through its scoped store, unchanged.
+- **UPDATE/DELETE** admit the same candidates and select by cost (§5.5). A host-attached target's
+  inventory admits only full scan and routes it through its scoped store, unchanged.
 - **DML EXPLAIN** renders the same typed mutation physical plan execution consumes. It does not run
   a parallel detector.
 
-The fixed selector preserves two details exactly: a same-key interval set with a direct clipping
-range replaces the broader contiguous PK/B-tree bound, and UPDATE/DELETE try GIN before GiST while
-SELECT tries GiST before GIN. Within every index-bearing kind, the lowest lowercased name wins.
+The fixed selector, used only by SELECT barrier inputs, preserves one detail exactly: a same-key
+interval set with a direct clipping range replaces the broader contiguous PK/B-tree bound. Otherwise
+it takes PK, B-tree, GiST, GIN, PK interval, index interval, then full. Within every index-bearing
+kind, the lowest lowercased name wins. (UPDATE/DELETE used a variant of it, trying GIN before GiST,
+until §5.5 replaced it.)
 The planner inventories once per base relation and attaches one estimate per candidate: logical
 output rows, access scan rows expressed through scheduled unit counts, weighted cost, and the
 canonical tie key.
 The cost selector consumes that vector as the base annotation for §5.2's complete pipeline set;
-eligible joins use §5.3/§5.4, while mutations and hard-fenced shapes retain explicit policies rather
-than accidentally inheriting a partial cost selector.
+eligible joins use §5.3/§5.4, mutation targets use §5.5, and hard-fenced shapes retain the explicit
+fixed policy rather than accidentally inheriting a partial cost selector.
 
 ### 5.2 Single-relation SELECT policy
 
@@ -386,8 +386,8 @@ is present, and compares the complete scheduled estimate through residual filter
 ordering and LIMIT/OFFSET.
 GiST, GIN, both interval-set kinds, PK, every ordered B-tree, and full scan all participate. Multiple
 matching ordering indexes participate independently in canonical name order. Eligible
-multi-relation SELECTs feed the same inventories into §5.3/§5.4's join search; UPDATE/DELETE retain
-§5.1's mutation policy until their dedicated slice.
+multi-relation SELECTs feed the same inventories into §5.3/§5.4's join search; UPDATE/DELETE targets
+use §5.5.
 
 Rules 4 and 5 consume each candidate's explicit scan-order property. A PK ORDER BY is
 elided only for a table-storage-order candidate; a B-tree bound can always elide only the exact same
@@ -446,11 +446,28 @@ counts through eight movable relations; larger islands use the one-state determi
 cheapest-next fallback. The final selected tree alone feeds ORDER BY/LIMIT recomputation, with only
 its final join step eligible for N-way streaming top-N.
 
+### 5.5 UPDATE/DELETE target policy (`dml.costed_access`)
+
+A mutation target is one base relation with no join, ordering, or LIMIT, so its policy is §5.2
+without composition: estimate every inventory candidate's access work plus the complete WHERE per
+scan row over the snapshot the mutation scan reads, and take the minimum, keeping the first
+candidate in canonical order on an exact tie ([estimator.md §9.3](estimator.md)). Mutation-only
+work is per affected row and identical for every candidate, so it is not part of the comparison.
+Execution plans after uncorrelated WHERE subqueries fold; DML EXPLAIN plans the unfolded filter.
+
+The selected path's natural emission order — storage-key order, or the named index's order for an
+ordered B-tree or ordered-index interval set — is the phase-one visitation order. It therefore
+decides which row's WHERE/assignment/CHECK error is reported first, where a cost ceiling aborts,
+and the order of volatile per-row assignments such as `nextval`; phase two still validates and writes
+the complete batch, and the affected rows and successful end state do not depend on the path. The
+NoREC `cost_plan_dml` relation compares cost-selected mutations against forms that defeat every
+bound.
+
 ## 6. Neutrality and determinism
 
 - **Same plan everywhere.** For a given resolved query and visible estimator inputs every core
   must choose the same plan. Eligible SELECTs use the exact shared estimate and total candidate
-  order in [estimator.md](estimator.md); staged mutation/barrier policies use their specified
+  order in [estimator.md](estimator.md); staged barrier policies use their specified
   structural order. Neither path may depend on map iteration. Plan choice is observable
   through metered cost and EXPLAIN, both corpus-pinned — a divergent planner is a failing `.test`
   file, not a silent drift.

@@ -1,8 +1,8 @@
 # P6a: deterministic estimated-cost selection among full, PK, and ordered B-tree paths for a
 # one-base-relation SELECT. Row-count changes alter the shared estimate and can therefore change the
-# selected physical path. The complete WHERE always remains the residual filter. UPDATE/DELETE and
-# joins retain their staged legacy policies.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.update, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.index_range, query.order_by, query.order_by_keys, query.limit, query.order_by_pk_scan, query.order_by_index_scan, query.explain, dml.explain, resource.cost_metering, types.i32
+# selected physical path. The complete WHERE always remains the residual filter. UPDATE/DELETE share
+# the same base selector; joins use the search in cost_plan_join*.test.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.update, dml.costed_access, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.index_range, query.order_by, query.order_by_keys, query.limit, query.order_by_pk_scan, query.order_by_index_scan, query.explain, dml.explain, resource.cost_metering, types.i32
 
 statement ok
 CREATE TABLE p6a (id i32 PRIMARY KEY, a i32, b i32)
@@ -179,8 +179,8 @@ Index bound: using z_b; touched=3
 1
 3
 
-# UPDATE remains on the mutation legacy policy: PK precedence is unchanged even though the
-# one-relation SELECT above chooses z_b for the same predicate.
+# UPDATE uses the same costed selector (estimator.md §9.3): it leaves the PK range for z_b, exactly
+# like the one-relation SELECT above. The dedicated mutation suite is dml/cost_plan_mutation.test.
 query ITTII nosort
 EXPLAIN UPDATE p6a SET a = a WHERE id > 0 AND b = 1
 ----
@@ -188,14 +188,14 @@ EXPLAIN UPDATE p6a SET a = a WHERE id > 0 AND b = 1
 Update p6a
 sets=1
 1
-9
+6
 1
 Filter
 conjuncts=2
 1
-9
+6
 2
 Scan p6a
-PK bound: id > 0; touched=3
-2
+Index bound: using z_b; touched=3
+1
 3

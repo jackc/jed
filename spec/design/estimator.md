@@ -9,8 +9,8 @@
 > relation-scoped prepared-plan validity, complete candidate inventory, base and whole-plan
 > estimates, EXPLAIN columns, complete single-relation pipeline selection, hard-fenced N-way join
 > search with Pareto-frontier DP through eight movable relations and deterministic cheapest-next
-> construction above the cap, and the retained transactional `ANALYZE` facts specified in
-> [statistics.md](statistics.md).
+> construction above the cap, the retained transactional `ANALYZE` facts specified in
+> [statistics.md](statistics.md), and costed UPDATE/DELETE target selection (§9.3).
 
 ## 1. Decision and scope
 
@@ -27,9 +27,9 @@ Plan identity therefore remains inside G1/G2/G3 rather than becoming a class-P e
 cost stays byte-identical because the selected plan and the runtime meter are both shared contracts.
 EXPLAIN makes the selected plan and estimates corpus-assertable.
 
-Initial cost-based selection applies to **SELECT**. UPDATE and DELETE share the behavior-neutral
-candidate inventory but retain their existing fixed access-path policies until a dedicated DML
-slice decides mutation visitation and error-selection consequences. DDL is outside the selector.
+Cost-based selection applies to **SELECT** and to the target scan of **UPDATE** and **DELETE**
+(§9.3), which share the behavior-neutral candidate inventory and the same estimate. DDL is outside
+the selector.
 
 The estimator is a planner heuristic, **not a safety gate**. An underestimate cannot weaken
 `max_cost` or `lifetime_max_cost`: execution still accrues the actual units and aborts through the
@@ -439,8 +439,8 @@ DML access-path policy remains authoritative:
 
 - `INSERT ... VALUES` starts with the exact authored candidate count; `INSERT ... SELECT` owns its
   rendered source-query estimate;
-- `UPDATE`/`DELETE` own the selected mutation scan plus residual-filter estimate, including a filter
-  expression's scalar subplans; and
+- `UPDATE`/`DELETE` own the selected (§9.3) mutation scan plus residual-filter estimate, including
+  a filter expression's scalar subplans; and
 - a DML root's `est_rows` is affected rows. `ON CONFLICT DO NOTHING` / `DO UPDATE` keeps the source
   candidate count until conflict-frequency statistics exist.
 
@@ -448,8 +448,8 @@ Mutation-only work with no current rendered node — VALUES/default/assignment/c
 expressions, uniqueness probes, compression, and phase-two writes — uses the initial zero fallback.
 That is an explicit precision boundary, not an assertion that execution performs no such work; the
 runtime meter remains authoritative. A later DML-estimator slice may add those units without changing
-the legacy mutation access policy or root cardinality. These estimates never change mutation
-execution or its actual cost.
+§9.3's access choice or root cardinality: they are per affected row, and affected rows are estimated
+once independently of the access candidate, so they add the same amount to every candidate.
 
 ## 9. Candidate total order
 
@@ -519,7 +519,7 @@ The resulting rule is deterministic:
 5. choose minimum cumulative cost, retaining the first candidate on an exact cost tie because the
    candidate list is already in §9 order.
 
-UPDATE and DELETE continue to call the fixed mutation policy from §1/§8.4.
+UPDATE and DELETE use §9.3.
 
 ### 9.2 Two-relation selector
 
@@ -562,6 +562,45 @@ physical visit order also defines deterministic error visitation and cost-ceilin
 The costed selector deliberately does not preserve FROM-order precedence between multiple possible
 runtime errors; portable error corpus cases use a single offending evaluation unless a selected plan
 is itself the behavior under test.
+
+### 9.3 Mutation target selector
+
+An `UPDATE` or `DELETE` target is one base relation with no join, ordering, or LIMIT. Its selector
+is the single-relation rule without composition:
+
+1. inventory every legal access path for the target over the complete resolved WHERE: PK, every
+   ordered B-tree, every GiST, every GIN, PK interval set, every ordered-index interval set, and
+   full scan (a host-attached target has only full scan);
+2. estimate each with §8.1's base-candidate rule and no `row_produced` — the selected Scan's access
+   work plus the complete WHERE evaluated once per scan row — against the visible snapshot the
+   mutation scan reads (under a writable-CTE read pin, the pre-statement state); and
+3. choose the minimum cost, retaining the first candidate on an exact tie because the inventory is
+   already in §9 order.
+
+The former fixed precedence — PK before any B-tree, GIN before GiST, a clipped interval set over
+its contiguous bound — no longer applies to mutations; it survives only for SELECT's staged
+barrier inputs.
+
+Only target-scan work enters the comparison. Assignment, CHECK, uniqueness/foreign-key work,
+`RETURNING`, and the phase-two writes run once per affected row, and the affected-row estimate is the
+complete WHERE's selectivity against `N` regardless of path (§7), so that work adds the same amount
+to every candidate and could not change the winner.
+
+Execution plans after folding globally-uncorrelated WHERE subqueries, so a folded value is a
+literal to the estimator, while DML EXPLAIN plans its resolved, unfolded filter, where the subquery
+is opaque. The two can therefore select differently for such a filter; a parameter is generic in
+both. This is the existing folding boundary, not a mutation-specific relaxation.
+
+**Visitation and error order.** The selected path's natural emission order is the phase-one
+visitation order: table storage-key order for full, PK, PK interval, GIN, and GiST paths, and the
+named index's key order for an ordered B-tree or ordered-index interval set. That order decides
+which matching row's WHERE, assignment, or CHECK error the statement reports when several rows would
+fail, the row at which a cost ceiling aborts, and the order of per-row volatile assignments such as
+`nextval`. This is the SELECT rule of §9.2: the selected plan defines visitation, and the plan is
+itself part of the contract. Phase two is unchanged; it validates and writes the complete phase-one
+batch. Results that do not depend on visitation — the affected rows and the end state of a
+successful statement — never depend on the choice, because every path rechecks the complete WHERE.
+`dml/cost_plan_mutation.test` pins a plan flip, both error orders, and `nextval` assignment order.
 
 ## 10. Join search and its deterministic bound
 
@@ -731,7 +770,8 @@ selectivities are recorded data, not a promise to reproduce PostgreSQL plans.
 ## 14. Deliberate boundaries and deferred work
 
 - No parameter-sensitive/custom plans in the current planner.
-- No cost-based DML access policy until a mutation-specific slice.
+- No cost-based choice for the source query of `INSERT ... SELECT` beyond the ordinary SELECT rules,
+  and no conflict-frequency model for `ON CONFLICT`.
 - No extended/multi-column statistics, automatic analyze, configurable targets, MCV-aware join
   skew, or distribution facts for composite/array/json/jsonb.
 - No planner-only wall-clock cost model.

@@ -1106,9 +1106,9 @@ impl Engine {
                     && !plan.has_window,
             );
             let bound = if plan.rels.len() == 1 {
-                select_costed_scan_candidate(candidates, &estimates, SELECT_SCAN_BOUND_POLICY)
+                select_costed_scan_candidate(candidates, &estimates)
             } else {
-                select_legacy_scan_candidate(candidates, SELECT_SCAN_BOUND_POLICY)
+                select_legacy_scan_candidate(candidates)
             };
             plan.phys.rel_estimates.push(estimates);
             plan.phys.rel_bounds.push(bound);

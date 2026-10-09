@@ -1113,7 +1113,9 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   fences: no relation crosses them, while following base INNER/CROSS islands may be searched against
   the fixed prefix. N-way ordered LIMIT materializes the winning left subtree and discounts only the
   final streamed join step. Exact structural ties and the selected plan define error/abort visitation.
-  UPDATE/DELETE retain their explicit staged policy until a mutation-specific slice.
+  UPDATE/DELETE targets choose from the same complete inventory by the same scan-plus-residual
+  estimate and canonical tie order; the selected path's emission order is the phase-one visitation
+  order, so it defines which row's error is reported first and the order of per-row `nextval`.
   P9 adds explicit transactional `ANALYZE table [(columns)]`. Each requested column is scanned in
   storage-key order to collect exact NULL/width facts, a deterministic bounded FNV-priority sample,
   KMV NDV, MCVs, and equi-depth bounds. Format v29 persists the facts; DML retains and marks them

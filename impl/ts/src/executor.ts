@@ -4655,8 +4655,12 @@ export class Engine {
     return this.planMutationScan(undefined, table, filter).bound;
   }
 
-  // Select an UPDATE/DELETE target access path through the same inventory as SELECT, using the
-  // mutation eligibility policy. Execution calls this after uncorrelated filter folding.
+  // Select an UPDATE/DELETE target access path by cost (estimator.md §9.3): every legal candidate in
+  // the shared inventory is estimated over the snapshot the scan reads, and the lowest
+  // scan-plus-residual estimate wins, the first in canonical kind/name order on an exact tie.
+  // Mutation-only work is per affected row and identical across candidates, so it cannot change the
+  // winner and is not added. Execution calls this after uncorrelated filter folding; EXPLAIN calls
+  // it on its resolved, unfolded filter.
   private planMutationScan(
     db: string | undefined,
     table: Table,
@@ -4669,16 +4673,9 @@ export class Engine {
       offset: 0,
       ...(db !== undefined ? { db } : {}),
     };
-    return {
-      bound: detectScanBoundWithPolicy(
-        filter,
-        rel,
-        this.readSnap(),
-        this,
-        MUTATION_SCAN_BOUND_POLICY,
-      ),
-      db,
-    };
+    const candidates = inventoryScanCandidates(filter, rel, this.readSnap(), this);
+    const estimates = estimateScanCandidates(candidates, rel, this, false);
+    return { bound: selectCostedScanCandidate(candidates, estimates), db };
   }
 
   // planExplainInner resolves the inner statement into a QueryPlan WITHOUT executing it. It handles the
@@ -18607,35 +18604,16 @@ export function buildIndexAccessPredicate(
   return { nameKey: idx.name.toLowerCase(), eqCols, range, suffixTypes };
 }
 
-// ScanBoundPolicy is the consumer-specific eligibility/precedence of the behavior-neutral LEGACY
-// selector. Inventory is policy-free and complete. Mutation tries GIN first; SELECT tries GiST first.
-export type ScanBoundPolicy = {
-  orderedIndex: boolean;
-  indexSet: boolean;
-  gistBeforeGin: boolean;
-};
-
-export const SELECT_SCAN_BOUND_POLICY: ScanBoundPolicy = {
-  orderedIndex: true,
-  indexSet: true,
-  gistBeforeGin: true,
-};
-
-export const MUTATION_SCAN_BOUND_POLICY: ScanBoundPolicy = {
-  orderedIndex: true,
-  indexSet: true,
-  gistBeforeGin: false,
-};
-
-// detectScanBound picks one SELECT relation's scan bound. It is the SELECT-policy wrapper over the
-// shared inventory plus behavior-neutral legacy selector.
+// detectScanBound picks one SELECT relation's scan bound. It is the fixed-policy wrapper over the
+// shared inventory plus behavior-neutral legacy selector, used by the SELECT barrier boundaries that
+// have not moved to cost selection.
 export function detectScanBound(
   filter: RExpr,
   rel: ScopeRel,
   snap: Snapshot,
   engine: Engine,
 ): ScanBound | null {
-  return detectScanBoundWithPolicy(filter, rel, snap, engine, SELECT_SCAN_BOUND_POLICY);
+  return selectLegacyScanCandidate(inventoryScanCandidates(filter, rel, snap, engine));
 }
 
 // inventoryScanCandidates enumerates EVERY legal base access path in estimator.toml's canonical
@@ -20257,48 +20235,27 @@ function namedScanCandidate(
   );
 }
 
-// selectLegacyScanCandidate reproduces the pre-P3 policy exactly. Its order deliberately differs
-// from the canonical cost-tie order for clipped same-key interval sets and mutation's GIN/GiST order.
-export function selectLegacyScanCandidate(
-  candidates: ScanCandidate[],
-  policy: ScanBoundPolicy,
-): ScanBound | null {
-  if (policy.indexSet) {
-    const candidate = firstScanCandidate(candidates, "pk_interval");
-    if (candidate?.bound?.kind === "pkSet" && candidate.bound.pkSet.clip.length > 0) {
-      return candidate.bound;
-    }
+// selectLegacyScanCandidate reproduces the pre-P3 fixed SELECT policy exactly for the barrier
+// shapes that have not moved to cost selection. Its order deliberately differs from the canonical
+// cost-tie order for clipped same-key interval sets.
+export function selectLegacyScanCandidate(candidates: ScanCandidate[]): ScanBound | null {
+  const pkInterval = firstScanCandidate(candidates, "pk_interval");
+  if (pkInterval?.bound?.kind === "pkSet" && pkInterval.bound.pkSet.clip.length > 0) {
+    return pkInterval.bound;
   }
   const pk = firstScanCandidate(candidates, "pk");
   if (pk?.bound !== null && pk?.bound !== undefined) return pk.bound;
-  if (policy.orderedIndex) {
-    for (const candidate of candidates) {
-      if (candidate.identity.kind !== "btree") continue;
-      if (policy.indexSet) {
-        const set = namedScanCandidate(
-          candidates,
-          "index_interval",
-          candidate.identity.indexName,
-        );
-        if (set?.bound?.kind === "indexSet" && set.bound.indexSet.clip.length > 0) {
-          return set.bound;
-        }
-      }
-      return candidate.bound;
+  for (const candidate of candidates) {
+    if (candidate.identity.kind !== "btree") continue;
+    const set = namedScanCandidate(candidates, "index_interval", candidate.identity.indexName);
+    if (set?.bound?.kind === "indexSet" && set.bound.indexSet.clip.length > 0) {
+      return set.bound;
     }
+    return candidate.bound;
   }
-  const [firstOpclass, secondOpclass]: ScanCandidateKind[] = policy.gistBeforeGin
-    ? ["gist", "gin"]
-    : ["gin", "gist"];
-  const first = firstScanCandidate(candidates, firstOpclass);
-  if (first?.bound !== null && first?.bound !== undefined) return first.bound;
-  const second = firstScanCandidate(candidates, secondOpclass);
-  if (second?.bound !== null && second?.bound !== undefined) return second.bound;
-  if (policy.indexSet) {
-    const pkSet = firstScanCandidate(candidates, "pk_interval");
-    if (pkSet?.bound !== null && pkSet?.bound !== undefined) return pkSet.bound;
-    const indexSet = firstScanCandidate(candidates, "index_interval");
-    if (indexSet?.bound !== null && indexSet?.bound !== undefined) return indexSet.bound;
+  for (const kind of ["gist", "gin", "pk_interval", "index_interval"] as const) {
+    const candidate = firstScanCandidate(candidates, kind);
+    if (candidate?.bound !== null && candidate?.bound !== undefined) return candidate.bound;
   }
   return null;
 }
@@ -20309,9 +20266,8 @@ export function selectLegacyScanCandidate(
 export function selectCostedScanCandidate(
   candidates: ScanCandidate[],
   estimates: CandidateEstimate[],
-  policy: ScanBoundPolicy,
 ): ScanBound | null {
-  const legacy = selectLegacyScanCandidate(candidates, policy);
+  const legacy = selectLegacyScanCandidate(candidates);
   if (candidates.length === 0 || candidates.length !== estimates.length) return legacy;
   let winner = -1;
   for (let i = 0; i < candidates.length; i++) {
@@ -20331,18 +20287,6 @@ export function scanBoundHasStorageOrder(bound: ScanBound | null | undefined): b
     bound.kind === "gin" ||
     bound.kind === "gist"
   );
-}
-
-// Compatibility entry point used by legacy SELECT boundaries and UPDATE/DELETE. P6a calls the
-// costed selector directly for eligible SELECT relations; candidate inventory remains unchanged.
-export function detectScanBoundWithPolicy(
-  filter: RExpr,
-  rel: ScopeRel,
-  snap: Snapshot,
-  engine: Engine,
-  policy: ScanBoundPolicy,
-): ScanBound | null {
-  return selectLegacyScanCandidate(inventoryScanCandidates(filter, rel, snap, engine), policy);
 }
 
 function intervalPlanHasRange(specs: IntervalSpec[], clip: BoundTerm[]): boolean {

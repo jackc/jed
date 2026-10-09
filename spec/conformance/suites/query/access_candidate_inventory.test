@@ -1,9 +1,9 @@
 # P3 access-candidate inventory plus staged selector coverage. EXPLAIN exposes only the selected member; the
 # mirrored per-core white-box tests assert the complete canonical list for this same mixed relation
 # (two B-tree, two GiST, two GIN, PK/index interval sets, and full scan). These shared cases pin that
-# P6a exact ties preserve the original B-tree outcome while deferred and mutation policies retain
-# their explicit precedence.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.gist_index, dml.update, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.index_range, query.or_in_point_lookup, query.interval_set, query.gin_scan, query.gist_scan, query.explain, dml.explain, types.i32, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators
+# P6a exact ties preserve the original B-tree outcome and that mutations share the same costed
+# selector and canonical tie order.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.gist_index, dml.update, dml.costed_access, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.index_range, query.or_in_point_lookup, query.interval_set, query.gin_scan, query.gist_scan, query.explain, dml.explain, types.i32, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators
 
 statement ok
 CREATE TABLE candidate_inventory (id i32 PRIMARY KEY, a i32, b i32, tags i32[], span i32range)
@@ -91,7 +91,7 @@ GiST bound: using a_gist; touched=3
 0
 0
 
-# Mutation retains its established GIN-before-GiST policy over the same complete inventory.
+# Mutation selection is costed over the same complete inventory; the exact tie keeps GiST before GIN.
 query ITTII nosort
 EXPLAIN UPDATE candidate_inventory SET id = id WHERE tags @> ARRAY[1] AND span && i32range(1, 3)
 ----
@@ -107,6 +107,6 @@ conjuncts=2
 0
 2
 Scan candidate_inventory
-GIN bound: using a_gin; touched=3
+GiST bound: using a_gist; touched=3
 0
 0

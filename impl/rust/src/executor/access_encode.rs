@@ -331,35 +331,15 @@ fn index_order_candidate<'a>(
     }
 }
 
-/// Consumer-specific eligibility/precedence for the behavior-neutral LEGACY selector. Inventory is
-/// policy-free and complete. Mutation tries GIN before GiST; SELECT tries GiST before GIN.
-#[derive(Clone, Copy)]
-pub(crate) struct ScanBoundPolicy {
-    ordered_index: bool,
-    index_set: bool,
-    gist_before_gin: bool,
-}
-
-pub(crate) const SELECT_SCAN_BOUND_POLICY: ScanBoundPolicy = ScanBoundPolicy {
-    ordered_index: true,
-    index_set: true,
-    gist_before_gin: true,
-};
-
-pub(crate) const MUTATION_SCAN_BOUND_POLICY: ScanBoundPolicy = ScanBoundPolicy {
-    ordered_index: true,
-    index_set: true,
-    gist_before_gin: false,
-};
-
-/// Pick one SELECT relation's scan bound (cost.md §3; indexes.md §5). This is the SELECT-policy
-/// wrapper over the shared inventory plus behavior-neutral legacy selector.
+/// Pick one SELECT relation's scan bound (cost.md §3; indexes.md §5). This is the fixed-policy
+/// wrapper over the shared inventory plus behavior-neutral legacy selector, used by the SELECT
+/// barrier boundaries that have not moved to cost selection.
 pub(crate) fn detect_scan_bound(
     filter: &RExpr,
     rel: &ScopeRel,
     catalog: &Engine,
 ) -> Option<ScanBound> {
-    detect_scan_bound_with_policy(filter, rel, catalog, SELECT_SCAN_BOUND_POLICY)
+    select_legacy_scan_candidate(inventory_scan_candidates(Some(filter), rel, catalog))
 }
 
 /// Enumerate EVERY legal base access path in estimator.toml's canonical rank/name order. It never
@@ -1696,69 +1676,51 @@ fn candidate_index(
     })
 }
 
-fn legacy_scan_candidate_index(
-    candidates: &[ScanCandidate<'_>],
-    policy: ScanBoundPolicy,
-) -> Option<usize> {
-    if policy.index_set {
-        if let Some(i) = candidate_index(candidates, ScanCandidateKind::PkInterval, None) {
-            if matches!(&candidates[i].bound, Some(ScanBound::PkSet(set)) if !set.clip.is_empty()) {
-                return Some(i);
-            }
+fn legacy_scan_candidate_index(candidates: &[ScanCandidate<'_>]) -> Option<usize> {
+    if let Some(i) = candidate_index(candidates, ScanCandidateKind::PkInterval, None) {
+        if matches!(&candidates[i].bound, Some(ScanBound::PkSet(set)) if !set.clip.is_empty()) {
+            return Some(i);
         }
     }
     if let Some(i) = candidate_index(candidates, ScanCandidateKind::Pk, None) {
         return Some(i);
     }
-    if policy.ordered_index {
-        for (i, candidate) in candidates.iter().enumerate() {
-            if candidate.identity.kind != ScanCandidateKind::Btree {
-                continue;
-            }
-            if policy.index_set {
-                if let Some(set_i) = candidate_index(
-                    candidates,
-                    ScanCandidateKind::IndexInterval,
-                    Some(&candidate.identity.index_name),
-                ) {
-                    if matches!(&candidates[set_i].bound, Some(ScanBound::IndexSet(set)) if !set.clip.is_empty())
-                    {
-                        return Some(set_i);
-                    }
-                }
-            }
-            return Some(i);
+    for (i, candidate) in candidates.iter().enumerate() {
+        if candidate.identity.kind != ScanCandidateKind::Btree {
+            continue;
         }
-    }
-    let (first, second) = if policy.gist_before_gin {
-        (ScanCandidateKind::Gist, ScanCandidateKind::Gin)
-    } else {
-        (ScanCandidateKind::Gin, ScanCandidateKind::Gist)
-    };
-    if let Some(i) = candidate_index(candidates, first, None) {
+        if let Some(set_i) = candidate_index(
+            candidates,
+            ScanCandidateKind::IndexInterval,
+            Some(&candidate.identity.index_name),
+        ) {
+            if matches!(&candidates[set_i].bound, Some(ScanBound::IndexSet(set)) if !set.clip.is_empty())
+            {
+                return Some(set_i);
+            }
+        }
         return Some(i);
     }
-    if let Some(i) = candidate_index(candidates, second, None) {
-        return Some(i);
-    }
-    if policy.index_set {
-        if let Some(i) = candidate_index(candidates, ScanCandidateKind::PkInterval, None) {
-            return Some(i);
-        }
-        if let Some(i) = candidate_index(candidates, ScanCandidateKind::IndexInterval, None) {
+    for kind in [
+        ScanCandidateKind::Gist,
+        ScanCandidateKind::Gin,
+        ScanCandidateKind::PkInterval,
+        ScanCandidateKind::IndexInterval,
+    ] {
+        if let Some(i) = candidate_index(candidates, kind, None) {
             return Some(i);
         }
     }
     candidate_index(candidates, ScanCandidateKind::Full, None)
 }
 
-/// Reproduce the pre-P3 policy exactly. This order deliberately differs from the canonical cost-tie
-/// order for clipped same-key interval sets and for mutation's GIN-before-GiST precedence.
+/// Reproduce the pre-P3 fixed SELECT policy exactly for the barrier shapes that have not moved to
+/// cost selection. This order deliberately differs from the canonical cost-tie order for clipped
+/// same-key interval sets.
 pub(crate) fn select_legacy_scan_candidate(
     mut candidates: Vec<ScanCandidate<'_>>,
-    policy: ScanBoundPolicy,
 ) -> Option<ScanBound> {
-    let winner = legacy_scan_candidate_index(&candidates, policy)?;
+    let winner = legacy_scan_candidate_index(&candidates)?;
     candidates[winner].bound.take()
 }
 
@@ -1768,10 +1730,9 @@ pub(crate) fn select_legacy_scan_candidate(
 pub(crate) fn select_costed_scan_candidate(
     mut candidates: Vec<ScanCandidate<'_>>,
     estimates: &[crate::estimator::CandidateEstimate],
-    policy: ScanBoundPolicy,
 ) -> Option<ScanBound> {
     if candidates.is_empty() || candidates.len() != estimates.len() {
-        return select_legacy_scan_candidate(candidates, policy);
+        return select_legacy_scan_candidate(candidates);
     }
     let mut winner: Option<usize> = None;
     for (i, _) in candidates.iter().enumerate() {
@@ -1791,20 +1752,6 @@ pub(crate) fn scan_bound_has_storage_order(bound: Option<&ScanBound>) -> bool {
         None | Some(
             ScanBound::Pk(_) | ScanBound::PkSet(_) | ScanBound::Gin(_) | ScanBound::Gist(_)
         )
-    )
-}
-
-/// Compatibility entry point used by legacy SELECT boundaries and UPDATE/DELETE. P6a calls the
-/// costed selector directly for eligible SELECT relations; candidate inventory remains unchanged.
-pub(crate) fn detect_scan_bound_with_policy(
-    filter: &RExpr,
-    rel: &ScopeRel,
-    catalog: &Engine,
-    policy: ScanBoundPolicy,
-) -> Option<ScanBound> {
-    select_legacy_scan_candidate(
-        inventory_scan_candidates(Some(filter), rel, catalog),
-        policy,
     )
 }
 
@@ -1855,9 +1802,12 @@ fn build_index_interval_set_plan(
 }
 
 impl Engine {
-    /// Select an UPDATE/DELETE target access path through the same inventory as SELECT, using the
-    /// mutation eligibility policy. Execution calls this after uncorrelated filter folding, matching
-    /// the old inline detector timing; EXPLAIN calls it on its resolved, unfolded filter.
+    /// Select an UPDATE/DELETE target access path by cost (estimator.md §9.3): every legal candidate
+    /// in the shared inventory is estimated over the snapshot the scan reads, and the lowest
+    /// scan-plus-residual estimate wins, the first in canonical kind/name order on an exact tie.
+    /// Mutation-only work is per affected row and identical across candidates, so it cannot change
+    /// the winner and is not added. Execution calls this after uncorrelated filter folding; EXPLAIN
+    /// calls it on its resolved, unfolded filter.
     pub(crate) fn plan_mutation_scan(
         &self,
         db: Option<&str>,
@@ -1873,7 +1823,9 @@ impl Engine {
                 cte: None,
                 db: db.map(str::to_owned),
             };
-            detect_scan_bound_with_policy(f, &rel, self, MUTATION_SCAN_BOUND_POLICY)
+            let candidates = inventory_scan_candidates(Some(f), &rel, self);
+            let estimates = estimate_scan_candidates(&candidates, &rel, self, false);
+            select_costed_scan_candidate(candidates, &estimates)
         });
         MutationScanPlan {
             bound,
@@ -6659,7 +6611,7 @@ mod candidate_inventory_tests {
         // The direct >= conjuncts clip their OR unions. Preserve the pre-P3 exception where the
         // clipped PK set replaces the broader contiguous PK bound.
         assert!(matches!(
-            select_legacy_scan_candidate(candidates, SELECT_SCAN_BOUND_POLICY),
+            select_legacy_scan_candidate(candidates),
             Some(ScanBound::PkSet(_))
         ));
 
@@ -6669,10 +6621,11 @@ mod candidate_inventory_tests {
 			 (a = 1 OR a = 2) AND a >= 0 AND \
 			 (b = 1 OR b = 2) AND b >= 0",
         );
-        let selected = select_legacy_scan_candidate(
-            inventory_scan_candidates(Some(&index_clip_filter), &rel, &db),
-            SELECT_SCAN_BOUND_POLICY,
-        );
+        let selected = select_legacy_scan_candidate(inventory_scan_candidates(
+            Some(&index_clip_filter),
+            &rel,
+            &db,
+        ));
         assert!(matches!(
             selected,
             Some(ScanBound::IndexSet(set)) if set.name_key == "a_btree"
@@ -6682,16 +6635,12 @@ mod candidate_inventory_tests {
             &db,
             "SELECT id FROM inventory WHERE tags @> ARRAY[1] AND span && i32range(1, 3)",
         );
-        let selected = select_legacy_scan_candidate(
-            inventory_scan_candidates(Some(&opclass_filter), &rel, &db),
-            SELECT_SCAN_BOUND_POLICY,
-        );
+        let selected = select_legacy_scan_candidate(inventory_scan_candidates(
+            Some(&opclass_filter),
+            &rel,
+            &db,
+        ));
         assert!(matches!(selected, Some(ScanBound::Gist(g)) if g.name_key == "a_gist"));
-        let selected = select_legacy_scan_candidate(
-            inventory_scan_candidates(Some(&opclass_filter), &rel, &db),
-            MUTATION_SCAN_BOUND_POLICY,
-        );
-        assert!(matches!(selected, Some(ScanBound::Gin(g)) if g.name_key == "a_gin"));
     }
 
     fn planned_inventory_filter(db: &Engine, sql: &str) -> RExpr {

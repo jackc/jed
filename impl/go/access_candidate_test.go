@@ -127,12 +127,12 @@ func TestScanCandidateInventoryIsCompleteCanonicalAndLegacyNeutral(t *testing.T)
 	}
 	// The direct id>=0 / a>=0 / b>=0 conjuncts clip their interval unions. Legacy selection must
 	// retain the pre-P3 exception where the clipped set replaces the broader contiguous PK bound.
-	if selected := selectLegacyScanCandidate(candidates, selectScanBoundPolicy); selected == nil || selected.pkSet == nil {
+	if selected := selectLegacyScanCandidate(candidates); selected == nil || selected.pkSet == nil {
 		t.Fatalf("SELECT legacy selector lost clipped PK interval precedence: %+v", selected)
 	}
 	indexClipFilter := plannedInventoryFilter(t, db,
 		"SELECT id FROM inventory WHERE (a = 1 OR a = 2) AND a >= 0 AND (b = 1 OR b = 2) AND b >= 0")
-	selected := selectLegacyScanCandidate(inventoryScanCandidates(indexClipFilter, rel, db), selectScanBoundPolicy)
+	selected := selectLegacyScanCandidate(inventoryScanCandidates(indexClipFilter, rel, db))
 	if selected == nil || selected.indexSet == nil || selected.indexSet.nameKey != "a_btree" {
 		t.Fatalf("SELECT legacy selector lost clipped lowest-index interval precedence: %+v", selected)
 	}
@@ -140,13 +140,9 @@ func TestScanCandidateInventoryIsCompleteCanonicalAndLegacyNeutral(t *testing.T)
 	opclassFilter := plannedInventoryFilter(t, db,
 		"SELECT id FROM inventory WHERE tags @> ARRAY[1] AND span && i32range(1, 3)")
 	opclassCandidates := inventoryScanCandidates(opclassFilter, rel, db)
-	selected = selectLegacyScanCandidate(opclassCandidates, selectScanBoundPolicy)
+	selected = selectLegacyScanCandidate(opclassCandidates)
 	if selected == nil || selected.gist == nil || selected.gist.nameKey != "a_gist" {
 		t.Fatalf("SELECT legacy selector = %+v, want lowest GiST", selected)
-	}
-	selected = selectLegacyScanCandidate(opclassCandidates, mutationScanBoundPolicy)
-	if selected == nil || selected.gin == nil || selected.gin.nameKey != "a_gin" {
-		t.Fatalf("mutation legacy selector = %+v, want lowest GIN", selected)
 	}
 }
 

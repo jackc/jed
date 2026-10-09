@@ -641,6 +641,31 @@ gen = "int_uniform"
 min = 1
 max = 100000
 
+# Cost-selected mutation access path (dml.costed_access; estimator.md §9.3): the WHERE admits both a
+# PK range (`id > $1`, nearly the whole table) and an equality on orders_customer_idx. The former
+# fixed mutation policy always took the PK bound and filtered ~1M rows; the costed selector picks the
+# ~10-row secondary-index gather, as the equivalent SELECT already did. Rolled back each iteration.
+[[bench]]
+name = "costed_update"
+description = "UPDATE on 1M rows whose WHERE has a broad PK range and a selective secondary equality"
+dataset = "large"
+kind = "write_rollback"
+sql = "UPDATE orders SET amount = amount + 1 WHERE id > $1 AND customer_id = $2"
+warmup = 20
+iterations = 200
+seed = 4260
+batch = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
 # Secondary-index point-set DELETE (query.index_mutation + query.or_in_point_lookup): four distinct
 # customer ids become four index probes, their keyed rows are removed in phase 2, and the transaction
 # rolls back. This continuously covers the second Phase-1 access path at realistic tree depth.

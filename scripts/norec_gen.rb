@@ -41,6 +41,10 @@
 #   cost_plan_p8 — N-way INL dependencies, selected-final-step top-N, and independently searched
 #              INNER islands around a LEFT fence compare P8 winners with expression-key forms that
 #              defeat the corresponding indexed/hash choices without changing rows.
+#   cost_plan_dml — UPDATE/DELETE whose WHERE admits competing PK/B-tree/GIN/GiST/interval bounds
+#              choose by estimated cost (estimator.md §9.3); applied to an identically-seeded table
+#              whose predicates are spelled to defeat every bound, both must reach the same
+#              by-construction end state, including an indexed-column update and a PK rekey.
 #   index_mut — UPDATE/DELETE target scans use a bare indexed equality/range or secondary-index
 #              IN-list; the equivalent `v + 0` predicates defeat the mutation bound. Applied to
 #              identically-seeded tables, both paths must reach the same by-construction end state,
@@ -211,6 +215,14 @@ COST_PLAN_P8_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_mul
                       query.comparison_order query.order_by query.order_by_keys query.limit
                       query.index_nested_loop query.hash_join query.order_by_join_scan
                       expr.arithmetic types.i32 null.three_valued].freeze
+COST_PLAN_DML_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index ddl.gin_index
+                       ddl.gist_index dml.insert dml.insert_multi_row dml.update dml.delete
+                       dml.costed_access query.select query.where_eq query.comparison_order
+                       query.logical_connectives query.order_by query.index_range
+                       query.or_in_point_lookup query.interval_set query.index_mutation
+                       query.gin_scan query.gist_scan expr.arithmetic types.i32 types.array
+                       types.range func.array_containment func.range_constructors
+                       func.range_operators].freeze
 INDEX_MUT_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert
                    dml.insert_multi_row dml.update dml.delete query.select query.where_eq
                    query.comparison_order query.order_by query.or_in_point_lookup
@@ -987,6 +999,74 @@ def gen_cost_plan_p8(seed)
   out << "# independently searched islands around a LEFT fence, including NULL extension"
   q(out, "IIIII", optimized, barrier_rows)
   q(out, "IIIII", reference, barrier_rows)
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: cost-selected UPDATE/DELETE access paths (costed mutation vs full scan) -----------
+# `opt` spells every predicate so PK, both B-trees, GIN, GiST, and interval-set candidates compete;
+# `ref` wraps each key in +0 or reverses the opclass operator, so it can only full-scan. Both tables
+# start identical and must reach the same end state after each mutation.
+def gen_cost_plan_dml(seed)
+  rng = Random.new(seed)
+  rows = (1..24).map do |id|
+    [id, rng.rand(0..20), rng.rand(0..3), [id % 3, (id + 1) % 5].uniq, [id % 8, id % 8 + rng.rand(1..4)], 0]
+  end
+  arr = ->(xs) { "ARRAY[#{xs.join(',')}]::i32[]" }
+  range = ->(lo, hi) { "i32range(#{lo},#{hi})" }
+  flat = lambda do |rs|
+    rs.sort_by(&:first).flat_map { |id, a, b, _tags, _span, w| [id.to_s, a.to_s, b.to_s, w.to_s] }
+  end
+  check = lambda do |out, label, rs|
+    out << "# #{label}: cost-selected and full-scan mutations reach the same state"
+    q(out, "IIII", "SELECT id, a, b, w FROM opt ORDER BY id", flat.call(rs))
+    q(out, "IIII", "SELECT id, a, b, w FROM ref ORDER BY id", flat.call(rs))
+  end
+
+  out = header(seed, COST_PLAN_DML_REQ, "cost-selected UPDATE/DELETE access paths")
+  values = rows.map do |id, a, b, tags, span, w|
+    "(#{id},#{a},#{b},'{#{tags.join(',')}}','[#{span[0]},#{span[1]})',#{w})"
+  end.join(', ')
+  %w[opt ref].each do |name|
+    stmt(out, "CREATE TABLE #{name} (id i32 PRIMARY KEY, a i32, b i32, tags i32[], span i32range, w i32)")
+    stmt(out, "CREATE INDEX #{name}_a ON #{name} (a)")
+    stmt(out, "CREATE INDEX #{name}_b ON #{name} (b)")
+    stmt(out, "CREATE INDEX #{name}_tags ON #{name} USING gin (tags)")
+    stmt(out, "CREATE INDEX #{name}_span ON #{name} USING gist (span)")
+    stmt(out, "INSERT INTO #{name} VALUES #{values}")
+  end
+
+  # PK range versus an equality on b, assigning the indexed column itself.
+  lo = rng.rand(0..10)
+  target = rows.map { |r| r[2] }.sample(random: rng)
+  stmt(out, "UPDATE opt SET b = b + 10, w = w + 1 WHERE id > #{lo} AND b = #{target}")
+  stmt(out, "UPDATE ref SET b = b + 10, w = w + 1 WHERE id + 0 > #{lo} AND b + 0 = #{target}")
+  rows = rows.map { |r| r[0] > lo && r[2] == target ? [r[0], r[1], r[2] + 10, r[3], r[4], r[5] + 1] : r }
+  check.call(out, "PK range versus B-tree equality UPDATE", rows)
+
+  # B-tree range versus GIN containment, rekeying every admitted row past the initial key space.
+  cut = rows.map { |r| r[1] }.sort[8]
+  term = rows.flat_map { |r| r[3] }.sample(random: rng)
+  stmt(out, "UPDATE opt SET id = id + 1000 WHERE a > #{cut} AND tags @> #{arr.call([term])}")
+  stmt(out, "UPDATE ref SET id = id + 1000 WHERE a + 0 > #{cut} AND #{arr.call([term])} <@ tags")
+  rows = rows.map { |r| r[1] > cut && r[3].include?(term) ? [r[0] + 1000, *r[1..]] : r }
+  check.call(out, "B-tree range versus GIN rekeying UPDATE", rows)
+
+  # Competing GIN and GiST bounds on DELETE.
+  term = rows.flat_map { |r| r[3] }.sample(random: rng)
+  point = rng.rand(1..8)
+  stmt(out, "DELETE FROM opt WHERE tags @> #{arr.call([term])} AND span @> #{range.call(point, point + 1)}")
+  stmt(out, "DELETE FROM ref WHERE #{arr.call([term])} <@ tags AND #{range.call(point, point + 1)} <@ span")
+  rows = rows.reject { |r| r[3].include?(term) && r[4][0] <= point && point + 1 <= r[4][1] }
+  check.call(out, "GIN versus GiST DELETE", rows)
+
+  # Ordered-index interval set versus a B-tree range on b.
+  points = rows.map { |r| r[1] }.uniq.sample(2, random: rng)
+  points = [0, 1] if points.size < 2
+  stmt(out, "DELETE FROM opt WHERE (a = #{points[0]} OR a = #{points[1]}) AND b >= 0")
+  stmt(out, "DELETE FROM ref WHERE (a + 0 = #{points[0]} OR a + 0 = #{points[1]}) AND b + 0 >= 0")
+  rows = rows.reject { |r| points.include?(r[1]) && r[2] >= 0 }
+  check.call(out, "index interval set versus B-tree range DELETE", rows)
 
   out.join("\n") + "\n"
 end
@@ -2742,6 +2822,7 @@ SCENARIOS = {
   "cost_plan_p6b" => method(:gen_cost_plan_p6b),
   "cost_plan_p7" => method(:gen_cost_plan_p7),
   "cost_plan_p8" => method(:gen_cost_plan_p8),
+  "cost_plan_dml" => method(:gen_cost_plan_dml),
   "index_mut" => method(:gen_index_mutation),
   "index_expr" => method(:gen_index_expr),
   "index_range" => method(:gen_index_range),
