@@ -3,7 +3,7 @@
 # stale after DML. The integer estimator consumes NULL/NDV/MCV/histogram facts without planning-time
 # leaf reads. jed_statistics is jed-owned introspection and EXPLAIN is jed-owned plan output, so this
 # file is cross-core checked rather than PostgreSQL-oracle imported.
-# requires: maintenance.analyze, introspect.statistics, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.alter_table, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, query.logical_connectives, expr.in_list, expr.between, expr.case, query.order_by, query.explain, query.qualified_table, session.privileges, session.allow_ddl, types.i32, types.text, types.decimal, types.array, types.jsonb, resource.cost_metering
+# requires: maintenance.analyze, introspect.statistics, dml.where_contradiction, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.alter_table, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, query.logical_connectives, expr.in_list, expr.between, expr.case, query.order_by, query.explain, query.qualified_table, session.privileges, session.allow_ddl, types.i32, types.text, types.decimal, types.array, types.jsonb, resource.cost_metering
 
 statement ok
 CREATE TABLE p9_stats (id i32 PRIMARY KEY, skew i32, label text)
@@ -274,3 +274,33 @@ query I nosort
 SELECT count(*) FROM p9_decimal WHERE v BETWEEN 1 AND 2.0
 ----
 3
+
+# A mutation that reads nothing — a proven WHERE contradiction (planner.md §3.1) or a provably empty
+# key bound — is still a successful DML statement, so it marks its target's facts stale too.
+statement ok
+CREATE TABLE p9_empty (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO p9_empty VALUES (1, 10), (2, 20)
+
+statement ok
+ANALYZE p9_empty (v)
+
+statement ok
+DELETE FROM p9_empty WHERE v > 30 AND v < 20
+
+query B nosort
+SELECT is_stale FROM jed_statistics WHERE table_name = 'p9_empty'
+----
+true
+
+statement ok
+ANALYZE p9_empty (v)
+
+statement ok
+UPDATE p9_empty SET v = 0 WHERE id = NULL
+
+query B nosort
+SELECT is_stale FROM jed_statistics WHERE table_name = 'p9_empty'
+----
+true

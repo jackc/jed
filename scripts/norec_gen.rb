@@ -99,6 +99,10 @@
 #   contradiction — a provably-never-TRUE bare-column literal AND-chain reads no relation
 #              (planner.md §3.1); the same predicate over `col + 0` is not proven and scans. Both must be
 #              empty (an ungrouped COUNT returns 0), and satisfiable near-miss ranges must match.
+#   dml_contradiction — UPDATE/DELETE whose WHERE is a proven contradiction read nothing
+#              (planner.md §3.1); the `col + 0` spelling is not proven and scans. Applied to
+#              identically-seeded tables, both leave every row unchanged, and satisfiable near-miss
+#              mutations reach the same by-construction end state.
 #   tlp      — Ternary-Logic Partitioning (SQLancer): for ANY predicate p, every row is in exactly
 #              one of `WHERE p` (TRUE) / `WHERE NOT p` (FALSE) / `WHERE p IS NULL` (UNKNOWN), so the
 #              three partitions UNION ALL must reconstruct the whole table (and COUNT over the whole
@@ -343,6 +347,12 @@ CONTRADICTION_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_mu
                        query.aggregates query.qualified_column query.join_inner
                        query.where_contradiction expr.arithmetic expr.comparison_value
                        null.three_valued types.i32 types.text types.boolean].freeze
+
+DML_CONTRADICTION_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row
+                           dml.update dml.delete dml.where_contradiction query.select
+                           query.where_eq query.comparison_order query.logical_connectives
+                           query.order_by query.where_contradiction expr.arithmetic
+                           expr.comparison_value null.three_valued types.i32 types.text].freeze
 
 # The default relation note describes the NoREC pair (an optimized form vs a non-optimizable
 # rewrite). TLP overrides it with its own partition-reconstruction note (it is not an opt pair).
@@ -2641,6 +2651,66 @@ def gen_contradiction(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: UPDATE/DELETE WHERE contradiction ------------------------------------------------
+# `opt` runs each mutation with a proven-contradictory WHERE; `ref` runs it with every bare column
+# spelled `x + 0` / `(s = 'v') = true`, which the proof cannot see, so it scans. Neither may change a
+# row. Satisfiable near-miss mutations then run on both and must reach the same end state.
+def gen_dml_contradiction(seed)
+  rng = Random.new(seed)
+  rows = (1..30).to_a.sample(8, random: rng).sort.map do |id|
+    [id, rng.rand < 0.2 ? nil : rng.rand(-5..15), %w[p q r s].sample(random: rng)]
+  end
+  lit = ->(x) { x.nil? ? "NULL" : x.to_s }
+  flat = ->(rs) { rs.flat_map { |id, x, s| [id.to_s, lit.call(x), s] } }
+  hide = ->(pred) { pred.gsub(/\bx /, "x + 0 ").gsub(/\bs = ('\w')/) { "(s = #{Regexp.last_match(1)}) = true" } }
+  check = lambda do |out, label, rs|
+    out << "# #{label}: proven and scanned mutations reach the same state"
+    q(out, "IIT", "SELECT id, x, s FROM opt ORDER BY id", flat.call(rs))
+    q(out, "IIT", "SELECT id, x, s FROM ref ORDER BY id", flat.call(rs))
+  end
+
+  out = header(seed, DML_CONTRADICTION_REQ, "UPDATE/DELETE WHERE contradiction (proven-empty vs scanned)")
+  %w[opt ref].each do |name|
+    stmt(out, "CREATE TABLE #{name} (id i32 PRIMARY KEY, x i32, s text)")
+    stmt(out, "INSERT INTO #{name} VALUES #{rows.map { |id, x, s| "(#{id}, #{lit.call(x)}, '#{s}')" }.join(', ')}")
+  end
+
+  lo = rng.rand(-5..10)
+  hi = lo + rng.rand(0..5)
+  k1 = rng.rand(-5..15)
+  k2 = k1 + rng.rand(1..4)
+  sv = %w[p q r s].sample(2, random: rng)
+  contradictions = [
+    "x > #{hi} AND x < #{lo}",
+    "x >= #{hi + 1} AND x <= #{hi}",
+    "x = #{k1} AND x = #{k2}",
+    "x = #{k1} AND x > #{k1}",
+    "x = NULL",
+    "s = '#{sv[0]}' AND s = '#{sv[1]}'",
+  ]
+  contradictions.each_with_index do |pred, i|
+    if i.even?
+      stmt(out, "UPDATE opt SET x = 100, s = 'z' WHERE #{pred}")
+      stmt(out, "UPDATE ref SET x = 100, s = 'z' WHERE #{hide.call(pred)}")
+    else
+      stmt(out, "DELETE FROM opt WHERE #{pred}")
+      stmt(out, "DELETE FROM ref WHERE #{hide.call(pred)}")
+    end
+  end
+  check.call(out, "contradictory UPDATE/DELETE", rows)
+
+  # Satisfiable near misses: a touching closed range, and an equality inside a closed range.
+  stmt(out, "UPDATE opt SET s = 'z' WHERE x >= #{lo} AND x <= #{lo}")
+  stmt(out, "UPDATE ref SET s = 'z' WHERE x + 0 >= #{lo} AND x + 0 <= #{lo}")
+  rows = rows.map { |id, x, s| !x.nil? && x == lo ? [id, x, "z"] : [id, x, s] }
+  stmt(out, "DELETE FROM opt WHERE x = #{k1} AND x >= #{k1}")
+  stmt(out, "DELETE FROM ref WHERE x + 0 = #{k1} AND x + 0 >= #{k1}")
+  rows = rows.reject { |_, x, _| !x.nil? && x == k1 }
+  check.call(out, "satisfiable near-miss UPDATE/DELETE", rows)
+
+  out.join("\n") + "\n"
+end
+
 # --- scenario: ON pushdown ---------------------------------------------------------------------
 def gen_on_pushdown(seed)
   rng = Random.new(seed)
@@ -2852,6 +2922,7 @@ SCENARIOS = {
   "join_comm" => method(:gen_join_comm),
   "where_pushdown" => method(:gen_where_pushdown),
   "contradiction" => method(:gen_contradiction),
+  "dml_contradiction" => method(:gen_dml_contradiction),
   "on_pushdown" => method(:gen_on_pushdown),
   "derived_pushdown" => method(:gen_derived_pushdown),
 }.freeze

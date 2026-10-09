@@ -1,0 +1,168 @@
+# UPDATE/DELETE WHERE contradiction detection (spec/design/planner.md §3.1). The SELECT proof applies
+# to a mutation's resolved WHERE before its uncorrelated subqueries fold: a literal FALSE or NULL
+# conjunct, a false literal-vs-literal comparison, a bare column compared with a NULL literal, and
+# bare-column literal comparisons with no common value (text by equality only). A proven mutation
+# reads no page or row of its target, evaluates no WHERE, SET, CHECK, or RETURNING item, and affects
+# nothing; uncorrelated subqueries still fold once and are charged. Results are ordinary PostgreSQL
+# semantics; the `# cost:` pins are jed's cross-core contract. `t` is one leaf.
+# requires: ddl.create_table, ddl.primary_key, ddl.sequence, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.returning, dml.where_contradiction, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.aggregates, query.qualified_column, query.subquery_scalar, query.subquery_correlated, query.subquery_exists, query.cte, query.cte_data_modifying, query.where_contradiction, func.sequence, expr.arithmetic, cast.explicit, error.division_by_zero, types.i32, types.i64, types.text, types.boolean, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, x i32, s text)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 'a'), (2, 5, 'b'), (3, NULL, 'c'), (4, 0, 'd')
+
+# An empty range on one column reads nothing and deletes nothing.
+# cost: 0
+statement ok
+DELETE FROM t WHERE x > 5 AND x < 3
+
+# cost: 0
+statement ok
+DELETE FROM t WHERE x > 5 AND x < 5
+
+# Conflicting equalities, and an equality outside a strict range on the same column.
+# cost: 0
+statement ok
+DELETE FROM t WHERE x = 1 AND x = 2
+
+# cost: 0
+statement ok
+UPDATE t SET x = x + 1 WHERE x = 1 AND x > 1
+
+# A comparison with NULL is never TRUE.
+# cost: 0
+statement ok
+DELETE FROM t WHERE x = NULL
+
+# Text equality is byte identity, so two different equality literals contradict.
+# cost: 0
+statement ok
+UPDATE t SET s = 'z' WHERE s = 'a' AND s = 'b'
+
+# Literal FALSE / NULL conjuncts and false literal comparisons.
+# cost: 0
+statement ok
+DELETE FROM t WHERE false
+
+# cost: 0
+statement ok
+UPDATE t SET x = 0 WHERE NULL
+
+# cost: 0
+statement ok
+DELETE FROM t WHERE 1 = 0
+
+# cost: 0
+statement ok
+UPDATE t SET x = 0 WHERE 2 < 1 AND id = 1
+
+# Nothing was deleted or changed.
+query IIT nosort
+SELECT id, x, s FROM t ORDER BY id
+----
+1
+1
+a
+2
+5
+b
+3
+NULL
+c
+4
+0
+d
+
+# Nothing is read, so neither the WHERE conjunct that would trap `1 / x` (x = 0 at id 4) nor the
+# trapping assignment is ever evaluated.
+# cost: 0
+statement ok
+DELETE FROM t WHERE x > 5 AND x < 3 AND 1 / x = 1
+
+# cost: 0
+statement ok
+UPDATE t SET x = x / 0 WHERE false
+
+# A correlated subquery in the WHERE never runs.
+# cost: 0
+statement ok
+DELETE FROM t WHERE x = 1 AND x = 2 AND EXISTS (SELECT 1 FROM t AS u WHERE u.id = t.id)
+
+# RETURNING projects nothing.
+# cost: 0
+query I nosort
+UPDATE t SET x = 9 WHERE x = 0 AND x = 1 RETURNING id
+----
+
+# cost: 0
+query IIT nosort
+DELETE FROM t WHERE s = 'a' AND s = 'c' RETURNING *
+----
+
+# A per-row volatile assignment never runs, so the sequence does not advance.
+statement ok
+CREATE SEQUENCE sq
+
+# cost: 0
+statement ok
+UPDATE t SET x = CAST(nextval('sq') AS i32) WHERE x > 5 AND x < 3
+
+query I nosort
+SELECT nextval('sq')
+----
+1
+
+# An uncorrelated WHERE subquery still folds once and is charged (the 10 units of `SELECT max(x)
+# FROM t`), while the target is not read.
+# cost: 10
+statement ok
+DELETE FROM t WHERE false AND x = (SELECT max(x) FROM t)
+
+# The proof reads the WHERE before folding, so a subquery that folds to NULL is not proven: the
+# subquery's 2 units plus the target scan (1 page + 4 rows + 1 comparison x 4), matching nothing.
+# cost: 11
+statement ok
+DELETE FROM t WHERE x = (SELECT CAST(NULL AS i32))
+
+# A writable CTE's proven DELETE returns no row to the primary.
+# cost: 1
+query I nosort
+WITH d AS (DELETE FROM t WHERE x = 1 AND x = 2 RETURNING id) SELECT count(*) FROM d
+----
+0
+
+# Text ORDERING is not proven (a collation may order it), so this empty range still scans:
+# 1 page + 4 rows + 3 nodes x 4 rows.
+# cost: 17
+statement ok
+DELETE FROM t WHERE s > 'b' AND s < 'a'
+
+# A TRUE literal comparison is not folded away: it is still evaluated per row.
+# cost: 17
+statement ok
+UPDATE t SET x = x WHERE 1 = 1 AND x = 77
+
+# A touching closed range is satisfiable: the scan runs (17 as above) and the one matching row is
+# updated or deleted.
+# cost: 17
+statement ok
+UPDATE t SET s = 'e' WHERE x >= 5 AND x <= 5
+
+# cost: 17
+statement ok
+DELETE FROM t WHERE x >= 0 AND x <= 0
+
+query IIT nosort
+SELECT id, x, s FROM t ORDER BY id
+----
+1
+1
+a
+2
+5
+e
+3
+NULL
+c

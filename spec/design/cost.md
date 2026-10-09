@@ -396,9 +396,10 @@ an equality ends the prefix: its range may bind, but a later member cannot (no s
   the range cursor.
 - **A provably empty range charges nothing.** A `pk = NULL` (3VL-unknown) or contradictory bounds
   (`pk > 5 AND pk < 5`) admit no key, so the scan reads no page and no row — `page_read` 0,
-  `storage_row_read` 0, and a mutation deletes/updates nothing. For a SELECT, a WHERE whose literals
-  contradict on any bare column (key or not) is proven at plan time and reads no relation at all
-  ([planner.md](planner.md) §3.1). (A point-lookup *miss* on an
+  `storage_row_read` 0, and a mutation deletes/updates nothing. For a SELECT, UPDATE, or DELETE, a
+  WHERE whose literals contradict on any bare column (key or not) is proven at plan time and reads no
+  relation at all ([planner.md](planner.md) §3.1); a mutation's uncorrelated subqueries still fold and
+  are charged. (A point-lookup *miss* on an
   existing key range — `pk = 99` where 99 isn't stored — still visits the leaf it would live in,
   so it charges that path's `page_read` but reads no row.)
 

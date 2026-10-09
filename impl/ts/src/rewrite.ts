@@ -365,6 +365,16 @@ function substituteBodyColumns(e: RExpr, offset: number, body: SelectPlan): RExp
   }
 }
 
+// whereContradicts flattens a WHERE's top-level AND-chain and applies the plan-time contradiction
+// proof. UPDATE/DELETE call it on their resolved, unfolded WHERE (planner.md §3.1), so the proof never
+// depends on an uncorrelated subquery's folded value. null (no WHERE) never contradicts.
+export function whereContradicts(filter: RExpr | null): boolean {
+  if (filter === null) return false;
+  const conjuncts: RExpr[] = [];
+  estimatorFlattenBoolean(filter, "and", conjuncts);
+  return whereConjunctsContradict(conjuncts);
+}
+
 // whereConjunctsContradict is the plan-time contradiction proof (planner.md §3.1): a literal FALSE
 // or NULL conjunct, a comparison between two literals that is never TRUE, or the estimator's
 // same-operand literal contradiction inventory (`x op NULL`, conflicting equalities, an empty range)

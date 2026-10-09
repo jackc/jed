@@ -4,7 +4,7 @@
 # subplan, and UPDATE/DELETE render the residual Filter + the target Scan. The scan access path is
 # chosen by the same policy-driven inventory the executor uses (PK, ordered B-tree, GIN/GiST,
 # interval set), so the reported path matches what the statement would run.
-# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.secondary_index, ddl.index_partial, ddl.gin_index, ddl.gist_index, dml.insert, dml.insert_select, dml.insert_multi_row, dml.insert_on_conflict, dml.update, dml.delete, dml.costed_access, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.composite_pk_pushdown, query.index_range, query.index_partial, query.or_in_point_lookup, query.interval_set, query.index_mutation, query.gin_scan, query.gist_scan, query.subquery_scalar, query.explain, dml.explain, expr.arithmetic, expr.in_list, types.i32, types.text, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.secondary_index, ddl.index_partial, ddl.gin_index, ddl.gist_index, dml.insert, dml.insert_select, dml.insert_multi_row, dml.insert_on_conflict, dml.update, dml.delete, dml.costed_access, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.composite_pk_pushdown, query.index_range, query.index_partial, query.or_in_point_lookup, query.interval_set, query.index_mutation, query.gin_scan, query.gist_scan, query.subquery_scalar, query.explain, query.explain_analyze, dml.explain, dml.explain_analyze, dml.where_contradiction, query.where_contradiction, expr.arithmetic, expr.in_list, types.i32, types.text, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)
@@ -426,4 +426,66 @@ conjuncts=2
 Scan dml_cpk
 PK bound: b = 1 and a = 1; touched=2
 0
+0
+
+# A WHERE contradiction (planner.md §3.1) keeps the plan shape — the target scan still renders the
+# path it would have selected — appends `; contradiction` to the Filter, and estimates the Filter,
+# the Scan, and the root at zero: the mutation reads nothing.
+query ITTII nosort
+EXPLAIN DELETE FROM t WHERE v > 30 AND v < 20
+----
+0
+Delete t
+-
+0
+0
+1
+Filter
+conjuncts=2; contradiction
+0
+0
+2
+Scan t
+Full scan; touched=1
+0
+0
+
+query ITTII nosort
+EXPLAIN UPDATE t SET v = 0 WHERE id = 1 AND id = 2
+----
+0
+Update t
+sets=1
+0
+0
+1
+Filter
+conjuncts=2; contradiction
+0
+0
+2
+Scan t
+PK bound: id = 1 and id = 2; touched=1
+0
+0
+
+# EXPLAIN ANALYZE executes the mutation: nothing is read, so every node's actual cost is zero.
+query ITTI nosort
+EXPLAIN (ANALYZE, COSTS FALSE) DELETE FROM t WHERE false
+----
+0
+Analyze
+cost=0 rows=0
+0
+1
+Delete t
+-
+0
+2
+Filter
+conjuncts=1; contradiction
+0
+3
+Scan t
+Full scan
 0

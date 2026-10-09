@@ -1124,8 +1124,9 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   equality joins, simple GROUP BY/DISTINCT, and variable-width hash work, are cache-safe and
   cross-core identical, and are summarized by `jed_statistics`. See
   `spec/design/statistics.md`; automatic analyze and extended/correlation statistics remain deferred.
-  Stage-2 rewrites now precede physical selection (`spec/design/planner.md` §3): a WHERE whose
-  literals contradict on a bare column (or a literal FALSE/NULL conjunct) reads no relation; in a
+  Stage-2 rewrites now precede physical selection (`spec/design/planner.md` §3): a SELECT, UPDATE, or
+  DELETE WHERE whose literals contradict on a bare column (or a literal FALSE/NULL conjunct) reads no
+  relation; in a
   join each structurally non-trapping single-relation conjunct on a preserved side runs inside that
   relation's scan (base table, derived table, CTE reference, SRF), leaving only the residual above the
   join; such a conjunct over a derived table's bare output columns moves into the body, which is

@@ -1242,13 +1242,20 @@ impl Engine {
             cte: None,
             db: db.map(str::to_owned),
         };
-        let mutation = self.plan_mutation_scan(db, table, filter);
-        let scan = EstimatedPlan::leaf(estimate_selected_scan(
+        let contradiction = where_contradicts(filter);
+        let mutation = self.plan_mutation_scan(db, table, filter, contradiction);
+        let mut scan = EstimatedPlan::leaf(estimate_selected_scan(
             mutation.bound.as_ref(),
             filter,
             &rel,
             self,
         ));
+        if contradiction {
+            // A WHERE contradiction reads no relation (planner.md §3.1): the target scan estimates
+            // zero, so the Filter above it runs over no row and only its uncorrelated subqueries
+            // remain.
+            scan = EstimatedPlan::leaf(PlanEstimate::empty(0));
+        }
         let Some(filter) = filter else {
             return scan;
         };

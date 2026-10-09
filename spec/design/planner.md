@@ -130,8 +130,23 @@ empty table: an ungrouped aggregate produces its one row (its `row_produced`), H
 once on it, GROUP BY/window/DISTINCT/ORDER BY produce nothing. Uncorrelated expression subqueries are
 still folded once before execution, as for any query. Each set-operation arm and each subquery is its
 own SELECT and is judged independently. The streaming pull lane keeps its lane and simply produces
-nothing. Mutations retain their existing runtime empty-bound behavior; a DML contradiction rule is a
-follow-on.
+nothing.
+
+**UPDATE and DELETE** (`dml.where_contradiction`). The same three proofs apply to a mutation target's
+resolved WHERE, taken **before** its uncorrelated subqueries fold: execution, DML EXPLAIN, and the
+estimator then judge the identical predicate, and a folded subquery value — a data-dependent constant —
+never feeds the proof (`x = (SELECT NULL)` is not proven, exactly as in a SELECT). A writable-CTE
+mutation is judged the same way. The target access path is still selected (§5.5) and rendered, but
+not executed.
+
+**Cost decision (UPDATE/DELETE).** A proven mutation reads **no page or row of its target** and charges
+nothing for them: no `page_read`, `storage_row_read`, WHERE, assignment, CHECK, or RETURNING
+evaluation. No row is affected, so no per-row volatile assignment (`nextval`) runs, no referential
+action fires, and RETURNING yields an empty result. Uncorrelated subqueries in the WHERE, SET list, and
+RETURNING list still fold once and are charged, as for any mutation. The statement still succeeds, so
+the target's statistics are marked stale like any zero-row DML ([statistics.md](statistics.md) §2).
+Previously such a mutation scanned its selected path and evaluated the WHERE per scanned row; a
+provably empty key bound already charged nothing and is unchanged.
 
 ### 3.2 WHERE pushdown (`query.where_pushdown`, `query.derived_pushdown`)
 
@@ -453,7 +468,8 @@ without composition: estimate every inventory candidate's access work plus the c
 scan row over the snapshot the mutation scan reads, and take the minimum, keeping the first
 candidate in canonical order on an exact tie ([estimator.md §9.3](estimator.md)). Mutation-only
 work is per affected row and identical for every candidate, so it is not part of the comparison.
-Execution plans after uncorrelated WHERE subqueries fold; DML EXPLAIN plans the unfolded filter.
+Execution plans after uncorrelated WHERE subqueries fold; DML EXPLAIN plans the unfolded filter. A
+WHERE contradiction (§3.1) still selects and renders a path, which is then not executed.
 
 The selected path's natural emission order — storage-key order, or the named index's order for an
 ordered B-tree or ordered-index interval set — is the phase-one visitation order. It therefore
@@ -484,7 +500,6 @@ bound.
 ## 7. Where future passes plug in
 
 - **Further stage-2 rewrites** (TODO.md) — pushdown into inlined CTE bodies, grouped bodies, and
-  set-operation arms; DML contradictions; constant folding — each under the §3 contract with its own
-  cost decision.
+  set-operation arms; constant folding — each under the §3 contract with its own cost decision.
 - **New physical rules** (the hash join above and later access paths tracked in TODO.md) land as
   discrete rule functions in the §4 inventory, each with its NoREC relation.

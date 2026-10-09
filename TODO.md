@@ -189,8 +189,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ push into **inlined CTE bodies** (needs per-reference body specialization: the
     inline/materialize mode is decided after the referencing query is planned), **grouped bodies**
     (conjuncts over grouping columns into the body's WHERE), and each **set-operation arm**.
+  - [x] _follow-on:_ **contradiction proofs for UPDATE/DELETE** (`dml.where_contradiction`) — the
+    SELECT proof over the target's resolved, unfolded WHERE; a proven mutation reads no target page
+    or row and evaluates no WHERE/SET/CHECK/RETURNING item, while uncorrelated subqueries still fold
+    and charge. [planner.md §3.1](spec/design/planner.md); NoREC `dml_contradiction`.
   - [ ] _follow-on:_ broader safe-conjunct gate (non-trapping casts/functions via a catalog
-    `traps` classification), contradiction proofs for UPDATE/DELETE, and parameter-time proofs.
+    `traps` classification) and parameter-time proofs.
   - [ ] _follow-on:_ plan-time **constant folding** / CSE / eliding a pushed recheck that its own
     access bound already guarantees — each removes `operator_eval` charges, so each needs its own
     explicit cost decision (the framing above), not a silent apply.

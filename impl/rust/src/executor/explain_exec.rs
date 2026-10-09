@@ -509,11 +509,14 @@ impl Engine {
     ) {
         let mut d = depth;
         if let Some(f) = filter {
-            let detail = if r.verbose {
+            let mut detail = if r.verbose {
                 format!("filter={}", render_rexpr(f))
             } else {
                 format!("conjuncts={}", conjunct_count(f))
             };
+            if where_contradicts(Some(f)) {
+                detail.push_str("; contradiction");
+            }
             r.emit(d, "Filter", detail);
             d += 1;
         }
@@ -634,7 +637,8 @@ impl Engine {
         table: &Table,
         filter: Option<&RExpr>,
     ) -> Option<ScanBound> {
-        self.plan_mutation_scan(None, table, filter).bound
+        self.plan_mutation_scan(None, table, filter, where_contradicts(filter))
+            .bound
     }
 
     /// Resolve the inner statement into a [`QueryPlan`] WITHOUT executing it — the read-query forms

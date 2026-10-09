@@ -121,6 +121,14 @@ lane was not re-run in this environment. Timings remain non-gating; the shared c
 oracle-checked rows, and the `on_pushdown` / `derived_pushdown` NoREC relations are the correctness
 proof.
 
+**DML contradiction result (2026-10-09).** The new `dml_contradiction` lane deletes from the
+1M-row `orders` table with `amount > 100000 AND amount < 50` (unindexed, provably empty) and rolls
+back each iteration. Before the rule each core full-scanned every row and evaluated the WHERE; now no
+row is read. Median per-statement time went from **206 ms to 5.9 µs Go**, **240 ms to 7.1 µs Rust**,
+and **580 ms to 28 µs TypeScript**, with the same checksum (`46b9d6e731035a45`) before and after on
+every core; the PostgreSQL and SQLite lanes were not run. Timings remain non-gating; the shared corpus
+pins and the `dml_contradiction` NoREC relation are the correctness proof.
+
 **Stage-2 WHERE rewrite result (2026-10-08).** The new `where_pushdown_join` /
 `where_pushdown_join_residual` pair counts the same join of two 4,000-row inputs whose single-table
 conjuncts keep 2% of each side; an expression ON key keeps nested loop in both, and the reference

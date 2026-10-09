@@ -108,6 +108,7 @@ import {
   pushedFilter,
   refreshPushdownResiduals,
   rewriteWhere,
+  whereContradicts,
   whereContradiction,
 } from "./rewrite.ts";
 import {
@@ -4113,7 +4114,13 @@ export class Engine {
     ctx: EstimateCteContext | null,
   ): EstimatedPlan {
     const rel: ScopeRel = { label: table.name.toLowerCase(), table, offset: 0, ...(db === undefined ? {} : { db }) };
-    const scan = leafEstimatedPlan(this.estimateSelectedScan(rel, this.planMutationScan(db, table, filter).bound, filter));
+    const contradiction = whereContradicts(filter);
+    let scan = leafEstimatedPlan(
+      this.estimateSelectedScan(rel, this.planMutationScan(db, table, filter, contradiction).bound, filter),
+    );
+    // A WHERE contradiction reads no relation (planner.md §3.1): the target scan estimates zero, so
+    // the Filter above it runs over no row and only its uncorrelated subqueries remain.
+    if (contradiction) scan = leafEstimatedPlan(emptyPlanEstimate(0n));
     if (filter === null) return scan;
     const logicalRows = estimateSelectivity(estimatorPredicateSelectivity(filter), scan.root.logicalRows);
     const rows = logicalRows > scan.root.rows ? scan.root.rows : logicalRows;
@@ -4577,11 +4584,9 @@ export class Engine {
   ): void {
     let d = depth;
     if (filter !== null) {
-      r.emit(
-        d,
-        "Filter",
-        r.verbose ? `filter=${renderRExpr(filter)}` : `conjuncts=${conjunctCount(filter)}`,
-      );
+      let detail = r.verbose ? `filter=${renderRExpr(filter)}` : `conjuncts=${conjunctCount(filter)}`;
+      if (whereContradicts(filter)) detail += "; contradiction";
+      r.emit(d, "Filter", detail);
       d++;
     }
     r.emit(d, "Scan " + name, this.scanDetail(name, this.dmlScanBound(table, filter), false, mask));
@@ -4652,7 +4657,7 @@ export class Engine {
   // dmlScanBound is EXPLAIN's compatibility wrapper over the typed mutation physical plan used by
   // execution. The unqualified explain surface has no database qualifier.
   private dmlScanBound(table: Table, filter: RExpr | null): ScanBound | null {
-    return this.planMutationScan(undefined, table, filter).bound;
+    return this.planMutationScan(undefined, table, filter, whereContradicts(filter)).bound;
   }
 
   // Select an UPDATE/DELETE target access path by cost (estimator.md §9.3): every legal candidate in
@@ -4660,13 +4665,15 @@ export class Engine {
   // scan-plus-residual estimate wins, the first in canonical kind/name order on an exact tie.
   // Mutation-only work is per affected row and identical across candidates, so it cannot change the
   // winner and is not added. Execution calls this after uncorrelated filter folding; EXPLAIN calls
-  // it on its resolved, unfolded filter.
+  // it on its resolved, unfolded filter. contradiction is the caller's stage-2 proof over the
+  // unfolded WHERE (whereContradicts), so both agree.
   private planMutationScan(
     db: string | undefined,
     table: Table,
     filter: RExpr | null,
+    contradiction: boolean,
   ): MutationScanPlan {
-    if (filter === null) return { bound: null, db };
+    if (filter === null) return { bound: null, db, contradiction };
     const rel: ScopeRel = {
       label: table.name.toLowerCase(),
       table,
@@ -4675,7 +4682,7 @@ export class Engine {
     };
     const candidates = inventoryScanCandidates(filter, rel, this.readSnap(), this);
     const estimates = estimateScanCandidates(candidates, rel, this, false);
-    return { bound: selectCostedScanCandidate(candidates, estimates), db };
+    return { bound: selectCostedScanCandidate(candidates, estimates), db, contradiction };
   }
 
   // planExplainInner resolves the inner statement into a QueryPlan WITHOUT executing it. It handles the
@@ -8625,6 +8632,8 @@ export class Engine {
     meter: Meter,
     mask: boolean[],
   ): MutationScanBatch {
+    // A WHERE contradiction (planner.md §3.1) reads no page and no row, and so charges nothing.
+    if (plan.contradiction) return { entries: [], pages: 0, slabs: 0, empty: true };
     const store = this.lkpStoreScoped(plan.db, tableName);
     const b = plan.bound;
     if (b === null) {
@@ -10993,6 +11002,9 @@ export class Engine {
     // uncorrelated execution reads the pre-DELETE snapshot (keys are collected before mutating).
     // Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13; cost.md §3).
     const meter = this.session.newMeter();
+    // The stage-2 contradiction proof (planner.md §3.1) reads the resolved WHERE before folding, as
+    // SELECT's plan-time proof and DML EXPLAIN do: a folded subquery value never feeds it.
+    const contradiction = whereContradicts(filter);
     if (filter !== null) {
       const cost = { value: 0n };
       filter = this.foldUncorrelatedInRExpr(filter, bound, ctx, cost);
@@ -11043,7 +11055,7 @@ export class Engine {
     // resolve its index store through the unscoped funnel. The whole WHERE stays the residual filter.
     const scanBefore = meter.accrued;
     const scan = this.executeMutationScan(
-      this.planMutationScan(del.db, table, filter),
+      this.planMutationScan(del.db, table, filter, contradiction),
       del.table,
       filter,
       bound,
@@ -11055,6 +11067,9 @@ export class Engine {
     if (scan.empty) {
       this.recordExplainActual("Scan " + del.table, scanActual);
       if (filter !== null) this.recordExplainActual("Filter", scanActual);
+      // A statement that read nothing still succeeded, so its target's statistics are marked stale
+      // like any zero-row DML (statistics.md §2).
+      this.markEstimatorMutation(del.db, del.table);
       return dmlOutcome(ret?.names ?? null, ret?.types ?? null, null, 0, meter.accrued); // empty bound
     }
     const blockCost = COSTS.pageRead * BigInt(scan.pages) + COSTS.valueDecompress * BigInt(scan.slabs);
@@ -11307,6 +11322,8 @@ export class Engine {
     // Phase 1: build + validate every matching row's new values; no writes yet. Each scanned row,
     // the filter, and each assignment RHS accrue cost (the phase-2 writes do not — cost.md §3).
     const meter = this.session.newMeter();
+    // The stage-2 contradiction proof (planner.md §3.1) reads the resolved WHERE before folding.
+    const contradiction = whereContradicts(filter);
     const foldCost = { value: 0n };
     for (const p of plans) p.source = this.foldUncorrelatedInRExpr(p.source, bound, ctx, foldCost);
     if (filter !== null) filter = this.foldUncorrelatedInRExpr(filter, bound, ctx, foldCost);
@@ -11359,7 +11376,7 @@ export class Engine {
     // resolve its index store through the unscoped funnel. The whole WHERE stays the residual filter.
     const scanBefore = meter.accrued;
     const scan = this.executeMutationScan(
-      this.planMutationScan(upd.db, table, filter),
+      this.planMutationScan(upd.db, table, filter, contradiction),
       upd.table,
       filter,
       bound,
@@ -11371,6 +11388,9 @@ export class Engine {
     if (scan.empty) {
       this.recordExplainActual("Scan " + upd.table, scanActual);
       if (filter !== null) this.recordExplainActual("Filter", scanActual);
+      // A statement that read nothing still succeeded, so its target's statistics are marked stale
+      // like any zero-row DML (statistics.md §2).
+      this.markEstimatorMutation(upd.db, upd.table);
       return dmlOutcome(ret?.names ?? null, ret?.types ?? null, null, 0, meter.accrued); // empty bound
     }
     const blockCost = COSTS.pageRead * BigInt(scan.pages) + COSTS.valueDecompress * BigInt(scan.slabs);
@@ -18386,7 +18406,9 @@ function indexOrderCandidate(
 
 // A mutation plan carries the chosen access path and its relation scope. Execution normalizes every
 // access path into keyed entries so UPDATE/DELETE can preserve their two-phase write discipline.
-export type MutationScanPlan = { bound: ScanBound | null; db?: string };
+// contradiction is the stage-2 proof (planner.md §3.1) that the WHERE is never TRUE: the bound is
+// still selected (EXPLAIN renders it), but execution reads nothing.
+export type MutationScanPlan = { bound: ScanBound | null; db?: string; contradiction: boolean };
 export type MutationScanBatch = {
   entries: Entry[];
   pages: number;

@@ -210,7 +210,8 @@ stay above the join, where they see the NULL-extended rows.
 If the `WHERE`'s literals rule out every row — `zone > 5 AND zone < 3`, `x = 1 AND x = 2`,
 `WHERE false` — the statement reads no table at all. The plan keeps its shape, the `Filter` detail
 ends in `contradiction`, and every scan estimates (and costs) zero. An ungrouped aggregate still returns
-its one row.
+its one row. `UPDATE` and `DELETE` get the same check: a contradictory mutation reads no row, evaluates
+none of its `SET` or `RETURNING` expressions, and changes nothing.
 
 <LiveSql seed={seed} query={contradiction} rows={4} />
 

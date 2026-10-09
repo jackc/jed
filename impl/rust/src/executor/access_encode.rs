@@ -1813,6 +1813,7 @@ impl Engine {
         db: Option<&str>,
         table: &Table,
         filter: Option<&RExpr>,
+        contradiction: bool,
     ) -> MutationScanPlan {
         let bound = filter.and_then(|f| {
             let rel = ScopeRel {
@@ -1830,6 +1831,7 @@ impl Engine {
         MutationScanPlan {
             bound,
             db: db.map(str::to_owned),
+            contradiction,
         }
     }
 }

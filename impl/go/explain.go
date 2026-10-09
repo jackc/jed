@@ -542,6 +542,9 @@ func (db *engine) renderDmlScan(r *explainRender, table *catTable, name string, 
 		if r.verbose {
 			detail = "filter=" + renderRExpr(filter)
 		}
+		if whereContradicts(filter) {
+			detail += "; contradiction"
+		}
 		r.emit(d, "Filter", detail)
 		d++
 	}
@@ -616,7 +619,7 @@ func (db *engine) explainUpdateTouched(table *catTable, upd *update, filter *rEx
 // dmlScanBound is EXPLAIN's compatibility wrapper over the typed mutation physical plan used by the
 // executors. The unqualified explain surface has a nil database scope.
 func (db *engine) dmlScanBound(table *catTable, filter *rExpr) *scanBound {
-	return db.planMutationScan(nil, table, filter).bound
+	return db.planMutationScan(nil, table, filter, whereContradicts(filter)).bound
 }
 
 // planExplainInner resolves the inner statement into a queryPlan WITHOUT executing it. It handles the

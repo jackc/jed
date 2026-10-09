@@ -2937,6 +2937,9 @@ impl Engine {
         // The uncorrelated execution reads the pre-DELETE snapshot (we collect keys before
         // mutating), matching PostgreSQL.
         let mut meter = self.session.new_meter();
+        // The stage-2 contradiction proof (planner.md §3.1) reads the resolved WHERE before folding,
+        // as SELECT's plan-time proof and DML EXPLAIN do: a folded subquery value never feeds it.
+        let contradiction = where_contradicts(filter.as_ref());
         if let Some(f) = &mut filter {
             self.fold_uncorrelated_in_rexpr(f, &bound, ctx, &mut meter.accrued)?;
         }
@@ -2984,7 +2987,8 @@ impl Engine {
         }
         // Select and execute the target scan through the shared mutation access-path seam. Planning
         // happens after uncorrelated folding, matching the old inline detector timing.
-        let scan_plan = self.plan_mutation_scan(del.db.as_deref(), table, filter.as_ref());
+        let scan_plan =
+            self.plan_mutation_scan(del.db.as_deref(), table, filter.as_ref(), contradiction);
         let scan_before = meter.accrued;
         let batch = self.execute_mutation_scan(
             &scan_plan,
@@ -3331,6 +3335,8 @@ impl Engine {
         // re-runs per row via the outer environment. The uncorrelated execution reads the
         // pre-UPDATE snapshot (phase 1 only reads; phase 2 writes), matching PostgreSQL.
         let mut meter = self.session.new_meter();
+        // The stage-2 contradiction proof (planner.md §3.1) reads the resolved WHERE before folding.
+        let contradiction = where_contradicts(filter.as_ref());
         for plan in &mut plans {
             self.fold_uncorrelated_in_rexpr(&mut plan.source, &bound, ctx, &mut meter.accrued)?;
         }
@@ -3386,7 +3392,8 @@ impl Engine {
         }
         // Select and execute the target scan through the shared mutation access-path seam. The
         // keyed batch is over the pre-update state and feeds the unchanged two-phase rewrite.
-        let scan_plan = self.plan_mutation_scan(upd.db.as_deref(), table, filter.as_ref());
+        let scan_plan =
+            self.plan_mutation_scan(upd.db.as_deref(), table, filter.as_ref(), contradiction);
         let scan_before = meter.accrued;
         let batch = self.execute_mutation_scan(
             &scan_plan,

@@ -461,6 +461,18 @@ fn substitute_body_columns(e: &RExpr, offset: usize, body: &SelectPlan) -> Optio
     )
 }
 
+/// Flatten a WHERE's top-level AND-chain and apply the plan-time contradiction proof. UPDATE/DELETE
+/// call it on their resolved, unfolded WHERE (planner.md §3.1), so the proof never depends on an
+/// uncorrelated subquery's folded value. `None` (no WHERE) never contradicts.
+pub(crate) fn where_contradicts(filter: Option<&RExpr>) -> bool {
+    let Some(filter) = filter else {
+        return false;
+    };
+    let mut conjuncts = Vec::new();
+    estimator_flatten_boolean(filter, true, &mut conjuncts);
+    where_conjuncts_contradict(&conjuncts)
+}
+
 /// The plan-time contradiction proof (planner.md §3.1): a literal FALSE or NULL conjunct, a
 /// comparison between two literals that is never TRUE, or the estimator's same-operand literal
 /// contradiction inventory (`x op NULL`, conflicting equalities, an empty range) restricted to

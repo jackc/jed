@@ -666,6 +666,20 @@ gen = "int_uniform"
 min = 1
 max = 100000
 
+# UPDATE/DELETE WHERE contradiction (dml.where_contradiction): the empty literal range on the
+# unindexed amount column is proven at plan time, so jed reads none of the 1M rows; before the rule
+# the mutation full-scanned them and evaluated the WHERE per row. Rolled back each iteration.
+[[bench]]
+name = "dml_contradiction"
+description = "DELETE on 1M rows whose WHERE `amount > 100000 AND amount < 50` is provably empty"
+dataset = "large"
+kind = "write_rollback"
+sql = "DELETE FROM orders WHERE amount > 100000 AND amount < 50"
+warmup = 20
+iterations = 200
+seed = 4274
+batch = 1
+
 # Secondary-index point-set DELETE (query.index_mutation + query.or_in_point_lookup): four distinct
 # customer ids become four index probes, their keyed rows are removed in phase 2, and the transaction
 # rolls back. This continuously covers the second Phase-1 access path at realistic tree depth.

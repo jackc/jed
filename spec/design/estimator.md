@@ -412,7 +412,9 @@ The following attribution rules close the remaining current-plan shapes:
   ON when nothing moved; no ON work when everything moved);
 - a WHERE contradiction ([planner.md](planner.md) §3.1) estimates every relation subtree — base
   scans, SRFs, CTE references, derived bodies — at zero rows, zero logical rows, and zero units, and a
-  FROM-less `Result` at zero rows; the pipeline above estimates normally over that empty input;
+  FROM-less `Result` at zero rows; the pipeline above estimates normally over that empty input. An
+  UPDATE/DELETE contradiction estimates its target scan the same way, so its Filter adds only its
+  uncorrelated subqueries;
 - a nested-loop join adds both input scans once and ON work over its saturated candidate pairs; an
   index-nested-loop repeats the selected inner access work by outer rows; a hash join adds its fixed
   build/probe work and ON recheck work over estimated bucket candidates;

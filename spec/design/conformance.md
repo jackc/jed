@@ -520,7 +520,9 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   `col + 0`; **contradiction** — a plan-time-proven
   empty bare-column literal AND-chain reads nothing ([planner.md §3.1](planner.md)) and must agree with
   the unproven `col + 0` spelling (empty rows, a zero ungrouped COUNT), plus satisfiable near-miss
-  ranges;
+  ranges; **dml_contradiction** — UPDATE/DELETE whose WHERE is a proven contradiction read nothing,
+  applied beside the unproven `col + 0` spelling to an identically seeded table: neither changes a
+  row, and satisfiable near-miss mutations reach the same end state;
   **cost_plan_dml** — UPDATE/DELETE whose WHERE admits competing PK, B-tree, GIN, GiST, and
   interval-set bounds take the estimated-cheapest one ([estimator.md §9.3](estimator.md)), including
   an indexed-column update and a PK rekey; an identically seeded table whose predicates use `col + 0`

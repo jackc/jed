@@ -5081,6 +5081,9 @@ pub(crate) enum ScanBound {
 pub(crate) struct MutationScanPlan {
     bound: Option<ScanBound>,
     db: Option<String>,
+    /// The stage-2 proof (planner.md §3.1) that the WHERE is never TRUE: the bound is still
+    /// selected (EXPLAIN renders it), but execution reads nothing.
+    contradiction: bool,
 }
 
 /// Normalized result of executing any mutation access path: keyed rows plus the exact up-front

@@ -2093,8 +2093,14 @@ func (db *engine) estimateQueryPlan(qp queryPlan, ctx *estimateCTECtx) estimated
 
 func (db *engine) estimateMutationScan(table *catTable, dbScope *string, filter *rExpr, ctx *estimateCTECtx) estimatedPlan {
 	rel := scopeRel{label: strings.ToLower(table.Name), table: table, offset: 0, db: dbScope}
-	bound := db.planMutationScan(dbScope, table, filter).bound
+	contradiction := whereContradicts(filter)
+	bound := db.planMutationScan(dbScope, table, filter, contradiction).bound
 	scan := leafEstimatedPlan(db.estimateSelectedScan(rel, bound, filter))
+	if contradiction {
+		// A WHERE contradiction reads no relation (planner.md §3.1): the target scan estimates zero,
+		// so the Filter above it runs over no row and only its uncorrelated subqueries remain.
+		scan = leafEstimatedPlan(planEstimate{})
+	}
 	if filter == nil {
 		return scan
 	}

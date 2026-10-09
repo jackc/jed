@@ -3064,6 +3064,9 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 	// uncorrelated execution reads the pre-DELETE snapshot (keys are collected before mutating).
 	// Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13; cost.md §3).
 	meter := db.session.newMeter()
+	// The stage-2 contradiction proof (planner.md §3.1) reads the resolved WHERE before folding, as
+	// SELECT's plan-time proof and DML EXPLAIN do: a folded subquery value never feeds it.
+	contradiction := whereContradicts(filter)
 	if filter != nil {
 		if err := db.foldUncorrelatedInRExpr(filter, bound, ctx, &meter.Accrued); err != nil {
 			return outcome{}, err
@@ -3108,7 +3111,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 	// Plan and execute the target scan through the shared mutation access-path seam. The plan is
 	// selected after uncorrelated folding, matching the old inline detector timing; the batch keeps
 	// storage keys for phase 2 and reports the same up-front units as before.
-	scanPlan := db.planMutationScan(del.DB, table, filter)
+	scanPlan := db.planMutationScan(del.DB, table, filter, contradiction)
 	scanBefore := meter.Accrued
 	batch, err := db.executeMutationScan(scanPlan, del.Table, bound, env, meter, mask)
 	if err != nil {
@@ -3120,6 +3123,9 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 		if filter != nil {
 			db.explainActual.record("Filter", scanActual)
 		}
+		// A statement that read nothing still succeeded, so its target's statistics are marked stale
+		// like any zero-row DML (statistics.md §2).
+		db.markEstimatorMutation(del.DB, del.Table)
 		return dmlOutcome(retNames, retTypes, nil, 0, meter.Accrued), nil
 	}
 	entries, overlap, slabs := batch.entries, batch.pages, batch.slabs
@@ -3411,6 +3417,8 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	// Phase 1: build + validate every matching row's new values; no writes yet. Each scanned row,
 	// the filter, and each assignment RHS accrue cost (the phase-2 writes do not — cost.md §3).
 	meter := db.session.newMeter()
+	// The stage-2 contradiction proof (planner.md §3.1) reads the resolved WHERE before folding.
+	contradiction := whereContradicts(filter)
 	for i := range plans {
 		if err := db.foldUncorrelatedInRExpr(plans[i].source, bound, ctx, &meter.Accrued); err != nil {
 			return outcome{}, err
@@ -3471,7 +3479,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	}
 	// Plan and execute the target scan through the shared mutation access-path seam. The keyed batch
 	// is over the pre-update state and feeds the unchanged two-phase rewrite below.
-	scanPlan := db.planMutationScan(upd.DB, table, filter)
+	scanPlan := db.planMutationScan(upd.DB, table, filter, contradiction)
 	scanBefore := meter.Accrued
 	batch, err := db.executeMutationScan(scanPlan, upd.Table, bound, env, meter, mask)
 	if err != nil {
@@ -3483,6 +3491,9 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 		if filter != nil {
 			db.explainActual.record("Filter", scanActual)
 		}
+		// A statement that read nothing still succeeded, so its target's statistics are marked stale
+		// like any zero-row DML (statistics.md §2).
+		db.markEstimatorMutation(upd.DB, upd.Table)
 		return dmlOutcome(retNames, retTypes, nil, 0, meter.Accrued), nil
 	}
 	entries, overlap, slabs := batch.entries, batch.pages, batch.slabs

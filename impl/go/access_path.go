@@ -217,6 +217,9 @@ type mutationScanPlan struct {
 	bound  *scanBound
 	filter *rExpr
 	scope  *string
+	// contradiction is the stage-2 proof (planner.md §3.1) that the WHERE is never TRUE: the bound is
+	// still selected (EXPLAIN renders it), but execution reads nothing.
+	contradiction bool
 }
 
 // mutationScanBatch is the normalized result of executing any mutation access path. Every path
@@ -676,9 +679,10 @@ func (db *engine) buildIndexIntervalSetPlan(filter *rExpr, rel scopeRel, idx ind
 // and the lowest scan-plus-residual estimate wins, the first in canonical kind/name order on an
 // exact tie. Mutation-only work (assignments, checks, writes, RETURNING) is per affected row and
 // identical across candidates, so it cannot change the winner and is not added. Execution calls this
-// after uncorrelated filter folding; EXPLAIN calls it on its resolved (unfolded) filter.
-func (db *engine) planMutationScan(scope *string, table *catTable, filter *rExpr) mutationScanPlan {
-	plan := mutationScanPlan{filter: filter, scope: scope}
+// after uncorrelated filter folding; EXPLAIN calls it on its resolved (unfolded) filter. contradiction
+// is the caller's stage-2 proof over the unfolded WHERE (whereContradicts), so both agree.
+func (db *engine) planMutationScan(scope *string, table *catTable, filter *rExpr, contradiction bool) mutationScanPlan {
+	plan := mutationScanPlan{filter: filter, scope: scope, contradiction: contradiction}
 	if filter == nil {
 		return plan
 	}
@@ -1612,6 +1616,10 @@ func indexLogicalInterval(logical keyBound) keyBound {
 // batch. It owns the access-method switch that used to be duplicated inline in both DML executors;
 // per-row guards, storage_row_read, residual evaluation, and the phase-2 writes stay with the caller.
 func (db *engine) executeMutationScan(plan mutationScanPlan, tableName string, params []Value, env *evalEnv, meter *costMeter, mask []bool) (mutationScanBatch, error) {
+	// A WHERE contradiction (planner.md §3.1) reads no page and no row, and so charges nothing.
+	if plan.contradiction {
+		return mutationScanBatch{empty: true}, nil
+	}
 	store := db.lkpStoreScoped(plan.scope, tableName)
 	b := plan.bound
 	if b == nil {

@@ -207,6 +207,14 @@ impl Engine {
         meter: &mut Meter,
         mask: &[bool],
     ) -> Result<MutationScanBatch> {
+        // A WHERE contradiction (planner.md §3.1) reads no page and no row, and so charges nothing.
+        if plan.contradiction {
+            return Ok(MutationScanBatch {
+                entries: Vec::new(),
+                pages: 0,
+                slabs: 0,
+            });
+        }
         let store = self.store_scoped(plan.db.as_deref(), table_name);
         let (entries, (pages, slabs)) = match plan.bound.as_ref() {
             None => {

@@ -135,7 +135,10 @@ Attributes are separated by `; `. A node with no attributes is `-`.
   into a derived body appears in the body's own plan (its Filter, a pushed filter on its Scan, or its
   access bound).
 - A WHERE contradiction ([planner.md](planner.md) §3.1) keeps the complete WHERE on the `Filter` node
-  and appends `; contradiction`; every relation below it estimates and charges zero.
+  and appends `; contradiction`; every relation below it estimates and charges zero. An UPDATE/DELETE
+  contradiction renders the same way: its target `Scan` still names the selected path, and the
+  `Filter`, `Scan`, and DML root estimate zero rows and zero cost (plus any uncorrelated WHERE
+  subquery).
 - Sort details are `keys=N` and optionally `top-k=K`. Limit details are `limit=N` / `offset=N`.
   Aggregate, Window, Values, set-op, CTE, and DML counts retain their established compact grammar.
 - Without VERBOSE, residual filters, HAVING, and join predicates retain compact `conjuncts=N`
