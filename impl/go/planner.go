@@ -1005,17 +1005,47 @@ func (db *engine) replanPushedBodies(plan *selectPlan, tableRefs []tableRef, cte
 		for ci, b := range ctes {
 			refs[ci] = b.refs
 		}
-		body, err := db.planSelectPushed(tableRefs[i].Subquery.Select, nil, ctes, ptypes, pushed)
+		body, err := db.replanPushedQuery(*tableRefs[i].Subquery, plan.rels[i].derived, pushed, ctes, ptypes)
 		for ci, b := range ctes {
 			b.refs = refs[ci]
 		}
 		if err != nil {
 			return err
 		}
-		plan.rels[i].derived = &queryPlan{sel: body}
+		plan.rels[i].derived = &body
 	}
 	plan.pushdown.bodyPushes = nil
 	return nil
+}
+
+// replanPushedQuery plans a body-pushable query expression again with conjuncts in its output-column
+// numbering pushed into it: a SELECT gets them substituted to the FROM slots its outputs read (below
+// its grouping, when grouped) and appended to its WHERE; a set operation pushes them into each arm and
+// keeps its own unified types, ORDER BY, and operator. first is the expression's first plan, whose
+// output mapping the replanned SELECT reproduces.
+func (db *engine) replanPushedQuery(qe queryExpr, first *queryPlan, pushed []*rExpr, ctes []*cteBinding, ptypes *paramTypes) (queryPlan, error) {
+	if first.sel != nil {
+		moved := make([]*rExpr, len(pushed))
+		for k, c := range pushed {
+			moved[k] = substituteBodyColumns(c, first.sel)
+		}
+		body, err := db.planSelectPushed(qe.Select, nil, ctes, ptypes, moved)
+		if err != nil {
+			return queryPlan{}, err
+		}
+		return queryPlan{sel: body}, nil
+	}
+	so := *first.setop
+	lhs, err := db.replanPushedQuery(qe.SetOp.Lhs, &first.setop.lhs, pushed, ctes, ptypes)
+	if err != nil {
+		return queryPlan{}, err
+	}
+	rhs, err := db.replanPushedQuery(qe.SetOp.Rhs, &first.setop.rhs, pushed, ctes, ptypes)
+	if err != nil {
+		return queryPlan{}, err
+	}
+	so.lhs, so.rhs = lhs, rhs
+	return queryPlan{setop: &so}, nil
 }
 
 // computeRelMasks computes the TOUCHED SET per relation (cost.md §3 "The touched set";

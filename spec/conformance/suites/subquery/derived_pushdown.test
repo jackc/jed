@@ -1,11 +1,12 @@
 # Predicate pushdown into derived tables and onto computed relations (spec/design/planner.md §3.2).
-# A pushdown-safe conjunct over a derived table whose body is a single SELECT without aggregate,
-# GROUP BY, window function, LIMIT, or OFFSET — and whose referenced output columns are bare body
-# columns — moves INTO the body: the body is planned again with the conjunct appended to its WHERE, so
-# it can bound the body's key and push further into the body's own joins. Otherwise, in a join, a
-# conjunct over a derived table, CTE reference, or set-returning function runs over that relation's
-# rows before the join. A body with LIMIT, a window function, or aggregation is never pushed into:
-# the answer would change. The rows are PostgreSQL's; the `# cost:` pins are jed's cross-core
+# A pushdown-safe conjunct over a derived table whose body is a SELECT without window function, LIMIT,
+# or OFFSET (grouped only by one grouping set) — or a set operation of such SELECTs — and whose
+# referenced output columns are bare body columns (grouping columns, in a grouped body) moves INTO the
+# body: the body is planned again with the conjunct appended to its WHERE, so it can bound the body's
+# key and push further into the body's own joins. Otherwise, in a join, a conjunct over a derived
+# table, CTE reference, or set-returning function runs over that relation's rows before the join. A
+# body with LIMIT or a window function is never pushed into: the answer would change. Grouped bodies
+# and set operations are covered in depth by subquery/grouped_setop_pushdown.test. The rows are PostgreSQL's; the `# cost:` pins are jed's cross-core
 # contract. All units weigh 1.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.column_alias, query.table_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.join_left, query.cross_join, query.limit, query.distinct, query.aggregates, query.group_by, query.window, query.window_ranking, query.union, query.values, query.cte, query.lateral, query.set_returning, query.derived_table, query.join_pushdown, query.hash_join, query.index_nested_loop, query.where_pushdown, query.derived_pushdown, query.on_pushdown, query.is_null, expr.arithmetic, null.three_valued, types.i32, resource.cost_metering
 
@@ -104,8 +105,9 @@ SELECT d.id, d.rn FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM t)
 12
 12
 
-# Aggregation blocks it (a grouped body is a follow-on): the count is over each whole group.
-# cost: 34
+# A conjunct over a grouping column moves below the grouping into the body's WHERE: only k = 1's
+# rows are grouped and counted (subquery/grouped_setop_pushdown.test covers grouped bodies).
+# cost: 31
 query II nosort
 SELECT d.k, d.n FROM (SELECT k, count(*) AS n FROM t GROUP BY k) d WHERE d.k = 1
 ----
@@ -172,8 +174,8 @@ NULL
 6
 30
 
-# A UNION ALL body is filtered as it is produced.
-# cost: 72
+# A UNION ALL body takes the conjunct into each arm, where it bounds the arm's primary key.
+# cost: 66
 query II nosort
 SELECT s.id, u.w FROM (SELECT id FROM t UNION ALL SELECT id FROM u) s JOIN u ON s.id = u.id WHERE s.id >= 2 ORDER BY s.id, u.w
 ----

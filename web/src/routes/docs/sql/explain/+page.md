@@ -47,6 +47,12 @@ WHERE c.zone < 8 AND t.id > 2;`;
 	const derivedPushdown = `EXPLAIN SELECT v.name
 FROM (SELECT id, name, region FROM city) v
 WHERE v.id = 3;`;
+	const groupedPushdown = `EXPLAIN SELECT g.region, g.cities
+FROM (SELECT region, count(*) AS cities FROM city GROUP BY region) g
+WHERE g.region = 2;`;
+	const setopPushdown = `EXPLAIN SELECT x.id
+FROM (SELECT id FROM city UNION SELECT city_id FROM trip) x
+WHERE x.id = 3;`;
 	const onPushdown = `EXPLAIN SELECT c.name, t.id
 FROM city c LEFT JOIN trip t ON c.id = t.city_id AND t.id > 5;`;
 	const aggregate = `EXPLAIN SELECT region, count(*)
@@ -216,13 +222,27 @@ none of its `SET` or `RETURNING` expressions, and changes nothing.
 <LiveSql seed={seed} query={contradiction} rows={4} />
 
 A condition on a subquery in `FROM` moves **into** the subquery when it only compares the subquery's
-plain output columns and the subquery has no `GROUP BY`, aggregate, window function, `LIMIT`, or
-`OFFSET`. The subquery is then planned as if you had written the condition inside it — here it
-becomes a primary-key lookup on `city` rather than a filter over every row the subquery returns.
-(A subquery that doesn't qualify, a `WITH` query, or a set-returning function in a join still gets
-the condition applied to its rows before the join, shown as `filter:conjuncts=N` on its node.)
+plain output columns and the subquery has no window function, `LIMIT`, or `OFFSET`. The subquery is
+then planned as if you had written the condition inside it — here it becomes a primary-key lookup on
+`city` rather than a filter over every row the subquery returns. (A subquery that doesn't qualify, a
+`WITH` query, or a set-returning function in a join still gets the condition applied to its rows
+before the join, shown as `filter:conjuncts=N` on its node.)
 
 <LiveSql seed={seed} query={derivedPushdown} rows={4} />
+
+A grouped subquery takes the condition too when it only compares **grouping columns**: it then decides
+which whole groups exist, so it runs before the grouping — here it bounds the `city_region` index under
+the `Aggregate`, and only one region's cities are counted. A condition on an aggregate result, or on a
+`ROLLUP`/`CUBE`/`GROUPING SETS` subquery, stays outside.
+
+<LiveSql seed={seed} query={groupedPushdown} rows={4} />
+
+A `UNION`, `INTERSECT`, or `EXCEPT` subquery takes the condition into **every branch**, and each branch
+plans it on its own table: here it is a primary-key lookup on `city` and a filter on `trip`'s scan.
+A branch whose column jed widens to the combined type (an `i32` branch of an `i64` column, say) keeps
+the condition outside.
+
+<LiveSql seed={seed} query={setopPushdown} rows={6} />
 
 The same applies to a join's `ON`: a condition on one table moves to that table when the join allows
 it — either side of an inner join, or the side an outer join fills with NULLs. Here `t.id > 5` only

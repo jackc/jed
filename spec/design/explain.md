@@ -133,7 +133,8 @@ Attributes are separated by `; `. A node with no attributes is `-`.
   the post-join residual and is omitted when nothing remains, and a join node's `on:conjuncts=N` /
   `on=<expr>` counts or spells only its residual ON, omitted when nothing remains. A conjunct moved
   into a derived body appears in the body's own plan (its Filter, a pushed filter on its Scan, or its
-  access bound).
+  access bound) — below a grouped body's `Aggregate`, and once under each SELECT of a set operation,
+  in that SELECT's own column slots.
 - A WHERE contradiction ([planner.md](planner.md) §3.1) keeps the complete WHERE on the `Filter` node
   and appends `; contradiction`; every relation below it estimates and charges zero. An UPDATE/DELETE
   contradiction renders the same way: its target `Scan` still names the selected path, and the

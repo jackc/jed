@@ -15,7 +15,8 @@
 //!     side of an INNER join (planner.md §3.3).
 //!
 //! A body pushdown is the one decision that changes a predicate: `plan_select` plans the derived
-//! body again with the moved conjuncts appended to its WHERE (`body_pushes`).
+//! body again with the moved conjuncts appended to its WHERE — to each SELECT of a set operation,
+//! and below a grouped SELECT's grouping (`body_pushes`).
 //!
 //! Rust note: a resolved `RExpr` is not `Clone` (a subquery owns its plan), so a residual cannot be
 //! an owned tree beside the WHERE / ON. It is recorded as the residual conjuncts' positions in the
@@ -127,8 +128,8 @@ pub(crate) struct WherePushdown {
     /// execution (empty: the join has no ON predicate left).
     on_split: Vec<bool>,
     on_residual: Vec<Vec<usize>>,
-    /// `body_pushes[i]`: the conjuncts moved into derived relation `i`'s body, rewritten to the
-    /// body's column slots, in source order. `plan_select` consumes them by planning the body again.
+    /// `body_pushes[i]`: the conjuncts moved into derived relation `i`'s body, rebased to the body's
+    /// output columns, in source order. `plan_select` consumes them by planning the body again.
     body_pushes: Vec<Vec<RExpr>>,
 }
 
@@ -297,7 +298,7 @@ pub(crate) fn rewrite_where(plan: &mut SelectPlan) {
             return;
         }
     }
-    let bodies: Vec<Option<&SelectPlan>> = plan.rels.iter().map(body_pushable).collect();
+    let bodies: Vec<Option<&QueryPlan>> = plan.rels.iter().map(body_pushable).collect();
     // The form a pushdown-safe single-relation conjunct takes (planner.md §3.2): into a
     // body-pushable derived body when every referenced output is a bare body column, else a scan
     // pushdown when the SELECT has another relation to join, else nothing.
@@ -306,7 +307,7 @@ pub(crate) fn rewrite_where(plan: &mut SelectPlan) {
             return None;
         }
         if let Some(body) = bodies[ri]
-            && let Some(moved) = substitute_body_columns(c, plan.rels[ri].offset, body)
+            && let Some(moved) = body_conjunct(c, plan.rels[ri].offset, body)
         {
             return Some((moved, true));
         }
@@ -426,39 +427,85 @@ fn mark_join_nullable(nullable: &mut [bool], kind: JoinKind, k: usize) {
     }
 }
 
-/// A derived relation's body when conjuncts may move into it (planner.md §3.2): a non-lateral single
-/// SELECT with no aggregate/GROUP BY, window function, LIMIT, or OFFSET. `None` otherwise (any other
-/// relation, or a set operation / VALUES / nested WITH body).
-fn body_pushable(rel: &PlanRel) -> Option<&SelectPlan> {
+/// A derived relation's body when conjuncts may move into it (planner.md §3.2): a non-lateral body
+/// that is a body-pushable SELECT or a set operation of them. `None` otherwise (any other relation,
+/// or a VALUES / nested WITH body).
+fn body_pushable(rel: &PlanRel) -> Option<&QueryPlan> {
     if rel.lateral {
         return None;
     }
-    let QueryPlan::Select(body) = rel.derived.as_deref()? else {
-        return None;
-    };
-    if body.is_agg
-        || !body.group_sets.is_empty()
-        || body.having.is_some()
-        || body.has_window
-        || body.limit.is_some()
-        || body.offset.is_some()
-    {
-        return None;
-    }
-    Some(body)
+    let body = rel.derived.as_deref()?;
+    query_body_pushable(body).then_some(body)
 }
 
-/// Clone a pushdown-safe conjunct over a derived relation (whose columns start at `offset`) with
-/// every column replaced by the body column its select-list item names. `None` when a referenced
-/// output is not a bare column of the body.
-fn substitute_body_columns(e: &RExpr, offset: usize, body: &SelectPlan) -> Option<RExpr> {
-    map_pushdown_safe(
-        e,
-        &|slot| match body.projections.get(slot.checked_sub(offset)?)? {
-            RExpr::Column(c) => Some(*c),
-            _ => None,
-        },
-    )
+/// The structural half of body-pushability (planner.md §3.2): a SELECT with no window function,
+/// LIMIT, or OFFSET that is either ungrouped or grouped by exactly one grouping set with at least one
+/// key; or a set operation without LIMIT/OFFSET whose two arms are body-pushable.
+fn query_body_pushable(q: &QueryPlan) -> bool {
+    match q {
+        QueryPlan::Select(b) => {
+            if b.has_window || b.limit.is_some() || b.offset.is_some() {
+                return false;
+            }
+            !b.is_agg || (b.group_sets.len() == 1 && !b.group_keys.is_empty())
+        }
+        QueryPlan::SetOp(so) => {
+            so.limit.is_none()
+                && so.offset.is_none()
+                && query_body_pushable(&so.lhs)
+                && query_body_pushable(&so.rhs)
+        }
+        _ => false,
+    }
+}
+
+/// The FROM slot a body-pushable SELECT's output column `j` reads; `None` when the select-list item
+/// is not a bare column. In a grouped body the item must be a grouping column: a plain input column
+/// of the master grouping list (an expression key's synthetic slot is not).
+fn body_input_column(b: &SelectPlan, j: usize) -> Option<usize> {
+    let RExpr::Column(idx) = b.projections.get(j)? else {
+        return None;
+    };
+    if !b.is_agg {
+        return Some(*idx);
+    }
+    let gk = *b.group_keys.get(*idx)?;
+    let width: usize = b.rels.iter().map(|r| r.col_count).sum();
+    (gk < width).then_some(gk)
+}
+
+/// Whether output column `j` of a body-pushable plan reads a bare body column of type `want` in
+/// every SELECT it combines: a set operation's arms (and its own unified column) must already have
+/// that exact type, so no arm value is widened after the pushed conjunct would have judged it.
+fn body_output_pushable(q: &QueryPlan, j: usize, want: &ResolvedType) -> bool {
+    match q {
+        QueryPlan::Select(b) => body_input_column(b, j).is_some() && b.column_types[j] == *want,
+        QueryPlan::SetOp(so) => {
+            so.column_types[j] == *want
+                && body_output_pushable(&so.lhs, j, want)
+                && body_output_pushable(&so.rhs, j, want)
+        }
+        _ => false,
+    }
+}
+
+/// Clone a pushdown-safe conjunct over a derived relation (whose columns start at `offset`) rebased
+/// to the body's output-column numbering; `None` when a referenced output column is not
+/// body-pushable ([`body_output_pushable`]). `replan_pushed_bodies` later substitutes each output
+/// column with the body column it reads, separately in each set-operation arm.
+fn body_conjunct(e: &RExpr, offset: usize, body: &QueryPlan) -> Option<RExpr> {
+    let types = body.column_types();
+    map_pushdown_safe(e, &|slot| {
+        let j = slot.checked_sub(offset)?;
+        (j < types.len() && body_output_pushable(body, j, &types[j])).then_some(j)
+    })
+}
+
+/// Clone a conjunct in a SELECT body's output-column numbering with every column replaced by the
+/// FROM slot that output reads. [`body_conjunct`] already proved each reference maps.
+pub(crate) fn substitute_body_columns(e: &RExpr, body: &SelectPlan) -> RExpr {
+    map_pushdown_safe(e, &|j| body_input_column(body, j))
+        .expect("body_conjunct proved every output column maps")
 }
 
 /// Flatten a WHERE's top-level AND-chain and apply the plan-time contradiction proof. UPDATE/DELETE

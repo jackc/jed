@@ -1,0 +1,306 @@
+# Predicate pushdown into grouped derived bodies and into every arm of a set operation (spec/design/
+# planner.md §3.2). A pushdown-safe conjunct over a derived table moves into a grouped body when every
+# column it references is a grouping column — a bare input column of the body's single grouping set —
+# and is appended to the body's WHERE, below the grouping: it keeps or drops whole groups, since every
+# member of a group judges it alike. A set-operation body takes the conjunct into each arm when every
+# arm is itself pushable and its referenced columns are bare columns of exactly the unified output
+# type. ROLLUP/CUBE/several grouping sets, an expression grouping key, an aggregate output, a window
+# function, a LIMIT/OFFSET (on the body, an arm, or the set operation), and an arm type that the
+# set operation widens all keep the conjunct outside. The rows are PostgreSQL's; the `# cost:` pins
+# are jed's cross-core contract.
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.column_alias, query.table_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.limit, query.distinct, query.aggregates, query.group_by, query.group_by_expr, query.group_by_functional_dependency, query.grouping_sets, query.having, query.union, query.intersect, query.except, query.derived_table, query.point_lookup, query.composite_pk_pushdown, query.join_pushdown, query.hash_join, query.index_nested_loop, query.where_pushdown, query.derived_pushdown, query.is_null, expr.arithmetic, null.three_valued, types.i32, types.i64, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, k i32, v i32)
+
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, w i32)
+
+statement ok
+CREATE TABLE g (a i32, b i32, c i32, PRIMARY KEY (a, b))
+
+statement ok
+CREATE TABLE n (id i64 PRIMARY KEY)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 10), (2, 2, 20), (3, 3, 30), (4, 1, 40), (5, 2, NULL), (6, 3, 60), (7, 1, 70), (8, 2, 80), (9, 3, 90), (10, 1, 100), (11, 2, 110), (12, NULL, 120)
+
+statement ok
+INSERT INTO u VALUES (1, 10), (2, NULL), (3, 30)
+
+statement ok
+INSERT INTO g VALUES (1, 1, 5), (1, 2, 6), (2, 1, 7), (2, 2, 8), (2, 3, NULL), (3, 1, 9)
+
+statement ok
+INSERT INTO n VALUES (2), (5)
+
+# A conjunct over a grouping column moves below the grouping into the body's WHERE, where it bounds
+# g's primary-key prefix: only the a = 2 rows are read and aggregated.
+# cost: 12
+query II nosort
+SELECT d.a, d.s FROM (SELECT a, sum(c) AS s FROM g GROUP BY a) d WHERE d.a = 2
+----
+2
+15
+
+# The body's HAVING stays in the body and judges only the groups the moved conjunct kept.
+# cost: 45
+query II nosort
+SELECT d.k, d.s FROM (SELECT k, sum(v) AS s FROM t GROUP BY k HAVING sum(v) > 150) d WHERE d.k >= 2 ORDER BY d.k
+----
+2
+210
+3
+180
+
+# An aggregate output column is not a grouping column, so `d.n > 3` stays in the outer WHERE while
+# `d.k IS NOT NULL` moves.
+# cost: 44
+query II nosort
+SELECT d.k, d.n FROM (SELECT k, count(*) AS n FROM t GROUP BY k) d WHERE d.n > 3 AND d.k IS NOT NULL ORDER BY d.k
+----
+1
+4
+2
+4
+
+# The NULL group: grouping keeps NULLs together, and `IS NULL` judges every member alike.
+# cost: 28
+query II nosort
+SELECT d.k, d.n FROM (SELECT k, count(*) AS n FROM t GROUP BY k) d WHERE d.k IS NULL
+----
+NULL
+1
+
+# An expression grouping key is not a bare column of the body, so the conjunct stays outside.
+# cost: 46
+query II nosort
+SELECT d.kk, d.n FROM (SELECT k + 0 AS kk, count(*) AS n FROM t GROUP BY k + 0) d WHERE d.kk = 1
+----
+1
+4
+
+# Neither is an expression over a grouping column.
+# cost: 38
+query II nosort
+SELECT d.kk, d.n FROM (SELECT k * 10 AS kk, count(*) AS n FROM t GROUP BY k) d WHERE d.kk = 10
+----
+10
+4
+
+# Several grouping sets block it: the rolled-up total row has k NULL, and filtering the input
+# would change it.
+# cost: 49
+query II nosort
+SELECT d.k, d.n FROM (SELECT k, count(*) AS n FROM t GROUP BY ROLLUP (k)) d WHERE d.k IS NULL ORDER BY d.n
+----
+NULL
+1
+NULL
+12
+
+# A column grouped through its table's primary key (functional dependency) is a grouping column too.
+# cost: 37
+query III nosort
+SELECT d.id, d.v, d.n FROM (SELECT id, v, count(*) AS n FROM t GROUP BY id) d WHERE d.v > 80 ORDER BY d.id
+----
+9
+90
+1
+10
+100
+1
+11
+110
+1
+12
+120
+1
+
+# A grouped body that joins: the moved conjunct is pushed again inside it, onto u.
+# cost: 37
+query III nosort
+SELECT d.k, d.w, d.n FROM (SELECT t.k, u.w, count(*) AS n FROM t JOIN u ON t.k = u.id GROUP BY t.k, u.w) d WHERE d.w > 10
+----
+3
+30
+3
+
+# A grouped body in a join takes the body form too.
+# cost: 43
+query III nosort
+SELECT d.k, d.n, u.w FROM (SELECT k, count(*) AS n FROM t GROUP BY k) d JOIN u ON d.k = u.id WHERE d.k < 3 ORDER BY d.k
+----
+1
+4
+10
+2
+4
+NULL
+
+# Moving the conjunct skips the k = 3 group, whose aggregate argument divides by zero (v = 30);
+# PostgreSQL pushes the qual the same way.
+# cost: 39
+query II nosort
+SELECT d.k, d.q FROM (SELECT k, sum(60 / (v - 30)) AS q FROM t GROUP BY k) d WHERE d.k = 1
+----
+1
+4
+
+# DISTINCT and ORDER BY in a grouped body do not block the move.
+# cost: 36
+query I nosort
+SELECT d.k FROM (SELECT DISTINCT k, count(*) AS n FROM t GROUP BY k ORDER BY k) d WHERE d.k <> 2 ORDER BY d.k
+----
+1
+3
+
+# The body's own WHERE is kept and the moved conjunct appended to it.
+# cost: 58
+query II nosort
+SELECT d.k, d.n FROM (SELECT k, count(*) AS n FROM t WHERE v > 20 GROUP BY k) d WHERE d.k <= 2 ORDER BY d.k
+----
+1
+3
+2
+2
+
+# Set operations: the conjunct is pushed into every arm, where each seeks its own primary key.
+# cost: 10
+query I nosort
+SELECT s.id FROM (SELECT id FROM t UNION ALL SELECT id FROM u) s WHERE s.id = 2
+----
+2
+2
+
+# UNION deduplicates whole rows, and equal rows judge a pushdown-safe conjunct alike.
+# cost: 48
+query I nosort
+SELECT s.k FROM (SELECT k FROM t UNION SELECT w FROM u) s WHERE s.k < 20 ORDER BY s.k
+----
+1
+2
+3
+10
+
+# NULLs are one class under UNION: the single NULL survives.
+# cost: 35
+query I nosort
+SELECT s.k FROM (SELECT k FROM t UNION SELECT w FROM u) s WHERE s.k IS NULL
+----
+NULL
+
+# INTERSECT: filtering both arms keeps exactly the matching classes the filter admits.
+# cost: 41
+query I nosort
+SELECT s.k FROM (SELECT k FROM t INTERSECT SELECT id FROM u) s WHERE s.k > 1 ORDER BY s.k
+----
+2
+3
+
+# cost: 43
+query I nosort
+SELECT s.k FROM (SELECT k FROM t INTERSECT ALL SELECT id FROM u) s WHERE s.k <> 1 ORDER BY s.k
+----
+2
+3
+
+# EXCEPT ALL: the right arm loses only rows no admitted left row could match, so the counts agree.
+# cost: 44
+query I nosort
+SELECT s.k FROM (SELECT k FROM t EXCEPT ALL SELECT id FROM u) s WHERE s.k >= 2 ORDER BY s.k
+----
+2
+2
+2
+3
+3
+
+# EXCEPT matches NULLs too: t's NULL k is removed by u's NULL w, in either plan.
+# cost: 34
+query I nosort
+SELECT s.k FROM (SELECT k FROM t EXCEPT SELECT w FROM u) s WHERE s.k IS NULL
+----
+
+# Conjuncts over two output columns both move into each arm.
+# cost: 36
+query II nosort
+SELECT s.a, s.b FROM (SELECT id AS a, k AS b FROM t UNION ALL SELECT id, w FROM u) s WHERE s.a < 4 AND s.b IS NOT NULL ORDER BY s.a, s.b
+----
+1
+1
+1
+10
+2
+2
+3
+3
+3
+30
+
+# Nested set operations: the conjunct reaches every SELECT of the tree.
+# cost: 51
+query I nosort
+SELECT s.id FROM (SELECT id FROM t UNION ALL SELECT id FROM u INTERSECT SELECT k FROM t) s WHERE s.id <= 2 ORDER BY s.id
+----
+1
+1
+2
+2
+
+# An arm whose column type differs from the unified output type (i32 widened to i64) blocks it:
+# the conjunct stays outside.
+# cost: 46
+query I nosort
+SELECT s.id FROM (SELECT id FROM t UNION ALL SELECT id FROM n) s WHERE s.id = 2
+----
+2
+2
+
+# A LIMIT on the set operation blocks it: the first three rows are chosen before the outer filter.
+# cost: 36
+query I nosort
+SELECT s.id FROM (SELECT id FROM t UNION ALL SELECT id FROM u ORDER BY id LIMIT 3) s WHERE s.id > 1
+----
+2
+
+# A set-operation ORDER BY without LIMIT does not.
+# cost: 10
+query I nosort
+SELECT s.id FROM (SELECT id FROM t UNION ALL SELECT id FROM u ORDER BY id) s WHERE s.id >= 11 ORDER BY s.id
+----
+11
+12
+
+# A grouped arm takes the conjunct below its grouping.
+# cost: 35
+query II nosort
+SELECT s.k, s.n FROM (SELECT k, count(*) AS n FROM t GROUP BY k UNION ALL SELECT id, w FROM u) s WHERE s.k = 3 ORDER BY s.n
+----
+3
+3
+3
+30
+
+# An arm whose output is not a bare column blocks it for every arm.
+# cost: 52
+query I nosort
+SELECT s.id FROM (SELECT id FROM t UNION ALL SELECT id + 0 FROM u) s WHERE s.id = 2
+----
+2
+2
+
+# Moving the conjunct into the arm skips the arm's select-list error at id = 3.
+# cost: 8
+query II nosort
+SELECT s.id, s.q FROM (SELECT id, 60 / (id - 3) AS q FROM t UNION ALL SELECT id, w FROM u) s WHERE s.id = 5
+----
+5
+30
+
+# Through a derived SELECT into the set operation below it.
+# cost: 10
+query I nosort
+SELECT * FROM (SELECT * FROM (SELECT id FROM t UNION SELECT id FROM u) x) y WHERE y.id = 3
+----
+3

@@ -96,6 +96,11 @@
 #              on to the body's own scans), or onto a CTE reference / SRF in a join (planner.md §3.2);
 #              `col + 0` keeps them outside. Bodies with LIMIT, DISTINCT, an own WHERE, a join, and a
 #              NULL-extended derived table must match by-construction rows.
+#   grouped_setop_pushdown — conjuncts over a grouped body's grouping columns move below its grouping,
+#              and conjuncts over a set operation move into every arm (planner.md §3.2); `col + 0`
+#              keeps them outside. Grouped bodies (HAVING, joined), a never-pushed ROLLUP body, all
+#              six set operators, and a grouped arm over NULL-bearing data must match by-construction
+#              rows.
 #   contradiction — a provably-never-TRUE bare-column literal AND-chain reads no relation
 #              (planner.md §3.1); the same predicate over `col + 0` is not proven and scans. Both must be
 #              empty (an ungrouped COUNT returns 0), and satisfiable near-miss ranges must match.
@@ -342,6 +347,14 @@ DERIVED_PUSHDOWN_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert
                           query.is_distinct_from query.where_pushdown query.derived_pushdown
                           query.derived_table expr.arithmetic expr.between expr.comparison_value
                           null.three_valued types.i32].freeze
+GROUPED_SETOP_PUSHDOWN_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row
+                                query.select query.where_eq query.comparison_order
+                                query.logical_connectives query.order_by query.order_by_keys
+                                query.qualified_column query.join_inner query.aggregates query.group_by
+                                query.grouping_sets query.having query.union query.intersect query.except
+                                query.is_null query.is_distinct_from query.where_pushdown
+                                query.derived_pushdown query.derived_table expr.arithmetic expr.between
+                                expr.comparison_value null.three_valued types.i32].freeze
 CONTRADICTION_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
                        query.where_eq query.comparison_order query.logical_connectives query.order_by
                        query.aggregates query.qualified_column query.join_inner
@@ -2880,6 +2893,109 @@ def gen_derived_pushdown(seed)
   out.join("\n") + "\n"
 end
 
+# Pushdown into grouped bodies and set-operation arms (planner.md §3.2). A conjunct over a grouping
+# column moves below the grouping; a conjunct over a set operation's output moves into every arm. The
+# `+ 0` spelling never moves. Grouped bodies (with HAVING, and joined to u), a ROLLUP body (never
+# pushed: the total row's NULL key must be judged after grouping), and every set operator over
+# NULL-bearing data must match by-construction rows.
+def gen_grouped_setop_pushdown(seed)
+  rng = Random.new(seed)
+  val = -> { rng.rand < 0.2 ? nil : rng.rand(0..10) }
+  t = (1..30).to_a.sample(10, random: rng).sort.map { |id| [id, rng.rand < 0.15 ? nil : rng.rand(1..5), val.call] }
+  u = (1..6).to_a.sample(4, random: rng).sort.map { |id| [id, val.call] }
+  lit = ->(x) { x.nil? ? "NULL" : x.to_s }
+  nkey = ->(x) { x.nil? ? [1, 0] : [0, x] }
+  flat = lambda do |rows|
+    rows.sort_by { |r| r.flat_map { |x| nkey.call(x) } }.flat_map { |r| r.map { |x| lit.call(x) } }
+  end
+  pick = lambda do |col|
+    sql, fn = WHERE_PUSHDOWN_TEMPLATES.sample(random: rng).call(col, rng)
+    [sql, fn, sql.gsub(col, "#{col} + 0")]
+  end
+  pair = lambda do |out, cols, sql, exp|
+    out << "# pushed spelling"
+    q(out, cols, sql.call(0), flat.call(exp))
+    out << "# `+ 0` spelling is never pushed — MUST match"
+    q(out, cols, sql.call(1), flat.call(exp))
+  end
+  # The groups of t by k (NULL is one group), in first-appearance order: [k, rows].
+  groups = t.group_by { |_, k, _| k }.to_a
+  sum = ->(xs) { (vs = xs.compact).empty? ? nil : vs.sum }
+
+  out = header(seed, GROUPED_SETOP_PUSHDOWN_REQ, "pushdown into grouped bodies and set-operation arms")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, k i32, v i32)")
+  stmt(out, "CREATE TABLE u (id i32 PRIMARY KEY, w i32)")
+  stmt(out, "INSERT INTO t VALUES #{t.map { |id, k, v| "(#{id}, #{lit.call(k)}, #{lit.call(v)})" }.join(', ')}")
+  stmt(out, "INSERT INTO u VALUES #{u.map { |id, w| "(#{id}, #{lit.call(w)})" }.join(', ')}")
+
+  pk_sql, pk, pk_scan = pick.call("d.k")
+  exp = groups.select { |k, _| pk.call(k) == true }.map { |k, rows| [k, rows.size, sum.call(rows.map { |r| r[2] })] }
+  out << "# a grouped body: the grouping-column conjunct moves below the grouping"
+  pair.call(out, "III", lambda { |m|
+    "SELECT d.k, d.n, d.s FROM (SELECT k, count(*) AS n, sum(v) AS s FROM t GROUP BY k) d " \
+      "WHERE #{[pk_sql, pk_scan][m]} ORDER BY d.k, d.n, d.s"
+  }, exp)
+
+  pk_sql, pk, pk_scan = pick.call("d.k")
+  exp = groups.select { |k, rows| rows.size >= 2 && pk.call(k) == true }.map { |k, rows| [k, rows.size] }
+  out << "# a grouped body with HAVING"
+  pair.call(out, "II", lambda { |m|
+    "SELECT d.k, d.n FROM (SELECT k, count(*) AS n FROM t GROUP BY k HAVING count(*) >= 2) d " \
+      "WHERE #{[pk_sql, pk_scan][m]} ORDER BY d.k, d.n"
+  }, exp)
+
+  pk_sql, pk, pk_scan = pick.call("d.k")
+  exp = groups.select { |k, _| pk.call(k) == true }
+              .flat_map { |k, rows| u.select { |ur| ur[0] == k }.map { |ur| [k, rows.size, ur[1]] } }
+  out << "# a grouped body joined to u"
+  pair.call(out, "III", lambda { |m|
+    "SELECT d.k, d.n, u.w FROM (SELECT k, count(*) AS n FROM t GROUP BY k) d JOIN u ON d.k = u.id " \
+      "WHERE #{[pk_sql, pk_scan][m]} ORDER BY d.k, d.n, u.w"
+  }, exp)
+
+  pk_sql, pk, pk_scan = pick.call("d.k")
+  exp = (groups.map { |k, rows| [k, rows.size] } + [[nil, t.size]]).select { |k, _| pk.call(k) == true }
+  out << "# ROLLUP: never pushed (the total row's NULL key is judged after grouping)"
+  pair.call(out, "II", lambda { |m|
+    "SELECT d.k, d.n FROM (SELECT k, count(*) AS n FROM t GROUP BY ROLLUP (k)) d " \
+      "WHERE #{[pk_sql, pk_scan][m]} ORDER BY d.k, d.n"
+  }, exp)
+
+  # Set operations over t.k and u.w (both i32, both NULL-bearing). Multisets keep NULL as one value.
+  left = t.map { |_, k, _| k }
+  right = u.map { |_, w| w }
+  count = ->(xs, x) { xs.count { |y| y == x } }
+  ops = {
+    "UNION ALL" => -> { left + right },
+    "UNION" => -> { (left + right).uniq },
+    "INTERSECT" => -> { left.uniq.select { |x| right.include?(x) } },
+    "INTERSECT ALL" => -> { left.uniq.flat_map { |x| [x] * [count.call(left, x), count.call(right, x)].min } },
+    "EXCEPT" => -> { left.uniq.reject { |x| right.include?(x) } },
+    "EXCEPT ALL" => -> { left.uniq.flat_map { |x| [x] * [count.call(left, x) - count.call(right, x), 0].max } },
+  }
+  ops.each do |op, combine|
+    px_sql, px, px_scan = pick.call("s.x")
+    exp = combine.call.select { |x| px.call(x) == true }.map { |x| [x] }
+    out << "# #{op}: the conjunct moves into both arms"
+    pair.call(out, "I", lambda { |m|
+      "SELECT s.x FROM (SELECT k AS x FROM t #{op} SELECT w FROM u) s WHERE #{[px_sql, px_scan][m]} ORDER BY s.x"
+    }, exp)
+  end
+
+  pa_sql, pa, pa_scan = pick.call("s.a")
+  pb_sql, pb, pb_scan = pick.call("s.b")
+  arm1 = groups.map { |k, rows| [k, rows.size] }
+  arm2 = u.map { |id, w| [id, w] }
+  exp = (arm1 + arm2).select { |a, b| pa.call(a) == true && pb.call(b) == true }
+  out << "# a grouped arm UNION ALL a plain arm, one conjunct per output column"
+  pair.call(out, "II", lambda { |m|
+    "SELECT s.a, s.b FROM (SELECT k AS a, count(*) AS b FROM t GROUP BY k UNION ALL SELECT id, w FROM u) s " \
+      "WHERE #{[pa_sql, pa_scan][m]} AND #{[pb_sql, pb_scan][m]} ORDER BY s.a, s.b"
+  }, exp)
+
+  out.join("\n") + "\n"
+end
+
 SCENARIOS = {
   "pushdown" => method(:gen_pushdown),
   "composite_pk" => method(:gen_composite_pk),
@@ -2925,6 +3041,7 @@ SCENARIOS = {
   "dml_contradiction" => method(:gen_dml_contradiction),
   "on_pushdown" => method(:gen_on_pushdown),
   "derived_pushdown" => method(:gen_derived_pushdown),
+  "grouped_setop_pushdown" => method(:gen_grouped_setop_pushdown),
 }.freeze
 
 # Run one core's harness once; return {basename => "PASS"/"FAIL"/"SKIP"} and the detail line per

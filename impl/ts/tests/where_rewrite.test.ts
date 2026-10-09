@@ -69,8 +69,8 @@ test("where pushdown: bound parameters filter inside the scan and charge like li
   }
 });
 
-// A bound parameter in a conjunct moved into a derived body (planner.md §3.2) or pushed from an ON
-// (§3.3) reads the bound value where it now runs, charges exactly like the literal spelling, and a
+// A bound parameter in a conjunct moved into a derived body — below a grouped body's grouping, and
+// into every set-operation arm (planner.md §3.2) — or pushed from an ON (§3.3) reads the bound value where it now runs, charges exactly like the literal spelling, and a
 // prepared statement's cached plan keeps the rewrite (the body was planned again once, before bind).
 test("derived and ON pushdown: bound parameters charge like literals", () => {
   const db = new Engine();
@@ -84,6 +84,20 @@ test("derived and ON pushdown: bound parameters charge like literals", () => {
       literal: "SELECT d.id FROM (SELECT id, v FROM a) d WHERE d.id = 2",
       value: 2n,
       want: [2n],
+    },
+    {
+      param: "SELECT d.k FROM (SELECT k, count(*) AS n FROM a GROUP BY k) d WHERE d.k = $1",
+      literal: "SELECT d.k FROM (SELECT k, count(*) AS n FROM a GROUP BY k) d WHERE d.k = 2",
+      value: 2n,
+      want: [2n],
+    },
+    {
+      param:
+        "SELECT s.id FROM (SELECT id FROM a UNION ALL SELECT id FROM b) s WHERE s.id >= $1 ORDER BY s.id",
+      literal:
+        "SELECT s.id FROM (SELECT id FROM a UNION ALL SELECT id FROM b) s WHERE s.id >= 12 ORDER BY s.id",
+      value: 12n,
+      want: [12n, 13n, 14n, 15n],
     },
     {
       param:

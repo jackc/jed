@@ -108,6 +108,7 @@ import {
   pushedFilter,
   refreshPushdownResiduals,
   rewriteWhere,
+  substituteBodyColumns,
   whereContradicts,
   whereContradiction,
 } from "./rewrite.ts";
@@ -13471,9 +13472,15 @@ export class Engine {
     pd.bodyPushes.forEach((pushed, i) => {
       if (pushed.length === 0) return;
       const refs = ctes.map((b) => b.refs);
-      let body: SelectPlan;
+      let body: QueryPlan;
       try {
-        body = this.planSelectPushed(tableRefs[i]!.subquery as Select, null, ctes, ptypes, pushed);
+        body = this.replanPushedQuery(
+          tableRefs[i]!.subquery!,
+          plan.rels[i]!.derived!,
+          pushed,
+          ctes,
+          ptypes,
+        );
       } finally {
         ctes.forEach((b, ci) => {
           b.refs = refs[ci]!;
@@ -13482,6 +13489,31 @@ export class Engine {
       plan.rels[i]!.derived = body;
     });
     pd.bodyPushes = null;
+  }
+
+  // replanPushedQuery plans a body-pushable query expression again with conjuncts in its
+  // output-column numbering pushed into it: a SELECT gets them substituted to the FROM slots its
+  // outputs read (below its grouping, when grouped) and appended to its WHERE; a set operation pushes
+  // them into each arm and keeps its own unified types, ORDER BY, and operator. first is the
+  // expression's first plan, whose output mapping the replanned SELECT reproduces.
+  private replanPushedQuery(
+    qe: QueryExpr,
+    first: QueryPlan,
+    pushed: RExpr[],
+    ctes: CteBinding[],
+    ptypes: ParamTypes,
+  ): QueryPlan {
+    if (first.kind === "select") {
+      const moved = pushed.map((c) => substituteBodyColumns(c, first));
+      return this.planSelectPushed(qe as Select, null, ctes, ptypes, moved);
+    }
+    const so = first as SetOpPlan;
+    const syntax = qe as SetOp;
+    return {
+      ...so,
+      lhs: this.replanPushedQuery(syntax.lhs, so.lhs, pushed, ctes, ptypes),
+      rhs: this.replanPushedQuery(syntax.rhs, so.rhs, pushed, ctes, ptypes),
+    };
   }
 
   // resolveSRF resolves a FROM-clause set-returning function call (generate_series(...)) into a

@@ -186,9 +186,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     side of INNER, the NULL-extended side of LEFT/RIGHT; a pushed ON conjunct is also an access-path
     input for its relation). [planner.md §3.2–§3.3](spec/design/planner.md); NoREC `on_pushdown` and
     `derived_pushdown`.
+  - [x] _follow-on:_ push into **grouped bodies** (a conjunct over bare-input grouping columns of a
+    single grouping set moves below the grouping into the body's WHERE; ROLLUP/CUBE/several sets,
+    expression keys, and aggregate outputs stay outside) and into **every set-operation arm** (all six
+    operators, nested; each arm's column must be bare and of exactly the unified output type).
+    [planner.md §3.2](spec/design/planner.md); NoREC `grouped_setop_pushdown`.
   - [ ] _follow-on:_ push into **inlined CTE bodies** (needs per-reference body specialization: the
-    inline/materialize mode is decided after the referencing query is planned), **grouped bodies**
-    (conjuncts over grouping columns into the body's WHERE), and each **set-operation arm**.
+    inline/materialize mode is decided after the referencing query is planned), **below a window**
+    (a conjunct over every PARTITION BY column), and into a **widened set-operation arm** (would need
+    the conjunct re-resolved at the arm's type).
   - [x] _follow-on:_ **contradiction proofs for UPDATE/DELETE** (`dml.where_contradiction`) — the
     SELECT proof over the target's resolved, unfolded WHERE; a proven mutation reads no target page
     or row and evaluates no WHERE/SET/CHECK/RETURNING item, while uncorrelated subqueries still fold

@@ -17,10 +17,11 @@
 //     side of an INNER join (planner.md §3.3).
 //
 // A body pushdown is the one decision that changes a predicate: planSelect plans the derived body
-// again with the moved conjuncts appended to its WHERE (bodyPushes).
+// again with the moved conjuncts appended to its WHERE — to each SELECT of a set operation, and
+// below a grouped SELECT's grouping (bodyPushes).
 
 import type { JoinKind } from "./ast.ts";
-import type { PlanRel, RExpr, SelectPlan } from "./executor.ts";
+import type { PlanRel, QueryPlan, RExpr, ResolvedType, SelectPlan } from "./executor.ts";
 import {
   estimatorComparisonParts,
   estimatorComparisonSatisfied,
@@ -28,6 +29,7 @@ import {
   estimatorFlattenBoolean,
   estimatorLiteral,
   estimatorLiteralCmp,
+  resolvedTypeEqual,
 } from "./executor.ts";
 
 // WherePushdown is the stage-2 predicate split. relFilters / relLocal hold one entry per relation
@@ -53,8 +55,8 @@ export type WherePushdown = {
   onSplit: boolean[];
   onResidual: (RExpr | null)[];
   onMoved: boolean[][];
-  // bodyPushes[i] is the conjuncts moved into derived relation i's body, rewritten to the body's
-  // column slots, in source order. planSelect consumes it by planning the body again (null after).
+  // bodyPushes[i] is the conjuncts moved into derived relation i's body, rebased to the body's
+  // output columns, in source order. planSelect consumes it by planning the body again (null after).
   bodyPushes: RExpr[][] | null;
   // access is the stage-3 access predicate when an ON conjunct was scan-pushed: the complete WHERE
   // AND each scan-pushed ON conjunct in source order (null: the access predicate is the WHERE).
@@ -147,7 +149,7 @@ export function rewriteWhere(plan: SelectPlan): void {
     if (plan.rels[ri]!.lateral === true || !pushdownSafe(c)) return null;
     const body = bodies[ri];
     if (body !== null && body !== undefined) {
-      const moved = substituteBodyColumns(c, plan.rels[ri]!.offset, body);
+      const moved = bodyConjunct(c, plan.rels[ri]!.offset, body);
       if (moved !== null) return { expr: moved, ri, body: true, on: false };
     }
     if (plan.rels.length < 2) return null;
@@ -302,64 +304,122 @@ function markJoinNullable(nullable: boolean[], kind: JoinKind, k: number): void 
 }
 
 // bodyPushable returns a derived relation's body when conjuncts may move into it (planner.md §3.2):
-// a non-lateral single SELECT with no aggregate/GROUP BY, window function, LIMIT, or OFFSET. null
-// otherwise (any other relation, or a set operation / VALUES / nested WITH body).
-function bodyPushable(rel: PlanRel): SelectPlan | null {
-  if (rel.derived === undefined || rel.lateral === true || rel.derived.kind !== "select")
-    return null;
-  const body = rel.derived;
-  if (
-    body.isAgg ||
-    body.groupSets.length > 0 ||
-    body.having !== null ||
-    body.hasWindow ||
-    body.limit !== null ||
-    body.offset !== null
-  ) {
+// a non-lateral body that is a body-pushable SELECT or a set operation of them. null otherwise (any
+// other relation, or a VALUES / nested WITH body).
+function bodyPushable(rel: PlanRel): QueryPlan | null {
+  if (rel.derived === undefined || rel.lateral === true || !queryBodyPushable(rel.derived)) {
     return null;
   }
-  return body;
+  return rel.derived;
 }
 
-// substituteBodyColumns clones a pushdown-safe conjunct over a derived relation (whose columns start
-// at offset) with every column replaced by the body column its select-list item names. null when a
-// referenced output is not a bare column of the body. Only the pushdownSafe node kinds reach it;
-// their leaves (literals, parameters) are shared, never mutated.
-function substituteBodyColumns(e: RExpr, offset: number, body: SelectPlan): RExpr | null {
+// queryBodyPushable is the structural half of body-pushability (planner.md §3.2): a SELECT with no
+// window function, LIMIT, or OFFSET that is either ungrouped or grouped by exactly one grouping set
+// with at least one key; or a set operation without LIMIT/OFFSET whose two arms are body-pushable.
+function queryBodyPushable(q: QueryPlan): boolean {
+  switch (q.kind) {
+    case "select":
+      if (q.hasWindow || q.limit !== null || q.offset !== null) return false;
+      return !q.isAgg || (q.groupSets.length === 1 && q.groupKeys.length > 0);
+    case "setOp":
+      return (
+        q.limit === null &&
+        q.offset === null &&
+        queryBodyPushable(q.lhs) &&
+        queryBodyPushable(q.rhs)
+      );
+    default:
+      return false;
+  }
+}
+
+// bodyInputColumn returns the FROM slot a body-pushable SELECT's output column j reads, null when
+// the select-list item is not a bare column. In a grouped body the item must be a grouping column: a
+// plain input column of the master grouping list (an expression key's synthetic slot is not).
+function bodyInputColumn(b: SelectPlan, j: number): number | null {
+  const item = b.projections[j];
+  if (item === undefined || item.kind !== "column") return null;
+  if (!b.isAgg) return item.index;
+  const gk = b.groupKeys[item.index];
+  if (gk === undefined) return null;
+  let width = 0;
+  for (const rel of b.rels) width += rel.colCount;
+  return gk < width ? gk : null;
+}
+
+// bodyOutputPushable reports whether output column j of a body-pushable plan reads a bare body
+// column of type want in every SELECT it combines: a set operation's arms (and its own unified
+// column) must already have that exact type, so no arm value is widened after the pushed conjunct
+// would have judged it.
+function bodyOutputPushable(q: QueryPlan, j: number, want: ResolvedType): boolean {
+  switch (q.kind) {
+    case "select":
+      return bodyInputColumn(q, j) !== null && resolvedTypeEqual(q.columnTypes[j]!, want);
+    case "setOp":
+      return (
+        resolvedTypeEqual(q.columnTypes[j]!, want) &&
+        bodyOutputPushable(q.lhs, j, want) &&
+        bodyOutputPushable(q.rhs, j, want)
+      );
+    default:
+      return false;
+  }
+}
+
+// bodyConjunct returns a pushdown-safe conjunct over a derived relation (whose columns start at
+// offset) rebased to the body's output-column numbering, null when a referenced output column is not
+// body-pushable (bodyOutputPushable). replanPushedBodies later substitutes each output column with
+// the body column it reads, separately in each set-operation arm.
+function bodyConjunct(c: RExpr, offset: number, body: QueryPlan): RExpr | null {
+  const types = body.columnTypes;
+  let ok = true;
+  const walk = (e: RExpr): void => {
+    if (!ok) return;
+    switch (e.kind) {
+      case "column": {
+        const j = e.index - offset;
+        ok = j >= 0 && j < types.length && bodyOutputPushable(body, j, types[j]!);
+        return;
+      }
+      case "and":
+      case "or":
+      case "compare":
+      case "distinct":
+        walk(e.lhs);
+        walk(e.rhs);
+        return;
+      case "not":
+      case "isNull":
+        walk(e.operand);
+        return;
+      default:
+        return;
+    }
+  };
+  walk(c);
+  return ok ? rebaseColumns(c, offset) : null;
+}
+
+// substituteBodyColumns clones a conjunct in a SELECT body's output-column numbering with every
+// column replaced by the FROM slot that output reads. bodyConjunct already proved each reference
+// maps. Only the pushdownSafe node kinds reach it; their leaves (literals, parameters) are shared,
+// never mutated.
+export function substituteBodyColumns(e: RExpr, body: SelectPlan): RExpr {
   switch (e.kind) {
-    case "column": {
-      const j = e.index - offset;
-      if (j < 0 || j >= body.projections.length) return null;
-      const item = body.projections[j]!;
-      if (item.kind !== "column") return null;
-      return { ...item };
-    }
+    case "column":
+      return { ...e, index: bodyInputColumn(body, e.index)! };
     case "and":
-    case "or": {
-      const lhs = substituteBodyColumns(e.lhs, offset, body);
-      if (lhs === null) return null;
-      const rhs = substituteBodyColumns(e.rhs, offset, body);
-      if (rhs === null) return null;
-      return { ...e, lhs, rhs };
-    }
-    case "not": {
-      const operand = substituteBodyColumns(e.operand, offset, body);
-      if (operand === null) return null;
-      return { ...e, operand };
-    }
+    case "or":
     case "compare":
-    case "distinct": {
-      const lhs = substituteBodyColumns(e.lhs, offset, body);
-      if (lhs === null) return null;
-      const rhs = substituteBodyColumns(e.rhs, offset, body);
-      if (rhs === null) return null;
-      return { ...e, lhs, rhs };
-    }
-    case "isNull": {
-      const operand = substituteBodyColumns(e.operand, offset, body);
-      if (operand === null) return null;
-      return { ...e, operand };
-    }
+    case "distinct":
+      return {
+        ...e,
+        lhs: substituteBodyColumns(e.lhs, body),
+        rhs: substituteBodyColumns(e.rhs, body),
+      };
+    case "not":
+    case "isNull":
+      return { ...e, operand: substituteBodyColumns(e.operand, body) };
     default:
       return e;
   }

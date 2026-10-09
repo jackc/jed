@@ -1277,17 +1277,74 @@ impl Engine {
             if pushed.is_empty() {
                 continue;
             }
-            let Some(QueryExpr::Select(body_sel)) = from_items[i].subquery.as_deref() else {
-                unreachable!("a body-pushed relation is a derived SELECT")
+            let Some(body_expr) = from_items[i].subquery.as_deref() else {
+                unreachable!("a body-pushed relation is a derived table")
             };
+            let first = plan.rels[i]
+                .derived
+                .take()
+                .expect("a body-pushed relation has a planned body");
             let refs: Vec<usize> = ctes.iter().map(|b| b.refs.get()).collect();
-            let body = self.plan_select_pushed(body_sel, None, ctes, ptypes, pushed);
+            let body = self.replan_pushed_query(body_expr, *first, &pushed, ctes, ptypes);
             for (b, r) in ctes.iter().zip(refs) {
                 b.refs.set(r);
             }
-            plan.rels[i].derived = Some(Box::new(QueryPlan::Select(body?)));
+            plan.rels[i].derived = Some(Box::new(body?));
         }
         Ok(())
+    }
+
+    /// Plan a body-pushable query expression again with conjuncts in its output-column numbering
+    /// pushed into it: a SELECT gets them substituted to the FROM slots its outputs read (below its
+    /// grouping, when grouped) and appended to its WHERE; a set operation pushes them into each arm
+    /// and keeps its own unified types, ORDER BY, and operator. `first` is the expression's first
+    /// plan, whose output mapping the replanned SELECT reproduces.
+    fn replan_pushed_query<'a>(
+        &'a self,
+        qe: &QueryExpr,
+        first: QueryPlan,
+        pushed: &[RExpr],
+        ctes: &'a [&'a CteBinding],
+        ptypes: &mut ParamTypes,
+    ) -> Result<QueryPlan> {
+        match (qe, first) {
+            (QueryExpr::Select(sel), QueryPlan::Select(first)) => {
+                let moved = pushed
+                    .iter()
+                    .map(|c| substitute_body_columns(c, &first))
+                    .collect();
+                Ok(QueryPlan::Select(
+                    self.plan_select_pushed(sel, None, ctes, ptypes, moved)?,
+                ))
+            }
+            (QueryExpr::SetOp(so), QueryPlan::SetOp(first)) => {
+                let SetOpPlan {
+                    op,
+                    all,
+                    lhs,
+                    rhs,
+                    column_names,
+                    column_types,
+                    order,
+                    limit,
+                    offset,
+                } = *first;
+                let lhs = self.replan_pushed_query(&so.lhs, lhs, pushed, ctes, ptypes)?;
+                let rhs = self.replan_pushed_query(&so.rhs, rhs, pushed, ctes, ptypes)?;
+                Ok(QueryPlan::SetOp(Box::new(SetOpPlan {
+                    op,
+                    all,
+                    lhs,
+                    rhs,
+                    column_names,
+                    column_types,
+                    order,
+                    limit,
+                    offset,
+                })))
+            }
+            _ => unreachable!("a body-pushed query is a SELECT or a set operation of them"),
+        }
     }
 }
 

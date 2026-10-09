@@ -83,8 +83,8 @@ fn ids(rows: &[Vec<Value>]) -> Vec<i64> {
         .collect()
 }
 
-/// A bound parameter in a conjunct moved into a derived body (planner.md §3.2) or pushed from an ON
-/// (§3.3) reads the bound value where it now runs, charges exactly like the literal spelling, and a
+/// A bound parameter in a conjunct moved into a derived body — below a grouped body's grouping, and
+/// into every set-operation arm (planner.md §3.2) — or pushed from an ON (§3.3) reads the bound value where it now runs, charges exactly like the literal spelling, and a
 /// prepared statement's cached plan keeps the rewrite (the body was planned again once, before bind).
 #[test]
 fn derived_and_on_pushdown_bound_parameters() {
@@ -99,12 +99,24 @@ fn derived_and_on_pushdown_bound_parameters() {
     ] {
         s.query_outcome(sql, &[]).unwrap();
     }
-    let cases: [(&str, &str, i64, Vec<i64>); 2] = [
+    let cases: [(&str, &str, i64, Vec<i64>); 4] = [
         (
             "SELECT d.id FROM (SELECT id, v FROM a) d WHERE d.id = $1",
             "SELECT d.id FROM (SELECT id, v FROM a) d WHERE d.id = 2",
             2,
             vec![2],
+        ),
+        (
+            "SELECT d.k FROM (SELECT k, count(*) AS n FROM a GROUP BY k) d WHERE d.k = $1",
+            "SELECT d.k FROM (SELECT k, count(*) AS n FROM a GROUP BY k) d WHERE d.k = 2",
+            2,
+            vec![2],
+        ),
+        (
+            "SELECT s.id FROM (SELECT id FROM a UNION ALL SELECT id FROM b) s WHERE s.id >= $1 ORDER BY s.id",
+            "SELECT s.id FROM (SELECT id FROM a UNION ALL SELECT id FROM b) s WHERE s.id >= 12 ORDER BY s.id",
+            12,
+            vec![12, 13, 14, 15],
         ),
         (
             "SELECT a.id FROM a LEFT JOIN b ON a.k = b.k AND b.w > $1 WHERE b.id IS NOT NULL ORDER BY a.id",

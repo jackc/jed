@@ -62,8 +62,8 @@ func TestWherePushdownBoundParameters(t *testing.T) {
 	}
 }
 
-// A bound parameter in a conjunct moved into a derived body (planner.md §3.2) or pushed from an ON
-// (§3.3) reads the bound value where it now runs, charges exactly like the literal spelling, and a
+// A bound parameter in a conjunct moved into a derived body — below a grouped body's grouping, and
+// into every set-operation arm (planner.md §3.2) — or pushed from an ON (§3.3) reads the bound value where it now runs, charges exactly like the literal spelling, and a
 // prepared statement's cached plan keeps the rewrite (the body was planned again once, before bind).
 func TestDerivedAndOnPushdownBoundParameters(t *testing.T) {
 	t.Parallel()
@@ -83,6 +83,16 @@ func TestDerivedAndOnPushdownBoundParameters(t *testing.T) {
 			param:   "SELECT d.id FROM (SELECT id, v FROM a) d WHERE d.id = $1",
 			literal: "SELECT d.id FROM (SELECT id, v FROM a) d WHERE d.id = 2",
 			value:   2, want: []int64{2},
+		},
+		{
+			param:   "SELECT d.k FROM (SELECT k, count(*) AS n FROM a GROUP BY k) d WHERE d.k = $1",
+			literal: "SELECT d.k FROM (SELECT k, count(*) AS n FROM a GROUP BY k) d WHERE d.k = 2",
+			value:   2, want: []int64{2},
+		},
+		{
+			param:   "SELECT s.id FROM (SELECT id FROM a UNION ALL SELECT id FROM b) s WHERE s.id >= $1 ORDER BY s.id",
+			literal: "SELECT s.id FROM (SELECT id FROM a UNION ALL SELECT id FROM b) s WHERE s.id >= 12 ORDER BY s.id",
+			value:   12, want: []int64{12, 13, 14, 15},
 		},
 		{
 			param:   "SELECT a.id FROM a LEFT JOIN b ON a.k = b.k AND b.w > $1 WHERE b.id IS NOT NULL ORDER BY a.id",

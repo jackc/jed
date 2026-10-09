@@ -404,7 +404,8 @@ The following attribution rules close the remaining current-plan shapes:
   outer rows then applies as for any INL inner. On a derived table, CTE reference, SRF, or catalog
   relation with produced rows `P` and logical rows `N`, the node adds `nodes(F) × P` `operator_eval`
   and its logical and delivered rows become `F`'s selectivity applied to `N`, capped by `P`. A
-  conjunct moved into a derived body is simply part of the body's own WHERE, estimated there;
+  conjunct moved into a derived body is simply part of the body's own WHERE, estimated there (below a
+  grouped body's grouping, and in each SELECT of a set operation);
 - the access path estimate of a base relation reads the **access predicate**: the complete WHERE
   plus every ON conjunct scan-pushed to a relation, so a pushed ON conjunct can bound, and shape the
   candidate estimate of, its relation exactly like a WHERE conjunct;

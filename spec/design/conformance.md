@@ -517,7 +517,10 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   defeated by `col + 0`; **derived_pushdown** — conjuncts moved into derived bodies (with their own
   WHERE, DISTINCT, a join; never through LIMIT) or onto a CTE reference / SRF in a join, and a
   NULL-extended derived table that must keep its conjunct ([planner.md §3.2](planner.md)), defeated by
-  `col + 0`; **contradiction** — a plan-time-proven
+  `col + 0`; **grouped_setop_pushdown** — conjuncts moved below a grouped body's grouping (with
+  HAVING, joined to another table) and into every arm of each of the six set operators and a grouped
+  arm, over NULL-bearing keys, plus a ROLLUP body that must keep its conjunct
+  ([planner.md §3.2](planner.md)), defeated by `col + 0`; **contradiction** — a plan-time-proven
   empty bare-column literal AND-chain reads nothing ([planner.md §3.1](planner.md)) and must agree with
   the unproven `col + 0` spelling (empty rows, a zero ungrouped COUNT), plus satisfiable near-miss
   ranges; **dml_contradiction** — UPDATE/DELETE whose WHERE is a proven contradiction read nothing,

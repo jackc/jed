@@ -121,6 +121,25 @@ lane was not re-run in this environment. Timings remain non-gating; the shared c
 oracle-checked rows, and the `on_pushdown` / `derived_pushdown` NoREC relations are the correctness
 proof.
 
+**Grouped-body and set-operation pushdown result (2026-10-09).** `grouped_pushdown_pk` reads
+`SELECT … FROM (SELECT g, count(*), max(v) FROM t GROUP BY g) d WHERE d.g = 500` over 100k rows
+keyed `(g, id)`; moved below the grouping, the conjunct bounds the primary-key prefix and only one
+100-row group is read and aggregated. `setop_pushdown_pk` reads `WHERE s.id = 50000 ORDER BY s.v`
+over a UNION ALL of two 100k-row tables; moved into both arms, it seeks each primary key. (The
+`ORDER BY` is required: the checksum compares rows in order, and PostgreSQL's parallel Append emits
+the two arms' rows in either order.) Each `_residual` reference spells the conjunct `+ 0`, which is
+exactly the plan these queries had before (grouped bodies and set operations were not pushed into):
+every input row is grouped, or both arms run whole, before the outer filter. Median per-query time,
+reference → pushed: `grouped_pushdown_pk` **53.8 ms → 62.3 µs Go**, 35.7 ms → 51.7 µs Rust,
+91.8 ms → 95.5 µs TypeScript (PostgreSQL via pgx 1.67 ms → 23.5 µs); `setop_pushdown_pk`
+**35.0 ms → 17.6 µs Go**, 51.9 ms → 13.0 µs Rust, 45.3 ms → 37.6 µs TypeScript (PostgreSQL via pgx
+3.31 ms → 12.8 µs). The `derived_pushdown_pk` control was unchanged (13.9 µs Go, 7.4 µs Rust,
+24.2 µs TypeScript mean). Every jed core and wrap and every PostgreSQL driver returned the same
+per-lane checksums. The `jed/wasm/wrap` lane did not run: the WASI wrap opens files with the default
+`locking = auto`, which fails `0A000` on `wasm32-wasip1` (locking.md), for every lane. The shared
+corpus pins (subquery/grouped_setop_pushdown.test, oracle-checked) and the `grouped_setop_pushdown`
+NoREC relation are the correctness proof.
+
 **DML contradiction result (2026-10-09).** The new `dml_contradiction` lane deletes from the
 1M-row `orders` table with `amount > 100000 AND amount < 50` (unindexed, provably empty) and rolls
 back each iteration. Before the rule each core full-scanned every row and evaluated the WHERE; now no

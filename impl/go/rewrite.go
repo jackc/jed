@@ -17,7 +17,8 @@ package jed
 //     side of an INNER join (planner.md §3.3).
 //
 // A body pushdown is the one decision that changes a predicate: planSelect plans the derived body
-// again with the moved conjuncts appended to its WHERE (bodyPushes).
+// again with the moved conjuncts appended to its WHERE — to each SELECT of a set operation, and
+// below a grouped SELECT's grouping (bodyPushes).
 
 // wherePushdown is the stage-2 predicate split. relFilters / relLocal hold one entry per relation
 // (nil: nothing scan-pushed); residual is the post-join WHERE when whereSplit (nil when every
@@ -35,8 +36,8 @@ type wherePushdown struct {
 	// at execution (nil: the join has no ON predicate left).
 	onSplit    []bool
 	onResidual []*rExpr
-	// bodyPushes[i] is the conjuncts moved into derived relation i's body, rewritten to the body's
-	// column slots, in source order. planSelect consumes it by planning the body again.
+	// bodyPushes[i] is the conjuncts moved into derived relation i's body, rebased to the body's
+	// output columns, in source order. planSelect consumes it by planning the body again.
 	bodyPushes [][]*rExpr
 	// access is the stage-3 access predicate when an ON conjunct was scan-pushed: the complete WHERE
 	// AND each scan-pushed ON conjunct in source order (nil: the access predicate is the WHERE).
@@ -86,7 +87,7 @@ func (sp *selectPlan) pushedFilter(ri int) (glob, local *rExpr) {
 }
 
 // pushedConjunct is one conjunct moved by stage 2, in source order: to relation ri's body (body,
-// already rewritten to body slots) or to its scan.
+// rebased to the body's output columns) or to its scan.
 type pushedConjunct struct {
 	expr *rExpr
 	ri   int
@@ -106,7 +107,7 @@ func rewriteWhere(plan *selectPlan) {
 			return
 		}
 	}
-	bodies := make([]*selectPlan, len(plan.rels))
+	bodies := make([]*queryPlan, len(plan.rels))
 	for i, rel := range plan.rels {
 		bodies[i] = bodyPushable(rel)
 	}
@@ -118,7 +119,7 @@ func rewriteWhere(plan *selectPlan) {
 			return pushedConjunct{}, false
 		}
 		if body := bodies[ri]; body != nil {
-			if moved, ok := substituteBodyColumns(c, plan.rels[ri].offset, body); ok {
+			if moved, ok := bodyConjunct(c, plan.rels[ri].offset, body); ok {
 				return pushedConjunct{expr: moved, ri: ri, body: true}, true
 			}
 		}
@@ -230,50 +231,116 @@ func markJoinNullable(nullable []bool, kind joinKind, k int) {
 }
 
 // bodyPushable returns a derived relation's body when conjuncts may move into it (planner.md §3.2):
-// a non-lateral single SELECT with no aggregate/GROUP BY, window function, LIMIT, or OFFSET. nil
-// otherwise (any other relation, or a set operation / VALUES / nested WITH body).
-func bodyPushable(rel planRel) *selectPlan {
-	if rel.derived == nil || rel.lateral || rel.derived.sel == nil {
+// a non-lateral body that is a body-pushable SELECT or a set operation of them. nil otherwise (any
+// other relation, or a VALUES / nested WITH body).
+func bodyPushable(rel planRel) *queryPlan {
+	if rel.derived == nil || rel.lateral || !queryBodyPushable(rel.derived) {
 		return nil
 	}
-	body := rel.derived.sel
-	if body.isAgg || len(body.groupSets) > 0 || body.having != nil || body.hasWindow || body.limit != nil || body.offset != nil {
-		return nil
-	}
-	return body
+	return rel.derived
 }
 
-// substituteBodyColumns clones a pushdown-safe conjunct over a derived relation (whose columns start
-// at offset) with every column replaced by the body column its select-list item names. false when
-// a referenced output is not a bare column of the body.
-func substituteBodyColumns(e *rExpr, offset int, body *selectPlan) (*rExpr, bool) {
-	if e == nil {
-		return nil, true
+// queryBodyPushable is the structural half of body-pushability (planner.md §3.2): a SELECT with no
+// window function, LIMIT, or OFFSET that is either ungrouped or grouped by exactly one grouping set
+// with at least one key; or a set operation without LIMIT/OFFSET whose two arms are body-pushable.
+func queryBodyPushable(q *queryPlan) bool {
+	switch {
+	case q.sel != nil:
+		b := q.sel
+		if b.hasWindow || b.limit != nil || b.offset != nil {
+			return false
+		}
+		return !b.isAgg || len(b.groupSets) == 1 && len(b.groupKeys) > 0
+	case q.setop != nil:
+		so := q.setop
+		return so.limit == nil && so.offset == nil && queryBodyPushable(&so.lhs) && queryBodyPushable(&so.rhs)
+	default:
+		return false
 	}
-	if e.kind == reColumn {
-		j := e.index - offset
-		if j < 0 || j >= len(body.projections) {
-			return nil, false
+}
+
+// bodyInputColumn returns the FROM slot a body-pushable SELECT's output column j reads, false when
+// the select-list item is not a bare column. In a grouped body the item must be a grouping column:
+// a plain input column of the master grouping list (an expression key's synthetic slot is not).
+func bodyInputColumn(b *selectPlan, j int) (int, bool) {
+	if j < 0 || j >= len(b.projections) || b.projections[j].kind != reColumn {
+		return 0, false
+	}
+	idx := b.projections[j].index
+	if !b.isAgg {
+		return idx, true
+	}
+	if idx >= len(b.groupKeys) {
+		return 0, false
+	}
+	width := 0
+	for _, rel := range b.rels {
+		width += rel.colCount
+	}
+	if gk := b.groupKeys[idx]; gk < width {
+		return gk, true
+	}
+	return 0, false
+}
+
+// bodyOutputPushable reports whether output column j of a body-pushable plan reads a bare body
+// column of type want in every SELECT it combines: a set operation's arms (and its own unified
+// column) must already have that exact type, so no arm value is widened after the pushed conjunct
+// would have judged it.
+func bodyOutputPushable(q *queryPlan, j int, want resolvedType) bool {
+	if q.sel != nil {
+		_, ok := bodyInputColumn(q.sel, j)
+		return ok && resolvedTypeEqual(q.sel.columnTypes[j], want)
+	}
+	so := q.setop
+	return resolvedTypeEqual(so.columnTypes[j], want) &&
+		bodyOutputPushable(&so.lhs, j, want) && bodyOutputPushable(&so.rhs, j, want)
+}
+
+// bodyConjunct returns a pushdown-safe conjunct over a derived relation (whose columns start at
+// offset) rebased to the body's output-column numbering, false when a referenced output column is
+// not body-pushable (bodyOutputPushable). replanPushedBodies later substitutes each output column
+// with the body column it reads, separately in each set-operation arm.
+func bodyConjunct(c *rExpr, offset int, body *queryPlan) (*rExpr, bool) {
+	types := body.columnTypes()
+	ok := true
+	var walk func(e *rExpr)
+	walk = func(e *rExpr) {
+		if e == nil || !ok {
+			return
 		}
-		item := body.projections[j]
-		if item.kind != reColumn {
-			return nil, false
+		if e.kind == reColumn {
+			j := e.index - offset
+			ok = j >= 0 && j < len(types) && bodyOutputPushable(body, j, types[j])
+			return
 		}
-		c := *item
-		return &c, true
+		walk(e.lhs)
+		walk(e.rhs)
+		walk(e.operand)
+	}
+	walk(c)
+	if !ok {
+		return nil, false
+	}
+	return rebaseColumns(c, offset), true
+}
+
+// substituteBodyColumns clones a conjunct in a body's output-column numbering with every column
+// replaced by the FROM slot that SELECT body's output reads. bodyConjunct already proved each
+// reference maps.
+func substituteBodyColumns(e *rExpr, body *selectPlan) *rExpr {
+	if e == nil {
+		return nil
 	}
 	c := *e
-	var ok bool
-	if c.lhs, ok = substituteBodyColumns(e.lhs, offset, body); !ok {
-		return nil, false
+	if c.kind == reColumn {
+		c.index, _ = bodyInputColumn(body, e.index)
+		return &c
 	}
-	if c.rhs, ok = substituteBodyColumns(e.rhs, offset, body); !ok {
-		return nil, false
-	}
-	if c.operand, ok = substituteBodyColumns(e.operand, offset, body); !ok {
-		return nil, false
-	}
-	return &c, true
+	c.lhs = substituteBodyColumns(e.lhs, body)
+	c.rhs = substituteBodyColumns(e.rhs, body)
+	c.operand = substituteBodyColumns(e.operand, body)
+	return &c
 }
 
 // whereContradicts flattens a WHERE's top-level AND-chain and applies the plan-time contradiction

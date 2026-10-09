@@ -268,9 +268,9 @@ test('the indexes page runs the partial-index lookup live', async ({ page }) => 
 
 test('the indexes page runs the GIN @> contains scan live', async ({ page }) => {
   await page.goto('/docs/sql/indexes/');
-  // Fourth panel = the GIN containment scan: tags @> ARRAY[10,20] → intro and gin (both hold
+  // Fifth panel = the GIN containment scan: tags @> ARRAY[10,20] → intro and gin (both hold
   // {10,20}); arrays/storage/empty do not — the posting-list intersection of the index.
-  const panel = page.getByTestId('live-sql').nth(3);
+  const panel = page.getByTestId('live-sql').nth(4);
   await expect(panel.getByTestId('result-rows')).toContainText('intro');
   await expect(panel.getByTestId('result-rows')).toContainText('gin');
   await expect(panel.getByTestId('result-rows')).not.toContainText('arrays');
@@ -278,18 +278,18 @@ test('the indexes page runs the GIN @> contains scan live', async ({ page }) => 
 
 test('the indexes page runs the GIN && overlaps scan live', async ({ page }) => {
   await page.goto('/docs/sql/indexes/');
-  // Fifth panel = the GIN overlap scan: tags && ARRAY[30,40] → intro (30), arrays (40),
+  // Sixth panel = the GIN overlap scan: tags && ARRAY[30,40] → intro (30), arrays (40),
   // storage (40) — the posting-list union; empty shares nothing and is excluded.
-  const panel = page.getByTestId('live-sql').nth(4);
+  const panel = page.getByTestId('live-sql').nth(5);
   await expect(panel.getByTestId('result-rows')).toContainText('storage');
   await expect(panel.getByTestId('result-rows')).not.toContainText('empty');
 });
 
 test('the indexes page runs the GIN = ANY membership scan live', async ({ page }) => {
   await page.goto('/docs/sql/indexes/');
-  // Sixth panel = the GIN membership scan: 20 = ANY(tags) → intro, arrays, gin (all hold 20)
+  // Seventh panel = the GIN membership scan: 20 = ANY(tags) → intro, arrays, gin (all hold 20)
   // — the single term's posting list; storage ({40,50}) and empty do not and are excluded.
-  const panel = page.getByTestId('live-sql').nth(5);
+  const panel = page.getByTestId('live-sql').nth(6);
   await expect(panel.getByTestId('result-rows')).toContainText('intro');
   await expect(panel.getByTestId('result-rows')).toContainText('arrays');
   await expect(panel.getByTestId('result-rows')).not.toContainText('storage');
@@ -297,9 +297,9 @@ test('the indexes page runs the GIN = ANY membership scan live', async ({ page }
 
 test('the indexes page runs the GIN = array-equality scan live', async ({ page }) => {
   await page.goto('/docs/sql/indexes/');
-  // Seventh panel = the GIN equality scan: tags = ARRAY[10,20] → gin ONLY (its tags ARE {10,20});
+  // Eighth panel = the GIN equality scan: tags = ARRAY[10,20] → gin ONLY (its tags ARE {10,20});
   // intro ({10,20,30}) merely contains them, so the residual = excludes it — stricter than @>.
-  const panel = page.getByTestId('live-sql').nth(6);
+  const panel = page.getByTestId('live-sql').nth(7);
   await expect(panel.getByTestId('result-rows')).toContainText('gin');
   await expect(panel.getByTestId('result-rows')).not.toContainText('intro');
 });
@@ -436,18 +436,37 @@ test('the explain page shows a WHERE conjunct moved into a FROM subquery', async
   await expect(panel.getByTestId('result-rows')).toContainText('PK bound: id = 3');
 });
 
+test('the explain page shows a WHERE conjunct moved below a grouped subquery', async ({ page }) => {
+  await page.goto('/docs/sql/explain/');
+  // Twelfth panel = the grouping-column `region = 2` bounds city_region under the Aggregate (§3.2).
+  const panel = page.getByTestId('live-sql').nth(11);
+  await expect(panel.getByTestId('result-rows')).toContainText('Aggregate');
+  await expect(panel.getByTestId('result-rows')).toContainText('Index bound: using city_region');
+});
+
+test('the explain page shows a WHERE conjunct moved into every set-operation branch', async ({
+  page
+}) => {
+  await page.goto('/docs/sql/explain/');
+  // Thirteenth panel = `x.id = 3` seeks city's PK in one UNION branch and filters trip in the other.
+  const panel = page.getByTestId('live-sql').nth(12);
+  await expect(panel.getByTestId('result-rows')).toContainText('Union');
+  await expect(panel.getByTestId('result-rows')).toContainText('PK bound: id = 3');
+  await expect(panel.getByTestId('result-rows')).toContainText('Scan trip');
+});
+
 test('the explain page shows an ON conjunct pushed to the NULL-extended side', async ({ page }) => {
   await page.goto('/docs/sql/explain/');
-  // Twelfth panel = `t.id > 5` runs in trip's scan; the LEFT join keeps one ON conjunct (§3.3).
-  const panel = page.getByTestId('live-sql').nth(11);
+  // Fourteenth panel = `t.id > 5` runs in trip's scan; the LEFT join keeps one ON conjunct (§3.3).
+  const panel = page.getByTestId('live-sql').nth(13);
   await expect(panel.getByTestId('result-rows')).toContainText('left; on:conjuncts=1');
   await expect(panel.getByTestId('result-rows')).toContainText('filter:conjuncts=1');
 });
 
 test('the explain page runs EXPLAIN ANALYZE with a deterministic cost', async ({ page }) => {
   await page.goto('/docs/sql/explain/');
-  // Fourteenth panel = EXPLAIN ANALYZE: the Analyze root reports the real accrued cost + row count.
-  const panel = page.getByTestId('live-sql').nth(13);
+  // Sixteenth panel = EXPLAIN ANALYZE: the Analyze root reports the real accrued cost + row count.
+  const panel = page.getByTestId('live-sql').nth(15);
   await expect(panel.getByTestId('result-rows')).toContainText('Analyze');
   await expect(panel.getByTestId('result-rows')).toContainText('cost=');
 });

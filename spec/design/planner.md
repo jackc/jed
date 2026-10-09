@@ -169,28 +169,61 @@ With no contradiction, each top-level WHERE conjunct, in source order, is **push
 A pushed conjunct then takes the first of these forms that applies:
 
 1. **Body pushdown** (`query.derived_pushdown`) — relation `i` is a derived table whose body is
-   **body-pushable** (below) and every column the conjunct references is an output column whose
-   select-list item is a bare column of the body. The conjunct is rewritten with each reference
-   replaced by that body column, and moves *into* the body. Applies with any number of FROM
-   relations, including one (`SELECT … FROM (SELECT …) d WHERE d.k = 5`).
+   **body-pushable** (below) and every column the conjunct references is a **pushable output
+   column** (below). The conjunct is rewritten with each reference replaced by the body column that
+   output reads, and moves *into* the body — into every SELECT of a set operation. Applies with any
+   number of FROM relations, including one (`SELECT … FROM (SELECT …) d WHERE d.k = 5`).
 2. **Scan pushdown** — the SELECT has at least two FROM relations. A base table (`query.where_pushdown`)
    or a derived table, CTE reference, set-returning function, or catalog relation
    (`query.derived_pushdown`) runs the conjunct over its own rows before they reach the join.
 3. Otherwise the conjunct stays in the residual (a single-relation SELECT gains nothing from a scan
    pushdown: the filter would run on the same rows either way).
 
-A derived body is **body-pushable** when it is a single SELECT — not a set operation, `VALUES`, or a
-nested `WITH` — with no aggregate or `GROUP BY`, no window function, and no `LIMIT` or `OFFSET`.
-`DISTINCT` and `ORDER BY` are admitted: a pushdown-safe conjunct over bare output columns gives the
-same answer for every row in one DISTINCT class (equal values compare equal, and every jed collation
-is deterministic), so filtering before or after deduplication keeps the same classes.
+A derived body is **body-pushable** when it is
+
+- a SELECT with no window function and no `LIMIT` or `OFFSET` that is either ungrouped or
+  **grouped by exactly one grouping set with at least one key** — a plain `GROUP BY` (`HAVING`
+  admitted), not `ROLLUP`, `CUBE`, several `GROUPING SETS`, or an aggregate without grouping keys; or
+- a **set operation** (`UNION`, `INTERSECT`, `EXCEPT`, each with or without `ALL`, nested to any
+  depth) with no `LIMIT` or `OFFSET` of its own, whose two arms are both body-pushable.
+
+`VALUES` and a nested `WITH` are not. Output column `j` of a body-pushable body is **pushable** when
+
+- for an ungrouped SELECT, its select-list item is a bare column of the body;
+- for a grouped SELECT, its select-list item is a **grouping column**: a key of the grouping set that
+  is a bare input column (a column grouped through its table's primary key, aggregates.md §16,
+  counts; an expression key such as `GROUP BY k + 0`, an aggregate result, or an expression over a
+  grouping column does not);
+- for a set operation, column `j` is pushable in both arms **and** each arm's column type is exactly
+  the set operation's unified output type, recursively — an arm the set operation widens
+  (`i32` under an `i64` output, `i32` under `decimal`, `f32` under `f64`) blocks the column, since the
+  conjunct was resolved against the widened type.
+
+Each admitted shape preserves the answer because a pushdown-safe conjunct over bare output columns
+gives the same answer for every row in one **equality class** (equal values compare equal under every
+admitted comparison, NULLs are one class to IS [NOT] NULL / IS [NOT] DISTINCT FROM, and every jed
+collation is deterministic):
+
+- `DISTINCT` keeps or drops whole classes, so filtering before or after deduplication agrees;
+  `ORDER BY` (without `LIMIT`) reorders only.
+- A grouped body's groups are classes of its grouping keys, so a conjunct over grouping columns keeps
+  or drops **whole groups** before they are aggregated; `HAVING` then judges the surviving groups as
+  before. With several grouping sets a column is NULL in rolled-up rows whatever its input value, so
+  filtering the input would change them; an ungrouped aggregate always produces its one row.
+- A set operation matches rows by NULL-safe equality of whole rows, so the left and right rows of
+  any match judge the conjunct alike: `filter(A op B) = filter(A) op filter(B)` for every operator and
+  multiplicity (an `EXCEPT ALL` right row the filter drops could only have cancelled a left row the
+  filter also drops).
 
 **Body form.** A derived body's pushed conjuncts — the WHERE's, in source order, after any §3.3 ON
 conjuncts pushed to the same relation — are appended to the body's own WHERE as a left-deep AND:
-`((W AND c1) AND c2)`, or `(c1 AND c2)` when the body has no WHERE. The body is then **planned again
-from its syntax** with that WHERE, so its own stage 2 (contradiction; pushdown, including into its
-own derived tables) and stage 3 (access paths — the pushed conjunct can now bound the body's key)
-treat it exactly as if it had been written in the body. Planning a body again has no other effect:
+`((W AND c1) AND c2)`, or `(c1 AND c2)` when the body has no WHERE. In a grouped body the WHERE is the
+pre-grouping filter, so the conjuncts run **below the grouping**, over the input rows. A set-operation
+body appends the same conjuncts, each rewritten to that arm's own columns, to the WHERE of every
+SELECT of its tree, which keeps its operators, unified types, and `ORDER BY`. The body (each SELECT of
+a set operation) is then **planned again from its syntax** with that WHERE, so its own stage 2
+(contradiction; pushdown, including into its own derived tables) and stage 3 (access paths — the
+pushed conjunct can now bound the body's key) treat it exactly as if it had been written in the body. Planning a body again has no other effect:
 in particular the statement's CTE reference counts, and so every CTE's inline/materialize mode, are
 unchanged. A conjunct that moved into a body is evaluated nowhere in the outer SELECT.
 
@@ -217,25 +250,33 @@ index-nested-loop inner — instead of once per **surviving joined row**; rows i
 the ON predicate, hash build/probe, the residual, or (for a base table) the row account. A
 body-pushed conjunct charges wherever the replanned body evaluates its WHERE — per body row, or per
 admitted base row when the body pushes it further — and, when it bounds the body's access path, the
-rows it excludes are never read, projected, or charged at all. The residual charges as the old WHERE
-did, over joined rows. Both rules are unconditional (PostgreSQL's choice), so the change is usually a
-reduction but is not monotone: when a join discards more rows than it multiplies, evaluating the
-conjunct on every base row can cost more than evaluating it on the few joined survivors. The
+rows it excludes are never read, projected, or charged at all. In a grouped body that is per **input
+row** below the grouping, instead of once per group row above it; the rows it rejects are never
+grouped or aggregated (no aggregate-argument, `FILTER`, or `HAVING` work for a dropped group). In a set
+operation it charges once per row of **each arm**, instead of once per combined output row; the rows it
+rejects never reach the combine. The residual charges as the old WHERE did, over joined rows. Both
+rules are unconditional (PostgreSQL's choice), so the change is usually a reduction but is not
+monotone: when a join discards more rows than it multiplies, evaluating the conjunct on every base row
+can cost more than evaluating it on the few joined survivors — and likewise on every input row of a
+grouped body that the conjunct cannot bound, rather than on its few groups, or on every arm row of a
+deduplicating set operation, rather than on its distinct survivors. The
 estimator models the split ([estimator.md](estimator.md) §8.3), so cost-based join search sees it, and
 the actual meter remains authoritative. Because only non-trapping conjuncts move, pushdown never raises
 an error the unrewritten plan would not; it can leave unraised an error on a row the moved conjunct
-now rejects first — an ON-predicate error on a pair, or a body's select-list error on a body row —
-the same narrowing a scan bound already performs.
+now rejects first — an ON-predicate error on a pair, a body's select-list error on a body row, or an
+aggregate-argument error in a group the conjunct drops — the same narrowing a scan bound already
+performs (PostgreSQL pushes the same quals, so it skips the same errors).
 
 EXPLAIN renders a scan-pushed filter on its relation's node (`Scan`, `Subquery`, `CTE Scan`, `SRF`,
-`Catalog Scan`), a body-pushed conjunct inside the body's own plan, and the residual as the Filter node
+`Catalog Scan`), a body-pushed conjunct inside the body's own plan (below a grouped body's
+`Aggregate`; once under each SELECT of a set operation), and the residual as the Filter node
 ([explain.md](explain.md) §5).
 
 **Not pushed into a body.** A CTE reference is scan-pushed only, even when its CTE is inlined: whether
 a CTE is inlined is decided from its reference count after the whole statement is planned, so
 pushing into an inlined CTE's body needs a per-reference body specialization (with its own EXPLAIN
-and estimate attribution) and is a follow-on. So are pushdown into a grouped body (a conjunct over
-grouping columns), into each arm of a set operation, and through a lateral relation.
+and estimate attribution) and is a follow-on. So is pushdown through a lateral relation, below a
+window function (a conjunct over every PARTITION BY column), and into an arm a set operation widens.
 
 ### 3.3 ON pushdown (`query.on_pushdown`)
 
@@ -499,7 +540,7 @@ bound.
 
 ## 7. Where future passes plug in
 
-- **Further stage-2 rewrites** (TODO.md) — pushdown into inlined CTE bodies, grouped bodies, and
-  set-operation arms; constant folding — each under the §3 contract with its own cost decision.
+- **Further stage-2 rewrites** (TODO.md) — pushdown into inlined CTE bodies and below window
+  partitions; constant folding — each under the §3 contract with its own cost decision.
 - **New physical rules** (the hash join above and later access paths tracked in TODO.md) land as
   discrete rule functions in the §4 inventory, each with its NoREC relation.
