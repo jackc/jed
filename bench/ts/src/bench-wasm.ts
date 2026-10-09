@@ -264,7 +264,9 @@ function instantiate(dataDir: string): WasmJed {
   wasi.initialize(instance);
   const w = new WasmJed(instance);
   if (w.abiVersion() !== ABI_VERSION) {
-    throw new Error(`jed_wasm ABI ${w.abiVersion()}, harness expects ${ABI_VERSION}; rebuild impl/wasm`);
+    throw new Error(
+      `jed_wasm ABI ${w.abiVersion()}, harness expects ${ABI_VERSION}; rebuild impl/wasm`,
+    );
   }
   return w;
 }
