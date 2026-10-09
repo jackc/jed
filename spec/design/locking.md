@@ -346,7 +346,7 @@ background lease polling are unmetered host work and never enter SQL cost.
 | Node/TS file | shared when native lock host is installed | the narrow Unix `flock` / Windows `LockFileEx` adapter; §8 |
 | Node/Rust wrap | shared | inherits the Rust local-file host; experimental delivery choice, §8 |
 | Browser/OPFS | exclusive | the sync access handle is inherently exclusive; explicit `shared` is `0A000` |
-| wasm32-wasip1 | unavailable | `auto`/`shared`/`exclusive` fail `0A000`; only explicit `none` proceeds |
+| wasm32-wasip1 | unavailable | `auto`/`shared`/`exclusive` fail `0A000`; only explicit `none` proceeds. The `impl/wasm` C ABI takes the mode as an explicit `jed_open`/`jed_create` argument with no wrap default; the single-process benchmark harness passes `none` as its own external coordination |
 | Ruby gem | shared | inherits the Rust host |
 | in-memory | n/a | process-private; no coordination bundle |
 

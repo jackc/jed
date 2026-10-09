@@ -1133,7 +1133,10 @@ prints **allocations/op** to stderr (deterministic, unlike wall-clock) as a comp
 (`bench/ts/src/lib.ts`), and its answer checksum must match the native cores' — the cross-engine
 checksum gate in `scripts/bench_report.rb` doubles as a **conformance check on the wasm build**. It
 needs Node's preview1 WASI: `node --experimental-wasi-unstable-preview1` (the Rakefile passes it);
-the `.jed` data files open through a WASI preopen of `bench/data`. **No new dependency** — the wasm
+the `.jed` data files open through a WASI preopen of `bench/data`. Because `wasm32-wasip1` has no
+file locking (locking.md §7.3), the harness opens and creates every file with an explicit
+`locking = none` (the ABI's `locking` argument, `impl/wasm/README.md`). Its own process ownership
+of the data files is the external coordination `none` requires. **No new dependency** — the wasm
 artifact is loaded by Node's built-in `WebAssembly`/`node:wasi`. Two deltas are interesting:
 
 - `jed/wasm/wrap − jed/ts/core` — the **wasm-vs-native-JS** comparison (the same Rust algorithms in

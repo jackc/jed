@@ -38,11 +38,23 @@ Output: `impl/wasm/target/wasm32-wasip1/release/jed_wasm.wasm`.
 | export | purpose |
 |---|---|
 | `jed_abi_version` | ABI version check |
-| `jed_open_memory` / `jed_create(path)` / `jed_open(path, ro)` / `jed_close(db)` | database lifecycle |
+| `jed_open_memory` / `jed_create(path, locking)` / `jed_open(path, ro, locking)` / `jed_close(db)` | database lifecycle |
 | `jed_execute(db, sql)` | one-shot parse+execute (DDL, `BEGIN`/`ROLLBACK`, `count(*)`) |
 | `jed_prepare(db, sql)` → stmt | parse once |
 | `jed_stmt_query` / `jed_stmt_execute(stmt, db, params, len)` | run the prepared statement (binding `$N`) |
 | `jed_stmt_free(stmt)` / `jed_free(buf)` | release a statement / a result buffer |
+
+### File locking
+
+`jed_create`/`jed_open` take an explicit `locking` byte, the `locking` handle setting of
+[`spec/design/locking.md`](../../spec/design/locking.md) §7.1: `0` auto, `1` shared, `2` exclusive,
+`3` none (any other value is `22023`). The wrap applies **no default of its own**: the caller
+always states the mode. `wasm32-wasip1` has no whole-file OS locking (locking.md §7.3), so `auto`,
+`shared`, and `exclusive` fail `0A000` at open/create, and only `none` opens a file. Pass `none`
+only when the host itself guarantees that no other process or handle opens the same file while this
+one is open, because nothing in the engine guards against concurrent access in that mode. The
+benchmark harness passes `none` because it is the external coordination: each bench process owns
+its dataset files, and the runner never points two processes at one file at the same time.
 
 Every fallible call returns a self-describing little-endian **result buffer** (length header + tag +
 payload) the host reads back out of `memory`, then returns with `jed_free`. The wire format and the

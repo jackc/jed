@@ -59,14 +59,16 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use jed::{
-    CreateOptions, Database, OpenOptions, PreparedStatement, Rows, Session, SessionOptions, Value,
+    CreateOptions, Database, Locking, OpenOptions, PreparedStatement, Rows, Session,
+    SessionOptions, Value,
 };
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-/// The ABI version the JS host checks on load.
-const ABI_VERSION: u32 = 1;
+/// The ABI version the JS host checks on load. v2: `jed_create`/`jed_open` take an explicit
+/// `locking` byte (see [`locking_mode`]).
+const ABI_VERSION: u32 = 2;
 
 const TAG_ERROR: u8 = 0;
 const TAG_STATEMENT: u8 = 1;
@@ -331,16 +333,38 @@ pub extern "C" fn jed_open_memory() -> *mut u8 {
     })
 }
 
-/// Create a new file-backed database at `path` (a WASI path under a host preopen). HANDLE or ERROR.
+/// Decode the host's `locking` byte into the cross-process coordination mode (spec/design/locking.md
+/// §7.1): `0` auto, `1` shared, `2` exclusive, `3` none; anything else is `22023`. The wrap applies
+/// no default of its own — the caller states the mode. On `wasm32-wasip1` file locking is
+/// unavailable (locking.md §7.3), so `auto`/`shared`/`exclusive` fail `0A000` at open/create and only
+/// `none` proceeds; a host may pass `3` only when it coordinates access to the file itself (e.g. a
+/// single-process benchmark that owns its data files).
+fn locking_mode(b: u8) -> Result<Locking, *mut u8> {
+    match b {
+        0 => Ok(Locking::Auto),
+        1 => Ok(Locking::Shared),
+        2 => Ok(Locking::Exclusive),
+        3 => Ok(Locking::None),
+        _ => Err(err_buf("22023", &format!("invalid locking mode {b}"))),
+    }
+}
+
+/// Create a new file-backed database at `path` (a WASI path under a host preopen) with the given
+/// `locking` mode ([`locking_mode`]). HANDLE or ERROR.
 #[unsafe(no_mangle)]
-pub extern "C" fn jed_create(path: *const c_char) -> *mut u8 {
+pub extern "C" fn jed_create(path: *const c_char, locking: u8) -> *mut u8 {
     guard(|| {
         let path = match cstr(path) {
             Ok(s) => s,
             Err(b) => return b,
         };
+        let locking = match locking_mode(locking) {
+            Ok(l) => l,
+            Err(b) => return b,
+        };
         match Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(path)),
+            locking,
             ..Default::default()
         }) {
             Ok(db) => ok_handle(Box::into_raw(Box::new(new_conn(db))) as usize as u64),
@@ -349,16 +373,22 @@ pub extern "C" fn jed_create(path: *const c_char) -> *mut u8 {
     })
 }
 
-/// Open an existing file-backed database at `path` (read-only iff `read_only != 0`). HANDLE or ERROR.
+/// Open an existing file-backed database at `path` (read-only iff `read_only != 0`) with the given
+/// `locking` mode ([`locking_mode`]). HANDLE or ERROR.
 #[unsafe(no_mangle)]
-pub extern "C" fn jed_open(path: *const c_char, read_only: u8) -> *mut u8 {
+pub extern "C" fn jed_open(path: *const c_char, read_only: u8, locking: u8) -> *mut u8 {
     guard(|| {
         let path = match cstr(path) {
             Ok(s) => s,
             Err(b) => return b,
         };
+        let locking = match locking_mode(locking) {
+            Ok(l) => l,
+            Err(b) => return b,
+        };
         let opts = OpenOptions {
             read_only: read_only != 0,
+            locking,
             ..OpenOptions::default()
         };
         match Database::open_with_options(path, opts) {

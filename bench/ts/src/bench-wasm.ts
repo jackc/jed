@@ -34,14 +34,23 @@ const TAG_STATEMENT = 1;
 const TAG_QUERY = 2;
 const TAG_HANDLE = 3;
 
+// The ABI this harness speaks (impl/wasm/src/lib.rs ABI_VERSION).
+const ABI_VERSION = 2;
+
+// jed_create/jed_open `locking` byte (spec/design/locking.md §7.1): 0 auto, 1 shared, 2 exclusive,
+// 3 none. wasm32-wasip1 has no file locking (locking.md §7.3), so only `none` opens a file there.
+// The harness supplies the external coordination `none` requires: each benchmark process owns its
+// dataset files and the runner never points two processes at the same file concurrently.
+const LOCKING_NONE = 3;
+
 interface WasmExports {
   memory: WebAssembly.Memory;
   jed_abi_version(): number;
   jed_alloc(len: number): number;
   jed_dealloc(ptr: number, len: number): void;
   jed_open_memory(): number;
-  jed_create(path: number): number;
-  jed_open(path: number, readOnly: number): number;
+  jed_create(path: number, locking: number): number;
+  jed_open(path: number, readOnly: number, locking: number): number;
   jed_close(db: number): void;
   jed_free(ptr: number): void;
   jed_execute(db: number, sql: number): number;
@@ -191,7 +200,7 @@ class WasmJed {
   createFile(path: string): number {
     const { ptr, len } = this.cstr(path);
     try {
-      return this.handle(this.ex.jed_create(ptr));
+      return this.handle(this.ex.jed_create(ptr, LOCKING_NONE));
     } finally {
       this.ex.jed_dealloc(ptr, len);
     }
@@ -199,7 +208,7 @@ class WasmJed {
   openFile(path: string, readOnly: boolean): number {
     const { ptr, len } = this.cstr(path);
     try {
-      return this.handle(this.ex.jed_open(ptr, readOnly ? 1 : 0));
+      return this.handle(this.ex.jed_open(ptr, readOnly ? 1 : 0, LOCKING_NONE));
     } finally {
       this.ex.jed_dealloc(ptr, len);
     }
@@ -253,7 +262,11 @@ function instantiate(dataDir: string): WasmJed {
   const wasi = new WASI({ version: "preview1", args: [], env: {}, preopens: { "/data": dataDir } });
   const instance = new WebAssembly.Instance(wasmModule, wasi.getImportObject());
   wasi.initialize(instance);
-  return new WasmJed(instance);
+  const w = new WasmJed(instance);
+  if (w.abiVersion() !== ABI_VERSION) {
+    throw new Error(`jed_wasm ABI ${w.abiVersion()}, harness expects ${ABI_VERSION}; rebuild impl/wasm`);
+  }
+  return w;
 }
 
 class WasmEngine implements Engine {
@@ -334,8 +347,13 @@ await mainWith({
     const w = instantiate(dataDir);
     if (dataset === "scratch") {
       const dir = mkdtempSync(join(dataDir, "scratch-wasm-"));
-      const db = w.createFile(wasiPath(dataDir, join(dir, "scratch.jed")));
-      return new WasmEngine(w, db, dataDir, dataset, dir);
+      try {
+        const db = w.createFile(wasiPath(dataDir, join(dir, "scratch.jed")));
+        return new WasmEngine(w, db, dataDir, dataset, dir);
+      } catch (e) {
+        rmSync(dir, { recursive: true, force: true });
+        throw e;
+      }
     }
     const db = w.openFile(wasiPath(dataDir, join(dataDir, `${dataset}.jed`)), false);
     return new WasmEngine(w, db, dataDir, dataset, null);
