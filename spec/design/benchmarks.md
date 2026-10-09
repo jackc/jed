@@ -97,6 +97,16 @@ Go, 0.373 → 0.370 ms Rust, 0.681 → 0.715 ms TypeScript; `secondary_pointset_
 3.54 → 3.73 ms Rust (single runs, within this machine's run-to-run spread). The PostgreSQL lane was
 not re-run.
 
+A CPU profile of Go `secondary_update` attributed that overhead to the estimator's per-call
+`nodeCount` and `height` walks, which visited every leaf reference. Both now use the B+tree
+same-depth invariant: a leaf parent adds its child count without visiting the children, and height
+follows the first child. That is O(interior nodes), with identical values. Over ~20k profiled
+statements, `planMutationScan` fell from 0.23 s to 0.03 s of CPU (about 11 µs → 1.5 µs per statement),
+and the two walks no longer appear in the profile. The per-statement saving is below this machine's
+wall-clock noise for these lanes (e.g. Go `secondary_update` 0.269–0.297 ms before vs 0.288 ms
+after, TypeScript 0.722–0.726 vs 0.557–0.697 ms, Rust 0.378–0.395 vs 0.378–0.385 ms;
+`full_scan_agg`, which also charges `nodeCount`, unchanged), with identical checksums.
+
 **Derived-table and ON pushdown result (2026-10-09).** `derived_pushdown_pk` reads
 `SELECT … FROM (SELECT id, v FROM t) d WHERE d.id = 50000` over 100k rows; moved into the body, the
 conjunct seeks t's primary key, while the `derived_pushdown_pk_residual` reference spells it

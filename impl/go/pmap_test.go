@@ -61,11 +61,15 @@ func pmShuffled(n uint64) []uint64 {
 // "Fan-out"): every node fits a page; every leaf is non-empty; an interior node has N+1 children
 // (N ≥ 0 only in the degenerate near-cap-separator case — these small-key tests never produce it,
 // so N ≥ 1 is asserted); records (vals/weights) live only in leaves; all leaves at the same depth;
-// and every key in a subtree respects its bounding separators (lo ≤ key < hi).
+// and every key in a subtree respects its bounding separators (lo ≤ key < hi). It also checks that
+// nodeCount and height, which rely on the same-depth invariant to skip leaves, equal a visit of
+// every node.
 func pmCheckInvariants(t *testing.T, pm *pMap) {
 	t.Helper()
+	nodes := 0
 	var walk func(n *pnode, isRoot bool, lo, hi []byte) int
 	walk = func(n *pnode, isRoot bool, lo, hi []byte) int {
+		nodes++
 		if n.isLeaf() {
 			if len(n.keys) == 0 && !isRoot {
 				t.Fatal("non-root leaf is empty")
@@ -126,8 +130,15 @@ func pmCheckInvariants(t *testing.T, pm *pMap) {
 		}
 		return depth + 1
 	}
+	height := 0
 	if pm.root != nil {
-		walk(pm.root, true, nil, nil)
+		height = walk(pm.root, true, nil, nil)
+	}
+	if got := pm.nodeCount(); got != nodes {
+		t.Fatalf("nodeCount = %d, visited %d nodes", got, nodes)
+	}
+	if got := pm.height(); got != height {
+		t.Fatalf("height = %d, walked depth %d", got, height)
 	}
 }
 

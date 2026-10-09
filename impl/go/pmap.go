@@ -519,49 +519,49 @@ func (m *pMap) inorder(src leafSource) ([][]byte, []storedRow, error) {
 // charges (spec/design/cost.md §3 "page_read"). A scan walks every node, so this is the structural
 // node count (interior + leaf); 0 for an empty map. Deterministic and byte-identical across cores
 // (the node boundaries are a §8 byte contract — format.md).
+//
+// All leaves sit at one depth (format.md "Fan-out"; the invariant open's skeleton load already uses),
+// so an interior's children are all leaves or all interiors. A leaf parent therefore contributes its
+// child count without visiting the children, and the walk is O(interior nodes) rather than
+// O(leaves): the planner calls it per statement. An OnDisk child is always a clean leaf and is
+// counted without loading it.
 func (m *pMap) nodeCount() int {
 	var count func(n *pnode) int
 	count = func(n *pnode) int {
-		if n == nil {
-			return 0
+		if n.isLeaf() {
+			return 1
+		}
+		if first := n.children[0].node; first == nil || first.isLeaf() {
+			return 1 + len(n.children)
 		}
 		total := 1
 		for _, c := range n.children {
-			if c.node != nil {
-				total += count(c.node)
-			} else {
-				// An OnDisk child is a clean leaf (only leaves page — pager.md §1/§4): it
-				// contributes one node, counted WITHOUT loading it — the resident-interior-skeleton
-				// dividend that keeps cost identical to P6.3 (pager.md §5).
-				total++
-			}
+			total += count(c.node)
 		}
 		return total
+	}
+	if m.root == nil {
+		return 0
 	}
 	return count(m.root)
 }
 
-// height is the root-to-leaf node count (0 empty, 1 root leaf). OnDisk children are always leaves,
-// so the resident interior skeleton contains enough information and this never faults a page.
+// height is the root-to-leaf node count (0 empty, 1 root leaf). Every leaf is at the same depth, so
+// the first-child path is the height; an OnDisk child is always a leaf, so this never faults a page.
 func (m *pMap) height() int {
-	var walk func(n *pnode) int
-	walk = func(n *pnode) int {
-		if n == nil {
-			return 0
+	h := 0
+	for n := m.root; n != nil; {
+		h++
+		if n.isLeaf() {
+			break
 		}
-		best := 0
-		for _, c := range n.children {
-			h := 1
-			if c.node != nil {
-				h = walk(c.node)
-			}
-			if h > best {
-				best = h
-			}
+		if n.children[0].node == nil {
+			h++
+			break
 		}
-		return 1 + best
+		n = n.children[0].node
 	}
-	return walk(m.root)
+	return h
 }
 
 // residentRecordBytes is the total on-disk record bytes stored in this tree — the sum of every

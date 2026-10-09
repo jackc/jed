@@ -83,14 +83,17 @@ function nodePayload(n: PNode, shape: LeafShape): number {
 // page; every leaf is non-empty; an interior node has N+1 children (N ≥ 0 only in the degenerate
 // near-cap-separator case — these small-key tests never produce it, so N ≥ 1 is asserted); records
 // (vals/weights) live only in leaves; all leaves at the same depth; and every key in a subtree
-// respects its bounding separators (left < sep ≤ right).
+// respects its bounding separators (left < sep ≤ right). Also checks that nodeCount and height,
+// which skip leaves via the same-depth invariant, equal a visit of every node.
 function checkInvariants(pm: PMap): void {
+  let nodes = 0;
   const walk = (
     n: PNode,
     isRoot: boolean,
     lo: Uint8Array | null,
     hi: Uint8Array | null,
   ): number => {
+    nodes++;
     if (n.children.length === 0) {
       assert.ok(n.keys.length > 0 || isRoot, "non-root leaf is empty");
       if (!n.packed) assert.equal(n.keys.length, n.vals.length);
@@ -126,7 +129,9 @@ function checkInvariants(pm: PMap): void {
     return depth! + 1;
   };
   const root = pm.rootNode();
-  if (root !== null) walk(root, true, null, null);
+  const height = root === null ? 0 : walk(root, true, null, null);
+  assert.equal(pm.nodeCount(), nodes, "nodeCount vs full visit");
+  assert.equal(pm.height(), height, "height vs walked depth");
 }
 
 test("pmap: insert/get/remove vs a reference map", () => {

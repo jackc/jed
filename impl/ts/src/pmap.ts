@@ -495,32 +495,40 @@ export class PMap {
   // scan charges (spec/design/cost.md §3 "page_read"). A scan walks every node, so this is the
   // structural node count (interior + leaf); 0 for an empty map. Deterministic and byte-identical
   // across cores (the node boundaries are a §8 byte contract — format.md).
+  //
+  // All leaves sit at one depth (format.md "Fan-out"; the invariant open's skeleton load already
+  // uses), so an interior's children are all leaves or all interiors. A leaf parent therefore
+  // contributes its child count without visiting the children, and the walk is O(interior nodes)
+  // rather than O(leaves): the planner calls it per statement. An OnDisk child is always a clean
+  // leaf and is counted without loading it.
   nodeCount(): number {
-    const count = (n: PNode | null): number => {
-      if (n === null) return 0;
+    const count = (n: PNode): number => {
+      if (isLeaf(n)) return 1;
+      const first = n.children[0]!.node;
+      if (first === null || isLeaf(first)) return 1 + n.children.length;
       let total = 1;
-      // A resident child is counted recursively; an OnDisk child is a clean leaf (only leaves page —
-      // pager.md §1/§4), counted as one node WITHOUT loading it — the resident-interior-skeleton
-      // dividend that keeps cost identical to P6.3 (pager.md §5).
-      for (const c of n.children) total += c.node !== null ? count(c.node) : 1;
+      for (const c of n.children) total += count(c.node!);
       return total;
     };
-    return count(this.root);
+    return this.root === null ? 0 : count(this.root);
   }
 
-  // Root-to-leaf node count (0 empty, 1 root leaf). An on-disk child is always a leaf, so the
-  // resident interior skeleton contains the complete height and no page must be faulted.
+  // Root-to-leaf node count (0 empty, 1 root leaf). Every leaf is at the same depth, so the
+  // first-child path is the height; an on-disk child is always a leaf, so no page is faulted.
   height(): number {
-    const walk = (n: PNode | null): number => {
-      if (n === null) return 0;
-      let best = 0;
-      for (const child of n.children) {
-        const childHeight = child.node === null ? 1 : walk(child.node);
-        if (childHeight > best) best = childHeight;
+    let height = 0;
+    let n = this.root;
+    while (n !== null) {
+      height++;
+      if (isLeaf(n)) break;
+      const child = n.children[0]!.node;
+      if (child === null) {
+        height++;
+        break;
       }
-      return 1 + best;
-    };
-    return walk(this.root);
+      n = child;
+    }
+    return height;
   }
 
   // residentRecordBytes is the total on-disk record bytes stored in this tree — the sum of every

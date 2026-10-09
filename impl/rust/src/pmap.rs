@@ -811,42 +811,51 @@ impl PMap {
     /// charges (spec/design/cost.md §3 "page_read"). A scan walks every node, so this is the
     /// structural node count (interior + leaf); `0` for an empty map. Deterministic and
     /// byte-identical across cores (the node boundaries are a §8 byte contract — format.md).
+    ///
+    /// All leaves sit at one depth (format.md "Fan-out"; the invariant open's skeleton load already
+    /// uses), so an interior's children are all leaves or all interiors. A leaf parent therefore
+    /// contributes its child count without visiting the children, and the walk is O(interior
+    /// nodes) rather than O(leaves): the planner calls it per statement. An `OnDisk` child is
+    /// always a clean leaf and is counted without loading it.
     pub fn node_count(&self) -> usize {
         fn count(node: &Node) -> usize {
-            1 + node
-                .children
-                .iter()
-                .map(|c| match c {
-                    // A resident child is counted recursively; an `OnDisk` child is a clean **leaf**
-                    // (only leaves page — pager.md §1/§4), so it contributes exactly one node and is
-                    // counted *without loading it* — the dividend of the resident interior skeleton
-                    // that keeps cost (§5) identical to P6.3.
-                    Child::Resident(n) => count(n),
-                    Child::OnDisk(_) => 1,
-                })
-                .sum::<usize>()
+            match node.children.first() {
+                None => 1,
+                Some(Child::OnDisk(_)) => 1 + node.children.len(),
+                Some(Child::Resident(first)) if first.is_leaf() => 1 + node.children.len(),
+                Some(Child::Resident(_)) => {
+                    1 + node
+                        .children
+                        .iter()
+                        .map(|c| match c {
+                            Child::Resident(n) => count(n),
+                            Child::OnDisk(_) => 1,
+                        })
+                        .sum::<usize>()
+                }
+            }
         }
         self.root.as_deref().map(count).unwrap_or(0)
     }
 
-    /// Root-to-leaf node count (`0` empty, `1` root leaf). Interior skeletons are resident and an
-    /// `OnDisk` child is always a leaf, so this never faults a page.
+    /// Root-to-leaf node count (`0` empty, `1` root leaf). Every leaf is at the same depth, so the
+    /// first-child path is the height; an `OnDisk` child is always a leaf, so this never faults a
+    /// page.
     pub(crate) fn height(&self) -> usize {
-        fn height(node: &Node) -> usize {
-            if node.children.is_empty() {
-                return 1;
-            }
-            1 + node
-                .children
-                .iter()
-                .map(|child| match child {
-                    Child::Resident(node) => height(node),
-                    Child::OnDisk(_) => 1,
-                })
-                .max()
-                .unwrap_or(0)
+        let mut height = 0;
+        let mut node = self.root.as_deref();
+        while let Some(n) = node {
+            height += 1;
+            node = match n.children.first() {
+                None => None,
+                Some(Child::OnDisk(_)) => {
+                    height += 1;
+                    None
+                }
+                Some(Child::Resident(child)) => Some(child),
+            };
         }
-        self.root.as_deref().map(height).unwrap_or(0)
+        height
     }
 
     /// Total on-disk record bytes stored in this tree — the sum of every leaf entry's `weight`
@@ -1648,7 +1657,8 @@ mod tests {
     /// fits a page; every leaf is non-empty; an interior node has `N+1` children (`N ≥ 0` only in
     /// the degenerate case — these small-key tests never produce it, so `N ≥ 1` is asserted);
     /// records (vals/weights) live only in leaves; all leaves at the same depth; and every key in
-    /// a subtree respects its bounding separators (left < sep ≤ right).
+    /// a subtree respects its bounding separators (left < sep ≤ right). Also checks the
+    /// leaf-skipping `node_count`/`height` against a full visit.
     fn check_invariants(pm: &PMap) {
         fn walk(
             node: &Node,
@@ -1720,9 +1730,21 @@ mod tests {
             }
             depth.unwrap() + 1
         }
-        if let Some(root) = &pm.root {
-            walk(root, true, CAP, None, None);
+        // node_count and height skip leaves via the same-depth invariant; they must equal a visit
+        // of every node.
+        fn all_nodes(node: &Node) -> usize {
+            1 + node
+                .children
+                .iter()
+                .map(|c| all_nodes(c.resident()))
+                .sum::<usize>()
         }
+        let (nodes, height) = match &pm.root {
+            Some(root) => (all_nodes(root), walk(root, true, CAP, None, None)),
+            None => (0, 0),
+        };
+        assert_eq!(pm.node_count(), nodes, "node_count vs full visit");
+        assert_eq!(pm.height(), height, "height vs walked depth");
     }
 
     #[test]
