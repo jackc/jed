@@ -44,6 +44,11 @@ JOIN region r ON r.id = c.region;`;
 FROM city c JOIN trip t ON c.zone = t.city_id
 WHERE c.zone < 8 AND t.id > 2;`;
 	const contradiction = `EXPLAIN SELECT name FROM city WHERE zone > 5 AND zone < 3;`;
+	const derivedPushdown = `EXPLAIN SELECT v.name
+FROM (SELECT id, name, region FROM city) v
+WHERE v.id = 3;`;
+	const onPushdown = `EXPLAIN SELECT c.name, t.id
+FROM city c LEFT JOIN trip t ON c.id = t.city_id AND t.id > 5;`;
 	const aggregate = `EXPLAIN SELECT region, count(*)
 FROM city GROUP BY region;`;
 	const analyze = `EXPLAIN ANALYZE SELECT name FROM city WHERE id = 3;`;
@@ -205,6 +210,23 @@ ends in `contradiction`, and every scan estimates (and costs) zero. An ungrouped
 its one row.
 
 <LiveSql seed={seed} query={contradiction} rows={4} />
+
+A condition on a subquery in `FROM` moves **into** the subquery when it only compares the subquery's
+plain output columns and the subquery has no `GROUP BY`, aggregate, window function, `LIMIT`, or
+`OFFSET`. The subquery is then planned as if you had written the condition inside it — here it
+becomes a primary-key lookup on `city` rather than a filter over every row the subquery returns.
+(A subquery that doesn't qualify, a `WITH` query, or a set-returning function in a join still gets
+the condition applied to its rows before the join, shown as `filter:conjuncts=N` on its node.)
+
+<LiveSql seed={seed} query={derivedPushdown} rows={4} />
+
+The same applies to a join's `ON`: a condition on one table moves to that table when the join allows
+it — either side of an inner join, or the side an outer join fills with NULLs. Here `t.id > 5` only
+decides which `trip` rows can match, so it runs in `trip`'s scan (and bounds its key); the join keeps
+`c.id = t.city_id`, and cities without a matching trip are still returned with NULLs. A condition on
+the side an outer join preserves stays in the `ON`.
+
+<LiveSql seed={seed} query={onPushdown} rows={4} />
 
 ## Aggregation
 

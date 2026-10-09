@@ -23,6 +23,14 @@ import (
 // runSelect: build the FROM scope, resolve every clause, infer $N types into ptypes. No row is
 // touched and no parameter is bound here (runQueryExpr binds once, after the whole tree is planned).
 func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*selectPlan, error) {
+	return db.planSelectPushed(sel, parent, ctes, ptypes, nil)
+}
+
+// planSelectPushed is planSelect with stage-2 body-pushed conjuncts (spec/design/planner.md §3.2)
+// appended to the resolved WHERE, in order, before the plan is rewritten and optimized: a derived
+// body planned again by its enclosing SELECT. The conjuncts are already resolved against this
+// SELECT's FROM slots.
+func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBinding, ptypes *paramTypes, pushed []*rExpr) (*selectPlan, error) {
 	// Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
 	// relation's flat column offset in FROM order, and reject a duplicate label — a self-join
 	// without distinct aliases is 42712 (spec/design/grammar.md §15). A FROM-less SELECT
@@ -950,6 +958,9 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 	// the plan outlives the scope and a correlated subquery can re-execute it per row). Resolve
 	// decides names, types, and errors — never an access path: plan.phys is zero-valued here, and
 	// only the optimizeSelect pass below writes it (spec/design/planner.md §2).
+	for _, c := range pushed {
+		filter = andConjunct(filter, c)
+	}
 	planRels := make([]planRel, len(s.rels))
 	for i, rel := range s.rels {
 		planRels[i] = planRel{tableName: rel.table.Name, db: rel.db, offset: rel.offset, colCount: len(rel.table.Columns), srf: srfPlans[i], cte: rel.cte, derived: derivedPlans[i], lateral: lateralFlags[i]}
@@ -969,10 +980,42 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 	// foldUncorrelatedInPlan is NOT a planner rewrite — it executes subqueries and needs bound
 	// params, so it stays post-bind in runQueryExpr.
 	rewriteWhere(plan)
+	if err := db.replanPushedBodies(plan, tableRefs, ctes, ptypes); err != nil {
+		return nil, err
+	}
 	//
 	// ——— Stage 3: physical/access-path selection (spec/design/planner.md §4) ———
 	db.optimizeSelect(plan, s.rels)
 	return plan, nil
+}
+
+// replanPushedBodies plans each derived body that stage 2 moved conjuncts into again from its syntax,
+// with those conjuncts appended to its WHERE (spec/design/planner.md §3.2), so the body's own
+// rewrite and access-path selection see them. Planning again must have no other effect: the CTE
+// reference counts the first planning recorded are restored, keeping every CTE's mode unchanged.
+func (db *engine) replanPushedBodies(plan *selectPlan, tableRefs []tableRef, ctes []*cteBinding, ptypes *paramTypes) error {
+	if plan.pushdown == nil || plan.pushdown.bodyPushes == nil {
+		return nil
+	}
+	for i, pushed := range plan.pushdown.bodyPushes {
+		if len(pushed) == 0 {
+			continue
+		}
+		refs := make([]int, len(ctes))
+		for ci, b := range ctes {
+			refs[ci] = b.refs
+		}
+		body, err := db.planSelectPushed(tableRefs[i].Subquery.Select, nil, ctes, ptypes, pushed)
+		for ci, b := range ctes {
+			b.refs = refs[ci]
+		}
+		if err != nil {
+			return err
+		}
+		plan.rels[i].derived = &queryPlan{sel: body}
+	}
+	plan.pushdown.bodyPushes = nil
+	return nil
 }
 
 // computeRelMasks computes the TOUCHED SET per relation (cost.md §3 "The touched set";

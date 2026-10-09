@@ -61,3 +61,60 @@ func TestWherePushdownBoundParameters(t *testing.T) {
 		}
 	}
 }
+
+// A bound parameter in a conjunct moved into a derived body (planner.md §3.2) or pushed from an ON
+// (§3.3) reads the bound value where it now runs, charges exactly like the literal spelling, and a
+// prepared statement's cached plan keeps the rewrite (the body was planned again once, before bind).
+func TestDerivedAndOnPushdownBoundParameters(t *testing.T) {
+	t.Parallel()
+	db := dbWith(
+		t,
+		"CREATE TABLE a (id i32 PRIMARY KEY, k i32, v i32)",
+		"CREATE TABLE b (id i32 PRIMARY KEY, k i32, w i32)",
+		"INSERT INTO a VALUES (1, 1, 10), (2, 2, 20), (3, 3, NULL), (4, 9, 40)",
+		"INSERT INTO b VALUES (11, 1, 5), (12, 2, NULL), (13, 2, 7), (14, 7, 0), (15, 8, 1)",
+	)
+	for _, tc := range []struct {
+		param, literal string
+		value          int64
+		want           []int64
+	}{
+		{
+			param:   "SELECT d.id FROM (SELECT id, v FROM a) d WHERE d.id = $1",
+			literal: "SELECT d.id FROM (SELECT id, v FROM a) d WHERE d.id = 2",
+			value:   2, want: []int64{2},
+		},
+		{
+			param:   "SELECT a.id FROM a LEFT JOIN b ON a.k = b.k AND b.w > $1 WHERE b.id IS NOT NULL ORDER BY a.id",
+			literal: "SELECT a.id FROM a LEFT JOIN b ON a.k = b.k AND b.w > 4 WHERE b.id IS NOT NULL ORDER BY a.id",
+			value:   4, want: []int64{1, 2},
+		},
+	} {
+		stmt, err := db.Prepare(tc.param)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lit := mustCost(t, db, tc.literal)
+		for _, run := range []func() (outcome, error){
+			func() (outcome, error) { return queryOutcome(db, tc.param, []Value{IntValue(tc.value)}) },
+			func() (outcome, error) { return prepOutcome(db, stmt, []Value{IntValue(tc.value)}) },
+			func() (outcome, error) { return prepOutcome(db, stmt, []Value{IntValue(tc.value)}) },
+		} {
+			out, err := run()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(out.Rows) != len(tc.want) {
+				t.Fatalf("%s: rows = %v, want %v", tc.param, out.Rows, tc.want)
+			}
+			for i, row := range out.Rows {
+				if row[0].Int != tc.want[i] {
+					t.Fatalf("%s: rows = %v, want %v", tc.param, out.Rows, tc.want)
+				}
+			}
+			if out.Cost != lit {
+				t.Errorf("%s: parameter cost %d, literal cost %d", tc.param, out.Cost, lit)
+			}
+		}
+	}
+}

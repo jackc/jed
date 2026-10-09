@@ -4,6 +4,28 @@
 
 use super::*;
 
+/// Append relation `i`'s scan-pushed filter (planner.md §3.2) to its node detail:
+/// `filter:conjuncts=N`, VERBOSE `filter=<expr>`. A computed relation's otherwise-empty detail is `-`.
+fn pushed_filter_detail(sp: &SelectPlan, i: usize, detail: String, verbose: bool) -> String {
+    let Some(pushed) = sp.pushed_filter(i) else {
+        return if detail.is_empty() {
+            "-".to_string()
+        } else {
+            detail
+        };
+    };
+    let part = if verbose {
+        format!("filter={}", render_rexpr(pushed))
+    } else {
+        format!("filter:conjuncts={}", conjunct_count(pushed))
+    };
+    if detail.is_empty() {
+        part
+    } else {
+        format!("{detail}; {part}")
+    }
+}
+
 pub(crate) fn select_actual_root_node(sp: &SelectPlan) -> String {
     if sp.limit.is_some() || sp.offset.is_some() {
         return "Limit".to_string();
@@ -796,31 +818,34 @@ impl Engine {
         if n == 1 {
             return self.render_rel_leaf(r, sp, 0, depth, note);
         }
-        let j = &sp.joins[n - 2];
+        // The join renders its residual ON; conjuncts pushed to a relation render there
+        // (planner.md §3.3).
+        let kind = sp.joins[n - 2].kind;
+        let on = sp.join_on(n - 2);
         let (node, detail) = if n == 2 {
             match &sp.phys.hash_join {
                 Some(hash) => (
                     "Hash Join",
-                    match &j.on {
+                    match &on {
                         Some(on) if r.verbose => format!(
                             "{}; keys={}; on={}",
-                            join_kind_text(j.kind),
+                            join_kind_text(kind),
                             hash.keys.len(),
-                            render_rexpr(on)
+                            on.render()
                         ),
                         Some(on) => format!(
                             "{}; keys={}; on:conjuncts={}",
-                            join_kind_text(j.kind),
+                            join_kind_text(kind),
                             hash.keys.len(),
-                            conjunct_count(on)
+                            on.conjunct_count()
                         ),
-                        None => format!("{}; keys={}", join_kind_text(j.kind), hash.keys.len()),
+                        None => format!("{}; keys={}", join_kind_text(kind), hash.keys.len()),
                     },
                 ),
-                None => ("Nested Loop", join_detail(j, r.verbose)),
+                None => ("Nested Loop", join_detail(kind, on.as_ref(), r.verbose)),
             }
         } else {
-            ("Nested Loop", join_detail(j, r.verbose))
+            ("Nested Loop", join_detail(kind, on.as_ref(), r.verbose))
         };
         r.emit(depth, node, with_note(detail, note));
         if n == 2 && sp.phys.relation_order.len() == 2 {
@@ -843,10 +868,11 @@ impl Engine {
             return self.render_rel_leaf(r, sp, sp.phys.relation_order[0], depth, note);
         }
         let step = &sp.phys.join_steps[n - 2];
+        // Each join's residual ON (planner.md §3.3).
         let ons: Vec<_> = step
             .on_indices
             .iter()
-            .filter_map(|index| sp.joins[*index].on.as_ref())
+            .filter_map(|index| sp.join_on(*index))
             .collect();
         let step_kind = step.on_indices.iter().fold(
             if step.on_indices.is_empty() {
@@ -862,17 +888,17 @@ impl Engine {
         let kind = join_kind_text(step_kind);
         let on_detail = match ons.len() {
             0 => String::new(),
-            1 if !r.verbose => format!("; on:conjuncts={}", conjunct_count(ons[0])),
+            1 if !r.verbose => format!("; on:conjuncts={}", ons[0].conjunct_count()),
             _ if !r.verbose => format!(
                 "; on:predicates={},conjuncts={}",
                 ons.len(),
-                ons.iter().map(|on| conjunct_count(on)).sum::<i64>()
+                ons.iter().map(FilterChain::conjunct_count).sum::<i64>()
             ),
-            1 => format!("; on={}", render_rexpr(ons[0])),
+            1 => format!("; on={}", ons[0].render()),
             _ => format!(
                 "; on=[{}]",
                 ons.iter()
-                    .map(|on| render_rexpr(on))
+                    .map(FilterChain::render)
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -915,28 +941,36 @@ impl Engine {
                 r.emit(
                     depth,
                     format!("Catalog Scan {}", rel.table_name),
-                    with_note(&format!("db={}", srf.introspect_scope), note),
+                    with_note(
+                        pushed_filter_detail(
+                            sp,
+                            i,
+                            format!("db={}", srf.introspect_scope),
+                            r.verbose,
+                        ),
+                        note,
+                    ),
                 );
                 return Ok(());
             }
             r.emit(
                 depth,
                 format!("SRF {}", rel.table_name),
-                with_note("-", note),
+                with_note(pushed_filter_detail(sp, i, String::new(), r.verbose), note),
             );
             Ok(())
         } else if rel.cte.is_some() {
             r.emit(
                 depth,
                 format!("CTE Scan {}", rel.table_name),
-                with_note("-", note),
+                with_note(pushed_filter_detail(sp, i, String::new(), r.verbose), note),
             );
             Ok(())
         } else if let Some(derived) = &rel.derived {
             r.emit(
                 depth,
                 format!("Subquery {}", rel.table_name),
-                with_note("-", note),
+                with_note(pushed_filter_detail(sp, i, String::new(), r.verbose), note),
             );
             self.render_query_plan(r, derived, depth + 1)
         } else {
@@ -946,15 +980,12 @@ impl Engine {
                 Some(b) => (Some(b), true),
                 None => (sp.phys.rel_bounds[i].as_ref(), false),
             };
-            let mut detail = self.scan_detail(&rel.table_name, bound, inl, &sp.rel_masks[i]);
-            // A pushed WHERE filter (planner.md §3.2) runs inside the scan, so it renders on the Scan.
-            if let Some(pushed) = sp.pushed_filter(i) {
-                if r.verbose {
-                    detail.push_str(&format!("; filter={}", render_rexpr(pushed)));
-                } else {
-                    detail.push_str(&format!("; filter:conjuncts={}", conjunct_count(pushed)));
-                }
-            }
+            let detail = pushed_filter_detail(
+                sp,
+                i,
+                self.scan_detail(&rel.table_name, bound, inl, &sp.rel_masks[i]),
+                r.verbose,
+            );
             r.emit(
                 depth,
                 format!("Scan {}", rel.table_name),

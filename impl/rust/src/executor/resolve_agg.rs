@@ -296,7 +296,7 @@ pub(crate) fn collect_touched_plan(plan: &QueryPlan, depth: usize, touched: &mut
                     collect_touched(on, depth, touched);
                 }
             }
-            if let Some(f) = &sp.filter {
+            if let Some(f) = sp.filter.get() {
                 collect_touched(f, depth, touched);
             }
             if let Some(h) = &sp.having {

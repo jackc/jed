@@ -511,7 +511,13 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   **where_pushdown** — single-relation WHERE conjuncts over INNER/LEFT/RIGHT/FULL and three-relation
   joins run inside their preserved base relation's scan ([planner.md §3.2](planner.md)), defeated by
   writing each column as `col + 0` (arithmetic never moves), over NULL-bearing data where a conjunct
-  wrongly pushed to a NULL-extended side changes the answer; **contradiction** — a plan-time-proven
+  wrongly pushed to a NULL-extended side changes the answer; **on_pushdown** — single-relation ON
+  conjuncts over INNER/LEFT/RIGHT/FULL, a NULL-extended derived side, and a three-relation chain whose
+  later INNER ON reads a relation an earlier LEFT JOIN NULL-extends ([planner.md §3.3](planner.md)),
+  defeated by `col + 0`; **derived_pushdown** — conjuncts moved into derived bodies (with their own
+  WHERE, DISTINCT, a join; never through LIMIT) or onto a CTE reference / SRF in a join, and a
+  NULL-extended derived table that must keep its conjunct ([planner.md §3.2](planner.md)), defeated by
+  `col + 0`; **contradiction** — a plan-time-proven
   empty bare-column literal AND-chain reads nothing ([planner.md §3.1](planner.md)) and must agree with
   the unproven `col + 0` spelling (empty rows, a zero ungrouped COUNT), plus satisfiable near-miss
   ranges;

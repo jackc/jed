@@ -1123,11 +1123,14 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   cross-core identical, and are summarized by `jed_statistics`. See
   `spec/design/statistics.md`; automatic analyze and extended/correlation statistics remain deferred.
   Stage-2 rewrites now precede physical selection (`spec/design/planner.md` §3): a WHERE whose
-  literals contradict on a bare column (or a literal FALSE/NULL conjunct) reads no relation, and in a
-  join each structurally non-trapping single-base-table conjunct on a preserved side runs inside that
-  table's scan, leaving only the residual above the join. Each rewrite carries an explicit cost
-  decision, may skip but never introduce an error, and keeps the complete WHERE as the input to
-  access-path detection and estimation.
+  literals contradict on a bare column (or a literal FALSE/NULL conjunct) reads no relation; in a
+  join each structurally non-trapping single-relation conjunct on a preserved side runs inside that
+  relation's scan (base table, derived table, CTE reference, SRF), leaving only the residual above the
+  join; such a conjunct over a derived table's bare output columns moves into the body, which is
+  planned again so it can bound the body's key; and a join's single-relation ON conjunct on the side
+  the join kind allows is pushed the same way (and may bound that relation's scan), leaving a
+  residual ON. Each rewrite carries an explicit cost decision, may skip but never introduce an error,
+  and keeps the complete WHERE and ON as the inputs to access-path detection and estimation.
 - **Ceiling + abort.** A caller may set a **maximum cost**; the instant accrued cost reaches
   it, execution **aborts deterministically** with a defined error code (registered in
   `spec/errors/`). The abort point is itself deterministic (same query + db + ceiling → same

@@ -2,41 +2,140 @@
 //! resolve has built the logical plan and before `optimize_select` chooses access paths. Its rules
 //! are pure plan→plan transforms: they never execute anything and never read a parameter value.
 //!
-//! The WHERE rewrite owns two decisions, recorded in `plan.pushdown` and never by mutating
-//! `plan.filter` (the complete WHERE stays the input every access-path detector and estimator rule
-//! reads):
+//! The predicate rewrite owns three decisions, recorded in `plan.pushdown` and never by mutating
+//! the WHERE or a join's ON (the complete predicates stay the input every access-path detector and
+//! estimator rule reads):
 //!
 //!   - contradiction: the WHERE's top-level AND-chain is provably never TRUE from plan-time
 //!     literals alone, so no relation is read and the FROM produces no rows (planner.md §3.1);
-//!   - pushdown: in a multi-relation SELECT, each structurally safe single-base-relation conjunct of
-//!     a relation no outer join NULL-extends is evaluated as that relation's rows are read, and only
-//!     the remaining conjuncts are re-applied to the joined rows (planner.md §3.2).
+//!   - WHERE pushdown: each structurally safe single-relation conjunct of a relation no outer join
+//!     NULL-extends moves into a derived table's body, or runs as that relation's rows are read, and
+//!     only the remaining conjuncts are re-applied to the joined rows (planner.md §3.2);
+//!   - ON pushdown: the same for a join's ON conjunct over the join's NULL-extended side, or either
+//!     side of an INNER join (planner.md §3.3).
 //!
-//! Rust note: a resolved `RExpr` is not `Clone` (a subquery owns its plan), so the residual cannot
-//! be an owned tree beside `filter`. It is recorded as the residual conjuncts' positions in the
-//! flattened WHERE and borrowed as a [`FilterChain`] — the same nodes the Go core's residual shares
-//! with its `filter`, so the uncorrelated-subquery fold reaches both. The pushed filters hold only
-//! pushdown-safe nodes, so they are real (cloned) trees.
+//! A body pushdown is the one decision that changes a predicate: `plan_select` plans the derived
+//! body again with the moved conjuncts appended to its WHERE (`body_pushes`).
+//!
+//! Rust note: a resolved `RExpr` is not `Clone` (a subquery owns its plan), so a residual cannot be
+//! an owned tree beside the WHERE / ON. It is recorded as the residual conjuncts' positions in the
+//! flattened predicate and borrowed as a [`FilterChain`] — the same nodes the Go core's residual
+//! shares with its `filter` / ON, so the uncorrelated-subquery fold reaches both. The pushed filters
+//! hold only pushdown-safe nodes, so they are real (cloned) trees. The stage-3 access predicate (the
+//! WHERE AND each scan-pushed ON conjunct) must be a real tree that contains the WHERE, so
+//! [`PlanFilter`] owns it and reaches the WHERE down its left spine.
 
 use super::*;
 
-/// The stage-2 WHERE split. `rel_filters` / `rel_local` hold one entry per relation (`None`:
-/// nothing pushed; both empty on a contradiction); `residual` lists the positions, in the flattened
-/// top-level AND-chain of `filter`, of the conjuncts left for the joined rows (empty when every
-/// conjunct was pushed).
+/// A SELECT's WHERE, owned together with the stage-3 **access predicate** built around it. When no
+/// ON conjunct is scan-pushed (the common case) the tree IS the WHERE. Otherwise stage 2 wraps it as
+/// the left-deep `((WHERE AND c1) AND c2)` of the scan-pushed ON conjuncts in source order (or
+/// `(c1 AND c2)` with no WHERE), so the WHERE is the node `appended` steps down the left spine.
+pub(crate) struct PlanFilter {
+    tree: Option<RExpr>,
+    appended: usize,
+    has_where: bool,
+}
+
+impl PlanFilter {
+    pub(crate) fn new(filter: Option<RExpr>) -> Self {
+        PlanFilter {
+            has_where: filter.is_some(),
+            tree: filter,
+            appended: 0,
+        }
+    }
+
+    /// The complete WHERE (`None`: the SELECT has none).
+    pub(crate) fn get(&self) -> Option<&RExpr> {
+        if !self.has_where {
+            return None;
+        }
+        let mut e = self.tree.as_ref()?;
+        for _ in 0..self.appended {
+            let RExpr::And(lhs, _) = e else {
+                unreachable!("the access predicate's left spine holds the WHERE")
+            };
+            e = lhs;
+        }
+        Some(e)
+    }
+
+    /// The complete WHERE, mutably (the post-bind uncorrelated-subquery fold).
+    pub(crate) fn get_mut(&mut self) -> Option<&mut RExpr> {
+        if !self.has_where {
+            return None;
+        }
+        let mut e = self.tree.as_mut()?;
+        for _ in 0..self.appended {
+            let RExpr::And(lhs, _) = e else {
+                unreachable!("the access predicate's left spine holds the WHERE")
+            };
+            e = lhs;
+        }
+        Some(e)
+    }
+
+    /// The complete WHERE, by value (tests that inspect a planned WHERE).
+    #[cfg(test)]
+    pub(crate) fn into_where(self) -> Option<RExpr> {
+        if !self.has_where {
+            return None;
+        }
+        let mut e = self.tree?;
+        for _ in 0..self.appended {
+            let RExpr::And(lhs, _) = e else {
+                unreachable!("the access predicate's left spine holds the WHERE")
+            };
+            e = *lhs;
+        }
+        Some(e)
+    }
+
+    pub(crate) fn is_some(&self) -> bool {
+        self.has_where
+    }
+
+    /// The predicate stage 3 reads for single-relation access paths: the complete WHERE AND every
+    /// ON conjunct scan-pushed to a relation — for its relation such a conjunct is a WHERE
+    /// conjunct, so it may bound that relation's scan (planner.md §3.3).
+    pub(crate) fn access(&self) -> Option<&RExpr> {
+        self.tree.as_ref()
+    }
+
+    fn append_access(&mut self, c: RExpr) {
+        self.tree = Some(and_conjunct(self.tree.take(), c));
+        self.appended += 1;
+    }
+}
+
+/// The stage-2 predicate split. `rel_filters` / `rel_local` hold one entry per relation (`None`:
+/// nothing scan-pushed; all empty on a contradiction). `residual` lists the positions, in the
+/// flattened top-level AND-chain of the WHERE, of the conjuncts left for the joined rows when
+/// `where_split` (empty when every conjunct moved); `on_residual[k]` does the same for join `k`'s ON
+/// when `on_split[k]`.
 pub(crate) struct WherePushdown {
     contradiction: bool,
-    /// The pushed filters in the plan's global slot numbering (EXPLAIN, estimator).
+    /// The scan-pushed filters in the plan's global slot numbering (EXPLAIN, estimator).
     rel_filters: Vec<Option<RExpr>>,
     /// The same filters rebased to the relation's own row (execution).
     rel_local: Vec<Option<RExpr>>,
+    /// At least one WHERE conjunct moved, so `residual` replaces the WHERE over joined rows.
+    where_split: bool,
     residual: Vec<usize>,
+    /// `on_split[k]`: join `k`'s ON lost at least one conjunct; `on_residual[k]` then replaces it at
+    /// execution (empty: the join has no ON predicate left).
+    on_split: Vec<bool>,
+    on_residual: Vec<Vec<usize>>,
+    /// `body_pushes[i]`: the conjuncts moved into derived relation `i`'s body, rewritten to the
+    /// body's column slots, in source order. `plan_select` consumes them by planning the body again.
+    body_pushes: Vec<Vec<RExpr>>,
 }
 
-/// A post-join WHERE: the left-deep AND, in source order, of `conjuncts`. A one-element chain is that
-/// expression itself — the complete WHERE when nothing was pushed. Every operation below reproduces
-/// exactly what the same operation does on the equivalent `RExpr::And` tree (eval order, guards and
-/// charges, rendering, estimator recursion), so the chain is observably that tree.
+/// A post-join predicate: the left-deep AND, in source order, of `conjuncts`. A one-element chain is
+/// that expression itself — the complete WHERE / ON when nothing was pushed. Every operation below
+/// reproduces exactly what the same operation does on the equivalent `RExpr::And` tree (eval order,
+/// guards and charges, rendering, estimator recursion), so the chain is observably that tree.
 pub(crate) struct FilterChain<'a> {
     pub(crate) conjuncts: Vec<&'a RExpr>,
 }
@@ -82,22 +181,26 @@ impl FilterChain<'_> {
     }
 }
 
+/// The chain of the conjuncts at `positions` in `predicate`'s flattened top-level AND-chain (`None`
+/// when no position is left).
+fn residual_chain<'a>(predicate: &'a RExpr, positions: &[usize]) -> Option<FilterChain<'a>> {
+    if positions.is_empty() {
+        return None;
+    }
+    let mut all = Vec::new();
+    estimator_flatten_boolean(predicate, true, &mut all);
+    Some(FilterChain {
+        conjuncts: positions.iter().map(|&i| all[i]).collect(),
+    })
+}
+
 impl SelectPlan {
-    /// The WHERE that remains to be evaluated over the joined rows: the residual after a pushdown,
-    /// otherwise the complete WHERE. A contradiction never reaches it (no row is produced).
+    /// The WHERE that remains to be evaluated over the joined rows: the residual after a WHERE
+    /// pushdown, otherwise the complete WHERE. A contradiction never reaches it (no row is produced).
     pub(crate) fn post_join_filter(&self) -> Option<FilterChain<'_>> {
-        let filter = self.filter.as_ref()?;
+        let filter = self.filter.get()?;
         match &self.pushdown {
-            Some(pd) if !pd.contradiction => {
-                if pd.residual.is_empty() {
-                    return None;
-                }
-                let mut all = Vec::new();
-                estimator_flatten_boolean(filter, true, &mut all);
-                Some(FilterChain {
-                    conjuncts: pd.residual.iter().map(|&i| all[i]).collect(),
-                })
-            }
+            Some(pd) if !pd.contradiction && pd.where_split => residual_chain(filter, &pd.residual),
             _ => Some(FilterChain {
                 conjuncts: vec![filter],
             }),
@@ -107,9 +210,28 @@ impl SelectPlan {
     /// Whether [`SelectPlan::post_join_filter`] is present (without building the chain).
     pub(crate) fn has_post_join_filter(&self) -> bool {
         match &self.pushdown {
-            Some(pd) if !pd.contradiction => !pd.residual.is_empty(),
+            Some(pd) if !pd.contradiction && pd.where_split => !pd.residual.is_empty(),
             _ => self.filter.is_some(),
         }
+    }
+
+    /// The ON that join `k` evaluates over its candidate pairs: the residual after an ON pushdown
+    /// (`None` when nothing remains), otherwise the complete ON (planner.md §3.3).
+    pub(crate) fn join_on(&self, k: usize) -> Option<FilterChain<'_>> {
+        let on = self.joins[k].on.as_ref()?;
+        match &self.pushdown {
+            Some(pd) if !pd.contradiction && pd.on_split.get(k).copied().unwrap_or(false) => {
+                residual_chain(on, &pd.on_residual[k])
+            }
+            _ => Some(FilterChain {
+                conjuncts: vec![on],
+            }),
+        }
+    }
+
+    /// [`SelectPlan::join_on`] of every join, in join order — built once before a per-pair loop.
+    pub(crate) fn join_ons(&self) -> Vec<Option<FilterChain<'_>>> {
+        (0..self.joins.len()).map(|k| self.join_on(k)).collect()
     }
 
     /// Stage 2 proved the WHERE never TRUE (planner.md §3.1).
@@ -117,7 +239,7 @@ impl SelectPlan {
         self.pushdown.as_ref().is_some_and(|pd| pd.contradiction)
     }
 
-    /// Relation `ri`'s pushed filter in global slots (EXPLAIN, estimator), or `None`.
+    /// Relation `ri`'s scan-pushed filter in global slots (EXPLAIN, estimator), or `None`.
     pub(crate) fn pushed_filter(&self, ri: usize) -> Option<&RExpr> {
         let pd = self.pushdown.as_ref()?;
         if pd.contradiction {
@@ -126,7 +248,7 @@ impl SelectPlan {
         pd.rel_filters.get(ri)?.as_ref()
     }
 
-    /// Relation `ri`'s pushed filter rebased to the relation's own row (execution), or `None`.
+    /// Relation `ri`'s scan-pushed filter rebased to the relation's own row (execution), or `None`.
     pub(crate) fn pushed_local_filter(&self, ri: usize) -> Option<&RExpr> {
         let pd = self.pushdown.as_ref()?;
         if pd.contradiction {
@@ -134,48 +256,132 @@ impl SelectPlan {
         }
         pd.rel_local.get(ri)?.as_ref()
     }
+
+    /// Take the conjuncts stage 2 moved into each derived body (one list per relation, empty when
+    /// none), leaving none behind: `plan_select` plans those bodies again (planner.md §3.2).
+    pub(crate) fn take_body_pushes(&mut self) -> Vec<Vec<RExpr>> {
+        match &mut self.pushdown {
+            Some(pd) if !pd.contradiction => std::mem::take(&mut pd.body_pushes),
+            _ => Vec::new(),
+        }
+    }
 }
 
-/// The stage-2 driver: contradiction detection first (it subsumes pushdown), then WHERE pushdown. A
-/// plan without a WHERE is untouched.
+/// One conjunct moved by stage 2, in source order: to relation `ri`'s body (`body`, already
+/// rewritten to body slots) or to its scan; `on` marks a conjunct from a join's ON.
+struct PushedConjunct {
+    expr: RExpr,
+    ri: usize,
+    body: bool,
+    on: bool,
+}
+
+/// The stage-2 driver: contradiction detection first (it subsumes pushdown), then ON pushdown (join
+/// order) and WHERE pushdown, whose moved conjuncts are collected in that source order. A plan
+/// without a WHERE or an ON is untouched.
 pub(crate) fn rewrite_where(plan: &mut SelectPlan) {
-    let Some(filter) = plan.filter.as_ref() else {
-        return;
-    };
     let mut conjuncts = Vec::new();
-    estimator_flatten_boolean(filter, true, &mut conjuncts);
-    if where_conjuncts_contradict(&conjuncts) {
-        plan.pushdown = Some(WherePushdown {
-            contradiction: true,
-            rel_filters: Vec::new(),
-            rel_local: Vec::new(),
-            residual: Vec::new(),
-        });
-        return;
-    }
-    if plan.rels.len() < 2 {
-        return;
-    }
-    let nullable = nullable_relations(plan);
-    let mut owners: Vec<Option<usize>> = Vec::with_capacity(conjuncts.len());
-    for c in &conjuncts {
-        let owner = conjunct_single_relation(plan, c)
-            .filter(|&ri| !nullable[ri] && pushdown_target(&plan.rels[ri]) && pushdown_safe(c));
-        owners.push(owner);
-    }
-    if owners.iter().all(Option::is_none) {
-        return;
-    }
-    let mut rel_filters: Vec<Option<RExpr>> = (0..plan.rels.len()).map(|_| None).collect();
-    let mut residual = Vec::new();
-    for (i, c) in conjuncts.iter().enumerate() {
-        match owners[i] {
-            Some(ri) => {
-                let acc = rel_filters[ri].take();
-                rel_filters[ri] = Some(and_conjunct(acc, clone_pushdown_safe(c)));
-            }
-            None => residual.push(i),
+    if let Some(filter) = plan.filter.get() {
+        estimator_flatten_boolean(filter, true, &mut conjuncts);
+        if where_conjuncts_contradict(&conjuncts) {
+            plan.pushdown = Some(WherePushdown {
+                contradiction: true,
+                rel_filters: Vec::new(),
+                rel_local: Vec::new(),
+                where_split: false,
+                residual: Vec::new(),
+                on_split: Vec::new(),
+                on_residual: Vec::new(),
+                body_pushes: Vec::new(),
+            });
+            return;
         }
+    }
+    let bodies: Vec<Option<&SelectPlan>> = plan.rels.iter().map(body_pushable).collect();
+    // The form a pushdown-safe single-relation conjunct takes (planner.md §3.2): into a
+    // body-pushable derived body when every referenced output is a bare body column, else a scan
+    // pushdown when the SELECT has another relation to join, else nothing.
+    let target = |c: &RExpr, ri: usize| -> Option<(RExpr, bool)> {
+        if plan.rels[ri].lateral || !pushdown_safe(c) {
+            return None;
+        }
+        if let Some(body) = bodies[ri]
+            && let Some(moved) = substitute_body_columns(c, plan.rels[ri].offset, body)
+        {
+            return Some((moved, true));
+        }
+        if plan.rels.len() < 2 {
+            return None;
+        }
+        Some((clone_pushdown_safe(c), false))
+    };
+
+    let mut pushes: Vec<PushedConjunct> = Vec::new();
+    let mut on_split = vec![false; plan.joins.len()];
+    let mut on_residual: Vec<Vec<usize>> = vec![Vec::new(); plan.joins.len()];
+    // prefix_nullable[i] marks a relation NULL-extended by an earlier join (joins[0..k-1]).
+    let mut prefix_nullable = vec![false; plan.rels.len()];
+    for (k, j) in plan.joins.iter().enumerate() {
+        if let Some(on) = &j.on {
+            let mut on_conjuncts = Vec::new();
+            estimator_flatten_boolean(on, true, &mut on_conjuncts);
+            for (pos, c) in on_conjuncts.iter().enumerate() {
+                if let Some(ri) = conjunct_single_relation(plan, c)
+                    && on_pushdown_side(j.kind, k, ri, &prefix_nullable)
+                    && let Some((expr, body)) = target(c, ri)
+                {
+                    pushes.push(PushedConjunct {
+                        expr,
+                        ri,
+                        body,
+                        on: true,
+                    });
+                    on_split[k] = true;
+                    continue;
+                }
+                on_residual[k].push(pos);
+            }
+        }
+        mark_join_nullable(&mut prefix_nullable, j.kind, k);
+    }
+
+    let mut where_split = false;
+    let mut residual = Vec::new();
+    // After the loop: every relation an outer join NULL-extends.
+    let nullable = prefix_nullable;
+    for (pos, c) in conjuncts.iter().enumerate() {
+        if let Some(ri) = conjunct_single_relation(plan, c)
+            && !nullable[ri]
+            && let Some((expr, body)) = target(c, ri)
+        {
+            pushes.push(PushedConjunct {
+                expr,
+                ri,
+                body,
+                on: false,
+            });
+            where_split = true;
+            continue;
+        }
+        residual.push(pos);
+    }
+    drop(conjuncts);
+    if pushes.is_empty() {
+        return;
+    }
+    let n = plan.rels.len();
+    let mut rel_filters: Vec<Option<RExpr>> = (0..n).map(|_| None).collect();
+    let mut body_pushes: Vec<Vec<RExpr>> = (0..n).map(|_| Vec::new()).collect();
+    for p in pushes {
+        if p.body {
+            body_pushes[p.ri].push(p.expr);
+            continue;
+        }
+        if p.on {
+            plan.filter.append_access(clone_pushdown_safe(&p.expr));
+        }
+        let acc = rel_filters[p.ri].take();
+        rel_filters[p.ri] = Some(and_conjunct(acc, p.expr));
     }
     let rel_local = rel_filters
         .iter()
@@ -186,8 +392,73 @@ pub(crate) fn rewrite_where(plan: &mut SelectPlan) {
         contradiction: false,
         rel_filters,
         rel_local,
+        where_split,
         residual,
+        on_split,
+        on_residual,
+        body_pushes,
     });
+}
+
+/// Whether join `k`'s kind lets an ON conjunct over relation `ri` move to that relation (planner.md
+/// §3.3): either input of INNER, the NULL-extended input of LEFT/RIGHT, never FULL. A left input
+/// must not already be NULL-extended by an earlier join.
+fn on_pushdown_side(kind: JoinKind, k: usize, ri: usize, prefix_nullable: &[bool]) -> bool {
+    let right = ri == k + 1;
+    match kind {
+        JoinKind::Inner => right || (ri <= k && !prefix_nullable[ri]),
+        JoinKind::Left => right,
+        JoinKind::Right => ri <= k && !prefix_nullable[ri],
+        _ => false,
+    }
+}
+
+/// Record the relations join `k` NULL-extends in the left-deep FROM: `joins[k]` attaches
+/// `rels[k+1]` to the accumulated `rels[0..=k]`.
+fn mark_join_nullable(nullable: &mut [bool], kind: JoinKind, k: usize) {
+    if matches!(kind, JoinKind::Left | JoinKind::Full) {
+        nullable[k + 1] = true;
+    }
+    if matches!(kind, JoinKind::Right | JoinKind::Full) {
+        for n in nullable.iter_mut().take(k + 1) {
+            *n = true;
+        }
+    }
+}
+
+/// A derived relation's body when conjuncts may move into it (planner.md §3.2): a non-lateral single
+/// SELECT with no aggregate/GROUP BY, window function, LIMIT, or OFFSET. `None` otherwise (any other
+/// relation, or a set operation / VALUES / nested WITH body).
+fn body_pushable(rel: &PlanRel) -> Option<&SelectPlan> {
+    if rel.lateral {
+        return None;
+    }
+    let QueryPlan::Select(body) = rel.derived.as_deref()? else {
+        return None;
+    };
+    if body.is_agg
+        || !body.group_sets.is_empty()
+        || body.having.is_some()
+        || body.has_window
+        || body.limit.is_some()
+        || body.offset.is_some()
+    {
+        return None;
+    }
+    Some(body)
+}
+
+/// Clone a pushdown-safe conjunct over a derived relation (whose columns start at `offset`) with
+/// every column replaced by the body column its select-list item names. `None` when a referenced
+/// output is not a bare column of the body.
+fn substitute_body_columns(e: &RExpr, offset: usize, body: &SelectPlan) -> Option<RExpr> {
+    map_pushdown_safe(
+        e,
+        &|slot| match body.projections.get(slot.checked_sub(offset)?)? {
+            RExpr::Column(c) => Some(*c),
+            _ => None,
+        },
+    )
 }
 
 /// The plan-time contradiction proof (planner.md §3.1): a literal FALSE or NULL conjunct, a
@@ -242,29 +513,6 @@ fn literal_comparison_false(c: &RExpr) -> bool {
         return false;
     }
     estimator_literal_cmp(lhs, rhs).is_some_and(|order| !estimator_comparison_satisfied(order, *op))
-}
-
-/// Mark every relation an outer join NULL-extends in the left-deep FROM: `joins[k]` attaches
-/// `rels[k+1]` to the accumulated `rels[0..=k]`.
-fn nullable_relations(plan: &SelectPlan) -> Vec<bool> {
-    let mut nullable = vec![false; plan.rels.len()];
-    for (k, j) in plan.joins.iter().enumerate() {
-        if matches!(j.kind, JoinKind::Left | JoinKind::Full) {
-            nullable[k + 1] = true;
-        }
-        if matches!(j.kind, JoinKind::Right | JoinKind::Full) {
-            for n in nullable.iter_mut().take(k + 1) {
-                *n = true;
-            }
-        }
-    }
-    nullable
-}
-
-/// Admit only a non-lateral base table: its rows are read by an access path, so the pushed filter
-/// runs exactly where the scan admits each row.
-fn pushdown_target(rel: &PlanRel) -> bool {
-    rel.srf.is_none() && rel.cte.is_none() && rel.derived.is_none() && !rel.lateral
 }
 
 /// The one relation whose columns `c` references; `None` when it references none or several. Only
@@ -357,13 +605,19 @@ fn clone_pushdown_safe(e: &RExpr) -> RExpr {
 /// Clone a pushdown-safe tree with every column slot shifted down by `offset`, so it evaluates
 /// against the relation's own row. Only the `pushdown_safe` node kinds reach it.
 fn rebase_columns(e: &RExpr, offset: usize) -> RExpr {
-    let boxed = |e: &RExpr| Box::new(rebase_columns(e, offset));
-    match e {
-        RExpr::Column(i) => RExpr::Column(i - offset),
+    map_pushdown_safe(e, &|slot| Some(slot - offset)).expect("every column slot is rebased")
+}
+
+/// Clone a pushdown-safe tree with every column slot mapped through `column` (`None` from it fails
+/// the clone). Only the `pushdown_safe` node kinds and the `estimator_literal` leaves reach it.
+fn map_pushdown_safe(e: &RExpr, column: &dyn Fn(usize) -> Option<usize>) -> Option<RExpr> {
+    let boxed = |e: &RExpr| map_pushdown_safe(e, column).map(Box::new);
+    Some(match e {
+        RExpr::Column(i) => RExpr::Column(column(*i)?),
         RExpr::Param(i) => RExpr::Param(*i),
-        RExpr::And(l, r) => RExpr::And(boxed(l), boxed(r)),
-        RExpr::Or(l, r) => RExpr::Or(boxed(l), boxed(r)),
-        RExpr::Not(operand) => RExpr::Not(boxed(operand)),
+        RExpr::And(l, r) => RExpr::And(boxed(l)?, boxed(r)?),
+        RExpr::Or(l, r) => RExpr::Or(boxed(l)?, boxed(r)?),
+        RExpr::Not(operand) => RExpr::Not(boxed(operand)?),
         RExpr::Compare {
             op,
             lhs,
@@ -371,17 +625,17 @@ fn rebase_columns(e: &RExpr, offset: usize) -> RExpr {
             collation,
         } => RExpr::Compare {
             op: *op,
-            lhs: boxed(lhs),
-            rhs: boxed(rhs),
+            lhs: boxed(lhs)?,
+            rhs: boxed(rhs)?,
             collation: collation.clone(),
         },
         RExpr::Distinct { lhs, rhs, negated } => RExpr::Distinct {
-            lhs: boxed(lhs),
-            rhs: boxed(rhs),
+            lhs: boxed(lhs)?,
+            rhs: boxed(rhs)?,
             negated: *negated,
         },
         RExpr::IsNull { operand, negated } => RExpr::IsNull {
-            operand: boxed(operand),
+            operand: boxed(operand)?,
             negated: *negated,
         },
         RExpr::ConstInt(v) => RExpr::ConstInt(*v),
@@ -402,6 +656,6 @@ fn rebase_columns(e: &RExpr, offset: usize) -> RExpr {
         RExpr::ConstArray(v) => RExpr::ConstArray(v.clone()),
         RExpr::ConstRange(v) => RExpr::ConstRange(v.clone()),
         RExpr::ConstNull => RExpr::ConstNull,
-        _ => unreachable!("only pushdown-safe nodes are rebased"),
-    }
+        _ => unreachable!("only pushdown-safe nodes are cloned"),
+    })
 }

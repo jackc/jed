@@ -125,10 +125,15 @@ Attributes are separated by `; `. A node with no attributes is `-`.
 - `touched=K` is the exact number of statically referenced stored columns. It is emitted for SELECT
   scans and UPDATE/DELETE target scans, including assignment sources and the storage-reading side of
   `RETURNING`; it is omitted when zero.
-- A SELECT scan that runs a pushed WHERE filter ([planner.md](planner.md) §3.2) appends
-  `filter:conjuncts=N` (VERBOSE: `filter=<expr>`, the left-deep AND in global column slots) after
-  `touched=`; the filter's work is part of that Scan's estimate and actual cost. The `Filter` node
-  then shows only the post-join residual and is omitted when nothing remains.
+- A SELECT scan that runs a scan-pushed filter — WHERE or ON conjuncts ([planner.md](planner.md)
+  §3.2–§3.3) — appends `filter:conjuncts=N` (VERBOSE: `filter=<expr>`, the left-deep AND in global
+  column slots) after `touched=`; the filter's work is part of that Scan's estimate and actual cost.
+  A `Subquery`, `CTE Scan`, or `SRF` node with a scan-pushed filter shows that same part as its whole
+  detail in place of `-`; a `Catalog Scan` appends it after `db=…`. The `Filter` node then shows only
+  the post-join residual and is omitted when nothing remains, and a join node's `on:conjuncts=N` /
+  `on=<expr>` counts or spells only its residual ON, omitted when nothing remains. A conjunct moved
+  into a derived body appears in the body's own plan (its Filter, a pushed filter on its Scan, or its
+  access bound).
 - A WHERE contradiction ([planner.md](planner.md) §3.1) keeps the complete WHERE on the `Filter` node
   and appends `; contradiction`; every relation below it estimates and charges zero.
 - Sort details are `keys=N` and optionally `top-k=K`. Limit details are `limit=N` / `offset=N`.

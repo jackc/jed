@@ -58,6 +58,8 @@ impl Engine {
     ) -> Result<Vec<Row>> {
         let driver = plan.phys.relation_order[0];
         let mask = plan.memory_mask(meter);
+        // Each join's residual ON after an ON pushdown (planner.md §3.3), else its complete ON.
+        let join_ons = plan.join_ons();
         let mut running: Vec<Row> = Vec::with_capacity(materialized[driver].len());
         for row in &materialized[driver] {
             let placed = place_physical_relation_row(plan, driver, row);
@@ -133,7 +135,7 @@ impl Engine {
                     combined[offset..offset + right.len()].clone_from_slice(right);
                     let mut keep = true;
                     for &on_index in &step.on_indices {
-                        let Some(predicate) = plan.joins[on_index].on.as_ref() else {
+                        let Some(predicate) = &join_ons[on_index] else {
                             continue;
                         };
                         if !predicate.eval(&combined, env, meter)?.is_true() {
@@ -207,7 +209,7 @@ impl Engine {
         let outer_rows = &materialized[outer_ordinal];
         let inner_inl = plan.phys.rel_inl_bounds[inner_ordinal].is_some();
         let inner_rows = &materialized[inner_ordinal];
-        let on = plan.joins[0].on.as_ref();
+        let on = plan.join_on(0);
         let hash_table = if let Some(hash) = &plan.phys.hash_join {
             Some(HashJoinTable::build(
                 hash,
@@ -259,7 +261,7 @@ impl Engine {
                     inner_ordinal,
                     inner_row,
                 );
-                let keep = match on {
+                let keep = match &on {
                     None => true,
                     Some(pred) => pred.eval(&combined, env, meter)?.is_true(),
                 };
@@ -516,7 +518,8 @@ impl Engine {
                 std::mem::take(&mut materialized[0])
             };
             for (k, pj) in plan.joins.iter().enumerate() {
-                let on = &pj.on;
+                // The residual ON after an ON pushdown (planner.md §3.3), else the complete ON.
+                let on = plan.join_on(k);
                 let emit_left = matches!(pj.kind, JoinKind::Left | JoinKind::Full);
                 let emit_right = matches!(pj.kind, JoinKind::Right | JoinKind::Full);
                 // NULL-pad widths come from the PLAN, never a sampled row, so they are correct even
@@ -549,7 +552,7 @@ impl Engine {
                         for right in &right_rows {
                             let mut combined = left.clone();
                             combined.extend_from_slice(right);
-                            let keep = match on {
+                            let keep = match &on {
                                 None => true,
                                 Some(pred) => pred.eval(&combined, &env, meter)?.is_true(),
                             };
@@ -597,7 +600,7 @@ impl Engine {
                         for right in &right_rows {
                             let mut combined = left.clone();
                             combined.extend_from_slice(right);
-                            let keep = match on {
+                            let keep = match &on {
                                 None => true,
                                 Some(pred) => pred.eval(&combined, &env, meter)?.is_true(),
                             };
@@ -664,7 +667,7 @@ impl Engine {
                     for (ri, right) in right_rows.iter().enumerate() {
                         let mut combined = left.clone();
                         combined.extend_from_slice(right);
-                        let keep = match on {
+                        let keep = match &on {
                             None => true,
                             Some(pred) => pred.eval(&combined, &env, meter)?.is_true(),
                         };
@@ -1291,7 +1294,7 @@ impl Engine {
                 self.fold_uncorrelated_in_rexpr(on, bound, ctes, cost)?;
             }
         }
-        if let Some(f) = &mut sp.filter {
+        if let Some(f) = sp.filter.get_mut() {
             let before = *cost;
             self.fold_uncorrelated_in_rexpr(f, bound, ctes, cost)?;
             if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {

@@ -86,16 +86,28 @@ SELECT o.id, inr.v FROM o JOIN inr ON true WHERE inr.id = o.k ORDER BY o.id
 2
 50
 
-# A constant term co-occurring with the sibling term tightens the per-outer seek: `inr.id = o.k AND
-# inr.id > 3` seeks the intersection each o-row. o 5. o.k=2 → seek id=2 ∩ id>3 → empty (0 page/rows);
-# o.k=5 → id=5 (>3) HIT (1 page + 1 row); o.k=9 → id=9 MISS (1 page + 0 rows); o.k=NULL → empty. inr:
-# 2 page + 1 row = 3. ON is a 3-node AND (`= AND >`) over the 1 hit = 3. 1 produced. 5+3+3+1 = 12.
-# cost: 12
+# A constant term co-occurring with the sibling term tightens the per-outer seek: `inr_wide.id = o.k
+# AND inr_wide.id > 3` seeks the intersection each o-row. The constant term is also pushed to
+# inr_wide as a filter (planner.md §3.3), rechecked on each fetched row; the ON keeps only the sibling
+# equality. (inr_wide is wide enough that per-row seeks beat a once-materialized `id > 3` range.)
+# o 5. o.k=2 → seek id=2 ∩ id>3 → empty (0 page/rows); o.k=5 → id=5 HIT (1 page + 1 row); o.k=9 →
+# id=9 HIT (1 page + 1 row); o.k=NULL → empty. inr_wide: 2 page + 2 rows = 4, pushed filter over the
+# 2 fetched rows = 2. ON over the 2 hits = 2. 2 produced. 5+4+2+2+2 = 15.
+statement ok
+CREATE TABLE inr_wide (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO inr_wide VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70), (8, 80),
+  (9, 90), (10, 100), (11, 110), (12, 120), (13, 130), (14, 140), (15, 150), (16, 160)
+
+# cost: 15
 query II nosort
-SELECT o.id, inr.v FROM o JOIN inr ON inr.id = o.k AND inr.id > 3 ORDER BY o.id
+SELECT o.id, inr_wide.v FROM o JOIN inr_wide ON inr_wide.id = o.k AND inr_wide.id > 3 ORDER BY o.id
 ----
 2
 50
+3
+90
 
 # CONTRAST — a RIGHT join does NOT bound the (preserved) inner side: `o RIGHT JOIN inr ON inr.id =
 # o.k` must emit every inr row, including those matching no o, so inr cannot be bounded per o-row and

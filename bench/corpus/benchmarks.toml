@@ -306,6 +306,86 @@ setup_sql = [
   "INSERT INTO contradiction_orders SELECT g, g % 1000 FROM generate_series(1, 100000) AS g"
 ]
 
+# Stage-2 pushdown into a derived body (query.derived_pushdown) and its results-identical outer-filter
+# reference. Moved into the body, `d.id = 50000` seeks the PK of the 100k-row table; spelled
+# `d.id + 0`, the conjunct stays outside and the whole body runs.
+[[bench]]
+name = "derived_pushdown_pk"
+description = "A derived table's bare-column conjunct moves into its body and seeks the PK of 100k rows"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT d.id, d.v FROM (SELECT id, v FROM dp_orders) d WHERE d.id = 50000"
+warmup = 100
+iterations = 5000
+seed = 4274
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS dp_orders",
+  "CREATE TABLE dp_orders (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO dp_orders SELECT g, g % 1000 FROM generate_series(1, 100000) AS g"
+]
+
+[[bench]]
+name = "derived_pushdown_pk_residual"
+description = "Residual reference for derived_pushdown_pk: `d.id + 0 = 50000` runs the whole 100k-row body"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT d.id, d.v FROM (SELECT id, v FROM dp_ref_orders) d WHERE d.id + 0 = 50000"
+warmup = 2
+iterations = 20
+seed = 4275
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS dp_ref_orders",
+  "CREATE TABLE dp_ref_orders (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO dp_ref_orders SELECT g, g % 1000 FROM generate_series(1, 100000) AS g"
+]
+
+# Stage-2 ON pushdown (query.on_pushdown) and its results-identical ON-resident reference. The pushed
+# `r.flag = 1` filters each 4,000-row input's inner side to 2% before an expression-keyed nested loop;
+# spelled `r.flag + 0 = 1` it stays in the ON and is evaluated over all 16M pairs.
+[[bench]]
+name = "on_pushdown_join"
+description = "A single-side ON conjunct runs inside the inner scan: 4,000×80 nested-loop pairs instead of 4,000×4,000"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM op_left l JOIN op_right r ON l.k + 0 = r.k AND r.flag = 1"
+warmup = 2
+iterations = 20
+seed = 4276
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS op_right",
+  "DROP TABLE IF EXISTS op_left",
+  "CREATE TABLE op_left (id bigint PRIMARY KEY, k bigint)",
+  "CREATE TABLE op_right (id bigint PRIMARY KEY, k bigint, flag bigint)",
+  "INSERT INTO op_left SELECT g, g % 400 FROM generate_series(1, 4000) AS g",
+  "INSERT INTO op_right SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 4000) AS g"
+]
+
+[[bench]]
+name = "on_pushdown_join_residual"
+description = "Residual reference for on_pushdown_join: `r.flag + 0 = 1` stays in the ON over 16M pairs"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM op_ref_left l JOIN op_ref_right r ON l.k + 0 = r.k AND r.flag + 0 = 1"
+warmup = 1
+iterations = 3
+seed = 4277
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS op_ref_right",
+  "DROP TABLE IF EXISTS op_ref_left",
+  "CREATE TABLE op_ref_left (id bigint PRIMARY KEY, k bigint)",
+  "CREATE TABLE op_ref_right (id bigint PRIMARY KEY, k bigint, flag bigint)",
+  "INSERT INTO op_ref_left SELECT g, g % 400 FROM generate_series(1, 4000) AS g",
+  "INSERT INTO op_ref_right SELECT g, g % 400, CASE WHEN g % 50 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 4000) AS g"
+]
+
 # P7 reverse-orientation INL and its results-identical nested-loop reference. The indexed 50k-row
 # relation deliberately appears first in SQL. Costed two-relation search reverses the physical
 # order so the 250-row driver is left and the PK relation becomes the per-row bound inner; wrapping

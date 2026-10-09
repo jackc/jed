@@ -1032,16 +1032,23 @@ is pinned here because, with no reference implementation, the count is a cross-c
   iteration order — running/left side outer in PK order, right side inner in PK order, left-deep —
   is fixed so the per-combination evals accrue in the same sequence in every core (a §8 surface;
   it fixes the cost-ceiling abort point even though only the total is asserted today).
-- **WHERE `operator_eval`** is split by the stage-2 pushdown ([planner.md](planner.md) §3.2). A
-  **pushed** conjunct — single base relation, preserved side, structurally non-trapping — is charged
-  per row its relation's access path admits (after that row's `storage_row_read`; per fetched row of
-  each per-outer-row INL probe), as the left-deep AND of that relation's pushed conjuncts in source
-  order; a row it rejects reaches no ON, hash, residual, or row-account work. The **residual** — the
-  left-deep AND of every other conjunct in source order — is charged per **surviving combined row**
-  (post-join); with no residual there is no post-join WHERE charge. **`row_produced`** is per emitted
-  output row (post-`LIMIT`/`OFFSET`); the combined row is simply wider. Join materialization
-  buffering, physical control flow, and row concatenation are **unmetered**, like the `ORDER BY`
-  sort and the `LIMIT` slice.
+- **WHERE and ON `operator_eval`** are split by the stage-2 pushdown ([planner.md](planner.md)
+  §3.2–§3.3). A **scan-pushed** conjunct — single relation, structurally non-trapping, from the WHERE
+  on a side no outer join NULL-extends or from an ON on a side its join allows — is charged per row
+  its relation delivers: for a base table per row its access path admits (after that row's
+  `storage_row_read`; per fetched row of each per-outer-row INL probe), for a derived table, CTE
+  reference, SRF, or catalog relation per produced row, after that relation's own charges. It is the
+  left-deep AND of that relation's pushed conjuncts in source order (each join's ON conjuncts in join
+  order, then the WHERE's); a row it rejects reaches no ON, hash, residual, or row-account work. A
+  **body-pushed** conjunct moved into a derived table's body is charged by the body's plan exactly as
+  if it had been written in the body's WHERE. Each join charges only its **residual ON** — the
+  left-deep AND of its remaining conjuncts, or the original ON when none moved, or nothing when all
+  moved — over its candidate pairs. The WHERE **residual** — the left-deep AND of every unmoved
+  conjunct in source order, or the original WHERE when none moved — is charged per **surviving
+  combined row** (post-join); with no residual there is no post-join WHERE charge.
+  **`row_produced`** is per emitted output row (post-`LIMIT`/`OFFSET`); the combined row is simply
+  wider. Join materialization buffering, physical control flow, and row concatenation are
+  **unmetered**, like the `ORDER BY` sort and the `LIMIT` slice.
 
 **Nested-loop worked example.** Tables `a` (3 rows), `b` (2 rows), each small enough to be a single
 leaf page; `SELECT * FROM a JOIN b ON a.k + 0 = b.k`, with 2 pairs surviving. The expression key
@@ -1056,7 +1063,9 @@ WHERE; `*` is bare-column projection; 2 emitted rows → 2 `row_produced`. **Tot
 rows has `v ≤ 0` and both surviving pairs pass. The conjunct is pushed to `a`: each of `a`'s 3 rows
 charges its one node (3), the rejected row never joins, so the `ON` runs over 2 × 2 = 4 pairs (8), and
 no residual remains: (1 + 3 + 3) + (1 + 2) + 8 + 2 = **20**. Without pushdown the `ON` would run over
-6 pairs (12) and the WHERE over the 2 survivors (2): 4 + 3 + 12 + 2 + 2 = 23.
+6 pairs (12) and the WHERE over the 2 survivors (2): 4 + 3 + 12 + 2 + 2 = 23. Writing the same
+conjunct in the `ON` instead (`ON a.k + 0 = b.k AND a.v > 0`) gives the same 20: it is pushed to `a`
+([planner.md](planner.md) §3.3) and the join's residual ON is the original 2-node key comparison.
 
 **Nested-loop OUTER joins charge identically — only the produced-row count grows.** `LEFT`/`RIGHT`/
 `FULL [OUTER] JOIN` ([grammar.md](grammar.md) §15) evaluate the `ON` over the **same**

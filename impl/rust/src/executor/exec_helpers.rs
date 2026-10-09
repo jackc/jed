@@ -278,7 +278,7 @@ impl crate::cursor::RowStream for StreamingScan {
             if TableStore::needs_resolution(&row, mask) {
                 self.scan.resolve_columns(&mut row, mask)?;
             }
-            let keep = match &self.plan.filter {
+            let keep = match self.plan.filter.get() {
                 Some(f) => f.eval(&row, &env, &mut self.meter)?.is_true(),
                 None => true,
             };
@@ -785,7 +785,7 @@ pub(crate) fn select_plan_references_outer(sp: &SelectPlan, depth: usize) -> boo
             .is_some_and(|on| rexpr_references_outer(on, depth))
     }) || sp
         .filter
-        .as_ref()
+        .get()
         .is_some_and(|f| rexpr_references_outer(f, depth))
         || sp
             .having

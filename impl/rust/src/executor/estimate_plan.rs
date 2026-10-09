@@ -184,6 +184,24 @@ impl Engine {
         }
     }
 
+    /// A join's ON work: `nodes(ON) × invocations` operator_eval plus its subqueries, over the
+    /// residual ON chain (an AND node holds no subquery, so the chain's subqueries are its
+    /// conjuncts' in order).
+    fn add_join_on_units(
+        &self,
+        dst: &mut PlanEstimate,
+        on: Option<&FilterChain<'_>>,
+        invocations: i64,
+        ctx: Option<&EstimateCteCtx>,
+    ) {
+        let Some(on) = on else { return };
+        dst.add_unit(
+            UNIT_OPERATOR_EVAL,
+            sat_mul(on.operator_nodes(), invocations),
+        );
+        self.add_expression_list_subqueries(dst, on.conjuncts.iter().copied(), invocations, ctx);
+    }
+
     fn estimate_plan_rel_scope<'a>(&'a self, rel: &PlanRel) -> Option<ScopeRel<'a>> {
         let table = self.table_scoped(rel.db.as_deref(), &rel.table_name)?;
         Some(ScopeRel {
@@ -413,6 +431,36 @@ impl Engine {
         ctx: Option<&EstimateCteCtx>,
     ) -> EstimatedPlan {
         let rel = &sp.rels[index];
+        let mut plan = self.estimate_relation_produced(sp, index, ctx);
+        if rel.srf.is_none() && rel.cte.is_none() && rel.derived.is_none() {
+            return plan;
+        }
+        // A computed relation's scan-pushed filter (planner.md §3.2) runs once over each produced
+        // row R: it adds nodes(F) × R operator_eval to the relation's node, and its selectivity
+        // shapes the logical rows, which cap the delivered rows.
+        if let Some(pushed) = sp.pushed_filter(index) {
+            let produced = plan.root.rows;
+            plan.root.logical_rows = estimate_rows(
+                &self.estimate_predicate_selectivity_with_statistics(sp, Some(pushed)),
+                plan.root.logical_rows,
+            );
+            plan.root.rows = plan.root.logical_rows.min(produced);
+            plan.root.add_unit(
+                UNIT_OPERATOR_EVAL,
+                sat_mul(estimator_operator_nodes(Some(pushed)), produced),
+            );
+            plan.nodes[0] = plan.root.clone();
+        }
+        plan
+    }
+
+    fn estimate_relation_produced(
+        &self,
+        sp: &SelectPlan,
+        index: usize,
+        ctx: Option<&EstimateCteCtx>,
+    ) -> EstimatedPlan {
+        let rel = &sp.rels[index];
         if let Some(derived) = &rel.derived {
             let body = self.estimate_query_plan(derived, ctx);
             return EstimatedPlan::parent(body.root.clone(), &[&body]);
@@ -449,7 +497,7 @@ impl Engine {
         let bound = sp.phys.rel_inl_bounds[index]
             .as_ref()
             .or(sp.phys.rel_bounds[index].as_ref());
-        let mut estimate = estimate_selected_scan(bound, sp.filter.as_ref(), &scope, self);
+        let mut estimate = estimate_selected_scan(bound, sp.filter.access(), &scope, self);
         // An unbounded secondary-index ORDER BY walks the index and point-fetches the table; it is
         // physically different from the full-table candidate that supplied the legacy access bound.
         if index == 0 && bound.is_none() {
@@ -466,7 +514,9 @@ impl Engine {
         // logical selectivity applies once to the relation's logical population; the delivered rows
         // are that, capped by the scan rows — except an index-nested-loop inner, whose per-call scan
         // is bounded by the join key rather than the filter, so the filter scales those rows.
-        if let Some(pushed) = sp.pushed_filter(index) {
+        if let Some(pushed) = sp.pushed_filter(index)
+            && rel.cte.is_none()
+        {
             let scan_rows = estimate.rows;
             let selectivity = self.estimate_predicate_selectivity_with_statistics(sp, Some(pushed));
             estimate.logical_rows = estimate_rows(&selectivity, estimate.logical_rows);
@@ -487,7 +537,7 @@ impl Engine {
         &self,
         sp: &SelectPlan,
         kind: JoinKind,
-        on: Option<&RExpr>,
+        on: Option<&FilterChain<'_>>,
         physical_pairs: i64,
         logical_pairs: i64,
         preserved_left: i64,
@@ -495,8 +545,10 @@ impl Engine {
         bound_by_outer: bool,
     ) -> (i64, i64) {
         let (mut rows, mut logical_rows) = (physical_pairs, logical_pairs);
-        if on.is_some() && !bound_by_outer {
-            let selectivity = self.estimate_predicate_selectivity_with_statistics(sp, on);
+        if let Some(on) = on
+            && !bound_by_outer
+        {
+            let selectivity = self.estimate_chain_selectivity(sp, on);
             rows = estimate_rows(&selectivity, rows);
             logical_rows = estimate_rows(&selectivity, logical_rows);
         }
@@ -559,10 +611,12 @@ impl Engine {
             sat_mul(left.root.logical_rows, right_per_call_logical)
         };
         let join = &sp.joins[n - 2];
+        // The join's residual ON after an ON pushdown (planner.md §3.3), else its complete ON.
+        let on = sp.join_on(n - 2);
         let (rows, logical_rows) = self.estimate_join_rows(
             sp,
             join.kind,
-            join.on.as_ref(),
+            on.as_ref(),
             physical_pairs,
             logical_pairs,
             left.root.rows,
@@ -598,11 +652,7 @@ impl Engine {
                 invocations = rows;
             }
         }
-        root.add_unit(
-            UNIT_OPERATOR_EVAL,
-            sat_mul(estimator_operator_nodes(join.on.as_ref()), invocations),
-        );
-        self.add_expression_subqueries(&mut root, join.on.as_ref(), invocations, ctx);
+        self.add_join_on_units(&mut root, on.as_ref(), invocations, ctx);
         EstimatedPlan::parent(root, &[&left, &right])
     }
 
@@ -629,12 +679,14 @@ impl Engine {
         } else {
             full_logical_pairs
         };
+        // Each join's residual ON after an ON pushdown (planner.md §3.3), else its complete ON.
+        let join_ons = sp.join_ons();
         if !bound_by_outer {
             for &on_index in &step.on_indices {
-                let selectivity = self.estimate_predicate_selectivity_with_statistics(
-                    sp,
-                    sp.joins[on_index].on.as_ref(),
-                );
+                let Some(on) = &join_ons[on_index] else {
+                    continue;
+                };
+                let selectivity = self.estimate_chain_selectivity(sp, on);
                 full_rows = estimate_rows(&selectivity, full_rows);
                 full_logical_rows = estimate_rows(&selectivity, full_logical_rows);
             }
@@ -726,17 +778,22 @@ impl Engine {
         let on_nodes = step.on_indices.iter().fold(0, |total, on_index| {
             sat_add(
                 total,
-                estimator_operator_nodes(sp.joins[*on_index].on.as_ref()),
+                join_ons[*on_index]
+                    .as_ref()
+                    .map_or(0, FilterChain::operator_nodes),
             )
         });
         root.add_unit(UNIT_OPERATOR_EVAL, sat_mul(on_nodes, invocations));
         for &on_index in &step.on_indices {
-            self.add_expression_subqueries(
-                &mut root,
-                sp.joins[on_index].on.as_ref(),
-                invocations,
-                ctx,
-            );
+            if let Some(on) = &join_ons[on_index] {
+                // An AND node holds no subquery, so the chain's subqueries are its conjuncts' in order.
+                self.add_expression_list_subqueries(
+                    &mut root,
+                    on.conjuncts.iter().copied(),
+                    invocations,
+                    ctx,
+                );
+            }
         }
         EstimatedPlan::parent(root, &[&outer, &inner])
     }
@@ -762,10 +819,11 @@ impl Engine {
         let full_pairs = sat_mul(outer.root.rows, inner_per_call.root.rows);
         let full_logical_pairs = sat_mul(outer.root.logical_rows, inner_per_call.root.logical_rows);
         let join = &sp.joins[0];
+        let on = sp.join_on(0);
         let (full_rows, full_logical_rows) = self.estimate_join_rows(
             sp,
             join.kind,
-            join.on.as_ref(),
+            on.as_ref(),
             full_pairs,
             full_logical_pairs,
             outer.root.rows,
@@ -837,11 +895,7 @@ impl Engine {
             );
             invocations = delivered_rows;
         }
-        root.add_unit(
-            UNIT_OPERATOR_EVAL,
-            sat_mul(estimator_operator_nodes(join.on.as_ref()), invocations),
-        );
-        self.add_expression_subqueries(&mut root, join.on.as_ref(), invocations, ctx);
+        self.add_join_on_units(&mut root, on.as_ref(), invocations, ctx);
         EstimatedPlan::parent(root, &[&outer, &inner])
     }
 
@@ -863,7 +917,7 @@ impl Engine {
                     || self.window_top_n_eligible(sp))
             {
                 let target = sat_add(limit, sp.offset.unwrap_or(0));
-                let cap = sp.filter.as_ref().map_or(target, |filter| {
+                let cap = sp.filter.get().map_or(target, |filter| {
                     required_estimate_input(
                         &self.estimate_predicate_selectivity_with_statistics(sp, Some(filter)),
                         target,

@@ -432,6 +432,8 @@ impl Engine {
         let mut passed = 0i64;
         // After a pushdown only the residual WHERE remains over the joined rows (planner.md §3.2).
         let post_join_filter = plan.post_join_filter();
+        // Each join evaluates only its residual ON after an ON pushdown (planner.md §3.3).
+        let join_ons = plan.join_ons();
         if plan.limit != Some(0) {
             let mut scan = rows.into_reader()?;
             'probe: while let Some(left) = scan.next()? {
@@ -454,7 +456,7 @@ impl Engine {
                     combined[offset..offset + right.len()].clone_from_slice(&right);
                     let mut keep = true;
                     for &oi in &on_indices {
-                        if let Some(on) = &plan.joins[oi].on {
+                        if let Some(on) = &join_ons[oi] {
                             if !on.eval(&combined, env, meter)?.is_true() {
                                 keep = false;
                                 break;
@@ -581,6 +583,8 @@ impl Engine {
             (0..plan.rels.len()).collect()
         };
         let driver = order[0];
+        // Each join evaluates only its residual ON after an ON pushdown (planner.md §3.3).
+        let join_ons = plan.join_ons();
         let mut rows = self.blocking_spool();
         let mut scan = inputs[driver].reader()?;
         while let Some(row) = scan.next()? {
@@ -655,7 +659,7 @@ impl Engine {
                     combined[offset..offset + right.len()].clone_from_slice(&right);
                     let mut keep = true;
                     for &on_index in &on_indices {
-                        if let Some(predicate) = &plan.joins[on_index].on {
+                        if let Some(predicate) = &join_ons[on_index] {
                             if !predicate.eval(&combined, env, meter)?.is_true() {
                                 keep = false;
                                 break;

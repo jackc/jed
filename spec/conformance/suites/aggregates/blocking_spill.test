@@ -70,7 +70,7 @@ SELECT l.id, r.id, r.v FROM spill_left l JOIN spill_right r ON l.k = r.k AND r.v
 3
 10
 
-# cost: 476
+# cost: 92
 query II nosort
 SELECT l.id, r.id FROM spill_left l LEFT JOIN spill_right r ON l.k = r.k AND r.v < 40 ORDER BY l.id, r.id
 ----

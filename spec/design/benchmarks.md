@@ -84,6 +84,20 @@ sort candidates — and the per-core spill tests prove this fixed-width K create
 smaller `work_mem` falls back to the existing external sorter. Timings remain non-gating; checksum,
 corpus results/costs, and the no-run/fallback invariants are the correctness proof.
 
+**Derived-table and ON pushdown result (2026-10-09).** `derived_pushdown_pk` reads
+`SELECT … FROM (SELECT id, v FROM t) d WHERE d.id = 50000` over 100k rows; moved into the body, the
+conjunct seeks t's primary key, while the `derived_pushdown_pk_residual` reference spells it
+`d.id + 0` and runs the whole body. `on_pushdown_join` counts an expression-keyed nested loop of two
+4,000-row inputs whose ON carries `r.flag = 1` (2% of the inner side); pushed, the ON runs over
+4,000 × 80 pairs, while the `r.flag + 0 = 1` reference keeps it in the ON over 16M pairs. Median
+per-query time: `derived_pushdown_pk` **17.0 ms → 11.6 µs Go** (9.5 µs Rust, 35.5 µs TypeScript;
+references 18.8 ms / 19.3 ms / 22.9 ms), and `on_pushdown_join` **1.87 s → 33.1 ms Go** (42.7 ms Rust,
+43.8 ms TypeScript; references 2.17 s / 2.96 s / 4.25 s). `where_pushdown_join` and its reference
+were unchanged. Every core, before and after, returned the same per-lane checksums; the PostgreSQL
+lane was not re-run in this environment. Timings remain non-gating; the shared corpus pins,
+oracle-checked rows, and the `on_pushdown` / `derived_pushdown` NoREC relations are the correctness
+proof.
+
 **Stage-2 WHERE rewrite result (2026-10-08).** The new `where_pushdown_join` /
 `where_pushdown_join_residual` pair counts the same join of two 4,000-row inputs whose single-table
 conjuncts keep 2% of each side; an expression ON key keeps nested loop in both, and the reference

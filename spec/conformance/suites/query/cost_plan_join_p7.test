@@ -63,20 +63,22 @@ INSERT INTO p7_ra VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10),
 statement ok
 INSERT INTO p7_rb VALUES (1), (2), (3)
 
+# The ON is written `a.id + 0 > 0` so it stays a join predicate: a bare `a.id > 0` would be pushed
+# to p7_ra's scan (planner.md §3.3), which is not what these records measure.
 # ORDER BY the first source's PK makes FROM order strictly cheaper and keeps p7_ra outer.
 query ITTII nosort
-EXPLAIN SELECT a.id, b.id FROM p7_ra a JOIN p7_rb b ON a.id > 0 ORDER BY a.id LIMIT 2
+EXPLAIN SELECT a.id, b.id FROM p7_ra a JOIN p7_rb b ON a.id + 0 > 0 ORDER BY a.id LIMIT 2
 ----
 0
 Limit
 limit=2
 2
-33
+39
 1
 Nested Loop
 inner; on:conjuncts=1; ordered: join pk ordered
 2
-31
+37
 2
 Scan p7_ra
 Full scan; touched=1
@@ -88,9 +90,9 @@ Full scan; touched=1
 3
 4
 
-# cost: 29
+# cost: 31
 query II nosort
-SELECT a.id, b.id FROM p7_ra a JOIN p7_rb b ON a.id > 0 ORDER BY a.id LIMIT 2
+SELECT a.id, b.id FROM p7_ra a JOIN p7_rb b ON a.id + 0 > 0 ORDER BY a.id LIMIT 2
 ----
 1
 1
@@ -100,18 +102,18 @@ SELECT a.id, b.id FROM p7_ra a JOIN p7_rb b ON a.id > 0 ORDER BY a.id LIMIT 2
 # ORDER BY the second source's PK reverses the winning orientation. The executor still evaluates
 # expressions and projects columns through their original logical slots.
 query ITTII nosort
-EXPLAIN SELECT a.id, b.id FROM p7_ra a JOIN p7_rb b ON a.id > 0 ORDER BY b.id LIMIT 2
+EXPLAIN SELECT a.id, b.id FROM p7_ra a JOIN p7_rb b ON a.id + 0 > 0 ORDER BY b.id LIMIT 2
 ----
 0
 Limit
 limit=2
 2
-47
+67
 1
 Nested Loop
 inner; on:conjuncts=1; ordered: join pk ordered
 7
-45
+65
 2
 Scan p7_rb
 Full scan; touched=1
@@ -123,9 +125,9 @@ Full scan; touched=1
 20
 21
 
-# cost: 29
+# cost: 31
 query II nosort
-SELECT a.id, b.id FROM p7_ra a JOIN p7_rb b ON a.id > 0 ORDER BY b.id LIMIT 2
+SELECT a.id, b.id FROM p7_ra a JOIN p7_rb b ON a.id + 0 > 0 ORDER BY b.id LIMIT 2
 ----
 1
 1

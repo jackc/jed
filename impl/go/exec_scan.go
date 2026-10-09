@@ -1659,7 +1659,7 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 		}
 		relWork[innerOrdinal] = meter.Accrued - before
 	}
-	on := plan.joins[0].on
+	on := plan.joinOn(0)
 	var hashTable *hashJoinTable
 	if plan.phys.hashJoin != nil && (plan.limit == nil || *plan.limit != 0) {
 		hashTable, err = newHashJoinTable(plan.phys.hashJoin, plan.rels[innerOrdinal].offset, plan.rels[outerOrdinal].offset, rightRows, meter)
@@ -1841,10 +1841,11 @@ func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *c
 				copy(combined[plan.rels[inner].offset:], right)
 				keep := true
 				for _, onIndex := range step.onIndices {
-					if plan.joins[onIndex].on == nil {
+					on := plan.joinOn(onIndex)
+					if on == nil {
 						continue
 					}
-					v, err := plan.joins[onIndex].on.eval(combined, env, meter)
+					v, err := on.eval(combined, env, meter)
 					if err != nil {
 						return selectResult{}, err
 					}
@@ -1943,6 +1944,36 @@ func rowsFromValues(in [][]Value) []storedRow {
 // query's own outer and its parent=nil body simply ignores it (a parent=nil plan holds no
 // outerColumn, so the two are observably identical).
 func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer []storedRow, left storedRow, rng *stmtRng, ctes cteCtx, meter *costMeter) ([]storedRow, error) {
+	rel := plan.rels[ri]
+	_, pushed := plan.pushedFilter(ri)
+	if pushed == nil || rel.srf == nil && rel.cte == nil && rel.derived == nil {
+		return db.materializeRelRows(plan, ri, params, outer, left, rng, ctes, meter)
+	}
+	// A computed relation's scan-pushed filter (planner.md §3.2) runs over its produced rows in
+	// production order; each rejected row's reservation is released before the join reads them.
+	rows, err := db.materializeRelRows(plan, ri, params, outer, left, rng, ctes, meter)
+	if err != nil {
+		return nil, err
+	}
+	env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
+	kept := rows[:0]
+	for _, row := range rows {
+		v, err := pushed.eval(row, env, meter)
+		if err != nil {
+			return nil, err
+		}
+		if v.IsTrue() {
+			kept = append(kept, row)
+		} else {
+			meter.releaseRowMasked(row, plan.relMasks[ri])
+		}
+	}
+	return kept, nil
+}
+
+// materializeRelRows produces relation ri's rows; a base table applies its pushed filter as its
+// access path admits each row.
+func (db *engine) materializeRelRows(plan *selectPlan, ri int, params []Value, outer []storedRow, left storedRow, rng *stmtRng, ctes cteCtx, meter *costMeter) ([]storedRow, error) {
 	rel := plan.rels[ri]
 	// A WHERE contradiction (planner.md §3.1) reads no relation: nothing is scanned, generated, or
 	// run, and nothing is charged.
@@ -2099,8 +2130,8 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 					break
 				}
 			}
-		} else if plan.filter != nil {
-			if _, q, ok := ginMatch(plan.filter, sb.gin.colGlobal); ok {
+		} else if access := plan.accessPredicate(); access != nil {
+			if _, q, ok := ginMatch(access, sb.gin.colGlobal); ok {
 				query = q
 			}
 		}
@@ -2131,8 +2162,8 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 					break
 				}
 			}
-		} else if plan.filter != nil {
-			if q, ok := gistQueryOperand(plan.filter, sb.gist); ok {
+		} else if access := plan.accessPredicate(); access != nil {
+			if q, ok := gistQueryOperand(access, sb.gist); ok {
 				query = q
 			}
 		}

@@ -73,3 +73,72 @@ fn where_pushdown_bound_parameters() {
         assert_eq!(cursor.cost(), literal_cost, "prepared v={v} w={w}");
     }
 }
+
+fn ids(rows: &[Vec<Value>]) -> Vec<i64> {
+    rows.iter()
+        .map(|r| match &r[0] {
+            Value::Int(x) => *x,
+            _ => panic!("expected an int"),
+        })
+        .collect()
+}
+
+/// A bound parameter in a conjunct moved into a derived body (planner.md §3.2) or pushed from an ON
+/// (§3.3) reads the bound value where it now runs, charges exactly like the literal spelling, and a
+/// prepared statement's cached plan keeps the rewrite (the body was planned again once, before bind).
+#[test]
+fn derived_and_on_pushdown_bound_parameters() {
+    let mut s = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    for sql in [
+        "CREATE TABLE a (id i32 PRIMARY KEY, k i32, v i32)",
+        "CREATE TABLE b (id i32 PRIMARY KEY, k i32, w i32)",
+        "INSERT INTO a VALUES (1, 1, 10), (2, 2, 20), (3, 3, NULL), (4, 9, 40)",
+        "INSERT INTO b VALUES (11, 1, 5), (12, 2, NULL), (13, 2, 7), (14, 7, 0), (15, 8, 1)",
+    ] {
+        s.query_outcome(sql, &[]).unwrap();
+    }
+    let cases: [(&str, &str, i64, Vec<i64>); 2] = [
+        (
+            "SELECT d.id FROM (SELECT id, v FROM a) d WHERE d.id = $1",
+            "SELECT d.id FROM (SELECT id, v FROM a) d WHERE d.id = 2",
+            2,
+            vec![2],
+        ),
+        (
+            "SELECT a.id FROM a LEFT JOIN b ON a.k = b.k AND b.w > $1 WHERE b.id IS NOT NULL ORDER BY a.id",
+            "SELECT a.id FROM a LEFT JOIN b ON a.k = b.k AND b.w > 4 WHERE b.id IS NOT NULL ORDER BY a.id",
+            4,
+            vec![1, 2],
+        ),
+    ];
+    for (param, literal, value, want) in cases {
+        let stmt = s.prepare(param).unwrap();
+        let literal_cost = match s.query_outcome(literal, &[]).unwrap() {
+            Outcome::Query { cost, .. } => cost,
+            Outcome::Statement { .. } => panic!("expected a query result"),
+        };
+        let params = [Value::Int(value)];
+        match s.query_outcome(param, &params).unwrap() {
+            Outcome::Query { rows, cost, .. } => {
+                assert_eq!(ids(&rows), want, "{param}");
+                assert_eq!(
+                    cost, literal_cost,
+                    "{param}: parameter cost vs literal cost"
+                );
+            }
+            Outcome::Statement { .. } => panic!("expected a query result"),
+        }
+        for _ in 0..2 {
+            let mut cursor = s.query_prepared(&stmt, &params).unwrap();
+            let mut prepared = Vec::new();
+            for r in &mut cursor {
+                prepared.push(r);
+            }
+            cursor.error().unwrap();
+            assert_eq!(ids(&prepared), want, "prepared {param}");
+            assert_eq!(cursor.cost(), literal_cost, "prepared {param}");
+        }
+    }
+}

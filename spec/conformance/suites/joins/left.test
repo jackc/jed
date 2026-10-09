@@ -79,10 +79,11 @@ NULL
 
 # Predicate in the ON: an unmatched left row is still PRESERVED (the extra condition only filters
 # which right rows match). `a.k=b.k AND b.label='twenty'` matches only a(2)↔b(20); a(1)/a(3)/a(4)
-# match nothing and NULL-extend. The safe label equality stays residual: k selects the hash bucket,
-# then the full 3-node ON and its varlen work are charged only on candidates.
+# match nothing and NULL-extend. The label equality filters the NULL-extended side, so it is pushed
+# to b's scan (planner.md §3.3) and only b(20) enters the hash table; the residual ON is the key
+# equality alone, charged on the hash candidates.
 # names: id, id
-# cost: 85
+# cost: 60
 query II nosort
 SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k AND b.label = 'twenty' ORDER BY a.id, b.id
 ----

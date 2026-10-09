@@ -177,8 +177,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   admitted row, before the join and the row account); only the residual is applied to joined rows.
   EXPLAIN shows pushed filters on their Scan; the estimator models both; NoREC `where_pushdown` and
   `contradiction` relations.
-  - [ ] _follow-on:_ push WHERE conjuncts **into derived tables / CTE bodies** (and SRF/catalog
-    relations), and push single-side **ON** conjuncts (the inner side of LEFT, either side of INNER).
+  - [x] _follow-on:_ push WHERE/ON conjuncts **into derived-table bodies** (`query.derived_pushdown`
+    — the body is planned again with them, so they can bound its key), onto **CTE references, SRFs,
+    and catalog relations** in a join, and **single-side ON conjuncts** (`query.on_pushdown` — either
+    side of INNER, the NULL-extended side of LEFT/RIGHT; a pushed ON conjunct is also an access-path
+    input for its relation). [planner.md §3.2–§3.3](spec/design/planner.md); NoREC `on_pushdown` and
+    `derived_pushdown`.
+  - [ ] _follow-on:_ push into **inlined CTE bodies** (needs per-reference body specialization: the
+    inline/materialize mode is decided after the referencing query is planned), **grouped bodies**
+    (conjuncts over grouping columns into the body's WHERE), and each **set-operation arm**.
   - [ ] _follow-on:_ broader safe-conjunct gate (non-trapping casts/functions via a catalog
     `traps` classification), contradiction proofs for UPDATE/DELETE, and parameter-time proofs.
   - [ ] _follow-on:_ plan-time **constant folding** / CSE / eliding a pushed recheck that its own

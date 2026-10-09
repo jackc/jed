@@ -4797,7 +4797,9 @@ pub(crate) struct GroupSetPlan {
 pub(crate) struct SelectPlan {
     rels: Vec<PlanRel>,
     joins: Vec<PlanJoin>,
-    filter: Option<RExpr>,
+    /// The complete WHERE (`filter.get()`), owned together with the stage-3 access predicate built
+    /// around it when an ON conjunct is scan-pushed (`filter.access()`; rewrite.rs `PlanFilter`).
+    filter: PlanFilter,
     is_agg: bool,
     group_keys: Vec<usize>,
     /// The materialized general-expression `GROUP BY` keys (`GROUP BY a + b`, aggregates.md §15), in

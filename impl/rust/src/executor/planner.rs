@@ -28,6 +28,21 @@ impl Engine {
         ctes: &'a [&'a CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<SelectPlan> {
+        self.plan_select_pushed(sel, parent, ctes, ptypes, Vec::new())
+    }
+
+    /// `plan_select` with stage-2 body-pushed conjuncts (spec/design/planner.md §3.2) appended to
+    /// the resolved WHERE, in order, before the plan is rewritten and optimized: a derived body
+    /// planned again by its enclosing SELECT. The conjuncts are already resolved against this
+    /// SELECT's FROM slots.
+    fn plan_select_pushed<'a>(
+        &'a self,
+        sel: &Select,
+        parent: Option<&Scope<'a>>,
+        ctes: &'a [&'a CteBinding],
+        ptypes: &mut ParamTypes,
+        pushed: Vec<RExpr>,
+    ) -> Result<SelectPlan> {
         // Build the FROM scope (spec/design/grammar.md §15/§44): resolve each table reference (42P01
         // if unknown), compute its flat column offset in FROM order, reject a duplicate label (42712),
         // and — for a LATERAL item — resolve its body / SRF args against the PREFIX of relations to
@@ -1186,6 +1201,13 @@ impl Engine {
                 })
             })
             .collect();
+        let mut filter = filter;
+        for c in pushed {
+            filter = Some(match filter {
+                None => c,
+                Some(acc) => RExpr::And(Box::new(acc), Box::new(c)),
+            });
+        }
         let rels: Vec<PlanRel> = scope
             .rels
             .iter()
@@ -1204,7 +1226,7 @@ impl Engine {
         let mut plan = SelectPlan {
             rels,
             joins,
-            filter,
+            filter: PlanFilter::new(filter),
             is_agg,
             group_keys,
             group_exprs,
@@ -1233,10 +1255,39 @@ impl Engine {
         // fold_uncorrelated_in_plan is NOT a planner rewrite — it executes subqueries and needs
         // bound params, so it stays post-bind in run_query_expr.
         rewrite_where(&mut plan);
+        self.replan_pushed_bodies(&mut plan, &from_items, ctes, ptypes)?;
         //
         // ——— Stage 3: physical/access-path selection (spec/design/planner.md §4) ———
         self.optimize_select(&mut plan, &scope);
         Ok(plan)
+    }
+
+    /// Plan each derived body that stage 2 moved conjuncts into again from its syntax, with those
+    /// conjuncts appended to its WHERE (spec/design/planner.md §3.2), so the body's own rewrite and
+    /// access-path selection see them. Planning again must have no other effect: the CTE reference
+    /// counts the first planning recorded are restored, keeping every CTE's mode unchanged.
+    fn replan_pushed_bodies<'a>(
+        &'a self,
+        plan: &mut SelectPlan,
+        from_items: &[&TableRef],
+        ctes: &'a [&'a CteBinding],
+        ptypes: &mut ParamTypes,
+    ) -> Result<()> {
+        for (i, pushed) in plan.take_body_pushes().into_iter().enumerate() {
+            if pushed.is_empty() {
+                continue;
+            }
+            let Some(QueryExpr::Select(body_sel)) = from_items[i].subquery.as_deref() else {
+                unreachable!("a body-pushed relation is a derived SELECT")
+            };
+            let refs: Vec<usize> = ctes.iter().map(|b| b.refs.get()).collect();
+            let body = self.plan_select_pushed(body_sel, None, ctes, ptypes, pushed);
+            for (b, r) in ctes.iter().zip(refs) {
+                b.refs.set(r);
+            }
+            plan.rels[i].derived = Some(Box::new(QueryPlan::Select(body?)));
+        }
+        Ok(())
     }
 }
 
@@ -1252,7 +1303,7 @@ impl Engine {
 fn compute_rel_masks(plan: &SelectPlan) -> Vec<Vec<bool>> {
     let total_cols: usize = plan.rels.iter().map(|r| r.col_count).sum();
     let mut touched = vec![false; total_cols];
-    if let Some(f) = &plan.filter {
+    if let Some(f) = plan.filter.get() {
         collect_touched(f, 0, &mut touched);
     }
     for j in &plan.joins {

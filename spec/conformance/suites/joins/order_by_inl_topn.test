@@ -53,9 +53,10 @@ SELECT o.id, i.id FROM o CROSS JOIN i WHERE i.id = o.k ORDER BY o.id LIMIT 2
 2
 5
 
-# Residual ON rejection: all three hits are examined before two survive. Outer 6 + inner 7 +
-# three 3-node AND predicates + two produced = 24.
-# cost: 24
+# Pushed ON rejection: `i.v > 20` is pushed to i (planner.md §3.3) and rechecked on each of the three
+# INL hits before two survive; the residual ON is the key equality over the two. Outer 6 + inner 7 +
+# three filter evals + two ON + two produced = 20.
+# cost: 20
 query II nosort
 SELECT o.id, i.id FROM o JOIN i ON i.id = o.k AND i.v > 20 ORDER BY o.id LIMIT 2
 ----

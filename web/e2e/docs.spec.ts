@@ -428,10 +428,26 @@ test('the explain page shows a proven WHERE contradiction', async ({ page }) => 
   await expect(panel.getByTestId('result-rows')).toContainText('conjuncts=2; contradiction');
 });
 
+test('the explain page shows a WHERE conjunct moved into a FROM subquery', async ({ page }) => {
+  await page.goto('/docs/sql/explain/');
+  // Eleventh panel = the subquery's body plans the moved `id = 3` as a PK lookup (planner.md §3.2).
+  const panel = page.getByTestId('live-sql').nth(10);
+  await expect(panel.getByTestId('result-rows')).toContainText('Subquery v');
+  await expect(panel.getByTestId('result-rows')).toContainText('PK bound: id = 3');
+});
+
+test('the explain page shows an ON conjunct pushed to the NULL-extended side', async ({ page }) => {
+  await page.goto('/docs/sql/explain/');
+  // Twelfth panel = `t.id > 5` runs in trip's scan; the LEFT join keeps one ON conjunct (§3.3).
+  const panel = page.getByTestId('live-sql').nth(11);
+  await expect(panel.getByTestId('result-rows')).toContainText('left; on:conjuncts=1');
+  await expect(panel.getByTestId('result-rows')).toContainText('filter:conjuncts=1');
+});
+
 test('the explain page runs EXPLAIN ANALYZE with a deterministic cost', async ({ page }) => {
   await page.goto('/docs/sql/explain/');
-  // Twelfth panel = EXPLAIN ANALYZE: the Analyze root reports the real accrued cost + row count.
-  const panel = page.getByTestId('live-sql').nth(11);
+  // Fourteenth panel = EXPLAIN ANALYZE: the Analyze root reports the real accrued cost + row count.
+  const panel = page.getByTestId('live-sql').nth(13);
   await expect(panel.getByTestId('result-rows')).toContainText('Analyze');
   await expect(panel.getByTestId('result-rows')).toContainText('cost=');
 });

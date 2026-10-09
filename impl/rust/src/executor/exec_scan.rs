@@ -62,7 +62,7 @@ fn process_streaming_row(
     } else {
         row
     };
-    if let Some(filter) = &plan.filter {
+    if let Some(filter) = plan.filter.get() {
         let before = meter.accrued;
         let keep = filter.eval(row, env, meter)?.is_true();
         actual.filter += meter.accrued - before;
@@ -367,7 +367,7 @@ impl Engine {
             Some(ScanBound::Gin(gb)) => {
                 let query = plan
                     .filter
-                    .as_ref()
+                    .get()
                     .and_then(|filter| gin_match(filter, gb.col_global).map(|(_, q)| q));
                 let (mut candidates, (pages, slabs)) = self.gin_bound_rows(
                     &plan.rels[0].table_name,
@@ -419,7 +419,7 @@ impl Engine {
             Some(ScanBound::Gist(gb)) => {
                 let query = plan
                     .filter
-                    .as_ref()
+                    .get()
                     .and_then(|filter| gist_query_operand(filter, gb));
                 let (mut candidates, (pages, slabs)) = self.gist_bound_rows(
                     &plan.rels[0].table_name,
@@ -657,7 +657,7 @@ impl Engine {
                 } else {
                     row
                 };
-                let keep = match &plan.filter {
+                let keep = match plan.filter.get() {
                     Some(f) => {
                         let before = meter.accrued;
                         let keep = f.eval(row, env, meter)?.is_true();
@@ -1221,7 +1221,7 @@ impl Engine {
                 if TableStore::needs_resolution(&row, &plan.rel_masks[0]) {
                     store.resolve_columns(&mut row, &plan.rel_masks[0])?;
                 }
-                let keep = match &plan.filter {
+                let keep = match plan.filter.get() {
                     Some(f) => {
                         let before = meter.accrued;
                         let keep = f.eval(&row, env, meter)?.is_true();
@@ -1349,7 +1349,7 @@ impl Engine {
                         None
                     };
                     let row_ref = resolved.as_ref().unwrap_or(row);
-                    let keep = match &plan.filter {
+                    let keep = match plan.filter.get() {
                         Some(f) => {
                             let before = meter.accrued;
                             let keep = f.eval(row_ref, env, meter)?.is_true();
@@ -1415,7 +1415,7 @@ impl Engine {
                         None
                     };
                     let row_ref = resolved.as_ref().unwrap_or(row);
-                    let keep = match &plan.filter {
+                    let keep = match plan.filter.get() {
                         Some(f) => {
                             let before = meter.accrued;
                             let keep = f.eval(row_ref, env, meter)?.is_true();
@@ -1577,7 +1577,8 @@ impl Engine {
             rel_work.insert(inner_ordinal, meter.accrued - before);
             rows
         };
-        let on = &plan.joins[0].on;
+        // The residual ON after an ON pushdown (planner.md §3.3), else the complete ON.
+        let on = plan.join_on(0);
         // After a pushdown only the residual WHERE remains over the joined rows (planner.md §3.2).
         let post_join_filter = plan.post_join_filter();
 
@@ -1640,7 +1641,7 @@ impl Engine {
                         right,
                     );
                     // INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).
-                    let keep = match on {
+                    let keep = match &on {
                         Some(pred) => pred.eval(&combined, env, meter)?.is_true(),
                         None => true,
                     };
@@ -1771,8 +1772,10 @@ impl Engine {
             .as_ref()
             .map(|hash| HashJoinTable::build(hash, plan.rels[inner].offset, 0, inner_rows, meter))
             .transpose()?;
-        // After a pushdown only the residual WHERE remains over the joined rows (planner.md §3.2).
+        // After a pushdown only the residual WHERE remains over the joined rows (planner.md §3.2),
+        // and each join evaluates only its residual ON (§3.3).
         let post_join_filter = plan.post_join_filter();
+        let join_ons = plan.join_ons();
 
         let limit = plan.limit;
         let offset = plan.offset.unwrap_or(0);
@@ -1807,7 +1810,7 @@ impl Engine {
                     combined[inner_offset..inner_offset + right.len()].clone_from_slice(right);
                     let mut keep = true;
                     for &on_index in &step.on_indices {
-                        let Some(predicate) = plan.joins[on_index].on.as_ref() else {
+                        let Some(predicate) = &join_ons[on_index] else {
                             continue;
                         };
                         if !predicate.eval(&combined, env, meter)?.is_true() {
@@ -1906,6 +1909,47 @@ impl Engine {
     /// relation is passed the query's own `outer` and its `parent = None` body simply ignores it
     /// (a `parent = None` plan holds no `OuterColumn`, so the two are observably identical).
     pub(crate) fn materialize_rel(
+        &self,
+        plan: &SelectPlan,
+        ri: usize,
+        params: &[Value],
+        outer: &[&[Value]],
+        left: &[Value],
+        rng: &std::cell::Cell<crate::seam::StmtRng>,
+        ctes: CteCtx,
+        meter: &mut Meter,
+    ) -> Result<Vec<Row>> {
+        let rel = &plan.rels[ri];
+        let pushed = plan.pushed_local_filter(ri);
+        let computed = rel.srf.is_some() || rel.cte.is_some() || rel.derived.is_some();
+        let (Some(pushed), true) = (pushed, computed) else {
+            return self.materialize_rel_rows(plan, ri, params, outer, left, rng, ctes, meter);
+        };
+        // A computed relation's scan-pushed filter (planner.md §3.2) runs over its produced rows in
+        // production order; each rejected row's reservation is released before the join reads them.
+        let rows = self.materialize_rel_rows(plan, ri, params, outer, left, rng, ctes, meter)?;
+        let env = EvalEnv {
+            exec: self,
+            params,
+            outer,
+            rng,
+            ctes,
+        };
+        let mut kept = Vec::with_capacity(rows.len());
+        for row in rows {
+            if pushed.eval(&row, &env, meter)?.is_true() {
+                kept.push(row);
+            } else {
+                meter.release_row_masked(&row, &plan.rel_masks[ri]);
+            }
+        }
+        Ok(kept)
+    }
+
+    /// Produce relation `ri`'s rows; a base table applies its pushed filter as its access path
+    /// admits each row.
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_rel_rows(
         &self,
         plan: &SelectPlan,
         ri: usize,
@@ -2077,13 +2121,13 @@ impl Engine {
                     inl_filters
                         .iter()
                         .copied()
-                        .chain(plan.filter.iter())
+                        .chain(plan.filter.get())
                         .find_map(|f| {
                             gin_sibling_match(f, gb.col_global, &sibling_columns).map(|(_, q)| q)
                         })
                 } else {
                     plan.filter
-                        .as_ref()
+                        .access()
                         .and_then(|f| gin_match(f, gb.col_global).map(|(_, q)| q))
                 };
                 let (pairs, units) = self.gin_bound_rows(
@@ -2104,7 +2148,7 @@ impl Engine {
                     inl_filters
                         .iter()
                         .copied()
-                        .chain(plan.filter.iter())
+                        .chain(plan.filter.get())
                         .find_map(|f| match gb.strategy {
                             crate::gist::GistStrategy::Equal => {
                                 gist_scalar_sibling_match(f, gb.col_global, &sibling_columns)
@@ -2114,7 +2158,7 @@ impl Engine {
                                 .map(|(_, q)| q),
                         })
                 } else {
-                    plan.filter.as_ref().and_then(|f| gist_query_operand(f, gb))
+                    plan.filter.access().and_then(|f| gist_query_operand(f, gb))
                 };
                 let (pairs, units) = self.gist_bound_rows(
                     &rel.table_name,
@@ -2457,7 +2501,7 @@ impl Engine {
         }
 
         // A3: apply the WHERE predicate over the lanes into a selection vector (None ⇒ all rows survive).
-        let (sel, n_emit) = match &plan.filter {
+        let (sel, n_emit) = match plan.filter.get() {
             Some(filter) => {
                 let s = filter_columnar(filter, &cols, mask, row_count, env, meter)?;
                 let n = s.len();
@@ -2602,7 +2646,7 @@ impl Engine {
                 )?;
                 // The same row-buffer accounting as the scalar aggregate branch (memory.md §5).
                 let mask = &plan.rel_masks[0];
-                let survivors: Vec<Row> = match &plan.filter {
+                let survivors: Vec<Row> = match plan.filter.get() {
                     None => rows,
                     Some(f) => {
                         let mut out: Vec<Row> = Vec::new();
@@ -2750,7 +2794,7 @@ impl Engine {
 
         let (row_count, pages) = if do_scan {
             let mut visit = |node: &crate::pmap::Node, i: usize| -> Result<()> {
-                if let Some(filter) = &plan.filter {
+                if let Some(filter) = plan.filter.get() {
                     for (c, &m) in mask.iter().enumerate() {
                         if m {
                             scratch[c] = node.col_at(i, c)?;

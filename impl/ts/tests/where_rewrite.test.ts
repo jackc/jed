@@ -68,3 +68,50 @@ test("where pushdown: bound parameters filter inside the scan and charge like li
     assert.equal(cost, lit.cost, `prepared v=${v} w=${w}`);
   }
 });
+
+// A bound parameter in a conjunct moved into a derived body (planner.md §3.2) or pushed from an ON
+// (§3.3) reads the bound value where it now runs, charges exactly like the literal spelling, and a
+// prepared statement's cached plan keeps the rewrite (the body was planned again once, before bind).
+test("derived and ON pushdown: bound parameters charge like literals", () => {
+  const db = new Engine();
+  execute(db, "CREATE TABLE a (id i32 PRIMARY KEY, k i32, v i32)");
+  execute(db, "CREATE TABLE b (id i32 PRIMARY KEY, k i32, w i32)");
+  execute(db, "INSERT INTO a VALUES (1, 1, 10), (2, 2, 20), (3, 3, NULL), (4, 9, 40)");
+  execute(db, "INSERT INTO b VALUES (11, 1, 5), (12, 2, NULL), (13, 2, 7), (14, 7, 0), (15, 8, 1)");
+  const cases: { param: string; literal: string; value: bigint; want: bigint[] }[] = [
+    {
+      param: "SELECT d.id FROM (SELECT id, v FROM a) d WHERE d.id = $1",
+      literal: "SELECT d.id FROM (SELECT id, v FROM a) d WHERE d.id = 2",
+      value: 2n,
+      want: [2n],
+    },
+    {
+      param:
+        "SELECT a.id FROM a LEFT JOIN b ON a.k = b.k AND b.w > $1 WHERE b.id IS NOT NULL ORDER BY a.id",
+      literal:
+        "SELECT a.id FROM a LEFT JOIN b ON a.k = b.k AND b.w > 4 WHERE b.id IS NOT NULL ORDER BY a.id",
+      value: 4n,
+      want: [1n, 2n],
+    },
+  ];
+  for (const tc of cases) {
+    const stmt = prepare(db, tc.param);
+    const lit = queryResult(execute(db, tc.literal));
+    const expected = tc.want.map((id) => [intValue(id)]);
+    const params = [intValue(tc.value)];
+
+    const direct = queryResult(executeParams(db, tc.param, params));
+    assert.deepEqual(direct.rows, expected, tc.param);
+    assert.equal(direct.cost, lit.cost, `${tc.param}: parameter cost must equal literal cost`);
+
+    for (let run = 0; run < 2; run++) {
+      const cursor = queryPrepared(db, stmt, params);
+      const rows: Value[][] = [];
+      for (const r of cursor) rows.push(r);
+      const cost = cursor.cost;
+      cursor.close();
+      assert.deepEqual(rows, expected, `prepared run ${run}: ${tc.param}`);
+      assert.equal(cost, lit.cost, `prepared run ${run}: ${tc.param}`);
+    }
+  }
+});

@@ -107,7 +107,7 @@ func (db *engine) execCostedTwoRelationJoin(plan *selectPlan, env *evalEnv, mete
 	outerRows := materialized[outerOrdinal]
 	innerINL := plan.phys.relINLBounds[innerOrdinal] != nil
 	innerRows := materialized[innerOrdinal]
-	on := plan.joins[0].on
+	on := plan.joinOn(0)
 
 	var table *hashJoinTable
 	var err error
@@ -236,7 +236,7 @@ func (db *engine) execCostedNWayJoin(plan *selectPlan, env *evalEnv, meter *cost
 				copy(combined[plan.rels[inner].offset:], right)
 				keep := true
 				for _, onIndex := range step.onIndices {
-					predicate := plan.joins[onIndex].on
+					predicate := plan.joinOn(onIndex)
 					if predicate == nil {
 						continue
 					}
@@ -622,7 +622,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			running = []storedRow{{}}
 		}
 		for k := range plan.joins {
-			on := plan.joins[k].on
+			on := plan.joinOn(k)
 			emitLeft := plan.joins[k].kind == joinLeft || plan.joins[k].kind == joinFull
 			emitRight := plan.joins[k].kind == joinRight || plan.joins[k].kind == joinFull
 			// NULL-pad widths come from the PLAN, never a sampled row, so they are correct even when

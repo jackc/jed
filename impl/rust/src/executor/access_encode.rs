@@ -6701,6 +6701,7 @@ mod candidate_inventory_tests {
         db.plan_select(&select, None, &[], &mut ParamTypes::default())
             .unwrap()
             .filter
+            .into_where()
             .expect("inventory query filter")
     }
 }

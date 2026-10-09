@@ -51,6 +51,7 @@ import type {
   SetOpKind,
   Statement,
   SubscriptSpec,
+  TableRef,
   TypeFieldDef,
   Update,
   WindowDef,
@@ -101,9 +102,11 @@ import { Meter, type QueryAccount, queryMemoryPeak, StateCharge } from "./cost.t
 import { optimizeSelect } from "./optimize.ts";
 import {
   type WherePushdown,
+  accessPredicate,
+  joinOn,
   postJoinFilter,
   pushedFilter,
-  refreshWhereResidual,
+  refreshPushdownResiduals,
   rewriteWhere,
   whereContradiction,
 } from "./rewrite.ts";
@@ -3517,6 +3520,31 @@ export class Engine {
 
   private estimateRelationRead(sp: SelectPlan, index: number, ctx: EstimateCteContext | null): EstimatedPlan {
     const rel = sp.rels[index]!;
+    if (rel.srf === undefined && rel.cte === undefined && rel.derived === undefined) {
+      return this.estimateRelationProduced(sp, index, ctx);
+    }
+    const plan = this.estimateRelationProduced(sp, index, ctx);
+    // A computed relation's scan-pushed filter (planner.md §3.2) runs once over each produced row R:
+    // it adds nodes(F) × R operator_eval to the relation's node, and its selectivity shapes the
+    // logical rows, which cap the delivered rows.
+    const pushed = pushedFilter(sp, index).glob;
+    if (pushed !== null) {
+      const root = clonePlanEstimate(plan.root);
+      const produced = root.rows;
+      root.logicalRows = estimateSelectivity(
+        this.estimatePredicateSelectivityWithStatistics(sp, pushed),
+        root.logicalRows,
+      );
+      root.rows = root.logicalRows < produced ? root.logicalRows : produced;
+      addPlanUnit(root, UNIT_OPERATOR_EVAL, saturatingEstimateMultiply(estimatorOperatorNodes(pushed), produced));
+      plan.root = root;
+      plan.nodes[0] = root;
+    }
+    return plan;
+  }
+
+  private estimateRelationProduced(sp: SelectPlan, index: number, ctx: EstimateCteContext | null): EstimatedPlan {
+    const rel = sp.rels[index]!;
     if (rel.derived !== undefined) {
       const body = this.estimateQueryPlan(rel.derived, ctx);
       return parentEstimatedPlan(body.root, body);
@@ -3542,7 +3570,7 @@ export class Engine {
     if (scopeRel === null) return leafEstimatedPlan(emptyPlanEstimate());
     const inl = sp.phys.relINLBounds[index] ?? null;
     const bound = inl ?? sp.phys.relBounds[index]!;
-    const estimate = this.estimateSelectedScan(scopeRel, bound, sp.filter);
+    const estimate = this.estimateSelectedScan(scopeRel, bound, accessPredicate(sp));
     // An unbounded secondary-index ORDER BY walks the index and point-fetches the table; it is
     // physically different from the full-table candidate that supplied the legacy access bound.
     if (index === 0 && bound === null && sp.phys.indexOrder !== null) {
@@ -3558,7 +3586,7 @@ export class Engine {
     // are that, capped by the scan rows — except an index-nested-loop inner, whose per-call scan
     // is bounded by the join key rather than the filter, so the filter scales those rows.
     const pushed = pushedFilter(sp, index).glob;
-    if (pushed !== null) {
+    if (pushed !== null && rel.cte === undefined) {
       const scanRows = estimate.rows;
       const selectivity = this.estimatePredicateSelectivityWithStatistics(sp, pushed);
       estimate.logicalRows = estimateSelectivity(selectivity, estimate.logicalRows);
@@ -3596,10 +3624,11 @@ export class Engine {
       ? physicalPairs
       : saturatingEstimateMultiply(left.root.logicalRows, rightPerCallLogical);
     const join = sp.joins[n - 2]!;
+    const on = joinOn(sp, n - 2);
     let rows = physicalPairs;
     let logicalRows = logicalPairs;
-    if (join.on !== null && !boundByOuter) {
-      const selectivity = this.estimatePredicateSelectivityWithStatistics(sp, join.on);
+    if (on !== null && !boundByOuter) {
+      const selectivity = this.estimatePredicateSelectivityWithStatistics(sp, on);
       rows = estimateSelectivity(selectivity, rows);
       logicalRows = estimateSelectivity(selectivity, logicalRows);
     }
@@ -3634,8 +3663,8 @@ export class Engine {
       addPlanUnit(root, UNIT_HASH_PROBE, saturatingEstimateAdd(saturatingEstimateMultiply(left.root.rows, probeBytes), saturatingEstimateMultiply(rows, framedBytes)));
       invocations = rows;
     }
-    addPlanUnit(root, UNIT_OPERATOR_EVAL, saturatingEstimateMultiply(estimatorOperatorNodes(join.on), invocations));
-    this.addExpressionSubqueries(root, join.on, invocations, ctx);
+    addPlanUnit(root, UNIT_OPERATOR_EVAL, saturatingEstimateMultiply(estimatorOperatorNodes(on), invocations));
+    this.addExpressionSubqueries(root, on, invocations, ctx);
     return parentEstimatedPlan(root, left, right);
   }
 
@@ -3665,7 +3694,7 @@ export class Engine {
       for (const onIndex of step.onIndices) {
         const selectivity = this.estimatePredicateSelectivityWithStatistics(
           sp,
-          sp.joins[onIndex]!.on,
+          joinOn(sp, onIndex),
         );
         fullRows = estimateSelectivity(selectivity, fullRows);
         fullLogicalRows = estimateSelectivity(selectivity, fullLogicalRows);
@@ -3756,12 +3785,12 @@ export class Engine {
     for (const onIndex of step.onIndices) {
       onNodes = saturatingEstimateAdd(
         onNodes,
-        estimatorOperatorNodes(sp.joins[onIndex]!.on),
+        estimatorOperatorNodes(joinOn(sp, onIndex)),
       );
     }
     addPlanUnit(root, UNIT_OPERATOR_EVAL, saturatingEstimateMultiply(onNodes, invocations));
     for (const onIndex of step.onIndices) {
-      this.addExpressionSubqueries(root, sp.joins[onIndex]!.on, invocations, ctx);
+      this.addExpressionSubqueries(root, joinOn(sp, onIndex), invocations, ctx);
     }
     return parentEstimatedPlan(root, outer, inner);
   }
@@ -3794,11 +3823,11 @@ export class Engine {
       outer.root.logicalRows,
       innerPerCall.root.logicalRows,
     );
-    const join = sp.joins[0]!;
+    const on = joinOn(sp, 0);
     let fullRows = fullPairs;
     let fullLogicalRows = fullLogicalPairs;
-    if (join.on !== null && !boundByOuter) {
-      const selectivity = this.estimatePredicateSelectivityWithStatistics(sp, join.on);
+    if (on !== null && !boundByOuter) {
+      const selectivity = this.estimatePredicateSelectivityWithStatistics(sp, on);
       fullRows = estimateSelectivity(selectivity, fullRows);
       fullLogicalRows = estimateSelectivity(selectivity, fullLogicalRows);
     }
@@ -3869,9 +3898,9 @@ export class Engine {
     addPlanUnit(
       root,
       UNIT_OPERATOR_EVAL,
-      saturatingEstimateMultiply(estimatorOperatorNodes(join.on), invocations),
+      saturatingEstimateMultiply(estimatorOperatorNodes(on), invocations),
     );
-    this.addExpressionSubqueries(root, join.on, invocations, ctx);
+    this.addExpressionSubqueries(root, on, invocations, ctx);
     return parentEstimatedPlan(root, outer, inner);
   }
 
@@ -4798,7 +4827,8 @@ export class Engine {
       this.renderRelLeaf(r, sp, 0, depth, note);
       return;
     }
-    const j = sp.joins[n - 2]!;
+    // The join renders its residual ON; conjuncts pushed to a relation render there (planner.md §3.3).
+    const j: PlanJoin = { kind: sp.joins[n - 2]!.kind, on: joinOn(sp, n - 2) };
     const isHash = n === 2 && sp.phys.hashJoin !== null;
     const detail = isHash
       ? `${j.kind}; keys=${sp.phys.hashJoin!.keys.length}${j.on === null ? "" : r.verbose ? `; on=${renderRExpr(j.on)}` : `; on:conjuncts=${conjunctCount(j.on)}`}`
@@ -4826,7 +4856,7 @@ export class Engine {
     }
     const step = sp.phys.joinSteps[n - 2]!;
     const ons = step.onIndices
-      .map((index) => sp.joins[index]!.on)
+      .map((index) => joinOn(sp, index))
       .filter((on): on is RExpr => on !== null);
     const kind = step.onIndices.reduce<JoinKind>((current, index) => {
       const candidate = sp.joins[index]!.kind;
@@ -4883,19 +4913,19 @@ export class Engine {
         r.emit(
           depth,
           "Catalog Scan " + rel.tableName,
-          withNote("db=" + rel.srf.introspectScope, note),
+          withNote(pushedFilterDetail(sp, i, "db=" + rel.srf.introspectScope, r.verbose), note),
         );
         return;
       }
-      r.emit(depth, "SRF " + rel.tableName, withNote("-", note));
+      r.emit(depth, "SRF " + rel.tableName, withNote(pushedFilterDetail(sp, i, "", r.verbose), note));
       return;
     }
     if (rel.cte !== undefined) {
-      r.emit(depth, "CTE Scan " + rel.tableName, withNote("-", note));
+      r.emit(depth, "CTE Scan " + rel.tableName, withNote(pushedFilterDetail(sp, i, "", r.verbose), note));
       return;
     }
     if (rel.derived !== undefined) {
-      r.emit(depth, "Subquery " + rel.tableName, withNote("-", note));
+      r.emit(depth, "Subquery " + rel.tableName, withNote(pushedFilterDetail(sp, i, "", r.verbose), note));
       this.renderQueryPlan(r, rel.derived, depth + 1);
       return;
     }
@@ -4903,14 +4933,13 @@ export class Engine {
     // bound in the access-path label (cost.md §3 "JOIN").
     const inl = sp.phys.relINLBounds[i] !== null;
     const bound = inl ? sp.phys.relINLBounds[i]! : sp.phys.relBounds[i]!;
-    let detail = this.scanDetail(rel.tableName, bound, inl, sp.relMasks[i]!);
     // A pushed WHERE filter (planner.md §3.2) runs inside the scan, so it renders on the Scan.
-    const pushed = pushedFilter(sp, i).glob;
-    if (pushed !== null) {
-      detail += r.verbose
-        ? `; filter=${renderRExpr(pushed)}`
-        : `; filter:conjuncts=${conjunctCount(pushed)}`;
-    }
+    const detail = pushedFilterDetail(
+      sp,
+      i,
+      this.scanDetail(rel.tableName, bound, inl, sp.relMasks[i]!),
+      r.verbose,
+    );
     r.emit(depth, "Scan " + rel.tableName, withNote(detail, note));
   }
 
@@ -12555,6 +12584,20 @@ export class Engine {
     ctes: CteBinding[],
     ptypes: ParamTypes,
   ): SelectPlan {
+    return this.planSelectPushed(sel, parent, ctes, ptypes, []);
+  }
+
+  // planSelectPushed is planSelect with stage-2 body-pushed conjuncts (spec/design/planner.md §3.2)
+  // appended to the resolved WHERE, in order, before the plan is rewritten and optimized: a derived
+  // body planned again by its enclosing SELECT. The conjuncts are already resolved against this
+  // SELECT's FROM slots.
+  private planSelectPushed(
+    sel: Select,
+    parent: Scope | null,
+    ctes: CteBinding[],
+    ptypes: ParamTypes,
+    pushed: RExpr[],
+  ): SelectPlan {
     // Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
     // relation's flat column offset in FROM order, and reject a duplicate label — a self-join
     // without distinct aliases is 42712 (spec/design/grammar.md §15). A FROM-less SELECT
@@ -13325,6 +13368,10 @@ export class Engine {
     // now carries). Pair each with its join kind — the kind only changes how unmatched rows are
     // handled in the executor loop, not the predicate (grammar.md §15).
     const joins: PlanJoin[] = sel.joins.map((j, k) => ({ kind: j.kind, on: joinPreds[k]! }));
+    // Body-pushed conjuncts from an enclosing SELECT (planner.md §3.2) join the WHERE as a left-deep
+    // AND after the body's own WHERE, in source order.
+    let fullFilter = filter;
+    for (const c of pushed) fullFilter = fullFilter === null ? c : { kind: "and", lhs: fullFilter, rhs: c };
 
     // Assemble the owned LOGICAL plan (table NAMES + offsets/widths replace the scope's tables, so
     // the plan outlives the scope and a correlated subquery can re-execute it per row). Resolve
@@ -13344,7 +13391,7 @@ export class Engine {
       kind: "select",
       rels: planRels,
       joins,
-      filter,
+      filter: fullFilter,
       isAgg,
       groupKeys,
       groupExprs,
@@ -13385,10 +13432,39 @@ export class Engine {
     // foldUncorrelatedInPlan is NOT a planner rewrite — it executes subqueries and needs bound
     // params, so it stays post-bind in the statement drivers.
     rewriteWhere(plan);
+    this.replanPushedBodies(plan, tableRefs, ctes, ptypes);
     //
     // ——— Stage 3: physical/access-path selection (spec/design/planner.md §4) ———
     optimizeSelect(plan, scope.rels, this.readSnap(), this);
     return plan;
+  }
+
+  // replanPushedBodies plans each derived body that stage 2 moved conjuncts into again from its
+  // syntax, with those conjuncts appended to its WHERE (spec/design/planner.md §3.2), so the body's
+  // own rewrite and access-path selection see them. Planning again must have no other effect: the
+  // CTE reference counts the first planning recorded are restored, keeping every CTE's mode unchanged.
+  private replanPushedBodies(
+    plan: SelectPlan,
+    tableRefs: TableRef[],
+    ctes: CteBinding[],
+    ptypes: ParamTypes,
+  ): void {
+    const pd = plan.pushdown;
+    if (pd === null || pd.bodyPushes === null) return;
+    pd.bodyPushes.forEach((pushed, i) => {
+      if (pushed.length === 0) return;
+      const refs = ctes.map((b) => b.refs);
+      let body: SelectPlan;
+      try {
+        body = this.planSelectPushed(tableRefs[i]!.subquery as Select, null, ctes, ptypes, pushed);
+      } finally {
+        ctes.forEach((b, ci) => {
+          b.refs = refs[ci]!;
+        });
+      }
+      plan.rels[i]!.derived = body;
+    });
+    pd.bodyPushes = null;
   }
 
   // resolveSRF resolves a FROM-clause set-returning function call (generate_series(...)) into a
@@ -15393,7 +15469,7 @@ export class Engine {
       rightRows = this.materializeRel(plan, innerOrdinal, outer, [], env, params, meter);
       relWork.set(innerOrdinal, meter.accrued - before);
     }
-    const on = plan.joins[0]!.on;
+    const on = joinOn(plan, 0);
 
     const limit = plan.limit;
     const offset = plan.offset ?? 0n;
@@ -15564,7 +15640,7 @@ export class Engine {
           combined.splice(plan.rels[inner]!.offset, right.length, ...right);
           let keep = true;
           for (const onIndex of step.onIndices) {
-            const on = plan.joins[onIndex]!.on;
+            const on = joinOn(plan, onIndex);
             if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) {
               keep = false;
               break;
@@ -15675,6 +15751,35 @@ export class Engine {
   // query's own outer and its parent=null body simply ignores it (a parent=null plan holds no
   // outerColumn, so the two are observably identical).
   private materializeRel(
+    plan: SelectPlan,
+    ri: number,
+    outer: Row[],
+    left: Row,
+    baseEnv: EvalEnv,
+    params: Value[],
+    meter: Meter,
+  ): Row[] {
+    const rel = plan.rels[ri]!;
+    const pushed = pushedFilter(plan, ri).local;
+    if (pushed === null || (rel.srf === undefined && rel.cte === undefined && rel.derived === undefined)) {
+      return this.materializeRelRows(plan, ri, outer, left, baseEnv, params, meter);
+    }
+    // A computed relation's scan-pushed filter (planner.md §3.2) runs over its produced rows in
+    // production order; each rejected row's reservation is released before the join reads them.
+    const rows = this.materializeRelRows(plan, ri, outer, left, baseEnv, params, meter);
+    const env: EvalEnv = { ...baseEnv, outer };
+    const mask = plan.relMasks[ri]!;
+    const kept: Row[] = [];
+    for (const row of rows) {
+      if (isTrue(evalExpr(pushed, row, env, meter))) kept.push(row);
+      else meter.releaseRowMasked(row, mask);
+    }
+    return kept;
+  }
+
+  // materializeRelRows produces relation ri's rows; a base table applies its pushed filter as its
+  // access path admits each row.
+  private materializeRelRows(
     plan: SelectPlan,
     ri: number,
     outer: Row[],
@@ -15827,8 +15932,9 @@ export class Engine {
           m = ginSiblingMatch(filter, relBound.gin.colGlobal, siblingRange);
           if (m !== null) break;
         }
-      } else if (plan.filter !== null) {
-        m = ginMatch(plan.filter, relBound.gin.colGlobal);
+      } else {
+        const access = accessPredicate(plan);
+        if (access !== null) m = ginMatch(access, relBound.gin.colGlobal);
       }
       const r = this.ginBoundRows(
         rel.tableName,
@@ -15854,8 +15960,9 @@ export class Engine {
               : (gistSiblingMatch(filter, relBound.gist.colGlobal, siblingRange)?.query ?? null);
           if (q !== null) break;
         }
-      } else if (plan.filter !== null) {
-        q = gistQueryOperand(plan.filter, relBound.gist);
+      } else {
+        const access = accessPredicate(plan);
+        if (access !== null) q = gistQueryOperand(access, relBound.gist);
       }
       const r = this.gistBoundRows(
         rel.tableName,
@@ -16400,7 +16507,7 @@ export class Engine {
           innerRows,
           meter,
         );
-    const on = plan.joins[0]!.on;
+    const on = joinOn(plan, 0);
     const mask = memoryMask(plan, meter);
     const out: Row[] = [];
     for (const outerRow of outerRows) {
@@ -16518,7 +16625,7 @@ export class Engine {
           combined.splice(plan.rels[inner]!.offset, right.length, ...right);
           let keep = true;
           for (const onIndex of step.onIndices) {
-            const on = plan.joins[onIndex]!.on;
+            const on = joinOn(plan, onIndex);
             if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) {
               keep = false;
               break;
@@ -16806,7 +16913,7 @@ export class Engine {
                 combined.splice(plan.rels[inner]!.offset, right.length, ...right);
                 let keep = true;
                 for (const index of onIndices) {
-                  const on = plan.joins[index]!.on;
+                  const on = joinOn(plan, index);
                   if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) {
                     keep = false;
                     break;
@@ -16870,7 +16977,7 @@ export class Engine {
                 combined.splice(plan.rels[inner]!.offset, right.length, ...right);
                 let keep = true;
                 for (const index of onIndices) {
-                  const on = plan.joins[index]!.on;
+                  const on = joinOn(plan, index);
                   if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) {
                     keep = false;
                     break;
@@ -17372,7 +17479,7 @@ export class Engine {
         materialized[0] = [];
       }
       for (let k = 0; k < plan.joins.length; k++) {
-      const on = plan.joins[k]!.on;
+      const on = joinOn(plan, k);
       const kind = plan.joins[k]!.kind;
       const emitLeft = kind === "left" || kind === "full";
       const emitRight = kind === "right" || kind === "full";
@@ -17972,11 +18079,12 @@ export class Engine {
     if (sp.filter !== null) {
       const before = cost.value;
       sp.filter = this.foldUncorrelatedInRExpr(sp.filter, bound, ctes, cost);
-      // The fold replaces a folded conjunct node (Go overwrites it in place), so the pushdown's
-      // residual is re-derived from the folded WHERE (planner.md §3.2).
-      refreshWhereResidual(sp);
       this.recordExplainActualFolded(frame, "Filter", cost.value - before);
     }
+    // The fold replaces a folded conjunct node (Go overwrites it in place), so the pushdown's
+    // residual WHERE, residual ONs, and access predicate are re-derived from the folded predicates
+    // (planner.md §3.2/§3.3).
+    refreshPushdownResiduals(sp);
     if (sp.having !== null) sp.having = this.foldUncorrelatedInRExpr(sp.having, bound, ctes, cost);
     for (const s of sp.aggSpecs) {
       if (s.operand !== null)
@@ -25603,6 +25711,15 @@ export type SelectPlan = {
   // (optimize.ts); zero-valued when resolve hands the plan over (spec/design/planner.md §4).
   phys: PhysicalPlan;
 };
+
+// pushedFilterDetail appends relation i's scan-pushed filter (planner.md §3.2) to its node detail:
+// `filter:conjuncts=N`, VERBOSE `filter=<expr>`. A computed relation's otherwise-empty detail is `-`.
+function pushedFilterDetail(sp: SelectPlan, i: number, detail: string, verbose: boolean): string {
+  const pushed = pushedFilter(sp, i).glob;
+  if (pushed === null) return detail === "" ? "-" : detail;
+  const part = verbose ? `filter=${renderRExpr(pushed)}` : `filter:conjuncts=${conjunctCount(pushed)}`;
+  return detail === "" ? part : `${detail}; ${part}`;
+}
 
 function selectActualRootNode(sp: SelectPlan): string {
   if (sp.limit !== null || sp.offset !== null) return "Limit";

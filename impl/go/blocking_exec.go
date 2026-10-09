@@ -672,7 +672,7 @@ func (db *engine) blockingJoinSteps(p *selectPlan, inputs []*rowSpool, env *eval
 				combined := append(storedRow(nil), left...)
 				copy(combined[offset:], right)
 				for _, onIndex := range onIndices {
-					if on := p.joins[onIndex].on; on != nil {
+					if on := p.joinOn(onIndex); on != nil {
 						v, err := on.eval(combined, env, m)
 						if err != nil {
 							return err
@@ -824,7 +824,7 @@ func (db *engine) boundedJoinTopN(p *selectPlan, own *blockingOwner, env *evalEn
 				combined := append(storedRow(nil), left...)
 				copy(combined[innerOffset:], right)
 				for _, i := range onIndices {
-					if on := p.joins[i].on; on != nil {
+					if on := p.joinOn(i); on != nil {
 						v, err := on.eval(combined, env, m)
 						if err != nil {
 							return err

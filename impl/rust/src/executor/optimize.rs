@@ -146,8 +146,8 @@ impl Engine {
         }
 
         let mut ordinary = [
-            inventory_scan_candidates(plan.filter.as_ref(), &scope.rels[0], scope.catalog),
-            inventory_scan_candidates(plan.filter.as_ref(), &scope.rels[1], scope.catalog),
+            inventory_scan_candidates(plan.filter.access(), &scope.rels[0], scope.catalog),
+            inventory_scan_candidates(plan.filter.access(), &scope.rels[1], scope.catalog),
         ];
         let mut candidates = Vec::new();
         for order in [[0, 1], [1, 0]] {
@@ -156,7 +156,7 @@ impl Engine {
             let outer_access = std::mem::take(&mut ordinary[outer]);
             for oc in outer_access {
                 let inner_access = inventory_scan_candidates(
-                    plan.filter.as_ref(),
+                    plan.filter.access(),
                     &scope.rels[inner],
                     scope.catalog,
                 );
@@ -174,7 +174,7 @@ impl Engine {
                         // Rebuild the same ordinary bound for the nested alternative; ScanBound is
                         // intentionally owned, so inventory rather than cloning keeps the type flat.
                         ic = inventory_scan_candidates(
-                            plan.filter.as_ref(),
+                            plan.filter.access(),
                             &scope.rels[inner],
                             scope.catalog,
                         )
@@ -194,7 +194,7 @@ impl Engine {
                 }
                 for ic in inventory_inl_candidates(
                     plan.joins[0].on.as_ref(),
-                    plan.filter.as_ref(),
+                    plan.filter.get(),
                     &scope.rels[inner],
                     &[relation_columns(plan, outer)],
                     scope.catalog,
@@ -213,7 +213,7 @@ impl Engine {
                 // expansion and attach by identity below.
             }
             ordinary[outer] =
-                inventory_scan_candidates(plan.filter.as_ref(), &scope.rels[outer], scope.catalog);
+                inventory_scan_candidates(plan.filter.access(), &scope.rels[outer], scope.catalog);
         }
         if candidates.is_empty() {
             return;
@@ -242,7 +242,7 @@ impl Engine {
         for mut candidate in candidates {
             let [outer, inner] = candidate.order;
             let mut outer_candidate =
-                inventory_scan_candidates(plan.filter.as_ref(), &scope.rels[outer], scope.catalog)
+                inventory_scan_candidates(plan.filter.access(), &scope.rels[outer], scope.catalog)
                     .into_iter()
                     .find(|c| c.identity == candidate.outer_identity)
                     .expect("outer candidate identity is reproducible");
@@ -389,7 +389,7 @@ impl Engine {
         } else {
             for &ordinal in island {
                 let identities: Vec<_> = inventory_scan_candidates(
-                    plan.filter.as_ref(),
+                    plan.filter.access(),
                     &scope.rels[ordinal],
                     scope.catalog,
                 )
@@ -463,7 +463,7 @@ impl Engine {
             let mut drivers = Vec::new();
             for &ordinal in island {
                 let identities: Vec<_> = inventory_scan_candidates(
-                    plan.filter.as_ref(),
+                    plan.filter.access(),
                     &scope.rels[ordinal],
                     scope.catalog,
                 )
@@ -569,7 +569,7 @@ impl Engine {
             }
             for candidate in inventory_inl_candidates(
                 None,
-                plan.filter.as_ref(),
+                plan.filter.get(),
                 &scope.rels[inner],
                 &sibling_columns,
                 scope.catalog,
@@ -594,7 +594,7 @@ impl Engine {
             }
 
             let identities: Vec<_> =
-                inventory_scan_candidates(plan.filter.as_ref(), &scope.rels[inner], scope.catalog)
+                inventory_scan_candidates(plan.filter.access(), &scope.rels[inner], scope.catalog)
                     .into_iter()
                     .map(|candidate| candidate.identity)
                     .collect();
@@ -662,7 +662,7 @@ impl Engine {
             match access {
                 JoinSearchAccess::Ordinary(identity) => {
                     plan.phys.rel_bounds[ordinal] = inventory_scan_candidates(
-                        plan.filter.as_ref(),
+                        plan.filter.access(),
                         &scope.rels[ordinal],
                         scope.catalog,
                     )
@@ -677,7 +677,7 @@ impl Engine {
                         .collect();
                     let (on, filter) = match on_index {
                         Some(index) => (plan.joins[*index].on.as_ref(), None),
-                        None => (None, plan.filter.as_ref()),
+                        None => (None, plan.filter.get()),
                     };
                     plan.phys.rel_inl_bounds[ordinal] = inventory_inl_candidates(
                         on,
@@ -1093,7 +1093,7 @@ impl Engine {
                 plan.phys.rel_estimates.push(Vec::new());
                 continue;
             }
-            let candidates = inventory_scan_candidates(plan.filter.as_ref(), rel, scope.catalog);
+            let candidates = inventory_scan_candidates(plan.filter.access(), rel, scope.catalog);
             let estimates = estimate_scan_candidates(
                 &candidates,
                 rel,
@@ -1129,7 +1129,7 @@ impl Engine {
             return;
         }
         let rel = &scope.rels[0];
-        let access = inventory_scan_candidates(plan.filter.as_ref(), rel, scope.catalog);
+        let access = inventory_scan_candidates(plan.filter.access(), rel, scope.catalog);
         if access.is_empty() {
             return;
         }
@@ -1266,7 +1266,7 @@ impl Engine {
                 }
                 detect_inl_bound(
                     plan.joins[i - 1].on.as_ref(),
-                    plan.filter.as_ref(),
+                    plan.filter.get(),
                     rel,
                     scope.catalog,
                 )

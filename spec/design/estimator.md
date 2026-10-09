@@ -395,12 +395,21 @@ The following attribution rules close the remaining current-plan shapes:
   result by rows physically delivered by its child, and adds expression work for the child rows. In
   a join with a stage-2 pushdown ([planner.md](planner.md) §3.2) the Filter's predicate is the
   residual only (no Filter node when it is empty);
-- a pushed filter `F` belongs to its base relation's Scan node. With the selected access path's scan
+- a scan-pushed filter `F` ([planner.md](planner.md) §3.2–§3.3, WHERE and ON conjuncts alike)
+  belongs to its relation's node. On a base relation's Scan, with the selected access path's scan
   rows `S` and logical rows `N`, the Scan adds `nodes(F) × S` `operator_eval`, its logical rows become
   the statistics-aware selectivity of `F` applied to `N`, and its delivered rows become
   `min(that, S)` — except an index-nested-loop inner, whose per-call `S` is bounded by the join key
   rather than by `F`, so its delivered rows are `F`'s selectivity applied to `S`. The repetition by
-  outer rows then applies as for any INL inner;
+  outer rows then applies as for any INL inner. On a derived table, CTE reference, SRF, or catalog
+  relation with produced rows `P` and logical rows `N`, the node adds `nodes(F) × P` `operator_eval`
+  and its logical and delivered rows become `F`'s selectivity applied to `N`, capped by `P`. A
+  conjunct moved into a derived body is simply part of the body's own WHERE, estimated there;
+- the access path estimate of a base relation reads the **access predicate**: the complete WHERE
+  plus every ON conjunct scan-pushed to a relation, so a pushed ON conjunct can bound, and shape the
+  candidate estimate of, its relation exactly like a WHERE conjunct;
+- a join's ON selectivity, `operator_eval`, and subquery work use its **residual ON** (the complete
+  ON when nothing moved; no ON work when everything moved);
 - a WHERE contradiction ([planner.md](planner.md) §3.1) estimates every relation subtree — base
   scans, SRFs, CTE references, derived bodies — at zero rows, zero logical rows, and zero units, and a
   FROM-less `Result` at zero rows; the pipeline above estimates normally over that empty input;

@@ -1,0 +1,256 @@
+# Predicate pushdown into derived tables and onto computed relations (spec/design/planner.md §3.2).
+# A pushdown-safe conjunct over a derived table whose body is a single SELECT without aggregate,
+# GROUP BY, window function, LIMIT, or OFFSET — and whose referenced output columns are bare body
+# columns — moves INTO the body: the body is planned again with the conjunct appended to its WHERE, so
+# it can bound the body's key and push further into the body's own joins. Otherwise, in a join, a
+# conjunct over a derived table, CTE reference, or set-returning function runs over that relation's
+# rows before the join. A body with LIMIT, a window function, or aggregation is never pushed into:
+# the answer would change. The rows are PostgreSQL's; the `# cost:` pins are jed's cross-core
+# contract. All units weigh 1.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.column_alias, query.table_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.join_left, query.cross_join, query.limit, query.distinct, query.aggregates, query.group_by, query.window, query.window_ranking, query.union, query.values, query.cte, query.lateral, query.set_returning, query.derived_table, query.join_pushdown, query.hash_join, query.index_nested_loop, query.where_pushdown, query.derived_pushdown, query.on_pushdown, query.is_null, expr.arithmetic, null.three_valued, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, k i32, v i32)
+
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, w i32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 10), (2, 2, 20), (3, 3, 30), (4, 1, 40), (5, 2, NULL), (6, 3, 60),
+  (7, 1, 70), (8, 2, 80), (9, 3, 90), (10, 1, 100), (11, 2, 110), (12, NULL, 120)
+
+statement ok
+INSERT INTO u VALUES (1, 10), (2, NULL), (3, 30)
+
+# The conjunct moves into the body and seeks t's primary key: t 1 page + 1 row; the body's WHERE (the
+# moved `id = 7`) on that row 1; the body produces 1 row and the outer SELECT 1. 2 + 1 + 1 + 1 = 5.
+# cost: 5
+query II nosort
+SELECT * FROM (SELECT id, v FROM t) d WHERE d.id = 7
+----
+7
+70
+
+# The same query with an arithmetic operand: not pushdown-safe, so the whole body runs and the outer
+# WHERE filters its rows. t 1 page + 12 rows; 12 body rows produced; the outer WHERE's two nodes on
+# each of them 24; 1 produced. 13 + 12 + 24 + 1 = 50.
+# cost: 50
+query II nosort
+SELECT * FROM (SELECT id, v FROM t) d WHERE d.id + 0 = 7
+----
+7
+70
+
+# A renamed bare column moves too; the body's own WHERE is kept and the conjunct is appended.
+# cost: 23
+query II nosort
+SELECT d.n, d.val FROM (SELECT id AS n, v AS val FROM t WHERE v > 15) d WHERE d.n < 5 ORDER BY d.n
+----
+2
+20
+3
+30
+4
+40
+
+# A non-bare output column (`v * 2`) stays in the outer WHERE; the bare one still moves.
+# cost: 56
+query II nosort
+SELECT d.id, d.vv FROM (SELECT id, v * 2 AS vv FROM t) d WHERE d.vv > 100 AND d.id <= 10 ORDER BY d.id
+----
+6
+120
+7
+140
+8
+160
+9
+180
+10
+200
+
+# DISTINCT keeps whole equality classes, so filtering before or after deduplication agrees.
+# cost: 29
+query I nosort
+SELECT d.k FROM (SELECT DISTINCT k FROM t) d WHERE d.k >= 2 ORDER BY d.k
+----
+2
+3
+
+# An ORDER BY without LIMIT in the body does not block the move.
+# cost: 13
+query I nosort
+SELECT d.id FROM (SELECT id FROM t ORDER BY v DESC) d WHERE d.id > 9 ORDER BY d.id
+----
+10
+11
+12
+
+# LIMIT blocks it: the body's first three rows are chosen before the outer filter.
+# cost: 12
+query I nosort
+SELECT d.id FROM (SELECT id FROM t ORDER BY id LIMIT 3) d WHERE d.id > 1 ORDER BY d.id
+----
+2
+3
+
+# A window function blocks it: row_number() numbers every body row.
+# cost: 51
+query II nosort
+SELECT d.id, d.rn FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM t) d WHERE d.id > 10 ORDER BY d.id
+----
+11
+11
+12
+12
+
+# Aggregation blocks it (a grouped body is a follow-on): the count is over each whole group.
+# cost: 34
+query II nosort
+SELECT d.k, d.n FROM (SELECT k, count(*) AS n FROM t GROUP BY k) d WHERE d.k = 1
+----
+1
+4
+
+# Nested derived tables: the conjunct moves through both bodies to t's primary key.
+# cost: 6
+query II nosort
+SELECT * FROM (SELECT * FROM (SELECT id, v FROM t) x) y WHERE y.id = 3
+----
+3
+30
+
+# A body that joins: the moved conjuncts are pushed again inside it, each to its own base table.
+# cost: 25
+query II nosort
+SELECT d.tid, d.w FROM (SELECT t.id AS tid, u.w FROM t JOIN u ON t.k = u.id) d WHERE d.w > 10 AND d.tid < 6 ORDER BY d.tid
+----
+3
+30
+
+# In a join, the derived table's bare-column conjunct moves into its body and u's conjunct runs on u.
+# cost: 31
+query II nosort
+SELECT d.id, u.w FROM (SELECT id, k FROM t) d JOIN u ON d.k = u.id WHERE d.id < 5 AND u.w IS NOT NULL ORDER BY d.id
+----
+1
+10
+3
+30
+4
+10
+
+# A NULL-extended derived table keeps its conjunct after the join: `d.w IS NULL` must also see the
+# NULL-extended rows (t rows whose k matches no u row).
+# cost: 193
+query II nosort
+SELECT t.id, d.id FROM t LEFT JOIN (SELECT id, w FROM u) d ON t.k = d.id WHERE d.w IS NULL ORDER BY t.id
+----
+2
+2
+5
+2
+8
+2
+11
+2
+12
+NULL
+
+# A body that does not qualify still takes a scan pushdown in a join: the LIMIT body runs whole and
+# its rows are filtered before the join.
+# cost: 35
+query II nosort
+SELECT d.id, u.w FROM (SELECT id, k FROM t ORDER BY id LIMIT 6) d JOIN u ON d.k = u.id WHERE d.id > 2 ORDER BY d.id
+----
+3
+30
+4
+10
+5
+NULL
+6
+30
+
+# A UNION ALL body is filtered as it is produced.
+# cost: 72
+query II nosort
+SELECT s.id, u.w FROM (SELECT id FROM t UNION ALL SELECT id FROM u) s JOIN u ON s.id = u.id WHERE s.id >= 2 ORDER BY s.id, u.w
+----
+2
+NULL
+2
+NULL
+3
+30
+3
+30
+
+# A VALUES body likewise.
+# cost: 17
+query II nosort
+SELECT v.x, u.w FROM (VALUES (1), (2), (3), (4)) v(x) JOIN u ON v.x = u.id WHERE v.x > 1 ORDER BY v.x
+----
+2
+NULL
+3
+30
+
+# A CTE reference is filtered as its rows are read (an inlined CTE's body is not pushed into).
+# cost: 53
+query II nosort
+WITH c AS (SELECT id, k FROM t) SELECT c.id, u.w FROM c JOIN u ON c.k = u.id WHERE c.id < 5 ORDER BY c.id
+----
+1
+10
+2
+NULL
+3
+30
+4
+10
+
+# A materialized CTE: each reference filters the buffer it copies.
+# cost: 65
+query II nosort
+WITH c AS MATERIALIZED (SELECT id, k FROM t) SELECT c.id, u.w FROM c JOIN u ON c.k = u.id WHERE c.id < 5 ORDER BY c.id
+----
+1
+10
+2
+NULL
+3
+30
+4
+10
+
+# A set-returning function is filtered as it generates.
+# cost: 23
+query II nosort
+SELECT g.g, u.w FROM generate_series(1, 6) AS g JOIN u ON g.g = u.id WHERE g.g > 1 ORDER BY g.g
+----
+2
+NULL
+3
+30
+
+# A LATERAL derived table is re-produced per left row; its conjunct stays after the join.
+# cost: 104
+query II nosort
+SELECT u.id, l.id FROM u, LATERAL (SELECT t.id FROM t WHERE t.k = u.id) l WHERE l.id > 8 ORDER BY u.id, l.id
+----
+1
+10
+2
+11
+3
+9
+
+# Moving the conjunct can skip a body expression error: only t(5)'s row is projected, so the
+# division by zero at id = 3 is never evaluated (PostgreSQL pushes the qual the same way).
+# cost: 7
+query II nosort
+SELECT d.id, d.q FROM (SELECT id, 60 / (id - 3) AS q FROM t) d WHERE d.id = 5
+----
+5
+30

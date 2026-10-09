@@ -90,10 +90,12 @@ NULL
 # very differently depending on where it sits. In the ON clause it is part of the match: a left row
 # that fails it simply does not match, so EVERY right row is still preserved (NULL-extended where it
 # found no qualifying left row). b(10) keeps its a(1) match (a.k=10 holds); b(20)/b(21)/b(30) match
-# no qualifying left row and are preserved with a NULL. All four b rows survive. 2 page + 8
-# materialize + 48 ON (16 candidate pairs x 3 ops: a.k=b.k, a.k=10, AND) + 4 produced = 62.
+# no qualifying left row and are preserved with a NULL. All four b rows survive. `a.k = 10` filters the
+# NULL-extended (left) side, so it is pushed to a's scan (planner.md §3.3): a 1 page + 4 rows + 4
+# filter evals = 9, b 1 page + 4 rows = 5; only a(1) survives, so the residual `a.k = b.k` runs over
+# 1 × 4 pairs = 4; 4 produced. 9 + 5 + 4 + 4 = 22 (the unpushed ON ran 16 pairs × 3 ops = 48).
 # names: id, id
-# cost: 62
+# cost: 22
 query II nosort
 SELECT a.id, b.id FROM a RIGHT JOIN b ON a.k = b.k AND a.k = 10 ORDER BY b.id
 ----

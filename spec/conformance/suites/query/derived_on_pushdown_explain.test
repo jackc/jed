@@ -1,0 +1,289 @@
+# EXPLAIN of pushdown into derived bodies, onto computed relations, and from ON clauses
+# (spec/design/planner.md §3.2/§3.3; explain.md §5). A conjunct moved into a derived body appears in
+# the body's own plan (its Filter, or its Scan when the body pushes it again, or as the body's access
+# bound). A scan-pushed filter renders on its relation's node — `Subquery`, `CTE Scan`, `SRF`, and
+# `Catalog Scan` as well as `Scan` — as `filter:conjuncts=N` (VERBOSE `filter=<expr>`). A join renders
+# only its residual ON and drops the `on` part when none remains. This rendering is jed-specific and
+# not oracle-imported.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.join_left, query.cross_join, query.join_pushdown, query.hash_join, query.index_nested_loop, query.where_pushdown, query.derived_pushdown, query.on_pushdown, query.derived_table, query.cte, query.set_returning, query.is_null, query.explain, query.explain_analyze, introspect.tables, introspect.columns, expr.arithmetic, null.three_valued, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE a (id i32 PRIMARY KEY, k i32, v i32)
+
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, k i32, w i32)
+
+statement ok
+INSERT INTO a VALUES (1, 1, 10), (2, 2, 20), (3, 3, NULL), (4, 9, 40)
+
+statement ok
+INSERT INTO b VALUES (11, 1, 5), (12, 2, NULL), (13, 2, 7), (14, 7, 0), (15, 8, 1)
+
+# The moved conjunct is the body's WHERE and bounds its primary key; the outer SELECT has no Filter.
+query ITTII nosort
+EXPLAIN SELECT * FROM (SELECT id, v FROM a) d WHERE d.id = 2
+----
+0
+Subquery d
+-
+1
+5
+1
+Filter
+conjuncts=1
+1
+4
+2
+Scan a
+PK bound: id = 2; touched=2
+1
+2
+
+# VERBOSE: the body's own WHERE comes first, the moved conjunct (in body slots) after it. The
+# non-bare `vv` conjunct is scan-pushed onto the Subquery node, in the outer SELECT's slots.
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT d.id, b.id FROM (SELECT id, k, v * 2 AS vv FROM a WHERE v > 5) d JOIN b ON d.k = b.k WHERE d.id < 4 AND d.vv > 30
+----
+0
+Hash Join
+inner; keys=1; on=(#1 = #4); output=[#0, #3]
+1
+52
+1
+Subquery d
+filter=(#2 > 30)
+1
+12
+2
+Filter
+filter=((#2 > 5) and (#0 < 4)); output=[#0, #1, (#2 * 2)]
+1
+11
+3
+Scan a
+PK bound: id < 4; touched=3
+2
+3
+1
+Scan b
+Full scan; touched=2
+5
+6
+
+# An inlined CTE reference renders its scan-pushed filter on the CTE Scan.
+query ITTII nosort
+EXPLAIN WITH c AS (SELECT id, k FROM a) SELECT c.id, b.id FROM c JOIN b ON c.k = b.k WHERE c.id < 3
+----
+0
+WITH
+ctes=1
+1
+57
+1
+CTE c
+inlined
+4
+0
+2
+Scan a
+Full scan; touched=2
+4
+9
+1
+Hash Join
+inner; keys=1; on:conjuncts=1
+1
+57
+2
+CTE Scan c
+filter:conjuncts=1
+2
+13
+2
+Scan b
+Full scan; touched=2
+5
+6
+
+# A set-returning function renders its scan-pushed filter on the SRF node.
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT g.g, b.id FROM generate_series(1, 5) AS g JOIN b ON g.g = b.k WHERE g.g > 1
+----
+0
+Nested Loop
+inner; on=(#0 = #2); output=[#0, #1]
+1
+27
+1
+SRF generate_series
+filter=(#0 > 1)
+2
+10
+1
+Scan b
+Full scan; touched=2
+5
+6
+
+# A catalog relation appends its filter after its database scope.
+query ITTII nosort
+EXPLAIN SELECT t.name, c.name FROM jed_tables t JOIN jed_columns c ON c.table_name = t.name WHERE t.name = 'a'
+----
+0
+Hash Join
+inner; keys=1; on:conjuncts=1
+1
+24
+1
+Catalog Scan jed_tables
+db=main; filter:conjuncts=1
+1
+4
+1
+Catalog Scan jed_columns
+db=main
+6
+6
+
+# ON pushdown: each side's single-relation conjunct renders on its Scan; the join keeps the residual.
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id FROM a JOIN b ON a.k = b.k AND a.v >= 20 AND b.w IS NOT NULL
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+1
+29
+1
+Scan a
+Full scan; touched=3; filter:conjuncts=1
+2
+9
+1
+Scan b
+Full scan; touched=3; filter:conjuncts=1
+4
+11
+
+# VERBOSE spells the residual ON and each pushed filter.
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT a.id, b.id FROM a JOIN b ON a.k = b.k AND a.v >= 20 AND b.w IS NOT NULL
+----
+0
+Nested Loop
+inner; on=(#1 = #4); output=[#0, #3]
+1
+29
+1
+Scan a
+Full scan; touched=3; filter=(#2 >= 20)
+2
+9
+1
+Scan b
+Full scan; touched=3; filter=(#5 is not null)
+4
+11
+
+# Nothing remains of the ON, so the join renders only its kind.
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id FROM a JOIN b ON b.w = 0
+----
+0
+Nested Loop
+inner
+4
+20
+1
+Scan a
+Full scan; touched=1
+4
+5
+1
+Scan b
+Full scan; touched=2; filter:conjuncts=1
+1
+11
+
+# LEFT: the NULL-extended side's conjunct bounds b's primary key and is rechecked there; the hash
+# join's residual ON is its key equality.
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k AND b.id = 13
+----
+0
+Hash Join
+left; keys=1; on=(#1 = #4); output=[#0, #3]
+4
+68
+1
+Scan a
+Full scan; touched=2
+4
+5
+1
+Scan b
+PK bound: id = 13; touched=2; filter=(#3 = 13)
+1
+3
+
+# A conjunct on the preserved side of a LEFT JOIN stays in the ON.
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k AND a.v >= 20
+----
+0
+Nested Loop
+left; on:conjuncts=2
+4
+75
+1
+Scan a
+Full scan; touched=3
+4
+5
+1
+Scan b
+Full scan; touched=2
+5
+6
+
+# EXPLAIN ANALYZE attributes a scan-pushed filter's work to the Subquery node and a moved conjunct's
+# work to the body.
+query ITTIII nosort
+EXPLAIN ANALYZE SELECT d.id, b.id FROM (SELECT id, k, v + 0 AS v0 FROM a) d JOIN b ON d.k = b.k WHERE d.id >= 2 AND d.v0 > 5
+----
+0
+Analyze
+cost=70 rows=2
+1
+51
+70
+1
+Hash Join
+inner; keys=1; on:conjuncts=1
+1
+51
+70
+2
+Subquery d
+filter:conjuncts=1
+1
+11
+16
+3
+Filter
+conjuncts=1
+2
+9
+13
+4
+Scan a
+PK bound: id >= 2; touched=3
+2
+3
+4
+2
+Scan b
+Full scan; touched=2
+5
+6
+6

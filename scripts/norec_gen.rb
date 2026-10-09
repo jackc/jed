@@ -84,6 +84,14 @@
 #              arithmetic, which never moves, so it is applied to the joined rows instead. INNER, LEFT,
 #              RIGHT, FULL and three-relation shapes over NULL-bearing data must match by-construction
 #              rows — a conjunct wrongly pushed to a NULL-extended side changes the answer.
+#   on_pushdown — single-relation ON conjuncts move to the side the join kind allows (planner.md
+#              §3.3); writing each column as `col + 0` keeps them in the ON. INNER/LEFT/RIGHT/FULL, a
+#              derived NULL-extended side, and a three-relation chain whose later INNER ON reads a
+#              relation an earlier LEFT JOIN NULL-extends (never pushed) must match by-construction rows.
+#   derived_pushdown — conjuncts over a derived table's bare output columns move INTO its body (and
+#              on to the body's own scans), or onto a CTE reference / SRF in a join (planner.md §3.2);
+#              `col + 0` keeps them outside. Bodies with LIMIT, DISTINCT, an own WHERE, a join, and a
+#              NULL-extended derived table must match by-construction rows.
 #   contradiction — a provably-never-TRUE bare-column literal AND-chain reads no relation
 #              (planner.md §3.1); the same predicate over `col + 0` is not proven and scans. Both must be
 #              empty (an ungrouped COUNT returns 0), and satisfiable near-miss ranges must match.
@@ -305,6 +313,19 @@ WHERE_PUSHDOWN_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_m
                         query.join_right query.join_full query.cross_join query.is_null
                         query.is_distinct_from query.where_pushdown expr.arithmetic expr.between
                         expr.comparison_value null.three_valued types.i32].freeze
+ON_PUSHDOWN_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                     query.where_eq query.comparison_order query.logical_connectives query.order_by
+                     query.order_by_keys query.qualified_column query.join_inner query.join_left
+                     query.join_right query.join_full query.is_null query.is_distinct_from
+                     query.where_pushdown query.derived_pushdown query.on_pushdown query.derived_table
+                     expr.arithmetic expr.between expr.comparison_value null.three_valued types.i32].freeze
+DERIVED_PUSHDOWN_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                          query.where_eq query.comparison_order query.logical_connectives query.order_by
+                          query.order_by_keys query.qualified_column query.join_inner query.join_left
+                          query.limit query.distinct query.cte query.set_returning query.is_null
+                          query.is_distinct_from query.where_pushdown query.derived_pushdown
+                          query.derived_table expr.arithmetic expr.between expr.comparison_value
+                          null.three_valued types.i32].freeze
 CONTRADICTION_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
                        query.where_eq query.comparison_order query.logical_connectives query.order_by
                        query.aggregates query.qualified_column query.join_inner
@@ -2540,6 +2561,175 @@ def gen_contradiction(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: ON pushdown ---------------------------------------------------------------------
+def gen_on_pushdown(seed)
+  rng = Random.new(seed)
+  val = -> { rng.rand < 0.2 ? nil : rng.rand(0..10) }
+  a = (1..20).to_a.sample(6, random: rng).sort.map { |id| [id, rng.rand(1..5), val.call] }
+  b = (101..120).to_a.sample(6, random: rng).sort.map { |id| [id, rng.rand(2..6), val.call] }
+  c = (201..220).to_a.sample(4, random: rng).sort.map { |id| [id, rng.rand(1..6)] }
+  lit = ->(x) { x.nil? ? "NULL" : x.to_s }
+  nkey = ->(x) { x.nil? ? [1, 0] : [0, x] }
+  flat = lambda do |rows|
+    rows.sort_by { |r| r.flat_map { |x| nkey.call(x) } }.flat_map { |r| r.map { |x| lit.call(x) } }
+  end
+  pick = lambda do |col|
+    sql, fn = WHERE_PUSHDOWN_TEMPLATES.sample(random: rng).call(col, rng)
+    [sql, fn, sql.gsub(col, "#{col} + 0")]
+  end
+  ids = ->(pairs) { pairs.map { |row| row.map { |r| r&.first } } }
+
+  out = header(seed, ON_PUSHDOWN_REQ, "ON pushdown (pushed vs ON-resident conjuncts)")
+  stmt(out, "CREATE TABLE a (id i32 PRIMARY KEY, k i32, v i32)")
+  stmt(out, "CREATE TABLE b (id i32 PRIMARY KEY, k i32, w i32)")
+  stmt(out, "CREATE TABLE c (id i32 PRIMARY KEY, k i32)")
+  stmt(out, "INSERT INTO a VALUES #{a.map { |id, k, v| "(#{id}, #{k}, #{lit.call(v)})" }.join(', ')}")
+  stmt(out, "INSERT INTO b VALUES #{b.map { |id, k, w| "(#{id}, #{k}, #{lit.call(w)})" }.join(', ')}")
+  stmt(out, "INSERT INTO c VALUES #{c.map { |id, k| "(#{id}, #{k})" }.join(', ')}")
+
+  # Every join kind with one conjunct per side in the ON: `on` decides a pair.
+  %w[INNER LEFT RIGHT FULL].each do |kind|
+    pa_sql, pa, pa_scan = pick.call("a.v")
+    pb_sql, pb, pb_scan = pick.call("b.w")
+    on = ->(ar, br) { ar[1] == br[1] && pa.call(ar[2]) == true && pb.call(br[2]) == true }
+    pairs = a.flat_map { |ar| b.select { |br| on.call(ar, br) }.map { |br| [ar, br] } }
+    rows = pairs.dup
+    rows += a.reject { |ar| b.any? { |br| on.call(ar, br) } }.map { |ar| [ar, nil] } if %w[LEFT FULL].include?(kind)
+    rows += b.reject { |br| a.any? { |ar| on.call(ar, br) } }.map { |br| [nil, br] } if %w[RIGHT FULL].include?(kind)
+    sql = ->(pa_x, pb_x) { "SELECT a.id, b.id FROM a #{kind} JOIN b ON a.k = b.k AND #{pa_x} AND #{pb_x} ORDER BY a.id, b.id" }
+    out << "# #{kind}: one ON conjunct per side (pushed only to a side the join NULL-extends, or INNER)"
+    q(out, "II", sql.call(pa_sql, pb_sql), flat.call(ids.call(rows)))
+    out << "# the same conjuncts over `+ 0` stay in the ON — MUST match"
+    q(out, "II", sql.call(pa_scan, pb_scan), flat.call(ids.call(rows)))
+  end
+
+  # A derived table on the NULL-extended side: the ON conjunct moves into its body.
+  pb_sql, pb, pb_scan = pick.call("d.w")
+  on = ->(ar, br) { ar[1] == br[1] && pb.call(br[2]) == true }
+  rows = a.flat_map { |ar| (m = b.select { |br| on.call(ar, br) }).empty? ? [[ar, nil]] : m.map { |br| [ar, br] } }
+  sql = ->(pb_x) { "SELECT a.id, d.id FROM a LEFT JOIN (SELECT id, k, w FROM b) d ON a.k = d.k AND #{pb_x} ORDER BY a.id, d.id" }
+  out << "# LEFT JOIN a derived table: the NULL-extended side's conjunct moves into the body"
+  q(out, "II", sql.call(pb_sql), flat.call(ids.call(rows)))
+  out << "# unpushed spelling — MUST match"
+  q(out, "II", sql.call(pb_scan), flat.call(ids.call(rows)))
+
+  # Three relations: b is NULL-extended by the LEFT JOIN, so the later INNER ON's b conjunct must
+  # stay in the ON; the a and c conjuncts move.
+  pa_sql, pa, pa_scan = pick.call("a.v")
+  pb_sql, pb, pb_scan = pick.call("b.w")
+  pc_sql, pc, pc_scan = pick.call("c.k")
+  ab = a.flat_map { |ar| (m = b.select { |br| br[1] == ar[1] }).empty? ? [[ar, nil]] : m.map { |br| [ar, br] } }
+  rows = ab.flat_map do |ar, br|
+    c.select { |cr| cr[1] == ar[1] && pa.call(ar[2]) == true && pb.call(br&.at(2)) == true && pc.call(cr[1]) == true }
+     .map { |cr| [ar, br, cr] }
+  end
+  three = lambda do |pa_x, pb_x, pc_x|
+    "SELECT a.id, b.id, c.id FROM a LEFT JOIN b ON a.k = b.k JOIN c ON c.k = a.k AND #{pa_x} AND #{pb_x} AND #{pc_x} " \
+      "ORDER BY a.id, b.id, c.id"
+  end
+  out << "# three relations: a conjunct on the earlier NULL-extended b stays in the later ON"
+  q(out, "III", three.call(pa_sql, pb_sql, pc_sql), flat.call(ids.call(rows)))
+  out << "# unpushed spelling — MUST match"
+  q(out, "III", three.call(pa_scan, pb_scan, pc_scan), flat.call(ids.call(rows)))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: pushdown into derived tables and onto computed relations ---------------------------
+def gen_derived_pushdown(seed)
+  rng = Random.new(seed)
+  val = -> { rng.rand < 0.2 ? nil : rng.rand(0..10) }
+  t = (1..30).to_a.sample(9, random: rng).sort.map { |id| [id, rng.rand(1..5), val.call] }
+  u = (1..6).to_a.sample(4, random: rng).sort.map { |id| [id, val.call] }
+  lit = ->(x) { x.nil? ? "NULL" : x.to_s }
+  nkey = ->(x) { x.nil? ? [1, 0] : [0, x] }
+  flat = lambda do |rows|
+    rows.sort_by { |r| r.flat_map { |x| nkey.call(x) } }.flat_map { |r| r.map { |x| lit.call(x) } }
+  end
+  pick = lambda do |col|
+    sql, fn = WHERE_PUSHDOWN_TEMPLATES.sample(random: rng).call(col, rng)
+    [sql, fn, sql.gsub(col, "#{col} + 0")]
+  end
+  pair = lambda do |out, cols, sql, exp|
+    out << "# pushed spelling"
+    q(out, cols, sql.call(0), flat.call(exp))
+    out << "# `+ 0` spelling is never pushed — MUST match"
+    q(out, cols, sql.call(1), flat.call(exp))
+  end
+
+  out = header(seed, DERIVED_PUSHDOWN_REQ, "pushdown into derived bodies and onto computed relations")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, k i32, v i32)")
+  stmt(out, "CREATE TABLE u (id i32 PRIMARY KEY, w i32)")
+  stmt(out, "INSERT INTO t VALUES #{t.map { |id, k, v| "(#{id}, #{k}, #{lit.call(v)})" }.join(', ')}")
+  stmt(out, "INSERT INTO u VALUES #{u.map { |id, w| "(#{id}, #{lit.call(w)})" }.join(', ')}")
+
+  # A single derived relation with a bare-column conjunct per column.
+  pi_sql, pi, pi_scan = pick.call("d.id")
+  pv_sql, pv, pv_scan = pick.call("d.v")
+  exp = t.select { |id, _, v| pi.call(id) == true && pv.call(v) == true }.map { |id, _, _| [id] }
+  out << "# a single derived table: both conjuncts move into the body"
+  pair.call(out, "I", lambda { |m|
+    "SELECT d.id FROM (SELECT id, k, v FROM t) d WHERE #{[pi_sql, pi_scan][m]} AND #{[pv_sql, pv_scan][m]} ORDER BY d.id"
+  }, exp)
+
+  # A body with its own WHERE and DISTINCT over (k, v).
+  pk_sql, pk, pk_scan = pick.call("d.k")
+  exp = t.reject { |_, _, v| v.nil? }.map { |_, k, v| [k, v] }.uniq.select { |k, _| pk.call(k) == true }
+  out << "# DISTINCT body with its own WHERE"
+  pair.call(out, "II", lambda { |m|
+    "SELECT d.k, d.v FROM (SELECT DISTINCT k, v FROM t WHERE v IS NOT NULL) d WHERE #{[pk_sql, pk_scan][m]} ORDER BY d.k, d.v"
+  }, exp)
+
+  # A LIMIT body is never pushed into: the first n rows are chosen first.
+  n = rng.rand(2..6)
+  pv_sql, pv, pv_scan = pick.call("d.v")
+  exp = t.first(n).select { |_, _, v| pv.call(v) == true }.map { |id, _, _| [id] }
+  out << "# LIMIT body: filtered after the LIMIT"
+  pair.call(out, "I", lambda { |m|
+    "SELECT d.id FROM (SELECT id, v FROM t ORDER BY id LIMIT #{n}) d WHERE #{[pv_sql, pv_scan][m]} ORDER BY d.id"
+  }, exp)
+
+  # A derived table that joins, joined to u: the bare conjuncts move into the body and on to t.
+  pv_sql, pv, pv_scan = pick.call("d.v")
+  pw_sql, pw, pw_scan = pick.call("x.w")
+  exp = t.flat_map { |tr| u.select { |ur| ur[0] == tr[1] }.map { |ur| [tr, ur] } }
+         .select { |tr, ur| pv.call(tr[2]) == true && pw.call(ur[1]) == true }
+         .map { |tr, ur| [tr[0], ur[0]] }
+  out << "# a derived table joined to u: one conjunct each"
+  pair.call(out, "II", lambda { |m|
+    "SELECT d.id, x.id FROM (SELECT t.id, t.k, t.v FROM t) d JOIN u x ON d.k = x.id " \
+      "WHERE #{[pv_sql, pv_scan][m]} AND #{[pw_sql, pw_scan][m]} ORDER BY d.id, x.id"
+  }, exp)
+
+  # A NULL-extended derived table keeps its conjunct after the join.
+  pw_sql, pw, pw_scan = pick.call("d.w")
+  exp = t.flat_map { |tr| (m = u.select { |ur| ur[0] == tr[1] }).empty? ? [[tr, nil]] : m.map { |ur| [tr, ur] } }
+         .select { |_, ur| pw.call(ur&.at(1)) == true }
+         .map { |tr, ur| [tr[0], ur&.first] }
+  out << "# NULL-extended derived table: the conjunct must see NULL-extended rows"
+  pair.call(out, "II", lambda { |m|
+    "SELECT t.id, d.id FROM t LEFT JOIN (SELECT id, w FROM u) d ON t.k = d.id WHERE #{[pw_sql, pw_scan][m]} ORDER BY t.id, d.id"
+  }, exp)
+
+  # A CTE reference and an SRF in a join are filtered as their rows are produced.
+  pv_sql, pv, pv_scan = pick.call("c.v")
+  exp = t.flat_map { |tr| u.select { |ur| ur[0] == tr[1] }.map { |ur| [tr, ur] } }
+         .select { |tr, _| pv.call(tr[2]) == true }
+         .map { |tr, ur| [tr[0], ur[0]] }
+  out << "# a CTE reference in a join"
+  pair.call(out, "II", lambda { |m|
+    "WITH c AS (SELECT id, k, v FROM t) SELECT c.id, u.id FROM c JOIN u ON c.k = u.id WHERE #{[pv_sql, pv_scan][m]} ORDER BY c.id, u.id"
+  }, exp)
+  pg_sql, pg, pg_scan = pick.call("g.g")
+  exp = (1..8).select { |g| pg.call(g) == true }.flat_map { |g| u.select { |ur| ur[0] == g }.map { |ur| [g, ur[0]] } }
+  out << "# an SRF in a join"
+  pair.call(out, "II", lambda { |m|
+    "SELECT g.g, u.id FROM generate_series(1, 8) AS g JOIN u ON g.g = u.id WHERE #{[pg_sql, pg_scan][m]} ORDER BY g.g, u.id"
+  }, exp)
+
+  out.join("\n") + "\n"
+end
+
 SCENARIOS = {
   "pushdown" => method(:gen_pushdown),
   "composite_pk" => method(:gen_composite_pk),
@@ -2581,6 +2771,8 @@ SCENARIOS = {
   "join_comm" => method(:gen_join_comm),
   "where_pushdown" => method(:gen_where_pushdown),
   "contradiction" => method(:gen_contradiction),
+  "on_pushdown" => method(:gen_on_pushdown),
+  "derived_pushdown" => method(:gen_derived_pushdown),
 }.freeze
 
 # Run one core's harness once; return {basename => "PASS"/"FAIL"/"SKIP"} and the detail line per

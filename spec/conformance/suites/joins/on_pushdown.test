@@ -1,0 +1,270 @@
+# ON predicate pushdown (spec/design/planner.md §3.3). A pushdown-safe conjunct of a join's ON that
+# references exactly one relation moves to that relation when the join kind allows it — either input
+# of INNER, the NULL-extended (right) input of LEFT, the NULL-extended (left) inputs of RIGHT, never
+# FULL — and a left input only when no earlier join NULL-extends it. It then runs as the relation's
+# rows are read (and may bound its scan), and the join evaluates only its residual ON. A conjunct on a
+# PRESERVED side is never pushed: it decides which preserved rows match, not which survive. The rows
+# are PostgreSQL's; the `# cost:` pins are jed's cross-core contract. All units weigh 1; every table
+# is one leaf page.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.join_left, query.join_right, query.join_full, query.cross_join, query.join_pushdown, query.hash_join, query.index_nested_loop, query.where_pushdown, query.derived_pushdown, query.on_pushdown, query.derived_table, query.is_null, query.is_distinct_from, expr.arithmetic, null.three_valued, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE a (id i32 PRIMARY KEY, k i32, v i32)
+
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, k i32, w i32)
+
+statement ok
+CREATE TABLE c (id i32 PRIMARY KEY, k i32)
+
+statement ok
+INSERT INTO a VALUES (1, 1, 10), (2, 2, 20), (3, 3, NULL), (4, 9, 40)
+
+statement ok
+INSERT INTO b VALUES (11, 1, 5), (12, 2, NULL), (13, 2, 7), (14, 7, 0), (15, 8, 1)
+
+statement ok
+INSERT INTO c VALUES (21, 1), (22, 2), (23, 3)
+
+# INNER: `a.v >= 20` moves to a and `b.w IS NOT NULL` to b; the join keeps only `a.k = b.k`. a: 1
+# page + 4 rows + 4 filter = 9; b: 1 + 5 + 5 = 11; the residual ON over 2 x 4 pairs = 8; 1 produced.
+# 9 + 11 + 8 + 1 = 29.
+# cost: 29
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k AND a.v >= 20 AND b.w IS NOT NULL ORDER BY a.id, b.id
+----
+2
+13
+
+# The same predicate written in the WHERE gives the same rows (an INNER ON conjunct is a filter).
+# cost: 29
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.v >= 20 AND b.w IS NOT NULL ORDER BY a.id, b.id
+----
+2
+13
+
+# INNER with an ON that references one side only: nothing is left for the join, so every a row pairs
+# with the one surviving b row. a 1 + 4; b 1 + 5 + 5 filter; no ON; 4 produced. 5 + 11 + 4 = 20.
+# cost: 20
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON b.w = 0 ORDER BY a.id, b.id
+----
+1
+14
+2
+14
+3
+14
+4
+14
+
+# LEFT: `b.w > 4` filters the NULL-extended side, so it moves to b. a(2) still matches b(13); a(3)
+# and a(4) find nothing and are NULL-extended, exactly as before.
+# cost: 28
+query II nosort
+SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k AND b.w > 4 ORDER BY a.id, b.id
+----
+1
+11
+2
+13
+3
+NULL
+4
+NULL
+
+# LEFT with a non-strict conjunct on the NULL-extended side: `b.w IS NULL` keeps only b(12), which
+# matches a(2); every other a row is NULL-extended (and keeps its NULL b.w in the output).
+# cost: 24
+query III nosort
+SELECT a.id, b.id, b.w FROM a LEFT JOIN b ON a.k = b.k AND b.w IS NULL ORDER BY a.id, b.id
+----
+1
+NULL
+NULL
+2
+12
+NULL
+3
+NULL
+NULL
+4
+NULL
+NULL
+
+# LEFT with a conjunct on the PRESERVED side: `a.v >= 20` stays in the ON. a(1) and a(3) fail it and
+# are NULL-extended rather than removed.
+# cost: 76
+query II nosort
+SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k AND a.v >= 20 ORDER BY a.id, b.id
+----
+1
+NULL
+2
+12
+2
+13
+3
+NULL
+4
+NULL
+
+# RIGHT: `a.v > 10` filters the NULL-extended (left) side and moves to a; `b.w > 0` filters the
+# preserved side and stays in the ON. Every b row survives.
+# cost: 50
+query II rowsort
+SELECT a.id, b.id FROM a RIGHT JOIN b ON a.k = b.k AND a.v > 10 AND b.w > 0
+----
+2
+13
+NULL
+11
+NULL
+12
+NULL
+14
+NULL
+15
+
+# FULL: both sides are preserved, so nothing moves.
+# cost: 119
+query II rowsort
+SELECT a.id, b.id FROM a FULL JOIN b ON a.k = b.k AND a.v > 10 AND b.w > 4
+----
+1
+NULL
+2
+13
+3
+NULL
+4
+NULL
+NULL
+11
+NULL
+12
+NULL
+14
+NULL
+15
+
+# Three relations. b is NULL-extended by the earlier LEFT JOIN, so the later INNER ON's `b.w IS NULL`
+# cannot move to b: filtering b first would NULL-extend a(1) and a(2), which the ON would then accept.
+# It stays in the second join's ON; `c.id > 21` moves to c.
+# cost: 68
+query III nosort
+SELECT a.id, b.id, c.id FROM a LEFT JOIN b ON a.k = b.k JOIN c ON c.k = a.k AND b.w IS NULL AND c.id > 21 ORDER BY a.id, b.id, c.id
+----
+2
+12
+22
+3
+NULL
+23
+
+# a is never NULL-extended, so a conjunct on it in a later INNER ON moves to a.
+# cost: 49
+query III nosort
+SELECT a.id, b.id, c.id FROM a LEFT JOIN b ON a.k = b.k JOIN c ON c.k = a.k AND a.v IS NOT NULL ORDER BY a.id, b.id, c.id
+----
+1
+11
+21
+2
+12
+22
+2
+13
+22
+
+# A pushed ON conjunct is an access-path input for its relation: `b.id = 13` bounds b's PK.
+# cost: 13
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k AND b.id = 13 ORDER BY a.id, b.id
+----
+2
+13
+
+# The same holds on the NULL-extended side of a LEFT JOIN: b is read at its key 13 only.
+# cost: 41
+query II nosort
+SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k AND b.id = 13 ORDER BY a.id, b.id
+----
+1
+NULL
+2
+13
+3
+NULL
+4
+NULL
+
+# ON and WHERE conjuncts on the same relation form one pushed filter (ON first, source order).
+# cost: 37
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k AND b.w > 0 WHERE b.w < 7 AND a.v > 0 ORDER BY a.id, b.id
+----
+1
+11
+
+# OR, NOT, and IS [NOT] DISTINCT FROM over one relation are pushdown-safe.
+# cost: 54
+query II nosort
+SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k AND (b.w IS NULL OR NOT (b.w < 6)) AND b.id IS DISTINCT FROM 11 ORDER BY a.id, b.id
+----
+1
+NULL
+2
+12
+2
+13
+3
+NULL
+4
+NULL
+
+# Arithmetic is not pushdown-safe: `b.w + 0 > 4` stays in the ON (same rows as the pushed form above,
+# which cost 28). a 1 + 4; b 1 + 5; the 4-node ON over 4 x 5 pairs = 80; 4 produced. 5 + 6 + 80 + 4 = 95.
+# cost: 95
+query II nosort
+SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k AND b.w + 0 > 4 ORDER BY a.id, b.id
+----
+1
+11
+2
+13
+3
+NULL
+4
+NULL
+
+# An ON conjunct over a derived table's bare output column moves INTO the body (planner.md §3.2's
+# body form); a(3) and a(4) are still NULL-extended.
+# cost: 30
+query II nosort
+SELECT a.id, d.id FROM a LEFT JOIN (SELECT id, k, w FROM b) d ON a.k = d.k AND d.w > 4 ORDER BY a.id, d.id
+----
+1
+11
+2
+13
+3
+NULL
+4
+NULL
+
+# A comma-joined relation has no ON; a later INNER ON still pushes to its own inputs.
+# cost: 41
+query III nosort
+SELECT a.id, b.id, c.id FROM a, b JOIN c ON c.k = b.k AND c.id < 23 WHERE a.k = b.k ORDER BY a.id, b.id, c.id
+----
+1
+11
+21
+2
+12
+22
+2
+13
+22

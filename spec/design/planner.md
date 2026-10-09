@@ -4,7 +4,7 @@
 > is a **deterministic rule engine** whose cost-based single-relation and join choices have
 > landed: it resolves
 > the query into a **logical plan**, applies **rewrite rules** (WHERE contradiction detection and
-> WHERE pushdown — §3), and then runs **physical/access-path selection** — a fixed, ordered list of discrete rules,
+> WHERE/ON predicate pushdown — §3), and then runs **physical/access-path selection** — a fixed, ordered list of discrete rules,
 > each a single function owning its gate and its action. This doc is the contract all three
 > cores implement in lockstep (CLAUDE.md §2). It exists because the passes used to be fused
 > into one `planSelect` function per core; the observable behavior — which plan is chosen,
@@ -71,12 +71,16 @@ with resolution, not with the rules.
 
 Stage 2 sits at a fixed position in each core's `planSelect`, after the logical plan and its
 `relMasks` annotation are complete and before `optimizeSelect`. Its one driver, `rewriteWhere`, runs
-contradiction detection (§3.1) and, when that does not fire, WHERE pushdown (§3.2). It records its
-decision in a `pushdown` annotation of the plan and **never rewrites `filter`**: the complete WHERE
-remains the input every access-path detector, index-nested-loop detector, touched-set walk, and
-selectivity rule reads, so bounds and estimates see exactly the predicates they saw before. Execution
-reads the annotation: a contradiction reads nothing, a pushed filter runs inside its relation's scan,
-and only the **residual** (`postJoinFilter`) is evaluated over joined rows.
+contradiction detection (§3.1) and, when that does not fire, predicate pushdown of the WHERE (§3.2) and
+of each join's ON (§3.3). It records its decision in a `pushdown` annotation of the plan and **never
+rewrites `filter` or an ON**: the complete WHERE and every complete ON remain the input every
+access-path detector, index-nested-loop detector, hash-key detector, join-dependency walk, touched-set
+walk, and selectivity rule reads, so bounds and estimates see exactly the predicates they saw before.
+Execution reads the annotation: a contradiction reads nothing, a pushed filter runs inside its
+relation's scan, and only the **residuals** (`postJoinFilter`, and each join's residual ON) are
+evaluated over joined rows. The one rewrite that does change a predicate is §3.2's **body pushdown**,
+and it changes only a derived table's *body*, which is planned again as if the conjuncts had been
+written there.
 
 The contract every rewrite rule meets:
 
@@ -129,15 +133,15 @@ own SELECT and is judged independently. The streaming pull lane keeps its lane a
 nothing. Mutations retain their existing runtime empty-bound behavior; a DML contradiction rule is a
 follow-on.
 
-### 3.2 WHERE pushdown (`query.where_pushdown`)
+### 3.2 WHERE pushdown (`query.where_pushdown`, `query.derived_pushdown`)
 
-In a SELECT with at least two FROM relations and no contradiction, each top-level WHERE conjunct, in
-source order, is **pushed** to relation `i` when all of these hold:
+With no contradiction, each top-level WHERE conjunct, in source order, is **pushed** toward relation
+`i` when all of these hold:
 
 - it references at least one column, and every column it references belongs to relation `i` (an
   outer reference makes it unsafe, below);
-- relation `i` is a non-lateral **base table** (not an SRF, catalog relation, CTE reference, or
-  derived table — pushing into those bodies is a follow-on);
+- relation `i` is not **lateral** (a correlated LATERAL relation is re-produced per left row; a
+  conjunct on it stays in the residual);
 - no outer join NULL-extends relation `i`: for the left-deep FROM, `joins[k]` LEFT marks
   `rels[k+1]`, RIGHT marks every `rels[0..k]`, FULL marks both;
 - the conjunct is **pushdown-safe**: a tree of AND/OR/NOT over comparisons (`= <> < <= > >=`, except a
@@ -147,33 +151,111 @@ source order, is **pushed** to relation `i` when all of these hold:
   neither raise an error nor change a value. Casts, arithmetic, functions, CASE, subqueries, and
   outer references stay in the residual.
 
-The conjuncts pushed to a relation form its **pushed filter**; all other conjuncts form the
-**residual**. Each is rebuilt as the **left-deep AND of its conjuncts in source order** (so a filter of
-`n` conjuncts has `n − 1` AND nodes; the original WHERE's AND nodes are not charged anywhere).
-Ordinary column slots are unchanged in the plan's copy; execution evaluates a copy rebased to the
-relation's own row.
+A pushed conjunct then takes the first of these forms that applies:
 
-**Execution.** The pushed filter runs wherever the relation's rows are read — the materialized scan,
+1. **Body pushdown** (`query.derived_pushdown`) — relation `i` is a derived table whose body is
+   **body-pushable** (below) and every column the conjunct references is an output column whose
+   select-list item is a bare column of the body. The conjunct is rewritten with each reference
+   replaced by that body column, and moves *into* the body. Applies with any number of FROM
+   relations, including one (`SELECT … FROM (SELECT …) d WHERE d.k = 5`).
+2. **Scan pushdown** — the SELECT has at least two FROM relations. A base table (`query.where_pushdown`)
+   or a derived table, CTE reference, set-returning function, or catalog relation
+   (`query.derived_pushdown`) runs the conjunct over its own rows before they reach the join.
+3. Otherwise the conjunct stays in the residual (a single-relation SELECT gains nothing from a scan
+   pushdown: the filter would run on the same rows either way).
+
+A derived body is **body-pushable** when it is a single SELECT — not a set operation, `VALUES`, or a
+nested `WITH` — with no aggregate or `GROUP BY`, no window function, and no `LIMIT` or `OFFSET`.
+`DISTINCT` and `ORDER BY` are admitted: a pushdown-safe conjunct over bare output columns gives the
+same answer for every row in one DISTINCT class (equal values compare equal, and every jed collation
+is deterministic), so filtering before or after deduplication keeps the same classes.
+
+**Body form.** A derived body's pushed conjuncts — the WHERE's, in source order, after any §3.3 ON
+conjuncts pushed to the same relation — are appended to the body's own WHERE as a left-deep AND:
+`((W AND c1) AND c2)`, or `(c1 AND c2)` when the body has no WHERE. The body is then **planned again
+from its syntax** with that WHERE, so its own stage 2 (contradiction; pushdown, including into its
+own derived tables) and stage 3 (access paths — the pushed conjunct can now bound the body's key)
+treat it exactly as if it had been written in the body. Planning a body again has no other effect:
+in particular the statement's CTE reference counts, and so every CTE's inline/materialize mode, are
+unchanged. A conjunct that moved into a body is evaluated nowhere in the outer SELECT.
+
+**Scan form.** The conjuncts scan-pushed to a relation form its **pushed filter**; all conjuncts that
+were neither scan- nor body-pushed form the **residual**. Each is rebuilt as the **left-deep AND of its
+conjuncts in source order** (so a filter of `n` conjuncts has `n − 1` AND nodes; the original WHERE's
+AND nodes are not charged anywhere). Ordinary column slots are unchanged in the plan's copy; execution
+evaluates a copy rebased to the relation's own row.
+
+**Execution.** A base table's pushed filter runs wherever its rows are read — the materialized scan,
 the per-outer-row index-nested-loop fetch, and the bounded spill lane — on each row the access path
 admits, after its `storage_row_read` and before it is admitted to the query-memory row account or
-reaches a join: a row that is not TRUE is dropped there. The residual, when present, is evaluated on
-each joined row exactly where the complete WHERE used to be; when every conjunct was pushed there is
-no post-join filter at all.
+reaches a join: a row that is not TRUE is dropped there. Any other relation is first produced exactly
+as before (a derived or inline-CTE body runs, a materialized CTE's buffer is copied with its
+`cte_scan_row` charges, an SRF or catalog relation generates its rows), with its rows reserved as
+before; its pushed filter then runs over those rows in production order and releases each rejected
+row's reservation before the join reads the relation. The residual, when present, is evaluated on
+each joined row exactly where the complete WHERE used to be; when nothing remains there is no
+post-join filter at all.
 
-**Cost decision.** A pushed conjunct charges its `operator_eval` (and size-scaled comparison units)
-once per **admitted base row** — repeated per outer row for an index-nested-loop inner — instead of
-once per **surviving joined row**; rows it rejects never reach the ON predicate, hash build/probe,
-the residual, or the row account. The residual charges as the old WHERE did, over joined rows. The
-rule is unconditional (PostgreSQL's choice), so the change is usually a reduction but is not
-monotone: when a join discards more rows than it multiplies, evaluating the conjunct on every base
-row can cost more than evaluating it on the few joined survivors. The estimator models the split
-([estimator.md](estimator.md) §8.3), so cost-based join search sees it, and the actual meter remains
-authoritative. Because only non-trapping conjuncts move, pushdown never raises an error the
-unrewritten plan would not; it can leave unraised an ON-predicate error on a pair whose base row the
-pushed filter rejected — the same narrowing a scan bound already performs.
+**Cost decision.** A scan-pushed conjunct charges its `operator_eval` (and size-scaled comparison
+units) once per **admitted or produced row** of its relation — repeated per outer row for an
+index-nested-loop inner — instead of once per **surviving joined row**; rows it rejects never reach
+the ON predicate, hash build/probe, the residual, or (for a base table) the row account. A
+body-pushed conjunct charges wherever the replanned body evaluates its WHERE — per body row, or per
+admitted base row when the body pushes it further — and, when it bounds the body's access path, the
+rows it excludes are never read, projected, or charged at all. The residual charges as the old WHERE
+did, over joined rows. Both rules are unconditional (PostgreSQL's choice), so the change is usually a
+reduction but is not monotone: when a join discards more rows than it multiplies, evaluating the
+conjunct on every base row can cost more than evaluating it on the few joined survivors. The
+estimator models the split ([estimator.md](estimator.md) §8.3), so cost-based join search sees it, and
+the actual meter remains authoritative. Because only non-trapping conjuncts move, pushdown never raises
+an error the unrewritten plan would not; it can leave unraised an error on a row the moved conjunct
+now rejects first — an ON-predicate error on a pair, or a body's select-list error on a body row —
+the same narrowing a scan bound already performs.
 
-EXPLAIN renders a pushed filter on its Scan and the residual as the Filter node
+EXPLAIN renders a scan-pushed filter on its relation's node (`Scan`, `Subquery`, `CTE Scan`, `SRF`,
+`Catalog Scan`), a body-pushed conjunct inside the body's own plan, and the residual as the Filter node
 ([explain.md](explain.md) §5).
+
+**Not pushed into a body.** A CTE reference is scan-pushed only, even when its CTE is inlined: whether
+a CTE is inlined is decided from its reference count after the whole statement is planned, so
+pushing into an inlined CTE's body needs a per-reference body specialization (with its own EXPLAIN
+and estimate attribution) and is a follow-on. So are pushdown into a grouped body (a conjunct over
+grouping columns), into each arm of a set operation, and through a lateral relation.
+
+### 3.3 ON pushdown (`query.on_pushdown`)
+
+Each join `joins[k]` with an ON flattens the ON's top-level AND-chain. A conjunct that is
+pushdown-safe and references exactly one relation `i`, which is not lateral, is pushed toward `i`
+when the join kind allows it:
+
+- **INNER**: `i` is either input — `rels[k+1]`, or any `rels[0..k]`;
+- **LEFT**: `i` is the right input `rels[k+1]` (the NULL-extended side);
+- **RIGHT**: `i` is one of the left inputs `rels[0..k]` (the NULL-extended side);
+- **FULL**: never (both sides are preserved).
+
+A conjunct that filters the *preserved* side of an outer join is never pushed: it decides which
+preserved rows match, not which survive. A left input `i ≤ k` additionally must not be NULL-extended
+by an earlier join `joins[0..k-1]` (the §3.2 rule applied to that prefix): filtering a NULL-extended
+relation before its own outer join would manufacture NULL-extended rows that the ON — perhaps
+`x IS NULL` — would then judge differently. A later join never matters: it consumes this join's output,
+which pushdown does not change.
+
+A pushed ON conjunct takes the same body or scan form as a WHERE conjunct (§3.2); unlike the WHERE,
+ON pushdown always has at least two relations, so the scan form is always available. A relation's
+pushed filter, and a derived body's appended conjuncts, list the pushed conjuncts in **source order**:
+each join's ON conjuncts in join order, then the WHERE's. Each join's remaining ON conjuncts form its
+**residual ON**, the left-deep AND in source order; when none remains the join has no ON predicate at
+all (an INNER join then pairs every surviving row, a LEFT/RIGHT join NULL-extends a preserved row only
+when the other side has no surviving row).
+
+**Execution and cost.** Exactly as §3.2: the pushed conjunct runs on each admitted or produced row of
+its relation instead of on every candidate pair, and the residual ON is evaluated wherever the
+complete ON was — nested loop, hash join (after key match), index nested loop, N-way step, streaming
+and spill lanes. Hash keys, index-nested-loop bounds, and N-way ON ownership are still detected from
+the complete ON; the hash keys are always cross-relation equalities and therefore always remain in
+the residual. The cost decision is §3.2's: per relation row instead of per pair, unconditional, not
+monotone, modelled by the estimator. EXPLAIN shows the residual ON on the join node (`on:conjuncts=N`
+/ VERBOSE `on=<expr>`, omitted when none remains) and the pushed conjuncts on the relation, as §3.2.
 
 ## 4. Stage 3 — physical/access-path selection: the rule inventory
 
@@ -384,8 +466,8 @@ its final join step eligible for N-way streaming top-N.
 
 ## 7. Where future passes plug in
 
-- **Further stage-2 rewrites** (TODO.md) — pushdown into derived tables / CTE bodies, ON-clause
-  pushdown, DML contradictions, constant folding — each under the §3 contract with its own cost
-  decision.
+- **Further stage-2 rewrites** (TODO.md) — pushdown into inlined CTE bodies, grouped bodies, and
+  set-operation arms; DML contradictions; constant folding — each under the §3 contract with its own
+  cost decision.
 - **New physical rules** (the hash join above and later access paths tracked in TODO.md) land as
   discrete rule functions in the §4 inventory, each with its NoREC relation.

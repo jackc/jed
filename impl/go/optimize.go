@@ -227,7 +227,7 @@ func (db *engine) ruleScanBounds(plan *selectPlan, rels []scopeRel) {
 		if plan.rels[i].srf != nil || plan.rels[i].derived != nil || plan.rels[i].cte != nil {
 			continue
 		}
-		candidates := inventoryScanCandidates(plan.filter, rel, db)
+		candidates := inventoryScanCandidates(plan.accessPredicate(), rel, db)
 		producesRows := len(rels) == 1 && !plan.isAgg && !plan.distinct && plan.limit == nil && plan.offset == nil && !plan.hasWindow
 		plan.phys.relEstimates[i] = db.estimateScanCandidates(candidates, rel, producesRows)
 		legacy := selectLegacyScanCandidate(candidates, selectScanBoundPolicy)
@@ -260,7 +260,7 @@ func (db *engine) ruleCostedSingleRelationPipeline(plan *selectPlan, rels []scop
 		return
 	}
 	rel := rels[0]
-	access := inventoryScanCandidates(plan.filter, rel, db)
+	access := inventoryScanCandidates(plan.accessPredicate(), rel, db)
 	if len(access) == 0 {
 		return
 	}
@@ -404,8 +404,8 @@ func (db *engine) ruleCostedTwoRelationJoin(plan *selectPlan, rels []scopeRel) {
 	}
 
 	ordinary := [2][]scanCandidate{
-		inventoryScanCandidates(plan.filter, rels[0], db),
-		inventoryScanCandidates(plan.filter, rels[1], db),
+		inventoryScanCandidates(plan.accessPredicate(), rels[0], db),
+		inventoryScanCandidates(plan.accessPredicate(), rels[1], db),
 	}
 	var candidates []twoRelationCandidate
 	for _, order := range [][2]int{{0, 1}, {1, 0}} {
@@ -729,7 +729,7 @@ func (db *engine) expandJoinSearchState(plan *selectPlan, rels []scopeRel, state
 			out = append(out, candidate)
 		}
 		hasHash := buildHashJoinPlanForOns(plan, rels, state.order, inner, onIndices) != nil
-		for _, access := range inventoryScanCandidates(plan.filter, rels[inner], db) {
+		for _, access := range inventoryScanCandidates(plan.accessPredicate(), rels[inner], db) {
 			if hasHash {
 				candidate := cloneJoinSearchState(state)
 				candidate.order = append(candidate.order, inner)
@@ -806,7 +806,7 @@ func (db *engine) searchJoinIsland(plan *selectPlan, rels []scopeRel, prefix *jo
 			insertJoinFrontier(&frontiers[joinFrontierIndex(0, prefix.satisfiesQueryOrder)], cloneJoinSearchState(*prefix))
 		} else {
 			for _, ordinal := range island {
-				for _, access := range inventoryScanCandidates(plan.filter, rels[ordinal], db) {
+				for _, access := range inventoryScanCandidates(plan.accessPredicate(), rels[ordinal], db) {
 					state := db.initialJoinSearchState(plan, rels, ordinal, access)
 					idx := joinFrontierIndex(joinIslandMask(state, island), state.satisfiesQueryOrder)
 					insertJoinFrontier(&frontiers[idx], state)
@@ -850,7 +850,7 @@ func (db *engine) searchJoinIsland(plan *selectPlan, rels []scopeRel, prefix *jo
 		} else {
 			var drivers []joinSearchState
 			for _, ordinal := range island {
-				for _, access := range inventoryScanCandidates(plan.filter, rels[ordinal], db) {
+				for _, access := range inventoryScanCandidates(plan.accessPredicate(), rels[ordinal], db) {
 					drivers = append(drivers, db.initialJoinSearchState(plan, rels, ordinal, access))
 				}
 			}

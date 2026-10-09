@@ -818,7 +818,8 @@ func (db *engine) renderJoinTree(r *explainRender, sp *selectPlan, n, depth int,
 	if n == 1 {
 		return db.renderRelLeaf(r, sp, 0, depth, note)
 	}
-	j := sp.joins[n-2]
+	// The join renders its residual ON; conjuncts pushed to a relation render there (planner.md §3.3).
+	j := planJoin{kind: sp.joins[n-2].kind, on: sp.joinOn(n - 2)}
 	node := "Nested Loop"
 	detail := joinDetail(j, r.verbose)
 	if n == 2 && sp.phys.hashJoin != nil {
@@ -853,9 +854,9 @@ func (db *engine) renderNWayJoinTree(r *explainRender, sp *selectPlan, n, depth 
 	var ons []string
 	conjuncts := 0
 	for _, onIndex := range step.onIndices {
-		if sp.joins[onIndex].on != nil {
-			ons = append(ons, renderRExpr(sp.joins[onIndex].on))
-			conjuncts += conjunctCount(sp.joins[onIndex].on)
+		if on := sp.joinOn(onIndex); on != nil {
+			ons = append(ons, renderRExpr(on))
+			conjuncts += conjunctCount(on)
 		}
 	}
 	kind := joinKindText(physicalStepKind(sp, step))
@@ -901,16 +902,16 @@ func (db *engine) renderRelLeaf(r *explainRender, sp *selectPlan, i, depth int, 
 		rel.srf.kind == srfJedStatistics):
 		// A catalog relation (introspection.md §5) is computed, not scanned — its own node name
 		// (it is a relation, not a function) plus the database scope it reads.
-		r.emit(depth, "Catalog Scan "+rel.tableName, withNote("db="+rel.srf.introspectScope, note))
+		r.emit(depth, "Catalog Scan "+rel.tableName, withNote(pushedFilterDetail(sp, i, "db="+rel.srf.introspectScope, r.verbose), note))
 		return nil
 	case rel.srf != nil:
-		r.emit(depth, "SRF "+rel.tableName, withNote("-", note))
+		r.emit(depth, "SRF "+rel.tableName, withNote(pushedFilterDetail(sp, i, "", r.verbose), note))
 		return nil
 	case rel.cte != nil:
-		r.emit(depth, "CTE Scan "+rel.tableName, withNote("-", note))
+		r.emit(depth, "CTE Scan "+rel.tableName, withNote(pushedFilterDetail(sp, i, "", r.verbose), note))
 		return nil
 	case rel.derived != nil:
-		r.emit(depth, "Subquery "+rel.tableName, withNote("-", note))
+		r.emit(depth, "Subquery "+rel.tableName, withNote(pushedFilterDetail(sp, i, "", r.verbose), note))
 		return db.renderQueryPlan(r, *rel.derived, depth+1)
 	default:
 		// An index-nested-loop bound (per-outer-row seek) takes precedence over the once-materialized
@@ -919,18 +920,30 @@ func (db *engine) renderRelLeaf(r *explainRender, sp *selectPlan, i, depth int, 
 		if sp.phys.relINLBounds[i] != nil {
 			bound, inl = sp.phys.relINLBounds[i], true
 		}
-		detail := db.scanDetail(rel.tableName, bound, inl, sp.relMasks[i])
-		// A pushed WHERE filter (planner.md §3.2) runs inside the scan, so it renders on the Scan.
-		if pushed, _ := sp.pushedFilter(i); pushed != nil {
-			if r.verbose {
-				detail += "; filter=" + renderRExpr(pushed)
-			} else {
-				detail += fmt.Sprintf("; filter:conjuncts=%d", conjunctCount(pushed))
-			}
-		}
+		detail := pushedFilterDetail(sp, i, db.scanDetail(rel.tableName, bound, inl, sp.relMasks[i]), r.verbose)
 		r.emit(depth, "Scan "+rel.tableName, withNote(detail, note))
 		return nil
 	}
+}
+
+// pushedFilterDetail appends relation i's scan-pushed filter (planner.md §3.2) to its node detail:
+// `filter:conjuncts=N`, VERBOSE `filter=<expr>`. A computed relation's otherwise-empty detail is `-`.
+func pushedFilterDetail(sp *selectPlan, i int, detail string, verbose bool) string {
+	pushed, _ := sp.pushedFilter(i)
+	if pushed == nil {
+		if detail == "" {
+			return "-"
+		}
+		return detail
+	}
+	part := fmt.Sprintf("filter:conjuncts=%d", conjunctCount(pushed))
+	if verbose {
+		part = "filter=" + renderRExpr(pushed)
+	}
+	if detail == "" {
+		return part
+	}
+	return detail + "; " + part
 }
 
 // renderSetOpPlan emits a set operation: any trailing Limit / Sort on the combined result, the

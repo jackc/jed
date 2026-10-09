@@ -1460,6 +1460,25 @@ func (db *engine) estimateRelation(sp *selectPlan, index int, ctx *estimateCTECt
 
 func (db *engine) estimateRelationRead(sp *selectPlan, index int, ctx *estimateCTECtx) estimatedPlan {
 	rel := sp.rels[index]
+	if rel.srf == nil && rel.cte == nil && rel.derived == nil {
+		return db.estimateRelationProduced(sp, index, ctx)
+	}
+	plan := db.estimateRelationProduced(sp, index, ctx)
+	// A computed relation's scan-pushed filter (planner.md §3.2) runs once over each produced row R:
+	// it adds nodes(F) × R operator_eval to the relation's node, and its selectivity shapes the
+	// logical rows, which cap the delivered rows.
+	if pushed, _ := sp.pushedFilter(index); pushed != nil {
+		produced := plan.root.rows
+		plan.root.logicalRows = estimateSelectivity(db.estimatePredicateSelectivityWithStatistics(sp, pushed), plan.root.logicalRows)
+		plan.root.rows = min64(plan.root.logicalRows, produced)
+		addPlanUnit(&plan.root, estimatorUnitOperatorEval, satEstimateMul(estimatorOperatorNodes(pushed), produced))
+		plan.nodes[0] = plan.root
+	}
+	return plan
+}
+
+func (db *engine) estimateRelationProduced(sp *selectPlan, index int, ctx *estimateCTECtx) estimatedPlan {
+	rel := sp.rels[index]
 	switch {
 	case rel.derived != nil:
 		body := db.estimateQueryPlan(*rel.derived, ctx)
@@ -1493,7 +1512,7 @@ func (db *engine) estimateRelationRead(sp *selectPlan, index int, ctx *estimateC
 		if index < len(sp.phys.relINLBounds) && sp.phys.relINLBounds[index] != nil {
 			bound = sp.phys.relINLBounds[index]
 		}
-		estimate := db.estimateSelectedScan(scopeRel, bound, sp.filter)
+		estimate := db.estimateSelectedScan(scopeRel, bound, sp.accessPredicate())
 		// An unbounded secondary-index ORDER BY walks the index and point-fetches the table; it is
 		// physically different from the full-table candidate that supplied the legacy access bound.
 		if index == 0 && bound == nil && sp.phys.indexOrder != nil {
@@ -1510,7 +1529,7 @@ func (db *engine) estimateRelationRead(sp *selectPlan, index int, ctx *estimateC
 		// logical selectivity applies once to the relation's logical population; the delivered rows
 		// are that, capped by the scan rows — except an index-nested-loop inner, whose per-call scan
 		// is bounded by the join key rather than the filter, so the filter scales those rows.
-		if pushed, _ := sp.pushedFilter(index); pushed != nil {
+		if pushed, _ := sp.pushedFilter(index); pushed != nil && rel.cte == nil {
 			scanRows := estimate.rows
 			selectivity := db.estimatePredicateSelectivityWithStatistics(sp, pushed)
 			estimate.logicalRows = estimateSelectivity(selectivity, estimate.logicalRows)
@@ -1592,7 +1611,8 @@ func (db *engine) estimateJoinTree(sp *selectPlan, n int, ctx *estimateCTECtx) e
 		logicalPairs = physicalPairs
 	}
 	join := sp.joins[n-2]
-	rows, logicalRows := db.joinEstimatedRows(sp, join.kind, join.on, physicalPairs, logicalPairs, left.root.rows, right.root.rows, boundByOuter)
+	on := sp.joinOn(n - 2)
+	rows, logicalRows := db.joinEstimatedRows(sp, join.kind, on, physicalPairs, logicalPairs, left.root.rows, right.root.rows, boundByOuter)
 	root := addPlanEstimates(left.root, right.root)
 	root.rows, root.logicalRows = rows, logicalRows
 	invocations := physicalPairs
@@ -1611,8 +1631,8 @@ func (db *engine) estimateJoinTree(sp *selectPlan, n int, ctx *estimateCTECtx) e
 		addPlanUnit(&root, estimatorUnitHashProbe, satEstimateAdd(satEstimateMul(left.root.rows, probeBytes), satEstimateMul(rows, framedBytes)))
 		invocations = rows
 	}
-	addPlanUnit(&root, estimatorUnitOperatorEval, satEstimateMul(estimatorOperatorNodes(join.on), invocations))
-	db.addExpressionSubqueries(&root, join.on, invocations, ctx)
+	addPlanUnit(&root, estimatorUnitOperatorEval, satEstimateMul(estimatorOperatorNodes(on), invocations))
+	db.addExpressionSubqueries(&root, on, invocations, ctx)
 	return parentEstimatedPlan(root, left, right)
 }
 
@@ -1634,7 +1654,7 @@ func (db *engine) estimateNWayJoinTree(sp *selectPlan, n int, ctx *estimateCTECt
 	fullRows := fullPairs
 	if !boundByOuter {
 		for _, onIndex := range step.onIndices {
-			selectivity := db.estimatePredicateSelectivityWithStatistics(sp, sp.joins[onIndex].on)
+			selectivity := db.estimatePredicateSelectivityWithStatistics(sp, sp.joinOn(onIndex))
 			fullRows = estimateSelectivity(selectivity, fullRows)
 			fullLogicalRows = estimateSelectivity(selectivity, fullLogicalRows)
 		}
@@ -1717,11 +1737,11 @@ func (db *engine) estimateNWayJoinTree(sp *selectPlan, n int, ctx *estimateCTECt
 	}
 	onNodes := int64(0)
 	for _, onIndex := range step.onIndices {
-		onNodes = satEstimateAdd(onNodes, estimatorOperatorNodes(sp.joins[onIndex].on))
+		onNodes = satEstimateAdd(onNodes, estimatorOperatorNodes(sp.joinOn(onIndex)))
 	}
 	addPlanUnit(&root, estimatorUnitOperatorEval, satEstimateMul(onNodes, invocations))
 	for _, onIndex := range step.onIndices {
-		db.addExpressionSubqueries(&root, sp.joins[onIndex].on, invocations, ctx)
+		db.addExpressionSubqueries(&root, sp.joinOn(onIndex), invocations, ctx)
 	}
 	return parentEstimatedPlan(root, outer, inner)
 }
@@ -1740,8 +1760,9 @@ func (db *engine) estimateTwoRelationJoin(sp *selectPlan, ctx *estimateCTECtx) e
 	fullPairs := satEstimateMul(outer.root.rows, innerPerCall.root.rows)
 	fullLogicalPairs := satEstimateMul(outer.root.logicalRows, innerPerCall.root.logicalRows)
 	join := sp.joins[0]
+	on := sp.joinOn(0)
 	fullRows, fullLogicalRows := db.joinEstimatedRows(
-		sp, join.kind, join.on, fullPairs, fullLogicalPairs,
+		sp, join.kind, on, fullPairs, fullLogicalPairs,
 		outer.root.rows, innerPerCall.root.rows, boundByOuter,
 	)
 
@@ -1801,8 +1822,8 @@ func (db *engine) estimateTwoRelationJoin(sp *selectPlan, ctx *estimateCTECtx) e
 		))
 		invocations = deliveredRows
 	}
-	addPlanUnit(&root, estimatorUnitOperatorEval, satEstimateMul(estimatorOperatorNodes(join.on), invocations))
-	db.addExpressionSubqueries(&root, join.on, invocations, ctx)
+	addPlanUnit(&root, estimatorUnitOperatorEval, satEstimateMul(estimatorOperatorNodes(on), invocations))
+	db.addExpressionSubqueries(&root, on, invocations, ctx)
 	return parentEstimatedPlan(root, outer, inner)
 }
 

@@ -42,6 +42,7 @@ import {
   selectLegacyScanCandidate,
 } from "./executor.ts";
 import { JOIN_DP_LIMIT } from "./estimator_constants.ts";
+import { accessPredicate } from "./rewrite.ts";
 import type { Snapshot } from "./snapshot.ts";
 import { isAttachmentScope } from "./session.ts";
 import type { ScalarType, Type } from "./types.ts";
@@ -216,7 +217,7 @@ function ruleScanBounds(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot, eng:
     ) {
       return null;
     }
-    const candidates = inventoryScanCandidates(plan.filter, rel, snap, eng);
+    const candidates = inventoryScanCandidates(accessPredicate(plan), rel, snap, eng);
     const estimates = estimateScanCandidates(
       candidates,
       rel,
@@ -262,7 +263,7 @@ function ruleCostedSingleRelationPipeline(
     return;
   }
   const rel = rels[0]!;
-  const access = inventoryScanCandidates(plan.filter, rel, snap, eng);
+  const access = inventoryScanCandidates(accessPredicate(plan), rel, snap, eng);
   if (access.length === 0) return;
 
   const pkDir =
@@ -390,8 +391,8 @@ function ruleCostedTwoRelationJoin(
   }
 
   const ordinary = [
-    inventoryScanCandidates(plan.filter, rels[0]!, snap, eng),
-    inventoryScanCandidates(plan.filter, rels[1]!, snap, eng),
+    inventoryScanCandidates(accessPredicate(plan), rels[0]!, snap, eng),
+    inventoryScanCandidates(accessPredicate(plan), rels[1]!, snap, eng),
   ];
   const candidates: TwoRelationCandidate[] = [];
   for (const order of [
@@ -739,7 +740,7 @@ function expandJoinSearchState(
       out.push(candidate);
     }
     const hasHash = buildHashJoinPlanForOns(plan, rels, state.order, inner, onIndices) !== null;
-    for (const access of inventoryScanCandidates(plan.filter, rels[inner]!, snap, eng)) {
+    for (const access of inventoryScanCandidates(accessPredicate(plan), rels[inner]!, snap, eng)) {
       if (hasHash) {
         const candidate = cloneJoinSearchState(state);
         candidate.order.push(inner);
@@ -826,7 +827,12 @@ function searchJoinIsland(
       insertJoinFrontier(frontiers[joinFrontierIndex(0, prefix.satisfiesQueryOrder)]!, prefix);
     } else {
       for (const ordinal of island) {
-        for (const access of inventoryScanCandidates(plan.filter, rels[ordinal]!, snap, eng)) {
+        for (const access of inventoryScanCandidates(
+          accessPredicate(plan),
+          rels[ordinal]!,
+          snap,
+          eng,
+        )) {
           const state = initialJoinSearchState(plan, rels, ordinal, access, snap, eng);
           insertJoinFrontier(
             frontiers[joinFrontierIndex(islandMask(state, island), state.satisfiesQueryOrder)]!,
@@ -879,7 +885,12 @@ function searchJoinIsland(
     } else {
       const drivers: JoinSearchState[] = [];
       for (const ordinal of island) {
-        for (const access of inventoryScanCandidates(plan.filter, rels[ordinal]!, snap, eng)) {
+        for (const access of inventoryScanCandidates(
+          accessPredicate(plan),
+          rels[ordinal]!,
+          snap,
+          eng,
+        )) {
           drivers.push(initialJoinSearchState(plan, rels, ordinal, access, snap, eng));
         }
       }

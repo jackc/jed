@@ -56,10 +56,12 @@ SELECT a.id, b.k FROM a JOIN b ON a.k = b.k WHERE b.label = 'twenty' ORDER BY a.
 20
 
 # An ON predicate may reference a single side. `a.k > 25` is TRUE only for a row k=30 (a.id 3;
-# a NULL k is unknown), which then pairs with every b row → 4 results. 8 + 16 ON + 4 produced = 28.
+# a NULL k is unknown), which then pairs with every b row → 4 results. The conjunct is pushed to a's
+# scan (planner.md §3.3): a 1 page + 4 rows + 4 filter evals = 9, b 1 page + 4 rows = 5; no ON is
+# left, so the one surviving a row pairs with every b row; 4 produced. 9 + 5 + 4 = 18.
 # Both output columns are named `id` (duplicate output names across tables are allowed).
 # names: id, id
-# cost: 30
+# cost: 18
 query II nosort
 SELECT a.id, b.id FROM a JOIN b ON a.k > 25 ORDER BY a.id, b.id
 ----

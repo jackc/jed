@@ -208,15 +208,18 @@ row. A row is always released under the measurement that reserved it.
 appended, at:
 
 - **Relation materialization** (eager SELECT path): each scanned base-table or
-  index-bounded row that passes the relation's pushed WHERE filter, if any
-  ([planner.md](planner.md) §3.2 — a rejected row is never reserved); each row of `generate_series` and `unnest` as it is generated;
+  index-bounded row that passes the relation's scan-pushed filter, if any
+  ([planner.md](planner.md) §3.2–§3.3 — a rejected row is never reserved); each row of `generate_series` and `unnest` as it is generated;
   the whole output of the other set-returning functions (JSON producers,
   `JSON_TABLE`, `jed_*` catalog functions), which are bounded by an existing value
   or the catalog, once produced; each row of a `VALUES` body; each row a
   materialized CTE reference copies from the CTE's buffer; and each prefix row the
   window-top-N lane collects. A derived table or an
   inline CTE body arrives charged as a projected result and is re-measured under the
-  relation mask (the difference is released).
+  relation mask (the difference is released). Any of these non-base relations with a
+  scan-pushed filter ([planner.md](planner.md) §3.2) is reserved exactly as above; the filter
+  then runs over its rows in production order and each rejected row's reservation is
+  released before the join reads the relation.
 - **Joins**: each combined row a join step keeps, each NULL-extended row (LEFT,
   RIGHT, FULL), and — for a costed N-way join — each driver row placed into the
   full-width layout before the first step. This covers the nested-loop, hash,

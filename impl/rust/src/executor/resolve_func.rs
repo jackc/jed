@@ -1464,12 +1464,12 @@ pub(crate) fn agg_detail(sp: &SelectPlan, verbose: bool) -> String {
 
 /// Render a Nested Loop node's attributes: the join kind and the ON predicate's conjunct count (a
 /// CROSS join has no ON).
-pub(crate) fn join_detail(j: &PlanJoin, verbose: bool) -> String {
-    let kind = join_kind_text(j.kind);
-    match &j.on {
+pub(crate) fn join_detail(kind: JoinKind, on: Option<&FilterChain<'_>>, verbose: bool) -> String {
+    let kind = join_kind_text(kind);
+    match on {
         None => kind.to_string(),
-        Some(on) if verbose => format!("{kind}; on={}", render_rexpr(on)),
-        Some(on) => format!("{kind}; on:conjuncts={}", conjunct_count(on)),
+        Some(on) if verbose => format!("{kind}; on={}", on.render()),
+        Some(on) => format!("{kind}; on:conjuncts={}", on.conjunct_count()),
     }
 }
 
