@@ -4,7 +4,7 @@
 # estimator algorithms remain hand-written in every core; P0 only fixes the shared constants and
 # total tie orders they consume. P4 will add codegen'd per-core constants plus shared vectors at
 # `spec/cost/estimator_vectors.toml`. `spec/cost/estimator_verify.rb` checks this file through
-# `rake verify` now.
+# `mise run verify` now.
 
 schema_version = 1
 

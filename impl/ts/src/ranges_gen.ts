@@ -3,8 +3,8 @@
 // Range-type descriptor table (CLAUDE.md §4/§5): the six built-in PostgreSQL range
 // types as DATA. The recursive value codec / comparator / text-I/O / canonicalize rule
 // that CONSUME this are hand-written per core (§5 forbids codegenning them; derived from
-// the element type, byte-identical by construction). Regenerate with `rake codegen`;
-// `rake verify` fails if this file is stale. Reasoning: ../../../spec/design/ranges.md.
+// the element type, byte-identical by construction). Regenerate with `mise run codegen`;
+// `mise run verify` fails if this file is stale. Reasoning: ../../../spec/design/ranges.md.
 
 // One range type's metadata, mirroring a [[range]] entry in spec/types/ranges.toml.
 // `element` is a scalar id (the subtype the range is built over); `discrete` marks an

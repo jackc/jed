@@ -169,7 +169,7 @@ def rust_file(ops, aggs, srfs, wins)
     // Operator + aggregate descriptor tables (CLAUDE.md §5: the codegen "middle path").
     // This is DATA only — the parser, executor, and the eq3/lt3 evaluation logic that
     // CONSUME it are hand-written (§5 forbids codegenning those). Regenerate with
-    // `rake codegen`; `rake verify` fails if this file is stale. Reasoning:
+    // `mise run codegen`; `mise run verify` fails if this file is stale. Reasoning:
     // ../../../spec/design/codegen.md.
 
     /// One operator's metadata, mirroring a `[[operator]]` entry in catalog.toml.
@@ -293,8 +293,8 @@ def rust_ranges_file(ranges)
     // Range-type descriptor table (CLAUDE.md §4/§5): the six built-in PostgreSQL range
     // types as DATA. The recursive value codec / comparator / text-I/O / canonicalize rule
     // that CONSUME this are hand-written per core (§5 forbids codegenning them; derived from
-    // the element type, byte-identical by construction). Regenerate with `rake codegen`;
-    // `rake verify` fails if this file is stale. Reasoning: ../../../spec/design/ranges.md.
+    // the element type, byte-identical by construction). Regenerate with `mise run codegen`;
+    // `mise run verify` fails if this file is stale. Reasoning: ../../../spec/design/ranges.md.
 
     /// One range type's metadata, mirroring a `[[range]]` entry in spec/types/ranges.toml.
     /// `element` is a scalar id (../../../spec/types/scalars.toml) — the subtype the range is
@@ -397,8 +397,8 @@ def go_file(ops, aggs, srfs, wins)
     //
     // Operator + aggregate descriptor tables (CLAUDE.md §5: the codegen "middle path").
     // DATA only — the parser, executor, and the Eq3/Lt3 evaluation logic that CONSUME it
-    // are hand-written (§5 forbids codegenning those). Regenerate with `rake codegen`;
-    // `rake verify` fails if this file is stale. Reasoning: ../../spec/design/codegen.md.
+    // are hand-written (§5 forbids codegenning those). Regenerate with `mise run codegen`;
+    // `mise run verify` fails if this file is stale. Reasoning: ../../spec/design/codegen.md.
 
     package jed
 
@@ -521,7 +521,7 @@ def go_ranges_file(ranges)
     // Range-type descriptor table (CLAUDE.md §4/§5): the six built-in PostgreSQL range types
     // as DATA. The recursive value codec / comparator / text-I/O / canonicalize rule that
     // CONSUME it are hand-written per core (§5 forbids codegenning them; derived from the
-    // element type, byte-identical by construction). Regenerate with `rake codegen`; `rake
+    // element type, byte-identical by construction). Regenerate with `mise run codegen`; `mise run
     // verify` fails if stale. Reasoning: ../../spec/design/ranges.md.
 
     package jed
@@ -618,8 +618,8 @@ def ts_file(ops, aggs, srfs, wins)
     //
     // Operator + aggregate descriptor tables (CLAUDE.md §5: the codegen "middle path").
     // DATA only — the parser, executor, and the eq3/lt3 evaluation logic that CONSUME it
-    // are hand-written (§5 forbids codegenning those). Regenerate with `rake codegen`;
-    // `rake verify` fails if this file is stale. Reasoning: ../../../spec/design/codegen.md.
+    // are hand-written (§5 forbids codegenning those). Regenerate with `mise run codegen`;
+    // `mise run verify` fails if this file is stale. Reasoning: ../../../spec/design/codegen.md.
 
     // One operator's metadata, mirroring a [[operator]] entry in catalog.toml. `symbol` is
     // absent for operators with no infix symbol (the IS [NOT] NULL tests).
@@ -738,8 +738,8 @@ def ts_ranges_file(ranges)
     // Range-type descriptor table (CLAUDE.md §4/§5): the six built-in PostgreSQL range
     // types as DATA. The recursive value codec / comparator / text-I/O / canonicalize rule
     // that CONSUME this are hand-written per core (§5 forbids codegenning them; derived from
-    // the element type, byte-identical by construction). Regenerate with `rake codegen`;
-    // `rake verify` fails if this file is stale. Reasoning: ../../../spec/design/ranges.md.
+    // the element type, byte-identical by construction). Regenerate with `mise run codegen`;
+    // `mise run verify` fails if this file is stale. Reasoning: ../../../spec/design/ranges.md.
 
     // One range type's metadata, mirroring a [[range]] entry in spec/types/ranges.toml.
     // `element` is a scalar id (the subtype the range is built over); `discrete` marks an
@@ -795,7 +795,7 @@ def main
 
   if check
     unless stale.empty?
-      stale.each { |rel| warn "STALE: #{rel} — run 'rake codegen'" }
+      stale.each { |rel| warn "STALE: #{rel} — run 'mise run codegen'" }
       exit 1
     end
     puts "OK: #{TARGETS.length + RANGE_TARGETS.length} generated files current " \

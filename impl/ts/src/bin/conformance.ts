@@ -581,7 +581,7 @@ function assertTypes(expected: string[] | null, actual: string[], sql: string): 
 
 // runFile runs all records in one .test file against a fresh database.
 // The file being walked, for JED_CONFORMANCE_QUERY_MEMORY_PEAKS (the per-record query-memory peak
-// mode, rake conformance:query_memory).
+// mode, mise run conformance:query_memory).
 let peakRel = "";
 
 // recordPeak appends the peak query-memory balance of record `ordinal` of the current file when the

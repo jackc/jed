@@ -10,7 +10,7 @@
 #                     LEVELS an implementation targets ("does impl X meet `core`?").
 #
 # This file defines axes 2 and 3 (axis 1 is the filesystem). TEST-TIME ONLY — the
-# harness reads it; no shipped engine does. Validated by `rake verify`.
+# harness reads it; no shipped engine does. Validated by `mise run verify`.
 
 schema_version = 1
 

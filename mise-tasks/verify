@@ -1,0 +1,31 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Verify the spec data tables and byte fixtures (toolchain-light; no engine build)"
+
+# Run the spec's data-table checkers (no engine required). Each checker is an independent
+# reference implementation that recomputes values from the rules and asserts the canonical
+# fixtures match (CLAUDE.md §5, §8). Add new checks here as subsystems gain verifiable data.
+# Deliberately toolchain-light: spec data only — no cargo/go/biome/npm needed.
+
+require_relative "../scripts/lib/tasks"
+
+CHECKS = [
+  ["key encoding", "spec/encoding/verify.rb"],
+  ["prng + uuid fixtures", "spec/encoding/prng_verify.rb"],
+  ["conformance taxonomy", "spec/conformance/verify.rb"],
+  ["file format", "spec/fileformat/verify.rb"],
+  ["function catalog", "spec/functions/verify.rb"],
+  ["cost schedule", "spec/cost/verify.rb"],
+  ["plan estimator", "spec/cost/estimator_verify.rb"],
+  ["operator codegen (drift)", "scripts/gen_catalog.rb", "--check"],
+  ["cost codegen (drift)", "scripts/gen_costs.rb", "--check"],
+  ["estimator codegen (drift)", "scripts/gen_estimator.rb", "--check"],
+  ["error codegen (drift)", "scripts/gen_errors.rb", "--check"],
+].freeze
+
+failures = CHECKS.reject do |name, script, *args|
+  puts "#{name}: #{script} #{args.join(' ')}".rstrip
+  system(RbConfig.ruby, script, *args)
+end.map(&:first)
+abort "verify: failed for #{failures.join(', ')}" unless failures.empty?
+puts "\nAll spec checks passed."

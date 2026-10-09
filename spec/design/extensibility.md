@@ -432,7 +432,7 @@ They feel like one decision; they are not. The seam ships with every built-in ar
 2. **The corpus gates the seam; benchmarks gate the dogfood.** A registry refactor is
    behaviour-preserving — rows/cost stay byte-identical, so the corpus passes unchanged (exactly how
    the resolution restructure was verified). But the hot-loop regression the dogfood risks is
-   **wall-clock**, invisible to the corpus — a `rake bench:diff` fact. So the seam is *corpus*-gated
+   **wall-clock**, invisible to the corpus — a `mise run bench:diff` fact. So the seam is *corpus*-gated
    (safe, behaviour-preserving) and the dogfood is a separate *benchmark* measurement.
 
 ---

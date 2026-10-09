@@ -2,7 +2,7 @@
 // (spec/design/concurrency-testing.md §6): the parallelism-stress format. Unlike the Layer 1/2
 // `# format: concurrency` schedules (an explicit total order, run inside the conformance harness),
 // a `stress/*.stress.toml` file has NO order — writers and readers run concurrently and correctness
-// is checked by INVARIANTS, not a transcript. It is bench-family (outside `rake ci`).
+// is checked by INVARIANTS, not a transcript. It is bench-family (outside `mise run ci`).
 //
 // The TS core is single-threaded (JS has no shared-memory threads for live objects), so it runs the
 // **seeded-sequential interleaver** (§6) — the only mode here. The workers are flattened to a fixed

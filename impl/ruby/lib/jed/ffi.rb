@@ -22,7 +22,7 @@ module Jed
     # Resolve the cdylib path. Honors `JED_RUBY_LIB` (an explicit override, e.g. a packaged or
     # vendored artifact), then the in-repo cargo build outputs, then the gem's own lib dir (where a
     # packaged gem would stage the artifact). Raises a clear {Jed::LoadError} pointing at
-    # `rake ruby:build` if none is found.
+    # `mise run ruby:build` if none is found.
     def lib_path
       override = ENV["JED_RUBY_LIB"]
       return override if override && File.exist?(override)
@@ -34,7 +34,7 @@ module Jed
 
       raise Jed::LoadError, <<~MSG.strip
         could not find the native library #{name}.
-        Build it with `rake ruby:build` (from the repo root) or set JED_RUBY_LIB to its path.
+        Build it with `mise run ruby:build` (from the repo root) or set JED_RUBY_LIB to its path.
         Searched:
           #{candidates.join("\n  ")}
       MSG
@@ -74,7 +74,7 @@ module Jed
     unless loaded_abi == Jed::ABI_VERSION
       raise Jed::LoadError,
         "jed native ABI mismatch: gem expects #{Jed::ABI_VERSION}, library reports #{loaded_abi} " \
-        "(rebuild with `rake ruby:build`)"
+        "(rebuild with `mise run ruby:build`)"
     end
 
     OPEN_MEMORY    = fn(:jed_open_memory, [], VOIDP)

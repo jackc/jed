@@ -2,7 +2,7 @@
 // Chromium against the Vite-served demo (browser/main.ts), exercising the FULL stack the node parity
 // test cannot: a real FileSystemSyncAccessHandle, in a real dedicated Worker, over the async RPC client.
 // Gated — run with `npm run test:browser` after `npx playwright install chromium`; NOT in the node unit
-// suite or `rake ci` (which the OPFS host leaves untouched — it adds no SQL semantics, hosts.md §5).
+// suite or `mise run ci` (which the OPFS host leaves untouched — it adds no SQL semantics, hosts.md §5).
 //
 // Each test gets a fresh browser context, so OPFS starts empty; a unique db name per test avoids the
 // exclusive-handle clash even if state lingered.

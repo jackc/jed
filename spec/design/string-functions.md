@@ -21,7 +21,7 @@ ride `RExpr::ScalarFunc` / `reScalarFunc` / `scalarFunc` like `abs`/`round`. Eac
 
 PostgreSQL is the behavioral default (CLAUDE.md §1) and every one of these is oracle-pinned
 against `postgres:18` — they live on the comparable surface, so the corpus rows are imported
-from the live oracle (`rake corpus:import`) and any deliberate divergence is recorded here.
+from the live oracle (`mise run corpus:import`) and any deliberate divergence is recorded here.
 
 ## 2. The character-unit decision — code points, and the cross-core trap
 

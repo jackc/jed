@@ -6,16 +6,16 @@
 > matching extension, (3) the three-axis taxonomy (suites / capabilities / profiles),
 > (4) the determinism rules, and (5) the corpus-bootstrapping policy. The capability and
 > profile *data* lives in [../conformance/manifest.toml](../conformance/manifest.toml),
-> validated by `rake verify`; this doc is the *why*.
+> validated by `mise run verify`; this doc is the *why*.
 
 The corpus is the spine of the project (CLAUDE.md §7). Because there is no reference
 implementation (CLAUDE.md §2), the only thing that says two cores agree is that they
 produce identical results on the same shared, declarative tests. Everything here is in
 service of that: one format, deterministic expected output, machine-legible failures.
 
-`rake conformance:spill[bytes,filter]` runs the same sequential corpus on file-backed
+`mise run conformance:spill [bytes] [filter]` runs the same sequential corpus on file-backed
 handles in all three cores with a forced `work_mem` threshold (default 256 bytes).
-It is part of `rake test` and `rake ci`. Each record retains the ordinary disk-mode
+It is part of `mise run test` and `mise run ci`. Each record retains the ordinary disk-mode
 reopen and receives the threshold again, so small SQL fixtures exercise scratch while
 checking their existing rows, types, errors, and exact costs. The harness-only
 `JED_CONFORMANCE_WORK_MEM` override also accepts zero for an unlimited comparison;
@@ -24,7 +24,7 @@ environment variables belong to the tooling, never to the built-in SQL engine.
 The forced run complements internal spill/cleanup/retained-state assertions; a corpus
 pass alone cannot prove that an implementation actually spilled.
 
-`rake conformance:query_memory[bytes,filter]` walks the corpus on all three cores in
+`mise run conformance:query_memory [bytes] [filter]` walks the corpus on all three cores in
 both storage modes, and once more on disk with `work_mem` forced to 256 bytes, with the
 query-memory account ([memory.md](memory.md)) active: every record without its own
 `# max_query_memory_bytes:` directive runs under the harness-only
@@ -36,7 +36,7 @@ would reveal. Each runner also writes every record's **peak** balance to
 fails unless the three cores agree on every record in every pass. In memory mode the peak is
 the record's minimal passing budget; on disk it is an upper bound, since spill-capable
 structures also spill when a smaller budget rejects them (memory.md §6.6). It is part of
-`rake test` and `rake ci`.
+`mise run test` and `mise run ci`.
 
 The Rust runner's `JED_CONFORMANCE_QUERY_MEMORY_PROBE` mode re-baselines pinned thresholds:
 records expected to succeed run under the accounting budget instead of their own (so their
@@ -236,7 +236,7 @@ separated into three independent axes:
 Capabilities and profiles are **data**, in
 [../conformance/manifest.toml](../conformance/manifest.toml) (data over code, CLAUDE.md §5);
 suites are the filesystem. All three are **test-time only** — the harness reads them; no
-shipped engine does. `rake verify` runs [../conformance/verify.rb](../conformance/verify.rb),
+shipped engine does. `mise run verify` runs [../conformance/verify.rb](../conformance/verify.rb),
 which checks the taxonomy is internally coherent: every required/profiled capability is
 defined, profile `includes` form no cycles, every `.test` has exactly one `# requires:`
 line, and no capability is defined but unused.
@@ -288,7 +288,7 @@ session-local **temp tables**, an explicit **transaction** spanning records, a s
 (§1) are likewise memory-only (the schedule driver is not a single reopenable handle).
 Conversely, a file whose contract holds **only on a file-backed database** — budget-aware spilling,
 which an in-memory database never does ([memory.md](memory.md) §6.6) — opts out of the memory pass
-with **`# skip: memory[ — reason]`**. `rake conformance` runs both modes on all three cores; `rake
+with **`# skip: memory[ — reason]`**. `mise run conformance` runs both modes on all three cores; `mise run
 ci` gates on both.
 
 ## 4. Determinism rules
@@ -348,8 +348,8 @@ Every corpus entry MUST obey:
 - The corpus is **predominantly hand-authored.** Integer semantics are small and fully
   known, so the expected output is written directly and reviewed as the contract.
 - **Oracle-import** against the live PostgreSQL cluster is **available** (`scripts/oracle_import.rb`;
-  `rake corpus:import[file]` fills a `.test`'s expected rows/error codes from PG, `rake
-  corpus:check[file]` re-derives and diffs without writing). It talks **only to the running
+  `mise run corpus:import <file>` fills a `.test`'s expected rows/error codes from PG, `mise run
+  corpus:check file` re-derives and diffs without writing). It talks **only to the running
   oracle cluster**, never the source checkout, so it does **not** trip the §12
   reference-provisioning gate, and it is **psql-only** (no `pg` gem — no §14 dependency). It is
   an authoring aid + a standing drift check, **not** a query generator (that is the metamorphic
@@ -375,13 +375,13 @@ Every corpus entry MUST obey:
     an oracle on one of them is calibrated to one machine's PostgreSQL rather than to PostgreSQL.
     The builtin provider consults no external library, and its code-point ordering **is** jed's
     single defined `C` collation (types.md §11), so PG and jed agree on text ordering *by
-    construction* instead of by hand-written override. `rake oracle:setup` provisions it
+    construction* instead of by hand-written override. `mise run oracle:setup` provisions it
     (a database's locale is fixed at CREATE time, so matching jed means creating one) inside
     **this checkout's own PostgreSQL cluster** (`.dev/postgres`, started by `mise run dev` —
     CLAUDE.md §12), so the oracle is per-checkout state rather than shared infrastructure.
     `PgOracle.assert_profile!` checks them **once per process** on first connect and **aborts** on
-    a mismatch, so every `corpus:*` / `rqg:*` task inherits the guard for free. `rake
-    oracle:status` prints declared-vs-live; `rake oracle:check` is the bare assertion.
+    a mismatch, so every `corpus:*` / `rqg:*` task inherits the guard for free. `mise run
+    oracle:status` prints declared-vs-live; `mise run oracle:check` is the bare assertion.
     `[cluster.tzdata]` is *reported*, not enforced — tzdata content legitimately varies per PG
     build, so a flip **warns** and names the override that depends on it.
   - **`[session]` — applied.** `DateStyle`, `IntervalStyle`, `extra_float_digits`, `bytea_output`,
@@ -391,13 +391,13 @@ Every corpus entry MUST obey:
     probe never inherits a server default. `TimeZone` is deliberately absent — it is per-record
     (`# timezone:`) and set from the record itself.
 
-  **Sweeping many files:** reset between them (`rake oracle:reset`). Probes roll back, but a
+  **Sweeping many files:** reset between them (`mise run oracle:reset`). Probes roll back, but a
   `.test` carrying its own transaction control commits its objects for real, and a later file
   replaying onto that state fails in a way that looks exactly like a regression.
 
   `spec/conformance/verify.rb` checks the table is structurally complete (every asserted key
   present and well-typed, every pin a non-empty string) so a typo cannot make an assertion
-  vacuous; that check is static and needs no server, so it runs inside toolchain-light `rake
+  vacuous; that check is static and needs no server, so it runs inside toolchain-light `mise run
   verify`. **Changing a value in the profile changes what the oracle answers** — treat it as a
   spec edit and re-run `corpus:check` over the oracle-checkable corpus.
 - **Intentional divergences are a machine-checked ledger.** PostgreSQL is the *default*, not a
@@ -454,10 +454,10 @@ profile's capabilities passes. All three cores (Rust, Go, TS) ship this harness 
 
 [scripts/norec_gen.rb](../../scripts/norec_gen.rb) generates self-checking metamorphic tests.
 Expected rows are known **by construction** from the generated data, so no oracle (PG or otherwise)
-is consulted. Each seed emits one file per scenario; `rake corpus:norec_sweep` runs a fixed,
+is consulted. Each seed emits one file per scenario; `mise run corpus:norec_sweep` runs a fixed,
 reproducible sweep (seeds 1..N × scenarios) on **all three cores**, so each test is checked
 **metamorphically** (the equivalent forms agree) *and* **differentially** (the cores agree). It is
-in the `rake ci` gate. Two families of relation are generated:
+in the `mise run ci` gate. Two families of relation are generated:
 
 - **NoREC** (Non-optimizing Reference Engine Construction): a query that triggers an optimization
   and a *semantically-equivalent* form that does **not** must return identical rows. The canonical
@@ -577,7 +577,7 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
 
 **Reducing a discovered failure.** Generation is seeded, so a failure reproduces deterministically
 (CLAUDE.md §10), but a failing file is large and noisy. [scripts/reduce.rb](../../scripts/reduce.rb)
-(`rake corpus:reduce[file,core]`) shrinks it automatically: **delta-debugging (ddmin) over the
+(`mise run corpus:reduce <file> [core]`) shrinks it automatically: **delta-debugging (ddmin) over the
 file's records** — the blank-line-separated `statement`/`query` blocks; the `# requires:` header is
 fixed — accepting a smaller record set iff the chosen core's harness still reports the
 **byte-identical failure signature** (the `FAIL …` message + SQL + expected/actual). That strict
@@ -589,7 +589,7 @@ on are retained automatically while unrelated records are stripped. The result i
 the reducer distills; the committed `.test` is the durable artifact). It reduces at record
 granularity only — shrinking the data or the failing SQL would change the expected/actual and thus
 the signature, so finer trimming is left to the author. A fixed synthetic case guards the reducer in
-`rake ci` (`rake corpus:reduce_selftest`).
+`mise run ci` (`mise run corpus:reduce_selftest`).
 
 Further SQLancer oracles remain open (TODO.md Phase 8): **PQS** (pivoted query synthesis — needs an
 in-harness expression evaluator) and broader NoREC/TLP relations as new optimizations land.

@@ -25,7 +25,7 @@
 # fingerprints — wrong answers make the timings meaningless, so no diff is emitted).
 # `--fail-over=PCT` additionally exits 2 if any matched pair regressed by more than
 # PCT% — a regression gate for scripts ("did anything get >10% slower?"). Wall-clock
-# is noisy and environment-relative; this gate is for operator use, never `rake ci`.
+# is noisy and environment-relative; this gate is for operator use, never `mise run ci`.
 
 require_relative "bench_results"
 require "json"

@@ -8,7 +8,7 @@
 //!
 //! Needs no TOML: the per-impl gate is the file's `# requires:` header vs this
 //! core's declared capability set. The manifest/profile data is validated
-//! separately by `rake verify`. Exit code is nonzero if any run file fails.
+//! separately by `mise run verify`. Exit code is nonzero if any run file fails.
 //!
 //! `--rebaseline` rewrites every `# cost: N` directive in place to the cost this core
 //! accrues (the tool for re-baselining the corpus after a cost-schedule change). This
@@ -29,7 +29,7 @@ use std::thread::{self, JoinHandle};
 
 thread_local! {
     /// The peak sink of `JED_CONFORMANCE_QUERY_MEMORY_PEAKS` (the per-record query-memory peak mode,
-    /// `rake conformance:query_memory`): the open output and the file being walked.
+    /// `mise run conformance:query_memory`): the open output and the file being walked.
     static PEAK_SINK: std::cell::RefCell<Option<(std::io::BufWriter<std::fs::File>, String)>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -691,7 +691,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
     let mut pending_query_memory: Option<i64> = None;
     let mut record_ordinal = 0usize;
     let probe_query_memory = std::env::var("JED_CONFORMANCE_QUERY_MEMORY_PROBE").is_ok();
-    // The whole-corpus accounting mode (`rake conformance:query_memory`): a budget applied to every
+    // The whole-corpus accounting mode (`mise run conformance:query_memory`): a budget applied to every
     // record without its own directive, so every query shape exercises the accounting.
     let query_memory_default: i64 = std::env::var("JED_CONFORMANCE_QUERY_MEMORY")
         .ok()

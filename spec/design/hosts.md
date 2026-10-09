@@ -268,7 +268,7 @@ zero `node:*`) and a clean Vite build of the Worker chunk. Two test layers: a **
 parity test** (`tests/opfs_parity.test.ts`, a fake sync handle — proves the byte contract both
 directions against the goldens, the §8 "done" criterion) and a **gated real-browser e2e** (Playwright +
 Vite, `e2e/opfs.spec.ts`, `npm run test:browser` — real `FileSystemSyncAccessHandle` in a real Worker,
-incl. durability across a page reload). Both are **outside `rake ci`** (TS unit tests are; the browser
+incl. durability across a page reload). Both are **outside `mise run ci`** (TS unit tests are; the browser
 e2e needs a Chromium binary) — the OPFS host adds no SQL semantics, so conformance is unchanged.
 
 ## 6. The decoration layering (where encryption and replication sit)
@@ -324,7 +324,7 @@ as it crosses. See the two docs for the full designs.
     sort currently stays resident for OPFS — `db.path` is null so the `SpillSink` is unset; an
     OPFS-backed `SpillSink` is the path); read-only multi-handle via `createSyncAccessHandle({ mode })`
     (not portable yet); running the real-browser e2e in CI (needs a headless-Chromium binary, today
-    outside `rake ci`); and **compaction** ([api.md](api.md) §2.6), which is `0A000` on OPFS until a
+    outside `mise run ci`); and **compaction** ([api.md](api.md) §2.6), which is `0A000` on OPFS until a
     crash-safe whole-file replace is designed for it (a sibling OPFS file plus a swap the engine can
     recover from — OPFS offers no atomic rename-over-existing contract the file host's recipe relies on).
 - **Shared multi-process file coordination** — ✅ **landed

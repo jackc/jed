@@ -5,7 +5,7 @@
 #   mise             one-shot work: install, init, migrate, build, test
 #   process-compose  long-running work: the PostgreSQL oracle, optionally the website dev server
 #
-# jed is a library: the engine itself needs no supervision, and `rake ci` starts no services. What
+# jed is a library: the engine itself needs no supervision, and `mise run ci` starts no services. What
 # genuinely needs supervising is the PostgreSQL differential oracle (CLAUDE.md §7) — a real server
 # with a startup delay, a readiness condition, and a lifetime longer than any one command.
 #
@@ -13,7 +13,7 @@
 # database bootstrap. Ports arrive through the environment (`.dev/`, exported by the launcher —
 # scripts/dev.rb); binary paths and the socket directory are resolved once inside
 # scripts/devdb.rb, so the supervisor and its readiness probe cannot disagree; and one-shot work
-# (initdb, creating the oracle database) stays in mise/rake tasks this file merely sequences.
+# (initdb, creating the oracle database) stays in mise tasks this file merely sequences.
 #
 #   mise run dev                             start the stack
 #   process-compose process list             status, scriptable
@@ -29,7 +29,7 @@ processes:
   # Creates the cluster if this checkout has none, then exits. Making it a dependency rather than a
   # documented prerequisite is what lets a fresh checkout go straight to `mise run dev`.
   db-init:
-    command: bundle exec rake db:init
+    command: mise run db:init
     availability:
       restart: "no"
 
@@ -54,7 +54,7 @@ processes:
   # Creates the oracle database (spec/conformance/oracle_profile.toml) once the server is up, then
   # exits. Idempotent, so a restart of the stack is free.
   oracle-setup:
-    command: bundle exec rake oracle:setup
+    command: mise run oracle:setup
     depends_on:
       postgres:
         condition: process_healthy

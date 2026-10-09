@@ -175,7 +175,8 @@ func TestTornWriteInFlightSubsetsAreAtomic(t *testing.T) {
 // FuzzCommitCrash is the explorer (testing-ideas.md §3: Go explores, the intrinsic oracle judges):
 // the fuzz input picks a crash boundary, a tear length, and an in-flight drop mask; every
 // reconstruction must recover the prior or post snapshot. Its f.Add seeds run inside `go test`
-// (so the path is covered in `rake ci`); `-fuzz` runs it as a campaign (rake fuzz:crash).
+// (so the path is covered in `mise run ci`); `-fuzz` runs it as a campaign
+// (mise run fuzz:one FuzzCommitCrash).
 func FuzzCommitCrash(f *testing.F) {
 	prior, ops, priorIDs, postIDs := recordFatCommit(f)
 	f.Add(0, 0, uint64(0))

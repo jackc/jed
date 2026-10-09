@@ -11,8 +11,8 @@ values—the complete surface required by the shared benchmark corpus.
 Build and test from the repository root:
 
 ```text
-rake node:build
-rake node:test
+mise run node:build
+mise run node:test
 ```
 
 The experimental package uses exact-pinned `napi-rs` crates and builds `jed_node.node`; no addon is
@@ -21,7 +21,7 @@ downloaded or compiled during `npm install`.
 Run the full pure-TypeScript versus Node/Rust comparison with:
 
 ```text
-rake bench:node_compare
+mise run bench:node_compare
 ```
 
 In the 2026-07-16 run, all 106 paired results agreed on checksums. The wrapper was 1.38× faster by

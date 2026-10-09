@@ -11,7 +11,7 @@
 #
 # Targets wasm32-wasip1 (NOT wasm32-unknown-unknown): WASI gives the core std::fs (open a .jed
 # file through a Node preopen) and getrandom a working backend (WASI random_get) with no Cargo
-# feature, and Node has a built-in WASI host. Build: see Rakefile `wasm:build`.
+# feature, and Node has a built-in WASI host. Build: see README.md (`mise run bench:build` builds it too).
 
 [package]
 name = "jed-wasm"

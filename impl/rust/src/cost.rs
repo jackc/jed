@@ -41,13 +41,13 @@ pub struct Lifetime {
 }
 
 /// Releases that exceeded their account's balance — always an engine accounting bug. Read by the
-/// conformance harness's whole-corpus accounting mode (`rake conformance:query_memory`).
+/// conformance harness's whole-corpus accounting mode (`mise run conformance:query_memory`).
 pub static QUERY_MEMORY_UNDERFLOWS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// The highest balance any account has reached since the conformance harness last reset it — the
 /// minimal passing `max_query_memory_bytes` of the record just run. The harness's peak mode
-/// (`rake conformance:query_memory`) compares it across cores for every record.
+/// (`mise run conformance:query_memory`) compares it across cores for every record.
 pub static QUERY_MEMORY_PEAK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// A statement's live query-memory account (spec/design/memory.md §2): the shared running total and

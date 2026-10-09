@@ -362,7 +362,7 @@ remains the separate proposed class-P problem in §7.
 the repo: the [oracle_overrides.toml](../conformance/oracle_overrides.toml) machine-checked
 PG-divergence ledger ([conformance.md](conformance.md) §5) and the §14 default-deny dependency
 policy. The [determinism_exceptions.toml](../conformance/determinism_exceptions.toml) ledger
-exists and is wired into `rake verify`; each entry states:
+exists and is wired into `mise run verify`; each entry states:
 
 ```toml
 # Determinism-exception ledger (CLAUDE.md §2/§8/§10/§13; spec/design/determinism.md).

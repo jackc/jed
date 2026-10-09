@@ -64,8 +64,8 @@ def rust_file(us)
     //
     // Cost unit schedule (CLAUDE.md §5, §13: the codegen "middle path"). DATA only — the
     // accrual sites that CONSUME these weights (executor / evaluator / storage reads) are
-    // hand-written (§5 forbids codegenning those). Regenerate with `rake codegen`;
-    // `rake verify` fails if this file is stale. Reasoning: ../../../spec/design/cost.md.
+    // hand-written (§5 forbids codegenning those). Regenerate with `mise run codegen`;
+    // `mise run verify` fails if this file is stale. Reasoning: ../../../spec/design/cost.md.
 
     pub const DEFAULT_SCALAR_BYTES: i64 = #{scalar_limit};
 
@@ -108,8 +108,8 @@ def go_file(us)
     //
     // Cost unit schedule (CLAUDE.md §5, §13: the codegen "middle path"). DATA only — the
     // accrual sites that CONSUME these weights (executor / evaluator / storage reads) are
-    // hand-written (§5 forbids codegenning those). Regenerate with `rake codegen`;
-    // `rake verify` fails if this file is stale. Reasoning: ../../spec/design/cost.md.
+    // hand-written (§5 forbids codegenning those). Regenerate with `mise run codegen`;
+    // `mise run verify` fails if this file is stale. Reasoning: ../../spec/design/cost.md.
 
     package jed
 
@@ -152,8 +152,8 @@ def ts_file(us)
     //
     // Cost unit schedule (CLAUDE.md §5, §13: the codegen "middle path"). DATA only — the
     // accrual sites that CONSUME these weights (executor / evaluator / storage reads) are
-    // hand-written (§5 forbids codegenning those). Regenerate with `rake codegen`;
-    // `rake verify` fails if this file is stale. Reasoning: ../../../spec/design/cost.md.
+    // hand-written (§5 forbids codegenning those). Regenerate with `mise run codegen`;
+    // `mise run verify` fails if this file is stale. Reasoning: ../../../spec/design/cost.md.
 
     export const DEFAULT_SCALAR_BYTES = #{scalar_limit}n;
 
@@ -203,7 +203,7 @@ def main
 
   if check
     unless stale.empty?
-      stale.each { |rel| warn "STALE: #{rel} — run 'rake codegen'" }
+      stale.each { |rel| warn "STALE: #{rel} — run 'mise run codegen'" }
       exit 1
     end
     puts "OK: #{TARGETS.length} generated files current (#{us.length} cost units)"

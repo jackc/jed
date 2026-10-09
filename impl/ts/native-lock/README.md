@@ -7,7 +7,7 @@ It performs no database I/O and contains no parser, planner, executor, storage, 
 Build the local development artifact from the repository root with:
 
 ```text
-rake ts:lock_build
+mise run ts:lock_build
 ```
 
 The exact-pinned Node-API dependencies and bounded host-only native exception are recorded in

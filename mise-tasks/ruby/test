@@ -1,0 +1,18 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Build the cdylib, then run the Ruby gem's minitest seam tests"
+#MISE depends=["ruby:build"]
+
+# The jed Ruby GEM (spec/design/ruby.md) is a host artifact that WRAPS the safe Rust core
+# (CLAUDE.md §2/§13), not a core. Its minitest suite tests the BINDING SEAM only (marshalling,
+# lifecycle); SQL semantics are inherited from Rust by construction (cores.md §1), so they stay in
+# the shared corpus. minitest is a Ruby bundled gem, resolved from the mise Ruby install — no
+# Gemfile entry, no new dependency (CLAUDE.md §14). This task deliberately does not load bundler,
+# which would restrict the child to the repo Gemfile's gems.
+
+require_relative "../../scripts/lib/tasks"
+include Tasks
+
+tests = Dir[File.join(RUBY_GEM_DIR, "test/**/*_test.rb")].sort
+ruby "-I#{File.join(RUBY_GEM_DIR, 'lib')}", "-I#{File.join(RUBY_GEM_DIR, 'test')}",
+     "-e", "ARGV.each { |f| require f }", "--", *tests

@@ -5,7 +5,7 @@
 > (CLAUDE.md §7) catches them. A **surviving** mutant — one the whole corpus still passes —
 > is untested logic, located to a line. It answers "are we only testing the obvious?"
 > (`.scratch/testing-ideas.md` §1.2) with a map, not a guess. This is an **analysis tool**,
-> deliberately outside `rake ci`; the harness is `impl/go/cmd/mutate`, driven by `rake mutation`.
+> deliberately outside `mise run ci`; the harness is `impl/go/cmd/mutate`, driven by `mise run mutation`.
 
 ## 1. The gap this closes
 
@@ -144,16 +144,16 @@ set a generous per-mutant timeout.
 
 ## 7. Where it sits
 
-`rake mutation` (`impl/go/cmd/mutate`) is **outside `rake ci`**, exactly like `rake bench` and
-`rake stress`: it is slow and exploratory, and a surviving mutant is a *finding to triage*, not a
-build break. So a non-zero exit (survivors present) does not fail the rake invocation; the printed
+`mise run mutation` (`impl/go/cmd/mutate`) is **outside `mise run ci`**, exactly like the `bench:*` tasks
+and `mise run stress`: it is slow and exploratory, and a surviving mutant is a *finding to triage*, not a
+build break. So a non-zero exit (survivors present) does not fail the task; the printed
 report and the JSONL artifact under `bench/results/mutation/<stamp>/` are the deliverable.
 
 ```
-rake mutation                  # default targets, 300 sampled mutants (seed 1)
-rake mutation[value.go]        # scope to one file, full sweep
-rake mutation[value.go,500,7]  # file, max mutants, seed
-go run ./cmd/mutate -h         # the full flag set (-mutators, -workers, -timeout, -unit, -list, -v, -json)
+mise run mutation                 # default targets, 300 sampled mutants (seed 1)
+mise run mutation value.go        # scope to one file, full sweep
+mise run mutation value.go 500 7  # file, max mutants, seed
+go run ./cmd/mutate -h            # the full flag set (-mutators, -workers, -timeout, -unit, -list, -v, -json)
 
 # byte-level files want the second oracle so survivors are real (not fixture-covered):
 go run ./cmd/mutate -files encoding.go -unit Encod    # corpus + the encoding byte-fixture tests

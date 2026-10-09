@@ -1,0 +1,16 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Generate per-language source from the spec data tables (codegen middle path)"
+
+# The "middle path" (CLAUDE.md §5): (re)generate per-language source from the canonical spec data
+# tables — the operator descriptor tables from spec/functions/catalog.toml, the cost-unit schedule
+# from spec/cost/schedule.toml, the estimator facts from spec/cost/estimator.toml, and the SqlState
+# enum + code mapping from spec/errors/registry.toml. `mise run verify` fails if any checked-in
+# generated file is stale.
+
+require_relative "../scripts/lib/tasks"
+
+GENERATORS = %w[scripts/gen_catalog.rb scripts/gen_costs.rb scripts/gen_estimator.rb scripts/gen_errors.rb].freeze
+
+failures = GENERATORS.reject { |g| system(RbConfig.ruby, g) }
+abort "codegen failed for #{failures.join(', ')}" unless failures.empty?

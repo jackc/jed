@@ -5,7 +5,7 @@
 # bytes the statement holds (ENTRY 32 per table entry, memory.md §6.1); the record below it at
 # budget - 1 fails 54P05. On a file-backed database aggregates, DISTINCT, and joins take the
 # bounded-spill lane, whose spill structures charge their resident elements instead (§6.6) — those
-# thresholds are cross-checked between cores by `rake conformance:query_memory`, so this file pins
+# thresholds are cross-checked between cores by `mise run conformance:query_memory`, so this file pins
 # the in-memory lanes only.
 # skip: disk — blocking operators take the bounded-spill lane on file-backed databases
 # requires: query.select, ddl.create_table, dml.insert, dml.insert_multi_row, dml.insert_select, types.text, types.json, types.jsonb, func.json_agg, query.join_inner, query.hash_join, query.aggregates, query.group_by, query.ordered_set_aggregate, query.hypothetical_set_aggregate, query.window, query.window_aggregate, query.intersect, query.except, query.cte, query.cte_recursive, query.order_by, query.limit, query.order_by_topk, query.distinct, query.set_returning, resource.query_memory

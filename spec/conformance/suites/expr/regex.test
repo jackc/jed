@@ -1,6 +1,6 @@
 # Regular-expression match operators `~` `~*` `!~` `!~*` (spec/design/regex.md, grammar.md §22b).
 # jed's own RE2-able flavor (a linear-time Pike VM, NOT PostgreSQL-compatible), but the BASIC subset
-# tested here AGREES with PostgreSQL, so these rows oracle-check (rake corpus:check). UNANCHORED
+# tested here AGREES with PostgreSQL, so these rows oracle-check (mise run corpus:check). UNANCHORED
 # (matches a substring); text×text→boolean; NULL propagates; non-text 42804; malformed pattern 2201B.
 # Match is by Unicode code point. The flavor-divergent surface (backreferences, lookaround — which PG
 # accepts but jed rejects 2201B) is NOT exercised here; the per-step cost + capture detail live in the

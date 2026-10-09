@@ -296,7 +296,7 @@ Incoming-FK validation reads this final cascade-adjusted state, so an FK removed
 
 ## 5. Conformance and cost obligations
 
-- **Oracle-check** row/error behavior against PostgreSQL (`rake corpus:check`); ledger each
+- **Oracle-check** row/error behavior against PostgreSQL (`mise run corpus:check`); ledger each
   divergence (dropped-column physical removal §3.2, end-state validation §4).
 - **Per-core unit tests only for what the corpus cannot express** (CLAUDE.md §10): the
   dropped-column tombstone divergence, catalog/introspection state (ordinals after a drop),

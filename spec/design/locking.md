@@ -15,7 +15,7 @@
 **Status: landed on the Rust, Go, and Node/TypeScript local-file hosts (2026-07-16).** Public
 `Database` opens and file attachments participate before reading database bytes; the shared
 `file.shared_process` actor corpus runs every same-core and cross-core pairing in
-`rake concurrency:process` and `rake ci`. `locking = none`, pre-protocol binaries, and non-cooperating
+`mise run concurrency:process` and `mise run ci`. `locking = none`, pre-protocol binaries, and non-cooperating
 file mutation remain explicitly outside the safety boundary.
 
 **Decision (revised 2026-07-16): build shared multi-process access as the first locking slice.**

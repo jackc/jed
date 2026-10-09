@@ -414,7 +414,7 @@ compression is Slice B). They were chosen with the maintainer; the byte details 
 - **Format version.** Clean break to **`format_version 3`** (v2 not read), regenerating the 15
   goldens (only the version field + CRC change for non-spilling fixtures) plus new external-value
   goldens. The version bump, the `format.md` byte-pinning, the Ruby reference, and all three cores
-  move **together** — that lockstep step is what makes `rake verify` green again; during
+  move **together** — that lockstep step is what makes `mise run verify` green again; during
   development the mechanism is built under the v2 version field, since a core cannot bump the
   version alone without regenerating the shared goldens.
 

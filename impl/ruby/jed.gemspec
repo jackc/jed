@@ -18,7 +18,7 @@ Gem::Specification.new do |spec|
   spec.required_ruby_version = ">= 3.2"
 
   # Pure-Ruby sources + the native-extension Rust crate. The compiled cdylib is NOT listed here:
-  # in-repo it is built by `rake ruby:build` and loaded from ext/target/release; producing a
+  # in-repo it is built by `mise run ruby:build` and loaded from ext/target/release; producing a
   # distributable gem that builds or bundles the cdylib on install (rb-sys / precompiled platform
   # gems) is the packaging follow-on (spec/design/ruby.md §6).
   spec.files =

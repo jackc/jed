@@ -6,7 +6,7 @@
 # cannot block). The queued open logically completes the instant the holding writer ends: the
 # equivalent serial order (§5). Results are therefore deterministic and identical on every core — a
 # single-threaded core queues w2 until release, while Go/Rust additionally drive the REAL blocking
-# acquire under the race detector (`rake concurrency:race`), the one concurrency path the sequential
+# acquire under the race detector (`mise run concurrency:race`), the one concurrency path the sequential
 # walk never exercises.
 #
 # What it pins, beyond snapshot_isolation.test / watermark_refcount.test:

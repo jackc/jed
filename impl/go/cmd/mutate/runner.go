@@ -242,7 +242,7 @@ func copyFile(src, dst string, perm os.FileMode) error {
 	return out.Close()
 }
 
-// goBinary locates the go toolchain: PATH first (the mise/rake environment puts it there),
+// goBinary locates the go toolchain: PATH first (the mise environment puts it there),
 // then GOROOT/bin/go as a fallback.
 func goBinary() string {
 	if p, err := exec.LookPath("go"); err == nil {

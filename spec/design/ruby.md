@@ -164,7 +164,7 @@ stored in its header.
 The loader ([ffi.rb](../../impl/ruby/lib/jed/ffi.rb)) resolves the platform cdylib
 (`libjed_ruby.{so,dylib}` / `jed_ruby.dll`) from, in order: `JED_RUBY_LIB` (explicit override),
 the in-repo cargo outputs (`ext/target/{release,debug}`), then the gem's own `lib/`. A missing
-library raises a `Jed::LoadError` pointing at `rake ruby:build`. On load the gem checks
+library raises a `Jed::LoadError` pointing at `mise run ruby:build`. On load the gem checks
 `jed_abi_version()` against its own `Jed::ABI_VERSION` (**before** binding the rest of the surface,
 so a stale cdylib fails with a clear version message rather than a missing-symbol error) and refuses
 a mismatch — never a silent wire misparse.
@@ -190,8 +190,8 @@ load; producing/shipping bundles is the host's concern, identical to the other c
 
 ## 6. Build, test, and follow-ons
 
-- **Build / test.** `rake ruby:build` compiles the cdylib; `rake ruby:test` builds it and runs
-  the gem's minitest **seam** tests (`impl/ruby/test`), folded into `rake test`/`rake ci` like
+- **Build / test.** `mise run ruby:build` compiles the cdylib; `mise run ruby:test` builds it and runs
+  the gem's minitest **seam** tests (`impl/ruby/test`), folded into `mise run test`/`mise run ci` like
   the CLI. Per CLAUDE.md §10 those tests cover only what the corpus cannot — the binding seam
   itself (marshalling, value coercion, NULL handling, handle lifecycle, error mapping,
   persistence). SQL semantics stay in the shared corpus, inherited by construction.
@@ -206,7 +206,7 @@ load; producing/shipping bundles is the host's concern, identical to the other c
     Left as String for now (no single obvious native target, unlike decimal/date/time).
   - **Distributable packaging** — a `gem install`-able native gem via **`rb-sys` + precompiled
     platform gems** (or `magnus` for richer Rust ergonomics), replacing the in-repo
-    `rake ruby:build` step. The TODO Phase 9 entry names this as the packaging approach.
+    `mise run ruby:build` step. The TODO Phase 9 entry names this as the packaging approach.
   - **A Ruby conformance runner** — optional, to demonstrate (not establish) the inherited
     corpus pass directly through the gem.
 

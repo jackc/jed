@@ -186,7 +186,7 @@ fn file_backed_readers_run_concurrently_with_a_committing_writer() {
     // concurrently with a writer committing (and persisting dirty pages) on another thread. Pool
     // bookkeeping is mutex-guarded, while cold decode runs outside that critical section. Each reader
     // pins a snapshot and must see an internally consistent count; reclamation stays watermark-safe.
-    // Run under `rake concurrency:race` for the data-race assertion.
+    // Run under `mise run concurrency:race` for the data-race assertion.
     let path = tmp("file_sessions_concurrent.jed");
     let _ = std::fs::remove_file(&path);
     {

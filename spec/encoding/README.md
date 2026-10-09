@@ -27,8 +27,8 @@ nullable presence tag, composition, and the NULLs-last decision — is in
 | [timestamps.toml](timestamps.toml) | `timestamp`/`timestamptz` parse / render vectors — `(input → micros)`, `(input → error)`, `(micros → text)` ([../design/timestamp.md](../design/timestamp.md)). |
 | [intervals.toml](intervals.toml) | `interval` parse / render vectors — `(input → months/days/micros)` and `(fields → text)` ([../design/interval.md](../design/interval.md)). |
 | [prng.toml](prng.toml) | splitmix64 PRNG stream + v4/v7 UUID byte-layout fixtures for the entropy seam ([../design/entropy.md](../design/entropy.md)). |
-| [verify.rb](verify.rb) | Independent reference encoder that checks every key-encoding vector for round-trip, byte-exactness, and order preservation. Run `rake verify` (or `bundle exec ruby spec/encoding/verify.rb`); test-time only. |
-| [prng_verify.rb](prng_verify.rb) | Independent Ruby reference that recomputes the splitmix64 + UUID fixtures and asserts they match (`rake verify`); test-time only. |
+| [verify.rb](verify.rb) | Independent reference encoder that checks every key-encoding vector for round-trip, byte-exactness, and order preservation. Run `mise run verify` (or `bundle exec ruby spec/encoding/verify.rb`); test-time only. |
+| [prng_verify.rb](prng_verify.rb) | Independent Ruby reference that recomputes the splitmix64 + UUID fixtures and asserts they match (`mise run verify`); test-time only. |
 
 ## NULL ordering (ratified here)
 

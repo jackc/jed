@@ -2,7 +2,7 @@
 # frozen_string_literal: true
 
 # Validate the cost unit schedule (schedule.toml) for internal coherence. Test-time
-# only (CLAUDE.md §5); run via `rake verify`. This is a COHERENCE checker — it does
+# only (CLAUDE.md §5); run via `mise run verify`. This is a COHERENCE checker — it does
 # NOT re-implement the accrual logic (that is hand-written per core). Checks, with no
 # engine required:
 #

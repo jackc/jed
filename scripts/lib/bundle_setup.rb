@@ -1,11 +1,11 @@
 # frozen_string_literal: true
 
-# scripts/lib/bundle_setup.rb — load the gems pinned in Gemfile.lock, from any working directory
-# and from a script invoked directly rather than through Rake.
+# scripts/lib/bundle_setup.rb — load the gems pinned in Gemfile.lock, from any working directory,
+# whether a mise task or a person invoked the script.
 #
-# The Rakefile has always done this. The standalone scripts did not, and got away with it only on
-# a machine where an earlier `bundle install` happened to leave the gems on Ruby's default load
-# path. On a fresh checkout that is not true, and the failure is a bare
+# The old Rakefile did this for every script it ran. The standalone scripts did not, and got away
+# with it only on a machine where an earlier `bundle install` happened to leave the gems on Ruby's
+# default load path. On a fresh checkout that is not true, and the failure is a bare
 #
 #   cannot load such file -- toml-rb (LoadError)
 #

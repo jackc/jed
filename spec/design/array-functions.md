@@ -261,7 +261,7 @@ corpus lands, in [../conformance/oracle_overrides.toml](../conformance/oracle_ov
 
 ## 6. Delivery (sub-slices)
 
-The surface lands as ordered, independently-shippable slices, each passing `rake ci` with
+The surface lands as ordered, independently-shippable slices, each passing `mise run ci` with
 oracle-checked conformance — mirroring array.md S0–S5 and composite S0–S6.
 
 - **AF1 ✅** — the §2 polymorphic machinery + the §3 scalar-function surface (`array_ndims`,

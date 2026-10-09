@@ -4,7 +4,7 @@ The function and operator catalog (CLAUDE.md §5): [catalog.toml](catalog.toml) 
 operator, its operand contract, result type, and NULL behavior — **as data**, authored
 once. It is the first surface on the **codegen middle path**: a build-time generator emits
 per-language operator descriptor tables from it (`impl/{rust/src,go,ts/src}/operators.{rs,go,ts}`,
-via `rake codegen`) rather than hand-writing N times — see
+via `mise run codegen`) rather than hand-writing N times — see
 [../design/codegen.md](../design/codegen.md). It is **descriptive of the implemented
 operators**, not aspirational, and grows one entry per feature. The *why* — the schema,
 truth-value result types, NULL propagation vs detection — lives in
@@ -34,4 +34,4 @@ The catalog has grown well past the original operator set. Authored kinds:
 > `set_returning` entries alongside the operator kinds (`<>`/`!=` deliberately do not
 > exist — only `=`). The `precedence` and `cost` fields are authored, and
 > `IS [NOT] DISTINCT FROM` plus the named / `DEFAULT`-argument functions have landed.
-> Coherence is checked by [verify.rb](verify.rb) (`rake verify`).
+> Coherence is checked by [verify.rb](verify.rb) (`mise run verify`).

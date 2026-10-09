@@ -24,8 +24,8 @@ process-compose = '1.122.0'
 # --- Environment -------------------------------------------------------------------------------
 #
 # This checkout's own service endpoints. Loading them here is what makes the per-checkout
-# PostgreSQL cluster the DEFAULT: a bare `psql`, `rake corpus:check`, and the bench harnesses all
-# read PGHOST/PGPORT from the environment, so pointing those at .dev/postgres in one place moves
+# PostgreSQL cluster the DEFAULT: a bare `psql`, `mise run corpus:check`, and the bench harnesses
+# all read PGHOST/PGPORT from the environment, so pointing those at .dev/postgres in one place moves
 # every consumer at once — rather than some tools reaching a checkout-local cluster and others a
 # machine-wide one, which is the split-brain the oracle profile exists to prevent.
 #
@@ -43,14 +43,13 @@ process-compose = '1.122.0'
 [env]
 _.file = ['.dev/ports.env', '.dev/derived.env']
 # Keep Go builds inside the writable checkout in sandboxed environments. An explicit cache
-# remains authoritative (for example, a shared CI cache). Rake supplies the same default when
-# invoked without mise.
+# remains authoritative (for example, a shared CI cache).
 GOCACHE = "{{ get_env(name='GOCACHE', default=config_root ~ '/.dev/go-build') }}"
 
 # Homebrew's postgresql@18 is KEG-ONLY: nothing is linked into the prefix bin, so psql,
 # pg_isready, and initdb are not on PATH after `brew install`. The scripts that need the SERVER
 # binaries resolve them explicitly (scripts/lib/pg_bin.rb), but the CLIENT tools are invoked by
-# name from several places — the readiness probe, `rake db:psql`, oracle_setup, and the whole
+# name from several places — the readiness probe, `mise run db:psql`, oracle_setup, and the whole
 # oracle harness — and a bare `psql` failing would take out corpus work, RQG, and benchmarks.
 #
 # Both standard Homebrew prefixes are listed (Apple silicon, then Intel). Neither exists on Linux,
@@ -63,78 +62,320 @@ _.path = [
 
 # --- Tasks: the project's development interface -----------------------------------------------
 #
-# These wrap the Rake surface rather than replacing it (the Rakefile is ~1,400 lines of real Ruby
-# — codegen drivers, the conformance walkers, the oracle/RQG tools — and CLAUDE.md §10 prefers Ruby
-# + Rake for exactly that). The point of the wrapper is a SINGLE entry point that behaves the same
-# on native macOS, inside the devcontainer, and in CI: `mise run ci` is `mise run ci` everywhere.
+# mise is the task runner (CLAUDE.md §10). Two kinds of task, one namespace (`mise tasks` lists
+# them all):
 #
-# `bundle exec` is deliberate: it pins rake + toml-rb to Gemfile.lock rather than to whatever the
-# ambient gem set happens to hold. Add a task here when a workflow should be reachable without
-# knowing it is Rake underneath; keep the implementation in the Rakefile.
+#   * here, in mise.toml — composite tasks (a sequential list of other tasks) and one-line commands;
+#   * mise-tasks/ — every task with real logic, as an executable Ruby script whose path is its name
+#     (mise-tasks/bench/run is `bench:run`). They share scripts/lib/tasks.rb.
+#
+# `mise run` always loads [env] above, so a task reaches this checkout's PostgreSQL cluster no
+# matter which shell started it.
+#
+# ORDER IS DELIBERATE. mise runs a task's `depends` in PARALLEL, so composites here list their
+# steps as `{ task = ... }` entries in `run`, which run one after another and stop at the first
+# failure. Keep it that way: concurrency:process relies on real OS-lock timing, benchmarks measure
+# wall-clock time, and three cores' corpus walks interleaved are unreadable. `depends` is used only
+# for a task's single build prerequisite (e.g. ts:lock_build), which mise runs once per invocation.
+#
+# Task arguments use mise's usage spec: `mise run corpus:check path/to/file.test`, and
+# `mise run <task> --help` prints them.
+
+# --- Gates ------------------------------------------------------------------------------------
+
+[tasks.default]
+description = "Engine test suites (alias for test)"
+run = [{ task = "test" }]
 
 [tasks.ci]
-description = "Full merge gate: spec verification, formatting, lint, tests, real-process locking"
-run = "bundle exec rake ci"
+description = "Full merge gate: spec verification, formatting, lint, tests, real-process locking, metamorphic sweep"
+# A SUPERSET of `test`: adds spec-data + byte-fixture verification + codegen drift (`verify`), the
+# formatter gate (`fmt`), the TS linter (`lint`), the downstream web type check (`web:check`), the
+# real-process shared-file corpus, and generative differential testing — the NoREC/TLP metamorphic
+# sweep + the reducer self-test.
+run = [
+  { task = "verify" },
+  { task = "fmt" },
+  { task = "lint" },
+  { task = "web:check" },
+  { task = "test" },
+  { task = "concurrency:process" },
+  { task = "corpus:norec_sweep" },
+  { task = "corpus:reduce_selftest" },
+]
 
 [tasks.test]
-description = "Engine test suites: conformance corpus (x3 cores) + unit + CLI + gem + migrate"
-run = "bundle exec rake test"
+description = "Engine test suites: conformance corpus (x3 cores; plain, forced-spill, query-memory) + unit + CLI + gem + migrate"
+# Example-based correctness against authored expectations — the inner dev loop.
+run = [
+  { task = "conformance" },
+  { task = "conformance:spill" },
+  { task = "conformance:query_memory" },
+  { task = "unit" },
+  { task = "cli:test" },
+  { task = "ruby:test" },
+  { task = "migrate:test" },
+]
 
-[tasks.verify]
-description = "Verify the spec data tables and byte fixtures (toolchain-light; no engine build)"
-run = "bundle exec rake verify"
+[tasks.fmt]
+description = "Check formatting of cores, host artifacts, tooling, and web (alias for fmt:check)"
+run = [{ task = "fmt:check" }]
 
-[tasks."bench:durability"]
-description = "Test and benchmark experimental one-flush Rust commit protocols"
-run = "bundle exec rake bench:durability"
+[tasks.lint]
+description = "Lint the TypeScript core and host/tooling packages with Biome (alias for lint:check)"
+run = [{ task = "lint:check" }]
 
-[tasks."bench:durable_commit"]
-description = "Benchmark production durable SQL commits on Go with real storage flushes"
-run = "bundle exec rake bench:durable_commit"
+# Biome's LINTER, deliberately separate from fmt so a lint finding never blocks the formatter and
+# vice versa. The tailored ruleset lives in biome.json; `biome lint` exits non-zero only on ERRORS,
+# so advisory warnings are surfaced without failing the gate. Scope is the TS core and host/tooling
+# packages: web is prettier-only, with svelte-check (web:check) as its type gate; the @generated
+# files stay excluded via biome.json.
+[tasks."lint:check"]
+description = "Lint the TypeScript cores with Biome's tailored ruleset (errors fail; warnings advise)"
+run = "biome lint impl/ts impl/node bench/ts migrate/ts"
+
+[tasks."lint:fix"]
+description = "Apply Biome's SAFE lint fixes to the TS cores (unsafe fixes stay per-rule + manual)"
+run = "biome lint --write impl/ts impl/node bench/ts migrate/ts"
+
+# --- Conformance (the §7 cross-core contract) ---------------------------------------------------
+# Every core walks the hand-authored corpus (spec/conformance/suites) TWICE — the two storage modes
+# of spec/design/conformance.md §3: "memory" (a fresh in-memory Database) and "disk" (a file-backed
+# database reopened before every record, so committed reads fault their leaves from disk). Every
+# record's rows/error/cost must be IDENTICAL in both modes. Rust runs RELEASE: the debug evaluator's
+# giant frames overflow the native stack on resource/depth_limit.test's deep nesting.
 
 [tasks.conformance]
 description = "Walk the conformance corpus on all three cores"
-run = "bundle exec rake conformance"
+run = [{ task = "conformance:rust" }, { task = "conformance:go" }, { task = "conformance:ts" }]
 
-[tasks.fmt]
-description = "Check formatting of cores, host artifacts, tooling, and web"
-run = "bundle exec rake fmt"
+[tasks."conformance:rust"]
+description = "Walk the conformance corpus on the Rust core, both storage modes (release)"
+run = [
+  "cargo run --release --quiet --bin conformance --manifest-path impl/rust/Cargo.toml",
+  "cargo run --release --quiet --bin conformance --manifest-path impl/rust/Cargo.toml -- disk",
+]
 
-[tasks."fmt:fix"]
-description = "Rewrite sources with the pinned formatters"
-run = "bundle exec rake fmt:fix"
+[tasks."conformance:go"]
+description = "Walk the conformance corpus on the Go core, both storage modes"
+dir = "{{config_root}}/impl/go"
+run = ["go run ./cmd/conformance", "go run ./cmd/conformance disk"]
 
-[tasks.lint]
-description = "Lint the TypeScript core and host/tooling packages with Biome"
-run = "bundle exec rake lint"
+[tasks."conformance:ts"]
+description = "Walk the conformance corpus on the TS core, both storage modes"
+depends = ["ts:lock_build"]
+dir = "{{config_root}}/impl/ts"
+run = ["npm run --silent conformance", "npm run --silent conformance -- disk"]
+
+# The stepped-THREADED concurrency conformance (spec/design/concurrency-testing.md §4.3), run under
+# the race detector: the same `# format: concurrency` schedules the corpus walk runs sequentially,
+# in the opt-in threaded mode, against the real concurrent code paths. Not in `ci` (it needs the
+# race-instrumented toolchains); run it when touching the shared-handle concurrency model. TS has
+# no threaded mode, so it is not run here.
+[tasks."concurrency:race"]
+description = "Run the stepped-threaded concurrency conformance under the race detector (Go + Rust)"
+run = [
+  "cd impl/go && go test -race -run TestConcurrencySchedulesThreaded ./cmd/conformance",
+  "cargo test --bin conformance --manifest-path impl/rust/Cargo.toml",
+]
+
+# --- Unit suites --------------------------------------------------------------------------------
+# Each core's per-language unit + integration suite: the checks the corpus CANNOT express
+# (CLAUDE.md §10). Rust runs RELEASE for the same depth_limit native-stack reason as conformance.
+
+[tasks.unit]
+description = "Run every core's per-language unit + integration suite"
+run = [{ task = "unit:rust" }, { task = "unit:go" }, { task = "unit:ts" }]
+
+[tasks."unit:rust"]
+description = "Run the Rust core's unit + integration tests (release)"
+run = "cargo test --release --manifest-path impl/rust/Cargo.toml"
+
+[tasks."unit:go"]
+description = "Run the Go core's unit tests"
+dir = "{{config_root}}/impl/go"
+run = "go test ./..."
+
+[tasks."unit:ts"]
+description = "Run the TS core's unit tests"
+depends = ["ts:lock_build"]
+dir = "{{config_root}}/impl/ts"
+run = "npm run --silent test"
+
+# --- Host programs and artifacts ---------------------------------------------------------------
+# The jed CLI (spec/design/cli.md) is a standalone crate so its TUI dependencies never enter the
+# zero-dep cores. jed-migrate (/migrate/design.md) is a consumer of the engine, one package per
+# core, verified against the shared /migrate/testdata corpus. Both run in `test`.
+
+[tasks."cli:build"]
+description = "Build the jed CLI (release) to cli/target/release/jed"
+run = "cargo build --release --manifest-path cli/Cargo.toml"
+
+[tasks."cli:test"]
+description = "Run the jed CLI's unit + end-to-end golden tests"
+run = "cargo test --manifest-path cli/Cargo.toml"
+
+[tasks."migrate:test"]
+description = "Run the jed-migrate packages' tests on all three cores (Go + Rust + TS)"
+run = [{ task = "migrate:test:go" }, { task = "migrate:test:rust" }, { task = "migrate:test:ts" }]
+
+[tasks."migrate:test:go"]
+description = "Run the Go jed-migrate package's tests"
+dir = "{{config_root}}/migrate/go"
+run = "go test ./..."
+
+[tasks."migrate:test:rust"]
+description = "Run the Rust jed-migrate crate's tests"
+run = "cargo test --manifest-path migrate/rust/Cargo.toml"
+
+[tasks."migrate:test:ts"]
+description = "Run the TS jed-migrate package's tests (bare Node via type-stripping — no install)"
+depends = ["ts:lock_build"]
+run = "node --test migrate/ts/tests/*.test.ts"
+
+[tasks."ruby:build"]
+description = "Build the Ruby gem's native extension cdylib (release) to impl/ruby/ext/target/release"
+run = "cargo build --release --manifest-path impl/ruby/ext/Cargo.toml"
+
+[tasks."node:test"]
+description = "Build and run the experimental native Node/Rust package seam tests"
+depends = ["node:build"]
+run = "node --test impl/node/test/*.test.ts"
 
 # --- Oracle (the live PostgreSQL differential oracle) ------------------------------------------
-# Corpus expectations are calibrated to the profile in spec/conformance/oracle_profile.toml; these
-# provision and inspect the server that has to match it.
+# Corpus expectations are calibrated to the profile in spec/conformance/oracle_profile.toml: the
+# locale provider, tzdata, and a dozen session GUCs change what PostgreSQL answers — in VALUES, not
+# just formatting. Cluster facts are ASSERTED at connect (every corpus:*/rqg:* task gets this
+# through PgOracle); session settings are APPLIED in each probe's preamble.
 
 [tasks."oracle:setup"]
 description = "Create/verify the oracle database declared in the profile"
-run = "bundle exec rake oracle:setup"
-
-[tasks."conformance:spill"]
-description = "Shared corpus on all three cores with forced file spill"
-run = "bundle exec rake conformance:spill"
-
-[tasks."conformance:query_memory"]
-description = "Shared corpus on all three cores with query-memory accounting active"
-run = "bundle exec rake conformance:query_memory"
-
-[tasks."bench:spill"]
-description = "Larger-than-work-memory JOIN, aggregate, and DISTINCT benchmark"
-run = "bundle exec rake bench:spill"
-
-[tasks."oracle:status"]
-description = "Print the declared oracle profile beside the live server's values"
-run = "bundle exec rake oracle:status"
+run = "ruby scripts/oracle_setup.rb"
 
 [tasks."oracle:reset"]
-description = "Drop every replayed object from the oracle database"
-run = "bundle exec rake oracle:reset"
+description = "Drop every replayed object from the oracle database (keeps the database + its locale)"
+run = "ruby scripts/oracle_setup.rb --reset"
+
+[tasks."oracle:status"]
+description = "Print the declared oracle profile beside the live server's values (fails on mismatch)"
+run = "ruby scripts/oracle_status.rb"
+
+[tasks."oracle:check"]
+description = "Assert the live oracle matches the declared profile (exit nonzero on mismatch)"
+run = '''ruby -e 'require "./scripts/lib/pg_oracle"; PgOracle.new(label: "check"); puts "OK: live oracle matches spec/conformance/oracle_profile.toml"' '''
+
+# --- Corpus and RQG tools (CLAUDE.md §7) ---------------------------------------------------------
+# These talk to the LIVE PostgreSQL oracle, never the reference source checkout. psql-only (no `pg`
+# gem). RQG generates random SQL over jed's supported subset and checks it against PG; it is slow
+# and needs the live oracle, so it stays OUTSIDE `ci` — what flows into `ci` is the emitted
+# suites/rqg/*.test.
+
+[tasks."corpus:check"]
+description = "Check a .test's expected output against the live PostgreSQL oracle (no write)"
+usage = 'arg "<file>" help="The .test file to check"'
+run = 'ruby scripts/oracle_import.rb --check "${usage_file}"'
+
+[tasks."corpus:import"]
+description = "Fill a .test's expected output from the live PostgreSQL oracle (writes the file)"
+usage = 'arg "<file>" help="The .test file to fill"'
+run = 'ruby scripts/oracle_import.rb "${usage_file}"'
+
+[tasks."corpus:norec"]
+description = "Generate one metamorphic NoREC seed (SQLancer-style) and run it on Go + TS"
+usage = 'arg "[seed]" help="The seed (default: random)"'
+run = 'ruby scripts/norec_gen.rb ${usage_seed:+"$usage_seed"}'
+
+# A fixed, reproducible sweep of seeds 1..N generated into suites/metamorphic, run once per core,
+# and removed. Runs all THREE cores, so each seed is checked metamorphically (optimized vs full
+# scan agree) AND differentially (the cores agree). Default N=20 (= 100 metamorphic pairs/core).
+[tasks."corpus:norec_sweep"]
+description = "CI sweep: N reproducible NoREC seeds (default 20) on all three cores; fails on any divergence"
+usage = 'arg "[count]" default="20" help="Number of seeds"'
+run = 'ruby scripts/norec_gen.rb --sweep "${usage_count}"'
+
+[tasks."corpus:reduce"]
+description = "Reduce a failing .test to a minimal one (ddmin)"
+usage = '''
+arg "<file>" help="The failing .test file"
+arg "[core]" help="rust, go, or ts (default rust)"
+'''
+run = 'ruby scripts/reduce.rb "${usage_file}" ${usage_core:+--core "$usage_core"}'
+
+[tasks."corpus:reduce_selftest"]
+description = "Self-test the reducer on a fixed synthetic failure (rust-only, oracle-free)"
+run = "ruby scripts/reduce_selftest.rb"
+
+[tasks."rqg:run"]
+description = "Run one RQG case across every shape; check vs PG, no corpus emit"
+usage = 'arg "[seed]" default="1" help="The seed"'
+run = 'ruby scripts/rqg_gen.rb "${usage_seed}"'
+
+[tasks."rqg:sweep"]
+description = "RQG sweep: N seeds vs PG; flag + reduce divergences, no corpus emit"
+usage = 'arg "[count]" default="200" help="Number of seeds"'
+run = 'ruby scripts/rqg_gen.rb --sweep "${usage_count}"'
+
+[tasks."rqg:emit"]
+description = "RQG sweep + emit curated/capped/deduped agreements to suites/rqg/"
+usage = 'arg "[count]" default="300" help="Number of seeds"'
+run = 'ruby scripts/rqg_gen.rb --sweep "${usage_count}" --emit'
+
+[tasks."rqg:replay"]
+description = "Reproduce one RQG case"
+usage = '''
+arg "<seed>" help="The seed"
+arg "[shape]" help="Restrict to this shape"
+'''
+run = 'ruby scripts/rqg_gen.rb "${usage_seed}" ${usage_shape:+--shapes "$usage_shape"}'
+
+[tasks."rqg:reduce"]
+description = "Reduce a flagged RQG .test to a minimal one (ddmin)"
+usage = '''
+arg "<file>" help="The flagged .test file"
+arg "[core]" help="rust, go, or ts (default rust)"
+'''
+run = 'ruby scripts/reduce.rb "${usage_file}" ${usage_core:+--core "$usage_core"}'
+
+# --- Benchmarks (spec/design/benchmarks.md; OUTSIDE ci) ------------------------------------------
+# bench:build/setup/run/node_compare/durability/durable_commit live in mise-tasks/bench/.
+
+[tasks."bench:report"]
+description = "Aggregate a results dir into a comparison table (default: newest)"
+usage = 'arg "[dir]" help="The results directory"'
+run = 'ruby scripts/bench_report.rb ${usage_dir:+"$usage_dir"}'
+
+[tasks."bench:html"]
+description = "Static HTML report for a results dir (default: newest, diffed against the previous run)"
+usage = '''
+arg "[dir]" help="The results directory"
+arg "[baseline]" help="The results directory to diff against"
+'''
+run = 'ruby scripts/bench_html.rb ${usage_dir:+"$usage_dir"} ${usage_baseline:+"$usage_baseline"}'
+
+[tasks."bench:markdown"]
+description = "Markdown report to stdout + <dir>/report.md (default: newest, diffed against the previous run)"
+usage = '''
+arg "[dir]" help="The results directory"
+arg "[baseline]" help="The results directory to diff against"
+'''
+run = 'ruby scripts/bench_markdown.rb ${usage_dir:+"$usage_dir"} ${usage_baseline:+"$usage_baseline"}'
+
+[tasks."bench:diff"]
+description = "Machine-readable JSONL diff of two runs (default: newest vs previous)"
+usage = '''
+arg "[dir]" help="The results directory"
+arg "[baseline]" help="The results directory to diff against"
+'''
+run = 'ruby scripts/bench_diff.rb ${usage_dir:+"$usage_dir"} ${usage_baseline:+"$usage_baseline"}'
+
+[tasks."bench:spill"]
+description = "Compare bounded JOIN/aggregate/DISTINCT with unlimited work_mem (larger than work memory)"
+usage = '''
+arg "[rows]" help="Rows per input"
+arg "[width]" help="Payload width in bytes"
+arg "[budget]" help="work_mem budget in bytes"
+'''
+run = 'ruby scripts/spill_bench.rb ${usage_rows:+"$usage_rows"} ${usage_width:+"$usage_width"} ${usage_budget:+"$usage_budget"}'
 
 # --- Bootstrap ---------------------------------------------------------------------------------
 
@@ -144,23 +385,18 @@ run = [
   "bundle install",
   "npm ci --silent --prefix impl/ts",
   "npm ci --silent --prefix web",
-  "bundle exec rake dev:ports:ensure",
+  { task = "dev:ports:ensure" },
   # The WASM bench target (bench/ts/src/bench-wasm.ts drives the core compiled to wasm32-wasip1).
   # rustup state lives in the container's home, NOT on the persist volume, so a devcontainer
-  # rebuild silently loses this and `rake bench:run` then fails on a cargo target error. It was a
-  # documented manual step; bootstrap is where it belongs. Tolerant of a non-rustup toolchain.
-  "command -v rustup >/dev/null && rustup target add wasm32-wasip1 || echo 'skip: no rustup; add the wasm32-wasip1 target manually for rake bench:*'",
+  # rebuild silently loses this and `mise run bench:run` then fails on a cargo target error. It was
+  # a documented manual step; bootstrap is where it belongs. Tolerant of a non-rustup toolchain.
+  "command -v rustup >/dev/null && rustup target add wasm32-wasip1 || echo 'skip: no rustup; add the wasm32-wasip1 target manually for bench:*'",
 ]
-
-# --- Per-worktree ports ------------------------------------------------------------------------
-# A git worktree is the native equivalent of a second devcontainer instance; these give it a
-# private group of TCP ports so several checkouts can serve simultaneously. The allocation is
-# port-tamer's (port-tamer.toml); scripts/devenv.rb drives it and derives PGHOST.
 
 [tasks."dev:browsers"]
 description = "Install the Chromium build the browser e2e suites drive (impl/ts + web)"
 # Separate from dev:init because it is a ~150 MB download that only the two Playwright suites need
-# — `rake ci` does not. --with-deps installs OS packages via apt and exists only on Linux, so it is
+# — `ci` does not. --with-deps installs OS packages via apt and exists only on Linux, so it is
 # applied there and omitted elsewhere; on macOS the browser bundle is self-contained.
 run = '''
 if [ "$(uname -s)" = "Linux" ]; then deps="--with-deps"; else deps=""; fi
@@ -171,22 +407,38 @@ for dir in impl/ts web; do (cd "$dir" && npx playwright install $deps chromium);
 description = "Start this checkout's long-running services (PostgreSQL oracle) under process-compose"
 run = "ruby scripts/dev.rb"
 
-[tasks."db:init"]
-description = "Create this checkout's PostgreSQL cluster under .dev/postgres (idempotent)"
-run = "bundle exec rake db:init"
+# --- Per-worktree ports ------------------------------------------------------------------------
+# A git worktree is the native equivalent of a second devcontainer instance; these give it a
+# private group of TCP ports so several checkouts can serve simultaneously. The allocation is
+# port-tamer's (port-tamer.toml); scripts/devenv.rb drives it and derives PGHOST.
 
-[tasks."db:psql"]
-description = "psql against this checkout's cluster"
-run = "bundle exec rake db:psql"
-
-[tasks."dev:ports"]
+[tasks."dev:ports:show"]
 description = "Print this worktree's TCP port allocation and whether each port is listening"
-run = "bundle exec rake dev:ports:show"
+alias = "dev:ports"
+run = "ruby scripts/devenv.rb show"
 
 [tasks."dev:ports:ensure"]
 description = "Allocate this worktree's ports if it has none (idempotent)"
-run = "bundle exec rake dev:ports:ensure"
+run = "ruby scripts/devenv.rb ensure"
 
 [tasks."dev:ports:overwrite"]
 description = "Move this worktree to a different port group (stop its services first)"
-run = "bundle exec rake dev:ports:overwrite"
+run = "ruby scripts/devenv.rb overwrite"
+
+# --- This checkout's PostgreSQL cluster (scripts/devdb.rb) --------------------------------------
+# One cluster per checkout, not databases inside a shared server: destructive resets stay local
+# and two checkouts run at once. The SERVER runs in the foreground under process-compose
+# (process-compose.yaml); these are the one-shot half.
+
+[tasks."db:init"]
+description = "Create this checkout's PostgreSQL cluster under .dev/postgres (idempotent)"
+run = "ruby scripts/devdb.rb init"
+
+[tasks."db:psql"]
+description = "psql against this checkout's cluster"
+raw = true
+run = "ruby scripts/devdb.rb psql"
+
+[tasks."db:reset"]
+description = "Destroy this checkout's cluster and re-init (destructive; CONFIRM=yes)"
+run = "ruby scripts/devdb.rb reset"

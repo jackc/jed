@@ -65,8 +65,8 @@ evaluate them. A generated descriptor never contains executable comparison logic
   `@generated … DO NOT EDIT` header (Go uses the canonical `// Code generated … DO NOT EDIT.`
   form). They are checked in — not generated during build — because none of the cores has a
   build step (Go and TS run from source; Rust has no `build.rs`). Regenerate with
-  `rake codegen`.
-- **Drift gate.** `rake verify` runs `gen_catalog.rb --check`, which regenerates in memory
+  `mise run codegen`.
+- **Drift gate.** `mise run verify` runs `gen_catalog.rb --check`, which regenerates in memory
   and byte-compares against the checked-in files, failing if any is stale. This is the
   guarantee that the committed source always equals the catalog.
 - **Per-core cross-check.** Each core's `spec_constants` test compiles the generated table

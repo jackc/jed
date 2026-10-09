@@ -377,7 +377,7 @@ representation/residency changes ride byte-invisibly on top:
   the single Packed read path (correctness no longer rides on the static touched set). *No format
   bump.*
 
-**Benchmarks — once, after B4.** Pin baseline numbers (`rake bench:run`) on the pre-B1 master,
+**Benchmarks — once, after B4.** Pin baseline numbers (`mise run bench:run`) on the pre-B1 master,
 then re-run the storage-touching bench families (point lookup, scans/aggregates, insert/commit,
 `in_list_*`, `index_range`, `concurrent_read`, the window benches) after B4 and report both
 numbers per [CLAUDE.md §10](../../CLAUDE.md). Deliberately **not per-slice**: B1–B3 are

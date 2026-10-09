@@ -1,0 +1,15 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Clone/refresh reference mirrors and check out worktrees into references/ (multi-GB; CLAUDE.md §12)"
+
+require_relative "../../scripts/lib/references"
+
+FileUtils.mkdir_p(References::MIRROR_ROOT)
+FileUtils.mkdir_p(References::WORKTREE_ROOT)
+References.each_repo do |repo|
+  References.ensure_mirror(repo)
+  References.ensure_worktree(repo)
+end
+puts
+puts "Done. Reference sources are in #{References::WORKTREE_ROOT}"
+References.print_status

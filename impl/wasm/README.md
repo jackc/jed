@@ -26,7 +26,7 @@ spill-target seam lands, while ordinary database paging continues through the pr
 ```
 rustup target add wasm32-wasip1        # once
 cargo build --release --target wasm32-wasip1 --manifest-path impl/wasm/Cargo.toml
-# or: rake bench:build   (builds this alongside the other bench engines)
+# or: mise run bench:build   (builds this alongside the other bench engines)
 ```
 
 Output: `impl/wasm/target/wasm32-wasip1/release/jed_wasm.wasm`.

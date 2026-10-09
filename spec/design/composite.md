@@ -237,7 +237,7 @@ writer's pending catalog under the single-writer staging model (CLAUDE.md §3) �
   `\` → `\\` (rowtypes.c `record_out` — *not* backslash-escaping; the oracle corrected the initial
   S3 `\"` rendering). A **NULL** field renders as the empty string between delimiters (unquoted).
   The renderer recurses for nested composites. This is the determinism/oracle surface — it equals
-  PG byte-for-byte (CLAUDE.md §8), verified by `rake corpus:check`.
+  PG byte-for-byte (CLAUDE.md §8), verified by `mise run corpus:check`.
 - **`record_in`** (✅ S6) parses `(…)` into fields (top-level commas, respecting quotes/escapes/
   nesting) and recursively coerces each token to its field type — an empty **unquoted** token is
   NULL, `""` is the empty text string, `""`→`"` and `\x`→`x` un-escape inside quotes. It is the
@@ -300,7 +300,7 @@ and are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle
 ## 12. Delivery (sub-slices)
 
 Composite types are **not a single vertical slice**. They land as ordered, independently-shippable
-sub-slices, each passing `rake ci`: **S0** ✅ spec + the CLAUDE.md §4/§5 open-type-system revision +
+sub-slices, each passing `mise run ci`: **S0** ✅ spec + the CLAUDE.md §4/§5 open-type-system revision +
 decisions + error codes (this doc); **S1** ✅ the open-`Type` refactor as a behavior-preserving no-op;
 **S2** ✅ `CREATE`/`DROP TYPE` + the catalog type-definition section + `format_version` 9 + goldens —
 the composite **type** is created, dropped, and persisted; **S3** ✅ a storable composite **column**
@@ -315,7 +315,7 @@ now allows same-arity, field-comparable composites; `42804` otherwise), the non-
 assumption), the `ORDER BY` lexicographic total-order arm, and DISTINCT/GROUP BY composite keys (the
 value Hash/Eq from S3); the S5 corpus rows are PG-verified; no format change; **S6** ✅ the PG-exact
 `record_out` (`"`→`""`, `\`→`\\` doubling) + `record_in` (`'(…)'::type` / `type '(…)'`,
-string-literal→composite) + the oracle check — `rake corpus:check` regenerates `composite.test`
+string-literal→composite) + the oracle check — `mise run corpus:check` regenerates `composite.test`
 byte-identically from live PG (two documented comparison-error-code overrides); no format change.
 **The composite-types feature is complete (S0–S6).**
 

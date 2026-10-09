@@ -43,5 +43,5 @@ func WriteSidecar(dataDir, dataset, engine, fingerprint string) error {
 
 // StaleErr is the uniform abort for a fingerprint mismatch (§5).
 func StaleErr(dataset, engine string) error {
-	return fmt.Errorf("stale benchmark data for %s/%s: run 'rake bench:setup'", dataset, engine)
+	return fmt.Errorf("stale benchmark data for %s/%s: run 'mise run bench:setup'", dataset, engine)
 }

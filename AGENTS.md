@@ -198,7 +198,7 @@ whole-engine memory guarantee. Host extensions remain outside these guarantees.
 ## Local References And Heavy Operations
 
 - Do not automatically provision or update `references/`.
-- Never run `rake references:setup`, `rake references:update`, or any large
+- Never run `mise run references:setup`, `mise run references:update`, or any large
   download on your own initiative.
 - If reference sources are missing, work without them or ask the user.
 - The PostgreSQL oracle is this checkout's own cluster (`.dev/postgres`), started by
@@ -210,9 +210,9 @@ whole-engine memory guarantee. Host extensions remain outside these guarantees.
 - The oracle's configuration is declared in `spec/conformance/oracle_profile.toml`
   (cluster facts asserted at connect, session GUCs applied per probe). A mismatch
   aborts. Changing a profile value changes what the oracle answers, so treat it as a
-  spec edit and re-run `corpus:check`. `rake oracle:status` shows declared vs live.
+  spec edit and re-run `corpus:check`. `mise run oracle:status` shows declared vs live.
 - Corpus probes run against the dedicated `jed_oracle` database (builtin `C.UTF-8`
-  provider, whose ordering is jed's `C` collation). `rake oracle:setup` provisions it;
+  provider, whose ordering is jed's `C` collation). `mise run oracle:setup` provisions it;
   the harness passes `-d`, so bare `psql` is `psql -d jed_oracle` for corpus work.
 
 ## Coding Style
@@ -221,16 +221,19 @@ whole-engine memory guarantee. Host extensions remain outside these guarantees.
 - In Rust, avoid unnecessary macro magic and deep generics.
 - In Go, avoid unnecessary interfaces and abstraction layers.
 - Keep modules flat, well named, and single purpose.
-- Prefer Ruby and Rake for scripts, task orchestration, codegen drivers, and
-  automation. Use shell or Make only when clearly better for the job.
-- Long-running services live in `process-compose.yaml`, one-shot work in mise/rake
+- Prefer Ruby for scripts, codegen drivers, and automation. Use shell only when
+  clearly better for the job.
+- Long-running services live in `process-compose.yaml`, one-shot work in mise
   tasks. `mise run dev` starts this checkout's stack (its own PostgreSQL cluster
   under `.dev/postgres`); `mise run dev:ports` shows its allocated ports. Corpus and
   benchmark work needs that stack running.
-- `mise run <task>` is the entry point, `rake <task>` the implementation: `mise.toml`
-  wraps the Rake surface so the same commands work natively, in the devcontainer, and
-  in CI. Put new logic in the Rakefile; surface it in `mise.toml` when it should be
-  reachable without knowing Rake is underneath.
+- `mise run <task>` is the only task runner (there is no Rakefile). Composite and
+  one-line tasks live in `mise.toml`; a task with real logic is an executable Ruby
+  script under `mise-tasks/` (`mise-tasks/bench/run` is `bench:run`). `mise tasks`
+  lists them; `mise run <task> --help` shows arguments. `mise run` loads this
+  checkout's `PGHOST`/`PGPORT`, so invoke tasks through it rather than running the
+  scripts behind them directly. Composite tasks sequence steps with `{ task = … }`
+  entries, because mise runs `depends` in parallel.
 
 ## Website And Docs
 
@@ -264,6 +267,6 @@ whole-engine memory guarantee. Host extensions remain outside these guarantees.
 4. Add per-core unit tests only for behavior outside corpus reach.
 5. Update specs, TODO, website docs, and examples when user-facing behavior or
    standing design changes.
-6. Run the relevant verification. Prefer `rake ci` for broad confidence and
-   narrower Rake tasks or per-core tests for scoped changes.
+6. Run the relevant verification. Prefer `mise run ci` for broad confidence and
+   narrower mise tasks or per-core tests for scoped changes.
 7. Report what changed, what was verified, and any remaining gaps.

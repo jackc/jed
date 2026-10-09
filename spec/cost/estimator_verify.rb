@@ -2,7 +2,7 @@
 # frozen_string_literal: true
 
 # Validate the mechanical plan-estimator facts (estimator.toml). Test-time only; run through
-# `rake verify`. This checks constants and total tie orders, never planner control flow — the
+# `mise run verify`. This checks constants and total tie orders, never planner control flow — the
 # estimator stays hand-written in every core (CLAUDE.md §5, estimator.md).
 
 require "bundler/setup"

@@ -7,9 +7,9 @@ is the binding tax — the FFI round-trip, result marshalling, value coercion, a
 allocation. Canonical design: [spec/design/benchmarks.md §7.1](../../spec/design/benchmarks.md).
 
 ```sh
-rake bench:setup     # generate the databases once (heavy: 1M rows) — same datasets the core uses
-rake bench:run       # runs every harness incl. jed/ruby/wrap; bench:report shows the columns
-rake "bench:run[point_lookup]"   # filter to the cheap, overhead-revealing benches
+mise run bench:setup # generate the databases once (heavy: 1M rows) — same datasets the core uses
+mise run bench:run   # runs every harness incl. jed/ruby/wrap; bench:report shows the columns
+mise run bench:run point_lookup # filter to the cheap, overhead-revealing benches
 ```
 
 In the report, read the overhead off the `jed/ruby/wrap` column minus the `jed/rust/core` column,
@@ -36,5 +36,5 @@ and hide it.
 - `test/vectors_test.rb` — pins the PRNG + checksum to the shared cross-language vectors (the
   agreement contract). Run: `mise exec -- ruby bench/ruby/test/vectors_test.rb`.
 
-No build step beyond the gem's native extension (`rake ruby:build`, done by `rake bench:build`).
-Deliberately **outside `rake ci`** — wall-clock is nondeterministic (CLAUDE.md §10).
+No build step beyond the gem's native extension (`mise run ruby:build`, done by `mise run bench:build`).
+Deliberately **outside `mise run ci`** — wall-clock is nondeterministic (CLAUDE.md §10).

@@ -7,7 +7,7 @@
 // incomplete engine reads as "fewer tests run" (spec/design/conformance.md §3).
 //
 // Needs no TOML: the per-impl gate is the file's `# requires:` header vs this core's
-// declared capability set; the manifest/profile data is validated by `rake verify`.
+// declared capability set; the manifest/profile data is validated by `mise run verify`.
 package main
 
 import (
@@ -760,7 +760,7 @@ func assertTypes(expected []string, actual []string, sql string) error {
 // runFile runs all records in one .test file against a fresh database, driving the public single-handle
 // *Database (its default autocommit session — the back-compat bridge, spec/design/session.md §2.1).
 // peakSink is the open output of JED_CONFORMANCE_QUERY_MEMORY_PEAKS (the per-record query-memory
-// peak mode, rake conformance:query_memory), or nil; peakRel is the file being walked.
+// peak mode, mise run conformance:query_memory), or nil; peakRel is the file being walked.
 var (
 	peakSink *os.File
 	peakRel  string
@@ -882,7 +882,7 @@ func runFile(text string, disk bool) error {
 	var pendingScalarBytes *int64
 	var pendingQueryMemory *int64
 	recordOrdinal := 0
-	// The whole-corpus accounting mode (`rake conformance:query_memory`): a budget applied to every
+	// The whole-corpus accounting mode (`mise run conformance:query_memory`): a budget applied to every
 	// record without its own directive, so every query shape exercises the accounting.
 	var queryMemoryDefault int64
 	if v := os.Getenv("JED_CONFORMANCE_QUERY_MEMORY"); v != "" {

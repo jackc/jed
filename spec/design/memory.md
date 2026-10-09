@@ -794,7 +794,7 @@ bounded overshoot of at most one extra page per resident leaf.
   reclamation, so a commit is rejected `54P06` and succeeds once the reader closes.
   Per-core tests cover the host API: setting on `create`/`attach`, the runtime
   setter, `0A000` on file backings, and multi-root rejection publishing nothing.
-  `rake conformance:query_memory` also records each record's final in-memory
+  `mise run conformance:query_memory` also records each record's final in-memory
   `storage_bytes` and fails unless all cores agree. That cross-core check is what
   backs the §8.4 claim, the same way peak balances back Q1–Q3.
 - **Q4b — documentation only (landed).** Public docs ([resource-limits](../../web/src/routes/docs/api/resource-limits/+page.md))
@@ -812,7 +812,7 @@ per-core tests for host-API collectors and cursor lifetimes. Documentation state
 which owners are covered; `max_query_memory_bytes` must not be described as a
 process or heap limit.
 
-`rake conformance:query_memory` runs the whole corpus with accounting active in
+`mise run conformance:query_memory` runs the whole corpus with accounting active in
 both storage modes, and once more on disk with `work_mem` forced low so every
 spill-capable structure spills. Each core records every record's **peak balance**
 (its minimal passing budget) and the task fails unless all cores agree on every

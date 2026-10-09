@@ -2,7 +2,7 @@
 //! (spec/design/concurrency-testing.md §6): the parallelism-stress format. Unlike the Layer 1/2
 //! `# format: concurrency` schedules (an explicit total order, run inside the conformance harness),
 //! a `stress/*.stress.toml` file has NO order — writers and readers run concurrently and
-//! correctness is checked by INVARIANTS, not a transcript. It is bench-family (outside `rake ci`):
+//! correctness is checked by INVARIANTS, not a transcript. It is bench-family (outside `mise run ci`):
 //! timing-nondeterministic, but its answers are still checked (the confluent final state + a
 //! cross-core answer checksum). Lives in the bench package so it reuses the shared splitmix64 PRNG
 //! and the FNV-1a answer checksum (benchmarks.md §6) with no new dependency.

@@ -3,7 +3,7 @@
 // Operator + aggregate descriptor tables (CLAUDE.md §5: the codegen "middle path").
 // This is DATA only — the parser, executor, and the eq3/lt3 evaluation logic that
 // CONSUME it are hand-written (§5 forbids codegenning those). Regenerate with
-// `rake codegen`; `rake verify` fails if this file is stale. Reasoning:
+// `mise run codegen`; `mise run verify` fails if this file is stale. Reasoning:
 // ../../../spec/design/codegen.md.
 
 /// One operator's metadata, mirroring a `[[operator]]` entry in catalog.toml.

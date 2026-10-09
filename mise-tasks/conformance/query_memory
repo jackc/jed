@@ -1,0 +1,65 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Run the shared SQL corpus on all cores with query-memory accounting active"
+#USAGE arg "[bytes]" help="The query-memory budget in bytes (default 1 TiB: huge but active)"
+#USAGE arg "[filter]" help="Run only corpus files whose path contains this substring"
+
+# The whole-corpus query-memory accounting mode (spec/design/memory.md §5): every record without its
+# own `# max_query_memory_bytes:` runs under a huge but ACTIVE budget, so every query shape exercises
+# the reserve/release sites; each core's runner fails a record whose releases exceed its
+# reservations. Results, errors, and costs must be unchanged. Both storage modes, since the eager
+# and bounded-spill lanes account differently.
+#
+# Each core also writes every record's PEAK balance (JED_CONFORMANCE_QUERY_MEMORY_PEAKS) — the
+# minimal budget under which that record passes — and the task fails unless the three cores agree
+# on every record's peak in each mode: the whole corpus becomes the cross-core check of the
+# reserve/release sites, not only the records that pin a threshold (memory.md §9). Each line also
+# carries main's committed storage bytes after the record, so the same comparison checks that the
+# cores allocate and compact pages identically — the basis of the 54P06 limit (memory.md §8.4).
+
+require "tmpdir"
+require_relative "../../scripts/lib/tasks"
+include Tasks
+
+# Compare the per-record peaks the three runners wrote for one storage mode: each line is
+# file<TAB>record-ordinal<TAB>peak<TAB>main-storage-bytes. A record a core did not run (a capability
+# skip) is compared only among the cores that ran it.
+def peak_mismatches(mode, paths)
+  tables = paths.transform_values do |path|
+    next {} unless File.exist?(path)
+
+    File.readlines(path, chomp: true).to_h do |line|
+      file, ordinal, peak, storage = line.split("\t")
+      [[file, ordinal.to_i], "peak=#{peak} storage=#{storage}"]
+    end
+  end
+  tables.values.flat_map(&:keys).uniq.sort.filter_map do |key|
+    seen = tables.filter_map { |core, table| [core, table[key]] if table.key?(key) }.to_h
+    next if seen.values.uniq.size <= 1
+
+    "#{mode} #{key[0]} record #{key[1]}: " + seen.map { |core, peak| "#{core}: #{peak}" }.join("; ")
+  end
+end
+
+env = { "JED_CONFORMANCE_QUERY_MEMORY" => ENV["usage_bytes"] || "1099511627776" }
+env["JED_CONFORMANCE_FILTER"] = ENV["usage_filter"] if ENV["usage_filter"]
+Dir.mktmpdir("jed-query-memory-peaks") do |dir|
+  mismatches = []
+  # The third pass forces every spill-capable structure on disk to spill (work_mem 256), so the
+  # spill transitions' releases are cross-checked too (memory.md §6.6).
+  { "memory" => {}, "disk" => {}, "disk-spill" => { "JED_CONFORMANCE_WORK_MEM" => "256" } }.each do |mode, mode_env|
+    extra = mode.start_with?("disk") ? ["disk"] : []
+    peaks = %w[rust go ts].to_h { |core| [core, File.join(dir, "#{mode}-#{core}.tsv")] }
+    peak_env = ->(core) { env.merge(mode_env, "JED_CONFORMANCE_QUERY_MEMORY_PEAKS" => peaks[core]) }
+    sh "cargo", "run", "--release", "--quiet", "--bin", "conformance", "--manifest-path", RUST_MANIFEST, "--", *extra,
+       env: peak_env.("rust")
+    sh "go", "run", "./cmd/conformance", *extra, env: peak_env.("go"), chdir: GO_DIR
+    sh "node", "src/bin/conformance.ts", *extra, env: peak_env.("ts"), chdir: TS_DIR
+    mismatches.concat(peak_mismatches(mode, peaks))
+  end
+  unless mismatches.empty?
+    warn mismatches.first(50).join("\n")
+    abort "query-memory peaks disagree across cores on #{mismatches.size} record(s)"
+  end
+  puts "query-memory peaks: all cores agree"
+end

@@ -7,7 +7,7 @@ module RQG
   # SpecData — the canonical shared spec tables the generator samples from (CLAUDE.md §5: generate
   # from data, not hardcoded SQL). Loads the scalar type ranges from spec/types/scalars.toml and the
   # capability registry from spec/conformance/manifest.toml, and validates every capability the
-  # generator might attach to a `# requires:` header actually EXISTS (so `rake verify` never sees an
+  # generator might attach to a `# requires:` header actually EXISTS (so `mise run verify` never sees an
   # orphan cap). The V1 scalar set + per-feature capability map are curated here; the *ranges* come
   # from scalars.toml so they stay in sync with the engine.
   module SpecData

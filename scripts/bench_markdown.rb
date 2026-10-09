@@ -100,7 +100,7 @@ out << "---"
 out << ""
 out << "lower is better · bars are linear within each benchmark · |Δ| under " \
        "#{BenchResults::NOISE_PCT.to_i}% is wall-clock noise (spec/design/benchmarks.md §10) · " \
-       "regenerate: `rake bench:markdown`"
+       "regenerate: `mise run bench:markdown`"
 
 markdown = "#{out.join("\n")}\n"
 out_path = File.join(run_dir, "report.md")

@@ -4,7 +4,7 @@
 > canonical **data** is [../cost/schedule.toml](../cost/schedule.toml) (the unit
 > weights); this doc is the *why* and — because cost is a cross-core contract with no
 > reference implementation (§2) — the precise **accrual rules** every core must obey.
-> The schedule is validated by [../cost/verify.rb](../cost/verify.rb) (`rake verify`).
+> The schedule is validated by [../cost/verify.rb](../cost/verify.rb) (`mise run verify`).
 > The separate, unmetered plan-time consumer of these units is specified in
 > [estimator.md](estimator.md); it owns no private cost weights.
 

@@ -372,7 +372,7 @@ are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle_ove
 ## 11. Delivery (sub-slices)
 
 Sequences are **not a single vertical slice**. They land as ordered, independently-shippable
-sub-slices, each passing `rake ci`:
+sub-slices, each passing `mise run ci`:
 
 - **S0** — this design doc + the error-code registrations + the CLAUDE.md §9 / TODO.md touch + the §5
   determinism divergence recorded. The decisions are ratified spec-first before any core changes.

@@ -112,12 +112,12 @@ A malformed bundle raises `Jed::Error`.
 The native extension is a Rust `cdylib`. From the **repo root**:
 
 ```sh
-rake ruby:build    # compile the cdylib to impl/ruby/ext/target/release
-rake ruby:test     # build + run the minitest seam tests (also part of `rake test` / `rake ci`)
+mise run ruby:build # compile the cdylib to impl/ruby/ext/target/release
+mise run ruby:test # build + run the minitest seam tests (also part of `mise run test` / `mise run ci`)
 ```
 
 The gem locates the compiled library automatically; override with `JED_RUBY_LIB=/path/to/libjed_ruby.so`.
 
-> **Packaging note.** This slice loads the cdylib built by `rake ruby:build`. A self-contained
+> **Packaging note.** This slice loads the cdylib built by `mise run ruby:build`. A self-contained
 > `gem install`-able native gem (via `rb-sys` + precompiled platform gems) is a follow-on —
 > see [spec/design/ruby.md](../../spec/design/ruby.md) §6 and the TODO Phase 9 entry.

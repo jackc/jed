@@ -242,7 +242,7 @@ export function readSidecar(dataDir: string, dataset: string, engine: string): s
 }
 
 export function staleErr(dataset: string, engine: string): Error {
-  return new Error(`stale benchmark data for ${dataset}/${engine}: run 'rake bench:setup'`);
+  return new Error(`stale benchmark data for ${dataset}/${engine}: run 'mise run bench:setup'`);
 }
 
 // --- param stream (benchmarks.md §3: one stream across warmup + measured) ---

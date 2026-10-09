@@ -1,0 +1,14 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Run the real-process shared-file corpus across every Rust/Go/Node pairing"
+#MISE depends=["ts:lock_build"]
+
+# Layer 4 of the concurrency contract (CLAUDE.md §7): spec/conformance/process/*.process.toml drives
+# real Rust/Go/Node actor processes over one shared file. Part of `mise run ci`.
+
+require_relative "../../scripts/lib/tasks"
+include Tasks
+
+sh "cargo", "build", "--release", "--bin", "process_actor", "--manifest-path", RUST_MANIFEST
+sh "go", "build", "-o", File.join(GO_DIR, "process_actor"), "./cmd/process_actor", chdir: GO_DIR
+ruby File.join(ROOT, "scripts/process_conformance.rb")

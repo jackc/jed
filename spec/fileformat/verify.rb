@@ -21,7 +21,7 @@ require "zlib"
 #
 #   ruby spec/fileformat/verify.rb              # verify fixtures/ match the reference
 #   ruby spec/fileformat/verify.rb --generate   # (re)write fixtures/ from the reference
-#   (or: rake verify)
+#   (or: mise run verify)
 #
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 

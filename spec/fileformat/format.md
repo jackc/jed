@@ -1522,7 +1522,7 @@ not by a static golden, because it depends on the commit history.)
 ## Fixtures
 
 [fixtures/](fixtures/) holds byte-exact goldens at `page_size = 256`, generated and checked by
-the independent Ruby reference in [verify.rb](verify.rb) (run via `rake verify`). Each fixture
+the independent Ruby reference in [verify.rb](verify.rb) (run via `mise run verify`). Each fixture
 is the **from-scratch image** of its logical content (built by inserting the rows in the
 listed order, then serialized clean). Fixtures sized to force a **multi-level tree** exercise
 the interior-node format and the split contract.

@@ -58,7 +58,7 @@ aggregation retains its existing fast path.
 The run used Linux x86-64 on an Intel Core Ultra 9 285K, Rust 1.99.0, Go 1.27.1,
 and Node 26.10.0. Raw baseline/current JSONL and workload metadata are retained
 under `bench/results/spill-20261004/{before,after}/`. The shared forced-spill SQL
-corpus is a separate gating check (`rake conformance:spill`, also in `rake ci`);
+corpus is a separate gating check (`mise run conformance:spill`, also in `mise run ci`);
 timings and RSS remain diagnostics. In-memory/OPFS/WASI scratch limitations,
 upstream materializers, final scalar values, result collectors and whole-query
 admission are documented in [spill.md](spill.md) and [memory.md](memory.md).
@@ -748,7 +748,7 @@ runs at Rust speed.”
 The integration gate passed the three core unit suites, shared conformance/cost corpus in memory and
 disk modes, byte-exact goldens and cross-core round trips, Go's full race suite, stepped Rust/Go race
 conformance, every Rust/Go/Node real-process pairing, TS Node/browser/worker typechecks, and the real
-Chromium OPFS durability tests. The full `rake ci` gate also passed, including all core/consumer
+Chromium OPFS durability tests. The full `mise run ci` gate also passed, including all core/consumer
 tests, the 2,280-check cross-core NoREC sweep, and the reducer self-test. No `/web` change is needed
 because SQL and host APIs are unchanged.
 
@@ -762,7 +762,7 @@ The benchmark suite answers two questions, continuously:
    SQLite on the same workload?
 
 This is **wall-clock** measurement and therefore deliberately **outside the conformance
-contract and `rake ci`** (CLAUDE.md §10): timings are environment-relative and
+contract and `mise run ci`** (CLAUDE.md §10): timings are environment-relative and
 nondeterministic, and must never gate a build. What *is* checked — loudly — is the
 **answers**: every result carries a checksum of the returned rows, and the report fails
 if any two engines/cores/drivers disagree for the same benchmark (§6). A benchmark run
@@ -778,7 +778,7 @@ now that the slice-7 convergence (session.md §2.4/§10) gives a shared `Databas
 concurrent reader `Session`s. **Correctness**-under-concurrency is *also* covered, by a
 sibling bench-family harness: the Layer 3 stress runner (`spec/design/concurrency-testing.md`
 §6) shares these modules' machinery (the splitmix64 PRNG, the FNV-1a answer checksum) via a
-`stress` binary per core, run by `rake stress` — see §2.
+`stress` binary per core, run by `mise run stress` — see §2.
 
 ## 2. Layout
 
@@ -793,14 +793,14 @@ bench/
                            #   (concurrency-testing.md §6); reuses the PRNG + checksum below
   data/                    # GITIGNORED: generated {small,large}.{jed,sqlite} + *.fingerprint
   results/                 # GITIGNORED: <UTC-stamp>/<lang>-<binary>.jsonl per run (+ stress/)
-stress/*.stress.toml       # Layer 3 stress workloads (run by `rake stress`)
-scripts/bench_report.rb    # aggregator (rake bench:report)
+stress/*.stress.toml   # Layer 3 stress workloads (run by `mise run stress`)
+scripts/bench_report.rb # aggregator (mise run bench:report)
 ```
 
 PostgreSQL benchmark data lives in this checkout's own PostgreSQL cluster (databases
 `jed_bench_small`, `jed_bench_large`, `jed_bench_scratch`), reached over its Unix socket like the
 oracle — `PGHOST`/`PGPORT` come from `.dev/` via mise, trust auth. The cluster must be running
-(`mise run dev`); `rake bench:setup` creates the databases, so they are regenerable rather than
+(`mise run dev`); `mise run bench:setup` creates the databases, so they are regenerable rather than
 persistent infrastructure.
 
 The corpus is data, the harnesses are code: each harness parses the same two TOML files
@@ -988,10 +988,10 @@ Stored per engine after a successful load:
 - PostgreSQL: row `('fingerprint', <hex>)` in table `_bench_meta(key text PRIMARY KEY,
   value text)` inside each `jed_bench_<dataset>` database.
 
-`bench-setup` (run via `rake bench:setup`) skips any engine/dataset pair whose stored
+`bench-setup` (run via `mise run bench:setup`) skips any engine/dataset pair whose stored
 fingerprint matches; `--force` regenerates unconditionally. **Every harness binary
 verifies the fingerprint before running** and aborts with `stale benchmark data: run
-'rake bench:setup'` on mismatch or absence — a benchmark can never silently run against
+'mise run bench:setup'` on mismatch or absence — a benchmark can never silently run against
 wrong data.
 
 The fingerprint covers `datasets.toml` but **not** jed's on-disk format version: a format
@@ -1132,7 +1132,7 @@ prints **allocations/op** to stderr (deterministic, unlike wall-clock) as a comp
 (`engine=jed, lang=wasm, variant=wrap`). It reuses the TS harness's param stream + FNV-1a checksum
 (`bench/ts/src/lib.ts`), and its answer checksum must match the native cores' — the cross-engine
 checksum gate in `scripts/bench_report.rb` doubles as a **conformance check on the wasm build**. It
-needs Node's preview1 WASI: `node --experimental-wasi-unstable-preview1` (the Rakefile passes it);
+needs Node's preview1 WASI: `node --experimental-wasi-unstable-preview1` (`mise run bench:run` passes it);
 the `.jed` data files open through a WASI preopen of `bench/data`. Because `wasm32-wasip1` has no
 file locking (locking.md §7.3), the harness opens and creates every file with an explicit
 `locking = none` (the ABI's `locking` argument, `impl/wasm/README.md`). Its own process ownership
@@ -1166,7 +1166,7 @@ separate host-artifact crate; neither core manifest changes. The local stripped 
 matrix in [locking.md §8](locking.md), complete value/error/session/host-function APIs, and worker-thread
 guidance for long synchronous calls.
 
-The full 2026-07-16 run is reproducible with `rake bench:node_compare`; a native Rust control was run
+The full 2026-07-16 run is reproducible with `mise run bench:node_compare`; a native Rust control was run
 beside it to distinguish core differences from binding overhead. Selected means:
 
 | Lane | Pure TS | Node/Rust wrap | Direction |
@@ -1276,15 +1276,15 @@ line and emit no result. **Deferred follow-on:** a cross-*engine* concurrent com
 ## 9. Running and reporting
 
 ```
-rake bench:setup        # build + run bench-setup (fingerprint-gated; [force] to override)
-rake bench:run          # build all binaries, run them sequentially, results to
+mise run bench:setup    # build + run bench-setup (fingerprint-gated; --force to override)
+mise run bench:run      # build all binaries, run them sequentially, results to
                         #   bench/results/<UTC-stamp>/, then report + HTML
-rake "bench:run[point_lookup]"   # substring filter, passed through to every binary
-rake bench:report       # re-aggregate the newest (or a given) results dir
-rake bench:html         # static HTML report for the newest (or a given) run dir,
+mise run bench:run point_lookup # substring filter, passed through to every binary
+mise run bench:report   # re-aggregate the newest (or a given) results dir
+mise run bench:html     # static HTML report for the newest (or a given) run dir,
                         #   diffed against the previous run by default
-rake bench:markdown     # the same report as Markdown, to stdout + <dir>/report.md
-rake "bench:diff[a,b]"  # machine-readable JSONL diff of two runs (default: newest
+mise run bench:markdown # the same report as Markdown, to stdout + <dir>/report.md
+mise run bench:diff a b # machine-readable JSONL diff of two runs (default: newest
                         #   vs previous)
 ```
 
@@ -1316,9 +1316,9 @@ like a failing conformance test) or on `fingerprint` (mixed-vintage data):
   partial/filtered runs explicit, plus a trailing `{"summary":…}` line (fingerprints,
   improved/regressed/noise counts at the same 5% floor). `--json` emits one pretty
   document instead; `--fail-over=PCT` exits 2 if any matched pair regressed by more
-  than PCT% — an operator-side regression gate, never part of `rake ci`.
+  than PCT% — an operator-side regression gate, never part of `mise run ci`.
 
-`rake ci` does **not** run benchmarks, and never will (§1).
+`mise run ci` does **not** run benchmarks, and never will (§1).
 
 ## 10. Methodology caveats
 

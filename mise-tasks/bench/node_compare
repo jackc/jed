@@ -1,0 +1,20 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Compare every jed benchmark through pure TS, Node/Rust wrap, and native Rust control"
+#MISE depends=["node:build"]
+#USAGE arg "[filter]" help="Run only benchmarks whose name contains this substring"
+
+require_relative "../../scripts/lib/bench"
+include Tasks
+
+npm_ci_if_stale("bench/ts")
+sh "cargo", "build", "--release", "--quiet", "--manifest-path", "bench/rust/Cargo.toml", "--bin", "bench-jed"
+dir = Bench.results_dir("-node-compare")
+filter = [ENV["usage_filter"]].compact
+args = ->(file) { ["bench/corpus", "bench/data", File.join(dir, file), *filter] }
+
+sh "node", "bench/ts/src/bench-jed.ts", *args.("ts-bench-jed.jsonl")
+sh "node", "bench/ts/src/bench-node-rust.ts", *args.("node-rust-bench-jed.jsonl")
+sh "bench/rust/target/release/bench-jed", *args.("rust-bench-jed.jsonl")
+
+Bench.report(dir, "scripts/bench_markdown.rb")

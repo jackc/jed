@@ -123,7 +123,7 @@ Each doc explains *why* a decision was made and points at the **data** that enco
 - [cli.md](cli.md) — the `jed` CLI host program: the TUI + script runner, output formats, CSV
   import, `--dump`, and `--readonly` (a host of the engine, not a core).
 - [benchmarks.md](benchmarks.md) — the wall-clock benchmark harness comparing the three cores
-  against PostgreSQL and SQLite (deliberately outside `rake ci`, answers still cross-checked).
-- [mutation-testing.md](mutation-testing.md) — mutation-testing the Go core (`rake mutation`,
+  against PostgreSQL and SQLite (deliberately outside `mise run ci`, answers still cross-checked).
+- [mutation-testing.md](mutation-testing.md) — mutation-testing the Go core (`mise run mutation`,
   `impl/go/cmd/mutate`): inject deliberate bugs and check the conformance corpus catches each;
-  a surviving mutant is untested logic, located to a line (an analysis tool, outside `rake ci`).
+  a surviving mutant is untested logic, located to a line (an analysis tool, outside `mise run ci`).

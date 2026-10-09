@@ -1,0 +1,62 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Check core, host-artifact, tooling, and web formatting against pinned tools"
+
+# The formatting gate for cores, host/tooling packages, and web. The formatters are VERSION-PINNED
+# so they are reproducible across contributors; this task is what makes the pins load-bearing.
+# Without a check, formatting silently drifts from the pinned tools (it had, in BOTH the Rust and
+# Go cores, before this gate). The pins, one per surface:
+#   rust              — rustfmt (ships with the mise-pinned Rust toolchain); `cargo fmt`.
+#   go                — gofumpt (mise-pinned go tool); a stricter SUPERSET of gofmt (its output is
+#                       always gofmt-clean too), chosen because mise already pins it.
+#   impl/ts, impl/node, bench/ts, migrate/ts — biome (mise-pinned; biome.json at repo root).
+#                       2-space, lineWidth 100. The @generated TS files
+#                       (operators/costs/ranges_gen/sqlstate) are EXCLUDED there, so the codegen
+#                       drift check (`mise run verify`) stays their single source of truth. Biome's
+#                       LINTER is on with a tailored ruleset, but FORMAT and LINT are separate gates:
+#                       `mise run fmt` runs `biome format` (format only), `mise run lint` runs
+#                       `biome lint` — so a lint finding never blocks the formatter, and vice versa.
+#   web               — prettier + prettier-plugin-svelte (npm devDeps, pinned EXACT in
+#                       web/package.json + lockfile). Formatter output changes between versions, so
+#                       the exact pin is the reproducibility guarantee here — the npm analogue of
+#                       the mise pins above. Config: web/.prettierrc.json. Markdown (mdsvex) is left
+#                       to the author via web/.prettierignore. Self-bootstraps web deps with
+#                       `npm ci` whenever the lockfile changes (Tasks.npm_ci_if_stale).
+# `tsc --noEmit` stays a separate TYPE check (`npm run typecheck` in impl/ts), not a formatter.
+# Kept SEPARATE from `verify`, which is deliberately toolchain-light.
+
+require_relative "../../scripts/lib/tasks"
+include Tasks
+
+CARGO_CRATES = {
+  "rust" => RUST_MANIFEST,
+  "ts-lock" => TS_LOCK_MANIFEST,
+  "cli" => CLI_MANIFEST,
+  "ruby-ext" => RUBY_EXT_MANIFEST,
+  "wasm" => WASM_MANIFEST,
+  "node-wrap" => NODE_WRAP_MANIFEST,
+  "migrate-rust" => MIGRATE_RUST_MANIFEST,
+}.freeze
+TS_FORMAT_DIRS = %w[impl/ts impl/node bench/ts migrate/ts].freeze
+
+failures = []
+
+CARGO_CRATES.each do |name, manifest|
+  failures << name unless sh?("cargo", "fmt", "--check", "--manifest-path", manifest)
+end
+
+# `gofumpt -l` exits 0 even when files differ, so the signal is the printed file list.
+puts "gofumpt -l impl/go migrate/go"
+unformatted = capture("gofumpt", "-l", GO_DIR, MIGRATE_GO_DIR).first.split("\n").map(&:strip).reject(&:empty?)
+unless unformatted.empty?
+  warn "  unformatted: #{unformatted.map { |f| f.delete_prefix("#{ROOT}/") }.join(', ')}"
+  failures << "go"
+end
+
+failures << "ts" unless sh?("biome", "format", *TS_FORMAT_DIRS)
+
+npm_ci_if_stale(WEB_DIR)
+failures << "web" unless sh?("npm", "run", "--silent", "--prefix", WEB_DIR, "format:check")
+
+abort "fmt: needs formatting in #{failures.join(', ')} — run `mise run fmt:fix`" unless failures.empty?
+puts "\nFormatting clean (rust + go + ts + web)."

@@ -4,8 +4,8 @@
 # scripts/oracle_setup.rb — provision the oracle database declared in
 # spec/conformance/oracle_profile.toml. Idempotent: creates it if absent, verifies it if present.
 #
-#   rake oracle:setup   # create if absent, verify if present
-#   rake oracle:reset   # drop every replayed object, keeping the database (and its locale)
+#   mise run oracle:setup # create if absent, verify if present
+#   mise run oracle:reset # drop every replayed object, keeping the database (and its locale)
 #
 # Why a dedicated database rather than the cluster's default `postgres`:
 #
@@ -17,7 +17,7 @@
 #      consults neither glibc nor macOS libc nor ICU, so it answers identically on every host —
 #      which is what keeps the corpus tied to PostgreSQL rather than to one machine's PostgreSQL.
 #   2. ISOLATION. Corpus probes replay CREATE/INSERT into the oracle. A dedicated database keeps
-#      that off the cluster's default and makes a reset cheap (`rake oracle:reset`).
+#      that off the cluster's default and makes a reset cheap (`mise run oracle:reset`).
 #
 # psql-only, like the rest of the oracle path (no `pg` gem — no CLAUDE.md §14 dependency).
 

@@ -312,7 +312,7 @@ pub fn read_sidecar(data_dir: &str, dataset: &str, engine: &str) -> String {
 }
 
 pub fn stale_err(dataset: &str, engine: &str) -> Box<dyn Error> {
-    format!("stale benchmark data for {dataset}/{engine}: run 'rake bench:setup'").into()
+    format!("stale benchmark data for {dataset}/{engine}: run 'mise run bench:setup'").into()
 }
 
 // --- param stream (benchmarks.md §3: one stream across warmup + measured) ---

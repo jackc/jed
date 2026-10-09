@@ -1,0 +1,11 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Fetch latest upstream for all reference mirrors and re-point worktrees"
+
+require_relative "../../scripts/lib/references"
+
+References.each_repo do |repo|
+  abort "mirror missing for #{repo[:name]}; run `mise run references:setup`" unless References.mirror_valid?(repo)
+  References.git_bare(repo, "remote", "update", "--prune")
+  References.ensure_worktree(repo)
+end

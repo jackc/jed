@@ -12,16 +12,16 @@ The driver compares unlimited, forced-spill and default-budget execution across 
 and fails if their results or costs differ. Setup is excluded from query memory
 and timings. Input exceeds the operator budget; this does not assert that it
 exceeds physical machine RAM or that `work_mem` caps process RSS.
-Use `rake 'bench:spill[rows,payload_bytes,work_mem]'` to change scale; raw results
+Use `mise run bench:spill <rows> <payload_bytes> <work_mem>` to change scale; raw results
 and workload metadata go into `bench/results/spill-<timestamp>/`.
 
 ```
-rake bench:setup     # generate benchmark databases (once; fingerprint-gated)
-rake bench:run       # run every harness binary, then print the comparison table + HTML
-rake bench:report    # re-print the newest results
-rake bench:html      # static HTML report (bars, multipliers, Δ vs the previous run)
-rake bench:markdown  # the same report as Markdown (terminal / VS Code preview)
-rake bench:diff      # machine-readable JSONL diff of two runs (newest vs previous)
+mise run bench:setup # generate benchmark databases (once; fingerprint-gated)
+mise run bench:run   # run every harness binary, then print the comparison table + HTML
+mise run bench:report # re-print the newest results
+mise run bench:html  # static HTML report (bars, multipliers, Δ vs the previous run)
+mise run bench:markdown # the same report as Markdown (terminal / VS Code preview)
+mise run bench:diff  # machine-readable JSONL diff of two runs (newest vs previous)
 ```
 
 - `corpus/` — the shared benchmark + dataset definitions (TOML).
@@ -34,6 +34,6 @@ rake bench:diff      # machine-readable JSONL diff of two runs (newest vs previo
   and [ruby/README.md](ruby/README.md).
 - `data/`, `results/` — generated; gitignored.
 
-Wall-clock numbers are environment-relative and deliberately **not** part of `rake ci`
+Wall-clock numbers are environment-relative and deliberately **not** part of `mise run ci`
 or the conformance contract — but every result carries an answer checksum and
 `bench:report` fails on any cross-engine disagreement.

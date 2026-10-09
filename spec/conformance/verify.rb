@@ -3,7 +3,7 @@
 
 # Validate the conformance taxonomy: the manifest (capabilities + profiles) against
 # the corpus (.test files and their `# requires:` declarations). Test-time only
-# (CLAUDE.md §5); run via `rake verify`. Checks, with no engine required:
+# (CLAUDE.md §5); run via `mise run verify`. Checks, with no engine required:
 #
 #   1. every capability a profile lists is a defined capability
 #   2. every profile `includes` names a defined profile (no cycles)

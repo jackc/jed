@@ -2,8 +2,8 @@
 //
 // Cost unit schedule (CLAUDE.md §5, §13: the codegen "middle path"). DATA only — the
 // accrual sites that CONSUME these weights (executor / evaluator / storage reads) are
-// hand-written (§5 forbids codegenning those). Regenerate with `rake codegen`;
-// `rake verify` fails if this file is stale. Reasoning: ../../../spec/design/cost.md.
+// hand-written (§5 forbids codegenning those). Regenerate with `mise run codegen`;
+// `mise run verify` fails if this file is stale. Reasoning: ../../../spec/design/cost.md.
 
 export const DEFAULT_SCALAR_BYTES = 67108864n;
 

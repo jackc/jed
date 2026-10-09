@@ -321,6 +321,9 @@ implementation. Suggested layout:
                         # A NON-CORE CONSUMER (the cli/ + bench/ precedent, §14): links a core in and
                         # drives it through the public host API; no core depends on it. Bundled by the
                         # CLI as `jed migrate`. See /migrate/design.md.
+mise.toml               # pinned tools, this checkout's [env], and the composite/one-line tasks.
+/mise-tasks/            # every task with real logic, as an executable Ruby script named by its
+                        # path (mise-tasks/bench/run is `mise run bench:run`) — §10.
 process-compose.yaml    # the long-running half of a development checkout (the PostgreSQL oracle).
                         # mise runs one-shot work (install/init/test); process-compose supervises
                         # anything that stays alive. `mise run dev` is the launcher. Identical on
@@ -351,27 +354,27 @@ This is the spine of the project. Treat it as the contract, not an afterthought.
   **total order over named read/write sessions** on one shared handle, **deterministic** because
   jed read results depend only on commit order + pin-points, never timing — so every core runs
   the identical schedule (a single-threaded core sequentially; a threaded core may enforce the
-  same order under a race detector). It runs *inside* `rake ci` via the capability gate
+  same order under a race detector). It runs *inside* `mise run ci` via the capability gate
   (`txn.shared`/`txn.read_handle`/`txn.watermark`/`txn.gate_blocking`). True-parallelism **stress**
-  (random schedule, invariant-checked) is the separate bench-family Layer 3, *outside* `rake ci`.
-  **Landed: Layers 1–3, all three cores.** Layers 1–2 run *inside* `rake ci` (stepped-sequential
+  (random schedule, invariant-checked) is the separate bench-family Layer 3, *outside* `mise run ci`.
+  **Landed: Layers 1–3, all three cores.** Layers 1–2 run *inside* `mise run ci` (stepped-sequential
   everywhere = the canonical result; the opt-in stepped-threaded mode on Go + Rust, one
-  thread/goroutine per session under a turn token, run under the race detector by `rake
+  thread/goroutine per session under a turn token, run under the race detector by `mise run
   concurrency:race`). Layer 2 adds the write-gate `open <sid> write blocks` annotation: a writer-open
   on the held single-writer gate, deferred to the gate-releasing step (the equivalent serial order) —
   and on Go/Rust the queued writer's thread parks inside the real `write()` on the gate under the race
   detector, the one concurrency path the sequential walk never exercises. This is what pulls
   concurrency — previously per-core hand-mirrored tests — back into the §2 differential net.
-  **Layer 3 (`rake stress`)** is the bench-family parallel-stress harness, *outside* `rake ci`:
+  **Layer 3 (`mise run stress`)** is the bench-family parallel-stress harness, *outside* `mise run ci`:
   `stress/*.stress.toml` workloads (concurrent writers + readers, no fixed order) run by one stress
   binary per core in the `bench/` modules (reusing the splitmix64 PRNG + FNV answer checksum), checked
   by per-snapshot invariants + a confluent final-state checksum that must agree across cores (Go under
   `-race`, Rust over real threads, TS via a seeded-sequential interleaver).
-  **Layer 4 (`rake concurrency:process`) is landed and release-blocking:** one shared
+  **Layer 4 (`mise run concurrency:process`) is landed and release-blocking:** one shared
   `spec/conformance/process/*.process.toml` corpus drives real Rust/Go/Node actor processes in every
   supported pairing over one file. Explicit barriers, kill hooks, and invariant checks cover the
   shared OS-lock protocol, crash release, meta recovery, and cross-core interoperability. It joins
-  `rake ci` with the `file.shared_process` capability and is release-blocking for shared file access;
+  `mise run ci` with the `file.shared_process` capability and is release-blocking for shared file access;
   this behavior must not live only in three mirrored per-core tests.
 - **Bootstrap the corpus via differential testing against PostgreSQL.** The real PG
   service is the **result oracle** (§1): run a supported-subset query against it, capture
@@ -708,7 +711,7 @@ The design is optimized for AI agents even more than for humans. In practice:
   entries pass." A feature = one SQL construct, parsed + planned + executed + tested, as
   a **vertical slice**. That is the unit of agent work and the unit of cross-language
   porting. When a slice touches the PostgreSQL-comparable surface, oracle-check its rows
-  (`rake corpus:check`) and record any deliberate PG divergence in the override ledger; when it
+  (`mise run corpus:check`) and record any deliberate PG divergence in the override ledger; when it
   adds a query optimization, add a metamorphic (NoREC) relation so the sweep keeps pace —
   neither grows on its own (`spec/design/conformance.md` §5/§8).
 - **Put tests in the corpus by default; write a per-core unit test ONLY for what the corpus
@@ -741,15 +744,15 @@ The design is optimized for AI agents even more than for humans. In practice:
   "host supplies it" boundary. Cost-based planning stays exact: the estimator's inputs, rational
   arithmetic, candidate ties, and bounded search are specified in `spec/design/estimator.md`, and
   plan divergence has no determinism-ledger exception.
-- **Benchmarks are wall-clock, never conformance.** `bench/` (`rake bench:setup/run/report`,
+- **Benchmarks are wall-clock, never conformance.** `bench/` (`mise run bench:setup/run/report`,
   [spec/design/benchmarks.md](spec/design/benchmarks.md)) compares the three cores against
-  PostgreSQL and SQLite. Deliberately **outside `rake ci`** and the conformance contract
+  PostgreSQL and SQLite. Deliberately **outside `mise run ci`** and the conformance contract
   (wall-clock is nondeterministic) — but answers are still checked: every result carries a
   cross-engine checksum and the report fails on any disagreement. When a perf-relevant
   feature lands, **add a benchmark** for it (the same growth obligation as NoREC relations);
   before/after a perf-sensitive change, **run the affected benchmarks** and report both
-  numbers in the change description (`rake bench:diff` emits the before/after comparison
-  as JSONL; `rake bench:html` / `bench:markdown` render a run — with deltas — for humans).
+  numbers in the change description (`mise run bench:diff` emits the before/after comparison
+  as JSONL; `mise run bench:html` / `bench:markdown` render a run — with deltas — for humans).
 - **Keep the website (`/web`) in sync with the surface it documents.** The static SvelteKit site
   (§6) is a tracked downstream consumer of the user-facing surface, like the corpus and benchmarks.
   When a change **adds or alters a user-facing SQL feature or the host/embedding API**, update the
@@ -764,19 +767,23 @@ The design is optimized for AI agents even more than for humans. In practice:
   macro magic. In Go, resist over-interfacing. Flat, well-named, single-responsibility
   modules with small context footprints are easier for agents (and humans) to reason
   over than implicit cleverness.
-- **Prefer Ruby and Rake for scripting and task running** — over bash and Make for
-  build scripts, automation, codegen drivers, and dependency/task orchestration. This is
-  a preference, not a prohibition: reach for bash or Make only when it is a *clearly*
-  better choice for the job (a trivial one-liner, or a tool that specifically expects a
-  Makefile). Ruby's readability keeps automation legible for agents and humans alike,
-  consistent with "boring, explicit code over clever abstraction."
+- **Prefer Ruby for scripting; mise is the task runner** — Ruby over bash and Make for
+  build scripts, automation, and codegen drivers. This is a preference, not a prohibition:
+  reach for bash only when it is a *clearly* better choice for the job (a trivial one-liner).
+  Ruby's readability keeps automation legible for agents and humans alike, consistent with
+  "boring, explicit code over clever abstraction."
 
-  **`mise run <task>` is the entry point; Rake is the implementation.** `mise.toml` declares
-  thin tasks (`ci`, `test`, `verify`, `fmt`, `lint`, `oracle:*`, `dev:init`) that shell out to
-  `bundle exec rake`, so one command set works natively, inside the devcontainer, and in CI —
-  the convergence the native-macOS work is built on. `rake <task>` remains equally valid and is
-  still where the logic lives; new automation goes in the Rakefile, and a task is surfaced in
-  `mise.toml` when it should be reachable without knowing Rake is underneath.
+  **`mise run <task>` is the only entry point; there is no Rakefile.** A task is either a
+  composite or one-line command in `mise.toml`, or — whenever it has real logic — an
+  executable Ruby script under `mise-tasks/` whose path is its name (`mise-tasks/bench/run`
+  is `mise run bench:run`; shared helpers in `scripts/lib/tasks.rb`). `mise tasks` lists them
+  all and `mise run <task> --help` shows a task's arguments (`mise run corpus:check
+  path/to/file.test`, never Rake's bracket syntax). Because `mise run` always loads
+  `mise.toml`'s `[env]` (this checkout's `PGHOST`/`PGPORT`), the same command works natively,
+  inside the devcontainer, in CI, and from an agent's non-interactive shell. One trap: mise
+  runs a task's `depends` in **parallel**, so composite tasks sequence their steps as
+  `{ task = … }` entries in `run` (benchmarks and the real-process locking corpus must never
+  overlap); reserve `depends` for a single build prerequisite.
 - **Spec-first per subsystem.** A subsystem's design doc + the relevant corpus is what an
   agent needs to work it without holding the whole engine in context.
 - **Multiple agent instances; sync through `origin`, not just shared memory.** Several
@@ -786,7 +793,7 @@ The design is optimized for AI agents even more than for humans. In practice:
   (`https://github.com/jackc/jed`) — the **only** upstream (the former private hub is gone), so
   it is the propagation path, and anything pushed there is published. **There is no standing
   push exception:** push a branch or `master` only when the user asks (the harness default).
-  **Merge to `master` only when green** (`rake ci` / verify). **`master` keeps a
+  **Merge to `master` only when green** (`mise run ci` / verify). **`master` keeps a
   strictly linear history — no merge bubbles, ever.** A merge into `master` must be
   fast-forward-only; integrate by **rebasing the feature branch onto the current `master`
   tip** (then ff), or equivalently **squash-merge** or **cherry-pick**. Whatever the
@@ -853,20 +860,20 @@ differential-testing **oracles** (§7) and as **design references** (§8). They 
 committed (the workspace `references/` directory is in `.gitignore`).
 
 > **Do NOT provision the references automatically.** Cloning the mirrors is a multi-GB
-> download (PostgreSQL and DuckDB especially). Never run `rake references:setup` /
+> download (PostgreSQL and DuckDB especially). Never run `mise run references:setup` /
 > `references:update`, or any other large download, on your own initiative — not to
 > "be helpful", not as a side effect of another task. If a reference you need is not
 > present in `references/`, either **work without it** or **ask the user to run
-> `rake references:setup`** (or for permission to). The same rule applies to any
+> `mise run references:setup`** (or for permission to). The same rule applies to any
 > heavy/expensive operation: surface it and let the user decide, don't auto-trigger it.
 
-Provision or refresh them with Rake (§10):
+Provision or refresh them with mise tasks (§10):
 
 ```
-rake references:setup    # clone mirrors (once) + check out worktrees into references/
-rake references:update   # fetch upstream, re-point worktrees
-rake references:status   # list repos, pinned ref, current HEAD
-rake references:clean    # remove worktrees, keep the cached mirrors
+mise run references:setup    # clone mirrors (once) + check out worktrees into references/
+mise run references:update   # fetch upstream, re-point worktrees
+mise run references:status   # list repos, pinned ref, current HEAD
+mise run references:clean    # remove worktrees, keep the cached mirrors
 ```
 
 **Storage model.** A bare `--mirror` clone of each repo lives **outside any checkout**, at a
@@ -896,26 +903,26 @@ still gets its own `references/` worktree, and so keeps the per-checkout ref ind
 | `sqllogictest-rs` | `main` | MIT / Apache-2.0 | Reference Rust sqllogictest runner — useful for `impl/rust`'s harness (§7). |
 
 PostgreSQL also runs **live** as a queryable oracle, separate from this source checkout — and it
-is **this checkout's own cluster**, not a shared server: `.dev/postgres`, created by `rake db:init`
+is **this checkout's own cluster**, not a shared server: `.dev/postgres`, created by `mise run db:init`
 and supervised by process-compose, identically on native macOS and in the devcontainer (`mise run
 dev` starts it; the retired `db` compose service is what this replaced). One cluster per checkout
 means destructive resets stay local and two checkouts run at once. It is reached over a
 **Unix-domain socket** (trust auth) whose port comes from the checkout's own allocation
 (`port-tamer.toml` → `.dev/ports.env`) and whose directory is derived from it (`.dev/derived.env`),
 which also supplies the fixed `PGUSER=postgres` / `PGDATABASE=postgres` libpq defaults; both files
-are loaded by mise — so bare `psql` or `rake
-corpus:check[<repo-root path>]` just works, and **`PGHOST` and `PGPORT` must never be set
+are loaded by mise — so bare `psql` or `mise run corpus:check
+<repo-root path>` just works, and **`PGHOST` and `PGPORT` must never be set
 independently of each other** (one without the other names a real port on the wrong server, and
 libpq then hunts a socket that cannot exist — the recurring foot-gun). Its **configuration is declared data**, not whatever the nearest server defaults to:
 `spec/conformance/oracle_profile.toml` asserts the cluster facts (PG major, locale provider +
 locale, encoding, database) at connect and applies the output-affecting session GUCs (`DateStyle`,
 `IntervalStyle`, `extra_float_digits`, …) in every probe — because those change the oracle's
 *values*, not just its formatting, and an undeclared oracle silently imports different answers
-(`spec/design/conformance.md`; `rake oracle:status`). Corpus probes run against a dedicated
+(`spec/design/conformance.md`; `mise run oracle:status`). Corpus probes run against a dedicated
 `jed_oracle` database on PG 17+'s **platform-independent `builtin` `C.UTF-8` provider** — whose
 code-point ordering *is* jed's single defined `C` collation — so text ordering agrees by
 construction rather than by hand-written override, and the oracle is tied to PostgreSQL rather
-than to one host's glibc/ICU. Provision it with `rake oracle:setup`; the harness connects to it
+than to one host's glibc/ICU. Provision it with `mise run oracle:setup`; the harness connects to it
 explicitly, so bare `psql` (still the cluster default) is `psql -d jed_oracle` for corpus work. The
 cluster also listens on loopback TCP at `PGPORT` for GUI tools, but the socket is the path the
 harnesses use.

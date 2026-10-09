@@ -1,0 +1,13 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Remove worktrees from references/ (keeps the cached mirrors)"
+
+require_relative "../../scripts/lib/references"
+
+References::REPOS.each do |repo|
+  wp = References.worktree_path(repo)
+  next unless References.worktree?(wp)
+
+  puts "removing worktree: #{wp}"
+  References.git_bare(repo, "worktree", "remove", "--force", wp)
+end

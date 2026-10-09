@@ -475,7 +475,7 @@ Sequenced to put the durability-risky part last:
     `suites/concurrency/attach_snapshot_isolation.test` asserts, over an attachment, the same
     cross-database snapshot isolation + watermark + version-advance-on-commit the single-handle 1b path
     was only correct-by-construction for. The threaded cores (Go/Rust) run it under the race detector
-    (`rake concurrency:race`) — a reader pinning `roots.attached` on its own goroutine/thread while a
+    (`mise run concurrency:race`) — a reader pinning `roots.attached` on its own goroutine/thread while a
     writer publishes a fresh attached map — the hardening proof; TS runs it stepped-sequentially.
     Additive tests + a harness extension, no engine change, no `format_version` change.
   - **1c — reframe session-local temp as an implicit in-memory attachment (§6). RESOLVED at the

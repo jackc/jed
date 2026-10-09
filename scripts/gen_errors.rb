@@ -66,7 +66,7 @@ def rust_file(es)
     // SQLSTATE error codes (CLAUDE.md §5, §10: the codegen "middle path"). DATA only — the
     // EngineError scaffolding that CONSUMES these (message assembly, Display, the raise sites
     // through the executor) is hand-written in error.rs (§5 forbids codegenning those).
-    // Regenerate with `rake codegen`; `rake verify` fails if this file is stale. Each variant's
+    // Regenerate with `mise run codegen`; `mise run verify` fails if this file is stale. Each variant's
     // message template + rationale live in spec/errors/registry.toml. Reasoning:
     // ../../../spec/design/codegen.md.
 
@@ -131,7 +131,7 @@ def go_file(es)
     // SQLSTATE error codes (CLAUDE.md §5, §10: the codegen "middle path"). DATA only — the
     // EngineError scaffolding that CONSUMES these (message assembly, Error rendering, the raise
     // sites through the executor) is hand-written in errors.go (§5 forbids codegenning those).
-    // Regenerate with `rake codegen`; `rake verify` fails if this file is stale. Each variant's
+    // Regenerate with `mise run codegen`; `mise run verify` fails if this file is stale. Each variant's
     // message template + rationale live in spec/errors/registry.toml. Reasoning:
     // ../../spec/design/codegen.md.
 
@@ -194,7 +194,7 @@ def ts_file(es)
     // SQLSTATE error codes (CLAUDE.md §5, §10: the codegen "middle path"). DATA only — the
     // EngineError scaffolding that CONSUMES these (message assembly, the raise sites through the
     // executor) is hand-written in errors.ts (§5 forbids codegenning those). Regenerate with
-    // `rake codegen`; `rake verify` fails if this file is stale. Each variant's message template +
+    // `mise run codegen`; `mise run verify` fails if this file is stale. Each variant's message template +
     // rationale live in spec/errors/registry.toml. Reasoning: ../../../spec/design/codegen.md.
     //
     // SqlState is a string-literal union (not a TS enum — the elidable subset forbids enums), and
@@ -249,7 +249,7 @@ def main
 
   if check
     unless stale.empty?
-      stale.each { |rel| warn "STALE: #{rel} — run 'rake codegen'" }
+      stale.each { |rel| warn "STALE: #{rel} — run 'mise run codegen'" }
       exit 1
     end
     puts "OK: #{TARGETS.length} generated files current (#{es.length} error codes)"

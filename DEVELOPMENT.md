@@ -69,7 +69,7 @@ persisted. `port-tamer.toml` declares which ports a checkout needs (append new e
 inserting or reordering renumbers the existing ones); the allocation itself lands in `.dev/`, which
 mise loads. `mise run dev:init` creates it, and `dev:ports:ensure` is idempotent afterwards.
 
-Go builds default to `.dev/go-build` through both mise and Rake, so sandboxed CI does not need
+Go builds default to `.dev/go-build` through mise's `[env]`, so sandboxed CI does not need
 write access to the home-directory cache. An explicit `GOCACHE` takes precedence; if it names a
 read-only location, unset it to use the checkout default or point it at a writable cache.
 
@@ -77,7 +77,7 @@ A listening port never moves an existing allocation — it may well belong to th
 running services. When two checkouts genuinely collide, move one deliberately: stop its services
 and run `mise run dev:ports:overwrite`.
 
-**Reference sources** (`references/`, §12 of `CLAUDE.md`) are provisioned per checkout with `rake
+**Reference sources** (`references/`, §12 of `CLAUDE.md`) are provisioned per checkout with `mise run
 references:setup`, sharing one machine-level mirror. They are a multi-GB download; nothing
 provisions them automatically.
 
@@ -90,8 +90,8 @@ server is **this checkout's own cluster**, not a shared service:
 
 ```sh
 mise run dev            # starts it (process-compose supervises)
-rake db:psql            # a shell against it
-rake oracle:status      # declared profile vs the live server
+mise run db:psql        # a shell against it
+mise run oracle:status  # declared profile vs the live server
 ```
 
 Its configuration is **declared data** — `spec/conformance/oracle_profile.toml`. The corpus is
@@ -106,8 +106,8 @@ than importing different answers. Consequences worth internalising:
   environment sets `PGUSER=postgres` and `PGDATABASE=postgres`, matching the role and database
   created by `initdb` on both macOS and in the devcontainer.
 - **Changing a profile value changes what the oracle answers.** Treat it as a spec edit and re-run
-  `rake corpus:check` over the oracle-checkable corpus.
-- When sweeping many corpus files, `rake oracle:reset` between them — a `.test` carrying its own
+  `mise run corpus:check` over the oracle-checkable corpus.
+- When sweeping many corpus files, `mise run oracle:reset` between them — a `.test` carrying its own
   transaction control commits its tables for real, and later files then replay onto a dirty
   database in a way that looks exactly like a regression.
 
@@ -127,9 +127,10 @@ than importing different answers. Consequences worth internalising:
 | `mise run oracle:status` / `oracle:setup` / `oracle:reset` | the oracle's profile and database |
 | `mise run dev:browsers` | Chromium for the two Playwright suites (~150 MB, not needed by `ci`) |
 
-`rake <task>` remains equally valid and is where the logic lives; `mise.toml` is a thin wrapper so
-one command set works in both environments. `rake -T` lists everything, including tasks with no
-mise wrapper (`bench:*`, `rqg:*`, `stress`, `fuzz`, `mutation`, `references:*`).
+`mise tasks` lists every task, including the ones not in this table (`bench:*`, `corpus:*`,
+`rqg:*`, `stress`, `fuzz`, `mutation`, `references:*`), and `mise run <task> --help` shows a task's
+arguments. There is no Rakefile: composite and one-line tasks live in `mise.toml`, and every task
+with real logic is a Ruby script under `mise-tasks/` (`mise-tasks/bench/run` is `bench:run`).
 
 Services are managed by process-compose, not bespoke tasks:
 

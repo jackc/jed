@@ -85,5 +85,5 @@ See [`design.md`](design.md) §9 and [`spec/design/cli.md`](../spec/design/cli.m
 ## Tests
 
 ```
-rake migrate:test        # Go + Rust + TS package suites (also part of `rake test` / `rake ci`)
+mise run migrate:test # Go + Rust + TS package suites (also part of `mise run test` / `mise run ci`)
 ```

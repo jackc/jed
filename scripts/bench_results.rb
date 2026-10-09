@@ -19,7 +19,7 @@ module BenchResults
 
   # All run dirs under bench/results/, sorted (the UTC stamp names make that
   # chronological). Newest is last. Restricted to the UTC-stamp naming
-  # (YYYYMMDD-HHMMSS) `rake bench:run` writes, so sibling result families that
+  # (YYYYMMDD-HHMMSS) `mise run bench:run` writes, so sibling result families that
   # live under bench/results/ but are not bench runs — the rqg firehose's
   # bench/results/rqg/ tree — are not mistaken for the newest run.
   def run_dirs
@@ -29,7 +29,7 @@ module BenchResults
   end
 
   # True when a run dir holds at least one result line — i.e. load_dir would succeed.
-  # A stray empty dir (an aborted `rake bench:run` leaves one behind) has no non-empty
+  # A stray empty dir (an aborted `mise run bench:run` leaves one behind) has no non-empty
   # *.jsonl, so it reads as false. Used to keep such a dir from being auto-picked as a
   # baseline (File.size? is nil for 0-byte/missing).
   def results?(dir)
@@ -44,7 +44,7 @@ module BenchResults
   def resolve_dirs(run_dir, baseline_dir, baseline: true)
     runs = run_dirs
     if run_dir.nil?
-      abort "no results under bench/results/ — run `rake bench:run`" if runs.empty?
+      abort "no results under bench/results/ — run `mise run bench:run`" if runs.empty?
       run_dir = runs.last
     end
     if baseline_dir.nil? && baseline
@@ -86,7 +86,7 @@ module BenchResults
     fingerprints = results.map { |r| r["fingerprint"] }.uniq
     return nil if fingerprints.size == 1
 
-    "mixed fingerprints in one run dir (regenerate with `rake bench:setup` and re-run): #{fingerprints.join(', ')}"
+    "mixed fingerprints in one run dir (regenerate with `mise run bench:setup` and re-run): #{fingerprints.join(', ')}"
   end
 
   # The run's failures plus the baseline's (prefixed "baseline: "), in one list — what

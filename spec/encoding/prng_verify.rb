@@ -4,7 +4,7 @@
 # Verify spec/encoding/prng.toml against the entropy-seam contract in spec/design/entropy.md.
 # INDEPENDENT reference implementation (CLAUDE.md §5/§8): recomputes the splitmix64 stream and the
 # v4/v7 UUID bytes from scratch — the Ruby "third voice" beyond the Rust/Go/TS cores, so a bug all
-# three cores share is still caught. Test-time only; run via `rake verify`.
+# three cores share is still caught. Test-time only; run via `mise run verify`.
 #
 #   bundle exec ruby spec/encoding/prng_verify.rb
 #

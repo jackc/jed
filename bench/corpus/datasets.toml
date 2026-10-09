@@ -1,7 +1,7 @@
 # Benchmark dataset spec — consumed by bench-setup (generation) and every harness
 # (fingerprint check). spec/design/benchmarks.md §4/§5. The sha256 of THIS FILE's bytes is
 # the staleness fingerprint: any edit (including generator_version) invalidates the
-# generated databases and harnesses refuse to run until `rake bench:setup` regenerates.
+# generated databases and harnesses refuse to run until `mise run bench:setup` regenerates.
 
 schema_version = 1
 

@@ -2,7 +2,7 @@
 // (spec/design/concurrency-testing.md §6): the parallelism-stress format. Unlike the Layer 1/2
 // `# format: concurrency` schedules (an explicit total order, run inside the conformance harness),
 // a `stress/*.stress.toml` file has NO order — writers and readers run concurrently and
-// correctness is checked by INVARIANTS, not a transcript. It is bench-family (outside `rake ci`):
+// correctness is checked by INVARIANTS, not a transcript. It is bench-family (outside `mise run ci`):
 // timing-nondeterministic, but its answers are still checked (the confluent final state + a
 // cross-core answer checksum). This binary lives in the bench module so it can reuse the shared
 // splitmix64 PRNG and the FNV-1a answer checksum (benchmarks.md §6) with no new dependency.
@@ -10,7 +10,7 @@
 // Two execution modes drive the SAME worker definitions:
 //   - threaded   (Go's native mode): one goroutine per worker over the shared handle; writers
 //     contend on the single-writer gate for real, readers pin real snapshots. Run under `-race`
-//     (via `rake stress`) this exercises the actual concurrent code paths. A watchdog flags a
+//     (via `mise run stress`) this exercises the actual concurrent code paths. A watchdog flags a
 //     deadlock as a timeout.
 //   - sequential (`--sequential`): the seeded interleaver (§6) — the same algorithm the
 //     single-thread TS core uses. Deterministic given the file's seed; never truly blocks (a
@@ -76,7 +76,7 @@ type stressFinal struct {
 	CrossCoreChecksum bool      `toml:"cross_core_checksum"`
 }
 
-// result is one JSONL line — one per stress file. `rake stress` aggregates these across cores.
+// result is one JSONL line — one per stress file. `mise run stress` aggregates these across cores.
 type result struct {
 	Schema          int    `json:"schema"`
 	Name            string `json:"name"`

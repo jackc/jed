@@ -3,9 +3,9 @@
 
 # scripts/devdb.rb — this checkout's own PostgreSQL cluster.
 #
-#   rake db:init      idempotent initdb into .dev/postgres/data
-#   rake db:psql      psql against this cluster
-#   rake db:reset     destroy the cluster and re-init (destructive; requires CONFIRM=yes)
+#   mise run db:init      idempotent initdb into .dev/postgres/data
+#   mise run db:psql      psql against this cluster
+#   mise run db:reset     destroy the cluster and re-init (destructive; requires CONFIRM=yes)
 #
 #   devdb.rb serve    exec the foreground server   (what process-compose supervises)
 #   devdb.rb ready    exec pg_isready against it   (process-compose's readiness probe)
@@ -41,11 +41,11 @@ MAJOR = CLUSTER.fetch("pg_major")
 # prevents.
 def pgport
   unless File.exist?(PORTS_ENV)
-    abort "devdb: no port allocation — run `rake dev:ports:ensure` first (#{PORTS_ENV} is missing)."
+    abort "devdb: no port allocation — run `mise run dev:ports:ensure` first (#{PORTS_ENV} is missing)."
   end
 
   File.read(PORTS_ENV)[/^PGPORT=(\d+)$/, 1] ||
-    abort("devdb: PGPORT missing from #{PORTS_ENV} — re-run `rake dev:ports:ensure`.")
+    abort("devdb: PGPORT missing from #{PORTS_ENV} — re-run `mise run dev:ports:ensure`.")
 end
 
 
@@ -58,7 +58,7 @@ def init
     FileUtils.mkdir_p(File.dirname(PGDATA))
     initdb = PgBin.tool("initdb", MAJOR)
     # Match the oracle profile's locale so the cluster's template databases order text the way jed
-    # does; `rake oracle:setup` then creates jed_oracle from template0 with the same settings.
+    # does; `mise run oracle:setup` then creates jed_oracle from template0 with the same settings.
     args = [initdb, "-D", PGDATA, "--encoding=#{CLUSTER.fetch('encoding')}", "-U", "postgres"]
     args += locale_args
     puts "  initdb #{PGDATA}"
@@ -88,7 +88,7 @@ end
 case ARGV[0]
 when "init" then init
 when "serve"
-  abort "devdb: cluster not initialized — run `rake db:init`" unless initialized?
+  abort "devdb: cluster not initialized — run `mise run db:init`" unless initialized?
 
   FileUtils.mkdir_p(DevPaths.socket_dir(pgport)) # a /tmp fallback dir can vanish between boots
   exec(*server_argv)
@@ -99,7 +99,7 @@ when "info"
   # compose service, which is NOT the cluster this stack runs. One definition, printed on request.
   puts "#{DevPaths.socket_dir(pgport)}\t#{pgport}"
 when "psql"
-  abort "devdb: cluster not initialized — run `rake db:init`" unless initialized?
+  abort "devdb: cluster not initialized — run `mise run db:init`" unless initialized?
   exec("psql", "-h", DevPaths.socket_dir(pgport), "-p", pgport, "-U", "postgres",
        "-d", CLUSTER.fetch("database"), *ARGV[1..])
 when "reset"

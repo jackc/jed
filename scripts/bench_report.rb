@@ -18,7 +18,7 @@ verbose = ARGV.delete("-v")
 dir = ARGV[0]
 if dir.nil?
   runs = BenchResults.run_dirs
-  abort "no results under bench/results/ — run `rake bench:run`" if runs.empty?
+  abort "no results under bench/results/ — run `mise run bench:run`" if runs.empty?
   dir = runs.last
 end
 

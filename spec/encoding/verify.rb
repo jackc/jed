@@ -6,7 +6,7 @@
 # from scratch and checks the three invariants (round-trip, byte-exactness, order)
 # rather than trusting the file. Test-time only (CLAUDE.md §5).
 #
-#   bundle exec ruby spec/encoding/verify.rb   (or: rake verify)
+#   bundle exec ruby spec/encoding/verify.rb   (or: mise run verify)
 #
 # Exit 0 = all vectors conform; nonzero = mismatch (prints the offending case).
 

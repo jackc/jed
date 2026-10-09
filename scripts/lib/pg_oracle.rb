@@ -102,7 +102,7 @@ class PgOracle
             #{want['database']} on PG #{want['pg_major']} at PGHOST=#{ENV.fetch('PGHOST', '(unset)')} PGPORT=#{ENV.fetch('PGPORT', '(unset)')}
 
               server not running?    mise run dev      (starts this checkout's cluster)
-              database missing?      rake oracle:setup
+              database missing?      mise run oracle:setup
 
             #{err.strip}
           MSG
@@ -141,7 +141,7 @@ class PgOracle
           #{bad.map { |f, w, g| format('  %-19s expected %-14s got %s', f, w.to_s.inspect, g.to_s.inspect) }.join("\n")}
           The corpus's expected output is calibrated to the declared profile; importing against a
           different one silently produces different answers. Fix the server, or — if this change is
-          intended — edit the profile and re-run `rake corpus:check` over the corpus.
+          intended — edit the profile and re-run `mise run corpus:check` over the corpus.
         MSG
       end
 

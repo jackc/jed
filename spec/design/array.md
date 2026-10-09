@@ -294,7 +294,7 @@ slice the whole access is a **slice** (result = the array type); otherwise it is
 ## 7. Text I/O — `array_out` / `array_in`
 
 The determinism/oracle surface (like composite's `record_out`/`record_in`, [composite.md
-§8](composite.md)); equals PG byte-for-byte (CLAUDE.md §8), verified by `rake corpus:check`. Reuses
+§8](composite.md)); equals PG byte-for-byte (CLAUDE.md §8), verified by `mise run corpus:check`. Reuses
 the **`T`** render tag (a *rendering* tag — an array prints as a printable-ASCII string, like
 bytea/uuid/composite; [conformance.md §1](conformance.md)) — **no new tag**.
 
@@ -482,7 +482,7 @@ multidim/slice follow-on); all other codes above already existed.
 ## 12. Delivery (sub-slices)
 
 Arrays are **not a single vertical slice** — they land as ordered, independently-shippable sub-slices,
-each passing `rake ci`, mirroring composite's S0–S6:
+each passing `mise run ci`, mirroring composite's S0–S6:
 
 - **S0 ✅** — this doc + the CLAUDE.md §4 array-axis touch (shape is a value property; structural;
   second container axis) + the TODO.md array slices + the §10 decisions + the §11 error surface.
@@ -500,7 +500,7 @@ each passing `rake ci`, mirroring composite's S0–S6:
 - **S4 ✅** — comparison / ordering / `IS NULL`: the resolver gate (same-element-type arrays
   comparable; `42804` otherwise), the **btree-NULL** element-wise `eq3`/`lt3`/`gt3` (§5 — *not* the
   composite 3VL path), the `ORDER BY` total-order arm, DISTINCT/GROUP BY array keys, the
-  whole-value-only `IS NULL`. Oracle-pinned via `rake corpus:check`. (Landed with S1/S2.)
+  whole-value-only `IS NULL`. Oracle-pinned via `mise run corpus:check`. (Landed with S1/S2.)
 - **S5 ✅** — multidimensional values, custom lower bounds, and array slices `a[m:n]`. The value
   representation gained `dims`/`lbounds` (the codec header already carried them — a pure unlock, no
   format bump); `ARRAY[ARRAY[…],…]` stacks (rectangular or `2202E`; scalar/array mix `42804`); the

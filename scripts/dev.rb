@@ -71,10 +71,10 @@ if ENV["PGHOST"] != db_socket || ENV["PGPORT"] != db_port
     dev: the allocation disagrees with the cluster layout.
       .dev/*.env:    PGHOST=#{ENV['PGHOST'].inspect} PGPORT=#{ENV['PGPORT'].inspect}
       devdb.rb info: PGHOST=#{db_socket.inspect} PGPORT=#{db_port.inspect}
-    Run `rake dev:ports:ensure` to regenerate the derived values.
+    Run `mise run dev:ports:ensure` to regenerate the derived values.
   MSG
 end
-puts "  postgres  #{db_socket}  port #{db_port}  (rake db:psql)"
+puts "  postgres #{db_socket}  port #{db_port}  (mise run db:psql)"
 puts "  web dev   http://127.0.0.1:#{ENV['WEB_DEV_PORT']} (disabled by default: process-compose process start web)"
 puts "  control   127.0.0.1:#{ENV['PC_PORT_NUM']}"
 puts

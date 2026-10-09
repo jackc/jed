@@ -7,11 +7,11 @@
 // much of the targeted logic the corpus actually exercises, answering "are we only testing the
 // obvious?" with a map instead of a guess (.scratch/testing-ideas.md §1.2).
 //
-// This deliberately lives OUTSIDE `rake ci`, like benchmarks and stress: it is a slow analysis
+// This deliberately lives OUTSIDE `mise run ci`, like benchmarks and stress: it is a slow analysis
 // tool, not a merge gate. It is reproducible — enumeration is deterministic and sampling is
-// seeded — so `rake mutation` yields the same mutant set every run.
+// seeded — so `mise run mutation` yields the same mutant set every run.
 //
-// Usage (from anywhere in the repo, or via `rake mutation`):
+// Usage (from anywhere in the repo, or via `mise run mutation`):
 //
 //	go run ./cmd/mutate [flags]
 //	  -files     comma list of target files, relative to impl/go (default: the core logic files)

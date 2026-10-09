@@ -14,8 +14,8 @@
 #   ruby scripts/rqg_gen.rb --sweep 200 --emit      # seeds 1..200, emit agreements to suites/rqg/
 #   ruby scripts/rqg_gen.rb --from 1 --to 50 --shapes select_where
 #
-# OUT of rake ci (slow, needs live PG — like mutation/stress/bench). The PRODUCT that flows INTO
-# rake ci is the emitted suites/rqg/*.test, which then runs on all three cores.
+# OUT of mise run ci (slow, needs live PG — like mutation/stress/bench). The PRODUCT that flows INTO
+# mise run ci is the emitted suites/rqg/*.test, which then runs on all three cores.
 
 require "open3"
 require "fileutils"

@@ -1,0 +1,58 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Layer 3 concurrency-stress suite on all three cores (bench-family, OUTSIDE mise run ci)"
+#USAGE arg "[filter]" help="Run only workloads whose name contains this substring"
+
+# Layer 3 of the concurrency contract (spec/design/concurrency-testing.md §6): the
+# parallelism-stress suite. Like bench:* it is bench-family — DELIBERATELY OUTSIDE `mise run ci`
+# (timing-nondeterministic schedule), but its ANSWERS are still checked: every core runs each
+# stress/*.stress.toml and emits a confluent final-state checksum, and the aggregation below fails
+# on any per-core failure OR any cross-core checksum disagreement. Go runs under -race (one
+# goroutine per worker over the shared handle), Rust over real OS threads, TS via the seeded
+# interleaver.
+
+require "json"
+require_relative "../scripts/lib/tasks"
+include Tasks
+
+dir = File.join(ROOT, "bench/results/stress", stamp)
+FileUtils.mkdir_p(dir)
+filter = [ENV["usage_filter"]].compact
+
+# A per-core FAIL exits non-zero; each runner writes its JSONL first, so the verdict survives in
+# the result files and the aggregation still runs (sh? instead of sh).
+puts "go: one goroutine per worker, under the race detector"
+sh? "go", "run", "-race", "./cmd/stress", STRESS_DIR, File.join(dir, "go.jsonl"), *filter,
+    env: { "CGO_ENABLED" => "1" }, chdir: File.join(ROOT, "bench/go")
+
+puts "rust: real OS threads"
+sh "cargo", "build", "--release", "--quiet", "--manifest-path", "bench/rust/Cargo.toml", "--bin", "stress"
+sh? "bench/rust/target/release/stress", STRESS_DIR, File.join(dir, "rust.jsonl"), *filter
+
+puts "ts: the seeded-sequential interleaver"
+npm_ci_if_stale("bench/ts")
+sh? "node", "bench/ts/src/stress.ts", STRESS_DIR, File.join(dir, "ts.jsonl"), *filter
+
+# Read every core's JSONL, print a per-workload matrix, and abort on a failure or a cross-core
+# checksum disagreement (the one thing no single core can catch on its own).
+puts
+results = Dir[File.join(dir, "*.jsonl")].sort.flat_map do |f|
+  File.readlines(f, chomp: true).reject(&:empty?).map { |l| JSON.parse(l) }
+end
+failures = []
+results.group_by { |r| r["name"] }.sort.each do |name, rows|
+  puts "  #{name}"
+  rows.sort_by { |r| r["lang"] }.each do |r|
+    detail = r["status"] == "pass" ? "checksum=#{r['checksum']} checks=#{r['invariant_checks']}" : r["error"].to_s
+    puts format("    %-6s %-12s %-12s %s", r["lang"], r["status"].upcase, r["mode"], detail)
+    failures << "#{r['lang']}/#{name}: #{r['error']}" if r["status"] == "fail"
+  end
+  # Cross-core agreement: a confluent workload's final checksum must match across every passing
+  # core, regardless of mode (real threads vs. the interleaver) — concurrency-testing.md §6.
+  passed = rows.select { |r| r["status"] == "pass" && r["cross_core_checksum"] }
+  next if passed.map { |r| r["checksum"] }.uniq.length <= 1
+
+  failures << "#{name}: CROSS-CORE CHECKSUM DISAGREEMENT (#{passed.map { |r| "#{r['lang']}=#{r['checksum']}" }.join(' ')})"
+end
+abort "\nstress FAILED:\n  - #{failures.join("\n  - ")}" unless failures.empty?
+puts "\nstress OK (all cores agree)"

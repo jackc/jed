@@ -245,8 +245,8 @@ func TestStructuredCorruptionFailsClosed(t *testing.T) {
 
 // FuzzCorruptFile is the corruption explorer (testing-ideas.md §3: Go explores, the intrinsic oracle
 // judges). The fuzz input selects an operator and its parameters; every corrupted image must fail
-// closed or stay inert. The f.Add seeds run inside `go test` (covered by `rake ci`); `-fuzz` runs the
-// campaign (rake fuzz:corruption).
+// closed or stay inert. The f.Add seeds run inside `go test` (covered by `mise run ci`); `-fuzz` runs the
+// campaign (mise run fuzz:one FuzzCorruptFile).
 func FuzzCorruptFile(f *testing.F) {
 	seed := seedCorruptTarget(f)
 	ps := int(binary.BigEndian.Uint32(seed[8:12]))

@@ -3,7 +3,7 @@
 // Range-type descriptor table (CLAUDE.md §4/§5): the six built-in PostgreSQL range types
 // as DATA. The recursive value codec / comparator / text-I/O / canonicalize rule that
 // CONSUME it are hand-written per core (§5 forbids codegenning them; derived from the
-// element type, byte-identical by construction). Regenerate with `rake codegen`; `rake
+// element type, byte-identical by construction). Regenerate with `mise run codegen`; `mise run
 // verify` fails if stale. Reasoning: ../../spec/design/ranges.md.
 
 package jed

@@ -3,7 +3,7 @@
 
 # Validate the function/operator catalog (catalog.toml) for internal coherence and
 # cross-references into the type tables and error registry. Test-time only
-# (CLAUDE.md §5); run via `rake verify`. This is a COHERENCE checker — it does NOT
+# (CLAUDE.md §5); run via `mise run verify`. This is a COHERENCE checker — it does NOT
 # re-implement three-valued logic. Checks, with no engine required:
 #
 #   1. schema_version == 2

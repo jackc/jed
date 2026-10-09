@@ -6,7 +6,7 @@ require "fileutils"
 module RQG
   # Per-run output: a timestamped dir under bench/results/rqg/ (the mutation/stress precedent) holding
   # run.jsonl (one event per case) and flagged/ (reduced divergence `.test`s + their .md sidecars).
-  # Outside rake ci — this is a discovery tool, not a conformance gate. Time.now is fine here (a plain
+  # Outside mise run ci — this is a discovery tool, not a conformance gate. Time.now is fine here (a plain
   # script, not a Workflow), so the stamp is wall-clock.
   class Report
     attr_reader :dir
@@ -26,7 +26,7 @@ module RQG
       File.write(flagged_path("#{name}.md"), <<~MD)
         # RQG divergence — #{kase.shape} seed #{kase.seed}
 
-        Reproduce: `rake 'rqg:replay[#{kase.seed},#{kase.shape}]'`
+        Reproduce: `mise run rqg:replay #{kase.seed} #{kase.shape}`
 
         ## Query
         ```sql

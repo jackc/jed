@@ -1,9 +1,9 @@
 package main
 
 // Regression guards for the Layer 3 stress runner (spec/design/concurrency-testing.md §6). The
-// bench module is not in `rake ci` (bench-family), so these run via `go test ./cmd/stress` during
+// bench module is not in `mise run ci` (bench-family), so these run via `go test ./cmd/stress` during
 // bench work — the same convention as prng_test.go / checksum_test.go. They lock in the two
-// properties the cross-core `rake stress` check depends on: the seeded interleaver is deterministic,
+// properties the cross-core `mise run stress` check depends on: the seeded interleaver is deterministic,
 // and a confluent workload's final checksum is mode-independent (sequential == threaded).
 
 import (
@@ -63,7 +63,7 @@ func TestSequentialDeterministic(t *testing.T) {
 }
 
 // TestModeAgreement: a confluent workload's final checksum is the same under the seeded interleaver
-// and under real goroutines — the property `rake stress` cross-checks across cores.
+// and under real goroutines — the property `mise run stress` cross-checks across cores.
 func TestModeAgreement(t *testing.T) {
 	seq := runOnce(t, balanceFile(), true)
 	threaded := runOnce(t, balanceFile(), false)

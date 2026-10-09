@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-# scripts/reduce_selftest.rb — guards scripts/reduce.rb against rotting (run by `rake ci`).
+# scripts/reduce_selftest.rb — guards scripts/reduce.rb against rotting (run by `mise run ci`).
 #
 # Deterministic, oracle-free, rust-only. Builds a hand-crafted multi-record `.test` with a KNOWN
 # minimal failing core, runs the reducer, and asserts it distilled exactly that core. The fixture

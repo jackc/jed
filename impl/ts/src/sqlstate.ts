@@ -3,7 +3,7 @@
 // SQLSTATE error codes (CLAUDE.md §5, §10: the codegen "middle path"). DATA only — the
 // EngineError scaffolding that CONSUMES these (message assembly, the raise sites through the
 // executor) is hand-written in errors.ts (§5 forbids codegenning those). Regenerate with
-// `rake codegen`; `rake verify` fails if this file is stale. Each variant's message template +
+// `mise run codegen`; `mise run verify` fails if this file is stale. Each variant's message template +
 // rationale live in spec/errors/registry.toml. Reasoning: ../../../spec/design/codegen.md.
 //
 // SqlState is a string-literal union (not a TS enum — the elidable subset forbids enums), and

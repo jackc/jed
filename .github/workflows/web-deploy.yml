@@ -2,7 +2,7 @@
 # static (SvelteKit adapter-static); this workflow gates on svelte-check and the interactive-feature
 # Playwright suite (the contract for the live database / language switcher / OPFS tool), then builds
 # with the project base path and publishes the artifact. The website is a non-core tooling module,
-# so this is separate from the engine's Rake CI.
+# so this is separate from the engine's `mise run ci` gate.
 
 name: Deploy website
 

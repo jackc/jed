@@ -102,7 +102,7 @@ because intermediate ceiling and saturation are observable.
 - the eight-relation dynamic-programming limit and larger-island strategy; and
 - access-path and join-algorithm tie orders.
 
-`rake verify` runs `estimator_verify.rb` to reject missing/duplicate facts, unreduced or invalid
+`mise run verify` runs `estimator_verify.rb` to reject missing/duplicate facts, unreduced or invalid
 fractions, changed approved defaults, incomplete tie orders, and incoherent estimator vectors. The
 generated constant tables and shared fixture matrix live at `spec/cost/estimator_vectors.toml`; the
 verifier validates its input, per-unit-count, row, cost, and tie-key fields. Codegen may copy
@@ -757,7 +757,7 @@ contract.
 
 ## 13. Conformance coverage
 
-- `rake verify` checks shared estimator facts, exact arithmetic vectors, and complete tie orders.
+- `mise run verify` checks shared estimator facts, exact arithmetic vectors, and complete tie orders.
 - Byte goldens, transactional row-count/statistics tests, reopen tests, and cache fresh-vs-hit parity
   cover persisted and snapshot inputs.
 - Shared access-candidate and estimator vectors pin every base access method.

@@ -3,7 +3,7 @@
 // SQLSTATE error codes (CLAUDE.md §5, §10: the codegen "middle path"). DATA only — the
 // EngineError scaffolding that CONSUMES these (message assembly, Error rendering, the raise
 // sites through the executor) is hand-written in errors.go (§5 forbids codegenning those).
-// Regenerate with `rake codegen`; `rake verify` fails if this file is stale. Each variant's
+// Regenerate with `mise run codegen`; `mise run verify` fails if this file is stale. Each variant's
 // message template + rationale live in spec/errors/registry.toml. Reasoning:
 // ../../spec/design/codegen.md.
 

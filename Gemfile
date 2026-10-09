@@ -1,4 +1,5 @@
-# Ruby build/test tooling for the engine (see CLAUDE.md §10: prefer Ruby + Rake).
+# Ruby build/test tooling for the engine (see CLAUDE.md §10: Ruby for automation, mise as the task
+# runner).
 #
 # Everything here is DEVELOPMENT/BUILD-TIME tooling only — there is no Ruby engine.
 # In particular toml-rb parses the canonical spec data tables (types, functions,
@@ -7,5 +8,4 @@
 
 source "https://rubygems.org"
 
-gem "rake"        # task runner (references:*, spec verification)
 gem "toml-rb"     # parser for the canonical spec data tables (TOML)

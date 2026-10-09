@@ -12,7 +12,7 @@
 # the session pins into every probe's `SET LOCAL` preamble.
 #
 # Changing a value here changes what the oracle answers. Treat it as a spec edit: re-run
-# `rake corpus:check` over the oracle-checkable corpus before committing.
+# `mise run corpus:check` over the oracle-checkable corpus before committing.
 
 schema_version = 1
 
@@ -52,7 +52,7 @@ encoding = "UTF8"
 
 # The database the oracle probes run against. A dedicated database, not the cluster's default:
 # a database's locale is fixed at CREATE time, so matching jed's collation means creating one
-# (`rake oracle:setup`). It also keeps replayed corpus DDL off the default database. The harness
+# (`mise run oracle:setup`). It also keeps replayed corpus DDL off the default database. The harness
 # names it explicitly (`psql -d`), so it does not depend on the PGDATABASE env.
 #
 # It lives in THIS CHECKOUT's cluster (.dev/postgres, started by `mise run dev`), not a shared

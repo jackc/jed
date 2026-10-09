@@ -268,8 +268,8 @@ Sequenced so the canonical operator lands first on a frozen budget seam:
   Group state preserves global fold order; aggregate DISTINCT membership spills too.
   Ordered-set and hypothetical collections use scratch and bounded replay/sorting;
   JSON aggregates assemble their final scalar after replay. Direct scans and their
-  cost prepasses stream. The shared forced-spill corpus joins `rake test`/`rake ci`;
-  `rake bench:spill` measures wide inputs larger than `work_mem`.
+  cost prepasses stream. The shared forced-spill corpus joins `mise run test`/`mise run ci`;
+  `mise run bench:spill` measures wide inputs larger than `work_mem`.
 
 Remaining allocation owners are explicit. Upstream materialized CTE/derived/SRF/index
 producers, the window stage's buffer, and materialized host results are row buffers

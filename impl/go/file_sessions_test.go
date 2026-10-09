@@ -193,7 +193,7 @@ func TestFileBackedReadersRunConcurrentlyWithAWriter(t *testing.T) {
 	// concurrently with a writer committing (and persisting dirty pages) on another goroutine. Pool
 	// bookkeeping is mutex-guarded, while cold decode runs outside that critical section. Each reader
 	// pins a snapshot and must see an internally consistent count; reclamation stays watermark-safe.
-	// Run under `go test -race` (rake concurrency:race walks the threaded conformance; this exercises
+	// Run under `go test -race` (mise run concurrency:race walks the threaded conformance; this exercises
 	// the file pager).
 	path := filepath.Join(t.TempDir(), "file_sessions_concurrent.jed")
 	func() {

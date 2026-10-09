@@ -98,7 +98,7 @@ test("scalar types match spec/types/scalars.toml", () => {
 
 test("error codes are registered in spec/errors/registry.toml", () => {
   // The generated SqlState union + code mapping (codegen middle path, CLAUDE.md §5) must match
-  // the canonical registry. The drift gate (`rake verify`) pins the generated file; this test
+  // the canonical registry. The drift gate (`mise run verify`) pins the generated file; this test
   // additionally walks the compiled-in ERRORS table against registry.toml row-for-row.
   const rows = readTomlTables(specPath("errors/registry.toml"), "error");
   assert.equal(rows.length, ERRORS.length, "error count");

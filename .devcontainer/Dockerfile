@@ -10,7 +10,7 @@ FROM mcr.microsoft.com/devcontainers/base:ubuntu24.04
 # worktree does — the convergence the native migration is built on. It does NOT
 # start a service: Debian's postgresql-18 package auto-creates a "main" cluster
 # and an init script, both of which we suppress, because the cluster this
-# project uses is created by `rake db:init` inside the checkout and supervised
+# project uses is created by `mise run db:init` inside the checkout and supervised
 # by process-compose. The `db` compose service remains the oracle for now.
 RUN apt-get update \
     && apt-get install -y postgresql-common \

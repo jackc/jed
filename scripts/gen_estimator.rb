@@ -216,7 +216,7 @@ def main
     end
   end
   unless stale.empty?
-    stale.each { |rel| warn "STALE: #{rel} — run 'rake codegen'" }
+    stale.each { |rel| warn "STALE: #{rel} — run 'mise run codegen'" }
     exit 1
   end
   puts "OK: #{TARGETS.length} generated estimator files current" if check

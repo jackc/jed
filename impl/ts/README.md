@@ -44,13 +44,13 @@ Relative imports carry an explicit `.ts` extension.
 Dev-dependencies are **type-check only** (no npm runtime footprint): `typescript` and
 `@types/node`. The engine, the unit tests, and the conformance harness run on **bare Node with no
 `npm install`**. File-backed Node use additionally needs the matching first-party prebuilt lock
-artifact; repository tests build it from exact-pinned safe Rust sources with `rake ts:lock_build`.
+artifact; repository tests build it from exact-pinned safe Rust sources with `mise run ts:lock_build`.
 
 ```sh
 mise exec -- node src/bin/conformance.ts   # run the shared conformance corpus (no install)
 mise exec -- node --test tests/*.test.ts   # unit tests (no install)
 mise exec -- npm install && mise exec -- npx tsc --noEmit   # type-check (the one install)
-rake ts:lock_build                         # build the local Node OS-lock host
+mise run ts:lock_build                     # build the local Node OS-lock host
 ```
 
 Spec data tables (e.g. `spec/encoding/integers.toml`) are read in tests by a tiny

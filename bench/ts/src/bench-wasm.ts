@@ -19,7 +19,7 @@ import { WASI } from "node:wasi";
 
 import { type Arg, type Checksum, type Engine, mainWith, readSidecar } from "./lib.ts";
 
-// The optimized release artifact (Rakefile `wasm:build`). Compiled once; instantiated per open.
+// The optimized release artifact (built by `mise run bench:build`). Compiled once; instantiated per open.
 const WASM_PATH = fileURLToPath(
   new URL("../../../impl/wasm/target/wasm32-wasip1/release/jed_wasm.wasm", import.meta.url),
 );

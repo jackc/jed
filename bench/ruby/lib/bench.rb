@@ -215,7 +215,7 @@ module Bench
   def run_one(cfg, w, corpus_dir, data_dir, want)
     eng = cfg[:open].call(data_dir, w.dataset)
     if w.dataset != "scratch" && eng.stored_fingerprint != want
-      raise "stale benchmark data for #{w.dataset}/#{cfg[:engine]}: run 'rake bench:setup'"
+      raise "stale benchmark data for #{w.dataset}/#{cfg[:engine]}: run 'mise run bench:setup'"
     end
 
     w.setup_sql_for(cfg[:engine]).each { |sql| eng.exec(sql) }

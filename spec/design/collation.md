@@ -847,7 +847,7 @@ leans on:
 - **2a — vendoring source + sync** ✅ *landed (dev set)*: `gen_collation_vectors` also writes the
   `.coll` artifacts the cores embed (`spec/collation/fixtures/*.coll`); `scripts/vendor_collations.rb`
   distributes them per core (Rust `include_bytes!`es spec/ directly; Go gets raw copies +
-  `//go:embed`; the browser-safe TS core gets a generated base64 module), with a `rake verify` drift
+  `//go:embed`; the browser-safe TS core gets a generated base64 module), with a `mise run verify` drift
   gate. **Still pending:** moving `ExtractHostCollation`/`CompileCollation` to a build/tools target
   compiled *out of* production (§4.1).
 - **2b — vendored read path** ✅ *landed (all three cores)*: each core embeds the vendored `.coll`

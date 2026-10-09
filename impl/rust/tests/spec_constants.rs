@@ -217,7 +217,7 @@ fn is_fixed_width_partitions_width_bytes_domain() {
 #[test]
 fn error_codes_are_registered() {
     // The generated SqlState table (codegen middle path, CLAUDE.md §5) must match the canonical
-    // registry. The drift gate (`rake verify`) pins the generated file byte-for-byte; this test
+    // registry. The drift gate (`mise run verify`) pins the generated file byte-for-byte; this test
     // additionally COMPILES the generated `ERRORS` slice into the crate and asserts it matches
     // registry.toml row-for-row — a genuinely compiled-and-verified artifact (like
     // operators_match_spec). The enum is not iterable, so the cross-check walks `ERRORS`.

@@ -322,7 +322,7 @@ them too).
   (scale preserved, e.g. `1.50`), strings JSON-escaped, `true`/`false`/`null` lowercase.
   Uses the existing **`T` render tag** (a printable-ASCII string, like bytea/uuid/array —
   [conformance.md §1](conformance.md)); **no new render tag**. Byte-identical to the PG
-  oracle, verified by `rake corpus:check`.
+  oracle, verified by `mise run corpus:check`.
 
 ### 6.3 Error surface
 
@@ -498,7 +498,7 @@ with their slice) and the suite they gate:
 
 A new `json` **profile** bundles these plus the path/function/table capabilities defined in
 the sibling docs. Tests live in a new `spec/conformance/suites/json/` suite, oracle-checked
-against live PG (`rake corpus:check`), with any deliberate divergence recorded in the
+against live PG (`mise run corpus:check`), with any deliberate divergence recorded in the
 override ledger. Per-core unit tests cover only what the corpus cannot express (CLAUDE.md
 §10): the on-disk golden round-trip, the `42883`/`0A000` divergences, and catalog
 introspection.
@@ -544,7 +544,7 @@ reserved flag.
 
 ## 12. Delivery — vertical slices
 
-Each slice is independently shippable (`rake ci` green) with its own capability + oracle-
+Each slice is independently shippable (`mise run ci` green) with its own capability + oracle-
 checked conformance entries, mirroring the composite/array/range cadence. Full sequencing
 across all four JSON docs is in [TODO.md]. Critical path:
 **J0 → {J1, J2, J3} → C0 → P1 → {P2, S2} → {R1, T1}**.

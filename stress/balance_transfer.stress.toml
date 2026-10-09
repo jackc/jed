@@ -1,8 +1,8 @@
 # Layer 3 parallelism-stress corpus (spec/design/concurrency-testing.md §6). Unlike the Layer 1/2
 # `# format: concurrency` schedules, a stress file has NO explicit order: writers and readers run
 # concurrently (real threads on Go/Rust; a seeded sequential interleaver on TS), and correctness is
-# checked by INVARIANTS, not an exact transcript. This is bench-family (outside `rake ci`); run it
-# with `rake stress`.
+# checked by INVARIANTS, not an exact transcript. This is bench-family (outside `mise run ci`); run it
+# with `mise run stress`.
 #
 # The classic non-oracle concurrency check: concurrent transfers between two accounts must keep the
 # total balance constant on EVERY reader snapshot (commit atomicity across handles + snapshot

@@ -489,7 +489,7 @@ backreferences `\1`, lookaround `(?=)`/`(?!)`/`(?<=)`/`(?<!)`, named groups. And
   `suites/resource/regex_program_limit.test` (`54001` boundary, jed-specific — not oracle-checked),
   `suites/expr/regexp_functions.test` (Slice 2), `suites/expr/regexp_oracle_functions.test` (Slice 3).
 - **Oracle divergence** (§7 conformance): jed's flavor is the RE2 subset, so only the **PG-agreeing
-  subset** is oracle-checkable (`rake corpus:check`); flavor-divergent cases (a pattern PG accepts
+  subset** is oracle-checkable (`mise run corpus:check`); flavor-divergent cases (a pattern PG accepts
   via a backref, greedy-edge differences) get **hand-authored expected output + an
   `oracle_overrides.toml` entry**. Cost is never oracle-checked (jed-specific).
 - A NoREC metamorphic relation (`col ~ p` ≡ `NOT (col !~ p)`) and a `bench/` regex workload, per the

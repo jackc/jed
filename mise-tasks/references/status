@@ -1,0 +1,7 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Show provisioned reference repos, their pinned ref, and current HEAD"
+
+require_relative "../../scripts/lib/references"
+
+References.print_status

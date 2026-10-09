@@ -76,9 +76,9 @@ module RQG
     end
 
     def file_header
-      ["# RQG #{@shape} corpus — GENERATED + curated by scripts/rqg_gen.rb (rake rqg:emit).",
+      ["# RQG #{@shape} corpus — GENERATED + curated by scripts/rqg_gen.rb (mise run rqg:emit).",
        "# One self-contained {schema, data, query} block per distinct query shape; expected rows are",
-       "# the live PostgreSQL oracle's (jed agreed by construction). Runs on all three cores in rake",
+       "# the live PostgreSQL oracle's (jed agreed by construction). Runs on all three cores in mise run",
        "# ci. Do NOT hand-edit — regenerate. See .scratch/testing-ideas.md §1 (the RQG firehose)."]
     end
   end

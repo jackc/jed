@@ -139,7 +139,7 @@ template = <<~'HTML'
   <footer>
     lower is better; bars are linear within each benchmark; Δ gray under <%= BenchResults::NOISE_PCT.to_i %>%
     (single-run wall-clock noise — spec/design/benchmarks.md §10).
-    Regenerate: <code>rake bench:html</code>.
+    Regenerate: <code>mise run bench:html</code>.
   </footer>
   </body>
   </html>

@@ -10,7 +10,7 @@
 # facts at connect; this script is the human-readable view of the same contract, plus the session
 # pins (which are applied, not asserted, so they cannot mismatch — they are shown for review).
 #
-#   rake oracle:status   # print declared vs actual, exit nonzero on mismatch
+#   mise run oracle:status # print declared vs actual, exit nonzero on mismatch
 
 require_relative "lib/pg_oracle"
 
