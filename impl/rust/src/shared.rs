@@ -311,11 +311,29 @@ struct StorageBudget {
 
 impl StorageBudget {
     /// Remember a successful in-memory commit's catalog root and written pages.
-    fn record(&mut self, write: &crate::format::IncrementalWrite) {
-        self.last_cat_root = write.root_page;
-        self.last_written = write.pages.iter().map(|(index, _)| *index).collect();
-        self.last_catalog_pages = crate::format::catalog_page_count(&write.pages);
+    fn record(&mut self, staged: &StagedCommit) {
+        self.last_cat_root = staged.root_page;
+        self.last_written = staged.written.clone();
+        self.last_catalog_pages = staged.catalog_pages;
     }
+}
+
+/// An in-memory commit whose pages are written into its block store but whose page accounting is not
+/// yet adopted (attached-databases.md §5). The pages occupy only free-list slots and pages past the
+/// high-water, none reachable from the published root, so dropping a staged commit leaves the storage
+/// exactly as the published root needs it; the next commit re-plans the same pages. Adopting it
+/// ([`Storage::adopt_staged`]) advances the high-water, free list, and budget record, then runs the
+/// post-commit compaction relative to the new root — which is sound only once that root is published.
+pub(crate) struct StagedCommit {
+    /// The attachment the commit belongs to (empty for a temp domain, which adopts in place).
+    name: String,
+    root_page: u32,
+    page_count: u32,
+    free_remaining: Vec<u32>,
+    /// The pages the commit wrote (unioned into the compaction's live set; the budget record).
+    written: Vec<u32>,
+    /// How many of them are catalog pages (the budget's repair exemption, memory.md §8.3).
+    catalog_pages: usize,
 }
 
 impl Storage {
@@ -380,6 +398,22 @@ impl Storage {
         // A temp domain (and an in-memory attachment) is session-local / driven by one caller, so its only
         // reader is the session's own streaming cursor — gated synchronously by `can_reclaim` (open_streams).
         // There is no cross-thread pin-registration race, so reuse is always safe here (transactions.md §8).
+        let staged = self.stage_in_memory(snap, budget, String::new())?;
+        self.adopt_staged(snap, staged, can_reclaim)
+    }
+
+    /// The first half of [`persist_temp`](Self::persist_temp): write `snap`'s dirty pages into the
+    /// in-RAM store and take the residency flip, but adopt none of the page accounting. An in-memory
+    /// attachment stages in `commit_tx` and adopts only after main persists and the roots publish
+    /// (attached-databases.md §5): adopting first would let a failed main persist leave a free list
+    /// computed from an unpublished root, so a later commit could overwrite pages the published root
+    /// still references.
+    pub(crate) fn stage_in_memory(
+        &mut self,
+        snap: &mut Snapshot,
+        budget: Option<&BudgetCtx<'_>>,
+        name: String,
+    ) -> Result<StagedCommit> {
         let write = self.plan_in_memory(snap, true, budget)?;
         {
             let mut pager = self.paging.pager();
@@ -394,11 +428,29 @@ impl Storage {
         for (index, _) in &write.pages {
             self.paging.invalidate(*index);
         }
-        self.page_count = write.page_count;
-        self.budget.record(&write);
-        self.free_pages = write.free_remaining;
         snap.demote_clean_leaves();
-        self.maybe_compact(snap, write.root_page, &write.pages, can_reclaim)
+        Ok(StagedCommit {
+            name,
+            root_page: write.root_page,
+            page_count: write.page_count,
+            catalog_pages: crate::format::catalog_page_count(&write.pages),
+            written: write.pages.iter().map(|(index, _)| *index).collect(),
+            free_remaining: write.free_remaining,
+        })
+    }
+
+    /// The second half of [`persist_temp`](Self::persist_temp): adopt a staged commit's page accounting
+    /// and run the post-commit compaction relative to `snap`, its now-committed root.
+    pub(crate) fn adopt_staged(
+        &mut self,
+        snap: &Snapshot,
+        staged: StagedCommit,
+        can_reclaim: bool,
+    ) -> Result<()> {
+        self.page_count = staged.page_count;
+        self.budget.record(&staged);
+        self.free_pages = staged.free_remaining;
+        self.maybe_compact(snap, staged.root_page, &staged.written, can_reclaim)
     }
 
     /// Plan an in-memory commit's page allocation under the domain's `max_storage_bytes` limit
@@ -672,10 +724,15 @@ impl Storage {
         for (index, _) in &write.pages {
             self.paging.invalidate(*index);
         }
-        self.page_count = write.page_count;
-        self.budget.record(&write);
-        self.free_pages = write.free_remaining;
-        self.maybe_compact(snap, write.root_page, &write.pages, can_reclaim)
+        let staged = StagedCommit {
+            name: String::new(),
+            root_page: write.root_page,
+            page_count: write.page_count,
+            catalog_pages: crate::format::catalog_page_count(&write.pages),
+            written: write.pages.iter().map(|(index, _)| *index).collect(),
+            free_remaining: write.free_remaining,
+        };
+        self.adopt_staged(snap, staged, can_reclaim)
     }
 
     /// Reclaim within-session copy-on-write orphans (temp-tables.md §6) **in RAM** by rebuilding the
@@ -691,7 +748,7 @@ impl Storage {
         &mut self,
         snap: &Snapshot,
         cat_root: u32,
-        written: &[(u32, Vec<u8>)],
+        written: &[u32],
         can_reclaim: bool,
     ) -> Result<()> {
         use crate::costs::{COMPACT_GROWTH, COMPACT_MIN_PAGES}; // shared data (memory.md §8.4)
@@ -704,9 +761,7 @@ impl Storage {
             return Ok(());
         }
         let mut reached = crate::format::reachable_pages(snap, &self.paging, cat_root)?;
-        for (index, _) in written {
-            reached.insert(*index);
-        }
+        reached.extend(written.iter().copied());
         self.free_pages = (crate::format::ROOT_PAGE..self.page_count)
             .filter(|p| !reached.contains(p))
             .collect();
@@ -1195,13 +1250,14 @@ impl Shared {
     }
 
     /// Commit a dirtied attachment's working snapshot into its block store (attached-databases.md §5, the
-    /// N-root commit). An IN-MEMORY attachment packs persist_temp-style (NO fsync — no durability
-    /// barrier). A FILE attachment (Slice 2) advances the version (`base_txid + 1`) for its alternating
-    /// meta slot + reopen, commits DURABLY through [`Storage::commit_durable`] (dirty pages + meta +
-    /// fsync, its own page space), then takes the post-commit residency flip. `can_reclaim` gates the
-    /// in-memory within-session compaction. Called from [`Engine::commit_tx`] under the writer gate, so
-    /// the storage mutation is single-writer. A detached-mid-transaction attachment (unreachable under
-    /// the gate) no-ops.
+    /// N-root commit). An IN-MEMORY attachment only STAGES persist_temp-style (pages written, NO fsync —
+    /// no durability barrier) and returns the [`StagedCommit`] that [`adopt_attachments`] adopts once main
+    /// has persisted and the roots have published. A FILE attachment (Slice 2) advances the version
+    /// (`base_txid + 1`) for its alternating meta slot + reopen, commits DURABLY through
+    /// [`Storage::commit_durable`] (dirty pages + meta + fsync, its own page space), then takes the
+    /// post-commit residency flip; `can_reclaim` gates its reclamation. Called from
+    /// [`Engine::commit_tx`] under the writer gate, so the storage mutation is single-writer. A
+    /// detached-mid-transaction attachment (unreachable under the gate) no-ops.
     pub(crate) fn commit_attachment(
         &self,
         name: &str,
@@ -1209,7 +1265,7 @@ impl Shared {
         base_txid: u64,
         can_reclaim: bool,
         stages_rows: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<StagedCommit>> {
         // The attachment's committed root and the watermark, read before the attachments lock: the
         // budget's forced compaction rebuilds the free list from that root (memory.md §8.3).
         let prev = self.committed_attachment(name);
@@ -1262,11 +1318,43 @@ impl Shared {
                     can_compact,
                     stages_rows,
                 });
-                att.storage
-                    .persist_temp(snap, can_reclaim, budget.as_ref())?;
+                let staged =
+                    att.storage
+                        .stage_in_memory(snap, budget.as_ref(), name.to_string())?;
+                return Ok(Some(staged));
             }
         }
-        Ok(())
+        Ok(None)
+    }
+
+    /// Adopt the in-memory attachment commits [`commit_attachment`] staged, after main persisted and the
+    /// roots published (attached-databases.md §5): advance each attachment's page accounting and run its
+    /// post-commit compaction relative to its now-published root in `attached`. Compaction is safe only
+    /// when no cross-session reader pins an older root (the live registry; the committing writer holds
+    /// the gate but is not in `live`) — read here, after publish, so a reader that pinned during the
+    /// commit is counted. The commit is already published, so a compaction walk that cannot read a page
+    /// only skips this reclamation: the free list stays the plan's, and the read error surfaces on the
+    /// next read of that page.
+    pub(crate) fn adopt_attachments(
+        &self,
+        staged: Vec<StagedCommit>,
+        attached: &HashMap<String, Arc<Snapshot>>,
+    ) {
+        if staged.is_empty() {
+            return;
+        }
+        let can_reclaim = !self.has_live_readers();
+        let mut atts = self
+            .attachments
+            .lock()
+            .expect("attachments lock not poisoned");
+        for commit in staged {
+            if let (Some(att), Some(snap)) =
+                (atts.get_mut(&commit.name), attached.get(&commit.name))
+            {
+                let _ = att.storage.adopt_staged(snap, commit, can_reclaim);
+            }
+        }
     }
 
     /// Run `f` on the storage of database `name` (`main` or an attachment; `42704` otherwise).
@@ -2618,7 +2706,10 @@ impl Session {
                 // A clean writable block: persist + swap roots at the next version. A failed/read-only
                 // block (or a commit_tx error) publishes nothing — a failed COMMIT is a ROLLBACK (PG).
                 Ok(outcome) if !failed && self.gate_held => self.publish().map(|()| outcome),
-                other => other,
+                other => {
+                    self.engine.staged_attachments.clear();
+                    other
+                }
             }
         } else {
             self.engine.rollback_tx()
@@ -2661,6 +2752,8 @@ impl Session {
     /// (and this session's version) unchanged and surfaces the error to the caller. In-memory persist
     /// is a no-op.
     fn publish(&mut self) -> Result<()> {
+        // Taken first, so any failure below drops the staged attachment commits unadopted.
+        let staged = std::mem::take(&mut self.engine.staged_attachments);
         self.shared.check_coordinator_pids()?;
         let mut snap = self.engine.committed.clone();
         snap.txid = self.base_version + 1; // advance the shared version on every commit
@@ -2679,11 +2772,14 @@ impl Session {
         self.engine.committed = snap.clone();
         // The N-root commit (attached-databases.md §5): publish the new main root TOGETHER with the
         // current attached roots in one atomic swap. `commit_tx` already adopted each dirtied
-        // attachment's working root into `engine.attached_committed` (and packed it into the attachment's
-        // in-RAM store); an unchanged attachment carries its prior root through. An empty map (nothing
-        // attached) is byte-for-byte the pre-attachment single-root publish.
+        // attachment's working root into `engine.attached_committed` (and staged its pages into the
+        // attachment's in-RAM store, adopted just below); an unchanged attachment carries its prior root
+        // through. An empty map (nothing attached) is byte-for-byte the pre-attachment single-root
+        // publish.
         self.shared
             .publish(Arc::new(snap), self.engine.attached_committed.clone());
+        self.shared
+            .adopt_attachments(staged, &self.engine.attached_committed);
         self.base_version += 1;
         Ok(())
     }
@@ -3785,5 +3881,172 @@ mod reclaim_watermark_tests {
         reader.join().unwrap();
         db.close().unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod multi_root_failure_tests {
+    //! A multi-root commit that fails after an in-memory attachment was staged (attached-databases.md
+    //! §5) must leave that attachment's storage matching its still-published root. Before staging was
+    //! split from adoption, the attachment adopted its page accounting and compacted relative to the
+    //! UNPUBLISHED root, so its free list held pages the published root still referenced; the next
+    //! commit overwrote them under every reader of the old root (silent corruption or `XX001`). Fault
+    //! injection and storage internals are out of the corpus's reach (CLAUDE.md §10). Mirrors the Go
+    //! multi_root_failure_test.go and the TS multi_root_failure test.
+
+    use super::*;
+    use crate::pager::{Fault, FaultPoint};
+    use crate::value::Value;
+
+    const ROWS: i64 = 200;
+
+    /// Every `(id, v)` of `a.t` in key order, read through a fresh session.
+    fn attachment_rows(db: &Database) -> Result<Vec<(i64, i64)>> {
+        let mut s = db.session(SessionOptions::default());
+        let rows = s.query("SELECT id, v FROM a.t ORDER BY id", &[])?;
+        Ok(rows
+            .map(|row| match (&row[0], &row[1]) {
+                (Value::Int(id), Value::Int(v)) => (*id, *v),
+                other => panic!("expected two integers, got {other:?}"),
+            })
+            .collect())
+    }
+
+    fn expected(v: impl Fn(i64) -> i64) -> Vec<(i64, i64)> {
+        (1..=ROWS).map(|id| (id, v(id))).collect()
+    }
+
+    /// Seed `a.t` with `ROWS` rows (v = 0) in one commit — a multi-leaf tree at page size 256.
+    fn seed_attachment(s: &mut Session) {
+        s.execute("CREATE TABLE a.t (id i64 PRIMARY KEY, v i64)", &[])
+            .unwrap();
+        s.execute(
+            &format!("INSERT INTO a.t SELECT g, 0 FROM generate_series(1, {ROWS}) AS g"),
+            &[],
+        )
+        .unwrap();
+    }
+
+    /// The failing transaction rewrites every leaf of `a.t` and doubles it, so its high-water passes
+    /// twice the live count and the post-commit compaction is due.
+    fn dirty_attachment(s: &mut Session) {
+        s.execute("UPDATE a.t SET v = 1", &[]).unwrap();
+        s.execute(
+            &format!(
+                "INSERT INTO a.t SELECT g, 1 FROM generate_series({}, {}) AS g",
+                ROWS + 1,
+                3 * ROWS
+            ),
+            &[],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn failed_main_persist_leaves_in_memory_attachment_intact() {
+        let path =
+            std::env::temp_dir().join(format!("jed_multi_root_failure_{}.jed", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::create(CreateOptions {
+            path: Some(path.clone()),
+            page_size: 256,
+            skip_fsync: true,
+            ..Default::default()
+        })
+        .unwrap();
+        db.attach("a", AttachSource::memory(), false).unwrap();
+        let mut s = db.session(SessionOptions::default());
+        s.execute("CREATE TABLE t (id i64 PRIMARY KEY)", &[])
+            .unwrap();
+        seed_attachment(&mut s);
+
+        // Main's durable commit fails at its barrier after the attachment was dirtied in the same tx.
+        s.begin(true).unwrap();
+        dirty_attachment(&mut s);
+        s.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+        db.0.storage
+            .lock()
+            .unwrap()
+            .paging
+            .pager()
+            .arm_fault(Fault::new(FaultPoint::Sync(1), None));
+        let err = s.commit().unwrap_err();
+        assert_eq!(err.code(), "58030", "{err:?}");
+
+        // Nothing published: a fresh session sees the attachment's prior root.
+        assert_eq!(attachment_rows(&db).unwrap(), expected(|_| 0));
+        // Main now refuses writes until reopened, but each attempt still stages attachment pages
+        // before main's persist fails. They must never land on pages the published root uses.
+        for k in 0..4 {
+            let err = s
+                .execute(
+                    &format!("UPDATE a.t SET v = {} WHERE id % 7 = {k}", 10 + k),
+                    &[],
+                )
+                .unwrap_err();
+            assert_eq!(err.code(), "58030", "{err:?}");
+            assert_eq!(attachment_rows(&db).unwrap(), expected(|_| 0));
+        }
+        drop(s);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failed_later_attachment_leaves_earlier_attachment_intact() {
+        let db = Database::create(CreateOptions {
+            page_size: 256,
+            ..Default::default()
+        })
+        .unwrap();
+        db.attach("a", AttachSource::memory(), false).unwrap();
+        db.attach("b", AttachSource::memory(), false).unwrap();
+        let mut s = db.session(SessionOptions::default());
+        s.execute("CREATE TABLE t (id i64 PRIMARY KEY)", &[])
+            .unwrap();
+        s.execute("CREATE TABLE b.t (id i64 PRIMARY KEY)", &[])
+            .unwrap();
+        seed_attachment(&mut s);
+
+        // `a` stages before `b` (in-memory attachments commit in name order); `b`'s pack fails.
+        s.begin(true).unwrap();
+        dirty_attachment(&mut s);
+        s.execute("INSERT INTO b.t VALUES (1)", &[]).unwrap();
+        s.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+        db.0.attachments
+            .lock()
+            .unwrap()
+            .get_mut("b")
+            .unwrap()
+            .storage
+            .paging
+            .pager()
+            .arm_fault(Fault::new(FaultPoint::BodyWrite(1), None));
+        let err = s.commit().unwrap_err();
+        assert_eq!(err.code(), "58030", "{err:?}");
+        assert_eq!(attachment_rows(&db).unwrap(), expected(|_| 0));
+
+        // Main and `a` stay writable. Each later commit rewrites one leaf path and reuses `a`'s free
+        // list; the leaves it does not touch are still the published root's and must survive.
+        for k in 0..6 {
+            s.execute(
+                &format!("UPDATE a.t SET v = 7 WHERE id = {}", 1 + 37 * k),
+                &[],
+            )
+            .unwrap();
+            s.execute(&format!("INSERT INTO t VALUES ({})", k + 2), &[])
+                .unwrap();
+        }
+        let updated = |id: i64| (id - 1) % 37 == 0 && id <= 1 + 37 * 5;
+        assert_eq!(
+            attachment_rows(&db).unwrap(),
+            expected(|id| if updated(id) { 7 } else { 0 })
+        );
+        let mut fresh = db.session(SessionOptions::default());
+        let n: Vec<_> = fresh
+            .query("SELECT count(*) FROM t", &[])
+            .unwrap()
+            .collect();
+        assert_eq!(n[0][0], Value::Int(6));
     }
 }

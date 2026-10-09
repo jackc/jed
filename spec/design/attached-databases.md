@@ -225,6 +225,20 @@ The existing model generalizes with one genuinely new constraint.
   (transactions.md §9), then swaps **every** touched attachment's committed root (file root(s) + each
   in-memory root) — the two-root swap of temp-tables.md §5 widened to N. Because ≤1 root is durable,
   there is no multi-file crash window. Rollback discards every attachment's working root.
+- **In-memory attachments stage, then adopt after publish.** Each dirtied in-memory attachment packs its
+  dirty pages into its byte store *before* main persists, but only into its free-list slots and past its
+  high-water — pages its published root never references — and changes **no** page accounting (high-water,
+  free list, the `max_storage_bytes` record of memory.md §8.3, within-session compaction). That accounting
+  is adopted, and compaction runs relative to the new root, only **after** main has persisted and the N
+  roots have published. A failure anywhere before that point — a later attachment's pack, the file
+  attachment's durable commit, or main's persist — therefore publishes nothing and leaves every in-memory
+  attachment's storage exactly as its still-published root needs it; the next commit re-plans over the
+  abandoned pages. (Adopting first let a failed commit compact against an unpublished root, so a later
+  commit could overwrite pages the published root still used.) Attachments commit in a fixed order —
+  in-memory ones by name, then the ≤1 file attachment — so a file attachment's durable point is followed
+  only by main's persist, which is then in-memory (the one-durable-writer rule) with its budget
+  prechecked. Compaction's watermark is read after publish, so a reader that pinned during the commit is
+  counted. On the success path the written bytes, the adopted accounting, and cost are unchanged.
 - **Per-attachment watermark.** The reader-liveness watermark (transactions.md §8) is **per
   attachment** — a reader pins a version in each attachment it touches, and each attachment's page
   reclamation (file: the P6.2 free-list; memory/temp: the within-session compaction the temp-blockstore

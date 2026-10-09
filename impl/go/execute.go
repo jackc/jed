@@ -2,6 +2,7 @@ package jed
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -182,6 +183,7 @@ func (db *engine) restoreSessionState(tx *activeTx) {
 // txid 0), make it durable (the single persist chokepoint, §9), then swap it in as committed. A
 // durable-write failure leaves committed untouched and propagates. Returns to autocommit.
 func (db *engine) commitTx() (outcome, error) {
+	db.stagedAttachments = nil
 	tx := db.session.tx
 	if tx == nil {
 		return outcome{Kind: outcomeStatement, Cost: 0}, nil
@@ -257,20 +259,38 @@ func (db *engine) commitTx() (outcome, error) {
 	db.session.tempCommitted = tx.tempWorking
 	// Adopt each dirtied host-attached database (attached-databases.md §5, the N-root commit) and adopt it
 	// into this engine's pinned attached view, so publish swaps a new roots.attached. An IN-MEMORY
-	// attachment materializes into its block store persistTemp-style (the same incremental copy-on-write
-	// pack as temp, NO fsync — no durability barrier); a FILE attachment (Slice 2) commits DURABLY through
-	// commitDurable (dirty pages + alternating meta slot + fsync, its own page space) and takes the
-	// post-commit residency flip. The root is DATABASE-scoped (published, cross-session-visible). At most
-	// one file attachment is dirty here (the one-durable-writer check above), so ≤1 fsync path runs.
-	// Within-session compaction (in-memory only) is safe iff no cross-session reader pins an older root
-	// (the live-registry watermark — the committing writer holds the gate but is not in `live`).
+	// attachment STAGES into its block store persistTemp-style (the same incremental copy-on-write pack as
+	// temp, NO fsync — no durability barrier) into free or past-high-water pages; its page accounting and
+	// compaction are adopted only after main persists and the roots publish, so a failure anywhere before
+	// that leaves its storage matching its still-published root. A FILE attachment (Slice 2) commits
+	// DURABLY through commitDurable (dirty pages + alternating meta slot + fsync, its own page space),
+	// takes the post-commit residency flip, and goes last, after every in-memory stage, so only main's
+	// persist follows its durable point. The root is DATABASE-scoped (published, cross-session-visible).
+	// At most one file attachment is dirty here (the one-durable-writer check above), so ≤1 fsync path
+	// runs. A file attachment's reclamation is safe iff no cross-session reader pins an older root (the
+	// live-registry watermark — the committing writer holds the gate but is not in `live`).
 	if len(tx.attachDirty) > 0 {
 		na := make(map[string]*snapshot, len(db.attachedCommitted))
 		for k, v := range db.attachedCommitted {
 			na[k] = v
 		}
 		canReclaim := db.core == nil || !db.core.hasLiveReaders()
+		names := make([]string, 0, len(tx.attachDirty))
 		for name := range tx.attachDirty {
+			names = append(names, name)
+		}
+		isFile := func(name string) bool {
+			att := db.core.attachment(name)
+			return att != nil && att.isFile()
+		}
+		sort.Slice(names, func(i, j int) bool {
+			if fi, fj := isFile(names[i]), isFile(names[j]); fi != fj {
+				return fj
+			}
+			return names[i] < names[j]
+		})
+		var staged []stagedCommit
+		for _, name := range names {
 			ws := tx.attachWorking[name]
 			att := db.core.attachment(name)
 			if att == nil {
@@ -296,13 +316,18 @@ func (db *engine) commitTx() (outcome, error) {
 					return outcome{}, err
 				}
 				ws.demoteCleanLeaves() // post-commit residency flip (bplus-reshape.md B4), like Session.publish
-			} else if err := att.storage.persistTemp(ws, canReclaim, db.core.attachmentBudget(name, stagesRows)); err != nil {
-				return outcome{}, err
+			} else {
+				commit, err := att.storage.stageInMemory(ws, db.core.attachmentBudget(name, stagesRows), name)
+				if err != nil {
+					return outcome{}, err
+				}
+				staged = append(staged, commit)
 			}
 			ws.freezeMutationGenerations()
 			na[name] = ws
 		}
 		db.attachedCommitted = na
+		db.stagedAttachments = staged
 	}
 	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }

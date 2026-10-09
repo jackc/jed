@@ -61,10 +61,40 @@ export function storageBytes(db: Engine): bigint {
 }
 
 // recordBudget remembers a successful in-memory commit's catalog root and written pages.
-function recordBudget(db: Engine, write: IncrementalWrite): void {
-  db.storageBudget.lastCatRoot = write.rootPage;
-  db.storageBudget.lastWritten = write.pages.map((pg) => pg.index);
-  db.storageBudget.lastCatalogPages = catalogPageCount(write.pages);
+function recordBudget(db: Engine, staged: StagedCommit): void {
+  db.storageBudget.lastCatRoot = staged.rootPage;
+  db.storageBudget.lastWritten = staged.written.slice();
+  db.storageBudget.lastCatalogPages = staged.catalogPages;
+}
+
+// StagedCommit is an in-memory commit whose pages are written into its block store but whose page
+// accounting is not yet adopted (attached-databases.md §5). The pages occupy only free-list slots and
+// pages past the high-water, none reachable from the published root, so dropping a staged commit leaves
+// the storage exactly as the published root needs it; the next commit re-plans the same pages. Adopting
+// it (adoptStaged) advances the high-water, free list, and budget record, then runs the post-commit
+// compaction relative to the new root — which is sound only once that root is published.
+export interface StagedCommit {
+  // name is the attachment the commit belongs to ("" for a temp domain, which adopts in place).
+  name: string;
+  rootPage: number;
+  pageCount: number;
+  freeRemaining: number[];
+  // written is the pages the commit wrote (unioned into the compaction's live set; the budget record).
+  written: number[];
+  // catalogPages is how many of them are catalog pages (the budget's repair exemption, memory.md §8.3).
+  catalogPages: number;
+}
+
+// stagedFromWrite summarizes a written incremental plan as a StagedCommit.
+function stagedFromWrite(name: string, write: IncrementalWrite): StagedCommit {
+  return {
+    name,
+    rootPage: write.rootPage,
+    pageCount: write.pageCount,
+    freeRemaining: write.freeRemaining,
+    written: write.pages.map((pg) => pg.index),
+    catalogPages: catalogPageCount(write.pages),
+  };
 }
 
 // planInMemory plans an in-memory commit's page allocation under the domain's max_storage_bytes limit
@@ -311,10 +341,7 @@ function commitInMemory(
   const meta = metaPage(db.pageSize, snap.txid, write.rootPage, write.pageCount, 0);
   paging.writeBlock(Number(snap.txid & 1n), meta);
   paging.sync();
-  db.pageCount = write.pageCount;
-  recordBudget(db, write);
-  db.freePages = write.freeRemaining;
-  maybeCompact(db, snap, write.rootPage, write.pages, canReclaim);
+  adoptStaged(db, snap, stagedFromWrite("", write), canReclaim);
 }
 
 // commitDurableAttachment durably commits a FILE-backed host attachment's working snapshot into its own
@@ -348,7 +375,7 @@ export function maybeCompact(
   db: Engine,
   snap: Snapshot,
   catRoot: number,
-  written: { index: number; bytes: Uint8Array }[],
+  written: number[],
   canReclaim: boolean,
 ): void {
   if (!db.reclaimWithinSession || !canReclaim || db.paging === null) return;
@@ -356,7 +383,7 @@ export function maybeCompact(
   if (db.pageCount <= COMPACT_MIN_PAGES || db.pageCount <= COMPACT_GROWTH * db.liveAtCompaction)
     return;
   const reached = reachablePages(snap, db.paging, catRoot);
-  for (const w of written) reached.add(w.index);
+  for (const p of written) reached.add(p);
   const free: number[] = [];
   for (let p = ROOT_PAGE; p < db.pageCount; p++) {
     if (!reached.has(p)) free.push(p);
@@ -383,18 +410,44 @@ export function persistTemp(
   budget: BudgetCtx | null = null,
 ): void {
   if (db.paging === null) return;
+  adoptStaged(db, snap, stageInMemory(db, snap, budget, ""), canReclaim);
+}
+
+// stageInMemory is the first half of persistTemp: write snap's dirty pages into the in-RAM store and
+// take the residency flip, but adopt none of the page accounting. An in-memory attachment stages in
+// commitTx and adopts only after main persists and the roots publish (attached-databases.md §5):
+// adopting first would let a failed main persist leave a free list computed from an unpublished root,
+// so a later commit could overwrite pages the published root still references.
+export function stageInMemory(
+  db: Engine,
+  snap: Snapshot,
+  budget: BudgetCtx | null,
+  name: string,
+): StagedCommit {
+  const paging = db.paging!;
   const write = planInMemory(db, snap, true, budget);
-  db.paging.reserve(write.pageCount);
+  paging.reserve(write.pageCount);
   for (const pg of write.pages) {
-    db.paging.writeBlock(pg.index, pg.bytes);
+    paging.writeBlock(pg.index, pg.bytes);
     // Drop any stale pool entry: within-session compaction may hand this page id back for a new node,
     // and the pool caches by page id (bufferpool.ts invalidate). A no-op for a fresh page.
-    db.paging.invalidate(pg.index);
+    paging.invalidate(pg.index);
   }
   // No meta write, no sync: never reopened, no durability barrier.
-  db.pageCount = write.pageCount;
-  recordBudget(db, write);
-  db.freePages = write.freeRemaining;
   snap.demoteCleanLeaves();
-  maybeCompact(db, snap, write.rootPage, write.pages, canReclaim);
+  return stagedFromWrite(name, write);
+}
+
+// adoptStaged is the second half of persistTemp: adopt a staged commit's page accounting and run the
+// post-commit compaction relative to snap, its now-committed root.
+export function adoptStaged(
+  db: Engine,
+  snap: Snapshot,
+  staged: StagedCommit,
+  canReclaim: boolean,
+): void {
+  db.pageCount = staged.pageCount;
+  recordBudget(db, staged);
+  db.freePages = staged.freeRemaining;
+  maybeCompact(db, snap, staged.rootPage, staged.written, canReclaim);
 }

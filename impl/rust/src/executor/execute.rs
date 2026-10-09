@@ -849,6 +849,7 @@ impl Engine {
     /// the §3 short commit window. A durable-write failure leaves `committed` untouched and
     /// propagates (the commit failed; the working set is discarded). Returns to autocommit.
     pub(crate) fn commit_tx(&mut self) -> Result<Outcome> {
+        self.staged_attachments.clear();
         let tx = match self.session.tx.take() {
             None => {
                 return Ok(Outcome::Statement {
@@ -957,19 +958,28 @@ impl Engine {
         self.session.temp_committed = temp_working;
         // Adopt each dirtied host-attached database (attached-databases.md §5, the N-root commit) and
         // adopt it into this engine's pinned attached view, so `publish` swaps a new `Roots::attached`. An
-        // IN-MEMORY attachment packs persist_temp-style (the same incremental copy-on-write pack as temp,
-        // NO fsync — no durability barrier); a FILE attachment (Slice 2) commits DURABLY (dirty pages +
-        // alternating meta slot + fsync, its own page space) — [`Shared::commit_attachment`] branches on
-        // the storage kind. The root is DATABASE-scoped (published, cross-session-visible). At most one
-        // file attachment is dirty here (the one-durable-writer check above), so ≤1 fsync path runs.
-        // Within-session compaction (in-memory only) is safe only when no cross-session reader pins an
-        // older root (the live-registry watermark — the committing writer holds the gate but is not in
-        // `live`).
+        // IN-MEMORY attachment STAGES persist_temp-style (the same incremental copy-on-write pack as temp,
+        // NO fsync — no durability barrier) into free or past-high-water pages; its page accounting and
+        // compaction are adopted only after main persists and the roots publish, so a failure anywhere
+        // before that leaves its storage matching its still-published root. A FILE attachment (Slice 2)
+        // commits DURABLY (dirty pages + alternating meta slot + fsync, its own page space) —
+        // [`Shared::commit_attachment`] branches on the storage kind — and goes last, after every
+        // in-memory stage, so only main's persist follows its durable point. The root is DATABASE-scoped
+        // (published, cross-session-visible). At most one file attachment is dirty here (the
+        // one-durable-writer check above), so ≤1 fsync path runs. A file attachment's reclamation is
+        // safe only when no cross-session reader pins an older root (the live-registry watermark — the
+        // committing writer holds the gate but is not in `live`).
         if !attach_dirty.is_empty() {
             let core = self.core.clone();
             let can_reclaim = core.as_ref().is_none_or(|c| !c.has_live_readers());
+            let mut names: Vec<&String> = attach_dirty.iter().collect();
+            names.sort_by_key(|name| {
+                let file = core.as_ref().is_some_and(|c| c.attachment_is_file(name));
+                (file, name.as_str())
+            });
+            let mut staged = Vec::new();
             let mut na = self.attached_committed.clone();
-            for name in &attach_dirty {
+            for name in names {
                 let Some(mut ws) = attach_working.remove(name) else {
                     continue;
                 };
@@ -978,11 +988,18 @@ impl Engine {
                 if let Some(c) = &core {
                     // A detached-mid-transaction attachment (unreachable under the writer gate) no-ops.
                     let base_txid = self.attached_committed.get(name).map_or(0, |a| a.txid);
-                    c.commit_attachment(name, &mut ws, base_txid, can_reclaim, stages_rows)?;
+                    staged.extend(c.commit_attachment(
+                        name,
+                        &mut ws,
+                        base_txid,
+                        can_reclaim,
+                        stages_rows,
+                    )?);
                 }
                 na.insert(name.clone(), std::sync::Arc::new(ws));
             }
             self.attached_committed = na;
+            self.staged_attachments = staged;
         }
         Ok(Outcome::Statement {
             cost: 0,

@@ -496,6 +496,11 @@ pub struct Engine {
     /// that stages none — pure deletes and drops — may exceed `max_storage_bytes` so a full database
     /// can be repaired. Read by the shared core's publish, which persists main after `commit_tx`.
     pub(crate) commit_stages_rows: bool,
+    /// The in-memory attachment commits the last `commit_tx` staged (attached-databases.md §5): their
+    /// pages are in each attachment's block store, but its page accounting and post-commit compaction
+    /// are adopted only after main persists and the roots publish. Taken by the shared core's publish;
+    /// dropped (publishing nothing) on any failure before it.
+    pub(crate) staged_attachments: Vec<crate::shared::StagedCommit>,
     /// The shared core this engine's session belongs to (attached-databases.md §5), or `None` for a
     /// bare/transient engine (a test [`Engine::new`], a `snapshot_engine`, a `from_snapshot` read view —
     /// none of which commit attachments). It is the engine's route to the core-owned attachment registry

@@ -83,10 +83,12 @@ import {
 } from "./ergonomic.ts";
 import { engineError } from "./errors.ts";
 import {
+  adoptStaged,
   type BudgetCtx,
   persistImpl,
   persistSharedBody,
   precheckBudget,
+  type StagedCommit,
   storageBytes,
 } from "./persist.ts";
 import type { Statement } from "./ast.ts";
@@ -506,6 +508,28 @@ class SharedCore {
   // so an empty registry means no other session can observe a page the commit is about to reclaim.
   hasLiveReaders(): boolean {
     return this.live.size > 0;
+  }
+
+  // adoptAttachments adopts the in-memory attachment commits commitTx staged, after main persisted and
+  // the roots published (attached-databases.md §5): advance each attachment's page accounting and run
+  // its post-commit compaction relative to its now-published root in attached. Compaction is safe only
+  // when no cross-session reader pins an older root (the live registry; the committing writer holds the
+  // gate but is not in live) — read here, after publish. The commit is already published, so a
+  // compaction walk that cannot read a page only skips this reclamation: the free list stays the
+  // plan's, and the read error surfaces on the next read of that page.
+  adoptAttachments(staged: StagedCommit[], attached: Map<string, Snapshot>): void {
+    if (staged.length === 0) return;
+    const canReclaim = !this.hasLiveReaders();
+    for (const commit of staged) {
+      const att = this.attachments.get(commit.name);
+      const snap = attached.get(commit.name);
+      if (att === undefined || snap === undefined) continue;
+      try {
+        adoptStaged(att.storage, snap, commit, canReclaim);
+      } catch {
+        // See above: an unreadable page skips reclamation; the commit stands.
+      }
+    }
   }
 
   // mainIsDurable reports whether MAIN is file-backed (durable) rather than in-memory — the input to the
@@ -1378,7 +1402,9 @@ export class Session {
       if (commit) {
         const failed = this.engine.session.tx?.failed ?? false;
         const out = this.engine.commitTx(); // inner in-memory swap: committed := working
-        if (!failed && this.gateHeld) this.publish(); // persist + publish; may throw on I/O failure
+        if (!failed && this.gateHeld)
+          this.publish(); // persist + publish; may throw on I/O failure
+        else this.engine.stagedAttachments = [];
         return out;
       }
       return this.engine.rollbackTx();
@@ -1428,6 +1454,9 @@ export class Session {
   // updated only on success, so a persist I/O failure throws and leaves the shared committed state (and
   // this session's version) unchanged. In-memory persist is a no-op.
   private publish(): void {
+    // Taken first, so any failure below drops the staged attachment commits unadopted.
+    const staged = this.engine.stagedAttachments;
+    this.engine.stagedAttachments = [];
     this.core.checkPid();
     const snap = this.engine.committed;
     snap.txid = this.baseVersion + 1n; // advance the shared version on every commit
@@ -1447,11 +1476,13 @@ export class Session {
     this.engine.committed = snap;
     this.core.committed = snap;
     // The N-root commit (attached-databases.md §5): publish the new attached roots the commit adopted
-    // (commitTx already packed each dirtied attachment's working root into its in-RAM store and adopted
+    // (commitTx already staged each dirtied attachment's working root into its in-RAM store and adopted
     // it into engine.attachedCommitted) together with the new main root, so a reader pins a consistent
-    // cross-database snapshot. An unchanged attachment carries its prior root through; an empty map
-    // (nothing attached) is the pre-attachment single-root publish.
+    // cross-database snapshot, then adopt the staged attachment storage accounting. An unchanged
+    // attachment carries its prior root through; an empty map (nothing attached) is the pre-attachment
+    // single-root publish.
     this.core.attached = this.engine.attachedCommitted;
+    this.core.adoptAttachments(staged, this.engine.attachedCommitted);
     this.baseVersion += 1n;
   }
 

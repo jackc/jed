@@ -198,6 +198,8 @@ import {
   commitDurableAttachment,
   persistSharedBody,
   persistTemp,
+  type StagedCommit,
+  stageInMemory,
   type StorageBudget,
 } from "./persist.ts";
 import { Decimal, workLinear } from "./decimal.ts";
@@ -1330,6 +1332,11 @@ export class Engine {
   // §8.3): a commit that stages none — pure deletes and drops — may exceed max_storage_bytes so a full
   // database can be repaired. Read by Session.publish, which persists main after commitTx.
   commitStagesRows: boolean;
+  // stagedAttachments is the in-memory attachment commits the last commitTx staged
+  // (attached-databases.md §5): their pages are in each attachment's block store, but its page
+  // accounting and post-commit compaction are adopted only after main persists and the roots publish.
+  // Taken by Session.publish; dropped (publishing nothing) on any failure before it.
+  stagedAttachments: StagedCommit[] = [];
   // Per-top-level-statement de-duplication for transactional estimator-revision advances.
   private estimatorTouched = new Set<string>();
   // Inbound NO ACTION/RESTRICT probes deferred until the outermost recursive action closure has
@@ -2606,6 +2613,7 @@ export class Engine {
   // persistHook, §9), then swap it in as committed. A durable-write failure leaves committed untouched
   // and rethrows. Returns to autocommit.
   commitTx(): Outcome {
+    this.stagedAttachments = [];
     const tx = this.session.tx;
     if (tx === null) return { kind: "statement", cost: 0n, rowsAffected: null };
     this.session.tx = null;
@@ -2692,11 +2700,19 @@ export class Engine {
     // only when no cross-session reader pins an older root (the live-registry watermark — the committing
     // writer holds the gate but is not itself a live reader). Skipped for a bare/core-less engine.
     if (tx.attachDirty !== undefined && tx.attachDirty.size > 0 && this.core !== null) {
+      const core = this.core;
       const na = new Map(this.attachedCommitted);
-      const canReclaim = !this.core.hasLiveReaders();
-      const canCompact = this.core.canCompactCommitted();
-      for (const name of tx.attachDirty) {
-        const att = this.core.attachments.get(name);
+      const canReclaim = !core.hasLiveReaders();
+      const canCompact = core.canCompactCommitted();
+      // In-memory attachments stage first, in name order; the (at most one) file attachment commits
+      // last, so only main's persist follows its durable point.
+      const isFile = (name: string): boolean => (core.attachments.get(name)?.storage.path ?? null) !== null;
+      const names = [...tx.attachDirty].sort((a, b) =>
+        isFile(a) !== isFile(b) ? (isFile(a) ? 1 : -1) : a < b ? -1 : a > b ? 1 : 0,
+      );
+      const staged: StagedCommit[] = [];
+      for (const name of names) {
+        const att = core.attachments.get(name);
         if (att === undefined) continue; // detached mid-transaction (unreachable) — nothing to persist
         const ws = tx.attachWorking!.get(name)!;
         const stagesRows = ws.stagedBytes() !== 0;
@@ -2731,14 +2747,15 @@ export class Engine {
         } else {
           // The budget's forced compaction rebuilds the free list from the attachment's committed
           // root (memory.md §8.3).
-          const prev = this.core.committedAttachment(name);
+          const prev = core.committedAttachment(name);
           const budget = prev === undefined ? null : { name, prev, canCompact, stagesRows };
-          persistTemp(att.storage, ws, canReclaim, budget);
+          staged.push(stageInMemory(att.storage, ws, budget, name));
         }
         ws.freezeMutationGenerations();
         na.set(name, ws);
       }
       this.attachedCommitted = na;
+      this.stagedAttachments = staged;
     }
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }

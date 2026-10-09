@@ -86,6 +86,11 @@ type engine struct {
 	// §8.3): a commit that stages none — pure deletes and drops — may exceed max_storage_bytes so a full
 	// database can be repaired. Read by Session.publish, which persists main after commitTx.
 	commitStagesRows bool
+	// stagedAttachments is the in-memory attachment commits the last commitTx staged
+	// (attached-databases.md §5): their pages are in each attachment's block store, but its page
+	// accounting and post-commit compaction are adopted only after main persists and the roots publish.
+	// Taken by Session.publish; dropped (publishing nothing) on any failure before it.
+	stagedAttachments []stagedCommit
 	// core is the shared core this engine's session belongs to (attached-databases.md §5), or nil for a
 	// bare/transient engine (a test engine, a snapshotEngine, committedEngine — none of which see
 	// attachments). It is the engine's route to the core-owned attachment registry (core.attachments)

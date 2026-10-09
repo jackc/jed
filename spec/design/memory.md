@@ -666,10 +666,13 @@ leave the transaction open. A forced compaction that ran before the rejection
 stays in effect; it only changed which dead pages the free list holds.
 
 **Multi-root commits.** A transaction that also dirties session temp tables or
-in-memory attachments packs those domains before main persists
-([attached-databases.md](attached-databases.md) §5), and packing a domain runs its
-post-commit compaction. So when any such domain is dirty, **every limited in-memory
-domain is prechecked before any domain packs a page**: attachments by name, then
+in-memory attachments packs those domains before main persists. Packing temp runs
+its post-commit compaction; an attachment only stages its pages, adopting its
+accounting and compaction after the roots publish
+([attached-databases.md](attached-databases.md) §5), but a `54P06` raised while it
+plans would still follow an earlier domain's pack. So when any such domain is
+dirty, **every limited in-memory domain is prechecked before any domain packs a
+page**: attachments by name, then
 main, each planned (with any forced compaction), checked, and its plan's page
 assignment discarded; the real commit then re-plans the same allocation. A
 rejection in any domain discards the whole transaction like a `ROLLBACK`, temp

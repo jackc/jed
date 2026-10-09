@@ -548,13 +548,44 @@ type storageBudget struct {
 }
 
 // record remembers a successful in-memory commit's catalog root and written pages.
-func (b *storageBudget) record(write incrementalWrite) {
-	b.lastCatRoot = write.rootPage
-	b.lastWritten = make([]uint32, len(write.pages))
+func (b *storageBudget) record(staged stagedCommit) {
+	b.lastCatRoot = staged.rootPage
+	b.lastWritten = append([]uint32(nil), staged.written...)
+	b.lastCatalogPages = staged.catalogPages
+}
+
+// stagedCommit is an in-memory commit whose pages are written into its block store but whose page
+// accounting is not yet adopted (attached-databases.md §5). The pages occupy only free-list slots and
+// pages past the high-water, none reachable from the published root, so dropping a staged commit leaves
+// the storage exactly as the published root needs it; the next commit re-plans the same pages. Adopting
+// it (adoptStaged) advances the high-water, free list, and budget record, then runs the post-commit
+// compaction relative to the new root — which is sound only once that root is published.
+type stagedCommit struct {
+	// name is the attachment the commit belongs to ("" for a temp domain, which adopts in place).
+	name          string
+	rootPage      uint32
+	pageCount     uint32
+	freeRemaining []uint32
+	// written is the pages the commit wrote (unioned into the compaction's live set; the budget record).
+	written []uint32
+	// catalogPages is how many of them are catalog pages (the budget's repair exemption, memory.md §8.3).
+	catalogPages int
+}
+
+// newStagedCommit summarizes a written incremental plan as a stagedCommit.
+func newStagedCommit(name string, write incrementalWrite) stagedCommit {
+	written := make([]uint32, len(write.pages))
 	for i, pg := range write.pages {
-		b.lastWritten[i] = pg.index
+		written[i] = pg.index
 	}
-	b.lastCatalogPages = catalogPageCount(write.pages)
+	return stagedCommit{
+		name:          name,
+		rootPage:      write.rootPage,
+		pageCount:     write.pageCount,
+		freeRemaining: write.freeRemaining,
+		written:       written,
+		catalogPages:  catalogPageCount(write.pages),
+	}
 }
 
 // budgetCtx is the budget context of one in-memory domain's commit (memory.md §8.3): its name (for the
@@ -776,10 +807,7 @@ func (st *storage) commitInMemory(snap *snapshot, write incrementalWrite, canRec
 	}); err != nil {
 		return err
 	}
-	st.pageCount = write.pageCount
-	st.budget.record(write)
-	st.freePages = write.freeRemaining
-	return st.maybeCompact(snap, write.rootPage, write.pages, canReclaim)
+	return st.adoptStagedLocked(snap, newStagedCommit("", write), canReclaim)
 }
 
 // planInMemory plans an in-memory commit's page allocation under the domain's max_storage_bytes limit
@@ -966,7 +994,7 @@ func (c *sharedCore) deregisterPin(v uint64) {
 // the live set so a live GiST R-tree (rewritten wholesale each commit, invisible to reachablePages) is
 // never freed. canReclaim is the caller's watermark decision — true iff no live reader/cursor pins a
 // version older than this commit.
-func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, written []dirtyPage, canReclaim bool) error {
+func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, written []uint32, canReclaim bool) error {
 	if !st.reclaimWithinSession || !canReclaim {
 		return nil
 	}
@@ -978,8 +1006,8 @@ func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, written []dirtyP
 	if err != nil {
 		return err
 	}
-	for _, w := range written {
-		reached[w.index] = true
+	for _, p := range written {
+		reached[p] = true
 	}
 	free := make([]uint32, 0, int(st.pageCount)-len(reached))
 	for p := rootPage; p < st.pageCount; p++ {
@@ -1006,12 +1034,32 @@ func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, written []dirtyP
 func (st *storage) persistTemp(snap *snapshot, canReclaim bool, budget *budgetCtx) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	staged, err := st.stageInMemoryLocked(snap, budget, "")
+	if err != nil {
+		return err
+	}
+	return st.adoptStagedLocked(snap, staged, canReclaim)
+}
+
+// stageInMemory is the first half of persistTemp: write snap's dirty pages into the in-RAM store and
+// take the residency flip, but adopt none of the page accounting. An in-memory attachment stages in
+// commitTx and adopts only after main persists and the roots publish (attached-databases.md §5):
+// adopting first would let a failed main persist leave a free list computed from an unpublished root,
+// so a later commit could overwrite pages the published root still references.
+func (st *storage) stageInMemory(snap *snapshot, budget *budgetCtx, name string) (stagedCommit, error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.stageInMemoryLocked(snap, budget, name)
+}
+
+// stageInMemoryLocked is stageInMemory with st.mu held.
+func (st *storage) stageInMemoryLocked(snap *snapshot, budget *budgetCtx, name string) (stagedCommit, error) {
 	// A temp domain (and an in-memory attachment) is session-local / driven by one goroutine, so its only
 	// reader is the session's own streaming cursor — gated synchronously by canReclaim (openStreams). There
 	// is no cross-thread pin-registration race, so reuse is always safe here (transactions.md §8).
 	write, err := st.planInMemory(snap, true, budget)
 	if err != nil {
-		return err
+		return stagedCommit{}, err
 	}
 	if err := st.paging.withPager(func(p *pager) error {
 		if err := p.reserve(write.pageCount); err != nil {
@@ -1027,13 +1075,42 @@ func (st *storage) persistTemp(snap *snapshot, canReclaim bool, budget *budgetCt
 		}
 		return nil // no meta write, no sync: never reopened, no durability barrier
 	}); err != nil {
-		return err
+		return stagedCommit{}, err
 	}
-	st.pageCount = write.pageCount
-	st.budget.record(write)
-	st.freePages = write.freeRemaining
 	snap.demoteCleanLeaves()
-	return st.maybeCompact(snap, write.rootPage, write.pages, canReclaim)
+	return newStagedCommit(name, write), nil
+}
+
+// adoptStagedLocked is the second half of persistTemp: adopt a staged commit's page accounting and run
+// the post-commit compaction relative to snap, its now-committed root. Caller holds st.mu.
+func (st *storage) adoptStagedLocked(snap *snapshot, staged stagedCommit, canReclaim bool) error {
+	st.pageCount = staged.pageCount
+	st.budget.record(staged)
+	st.freePages = staged.freeRemaining
+	return st.maybeCompact(snap, staged.rootPage, staged.written, canReclaim)
+}
+
+// adoptAttachments adopts the in-memory attachment commits commitTx staged, after main persisted and
+// the roots published (attached-databases.md §5): advance each attachment's page accounting and run its
+// post-commit compaction relative to its now-published root in attached. Compaction is safe only when
+// no cross-session reader pins an older root (the live registry; the committing writer holds the gate
+// but is not in live) — read here, after publish, so a reader that pinned during the commit is counted.
+// The commit is already published, so a compaction walk that cannot read a page only skips this
+// reclamation: the free list stays the plan's, and the read error surfaces on the next read of that page.
+func (c *sharedCore) adoptAttachments(staged []stagedCommit, attached map[string]*snapshot) {
+	if len(staged) == 0 {
+		return
+	}
+	canReclaim := !c.hasLiveReaders()
+	for _, commit := range staged {
+		att, snap := c.attachment(commit.name), attached[commit.name]
+		if att == nil || snap == nil {
+			continue
+		}
+		att.storage.mu.Lock()
+		_ = att.storage.adoptStagedLocked(snap, commit, canReclaim)
+		att.storage.mu.Unlock()
+	}
 }
 
 // attachmentBudget is the budget context of in-memory attachment name's commit (memory.md §8.3), or
@@ -2086,6 +2163,8 @@ func (s *Session) endBlock(commit bool) (outcome, error) {
 		if err == nil && !failed && s.gateHeld {
 			// A clean writable block: persist + publish. A persist failure surfaces here and stores nothing.
 			err = s.publish()
+		} else {
+			s.engine.stagedAttachments = nil
 		}
 	} else {
 		out, err = s.engine.rollbackTx()
@@ -2124,6 +2203,9 @@ func (s *Session) refreshCommitted() {
 // any host, bplus-reshape.md B3) and the root is stored only on success, so a persist I/O failure
 // leaves the shared committed state (and this session's version) unchanged and surfaces the error.
 func (s *Session) publish() error {
+	// Taken first, so any failure below drops the staged attachment commits unadopted.
+	staged := s.engine.stagedAttachments
+	s.engine.stagedAttachments = nil
 	if err := s.core.checkCoordinatorPIDs(); err != nil {
 		return err
 	}
@@ -2145,8 +2227,8 @@ func (s *Session) publish() error {
 	s.engine.committed = snap
 	// The N-root commit (attached-databases.md §5): publish the new main root TOGETHER with the current
 	// attached roots in one atomic Store, so a reader pins a consistent cross-database snapshot. commitTx
-	// already adopted each dirtied attachment's working root into engine.attachedCommitted (and packed it
-	// into the attachment's in-RAM store); an unchanged attachment carries its prior root through
+	// already adopted each dirtied attachment's working root into engine.attachedCommitted (and staged its
+	// pages into the attachment's in-RAM store, adopted just after the Store); an unchanged attachment carries its prior root through
 	// unchanged. A nil map (nothing attached) is byte-for-byte the pre-attachment single-root publish.
 	// The Store takes liveMu — the same lock pinLatest registers under (transactions.md §8) — so a reader
 	// pins EITHER the old committed (and is counted at that version) OR the new one, never a version the
@@ -2154,6 +2236,7 @@ func (s *Session) publish() error {
 	s.core.liveMu.Lock()
 	s.core.roots.Store(&roots{committed: snap, attached: s.engine.attachedCommitted})
 	s.core.liveMu.Unlock()
+	s.core.adoptAttachments(staged, s.engine.attachedCommitted)
 	s.baseVersion++
 	return nil
 }
