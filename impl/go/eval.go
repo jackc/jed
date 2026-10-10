@@ -2448,26 +2448,26 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
-		// STRICT: a NULL argument short-circuits to NULL before the kernel runs (§4.2), so the kernel
-		// never sees a NULL — exactly like the built-in scalar-function arm.
-		hvals := make([]Value, 0, len(e.sargs))
-		for _, a := range e.sargs {
-			v, err := a.eval(row, env, m)
-			if err != nil {
-				return Value{}, err
-			}
-			if v.Kind == ValNull {
-				return NullValue(), nil // NULL propagates
-			}
-			hvals = append(hvals, v)
-		}
 		// The kernel's outcome for this row: prefetched by the site's batch (§4.2.1 — speculative
-		// batch, scalar replay), or a batch-of-one call when it has none.
-		var out Value
-		var err error
-		if o, ok := env.hostBatch.take(e); ok {
-			out, err = o.value, o.err
-		} else {
+		// batch, scalar replay), or a batch-of-one call when it has none. A prefetched outcome proves
+		// every argument is trivially evaluable (free, cannot raise) and non-NULL on this row, so
+		// evaluating them again here would charge nothing, raise nothing, and not short-circuit — the
+		// replay skips it.
+		out, ok, err := env.hostBatch.take(e)
+		if !ok {
+			// STRICT: a NULL argument short-circuits to NULL before the kernel runs (§4.2), so the
+			// kernel never sees a NULL — exactly like the built-in scalar-function arm.
+			hvals := make([]Value, 0, len(e.sargs))
+			for _, a := range e.sargs {
+				v, err := a.eval(row, env, m)
+				if err != nil {
+					return Value{}, err
+				}
+				if v.Kind == ValNull {
+					return NullValue(), nil // NULL propagates
+				}
+				hvals = append(hvals, v)
+			}
 			out, err = hf.callOne(hvals)
 		}
 		if err != nil {

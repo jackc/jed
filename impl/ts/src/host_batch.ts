@@ -2,10 +2,11 @@
 // replay. An evaluation site that already holds a chunk of rows asks HostBatch.setRow to call each
 // eligible host function ONCE over the chunk's argument columns, then replays its ordinary
 // row-at-a-time evaluation with the batch installed on the EvalEnv (env.hostBatch). The hostFunc eval
-// case still charges, guards, evaluates its arguments, short-circuits NULL, and type-checks per row
-// exactly as before; it only takes the kernel's outcome from the cache instead of calling the kernel.
-// So rows, cost, abort points, and errors are identical to batch-of-one by construction. Mirrors
-// impl/rust/src/executor/host_batch.rs.
+// case still charges, guards, and type-checks per row exactly as before, and evaluates its arguments
+// and short-circuits NULL for any row the batch cannot answer; for a prefetched row it takes the
+// kernel's outcome from the cache, skipping the argument evaluation that would charge nothing, raise
+// nothing, and not short-circuit. So rows, cost, abort points, and errors are identical to
+// batch-of-one by construction. Mirrors impl/rust/src/executor/host_batch.rs.
 
 import { Meter } from "./cost.ts";
 import { evalExpr } from "./eval.ts";

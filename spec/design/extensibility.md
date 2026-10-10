@@ -366,7 +366,9 @@ lanes (packed-leaf.md §11), batching needs no unmetered gate. A call node is el
    SQL behavior;
 2. every argument is **trivially evaluable** — a column reference, constant, or parameter — so the
    prefetch can evaluate it without a meter: such an argument is free (cost.md §3) and cannot raise,
-   so the prefetch does no unmetered engine work and replay re-reads the same values;
+   so the prefetch does no unmetered engine work. For the same reason a replayed row whose outcome
+   *was* prefetched (its arguments proven non-NULL) may skip re-evaluating them: doing so would charge
+   nothing, raise nothing, and not short-circuit, so it is unobservable;
 3. it is evaluated **unconditionally, once per row**, at the site — a direct item of the evaluated
    expression list, not beneath `CASE`/`COALESCE`/`NULLIF`/`AND`/`OR` or inside a subquery.
 

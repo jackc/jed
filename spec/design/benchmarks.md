@@ -1300,10 +1300,16 @@ of a single-row kernel and `(batch − none) / rows` the cost left after batchin
 shape is chosen because it runs on the buffered projection, the site that prefetches; a full-table
 `ORDER BY id` streams and calls the kernel batch-of-one (extensibility.md §4.2.1 "Sites").
 
-In the native cores a host call is an in-process closure call, so batching is roughly neutral there
-(at landing: Rust's batch saved ~15 ns of a ~70 ns per-row call, TS was within noise, and Go's batch
-was ~20–50 ns per row *slower* — the prefetch evaluates the arguments a second time and stores an
-outcome per row, which a closure call that cheap does not repay). The triple exists for the wrapped bindings, where each call crosses a language
+In the native cores a host call is an in-process closure call, so batching is roughly neutral there.
+Because both functions are immutable, both are prefetched at this site — `bench_mix_row` through the
+registry's single-row adapter — so `row` and `batch` differ only in kernel shape. At landing, Rust's
+batch saved ~15 ns of a ~70 ns per-row call, TS was within noise, and Go's batch was ~20–50 ns per row
+*slower* than its single-row kernel, both ~80 ns over `none`: the replay evaluated the arguments a
+second time into a fresh per-row slice, and the prefetch stored and copied a 56-byte outcome per row.
+After the replay began skipping argument evaluation for prefetched rows (extensibility.md §4.2.1,
+condition 2) and Go began storing results compactly in reused buffers, Go's `row`/`batch` sit ~5–15 ns
+over `none` (p50 per row, median of 5: none 915, row 921, batch 929), Rust's are ~6–8 ns faster
+than before (row 542, batch 528), and TS is unchanged within noise. The triple exists for the wrapped bindings, where each call crosses a language
 boundary and batching amortizes it; a wrapped driver (Ruby gem, Node/Rust, wasm) joins the triple
 when its binding exposes host functions. Until then those drivers skip it, like the PostgreSQL and
 SQLite drivers (`engines = ["jed"]`).

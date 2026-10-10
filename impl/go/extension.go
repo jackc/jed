@@ -154,14 +154,6 @@ type hostFuncEntry struct {
 	batchKernel     HostBatchKernel // the batch kernel, or nil when kernel is set
 }
 
-// hostOutcome is one row's outcome of a batch kernel call (§4.2.1): the returned value, the error the
-// kernel reported for this row, or — computed false — a row after the failing one, never computed.
-type hostOutcome struct {
-	value    Value
-	err      error
-	computed bool
-}
-
 // batchable reports whether the executor may prefetch this function's results in a batch ahead of the
 // row-at-a-time replay (§4.2.1): any rung but Volatile, whose call set must stay exactly the scalar one.
 func (f *hostFuncEntry) batchable() bool { return f.volatility != VolatilityVolatile }
@@ -177,23 +169,25 @@ func (f *hostFuncEntry) callOne(args []Value) (Value, error) {
 	for j, v := range args {
 		cols[j] = []Value{v}
 	}
-	o := f.callBatch(cols, 1)[0]
-	return o.value, o.err
+	results, err := f.callBatch(cols, 1)
+	if err != nil {
+		return Value{}, err
+	}
+	return results[0], nil
 }
 
-// callBatch runs the kernel over args (column-major, n ≥ 1 rows, no NULLs) and returns one outcome per
-// row: a value for a returned result, an error for the row the kernel reported failing, and a
-// not-computed outcome for every row after it. Enforces the ABI shape (§4.2.1, all 22000): a successful
-// return with too few results fails at the first unanswered row; too many results, or an error after
-// answering every row, fails at the first row. Results are NOT type-checked here — the replay does
-// that per row, so a type error surfaces at its own row.
-func (f *hostFuncEntry) callBatch(args [][]Value, n int) []hostOutcome {
-	var out []Value
+// callBatch runs the kernel over args (column-major, n ≥ 1 rows, no NULLs) and returns the results of
+// the leading rows the kernel answered and, when that is fewer than n, the error of the row after them
+// (every later row was never computed); so err == nil ⇒ len(results) == n. Enforces the ABI shape
+// (§4.2.1, all 22000): a successful return with too few results fails at the first unanswered row; too
+// many results, or an error after answering every row, fails at the first row. Results are NOT
+// type-checked here — the replay does that per row, so a type error surfaces at its own row.
+func (f *hostFuncEntry) callBatch(args [][]Value, n int) ([]Value, error) {
+	out := make([]Value, 0, n)
 	var err error
 	if f.batchKernel != nil {
-		out, err = f.batchKernel(args, make([]Value, 0, n))
+		out, err = f.batchKernel(args, out)
 	} else {
-		out = make([]Value, 0, n)
 		row := make([]Value, len(args))
 		for i := 0; i < n; i++ {
 			for j, col := range args {
@@ -206,22 +200,14 @@ func (f *hostFuncEntry) callBatch(args [][]Value, n int) []hostOutcome {
 			out = append(out, v)
 		}
 	}
-	outcomes := make([]hostOutcome, n)
 	got := len(out)
 	if got > n || (got == n && err != nil) {
-		outcomes[0] = hostOutcome{err: f.shapeError(n, got), computed: true}
-		return outcomes
+		return out[:0], f.shapeError(n, got)
 	}
-	for i, v := range out {
-		outcomes[i] = hostOutcome{value: v, computed: true}
+	if got < n && err == nil {
+		err = f.shapeError(n, got)
 	}
-	if got < n {
-		if err == nil {
-			err = f.shapeError(n, got)
-		}
-		outcomes[got] = hostOutcome{err: err, computed: true}
-	}
-	return outcomes
+	return out, err
 }
 
 func (f *hostFuncEntry) shapeError(n, got int) error {

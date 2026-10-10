@@ -1645,21 +1645,27 @@ impl RExpr {
                 // cost.md §3) so a large declared weight aborts BEFORE the kernel runs.
                 m.charge(hf.cost);
                 m.guard()?;
-                // STRICT: a NULL argument short-circuits to NULL before the kernel runs (§4.2), so
-                // the kernel never sees a NULL — exactly like the built-in scalar-function arm.
-                let mut vals = Vec::with_capacity(args.len());
-                for a in args {
-                    let v = a.eval(row, env, m)?;
-                    if matches!(v, Value::Null) {
-                        return Ok(Value::Null); // NULL propagates
-                    }
-                    vals.push(v);
-                }
                 // The kernel's outcome for this row: prefetched by the site's batch (§4.2.1 —
-                // speculative batch, scalar replay), or a batch-of-one call when it has none.
+                // speculative batch, scalar replay), or a batch-of-one call when it has none. A
+                // prefetched outcome proves every argument is trivially evaluable (free, cannot raise)
+                // and non-NULL on this row, so evaluating them again here would charge nothing, raise
+                // nothing, and not short-circuit — the replay skips it.
                 let out = match env.host_batch.and_then(|b| b.take(self)) {
                     Some(outcome) => outcome?,
-                    None => hf.call_one(vals)?,
+                    None => {
+                        // STRICT: a NULL argument short-circuits to NULL before the kernel runs
+                        // (§4.2), so the kernel never sees a NULL — exactly like the built-in
+                        // scalar-function arm.
+                        let mut vals = Vec::with_capacity(args.len());
+                        for a in args {
+                            let v = a.eval(row, env, m)?;
+                            if matches!(v, Value::Null) {
+                                return Ok(Value::Null); // NULL propagates
+                            }
+                            vals.push(v);
+                        }
+                        hf.call_one(vals)?
+                    }
                 };
                 // Defend jed's own strict type system against a misbehaving host kernel (CLAUDE.md
                 // §13 — the host owns its consequences, but a wrong-typed value must never reach

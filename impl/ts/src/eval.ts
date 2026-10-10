@@ -1129,20 +1129,24 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // weight aborts BEFORE the kernel runs.
       m.charge(hf.cost);
       m.guard();
-      // STRICT: a NULL argument short-circuits to NULL before the kernel runs (§4.2), so the kernel
-      // never sees a NULL — exactly like the built-in scalar-function arm.
-      const hvals: Value[] = [];
-      for (const a of e.args) {
-        const v = evalExpr(a, row, env, m);
-        if (v.kind === "null") return nullValue(); // NULL propagates
-        hvals.push(v);
-      }
       // The kernel's outcome for this row: prefetched by the site's batch (§4.2.1 — speculative
-      // batch, scalar replay), or a batch-of-one call when it has none.
+      // batch, scalar replay), or a batch-of-one call when it has none. A prefetched outcome proves
+      // every argument is trivially evaluable (free, cannot raise) and non-NULL on this row, so
+      // evaluating them again here would charge nothing, raise nothing, and not short-circuit — the
+      // replay skips it.
       const outcome = env.hostBatch?.take(e);
       let out: Value;
-      if (outcome === undefined) out = hf.callOne(hvals);
-      else if ("error" in outcome) throw outcome.error;
+      if (outcome === undefined) {
+        // STRICT: a NULL argument short-circuits to NULL before the kernel runs (§4.2), so the
+        // kernel never sees a NULL — exactly like the built-in scalar-function arm.
+        const hvals: Value[] = [];
+        for (const a of e.args) {
+          const v = evalExpr(a, row, env, m);
+          if (v.kind === "null") return nullValue(); // NULL propagates
+          hvals.push(v);
+        }
+        out = hf.callOne(hvals);
+      } else if ("error" in outcome) throw outcome.error;
       else out = outcome.value;
       // Defend jed's own strict type system against a misbehaving host kernel (CLAUDE.md §13 — the
       // host owns its consequences, but a wrong-typed value must never reach jed's codecs /
