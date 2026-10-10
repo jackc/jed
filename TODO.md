@@ -270,7 +270,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   (existing file); Go's exported `OpenDatabaseWithOptions`/`OpenOptions` closed the last open-surface
   divergence. Host-API only, byte-neutral. → [api.md §2.1.1](spec/design/api.md)
   - [ ] _follow-on:_ the anticipated create-time knobs as new `CreateOptions` fields
-    (`max_storage_bytes` has landed as the in-memory storage limit, memory.md §8 / Q4a; next a spill `temp_dir`, then a thread count);
+    (`max_storage_bytes` has landed as the storage limit, memory.md §8 / Q4a and Q4c; next a spill `temp_dir`, then a thread count);
     optionally sweep the async OPFS/browser host (`createOpfs`/`OpfsDatabase.create`) into the
     unified `create(opts)` shape.
 - [ ] **Storage hosts** — the five-method `BlockStore` byte device, host catalog, and decoration layering (encryption codec above the seam, replication tee below) authored in [hosts.md](spec/design/hosts.md). **Landed:** the per-core `FileBlockStore`s, the Node `fs` host, and the **Browser/OPFS host** (`FileSystemSyncAccessHandle` → engine in a Web Worker, file-host parity vs goldens, gated Playwright e2e). **Open:** OPFS disk-spill and running the real-browser e2e inside `mise run ci`. → [hosts.md §3/§5/§7](spec/design/hosts.md)
@@ -407,7 +407,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ a within-statement check (today a statement's own writes are checked once it
     completes, like `temp_buffers`), and a net-residency measure (today a rewrite charges again).
 - [x] **Q4a — committed in-memory storage.** A database-owned `max_storage_bytes` (create/attach
-  option + handle setter, unlimited by default, in-memory backings only — `0A000` on files) over
+  option + handle setter, unlimited by default; the file form is Q4c below) over
   `page_count × page_size`, checked at commit before any write; a commit that raises the
   high-water past the limit fails `54P06` after one forced compaction, with a repair exemption for
   pure deletes and drops and a multi-root precheck. The compaction trigger is shared data
@@ -418,9 +418,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [x] _Q4b:_ the resource-limits web page documents the §8.6 cache rules (evict-only,
     live-reference overshoot, the interior skeleton and GiST tree outside `cache_bytes`) and the
     B/2–B sizing note.
-  - [ ] _follow-on:_ a file-backed database-size cap over the **live** page count (§8.7 — the
-    high-water is co-residence-timing-dependent under shared access); bounding the interior
-    skeleton and resident GiST R-tree once they page.
+  - [x] _Q4c:_ the file form — `max_storage_bytes` on a file-backed database or file attachment
+    limits its **live** pages (reachable from the catalog root), an exact count persisted at meta
+    offset 56 (`format_version` 34) and advanced by an exact per-commit delta, so the trip point is
+    independent of the free list, the watermark, and co-resident append-only allocation. Create /
+    open / attach options and the setter; no forced compaction. Pinned by
+    `resource/storage_file.test` (disk) and `process/storage_limit.process.toml` (alone vs
+    co-resident); every core recounts each commit by reachability under the disk corpus.
+    See [memory.md](spec/design/memory.md) §8.7.
+  - [ ] _follow-on:_ bounding the interior skeleton and resident GiST R-tree once they page.
 - [x] **Output-constructing kernels** ([cost.md §8.1](spec/design/cost.md)). Growth kernels
   (array/JSON construction, concatenation, escaping renders) charge `scalar_byte × payload(result)`
   to cost after construction, which closes the geometric-growth hole (a recursive CTE doubling a

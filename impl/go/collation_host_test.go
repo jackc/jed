@@ -444,7 +444,6 @@ func TestUpgradeCollationsClearsSkew(t *testing.T) {
 	if loadedEngine.columnStatisticsScoped(nil, "t", 0) != nil {
 		t.Fatal("skewed statistics must be unavailable to the estimator")
 	}
-	db.engine = loadedEngine
 
 	n, err := db.UpgradeCollations()
 	if err != nil {

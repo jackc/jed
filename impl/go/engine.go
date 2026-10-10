@@ -54,6 +54,9 @@ type engine struct {
 	// reclamation walk only once the high-water passes ~2× it, mirroring storage (shared.go). 0 for an
 	// in-memory database (no persistence).
 	liveAtCompaction uint32
+	// live is the live-page accounting of the committed file state (spec/design/memory.md §8.7): read
+	// from the meta at open and advanced by every file commit. Zero for an in-memory engine.
+	live liveCount
 	// freeGenTxid is the version the current freePages list is "as of" — the last compaction's txid, or
 	// the committed version at open (every persisted free page is dead at the committed version). It gates
 	// reuse under the reader-liveness watermark (transactions.md §8): a page dead at generation G is safe

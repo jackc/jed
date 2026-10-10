@@ -1,15 +1,26 @@
-// Host-API surface of the committed-storage limit (spec/design/memory.md §8, Q4a): the create and
-// attach options, the runtime setter and the storageBytes gauge, the 0A000/42704 rejections, the
-// multi-root precheck, and the reader watermark's hold on forced compaction. Trip points themselves are
-// pinned in spec/conformance/suites/resource/storage_memory.test. Mirrors
+// Host-API surface of the committed-storage limit (spec/design/memory.md §8): the create, open, and
+// attach options, the runtime setter and the storageBytes gauge, the 42704 rejections, the multi-root
+// precheck, the reader watermark's hold on forced compaction (in-memory, Q4a), and the file form's
+// live-page measure (§8.7). Trip points themselves are pinned in
+// spec/conformance/suites/resource/storage_memory.test and storage_file.test. Mirrors
 // impl/rust/tests/storage_memory.rs.
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { attachFile, attachMemory, createDatabase, EngineError } from "../src/tooling.ts";
+import {
+  attachFile,
+  attachMemory,
+  createDatabase,
+  type Database,
+  EngineError,
+  openDatabase,
+  queryOutcome,
+  render,
+  verifyLivePages,
+} from "../src/tooling.ts";
 
 const PAGE = 8192n;
 
@@ -58,28 +69,135 @@ test("storage limit options and gauge", () => {
   db.close();
 });
 
-test("storage limit rejects file backings", () => {
-  const dir = mkdtempSync(join(tmpdir(), "jed-storage-memory-"));
-  const path = join(dir, "create.jed");
+// fileDb creates a fresh file-backed database with the live-page self-check on (memory.md §8.7): every
+// commit in these tests also recounts its live pages by reachability and throws on a mismatch.
+function fileDb(dir: string, tag: string, maxStorageBytes = 0n): { db: Database; path: string } {
+  verifyLivePages.enabled = true;
+  const path = join(dir, `${tag}.jed`);
+  return { db: createDatabase({ path, skipFsync: true, maxStorageBytes }), path };
+}
+
+function withDir(body: (dir: string) => void): void {
+  const dir = mkdtempSync(join(tmpdir(), "jed-storage-file-"));
   try {
-    assert.throws(() => createDatabase({ path, maxStorageBytes: PAGE }), is("0A000"));
-    assert.ok(!existsSync(path), "a rejected create makes no file");
-
-    const db = createDatabase({ path, skipFsync: true });
-    assert.throws(() => db.setMaxStorageBytes("main", PAGE), is("0A000"));
-    db.setMaxStorageBytes("main", 0n);
-    assert.ok(db.storageBytes("main") > 0n);
-    db.close();
-
-    const host = createDatabase();
-    assert.throws(
-      () => host.attach("f", { ...attachFile(path), maxStorageBytes: PAGE }, false),
-      is("0A000"),
-    );
-    host.close();
+    body(dir);
   } finally {
+    verifyLivePages.enabled = false;
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+test("file storage limit measures live pages", () => {
+  withDir((dir) => {
+    let { db, path } = fileDb(dir, "live");
+    // A fresh file holds one live page: its catalog.
+    assert.equal(db.storageBytes("main"), PAGE);
+    let s = db.session();
+    s.execute("CREATE TABLE t (id i32 PRIMARY KEY, v text)");
+    s.execute(batch(0, 200));
+    const full = db.storageBytes("main");
+    assert.ok(full > PAGE && full % PAGE === 0n);
+    // A delete lowers the measure at once; the file keeps its high-water and free pages.
+    const highWater = db.pageCount;
+    s.execute("DELETE FROM t WHERE id >= 100");
+    const half = db.storageBytes("main");
+    assert.ok(half < full);
+    assert.ok(db.pageCount >= highWater);
+
+    // The setter limits the file from the next commit; a rejected commit writes nothing.
+    db.setMaxStorageBytes("main", half);
+    assert.throws(() => s.execute(batch(100, 100)), is("54P06"));
+    assert.equal(db.storageBytes("main"), half);
+    // A commit that does not grow the live count is admitted at the limit.
+    s.execute("UPDATE t SET v = 'short' WHERE id < 10");
+    assert.equal(s.get("SELECT count(*) AS n FROM t")!.n, 100n);
+    const measured = db.storageBytes("main");
+    s.close();
+    db.close();
+
+    // The count is persisted: a reopen reports it without walking the file, and the open option sets
+    // the limit.
+    db = openDatabase(path, { skipFsync: true, maxStorageBytes: measured });
+    assert.equal(db.storageBytes("main"), measured);
+    s = db.session();
+    assert.throws(() => s.execute(batch(100, 100)), is("54P06"));
+    db.setMaxStorageBytes("main", 0n);
+    s.execute(batch(100, 100));
+    s.close();
+    db.close();
+  });
+});
+
+test("file storage limit counts every live structure", () => {
+  // Indexes (B-tree, GIN, GiST), overflow chains, a drop, and a host compaction, each checked by the
+  // reachability recount.
+  withDir((dir) => {
+    const { db } = fileDb(dir, "structures");
+    const s = db.session();
+    s.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32, v text, a i32[], r i32range)");
+    s.execute("CREATE INDEX t_k ON t (k)");
+    s.execute("CREATE INDEX t_a ON t USING gin (a)");
+    s.execute("CREATE INDEX t_r ON t USING gist (r)");
+    // An incompressible value larger than a record spills into its own overflow chain per row.
+    let x = 0x4a454442;
+    let filler = "";
+    for (let i = 0; i < 5000; i++) {
+      x = (x ^ (x << 13)) >>> 0;
+      x = (x ^ (x >>> 17)) >>> 0;
+      x = (x ^ (x << 5)) >>> 0;
+      filler += String.fromCharCode(65 + (x % 26));
+    }
+    s.run("INSERT INTO t VALUES (0, 0, $1, '{0,1}', '[0,5)')", filler);
+    const rows: string[] = [];
+    for (let g = 1; g <= 300; g++) rows.push(`(${g}, '{${g},${g + 1}}', '[${g},${g + 5})')`);
+    s.execute(`INSERT INTO t (id, a, r) VALUES ${rows.join(", ")}`);
+    s.execute("UPDATE t SET k = id % 7, v = (SELECT v FROM t WHERE id = 0)");
+    const full = db.storageBytes("main");
+    s.execute("UPDATE t SET v = left(v, 10) WHERE id % 3 = 0");
+    s.execute("DELETE FROM t WHERE id > 150");
+    assert.ok(db.storageBytes("main") < full);
+    s.execute("CREATE TABLE u (id i32 PRIMARY KEY, v text)");
+    s.execute("INSERT INTO u SELECT id, v FROM t");
+    s.execute("DROP TABLE t");
+    const before = db.storageBytes("main");
+    db.compact("main");
+    // Compaction renumbers pages but keeps every live one.
+    assert.equal(db.storageBytes("main"), before);
+    s.execute("DROP TABLE u");
+    assert.equal(db.storageBytes("main"), PAGE);
+    s.close();
+    db.close();
+  });
+});
+
+test("file attachment storage limit", () => {
+  withDir((dir) => {
+    const { db: file, path } = fileDb(dir, "attach");
+    file.execute("CREATE TABLE a (id i32 PRIMARY KEY, v text)");
+    file.close();
+    const host = createDatabase();
+    host.attach("f", attachFile(path, { maxStorageBytes: 4n * PAGE }), false);
+    const s = host.session();
+    s.execute("CREATE TABLE t (id i32 PRIMARY KEY, v text)");
+    const main = host.storageBytes("main");
+    const aux = host.storageBytes("f");
+    // A multi-root commit rejected in the file attachment publishes neither database.
+    s.execute("BEGIN");
+    s.execute(batch(0, 10));
+    s.execute("INSERT INTO f.a SELECT g, repeat('y', 1000) FROM generate_series(1, 100) g");
+    assert.throws(() => s.execute("COMMIT"), is("54P06"));
+    assert.equal(host.storageBytes("main"), main);
+    assert.equal(host.storageBytes("f"), aux);
+    // queryOutcome closes its cursor, so no reader pin outlives it (the detach below needs none).
+    const out = queryOutcome(s, "SELECT (SELECT count(*) FROM t), (SELECT count(*) FROM f.a)");
+    assert.equal(out.kind === "query" ? out.rows.map((r) => r.map(render)).join() : "", "0,0");
+    // A small write fits.
+    s.execute("INSERT INTO f.a VALUES (1, 'z')");
+    assert.ok(host.storageBytes("f") <= 4n * PAGE);
+    s.close();
+    host.detach("f");
+    host.close();
+  });
 });
 
 test("multi-root rejection packs no attachment", () => {

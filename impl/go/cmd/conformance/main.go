@@ -36,6 +36,9 @@ func run() int {
 	// resident and on-disk-faulted reads (the window-operand touched-set bug the in-memory pass could
 	// not see). Every record's SQL-in → rows/error/cost-out must be IDENTICAL in both modes.
 	disk := len(os.Args) > 1 && os.Args[1] == "disk"
+	// The disk pass recounts every commit's live pages by reachability (memory.md §8.7), so the whole
+	// corpus checks the incremental count the file-backed storage limit relies on.
+	jed.SetVerifyLivePages(disk)
 	mode := "memory"
 	if disk {
 		mode = "disk"
@@ -367,9 +370,10 @@ func parseAttachDirective(line string) (string, bool) {
 
 // parseMaxStorageBytesDirective parses a `# max_storage_bytes: N [database]` line
 // (spec/design/memory.md §8.1): an ACTION that sets the committed-storage limit of `main` (or the
-// named attachment) on the running handle from this point of the file on. In-memory backings only, so
-// such files are `# skip: disk`. Returns the limit and database name, or ok false if not this
-// directive.
+// named attachment) on the running handle from this point of the file on. The disk pass re-applies
+// main's limit after each per-record reopen; an in-memory database and a file-backed one measure
+// different things (§8.2 vs §8.7), so a file that pins trip points runs in one mode only. Returns the
+// limit and database name, or ok false if not this directive.
 func parseMaxStorageBytesDirective(line string) (int64, string, bool) {
 	body, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "max_storage_bytes:")
 	if !ok {
@@ -830,6 +834,9 @@ func runFile(text string, disk bool) error {
 	// onTemp tracks whether db/sess still point at the reopenable temp-file handle (a `# fixture:` swap
 	// flips it off — but fixtures are `# skip: disk`, so that never coexists with disk mode).
 	onTemp := disk
+	// mainStorageLimit is main's `# max_storage_bytes:` limit, re-applied to each disk-mode reopen (a
+	// handle setting).
+	mainStorageLimit := int64(0)
 	// reopenDisk closes the current handle and reopens the temp image, so the next record reads a fully
 	// demand-paged store (leaves fault on access — the on-disk read path the memory pass never reaches).
 	// A fresh session is minted; only per-record directives (re-applied below) and committed data (on the
@@ -844,6 +851,9 @@ func runFile(text string, disk bool) error {
 			return fmt.Errorf("disk reopen: open %s: %w", tmpPath, err)
 		}
 		db = reDB
+		if err := db.SetMaxStorageBytes("main", mainStorageLimit); err != nil {
+			return fmt.Errorf("disk reopen: max_storage_bytes: %w", err)
+		}
 		sess = db.Session(jed.SessionOptions{})
 		return nil
 	}
@@ -938,6 +948,9 @@ func runFile(text string, disk bool) error {
 			if bytes, name, ok := parseMaxStorageBytesDirective(line); ok {
 				if err := db.SetMaxStorageBytes(name, bytes); err != nil {
 					return fmt.Errorf("max_storage_bytes %q: %w", name, err)
+				}
+				if strings.EqualFold(name, "main") {
+					mainStorageLimit = bytes
 				}
 				i++
 				continue

@@ -10,7 +10,7 @@ accounts and one database-owned account (§8):
 |---|---|---|---|---|
 | Scalar allocation | `max_scalar_bytes` | 64 MiB | cumulative churn, never refunded | `54P04` |
 | Query memory | `max_query_memory_bytes` | unlimited | live logical bytes, released when dropped; opens holding the transaction's pending writes (§7) | `54P05` |
-| Committed storage (§8) | `max_storage_bytes` (database) | unlimited | an in-memory domain's `page_count × page_size`, checked at commit | `54P06` |
+| Committed storage (§8) | `max_storage_bytes` (database) | unlimited | an in-memory domain's `page_count × page_size`, a file's `live_pages × page_size` (§8.7), checked at commit | `54P06` |
 
 All are **guardrails, not heap caps.** They bound logical bytes computed from a
 shared, representation-independent schedule (or, for committed storage, the
@@ -552,9 +552,9 @@ are checked once the statement completes. Thresholds are pinned by
 
 ## 8. Q4: storage
 
-> **Status: Q4a implemented** in all three cores; **Q4b** (the public docs) landed.
-> The cache rules in §8.6 record contracts the pager already keeps and add nothing
-> to enforce.
+> **Status: Q4a implemented** in all three cores; **Q4b** (the public docs) landed;
+> **Q4c** (the file form, §8.7) implemented in all three cores. The cache rules in
+> §8.6 record contracts the pager already keeps and add nothing to enforce.
 
 Q1–Q3 charge memory that a **session** owns: a statement's buffers and state, and
 its transaction's staged writes. Storage memory outlives every statement and is
@@ -566,7 +566,7 @@ contracts:
 
 | Class | Owners | Bound | On exhaustion | Contract |
 |---|---|---|---|---|
-| **Committed storage** — non-refaultable bytes the database *is* | the `MemoryBlockStore` of an in-memory database and of each in-memory attachment | `max_storage_bytes` (new, §8.1) | the growing commit fails `54P06` | deterministic, cross-core (§8.4) |
+| **Committed storage** — non-refaultable bytes the database *is* | the `MemoryBlockStore` of an in-memory database and of each in-memory attachment; the live pages of a file-backed database and of each file attachment (§8.7) | `max_storage_bytes` (§8.1) | the growing commit fails `54P06` | deterministic, cross-core (§8.4, §8.7) |
 | **Caches** — refaultable copies of durable pages | the file-backed leaf pool | `cache_bytes` (existing, [pager.md](pager.md) §3) | evict; **never fails** | none; residency is unobservable (§8.6) |
 
 Session-local temp domains are neither. A session owns them, and `temp_buffers`
@@ -576,7 +576,8 @@ so Q4 does not count them again.
 The hazard Q4a closes: an untrusted session on an in-memory database can commit
 many small, cheap transactions. Each one fits `max_cost` and Q3's per-transaction
 bound, yet together they grow the database's RAM without limit. Q4a bounds what
-the session can make the *database* hold.
+the session can make the *database* hold. Q4c closes the same hazard for a durable
+file, which would otherwise grow until the disk fills (§8.7).
 
 ### 8.1 The setting
 
@@ -595,10 +596,13 @@ unlimited, which is the default**, for the same reason Q1 has no finite default
 retires the provisional `memory_limit` `CreateOptions` knob in TODO.md and gives it
 the `max_*_bytes` name its siblings use.
 
-Q4a covers **in-memory backings only**. Setting the limit on a file-backed database
-or file attachment is `0A000`. The file form of the limit (a database-size cap, the
-analog of SQLite's `max_page_count`) is a different measure, and §8.7 explains why
-it stays deferred rather than reusing this one.
+The same setting limits a **file-backed** database or file attachment (Q4c), over a
+different measure: its live pages, not its high-water (§8.7). For a file it is also
+an open option (Rust `OpenOptions { max_storage_bytes }`, Go
+`OpenOptions.MaxStorageBytes`, TS `maxStorageBytes`), and the create and attach
+options accept a file path. Like every handle setting it is not stored in the
+file: each handle, and each process sharing the file, enforces the limit it was
+given against the one persisted count.
 
 ### 8.2 Measure
 
@@ -750,31 +754,126 @@ state it accurately:
   (pager.md §6, gist.md §11).
 
 The handle gains one read-only **deterministic gauge**, `storage_bytes(name)`
-(Rust/Go/TS idiomatic spellings, like `resident_leaves`). It reports §8.2's measure
-for in-memory domains and `page_count × page_size` for file-backed ones. In both
-cases it is the logical committed high-water mark, not RSS, so a host can watch
-growth against its limit before it is hit.
+(Rust/Go/TS idiomatic spellings, like `resident_leaves`). It reports the measure
+the limit checks: §8.2's high-water for in-memory domains and §8.7's live pages for
+file-backed ones. It is neither RSS nor the file's length, so a host can watch
+growth against its limit before it is hit. A process sharing a file sees a peer's
+commits in the gauge once it begins its next transaction, which reloads the meta.
 
-### 8.7 Why the file form is deferred
+### 8.7 The file form
 
-For a file-backed database, `page_count × page_size` is not deterministic under
-shared multi-process access. While another process is co-resident, commits are
-append-only (`free_list_head = 0`, [locking.md](locking.md)). Co-residence is
-detected by a background probe, so how much the file grows depends on timing that
-no single handle's operation sequence fixes. A file-size cap therefore needs a
-different measure: the **live** page count (reachable pages), which is a function
-of the committed trees alone and does not depend on reuse, watermark, or
-co-residence. It also needs an exact incremental orphan count per commit. The GiST
-whole-tree rewrite makes that count non-trivial today. The cap answers a different
-need (disk use, analogous to `53100 disk_full`) from Q4's (RAM), so it is a
-separate follow-on and not foreclosed. Rejecting the setting on a file database
-with `0A000` keeps that door open: a later file form can adopt the same option
-name with a stated measure, instead of silently reinterpreting an accepted value.
+> **Status: implemented (Q4c)** in all three cores, `format_version` 34.
+
+**Why not the high-water.** For a file-backed database, `page_count × page_size` is
+not deterministic under shared multi-process access. While another process is
+co-resident, commits are append-only (`free_list_head = 0`,
+[locking.md](locking.md)). Co-residence is detected by a background probe, so how
+much the file grows depends on timing that no single handle's operation sequence
+fixes. Within one process the high-water also depends on the reader watermark,
+which can defer free-list reuse. The file form therefore limits a different
+measure.
+
+**Measure.**
+
+```
+storage_bytes(file) = live_pages × page_size
+```
+
+`live_pages` counts the pages reachable from the committed catalog root: the
+catalog chain, every node of every table B+tree and B-tree/GIN index tree, every
+GiST R-tree page, and every overflow page of a live externalized value. It never
+counts the meta slots, free-list pages, commit-manifest pages, or dead pages. It is
+a function of the committed trees alone, so it does not depend on free-list reuse,
+the reader watermark, co-residence, or host compaction (which rewrites the file but
+keeps every live page). It answers disk use, the need SQLite's `max_page_count` and
+PostgreSQL's `53100 disk_full` answer, but as a deterministic logical count.
+
+The file's length may exceed the measure by dead pages: up to roughly the live size
+again under periodic reclamation (§8.2's `2 × live` trigger), and more while a pinned
+reader defers reuse or while processes are co-resident and commits only append.
+Those dead pages are bounded by the work that wrote them, which `max_cost` and
+`lifetime_max_cost` meter, not by this limit. Reclamation resumes once the reader
+closes or one process is alone, and host compaction returns them
+([api.md](api.md) §2.6).
+
+**Persistence.** The exact count is stored at meta offset 56
+([format.md](../fileformat/format.md), `format_version` 34). Every commit by every
+process advances it, with or without a limit. Open reads it without walking the
+file, and a co-resident process reads its peer's count when it reloads the meta at
+transaction begin. A from-scratch image (create, host compaction) records all of
+its body pages. Old binaries cannot overlap the rollout: readers accept only the
+exact current version.
+
+**The per-commit delta.** A commit computes its count before writing anything:
+
+```
+live(after) = live(before) + written − catalog(before) − gist(before) − orphaned
+```
+
+Each term is exact:
+
+- **`written`**: every page the incremental image writes — dirty tree nodes, the
+  fresh overflow chains of each dirty leaf, the whole GiST forest, the catalog
+  chain — is reachable from the new root. Free-list and manifest pages are planned
+  separately and are not counted.
+- **`catalog`, `gist`**: the catalog chain and every GiST R-tree are rewritten whole
+  by every commit ([gist.md](gist.md) §4.1(b)), so the previous ones are orphaned
+  whole. Their sizes are remembered from the last commit, or counted at open while
+  the loader reads the catalog chain and eagerly walks each GiST tree.
+- **`orphaned`**: the previous snapshot's B-tree pages that the new one no longer
+  references, plus the overflow pages their leaves own. While serializing, the
+  commit records `kept`: every clean node and `OnDisk` leaf the dirty region points
+  at, and every clean tree root. A persisted node is immutable, so a page in `kept`
+  roots a subtree the two snapshots share whole. The commit then walks the previous
+  snapshot's trees, skipping shared subtrees and counting every other node. An
+  orphaned leaf of a table with variable-width columns also contributes its overflow
+  pages. Chains are never shared between leaf versions, because a dirty leaf
+  re-encodes every value into fresh chains, and each external pointer's stored
+  length gives its chain's page count, `⌈len / C⌉`. So the leaf page alone is
+  enough, with no chain walk.
+
+The walk's cost is proportional to the dirty region. It reads only orphaned leaves
+of tables with variable-width columns, which the writer usually just faulted; a
+`DROP TABLE` or a full rewrite of such a table reads that table's leaves once. A
+count that would go negative means the stored count is wrong: `XX001`.
+
+**Admission.** The check runs once per commit of a file domain, after page
+allocation is planned and before any page is written or the commit begins. A plan
+is admitted when any of these holds:
+
+1. **It fits:** the domain is unlimited, or the plan does not grow the live count
+   (`live(after) ≤ live(before)`, so a limit lowered below the current size still
+   admits commits that only rewrite or shrink), or
+   `live(after) × page_size ≤ max_storage_bytes`.
+2. **The repair exemption** of §8.3: the commit stages no record version and
+   rewrites no more catalog pages than the last commit did.
+
+There is no forced compaction: reclaiming dead pages cannot lower the measure, and
+a delete lowers it at once. Failure is §8.3's: `54P06`, nothing written, the
+transaction discarded, and the handle not poisoned (a serialization-only error,
+[validated-cow.md](validated-cow.md)). The multi-root precheck of §8.3 covers file
+domains too, so a `54P06` in main or in a file attachment discards the whole
+transaction before any domain packs a page.
+
+**Determinism.** The trip point is a pure function of the sequence of operations:
+the count depends only on the committed trees, and the commit order of a shared
+file is serialized by its global writer lock. The real-process corpus pins this
+independence: one process alone and two co-resident processes with append-only
+commits trip at the same batch and report the same gauge, though the co-resident
+file grows to nearly twice the length (`process/storage_limit.process.toml`).
+
+**Verification.** The Ruby reference ([verify.rb](../fileformat/verify.rb)) checks
+that every golden's stored count equals the pages its independent decoder reaches.
+Each core can recount every file commit by a reachability walk and fail on a
+mismatch; the conformance harnesses turn this on for the whole disk pass.
+`mise run conformance:query_memory` compares every record's disk-mode
+`storage_bytes` across cores.
 
 ### 8.8 Not covered
 
 Q4 leaves these outside every account: the interior skeleton and GiST R-tree of
-file-backed databases (§8.6), the catalog (proportional to schema size; DDL is
+file-backed databases as resident memory (§8.6; their pages count toward a file's
+live pages), a file's dead pages (§8.7), the catalog (proportional to schema size; DDL is
 gated by `allow_ddl`), persisted statistics (bounded by the statistics target,
 [statistics.md](statistics.md)), host-owned prepared statements and their plan
 caches, and per-core representation overhead beyond the logical page bytes. A
@@ -800,8 +899,19 @@ bounded overshoot of at most one extra page per resident leaf.
 - **Q4b — documentation only (landed).** Public docs ([resource-limits](../../web/src/routes/docs/api/resource-limits/+page.md))
   describe the cache rules of §8.6 and the B/2–B sizing note of §8.2. No engine
   change.
-- **Follow-ons:** the file-backed size cap on live pages (§8.7); bounding the
-  interior skeleton and GiST tree under `cache_bytes` once they page.
+- **Q4c — the file form (landed).** The live-page measure, its persisted count
+  (`format_version` 34, meta offset 56) and exact per-commit delta, admission, the
+  file create/open/attach options and setter, and the gauge's file measure (§8.7),
+  in all three cores. Corpus: `resource/storage_file.test` (disk pass only;
+  capability `resource.storage_file`), which pins exact trip points, admission of
+  non-growing commits under a lowered limit, a delete's immediate effect, an index
+  build, and GiST pages; the harnesses re-apply main's limit after each disk-mode
+  reopen. `process/storage_limit.process.toml` pins the same trip point alone and
+  co-resident. Per-core tests cover the open option, the persisted count across a
+  reopen, file attachments and their multi-root rejection, and a reachability
+  recount across B-tree, GIN, GiST, overflow, drop, and compaction.
+- **Follow-ons:** bounding the interior skeleton and GiST tree under `cache_bytes`
+  once they page.
 
 ## 9. Rollout gates
 

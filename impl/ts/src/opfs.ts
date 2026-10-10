@@ -23,7 +23,7 @@
 
 import { Engine, DEFAULT_PAGE_SIZE } from "./executor.ts";
 import { engineError } from "./errors.ts";
-import { loadEnginePaged, toImage } from "./format.ts";
+import { loadEnginePaged, ROOT_PAGE, toImage } from "./format.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager } from "./pager.ts";
 import { persistImpl } from "./persist.ts";
@@ -51,6 +51,10 @@ export function createOpfsWithHandle(handle: SyncAccessHandle, opts: DatabaseOpt
   store.writeAt(0, bytes);
   store.sync();
   db.pageCount = Math.floor(bytes.length / db.pageSize);
+  // The image is of an empty database: every body page is live, and every one is a catalog page
+  // (spec/design/memory.md §8.7).
+  const body = db.pageCount - ROOT_PAGE;
+  db.live = { live: body, catalog: body, gist: 0 };
   // Adopt the just-written handle as the open pager + buffer pool, so later commits write through the
   // seam without re-acquiring (spec/design/pager.md). Pager.fromStore reads the page size from the meta
   // header just written.

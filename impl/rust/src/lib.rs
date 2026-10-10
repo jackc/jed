@@ -132,6 +132,8 @@ pub mod tooling {
     pub use crate::catalog::{CompositeType, IndexKey, IndexKeyExpr, Table};
     /// Query-memory accounting underflows (spec/design/memory.md) — the conformance harness's check.
     pub use crate::cost::{QUERY_MEMORY_PEAK, QUERY_MEMORY_UNDERFLOWS};
+    /// Recount every file commit's live pages by reachability (spec/design/memory.md §8.7).
+    pub use crate::format::VERIFY_LIVE_PAGES;
     pub use crate::types::{ScalarType, Type};
 
     pub mod collation {
@@ -792,6 +794,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Live query-memory budget over row buffers + result collectors (54P05, memory.md §2-§5).
     "resource.query_memory",
     "resource.storage_memory",
+    "resource.storage_file",
     // Nesting-depth limit — a fixed MAX_EXPR_DEPTH checked in the parser aborts deeply-nested
     // input with 54001 before it can overflow the native stack (CLAUDE.md §13; cost.md §7).
     "resource.depth_limit",

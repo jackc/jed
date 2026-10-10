@@ -465,6 +465,9 @@ pub struct Engine {
     /// only once the high-water passes ~2× it, mirroring [`crate::shared::Storage`]. `0` for an
     /// in-memory database (no persistence).
     pub(crate) live_at_compaction: u32,
+    /// The live-page accounting of the committed file state (spec/design/memory.md §8.7): read from
+    /// the meta at open and advanced by every file commit. Zero for an in-memory engine.
+    pub(crate) live: crate::format::LiveCount,
     /// The version the current `free_pages` list is "as of" — the last compaction's txid, or the
     /// committed version at open. It gates within-session reuse under the reader-liveness watermark
     /// (transactions.md §8): a page dead at generation G is reusable only once no reader pins a version

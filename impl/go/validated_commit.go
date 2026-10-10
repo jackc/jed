@@ -199,10 +199,10 @@ func (p *pager) validateCommitManifest(m meta, raw []byte) (bool, error) {
 
 // commitManifest encodes the fixed meta inline region and the reserved overflow
 // chain. The dirty set includes free-list pages, but not the manifest itself.
-func commitManifest(ps uint32, txid uint64, root, pageCount, head uint32, dirty []dirtyPage, manifestIDs []uint32) ([]byte, []dirtyPage) {
+func commitManifest(ps uint32, txid uint64, root, pageCount, head, livePages uint32, dirty []dirtyPage, manifestIDs []uint32) ([]byte, []dirtyPage) {
 	ordered := append([]dirtyPage(nil), dirty...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].index < ordered[j].index })
-	meta := metaPage(ps, txid, root, pageCount, head)
+	meta := metaPage(ps, txid, root, pageCount, head, livePages)
 	binary.BigEndian.PutUint32(meta[40:], uint32(len(ordered)))
 	binary.BigEndian.PutUint32(meta[44:], uint32(len(manifestIDs)))
 	if len(manifestIDs) > 0 {
@@ -250,7 +250,7 @@ type validatedCommitPlan struct {
 	generation      uint64
 }
 
-func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incrementalWrite, pageSize, liveAtCompaction uint32, generation uint64, canReclaim, canReuse bool) (validatedCommitPlan, error) {
+func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incrementalWrite, pageSize, liveAtCompaction uint32, generation uint64, canReclaim, canReuse bool, livePages uint32) (validatedCommitPlan, error) {
 	candidates, live, gen, err := freeListCandidates(snap, paging, write.rootPage, write.pages, write.freeRemaining, write.pageCount, liveAtCompaction, generation, canReclaim)
 	if err != nil {
 		return validatedCommitPlan{}, err
@@ -297,12 +297,12 @@ func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incremental
 		dirty := make([]dirtyPage, 0, len(write.pages)+len(fl))
 		dirty = append(dirty, write.pages...)
 		dirty = append(dirty, fl...)
-		meta, overflow := commitManifest(pageSize, snap.txid, write.rootPage, pc, head, dirty, ids)
+		meta, overflow := commitManifest(pageSize, snap.txid, write.rootPage, pc, head, livePages, dirty, ids)
 		return validatedCommitPlan{pages: append(fl, overflow...), meta: meta, free: free, pageCount: pc, live: live, generation: gen}, nil
 	}
 }
 
-func planSharedValidatedCommit(ps uint32, snap *snapshot, write incrementalWrite) (validatedCommitPlan, error) {
+func planSharedValidatedCommit(ps uint32, snap *snapshot, write incrementalWrite, livePages uint32) (validatedCommitPlan, error) {
 	left := max(0, len(write.pages)-manifestInlineCapacity(int(ps)))
 	count := (left + manifestOverflowCapacity(int(ps)) - 1) / manifestOverflowCapacity(int(ps))
 	if uint64(write.pageCount)+uint64(count) > uint64(^uint32(0)) {
@@ -313,6 +313,6 @@ func planSharedValidatedCommit(ps uint32, snap *snapshot, write incrementalWrite
 		ids[i] = write.pageCount + uint32(i)
 	}
 	pc := write.pageCount + uint32(count)
-	meta, pages := commitManifest(ps, snap.txid, write.rootPage, pc, 0, write.pages, ids)
+	meta, pages := commitManifest(ps, snap.txid, write.rootPage, pc, 0, livePages, write.pages, ids)
 	return validatedCommitPlan{pages: pages, meta: meta, pageCount: pc, generation: snap.txid}, nil
 }

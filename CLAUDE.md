@@ -608,6 +608,12 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   barriers remain additional; this is one barrier for steady-state commits. No WAL, body redo,
   or new host durability primitive. The same v33 bytes and protocol bind Rust, Go, TypeScript,
   and shared-file access. [spec/design/validated-cow.md](spec/design/validated-cow.md).
+- **Live page count (format v34).** Meta offset 56 records the exact number of pages reachable
+  from the catalog root (catalog chain, tree and GiST nodes, live overflow chains — never meta,
+  free-list, or manifest pages). Every commit advances it by an exact delta — its written pages
+  minus the previous catalog chain, GiST forest, and the B-tree pages outside the subtrees the two
+  snapshots share — so open never walks the file. The file form of `max_storage_bytes` limits it
+  (§13; [spec/design/memory.md](spec/design/memory.md) §8.7).
 - On-disk format and key encoding are spec'd with byte fixtures (§8). **Status:** the
   single-file on-disk format is authored in `spec/fileformat/format.md` and is now the
   **page-backed copy-on-write B+tree** (`format_version` 24 — the B+tree reshape,
@@ -959,8 +965,11 @@ holds a transaction's pending writes (slice Q3): every record version it stages 
 bytes until commit/rollback, each statement's account opens holding them, and they must fit after
 every statement. A database-owned, opt-in `max_storage_bytes` (unlimited by default; `54P06`)
 bounds an in-memory database's or attachment's committed pages, checked at commit before any write
-(slice Q4a); file-backed page caches stay evict-only under `cache_bytes` and never fail a query.
-A file-backed size cap is still uncovered. These are guardrails, not heap caps: resource-
+(slice Q4a), and a file-backed database's or attachment's **live** pages — reachable from the catalog
+root, an exact count persisted in the meta page, so the trip point is independent of the free list
+and of co-resident append-only allocation (slice Q4c, memory.md §8.7); file-backed page caches stay
+evict-only under `cache_bytes` and never fail a query. A file's dead pages are bounded by the work
+that wrote them (`max_cost`/`lifetime_max_cost`), not by this limit. These are guardrails, not heap caps: resource-
 exhaustion resistance remains a requirement; do not claim the current limits are a
 whole-engine memory guarantee. Host extensions remain outside these guarantees.
 

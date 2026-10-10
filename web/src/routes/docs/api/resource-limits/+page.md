@@ -102,24 +102,40 @@ much a transaction writes, not how much it ends up holding. Temporary tables are
 
 ## Storage limit
 
-`max_storage_bytes` bounds how much an **in-memory database keeps** once its transactions commit —
-the one thing the per-statement and per-transaction budgets cannot see, since many small committed
-transactions each fit them. It belongs to the database rather than to a session, so every session
-shares it. Set it when you create an in-memory database (`max_storage_bytes` / `MaxStorageBytes` /
-`maxStorageBytes` in the create options), on an in-memory attachment's source, or later with
-`set_max_storage_bytes(name, bytes)` / `SetMaxStorageBytes(name, bytes)` /
+`max_storage_bytes` bounds how much a **database keeps** once its transactions commit — the one
+thing the per-statement and per-transaction budgets cannot see, since many small committed
+transactions each fit them. Without it, a session that can insert can grow an in-memory database
+until RAM runs out, or a file until the disk fills. It belongs to the database rather than to a
+session, so every session shares it. Set it in the create options (`max_storage_bytes` /
+`MaxStorageBytes` / `maxStorageBytes`), in the open options of a file, on an attachment's source, or
+later with `set_max_storage_bytes(name, bytes)` / `SetMaxStorageBytes(name, bytes)` /
 `setMaxStorageBytes(name, bytes)`, where `name` is `main` or an attachment. It is **unlimited by
-default**; non-positive values restore unlimited. A file-backed database rejects a limit with `0A000`.
+default**; non-positive values restore unlimited. It is a handle setting, not stored in the file.
 
-The limit counts the database's pages: its page high-water times its page size, which the
-`storage_bytes(name)` / `StorageBytes(name)` / `storageBytes(name)` gauge reports. A commit that would
-raise it past the limit fails with **`54P06`** and commits nothing, after first reclaiming any dead
-pages. jed keeps freed pages for reuse and reclaims them in batches, so a database under a limit of
-B bytes reliably holds about B/2 bytes of live pages and may hold up to B. A commit that fits in
-freed pages always succeeds, even when a lowered limit is already below the current size, and so
-does a commit that only deletes rows or drops objects, so a full database can always be cleaned
-up. A read session that predates the last commit can keep dead pages from being reclaimed; closing
-it frees them for the next commit.
+A commit that would grow the database past the limit fails with **`54P06`** and commits nothing. A
+commit that only deletes rows or drops objects always succeeds, so a full database can always be
+cleaned up. The `storage_bytes(name)` / `StorageBytes(name)` / `storageBytes(name)` gauge reports
+the number the limit checks, which depends on where the database lives.
+
+**In-memory databases** count their pages: the page high-water times the page size. A commit that
+would raise it past the limit first reclaims any dead pages. jed keeps freed pages for reuse and
+reclaims them in batches, so a database under a limit of B bytes reliably holds about B/2 bytes of
+live pages and may hold up to B. A commit that fits in freed pages always succeeds, even when a
+lowered limit is already below the current size. A read session that predates the last commit can
+keep dead pages from being reclaimed; closing it frees them for the next commit.
+
+**File-backed databases** count their **live pages**: the pages reachable from the current schema
+and data, times the page size. Pages freed by deletes and updates do not count, and neither does
+the file's length, so a delete lowers the count at once and a limit of B bytes holds B bytes of live
+data. A commit that does not add live pages always succeeds, even under a lowered limit. jed stores
+the exact count in the file and updates it on every commit, so opening a file never scans it, and
+the count is the same whether one process writes the file or several share it. Each process
+enforces the limit its own handle was given.
+
+The file itself can be longer than the live count: freed pages wait for reuse, and while another
+process shares the file or an old read session is open, commits append instead of reusing them.
+That extra space is bounded by how much writing produced it, which `max_cost` and
+`lifetime_max_cost` limit, and `compact` returns it.
 
 ## Page cache
 
@@ -137,13 +153,12 @@ The budget bounds the cached pages, with two qualifications:
   So the cache can briefly hold a few pages over its budget with many concurrent readers.
 - **Some structures are not in the cache.** The interior pages of every table and index tree stay in
   memory. They are a small fraction of a tree's pages, since each one routes to many leaves. The
-  index tree of a GiST index also stays in memory, and grows with the number of indexed rows. `cache_bytes` does not bound these. On a
-  file-backed database they grow with the file, so bound them by bounding what is stored. On an
-  in-memory database they are part of the pages `max_storage_bytes` counts.
+  index tree of a GiST index also stays in memory, and grows with the number of indexed rows. `cache_bytes` does not bound these. They are
+  part of the pages `max_storage_bytes` counts, so it bounds them indirectly on both kinds of
+  database.
 
 An in-memory database ignores `cache_bytes`: all of its pages stay in memory, and `max_storage_bytes`
-is the limit for them. The `storage_bytes(name)` gauge also works on a file-backed database, where it
-reports the file's page high-water times its page size. There is no limit on that number yet.
+is the limit for them.
 
 ## Memory coverage
 

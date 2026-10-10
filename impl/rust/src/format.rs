@@ -104,7 +104,8 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// to v30, so a file with no such index moves to v31 only by its version byte + meta CRC.
 // v32: persisted timezone dependencies (spec/design/index-dependencies.md).
 // v33: full-page meta CRC and inline/overflow validated-COW manifest.
-const FORMAT_VERSION: u16 = 33;
+// v34: meta offset 56 carries the exact live page count (spec/design/memory.md §8.7).
+const FORMAT_VERSION: u16 = 34;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -1469,7 +1470,15 @@ impl Snapshot {
 
         // Meta last: both slots hold the current meta (a fresh from-scratch image has no distinct
         // prior version; slot alternation is the live incremental-commit path — format.md).
-        let meta = meta_page(page_size, txid, cat_root, page_count, 0);
+        // Every body page of a from-scratch image is live (no free list, no manifest).
+        let meta = meta_page(
+            page_size,
+            txid,
+            cat_root,
+            page_count,
+            0,
+            page_count - ROOT_PAGE,
+        );
         (body.sink)(0, &meta)?;
         (body.sink)(1, &meta)?;
         Ok(page_count)
@@ -1617,6 +1626,179 @@ pub(crate) struct IncrementalWrite {
     /// persisting the free-list never grows the file), and reclaims this commit's fresh orphans into
     /// the persisted list too (shared.rs / file.rs — spec/fileformat/format.md *Reclamation*).
     pub(crate) free_remaining: Vec<u32>,
+    /// The committed B-tree pages the new snapshot still references at the boundary of its dirty
+    /// region: every clean node or `OnDisk` leaf a dirty node points at, and every clean tree root.
+    /// Their subtrees are shared with the previous snapshot, so the live-page delta skips them
+    /// ([`LiveCount::after`], spec/design/memory.md §8.7).
+    pub(crate) kept: HashSet<u32>,
+    /// How many of `pages` are catalog pages, and how many are GiST R-tree pages. Both are
+    /// rewritten whole every commit.
+    pub(crate) catalog_pages: u32,
+    pub(crate) gist_pages: u32,
+}
+
+/// The live-page accounting of one committed file state (spec/design/memory.md §8.7): `live` is the
+/// number of pages reachable from the catalog root — the catalog chain, every B-tree and GiST node,
+/// and every live overflow page; never the meta slots, free-list pages, or manifest pages. `catalog`
+/// and `gist` are the parts of `live` that every commit rewrites whole, so the next commit orphans
+/// them all. `live` is persisted at meta offset 56 (v34); the other two are recounted on open.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LiveCount {
+    pub(crate) live: u32,
+    pub(crate) catalog: u32,
+    pub(crate) gist: u32,
+}
+
+impl LiveCount {
+    /// The accounting after `write` replaces `prev` (the committed snapshot this count describes):
+    /// every written page is reachable from the new root, and the orphans are `prev`'s whole catalog
+    /// chain, its whole GiST forest, and each B-tree node outside the shared subtrees together with
+    /// its leaf's overflow pages. A count that would go negative means the persisted count was wrong:
+    /// `XX001`.
+    pub(crate) fn after(
+        self,
+        write: &IncrementalWrite,
+        prev: &Snapshot,
+        paging: &SharedPaging,
+        page_size: u32,
+    ) -> Result<LiveCount> {
+        let orphaned = orphaned_tree_pages(prev, &write.kept, paging, page_payload(page_size))?;
+        let live = i64::from(self.live) + write.pages.len() as i64
+            - i64::from(self.catalog)
+            - i64::from(self.gist)
+            - orphaned as i64;
+        let live = u32::try_from(live).map_err(|_| corrupt("live page count out of range"))?;
+        Ok(LiveCount {
+            live,
+            catalog: write.catalog_pages,
+            gist: write.gist_pages,
+        })
+    }
+}
+
+/// The B-tree pages of `prev` (table data trees and B-tree/GIN index trees) that the new snapshot no
+/// longer references, plus the overflow pages their leaves own (spec/design/memory.md §8.7). A
+/// subtree whose root page is in `kept` is shared and skipped whole: a persisted node is immutable,
+/// so everything under it is shared too. Overflow chains are never shared between leaf versions — a
+/// dirty leaf re-encodes every value into fresh chains — so an orphaned leaf orphans every chain it
+/// points at, and its chain page count follows from each external pointer's stored length. The walk
+/// reads only orphaned leaves of tables with spillable columns.
+pub(crate) fn orphaned_tree_pages(
+    prev: &Snapshot,
+    kept: &HashSet<u32>,
+    paging: &SharedPaging,
+    cap: usize,
+) -> Result<u64> {
+    let mut count = 0u64;
+    for st in prev.stores_iter() {
+        if let Some(root) = st.tree_root() {
+            let col_types =
+                any_spillable(st.col_types()).then(|| Arc::new(st.col_types().to_vec()));
+            count += orphaned_node_pages(root, kept, paging, col_types.as_ref(), cap)?;
+        }
+    }
+    // A GiST leaf-key store is never serialized (its nodes keep page 0); its R-tree pages are
+    // counted wholesale through `LiveCount::gist`.
+    for st in prev.index_stores_iter() {
+        if let Some(root) = st.tree_root() {
+            count += orphaned_node_pages(root, kept, paging, None, cap)?;
+        }
+    }
+    Ok(count)
+}
+
+fn orphaned_node_pages(
+    node: &Node,
+    kept: &HashSet<u32>,
+    paging: &SharedPaging,
+    col_types: Option<&Arc<Vec<ColType>>>,
+    cap: usize,
+) -> Result<u64> {
+    let page = node.page.load(Ordering::Acquire);
+    if page == 0 || kept.contains(&page) {
+        return Ok(0);
+    }
+    if node.children.is_empty() {
+        return orphaned_leaf_pages(page, paging, col_types, cap);
+    }
+    let mut count = 1;
+    for child in &node.children {
+        count += match child {
+            Child::Resident(n) => orphaned_node_pages(n, kept, paging, col_types, cap)?,
+            Child::OnDisk(p) if kept.contains(p) => 0,
+            Child::OnDisk(p) => orphaned_leaf_pages(*p, paging, col_types, cap)?,
+        };
+    }
+    Ok(count)
+}
+
+/// One orphaned leaf page plus the overflow pages its external values own.
+fn orphaned_leaf_pages(
+    page_idx: u32,
+    paging: &SharedPaging,
+    col_types: Option<&Arc<Vec<ColType>>>,
+    cap: usize,
+) -> Result<u64> {
+    let Some(col_types) = col_types else {
+        return Ok(1);
+    };
+    let block = paging.pager().read_block(page_idx)?;
+    let page = parse_page(&block)?;
+    if page.page_type != PAGE_LEAF {
+        return Err(corrupt("expected a B-tree leaf page"));
+    }
+    let n = page.item_count as usize;
+    let shared = Arc::new(block.to_vec());
+    let payload = &shared[PAGE_HEADER..];
+    let dirs = parse_pax_leaf(payload, n, col_types)?;
+    let mut count = 1u64;
+    for (c, ty) in col_types.iter().enumerate() {
+        if fixed_value_width(ty).is_some() {
+            continue;
+        }
+        let tyref = crate::value::TypeRef::new(Arc::clone(col_types), c);
+        for i in 0..n {
+            if dirs.is_null(payload, c, i) {
+                continue;
+            }
+            let mut pos = dirs.value_off(payload, c, i);
+            // Only the pointer's stored length matters; the resolution handle is deliberately dead.
+            let v = read_value_lazy(&tyref, &shared, payload, &mut pos, &std::sync::Weak::new())?;
+            let stored = match v {
+                Value::Unfetched(Unfetched::External { len, .. }) => len as usize,
+                Value::Unfetched(Unfetched::ExternalComp { stored_len, .. }) => stored_len as usize,
+                _ => continue,
+            };
+            count += stored.div_ceil(cap) as u64;
+        }
+    }
+    Ok(count)
+}
+
+/// When set, every file commit recounts its live pages by a reachability walk and panics if the
+/// incremental count differs (test tooling: the conformance harness's disk pass and per-core tests).
+pub static VERIFY_LIVE_PAGES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Recount `live` by reachability and compare it with the incremental count ([`VERIFY_LIVE_PAGES`]). Runs after the commit's body pages are written, so the
+/// walk reads the new catalog; the GiST pages it cannot see are this commit's whole GiST write.
+pub(crate) fn verify_live_count(
+    snap: &Snapshot,
+    paging: &SharedPaging,
+    write: &IncrementalWrite,
+    live: LiveCount,
+) -> Result<()> {
+    if !VERIFY_LIVE_PAGES.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let reached = reachable_pages(snap, paging, write.root_page)?.len() as u64;
+    let walked = reached + u64::from(write.gist_pages);
+    assert_eq!(
+        walked,
+        u64::from(live.live),
+        "incremental live page count diverged from the reachability walk"
+    );
+    Ok(())
 }
 
 /// Allocates page indices for an incremental commit: the **free-list** first (lowest index, the
@@ -1694,6 +1876,8 @@ impl Snapshot {
         };
 
         let mut pages: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut kept: HashSet<u32> = HashSet::new();
+        let mut gist_pages = 0u32;
         let mut root_data_page = vec![0u32; tables.len()];
         let mut index_roots: Vec<Vec<u32>> = vec![Vec::new(); tables.len()];
         for (ti, (_, table, store)) in tables.iter().enumerate() {
@@ -1705,6 +1889,7 @@ impl Snapshot {
                     ps,
                     &mut alloc,
                     &mut pages,
+                    &mut kept,
                     paging,
                 )?;
             }
@@ -1720,6 +1905,7 @@ impl Snapshot {
                         let mut a = || alloc.take();
                         serialize_gist_index(self, table, idx, &mut a)?
                     };
+                    gist_pages += gpages.len() as u32;
                     for p in gpages {
                         pages.push((
                             p.page_no,
@@ -1730,9 +1916,16 @@ impl Snapshot {
                 } else {
                     let istore = self.index_store(&idx.name.to_ascii_lowercase());
                     match istore.tree_root() {
-                        Some(root) => {
-                            serialize_dirty(root, &[], cap, ps, &mut alloc, &mut pages, paging)?
-                        }
+                        Some(root) => serialize_dirty(
+                            root,
+                            &[],
+                            cap,
+                            ps,
+                            &mut alloc,
+                            &mut pages,
+                            &mut kept,
+                            paging,
+                        )?,
                         None => 0,
                     }
                 };
@@ -1813,6 +2006,9 @@ impl Snapshot {
             root_page: cat_root,
             page_count: alloc.next,
             free_remaining: alloc.free[alloc.cursor..].to_vec(),
+            kept,
+            catalog_pages: cat_pages.len() as u32,
+            gist_pages,
         })
     }
 }
@@ -1944,6 +2140,7 @@ fn read_free_list(
 /// only rebuilds the modified path), so nothing is written and its existing page is returned. The
 /// node's set-once page id is stored here — safe on the shared tree, since a node is otherwise
 /// immutable (`AtomicU32`, P5.3b). Mirrors `serialize_node` for the byte layout.
+#[allow(clippy::too_many_arguments)]
 fn serialize_dirty(
     node: &Arc<Node>,
     col_types: &[ColType],
@@ -1951,10 +2148,12 @@ fn serialize_dirty(
     ps: usize,
     alloc: &mut PageAlloc,
     pages: &mut Vec<(u32, Vec<u8>)>,
+    kept: &mut HashSet<u32>,
     paging: Option<&SharedPaging>,
 ) -> Result<u32> {
     let existing = node.page.load(Ordering::Acquire);
     if existing != 0 {
+        kept.insert(existing);
         return Ok(existing);
     }
     let mut child_pages = Vec::with_capacity(node.children.len());
@@ -1962,8 +2161,13 @@ fn serialize_dirty(
         // A `Resident` child recurses (dirty descendants get pages); an `OnDisk` child is a clean
         // leaf already durable at its page — keep it, write nothing (the incremental-commit win).
         let cp = match child {
-            Child::Resident(n) => serialize_dirty(n, col_types, cap, ps, alloc, pages, paging)?,
-            Child::OnDisk(p) => *p,
+            Child::Resident(n) => {
+                serialize_dirty(n, col_types, cap, ps, alloc, pages, kept, paging)?
+            }
+            Child::OnDisk(p) => {
+                kept.insert(*p);
+                *p
+            }
         };
         child_pages.push(cp);
     }
@@ -2108,12 +2312,18 @@ impl Engine {
         let mut cat_page = meta.root_page;
         let mut statistics_expected: std::collections::HashMap<(String, usize), (usize, usize)> =
             std::collections::HashMap::new();
+        let mut live = LiveCount {
+            live: meta.live_pages,
+            catalog: 0,
+            gist: 0,
+        };
         while cat_page != 0 {
             let block = paging.pager().read_block(cat_page)?;
             let page = parse_page(&block)?;
             if page.page_type != PAGE_CATALOG {
                 return Err(corrupt("expected a catalog page"));
             }
+            live.catalog += 1;
             let mut pos = 0usize;
             for _ in 0..page.item_count {
                 // Each catalog entry is kind-tagged (v9): 1 = a composite-type entry (registered
@@ -2190,8 +2400,10 @@ impl Engine {
                             // whole R-tree, recover its leaf keys into a fully-resident leaf store.
                             // The resident R-tree is rebuilt below.
                             let mut keys = Vec::new();
+                            let gist_pages = std::cell::Cell::new(0u32);
                             read_gist_leaf_keys(
                                 &|p| {
+                                    gist_pages.set(gist_pages.get() + 1);
                                     let block = paging.pager().read_block(p)?;
                                     let pg = parse_page(&block)?;
                                     Ok((pg.page_type, pg.item_count, pg.payload.to_vec()))
@@ -2199,6 +2411,7 @@ impl Engine {
                                 iroot,
                                 &mut keys,
                             )?;
+                            live.gist += gist_pages.get();
                             for k in keys {
                                 istore.insert(k, Vec::new())?;
                             }
@@ -2251,6 +2464,7 @@ impl Engine {
         // free-list), so the first commit after open does not compact spuriously (format.rs
         // `compacted_free_list`).
         db.live_at_compaction = meta.page_count.saturating_sub(db.free_pages.len() as u32);
+        db.live = live;
         db.committed = snap;
         // Stores created in a LATER session bind this same pager at creation (Snapshot::store_paging),
         // so they join the post-commit residency flip like the loaded stores attached above.
@@ -2409,6 +2623,7 @@ pub(crate) fn plan_free_list(
     ps: usize,
     can_reclaim: bool,
     can_reuse: bool,
+    live_pages: u32,
 ) -> Result<CommitPlan> {
     use crate::costs::{COMPACT_GROWTH, COMPACT_MIN_PAGES}; // shared data (memory.md §8.4)
     // `live_at_compaction == 0` is the shared-file handoff sentinel: co-resident commits deliberately
@@ -2474,7 +2689,7 @@ pub(crate) fn plan_free_list(
             n = needed;
             continue;
         }
-        let base = meta_page(ps as u32, snap.txid, cat_root, new_pc, head);
+        let base = meta_page(ps as u32, snap.txid, cat_root, new_pc, head, live_pages);
         let (meta, overflow) = commit_manifest::encode(base, written, &pages, &ids);
         let mut auxiliary = pages;
         auxiliary.extend(overflow);
@@ -2502,6 +2717,7 @@ pub(crate) fn plan_shared_commit(
     page_size: u32,
     txid: u64,
     write: &IncrementalWrite,
+    live_pages: u32,
 ) -> Result<CommitPlan> {
     let n = commit_manifest::overflow_needed(page_size as usize, write.pages.len());
     let end = write.page_count.checked_add(n as u32).ok_or_else(|| {
@@ -2512,7 +2728,7 @@ pub(crate) fn plan_shared_commit(
     })?;
     let ids: Vec<_> = (write.page_count..end).collect();
     let (meta, auxiliary) = commit_manifest::encode(
-        meta_page(page_size, txid, write.root_page, end, 0),
+        meta_page(page_size, txid, write.root_page, end, 0, live_pages),
         &write.pages,
         &[],
         &ids,
@@ -3541,6 +3757,7 @@ pub(crate) fn meta_page(
     root_page: u32,
     page_count: u32,
     free_list_head: u32,
+    live_pages: u32,
 ) -> Vec<u8> {
     let mut p = vec![0u8; page_size as usize];
     p[0..4].copy_from_slice(&MAGIC);
@@ -3551,6 +3768,8 @@ pub(crate) fn meta_page(
     p[24..28].copy_from_slice(&page_count.to_be_bytes());
     // v25: offset 28 is the persisted free-list head (0 = empty); through v24 it was reserved 0.
     p[28..32].copy_from_slice(&free_list_head.to_be_bytes());
+    // v34: offset 56 is the exact live page count (spec/design/memory.md §8.7).
+    p[56..60].copy_from_slice(&live_pages.to_be_bytes());
     let crc = meta_crc(&p);
     p[32..36].copy_from_slice(&crc.to_be_bytes());
     p
@@ -3584,7 +3803,14 @@ fn write_meta(
     page_count: u32,
 ) {
     let off = slot * ps;
-    image[off..off + ps].copy_from_slice(&meta_page(page_size, txid, root_page, page_count, 0));
+    image[off..off + ps].copy_from_slice(&meta_page(
+        page_size,
+        txid,
+        root_page,
+        page_count,
+        0,
+        page_count - ROOT_PAGE,
+    ));
 }
 
 /// A validated meta slot's salient fields.
@@ -3597,6 +3823,8 @@ struct Meta {
     /// The persisted free-list head (v25 — meta offset 28): the first `page_type 7` page, or `0`
     /// for an empty free-list. Open follows this chain instead of reconstructing the free-list.
     free_list_head: u32,
+    /// The exact live page count (v34 — meta offset 56, spec/design/memory.md §8.7).
+    live_pages: u32,
 }
 
 /// Validate a standalone meta block; None if it is not a valid meta. Shared by `read_meta` (whole
@@ -3628,12 +3856,18 @@ fn parse_meta(m: &[u8]) -> Option<Meta> {
     if root_page < ROOT_PAGE || root_page >= page_count {
         return None;
     }
+    // v34: the live pages are a subset of the body pages.
+    let live_pages = u32::from_be_bytes(m[56..60].try_into().unwrap());
+    if live_pages > page_count - ROOT_PAGE {
+        return None;
+    }
     Some(Meta {
         protected: Arc::new(HashSet::new()),
         txid: u64::from_be_bytes(m[12..20].try_into().unwrap()),
         root_page: u32::from_be_bytes(m[20..24].try_into().unwrap()),
         page_count,
         free_list_head,
+        live_pages,
     })
 }
 

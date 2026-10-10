@@ -202,6 +202,7 @@ import {
 } from "./timezone.ts";
 import {
   crc32Ieee,
+  type LiveCount,
   newTempStorage,
   pagePayload,
   recordCompressUnits,
@@ -1326,6 +1327,9 @@ export class Engine {
   // older version (single-handle, reconstruct-on-open, all readers current) the gate always passes, so the
   // on-disk byte layout is byte-for-byte unchanged.
   freeGenTxid: bigint;
+  // live is the live-page accounting of the committed file state (spec/design/memory.md §8.7): read
+  // from the meta at open and advanced by every durable commit. Unused for an in-memory storage.
+  live: LiveCount;
   // tempStorage is the SESSION-LOCAL temp domain's storage Engine (temp-tables.md §6): the private in-RAM
   // MemoryBlockStore + pager + pinned pool its temp tables ride, with within-session compaction on.
   // Created lazily on the first session-local temp DDL (newTempStorage); null until then. Its pageCount
@@ -1377,6 +1381,7 @@ export class Engine {
     this.reclaimWithinSession = false;
     this.liveAtCompaction = 0;
     this.freeGenTxid = 0n;
+    this.live = { live: 0, catalog: 0, gist: 0 };
     this.tempStorage = null;
     this.openStreams = 0;
     this.storageBudget = { limit: 0n, lastCatRoot: 0, lastWritten: [], lastCatalogPages: 0 };
@@ -2731,15 +2736,20 @@ export class Engine {
         const ws = tx.attachWorking!.get(name)!;
         const stagesRows = ws.stagedBytes() !== 0;
         ws.clearStaged();
+        // The committed-storage context (memory.md §8.3, §8.7): a file attachment's live-page delta and
+        // an in-memory one's forced compaction both start from the attachment's committed root.
+        const prev = core.committedAttachment(name);
         // A FILE attachment commits DURABLY (dirty pages + alternating meta slot + fsync, its own page
         // space); an in-memory one packs persist_temp-style (NO fsync). At most one file attachment is
         // dirty here (the one-durable-writer check above), so ≤1 fsync path runs.
         if (att.storage.path !== null) {
           ws.txid = (this.attachedCommitted.get(name)?.txid ?? 0n) + 1n; // alternating meta slot + reopen
+          if (prev === undefined) throw new Error("an attached file has a committed root");
+          const budget = { name, prev, canCompact, stagesRows };
           if (att.coordinator?.state === "shared") {
             let bodyWritten = false;
             try {
-              const pending = persistSharedBody(att.storage, ws);
+              const pending = persistSharedBody(att.storage, ws, budget);
               bodyWritten = true;
               att.coordinator.lockCommitExclusive();
               try {
@@ -2756,12 +2766,11 @@ export class Engine {
           } else {
             // A local reader pins every attached root, so reuse is safe only after that common
             // watermark drains.
-            commitDurableAttachment(att.storage, ws, canReclaim, canReclaim);
+            commitDurableAttachment(att.storage, ws, canReclaim, canReclaim, budget);
           }
         } else {
           // The budget's forced compaction rebuilds the free list from the attachment's committed
           // root (memory.md §8.3).
-          const prev = core.committedAttachment(name);
           const budget = prev === undefined ? null : { name, prev, canCompact, stagesRows };
           staged.push(stageInMemory(att.storage, ws, budget, name));
         }
@@ -14573,6 +14582,7 @@ export class Engine {
     e.reclaimWithinSession = false;
     e.liveAtCompaction = 0;
     e.freeGenTxid = 0n;
+    e.live = { live: 0, catalog: 0, gist: 0 };
     e.tempStorage = null;
     e.openStreams = 0;
     e.estimatorTouched = new Set();

@@ -320,6 +320,7 @@ class SharedCore {
     this.storage.freePages = loaded.freePages;
     this.storage.liveAtCompaction = loaded.liveAtCompaction;
     this.storage.freeGenTxid = loaded.freeGenTxid;
+    this.storage.live = loaded.live;
     this.committed = loaded.committed;
     this.planEpoch++;
   }
@@ -335,6 +336,7 @@ class SharedCore {
     attachment.storage.freePages = loaded.freePages;
     attachment.storage.liveAtCompaction = loaded.liveAtCompaction;
     attachment.storage.freeGenTxid = loaded.freeGenTxid;
+    attachment.storage.live = loaded.live;
     const attached = new Map(this.attached);
     attached.set(name, loaded.committed);
     this.attached = attached;
@@ -470,10 +472,16 @@ class SharedCore {
     // so both hold and behavior (and on-disk bytes) are identical to an ungated commit.
     const oldest = this.oldestLiveVersion(snap.txid);
     const coordinator = this.coordinator;
+    const budget: BudgetCtx = {
+      name: "main",
+      prev: this.committed,
+      canCompact: this.canCompactCommitted(),
+      stagesRows,
+    };
     if (coordinator !== null && coordinator.state === "shared" && this.storage.path !== null) {
       let bodyWritten = false;
       try {
-        const pending = persistSharedBody(this.storage, snap);
+        const pending = persistSharedBody(this.storage, snap, budget);
         bodyWritten = true;
         coordinator.lockCommitExclusive();
         try {
@@ -488,12 +496,6 @@ class SharedCore {
       }
       return;
     }
-    const budget: BudgetCtx = {
-      name: "main",
-      prev: this.committed,
-      canCompact: this.canCompactCommitted(),
-      stagesRows,
-    };
     persistImpl(
       this.storage,
       snap,
@@ -515,10 +517,11 @@ class SharedCore {
     return this.oldest() >= this.committed.txid;
   }
 
-  // precheckBudgets checks every limited in-memory domain of a multi-root commit before any domain
-  // writes a page (memory.md §8.3): attachments commit before main, so a later domain's 54P06 must not
-  // follow an earlier domain's pack and compaction. main is the working main snapshot (persisted at
-  // publish, whether or not it is dirty); attached the dirtied attachments' working snapshots.
+  // precheckBudgets checks every limited domain — in-memory (memory.md §8.3) or durable (§8.7) — of a
+  // multi-root commit before any domain writes a page: attachments commit before main, so a later
+  // domain's 54P06 must not follow an earlier domain's pack, compaction, or durable write. main is the
+  // working main snapshot (persisted at publish, whether or not it is dirty); attached the dirtied
+  // attachments' working snapshots.
   // Attachments are visited in name order, so which domain a 54P06 names never depends on set order.
   precheckBudgets(main: Snapshot, mainStagesRows: boolean, attached: [string, Snapshot][]): void {
     const canCompact = this.canCompactCommitted();
@@ -653,6 +656,7 @@ function compactStorage(st: Engine, snap: Snapshot, txid: bigint): Snapshot {
   st.freePages = loaded.freePages;
   st.liveAtCompaction = loaded.liveAtCompaction;
   st.freeGenTxid = loaded.freeGenTxid;
+  st.live = loaded.live;
   st.storageBudget.lastCatRoot = 0;
   st.storageBudget.lastWritten = [];
   st.storageBudget.lastCatalogPages = 0;
@@ -682,8 +686,9 @@ export function registerFileCompactor(fn: FileCompactor): void {
 // (spec/design/attached-databases.md §4). A MEMORY source is a fresh, empty in-memory database
 // (Slice 1b); a FILE source opens an existing single-file jed database on disk (Slice 2). Build one with
 // attachMemory() or attachFile(path).
-// maxStorageBytes limits an in-memory attachment's committed storage (spec/design/memory.md §8.1);
-// zero, negative, or absent is unlimited. A positive limit on a file source is 0A000 at attach.
+// maxStorageBytes limits the attachment's committed storage (spec/design/memory.md §8.1): an in-memory
+// attachment's page high-water (§8.2), a file attachment's live pages (§8.7). Zero, negative, or absent
+// is unlimited.
 export type AttachSource = {
   file: boolean;
   path?: string;
@@ -698,21 +703,14 @@ export function attachMemory(options: Pick<AttachSource, "maxStorageBytes"> = {}
   return { file: false, ...options };
 }
 
-// fileStorageLimitError is the 0A000 for a committed-storage limit on a file backing (memory.md §8.7).
-export function fileStorageLimitError(): Error {
-  return engineError(
-    "feature_not_supported",
-    "max_storage_bytes applies only to in-memory databases",
-  );
-}
-
 // attachFile returns a source for a file-backed attachment: an existing single-file jed database at path
 // (attached-databases.md §4, Slice 2). The file's own page size is honored (each attachment is its own
 // page space, §2). With readOnly=true it is opened read-only (as well as write-rejected, 25006);
 // readOnly=false opens it read-write so DDL/DML can target it (subject to the one-durable-writer rule, §5).
+// options.maxStorageBytes limits the file's live pages (memory.md §8.7).
 export function attachFile(
   path: string,
-  options: Pick<AttachSource, "locking" | "fileLockTimeoutMs"> = {},
+  options: Pick<AttachSource, "locking" | "fileLockTimeoutMs" | "maxStorageBytes"> = {},
 ): AttachSource {
   return { file: true, path, ...options };
 }
@@ -811,7 +809,6 @@ export class Database {
     let storage: Engine;
     let root: Snapshot;
     let coordinator: FileCoordinatorHost | null = null;
-    if (source.file && (source.maxStorageBytes ?? 0n) > 0n) throw fileStorageLimitError();
     if (source.file) {
       if (fileAttachOpener === null) {
         // A pure in-memory build (no node/OPFS host imported) has no file layer to reach.
@@ -828,6 +825,7 @@ export class Database {
       }
       // v25: a file attachment persists + reclaims like the main file domain.
       engine.reclaimWithinSession = true;
+      engine.storageBudget.limit = source.maxStorageBytes ?? 0n;
       storage = engine; // its stores fault through engine.paging (bound at load); storePaging stays unset
       root = engine.committed;
     } else {
@@ -1212,17 +1210,16 @@ export class Database {
   }
   // setMaxStorageBytes sets the committed-storage limit of database name — main or an attachment — in
   // bytes (spec/design/memory.md §8.1); zero or negative is unlimited. Shared by every session on the
-  // handle and checked at each later commit. A positive limit on a file-backed database is 0A000; a name
-  // that is not attached is 42704.
+  // handle and checked at each later commit: an in-memory database's page high-water (§8.2), a
+  // file-backed database's live pages (§8.7). A name that is not attached is 42704.
   setMaxStorageBytes(name: string, bytes: bigint): void {
-    const st = this.core.storageFor(name);
-    if (st.persistHook !== null && bytes > 0n) throw fileStorageLimitError();
-    st.storageBudget.limit = bytes;
+    this.core.storageFor(name).storageBudget.limit = bytes;
   }
 
-  // storageBytes is the committed storage of database name — main or an attachment — in bytes: its
-  // logical page high-water times its page size (spec/design/memory.md §8.2/§8.6). Deterministic; not
-  // RSS.
+  // storageBytes is the committed storage of database name — main or an attachment — in bytes, the
+  // measure maxStorageBytes limits: an in-memory database's logical page high-water times its page size
+  // (spec/design/memory.md §8.2), a file-backed database's live pages times its page size (§8.7).
+  // Deterministic; not RSS, and not the file length.
   storageBytes(name: string): bigint {
     return storageBytes(this.core.storageFor(name));
   }

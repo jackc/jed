@@ -108,6 +108,11 @@ type OpenOptions struct {
 	// scalar functions the host supplies, FROZEN for the handle's lifetime. A handle setting like the
 	// rest — not stored in the file, so a reopening host brings its own (§14 step 3). nil ⇒ none.
 	Extensions *ExtensionRegistry
+	// MaxStorageBytes is the committed-storage limit in bytes over the file's live pages
+	// (spec/design/memory.md §8.7): a commit that would grow livePages × pageSize past it fails 54P06.
+	// Zero or negative is unlimited (the default). A handle setting, not stored in the file;
+	// Database.SetMaxStorageBytes changes it.
+	MaxStorageBytes int64
 }
 
 // Open opens an existing file-backed database at path with default open settings — the buffer-pool
@@ -178,6 +183,9 @@ func (db *engine) writeFullImage(noSync bool) error {
 		return err
 	}
 	db.pageCount = uint32(len(bytes) / int(db.pageSize))
+	// create writes an empty database: every body page is live, and every one is a catalog page.
+	body := db.pageCount - rootPage
+	db.live = liveCount{live: body, catalog: body}
 	return nil
 }
 
@@ -196,15 +204,22 @@ func (db *engine) persist(snap *snapshot) error {
 	if err != nil {
 		return err
 	}
+	// The live-page count this commit publishes (spec/design/memory.md §8.7): db.committed is still the
+	// previous snapshot here.
+	live, err := db.live.after(write, db.committed, db.paging, db.pageSize)
+	if err != nil {
+		return err
+	}
 	st := storage{
 		pageSize: db.pageSize, pageCount: db.pageCount, freePages: db.freePages,
 		paging: db.paging, liveAtCompaction: db.liveAtCompaction, freeGenTxid: db.freeGenTxid,
 	}
-	if err := st.commitFile(snap, write, db.openStreams == 0, true); err != nil {
+	if err := st.commitFile(snap, write, live, db.openStreams == 0, true); err != nil {
 		return err
 	}
 	db.pageCount, db.freePages = st.pageCount, st.freePages
 	db.liveAtCompaction, db.freeGenTxid = st.liveAtCompaction, st.freeGenTxid
+	db.live = st.live
 	return nil
 }
 

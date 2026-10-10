@@ -467,7 +467,8 @@ host-API act — CLAUDE.md §13).
 `name` is `main` or an attached database (attached-databases.md §4), case-insensitive. Compaction
 works on both backings: a file is rewritten as described below, and an in-memory database (or
 in-memory attachment) swaps its `MemoryBlockStore` for the compact image, releasing its dead pages
-from RAM and lowering `storage_bytes` (memory.md §8).
+from RAM and lowering `storage_bytes` (memory.md §8). A file's `storage_bytes` counts only live pages
+(memory.md §8.7), so compacting a file shortens it but leaves the gauge unchanged.
 
 **Preconditions, checked in this order (nothing is written when one fails):**
 
@@ -1179,18 +1180,22 @@ iterators — are the host's memory.
 
 ### Committed storage setting
 
-`max_storage_bytes` limits an **in-memory** database's committed storage, measured
-as its logical page high-water times its page size (memory.md §8). It belongs to
-the database, not a session: set it with `CreateOptions { max_storage_bytes }`
-(Rust i64) / `CreateOptions.MaxStorageBytes` (Go int64) / `maxStorageBytes` (TS)
-on an in-memory `create`, with the in-memory attach source's option (Rust
-`AttachSource::memory().max_storage_bytes(n)` and its Go/TS equivalents), or later
-with `set_max_storage_bytes(name, n)` / `SetMaxStorageBytes` / `setMaxStorageBytes`,
-where `name` is `main` or an attachment. Every session on the handle shares it. The
-read-only gauge `storage_bytes(name)` / `StorageBytes` / `storageBytes` reports the
-measure for any backing. Default: **unlimited**; non-positive restores it. A positive
-limit on a file-backed database or file attachment is `0A000`; a name that is not
-attached is `42704`. A commit that would raise the high-water past the limit fails
-`54P06` and commits nothing, after one forced compaction; commits that fit in free
-pages, and pure deletes and drops, are always admitted. Not persisted, not
-transactional, and not reachable from SQL.
+`max_storage_bytes` limits a database's committed storage (memory.md §8). An
+**in-memory** database is measured by its logical page high-water times its page
+size (§8.2); a **file-backed** database by its live pages — those reachable from
+its catalog root — times its page size (§8.7), so neither free pages nor the
+file's length count. It belongs to the database, not a session: set it with
+`CreateOptions { max_storage_bytes }` (Rust i64) / `CreateOptions.MaxStorageBytes`
+(Go int64) / `maxStorageBytes` (TS) on `create`, with the same field of the open
+options on a file `open`, with the attach source's option (Rust
+`AttachSource::memory().max_storage_bytes(n)` or `AttachSource::file(p).max_storage_bytes(n)`
+and their Go/TS equivalents), or later with `set_max_storage_bytes(name, n)` /
+`SetMaxStorageBytes` / `setMaxStorageBytes`, where `name` is `main` or an
+attachment. Every session on the handle shares it; each process sharing a file
+enforces its own setting against the one persisted count. The read-only gauge
+`storage_bytes(name)` / `StorageBytes` / `storageBytes` reports the measure the
+limit checks. Default: **unlimited**; non-positive restores it. A name that is not
+attached is `42704`. A commit that would grow the measure past the limit fails
+`54P06` and commits nothing (an in-memory database first tries one forced
+compaction); commits that do not grow the measure, and pure deletes and drops, are
+always admitted. Not persisted, not transactional, and not reachable from SQL.

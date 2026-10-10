@@ -623,6 +623,8 @@ var SupportedCapabilities = []string{
 	"resource.query_memory",
 	// Committed-storage limit of in-memory databases (54P06, memory.md §8).
 	"resource.storage_memory",
+	// The file form of that limit: a file-backed database's live pages (54P06, memory.md §8.7).
+	"resource.storage_file",
 	// Nesting-depth limit — a fixed maxExprDepth checked in the parser aborts deeply-nested input
 	// with 54001 before it can overflow the native stack (CLAUDE.md §13; cost.md §7).
 	"resource.depth_limit",

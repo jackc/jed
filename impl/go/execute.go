@@ -197,9 +197,9 @@ func (db *engine) commitTx() (outcome, error) {
 		return outcome{Kind: outcomeStatement, Cost: 0}, nil
 	}
 	// A multi-root commit packs session temp and attachments before main persists at publish: check
-	// every in-memory budget first, so a later domain's 54P06 discards the whole transaction — session
-	// state restored as on ROLLBACK — before any domain has packed a page (memory.md §8.3). Main
-	// persists the working set, or its unchanged base when only temp changed.
+	// every storage budget first (in-memory and file, memory.md §8.3/§8.7), so a later domain's 54P06
+	// discards the whole transaction — session state restored as on ROLLBACK — before any domain has
+	// packed a page. Main persists the working set, or its unchanged base when only temp changed.
 	if (tx.tempDirty || len(tx.attachDirty) > 0) && db.core != nil {
 		pureTemp := !tx.mainDirty && tx.tempDirty
 		attached := make([]budgetDomain, 0, len(tx.attachDirty))
@@ -301,16 +301,24 @@ func (db *engine) commitTx() (outcome, error) {
 			if att.isFile() {
 				// Advance the version for the alternating meta slot + reopen (like the main file commit).
 				ws.txid = db.attachedCommitted[name].txid + 1
+				// The file form of the attachment's storage budget (memory.md §8.7) reads its published
+				// root: the live-page delta counts the pages this commit orphans in it.
+				budget := &budgetCtx{
+					name:       name,
+					prev:       db.core.roots.Load().attached[name],
+					canCompact: db.core.canCompactCommitted(),
+					stagesRows: stagesRows,
+				}
 				var err error
 				if att.coordinator != nil && att.coordinator.lease() == leaseShared {
-					err = att.storage.commitShared(ws, att.coordinator)
+					err = att.storage.commitShared(ws, att.coordinator, budget)
 					if err != nil && att.storage.paging.commitRequiresReopen() {
 						att.coordinator.setLease(leasePoisoned)
 					}
 				} else {
 					// A local reader pins every attached root, so reuse is safe only once that common
 					// watermark has drained.
-					err = att.storage.commitDurable(ws, canReclaim, canReclaim, nil)
+					err = att.storage.commitDurable(ws, canReclaim, canReclaim, budget)
 				}
 				if err != nil {
 					return outcome{}, err

@@ -80,6 +80,12 @@ for await (const line of createInterface({ input: process.stdin, crlfDelay: Infi
       case "COMPACT":
         database.compact(argument || "main");
         break;
+      case "MAX_STORAGE_BYTES":
+        database.setMaxStorageBytes("main", BigInt(argument));
+        break;
+      case "STORAGE_BYTES":
+        value = database.storageBytes("main").toString();
+        break;
       case "TXID":
         value = database.txid.toString();
         break;

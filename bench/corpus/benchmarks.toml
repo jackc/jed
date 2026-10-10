@@ -1203,6 +1203,32 @@ gen = "int_uniform"
 min = 0
 max = 99999
 
+# The same durable single-row commit on a table with a variable-width column. Each commit's
+# live-page delta (memory.md §8.7) reads the replaced leaf to count the overflow pages it owned, a
+# read the integer-only table above never needs.
+[[bench]]
+name = "insert_commit_durable_text"
+description = "Durable single-row commits on a table with a text column: one INSERT per commit, full fsync path"
+dataset = "scratch"
+kind = "write_durable"
+sql = "INSERT INTO scratch (id, v) VALUES ($1, $2)"
+warmup = 10
+iterations = 300
+seed = 4286
+setup_sql = ["CREATE TABLE scratch (id bigint PRIMARY KEY, v text)"]
+
+[bench.setup_sql_override]
+sqlite = ["CREATE TABLE scratch (id INTEGER PRIMARY KEY, v TEXT)"]
+
+[[bench.param]]
+gen = "serial"
+start = 1
+
+[[bench.param]]
+gen = "text"
+min_len = 8
+max_len = 32
+
 [[bench]]
 name = "cte_materialized"
 description = "Multi-reference materialized CTE: a per-customer order-count aggregate (~100k rows) buffered once and scanned by two references (spec/design/cte.md, cost.md §3 cte_scan_row)"

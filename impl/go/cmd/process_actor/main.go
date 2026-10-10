@@ -86,6 +86,16 @@ func run() error {
 				name = "main"
 			}
 			err = db.Compact(name)
+		case "MAX_STORAGE_BYTES":
+			bytes, parseErr := strconv.ParseInt(argument, 10, 64)
+			if parseErr != nil {
+				panic("MAX_STORAGE_BYTES bytes: " + parseErr.Error())
+			}
+			err = db.SetMaxStorageBytes("main", bytes)
+		case "STORAGE_BYTES":
+			var bytes int64
+			bytes, err = db.StorageBytes("main")
+			value = strconv.FormatInt(bytes, 10)
 		case "TXID":
 			value = strconv.FormatUint(db.Txid(), 10)
 		case "PAGE_COUNT":

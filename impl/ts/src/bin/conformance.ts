@@ -38,6 +38,7 @@ import {
   openDatabase,
   type Session,
   SUPPORTED_CAPABILITIES,
+  verifyLivePages,
 } from "../tooling.ts";
 
 function repoRoot(): string {
@@ -152,8 +153,10 @@ function parseAttachDirective(line: string): string | null {
 
 // parseMaxStorageBytesDirective parses a file-level `# max_storage_bytes: N [database]` line
 // (spec/design/memory.md §8.1): an ACTION that sets the committed-storage limit of `main` (or the named
-// attachment) on the running handle from this point of the file on. In-memory backings only, so such
-// files are # skip: disk. Returns [bytes, database], or null if not this directive.
+// attachment) on the running handle from this point of the file on. The disk pass re-applies main's
+// limit after each per-record reopen; an in-memory database and a file-backed one measure different
+// things (§8.2 vs §8.7), so a file that pins trip points runs in one mode only. Returns [bytes,
+// database], or null if not this directive.
 function parseMaxStorageBytesDirective(line: string): [bigint, string] | null {
   const rest = line.replace(/^#/, "").trim();
   if (!rest.startsWith("max_storage_bytes:")) return null;
@@ -616,6 +619,8 @@ function runFile(text: string, disk: boolean): void {
   // handle; in memory mode a fresh in-memory Database (never reopened).
   let attachDb: Database = dbHandle ?? createDatabase({});
   let db = attachDb.session();
+  // Main's `# max_storage_bytes:` limit, re-applied to each disk-mode reopen (a handle setting).
+  let mainStorageLimit = 0n;
   try {
     const lines = text.split("\n");
     const c: Cursor = { i: 0 };
@@ -697,6 +702,7 @@ function runFile(text: string, disk: boolean): void {
         const msb = parseMaxStorageBytesDirective(line);
         if (msb !== null) {
           attachDb.setMaxStorageBytes(msb[1], msb[0]);
+          if (msb[1].toLowerCase() === "main") mainStorageLimit = msb[0];
           c.i++;
           continue;
         }
@@ -788,6 +794,7 @@ function runFile(text: string, disk: boolean): void {
       if (disk && onTemp) {
         dbHandle!.close();
         dbHandle = openDatabase(tmpPath!, { skipFsync: true }); // fsync=off (throwaway image)
+        dbHandle.setMaxStorageBytes("main", mainStorageLimit);
         attachDb = dbHandle;
         db = dbHandle.session();
       }
@@ -1309,6 +1316,9 @@ function main(): number {
   // rows/error/cost-out must be IDENTICAL in both modes.
   const disk = process.argv.slice(2).includes("disk");
   const mode = disk ? "disk" : "memory";
+  // The disk pass recounts every commit's live pages by reachability (memory.md §8.7), so the whole
+  // corpus checks the incremental count the file-backed storage limit relies on.
+  verifyLivePages.enabled = disk;
 
   const suites = suitesDir();
   const files = readdirSync(suites, { recursive: true })

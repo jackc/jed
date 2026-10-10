@@ -1,4 +1,4 @@
-// Validated COW descriptor (format v33). This module is host-independent: recovery hashes raw
+// Validated COW descriptor (format v33; v34 adds the live page count at meta offset 56). This module is host-independent: recovery hashes raw
 // stored bytes before decoding any candidate catalog, tree, or free-list page.
 import { crc32Update } from "./crc32.ts";
 import { engineError } from "./errors.ts";
@@ -45,6 +45,8 @@ export type CommitMeta = {
   rootPage: number;
   pageCount: number;
   freeListHead: number;
+  // livePages is the exact live page count (v34 — meta offset 56, spec/design/memory.md §8.7).
+  livePages: number;
   dirtyCount: number;
   overflowHead: number;
   overflowCount: number;
@@ -137,16 +139,17 @@ export function parseCommitMeta(
   const dv = view(block);
   if (
     dv.getUint32(0, false) !== 0x4a454442 ||
-    dv.getUint16(4, false) !== 33 ||
+    dv.getUint16(4, false) !== 34 ||
     dv.getUint16(6, false) !== 0 ||
     dv.getUint32(8, false) !== pageSize ||
     dv.getUint32(32, false) !== metaChecksum(block) ||
-    dv.getBigUint64(56, false) !== 0n
+    dv.getUint32(60, false) !== 0
   )
     return null;
   const pageCount = dv.getUint32(24, false);
   const rootPage = dv.getUint32(20, false);
   const freeListHead = dv.getUint32(28, false);
+  const livePages = dv.getUint32(56, false);
   const dirtyCount = dv.getUint32(40, false);
   const overflowHead = dv.getUint32(36, false);
   const overflowCount = dv.getUint32(44, false);
@@ -157,6 +160,8 @@ export function parseCommitMeta(
     pageCount > physicalPages ||
     !bodyPage(rootPage) ||
     (freeListHead !== 0 && !bodyPage(freeListHead)) ||
+    // v34: the live pages are a subset of the body pages.
+    livePages > pageCount - 2 ||
     dirtyCount > pageCount - 2 ||
     overflowCount > pageCount - 2 - dirtyCount ||
     (overflowCount === 0) !== (overflowHead === 0) ||
@@ -178,6 +183,7 @@ export function parseCommitMeta(
     rootPage,
     pageCount,
     freeListHead,
+    livePages,
     dirtyCount,
     overflowHead,
     overflowCount,

@@ -17,9 +17,17 @@
 # carries main's committed storage bytes after the record, so the same comparison checks that the
 # cores allocate and compact pages identically — the basis of the 54P06 limit (memory.md §8.4).
 
+require "set"
 require "tmpdir"
 require_relative "../../scripts/lib/tasks"
 include Tasks
+
+# Corpus files that open a pre-built `# fixture:` image. The Go harness opens the image as a file and
+# the Rust and TS harnesses load it in memory, and the two backings measure committed storage
+# differently (memory.md §8.2 vs §8.7), so only their peaks are compared.
+FIXTURE_FILES = Dir[File.join(ROOT, "spec/conformance/suites/**/*.test")].filter_map do |path|
+  path.delete_prefix(File.join(ROOT, "spec/conformance/suites/")) if File.read(path).match?(/^# fixture:/)
+end.to_set.freeze
 
 # Compare the per-record peaks the three runners wrote for one storage mode: each line is
 # file<TAB>record-ordinal<TAB>peak<TAB>main-storage-bytes. A record a core did not run (a capability
@@ -30,7 +38,8 @@ def peak_mismatches(mode, paths)
 
     File.readlines(path, chomp: true).to_h do |line|
       file, ordinal, peak, storage = line.split("\t")
-      [[file, ordinal.to_i], "peak=#{peak} storage=#{storage}"]
+      measured = FIXTURE_FILES.include?(file) ? "peak=#{peak}" : "peak=#{peak} storage=#{storage}"
+      [[file, ordinal.to_i], measured]
     end
   end
   tables.values.flat_map(&:keys).uniq.sort.filter_map do |key|

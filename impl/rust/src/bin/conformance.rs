@@ -88,6 +88,9 @@ fn main() -> ExitCode {
     // Every record's SQL-in → rows/error/cost-out must be IDENTICAL in both modes.
     let disk = std::env::args().any(|a| a == "disk");
     let mode = if disk { "disk" } else { "memory" };
+    // The disk pass recounts every commit's live pages by reachability (memory.md §8.7), so the whole
+    // corpus checks the incremental count the file-backed storage limit relies on.
+    jed::tooling::VERIFY_LIVE_PAGES.store(disk, std::sync::atomic::Ordering::Relaxed);
 
     let supported: BTreeSet<&str> = SUPPORTED_CAPABILITIES.iter().copied().collect();
     let (mut passed, mut failed, mut skipped) = (0u32, 0u32, 0u32);
@@ -276,7 +279,9 @@ fn parse_attach_directive(rest: &str) -> Option<String> {
 
 /// Parse a `# max_storage_bytes: N [database]` directive (spec/design/memory.md §8.1): an ACTION that
 /// sets the committed-storage limit of `main` (or the named attachment) on the running handle from
-/// this point of the file on. In-memory backings only, so such files are `# skip: disk`.
+/// this point of the file on. The disk pass re-applies main's limit after each per-record reopen; an
+/// in-memory database and a file-backed one measure different things (§8.2 vs §8.7), so a file that
+/// pins trip points runs in one mode only.
 fn parse_max_storage_bytes_directive(rest: &str) -> Option<(i64, String)> {
     let body = rest.trim_start().strip_prefix("max_storage_bytes:")?.trim();
     let mut parts = body.split_whitespace();
@@ -669,6 +674,8 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
     // resets). Re-minted whenever a `# fixture:` swaps the underlying database, or (disk mode) whenever
     // the file is reopened before a record.
     let mut sess = db.session(jed::SessionOptions::default());
+    // Main's `# max_storage_bytes:` limit, re-applied to each disk-mode reopen (a handle setting).
+    let mut main_storage_limit = 0i64;
     let mut lines = text.lines().peekable();
     // A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
     // next record consumes them.
@@ -738,6 +745,9 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
             if let Some((bytes, name)) = parse_max_storage_bytes_directive(rest) {
                 db.set_max_storage_bytes(&name, bytes)
                     .map_err(|e| format!("max_storage_bytes {name:?}: {}", e.message))?;
+                if name.eq_ignore_ascii_case("main") {
+                    main_storage_limit = bytes;
+                }
                 continue;
             }
             // `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh `Engine::new()`
@@ -831,6 +841,8 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                 },
             )
             .map_err(|e| format!("disk reopen: open {}: {}", p.display(), e.message))?;
+            db.set_max_storage_bytes("main", main_storage_limit)
+                .map_err(|e| format!("disk reopen: max_storage_bytes: {}", e.message))?;
             sess = db.session(jed::SessionOptions::default());
         }
         // This record consumes any pending assertions (so they never leak forward).

@@ -35,7 +35,7 @@ statements **atomically**, run them in one `update` closure — or on a single s
 jed keeps durable data in one file without a WAL. Commits write changed pages once, record their
 checksums with the new root, and finish with one durable flush in the steady state. Opening validates
 the latest commit before adopting it; file growth and resuming writes after recovery can require
-additional flushes. Format v33 requires all processes sharing a file to use a compatible jed version.
+additional flushes. Format v34 requires all processes sharing a file to use a compatible jed version.
 After a storage write or flush error, close and reopen the handle before writing again so recovery
 can determine the committed outcome. An encoding or size error before storage writes does not
 require reopening; discard the failed transaction and continue using the handle.

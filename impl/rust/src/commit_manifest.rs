@@ -125,7 +125,7 @@ fn validate_inner(
     if pc > physical
         || pc < 3
         || count as u64 + n as u64 > u64::from(pc - 2)
-        || meta[56..64].iter().any(|b| *b != 0)
+        || meta[60..64].iter().any(|b| *b != 0)
         || (n == 0) != (next == 0)
         || (count == 0 && (n != 0 || u64_at(meta, 48) != 0))
         || overflow_needed(meta.len(), count) > n

@@ -73,10 +73,11 @@ pub struct CreateOptions {
     /// session. Default empty (no extensions). Not stored in the file — a host reopens with its own
     /// registry (the ephemeral, no-persisted-use rule of §14 step 3).
     pub extensions: Arc<ExtensionRegistry>,
-    /// The committed-storage limit of an **in-memory** database in bytes (spec/design/memory.md §8):
-    /// a commit that would raise `page_count × page_size` past it fails `54P06`. Zero or negative is
-    /// unlimited (the default). Not stored anywhere; [`Database::set_max_storage_bytes`] changes it.
-    /// A positive value with a `path` is `0A000` (the file form is deferred, memory.md §8.7).
+    /// The committed-storage limit in bytes (spec/design/memory.md §8): a commit that would grow the
+    /// database past it fails `54P06`. An in-memory database measures its page high-water
+    /// (`page_count × page_size`, §8.2), a file-backed one its live pages (`live_pages × page_size`,
+    /// §8.7). Zero or negative is unlimited (the default). Not stored anywhere;
+    /// [`Database::set_max_storage_bytes`] changes it.
     pub max_storage_bytes: i64,
 }
 
@@ -134,6 +135,11 @@ pub struct OpenOptions {
     /// stored in the file, so a reopening host brings its own (§14 step 3: no persisted use). Default
     /// empty.
     pub extensions: Arc<ExtensionRegistry>,
+    /// The committed-storage limit in bytes over the file's live pages (spec/design/memory.md §8.7):
+    /// a commit that would grow `live_pages × page_size` past it fails `54P06`. Zero or negative is
+    /// unlimited (the default). A handle setting, not stored in the file;
+    /// [`Database::set_max_storage_bytes`] changes it.
+    pub max_storage_bytes: i64,
 }
 
 impl Default for OpenOptions {
@@ -146,6 +152,7 @@ impl Default for OpenOptions {
             locking: Locking::Auto,
             file_lock_timeout_ms: DEFAULT_FILE_LOCK_TIMEOUT_MS,
             extensions: Arc::new(ExtensionRegistry::default()),
+            max_storage_bytes: 0,
         }
     }
 }
@@ -272,6 +279,14 @@ impl Engine {
             .to_image(self.page_size, self.committed.txid)?;
         write_atomic(&path, &bytes, no_sync)?;
         self.page_count = (bytes.len() / self.page_size as usize) as u32;
+        // `create` writes an empty database: every body page is live, and every one is a catalog page.
+        debug_assert_eq!(self.committed.stores_iter().count(), 0);
+        let body = self.page_count - crate::format::ROOT_PAGE;
+        self.live = crate::format::LiveCount {
+            live: body,
+            catalog: body,
+            gist: 0,
+        };
         Ok(())
     }
 
@@ -305,6 +320,14 @@ impl Engine {
             true,
             self.paging.as_deref(),
         )?;
+        // The live-page count this commit publishes (spec/design/memory.md §8.7): `self.committed`
+        // is still the previous snapshot here.
+        let live = self.live.after(
+            &write,
+            &self.committed,
+            self.paging.as_deref().expect("paging present"),
+            self.page_size,
+        )?;
         // v25: write the dirty tree + catalog first (unsynced), so the in-commit reachability walk can
         // read the new catalog back through the pager (read-your-writes) — the free-list persisted this
         // commit thus reclaims this commit's fresh orphans (`plan_free_list`); a short open→commit→close
@@ -336,7 +359,9 @@ impl Engine {
             ps,
             can_reclaim,
             true,
+            live.live,
         )?;
+        crate::format::verify_live_count(snap, &paging, &write, live)?;
         {
             let mut pager = paging.pager();
             pager.reserve(plan.page_count)?;
@@ -356,6 +381,7 @@ impl Engine {
         self.free_pages = plan.persisted;
         self.live_at_compaction = plan.live;
         self.free_gen_txid = plan.generation;
+        self.live = live;
         Ok(())
     }
 

@@ -29,6 +29,8 @@ export { loadEngine, toImage } from "./format.ts";
 export { create, open, commit, rollback, close } from "./file.ts";
 // Query-memory accounting underflows (spec/design/memory.md) — the conformance harness's check.
 export { queryMemoryPeak, queryMemoryUnderflows } from "./cost.ts";
+// Recount every file commit's live pages by reachability (spec/design/memory.md §8.7).
+export { verifyLivePages } from "./format.ts";
 import { query } from "./api.ts";
 export {
   begin,

@@ -1,7 +1,8 @@
-//! Host-API surface of the committed-storage limit (spec/design/memory.md §8, Q4a): the create and
-//! attach options, the runtime setter and the `storage_bytes` gauge, the `0A000`/`42704` rejections,
-//! the multi-root precheck, and the reader watermark's hold on forced compaction. Trip points
-//! themselves are pinned in spec/conformance/suites/resource/storage_memory.test.
+//! Host-API surface of the committed-storage limit (spec/design/memory.md §8): the create, open, and
+//! attach options, the runtime setter and the `storage_bytes` gauge, the `42704` rejections, the
+//! multi-root precheck, the reader watermark's hold on forced compaction (in-memory, Q4a), and the
+//! file form's live-page measure (§8.7). Trip points themselves are pinned in
+//! spec/conformance/suites/resource/storage_memory.test and storage_file.test.
 
 use jed::{AttachSource, CreateOptions, Database, SessionOptions};
 
@@ -81,44 +82,194 @@ fn storage_limit_options_and_gauge() {
     );
 }
 
-#[test]
-fn storage_limit_rejects_file_backings() {
-    let path = temp_path("create");
+/// A fresh file-backed database with the live-page self-check on (memory.md §8.7): every commit in
+/// these tests also recounts its live pages by reachability and panics on a mismatch.
+fn file_db(tag: &str, max_storage_bytes: i64) -> (Database, std::path::PathBuf) {
+    jed::tooling::VERIFY_LIVE_PAGES.store(true, std::sync::atomic::Ordering::Relaxed);
+    let path = temp_path(tag);
     let _ = std::fs::remove_file(&path);
-    let err = Database::create(CreateOptions {
-        path: Some(path.clone()),
-        max_storage_bytes: PAGE,
-        ..Default::default()
-    })
-    .err()
-    .expect("0A000");
-    assert_eq!(err.code(), "0A000");
-    assert!(!path.exists(), "a rejected create makes no file");
-
+    let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
     let db = Database::create(CreateOptions {
         path: Some(path.clone()),
         skip_fsync: true,
+        max_storage_bytes,
         ..Default::default()
     })
     .unwrap();
+    (db, path)
+}
+
+fn remove_file_db(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
+}
+
+#[test]
+fn file_storage_limit_measures_live_pages() {
+    let (db, path) = file_db("live", 0);
+    // A fresh file holds one live page: its catalog.
+    assert_eq!(db.storage_bytes("main").unwrap(), PAGE);
+    let mut s = db.session(SessionOptions::default());
+    s.execute("CREATE TABLE t (id i32 PRIMARY KEY, v text)", &[])
+        .unwrap();
+    s.execute(&batch(0, 200), &[]).unwrap();
+    let full = db.storage_bytes("main").unwrap();
+    assert!(full > PAGE && full % PAGE == 0);
+    // A delete lowers the measure at once; the file keeps its high-water and free pages.
+    let high_water = db.page_count();
+    s.execute("DELETE FROM t WHERE id >= 100", &[]).unwrap();
+    let half = db.storage_bytes("main").unwrap();
+    assert!(half < full);
+    assert!(db.page_count() >= high_water);
+
+    // The setter limits the file from the next commit; a rejected commit writes nothing.
+    db.set_max_storage_bytes("main", half).unwrap();
     assert_eq!(
-        db.set_max_storage_bytes("main", PAGE).unwrap_err().code(),
-        "0A000"
+        s.execute(&batch(100, 100), &[]).unwrap_err().code(),
+        "54P06"
     );
-    db.set_max_storage_bytes("main", 0).unwrap();
-    assert!(db.storage_bytes("main").unwrap() > 0);
+    assert_eq!(db.storage_bytes("main").unwrap(), half);
+    // A commit that does not grow the live count is admitted at the limit.
+    s.execute("UPDATE t SET v = 'short' WHERE id < 10", &[])
+        .unwrap();
+    let rows = s.query_rows("SELECT count(*) FROM t", ()).unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 100);
+    let measured = db.storage_bytes("main").unwrap();
+    drop(s);
     drop(db);
 
+    // The count is persisted: a reopen reports it without walking the file, and the open option
+    // sets the limit.
+    let db = Database::open_with_options(
+        &path,
+        jed::OpenOptions {
+            skip_fsync: true,
+            max_storage_bytes: measured,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.storage_bytes("main").unwrap(), measured);
+    let mut s = db.session(SessionOptions::default());
+    assert_eq!(
+        s.execute(&batch(100, 100), &[]).unwrap_err().code(),
+        "54P06"
+    );
+    db.set_max_storage_bytes("main", 0).unwrap();
+    s.execute(&batch(100, 100), &[]).unwrap();
+    drop(s);
+    drop(db);
+    remove_file_db(&path);
+}
+
+#[test]
+fn file_storage_limit_counts_every_live_structure() {
+    // Indexes (B-tree, GIN, GiST), overflow chains, a drop, and a host compaction, each checked by
+    // the reachability recount.
+    let (db, path) = file_db("structures", 0);
+    let mut s = db.session(SessionOptions::default());
+    s.execute(
+        "CREATE TABLE t (id i32 PRIMARY KEY, k i32, v text, a i32[], r i32range)",
+        &[],
+    )
+    .unwrap();
+    s.execute("CREATE INDEX t_k ON t (k)", &[]).unwrap();
+    s.execute("CREATE INDEX t_a ON t USING gin (a)", &[])
+        .unwrap();
+    s.execute("CREATE INDEX t_r ON t USING gist (r)", &[])
+        .unwrap();
+    // An incompressible value larger than a record spills into its own overflow chain per row.
+    let mut x: u32 = 0x4A45_4442;
+    let filler: String = (0..5000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            char::from(b'A' + (x % 26) as u8)
+        })
+        .collect();
+    s.execute(
+        "INSERT INTO t VALUES (0, 0, $1, '{0,1}', '[0,5)')",
+        &[jed::Value::Text(filler)],
+    )
+    .unwrap();
+    let rows: Vec<String> = (1..=300)
+        .map(|g| format!("({g}, '{{{g},{}}}', '[{g},{})')", g + 1, g + 5))
+        .collect();
+    s.execute(
+        &format!("INSERT INTO t (id, a, r) VALUES {}", rows.join(", ")),
+        &[],
+    )
+    .unwrap();
+    s.execute(
+        "UPDATE t SET k = id % 7, v = (SELECT v FROM t WHERE id = 0)",
+        &[],
+    )
+    .unwrap();
+    let full = db.storage_bytes("main").unwrap();
+    s.execute("UPDATE t SET v = left(v, 10) WHERE id % 3 = 0", &[])
+        .unwrap();
+    s.execute("DELETE FROM t WHERE id > 150", &[]).unwrap();
+    assert!(db.storage_bytes("main").unwrap() < full);
+    s.execute("CREATE TABLE u (id i32 PRIMARY KEY, v text)", &[])
+        .unwrap();
+    s.execute("INSERT INTO u SELECT id, v FROM t", &[]).unwrap();
+    s.execute("DROP TABLE t", &[]).unwrap();
+    let before = db.storage_bytes("main").unwrap();
+    db.compact("main").unwrap();
+    // Compaction renumbers pages but keeps every live one.
+    assert_eq!(db.storage_bytes("main").unwrap(), before);
+    s.execute("DROP TABLE u", &[]).unwrap();
+    assert_eq!(db.storage_bytes("main").unwrap(), PAGE);
+    drop(s);
+    drop(db);
+    remove_file_db(&path);
+}
+
+#[test]
+fn file_attachment_storage_limit() {
+    let (mut file, path) = file_db("attach", 0);
+    file.execute("CREATE TABLE a (id i32 PRIMARY KEY, v text)", &[])
+        .unwrap();
+    drop(file);
     let host = Database::create(CreateOptions::default()).unwrap();
-    let err = host
-        .attach(
-            "f",
-            AttachSource::file(&path).max_storage_bytes(PAGE),
-            false,
+    host.attach(
+        "f",
+        AttachSource::file(&path).max_storage_bytes(4 * PAGE),
+        false,
+    )
+    .unwrap();
+    let mut s = host.session(SessionOptions::default());
+    s.execute("CREATE TABLE t (id i32 PRIMARY KEY, v text)", &[])
+        .unwrap();
+    let main = host.storage_bytes("main").unwrap();
+    let aux = host.storage_bytes("f").unwrap();
+    // A multi-root commit rejected in the file attachment publishes neither database.
+    s.execute("BEGIN", &[]).unwrap();
+    s.execute(&batch(0, 10), &[]).unwrap();
+    s.execute(
+        "INSERT INTO f.a SELECT g, repeat('y', 1000) FROM generate_series(1, 100) g",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(s.execute("COMMIT", &[]).unwrap_err().code(), "54P06");
+    assert_eq!(host.storage_bytes("main").unwrap(), main);
+    assert_eq!(host.storage_bytes("f").unwrap(), aux);
+    let rows = s
+        .query_rows(
+            "SELECT (SELECT count(*) FROM t), (SELECT count(*) FROM f.a)",
+            (),
         )
-        .unwrap_err();
-    assert_eq!(err.code(), "0A000");
-    let _ = std::fs::remove_file(&path);
+        .unwrap();
+    assert_eq!(rows[0].get::<i64>(0).unwrap(), 0);
+    assert_eq!(rows[0].get::<i64>(1).unwrap(), 0);
+    // A small write fits.
+    s.execute("INSERT INTO f.a VALUES (1, 'z')", &[]).unwrap();
+    assert!(host.storage_bytes("f").unwrap() <= 4 * PAGE);
+    drop(s);
+    host.detach("f").unwrap();
+    drop(host);
+    remove_file_db(&path);
 }
 
 #[test]

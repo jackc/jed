@@ -418,6 +418,11 @@ adoption, and continued commits. `cow_reuse` updates 400 rows repeatedly across 
 writer handoffs, exercising multi-page manifests, free-list planning, and bounded page reuse.
 `cow_serialization_error` rejects oversized catalogs without poisoning exclusive/shared
 writers or file attachments, including explicit commits that encoded dirty rows before failing.
+`storage_limit` pins the file form of `max_storage_bytes` (memory.md §8.7): actors set the limit
+(`max_storage_bytes`) and read the gauge (`storage_bytes`), and one process alone and two
+co-resident processes with append-only commits trip at the same batch with the same live count,
+though the co-resident file grows to nearly twice the length. A peer's delete lowers the count the
+other process commits against.
 
 The corpus, not per-core copies, covers:
 

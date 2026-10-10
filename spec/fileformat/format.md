@@ -17,7 +17,16 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 33)
+## Version scope (`format_version` 34)
+
+`format_version` **34** — **the live page count**
+([../design/memory.md §8.7](../design/memory.md)). Meta offset 56, reserved zero through v33, is now
+`live_pages` (u32): the exact number of pages reachable from `root_page` — the catalog chain, every
+B-tree and GiST node, and every live overflow page; never the meta slots, free-list pages, or
+manifest pages. Every commit writes the count it computes incrementally; a from-scratch image writes
+`page_count − 2`. A candidate whose count exceeds `page_count − 2` is invalid. Bytes 60–63 stay
+reserved zero. The file-backed `max_storage_bytes` limit measures `live_pages × page_size`. All
+golden meta pages change; readers accept only the exact current version.
 
 `format_version` **33** — **validated copy-on-write commit**
 ([../design/validated-cow.md](../design/validated-cow.md)). Meta CRC-32 now covers the entire
@@ -518,7 +527,7 @@ Two slots for torn-write-safe publication, with dirty-page validation since v33
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`33`** |
+| 4  | 2 | `format_version` (u16) — current = **`34`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -530,7 +539,8 @@ Two slots for torn-write-safe publication, with dirty-page validation since v33
 | 40 | 4 | `manifest_entries` (u32) — total dirty body/free-list entries, including inline entries |
 | 44 | 4 | `manifest_pages` (u32) — number of overflow-chain pages |
 | 48 | 8 | `manifest_crc64` (u64) — identity of the complete overflow chain; 0 when no chain |
-| 56 | 8 | reserved (0) |
+| 56 | 4 | `live_pages` (u32) — **new in v34**: the exact count of pages reachable from `root_page` (*Live page count* below). Must be `≤ page_count − 2` |
+| 60 | 4 | reserved (0) |
 | 64 | variable | first `min(manifest_entries, floor((page_size - 64) / 12))` entries, then zero padding |
 
 `page_size` lives at a fixed offset so a reader can learn it before it knows where page 1
@@ -557,8 +567,9 @@ present (copy-on-write never overwrote them). `create` seeds **both** slots with
 `txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit
 then overwrites slot 0).
 
-**Opening (slot selection).** Validate each candidate's magic, exact version 33, fixed page size,
-reserved fields, full-page CRC, page-count bounds, root and free-list bounds, and manifest below.
+**Opening (slot selection).** Validate each candidate's magic, exact version 34, fixed page size,
+reserved fields, full-page CRC, page-count bounds, root, free-list, and live-count bounds, and
+manifest below.
 Choose the fully validated candidate with highest `txid`; ties prefer slot 0. A structurally invalid,
 torn, or dependency-mismatched candidate permits trying the other slot. Neither valid → `XX001`.
 An actual host I/O error propagates rather than silently selecting an older snapshot. Load the chosen
@@ -569,6 +580,18 @@ non-increasing entries, or entries overlapping its own chain or protected manife
 is `XX001`; it does not retry an older candidate. This is the same distinction as a checksum-valid
 catalog with invalid logical contents. Manifest validation proves the expected bytes reached
 storage; it is not a semantic validation of the entire database.
+
+### Live page count (v34)
+
+`live_pages` is the size of the set of pages a reader reaches from `root_page`: each catalog-chain
+page, each node page of every table B+tree and every B-tree, GIN, or GiST index, and each overflow
+page of a value an in-tree record externalizes. Meta slots, free-list pages (`page_type 7`),
+manifest pages (`page_type 8`), and dead pages are not counted. A from-scratch image writes
+`page_count − 2`, since every body page is live. An incremental commit writes the count it derives
+from the previous one ([../design/memory.md §8.7](../design/memory.md)), so open never walks the
+file to learn it. A reader bounds the field but cannot cheaply verify it; the Ruby reference checks
+every golden's count against the pages its decoder reaches. An in-memory store's meta, which is
+never reopened, carries `0`.
 
 ### Commit manifest (v33)
 

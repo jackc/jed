@@ -246,6 +246,12 @@ sits so the options stay open (CLAUDE.md §9).
   meta/free-list pages — not O(file). The lone exception is a **no-PK** table, whose synthetic-rowid
   reconstruction still faults its leaves to find `max key + 1` (most tables have a PK; bounded by the
   pool).
+- **Live page count** — ✅ **landed (v34).** Meta offset 56 records the exact number of pages
+  reachable from the catalog root, so the file-backed `max_storage_bytes` limit
+  ([memory.md](memory.md) §8.7) never walks the file at open. Each commit derives the new count from
+  the previous one: it adds every page it writes, and subtracts the previous catalog chain and GiST
+  forest (both rewritten whole) and the previous B-tree pages outside the subtrees the two snapshots
+  share, with each orphaned leaf's overflow pages counted from its external pointers' lengths.
 - **Multi-process file locking** — ✅ **landed ([locking.md](locking.md)).** Protocol-aware handles and
   file attachments share the same file safely through a stable `<path>.lock/` bundle carrying
   presence/arrival/transition/writer/commit OS locks. An

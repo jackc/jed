@@ -20,19 +20,23 @@ import {
   catalogPageCount,
   incrementalImage,
   type IncrementalWrite,
+  liveAfter,
+  type LiveCount,
   metaPage,
   planFreeList,
   reachablePages,
   ROOT_PAGE,
   unassignPages,
+  verifyLiveCount,
 } from "./format.ts";
 
-// StorageBudget is the max_storage_bytes state of one storage domain (memory.md §8.1–§8.3): the limit,
-// plus what the last successful in-memory commit wrote, so a commit that would exceed the limit can
-// first compact the committed snapshot (its catalog root and written pages — the latter cover a GiST
-// R-tree, which reachablePages cannot see).
+// StorageBudget is the max_storage_bytes state of one storage domain (memory.md §8.1–§8.3, §8.7): the
+// limit, plus what the last successful in-memory commit wrote, so a commit that would exceed the limit
+// can first compact the committed snapshot (its catalog root and written pages — the latter cover a
+// GiST R-tree, which reachablePages cannot see).
 export type StorageBudget = {
-  // Positive: the limit in bytes over pageCount × pageSize. Zero or negative: unlimited.
+  // Positive: the limit in bytes over pageCount × pageSize for an in-memory domain (§8.2), over
+  // live pages × pageSize for a durable one (§8.7). Zero or negative: unlimited.
   limit: bigint;
   // The catalog root the last commit wrote; 0 before the first commit (nothing to reclaim yet).
   lastCatRoot: number;
@@ -42,11 +46,12 @@ export type StorageBudget = {
   lastCatalogPages: number;
 };
 
-// BudgetCtx is the budget context of one in-memory domain's commit (memory.md §8.3): its name (for the
-// 54P06 message), its committed snapshot (what a forced compaction rebuilds the free list from),
-// whether the reader watermark allows compacting that snapshot (no live reader pins an older version),
-// and whether the commit stages any record version (one that stages none and does not grow the catalog
-// is admitted over the limit — the repair exemption).
+// BudgetCtx is the budget context of one domain's commit (memory.md §8.3, §8.7): its name (for the 54P06
+// message), its committed snapshot (what a forced compaction rebuilds the free list from, and what a
+// durable commit's live-page delta is taken against), whether the reader watermark allows compacting
+// that snapshot (no live reader pins an older version), and whether the commit stages any record
+// version (one that stages none and does not grow the catalog is admitted over the limit — the repair
+// exemption).
 export type BudgetCtx = {
   name: string;
   prev: Snapshot;
@@ -54,10 +59,43 @@ export type BudgetCtx = {
   stagesRows: boolean;
 };
 
-// storageBytes is the committed-storage measure (memory.md §8.2): the logical high-water times the page
-// size — deterministic, not RSS.
+// storageBytes is the committed-storage measure: an in-memory domain's logical high-water times the
+// page size (memory.md §8.2), a durable domain's live pages times the page size (§8.7) — deterministic,
+// not RSS and not the file length.
 export function storageBytes(db: Engine): bigint {
-  return BigInt(db.pageCount) * BigInt(db.pageSize);
+  const pages = db.persistHook !== null ? db.live.live : db.pageCount;
+  return BigInt(pages) * BigInt(db.pageSize);
+}
+
+// admitFile is the live-page count a DURABLE commit of write would publish, admitted under the file
+// form of max_storage_bytes (memory.md §8.7) before any page is written. The measure is the live pages
+// — reachable from the new catalog root — times the page size, so neither free pages nor the
+// co-resident append-only allocation counts. A commit is admitted when the domain is unlimited, when it
+// does not grow the live count, when it fits, or under the repair exemption (it stages no record
+// version and rewrites no more catalog pages than the last commit). There is no forced compaction:
+// reclaiming dead pages cannot lower the measure. prev is the committed snapshot the domain's live
+// count describes; a null budget (a bare engine's commit) only computes the count.
+function admitFile(
+  db: Engine,
+  write: IncrementalWrite,
+  prev: Snapshot,
+  budget: BudgetCtx | null,
+): LiveCount {
+  const live = liveAfter(db.live, write, prev, db.paging!, db.pageSize);
+  const limit = db.storageBudget.limit;
+  if (
+    budget === null ||
+    limit <= 0n ||
+    live.live <= db.live.live ||
+    BigInt(live.live) * BigInt(db.pageSize) <= limit ||
+    (!budget.stagesRows && write.catalogPages <= db.live.catalog)
+  ) {
+    return live;
+  }
+  throw engineError(
+    "storage_limit_exceeded",
+    `storage of database "${budget.name}" exceeded the limit of ${limit} bytes`,
+  );
 }
 
 // recordBudget remembers a successful in-memory commit's catalog root and written pages.
@@ -169,17 +207,26 @@ function forceCompact(db: Engine, prev: Snapshot): boolean {
   return true;
 }
 
-// precheckBudget checks an in-memory domain's budget ahead of a multi-root commit (memory.md §8.3), so a
-// rejection in a domain committed later publishes no domain's pages: plan (with any forced compaction),
-// then release the plan's page ids. The real commit re-plans the same allocation. A durable or unlimited
-// domain checks nothing.
+// precheckBudget checks a domain's budget ahead of a multi-root commit (memory.md §8.3, §8.7), so a
+// rejection in a domain committed later publishes no domain's pages: plan (an in-memory domain with any
+// forced compaction), admit, then release the plan's page ids. The real commit re-plans the same
+// allocation. An unlimited domain checks nothing.
 export function precheckBudget(
   db: Engine,
   snap: Snapshot,
   reuse: boolean,
   budget: BudgetCtx,
 ): void {
-  if (db.persistHook !== null || db.paging === null || db.storageBudget.limit <= 0n) return;
+  if (db.paging === null || db.storageBudget.limit <= 0n) return;
+  if (db.persistHook !== null) {
+    const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages, db.paging, reuse);
+    try {
+      admitFile(db, write, budget.prev, budget);
+    } finally {
+      unassignPages(snap, write.pages);
+    }
+    return;
+  }
   const write = planInMemory(db, snap, reuse, budget);
   unassignPages(snap, write.pages);
 }
@@ -189,8 +236,9 @@ export function precheckBudget(
 // excludes all descriptor dependencies, preserving the previous candidate during the next commit.
 // Memory stores retain their RAM free list and post-commit compaction without descriptor overhead.
 // canReclaim is the caller's reader-watermark decision (default: no open streaming cursor).
-// budget is the main domain's committed-storage context (memory.md §8.3), checked only for an
-// in-memory store.
+// budget is the domain's committed-storage context (memory.md §8.3, §8.7): an in-memory store is
+// planned under it, a durable one admitted under its file form. A durable commit without one (a bare
+// engine's persistHook) takes its live-page delta against db.committed, still the previous snapshot.
 export function persistImpl(
   db: Engine,
   snap: Snapshot,
@@ -208,8 +256,10 @@ export function persistImpl(
   // DURABLE (file or OPFS — both reopened, both set a persistHook; the OPFS host leaves `path` null, so
   // durability is keyed on persistHook, not path) persists the free-list in-commit; an IN-MEMORY main
   // store (persistHook null) keeps its free-list in RAM.
-  if (db.persistHook !== null) commitFile(db, snap, write, reclaim, canReuse);
-  else commitInMemory(db, snap, write, reclaim);
+  if (db.persistHook !== null) {
+    const live = admitFile(db, write, budget?.prev ?? db.committed, budget);
+    commitFile(db, snap, write, live, reclaim, canReuse);
+  } else commitInMemory(db, snap, write, reclaim);
   return write;
 }
 
@@ -217,9 +267,12 @@ export function persistImpl(
 // persisted free list, rewrites its chain, truncates, or replaces the file. Body and overflow
 // descriptor writes happen before commit EX; meta publication and the single durability barrier
 // stay inside commit EX so another process cannot adopt an unacknowledged live writer's generation.
+// budget is the domain's committed-storage context: the commit is admitted under the file form of
+// max_storage_bytes (memory.md §8.7) before any page is written.
 export function persistSharedBody(
   db: Engine,
   snap: Snapshot,
+  budget: BudgetCtx,
 ): {
   write: IncrementalWrite;
   publishMeta: () => void;
@@ -228,6 +281,7 @@ export function persistSharedBody(
   paging?.checkDurableCommit();
   const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages, db.paging, false);
   if (paging === null) return { write, publishMeta: () => {} };
+  const live = admitFile(db, write, budget.prev, budget);
   const overflowCount = Math.ceil(
     Math.max(0, write.pages.length - manifestInlineCapacity(db.pageSize)) /
       manifestOverflowCapacity(db.pageSize),
@@ -241,10 +295,19 @@ export function persistSharedBody(
   paging.refreshAllocatedPages();
   paging.reserve(pageCount);
   for (const pg of [...write.pages, ...manifest.pages]) paging.writeBlock(pg.index, pg.bytes);
+  verifyLiveCount(snap, paging, write, live);
   return {
     write,
     publishMeta: () => {
-      const meta = metaPage(db.pageSize, snap.txid, write.rootPage, pageCount, 0, manifest);
+      const meta = metaPage(
+        db.pageSize,
+        snap.txid,
+        write.rootPage,
+        pageCount,
+        0,
+        live.live,
+        manifest,
+      );
       paging.writeBlock(Number(snap.txid & 1n), meta);
       paging.sync();
       paging.finishDurableCommit(snap.txid, metaChecksum(meta));
@@ -254,6 +317,7 @@ export function persistSharedBody(
       // trusting reachability facts from before a co-resident interval.
       db.liveAtCompaction = 0;
       db.freeGenTxid = snap.txid;
+      db.live = live;
     },
   };
 }
@@ -261,10 +325,12 @@ export function persistSharedBody(
 // Write tree/catalog first so reclamation can read the new catalog. Joint allocation then reserves
 // descriptor and free-list pages from the prior safe free set, protecting every new write from reuse.
 // The inline/overflow descriptor hashes those body pages and the single final sync publishes them.
+// live is the admitted live-page count the meta publishes (memory.md §8.7).
 function commitFile(
   db: Engine,
   snap: Snapshot,
   write: IncrementalWrite,
+  live: LiveCount,
   canReclaim: boolean,
   canReuse: boolean,
 ): void {
@@ -289,6 +355,7 @@ function commitFile(
     canReclaim,
     canReuse,
   );
+  verifyLiveCount(snap, paging, write, live);
   paging.reserve(plan.newPageCount);
   for (const pg of plan.pages) {
     paging.writeBlock(pg.index, pg.bytes);
@@ -310,6 +377,7 @@ function commitFile(
     write.rootPage,
     plan.newPageCount,
     plan.head,
+    live.live,
     manifest,
   );
   paging.writeBlock(Number(snap.txid & 1n), meta);
@@ -319,6 +387,7 @@ function commitFile(
   db.freePages = plan.persisted;
   db.liveAtCompaction = plan.newLive;
   db.freeGenTxid = plan.newGen;
+  db.live = live;
 }
 
 // commitInMemory is the IN-MEMORY branch of persistImpl: a MemoryBlockStore is never reopened, so it
@@ -338,7 +407,8 @@ function commitInMemory(
     paging.invalidate(pg.index);
   }
   paging.sync(); // a no-op on a MemoryBlockStore
-  const meta = metaPage(db.pageSize, snap.txid, write.rootPage, write.pageCount, 0);
+  // A memory store is never reopened, so its meta carries no live-page count (memory.md §8.7).
+  const meta = metaPage(db.pageSize, snap.txid, write.rootPage, write.pageCount, 0, 0);
   paging.writeBlock(Number(snap.txid & 1n), meta);
   paging.sync();
   adoptStaged(db, snap, stagedFromWrite("", write), canReclaim);
@@ -348,14 +418,16 @@ function commitInMemory(
 // byte store (attached-databases.md §5, Slice 2): the SAME durable recipe as the main persist
 // (persistImpl — v25 persists the free-list in-commit for a file store), then the post-commit residency
 // flip (demoteCleanLeaves — bplus-reshape.md B4). The caller advances snap.txid before calling. Runs
-// under the writer gate. An in-memory attachment uses persistTemp instead (no fsync).
+// under the writer gate. An in-memory attachment uses persistTemp instead (no fsync). budget is the
+// attachment's committed-storage context (memory.md §8.7).
 export function commitDurableAttachment(
   db: Engine,
   snap: Snapshot,
   canReclaim: boolean,
-  canReuse = true,
+  canReuse: boolean,
+  budget: BudgetCtx,
 ): void {
-  persistImpl(db, snap, canReclaim, canReuse);
+  persistImpl(db, snap, canReclaim, canReuse, budget);
   snap.demoteCleanLeaves();
 }
 

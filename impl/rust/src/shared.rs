@@ -215,19 +215,20 @@ impl AttachSource {
         self
     }
 
-    /// Limit an in-memory attachment's committed storage to `bytes` (spec/design/memory.md §8.1);
-    /// zero or negative is unlimited. A positive limit on a file source is `0A000` at attach.
+    /// Limit the attachment's committed storage to `bytes` (spec/design/memory.md §8.1): an in-memory
+    /// attachment's page high-water (§8.2), a file attachment's live pages (§8.7). Zero or negative is
+    /// unlimited.
     pub fn max_storage_bytes(mut self, bytes: i64) -> AttachSource {
         self.max_storage_bytes = bytes;
         self
     }
 }
 
-/// The `0A000` for a committed-storage limit on a file backing (memory.md §8.7).
-fn file_storage_limit_error() -> EngineError {
+/// The `54P06` for a commit of database `name` that would exceed its `max_storage_bytes` (memory.md §8.3).
+fn storage_limit_error(name: &str, limit: i64) -> EngineError {
     EngineError::new(
-        SqlState::FeatureNotSupported,
-        "max_storage_bytes applies only to in-memory databases",
+        SqlState::StorageLimitExceeded,
+        format!("storage of database \"{name}\" exceeded the limit of {limit} bytes"),
     )
 }
 
@@ -277,11 +278,14 @@ pub(crate) struct Storage {
     /// pinning an older version (single-handle, reconstruct-on-open, all readers current) the gate always
     /// passes, so the on-disk byte layout is byte-for-byte unchanged.
     free_gen_txid: u64,
-    /// The committed-storage budget of an in-memory domain (memory.md §8, Q4a).
+    /// The committed-storage budget (memory.md §8): the in-memory form (Q4a) or the file form (§8.7).
     budget: StorageBudget,
+    /// The live-page accounting of a file-backed domain's committed state (memory.md §8.7); unused
+    /// for an in-memory domain.
+    live: crate::format::LiveCount,
 }
 
-/// The `max_storage_bytes` state of one in-memory domain (memory.md §8.1–§8.3): the limit, plus what
+/// The `max_storage_bytes` state of one domain (memory.md §8.1–§8.3, §8.7): the limit, plus what
 /// the last successful commit wrote, so a commit that would exceed the limit can first compact the
 /// committed snapshot (its catalog root and written pages — the latter cover a GiST R-tree, which
 /// [`crate::format::reachable_pages`] cannot see).
@@ -366,6 +370,7 @@ impl Storage {
             live_at_compaction: 0,
             free_gen_txid: 0,
             budget: StorageBudget::default(),
+            live: crate::format::LiveCount::default(),
         }
     }
 
@@ -509,13 +514,33 @@ impl Storage {
         {
             return Ok(write);
         }
-        Err(EngineError::new(
-            SqlState::StorageLimitExceeded,
-            format!(
-                "storage of database \"{}\" exceeded the limit of {} bytes",
-                ctx.name, self.budget.limit
-            ),
-        ))
+        Err(storage_limit_error(ctx.name, self.budget.limit))
+    }
+
+    /// The live-page count a FILE commit of `write` would publish, admitted under the file form of
+    /// `max_storage_bytes` (memory.md §8.7) before any page is written. The measure is the live
+    /// pages — reachable from the new catalog root — times the page size, so neither free pages nor
+    /// the co-resident append-only allocation counts. A commit is admitted when the domain is
+    /// unlimited, when it does not grow the live count, when it fits, or under the repair exemption
+    /// (it stages no record version and rewrites no more catalog pages than the last commit). There is
+    /// no forced compaction: reclaiming dead pages cannot lower the measure.
+    fn admit_file(
+        &self,
+        write: &crate::format::IncrementalWrite,
+        ctx: &BudgetCtx<'_>,
+    ) -> Result<crate::format::LiveCount> {
+        let live = self
+            .live
+            .after(write, ctx.prev, &self.paging, self.page_size)?;
+        let limit = self.budget.limit;
+        if limit <= 0
+            || live.live <= self.live.live
+            || u64::from(live.live) * u64::from(self.page_size) <= limit as u64
+            || (!ctx.stages_rows && write.catalog_pages <= self.live.catalog)
+        {
+            return Ok(live);
+        }
+        Err(storage_limit_error(ctx.name, limit))
     }
 
     /// Whether `write` is admitted (memory.md §8.3): an unlimited domain, a commit that does not
@@ -557,17 +582,35 @@ impl Storage {
         reuse: bool,
         budget: &BudgetCtx<'_>,
     ) -> Result<()> {
-        if self.path.is_some() || self.budget.limit <= 0 {
+        if self.budget.limit <= 0 {
             return Ok(());
+        }
+        if self.path.is_some() {
+            let write = snap.incremental_image(
+                self.page_size,
+                self.page_count,
+                &self.free_pages,
+                reuse,
+                Some(&self.paging),
+            )?;
+            let admitted = self.admit_file(&write, budget);
+            snap.unassign_pages(&write.pages);
+            return admitted.map(|_| ());
         }
         let write = self.plan_in_memory(snap, reuse, Some(budget))?;
         snap.unassign_pages(&write.pages);
         Ok(())
     }
 
-    /// The committed-storage measure (memory.md §8.2): the logical high-water times the page size.
+    /// The committed-storage measure: an in-memory domain's logical high-water times the page size
+    /// (memory.md §8.2), a file-backed domain's live pages times the page size (§8.7).
     pub(crate) fn storage_bytes(&self) -> i64 {
-        i64::from(self.page_count) * i64::from(self.page_size)
+        let pages = if self.path.is_some() {
+            self.live.live
+        } else {
+            self.page_count
+        };
+        i64::from(pages) * i64::from(self.page_size)
     }
 
     /// Durably publish `snap` into this storage via an **incremental** copy-on-write commit
@@ -585,6 +628,7 @@ impl Storage {
         budget: Option<&BudgetCtx<'_>>,
     ) -> Result<()> {
         if self.path.is_some() {
+            let ctx = budget.expect("a file commit names its previous snapshot");
             self.paging.pager().check_commit()?;
             let write = snap.incremental_image(
                 self.page_size,
@@ -593,7 +637,8 @@ impl Storage {
                 can_reuse,
                 Some(&self.paging),
             )?;
-            self.commit_file(snap, write, can_reclaim, can_reuse)
+            let live = self.admit_file(&write, ctx)?;
+            self.commit_file(snap, write, live, can_reclaim, can_reuse)
         } else {
             let write = self.plan_in_memory(snap, can_reuse, budget)?;
             self.commit_in_memory(snap, write, can_reclaim)
@@ -606,6 +651,7 @@ impl Storage {
         &mut self,
         snap: &Snapshot,
         write: crate::format::IncrementalWrite,
+        live: crate::format::LiveCount,
         can_reclaim: bool,
         can_reuse: bool,
     ) -> Result<()> {
@@ -635,7 +681,9 @@ impl Storage {
             ps,
             can_reclaim,
             can_reuse,
+            live.live,
         )?;
+        crate::format::verify_live_count(snap, &self.paging, &write, live)?;
         {
             let mut pager = self.paging.pager();
             pager.reserve(plan.page_count)?;
@@ -655,6 +703,7 @@ impl Storage {
         self.free_pages = plan.persisted;
         self.live_at_compaction = plan.live;
         self.free_gen_txid = plan.generation;
+        self.live = live;
         Ok(())
     }
 
@@ -665,9 +714,10 @@ impl Storage {
         &mut self,
         snap: &Snapshot,
         write: crate::format::IncrementalWrite,
+        live: crate::format::LiveCount,
         coordinator: &FileCoordinator,
     ) -> Result<()> {
-        let plan = crate::format::plan_shared_commit(self.page_size, snap.txid, &write)?;
+        let plan = crate::format::plan_shared_commit(self.page_size, snap.txid, &write, live.live)?;
         {
             let mut pager = self.paging.pager();
             pager.begin_commit()?;
@@ -677,6 +727,7 @@ impl Storage {
                 pager.write_block(*index, bytes)?;
             }
         }
+        crate::format::verify_live_count(snap, &self.paging, &write, live)?;
         let commit = coordinator.lock_commit_exclusive()?;
         {
             let mut pager = self.paging.pager();
@@ -690,6 +741,7 @@ impl Storage {
         // Force the first later alone commit to reconstruct the reclaimable set.
         self.live_at_compaction = 0;
         self.free_gen_txid = snap.txid;
+        self.live = live;
         Ok(())
     }
 
@@ -704,11 +756,13 @@ impl Storage {
         write: crate::format::IncrementalWrite,
         can_reclaim: bool,
     ) -> Result<()> {
+        // A memory store is never reopened, so its meta carries no live-page count (memory.md §8.7).
         let meta = crate::format::meta_page(
             self.page_size,
             snap.txid,
             write.root_page,
             write.page_count,
+            0,
             0,
         );
         {
@@ -798,6 +852,7 @@ impl Storage {
         self.free_pages = engine.free_pages.clone();
         self.live_at_compaction = engine.live_at_compaction;
         self.free_gen_txid = engine.free_gen_txid;
+        self.live = engine.live;
         self.budget.last_cat_root = 0;
         self.budget.last_written.clear();
         self.budget.last_catalog_pages = 0;
@@ -1097,6 +1152,7 @@ impl Shared {
             storage.free_pages = engine.free_pages.clone();
             storage.live_at_compaction = engine.live_at_compaction;
             storage.free_gen_txid = engine.free_gen_txid;
+            storage.live = engine.live;
         }
         let mut roots = self.roots.write().expect("roots lock not poisoned");
         roots.committed = Arc::new(engine.committed);
@@ -1139,6 +1195,7 @@ impl Shared {
             attachment.storage.free_pages = engine.free_pages.clone();
             attachment.storage.live_at_compaction = engine.live_at_compaction;
             attachment.storage.free_gen_txid = engine.free_gen_txid;
+            attachment.storage.live = engine.live;
         }
         self.roots
             .write()
@@ -1402,6 +1459,13 @@ impl Shared {
         if let Some(att) = atts.get_mut(name) {
             if att.storage.path.is_some() {
                 snap.txid = base_txid + 1;
+                let prev = prev.expect("an attached file has a committed root");
+                let budget = BudgetCtx {
+                    name,
+                    prev: &prev,
+                    can_compact,
+                    stages_rows,
+                };
                 let shared = att
                     .coordinator
                     .as_ref()
@@ -1415,9 +1479,11 @@ impl Shared {
                         false,
                         Some(&att.storage.paging),
                     )?;
+                    let live = att.storage.admit_file(&write, &budget)?;
                     let result = att.storage.commit_file_shared(
                         snap,
                         write,
+                        live,
                         att.coordinator
                             .as_ref()
                             .expect("shared attachment has coordinator"),
@@ -1433,7 +1499,7 @@ impl Shared {
                     // A local reader pins the whole roots map, so reuse is safe only when that common
                     // watermark says no older attachment root is live.
                     att.storage
-                        .commit_durable(snap, can_reclaim, can_reclaim, None)?;
+                        .commit_durable(snap, can_reclaim, can_reclaim, Some(&budget))?;
                 }
                 snap.demote_clean_leaves(); // post-commit residency flip (bplus-reshape.md B4)
             } else {
@@ -1712,6 +1778,12 @@ impl Shared {
         let can_compact = self.can_compact_committed();
         let mut st = self.storage.lock().expect("storage lock not poisoned");
         let can_reuse = !shared && oldest >= st.free_gen_txid;
+        let budget = BudgetCtx {
+            name: "main",
+            prev: &prev,
+            can_compact,
+            stages_rows,
+        };
         if shared && st.path.is_some() {
             st.paging.pager().check_commit()?;
             let write = snap.incremental_image(
@@ -1721,9 +1793,11 @@ impl Shared {
                 false,
                 Some(&st.paging),
             )?;
+            let live = st.admit_file(&write, &budget)?;
             let result = st.commit_file_shared(
                 snap,
                 write,
+                live,
                 self.coordinator
                     .as_ref()
                     .expect("shared state has coordinator"),
@@ -1736,12 +1810,6 @@ impl Shared {
             }
             result
         } else {
-            let budget = BudgetCtx {
-                name: "main",
-                prev: &prev,
-                can_compact,
-                stages_rows,
-            };
             st.commit_durable(snap, can_reclaim, can_reuse, Some(&budget))
         }
     }
@@ -1905,6 +1973,7 @@ impl Database {
             live_at_compaction: engine.live_at_compaction,
             free_gen_txid: engine.free_gen_txid,
             budget: StorageBudget::default(),
+            live: engine.live,
         };
         let shared = Arc::new(Shared {
             roots: RwLock::new(Roots {
@@ -2009,20 +2078,19 @@ impl Database {
 
     /// Set the committed-storage limit of database `name` — `main` or an attachment — in bytes
     /// (spec/design/memory.md §8.1); zero or negative is unlimited. Shared by every session on the
-    /// handle and checked at each later commit. A positive limit on a file-backed database is `0A000`;
-    /// a name that is not attached is `42704`.
+    /// handle and checked at each later commit: an in-memory database's page high-water (§8.2), a
+    /// file-backed database's live pages (§8.7). A name that is not attached is `42704`.
     pub fn set_max_storage_bytes(&self, name: &str, bytes: i64) -> Result<()> {
         self.0.with_storage(name, |st| {
-            if st.path.is_some() && bytes > 0 {
-                return Err(file_storage_limit_error());
-            }
             st.budget.limit = bytes;
             Ok(())
         })
     }
 
-    /// The committed storage of database `name` — `main` or an attachment — in bytes: its logical page
-    /// high-water times its page size (spec/design/memory.md §8.2/§8.6). Deterministic; not RSS.
+    /// The committed storage of database `name` — `main` or an attachment — in bytes, the measure
+    /// `max_storage_bytes` limits: an in-memory database's logical page high-water times its page size
+    /// (spec/design/memory.md §8.2), a file-backed database's live pages times its page size (§8.7).
+    /// Deterministic; not RSS, and not the file length.
     pub fn storage_bytes(&self, name: &str) -> Result<i64> {
         self.0.with_storage(name, |st| Ok(st.storage_bytes()))
     }
@@ -2118,9 +2186,6 @@ impl Database {
         // Frozen at create, shared into every minted session (extensibility.md §7). Captured before
         // the `opts.path` move below.
         let extensions = opts.extensions.clone();
-        if opts.path.is_some() && opts.max_storage_bytes > 0 {
-            return Err(file_storage_limit_error());
-        }
         match opts.path {
             Some(path) => {
                 let coordinator =
@@ -2135,11 +2200,13 @@ impl Database {
                         no_sync: opts.skip_fsync,
                     },
                 )?;
-                Ok(Database::from_engine_coordinated(
-                    engine,
-                    coordinator,
-                    extensions,
-                ))
+                let db = Database::from_engine_coordinated(engine, coordinator, extensions);
+                db.0.storage
+                    .lock()
+                    .expect("storage lock not poisoned")
+                    .budget
+                    .limit = opts.max_storage_bytes;
+                Ok(db)
             }
             // in-memory never fsyncs; skip_fsync is a no-op
             None => {
@@ -2166,6 +2233,7 @@ impl Database {
         // Frozen at open, shared into every minted session (extensibility.md §7). Captured before the
         // `..opts` move below (the Engine layer ignores it — extensions live on the shared core).
         let extensions = opts.extensions.clone();
+        let max_storage_bytes = opts.max_storage_bytes;
         let coordinator =
             FileCoordinator::open(path.as_ref(), opts.locking, opts.file_lock_timeout_ms)?;
         let canonical = coordinator
@@ -2184,11 +2252,13 @@ impl Database {
             },
         )?;
         drop(commit);
-        Ok(Database::from_engine_coordinated(
-            engine,
-            coordinator,
-            extensions,
-        ))
+        let db = Database::from_engine_coordinated(engine, coordinator, extensions);
+        db.0.storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .budget
+            .limit = max_storage_bytes;
+        Ok(db)
     }
 
     /// The committed version currently published (the monotonic commit counter, transactions.md
@@ -2228,9 +2298,6 @@ impl Database {
         // Open a file source BEFORE taking the writer gate (an open may block on I/O and can fail): a
         // standalone engine over the file, whose committed snapshot + storage identity become the
         // attachment. If the name is taken, the built `Storage` drops here (closing the just-opened file).
-        if source.file && source.max_storage_bytes > 0 {
-            return Err(file_storage_limit_error());
-        }
         let file_backing: Option<(Storage, Snapshot, Option<Arc<FileCoordinator>>)> = if source.file
         {
             let path = source.path.as_ref().expect("a file source carries a path");
@@ -2269,7 +2336,11 @@ impl Database {
                 reclaim_within_session: true,
                 live_at_compaction: engine.live_at_compaction,
                 free_gen_txid: engine.free_gen_txid,
-                budget: StorageBudget::default(),
+                budget: StorageBudget {
+                    limit: source.max_storage_bytes,
+                    ..StorageBudget::default()
+                },
+                live: engine.live,
             };
             Some((storage, engine.committed, coordinator))
         } else {

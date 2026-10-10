@@ -1,3 +1,4 @@
+require "set"
 require "zlib"
 #!/usr/bin/env ruby
 # frozen_string_literal: true
@@ -26,7 +27,7 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 33 # v33: full-page meta CRC and validated-COW inline/overflow manifests.
+VERSION = 34 # v34: meta offset 56 carries the exact live page count (memory.md S8.7).
 # format_version 32 adds timezone dependencies; v31: host-function index dependencies (extensibility.md §8.1) — the
 # per-index index_flags byte gains bit2 has_host_deps, and (only when set) after the v27 predicate a
 # u16 dep_count + per dependency name (u16 len + UTF-8) ‖ arg_count u16 ‖ arg type codes (u8 each) ‖
@@ -2761,7 +2762,8 @@ def pack(sizes, cap)
   groups
 end
 
-def write_meta(image, ps, slot, page_size, txid, root, page_count)
+# `live` defaults to every body page: a from-scratch image has no free list and no manifest.
+def write_meta(image, ps, slot, page_size, txid, root, page_count, live = page_count - 2)
   off = slot * ps
   image[off, ps] = "\x00".b * ps
   image[off, 4] = MAGIC
@@ -2770,6 +2772,7 @@ def write_meta(image, ps, slot, page_size, txid, root, page_count)
   image[off + 12, 8] = u64(txid)
   image[off + 20, 4] = u32(root)
   image[off + 24, 4] = u32(page_count)
+  image[off + 56, 4] = u32(live) # v34: the exact live page count
   image[off + 32, 4] = u32(meta_crc(image.byteslice(off, ps)))
 end
 
@@ -3068,7 +3071,9 @@ def cow_fixture_image(fx)
     payload = u64(2) + u32(ordinal) + u32(0) + chunk.join.b
     write_page(image, ps, index, 8, chunk.length, chain[ordinal + 1] || 0, payload)
   end
-  write_meta(image, ps, 0, ps, 2, root, image.bytesize / ps)
+  # The new state's live pages are exactly its freshly appended leaf + catalog pages; the orphan
+  # writes and the manifest chain are not reachable.
+  write_meta(image, ps, 0, ps, 2, root, image.bytesize / ps, fresh.bytesize / ps - old_count)
   image[36, 12] = u32(chain.first || 0) + u32(entries.length) + u32(chain.length)
   image[64, inline_count * 12] = entries.first(inline_count).join.b
   refresh_manifest_chain_digest(image, ps, chain)
@@ -3156,9 +3161,11 @@ def read_meta(image, ps, slot)
   return nil unless meta_crc(m) == m.byteslice(32, 4).unpack1("N")
 
   meta = { txid: m.byteslice(12, 8).unpack1("Q>"), root_page: m.byteslice(20, 4).unpack1("N"),
-           page_count: m.byteslice(24, 4).unpack1("N"), free_head: m.byteslice(28, 4).unpack1("N") }
+           page_count: m.byteslice(24, 4).unpack1("N"), free_head: m.byteslice(28, 4).unpack1("N"),
+           live: m.byteslice(56, 4).unpack1("N") }
   return nil unless meta[:page_count] >= 3 && meta[:page_count] <= image.bytesize / ps
   return nil unless (2...meta[:page_count]).cover?(meta[:root_page])
+  return nil unless meta[:live] <= meta[:page_count] - 2
   return nil unless meta[:free_head].zero? || (2...meta[:page_count]).cover?(meta[:free_head])
   return nil unless valid_manifest?(image, ps, m, meta)
 
@@ -3168,7 +3175,7 @@ end
 def valid_manifest?(image, ps, m, meta)
   head, count, chain_count = m.byteslice(36, 12).unpack("N3")
   digest = m.byteslice(48, 8).unpack1("Q>")
-  return false unless m.byteslice(56, 8) == "\x00".b * 8
+  return false unless m.byteslice(60, 4) == "\x00".b * 4
   return false if count + chain_count > meta[:page_count] - 2
   return false unless (chain_count.zero? && head.zero? && digest.zero?) ||
                       (chain_count.positive? && head >= 2 && head < meta[:page_count])
@@ -3252,6 +3259,7 @@ def read_page(image, ps, index)
   p = image.byteslice(off, ps)
   # Verify the per-page checksum (v7) before trusting any header field (format.md *Page header*).
   raise "page checksum mismatch (corrupted page)" unless page_crc(p) == p.byteslice(12, 4).unpack1("N")
+  $reached << index if $reached
   { type: p.getbyte(0), item_count: p.byteslice(4, 4).unpack1("N"),
     next_page: p.byteslice(8, 4).unpack1("N"), payload: p.byteslice(PAGE_HEADER, ps - PAGE_HEADER) }
 end
@@ -4042,6 +4050,9 @@ def decode_image(image)
   ps = image.byteslice(8, 4).unpack1("N")
   meta = select_meta(image, ps)
   validate_free_list!(image, ps, meta)
+  # Every page the decode reads from the catalog root is live (v34): the catalog chain, each tree
+  # and GiST node, and each overflow page. The meta's count must equal that reachable set.
+  $reached = Set.new
   types = []
   sequences = []
   collations = []
@@ -4103,6 +4114,9 @@ def decode_image(image)
     raise "incomplete statistics group" unless item && item[:mcv].size == mcv_count &&
                                                item[:histogram].size == histogram_count
   end
+  reached = $reached.size
+  $reached = nil
+  raise "live page count #{meta[:live]} does not match #{reached} reachable pages" unless meta[:live] == reached
   { types: types, sequences: sequences, collations: collations, tables: tables,
     statistics: statistics }
 end

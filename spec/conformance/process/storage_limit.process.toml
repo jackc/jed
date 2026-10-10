@@ -1,0 +1,285 @@
+schema_version = 1
+name = "storage-limit-live-pages"
+description = "A file's max_storage_bytes trips at the same live-page count whether one process writes it alone or two co-resident processes share it with append-only commits; a peer's delete lowers the count every process sees (memory.md §8.7)."
+requires = ["file.shared_process"]
+
+# One process alone: twenty pages hold fourteen batches.
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create"
+path = "solo"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i32 PRIMARY KEY, v text)"
+
+[[step]]
+actor = "a"
+command = "max_storage_bytes"
+argument = "163840"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(0, 9) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(10, 19) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(20, 29) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(30, 39) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(40, 49) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(50, 59) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(60, 69) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(70, 79) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(80, 89) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(90, 99) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(100, 109) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(110, 119) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(120, 129) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(130, 139) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(140, 149) g"
+expect_error = "54P06"
+
+[[step]]
+actor = "a"
+command = "storage_bytes"
+expect = "163840"
+
+[[step]]
+actor = "a"
+command = "page_count"
+expect = "33"
+
+[[step]]
+actor = "a"
+command = "close"
+
+# Two co-resident processes alternate the same batches. Their commits only append, so the file
+# grows to 63 pages against 33 alone, yet the limit trips at the same batch and both processes
+# report the same live count.
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i32 PRIMARY KEY, v text)"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open"
+
+[[step]]
+actor = "a"
+command = "max_storage_bytes"
+argument = "163840"
+
+[[step]]
+actor = "b"
+command = "max_storage_bytes"
+argument = "163840"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(0, 9) g"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(10, 19) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(20, 29) g"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(30, 39) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(40, 49) g"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(50, 59) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(60, 69) g"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(70, 79) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(80, 89) g"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(90, 99) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(100, 109) g"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(110, 119) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(120, 129) g"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(130, 139) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(140, 149) g"
+expect_error = "54P06"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(140, 149) g"
+expect_error = "54P06"
+
+[[step]]
+actor = "a"
+command = "storage_bytes"
+expect = "163840"
+
+[[step]]
+actor = "b"
+command = "storage_bytes"
+expect = "163840"
+
+[[step]]
+actor = "a"
+command = "page_count"
+expect = "63"
+
+# A peer's delete lowers the live count the other process commits against.
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "DELETE FROM t WHERE id >= 70"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "70"
+
+[[step]]
+actor = "a"
+command = "storage_bytes"
+expect = "90112"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(70, 79) g"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(80, 89) g"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "90"
+
+[[step]]
+actor = "b"
+command = "storage_bytes"
+expect = "114688"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "close"

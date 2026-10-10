@@ -117,6 +117,8 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   recovered/foreign generations before further writes; poison storage on I/O failure.
   Serialization errors before storage work discard the transaction without poisoning the handle.
   Follow `spec/design/validated-cow.md` and the shared byte format. No WAL or redo copies.
+- Meta offset 56 (v34) holds the exact live page count; every commit advances it by an exact
+  delta, and the file form of `max_storage_bytes` limits it (memory.md §8.7).
 - Key encoding must preserve logical order in raw byte order.
 - Do not assume on-disk page bytes are plaintext-comparable; leave room for the
   encryption-at-rest design.
@@ -167,8 +169,11 @@ holds a transaction's pending writes (slice Q3): every record version it stages 
 bytes until commit/rollback, each statement's account opens holding them, and they must fit after
 every statement. A database-owned, opt-in `max_storage_bytes` (unlimited by default; `54P06`)
 bounds an in-memory database's or attachment's committed pages, checked at commit before any write
-(slice Q4a); file-backed page caches stay evict-only under `cache_bytes` and never fail a query.
-A file-backed size cap is still uncovered. These are guardrails, not heap caps: resource-
+(slice Q4a), and a file-backed database's or attachment's **live** pages — reachable from the catalog
+root, an exact count persisted in the meta page, so the trip point is independent of the free list
+and of co-resident append-only allocation (slice Q4c, memory.md §8.7); file-backed page caches stay
+evict-only under `cache_bytes` and never fail a query. A file's dead pages are bounded by the work
+that wrote them (`max_cost`/`lifetime_max_cost`), not by this limit. These are guardrails, not heap caps: resource-
 exhaustion resistance remains a requirement; do not claim the current limits are a
 whole-engine memory guarantee. Host extensions remain outside these guarantees.
 

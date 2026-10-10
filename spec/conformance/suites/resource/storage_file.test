@@ -1,0 +1,145 @@
+# Committed storage of a file-backed database (memory.md §8.7): max_storage_bytes limits a file by its
+# LIVE pages — every page reachable from the catalog root (catalog, tree and GiST nodes, overflow
+# chains), never the meta slots, free pages, or the file's length. A commit that would grow
+# live_pages × page_size past the limit fails 54P06 and writes nothing; a commit that does not grow
+# the live count is admitted, so a full database can always be repaired. The count is persisted in the
+# meta page, so it survives the disk pass's per-record reopen; the harness re-applies the handle's
+# limit after each reopen. A jed-specific resource contract, not a PostgreSQL limit. Pages are 8192
+# bytes; a t row holds a 1000-byte value, so a batch of ten rows fills about one and a half leaves.
+# skip: memory — an in-memory database measures its page high-water instead (storage_memory.test)
+# requires: query.select, query.aggregates, query.set_returning, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.secondary_index, ddl.gist_index, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, types.text, types.range, resource.storage_file
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v text)
+
+# Twenty pages.
+# max_storage_bytes: 163840
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(0, 9) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(10, 19) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(20, 29) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(30, 39) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(40, 49) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(50, 59) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(60, 69) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(70, 79) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(80, 89) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(90, 99) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(100, 109) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(110, 119) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(120, 129) g
+
+# The live count is now exactly twenty pages: one catalog page, the leaves, and their interior root.
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(130, 139) g
+
+# The fifteenth batch would grow it past the limit: the autocommit write commits nothing.
+statement error 54P06
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(140, 149) g
+
+query I nosort
+SELECT count(*) FROM t
+----
+140
+
+# A delete lowers the live count at once. The dead pages stay in the file, but they are not live, so
+# the next batches fit with no compaction.
+statement ok
+DELETE FROM t WHERE id >= 70
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(70, 79) g
+
+statement ok
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(80, 89) g
+
+query I nosort
+SELECT count(*) FROM t
+----
+90
+
+# A limit below the current size still admits commits that do not grow the live count.
+# max_storage_bytes: 8192
+
+statement ok
+UPDATE t SET v = 'y' WHERE id < 8
+
+statement ok
+INSERT INTO t VALUES (1000, 'z')
+
+statement error 54P06
+INSERT INTO t SELECT g, repeat('x', 1000) FROM generate_series(90, 99) g
+
+# An index build adds live pages like any write. This one needs exactly fourteen more.
+statement error 54P06
+CREATE INDEX t_v ON t (v)
+
+# max_storage_bytes: 229368
+
+statement error 54P06
+CREATE INDEX t_v ON t (v)
+
+# max_storage_bytes: 229376
+
+statement ok
+CREATE INDEX t_v ON t (v)
+
+# Dropping the table shrinks the live count to the catalog page: admitted under any limit.
+# max_storage_bytes: 8192
+
+statement ok
+DROP TABLE t
+
+# A GiST index's R-tree pages are live too; every commit rewrites the whole tree (seven pages).
+# max_storage_bytes: 57344
+
+statement ok
+CREATE TABLE g (id i32 PRIMARY KEY, r i32range)
+
+statement ok
+CREATE INDEX g_r ON g USING gist (r)
+
+statement ok
+INSERT INTO g VALUES (0, '[0,3)'), (1, '[1,4)'), (2, '[2,5)'), (3, '[3,6)'), (4, '[4,7)')
+
+statement ok
+INSERT INTO g VALUES (5, '[5,8)'), (6, '[6,9)'), (7, '[7,10)'), (8, '[8,11)'), (9, '[9,12)')
+
+statement error 54P06
+INSERT INTO g VALUES (10, '[10,13)'), (11, '[11,14)'), (12, '[12,15)'), (13, '[13,16)'), (14, '[14,17)')
+
+# Unlimited again: the same rows commit.
+# max_storage_bytes: 0
+
+statement ok
+INSERT INTO g VALUES (10, '[10,13)'), (11, '[11,14)'), (12, '[12,15)'), (13, '[13,16)'), (14, '[14,17)')
+
+query I nosort
+SELECT count(*) FROM g
+----
+15

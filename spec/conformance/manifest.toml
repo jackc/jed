@@ -1545,3 +1545,7 @@ description = "Live per-statement logical query-memory budget over row buffers, 
 [[capability]]
 id = "resource.storage_memory"
 description = "Database-owned committed-storage limit for in-memory databases and in-memory attachments (Q4a, 54P06); memory.md §8. A commit that would raise page_count × page_size past max_storage_bytes first compacts the committed snapshot, then fails before writing; a commit that does not raise the high-water, or stages no record version without growing the catalog, is admitted. Host create/attach options and setter, and the file-level `# max_storage_bytes: N [database]` corpus action."
+
+[[capability]]
+id = "resource.storage_file"
+description = "The file form of the committed-storage limit (54P06); memory.md §8.7. A file-backed database (main or a file attachment) is limited by its LIVE pages — reachable from the catalog root, never meta, free-list, or manifest pages — so the trip point is a function of the committed trees alone, independent of the free list, the reader watermark, and co-resident append-only allocation. The exact count is persisted at meta offset 56 (format_version 34) and advanced by every commit. A commit that would grow live_pages × page_size past max_storage_bytes fails before writing; one that does not grow the live count, or stages no record version without growing the catalog, is admitted. Host create/open/attach options and setter; the `# max_storage_bytes:` action is re-applied after each disk-mode reopen."

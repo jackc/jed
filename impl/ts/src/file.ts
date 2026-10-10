@@ -28,14 +28,13 @@ import { FileBlockStore } from "./fileblockstore.ts";
 import { DEFAULT_PAGE_SIZE, Engine, type Snapshot } from "./executor.ts";
 import { engineError } from "./errors.ts";
 import type { ExtensionRegistry } from "./extension.ts";
-import { loadEnginePaged, toImage, writeImage } from "./format.ts";
+import { loadEnginePaged, ROOT_PAGE, toImage, writeImage } from "./format.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager } from "./pager.ts";
 import { persistImpl } from "./persist.ts";
 import {
   buildInMemory,
   Database,
-  fileStorageLimitError,
   registerFileAttachOpener,
   registerFileCompactor,
 } from "./shared.ts";
@@ -71,10 +70,10 @@ export type CreateOptions = {
   // the host supplies, FROZEN for the handle's lifetime and shared into every session. Not stored in
   // the file — a host reopens with its own registry (the ephemeral, no-persisted-use rule of §14).
   extensions?: ExtensionRegistry;
-  // The committed-storage limit of an IN-MEMORY database in bytes (spec/design/memory.md §8): a commit
-  // that would raise pageCount × pageSize past it fails 54P06. Zero, negative, or absent is unlimited
-  // (the default). Not stored anywhere; Database.setMaxStorageBytes changes it. A positive value with a
-  // path is 0A000 (the file form is deferred, memory.md §8.7).
+  // The committed-storage limit in bytes (spec/design/memory.md §8): a commit that would grow the
+  // database past it fails 54P06. An in-memory database measures its page high-water (pageCount ×
+  // pageSize, §8.2), a file-backed one its live pages (livePages × pageSize, §8.7). Zero, negative, or
+  // absent is unlimited (the default). Not stored anywhere; Database.setMaxStorageBytes changes it.
   maxStorageBytes?: bigint;
 };
 
@@ -122,6 +121,10 @@ function writeFullImage(db: Engine, noSync: boolean): void {
   const bytes = toImage(db.committed, db.pageSize, db.committed.txid);
   writeAtomic(db.path, bytes, noSync);
   db.pageCount = Math.floor(bytes.length / db.pageSize);
+  // The image is of an empty database: every body page is live, and every one is a catalog page
+  // (spec/design/memory.md §8.7).
+  const body = db.pageCount - ROOT_PAGE;
+  db.live = { live: body, catalog: body, gist: 0 };
 }
 
 // OpenOptions are open-time settings for a file-backed database (spec/design/api.md §2.1). Unlike
@@ -156,6 +159,11 @@ export type OpenOptions = {
   // the host supplies, FROZEN for the handle's lifetime. A handle setting like the rest — not stored
   // in the file, so a reopening host brings its own (§14 step 3).
   extensions?: ExtensionRegistry;
+  // The committed-storage limit in bytes over the file's live pages (spec/design/memory.md §8.7): a
+  // commit that would grow livePages × pageSize past it fails 54P06. Zero, negative, or absent is
+  // unlimited (the default). A handle setting, not stored in the file; Database.setMaxStorageBytes
+  // changes it.
+  maxStorageBytes?: bigint;
 };
 
 // open opens an existing file-backed database at path with optional open settings (the memory budget,
@@ -190,6 +198,7 @@ export function open(path: string, opts: OpenOptions = {}): Engine {
     db.path = path;
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
     db.readOnly = readOnly;
+    db.storageBudget.limit = opts.maxStorageBytes ?? 0n;
     // Scratch is independent of the persistence path, so read-only database filesystems remain
     // readable when ORDER BY crosses work_mem (spill.md §4, api.md §2.1).
     db.spillSink = new FileSpillSink(tmpdir());
@@ -343,7 +352,6 @@ function removeQuietly(path: string): void {
 export function createDatabase(opts: CreateOptions = {}): Database {
   const pageSize = opts.pageSize || DEFAULT_PAGE_SIZE;
   const maxStorageBytes = opts.maxStorageBytes ?? 0n;
-  if (opts.path !== undefined && maxStorageBytes > 0n) throw fileStorageLimitError();
   if (opts.path !== undefined) {
     const coordinator = FileCoordinator.create(opts.path, opts.locking, opts.fileLockTimeoutMs);
     try {
@@ -351,6 +359,7 @@ export function createDatabase(opts: CreateOptions = {}): Database {
         pageSize,
         noSync: opts.skipFsync,
       });
+      engine.storageBudget.limit = maxStorageBytes;
       return Database.fromEngine(engine, coordinator, opts.extensions ?? null);
     } catch (error) {
       coordinator?.close();

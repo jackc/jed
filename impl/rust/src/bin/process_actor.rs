@@ -115,6 +115,12 @@ fn run() -> Result<(), EngineError> {
                     argument
                 })
                 .map(|_| String::new()),
+            "MAX_STORAGE_BYTES" => database
+                .set_max_storage_bytes("main", argument.parse().expect("MAX_STORAGE_BYTES bytes"))
+                .map(|_| String::new()),
+            "STORAGE_BYTES" => database
+                .storage_bytes("main")
+                .map(|bytes| bytes.to_string()),
             "TXID" => Ok(database.txid().to_string()),
             "PAGE_COUNT" => Ok(database.page_count().to_string()),
             "CLOSE" => {
