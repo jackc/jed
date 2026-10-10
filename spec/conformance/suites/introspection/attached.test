@@ -5,7 +5,7 @@
 # against the attached database's pinned catalog snapshot — the SQLite `aux.sqlite_schema` shape.
 # Every database carries the built-ins in its relation namespace; only the qualifier must name an
 # attached database (else 42P01). jed-specific, CROSS-CORE-checked, NOT oracle-checked.
-# requires: introspect.tables, introspect.columns, harness.attach, attach.in_memory, query.qualified_table, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, query.join_inner, query.aggregates, types.i32, types.text
+# requires: introspect.tables, introspect.columns, introspect.sequences, introspect.types, introspect.type_fields, ddl.sequence, types.composite, harness.attach, attach.in_memory, query.qualified_table, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, query.join_inner, query.aggregates, types.i32, types.text
 # attach: reports
 
 # --- a fresh attachment lists nothing -------------------------------------------------------------
@@ -65,3 +65,37 @@ INSERT INTO reports.jed_tables VALUES ('x')
 
 statement error 42809
 DELETE FROM reports.jed_columns
+
+# --- sequences and types are scoped per database too (introspection.md §5.3) ---------------------
+
+# a sequence and a type created in main are not objects of the attachment
+statement ok
+CREATE SEQUENCE main_seq
+
+statement ok
+CREATE TYPE pair AS (a i32, b i32)
+
+query T nosort
+SELECT name FROM jed_sequences
+----
+main_seq
+
+query T nosort
+SELECT name FROM jed_types
+----
+pair
+
+query I nosort
+SELECT count(*) FROM reports.jed_sequences
+----
+0
+
+query I nosort
+SELECT count(*) FROM reports.jed_types
+----
+0
+
+query I nosort
+SELECT count(*) FROM reports.jed_type_fields
+----
+0

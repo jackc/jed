@@ -3,10 +3,9 @@
 > How a query (and through it, a host) discovers what a database contains: the decision —
 > **`jed_`-prefixed virtual catalog relations**, scoped per database by the existing qualifier —
 > plus the **`jed_` name reservation** that keeps their namespace clear (§4, **implemented**).
-> Five relations are implemented — **`jed_tables` + `jed_columns`** (slice I1 — §5),
-> **`jed_indexes` + `jed_constraints`** (slice I2 — §5.1), and **`jed_statistics`** (P9 — §5.2);
-> `jed_sequences` / `jed_types` remain
-> designed-only (I3).
+> Eight relations are implemented — **`jed_tables` + `jed_columns`** (slice I1 — §5),
+> **`jed_indexes` + `jed_constraints`** (slice I2 — §5.1), **`jed_statistics`** (P9 — §5.2), and
+> **`jed_sequences` + `jed_types` + `jed_type_fields`** (slice I3 — §5.3).
 > [attached-databases.md](attached-databases.md) §3 owns the qualifier model the scoping rides;
 > [session.md](session.md) owns the privilege gating; [api.md](api.md) §7 owns the host handle —
 > which deliberately exposes **no** introspection convenience (the old `table_names()` was removed
@@ -25,7 +24,8 @@ relations below shipped, `table_names()` was **removed** (§6): SQL is now the w
 
 **Decision (2026-07-04): introspection is a family of `jed_`-prefixed, read-only, computed
 catalog relations in the ordinary relation namespace** — `jed_tables` and `jed_columns` first,
-then `jed_indexes` / `jed_constraints` / `jed_sequences` / `jed_types` (§5) — resolved like any
+then `jed_indexes` / `jed_constraints` / `jed_sequences` / `jed_types` / `jed_type_fields` (§5) —
+resolved like any
 table and scoped to a database by the existing qualifier: unqualified = the implicit scope
 (`main`), `temp.jed_tables` = the session temp domain, `reports.jed_tables` = the attachment
 (attached-databases.md §3). They are **not stored**: rows are derived at execution from the
@@ -351,10 +351,91 @@ lowercased table name then column ordinal. The relation is independently privile
 name `jed_statistics`, charges one `generated_row` per summary, and exposes no typed MCV/histogram
 arrays in P9.
 
-**Later relations** (same model, own slices — I3): `jed_sequences` (the six definition fields +
-ownership), `jed_types` (composite types + fields). Capability ids `introspect.tables`,
-`introspect.columns`, `introspect.indexes`, `introspect.constraints`, `introspect.statistics`, … —
-one per relation.
+Capability ids are one per relation: `introspect.tables`, `introspect.columns`,
+`introspect.indexes`, `introspect.constraints`, `introspect.statistics`, `introspect.sequences`,
+`introspect.types`, `introspect.type_fields`.
+
+## 5.3 `jed_sequences`, `jed_types`, `jed_type_fields` (I3) — implemented
+
+The same model as §5 (read-only computed relations, scoped by the qualifier, riding the SRF-plan
+shape, self-excluding, `SELECT`-gated, `42809` on a write target, one `generated_row` per produced
+row, exact-count estimates): three relations describing the two **database-level** catalog-object
+kinds that are not tables — sequences ([sequences.md](sequences.md)) and composite types
+([composite.md](composite.md)). Every column name and value is a compatibility surface, pinned by
+`suites/introspection/jed_sequences.test`, `jed_sequences_txn.test` (memory-only — a transaction
+spanning records), and `jed_types.test`, with temp and attachment scoping in `temp_scope.test` /
+`attached.test`.
+
+```
+jed_sequences(
+  name             text NOT NULL,     -- the sequence name (relation namespace, original case)
+  start_value      i64 NOT NULL,      -- START WITH
+  min_value        i64 NOT NULL,      -- MINVALUE (inclusive)
+  max_value        i64 NOT NULL,      -- MAXVALUE (inclusive)
+  increment_by     i64 NOT NULL,      -- INCREMENT BY (non-zero; negative = descending)
+  cycle            boolean NOT NULL,  -- CYCLE
+  cache_size       i64 NOT NULL,      -- CACHE as declared (behaves as 1 — sequences.md §7)
+  last_value       i64,               -- the last value handed out; NULL until the sequence is read
+  owned_by_table   text,              -- the OWNED BY owning table (serial / IDENTITY); NULL otherwise
+  owned_by_column  text               -- the owning column's name; NULL iff owned_by_table is NULL
+)
+
+jed_types(
+  name  text NOT NULL,                -- the type name as created
+  kind  text NOT NULL                 -- 'composite' (the only user-definable type kind today)
+)
+
+jed_type_fields(
+  type_name  text NOT NULL,           -- the owning type's name as created
+  name       text NOT NULL,           -- the field name
+  ordinal    i32  NOT NULL,           -- 1-based, CREATE TYPE order
+  type       text NOT NULL,           -- the canonical type text (§5 — the jed_columns.type rendering)
+  not_null   boolean NOT NULL         -- the field was declared NOT NULL
+)
+```
+
+**`jed_sequences` column names follow PostgreSQL's `pg_sequences` view** (`start_value`,
+`min_value`, `max_value`, `increment_by`, `cycle`, `cache_size`, `last_value`) — the spelling a PG
+user already knows — except `name` (for `sequencename`), keeping the family's `name` convention.
+Three deliberate differences from `pg_sequences`, each recorded per CLAUDE.md §1:
+
+- **`last_value` follows PG's rule — NULL until the sequence has been read** (`is_called` false: a
+  fresh sequence, after `setval(s, n, false)`, after `ALTER SEQUENCE … RESTART`). Because jed's
+  `CACHE` behaves as 1, a non-NULL `last_value` is exactly the last value handed out (PG's may run
+  ahead by the cache). The counter is a snapshot field (sequences.md §5), so the value is the
+  reading transaction's: its own uncommitted `nextval` is visible, a rolled-back one is gone.
+- **No `data_type` column.** The `AS smallint | integer | bigint` type is not persisted — it is
+  reducible to the bounds (sequences.md §14) — so there is nothing to render; a consumer reads the
+  bounds.
+- **No `sequenceowner`; `owned_by_table` / `owned_by_column` instead.** PG's `sequenceowner` is a
+  *role*, and jed has no roles (CLAUDE.md §3). The jed fact worth exposing is the **`OWNED BY`
+  link** a `serial`/`bigserial`/`smallserial` or `IDENTITY` column creates (sequences.md §12/§13),
+  which drives `DROP TABLE` auto-drop and the `DROP SEQUENCE` `2BP01`. The table renders by its
+  canonical name, the column by its current name (the link stores an ordinal, so a column rename is
+  reflected). A standalone `CREATE SEQUENCE` — including one a column references only through
+  `DEFAULT nextval('s')` — has no link and shows NULL in both.
+
+Owned temp sequences (temp-tables.md §8) live in the session temp domain, so
+`temp.jed_sequences` lists them and unqualified `jed_sequences` (= `main`) does not.
+
+**`jed_types` lists user-defined types only.** Built-in types are the spec (`spec/types/`), not
+catalog facts, and arrays/ranges are structural (no catalog object — array.md §3, ranges.md §3), so
+none is a row — the §5 user-objects-only rule. Today every row has `kind = 'composite'`; the column
+holds the door open for a future user-definable kind (an enum, a domain) to arrive as a new value,
+not a new relation. `CREATE TYPE` is persistent DDL, so `temp.jed_types` resolves but is always
+empty.
+
+**Fields are their own relation, mirroring `jed_tables` / `jed_columns`.** A composite field has
+the same shape as a table column (name, ordinal, typmod-bearing type, NOT NULL), so
+`jed_type_fields` reuses `jed_columns`' column set and canonical type text, and joins to
+`jed_types` on `type_name = name` (and to `jed_columns.type` to find a type's uses). The rejected
+alternative — field lists as parallel `text[]` / `boolean[]` columns on the `jed_types` row — is
+positional, cannot be filtered per field, and cannot carry a future per-field column without
+another parallel array.
+
+**Generation order** (deterministic; the multiset is the contract). `jed_sequences`: ascending
+lowercased name. `jed_types`: ascending lowercased name. `jed_type_fields`: types in ascending
+lowercased name, then ordinal.
 
 ## 6. The host API carries no introspection convenience
 
@@ -383,11 +464,6 @@ state created by host-API acts (attached-databases.md §2), not database state �
 `jed_databases` relation; the host already holds what it attached. This also keeps every catalog
 relation a pure function of one database's snapshot.
 
-**Attachment listing is host-API-only, by design.** Which databases are attached is *handle*
-state created by host-API acts (attached-databases.md §2), not database state — so there is no
-`jed_databases` relation; the host already holds what it attached. This also keeps every catalog
-relation a pure function of one database's snapshot.
-
 ## 7. Error codes
 
 | Code | Name | Raised |
@@ -404,7 +480,7 @@ The later relations' own errors (if any new arise) are pinned by their implement
 |---|---|---|
 | **I0** | this doc; `42939` in the error registry; the `jed_` reservation in all three cores; `suites/ddl/reserved_names.test` | ✅ landed |
 | **I1** | `jed_tables` + `jed_columns`: resolution funnel interception (CTE-shadow / built-in-first / qualifier scoping), computed-relation execution riding the SRF plan shape, privilege gating, the 42809 read-only rejections, `generated_row` cost pinning (cost.md), `EXPLAIN` `Catalog Scan`, capabilities `introspect.tables`/`introspect.columns`, the canonical-type-text corpus (`suites/introspection/`, 4 files incl. temp + attachment scoping), `/web` docs | ✅ landed |
-| **I2** | `jed_indexes` + `jed_constraints` (§5.1): two more built-in-name-classifier entries + two row generators (every gate inherited from I1), the `text[]` member-list columns, the CHECK `expression` from the persisted canonical text, capabilities `introspect.indexes`/`introspect.constraints`, corpus (`suites/introspection/jed_indexes.test` + `jed_constraints.test`), cost.md worked examples, `/web` docs | ✅ **this change** |
+| **I2** | `jed_indexes` + `jed_constraints` (§5.1): two more built-in-name-classifier entries + two row generators (every gate inherited from I1), the `text[]` member-list columns, the CHECK `expression` from the persisted canonical text, capabilities `introspect.indexes`/`introspect.constraints`, corpus (`suites/introspection/jed_indexes.test` + `jed_constraints.test`), cost.md worked examples, `/web` docs | ✅ landed |
 | **P9** | `jed_statistics` (§5.2): one summary row per analyzed column, qualified-domain scoping, stale/NDV/width/count visibility, capability `introspect.statistics`, corpus + `/web` docs | ✅ landed with column statistics |
-| I3 | `jed_sequences`, `jed_types` | not started |
+| **I3** | `jed_sequences` + `jed_types` + `jed_type_fields` (§5.3): three classifier entries + three row generators (every gate inherited from I1), PG `pg_sequences`-spelled sequence columns with the `OWNED BY` link, composite types with their fields as a separate relation, capabilities `introspect.sequences`/`introspect.types`/`introspect.type_fields`, corpus (`suites/introspection/jed_sequences.test` + `jed_sequences_txn.test` + `jed_types.test`, temp + attachment scoping), cost.md worked examples, `/web` docs | ✅ landed |
 | — | `information_schema` compat views over the `jed_` relations | door open, **not planned** |

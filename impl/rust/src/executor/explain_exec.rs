@@ -68,14 +68,7 @@ pub(crate) fn select_actual_root_node(sp: &SelectPlan) -> String {
 
 pub(crate) fn select_actual_rel_node(rel: &PlanRel) -> String {
     if let Some(srf) = &rel.srf {
-        if matches!(
-            srf.kind,
-            SrfKind::JedTables
-                | SrfKind::JedColumns
-                | SrfKind::JedIndexes
-                | SrfKind::JedConstraints
-                | SrfKind::JedStatistics
-        ) {
+        if srf.kind.is_catalog() {
             return format!("Catalog Scan {}", rel.table_name);
         }
         return format!("SRF {}", rel.table_name);
@@ -934,14 +927,7 @@ impl Engine {
         if let Some(srf) = &rel.srf {
             // A catalog relation (introspection.md §5) is computed, not scanned — its own node name
             // (it is a relation, not a function) plus the database scope it reads.
-            if matches!(
-                srf.kind,
-                SrfKind::JedTables
-                    | SrfKind::JedColumns
-                    | SrfKind::JedIndexes
-                    | SrfKind::JedConstraints
-                    | SrfKind::JedStatistics
-            ) {
+            if srf.kind.is_catalog() {
                 r.emit(
                     depth,
                     format!("Catalog Scan {}", rel.table_name),

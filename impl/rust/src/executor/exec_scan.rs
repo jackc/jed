@@ -1999,6 +1999,9 @@ impl Engine {
                 SrfKind::JedIndexes => self.jed_indexes_rows(srf, meter),
                 SrfKind::JedConstraints => self.jed_constraints_rows(srf, meter),
                 SrfKind::JedStatistics => self.jed_statistics_rows(srf, meter),
+                SrfKind::JedSequences => self.jed_sequences_rows(srf, meter),
+                SrfKind::JedTypes => self.jed_types_rows(srf, meter),
+                SrfKind::JedTypeFields => self.jed_type_fields_rows(srf, meter),
             }?;
             for row in &rows {
                 meter.admit_row_masked(row, mask)?;

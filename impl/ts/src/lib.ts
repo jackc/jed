@@ -817,6 +817,12 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // constraint — name, table_name, type, columns (text[]), expression, ref_table, ref_columns
   // (text[]) (introspection.md §5.1).
   "introspect.constraints",
+  // The jed_sequences / jed_types / jed_type_fields catalog relations (I3, introspection.md §5.3):
+  // one row per sequence (pg_sequences columns + the OWNED BY link), per user-defined type, and per
+  // composite field.
+  "introspect.sequences",
+  "introspect.types",
+  "introspect.type_fields",
   // Stable lock-bundle protocol for safe shared multi-process main files and file attachments.
   "file.shared_process",
 ];

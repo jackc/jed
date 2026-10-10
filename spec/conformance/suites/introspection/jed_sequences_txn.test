@@ -1,0 +1,56 @@
+# skip: disk — an explicit transaction spanning records does not survive the disk-mode per-record
+# reopen (spec/design/conformance.md §3.4).
+# jed_sequences.last_value inside a transaction (spec/design/introspection.md §5.3): the counter is
+# a snapshot field (sequences.md §5), so the catalog relation reads the transaction's working
+# snapshot — its own uncommitted nextval is visible, and ROLLBACK restores the committed value.
+# jed-specific, CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# requires: introspect.sequences, ddl.sequence, func.sequence, txn.explicit, query.select, query.where_eq, query.aggregates, types.i64, types.text
+
+statement ok
+CREATE SEQUENCE s
+
+query I nosort
+SELECT nextval('s')
+----
+1
+
+statement ok
+BEGIN
+
+query I nosort
+SELECT nextval('s')
+----
+2
+
+query I nosort
+SELECT last_value FROM jed_sequences WHERE name = 's'
+----
+2
+
+statement ok
+ROLLBACK
+
+query I nosort
+SELECT last_value FROM jed_sequences WHERE name = 's'
+----
+1
+
+# a fresh sequence created and read inside a rolled-back transaction leaves no row behind
+statement ok
+BEGIN
+
+statement ok
+CREATE SEQUENCE t
+
+query I nosort
+SELECT count(*) FROM jed_sequences
+----
+2
+
+statement ok
+ROLLBACK
+
+query T nosort
+SELECT name FROM jed_sequences
+----
+s

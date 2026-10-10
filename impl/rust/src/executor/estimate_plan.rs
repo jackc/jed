@@ -386,8 +386,26 @@ impl Engine {
         let Some(snap) = self.snap_for_scope(&srf.introspect_scope) else {
             return 0;
         };
-        if srf.kind == SrfKind::JedStatistics {
-            return snap.statistics_sorted().len().min(MAX_ESTIMATE as usize) as i64;
+        match srf.kind {
+            SrfKind::JedStatistics => {
+                return snap.statistics_sorted().len().min(MAX_ESTIMATE as usize) as i64;
+            }
+            SrfKind::JedSequences => {
+                return snap.sequences_sorted().len().min(MAX_ESTIMATE as usize) as i64;
+            }
+            SrfKind::JedTypes => {
+                return snap
+                    .composite_types_sorted()
+                    .len()
+                    .min(MAX_ESTIMATE as usize) as i64;
+            }
+            SrfKind::JedTypeFields => {
+                return snap
+                    .composite_types_sorted()
+                    .into_iter()
+                    .fold(0, |rows, ty| sat_add(rows, ty.fields.len() as i64));
+            }
+            _ => {}
         }
         snap.tables_sorted().into_iter().fold(0, |rows, table| {
             let count = match srf.kind {
@@ -478,11 +496,7 @@ impl Engine {
         if let Some(srf) = &rel.srf {
             let rows = match srf.kind {
                 SrfKind::GenerateSeries => Self::estimate_generate_series_rows(srf),
-                SrfKind::JedTables
-                | SrfKind::JedColumns
-                | SrfKind::JedIndexes
-                | SrfKind::JedConstraints
-                | SrfKind::JedStatistics => self.estimate_catalog_rows(srf),
+                kind if kind.is_catalog() => self.estimate_catalog_rows(srf),
                 _ => DEFAULT_SRF_ROWS,
             };
             let mut estimate = PlanEstimate::empty(rows);

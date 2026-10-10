@@ -3911,6 +3911,33 @@ pub(crate) enum SrfKind {
     JedConstraints,
     /// The P9 one-row-per-analyzed-column statistics summary relation.
     JedStatistics,
+    /// The `jed_sequences` catalog relation (introspection.md §5.3, slice I3) — one row per
+    /// sequence of the qualified database.
+    JedSequences,
+    /// The `jed_types` catalog relation (introspection.md §5.3, slice I3) — one row per
+    /// user-defined type of the qualified database.
+    JedTypes,
+    /// The `jed_type_fields` catalog relation (introspection.md §5.3, slice I3) — one row per field
+    /// of every user-defined type, in (type, ordinal) order.
+    JedTypeFields,
+}
+
+impl SrfKind {
+    /// Whether the kind is a built-in catalog relation (introspection.md §5) rather than a
+    /// set-returning function: EXPLAIN renders it as a `Catalog Scan` of its database scope.
+    pub(crate) fn is_catalog(&self) -> bool {
+        matches!(
+            self,
+            SrfKind::JedTables
+                | SrfKind::JedColumns
+                | SrfKind::JedIndexes
+                | SrfKind::JedConstraints
+                | SrfKind::JedStatistics
+                | SrfKind::JedSequences
+                | SrfKind::JedTypes
+                | SrfKind::JedTypeFields
+        )
+    }
 }
 
 /// A resolved `JSON_TABLE` plan (T1, json-table.md §3) — the compiled root path + the column tree.
@@ -3973,8 +4000,8 @@ pub(crate) struct SrfPlan {
     introspect_scope: String,
 }
 
-/// Classify a relation name as a built-in catalog relation (introspection.md §5): `jed_tables` /
-/// `jed_columns`, case-insensitively (identifier resolution folds case; grammar.md §3 leaves no
+/// Classify a relation name as a built-in catalog relation (introspection.md §5): the `jed_`-prefixed
+/// relation family, case-insensitively (identifier resolution folds case; grammar.md §3 leaves no
 /// quoted escape). Built-in names resolve in every database's relation namespace, checked AFTER a
 /// statement-local CTE (a CTE shadows a catalog relation — PG-matching, oracle-checked) and BEFORE
 /// the user catalog (post-I0 the two can never collide; for a pre-reservation legacy file the
@@ -3986,11 +4013,14 @@ fn catalog_rel_kind(name: &str) -> Option<SrfKind> {
         "jed_indexes" => Some(SrfKind::JedIndexes),
         "jed_constraints" => Some(SrfKind::JedConstraints),
         "jed_statistics" => Some(SrfKind::JedStatistics),
+        "jed_sequences" => Some(SrfKind::JedSequences),
+        "jed_types" => Some(SrfKind::JedTypes),
+        "jed_type_fields" => Some(SrfKind::JedTypeFields),
         _ => None,
     }
 }
 
-/// Whether `name` is a built-in catalog relation (`jed_tables` / `jed_columns`). The write paths
+/// Whether `name` is a built-in catalog relation (introspection.md §5). The write paths
 /// use it to reject a catalog relation as a mutation/DDL target (`42809` — a catalog relation is
 /// read-only, introspection.md §5); the privilege gate uses it so a built-in is SELECT-gated
 /// exactly like a user table under an explicit-grant session envelope.
@@ -4114,6 +4144,41 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
                 col("average_width", ScalarType::Int64, false),
                 col("mcv_count", ScalarType::Int32, true),
                 col("histogram_count", ScalarType::Int32, true),
+            ],
+        ),
+        SrfKind::JedSequences => table(
+            "jed_sequences",
+            vec![
+                col("name", ScalarType::Text, true),
+                col("start_value", ScalarType::Int64, true),
+                col("min_value", ScalarType::Int64, true),
+                col("max_value", ScalarType::Int64, true),
+                col("increment_by", ScalarType::Int64, true),
+                col("cycle", ScalarType::Bool, true),
+                col("cache_size", ScalarType::Int64, true),
+                // NULL until the sequence has been read (PG's pg_sequences rule —
+                // introspection.md §5.3).
+                col("last_value", ScalarType::Int64, false),
+                // The OWNED BY link of a serial / IDENTITY column; NULL for a standalone sequence.
+                col("owned_by_table", ScalarType::Text, false),
+                col("owned_by_column", ScalarType::Text, false),
+            ],
+        ),
+        SrfKind::JedTypes => table(
+            "jed_types",
+            vec![
+                col("name", ScalarType::Text, true),
+                col("kind", ScalarType::Text, true),
+            ],
+        ),
+        SrfKind::JedTypeFields => table(
+            "jed_type_fields",
+            vec![
+                col("type_name", ScalarType::Text, true),
+                col("name", ScalarType::Text, true),
+                col("ordinal", ScalarType::Int32, true),
+                col("type", ScalarType::Text, true),
+                col("not_null", ScalarType::Bool, true),
             ],
         ),
         _ => unreachable!("only catalog-relation kinds reach catalog_rel_table"),

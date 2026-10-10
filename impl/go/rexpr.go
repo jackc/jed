@@ -1403,7 +1403,27 @@ const (
 	srfJedConstraints
 	// srfJedStatistics is the P9 one-row-per-analyzed-column summary relation.
 	srfJedStatistics
+	// srfJedSequences is the jed_sequences catalog relation (introspection.md §5.3, slice I3) — one
+	// row per sequence of the qualified database.
+	srfJedSequences
+	// srfJedTypes is the jed_types catalog relation (introspection.md §5.3, slice I3) — one row per
+	// user-defined type of the qualified database.
+	srfJedTypes
+	// srfJedTypeFields is the jed_type_fields catalog relation (introspection.md §5.3, slice I3) —
+	// one row per field of every user-defined type, in (type, ordinal) order.
+	srfJedTypeFields
 )
+
+// isCatalog reports whether the kind is a built-in catalog relation (introspection.md §5) rather
+// than a set-returning function: EXPLAIN renders it as a Catalog Scan of its database scope.
+func (k srfKind) isCatalog() bool {
+	switch k {
+	case srfJedTables, srfJedColumns, srfJedIndexes, srfJedConstraints, srfJedStatistics,
+		srfJedSequences, srfJedTypes, srfJedTypeFields:
+		return true
+	}
+	return false
+}
 
 // srfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,
 // array-functions.md §9). kind selects the generator: generate_series(start, stop[, step]) (args =

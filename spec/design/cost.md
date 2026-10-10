@@ -1192,8 +1192,9 @@ but charges no `row_produced`. Worked examples (all asserted in the corpus):
   (`page_read` + 3 `storage_row_read`) **+ 3 `generated_row`** (the series is materialized once,
   like any join operand) + 9 `row_produced` for the product.
 
-**The catalog relations ride the same unit** ([introspection.md](introspection.md) §5, slices I1 +
-I2): `jed_tables` / `jed_columns` / `jed_indexes` / `jed_constraints` are computed relations — rows
+**The catalog relations ride the same unit** ([introspection.md](introspection.md) §5, slices I1 –
+I3): `jed_tables` / `jed_columns` / `jed_indexes` / `jed_constraints` / `jed_sequences` /
+`jed_types` / `jed_type_fields` are computed relations — rows
 derived at execution from the qualified database's pinned catalog snapshot, which is **resident by
 construction** ([pager.md](pager.md)'s catalog residency) — so a catalog scan charges one
 `generated_row` per produced row (guarded, at the source) and **zero** `page_read` /
@@ -1206,7 +1207,9 @@ per `WHERE` evaluation, `aggregate_accumulate` per folded row. Worked examples (
 `row_produced` = **4**; `SELECT count(*) FROM jed_columns` over 37 columns — 37 `generated_row` +
 37 `aggregate_accumulate` + 1 `row_produced` = **75**; `SELECT name FROM jed_indexes` over 4
 indexes — 4 `generated_row` + 4 `row_produced` = **8** (the same for a 4-constraint
-`jed_constraints` scan).
+`jed_constraints` scan); `SELECT name FROM jed_sequences` over 3 sequences — **6**;
+`SELECT count(*) FROM jed_type_fields` over 4 fields — 4 `generated_row` + 4 `aggregate_accumulate`
++ 1 `row_produced` = **9**.
 
 `jed_statistics` uses the same model: one `generated_row` for each collected column summary and no
 page/storage-row units. Its values come from the pinned resident snapshot facts, never a collection

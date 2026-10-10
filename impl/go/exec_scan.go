@@ -2009,6 +2009,12 @@ func (db *engine) materializeRelRows(plan *selectPlan, ri int, params []Value, o
 			rows, err = db.jedConstraintsRows(rel.srf, meter)
 		case srfJedStatistics:
 			rows, err = db.jedStatisticsRows(rel.srf, meter)
+		case srfJedSequences:
+			rows, err = db.jedSequencesRows(rel.srf, meter)
+		case srfJedTypes:
+			rows, err = db.jedTypesRows(rel.srf, meter)
+		case srfJedTypeFields:
+			rows, err = db.jedTypeFieldsRows(rel.srf, meter)
 		}
 		if err != nil {
 			return nil, err

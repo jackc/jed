@@ -1,0 +1,303 @@
+# The jed_sequences catalog relation (spec/design/introspection.md §5.3, slice I3): a read-only
+# COMPUTED relation — one row per SEQUENCE of the qualified database: name / start_value /
+# min_value / max_value / increment_by / cycle / cache_size (PostgreSQL pg_sequences spelling) /
+# last_value (NULL until the sequence has been read — PG's rule) / owned_by_table + owned_by_column
+# (the OWNED BY link a serial or IDENTITY column creates; NULL for a standalone sequence).
+# Resolution / qualifier scoping / read-only rejection / privileges / cost are the same model as
+# jed_tables (pinned there). jed-specific, so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# requires: introspect.sequences, introspect.tables, ddl.sequence, ddl.sequence_as_type, ddl.alter_sequence, ddl.serial, ddl.identity, ddl.alter_table, func.sequence, ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.cte, query.join_inner, query.qualified_table, query.explain, query.aggregates, session.privileges, resource.cost_metering, types.i32, types.i64, types.text
+
+# --- an empty database lists no sequences ---------------------------------------------------------
+
+query T rowsort
+SELECT name FROM jed_sequences
+----
+
+# --- a default ascending sequence: PG's defaults, last_value NULL until read ----------------------
+
+statement ok
+CREATE SEQUENCE s
+
+query TIIIIBIITT nosort
+SELECT name, start_value, min_value, max_value, increment_by, cycle, cache_size, last_value, owned_by_table, owned_by_column FROM jed_sequences
+----
+s
+1
+1
+9223372036854775807
+1
+false
+1
+NULL
+NULL
+NULL
+
+# --- a descending sequence takes the negative-increment defaults ---------------------------------
+
+statement ok
+CREATE SEQUENCE down INCREMENT BY -2
+
+query IIII nosort
+SELECT start_value, min_value, max_value, increment_by FROM jed_sequences WHERE name = 'down'
+----
+-1
+-9223372036854775808
+-1
+-2
+
+# --- every option renders as declared; AS sets the bounds (the type itself is not persisted) ------
+
+statement ok
+CREATE SEQUENCE Opts AS smallint START WITH 5 MINVALUE 3 CACHE 10 CYCLE
+
+query TIIIIBI nosort
+SELECT name, start_value, min_value, max_value, increment_by, cycle, cache_size FROM jed_sequences WHERE name = 'Opts'
+----
+Opts
+5
+3
+32767
+1
+true
+10
+
+# --- last_value tracks the counter: the last value handed out once read -------------------------
+
+query I nosort
+SELECT nextval('s')
+----
+1
+
+query I nosort
+SELECT nextval('s')
+----
+2
+
+query I nosort
+SELECT last_value FROM jed_sequences WHERE name = 's'
+----
+2
+
+# setval(..., true) is a read: last_value is the set value
+query I nosort
+SELECT setval('s', 40)
+----
+40
+
+query I nosort
+SELECT last_value FROM jed_sequences WHERE name = 's'
+----
+40
+
+# setval(..., false) clears is_called: last_value is NULL again (PG's pg_sequences rule)
+query I nosort
+SELECT setval('s', 50, false)
+----
+50
+
+query I nosort
+SELECT last_value FROM jed_sequences WHERE name = 's'
+----
+NULL
+
+query I nosort
+SELECT nextval('s')
+----
+50
+
+query I nosort
+SELECT last_value FROM jed_sequences WHERE name = 's'
+----
+50
+
+# ALTER SEQUENCE ... RESTART clears is_called too
+statement ok
+ALTER SEQUENCE s RESTART WITH 7
+
+query II nosort
+SELECT start_value, last_value FROM jed_sequences WHERE name = 's'
+----
+1
+NULL
+
+# --- the OWNED BY link: serial and IDENTITY columns own their sequence ---------------------------
+
+statement ok
+CREATE TABLE Orders (id serial PRIMARY KEY, n i32)
+
+statement ok
+CREATE TABLE items (sku i64 GENERATED ALWAYS AS IDENTITY PRIMARY KEY, label text)
+
+# a plain DEFAULT nextval('s') creates no link (PG — sequences.md §10)
+statement ok
+CREATE TABLE notes (id i64 DEFAULT nextval('down') PRIMARY KEY)
+
+query TTT nosort
+SELECT name, owned_by_table, owned_by_column FROM jed_sequences ORDER BY name
+----
+Opts
+NULL
+NULL
+down
+NULL
+NULL
+items_sku_seq
+items
+sku
+orders_id_seq
+Orders
+id
+s
+NULL
+NULL
+
+# the owning serial i32 column's sequence carries the i32 bounds
+query II nosort
+SELECT min_value, max_value FROM jed_sequences WHERE name = 'orders_id_seq'
+----
+1
+2147483647
+
+# --- renames are reflected: the column by its current name, the table by its canonical name -------
+
+statement ok
+ALTER TABLE items RENAME COLUMN sku TO item_id
+
+statement ok
+ALTER TABLE items RENAME TO products
+
+query TTT nosort
+SELECT name, owned_by_table, owned_by_column FROM jed_sequences WHERE owned_by_table IS NOT NULL ORDER BY name
+----
+items_sku_seq
+products
+item_id
+orders_id_seq
+Orders
+id
+
+statement ok
+ALTER SEQUENCE orders_id_seq RENAME TO order_ids
+
+query TT nosort
+SELECT name, owned_by_table FROM jed_sequences WHERE owned_by_table = 'Orders'
+----
+order_ids
+Orders
+
+# --- composes with the other catalog relations: an owned sequence's column type ------------------
+
+query TTT nosort
+SELECT s.name, c.name, c.type FROM jed_sequences s JOIN jed_columns c ON c.table_name = s.owned_by_table AND c.name = s.owned_by_column ORDER BY s.name
+----
+items_sku_seq
+item_id
+i64
+order_ids
+id
+i32
+
+# --- DROP is reflected: DROP SEQUENCE removes the row, DROP TABLE auto-drops its owned sequence --
+
+statement ok
+DROP SEQUENCE Opts
+
+statement ok
+DROP TABLE products
+
+query T nosort
+SELECT name FROM jed_sequences ORDER BY name
+----
+down
+order_ids
+s
+
+# --- resolution: case-insensitive, alias renames the relation, qualifier scoping -----------------
+
+query T nosort
+SELECT name FROM JED_Sequences ORDER BY name
+----
+down
+order_ids
+s
+
+query T nosort
+SELECT js.name FROM jed_sequences AS js WHERE js.increment_by < 0
+----
+down
+
+query T nosort
+SELECT name FROM main.jed_sequences ORDER BY name
+----
+down
+order_ids
+s
+
+statement error 42P01
+SELECT name FROM nope.jed_sequences
+
+# a statement-local CTE SHADOWS the catalog relation (PG-matching resolution order)
+query I nosort
+WITH jed_sequences AS (SELECT 1 AS x) SELECT x FROM jed_sequences
+----
+1
+
+# --- read-only: every mutation / DDL target naming the relation is 42809 ------------------------
+
+statement error 42809
+INSERT INTO jed_sequences (name) VALUES ('x')
+
+statement error 42809
+UPDATE jed_sequences SET cycle = true
+
+statement error 42809
+DELETE FROM jed_sequences
+
+statement error 42809
+DROP TABLE jed_sequences
+
+# IF EXISTS does not suppress a kind rejection (the relation exists)
+statement error 42809
+DROP TABLE IF EXISTS jed_sequences
+
+statement error 42809
+CREATE INDEX i ON jed_sequences (name)
+
+# CREATE of any jed_-prefixed name stays the I0 reservation (42939), not 42809
+statement error 42939
+CREATE SEQUENCE jed_sequences
+
+# --- cost: one generated_row per produced row, zero page_read / storage_row_read ----------------
+
+# 3 sequences: 3 generated_row + 3 row_produced = 6. No page is read — the catalog is resident.
+# cost: 6
+query T rowsort
+SELECT name FROM jed_sequences
+----
+down
+order_ids
+s
+
+# --- EXPLAIN: a Catalog Scan leaf carrying its database scope ------------------------------------
+
+query ITTII nosort
+EXPLAIN SELECT name FROM jed_sequences
+----
+0
+Catalog Scan jed_sequences
+db=main
+3
+6
+
+# --- privileges: gated exactly like a user table (per-table SELECT under the envelope) -----------
+
+# default_privileges: NONE
+statement error 42501
+SELECT name FROM jed_sequences
+
+# default_privileges: NONE
+# grant: SELECT ON jed_sequences
+query I nosort
+SELECT count(*) FROM jed_sequences
+----
+3

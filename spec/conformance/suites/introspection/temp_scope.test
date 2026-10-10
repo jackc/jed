@@ -5,7 +5,7 @@
 # catalog snapshot — the qualifier picks the database, exactly as for a user table. Unqualified
 # stays main (never temp-first: the built-in exists in every database, so the implicit scope is
 # pinned to main rather than walking). jed-specific, CROSS-CORE-checked, NOT oracle-checked.
-# requires: introspect.tables, introspect.columns, ddl.create_table, ddl.primary_key, ddl.temp_table, ddl.drop_table, dml.insert, query.select, query.where_eq, query.order_by, query.qualified_table, query.aggregates, session.allow_temp_ddl, types.i32, types.text
+# requires: introspect.tables, introspect.columns, introspect.sequences, introspect.types, introspect.type_fields, ddl.serial, types.composite, ddl.create_table, ddl.primary_key, ddl.temp_table, ddl.drop_table, dml.insert, query.select, query.where_eq, query.order_by, query.qualified_table, query.aggregates, session.allow_temp_ddl, types.i32, types.text
 
 # --- an empty temp domain lists nothing -----------------------------------------------------------
 
@@ -76,3 +76,41 @@ DELETE FROM temp.jed_tables
 
 statement error 42809
 INSERT INTO temp.jed_columns VALUES ('t', 'c', 1, 'i32', false, NULL)
+
+# --- temp sequences and types (introspection.md §5.3) --------------------------------------------
+
+# a temp serial column's owned sequence lives in the temp domain (temp-tables.md §8)
+statement ok
+CREATE TEMP TABLE counted (id serial, v text)
+
+query TTT nosort
+SELECT name, owned_by_table, owned_by_column FROM temp.jed_sequences
+----
+counted_id_seq
+counted
+id
+
+# unqualified = main, which has no sequence
+query I nosort
+SELECT count(*) FROM jed_sequences
+----
+0
+
+# CREATE TYPE is persistent DDL, so the temp domain never holds a type: temp.jed_types resolves,
+# and is empty
+statement ok
+CREATE TYPE pair AS (a i32, b i32)
+
+query T nosort
+SELECT name FROM temp.jed_types
+----
+
+query I nosort
+SELECT count(*) FROM temp.jed_type_fields
+----
+0
+
+query T nosort
+SELECT name FROM jed_types
+----
+pair

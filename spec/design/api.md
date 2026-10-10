@@ -694,7 +694,8 @@ only and the engine has no wire protocol).
 
 **Catalog reads — introspection is SQL, not the host API.** The introspection surface is the
 `jed_` catalog relations reached through ordinary SQL (`SELECT * FROM jed_tables` / `jed_columns` /
-`jed_indexes` / `jed_constraints` — [introspection.md](introspection.md)); a host discovers schema by
+`jed_indexes` / `jed_constraints` / `jed_sequences` / `jed_types` / `jed_type_fields` —
+[introspection.md](introspection.md)); a host discovers schema by
 querying them, and there is deliberately **no host-API introspection convenience**. The old
 `table_names()` catalog read is **removed** in favor of `SELECT name FROM jed_tables`. What remains is
 `table` (the last row), a **`#[doc(hidden)]` `tooling` accessor, not the embedding API**: the in-repo

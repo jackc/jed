@@ -783,9 +783,7 @@ func selectActualRootNode(sp *selectPlan) string {
 
 func selectActualRelNode(rel planRel) string {
 	if rel.srf != nil {
-		if rel.srf.kind == srfJedTables || rel.srf.kind == srfJedColumns ||
-			rel.srf.kind == srfJedIndexes || rel.srf.kind == srfJedConstraints ||
-			rel.srf.kind == srfJedStatistics {
+		if rel.srf.kind.isCatalog() {
 			return "Catalog Scan " + rel.tableName
 		}
 		return "SRF " + rel.tableName
@@ -900,9 +898,7 @@ func (db *engine) renderNWayJoinTree(r *explainRender, sp *selectPlan, n, depth 
 func (db *engine) renderRelLeaf(r *explainRender, sp *selectPlan, i, depth int, note string) error {
 	rel := sp.rels[i]
 	switch {
-	case rel.srf != nil && (rel.srf.kind == srfJedTables || rel.srf.kind == srfJedColumns ||
-		rel.srf.kind == srfJedIndexes || rel.srf.kind == srfJedConstraints ||
-		rel.srf.kind == srfJedStatistics):
+	case rel.srf != nil && rel.srf.kind.isCatalog():
 		// A catalog relation (introspection.md §5) is computed, not scanned — its own node name
 		// (it is a relation, not a function) plus the database scope it reads.
 		r.emit(depth, "Catalog Scan "+rel.tableName, withNote(pushedFilterDetail(sp, i, "db="+rel.srf.introspectScope, r.verbose), note))

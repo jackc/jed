@@ -3504,6 +3504,13 @@ export class Engine {
       for (const columns of snap.statistics.values()) count += BigInt(columns.size);
       return count > MAX_ESTIMATE ? MAX_ESTIMATE : count;
     }
+    if (srf.kind === "jed_sequences") return saturatingEstimateAdd(0n, BigInt(snap.sequences.size));
+    if (srf.kind === "jed_types") return saturatingEstimateAdd(0n, BigInt(snap.types.size));
+    if (srf.kind === "jed_type_fields") {
+      let fields = 0n;
+      for (const ty of snap.types.values()) fields = saturatingEstimateAdd(fields, BigInt(ty.fields.length));
+      return fields;
+    }
     let rows = 0n;
     for (const table of snap.tablesSorted()) {
       switch (srf.kind) {
@@ -4919,13 +4926,7 @@ export class Engine {
     if (rel.srf !== undefined) {
       // A catalog relation (introspection.md §5) is computed, not scanned — its own node name (it
       // is a relation, not a function) plus the database scope it reads.
-      if (
-        rel.srf.kind === "jed_tables" ||
-        rel.srf.kind === "jed_columns" ||
-        rel.srf.kind === "jed_indexes" ||
-        rel.srf.kind === "jed_constraints" ||
-        rel.srf.kind === "jed_statistics"
-      ) {
+      if (isCatalogSrfKind(rel.srf.kind)) {
         r.emit(
           depth,
           "Catalog Scan " + rel.tableName,
@@ -14244,6 +14245,93 @@ export class Engine {
     return out;
   }
 
+  // jedSequencesRows generates the rows of the jed_sequences catalog relation (introspection.md
+  // §5.3): one row per sequence of the scope's snapshot, in ascending lowercased-name order. The
+  // definition fields render as stored; last_value is NULL until the sequence has been read
+  // (!isCalled — PG's pg_sequences rule); owned_by_table / owned_by_column render the OWNED BY link
+  // of a serial / IDENTITY column (the owning table's canonical name, the column's current name),
+  // NULL for a standalone sequence. Cost mirrors jedTablesRows.
+  private jedSequencesRows(srf: SrfPlan, meter: Meter): Row[] {
+    const snap = this.snapForScope(srf.introspectScope!);
+    if (snap === undefined) {
+      throw engineError("undefined_table", `database "${srf.introspectScope}" is not attached`);
+    }
+    const out: Row[] = [];
+    for (const seq of snap.sequencesSorted()) {
+      meter.guard();
+      meter.charge(COSTS.generatedRow);
+      let ownerTable = nullValue();
+      let ownerColumn = nullValue();
+      if (seq.ownedBy !== undefined) {
+        // The owner always exists: DROP TABLE auto-drops its owned sequences (sequences.md §12).
+        ownerTable = textValue(seq.ownedBy.table);
+        const t = snap.table(seq.ownedBy.table);
+        if (t !== undefined) {
+          ownerTable = textValue(t.name);
+          const c = t.columns[seq.ownedBy.column];
+          if (c !== undefined) ownerColumn = textValue(c.name);
+        }
+      }
+      out.push([
+        textValue(seq.name),
+        intValue(seq.start),
+        intValue(seq.minValue),
+        intValue(seq.maxValue),
+        intValue(seq.increment),
+        boolValue(seq.cycle),
+        intValue(seq.cache),
+        seq.isCalled ? intValue(seq.lastValue) : nullValue(),
+        ownerTable,
+        ownerColumn,
+      ]);
+    }
+    return out;
+  }
+
+  // jedTypesRows generates the rows of the jed_types catalog relation (introspection.md §5.3): one
+  // row per user-defined type of the scope's snapshot, in ascending lowercased-name order. Every
+  // user type is a composite today. Cost mirrors jedTablesRows.
+  private jedTypesRows(srf: SrfPlan, meter: Meter): Row[] {
+    const snap = this.snapForScope(srf.introspectScope!);
+    if (snap === undefined) {
+      throw engineError("undefined_table", `database "${srf.introspectScope}" is not attached`);
+    }
+    const out: Row[] = [];
+    for (const ty of snap.compositeTypesSorted()) {
+      meter.guard();
+      meter.charge(COSTS.generatedRow);
+      out.push([textValue(ty.name), textValue("composite")]);
+    }
+    return out;
+  }
+
+  // jedTypeFieldsRows generates the rows of the jed_type_fields catalog relation (introspection.md
+  // §5.3): one row per field of every user-defined type of the scope's snapshot, in (lowercased type
+  // name, ordinal) order — jed_columns' shape, with the same canonical type text. Cost mirrors
+  // jedTablesRows.
+  private jedTypeFieldsRows(srf: SrfPlan, meter: Meter): Row[] {
+    const snap = this.snapForScope(srf.introspectScope!);
+    if (snap === undefined) {
+      throw engineError("undefined_table", `database "${srf.introspectScope}" is not attached`);
+    }
+    const out: Row[] = [];
+    for (const ty of snap.compositeTypesSorted()) {
+      for (let i = 0; i < ty.fields.length; i++) {
+        const f = ty.fields[i]!;
+        meter.guard();
+        meter.charge(COSTS.generatedRow);
+        out.push([
+          textValue(ty.name),
+          textValue(f.name),
+          intValue(BigInt(i + 1)),
+          textValue(catalogTypeText(f.type, f.decimal, f.varcharLen)),
+          boolValue(f.notNull),
+        ]);
+      }
+    }
+    return out;
+  }
+
   private jedStatisticsRows(srf: SrfPlan, meter: Meter): Row[] {
     const snap = this.snapForScope(srf.introspectScope!);
     if (snap === undefined) {
@@ -15949,6 +16037,15 @@ export class Engine {
           break;
         case "jed_statistics":
           srfRows = this.jedStatisticsRows(rel.srf, meter);
+          break;
+        case "jed_sequences":
+          srfRows = this.jedSequencesRows(rel.srf, meter);
+          break;
+        case "jed_types":
+          srfRows = this.jedTypesRows(rel.srf, meter);
+          break;
+        case "jed_type_fields":
+          srfRows = this.jedTypeFieldsRows(rel.srf, meter);
           break;
       }
       for (const row of srfRows) meter.admitRowMasked(row, mask);
@@ -25164,7 +25261,12 @@ export type SrfKind =
   // The jed_constraints catalog relation (introspection.md §5.1, slice I2) — one row per CHECK /
   // UNIQUE / FK / EXCLUDE constraint of every user table.
   | "jed_constraints"
-  | "jed_statistics";
+  | "jed_statistics"
+  // The jed_sequences / jed_types / jed_type_fields catalog relations (introspection.md §5.3,
+  // slice I3) — one row per sequence, per user-defined type, and per composite field.
+  | "jed_sequences"
+  | "jed_types"
+  | "jed_type_fields";
 
 // SrfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,
 // array-functions.md §9). kind selects the generator: generate_series(start, stop[, step]) (args =
@@ -25189,7 +25291,7 @@ export type SrfPlan = {
 };
 
 // catalogRelKind classifies a relation name as a built-in catalog relation (introspection.md §5):
-// jed_tables / jed_columns, case-insensitively (identifier resolution folds case; grammar.md §3
+// the jed_-prefixed relation family, case-insensitively (identifier resolution folds case; grammar.md §3
 // leaves no quoted escape). Built-in names resolve in every database's relation namespace, checked
 // AFTER a statement-local CTE (a CTE shadows a catalog relation — PG-matching, oracle-checked) and
 // BEFORE the user catalog (post-I0 the two can never collide; for a pre-reservation legacy file the
@@ -25199,7 +25301,10 @@ export type CatalogRelKind =
   | "jed_columns"
   | "jed_indexes"
   | "jed_constraints"
-  | "jed_statistics";
+  | "jed_statistics"
+  | "jed_sequences"
+  | "jed_types"
+  | "jed_type_fields";
 
 export function catalogRelKind(name: string): CatalogRelKind | undefined {
   const lname = name.toLowerCase();
@@ -25208,14 +25313,24 @@ export function catalogRelKind(name: string): CatalogRelKind | undefined {
     lname === "jed_columns" ||
     lname === "jed_indexes" ||
     lname === "jed_constraints" ||
-    lname === "jed_statistics"
+    lname === "jed_statistics" ||
+    lname === "jed_sequences" ||
+    lname === "jed_types" ||
+    lname === "jed_type_fields"
   ) {
     return lname;
   }
   return undefined;
 }
 
-// isCatalogRelName reports whether name is a built-in catalog relation (jed_tables / jed_columns).
+// isCatalogSrfKind reports whether an SRF kind is a built-in catalog relation (introspection.md
+// §5) rather than a set-returning function: EXPLAIN renders it as a Catalog Scan of its database
+// scope.
+export function isCatalogSrfKind(kind: SrfKind): boolean {
+  return catalogRelKind(kind) !== undefined;
+}
+
+// isCatalogRelName reports whether name is a built-in catalog relation (introspection.md §5).
 // The write paths use it to reject a catalog relation as a mutation/DDL target (42809 — a catalog
 // relation is read-only, introspection.md §5); the privilege gate uses it so a built-in is
 // SELECT-gated exactly like a user table under an explicit-grant session envelope.
@@ -25296,6 +25411,31 @@ export function catalogRelTable(kind: CatalogRelKind): Table {
         col("expression", "text", false),
         col("ref_table", "text", false),
         textArr("ref_columns", false),
+      ]);
+    case "jed_sequences":
+      return table("jed_sequences", [
+        col("name", "text", true),
+        col("start_value", "i64", true),
+        col("min_value", "i64", true),
+        col("max_value", "i64", true),
+        col("increment_by", "i64", true),
+        col("cycle", "boolean", true),
+        col("cache_size", "i64", true),
+        // NULL until the sequence has been read (PG's pg_sequences rule — introspection.md §5.3).
+        col("last_value", "i64", false),
+        // The OWNED BY link of a serial / IDENTITY column; NULL for a standalone sequence.
+        col("owned_by_table", "text", false),
+        col("owned_by_column", "text", false),
+      ]);
+    case "jed_types":
+      return table("jed_types", [col("name", "text", true), col("kind", "text", true)]);
+    case "jed_type_fields":
+      return table("jed_type_fields", [
+        col("type_name", "text", true),
+        col("name", "text", true),
+        col("ordinal", "i32", true),
+        col("type", "text", true),
+        col("not_null", "boolean", true),
       ]);
     default: // "jed_statistics"
       return table("jed_statistics", [
@@ -25979,14 +26119,7 @@ function selectActualRootNode(sp: SelectPlan): string {
 
 function selectActualRelNode(rel: PlanRel): string {
   if (rel.srf !== undefined) {
-    if (
-      rel.srf.kind === "jed_tables" ||
-      rel.srf.kind === "jed_columns" ||
-      rel.srf.kind === "jed_indexes" ||
-      rel.srf.kind === "jed_constraints" ||
-      rel.srf.kind === "jed_statistics"
-    )
-      return "Catalog Scan " + rel.tableName;
+    if (isCatalogSrfKind(rel.srf.kind)) return "Catalog Scan " + rel.tableName;
     return "SRF " + rel.tableName;
   }
   if (rel.cte !== undefined) return "CTE Scan " + rel.tableName;

@@ -282,16 +282,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     (`(sequence, name, checksum, applied_at)` — drift detection, out-of-order, truthful status); a
     `set-version` baseline (adopt an existing DB); an all-or-nothing whole-run transaction mode; an
     `OnStart` progress callback; a `renumber` collision helper.
-- [ ] **Schema introspection — I3: `jed_sequences` + `jed_types`** — I0 (the `jed_` name reservation,
-  `42939`), I1 (`jed_tables` + `jed_columns`), and I2 (`jed_indexes` + `jed_constraints`) are landed
-  (all 3 cores): read-only computed relations resolved in every database's relation namespace, derived
-  from the pinned catalog snapshot (no storage, no format bump), riding the SRF plan shape; per-table
-  `SELECT`-gated (`42501`), write/DDL targets `42809`, one `generated_row` per row; caps
-  `introspect.*`. SQL against the `jed_` relations is the whole surface (no host-API convenience);
-  `information_schema`/`pg_catalog` are recorded non-goals. Remaining: **I3** (`jed_sequences` +
-  `jed_types`); a `DEFAULT`-rendering column once a canonical expression-text form is pinned; the
-  EXCLUDE operator list as a `jed_constraints` column addition.
-  → [introspection.md](spec/design/introspection.md) _(size: M; deps: none)_
+- [x] **Schema introspection — the `jed_` catalog relations** — I0 (the `jed_` name reservation,
+  `42939`), I1 (`jed_tables` + `jed_columns`), I2 (`jed_indexes` + `jed_constraints`), and I3
+  (`jed_sequences` + `jed_types` + `jed_type_fields`) are landed (all 3 cores): read-only computed
+  relations resolved in every database's relation namespace, derived from the pinned catalog snapshot
+  (no storage, no format bump), riding the SRF plan shape; per-table `SELECT`-gated (`42501`),
+  write/DDL targets `42809`, one `generated_row` per row; caps `introspect.*`. SQL against the `jed_`
+  relations is the whole surface (no host-API convenience); `information_schema`/`pg_catalog` are
+  recorded non-goals. → [introspection.md](spec/design/introspection.md)
+  - [ ] _follow-on:_ a `DEFAULT`-rendering `jed_columns` column once a canonical expression-text form
+    is pinned; the EXCLUDE operator list as a `jed_constraints` column addition. _(size: S each)_
 - [x] **Structured error fields** ([error-fields.md](spec/design/error-fields.md)) — ✅ LANDED (all 3 cores). `EngineError` gained four optional identifier fields modeled on pgx's `pgconn.PgError` — `ConstraintName`/`TableName`/`ColumnName`/`DataTypeName` (Rust `Option<String>`, Go `string`, TS optional) — so a host identifies *which* constraint fired without regexing the (non-contractual) message. Populated via **typed constructor helpers** that own message *and* fields together (no drift): 23505/23514/23503/23P01 → constraint+table; 23502 → column (+ table stamped at the DML boundary via `stampTable`/`.map_err`); 22003 routes through the `overflow(ty)` helper + 22001 varchar → data type (+ column). `Display`/`Error()` unchanged; per-core `error_fields` tests (corpus can't assert structured fields). **Hard-excluded:** pgx's `File`/`Line`/`Routine` (core source location differs across cores → would break §8 byte-identity). No format bump, no cost/determinism change.
   - [ ] _follow-on:_ `Detail` (the offending values, `Key (id)=(1) already exists` — the leading phase-2 field; revisits the no-DETAIL-line house style + needs value formatting through the deterministic text path); `Position` (1-based query offset for 42601/42703 — needs the parsers to thread byte positions); `Hint`; a `DatabaseName` analog for pgx's `SchemaName` (jed qualifies by database, not schema). All additive. → [error-fields.md §7](spec/design/error-fields.md)
 

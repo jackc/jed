@@ -1,0 +1,247 @@
+# The jed_types + jed_type_fields catalog relations (spec/design/introspection.md §5.3, slice I3):
+# read-only COMPUTED relations over the qualified database's USER-DEFINED types. jed_types has one
+# row per type (name / kind — 'composite', the only user-definable kind today); jed_type_fields has
+# one row per field (type_name / name / ordinal / type / not_null — jed_columns' shape, with the
+# same canonical type text). Built-in and structural (array/range) types are not catalog objects, so
+# they are never rows. Resolution / qualifier scoping / read-only rejection / privileges / cost are
+# the same model as jed_tables (pinned there). jed-specific, so CROSS-CORE-checked, NOT
+# PostgreSQL-oracle-checked.
+# requires: introspect.types, introspect.type_fields, introspect.columns, types.composite, types.composite_array_field, types.array, types.decimal, types.varchar_length, ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.cte, query.join_inner, query.qualified_table, query.explain, query.aggregates, session.privileges, resource.cost_metering, types.i32, types.text
+
+# --- an empty database lists no types and no fields -----------------------------------------------
+
+query T rowsort
+SELECT name FROM jed_types
+----
+
+query T rowsort
+SELECT name FROM jed_type_fields
+----
+
+# --- one row per user-defined type; one row per field in CREATE TYPE order ----------------------
+
+statement ok
+CREATE TYPE addr AS (street text NOT NULL, zip i32)
+
+statement ok
+CREATE TYPE Money AS (amount decimal(10,2), currency varchar(3) NOT NULL)
+
+statement ok
+CREATE TYPE person AS (name text, home addr, tags text[], wallet Money)
+
+query TT nosort
+SELECT name, kind FROM jed_types ORDER BY name
+----
+Money
+composite
+addr
+composite
+person
+composite
+
+# the canonical type text: typmods at the leaf, a nested composite by its name as created, [] for an
+# array (the jed_columns.type rendering)
+query TTITB nosort
+SELECT type_name, name, ordinal, type, not_null FROM jed_type_fields ORDER BY type_name, ordinal
+----
+Money
+amount
+1
+decimal(10,2)
+false
+Money
+currency
+2
+varchar(3)
+true
+addr
+street
+1
+text
+true
+addr
+zip
+2
+i32
+false
+person
+name
+1
+text
+false
+person
+home
+2
+addr
+false
+person
+tags
+3
+text[]
+false
+person
+wallet
+4
+Money
+false
+
+# --- composes with the other catalog relations ----------------------------------------------------
+
+# field count per type
+query TI nosort
+SELECT t.name, count(*) FROM jed_types t JOIN jed_type_fields f ON f.type_name = t.name GROUP BY t.name ORDER BY t.name
+----
+Money
+2
+addr
+2
+person
+4
+
+statement ok
+CREATE TABLE people (id i32 PRIMARY KEY, who person, mailing addr, history addr[])
+
+# which table columns are typed directly at a user-defined type
+query TTT nosort
+SELECT t.name, c.table_name, c.name FROM jed_types t JOIN jed_columns c ON c.type = t.name ORDER BY t.name, c.name
+----
+addr
+people
+mailing
+person
+people
+who
+
+# --- DROP TYPE is reflected immediately, removing the type and its fields ------------------------
+
+statement ok
+DROP TABLE people
+
+statement ok
+DROP TYPE person
+
+query T nosort
+SELECT name FROM jed_types ORDER BY name
+----
+Money
+addr
+
+query I nosort
+SELECT count(*) FROM jed_type_fields
+----
+4
+
+# --- resolution: case-insensitive, alias renames the relation, qualifier scoping -----------------
+
+query T nosort
+SELECT name FROM JED_Types ORDER BY name
+----
+Money
+addr
+
+query T nosort
+SELECT f.name FROM jed_type_fields AS f WHERE f.not_null ORDER BY f.name
+----
+currency
+street
+
+query T nosort
+SELECT name FROM main.jed_type_fields WHERE type_name = 'addr' ORDER BY ordinal
+----
+street
+zip
+
+statement error 42P01
+SELECT name FROM nope.jed_types
+
+statement error 42P01
+SELECT name FROM nope.jed_type_fields
+
+# a statement-local CTE SHADOWS the catalog relation (PG-matching resolution order)
+query I nosort
+WITH jed_types AS (SELECT 1 AS x) SELECT x FROM jed_types
+----
+1
+
+# --- read-only: every mutation / DDL target naming either relation is 42809 ----------------------
+
+statement error 42809
+INSERT INTO jed_types VALUES ('x', 'composite')
+
+statement error 42809
+UPDATE jed_type_fields SET not_null = true
+
+statement error 42809
+DELETE FROM jed_types
+
+statement error 42809
+DROP TABLE jed_type_fields
+
+# IF EXISTS does not suppress a kind rejection (the relation exists)
+statement error 42809
+DROP TABLE IF EXISTS jed_types
+
+statement error 42809
+CREATE INDEX i ON jed_type_fields (name)
+
+# CREATE of any jed_-prefixed name stays the I0 reservation (42939), not 42809
+statement error 42939
+CREATE TYPE jed_types AS (a i32)
+
+statement error 42939
+CREATE TABLE jed_type_fields (a i32)
+
+# --- cost: one generated_row per produced row, zero page_read / storage_row_read ----------------
+
+# 2 types: 2 generated_row + 2 row_produced = 4. No page is read — the catalog is resident.
+# cost: 4
+query T rowsort
+SELECT name FROM jed_types
+----
+Money
+addr
+
+# 4 fields: 4 generated_row + 4 aggregate_accumulate + 1 row_produced = 9.
+# cost: 9
+query I nosort
+SELECT count(*) FROM jed_type_fields
+----
+4
+
+# --- EXPLAIN: a Catalog Scan leaf carrying its database scope ------------------------------------
+
+query ITTII nosort
+EXPLAIN SELECT name FROM jed_types
+----
+0
+Catalog Scan jed_types
+db=main
+2
+4
+
+query ITTII nosort
+EXPLAIN SELECT name FROM jed_type_fields
+----
+0
+Catalog Scan jed_type_fields
+db=main
+4
+8
+
+# --- privileges: each relation is gated under its own name ----------------------------------------
+
+# default_privileges: NONE
+statement error 42501
+SELECT name FROM jed_types
+
+# default_privileges: NONE
+# grant: SELECT ON jed_types
+statement error 42501
+SELECT name FROM jed_type_fields
+
+# default_privileges: NONE
+# grant: SELECT ON jed_types
+query I nosort
+SELECT count(*) FROM jed_types
+----
+2

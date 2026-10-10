@@ -813,6 +813,111 @@ impl Engine {
         Ok(out)
     }
 
+    /// Generate the rows of the `jed_sequences` catalog relation (introspection.md §5.3): one row per
+    /// sequence of the scope's snapshot, in ascending lowercased-name order. The definition fields
+    /// render as stored; `last_value` is NULL until the sequence has been read (`!is_called` — PG's
+    /// `pg_sequences` rule); `owned_by_table` / `owned_by_column` render the OWNED BY link of a
+    /// serial / IDENTITY column (the owning table's canonical name, the column's current name), NULL
+    /// for a standalone sequence. Cost mirrors jed_tables_rows.
+    pub(crate) fn jed_sequences_rows(&self, srf: &SrfPlan, meter: &mut Meter) -> Result<Vec<Row>> {
+        let Some(snap) = self.snap_for_scope(&srf.introspect_scope) else {
+            return Err(EngineError::new(
+                SqlState::UndefinedTable,
+                format!("database \"{}\" is not attached", srf.introspect_scope),
+            ));
+        };
+        let mut out: Vec<Row> = Vec::new();
+        for seq in snap.sequences_sorted() {
+            meter.guard()?;
+            meter.charge(COSTS.generated_row);
+            let last_value = if seq.is_called {
+                Value::Int(seq.last_value)
+            } else {
+                Value::Null
+            };
+            // The owner always exists: DROP TABLE auto-drops its owned sequences (sequences.md §12).
+            let (owner_table, owner_column) = match &seq.owned_by {
+                Some(owner) => match snap.table(&owner.table) {
+                    Some(t) => (
+                        Value::Text(t.name.clone()),
+                        t.columns
+                            .get(owner.column as usize)
+                            .map_or(Value::Null, |c| Value::Text(c.name.clone())),
+                    ),
+                    None => (Value::Text(owner.table.clone()), Value::Null),
+                },
+                None => (Value::Null, Value::Null),
+            };
+            out.push(vec![
+                Value::Text(seq.name.clone()),
+                Value::Int(seq.start),
+                Value::Int(seq.min_value),
+                Value::Int(seq.max_value),
+                Value::Int(seq.increment),
+                Value::Bool(seq.cycle),
+                Value::Int(seq.cache),
+                last_value,
+                owner_table,
+                owner_column,
+            ]);
+        }
+        Ok(out)
+    }
+
+    /// Generate the rows of the `jed_types` catalog relation (introspection.md §5.3): one row per
+    /// user-defined type of the scope's snapshot, in ascending lowercased-name order. Every user type
+    /// is a composite today. Cost mirrors jed_tables_rows.
+    pub(crate) fn jed_types_rows(&self, srf: &SrfPlan, meter: &mut Meter) -> Result<Vec<Row>> {
+        let Some(snap) = self.snap_for_scope(&srf.introspect_scope) else {
+            return Err(EngineError::new(
+                SqlState::UndefinedTable,
+                format!("database \"{}\" is not attached", srf.introspect_scope),
+            ));
+        };
+        let mut out: Vec<Row> = Vec::new();
+        for ty in snap.composite_types_sorted() {
+            meter.guard()?;
+            meter.charge(COSTS.generated_row);
+            out.push(vec![
+                Value::Text(ty.name.clone()),
+                Value::Text("composite".to_string()),
+            ]);
+        }
+        Ok(out)
+    }
+
+    /// Generate the rows of the `jed_type_fields` catalog relation (introspection.md §5.3): one row
+    /// per field of every user-defined type of the scope's snapshot, in (lowercased type name,
+    /// ordinal) order — jed_columns' shape, with the same canonical type text. Cost mirrors
+    /// jed_tables_rows.
+    pub(crate) fn jed_type_fields_rows(
+        &self,
+        srf: &SrfPlan,
+        meter: &mut Meter,
+    ) -> Result<Vec<Row>> {
+        let Some(snap) = self.snap_for_scope(&srf.introspect_scope) else {
+            return Err(EngineError::new(
+                SqlState::UndefinedTable,
+                format!("database \"{}\" is not attached", srf.introspect_scope),
+            ));
+        };
+        let mut out: Vec<Row> = Vec::new();
+        for ty in snap.composite_types_sorted() {
+            for (i, f) in ty.fields.iter().enumerate() {
+                meter.guard()?;
+                meter.charge(COSTS.generated_row);
+                out.push(vec![
+                    Value::Text(ty.name.clone()),
+                    Value::Text(f.name.clone()),
+                    Value::Int(i as i64 + 1),
+                    Value::Text(catalog_type_text(&f.ty, f.decimal.as_ref(), f.varchar_len)),
+                    Value::Bool(f.not_null),
+                ]);
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn jed_statistics_rows(&self, srf: &SrfPlan, meter: &mut Meter) -> Result<Vec<Row>> {
         let Some(snap) = self.snap_for_scope(&srf.introspect_scope) else {
             return Err(EngineError::new(

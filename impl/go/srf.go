@@ -508,7 +508,7 @@ func srfKindName(kind srfKind) string {
 }
 
 // catalogRelKind classifies a relation name as a built-in catalog relation (introspection.md §5):
-// jed_tables / jed_columns, case-insensitively (identifier resolution folds case; grammar.md §3
+// the jed_-prefixed relation family, case-insensitively (identifier resolution folds case; grammar.md §3
 // leaves no quoted escape). Built-in names resolve in every database's relation namespace, checked
 // AFTER a statement-local CTE (a CTE shadows a catalog relation — PG-matching, oracle-checked) and
 // BEFORE the user catalog (post-I0 the two can never collide; for a pre-reservation legacy file
@@ -525,6 +525,12 @@ func catalogRelKind(name string) (srfKind, bool) {
 		return srfJedConstraints, true
 	case "jed_statistics":
 		return srfJedStatistics, true
+	case "jed_sequences":
+		return srfJedSequences, true
+	case "jed_types":
+		return srfJedTypes, true
+	case "jed_type_fields":
+		return srfJedTypeFields, true
 	}
 	return 0, false
 }
@@ -542,7 +548,7 @@ func indexMethodName(kind indexKind) string {
 	}
 }
 
-// isCatalogRelName reports whether name is a built-in catalog relation (jed_tables / jed_columns).
+// isCatalogRelName reports whether name is a built-in catalog relation (introspection.md §5).
 // The write paths use it to reject a catalog relation as a mutation/DDL target (42809 — a catalog
 // relation is read-only, introspection.md §5); the privilege gate uses it so a built-in is
 // SELECT-gated exactly like a user table under an explicit-grant session envelope.
@@ -600,6 +606,34 @@ func catalogRelTable(kind srfKind) *catTable {
 			{Name: "expression", Type: scalarT(scalarText)},
 			{Name: "ref_table", Type: scalarT(scalarText)},
 			{Name: "ref_columns", Type: textArr},
+		}}
+	case srfJedSequences:
+		return &catTable{Name: "jed_sequences", Columns: []catColumn{
+			{Name: "name", Type: scalarT(scalarText), NotNull: true},
+			{Name: "start_value", Type: scalarT(scalarInt64), NotNull: true},
+			{Name: "min_value", Type: scalarT(scalarInt64), NotNull: true},
+			{Name: "max_value", Type: scalarT(scalarInt64), NotNull: true},
+			{Name: "increment_by", Type: scalarT(scalarInt64), NotNull: true},
+			{Name: "cycle", Type: scalarT(scalarBool), NotNull: true},
+			{Name: "cache_size", Type: scalarT(scalarInt64), NotNull: true},
+			// NULL until the sequence has been read (PG's pg_sequences rule — introspection.md §5.3).
+			{Name: "last_value", Type: scalarT(scalarInt64)},
+			// The OWNED BY link of a serial / IDENTITY column; NULL for a standalone sequence.
+			{Name: "owned_by_table", Type: scalarT(scalarText)},
+			{Name: "owned_by_column", Type: scalarT(scalarText)},
+		}}
+	case srfJedTypes:
+		return &catTable{Name: "jed_types", Columns: []catColumn{
+			{Name: "name", Type: scalarT(scalarText), NotNull: true},
+			{Name: "kind", Type: scalarT(scalarText), NotNull: true},
+		}}
+	case srfJedTypeFields:
+		return &catTable{Name: "jed_type_fields", Columns: []catColumn{
+			{Name: "type_name", Type: scalarT(scalarText), NotNull: true},
+			{Name: "name", Type: scalarT(scalarText), NotNull: true},
+			{Name: "ordinal", Type: scalarT(scalarInt32), NotNull: true},
+			{Name: "type", Type: scalarT(scalarText), NotNull: true},
+			{Name: "not_null", Type: scalarT(scalarBool), NotNull: true},
 		}}
 	default: // srfJedStatistics
 		return &catTable{Name: "jed_statistics", Columns: []catColumn{
@@ -921,6 +955,101 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 				NullValue(),
 				NullValue(),
 				NullValue(),
+			})
+		}
+	}
+	return out, nil
+}
+
+// jedSequencesRows generates the rows of the jed_sequences catalog relation (introspection.md
+// §5.3): one row per sequence of the scope's snapshot, in ascending lowercased-name order. The
+// definition fields render as stored; last_value is NULL until the sequence has been read
+// (!IsCalled — PG's pg_sequences rule); owned_by_table / owned_by_column render the OWNED BY link
+// of a serial / IDENTITY column (the owning table's canonical name, the column's current name),
+// NULL for a standalone sequence. Cost mirrors jedTablesRows.
+func (db *engine) jedSequencesRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
+	snap := db.snapForScope(sp.introspectScope)
+	if snap == nil {
+		return nil, newError(UndefinedTable, `database "`+sp.introspectScope+`" is not attached`)
+	}
+	var out []storedRow
+	for _, seq := range snap.sequencesSorted() {
+		if err := m.Guard(); err != nil {
+			return nil, err
+		}
+		m.Charge(costs.GeneratedRow)
+		lastValue := NullValue()
+		if seq.IsCalled {
+			lastValue = IntValue(seq.LastValue)
+		}
+		ownerTable, ownerColumn := NullValue(), NullValue()
+		if seq.OwnedBy != nil {
+			// The owner always exists: DROP TABLE auto-drops its owned sequences (sequences.md §12).
+			ownerTable = TextValue(seq.OwnedBy.Table)
+			if t, ok := snap.table(seq.OwnedBy.Table); ok {
+				ownerTable = TextValue(t.Name)
+				if int(seq.OwnedBy.Column) < len(t.Columns) {
+					ownerColumn = TextValue(t.Columns[seq.OwnedBy.Column].Name)
+				}
+			}
+		}
+		out = append(out, storedRow{
+			TextValue(seq.Name),
+			IntValue(seq.Start),
+			IntValue(seq.MinValue),
+			IntValue(seq.MaxValue),
+			IntValue(seq.Increment),
+			BoolValue(seq.Cycle),
+			IntValue(seq.Cache),
+			lastValue,
+			ownerTable,
+			ownerColumn,
+		})
+	}
+	return out, nil
+}
+
+// jedTypesRows generates the rows of the jed_types catalog relation (introspection.md §5.3): one
+// row per user-defined type of the scope's snapshot, in ascending lowercased-name order. Every user
+// type is a composite today. Cost mirrors jedTablesRows.
+func (db *engine) jedTypesRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
+	snap := db.snapForScope(sp.introspectScope)
+	if snap == nil {
+		return nil, newError(UndefinedTable, `database "`+sp.introspectScope+`" is not attached`)
+	}
+	var out []storedRow
+	for _, ct := range snap.compositeTypesSorted() {
+		if err := m.Guard(); err != nil {
+			return nil, err
+		}
+		m.Charge(costs.GeneratedRow)
+		out = append(out, storedRow{TextValue(ct.Name), TextValue("composite")})
+	}
+	return out, nil
+}
+
+// jedTypeFieldsRows generates the rows of the jed_type_fields catalog relation (introspection.md
+// §5.3): one row per field of every user-defined type of the scope's snapshot, in (lowercased type
+// name, ordinal) order — jed_columns' shape, with the same canonical type text. Cost mirrors
+// jedTablesRows.
+func (db *engine) jedTypeFieldsRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
+	snap := db.snapForScope(sp.introspectScope)
+	if snap == nil {
+		return nil, newError(UndefinedTable, `database "`+sp.introspectScope+`" is not attached`)
+	}
+	var out []storedRow
+	for _, ct := range snap.compositeTypesSorted() {
+		for i, f := range ct.Fields {
+			if err := m.Guard(); err != nil {
+				return nil, err
+			}
+			m.Charge(costs.GeneratedRow)
+			out = append(out, storedRow{
+				TextValue(ct.Name),
+				TextValue(f.Name),
+				IntValue(int64(i + 1)),
+				TextValue(catalogTypeText(f.Type, f.Decimal, f.VarcharLen)),
+				BoolValue(f.NotNull),
 			})
 		}
 	}
