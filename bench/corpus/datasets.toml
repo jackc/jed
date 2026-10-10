@@ -10,7 +10,9 @@ schema_version = 1
 # split-rule fix) even if the shapes below do not.
 # 4: the on-disk format bumped 21 → 22 (varchar(n) length limits), which reshapes every
 #    generated .jed; the v21 datasets are unreadable by the current core, so invalidate them.
-generator_version = 5
+# 6: the on-disk format bumped 33 → 34 (the live page count in the meta page), so datasets
+#    generated before it fail to open (XX001); invalidate them.
+generator_version = 6
 
 [[dataset]]
 name = "small"
