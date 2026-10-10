@@ -18,6 +18,7 @@ import {
   query,
   queryPrepared,
 } from "../../../impl/ts/src/tooling.ts";
+import { ExtensionRegistry } from "../../../impl/ts/src/extension.ts";
 import { intValue, textValue, type Value } from "../../../impl/ts/src/value.ts";
 
 import {
@@ -30,6 +31,7 @@ import {
 } from "./lib.ts";
 
 class JedEngine implements Engine {
+  readonly hostFunctions = true; // every handle carries benchExtensions() (benchmarks.md §8.2)
   private readonly db: JedDb;
   private stmt: PreparedStatement | null = null;
   private readonly dataDir: string;
@@ -110,7 +112,9 @@ class JedEngine implements Engine {
     meas: Arg[][][],
     expectRows: number,
   ): Promise<ConcurrentOutcome> {
-    const db = openDatabase(join(this.dataDir, `${this.dataset}.jed`));
+    const db = openDatabase(join(this.dataDir, `${this.dataset}.jed`), {
+      extensions: benchExtensions(),
+    });
     const readers = meas.length;
     const sessions: Session[] = Array.from({ length: readers }, () => db.readSession());
     try {
@@ -143,6 +147,35 @@ class JedEngine implements Engine {
       db.close();
     }
   }
+}
+
+// benchMix is the bench host functions' arithmetic (benchmarks.md §8.2) — cheap on purpose, so the
+// timings expose per-call overhead.
+function benchMix(v: Value): Value {
+  return intValue(((v as { kind: "int"; int: bigint }).int * 2654435761n) % 1000003n);
+}
+
+// benchExtensions registers the bench host functions on every handle: the same arithmetic as a
+// single-row kernel (bench_mix_row) and a batch kernel (bench_mix_batch).
+function benchExtensions(): ExtensionRegistry {
+  const reg = new ExtensionRegistry();
+  reg.registerFunction({
+    name: "bench_mix_row",
+    argTypes: ["i32"],
+    result: "i64",
+    volatility: "immutable",
+    kernel: (args) => benchMix(args[0]),
+  });
+  reg.registerFunction({
+    name: "bench_mix_batch",
+    argTypes: ["i32"],
+    result: "i64",
+    volatility: "immutable",
+    batchKernel: (args, out) => {
+      for (const v of args[0]) out.push(benchMix(v));
+    },
+  });
+  return reg;
 }
 
 function bindArgs(args: Arg[]): Value[] {
@@ -189,8 +222,14 @@ await mainWith({
   async open(dataDir: string, dataset: string): Promise<Engine> {
     if (dataset === "scratch") {
       const dir = mkdtempSync(join(dataDir, "scratch-"));
-      return new JedEngine(create(join(dir, "scratch.jed")), dataDir, dataset, dir);
+      const db = create(join(dir, "scratch.jed"));
+      db.session.extensions = benchExtensions();
+      return new JedEngine(db, dataDir, dataset, dir);
     }
-    return new JedEngine(open(join(dataDir, `${dataset}.jed`)), dataDir, dataset, null);
+    // The low-level tooling open/create build a bare engine (no shared core to carry a registry), so
+    // the bench host functions are installed on its session the way a session mint would.
+    const db = open(join(dataDir, `${dataset}.jed`));
+    db.session.extensions = benchExtensions();
+    return new JedEngine(db, dataDir, dataset, null);
   },
 });

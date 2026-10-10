@@ -303,6 +303,7 @@ impl Engine {
             outer,
             rng: stmt_rng,
             ctes,
+            host_batch: None,
         };
         // A WHERE contradiction (planner.md §3.1) skips every scan lane: the eager pipeline below
         // runs over an empty FROM (materialize_rel reads nothing), so aggregates still see their

@@ -1655,7 +1655,12 @@ impl RExpr {
                     }
                     vals.push(v);
                 }
-                let out = (hf.kernel)(&vals)?;
+                // The kernel's outcome for this row: prefetched by the site's batch (§4.2.1 —
+                // speculative batch, scalar replay), or a batch-of-one call when it has none.
+                let out = match env.host_batch.and_then(|b| b.take(self)) {
+                    Some(outcome) => outcome?,
+                    None => hf.call_one(vals)?,
+                };
                 // Defend jed's own strict type system against a misbehaving host kernel (CLAUDE.md
                 // §13 — the host owns its consequences, but a wrong-typed value must never reach
                 // jed's codecs / comparators): the returned value must be NULL or match the declared

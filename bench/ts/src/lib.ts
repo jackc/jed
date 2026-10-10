@@ -125,6 +125,7 @@ export interface Bench {
   engines: string[];
   batch: number;
   readers: number; // concurrent_read: reader Sessions
+  hostFunctions: boolean; // calls the bench host functions (benchmarks.md §8.2)
   setupSql: string[];
   sqlOverride: Record<string, string>;
   setupSqlOverride: Record<string, string[]>;
@@ -200,6 +201,7 @@ export function loadCorpus(corpusDir: string): Bench[] {
       engines: strList(raw.engines),
       batch: num(raw.batch),
       readers: num(raw.readers),
+      hostFunctions: raw.host_functions === true,
       setupSql: strList(raw.setup_sql),
       sqlOverride: (raw.sql_override as Record<string, string> | undefined) ?? {},
       setupSqlOverride: (raw.setup_sql_override as Record<string, string[]> | undefined) ?? {},
@@ -311,6 +313,9 @@ export interface Engine {
     meas: Arg[][][],
     expectRows: number,
   ): Promise<ConcurrentOutcome>;
+  // OPTIONAL: true when the driver registered the bench host functions (bench_mix_row /
+  // bench_mix_batch, benchmarks.md §8.2). A driver without it skips a host_functions bench.
+  hostFunctions?: boolean;
 }
 
 // ConcurrentOutcome is what a driver's concurrentRead returns (benchmarks.md §8.1):
@@ -468,6 +473,13 @@ async function runOne(
         fingerprint: want,
         started_at: startedAt,
       };
+    }
+
+    if (b.hostFunctions && eng.hostFunctions !== true) {
+      process.stderr.write(
+        `  skip: ${cfg.engine}/${cfg.lang}/${cfg.variant} has no bench host functions\n`,
+      );
+      return null;
     }
 
     await eng.prepare(sqlFor(b, cfg.engine));

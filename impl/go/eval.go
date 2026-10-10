@@ -2461,7 +2461,15 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			hvals = append(hvals, v)
 		}
-		out, err := hf.kernel(hvals)
+		// The kernel's outcome for this row: prefetched by the site's batch (§4.2.1 — speculative
+		// batch, scalar replay), or a batch-of-one call when it has none.
+		var out Value
+		var err error
+		if o, ok := env.hostBatch.take(e); ok {
+			out, err = o.value, o.err
+		} else {
+			out, err = hf.callOne(hvals)
+		}
 		if err != nil {
 			return Value{}, err
 		}

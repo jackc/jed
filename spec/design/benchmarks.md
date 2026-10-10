@@ -839,6 +839,8 @@ Optional keys:
 - `readers = N` — `concurrent_read` only: the number of reader `Session`s minted from the
   one shared `Database` (§8.1).
 - `setup_sql = ["..."]` — write kinds only: statements run once before warmup.
+- `host_functions = true` — the bench calls the bench host functions (§8.2); a driver that
+  does not register them skips it.
 - `[bench.sql_override]` / `[bench.setup_sql_override]` — per-engine SQL text keyed by
   `jed` / `postgres` / `sqlite`, used only where dialects genuinely diverge (v1 uses it
   once, for the scratch table's SQLite rowid-pk DDL — §8).
@@ -1276,6 +1278,35 @@ defaulting to `None`, TS optional `Engine.concurrentRead`); the Ruby gem wrap (a
 line and emit no result. **Deferred follow-on:** a cross-*engine* concurrent comparison
 (PostgreSQL connection pools, SQLite multi-connection readers) — a larger driver effort
 (thread-per-connection pools across every binary) that is not the slice-7 feature under test.
+
+## 8.2 Host-function benchmarks (`host_functions = true`)
+
+The `host_function_{none,row,batch}` triple measures the cost of calling a host-registered scalar
+function and what the batched kernel ABI ([extensibility.md](extensibility.md) §4.2.1) saves. A
+driver that supports the bench host functions registers both of these at open, on every handle,
+immutable with the default unit cost:
+
+| name | signature | kernel |
+|---|---|---|
+| `bench_mix_row` | `(i32) → i64` | single-row: `x * 2654435761 % 1000003` |
+| `bench_mix_batch` | `(i32) → i64` | batch: the same arithmetic over the column |
+
+The arithmetic is cheap on purpose, so the timings expose per-call overhead rather than kernel
+work, and identical in both forms, so the row and batch answers agree. The three benches share a
+parameter stream and SQL shape (`WHERE customer_id BETWEEN $1 AND $2 ORDER BY id`: 100 customers,
+≈1,000 rows of the resident 10k-row `small` table, so engine per-row work is small enough for the
+call to show); only the projected expression differs, so `(row − none) / rows` is the per-call cost
+of a single-row kernel and `(batch − none) / rows` the cost left after batching. The index-selected
+shape is chosen because it runs on the buffered projection, the site that prefetches; a full-table
+`ORDER BY id` streams and calls the kernel batch-of-one (extensibility.md §4.2.1 "Sites").
+
+In the native cores a host call is an in-process closure call, so batching is roughly neutral there
+(at landing: Rust's batch saved ~15 ns of a ~70 ns per-row call, TS was within noise, and Go's batch
+was ~20–50 ns per row *slower* — the prefetch evaluates the arguments a second time and stores an
+outcome per row, which a closure call that cheap does not repay). The triple exists for the wrapped bindings, where each call crosses a language
+boundary and batching amortizes it; a wrapped driver (Ruby gem, Node/Rust, wasm) joins the triple
+when its binding exposes host functions. Until then those drivers skip it, like the PostgreSQL and
+SQLite drivers (`engines = ["jed"]`).
 
 ## 9. Running and reporting
 

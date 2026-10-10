@@ -441,3 +441,254 @@ test("host-dep index reopen with the function missing", () => {
   );
   db.close();
 });
+
+// ---------------------------------------------------------------------------------------------
+// The batched kernel ABI (extensibility.md §4.2.1). Batching is host-observable only (how often, and
+// over how many rows, a kernel runs); rows, cost, and errors must be identical to batch-of-one. These
+// mirror the Rust/Go batch tests one-for-one.
+// ---------------------------------------------------------------------------------------------
+
+// host_twice(i64) -> i64 as a BATCH kernel: doubles each row; throws at the row whose value is
+// `failAt` (the prefix rule — the rows before it are pushed first). Records each call's row count.
+function twiceBatched(
+  calls: number[],
+  volatility: "immutable" | "volatile",
+  failAt: bigint | null,
+): HostFunctionSpec {
+  return {
+    name: "host_twice",
+    argTypes: ["i64"],
+    result: "i64",
+    batchKernel: (args, out) => {
+      calls.push(args[0]!.length);
+      for (const v of args[0]!) {
+        const x = asInt(v);
+        if (x === failAt)
+          throw new EngineError("invalid_parameter_value", `host_twice refuses ${x}`);
+        out.push(intValue(x * 2n));
+      }
+    },
+    volatility,
+    cost: 5n,
+  };
+}
+
+// The same function as a SINGLE-ROW kernel — the batch-of-one reference.
+function twiceRow(calls: number[], failAt: bigint | null): HostFunctionSpec {
+  return {
+    name: "host_twice",
+    argTypes: ["i64"],
+    result: "i64",
+    kernel: (args) => {
+      calls.push(1);
+      const x = asInt(args[0]!);
+      if (x === failAt) throw new EngineError("invalid_parameter_value", `host_twice refuses ${x}`);
+      return intValue(x * 2n);
+    },
+    volatility: "immutable",
+    cost: 5n,
+  };
+}
+
+// A table t(id i64 PRIMARY KEY, a i64) of `n` rows (g, g), with `a` NULL where g % 10 = 0.
+function batchDb(f: HostFunctionSpec, n: number): Session {
+  return dbExt(regWith(f), [
+    "CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+    `INSERT INTO t SELECT g, CASE WHEN g % 10 = 0 THEN NULL ELSE g END FROM generate_series(1, ${n}) AS g`,
+  ]);
+}
+
+// { rows, cost } of a query, or its "code message" error.
+function runQ(s: Session, sql: string): { rows: Value[][]; cost: bigint } | string {
+  try {
+    const o = queryOutcome(s, sql);
+    if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
+    return { rows: o.rows, cost: o.cost };
+  } catch (e) {
+    if (e instanceof EngineError) return `${e.code()} ${e.message}`;
+    throw e;
+  }
+}
+
+test("batch kernel is called once per chunk", () => {
+  // 2500 rows (250 of them NULL) through the buffered projection: three chunks of ≤1024 rows, each
+  // one kernel call over its non-NULL rows only (strict).
+  const calls: number[] = [];
+  const s = batchDb(twiceBatched(calls, "immutable", null), 2500);
+  const got = runQ(s, "SELECT id, host_twice(a) FROM t");
+  assert.ok(typeof got !== "string", String(got));
+  assert.equal(got.rows.length, 2500);
+  for (const r of got.rows) {
+    const id = asInt(r[0]!);
+    if (id % 10n === 0n) assert.equal(r[1]!.kind, "null");
+    else assert.equal(asInt(r[1]!), id * 2n);
+  }
+  assert.deepEqual(calls, [922, 922, 406]);
+});
+
+test("batch matches the row kernel in rows and cost", () => {
+  // The same query against a batch kernel and a single-row kernel: identical rows and cost.
+  const sqls = [
+    "SELECT id, host_twice(a) FROM t",
+    "SELECT id, host_twice(a), host_twice(id) FROM t WHERE id > 100",
+    "SELECT a, host_twice(a) FROM t ORDER BY a DESC LIMIT 7 OFFSET 3",
+    "SELECT x.id, host_twice(y.a) FROM t AS x JOIN t AS y ON x.id = y.id + 1",
+    "SELECT host_twice(count(*)) FROM t",
+  ];
+  for (const sql of sqls) {
+    const batched = batchDb(twiceBatched([], "immutable", null), 1500);
+    const single = batchDb(twiceRow([], null), 1500);
+    assert.deepEqual(runQ(batched, sql), runQ(single, sql), sql);
+  }
+});
+
+test("volatile batch kernel is called per row", () => {
+  // A volatile function's call set stays exactly the scalar one: one-row batches, one per non-NULL
+  // row.
+  const calls: number[] = [];
+  const s = batchDb(twiceBatched(calls, "volatile", null), 30);
+  runQ(s, "SELECT host_twice(a) FROM t");
+  assert.deepEqual(calls, new Array(27).fill(1));
+});
+
+test("batch error raises at the scalar row", () => {
+  // The kernel fails at a = 57. Alone, that is the error; with an earlier per-row error in the same
+  // projection (division by zero at id = 40) the earlier row still wins, exactly as the single-row
+  // kernel orders them.
+  for (const sql of [
+    "SELECT host_twice(a) FROM t",
+    "SELECT 1 / (id - 40), host_twice(a) FROM t",
+    "SELECT host_twice(a), 1 / (id - 40) FROM t",
+    "SELECT host_twice(a), 1 / (id - 60) FROM t",
+  ]) {
+    const batched = batchDb(twiceBatched([], "immutable", 57n), 200);
+    const single = batchDb(twiceRow([], 57n), 200);
+    const got = runQ(batched, sql);
+    assert.equal(typeof got, "string", sql);
+    assert.deepEqual(got, runQ(single, sql), sql);
+  }
+});
+
+test("batch cost abort matches the row kernel and bounds speculation", () => {
+  // Under a ceiling the abort is the single-row kernel's (same code, same accrued cost), and the
+  // prefetch ran the kernel over no more rows than the budget could pay for (§4.2.1).
+  const calls: number[] = [];
+  const batched = batchDb(twiceBatched(calls, "immutable", null), 2000);
+  const single = batchDb(twiceRow([], null), 2000);
+  const budget = 200n;
+  batched.setMaxCost(budget);
+  single.setMaxCost(budget);
+  const sql = "SELECT id, host_twice(a) FROM t";
+  const b = runQ(batched, sql);
+  const s = runQ(single, sql);
+  assert.equal(typeof b, "string");
+  assert.ok(String(b).startsWith("54P01 "), String(b));
+  assert.equal(b, s);
+  const speculated = calls.reduce((a, c) => a + c, 0);
+  assert.ok(speculated <= Number(budget / 5n) + 1, `kernel ran over ${speculated} rows`);
+});
+
+test("batch through the streaming cursor matches", () => {
+  // The lazy query() cursor drives the same buffered projection: same rows, chunked calls.
+  const calls: number[] = [];
+  const s = batchDb(twiceBatched(calls, "immutable", null), 1100);
+  const rows: Value[][] = [];
+  const cur = s.query("SELECT host_twice(a) FROM t");
+  try {
+    for (const r of cur) rows.push(r);
+  } finally {
+    cur.close();
+  }
+  assert.equal(rows.length, 1100);
+  assert.equal(asInt(rows[0]![0]!), 2n);
+  assert.equal(rows[9]![0]!.kind, "null");
+  assert.deepEqual(calls, [922, 68]);
+});
+
+test("batch through the eager materialized drive matches", () => {
+  // TS-only: a top-level SELECT drains through the lazy cursor above, so the eager drive
+  // (drainEmitterEager — a WITH body, a set-operation arm, a derived table, INSERT … SELECT) is
+  // reached through a WITH wrapper here. Same chunked calls, and the same rows/cost as the row kernel.
+  const calls: number[] = [];
+  const s = batchDb(twiceBatched(calls, "immutable", null), 2500);
+  const sql = "WITH w AS (SELECT 1) SELECT id, host_twice(a) FROM t";
+  const got = runQ(s, sql);
+  assert.deepEqual(calls, [922, 922, 406]);
+  assert.deepEqual(got, runQ(batchDb(twiceRow([], null), 2500), sql));
+});
+
+test("batch shape violations are 22000", () => {
+  // Too few results on a normal return, and too many, are caught rather than misattributed.
+  const shaped = (extra: boolean): HostFunctionSpec => ({
+    name: "host_shape",
+    argTypes: ["i64"],
+    result: "i64",
+    batchKernel: (args, out) => {
+      const n = args[0]!.length;
+      const want = extra ? n + 1 : n - 1;
+      for (let i = 0; i < want; i++) out.push(intValue(0n));
+    },
+    volatility: "immutable",
+  });
+  for (const extra of [false, true]) {
+    const s = batchDb(shaped(extra), 20);
+    assert.equal(
+      errCodeOf(() => queryOutcome(s, "SELECT host_shape(a) FROM t")),
+      "22000",
+      `extra=${extra}`,
+    );
+  }
+  // A wrong-typed result in a batch is caught at its own row too.
+  const s = batchDb(
+    {
+      name: "host_liar",
+      argTypes: ["i64"],
+      result: "i64",
+      batchKernel: (args, out) => {
+        for (const _ of args[0]!) out.push(textValue("oops"));
+      },
+      volatility: "immutable",
+    },
+    20,
+  );
+  assert.equal(
+    errCodeOf(() => queryOutcome(s, "SELECT host_liar(a) FROM t")),
+    "22000",
+  );
+});
+
+test("batch kernel serves a lone call", () => {
+  // Outside a prefetching site (a FROM-less SELECT, a WHERE filter) a batch kernel is handed a
+  // one-row batch.
+  const calls: number[] = [];
+  const s = batchDb(twiceBatched(calls, "immutable", null), 5);
+  assert.equal(asInt(oneVal(s, "SELECT host_twice(21)")), 42n);
+  const rows = rowsOf(s, "SELECT id FROM t WHERE host_twice(a) = 6");
+  assert.deepEqual(
+    rows.map((r) => asInt(r[0]!)),
+    [3n],
+  );
+  assert.deepEqual(calls, new Array(6).fill(1));
+});
+
+test("exactly one of kernel and batchKernel is required", () => {
+  // Both, or neither, is rejected 22023 at registration (the code a negative cost uses).
+  const r = new ExtensionRegistry();
+  const base = { name: "host_k", argTypes: [] as [], result: "i64" as const };
+  assert.equal(
+    errCodeOf(() => r.registerFunction(base)),
+    "22023",
+  );
+  assert.equal(
+    errCodeOf(() =>
+      r.registerFunction({
+        ...base,
+        kernel: () => intValue(0n),
+        batchKernel: (_args, out) => {
+          out.push(intValue(0n));
+        },
+      }),
+    ),
+    "22023",
+  );
+});

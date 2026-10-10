@@ -96,7 +96,7 @@ pub use executor::{
 };
 // Host extensibility (spec/design/extensibility.md §4.2) — the host registers scalar functions into
 // an `ExtensionRegistry` and hands it to `create`/`open` via `CreateOptions`/`OpenOptions`.
-pub use extension::{ExtensionRegistry, HostFunction, HostKernel, Volatility};
+pub use extension::{ExtensionRegistry, HostBatchKernel, HostFunction, HostKernel, Volatility};
 // The scalar type set is on the public surface (a host names it to declare host-function signatures).
 pub use types::ScalarType;
 // The low-level single-threaded `Engine` is a purely INTERNAL concern — not the public embedding

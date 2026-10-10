@@ -35,6 +35,23 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// with_tax(cents) -> cents plus 8% tax, as a BATCH kernel: it receives a whole column of rows per
+	// call (args[0][i] is row i's argument) and appends one result per row to out. jed calls it once
+	// per chunk where it already holds the rows, and one row at a time elsewhere — same rows, cost, and
+	// errors either way.
+	err = registry.RegisterFunction(
+		jed.NewHostBatchFunction("with_tax", []string{"i64"}, "i64",
+			func(args [][]jed.Value, out []jed.Value) ([]jed.Value, error) {
+				for _, v := range args[0] {
+					out = append(out, jed.IntValue(v.Int+v.Int*8/100))
+				}
+				return out, nil
+			}).
+			WithVolatility(jed.VolatilityImmutable))
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	db, err := jed.CreateDatabase(jed.CreateOptions{Extensions: registry})
 	if err != nil {
 		log.Fatal(err)
@@ -51,13 +68,15 @@ func main() {
 	mustExec(db, "CREATE INDEX ON product (discount(price_cents, 10))")
 
 	// Call it by name from SQL, exactly like a built-in.
-	rows, err := db.Query(ctx, "SELECT name, discount(price_cents, 15) AS sale FROM product ORDER BY id")
+	rows, err := db.Query(ctx,
+		"SELECT name, discount(price_cents, 15) AS sale, with_tax(price_cents) AS total FROM product ORDER BY id")
 	if err != nil {
 		log.Fatal(err)
 	}
 	for rows.Next() {
 		r := rows.Row()
-		fmt.Printf("%s -> %s\n", r[0].Render(), r[1].Render()) // Mug -> 1063, Notebook -> 340
+		// Mug -> 1063 / 1350, Notebook -> 340 / 432
+		fmt.Printf("%s -> %s / %s\n", r[0].Render(), r[1].Render(), r[2].Render())
 	}
 }
 

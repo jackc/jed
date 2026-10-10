@@ -6,7 +6,12 @@ package jed
 // unit-test category). Mirrors impl/rust/tests/host_functions.rs one-for-one.
 
 import (
+	"context"
+	"fmt"
 	"path/filepath"
+	"reflect"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -431,5 +436,258 @@ func TestHostFuncIndexReopenMissingFunction(t *testing.T) {
 	// A write that would maintain the index needs the missing function → 42883 (resolution fails).
 	if _, err := queryOutcome(db, "INSERT INTO t VALUES (3, 3)", nil); errCodeOf(err) != "42883" {
 		t.Fatalf("write needing the missing function = %v, want 42883", err)
+	}
+}
+
+// ── The batched kernel ABI (extensibility.md §4.2.1) ────────────────────────────────────────────
+// Batching is host-observable only (how often, and over how many rows, a kernel runs); rows, cost,
+// and errors must be identical to batch-of-one. These mirror the Rust/TS batch tests one-for-one.
+
+// hostCalls records the row count of every kernel call.
+type hostCalls struct {
+	mu    sync.Mutex
+	sizes []int
+}
+
+func (c *hostCalls) record(n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sizes = append(c.sizes, n)
+}
+
+func (c *hostCalls) get() []int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]int(nil), c.sizes...)
+}
+
+// twiceBatched is host_twice(i64) -> i64 as a BATCH kernel: doubles each row; raises at the row whose
+// value is failAt (the prefix rule — the rows before it are appended first). failAt < 0 never fails.
+func twiceBatched(calls *hostCalls, vol Volatility, failAt int64) *HostFunction {
+	return NewHostBatchFunction("host_twice", []string{"i64"}, "i64",
+		func(args [][]Value, out []Value) ([]Value, error) {
+			calls.record(len(args[0]))
+			for _, v := range args[0] {
+				if v.Int == failAt {
+					return out, newError(InvalidParameterValue, fmt.Sprintf("host_twice refuses %d", v.Int))
+				}
+				out = append(out, IntValue(v.Int*2))
+			}
+			return out, nil
+		}).WithVolatility(vol).WithCost(5)
+}
+
+// twiceRow is the same function as a SINGLE-ROW kernel — the batch-of-one reference.
+func twiceRow(calls *hostCalls, failAt int64) *HostFunction {
+	return NewHostFunction("host_twice", []string{"i64"}, "i64",
+		func(args []Value) (Value, error) {
+			calls.record(1)
+			if args[0].Int == failAt {
+				return Value{}, newError(InvalidParameterValue, fmt.Sprintf("host_twice refuses %d", args[0].Int))
+			}
+			return IntValue(args[0].Int * 2), nil
+		}).WithVolatility(VolatilityImmutable).WithCost(5)
+}
+
+// batchDB is a table t(id i64 PRIMARY KEY, a i64) of n rows (g, g), with a NULL where g % 10 = 0.
+func batchDB(t *testing.T, f *HostFunction, n int) *Session {
+	t.Helper()
+	return dbExt(t, regWith(t, f),
+		"CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+		fmt.Sprintf("INSERT INTO t SELECT g, CASE WHEN g %% 10 = 0 THEN NULL ELSE g END FROM generate_series(1, %d) AS g", n))
+}
+
+// batchRun is a query's rows + cost, or its error code + message, rendered for comparison.
+func batchRun(s *Session, sql string) string {
+	out, err := queryOutcome(s, sql, nil)
+	if err != nil {
+		return fmt.Sprintf("error %s %s", errCodeOf(err), err.(*EngineError).Message)
+	}
+	return fmt.Sprintf("rows %v cost %d", out.Rows, out.Cost)
+}
+
+func TestHostBatchKernelCalledOncePerChunk(t *testing.T) {
+	t.Parallel()
+	// 2500 rows (250 of them NULL) through the buffered projection: three chunks of ≤1024 rows, each
+	// one kernel call over its non-NULL rows only (strict).
+	calls := &hostCalls{}
+	s := batchDB(t, twiceBatched(calls, VolatilityImmutable, -1), 2500)
+	rows := hostRows(t, s, "SELECT id, host_twice(a) FROM t")
+	if len(rows) != 2500 {
+		t.Fatalf("got %d rows, want 2500", len(rows))
+	}
+	for _, r := range rows {
+		id := r[0].Int
+		if id%10 == 0 {
+			if !r[1].IsNull() {
+				t.Fatalf("row %d: got %v, want NULL", id, r[1])
+			}
+		} else if r[1].Kind != ValInt || r[1].Int != id*2 {
+			t.Fatalf("row %d: got %v, want %d", id, r[1], id*2)
+		}
+	}
+	if got := calls.get(); !reflect.DeepEqual(got, []int{922, 922, 406}) {
+		t.Fatalf("call sizes = %v, want [922 922 406]", got)
+	}
+}
+
+func TestHostBatchMatchesRowKernelRowsAndCost(t *testing.T) {
+	t.Parallel()
+	// The same query against a batch kernel and a single-row kernel: identical rows and cost.
+	for _, sql := range []string{
+		"SELECT id, host_twice(a) FROM t",
+		"SELECT id, host_twice(a), host_twice(id) FROM t WHERE id > 100",
+		"SELECT a, host_twice(a) FROM t ORDER BY a DESC LIMIT 7 OFFSET 3",
+		"SELECT x.id, host_twice(y.a) FROM t AS x JOIN t AS y ON x.id = y.id + 1",
+		"SELECT host_twice(count(*)) FROM t",
+	} {
+		batched := batchDB(t, twiceBatched(&hostCalls{}, VolatilityImmutable, -1), 1500)
+		single := batchDB(t, twiceRow(&hostCalls{}, -1), 1500)
+		b, r := batchRun(batched, sql), batchRun(single, sql)
+		if strings.HasPrefix(b, "error") || b != r {
+			t.Fatalf("%s:\nbatched %.200s\nsingle  %.200s", sql, b, r)
+		}
+	}
+}
+
+func TestHostVolatileBatchKernelIsCalledPerRow(t *testing.T) {
+	t.Parallel()
+	// A volatile function's call set stays exactly the scalar one: one-row batches, one per non-NULL
+	// row.
+	calls := &hostCalls{}
+	s := batchDB(t, twiceBatched(calls, VolatilityVolatile, -1), 30)
+	hostRows(t, s, "SELECT host_twice(a) FROM t")
+	want := make([]int, 27)
+	for i := range want {
+		want[i] = 1
+	}
+	if got := calls.get(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("call sizes = %v, want 27 one-row calls", got)
+	}
+}
+
+func TestHostBatchErrorRaisesAtTheScalarRow(t *testing.T) {
+	t.Parallel()
+	// The kernel fails at a = 57. Alone, that is the error; with an earlier per-row error in the same
+	// projection (division by zero at id = 40) the earlier row still wins, exactly as the single-row
+	// kernel orders them.
+	for _, sql := range []string{
+		"SELECT host_twice(a) FROM t",
+		"SELECT 1 / (id - 40), host_twice(a) FROM t",
+		"SELECT host_twice(a), 1 / (id - 40) FROM t",
+		"SELECT host_twice(a), 1 / (id - 60) FROM t",
+	} {
+		batched := batchDB(t, twiceBatched(&hostCalls{}, VolatilityImmutable, 57), 200)
+		single := batchDB(t, twiceRow(&hostCalls{}, 57), 200)
+		b, r := batchRun(batched, sql), batchRun(single, sql)
+		if !strings.HasPrefix(b, "error") || b != r {
+			t.Fatalf("%s:\nbatched %.200s\nsingle  %.200s", sql, b, r)
+		}
+	}
+}
+
+func TestHostBatchCostAbortMatchesRowKernelAndBoundsSpeculation(t *testing.T) {
+	t.Parallel()
+	// Under a ceiling the abort is the single-row kernel's (same code, same accrued cost), and the
+	// prefetch ran the kernel over no more rows than the budget could pay for (§4.2.1).
+	calls := &hostCalls{}
+	batched := batchDB(t, twiceBatched(calls, VolatilityImmutable, -1), 2000)
+	single := batchDB(t, twiceRow(&hostCalls{}, -1), 2000)
+	const budget = 200
+	batched.SetMaxCost(budget)
+	single.SetMaxCost(budget)
+	const sql = "SELECT id, host_twice(a) FROM t"
+	b, r := batchRun(batched, sql), batchRun(single, sql)
+	if !strings.HasPrefix(b, "error 54P01") || b != r {
+		t.Fatalf("batched %.200s\nsingle  %.200s", b, r)
+	}
+	speculated := 0
+	for _, n := range calls.get() {
+		speculated += n
+	}
+	if speculated > budget/5+1 {
+		t.Fatalf("kernel ran over %d rows", speculated)
+	}
+}
+
+func TestHostBatchThroughStreamingCursorMatches(t *testing.T) {
+	t.Parallel()
+	// The lazy Query cursor drives the same buffered projection: same rows, chunked calls.
+	calls := &hostCalls{}
+	s := batchDB(t, twiceBatched(calls, VolatilityImmutable, -1), 1100)
+	rs, err := s.Query(context.Background(), "SELECT host_twice(a) FROM t")
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rs.Close()
+	var rows [][]Value
+	for rs.Next() {
+		rows = append(rows, append([]Value(nil), rs.Row()...))
+	}
+	if err := rs.Err(); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if len(rows) != 1100 {
+		t.Fatalf("got %d rows, want 1100", len(rows))
+	}
+	if rows[0][0].Int != 2 || !rows[9][0].IsNull() {
+		t.Fatalf("rows[0] = %v, rows[9] = %v, want 2 and NULL", rows[0], rows[9])
+	}
+	if got := calls.get(); !reflect.DeepEqual(got, []int{922, 68}) {
+		t.Fatalf("call sizes = %v, want [922 68]", got)
+	}
+}
+
+func TestHostBatchShapeViolationsAre22000(t *testing.T) {
+	t.Parallel()
+	// Too few results on success, and too many, are caught rather than misattributed.
+	shaped := func(extra bool) *HostFunction {
+		return NewHostBatchFunction("host_shape", []string{"i64"}, "i64",
+			func(args [][]Value, out []Value) ([]Value, error) {
+				want := len(args[0]) - 1
+				if extra {
+					want = len(args[0]) + 1
+				}
+				for i := 0; i < want; i++ {
+					out = append(out, IntValue(0))
+				}
+				return out, nil
+			}).WithVolatility(VolatilityImmutable)
+	}
+	for _, extra := range []bool{false, true} {
+		s := batchDB(t, shaped(extra), 20)
+		if _, err := queryOutcome(s, "SELECT host_shape(a) FROM t", nil); errCodeOf(err) != "22000" {
+			t.Fatalf("extra=%v: got %v, want 22000", extra, err)
+		}
+	}
+	// A wrong-typed result in a batch is caught at its own row too.
+	liar := NewHostBatchFunction("host_liar", []string{"i64"}, "i64",
+		func(args [][]Value, out []Value) ([]Value, error) {
+			for range args[0] {
+				out = append(out, TextValue("oops"))
+			}
+			return out, nil
+		}).WithVolatility(VolatilityImmutable)
+	s := batchDB(t, liar, 20)
+	if _, err := queryOutcome(s, "SELECT host_liar(a) FROM t", nil); errCodeOf(err) != "22000" {
+		t.Fatalf("wrong-typed batch result: got %v, want 22000", err)
+	}
+}
+
+func TestHostBatchKernelServesALoneCall(t *testing.T) {
+	t.Parallel()
+	// Outside a prefetching site (a FROM-less SELECT, a WHERE filter) a batch kernel is handed a
+	// one-row batch.
+	calls := &hostCalls{}
+	s := batchDB(t, twiceBatched(calls, VolatilityImmutable, -1), 5)
+	if v := oneVal(t, s, "SELECT host_twice(21)"); v.Int != 42 {
+		t.Fatalf("host_twice(21) = %v, want 42", v)
+	}
+	rows := hostRows(t, s, "SELECT id FROM t WHERE host_twice(a) = 6")
+	if len(rows) != 1 || rows[0][0].Int != 3 {
+		t.Fatalf("WHERE host_twice(a) = 6 → %v, want [[3]]", rows)
+	}
+	if got := calls.get(); !reflect.DeepEqual(got, []int{1, 1, 1, 1, 1, 1}) {
+		t.Fatalf("call sizes = %v, want six one-row calls", got)
 	}
 }

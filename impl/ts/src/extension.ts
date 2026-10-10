@@ -11,14 +11,18 @@
 //     a NULL.
 //   - Exact scalar signatures — (name, ScalarType[]) → ScalarType, matched by equality (no implicit
 //     promotion). A built-in overload always wins over a host one (§4.2).
-//   - Single-row kernels ("batch-of-one"); the vectorized ABI is a follow-on.
+//   - Batched kernels (§4.2.1) — every host function runs through ONE column-in → column-out batch
+//     kernel ABI. A host registers either a batch kernel (`batchKernel`) or a single-row kernel
+//     (`kernel`), which a batch evaluation loops over. The executor prefetches a batch at the sites
+//     that hold a chunk of rows and replays the row-at-a-time evaluation against it, so cost, error
+//     order, and results are identical to batch-of-one by construction.
 //
 // `volatility` and `crossCore` are RECORDED forward-compat (only "immutable" will later admit
 // constant-folding / index-backing; `crossCore` governs the §10 determinism ledger — jed has no
 // runtime taint yet, for floats or anything). `cost` IS enforced: the declared static weight
 // (cost.md §6 design (a)) is charged per call.
 
-import { engineError } from "./errors.ts";
+import { type EngineError, engineError } from "./errors.ts";
 import { ALL_SCALAR_TYPES, type ScalarType } from "./types.ts";
 import type { Value } from "./value.ts";
 
@@ -31,6 +35,20 @@ export type Volatility = "immutable" | "stable" | "volatile";
 // EngineError. STRICT — never invoked with a NULL argument (the engine short-circuits NULL→NULL).
 export type HostKernel = (args: Value[]) => Value;
 
+// A host BATCH kernel (extensibility.md §4.2.1) — the column-in → column-out ABI every host function
+// is evaluated through. `args` is column-major: args[j][i] is argument j of row i; every column has
+// the same length n ≥ 1 and holds no NULL (strict — a row with a NULL argument is never sent). The
+// kernel pushes one result per row, in row order, to `out` (handed in empty). On a throw, out.length
+// is the index of the failing row — the rows before it succeeded — so a batch raises for the same row
+// a single-row call would. Must be the row-wise map of a scalar function: result i depends only on
+// row i's arguments.
+export type HostBatchKernel = (args: Value[][], out: Value[]) => void;
+
+// One row's outcome of a batch call (HostFuncEntry.callBatch): a returned result, or the error the
+// kernel raised for that row. A row after a reported error has no outcome (undefined — never
+// computed).
+export type HostOutcome = { value: Value } | { error: unknown };
+
 // The spec a host passes to ExtensionRegistry.registerFunction. `argTypes`/`result` are canonical
 // ScalarType names ("i64", "text", …). Optional fields default to safe values (Volatile, not
 // cross-core, unit cost) — matching Rust/Go so a function registered identically on every core
@@ -39,7 +57,10 @@ export interface HostFunctionSpec {
   name: string;
   argTypes: ScalarType[];
   result: ScalarType;
-  kernel: HostKernel;
+  // Exactly ONE of `kernel` (a single-row kernel) or `batchKernel` (a column-in → column-out batch
+  // kernel, §4.2.1) must be given; either shape serves every evaluation.
+  kernel?: HostKernel;
+  batchKernel?: HostBatchKernel;
   volatility?: Volatility;
   crossCore?: boolean;
   cost?: bigint;
@@ -59,19 +80,100 @@ export interface HostFunctionSpec {
 }
 
 // A registered host function (the internal, defaults-resolved form).
-interface HostFuncEntry {
-  name: string;
-  argTypes: ScalarType[];
-  result: ScalarType;
-  volatility: Volatility;
-  crossCore: boolean;
-  cost: bigint;
+export class HostFuncEntry {
+  readonly name: string;
+  readonly argTypes: ScalarType[];
+  readonly result: ScalarType;
+  readonly volatility: Volatility;
+  readonly crossCore: boolean;
+  readonly cost: bigint;
   // The host's stable component identity at registration, or null for an ad-hoc-query-only function
   // (extensibility.md §7, step 4). Required to back a persisted index (§8.1).
-  componentId: string | null;
+  readonly componentId: string | null;
   // The host's semantic version at registration (extensibility.md §7). Default 0.
-  semanticVersion: number;
-  kernel: HostKernel;
+  readonly semanticVersion: number;
+  // The kernel the host registered — exactly one is set (§4.2.1): a single-row kernel is looped over
+  // a batch, and a batch kernel is handed a one-row batch for a lone call.
+  private readonly kernel: HostKernel | null;
+  private readonly batchKernel: HostBatchKernel | null;
+
+  constructor(
+    name: string,
+    spec: HostFunctionSpec,
+    cost: bigint,
+    kernel: HostKernel | null,
+    batchKernel: HostBatchKernel | null,
+  ) {
+    this.name = name;
+    this.argTypes = [...spec.argTypes];
+    this.result = spec.result;
+    this.volatility = spec.volatility ?? "volatile";
+    this.crossCore = spec.crossCore ?? false;
+    this.cost = cost;
+    this.componentId = spec.componentId ?? null;
+    this.semanticVersion = spec.semanticVersion ?? 0;
+    this.kernel = kernel;
+    this.batchKernel = batchKernel;
+  }
+
+  // Whether the executor may prefetch this function's results in a batch ahead of the row-at-a-time
+  // replay (§4.2.1): any rung but "volatile", whose call set must stay exactly the scalar one.
+  batchable(): boolean {
+    return this.volatility !== "volatile";
+  }
+
+  // Call the kernel for ONE row (`args` non-NULL, one per parameter) — the batch-of-one path of every
+  // site that does not prefetch. A single-row kernel's throw propagates unchanged; a batch kernel is
+  // handed a one-row batch and held to the same shape rules as callBatch.
+  callOne(args: Value[]): Value {
+    if (this.kernel !== null) return this.kernel(args);
+    const outcome = this.callBatch(
+      args.map((v) => [v]),
+      1,
+    )[0]!;
+    if ("error" in outcome) throw outcome.error;
+    return outcome.value;
+  }
+
+  // Run the kernel over `args` (column-major, n ≥ 1 rows, no NULLs) and return one outcome per row:
+  // {value} for a returned result, {error} for the row the kernel reported failing, and undefined for
+  // every row after it (never computed). Enforces the ABI shape (§4.2.1, all 22000): a normal return
+  // with too few results fails at the first unanswered row; too many results, or a throw after
+  // answering every row, fails at the first row. Results are NOT type-checked here — the replay does
+  // that per row, so a type error surfaces at its own row.
+  callBatch(args: Value[][], n: number): (HostOutcome | undefined)[] {
+    const out: Value[] = [];
+    let failed = false;
+    let err: unknown;
+    try {
+      if (this.batchKernel !== null) {
+        this.batchKernel(args, out);
+      } else {
+        const k = this.kernel!;
+        for (let i = 0; i < n; i++) out.push(k(args.map((col) => col[i]!)));
+      }
+    } catch (e) {
+      failed = true;
+      err = e;
+    }
+    const outcomes: (HostOutcome | undefined)[] = [];
+    const got = out.length;
+    if (got > n || (got === n && failed)) {
+      outcomes.push({ error: this.shapeError(n, got) });
+    } else {
+      for (const v of out) outcomes.push({ value: v });
+      if (got < n) outcomes.push({ error: failed ? err : this.shapeError(n, got) });
+    }
+    while (outcomes.length < n) outcomes.push(undefined);
+    return outcomes;
+  }
+
+  private shapeError(n: number, got: number): EngineError {
+    return engineError(
+      "data_exception",
+      `host function ${this.name} returned ${got} results for a batch of ${n} rows`,
+    );
+  }
 }
 
 // The immutable set of host extensions supplied at open/create and FROZEN for the database handle's
@@ -81,10 +183,11 @@ interface HostFuncEntry {
 export class ExtensionRegistry {
   private readonly functions: HostFuncEntry[] = [];
 
-  // Register a host scalar function. Throws on a negative cost (22023), an unknown argument/result
-  // type (42704), or a second function with an identical (name, argTypes) signature (42723 —
-  // signature-level, not name-level: a host may overload a name across argument types, §4.2). A
-  // signature that shadows a built-in is accepted but never reached (built-ins win).
+  // Register a host scalar function. Throws on a negative cost or not exactly one of kernel /
+  // batchKernel (22023), an unknown argument/result type (42704), or a second function with an
+  // identical (name, argTypes) signature (42723 — signature-level, not name-level: a host may overload
+  // a name across argument types, §4.2). A signature that shadows a built-in is accepted but never
+  // reached (built-ins win).
   registerFunction(spec: HostFunctionSpec): void {
     const name = spec.name.toLowerCase();
     const cost = spec.cost ?? 1n;
@@ -92,6 +195,13 @@ export class ExtensionRegistry {
       throw engineError(
         "invalid_parameter_value",
         `host function ${name}: cost must be non-negative`,
+      );
+    const kernel = spec.kernel ?? null;
+    const batchKernel = spec.batchKernel ?? null;
+    if ((kernel === null) === (batchKernel === null))
+      throw engineError(
+        "invalid_parameter_value",
+        `host function ${name}: exactly one of kernel or batchKernel must be given`,
       );
     for (const t of spec.argTypes)
       if (!isScalarType(t))
@@ -107,17 +217,7 @@ export class ExtensionRegistry {
           "duplicate_function",
           `host function ${name} already registered with this signature`,
         );
-    this.functions.push({
-      name,
-      argTypes: [...spec.argTypes],
-      result: spec.result,
-      volatility: spec.volatility ?? "volatile",
-      crossCore: spec.crossCore ?? false,
-      cost,
-      componentId: spec.componentId ?? null,
-      semanticVersion: spec.semanticVersion ?? 0,
-      kernel: spec.kernel,
-    });
+    this.functions.push(new HostFuncEntry(name, spec, cost, kernel, batchKernel));
   }
 
   // Whether any registered host function has this (lowercased) name — the resolve-time routing gate.

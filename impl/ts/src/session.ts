@@ -27,6 +27,7 @@ import type { Value } from "./value.ts";
 import type { Row } from "./storage.ts";
 import { isTrue, nullValue } from "./value.ts";
 import { evalExpr } from "./eval.ts";
+import { HostBatch } from "./host_batch.ts";
 import { COSTS, DEFAULT_SCALAR_BYTES } from "./costs.ts";
 import { entryBytes } from "./memsize.ts";
 import type { TableStore } from "./storage.ts";
@@ -765,6 +766,11 @@ export function* bufferedRows(
     }
     return;
   }
+  // The projection's host-function batch prefetch (extensibility.md §4.2.1), if any call in it is
+  // eligible: host calls prefetch a chunk at a time and replay row by row.
+  const batch =
+    em.mode === "project" ? HostBatch.forExprs(plan.projections, engine.session.extensions) : null;
+  const benv: EvalEnv = batch === null ? env : { ...env, hostBatch: batch };
   for (let i = em.start; i < em.end; i++) {
     meter.guard(); // enforce the cost ceiling / cancellation per produced row (CLAUDE.md §13)
     meter.charge(COSTS.rowProduced);
@@ -773,7 +779,10 @@ export function* bufferedRows(
       const row = em.rows[i]!;
       meter.releaseRow(row);
       yield row;
-    } else yield plan.projections.map((p) => evalExpr(p, em.rows[i]!, env, meter));
+    } else {
+      batch?.setRow(i, em.rows, em.end, env, meter);
+      yield plan.projections.map((p) => evalExpr(p, em.rows[i]!, benv, meter));
+    }
   }
 }
 

@@ -4,7 +4,7 @@
 
 <svelte:head>
 	<title>Host functions — jed</title>
-	<meta name="description" content="Register your own scalar functions over jed's built-in types: a frozen ExtensionRegistry supplied at open/create, resolved and evaluated beside the built-in catalog. Strict, exact-typed, cost-metered." />
+	<meta name="description" content="Register your own scalar functions over jed's built-in types: a frozen ExtensionRegistry supplied at open/create, resolved and evaluated beside the built-in catalog. Strict, exact-typed, cost-metered, with single-row or batch kernels." />
 </svelte:head>
 
 # Host functions
@@ -44,6 +44,28 @@ Two behaviors are guaranteed and free:
 - **Result-type checked.** A kernel that returns a value not matching its declared result type is
   caught (`22000`), so a misbehaving host function cannot leak a wrong-typed value into jed's strict
   type system.
+
+## Batch kernels
+
+A kernel can take one row at a time, as above, or a **whole column of rows per call**. A batch
+kernel receives its arguments **column-major** — `args[j][i]` is argument `j` of row `i`, never
+NULL — and appends one result per row, in order, to an output column. To fail, it stops at the
+failing row and raises; the results it already appended mark which row that was, so the error is
+reported for exactly the row a one-row kernel would have failed on.
+
+Both forms behave identically from SQL — same rows, same cost, same errors in the same order. The
+difference is how often your code is entered: where jed already holds a chunk of rows (a projection
+over a filtered or joined result), it calls a non-`volatile` batch kernel once per chunk of up to
+1,024 rows, then replays the row-by-row evaluation against those results. That matters most when a
+call crosses a language boundary — a binding that wraps jed in another language pays the crossing
+once per chunk instead of once per row. A `volatile` function is always called one row at a time,
+so its calls happen exactly as a one-row kernel's would.
+
+Because jed may compute a chunk ahead of the rows it emits, a batch kernel can run on rows a query
+never returns — the tail of a chunk after a `LIMIT` is satisfied, or after an earlier error. Your
+kernel must be a plain per-row map: result `i` depends only on row `i`'s arguments. On a session
+with a cost ceiling, the chunk is capped at what the remaining budget could pay for at the declared
+`cost`, so the speculation stays bounded.
 
 ## Resolution: built-ins win
 
@@ -90,6 +112,7 @@ owns that decision. The engine's one mechanical defense is the **cost gate** abo
 only a function that declared its cost. That is the whole trade: jed gives you a clean, first-class
 extension seam and a legible line where your code takes over.
 
-The surface is still deliberately narrow — **strict**, **exact scalar signatures** (no implicit
-promotion), and **single-row** kernels (the vectorized/batched ABI is a follow-on). Host functions in
-`DEFAULT`/`CHECK` columns, host *types*, and non-strict functions come later.
+The surface is still deliberately narrow — **strict** and **exact scalar signatures** (no implicit
+promotion). Host functions in `DEFAULT`/`CHECK` columns, host *types*, and non-strict functions come
+later, as does batching at more sites (filters, streaming scans, writes, index builds — today they
+call a batch kernel with one row).

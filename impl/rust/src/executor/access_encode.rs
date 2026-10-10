@@ -6448,6 +6448,9 @@ pub(crate) struct EvalEnv<'a> {
     /// The statement's CTE execution context (spec/design/cte.md §5), so a FROM reference at any
     /// nesting depth delivers a CTE's rows. `CteCtx::empty()` for every non-`WITH` statement.
     pub(crate) ctes: CteCtx<'a>,
+    /// The evaluating site's prefetched host-function outcomes (extensibility.md §4.2.1), or `None`
+    /// — a host call then invokes its kernel for the current row alone.
+    pub(crate) host_batch: Option<&'a HostBatch>,
 }
 
 /// Whether `plan` is the single-table, no-blocking-operator **streaming scan** shape

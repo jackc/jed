@@ -99,6 +99,7 @@ import {
   resolveColType,
 } from "./catalog.ts";
 import { Meter, type QueryAccount, queryMemoryPeak, StateCharge } from "./cost.ts";
+import { HostBatch } from "./host_batch.ts";
 import { optimizeSelect } from "./optimize.ts";
 import {
   type WherePushdown,
@@ -16348,10 +16349,15 @@ export class Engine {
       }
       return out;
     }
+    // Host calls in the projection prefetch a chunk at a time and replay row by row
+    // (extensibility.md §4.2.1).
+    const batch = HostBatch.forExprs(plan.projections, this.session.extensions);
+    const benv: EvalEnv = batch === null ? env : { ...env, hostBatch: batch };
     for (let i = em.start; i < em.end; i++) {
       meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
       meter.charge(COSTS.rowProduced);
-      const o = plan.projections.map((p) => evalExpr(p, em.rows[i]!, env, meter));
+      batch?.setRow(i, em.rows, em.end, env, meter);
+      const o = plan.projections.map((p) => evalExpr(p, em.rows[i]!, benv, meter));
       meter.admitRow(o); // the buffered result collector (memory.md §5.1)
       out.push(o);
     }
@@ -26426,6 +26432,9 @@ export type EvalEnv = {
   // §4/§6) can resolve a name to a catalog sequence and advance/read it (mirrors Rust's env.exec —
   // the same access the clock seam already uses). Only nextval/currval touch it.
   exec: Engine;
+  // The evaluating site's prefetched host-function outcomes (extensibility.md §4.2.1), or undefined —
+  // a host call then invokes its kernel for the current row alone.
+  hostBatch?: HostBatch;
 };
 
 // ============================================================================

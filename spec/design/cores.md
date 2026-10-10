@@ -100,6 +100,10 @@ registers its own SQL functions:
 The mitigation that keeps a wrap viable: **design the host-function API vectorized /
 batched** (a column of values per crossing, not one row at a time), so the boundary is
 amortized. Decide this early — it is what determines whether wrapping is on the table at all.
+**Landed:** every core evaluates host functions through a column-in → column-out batch kernel
+([extensibility.md](extensibility.md) §4.2.1), called once per chunk at the buffered projection with
+results, cost, and errors identical to one-row calls. A wrapped binding can therefore cross the
+boundary once per chunk; more sites batching (streaming scans, filters, writes) are follow-ons.
 
 ### 2.2 Deciding factor — parallelism (where the threads live)
 

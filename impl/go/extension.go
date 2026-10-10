@@ -1,5 +1,7 @@
 package jed
 
+import "fmt"
+
 // Host extensions (spec/design/extensibility.md §4.2 / §5.1 / §7) — the injection seam a host
 // application uses to register its own SCALAR FUNCTIONS OVER EXISTING TYPES. This is delivery step 3
 // (extensibility.md §14): runtime host functions, resolved + evaluated through a registry the host
@@ -13,7 +15,11 @@ package jed
 //     a NULL.
 //   - Exact scalar signatures — (name, []scalarType) → scalarType, matched by equality (no implicit
 //     promotion). A built-in overload always wins over a host one (§4.2).
-//   - Single-row kernels ("batch-of-one"); the vectorized ABI is a follow-on.
+//   - Batched kernels (§4.2.1) — every host function runs through ONE column-in → column-out batch
+//     kernel ABI. A host registers either a batch kernel (NewHostBatchFunction) or a single-row kernel
+//     (NewHostFunction), which a batch evaluation loops over. The executor prefetches a batch at the
+//     sites that hold a chunk of rows and replays the row-at-a-time evaluation against it, so cost,
+//     error order, and results are identical to batch-of-one by construction.
 //
 // `Volatility` and `CrossCore` are RECORDED forward-compat (only Immutable will later admit
 // constant-folding / index-backing; CrossCore governs the §10 determinism ledger — jed has no
@@ -39,9 +45,18 @@ const (
 // with a NULL argument (the engine short-circuits NULL→NULL, §4.2).
 type HostKernel func(args []Value) (Value, error)
 
+// HostBatchKernel is a host BATCH kernel (extensibility.md §4.2.1) — the column-in → column-out ABI
+// every host function is evaluated through. args is column-major: args[j][i] is argument j of row i;
+// every column has the same length n ≥ 1 and holds no NULL (strict — a row with a NULL argument is
+// never sent). The kernel appends one result per row, in row order, to out (handed in empty) and
+// returns it. On error, the length of the returned slice is the index of the failing row — the rows
+// before it succeeded — so a batch raises for the same row a single-row call would. Must be the
+// row-wise map of a scalar function: result i depends only on row i's arguments.
+type HostBatchKernel func(args [][]Value, out []Value) ([]Value, error)
+
 // HostFunction is a host scalar function to register (extensibility.md §4.2). Build it with
-// NewHostFunction (safe defaults: Volatile, not cross-core, unit cost) and refine with the fluent
-// setters. Argument/result types are canonical scalar type NAMES ("i64", "text", "f64", … — the
+// NewHostFunction (a single-row kernel) or NewHostBatchFunction (a batch kernel, §4.2.1) — safe
+// defaults: Volatile, not cross-core, unit cost — and refine with the fluent setters. Argument/result types are canonical scalar type NAMES ("i64", "text", "f64", … — the
 // spellings scalarTypeFromName accepts), resolved at RegisterFunction.
 type HostFunction struct {
 	name         string
@@ -62,11 +77,17 @@ type HostFunction struct {
 	// the version it was built against; a mismatch on reopen forces a rebuild, never a silent stale-key
 	// read. Default 0.
 	semanticVersion uint32
-	kernel          HostKernel
+	// Exactly one of kernel / batchKernel is set — either shape serves every evaluation (§4.2.1): a
+	// single-row kernel is looped over a batch, and a batch kernel is handed a one-row batch for a lone
+	// call.
+	kernel      HostKernel
+	batchKernel HostBatchKernel
 }
 
-// NewHostFunction builds a host scalar function with safe defaults — Volatile, not
-// cross-core-deterministic, unit cost. Refine with WithVolatility / WithCrossCore / WithCost.
+// NewHostFunction builds a host scalar function with a SINGLE-ROW kernel and safe defaults — Volatile,
+// not cross-core-deterministic, unit cost. Refine with WithVolatility / WithCrossCore / WithCost. A
+// batch evaluation calls it once per row (§4.2.1); use NewHostBatchFunction to take a whole column per
+// call instead.
 func NewHostFunction(name string, argTypes []string, resultType string, kernel HostKernel) *HostFunction {
 	return &HostFunction{
 		name:         toLowerASCII(name),
@@ -76,6 +97,21 @@ func NewHostFunction(name string, argTypes []string, resultType string, kernel H
 		crossCore:    false,
 		cost:         1,
 		kernel:       kernel,
+	}
+}
+
+// NewHostBatchFunction builds a host scalar function with a BATCH kernel (extensibility.md §4.2.1) —
+// one call per column of rows rather than per row, which amortizes a per-call boundary. Same safe
+// defaults as NewHostFunction.
+func NewHostBatchFunction(name string, argTypes []string, resultType string, kernel HostBatchKernel) *HostFunction {
+	return &HostFunction{
+		name:         toLowerASCII(name),
+		argTypeNames: argTypes,
+		resultName:   resultType,
+		volatility:   VolatilityVolatile,
+		crossCore:    false,
+		cost:         1,
+		batchKernel:  kernel,
 	}
 }
 
@@ -114,7 +150,82 @@ type hostFuncEntry struct {
 	// componentID ⇒ the function may NOT back a persisted index expression (42P17 at CREATE INDEX).
 	componentID     *string
 	semanticVersion uint32
-	kernel          HostKernel
+	kernel          HostKernel      // the single-row kernel, or nil when batchKernel is set
+	batchKernel     HostBatchKernel // the batch kernel, or nil when kernel is set
+}
+
+// hostOutcome is one row's outcome of a batch kernel call (§4.2.1): the returned value, the error the
+// kernel reported for this row, or — computed false — a row after the failing one, never computed.
+type hostOutcome struct {
+	value    Value
+	err      error
+	computed bool
+}
+
+// batchable reports whether the executor may prefetch this function's results in a batch ahead of the
+// row-at-a-time replay (§4.2.1): any rung but Volatile, whose call set must stay exactly the scalar one.
+func (f *hostFuncEntry) batchable() bool { return f.volatility != VolatilityVolatile }
+
+// callOne calls the kernel for ONE row (args non-NULL, one per parameter) — the batch-of-one path of
+// every site that does not prefetch. A batch kernel is handed a one-row batch and held to the same
+// shape rules as callBatch.
+func (f *hostFuncEntry) callOne(args []Value) (Value, error) {
+	if f.batchKernel == nil {
+		return f.kernel(args)
+	}
+	cols := make([][]Value, len(args))
+	for j, v := range args {
+		cols[j] = []Value{v}
+	}
+	o := f.callBatch(cols, 1)[0]
+	return o.value, o.err
+}
+
+// callBatch runs the kernel over args (column-major, n ≥ 1 rows, no NULLs) and returns one outcome per
+// row: a value for a returned result, an error for the row the kernel reported failing, and a
+// not-computed outcome for every row after it. Enforces the ABI shape (§4.2.1, all 22000): a successful
+// return with too few results fails at the first unanswered row; too many results, or an error after
+// answering every row, fails at the first row. Results are NOT type-checked here — the replay does
+// that per row, so a type error surfaces at its own row.
+func (f *hostFuncEntry) callBatch(args [][]Value, n int) []hostOutcome {
+	var out []Value
+	var err error
+	if f.batchKernel != nil {
+		out, err = f.batchKernel(args, make([]Value, 0, n))
+	} else {
+		out = make([]Value, 0, n)
+		row := make([]Value, len(args))
+		for i := 0; i < n; i++ {
+			for j, col := range args {
+				row[j] = col[i]
+			}
+			var v Value
+			if v, err = f.kernel(row); err != nil {
+				break
+			}
+			out = append(out, v)
+		}
+	}
+	outcomes := make([]hostOutcome, n)
+	got := len(out)
+	if got > n || (got == n && err != nil) {
+		outcomes[0] = hostOutcome{err: f.shapeError(n, got), computed: true}
+		return outcomes
+	}
+	for i, v := range out {
+		outcomes[i] = hostOutcome{value: v, computed: true}
+	}
+	if got < n {
+		if err == nil {
+			err = f.shapeError(n, got)
+		}
+		outcomes[got] = hostOutcome{err: err, computed: true}
+	}
+	return outcomes
+}
+
+func (f *hostFuncEntry) shapeError(n, got int) error {
+	return newError(DataException, fmt.Sprintf("host function %s returned %d results for a batch of %d rows", f.name, got, n))
 }
 
 // ExtensionRegistry is the immutable set of host extensions supplied at open/create and FROZEN for
@@ -163,6 +274,7 @@ func (r *ExtensionRegistry) RegisterFunction(f *HostFunction) error {
 		componentID:     f.componentID,
 		semanticVersion: f.semanticVersion,
 		kernel:          f.kernel,
+		batchKernel:     f.batchKernel,
 	})
 	return nil
 }

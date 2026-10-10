@@ -557,6 +557,9 @@ type bufferedScanCursor struct {
 	em     emitter // the emission descriptor, valid once ran
 	idx    int64   // next row index: [em.start, em.end) for buffer modes, [0, len) for emitFinal
 	done   bool    // exhausted or closed — then nextRow is a no-op
+	// batch is the emitProject projection's host-function batch prefetch (extensibility.md §4.2.1),
+	// or nil when no call in it is eligible. Built once the blocking part has run.
+	batch *hostBatch
 }
 
 func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
@@ -575,6 +578,9 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 		c.ran = true
 		if em.mode != emitFinal {
 			c.idx = em.start
+		}
+		if em.mode == emitProject {
+			c.batch = newHostBatch(c.plan.projections, c.eng.session.extensions)
 		}
 	}
 	switch c.em.mode {
@@ -672,13 +678,17 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 			c.done = true
 			return nil, false, nil
 		}
-		row := c.em.src[c.idx]
+		ri := int(c.idx)
+		row := c.em.src[ri]
 		c.idx++
 		if err := c.meter.Guard(); err != nil { // enforce the cost ceiling / cancellation per produced row
 			return nil, false, err
 		}
 		c.meter.Charge(costs.RowProduced)
-		env := &evalEnv{exec: c.eng, params: c.params, outer: nil, rng: c.rng, ctes: cteCtx{}}
+		env := &evalEnv{exec: c.eng, params: c.params, outer: nil, rng: c.rng, ctes: cteCtx{}, hostBatch: c.batch}
+		if c.batch != nil {
+			c.batch.setRow(ri, c.em.src, int(c.em.end), env, c.meter)
+		}
 		projected := make([]Value, len(c.plan.projections))
 		for i, p := range c.plan.projections {
 			v, perr := p.eval(row, env, c.meter)

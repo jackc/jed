@@ -1091,6 +1091,7 @@ impl Engine {
             outer: &[],
             rng,
             ctes: CteCtx::empty(),
+            host_batch: None,
         };
         for values in &rows {
             let mut row = Vec::with_capacity(n);
@@ -1385,6 +1386,7 @@ impl Engine {
             outer: &[],
             rng,
             ctes: CteCtx::empty(),
+            host_batch: None,
         };
 
         let key = if pk.is_empty() {
@@ -1823,6 +1825,7 @@ impl Engine {
                                     outer: &[],
                                     rng,
                                     ctes: CteCtx::empty(),
+                                    host_batch: None,
                                 };
                                 // An optional WHERE that is not TRUE skips the update (existing row
                                 // unchanged, not returned) — but the arbiter key was already
@@ -2140,6 +2143,7 @@ impl Engine {
             outer: &[],
             rng,
             ctes: CteCtx::empty(),
+            host_batch: None,
         };
         for (name, rexpr) in checks {
             if matches!(rexpr.eval(row, &env, meter)?, Value::Bool(false)) {
@@ -2330,6 +2334,7 @@ impl Engine {
             outer: &[],
             rng: &stmt_rng,
             ctes,
+            host_batch: None,
         };
         let mut out = Vec::with_capacity(rows.len());
         for (i, &row) in rows.iter().enumerate() {
@@ -2842,6 +2847,7 @@ impl Engine {
             outer: &[],
             rng: &stmt_rng,
             ctes: ctx,
+            host_batch: None,
         };
         // DELETE's touched set (cost.md §3): the filter's columns plus the RETURNING items'
         // OLD-side references — a returned old value is a logical read of the dropped row,
@@ -3260,6 +3266,7 @@ impl Engine {
             outer: &[],
             rng: &stmt_rng,
             ctes: ctx,
+            host_batch: None,
         };
         // UPDATE's touched set (cost.md §3): the filter's columns, every assignment SOURCE's,
         // and the RETURNING items' — the NEW side minus the assigned columns (an assigned

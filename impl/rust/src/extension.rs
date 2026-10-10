@@ -18,8 +18,11 @@
 //   * EXACT scalar signatures — `(name, [ScalarType]) → ScalarType`. Overload resolution matches the
 //     resolved argument scalar types exactly; no implicit promotion (a promotion/family-pattern
 //     signature is a follow-on). A built-in overload always wins over a host one (§4.2).
-//   * SINGLE-ROW kernels ("batch-of-one", §14 step 3) — the vectorized/batched column ABI is a
-//     follow-on; the executor calls the kernel once per row.
+//   * BATCHED kernels (§4.2.1) — every host function runs through ONE column-in → column-out batch
+//     kernel ABI. A host registers either a batch kernel ([`HostFunction::batched`]) or a single-row
+//     kernel ([`HostFunction::new`]), which a batch evaluation loops over. The executor prefetches
+//     a batch at the sites that hold a chunk of rows and replays the row-at-a-time evaluation against
+//     it, so cost, error order, and results are identical to batch-of-one by construction.
 //
 // Two forward-looking declarations are RECORDED but not yet enforced this slice: `volatility` (only
 // `Immutable` will later admit constant-folding / index-backing — no host function is folded now) and
@@ -51,6 +54,15 @@ pub enum Volatility {
 /// handle across threads exactly like the rest of the shared core.
 pub type HostKernel = Box<dyn Fn(&[Value]) -> Result<Value> + Send + Sync>;
 
+/// A host **batch** kernel (extensibility.md §4.2.1) — the column-in → column-out ABI every host
+/// function is evaluated through. `args` is column-major: `args[j][i]` is argument `j` of row `i`; every
+/// column has the same length `n ≥ 1` and holds no NULL (strict — a row with a NULL argument is never
+/// sent). The kernel appends one result per row, in row order, to `out` (handed in empty). On `Err`,
+/// the number of results it appended is the index of the failing row — the rows before it succeeded —
+/// so a batch raises for the same row a single-row call would. Must be the row-wise map of a scalar
+/// function: result `i` depends only on row `i`'s arguments.
+pub type HostBatchKernel = Box<dyn Fn(&[Vec<Value>], &mut Vec<Value>) -> Result<()> + Send + Sync>;
+
 /// One registered host scalar function (extensibility.md §4.2). Built with [`HostFunction::new`]
 /// (safe defaults: `Volatile`, not cross-core, unit cost) and refined with the builder setters.
 pub struct HostFunction {
@@ -79,18 +91,47 @@ pub struct HostFunction {
     /// dependent index persists the version it was built against; a mismatch on reopen forces the
     /// index unusable (rebuild required), never a silent stale-key read. Default `0`.
     pub(crate) semantic_version: u32,
-    pub(crate) kernel: HostKernel,
+    pub(crate) kernel: Kernel,
+}
+
+/// The kernel a host registered — either shape serves every evaluation (§4.2.1): a single-row kernel
+/// is looped over a batch, and a batch kernel is handed a one-row batch for a lone call.
+pub(crate) enum Kernel {
+    Row(HostKernel),
+    Batch(HostBatchKernel),
 }
 
 impl HostFunction {
-    /// A host scalar function with safe defaults — `Volatile`, not cross-core-deterministic, unit
-    /// cost. Refine with [`volatility`](Self::volatility) / [`cross_core`](Self::cross_core) /
-    /// [`cost`](Self::cost).
+    /// A host scalar function with a **single-row** kernel and safe defaults — `Volatile`, not
+    /// cross-core-deterministic, unit cost. Refine with [`volatility`](Self::volatility) /
+    /// [`cross_core`](Self::cross_core) / [`cost`](Self::cost). A batch evaluation calls it once per
+    /// row (§4.2.1); use [`batched`](Self::batched) to take a whole column per call instead.
     pub fn new(
         name: impl Into<String>,
         arg_types: Vec<ScalarType>,
         result: ScalarType,
         kernel: HostKernel,
+    ) -> Self {
+        HostFunction::with_kernel(name, arg_types, result, Kernel::Row(kernel))
+    }
+
+    /// A host scalar function with a **batch** kernel (extensibility.md §4.2.1) — one call per
+    /// column of rows rather than per row, which amortizes a per-call boundary (an FFI upcall in a
+    /// wrapped core). Same safe defaults as [`new`](Self::new).
+    pub fn batched(
+        name: impl Into<String>,
+        arg_types: Vec<ScalarType>,
+        result: ScalarType,
+        kernel: HostBatchKernel,
+    ) -> Self {
+        HostFunction::with_kernel(name, arg_types, result, Kernel::Batch(kernel))
+    }
+
+    fn with_kernel(
+        name: impl Into<String>,
+        arg_types: Vec<ScalarType>,
+        result: ScalarType,
+        kernel: Kernel,
     ) -> Self {
         HostFunction {
             name: name.into().to_ascii_lowercase(),
@@ -139,6 +180,75 @@ impl HostFunction {
     pub fn semantic_version(mut self, v: u32) -> Self {
         self.semantic_version = v;
         self
+    }
+
+    /// Whether the executor may prefetch this function's results in a batch ahead of the row-at-a-time
+    /// replay (§4.2.1): any rung but `Volatile`, whose call set must stay exactly the scalar one.
+    pub(crate) fn batchable(&self) -> bool {
+        self.volatility != Volatility::Volatile
+    }
+
+    /// Call the kernel for ONE row (`args` non-NULL, one per parameter) — the batch-of-one path of
+    /// every site that does not prefetch. A batch kernel is handed a one-row batch and held to the
+    /// same shape rules as [`call_batch`](Self::call_batch).
+    pub(crate) fn call_one(&self, args: Vec<Value>) -> Result<Value> {
+        match &self.kernel {
+            Kernel::Row(k) => k(&args),
+            Kernel::Batch(_) => {
+                let cols: Vec<Vec<Value>> = args.into_iter().map(|v| vec![v]).collect();
+                self.call_batch(&cols, 1)
+                    .pop()
+                    .flatten()
+                    .expect("a one-row batch yields one outcome")
+            }
+        }
+    }
+
+    /// Run the kernel over `args` (column-major, `n ≥ 1` rows, no NULLs) and return one outcome per
+    /// row: `Some(Ok(v))` for a returned result, `Some(Err(e))` for the row the kernel reported
+    /// failing, and `None` for every row after it (never computed). Enforces the ABI shape (§4.2.1,
+    /// all `22000`): a successful return with too few results fails at the first unanswered row; too
+    /// many results, or an error after answering every row, fails at the first row. Results are NOT
+    /// type-checked here — the replay does that per row, so a type error surfaces at its own row.
+    pub(crate) fn call_batch(&self, args: &[Vec<Value>], n: usize) -> Vec<Option<Result<Value>>> {
+        let mut out = Vec::with_capacity(n);
+        let res = match &self.kernel {
+            Kernel::Batch(k) => k(args, &mut out),
+            Kernel::Row(k) => (|| {
+                let mut row = Vec::with_capacity(args.len());
+                for i in 0..n {
+                    row.clear();
+                    row.extend(args.iter().map(|col| col[i].clone()));
+                    out.push(k(&row)?);
+                }
+                Ok(())
+            })(),
+        };
+        let mut outcomes: Vec<Option<Result<Value>>> = Vec::with_capacity(n);
+        let got = out.len();
+        if got > n || (got == n && res.is_err()) {
+            outcomes.push(Some(Err(self.shape_error(n, got))));
+        } else {
+            outcomes.extend(out.into_iter().map(|v| Some(Ok(v))));
+            if got < n {
+                outcomes.push(Some(Err(match res {
+                    Err(e) => e,
+                    Ok(()) => self.shape_error(n, got),
+                })));
+            }
+        }
+        outcomes.resize_with(n, || None);
+        outcomes
+    }
+
+    fn shape_error(&self, n: usize, got: usize) -> EngineError {
+        EngineError::new(
+            SqlState::DataException,
+            format!(
+                "host function {} returned {got} results for a batch of {n} rows",
+                self.name
+            ),
+        )
     }
 
     /// Whether this function's signature matches `arg_tys` exactly (arity + per-position scalar type).

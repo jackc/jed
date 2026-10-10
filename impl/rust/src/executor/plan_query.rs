@@ -983,6 +983,7 @@ impl Engine {
             outer,
             rng: &stmt_rng,
             ctes,
+            host_batch: None,
         };
         let mut meter = self.session.new_meter();
         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(plan.rows.len());

@@ -260,6 +260,7 @@ impl crate::cursor::RowStream for StreamingScan {
             outer: &[],
             rng: &self.rng,
             ctes: CteCtx::empty(),
+            host_batch: None,
         };
         let mask = &self.plan.rel_masks[0];
         loop {
@@ -380,6 +381,9 @@ pub(crate) enum BufState {
         idx: usize,
         end: usize,
         project: bool,
+        /// The projection's host-function batch prefetch (extensibility.md §4.2.1), if any call
+        /// in it is eligible.
+        batch: Option<HostBatch>,
     },
     /// A fully-formed result from a special input-streaming path (already projected AND charged) —
     /// emission just hands the rows out.
@@ -449,6 +453,13 @@ impl crate::cursor::RowStream for BufferedScan {
                     idx: start,
                     end,
                     project: matches!(mode, EmitMode::Project),
+                    batch: match mode {
+                        EmitMode::Project => HostBatch::for_exprs(
+                            &self.plan.projections,
+                            &self.engine.session.extensions,
+                        ),
+                        EmitMode::Identity => None,
+                    },
                 },
                 Emitter::Final { rows } => BufState::Final {
                     iter: rows.into_iter(),
@@ -497,6 +508,7 @@ impl crate::cursor::RowStream for BufferedScan {
                     outer: &[],
                     rng: &self.rng,
                     ctes: CteCtx::empty(),
+                    host_batch: None,
                 };
                 Ok(Some(
                     self.plan
@@ -539,6 +551,7 @@ impl crate::cursor::RowStream for BufferedScan {
                     outer: &[],
                     rng: &self.rng,
                     ctes: CteCtx::empty(),
+                    host_batch: None,
                 };
                 let mut out = Vec::with_capacity(self.plan.projections.len());
                 for p in &self.plan.projections {
@@ -551,6 +564,7 @@ impl crate::cursor::RowStream for BufferedScan {
                 idx,
                 end,
                 project,
+                batch,
             } => {
                 if *idx >= *end {
                     return Ok(None);
@@ -561,12 +575,20 @@ impl crate::cursor::RowStream for BufferedScan {
                 self.meter.guard()?; // enforce the cost ceiling / cancellation per produced row
                 self.meter.charge(COSTS.row_produced);
                 if project {
-                    let env = EvalEnv {
+                    let base = EvalEnv {
                         exec: &self.engine,
                         params: &self.params,
                         outer: &[],
                         rng: &self.rng,
                         ctes: CteCtx::empty(),
+                        host_batch: None,
+                    };
+                    if let Some(b) = batch {
+                        b.set_row(i, rows, *end, &self.plan.projections, &base, &self.meter);
+                    }
+                    let env = EvalEnv {
+                        host_batch: batch.as_ref(),
+                        ..base
                     };
                     let mut out = Vec::with_capacity(self.plan.projections.len());
                     for p in &self.plan.projections {

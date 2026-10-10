@@ -1690,3 +1690,80 @@ gen = "int_window"
 base = 0
 off_min = 99
 off_max = 99
+
+# Host-function call overhead (spec/design/extensibility.md §4.2.1, benchmarks.md §8.2). The three
+# benches differ ONLY in the projected function and share one parameter stream: `host_function_none`
+# projects the bare column (the baseline), `host_function_row` calls a SINGLE-ROW kernel once per row,
+# and `host_function_batch` the same arithmetic as a BATCH kernel called once per prefetched chunk.
+# `(row - none) / rows` is the per-call cost of a single-row kernel; `batch - none` what is left after
+# batching. Each query selects ~1,000 rows (100 customers) by the customer index, so it runs on the buffered
+# projection — the site that prefetches (an `ORDER BY id` full scan streams and calls batch-of-one).
+# jed-only, and only for drivers that register the bench host functions; the rest skip (§8.2).
+[[bench]]
+name = "host_function_none"
+description = "Project a bare column over ~1,000 index-selected rows of the resident 10k table — the baseline for the host-function pair"
+dataset = "small"
+kind = "query"
+engines = ["jed"]
+host_functions = true
+sql = "SELECT id, amount FROM orders WHERE customer_id BETWEEN $1 AND $2 ORDER BY id"
+warmup = 200
+iterations = 2000
+seed = 4801
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 901
+
+[[bench.param]]
+gen = "int_window"
+base = 0
+off_min = 99
+off_max = 99
+
+[[bench]]
+name = "host_function_row"
+description = "Project a single-row-kernel host function over ~1,000 index-selected rows of the resident 10k table — one kernel call per row"
+dataset = "small"
+kind = "query"
+engines = ["jed"]
+host_functions = true
+sql = "SELECT id, bench_mix_row(amount) FROM orders WHERE customer_id BETWEEN $1 AND $2 ORDER BY id"
+warmup = 200
+iterations = 2000
+seed = 4801
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 901
+
+[[bench.param]]
+gen = "int_window"
+base = 0
+off_min = 99
+off_max = 99
+
+[[bench]]
+name = "host_function_batch"
+description = "Project a batch-kernel host function over ~1,000 index-selected rows of the resident 10k table — one kernel call per prefetched chunk"
+dataset = "small"
+kind = "query"
+engines = ["jed"]
+host_functions = true
+sql = "SELECT id, bench_mix_batch(amount) FROM orders WHERE customer_id BETWEEN $1 AND $2 ORDER BY id"
+warmup = 200
+iterations = 2000
+seed = 4801
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 901
+
+[[bench.param]]
+gen = "int_window"
+base = 0
+off_min = 99
+off_max = 99

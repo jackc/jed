@@ -28,6 +28,23 @@ registry.registerFunction({
   }
 });
 
+// with_tax(cents) -> cents plus 8% tax, as a BATCH kernel: it receives a whole column of rows per
+// call (args[0][i] is row i's argument) and pushes one result per row to `out`. jed calls it once
+// per chunk where it already holds the rows, and one row at a time elsewhere — same rows, cost, and
+// errors either way.
+registry.registerFunction({
+  name: 'with_tax',
+  argTypes: ['i64'],
+  result: 'i64',
+  volatility: 'immutable',
+  batchKernel: (args, out) => {
+    for (const v of args[0]) {
+      const cents = (v as { kind: 'int'; int: bigint }).int;
+      out.push(intValue(cents + (cents * 8n) / 100n));
+    }
+  }
+});
+
 const db = createDatabase({ extensions: registry });
 
 db.execute('CREATE TABLE product (id i32 PRIMARY KEY, name text, price_cents i64)');
@@ -40,9 +57,10 @@ db.execute('CREATE INDEX ON product (discount(price_cents, 10))');
 
 // Call it by name from SQL, exactly like a built-in.
 for (const row of db.query(
-  'SELECT name, discount(price_cents, 15) AS sale FROM product ORDER BY id'
+  'SELECT name, discount(price_cents, 15) AS sale, with_tax(price_cents) AS total FROM product ORDER BY id'
 )) {
-  console.log(`${render(row[0])} -> ${render(row[1])}`); // Mug -> 1063, Notebook -> 340
+  // Mug -> 1063 / 1350, Notebook -> 340 / 432
+  console.log(`${render(row[0])} -> ${render(row[1])} / ${render(row[2])}`);
 }
 
 db.close();

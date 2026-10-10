@@ -90,6 +90,8 @@ pub(crate) use access_encode::*;
 mod rewrite;
 pub(crate) use rewrite::*;
 mod engine;
+mod host_batch;
+pub(crate) use host_batch::HostBatch;
 mod snapshot;
 mod statistics;
 pub(crate) use statistics::*;

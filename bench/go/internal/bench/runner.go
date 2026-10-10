@@ -59,6 +59,13 @@ type Reader interface {
 	Query(sql string, args []any, sum *Checksum) (int, error)
 }
 
+// HostFunctionEngine is the OPTIONAL capability of a driver that registered the bench host
+// functions (bench_mix_row / bench_mix_batch, spec/design/benchmarks.md §8.2). A driver without
+// it makes the runner SKIP a host_functions bench.
+type HostFunctionEngine interface {
+	HostFunctions() bool
+}
+
 // errSkip is the sentinel runOne returns when a bench does not apply to this driver (a
 // concurrent_read on a driver without ConcurrentEngine). Run drops it and continues.
 var errSkip = errors.New("bench skipped for this driver")
@@ -178,6 +185,13 @@ func runOne(cfg Config, b *Bench, datasets *Datasets, dataDir, want string) (Res
 			return res, errSkip
 		}
 		return runConcurrent(cfg, b, ce, res)
+	}
+
+	if b.HostFunctions {
+		if he, ok := eng.(HostFunctionEngine); !ok || !he.HostFunctions() {
+			fmt.Fprintf(os.Stderr, "  skip: %s/%s/%s has no bench host functions\n", cfg.Engine, cfg.Lang, cfg.Variant)
+			return res, errSkip
+		}
 	}
 
 	stmt, err := eng.Prepare(b.SQLFor(cfg.Engine))

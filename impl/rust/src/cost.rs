@@ -447,6 +447,22 @@ impl Meter {
         }
     }
 
+    /// The cost still payable before a ceiling trips — the smaller remaining per-statement /
+    /// lifetime budget — or `None` when neither is armed. Bounds how far a host-function batch
+    /// prefetch may run ahead of replay (extensibility.md §4.2.1); never consulted by enforcement.
+    pub(crate) fn headroom(&self) -> Option<i64> {
+        let stmt = (self.limit > 0).then(|| self.limit - self.accrued);
+        let life = self
+            .lifetime
+            .as_ref()
+            .filter(|l| l.limit > 0)
+            .map(|l| l.limit - l.total.get());
+        match (stmt, life) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// Whether NO enforcement is armed — no per-statement ceiling, no session lifetime budget, and no
     /// cancellation poll — so [`guard`](Meter::guard) is a no-op. The gate for the Track A2/A3 columnar
     /// fast path (packed-leaf.md §11): it charges the scan block in bulk (not per row with an

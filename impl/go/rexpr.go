@@ -1692,6 +1692,9 @@ type evalEnv struct {
 	// ctes is the statement's CTE execution context (spec/design/cte.md §5), so a FROM reference at
 	// any nesting depth delivers a CTE's rows. The zero cteCtx for every non-WITH statement.
 	ctes cteCtx
+	// hostBatch is the evaluating site's prefetched host-function outcomes (extensibility.md §4.2.1),
+	// or nil — a host call then invokes its kernel for the current row alone.
+	hostBatch *hostBatch
 }
 
 // rCaseArm is one resolved (condition, result) branch of a reCase node (spec/design/grammar.md

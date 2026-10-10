@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use jed::value::Value;
-use jed::{CreateOptions, Database, ExtensionRegistry, HostFunction, ScalarType, Volatility};
+use jed::{CreateOptions, Database, ExtensionRegistry, HostFunction, ScalarType, Value, Volatility};
 
 fn main() -> jed::Result<()> {
     // A host registers its own SCALAR FUNCTIONS over the built-in types. Build a registry, add
@@ -34,6 +33,26 @@ fn main() -> jed::Result<()> {
         .semantic_version(1), // bump when a formula change would invalidate stored index keys
     )?;
 
+    // with_tax(cents) -> cents plus 8% tax, as a BATCH kernel: it receives a whole column of rows per
+    // call (args[0][i] is row i's argument) and appends one result per row to `out`. jed calls it
+    // once per chunk where it already holds the rows, and one row at a time elsewhere — same rows,
+    // cost, and errors either way.
+    registry.register_function(
+        HostFunction::batched(
+            "with_tax",
+            vec![ScalarType::Int64],
+            ScalarType::Int64,
+            Box::new(|args: &[Vec<Value>], out: &mut Vec<Value>| -> jed::Result<()> {
+                for v in &args[0] {
+                    let Value::Int(cents) = v else { unreachable!("strict + resolved i64 arg") };
+                    out.push(Value::Int(cents + cents * 8 / 100));
+                }
+                Ok(())
+            }),
+        )
+        .volatility(Volatility::Immutable),
+    )?;
+
     let mut db = Database::create(CreateOptions { extensions: Arc::new(registry), ..Default::default() })?;
 
     db.execute("CREATE TABLE product (id i32 PRIMARY KEY, name text, price_cents i64)", &[])?;
@@ -45,9 +64,11 @@ fn main() -> jed::Result<()> {
     db.execute("CREATE INDEX ON product (discount(price_cents, 10))", &[])?;
 
     // Call it by name from SQL, exactly like a built-in.
-    let sql = "SELECT name, discount(price_cents, 15) AS sale FROM product ORDER BY id";
+    let sql = "SELECT name, discount(price_cents, 15) AS sale, with_tax(price_cents) AS total \
+               FROM product ORDER BY id";
     for row in db.query(sql, &[])? {
-        println!("{} -> {}", row[0].render(), row[1].render()); // Mug -> 1063, Notebook -> 340
+        // Mug -> 1063 / 1350, Notebook -> 340 / 432
+        println!("{} -> {} / {}", row[0].render(), row[1].render(), row[2].render());
     }
 
     Ok(())

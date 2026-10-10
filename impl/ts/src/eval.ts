@@ -1137,7 +1137,13 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         if (v.kind === "null") return nullValue(); // NULL propagates
         hvals.push(v);
       }
-      const out = hf.kernel(hvals);
+      // The kernel's outcome for this row: prefetched by the site's batch (§4.2.1 — speculative
+      // batch, scalar replay), or a batch-of-one call when it has none.
+      const outcome = env.hostBatch?.take(e);
+      let out: Value;
+      if (outcome === undefined) out = hf.callOne(hvals);
+      else if ("error" in outcome) throw outcome.error;
+      else out = outcome.value;
       // Defend jed's own strict type system against a misbehaving host kernel (CLAUDE.md §13 — the
       // host owns its consequences, but a wrong-typed value must never reach jed's codecs /
       // comparators): the returned value must be NULL or match the declared scalar result type.

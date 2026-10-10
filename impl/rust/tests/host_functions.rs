@@ -552,3 +552,269 @@ fn hostfunc_index_reopen_missing_function() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+// ── The batched kernel ABI (extensibility.md §4.2.1) ────────────────────────────────────────────
+// Batching is host-observable only (how often, and over how many rows, a kernel runs); rows, cost,
+// and errors must be identical to batch-of-one. These mirror the Go/TS batch tests one-for-one.
+
+/// Records the row count of every kernel call.
+type Calls = Arc<std::sync::Mutex<Vec<usize>>>;
+
+/// `host_twice(i64) -> i64` as a BATCH kernel: doubles each row; raises at the row whose value is
+/// `fail_at` (the prefix rule — the rows before it are appended first).
+fn twice_batched(calls: Calls, vol: Volatility, fail_at: Option<i64>) -> HostFunction {
+    HostFunction::batched(
+        "host_twice",
+        vec![ScalarType::Int64],
+        ScalarType::Int64,
+        Box::new(
+            move |args: &[Vec<Value>], out: &mut Vec<Value>| -> jed::Result<()> {
+                calls.lock().unwrap().push(args[0].len());
+                for v in &args[0] {
+                    let Value::Int(x) = v else {
+                        unreachable!("strict + resolved i64 arg")
+                    };
+                    if Some(*x) == fail_at {
+                        return Err(jed::EngineError::new(
+                            jed::SqlState::InvalidParameterValue,
+                            format!("host_twice refuses {x}"),
+                        ));
+                    }
+                    out.push(Value::Int(x * 2));
+                }
+                Ok(())
+            },
+        ),
+    )
+    .volatility(vol)
+    .cost(5)
+}
+
+/// The same function as a SINGLE-ROW kernel — the batch-of-one reference.
+fn twice_row(calls: Calls, fail_at: Option<i64>) -> HostFunction {
+    HostFunction::new(
+        "host_twice",
+        vec![ScalarType::Int64],
+        ScalarType::Int64,
+        Box::new(move |args: &[Value]| -> jed::Result<Value> {
+            calls.lock().unwrap().push(1);
+            let Value::Int(x) = &args[0] else {
+                unreachable!("strict + resolved i64 arg")
+            };
+            if Some(*x) == fail_at {
+                return Err(jed::EngineError::new(
+                    jed::SqlState::InvalidParameterValue,
+                    format!("host_twice refuses {x}"),
+                ));
+            }
+            Ok(Value::Int(x * 2))
+        }),
+    )
+    .volatility(Volatility::Immutable)
+    .cost(5)
+}
+
+/// A table `t(id i64 PRIMARY KEY, a i64)` of `n` rows `(g, g)`, with `a` NULL where `g % 10 = 0`.
+fn batch_db(f: HostFunction, n: i64) -> Session {
+    db_with_ext(
+        registry(vec![f]),
+        &[
+            "CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+            &format!(
+                "INSERT INTO t SELECT g, CASE WHEN g % 10 = 0 THEN NULL ELSE g END \
+                 FROM generate_series(1, {n}) AS g"
+            ),
+        ],
+    )
+}
+
+fn new_calls() -> Calls {
+    Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
+/// `(rows, cost)` of a query, or its error code.
+fn run(db: &mut Session, sql: &str) -> std::result::Result<(Vec<Vec<Value>>, i64), String> {
+    match db.query_outcome(sql, &[]) {
+        Ok(Outcome::Query { rows, cost, .. }) => Ok((rows, cost)),
+        Ok(Outcome::Statement { .. }) => panic!("expected a query result for {sql:?}"),
+        Err(e) => Err(format!("{} {}", e.code(), e.message)),
+    }
+}
+
+#[test]
+fn batch_kernel_called_once_per_chunk() {
+    // 2500 rows (250 of them NULL) through the buffered projection: three chunks of ≤1024 rows, each
+    // one kernel call over its non-NULL rows only (strict).
+    let calls = new_calls();
+    let mut db = batch_db(
+        twice_batched(calls.clone(), Volatility::Immutable, None),
+        2500,
+    );
+    let (rows, _) = run(&mut db, "SELECT id, host_twice(a) FROM t").unwrap();
+    assert_eq!(rows.len(), 2500);
+    for r in &rows {
+        let Value::Int(id) = r[0] else { panic!() };
+        let want = if id % 10 == 0 {
+            Value::Null
+        } else {
+            Value::Int(id * 2)
+        };
+        assert_eq!(r[1], want);
+    }
+    assert_eq!(*calls.lock().unwrap(), vec![922, 922, 406]);
+}
+
+#[test]
+fn batch_matches_row_kernel_rows_and_cost() {
+    // The same query against a batch kernel and a single-row kernel: identical rows and cost.
+    let sqls = [
+        "SELECT id, host_twice(a) FROM t",
+        "SELECT id, host_twice(a), host_twice(id) FROM t WHERE id > 100",
+        "SELECT a, host_twice(a) FROM t ORDER BY a DESC LIMIT 7 OFFSET 3",
+        "SELECT x.id, host_twice(y.a) FROM t AS x JOIN t AS y ON x.id = y.id + 1",
+        "SELECT host_twice(count(*)) FROM t",
+    ];
+    for sql in sqls {
+        let mut batched = batch_db(
+            twice_batched(new_calls(), Volatility::Immutable, None),
+            1500,
+        );
+        let mut single = batch_db(twice_row(new_calls(), None), 1500);
+        assert_eq!(run(&mut batched, sql), run(&mut single, sql), "{sql}");
+    }
+}
+
+#[test]
+fn volatile_batch_kernel_is_called_per_row() {
+    // A volatile function's call set stays exactly the scalar one: one-row batches, one per
+    // non-NULL row.
+    let calls = new_calls();
+    let mut db = batch_db(twice_batched(calls.clone(), Volatility::Volatile, None), 30);
+    run(&mut db, "SELECT host_twice(a) FROM t").unwrap();
+    assert_eq!(*calls.lock().unwrap(), vec![1; 27]);
+}
+
+#[test]
+fn batch_error_raises_at_the_scalar_row() {
+    // The kernel fails at a = 57. Alone, that is the error; with an earlier per-row error in the
+    // same projection (division by zero at id = 40) the earlier row still wins, exactly as the
+    // single-row kernel orders them.
+    for sql in [
+        "SELECT host_twice(a) FROM t",
+        "SELECT 1 / (id - 40), host_twice(a) FROM t",
+        "SELECT host_twice(a), 1 / (id - 40) FROM t",
+        "SELECT host_twice(a), 1 / (id - 60) FROM t",
+    ] {
+        let mut batched = batch_db(
+            twice_batched(new_calls(), Volatility::Immutable, Some(57)),
+            200,
+        );
+        let mut single = batch_db(twice_row(new_calls(), Some(57)), 200);
+        let got = run(&mut batched, sql);
+        assert!(got.is_err(), "{sql}");
+        assert_eq!(got, run(&mut single, sql), "{sql}");
+    }
+}
+
+#[test]
+fn batch_cost_abort_matches_row_kernel_and_bounds_speculation() {
+    // Under a ceiling the abort is the single-row kernel's (same code, same accrued cost), and the
+    // prefetch ran the kernel over no more rows than the budget could pay for (§4.2.1).
+    let calls = new_calls();
+    let mut batched = batch_db(
+        twice_batched(calls.clone(), Volatility::Immutable, None),
+        2000,
+    );
+    let mut single = batch_db(twice_row(new_calls(), None), 2000);
+    let budget = 200;
+    batched.set_max_cost(budget);
+    single.set_max_cost(budget);
+    let sql = "SELECT id, host_twice(a) FROM t";
+    let b = batched.query_outcome(sql, &[]).unwrap_err();
+    let s = single.query_outcome(sql, &[]).unwrap_err();
+    assert_eq!(b.code(), "54P01");
+    assert_eq!((b.code(), &b.message), (s.code(), &s.message));
+    let speculated: usize = calls.lock().unwrap().iter().sum();
+    assert!(
+        speculated <= (budget / 5) as usize + 1,
+        "kernel ran over {speculated} rows"
+    );
+}
+
+#[test]
+fn batch_through_streaming_cursor_matches() {
+    // The lazy query() cursor drives the same buffered projection: same rows, chunked calls.
+    let calls = new_calls();
+    let mut db = batch_db(
+        twice_batched(calls.clone(), Volatility::Immutable, None),
+        1100,
+    );
+    let rows: Vec<Vec<Value>> = db
+        .query("SELECT host_twice(a) FROM t", &[])
+        .unwrap()
+        .collect();
+    assert_eq!(rows.len(), 1100);
+    assert_eq!(rows[0], vec![Value::Int(2)]);
+    assert_eq!(rows[9], vec![Value::Null]);
+    assert_eq!(*calls.lock().unwrap(), vec![922, 68]);
+}
+
+#[test]
+fn batch_shape_violations_are_22000() {
+    // Too few results on success, and too many, are caught rather than misattributed.
+    fn shaped(extra: bool) -> HostFunction {
+        HostFunction::batched(
+            "host_shape",
+            vec![ScalarType::Int64],
+            ScalarType::Int64,
+            Box::new(
+                move |args: &[Vec<Value>], out: &mut Vec<Value>| -> jed::Result<()> {
+                    let n = args[0].len();
+                    let want = if extra { n + 1 } else { n - 1 };
+                    out.extend((0..want).map(|_| Value::Int(0)));
+                    Ok(())
+                },
+            ),
+        )
+        .volatility(Volatility::Immutable)
+    }
+    for extra in [false, true] {
+        let mut db = batch_db(shaped(extra), 20);
+        let err = db
+            .query_outcome("SELECT host_shape(a) FROM t", &[])
+            .unwrap_err();
+        assert_eq!(err.code(), "22000", "extra={extra}");
+    }
+    // A wrong-typed result in a batch is caught at its own row too.
+    let liar = HostFunction::batched(
+        "host_liar",
+        vec![ScalarType::Int64],
+        ScalarType::Int64,
+        Box::new(
+            |args: &[Vec<Value>], out: &mut Vec<Value>| -> jed::Result<()> {
+                out.extend(args[0].iter().map(|_| Value::Text("oops".into())));
+                Ok(())
+            },
+        ),
+    )
+    .volatility(Volatility::Immutable);
+    let mut db = batch_db(liar, 20);
+    assert_eq!(
+        db.query_outcome("SELECT host_liar(a) FROM t", &[])
+            .unwrap_err()
+            .code(),
+        "22000"
+    );
+}
+
+#[test]
+fn batch_kernel_serves_a_lone_call() {
+    // Outside a prefetching site (a FROM-less SELECT, a WHERE filter) a batch kernel is handed a
+    // one-row batch.
+    let calls = new_calls();
+    let mut db = batch_db(twice_batched(calls.clone(), Volatility::Immutable, None), 5);
+    assert_eq!(one(&mut db, "SELECT host_twice(21)"), Value::Int(42));
+    let (rows, _) = run(&mut db, "SELECT id FROM t WHERE host_twice(a) = 6").unwrap();
+    assert_eq!(rows, vec![vec![Value::Int(3)]]);
+    assert_eq!(*calls.lock().unwrap(), vec![1; 6]);
+}

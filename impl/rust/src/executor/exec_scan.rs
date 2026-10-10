@@ -1934,6 +1934,7 @@ impl Engine {
             outer,
             rng,
             ctes,
+            host_batch: None,
         };
         let mut kept = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1972,6 +1973,7 @@ impl Engine {
             outer,
             rng,
             ctes,
+            host_batch: None,
         };
         // A set-returning relation is generated, not scanned (functions.md §10): produce its rows,
         // charging generated_row per element (its args read `outer` — implicitly lateral, §44).
@@ -2264,6 +2266,7 @@ impl Engine {
                     outer,
                     rng: &stmt_rng,
                     ctes,
+                    host_batch: None,
                 };
                 let mut out = Vec::new();
                 for _ in 0..remaining {
@@ -2302,6 +2305,7 @@ impl Engine {
                     outer,
                     rng: &stmt_rng,
                     ctes,
+                    host_batch: None,
                 };
                 let mut out = Vec::with_capacity(remaining);
                 for _ in 0..remaining {
@@ -2343,17 +2347,29 @@ impl Engine {
                     out
                 }
                 EmitMode::Project => {
-                    let env = EvalEnv {
+                    let base = EvalEnv {
                         exec: self,
                         params,
                         outer,
                         rng: &stmt_rng,
                         ctes,
+                        host_batch: None,
                     };
+                    // Host calls in the projection prefetch a chunk at a time and replay row by
+                    // row (extensibility.md §4.2.1).
+                    let mut batch =
+                        HostBatch::for_exprs(&plan.projections, &self.session.extensions);
                     let mut out = Vec::with_capacity(end - start);
-                    for row in &rows[start..end] {
+                    for (i, row) in rows.iter().enumerate().take(end).skip(start) {
                         meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
                         meter.charge(COSTS.row_produced);
+                        if let Some(b) = &mut batch {
+                            b.set_row(i, &rows, end, &plan.projections, &base, &meter);
+                        }
+                        let env = EvalEnv {
+                            host_batch: batch.as_ref(),
+                            ..base
+                        };
                         let mut o = Vec::with_capacity(plan.projections.len());
                         for p in &plan.projections {
                             o.push(p.eval(row, &env, &mut meter)?);

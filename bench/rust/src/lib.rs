@@ -129,6 +129,8 @@ pub struct Bench {
     pub engines: Vec<String>,
     pub batch: usize,
     pub readers: usize,
+    /// The bench calls the bench host functions (benchmarks.md §8.2); drivers without them skip it.
+    pub host_functions: bool,
     pub setup_sql: Vec<String>,
     pub sql_override: Vec<(String, String)>,
     pub setup_sql_override: Vec<(String, Vec<String>)>,
@@ -247,6 +249,10 @@ pub fn load_corpus(corpus_dir: &str) -> BoxResult<Vec<Bench>> {
             engines: str_list(t, "engines"),
             batch: int_field(t, "batch") as usize,
             readers: int_field(t, "readers") as usize,
+            host_functions: t
+                .get("host_functions")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             setup_sql: str_list(t, "setup_sql"),
             sql_override: t
                 .get("sql_override")
@@ -375,6 +381,13 @@ pub trait Engine {
     fn exec_prepared(&mut self, args: &[Arg]) -> BoxResult<()>;
     fn query_int(&mut self, sql: &str) -> BoxResult<i64>;
     fn stored_fingerprint(&mut self) -> BoxResult<String>;
+
+    /// Whether this driver registered the bench host functions (`bench_mix_row` /
+    /// `bench_mix_batch`, benchmarks.md §8.2). The default `false` makes the runner SKIP a
+    /// `host_functions = true` bench.
+    fn host_functions(&self) -> bool {
+        false
+    }
 
     /// Run a concurrent_read bench (spec/design/benchmarks.md §8.1): open one reader per
     /// block over the same committed data (jed: one SharedCore + N reader Sessions, the
@@ -542,6 +555,13 @@ fn run_one(
 
     if b.kind == "concurrent_read" {
         return run_concurrent(cfg, b, eng.as_mut(), want);
+    }
+    if b.host_functions && !eng.host_functions() {
+        eprintln!(
+            "  skip: {}/{}/{} has no bench host functions",
+            cfg.engine, cfg.lang, cfg.variant
+        );
+        return Ok(None);
     }
 
     eng.prepare(b.sql_for(cfg.engine))?;

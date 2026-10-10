@@ -329,6 +329,17 @@ export class Meter {
       this.lifetime.total = saturatingCostAdd(this.lifetime.total, units);
   }
 
+  // headroom is the cost still payable before a ceiling trips — the smaller remaining per-statement /
+  // lifetime budget — or undefined when neither is armed. Bounds how far a host-function batch
+  // prefetch may run ahead of replay (extensibility.md §4.2.1); never consulted by enforcement.
+  headroom(): bigint | undefined {
+    const stmt = this.limit > 0n ? this.limit - this.accrued : undefined;
+    const l = this.lifetime;
+    const life = l !== undefined && l.limit > 0n ? l.limit - l.total : undefined;
+    if (stmt !== undefined && life !== undefined) return stmt < life ? stmt : life;
+    return stmt ?? life;
+  }
+
   // isUnmetered reports whether NO cost ceiling is armed — no per-statement maxCost and no session
   // lifetime budget — so guard() is a no-op. The gate for the Track A2/A3 columnar fast path
   // (packed-leaf.md §11): it charges the scan block in bulk (not per row with an intervening guard),

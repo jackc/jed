@@ -2801,6 +2801,7 @@ impl Engine {
                                     outer: &[],
                                     rng: &rng,
                                     ctes: CteCtx::empty(),
+                                    host_batch: None,
                                 };
                                 let mut default_meter = self.session.new_meter();
                                 target.default =
@@ -3019,6 +3020,7 @@ impl Engine {
                 outer: &[],
                 rng: &rng,
                 ctes: CteCtx::empty(),
+                host_batch: None,
             };
             let pk: Vec<(usize, Type)> = table
                 .pk
@@ -3815,6 +3817,7 @@ impl Engine {
             outer: &[],
             rng: &rng,
             ctes: CteCtx::empty(),
+            host_batch: None,
         };
         index_entry_keys(columns, col_types, colls, rindex, storage_key, row, &env)
     }
@@ -3836,6 +3839,7 @@ impl Engine {
             outer: &[],
             rng: &rng,
             ctes: CteCtx::empty(),
+            host_batch: None,
         };
         index_prefix_key(col_types, colls, rindex, row, &env)
     }
@@ -3859,6 +3863,7 @@ impl Engine {
             outer: &[],
             rng: &rng,
             ctes: CteCtx::empty(),
+            host_batch: None,
         };
         arbiter_key(arb, pk, col_types, colls, rindexes, row, &env)
     }
@@ -3921,6 +3926,7 @@ impl Engine {
                     outer: &[],
                     rng,
                     ctes: CteCtx::empty(),
+                    host_batch: None,
                 };
                 rx.eval(&[], &env, meter)
             }
@@ -4456,6 +4462,7 @@ impl Engine {
                 outer: &[],
                 rng: &rng,
                 ctes: CteCtx::empty(),
+                host_batch: None,
             };
             let store = self.store_scoped(ci.db.as_deref(), &ci.table);
             // Resolved column types (composite index key vehicle, §2.15).

@@ -2,9 +2,11 @@
 
 use std::time::Instant;
 
+use std::sync::Arc;
+
 use jed::{
-    CreateOptions, Database, Locking, OpenOptions, PreparedStatement, Session, SessionOptions,
-    Value,
+    CreateOptions, Database, ExtensionRegistry, HostFunction, Locking, OpenOptions,
+    PreparedStatement, ScalarType, Session, SessionOptions, Value, Volatility,
 };
 
 use jed_bench::{
@@ -40,6 +42,7 @@ fn open(data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>> {
         let db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(format!("{dir}/scratch.jed"))),
             locking,
+            extensions: bench_extensions()?,
             ..Default::default()
         })
         .map_err(|e| e.to_string())?;
@@ -57,6 +60,7 @@ fn open(data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>> {
         format!("{data_dir}/{dataset}.jed"),
         OpenOptions {
             locking,
+            extensions: bench_extensions()?,
             ..Default::default()
         },
     )
@@ -70,6 +74,42 @@ fn open(data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>> {
         dataset: dataset.to_string(),
         scratch: None,
     }))
+}
+
+/// The bench host functions (benchmarks.md §8.2): the same cheap arithmetic as a single-row
+/// kernel (`bench_mix_row`) and a batch kernel (`bench_mix_batch`), registered on every handle.
+fn bench_extensions() -> BoxResult<Arc<ExtensionRegistry>> {
+    fn mix(v: &Value) -> Value {
+        let Value::Int(x) = v else {
+            unreachable!("strict + resolved i32 arg")
+        };
+        Value::Int(x * 2654435761 % 1000003)
+    }
+    let mut reg = ExtensionRegistry::new();
+    reg.register_function(
+        HostFunction::new(
+            "bench_mix_row",
+            vec![ScalarType::Int32],
+            ScalarType::Int64,
+            Box::new(|args: &[Value]| Ok(mix(&args[0]))),
+        )
+        .volatility(Volatility::Immutable),
+    )
+    .map_err(|e| e.to_string())?;
+    reg.register_function(
+        HostFunction::batched(
+            "bench_mix_batch",
+            vec![ScalarType::Int32],
+            ScalarType::Int64,
+            Box::new(|args: &[Vec<Value>], out: &mut Vec<Value>| {
+                out.extend(args[0].iter().map(mix));
+                Ok(())
+            }),
+        )
+        .volatility(Volatility::Immutable),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(Arc::new(reg))
 }
 
 /// Optional benchmark-only coordination override. Ordinary runs keep the public API's `auto`
@@ -110,6 +150,10 @@ fn bind_args(args: &[Arg]) -> Vec<Value> {
 }
 
 impl Engine for JedEngine {
+    fn host_functions(&self) -> bool {
+        true
+    }
+
     fn exec(&mut self, sql: &str) -> BoxResult<()> {
         self.sess.execute(sql, &[]).map_err(|e| e.to_string())?;
         Ok(())

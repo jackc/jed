@@ -1095,8 +1095,8 @@ functions to it, and passes it in the create/open options; the engine **freezes 
 lifetime** and shares it into every session (§7 — registration is a **host-API act, never SQL**:
 there is no `CREATE FUNCTION … LANGUAGE HOST` DDL, which keeps it off the untrusted-query surface).
 This is the *function seam* of extensibility.md §5.1: **strict** (a NULL argument short-circuits to
-NULL before the kernel runs), **exact scalar signatures** (no implicit promotion), and **single-row**
-kernels ("batch-of-one"; the vectorized ABI is a follow-on). Since step 4 an `immutable` host function
+NULL before the kernel runs), **exact scalar signatures** (no implicit promotion), and a
+**single-row or batch kernel** (the column-in → column-out ABI, extensibility.md §4.2.1). Since step 4 an `immutable` host function
 that also declares a **component identity** may back a **persisted index** (below).
 
 - **Register.** A function carries a name, an exact scalar argument signature, a scalar result type,
@@ -1107,6 +1107,14 @@ that also declares a **component identity** may back a **persisted index** (belo
   `42704` (Go/TS, which name types by string); a second function with an **identical** `(name,
   arg-types)` signature is `42723` (signature-level — a host may overload a name across argument
   types).
+- **Batch kernels.** A function may instead carry a **batch kernel** — column-major arguments
+  (`args[j][i]` is argument `j` of row `i`, never NULL) in, one appended result per row out; on
+  error, the count of results appended is the failing row (extensibility.md §4.2.1). Where the
+  engine holds a chunk of rows (the buffered projection), a non-`volatile` function's kernel runs once
+  per chunk of up to 1,024 rows and the row-at-a-time evaluation replays against the results, so
+  rows, cost, and errors are identical to the single-row form; elsewhere it gets a one-row batch. A
+  malformed batch (too many results, too few on success, an error after answering every row) is
+  `22000`. TypeScript rejects a spec with both or neither of `kernel`/`batchKernel` (`22023`).
 - **Resolve + evaluate.** A host name (or a host overload of a built-in name over a new signature)
   resolves after the built-in catalog — **a built-in overload always wins an exact collision.** At
   eval the kernel is reached **by id** through the frozen registry; the declared `cost` is charged
@@ -1135,6 +1143,7 @@ cost** — the defaults match):
 |---|---|---|---|
 | build | `let mut r = ExtensionRegistry::new();` | `r := NewExtensionRegistry()` | `const r = new ExtensionRegistry()` |
 | register | `r.register_function(HostFunction::new("f", vec![ScalarType::Int64, ScalarType::Int64], ScalarType::Int64, Box::new(\|a\| Ok(...))).cost(3))?` | `r.RegisterFunction(NewHostFunction("f", []string{"i64","i64"}, "i64", func(a []Value) (Value, error) { ... }).WithCost(3))` | `r.registerFunction({ name: "f", argTypes: ["i64","i64"], result: "i64", kernel: (a) => ..., cost: 3n })` |
+| batch kernel | `HostFunction::batched("f", vec![ScalarType::Int64], ScalarType::Int64, Box::new(\|args, out\| { out.extend(…); Ok(()) }))` | `NewHostBatchFunction("f", []string{"i64"}, "i64", func(args [][]Value, out []Value) ([]Value, error) { …; return out, nil })` | `r.registerFunction({ name: "f", argTypes: ["i64"], result: "i64", batchKernel: (args, out) => { out.push(…) } })` |
 | index-backing | `HostFunction::new(…).volatility(Volatility::Immutable).component_id("com.example/f").semantic_version(1)` | `NewHostFunction(…).WithVolatility(VolatilityImmutable).WithComponentID("com.example/f").WithSemanticVersion(1)` | `{ …, volatility: "immutable", componentId: "com.example/f", semanticVersion: 1 }` |
 | install | `Database::create(CreateOptions { extensions: Arc::new(r), ..Default::default() })` | `CreateDatabase(CreateOptions{Extensions: r})` | `createDatabase({ extensions: r })` |
 

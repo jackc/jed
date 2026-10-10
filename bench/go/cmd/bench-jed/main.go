@@ -25,13 +25,17 @@ type engine struct {
 
 func open(dataDir, dataset string) (bench.Engine, error) {
 	e := &engine{dataDir: dataDir, dataset: dataset}
+	ext, err := benchExtensions()
+	if err != nil {
+		return nil, err
+	}
 	if dataset == "scratch" {
 		dir, err := os.MkdirTemp(dataDir, "scratch-")
 		if err != nil {
 			return nil, err
 		}
 		e.scratch = dir
-		db, err := jed.CreateDatabase(jed.CreateOptions{Path: filepath.Join(dir, "scratch.jed")})
+		db, err := jed.CreateDatabase(jed.CreateOptions{Path: filepath.Join(dir, "scratch.jed"), Extensions: ext})
 		if err != nil {
 			os.RemoveAll(dir)
 			return nil, err
@@ -40,7 +44,7 @@ func open(dataDir, dataset string) (bench.Engine, error) {
 		e.sess = db.Session(jed.SessionOptions{})
 		return e, nil
 	}
-	db, err := jed.OpenDatabase(filepath.Join(dataDir, dataset+".jed"))
+	db, err := jed.OpenDatabaseWithOptions(filepath.Join(dataDir, dataset+".jed"), jed.OpenOptions{Extensions: ext})
 	if err != nil {
 		return nil, err
 	}
@@ -48,6 +52,39 @@ func open(dataDir, dataset string) (bench.Engine, error) {
 	e.sess = db.Session(jed.SessionOptions{})
 	return e, nil
 }
+
+// benchMix is the bench host functions' arithmetic (benchmarks.md §8.2) — cheap on purpose, so the
+// timings expose per-call overhead.
+func benchMix(v jed.Value) jed.Value {
+	return jed.IntValue(v.Int * 2654435761 % 1000003)
+}
+
+// benchExtensions registers the bench host functions on every handle: the same arithmetic as a
+// single-row kernel (bench_mix_row) and a batch kernel (bench_mix_batch).
+func benchExtensions() (*jed.ExtensionRegistry, error) {
+	reg := jed.NewExtensionRegistry()
+	err := reg.RegisterFunction(jed.NewHostFunction("bench_mix_row", []string{"i32"}, "i64",
+		func(args []jed.Value) (jed.Value, error) {
+			return benchMix(args[0]), nil
+		}).WithVolatility(jed.VolatilityImmutable))
+	if err != nil {
+		return nil, err
+	}
+	err = reg.RegisterFunction(jed.NewHostBatchFunction("bench_mix_batch", []string{"i32"}, "i64",
+		func(args [][]jed.Value, out []jed.Value) ([]jed.Value, error) {
+			for _, v := range args[0] {
+				out = append(out, benchMix(v))
+			}
+			return out, nil
+		}).WithVolatility(jed.VolatilityImmutable))
+	if err != nil {
+		return nil, err
+	}
+	return reg, nil
+}
+
+// HostFunctions reports that every handle carries the bench host functions (benchmarks.md §8.2).
+func (e *engine) HostFunctions() bool { return true }
 
 // drainExec runs a statement through the ergonomic Query seam to completion, discarding any rows — the
 // bench equivalent of Exec (a write materializes at the call; Close releases the cursor).

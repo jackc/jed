@@ -1354,6 +1354,7 @@ mod tests {
             outer: &[],
             rng: &rng,
             ctes: CteCtx::empty(),
+            host_batch: None,
         };
         let rows = engine
             .scan_blocking_relation(&plan, 0, &env, &mut Meter::new())

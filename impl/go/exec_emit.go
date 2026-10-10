@@ -396,12 +396,19 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 		return out, nil
 	default: // emitProject
 		env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
+		// Host calls in the projection prefetch a chunk at a time and replay row by row
+		// (extensibility.md §4.2.1).
+		env.hostBatch = newHostBatch(plan.projections, db.session.extensions)
 		out := make([][]Value, 0, em.end-em.start)
-		for _, row := range em.src[em.start:em.end] {
+		for ri := int(em.start); ri < int(em.end); ri++ {
+			row := em.src[ri]
 			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
 				return nil, err
 			}
 			meter.Charge(costs.RowProduced)
+			if env.hostBatch != nil {
+				env.hostBatch.setRow(ri, em.src, int(em.end), env, meter)
+			}
 			projected := make([]Value, len(plan.projections))
 			for i, p := range plan.projections {
 				v, perr := p.eval(row, env, meter)

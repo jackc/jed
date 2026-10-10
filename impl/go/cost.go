@@ -80,6 +80,25 @@ func (m *costMeter) unmetered() bool {
 	return m.Limit == 0 && m.lifetimeLimit == 0 && m.cancel == nil
 }
 
+// headroom reports the cost still payable before a ceiling trips — the smaller remaining
+// per-statement / lifetime budget — or ok=false when neither is armed. Bounds how far a host-function
+// batch prefetch may run ahead of replay (extensibility.md §4.2.1); never consulted by enforcement.
+func (m *costMeter) headroom() (int64, bool) {
+	var h int64
+	ok := false
+	if m.Limit > 0 {
+		h, ok = m.Limit-m.Accrued, true
+	}
+	if m.lifetimeTotal != nil && m.lifetimeLimit > 0 {
+		life := m.lifetimeLimit - *m.lifetimeTotal
+		if !ok || life < h {
+			h = life
+		}
+		ok = true
+	}
+	return h, ok
+}
+
 // NewMeterWithLimit returns a fresh meter that aborts once accrued cost reaches limit
 // (limit <= 0 ⇒ unlimited), with no session lifetime budget. The ceiling is the session's
 // max_cost (spec/design/api.md §8). Used where there is no session cumulative to thread.

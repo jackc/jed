@@ -319,6 +319,74 @@ must carry:
     non-cross-core (e.g. it calls the platform libm). Only a function declared *and harness-verified*
     cross-core-deterministic produces untainted results (§10).
 
+### 4.2.1 The batched kernel ABI — column-in, column-out (✅ landed, all 3 cores)
+
+Every host function is evaluated through **one** kernel shape: a **batch kernel** over `n ≥ 1` rows.
+A host registers either a batch kernel directly or the familiar single-row kernel, which the
+registry adapts into a batch kernel (a loop over the rows). The executor never sees the difference.
+
+**The call.** `args` is **column-major**: `args[j][i]` is argument `j` of row `i`; every column has
+the same length `n ≥ 1`, and no value is NULL (the function is strict — a row with any NULL argument
+yields NULL and is never sent to the kernel). The kernel **appends** one result per row, in row order,
+to an output column it is handed. It returns success, or an error; **on error, the number of results
+it appended is the index of the failing row** — rows before it succeeded, and their results stand.
+This prefix rule is what keeps error ordering identical to scalar evaluation without a per-row result
+envelope, and it is the shape a wrapped core marshals once per crossing.
+
+| | Rust | Go | TS |
+|---|---|---|---|
+| batch kernel | `Box<dyn Fn(&[Vec<Value>], &mut Vec<Value>) -> Result<()> + Send + Sync>` | `func(args [][]Value, out []Value) ([]Value, error)` (append to `out`, return it) | `(args: Value[][], out: Value[]) => void` (push to `out`, throw on error) |
+| register | `HostFunction::batched(name, args, result, kernel)` | `NewHostBatchFunction(name, args, result, kernel)` | `{ …, batchKernel }` in place of `kernel` |
+
+**What the host promises.** A batch kernel is the row-wise map of a scalar function: result `i`
+depends only on row `i`'s arguments (and, for a `stable` function, statement-stable state); it
+processes rows in order and stops at the first row that fails, which is the row the scalar form would
+have failed on. The engine defends its own invariants against a kernel that breaks the shape (all
+`22000`): a successful return with fewer results than rows raises at the first unanswered row; a
+return with more results than rows, or an error after answering every row, names no failing row and
+raises at the batch's first row. Each result is still checked against the declared type (`22000`, as
+for a single-row kernel).
+
+**How the engine calls it — speculative batch, scalar replay.** Batching must not move the cost
+abort row, the error row, or any result (§4.2: "error ordering must be identical to scalar"). So the
+observable evaluation **stays the row-at-a-time evaluation**, unchanged: for every row, the call node
+charges the declared cost, guards, evaluates its arguments, short-circuits a NULL, and type-checks the
+result, at exactly the points it always did. What changes is only *where the result comes from*.
+Before an evaluation site replays a chunk of rows it already holds, it **prefetches**: for each
+eligible call node it gathers the chunk's argument columns, calls the kernel once, and caches the
+per-row outcome (result, or the error at the reported row). Replay then takes row `i`'s outcome from
+the cache instead of calling the kernel; a row the cache cannot answer (past a reported error, or
+outside the prefetched chunk) falls back to a batch-of-one call. Rows, cost, abort points, and errors
+are therefore identical to batch-of-one **by construction**, metered or not — unlike the columnar
+lanes (packed-leaf.md §11), batching needs no unmetered gate. A call node is eligible when:
+
+1. its function is **not `volatile`** — a volatile function's call set stays exactly the scalar one.
+   An `immutable`/`stable` kernel may be invoked on rows replay never reaches (a later error, an early
+   cursor close, a LIMIT window that ends mid-chunk); those calls are wasted host work, not observable
+   SQL behavior;
+2. every argument is **trivially evaluable** — a column reference, constant, or parameter — so the
+   prefetch can evaluate it without a meter: such an argument is free (cost.md §3) and cannot raise,
+   so the prefetch does no unmetered engine work and replay re-reads the same values;
+3. it is evaluated **unconditionally, once per row**, at the site — a direct item of the evaluated
+   expression list, not beneath `CASE`/`COALESCE`/`NULLIF`/`AND`/`OR` or inside a subquery.
+
+**Bounding the speculation.** A chunk is at most 1024 rows. On a metered handle the chunk for a node
+with declared cost `c > 0` is further capped at `⌊headroom / c⌋ + 1` rows, where `headroom` is the
+smaller remaining statement/lifetime budget: every replayed row charges at least `c`, so the kernel
+never runs on more rows than the budget could pay for, plus the one that trips it. A batch kernel is
+still host code (§9) — this bounds how far *jed* runs ahead, not what the kernel does per call.
+
+**Sites.** The prefetch is a helper an evaluation site calls over rows it already holds; it is wired
+into the **projection of the buffered blocking path** (the `Buffer` emitter: plain and filtered scans
+without a streaming order, index-bounded scans, joins, eager sorts, and grouped output) — wherever
+that SELECT runs, including as a derived table, a CTE body, a set-operation arm, or an
+`INSERT … SELECT` source. The other row-evaluation sites call the kernel batch-of-one and adopt the
+helper as follow-ons: streaming scan/sort/join projections (notably a full scan in `ORDER BY` primary
+key order), `WHERE`/`ON` filters inside scans, aggregate arguments, `INSERT … VALUES`,
+`UPDATE … SET`, `RETURNING`, and index build/maintenance over a host expression (§8.1). Which rows a
+kernel is called with, and how often, is host-observable only; it is not part of the cross-core
+contract.
+
 ### 4.3 Host-defined core (scalar) types — reasonable; climb the §3 ladder, the host picks how high
 
 The hard case: the host supplies text/bin/compare/key directly; jed derives nothing. Host scalar
@@ -771,8 +839,8 @@ cleanup, not a prerequisite. A suggested sequence:
    included); a separate `HostFunc`/`hostFunc` resolved node reached **by id** through the registry
    alongside the untouched built-in dispatch; built-ins win an exact-signature collision; `cost`
    (design (a) static weight) charged per call + guarded against the ceiling; wrong-typed kernel
-   results caught (`22000`); `42723` for a duplicate registration. **Deferred to later slices**:
-   the vectorized/batched kernel ABI (batch-of-one only for now), non-strict host functions, host
+   results caught (`22000`); `42723` for a duplicate registration. **Since landed:** the
+   vectorized/batched kernel ABI (§4.2.1). **Deferred to later slices**: non-strict host functions, host
    functions over container args, and runtime *enforcement* of the `volatility`/`cross_core`
    declarations (recorded but not yet acted on — no host function is constant-folded, and there is no
    runtime taint mechanism yet, matching how `float` is handled at the spec layer, §2).
@@ -837,7 +905,7 @@ When a section here is ratified, update **in the same change** (mirrors [determi
 | §2 | Determinism-ownership is the line that moves | **proposed** (the governing principle) |
 | §3 | The `TypeExpr` model + the capability ladder + the closed container axis | **proposed** (composite arm is **landed**) |
 | §4.1 | Composite types (derived codec, G2 free, self-describing) | **landed as a type**; composite-**as-key** **landed** (§14 step 2, `composite-field-slots` [encoding.md §2.15](encoding.md); array-of-composite element the lone remaining `0A000`) |
-| §4.2 | Host scalar functions (registry, signature overloads, vectorized, cost, volatility) | **landed** (all 3 cores): registry + resolve + eval seam, exact-signature overloading, cost charged/gated, strict, wrong-type-caught, 42723 (§14 step 3); **plus** `component_id`/`semantic_version` + index-backing (§14 step 4). Vectorized ABI, non-strict, container args, cross-core *taint enforcement* still deferred |
+| §4.2 | Host scalar functions (registry, signature overloads, vectorized, cost, volatility) | **landed** (all 3 cores): registry + resolve + eval seam, exact-signature overloading, cost charged/gated, strict, wrong-type-caught, 42723 (§14 step 3); **plus** `component_id`/`semantic_version` + index-backing (§14 step 4); **plus** the batched column-in/column-out kernel ABI (§4.2.1), batched at the buffered projection site. Non-strict, container args, cross-core *taint enforcement*, and batching at the remaining sites still deferred |
 | §4.3 | Host scalar types (Storable→Indexed ladder, `type_code 21`, opaque) | **proposed** |
 | §5 | Dispatch — registry the many, inline the few (§5.1 splits the **seam** from the **dogfood**; function seam first) | **built** for built-in scalar functions + aggregates *and* the **host function injection seam** (§14 step 3, all 3 cores): a host kernel is reached by id through the frozen registry alongside the inlined built-in arms. Type-vtable depth (Fork A) + the type-method seam (step 5) **proposed** |
 | §6 | Persisted host-type catalog + on-disk representation (`type_code 21`, `format_version 32`) | **proposed** (the per-index host-dep list of step 4 landed at `format_version 31`) |
