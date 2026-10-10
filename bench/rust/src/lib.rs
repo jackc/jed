@@ -532,6 +532,13 @@ fn run_one(
         eng.exec(sql)
             .map_err(|e| format!("setup_sql {sql:?}: {e}"))?;
     }
+    // A scratch write_rollback table is built by setup_sql, so its expected post-run count is the
+    // count observed now rather than a dataset spec row count (benchmarks.md §8).
+    let scratch_rows = if b.kind == "write_rollback" && b.dataset == "scratch" {
+        eng.query_int(&format!("SELECT count(*) FROM {}", write_table(&b.sql)))?
+    } else {
+        0
+    };
 
     if b.kind == "concurrent_read" {
         return run_concurrent(cfg, b, eng.as_mut(), want);
@@ -592,6 +599,7 @@ fn run_one(
         let table = write_table(&b.sql);
         let n = eng.query_int(&format!("SELECT count(*) FROM {table}"))?;
         let expect = match b.kind.as_str() {
+            "write_rollback" if b.dataset == "scratch" => scratch_rows,
             "write_rollback" => dataset_table_rows(corpus_dir, &b.dataset, &table)?,
             _ => (b.warmup + b.iterations) as i64,
         };

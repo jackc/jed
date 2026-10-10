@@ -419,6 +419,12 @@ async function runOne(
     for (const sql of setupSqlFor(b, cfg.engine)) {
       await eng.exec(sql);
     }
+    // A scratch write_rollback table is built by setup_sql, so its expected post-run count is the
+    // count observed now rather than a dataset spec row count (benchmarks.md §8).
+    const scratchRows =
+      b.kind === "write_rollback" && b.dataset === "scratch"
+        ? await eng.queryInt(`SELECT count(*) FROM ${writeTable(b.sql)}`)
+        : 0n;
 
     if (b.kind === "concurrent_read") {
       if (eng.concurrentRead === undefined) {
@@ -515,9 +521,11 @@ async function runOne(
       const table = writeTable(b.sql);
       const n = await eng.queryInt(`SELECT count(*) FROM ${table}`);
       const expect =
-        b.kind === "write_rollback"
-          ? datasetTableRows(corpusDir, b.dataset, table)
-          : BigInt(b.warmup + b.iterations);
+        b.kind !== "write_rollback"
+          ? BigInt(b.warmup + b.iterations)
+          : b.dataset === "scratch"
+            ? scratchRows
+            : datasetTableRows(corpusDir, b.dataset, table);
       if (n !== expect) {
         throw new Error(`post-run count(*) of ${table}: got ${n}, want ${expect}`);
       }

@@ -81,6 +81,10 @@ id = "ddl.foreign_key"
 description = "FOREIGN KEY constraints — column-level REFERENCES and table-level [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES parent (cols) with ON DELETE/UPDATE NO ACTION|RESTRICT|CASCADE|SET NULL|SET DEFAULT: child INSERT/UPDATE and parent DELETE/UPDATE enforcement, recursive generated actions through the ordinary DML pipeline, MATCH SIMPLE NULL exemption, and action-failure rollback; referenced columns must be the parent PK or a UNIQUE set (42830), same-type pairing (42804, stricter than PG), PG auto-naming, per-table constraint namespace 42710; MATCH FULL is 0A000; DROP TABLE of a referenced table is 2BP01; action codes persisted in the v30 catalog (spec/design/constraints.md §6, grammar.md §43)"
 
 [[capability]]
+id = "ddl.foreign_key_child_index"
+description = "Parent-side FK reverse match through a child index (spec/design/constraints.md §6.5/§6.11): a parent DELETE/UPDATE's NO ACTION/RESTRICT search for referencing children probes a usable child key — the child PRIMARY KEY or a non-partial plain-column ordered B-tree index whose leading key columns are, as a set, the FK's local columns (text columns collated like the parent and not version-skewed), PK first then ascending lowercased index name — for the parent tuple's key prefix, else full-scans the child. Both paths are metered and guarded (index probe: page_read over the probe range's overlapping nodes; scan: the FK-column full-scan block plus storage_row_read per row pulled, up to the first match), so max_cost/lifetime_max_cost bound the O(parents x children) fallback. No index is auto-created (PG-matching); visible 23503 behavior is unchanged. Builds on ddl.foreign_key + ddl.secondary_index"
+
+[[capability]]
 id = "ddl.drop_table"
 description = "DROP TABLE — remove a table (definition + rows) from the catalog; missing table is 42P01 (grammar.md §13)"
 

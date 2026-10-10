@@ -1418,6 +1418,35 @@ A DML statement's `RETURNING` clause ([grammar.md](grammar.md) §32) is metered 
   per-row ceiling guard — so a `54P01` abort mid-`RETURNING` has written nothing
   (all-or-nothing is preserved; §6).
 
+### Foreign-key reverse match — a parent mutation's search for referencing children
+
+A parent `DELETE`/`UPDATE` whose referenced tuple disappears must confirm, for every inbound
+`NO ACTION`/`RESTRICT` FK, that no child row still references it ([constraints.md](constraints.md)
+§6.5). That search is metered, because one statement issues one search per (disappearing parent
+tuple × inbound FK). Unmetered, a `DELETE` of N parents over a child of M rows would do N × M work
+that `max_cost` never sees. The search observes the statement's end state and charges the
+originating statement, after every generated referential write action, in the deterministic
+deferred-check order (referencing table, then FK name, then parent-row order). Each charge is
+`Guard`ed before the work it pays for.
+
+- **Index probe** (the child's PK, or a non-partial plain-column ordered B-tree whose leading
+  columns are the FK columns, chosen by constraints.md §6.5's canonical order): `page_read` × the
+  chosen tree's nodes overlapping `[P, prefix-successor(P))`, charged as one block. It is the same
+  logical overlap count as a bounded scan, computed without faulting a leaf. A miss on a resident
+  tree charges its root→leaf path; an empty child tree charges 0. The probe reads keys only, so it
+  charges no `storage_row_read` and no decompression.
+- **Full-scan fallback** (no usable child key): the full-scan block for the touched set **{the FK's
+  local columns}**: `page_read` × the child's node count plus those columns' overflow-chain pages,
+  and their `value_decompress` slabs. Then one `storage_row_read` per child row pulled in
+  storage-key order, up to and including the first match.
+
+So a `DELETE` of 1,000 childless parents over an unindexed 100,000-row child charges about
+1,000 × (child pages + 100,000). The ceiling now stops it. Indexing the FK columns brings the cost
+down to about 1,000 × the index's height. The child-side existence probe and the UPDATE re-probe of the parent
+stay unmetered: each is a single descent per metered row (below). Generated `CASCADE` / `SET NULL` /
+`SET DEFAULT` statements are ordinary DML and charge their own planned scans.
+`suites/ddl/foreign_key_child_index.test` pins both paths and the ceiling cross-core.
+
 ### What is NOT metered (defined boundary)
 
 Metering covers **execution** — per-row scans, per-row produced, per-row expression
@@ -1455,7 +1484,10 @@ evaluation. It deliberately does **not** meter:
 - **Uniqueness validation** — the primary-key duplicate check and the unique-index probes
   (indexes.md §8) at INSERT/UPDATE, and `CREATE UNIQUE INDEX`'s build verification, are
   constraint validation like NOT NULL (a branch, not expression evaluation): unmetered. An
-  INSERT into a uniquely-indexed table costs the same as into a plainly-indexed one.
+  INSERT into a uniquely-indexed table costs the same as into a plainly-indexed one. The
+  foreign-key **forward** probes (a child row's parent-existence check, and a parent UPDATE's
+  re-probe of its old key) share this boundary; the parent-side **reverse** match does not (the
+  subsection above).
 - **JOIN nested-loop control flow** — buffering each materialized table, iterating the
   Cartesian/left-deep combinations, and concatenating left+right rows are bookkeeping, not
   evaluation; only `storage_row_read` (per materialized row), the `ON`/WHERE/projection

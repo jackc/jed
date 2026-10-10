@@ -1632,42 +1632,84 @@ impl Engine {
         }
     }
 
-    /// Whether any row of `child_table` references the parent tuple `target` (the parent key bytes,
-    /// in the byte space [`fk_probe`] produces) via `fk` — the reverse of the child-side probe, a
-    /// full scan since child FK columns are not index-backed (spec/design/constraints.md §6.5).
-    /// MATCH SIMPLE: a child row with any NULL FK column references nothing. Rows whose storage key
-    /// is in `exclude` are skipped — the END STATE for a self-reference, whose child IS the table
-    /// being mutated (so its deleted/updated rows must not count). `parent` is the referenced
-    /// table's catalog. Unmetered validation.
+    /// Whether any row of `child_table` references the parent tuple via `fk` — the reverse of the
+    /// child-side probe (spec/design/constraints.md §6.5). `values` is the parent tuple in FK slot
+    /// order (`values[i]` pairs `fk.columns[i]` ⇄ `fk.ref_columns[i]`), every member non-NULL;
+    /// `target` is the same tuple in the parent's stored-key byte space ([`fk_probe`]). A usable
+    /// child PK/index is probed for the prefix; otherwise the child is scanned in storage-key order
+    /// (MATCH SIMPLE: a child row with any NULL FK column references nothing). Metered and guarded
+    /// before the work it pays for (constraints.md §6.11, cost.md §3 "Foreign-key reverse match").
     pub(crate) fn fk_child_references(
         &self,
         child_table: &str,
         fk: &ForeignKeyConstraint,
         parent: &Table,
+        values: &[Value],
         target: &[u8],
-        exclude: &HashSet<Vec<u8>>,
+        meter: &mut Meter,
     ) -> Result<bool> {
-        // `target` is in the parent's stored-key byte space, so the child probe encodes a collated
-        // parent key column with the PARENT's collation (§2.12).
-        let parent_colls = self.column_collations(&parent.columns);
-        let store = self.read_snap().store(child_table);
+        let snap = self.read_snap();
+        let child = snap.table(child_table).expect("foreign-key child exists");
+        let store = snap.store(child_table);
+        if let Some(path) = fk_choose_reverse_path(snap, fk, child, parent) {
+            let child_colls = self.column_collations(&child.columns);
+            let mut prefix = Vec::new();
+            for &c in &path.cols {
+                let slot = fk
+                    .columns
+                    .iter()
+                    .position(|&local| local == c)
+                    .expect("a reverse-path column is one of the FK's local columns");
+                let b = encode_typed_key(
+                    &child.columns[c].ty,
+                    &values[slot],
+                    child_colls[c].as_deref(),
+                )?;
+                if path.index.is_some() {
+                    prefix.push(0x00);
+                }
+                prefix.extend_from_slice(&b);
+            }
+            let bound = unique_probe_bound(&prefix);
+            let tree = match &path.index {
+                Some(name) => snap.index_store(name),
+                None => store,
+            };
+            meter.charge(COSTS.page_read * tree.overlap_node_count(&bound) as i64);
+            meter.guard()?;
+            let mut found = false;
+            tree.scan_range(&bound, &mut |_, _| {
+                found = true;
+                Ok(false)
+            })?;
+            return Ok(found);
+        }
         let mut mask = vec![false; store.col_types().len()];
         for &column in &fk.columns {
             mask[column] = true;
         }
-        for (k, mut row) in store.iter_entries()? {
-            if exclude.contains(&k) {
-                continue;
-            }
+        let (pages, slabs) = store.scan_units(&mask)?;
+        meter.charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
+        meter.guard()?;
+        // `target` is in the parent's stored-key byte space, so the child probe encodes a collated
+        // parent key column with the PARENT's collation (§2.12).
+        let parent_colls = self.column_collations(&parent.columns);
+        let mut found = false;
+        store.scan_range(&KeyBound::unbounded(), &mut |_, row| {
+            meter.charge(COSTS.storage_row_read);
+            meter.guard()?;
             // Persisted child rows may defer even inline values. Leave unrelated payloads deferred.
+            let mut row = row.clone();
             store.resolve_columns(&mut row, &mask)?;
-            if let Some(probe) = fk_probe(fk, parent, &parent_colls, &row, &fk.columns)? {
-                if probe.bytes() == target {
-                    return Ok(true);
-                }
+            if let Some(probe) = fk_probe(fk, parent, &parent_colls, &row, &fk.columns)?
+                && probe.bytes() == target
+            {
+                found = true;
+                return Ok(false);
             }
-        }
-        Ok(false)
+            Ok(true)
+        })?;
+        Ok(found)
     }
 
     /// Every (child table name, FK) pair in the visible snapshot whose FK references `parent_name`

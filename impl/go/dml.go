@@ -2602,6 +2602,7 @@ type fkDeferredCheck struct {
 	childTable string
 	fk         foreignKey
 	probe      fkProbe
+	values     []Value // the parent tuple in FK slot order, for the child-key reverse probe
 	update     bool
 }
 
@@ -2801,9 +2802,18 @@ func (db *engine) runFkUpdateAction(parent, child *catTable, fk *foreignKey, tra
 	return db.runFkActionUpdate(&update{Table: child.Name, DB: &main, Assignments: assignments, Filter: &filter}, params, meter)
 }
 
+// fkTupleValues copies a parent row's referenced tuple in FK slot order.
+func fkTupleValues(row storedRow, refColumns []int) []Value {
+	tuple := make([]Value, len(refColumns))
+	for i, column := range refColumns {
+		tuple[i] = row[column]
+	}
+	return tuple
+}
+
 // flushFkDeferredChecks validates the complete recursive closure. The queue order is the
 // deterministic depth-first action visitation order; no check can enqueue more work.
-func (db *engine) flushFkDeferredChecks() error {
+func (db *engine) flushFkDeferredChecks(meter *costMeter) error {
 	for i := range db.session.fkDeferredChecks {
 		check := &db.session.fkDeferredChecks[i]
 		if check.update {
@@ -2815,7 +2825,7 @@ func (db *engine) flushFkDeferredChecks() error {
 				continue
 			}
 		}
-		referenced, err := db.fkChildReferences(check.childTable, &check.fk, check.parent, check.probe.bytes, map[string]struct{}{})
+		referenced, err := db.fkChildReferences(check.childTable, &check.fk, check.parent, check.values, check.probe.bytes, meter)
 		if err != nil {
 			return err
 		}
@@ -2888,11 +2898,12 @@ func (db *engine) applyFkDeleteActions(parent *catTable, rows []storedRow, meter
 			}
 			db.session.fkDeferredChecks = append(db.session.fkDeferredChecks, fkDeferredCheck{
 				parent: parent, childTable: r.childTable, fk: r.fk, probe: probe,
+				values: fkTupleValues(row, r.fk.RefColumns),
 			})
 		}
 	}
 	if root {
-		return db.flushFkDeferredChecks()
+		return db.flushFkDeferredChecks(meter)
 	}
 	return nil
 }
@@ -2975,12 +2986,13 @@ func (db *engine) applyFkUpdateActions(parent *catTable, updates []fkUpdateTrans
 				continue
 			}
 			db.session.fkDeferredChecks = append(db.session.fkDeferredChecks, fkDeferredCheck{
-				parent: parent, childTable: r.childTable, fk: r.fk, probe: oldProbe, update: true,
+				parent: parent, childTable: r.childTable, fk: r.fk, probe: oldProbe,
+				values: fkTupleValues(u.oldRow, r.fk.RefColumns), update: true,
 			})
 		}
 	}
 	if root {
-		return db.flushFkDeferredChecks()
+		return db.flushFkDeferredChecks(meter)
 	}
 	return nil
 }

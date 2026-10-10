@@ -1034,33 +1034,141 @@ func (db *engine) fkProbeHits(probe fkProbe, parentTable string) (bool, error) {
 	}
 }
 
-// fkChildReferences reports whether any row of childTable references the parent tuple target (the
-// parent key bytes, in the byte space buildFkProbe produces) via fk — the reverse of the
-// child-side probe, a full scan since child FK columns are not index-backed
-// (spec/design/constraints.md §6.5). MATCH SIMPLE: a child row with any NULL FK column references
-// nothing. Rows whose storage key is in exclude are skipped — the END STATE for a self-reference,
-// whose child IS the table being mutated (so its deleted/updated rows must not count). parent is
-// the referenced table's catalog. Unmetered validation.
-func (db *engine) fkChildReferences(childTable string, fk *foreignKey, parent *catTable, target []byte, exclude map[string]struct{}) (bool, error) {
-	store := db.readSnap().store(childTable)
+// fkReversePath is the access path a parent-side reverse match uses on the child table
+// (spec/design/constraints.md §6.5): the child's PK (index == ""), a plain-column ordered B-tree
+// secondary index (index = its lowercased name), or — cols == nil — the full-scan fallback. cols
+// are the leading child key columns, in key order, whose set is exactly the FK's local columns.
+type fkReversePath struct {
+	index string
+	cols  []int
+}
+
+// fkReverseKeyUsable reports whether leading — the first len(fk.Columns) key columns of a child
+// tree — can serve fk's reverse match: the same column set as the FK's local columns, and every
+// text column collated exactly like its referenced parent column under a collation whose stored
+// keys are not version-skewed (constraints.md §6.5 step 1).
+func fkReverseKeyUsable(snap *snapshot, fk *foreignKey, child, parent *catTable, leading []int) bool {
+	if len(leading) != len(fk.Columns) || !slices.Equal(sortedUnique(leading), sortedUnique(fk.Columns)) {
+		return false
+	}
+	for slot, local := range fk.Columns {
+		coll := child.Columns[local].Collation
+		if coll != parent.Columns[fk.RefColumns[slot]].Collation {
+			return false
+		}
+		if coll != "" {
+			if _, _, _, _, skewed := snap.collationSkew(coll); skewed {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// fkChooseReversePath picks the child reverse-match path deterministically: the child PK, then
+// usable non-partial plain-column B-tree indexes in ascending lowercased-name order (the planner's
+// canonical tie order), else the full scan (constraints.md §6.5 steps 1–2).
+func fkChooseReversePath(snap *snapshot, fk *foreignKey, child, parent *catTable) fkReversePath {
+	k := len(fk.Columns)
+	if len(child.PK) >= k && fkReverseKeyUsable(snap, fk, child, parent, child.PK[:k]) {
+		return fkReversePath{cols: child.PK[:k]}
+	}
+	best := ""
+	var bestCols []int
+	for i := range child.Indexes {
+		ix := &child.Indexes[i]
+		if ix.Kind != indexBtree || ix.Predicate != nil || len(ix.Keys) < k {
+			continue
+		}
+		leading := make([]int, 0, k)
+		for _, key := range ix.Keys[:k] {
+			c, ok := key.asColumn()
+			if !ok {
+				break
+			}
+			leading = append(leading, c)
+		}
+		if len(leading) != k || !fkReverseKeyUsable(snap, fk, child, parent, leading) {
+			continue
+		}
+		name := strings.ToLower(ix.Name)
+		if bestCols == nil || name < best {
+			best, bestCols = name, leading
+		}
+	}
+	if bestCols != nil {
+		return fkReversePath{index: best, cols: bestCols}
+	}
+	return fkReversePath{}
+}
+
+// fkChildReferences reports whether any row of childTable references the parent tuple via fk —
+// the reverse of the child-side probe (spec/design/constraints.md §6.5). values is the parent
+// tuple in FK slot order (values[i] pairs fk.Columns[i] ⇄ fk.RefColumns[i]), every member
+// non-NULL; target is the same tuple in the parent's stored-key byte space (buildFkProbe). A
+// usable child PK/index is probed for the prefix; otherwise the child is scanned in storage-key
+// order (MATCH SIMPLE: a child row with any NULL FK column references nothing). Metered and guarded
+// before the work it pays for (constraints.md §6.11, cost.md §3 "Foreign-key reverse match").
+func (db *engine) fkChildReferences(childTable string, fk *foreignKey, parent *catTable, values []Value, target []byte, meter *costMeter) (bool, error) {
+	snap := db.readSnap()
+	child, ok := snap.table(childTable)
+	if !ok {
+		panic("foreign-key child exists")
+	}
+	store := snap.store(childTable)
+	if path := fkChooseReversePath(snap, fk, child, parent); path.cols != nil {
+		childColls := db.columnCollations(child.Columns)
+		var prefix []byte
+		for _, c := range path.cols {
+			b, err := encodeTypedKey(child.Columns[c].Type, values[slices.Index(fk.Columns, c)], childColls[c])
+			if err != nil {
+				return false, err
+			}
+			if path.index != "" {
+				prefix = append(prefix, 0x00)
+			}
+			prefix = append(prefix, b...)
+		}
+		bound := uniqueProbeBound(prefix)
+		tree := store
+		if path.index != "" {
+			tree = snap.indexStore(path.index)
+		}
+		meter.Charge(costs.PageRead * int64(tree.OverlapNodeCount(bound)))
+		if err := meter.Guard(); err != nil {
+			return false, err
+		}
+		found := false
+		err := tree.ScanRange(bound, func([]byte, storedRow) (bool, error) {
+			found = true
+			return false, nil
+		})
+		return found, err
+	}
 	mask := make([]bool, len(store.colTypes))
 	for _, column := range fk.Columns {
 		mask[column] = true
 	}
-	entries, err := store.EntriesInKeyOrder()
+	pages, slabs, err := store.ScanUnits(mask)
 	if err != nil {
+		return false, err
+	}
+	meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs))
+	if err := meter.Guard(); err != nil {
 		return false, err
 	}
 	// target is in the parent's stored-key byte space, so the child probe encodes a collated
 	// parent key column with the PARENT's collation (§2.12).
 	parentColls := db.columnCollations(parent.Columns)
-	for _, e := range entries {
-		if _, skip := exclude[string(e.Key)]; skip {
-			continue
+	found := false
+	err = store.ScanRange(unboundedBound(), func(_ []byte, row storedRow) (bool, error) {
+		meter.Charge(costs.StorageRowRead)
+		if err := meter.Guard(); err != nil {
+			return false, err
 		}
 		// Persisted child rows can hold deferred values, including inline text.
 		// Resolve only the FK columns; unrelated payloads must stay deferred.
-		row, err := store.resolveColumns(e.Row, mask)
+		row, err := store.resolveColumns(row, mask)
 		if err != nil {
 			return false, err
 		}
@@ -1069,10 +1177,12 @@ func (db *engine) fkChildReferences(childTable string, fk *foreignKey, parent *c
 			return false, err
 		}
 		if ok && bytes.Equal(probe.bytes, target) {
-			return true, nil
+			found = true
+			return false, nil
 		}
-	}
-	return false, nil
+		return true, nil
+	})
+	return found, err
 }
 
 // fkReferencer is one (child table name, FK) inbound-reference pair.

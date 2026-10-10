@@ -580,20 +580,48 @@ table (and the table itself, for a self-reference) that references this table:
   (the end state still contains every referenced tuple) where PostgreSQL's per-row check fails on
   the transient — the same end-state divergence `UNIQUE` carries (§6.7, [indexes.md §7](indexes.md)).
 
-Finding the children is the **reverse** of the child-side probe and is **not** index-accelerated:
-the child's FK columns are not necessarily indexed (PostgreSQL does not auto-index them either), so
-jed **full-scans** each referencing table for a row whose FK tuple equals the disappearing parent
-tuple (MATCH SIMPLE: a child row with any NULL FK column references nothing and is skipped). This is
-O(child rows) per parent mutation; an opt-in backing index on FK columns is a follow-on optimization
-slice ([../../TODO.md](../../TODO.md)). When more than one FK is violated, the reported one is
-deterministic: referencing tables in ascending lowercased-name order, then FKs in name order.
+Finding the children is the **reverse** of the child-side probe. PostgreSQL does not auto-index a
+child's FK columns, and neither does jed; but, like PostgreSQL, jed **uses** such an index when one
+exists. For each pending check (one per inbound NO ACTION/RESTRICT FK × disappearing parent tuple)
+the engine picks a **reverse access path** on the child table, deterministically from the catalog:
 
-The reverse scan resolves the child's FK columns through the child store before encoding a
+1. **A usable child key.** A child B-tree is usable when its **leading `k` key columns** (`k` = the
+   FK's width) are, as a **set**, exactly the FK's local columns, and every leading column whose type
+   is `text` has the **same effective collation** as its paired referenced parent column and that
+   collation is **not version-skewed** ([collation.md](collation.md) §8) — so a stored key and the
+   probe agree on the parent's equality. The candidates are the child's **primary key** (its
+   members in key order) and every **ordered B-tree secondary index**, unique or not, that is
+   **not partial** and whose leading `k` keys are **plain columns** (an expression key, GIN, GiST,
+   or a partial index never qualifies: a partial index can omit a referencing row). Trailing key
+   columns beyond `k` are ignored.
+2. **Tie order.** When several qualify, the **primary key** wins, then indexes in ascending
+   lowercased-name order — the planner's canonical access-path tie order
+   ([estimator.md](estimator.md)). Every qualifying path returns the same answer; the order only
+   fixes which tree is probed, and so the cost.
+3. **The probe.** The disappearing parent tuple's values are re-encoded in the **chosen child
+   key's column order**, each with the child column's type and collation (identical to the
+   parent's by §6.2 step 5 and the collation gate above): bare member encodings concatenated for
+   the PK, `0x00`-tagged slots for an index ([indexes.md §3](indexes.md)). The child holds a
+   referencing row iff the half-open prefix range `[P, prefix-successor(P))` holds **any** entry.
+   No row is reconstructed: every member of `P` is non-NULL, so a matching key is a complete,
+   non-NULL FK tuple (MATCH SIMPLE is satisfied by construction).
+4. **Fallback — the full scan.** With no usable key, jed scans the child in storage-key order for a
+   row whose FK tuple equals the disappearing parent tuple (MATCH SIMPLE: a child row with any NULL
+   FK column references nothing and is skipped), stopping at the first match. This is O(child rows)
+   per check, which is why the work is now **metered** (§6.11): indexing the FK columns turns it
+   into O(log child rows).
+
+Either path observes the statement's **end state** (the working snapshot after every generated
+write, whose index stores are maintained in phase 2). The answer is identical on every path, so the
+visible behavior — whether `23503` fires and which FK it names — does not depend on the choice. When
+more than one FK is violated, the reported one is deterministic: referencing tables in ascending
+lowercased-name order, then FKs in name order.
+
+The scan fallback resolves the child's FK columns through the child store before encoding a
 probe. Persisted rows may defer even small inline values, as well as compressed or external
 values ([lazy-record.md](lazy-record.md)); key encoders accept only materialized values.
-Resolve only the local FK-column mask, after excluding rows absent from the end state, on a
-private row copy. Unrelated payloads stay deferred, shared snapshots stay immutable, and
-decoding or I/O failures propagate normally. This remains unmetered validation (§6.11).
+Resolve only the local FK-column mask on a private row copy. Unrelated payloads stay deferred,
+shared snapshots stay immutable, and decoding or I/O failures propagate normally.
 
 ### 6.6 Referential actions
 
@@ -635,7 +663,7 @@ cannot overflow a core's native stack.
 `RETURNING` and the DML command tag remain those of the directly named statement: generated child
 rows are not appended and do not increase `rows_affected`. Their deterministic scan, expression,
 and compression work **does** accrue to the originating statement's cost and to its `max_cost` /
-`lifetime_max_cost` ceilings. The reverse FK match itself remains unmetered, as before (§6.11).
+`lifetime_max_cost` ceilings, as does the deferred NO ACTION/RESTRICT reverse match (§6.11).
 
 ### 6.7 Divergences from PostgreSQL (documented per CLAUDE.md §1)
 
@@ -702,15 +730,33 @@ always fine and takes its FK with it. (`DROP TABLE` cost stays zero — a pure c
 
 ### 6.11 Cost
 
-FK **validation and reverse matching** are unmetered, like the primary-key duplicate check and the
-uniqueness probes (cost.md §3 "What is NOT metered"): a child `INSERT`/`UPDATE` that only validates
-an FK accrues the same cost whether or not the constraint exists, and the parent-side scan that
-discovers matching children is not charged. (The `max_cost` ceiling therefore does not directly
-bound that reverse scan — acceptable because the child table's size is itself bounded by the metered
-work that populated it, the same reasoning `UNIQUE` relies on, §5; the backing-index follow-on would
-make it a probe.) A referential **write action**, however, executes the ordinary generated child
+The **child-side existence probe** (§6.4) and the UPDATE path's re-probe of the parent (does the
+old referenced tuple still exist?) are unmetered, like the primary-key duplicate check and the
+uniqueness probes (cost.md §3 "What is NOT metered"): each is one point/prefix descent per metered
+candidate row, so its work is bounded by the metered work that produced the row. A child
+`INSERT`/`UPDATE` that only validates an FK accrues the same cost whether or not the constraint
+exists.
+
+The parent-side **reverse match** (§6.5) is different: its work is per (parent row × child table),
+not per metered row, so a single cheap-looking `DELETE` could otherwise perform O(parents × children)
+comparisons the ceiling never sees. It is therefore **metered**, charged to the originating
+statement before the work it pays for, and `Guard`ed immediately, so `max_cost` /
+`lifetime_max_cost` stop it deterministically (cost.md §3 "Foreign-key reverse match"):
+
+- **Index probe** — `page_read` × the nodes of the chosen child tree that overlap the probe range
+  `[P, prefix-successor(P))` (the bounded-scan overlap rule), as one block. No row is reconstructed,
+  so no `storage_row_read`.
+- **Full-scan fallback** — the child's full-scan block for the FK-column touched set (`page_read` ×
+  node count plus those columns' overflow-chain pages, and `value_decompress` slabs), then one
+  `storage_row_read` per child row pulled in storage-key order, up to and including a match.
+
+(Before this slice the reverse match was unmetered, on the argument that the child table's size is
+bounded by the metered work that filled it. That bounds the child, not the product with the number
+of deleted parents.) A referential **write action**, however, executes the ordinary generated child
 UPDATE/DELETE pipeline and charges its scan, expression, and compression units to the originating
-statement (§6.6). Runtime errors in a `SET DEFAULT` expression propagate as themselves.
+statement (§6.6); that generated statement's own access path comes from the ordinary planner, which
+already uses a child index for a bounded predicate. Runtime errors in a `SET DEFAULT` expression
+propagate as themselves.
 
 ## 7. INSERT validation and write order
 

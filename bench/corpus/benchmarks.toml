@@ -1537,3 +1537,61 @@ expect_rows_per_iter = 1
 gen = "int_uniform"
 min = 1
 max = 1000000
+
+# Parent-side FK reverse match (ddl.foreign_key_child_index; constraints.md §6.5). Each iteration
+# deletes ten childless parents in one transaction, then rolls back. Every delete must confirm that
+# none of the 100k child rows still references the parent. With fk_ri_child_parent_idx on the FK
+# column, each check is one index descent. The unindexed sibling below keeps the full-scan fallback.
+# Before this slice both lanes scanned every child row per deleted parent. SQLite is excluded
+# because it enforces foreign keys only under PRAGMA foreign_keys = ON.
+[[bench]]
+name = "fk_delete_parent_indexed"
+description = "DELETE 10 childless parents over a 100k-row child with an index on the FK column, rolled back"
+dataset = "scratch"
+kind = "write_rollback"
+sql = "DELETE FROM fk_ri_parent WHERE id = $1"
+warmup = 100
+iterations = 1000
+seed = 4282
+batch = 10
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS fk_ri_child",
+  "DROP TABLE IF EXISTS fk_ri_parent",
+  "CREATE TABLE fk_ri_parent (id bigint PRIMARY KEY)",
+  "CREATE TABLE fk_ri_child (id bigint PRIMARY KEY, parent_id bigint REFERENCES fk_ri_parent)",
+  "INSERT INTO fk_ri_parent SELECT g FROM generate_series(CAST(1 AS bigint), CAST(2000 AS bigint)) AS g",
+  "INSERT INTO fk_ri_child SELECT g, g % 1000 + 1 FROM generate_series(CAST(1 AS bigint), CAST(100000 AS bigint)) AS g",
+  "CREATE INDEX fk_ri_child_parent_idx ON fk_ri_child (parent_id)"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1001
+max = 2000
+
+# The full-scan fallback for the same workload: no child key leads with parent_id.
+[[bench]]
+name = "fk_delete_parent_unindexed"
+description = "DELETE 10 childless parents over a 100k-row child with no index on the FK column, rolled back"
+dataset = "scratch"
+kind = "write_rollback"
+sql = "DELETE FROM fk_ri_scan_parent WHERE id = $1"
+warmup = 2
+iterations = 20
+seed = 4283
+batch = 10
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS fk_ri_scan_child",
+  "DROP TABLE IF EXISTS fk_ri_scan_parent",
+  "CREATE TABLE fk_ri_scan_parent (id bigint PRIMARY KEY)",
+  "CREATE TABLE fk_ri_scan_child (id bigint PRIMARY KEY, parent_id bigint REFERENCES fk_ri_scan_parent)",
+  "INSERT INTO fk_ri_scan_parent SELECT g FROM generate_series(CAST(1 AS bigint), CAST(2000 AS bigint)) AS g",
+  "INSERT INTO fk_ri_scan_child SELECT g, g % 1000 + 1 FROM generate_series(CAST(1 AS bigint), CAST(100000 AS bigint)) AS g"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1001
+max = 2000

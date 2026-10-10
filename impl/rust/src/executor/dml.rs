@@ -65,6 +65,8 @@ pub(super) struct FkDeferredCheck {
     child_table: String,
     fk: ForeignKeyConstraint,
     probe: FkProbe,
+    /// The parent tuple in FK slot order, for the child-key reverse probe.
+    values: Vec<Value>,
     update: bool,
 }
 
@@ -2653,7 +2655,7 @@ impl Engine {
 
     /// Validate every deferred inbound edge after the recursive write closure reaches a fixed
     /// point. Taking the queue avoids borrowing session state while probing the final snapshot.
-    fn flush_fk_deferred_checks(&mut self) -> Result<()> {
+    fn flush_fk_deferred_checks(&mut self, meter: &mut Meter) -> Result<()> {
         let checks = std::mem::take(&mut self.session.fk_deferred_checks);
         for check in checks {
             if check.update && self.fk_probe_hits(&check.probe, &check.parent.name)? {
@@ -2663,8 +2665,9 @@ impl Engine {
                 &check.child_table,
                 &check.fk,
                 &check.parent,
+                &check.values,
                 check.probe.bytes(),
-                &HashSet::new(),
+                meter,
             )? {
                 return Err(EngineError::fk_violation_delete(
                     &check.parent.name,
@@ -2743,6 +2746,7 @@ impl Engine {
                         child_table: child_name.clone(),
                         fk: fk.clone(),
                         probe,
+                        values: fk.ref_columns.iter().map(|&i| row[i].clone()).collect(),
                         update: false,
                     });
                 }
@@ -2750,7 +2754,7 @@ impl Engine {
             Ok(())
         })();
         if result.is_ok() && root {
-            result = self.flush_fk_deferred_checks();
+            result = self.flush_fk_deferred_checks(meter);
         }
         self.session.read_pin = saved_pin;
         if root {
@@ -2836,6 +2840,7 @@ impl Engine {
                         child_table: child_name.clone(),
                         fk: fk.clone(),
                         probe: old_probe,
+                        values: fk.ref_columns.iter().map(|&i| old_row[i].clone()).collect(),
                         update: true,
                     });
                 }
@@ -2843,7 +2848,7 @@ impl Engine {
             Ok(())
         })();
         if result.is_ok() && root {
-            result = self.flush_fk_deferred_checks();
+            result = self.flush_fk_deferred_checks(meter);
         }
         self.session.read_pin = saved_pin;
         if root {

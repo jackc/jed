@@ -162,6 +162,14 @@ func runOne(cfg Config, b *Bench, datasets *Datasets, dataDir, want string) (Res
 			return res, fmt.Errorf("setup_sql %q: %w", sql, err)
 		}
 	}
+	// A scratch write_rollback table is built by setup_sql, so its expected post-run count is the
+	// count observed now rather than a dataset spec row count (benchmarks.md §8).
+	var scratchRows int64
+	if b.Kind == "write_rollback" && b.Dataset == "scratch" {
+		if scratchRows, err = eng.QueryInt("SELECT count(*) FROM " + writeTable(b.SQL)); err != nil {
+			return res, err
+		}
+	}
 
 	if b.Kind == "concurrent_read" {
 		ce, ok := eng.(ConcurrentEngine)
@@ -252,6 +260,10 @@ func runOne(cfg Config, b *Bench, datasets *Datasets, dataDir, want string) (Res
 		var expect int64
 		switch b.Kind {
 		case "write_rollback":
+			if b.Dataset == "scratch" {
+				expect = scratchRows
+				break
+			}
 			ds, err := datasets.Find(b.Dataset)
 			if err != nil {
 				return res, err

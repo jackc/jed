@@ -52,6 +52,12 @@ Foreign keys accept `ON DELETE` and `ON UPDATE` with `NO ACTION` (the default), 
 uses each referencing column's declared default, or `NULL` when it has none; generated changes run
 the same type, `NOT NULL`, `CHECK`, uniqueness, and foreign-key checks as an ordinary statement.
 
+Deleting or re-keying a parent row checks every referencing table for rows that still point at it.
+As in PostgreSQL, jed does not index a foreign key's referencing columns for you. Without such an
+index each check scans the whole child table. Create an index that starts with the foreign-key
+columns (or make them the leading primary-key columns) and each check becomes one index lookup. The
+check's work counts toward a session's `max_cost`.
+
 ## Applying defaults
 
 Omitting a column or using `DEFAULT` in a VALUES slot applies its declared default. To insert one

@@ -3559,6 +3559,89 @@ pub(crate) fn fk_probe(
     }
 }
 
+/// The access path a parent-side reverse match uses on the child table
+/// (spec/design/constraints.md §6.5): the child's PK (`index == None`) or a plain-column ordered
+/// B-tree secondary index (`index` = its lowercased name). `cols` are the leading child key
+/// columns, in key order, whose set is exactly the FK's local columns. No path ⇒ the full-scan
+/// fallback.
+pub(crate) struct FkReversePath {
+    pub(crate) index: Option<String>,
+    pub(crate) cols: Vec<usize>,
+}
+
+/// Whether `leading` — the first `fk.columns.len()` key columns of a child tree — can serve `fk`'s
+/// reverse match: the same column set as the FK's local columns, and every text column collated
+/// exactly like its referenced parent column under a collation whose stored keys are not
+/// version-skewed (constraints.md §6.5 step 1).
+fn fk_reverse_key_usable(
+    snap: &Snapshot,
+    fk: &ForeignKeyConstraint,
+    child: &Table,
+    parent: &Table,
+    leading: &[usize],
+) -> bool {
+    if leading.len() != fk.columns.len() || sorted_unique(leading) != sorted_unique(&fk.columns) {
+        return false;
+    }
+    for (slot, &local) in fk.columns.iter().enumerate() {
+        let coll = &child.columns[local].collation;
+        if *coll != parent.columns[fk.ref_columns[slot]].collation {
+            return false;
+        }
+        if let Some(name) = coll
+            && snap.collation_skew(name).is_some()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Pick the child reverse-match path deterministically: the child PK, then usable non-partial
+/// plain-column B-tree indexes in ascending lowercased-name order (the planner's canonical tie
+/// order), else `None` — the full scan (constraints.md §6.5 steps 1–2).
+pub(crate) fn fk_choose_reverse_path(
+    snap: &Snapshot,
+    fk: &ForeignKeyConstraint,
+    child: &Table,
+    parent: &Table,
+) -> Option<FkReversePath> {
+    let k = fk.columns.len();
+    if child.pk.len() >= k && fk_reverse_key_usable(snap, fk, child, parent, &child.pk[..k]) {
+        return Some(FkReversePath {
+            index: None,
+            cols: child.pk[..k].to_vec(),
+        });
+    }
+    let mut best: Option<FkReversePath> = None;
+    for ix in &child.indexes {
+        if ix.kind != IndexKind::Btree || ix.predicate.is_some() || ix.keys.len() < k {
+            continue;
+        }
+        let Some(leading) = ix.keys[..k]
+            .iter()
+            .map(IndexKey::as_column)
+            .collect::<Option<Vec<usize>>>()
+        else {
+            continue;
+        };
+        if !fk_reverse_key_usable(snap, fk, child, parent, &leading) {
+            continue;
+        }
+        let name = ix.name.to_ascii_lowercase();
+        if best
+            .as_ref()
+            .is_none_or(|b| name < *b.index.as_ref().expect("an index path"))
+        {
+            best = Some(FkReversePath {
+                index: Some(name),
+                cols: leading,
+            });
+        }
+    }
+    best
+}
+
 /// Construct a PK tuple's maximal equality prefix plus optional range on the next member. Each
 /// filter is walked as a top-level AND chain; ordinary scans pass WHERE, while INL passes ON+WHERE.
 pub(crate) fn detect_pk_bound(

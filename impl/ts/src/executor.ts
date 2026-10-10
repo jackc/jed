@@ -1359,6 +1359,8 @@ export class Engine {
     childTable: string;
     fk: ForeignKey;
     probe: FkProbe;
+    // The parent tuple in FK slot order, for the child-key reverse probe.
+    values: Value[];
     update: boolean;
   }[] = [];
 
@@ -7731,34 +7733,71 @@ export class Engine {
     );
   }
 
-  // fkChildReferences reports whether any row of `childTable` references the parent tuple `target`
-  // (the parent key bytes, in the byte space fkProbe produces) via `fk` — the reverse of the
-  // child-side probe, a full scan since child FK columns are not index-backed
-  // (spec/design/constraints.md §6.5). MATCH SIMPLE: a child row with any NULL FK column references
-  // nothing. Rows whose storage key is in `exclude` are skipped — the END STATE for a
-  // self-reference, whose child IS the table being mutated (so its deleted/updated rows must not
-  // count). `parent` is the referenced table's catalog. Unmetered validation.
+  // fkChildReferences reports whether any row of `childTable` references the parent tuple via `fk` —
+  // the reverse of the child-side probe (spec/design/constraints.md §6.5). `values` is the parent
+  // tuple in FK slot order (values[i] pairs fk.columns[i] ⇄ fk.refColumns[i]), every member
+  // non-NULL; `target` is the same tuple in the parent's stored-key byte space (fkProbe). A usable
+  // child PK/index is probed for the prefix; otherwise the child is scanned in storage-key order
+  // (MATCH SIMPLE: a child row with any NULL FK column references nothing). Metered and guarded
+  // before the work it pays for (constraints.md §6.11, cost.md §3 "Foreign-key reverse match").
   private fkChildReferences(
     childTable: string,
     fk: ForeignKey,
     parent: Table,
+    values: Value[],
     target: Uint8Array,
-    exclude: Set<string>,
+    meter: Meter,
   ): boolean {
+    const snap = this.readSnap();
+    const child = snap.table(childTable);
+    if (child === undefined) throw new Error("foreign-key child exists");
+    const store = snap.store(childTable);
+    const path = fkChooseReversePath(snap, fk, child, parent);
+    if (path !== null) {
+      const childColls = this.columnCollations(child.columns);
+      const parts: Uint8Array[] = [];
+      for (const c of path.cols) {
+        const b = encodeTypedKey(
+          child.columns[c]!.type,
+          values[fk.columns.indexOf(c)]!,
+          childColls[c] ?? null,
+        );
+        if (path.index !== null) parts.push(new Uint8Array([0x00]));
+        parts.push(b);
+      }
+      const bound = uniqueProbeBound(concatBytes(parts));
+      const tree = path.index === null ? store : snap.indexStore(path.index);
+      meter.charge(COSTS.pageRead * BigInt(tree.overlapNodeCount(bound)));
+      meter.guard();
+      let found = false;
+      tree.scanRange(bound, () => {
+        found = true;
+        return false;
+      });
+      return found;
+    }
+    const mask = store.columnTypes().map(() => false);
+    for (const column of fk.columns) mask[column] = true;
+    const { pages, slabs } = store.scanUnits(mask);
+    meter.charge(COSTS.pageRead * BigInt(pages) + COSTS.valueDecompress * BigInt(slabs));
+    meter.guard();
     // target is in the parent's stored-key byte space, so the child probe encodes a collated parent
     // key column with the PARENT's collation (§2.12).
     const parentColls = this.columnCollations(parent.columns);
-    const store = this.readSnap().store(childTable);
-    const mask = store.columnTypes().map(() => false);
-    for (const column of fk.columns) mask[column] = true;
-    for (const e of store.entriesInKeyOrder()) {
-      if (exclude.has(e.key.join(","))) continue;
+    let found = false;
+    store.scanRange(unboundedBound(), (_key, stored) => {
+      meter.charge(COSTS.storageRowRead);
+      meter.guard();
       // Persisted child rows may defer even inline values. Leave unrelated payloads deferred.
-      const row = store.resolveColumns(e.row, mask);
+      const row = store.resolveColumns(stored, mask);
       const probe = fkProbe(fk, parent, parentColls, row, fk.columns);
-      if (probe !== null && bytesEq(fkProbeBytes(probe), target)) return true;
-    }
-    return false;
+      if (probe !== null && bytesEq(fkProbeBytes(probe), target)) {
+        found = true;
+        return false;
+      }
+      return true;
+    });
+    return found;
   }
 
   // fkReferencers returns every (child table name, FK) pair in the visible snapshot whose FK
@@ -10830,7 +10869,9 @@ export class Engine {
     );
   }
 
-  private flushFkDeferredChecks(): void {
+  // flushFkDeferredChecks validates the complete recursive closure. The queue order is the
+  // deterministic depth-first action visitation order; no check can enqueue more work.
+  private flushFkDeferredChecks(meter: Meter): void {
     const checks = this.fkDeferredChecks;
     this.fkDeferredChecks = [];
     for (const check of checks) {
@@ -10840,8 +10881,9 @@ export class Engine {
           check.childTable,
           check.fk,
           check.parent,
+          check.values,
           fkProbeBytes(check.probe),
-          new Set(),
+          meter,
         )
       ) {
         throw fkViolationDelete(check.parent.name, check.fk.name, check.childTable);
@@ -10893,12 +10935,13 @@ export class Engine {
               childTable,
               fk,
               probe,
+              values: fk.refColumns.map((column) => row[column]!),
               update: false,
             });
           }
         }
       }
-      if (root) this.flushFkDeferredChecks();
+      if (root) this.flushFkDeferredChecks(meter);
     } finally {
       this.session.readPin = savedPin;
       if (root) this.fkDeferredChecks = [];
@@ -10951,11 +10994,12 @@ export class Engine {
             childTable,
             fk,
             probe: oldProbe,
+            values: fk.refColumns.map((column) => u.oldRow[column]!),
             update: true,
           });
         }
       }
-      if (root) this.flushFkDeferredChecks();
+      if (root) this.flushFkDeferredChecks(meter);
     } finally {
       this.session.readPin = savedPin;
       if (root) this.fkDeferredChecks = [];
@@ -21752,6 +21796,66 @@ export function indexPrefixKey(
     parts.push(Uint8Array.of(0x00), b);
   }
   return concatBytes(parts);
+}
+
+// fkReversePath is the access path a parent-side reverse match uses on the child table
+// (spec/design/constraints.md §6.5): the child's PK (index === null) or a plain-column ordered
+// B-tree secondary index (index = its lowercased name); null from fkChooseReversePath is the
+// full-scan fallback. cols are the leading child key columns, in key order, whose set is exactly
+// the FK's local columns.
+type FkReversePath = { index: string | null; cols: number[] };
+
+// fkReverseKeyUsable reports whether `leading` — the first fk.columns.length key columns of a child
+// tree — can serve fk's reverse match: the same column set as the FK's local columns, and every
+// text column collated exactly like its referenced parent column under a collation whose stored
+// keys are not version-skewed (constraints.md §6.5 step 1).
+function fkReverseKeyUsable(
+  snap: Snapshot,
+  fk: ForeignKey,
+  child: Table,
+  parent: Table,
+  leading: number[],
+): boolean {
+  if (
+    leading.length !== fk.columns.length ||
+    !sameSet(sortedUnique(leading), sortedUnique(fk.columns))
+  ) {
+    return false;
+  }
+  for (let slot = 0; slot < fk.columns.length; slot++) {
+    const coll = child.columns[fk.columns[slot]!]!.collation;
+    if (coll !== parent.columns[fk.refColumns[slot]!]!.collation) return false;
+    if (coll !== null && snap.collationSkew(coll) !== undefined) return false;
+  }
+  return true;
+}
+
+// fkChooseReversePath picks the child reverse-match path deterministically: the child PK, then
+// usable non-partial plain-column B-tree indexes in ascending lowercased-name order (the planner's
+// canonical tie order), else null — the full scan (constraints.md §6.5 steps 1–2).
+function fkChooseReversePath(
+  snap: Snapshot,
+  fk: ForeignKey,
+  child: Table,
+  parent: Table,
+): FkReversePath | null {
+  const k = fk.columns.length;
+  if (child.pk.length >= k && fkReverseKeyUsable(snap, fk, child, parent, child.pk.slice(0, k))) {
+    return { index: null, cols: child.pk.slice(0, k) };
+  }
+  let best: FkReversePath | null = null;
+  for (const ix of child.indexes) {
+    if (ix.kind !== "btree" || ix.predicate !== undefined || ix.keys.length < k) continue;
+    const leading: number[] = [];
+    for (const key of ix.keys.slice(0, k)) {
+      if (key.kind !== "column") break;
+      leading.push(key.column);
+    }
+    if (leading.length !== k || !fkReverseKeyUsable(snap, fk, child, parent, leading)) continue;
+    const name = ix.name.toLowerCase();
+    if (best === null || name < best.index!) best = { index: name, cols: leading };
+  }
+  return best;
 }
 
 // uniqueProbeBound is the half-open byte range [prefix, byte-successor(prefix)) — every

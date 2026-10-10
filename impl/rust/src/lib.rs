@@ -172,6 +172,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // columns must be a parent PK/UNIQUE set (42830); persisted (format_version 11)
     // (constraints.md §6, grammar.md §43).
     "ddl.foreign_key",
+    "ddl.foreign_key_child_index",
     // DROP TABLE — remove a table (definition + rows) from the catalog (grammar.md §13).
     "ddl.drop_table",
     // DROP TABLE IF EXISTS — the idempotent form: a missing table is a no-op success rather

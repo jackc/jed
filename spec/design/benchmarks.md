@@ -1212,7 +1212,11 @@ Two write kinds:
   default `synchronous_commit=on`; SQLite: `PRAGMA journal_mode=DELETE; PRAGMA
   synchronous=FULL`. The final `count(*)` must equal `warmup + iterations`.
 
-`dataset = "scratch"` is reserved for `write_durable`: jed/SQLite harnesses create a
+A `write_rollback` bench may also use `dataset = "scratch"` when its `setup_sql` builds the
+written table; its expected post-run `count(*)` is then the count observed right after
+`setup_sql`, not a dataset spec row count (the `fk_delete_parent_*` lanes).
+
+`dataset = "scratch"` otherwise serves `write_durable`: jed/SQLite harnesses create a
 fresh file in a per-run temp dir under `bench/data/` (removed on exit); for PostgreSQL,
 `bench-setup` creates an empty `jed_bench_scratch` database once and the harness runs
 `DROP TABLE IF EXISTS` + the bench's `setup_sql` per run. No fingerprint applies to

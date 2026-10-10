@@ -699,7 +699,7 @@ reason = "jed: ordering a subquery BY an enclosing-query column is a degenerate 
 # documented surface narrowing, the single defined `C`/byte collation (§8), or a jed extension PG
 # lacks. NOT ledgered here, by design (documented, but not PG-comparable divergences): the
 # cost-ceiling `54P01` + depth-limit `54001` records in resource/{cost_limit,depth_limit} and
-# query/{generate_series,unnest} — jed-only resource bounds (§13) the oracle cannot model; the
+# query/{generate_series,unnest} + ddl/foreign_key_child_index — jed-only resource bounds (§13) the oracle cannot model; the
 # entropy/clock-seam DIFFs in expr/{clock_functions,uuid_generate} + ddl/column_default_expr —
 # deterministic-given-the-injected-seed and ledgered in determinism_exceptions.toml, so PG's live
 # clock/entropy regenerates different bytes every run; and transactions/* — txn-control replay
