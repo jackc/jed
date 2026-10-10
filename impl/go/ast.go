@@ -589,6 +589,10 @@ type update struct {
 	// Returning is the optional terminal RETURNING clause (spec/design/grammar.md §32):
 	// project each matched row's NEW (post-assignment) values. Nil = no clause.
 	Returning *returningClause
+	// fkTarget is set only on a generated referential action (constraints.md §6.6): the target rows
+	// are gathered by key instead of selected by Filter (which is then nil), and an ON UPDATE
+	// CASCADE takes each row's new FK values from its map.
+	fkTarget *fkKeyedTarget
 }
 
 // Assignment is one `SET <Column> = <Value>` clause; Value is a general expression.
@@ -612,6 +616,9 @@ type deleteStmt struct {
 	// Returning is the optional terminal RETURNING clause (spec/design/grammar.md §32):
 	// project each deleted row's OLD values. Nil = no clause.
 	Returning *returningClause
+	// fkTarget is set only on a generated referential action (constraints.md §6.6): the target rows
+	// are gathered by key instead of selected by Filter (which is then nil).
+	fkTarget *fkKeyedTarget
 }
 
 // returningClause is a DML RETURNING clause. OldAlias / NewAlias are the optional PostgreSQL-18

@@ -27,9 +27,12 @@ INSERT INTO act_c VALUES (10, 1), (20, 1), (30, 2)
 statement ok
 INSERT INTO act_g VALUES (100, 10), (200, 20), (300, 30)
 
-# The generated child UPDATE's ordinary scan/eval work accrues to the parent statement. RETURNING
-# remains scoped to the directly updated parent row rather than including generated child rows.
-# cost: 17
+# The generated child UPDATE's work accrues to the parent statement. RETURNING remains scoped to
+# the directly updated parent row rather than including generated child rows. The parent UPDATE is
+# 1 page + 1 row + 1 filter eval + 1 returned row = 4. The keyed cascade into act_c (no key leads
+# with pid) is one full scan, 1 page + 3 rows; the tuple match and old->new lookup are unmetered
+# (constraints.md §6.11). 4 + 4 = 8.
+# cost: 8
 query I nosort
 UPDATE act_p SET id = 11 WHERE id = 1 RETURNING id
 ----

@@ -3527,6 +3527,7 @@ impl Parser {
             assignments,
             filter,
             returning,
+            fk_target: None,
         })
     }
 
@@ -3542,6 +3543,7 @@ impl Parser {
             db,
             filter,
             returning,
+            fk_target: None,
         })
     }
 

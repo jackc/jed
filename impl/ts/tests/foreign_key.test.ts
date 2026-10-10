@@ -68,11 +68,20 @@ test("FK parent UPDATE end-state swap allowed", () => {
     "INSERT INTO c VALUES (10, 100), (11, 200)",
     "CREATE TABLE cc (id i32 PRIMARY KEY, pc i32 REFERENCES p (code) ON UPDATE CASCADE)",
     "INSERT INTO cc VALUES (20, 100), (21, 200)",
+    // ci's index makes its cascade gather through the keyed index path (constraints.md §6.6); cc
+    // keeps the full-scan fallback. Each child row is visited once in either case.
+    "CREATE TABLE ci (id i32 PRIMARY KEY, pc i32 REFERENCES p (code) ON UPDATE CASCADE)",
+    "CREATE INDEX ci_pc ON ci (pc)",
+    "INSERT INTO ci VALUES (30, 100), (31, 200)",
   ]);
   db.execute("UPDATE p SET code = CASE code WHEN 100 THEN 200 ELSE 100 END"); // swap — end state valid
   assert.deepEqual(query(db, "SELECT id, pc FROM cc ORDER BY id"), [
     ["20", "200"],
     ["21", "100"],
+  ]);
+  assert.deepEqual(query(db, "SELECT id, pc FROM ci ORDER BY id"), [
+    ["30", "200"],
+    ["31", "100"],
   ]);
   assert.equal(
     errCode(() => db.execute("UPDATE p SET code = 999 WHERE id = 1")),
@@ -87,16 +96,27 @@ test("FK action preserves main scope across temp overlap", () => {
   const shadowed = db.session({});
   shadowed.execute("CREATE TEMP TABLE c (temp_id i32 PRIMARY KEY, scratch text)");
   shadowed.execute("INSERT INTO c VALUES (99, 'keep')");
+  // ci's index makes its cascade gather through the keyed index path, whose child-row lookups must
+  // also stay in main (constraints.md §6.6).
+  shadowed.execute("CREATE TEMP TABLE ci (temp_id i32 PRIMARY KEY)");
+  shadowed.execute("INSERT INTO ci VALUES (98)");
 
   const persistent = db.session({});
   persistent.execute("CREATE TABLE p (id i32 PRIMARY KEY)");
   persistent.execute("CREATE TABLE c (id i32 PRIMARY KEY, pid i32 REFERENCES p ON DELETE CASCADE)");
   persistent.execute("INSERT INTO p VALUES (1)");
   persistent.execute("INSERT INTO c VALUES (10, 1)");
+  persistent.execute(
+    "CREATE TABLE ci (id i32 PRIMARY KEY, pid i32 REFERENCES p ON DELETE CASCADE)",
+  );
+  persistent.execute("CREATE INDEX ci_pid ON ci (pid)");
+  persistent.execute("INSERT INTO ci VALUES (20, 1)");
 
   shadowed.execute("DELETE FROM main.p WHERE id = 1");
   assert.deepEqual(query(persistent, "SELECT id FROM c"), []);
   assert.deepEqual(query(shadowed, "SELECT temp_id, scratch FROM c"), [["99", "keep"]]);
+  assert.deepEqual(query(persistent, "SELECT id FROM ci"), []);
+  assert.deepEqual(query(shadowed, "SELECT temp_id FROM ci"), [["98"]]);
   persistent.close();
   shadowed.close();
 });

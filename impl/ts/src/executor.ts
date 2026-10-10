@@ -311,7 +311,6 @@ import {
   intValue,
   isTrue,
   nullValue,
-  render as valueRender,
   renderByteaHex,
   renderFloat,
   renderUuid,
@@ -7754,18 +7753,7 @@ export class Engine {
     const store = snap.store(childTable);
     const path = fkChooseReversePath(snap, fk, child, parent);
     if (path !== null) {
-      const childColls = this.columnCollations(child.columns);
-      const parts: Uint8Array[] = [];
-      for (const c of path.cols) {
-        const b = encodeTypedKey(
-          child.columns[c]!.type,
-          values[fk.columns.indexOf(c)]!,
-          childColls[c] ?? null,
-        );
-        if (path.index !== null) parts.push(new Uint8Array([0x00]));
-        parts.push(b);
-      }
-      const bound = uniqueProbeBound(concatBytes(parts));
+      const bound = uniqueProbeBound(this.fkReversePrefix(path, fk, child, values));
       const tree = path.index === null ? store : snap.indexStore(path.index);
       meter.charge(COSTS.pageRead * BigInt(tree.overlapNodeCount(bound)));
       meter.guard();
@@ -7798,6 +7786,109 @@ export class Engine {
       return true;
     });
     return found;
+  }
+
+  // fkReversePrefix encodes a parent tuple (FK slot order) as the chosen child key's probe prefix:
+  // bare member encodings for the PK, 0x00-tagged slots for an index (constraints.md §6.5 step 3).
+  private fkReversePrefix(
+    path: FkReversePath,
+    fk: ForeignKey,
+    child: Table,
+    values: Value[],
+  ): Uint8Array {
+    const childColls = this.columnCollations(child.columns);
+    const parts: Uint8Array[] = [];
+    for (const c of path.cols) {
+      const b = encodeTypedKey(
+        child.columns[c]!.type,
+        values[fk.columns.indexOf(c)]!,
+        childColls[c] ?? null,
+      );
+      if (path.index !== null) parts.push(new Uint8Array([0x00]));
+      parts.push(b);
+    }
+    return concatBytes(parts);
+  }
+
+  // newFkKeyedTarget de-duplicates old (and pairs each with its new tuple when next is non-null).
+  // Every tuple is complete (non-NULL) — the callers drop MATCH SIMPLE-exempt parent rows.
+  private newFkKeyedTarget(
+    parent: Table,
+    fk: ForeignKey,
+    old: Value[][],
+    next: Value[][] | null,
+  ): FkKeyedTarget {
+    const t: FkKeyedTarget = {
+      parent,
+      parentColls: this.columnCollations(parent.columns),
+      fk,
+      tuples: [],
+      next: next !== null ? [] : null,
+      keys: new Map(),
+    };
+    old.forEach((tuple, i) => {
+      const probe = fkProbe(fk, parent, t.parentColls, tuple, fkSlotOrdinals(tuple.length));
+      if (probe === null) return;
+      const key = fkProbeBytes(probe).join(",");
+      if (t.keys.has(key)) return;
+      t.keys.set(key, t.tuples.length);
+      t.tuples.push(tuple);
+      if (next !== null) t.next!.push(next[i]!);
+    });
+    return t;
+  }
+
+  // fkKeyedScan gathers a keyed target's candidate child rows (constraints.md §6.6): one prefix
+  // probe per tuple through the §6.5 reverse path, de-duplicated and in storage-key order, or else
+  // the child's full scan. The batch's page/slab block is the sum of the probes' bounded-scan blocks
+  // (or the full-scan block); the caller charges it, then storageRowRead per entry, then applies
+  // fkKeyedMatch as the row filter.
+  private fkKeyedScan(t: FkKeyedTarget, childTable: string, mask: boolean[]): MutationScanBatch {
+    const snap = this.readSnap();
+    const child = snap.table(childTable);
+    if (child === undefined) throw new Error("foreign-key child exists");
+    const store = snap.store(childTable);
+    const path = fkChooseReversePath(snap, t.fk, child, t.parent);
+    if (path === null) {
+      const r = store.scanWithUnits(mask);
+      return { entries: r.entries, pages: r.pages, slabs: r.slabs, empty: false };
+    }
+    const suffix: ScalarType[] = [];
+    if (path.index !== null) {
+      const ix = child.indexes.find((i) => i.name.toLowerCase() === path.index);
+      if (ix !== undefined) {
+        for (const key of ix.keys.slice(path.cols.length)) {
+          if (key.kind === "column") suffix.push(typeAsScalar(child.columns[key.column]!.type)!);
+        }
+      }
+    }
+    const out: MutationScanBatch = { entries: [], pages: 0, slabs: 0, empty: false };
+    const seen = new Set<string>();
+    for (const tuple of t.tuples) {
+      const prefix = this.fkReversePrefix(path, t.fk, child, tuple);
+      const bound = uniqueProbeBound(prefix);
+      const r =
+        path.index === null
+          ? store.rangeScanWithUnits(bound, mask)
+          : indexStoreBoundEntries(
+              snap.indexStore(path.index),
+              store,
+              suffix,
+              bound,
+              prefix.length,
+              mask,
+            );
+      out.pages += r.pages;
+      out.slabs += r.slabs;
+      for (const e of r.entries) {
+        const key = e.key.join(",");
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.entries.push(e);
+      }
+    }
+    out.entries.sort((a, b) => compareBytes(a.key, b.key));
+    return out;
   }
 
   // fkReferencers returns every (child table name, FK) pair in the visible snapshot whose FK
@@ -8516,30 +8607,14 @@ export class Engine {
     prefixByteLen: number,
     mask: boolean[],
   ): { entries: Entry[]; pages: number; slabs: number } {
-    const istore = this.lkpIndexStore(nameKey);
-    // The index store has no payload columns, so its mask is empty and its fused scan
-    // contributes only the index-tree page_read count (no spill/compress units).
-    const iscan = istore.rangeScanWithUnits(b, []);
-    let pages = iscan.pages;
-    const store = this.lkpStore(tableName);
-    let slabs = 0;
-    const rows: Entry[] = [];
-    for (const e of iscan.entries) {
-      // Skip the equality prefix by its known byte length, then each remaining key component by width
-      // (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the fixed width, indexes.md §5.1); the
-      // suffix after them is the row's storage key (indexes.md §3).
-      let at = prefixByteLen;
-      for (const ty of suffixTypes) {
-        at += e.key[at] === 0x01 ? 1 : 1 + widthBytes(ty);
-      }
-      const rowKey = e.key.slice(at);
-      const u = store.getWithUnits(rowKey, mask);
-      pages += u.pages;
-      slabs += u.slabs;
-      if (u.row === undefined) throw new Error("an index entry references a stored row");
-      rows.push({ key: rowKey, row: u.row });
-    }
-    return { entries: rows, pages, slabs };
+    return indexStoreBoundEntries(
+      this.lkpIndexStore(nameKey),
+      this.lkpStore(tableName),
+      suffixTypes,
+      b,
+      prefixByteLen,
+      mask,
+    );
   }
 
   // indexPointRows fetches the rows a SINGLE already-encoded leading-column index value admits — the
@@ -10650,77 +10725,6 @@ export class Engine {
     return out;
   }
 
-  // Combine a non-empty expression list as a balanced tree so a large parent batch does not make
-  // generated referential-action predicates linear in resolver/evaluator stack depth.
-  private balancedFkExpr(exprs: Expr[], op: BinaryOp): Expr {
-    while (exprs.length > 1) {
-      const next: Expr[] = [];
-      for (let i = 0; i < exprs.length; i += 2) {
-        const lhs = exprs[i]!;
-        const rhs = exprs[i + 1];
-        next.push(rhs === undefined ? lhs : { kind: "binary", op, lhs, rhs });
-      }
-      exprs = next;
-    }
-    return exprs[0]!;
-  }
-
-  // Build a typed constant for generated action SQL. Public parameter inference is intentionally
-  // scalar-only, so keyable containers use their byte-exact text output under an explicit cast.
-  private fkActionValueExpr(type: Type, value: Value, params: Value[]): Expr {
-    if (type.kind === "scalar") {
-      params.push(value);
-      return { kind: "param", index: params.length };
-    }
-    if (type.kind !== "array" && type.kind !== "range") {
-      throw new Error("foreign-key action key is a keyable scalar, array, or range");
-    }
-    return {
-      kind: "cast",
-      inner: { kind: "literal", literal: { kind: "text", text: valueRender(value) } },
-      typeName: typeCanonicalName(type),
-      typeMod: null,
-    };
-  }
-
-  // One child FK-tuple equality in the parent key's collation.
-  private fkActionMatchExpr(
-    parent: Table,
-    child: Table,
-    fk: ForeignKey,
-    values: Expr[],
-  ): Expr {
-    const parts: Expr[] = fk.columns.map((local, slot) => {
-      const referenced = fk.refColumns[slot]!;
-      let lhs: Expr = { kind: "column", name: child.columns[local]!.name };
-      const parentColumn = parent.columns[referenced]!;
-      if (parentColumn.type.kind === "scalar" && parentColumn.type.scalar === "text") {
-        lhs = { kind: "collate", inner: lhs, collation: parentColumn.collation ?? "C" };
-      }
-      return { kind: "binary", op: "eq", lhs, rhs: values[slot]! };
-    });
-    return this.balancedFkExpr(parts, "and");
-  }
-
-  private fkActionPredicate(
-    parent: Table,
-    child: Table,
-    fk: ForeignKey,
-    oldTuples: Value[][],
-  ): { filter: Expr; params: Value[]; values: Expr[][] } {
-    const params: Value[] = [];
-    const values: Expr[][] = [];
-    const matches: Expr[] = [];
-    for (const tuple of oldTuples) {
-      const tupleValues = tuple.map((value, slot) =>
-        this.fkActionValueExpr(parent.columns[fk.refColumns[slot]!]!.type, value, params),
-      );
-      values.push(tupleValues);
-      matches.push(this.fkActionMatchExpr(parent, child, fk, tupleValues));
-    }
-    return { filter: this.balancedFkExpr(matches, "or"), params, values };
-  }
-
   // Generated statements share the originating statement's remaining ceiling and lifetime
   // counter. Their accrued statement cost is folded into the caller without charging lifetime twice.
   private runFkActionUpdate(update: Update, params: Value[], meter: Meter): void {
@@ -10773,11 +10777,11 @@ export class Engine {
     meter: Meter,
   ): void {
     if (oldTuples.length === 0) return;
-    const { filter, params } = this.fkActionPredicate(parent, child, fk, oldTuples);
+    const fkTarget = this.newFkKeyedTarget(parent, fk, oldTuples, null);
     if (fk.onDelete === "cascade") {
       this.runFkActionDelete(
-        { kind: "delete", table: child.name, db: "main", filter, returning: null },
-        params,
+        { kind: "delete", table: child.name, db: "main", filter: null, returning: null, fkTarget },
+        [],
         meter,
       );
     } else if (fk.onDelete === "setNull" || fk.onDelete === "setDefault") {
@@ -10791,10 +10795,11 @@ export class Engine {
             isDefault: fk.onDelete === "setDefault",
             value: { kind: "literal", literal: { kind: "null" } },
           })),
-          filter,
+          filter: null,
           returning: null,
+          fkTarget,
         },
-        params,
+        [],
         meter,
       );
     }
@@ -10809,41 +10814,19 @@ export class Engine {
   ): void {
     if (transitions.length === 0) return;
     const oldTuples = transitions.map(([oldTuple]) => oldTuple);
-    const action = this.fkActionPredicate(parent, child, fk, oldTuples);
+    const newTuples =
+      fk.onUpdate === "cascade" ? transitions.map(([, newTuple]) => newTuple) : null;
     const assignments: import("./ast.ts").Assignment[] = [];
     if (fk.onUpdate === "cascade") {
-      const newValues = transitions.map(([, newTuple]) =>
-        newTuple.map((value, slot) =>
-          this.fkActionValueExpr(
-            parent.columns[fk.refColumns[slot]!]!.type,
-            value,
-            action.params,
-          ),
-        ),
-      );
-      fk.columns.forEach((column, slot) => {
+      // Each assignment is a placeholder self-reference; executeUpdate substitutes the row's
+      // mapped new value before coercion and validation (constraints.md §6.6 "Keyed target").
+      for (const column of fk.columns) {
         assignments.push({
           column: child.columns[column]!.name,
           isDefault: false,
-          value: {
-            kind: "case",
-            operand: null,
-            whens: action.values.map((values, i) => ({
-              cond: this.fkActionMatchExpr(parent, child, fk, values),
-              result:
-                child.columns[column]!.type.kind === "scalar"
-                  ? {
-                      kind: "cast",
-                      inner: newValues[i]![slot]!,
-                      typeName: typeCanonicalName(child.columns[column]!.type),
-                      typeMod: null,
-                    }
-                  : newValues[i]![slot]!,
-            })),
-            els: { kind: "column", name: child.columns[column]!.name },
-          },
+          value: { kind: "column", name: child.columns[column]!.name },
         });
-      });
+      }
     } else if (fk.onUpdate === "setNull" || fk.onUpdate === "setDefault") {
       for (const column of fk.columns) {
         assignments.push({
@@ -10855,16 +10838,18 @@ export class Engine {
     } else {
       return;
     }
+    const fkTarget = this.newFkKeyedTarget(parent, fk, oldTuples, newTuples);
     this.runFkActionUpdate(
       {
         kind: "update",
         table: child.name,
         db: "main",
         assignments,
-        filter: action.filter,
+        filter: null,
         returning: null,
+        fkTarget,
       },
-      action.params,
+      [],
       meter,
     );
   }
@@ -11091,6 +11076,10 @@ export class Engine {
         if (retMask[i]) mask[i] = true;
       }
     }
+    // A generated action's keyed target reads the FK columns for its membership test (§6.11).
+    if (del.fkTarget !== undefined) {
+      for (const column of del.fkTarget.fk.columns) mask[column] = true;
+    }
     // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
     // scan"); an empty bound deletes nothing — with RETURNING that is still a query result
     // (empty rows), never a bare statement (grammar.md §32). The whole WHERE stays the
@@ -11098,16 +11087,20 @@ export class Engine {
     // storageRowRead per scanned row.
     // A host-attached target full-scans this slice (attached-databases.md §8) — a bounded scan would
     // resolve its index store through the unscoped funnel. The whole WHERE stays the residual filter.
+    // A generated action gathers its keyed target instead (constraints.md §6.6).
     const scanBefore = meter.accrued;
-    const scan = this.executeMutationScan(
-      this.planMutationScan(del.db, table, filter, contradiction),
-      del.table,
-      filter,
-      bound,
-      env,
-      meter,
-      mask,
-    );
+    const scan =
+      del.fkTarget !== undefined
+        ? this.fkKeyedScan(del.fkTarget, del.table, mask)
+        : this.executeMutationScan(
+            this.planMutationScan(del.db, table, filter, contradiction),
+            del.table,
+            filter,
+            bound,
+            env,
+            meter,
+            mask,
+          );
     let scanActual = meter.accrued - scanBefore;
     if (scan.empty) {
       this.recordExplainActual("Scan " + del.table, scanActual);
@@ -11131,8 +11124,9 @@ export class Engine {
       // touched set the block above charged (large-values.md §14).
       const row = store.resolveColumns(e.row, mask);
       const beforeFilter = meter.accrued;
-      const keep = filter === null || isTrue(evalExpr(filter, row, env, meter));
+      let keep = filter === null || isTrue(evalExpr(filter, row, env, meter));
       filterActual += meter.accrued - beforeFilter;
+      if (del.fkTarget !== undefined) keep = fkKeyedMatch(del.fkTarget, row) !== null;
       if (keep) {
         // The FK parent-side probe + index-entry removal below read this row's key/index columns
         // directly; resolve its inline-deferred values (lazy-record.md §5b — a key column is always
@@ -11399,6 +11393,10 @@ export class Engine {
     const mask: boolean[] = new Array(table.columns.length).fill(false);
     if (filter !== null) collectTouched(filter, 0, mask);
     for (const p of plans) collectTouched(p.source, 0, mask);
+    // A generated action's keyed target reads the FK columns for its membership test (§6.11).
+    if (upd.fkTarget !== undefined) {
+      for (const column of upd.fkTarget.fk.columns) mask[column] = true;
+    }
     // The RETURNING mask spans the [base | other] projection row (new at 0, old at ncols):
     // the NEW side joins minus the assigned columns (an assigned column's returned value is
     // the freshly computed one, not a storage read); the OLD side joins unconditionally
@@ -11419,16 +11417,20 @@ export class Engine {
     // storageRowRead per scanned row.
     // A host-attached target full-scans this slice (attached-databases.md §8) — a bounded scan would
     // resolve its index store through the unscoped funnel. The whole WHERE stays the residual filter.
+    // A generated action gathers its keyed target instead (constraints.md §6.6).
     const scanBefore = meter.accrued;
-    const scan = this.executeMutationScan(
-      this.planMutationScan(upd.db, table, filter, contradiction),
-      upd.table,
-      filter,
-      bound,
-      env,
-      meter,
-      mask,
-    );
+    const scan =
+      upd.fkTarget !== undefined
+        ? this.fkKeyedScan(upd.fkTarget, upd.table, mask)
+        : this.executeMutationScan(
+            this.planMutationScan(upd.db, table, filter, contradiction),
+            upd.table,
+            filter,
+            bound,
+            env,
+            meter,
+            mask,
+          );
     let scanActual = meter.accrued - scanBefore;
     if (scan.empty) {
       this.recordExplainActual("Scan " + upd.table, scanActual);
@@ -11456,6 +11458,14 @@ export class Engine {
         filterActual += meter.accrued - beforeFilter;
         if (!keep) continue;
       }
+      // A generated action's keyed target: the row must reference a batch tuple, and an ON UPDATE
+      // CASCADE substitutes that tuple's new values for its placeholder assignments (§6.6).
+      let mapped: Value[] | null = null;
+      if (upd.fkTarget !== undefined) {
+        const i = fkKeyedMatch(upd.fkTarget, filtered);
+        if (i === null) continue;
+        if (upd.fkTarget.next !== null) mapped = upd.fkTarget.next[i]!;
+      }
       // The OLD row is retained for index-entry removal (its key/index columns are read directly
       // below); resolve its inline-deferred values (lazy-record.md §5b — a key column is always
       // inline, so cost-free) so that maintenance sees resident values.
@@ -11463,7 +11473,9 @@ export class Engine {
       const newRow = row.slice();
       for (const p of plans) {
         try {
-          newRow[p.idx] = checkAssign(p, evalExpr(p.source, row, env, meter));
+          let raw = evalExpr(p.source, row, env, meter);
+          if (mapped !== null) raw = mapped[upd.fkTarget!.fk.columns.indexOf(p.idx)]!;
+          newRow[p.idx] = checkAssign(p, raw);
         } catch (e) {
           throw stampTable(e, table.name);
         }
@@ -21830,6 +21842,18 @@ function fkReverseKeyUsable(
   return true;
 }
 
+// fkReverseTailFixed reports whether every index key after the FK's leading columns is a plain
+// fixed-width scalar column, so an entry's storage-key suffix can be located by skipping fixed-width
+// slots (constraints.md §6.5 step 1, indexes.md §5.1).
+function fkReverseTailFixed(child: Table, tail: IndexKey[]): boolean {
+  for (const key of tail) {
+    if (key.kind !== "column") return false;
+    const ty = typeAsScalar(child.columns[key.column]!.type);
+    if (ty === undefined || !isFixedWidth(ty)) return false;
+  }
+  return true;
+}
+
 // fkChooseReversePath picks the child reverse-match path deterministically: the child PK, then
 // usable non-partial plain-column B-tree indexes in ascending lowercased-name order (the planner's
 // canonical tie order), else null — the full scan (constraints.md §6.5 steps 1–2).
@@ -21851,11 +21875,82 @@ function fkChooseReversePath(
       if (key.kind !== "column") break;
       leading.push(key.column);
     }
-    if (leading.length !== k || !fkReverseKeyUsable(snap, fk, child, parent, leading)) continue;
+    if (
+      leading.length !== k ||
+      !fkReverseTailFixed(child, ix.keys.slice(k)) ||
+      !fkReverseKeyUsable(snap, fk, child, parent, leading)
+    ) {
+      continue;
+    }
     const name = ix.name.toLowerCase();
     if (best === null || name < best.index!) best = { index: name, cols: leading };
   }
   return best;
+}
+
+// FkKeyedTarget is a generated referential action's target (constraints.md §6.6): the batch's
+// distinct, complete old parent tuples (FK slot order), keyed by their parent-space probe bytes.
+// For ON UPDATE CASCADE, next[i] is tuples[i]'s new tuple; null for DELETE / SET NULL / SET DEFAULT.
+export type FkKeyedTarget = {
+  parent: Table;
+  parentColls: (Collation | null)[];
+  fk: ForeignKey;
+  tuples: Value[][];
+  next: Value[][] | null;
+  keys: Map<string, number>;
+};
+
+// fkSlotOrdinals is 0..n-1: a tuple in FK slot order viewed as a row whose ordinal i supplies
+// fk.refColumns[i].
+function fkSlotOrdinals(n: number): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < n; i++) out.push(i);
+  return out;
+}
+
+// fkKeyedMatch reports which batch tuple a child row's FK tuple equals, in the parent's key space
+// (null = none). A row with any NULL FK column references nothing (MATCH SIMPLE). Unmetered set
+// membership (§6.11).
+function fkKeyedMatch(t: FkKeyedTarget, row: Row): number | null {
+  const probe = fkProbe(t.fk, t.parent, t.parentColls, row, t.fk.columns);
+  if (probe === null) return null;
+  return t.keys.get(fkProbeBytes(probe).join(",")) ?? null;
+}
+
+// indexStoreBoundEntries is the key-preserving ordered-index gather over explicit stores: range-scan
+// the index tree over an already-built bound, recover each entry's row storage key, and point-look-up
+// the row in `store`. A caller with a fixed scope (a generated referential action — constraints.md
+// §6.6) passes main's stores rather than the session-local-first funnel.
+function indexStoreBoundEntries(
+  istore: TableStore,
+  store: TableStore,
+  suffixTypes: ScalarType[],
+  b: KeyBound,
+  prefixByteLen: number,
+  mask: boolean[],
+): { entries: Entry[]; pages: number; slabs: number } {
+  // The index store has no payload columns, so its mask is empty and its fused scan
+  // contributes only the index-tree page_read count (no spill/compress units).
+  const iscan = istore.rangeScanWithUnits(b, []);
+  let pages = iscan.pages;
+  let slabs = 0;
+  const rows: Entry[] = [];
+  for (const e of iscan.entries) {
+    // Skip the equality prefix by its known byte length, then each remaining key component by width
+    // (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the fixed width, indexes.md §5.1); the
+    // suffix after them is the row's storage key (indexes.md §3).
+    let at = prefixByteLen;
+    for (const ty of suffixTypes) {
+      at += e.key[at] === 0x01 ? 1 : 1 + widthBytes(ty);
+    }
+    const rowKey = e.key.slice(at);
+    const u = store.getWithUnits(rowKey, mask);
+    pages += u.pages;
+    slabs += u.slabs;
+    if (u.row === undefined) throw new Error("an index entry references a stored row");
+    rows.push({ key: rowKey, row: u.row });
+  }
+  return { entries: rows, pages, slabs };
 }
 
 // uniqueProbeBound is the half-open byte range [prefix, byte-successor(prefix)) — every

@@ -1065,6 +1065,40 @@ func fkReverseKeyUsable(snap *snapshot, fk *foreignKey, child, parent *catTable,
 	return true
 }
 
+// fkReverseTailFixed reports whether every index key after the FK's leading columns is a plain
+// fixed-width scalar column, so an entry's storage-key suffix can be located by skipping fixed-width
+// slots (constraints.md §6.5 step 1, indexes.md §5.1).
+func fkReverseTailFixed(child *catTable, tail []indexKey) bool {
+	for _, key := range tail {
+		c, ok := key.asColumn()
+		if !ok {
+			return false
+		}
+		if ty, ok := child.Columns[c].Type.AsScalar(); !ok || !ty.IsFixedWidth() {
+			return false
+		}
+	}
+	return true
+}
+
+// fkReversePrefix encodes a parent tuple (FK slot order) as the chosen child key's probe prefix:
+// bare member encodings for the PK, 0x00-tagged slots for an index (constraints.md §6.5 step 3).
+func (db *engine) fkReversePrefix(path fkReversePath, fk *foreignKey, child *catTable, values []Value) ([]byte, error) {
+	childColls := db.columnCollations(child.Columns)
+	var prefix []byte
+	for _, c := range path.cols {
+		b, err := encodeTypedKey(child.Columns[c].Type, values[slices.Index(fk.Columns, c)], childColls[c])
+		if err != nil {
+			return nil, err
+		}
+		if path.index != "" {
+			prefix = append(prefix, 0x00)
+		}
+		prefix = append(prefix, b...)
+	}
+	return prefix, nil
+}
+
 // fkChooseReversePath picks the child reverse-match path deterministically: the child PK, then
 // usable non-partial plain-column B-tree indexes in ascending lowercased-name order (the planner's
 // canonical tie order), else the full scan (constraints.md §6.5 steps 1–2).
@@ -1088,7 +1122,7 @@ func fkChooseReversePath(snap *snapshot, fk *foreignKey, child, parent *catTable
 			}
 			leading = append(leading, c)
 		}
-		if len(leading) != k || !fkReverseKeyUsable(snap, fk, child, parent, leading) {
+		if len(leading) != k || !fkReverseTailFixed(child, ix.Keys[k:]) || !fkReverseKeyUsable(snap, fk, child, parent, leading) {
 			continue
 		}
 		name := strings.ToLower(ix.Name)
@@ -1117,17 +1151,9 @@ func (db *engine) fkChildReferences(childTable string, fk *foreignKey, parent *c
 	}
 	store := snap.store(childTable)
 	if path := fkChooseReversePath(snap, fk, child, parent); path.cols != nil {
-		childColls := db.columnCollations(child.Columns)
-		var prefix []byte
-		for _, c := range path.cols {
-			b, err := encodeTypedKey(child.Columns[c].Type, values[slices.Index(fk.Columns, c)], childColls[c])
-			if err != nil {
-				return false, err
-			}
-			if path.index != "" {
-				prefix = append(prefix, 0x00)
-			}
-			prefix = append(prefix, b...)
+		prefix, err := db.fkReversePrefix(path, fk, child, values)
+		if err != nil {
+			return false, err
 		}
 		bound := uniqueProbeBound(prefix)
 		tree := store
@@ -1139,7 +1165,7 @@ func (db *engine) fkChildReferences(childTable string, fk *foreignKey, parent *c
 			return false, err
 		}
 		found := false
-		err := tree.ScanRange(bound, func([]byte, storedRow) (bool, error) {
+		err = tree.ScanRange(bound, func([]byte, storedRow) (bool, error) {
 			found = true
 			return false, nil
 		})
@@ -1183,6 +1209,129 @@ func (db *engine) fkChildReferences(childTable string, fk *foreignKey, parent *c
 		return true, nil
 	})
 	return found, err
+}
+
+// fkKeyedTarget is a generated referential action's target (constraints.md §6.6): the batch's
+// distinct, complete old parent tuples (FK slot order), keyed by their parent-space probe bytes.
+// For ON UPDATE CASCADE, next[i] is tuples[i]'s new tuple; nil for DELETE / SET NULL / SET DEFAULT.
+type fkKeyedTarget struct {
+	parent      *catTable
+	parentColls []*Collation
+	fk          *foreignKey
+	tuples      [][]Value
+	next        [][]Value
+	keys        map[string]int
+}
+
+// newFkKeyedTarget de-duplicates old (and pairs each with its new tuple when next is non-nil).
+// Every tuple is complete (non-NULL) — the callers drop MATCH SIMPLE-exempt parent rows.
+func (db *engine) newFkKeyedTarget(parent *catTable, fk *foreignKey, old, next [][]Value) (*fkKeyedTarget, error) {
+	t := &fkKeyedTarget{
+		parent: parent, parentColls: db.columnCollations(parent.Columns), fk: fk,
+		keys: make(map[string]int, len(old)),
+	}
+	for i, tuple := range old {
+		probe, ok, err := buildFkProbe(fk, parent, t.parentColls, storedRow(tuple), fkSlotOrdinals(len(tuple)))
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		if _, dup := t.keys[string(probe.bytes)]; dup {
+			continue
+		}
+		t.keys[string(probe.bytes)] = len(t.tuples)
+		t.tuples = append(t.tuples, tuple)
+		if next != nil {
+			t.next = append(t.next, next[i])
+		}
+	}
+	return t, nil
+}
+
+// fkSlotOrdinals is 0..n-1: a tuple in FK slot order viewed as a row whose ordinal i supplies
+// fk.RefColumns[i].
+func fkSlotOrdinals(n int) []int {
+	out := make([]int, n)
+	for i := range out {
+		out[i] = i
+	}
+	return out
+}
+
+// match reports which batch tuple a child row's FK tuple equals, in the parent's key space. A row
+// with any NULL FK column references nothing (MATCH SIMPLE). Unmetered set membership (§6.11).
+func (t *fkKeyedTarget) match(row storedRow) (int, bool, error) {
+	probe, ok, err := buildFkProbe(t.fk, t.parent, t.parentColls, row, t.fk.Columns)
+	if err != nil || !ok {
+		return 0, false, err
+	}
+	i, found := t.keys[string(probe.bytes)]
+	return i, found, nil
+}
+
+// fkKeyedScan gathers a keyed target's candidate child rows (constraints.md §6.6): one prefix
+// probe per tuple through the §6.5 reverse path, de-duplicated and in storage-key order, or else
+// the child's full scan. The batch's page/slab block is the sum of the probes' bounded-scan blocks
+// (or the full-scan block); the caller charges it, then storage_row_read per entry, then applies
+// match as the row filter.
+func (db *engine) fkKeyedScan(t *fkKeyedTarget, childTable string, mask []bool) (mutationScanBatch, error) {
+	snap := db.readSnap()
+	child, ok := snap.table(childTable)
+	if !ok {
+		panic("foreign-key child exists")
+	}
+	store := snap.store(childTable)
+	path := fkChooseReversePath(snap, t.fk, child, t.parent)
+	if path.cols == nil {
+		entries, pages, slabs, err := store.ScanWithUnits(mask)
+		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
+	}
+	var suffix []scalarType
+	if path.index != "" {
+		for i := range child.Indexes {
+			if strings.ToLower(child.Indexes[i].Name) == path.index {
+				for _, key := range child.Indexes[i].Keys[len(path.cols):] {
+					c, _ := key.asColumn()
+					suffix = append(suffix, child.Columns[c].Type.ScalarTy())
+				}
+				break
+			}
+		}
+	}
+	var out mutationScanBatch
+	seen := make(map[string]struct{})
+	for _, tuple := range t.tuples {
+		prefix, err := db.fkReversePrefix(path, t.fk, child, tuple)
+		if err != nil {
+			return mutationScanBatch{}, err
+		}
+		bound := uniqueProbeBound(prefix)
+		var entries []entry
+		var pages, slabs int
+		if path.index == "" {
+			entries, pages, slabs, err = store.RangeScanWithUnits(bound, mask)
+		} else {
+			// The FK child is always a main table: resolve its stores in the main snapshot, never through
+			// the temp-first name walk a same-named session-local temp table would capture.
+			entries, pages, slabs, err = indexStoreBoundEntries(snap.indexStore(path.index), store, suffix, bound, len(prefix), mask)
+		}
+		if err != nil {
+			return mutationScanBatch{}, err
+		}
+		out.pages += pages
+		out.slabs += slabs
+		for _, e := range entries {
+			if _, dup := seen[string(e.Key)]; dup {
+				continue
+			}
+			seen[string(e.Key)] = struct{}{}
+			out.entries = append(out.entries, e)
+		}
+	}
+	sort.Slice(out.entries, func(i, j int) bool { return bytes.Compare(out.entries[i].Key, out.entries[j].Key) < 0 })
+	return out, nil
 }
 
 // fkReferencer is one (child table name, FK) inbound-reference pair.

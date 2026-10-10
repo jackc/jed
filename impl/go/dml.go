@@ -2606,71 +2606,6 @@ type fkDeferredCheck struct {
 	update     bool
 }
 
-// balancedFkExpr combines a non-empty expression list without making resolver/evaluator depth
-// proportional to the number of parent rows in a generated referential-action predicate.
-func balancedFkExpr(exprs []exprNode, op binaryOp) exprNode {
-	for len(exprs) > 1 {
-		next := make([]exprNode, 0, (len(exprs)+1)/2)
-		for i := 0; i < len(exprs); i += 2 {
-			if i+1 == len(exprs) {
-				next = append(next, exprs[i])
-			} else {
-				next = append(next, newBinaryExpr(op, exprs[i], exprs[i+1]))
-			}
-		}
-		exprs = next
-	}
-	return exprs[0]
-}
-
-// fkActionValueExpr builds a typed constant for generated action SQL. Public bind-parameter
-// inference is intentionally scalar-only, so keyable containers use their byte-exact text output
-// under an explicit cast while scalars retain the ordinary parameter path.
-func fkActionValueExpr(ty dataType, value Value, params *[]Value) exprNode {
-	if _, ok := ty.AsScalar(); ok {
-		*params = append(*params, value)
-		return exprNode{Kind: exprParam, Param: uint64(len(*params))}
-	}
-	if !ty.IsArray() && !ty.IsRange() {
-		panic("foreign-key action key is a keyable scalar, array, or range")
-	}
-	inner := exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalText, Str: value.Render()}}
-	return exprNode{Kind: exprCast, Cast: &castExpr{Inner: inner, TypeName: ty.CanonicalName()}}
-}
-
-// fkActionMatchExpr builds one child FK-tuple equality in the parent's key collation.
-func fkActionMatchExpr(parent, child *catTable, fk *foreignKey, values []exprNode) exprNode {
-	parts := make([]exprNode, 0, len(fk.Columns))
-	for slot, local := range fk.Columns {
-		lhs := exprNode{Kind: exprColumn, Column: child.Columns[local].Name}
-		if ty, ok := parent.Columns[fk.RefColumns[slot]].Type.AsScalar(); ok && ty == scalarText {
-			lhs = exprNode{Kind: exprCollate, Collate: &collateExpr{
-				Inner: lhs, Collation: parent.Columns[fk.RefColumns[slot]].Collation,
-			}}
-		}
-		parts = append(parts, newBinaryExpr(opEq, lhs, values[slot]))
-	}
-	return balancedFkExpr(parts, opAnd)
-}
-
-// fkActionPredicate selects child rows whose FK tuple equals any old parent tuple. It also returns
-// each tuple's typed operands so ON UPDATE CASCADE can reuse the conditions in CASE arms.
-func fkActionPredicate(parent, child *catTable, fk *foreignKey, oldTuples [][]Value) (exprNode, []Value, [][]exprNode) {
-	var values []Value
-	operands := make([][]exprNode, 0, len(oldTuples))
-	matches := make([]exprNode, 0, len(oldTuples))
-	for _, tuple := range oldTuples {
-		tupleOperands := make([]exprNode, 0, len(tuple))
-		for slot, value := range tuple {
-			ty := parent.Columns[fk.RefColumns[slot]].Type
-			tupleOperands = append(tupleOperands, fkActionValueExpr(ty, value, &values))
-		}
-		operands = append(operands, tupleOperands)
-		matches = append(matches, fkActionMatchExpr(parent, child, fk, tupleOperands))
-	}
-	return balancedFkExpr(matches, opOr), values, operands
-}
-
 // runFkActionUpdate/Delete execute generated work through the ordinary DML pipeline. The nested
 // meter live-charges the shared lifetime counter; its statement total is folded into the caller
 // without charging lifetime twice.
@@ -2730,11 +2665,14 @@ func (db *engine) runFkDeleteAction(parent, child *catTable, fk *foreignKey, old
 	if len(oldTuples) == 0 {
 		return nil
 	}
-	filter, params, _ := fkActionPredicate(parent, child, fk, oldTuples)
+	target, err := db.newFkKeyedTarget(parent, fk, oldTuples, nil)
+	if err != nil {
+		return err
+	}
+	main := "main"
 	switch fk.OnDelete {
 	case fkCascade:
-		main := "main"
-		return db.runFkActionDelete(&deleteStmt{Table: child.Name, DB: &main, Filter: &filter}, params, meter)
+		return db.runFkActionDelete(&deleteStmt{Table: child.Name, DB: &main, fkTarget: target}, nil, meter)
 	case fkSetNull, fkSetDefault:
 		assignments := make([]assignment, 0, len(fk.Columns))
 		for _, column := range fk.Columns {
@@ -2743,8 +2681,7 @@ func (db *engine) runFkDeleteAction(parent, child *catTable, fk *foreignKey, old
 				Value: exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalNull}},
 			})
 		}
-		main := "main"
-		return db.runFkActionUpdate(&update{Table: child.Name, DB: &main, Assignments: assignments, Filter: &filter}, params, meter)
+		return db.runFkActionUpdate(&update{Table: child.Name, DB: &main, Assignments: assignments, fkTarget: target}, nil, meter)
 	default:
 		return nil
 	}
@@ -2755,37 +2692,25 @@ func (db *engine) runFkUpdateAction(parent, child *catTable, fk *foreignKey, tra
 		return nil
 	}
 	oldTuples := make([][]Value, len(transitions))
+	var newTuples [][]Value
+	if fk.OnUpdate == fkCascade {
+		newTuples = make([][]Value, len(transitions))
+	}
 	for i := range transitions {
 		oldTuples[i] = transitions[i][0]
+		if newTuples != nil {
+			newTuples[i] = transitions[i][1]
+		}
 	}
-	filter, params, oldOperands := fkActionPredicate(parent, child, fk, oldTuples)
 	assignments := make([]assignment, 0, len(fk.Columns))
 	switch fk.OnUpdate {
 	case fkCascade:
-		newOperands := make([][]exprNode, 0, len(transitions))
-		for _, transition := range transitions {
-			operands := make([]exprNode, 0, len(transition[1]))
-			for slot, value := range transition[1] {
-				ty := parent.Columns[fk.RefColumns[slot]].Type
-				operands = append(operands, fkActionValueExpr(ty, value, &params))
-			}
-			newOperands = append(newOperands, operands)
-		}
-		for slot, column := range fk.Columns {
-			whens := make([]caseWhen, 0, len(transitions))
-			for i, operands := range oldOperands {
-				result := newOperands[i][slot]
-				if _, scalar := child.Columns[column].Type.AsScalar(); scalar {
-					result = exprNode{Kind: exprCast, Cast: &castExpr{
-						Inner: result, TypeName: child.Columns[column].Type.CanonicalName(),
-					}}
-				}
-				whens = append(whens, caseWhen{Cond: fkActionMatchExpr(parent, child, fk, operands), Result: result})
-			}
-			els := exprNode{Kind: exprColumn, Column: child.Columns[column].Name}
+		// Each assignment is a placeholder self-reference; executeUpdate substitutes the row's
+		// mapped new value before coercion and validation (constraints.md §6.6 "Keyed target").
+		for _, column := range fk.Columns {
 			assignments = append(assignments, assignment{
 				Column: child.Columns[column].Name,
-				Value:  exprNode{Kind: exprCase, Case: &caseExpr{Whens: whens, Els: &els}},
+				Value:  exprNode{Kind: exprColumn, Column: child.Columns[column].Name},
 			})
 		}
 	case fkSetNull, fkSetDefault:
@@ -2798,8 +2723,12 @@ func (db *engine) runFkUpdateAction(parent, child *catTable, fk *foreignKey, tra
 	default:
 		return nil
 	}
+	target, err := db.newFkKeyedTarget(parent, fk, oldTuples, newTuples)
+	if err != nil {
+		return err
+	}
 	main := "main"
-	return db.runFkActionUpdate(&update{Table: child.Name, DB: &main, Assignments: assignments, Filter: &filter}, params, meter)
+	return db.runFkActionUpdate(&update{Table: child.Name, DB: &main, Assignments: assignments, fkTarget: target}, nil, meter)
 }
 
 // fkTupleValues copies a parent row's referenced tuple in FK slot order.
@@ -3120,12 +3049,23 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 			mask[i] = mask[i] || retMask[i]
 		}
 	}
+	// A generated action's keyed target reads the FK columns for its membership test (§6.11).
+	if del.fkTarget != nil {
+		for _, column := range del.fkTarget.fk.Columns {
+			mask[column] = true
+		}
+	}
 	// Plan and execute the target scan through the shared mutation access-path seam. The plan is
 	// selected after uncorrelated folding, matching the old inline detector timing; the batch keeps
-	// storage keys for phase 2 and reports the same up-front units as before.
-	scanPlan := db.planMutationScan(del.DB, table, filter, contradiction)
+	// storage keys for phase 2 and reports the same up-front units as before. A generated action
+	// gathers its keyed target instead (constraints.md §6.6).
 	scanBefore := meter.Accrued
-	batch, err := db.executeMutationScan(scanPlan, del.Table, bound, env, meter, mask)
+	var batch mutationScanBatch
+	if del.fkTarget != nil {
+		batch, err = db.fkKeyedScan(del.fkTarget, del.Table, mask)
+	} else {
+		batch, err = db.executeMutationScan(db.planMutationScan(del.DB, table, filter, contradiction), del.Table, bound, env, meter, mask)
+	}
 	if err != nil {
 		return outcome{}, err
 	}
@@ -3167,6 +3107,11 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 			}
 			filterActual += meter.Accrued - beforeFilter
 			keep = v.IsTrue()
+		}
+		if del.fkTarget != nil {
+			if _, keep, err = del.fkTarget.match(row); err != nil {
+				return outcome{}, err
+			}
 		}
 		if keep {
 			// The FK parent-side probe + index-entry removal below read this row's key/index columns
@@ -3470,6 +3415,12 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	for i := range plans {
 		collectTouched(plans[i].source, 0, mask)
 	}
+	// A generated action's keyed target reads the FK columns for its membership test (§6.11).
+	if upd.fkTarget != nil {
+		for _, column := range upd.fkTarget.fk.Columns {
+			mask[column] = true
+		}
+	}
 	// The RETURNING mask spans the [base | other] projection row (new at 0, old at ncols):
 	// the NEW side joins minus the assigned columns (an assigned column's returned value is
 	// the freshly computed one, not a storage read); the OLD side joins unconditionally
@@ -3491,9 +3442,13 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	}
 	// Plan and execute the target scan through the shared mutation access-path seam. The keyed batch
 	// is over the pre-update state and feeds the unchanged two-phase rewrite below.
-	scanPlan := db.planMutationScan(upd.DB, table, filter, contradiction)
 	scanBefore := meter.Accrued
-	batch, err := db.executeMutationScan(scanPlan, upd.Table, bound, env, meter, mask)
+	var batch mutationScanBatch
+	if upd.fkTarget != nil {
+		batch, err = db.fkKeyedScan(upd.fkTarget, upd.Table, mask)
+	} else {
+		batch, err = db.executeMutationScan(db.planMutationScan(upd.DB, table, filter, contradiction), upd.Table, bound, env, meter, mask)
+	}
 	if err != nil {
 		return outcome{}, err
 	}
@@ -3538,6 +3493,21 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			}
 			filterActual += meter.Accrued - beforeFilter
 		}
+		// A generated action's keyed target: the row must reference a batch tuple, and an ON UPDATE
+		// CASCADE substitutes that tuple's new values for its placeholder assignments (§6.6).
+		var mapped []Value
+		if upd.fkTarget != nil {
+			i, ok, err := upd.fkTarget.match(row)
+			if err != nil {
+				return outcome{}, err
+			}
+			if !ok {
+				continue
+			}
+			if upd.fkTarget.next != nil {
+				mapped = upd.fkTarget.next[i]
+			}
+		}
 		// The OLD row is retained for index-entry removal (its key/index columns are read directly
 		// below); resolve its inline-deferred values (lazy-record.md §5b — a key column is always
 		// inline, so cost-free) so that maintenance sees resident values.
@@ -3550,6 +3520,9 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			raw, err := p.source.eval(row, env, meter)
 			if err != nil {
 				return outcome{}, err
+			}
+			if mapped != nil {
+				raw = mapped[slices.Index(upd.fkTarget.fk.Columns, p.idx)]
 			}
 			checked, err := p.check(raw)
 			if err != nil {

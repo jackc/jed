@@ -1378,14 +1378,19 @@ func (db *engine) indexScanBound(tableName, nameKey string, suffixTypes []scalar
 // indexScanBoundEntries is the key-preserving core of the ordered-index gather. Candidate ordering
 // and units are identical to indexScanBound; only the already-recovered storage key is retained.
 func (db *engine) indexScanBoundEntries(tableName, nameKey string, suffixTypes []scalarType, b keyBound, prefixByteLen int, mask []bool) (out []entry, pages, slabs int, err error) {
-	istore := db.lkpIndexStore(nameKey)
+	return indexStoreBoundEntries(db.lkpIndexStore(nameKey), db.lkpStore(tableName), suffixTypes, b, prefixByteLen, mask)
+}
+
+// indexStoreBoundEntries is indexScanBoundEntries over already-resolved index and table stores, for
+// a caller that must not take the temp-first name walk (a main-scoped FK action, constraints.md
+// §6.6).
+func indexStoreBoundEntries(istore, store *tableStore, suffixTypes []scalarType, b keyBound, prefixByteLen int, mask []bool) (out []entry, pages, slabs int, err error) {
 	// The index store has no payload columns, so its mask is empty and its fused scan contributes
 	// only the index-tree page_read count (no spill/compress units).
 	entries, pages, _, err := istore.RangeScanWithUnits(b, nil)
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	store := db.lkpStore(tableName)
 	for _, e := range entries {
 		// Skip the equality prefix by its known byte length, then each remaining key component by
 		// width (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the fixed width, indexes.md §5.1);

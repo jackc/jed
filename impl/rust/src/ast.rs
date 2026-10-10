@@ -590,6 +590,10 @@ pub struct Update {
     /// The optional terminal `RETURNING` clause (spec/design/grammar.md §32): project each
     /// matched row's NEW (post-assignment) values.
     pub returning: Option<ReturningClause>,
+    /// Set only on a generated referential action (constraints.md §6.6): the target rows are
+    /// gathered by key instead of selected by `filter` (which is then `None`), and an ON UPDATE
+    /// CASCADE takes each row's new FK values from its map. The parser never sets it.
+    pub fk_target: Option<FkTarget>,
 }
 
 /// One `SET <column> = <expr>` clause.
@@ -615,6 +619,30 @@ pub struct Delete {
     /// The optional terminal `RETURNING` clause (spec/design/grammar.md §32): project each
     /// deleted row's OLD values.
     pub returning: Option<ReturningClause>,
+    /// Set only on a generated referential action (constraints.md §6.6): the target rows are
+    /// gathered by key instead of selected by `filter` (which is then `None`). The parser never
+    /// sets it.
+    pub fk_target: Option<FkTarget>,
+}
+
+/// A generated referential action's keyed target (constraints.md §6.6), carried on the internal
+/// [`Update`]/[`Delete`] it drives. Shared by reference: equality is identity, and `Debug` elides
+/// the batch — it is executor state, never parsed SQL.
+#[derive(Clone)]
+pub struct FkTarget(pub(crate) std::sync::Arc<crate::executor::FkKeyedTarget>);
+
+impl PartialEq for FkTarget {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for FkTarget {}
+
+impl std::fmt::Debug for FkTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FkTarget")
+    }
 }
 
 /// A DML `RETURNING` clause. `old_alias` / `new_alias` are the optional PostgreSQL-18

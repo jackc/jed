@@ -1653,23 +1653,7 @@ impl Engine {
         let store = snap.store(child_table);
         if let Some(path) = fk_choose_reverse_path(snap, fk, child, parent) {
             let child_colls = self.column_collations(&child.columns);
-            let mut prefix = Vec::new();
-            for &c in &path.cols {
-                let slot = fk
-                    .columns
-                    .iter()
-                    .position(|&local| local == c)
-                    .expect("a reverse-path column is one of the FK's local columns");
-                let b = encode_typed_key(
-                    &child.columns[c].ty,
-                    &values[slot],
-                    child_colls[c].as_deref(),
-                )?;
-                if path.index.is_some() {
-                    prefix.push(0x00);
-                }
-                prefix.extend_from_slice(&b);
-            }
+            let prefix = fk_reverse_prefix(&path, fk, child, &child_colls, values)?;
             let bound = unique_probe_bound(&prefix);
             let tree = match &path.index {
                 Some(name) => snap.index_store(name),
@@ -1710,6 +1694,123 @@ impl Engine {
             Ok(true)
         })?;
         Ok(found)
+    }
+
+    /// Build a generated referential action's keyed target (constraints.md §6.6): de-duplicate
+    /// `old` by parent-space probe bytes, pairing each kept tuple with its new tuple when `next` is
+    /// given (ON UPDATE CASCADE). Every tuple is complete (non-NULL) — the callers drop MATCH
+    /// SIMPLE-exempt parent rows.
+    pub(crate) fn new_fk_keyed_target(
+        &self,
+        parent: &Table,
+        fk: &ForeignKeyConstraint,
+        old: &[Vec<Value>],
+        next: Option<&[Vec<Value>]>,
+    ) -> Result<FkKeyedTarget> {
+        let mut t = FkKeyedTarget {
+            parent: parent.clone(),
+            parent_colls: self.column_collations(&parent.columns),
+            fk: fk.clone(),
+            tuples: Vec::new(),
+            next: next.map(|_| Vec::new()),
+            keys: HashMap::with_capacity(old.len()),
+        };
+        for (i, tuple) in old.iter().enumerate() {
+            // The tuple in FK slot order, viewed as a row whose ordinal i supplies
+            // fk.ref_columns[i].
+            let ordinals: Vec<usize> = (0..tuple.len()).collect();
+            let Some(probe) = fk_probe(fk, parent, &t.parent_colls, tuple, &ordinals)? else {
+                continue;
+            };
+            if t.keys.contains_key(probe.bytes()) {
+                continue;
+            }
+            t.keys.insert(probe.bytes().to_vec(), t.tuples.len());
+            t.tuples.push(tuple.clone());
+            if let (Some(out), Some(next)) = (t.next.as_mut(), next) {
+                out.push(next[i].clone());
+            }
+        }
+        Ok(t)
+    }
+
+    /// Gather a keyed target's candidate child rows (constraints.md §6.6): one prefix probe per
+    /// tuple through the §6.5 reverse path, de-duplicated and in storage-key order, or else the
+    /// child's full scan. The batch's page/slab block is the sum of the probes' bounded-scan blocks
+    /// (or the full-scan block); the caller charges it, then `storage_row_read` per entry, then
+    /// applies [`FkKeyedTarget::match_row`] as the row filter.
+    pub(crate) fn fk_keyed_scan(
+        &self,
+        t: &FkKeyedTarget,
+        child_table: &str,
+        mask: &[bool],
+    ) -> Result<MutationScanBatch> {
+        let snap = self.read_snap();
+        let child = snap.table(child_table).expect("foreign-key child exists");
+        let store = snap.store(child_table);
+        let Some(path) = fk_choose_reverse_path(snap, &t.fk, child, &t.parent) else {
+            let (entries, pages, slabs) = store.scan_with_units(mask)?;
+            return Ok(MutationScanBatch {
+                entries,
+                pages,
+                slabs,
+            });
+        };
+        let mut suffix: Vec<ScalarType> = Vec::new();
+        if let Some(name) = &path.index {
+            let ix = child
+                .indexes
+                .iter()
+                .find(|ix| ix.name.to_ascii_lowercase() == *name)
+                .expect("the reverse-path index exists");
+            for key in &ix.keys[path.cols.len()..] {
+                let c = key
+                    .as_column()
+                    .expect("a reverse-path tail key is a plain column");
+                suffix.push(
+                    child.columns[c]
+                        .ty
+                        .as_scalar()
+                        .expect("a reverse-path tail column is a fixed-width scalar"),
+                );
+            }
+        }
+        let child_colls = self.column_collations(&child.columns);
+        let mut out = MutationScanBatch {
+            entries: Vec::new(),
+            pages: 0,
+            slabs: 0,
+        };
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        for tuple in &t.tuples {
+            let prefix = fk_reverse_prefix(&path, &t.fk, child, &child_colls, tuple)?;
+            let bound = unique_probe_bound(&prefix);
+            let (entries, pages, slabs) = match &path.index {
+                None => store.range_scan_with_units(&bound, mask)?,
+                Some(name) => {
+                    // Both stores come from the main snapshot: a session-local temp table
+                    // shadowing the child's name must not capture the lookups (§6.6).
+                    let (entries, (pages, slabs)) = index_store_bound_entries(
+                        snap.index_store(name),
+                        store,
+                        &suffix,
+                        &bound,
+                        prefix.len(),
+                        mask,
+                    )?;
+                    (entries, pages, slabs)
+                }
+            };
+            out.pages += pages;
+            out.slabs += slabs;
+            for (key, row) in entries {
+                if seen.insert(key.clone()) {
+                    out.entries.push((key, row));
+                }
+            }
+        }
+        out.entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
     }
 
     /// Every (child table name, FK) pair in the visible snapshot whose FK references `parent_name`
@@ -1785,5 +1886,35 @@ impl Engine {
             }
             n += 1;
         }
+    }
+}
+
+/// A generated referential action's target (constraints.md §6.6): the batch's distinct, complete
+/// old parent tuples (FK slot order), keyed by their parent-space probe bytes. For ON UPDATE
+/// CASCADE, `next[i]` is `tuples[i]`'s new tuple; `None` for DELETE / SET NULL / SET DEFAULT.
+pub(crate) struct FkKeyedTarget {
+    pub(crate) parent: Table,
+    pub(crate) parent_colls: Vec<Option<std::sync::Arc<Collation>>>,
+    pub(crate) fk: ForeignKeyConstraint,
+    pub(crate) tuples: Vec<Vec<Value>>,
+    pub(crate) next: Option<Vec<Vec<Value>>>,
+    pub(crate) keys: HashMap<Vec<u8>, usize>,
+}
+
+impl FkKeyedTarget {
+    /// Which batch tuple a child row's FK tuple equals, in the parent's key space. A row with any
+    /// NULL FK column references nothing (MATCH SIMPLE). Unmetered set membership (§6.11).
+    pub(crate) fn match_row(&self, row: &Row) -> Result<Option<usize>> {
+        let Some(probe) = fk_probe(
+            &self.fk,
+            &self.parent,
+            &self.parent_colls,
+            row,
+            &self.fk.columns,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(self.keys.get(probe.bytes()).copied())
     }
 }

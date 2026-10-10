@@ -3597,6 +3597,49 @@ fn fk_reverse_key_usable(
     true
 }
 
+/// Whether every index key after the FK's leading columns is a plain fixed-width scalar column, so
+/// an entry's storage-key suffix can be located by skipping fixed-width slots (constraints.md §6.5
+/// step 1, indexes.md §5.1).
+fn fk_reverse_tail_fixed(child: &Table, tail: &[IndexKey]) -> bool {
+    tail.iter().all(|key| {
+        key.as_column().is_some_and(|c| {
+            child.columns[c]
+                .ty
+                .as_scalar()
+                .is_some_and(ScalarType::is_fixed_width)
+        })
+    })
+}
+
+/// Encode a parent tuple (FK slot order) as the chosen child key's probe prefix: bare member
+/// encodings for the PK, `0x00`-tagged slots for an index (constraints.md §6.5 step 3).
+pub(crate) fn fk_reverse_prefix(
+    path: &FkReversePath,
+    fk: &ForeignKeyConstraint,
+    child: &Table,
+    child_colls: &[Option<std::sync::Arc<Collation>>],
+    values: &[Value],
+) -> Result<Vec<u8>> {
+    let mut prefix = Vec::new();
+    for &c in &path.cols {
+        let slot = fk
+            .columns
+            .iter()
+            .position(|&local| local == c)
+            .expect("a reverse-path column is one of the FK's local columns");
+        let b = encode_typed_key(
+            &child.columns[c].ty,
+            &values[slot],
+            child_colls[c].as_deref(),
+        )?;
+        if path.index.is_some() {
+            prefix.push(0x00);
+        }
+        prefix.extend_from_slice(&b);
+    }
+    Ok(prefix)
+}
+
 /// Pick the child reverse-match path deterministically: the child PK, then usable non-partial
 /// plain-column B-tree indexes in ascending lowercased-name order (the planner's canonical tie
 /// order), else `None` — the full scan (constraints.md §6.5 steps 1–2).
@@ -3625,7 +3668,9 @@ pub(crate) fn fk_choose_reverse_path(
         else {
             continue;
         };
-        if !fk_reverse_key_usable(snap, fk, child, parent, &leading) {
+        if !fk_reverse_tail_fixed(child, &ix.keys[k..])
+            || !fk_reverse_key_usable(snap, fk, child, parent, &leading)
+        {
             continue;
         }
         let name = ix.name.to_ascii_lowercase();

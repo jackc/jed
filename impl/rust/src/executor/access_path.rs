@@ -62,34 +62,14 @@ impl Engine {
         prefix_byte_len: usize,
         mask: &[bool],
     ) -> Result<(Vec<(Vec<u8>, Row)>, (usize, usize))> {
-        let istore = self.index_store(name_key);
-        // The index store has no payload columns, so its mask is empty and its fused scan
-        // contributes only the index-tree page_read count (no spill/compress units).
-        let (entries, mut pages, _) = istore.range_scan_with_units(bound, &[])?;
-        let store = self.store(table_name);
-        let mut slabs = 0usize;
-        let mut rows = Vec::with_capacity(entries.len());
-        for (ekey, _) in entries {
-            // Skip the equality prefix by its known byte length, then each remaining key component by
-            // width (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the fixed width,
-            // indexes.md §5.1); the suffix after them is the row's storage key (indexes.md §3).
-            let mut at = prefix_byte_len;
-            for &ty in suffix_types {
-                at += match ekey.get(at) {
-                    Some(0x01) => 1,
-                    _ => 1 + ty.width_bytes(),
-                };
-            }
-            let row_key = &ekey[at..];
-            let (row, n, s) = store.get_with_units(row_key, mask)?;
-            pages += n;
-            slabs += s;
-            rows.push((
-                row_key.to_vec(),
-                row.expect("an index entry references a stored row"),
-            ));
-        }
-        Ok((rows, (pages, slabs)))
+        index_store_bound_entries(
+            self.index_store(name_key),
+            self.store(table_name),
+            suffix_types,
+            bound,
+            prefix_byte_len,
+            mask,
+        )
     }
 
     /// Execute canonical logical intervals over the row's own B-tree. Storage keys are retained for
@@ -526,4 +506,44 @@ impl Engine {
         }
         Ok((rows, (pages, slabs)))
     }
+}
+
+/// Store-explicit core of [`Engine::index_scan_bound_entries`]: gather the entries `istore` admits
+/// within `bound` and point-look-up each one's row in `store`. A caller that must not resolve names
+/// through the temp-first walk (the keyed referential-action gather, constraints.md §6.6) passes
+/// the main snapshot's stores directly.
+pub(crate) fn index_store_bound_entries(
+    istore: &TableStore,
+    store: &TableStore,
+    suffix_types: &[ScalarType],
+    bound: &KeyBound,
+    prefix_byte_len: usize,
+    mask: &[bool],
+) -> Result<(Vec<(Vec<u8>, Row)>, (usize, usize))> {
+    // The index store has no payload columns, so its mask is empty and its fused scan
+    // contributes only the index-tree page_read count (no spill/compress units).
+    let (entries, mut pages, _) = istore.range_scan_with_units(bound, &[])?;
+    let mut slabs = 0usize;
+    let mut rows = Vec::with_capacity(entries.len());
+    for (ekey, _) in entries {
+        // Skip the equality prefix by its known byte length, then each remaining key component by
+        // width (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the fixed width,
+        // indexes.md §5.1); the suffix after them is the row's storage key (indexes.md §3).
+        let mut at = prefix_byte_len;
+        for &ty in suffix_types {
+            at += match ekey.get(at) {
+                Some(0x01) => 1,
+                _ => 1 + ty.width_bytes(),
+            };
+        }
+        let row_key = &ekey[at..];
+        let (row, n, s) = store.get_with_units(row_key, mask)?;
+        pages += n;
+        slabs += s;
+        rows.push((
+            row_key.to_vec(),
+            row.expect("an index entry references a stored row"),
+        ));
+    }
+    Ok((rows, (pages, slabs)))
 }

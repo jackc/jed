@@ -9,7 +9,7 @@ pub(crate) use crate::ast::{
     AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence, AlterTable,
     AlterTableAction, AlterTableEdit, Analyze, BinaryOp, ConflictAction, ConflictTarget,
     CreateIndex, CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef, Delete,
-    DropIndex, DropSequence, DropTable, DropType, Expr, GroupItem, IndexKeyElem, Insert,
+    DropIndex, DropSequence, DropTable, DropType, Expr, FkTarget, GroupItem, IndexKeyElem, Insert,
     InsertSource, InsertValue, JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper,
     JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, ReturningClause,
     Select, SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef,
@@ -50,6 +50,7 @@ pub(crate) use std::sync::LazyLock;
 mod window;
 pub(crate) use window::*;
 mod access_path;
+pub(crate) use access_path::index_store_bound_entries;
 mod aggregate;
 mod ddl;
 mod index_dependencies;
@@ -59,6 +60,7 @@ pub(crate) use dml::CachedInsert;
 mod blocking_spill;
 mod eval;
 mod exec_emit;
+pub(crate) use exec_emit::FkKeyedTarget;
 mod exec_scan;
 mod hash_join;
 pub(crate) use hash_join::*;

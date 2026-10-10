@@ -1595,3 +1595,72 @@ setup_sql = [
 gen = "int_uniform"
 min = 1001
 max = 2000
+
+# Keyed referential actions (constraints.md §6.6 "Keyed target"). Each iteration deletes 100
+# consecutive parents, each with 10 children, through ON DELETE CASCADE, then rolls back. With
+# fk_cas_child_parent_idx the cascade is one index probe per parent. Before keyed targets, the
+# generated child DELETE evaluated a 100-way OR of parent keys for every row it touched. The
+# unindexed sibling cascades through one scan of the 100k-row child plus a hash membership test,
+# where the OR used to be evaluated against every child row.
+[[bench]]
+name = "fk_cascade_delete_indexed"
+description = "DELETE 100 parents x 10 children each via ON DELETE CASCADE, FK column indexed, rolled back"
+dataset = "scratch"
+kind = "write_rollback"
+sql = "DELETE FROM fk_cas_parent WHERE id BETWEEN $1 AND $2"
+warmup = 20
+iterations = 200
+seed = 4284
+batch = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS fk_cas_child",
+  "DROP TABLE IF EXISTS fk_cas_parent",
+  "CREATE TABLE fk_cas_parent (id bigint PRIMARY KEY)",
+  "CREATE TABLE fk_cas_child (id bigint PRIMARY KEY, parent_id bigint REFERENCES fk_cas_parent ON DELETE CASCADE)",
+  "INSERT INTO fk_cas_parent SELECT g FROM generate_series(CAST(1 AS bigint), CAST(10000 AS bigint)) AS g",
+  "INSERT INTO fk_cas_child SELECT g, g % 10000 + 1 FROM generate_series(CAST(1 AS bigint), CAST(100000 AS bigint)) AS g",
+  "CREATE INDEX fk_cas_child_parent_idx ON fk_cas_child (parent_id)"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 9900
+
+[[bench.param]]
+gen = "int_window"
+base = 0
+off_min = 99
+off_max = 99
+
+[[bench]]
+name = "fk_cascade_delete_unindexed"
+description = "DELETE 100 parents x 10 children each via ON DELETE CASCADE, FK column unindexed, rolled back"
+dataset = "scratch"
+kind = "write_rollback"
+sql = "DELETE FROM fk_cas_scan_parent WHERE id BETWEEN $1 AND $2"
+warmup = 2
+iterations = 20
+seed = 4285
+batch = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS fk_cas_scan_child",
+  "DROP TABLE IF EXISTS fk_cas_scan_parent",
+  "CREATE TABLE fk_cas_scan_parent (id bigint PRIMARY KEY)",
+  "CREATE TABLE fk_cas_scan_child (id bigint PRIMARY KEY, parent_id bigint REFERENCES fk_cas_scan_parent ON DELETE CASCADE)",
+  "INSERT INTO fk_cas_scan_parent SELECT g FROM generate_series(CAST(1 AS bigint), CAST(10000 AS bigint)) AS g",
+  "INSERT INTO fk_cas_scan_child SELECT g, g % 10000 + 1 FROM generate_series(CAST(1 AS bigint), CAST(100000 AS bigint)) AS g"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 9900
+
+[[bench.param]]
+gen = "int_window"
+base = 0
+off_min = 99
+off_max = 99

@@ -117,6 +117,11 @@ fn parent_update_end_state_swap_allowed() {
         "INSERT INTO c VALUES (10, 100), (11, 200)",
         "CREATE TABLE cc (id i32 PRIMARY KEY, pc i32 REFERENCES p (code) ON UPDATE CASCADE)",
         "INSERT INTO cc VALUES (20, 100), (21, 200)",
+        // ci's index makes its cascade gather through the keyed index path (constraints.md §6.6);
+        // cc keeps the full-scan fallback. Each child row is visited once in either case.
+        "CREATE TABLE ci (id i32 PRIMARY KEY, pc i32 REFERENCES p (code) ON UPDATE CASCADE)",
+        "CREATE INDEX ci_pc ON ci (pc)",
+        "INSERT INTO ci VALUES (30, 100), (31, 200)",
     ]);
     // Swap 100 ⇄ 200 across the two parent rows: the end state still contains {100, 200}, so both
     // children remain valid. jed accepts this (PG would reject the transient collision).
@@ -125,15 +130,14 @@ fn parent_update_end_state_swap_allowed() {
         &[],
     )
     .unwrap();
-    let rows = db.rows_in_key_order("cc").unwrap();
-    assert!(matches!(
-        rows[0].as_slice(),
-        [Value::Int(20), Value::Int(200)]
-    ));
-    assert!(matches!(
-        rows[1].as_slice(),
-        [Value::Int(21), Value::Int(100)]
-    ));
+    for child in ["cc", "ci"] {
+        let rows = db.rows_in_key_order(child).unwrap();
+        assert_eq!(rows.len(), 2, "{child} cascaded swap rows: {rows:?}");
+        assert!(
+            matches!(rows[0][1], Value::Int(200)) && matches!(rows[1][1], Value::Int(100)),
+            "{child} cascaded swap rows: {rows:?}"
+        );
+    }
     // But genuinely removing a referenced value still traps 23503.
     assert_eq!(
         err(&mut db, "UPDATE p SET code = 999 WHERE id = 1"),
@@ -156,6 +160,14 @@ fn action_preserves_main_scope_across_temp_overlap() {
     shadowed
         .query_outcome("INSERT INTO c VALUES (99, 'keep')", &[])
         .unwrap();
+    // ci's index makes its cascade gather through the keyed index path, whose child-row lookups
+    // must also stay in main (constraints.md §6.6).
+    shadowed
+        .query_outcome("CREATE TEMP TABLE ci (temp_id i32 PRIMARY KEY)", &[])
+        .unwrap();
+    shadowed
+        .query_outcome("INSERT INTO ci VALUES (98)", &[])
+        .unwrap();
 
     let mut persistent = db.session(SessionOptions::default());
     for sql in [
@@ -163,6 +175,9 @@ fn action_preserves_main_scope_across_temp_overlap() {
         "CREATE TABLE c (id i32 PRIMARY KEY, pid i32 REFERENCES p ON DELETE CASCADE)",
         "INSERT INTO p VALUES (1)",
         "INSERT INTO c VALUES (10, 1)",
+        "CREATE TABLE ci (id i32 PRIMARY KEY, pid i32 REFERENCES p ON DELETE CASCADE)",
+        "CREATE INDEX ci_pid ON ci (pid)",
+        "INSERT INTO ci VALUES (20, 1)",
     ] {
         persistent.query_outcome(sql, &[]).unwrap();
     }
@@ -183,5 +198,19 @@ fn action_preserves_main_scope_across_temp_overlap() {
             .unwrap()
             .collect::<Vec<_>>(),
         vec![vec![Value::Int(99), Value::Text("keep".to_string())]]
+    );
+    assert!(
+        persistent
+            .query("SELECT id FROM ci", &[])
+            .unwrap()
+            .collect::<Vec<_>>()
+            .is_empty()
+    );
+    assert_eq!(
+        shadowed
+            .query("SELECT temp_id FROM ci", &[])
+            .unwrap()
+            .collect::<Vec<_>>(),
+        vec![vec![Value::Int(98)]]
     );
 }

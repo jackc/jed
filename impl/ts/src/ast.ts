@@ -9,6 +9,7 @@
 // fit; with no context it defaults to i64 (spec/design/types.md §6). A boolean literal
 // is expression-only this slice (it cannot be stored).
 import type { Decimal } from "./decimal.ts";
+import type { FkKeyedTarget } from "./executor.ts";
 
 export type Literal =
   | { kind: "null" }
@@ -1061,6 +1062,10 @@ export type Update = {
   // The optional terminal RETURNING clause (spec/design/grammar.md §32): project each matched
   // row's NEW (post-assignment) values. Null = no clause.
   returning: ReturningClause | null;
+  // Set only on a generated referential action (constraints.md §6.6), never by the parser: the
+  // target rows are gathered by key instead of selected by filter (which is then null), and an ON
+  // UPDATE CASCADE takes each row's new FK values from its map.
+  fkTarget?: FkKeyedTarget;
 };
 
 // Delete is `DELETE FROM <table> [WHERE ...]`. No WHERE deletes every row; the WHERE
@@ -1075,6 +1080,9 @@ export type Delete = {
   db?: string;
   filter: Expr | null;
   returning: ReturningClause | null;
+  // Set only on a generated referential action (constraints.md §6.6), never by the parser: the
+  // target rows are gathered by key instead of selected by filter (which is then null).
+  fkTarget?: FkKeyedTarget;
 };
 
 // A DML RETURNING clause. oldAlias / newAlias are the optional PostgreSQL-18

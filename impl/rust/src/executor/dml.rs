@@ -70,113 +70,6 @@ pub(super) struct FkDeferredCheck {
     update: bool,
 }
 
-/// Combine a non-empty expression list as a balanced binary tree. Referential-action predicates
-/// are synthesized from an arbitrary parent batch; balancing keeps resolver/evaluator stack depth
-/// logarithmic rather than proportional to the number of changed rows (constraints.md §6.6).
-fn balanced_fk_expr(mut exprs: Vec<Expr>, op: BinaryOp) -> Expr {
-    debug_assert!(!exprs.is_empty());
-    while exprs.len() > 1 {
-        let mut next = Vec::with_capacity(exprs.len().div_ceil(2));
-        let mut it = exprs.into_iter();
-        while let Some(lhs) = it.next() {
-            if let Some(rhs) = it.next() {
-                next.push(Expr::Binary {
-                    op,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                });
-            } else {
-                next.push(lhs);
-            }
-        }
-        exprs = next;
-    }
-    exprs.pop().unwrap()
-}
-
-/// One FK-tuple equality in the PARENT key's collation. The ordinary SQL comparison path is reused
-/// by generated UPDATE/DELETE, but an explicitly collated parent text key must not accidentally use
-/// a differently-collated child column while finding action targets.
-fn fk_action_value_expr(ty: &Type, value: &Value, params: &mut Vec<Value>) -> Result<Expr> {
-    match ty {
-        Type::Scalar(_) => {
-            let id = u32::try_from(params.len() + 1).map_err(|_| {
-                EngineError::new(
-                    SqlState::StatementTooComplex,
-                    "referential action generated too many bound values",
-                )
-            })?;
-            params.push(value.clone());
-            Ok(Expr::Param(id))
-        }
-        Type::Array(_) | Type::Range(_) => Ok(Expr::Cast {
-            inner: Box::new(Expr::Literal(Literal::Text(value.render()))),
-            type_name: ty.canonical_name(),
-            type_mod: None,
-        }),
-        Type::Composite(_) => {
-            unreachable!("foreign-key action key is a keyable scalar, array, or range")
-        }
-    }
-}
-
-fn fk_action_match_expr(
-    parent: &Table,
-    child: &Table,
-    fk: &ForeignKeyConstraint,
-    values: &[Expr],
-) -> Expr {
-    let mut parts = Vec::with_capacity(fk.columns.len());
-    for (slot, (&local, &referenced)) in fk.columns.iter().zip(&fk.ref_columns).enumerate() {
-        let mut lhs = Expr::Column(child.columns[local].name.clone());
-        if matches!(
-            parent.columns[referenced].ty,
-            Type::Scalar(ScalarType::Text)
-        ) {
-            lhs = Expr::Collate {
-                inner: Box::new(lhs),
-                collation: parent.columns[referenced]
-                    .collation
-                    .clone()
-                    .unwrap_or_else(|| "C".to_string()),
-            };
-        }
-        parts.push(Expr::Binary {
-            op: BinaryOp::Eq,
-            lhs: Box::new(lhs),
-            rhs: Box::new(values[slot].clone()),
-        });
-    }
-    balanced_fk_expr(parts, BinaryOp::And)
-}
-
-/// Build the disjunction selecting every child row whose FK tuple equals one of `old_tuples`.
-/// Returns the scalar bound values and each tuple's typed operands so ON UPDATE CASCADE can reuse
-/// each condition in its per-column CASE expression without duplicating values.
-fn fk_action_predicate(
-    parent: &Table,
-    child: &Table,
-    fk: &ForeignKeyConstraint,
-    old_tuples: &[Vec<Value>],
-) -> Result<(Expr, Vec<Value>, Vec<Vec<Expr>>)> {
-    let mut values = Vec::new();
-    let mut operands = Vec::with_capacity(old_tuples.len());
-    let mut matches = Vec::with_capacity(old_tuples.len());
-    for tuple in old_tuples {
-        let mut tuple_values = Vec::with_capacity(tuple.len());
-        for (slot, value) in tuple.iter().enumerate() {
-            tuple_values.push(fk_action_value_expr(
-                &parent.columns[fk.ref_columns[slot]].ty,
-                value,
-                &mut values,
-            )?);
-        }
-        matches.push(fk_action_match_expr(parent, child, fk, &tuple_values));
-        operands.push(tuple_values);
-    }
-    Ok((balanced_fk_expr(matches, BinaryOp::Or), values, operands))
-}
-
 impl Engine {
     fn insert_target_signature(
         &self,
@@ -2528,16 +2421,19 @@ impl Engine {
         if old_tuples.is_empty() {
             return Ok(());
         }
-        let (filter, params, _) = fk_action_predicate(parent, child, fk, old_tuples)?;
+        let target = FkTarget(std::sync::Arc::new(
+            self.new_fk_keyed_target(parent, fk, old_tuples, None)?,
+        ));
         match fk.on_delete {
             FkAction::Cascade => self.run_fk_action_delete(
                 Delete {
                     table: child.name.clone(),
                     db: Some("main".to_string()),
-                    filter: Some(filter),
+                    filter: None,
                     returning: None,
+                    fk_target: Some(target),
                 },
-                params,
+                Vec::new(),
                 meter,
             ),
             FkAction::SetNull | FkAction::SetDefault => {
@@ -2555,10 +2451,11 @@ impl Engine {
                         table: child.name.clone(),
                         db: Some("main".to_string()),
                         assignments,
-                        filter: Some(filter),
+                        filter: None,
                         returning: None,
+                        fk_target: Some(target),
                     },
-                    params,
+                    Vec::new(),
                     meter,
                 )
             }
@@ -2580,55 +2477,21 @@ impl Engine {
             return Ok(());
         }
         let old_tuples: Vec<Vec<Value>> = transitions.iter().map(|x| x.0.clone()).collect();
-        let (filter, mut params, old_values) = fk_action_predicate(parent, child, fk, &old_tuples)?;
+        let new_tuples: Option<Vec<Vec<Value>>> = (fk.on_update == FkAction::Cascade)
+            .then(|| transitions.iter().map(|x| x.1.clone()).collect());
         let assignments = match fk.on_update {
-            FkAction::Cascade => {
-                let mut new_values = Vec::with_capacity(transitions.len());
-                for (_, new_tuple) in transitions {
-                    let mut values = Vec::with_capacity(new_tuple.len());
-                    for (slot, value) in new_tuple.iter().enumerate() {
-                        values.push(fk_action_value_expr(
-                            &parent.columns[fk.ref_columns[slot]].ty,
-                            value,
-                            &mut params,
-                        )?);
-                    }
-                    new_values.push(values);
-                }
-                fk.columns
-                    .iter()
-                    .enumerate()
-                    .map(|(slot, &column)| {
-                        let whens = old_values
-                            .iter()
-                            .enumerate()
-                            .map(|(i, values)| {
-                                let result = if child.columns[column].ty.as_scalar().is_some() {
-                                    Expr::Cast {
-                                        inner: Box::new(new_values[i][slot].clone()),
-                                        type_name: child.columns[column].ty.canonical_name(),
-                                        type_mod: None,
-                                    }
-                                } else {
-                                    new_values[i][slot].clone()
-                                };
-                                (fk_action_match_expr(parent, child, fk, values), result)
-                            })
-                            .collect();
-                        crate::ast::Assignment {
-                            column: child.columns[column].name.clone(),
-                            is_default: false,
-                            value: Expr::Case {
-                                operand: None,
-                                whens,
-                                els: Some(Box::new(Expr::Column(
-                                    child.columns[column].name.clone(),
-                                ))),
-                            },
-                        }
-                    })
-                    .collect()
-            }
+            // Each assignment is a placeholder self-reference; execute_update substitutes the
+            // row's mapped new value before coercion and validation (constraints.md §6.6
+            // "Keyed target").
+            FkAction::Cascade => fk
+                .columns
+                .iter()
+                .map(|&column| crate::ast::Assignment {
+                    column: child.columns[column].name.clone(),
+                    is_default: false,
+                    value: Expr::Column(child.columns[column].name.clone()),
+                })
+                .collect(),
             FkAction::SetNull | FkAction::SetDefault => fk
                 .columns
                 .iter()
@@ -2640,15 +2503,22 @@ impl Engine {
                 .collect(),
             FkAction::NoAction | FkAction::Restrict => return Ok(()),
         };
+        let target = FkTarget(std::sync::Arc::new(self.new_fk_keyed_target(
+            parent,
+            fk,
+            &old_tuples,
+            new_tuples.as_deref(),
+        )?));
         self.run_fk_action_update(
             Update {
                 table: child.name.clone(),
                 db: Some("main".to_string()),
                 assignments,
-                filter: Some(filter),
+                filter: None,
                 returning: None,
+                fk_target: Some(target),
             },
-            params,
+            Vec::new(),
             meter,
         )
     }
@@ -2990,20 +2860,36 @@ impl Engine {
                 *m |= ret_mask[i];
             }
         }
+        // A generated action's keyed target reads the FK columns for its membership test (§6.11).
+        if let Some(target) = &del.fk_target {
+            for &column in &target.0.fk.columns {
+                mask[column] = true;
+            }
+        }
         // Select and execute the target scan through the shared mutation access-path seam. Planning
-        // happens after uncorrelated folding, matching the old inline detector timing.
-        let scan_plan =
-            self.plan_mutation_scan(del.db.as_deref(), table, filter.as_ref(), contradiction);
+        // happens after uncorrelated folding, matching the old inline detector timing. A generated
+        // action gathers its keyed target instead (constraints.md §6.6).
         let scan_before = meter.accrued;
-        let batch = self.execute_mutation_scan(
-            &scan_plan,
-            &del.table,
-            filter.as_ref(),
-            &bound,
-            &env,
-            &mut meter,
-            &mask,
-        )?;
+        let batch = match &del.fk_target {
+            Some(target) => self.fk_keyed_scan(&target.0, &del.table, &mask)?,
+            None => {
+                let scan_plan = self.plan_mutation_scan(
+                    del.db.as_deref(),
+                    table,
+                    filter.as_ref(),
+                    contradiction,
+                );
+                self.execute_mutation_scan(
+                    &scan_plan,
+                    &del.table,
+                    filter.as_ref(),
+                    &bound,
+                    &env,
+                    &mut meter,
+                    &mask,
+                )?
+            }
+        };
         let mut scan_actual = meter.accrued - scan_before;
         let block_cost =
             COSTS.page_read * batch.pages as i64 + COSTS.value_decompress * batch.slabs as i64;
@@ -3019,7 +2905,7 @@ impl Engine {
             // Materialize the filter's columns if the lazy load left them unfetched — exactly
             // the touched set the block above charged (large-values.md §14).
             store.resolve_columns(&mut row, &mask)?;
-            let keep = match &filter {
+            let mut keep = match &filter {
                 None => true,
                 Some(f) => {
                     let before = meter.accrued;
@@ -3028,6 +2914,9 @@ impl Engine {
                     keep
                 }
             };
+            if let Some(target) = &del.fk_target {
+                keep = target.0.match_row(&row)?.is_some();
+            }
             if keep {
                 // The FK parent-side probe + index-entry removal below read this row's key/index
                 // columns directly; resolve its inline-deferred values (lazy-record.md §5b — a key
@@ -3395,20 +3284,36 @@ impl Engine {
                 *m |= ret_mask[ncols + i]; // old side — always a storage read
             }
         }
+        // A generated action's keyed target reads the FK columns for its membership test (§6.11).
+        if let Some(target) = &upd.fk_target {
+            for &column in &target.0.fk.columns {
+                mask[column] = true;
+            }
+        }
         // Select and execute the target scan through the shared mutation access-path seam. The
-        // keyed batch is over the pre-update state and feeds the unchanged two-phase rewrite.
-        let scan_plan =
-            self.plan_mutation_scan(upd.db.as_deref(), table, filter.as_ref(), contradiction);
+        // keyed batch is over the pre-update state and feeds the unchanged two-phase rewrite. A
+        // generated action gathers its keyed target instead (constraints.md §6.6).
         let scan_before = meter.accrued;
-        let batch = self.execute_mutation_scan(
-            &scan_plan,
-            &upd.table,
-            filter.as_ref(),
-            &bound,
-            &env,
-            &mut meter,
-            &mask,
-        )?;
+        let batch = match &upd.fk_target {
+            Some(target) => self.fk_keyed_scan(&target.0, &upd.table, &mask)?,
+            None => {
+                let scan_plan = self.plan_mutation_scan(
+                    upd.db.as_deref(),
+                    table,
+                    filter.as_ref(),
+                    contradiction,
+                );
+                self.execute_mutation_scan(
+                    &scan_plan,
+                    &upd.table,
+                    filter.as_ref(),
+                    &bound,
+                    &env,
+                    &mut meter,
+                    &mask,
+                )?
+            }
+        };
         let mut scan_actual = meter.accrued - scan_before;
         let block_cost =
             COSTS.page_read * batch.pages as i64 + COSTS.value_decompress * batch.slabs as i64;
@@ -3436,13 +3341,35 @@ impl Engine {
             if !matched {
                 continue;
             }
+            // A generated action's keyed target: the row must reference a batch tuple, and an ON
+            // UPDATE CASCADE substitutes that tuple's new values for its placeholder assignments
+            // (§6.6).
+            let mut mapped: Option<&[Value]> = None;
+            if let Some(target) = &upd.fk_target {
+                let Some(i) = target.0.match_row(&row)? else {
+                    continue;
+                };
+                if let Some(next) = &target.0.next {
+                    mapped = Some(&next[i]);
+                }
+            }
             // The OLD row is retained for index-entry removal (its key/index columns are read
             // directly below); resolve its inline-deferred values (lazy-record.md §5b — a key
             // column is always inline, so cost-free) so that maintenance sees resident values.
             store.resolve_inline_columns(&mut row)?;
             let mut new_row = row.clone();
             for plan in &plans {
-                let raw = plan.source.eval(&row, &env, &mut meter)?;
+                let mut raw = plan.source.eval(&row, &env, &mut meter)?;
+                if let (Some(mapped), Some(target)) = (mapped, &upd.fk_target) {
+                    let slot = target
+                        .0
+                        .fk
+                        .columns
+                        .iter()
+                        .position(|&c| c == plan.idx)
+                        .expect("a CASCADE assignment is one of the FK's local columns");
+                    raw = mapped[slot].clone();
+                }
                 new_row[plan.idx] = plan.check(raw).map_err(|e| e.with_table(&relation))?;
             }
             // The rewritten row is stored fully resident: resolve any still-unfetched (untouched)

@@ -119,13 +119,20 @@ func TestForeignKeyParentUpdateEndStateSwap(t *testing.T) {
 		"INSERT INTO c VALUES (10, 100), (11, 200)",
 		"CREATE TABLE cc (id i32 PRIMARY KEY, pc i32 REFERENCES p (code) ON UPDATE CASCADE)",
 		"INSERT INTO cc VALUES (20, 100), (21, 200)",
+		// ci's index makes its cascade gather through the keyed index path (constraints.md §6.6);
+		// cc keeps the full-scan fallback. Each child row is visited once in either case.
+		"CREATE TABLE ci (id i32 PRIMARY KEY, pc i32 REFERENCES p (code) ON UPDATE CASCADE)",
+		"CREATE INDEX ci_pc ON ci (pc)",
+		"INSERT INTO ci VALUES (30, 100), (31, 200)",
 	)
 	if _, err := queryOutcome(db, "UPDATE p SET code = CASE code WHEN 100 THEN 200 ELSE 100 END", nil); err != nil {
 		t.Fatalf("referenced-value swap should succeed (end state): %v", err)
 	}
-	out, err := queryOutcome(db, "SELECT id, pc FROM cc ORDER BY id", nil)
-	if err != nil || len(out.Rows) != 2 || out.Rows[0][1].Int != 200 || out.Rows[1][1].Int != 100 {
-		t.Fatalf("cascaded swap rows: %v, err=%v", out.Rows, err)
+	for _, child := range []string{"cc", "ci"} {
+		out, err := queryOutcome(db, "SELECT id, pc FROM "+child+" ORDER BY id", nil)
+		if err != nil || len(out.Rows) != 2 || out.Rows[0][1].Int != 200 || out.Rows[1][1].Int != 100 {
+			t.Fatalf("%s cascaded swap rows: %v, err=%v", child, out.Rows, err)
+		}
 	}
 	if got := fkErr(t, db, "UPDATE p SET code = 999 WHERE id = 1"); got != "23503" {
 		t.Fatalf("orphaning update: got %s, want 23503", got)
@@ -141,6 +148,10 @@ func TestForeignKeyActionPreservesMainScopeAcrossTempOverlap(t *testing.T) {
 	defer shadowed.Close()
 	mustExec(t, shadowed, "CREATE TEMP TABLE c (temp_id i32 PRIMARY KEY, scratch text)")
 	mustExec(t, shadowed, "INSERT INTO c VALUES (99, 'keep')")
+	// ci's index makes its cascade gather through the keyed index path, whose child-row lookups
+	// must also stay in main (constraints.md §6.6).
+	mustExec(t, shadowed, "CREATE TEMP TABLE ci (temp_id i32 PRIMARY KEY)")
+	mustExec(t, shadowed, "INSERT INTO ci VALUES (98)")
 
 	persistent := base.Session(SessionOptions{})
 	defer persistent.Close()
@@ -148,6 +159,9 @@ func TestForeignKeyActionPreservesMainScopeAcrossTempOverlap(t *testing.T) {
 	mustExec(t, persistent, "CREATE TABLE c (id i32 PRIMARY KEY, pid i32 REFERENCES p ON DELETE CASCADE)")
 	mustExec(t, persistent, "INSERT INTO p VALUES (1)")
 	mustExec(t, persistent, "INSERT INTO c VALUES (10, 1)")
+	mustExec(t, persistent, "CREATE TABLE ci (id i32 PRIMARY KEY, pid i32 REFERENCES p ON DELETE CASCADE)")
+	mustExec(t, persistent, "CREATE INDEX ci_pid ON ci (pid)")
+	mustExec(t, persistent, "INSERT INTO ci VALUES (20, 1)")
 
 	mustExec(t, shadowed, "DELETE FROM main.p WHERE id = 1")
 	persistentOut, err := queryOutcome(persistent, "SELECT id, pid FROM c", nil)
@@ -165,5 +179,11 @@ func TestForeignKeyActionPreservesMainScopeAcrossTempOverlap(t *testing.T) {
 	}
 	if len(tempRows) != 1 || tempRows[0][0].Int != 99 || tempRows[0][1].str() != "keep" {
 		t.Fatalf("temp shadow rows after main cascade = %v, want [[99 keep]]", tempRows)
+	}
+	if out, err := queryOutcome(persistent, "SELECT id FROM ci", nil); err != nil || len(out.Rows) != 0 {
+		t.Fatalf("persistent indexed child rows after cascade = %v, err=%v, want empty", out.Rows, err)
+	}
+	if out, err := queryOutcome(shadowed, "SELECT temp_id FROM ci", nil); err != nil || len(out.Rows) != 1 || out.Rows[0][0].Int != 98 {
+		t.Fatalf("temp indexed shadow rows after main cascade = %v, err=%v, want [[98]]", out.Rows, err)
 	}
 }

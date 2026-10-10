@@ -592,8 +592,10 @@ the engine picks a **reverse access path** on the child table, deterministically
    probe agree on the parent's equality. The candidates are the child's **primary key** (its
    members in key order) and every **ordered B-tree secondary index**, unique or not, that is
    **not partial** and whose leading `k` keys are **plain columns** (an expression key, GIN, GiST,
-   or a partial index never qualifies: a partial index can omit a referencing row). Trailing key
-   columns beyond `k` are ignored.
+   or a partial index never qualifies: a partial index can omit a referencing row). Every key
+   column after the leading `k` must be a **fixed-width scalar**, so an entry's storage-key suffix
+   can be located by skipping fixed-width slots (the [indexes.md §5.1](indexes.md) rule); a child
+   PK always qualifies on this point, since its tail is the rest of the storage key itself.
 2. **Tie order.** When several qualify, the **primary key** wins, then indexes in ascending
    lowercased-name order — the planner's canonical access-path tie order
    ([estimator.md](estimator.md)). Every qualifying path returns the same answer; the order only
@@ -644,6 +646,26 @@ The grammar and executor support the full `ON DELETE` / `ON UPDATE` action set:
   has no default, once per affected child row. Expression defaults use the same host-injected
   clock/entropy/sequence seams as ordinary DML. The resulting row is validated normally; in
   particular, a default tuple that names no parent raises `23503`.
+
+**Keyed target.** A generated write action is one child `UPDATE`/`DELETE` per (FK × parent
+mutation batch), but it is not driven by a SQL predicate. It carries an internal **keyed target**:
+the batch's distinct, complete (non-NULL) old parent tuples. Its rows are gathered through the same
+reverse path §6.5 chooses for the FK:
+
+- **With a usable child key**, each distinct tuple is one prefix probe `[P, prefix-successor(P))`
+  of that key. On the PK the probe is a bounded scan of the child; on an index each admitted entry
+  is followed by a point lookup of its child row. The gathered rows are de-duplicated and then
+  visited in **storage-key order**.
+- **Without one**, the child is scanned once in storage-key order.
+
+Either way a row is a target iff its FK tuple, encoded in the parent's key space, is one of the
+batch's tuples. That hash-set membership test replaces the former generated OR of tuple
+equalities. `ON UPDATE CASCADE` likewise takes each target row's new FK values from the batch's
+`old tuple -> new tuple` map. It no longer evaluates an N-arm `CASE`. The work is therefore
+O(tuples × log child + targets) with a usable key and O(child + tuples) without, instead of
+O(tuples × child). The mapped, NULL, or default value then enters the ordinary assignment
+pipeline unchanged, including coercion, `varchar(n)` length, and `NOT NULL`. RETURNING and
+`rows_affected` are unaffected.
 
 Actions run inside the originating statement's all-or-nothing mutation closure. The directly
 targeted parent rows are phase-2-written first; then inbound write actions run to a fixed point;
@@ -752,11 +774,27 @@ statement before the work it pays for, and `Guard`ed immediately, so `max_cost` 
 
 (Before this slice the reverse match was unmetered, on the argument that the child table's size is
 bounded by the metered work that filled it. That bounds the child, not the product with the number
-of deleted parents.) A referential **write action**, however, executes the ordinary generated child
-UPDATE/DELETE pipeline and charges its scan, expression, and compression units to the originating
-statement (§6.6); that generated statement's own access path comes from the ordinary planner, which
-already uses a child index for a bounded predicate. Runtime errors in a `SET DEFAULT` expression
-propagate as themselves.
+of deleted parents.)
+
+A referential **write action** charges the originating statement for its keyed target gather and
+then for the ordinary row pipeline (§6.6):
+
+- **Keyed gather, usable child key** — per distinct parent tuple, the bounded-scan block of its
+  probe range. On the child PK that is the overlapping table-tree nodes plus the admitted rows'
+  touched-column overflow/decompress units. On an index it is the overlapping index-tree nodes
+  plus, per admitted entry, that row's root→row point-lookup pages and touched-column units, which
+  is the index-bounded-scan block (cost.md §3). The blocks are summed and charged before the row
+  loop.
+- **Keyed gather, full-scan fallback** — the child's ordinary full-scan block for the touched set.
+- **Rows** — one `storage_row_read` per gathered row (every child row, on the fallback), guarded
+  per row like any mutation scan. The tuple-set membership test and the cascade value lookup are
+  set membership, not evaluation, so they are unmetered, like `DISTINCT` dedup. The touched set is
+  the FK's local columns: an `ON UPDATE CASCADE` reads them to find the mapping, while a
+  `DELETE`/`SET NULL` reads them for the membership test.
+- **The rest** — `SET DEFAULT` expression evaluation, CHECKs, compression of the rewritten rows,
+  and every nested action charge exactly as in an ordinary statement.
+
+Runtime errors in a `SET DEFAULT` expression propagate as themselves.
 
 ## 7. INSERT validation and write order
 

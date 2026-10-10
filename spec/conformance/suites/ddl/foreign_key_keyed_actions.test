@@ -1,0 +1,301 @@
+# Keyed referential actions (spec/design/constraints.md §6.6 "Keyed target", §6.11; cost.md §3
+# "Foreign-key reverse match"). A generated CASCADE / SET NULL / SET DEFAULT gathers its child rows
+# through the §6.5 reverse path instead of evaluating a generated OR of tuple equalities: one prefix
+# probe per distinct parent tuple on a usable child key (the child PK, or a non-partial plain-column
+# B-tree leading with the FK columns), else one full scan of the child. A row is a target iff its
+# FK tuple is one of the batch's parent tuples, and ON UPDATE CASCADE takes its new values from the
+# batch's old -> new map. Both are unmetered set membership. The rows then run the ordinary
+# pipeline. All units weigh 1, and every table fits in one leaf unless stated otherwise.
+# requires: ddl.create_table, ddl.primary_key, ddl.foreign_key, ddl.foreign_key_child_index, ddl.secondary_index, ddl.column_default, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, query.select, query.order_by, query.aggregates, query.set_returning, query.where_eq, query.comparison_order, query.point_lookup, types.i32, types.text, types.varchar_length, ddl.unique, expr.in_list, query.logical_connectives, null.three_valued, resource.cost_metering, resource.cost_limit
+
+# --- ON DELETE CASCADE: full-scan fallback vs an index on the FK column -------------------------
+
+statement ok
+CREATE TABLE kp (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE kc (id i32 PRIMARY KEY, pid i32 REFERENCES kp ON DELETE CASCADE ON UPDATE CASCADE)
+
+statement ok
+INSERT INTO kp VALUES (1), (2), (3), (4)
+
+statement ok
+INSERT INTO kc VALUES (10, 1), (20, 1), (30, 2), (40, 3)
+
+# The parent point delete is 1 page + 1 row + 1 filter eval = 3. The cascade has no usable key, so
+# it scans kc once: 1 page + 4 rows. 3 + 5 = 8.
+# cost: 8
+statement ok
+DELETE FROM kp WHERE id = 1
+
+query II rowsort
+SELECT id, pid FROM kc
+----
+30
+2
+40
+3
+
+statement ok
+CREATE INDEX kc_pid ON kc (pid)
+
+# With kc_pid, the cascade probes the index for pid = 2 (1 index page) and point-looks-up the one
+# admitted row (1 table page), then reads it (1 row). 3 + 3 = 6.
+# cost: 6
+statement ok
+DELETE FROM kp WHERE id = 2
+
+query II rowsort
+SELECT id, pid FROM kc
+----
+40
+3
+
+# A parent with no children probes and gathers nothing: 3 + 1 index page = 4.
+# cost: 4
+statement ok
+DELETE FROM kp WHERE id = 4
+
+# --- ON UPDATE CASCADE through the index -----------------------------------------------------
+
+statement ok
+INSERT INTO kp VALUES (5), (6)
+
+statement ok
+INSERT INTO kc VALUES (50, 5), (51, 5), (60, 6)
+
+# Re-keying two parents maps 5 -> 15 and 6 -> 16 in one child update, each child row taking its own
+# parent's new key. (A key swap also succeeds in jed, which validates the end state; PostgreSQL's
+# per-row check rejects it, the constraints.md §6.7 divergence kept out of this corpus.)
+statement ok
+UPDATE kp SET id = id + 10 WHERE id IN (5, 6)
+
+query II rowsort
+SELECT id, pid FROM kc
+----
+40
+3
+50
+15
+51
+15
+60
+16
+
+# The parent UPDATE is 1 page + 1 row + 1 filter eval = 3, and RETURNING adds 1 produced row. The
+# cascade probes kc_pid for pid = 3 (1 index page), point-looks-up its one child (1 page) and
+# reads it (1 row). The cascade's assignment is a placeholder self-reference: 0 evals. 4 + 3 = 7.
+# cost: 7
+query I nosort
+UPDATE kp SET id = 30 WHERE id = 3 RETURNING id
+----
+30
+
+query II rowsort
+SELECT id, pid FROM kc WHERE id = 40
+----
+40
+30
+
+# --- A composite FK served by an index in a different column order -----------------------------
+
+statement ok
+CREATE TABLE kcp (a i32, b i32, PRIMARY KEY (a, b))
+
+statement ok
+CREATE TABLE kcc (id i32 PRIMARY KEY, x i32, y i32, FOREIGN KEY (x, y) REFERENCES kcp (a, b) ON DELETE CASCADE ON UPDATE CASCADE)
+
+statement ok
+CREATE INDEX kcc_yx ON kcc (y, x)
+
+statement ok
+INSERT INTO kcp VALUES (1, 1), (1, 2), (2, 1), (2, 2)
+
+statement ok
+INSERT INTO kcc VALUES (1, 1, 1), (2, 1, 2), (3, 2, 1), (4, 2, 1), (5, NULL, 1)
+
+# Deleting three parents gathers through kcc_yx once per tuple. The parent full scan is 1 page +
+# 4 rows + 4 x 3 evals (the `a = 1 OR b = 1` is three operators per row): 17. The three probes
+# (1, 1), (1, 2) and (2, 1) each charge 1 index page, and they admit rows 1, 2, 3, 4, each a 1-page
+# point lookup: 3 + 4 = 7. The four gathered rows are 4 row reads. 17 + 7 + 4 = 28. The (NULL, 1)
+# child references nothing (MATCH SIMPLE) and survives.
+# cost: 28
+statement ok
+DELETE FROM kcp WHERE a = 1 OR b = 1
+
+query III rowsort
+SELECT id, x, y FROM kcc
+----
+5
+NULL
+1
+
+# The composite tuple maps as a whole.
+statement ok
+INSERT INTO kcc VALUES (6, 2, 2)
+
+statement ok
+UPDATE kcp SET a = 7, b = 8 WHERE a = 2 AND b = 2
+
+query III rowsort
+SELECT id, x, y FROM kcc
+----
+5
+NULL
+1
+6
+7
+8
+
+# --- SET NULL and SET DEFAULT through a child PK prefix ----------------------------------------
+
+statement ok
+CREATE TABLE sp (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE sn (pid i32 REFERENCES sp ON DELETE SET NULL, seq i32, note i32, UNIQUE (pid, seq))
+
+statement ok
+CREATE TABLE sd (pid i32 DEFAULT 0 REFERENCES sp ON DELETE SET DEFAULT, seq i32, PRIMARY KEY (pid, seq))
+
+statement ok
+INSERT INTO sp VALUES (0), (1), (2)
+
+statement ok
+INSERT INTO sn VALUES (1, 1, 0), (1, 2, 0), (2, 1, 0)
+
+statement ok
+INSERT INTO sd VALUES (1, 1), (2, 1)
+
+statement ok
+DELETE FROM sp WHERE id = 1
+
+query II rowsort
+SELECT pid, seq FROM sn
+----
+2
+1
+NULL
+1
+NULL
+2
+
+query II rowsort
+SELECT pid, seq FROM sd
+----
+0
+1
+2
+1
+
+# The default tuple (0, 1) collides with the existing child key: the ordinary pipeline's 23505.
+statement ok
+INSERT INTO sd VALUES (2, 2)
+
+statement ok
+INSERT INTO sd VALUES (0, 2)
+
+statement error 23505
+DELETE FROM sp WHERE id = 2
+
+query II rowsort
+SELECT pid, seq FROM sd
+----
+0
+1
+0
+2
+2
+1
+2
+2
+
+# A NOT NULL FK column under SET NULL is the ordinary 23502, and the parent delete rolls back.
+statement ok
+CREATE TABLE snp (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE snn (id i32 PRIMARY KEY, pid i32 NOT NULL REFERENCES snp ON DELETE SET NULL)
+
+statement ok
+INSERT INTO snp VALUES (1), (2)
+
+statement ok
+INSERT INTO snn VALUES (1, 1)
+
+statement error 23502
+DELETE FROM snp WHERE id = 1
+
+query I nosort
+SELECT count(*) FROM snp
+----
+2
+
+# --- The cascaded value passes through ordinary assignment validation -------------------------
+
+statement ok
+CREATE TABLE vp (code varchar(10) PRIMARY KEY)
+
+statement ok
+CREATE TABLE vc (id i32 PRIMARY KEY, code varchar(3) REFERENCES vp ON UPDATE CASCADE)
+
+statement ok
+INSERT INTO vp VALUES ('abc')
+
+statement ok
+INSERT INTO vc VALUES (1, 'abc')
+
+statement error 22001
+UPDATE vp SET code = 'abcdef' WHERE code = 'abc'
+
+statement ok
+UPDATE vp SET code = 'xyz' WHERE code = 'abc'
+
+query IT nosort
+SELECT id, code FROM vc
+----
+1
+xyz
+
+# --- Many parents: linear in the parents, not parents x children ------------------------------
+
+statement ok
+CREATE TABLE mp (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE mc (id i32 PRIMARY KEY, pid i32 REFERENCES mp ON DELETE CASCADE)
+
+statement ok
+INSERT INTO mp SELECT x FROM generate_series(1, 2000) x
+
+statement ok
+INSERT INTO mc SELECT x, x FROM generate_series(1, 2000) x
+
+# Unindexed, deleting 1000 parents cascades through ONE scan of mc and a hash membership test per
+# row, not a 1000-way OR per row: 1000 parent rows + 1000 filter evals + 2000 child rows, plus 8
+# pages across the two trees.
+# cost: 4008
+statement ok
+DELETE FROM mp WHERE id <= 1000
+
+query I nosort
+SELECT count(*) FROM mc
+----
+1000
+
+statement ok
+CREATE INDEX mc_pid ON mc (pid)
+
+# Indexed, it is one probe (2 index pages) and one point lookup (2 table pages) per parent, plus
+# the gathered row's read: 1000 x 5 on top of the parent's 1000 rows + 1000 evals + 4 pages. The
+# former generated predicate, an OR of 1000 equalities evaluated per child row, cost about 4 million
+# here; the ceiling now admits the statement with room to spare.
+# max_cost: 20000
+# cost: 7004
+statement ok
+DELETE FROM mp WHERE id <= 2000
+
+query I nosort
+SELECT count(*) FROM mc
+----
+0

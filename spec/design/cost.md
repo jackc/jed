@@ -1443,9 +1443,18 @@ deferred-check order (referencing table, then FK name, then parent-row order). E
 So a `DELETE` of 1,000 childless parents over an unindexed 100,000-row child charges about
 1,000 × (child pages + 100,000). The ceiling now stops it. Indexing the FK columns brings the cost
 down to about 1,000 × the index's height. The child-side existence probe and the UPDATE re-probe of the parent
-stay unmetered: each is a single descent per metered row (below). Generated `CASCADE` / `SET NULL` /
-`SET DEFAULT` statements are ordinary DML and charge their own planned scans.
-`suites/ddl/foreign_key_child_index.test` pins both paths and the ceiling cross-core.
+stay unmetered: each is a single descent per metered row (below). `suites/ddl/foreign_key_child_index.test`
+pins both paths and the ceiling cross-core.
+
+Generated `CASCADE` / `SET NULL` / `SET DEFAULT` statements gather their target rows through the
+same reverse path, as a **keyed target** ([constraints.md](constraints.md) §6.6/§6.11). With a
+usable child key, each distinct parent tuple charges its probe range's bounded-scan block: the
+PK-bounded block, or the index-bounded block including each admitted row's point lookup. Without
+one, the gather charges the child's ordinary full-scan block. Then each gathered row charges one
+`storage_row_read`. The parent-tuple membership test and the `ON UPDATE CASCADE` old→new lookup are
+unmetered set membership, so an action over N parents no longer accrues the N-way OR and N-arm
+`CASE` `operator_eval`s per child row. `suites/ddl/foreign_key_keyed_actions.test` pins the keyed
+costs.
 
 ### What is NOT metered (defined boundary)
 
