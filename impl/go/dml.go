@@ -1056,6 +1056,13 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 						"INSERT ... SELECT into composite column %s is not supported yet", col.Name,
 					))
 				}
+				// INSERT ... SELECT into an array column is deferred (the VALUES + ARRAY[…] path
+				// is the supported input — spec/design/array.md §12).
+				if col.Type.IsArray() {
+					return outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
+						"INSERT ... SELECT into array column %s is not supported yet", col.Name,
+					))
+				}
 				// INSERT ... SELECT into a range column is deferred (the VALUES + range literal/cast
 				// path is the supported input — spec/design/ranges.md §1).
 				if col.Type.IsRange() {

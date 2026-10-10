@@ -498,6 +498,11 @@ reason = "jed: comparing i32[] to text[] is a cross-type error 42804 (the strict
 
 [[override]]
 file = "types/array.test"
+sql = "INSERT INTO t (id, xs) SELECT 9, ARRAY[1]"
+reason = "jed: INSERT ... SELECT into an array column is deferred this slice (0A000 — array.md §12; the VALUES + ARRAY[…] / '{…}' literal path is the supported input), like the composite and range columns. PostgreSQL inserts the row. A documented narrowing."
+
+[[override]]
+file = "types/array.test"
 sql = "CREATE TABLE k (xs i32[] PRIMARY KEY)"
 reason = "jed: an array PRIMARY KEY is rejected 0A000 this slice (the order-preserving array key encoding is authored but unexercised — array.md §12). PostgreSQL allows an array primary key, so it does NOT raise. A documented narrowing."
 
