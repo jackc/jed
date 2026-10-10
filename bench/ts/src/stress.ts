@@ -104,11 +104,18 @@ function parseOp(op: string): string[] {
 // queryScalar runs a single-column, single-row query and renders the scalar to its canonical string
 // (render — so the decimal `sum(bigint)` result `1000` renders identically across cores). The
 // invariant is a string compare, not folded into the cross-core checksum.
+// The cursor is closed in `finally` — its reader-liveness pin outlives the session otherwise (JS has no
+// destructor; streaming.md §5).
 function queryScalar(rh: Session, sql: string): string {
-  for (const row of rh.query(sql, [])) {
-    return render(row[0]);
+  const rows = rh.query(sql, []);
+  try {
+    for (const row of rows) {
+      return render(row[0]);
+    }
+    throw new Error(`no row from ${sql}`);
+  } finally {
+    rows.close();
   }
-  throw new Error(`no row from ${sql}`);
 }
 
 // --- setup + the final check -----------------------------------------------------------------
@@ -127,10 +134,11 @@ function setup(db: Database, sql: string[]): void {
 function checkFinal(db: Database, f: StressFile): { checksum: string; ok: boolean } {
   if (f.finalQuery === null) return { checksum: "", ok: true };
   const rh = db.readSession();
+  const rows = rh.query(f.finalQuery, []);
   try {
     const sum = new Checksum();
     const got: bigint[][] = [];
-    for (const row of rh.query(f.finalQuery, [])) {
+    for (const row of rows) {
       const ints: bigint[] = [];
       for (const v of row) {
         if (v.kind === "int") {
@@ -147,6 +155,7 @@ function checkFinal(db: Database, f: StressFile): { checksum: string; ok: boolea
     }
     return { checksum: sum.hex(), ok: finalEqual(got, f.finalExpect) };
   } finally {
+    rows.close();
     rh.close();
   }
 }

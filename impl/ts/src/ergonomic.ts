@@ -182,35 +182,51 @@ export class Statement {
   // mid-drain streaming error (a 54P01 cost abort, 57014 cancellation, or arithmetic trap) rather than
   // dropping it. A raw streaming Rows must be closed after draining — JS has no destructor and the
   // iterator does not auto-close — so its reader-liveness pin is released in `finally` (api.md §11,
-  // streaming.md §5); this is stricter than get/all/iterate, which drain without closing.
+  // streaming.md §5). get/all/iterate close their cursor the same way.
   run(...params: JsParam[]): RunResult {
     return drainRun(this.handle.queryPrepared(this.prepared(), bindParams(params)));
   }
 
   // get runs a query, binding native params, and returns its FIRST row as an object — or undefined
-  // when the query produced no rows. Extra rows are not materialized beyond the first.
+  // when the query produced no rows. Extra rows are not materialized beyond the first: the cursor is
+  // closed right after the first pull, releasing its reader-liveness pin (streaming.md §5).
   get(...params: JsParam[]): Row | undefined {
     const rows = this.handle.queryPrepared(this.prepared(), bindParams(params));
-    for (const values of rows) return rowObject(values, rows.columnNames);
-    return undefined;
+    try {
+      for (const values of rows) return rowObject(values, rows.columnNames);
+      return undefined;
+    } finally {
+      rows.close();
+    }
   }
 
-  // all runs a query, binding native params, and returns every row as an object.
+  // all runs a query, binding native params, and returns every row as an object. The cursor is closed
+  // after the drain — on a mid-drain error too — so no reader pin outlives the call.
   all(...params: JsParam[]): Row[] {
     const rows = this.handle.queryPrepared(this.prepared(), bindParams(params));
-    const out: Row[] = [];
-    for (const values of rows) {
-      // The engine-owned collector charges each collected row (spec/design/memory.md §5.1).
-      rows.admitCollected(values);
-      out.push(rowObject(values, rows.columnNames));
+    try {
+      const out: Row[] = [];
+      for (const values of rows) {
+        // The engine-owned collector charges each collected row (spec/design/memory.md §5.1).
+        rows.admitCollected(values);
+        out.push(rowObject(values, rows.columnNames));
+      }
+      return out;
+    } finally {
+      rows.close();
     }
-    return out;
   }
 
-  // iterate runs a query, binding native params, and yields each row object lazily (over the
-  // materialized result — true streaming is deferred per CLAUDE.md §9, but the contract is the seam).
+  // iterate runs a query, binding native params, and yields each row object lazily, pulling one row
+  // from the cursor per step. The cursor is closed when the generator finishes — exhausted, thrown, or
+  // returned early by a consumer's `break` / `return()` — releasing its reader-liveness pin
+  // (streaming.md §5). A generator that is never started opens no cursor.
   *iterate(...params: JsParam[]): IterableIterator<Row> {
     const rows = this.handle.queryPrepared(this.prepared(), bindParams(params));
-    for (const values of rows) yield rowObject(values, rows.columnNames);
+    try {
+      for (const values of rows) yield rowObject(values, rows.columnNames);
+    } finally {
+      rows.close();
+    }
   }
 }

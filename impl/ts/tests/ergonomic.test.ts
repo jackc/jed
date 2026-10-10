@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { Database } from "../src/tooling.ts";
+import { attachMemory, type Database, EngineError } from "../src/tooling.ts";
 import { intValue } from "../src/value.ts";
 import { memDb } from "./mem_db.ts";
 
@@ -128,4 +128,65 @@ test("methods on Session and Transaction", () => {
   } finally {
     s.close();
   }
+});
+
+// get/all/iterate close their cursor (JS has no destructor; streaming.md §5), so no reader-liveness pin
+// outlives the call — not past session.close(), and not into a later detach, which a live reader blocks
+// (55006). iterate releases on exhaustion, on an early break, and when its consumer stops it with
+// return(); a mid-drain error still releases. A raw query cursor left open is the control.
+test("get, all, and iterate release their reader pin", () => {
+  const db = memDb();
+  db.attach("aux", attachMemory(), false);
+  db.run("CREATE TABLE aux.a (id i32 PRIMARY KEY)");
+  db.run("INSERT INTO aux.a VALUES (1), (2), (3)");
+  const unpinned = () => assert.strictEqual(db.oldestLiveTxid(), db.version, "no reader pin held");
+
+  const s = db.session({});
+  const open = s.query("SELECT id FROM aux.a", []);
+  assert.throws(
+    () => db.detach("aux"),
+    (e: unknown) => e instanceof EngineError && e.code() === "55006",
+    "an unclosed cursor blocks detach",
+  );
+  open.close();
+  unpinned();
+
+  const stmt = s.prepare("SELECT id FROM aux.a ORDER BY id");
+  assert.strictEqual(stmt.get()?.id, 1n);
+  unpinned();
+  assert.strictEqual(s.prepare("SELECT id FROM aux.a WHERE id > 9").get(), undefined);
+  unpinned();
+  assert.strictEqual(stmt.all().length, 3);
+  unpinned();
+  assert.deepEqual(
+    [...stmt.iterate()].map((r) => r.id),
+    [1n, 2n, 3n],
+  );
+  unpinned();
+  for (const row of stmt.iterate()) {
+    assert.strictEqual(row.id, 1n);
+    break;
+  }
+  unpinned();
+  const it = stmt.iterate();
+  assert.strictEqual(it.next().value?.id, 1n);
+  it.return?.();
+  unpinned();
+  stmt.iterate(); // never started: opens no cursor
+  unpinned();
+
+  const trap = s.prepare("SELECT 1 / (id - 2) AS q FROM aux.a");
+  assert.throws(
+    () => trap.all(),
+    (e: unknown) => e instanceof EngineError && e.code() === "22012",
+  );
+  unpinned();
+
+  // The Database one-shots route through the same Statement.
+  assert.strictEqual(db.get("SELECT id FROM aux.a ORDER BY id")?.id, 1n);
+  assert.strictEqual(db.all("SELECT id FROM aux.a").length, 3);
+  unpinned();
+
+  s.close();
+  db.detach("aux");
 });

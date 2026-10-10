@@ -17,8 +17,6 @@ import {
   type Database,
   EngineError,
   openDatabase,
-  queryOutcome,
-  render,
   verifyLivePages,
 } from "../src/tooling.ts";
 
@@ -188,9 +186,13 @@ test("file attachment storage limit", () => {
     assert.throws(() => s.execute("COMMIT"), is("54P06"));
     assert.equal(host.storageBytes("main"), main);
     assert.equal(host.storageBytes("f"), aux);
-    // queryOutcome closes its cursor, so no reader pin outlives it (the detach below needs none).
-    const out = queryOutcome(s, "SELECT (SELECT count(*) FROM t), (SELECT count(*) FROM f.a)");
-    assert.equal(out.kind === "query" ? out.rows.map((r) => r.map(render)).join() : "", "0,0");
+    assert.deepEqual(
+      s.get("SELECT (SELECT count(*) FROM t) AS t, (SELECT count(*) FROM f.a) AS a"),
+      {
+        t: 0n,
+        a: 0n,
+      },
+    );
     // A small write fits.
     s.execute("INSERT INTO f.a VALUES (1, 'z')");
     assert.ok(host.storageBytes("f") <= 4n * PAGE);

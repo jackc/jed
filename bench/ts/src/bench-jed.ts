@@ -151,31 +151,35 @@ function bindArgs(args: Arg[]): Value[] {
 
 // runReaderQuery runs one query through a reader Session, re-parsing the SQL each call — deliberate
 // (benchmarks.md §8.1): a constant per-query parse cost is included, uniform across the jed cores —
-// folding rows into sum.
+// folding rows into sum. The cursor is closed after the drain, releasing its reader-liveness pin.
 function runReaderQuery(sess: Session, sql: string, args: Arg[], sum: Checksum | null): number {
   const rows = sess.query(sql, bindArgs(args));
-  let n = 0;
-  for (const row of rows) {
-    n++;
-    if (sum === null) continue;
-    for (const v of row) {
-      switch (v.kind) {
-        case "null":
-          sum.null();
-          break;
-        case "int":
-          sum.int(v.int);
-          break;
-        case "text":
-          sum.text(v.text);
-          break;
-        default:
-          throw new Error(`unexpected result kind ${v.kind}`);
+  try {
+    let n = 0;
+    for (const row of rows) {
+      n++;
+      if (sum === null) continue;
+      for (const v of row) {
+        switch (v.kind) {
+          case "null":
+            sum.null();
+            break;
+          case "int":
+            sum.int(v.int);
+            break;
+          case "text":
+            sum.text(v.text);
+            break;
+          default:
+            throw new Error(`unexpected result kind ${v.kind}`);
+        }
       }
+      sum.endRow();
     }
-    sum.endRow();
+    return n;
+  } finally {
+    rows.close();
   }
-  return n;
 }
 
 await mainWith({
