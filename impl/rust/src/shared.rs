@@ -4188,6 +4188,7 @@ mod multi_root_failure_tests {
         let path =
             std::env::temp_dir().join(format!("jed_multi_root_failure_{}.jed", std::process::id()));
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
         let db = Database::create(CreateOptions {
             path: Some(path.clone()),
             page_size: 256,
@@ -4231,6 +4232,7 @@ mod multi_root_failure_tests {
         drop(s);
         drop(db);
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
     }
 
     #[test]

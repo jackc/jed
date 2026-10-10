@@ -340,14 +340,22 @@ func openFixture(rel string) (*jed.Database, func(), error) {
 	}
 	db, err := jed.OpenDatabase(tmpPath)
 	if err != nil {
-		os.Remove(tmpPath)
+		removeTempDB(tmpPath)
 		return nil, nil, fmt.Errorf("fixture: open %s: %w", rel, err)
 	}
 	cleanup := func() {
 		_ = db.Close()
-		os.Remove(tmpPath)
+		removeTempDB(tmpPath)
 	}
 	return db, cleanup, nil
+}
+
+// removeTempDB removes a harness temp database image and the `<path>.lock/` coordination bundle that
+// opening it created beside it (spec/design/locking.md). Removing only the image leaks one directory
+// per corpus file into the temp dir. Call it after the handle is closed.
+func removeTempDB(path string) {
+	os.Remove(path)
+	os.RemoveAll(path + ".lock")
 }
 
 // parseAttachDirective parses a file-level `# attach: <name>` line (spec/design/attached-databases.md
@@ -813,7 +821,7 @@ func runFile(text string, disk bool) error {
 		// the per-commit fdatasync (the ~20x cost) while keeping the identical on-disk bytes + read path.
 		db, err = jed.CreateDatabase(jed.CreateOptions{Path: tmpPath, SkipFsync: true})
 		if err != nil {
-			os.Remove(tmpPath)
+			removeTempDB(tmpPath)
 			return fmt.Errorf("disk mode: create %s: %w", tmpPath, err)
 		}
 	} else {
@@ -864,7 +872,7 @@ func runFile(text string, disk bool) error {
 		cleanup = func() {
 			sess.Close()
 			db.Close()
-			os.Remove(tmpPath)
+			removeTempDB(tmpPath)
 		}
 	}
 	defer func() { cleanup() }()

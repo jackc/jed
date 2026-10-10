@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import {
   createDatabase,
   type Database,
@@ -298,8 +298,13 @@ function geoHash(component: string, version: number): HostFunctionSpec {
   };
 }
 
+// One scratch directory per run, removed whole after the last test — so each database's `<path>.lock/`
+// coordination bundle (spec/design/locking.md) goes with it, even when a test fails partway.
+const scratch = mkdtempSync(join(tmpdir(), "jed-hostfunc-"));
+after(() => rmSync(scratch, { recursive: true, force: true }));
+
 function tmpFile(name: string): string {
-  return join(mkdtempSync(join(tmpdir(), "jed-hostfunc-")), name);
+  return join(scratch, name);
 }
 
 function createFile(path: string, reg: ExtensionRegistry, stmts: string[]): void {
@@ -378,7 +383,6 @@ test("host-dep index reopen with a matching registry is usable", () => {
   queryOutcome(db, "INSERT INTO t VALUES (3, 3)");
   assert.deepEqual(idsFile(db, "SELECT id FROM t WHERE geo_hash(a) = 30 ORDER BY id"), [1n, 3n]);
   db.close();
-  rmSync(path, { force: true });
 });
 
 test("host-dep index reopen with a bumped version is unusable", () => {
@@ -400,7 +404,6 @@ test("host-dep index reopen with a bumped version is unusable", () => {
     "XX002",
   );
   db.close();
-  rmSync(path, { force: true });
 });
 
 test("host-dep index reopen with a different component is unusable", () => {
@@ -418,7 +421,6 @@ test("host-dep index reopen with a different component is unusable", () => {
     "XX002",
   );
   db.close();
-  rmSync(path, { force: true });
 });
 
 test("host-dep index reopen with the function missing", () => {
@@ -438,5 +440,4 @@ test("host-dep index reopen with the function missing", () => {
     "42883",
   );
   db.close();
-  rmSync(path, { force: true });
 });

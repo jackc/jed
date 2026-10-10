@@ -13,13 +13,14 @@ import {
   lstatSync,
   mkdtempSync,
   readFileSync,
+  rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import {
   attachFile,
   attachMemory,
@@ -35,9 +36,14 @@ import { errCode } from "./util.ts";
 
 const PAGE = 4096;
 
-// tmp is a fresh path in a fresh scratch directory (never the repo tree).
+// tmp is a fresh path in this run's scratch directory (never the repo tree). The directory is removed
+// whole after the last test, taking each database's `<path>.lock/` coordination bundle
+// (spec/design/locking.md) with it.
+const scratch = mkdtempSync(join(tmpdir(), "jed-compact-"));
+after(() => rmSync(scratch, { recursive: true, force: true }));
+
 function tmp(name: string): string {
-  return join(mkdtempSync(join(tmpdir(), "jed-compact-")), name);
+  return join(scratch, name);
 }
 
 function createFile(path: string): Database {

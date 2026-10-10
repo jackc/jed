@@ -45,8 +45,17 @@ fn testdata(name: &str) -> String {
 
 fn tmp(name: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("jed_e2e_{}_{name}", std::process::id()));
-    let _ = std::fs::remove_file(&p);
+    remove_db(&p);
     p
+}
+
+/// Remove a temp database file and the `<path>.lock/` coordination bundle opening it created beside
+/// it (spec/design/locking.md) — removing only the file leaks one directory per run.
+fn remove_db(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let mut bundle = path.as_os_str().to_owned();
+    bundle.push(".lock");
+    let _ = std::fs::remove_dir_all(bundle);
 }
 
 #[test]
@@ -135,7 +144,7 @@ fn cost_ceiling_aborts_with_54p01_and_a_hint() {
         "stderr: {}",
         r.stderr
     );
-    let _ = std::fs::remove_file(&db);
+    remove_db(&db);
 }
 
 #[test]
@@ -159,7 +168,7 @@ fn create_then_reopen_round_trips() {
     let r = run(&["--create", db_str, "-c", "SELECT a FROM t"], "");
     assert_eq!(r.code, 1);
     assert!(r.stderr.contains("ERROR 58P02:"), "stderr: {}", r.stderr);
-    let _ = std::fs::remove_file(&db);
+    remove_db(&db);
 }
 
 #[test]
@@ -235,7 +244,7 @@ fn readonly_serves_reads_and_rejects_writes() {
     assert_eq!(r.code, 1);
     let r = run(&["--readonly", "--create", db_str], "");
     assert_eq!(r.code, 1);
-    let _ = std::fs::remove_file(&db);
+    remove_db(&db);
 }
 
 #[test]
@@ -415,7 +424,7 @@ fn csv_export_then_import_round_trips() {
     // v1 caveat (cli.md §5): csv export writes NULL as an empty UNQUOTED field, and ''
     // as a quoted empty — both NULL and '' survive the round trip distinctly only when
     // the writer quotes ''. Today it does not, so '' comes back as NULL (accepted).
-    let _ = std::fs::remove_file(&db);
+    remove_db(&db);
     let _ = std::fs::remove_file(&exported);
 }
 
@@ -464,9 +473,9 @@ fn dump_replays_into_an_identical_database() {
     let r = run(&["--dump"], "");
     assert_eq!(r.code, 1);
 
-    let _ = std::fs::remove_file(&db);
+    remove_db(&db);
     let _ = std::fs::remove_file(&dump_path);
-    let _ = std::fs::remove_file(&replayed);
+    remove_db(&replayed);
 }
 
 // ───────────────────────────── `jed migrate` subcommand ─────────────────────────────
@@ -519,7 +528,7 @@ fn migrate_applies_up_then_status_then_down() {
     assert_eq!((r.code, r.stderr.as_str()), (0, ""));
     assert!(r.stdout.contains("nothing to do"), "{}", r.stdout);
 
-    let _ = std::fs::remove_file(&db);
+    remove_db(&db);
 }
 
 #[test]
@@ -536,7 +545,7 @@ fn migrate_irreversible_down_exits_2() {
     assert_eq!(r.code, 2);
     assert!(r.stderr.contains("irreversible"), "{}", r.stderr);
 
-    let _ = std::fs::remove_file(&db);
+    remove_db(&db);
 }
 
 #[test]
@@ -550,7 +559,7 @@ fn migrate_failing_statement_exits_2() {
     assert!(r.stderr.contains("0A000"), "{}", r.stderr);
     assert!(r.stderr.contains("in statement:"), "{}", r.stderr);
 
-    let _ = std::fs::remove_file(&db);
+    remove_db(&db);
 }
 
 #[test]
@@ -561,7 +570,7 @@ fn migrate_bad_target_exits_1() {
     let r = run(&["migrate", "-d", "9", "-m", &migs, db_str], "");
     assert_eq!(r.code, 1);
     assert!(r.stderr.contains("out of range"), "{}", r.stderr);
-    let _ = std::fs::remove_file(&db);
+    remove_db(&db);
 }
 
 #[test]

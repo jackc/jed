@@ -9,10 +9,10 @@
 // Mirrored in impl/go/split_shape_test.go and impl/rust/tests/split_shape.rs.
 
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { begin } from "../src/api.ts";
 import { type Engine, create, execute, toImage } from "../src/tooling.ts";
 
@@ -22,10 +22,14 @@ function cost(db: Engine, sql: string): bigint {
 
 // A 121-row table at the fixture page size (256): id bigint pk, v integer = id % 7.
 // Ascending inserts pks 0..120 in order; shuffled inserts the permutation (i*37) mod
-// 121 — deterministic, identical in every core.
+// 121 — deterministic, identical in every core. Each database is a fresh file in this run's scratch
+// directory, removed whole after the last test.
+const scratch = mkdtempSync(join(tmpdir(), "split-shape-"));
+after(() => rmSync(scratch, { recursive: true, force: true }));
+let dbSeq = 0;
+
 function splitShapeDb(shuffled: boolean): Engine {
-  const dir = mkdtempSync(join(tmpdir(), "split-shape-"));
-  const db = create(join(dir, "t.jed"), { pageSize: 256 });
+  const db = create(join(scratch, `t${dbSeq++}.jed`), { pageSize: 256 });
   execute(db, "CREATE TABLE t (id bigint PRIMARY KEY, v integer)");
   for (let i = 0; i < 121; i++) {
     const pk = shuffled ? (i * 37) % 121 : i;

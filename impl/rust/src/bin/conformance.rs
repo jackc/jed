@@ -636,17 +636,22 @@ fn assert_types(
 /// Run all records in one .test file against a fresh database. Returns the first
 /// mismatch as an error string.
 fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
-    // A Drop guard removes the disk-mode temp image on every exit path (memory mode: no temp file).
+    // A Drop guard removes the disk-mode temp image on every exit path (memory mode: no temp file),
+    // together with the `<path>.lock/` coordination bundle opening it created beside it
+    // (spec/design/locking.md) — removing only the image leaks one directory per corpus file.
     struct TempGuard(Option<PathBuf>);
     impl Drop for TempGuard {
         fn drop(&mut self) {
             if let Some(p) = &self.0 {
                 let _ = std::fs::remove_file(p);
+                let mut bundle = p.clone().into_os_string();
+                bundle.push(".lock");
+                let _ = std::fs::remove_dir_all(bundle);
             }
         }
     }
     // Declared BEFORE `db`, so it drops AFTER `db` (reverse declaration order) — the handle closes,
-    // then the file is removed.
+    // then the files are removed.
     let tmp_path = if disk { Some(disk_temp_path()) } else { None };
     let _guard = TempGuard(tmp_path.clone());
     // In DISK mode the file is a temp .jed image reopened before every record (below), so each
