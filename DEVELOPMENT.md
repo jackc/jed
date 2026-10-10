@@ -129,8 +129,8 @@ than importing different answers. Consequences worth internalising:
 
 `mise tasks` lists every task, including the ones not in this table (`bench:*`, `corpus:*`,
 `rqg:*`, `stress`, `fuzz`, `mutation`, `references:*`), and `mise run <task> --help` shows a task's
-arguments. There is no Rakefile: composite and one-line tasks live in `mise.toml`, and every task
-with real logic is a Ruby script under `mise-tasks/` (`mise-tasks/bench/run` is `bench:run`).
+arguments. There is no Rakefile: composite tasks and straight-line commands are shell in `mise.toml`, and
+every task with real logic is a Ruby script under `mise-tasks/` (`mise-tasks/stress` is `stress`).
 
 Services are managed by process-compose, not bespoke tasks:
 

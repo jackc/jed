@@ -321,9 +321,9 @@ implementation. Suggested layout:
                         # A NON-CORE CONSUMER (the cli/ + bench/ precedent, §14): links a core in and
                         # drives it through the public host API; no core depends on it. Bundled by the
                         # CLI as `jed migrate`. See /migrate/design.md.
-mise.toml               # pinned tools, this checkout's [env], and the composite/one-line tasks.
+mise.toml               # pinned tools, this checkout's [env], and the composite/shell tasks.
 /mise-tasks/            # every task with real logic, as an executable Ruby script named by its
-                        # path (mise-tasks/bench/run is `mise run bench:run`) — §10.
+                        # path (mise-tasks/stress is `mise run stress`) — §10.
 process-compose.yaml    # the long-running half of a development checkout (the PostgreSQL oracle).
                         # mise runs one-shot work (install/init/test); process-compose supervises
                         # anything that stays alive. `mise run dev` is the launcher. Identical on
@@ -773,10 +773,14 @@ The design is optimized for AI agents even more than for humans. In practice:
   Ruby's readability keeps automation legible for agents and humans alike, consistent with
   "boring, explicit code over clever abstraction."
 
-  **`mise run <task>` is the only entry point; there is no Rakefile.** A task is either a
-  composite or one-line command in `mise.toml`, or — whenever it has real logic — an
-  executable Ruby script under `mise-tasks/` whose path is its name (`mise-tasks/bench/run`
-  is `mise run bench:run`; shared helpers in `scripts/lib/tasks.rb`). `mise tasks` lists them
+  **`mise run <task>` is the only entry point; there is no Rakefile.** Where a task lives
+  follows what it does: a composite task, or a straight-line run of commands (a build, a
+  loop over binaries, a test invocation), is a shell `run` in `mise.toml`; a task with real
+  logic — parsing output, comparing results across cores, collecting failures before
+  reporting — is an executable Ruby script under `mise-tasks/` whose path is its name
+  (`mise-tasks/references/setup` is `mise run references:setup`; shared helpers in
+  `scripts/lib/tasks.rb`). Larger tools stay in `scripts/` and a task calls them. Don't wrap
+  plain commands in Ruby, and don't grow shell past a few lines of control flow. `mise tasks` lists them
   all and `mise run <task> --help` shows a task's arguments (`mise run corpus:check
   path/to/file.test`, never Rake's bracket syntax). Because `mise run` always loads
   `mise.toml`'s `[env]` (this checkout's `PGHOST`/`PGPORT`), the same command works natively,

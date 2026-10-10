@@ -28,32 +28,21 @@
 require_relative "../../scripts/lib/tasks"
 include Tasks
 
-CARGO_CRATES = {
-  "rust" => RUST_MANIFEST,
-  "ts-lock" => TS_LOCK_MANIFEST,
-  "cli" => CLI_MANIFEST,
-  "ruby-ext" => RUBY_EXT_MANIFEST,
-  "wasm" => WASM_MANIFEST,
-  "node-wrap" => NODE_WRAP_MANIFEST,
-  "migrate-rust" => MIGRATE_RUST_MANIFEST,
-}.freeze
-TS_FORMAT_DIRS = %w[impl/ts impl/node bench/ts migrate/ts].freeze
-
 failures = []
 
-CARGO_CRATES.each do |name, manifest|
+FMT_CARGO_CRATES.each do |name, manifest|
   failures << name unless sh?("cargo", "fmt", "--check", "--manifest-path", manifest)
 end
 
 # `gofumpt -l` exits 0 even when files differ, so the signal is the printed file list.
-puts "gofumpt -l impl/go migrate/go"
-unformatted = capture("gofumpt", "-l", GO_DIR, MIGRATE_GO_DIR).first.split("\n").map(&:strip).reject(&:empty?)
+puts "gofumpt -l #{FMT_GO_DIRS.join(' ')}"
+unformatted = capture("gofumpt", "-l", *FMT_GO_DIRS).first.split("\n").map(&:strip).reject(&:empty?)
 unless unformatted.empty?
   warn "  unformatted: #{unformatted.map { |f| f.delete_prefix("#{ROOT}/") }.join(', ')}"
   failures << "go"
 end
 
-failures << "ts" unless sh?("biome", "format", *TS_FORMAT_DIRS)
+failures << "ts" unless sh?("biome", "format", *FMT_TS_DIRS)
 
 npm_ci_if_stale(WEB_DIR)
 failures << "web" unless sh?("npm", "run", "--silent", "--prefix", WEB_DIR, "format:check")

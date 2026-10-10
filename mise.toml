@@ -65,9 +65,13 @@ _.path = [
 # mise is the task runner (CLAUDE.md §10). Two kinds of task, one namespace (`mise tasks` lists
 # them all):
 #
-#   * here, in mise.toml — composite tasks (a sequential list of other tasks) and one-line commands;
-#   * mise-tasks/ — every task with real logic, as an executable Ruby script whose path is its name
-#     (mise-tasks/bench/run is `bench:run`). They share scripts/lib/tasks.rb.
+#   * here, in mise.toml — composite tasks (a sequential list of other tasks) and straight-line
+#     commands, as POSIX shell (mise runs each `run` string under `sh -o errexit`);
+#   * mise-tasks/ — every task with real logic (parsing output, cross-core comparison, collecting
+#     failures), as an executable Ruby script whose path is its name (mise-tasks/stress is
+#     `stress`). They share scripts/lib/tasks.rb.
+#
+# Optional usage arguments expand with `${usage_x:+"$usage_x"}`, so an absent one adds no word.
 #
 # `mise run` always loads [env] above, so a task reaches this checkout's PostgreSQL cluster no
 # matter which shell started it.
@@ -138,6 +142,12 @@ run = "biome lint impl/ts impl/node bench/ts migrate/ts"
 description = "Apply Biome's SAFE lint fixes to the TS cores (unsafe fixes stay per-rule + manual)"
 run = "biome lint --write impl/ts impl/node bench/ts migrate/ts"
 
+# svelte-check follows the website's $jed imports into the browser-consumed TS core modules,
+# catching drift at that downstream boundary as well as errors in the Svelte application.
+[tasks."web:check"]
+description = "Type-check the website and its browser-consumed TypeScript core modules"
+run = ["ruby scripts/npm_ci.rb web", "npm run --silent --prefix web check"]
+
 # --- Conformance (the §7 cross-core contract) ---------------------------------------------------
 # Every core walks the hand-authored corpus (spec/conformance/suites) TWICE — the two storage modes
 # of spec/design/conformance.md §3: "memory" (a fresh in-memory Database) and "disk" (a file-backed
@@ -166,6 +176,33 @@ description = "Walk the conformance corpus on the TS core, both storage modes"
 depends = ["ts:lock_build"]
 dir = "{{config_root}}/impl/ts"
 run = ["npm run --silent conformance", "npm run --silent conformance -- disk"]
+
+# Disk storage mode with a tiny work_mem, so every spill-capable operator spills
+# (spec/design/spill.md). Results, errors, and costs must be unchanged.
+[tasks."conformance:spill"]
+description = "Run the shared SQL corpus on all cores with forced file spill"
+usage = '''
+arg "[bytes]" default="256" help="work_mem in bytes"
+arg "[filter]" help="Run only corpus files whose path contains this substring"
+'''
+run = '''
+export JED_CONFORMANCE_WORK_MEM="$usage_bytes"
+if [ -n "${usage_filter:-}" ]; then export JED_CONFORMANCE_FILTER="$usage_filter"; fi
+cargo run --release --quiet --bin conformance --manifest-path impl/rust/Cargo.toml -- disk
+(cd impl/go && go run ./cmd/conformance disk)
+(cd impl/ts && node src/bin/conformance.ts disk)
+'''
+
+# Layer 4 of the concurrency contract (CLAUDE.md §7): spec/conformance/process/*.process.toml drives
+# real Rust/Go/Node actor processes over one shared file. Part of `ci`.
+[tasks."concurrency:process"]
+description = "Run the real-process shared-file corpus across every Rust/Go/Node pairing"
+depends = ["ts:lock_build"]
+run = [
+  "cargo build --release --bin process_actor --manifest-path impl/rust/Cargo.toml",
+  "cd impl/go && go build -o process_actor ./cmd/process_actor",
+  "ruby scripts/process_conformance.rb",
+]
 
 # The stepped-THREADED concurrency conformance (spec/design/concurrency-testing.md §4.3), run under
 # the race detector: the same `# format: concurrency` schedules the corpus walk runs sequentially,
@@ -237,10 +274,50 @@ run = "node --test migrate/ts/tests/*.test.ts"
 description = "Build the Ruby gem's native extension cdylib (release) to impl/ruby/ext/target/release"
 run = "cargo build --release --manifest-path impl/ruby/ext/Cargo.toml"
 
+# The jed Ruby gem (spec/design/ruby.md) WRAPS the safe Rust core; its minitest suite tests the
+# BINDING SEAM only (marshalling, lifecycle) — SQL semantics stay in the shared corpus. minitest is a
+# Ruby bundled gem, resolved from the mise Ruby install (no Gemfile entry, no new dependency).
+[tasks."ruby:test"]
+description = "Build the cdylib, then run the Ruby gem's minitest seam tests"
+depends = ["ruby:build"]
+run = '''
+ruby -Iimpl/ruby/lib -Iimpl/ruby/test -e 'ARGV.each { |f| require File.expand_path(f) }' -- impl/ruby/test/*_test.rb
+'''
+
+# An EXPERIMENTAL native Node-API host artifact wrapping the safe Rust core — not a fourth core. It
+# measures shipping the independent TypeScript core against shipping a Node package backed by Rust
+# (spec/design/benchmarks.md §7.3); exact-pinned napi-rs crates build the local .node module.
+[tasks."node:build"]
+description = "Build the experimental native Node/Rust package"
+run = '''
+cargo build --release --manifest-path impl/node/Cargo.toml
+case "$(uname -s)" in
+  Darwin) lib=libjed_node.dylib ;;
+  MINGW*|MSYS*|CYGWIN*) lib=jed_node.dll ;;
+  *) lib=libjed_node.so ;;
+esac
+cp "impl/node/target/release/$lib" impl/node/jed_node.node
+'''
+
 [tasks."node:test"]
 description = "Build and run the experimental native Node/Rust package seam tests"
 depends = ["node:build"]
 run = "node --test impl/node/test/*.test.ts"
+
+# The production narrow Node-API OS-lock host for the independent TypeScript core
+# (spec/design/locking.md §8). It exposes no SQL/storage behavior; the TypeScript engine remains an
+# independent conformance voice.
+[tasks."ts:lock_build"]
+description = "Build the TypeScript core's narrow native OS-lock adapter"
+run = '''
+cargo build --release --manifest-path impl/ts/native-lock/Cargo.toml
+case "$(uname -s)" in
+  Darwin) lib=libjed_lock.dylib ;;
+  MINGW*|MSYS*|CYGWIN*) lib=jed_lock.dll ;;
+  *) lib=libjed_lock.so ;;
+esac
+cp "impl/ts/native-lock/target/release/$lib" impl/ts/jed_lock.node
+'''
 
 # --- Oracle (the live PostgreSQL differential oracle) ------------------------------------------
 # Corpus expectations are calibrated to the profile in spec/conformance/oracle_profile.toml: the
@@ -337,7 +414,76 @@ arg "[core]" help="rust, go, or ts (default rust)"
 run = 'ruby scripts/reduce.rb "${usage_file}" ${usage_core:+--core "$usage_core"}'
 
 # --- Benchmarks (spec/design/benchmarks.md; OUTSIDE ci) ------------------------------------------
-# bench:build/setup/run/node_compare/durability/durable_commit live in mise-tasks/bench/.
+# Wall-clock timings are environment-relative and nondeterministic, so these stay out of `ci`. The
+# answers are still checked: every result carries a cross-engine checksum and bench:report fails on
+# any disagreement. bench:durability and bench:durable_commit live in mise-tasks/bench/.
+
+# Every Go binary except the cgo SQLite baseline builds with CGO_ENABLED=0, proving the cgo surface
+# stays confined to bench-sqlite-cgo (benchmarks.md §7). The Ruby gem bench needs the gem's native
+# extension, and the wasm bench needs the core compiled to wasm32-wasip1 (`mise run dev:init` adds
+# the rustup target).
+[tasks."bench:build"]
+description = "Build all benchmark binaries and wrapped host artifacts"
+depends = ["node:build"]
+run = [
+  "cd bench/go && CGO_ENABLED=0 go build -o bin/ ./cmd/bench-setup ./cmd/bench-jed ./cmd/bench-pg ./cmd/bench-sqlite",
+  "cd bench/go && CGO_ENABLED=1 go build -o bin/ ./cmd/bench-sqlite-cgo",
+  "cargo build --release --quiet --manifest-path bench/rust/Cargo.toml",
+  "ruby scripts/npm_ci.rb bench/ts",
+  "cargo build --release --quiet --manifest-path impl/ruby/ext/Cargo.toml",
+  "cargo build --release --quiet --target wasm32-wasip1 --manifest-path impl/wasm/Cargo.toml",
+]
+
+[tasks."bench:setup"]
+description = "Generate/refresh the benchmark databases (fingerprint-gated; --force to override)"
+usage = 'flag "--force" help="Regenerate even when the fingerprints match"'
+run = [
+  "cd bench/go && CGO_ENABLED=0 go build -o bin/ ./cmd/bench-setup",
+  "bench/go/bin/bench-setup bench/corpus bench/data ${usage_force:+--force}",
+]
+
+# Every harness runs one after another (they measure wall-clock time), then the report. The Ruby gem
+# bench (jed/ruby/wrap) measures the binding overhead against jed/rust/core; the wasm wrap
+# (jed/wasm/wrap) runs the Rust core compiled to wasm32-wasip1 over node:wasi, whose preview1 host
+# needs the --experimental flag.
+[tasks."bench:run"]
+description = "Run every benchmark binary sequentially; results to bench/results/<stamp>/ + report"
+depends = ["bench:build"]
+usage = 'arg "[filter]" help="Run only benchmarks whose name contains this substring"'
+run = '''
+dir="bench/results/$(date -u +%Y%m%d-%H%M%S)"
+mkdir -p "$dir"
+for bin in bench-jed bench-pg bench-sqlite bench-sqlite-cgo; do
+  "bench/go/bin/$bin" bench/corpus bench/data "$dir/go-$bin.jsonl" ${usage_filter:+"$usage_filter"}
+done
+for bin in bench-jed bench-pg bench-sqlite; do
+  "bench/rust/target/release/$bin" bench/corpus bench/data "$dir/rust-$bin.jsonl" ${usage_filter:+"$usage_filter"}
+done
+for bin in bench-jed bench-pg bench-sqlite; do
+  node "bench/ts/src/$bin.ts" bench/corpus bench/data "$dir/ts-$bin.jsonl" ${usage_filter:+"$usage_filter"}
+done
+node bench/ts/src/bench-node-rust.ts bench/corpus bench/data "$dir/node-rust-bench-jed.jsonl" ${usage_filter:+"$usage_filter"}
+ruby bench/ruby/bench_jed.rb bench/corpus bench/data "$dir/ruby-bench-jed.jsonl" ${usage_filter:+"$usage_filter"}
+node --experimental-wasi-unstable-preview1 bench/ts/src/bench-wasm.ts bench/corpus bench/data "$dir/wasm-bench-jed.jsonl" ${usage_filter:+"$usage_filter"}
+ruby scripts/bench_report.rb "$dir"
+ruby scripts/bench_html.rb "$dir"
+'''
+
+[tasks."bench:node_compare"]
+description = "Compare every jed benchmark through pure TS, Node/Rust wrap, and native Rust control"
+depends = ["node:build"]
+usage = 'arg "[filter]" help="Run only benchmarks whose name contains this substring"'
+run = '''
+ruby scripts/npm_ci.rb bench/ts
+cargo build --release --quiet --manifest-path bench/rust/Cargo.toml --bin bench-jed
+dir="bench/results/$(date -u +%Y%m%d-%H%M%S)-node-compare"
+mkdir -p "$dir"
+node bench/ts/src/bench-jed.ts bench/corpus bench/data "$dir/ts-bench-jed.jsonl" ${usage_filter:+"$usage_filter"}
+node bench/ts/src/bench-node-rust.ts bench/corpus bench/data "$dir/node-rust-bench-jed.jsonl" ${usage_filter:+"$usage_filter"}
+bench/rust/target/release/bench-jed bench/corpus bench/data "$dir/rust-bench-jed.jsonl" ${usage_filter:+"$usage_filter"}
+ruby scripts/bench_report.rb "$dir"
+ruby scripts/bench_markdown.rb "$dir"
+'''
 
 [tasks."bench:report"]
 description = "Aggregate a results dir into a comparison table (default: newest)"
@@ -376,6 +522,51 @@ arg "[width]" help="Payload width in bytes"
 arg "[budget]" help="work_mem budget in bytes"
 '''
 run = 'ruby scripts/spill_bench.rb ${usage_rows:+"$usage_rows"} ${usage_width:+"$usage_width"} ${usage_budget:+"$usage_budget"}'
+
+# --- Explorers (slow analysis tools; OUTSIDE ci) ------------------------------------------------
+# Coverage-guided fuzzing of the Go core's crash / corruption durability surface. The oracle is
+# INTRINSIC — never crash, never loop, fail closed. The fuzz seed corpora still run inside `ci` via
+# unit:go (every f.Add seed executes under a plain `go test`); `-fuzz` just explores wider.
+
+[tasks.fuzz]
+description = "Run every crash/corruption fuzz target (default 60s each)"
+usage = 'arg "[time]" default="60s" help="Fuzz time per target, e.g. 120s"'
+dir = "{{config_root}}/impl/go"
+run = '''
+for name in FuzzCorruptFile FuzzCommitCrash; do
+  go test -run '^$' -fuzz "^$name\$" -fuzztime "$usage_time" ./
+done
+'''
+
+[tasks."fuzz:one"]
+description = "Fuzz one crash/corruption target (default 60s)"
+usage = '''
+arg "<name>" help="The fuzz target, e.g. FuzzCorruptFile or FuzzCommitCrash"
+arg "[time]" default="60s" help="Fuzz time, e.g. 300s"
+'''
+dir = "{{config_root}}/impl/go"
+run = 'go test -run "^$" -fuzz "^${usage_name}\$" -fuzztime "$usage_time" ./'
+
+# Mutation-testing of the Go core (spec/design/mutation-testing.md): inject deliberate bugs and check
+# the conformance corpus catches each one; a SURVIVING mutant is untested logic, located precisely.
+# Survivors make the runner exit non-zero, which is a result, not a task failure — the printed
+# report and the JSONL under bench/results/mutation/<stamp>/ are the deliverable.
+#   mise run mutation                    # default targets, 300 sampled
+#   mise run mutation value.go           # one file, full sweep
+#   mise run mutation value.go 500 7     # file, max mutants, sample seed
+[tasks.mutation]
+description = "Mutation-test the Go core: inject bugs, check the conformance corpus catches them"
+usage = '''
+arg "[files]" help="Go source files to mutate (relative to impl/go, comma-separated)"
+arg "[n]" help="Maximum number of mutants"
+arg "[seed]" help="Sample seed"
+'''
+run = '''
+dir="$PWD/bench/results/mutation/$(date -u +%Y%m%d-%H%M%S)"
+mkdir -p "$dir"
+cd impl/go
+go run ./cmd/mutate -json "$dir/go.jsonl" ${usage_files:+-files "$usage_files"} ${usage_n:+-n "$usage_n"} ${usage_seed:+-seed "$usage_seed"} || true
+'''
 
 # --- Bootstrap ---------------------------------------------------------------------------------
 

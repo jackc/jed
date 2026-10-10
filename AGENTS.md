@@ -227,9 +227,9 @@ whole-engine memory guarantee. Host extensions remain outside these guarantees.
   tasks. `mise run dev` starts this checkout's stack (its own PostgreSQL cluster
   under `.dev/postgres`); `mise run dev:ports` shows its allocated ports. Corpus and
   benchmark work needs that stack running.
-- `mise run <task>` is the only task runner (there is no Rakefile). Composite and
-  one-line tasks live in `mise.toml`; a task with real logic is an executable Ruby
-  script under `mise-tasks/` (`mise-tasks/bench/run` is `bench:run`). `mise tasks`
+- `mise run <task>` is the only task runner (there is no Rakefile). Composite tasks
+  and straight-line commands are shell in `mise.toml`; a task with real logic is an
+  executable Ruby script under `mise-tasks/` (`mise-tasks/stress` is `stress`). `mise tasks`
   lists them; `mise run <task> --help` shows arguments. `mise run` loads this
   checkout's `PGHOST`/`PGPORT`, so invoke tasks through it rather than running the
   scripts behind them directly. Composite tasks sequence steps with `{ task = … }`

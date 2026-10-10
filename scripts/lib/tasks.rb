@@ -2,15 +2,15 @@
 
 # scripts/lib/tasks.rb — shared helpers for the Ruby file tasks under mise-tasks/ (CLAUDE.md §10).
 #
-# mise is the task runner: mise.toml declares the composite and one-line tasks, and every task
-# with real logic is an executable Ruby script under mise-tasks/ (mise-tasks/bench/run is
-# `mise run bench:run`). Each script requires this file for the repo layout and the few process
-# helpers they share. mise runs a task with the repo root as its working directory and with
+# mise is the task runner: mise.toml declares the composite tasks and straight-line commands as
+# shell, and every task with real logic is an executable Ruby script under mise-tasks/
+# (mise-tasks/stress is `mise run stress`). Each script requires this file for the repo layout and
+# the few process helpers they share; scripts/npm_ci.rb exposes npm_ci_if_stale to the shell tasks. mise runs a task with the repo root as its working directory and with
 # mise.toml's [env] loaded, so these helpers need not resolve either themselves.
 #
 # Deliberately NOT loaded here: bundler. The task scripts use only Ruby's standard library, and a
-# loaded bundler would leak its environment into child processes (the minitest and bench-gem
-# children need Ruby's bundled gems, which a Gemfile-restricted child cannot load). The spec and
+# loaded bundler would leak its environment into child processes, restricting any Ruby child to the
+# Gemfile's gems. The spec and
 # codegen scripts that need toml-rb load it themselves (scripts/lib/bundle_setup.rb).
 
 require "digest"
@@ -24,41 +24,25 @@ module Tasks
 
   ROOT = DevPaths::ROOT
 
-  RUST_MANIFEST = File.join(ROOT, "impl/rust/Cargo.toml")
-  CLI_MANIFEST = File.join(ROOT, "cli/Cargo.toml")
   GO_DIR = File.join(ROOT, "impl/go")
   TS_DIR = File.join(ROOT, "impl/ts")
-  # The jed Ruby gem (a host artifact; spec/design/ruby.md) and its native-extension cdylib crate.
-  RUBY_GEM_DIR = File.join(ROOT, "impl/ruby")
-  RUBY_EXT_MANIFEST = File.join(RUBY_GEM_DIR, "ext/Cargo.toml")
-  # The wasm32-wasip1 wrap of the core (a host artifact; impl/wasm/README.md).
-  WASM_MANIFEST = File.join(ROOT, "impl/wasm/Cargo.toml")
-  WASM_TARGET = "wasm32-wasip1"
-  # The experimental native Node-API wrap of the Rust core (spec/design/benchmarks.md §7.3).
-  NODE_WRAP_DIR = File.join(ROOT, "impl/node")
-  NODE_WRAP_MANIFEST = File.join(NODE_WRAP_DIR, "Cargo.toml")
-  NODE_WRAP_MODULE = File.join(NODE_WRAP_DIR, "jed_node.node")
-  # The TypeScript core's narrow native OS-lock adapter (spec/design/locking.md §8).
-  TS_LOCK_MANIFEST = File.join(TS_DIR, "native-lock/Cargo.toml")
-  TS_LOCK_MODULE = File.join(TS_DIR, "jed_lock.node")
-  # jed-migrate (/migrate/design.md): a consumer of the engine per language, not a core.
-  MIGRATE_GO_DIR = File.join(ROOT, "migrate/go")
-  MIGRATE_RUST_MANIFEST = File.join(ROOT, "migrate/rust/Cargo.toml")
-  MIGRATE_TS_DIR = File.join(ROOT, "migrate/ts")
+  RUST_MANIFEST = File.join(ROOT, "impl/rust/Cargo.toml")
   WEB_DIR = File.join(ROOT, "web")
   STRESS_DIR = File.join(ROOT, "stress")
 
-  # The platform file name of a Rust cdylib built from crate `name`.
-  def cdylib(name)
-    case RbConfig::CONFIG["host_os"]
-    when /darwin/ then "lib#{name}.dylib"
-    when /mswin|mingw|cygwin/ then "#{name}.dll"
-    else "lib#{name}.so"
-    end
-  end
-
-  NODE_WRAP_ARTIFACT = File.join(NODE_WRAP_DIR, "target/release", cdylib("jed_node"))
-  TS_LOCK_ARTIFACT = File.join(TS_DIR, "native-lock/target/release", cdylib("jed_lock"))
+  # What the formatter gate covers — fmt:check checks it and fmt:fix rewrites it
+  # (mise-tasks/fmt/check documents the pinned tools).
+  FMT_CARGO_CRATES = {
+    "rust" => "impl/rust/Cargo.toml",
+    "ts-lock" => "impl/ts/native-lock/Cargo.toml",
+    "cli" => "cli/Cargo.toml",
+    "ruby-ext" => "impl/ruby/ext/Cargo.toml",   # the jed Ruby gem's native extension
+    "wasm" => "impl/wasm/Cargo.toml",           # the wasm32-wasip1 wrap of the core
+    "node-wrap" => "impl/node/Cargo.toml",      # the experimental Node-API wrap of the core
+    "migrate-rust" => "migrate/rust/Cargo.toml", # jed-migrate, a consumer of the engine
+  }.freeze
+  FMT_GO_DIRS = %w[impl/go migrate/go].freeze
+  FMT_TS_DIRS = %w[impl/ts impl/node bench/ts migrate/ts].freeze # biome.json excludes generated files
 
   # Print a command the way a shell would show it, then run it. Aborts the task on failure.
   # `env` adds variables for the child; `chdir` runs it elsewhere than the repo root.

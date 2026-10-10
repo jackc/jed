@@ -7,11 +7,8 @@
 require_relative "../../scripts/lib/tasks"
 include Tasks
 
-[RUST_MANIFEST, TS_LOCK_MANIFEST, CLI_MANIFEST, RUBY_EXT_MANIFEST, WASM_MANIFEST, NODE_WRAP_MANIFEST,
- MIGRATE_RUST_MANIFEST].each do |manifest|
-  sh "cargo", "fmt", "--manifest-path", manifest
-end
-sh "gofumpt", "-w", GO_DIR, MIGRATE_GO_DIR
-sh "biome", "format", "--write", "impl/ts", "impl/node", "bench/ts", "migrate/ts"
+FMT_CARGO_CRATES.each_value { |manifest| sh "cargo", "fmt", "--manifest-path", manifest }
+sh "gofumpt", "-w", *FMT_GO_DIRS
+sh "biome", "format", "--write", *FMT_TS_DIRS
 npm_ci_if_stale(WEB_DIR)
 sh "npm", "run", "--silent", "--prefix", WEB_DIR, "format"
