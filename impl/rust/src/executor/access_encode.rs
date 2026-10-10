@@ -2864,11 +2864,13 @@ fn index_slot_key(
 
 /// encoding.md §2.2 nullable slot — `0x00` + the type's bare order-preserving key bytes when
 /// present, the lone `0x01` for NULL (always tagged, even for a NOT NULL column) — then the
-/// row's storage key as the suffix. A column key's value is always resident (never `Unfetched`):
-/// a fixed-width type never spills, and a `text`/`bytea` value large enough to spill would
-/// produce an over-`RECORD_MAX` entry key, rejected `0A000` at the insert that stored it. An
-/// expression key evaluates against the row (spec/design/indexes.md §4); a referenced spilled
-/// value faults in through the evaluator's `Unfetched` backstop.
+/// row's storage key as the suffix. A column key's value may be **deferred** (`Unfetched`): a
+/// variable-width key column (`text`/`bytea`/`decimal`/a container) whose value spilled when its
+/// table record exceeded `RECORD_MAX` is lazily fetched once its leaf faults in from disk, and an
+/// UPDATE's new row carries unassigned columns over from the old row still deferred. The key
+/// encoders resolve it through [`resident`], so maintenance computes the same entry bytes the
+/// INSERT wrote. An expression key evaluates against the row (spec/design/indexes.md §4); a
+/// referenced spilled value faults in through the evaluator's `Unfetched` backstop.
 pub(crate) fn index_entry_key(
     col_types: &[ColType],
     colls: &[Option<std::sync::Arc<Collation>>],
@@ -2937,8 +2939,8 @@ pub(crate) fn index_entry_keys(
             row,
             env,
         )?],
-        IndexKind::Gin => gin_entries(columns, &rindex.column_ordinals(), storage_key, row),
-        IndexKind::Gist => gist_entries(columns, &rindex.column_ordinals(), storage_key, row),
+        IndexKind::Gin => gin_entries(columns, &rindex.column_ordinals(), storage_key, row)?,
+        IndexKind::Gist => gist_entries(columns, &rindex.column_ordinals(), storage_key, row)?,
     })
 }
 
@@ -2977,8 +2979,8 @@ pub(crate) fn index_entry_keys_columns(
             out.extend_from_slice(storage_key);
             vec![out]
         }
-        IndexKind::Gin => gin_entries(columns, &cols, storage_key, row),
-        IndexKind::Gist => gist_entries(columns, &cols, storage_key, row),
+        IndexKind::Gin => gin_entries(columns, &cols, storage_key, row)?,
+        IndexKind::Gist => gist_entries(columns, &cols, storage_key, row)?,
     })
 }
 
@@ -2994,28 +2996,33 @@ pub(crate) fn gist_entries(
     cols: &[usize],
     storage_key: &[u8],
     row: &Row,
-) -> Vec<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>> {
+    // A spilled range (a `numrange` over huge decimals) may still be deferred — resolve it first.
+    let vals: Vec<Cow<'_, Value>> = cols
+        .iter()
+        .map(|&ci| resident(&row[ci]))
+        .collect::<Result<_>>()?;
     // Pre-encode scalar key bytes so the borrowed `GistLeafComp::Scalar(&[u8])` outlives the build.
     let mut scalar_keys: Vec<Vec<u8>> = Vec::new();
-    for &ci in cols {
+    for (&ci, v) in cols.iter().zip(&vals) {
         let col = &columns[ci];
-        if matches!(row[ci], Value::Null) {
-            return Vec::new(); // any NULL excluded column → row not indexed (NULL rule)
+        if matches!(**v, Value::Null) {
+            return Ok(Vec::new()); // any NULL excluded column → row not indexed (NULL rule)
         }
         if col.ty.range_element().is_none() {
             // scalar `=` opclass: the value's order-preserving KEY bytes (gist.md §6). The column
             // is a FIXED-WIDTH keyable (the gate), so the key encoding is collation-free/infallible.
-            let k = encode_key_value(col.ty.scalar(), &row[ci], None)
+            let k = encode_key_value(col.ty.scalar(), v, None)
                 .expect("a fixed-width GiST scalar key is infallible (no collation)");
             scalar_keys.push(k);
         }
     }
     let mut comps: Vec<crate::gist::GistLeafComp> = Vec::with_capacity(cols.len());
     let mut next_scalar = 0usize;
-    for &ci in cols {
+    for (&ci, v) in cols.iter().zip(&vals) {
         let col = &columns[ci];
         match col.ty.range_element() {
-            Some(elem) => match &row[ci] {
+            Some(elem) => match &**v {
                 Value::Range(rv) => comps.push(crate::gist::GistLeafComp::Range(elem.scalar(), rv)),
                 _ => unreachable!("a GiST range index column holds a range or NULL"),
             },
@@ -3025,7 +3032,7 @@ pub(crate) fn gist_entries(
             }
         }
     }
-    vec![crate::gist::leaf_key_multi(&comps, storage_key)]
+    Ok(vec![crate::gist::leaf_key_multi(&comps, storage_key)])
 }
 
 /// Build a row's `EXCLUDE` conjunction probe (spec/design/gist.md §7): one GiST query operand +
@@ -3039,17 +3046,18 @@ pub(crate) fn exclusion_probe_query(
     columns: &[Column],
     exc: &ExclusionConstraint,
     row: &Row,
-) -> Option<(Vec<crate::gist::GistQuery>, Vec<crate::gist::GistStrategy>)> {
+) -> Result<Option<(Vec<crate::gist::GistQuery>, Vec<crate::gist::GistStrategy>)>> {
     use crate::gist::{GistQuery, GistStrategy};
     let mut q = Vec::with_capacity(exc.elements.len());
     let mut strats = Vec::with_capacity(exc.elements.len());
     for el in &exc.elements {
         let ci = el.column;
-        match (&row[ci], el.op) {
-            (Value::Null, _) => return None, // NULL rule: exempt
+        let v = resident(&row[ci])?; // an UPDATE's carried-over spilled range may be deferred
+        match (&*v, el.op) {
+            (Value::Null, _) => return Ok(None), // NULL rule: exempt
             (Value::Range(rv), ExclusionOp::Overlaps) => {
                 if rv.empty {
-                    return None; // empty && anything is FALSE → exempt
+                    return Ok(None); // empty && anything is FALSE → exempt
                 }
                 q.push(GistQuery::Range(rv.clone()));
                 strats.push(GistStrategy::Overlaps);
@@ -3063,7 +3071,7 @@ pub(crate) fn exclusion_probe_query(
             _ => unreachable!("an && exclusion column holds a range or NULL"),
         }
     }
-    Some((q, strats))
+    Ok(Some((q, strats)))
 }
 
 /// Does the `(expr_i op_i)` conjunction hold between two rows (spec/design/gist.md §7)? Used for the
@@ -3076,12 +3084,13 @@ pub(crate) fn exclusion_pair_conflicts(
     exc: &ExclusionConstraint,
     a: &Row,
     b: &Row,
-) -> bool {
+) -> Result<bool> {
     for el in &exc.elements {
         let ci = el.column;
-        let (va, vb) = (&a[ci], &b[ci]);
+        let (va, vb) = (resident(&a[ci])?, resident(&b[ci])?);
+        let (va, vb) = (&*va, &*vb);
         if matches!(va, Value::Null) || matches!(vb, Value::Null) {
-            return false;
+            return Ok(false);
         }
         let ok = match el.op {
             ExclusionOp::Overlaps => match (va, vb) {
@@ -3097,10 +3106,10 @@ pub(crate) fn exclusion_pair_conflicts(
             }
         };
         if !ok {
-            return false;
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 /// Is `elem` an element type a GIN (`array_ops`) index admits? The integers, `boolean`, `uuid`,
@@ -3153,7 +3162,7 @@ pub(crate) fn gin_entries(
     cols: &[usize],
     storage_key: &[u8],
     row: &Row,
-) -> Vec<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>> {
     let ci = cols[0];
     let elem_ty = columns[ci]
         .ty
@@ -3161,7 +3170,9 @@ pub(crate) fn gin_entries(
         .expect("a GIN index column is an array (CREATE INDEX gate)")
         .scalar();
     let mut terms: Vec<Vec<u8>> = Vec::new();
-    if let Value::Array(arr) = &row[ci] {
+    // A large array spills like any variable-width value, so a stored row's array may be deferred;
+    // it must be resolved — skipping it would silently drop (or fail to remove) its posting entries.
+    if let Value::Array(arr) = &*resident(&row[ci])? {
         for el in &arr.elements {
             // a NULL element contributes no term; a non-keyable element is impossible under the gate
             if !matches!(el, Value::Null) {
@@ -3178,13 +3189,13 @@ pub(crate) fn gin_entries(
     // byte-sort == value-sort (order-preserving). Each distinct term yields one entry.
     terms.sort_unstable();
     terms.dedup();
-    terms
+    Ok(terms
         .into_iter()
         .map(|mut entry| {
             entry.extend_from_slice(storage_key);
             entry
         })
-        .collect()
+        .collect())
 }
 
 /// A row's PRIMARY-KEY STORAGE KEY (spec/design/encoding.md §2.3): the concatenation of the
@@ -3278,10 +3289,12 @@ pub(crate) fn prefix_successor(p: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// The order-preserving key bytes for one keyable value (encoding.md §2), matching the PK / index
-/// encoders. `value` is non-NULL and of a keyable type (a foreign-key column always is — its type
-/// equals a PK/UNIQUE parent column, CREATE TABLE §6.2). `coll` is the text component's frozen
-/// collation: `None` (the fast path, and every non-text type) keys a `text` by its raw UTF-8
-/// (`text-terminated-escape` §2.4); `Some(c)` keys it by the collation's UCA sort key
+/// encoders. `value` is non-NULL and of a keyable scalar type — every key site's column/expression
+/// type passes a keyability gate (PRIMARY KEY / CREATE INDEX / UNIQUE, and a foreign-key column's
+/// type equals its PK/UNIQUE parent column's, CREATE TABLE §6.2). A **deferred** value (a spilled
+/// large value of a lazily-decoded row) is resolved first ([`resident`]). `coll` is the text
+/// component's frozen collation: `None` (the fast path, and every non-text type) keys a `text` by
+/// its raw UTF-8 (`text-terminated-escape` §2.4); `Some(c)` keys it by the collation's UCA sort key
 /// (`text-collated-sortkey` §2.12), which can fail (`0A000`) on a code point the collation does not
 /// map — propagated, so a collated INSERT of an unmapped string aborts the write.
 pub(crate) fn encode_key_value(
@@ -3304,8 +3317,28 @@ pub(crate) fn encode_key_value(
         Value::Interval(iv) => iv.encode_key(),
         Value::Float64(f) => encode_f64_key(*f),
         Value::Float32(f) => encode_f32_key(*f),
-        _ => unreachable!("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)"),
+        Value::Unfetched(u) => {
+            return encode_key_value(ty, &crate::format::resolve_unfetched_self(u)?, coll);
+        }
+        _ => unreachable!(
+            "encode_key_value: a non-keyable scalar value (every key site's type passes a keyability gate)"
+        ),
     })
+}
+
+/// `value` with a lazily-**deferred** large value (`Value::Unfetched` — a spilled/compressed column
+/// of a faulted Packed leaf, spec/design/lazy-record.md) resolved from its own carried handles, or
+/// borrowed unchanged. Every key encoder and index-entry builder routes a column value through this:
+/// a stored row's variable-width key column (`text`/`bytea`/`decimal`/a container) spills once its
+/// record exceeds `RECORD_MAX`, and an UPDATE's new row carries its unassigned columns over from
+/// the old row still deferred — so index maintenance, uniqueness/FK probes, and EXCLUDE checks fault
+/// the value in to compute the same key bytes the INSERT wrote (never a panic, never a skipped
+/// entry). The fetch is unmetered, like the evaluator's backstop it shares.
+pub(crate) fn resident(value: &Value) -> Result<Cow<'_, Value>> {
+    match value {
+        Value::Unfetched(u) => Ok(Cow::Owned(crate::format::resolve_unfetched_self(u)?)),
+        v => Ok(Cow::Borrowed(v)),
+    }
 }
 
 /// The `float-order-preserving` key body for an `f64` (encoding.md §2.8): canonicalize via
@@ -3341,6 +3374,9 @@ pub(crate) fn encode_typed_key(
     coll: Option<&Collation>,
 ) -> Result<Vec<u8>> {
     match value {
+        Value::Unfetched(u) => {
+            encode_typed_key(ty, &crate::format::resolve_unfetched_self(u)?, coll)
+        }
         Value::Range(rv) => {
             let elem = ty
                 .range_element()
@@ -3373,6 +3409,9 @@ pub(crate) fn encode_key_ct(
     coll: Option<&Collation>,
 ) -> Result<Vec<u8>> {
     match (ct, value) {
+        (_, Value::Unfetched(u)) => {
+            encode_key_ct(ct, &crate::format::resolve_unfetched_self(u)?, coll)
+        }
         (ColType::Composite { fields, .. }, Value::Composite(vals)) => {
             encode_composite_key(fields, vals)
         }

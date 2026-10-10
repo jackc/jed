@@ -1257,13 +1257,13 @@ impl Engine {
             for exc in &exclusions {
                 let ikey = exc.index.to_ascii_lowercase();
                 for (_, row) in &prepared {
-                    if self.insert_exclusion_conflicts_stored(&tcols, exc, row, &ikey) {
+                    if self.insert_exclusion_conflicts_stored(&tcols, exc, row, &ikey)? {
                         return Err(EngineError::exclusion_violation(&relation, &exc.name));
                     }
                 }
                 for i in 0..prepared.len() {
                     for j in 0..i {
-                        if exclusion_pair_conflicts(&tcols, exc, &prepared[i].1, &prepared[j].1) {
+                        if exclusion_pair_conflicts(&tcols, exc, &prepared[i].1, &prepared[j].1)? {
                             return Err(EngineError::exclusion_violation(&relation, &exc.name));
                         }
                     }
@@ -1469,7 +1469,7 @@ impl Engine {
                 .unwrap_or_default();
             for exc in &exclusions {
                 let ikey = exc.index.to_ascii_lowercase();
-                if self.insert_exclusion_conflicts_stored(&tcols, exc, &row, &ikey) {
+                if self.insert_exclusion_conflicts_stored(&tcols, exc, &row, &ikey)? {
                     return Err(EngineError::exclusion_violation(&relation, &exc.name));
                 }
             }
@@ -2110,12 +2110,13 @@ impl Engine {
         exc: &ExclusionConstraint,
         row: &Row,
         index_key: &str,
-    ) -> bool {
-        let Some((query, strats)) = exclusion_probe_query(columns, exc, row) else {
-            return false;
+    ) -> Result<bool> {
+        let Some((query, strats)) = exclusion_probe_query(columns, exc, row)? else {
+            return Ok(false);
         };
-        self.gist_tree(index_key)
-            .is_some_and(|tree| !tree.search(&query, &strats).0.is_empty())
+        Ok(self
+            .gist_tree(index_key)
+            .is_some_and(|tree| !tree.search(&query, &strats).0.is_empty()))
     }
 
     /// Evaluate the table's CHECK constraints on one candidate row (constraints.md §4.4): TRUE
@@ -3473,7 +3474,7 @@ impl Engine {
             for exc in &exclusions {
                 let ikey = exc.index.to_ascii_lowercase();
                 for (_, _, new_row, _) in &updates {
-                    if let Some((q, strats)) = exclusion_probe_query(&tcolumns, exc, new_row) {
+                    if let Some((q, strats)) = exclusion_probe_query(&tcolumns, exc, new_row)? {
                         let conflict = match self.gist_tree(&ikey) {
                             Some(tree) => tree
                                 .search(&q, &strats)
@@ -3489,7 +3490,7 @@ impl Engine {
                 }
                 for i in 0..updates.len() {
                     for j in 0..i {
-                        if exclusion_pair_conflicts(&tcolumns, exc, &updates[i].2, &updates[j].2) {
+                        if exclusion_pair_conflicts(&tcolumns, exc, &updates[i].2, &updates[j].2)? {
                             return Err(EngineError::exclusion_violation(&relation, &exc.name));
                         }
                     }

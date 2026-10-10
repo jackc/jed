@@ -206,6 +206,7 @@ import {
   newTempStorage,
   pagePayload,
   recordCompressUnits,
+  resolveUnfetchedSelf,
   typeCodeForScalar,
 } from "./format.ts";
 import {
@@ -21303,10 +21304,13 @@ export function indexSlotKey(
 // indexEntryKey builds a secondary-index entry key (spec/design/indexes.md §3): each key element as
 // the encoding.md §2.2 nullable slot — 0x00 + the type's bare order-preserving key bytes when
 // present, the lone 0x01 for NULL (always tagged, even for a NOT NULL column) — then the row's
-// storage key as the suffix. A column key's value is always resident (never unfetched: an indexable
-// fixed-width type never spills, and a large text/bytea would over-RECORD_MAX the entry, rejected
-// 0A000 at insert). An expression key evaluates against the row (§4); a referenced spilled value
-// faults in through the evaluator's Unfetched backstop.
+// storage key as the suffix. A column key's value may be DEFERRED (unfetched): a variable-width key
+// column (text/bytea/decimal/a container) whose value spilled when its table record exceeded
+// RECORD_MAX is lazily fetched once its leaf faults in from disk, and an UPDATE's new row carries
+// unassigned columns over from the old row still deferred. The key encoders resolve it
+// (residentValue), so maintenance computes the same entry bytes the INSERT wrote. An expression key
+// evaluates against the row (§4); a referenced spilled value faults in through the evaluator's
+// Unfetched backstop.
 export function indexEntryKey(
   colTypes: ColType[],
   colls: (Collation | null)[],
@@ -21417,7 +21421,7 @@ export function gistEntries(
   const inputs: GistLeafInput[] = [];
   for (const ci of cols) {
     const colType = columns[ci]!.type;
-    const v = row[ci]!;
+    const v = residentValue(row[ci]!); // a spilled range (a numrange over huge decimals) may be deferred
     if (v.kind === "null") return []; // any NULL excluded column → row not indexed (NULL rule)
     if (colType.kind === "range" && v.kind === "range") {
       inputs.push({ range: { kind: "scalar", scalar: typeScalar(colType.elem) }, value: v });
@@ -21446,7 +21450,7 @@ export function exclusionProbeQuery(
   const query: GistQuery[] = [];
   const strats: GistStrategy[] = [];
   for (const el of exc.elements) {
-    const v = row[el.column]!;
+    const v = residentValue(row[el.column]!); // an UPDATE's carried-over spilled range may be deferred
     if (v.kind === "null") return null; // NULL rule: exempt
     if (el.op === "overlaps") {
       if (v.kind !== "range" || v.empty) return null; // empty && anything is FALSE → exempt
@@ -21473,8 +21477,8 @@ export function exclusionPairConflicts(
   b: Row,
 ): boolean {
   for (const el of exc.elements) {
-    const va = a[el.column]!;
-    const vb = b[el.column]!;
+    const va = residentValue(a[el.column]!);
+    const vb = residentValue(b[el.column]!);
     if (va.kind === "null" || vb.kind === "null") return false;
     let ok: boolean;
     if (el.op === "overlaps") {
@@ -21599,7 +21603,9 @@ export function ginEntries(
   if (colType.kind !== "array")
     throw new Error("a GIN index column is an array (CREATE INDEX gate)");
   const elemTy = typeScalar(colType.elem);
-  const v = row[ci]!;
+  // A large array spills like any variable-width value, so a stored row's array may be deferred; it
+  // must be resolved — skipping it would silently drop (or fail to remove) its posting entries.
+  const v = residentValue(row[ci]!);
   if (v.kind !== "array") return [];
   // Dedup by the encoded term (the encoding is a bijection: byte-dedup == value-dedup, byte-sort ==
   // value-sort) generically over every admitted element type.
@@ -21975,9 +21981,18 @@ export function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
   return compareBytes(a, b) === 0;
 }
 
-// encodeKeyValue is the order-preserving key bytes for one keyable value (encoding.md §2),
-// matching the PK / index encoders. `value` is non-NULL and of a keyable type (a foreign-key
-// column always is — its type equals a PK/UNIQUE parent column, CREATE TABLE §6.2).
+// residentValue returns value with a lazily-DEFERRED large value (kind "unfetched" — a
+// spilled/compressed column of a faulted packed leaf, spec/design/lazy-record.md) resolved from its
+// own carried handles, or value unchanged. Every key encoder and index-entry builder routes a column
+// value through this: a stored row's variable-width key column (text/bytea/decimal/a container)
+// spills once its record exceeds RECORD_MAX, and an UPDATE's new row carries its unassigned columns
+// over from the old row still deferred — so index maintenance, uniqueness/FK probes, and EXCLUDE
+// checks fault the value in to compute the same key bytes the INSERT wrote (never an internal error,
+// never a skipped entry). The fetch is unmetered, like the evaluator's backstop it shares.
+export function residentValue(value: Value): Value {
+  return value.kind === "unfetched" ? resolveUnfetchedSelf(value.ref) : value;
+}
+
 // collatedTextKey is the order-preserving key body for a text value (encoding.md §2.12): the
 // collation's UCA sort key when coll is non-null (a non-C collated column), else the C
 // text-terminated-escape body (§2.4). The sort key throws (0A000) on a code point the collation does
@@ -21986,6 +22001,11 @@ export function collatedTextKey(coll: Collation | null, s: string): Uint8Array {
   return coll !== null ? collationSortKey(coll, s) : encodeTerminated(SQL_BYTE_ENCODER.encode(s));
 }
 
+// encodeKeyValue is the order-preserving key bytes for one keyable value (encoding.md §2),
+// matching the PK / index encoders. `value` is non-NULL and of a keyable scalar type — every key
+// site's column/expression type passes a keyability gate (PRIMARY KEY / CREATE INDEX / UNIQUE, and a
+// foreign-key column's type equals its PK/UNIQUE parent column's, CREATE TABLE §6.2). A DEFERRED
+// value (a spilled large value of a lazily-decoded row) is resolved first (residentValue).
 export function encodeKeyValue(ty: ScalarType, value: Value, coll: Collation | null): Uint8Array {
   if (value.kind === "int") return encodeInt(ty, value.int);
   if (value.kind === "bool") return encodeBool(value.value);
@@ -21999,7 +22019,10 @@ export function encodeKeyValue(ty: ScalarType, value: Value, coll: Collation | n
   if (value.kind === "interval") return intervalEncodeKey(value.iv);
   if (value.kind === "f64") return encodeFloat64Key(value.value);
   if (value.kind === "f32") return encodeFloat32Key(value.value);
-  throw new Error("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)");
+  if (value.kind === "unfetched") return encodeKeyValue(ty, resolveUnfetchedSelf(value.ref), coll);
+  throw new Error(
+    "encodeKeyValue: a non-keyable scalar value (every key site's type passes a keyability gate)",
+  );
 }
 
 // encodeTypedKey is the order-preserving key bytes for one keyable value given its column Type — the
@@ -22010,6 +22033,7 @@ export function encodeKeyValue(ty: ScalarType, value: Value, coll: Collation | n
 // holds a range value, so the scalar arm never sees a range type. coll selects a text column's key
 // form (§2.12); it never applies to a range element (no range subtype is text).
 export function encodeTypedKey(ty: Type, value: Value, coll: Collation | null): Uint8Array {
+  value = residentValue(value);
   if (value.kind === "range") {
     if (ty.kind !== "range") {
       throw new Error("a range key value has a range column type");
@@ -22033,6 +22057,7 @@ export function encodeTypedKey(ty: Type, value: Value, coll: Collation | null): 
 // (encoding.md §2.15). value is non-NULL (callers tag the §2.2 slot). coll selects a text column's
 // collated key form (§2.12); it never applies to a container element or a composite field.
 export function encodeColTypeKey(ct: ColType, value: Value, coll: Collation | null): Uint8Array {
+  value = residentValue(value);
   if (ct.kind === "composite") {
     if (value.kind !== "composite") throw new Error("composite ColType requires a composite value");
     return encodeCompositeKey(ct.fields, value.fields);

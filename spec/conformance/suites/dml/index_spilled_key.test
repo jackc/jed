@@ -1,0 +1,185 @@
+# Index maintenance over SPILLED key values (spec/design/indexes.md §4, large-values.md §12/§14,
+# lazy-record.md). A `text` key column whose value is large and incompressible spills to an
+# overflow chain when its table record exceeds RECORD_MAX; once its leaf faults in from disk the
+# value is lazily DEFERRED. Every write path that recomputes the row's index entries — DELETE, an
+# UPDATE of any column (the unassigned key column is carried over still deferred), a PK re-key,
+# and CREATE INDEX over existing rows — must fault the value in and compute the same entry bytes
+# the INSERT wrote: never a panic, never a skipped or stale entry. The bug class is visible only
+# in the DISK pass (which reopens before every record); the memory pass pins the same results.
+# A key larger than a page is rejected 0A000 from INSERT and UPDATE alike.
+#
+# The 4500-char value is built by a recursive CTE over a 64-symbol LCG (lpad(c, n + 1, s) appends
+# c to s), so LZ4 cannot shrink it and it genuinely spills plain at the default 8 KiB page.
+# jed-specific, CROSS-CORE-checked, NOT oracle-checked: PostgreSQL rejects a btree entry this large
+# (54000, "index row size exceeds btree maximum"), whereas jed's B-tree admits a key up to a page.
+# requires: expr.case, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.foreign_key, dml.insert, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.aggregates, query.cte, query.cte_recursive, query.set_returning, query.subquery_scalar, types.i32, types.i64, types.text, dml.insert_multi_row, dml.update_container, types.array, ddl.gin_index, query.gin_scan
+
+statement ok
+CREATE TABLE big_keys (id i32 PRIMARY KEY, v text)
+
+statement ok
+CREATE INDEX big_keys_v ON big_keys (v)
+
+statement ok
+INSERT INTO big_keys SELECT 0, s FROM (WITH RECURSIVE gen(n, x, s) AS (SELECT 0, 12345::i64, ''::text UNION ALL SELECT n + 1, (x * 1103515245 + 12345) % 2147483648, lpad(chr((48 + x / 65536 % 64)::i32), n + 1, s) FROM gen WHERE n < 4500) SELECT s FROM gen WHERE n = 4500) AS big
+
+statement ok
+INSERT INTO big_keys SELECT g, NULL FROM generate_series(1, 300) g
+
+query I nosort
+SELECT length(v) FROM big_keys WHERE id = 0
+----
+4500
+
+# Copy the spilled value into every row (the reported panic: the old row 0's entry key is built
+# from its deferred value).
+statement ok
+UPDATE big_keys SET v = (SELECT v FROM big_keys WHERE id = 0)
+
+query I nosort
+SELECT count(*) FROM big_keys WHERE v = (SELECT v FROM big_keys WHERE id = 7)
+----
+301
+
+# Re-key rows whose key column is carried over (still deferred) into the new row.
+statement ok
+UPDATE big_keys SET id = id + 1000 WHERE id < 100
+
+statement ok
+DELETE FROM big_keys WHERE id >= 1050
+
+query I nosort
+SELECT count(*) FROM big_keys WHERE v > ''
+----
+251
+
+statement ok
+UPDATE big_keys SET v = 'small' WHERE id >= 1000 AND id < 1010
+
+query II nosort
+SELECT count(*), min(id) FROM big_keys WHERE v = 'small'
+----
+10
+1000
+
+# The index holds no stale entries: index-bounded and full counts agree after the churn.
+query I nosort
+SELECT count(*) FROM big_keys WHERE v > ''
+----
+251
+
+query I nosort
+SELECT count(*) FROM big_keys WHERE length(v) = 4500
+----
+241
+
+# A key larger than a page is 0A000 from INSERT and UPDATE alike (repeat doubles it to 9000 bytes).
+statement error 0A000
+INSERT INTO big_keys SELECT 5000, repeat(v, 2) FROM big_keys WHERE id = 1010
+
+statement error 0A000
+UPDATE big_keys SET v = repeat(v, 2) WHERE id = 1010
+
+statement ok
+DELETE FROM big_keys
+
+query I nosort
+SELECT count(*) FROM big_keys WHERE v > ''
+----
+0
+
+# CREATE INDEX over a table whose rows already hold spilled values.
+statement ok
+CREATE TABLE big_late (id i32 PRIMARY KEY, v text)
+
+statement ok
+INSERT INTO big_late SELECT 1, s FROM (WITH RECURSIVE gen(n, x, s) AS (SELECT 0, 777::i64, ''::text UNION ALL SELECT n + 1, (x * 1103515245 + 12345) % 2147483648, lpad(chr((48 + x / 65536 % 64)::i32), n + 1, s) FROM gen WHERE n < 4500) SELECT s FROM gen WHERE n = 4500) AS big
+
+statement ok
+CREATE INDEX big_late_v ON big_late (v)
+
+query I nosort
+SELECT id FROM big_late WHERE v = (SELECT v FROM big_late WHERE id = 1)
+----
+1
+
+# UNIQUE and FOREIGN KEY probes over a spilled key.
+statement ok
+CREATE TABLE big_parent (id i32 PRIMARY KEY, k text UNIQUE)
+
+statement ok
+CREATE TABLE big_child (id i32 PRIMARY KEY, k text REFERENCES big_parent(k))
+
+statement ok
+INSERT INTO big_parent SELECT id, v FROM big_late
+
+statement ok
+INSERT INTO big_child SELECT 1, k FROM big_parent
+
+statement error 23505
+INSERT INTO big_parent SELECT 2, k FROM big_parent WHERE id = 1
+
+statement error 23503
+DELETE FROM big_parent WHERE id = 1
+
+statement ok
+UPDATE big_child SET id = 2
+
+statement ok
+DELETE FROM big_child
+
+statement ok
+DELETE FROM big_parent WHERE id = 1
+
+query I nosort
+SELECT count(*) FROM big_parent
+----
+0
+
+# GIN over a spilled array: an i64[] of 12345 then 600 pseudo-random 9-digit elements (built as
+# text one character per step by the same LCG — a digit, or a comma every tenth step — then cast)
+# is incompressible and spills plain. CREATE INDEX over the stored row must index every term (a
+# skipped deferred array would silently miss the row), and DELETE must remove them.
+statement ok
+CREATE TABLE big_arrays (id i32 PRIMARY KEY, a i64[])
+
+statement ok
+CREATE TABLE big_array_src (id i32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO big_array_src SELECT 1, s FROM (WITH RECURSIVE gen(n, x, s) AS (SELECT 0, 12345::i64, '{12345'::text UNION ALL SELECT n + 1, (x * 1103515245 + 12345) % 2147483648, lpad(CASE WHEN n % 10 = 0 THEN ',' ELSE chr((48 + x / 65536 % 10)::i32) END, n + 7, s) FROM gen WHERE n < 6000) SELECT lpad('}', 6007, s) AS s FROM gen WHERE n = 6000) AS big
+
+statement ok
+INSERT INTO big_arrays VALUES (1, ARRAY[1]), (2, ARRAY[7, 8])
+
+statement ok
+UPDATE big_arrays SET a = (SELECT s FROM big_array_src WHERE id = 1)::i64[] WHERE id = 1
+
+statement ok
+CREATE INDEX big_arrays_a ON big_arrays USING gin (a)
+
+query I nosort
+SELECT id FROM big_arrays WHERE a @> ARRAY[12345]
+----
+1
+
+query I nosort
+SELECT id FROM big_arrays WHERE a @> ARRAY[7]
+----
+2
+
+statement ok
+DELETE FROM big_arrays WHERE id = 1
+
+statement ok
+INSERT INTO big_arrays VALUES (1, ARRAY[9])
+
+query I nosort
+SELECT count(*) FROM big_arrays WHERE a @> ARRAY[12345]
+----
+0
+
+query I nosort
+SELECT id FROM big_arrays WHERE a @> ARRAY[9]
+----
+1

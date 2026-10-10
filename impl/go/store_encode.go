@@ -792,10 +792,18 @@ func typesEqual(a, b dataType) bool {
 }
 
 // encodeKeyValue is the order-preserving key bytes for one keyable value (encoding.md §2),
-// matching the PK / index encoders. value is non-NULL and of a keyable type (a foreign-key
-// column always is — its type equals a PK/UNIQUE parent column, CREATE TABLE §6.2).
+// matching the PK / index encoders. value is non-NULL and of a keyable scalar type — every key
+// site's column/expression type passes a keyability gate (PRIMARY KEY / CREATE INDEX / UNIQUE, and a
+// foreign-key column's type equals its PK/UNIQUE parent column's, CREATE TABLE §6.2). A DEFERRED
+// value (a spilled large value of a lazily-decoded row) is resolved first (residentValue).
 func encodeKeyValue(ty scalarType, value Value, coll *Collation) ([]byte, error) {
 	switch value.Kind {
+	case ValUnfetched:
+		v, err := resolveUnfetchedSelf(value.unfetched())
+		if err != nil {
+			return nil, err
+		}
+		return encodeKeyValue(ty, v, coll)
 	case ValInt:
 		return encodeInt(ty, value.Int), nil
 	case ValBool:
@@ -817,8 +825,23 @@ func encodeKeyValue(ty scalarType, value Value, coll *Collation) ([]byte, error)
 	case ValFloat32:
 		return encodeFloat32Key(uint32(value.Int)), nil
 	default:
-		panic("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)")
+		panic("encodeKeyValue: a non-keyable scalar value (every key site's type passes a keyability gate)")
 	}
+}
+
+// residentValue returns value with a lazily-DEFERRED large value (ValUnfetched — a spilled/compressed
+// column of a faulted packed leaf, spec/design/lazy-record.md) resolved from its own carried handles,
+// or value unchanged. Every key encoder and index-entry builder routes a column value through this:
+// a stored row's variable-width key column (text/bytea/decimal/a container) spills once its record
+// exceeds RECORD_MAX, and an UPDATE's new row carries its unassigned columns over from the old row
+// still deferred — so index maintenance, uniqueness/FK probes, and EXCLUDE checks fault the value in
+// to compute the same key bytes the INSERT wrote (never a panic, never a skipped entry). The fetch is
+// unmetered, like the evaluator's backstop it shares.
+func residentValue(value Value) (Value, error) {
+	if value.Kind == ValUnfetched {
+		return resolveUnfetchedSelf(value.unfetched())
+	}
+	return value, nil
 }
 
 // encodeTypedKey is the order-preserving key bytes for one keyable value given its column Type — the
@@ -828,6 +851,10 @@ func encodeKeyValue(ty scalarType, value Value, coll *Collation) ([]byte, error)
 // encodeKeyValue. value is non-NULL (callers handle the NULL slot tag), and a range column always
 // holds a ValRange, so the scalar arm never sees a range type.
 func encodeTypedKey(ty dataType, value Value, coll *Collation) ([]byte, error) {
+	value, err := residentValue(value)
+	if err != nil {
+		return nil, err
+	}
 	if value.Kind == ValRange {
 		elem, ok := ty.RangeElement()
 		if !ok {
@@ -885,6 +912,10 @@ func encodeArrayKey(elem scalarType, a *ArrayVal) ([]byte, error) {
 // (encoding.md §2.15). value is non-NULL (callers tag the §2.2 slot). coll selects a text column's
 // collated key form (§2.12); it never applies to a container element or a composite field.
 func encodeColTypeKey(ct colType, value Value, coll *Collation) ([]byte, error) {
+	value, err := residentValue(value)
+	if err != nil {
+		return nil, err
+	}
 	switch {
 	case ct.Composite:
 		return encodeCompositeKey(ct.Fields, *value.composite())

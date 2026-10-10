@@ -244,10 +244,13 @@ func indexSlotKey(key resolvedKey, colTypes []colType, colls []*Collation, row s
 // indexEntryKey builds a secondary-index entry key (spec/design/indexes.md §3): each key element
 // as the encoding.md §2.2 nullable slot — 0x00 + the slot's bare order-preserving key bytes when
 // present, the lone 0x01 for NULL (always tagged, even for a NOT NULL column) — then the row's
-// storage key as the suffix. A column key's value is always resident (a fixed-width type never
-// spills, and a spillable text/bytea would over-fill the entry key, rejected 0A000 at its insert);
-// an expression key evaluates against the row (§4), faulting a referenced spilled value in through
-// the evaluator's Unfetched backstop.
+// storage key as the suffix. A column key's value may be DEFERRED (ValUnfetched): a variable-width
+// key column (text/bytea/decimal/a container) whose value spilled when its table record exceeded
+// RECORD_MAX is lazily fetched once its leaf faults in from disk, and an UPDATE's new row carries
+// unassigned columns over from the old row still deferred. The key encoders resolve it
+// (residentValue), so maintenance computes the same entry bytes the INSERT wrote. An expression key
+// evaluates against the row (§4), faulting a referenced spilled value in through the evaluator's
+// Unfetched backstop.
 func indexEntryKey(colTypes []colType, colls []*Collation, rindex *resolvedIndex, storageKey []byte, row storedRow, env *evalEnv) ([]byte, error) {
 	var out []byte
 	for _, key := range rindex.Keys {
@@ -298,10 +301,10 @@ func indexEntryKeys(columns []catColumn, colTypes []colType, colls []*Collation,
 		return nil, nil // partial index: a non-qualifying row contributes no entry
 	}
 	if rindex.Kind == indexGin {
-		return ginEntries(columns, rindex.columnOrdinals(), storageKey, row), nil
+		return ginEntries(columns, rindex.columnOrdinals(), storageKey, row)
 	}
 	if rindex.Kind == indexGist {
-		return gistEntries(columns, rindex.columnOrdinals(), storageKey, row), nil
+		return gistEntries(columns, rindex.columnOrdinals(), storageKey, row)
 	}
 	ek, err := indexEntryKey(colTypes, colls, rindex, storageKey, row, env)
 	if err != nil {
@@ -332,14 +335,17 @@ func indexEntryKeysColumns(columns []catColumn, colTypes []colType, colls []*Col
 // leaf key, encodeRangeBody(bound) ‖ storage_key (the GIN term ‖ skey pattern), so all existing
 // index maintenance (insert/update/delete) reuses it unchanged. A NULL range value is not indexed;
 // the empty range is a real value and IS indexed. cols is the index's plain-column ordinals.
-func gistEntries(columns []catColumn, cols []int, storageKey []byte, row storedRow) [][]byte {
+func gistEntries(columns []catColumn, cols []int, storageKey []byte, row storedRow) ([][]byte, error) {
 	ops := make([]gistOpclass, len(cols))
 	bound := make([]gistBound, len(cols))
 	for i, ci := range cols {
 		col := columns[ci]
-		v := row[ci]
+		v, err := residentValue(row[ci]) // a spilled range (a numrange over huge decimals) may be deferred
+		if err != nil {
+			return nil, err
+		}
 		if v.Kind == ValNull {
-			return nil // any NULL excluded column → row not indexed (the §7 NULL rule)
+			return nil, nil // any NULL excluded column → row not indexed (the §7 NULL rule)
 		}
 		if rt, ok := col.Type.RangeElement(); ok {
 			// range_ops: the row range's value-codec bytes.
@@ -356,7 +362,7 @@ func gistEntries(columns []catColumn, cols []int, storageKey []byte, row storedR
 		ops[i] = gistOpclass{scalar: true}
 		bound[i] = gistBound{smin: k, smax: k}
 	}
-	return [][]byte{gistLeafKey(ops, bound, storageKey)}
+	return [][]byte{gistLeafKey(ops, bound, storageKey)}, nil
 }
 
 // exclusionProbeQuery builds a row's EXCLUDE conjunction probe (spec/design/gist.md §7): one GiST
@@ -365,19 +371,22 @@ func gistEntries(columns []catColumn, cols []int, storageKey []byte, row storedR
 // a && element holds the empty range (empty && anything is FALSE, so the conjunction can never be
 // TRUE — this also sidesteps the empty-range overlap-descend trap, gist.md §5). The query is fed to
 // the resident GiST tree's search, whose leaf recheck IS the full conjunction, so a hit is a conflict.
-func exclusionProbeQuery(columns []catColumn, exc exclusionConstraint, row storedRow) ([]gistQuery, []gistStrategy, bool) {
+func exclusionProbeQuery(columns []catColumn, exc exclusionConstraint, row storedRow) ([]gistQuery, []gistStrategy, bool, error) {
 	q := make([]gistQuery, 0, len(exc.Elements))
 	strats := make([]gistStrategy, 0, len(exc.Elements))
 	for _, el := range exc.Elements {
 		ci := el.Column
-		v := row[ci]
+		v, err := residentValue(row[ci]) // an UPDATE's carried-over spilled range may be deferred
+		if err != nil {
+			return nil, nil, false, err
+		}
 		if v.Kind == ValNull {
-			return nil, nil, false // NULL rule: exempt
+			return nil, nil, false, nil // NULL rule: exempt
 		}
 		switch el.Op {
 		case exclOverlaps:
 			if v.rangeVal().Empty {
-				return nil, nil, false // empty && anything is FALSE → exempt
+				return nil, nil, false, nil // empty && anything is FALSE → exempt
 			}
 			q = append(q, gistQuery{rng: v.rangeVal()})
 			strats = append(strats, gistOverlaps)
@@ -390,7 +399,7 @@ func exclusionProbeQuery(columns []catColumn, exc exclusionConstraint, row store
 			strats = append(strats, gistEqual)
 		}
 	}
-	return q, strats, true
+	return q, strats, true, nil
 }
 
 // exclusionPairConflicts reports whether the (expr_i op_i) conjunction holds between two rows
@@ -398,12 +407,19 @@ func exclusionProbeQuery(columns []catColumn, exc exclusionConstraint, row store
 // holds only stored rows). A NULL in any excluded column of either row, or an empty range under &&
 // (rangeOverlaps of an empty range is FALSE), makes that element not-TRUE → no conflict. Returns true
 // only when EVERY element is definitely TRUE.
-func exclusionPairConflicts(columns []catColumn, exc exclusionConstraint, a, b storedRow) bool {
+func exclusionPairConflicts(columns []catColumn, exc exclusionConstraint, a, b storedRow) (bool, error) {
 	for _, el := range exc.Elements {
 		ci := el.Column
-		va, vb := a[ci], b[ci]
+		va, err := residentValue(a[ci])
+		if err != nil {
+			return false, err
+		}
+		vb, err := residentValue(b[ci])
+		if err != nil {
+			return false, err
+		}
 		if va.Kind == ValNull || vb.Kind == ValNull {
-			return false
+			return false, nil
 		}
 		var ok bool
 		switch el.Op {
@@ -421,10 +437,10 @@ func exclusionPairConflicts(columns []catColumn, exc exclusionConstraint, a, b s
 			ok = bytes.Equal(ka, kb)
 		}
 		if !ok {
-			return false
+			return false, nil
 		}
 	}
-	return true
+	return true, nil
 }
 
 // isGinElementType reports whether elem is an element type a GIN (array_ops) index admits —
@@ -461,12 +477,17 @@ func isGistDeferredScalarType(ty dataType) bool {
 // they appear in no posting list). Returned sorted by encoded term (= key-encoding byte order, which
 // is order-preserving for every admitted element type). array_ops over any fixed-width key-encodable
 // element type.
-func ginEntries(columns []catColumn, cols []int, storageKey []byte, row storedRow) [][]byte {
+func ginEntries(columns []catColumn, cols []int, storageKey []byte, row storedRow) ([][]byte, error) {
 	ci := cols[0]
 	elemTy := columns[ci].Type.Array.ScalarTy()
-	v := row[ci]
+	// A large array spills like any variable-width value, so a stored row's array may be deferred;
+	// it must be resolved — skipping it would silently drop (or fail to remove) its posting entries.
+	v, err := residentValue(row[ci])
+	if err != nil {
+		return nil, err
+	}
 	if v.Kind != ValArray {
-		return nil
+		return nil, nil
 	}
 	// Dedup by the encoded term (the encoding is a bijection: byte-dedup == value-dedup, byte-sort
 	// == value-sort) generically over every admitted element type.
@@ -493,7 +514,7 @@ func ginEntries(columns []catColumn, cols []int, storageKey []byte, row storedRo
 		entry := append(append([]byte{}, t...), storageKey...)
 		entries = append(entries, entry)
 	}
-	return entries
+	return entries, nil
 }
 
 // bytesDiff returns the entries in a that are not in b (set difference over byte slices),
@@ -1686,13 +1707,21 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 		tcols := table.Columns
 		for _, exc := range table.Exclusions {
 			for _, pr := range prepared {
-				if db.insertExclusionConflictsStored(tcols, exc, pr.row) {
+				conflict, err := db.insertExclusionConflictsStored(tcols, exc, pr.row)
+				if err != nil {
+					return nil, err
+				}
+				if conflict {
 					return nil, newExclusionViolation(table.Name, exc.Name)
 				}
 			}
 			for i := range prepared {
 				for j := 0; j < i; j++ {
-					if exclusionPairConflicts(tcols, exc, prepared[i].row, prepared[j].row) {
+					conflict, err := exclusionPairConflicts(tcols, exc, prepared[i].row, prepared[j].row)
+					if err != nil {
+						return nil, err
+					}
+					if conflict {
 						return nil, newExclusionViolation(table.Name, exc.Name)
 					}
 				}
@@ -1885,7 +1914,11 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 	}
 
 	for _, exc := range table.Exclusions {
-		if db.insertExclusionConflictsStored(table.Columns, exc, row) {
+		conflict, err := db.insertExclusionConflictsStored(table.Columns, exc, row)
+		if err != nil {
+			return nil, err
+		}
+		if conflict {
 			return nil, newExclusionViolation(table.Name, exc.Name)
 		}
 	}
@@ -1948,17 +1981,17 @@ func (db *engine) validateInsertFKStored(relation string, fk *foreignKey, probe 
 
 // insertExclusionConflictsStored probes the resident GiST rows for one candidate. The batch caller
 // separately retains its pairwise end-state pass; the stored-row semantics are shared.
-func (db *engine) insertExclusionConflictsStored(columns []catColumn, exc exclusionConstraint, row storedRow) bool {
-	query, strats, ok := exclusionProbeQuery(columns, exc, row)
-	if !ok {
-		return false
+func (db *engine) insertExclusionConflictsStored(columns []catColumn, exc exclusionConstraint, row storedRow) (bool, error) {
+	query, strats, ok, err := exclusionProbeQuery(columns, exc, row)
+	if err != nil || !ok {
+		return false, err
 	}
 	tree := db.readSnap().gistTreeFor(strings.ToLower(exc.Index))
 	if tree == nil {
-		return false
+		return false, nil
 	}
 	hits, _, _ := tree.search(query, strats)
-	return len(hits) > 0
+	return len(hits) > 0, nil
 }
 
 // foldConflictPlan folds globally-uncorrelated subqueries in a DO UPDATE's SET/WHERE once (their
@@ -3652,7 +3685,10 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 		for _, exc := range table.Exclusions {
 			ikey := strings.ToLower(exc.Index)
 			for _, u := range updates {
-				q, strats, ok := exclusionProbeQuery(table.Columns, exc, u.row)
+				q, strats, ok, err := exclusionProbeQuery(table.Columns, exc, u.row)
+				if err != nil {
+					return outcome{}, err
+				}
 				if !ok {
 					continue
 				}
@@ -3672,7 +3708,11 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			}
 			for i := range updates {
 				for j := 0; j < i; j++ {
-					if exclusionPairConflicts(table.Columns, exc, updates[i].row, updates[j].row) {
+					conflict, err := exclusionPairConflicts(table.Columns, exc, updates[i].row, updates[j].row)
+					if err != nil {
+						return outcome{}, err
+					}
+					if conflict {
 						return outcome{}, newExclusionViolation(table.Name, exc.Name)
 					}
 				}

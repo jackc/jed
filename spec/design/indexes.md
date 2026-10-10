@@ -219,12 +219,21 @@ columns the expressions *reference* (not the fixed-width indexed columns of a pl
 so if a referenced value is a spilled/compressed large value the build charges its
 `value_decompress` slabs (large-values.md §14) — deterministic and cross-core identical.
 
-A **plain** column index reads only fixed-width, never-spilling indexable columns, so its
-maintenance cannot fault. An **expression** index may reference a variable-width column
-(`lower(bigtext)`) whose value spilled to an overflow chain; evaluating the expression
-faults it in on demand through the ordinary evaluator backstop (the lazy-record
-`Unfetched` resolution), so maintenance transparently materializes what a key expression
-reads.
+A **plain** column index may key a variable-width column (`text`/`bytea`/`decimal`, or an
+array/range/composite) whose value spilled to an overflow chain or compressed when its
+*table* record exceeded `RECORD_MAX` (large-values.md §12): the index entry key holds the
+full encoded value, which is admitted up to a page (a larger entry is `0A000`, from INSERT
+and UPDATE alike). Once the row's leaf faults in from disk that value is lazily
+**deferred**, and an UPDATE's new row carries its unassigned columns over still deferred,
+so every entry builder — B-tree, GIN, GiST, and the uniqueness/FK/EXCLUDE probes — resolves
+a deferred column value before encoding it, computing the same entry bytes the INSERT
+wrote (a skipped deferred value would leave stale or missing entries). An **expression**
+index may likewise reference a spilled column (`lower(bigtext)`); evaluating the expression
+faults it in through the ordinary evaluator backstop (the lazy-record `Unfetched`
+resolution). Both fetches are unmetered maintenance work, like the eval itself. Pinned by
+`conformance/suites/dml/index_spilled_key.test` (its disk pass reopens before every record).
+PostgreSQL rejects a btree entry over ~2.7 KB (`54000`); jed's larger key ceiling is a
+deliberate divergence of its page-sized B-tree records.
 
 ## 5. The planner: index-bounded scans (SELECT)
 

@@ -756,7 +756,11 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 				if err != nil {
 					return nil, err
 				}
-				if exclusionPairConflicts(t.Columns, ex, a, b) {
+				conflict, err := exclusionPairConflicts(t.Columns, ex, a, b)
+				if err != nil {
+					return nil, err
+				}
+				if conflict {
 					return nil, newExclusionViolation(t.Name, ex.Name)
 				}
 			}

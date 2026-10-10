@@ -3254,7 +3254,7 @@ impl Engine {
                         meter.guard()?;
                         let mut b = rows[j].1.clone();
                         store.resolve_inline_columns(&mut b)?;
-                        if exclusion_pair_conflicts(&table.columns, ex, &a, &b) {
+                        if exclusion_pair_conflicts(&table.columns, ex, &a, &b)? {
                             return Err(EngineError::exclusion_violation(&table.name, &ex.name));
                         }
                     }
