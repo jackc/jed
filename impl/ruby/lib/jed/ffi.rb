@@ -5,7 +5,7 @@ require "rbconfig"
 
 module Jed
   # The thin Fiddle binding to the native cdylib (spec/design/ruby.md §5). Loads `libjed_ruby`,
-  # binds the eight C-ABI entry points, and verifies the ABI version on load. Uses only Ruby's
+  # binds the C-ABI entry points, and verifies the ABI version on load. Uses only Ruby's
   # stdlib `fiddle` — no third-party gem (CLAUDE.md §14).
   module FFI
     module_function
@@ -59,9 +59,14 @@ module Jed
     UINT = Fiddle::TYPE_INT # the u32 ABI-version return; non-negative, fits an int
     CHAR = Fiddle::TYPE_CHAR # the read_only u8 flag
     VOID = Fiddle::TYPE_VOID
+    # Host-function callback types (ruby.md §5b): pointers cross as integers, so a closure call builds
+    # no Fiddle::Pointer.
+    UINTPTR = Fiddle::TYPE_UINTPTR_T
+    U64 = Fiddle::TYPE_UINT64_T
+    I64 = Fiddle::TYPE_INT64_T
 
-    def fn(sym, args, ret)
-      Fiddle::Function.new(LIB[sym.to_s], args, ret, name: sym.to_s)
+    def fn(sym, args, ret, need_gvl: false)
+      Fiddle::Function.new(LIB[sym.to_s], args, ret, name: sym.to_s, need_gvl: need_gvl)
     end
     module_function :fn
 
@@ -77,9 +82,10 @@ module Jed
         "(rebuild with `mise run ruby:build`)"
     end
 
-    OPEN_MEMORY    = fn(:jed_open_memory, [], VOIDP)
-    CREATE         = fn(:jed_create, [VOIDP], VOIDP)
-    OPEN           = fn(:jed_open, [VOIDP, CHAR], VOIDP)
+    # The trailing VOIDP of the three opens is the host-function registry (null = none, ruby.md §5b).
+    OPEN_MEMORY    = fn(:jed_open_memory, [VOIDP], VOIDP)
+    CREATE         = fn(:jed_create, [VOIDP, VOIDP], VOIDP)
+    OPEN           = fn(:jed_open, [VOIDP, CHAR, VOIDP], VOIDP)
     # (db, sql, params_buf, params_len) — the param buffer is the ruby.md §3a encoding (null/0 = none).
     EXECUTE        = fn(:jed_execute, [VOIDP, VOIDP, VOIDP, UINT], VOIDP)
     COMMIT         = fn(:jed_commit, [VOIDP], VOIDP)
@@ -88,5 +94,13 @@ module Jed
     # (bytes, len) → engine-global host-bundle loaders; UNIT on success / ERROR on a bad bundle.
     LOAD_UNICODE   = fn(:jed_load_unicode_data, [VOIDP, UINT], VOIDP)
     LOAD_TIMEZONE  = fn(:jed_load_time_zone_data, [VOIDP, UINT], VOIDP)
+    # Host functions (ruby.md §5b): the registry, and the large-result sink a callback calls while it
+    # holds the GVL (need_gvl: true — a memcpy, so releasing and re-acquiring the GVL would only cost).
+    REGISTRY_NEW      = fn(:jed_registry_new, [], VOIDP)
+    REGISTRY_FREE     = fn(:jed_registry_free, [VOIDP], VOID)
+    # (registry, name, arg_types csv, result, volatility, cost, batched, callback, user_data) → TYPES|ERROR
+    REGISTRY_REGISTER = fn(:jed_registry_register,
+      [VOIDP, VOIDP, VOIDP, VOIDP, CHAR, I64, CHAR, VOIDP, UINTPTR], VOIDP)
+    HOST_RESULT       = fn(:jed_host_result, [UINTPTR, VOIDP, U64], VOID, need_gvl: true)
   end
 end

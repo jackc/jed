@@ -51,7 +51,9 @@ module Jed
       return -Float::INFINITY if raw == NEG_INF
 
       m = DATE_RE.match(raw) or return raw # unknown shape → fall back to the String, never crash
-      Date.new(astro_year(m[1], m[4]), m[2].to_i, m[3].to_i)
+      # Proleptic Gregorian, like jed/PG and Ruby's Time. Ruby's default calendar switches to Julian
+      # before 1582, which would name a different day (and shift it when bound back).
+      Date.new(astro_year(m[1], m[4]), m[2].to_i, m[3].to_i, Date::GREGORIAN)
     end
 
     def timestamp(raw)

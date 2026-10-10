@@ -73,13 +73,28 @@ class JedEngine
   end
 end
 
+# The bench host functions (spec/design/benchmarks.md §8.2), registered on every handle exactly as
+# bench_jed.rs does: the same arithmetic as a single-row kernel (one upcall per row) and a batch kernel
+# (one upcall per prefetched chunk). `remainder` truncates like Rust's `%`, so a negative input would
+# agree too.
+BENCH_EXTENSIONS = Jed::ExtensionRegistry.new.tap do |reg|
+  reg.register("bench_mix_row", [:i32], :i64, volatility: :immutable) do |x|
+    (x * 2_654_435_761).remainder(1_000_003)
+  end
+  reg.register_batch("bench_mix_batch", [:i32], :i64, volatility: :immutable) do |xs, out|
+    xs.each { |x| out << (x * 2_654_435_761).remainder(1_000_003) }
+  end
+end
+
 open_engine = lambda do |data_dir, dataset|
   if dataset == "scratch"
     dir = File.join(data_dir, "scratch-ruby-#{Process.pid}")
     FileUtils.mkdir_p(dir)
-    JedEngine.new(Jed.create(File.join(dir, "scratch.jed")), data_dir, dataset, dir)
+    db = Jed.create(File.join(dir, "scratch.jed"), extensions: BENCH_EXTENSIONS)
+    JedEngine.new(db, data_dir, dataset, dir)
   else
-    JedEngine.new(Jed.open(File.join(data_dir, "#{dataset}.jed")), data_dir, dataset, nil)
+    db = Jed.open(File.join(data_dir, "#{dataset}.jed"), extensions: BENCH_EXTENSIONS)
+    JedEngine.new(db, data_dir, dataset, nil)
   end
 end
 

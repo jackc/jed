@@ -11,6 +11,7 @@ module Jed
     TAG_QUERY = 2
     TAG_HANDLE = 3
     TAG_UNIT = 4
+    TAG_TYPES = 5
 
     # Copy the result buffer at `ptr` (a Fiddle::Pointer) into a Ruby String, free the native
     # allocation, and return the parsed Hash. The first 8 bytes carry the total length.
@@ -56,6 +57,8 @@ module Jed
         { kind: :handle, ptr: cur.u64 }
       when TAG_UNIT
         { kind: :unit }
+      when TAG_TYPES
+        { kind: :types, types: Array.new(cur.u32) { cur.lstr } }
       else
         raise Jed::LoadError, "unknown result tag #{tag} from the native library"
       end

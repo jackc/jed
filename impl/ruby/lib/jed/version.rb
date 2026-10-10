@@ -5,6 +5,7 @@ module Jed
 
   # The native C-ABI version this gem speaks. Must equal `jed_abi_version()` in the loaded
   # cdylib; the FFI loader refuses a mismatch (spec/design/ruby.md §5). v2 added `$N` bind params;
-  # v3 added the decimal/date/timestamp param tags; v4 added the host-bundle loaders.
-  ABI_VERSION = 4
+  # v3 added the decimal/date/timestamp param tags; v4 added the host-bundle loaders; v5 added host
+  # functions (the registry calls and the open calls' registry argument).
+  ABI_VERSION = 5
 end

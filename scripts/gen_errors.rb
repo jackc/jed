@@ -54,6 +54,7 @@ def rust_variant(e)
 end
 
 def rust_arm(e) = "            SqlState::#{pascal(e['name'])} => \"#{e['code']}\","
+def rust_from_arm(e) = "            \"#{e['code']}\" => Some(SqlState::#{pascal(e['name'])}),"
 
 def rust_desc(e)
   %(    ErrorDesc { code: "#{e['code']}", name: "#{e['name']}", class: "#{e['class']}" },)
@@ -83,6 +84,16 @@ def rust_file(es)
         pub fn code(self) -> &'static str {
             match self {
     #{es.map { |e| rust_arm(e) }.join("\n")}
+            }
+        }
+
+        /// The SQLSTATE a registered 5-char code names, or `None` for a code outside the registry.
+        /// For hosts that carry an error across a language boundary as its code (a wrapped binding's
+        /// host-function kernel, spec/design/ruby.md §5b).
+        pub fn from_code(code: &str) -> Option<SqlState> {
+            match code {
+    #{es.map { |e| rust_from_arm(e) }.join("\n")}
+                _ => None,
             }
         }
     }

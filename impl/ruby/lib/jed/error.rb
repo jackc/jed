@@ -7,9 +7,14 @@ module Jed
   class Error < StandardError
     # The 5-char SQLSTATE, e.g. "23505" (unique_violation) or "42601" (syntax_error).
     attr_reader :sqlstate
+    # The engine's message text without the SQLSTATE prefix that {#message} carries.
+    attr_reader :raw_message
 
+    # A host function may raise one of these to fail with a specific SQLSTATE
+    # (spec/design/ruby.md §5b): `raise Jed::Error.new("22012", "division by zero")`.
     def initialize(sqlstate, message)
       @sqlstate = sqlstate
+      @raw_message = message
       super("#{sqlstate}: #{message}")
     end
   end

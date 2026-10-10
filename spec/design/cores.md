@@ -104,6 +104,10 @@ amortized. Decide this early — it is what determines whether wrapping is on th
 ([extensibility.md](extensibility.md) §4.2.1), called once per chunk at the buffered projection with
 results, cost, and errors identical to one-row calls. A wrapped binding can therefore cross the
 boundary once per chunk; more sites batching (streaming scans, filters, writes) are follow-ons.
+**Measured** in the Ruby gem, a Fiddle-based wrap ([benchmarks.md](benchmarks.md) §8.2): a crossing
+costs ≈ 0.7 µs, so a per-row host function costs the wrap 765 ns/row against the native core's
+47 ns/row. Batching cuts that to 254 ns/row (the native core pays 32 ns/row), leaving per-value
+marshalling as the remainder.
 
 ### 2.2 Deciding factor — parallelism (where the threads live)
 

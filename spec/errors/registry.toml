@@ -328,6 +328,19 @@ name = "dependent_objects_still_exist"
 class = "dependent objects still exist"
 template = "cannot drop type {name} because other objects depend on it: {detail}"
 
+# --- external routine exception (class 38) ---------------------------------
+# 38000 external_routine_exception — a host function's kernel failed in a way that
+# carries no SQLSTATE of its own: an uncaught exception in a wrapped binding's
+# host-language kernel (the Ruby gem, spec/design/ruby.md §5b), or a callback that
+# exited non-locally. PostgreSQL raises this exact code for an uncaught error in an
+# externally defined routine (PL/Perl `die`, a PL/Python exception without an
+# SQLSTATE). The built-in surface never raises it.
+[[error]]
+code = "38000"
+name = "external_routine_exception"
+class = "external routine exception"
+template = "host function {name} raised {detail}"
+
 # --- syntax error / access rule violation (class 42) ------------------------
 [[error]]
 code = "42601"

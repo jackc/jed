@@ -8,6 +8,7 @@ require_relative "jed/coerce"
 require_relative "jed/params"
 require_relative "jed/result"
 require_relative "jed/database"
+require_relative "jed/extension"
 
 # jed — an embedded SQL database with PostgreSQL behavior and a strict, static type system.
 #
@@ -22,14 +23,17 @@ require_relative "jed/database"
 #   end
 module Jed
   class << self
-    # Open a new in-memory database (see {Database.memory}).
-    def memory(&) = Database.memory(&)
+    # Open a new in-memory database (see {Database.memory}). `extensions:` is a
+    # {Jed::ExtensionRegistry} of host functions (spec/design/ruby.md §5b).
+    def memory(extensions: nil, &) = Database.memory(extensions: extensions, &)
 
     # Create a new file-backed database at `path` (see {Database.create}).
-    def create(path, &) = Database.create(path, &)
+    def create(path, extensions: nil, &) = Database.create(path, extensions: extensions, &)
 
     # Open an existing file-backed database at `path` (see {Database.open}).
-    def open(path, read_only: false, &) = Database.open(path, read_only: read_only, &)
+    def open(path, read_only: false, extensions: nil, &)
+      Database.open(path, read_only: read_only, extensions: extensions, &)
+    end
 
     # Load a Unicode collation bundle (a `JUCD` byte string) into the **engine-global** collation
     # set (spec/design/collation.md). The bare engine ships `C`-collation only; this adds the

@@ -206,13 +206,6 @@ module Bench
         warn "  skip: #{cfg[:engine]}/#{cfg[:lang]}/#{cfg[:variant]} has no concurrent_read support"
         next
       end
-      # The gem does not expose host functions yet, so it cannot register the bench host
-      # functions (spec/design/benchmarks.md §8.2).
-      if w.host_functions
-        warn "  skip: #{cfg[:engine]}/#{cfg[:lang]}/#{cfg[:variant]} has no bench host functions"
-        next
-      end
-
       warn "#{cfg[:engine]}/#{cfg[:lang]}/#{cfg[:variant]}: #{w.name} (#{w.dataset}) ..."
       run_one(cfg, w, corpus_dir, data_dir, want).to_json_line(cfg)
     end

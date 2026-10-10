@@ -99,6 +99,8 @@ const (
 	InFailedSqlTransaction
 	// DependentObjectsStillExist is 2BP01 — cannot drop type {name} because other objects depend on it: {detail}.
 	DependentObjectsStillExist
+	// ExternalRoutineException is 38000 — host function {name} raised {detail}.
+	ExternalRoutineException
 	// SyntaxError is 42601 — syntax error: {detail}.
 	SyntaxError
 	// UndefinedTable is 42P01 — table does not exist: {name}.
@@ -280,6 +282,8 @@ func (s SqlState) Code() string {
 		return "25P02"
 	case DependentObjectsStillExist:
 		return "2BP01"
+	case ExternalRoutineException:
+		return "38000"
 	case SyntaxError:
 		return "42601"
 	case UndefinedTable:
@@ -430,6 +434,7 @@ var errorDescs = []errorDesc{
 	{Code: "25006", Name: "read_only_sql_transaction", Class: "invalid transaction state"},
 	{Code: "25P02", Name: "in_failed_sql_transaction", Class: "invalid transaction state"},
 	{Code: "2BP01", Name: "dependent_objects_still_exist", Class: "dependent objects still exist"},
+	{Code: "38000", Name: "external_routine_exception", Class: "external routine exception"},
 	{Code: "42601", Name: "syntax_error", Class: "syntax error or access rule violation"},
 	{Code: "42P01", Name: "undefined_table", Class: "syntax error or access rule violation"},
 	{Code: "42703", Name: "undefined_column", Class: "syntax error or access rule violation"},

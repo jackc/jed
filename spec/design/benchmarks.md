@@ -1310,9 +1310,37 @@ After the replay began skipping argument evaluation for prefetched rows (extensi
 condition 2) and Go began storing results compactly in reused buffers, Go's `row`/`batch` sit ~5–15 ns
 over `none` (p50 per row, median of 5: none 915, row 921, batch 929), Rust's are ~6–8 ns faster
 than before (row 542, batch 528), and TS is unchanged within noise. The triple exists for the wrapped bindings, where each call crosses a language
-boundary and batching amortizes it; a wrapped driver (Ruby gem, Node/Rust, wasm) joins the triple
-when its binding exposes host functions. Until then those drivers skip it, like the PostgreSQL and
-SQLite drivers (`engines = ["jed"]`).
+boundary and batching amortizes it. A wrapped driver joins the triple when its binding exposes host
+functions; the Ruby gem does (below). The Node/Rust and wasm drivers do not yet and skip it, like the
+PostgreSQL and SQLite drivers (`engines = ["jed"]`).
+
+**The Ruby gem — the first measured boundary (2026-10-10).** The gem (`jed/ruby/wrap`,
+[ruby.md](ruby.md) §5b) registers both functions as Ruby blocks behind Fiddle closures:
+`bench_mix_row` crosses into Ruby once per row, `bench_mix_batch` once per prefetched chunk.
+Medians of five runs on one Linux x86-64 machine, ≈996 rows per iteration, answer checksums
+identical to `jed/rust/core`:
+
+| | `none` | `row` | `batch` | row − none | batch − none | batching saves |
+|---|---:|---:|---:|---:|---:|---:|
+| `jed/rust/core` | 0.495 ms | 0.542 ms | 0.527 ms | 47 ns/row | 32 ns/row | 15 ns/row |
+| `jed/ruby/wrap` | 2.811 ms | 3.573 ms | 3.064 ms | 765 ns/row | 254 ns/row | 511 ns/row |
+
+- **Per-call boundary cost: ≈ 0.7 µs.** A single-row host call costs the gem 765 ns per row against
+  the core's 47 ns, so each Rust → Ruby → Rust crossing adds about 720 ns. Measured in isolation, the
+  parts are ≈ 340 ns of Ruby-side marshalling (reading the argument buffer, `unpack`/`pack`, writing
+  the result), ≈ 300 ns of libffi trampoline and Ruby method dispatch, and ≈ 130 ns to re-acquire the
+  GVL, which `jed_execute` releases so other Ruby threads keep running.
+- **Batching removes about two-thirds of it.** One crossing per chunk of up to 1,024 rows turns
+  765 ns/row into 254 ns/row. The remainder is per *value*, not per call: converting each argument and result
+  between jed values and Ruby objects, running the Ruby block (≈ 30 ns), and the engine's own
+  prefetch work (the 32 ns the core also pays).
+- **What it means for the native-vs-wrap call** ([cores.md](cores.md) §2.1): with a hot per-row host
+  function, a wrapped binding pays roughly 16× the core's per-row host-call cost (8× when batched).
+  The whole `none` baseline is also ≈ 5.7× the core's, because the gem converts every result cell
+  into a Ruby object (§7.1). Batching makes per-row host functions affordable in a wrap, but they are
+  not free. The Fiddle-based gem is a near-worst case for the boundary: a compiled binding (`rb-sys`,
+  JNI, P/Invoke, UniFFI) avoids libffi's generic trampoline, though a managed runtime still pays its
+  own thread-attach / safepoint and marshalling costs.
 
 ## 9. Running and reporting
 

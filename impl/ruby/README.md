@@ -107,6 +107,45 @@ end
 
 A malformed bundle raises `Jed::Error`.
 
+### Host functions
+
+Register your own scalar functions, callable from SQL by name. Pass the registry when you open a
+database; the handle keeps the functions registered up to that point.
+
+```ruby
+reg = Jed::ExtensionRegistry.new
+
+# Single-row: called once per row with that row's arguments.
+reg.register("add_tax", [:decimal, :decimal], :decimal, volatility: :immutable) do |amount, rate|
+  amount * (1 + rate)
+end
+
+# Batch: one Array per argument, plus an output Array to append one result per row to.
+reg.register_batch("score", [:i32, :text], :i64, volatility: :immutable, cost: 2) do |ids, names, out|
+  ids.zip(names) { |id, name| out << (id * name.length) }
+end
+
+Jed.memory(extensions: reg) do |db|
+  db.query("SELECT add_tax(19.99, 0.08)").first[0]   # => 0.215892e2
+end
+```
+
+- Functions are **strict**: a NULL argument returns NULL without calling the block. Return `nil` for
+  a NULL result.
+- Arguments arrive as the same Ruby values a query returns (table above). The types a host function
+  may take or return are `i16` `i32` `i64` `f32` `f64` `boolean` `decimal` `text` `date` `timestamp`
+  `timestamptz`.
+- Raising fails the statement: a `Jed::Error.new("22012", "…")` keeps its SQLSTATE; any other
+  exception is `38000` with the exception as the `Jed::Error`'s `cause`. A result of the wrong class
+  is `22000`.
+- A batch block that raises after appending some results fails at the row after them, exactly as the
+  single-row form would.
+- `volatility:` is `:immutable`, `:stable`, or `:volatile` (the default). Only a non-volatile batch
+  function is called with chunks of up to 1,024 rows; that is what makes batching pay off.
+- `cost:` (default `1`) is charged per call against the engine's cost meter.
+- A host function may not use the database handle that is calling it (`55006`); other handles are
+  fine.
+
 ## Build & test (in-repo)
 
 The native extension is a Rust `cdylib`. From the **repo root**:

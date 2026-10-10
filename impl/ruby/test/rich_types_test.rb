@@ -50,10 +50,12 @@ class RichTypesTest < Minitest::Test
 
   def test_bc_date_uses_astronomical_year
     Jed.memory do |db|
-      # 44 BC → astronomical year -43 (1 - 44)
+      # 44 BC → astronomical year -43 (1 - 44), in the proleptic Gregorian calendar jed uses.
       row = db.query("SELECT DATE '0044-03-15 BC' AS d").first
       assert_instance_of Date, row[:d]
-      assert_equal Date.new(-43, 3, 15), row[:d]
+      assert_equal Date.new(-43, 3, 15, Date::GREGORIAN), row[:d]
+      # It binds back as the same day (Ruby's default calendar is Julian before 1582).
+      assert_equal true, db.query("SELECT $1::date = DATE '0044-03-15 BC' AS same", row[:d]).first[:same]
     end
   end
 
