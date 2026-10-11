@@ -73,7 +73,9 @@ end
 # [status, detail] where status is "PASS"/"FAIL"/"SKIP"/nil and detail is the full multi-line
 # `FAIL …` text (the failure signature) for a FAIL, else the single status line.
 def harness_status(core)
-  out, = Open3.capture2e(*core[:cmd], chdir: core[:dir])
+  # Walk only the candidate: the rest of the corpus is irrelevant to its status, and a full debug
+  # walk per ddmin probe costs seconds each (it dominated `mise run ci` via reduce_selftest).
+  out, = Open3.capture2e({ "JED_CONFORMANCE_FILTER" => TMP_REL }, *core[:cmd], chdir: core[:dir])
   lines = out.lines
   start = lines.index { |l| l =~ /\A(PASS|FAIL|SKIP)\s+#{Regexp.escape(TMP_REL)}(\s|:|\z)/ }
   return [nil, out] unless start # candidate not run at all — surface the whole output

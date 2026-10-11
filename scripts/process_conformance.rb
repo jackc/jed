@@ -138,7 +138,7 @@ def run_scenario(path, first_core, second_core)
     ensure
       actors.each_value(&:cleanup)
     end
-    puts "PASS #{name} #{first_core}->#{second_core}"
+    image = nil
     if data["byte_identical"]
       image = File.binread(File.join(dir, "shared.jed"))
       ps = image.byteslice(8, 4).unpack1("N")
@@ -148,25 +148,50 @@ def run_scenario(path, first_core, second_core)
       if data["max_page_count"] && page_count > data["max_page_count"]
         raise "page reuse did not bound growth: #{page_count} > #{data['max_page_count']}"
       end
-      image.byteslice(0, ps * page_count)
+      image = image.byteslice(0, ps * page_count)
     end
+    [name, image]
   end
 end
 
-failures = []
-Dir[File.join(CORPUS, "*.process.toml")].sort.each do |path|
-  reference = nil
-  CORES.product(CORES).each do |first, second|
-    begin
-      image = run_scenario(path, first, second)
-      if image
-        reference ||= image
-        raise "final incremental bytes differ across core pairings" unless image == reference
+# Every (scenario, pairing) runs in its own temp directory over its own files, so pairings share no
+# file or lock and can run concurrently. A pairing spends most of its time waiting on the
+# coordinators' real 1 s lease probe, so a serial run is mostly sleep. Results print in corpus order
+# whatever the completion order; JED_PROCESS_JOBS=1 runs serially.
+JOBS = [Integer(ENV.fetch("JED_PROCESS_JOBS", "8")), 1].max
+
+jobs = Dir[File.join(CORPUS, "*.process.toml")].sort.flat_map do |path|
+  CORES.product(CORES).map { |first, second| { path: path, first: first, second: second } }
+end
+queue = Queue.new
+jobs.each { |job| queue << job }
+queue.close
+Array.new(JOBS) do
+  Thread.new do
+    while (job = queue.pop)
+      begin
+        job[:name], job[:image] = run_scenario(job[:path], job[:first], job[:second])
+      rescue => error
+        job[:error] = error
       end
-    rescue => error
-      warn "FAIL #{File.basename(path)} #{first}->#{second}: #{error.message}"
-      failures << [path, first, second]
     end
+  end
+end.each(&:join)
+
+failures = []
+references = {}
+jobs.each do |job|
+  pairing = "#{job[:first]}->#{job[:second]}"
+  error = job[:error]&.message
+  if error.nil? && job[:image]
+    reference = (references[job[:path]] ||= job[:image])
+    error = "final incremental bytes differ across core pairings" unless job[:image] == reference
+  end
+  if error
+    warn "FAIL #{File.basename(job[:path])} #{pairing}: #{error}"
+    failures << job
+  else
+    puts "PASS #{job[:name]} #{pairing}"
   end
 end
 

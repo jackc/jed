@@ -324,17 +324,22 @@ impl FileCoordinator {
         let inner = Arc::clone(&self.inner);
         *slot = Some(thread::spawn(move || {
             loop {
-                let guard = inner.wake_mu.lock().expect("probe wake lock poisoned");
-                let (_guard, wait) = inner
-                    .wake
-                    .wait_timeout_while(guard, POLL_INTERVAL, |_| {
-                        !inner.stop.load(Ordering::Acquire)
-                    })
-                    .expect("probe wake lock poisoned");
+                // Release the wait mutex before the callback: Drop takes it to publish `stop`, and
+                // may run on this thread when the callback releases the last handle.
+                let timed_out = {
+                    let guard = inner.wake_mu.lock().expect("probe wake lock poisoned");
+                    let (_guard, wait) = inner
+                        .wake
+                        .wait_timeout_while(guard, POLL_INTERVAL, |_| {
+                            !inner.stop.load(Ordering::Acquire)
+                        })
+                        .expect("probe wake lock poisoned");
+                    wait.timed_out()
+                };
                 if inner.stop.load(Ordering::Acquire) {
                     break;
                 }
-                if wait.timed_out() {
+                if timed_out {
                     callback();
                 }
             }
@@ -344,7 +349,13 @@ impl FileCoordinator {
 
 impl Drop for FileCoordinator {
     fn drop(&mut self) {
-        self.inner.stop.store(true, Ordering::Release);
+        // Publish `stop` under the probe's wait mutex: set without it, the store + notify could land
+        // between the probe's predicate check and its park, losing the wakeup and stalling this
+        // join for a full POLL_INTERVAL.
+        {
+            let _guard = self.inner.wake_mu.lock().expect("probe wake lock poisoned");
+            self.inner.stop.store(true, Ordering::Release);
+        }
         self.inner.wake.notify_all();
         if let Some(handle) = self.probe.lock().expect("probe lock poisoned").take() {
             if handle.thread().id() != thread::current().id() {

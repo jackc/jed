@@ -404,7 +404,9 @@ cores interpreting one bundle. A `.process.toml` scenario declares named actors 
 `node`), one temporary database path, and an explicit sequence of commands and barriers. Each core
 supplies a small test-only actor binary that accepts create/open/begin/query/commit/rollback/close and
 named fault-hook commands over stdin and returns framed results over stdout. The shared Ruby driver
-owns scheduling, deadlines, process kill, and transcript comparison.
+owns scheduling, deadlines, process kill, and transcript comparison. Each (scenario, pairing) run
+uses its own temporary directory, so the driver runs pairings concurrently (`JED_PROCESS_JOBS`,
+default 8) and reports them in corpus order; ordering *within* a scenario is unchanged.
 
 A scenario may specify `fixture = "fileformat/fixtures/<name>.jed"` to seed the shared
 file from an independently authored recovery image before actors open it. With
