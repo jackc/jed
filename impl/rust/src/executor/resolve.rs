@@ -166,7 +166,25 @@ pub(crate) fn resolve_binary(
             // Resolve the operands (a literal adapts to its sibling; text literals stay
             // text), then require they be comparable — a mixed integer/text pair is 42804.
             // The runtime comparison (eq3/lt3/gt3) dispatches on the value variants.
-            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
+            // `ROW(a, b) op (SELECT x, y …)` — a row constructor compared with a subquery is a
+            // ROW-VALUED subquery (grammar.md §26): the body must have exactly as many columns as the
+            // row, and its single row compares as an anonymous composite. Only this direction — a
+            // subquery on the left stays a scalar subquery (42601 for >1 column), like PostgreSQL.
+            let (rl, lt, rr, rt) = match (lhs, rhs) {
+                (Expr::Row(items), Expr::ScalarSubquery(q)) => {
+                    let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
+                    let (plan, rt) = plan_row_subquery(scope, q, items.len(), params)?;
+                    let rr = RExpr::Subquery {
+                        plan: Box::new(plan),
+                        kind: SubqueryKind::Scalar,
+                        lhs: None,
+                        negated: false,
+                        row_valued: true,
+                    };
+                    (rl, lt, rr, rt)
+                }
+                _ => resolve_operand_pair(scope, lhs, rhs, agg, params)?,
+            };
             classify_comparable(&lt, &rt)?;
             // A mixed-width float comparison promotes the f32 side to f64 first (the
             // implicit cast — spec/design/float.md §2/§3), so the runtime compare sees one width.
@@ -1276,6 +1294,7 @@ pub(crate) fn resolve_quantified(
             all,
             lhs: Box::new(rl),
             array: Box::new(ra),
+            row_wise: false,
         },
         ResolvedType::Bool,
     ))

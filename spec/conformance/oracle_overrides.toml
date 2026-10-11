@@ -356,6 +356,19 @@ file = "types/composite.test"
 sql = "SELECT ROW(1, 2) = ROW(1, 2, 3)"
 reason = "jed: comparing rows of different sizes is 42804 (datatype_mismatch — the comparison gate, composite.md §5). PostgreSQL raises 42601 (\"unequal number of entries in row expressions\"). A code-only divergence; both reject."
 
+# A row-valued subquery's rows compare through the same composite gate (grammar.md §26), so an
+# incomparable field pair in the comparison / IN forms is jed's 42804. (The ANY/ALL form keeps the
+# quantifier's 42883 posture and agrees with PG.)
+[[override]]
+file = "subquery/row_valued.test"
+sql = "SELECT ROW(1, 2) = (SELECT true, 2)"
+reason = "jed: a row-valued subquery compares as an anonymous composite, so an incomparable field pair (i64 vs boolean) is 42804 (datatype_mismatch — the composite comparison gate, composite.md §5). PostgreSQL expands the row comparison per field and raises 42883 (no `integer = boolean` operator). A code-only divergence; both reject."
+
+[[override]]
+file = "subquery/row_valued.test"
+sql = "SELECT ROW(1, 2) IN (SELECT true, 2)"
+reason = "jed: a row-valued IN subquery compares each body row as an anonymous composite, so an incomparable field pair (i64 vs boolean) is 42804 (datatype_mismatch — the same gate a single-column IN subquery uses, composite.md §5). PostgreSQL raises 42883 (no `integer = boolean` operator). A code-only divergence; both reject."
+
 # (Nested WITH has since landed — spec/design/cte.md §7 — so jed now accepts it like PostgreSQL; the
 # former cte/errors.test + subquery/derived.test override entries were removed with the feature.)
 

@@ -68,6 +68,10 @@ type parser struct {
 	// per AST level descended (deepen), restored on the way back up; left stale on the error path
 	// because a depth error aborts the whole parse.
 	depth int
+	// bareRowEnd is the token position just past the `)` of the most recent bare `(a, b, …)` row
+	// constructor (0 = none). A bare row is not a parenthesized base, so parsePostfix refuses
+	// `.field` on it (PostgreSQL: `(1,2).f1` is a syntax error, `((1,2)).f1` is field access).
+	bareRowEnd int
 }
 
 // NewParser builds a parser over the given tokens.
@@ -4878,6 +4882,9 @@ func (p *parser) parsePostfix() (exprNode, error) {
 	if err != nil {
 		return exprNode{}, err
 	}
+	if p.pos == p.bareRowEnd {
+		fieldAccessible = false
+	}
 	for {
 		// each postfix `::`/`[…]`/`.field`/COLLATE wraps the base in one more AST level; deepen only
 		// when a postfix actually follows (not on the terminating non-postfix token). COLLATE shares
@@ -5028,6 +5035,25 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err != nil {
 			return exprNode{}, err
 		}
+		// `(a, b, …)` — the bare row constructor (composite.md §1), PostgreSQL's implicit `ROW`
+		// spelling: two or more comma-separated expressions in parentheses. Identical to
+		// `ROW(a, b, …)`; a single parenthesized expression stays a grouping.
+		if p.peek().Kind == tokComma {
+			items := []exprNode{e}
+			for p.peek().Kind == tokComma {
+				p.advance()
+				next, err := p.parseExpr()
+				if err != nil {
+					return exprNode{}, err
+				}
+				items = append(items, next)
+			}
+			if err := p.expect(tokRParen); err != nil {
+				return exprNode{}, err
+			}
+			p.bareRowEnd = p.pos
+			return exprNode{Kind: exprRow, RowItems: items}, nil
+		}
 		if err := p.expect(tokRParen); err != nil {
 			return exprNode{}, err
 		}
@@ -5052,7 +5078,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 	}
 	// `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Recognized when ROW is
 	// immediately followed by `(`, so `row` stays usable as a column / function name otherwise. The
-	// bare `(a, b)` form is deferred (0A000); only the keyword form parses.
+	// bare `(a, b)` form is parsed with the parenthesized expression above.
 	if p.peekKeyword() == "row" && p.peekKindAt(1) == tokLParen {
 		p.advance() // ROW
 		if err := p.expect(tokLParen); err != nil {

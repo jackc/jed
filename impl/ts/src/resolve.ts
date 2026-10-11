@@ -384,6 +384,47 @@ export function planSubquery(scope: Scope, inner: QueryExpr, params: ParamTypes)
   return scope.catalog.planQuery(inner, scope, scope.ctes, params);
 }
 
+// planRowSubquery plans a ROW-VALUED subquery (grammar.md §26) whose left operand is a row
+// constructor of `arity` fields: the body must yield exactly `arity` columns (fewer / more is 42601,
+// PostgreSQL's "subquery has too few / too many columns"). Returns the plan and the anonymous
+// composite type its rows take (fields f1…fN over the column types, like a ROW(…) constructor).
+export function planRowSubquery(
+  scope: Scope,
+  inner: QueryExpr,
+  arity: number,
+  params: ParamTypes,
+): { plan: QueryPlan; type: ResolvedType } {
+  const plan = planSubquery(scope, inner, params);
+  const n = plan.columnTypes.length;
+  if (n !== arity) {
+    const which = n < arity ? "few" : "many";
+    throw engineError("syntax_error", `subquery has too ${which} columns`);
+  }
+  const fields = plan.columnTypes.map((type, i) => ({ name: "f" + (i + 1), type }));
+  return { plan, type: { kind: "composite", name: null, fields } };
+}
+
+// planMembershipSubquery plans the body of an IN / ANY / ALL subquery, returning the plan, the
+// element type each body row contributes, and whether it is ROW-VALUED. A row-constructor `lhs`
+// makes it row-valued (planRowSubquery); any other `lhs` needs exactly one body column (42601
+// otherwise).
+function planMembershipSubquery(
+  scope: Scope,
+  lhs: Expr,
+  inner: QueryExpr,
+  params: ParamTypes,
+): { plan: QueryPlan; elem: ResolvedType; rowValued: boolean } {
+  if (lhs.kind === "row") {
+    const r = planRowSubquery(scope, inner, lhs.fields.length, params);
+    return { plan: r.plan, elem: r.type, rowValued: true };
+  }
+  const plan = planSubquery(scope, inner, params);
+  if (plan.columnTypes.length !== 1) {
+    throw engineError("syntax_error", "subquery has too many columns");
+  }
+  return { plan, elem: plan.columnTypes[0]!, rowValued: false };
+}
+
 // dateClockLiteral resolves a date-context string literal naming one of the special values beyond
 // ±infinity (date.md §6): 'epoch' folds to the constant 1970-01-01 like any date literal, while
 // the CLOCK-RELATIVE words 'today' / 'now' / 'tomorrow' / 'yesterday' become the STABLE dateClock
@@ -830,6 +871,7 @@ export function resolve(
           subKind: "scalar",
           lhs: null,
           negated: false,
+          rowValued: false,
         },
         type: plan.columnTypes[0]!,
       };
@@ -845,6 +887,7 @@ export function resolve(
           subKind: "exists",
           lhs: null,
           negated: false,
+          rowValued: false,
         },
         type: { kind: "bool" },
       };
@@ -852,13 +895,11 @@ export function resolve(
     case "inSubquery": {
       // The LHS is an OUTER expression (resolved in the current scope / agg context); the subquery
       // yields the single membership column. The test is `lhs = element`, so the pair must be
-      // comparable (42804), exactly like a literal IN.
+      // comparable (42804), exactly like a literal IN. A row-constructor LHS makes it ROW-VALUED: N
+      // body columns, each row one anonymous composite element.
       const { node: lhs, type: lt } = resolve(scope, e.lhs, null, ag, params);
-      const plan = planSubquery(scope, e.query, params);
-      if (plan.columnTypes.length !== 1) {
-        throw engineError("syntax_error", "subquery has too many columns");
-      }
-      classifyComparable(lt, plan.columnTypes[0]!);
+      const { plan, elem, rowValued } = planMembershipSubquery(scope, e.lhs, e.query, params);
+      classifyComparable(lt, elem);
       return {
         node: {
           kind: "subquery",
@@ -866,6 +907,7 @@ export function resolve(
           subKind: "in",
           lhs,
           negated: e.negated,
+          rowValued,
         },
         type: { kind: "bool" },
       };
@@ -876,16 +918,13 @@ export function resolve(
       // column (42601), and require comparability — reporting operator-not-found (42883) the way the
       // array quantifier does (§11.3), not the plain 42804. No 21000 cardinality limit.
       const { node: lhs, type: lt } = resolve(scope, e.lhs, null, ag, params);
-      const plan = planSubquery(scope, e.query, params);
-      if (plan.columnTypes.length !== 1) {
-        throw engineError("syntax_error", "subquery has too many columns");
-      }
+      const { plan, elem, rowValued } = planMembershipSubquery(scope, e.lhs, e.query, params);
       try {
-        classifyComparable(lt, plan.columnTypes[0]!);
+        classifyComparable(lt, elem);
       } catch {
         throw engineError(
           "undefined_function",
-          `operator does not exist: ${rtName(lt)} ${binaryOpSymbol(e.op)} ${rtName(plan.columnTypes[0]!)}`,
+          `operator does not exist: ${rtName(lt)} ${binaryOpSymbol(e.op)} ${rtName(elem)}`,
         );
       }
       return {
@@ -895,6 +934,7 @@ export function resolve(
           subKind: "quantified",
           lhs,
           negated: false,
+          rowValued,
           op: e.op,
           all: e.all,
         },
@@ -2027,7 +2067,27 @@ export function resolveBinary(
       // operands (a literal adapts to its sibling; text literals stay text), then require
       // they be comparable — a mixed integer/text pair is 42804. The runtime comparison
       // (eq3/lt3/gt3) dispatches on the value kinds.
-      const p = resolveOperandPair(scope, lhs, rhs, ag, params);
+      //
+      // `ROW(a, b) op (SELECT x, y …)` — a row constructor compared with a subquery is a ROW-VALUED
+      // subquery (grammar.md §26): the body must have exactly as many columns as the row, and its
+      // single row compares as an anonymous composite. Only this direction — a subquery on the left
+      // stays a scalar subquery (42601 for >1 column), like PostgreSQL.
+      let p: { rl: RExpr; lt: ResolvedType; rr: RExpr; rt: ResolvedType };
+      if (lhs.kind === "row" && rhs.kind === "scalarSubquery") {
+        const l = resolve(scope, lhs, null, ag, params);
+        const r = planRowSubquery(scope, rhs.query, lhs.fields.length, params);
+        const rr: RExpr = {
+          kind: "subquery",
+          plan: r.plan,
+          subKind: "scalar",
+          lhs: null,
+          negated: false,
+          rowValued: true,
+        };
+        p = { rl: l.node, lt: l.type, rr, rt: r.type };
+      } else {
+        p = resolveOperandPair(scope, lhs, rhs, ag, params);
+      }
       classifyComparable(p.lt, p.rt);
       // A mixed-width float comparison promotes the narrower operand to f64 (float.md §3), so
       // the runtime eq3/lt3/gt3 see one width (they require both sides the same float kind).
@@ -3098,7 +3158,7 @@ export function resolveQuantified(
     );
   }
   return {
-    node: { kind: "quantified", op, all, lhs: rl.node, array: ra.node },
+    node: { kind: "quantified", op, all, lhs: rl.node, array: ra.node, rowWise: false },
     type: { kind: "bool" },
   };
 }

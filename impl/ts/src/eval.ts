@@ -2101,7 +2101,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           );
         }
         // 0 rows -> NULL (the static type was settled at resolve).
-        out = r.rows.length === 0 ? nullValue() : r.rows[0]![0]!;
+        out = r.rows.length === 0 ? nullValue() : subqueryRowValue(r.rows[0]!, e.rowValued);
       } else if (e.subKind === "exists") {
         // EXISTS ignores the select list entirely and is never NULL.
         out = { kind: "bool", value: r.rows.length > 0 !== e.negated };
@@ -2109,12 +2109,12 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // A correlated quantified subquery (array-functions.md §11.6): gather the body's single
         // column into an array and run the SAME 3VL fold as the array form.
         const lv = evalExpr(e.lhs!, row, env, m);
-        const elements = r.rows.map((rr) => rr[0]!);
-        out = quantifiedMembership(e.op!, e.all!, lv, arrayValue(elements), m);
+        const elements = r.rows.map((rr) => subqueryRowValue(rr, e.rowValued));
+        out = quantifiedMembership(e.op!, e.all!, e.rowValued, lv, arrayValue(elements), m);
       } else {
         // in
         const lv = evalExpr(e.lhs!, row, env, m);
-        const list = r.rows.map((rr) => rr[0]!);
+        const list = r.rows.map((rr) => subqueryRowValue(rr, e.rowValued));
         out = inMembership(lv, list, e.negated, m);
       }
       m.releaseQuery(held);
@@ -2132,9 +2132,15 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       m.charge(COSTS.operatorEval);
       const lv = evalExpr(e.lhs, row, env, m);
       const av = evalExpr(e.array, row, env, m);
-      return quantifiedMembership(e.op, e.all, lv, av, m);
+      return quantifiedMembership(e.op, e.all, e.rowWise, lv, av, m);
     }
   }
+}
+
+// subqueryRowValue is the value one subquery body row contributes (§26): its single column, or —
+// for a ROW-VALUED subquery — all of its columns packaged as one anonymous composite.
+export function subqueryRowValue(row: Value[], rowValued: boolean): Value {
+  return rowValued ? compositeValue(row) : row[0]!;
 }
 
 // quantifiedMembership is the three-valued membership fold for `lhs op ANY/ALL(array)`
@@ -2144,9 +2150,13 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
 // FALSE) and ALL (all=true) the AND-fold (FALSE if any is FALSE, else NULL if any is NULL, else TRUE;
 // empty -> TRUE). Each element comparison charges one operator_eval (+ size-scaled decimal_work),
 // exactly like inMembership, so max_cost bounds the walk (54P01).
+//
+// `rowWise` is the folded ROW-VALUED subquery form (grammar.md §26): each element compares by the
+// row-constructor 3VL (rowCmp3) rather than quantifiedCmp3's composite total order.
 export function quantifiedMembership(
   op: BinaryOp,
   all: boolean,
+  rowWise: boolean,
   lv: Value,
   av: Value,
   m: Meter,
@@ -2158,7 +2168,7 @@ export function quantifiedMembership(
     m.charge(COSTS.operatorEval);
     m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(lv, e) - 1));
     m.guard();
-    const t = quantifiedCmp3(op, lv, e);
+    const t = rowWise ? rowCmp3(op, lv, e) : quantifiedCmp3(op, lv, e);
     if (t === "true") {
       // ANY short-circuits TRUE; ALL keeps going (TRUE is its neutral element).
       if (!all) return { kind: "bool", value: true };
@@ -2172,6 +2182,26 @@ export function quantifiedMembership(
   // Drained without a short-circuit: a NULL seen -> UNKNOWN; else the quantifier's identity (ALL ->
   // TRUE, ANY -> FALSE — also the empty-array result).
   return anyNull ? nullValue() : { kind: "bool", value: all };
+}
+
+// rowCmp3 is the row-constructor three-valued comparison `x op e` (composite.md §5): the same
+// eq3/lt3/gt3 decomposition the "compare" node evaluates, so a NULL field at the deciding position
+// is UNKNOWN (PostgreSQL's row comparison against a subquery row).
+export function rowCmp3(op: BinaryOp, x: Value, e: Value): ThreeValued {
+  switch (op) {
+    case "eq":
+      return eq3(x, e);
+    case "ne":
+      return not3(eq3(x, e));
+    case "lt":
+      return lt3(x, e);
+    case "gt":
+      return gt3(x, e);
+    case "le":
+      return or3(lt3(x, e), eq3(x, e));
+    default: // ge
+      return or3(gt3(x, e), eq3(x, e));
+  }
 }
 
 // quantifiedCmp3 is the per-element three-valued comparison `lhs op e` for a quantified node,

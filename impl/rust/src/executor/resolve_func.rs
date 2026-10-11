@@ -2120,6 +2120,7 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
             all,
             lhs,
             array,
+            ..
         } => format!(
             "{} {} {}({})",
             render_rexpr(lhs),
@@ -3142,6 +3143,59 @@ pub(crate) fn resolve_field_of(
 /// defaults such a `$N` to text — grammar.md §26). The inner query is resolved ONCE, with `scope`
 /// as its parent, so correlated references become `OuterColumn` and errors fire even over an
 /// empty outer.
+/// Plan a ROW-VALUED subquery (grammar.md §26) whose left operand is a row constructor of `arity`
+/// fields: the body must yield exactly `arity` columns (fewer / more is 42601, PostgreSQL's "subquery
+/// has too few / too many columns"). Returns the plan and the anonymous composite type its rows take
+/// (fields `f1…fN` over the column types, like a `ROW(…)` constructor).
+pub(crate) fn plan_row_subquery(
+    scope: &Scope,
+    inner: &QueryExpr,
+    arity: usize,
+    params: &mut ParamTypes,
+) -> Result<(QueryPlan, ResolvedType)> {
+    let plan = plan_subquery(scope, inner, params)?;
+    let n = plan.column_types().len();
+    if n != arity {
+        let which = if n < arity { "few" } else { "many" };
+        return Err(EngineError::new(
+            SqlState::SyntaxError,
+            format!("subquery has too {which} columns"),
+        ));
+    }
+    let fields = plan
+        .column_types()
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| (format!("f{}", i + 1), ty.clone()))
+        .collect();
+    let ty = ResolvedType::Composite(Box::new(CompositeRType { name: None, fields }));
+    Ok((plan, ty))
+}
+
+/// Plan the body of an `IN` / `ANY` / `ALL` subquery, returning the plan, the element type each body
+/// row contributes, and whether it is ROW-VALUED. A row-constructor `lhs` makes it row-valued
+/// (`plan_row_subquery`); any other `lhs` needs exactly one body column (42601 otherwise).
+fn plan_membership_subquery(
+    scope: &Scope,
+    lhs: &Expr,
+    inner: &QueryExpr,
+    params: &mut ParamTypes,
+) -> Result<(QueryPlan, ResolvedType, bool)> {
+    if let Expr::Row(items) = lhs {
+        let (plan, ty) = plan_row_subquery(scope, inner, items.len(), params)?;
+        return Ok((plan, ty, true));
+    }
+    let plan = plan_subquery(scope, inner, params)?;
+    if plan.column_types().len() != 1 {
+        return Err(EngineError::new(
+            SqlState::SyntaxError,
+            "subquery has too many columns",
+        ));
+    }
+    let elem = plan.column_types()[0].clone();
+    Ok((plan, elem, false))
+}
+
 pub(crate) fn plan_subquery(
     scope: &Scope,
     inner: &QueryExpr,
@@ -3642,6 +3696,7 @@ pub(crate) fn resolve(
                     kind: SubqueryKind::Scalar,
                     lhs: None,
                     negated: false,
+                    row_valued: false,
                 },
                 out_type,
             ))
@@ -3656,6 +3711,7 @@ pub(crate) fn resolve(
                     kind: SubqueryKind::Exists,
                     lhs: None,
                     negated: false,
+                    row_valued: false,
                 },
                 ResolvedType::Bool,
             ))
@@ -3667,22 +3723,18 @@ pub(crate) fn resolve(
         } => {
             // The LHS is an OUTER expression (resolved in the current scope / agg context); the
             // subquery yields the single membership column. The test is `lhs = element`, so the
-            // pair must be comparable (42804), exactly like a literal IN.
+            // pair must be comparable (42804), exactly like a literal IN. A row-constructor LHS
+            // makes it ROW-VALUED: N body columns, each row one anonymous composite element.
             let (rlhs, lt) = resolve(scope, lhs, None, agg, params)?;
-            let plan = plan_subquery(scope, query, params)?;
-            if plan.column_types().len() != 1 {
-                return Err(EngineError::new(
-                    SqlState::SyntaxError,
-                    "subquery has too many columns",
-                ));
-            }
-            classify_comparable(&lt, &plan.column_types()[0])?;
+            let (plan, elem, row_valued) = plan_membership_subquery(scope, lhs, query, params)?;
+            classify_comparable(&lt, &elem)?;
             Ok((
                 RExpr::Subquery {
                     plan: Box::new(plan),
                     kind: SubqueryKind::In,
                     lhs: Some(Box::new(rlhs)),
                     negated: *negated,
+                    row_valued,
                 },
                 ResolvedType::Bool,
             ))
@@ -4571,21 +4623,15 @@ pub(crate) fn resolve(
             // operator-not-found (42883) the way the array quantifier does (§11.3), not the plain
             // 42804. No 21000 cardinality limit (any row count is a list).
             let (rlhs, lt) = resolve(scope, lhs, None, agg, params)?;
-            let plan = plan_subquery(scope, query, params)?;
-            if plan.column_types().len() != 1 {
-                return Err(EngineError::new(
-                    SqlState::SyntaxError,
-                    "subquery has too many columns",
-                ));
-            }
-            classify_comparable(&lt, &plan.column_types()[0]).map_err(|_| {
+            let (plan, elem, row_valued) = plan_membership_subquery(scope, lhs, query, params)?;
+            classify_comparable(&lt, &elem).map_err(|_| {
                 EngineError::new(
                     SqlState::UndefinedFunction,
                     format!(
                         "operator does not exist: {} {} {}",
                         lt.type_name(),
                         binary_op_symbol(*op),
-                        plan.column_types()[0].type_name()
+                        elem.type_name()
                     ),
                 )
             })?;
@@ -4606,6 +4652,7 @@ pub(crate) fn resolve(
                     kind: SubqueryKind::Quantified { op: cop, all: *all },
                     lhs: Some(Box::new(rlhs)),
                     negated: false,
+                    row_valued,
                 },
                 ResolvedType::Bool,
             ))

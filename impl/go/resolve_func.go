@@ -1524,25 +1524,23 @@ func resolveQuantified(s *scope, q *quantifiedExpr, ag *aggCtx, params *paramTyp
 
 // resolveQuantifiedSubquery resolves `lhs op ANY/ALL ( SELECT … )` (array-functions.md §11.6) — the
 // IN-subquery pattern with the quantifier's comparison + 3VL fold. Resolve the outer lhs, plan the
-// body, require ONE column (42601), and require comparability — reporting operator-not-found (42883)
+// body, require ONE column (42601) — or, for a row-constructor lhs, one column per row field (the
+// ROW-VALUED form, grammar.md §26) — and require comparability — reporting operator-not-found (42883)
 // the way the array quantifier does (§11.3), not the plain 42804. No 21000 cardinality limit.
 func resolveQuantifiedSubquery(s *scope, q *quantifiedSubqueryExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	rlhs, lt, err := resolve(s, q.Lhs, nil, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
-	plan, err := planSubquery(s, q.Query, params)
+	plan, elem, rowValued, err := planMembershipSubquery(s, q.Lhs, q.Query, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
-	if len(plan.columnTypes()) != 1 {
-		return nil, resolvedType{}, newError(SyntaxError, "subquery has too many columns")
-	}
-	if err := classifyComparable(lt, plan.columnTypes()[0]); err != nil {
+	if err := classifyComparable(lt, elem); err != nil {
 		return nil, resolvedType{}, newError(UndefinedFunction,
-			fmt.Sprintf("operator does not exist: %s %s %s", rtName(lt), binaryOpSymbol(q.Op), rtName(plan.columnTypes()[0])))
+			fmt.Sprintf("operator does not exist: %s %s %s", rtName(lt), binaryOpSymbol(q.Op), rtName(elem)))
 	}
-	return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqQuantified, op: q.Op, quantAll: q.All, lhs: rlhs}, resolvedType{kind: rtBool}, nil
+	return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqQuantified, op: q.Op, quantAll: q.All, lhs: rlhs, rowValued: rowValued}, resolvedType{kind: rtBool}, nil
 }
 
 // resolveJSONAccess resolves a jsonb accessor operator (`-> ->> #> #>>`,

@@ -113,6 +113,13 @@ FROM product
 WHERE price > ANY(SELECT price FROM product WHERE category = 'office')
 ORDER BY price;`;
 
+	const rowSubquery = `SELECT name, category, price
+FROM product
+WHERE (category, price) IN (
+  SELECT category, max(price) FROM product GROUP BY category
+)
+ORDER BY name;`;
+
 	const variadicExample = `SELECT num_nulls(1, NULL, 3)                AS spread,
        num_nulls(VARIADIC ARRAY[1, NULL, 3]) AS variadic,
        num_nonnulls(1, NULL, 3)              AS non_nulls;`;
@@ -392,6 +399,20 @@ The operand may also be a **subquery** — `x op ANY/ALL(SELECT …)`, the subqu
 subquery's single column, with the same three-valued fold (and no row-count limit):
 
 <LiveSql {seed} query={quantifiedSubquery} rows={4} />
+
+## Row comparisons and row-valued subqueries
+
+A parenthesized list of two or more expressions — `(a, b)`, the same value as `ROW(a, b)` — is a
+**row**. Rows compare field by field: `=` needs every field equal, and `<` / `>` are decided by the
+first field that differs, so `WHERE (category, id) > ('kitchen', 3)` is a keyset-pagination predicate.
+A `NULL` field makes the comparison `NULL` when it is the field that decides.
+
+A row on the left of a comparison, `IN`, or `ANY` / `ALL` makes the subquery on the right
+**row-valued**: it must return exactly as many columns as the row has fields (otherwise `42601`), and
+each of its rows is compared as a row. The single-row comparison `(a, b) = (SELECT x, y …)` still
+requires at most one row (`21000`); `IN`, `ANY`, and `ALL` take any number:
+
+<LiveSql {seed} query={rowSubquery} rows={4} />
 
 ## Variadic functions (`VARIADIC`)
 

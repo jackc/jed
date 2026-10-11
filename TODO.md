@@ -88,12 +88,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ## Relational depth + constraints
 
-- [x] **Subqueries** — uncorrelated scalar, `[NOT] IN (SELECT …)`, `[NOT] EXISTS`, correlated, subqueries in UPDATE/DELETE, `$N` inside a subquery, derived tables, a `VALUES` body, `LATERAL`, `x op ANY/ALL(SELECT …)`. → [grammar.md §26/§42/§44](spec/design/grammar.md)
+- [x] **Subqueries** — uncorrelated scalar, `[NOT] IN (SELECT …)`, `[NOT] EXISTS`, correlated, subqueries in UPDATE/DELETE and `INSERT ... VALUES` slots, `$N` inside a subquery, derived tables, a `VALUES` body, `LATERAL`, `x op ANY/ALL(SELECT …)`, **row-valued** subqueries (`(a, b) op | IN | op ANY/ALL (SELECT x, y …)`, with the bare `(a, b)` row constructor). → [grammar.md §26/§42/§44](spec/design/grammar.md)
   - [ ] _follow-on:_ a correlated `GROUP BY` key (`0A000`, degenerate). Correlated `ORDER BY` keys have landed as `query.order_by_correlated`.
   - [x] _follow-on:_ a **parenthesized-join FROM** (`FROM (a JOIN b ON …) [AS g]`) — unaliased groups keep their inner labels visible (chain-leading groups splice into the chain; right-hand groups plan as inline derived bodies), aliased groups are `(SELECT * FROM <join>) AS g`. → [grammar.md §15](spec/design/grammar.md)
     - [ ] _narrowing:_ a `LATERAL` item inside a right-hand group referencing relations outside it (42P01; PG allows); redundant parentheses around a derived subquery `((SELECT …)) AS s` (42601).
   - [ ] _follow-on:_ a trailing **`ORDER BY`/`LIMIT` on a VALUES body**.
-  - [ ] **Subqueries — remaining seams:** **row-valued** subqueries. (Subqueries in an `INSERT ... VALUES` slot landed with general VALUES expressions — [grammar.md §16](spec/design/grammar.md).) _(size: S)_
 - [x] **Set operations — `UNION [ALL]`, `INTERSECT [ALL]`, `EXCEPT [ALL]`** — precedence tree (INTERSECT binds tighter), full per-column type unification, NULL-safe multiset semantics, trailing ORDER BY by name/ordinal. → [grammar.md §25](spec/design/grammar.md)
   - [ ] _follow-on:_ parenthesized operands `(SELECT …) UNION …`; ORDER BY/LIMIT inside an operand; a set op in an `INSERT … SELECT` source.
 - [x] **Common table expressions (`WITH`)** — named derived tables (PG hybrid inline/materialize), `WITH RECURSIVE`, data-modifying (writable) CTEs, nested `WITH`. → [cte.md](spec/design/cte.md), [recursive-cte.md](spec/design/recursive-cte.md), [writable-cte.md](spec/design/writable-cte.md)

@@ -2645,6 +2645,7 @@ where
             all: false,
             lhs,
             array,
+            ..
         } if is_column(array, col_global) && query_ok(lhs) => {
             Some((GinStrategy::Member, lhs.as_ref()))
         }

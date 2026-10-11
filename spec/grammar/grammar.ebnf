@@ -999,7 +999,13 @@ subscript      ::= "[" ( a_expr [ ":" [ a_expr ] ] | ":" [ a_expr ] ) "]"
  * "(" query_expr ")" (../design/grammar.md §26) — disambiguated by a leading "SELECT" (or a nested "WITH", cte.md §7) after the
  * "(". "EXISTS" "(" query_expr ")" is the existence predicate. Both subquery forms (and the
  * IN-subquery above) are UNCORRELATED this slice: a reference to an outer-query column, or a bind
- * parameter "$N", inside the subquery is a 0A000 (../design/grammar.md §26). */
+ * parameter "$N", inside the subquery is a 0A000 (../design/grammar.md §26).
+ *   ROW CONSTRUCTORS (../design/composite.md §1): "ROW" "(" … ")" (zero or more fields; "ROW" is
+ * recognized only when "(" follows) and the BARE form — two or more comma-separated expressions in
+ * parentheses, "(a, b)" — build the same anonymous composite. A single parenthesized expression stays
+ * a grouping. The bare row is not a field-access base ("(1, 2).f1" is 42601; "((1, 2)).f1" selects).
+ * A row constructor on the LEFT of a comparison / IN / ANY / ALL makes a subquery on the right
+ * ROW-VALUED (../design/grammar.md §26). */
 primary        ::= number
                  | string
                  | "TRUE" | "FALSE"
@@ -1015,7 +1021,8 @@ primary        ::= number
                  | greatest_least_expr
                  | function_call
                  | "EXISTS" "(" subquery_expr ")"
-                 | "(" ( subquery_expr | expr ) ")"
+                 | "ROW" "(" ( expr ( "," expr )* )? ")"
+                 | "(" ( subquery_expr | expr ( "," expr )* ) ")"
                  | column_ref
 
 /* CURRENT_TIMESTAMP is the SQL-standard BARE keyword (no parens) for the transaction/statement

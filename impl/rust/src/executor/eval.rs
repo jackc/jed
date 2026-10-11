@@ -2847,6 +2847,7 @@ impl RExpr {
                 kind,
                 lhs,
                 negated,
+                row_valued,
             } => {
                 m.charge(COSTS.operator_eval);
                 let mut child: Vec<&[Value]> = env.outer.to_vec();
@@ -2871,7 +2872,7 @@ impl RExpr {
                         Ok(r.rows
                             .into_iter()
                             .next()
-                            .map(|mut row| row.swap_remove(0))
+                            .map(|row| subquery_row_value(row, *row_valued))
                             .unwrap_or(Value::Null))
                     }
                     // EXISTS ignores the select list entirely and is never NULL.
@@ -2884,7 +2885,7 @@ impl RExpr {
                         let list: Vec<Value> = r
                             .rows
                             .into_iter()
-                            .map(|mut row| row.swap_remove(0))
+                            .map(|row| subquery_row_value(row, *row_valued))
                             .collect();
                         in_membership(&lv, &list, *negated, m)
                     }
@@ -2898,7 +2899,7 @@ impl RExpr {
                         let elements: Vec<Value> = r
                             .rows
                             .into_iter()
-                            .map(|mut row| row.swap_remove(0))
+                            .map(|row| subquery_row_value(row, *row_valued))
                             .collect();
                         let arr = if elements.is_empty() {
                             ArrayVal::empty()
@@ -2909,7 +2910,7 @@ impl RExpr {
                                 elements,
                             }
                         };
-                        quantified_membership(*op, *all, &lv, &Value::Array(arr), m)
+                        quantified_membership(*op, *all, *row_valued, &lv, &Value::Array(arr), m)
                     }
                 };
                 m.release_query(held);
@@ -2928,11 +2929,12 @@ impl RExpr {
                 all,
                 lhs,
                 array,
+                row_wise,
             } => {
                 m.charge(COSTS.operator_eval);
                 let lv = lhs.eval(row, env, m)?;
                 let av = array.eval(row, env, m)?;
-                quantified_membership(*op, *all, &lv, &av, m)
+                quantified_membership(*op, *all, *row_wise, &lv, &av, m)
             }
         }
     }

@@ -1361,6 +1361,7 @@ impl Engine {
                 kind,
                 lhs,
                 negated,
+                row_valued,
             } = taken
             else {
                 unreachable!("guarded by matches! above")
@@ -1379,7 +1380,7 @@ impl Engine {
                         .rows
                         .into_iter()
                         .next()
-                        .map(|mut row| row.swap_remove(0))
+                        .map(|row| subquery_row_value(row, row_valued))
                         .unwrap_or(Value::Null);
                     value_to_rexpr(&value)
                 }
@@ -1388,7 +1389,7 @@ impl Engine {
                     let list: Vec<Value> = r
                         .rows
                         .into_iter()
-                        .map(|mut row| row.swap_remove(0))
+                        .map(|row| subquery_row_value(row, row_valued))
                         .collect();
                     RExpr::InValues {
                         lhs: lhs.expect("an IN subquery carries its resolved lhs"),
@@ -1403,7 +1404,7 @@ impl Engine {
                     let elements: Vec<Value> = r
                         .rows
                         .into_iter()
-                        .map(|mut row| row.swap_remove(0))
+                        .map(|row| subquery_row_value(row, row_valued))
                         .collect();
                     let arr = if elements.is_empty() {
                         ArrayVal::empty()
@@ -1419,6 +1420,7 @@ impl Engine {
                         all,
                         lhs: lhs.expect("a quantified subquery carries its resolved lhs"),
                         array: Box::new(RExpr::ConstArray(Box::new(arr))),
+                        row_wise: row_valued,
                     }
                 }
             };

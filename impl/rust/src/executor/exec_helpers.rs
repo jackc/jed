@@ -904,6 +904,16 @@ impl crate::cursor::RowStream for DeferredResult {
     }
 }
 
+/// The value one subquery body row contributes (§26): its single column, or — for a ROW-VALUED
+/// subquery — all of its columns packaged as one anonymous composite.
+pub(crate) fn subquery_row_value(mut row: Vec<Value>, row_valued: bool) -> Value {
+    if row_valued {
+        Value::Composite(row)
+    } else {
+        row.swap_remove(0)
+    }
+}
+
 /// Build the constant `RExpr` for a folded uncorrelated-subquery value (§26). The static type
 /// was settled at resolve, so a NULL value here is just `ConstNull`.
 pub(crate) fn value_to_rexpr(v: &Value) -> RExpr {

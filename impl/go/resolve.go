@@ -853,6 +853,52 @@ func planSubquery(s *scope, inner queryExpr, params *paramTypes) (queryPlan, err
 	return s.catalog.planQuery(inner, s, s.ctes, params)
 }
 
+// planRowSubquery plans a ROW-VALUED subquery (grammar.md §26) whose left operand is a row
+// constructor of `arity` fields: the body must yield exactly `arity` columns (fewer / more is 42601,
+// PostgreSQL's "subquery has too few / too many columns"). Returns the plan and the anonymous
+// composite type its rows take (fields f1…fN over the column types, like a ROW(…) constructor).
+func planRowSubquery(s *scope, inner queryExpr, arity int, params *paramTypes) (queryPlan, resolvedType, error) {
+	plan, err := planSubquery(s, inner, params)
+	if err != nil {
+		return queryPlan{}, resolvedType{}, err
+	}
+	colTypes := plan.columnTypes()
+	if len(colTypes) != arity {
+		which := "many"
+		if len(colTypes) < arity {
+			which = "few"
+		}
+		return queryPlan{}, resolvedType{}, newError(SyntaxError, fmt.Sprintf("subquery has too %s columns", which))
+	}
+	fields := make([]compositeRField, len(colTypes))
+	for i, ty := range colTypes {
+		fields[i] = compositeRField{name: fmt.Sprintf("f%d", i+1), ty: ty}
+	}
+	return plan, resolvedType{kind: rtComposite, comp: &compositeRType{fields: fields}}, nil
+}
+
+// planMembershipSubquery plans the body of an IN / ANY / ALL subquery, returning the plan, the
+// element type each body row contributes, and whether it is ROW-VALUED. A row-constructor `lhs`
+// makes it row-valued (planRowSubquery); any other `lhs` needs exactly one body column (42601
+// otherwise).
+func planMembershipSubquery(s *scope, lhs exprNode, inner queryExpr, params *paramTypes) (queryPlan, resolvedType, bool, error) {
+	if lhs.Kind == exprRow {
+		plan, ty, err := planRowSubquery(s, inner, len(lhs.RowItems), params)
+		if err != nil {
+			return queryPlan{}, resolvedType{}, false, err
+		}
+		return plan, ty, true, nil
+	}
+	plan, err := planSubquery(s, inner, params)
+	if err != nil {
+		return queryPlan{}, resolvedType{}, false, err
+	}
+	if len(plan.columnTypes()) != 1 {
+		return queryPlan{}, resolvedType{}, false, newError(SyntaxError, "subquery has too many columns")
+	}
+	return plan, plan.columnTypes()[0], false, nil
+}
+
 // resolveSubscriptInt resolves one array-subscript bound to an integer rExpr (a literal adapts to
 // int4; a non-integer is 42804). A NULL-typed bound is accepted — it evaluates to a NULL subscript
 // → NULL result (spec/design/array.md §6).
@@ -1288,23 +1334,21 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 	case exprInSubquery:
 		// The LHS is an OUTER expression (resolved in the current scope / agg context); the
 		// subquery yields the single membership column. The test is `lhs = element`, so the pair
-		// must be comparable (42804), exactly like a literal IN.
+		// must be comparable (42804), exactly like a literal IN. A row-constructor LHS makes it
+		// ROW-VALUED: N body columns, each row one anonymous composite element.
 		is := e.InSubquery
 		rlhs, lt, err := resolve(s, is.Lhs, nil, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		plan, err := planSubquery(s, is.Query, params)
+		plan, elem, rowValued, err := planMembershipSubquery(s, is.Lhs, is.Query, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		if len(plan.columnTypes()) != 1 {
-			return nil, resolvedType{}, newError(SyntaxError, "subquery has too many columns")
-		}
-		if err := classifyComparable(lt, plan.columnTypes()[0]); err != nil {
+		if err := classifyComparable(lt, elem); err != nil {
 			return nil, resolvedType{}, err
 		}
-		return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqIn, lhs: rlhs, negated: is.Negated}, resolvedType{kind: rtBool}, nil
+		return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqIn, lhs: rlhs, negated: is.Negated, rowValued: rowValued}, resolvedType{kind: rtBool}, nil
 	case exprCollate:
 		// `expr COLLATE "name"` (spec/design/collation.md §1) — a postfix collation operator. Resolve
 		// the inner expression, require a collatable (text) type (42804, PG-matching), and validate
@@ -2426,9 +2470,30 @@ func resolveBinary(s *scope, b *binaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		// the operands (a literal adapts to its sibling; text literals stay text), then
 		// require they be comparable — a mixed integer/text pair is 42804. The runtime
 		// comparison (Eq3/Lt3/Gt3) dispatches on the value kinds.
-		rl, lt, rr, rt, err := resolveOperandPair(s, b.Lhs, b.Rhs, ag, params)
-		if err != nil {
-			return nil, resolvedType{}, err
+		//
+		// `ROW(a, b) op (SELECT x, y …)` — a row constructor compared with a subquery is a
+		// ROW-VALUED subquery (grammar.md §26): the body must have exactly as many columns as the
+		// row, and its single row compares as an anonymous composite. Only this direction — a
+		// subquery on the left stays a scalar subquery (42601 for >1 column), like PostgreSQL.
+		var rl, rr *rExpr
+		var lt, rt resolvedType
+		var err error
+		if b.Lhs.Kind == exprRow && b.Rhs.Kind == exprScalarSubquery {
+			rl, lt, err = resolve(s, b.Lhs, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			plan, ty, perr := planRowSubquery(s, *b.Rhs.Subquery, len(b.Lhs.RowItems), params)
+			if perr != nil {
+				return nil, resolvedType{}, perr
+			}
+			rr = &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqScalar, rowValued: true}
+			rt = ty
+		} else {
+			rl, lt, rr, rt, err = resolveOperandPair(s, b.Lhs, b.Rhs, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
 		}
 		if err := classifyComparable(lt, rt); err != nil {
 			return nil, resolvedType{}, err

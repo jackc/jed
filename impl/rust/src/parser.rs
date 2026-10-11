@@ -53,6 +53,10 @@ pub struct Parser {
     /// level descended (`deepen`), restored on the way back up; left stale on the error path
     /// because a depth error aborts the whole parse.
     depth: usize,
+    /// The token position just past the `)` of the most recent bare `(a, b, …)` row constructor
+    /// (0 = none). A bare row is not a parenthesized base, so `parse_postfix` refuses `.field` on it
+    /// (PostgreSQL: `(1,2).f1` is a syntax error, `((1,2)).f1` is field access).
+    bare_row_end: usize,
 }
 
 impl Parser {
@@ -61,6 +65,7 @@ impl Parser {
             tokens,
             pos: 0,
             depth: 0,
+            bare_row_end: 0,
         }
     }
 
@@ -4225,6 +4230,9 @@ impl Parser {
         let base = self.depth;
         let mut field_accessible = matches!(self.peek(), Token::LParen);
         let mut expr = self.parse_primary()?;
+        if self.pos == self.bare_row_end {
+            field_accessible = false;
+        }
         loop {
             // each postfix `::`/`[…]`/`.field` wraps the base in one more AST level; deepen only
             // when a postfix actually follows (not on the terminating non-postfix token).
@@ -4357,6 +4365,19 @@ impl Parser {
                 return Ok(Expr::ScalarSubquery(Box::new(q)));
             }
             let e = self.parse_expr()?;
+            // `(a, b, …)` — the bare row constructor (composite.md §1), PostgreSQL's implicit `ROW`
+            // spelling: two or more comma-separated expressions in parentheses. Identical to
+            // `ROW(a, b, …)`; a single parenthesized expression stays a grouping.
+            if matches!(self.peek(), Token::Comma) {
+                let mut fields = vec![e];
+                while matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    fields.push(self.parse_expr()?);
+                }
+                self.expect(&Token::RParen)?;
+                self.bare_row_end = self.pos;
+                return Ok(Expr::Row(fields));
+            }
             self.expect(&Token::RParen)?;
             return Ok(e);
         }
@@ -4422,7 +4443,7 @@ impl Parser {
         }
         // `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Recognized when
         // `ROW` is immediately followed by `(`, so `row` stays usable as a column / function name
-        // otherwise. The bare `(a, b)` form is deferred (`0A000`); only the keyword form parses.
+        // otherwise. The bare `(a, b)` form is parsed with the parenthesized expression above.
         if self.peek_keyword().as_deref() == Some("row") && matches!(self.peek_at(1), Token::LParen)
         {
             self.advance(); // ROW

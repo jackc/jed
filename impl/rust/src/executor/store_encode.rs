@@ -1143,9 +1143,13 @@ pub(crate) fn eval_date_arith(
 /// (all=true) is the AND-fold (FALSE if any is FALSE, else NULL if any is NULL, else TRUE; empty →
 /// TRUE). Each element comparison charges one `operator_eval` (+ size-scaled `decimal_work`),
 /// exactly like `in_membership`, so `max_cost` bounds the walk (54P01, CLAUDE.md §13).
+///
+/// `row_wise` is the folded ROW-VALUED subquery form (grammar.md §26): each element compares by
+/// the row-constructor 3VL (`row_cmp3`) rather than `quantified_cmp3`'s composite total order.
 pub(crate) fn quantified_membership(
     op: CmpOp,
     all: bool,
+    row_wise: bool,
     lv: &Value,
     av: &Value,
     m: &mut Meter,
@@ -1160,7 +1164,12 @@ pub(crate) fn quantified_membership(
         m.charge(COSTS.operator_eval);
         m.charge(COSTS.decimal_work * ((decimal_cmp_work(lv, e) - 1) as i64));
         m.guard()?;
-        match quantified_cmp3(op, lv, e) {
+        let tv = if row_wise {
+            row_cmp3(op, lv, e)
+        } else {
+            quantified_cmp3(op, lv, e)
+        };
+        match tv {
             ThreeValued::True => {
                 // ANY short-circuits TRUE; ALL keeps going (TRUE is its neutral element).
                 if !all {
@@ -1183,6 +1192,20 @@ pub(crate) fn quantified_membership(
     } else {
         Value::Bool(all)
     })
+}
+
+/// The row-constructor three-valued comparison `lhs op e` (composite.md §5): the same
+/// `eq3`/`lt3`/`gt3` decomposition `RExpr::Compare` evaluates, so a NULL field at the deciding
+/// position is UNKNOWN (PostgreSQL's row comparison against a subquery row).
+pub(crate) fn row_cmp3(op: CmpOp, x: &Value, e: &Value) -> ThreeValued {
+    match op {
+        CmpOp::Eq => x.eq3(e),
+        CmpOp::Ne => x.eq3(e).not(),
+        CmpOp::Lt => x.lt3(e),
+        CmpOp::Gt => x.gt3(e),
+        CmpOp::Le => x.lt3(e).or(x.eq3(e)),
+        CmpOp::Ge => x.gt3(e).or(x.eq3(e)),
+    }
 }
 
 /// The per-element three-valued comparison `lhs op e` for a quantified node, normalizing a

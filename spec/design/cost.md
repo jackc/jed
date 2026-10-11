@@ -1383,6 +1383,12 @@ set-operation combine. How many times that operand cost lands depends on correla
 Both are fully deterministic and identical across cores: the same `(query, database)` always
 visits the same outer rows in the same order and runs the subquery the same number of times.
 
+A **row-valued** subquery (grammar.md §26 "Row-valued subqueries" — a row constructor on the left)
+costs exactly as its single-column form: packaging each body row into an anonymous composite is
+unmetered, each per-row comparison is still one `operator_eval`, and the left-hand `ROW(…)` / bare
+`(a, b)` constructor charges its ordinary one `operator_eval` each time it is evaluated (once per
+`IN` / `ANY` / `ALL` node evaluation, once per comparison).
+
 The same accounting applies when the enclosing statement is a **`DELETE` / `UPDATE`** (a
 subquery in its `WHERE`, or an `UPDATE` assignment RHS — grammar.md §26): an uncorrelated
 subquery folds once (operand cost added once, before the scan), and a correlated one re-runs

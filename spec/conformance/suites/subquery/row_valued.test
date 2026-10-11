@@ -1,0 +1,320 @@
+# Row-valued subqueries (spec/design/grammar.md §26 "Row-valued subqueries"): a ROW CONSTRUCTOR on
+# the left of a comparison, [NOT] IN, or op ANY/SOME/ALL makes the subquery row-valued. The body
+# must return exactly as many columns as the row (fewer / more → 42601), and each body row compares
+# as an anonymous composite under the row-constructor 3VL (composite.md §5): `=` is FALSE if any field
+# is FALSE, else NULL if any field is NULL; the ordering operators are decided by the first unequal
+# field, NULL there. The scalar form keeps the 21000 one-row limit (zero rows → NULL); IN / ANY / ALL
+# take any row count (empty → FALSE / TRUE). Only a syntactic row constructor triggers the form —
+# `ROW(…)` or the bare `(a, b, …)` — and only on the LEFT. Verified against the live PostgreSQL 18
+# oracle; cost is jed's deterministic cross-core contract (spec/design/cost.md §3).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.comparison_order, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_in, query.subquery_correlated, query.subquery_quantified, query.subquery_row_valued, types.composite, types.composite_bare_row, expr.in_list, expr.comparison_value, types.i32, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE a (id i32 PRIMARY KEY, x i32, y i32)
+
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, x i32, y i32)
+
+statement ok
+INSERT INTO a VALUES (1, 1, 2), (2, 3, 4), (3, 5, NULL), (4, 7, 8)
+
+statement ok
+INSERT INTO b VALUES (1, 1, 2), (2, 3, 5), (3, 5, 6), (4, NULL, 8)
+
+# --- single-row comparison: ROW(…) op (SELECT …) ---
+
+# The one body row compares as a row: equal / unequal / a NULL deciding field.
+query BBB nosort
+SELECT ROW(1, 2) = (SELECT 1, 2), ROW(1, 2) = (SELECT 1, 3), ROW(1, NULL) = (SELECT 1, 2)
+----
+true
+false
+NULL
+
+# A FALSE field dominates a NULL field, on either side.
+query BB nosort
+SELECT ROW(1, NULL) = (SELECT 2, 2), ROW(1, 2) = (SELECT NULL::i32, 3)
+----
+false
+false
+
+# Zero body rows → the whole row is NULL, so the comparison is NULL.
+query B nosort
+SELECT ROW(1, 2) = (SELECT 1, 2 WHERE false)
+----
+NULL
+
+# More than one body row is a cardinality violation.
+statement error 21000
+SELECT ROW(1, 2) = (SELECT x, y FROM b)
+
+# The ordering operators are lexicographic: the first unequal field decides.
+query BBBB nosort
+SELECT ROW(1, 2) < (SELECT 1, 3), ROW(2, 1) < (SELECT 1, 9), ROW(1, 2) >= (SELECT 1, 2), ROW(1, 2) <> (SELECT 1, 3)
+----
+true
+false
+true
+true
+
+# A NULL in a non-deciding field is never examined; in the deciding field it is NULL.
+query BB nosort
+SELECT ROW(1, NULL) < (SELECT 2, 2), ROW(1, NULL) < (SELECT 1, 2)
+----
+true
+NULL
+
+# The bare `(a, b)` spelling is the same row constructor.
+query I nosort
+SELECT id FROM a WHERE (x, y) = (SELECT x, y FROM b WHERE id = 1)
+----
+1
+
+# A one-field row compares against a one-column body.
+query B nosort
+SELECT ROW(1) = (SELECT 1)
+----
+true
+
+# Field types follow the ordinary comparison rules (an i32 field against an i64 column).
+query B nosort
+SELECT ROW(1, 2) = (SELECT 1::i64, 2::i64)
+----
+true
+
+# Nested rows compare field by field.
+query B nosort
+SELECT ROW(ROW(1, 2), 3) = (SELECT ROW(1, 2), 3)
+----
+true
+
+# Correlated: re-executed per outer row.
+# Correlated: the outer scan reads a (page_read 1 + 4 storage_row_read = 5). Each of the 4 outer rows
+# charges the Compare node (1) + the ROW constructor (1) + the subquery node (1) + the inner run,
+# bounded to a b.id point lookup (page_read 1 + storage_row_read 1 + the b.id = a.id recheck 1 +
+# row_produced 1 = 4) = 7, i.e. 28. Plus 4 row_produced. Total 5 + 28 + 4 = 37.
+# cost: 37
+query IB rowsort
+SELECT id, (x, y) = (SELECT x, y FROM b WHERE b.id = a.id) FROM a
+----
+1
+true
+2
+false
+3
+NULL
+4
+NULL
+
+# --- [NOT] IN (SELECT …) ---
+
+# The uncorrelated body runs once (page_read 1 + 4 storage_row_read + 4 row_produced = 9) and folds to
+# a constant list of 4 rows; the outer scans a (page_read 1 + 4 storage_row_read = 5). Each of the 4
+# outer rows charges the IN node (1) + the ROW constructor (1) + one comparison per list row (4) = 6,
+# i.e. 24. Plus 1 surviving row → row_produced 1. Total 9 + 5 + 24 + 1 = 39.
+# cost: 39
+query I nosort
+SELECT id FROM a WHERE (x, y) IN (SELECT x, y FROM b) ORDER BY id
+----
+1
+
+query I nosort
+SELECT id FROM a WHERE ROW(x, y) IN (SELECT x, y FROM b) ORDER BY id
+----
+1
+
+# NOT IN keeps only the definitely-absent rows: a(5, NULL) = b(5, 6) and a(7, 8) = b(NULL, 8) are
+# both NULL (an equal field plus a NULL field), so only a(3, 4) — FALSE against every b row — is kept.
+query I nosort
+SELECT id FROM a WHERE (x, y) NOT IN (SELECT x, y FROM b) ORDER BY id
+----
+2
+
+query BBB nosort
+SELECT ROW(1, 2) IN (SELECT 1, 2), ROW(1, NULL) IN (SELECT 1, 2), ROW(1, NULL) NOT IN (SELECT 2, 2)
+----
+true
+NULL
+true
+
+query BB nosort
+SELECT ROW(1, 2) IN (SELECT NULL::i32, 2), ROW(1, 2) IN (SELECT NULL::i32, 3)
+----
+NULL
+false
+
+# An empty body: IN is FALSE and NOT IN is TRUE, even for an all-NULL row.
+query BB nosort
+SELECT ROW(1, 2) IN (SELECT 1, 2 WHERE false), ROW(NULL::i32, NULL::i32) NOT IN (SELECT 1, 2 WHERE false)
+----
+false
+true
+
+query B nosort
+SELECT ROW(1, 2::i64) IN (SELECT 1::i64, 2)
+----
+true
+
+# Correlated IN.
+query IB rowsort
+SELECT id, (x, y) IN (SELECT x, y FROM b WHERE b.id <= a.id) FROM a
+----
+1
+true
+2
+false
+3
+NULL
+4
+NULL
+
+# --- op ANY / SOME / ALL (SELECT …) ---
+
+query BBB nosort
+SELECT ROW(1, 2) < ANY (SELECT 1, 3), ROW(1, 2) = ALL (SELECT 1, 2 UNION ALL SELECT 1, 3), ROW(1, 2) <> ALL (SELECT 1, 3 UNION ALL SELECT 2, 2)
+----
+true
+false
+true
+
+# Each body folds once to a constant array: (SELECT 1, 2) produces 1 row (1); the b body reads
+# page_read 1 + 4 storage_row_read + 4 IS NOT NULL evaluations + 3 row_produced = 12. Each folded
+# node charges itself (1) + its ROW constructor (1) + one per row compared: SOME stops at its first
+# TRUE (1 → 3), ALL at its first FALSE, (5,6) the third row (3 → 5). Plus 1 row_produced. Total
+# 1 + 12 + 3 + 5 + 1 = 22.
+# cost: 22
+query BB nosort
+SELECT ROW(1, 2) <= SOME (SELECT 1, 2), ROW(5, 0) > ALL (SELECT x, y FROM b WHERE x IS NOT NULL)
+----
+true
+false
+
+# The per-row comparison is the row-constructor 3VL — a NULL deciding field is UNKNOWN (unlike
+# `= ANY(composite[])`, which uses the composite total order — array-functions.md §13).
+query BBBB nosort
+SELECT ROW(1, NULL) = ANY (SELECT 1, NULL::i32), ROW(1, NULL) = ANY (SELECT 2, NULL::i32), ROW(1, NULL) < ANY (SELECT 2, NULL::i32), ROW(1, NULL) < ALL (SELECT 1, 5)
+----
+NULL
+false
+true
+NULL
+
+query B nosort
+SELECT ROW(1, 2) <> ALL (SELECT NULL::i32, 3)
+----
+true
+
+# An empty body: ANY is FALSE, ALL is TRUE (even for a NULL-field row).
+query BBB nosort
+SELECT ROW(1, 2) = ANY (SELECT 1, 2 WHERE false), ROW(1, 2) = ALL (SELECT 1, 2 WHERE false), ROW(NULL::i32, 2) = ALL (SELECT 1, 2 WHERE false)
+----
+false
+true
+true
+
+# Correlated ANY.
+query IB rowsort
+SELECT id, (x, y) <= ANY (SELECT x, y FROM b WHERE b.id >= a.id) FROM a
+----
+1
+true
+2
+true
+3
+NULL
+4
+NULL
+
+# --- in UPDATE / DELETE ---
+
+statement ok
+UPDATE a SET y = 20 WHERE (x, y) = (SELECT x, y FROM b WHERE id = 1)
+
+statement ok
+DELETE FROM a WHERE (x, y) IN (SELECT x, y - 1 FROM b)
+
+query III nosort
+SELECT id, x, y FROM a ORDER BY id
+----
+1
+1
+20
+3
+5
+NULL
+4
+7
+8
+
+# --- errors ---
+
+# The body must have exactly as many columns as the row.
+statement error 42601
+SELECT ROW(1, 2) = (SELECT 1)
+
+statement error 42601
+SELECT ROW(1, 2) = (SELECT 1, 2, 3)
+
+statement error 42601
+SELECT ROW(1, 2) IN (SELECT 1)
+
+statement error 42601
+SELECT ROW(1, 2) IN (SELECT 1, 2, 3)
+
+statement error 42601
+SELECT ROW(1, 2) = ANY (SELECT 1)
+
+statement error 42601
+SELECT ROW(1, 2) NOT IN (SELECT x, y, id FROM b)
+
+# A row constructor always compares field-wise, so a body yielding one composite column is too few.
+statement error 42601
+SELECT ROW(1, 2) = (SELECT ROW(1, 2))
+
+# A subquery on the LEFT stays a scalar subquery.
+statement error 42601
+SELECT (SELECT 1, 2) = ROW(1, 2)
+
+# Only the six comparison operators make it row-valued.
+statement error 42601
+SELECT ROW(1, 2) IS DISTINCT FROM (SELECT 1, 2)
+
+# An incomparable field pair: the quantified form reports operator-not-found, like PostgreSQL.
+statement error 42883
+SELECT ROW(1, 2) = ANY (SELECT true, 2)
+
+# The comparison and IN forms report jed's 42804 datatype mismatch (oracle_overrides.toml).
+statement error 42804
+SELECT ROW(1, 2) = (SELECT true, 2)
+
+statement error 42804
+SELECT ROW(1, 2) IN (SELECT true, 2)
+
+# --- the bare row constructor (composite.md §1) ---
+
+query T nosort
+SELECT (1, 2)
+----
+(1,2)
+
+query BB nosort
+SELECT (1, 2) IN ((1, 2), (3, 4)), (1, 2) = ROW(1, 2)
+----
+true
+true
+
+# Keyset pagination: a row comparison against a constant row.
+query I nosort
+SELECT id FROM b WHERE (x, y) > (1, 2) ORDER BY id
+----
+2
+3
+
+# A parenthesized row is a field-access base; the bare row itself is not (PG: syntax error).
+query I nosort
+SELECT ((1, 2)).f2
+----
+2
+
+statement error 42601
+SELECT (1, 2).f1

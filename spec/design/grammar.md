@@ -1575,6 +1575,9 @@ subqueries inside its source query.
 - **`x [NOT] IN ( query_expr )`** — membership of `x` in the subquery's single output column.
 - **`[NOT] EXISTS ( query_expr )`** — whether the subquery produces at least one row.
 
+A row constructor on the left of a comparison, `IN`, or `ANY`/`ALL` makes the subquery
+**row-valued** (multi-column) — see [Row-valued subqueries](#row-valued-subqueries).
+
 **Disambiguation.** A `(` that begins a `primary` starts a scalar subquery when the next token
 is `SELECT`, otherwise a parenthesized expression. `IN (` likewise: a leading `SELECT` is the
 IN-subquery, otherwise the §20 value list. `EXISTS` is a keyword prefix taking `( query_expr )`.
@@ -1623,6 +1626,50 @@ subquery's cost, counted **once** (it ran once); the folded constant is a leaf a
 subquery's cost **per outer row** the node evaluates, plus one `operator_eval` for the
 subquery node itself each time — see [cost.md](cost.md) §3.
 
+### Row-valued subqueries
+
+A **row constructor** on the left — `ROW(a, b, …)` or the bare `(a, b, …)` (composite.md §1) — makes
+the subquery **row-valued** in three positions:
+
+```
+row op ( query_expr )                 -- op ∈ = <> < <= > >= (single-row comparison)
+row [NOT] IN ( query_expr )
+row op ANY | SOME | ALL ( query_expr )
+```
+
+- **Arity.** The body must return **exactly** as many columns as the row has fields: fewer is
+  **`42601`** "subquery has too few columns", more is `42601` "subquery has too many columns"
+  (PostgreSQL's messages). A one-field `ROW(x)` takes a one-column body.
+- **Value.** Each body row packages its columns as one **anonymous composite** (fields `f1…fN` over
+  the column types — exactly the type a `ROW(…)` constructor resolves to), so the comparison is the
+  ordinary row comparison of composite.md §5: field types must be pairwise comparable, and the result
+  is the **row-constructor 3VL** — `=` is FALSE if any field is FALSE, else NULL if any field is NULL;
+  `< <= > >=` are decided by the first unequal field (NULL there is NULL).
+- **Cardinality.** The single-row comparison keeps the scalar rules: more than one body row is
+  **`21000`**, zero rows is the NULL row (so the comparison is NULL). `IN` / `ANY` / `ALL` take any
+  row count; an empty body is FALSE (`IN`, `ANY`) / TRUE (`NOT IN`, `ALL`) regardless of the row, as in
+  the single-column forms. The `ANY` / `ALL` per-row comparison is the same row-constructor 3VL —
+  **not** the composite total order the array quantifier applies to composite elements
+  ([array-functions.md §13](array-functions.md)) — matching PostgreSQL (`ROW(1,NULL) = ANY (SELECT 1,
+  NULL)` is NULL).
+- **Only a syntactic row constructor, only on the left.** A composite-valued expression on the left
+  (a composite column, a parenthesized subquery), a subquery on the **left** (`(SELECT 1, 2) = ROW(1,
+  2)`), or any other operator (`IS DISTINCT FROM`) keeps the single-column rule (`42601` "subquery
+  must return only one column"). A row constructor **always** compares field-wise, so `ROW(1, 2) =
+  (SELECT ROW(1, 2))` is `42601` (too few columns) — PostgreSQL's rule.
+- **Errors.** An incomparable field pair is jed's composite gate `42804` for the comparison and `IN`
+  forms (PostgreSQL: `42883`, ledgered) and `42883` for `ANY` / `ALL` (the quantifier's posture, §41).
+- **Evaluation and cost** are the single-column forms' (planned once; uncorrelated folds to a constant
+  row / `IN` list / row-wise constant-array quantifier; correlated re-executes per outer row): packaging
+  a body row is free, and the row constructor on the left charges its ordinary `operator_eval` each
+  time it is evaluated ([cost.md](cost.md) §3).
+
+```sql
+SELECT * FROM orders WHERE (customer, region) IN (SELECT id, home FROM customers WHERE vip)
+UPDATE t SET flag = true WHERE (a, b) = (SELECT x, y FROM u WHERE u.id = t.id)
+SELECT ROW(1, 2) < ALL (SELECT x, y FROM u)
+```
+
 ### Correlated subqueries
 
 A **correlated** subquery references a column of an enclosing query. Resolution uses a **scope
@@ -1670,7 +1717,8 @@ real cause (the type can't be determined) and is consistent with its strict, no-
 - **Derived tables** — `FROM ( query_expr ) AS t` (a subquery as a relation) landed as its own
   slice; see §42.
 - **`ANY` / `ALL` over a subquery** — `x op ANY/ALL(SELECT …)` landed (the subquery spelling of `IN`);
-  see §41 / [array-functions.md §11.6](array-functions.md). **Row-valued** subqueries are not implemented.
+  see §41 / [array-functions.md §11.6](array-functions.md). **Row-valued** subqueries landed —
+  see [Row-valued subqueries](#row-valued-subqueries).
 - **Subqueries in `GROUP BY`** are not reachable — a `GROUP BY` key is grammatically a
   `column_ref` only (§18), so `(SELECT …)` there is a `42601` syntax error by the existing rule.
 

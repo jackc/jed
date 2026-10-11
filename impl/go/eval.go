@@ -3761,7 +3761,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			v := NullValue() // 0 rows -> NULL (the static type was settled at resolve)
 			if len(r.rows) == 1 {
-				v = r.rows[0][0]
+				v = subqueryRowValue(r.rows[0], e.rowValued)
 			}
 			m.releaseQuery(held)
 			return v, nil
@@ -3778,9 +3778,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			elems := make([]Value, len(r.rows))
 			for i, rr := range r.rows {
-				elems[i] = rr[0]
+				elems[i] = subqueryRowValue(rr, e.rowValued)
 			}
-			v, qerr := quantifiedMembership(e.op, e.quantAll, lv, ArrayValue(elems), m)
+			v, qerr := quantifiedMembership(e.op, e.quantAll, e.rowValued, lv, ArrayValue(elems), m)
 			m.releaseQuery(held)
 			return v, qerr
 		default: // sqIn
@@ -3790,7 +3790,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			list := make([]Value, len(r.rows))
 			for i, rr := range r.rows {
-				list[i] = rr[0]
+				list[i] = subqueryRowValue(rr, e.rowValued)
 			}
 			v, ierr := inMembership(lv, list, e.negated, m)
 			m.releaseQuery(held)
@@ -3816,7 +3816,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		return quantifiedMembership(e.op, e.quantAll, lv, av, m)
+		return quantifiedMembership(e.op, e.quantAll, e.rowWise, lv, av, m)
 	default: // reDistinct
 		m.Charge(costs.OperatorEval)
 		a, err := e.lhs.eval(row, env, m)

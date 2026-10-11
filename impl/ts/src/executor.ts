@@ -379,7 +379,7 @@ import {
 // column. The resolved SCALAR type — for decimal the unconstrained "decimal", not the
 // numeric(p,s) typmod (spec/design/conformance.md §7).
 import type { AssignPlan } from "./window.ts";
-import { evalExpr, floatToIntHalfAway, toDecimal } from "./eval.ts";
+import { evalExpr, floatToIntHalfAway, subqueryRowValue, toDecimal } from "./eval.ts";
 import {
   coerceForStore,
   dateClockValue,
@@ -18769,7 +18769,9 @@ export class Engine {
               "more than one row returned by a subquery used as an expression",
             );
           }
-          return valueToRExpr(r.rows.length === 1 ? r.rows[0]![0]! : nullValue());
+          return valueToRExpr(
+            r.rows.length === 1 ? subqueryRowValue(r.rows[0]!, e.rowValued) : nullValue(),
+          );
         }
         if (e.subKind === "exists") {
           return { kind: "constBool", value: r.rows.length > 0 !== e.negated };
@@ -18778,17 +18780,18 @@ export class Engine {
           // An uncorrelated quantified subquery folds to a constant-array `quantified`
           // (array-functions.md §11.6): its single column becomes a 1-D array and the node reuses
           // the array form's 3VL fold — no per-row re-execution.
-          const elements = r.rows.map((row) => row[0]!);
+          const elements = r.rows.map((row) => subqueryRowValue(row, e.rowValued));
           return {
             kind: "quantified",
             op: e.op!,
             all: e.all!,
             lhs: e.lhs!,
             array: valueToRExpr(arrayValue(elements)),
+            rowWise: e.rowValued,
           };
         }
         // in
-        const list = r.rows.map((row) => row[0]!);
+        const list = r.rows.map((row) => subqueryRowValue(row, e.rowValued));
         return { kind: "inValues", lhs: e.lhs!, list, negated: e.negated };
       }
       case "cast":
@@ -25413,6 +25416,10 @@ export type RExpr =
       subKind: SubqueryKind;
       lhs: RExpr | null;
       negated: boolean;
+      // A ROW-VALUED subquery (grammar.md §26 "Row-valued subqueries"): the left operand is a row
+      // constructor, so each body row packages its N columns as one anonymous composite value
+      // instead of yielding its single column. Never set for "exists".
+      rowValued: boolean;
       // For subKind "quantified" (array-functions.md §11.6): the comparison op + ALL flag, so the
       // body's single column folds through quantifiedMembership exactly like the array form.
       op?: BinaryOp;
@@ -25430,6 +25437,10 @@ export type RExpr =
       all: boolean;
       lhs: RExpr;
       array: RExpr;
+      // The folded form of a ROW-VALUED quantified subquery (grammar.md §26): each element is
+      // compared by the row-constructor 3VL (eq3/lt3/gt3, like "compare"), not the composite total
+      // order the array form uses for composite elements (array-functions.md §13).
+      rowWise: boolean;
     };
 
 // SubqueryKind selects which subquery form a "subquery" RExpr is (spec/design/grammar.md §26).

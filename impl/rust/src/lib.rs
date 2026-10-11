@@ -235,6 +235,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Composite (row) types — CREATE TYPE / DROP TYPE, persisted (format_version 9). S2: the type
     // is created/dropped/persisted; composite columns/values land later (spec/design/composite.md).
     "types.composite",
+    // The bare row constructor (a, b, …) — the implicit-ROW spelling (composite.md §1).
+    "types.composite_bare_row",
     "types.array",
     // Array element subscript a[i] — 1-based, OOB/NULL → NULL, non-array base 42804 (array.md §6).
     "expr.array_subscript",
@@ -581,6 +583,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Quantified comparison over a subquery — x op ANY/SOME/ALL (SELECT …), the subquery spelling
     // of IN (array-functions.md §11.6).
     "query.subquery_quantified",
+    // Row-valued subqueries — ROW(a, b) / (a, b) op | IN | op ANY/ALL (SELECT x, y …) (grammar.md §26).
+    "query.subquery_row_valued",
     // Non-recursive common table expressions — WITH name [(cols)] AS [NOT] MATERIALIZED (query)
     // [, ...] <query> (spec/design/cte.md).
     "query.cte",

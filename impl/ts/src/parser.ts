@@ -265,11 +265,16 @@ class Parser {
   // descended (deepen), restored on the way back up; left stale on the error path because a depth
   // error aborts the whole parse.
   private depth: number;
+  // The token position just past the `)` of the most recent bare `(a, b, …)` row constructor (0 =
+  // none). A bare row is not a parenthesized base, so parsePostfix refuses `.field` on it
+  // (PostgreSQL: `(1,2).f1` is a syntax error, `((1,2)).f1` is field access).
+  private bareRowEnd: number;
 
   constructor(tokens: Token[]) {
     this.tokens = tokens;
     this.pos = 0;
     this.depth = 0;
+    this.bareRowEnd = 0;
   }
 
   // deepen descends one nesting level, enforcing MAX_EXPR_DEPTH (spec/design/cost.md §7). Call at
@@ -3647,6 +3652,7 @@ class Parser {
     const base0 = this.depth;
     let fieldAccessible = this.peek().kind === "lparen";
     let expr = this.parsePrimary();
+    if (this.pos === this.bareRowEnd) fieldAccessible = false;
     for (;;) {
       const k = this.peek().kind;
       // each postfix `::`/`[…]`/`.field`/COLLATE wraps the base in one more AST level; deepen only
@@ -3744,6 +3750,19 @@ class Parser {
         return { kind: "scalarSubquery", query };
       }
       const e = this.parseExpr();
+      // `(a, b, …)` — the bare row constructor (composite.md §1), PostgreSQL's implicit `ROW`
+      // spelling: two or more comma-separated expressions in parentheses. Identical to
+      // `ROW(a, b, …)`; a single parenthesized expression stays a grouping.
+      if (this.peek().kind === "comma") {
+        const fields: Expr[] = [e];
+        while (this.peek().kind === "comma") {
+          this.advance();
+          fields.push(this.parseExpr());
+        }
+        this.expect("rparen");
+        this.bareRowEnd = this.pos;
+        return { kind: "row", fields };
+      }
       this.expect("rparen");
       return e;
     }
@@ -3763,7 +3782,7 @@ class Parser {
     }
     // `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Recognized when `ROW`
     // is immediately followed by `(`, so `row` stays usable as a column / function name otherwise.
-    // The bare `(a, b)` form is deferred (0A000); only the keyword form parses.
+    // The bare `(a, b)` form is parsed with the parenthesized expression above.
     if (this.peekKeyword() === "row" && this.peekKindAt(1) === "lparen") {
       this.advance(); // ROW
       this.expect("lparen");

@@ -1120,6 +1120,10 @@ type rExpr struct {
 	// reQuantified: `lhs` is the scalar, `rhs` the array node, `op` the comparison, `quantAll`
 	// selects ALL (true) vs ANY/SOME (false) (spec/design/array-functions.md §11).
 	quantAll bool
+	// reQuantified: the folded form of a ROW-VALUED quantified subquery (grammar.md §26) — each
+	// element is compared by the row-constructor 3VL (Eq3/Lt3/Gt3, like reCompare), not the
+	// composite total order the array form uses for composite elements (array-functions.md §13).
+	rowWise bool
 
 	// reOuterColumn: the number of frames out (`index` reuses the column index field).
 	level int
@@ -1128,6 +1132,10 @@ type rExpr struct {
 	subPlan *queryPlan
 	subKind subqueryKind
 	list    []Value
+	// reSubquery: a ROW-VALUED subquery (grammar.md §26 "Row-valued subqueries") — the left operand
+	// is a row constructor, so each body row packages its N columns as one anonymous composite value
+	// instead of yielding its single column. Never set for sqExists.
+	rowValued bool
 }
 
 // rSubscript is one resolved subscript spec in a reSubscript (spec/design/array.md §6): an index

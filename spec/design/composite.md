@@ -45,9 +45,13 @@ SELECT * FROM person WHERE home = ROW('Main', 90210)
   method recurses. An unknown field type is `42704`. Nesting is bounded to `MAX_COMPOSITE_DEPTH`
   (32) deep — a deeper chain aborts `54001` ([cost.md §7b](cost.md)), the untrusted-query
   native-stack gate that keeps the recursive derived methods safe.
-- **`ROW(…)` constructor only.** The bare `(a, b, …)` row constructor (PostgreSQL's parenthesized
-  form) is deferred (`0A000`) — it is parser-ambiguous with grouping/subqueries and adds no
-  capability `ROW(…)` lacks. `ROW(x)` is a one-field row; `ROW()` is the zero-field row.
+- **`ROW(…)` and the bare `(a, b, …)` constructor.** `ROW(x)` is a one-field row; `ROW()` is the
+  zero-field row. The bare form — PostgreSQL's implicit `ROW`: two or more comma-separated expressions
+  in parentheses — builds the identical anonymous composite (a single parenthesized expression stays a
+  grouping, and a leading `SELECT` is still a subquery). It is the idiomatic spelling of row
+  comparison (`WHERE (a, b) > (1, 2)`) and of the row-valued subqueries of
+  [grammar.md §26](grammar.md) (`(a, b) IN (SELECT x, y …)`). A bare row is not a field-access base:
+  `(1, 2).f1` is `42601`, `((1, 2)).f1` selects (PostgreSQL).
 - **Field access** `(expr).field` and `(expr).*` (✅ S4). Field selection is **parens-required**,
   matching PostgreSQL: `.field` / `.*` is a postfix operator that applies only to a **parenthesized**
   base — `(home).zip`, `(t.home).zip`, `(ROW(1,2)).f1`, `('(…)'::addr).zip` — and chains on a prior

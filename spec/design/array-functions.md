@@ -654,6 +654,11 @@ bridge of §11 and the §26 subquery machinery** — the parser, after the quant
   the same `quantified_membership` fold. Bind parameters inside follow §26 (`42P18` only when a `$N`
   is typed solely by the enclosing query). Cost is §26's (subquery cost, once or per-row) plus §11.4's
   per-element fold.
+- **Row-valued.** A row constructor `x` (`ROW(a, b) op ANY (SELECT c, d …)`) takes an N-column body
+  instead ([grammar.md §26 "Row-valued subqueries"](grammar.md)): each row folds as an anonymous
+  composite, and the per-element comparison is the **row-constructor 3VL** (`eq3`/`lt3`/`gt3`), not
+  the composite total order §13 uses for composite array elements — the folded `Quantified` carries
+  a `row_wise` flag that selects it.
 
 `SOME` folds to `ANY`; and jed's lack of `<>` keeps `<> ALL` (≡ `NOT IN`) unreachable, the §11.1 gap,
 here too.

@@ -3128,6 +3128,10 @@ pub(crate) enum RExpr {
         lhs: Option<Box<RExpr>>,
         /// For `In` / `Exists`: the `NOT` flag.
         negated: bool,
+        /// A ROW-VALUED subquery (grammar.md §26 "Row-valued subqueries"): the left operand is a
+        /// row constructor, so each body row packages its N columns as one anonymous composite
+        /// value (`Value::Composite`) instead of yielding its single column. Never set for Exists.
+        row_valued: bool,
     },
     /// A folded **uncorrelated** `IN (subquery)` (spec/design/grammar.md §26): the subquery ran
     /// once (at the fold pass) yielding the constant `list`; per row it tests `lhs` for 3-valued
@@ -3150,6 +3154,10 @@ pub(crate) enum RExpr {
         all: bool,
         lhs: Box<RExpr>,
         array: Box<RExpr>,
+        /// The folded form of a ROW-VALUED quantified subquery (grammar.md §26): each element is
+        /// compared by the row-constructor 3VL (`eq3`/`lt3`/`gt3`, like `RExpr::Compare`), not the
+        /// composite total order the array form uses for composite elements (array-functions.md §13).
+        row_wise: bool,
     },
 }
 

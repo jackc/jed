@@ -1541,7 +1541,7 @@ func (db *engine) foldUncorrelatedInRExpr(e *rExpr, bound []Value, ctes cteCtx, 
 			}
 			val := NullValue()
 			if len(r.rows) == 1 {
-				val = r.rows[0][0]
+				val = subqueryRowValue(r.rows[0], e.rowValued)
 			}
 			*e = *valueToRExpr(val)
 		case sqExists:
@@ -1552,14 +1552,14 @@ func (db *engine) foldUncorrelatedInRExpr(e *rExpr, bound []Value, ctes cteCtx, 
 			// the array form's 3VL fold — no per-row re-execution.
 			elems := make([]Value, len(r.rows))
 			for i, row := range r.rows {
-				elems[i] = row[0]
+				elems[i] = subqueryRowValue(row, e.rowValued)
 			}
 			arr := &rExpr{kind: reConstArray, cArray: oneDimArray(elems)}
-			*e = rExpr{kind: reQuantified, op: e.op, quantAll: e.quantAll, lhs: e.lhs, rhs: arr}
+			*e = rExpr{kind: reQuantified, op: e.op, quantAll: e.quantAll, lhs: e.lhs, rhs: arr, rowWise: e.rowValued}
 		default: // sqIn
 			list := make([]Value, len(r.rows))
 			for i, row := range r.rows {
-				list[i] = row[0]
+				list[i] = subqueryRowValue(row, e.rowValued)
 			}
 			*e = rExpr{kind: reInValues, lhs: e.lhs, list: list, negated: e.negated}
 		}
@@ -2221,7 +2221,10 @@ func inMembership(lv Value, list []Value, negated bool, m *costMeter) (Value, er
 // FALSE) and ALL (all=true) the AND-fold (FALSE if any is FALSE, else NULL if any is NULL, else TRUE;
 // empty → TRUE). Each element comparison charges one operator_eval (+ size-scaled decimal_work),
 // exactly like inMembership, so max_cost bounds the walk (54P01).
-func quantifiedMembership(op binaryOp, all bool, lv, av Value, m *costMeter) (Value, error) {
+//
+// rowWise is the folded ROW-VALUED subquery form (grammar.md §26): each element compares by the
+// row-constructor 3VL (rowCmp3) rather than quantifiedCmp3's composite total order.
+func quantifiedMembership(op binaryOp, all, rowWise bool, lv, av Value, m *costMeter) (Value, error) {
 	if av.Kind == ValNull {
 		return NullValue(), nil
 	}
@@ -2232,7 +2235,13 @@ func quantifiedMembership(op binaryOp, all bool, lv, av Value, m *costMeter) (Va
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
-		switch quantifiedCmp3(op, lv, e) {
+		var tv ThreeValued
+		if rowWise {
+			tv = rowCmp3(op, lv, e)
+		} else {
+			tv = quantifiedCmp3(op, lv, e)
+		}
+		switch tv {
 		case True:
 			// ANY short-circuits TRUE; ALL keeps going (TRUE is its neutral element).
 			if !all {
@@ -2253,6 +2262,26 @@ func quantifiedMembership(op binaryOp, all bool, lv, av Value, m *costMeter) (Va
 		return NullValue(), nil
 	}
 	return BoolValue(all), nil
+}
+
+// rowCmp3 is the row-constructor three-valued comparison `x op e` (composite.md §5): the same
+// Eq3/Lt3/Gt3 decomposition reCompare evaluates, so a NULL field at the deciding position is
+// UNKNOWN (PostgreSQL's row comparison against a subquery row).
+func rowCmp3(op binaryOp, x, e Value) ThreeValued {
+	switch op {
+	case opEq:
+		return x.Eq3(e)
+	case opNe:
+		return not3(x.Eq3(e))
+	case opLt:
+		return x.Lt3(e)
+	case opGt:
+		return x.Gt3(e)
+	case opLe:
+		return or3(x.Lt3(e), x.Eq3(e))
+	default: // OpGe
+		return or3(x.Gt3(e), x.Eq3(e))
+	}
 }
 
 // quantifiedCmp3 is the per-element three-valued comparison `lhs op e` for a quantified node,
@@ -2312,6 +2341,15 @@ func quantifiedCmp3(op binaryOp, x, e Value) ThreeValued {
 	default: // OpGe
 		return or3(x.Gt3(e), x.Eq3(e))
 	}
+}
+
+// subqueryRowValue is the value one subquery body row contributes (§26): its single column, or —
+// for a ROW-VALUED subquery — all of its columns packaged as one anonymous composite.
+func subqueryRowValue(row storedRow, rowValued bool) Value {
+	if rowValued {
+		return CompositeValue(row)
+	}
+	return row[0]
 }
 
 // valueToRExpr builds the constant rExpr for a folded subquery value (§26). The static type is
