@@ -776,7 +776,7 @@ impl Engine {
         } else {
             &sel.items
         };
-        let (mut projections, mut column_names, mut column_types) =
+        let (mut projections, mut column_names, mut column_types, mut column_derivs) =
             resolve_projections(&scope, items_ref, &mut agg_ctx, ptypes)?;
         let group = if sel.join_group {
             Some(join_group_outputs(
@@ -784,6 +784,7 @@ impl Engine {
                 &mut projections,
                 &mut column_names,
                 &mut column_types,
+                &mut column_derivs,
             ))
         } else {
             None
@@ -1001,10 +1002,7 @@ impl Engine {
                             }
                             resolve_collation_name(scope.catalog, name)?
                         }
-                        None => match &scope.column_of(r).collation {
-                            Some(cn) => resolve_collation_name(scope.catalog, cn)?,
-                            None => None,
-                        },
+                        None => column_collation(&scope, r)?,
                     };
                     let k = order_exprs.len();
                     order_exprs.push(RExpr::OuterColumn { level, index });
@@ -1036,10 +1034,7 @@ impl Engine {
                             }
                             resolve_collation_name(scope.catalog, name)?
                         }
-                        None => match &scope.column_of(r).collation {
-                            Some(cn) => resolve_collation_name(scope.catalog, cn)?,
-                            None => None,
-                        },
+                        None => column_collation(&scope, r)?,
                     };
                     let slot = if is_agg {
                         group_keys
@@ -1370,6 +1365,7 @@ impl Engine {
             projections,
             column_names,
             column_types,
+            column_derivs,
             distinct: sel.distinct,
             limit: sel.limit,
             offset: sel.offset,
@@ -1638,6 +1634,7 @@ fn join_group_outputs(
     projections: &mut Vec<RExpr>,
     names: &mut Vec<String>,
     types: &mut Vec<ResolvedType>,
+    derivs: &mut Vec<Deriv>,
 ) -> JoinGroupLayout {
     // `pos[flat]` is the output position of the scope's flat column `flat`.
     let mut pos: Vec<usize> = vec![usize::MAX; scope.width()];
@@ -1664,6 +1661,7 @@ fn join_group_outputs(
         projections.push(RExpr::Column(idx));
         names.push(c.name.clone());
         types.push(resolved_type_of_col(&c.ty, scope.catalog));
+        derivs.push(cat_column_deriv(c));
     }
     for pr in projections.iter() {
         let RExpr::Column(idx) = pr else {
@@ -1681,6 +1679,7 @@ fn join_group_outputs(
             default_expr: None,
             identity: None,
             collation: c.collation.clone(),
+            no_collation: c.no_collation,
         });
     }
     for r in &scope.rels {

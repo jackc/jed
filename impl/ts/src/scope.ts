@@ -17,12 +17,14 @@ import type {
 } from "./executor.ts";
 import {
   type Engine,
+  queryPlanColumnDerivs,
   astSubscriptExprs,
   exprHasAggregate,
   itemsHaveAggregate,
   outerOf,
 } from "./executor.ts";
 import type { Column, SeqDataType, SeqOwner, SequenceDef, Table } from "./catalog.ts";
+import type { Deriv } from "./resolve.ts";
 import {
   columnIndex,
   seqDataTypeDefaultBounds,
@@ -876,18 +878,27 @@ export function checkRecursiveColumnTypes(
 // (spec/design/cte.md §2): one column per body output, named by the rename list (a count mismatch
 // with MORE aliases is 42P10) or the body's own output names, typed from the planned body. The
 // relation has no primary key / constraints — it is read-only and its rows come from the CTE
-// context, never a store.
+// context, never a store. Each column carries its body output's collation derivation
+// (spec/design/collation.md §1 "Derived relations").
 export function cteSyntheticTable(name: string, plan: QueryPlan, rename: string[] | null): Table {
-  return cteSyntheticTableCols(name, plan.columnNames, plan.columnTypes, rename);
+  return cteSyntheticTableCols(
+    name,
+    plan.columnNames,
+    plan.columnTypes,
+    queryPlanColumnDerivs(plan),
+    rename,
+  );
 }
 
 // cteSyntheticTableCols is the shared core of cteSyntheticTable, over explicit body column names +
-// types — so a data-modifying CTE (whose "body output" is its RETURNING projection, not a QueryPlan)
-// builds its synthetic relation the same way (spec/design/writable-cte.md §1).
+// types + collation derivations (null = none for every column) — so a data-modifying CTE (whose
+// "body output" is its RETURNING projection, not a QueryPlan) builds its synthetic relation the same
+// way (spec/design/writable-cte.md §1).
 export function cteSyntheticTableCols(
   name: string,
   bodyNames: string[],
   bodyTypes: ResolvedType[],
+  bodyDerivs: Deriv[] | null,
   rename: string[] | null,
 ): Table {
   let colNames: string[];
@@ -917,7 +928,23 @@ export function cteSyntheticTableCols(
     identity: null,
     collation: null,
   }));
+  columns.forEach((col, i) => {
+    setSyntheticCollation(col, bodyDerivs === null ? { kind: "none" } : bodyDerivs[i]!);
+  });
   return { name, columns, pk: [], checks: [], indexes: [], fks: [], exclusions: [] };
+}
+
+// setSyntheticCollation records a body output's collation derivation on its synthetic column
+// (spec/design/collation.md §1 "Derived relations", PostgreSQL's rule): an implicit OR explicit body
+// collation becomes the column's IMPLICIT collation (an outer reference is a plain column reference);
+// any other body output has no collation and takes a neighbour's (PG's default). An indeterminate
+// body output also has none in PG (unreachable today: no output expression combines collations).
+function setSyntheticCollation(col: Column, d: Deriv): void {
+  if (d.kind === "implicit" || d.kind === "explicit") {
+    if (d.name !== "C") col.collation = d.name;
+  } else {
+    col.noCollation = true;
+  }
 }
 
 // typeFromResolved is the catalog Type that round-trips a column's ResolvedType — used to give a

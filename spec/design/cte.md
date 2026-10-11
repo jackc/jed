@@ -38,6 +38,12 @@ SELECT x, y FROM c CROSS JOIN a
 - **`MATERIALIZED` / `NOT MATERIALIZED`**: the explicit override of the evaluation rule (§3).
 - A reference to a CTE in `FROM` works exactly like a table reference: bare or aliased
   (`FROM c AS k`), `SELECT *` expands its columns, qualified `c.x` works via the label mechanism.
+- **Each output column keeps its body output's collation** (PostgreSQL): a body column that derives
+  a collation — a collated column reference, or an explicit `COLLATE` — gives the CTE column that
+  collation as an *implicit* one; any other body output has none and takes a neighbour's
+  ([collation.md](collation.md) §1 "Derived relations"). A recursive CTE's columns take the
+  non-recursive term's; a data-modifying CTE's, its `RETURNING` items'. The same rule binds a derived
+  table, which is mechanically an inline CTE.
 
 **Nested `WITH` is supported (§7).** Besides the statement top level, a `WITH` may prefix a
 *parenthesized* query expression — a subquery, a derived table, or another CTE's body

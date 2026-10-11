@@ -190,7 +190,7 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 	}
 	if returning == nil {
 		dm.noReturning = true
-		table, err := cteSyntheticTableCols(lname, nil, nil, rename)
+		table, err := cteSyntheticTableCols(lname, nil, nil, nil, rename)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -201,11 +201,11 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 		return nil, nil, err
 	}
 	s.ctes = bindings
-	_, names, types, err := resolveProjections(s, returning.Items, &aggCtx{collecting: false}, ptypes)
+	_, names, types, derivs, err := resolveProjections(s, returning.Items, &aggCtx{collecting: false}, ptypes)
 	if err != nil {
 		return nil, nil, err
 	}
-	table, err := cteSyntheticTableCols(lname, names, types, rename)
+	table, err := cteSyntheticTableCols(lname, names, types, derivs, rename)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1130,15 +1130,18 @@ func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string, unionA
 // cteSyntheticTable builds the synthetic relation a CTE reference resolves against
 // (spec/design/cte.md §2): one column per body output, named by the rename list (a count mismatch is
 // 42P10) or the body's own output names, typed from the planned body. The relation has no primary
-// key / constraints — it is read-only and its rows come from the CTE context, never a store.
+// key / constraints — it is read-only and its rows come from the CTE context, never a store. Each
+// column carries its body output's collation derivation (spec/design/collation.md §1 "Derived
+// relations").
 func cteSyntheticTable(name string, plan *queryPlan, rename []string) (*catTable, error) {
-	return cteSyntheticTableCols(name, plan.columnNames(), plan.columnTypes(), rename)
+	return cteSyntheticTableCols(name, plan.columnNames(), plan.columnTypes(), plan.columnDerivs(), rename)
 }
 
 // cteSyntheticTableCols is the shared core of cteSyntheticTable, over explicit body column names +
-// types — so a data-modifying CTE (whose "body output" is its RETURNING projection, not a queryPlan)
-// builds its synthetic relation the same way (spec/design/writable-cte.md §1).
-func cteSyntheticTableCols(name string, bodyNames []string, bodyTypes []resolvedType, rename []string) (*catTable, error) {
+// types + collation derivations (nil = none for every column) — so a data-modifying CTE (whose "body
+// output" is its RETURNING projection, not a queryPlan) builds its synthetic relation the same way
+// (spec/design/writable-cte.md §1).
+func cteSyntheticTableCols(name string, bodyNames []string, bodyTypes []resolvedType, bodyDerivs []deriv, rename []string) (*catTable, error) {
 	var colNames []string
 	if rename != nil {
 		// PostgreSQL allows FEWER aliases than the body has columns — the first len(rename) columns
@@ -1168,8 +1171,29 @@ func cteSyntheticTableCols(name string, bodyNames []string, bodyTypes []resolved
 			return nil, err
 		}
 		columns[i] = catColumn{Name: n, Type: ty}
+		var d deriv
+		if bodyDerivs != nil {
+			d = bodyDerivs[i]
+		}
+		setSyntheticCollation(&columns[i], d)
 	}
 	return &catTable{Name: name, Columns: columns}, nil
+}
+
+// setSyntheticCollation records a body output's collation derivation on its synthetic column
+// (spec/design/collation.md §1 "Derived relations", PostgreSQL's rule): an implicit OR explicit body
+// collation becomes the column's IMPLICIT collation (an outer reference is a plain column reference);
+// any other body output has no collation and takes a neighbour's (PG's default). An indeterminate
+// body output also has none in PG (unreachable today: no output expression combines collations).
+func setSyntheticCollation(col *catColumn, d deriv) {
+	switch d.kind {
+	case derivImplicit, derivExplicit:
+		if d.name != "C" {
+			col.Collation = d.name
+		}
+	default:
+		col.NoCollation = true
+	}
 }
 
 // typeFromResolved is the catalog Type for a resolved expression type — used to give a CTE's

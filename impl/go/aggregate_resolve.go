@@ -162,10 +162,8 @@ func resolveOrderedSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		if cn := s.columnOf(r).Collation; cn != "" {
-			if collation, err = resolveCollationName(s.catalog, cn); err != nil {
-				return nil, resolvedType{}, err
-			}
+		if collation, err = columnCollation(s, r); err != nil {
+			return nil, resolvedType{}, err
 		}
 	}
 	var (
@@ -292,10 +290,8 @@ func resolveHypotheticalSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, par
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
-			if cn := s.columnOf(r).Collation; cn != "" {
-				if collation, err = resolveCollationName(s.catalog, cn); err != nil {
-					return nil, resolvedType{}, err
-				}
+			if collation, err = columnCollation(s, r); err != nil {
+				return nil, resolvedType{}, err
 			}
 		}
 		// The hypothetical direct arg, evaluated per group (grouped context); a literal adapts to the

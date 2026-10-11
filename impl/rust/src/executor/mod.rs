@@ -3257,6 +3257,18 @@ impl QueryPlan {
             QueryPlan::With(w) => w.body.column_names(),
         }
     }
+
+    /// The per-output-column collation derivations (spec/design/collation.md §1 "Derived
+    /// relations") — the basis for a derived table / CTE synthetic column's collation. A VALUES body
+    /// derives none, and a set operation's output does not yet propagate a collation (§14), so both
+    /// yield `None` (none for every column).
+    fn column_derivs(&self) -> Option<&[Deriv]> {
+        match self {
+            QueryPlan::Select(s) => Some(&s.column_derivs),
+            QueryPlan::SetOp(_) | QueryPlan::Values(_) => None,
+            QueryPlan::With(w) => w.body.column_derivs(),
+        }
+    }
 }
 
 /// A resolved VALUES-body relation (spec/design/grammar.md §42), executable to its literal rows.
@@ -3773,22 +3785,31 @@ fn select_exprs(s: &Select) -> Vec<&Expr> {
 /// Build the synthetic relation a CTE reference resolves against (spec/design/cte.md §2): one
 /// column per body output, named by the rename list (a count mismatch is 42P10) or the body's own
 /// output names, typed from the planned body. The relation has no primary key / constraints — it is
-/// read-only and its rows come from the CTE context, never a store.
+/// read-only and its rows come from the CTE context, never a store. Each column carries its body
+/// output's collation derivation (spec/design/collation.md §1 "Derived relations").
 fn cte_synthetic_table(
     name: &str,
     plan: &QueryPlan,
     rename: Option<&[String]>,
 ) -> Result<Box<Table>> {
-    cte_synthetic_table_cols(name, plan.column_names(), plan.column_types(), rename)
+    cte_synthetic_table_cols(
+        name,
+        plan.column_names(),
+        plan.column_types(),
+        plan.column_derivs(),
+        rename,
+    )
 }
 
-/// The shared core of [`cte_synthetic_table`], over explicit body column names + types — so a
-/// data-modifying CTE (whose "body output" is its `RETURNING` projection, not a `QueryPlan`) builds
-/// its synthetic relation the same way (spec/design/writable-cte.md §1).
+/// The shared core of [`cte_synthetic_table`], over explicit body column names + types + collation
+/// derivations (`None` = none for every column) — so a data-modifying CTE (whose "body output" is
+/// its `RETURNING` projection, not a `QueryPlan`) builds its synthetic relation the same way
+/// (spec/design/writable-cte.md §1).
 fn cte_synthetic_table_cols(
     name: &str,
     body_names: &[String],
     body_types: &[ResolvedType],
+    body_derivs: Option<&[Deriv]>,
     rename: Option<&[String]>,
 ) -> Result<Box<Table>> {
     let col_names: Vec<String> = match rename {
@@ -3819,8 +3840,9 @@ fn cte_synthetic_table_cols(
     let columns = col_names
         .iter()
         .zip(body_types.iter())
-        .map(|(n, t)| {
-            Ok(Column {
+        .enumerate()
+        .map(|(i, (n, t))| {
+            let mut col = Column {
                 name: n.clone(),
                 ty: type_from_resolved(t)?,
                 decimal: None,
@@ -3831,7 +3853,14 @@ fn cte_synthetic_table_cols(
                 default_expr: None,
                 identity: None,
                 collation: None,
-            })
+                no_collation: false,
+            };
+            let d = match body_derivs {
+                Some(ds) => &ds[i],
+                None => &Deriv::None,
+            };
+            set_synthetic_collation(&mut col, d);
+            Ok(col)
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Box::new(Table {
@@ -3843,6 +3872,22 @@ fn cte_synthetic_table_cols(
         foreign_keys: Vec::new(),
         exclusions: Vec::new(),
     }))
+}
+
+/// Record a body output's collation derivation on its synthetic column (spec/design/collation.md §1
+/// "Derived relations", PostgreSQL's rule): an implicit OR explicit body collation becomes the
+/// column's IMPLICIT collation (an outer reference is a plain column reference); any other body
+/// output has no collation and takes a neighbour's (PG's default). An indeterminate body output
+/// also has none in PG (unreachable today: no output expression combines collations).
+fn set_synthetic_collation(col: &mut Column, d: &Deriv) {
+    match d {
+        Deriv::Implicit(name) | Deriv::Explicit(name) => {
+            if name != "C" {
+                col.collation = Some(name.clone());
+            }
+        }
+        Deriv::None | Deriv::Indeterminate => col.no_collation = true,
+    }
 }
 
 /// The catalog `Type` whose `resolved_type_of_col` round-trips to `rt` — used to give a CTE's
@@ -4237,6 +4282,7 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
         default_expr: None,
         identity: None,
         collation: None,
+        no_collation: false,
     };
     let col = |name: &str, ty: ScalarType, not_null: bool| mk_col(name, Type::Scalar(ty), not_null);
     // A `text[]` member-list column (introspection.md §5.1 — the indexed / member column names).
@@ -4410,6 +4456,7 @@ fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> Box<Table> {
             default_expr: None,
             identity: None,
             collation: None,
+            no_collation: false,
         }],
         pk: Vec::new(),
         checks: Vec::new(),
@@ -4775,6 +4822,7 @@ fn jt_column(name: &str, ty: ScalarType, decimal: Option<DecimalTypmod>) -> Colu
         default_expr: None,
         identity: None,
         collation: None,
+        no_collation: false,
     }
 }
 
@@ -4993,6 +5041,7 @@ fn srf_table_cols(func_name: &str, alias: Option<&str>, cols: Vec<(&str, Type)>)
                 default_expr: None,
                 identity: None,
                 collation: None,
+                no_collation: false,
             })
             .collect(),
         pk: Vec::new(),
@@ -5081,6 +5130,9 @@ pub(crate) struct SelectPlan {
     projections: Vec<RExpr>,
     column_names: Vec<String>,
     column_types: Vec<ResolvedType>,
+    /// Each output column's collation derivation (collation.md §1 "Derived relations"), carried
+    /// into a derived table / CTE over this SELECT.
+    column_derivs: Vec<Deriv>,
     distinct: bool,
     limit: Option<i64>,
     offset: Option<i64>,

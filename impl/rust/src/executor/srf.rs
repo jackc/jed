@@ -316,6 +316,7 @@ impl Engine {
                 default_expr: None,
                 identity: None,
                 collation: None,
+                no_collation: false,
             });
         }
         let table = Box::new(Table {
@@ -384,6 +385,7 @@ impl Engine {
                 default_expr: None,
                 identity: None,
                 collation: None,
+                no_collation: false,
             })
             .collect();
         let want = if jsonb {

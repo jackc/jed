@@ -237,7 +237,7 @@ impl Engine {
         })?;
         match returning {
             None => {
-                let table = cte_synthetic_table_cols(lname, &[], &[], rename)?;
+                let table = cte_synthetic_table_cols(lname, &[], &[], None, rename)?;
                 Ok((
                     table,
                     DmCte {
@@ -249,9 +249,9 @@ impl Engine {
             Some(returning) => {
                 let mut scope = Scope::returning(self, tdef, base_is_old, returning)?;
                 scope.ctes = bindings;
-                let (_, names, types) =
+                let (_, names, types, derivs) =
                     resolve_projections(&scope, &returning.items, &mut AggCtx::Forbidden, ptypes)?;
-                let table = cte_synthetic_table_cols(lname, &names, &types, rename)?;
+                let table = cte_synthetic_table_cols(lname, &names, &types, Some(&derivs), rename)?;
                 Ok((
                     table,
                     DmCte {

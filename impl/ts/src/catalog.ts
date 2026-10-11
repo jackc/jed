@@ -52,6 +52,12 @@ export type Column = {
   // text column carries one. A column reference's IMPLICIT collation in the derivation (42P22);
   // persisted as column flag bit6 + a trailing name (format_version 17).
   collation: string | null;
+  // noCollation marks a SYNTHETIC relation's text column (a derived table / CTE / writable-CTE
+  // RETURNING output — spec/design/collation.md §1 "Derived relations") whose body output derived NO
+  // collation (a literal, a non-propagating expression, a VALUES / set-operation column): it takes a
+  // neighbour's collation, where a catalog column (absent/false) is implicitly `collation` (C if
+  // null). A body output's implicit or explicit collation rides `collation` instead. Never persisted.
+  noCollation?: boolean;
 };
 
 // IdentityKind is the kind of an IDENTITY column (spec/design/sequences.md §13). "always"

@@ -2728,7 +2728,7 @@ func (db *engine) resolveReturning(table *catTable, returning returningClause, b
 		return nil, nil, nil, err
 	}
 	s.ctes = ctes
-	nodes, names, types, err := resolveProjections(s, returning.Items, &aggCtx{collecting: false}, ptypes)
+	nodes, names, types, _, err := resolveProjections(s, returning.Items, &aggCtx{collecting: false}, ptypes)
 	if err != nil {
 		return nil, nil, nil, err
 	}

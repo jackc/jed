@@ -1503,10 +1503,7 @@ pub(crate) fn resolve_ordered_set_aggregate(
                     Some(q) => scope.resolve_qualified(q, col)?,
                     None => scope.resolve_bare(col)?,
                 };
-                match &scope.column_of(r).collation {
-                    Some(cn) => resolve_collation_name(scope.catalog, cn)?,
-                    None => None,
-                }
+                column_collation(scope, r)?
             }
             _ => None,
         },
@@ -1695,10 +1692,7 @@ pub(crate) fn resolve_hypothetical_set_aggregate(
                         Some(q) => scope.resolve_qualified(q, col)?,
                         None => scope.resolve_bare(col)?,
                     };
-                    match &scope.column_of(r).collation {
-                        Some(cn) => resolve_collation_name(scope.catalog, cn)?,
-                        None => None,
-                    }
+                    column_collation(scope, r)?
                 }
                 _ => None,
             },

@@ -965,14 +965,15 @@ pub(crate) fn grouping_error_column(name: &str) -> EngineError {
 
 /// Resolve `SELECT` items against the FROM scope into evaluable projections (any result type
 /// is allowed in the select list, including boolean — `SELECT a = b`), each paired with its
-/// output column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM
-/// order, each relation's columns in catalog order (§15).
+/// output column name (spec/design/grammar.md §8) and collation derivation (spec/design/
+/// collation.md §1). `*` expands across ALL relations in FROM order, each relation's columns in
+/// catalog order (§15).
 pub(crate) fn resolve_projections(
     scope: &Scope,
     items: &SelectItems,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
-) -> Result<(Vec<RExpr>, Vec<String>, Vec<ResolvedType>)> {
+) -> Result<(Vec<RExpr>, Vec<String>, Vec<ResolvedType>, Vec<Deriv>)> {
     match items {
         SelectItems::All => {
             // `*` with nothing to expand — a FROM-less SELECT — is PostgreSQL's exact error
@@ -987,6 +988,7 @@ pub(crate) fn resolve_projections(
             let mut nodes = Vec::new();
             let mut names = Vec::new();
             let mut types = Vec::new();
+            let mut derivs = Vec::new();
             // The FROM planner fixed the `*` order (USING/NATURAL merges per join — PostgreSQL,
             // grammar.md §15); a merge's underlying copies are hidden and so absent from it.
             if let Some(star) = &scope.star {
@@ -995,8 +997,9 @@ pub(crate) fn resolve_projections(
                     nodes.push(RExpr::Column(idx));
                     names.push(c.name.clone());
                     types.push(resolved_type_of_col(&c.ty, scope.catalog));
+                    derivs.push(cat_column_deriv(c));
                 }
-                return Ok((nodes, names, types));
+                return Ok((nodes, names, types, derivs));
             }
             // The RETURNING `old`/`new` pseudo-relations are qualifier-only: `*` expands the
             // real relations' columns exactly as before (grammar.md §32).
@@ -1009,14 +1012,16 @@ pub(crate) fn resolve_projections(
                     nodes.push(RExpr::Column(idx));
                     names.push(c.name.clone());
                     types.push(resolved_type_of_col(&c.ty, scope.catalog));
+                    derivs.push(cat_column_deriv(c));
                 }
             }
-            Ok((nodes, names, types))
+            Ok((nodes, names, types, derivs))
         }
         SelectItems::Items(items) => {
             let mut nodes = Vec::new();
             let mut names = Vec::new();
             let mut types = Vec::new();
+            let mut derivs = Vec::new();
             for it in items {
                 // `t.*` expands the FROM relation labeled `qualifier` into one output column per
                 // column, in catalog order (grammar.md §15) — like bare `*` but for one named
@@ -1047,6 +1052,7 @@ pub(crate) fn resolve_projections(
                         nodes.push(RExpr::Column(slots[i]));
                         names.push(c.name.clone());
                         types.push(resolved_type_of_col(&c.ty, scope.catalog));
+                        derivs.push(cat_column_deriv(c));
                     }
                     continue;
                 }
@@ -1077,6 +1083,7 @@ pub(crate) fn resolve_projections(
                         });
                         names.push(fname);
                         types.push(fty);
+                        derivs.push(Deriv::None);
                     }
                     continue;
                 }
@@ -1085,10 +1092,19 @@ pub(crate) fn resolve_projections(
                     Some(a) => a.clone(),
                     None => output_name(scope, &it.expr),
                 });
+                // The output column's collation derivation (spec/design/collation.md §1 "Derived
+                // relations"), which a derived table / CTE over this body carries into its synthetic
+                // column.
+                let d = if matches!(ty, ResolvedType::Text) {
+                    derive_collation(scope, &it.expr)?
+                } else {
+                    Deriv::None
+                };
+                derivs.push(d);
                 nodes.push(node);
                 types.push(ty);
             }
-            Ok((nodes, names, types))
+            Ok((nodes, names, types, derivs))
         }
     }
 }
@@ -5007,16 +5023,28 @@ pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
 /// (its frozen collation, `C` if none); a non-text column or an unresolvable reference is `None`.
 pub(crate) fn column_deriv(scope: &Scope, r: Option<Resolved>) -> Deriv {
     match r {
-        Some(r) => {
-            let col = scope.column_of(r);
-            if col.ty.is_text() {
-                Deriv::Implicit(col.collation.clone().unwrap_or_else(|| "C".to_string()))
-            } else {
-                Deriv::None
-            }
-        }
+        Some(r) => cat_column_deriv(scope.column_of(r)),
         None => Deriv::None,
     }
+}
+
+/// A column's derivation: implicit for a text column (its frozen collation, `C` if none), unless it
+/// is a synthetic relation's column whose body output derived no collation (`Column::no_collation`
+/// — spec/design/collation.md §1 "Derived relations").
+pub(crate) fn cat_column_deriv(col: &Column) -> Deriv {
+    if !col.ty.is_text() || col.no_collation {
+        return Deriv::None;
+    }
+    Deriv::Implicit(col.collation.clone().unwrap_or_else(|| "C".to_string()))
+}
+
+/// The concrete collation a sort over a bare column reference uses absent an explicit `COLLATE`:
+/// the column's derivation resolved (`None` = byte order).
+pub(crate) fn column_collation(
+    scope: &Scope,
+    r: Resolved,
+) -> Result<Option<std::sync::Arc<Collation>>> {
+    resolve_deriv(scope.catalog, cat_column_deriv(scope.column_of(r)))
 }
 
 /// Combine two operands' derivations (spec/design/collation.md §1/§7, PG's rules). Explicit

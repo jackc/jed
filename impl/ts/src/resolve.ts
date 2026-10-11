@@ -136,7 +136,7 @@ export function resolveProjections(
   items: SelectItems,
   ag: AggCtx,
   params: ParamTypes,
-): { nodes: RExpr[]; names: string[]; types: ResolvedType[] } {
+): { nodes: RExpr[]; names: string[]; types: ResolvedType[]; derivs: Deriv[] } {
   if (items.kind === "all") {
     // `*` with nothing to expand — a FROM-less SELECT — is PostgreSQL's exact error
     // (grammar.md §34). Qualifier-only rels don't count: they are RETURNING's old/new
@@ -147,6 +147,7 @@ export function resolveProjections(
     const nodes: RExpr[] = [];
     const names: string[] = [];
     const types: ResolvedType[] = [];
+    const derivs: Deriv[] = [];
     // The FROM planner fixed the `*` order (USING/NATURAL merges per join — PostgreSQL,
     // grammar.md §15); a merge's underlying copies are hidden and so absent from it.
     if (scope.star !== null) {
@@ -155,8 +156,9 @@ export function resolveProjections(
         nodes.push({ kind: "column", index: idx });
         names.push(c.name);
         types.push(resolvedTypeOfCol(c.type, scope.catalog));
+        derivs.push(catColumnDeriv(c));
       }
-      return { nodes, names, types };
+      return { nodes, names, types, derivs };
     }
     // The RETURNING old/new pseudo-relations are qualifier-only: `*` expands the real
     // relations' columns exactly as before (grammar.md §32).
@@ -168,13 +170,15 @@ export function resolveProjections(
         nodes.push({ kind: "column", index: idx });
         names.push(c.name);
         types.push(resolvedTypeOfCol(c.type, scope.catalog));
+        derivs.push(catColumnDeriv(c));
       });
     }
-    return { nodes, names, types };
+    return { nodes, names, types, derivs };
   }
   const nodes: RExpr[] = [];
   const names: string[] = [];
   const types: ResolvedType[] = [];
+  const derivs: Deriv[] = [];
   for (const it of items.items) {
     // `t.*` expands the FROM relation labeled `qualifier` into one output column per column, in
     // catalog order (grammar.md §15) — like bare `*` but for one named relation and mixable with
@@ -206,6 +210,7 @@ export function resolveProjections(
         nodes.push({ kind: "column", index: slots[i]! });
         names.push(c.name);
         types.push(resolvedTypeOfCol(c.type, scope.catalog));
+        derivs.push(catColumnDeriv(c));
       });
       continue;
     }
@@ -228,15 +233,19 @@ export function resolveProjections(
         nodes.push({ kind: "field", base: bn, index: i });
         names.push(f.name);
         types.push(f.type);
+        derivs.push({ kind: "none" });
       });
       continue;
     }
     const { node, type } = resolve(scope, it.expr, null, ag, params);
     nodes.push(node);
     types.push(type);
+    // The output column's collation derivation (spec/design/collation.md §1 "Derived relations"),
+    // which a derived table / CTE over this body carries into its synthetic column.
+    derivs.push(type.kind === "text" ? deriveCollation(scope, it.expr) : { kind: "none" });
     names.push(it.alias ?? outputName(scope, it.expr));
   }
-  return { nodes, names, types };
+  return { nodes, names, types, derivs };
 }
 
 // outputName is the output column name of an un-aliased select item (grammar.md §8/§15): a
@@ -1906,8 +1915,22 @@ export function columnDeriv(scope: Scope, resolve: () => Resolved): Deriv {
   } catch {
     return { kind: "none" };
   }
+  return catColumnDeriv(col);
+}
+
+// catColumnDeriv is a column's derivation: implicit for a text column (its frozen collation, C if
+// none), unless it is a synthetic relation's column whose body output derived no collation
+// (Column.noCollation — spec/design/collation.md §1 "Derived relations").
+export function catColumnDeriv(col: Column): Deriv {
   if (!typeIsText(col.type)) return { kind: "none" };
+  if (col.noCollation === true) return { kind: "none" };
   return { kind: "implicit", name: col.collation ?? "C" };
+}
+
+// columnCollation is the concrete collation a sort over a bare column reference uses absent an
+// explicit COLLATE: the column's derivation resolved (null = byte order).
+export function columnCollation(scope: Scope, r: Resolved): Collation | null {
+  return resolveDeriv(scope.catalog, catColumnDeriv(scope.columnOf(r)));
 }
 
 // combineDeriv combines two operands' derivations (spec/design/collation.md §1/§7, PG's rules).

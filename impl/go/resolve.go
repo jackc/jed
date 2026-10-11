@@ -610,9 +610,9 @@ func resolvedTypeOfCol(ty dataType, snap *snapshot) resolvedType {
 
 // resolveProjections resolves SELECT items into evaluable projections (any result type is
 // allowed in the select list, including boolean — SELECT a = b), each paired with its output
-// column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM order,
-// each relation's columns in catalog order (§15).
-func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTypes) ([]*rExpr, []string, []resolvedType, error) {
+// column name (spec/design/grammar.md §8) and collation derivation (spec/design/collation.md §1).
+// `*` expands across ALL relations in FROM order, each relation's columns in catalog order (§15).
+func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTypes) ([]*rExpr, []string, []resolvedType, []deriv, error) {
 	if items.All {
 		// `*` with nothing to expand — a FROM-less SELECT — is PostgreSQL's exact error
 		// (grammar.md §34). Qualifier-only rels don't count: they are RETURNING's old/new
@@ -625,11 +625,12 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 			}
 		}
 		if !expandable {
-			return nil, nil, nil, newError(SyntaxError, "SELECT * with no tables specified is not valid")
+			return nil, nil, nil, nil, newError(SyntaxError, "SELECT * with no tables specified is not valid")
 		}
 		var ps []*rExpr
 		var names []string
 		var types []resolvedType
+		var derivs []deriv
 		// The FROM planner fixed the `*` order (USING/NATURAL merges per join — PostgreSQL,
 		// grammar.md §15); a merge's underlying copies are hidden and so absent from it.
 		if s.star != nil {
@@ -638,8 +639,9 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 				ps = append(ps, &rExpr{kind: reColumn, index: idx})
 				names = append(names, c.Name)
 				types = append(types, resolvedTypeOfCol(c.Type, s.catalog.readSnap()))
+				derivs = append(derivs, catColumnDeriv(c))
 			}
-			return ps, names, types, nil
+			return ps, names, types, derivs, nil
 		}
 		// The RETURNING old/new pseudo-relations are qualifier-only: `*` expands the real
 		// relations' columns exactly as before (grammar.md §32).
@@ -655,13 +657,15 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 				ps = append(ps, &rExpr{kind: reColumn, index: idx})
 				names = append(names, r.table.Columns[i].Name)
 				types = append(types, resolvedTypeOfCol(r.table.Columns[i].Type, s.catalog.readSnap()))
+				derivs = append(derivs, catColumnDeriv(&r.table.Columns[i]))
 			}
 		}
-		return ps, names, types, nil
+		return ps, names, types, derivs, nil
 	}
 	ps := make([]*rExpr, 0, len(items.Items))
 	names := make([]string, 0, len(items.Items))
 	types := make([]resolvedType, 0, len(items.Items))
+	derivs := make([]deriv, 0, len(items.Items))
 	for _, it := range items.Items {
 		// `t.*` expands the FROM relation labeled Qualifier into one output column per column, in
 		// catalog order (grammar.md §15) — like bare `*` but for one named relation and mixable with
@@ -687,12 +691,13 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 				}
 			}
 			if table == nil {
-				return nil, nil, nil, newError(UndefinedTable, "missing FROM-clause entry for table "+it.Expr.Qualifier)
+				return nil, nil, nil, nil, newError(UndefinedTable, "missing FROM-clause entry for table "+it.Expr.Qualifier)
 			}
 			for i := range table.Columns {
 				ps = append(ps, &rExpr{kind: reColumn, index: slots[i]})
 				names = append(names, table.Columns[i].Name)
 				types = append(types, resolvedTypeOfCol(table.Columns[i].Type, s.catalog.readSnap()))
+				derivs = append(derivs, catColumnDeriv(&table.Columns[i]))
 			}
 			continue
 		}
@@ -703,10 +708,10 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 		if it.Expr.Kind == exprFieldStar {
 			baseNode, baseTy, err := resolve(s, *it.Expr.Base, nil, ag, params)
 			if err != nil {
-				return nil, nil, nil, err
+				return nil, nil, nil, nil, err
 			}
 			if baseTy.kind != rtComposite {
-				return nil, nil, nil, newError(WrongObjectType, fmt.Sprintf(
+				return nil, nil, nil, nil, newError(WrongObjectType, fmt.Sprintf(
 					"column notation .* applied to type %s, which is not a composite type",
 					rtName(baseTy),
 				))
@@ -715,22 +720,32 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 				ps = append(ps, &rExpr{kind: reField, operand: baseNode, index: i})
 				names = append(names, f.name)
 				types = append(types, f.ty)
+				derivs = append(derivs, deriv{})
 			}
 			continue
 		}
 		node, ty, err := resolve(s, it.Expr, nil, ag, params)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		ps = append(ps, node)
 		types = append(types, ty)
+		// The output column's collation derivation (spec/design/collation.md §1 "Derived relations"),
+		// which a derived table / CTE over this body carries into its synthetic column.
+		d := deriv{}
+		if ty.kind == rtText {
+			if d, err = deriveCollation(s, it.Expr); err != nil {
+				return nil, nil, nil, nil, err
+			}
+		}
+		derivs = append(derivs, d)
 		if it.Alias != nil {
 			names = append(names, *it.Alias)
 		} else {
 			names = append(names, outputName(s, it.Expr))
 		}
 	}
-	return ps, names, types, nil
+	return ps, names, types, derivs, nil
 }
 
 // outputName is the output column name of an un-aliased select item (grammar.md §8/§15): a
@@ -2306,8 +2321,17 @@ func columnDeriv(s *scope, r resolved, err error) deriv {
 	if err != nil {
 		return deriv{}
 	}
-	col := s.columnOf(r)
+	return catColumnDeriv(s.columnOf(r))
+}
+
+// catColumnDeriv is a column's derivation: implicit for a text column (its frozen collation, C if
+// none), unless it is a synthetic relation's column whose body output derived no collation
+// (catColumn.NoCollation — spec/design/collation.md §1 "Derived relations").
+func catColumnDeriv(col *catColumn) deriv {
 	if !col.Type.IsText() {
+		return deriv{}
+	}
+	if col.NoCollation {
 		return deriv{}
 	}
 	name := col.Collation
@@ -2315,6 +2339,12 @@ func columnDeriv(s *scope, r resolved, err error) deriv {
 		name = "C"
 	}
 	return deriv{name: name, kind: derivImplicit}
+}
+
+// columnCollation is the concrete collation a sort over a bare column reference uses absent an
+// explicit COLLATE: the column's derivation resolved (nil = byte order).
+func columnCollation(s *scope, r resolved) (*Collation, error) {
+	return resolveDeriv(s.catalog, catColumnDeriv(s.columnOf(r)))
 }
 
 // combineDeriv combines two operands' derivations (spec/design/collation.md §1/§7, PG's rules).

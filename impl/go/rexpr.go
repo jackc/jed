@@ -1227,6 +1227,20 @@ func (p *queryPlan) columnNames() []string {
 	return p.setop.columnNames
 }
 
+// columnDerivs returns the plan's per-output-column collation derivations (spec/design/collation.md
+// §1 "Derived relations") — the basis for a derived table / CTE synthetic column's collation. A VALUES
+// body derives none, and a set operation's output does not yet propagate a collation (§14), so both
+// yield nil (none for every column).
+func (p *queryPlan) columnDerivs() []deriv {
+	if p.sel != nil {
+		return p.sel.columnDerivs
+	}
+	if p.with != nil {
+		return p.with.body.columnDerivs()
+	}
+	return nil
+}
+
 // valuesPlan is a resolved VALUES-body relation (spec/design/grammar.md §42), executable to its
 // literal rows — the FROM-position sibling of INSERT … VALUES. rows[r][c] is row r, column c, each
 // resolved against no FROM row (a non-LATERAL body sees no sibling; it may correlate to an enclosing
@@ -1595,9 +1609,12 @@ type selectPlan struct {
 	projections []*rExpr
 	columnNames []string
 	columnTypes []resolvedType
-	distinct    bool
-	limit       *int64
-	offset      *int64
+	// columnDerivs is each output column's collation derivation (collation.md §1 "Derived relations"),
+	// carried into a derived table / CTE over this SELECT.
+	columnDerivs []deriv
+	distinct     bool
+	limit        *int64
+	offset       *int64
 	// relMasks is the TOUCHED SET per relation (cost.md §3 "The touched set"; large-values.md
 	// §14): which of its columns this query statically references. Drives the chain-page_read /
 	// value_decompress portion of the scan's up-front cost block — an untouched spilled or

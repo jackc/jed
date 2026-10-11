@@ -929,6 +929,7 @@ impl Engine {
                 default_expr,
                 identity: identity_kind,
                 collation,
+                no_collation: false,
             });
         }
 
@@ -3689,6 +3690,7 @@ impl Engine {
             default_expr: None,
             identity: None,
             collation,
+            no_collation: false,
         };
         if def.primary_key {
             if !table.pk.is_empty() {

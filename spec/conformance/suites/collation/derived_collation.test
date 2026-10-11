@@ -1,0 +1,224 @@
+# A derived table / CTE output column keeps its body output's collation (spec/design/collation.md §1
+# "Derived relations", PostgreSQL's rule): an outer reference to it is a plain column reference, so it
+# carries the body column's collation as an IMPLICIT one — even when the body applied an explicit
+# COLLATE. A body output with no collation (a VALUES column, a literal) stays without one and takes a
+# neighbour's.
+#
+# The vendored `unicode` collation is the CLDR-DUCET root: a < A < b < B (lowercase before its
+# uppercase). Built-in C is byte / code-point order: A(0x41) < B < a(0x61) < b.
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.returning, query.select, query.order_by, query.join_inner, query.cross_join, query.lateral, query.table_alias, query.qualified_column, query.derived_table, query.values, query.cte, query.cte_recursive, query.cte_data_modifying, query.join_parenthesized, query.window, query.window_ranking, expr.collate, ddl.collate_column, types.i32, types.text
+
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+statement ok
+CREATE TABLE ct (id i32 PRIMARY KEY, s text COLLATE "unicode")
+
+statement ok
+CREATE TABLE cc (id i32 PRIMARY KEY, c text)
+
+statement ok
+INSERT INTO ct VALUES (1, 'b'), (2, 'A'), (3, 'a'), (4, 'B')
+
+statement ok
+INSERT INTO cc VALUES (1, 'b'), (2, 'A'), (3, 'a')
+
+# ============================================================================================
+# The body column's implicit collation carries through a derived table.
+# ============================================================================================
+
+query T nosort
+SELECT s FROM (SELECT s FROM ct) d ORDER BY s
+----
+a
+A
+b
+B
+
+query T nosort
+SELECT d.s FROM (SELECT * FROM ct) AS d ORDER BY d.s DESC
+----
+B
+b
+A
+a
+
+# A column-rename list renames, never re-collates.
+query T nosort
+SELECT x FROM (SELECT s FROM ct) d(x) ORDER BY x
+----
+a
+A
+b
+B
+
+# Nested derived tables carry it level by level.
+query T nosort
+SELECT y FROM (SELECT x AS y FROM (SELECT s AS x FROM ct) d1) d2 ORDER BY y
+----
+a
+A
+b
+B
+
+# A LATERAL derived table too.
+query IT nosort
+SELECT cc.id, l.s FROM cc, LATERAL (SELECT s FROM ct WHERE ct.id <= cc.id) l ORDER BY cc.id, l.s
+----
+1
+b
+2
+A
+2
+b
+3
+a
+3
+A
+3
+b
+
+# The carried collation drives window ORDER BY and comparisons as well.
+query TI nosort
+SELECT s, row_number() OVER (ORDER BY s) FROM (SELECT s FROM ct) d ORDER BY s
+----
+a
+1
+A
+2
+b
+3
+B
+4
+
+query T nosort
+SELECT s FROM (SELECT s FROM ct) d WHERE s < 'b' ORDER BY s
+----
+a
+A
+
+# An aliased parenthesized join is an ordinary derived table over its inner columns.
+query T nosort
+SELECT g.s FROM (ct JOIN cc ON ct.id = cc.id) AS g ORDER BY g.s
+----
+a
+A
+b
+
+# ============================================================================================
+# CTEs — plain, multiply-referenced (materialized), recursive, and data-modifying RETURNING.
+# ============================================================================================
+
+query T nosort
+WITH w AS (SELECT s FROM ct) SELECT s FROM w ORDER BY s
+----
+a
+A
+b
+B
+
+query TT nosort
+WITH w AS (SELECT id, s FROM ct) SELECT a.s, b.s FROM w a JOIN w b ON a.id = b.id ORDER BY b.s
+----
+a
+a
+A
+A
+b
+b
+B
+B
+
+query T nosort
+WITH w(x) AS MATERIALIZED (SELECT s FROM ct) SELECT x FROM w ORDER BY x
+----
+a
+A
+b
+B
+
+# A recursive CTE's columns take the non-recursive term's collation.
+query IT nosort
+WITH RECURSIVE r(n, x) AS (SELECT 1, s FROM ct WHERE id = 4 UNION ALL SELECT n + 1, x FROM r WHERE n < 2) SELECT n, x FROM r ORDER BY x, n
+----
+1
+B
+2
+B
+
+query T nosort
+WITH RECURSIVE r(x) AS (SELECT s FROM ct UNION SELECT x FROM r WHERE false) SELECT x FROM r ORDER BY x
+----
+a
+A
+b
+B
+
+query T nosort
+WITH u AS (UPDATE ct SET id = id WHERE id > 0 RETURNING s) SELECT s FROM u ORDER BY s
+----
+a
+A
+b
+B
+
+query T nosort
+WITH i AS (INSERT INTO ct VALUES (5, 'C'), (6, 'c') RETURNING s) SELECT s FROM i ORDER BY s
+----
+c
+C
+
+statement ok
+DELETE FROM ct WHERE id > 4
+
+# ============================================================================================
+# An explicit COLLATE in the body becomes the column's IMPLICIT collation outside.
+# ============================================================================================
+
+query T nosort
+SELECT x FROM (SELECT s COLLATE "C" AS x FROM ct) d ORDER BY x
+----
+A
+B
+a
+b
+
+# Implicit C meets implicit unicode: indeterminate (an explicit COLLATE resolves it).
+statement error 42P22
+SELECT x FROM (SELECT s COLLATE "C" AS x FROM ct) d, ct WHERE d.x < ct.s
+
+query T rowsort
+SELECT x FROM (SELECT s COLLATE "C" AS x FROM ct) d, ct WHERE d.x < ct.s COLLATE "unicode" AND ct.id = 1
+----
+A
+a
+
+# ============================================================================================
+# No collation in the body: a VALUES column / a literal takes its neighbour's collation.
+# ============================================================================================
+
+query T nosort
+SELECT x FROM (VALUES ('b'), ('A'), ('a'), ('B')) v(x) ORDER BY x
+----
+A
+B
+a
+b
+
+query T nosort
+SELECT ct.s FROM (VALUES ('b')) v(x) JOIN ct ON ct.s < v.x ORDER BY ct.s
+----
+a
+A
+
+query T nosort
+SELECT ct.s FROM (SELECT 'b'::text AS x) d JOIN ct ON ct.s < d.x ORDER BY ct.s
+----
+a
+A
+
+query T nosort
+WITH w AS (SELECT 'b'::text AS x) SELECT ct.s FROM w, ct WHERE w.x > ct.s ORDER BY ct.s
+----
+a
+A

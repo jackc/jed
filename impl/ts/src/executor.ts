@@ -413,7 +413,10 @@ import {
   widenFloatTo,
 } from "./kernels.ts";
 import {
+  type Deriv,
+  catColumnDeriv,
   collatedCmp,
+  columnCollation,
   deriveCollation,
   elemJsonText,
   jsonArgNode,
@@ -12241,18 +12244,18 @@ export class Engine {
       throw engineError("undefined_table", "table does not exist: " + tableName);
     }
     if (returning === null) {
-      const table = cteSyntheticTableCols(lname, [], [], rename);
+      const table = cteSyntheticTableCols(lname, [], [], null, rename);
       return { table, dm: { stmt, noReturning: true } };
     }
     const scope = Scope.returning(this, tdef, baseIsOld, returning);
     scope.ctes = bindings;
-    const { names, types } = resolveProjections(
+    const { names, types, derivs } = resolveProjections(
       scope,
       returning.items,
       { collecting: false, groupKeys: [], specs: [] },
       ptypes,
     );
-    const table = cteSyntheticTableCols(lname, names, types, rename);
+    const table = cteSyntheticTableCols(lname, names, types, derivs, rename);
     return { table, dm: { stmt, noReturning: false } };
   }
 
@@ -13490,10 +13493,11 @@ export class Engine {
       nodes: projections,
       names: columnNames,
       types: columnTypes,
+      derivs: columnDerivs,
     } = resolveProjections(scope, itemsRef, projAgg, ptypes);
     const group =
       sel.joinGroup === true
-        ? joinGroupOutputs(scope, projections, columnNames, columnTypes)
+        ? joinGroupOutputs(scope, projections, columnNames, columnTypes, columnDerivs)
         : null;
     let aggSpecs = projAgg.specs;
     let groupingSpecs: number[][] = projAgg.groupingSpecs ?? [];
@@ -13641,8 +13645,8 @@ export class Engine {
               );
             }
             oCollation = resolveCollationName(scope.catalog, key.collation);
-          } else if (col.collation !== null) {
-            oCollation = resolveCollationName(scope.catalog, col.collation);
+          } else {
+            oCollation = columnCollation(scope, r);
           }
           const k = orderExprs.length;
           orderExprs.push({ kind: "outerColumn", level: r.level, index: r.index });
@@ -13675,8 +13679,7 @@ export class Engine {
           }
           collation = resolveCollationName(scope.catalog, key.collation);
         } else {
-          const cn = scope.columnAt(idx).collation;
-          if (cn !== null) collation = resolveCollationName(scope.catalog, cn);
+          collation = columnCollation(scope, r);
         }
         let slot = idx;
         if (isAgg) {
@@ -13896,6 +13899,7 @@ export class Engine {
       projections,
       columnNames,
       columnTypes,
+      columnDerivs,
       distinct: sel.distinct,
       limit: sel.limit,
       offset: sel.offset,
@@ -24047,8 +24051,13 @@ export type JoinGroupLayout = {
 
 // groupColumn is a body output column of a parenthesized join: only its source column's name, type,
 // and collation carry over.
-function groupColumn(name: string, type: Type, collation: string | null): Column {
-  return {
+function groupColumn(
+  name: string,
+  type: Type,
+  collation: string | null,
+  noCollation: boolean,
+): Column {
+  const col: Column = {
     name,
     type,
     decimal: null,
@@ -24060,6 +24069,8 @@ function groupColumn(name: string, type: Type, collation: string | null): Column
     identity: null,
     collation,
   };
+  if (noCollation) col.noCollation = true;
+  return col;
 }
 
 // pseudoTable is the one-column relation a synthesized USING/NATURAL equality reads one side
@@ -24076,6 +24087,7 @@ function joinGroupOutputs(
   projections: RExpr[],
   names: string[],
   types: ResolvedType[],
+  derivs: Deriv[],
 ): JoinGroupLayout {
   const pos = new Map<number, number>();
   projections.forEach((pr, p) => {
@@ -24091,10 +24103,11 @@ function joinGroupOutputs(
     projections.push({ kind: "column", index: idx });
     names.push(c.name);
     types.push(resolvedTypeOfCol(c.type, s.catalog));
+    derivs.push(catColumnDeriv(c));
   }
   for (const pr of projections) {
     const c = s.columnAt(starColumnIndex(pr));
-    group.columns.push(groupColumn(c.name, c.type, c.collation));
+    group.columns.push(groupColumn(c.name, c.type, c.collation, c.noCollation === true));
   }
   for (const r of s.rels) {
     if (r.label === "") continue;
@@ -26705,6 +26718,9 @@ export type SelectPlan = {
   projections: RExpr[];
   columnNames: string[];
   columnTypes: ResolvedType[];
+  // columnDerivs is each output column's collation derivation (collation.md §1 "Derived relations"),
+  // carried into a derived table / CTE over this SELECT.
+  columnDerivs: Deriv[];
   distinct: boolean;
   limit: bigint | null;
   offset: bigint | null;
@@ -26915,6 +26931,16 @@ export type WithPlan = {
 // a nested WITH plan (mirrors QueryExpr's bodies). A VALUES plan is only ever produced as a
 // derived-table body.
 export type QueryPlan = SelectPlan | SetOpPlan | ValuesPlan | WithPlan;
+
+// queryPlanColumnDerivs returns the plan's per-output-column collation derivations
+// (spec/design/collation.md §1 "Derived relations") — the basis for a derived table / CTE synthetic
+// column's collation. A VALUES body derives none, and a set operation's output does not yet propagate
+// a collation (§14), so both yield null (none for every column).
+export function queryPlanColumnDerivs(plan: QueryPlan): Deriv[] | null {
+  if (plan.kind === "select") return plan.columnDerivs;
+  if (plan.kind === "with") return queryPlanColumnDerivs(plan.body);
+  return null;
+}
 
 // ScanCache is a prepared statement's memoized scan plan (spec/design/api.md §2.4): the resolved
 // SelectPlan (shared by reference, so a cache hit rebuilds the cursor around the SAME plan object and
@@ -29077,8 +29103,7 @@ export function resolveOrderedSetAggregate(
       key.qualifier !== null && key.qualifier !== undefined && key.qualifier !== ""
         ? scope.resolveQualified(key.qualifier, key.column)
         : scope.resolveBare(key.column);
-    const cn = scope.columnOf(res).collation;
-    if (cn !== null) collation = resolveCollationName(scope.catalog, cn);
+    collation = columnCollation(scope, res);
   }
 
   let plan: AggPlan;
@@ -29263,8 +29288,7 @@ export function resolveHypotheticalSetAggregate(
         key.qualifier !== null && key.qualifier !== undefined && key.qualifier !== ""
           ? scope.resolveQualified(key.qualifier, key.column)
           : scope.resolveBare(key.column);
-      const cn = scope.columnOf(res).collation;
-      if (cn !== null) collation = resolveCollationName(scope.catalog, cn);
+      collation = columnCollation(scope, res);
     }
     // The hypothetical direct arg, evaluated per group (grouped context); a literal adapts to the
     // key's scalar type via the hint. Its type must match the key's family (else 42883).

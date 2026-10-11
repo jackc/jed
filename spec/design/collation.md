@@ -198,6 +198,20 @@ SELECT 'ä' < 'z' COLLATE "de"                      -- per-expression collation 
   `=`/`<>` (PG raises it regardless), even though jed's `=`/`<>` ignore the collation at eval (byte
   equality, §7). (In slice 1c only `42P21` was reachable — every column was implicitly `C`. An earlier
   draft named `42P22` for the explicit case — corrected: PG raises `42P21` there.)
+- **Derived relations keep their body's collation.** A derived table, a VALUES body, a CTE (recursive
+  or not), and a data-modifying CTE's `RETURNING` list expose synthetic columns; each carries its body
+  output column's derivation, PostgreSQL's rule (a reference to a subquery output is a plain column
+  reference, `exprCollation` of the body item). An **implicit or explicit** body collation becomes
+  the synthetic column's **implicit** collation — so `SELECT s FROM (SELECT s FROM t) d ORDER BY s`
+  orders by `s`'s frozen collation, and a body `s COLLATE "C"` is implicit `C` outside (it conflicts
+  `42P22` with an implicit `unicode` column, as a `C` table column would). A body output with **no**
+  collation — a literal, a non-propagating expression, every VALUES column, every set-operation
+  column (the deferred set-op narrowing, §14) — leaves the synthetic column with none, so it takes a
+  neighbour's like a literal does (PG's `default` collation, which yields to any other implicit one).
+  A recursive CTE's columns take the non-recursive term's derivations (PG additionally rejects a
+  recursive term whose combined collation differs, `42P21`; that check is deferred — §14). Renaming
+  (`AS d(x)`) never re-collates. An unaliased parenthesized join copies its inner columns verbatim
+  ([grammar.md](grammar.md) §15); an aliased one is an ordinary derived table.
 - **Provenance + introspection.** Each collation carries an optional, human-readable
   **description** recording where it came from — auto-filled at **build time** by
   `ExtractHostCollation` with the core/OS/library identity (e.g. `Go 1.26.3 / Linux 7.1 / ICU 73`),
@@ -818,7 +832,10 @@ sub-slices**, each independently testable (CLAUDE.md §10), in dependency order:
   reference (implicit), `COLLATE` (explicit), and `||` (combine); every other shape resets to none
   (takes a neighbour's) — the same documented narrowing as 1c. Set-operation output columns do not
   yet propagate an implicit collation (an explicit `COLLATE` on a set-op ORDER BY key still works) — a
-  deferred follow-on.
+  deferred follow-on; it would also flow into a derived table / CTE over a set operation, and enable
+  PG's recursive-CTE collation-consistency check (`42P21`). *(Since landed: a derived table / VALUES
+  body / CTE / writable-CTE `RETURNING` column carries its body output's derivation — §1 "Derived
+  relations".)*
 - **1e — collated keys** ✅ *landed*: the sort-key key encoding as a new
   [encoding.md §2.12](encoding.md) sub-section (`text-collated-sortkey`), a collated text
   `PRIMARY KEY` / ordered secondary index / `UNIQUE` whose stored key is the column collation's UCA

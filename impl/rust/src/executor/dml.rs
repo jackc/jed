@@ -2519,7 +2519,7 @@ impl Engine {
         let tdef = self.table(table).expect("INSERT target resolved above");
         let mut scope = Scope::returning(self, tdef, base_is_old, returning)?;
         scope.ctes = ctes;
-        let (nodes, names, types) =
+        let (nodes, names, types, _) =
             resolve_projections(&scope, &returning.items, &mut AggCtx::Forbidden, ptypes)?;
         Ok((nodes, names, type_names(&types)))
     }
@@ -3014,7 +3014,7 @@ impl Engine {
             Some(returning) => {
                 let mut rscope = Scope::returning(self, table, true, returning)?;
                 rscope.ctes = ctx.bindings;
-                let (nodes, names, types) = resolve_projections(
+                let (nodes, names, types, _) = resolve_projections(
                     &rscope,
                     &returning.items,
                     &mut AggCtx::Forbidden,
@@ -3437,7 +3437,7 @@ impl Engine {
             Some(returning) => {
                 let mut rscope = Scope::returning(self, table, false, returning)?;
                 rscope.ctes = ctx.bindings;
-                let (nodes, names, types) = resolve_projections(
+                let (nodes, names, types, _) = resolve_projections(
                     &rscope,
                     &returning.items,
                     &mut AggCtx::Forbidden,

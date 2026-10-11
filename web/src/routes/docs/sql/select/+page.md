@@ -281,6 +281,9 @@ By default the body cannot see the other `FROM` relations beside it — mark it 
 correlate it with them. Inside a subquery, though, the body may reference columns of an *enclosing*
 query level, like any correlated subquery: `SELECT (SELECT z FROM (SELECT a.x AS z) d) FROM a`.
 
+Each output column keeps its body column's collation, as in PostgreSQL: a `text COLLATE "unicode"`
+column selected through a derived table or a CTE still orders and compares by `unicode` outside it.
+
 ## `VALUES` lists in `FROM` (`FROM (VALUES …) AS v(x)`)
 
 A derived table's body may also be a `VALUES` list — a literal table of rows you write inline,

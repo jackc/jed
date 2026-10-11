@@ -594,13 +594,13 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			return nil, err
 		}
 	}
-	projections, columnNames, columnTypes, err := resolveProjections(s, items, projAgg, ptypes)
+	projections, columnNames, columnTypes, columnDerivs, err := resolveProjections(s, items, projAgg, ptypes)
 	if err != nil {
 		return nil, err
 	}
 	var group *joinGroupLayout
 	if sel.JoinGroup {
-		group = joinGroupOutputs(s, &projections, &columnNames, &columnTypes)
+		group = joinGroupOutputs(s, &projections, &columnNames, &columnTypes, &columnDerivs)
 	}
 	aggSpecs := projAgg.specs
 	windowSpecs := projAgg.windowSpecs
@@ -786,10 +786,8 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 					if coll, err = resolveCollationName(s.catalog, key.Collation); err != nil {
 						return nil, err
 					}
-				} else if cn := s.columnOf(r).Collation; cn != "" {
-					if coll, err = resolveCollationName(s.catalog, cn); err != nil {
-						return nil, err
-					}
+				} else if coll, err = columnCollation(s, r); err != nil {
+					return nil, err
 				}
 				k := len(orderExprs)
 				orderExprs = append(orderExprs, rexpr)
@@ -815,10 +813,8 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				if coll, err = resolveCollationName(s.catalog, key.Collation); err != nil {
 					return nil, err
 				}
-			} else if cn := s.columnOf(r).Collation; cn != "" {
-				if coll, err = resolveCollationName(s.catalog, cn); err != nil {
-					return nil, err
-				}
+			} else if coll, err = columnCollation(s, r); err != nil {
+				return nil, err
 			}
 			slot := idx
 			if isAgg {
@@ -1054,7 +1050,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		groupSets:  groupSets, groupingSpecs: groupingSpecs,
 		aggSpecs: aggSpecs, hasWindow: hasWindow, windowSpecs: windowSpecs, windowKeys: windowKeys, having: having,
 		order: order, orderExprs: orderExprs, projections: projections,
-		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
+		columnNames: columnNames, columnTypes: columnTypes, columnDerivs: columnDerivs, distinct: sel.Distinct,
 		limit: sel.Limit, offset: sel.Offset, group: group,
 	}
 	plan.relMasks = computeRelMasks(plan)
@@ -1270,7 +1266,7 @@ type joinGroupLayout struct {
 // joinGroupOutputs completes a JoinGroup body: after its `*` columns it appends every slot the star
 // omitted (a USING/NATURAL copy superseded by a merge), so each inner relation's columns are all
 // present, and records where each inner label's columns landed. Every star output is a bare column.
-func joinGroupOutputs(s *scope, projections *[]*rExpr, names *[]string, types *[]resolvedType) *joinGroupLayout {
+func joinGroupOutputs(s *scope, projections *[]*rExpr, names *[]string, types *[]resolvedType, derivs *[]deriv) *joinGroupLayout {
 	pos := make(map[int]int, s.width())
 	for p, pr := range *projections {
 		pos[pr.index] = p
@@ -1288,10 +1284,11 @@ func joinGroupOutputs(s *scope, projections *[]*rExpr, names *[]string, types *[
 		*projections = append(*projections, &rExpr{kind: reColumn, index: idx})
 		*names = append(*names, c.Name)
 		*types = append(*types, resolvedTypeOfCol(c.Type, s.catalog.readSnap()))
+		*derivs = append(*derivs, catColumnDeriv(c))
 	}
 	for _, pr := range *projections {
 		c := s.columnAt(pr.index)
-		group.columns = append(group.columns, catColumn{Name: c.Name, Type: c.Type, Collation: c.Collation})
+		group.columns = append(group.columns, catColumn{Name: c.Name, Type: c.Type, Collation: c.Collation, NoCollation: c.NoCollation})
 	}
 	for _, r := range s.rels {
 		if r.label == "" {
