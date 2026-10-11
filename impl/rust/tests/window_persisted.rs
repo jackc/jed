@@ -17,6 +17,13 @@ fn query_rows(db: &mut Session, sql: &str) -> Vec<Vec<jed::Value>> {
     }
 }
 
+/// Remove a closed test database and the `<path>.lock/` coordination bundle opening it created
+/// beside it (spec/design/locking.md).
+fn remove_db(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
+}
+
 /// A small-page file table whose `amount` column is not referenced outside the window functions
 /// under test, committed + reopened so its rows fault in lazily. 40 rows over 256-byte pages span
 /// several leaves, so the masked scan is genuinely exercised.
@@ -78,7 +85,7 @@ fn running_aggregate_over_persisted_column() {
         );
     }
     drop(db);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
 }
 
 /// The windowed TOP-N optimization (spec/design/window.md §5.2) reads only the first OFFSET+LIMIT
@@ -106,7 +113,7 @@ fn top_n_over_persisted_column() {
         );
     }
     drop(db);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
 }
 
 #[test]
@@ -137,5 +144,5 @@ fn filter_and_offset_over_persisted_column() {
         assert_eq!(r[1].render(), want_f[i], "filter row {}", i + 1);
     }
     drop(db);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
 }

@@ -342,6 +342,13 @@ fn tmp(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
 }
 
+/// Remove a closed test database and the `<path>.lock/` coordination bundle opening it created
+/// beside it (spec/design/locking.md).
+fn remove_db(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
+}
+
 fn create_file(path: &std::path::Path, ext: std::sync::Arc<ExtensionRegistry>, stmts: &[&str]) {
     let _ = std::fs::remove_file(path);
     let mut db = Database::create(CreateOptions {
@@ -1284,9 +1291,9 @@ fn batch_streaming_scan_storage_errors_match_row_kernel() {
         }
     }
     assert!(detected > 0, "a corrupted leaf should fail a scan");
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(&cpath);
-    let _ = std::fs::remove_file(&spath);
+    remove_db(&path);
+    remove_db(&cpath);
+    remove_db(&spath);
 }
 
 // ---- Host functions in DEFAULT / CHECK (spec/design/extensibility.md §7.1, step 4b). ----

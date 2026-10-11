@@ -27,6 +27,13 @@ fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
 }
 
+/// Remove a closed test database and the `<path>.lock/` coordination bundle opening it created
+/// beside it (spec/design/locking.md).
+fn remove_db(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
+}
+
 /// A wide all-fixed-width table (i16/i32/i64, several nullable) plus a secondary index and a join
 /// partner. Every column is fixed-width, so on a paged reopen the leaf is Packed with no deferred
 /// values — the case `row_at_masked` skips whole-column decodes that `row_at` would have done.
@@ -203,7 +210,8 @@ fn paged_masked_scan_matches_resident_across_query_shapes() {
             "cost differs (paged-masked vs resident) for `{sql}`"
         );
     }
-    let _ = std::fs::remove_file(&path);
+    drop(paged);
+    remove_db(&path);
 }
 
 /// Seed a MULTI-LEVEL B-tree (enough rows that the tree splits past a single leaf into a root interior
@@ -349,5 +357,6 @@ fn paged_columnar_multilevel_matches_resident() {
             "lazy-columnar cost differs (paged query() vs resident) for `{sql}`"
         );
     }
-    let _ = std::fs::remove_file(&path);
+    drop(paged);
+    remove_db(&path);
 }

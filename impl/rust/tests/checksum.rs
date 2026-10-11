@@ -35,6 +35,13 @@ fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
 }
 
+/// Remove a closed test database and the `<path>.lock/` coordination bundle opening it created
+/// beside it (spec/design/locking.md).
+fn remove_db(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
+}
+
 /// The full scan result as rendered strings, or the error if any page read failed.
 fn scan(path: &std::path::Path) -> Result<Vec<Vec<String>>> {
     let mut db = Database::open_with_options(
@@ -133,6 +140,6 @@ fn corrupting_checkpoint_body_page_is_caught_or_inert_never_silent() {
         "expected live pages across kinds to be detected, got {detected}"
     );
 
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(&cpath);
+    remove_db(&path);
+    remove_db(&cpath);
 }

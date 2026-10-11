@@ -19,6 +19,13 @@ fn tmp(name: &str) -> PathBuf {
     std::env::temp_dir().join(name)
 }
 
+/// Remove a closed test database and the `<path>.lock/` coordination bundle opening it created
+/// beside it (spec/design/locking.md).
+fn remove_db(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
+}
+
 /// Load jed's pinned production `JUCD` bundle (spec/collation/fixtures/unicode.jucd) into the
 /// engine-global loaded set — what a production host does once at startup via `db.LoadUnicodeData`
 /// before opening files / running collated queries (collation.md §4). Idempotent (global, first-wins).
@@ -380,5 +387,5 @@ fn reference_only_file_round_trip() {
         vec!["a", "ä", "z"]
     );
     drop(re);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
 }

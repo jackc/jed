@@ -635,8 +635,17 @@ function runFile(text: string, disk: boolean): void {
   // fsync=off (api.md §2.1): the disk pass reopens a throwaway temp image before every record to exercise
   // the on-disk faulted read path — durability across an OS crash is irrelevant, so skip the per-commit
   // fdatasync (the ~20x cost) while keeping the identical on-disk bytes + read path.
-  let dbHandle: Database | null =
-    tmpPath === null ? null : createDatabase({ path: tmpPath, skipFsync: true });
+  // A failed create (e.g. ENOSPC once the bundle exists) runs before the try/finally below, so remove
+  // the temp directory here, or every failing file leaks one `<dir>/conf.jed.lock/`.
+  let dbHandle: Database | null = null;
+  if (tmpDir !== null && tmpPath !== null) {
+    try {
+      dbHandle = createDatabase({ path: tmpPath, skipFsync: true });
+    } catch (e) {
+      rmSync(tmpDir, { recursive: true, force: true });
+      throw e;
+    }
+  }
   let onTemp = disk;
   // The Database the current session was minted from, held so a `# attach:` directive (memory-mode only
   // — # skip: disk) can attach a fresh in-memory database into it. In disk mode it is the reopenable file

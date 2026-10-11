@@ -4040,6 +4040,7 @@ mod residency_flip_tests {
         run(&mut db);
         db.close().unwrap();
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
     }
 }
 
@@ -4165,6 +4166,7 @@ mod reclaim_watermark_tests {
         reader.join().unwrap();
         db.close().unwrap();
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
     }
 }
 

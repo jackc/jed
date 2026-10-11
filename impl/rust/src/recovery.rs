@@ -16,6 +16,13 @@ fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
 }
 
+/// Remove a closed test database and the `<path>.lock/` coordination bundle opening it created
+/// beside it (spec/design/locking.md).
+fn remove_db(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
+}
+
 /// A fresh file-backed `t(id i32 PRIMARY KEY)` seeded with rows `1..=2`, returned with the prior
 /// committed `txid`. Each autocommit `INSERT` persists durably, so the file holds a real two-row
 /// commit before any fault is armed.
@@ -61,6 +68,7 @@ fn crash_mid_body_recovers_prior() {
     assert_eq!(db.txid(), prior, "fell back to the prior snapshot");
     assert_eq!(ids(&db), vec![1, 2], "the prior snapshot is intact");
     db.close().unwrap();
+    remove_db(&path);
 }
 
 /// `BodyWrite(1)` torn — a partial first body-page write. A dirty page is always a freshly allocated
@@ -77,6 +85,7 @@ fn torn_body_page_recovers_prior() {
     assert_eq!(db.txid(), prior, "the torn body page is never referenced");
     assert_eq!(ids(&db), vec![1, 2]);
     db.close().unwrap();
+    remove_db(&path);
 }
 
 /// A failed durability barrier poisons the handle, even though its complete cache state may be
@@ -95,6 +104,7 @@ fn failed_sync_requires_reopen() {
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
     db.close().unwrap();
+    remove_db(&path);
 }
 
 /// `MetaWrite`: the body is fully written, then metadata publication fails. The prior meta is
@@ -110,6 +120,7 @@ fn crash_before_meta_recovers_prior() {
     assert_eq!(db.txid(), prior, "unreferenced body → prior snapshot");
     assert_eq!(ids(&db), vec![1, 2]);
     db.close().unwrap();
+    remove_db(&path);
 }
 
 /// `MetaWrite` torn — a partial meta-slot write corrupts its checksum. The loader rejects the torn slot
@@ -132,6 +143,7 @@ fn torn_meta_write_falls_back_to_prior() {
     );
     assert_eq!(ids(&db), vec![1, 2]);
     db.close().unwrap();
+    remove_db(&path);
 }
 
 /// `Sync(1)` — the meta is written, then its durability barrier fails. Atomicity holds either way: a
@@ -154,6 +166,7 @@ fn crash_before_meta_sync_is_atomic() {
         assert_eq!(got, vec![1, 2, 3], "new snapshot is fully consistent");
     }
     db.close().unwrap();
+    remove_db(&path);
 }
 
 /// After a crash-to-prior recovery the file is fully functional: the free-list reconstructs correctly
@@ -199,4 +212,5 @@ fn recovery_then_free_list_reuse_stays_consistent() {
         db.page_count
     );
     db.close().unwrap();
+    remove_db(&path);
 }

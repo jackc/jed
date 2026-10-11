@@ -1369,7 +1369,8 @@ mod tests {
         drop(reader);
         drop(session);
         drop(db);
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
     }
 
     #[test]

@@ -65,7 +65,7 @@ fn reverse_foreign_key_leaves_unrelated_payloads_deferred() {
         "XX001"
     );
     drop(db);
-    std::fs::remove_file(path).unwrap();
+    remove_db(&path);
 }
 
 /// Incompressible filler (spec/fileformat/format.md "Fixtures") — see overflow_cost.rs.
@@ -85,6 +85,13 @@ fn filler_text(n: usize) -> String {
 
 fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
+}
+
+/// Remove a closed test database and the `<path>.lock/` coordination bundle opening it created
+/// beside it (spec/design/locking.md).
+fn remove_db(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
 }
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
@@ -223,7 +230,7 @@ fn chains_are_read_only_when_touched() {
     assert_eq!(r4[0][0].render(), "tiny");
 
     drop(db);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
 }
 
 /// All three lazy forms materialize exactly through the paged path (resolution correctness).
@@ -264,7 +271,7 @@ fn lazy_values_round_trip_exactly() {
         ]
     );
     drop(db);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
 }
 
 /// An UPDATE that never touches the spilled column re-stores it without losing it: the
@@ -328,7 +335,7 @@ fn update_of_other_columns_preserves_spilled_values() {
     assert_eq!(rows[1][0].render(), "small");
     assert_eq!(rows[1][1].render(), "99");
     drop(db);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
 }
 
 /// Logical cost is mode-independent (cost.md §3): a demand-paged file and a fully-resident
@@ -378,5 +385,5 @@ fn paged_and_resident_costs_match() {
         assert_eq!(cost(&mut mem, sql), cost(&mut paged, sql), "{sql}");
     }
     drop(paged);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
 }

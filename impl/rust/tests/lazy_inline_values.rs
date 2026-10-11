@@ -15,6 +15,13 @@ fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
 }
 
+/// Remove a closed test database and the `<path>.lock/` coordination bundle opening it created
+/// beside it (spec/design/locking.md).
+fn remove_db(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(path.with_extension("jed.lock"));
+}
+
 /// Schema + rows exercising every deferrable type alongside a join partner and a secondary index.
 /// Default page size (8192) keeps every value inline-plain, so on a paged reopen each lands as
 /// `Unfetched::Inline` — the L2 case (nothing spills; that is large-values.md §14's case).
@@ -183,7 +190,7 @@ fn paged_inline_values_match_resident_across_query_shapes() {
     }
 
     drop(paged);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
 }
 
 /// Mutations on a paged store with deferred inline values: an UPDATE that touches only some columns
@@ -275,7 +282,7 @@ fn mutations_preserve_untouched_inline_values() {
         );
     }
     drop(paged);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
 }
 
 /// The v7 per-page CRC (replicated, like lazy_large_values.rs) so a corrupted page stays
@@ -385,7 +392,7 @@ fn untouched_corrupt_inline_body_defers_its_error() {
     assert_eq!(err.code(), "XX001");
 
     drop(db);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
 }
 
 /// An untouched deferred column riding a *spilling* sort (spill.md §4): the streaming sort feed
@@ -461,5 +468,5 @@ fn untouched_deferred_column_rides_a_spilling_sort() {
     }
 
     drop(paged);
-    let _ = std::fs::remove_file(&path);
+    remove_db(&path);
 }
