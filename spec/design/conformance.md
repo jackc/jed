@@ -441,8 +441,13 @@ settings) is a **walk**. `mise run test` and `mise run ci` do not invoke `confor
 they run `mise run conformance:all [--checked] [filter]`, which builds each runner once and runs all
 of those walks concurrently (they are independent single-threaded processes), buffering each walk's
 output and reporting in a fixed order. It then applies the query-memory peak comparison above. `ci`
-passes `--checked` through `JED_CONFORMANCE_CHECKED`; `JED_CONFORMANCE_JOBS` caps concurrency (1 runs
-the walks serially). The individual tasks remain for running one family alone.
+passes `--checked`; `JED_CONFORMANCE_JOBS` caps concurrency (1 runs the walks serially). The
+individual tasks remain for running one family alone.
+
+`test` and `ci` themselves run their steps concurrently the same way (`scripts/gate.rb`), with one
+ordering constraint: `corpus:norec_sweep` and `corpus:reduce_selftest` write temporary files into
+`suites/`, so they start only after the steps that read the whole tree (`verify`, `conformance:all`)
+have finished.
 
 ## 7. Open / deferred
 

@@ -76,11 +76,14 @@ _.path = [
 # `mise run` always loads [env] above, so a task reaches this checkout's PostgreSQL cluster no
 # matter which shell started it.
 #
-# ORDER IS DELIBERATE. mise runs a task's `depends` in PARALLEL, so composites here list their
-# steps as `{ task = ... }` entries in `run`, which run one after another and stop at the first
-# failure. Keep it that way: concurrency:process relies on real OS-lock timing, benchmarks measure
-# wall-clock time, and three cores' corpus walks interleaved are unreadable. `depends` is used only
-# for a task's single build prerequisite (e.g. ts:lock_build), which mise runs once per invocation.
+# ORDER IS DELIBERATE. mise runs a task's `depends` in PARALLEL and interleaves their output, so
+# composites here list their steps as `{ task = ... }` entries in `run`, which run one after another
+# and stop at the first failure. Benchmarks measure wall-clock time and must never overlap anything.
+# The exceptions are `test` and `ci` (scripts/gate.rb) and `conformance:all`, which run their steps
+# concurrently through scripts/lib/parallel.rb: each step's output buffered and printed in order,
+# every step run to completion, and `after` ordering where two steps must not overlap. `depends` is
+# used only for a task's single build prerequisite (e.g. ts:lock_build), which mise runs once per
+# invocation.
 #
 # Task arguments use mise's usage spec: `mise run corpus:check path/to/file.test`, and
 # `mise run <task> --help` prints them.
@@ -91,37 +94,21 @@ _.path = [
 description = "Engine test suites (alias for test)"
 run = [{ task = "test" }]
 
+# `test` and `ci` run their steps concurrently, each step's output buffered and printed in order;
+# the step lists live in scripts/gate.rb, where `ci` is `test` plus its extra steps by construction.
 [tasks.ci]
 description = "Full merge gate: spec verification, formatting, lint, tests, real-process locking, metamorphic sweep"
 # A SUPERSET of `test`: adds spec-data + byte-fixture verification + codegen drift (`verify`), the
 # formatter gate (`fmt`), the TS linter (`lint`), the downstream web type check (`web:check`), the
-# Rust corpus walks with debug assertions + overflow checks (the `conformance:rust:checked` walks),
-# the real-process shared-file corpus, and generative differential testing — the NoREC/TLP
-# metamorphic sweep + the reducer self-test. The checked walks come from setting
-# JED_CONFORMANCE_CHECKED, which is `conformance:all --checked`: they join the walks `test` already
-# runs concurrently, instead of following them.
-env = { JED_CONFORMANCE_CHECKED = "1" }
-run = [
-  { task = "verify" },
-  { task = "fmt" },
-  { task = "lint" },
-  { task = "web:check" },
-  { task = "test" },
-  { task = "concurrency:process" },
-  { task = "corpus:norec_sweep" },
-  { task = "corpus:reduce_selftest" },
-]
+# Rust corpus walks with debug assertions + overflow checks (`conformance:all --checked`), the
+# real-process shared-file corpus, and generative differential testing — the NoREC/TLP metamorphic
+# sweep + the reducer self-test.
+run = "ruby scripts/gate.rb ci"
 
 [tasks.test]
 description = "Engine test suites: conformance corpus (x3 cores; plain, forced-spill, query-memory) + unit + CLI + gem + migrate"
 # Example-based correctness against authored expectations — the inner dev loop.
-run = [
-  { task = "conformance:all" },
-  { task = "unit" },
-  { task = "cli:test" },
-  { task = "ruby:test" },
-  { task = "migrate:test" },
-]
+run = "ruby scripts/gate.rb test"
 
 [tasks.fmt]
 description = "Check formatting of cores, host artifacts, tooling, and web (alias for fmt:check)"
@@ -337,7 +324,12 @@ case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) lib=jed_lock.dll ;;
   *) lib=libjed_lock.so ;;
 esac
-cp "impl/ts/native-lock/target/release/$lib" impl/ts/jed_lock.node
+# Replace the addon only when it changed, and by rename: steps that depend on this task run
+# concurrently under `mise run ci`, and one may be loading the addon while another copies it.
+if ! cmp -s "impl/ts/native-lock/target/release/$lib" impl/ts/jed_lock.node; then
+  cp "impl/ts/native-lock/target/release/$lib" "impl/ts/jed_lock.node.$$"
+  mv -f "impl/ts/jed_lock.node.$$" impl/ts/jed_lock.node
+fi
 '''
 
 # --- Oracle (the live PostgreSQL differential oracle) ------------------------------------------

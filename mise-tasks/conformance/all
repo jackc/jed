@@ -2,7 +2,7 @@
 # frozen_string_literal: true
 #MISE description="Run every corpus walk concurrently: plain, forced-spill, query-memory (and --checked Rust)"
 #MISE depends=["ts:lock_build"]
-#USAGE flag "--checked" env="JED_CONFORMANCE_CHECKED" help="Also walk with the Rust `checked` profile (debug assertions + overflow checks)"
+#USAGE flag "--checked" help="Also walk with the Rust `checked` profile (debug assertions + overflow checks)"
 #USAGE arg "[filter]" help="Run only corpus files whose path contains this substring"
 
 # A WALK is one run of a core's conformance runner over the shared corpus in one configuration (core
@@ -19,15 +19,18 @@
 
 require "etc"
 require "tmpdir"
+require_relative "../../scripts/lib/parallel"
 require_relative "../../scripts/lib/tasks"
 require_relative "../../scripts/lib/query_memory_peaks"
 include Tasks
+
+$stdout.sync = true # keep stdout in order with the abort message on stderr
 
 CHECKED = ENV["usage_checked"] == "true"
 JOBS = [Integer(ENV.fetch("JED_CONFORMANCE_JOBS", Etc.nprocessors.to_s)), 1].max
 EXE = Gem.win_platform? ? ".exe" : ""
 
-started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+started = Parallel.now
 
 # Build each runner once and run the binaries directly: concurrent `cargo run`s queue on cargo's
 # build lock, and every `go run` relinks.
@@ -44,14 +47,12 @@ CORES = {
   "ts" => [%w[node src/bin/conformance.ts], TS_DIR],
 }.freeze
 
-Walk = Struct.new(:name, :argv, :env, :chdir, :status, :seconds, :log)
-
 common_env = ENV["usage_filter"] ? { "JED_CONFORMANCE_FILTER" => ENV["usage_filter"] } : {}
 Dir.mktmpdir("jed-conformance-all") do |dir|
   walks = []
   add = lambda do |name, core, args, env = {}|
     argv, chdir = CORES.fetch(core)
-    walks << Walk.new(name, argv + args, common_env.merge(env), chdir)
+    walks << Parallel::Job.new(name: name, argv: argv + args, env: common_env.merge(env), chdir: chdir)
   end
 
   # `conformance`: both storage modes.
@@ -62,8 +63,8 @@ Dir.mktmpdir("jed-conformance-all") do |dir|
   # `conformance:rust:checked`: the corpus's debug-assertion / overflow-check pass.
   if CHECKED
     checked = [File.join(rust_target, "checked", "conformance#{EXE}")]
-    walks << Walk.new("checked rust memory", checked, common_env, ROOT)
-    walks << Walk.new("checked rust disk", checked + ["disk"], common_env, ROOT)
+    walks << Parallel::Job.new(name: "checked rust memory", argv: checked, env: common_env, chdir: ROOT)
+    walks << Parallel::Job.new(name: "checked rust disk", argv: checked + ["disk"], env: common_env, chdir: ROOT)
   end
   # `conformance:spill`: every spill-capable operator on disk, then the temp-table files in memory
   # with every temp domain spilling (spec/design/conformance.md §1).
@@ -81,61 +82,19 @@ Dir.mktmpdir("jed-conformance-all") do |dir|
                           "JED_CONFORMANCE_QUERY_MEMORY_PEAKS" => peaks[mode][core]))
     end
   end
-  walks.each_with_index { |walk, i| walk.log = File.join(dir, format("%02d.log", i)) }
 
-  # Start the TS walks first: they are the slowest, so they decide when the set finishes.
-  queue = Queue.new
-  walks.each_index.sort_by { |i| [walks[i].name.include?(" ts ") ? 0 : 1, i] }.each { |i| queue << i }
-  queue.close
-  done = Queue.new
-  live = {}
-  lock = Mutex.new
-
-  $stdout.puts "running #{walks.size} walks, #{JOBS} at a time"
+  $stdout.puts "running #{walks.size} walks, #{[JOBS, walks.size].min} at a time"
   $stdout.flush
-  begin
-    Array.new([JOBS, walks.size].min) do
-      Thread.new do
-        while (i = queue.pop)
-          walk = walks[i]
-          clock = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          begin
-            pid = Process.spawn(walk.env, *walk.argv, chdir: walk.chdir, out: walk.log, err: %i[child out])
-            lock.synchronize { live[pid] = true }
-            Process.wait(pid)
-            lock.synchronize { live.delete(pid) }
-            walk.status = $?.success?
-          rescue SystemCallError => e
-            File.write(walk.log, "could not start #{walk.argv.first}: #{e.message}\n")
-            walk.status = false
-          end
-          walk.seconds = Process.clock_gettime(Process::CLOCK_MONOTONIC) - clock
-          done << i
-        end
-      end
-    end
+  # Start the TS walks first: they are the slowest, so they decide when the set finishes.
+  Parallel.run(walks, dir: dir, limit: JOBS, rank: ->(walk) { walk.name.include?(" ts ") ? 0 : 1 }) do |walk|
+    puts format("%-4s %-34s %6.2fs", walk.status ? "ok" : "FAIL", walk.name, walk.seconds)
+    File.foreach(walk.log) do |line|
+      next if line.start_with?("PASS ") || (walk.status && line.start_with?("SKIP "))
+      next if walk.status && line.strip.empty?
 
-    finished = Array.new(walks.size, false)
-    reported = 0
-    walks.size.times do
-      finished[done.pop] = true
-      while reported < walks.size && finished[reported]
-        walk = walks[reported]
-        puts format("%-4s %-34s %6.2fs", walk.status ? "ok" : "FAIL", walk.name, walk.seconds)
-        File.foreach(walk.log) do |line|
-          next if line.start_with?("PASS ") || (walk.status && line.start_with?("SKIP "))
-          next if walk.status && line.strip.empty?
-
-          puts "     #{line}"
-        end
-        $stdout.flush
-        reported += 1
-      end
+      puts "     #{line}"
     end
-  ensure
-    # Interrupted: start nothing more, and stop any walk still running rather than orphaning it.
-    queue.clear
-    lock.synchronize { live.each_key { |pid| Process.kill("TERM", pid) rescue nil } }
+    $stdout.flush
   end
 
   failures = walks.reject(&:status).map(&:name)
@@ -149,7 +108,7 @@ Dir.mktmpdir("jed-conformance-all") do |dir|
     failures << "query-memory peaks disagree across cores on #{mismatches.size} #{mode} record(s)"
   end
 
-  elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+  elapsed = Parallel.now - started
   walk_time = walks.sum(&:seconds)
   puts format("\n%d walks in %.1fs (%.1fs of walk time)", walks.size, elapsed, walk_time)
   abort "conformance failed:\n  #{failures.join("\n  ")}" unless failures.empty?

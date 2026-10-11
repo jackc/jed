@@ -795,9 +795,13 @@ The design is optimized for AI agents even more than for humans. In practice:
   path/to/file.test`, never Rake's bracket syntax). Because `mise run` always loads
   `mise.toml`'s `[env]` (this checkout's `PGHOST`/`PGPORT`), the same command works natively,
   inside the devcontainer, in CI, and from an agent's non-interactive shell. One trap: mise
-  runs a task's `depends` in **parallel**, so composite tasks sequence their steps as
-  `{ task = … }` entries in `run` (benchmarks and the real-process locking corpus must never
-  overlap); reserve `depends` for a single build prerequisite.
+  runs a task's `depends` in **parallel** with interleaved output, so composite tasks sequence
+  their steps as `{ task = … }` entries in `run` (benchmarks must never overlap anything); reserve
+  `depends` for a single build prerequisite. The exceptions are the gates: `test`, `ci`
+  (`scripts/gate.rb`) and `conformance:all` run their steps concurrently through
+  `scripts/lib/parallel.rb`, buffering each step's output and reporting in a fixed order. A step that
+  must not overlap another declares it (`after:`), as the corpus-writing NoREC sweep and reducer
+  self-test do for the corpus readers.
 - **Spec-first per subsystem.** A subsystem's design doc + the relevant corpus is what an
   agent needs to work it without holding the whole engine in context.
 - **Multiple agent instances; sync through `origin`, not just shared memory.** Several
