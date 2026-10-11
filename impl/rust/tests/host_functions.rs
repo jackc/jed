@@ -818,3 +818,31 @@ fn batch_kernel_serves_a_lone_call() {
     assert_eq!(rows, vec![vec![Value::Int(3)]]);
     assert_eq!(*calls.lock().unwrap(), vec![1; 6]);
 }
+
+#[test]
+fn zero_arg_batch_kernel_is_never_prefetched() {
+    // A zero-argument batch kernel receives no columns, so it cannot learn a batch's row count;
+    // the engine therefore never prefetches a zero-argument call and always hands it a one-row
+    // batch (§4.2.1). A kernel that appends one result per call is correct.
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = calls.clone();
+    let seven = HostFunction::batched(
+        "host_seven",
+        vec![],
+        ScalarType::Int64,
+        Box::new(
+            move |args: &[Vec<Value>], out: &mut Vec<Value>| -> jed::Result<()> {
+                assert!(args.is_empty());
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                out.push(Value::Int(7));
+                Ok(())
+            },
+        ),
+    )
+    .volatility(Volatility::Immutable);
+    let mut db = batch_db(seven, 30);
+    let (rows, _) = run(&mut db, "SELECT id, host_seven() FROM t").unwrap();
+    assert_eq!(rows.len(), 30);
+    assert!(rows.iter().all(|r| r[1] == Value::Int(7)));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 30);
+}

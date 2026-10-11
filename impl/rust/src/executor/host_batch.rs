@@ -65,7 +65,8 @@ fn trivially_evaluable(e: &RExpr) -> bool {
 impl HostBatch {
     /// The batch for a site that evaluates every expression of `exprs` once per row, or `None` when
     /// none is eligible (§4.2.1): an item that is itself a call to a non-`volatile` host function
-    /// whose arguments are all trivially evaluable.
+    /// with at least one argument, all trivially evaluable. A zero-argument call is never prefetched:
+    /// its kernel receives no columns, so it could not learn the batch's row count.
     pub(crate) fn for_exprs(
         exprs: &[RExpr],
         ext: &crate::extension::ExtensionRegistry,
@@ -75,7 +76,9 @@ impl HostBatch {
             .enumerate()
             .filter(|(_, e)| match e {
                 RExpr::HostFunc { id, args, .. } => {
-                    ext.function(*id).batchable() && args.iter().all(trivially_evaluable)
+                    ext.function(*id).batchable()
+                        && !args.is_empty()
+                        && args.iter().all(trivially_evaluable)
                 }
                 _ => false,
             })

@@ -73,13 +73,14 @@ export class HostBatch {
   }
 
   // The batch for a site that evaluates every expression of `exprs` once per row, or null when none
-  // is eligible (§4.2.1): an item that is itself a call to a non-volatile host function whose
-  // arguments are all trivially evaluable.
+  // is eligible (§4.2.1): an item that is itself a call to a non-volatile host function with at
+  // least one argument, all trivially evaluable. A zero-argument call is never prefetched: its kernel
+  // receives no columns, so it could not learn the batch's row count.
   static forExprs(exprs: RExpr[], registry: ExtensionRegistry | null): HostBatch | null {
     if (registry === null) return null;
     const slots: Slot[] = [];
     for (const e of exprs) {
-      if (e.kind !== "hostFunc") continue;
+      if (e.kind !== "hostFunc" || e.args.length === 0) continue;
       if (!registry.functionAt(e.id).batchable() || !e.args.every(triviallyEvaluable)) continue;
       slots.push({ node: e, base: 0, outcomes: [] });
     }

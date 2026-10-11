@@ -59,7 +59,9 @@ over a filtered or joined result), it calls a non-`volatile` batch kernel once p
 1,024 rows, then replays the row-by-row evaluation against those results. That matters most when a
 call crosses a language boundary — a binding that wraps jed in another language pays the crossing
 once per chunk instead of once per row. A `volatile` function is always called one row at a time,
-so its calls happen exactly as a one-row kernel's would.
+so its calls happen exactly as a one-row kernel's would. So is a function with **no arguments**: its
+batch kernel receives no columns to learn a row count from, so jed always hands it exactly one row,
+and it appends exactly one result.
 
 Because jed may compute a chunk ahead of the rows it emits, a batch kernel can run on rows a query
 never returns — the tail of a chunk after a `LIMIT` is satisfied, or after an earlier error. Your

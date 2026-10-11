@@ -61,11 +61,12 @@ func triviallyEvaluable(e *rExpr) bool {
 
 // newHostBatch returns the batch for a site that evaluates every expression of exprs once per row,
 // or nil when none is eligible (§4.2.1): an item that is itself a call to a non-Volatile host
-// function whose arguments are all trivially evaluable.
+// function with at least one argument, all trivially evaluable. A zero-argument call is never
+// prefetched: its kernel receives no columns, so it could not learn the batch's row count.
 func newHostBatch(exprs []*rExpr, ext *ExtensionRegistry) *hostBatch {
 	var slots []hostBatchSlot
 	for _, e := range exprs {
-		if e.kind != reHostFunc || !ext.function(e.index).batchable() {
+		if e.kind != reHostFunc || len(e.sargs) == 0 || !ext.function(e.index).batchable() {
 			continue
 		}
 		eligible := true

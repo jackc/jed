@@ -41,7 +41,7 @@ export type HostKernel = (args: Value[]) => Value;
 // kernel pushes one result per row, in row order, to `out` (handed in empty). On a throw, out.length
 // is the index of the failing row — the rows before it succeeded — so a batch raises for the same row
 // a single-row call would. Must be the row-wise map of a scalar function: result i depends only on
-// row i's arguments.
+// row i's arguments. A zero-argument kernel (no columns) is always handed exactly one row.
 export type HostBatchKernel = (args: Value[][], out: Value[]) => void;
 
 // One row's outcome of a batch call (HostFuncEntry.callBatch): a returned result, or the error the

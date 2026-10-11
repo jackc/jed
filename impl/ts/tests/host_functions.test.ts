@@ -671,6 +671,29 @@ test("batch kernel serves a lone call", () => {
   assert.deepEqual(calls, new Array(6).fill(1));
 });
 
+test("zero-argument batch kernel is never prefetched", () => {
+  // A zero-argument batch kernel receives no columns, so it cannot learn a batch's row count; the
+  // engine therefore never prefetches a zero-argument call and always hands it a one-row batch
+  // (§4.2.1). A kernel that appends one result per call is correct.
+  let calls = 0;
+  const seven: HostFunctionSpec = {
+    name: "host_seven",
+    argTypes: [],
+    result: "i64",
+    batchKernel: (args, out) => {
+      assert.equal(args.length, 0);
+      calls++;
+      out.push(intValue(7n));
+    },
+    volatility: "immutable",
+  };
+  const s = batchDb(seven, 30);
+  const rows = rowsOf(s, "SELECT id, host_seven() FROM t");
+  assert.equal(rows.length, 30);
+  for (const r of rows) assert.equal(asInt(r[1]!), 7n);
+  assert.equal(calls, 30);
+});
+
 test("exactly one of kernel and batchKernel is required", () => {
   // Both, or neither, is rejected 22023 at registration (the code a negative cost uses).
   const r = new ExtensionRegistry();

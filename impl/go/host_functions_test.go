@@ -691,3 +691,32 @@ func TestHostBatchKernelServesALoneCall(t *testing.T) {
 		t.Fatalf("call sizes = %v, want six one-row calls", got)
 	}
 }
+
+func TestHostZeroArgBatchKernelIsNeverPrefetched(t *testing.T) {
+	t.Parallel()
+	// A zero-argument batch kernel receives no columns, so it cannot learn a batch's row count; the
+	// engine therefore never prefetches a zero-argument call and always hands it a one-row batch
+	// (§4.2.1). A kernel that appends one result per call is correct.
+	calls := &hostCalls{}
+	seven := NewHostBatchFunction("host_seven", []string{}, "i64",
+		func(args [][]Value, out []Value) ([]Value, error) {
+			if len(args) != 0 {
+				return out, fmt.Errorf("host_seven got %d argument columns", len(args))
+			}
+			calls.record(1)
+			return append(out, IntValue(7)), nil
+		}).WithVolatility(VolatilityImmutable)
+	s := batchDB(t, seven, 30)
+	rows := hostRows(t, s, "SELECT id, host_seven() FROM t")
+	if len(rows) != 30 {
+		t.Fatalf("got %d rows, want 30", len(rows))
+	}
+	for _, r := range rows {
+		if r[1].Kind != ValInt || r[1].Int != 7 {
+			t.Fatalf("row %d: got %v, want 7", r[0].Int, r[1])
+		}
+	}
+	if got := len(calls.get()); got != 30 {
+		t.Fatalf("kernel called %d times, want 30", got)
+	}
+}

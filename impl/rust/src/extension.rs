@@ -60,7 +60,8 @@ pub type HostKernel = Box<dyn Fn(&[Value]) -> Result<Value> + Send + Sync>;
 /// sent). The kernel appends one result per row, in row order, to `out` (handed in empty). On `Err`,
 /// the number of results it appended is the index of the failing row — the rows before it succeeded —
 /// so a batch raises for the same row a single-row call would. Must be the row-wise map of a scalar
-/// function: result `i` depends only on row `i`'s arguments.
+/// function: result `i` depends only on row `i`'s arguments. A zero-argument kernel (no columns) is
+/// always handed exactly one row.
 pub type HostBatchKernel = Box<dyn Fn(&[Vec<Value>], &mut Vec<Value>) -> Result<()> + Send + Sync>;
 
 /// One registered host scalar function (extensibility.md §4.2). Built with [`HostFunction::new`]
@@ -211,6 +212,12 @@ impl HostFunction {
     /// many results, or an error after answering every row, fails at the first row. Results are NOT
     /// type-checked here — the replay does that per row, so a type error surfaces at its own row.
     pub(crate) fn call_batch(&self, args: &[Vec<Value>], n: usize) -> Vec<Option<Result<Value>>> {
+        // A kernel learns the row count only from its columns, so a zero-argument call is always a
+        // one-row batch (§4.2.1).
+        debug_assert!(
+            !args.is_empty() || n == 1,
+            "a zero-argument batch has one row"
+        );
         let mut out = Vec::with_capacity(n);
         let res = match &self.kernel {
             Kernel::Batch(k) => k(args, &mut out),

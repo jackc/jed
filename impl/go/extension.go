@@ -51,7 +51,8 @@ type HostKernel func(args []Value) (Value, error)
 // never sent). The kernel appends one result per row, in row order, to out (handed in empty) and
 // returns it. On error, the length of the returned slice is the index of the failing row — the rows
 // before it succeeded — so a batch raises for the same row a single-row call would. Must be the
-// row-wise map of a scalar function: result i depends only on row i's arguments.
+// row-wise map of a scalar function: result i depends only on row i's arguments. A zero-argument
+// kernel (no columns) is always handed exactly one row.
 type HostBatchKernel func(args [][]Value, out []Value) ([]Value, error)
 
 // HostFunction is a host scalar function to register (extensibility.md §4.2). Build it with

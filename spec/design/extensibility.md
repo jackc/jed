@@ -333,6 +333,11 @@ it appended is the index of the failing row** — rows before it succeeded, and 
 This prefix rule is what keeps error ordering identical to scalar evaluation without a per-row result
 envelope, and it is the shape a wrapped core marshals once per crossing.
 
+**Zero arguments.** A kernel learns the row count only from its columns, so a **zero-argument**
+function's kernel — handed no columns — always receives exactly **one** row (`n = 1`): it appends one
+result per call. The engine guarantees this by never prefetching a zero-argument call (eligibility
+rule 2 below); batching buys nothing without argument columns to amortize.
+
 | | Rust | Go | TS |
 |---|---|---|---|
 | batch kernel | `Box<dyn Fn(&[Vec<Value>], &mut Vec<Value>) -> Result<()> + Send + Sync>` | `func(args [][]Value, out []Value) ([]Value, error)` (append to `out`, return it) | `(args: Value[][], out: Value[]) => void` (push to `out`, throw on error) |
@@ -364,9 +369,9 @@ lanes (packed-leaf.md §11), batching needs no unmetered gate. A call node is el
    An `immutable`/`stable` kernel may be invoked on rows replay never reaches (a later error, an early
    cursor close, a LIMIT window that ends mid-chunk); those calls are wasted host work, not observable
    SQL behavior;
-2. every argument is **trivially evaluable** — a column reference, constant, or parameter — so the
-   prefetch can evaluate it without a meter: such an argument is free (cost.md §3) and cannot raise,
-   so the prefetch does no unmetered engine work. For the same reason a replayed row whose outcome
+2. it has **at least one argument**, and every argument is **trivially evaluable** — a column
+   reference, constant, or parameter — so the prefetch can evaluate it without a meter: such an
+   argument is free (cost.md §3) and cannot raise, so the prefetch does no unmetered engine work. For the same reason a replayed row whose outcome
    *was* prefetched (its arguments proven non-NULL) may skip re-evaluating them: doing so would charge
    nothing, raise nothing, and not short-circuit, so it is unobservable;
 3. it is evaluated **unconditionally, once per row**, at the site — a direct item of the evaluated
