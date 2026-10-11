@@ -21,6 +21,12 @@ s.query("SELECT current_setting('myapp.tenant')");
 // Variables are SESSION state, not data — they do NOT roll back with a transaction. resetVar clears
 // one by name.
 s.resetVar('myapp.tenant');
+
+// The built-in session time zone (UTC by default) decides how a timestamptz renders as text. A query
+// returns a zone-free value; render it through the session to show it in the session zone.
+s.setTimeZone('+05:00'); // a fixed offset uses the POSIX sign: '+05:00' is UTC-5
+const [[at]] = [...s.query("SELECT timestamptz '2024-01-15 12:00:00+00'")];
+console.log(s.render(at)); // 2024-01-15 07:00:00-05
 s.close();
 
 db.close();

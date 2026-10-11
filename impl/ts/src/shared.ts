@@ -112,7 +112,7 @@ export function setAfterPersistHook(
 import type { ScriptSummary } from "./split.ts";
 import type { Privileges, PrivilegeSet } from "./privileges.ts";
 import type { ClockFunc, RandomFill } from "./seam.ts";
-import type { Value } from "./value.ts";
+import { renderIn, type Value } from "./value.ts";
 
 const pathEncoder = new TextEncoder();
 function compareFilePaths(left: string, right: string): number {
@@ -1859,6 +1859,14 @@ export class Session {
   }
   setTimeZone(zone: string): void {
     this.engine.session.setTimeZone(zone);
+  }
+  // render renders v as PostgreSQL shows a result column (spec/design/timezones.md §9.5): exactly the
+  // canonical render, except every timestamptz — at any depth inside an array, composite, or range —
+  // renders in this session's CURRENT time zone (`2024-01-15 07:00:00-05`). Host-side and unmetered.
+  // Throws 22008 only for a finite instant within an offset of jed's i64 extremes, outside
+  // PostgreSQL's range. The value.ts render stays the zone-free (UTC) canonical form.
+  render(v: Value): string {
+    return renderIn(v, this.engine.session.timeZone);
   }
   setRandomSource(f: RandomFill): void {
     this.engine.session.seam.randomFill = f;

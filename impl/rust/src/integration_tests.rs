@@ -187,6 +187,8 @@ mod subquery;
 mod timestamp;
 #[path = "../tests/timestamptz_session_input.rs"]
 mod timestamptz_session_input;
+#[path = "../tests/timestamptz_session_render.rs"]
+mod timestamptz_session_render;
 #[path = "../tests/timezone.rs"]
 mod timezone;
 #[path = "../tests/transactions.rs"]

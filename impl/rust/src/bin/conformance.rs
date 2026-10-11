@@ -15,7 +15,7 @@
 //! core is the writer; the Go/TS harnesses stay pure verifiers, so re-running them is the
 //! independent cross-core check that all cores agree on the new costs (CLAUDE.md §8).
 
-use jed::{CreateOptions, Database, SUPPORTED_CAPABILITIES, Session as JedSession, Value};
+use jed::{CreateOptions, Database, SUPPORTED_CAPABILITIES, Session as JedSession};
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -1254,7 +1254,9 @@ fn take_sql_until_separator<'a, I: Iterator<Item = &'a str>>(
 struct Drained {
     column_names: Vec<String>,
     column_types: Vec<String>,
-    rows: Vec<Vec<Value>>,
+    /// Each result cell, rendered through the session that ran the record (`Session::render`), so
+    /// a `timestamptz` shows in that session's `# timezone:` zone (spec/design/timezones.md §9.5).
+    rows: Vec<Vec<String>>,
     cost: i64,
 }
 
@@ -1280,12 +1282,23 @@ fn drain_query(sess: &mut JedSession, sql: &str) -> jed::Result<Drained> {
     let mut rows = sess.query(sql, &[])?;
     let column_names = rows.column_names().to_vec();
     let column_types = rows.column_types().to_vec();
-    let mut collected = Vec::new();
+    let mut values = Vec::new();
     while let Some(row) = rows.next() {
-        collected.push(row);
+        values.push(row);
     }
     rows.error()?;
     let cost = rows.cost();
+    drop(rows);
+    // Render while the record's session zone is still in effect; a render failure (22008, only at
+    // jed's out-of-PG-range extremes) fails the record like an output-time error fails a PG query.
+    let mut collected = Vec::with_capacity(values.len());
+    for row in &values {
+        collected.push(
+            row.iter()
+                .map(|v| sess.render(v))
+                .collect::<jed::Result<Vec<String>>>()?,
+        );
+    }
     Ok(Drained {
         column_names,
         column_types,
@@ -1299,15 +1312,9 @@ fn drain_query(sess: &mut JedSession, sql: &str) -> jed::Result<Drained> {
 fn render_drained(drained: &Drained, cols: usize, sortmode: &str) -> Vec<String> {
     let mut flat = Vec::new();
     for row in &drained.rows {
-        for v in row {
-            flat.push(render_value(v));
-        }
+        flat.extend(row.iter().cloned());
     }
     apply_sort(flat, cols, sortmode)
-}
-
-fn render_value(v: &Value) -> String {
-    v.render()
 }
 
 /// Compare an expected vs actual flat row-major result list, applying the per-column conformance

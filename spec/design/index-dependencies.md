@@ -18,6 +18,7 @@ and overloads apply these argument-sensitive rules:
 | EXTRACT / date_part from timestamptz, constant field `epoch` | arguments only |
 | Other EXTRACT / date_part from timestamptz | session timezone |
 | timestamp/date conversion crossing the timestamptz boundary | session timezone |
+| timestamptz → text, or array → text whose element type contains timestamptz (timezones.md §9.5) | session timezone |
 | timestamptz interval arithmetic | arguments only under jed's existing UTC arithmetic contract (interval.md) |
 | Two-argument date_trunc on timestamptz; six-argument make_timestamptz | session timezone |
 | AT TIME ZONE, explicit-zone date_trunc / make_timestamptz | arguments plus the explicit zone |

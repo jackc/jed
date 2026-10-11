@@ -307,9 +307,19 @@ impl RExpr {
                 m.charge(COSTS.operator_eval);
                 match inner.eval(row, env, m)? {
                     Value::Null => Ok(Value::Null),
-                    // array → text: render via `array_out` (PG-byte-exact §7).
+                    // array → text: render via `array_out` (PG-byte-exact §7). A `timestamptz` at
+                    // any depth renders in the SESSION zone, one `timezone` unit per finite instant,
+                    // charged before rendering like the scalar text cast (timezones.md §9.5).
                     Value::Array(a) if to_elem.is_none() => {
-                        let out = Value::Text(crate::value::array_out(&a));
+                        let zoned = a.elements.iter().map(Value::zone_render_count).sum::<u64>();
+                        if zoned > 0 {
+                            m.charge(COSTS.timezone * zoned as i64);
+                            m.guard()?;
+                        }
+                        let out = Value::Text(crate::value::array_out_zoned(
+                            &a,
+                            Some(&env.exec.session.time_zone),
+                        )?);
                         // A growth kernel: element quoting can expand strings (cost.md §8.1).
                         if !rexpr_is_constant(inner) {
                             charge_output(m, &out)?;

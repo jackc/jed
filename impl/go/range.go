@@ -683,8 +683,18 @@ func rangeMinus(a, b *RangeVal) (*RangeVal, error) {
 // [(lower,upper)] with the bound omitted for infinite and double-quoted where the element's text
 // has a special character (so a tsrange bound's space is quoted, a daterange bound is bare).
 func rangeOut(r *RangeVal) string {
+	s, err := rangeOutZoned(r, nil)
+	if err != nil {
+		panic("BUG: the canonical render cannot fail")
+	}
+	return s
+}
+
+// rangeOutZoned is rangeOut with a tstzrange bound rendered in zone when one is given (the session
+// render, timezones.md §9.5).
+func rangeOutZoned(r *RangeVal, zone *ZoneRef) (string, error) {
 	if r.Empty {
-		return "empty"
+		return "empty", nil
 	}
 	var b strings.Builder
 	if r.LowerInc {
@@ -693,18 +703,26 @@ func rangeOut(r *RangeVal) string {
 		b.WriteByte('(')
 	}
 	if r.Lower != nil {
-		b.WriteString(quoteRangeBound(r.Lower.Render()))
+		s, err := r.Lower.renderZoned(zone)
+		if err != nil {
+			return "", err
+		}
+		b.WriteString(quoteRangeBound(s))
 	}
 	b.WriteByte(',')
 	if r.Upper != nil {
-		b.WriteString(quoteRangeBound(r.Upper.Render()))
+		s, err := r.Upper.renderZoned(zone)
+		if err != nil {
+			return "", err
+		}
+		b.WriteString(quoteRangeBound(s))
 	}
 	if r.UpperInc {
 		b.WriteByte(']')
 	} else {
 		b.WriteByte(')')
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 // quoteRangeBound double-quotes a bound's rendered text if it needs it (PG range_out quoting):

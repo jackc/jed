@@ -2067,6 +2067,18 @@ pub(crate) struct CompositeRType {
 }
 
 impl ResolvedType {
+    /// Whether a `timestamptz` occurs anywhere in this type — itself, an array element, a composite
+    /// field, or a range subtype, at any depth. Rendering such a value to text reads the session zone
+    /// (timezones.md §9.5).
+    pub(crate) fn contains_timestamptz(&self) -> bool {
+        match self {
+            ResolvedType::Timestamptz => true,
+            ResolvedType::Array(e) | ResolvedType::Range(e) => e.contains_timestamptz(),
+            ResolvedType::Composite(c) => c.fields.iter().any(|(_, t)| t.contains_timestamptz()),
+            _ => false,
+        }
+    }
+
     /// This type's name, for the `# types:` output and a `42804` assignability message (the integer
     /// width is exact). A named composite is its type name; an anonymous `ROW(...)` is `record` (PG).
     fn type_name(&self) -> String {

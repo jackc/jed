@@ -21,7 +21,7 @@ import {
   type ScanCacheHolder,
   stmtIsWrite,
 } from "./executor.ts";
-import type { Value } from "./value.ts";
+import { renderIn, type Value } from "./value.ts";
 
 // PreparedStatement is a parsed, reusable statement (spec/design/api.md §2.4): a standalone value
 // holding only the parsed AST and its plan cache — no session or database reference (the converged
@@ -332,6 +332,12 @@ export class Transaction {
   query(sql: string, params: Value[] = []): Rows {
     const outcome = this.db.executeStmtParams(this.db.parse(sql), params);
     return rowsFromOutcome(outcome, this.db.session);
+  }
+
+  // render renders v in the owning session's current time zone — Session.render
+  // (spec/design/timezones.md §9.5).
+  render(v: Value): string {
+    return renderIn(v, this.db.session.timeZone);
   }
 
   // prepareStatement parses sql once into a reusable PreparedStatement (spec/design/api.md §2.4): a

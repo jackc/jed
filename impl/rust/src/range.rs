@@ -868,20 +868,33 @@ pub fn range_minus(a: &RangeVal, b: &RangeVal) -> Result<RangeVal> {
 /// when the element's rendering has a special character (whitespace, a bracket/comma/quote/backslash,
 /// or is empty) — so a tsrange bound's space is quoted but a daterange bound is bare.
 pub fn range_out(r: &RangeVal) -> String {
+    range_out_zoned(r, None).expect("the canonical render cannot fail")
+}
+
+/// [`range_out`] with a `tstzrange` bound rendered in `zone` when one is given (the session render,
+/// timezones.md §9.5).
+pub(crate) fn range_out_zoned(
+    r: &RangeVal,
+    zone: Option<&crate::timezone::ZoneRef>,
+) -> Result<String> {
     if r.empty {
-        return "empty".to_string();
+        return Ok("empty".to_string());
     }
+    let render = |v: &Value| match zone {
+        Some(z) => v.render_in(z),
+        None => Ok(v.render()),
+    };
     let mut out = String::new();
     out.push(if r.lower_inc { '[' } else { '(' });
     if let Some(lo) = &r.lower {
-        out.push_str(&quote_bound(&lo.render()));
+        out.push_str(&quote_bound(&render(lo)?));
     }
     out.push(',');
     if let Some(hi) = &r.upper {
-        out.push_str(&quote_bound(&hi.render()));
+        out.push_str(&quote_bound(&render(hi)?));
     }
     out.push(if r.upper_inc { ']' } else { ')' });
-    out
+    Ok(out)
 }
 
 /// Double-quote a bound's rendered text if it needs it (PG range_out quoting): empty, or containing

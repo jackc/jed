@@ -63,9 +63,9 @@ decomposed *in*. Each is oracle-checked against PostgreSQL.
 What it deliberately does **not** add: any change to how `timestamptz` is *stored* or *compared* (§2);
 the `text`↔datetime casts, `make_timestamptz`, `to_char`/`to_timestamp`, and `date_part` (§9, the
 deferred remainder); and the **session-zone rendering** of a `timestamptz` to text — the session zone
-drives *computation* this slice, not *output formatting* (§9.5). Those land later, each oracle-checked
-against PostgreSQL (the `timestamptz → text` cast and the runtime `text`→datetime casts have since
-landed — §9.5, §9.3).
+drove *computation* in this slice, not *output formatting*. Those landed later, each oracle-checked
+against PostgreSQL (session-zone rendering, the runtime `text`→datetime casts, and offset-less input in
+the session zone — §9.5, §9.3).
 
 ## 2. The representation — `timestamptz` is UTC, and that buys structural immunity
 
@@ -274,7 +274,7 @@ derive*, not to *read a stored value*:
 | `timestamptz` stored value / comparison / plain index | **No** | UTC `i64`; tz-free (§2). The common case. |
 | `AT TIME ZONE` in a query expression | the query reads it | Pure over the instant + loaded bytes; affects the *computed result*, never stored bytes or order. |
 | Parse an offset-less `timestamptz` string in the session zone (every input path: literal, assignment, bound parameter, container text, the runtime `text` cast — §9.3) | — (write path) | The result is a UTC instant; STABLE, so never a persisted index key. |
-| Render a `timestamptz` as `text` in the session zone (the `::text` cast, §9.5) | the query reads it | Affects the computed text, never stored bytes or order; STABLE, so never a persisted index key. |
+| Render a `timestamptz` as `text` in the session zone (the `::text` cast, `array → text`, and the host's session render of a result cell — §9.5) | the query reads it | Affects the computed text, never stored bytes or order; STABLE, so never a persisted index key. |
 | `tz`-dependent **expression DEFAULT** ([constraints.md §2](constraints.md)) | **No** | Evaluated once at INSERT, frozen as a stored value; a plain index over that value stays consistent. **Not exposed.** |
 | `tz`-dependent **functional index key** (future) | **No** for the base heap-scan; **yes** for index-accelerated lookup | The exposed case — §8. |
 | `tz`-dependent **STORED generated column** (future) | **No** — value on disk | Exposed only on recompute/maintenance. |
@@ -338,9 +338,9 @@ exactly as PostgreSQL does. Each is oracle-checked against `postgres:18` (CLAUDE
 `clock_timestamp()` (VOLATILE) → `timestamptz`.
 
 **Still deferred** (each oracle-checked against PG when it lands, CLAUDE.md §7): `to_char` /
-`to_timestamp` (a parsing/formatting surface, a different axis from "in a zone"), `age`, and the
-session-zone rendering of a `timestamptz` **result cell** (§9.5 — the explicit `timestamptz → text`
-cast itself has landed and renders in the session zone). The runtime `text → date` /
+`to_timestamp` (a parsing/formatting surface, a different axis from "in a zone") and `age`.
+Session-zone rendering of a `timestamptz` — the `::text` cast, nested in `array → text`, and result
+cells through the host's session render — has landed (§9.5). The runtime `text → date` /
 `timestamp` / `timestamptz` casts ([date.md §6](date.md), §9.3), offset-less `timestamptz` input in
 the session zone on every path (§9.3), **`date_part`** (§9.2), and
 `make_timestamptz` (the make_timestamp slice, [functions.md §11](functions.md)) have landed. All remain
@@ -476,7 +476,7 @@ the executing handle for the statement's duration), so `date_trunc(unit, timesta
 cross-core metering point — like `AT TIME ZONE`). They are never folded at resolve time (no constant
 folding evaluates them), so the zone is always the one in effect when the row is processed.
 
-### 9.5 Rendering: the text cast follows the session zone; result cells stay UTC
+### 9.5 Rendering: every `timestamptz` → text follows the session zone
 
 The explicit **`timestamptz → text` cast** (`tz::text`, `CAST(tz AS text)`, `tz::varchar(n)` —
 [types.md](types.md) §5) renders the instant **in the session zone**, as PostgreSQL's `timestamptz_out`
@@ -486,21 +486,49 @@ effect at that instant in PostgreSQL's `EncodeTimezone` spelling — `+HH` for a
 pre-standard-time local mean time such as New York's `-04:56:02`), placed before any ` BC` era.
 `±infinity` render bare and consult no zone. A finite instant charges one `timezone` unit, and the cast
 is **STABLE** (`42P17` in an index expression or predicate), the same posture as the §9.3 casts. The
-element-wise `timestamptz[] → text[]` cast renders each element the same way. All of this is
-oracle-checked (`suites/cast/scalar_to_text.test`).
+element-wise `timestamptz[] → text[]` cast renders each element the same way. Oracle-checked
+(`suites/cast/scalar_to_text.test`).
 
-A deliberate, documented narrowing remains for **result cells**: a `timestamptz` value returned as a
-column still renders in **UTC** (the `+00` suffix) regardless of the session zone, and so does a
-`timestamptz` nested inside an array/record/range render (`array_out`, `record_out`, `range_out`, and
-an `array → text` cast). PostgreSQL renders those in the session zone too. jed's value→text rendering
-of a result is context-free ([value rendering](../../impl/rust/src/value.rs)), and threading the zone
-into it (recursively, through the container renders) is the separate **session-zone result rendering**
-follow-on. The exposure is contained: there is **no SQL `SET TIME ZONE`** yet (the slot is
-host-API-only — [session.md §6.2](session.md)), so only a host that deliberately calls `set_time_zone`
-sees it, and the value is the same instant either way; a query that wants the session-zone text asks
-for it with `::text`. Tests exercise a `timestamptz`-producing operation under a non-UTC session by
-casting it to text, rendering it through `AT TIME ZONE 'UTC'` (a zone-free `timestamp`), or checking a
-zone-free output type.
+Every other place a `timestamptz` becomes text follows the same rule, so a session zone governs
+computation (§9.4), input (§9.3), and output alike. Oracle-checked in
+`suites/types/timestamptz_session_render.test`.
+
+- **The `array → text` cast** (`array_out`, [array.md](array.md) §7) renders a `timestamptz` at any
+  depth in the session zone: an element, a field of a composite element (`record_out`), or a bound of
+  a range element (`range_out`). It charges one `timezone` unit per finite `timestamptz` it renders
+  (NULL and `±infinity` charge nothing), all charged and guarded before rendering, on top of its
+  existing `operator_eval` and output-byte charges. The cast is **STABLE iff its element type contains
+  `timestamptz`** anywhere (through composite fields, range subtypes, and nested arrays), so
+  `42P17` in an index expression or predicate; an array whose element type holds no `timestamptz`
+  renders zone-free and stays admissible. (PostgreSQL marks `array_out` STABLE for every element type;
+  jed's per-operation dependency rule, [index-dependencies.md](index-dependencies.md), admits the
+  zone-free ones.) The composite → text and range → text casts remain `0A000`, and `to_json[b]` of a
+  `timestamptz` remains a `0A000` follow-on; when it lands it renders the session zone in
+  PostgreSQL's ISO form (`"2024-01-15T17:30:00+05:30"`).
+- **Result cells.** A result cell is a zone-free value; turning it into text is a host act. The host
+  API therefore has two renders:
+  - the **canonical render** — Rust `Value::render`, Go `Value.Render`, TS `render(value)` — is
+    zone-free: a `timestamptz` renders in UTC (`+00`). It needs no session, never fails, and its
+    output re-parses to the same instant under any session zone. The CLI's `--dump` uses it so a dump
+    does not depend on the zone it was taken in.
+  - the **session render** — Rust `Session::render` / `Transaction::render`, Go `Session.Render` /
+    `Transaction.Render`, TS `Session.render` / `Transaction.render` — renders a value the way
+    PostgreSQL shows a result column: every `timestamptz` in it, at any depth inside an array,
+    composite, or range, in the session's **current** zone. It is host-side work after the
+    statement, so it is unmetered. It fails with `22008` only for a finite instant within an offset of
+    jed's `i64` extremes (§6), far outside PostgreSQL's range; inside PostgreSQL's range it cannot fail.
+  The conformance harness renders every result cell through the session render of the session that ran
+  the record, so a `# timezone:` directive governs the record's rendering too. A render failure fails
+  the record with its code, as an output-time error fails the query in PostgreSQL.
+- **Hosts with no zone setting.** The CLI and the web playground never set a zone; their sessions run
+  in `UTC`, where the session render equals the canonical render. The TS ergonomic row mapping
+  (`valueToJs`) returns the canonical text for the types it does not map natively, so it is zone-free;
+  a host that wants session-zone text calls the session render.
+- **EXPLAIN (a deliberate divergence).** `EXPLAIN (VERBOSE)` prints a `timestamptz` constant in its
+  canonical UTC spelling (`'2024-01-15 12:00:00+00'`), where PostgreSQL deparses it in the session
+  zone. jed's plan text is its own context-free spelling (structural column slots, not a SQL
+  deparse — [explain.md](explain.md)), so the same plan prints identically under every session; the
+  explicit `+00` keeps the constant unambiguous.
 
 ## 10. Untrusted-query safety, cost, and the determinism ledger
 
@@ -601,15 +629,16 @@ the tz database, the load seam, the TZif reader, `AT TIME ZONE`, and the convers
   `date_trunc` / `EXTRACT` / the cross-family casts (§9); the runtime `text → date` cast and
   `date_part` (§9.2) have since landed ([date.md §6](date.md)), and so have the runtime
   `text → timestamp`/`timestamptz` casts and offset-less `timestamptz` input in the session zone on
-  every path (§9.3). Still deferred: `to_char`, `age`, and session-zone rendering of result
-  cells (§9, §9.5 — the explicit `timestamptz → text` cast has landed and renders in the session zone).
+  every path (§9.3), and session-zone rendering everywhere a `timestamptz` becomes text (§9.5). Still
+  deferred: `to_char` and `age`.
   (`make_timestamptz` landed with the make_timestamp slice — [functions.md §11](functions.md).)
 - **Persisted dependencies.** Format 32 adds per-index timezone pins for derived keys and partial
   predicates ([index-dependencies.md](index-dependencies.md)); plain values keep their UTC encoding.
-- **Session zone drives computation and the text cast, not result rendering.** The session `TimeZone`
-  is the zone a `timestamptz` is decomposed *in* (§9.4) and the zone the explicit `timestamptz → text`
-  cast renders in; a `timestamptz` result cell still *renders* in UTC (§9.5) — the result-rendering
-  follow-on lifts that.
+- **Session zone drives computation, input, and rendering.** The session `TimeZone` is the zone a
+  `timestamptz` is decomposed *in* (§9.4), the zone offset-less input is read in (§9.3), and the zone
+  every `timestamptz` → text renders in (§9.5): the `::text` cast, `array → text`, and a result cell
+  through the host's session render. The canonical value render stays zone-free (UTC), and EXPLAIN
+  keeps that canonical spelling (a documented divergence, §9.5).
 - **`date_part` and `julian` excluded by jed's type system.** `date_part` returns `double precision` and
   jed has no `float` type (§9.2); `EXTRACT(julian …)` on a timestamp is a non-terminating PG-internal
   decimal (§9.2) — both deferred, documented divergences (a `date` argument to `date_trunc`/an implicit
@@ -642,7 +671,8 @@ the tz database, the load seam, the TZif reader, `AT TIME ZONE`, and the convers
   loaded set (`UTC` + fixed offsets always; a named zone gated on a loaded bundle providing it, else
   `22023`) and stored as a resolved `ZoneRef`; there is **no SQL `SET TIME ZONE`** yet. Setting it is
   pure session state — no storage effect, fully deterministic given the directive — and it drives
-  *computation* and the `timestamptz → text` cast, not yet result-cell *rendering* (§9.5). `AT TIME ZONE` (Slice 1) takes an explicit zone, so it is
+  *computation*, input, and the rendering of every `timestamptz` → text, result cells included through
+  the host's session render (§9.5). `AT TIME ZONE` (Slice 1) takes an explicit zone, so it is
   independent of the slot.
 - **Abbreviations** (`EST`, `CST`, …) are ambiguous and PG keeps a separate curated table
   (`pg_timezone_abbrevs`). Proposal: **defer** abbreviation *input* (accept only IANA zone names + fixed

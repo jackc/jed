@@ -4,7 +4,7 @@ import type { Meter } from "./cost.ts";
 import type { ThreeValued, Value } from "./value.ts";
 import { resolveUnfetchedSelf } from "./format.ts";
 import {
-  arrayOut,
+  arrayOutZoned,
   arrayValue,
   boolAnd,
   boolNot,
@@ -33,6 +33,7 @@ import {
   timestampValue,
   timestamptzValue,
   uuidValue,
+  zoneRenderCount,
 } from "./value.ts";
 import { COSTS } from "./costs.ts";
 import { makeDate } from "./date.ts";
@@ -175,11 +176,12 @@ import {
   regexpNthMatch,
 } from "./regex.ts";
 import type { RegexProgram } from "./regex.ts";
-import { NEG_INFINITY, POS_INFINITY, makeTimestamp, renderTimestamptzAt } from "./timestamp.ts";
+import { NEG_INFINITY, POS_INFINITY, makeTimestamp } from "./timestamp.ts";
 import {
   instantToLocalMicros,
   localToInstantMicros,
   offsetAtRef,
+  renderTimestamptzIn,
   resolveZone,
 } from "./timezone.ts";
 import { dateTruncInterval, dateTruncMicros, extractField } from "./datetime_fn.ts";
@@ -318,11 +320,17 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const v = evalExpr(e.operand, row, env, m);
       if (v.kind === "null") return nullValue();
       if (e.toElem === null) {
-        // array → text: render via array_out (PG-byte-exact §7). A growth kernel: element quoting
-        // can expand strings (cost.md §8.1).
-        const out = textValue(
-          arrayOut(v as { dims: number[]; lbounds: number[]; elements: Value[] }),
-        );
+        // array → text: render via array_out (PG-byte-exact §7). A timestamptz at any depth renders
+        // in the SESSION zone, one timezone unit per finite instant, charged before rendering like
+        // the scalar text cast (timezones.md §9.5). A growth kernel: element quoting can expand
+        // strings (cost.md §8.1).
+        const a = v as { dims: number[]; lbounds: number[]; elements: Value[] };
+        const zoned = a.elements.reduce((n, el) => n + zoneRenderCount(el), 0);
+        if (zoned > 0) {
+          m.charge(COSTS.timezone * BigInt(zoned));
+          m.guard();
+        }
+        const out = textValue(arrayOutZoned(a, env.exec.session.timeZone));
         return growthResult(m, [e.operand], out);
       }
       if (v.kind === "text") {
@@ -2563,8 +2571,7 @@ function scalarToText(v: Value, env: EvalEnv, m: Meter): string {
       if (v.micros === NEG_INFINITY || v.micros === POS_INFINITY) return renderValue(v);
       m.charge(COSTS.timezone);
       m.guard();
-      const local = instantToLocalMicros(env.exec.session.timeZone, v.micros);
-      return renderTimestamptzAt(v.micros, Number((local - v.micros) / 1_000_000n));
+      return renderTimestamptzIn(env.exec.session.timeZone, v.micros);
     }
     default:
       return renderValue(v);

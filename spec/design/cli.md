@@ -177,7 +177,9 @@ TUI editor's run action:
 ## 5. Output formats (script mode)
 
 Every cell renders through the engine's canonical `Value::render()` — byte-identical to
-the conformance corpus' rendering, in every format.
+the conformance corpus' rendering, in every format. The CLI has no time-zone setting, so its
+sessions run in `UTC`, where the canonical render equals the session render the corpus uses
+([timezones.md](timezones.md) §9.5).
 
 - **`aligned`** (default): psql-flavored ASCII — ` | ` separators, `-+-` header rule;
   int/decimal columns right-aligned, everything else left-aligned; **NULL renders as

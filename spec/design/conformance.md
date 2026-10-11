@@ -91,7 +91,10 @@ Conventions, fixed here so every implementation renders identically:
   negatives). A **boolean renders as the literal `true` or `false`** (lowercase; never
   `t`/`f`, `0`/`1`, or host casing — a CLAUDE.md §8 determinism decision). **NULL renders as
   the literal `NULL`** (for every column type, boolean included — a NULL boolean is unknown,
-  printed `NULL`, not `false`).
+  printed `NULL`, not `false`). A value renders through the **session render** of the session that
+  ran the record ([timezones.md](timezones.md) §9.5), so a `timestamptz` — at any depth — prints
+  in that record's `# timezone:` zone, as PostgreSQL prints it under `SET TIME ZONE`; a render
+  failure fails the record with its code.
 - **empty result** — the `----` separator followed by no value lines (the record ends at
   the next blank line).
 - **sortmode** — `nosort` (compare in returned order), `rowsort` (compare as multisets — sort

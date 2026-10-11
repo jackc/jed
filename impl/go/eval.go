@@ -1382,9 +1382,27 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return NullValue(), nil
 		}
 		if e.castElem == nil {
-			// array → text: render via array_out (PG-byte-exact §7). A growth kernel: element quoting
-			// can expand strings (cost.md §8.1).
-			return growthResult(m, []*rExpr{e.operand}, TextValue(arrayOut(v.arrayVal())))
+			// array → text: render via array_out (PG-byte-exact §7). A timestamptz at any depth
+			// renders in the SESSION zone, one timezone unit per finite instant, charged before
+			// rendering like the scalar text cast (timezones.md §9.5). A growth kernel: element
+			// quoting can expand strings (cost.md §8.1).
+			a := v.arrayVal()
+			var zoned int64
+			for _, el := range a.Elements {
+				zoned += el.zoneRenderCount()
+			}
+			if zoned > 0 {
+				m.Charge(costs.Timezone * zoned)
+				if err := m.Guard(); err != nil {
+					return Value{}, err
+				}
+			}
+			zone := env.exec.session.timeZone
+			text, err := arrayOutZoned(a, &zone)
+			if err != nil {
+				return Value{}, err
+			}
+			return growthResult(m, []*rExpr{e.operand}, TextValue(text))
 		}
 		if v.Kind == ValText {
 			// runtime text → T[]: coerce the per-row string via array_in against the target element

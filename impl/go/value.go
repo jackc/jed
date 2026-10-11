@@ -512,7 +512,10 @@ func (t ThreeValued) IsTrue() bool { return t == True }
 
 // Render formats for conformance output: integers as shortest decimal, booleans as
 // the canonical "true"/"false", NULL (including a NULL/unknown boolean) as the literal
-// "NULL" (spec/design/conformance.md §1; the canonical spelling is a §8 decision).
+// "NULL" (spec/design/conformance.md §1; the canonical spelling is a §8 decision). This is the
+// zone-free canonical render: a timestamptz renders in UTC (+00) at any depth, so the text
+// re-parses to the same instant under any session zone. Session.Render renders the way PostgreSQL
+// shows a result column, in the session zone (spec/design/timezones.md §9.5).
 func (v Value) Render() string {
 	switch v.Kind {
 	case ValNull:
@@ -536,6 +539,7 @@ func (v Value) Render() string {
 	case ValTimestamp:
 		return renderTimestamp(v.Int)
 	case ValTimestamptz:
+		// The zone-free canonical render (UTC, +00); renderIn renders in a session zone.
 		return renderTimestamptz(v.Int)
 	case ValDate:
 		return renderDate(int32(v.Int))
@@ -574,6 +578,67 @@ func (v Value) Render() string {
 	default:
 		return strconv.FormatInt(v.Int, 10)
 	}
+}
+
+// renderIn renders as PostgreSQL shows a result column in a session zone (timezones.md §9.5):
+// exactly Render, except every timestamptz — at any depth inside an array, composite, or range —
+// renders in zone (+HH / +HH:MM / +HH:MM:SS; ±infinity bare). Fails 22008 only for a finite instant
+// whose local reading leaves the i64 range (timezones.md §6).
+func (v Value) renderIn(zone ZoneRef) (string, error) {
+	return v.renderZoned(&zone)
+}
+
+// renderZoned is the shared body of Render (zone == nil, the canonical UTC render, infallible) and
+// renderIn (zone != nil).
+func (v Value) renderZoned(zone *ZoneRef) (string, error) {
+	switch v.Kind {
+	case ValTimestamptz:
+		if zone != nil {
+			return renderTimestamptzIn(v.Int, *zone)
+		}
+	case ValComposite:
+		return recordOutZoned(*v.composite(), zone)
+	case ValArray:
+		return arrayOutZoned(v.arrayVal(), zone)
+	case ValRange:
+		return rangeOutZoned(v.rangeVal(), zone)
+	}
+	return v.Render(), nil
+}
+
+// zoneRenderCount reports how many finite timestamptz values a session-zone render of v converts —
+// each one timezone cost unit when the engine renders it (the array → text cast, timezones.md
+// §9.5). NULL and ±infinity count nothing; containers are walked at every depth.
+func (v Value) zoneRenderCount() int64 {
+	switch v.Kind {
+	case ValTimestamptz:
+		if v.Int != negInfinity && v.Int != posInfinity {
+			return 1
+		}
+	case ValComposite:
+		var n int64
+		for _, f := range *v.composite() {
+			n += f.zoneRenderCount()
+		}
+		return n
+	case ValArray:
+		var n int64
+		for _, e := range v.arrayVal().Elements {
+			n += e.zoneRenderCount()
+		}
+		return n
+	case ValRange:
+		r := v.rangeVal()
+		var n int64
+		if r.Lower != nil {
+			n += r.Lower.zoneRenderCount()
+		}
+		if r.Upper != nil {
+			n += r.Upper.zoneRenderCount()
+		}
+		return n
+	}
+	return 0
 }
 
 func bool3(b bool) ThreeValued {
@@ -941,6 +1006,16 @@ func compositeOrder3(a, b []Value, gt bool) ThreeValued {
 // naturally — a nested composite's text contains parens/commas, so it is quoted. The spelling must
 // equal PG byte-for-byte (CLAUDE.md §8).
 func recordOut(fields []Value) string {
+	s, err := recordOutZoned(fields, nil)
+	if err != nil {
+		panic("BUG: the canonical render cannot fail")
+	}
+	return s
+}
+
+// recordOutZoned is recordOut with each field rendered by renderZoned — a timestamptz field in zone
+// when one is given (timezones.md §9.5).
+func recordOutZoned(fields []Value, zone *ZoneRef) (string, error) {
 	var b strings.Builder
 	b.WriteByte('(')
 	for i, f := range fields {
@@ -950,7 +1025,10 @@ func recordOut(fields []Value) string {
 		if f.Kind == ValNull {
 			continue // a NULL field is the empty string between delimiters (unquoted)
 		}
-		s := f.Render()
+		s, err := f.renderZoned(zone)
+		if err != nil {
+			return "", err
+		}
 		if recordFieldNeedsQuote(s) {
 			b.WriteByte('"')
 			for _, ch := range s {
@@ -966,7 +1044,7 @@ func recordOut(fields []Value) string {
 		}
 	}
 	b.WriteByte(')')
-	return b.String()
+	return b.String(), nil
 }
 
 // parseRecordTokens is the PG record_in tokenizer (spec/design/composite.md §8) — the exact inverse
@@ -1210,8 +1288,18 @@ func compositeTotalCmp(a, b []Value) int {
 // escapes** an embedded `"` → `\"` and `\` → `\\` (the contrast with record_out, which doubles).
 // The empty array renders `{}`. Equals PG byte-for-byte (CLAUDE.md §8).
 func arrayOut(a *ArrayVal) string {
+	s, err := arrayOutZoned(a, nil)
+	if err != nil {
+		panic("BUG: the canonical render cannot fail")
+	}
+	return s
+}
+
+// arrayOutZoned is arrayOut with each element rendered by renderZoned — a timestamptz at any depth
+// in zone when one is given (the session render and the array → text cast, timezones.md §9.5).
+func arrayOutZoned(a *ArrayVal, zone *ZoneRef) (string, error) {
 	if len(a.Elements) == 0 {
-		return "{}" // the empty array (ndim 0)
+		return "{}", nil // the empty array (ndim 0)
 	}
 	var b strings.Builder
 	prefix := false
@@ -1232,35 +1320,43 @@ func arrayOut(a *ArrayVal) string {
 		b.WriteByte('=')
 	}
 	cursor := 0
-	renderArrayDim(a, 0, &cursor, &b)
-	return b.String()
+	if err := renderArrayDim(a, 0, &cursor, &b, zone); err != nil {
+		return "", err
+	}
+	return b.String(), nil
 }
 
 // renderArrayDim renders the brace structure for dimension d of a, consuming flattened elements via
 // cursor (the helper for arrayOut). The innermost dimension renders elements; outer dimensions recurse.
-func renderArrayDim(a *ArrayVal, d int, cursor *int, b *strings.Builder) {
+func renderArrayDim(a *ArrayVal, d int, cursor *int, b *strings.Builder, zone *ZoneRef) error {
 	b.WriteByte('{')
 	for k := 0; k < a.Dims[d]; k++ {
 		if k > 0 {
 			b.WriteByte(',')
 		}
 		if d+1 == a.Ndim() {
-			renderArrayElem(a.Elements[*cursor], b)
+			if err := renderArrayElem(a.Elements[*cursor], b, zone); err != nil {
+				return err
+			}
 			*cursor++
-		} else {
-			renderArrayDim(a, d+1, cursor, b)
+		} else if err := renderArrayDim(a, d+1, cursor, b, zone); err != nil {
+			return err
 		}
 	}
 	b.WriteByte('}')
+	return nil
 }
 
 // renderArrayElem renders one array element (PG array_out quoting; a NULL element is unquoted NULL).
-func renderArrayElem(e Value, b *strings.Builder) {
+func renderArrayElem(e Value, b *strings.Builder, zone *ZoneRef) error {
 	if e.Kind == ValNull {
 		b.WriteString("NULL")
-		return
+		return nil
 	}
-	s := e.Render()
+	s, err := e.renderZoned(zone)
+	if err != nil {
+		return err
+	}
 	if arrayElemNeedsQuote(s) {
 		b.WriteByte('"')
 		for _, ch := range s {
@@ -1273,6 +1369,7 @@ func renderArrayElem(e Value, b *strings.Builder) {
 	} else {
 		b.WriteString(s)
 	}
+	return nil
 }
 
 // arrayElemNeedsQuote reports whether an array_out element token must be double-quoted: the empty

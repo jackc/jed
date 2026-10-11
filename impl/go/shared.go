@@ -2765,6 +2765,13 @@ func (s *Session) Var(name string) (string, bool)  { return s.engine.session.Var
 // SetTimeZone sets the session time zone (§6.2); an unrecognized zone is 22023.
 func (s *Session) SetTimeZone(zone string) error { return s.engine.session.SetTimeZone(zone) }
 
+// Render renders v as PostgreSQL shows a result column (spec/design/timezones.md §9.5): exactly
+// Value.Render, except every timestamptz — at any depth inside an array, composite, or range —
+// renders in this session's **current** time zone (2024-01-15 07:00:00-05). Host-side and unmetered.
+// 22008 only for a finite instant within an offset of jed's i64 extremes, outside PostgreSQL's
+// range. Value.Render stays the zone-free (UTC) canonical form.
+func (s *Session) Render(v Value) (string, error) { return v.renderIn(s.engine.session.timeZone) }
+
 // SetRandomSource / ClearRandomSource — the uuid-generator entropy seam (entropy.md §6).
 func (s *Session) SetRandomSource(f RandomSource) { s.engine.session.seam.SetRandom(f) }
 func (s *Session) ClearRandomSource()             { s.engine.session.seam.ClearRandom() }

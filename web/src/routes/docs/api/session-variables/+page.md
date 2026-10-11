@@ -40,6 +40,21 @@ Session variables live on the session, not in the database:
 - Each session has its own independent set — a variable on one session is invisible to another.
 - `reset_var(name)` clears one variable by name.
 
+## The session time zone
+
+The one built-in setting is the session **time zone**, `UTC` by default. Set it with
+`set_time_zone` (Rust), `SetTimeZone` (Go), or `setTimeZone` (TypeScript) to `UTC`, a fixed offset
+such as `+05:30` (POSIX sign: `+05:30` is UTC−5:30), or a named zone from a loaded time-zone
+database; an unknown zone raises `22023`. The zone decides how a `timestamptz` is read without an
+offset, how `date_trunc`, `EXTRACT`, and the datetime casts decompose it, and how it renders as text.
+
+A query returns a `timestamptz` as a zone-free value. To show it the way PostgreSQL would, render it
+through the session: `session.render(&value)` (Rust), `session.Render(value)` (Go), or
+`session.render(value)` (TypeScript). This renders every `timestamptz` in the value — including one
+inside an array, composite, or range — in the session's current zone, for example
+`2024-01-15 07:00:00-05`. A `Value`'s own render is always UTC (`2024-01-15 12:00:00+00`). Both
+spellings carry the offset, so either one reads back as the same instant.
+
 > **Scope.** This is the v1 surface — the host API plus the `current_setting()` read. The SQL
-> `SET` / `RESET` / `SHOW` grammar, a built-in `time_zone` setting, and transaction-scoped
-> `SET LOCAL` variables are planned follow-ons.
+> `SET` / `RESET` / `SHOW` grammar (including `SET TIME ZONE`) and transaction-scoped `SET LOCAL`
+> variables are planned follow-ons.

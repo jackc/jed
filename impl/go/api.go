@@ -21,6 +21,12 @@ func (tx *Transaction) queryValues(sql string, params []Value) (*Rows, error) {
 	return tx.db.queryValues(sql, params)
 }
 
+// Render renders v in the owning session's current time zone — Session.Render
+// (spec/design/timezones.md §9.5).
+func (tx *Transaction) Render(v Value) (string, error) {
+	return v.renderIn(tx.db.session.timeZone)
+}
+
 // Commit publishes the transaction durably (per synchronous). Idempotent after the transaction
 // has ended.
 func (tx *Transaction) Commit() error {

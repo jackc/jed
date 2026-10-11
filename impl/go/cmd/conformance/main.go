@@ -1367,16 +1367,37 @@ func drainQuery(sess *jed.Session, sql, sortmode string, cols int) (cells, names
 		return nil, nil, nil, 0, qerr
 	}
 	defer rows.Close()
-	var flat []string
+	var values [][]jed.Value
 	for rows.Next() {
-		for _, v := range rows.Row() {
-			flat = append(flat, v.Render())
-		}
+		values = append(values, append([]jed.Value(nil), rows.Row()...))
 	}
 	if derr := rows.Err(); derr != nil {
 		return nil, nil, nil, 0, derr
 	}
+	flat, rerr := renderCells(sess, values)
+	if rerr != nil {
+		return nil, nil, nil, 0, rerr
+	}
 	return applySort(flat, cols, sortmode), rows.ColumnNames(), rows.ColumnTypes(), rows.Cost(), nil
+}
+
+// renderCells renders every drained result cell through the session that ran the record
+// (Session.Render), so a timestamptz shows in that session's `# timezone:` zone (spec/design/
+// timezones.md §9.5). It runs after the full drain, while the record's session zone is still in
+// effect; a render failure (22008, only at jed's out-of-PG-range extremes) fails the record like an
+// output-time error fails a PostgreSQL query.
+func renderCells(sess *jed.Session, values [][]jed.Value) ([]string, error) {
+	var flat []string
+	for _, row := range values {
+		for _, v := range row {
+			s, err := sess.Render(v)
+			if err != nil {
+				return nil, err
+			}
+			flat = append(flat, s)
+		}
+	}
+	return flat, nil
 }
 
 func applySort(flat []string, cols int, sortmode string) []string {

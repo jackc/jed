@@ -30861,6 +30861,23 @@ export function scalarPairCastable(from: ScalarType, to: ScalarType): boolean {
   return false;
 }
 
+// containsTimestamptz reports whether a timestamptz occurs anywhere in t — itself, an array element, a
+// composite field, or a range subtype, at any depth. Rendering such a value to text reads the session
+// zone (timezones.md §9.5).
+export function containsTimestamptz(t: ResolvedType): boolean {
+  switch (t.kind) {
+    case "timestamptz":
+      return true;
+    case "array":
+    case "range":
+      return containsTimestamptz(t.elem);
+    case "composite":
+      return t.fields.some((f) => containsTimestamptz(f.type));
+    default:
+      return false;
+  }
+}
+
 export function resolvedTypeEqual(a: ResolvedType, b: ResolvedType): boolean {
   if (a.kind !== b.kind) return false;
   if (a.kind === "int" || a.kind === "float") return a.ty === (b as { ty: ScalarType }).ty;

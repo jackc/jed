@@ -3426,6 +3426,14 @@ impl Session {
     pub fn set_time_zone(&mut self, zone: &str) -> Result<()> {
         self.engine.session.set_time_zone(zone)
     }
+    /// Render `v` as PostgreSQL shows a result column (spec/design/timezones.md §9.5): exactly
+    /// [`Value::render`], except every `timestamptz` — at any depth inside an array, composite, or
+    /// range — renders in this session's **current** time zone (`2024-01-15 07:00:00-05`). Host-side
+    /// and unmetered. `22008` only for a finite instant within an offset of jed's `i64` extremes,
+    /// outside PostgreSQL's range. [`Value::render`] stays the zone-free (UTC) canonical form.
+    pub fn render(&self, v: &Value) -> Result<String> {
+        v.render_in(&self.engine.session.time_zone)
+    }
     /// Inject a random source for the uuid generators (entropy.md §6).
     pub fn set_random_source(&mut self, f: crate::seam::RandomSource) {
         self.engine.session.set_random_source(f);

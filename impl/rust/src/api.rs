@@ -297,6 +297,12 @@ impl Transaction<'_> {
         self.db.query(sql, params)
     }
 
+    /// Render `v` in the owning session's current time zone — [`Session::render`](crate::Session::render)
+    /// (spec/design/timezones.md §9.5).
+    pub fn render(&self, v: &Value) -> Result<String> {
+        v.render_in(&self.db.session.time_zone)
+    }
+
     /// Run a [`PreparedStatement`] within this transaction, binding `params` — the prepared analogue
     /// of [`execute`](Transaction::execute) (spec/design/api.md §2.4). The statement is a standalone
     /// value: this transaction supplies the session the execute observes.

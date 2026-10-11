@@ -11,6 +11,7 @@
 
 use crate::date;
 use crate::decimal::Decimal;
+use crate::error::Result as EngineResult;
 use crate::interval::{self, Interval};
 use crate::json::{self, JsonNode};
 use crate::timestamp;
@@ -602,7 +603,10 @@ impl Value {
     /// Render for conformance output: integers as shortest decimal, booleans as the
     /// canonical `true`/`false`, text verbatim (the `T` tag — no quoting), NULL
     /// (including a NULL/unknown boolean) as the literal `NULL` (spec/design/conformance.md
-    /// §1; the canonical spelling is a §8 decision).
+    /// §1; the canonical spelling is a §8 decision). This is the zone-free canonical render: a
+    /// `timestamptz` renders in UTC (`+00`) at any depth, so the text re-parses to the same instant
+    /// under any session zone. `Session::render` renders the way PostgreSQL shows a result column,
+    /// in the session zone (spec/design/timezones.md §9.5).
     pub fn render(&self) -> String {
         match self {
             Value::Null => "NULL".to_string(),
@@ -625,7 +629,8 @@ impl Value {
             // Uuid renders as the canonical 8-4-4-4-12 lowercase-hex form (PG `uuid_out`).
             Value::Uuid(u) => render_uuid(u),
             // Timestamps render via the shared calendar formatter (spec/design/timestamp.md):
-            // `YYYY-MM-DD HH:MM:SS[.ffffff]`, timestamptz with a `+00` suffix, ±infinity bare.
+            // `YYYY-MM-DD HH:MM:SS[.ffffff]`, timestamptz with a `+00` suffix, ±infinity bare. This is
+            // the zone-free canonical render; [`Value::render_in`] renders in a session zone.
             Value::Timestamp(m) => timestamp::render_timestamp(*m),
             Value::Timestamptz(m) => timestamp::render_timestamptz(*m),
             // A date renders via the calendar formatter (spec/design/date.md): `YYYY-MM-DD`,
@@ -651,6 +656,44 @@ impl Value {
             // jsonb renders the canonical PG text (`jsonb_out` — §6.2).
             Value::Jsonb(n) => json::jsonb_out(n),
             Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
+        }
+    }
+
+    /// Render as PostgreSQL shows a result column in a session zone (timezones.md §9.5): exactly
+    /// [`Value::render`], except every `timestamptz` — at any depth inside an array, composite, or
+    /// range — renders in `zone` (`+HH` / `+HH:MM` / `+HH:MM:SS`; ±infinity bare). Fails `22008` only
+    /// for a finite instant whose local reading leaves the `i64` range (timezones.md §6).
+    pub(crate) fn render_in(&self, zone: &crate::timezone::ZoneRef) -> EngineResult<String> {
+        self.render_zoned(Some(zone))
+    }
+
+    /// The shared body of [`Value::render`] (`zone = None`, the canonical UTC render, infallible) and
+    /// [`Value::render_in`] (`Some(zone)`).
+    fn render_zoned(&self, zone: Option<&crate::timezone::ZoneRef>) -> EngineResult<String> {
+        match (self, zone) {
+            (Value::Timestamptz(m), Some(z)) => timestamp::render_timestamptz_in(*m, z),
+            (Value::Composite(fields), _) => record_out_zoned(fields, zone),
+            (Value::Array(a), _) => array_out_zoned(a, zone),
+            (Value::Range(r), _) => crate::range::range_out_zoned(r, zone),
+            _ => Ok(self.render()),
+        }
+    }
+
+    /// How many finite `timestamptz` values a session-zone render of this value converts — each one
+    /// `timezone` cost unit when the engine renders it (the `array → text` cast, timezones.md §9.5).
+    /// NULL and ±infinity count nothing; containers are walked at every depth.
+    pub(crate) fn zone_render_count(&self) -> u64 {
+        match self {
+            Value::Timestamptz(m) => {
+                u64::from(*m != timestamp::NEG_INFINITY && *m != timestamp::POS_INFINITY)
+            }
+            Value::Composite(fields) => fields.iter().map(Value::zone_render_count).sum(),
+            Value::Array(a) => a.elements.iter().map(Value::zone_render_count).sum(),
+            Value::Range(r) => {
+                r.lower.as_ref().map_or(0, |v| v.zone_render_count())
+                    + r.upper.as_ref().map_or(0, |v| v.zone_render_count())
+            }
+            _ => 0,
         }
     }
 
@@ -897,6 +940,15 @@ fn composite_order3(a: &[Value], b: &[Value], gt: bool) -> ThreeValued {
 /// naturally — a nested composite's text contains parens/commas, so it is quoted. The spelling must
 /// equal PG byte-for-byte (CLAUDE.md §8).
 pub fn record_out(fields: &[Value]) -> String {
+    record_out_zoned(fields, None).expect("the canonical render cannot fail")
+}
+
+/// [`record_out`] with each field rendered by [`Value::render_zoned`] — a `timestamptz` field in
+/// `zone` when one is given (timezones.md §9.5).
+fn record_out_zoned(
+    fields: &[Value],
+    zone: Option<&crate::timezone::ZoneRef>,
+) -> EngineResult<String> {
     let mut out = String::from("(");
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
@@ -905,7 +957,7 @@ pub fn record_out(fields: &[Value]) -> String {
         if matches!(f, Value::Null) {
             continue; // a NULL field is the empty string between delimiters (unquoted)
         }
-        let s = f.render();
+        let s = f.render_zoned(zone)?;
         if record_field_needs_quote(&s) {
             out.push('"');
             for ch in s.chars() {
@@ -921,7 +973,7 @@ pub fn record_out(fields: &[Value]) -> String {
         }
     }
     out.push(')');
-    out
+    Ok(out)
 }
 
 /// PostgreSQL `record_in` tokenizer (spec/design/composite.md §8) — the exact inverse of
@@ -1108,8 +1160,18 @@ fn composite_total_cmp(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
 /// escapes** an embedded `"` → `\"` and `\` → `\\` (the contrast with `record_out`, which doubles).
 /// The empty array renders `{}`. The spelling must equal PG byte-for-byte (CLAUDE.md §8).
 pub fn array_out(a: &ArrayVal) -> String {
+    array_out_zoned(a, None).expect("the canonical render cannot fail")
+}
+
+/// [`array_out`] with each element rendered by [`Value::render_zoned`] — a `timestamptz` at any
+/// depth in `zone` when one is given (the session render and the `array → text` cast,
+/// timezones.md §9.5).
+pub(crate) fn array_out_zoned(
+    a: &ArrayVal,
+    zone: Option<&crate::timezone::ZoneRef>,
+) -> EngineResult<String> {
     if a.elements.is_empty() {
-        return "{}".to_string(); // the empty array (ndim 0)
+        return Ok("{}".to_string()); // the empty array (ndim 0)
     }
     let mut out = String::new();
     if a.lbounds.iter().any(|&lb| lb != 1) {
@@ -1124,35 +1186,46 @@ pub fn array_out(a: &ArrayVal) -> String {
         out.push('=');
     }
     let mut cursor = 0usize;
-    render_array_dim(a, 0, &mut cursor, &mut out);
-    out
+    render_array_dim(a, 0, &mut cursor, &mut out, zone)?;
+    Ok(out)
 }
 
 /// Render the brace structure for dimension `d` of `a`, consuming flattened elements via `cursor`
 /// (the helper for [`array_out`]). The innermost dimension renders elements; outer dimensions
 /// recurse into nested braces.
-fn render_array_dim(a: &ArrayVal, d: usize, cursor: &mut usize, out: &mut String) {
+fn render_array_dim(
+    a: &ArrayVal,
+    d: usize,
+    cursor: &mut usize,
+    out: &mut String,
+    zone: Option<&crate::timezone::ZoneRef>,
+) -> EngineResult<()> {
     out.push('{');
     for k in 0..a.dims[d] {
         if k > 0 {
             out.push(',');
         }
         if d + 1 == a.ndim() {
-            render_array_elem(&a.elements[*cursor], out);
+            render_array_elem(&a.elements[*cursor], out, zone)?;
             *cursor += 1;
         } else {
-            render_array_dim(a, d + 1, cursor, out);
+            render_array_dim(a, d + 1, cursor, out, zone)?;
         }
     }
     out.push('}');
+    Ok(())
 }
 
 /// Render one array element (with PG `array_out` quoting; a NULL element is the unquoted `NULL`).
-fn render_array_elem(e: &Value, out: &mut String) {
+fn render_array_elem(
+    e: &Value,
+    out: &mut String,
+    zone: Option<&crate::timezone::ZoneRef>,
+) -> EngineResult<()> {
     match e {
         Value::Null => out.push_str("NULL"),
         _ => {
-            let s = e.render();
+            let s = e.render_zoned(zone)?;
             if array_elem_needs_quote(&s) {
                 out.push('"');
                 for ch in s.chars() {
@@ -1167,6 +1240,7 @@ fn render_array_elem(e: &Value, out: &mut String) {
             }
         }
     }
+    Ok(())
 }
 
 /// The structured result of [`parse_array_literal`]: the shape (`dims`, `lbounds`) and the

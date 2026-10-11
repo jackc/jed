@@ -4130,11 +4130,16 @@ pub(crate) fn resolve(
                     | ResolvedType::Jsonb
                     | ResolvedType::JsonPath => Ok((cast(rinner), ResolvedType::Text)),
                     // array → text (spec/design/array.md §7): `array_out` renders `{…}` per row.
-                    // Explicit only — like the scalar casts above. Handled by `ArrayCast`.
-                    ResolvedType::Array(_) => Ok((
-                        RExpr::ArrayCast {
-                            inner: Box::new(rinner),
-                            to_elem: None,
+                    // Explicit only — like the scalar casts above. Handled by `ArrayCast`. A
+                    // `timestamptz` anywhere in the element type renders in the session zone, so the
+                    // cast is then STABLE (timezones.md §9.5).
+                    ResolvedType::Array(ref elem) => Ok((
+                        {
+                            params.nonimmutable |= elem.contains_timestamptz();
+                            RExpr::ArrayCast {
+                                inner: Box::new(rinner),
+                                to_elem: None,
+                            }
                         },
                         ResolvedType::Text,
                     )),

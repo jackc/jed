@@ -90,6 +90,28 @@ type compositeRField struct {
 	ty   resolvedType
 }
 
+// containsTimestamptz reports whether a timestamptz occurs anywhere in t — itself, an array
+// element, a composite field, or a range subtype, at any depth. Rendering such a value to text reads
+// the session zone (timezones.md §9.5).
+func (t resolvedType) containsTimestamptz() bool {
+	switch t.kind {
+	case rtTimestamptz:
+		return true
+	case rtArray, rtRange:
+		return t.elem != nil && t.elem.containsTimestamptz()
+	case rtComposite:
+		if t.comp == nil {
+			return false
+		}
+		for _, f := range t.comp.fields {
+			if f.ty.containsTimestamptz() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func intType(t resolvedType) (scalarType, bool) {
 	if t.kind == rtInt {
 		return t.intTy, true

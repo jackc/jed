@@ -1627,7 +1627,10 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				return cast, textRt, nil
 			case rtArray:
 				// array → text (spec/design/array.md §7): array_out renders {…} per row. Explicit only,
-				// like the scalar casts above. Handled by reArrayCast.
+				// like the scalar casts above. Handled by reArrayCast. A timestamptz anywhere in the
+				// element type renders in the session zone, so the cast is then STABLE (timezones.md
+				// §9.5).
+				params.nonimmutable = params.nonimmutable || (ity.elem != nil && ity.elem.containsTimestamptz())
 				return &rExpr{kind: reArrayCast, operand: rinner}, textRt, nil
 			default:
 				return nil, resolvedType{}, newError(FeatureNotSupported, "casting to text is not supported yet")

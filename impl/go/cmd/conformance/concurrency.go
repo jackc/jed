@@ -283,16 +283,16 @@ func parseSchedule(text string) ([]cStep, error) {
 	return steps, nil
 }
 
-// runRecord runs one `on <sid>` record against exec (a session's ergonomic Query seam), returning the
-// first mismatch as an error. exec is a function so the same logic drives both the sequential map and a
-// worker goroutine's handle. The cursor is always fully drained + closed here (before this returns), so
+// runRecord runs one `on <sid>` record against s (its ergonomic Query seam), returning the first
+// mismatch as an error. Taking the session lets the same logic drive both the sequential map and a
+// worker goroutine's handle, and render each result cell in that session's zone. The cursor is always fully drained + closed here (before this returns), so
 // any streaming reader-liveness pin is released before the schedule's next step observes the watermark.
-func runRecord(exec func(string) (*jed.Rows, error), sid string, rec cRecord) error {
+func runRecord(s *cSession, sid string, rec cRecord) error {
 	switch rec.kind {
 	case "statement":
-		rows, err := exec(rec.sql)
+		rows, err := s.execute(rec.sql)
 		if err == nil {
-			_, err = drainRecord(rows, 1, "nosort") // drain to surface any deferred error + release the cursor
+			_, err = drainRecord(s.h, rows, 1, "nosort") // drain to surface any deferred error + release the cursor
 		}
 		switch rec.expect {
 		case "ok":
@@ -310,7 +310,7 @@ func runRecord(exec func(string) (*jed.Rows, error), sid string, rec cRecord) er
 			return fmt.Errorf("[%s] unknown statement kind %q", sid, rec.expect)
 		}
 	case "query":
-		rows, err := exec(rec.sql)
+		rows, err := s.execute(rec.sql)
 		if err != nil {
 			return fmt.Errorf("[%s] query failed with %s\n  SQL: %s", sid, err.Error(), rec.sql)
 		}
@@ -318,7 +318,7 @@ func runRecord(exec func(string) (*jed.Rows, error), sid string, rec cRecord) er
 		if cols == 0 {
 			cols = 1
 		}
-		actual, derr := drainRecord(rows, cols, rec.sortmode)
+		actual, derr := drainRecord(s.h, rows, cols, rec.sortmode)
 		if derr != nil {
 			return fmt.Errorf("[%s] query failed with %s\n  SQL: %s", sid, derr.Error(), rec.sql)
 		}
@@ -334,17 +334,20 @@ func runRecord(exec func(string) (*jed.Rows, error), sid string, rec cRecord) er
 
 // drainRecord pulls a cursor to exhaustion and returns its rendered+sorted result cells (nil for a
 // no-column statement result), always closing the cursor — the concurrency runner's analogue of
-// main.go's drainQuery. Cost is not needed here (concurrency schedules assert on rows, not cost).
-func drainRecord(rows *jed.Rows, cols int, sortmode string) ([]string, error) {
+// main.go's drainQuery. Cost is not needed here (concurrency schedules assert on rows, not cost). Each
+// cell renders through sess, the session that ran the record (renderCells, timezones.md §9.5).
+func drainRecord(sess *jed.Session, rows *jed.Rows, cols int, sortmode string) ([]string, error) {
 	defer rows.Close()
 	hasCols := len(rows.ColumnNames()) > 0
-	var flat []string
+	var values [][]jed.Value
 	for rows.Next() {
-		for _, v := range rows.Row() {
-			flat = append(flat, v.Render())
-		}
+		values = append(values, append([]jed.Value(nil), rows.Row()...))
 	}
 	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	flat, err := renderCells(sess, values)
+	if err != nil {
 		return nil, err
 	}
 	if !hasCols {
@@ -468,7 +471,7 @@ func runScheduleSequential(steps []cStep, header []string) error {
 			if !ok {
 				return fmt.Errorf("on unknown session %q", st.sid)
 			}
-			if err := runRecord(s.execute, st.sid, st.rec); err != nil {
+			if err := runRecord(s, st.sid, st.rec); err != nil {
 				return err
 			}
 		}
@@ -535,7 +538,7 @@ func readWorker(db *jed.Database, sid string, cmd chan cCmd, reply chan error, d
 			reply <- err
 			return
 		}
-		reply <- runRecord(s.execute, sid, c.rec)
+		reply <- runRecord(s, sid, c.rec)
 	}
 	s.h.Close() // teardown: command channel closed without an explicit end
 }
@@ -560,7 +563,7 @@ func writeWorker(db *jed.Database, sid string, cmd chan cCmd, reply chan error, 
 			reply <- err
 			return
 		}
-		reply <- runRecord(s.execute, sid, c.rec)
+		reply <- runRecord(s, sid, c.rec)
 	}
 	_ = s.h.Rollback() // teardown: command channel closed without an explicit end (release gate)
 }

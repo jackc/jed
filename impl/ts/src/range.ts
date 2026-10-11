@@ -8,7 +8,8 @@
 import { encodeInt } from "./encoding.ts";
 import { type RangeDesc, RANGES } from "./ranges_gen.ts";
 import { canonicalName, scalarTypeFromName, type ScalarType } from "./types.ts";
-import { emptyRangeValue, rangeValue, render, type Value } from "./value.ts";
+import { emptyRangeValue, rangeValue, render, renderIn, type Value } from "./value.ts";
+import type { ZoneRef } from "./timezone.ts";
 import { engineError } from "./errors.ts";
 
 // rangeByName looks up a range type by name (case-insensitive), matching the canonical id or any
@@ -603,11 +604,18 @@ function rangeShapeValue(r: RangeShape): Value {
 // [(lower,upper)] with the bound omitted for infinite and double-quoted where the element's text has
 // a special character (so a tsrange bound's space is quoted, a daterange bound is bare).
 export function rangeOut(v: Value & { kind: "range" }): string {
+  return rangeOutZoned(v, null);
+}
+
+// rangeOutZoned is rangeOut with a tstzrange bound rendered in zone when one is given (the session
+// render, timezones.md §9.5). Throws 22008 only where renderIn does.
+export function rangeOutZoned(v: Value & { kind: "range" }, zone: ZoneRef | null): string {
   if (v.empty) return "empty";
+  const rb = (b: Value): string => (zone === null ? render(b) : renderIn(b, zone));
   let out = v.lowerInc ? "[" : "(";
-  if (v.lower !== null) out += quoteBound(render(v.lower));
+  if (v.lower !== null) out += quoteBound(rb(v.lower));
   out += ",";
-  if (v.upper !== null) out += quoteBound(render(v.upper));
+  if (v.upper !== null) out += quoteBound(rb(v.upper));
   out += v.upperInc ? "]" : ")";
   return out;
 }

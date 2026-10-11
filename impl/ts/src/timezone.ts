@@ -17,6 +17,7 @@ import {
   daysFromCivil,
   fieldOverflow,
   parseTimestamptzInput,
+  renderTimestamptzAt,
 } from "./timestamp.ts";
 
 const SECS_PER_DAY = 86_400n;
@@ -632,6 +633,16 @@ export function offsetAtRef(zr: ZoneRef, instantSecs: bigint): Offset {
 export function instantToLocalMicros(zr: ZoneRef, instantMicros: bigint): bigint {
   const off = offsetAtRef(zr, floorDivBig(instantMicros, 1_000_000n));
   return finiteShift(instantMicros + BigInt(off.utoff) * 1_000_000n);
+}
+
+// renderTimestamptzIn renders a timestamptz instant as text in zone zr (timezones.md §9.5): the local
+// wall clock plus the offset suffix in effect at the instant. ±infinity render bare and consult no
+// zone; a finite instant whose local reading leaves the i64 range traps 22008 (instantToLocalMicros).
+// Meters nothing — a caller that renders per row charges the timezone unit.
+export function renderTimestamptzIn(zr: ZoneRef, micros: bigint): string {
+  if (micros === NEG_INFINITY || micros === POS_INFINITY) return renderTimestamptzAt(micros, 0);
+  const local = instantToLocalMicros(zr, micros);
+  return renderTimestamptzAt(micros, Number((local - micros) / 1_000_000n));
 }
 
 // localToInstantMicros is timestamp AT TIME ZONE zone (§4): instant = wall − utoff. The offset is

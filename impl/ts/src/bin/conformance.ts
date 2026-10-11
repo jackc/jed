@@ -34,7 +34,6 @@ import {
   queryMemoryPeak,
   queryMemoryUnderflows,
   queryOutcome,
-  render,
   seededRandomSource,
   openDatabase,
   type Session,
@@ -248,10 +247,23 @@ function applySort(flat: string[], cols: number, sortmode: string): string[] {
   return flat;
 }
 
-function renderOutcome(outcome: Outcome, cols: number, sortmode: string): string[] {
-  if (outcome.kind !== "query") return [];
-  const flat = outcome.rows.flatMap((row) => row.map((v) => render(v)));
-  return applySort(flat, cols, sortmode);
+// Drained is a record's materialized outcome plus each result cell rendered through the session that
+// ran it (Session.render), so a timestamptz shows in that session's `# timezone:` zone
+// (spec/design/timezones.md §9.5).
+type Drained = { outcome: Outcome; cells: string[][] };
+
+// drainQuery runs sql on sess and renders every result cell while the record's session zone is still
+// in effect; a render failure (22008, only at jed's out-of-PG-range extremes) throws, failing the
+// record like an output-time error fails a PG query. Mirrors the Rust harness's drain_query.
+function drainQuery(sess: Session, sql: string): Drained {
+  const outcome = queryOutcome(sess, sql);
+  const cells =
+    outcome.kind === "query" ? outcome.rows.map((row) => row.map((v) => sess.render(v))) : [];
+  return { outcome, cells };
+}
+
+function renderDrained(drained: Drained, cols: number, sortmode: string): string[] {
+  return applySort(drained.cells.flat(), cols, sortmode);
 }
 
 function arrEq(a: string[], b: string[]): boolean {
@@ -940,7 +952,7 @@ function runFile(text: string, disk: boolean): void {
         let err: unknown = null;
         let outcome: Outcome | null = null;
         try {
-          outcome = queryOutcome(db, sql);
+          outcome = drainQuery(db, sql).outcome;
         } catch (e) {
           err = e;
         }
@@ -971,14 +983,15 @@ function runFile(text: string, disk: boolean): void {
           expected.push(lines[c.i]!.trim());
           c.i++;
         }
-        let outcome: Outcome;
+        let drained: Drained;
         try {
-          outcome = queryOutcome(db, sql);
+          drained = drainQuery(db, sql);
         } catch (e) {
           throw new Error(`query failed with ${msgOf(e)}\n  SQL: ${sql}`);
         }
+        const outcome = drained.outcome;
         const cols = coltypes.length === 0 ? 1 : coltypes.length;
-        const actual = renderOutcome(outcome, cols, sortmode);
+        const actual = renderDrained(drained, cols, sortmode);
         const exp = applySort(expected, cols, sortmode);
         // Compare column-aware: an `R` (float) column compares by parsed value within a tolerance
         // (the R-tag exemption — float.md §9); every other tag is exact string. arrEq is the
@@ -1078,11 +1091,11 @@ function isConcurrencyFormat(text: string): boolean {
 type CSession = { h: Session; isWrite: boolean };
 
 // sessionExecute runs sql against the session's handle through the total `query` seam, materializing
-// the cursor into an outcome (so the schedule runner streams reads exactly like the sequential runner,
+// the cursor into an outcome with every cell rendered in that session's zone (drainQuery) (so the schedule runner streams reads exactly like the sequential runner,
 // exercising the read-lane gates + block-poisoning — concurrency-testing.md §4). A read session's
 // writes are rejected with 25006 by the session itself (without poisoning it).
-function sessionExecute(s: CSession, sql: string): Outcome {
-  return queryOutcome(s.h, sql);
+function sessionExecute(s: CSession, sql: string): Drained {
+  return drainQuery(s.h, sql);
 }
 
 // concurrencyDirectives are the line-leading keywords that bound a record body. Unlike the
@@ -1169,14 +1182,14 @@ function runConcurrencyRecord(
     const coltypes = rec[1] ?? "";
     const sortmode = rec[2] ?? "nosort";
     const { sql, expected } = takeConcurrencyQuery(lines, c);
-    let outcome: Outcome;
+    let drained: Drained;
     try {
-      outcome = sessionExecute(s, sql);
+      drained = sessionExecute(s, sql);
     } catch (e) {
       throw new Error(`[${sid}] query failed with ${msgOf(e)}\n  SQL: ${sql}`);
     }
     const cols = coltypes.length === 0 ? 1 : coltypes.length;
-    const actual = renderOutcome(outcome, cols, sortmode);
+    const actual = renderDrained(drained, cols, sortmode);
     const exp = applySort(expected, cols, sortmode);
     const ok = coltypes.includes("R") ? rowsEqual(coltypes, cols, actual, exp) : arrEq(actual, exp);
     if (!ok) {

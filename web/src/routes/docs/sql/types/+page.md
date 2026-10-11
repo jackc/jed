@@ -190,7 +190,9 @@ verbatim and `jsonb` canonical:
 A `timestamptz` renders **in the session time zone**, with PostgreSQL's offset spelling (`-05`,
 `+05:30`); the panel runs in the default `UTC` session. Because the result depends on the session,
 an index expression containing `timestamptz::text` is rejected (`42P17`), as in PostgreSQL; every
-other cast to text is fine in an index. An `array → text[]` cast renders each element the same way.
+other cast to text is fine in an index. An `array → text[]` cast renders each element the same way,
+and so does `array → text` for a `timestamptz` anywhere inside the array — an element, a composite
+field, or a range bound (see [Time zones](#time-zones)).
 A `float` uses each engine's shortest round-trip form, so very large or small values may differ in
 exponent spelling between the Rust, Go, and TypeScript engines.
 
@@ -292,6 +294,21 @@ Named IANA zones (`America/New_York`, `Europe/Paris`, …) come from a time-zone
 already-loaded zone (an unknown zone raises `22023`). This is the same host-loaded-data model jed
 uses for Unicode collation; see the design notes for the `JTZ` bundle and the `db.loadTimeZoneData`
 host call.
+
+### Rendering in the session time zone
+
+A `timestamptz` is shown in the **session time zone** wherever it becomes text, as in PostgreSQL:
+a result column, a `timestamptz` nested inside an array, composite, or range result, and the
+`::text` and `array → text` casts. In a session set to `America/New_York`,
+`timestamptz '2024-01-15 12:00:00+00'` shows as `2024-01-15 07:00:00-05`; in `Asia/Kolkata` it shows
+as `2024-01-15 17:30:00+05:30`. The offset is always written out, so the text names the same instant
+whatever zone reads it back. The panels on this page run in the default `UTC` session.
+
+The value itself carries no zone. The host chooses how to render a result: the session's `render`
+method (Rust `session.render(&value)`, Go `session.Render(value)`, TypeScript `session.render(value)`)
+renders it in the session's current zone, while a `Value`'s own canonical render is always UTC
+(`+00`). `EXPLAIN (VERBOSE)` also prints a `timestamptz` constant in UTC, where PostgreSQL uses the
+session zone.
 
 ### Strings without an offset
 

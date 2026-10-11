@@ -11,9 +11,10 @@
 import type { ColType } from "./catalog.ts";
 import { Decimal } from "./decimal.ts";
 import { type Interval, intervalCmp, renderInterval } from "./interval.ts";
-import { renderTimestamp, renderTimestamptz } from "./timestamp.ts";
+import { NEG_INFINITY, POS_INFINITY, renderTimestamp, renderTimestamptz } from "./timestamp.ts";
 import { renderDate } from "./date.ts";
-import { rangeOut, rangeTotalCmp } from "./range.ts";
+import { rangeOut, rangeOutZoned, rangeTotalCmp } from "./range.ts";
+import { type ZoneRef, renderTimestamptzIn } from "./timezone.ts";
 import { type JsonNode, jsonNodeCmp, jsonbOut } from "./json.ts";
 
 export type Value =
@@ -497,7 +498,10 @@ function bool3(b: boolean): ThreeValued {
 // render formats for conformance output: integers as shortest decimal, booleans as the
 // canonical "true"/"false", NULL (including a NULL/unknown boolean) as the literal
 // "NULL" (spec/design/conformance.md §1; the canonical spelling is a §8 decision).
-// BigInt#toString gives the plain decimal with no `n` suffix, matching Go's FormatInt.
+// BigInt#toString gives the plain decimal with no `n` suffix, matching Go's FormatInt. This is the
+// zone-free canonical render: a timestamptz renders in UTC (`+00`) at any depth, so the text
+// re-parses to the same instant under any session zone. Session.render renders the way PostgreSQL
+// shows a result column, in the session zone (spec/design/timezones.md §9.5).
 export function render(v: Value): string {
   switch (v.kind) {
     case "null":
@@ -528,6 +532,7 @@ export function render(v: Value): string {
     case "timestamp":
       return renderTimestamp(v.micros);
     case "timestamptz":
+      // The zone-free canonical render (UTC, `+00`); renderIn renders in a session zone.
       return renderTimestamptz(v.micros);
     case "date":
       return renderDate(v.days);
@@ -564,6 +569,52 @@ export function render(v: Value): string {
   }
 }
 
+// renderIn renders v as PostgreSQL shows a result column in a session zone (timezones.md §9.5):
+// exactly render, except every timestamptz — at any depth inside an array, composite, or range —
+// renders in zone (`+HH` / `+HH:MM` / `+HH:MM:SS`; ±infinity bare). Throws 22008 only for a finite
+// instant whose local reading leaves the i64 range (timezones.md §6).
+export function renderIn(v: Value, zone: ZoneRef): string {
+  return renderZoned(v, zone);
+}
+
+// renderZoned is the shared body of render (zone = null, the canonical UTC render, infallible) and
+// renderIn (a zone).
+function renderZoned(v: Value, zone: ZoneRef | null): string {
+  switch (v.kind) {
+    case "timestamptz":
+      return zone === null ? renderTimestamptz(v.micros) : renderTimestamptzIn(zone, v.micros);
+    case "composite":
+      return recordOutZoned(v.fields, zone);
+    case "array":
+      return arrayOutZoned(v, zone);
+    case "range":
+      return rangeOutZoned(v, zone);
+    default:
+      return render(v);
+  }
+}
+
+// zoneRenderCount is how many finite timestamptz values a session-zone render of v converts — each
+// one timezone cost unit when the engine renders it (the array → text cast, timezones.md §9.5).
+// NULL and ±infinity count nothing; containers are walked at every depth.
+export function zoneRenderCount(v: Value): number {
+  switch (v.kind) {
+    case "timestamptz":
+      return v.micros !== NEG_INFINITY && v.micros !== POS_INFINITY ? 1 : 0;
+    case "composite":
+      return v.fields.reduce((n, f) => n + zoneRenderCount(f), 0);
+    case "array":
+      return v.elements.reduce((n, e) => n + zoneRenderCount(e), 0);
+    case "range":
+      return (
+        (v.lower !== null ? zoneRenderCount(v.lower) : 0) +
+        (v.upper !== null ? zoneRenderCount(v.upper) : 0)
+      );
+    default:
+      return 0;
+  }
+}
+
 // recordOut is PostgreSQL record_out (spec/design/composite.md §8): render a composite's fields as
 // `(f1,f2,…)`. A NULL field is the empty string between delimiters (unquoted); every other field is
 // rendered by its own `render` and double-quoted iff it is empty or contains a delimiter / quote /
@@ -572,12 +623,18 @@ export function render(v: Value): string {
 // nested composite's text contains parens/commas, so it is quoted. The spelling must equal PG
 // byte-for-byte (CLAUDE.md §8).
 export function recordOut(fields: Value[]): string {
+  return recordOutZoned(fields, null);
+}
+
+// recordOutZoned is recordOut with each field rendered by renderZoned — a timestamptz field in zone
+// when one is given (timezones.md §9.5).
+function recordOutZoned(fields: Value[], zone: ZoneRef | null): string {
   let out = "(";
   for (let i = 0; i < fields.length; i++) {
     if (i > 0) out += ",";
     const f = fields[i]!;
     if (f.kind === "null") continue; // a NULL field is the empty string between delimiters (unquoted)
-    const s = render(f);
+    const s = renderZoned(f, zone);
     if (recordFieldNeedsQuote(s)) {
       out += '"';
       for (const ch of s) {
@@ -628,6 +685,15 @@ function recordFieldNeedsQuote(s: string): boolean {
 // Inside the quotes PostgreSQL BACKSLASH-ESCAPES an embedded `"` → `\"` and `\` → `\\` (the contrast
 // with record_out doubling). The empty array renders `{}`. Equals PG byte-for-byte (CLAUDE.md §8).
 export function arrayOut(a: { dims: number[]; lbounds: number[]; elements: Value[] }): string {
+  return arrayOutZoned(a, null);
+}
+
+// arrayOutZoned is arrayOut with each element rendered by renderZoned — a timestamptz at any depth in
+// zone when one is given (the session render and the array → text cast, timezones.md §9.5).
+export function arrayOutZoned(
+  a: { dims: number[]; lbounds: number[]; elements: Value[] },
+  zone: ZoneRef | null,
+): string {
   if (a.elements.length === 0) return "{}"; // the empty array (ndim 0)
   let out = "";
   if (a.lbounds.some((lb) => lb !== 1)) {
@@ -637,7 +703,7 @@ export function arrayOut(a: { dims: number[]; lbounds: number[]; elements: Value
     out += "=";
   }
   const cursor = { i: 0 };
-  return out + renderArrayDim(a, 0, cursor);
+  return out + renderArrayDim(a, 0, cursor, zone);
 }
 
 // renderArrayDim renders the brace structure for dimension d of a, consuming flattened elements via
@@ -646,24 +712,25 @@ function renderArrayDim(
   a: { dims: number[]; elements: Value[] },
   d: number,
   cursor: { i: number },
+  zone: ZoneRef | null,
 ): string {
   let out = "{";
   for (let k = 0; k < a.dims[d]!; k++) {
     if (k > 0) out += ",";
     if (d + 1 === a.dims.length) {
-      out += renderArrayElem(a.elements[cursor.i]!);
+      out += renderArrayElem(a.elements[cursor.i]!, zone);
       cursor.i++;
     } else {
-      out += renderArrayDim(a, d + 1, cursor);
+      out += renderArrayDim(a, d + 1, cursor, zone);
     }
   }
   return out + "}";
 }
 
 // renderArrayElem renders one array element (PG array_out quoting; a NULL element is unquoted NULL).
-function renderArrayElem(e: Value): string {
+function renderArrayElem(e: Value, zone: ZoneRef | null): string {
   if (e.kind === "null") return "NULL";
-  const s = render(e);
+  const s = renderZoned(e, zone);
   if (!arrayElemNeedsQuote(s)) return s;
   let out = '"';
   for (const ch of s) {

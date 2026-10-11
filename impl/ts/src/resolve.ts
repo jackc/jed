@@ -25,6 +25,7 @@ import {
   resolveWindowCall,
   resolvedRangeElementScalar,
   resolvedToScalar,
+  containsTimestamptz,
   resolvedTypeEqual,
   resolvedTypeOf,
   resolvedTypeOfCol,
@@ -1221,8 +1222,11 @@ export function resolve(
           case "jsonpath":
             return { node: cast, type: textType };
           // array → text (spec/design/array.md §7): array_out renders {…} per row. Explicit only,
-          // like the scalar casts above. Handled by arrayCast (toElem null).
+          // like the scalar casts above. Handled by arrayCast (toElem null). A timestamptz anywhere in
+          // the element type renders in the session zone, so the cast is then STABLE (timezones.md
+          // §9.5).
           case "array":
+            params.nonimmutable ||= containsTimestamptz(inner.type.elem);
             return {
               node: { kind: "arrayCast", toElem: null, operand: inner.node },
               type: textType,

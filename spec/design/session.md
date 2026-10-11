@@ -566,9 +566,14 @@ set through the **host API** (`set_time_zone` / `SessionOptions::time_zone` — 
 `Session::set_time_zone`, Go `SetTimeZone`, TS `setTimeZone`), **validated against the loaded zone set**
 (`UTC` and fixed numeric offsets like `+05:00` always; a **named** IANA zone now accepted when a loaded
 `JTZ` bundle provides it — else **`22023`**, lifting the earlier `0A000`-on-named narrowing), and stored
-as a resolved `ZoneRef`. There is **no SQL `SET TIME ZONE`** grammar yet (a follow-on), and the slot
-drives *computation*, not yet `timestamptz`-*rendering* (timezones.md §9.5). Capability:
-`session.timezone`; corpus directive `# timezone: <zone>`.
+as a resolved `ZoneRef`. There is **no SQL `SET TIME ZONE`** grammar yet (a follow-on). The slot is
+also the zone every `timestamptz` renders to text in (timezones.md §9.5): the `::text` cast, a
+`timestamptz` nested in an `array → text` cast, and a result cell rendered through the session's
+**`render`** method (Rust `Session::render` / `Transaction::render`, Go `Session.Render` /
+`Transaction.Render`, TS `Session.render` / `Transaction.render`), which renders a value the way
+PostgreSQL shows a result column, in the session's current zone. The canonical value render
+(`Value::render` / `Value.Render` / `render(value)`) stays zone-free (UTC). Capability:
+`session.timezone`; corpus directive `# timezone: <zone>`, which governs the record's rendering too.
 
 ## 7. Errors
 
@@ -706,7 +711,8 @@ Not one slice — a sequence of vertical slices (CLAUDE.md §10), each independe
 6. **Session time zone slot** (§6.2) — the `time_zone` built-in (default `UTC`; `UTC` + fixed offsets
    + **named loaded zones**, `22023` otherwise), the `# timezone:` directive. Capability
    `session.timezone`. The consumers (`date_trunc` / `EXTRACT` / cross-family casts) landed with the tz
-   conversion slice ([timezones.md §9](timezones.md)): the slot is the zone a `timestamptz` decomposes in.
+   conversion slice ([timezones.md §9](timezones.md)): the slot is the zone a `timestamptz` decomposes in,
+   is read in (§9.3), and renders in (§9.5, with the host-API session render).
 7. **Convergence with the shared handle** (§2.4) — fold `SharedDb`/`ReadHandle`/`WriteHandle` into
    `Database` + `Session` so a session *is* the configured concurrency handle. Decided shape (this
    doc): **full rename** (`SharedDb`→`Database`, the old executor handle→`Engine`), **unified

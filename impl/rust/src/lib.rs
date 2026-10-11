@@ -726,6 +726,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // An offset-less timestamptz string read in the session zone wherever it is input — literals,
     // assignment, DEFAULT, bound parameters, and array/range/record text (timezones.md §9.3).
     "types.timestamptz_session_input",
+    "types.timestamptz_session_render",
     // Per-column COLLATE in CREATE TABLE (collation slice 1d, spec/design/collation.md §1/§5): a
     // column's effective collation is frozen at create (text-only 42804, loaded-or-C name 42704) and
     // is its IMPLICIT collation — ORDER BY / comparisons use it with no explicit COLLATE; two
