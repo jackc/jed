@@ -105,7 +105,7 @@ message `{kind} name {name} is reserved (the jed_ prefix is reserved for system 
 
 | Site | Checked name |
 |---|---|
-| `CREATE TABLE` (all scopes: bare, `TEMP`, `main.`/`temp.`/attachment-qualified) | the table name |
+| `CREATE TABLE` (all scopes: bare, `TEMP`, `main.`/`temp.`/attachment-qualified; incl. `IF NOT EXISTS`, **not** suppressed) | the table name |
 | `CREATE INDEX name ON …` | the **explicit** index name only |
 | `CREATE SEQUENCE` (incl. `IF NOT EXISTS` — reservation is not a collision, so it is **not** suppressed) | the sequence name |
 | `CREATE TYPE … AS (…)` | the type name |

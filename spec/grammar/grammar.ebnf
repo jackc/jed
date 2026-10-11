@@ -91,8 +91,12 @@ analyze        ::= "ANALYZE" qualified_table ("(" identifier ("," identifier)* "
  * documented divergence from PostgreSQL's pg_temp shadowing — temp-tables.md §3). CREATE/DROP of a
  * session-local temp table is gated by `allow_temp_ddl` — the temp-scoped split of `allow_ddl`
  * (42501 if denied — temp-tables.md §5). `ON COMMIT` is deferred to a later slice (temp-tables.md
- * §1/§13). */
-create_table   ::= "CREATE" table_scope? "TABLE" qualified_table
+ * §1/§13). "IF NOT EXISTS" makes a name already taken in the target database's relation namespace a
+ * no-op success instead of 42P07, decided before any column/constraint work so the skipped
+ * definition is neither validated nor created (../design/grammar.md §13); the jed_ reservation
+ * (42939) is not suppressed. Recognized by a two-token lookahead, so a lone "if" stays an identifier
+ * and "CREATE TABLE if (...)" creates a table named "if" (PG-faithful). */
+create_table   ::= "CREATE" table_scope? "TABLE" ("IF" "NOT" "EXISTS")? qualified_table
                    "(" table_element ("," table_element)* ")"
 table_scope    ::= "TEMPORARY" | "TEMP"
 

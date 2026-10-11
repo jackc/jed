@@ -457,6 +457,23 @@ impl Engine {
         }
     }
 
+    /// Whether CREATE TABLE's target name is already taken. The relation namespace is shared between
+    /// tables and indexes (indexes.md §2), so a collision with either kind is the same 42P07 — PG's
+    /// "relation" word. For a bare/main/temp target `relation_exists` is temp-aware
+    /// (preclude-overlaps — temp-tables.md §3); an attachment target checks its OWN snapshot's
+    /// namespace (each attached database is independent, attached-databases.md §3).
+    fn create_table_name_taken(&self, name: &str, attach_name: Option<&str>) -> bool {
+        match attach_name {
+            Some(attach) => {
+                let as_snap = self
+                    .attach_read_snap(attach)
+                    .expect("attachment resolved by the caller");
+                as_snap.table(name).is_some() || as_snap.find_index(name).is_some()
+            }
+            None => self.relation_exists(name),
+        }
+    }
+
     /// Analyze and run a CREATE TABLE: resolve each column's type name, enforce a
     /// single primary key across both forms (column-level and the table-level
     /// `PRIMARY KEY (a, b, …)` constraint — which is implicitly NOT NULL per member),
@@ -509,6 +526,19 @@ impl Engine {
                 }
             }
         }
+        // The reservation is not a collision, so IF NOT EXISTS does not suppress it
+        // (spec/design/introspection.md §4).
+        check_reserved_name("table", &ct.name)?;
+        // IF NOT EXISTS (grammar.md §13): a taken name is a no-op success, decided before any column
+        // or constraint work (PostgreSQL's order) — so nothing in the definition is validated and
+        // nothing is created (no owned `serial` sequence), and the working snapshot stays untouched.
+        // The bare form keeps its 42P07 below, after the narrowings.
+        if ct.if_not_exists && self.create_table_name_taken(&ct.name, attach_name.as_deref()) {
+            return Ok(Outcome::Statement {
+                cost: 0,
+                rows_affected: None,
+            });
+        }
         if target_temp && !ct.excludes.is_empty() {
             // An EXCLUDE constraint's backing GiST index would live on the temp snapshot — deferred
             // with the rest of the GiST-on-temp narrowing (spec/design/gist.md §11), a clean 0A000
@@ -542,23 +572,7 @@ impl Engine {
                 ));
             }
         }
-        check_reserved_name("table", &ct.name)?;
-        // The relation namespace is shared between tables and indexes (indexes.md §2), so a
-        // CREATE TABLE colliding with either kind is the same 42P07 — PG's "relation" word. For a
-        // bare/main/temp target `relation_exists` is temp-aware (preclude-overlaps — temp-tables.md §3);
-        // an attachment target checks its OWN snapshot's namespace (each attached database is
-        // independent, §3).
-        if let Some(name) = &attach_name {
-            let as_snap = self
-                .attach_read_snap(name)
-                .expect("attachment resolved above");
-            if as_snap.table(&ct.name).is_some() || as_snap.find_index(&ct.name).is_some() {
-                return Err(EngineError::new(
-                    SqlState::DuplicateTable,
-                    format!("relation already exists: {}", ct.name),
-                ));
-            }
-        } else if self.relation_exists(&ct.name) {
+        if self.create_table_name_taken(&ct.name, attach_name.as_deref()) {
             return Err(EngineError::new(
                 SqlState::DuplicateTable,
                 format!("relation already exists: {}", ct.name),

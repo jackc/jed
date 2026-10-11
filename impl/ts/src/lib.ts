@@ -19,6 +19,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // (constraints.md §6, grammar.md §43).
   "ddl.foreign_key",
   "ddl.foreign_key_child_index",
+  // CREATE TABLE IF NOT EXISTS — the idempotent form (persistent and TEMP): a taken relation name
+  // is a no-op success rather than 42P07, decided before any column work (grammar.md §13).
+  "ddl.create_table_if_not_exists",
   // DROP TABLE — remove a table (definition + rows) from the catalog (grammar.md §13).
   "ddl.drop_table",
   // DROP TABLE IF EXISTS — the idempotent form: a missing table is a no-op success rather

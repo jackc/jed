@@ -9,7 +9,7 @@
 # and engine-GENERATED names — a serial's <table>_<col>_seq and an index auto-name both stay legal
 # for a table named jed. IF NOT EXISTS does not suppress the error (a reservation is not a
 # collision).
-# requires: ddl.create_table, ddl.primary_key, ddl.temp_table, session.allow_temp_ddl, ddl.secondary_index, ddl.unique, ddl.exclusion_constraint, ddl.check, ddl.sequence, ddl.alter_sequence, ddl.alter_table, ddl.serial, func.sequence, types.composite, types.range, dml.insert, dml.insert_column_list, query.select, types.i32
+# requires: ddl.create_table, ddl.create_table_if_not_exists, ddl.primary_key, ddl.temp_table, session.allow_temp_ddl, ddl.secondary_index, ddl.unique, ddl.exclusion_constraint, ddl.check, ddl.sequence, ddl.alter_sequence, ddl.alter_table, ddl.serial, func.sequence, types.composite, types.range, dml.insert, dml.insert_column_list, query.select, types.i32
 
 # --- the relation namespace: tables (persistent + TEMP), case-insensitively ------------------------
 
@@ -25,6 +25,13 @@ CREATE TABLE jed_ (a i32)
 
 statement error 42939
 CREATE TEMP TABLE jed_scratch (a i32)
+
+# a reservation is not a collision: IF NOT EXISTS does not suppress it (persistent or TEMP)
+statement error 42939
+CREATE TABLE IF NOT EXISTS jed_tables (a i32)
+
+statement error 42939
+CREATE TEMP TABLE IF NOT EXISTS jed_scratch (a i32)
 
 # --- indexes, sequences, named UNIQUE / EXCLUDE constraints ----------------------------------------
 

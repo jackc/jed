@@ -455,6 +455,16 @@ func (p *parser) parseCreateTable() (*createTable, error) {
 	if err := p.expectKeyword("table"); err != nil {
 		return nil, err
 	}
+	// `IF NOT EXISTS` (grammar.md §13) is recognized by a two-token lookahead, so a lone `if` stays an
+	// ordinary non-reserved table name: `CREATE TABLE if (...)` creates a table named `if` (the DROP
+	// TABLE IF EXISTS precedent).
+	ifNotExists := false
+	if p.peekKeyword() == "if" && p.peekKeywordAt(1) == "not" {
+		var err error
+		if ifNotExists, err = p.parseIfNotExists(); err != nil {
+			return nil, err
+		}
+	}
 	// An optional database qualifier `db.table` (attached-databases.md §3, Slice 1b): create the table
 	// INTO the named database (`main` / `temp` / a host attachment). A bare name uses the implicit
 	// scope. The `.` after the first identifier makes it the qualifier and the next the table name.
@@ -524,7 +534,7 @@ func (p *parser) parseCreateTable() (*createTable, error) {
 	if len(columns) == 0 {
 		return nil, newError(SyntaxError, "a table must have at least one column")
 	}
-	return &createTable{Name: name, Temp: temp, DB: dbQualifier, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques, ForeignKeys: foreignKeys, Excludes: excludes}, nil
+	return &createTable{Name: name, Temp: temp, IfNotExists: ifNotExists, DB: dbQualifier, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques, ForeignKeys: foreignKeys, Excludes: excludes}, nil
 }
 
 // atExclusionTableConstraint reports whether the cursor sits on a table-level EXCLUDE constraint:

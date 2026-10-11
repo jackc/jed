@@ -1,0 +1,112 @@
+# CREATE TABLE IF NOT EXISTS — the idempotent form of CREATE TABLE (grammar.md §13). A name already
+# taken in the relation namespace (a table, index, or sequence) makes the statement a no-op success
+# instead of 42P07 (PostgreSQL emits a notice; jed has no notice channel, so it is silent). The skip
+# is decided before any column or constraint work, so the skipped definition is never validated and
+# creates nothing — the existing relation and its rows are untouched. The TEMP form and the
+# preclude-overlaps namespace are covered in temp_table.test; the jed_ reservation in
+# reserved_names.test.
+# Format + the `requires` directive: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.create_table_if_not_exists, ddl.primary_key, ddl.secondary_index, ddl.sequence, ddl.serial, dml.insert, query.select, query.order_by, types.i32, types.text
+
+# --- a missing name creates the table, exactly like the bare form ----------------------------------
+
+statement ok
+CREATE TABLE IF NOT EXISTS t (id i32 PRIMARY KEY, v text)
+
+statement ok
+INSERT INTO t VALUES (1, 'one'), (2, 'two')
+
+# --- a taken name is a no-op: the existing table keeps its definition and rows ---------------------
+
+statement ok
+CREATE TABLE IF NOT EXISTS t (id i32 PRIMARY KEY, v text)
+
+# a different definition is skipped just the same — it does not replace or alter t
+statement ok
+CREATE TABLE IF NOT EXISTS t (other i32)
+
+query IT nosort
+SELECT id, v FROM t ORDER BY id
+----
+1
+one
+2
+two
+
+# the original shape still accepts writes
+statement ok
+INSERT INTO t VALUES (3, 'three')
+
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+3
+
+# the bare form still rejects the duplicate
+statement error 42P07
+CREATE TABLE t (id i32 PRIMARY KEY, v text)
+
+# --- the skipped definition is never validated ------------------------------------------------------
+
+# an unknown column type would be 42704 on a create, but the skip comes first
+statement ok
+CREATE TABLE IF NOT EXISTS t (a no_such_type)
+
+# a repeated column name would be 42701
+statement ok
+CREATE TABLE IF NOT EXISTS t (a i32, a i32)
+
+# --- the skipped definition creates nothing ----------------------------------------------------------
+
+# a serial column would create the owned sequence t_id_seq; skipped, the name stays free
+statement ok
+CREATE TABLE IF NOT EXISTS t (id serial PRIMARY KEY)
+
+statement ok
+CREATE SEQUENCE t_id_seq
+
+# --- every relation kind shares the namespace -------------------------------------------------------
+
+statement ok
+CREATE INDEX t_v_idx ON t (v)
+
+# a name taken by an index is a no-op (the bare form is 42P07)
+statement ok
+CREATE TABLE IF NOT EXISTS t_v_idx (a i32)
+
+statement error 42P07
+CREATE TABLE t_v_idx (a i32)
+
+# a name taken by a sequence is a no-op too
+statement ok
+CREATE TABLE IF NOT EXISTS t_id_seq (a i32)
+
+statement error 42P07
+CREATE TABLE t_id_seq (a i32)
+
+# --- IF NOT EXISTS is recognized by a two-token lookahead -------------------------------------------
+
+# a lone `if` stays an ordinary table name
+statement ok
+CREATE TABLE if (a i32)
+
+statement ok
+INSERT INTO if VALUES (7)
+
+statement ok
+CREATE TABLE IF NOT EXISTS if (b text)
+
+query I nosort
+SELECT a FROM if
+----
+7
+
+# IF NOT EXISTS still needs a table name after it
+statement error 42601
+CREATE TABLE IF NOT EXISTS (a i32)
+
+# `IF EXISTS` is not a CREATE form: `if` is read as the table name, and `exists` is a syntax error
+statement error 42601
+CREATE TABLE IF EXISTS u (a i32)

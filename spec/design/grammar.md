@@ -524,8 +524,27 @@ is a silent success). `IF EXISTS` suppresses **only** the missing-table error �
 too). The `IF EXISTS` keyword pair is recognized by a **two-token lookahead** (the shape the
 statement dispatch uses), so a lone `if` stays an ordinary non-reserved identifier:
 `DROP TABLE if` drops a table named `if` — PG-faithful (§1) — while only the adjacent pair
-`IF EXISTS` selects the idempotent form. The symmetric `CREATE TABLE IF NOT EXISTS` is still
-deferred and can land later ([../../TODO.md](../../TODO.md)).
+`IF EXISTS` selects the idempotent form.
+
+**`CREATE TABLE IF NOT EXISTS` — the symmetric idempotent create.** A name already taken in the
+target database's relation namespace — a table, index, or sequence (the namespace is shared, §1) —
+turns `CREATE TABLE`'s `42P07` into a **no-op success** (PostgreSQL emits a *"relation already
+exists, skipping"* notice; jed has no notice channel, so it is silent). It is **not** a "create or
+replace": the existing relation keeps its definition and rows whatever the new definition says.
+Following PostgreSQL (`transformCreateStmt` checks existence first), the skip is decided **before
+any column or constraint work**: the skipped definition is never validated (an unknown type, a
+repeated column, a jed narrowing that would be `0A000` on a create — none is reported) and creates
+nothing (a `serial` column's owned sequence is not made). What *does* still run first is the
+statement's own gating and target resolution — the `allow_ddl` / `allow_temp_ddl` gate (`42501`),
+the database qualifier (an unattached one is `42P01`, a read-only attachment `25006`), and the
+`jed_` reservation (`42939`; a reservation is not a collision, as for `CREATE SEQUENCE IF NOT
+EXISTS`). The collision is checked in the namespace the bare form would check: a host attachment's
+own namespace for `db.table`, and the temp-aware session namespace otherwise — so under the
+preclude-overlaps rule ([temp-tables.md](temp-tables.md) §3) `CREATE TEMP TABLE IF NOT EXISTS p`
+with a persistent `p` is a **no-op**, where PostgreSQL would create a `pg_temp` table shadowing it
+(the same documented divergence the bare form's `42P07` carries). Like `IF EXISTS`, the keywords
+are recognized by a **two-token lookahead** (`IF NOT`), so `CREATE TABLE if (...)` still creates a
+table named `if`.
 
 **Multi-table drop.** `DROP TABLE a, b, c` removes several tables in one statement. It is
 **two-phase / all-or-nothing** (the discipline §12 uses for multi-row work): every name is

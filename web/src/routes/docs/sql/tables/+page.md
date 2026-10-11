@@ -47,6 +47,15 @@ Things to try in the panel above:
 Each constraint violation is rejected before anything is written — a statement is all-or-nothing.
 See the [error reference](../../reference/errors/) for every code.
 
+Creating a table whose name is already taken by a table, index, or sequence is error `42P07`.
+`CREATE TABLE IF NOT EXISTS` makes it a no-op instead, so setup scripts can be re-run safely. It
+does not compare definitions: the existing table keeps its columns and rows, even if the new
+definition differs.
+
+```sql
+CREATE TABLE IF NOT EXISTS account (id i32 PRIMARY KEY, owner text);   -- no-op: account exists
+```
+
 Foreign keys accept `ON DELETE` and `ON UPDATE` with `NO ACTION` (the default), `RESTRICT`,
 `CASCADE`, `SET NULL`, or `SET DEFAULT`. Actions recurse through dependent tables. `SET DEFAULT`
 uses each referencing column's declared default, or `NULL` when it has none; generated changes run

@@ -5163,6 +5163,18 @@ export class Engine {
     return this.readSnap().rowsInKeyOrder(name);
   }
 
+  // createTableNameTaken reports whether CREATE TABLE's target name is already taken. The relation
+  // namespace is shared between tables and indexes (indexes.md §2), so a collision with either kind is
+  // the same 42P07 — PG's "relation" word. For a bare/main/temp target (attachName === "")
+  // relationExists is temp-aware (a temp name collides with temp + persistent alike — temp-tables.md
+  // §3); an attachment target checks its OWN snapshot's namespace (each attached database is
+  // independent, attached-databases.md §3).
+  private createTableNameTaken(name: string, attachName: string): boolean {
+    if (attachName === "") return this.relationExists(name);
+    const as = this.attachReadSnap(attachName)!;
+    return as.table(name) !== undefined || as.findIndex(name) !== null;
+  }
+
   // executeCreateTable resolves each column's type name, enforces a single primary key
   // across both forms (column-level and the table-level PRIMARY KEY (a, b, ...) constraint —
   // which is implicitly NOT NULL per member), rejects duplicate table and column names, then
@@ -5205,6 +5217,16 @@ export class Engine {
           this.checkAttachmentWritable(ct.db);
       }
     }
+    // The reservation is not a collision, so IF NOT EXISTS does not suppress it
+    // (spec/design/introspection.md §4).
+    checkReservedName("table", ct.name);
+    // IF NOT EXISTS (grammar.md §13): a taken name is a no-op success, decided before any column or
+    // constraint work (PostgreSQL's order) — so nothing in the definition is validated and nothing is
+    // created (no owned serial sequence), and the working snapshot stays untouched. The bare form keeps
+    // its 42P07 below, after the narrowings.
+    if (ct.ifNotExists && this.createTableNameTaken(ct.name, attachName)) {
+      return { kind: "statement", cost: 0n, rowsAffected: null };
+    }
     if (targetTemp && ct.excludes.length > 0) {
       // An EXCLUDE constraint's backing GiST index would live on the temp snapshot — deferred with
       // the rest of the GiST-on-temp narrowing (spec/design/gist.md §11), a clean 0A000.
@@ -5237,18 +5259,7 @@ export class Engine {
         );
       }
     }
-    checkReservedName("table", ct.name);
-    // The relation namespace is shared between tables and indexes (indexes.md §2), so a CREATE TABLE
-    // colliding with either kind is the same 42P07 — PG's "relation" word. For a bare/main/temp target
-    // relationExists is temp-aware (a temp name collides with temp + persistent alike — temp-tables.md
-    // §3); an attachment target checks its OWN snapshot's namespace (each attached database is
-    // independent, §3).
-    if (attachName !== "") {
-      const as = this.attachReadSnap(attachName)!;
-      if (as.table(ct.name) !== undefined || as.findIndex(ct.name) !== null) {
-        throw engineError("duplicate_table", "relation already exists: " + ct.name);
-      }
-    } else if (this.relationExists(ct.name)) {
+    if (this.createTableNameTaken(ct.name, attachName)) {
       throw engineError("duplicate_table", "relation already exists: " + ct.name);
     }
 

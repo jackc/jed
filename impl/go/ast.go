@@ -159,8 +159,13 @@ type createTable struct {
 	// (spec/design/temp-tables.md). A temp table makes ZERO writes to the database file (it lives
 	// outside the serialized snapshot) and is dropped at session close. Its DDL is gated by
 	// allowTempDDL rather than allowDDL (temp-tables.md §5).
-	Temp    bool
-	Columns []columnDef
+	Temp bool
+	// IfNotExists is whether `IF NOT EXISTS` followed `TABLE` (grammar.md §13): a name already taken in
+	// the target database's relation namespace makes the statement a no-op success instead of 42P07.
+	// The skip happens before any column or constraint work (PostgreSQL's order), so nothing in the
+	// definition is validated or created — not even a serial column's owned sequence.
+	IfNotExists bool
+	Columns     []columnDef
 	// TablePKs is the table-level `PRIMARY KEY (a, b, …)` constraints, each a list of
 	// member column names in key order (spec/design/grammar.md §28). The parser collects
 	// every one it sees; CREATE TABLE's execution resolves them (42703/42701) and rejects

@@ -355,6 +355,16 @@ impl Parser {
             self.advance();
         }
         self.expect_keyword("table")?;
+        // `IF NOT EXISTS` (grammar.md §13) is recognized by a two-token lookahead, so a lone `if`
+        // stays an ordinary non-reserved table name: `CREATE TABLE if (...)` creates a table named
+        // `if` (the DROP TABLE IF EXISTS precedent).
+        let if_not_exists = if self.peek_keyword().as_deref() == Some("if")
+            && self.peek_keyword_at(1).as_deref() == Some("not")
+        {
+            self.parse_if_not_exists()?
+        } else {
+            false
+        };
         // An optional database qualifier `db.table` (attached-databases.md §3, Slice 1b): create the
         // table INTO the named database (`main` / `temp` / a host attachment). A bare name uses the
         // implicit scope. The `.` after the first identifier makes it the qualifier, the next the name.
@@ -402,6 +412,7 @@ impl Parser {
         Ok(CreateTable {
             name,
             temp,
+            if_not_exists,
             columns,
             table_pks,
             checks,

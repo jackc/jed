@@ -9,7 +9,7 @@
 # no embedded multi-database model), so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
 # attach: mydb
 # attach: refs
-# requires: attach.in_memory, harness.attach, query.qualified_table, ddl.create_table, ddl.temp_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.check, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, types.i32, types.text, session.allow_temp_ddl
+# requires: attach.in_memory, harness.attach, query.qualified_table, ddl.create_table, ddl.create_table_if_not_exists, ddl.temp_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.check, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, types.i32, types.text, session.allow_temp_ddl
 
 # --- CREATE TABLE into an attachment + populate it --------------------------------------------
 
@@ -45,6 +45,42 @@ query I nosort
 SELECT x.qty FROM mydb.item AS x WHERE x.id = 3
 ----
 30
+
+# --- CREATE TABLE IF NOT EXISTS checks the TARGET database's own namespace --------------------
+
+# mydb.item is taken: a no-op that leaves the attachment's table and rows untouched
+statement ok
+CREATE TABLE IF NOT EXISTS mydb.item (other i32)
+
+# the skip precedes the attachment narrowings (a serial column is 0A000 on a create)
+statement ok
+CREATE TABLE IF NOT EXISTS mydb.item (id serial PRIMARY KEY)
+
+query IT nosort
+SELECT id, name FROM mydb.item ORDER BY id
+----
+1
+apple
+2
+pear
+3
+plum
+
+# each attached database is an independent namespace: refs has no item, so this creates one
+statement ok
+CREATE TABLE IF NOT EXISTS refs.item (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO refs.item VALUES (42)
+
+query I nosort
+SELECT id FROM refs.item
+----
+42
+
+# an unattached qualifier is still 42P01 — the target database resolves before the skip
+statement error 42P01
+CREATE TABLE IF NOT EXISTS nope.item (id i32 PRIMARY KEY)
 
 # --- a second attachment + a cross-attachment JOIN --------------------------------------------
 

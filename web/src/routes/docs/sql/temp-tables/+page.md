@@ -51,6 +51,13 @@ CREATE TABLE t (id i32 PRIMARY KEY);
 CREATE TEMP TABLE t (id i32 PRIMARY KEY);   -- error 42P07: relation already exists
 ```
 
+`CREATE TEMP TABLE IF NOT EXISTS` turns that conflict into a no-op, so with the persistent `t` above
+it creates nothing (PostgreSQL would create a temp `t` hiding the persistent one):
+
+```sql
+CREATE TEMP TABLE IF NOT EXISTS t (id i32 PRIMARY KEY);   -- no-op: t already exists
+```
+
 `TEMP` / `TEMPORARY` are recognized only between `CREATE` and `TABLE`, so a table *named* `temp` is
 still an ordinary persistent table:
 

@@ -395,6 +395,24 @@ func (db *engine) typeIsKeyable(ty dataType) bool {
 	}
 }
 
+// createTableNameTaken reports whether CREATE TABLE's target name is already taken. The relation
+// namespace is shared between tables and indexes (indexes.md §2), so a collision with either kind is
+// the same 42P07 — PG's "relation" word. For a bare/main/temp target (attachName == "") relationExists
+// is temp-aware (a temp name collides with temp + persistent alike — temp-tables.md §3); an attachment
+// target checks its OWN snapshot's namespace (each attached database is independent,
+// attached-databases.md §3).
+func (db *engine) createTableNameTaken(name, attachName string) bool {
+	if attachName == "" {
+		return db.relationExists(name)
+	}
+	as := db.attachReadSnap(attachName)
+	if _, ok := as.table(name); ok {
+		return true
+	}
+	_, _, ok := as.findIndex(name)
+	return ok
+}
+
 func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 	// A session-local temporary table (spec/design/temp-tables.md) is built exactly like a persistent
 	// one but registered into the session temp snapshot at the end (§2), so it makes zero file writes.
@@ -430,6 +448,18 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			}
 		}
 	}
+	// The reservation is not a collision, so IF NOT EXISTS does not suppress it
+	// (spec/design/introspection.md §4).
+	if err := checkReservedName("table", ct.Name); err != nil {
+		return outcome{}, err
+	}
+	// IF NOT EXISTS (grammar.md §13): a taken name is a no-op success, decided before any column or
+	// constraint work (PostgreSQL's order) — so nothing in the definition is validated and nothing is
+	// created (no owned serial sequence), and the working snapshot stays untouched. The bare form keeps
+	// its 42P07 below, after the narrowings.
+	if ct.IfNotExists && db.createTableNameTaken(ct.Name, attachName) {
+		return outcome{Kind: outcomeStatement, Cost: 0}, nil
+	}
 	if targetTemp && len(ct.Excludes) > 0 {
 		// An EXCLUDE constraint's backing GiST index would live on the temp snapshot — deferred with
 		// the rest of the GiST-on-temp narrowing (spec/design/gist.md §11), a clean 0A000.
@@ -450,23 +480,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			return outcome{}, newError(FeatureNotSupported, "an EXCLUDE constraint on an attached-database table is not supported yet")
 		}
 	}
-	if err := checkReservedName("table", ct.Name); err != nil {
-		return outcome{}, err
-	}
-	// The relation namespace is shared between tables and indexes (indexes.md §2), so a CREATE TABLE
-	// colliding with either kind is the same 42P07 — PG's "relation" word. For a bare/main/temp target
-	// relationExists is temp-aware (a temp name collides with temp + persistent alike — temp-tables.md
-	// §3); an attachment target checks its OWN snapshot's namespace (each attached database is
-	// independent, §3).
-	if attachName != "" {
-		as := db.attachReadSnap(attachName)
-		if _, ok := as.table(ct.Name); ok {
-			return outcome{}, newError(DuplicateTable, "relation already exists: "+ct.Name)
-		}
-		if _, _, ok := as.findIndex(ct.Name); ok {
-			return outcome{}, newError(DuplicateTable, "relation already exists: "+ct.Name)
-		}
-	} else if db.relationExists(ct.Name) {
+	if db.createTableNameTaken(ct.Name, attachName) {
 		return outcome{}, newError(DuplicateTable, "relation already exists: "+ct.Name)
 	}
 

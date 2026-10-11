@@ -6,7 +6,7 @@
 # from PostgreSQL's pg_temp shadowing — §3), so this suite is jed-specific: CROSS-CORE-checked, NOT
 # PostgreSQL-oracle-checked (the divergences + the host-configured allow_temp_ddl gate cannot be
 # reproduced via the same SQL). Format + the `requires` gate: ../../../design/conformance.md.
-# requires: ddl.temp_table, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.unique, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, types.i32, session.allow_temp_ddl
+# requires: ddl.temp_table, ddl.create_table, ddl.create_table_if_not_exists, ddl.primary_key, ddl.drop_table, ddl.unique, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, types.i32, session.allow_temp_ddl, query.qualified_table
 
 # --- full CRUD on a session-local temp table --------------------------------------------------
 
@@ -77,6 +77,69 @@ CREATE TEMP TABLE p (id i32 PRIMARY KEY)
 statement error 42P07
 CREATE TABLE t (id i32 PRIMARY KEY)
 
+# --- CREATE TEMP TABLE IF NOT EXISTS -----------------------------------------------------------
+
+# a taken temp name is a no-op: t keeps its definition and rows
+statement ok
+CREATE TEMP TABLE IF NOT EXISTS t (other text)
+
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+
+# a missing name creates the temp table
+statement ok
+CREATE TEMP TABLE IF NOT EXISTS t3 (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO t3 VALUES (8)
+
+statement ok
+CREATE TEMPORARY TABLE IF NOT EXISTS t3 (id i32 PRIMARY KEY)
+
+query I nosort
+SELECT id FROM t3
+----
+8
+
+# the `temp.` qualifier is the same target
+statement ok
+CREATE TABLE IF NOT EXISTS temp.t3 (x i32)
+
+query I nosort
+SELECT id FROM temp.t3
+----
+8
+
+# under preclude-overlaps a TEMP create naming a PERSISTENT relation is a collision, so IF NOT EXISTS
+# makes it a no-op — PostgreSQL would instead create a pg_temp table shadowing p (the §3 divergence)
+statement ok
+CREATE TEMP TABLE IF NOT EXISTS p (other text)
+
+statement ok
+INSERT INTO p VALUES (1)
+
+query I nosort
+SELECT id FROM main.p
+----
+1
+
+# and a persistent create naming a temp table is a no-op too (t stays temp)
+statement ok
+CREATE TABLE IF NOT EXISTS t (id i32 PRIMARY KEY)
+
+query I nosort
+SELECT id FROM temp.t ORDER BY id
+----
+1
+2
+
+# the skip precedes the temp narrowings (a FOREIGN KEY on a temp table is 0A000 on a create)
+statement ok
+CREATE TEMP TABLE IF NOT EXISTS t (id i32 PRIMARY KEY, pid i32 REFERENCES p)
+
 # --- TEMP is positional: a table NAMED "temp" is an ordinary persistent table -----------------
 
 statement ok
@@ -123,3 +186,12 @@ CREATE TABLE persistent_denied (id i32 PRIMARY KEY)
 # allow_temp_ddl: on
 statement ok
 CREATE TEMP TABLE scratch (id i32 PRIMARY KEY)
+
+# the gate is checked before the IF NOT EXISTS skip: even a no-op temp create is denied
+# allow_temp_ddl: off
+statement error 42501
+CREATE TEMP TABLE IF NOT EXISTS scratch (id i32 PRIMARY KEY)
+
+# allow_ddl: off
+statement error 42501
+CREATE TABLE IF NOT EXISTS p (id i32 PRIMARY KEY)

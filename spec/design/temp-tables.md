@@ -59,9 +59,14 @@ table_scope    ::= "TEMPORARY" | "TEMP"
   the same namespace, §3). No grammar change for `DROP`.
 - **Deferred surface** (each simply absent from the grammar this slice, none foreclosed — §14):
   `ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP }` (default is **`PRESERVE ROWS`**, the only
-  behavior implemented — `DELETE ROWS`/`DROP` are `0A000`); `IF NOT EXISTS` (consistent with
-  persistent `CREATE TABLE`, which has none — a collision is `42P07`); and `CREATE TEMP TABLE … AS
+  behavior implemented — `DELETE ROWS`/`DROP` are `0A000`); and `CREATE TEMP TABLE … AS
   SELECT` (CTAS does not exist yet for any table kind).
+- `CREATE [TEMP|TEMPORARY] TABLE IF NOT EXISTS` is supported exactly as for a persistent table
+  ([grammar.md](grammar.md) §13): a collision under the preclude-overlaps namespace (§3) — a temp
+  name already taken by a temp **or** persistent relation — is a no-op success rather than `42P07`.
+  So with a persistent `p`, `CREATE TEMP TABLE IF NOT EXISTS p (...)` creates nothing, where
+  PostgreSQL would create a `pg_temp.p` shadowing it — the §3 divergence, seen through `IF NOT
+  EXISTS`. The `allow_temp_ddl` gate (§5) still applies to the no-op.
 
 ## 2. The one idea that makes everything else fall out: temp state lives outside the snapshot
 
@@ -483,7 +488,7 @@ and memory-only per the design decision:
   retired (Slice 0, §13); a `Database`-scoped in-memory **attachment** is its replacement
   ([attached-databases.md](attached-databases.md) §6). Not deferred — deliberately not part of temp.
 - `ON COMMIT DELETE ROWS` / `ON COMMIT DROP` (§1, D6).
-- `IF NOT EXISTS`, `CREATE TEMP TABLE … AS SELECT` (§1).
+- `CREATE TEMP TABLE … AS SELECT` (§1).
 - `FOREIGN KEY` involving temp tables (§8) — start with FKs among same-kind temp tables.
 - A host-configurable spill directory (shared with the external sort — spill.md), so a WASI or OPFS
   host could offer a temp spill target; and migrating a shrunken spilled domain back into RAM.

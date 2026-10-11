@@ -151,6 +151,11 @@ pub struct CreateTable {
     /// outside the serialized `Snapshot`) and is dropped at session close. Its DDL is gated by
     /// `allow_temp_ddl` rather than `allow_ddl` (temp-tables.md §5).
     pub temp: bool,
+    /// Whether `IF NOT EXISTS` followed `TABLE` (grammar.md §13): a name already taken in the
+    /// target database's relation namespace makes the statement a no-op success instead of 42P07.
+    /// The skip happens before any column or constraint work (PostgreSQL's order), so nothing in the
+    /// definition is validated or created — not even a `serial` column's owned sequence.
+    pub if_not_exists: bool,
     pub columns: Vec<ColumnDef>,
     /// The table-level `PRIMARY KEY (a, b, …)` constraints, each a list of member column
     /// names in key order (spec/design/grammar.md §28). The parser collects every one it
