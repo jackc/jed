@@ -63,6 +63,23 @@ ORDER BY category;`;
 FROM (VALUES ('a', 1), ('b', 2), ('c', 3)) AS v (label, qty)
 ORDER BY label;`;
 
+	const parenSeed = `CREATE TABLE customer (id i32 PRIMARY KEY, name text NOT NULL);
+CREATE TABLE product (id i32 PRIMARY KEY, name text NOT NULL);
+CREATE TABLE orders (
+  id          i32 PRIMARY KEY,
+  customer_id i32 NOT NULL,
+  product_id  i32 NOT NULL
+);
+INSERT INTO customer VALUES (1, 'Ada'), (2, 'Grace'), (3, 'Linus');
+INSERT INTO product VALUES (1, 'Pen'), (2, 'Mug');
+INSERT INTO orders VALUES (1, 1, 1), (2, 1, 2), (3, 2, 2);`;
+
+	const parenthesized = `SELECT c.name, p.name AS product
+FROM customer AS c
+LEFT JOIN (orders AS o JOIN product AS p ON p.id = o.product_id)
+  ON o.customer_id = c.id
+ORDER BY c.name, product;`;
+
 	const lateral = `SELECT c.category, top.name, top.price
 FROM (SELECT DISTINCT category FROM product) AS c
 CROSS JOIN LATERAL (
@@ -254,8 +271,7 @@ column-rename list (`AS t (a, b)`):
 <LiveSql {seed} query={derived} rows={4} />
 
 By default the body is an independent query — it cannot see the enclosing query's other `FROM`
-relations. Mark it `LATERAL` (below) to correlate it. A parenthesized join (`FROM (a JOIN b …)`) and a
-`WITH` body are not yet supported.
+relations. Mark it `LATERAL` (below) to correlate it.
 
 ## `VALUES` lists in `FROM` (`FROM (VALUES …) AS v(x)`)
 
@@ -301,6 +317,20 @@ not yet supported.
 `NATURAL JOIN` is the shorthand: `a NATURAL JOIN b` joins on **every column the two tables share by
 name** (merging each, like `USING`). With no shared column it is a `CROSS JOIN`. It composes with
 `LEFT`/`RIGHT` (`a NATURAL LEFT JOIN b`); `NATURAL FULL JOIN` is not yet supported.
+
+## Parenthesized joins (`FROM (a JOIN b ON …)`)
+
+Parentheses group joins into a single `FROM` item and so set the join tree. Below, every customer is
+kept, and a customer's orders appear only where the inner join of `orders` and `product` matched —
+Linus, with no orders, still gets a row:
+
+<LiveSql seed={parenSeed} query={parenthesized} rows={4} />
+
+Without an alias the inner tables' names stay visible (`o.customer_id`, `p.name`, `p.*`) and must not
+repeat another `FROM` name. With an alias, `(a JOIN b ON …) AS g` behaves exactly like the derived
+table `(SELECT * FROM a JOIN b ON …) AS g`: you reference its columns through `g` (an optional
+column list `AS g (x, y)` renames them), and the inner names are hidden. The join inside the
+parentheses sees only its own tables, and must contain at least one join — `FROM (a)` is an error.
 
 ## Conditional expressions (`CASE`, `COALESCE`, `GREATEST`/`LEAST`)
 

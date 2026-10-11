@@ -1580,6 +1580,9 @@ type selectPlan struct {
 	// rewrite fired. filter above stays the COMPLETE WHERE — the input every access-path detector
 	// and estimator rule reads; execution evaluates postJoinFilter() over joined rows.
 	pushdown *wherePushdown
+	// group is the output layout of an unaliased parenthesized join's body (planner.go
+	// joinGroupOutputs; spec/design/grammar.md §15); nil for every written SELECT.
+	group *joinGroupLayout
 	// phys is the plan's physical / access-path decisions — set ONLY by the optimizeSelect pass
 	// (optimize.go); zero-valued when resolve hands the plan over (spec/design/planner.md §4).
 	phys physicalPlan

@@ -3128,7 +3128,8 @@ func (p *parser) parseFromClause() (tableRef, []joinClause, error) {
 	if err != nil {
 		return tableRef{}, nil, err
 	}
-	var joins []joinClause
+	// A leading unaliased parenthesized join is the same left-deep chain without its parentheses.
+	from, joins := spliceLeadingGroup(from, nil)
 	for {
 		for {
 			j, ok, err := p.parseJoinClause()
@@ -3150,7 +3151,10 @@ func (p *parser) parseFromClause() (tableRef, []joinClause, error) {
 			if err != nil {
 				return tableRef{}, nil, err
 			}
+			// An unaliased parenthesized join after a comma starts the new segment the same way.
+			table, groupJoins := spliceLeadingGroup(table, nil)
 			joins = append(joins, joinClause{Kind: joinCross, Table: table, Comma: true})
+			joins = append(joins, groupJoins...)
 			continue
 		}
 		break
@@ -3158,11 +3162,55 @@ func (p *parser) parseFromClause() (tableRef, []joinClause, error) {
 	return from, joins, nil
 }
 
-// parseTableRef parses `table_ref ::= derived_table derived_alias? | table_function
-// table_function_alias? | qualified_table ("AS"? identifier)?` (grammar.md §15/§35/§42). A `(`
-// at the START of a table_ref, when a SELECT
-// follows, begins a DERIVED TABLE — a parenthesized subquery used as a relation (§42); any other
-// leading `(` is a 42601 this slice (no parenthesized-join FROM). Otherwise it is a base table name
+// spliceLeadingGroup removes the parentheses from an unaliased parenthesized join that BEGINS a
+// left-deep chain (spec/design/grammar.md §15): `(a JOIN b ON p) JOIN c ON q` is exactly
+// `a JOIN b ON p JOIN c ON q`, the same join tree with the same ON scopes, so the group's chain
+// becomes the chain's prefix and joins follow it. Any other item is returned unchanged.
+func spliceLeadingGroup(item tableRef, joins []joinClause) (tableRef, []joinClause) {
+	if item.Alias != nil || item.Subquery == nil || item.Subquery.Select == nil || !item.Subquery.Select.JoinGroup {
+		return item, joins
+	}
+	group := item.Subquery.Select
+	return *group.From, append(append([]joinClause(nil), group.Joins...), joins...)
+}
+
+// parseJoinGroup parses the inside of a parenthesized join `"(" table_ref join_clause+ ")"`
+// (spec/design/grammar.md §15) after its `(`, stopping before the `)`. The group may not contain a
+// comma, and must contain at least one join (`FROM (a)` is 42601, as in PostgreSQL). Its body is a
+// `SELECT *` over the chain; the caller marks it JoinGroup when no alias follows.
+func (p *parser) parseJoinGroup() (queryExpr, error) {
+	if err := p.deepen(); err != nil {
+		return queryExpr{}, err
+	}
+	first, err := p.parseTableRef()
+	if err != nil {
+		return queryExpr{}, err
+	}
+	from, joins := spliceLeadingGroup(first, nil)
+	for {
+		j, ok, err := p.parseJoinClause()
+		if err != nil {
+			return queryExpr{}, err
+		}
+		if !ok {
+			break
+		}
+		joins = append(joins, j)
+	}
+	// `((a JOIN b ON p))` is a join (the inner group's chain); `(a)` is not.
+	if len(joins) == 0 {
+		return queryExpr{}, newError(SyntaxError,
+			"a parenthesized FROM item must be a subquery, a VALUES list, or a join")
+	}
+	p.undeepen()
+	return queryExpr{Select: &selectStmt{Items: selectItems{All: true}, From: &from, Joins: joins}}, nil
+}
+
+// parseTableRef parses `table_ref ::= derived_table derived_alias? | joined_group derived_alias? |
+// table_function table_function_alias? | qualified_table ("AS"? identifier)?` (grammar.md
+// §15/§35/§42). A `(` at the START of a table_ref, when SELECT/WITH/VALUES follows, begins a DERIVED
+// TABLE — a parenthesized subquery used as a relation (§42); any other leading `(` begins a
+// PARENTHESIZED JOIN `(a JOIN b ON …)` (§15). Otherwise it is a base table name
 // OR a set-returning function call, a `(` immediately after the leading identifier marking the
 // function form; the resolver owns arity/type errors. The alias logic is shared: an explicit AS
 // takes the next identifier unconditionally; an implicit alias is taken only when the next token is
@@ -3180,7 +3228,7 @@ func (p *parser) parseTableRef() (tableRef, error) {
 		p.advance()
 	}
 	if p.peek().Kind == tokLParen {
-		tr, err := p.parseDerivedTable()
+		tr, err := p.parseDerivedTable(lateral)
 		if err != nil {
 			return tableRef{}, err
 		}
@@ -3497,21 +3545,23 @@ func (p *parser) parseJtPathClause() (*string, error) {
 	return &s, nil
 }
 
-// parseDerivedTable parses a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42).
-// The caller has verified the next token is `(`. A derived table is recognized only when a SELECT
-// follows the `(` (the §26 leading-SELECT lookahead, a §8 cross-core surface); any other leading `(`
-// is a 42601 (no parenthesized-join FROM this slice). The alias is OPTIONAL (PostgreSQL 18 relaxed
-// the old mandatory-alias rule): present, it is the label and may carry a column-rename list; absent,
-// the relation has no qualifier (its bare columns still resolve). Name/Alias carry the alias (empty
-// when none).
-func (p *parser) parseDerivedTable() (tableRef, error) {
-	// Consume the opening `(`. The body is EITHER a query_expr (a leading SELECT) OR a VALUES list
+// parseDerivedTable parses a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42) —
+// or a PARENTHESIZED JOIN `"(" table_ref join_clause+ ")" derived_alias?` (§15). The caller has
+// verified the next token is `(`. A derived table is recognized when SELECT, WITH, or VALUES follows
+// the `(` (the §26 leading-SELECT lookahead, a §8 cross-core surface); any other leading `(` is a
+// parenthesized join, which may not follow LATERAL (42601). The alias is OPTIONAL (PostgreSQL 18
+// relaxed the old mandatory-alias rule): present, it is the label and may carry a column-rename list;
+// absent, the relation has no qualifier (its bare columns still resolve). An aliased join is the
+// derived table `(SELECT * FROM <join>) AS alias`; an unaliased one keeps its inner labels visible
+// (JoinGroup). Name/Alias carry the alias (empty when none).
+func (p *parser) parseDerivedTable(lateral bool) (tableRef, error) {
+	// Consume the opening `(`. The body is a query_expr (a leading SELECT/WITH), a VALUES list
 	// (a leading VALUES) — FROM (VALUES (e…),(e…)), a computed relation of literal rows
-	// (spec/design/grammar.md §42); any other leading `(` is rejected (a parenthesized-join FROM
-	// `(a JOIN b ON …)` is a deferred narrowing).
+	// (spec/design/grammar.md §42) — or a parenthesized join.
 	p.advance()
 	var body *queryExpr
 	var values [][]*exprNode
+	joinGroup := false
 	switch {
 	case p.peekKeyword() == "values":
 		v, err := p.parseValuesBody()
@@ -3526,9 +3576,15 @@ func (p *parser) parseDerivedTable() (tableRef, error) {
 			return tableRef{}, err
 		}
 		body = &b
+	case lateral:
+		return tableRef{}, newError(SyntaxError, "LATERAL must be followed by a subquery or a function call")
 	default:
-		return tableRef{}, newError(SyntaxError,
-			"subquery in FROM must begin with SELECT or VALUES (a parenthesized join is not supported)")
+		b, err := p.parseJoinGroup()
+		if err != nil {
+			return tableRef{}, err
+		}
+		body = &b
+		joinGroup = true
 	}
 	if err := p.expect(tokRParen); err != nil {
 		return tableRef{}, err
@@ -3571,6 +3627,10 @@ func (p *parser) parseDerivedTable() (tableRef, error) {
 	name := ""
 	if alias != nil {
 		name = *alias
+	}
+	// An unaliased join keeps its inner relation labels visible to the enclosing query.
+	if joinGroup && alias == nil {
+		body.Select.JoinGroup = true
 	}
 	return tableRef{Name: name, Alias: alias, Subquery: body, Values: values, ColumnAliases: columnAliases}, nil
 }

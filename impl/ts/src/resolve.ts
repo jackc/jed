@@ -121,7 +121,7 @@ import {
 } from "./jsonpath.ts";
 import type { ExtractSrc } from "./datetime_fn.ts";
 import { extractField } from "./datetime_fn.ts";
-import type { ColType, Column } from "./catalog.ts";
+import type { ColType, Column, Table } from "./catalog.ts";
 import type { RegexProgram } from "./regex.ts";
 import { foldLowerSimple, loadedProperty, sortKey as collationSortKey } from "./collation.ts";
 import { compileRegex } from "./regex.ts";
@@ -180,15 +180,28 @@ export function resolveProjections(
     // exactly as a qualified column ref.
     if (it.expr.kind === "qualifiedStar") {
       const want = it.expr.qualifier.toLowerCase();
+      let table: Table | undefined;
+      let slots: number[] = [];
       const rel = scope.rels.find((r) => r.label === want);
-      if (rel === undefined) {
+      if (rel !== undefined) {
+        table = rel.table;
+        slots = rel.table.columns.map((_c, i) => rel.offset + i);
+      } else {
+        // An inner label of an unaliased parenthesized join expands to its own columns (§15).
+        const sub = scope.subRels.find((sr) => sr.label === want);
+        if (sub !== undefined) {
+          table = sub.table;
+          slots = sub.slots;
+        }
+      }
+      if (table === undefined) {
         throw engineError(
           "undefined_table",
           "missing FROM-clause entry for table " + it.expr.qualifier,
         );
       }
-      rel.table.columns.forEach((c, i) => {
-        nodes.push({ kind: "column", index: rel.offset + i });
+      table.columns.forEach((c, i) => {
+        nodes.push({ kind: "column", index: slots[i]! });
         names.push(c.name);
         types.push(resolvedTypeOfCol(c.type, scope.catalog));
       });

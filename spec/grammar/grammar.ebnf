@@ -647,7 +647,7 @@ group_set      ::= "(" (column_ref ("," column_ref)*)? ")" | column_ref
  * ON-resolution segment: a join's ON inside one item may NOT reference a relation in an earlier
  * item (`FROM a, b JOIN c ON a.x = c.x` is a 42P01 on `a`, matching PostgreSQL). A LATERAL item
  * still sees earlier comma items (`FROM t, LATERAL (…)`); only a join's ON is segment-restricted.
- * A table_ref is one of three row sources, each with an alias:
+ * A table_ref is one of four row sources, each with an alias:
  *   - a DERIVED TABLE — a parenthesized subquery "(" query_expr ")" used as a relation
  *     (../design/grammar.md §42), e.g. "(SELECT id, n FROM t) AS d". It reuses the same
  *     computed-row-source seam as a single-reference CTE (../design/cte.md §3): the body
@@ -657,14 +657,23 @@ group_set      ::= "(" (column_ref ("," column_ref)*)? ")" | column_ref
  *     each column's type unifies across rows like a set operation (42804 on a mismatch).
  *   - a base table NAME;
  *   - a set-returning function CALL (table_function — generate_series(1,5), the computed
- *     row source of ../design/grammar.md §35).
+ *     row source of ../design/grammar.md §35);
+ *   - a PARENTHESIZED JOIN (joined_group — "(a JOIN b ON …)", ../design/grammar.md §15): a
+ *     join chain with at least one join and no comma, which may nest. The parentheses set the join
+ *     tree, and the group's ON clauses see only its own relations (an outer sibling is 42P01).
+ *     UNALIASED, its inner relation labels stay visible to the enclosing query and take part in
+ *     the duplicate-label check; at the start of a from_item (or of an enclosing group) it is the
+ *     same left-deep chain and splices into it. ALIASED, it is exactly the derived table
+ *     "(SELECT * FROM <join>) AS g" (inner labels hidden; "AS g(c1, …)" renames).
  * The alias (or, for a name/function with none, the table name / function name) is the
  * relation's LABEL, used to qualify columns (t.col); two relations with the same label (a
  * self-join with no aliases, "t JOIN t") is a 42712 duplicate_alias.
  *   DISAMBIGUATION (each a §8 cross-core determinism surface): a "(" at the START of a
  * table_ref begins a derived table when the token after it is "SELECT" (the same leading-
- * "SELECT" rule scalar subqueries and IN-subqueries use — §26) OR "VALUES" (a VALUES-body
- * derived table); any other leading "(" is a 42601 this slice (no parenthesized-join FROM).
+ * "SELECT" rule scalar subqueries and IN-subqueries use — §26), "WITH" (a nested-WITH body), OR
+ * "VALUES" (a VALUES-body derived table); any other leading "(" begins a joined_group (a "(" with no
+ * join inside — "FROM (a)", "FROM (a, b)" — is 42601, as in PostgreSQL; "LATERAL" before a
+ * joined_group is 42601).
  * A "(" immediately after a leading IDENTIFIER marks the function form (a one-token
  * lookahead; a bare table name has no "(" there).
  *   ALIAS. A derived table's alias is OPTIONAL (PostgreSQL 18 relaxed the old "subquery in FROM
@@ -689,8 +698,11 @@ from_clause    ::= from_item ("," from_item)*
 from_item      ::= table_ref join_clause*
 
 table_ref      ::= "LATERAL"? derived_table derived_alias?
+                 | joined_group derived_alias?
                  | "LATERAL"? table_function table_function_alias?
                  | qualified_table ("AS"? identifier)?
+
+joined_group   ::= "(" (table_ref join_clause+ | joined_group) ")"
 
 /* A database-QUALIFIED table name (../design/attached-databases.md §3). jed's FIRST multi-part name
  * in TABLE position: an OPTIONAL leading `db "."` names the ATTACHED DATABASE the table lives in

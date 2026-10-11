@@ -1057,6 +1057,12 @@ export type Select = {
   // grammar.ebnf `window_clause`), referenced by `OVER name`. Empty when absent. Resolved by a
   // desugaring pass that rewrites each `OVER name` to its definition before resolution.
   windows: [string, WindowDef][];
+  // joinGroup marks the synthesized body of an UNALIASED parenthesized-join FROM item
+  // `(a JOIN b ON …)` (spec/design/grammar.md §15): a `SELECT *` over the group's join chain whose
+  // inner relation labels stay visible to the enclosing query. Planning appends the join's hidden
+  // USING/NATURAL copies after the star columns and records the inner labels' column positions
+  // (SelectPlan.group). Never set by a written SELECT; an aliased group is an ordinary derived table.
+  joinGroup?: boolean;
 };
 
 // Update is `UPDATE <table> SET ... [WHERE ...]`. Assigning a PRIMARY KEY column re-keys

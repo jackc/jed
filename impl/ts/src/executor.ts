@@ -461,7 +461,8 @@ import {
   rejectParamsForDDL,
   seqBoundCheckLast,
   seqBoundCheckStart,
-  relOfIndex,
+  subRelsWithin,
+  type SubRel,
   renderBoundSrc,
   renderBoundTerms,
   renderRExpr,
@@ -13018,6 +13019,9 @@ export class Engine {
     const lateralFlags: boolean[] = [];
     const seenLabels = new Set<string>();
     let offset = 0;
+    // The inner labels and hidden USING copies of each unaliased parenthesized join (§15).
+    const subRels: SubRel[] = [];
+    const groupHidden: number[] = [];
     for (let i = 0; i < tableRefs.length; i++) {
       const tref = tableRefs[i]!;
       let t: Table;
@@ -13038,7 +13042,11 @@ export class Engine {
       // The prefix scope a LATERAL item resolves against: the relations to its left, chained to the
       // enclosing query's parent (so a sibling column correlates as Outer{level=1}, an enclosing one
       // deeper). null when not lateral-eligible.
-      const lateralParent = lateralEligible ? new Scope([...rels], this, parent, true, ctes) : null;
+      let lateralParent: Scope | null = null;
+      if (lateralEligible) {
+        lateralParent = new Scope([...rels], this, parent, true, ctes);
+        lateralParent.subRels = [...subRels];
+      }
       if (isDerived) {
         // Plan the body. LATERAL → parent is the prefix scope (a sibling/outer column correlates);
         // otherwise an INDEPENDENT query (parent=null, §42). A LATERAL VALUES body resolves its
@@ -13051,6 +13059,19 @@ export class Engine {
         lateral = lateralEligible && queryPlanReferencesOuter(plan, 0);
         const label = tref.alias === null ? "" : tref.alias.toLowerCase();
         t = cteSyntheticTable(label, plan, tref.columnAliases ?? null);
+        // An unaliased parenthesized join's columns are its inner columns, collation included.
+        const group = derivedJoinGroup(plan);
+        if (group !== null) {
+          t = {
+            name: label,
+            columns: group.columns,
+            pk: [],
+            checks: [],
+            indexes: [],
+            fks: [],
+            exclusions: [],
+          };
+        }
         derived = plan;
       } else if (tref.args !== null) {
         // A table function (SRF) — implicitly lateral. At i>0 its args resolve against the prefix
@@ -13159,11 +13180,24 @@ export class Engine {
       // An unaliased derived table (grammar.md §42, PG 18) has an EMPTY label — it has no qualifier,
       // so two of them never collide and the duplicate-label check is skipped (its bare columns still
       // resolve, and stay ambiguous via resolveBare). Every other relation has a non-empty label.
-      if (label !== "") {
-        if (seenLabels.has(label)) {
-          throw engineError("duplicate_alias", "table name " + label + " specified more than once");
+      const labels = [label];
+      // An unaliased parenthesized join (§15) is one relation with no label of its own, whose
+      // inner labels stay visible — and so take part in the duplicate-label check.
+      const group = derived === undefined ? null : derivedJoinGroup(derived);
+      if (group !== null) {
+        for (const sr of group.subRels) {
+          const slots = sr.slots.map((slot) => offset + slot);
+          subRels.push({ label: sr.label, table: sr.table, slots, rel: i });
+          labels.push(sr.label);
         }
-        seenLabels.add(label);
+        for (const h of group.hidden) groupHidden.push(offset + h);
+      }
+      for (const l of labels) {
+        if (l === "") continue;
+        if (seenLabels.has(l)) {
+          throw engineError("duplicate_alias", "table name " + l + " specified more than once");
+        }
+        seenLabels.add(l);
       }
       rels.push({ label, table: t, offset, cte: cteIdx, db: tref.db });
       srfPlans.push(srf);
@@ -13180,7 +13214,7 @@ export class Engine {
     // single merge column — the left for INNER/LEFT, the right for RIGHT (FULL JOIN USING, a COALESCE,
     // is 0A000). Both copies are hidden from `*`. Merges/predicates respect the comma SEGMENT (commit 1).
     const merges: MergeCol[] = [];
-    const hidden: number[] = [];
+    const hidden: number[] = groupHidden;
     const joinPreds: (RExpr | null)[] = [];
     for (let k = 0; k < sel.joins.length; k++) {
       const j = sel.joins[k]!;
@@ -13212,8 +13246,13 @@ export class Engine {
           );
         }
         const left = mkScope(seg, k);
+        // The synthesized predicate compares the two chosen columns through one-column pseudo
+        // relations at their flat slots, so it binds exactly those columns even when a side is an
+        // unlabeled relation or carries a second column of the same name.
+        const pairRels: ScopeRel[] = [];
         let predAst: Expr | null = null;
-        for (const name of usingCols) {
+        for (let n = 0; n < usingCols.length; n++) {
+          const name = usingCols[n]!;
           let li = -1;
           try {
             const lr = left.resolveBare(name);
@@ -13227,7 +13266,6 @@ export class Engine {
               `column "${name}" specified in USING clause does not exist in left table`,
             );
           }
-          const [llabel, lname] = relOfIndex(rels, li);
           const rightRel = rels[k + 1]!;
           const rl = columnIndex(rightRel.table, name);
           if (rl < 0) {
@@ -13237,11 +13275,17 @@ export class Engine {
             );
           }
           const ri = rightRel.offset + rl;
+          const lq = "\u0000l" + n;
+          const rq = "\u0000r" + n;
+          pairRels.push(
+            { label: lq, table: pseudoTable(lq, left.columnAt(li)), offset: li },
+            { label: rq, table: pseudoTable(rq, rightRel.table.columns[rl]!), offset: ri },
+          );
           const eq: Expr = {
             kind: "binary",
             op: "eq",
-            lhs: { kind: "qualifiedColumn", qualifier: llabel, name: lname },
-            rhs: { kind: "qualifiedColumn", qualifier: rightRel.label, name },
+            lhs: { kind: "qualifiedColumn", qualifier: lq, name },
+            rhs: { kind: "qualifiedColumn", qualifier: rq, name },
           };
           predAst = predAst === null ? eq : { kind: "binary", op: "and", lhs: predAst, rhs: eq };
           const mi = j.kind === "right" ? ri : li;
@@ -13250,10 +13294,11 @@ export class Engine {
           merges.push({ name: name.toLowerCase(), index: mi });
           hidden.push(li, ri);
         }
-        const partial = mkScope(seg, k + 1);
-        joinPreds.push(resolveBooleanFilter(partial, predAst!, ptypes));
+        const pair = new Scope(pairRels, this, null, false, ctes);
+        joinPreds.push(resolveBooleanFilter(pair, predAst!, ptypes));
       } else if (j.on !== null) {
         const partial = mkScope(seg, k + 1);
+        partial.subRels = subRelsWithin(subRels, seg, k + 1);
         joinPreds.push(resolveBooleanFilter(partial, j.on, ptypes));
       } else {
         joinPreds.push(null);
@@ -13263,6 +13308,7 @@ export class Engine {
     const scope = new Scope(rels, this, parent, true, ctes);
     scope.merges = merges;
     scope.hidden = hidden;
+    scope.subRels = subRels;
 
     // Expand GROUP BY (including ROLLUP / CUBE / GROUPING SETS) into a list of grouping sets, resolve
     // each set's columns to flat row indices, and build the master grouping-column list (groupKeys) —
@@ -13405,6 +13451,10 @@ export class Engine {
       names: columnNames,
       types: columnTypes,
     } = resolveProjections(scope, itemsRef, projAgg, ptypes);
+    const group =
+      sel.joinGroup === true
+        ? joinGroupOutputs(scope, projections, columnNames, columnTypes)
+        : null;
     let aggSpecs = projAgg.specs;
     let groupingSpecs: number[][] = projAgg.groupingSpecs ?? [];
     // The collected window specs + materialized window-key expressions (empty unless a window query).
@@ -13809,6 +13859,7 @@ export class Engine {
       distinct: sel.distinct,
       limit: sel.limit,
       offset: sel.offset,
+      group,
       relMasks: [],
       pushdown: null,
       phys: {
@@ -23926,6 +23977,94 @@ function computeRelMasks(plan: SelectPlan): boolean[][] {
   return plan.rels.map((r) => touched.slice(r.offset, r.offset + r.colCount));
 }
 
+// JoinGroupLayout is the output shape of an unaliased parenthesized join's body
+// (spec/design/grammar.md §15): columns are the body outputs (the star columns, then the hidden
+// USING/NATURAL copies), each keeping its source column's name, type, and collation; hidden is the
+// output positions of those copies; subRels give each inner label's columns as output positions
+// (rel unused).
+export type JoinGroupLayout = {
+  columns: Column[];
+  hidden: number[];
+  subRels: SubRel[];
+};
+
+// groupColumn is a body output column of a parenthesized join: only its source column's name, type,
+// and collation carry over.
+function groupColumn(name: string, type: Type, collation: string | null): Column {
+  return {
+    name,
+    type,
+    decimal: null,
+    varcharLen: null,
+    primaryKey: false,
+    notNull: false,
+    default: null,
+    defaultExpr: null,
+    identity: null,
+    collation,
+  };
+}
+
+// pseudoTable is the one-column relation a synthesized USING/NATURAL equality reads one side
+// through (grammar.md §15): exactly the chosen column, under an internal label.
+function pseudoTable(name: string, column: Column): Table {
+  return { name, columns: [column], pk: [], checks: [], indexes: [], fks: [], exclusions: [] };
+}
+
+// joinGroupOutputs completes a joinGroup body: after its `*` columns it appends every slot the star
+// omitted (a USING/NATURAL copy superseded by a merge), so each inner relation's columns are all
+// present, and records where each inner label's columns landed. Every star output is a bare column.
+function joinGroupOutputs(
+  s: Scope,
+  projections: RExpr[],
+  names: string[],
+  types: ResolvedType[],
+): JoinGroupLayout {
+  const pos = new Map<number, number>();
+  projections.forEach((pr, p) => {
+    pos.set(starColumnIndex(pr), p);
+  });
+  const group: JoinGroupLayout = { columns: [], hidden: [], subRels: [] };
+  const extra = [...new Set(s.hidden)].sort((a, b) => a - b);
+  for (const idx of extra) {
+    if (pos.has(idx)) continue;
+    pos.set(idx, projections.length);
+    group.hidden.push(projections.length);
+    const c = s.columnAt(idx);
+    projections.push({ kind: "column", index: idx });
+    names.push(c.name);
+    types.push(resolvedTypeOfCol(c.type, s.catalog));
+  }
+  for (const pr of projections) {
+    const c = s.columnAt(starColumnIndex(pr));
+    group.columns.push(groupColumn(c.name, c.type, c.collation));
+  }
+  for (const r of s.rels) {
+    if (r.label === "") continue;
+    const slots = r.table.columns.map((_c, c) => pos.get(r.offset + c)!);
+    group.subRels.push({ label: r.label, table: r.table, slots, rel: 0 });
+  }
+  for (const sr of s.subRels) {
+    const slots = sr.slots.map((slot) => pos.get(slot)!);
+    group.subRels.push({ label: sr.label, table: sr.table, slots, rel: 0 });
+  }
+  return group;
+}
+
+// starColumnIndex is the flat slot a join group body's output reads (every output is a bare
+// column).
+function starColumnIndex(pr: RExpr): number {
+  if (pr.kind !== "column") throw new Error("a join group's outputs are bare columns");
+  return pr.index;
+}
+
+// derivedJoinGroup is the layout of a FROM item's derived body when it is an unaliased
+// parenthesized join, else null.
+function derivedJoinGroup(plan: QueryPlan): JoinGroupLayout | null {
+  if (plan.kind !== "select") return null;
+  return plan.group;
+}
+
 // A resolved host-function call node — the hostFunc RExpr variant, carried by collectHostFuncNodes.
 type HostFuncNode = Extract<RExpr, { kind: "hostFunc" }>;
 
@@ -26516,6 +26655,9 @@ export type SelectPlan = {
   // rewrite fired. filter above stays the COMPLETE WHERE — the input every access-path detector
   // and estimator rule reads; execution evaluates postJoinFilter() over joined rows.
   pushdown: WherePushdown | null;
+  // group is the output layout of an unaliased parenthesized join's body (joinGroupOutputs;
+  // spec/design/grammar.md §15); null for every written SELECT.
+  group: JoinGroupLayout | null;
   // phys is the plan's physical / access-path decisions — set ONLY by the optimizeSelect pass
   // (optimize.ts); zero-valued when resolve hands the plan over (spec/design/planner.md §4).
   phys: PhysicalPlan;

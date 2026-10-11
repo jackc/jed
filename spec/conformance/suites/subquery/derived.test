@@ -215,16 +215,19 @@ SELECT 1 FROM t AS d CROSS JOIN (SELECT id FROM t) AS d
 statement error 42P01
 SELECT t.id FROM t JOIN (SELECT id FROM t AS u WHERE u.id = t.id) AS d ON t.id = d.id
 
-# A leading `(` in FROM that does NOT begin a SELECT is 42601 this slice (no parenthesized-join FROM
-# — a deferred feature). DOCUMENTED DIVERGENCE: PostgreSQL parses the parenthesized join and instead
-# reports 42712 (the duplicate `t`) — see oracle_overrides.toml.
-statement error 42601
+# A leading `(` in FROM that does NOT begin a SELECT/VALUES/WITH is a parenthesized join
+# (spec/design/grammar.md §15; joins/parenthesized.test) — here its inner duplicate `t` is 42712.
+statement error 42712
 SELECT * FROM (t JOIN t ON 1 = 1) AS x
 
 # A body producing two columns of the same name is allowed, but a later BARE reference to that name
 # is ambiguous -> 42702 (the same rule a self-join of same-labelled relations takes).
 statement error 42702
 SELECT a FROM (SELECT id AS a, n AS a FROM t) AS d
+
+# A QUALIFIED reference to the duplicated name is ambiguous too.
+statement error 42702
+SELECT d.a FROM (SELECT id AS a, n AS a FROM t) AS d
 
 # A nested WITH inside a derived-table body is now supported (spec/design/cte.md §7) — see
 # cte/nested.test for the behavior. (Previously a top-level-only narrowing / 42601.)

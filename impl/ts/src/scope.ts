@@ -1,9 +1,6 @@
 import type { TimeZoneDeps } from "./catalog.ts";
 import type { InputZone } from "./timezone.ts";
 import { noteIndexZone } from "./index_dependencies.ts";
-// relOfIndex returns the [label, column-name] of the relation owning a flat row index — used to
-// synthesize a USING/NATURAL join predicate's qualified column references (spec/design/grammar.md
-// §15). The index is known valid (resolution produced it), so the scan always finds an owner.
 import type {
   BoundTerm,
   CteBinding,
@@ -85,13 +82,20 @@ import { render, renderFloat } from "./value.ts";
 import { storeValue } from "./store.ts";
 import type { Privilege } from "./privileges.ts";
 import type { TableStore } from "./storage.ts";
-export function relOfIndex(rels: ScopeRel[], idx: number): [string, string] {
-  for (const r of rels) {
-    const n = r.table.columns.length;
-    if (idx >= r.offset && idx < r.offset + n)
-      return [r.label, r.table.columns[idx - r.offset]!.name];
-  }
-  throw new Error("USING merge index out of range");
+// SubRel is one inner relation label of an unaliased parenthesized join (grammar.md §15): its
+// table's columns live at the flat slots `slots` of the join's single FROM relation (slot k holds
+// column k). rel is the owning FROM ordinal, so a partial ON scope sees only the labels of the
+// relations it spans.
+export type SubRel = {
+  label: string;
+  table: Table;
+  slots: number[];
+  rel: number;
+};
+
+// subRelsWithin returns the sub-relation labels owned by FROM ordinals lo..hi inclusive.
+export function subRelsWithin(subs: SubRel[], lo: number, hi: number): SubRel[] {
+  return subs.filter((sr) => sr.rel >= lo && sr.rel <= hi);
 }
 
 export class Scope {
@@ -112,8 +116,13 @@ export class Scope {
   // copies' 42702 ambiguity). Empty except in a SELECT whose FROM has a USING join.
   merges: MergeCol[] = [];
   // Flat indices SUPERSEDED by a merge — the underlying left+right copies, omitted from `*`
-  // expansion (still reachable qualified). Empty unless `merges` is non-empty.
+  // expansion (still reachable qualified) — plus the copies an unaliased parenthesized join carries
+  // after its star columns. Empty unless the FROM has a USING/NATURAL join.
   hidden: number[] = [];
+  // The relation labels an UNALIASED parenthesized join keeps visible (spec/design/grammar.md §15):
+  // `(a JOIN b ON …)` is one FROM relation, yet `a.x` and `b.*` still name its inner relations.
+  // Reached only by qualified references; never physical.
+  subRels: SubRel[] = [];
   constructor(
     rels: ScopeRel[],
     catalog: Engine,
@@ -266,9 +275,33 @@ export class Scope {
     const q = qualifier.toLowerCase();
     for (const r of this.rels) {
       if (r.label === q) {
-        const local = columnIndex(r.table, name);
+        // A synthetic relation (a derived table, an aliased parenthesized join) may carry two
+        // columns of one name; a qualified reference to it is ambiguous (42702) exactly as a bare
+        // one is (PG). A USING/NATURAL copy hidden by a merge yields to the visible column.
+        const lowerName = name.toLowerCase();
+        let found = -1;
+        let visible = -1;
+        let ambiguous = false;
+        for (let local = 0; local < r.table.columns.length; local++) {
+          if (r.table.columns[local]!.name.toLowerCase() !== lowerName) continue;
+          const idx = r.offset + local;
+          if (found < 0) found = idx;
+          if (!this.hidden.includes(idx)) {
+            ambiguous = ambiguous || visible >= 0;
+            visible = idx;
+          }
+        }
+        if (found < 0) throw undefinedColumn(name);
+        if (ambiguous) throw ambiguousColumn(name);
+        if (visible >= 0) return { level: 0, index: visible };
+        return { level: 0, index: found };
+      }
+    }
+    for (const sr of this.subRels) {
+      if (sr.label === q) {
+        const local = columnIndex(sr.table, name);
         if (local < 0) throw undefinedColumn(name);
-        return { level: 0, index: r.offset + local };
+        return { level: 0, index: sr.slots[local]! };
       }
     }
     if (this.parent !== null) return outerOf(this.parent.resolveQualified(qualifier, name));

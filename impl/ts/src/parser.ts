@@ -116,6 +116,26 @@ function isTableRefStopKeyword(kw: string): boolean {
   }
 }
 
+// spliceLeadingGroup removes the parentheses from an unaliased parenthesized join that BEGINS a
+// left-deep chain (spec/design/grammar.md §15): `(a JOIN b ON p) JOIN c ON q` is exactly
+// `a JOIN b ON p JOIN c ON q`, the same join tree with the same ON scopes, so the group's chain
+// becomes the chain's prefix and joins follow it. Any other item is returned unchanged.
+function spliceLeadingGroup(
+  item: TableRef,
+  joins: JoinClause[],
+): { from: TableRef; joins: JoinClause[] } {
+  const group = item.subquery;
+  if (
+    item.alias !== null ||
+    group === undefined ||
+    group.kind !== "select" ||
+    group.joinGroup !== true
+  ) {
+    return { from: item, joins };
+  }
+  return { from: group.from!, joins: [...group.joins, ...joins] };
+}
+
 // foldInt converts a lexed unsigned magnitude (<= 2^63) and a sign into a signed
 // i64-range bigint, throwing 22003 when the result does not fit (a bare 2^63, or the
 // not-negated 2^63). -(2^63) folds to i64's minimum (spec/design/grammar.md §4).
@@ -2474,8 +2494,8 @@ class Parser {
   // not reserved (§3); the loop recognizes a join only by a leading join keyword, so any other
   // trailing word ends the FROM clause.
   private parseFromClause(): { from: TableRef; joins: JoinClause[] } {
-    const from = this.parseTableRef();
-    const joins: JoinClause[] = [];
+    // A leading unaliased parenthesized join is the same left-deep chain without its parentheses.
+    const { from, joins } = spliceLeadingGroup(this.parseTableRef(), []);
     for (;;) {
       for (;;) {
         const j = this.parseJoinClause();
@@ -2488,8 +2508,10 @@ class Parser {
       // picks up any joins of the new item (`a, b JOIN c ON …`) before the next comma.
       if (this.peek().kind === "comma") {
         this.advance();
-        const table = this.parseTableRef();
+        // An unaliased parenthesized join after a comma starts the new segment the same way.
+        const { from: table, joins: groupJoins } = spliceLeadingGroup(this.parseTableRef(), []);
         joins.push({ kind: "cross", table, on: null, comma: true });
+        joins.push(...groupJoins);
         continue;
       }
       break;
@@ -2497,14 +2519,50 @@ class Parser {
     return { from, joins };
   }
 
-  // parseTableRef parses `table_ref ::= derived_table derived_alias? | table_function
-  // table_function_alias? | qualified_table ("AS"? identifier)?` (grammar.md §15/§35/§42). A `(`
-  // at the START of a
-  // table_ref, when a SELECT follows, begins a DERIVED TABLE — a parenthesized subquery used as a
-  // relation (§42); any other leading `(` is a 42601 this slice (no parenthesized-join FROM).
-  // Otherwise it is a base table name OR a set-returning function call, a `(` immediately after the
-  // leading identifier marking the function form; the resolver owns arity/type errors. The alias
-  // logic is shared. The stop-keyword set is a §8 cross-core surface.
+  // parseJoinGroup parses the inside of a parenthesized join `"(" table_ref join_clause+ ")"`
+  // (spec/design/grammar.md §15) after its `(`, stopping before the `)`. The group may not contain a
+  // comma, and must contain at least one join (`FROM (a)` is 42601, as in PostgreSQL). Its body is a
+  // `SELECT *` over the chain; the caller marks it joinGroup when no alias follows.
+  private parseJoinGroup(): Select {
+    this.deepen();
+    const { from, joins } = spliceLeadingGroup(this.parseTableRef(), []);
+    for (;;) {
+      const j = this.parseJoinClause();
+      if (j === null) break;
+      joins.push(j);
+    }
+    // `((a JOIN b ON p))` is a join (the inner group's chain); `(a)` is not.
+    if (joins.length === 0) {
+      throw engineError(
+        "syntax_error",
+        "a parenthesized FROM item must be a subquery, a VALUES list, or a join",
+      );
+    }
+    this.undeepen();
+    return {
+      kind: "select",
+      distinct: false,
+      items: { kind: "all" },
+      from,
+      joins,
+      filter: null,
+      groupBy: [],
+      having: null,
+      orderBy: [],
+      limit: null,
+      offset: null,
+      windows: [],
+    };
+  }
+
+  // parseTableRef parses `table_ref ::= derived_table derived_alias? | joined_group derived_alias? |
+  // table_function table_function_alias? | qualified_table ("AS"? identifier)?` (grammar.md
+  // §15/§35/§42). A `(` at the START of a table_ref, when SELECT/WITH/VALUES follows, begins a
+  // DERIVED TABLE — a parenthesized subquery used as a relation (§42); any other leading `(` begins a
+  // PARENTHESIZED JOIN `(a JOIN b ON …)` (§15). Otherwise it is a base table name OR a set-returning
+  // function call, a `(` immediately after the leading identifier marking the function form; the
+  // resolver owns arity/type errors. The alias logic is shared. The stop-keyword set is a §8
+  // cross-core surface.
   private parseTableRef(): TableRef {
     // An optional leading LATERAL (grammar.md §44) marks a derived table / table function as
     // correlated to the EARLIER FROM relations. LATERAL is non-reserved (§3), so it is the keyword
@@ -2519,7 +2577,7 @@ class Parser {
       this.advance();
     }
     if (this.peek().kind === "lparen") {
-      const tr = this.parseDerivedTable();
+      const tr = this.parseDerivedTable(lateral);
       tr.lateral = lateral;
       return tr;
     }
@@ -2596,31 +2654,36 @@ class Parser {
     return { name, db, alias, args, columnAliases, columnDefs, lateral };
   }
 
-  // parseDerivedTable parses a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42).
-  // The caller has verified the next token is `(`. A derived table is recognized only when a SELECT
+  // parseDerivedTable parses a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42)
+  // — or a PARENTHESIZED JOIN `"(" table_ref join_clause+ ")" derived_alias?` (§15). The caller has
+  // verified the next token is `(`. A derived table is recognized when SELECT, WITH, or VALUES
   // follows the `(` (the §26 leading-SELECT lookahead, a §8 cross-core surface); any other leading
-  // `(` is a 42601 (no parenthesized-join FROM this slice). The alias is OPTIONAL (PostgreSQL 18
-  // relaxed the old mandatory-alias rule): present, it is the label and may carry a column-rename
-  // list; absent, the relation has no qualifier (its bare columns still resolve). name/alias carry
-  // the alias ("" / null when none).
-  private parseDerivedTable(): TableRef {
-    // Consume the opening `(`. The body is EITHER a query_expr (a leading SELECT) OR a VALUES list
+  // `(` is a parenthesized join, which may not follow LATERAL (42601). The alias is OPTIONAL
+  // (PostgreSQL 18 relaxed the old mandatory-alias rule): present, it is the label and may carry a
+  // column-rename list; absent, the relation has no qualifier (its bare columns still resolve). An
+  // aliased join is the derived table `(SELECT * FROM <join>) AS alias`; an unaliased one keeps its
+  // inner labels visible (joinGroup). name/alias carry the alias ("" / null when none).
+  private parseDerivedTable(lateral: boolean): TableRef {
+    // Consume the opening `(`. The body is a query_expr (a leading SELECT/WITH), a VALUES list
     // (a leading VALUES) — FROM (VALUES (e…),(e…)), a computed relation of literal rows
-    // (grammar.md §42); any other leading `(` is rejected (a parenthesized-join FROM
-    // `(a JOIN b ON …)` is a deferred narrowing).
+    // (grammar.md §42) — or a parenthesized join.
     this.advance();
     let body: QueryExpr | undefined;
     let values: Expr[][] | undefined;
+    let group: Select | undefined;
     if (this.peekKeyword() === "values") {
       values = this.parseValuesBody();
     } else if (this.atSubqueryStart()) {
       // A leading SELECT, or a nested WITH (cte.md §7), is a query_expr body.
       body = this.parseSubquery();
-    } else {
+    } else if (lateral) {
       throw engineError(
         "syntax_error",
-        "subquery in FROM must begin with SELECT or VALUES (a parenthesized join is not supported)",
+        "LATERAL must be followed by a subquery or a function call",
       );
+    } else {
+      group = this.parseJoinGroup();
+      body = group;
     }
     this.expect("rparen");
     // The alias is optional, parsed exactly like a base table's.
@@ -2647,6 +2710,10 @@ class Parser {
         columnAliases.push(this.expectIdentifier());
       }
       this.expect("rparen");
+    }
+    // An unaliased join keeps its inner relation labels visible to the enclosing query.
+    if (group !== undefined && alias === null) {
+      group.joinGroup = true;
     }
     return {
       name: alias ?? "",

@@ -81,8 +81,35 @@ type scope struct {
 	// the underlying copies' 42702 ambiguity). Empty except in a SELECT whose FROM has a USING join.
 	merges []mergeCol
 	// hidden is the flat indices SUPERSEDED by a merge — the underlying left+right copies, omitted
-	// from `*` expansion (still reachable qualified). Empty unless merges is non-empty.
+	// from `*` expansion (still reachable qualified) — plus the copies an unaliased parenthesized
+	// join carries after its star columns. Empty unless the FROM has a USING/NATURAL join.
 	hidden []int
+	// subRels are the relation labels an UNALIASED parenthesized join keeps visible
+	// (spec/design/grammar.md §15): `(a JOIN b ON …)` is one FROM relation, yet `a.x` and `b.*`
+	// still name its inner relations. Reached only by qualified references; never physical.
+	subRels []subRel
+}
+
+// subRel is one inner relation label of an unaliased parenthesized join (grammar.md §15): its
+// table's columns live at the flat slots `slots` of the join's single FROM relation (slot k holds
+// column k). rel is the owning FROM ordinal, so a partial ON scope sees only the labels of the
+// relations it spans.
+type subRel struct {
+	label string
+	table *catTable
+	slots []int
+	rel   int
+}
+
+// subRelsWithin returns the sub-relation labels owned by FROM ordinals lo..hi inclusive.
+func subRelsWithin(subs []subRel, lo, hi int) []subRel {
+	var out []subRel
+	for _, sr := range subs {
+		if sr.rel >= lo && sr.rel <= hi {
+			out = append(out, sr)
+		}
+	}
+	return out
 }
 
 // mergeCol is a USING/NATURAL merged column (spec/design/grammar.md §15): name is the (lowercased)
@@ -239,11 +266,41 @@ func (s *scope) resolveQualified(qualifier, name string) (resolved, error) {
 	q := strings.ToLower(qualifier)
 	for _, r := range s.rels {
 		if r.label == q {
-			local := r.table.ColumnIndex(name)
+			// A synthetic relation (a derived table, an aliased parenthesized join) may carry two
+			// columns of one name; a qualified reference to it is ambiguous (42702) exactly as a bare
+			// one is (PG). A USING/NATURAL copy hidden by a merge yields to the visible column.
+			found, visible, ambiguous := -1, -1, false
+			for local, c := range r.table.Columns {
+				if !strings.EqualFold(c.Name, name) {
+					continue
+				}
+				idx := r.offset + local
+				if found < 0 {
+					found = idx
+				}
+				if !slices.Contains(s.hidden, idx) {
+					ambiguous = ambiguous || visible >= 0
+					visible = idx
+				}
+			}
+			switch {
+			case found < 0:
+				return resolved{}, undefinedColumn(name)
+			case ambiguous:
+				return resolved{}, ambiguousColumn(name)
+			case visible >= 0:
+				return resolved{level: 0, index: visible}, nil
+			}
+			return resolved{level: 0, index: found}, nil
+		}
+	}
+	for _, sr := range s.subRels {
+		if sr.label == q {
+			local := sr.table.ColumnIndex(name)
 			if local < 0 {
 				return resolved{}, undefinedColumn(name)
 			}
-			return resolved{level: 0, index: r.offset + local}, nil
+			return resolved{level: 0, index: sr.slots[local]}, nil
 		}
 	}
 	if s.parent != nil {
@@ -300,20 +357,6 @@ func naturalCommonCols(rels []scopeRel, seg, k int) []string {
 		}
 	}
 	return out
-}
-
-// relOfIndex returns the (label, column-name) of the relation owning a flat row index — used to
-// synthesize a USING/NATURAL join predicate's qualified column references (grammar.md §15). The
-// index is known valid (resolution produced it), so the scan always finds an owner.
-func relOfIndex(rels []scopeRel, idx int) (string, string) {
-	for i := range rels {
-		r := rels[i]
-		n := len(r.table.Columns)
-		if idx >= r.offset && idx < r.offset+n {
-			return r.label, r.table.Columns[idx-r.offset].Name
-		}
-	}
-	panic("USING merge index out of range")
 }
 
 // ancestor returns the scope `level` hops outward (1 = immediate parent).
@@ -624,20 +667,30 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 		// 42P01, exactly as a qualified column ref.
 		if it.Expr.Kind == exprQualifiedStar {
 			want := toLowerASCII(it.Expr.Qualifier)
-			var found *scopeRel
+			var table *catTable
+			var slots []int
 			for i := range s.rels {
 				if s.rels[i].label == want {
-					found = &s.rels[i]
+					table = s.rels[i].table
+					for c := range table.Columns {
+						slots = append(slots, s.rels[i].offset+c)
+					}
 					break
 				}
 			}
-			if found == nil {
+			// An inner label of an unaliased parenthesized join expands to its own columns (§15).
+			for i := range s.subRels {
+				if table == nil && s.subRels[i].label == want {
+					table, slots = s.subRels[i].table, s.subRels[i].slots
+				}
+			}
+			if table == nil {
 				return nil, nil, nil, newError(UndefinedTable, "missing FROM-clause entry for table "+it.Expr.Qualifier)
 			}
-			for i := range found.table.Columns {
-				ps = append(ps, &rExpr{kind: reColumn, index: found.offset + i})
-				names = append(names, found.table.Columns[i].Name)
-				types = append(types, resolvedTypeOfCol(found.table.Columns[i].Type, s.catalog.readSnap()))
+			for i := range table.Columns {
+				ps = append(ps, &rExpr{kind: reColumn, index: slots[i]})
+				names = append(names, table.Columns[i].Name)
+				types = append(types, resolvedTypeOfCol(table.Columns[i].Type, s.catalog.readSnap()))
 			}
 			continue
 		}

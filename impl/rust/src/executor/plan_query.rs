@@ -915,6 +915,7 @@ impl Engine {
             ctes,
             merges: Vec::new(),
             hidden: Vec::new(),
+            sub_rels: Vec::new(),
         };
         let mut resolved_rows: Vec<Vec<RExpr>> = Vec::with_capacity(rows.len());
         let mut col_types: Vec<ResolvedType> = Vec::with_capacity(arity);

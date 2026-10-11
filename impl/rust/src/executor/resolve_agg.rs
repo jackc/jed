@@ -416,22 +416,6 @@ pub(crate) fn natural_common_cols(rels: &[ScopeRel], seg: usize, k: usize) -> Ve
     out
 }
 
-/// The `(label, column-name)` of the relation owning a flat row index — used to synthesize a
-/// `USING`/`NATURAL` join predicate's qualified column references (spec/design/grammar.md §15).
-/// The index is known valid (resolution produced it), so the scan always finds an owner.
-pub(crate) fn rel_of_index(rels: &[ScopeRel], idx: usize) -> (String, String) {
-    for r in rels {
-        let n = r.table.columns.len();
-        if idx >= r.offset && idx < r.offset + n {
-            return (
-                r.label.clone(),
-                r.table.columns[idx - r.offset].name.clone(),
-            );
-        }
-    }
-    unreachable!("USING merge index out of range")
-}
-
 // === Function registry (spec/design/extensibility.md §5) ============================
 // Resolution for the named scalar functions and the aggregates is DATA-DRIVEN: instead of
 // re-encoding the name set in hand-written `match`es (the old known-name gate + result-type

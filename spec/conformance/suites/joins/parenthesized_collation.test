@@ -1,0 +1,35 @@
+# Parenthesized-join FROM (spec/design/grammar.md §15) keeps each inner column's collation: an
+# unaliased group on the right of a join reaches `p.name` through its inline body, and the text
+# column still orders by its frozen `unicode` collation (a < A < b < B), not C byte order.
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.join_inner, query.table_alias, query.qualified_column, query.join_parenthesized, ddl.collate_column, types.i32, types.text
+
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY, name text COLLATE "unicode")
+
+statement ok
+CREATE TABLE q (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO p VALUES (1, 'b'), (2, 'A'), (3, 'a'), (4, 'B')
+
+statement ok
+INSERT INTO q VALUES (1), (2), (3), (4)
+
+query T nosort
+SELECT p.name FROM q AS o JOIN (p JOIN q ON p.id = q.id) ON o.id = p.id ORDER BY p.name
+----
+a
+A
+b
+B
+
+query T nosort
+SELECT name FROM q AS o JOIN (p JOIN q ON p.id = q.id) ON o.id = p.id ORDER BY name
+----
+a
+A
+b
+B

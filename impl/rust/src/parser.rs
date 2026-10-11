@@ -2568,6 +2568,7 @@ impl Parser {
             limit: None,
             offset: None,
             windows,
+            join_group: false,
         })
     }
 
@@ -2769,8 +2770,9 @@ impl Parser {
     /// join keyword (`JOIN` / `INNER`/`CROSS`/`LEFT`/`RIGHT`/`FULL` ... `JOIN`), so any other
     /// trailing word ends the FROM clause.
     fn parse_from_clause(&mut self) -> Result<(TableRef, Vec<JoinClause>)> {
-        let from = self.parse_table_ref()?;
-        let mut joins = Vec::new();
+        let first = self.parse_table_ref()?;
+        // A leading unaliased parenthesized join is the same left-deep chain without its parentheses.
+        let (from, mut joins) = splice_leading_group(first, Vec::new());
         loop {
             while let Some(j) = self.parse_join_clause()? {
                 joins.push(j);
@@ -2782,7 +2784,9 @@ impl Parser {
             // the new item (`a, b JOIN c ON …`) before the next comma is considered.
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
-                let table = self.parse_table_ref()?;
+                let item = self.parse_table_ref()?;
+                // An unaliased parenthesized join after a comma starts the new segment the same way.
+                let (table, group_joins) = splice_leading_group(item, Vec::new());
                 joins.push(JoinClause {
                     kind: JoinKind::Cross,
                     table,
@@ -2791,6 +2795,7 @@ impl Parser {
                     natural: false,
                     comma: true,
                 });
+                joins.extend(group_joins);
                 continue;
             }
             break;
@@ -2798,12 +2803,47 @@ impl Parser {
         Ok((from, joins))
     }
 
-    /// `table_ref ::= derived_table derived_alias? | table_function table_function_alias? |
-    /// qualified_table ("AS"? identifier)?` (grammar.md §15/§35/§42). A `(` at the START of a
-    /// table_ref, when the next
-    /// token is `SELECT`, begins a DERIVED TABLE — a parenthesized subquery used as a relation,
-    /// `FROM (SELECT …) AS t` (§42); any other leading `(` is a 42601 this slice (no
-    /// parenthesized-join FROM). Otherwise it is a base table name OR a set-returning function call
+    /// Parse the inside of a parenthesized join `"(" table_ref join_clause+ ")"`
+    /// (spec/design/grammar.md §15) after its `(`, stopping before the `)`. The group may not contain
+    /// a comma, and must contain at least one join (`FROM (a)` is 42601, as in PostgreSQL). Its body
+    /// is a `SELECT *` over the chain; the caller marks it `join_group` when no alias follows.
+    fn parse_join_group(&mut self) -> Result<QueryExpr> {
+        self.deepen()?;
+        let first = self.parse_table_ref()?;
+        let (from, mut joins) = splice_leading_group(first, Vec::new());
+        while let Some(j) = self.parse_join_clause()? {
+            joins.push(j);
+        }
+        // `((a JOIN b ON p))` is a join (the inner group's chain); `(a)` is not.
+        if joins.is_empty() {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "a parenthesized FROM item must be a subquery, a VALUES list, or a join",
+            ));
+        }
+        self.undeepen();
+        Ok(QueryExpr::Select(Box::new(Select {
+            distinct: false,
+            items: SelectItems::All,
+            from: Some(from),
+            joins,
+            filter: None,
+            group_by: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            windows: Vec::new(),
+            join_group: false,
+        })))
+    }
+
+    /// `table_ref ::= derived_table derived_alias? | joined_group derived_alias? | table_function
+    /// table_function_alias? | qualified_table ("AS"? identifier)?` (grammar.md §15/§35/§42). A `(`
+    /// at the START of a table_ref, when `SELECT`/`WITH`/`VALUES` follows, begins a DERIVED TABLE — a
+    /// parenthesized subquery used as a relation, `FROM (SELECT …) AS t` (§42); any other leading `(`
+    /// begins a PARENTHESIZED JOIN `(a JOIN b ON …)` (§15). Otherwise it is a base table name OR a
+    /// set-returning function call
     /// (`generate_series(1, 5)`), a `(` immediately after the leading identifier marking the
     /// function form. The alias logic is shared: an explicit `AS` takes the next identifier
     /// unconditionally; an implicit alias is taken only when the next token is a word that is NOT
@@ -2824,7 +2864,7 @@ impl Parser {
             self.advance();
         }
         if matches!(self.peek(), Token::LParen) {
-            let mut tr = self.parse_derived_table()?;
+            let mut tr = self.parse_derived_table(lateral)?;
             tr.lateral = lateral;
             return Ok(tr);
         }
@@ -2928,33 +2968,39 @@ impl Parser {
         })
     }
 
-    /// Parse a DERIVED TABLE — `"(" (query_expr | values_body) ")" derived_alias?` (grammar.md §42).
-    /// The caller has verified the next token is `(`. A derived table is recognized when a `SELECT`
-    /// (a `query_expr` body) OR `VALUES` (a VALUES-body relation) follows the `(` — the §26
+    /// Parse a DERIVED TABLE — `"(" (query_expr | values_body) ")" derived_alias?` (grammar.md §42)
+    /// — or a PARENTHESIZED JOIN `"(" table_ref join_clause+ ")" derived_alias?` (§15). The caller
+    /// has verified the next token is `(`. A derived table is recognized when a `SELECT`/`WITH` (a
+    /// `query_expr` body) OR `VALUES` (a VALUES-body relation) follows the `(` — the §26
     /// leading-`SELECT` lookahead, extended with `VALUES`, a §8 cross-core surface; any other
-    /// leading `(` is a 42601 (no parenthesized-join FROM this slice). The alias is OPTIONAL
-    /// (PostgreSQL 18 relaxed the old mandatory-alias rule): present, it is the relation's label and
-    /// may carry a column-rename list `(c1, c2, …)`; absent, the relation has no qualifier (its bare
-    /// columns still resolve and can be ambiguous). `alias`/`name` carry the alias (empty when none).
-    fn parse_derived_table(&mut self) -> Result<TableRef> {
-        // Consume the opening `(`. A leading `SELECT` is a query-expr body; a leading `VALUES` is a
-        // VALUES-body relation; any other leading `(` is rejected (a parenthesized-join FROM
-        // `(a JOIN b ON …)` is a deferred narrowing).
+    /// leading `(` is a parenthesized join, which may not follow `LATERAL` (42601). The alias is
+    /// OPTIONAL (PostgreSQL 18 relaxed the old mandatory-alias rule): present, it is the relation's
+    /// label and may carry a column-rename list `(c1, c2, …)`; absent, the relation has no qualifier
+    /// (its bare columns still resolve and can be ambiguous). An aliased join is the derived table
+    /// `(SELECT * FROM <join>) AS alias`; an unaliased one keeps its inner labels visible
+    /// (`join_group`). `alias`/`name` carry the alias (empty when none).
+    fn parse_derived_table(&mut self, lateral: bool) -> Result<TableRef> {
+        // Consume the opening `(`. A leading `SELECT`/`WITH` is a query-expr body; a leading `VALUES`
+        // is a VALUES-body relation; any other leading `(` is a parenthesized join.
         self.advance();
         // The body is EITHER a query_expr (a leading `SELECT`) OR a VALUES list (a leading
         // `VALUES`) — `(VALUES (e…),(e…))`, a computed relation of literal rows (grammar.md §42).
         // The VALUES body's values are GENERAL expressions (resolved as constants at plan time,
         // parent = None) and it takes NO trailing ORDER BY / LIMIT (a deferred narrowing — that
         // surfaces as a 42601 leftover token at the expected `)`).
-        let (subquery, values) = if self.peek_keyword().as_deref() == Some("values") {
+        let mut join_group = false;
+        let (mut subquery, values) = if self.peek_keyword().as_deref() == Some("values") {
             (None, Some(self.parse_values_body()?))
         } else if self.at_subquery_start() {
             (Some(Box::new(self.parse_subquery()?)), None)
-        } else {
+        } else if lateral {
             return Err(EngineError::new(
                 SqlState::SyntaxError,
-                "subquery in FROM must begin with SELECT or VALUES (a parenthesized join is not supported)",
+                "LATERAL must be followed by a subquery or a function call",
             ));
+        } else {
+            join_group = true;
+            (Some(Box::new(self.parse_join_group()?)), None)
         };
         self.expect(&Token::RParen)?;
         // The alias is optional, parsed exactly like a base table's: an explicit `AS` takes the
@@ -2987,6 +3033,12 @@ impl Parser {
         } else {
             None
         };
+        // An unaliased join keeps its inner relation labels visible to the enclosing query.
+        if join_group && alias.is_none() {
+            if let Some(QueryExpr::Select(sel)) = subquery.as_deref_mut() {
+                sel.join_group = true;
+            }
+        }
         Ok(TableRef {
             name: alias.clone().unwrap_or_default(),
             // A derived table has no database qualifier (only a base table in table position does).
@@ -5267,6 +5319,25 @@ fn render_token(t: &Token) -> String {
 
 fn syntax(msg: impl Into<String>) -> EngineError {
     EngineError::new(SqlState::SyntaxError, msg.into())
+}
+
+/// Remove the parentheses from an unaliased parenthesized join that BEGINS a left-deep chain
+/// (spec/design/grammar.md §15): `(a JOIN b ON p) JOIN c ON q` is exactly `a JOIN b ON p JOIN c ON
+/// q`, the same join tree with the same ON scopes, so the group's chain becomes the chain's prefix
+/// and `joins` follow it. Any other item is returned unchanged.
+fn splice_leading_group(item: TableRef, joins: Vec<JoinClause>) -> (TableRef, Vec<JoinClause>) {
+    let is_group = item.alias.is_none()
+        && matches!(item.subquery.as_deref(), Some(QueryExpr::Select(sel)) if sel.join_group);
+    if !is_group {
+        return (item, joins);
+    }
+    let Some(QueryExpr::Select(group)) = item.subquery.map(|b| *b) else {
+        unreachable!("a join group's body is a SELECT")
+    };
+    let group = *group;
+    let mut out = group.joins;
+    out.extend(joins);
+    (group.from.expect("a join group has a FROM item"), out)
 }
 
 /// Whether `kw` (already lower-cased) is a keyword that may legally follow a `table_ref`,

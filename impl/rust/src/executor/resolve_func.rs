@@ -1023,13 +1023,27 @@ pub(crate) fn resolve_projections(
                 // (like bare `*`); an unknown label is 42P01, exactly as a qualified column ref.
                 if let Expr::QualifiedStar { qualifier } = &it.expr {
                     let want = qualifier.to_ascii_lowercase();
-                    let rel = scope
-                        .rels
-                        .iter()
-                        .find(|r| r.label == want)
-                        .ok_or_else(|| missing_from_entry(qualifier))?;
-                    for (i, c) in rel.table.columns.iter().enumerate() {
-                        nodes.push(RExpr::Column(rel.offset + i));
+                    let (table, slots): (&Table, Vec<usize>) =
+                        match scope.rels.iter().find(|r| r.label == want) {
+                            Some(rel) => (
+                                rel.table,
+                                (0..rel.table.columns.len())
+                                    .map(|c| rel.offset + c)
+                                    .collect(),
+                            ),
+                            // An inner label of an unaliased parenthesized join expands to its own
+                            // columns (§15).
+                            None => {
+                                let sr = scope
+                                    .sub_rels
+                                    .iter()
+                                    .find(|sr| sr.label == want)
+                                    .ok_or_else(|| missing_from_entry(qualifier))?;
+                                (sr.table, sr.slots.clone())
+                            }
+                        };
+                    for (i, c) in table.columns.iter().enumerate() {
+                        nodes.push(RExpr::Column(slots[i]));
                         names.push(c.name.clone());
                         types.push(resolved_type_of_col(&c.ty, scope.catalog));
                     }

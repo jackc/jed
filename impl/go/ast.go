@@ -828,6 +828,12 @@ type selectStmt struct {
 	// absent. Resolved by a desugaring pass that rewrites each `OVER name` to its definition (into
 	// the call's Over) before resolution.
 	Windows []namedWindow
+	// JoinGroup marks the synthesized body of an UNALIASED parenthesized-join FROM item
+	// `(a JOIN b ON …)` (spec/design/grammar.md §15): a `SELECT *` over the group's join chain whose
+	// inner relation labels stay visible to the enclosing query. Planning appends the join's hidden
+	// USING/NATURAL copies after the star columns and records the inner labels' column positions
+	// (selectPlan.group). Never set by a written SELECT; an aliased group is an ordinary derived table.
+	JoinGroup bool
 }
 
 // NamedWindow is one `name AS (definition)` entry of a WINDOW clause (spec/design/window.md §5).

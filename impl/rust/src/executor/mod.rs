@@ -1507,10 +1507,13 @@ impl<'a> FinalRel<'a> {
 fn build_prefix_scope<'s>(
     finalized: &'s [FinalRel<'s>],
     synthetic: &'s [Box<Table>],
+    group_subs: &'s [GroupSubRel],
     parent: Option<&'s Scope<'s>>,
     catalog: &'s Engine,
     ctes: &'s [&'s CteBinding],
 ) -> Scope<'s> {
+    // The inner labels of the unaliased parenthesized joins to its left (grammar.md §15).
+    let sub_rels = sub_rels_within(group_subs, 0, usize::MAX);
     Scope {
         rels: finalized
             .iter()
@@ -1531,6 +1534,7 @@ fn build_prefix_scope<'s>(
         ctes,
         merges: Vec::new(),
         hidden: Vec::new(),
+        sub_rels,
     }
 }
 
@@ -1629,8 +1633,55 @@ pub(crate) struct Scope<'a> {
     /// `USING`/`NATURAL` join.
     merges: Vec<MergeCol>,
     /// Flat indices SUPERSEDED by a merge — the underlying left+right copies, omitted from `*`
-    /// expansion (still reachable qualified). Empty unless `merges` is non-empty.
+    /// expansion (still reachable qualified) — plus the copies an unaliased parenthesized join
+    /// carries after its star columns. Empty unless the FROM has a `USING`/`NATURAL` join.
     hidden: Vec<usize>,
+    /// The relation labels an UNALIASED parenthesized join keeps visible (spec/design/grammar.md
+    /// §15): `(a JOIN b ON …)` is one FROM relation, yet `a.x` and `b.*` still name its inner
+    /// relations. Reached only by qualified references; never physical.
+    sub_rels: Vec<SubRel<'a>>,
+}
+
+/// One inner relation label of an unaliased parenthesized join (grammar.md §15): its table's
+/// columns live at the flat slots `slots` of the join's single FROM relation (slot k holds column
+/// k). A scope's borrowed view of a [`GroupSubRel`].
+#[derive(Clone)]
+pub(crate) struct SubRel<'a> {
+    label: String,
+    table: &'a Table,
+    slots: Vec<usize>,
+}
+
+/// The owned form of a [`SubRel`], held by a [`JoinGroupLayout`] and by the FROM build that
+/// registers a join group's inner labels (the scope's `SubRel`s borrow its table). `rel` is the
+/// owning FROM ordinal, so a partial ON scope sees only the labels of the relations it spans.
+pub(crate) struct GroupSubRel {
+    label: String,
+    table: Box<Table>,
+    slots: Vec<usize>,
+    rel: usize,
+}
+
+/// The output shape of an unaliased parenthesized join's body (spec/design/grammar.md §15):
+/// `columns` are the body outputs (the star columns, then the hidden USING/NATURAL copies), each
+/// keeping its source column's name, type, and collation; `hidden` is the output positions of those
+/// copies; `sub_rels` give each inner label's columns as output positions (`rel` unused).
+pub(crate) struct JoinGroupLayout {
+    columns: Vec<Column>,
+    hidden: Vec<usize>,
+    sub_rels: Vec<GroupSubRel>,
+}
+
+/// The borrowed sub-relation labels owned by FROM ordinals `lo..=hi`.
+fn sub_rels_within(subs: &[GroupSubRel], lo: usize, hi: usize) -> Vec<SubRel<'_>> {
+    subs.iter()
+        .filter(|sr| sr.rel >= lo && sr.rel <= hi)
+        .map(|sr| SubRel {
+            label: sr.label.clone(),
+            table: &sr.table,
+            slots: sr.slots.clone(),
+        })
+        .collect()
 }
 
 impl<'a> Scope<'a> {
@@ -1654,6 +1705,7 @@ impl<'a> Scope<'a> {
             ctes: &[],
             merges: Vec::new(),
             hidden: Vec::new(),
+            sub_rels: Vec::new(),
         }
     }
 
@@ -1670,6 +1722,7 @@ impl<'a> Scope<'a> {
             ctes: &[],
             merges: Vec::new(),
             hidden: Vec::new(),
+            sub_rels: Vec::new(),
         }
     }
 
@@ -1745,6 +1798,7 @@ impl<'a> Scope<'a> {
             ctes: &[],
             merges: Vec::new(),
             hidden: Vec::new(),
+            sub_rels: Vec::new(),
         })
     }
 
@@ -1783,6 +1837,7 @@ impl<'a> Scope<'a> {
             ctes: &[],
             merges: Vec::new(),
             hidden: Vec::new(),
+            sub_rels: Vec::new(),
         }
     }
 
@@ -1841,11 +1896,37 @@ impl<'a> Scope<'a> {
     fn resolve_qualified(&self, qualifier: &str, name: &str) -> Result<Resolved> {
         let q = qualifier.to_ascii_lowercase();
         if let Some(rel) = self.rels.iter().find(|r| r.label == q) {
-            let local = rel
+            // A synthetic relation (a derived table, an aliased parenthesized join) may carry two
+            // columns of one name; a qualified reference to it is ambiguous (42702) exactly as a bare
+            // one is (PG). A USING/NATURAL copy hidden by a merge yields to the visible column.
+            let mut found: Option<usize> = None;
+            let mut visible: Option<usize> = None;
+            let mut ambiguous = false;
+            for (local, c) in rel.table.columns.iter().enumerate() {
+                if !c.name.eq_ignore_ascii_case(name) {
+                    continue;
+                }
+                let idx = rel.offset + local;
+                if found.is_none() {
+                    found = Some(idx);
+                }
+                if !self.hidden.contains(&idx) {
+                    ambiguous = ambiguous || visible.is_some();
+                    visible = Some(idx);
+                }
+            }
+            return match (found, visible) {
+                (None, _) => Err(undefined_column(name)),
+                _ if ambiguous => Err(ambiguous_column(name)),
+                (_, Some(idx)) | (Some(idx), None) => Ok(Resolved::Local(idx)),
+            };
+        }
+        if let Some(sr) = self.sub_rels.iter().find(|sr| sr.label == q) {
+            let local = sr
                 .table
                 .column_index(name)
                 .ok_or_else(|| undefined_column(name))?;
-            return Ok(Resolved::Local(rel.offset + local));
+            return Ok(Resolved::Local(sr.slots[local]));
         }
         match self.parent {
             Some(p) => Ok(outer_of(p.resolve_qualified(qualifier, name)?)),
@@ -4974,6 +5055,9 @@ pub(crate) struct SelectPlan {
     /// `filter` above stays the COMPLETE WHERE — the input every access-path detector and estimator
     /// rule reads; execution evaluates `post_join_filter()` over joined rows.
     pushdown: Option<WherePushdown>,
+    /// The output layout of an unaliased parenthesized join's body (planner.rs
+    /// `join_group_outputs`; spec/design/grammar.md §15); `None` for every written SELECT.
+    group: Option<JoinGroupLayout>,
     /// The plan's physical / access-path decisions — set ONLY by the `optimize_select` pass
     /// (optimize.rs); default (zero-valued) when resolve hands the plan over
     /// (spec/design/planner.md §4).

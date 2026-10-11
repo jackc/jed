@@ -398,6 +398,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.comma_from",
   "query.join_using",
   "query.join_natural",
+  "query.join_parenthesized",
   "query.join_left",
   "query.join_right",
   "query.join_full",

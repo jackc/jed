@@ -112,10 +112,10 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   select-item alias; `table_ref` now adds the optional `AS` of a **table** alias (§15).
 - **Single-table `UPDATE` / `DELETE`** — those two still take one table (no `JOIN`, no `USING`).
   `SELECT` is now **multi-table** via `JOIN` (§15): `INNER JOIN ... ON`, `CROSS JOIN`, the
-  `LEFT`/`RIGHT`/`FULL [OUTER] JOIN` family, comma-`FROM`, `JOIN ... USING (cols)`, and
-  `NATURAL JOIN` all execute (subqueries / derived tables / `IN` / `EXISTS` / correlated landed too).
-  Only **`FULL JOIN USING`** / `NATURAL FULL JOIN` (the `COALESCE` merge) and a parenthesized-join
-  FROM remain deferred join forms.
+  `LEFT`/`RIGHT`/`FULL [OUTER] JOIN` family, comma-`FROM`, `JOIN ... USING (cols)`, `NATURAL JOIN`,
+  and parenthesized joins `FROM (a JOIN b ON …)` all execute (subqueries / derived tables / `IN` /
+  `EXISTS` / correlated landed too). Only **`FULL JOIN USING`** / `NATURAL FULL JOIN` (the
+  `COALESCE` merge) remains a deferred join form.
 - **`INSERT` values** were originally *literals only*; the `DEFAULT` keyword, an explicit
   **column list** (`INSERT INTO t (a, c) VALUES ...`, §12, §16), `INSERT ... SELECT` (§24), and
   finally **general expressions in a `VALUES` value slot** (arithmetic, function calls, `CASE`,
@@ -827,12 +827,54 @@ segment-restricted** — a lateral item's body resolves against *all* preceding 
 narrowed. This makes `FROM t, LATERAL (…)` reachable for the first time (until now LATERAL needed
 explicit `JOIN` syntax — [../../TODO.md](../../TODO.md)).
 
+**Parenthesized joins (`FROM (a JOIN b ON …) [AS g [(cols)]]`).** A `(` at the start of a
+`table_ref` that is **not** followed by `SELECT`, `WITH`, or `VALUES` (those begin a derived table,
+§42) begins a **parenthesized join**: `"(" table_ref join_clause+ ")" derived_alias?`. It must
+contain at least one join and no comma (`FROM (a)` and `FROM (a, b)` are `42601`, as in
+PostgreSQL); its items may themselves be parenthesized joins, derived tables, or table functions;
+`LATERAL` may not precede it (`42601`); and its nesting counts toward `MAX_EXPR_DEPTH` (`54001`).
+The parentheses set the **join tree**: `c LEFT JOIN (a JOIN b ON p) ON q` preserves every `c` row
+unless the *whole* inner join matches, whereas the left-deep `c LEFT JOIN a ON q JOIN b ON p` drops
+the `c` rows its trailing inner join cannot extend. The group's `ON`/`USING` clauses see only the
+group's own relations — a reference to an enclosing sibling is `42P01` (PG's "invalid reference to
+FROM-clause entry").
+
+- **Unaliased**, the group is one join-tree node whose inner relation labels stay visible: `a.x`,
+  `b.*`, `WHERE`/`GROUP BY`/`ORDER BY`, a correlated subquery, and a later `LATERAL` item all reach
+  them, and they take part in the FROM duplicate-label check (`FROM a JOIN (a JOIN b ON …) ON …` is
+  `42712`). Its `*` contribution is the inner join's own `*` (its USING/NATURAL merges first), placed
+  at the group's position; an outer `USING`/`NATURAL` sees the group's merged column as one column.
+- **Aliased**, `(a JOIN b ON p) AS g` **is** the derived table `(SELECT * FROM a JOIN b ON p) AS g`
+  (§42): the inner labels are hidden (`a.x` is `42P01`, so an inner label may repeat an outer one),
+  `g.*` is the join's `*`, `AS g(c1, …)` renames left to right, and a name the join carries twice is
+  ambiguous through the alias (`g.id` is `42702`, like any duplicated derived-table column).
+
+*Mechanics.* The parser builds the group's body as a `SELECT *` over its chain. A group that
+**begins** a chain — the first FROM item, the item after a comma, or the first item of an enclosing
+group — is the same left-deep chain without its parentheses (the same tree and the same `ON` scopes),
+so an unaliased one is **spliced** into the enclosing chain and the planner sees an ordinary chain.
+Any other unaliased group is an inline derived body (`parent = None`, like §42) marked as a join
+group: after its `*` columns it emits every slot the `*` omitted — the USING/NATURAL copies a merge
+superseded — so each inner relation is complete, and it records where each inner label's columns
+landed. The enclosing scope carries those labels as **qualifier-only views** over the group's slots
+(never physical relations; a partial `ON` scope sees only the views of the relations it spans), marks
+the extra copies hidden (so `*` and bare resolution skip them, while `b.id` still reads `b`'s own
+column — NULL under a LEFT join where the merged `id` is `a`'s), and keeps each inner column's
+collation. Being a derived input, a right-hand group is a join-search fence; its body plans its own
+join. *(Fixed with this slice: a `USING` predicate binds the two chosen columns directly through
+one-column pseudo relations at their flat slots, so a side that is an unlabeled relation — an
+unaliased derived table or join group — no longer resolves to the first unlabeled relation.)*
+
 **Deliberate narrowings (each relaxable later, [../../TODO.md](../../TODO.md)).**
 
-- **No parenthesized-join FROM** (`FROM (a JOIN b ON …)`), and **no `FULL JOIN ... USING`** /
-  `NATURAL FULL JOIN` (its `COALESCE` merge — above). A **derived table** (`FROM (SELECT …) AS t`)
-  *is* supported — see §42; the **`t.*`** qualified star, **`USING`**, and **`NATURAL`** have landed
-  (above).
+- **No `FULL JOIN ... USING`** / `NATURAL FULL JOIN` (its `COALESCE` merge — above). A **derived
+  table** (`FROM (SELECT …) AS t`) and a **parenthesized join** are supported (§42, above); the
+  **`t.*`** qualified star, **`USING`**, and **`NATURAL`** have landed (above).
+- **A `LATERAL` item inside a right-hand parenthesized join** cannot reference relations outside the
+  group (`42P01`; PostgreSQL allows it), because that group's body is planned as an independent derived
+  body. Inside a *spliced* (chain-leading) group it sees earlier relations normally.
+- **`((SELECT …)) AS s`** — redundant parentheses around a derived-table subquery — stay `42601` (the
+  inner item is not a join).
 - **`UPDATE` / `DELETE` stay single-table** — they keep one table name and gain nothing here
   (though a qualified `WHERE t.a = 1` referencing their sole table now resolves, harmlessly).
 
@@ -2372,8 +2414,8 @@ must be **distinct** from the other FROM relations' labels: a collision is **`42
 followed by `SELECT` is a derived table — the *same* leading-`SELECT` lookahead scalar subqueries
 and IN-subqueries use (§26), so the three hand-written parsers stay byte-identical. A leading `(`
 followed by `VALUES` is the **VALUES-body derived table** (below). A leading `(` followed by
-**neither** is a **`42601`** this slice (a parenthesized join expression `FROM (a JOIN b ON …)` is a
-deferred narrowing, below). The base-table / SRF forms are unchanged: a `(` *after* a leading
+**neither** (nor `WITH`) begins a **parenthesized join** `FROM (a JOIN b ON …)` (§15) — an aliased one
+is exactly the derived table `(SELECT * FROM a JOIN b ON …) AS g`. The base-table / SRF forms are unchanged: a `(` *after* a leading
 identifier is still the function form (§35).
 
 **The VALUES body — `FROM (VALUES (1),(2)) AS v(x)`.** The derived-table body may be a `VALUES` list
@@ -2404,7 +2446,7 @@ always-inlined single-reference CTE — so the alias rules, the column-rename li
 - **No trailing `ORDER BY` / `LIMIT` on the body (a deferred narrowing).** `(VALUES … ORDER BY 1)` is
   `42601` (a leftover token). Order/limit the *outer* query instead (`FROM (VALUES …) v ORDER BY x`).
   A documented PG divergence (PG accepts a VALUES query's trailing clauses), recorded in the override
-  ledger alongside the no-parenthesized-join and no-`WITH`-body narrowings.
+  ledger.
 
 **The body is NOT correlated (no `LATERAL`).** A derived-table body is planned as an **independent
 query** (`parent = None`), exactly like a non-recursive CTE body ([cte.md](cte.md) §2): it sees its
@@ -2435,7 +2477,8 @@ by the body's own context (§26); a `$N` with no type context errors `42P18` as 
 | Duplicate explicit FROM label (alias collides) | `42712` | `duplicate_alias`; the general FROM-label rule (§15). Unaliased derived tables have no label and never collide. |
 | Ambiguous bare reference to a duplicated body output column | `42702` | Within one relation or across two (cte.md §2). |
 | Outer / sibling column referenced inside the body | `42703` / `42P01` | The body is not correlated / not LATERAL. |
-| Leading `(` in FROM not followed by `SELECT`, `VALUES`, or `WITH` | `42601` | No parenthesized-join FROM this slice — a **documented divergence** (PG parses `(a JOIN b …)`; the override ledger records it). |
+| Leading `(` in FROM not followed by `SELECT`, `VALUES`, or `WITH` | ✅ | **Landed** (§15): a parenthesized join. `FROM (a)` / `(a, b)` (no join inside) is `42601`, as in PG. |
+| Qualified reference to a duplicated body output column (`d.a`) | `42702` | Ambiguous, like the bare reference (PG). |
 | Nested `WITH` inside the body | ✅ | **Landed** (cte.md §7): a derived-table body may be a `WITH`-prefixed query, establishing a child scope over the enclosing visible CTEs. |
 | VALUES-body rows of differing arity | `42601` | `VALUES lists must all be the same length` (the §12 rule). |
 | VALUES-body columns whose row types do not unify | `42804` | `datatype_mismatch`, the set-operation unification rule (§25). |
@@ -2448,8 +2491,8 @@ by the body's own context (§26); a `$N` with no type context errors `42P18` as 
 - **`LATERAL`** — ✅ **landed** (§44): a derived table (or SRF, §35) preceded by `LATERAL` (SRFs
   implicitly) sees earlier FROM relations. A *non-`LATERAL`* derived-table body stays independent
   (`parent = None`), the rule above.
-- **Parenthesized join / table-reference FROM** — `FROM (a JOIN b ON …) c`. A leading `(` not
-  starting a `SELECT` is `42601`.
+- **Parenthesized join / table-reference FROM** — ✅ **landed** (§15): `FROM (a JOIN b ON …) c` is
+  the derived table `(SELECT * FROM a JOIN b ON …) AS c`; unaliased, the inner labels stay visible.
 - **A `WITH` *inside* the body** (nested `WITH`) — ✅ **landed** (cte.md §7): a derived-table body,
   like any parenthesized subquery, may be a `WITH`-prefixed query (`subquery_expr`), establishing its
   own child CTE scope over the enclosing statement's visible bindings. *(The

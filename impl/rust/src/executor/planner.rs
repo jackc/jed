@@ -81,6 +81,9 @@ impl Engine {
         let mut finalized: Vec<FinalRel> = Vec::with_capacity(from_items.len());
         let mut seen_labels: HashSet<String> = HashSet::new();
         let mut offset = 0usize;
+        // The inner labels and hidden USING copies of each unaliased parenthesized join (§15).
+        let mut group_subs: Vec<GroupSubRel> = Vec::new();
+        let mut group_hidden: Vec<usize> = Vec::new();
         for (i, tref) in from_items.iter().enumerate() {
             let is_derived = tref.subquery.is_some() || tref.values.is_some();
             // A FROM item is lateral-ELIGIBLE when it can see earlier siblings: a derived table /
@@ -98,7 +101,8 @@ impl Engine {
                 // INDEPENDENT query (`parent = None`, §42). A LATERAL VALUES body resolves its values
                 // against the prefix too (a column ref then correlates instead of 42703).
                 let plan = if lateral_eligible {
-                    let prefix = build_prefix_scope(&finalized, &synthetic, parent, self, ctes);
+                    let prefix =
+                        build_prefix_scope(&finalized, &synthetic, &group_subs, parent, self, ctes);
                     match (&tref.subquery, &tref.values) {
                         (Some(body), _) => self.plan_query(body, Some(&prefix), ctes, ptypes)?,
                         (None, Some(rows)) => QueryPlan::Values(self.plan_values(
@@ -120,7 +124,19 @@ impl Engine {
                 };
                 lateral_flags.push(lateral_eligible && query_plan_references_outer(&plan, 0));
                 let label = tref.alias.clone().unwrap_or_default().to_ascii_lowercase();
-                let table = cte_synthetic_table(&label, &plan, tref.column_aliases.as_deref())?;
+                let mut table = cte_synthetic_table(&label, &plan, tref.column_aliases.as_deref())?;
+                // An unaliased parenthesized join's columns are its inner columns, collation included.
+                if let Some(group) = derived_join_group(Some(&plan)) {
+                    table = Box::new(Table {
+                        name: label.clone(),
+                        columns: group.columns.clone(),
+                        pk: Vec::new(),
+                        checks: Vec::new(),
+                        indexes: Vec::new(),
+                        foreign_keys: Vec::new(),
+                        exclusions: Vec::new(),
+                    });
+                }
                 synthetic.push(table);
                 let si = synthetic.len() - 1;
                 srf_meta.push(None);
@@ -132,7 +148,8 @@ impl Engine {
                 // prefix scope (a sibling column then correlates); at i==0 against `parent` (the
                 // enclosing query / params), unchanged (functions.md §10).
                 let (mut table, rargs, kind) = if lateral_eligible {
-                    let prefix = build_prefix_scope(&finalized, &synthetic, parent, self, ctes);
+                    let prefix =
+                        build_prefix_scope(&finalized, &synthetic, &group_subs, parent, self, ctes);
                     self.resolve_srf(
                         &tref.name,
                         args,
@@ -172,7 +189,8 @@ impl Engine {
                 let scope_parent;
                 let prefix;
                 let resolve_against = if lateral_eligible {
-                    prefix = build_prefix_scope(&finalized, &synthetic, parent, self, ctes);
+                    prefix =
+                        build_prefix_scope(&finalized, &synthetic, &group_subs, parent, self, ctes);
                     Some(&prefix)
                 } else {
                     scope_parent = parent;
@@ -303,11 +321,31 @@ impl Engine {
                 .unwrap_or_else(|| table.name.clone())
                 .to_ascii_lowercase();
             let col_count = table.columns.len();
-            if !label.is_empty() && !seen_labels.insert(label.clone()) {
-                return Err(EngineError::new(
-                    SqlState::DuplicateAlias,
-                    format!("table name {label} specified more than once"),
-                ));
+            let mut labels = vec![label.clone()];
+            // An unaliased parenthesized join (§15) is one relation with no label of its own, whose
+            // inner labels stay visible — and so take part in the duplicate-label check.
+            if let Some(group) = derived_join_group(derived_plans[i].as_ref()) {
+                for sr in &group.sub_rels {
+                    group_subs.push(GroupSubRel {
+                        label: sr.label.clone(),
+                        table: sr.table.clone(),
+                        slots: sr.slots.iter().map(|&slot| offset + slot).collect(),
+                        rel: i,
+                    });
+                    labels.push(sr.label.clone());
+                }
+                group_hidden.extend(group.hidden.iter().map(|&h| offset + h));
+            }
+            for label in &labels {
+                if label.is_empty() {
+                    continue;
+                }
+                if !seen_labels.insert(label.clone()) {
+                    return Err(EngineError::new(
+                        SqlState::DuplicateAlias,
+                        format!("table name {label} specified more than once"),
+                    ));
+                }
             }
             finalized.push(FinalRel {
                 label,
@@ -344,7 +382,7 @@ impl Engine {
         // Both underlying copies are hidden from `*`. Merges/predicates respect the comma SEGMENT
         // (commit-1): a join sees only its own comma item, and an earlier item's merge is out of scope.
         let mut merges: Vec<MergeCol> = Vec::new();
-        let mut hidden: Vec<usize> = Vec::new();
+        let mut hidden: Vec<usize> = group_hidden;
         let mut join_preds: Vec<Option<RExpr>> = Vec::with_capacity(sel.joins.len());
         for (k, j) in sel.joins.iter().enumerate() {
             let mut seg = k + 1;
@@ -390,9 +428,14 @@ impl Engine {
                     ctes,
                     merges: seg_merges.clone(),
                     hidden: seg_hidden.clone(),
+                    sub_rels: Vec::new(),
                 };
+                // The synthesized predicate compares the two chosen columns through one-column pseudo
+                // relations at their flat slots, so it binds exactly those columns even when a side is
+                // an unlabeled relation or carries a second column of the same name.
+                let mut pair_tables: Vec<(Table, usize)> = Vec::new();
                 let mut pred_ast: Option<Expr> = None;
-                for name in cols {
+                for (n, name) in cols.iter().enumerate() {
                     let li = match left.resolve_bare(name) {
                         Ok(Resolved::Local(i)) => i,
                         _ => {
@@ -404,7 +447,6 @@ impl Engine {
                             ));
                         }
                     };
-                    let (llabel, lname) = rel_of_index(&rels, li);
                     let right_rel = &rels[k + 1];
                     let rl = right_rel.table.column_index(name).ok_or_else(|| {
                         EngineError::new(
@@ -415,14 +457,20 @@ impl Engine {
                         )
                     })?;
                     let ri = right_rel.offset + rl;
+                    let (lq, rq) = (format!("\0l{n}"), format!("\0r{n}"));
+                    pair_tables.push((one_column_table(&lq, left.column_at(li).clone()), li));
+                    pair_tables.push((
+                        one_column_table(&rq, right_rel.table.columns[rl].clone()),
+                        ri,
+                    ));
                     let eq = binary_expr(
                         BinaryOp::Eq,
                         Expr::QualifiedColumn {
-                            qualifier: llabel,
-                            name: lname,
+                            qualifier: lq,
+                            name: name.clone(),
                         },
                         Expr::QualifiedColumn {
-                            qualifier: right_rel.label.clone(),
+                            qualifier: rq,
                             name: name.clone(),
                         },
                     );
@@ -443,17 +491,28 @@ impl Engine {
                     hidden.push(li);
                     hidden.push(ri);
                 }
-                let partial = Scope {
-                    rels: rels[seg..=k + 1].to_vec(),
-                    parent,
+                let pair = Scope {
+                    rels: pair_tables
+                        .iter()
+                        .map(|(t, off)| ScopeRel {
+                            label: t.name.clone(),
+                            table: t,
+                            offset: *off,
+                            qualifier_only: false,
+                            cte: None,
+                            db: None,
+                        })
+                        .collect(),
+                    parent: None,
                     catalog: self,
-                    allow_subquery: true,
+                    allow_subquery: false,
                     ctes,
-                    merges: seg_merges.clone(),
-                    hidden: seg_hidden.clone(),
+                    merges: Vec::new(),
+                    hidden: Vec::new(),
+                    sub_rels: Vec::new(),
                 };
                 Some(resolve_boolean_filter(
-                    &partial,
+                    &pair,
                     pred_ast.as_ref().expect("USING has >= 1 column"),
                     ptypes,
                 )?)
@@ -466,6 +525,7 @@ impl Engine {
                     ctes,
                     merges: seg_merges,
                     hidden: seg_hidden,
+                    sub_rels: sub_rels_within(&group_subs, seg, k + 1),
                 };
                 Some(resolve_boolean_filter(&partial, on_expr, ptypes)?)
             } else {
@@ -482,6 +542,7 @@ impl Engine {
             ctes,
             merges,
             hidden,
+            sub_rels: sub_rels_within(&group_subs, 0, usize::MAX),
         };
 
         // Expand GROUP BY (including ROLLUP / CUBE / GROUPING SETS) into a list of grouping sets,
@@ -658,8 +719,18 @@ impl Engine {
         } else {
             &sel.items
         };
-        let (mut projections, column_names, column_types) =
+        let (mut projections, mut column_names, mut column_types) =
             resolve_projections(&scope, items_ref, &mut agg_ctx, ptypes)?;
+        let group = if sel.join_group {
+            Some(join_group_outputs(
+                &scope,
+                &mut projections,
+                &mut column_names,
+                &mut column_types,
+            ))
+        } else {
+            None
+        };
         // Pull the collected aggregate + window specs (and materialized window-key expressions) out of
         // the projection context. A grouped+window query (`GroupedWindow`) carries all; a plain
         // aggregate/window query carries one (the rest empty). spec/design/window.md §5.1.
@@ -1247,6 +1318,7 @@ impl Engine {
             offset: sel.offset,
             rel_masks: Vec::new(),
             pushdown: None,
+            group,
             phys: PhysicalPlan::default(),
         };
         plan.rel_masks = compute_rel_masks(&plan);
@@ -1481,4 +1553,104 @@ fn compute_rel_masks(plan: &SelectPlan) -> Vec<Vec<bool>> {
         .iter()
         .map(|r| touched[r.offset..r.offset + r.col_count].to_vec())
         .collect()
+}
+
+/// A one-column table named `name` holding `column` — the pseudo relation a USING/NATURAL join's
+/// synthesized predicate reads one chosen column through (spec/design/grammar.md §15).
+fn one_column_table(name: &str, column: Column) -> Table {
+    Table {
+        name: name.to_string(),
+        columns: vec![column],
+        pk: Vec::new(),
+        checks: Vec::new(),
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+        exclusions: Vec::new(),
+    }
+}
+
+/// Complete a `join_group` body: after its `*` columns append every slot the star omitted (a
+/// USING/NATURAL copy superseded by a merge), so each inner relation's columns are all present, and
+/// record where each inner label's columns landed. Every star output is a bare column.
+fn join_group_outputs(
+    scope: &Scope,
+    projections: &mut Vec<RExpr>,
+    names: &mut Vec<String>,
+    types: &mut Vec<ResolvedType>,
+) -> JoinGroupLayout {
+    // `pos[flat]` is the output position of the scope's flat column `flat`.
+    let mut pos: Vec<usize> = vec![usize::MAX; scope.width()];
+    for (p, pr) in projections.iter().enumerate() {
+        if let RExpr::Column(idx) = pr {
+            pos[*idx] = p;
+        }
+    }
+    let mut group = JoinGroupLayout {
+        columns: Vec::new(),
+        hidden: Vec::new(),
+        sub_rels: Vec::new(),
+    };
+    let mut extra = scope.hidden.clone();
+    extra.sort_unstable();
+    extra.dedup();
+    for idx in extra {
+        if pos[idx] != usize::MAX {
+            continue;
+        }
+        pos[idx] = projections.len();
+        group.hidden.push(projections.len());
+        let c = scope.column_at(idx);
+        projections.push(RExpr::Column(idx));
+        names.push(c.name.clone());
+        types.push(resolved_type_of_col(&c.ty, scope.catalog));
+    }
+    for pr in projections.iter() {
+        let RExpr::Column(idx) = pr else {
+            unreachable!("a join group's outputs are bare columns")
+        };
+        let c = scope.column_at(*idx);
+        group.columns.push(Column {
+            name: c.name.clone(),
+            ty: c.ty.clone(),
+            decimal: None,
+            varchar_len: None,
+            primary_key: false,
+            not_null: false,
+            default: None,
+            default_expr: None,
+            identity: None,
+            collation: c.collation.clone(),
+        });
+    }
+    for r in &scope.rels {
+        if r.label.is_empty() {
+            continue;
+        }
+        group.sub_rels.push(GroupSubRel {
+            label: r.label.clone(),
+            table: Box::new(r.table.clone()),
+            slots: (0..r.table.columns.len())
+                .map(|c| pos[r.offset + c])
+                .collect(),
+            rel: 0,
+        });
+    }
+    for sr in &scope.sub_rels {
+        group.sub_rels.push(GroupSubRel {
+            label: sr.label.clone(),
+            table: Box::new(sr.table.clone()),
+            slots: sr.slots.iter().map(|&slot| pos[slot]).collect(),
+            rel: 0,
+        });
+    }
+    group
+}
+
+/// The layout of a FROM item's derived body when it is an unaliased parenthesized join, else
+/// `None`.
+fn derived_join_group(plan: Option<&QueryPlan>) -> Option<&JoinGroupLayout> {
+    match plan {
+        Some(QueryPlan::Select(sel)) => sel.group.as_ref(),
+        _ => None,
+    }
 }

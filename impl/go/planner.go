@@ -58,6 +58,9 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	lateralFlags := make([]bool, len(tableRefs))
 	seenLabels := make(map[string]bool)
 	offset := 0
+	// The inner labels and hidden USING copies of each unaliased parenthesized join (§15).
+	var subRels []subRel
+	var groupHidden []int
 	for i, tref := range tableRefs {
 		var t *catTable
 		var cteIdx *int
@@ -72,7 +75,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		// deeper). nil when not lateral-eligible.
 		var lateralParent *scope
 		if lateralEligible {
-			lateralParent = &scope{rels: rels, parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
+			lateralParent = &scope{rels: rels, parent: parent, catalog: db, allowSubquery: true, ctes: ctes, subRels: subRels}
 		}
 		if isDerived {
 			// Plan the body. LATERAL → parent is the prefix scope (a sibling/outer column correlates);
@@ -104,6 +107,10 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			tbl, terr := cteSyntheticTable(label, &plan, tref.ColumnAliases)
 			if terr != nil {
 				return nil, terr
+			}
+			// An unaliased parenthesized join's columns are its inner columns, collation included.
+			if group := derivedJoinGroup(&plan); group != nil {
+				tbl = &catTable{Name: label, Columns: group.columns}
 			}
 			t = tbl
 			derivedPlans[i] = &plan
@@ -239,7 +246,26 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		// qualifier, so two of them never collide and the duplicate-label check is skipped (its bare
 		// columns still resolve, and stay ambiguous via resolveBare). Every other relation has a
 		// non-empty label (a table/function name or an explicit alias).
-		if label != "" {
+		labels := []string{label}
+		// An unaliased parenthesized join (§15) is one relation with no label of its own, whose inner
+		// labels stay visible — and so take part in the duplicate-label check.
+		if group := derivedJoinGroup(derivedPlans[i]); group != nil {
+			for _, sr := range group.subRels {
+				slots := make([]int, len(sr.slots))
+				for c, slot := range sr.slots {
+					slots[c] = offset + slot
+				}
+				subRels = append(subRels, subRel{label: sr.label, table: sr.table, slots: slots, rel: i})
+				labels = append(labels, sr.label)
+			}
+			for _, h := range group.hidden {
+				groupHidden = append(groupHidden, offset+h)
+			}
+		}
+		for _, label := range labels {
+			if label == "" {
+				continue
+			}
 			if seenLabels[label] {
 				return nil, newError(DuplicateAlias, "table name "+label+" specified more than once")
 			}
@@ -257,7 +283,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	// single merge column — the left for INNER/LEFT, the right for RIGHT (FULL JOIN USING, a COALESCE,
 	// is 0A000). Both copies are hidden from `*`. Merges/predicates respect the comma SEGMENT (commit 1).
 	var merges []mergeCol
-	var hidden []int
+	hidden := groupHidden
 	joinPreds := make([]*rExpr, len(sel.Joins))
 	for k := range sel.Joins {
 		j := &sel.Joins[k]
@@ -293,23 +319,30 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				return nil, newError(FeatureNotSupported, "FULL JOIN with a merged (USING/NATURAL) condition is not supported yet")
 			}
 			left := &scope{rels: rels[seg : k+1], parent: parent, catalog: db, allowSubquery: true, ctes: ctes, merges: segMerges, hidden: segHidden}
+			// The synthesized predicate compares the two chosen columns through one-column pseudo
+			// relations at their flat slots, so it binds exactly those columns even when a side is an
+			// unlabeled relation or carries a second column of the same name.
+			var pairRels []scopeRel
 			var predAST *exprNode
-			for _, name := range usingCols {
+			for n, name := range usingCols {
 				lr, lerr := left.resolveBare(name)
 				if lerr != nil || lr.level != 0 {
 					return nil, newError(UndefinedColumn, "column \""+name+"\" specified in USING clause does not exist in left table")
 				}
 				li := lr.index
-				llabel, lname := relOfIndex(rels, li)
 				rightRel := &rels[k+1]
 				rl := rightRel.table.ColumnIndex(name)
 				if rl < 0 {
 					return nil, newError(UndefinedColumn, "column \""+name+"\" specified in USING clause does not exist in right table")
 				}
 				ri := rightRel.offset + rl
+				lq, rq := fmt.Sprintf("\x00l%d", n), fmt.Sprintf("\x00r%d", n)
+				pairRels = append(pairRels,
+					scopeRel{label: lq, table: &catTable{Name: lq, Columns: []catColumn{*left.columnAt(li)}}, offset: li},
+					scopeRel{label: rq, table: &catTable{Name: rq, Columns: []catColumn{rightRel.table.Columns[rl]}}, offset: ri})
 				eq := newBinaryExpr(opEq,
-					exprNode{Kind: exprQualifiedColumn, Qualifier: llabel, Column: lname},
-					exprNode{Kind: exprQualifiedColumn, Qualifier: rightRel.label, Column: name})
+					exprNode{Kind: exprQualifiedColumn, Qualifier: lq, Column: name},
+					exprNode{Kind: exprQualifiedColumn, Qualifier: rq, Column: name})
 				if predAST == nil {
 					predAST = &eq
 				} else {
@@ -324,14 +357,14 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				merges = append(merges, mergeCol{name: strings.ToLower(name), index: mi})
 				hidden = append(hidden, li, ri)
 			}
-			partial := &scope{rels: rels[seg : k+2], parent: parent, catalog: db, allowSubquery: true, ctes: ctes, merges: segMerges, hidden: segHidden}
-			pred, perr := resolveBooleanFilter(partial, predAST, ptypes)
+			pair := &scope{rels: pairRels, catalog: db, ctes: ctes}
+			pred, perr := resolveBooleanFilter(pair, predAST, ptypes)
 			if perr != nil {
 				return nil, perr
 			}
 			joinPreds[k] = pred
 		case j.On != nil:
-			partial := &scope{rels: rels[seg : k+2], parent: parent, catalog: db, allowSubquery: true, ctes: ctes, merges: segMerges, hidden: segHidden}
+			partial := &scope{rels: rels[seg : k+2], parent: parent, catalog: db, allowSubquery: true, ctes: ctes, merges: segMerges, hidden: segHidden, subRels: subRelsWithin(subRels, seg, k+1)}
 			pred, perr := resolveBooleanFilter(partial, j.On, ptypes)
 			if perr != nil {
 				return nil, perr
@@ -340,7 +373,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		}
 	}
 
-	s := &scope{rels: rels, parent: parent, catalog: db, allowSubquery: true, ctes: ctes, merges: merges, hidden: hidden}
+	s := &scope{rels: rels, parent: parent, catalog: db, allowSubquery: true, ctes: ctes, merges: merges, hidden: hidden, subRels: subRels}
 
 	// Resolve projections (paired with output names — §8), the optional WHERE (must be
 	// boolean), and the ORDER BY keys against the full scope. A bare key ambiguous across
@@ -518,6 +551,10 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	projections, columnNames, columnTypes, err := resolveProjections(s, items, projAgg, ptypes)
 	if err != nil {
 		return nil, err
+	}
+	var group *joinGroupLayout
+	if sel.JoinGroup {
+		group = joinGroupOutputs(s, &projections, &columnNames, &columnTypes)
 	}
 	aggSpecs := projAgg.specs
 	windowSpecs := projAgg.windowSpecs
@@ -972,7 +1009,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		aggSpecs: aggSpecs, hasWindow: hasWindow, windowSpecs: windowSpecs, windowKeys: windowKeys, having: having,
 		order: order, orderExprs: orderExprs, projections: projections,
 		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
-		limit: sel.Limit, offset: sel.Offset,
+		limit: sel.Limit, offset: sel.Offset, group: group,
 	}
 	plan.relMasks = computeRelMasks(plan)
 	// ——— Stage 2: logical rewrite rules (spec/design/planner.md §3) ———
@@ -1170,4 +1207,69 @@ func computeRelMasks(plan *selectPlan) [][]bool {
 		relMasks[i] = touched[rel.offset : rel.offset+rel.colCount]
 	}
 	return relMasks
+}
+
+// joinGroupLayout is the output shape of an unaliased parenthesized join's body (spec/design/grammar.md
+// §15): columns are the body outputs (the star columns, then the hidden USING/NATURAL copies), each
+// keeping its source column's name, type, and collation; hidden is the output positions of those
+// copies; subRels give each inner label's columns as output positions (rel unused).
+type joinGroupLayout struct {
+	columns []catColumn
+	hidden  []int
+	subRels []subRel
+}
+
+// joinGroupOutputs completes a JoinGroup body: after its `*` columns it appends every slot the star
+// omitted (a USING/NATURAL copy superseded by a merge), so each inner relation's columns are all
+// present, and records where each inner label's columns landed. Every star output is a bare column.
+func joinGroupOutputs(s *scope, projections *[]*rExpr, names *[]string, types *[]resolvedType) *joinGroupLayout {
+	pos := make(map[int]int, s.width())
+	for p, pr := range *projections {
+		pos[pr.index] = p
+	}
+	group := &joinGroupLayout{}
+	extra := slices.Clone(s.hidden)
+	slices.Sort(extra)
+	for _, idx := range slices.Compact(extra) {
+		if _, ok := pos[idx]; ok {
+			continue
+		}
+		pos[idx] = len(*projections)
+		group.hidden = append(group.hidden, len(*projections))
+		c := s.columnAt(idx)
+		*projections = append(*projections, &rExpr{kind: reColumn, index: idx})
+		*names = append(*names, c.Name)
+		*types = append(*types, resolvedTypeOfCol(c.Type, s.catalog.readSnap()))
+	}
+	for _, pr := range *projections {
+		c := s.columnAt(pr.index)
+		group.columns = append(group.columns, catColumn{Name: c.Name, Type: c.Type, Collation: c.Collation})
+	}
+	for _, r := range s.rels {
+		if r.label == "" {
+			continue
+		}
+		slots := make([]int, len(r.table.Columns))
+		for c := range slots {
+			slots[c] = pos[r.offset+c]
+		}
+		group.subRels = append(group.subRels, subRel{label: r.label, table: r.table, slots: slots})
+	}
+	for _, sr := range s.subRels {
+		slots := make([]int, len(sr.slots))
+		for c, slot := range sr.slots {
+			slots[c] = pos[slot]
+		}
+		group.subRels = append(group.subRels, subRel{label: sr.label, table: sr.table, slots: slots})
+	}
+	return group
+}
+
+// derivedJoinGroup is the layout of a FROM item's derived body when it is an unaliased parenthesized
+// join, else nil.
+func derivedJoinGroup(plan *queryPlan) *joinGroupLayout {
+	if plan == nil || plan.sel == nil {
+		return nil
+	}
+	return plan.sel.group
 }

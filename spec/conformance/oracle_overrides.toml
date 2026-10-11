@@ -471,15 +471,9 @@ file = "expr/float_math.test"
 sql = "SELECT log10(x) FROM f WHERE id = 3"
 reason = "jed: log10 of zero traps 22003 (jed's single numeric range/domain code — no granular 2201E in the registry). PostgreSQL raises 2201E (invalid_argument_for_logarithm). Engine-wide collapse to 22003."
 
-# --- derived tables: jed defers two FROM-clause forms PostgreSQL accepts (grammar.md §42). Both are
-# deliberate parser narrowings, relaxable later.
-[[override]]
-file = "subquery/derived.test"
-sql = "SELECT * FROM (t JOIN t ON 1 = 1) AS x"
-reason = "jed: a parenthesized-join FROM is a deferred narrowing — a leading `(` in FROM not followed by SELECT is 42601 (grammar.md §42). PostgreSQL parses `(t JOIN t ON …)` as a parenthesized join and instead reports 42712 (the duplicate `t`). A deliberate surface narrowing; the row behavior of derived tables is unaffected."
-
-# (A nested WITH in a derived-table body has since landed — spec/design/cte.md §7 — so jed now accepts
-# it like PostgreSQL; its former override entry was removed with the feature.)
+# (Derived tables: a nested WITH in a derived-table body — spec/design/cte.md §7 — and a
+# parenthesized-join FROM — grammar.md §15 — have both landed, so jed now accepts them like
+# PostgreSQL; their former override entries were removed with the features.)
 
 # --- VALUES-body derived table (grammar.md §42): a trailing ORDER BY / LIMIT on the VALUES body is a
 # deferred narrowing, relaxable later.
