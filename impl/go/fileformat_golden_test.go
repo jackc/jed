@@ -192,6 +192,21 @@ func hostfuncIndexTableDB(t *testing.T) *Session {
 	return s
 }
 
+// hostfuncCheckTableDB has a HOST-FUNCTION check dependency (v35 — each check entry's check_flags byte
+// + the dependency list, extensibility.md §7.1.3): t_a_check calls no host function (flags 0) and
+// t_a_check1 calls geo_hash(a) (flags 1 + the list). EMPTY table, so the fixture isolates the v35
+// catalog change. Must match verify.rb's HOSTFUNC_CHECK_TABLE.
+func hostfuncCheckTableDB(t *testing.T) *Session {
+	reg := regWith(t, geoHash("com.example/geo_hash", 1))
+	db, err := CreateDatabase(CreateOptions{PageSize: goldenPageSize, Extensions: reg})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	s := db.Session(SessionOptions{})
+	run(t, s, "CREATE TABLE t (id i64 PRIMARY KEY, a i64 CHECK (a <> 0), CHECK (geo_hash(a) > 0))")
+	return s
+}
+
 // uniqueTableDB has UNIQUE indexes (v6 — the per-index flags byte, indexes.md §8):
 // t_v_key (a UNIQUE constraint's auto-name) over a nullable column holding two NULLs
 // (NULLS DISTINCT — both stored), the named two-column constraint wv, a CREATE UNIQUE
@@ -999,6 +1014,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"partial_index_table.jed", partialIndexTableDB},
 		{"timezone_index_table.jed", timezoneIndexTableDB},
 		{"hostfunc_index_table.jed", hostfuncIndexTableDB},
+		{"hostfunc_check_table.jed", hostfuncCheckTableDB},
 		{"gin_array_table.jed", ginArrayTableDB},
 		{"gin_uuid_table.jed", ginUuidTableDB},
 		{"fk_table.jed", fkTableDB},

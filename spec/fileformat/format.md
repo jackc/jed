@@ -17,7 +17,15 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 34)
+## Version scope (`format_version` 35)
+
+`format_version` **35** — **host-function check dependencies**
+([../design/extensibility.md §7.1](../design/extensibility.md)). Every `CHECK` entry in the table
+catalog gains a trailing `u8 check_flags` after `check_expr`: bit0 `has_host_deps`; bits 1–7
+reserved, written 0 (a set reserved bit is `XX001`). When bit0 is set, the v31 host-function
+dependency list follows, byte-for-byte the per-index encoding below (a zero `dep_count` is `XX001`).
+A check that calls no host function writes only the zero flags byte, so every golden with a `CHECK`
+changes. A column `DEFAULT` persists nothing new. Readers accept only the exact current version.
 
 `format_version` **34** — **the live page count**
 ([../design/memory.md §8.7](../design/memory.md)). Meta offset 56, reserved zero through v33, is now
@@ -527,7 +535,7 @@ Two slots for torn-write-safe publication, with dirty-page validation since v33
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`34`** |
+| 4  | 2 | `format_version` (u16) — current = **`35`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -725,6 +733,8 @@ columns and the index list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;`check_name` | UTF-8 (original case) |
 | &nbsp;&nbsp;`check_expr_len` | u16 |
 | &nbsp;&nbsp;`check_expr` | UTF-8 — the expression text (*Check-expression text* below) |
+| &nbsp;&nbsp;`check_flags` | u8 — **new in v35**: bit0 `has_host_deps`; bits 1–7 reserved, written 0 (a set reserved bit is `XX001`) |
+| &nbsp;&nbsp;`check_host_deps` | only when `check_flags` bit0 is set: the v31 dependency list (Version scope above), the same bytes an index writes |
 | `index_count` | u16 — the table's secondary indexes (**new in v5**; `0` for an unindexed table) |
 | per index (×`index_count`): | |
 | &nbsp;&nbsp;`index_name_len` | u16 |
@@ -1580,6 +1590,7 @@ the interior-node format and the split contract.
 | `gin_array_table.jed` | **GIN inverted index** (v13) — the per-index `index_kind` byte: a `USING gin` index over an `i32[]` column (rows with multi-element, duplicate-element, empty, and NULL arrays — exercising term dedup and the zero-entry cases; entries are `encode(elem) ‖ storage-key`, empty payload — [../design/gin.md §4](../design/gin.md)) beside one ordinary ordered index (`index_kind = 0`) in the same catalog |
 | `gin_uuid_table.jed` | **GIN over a non-integer element type** (no version bump — `uuid` is a fixed-width key encoding already on disk) — a `USING gin` index over a `uuid[]` column: each GIN term is the element's 16-byte `uuid-raw16` key encoding, so entries are `encode_uuid(elem) ‖ storage-key` (empty payload — [../design/gin.md §3/§4](../design/gin.md)). Same row shape as `gin_array_table` (term dedup, empty/NULL arrays, a NULL element), pinning that a uuid-element GIN serializes byte-identically across cores |
 | `check_table.jed` | **`CHECK` constraints** (v4) — the catalog check list: an auto-named single-column check, an explicitly-named multi-column check, and a check whose text exercises the token rendering (string + decimal literals, `<=`); stored in name order |
+| `hostfunc_check_table.jed` | **host-function check dependencies** (v35) — `t_a_check` with `check_flags` 0 beside `t_a_check1`, which calls the host function `geo_hash(i64) -> i64` (component `com.example/geo_hash`, semantic version 1) and so carries flags 1 + the dependency list (empty table) |
 | `tall_tree.jed` | enough small int rows to force a **two-level interior** (height-2 tree) — exercises interior-of-interior child pointers and post-order page allocation |
 | `torn_meta_slot0.jed` | slot 0 checksum corrupted → loader falls back to slot 1 |
 | `torn_meta_slot1.jed` | slot 1 checksum corrupted → loader falls back to slot 0 |

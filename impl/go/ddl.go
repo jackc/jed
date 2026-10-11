@@ -86,15 +86,47 @@ func hostDepArgCodes(d hostFuncDep) []byte {
 //
 // Deduplicated by (name, arg types); the caller sorts for a stable on-disk order.
 func collectIndexHostDeps(node *rExpr, reg *ExtensionRegistry, out *[]hostFuncDep) error {
+	return collectHostDeps(node, reg, true, "an index expression", out)
+}
+
+// collectCheckHostDeps collects a resolved CHECK expression's host-function dependencies
+// (spec/design/extensibility.md §7.1.2), sorted for the on-disk order. Unlike an index, a check
+// has no volatility gate — the built-in rule admits CHECK (ts < now()), and nothing relies on a
+// check being immutable — but each host function must declare a component identity (42P17) so a
+// swapped implementation is detectable. nil for a check that calls no host function.
+func collectCheckHostDeps(node *rExpr, reg *ExtensionRegistry) ([]hostFuncDep, error) {
+	var deps []hostFuncDep
+	if err := collectHostDeps(node, reg, false, "a check constraint", &deps); err != nil {
+		return nil, err
+	}
+	sortHostDeps(deps)
+	return deps, nil
+}
+
+// sortHostDeps fixes a stable on-disk / cross-core order (CLAUDE.md §8): by (name, on-disk arg-type
+// codes), so registration order never leaks into the file bytes.
+func sortHostDeps(deps []hostFuncDep) {
+	slices.SortFunc(deps, func(a, b hostFuncDep) int {
+		if c := strings.Compare(a.Name, b.Name); c != 0 {
+			return c
+		}
+		return bytes.Compare(hostDepArgCodes(a), hostDepArgCodes(b))
+	})
+}
+
+// collectHostDeps is the shared walk behind collectIndexHostDeps / collectCheckHostDeps: it admits
+// each host call (requireImmutable only for an index) and appends one dependency per distinct
+// (name, arg types) signature to out.
+func collectHostDeps(node *rExpr, reg *ExtensionRegistry, requireImmutable bool, site string, out *[]hostFuncDep) error {
 	return walkIndexExprHostFuncs(node, func(n *rExpr) error {
 		hf := reg.function(n.index)
-		if hf.volatility != VolatilityImmutable {
+		if requireImmutable && hf.volatility != VolatilityImmutable {
 			return newError(InvalidObjectDefinition,
-				"host function "+n.cText+" in an index expression must be IMMUTABLE")
+				"host function "+n.cText+" in "+site+" must be IMMUTABLE")
 		}
 		if hf.componentID == nil {
 			return newError(InvalidObjectDefinition,
-				"host function "+n.cText+" used in an index expression must declare a component identity")
+				"host function "+n.cText+" used in "+site+" must declare a component identity")
 		}
 		for _, d := range *out {
 			if d.Name == hf.name && sameHostSig(d.ArgTypes, hf.argTypes) {
@@ -122,18 +154,41 @@ func collectIndexHostDeps(node *rExpr, reg *ExtensionRegistry, out *[]hostFuncDe
 // (42883). A no-op for an index that records no host dependency.
 func verifyIndexHostDeps(node *rExpr, reg *ExtensionRegistry, deps []hostFuncDep) error {
 	return walkIndexExprHostFuncs(node, func(n *rExpr) error {
-		hf := reg.function(n.index)
-		for _, d := range deps {
-			if d.Name == hf.name && sameHostSig(d.ArgTypes, hf.argTypes) &&
-				hf.componentID != nil && *hf.componentID == d.ComponentID &&
-				hf.semanticVersion == d.SemanticVersion {
-				return nil
-			}
+		if hostDepMatches(reg.function(n.index), deps) {
+			return nil
 		}
 		return newError(CollationVersionMismatch,
 			"index depends on host function "+n.cText+" whose registered component/version no longer "+
 				"matches the file; the index is unusable until it is rebuilt")
 	})
+}
+
+// verifyCheckHostDeps is verifyIndexHostDeps for a CHECK (spec/design/extensibility.md §7.1.2): every
+// host call the resolved check makes must match a dependency persisted with it, else XX002. Unlike an
+// index there is no read-side fallback to take — only a statement that evaluates the check resolves it.
+// A check that persisted no dependency but now resolves to a host function fails the same way.
+func verifyCheckHostDeps(name string, node *rExpr, reg *ExtensionRegistry, deps []hostFuncDep) error {
+	return walkIndexExprHostFuncs(node, func(n *rExpr) error {
+		if hostDepMatches(reg.function(n.index), deps) {
+			return nil
+		}
+		return newError(CollationVersionMismatch,
+			"check constraint "+name+" depends on host function "+n.cText+" whose registered "+
+				"component/version no longer matches the file; the constraint must be re-added")
+	})
+}
+
+// hostDepMatches reports whether a resolved host function's current registration matches one of deps
+// by signature, component identity, and semantic version.
+func hostDepMatches(hf *hostFuncEntry, deps []hostFuncDep) bool {
+	for _, d := range deps {
+		if d.Name == hf.name && sameHostSig(d.ArgTypes, hf.argTypes) &&
+			hf.componentID != nil && *hf.componentID == d.ComponentID &&
+			hf.semanticVersion == d.SemanticVersion {
+			return true
+		}
+	}
+	return false
 }
 
 // stmtKind is a short label for a statement kind, for the 25006 read-only-violation message (the
@@ -779,6 +834,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 	// before a 42710 between earlier ones. Resolution needs a catalog *Table, so build it
 	// now (checks attach below, before putTable).
 	table := &catTable{Name: ct.Name, Columns: columns, PK: pk}
+	checkDeps := make([][]hostFuncDep, len(ct.Checks))
 	for i := range ct.Checks {
 		def := &ct.Checks[i]
 		// Structural rejections first (a single pre-walk — a documented micro-order
@@ -788,12 +844,17 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			return outcome{}, err
 		}
 		s := singleScope(db, table)
-		_, ty, err := resolve(s, def.Expr, nil, &aggCtx{collecting: false}, &paramTypes{})
+		node, ty, err := resolve(s, def.Expr, nil, &aggCtx{collecting: false}, &paramTypes{})
 		if err != nil {
 			return outcome{}, err
 		}
 		if ty.kind != rtBool && ty.kind != rtNull {
 			return outcome{}, typeError("argument of CHECK must be boolean")
+		}
+		// Host functions the check calls (spec/design/extensibility.md §7.1.2): each needs a component
+		// identity (42P17), and the resolved dependencies persist with the check.
+		if checkDeps[i], err = collectCheckHostDeps(node, db.session.extensions); err != nil {
+			return outcome{}, err
 		}
 	}
 	// Naming (constraints.md §4.3): a single pass in textual order. An explicit name is
@@ -832,7 +893,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 				name = base + strconv.Itoa(suffix)
 			}
 		}
-		checks = append(checks, checkConstraint{Name: name, ExprText: def.Text, Expr: def.Expr})
+		checks = append(checks, checkConstraint{Name: name, ExprText: def.Text, Expr: def.Expr, HostDeps: checkDeps[i]})
 	}
 	// Evaluation (and on-disk) order: ascending byte order of the lowercased name
 	// (constraints.md §4.4 — PG evaluates checks sorted by name, oracle-probed).
@@ -1356,6 +1417,11 @@ func (db *engine) resolveChecksWithParams(table *catTable, ptypes *paramTypes) (
 		if err != nil {
 			return nil, err
 		}
+		// Reopen soundness (spec/design/extensibility.md §7.1.2): every host call must still match the
+		// dependency persisted with the check, else XX002 before any mutation.
+		if err := verifyCheckHostDeps(table.Checks[i].Name, node, db.session.extensions, table.Checks[i].HostDeps); err != nil {
+			return nil, err
+		}
 		out = append(out, namedCheck{name: table.Checks[i].Name, node: node})
 	}
 	return out, nil
@@ -1372,10 +1438,18 @@ func (db *engine) resolveDefaultExprs(table *catTable) ([]*rExpr, error) {
 }
 
 func (db *engine) resolveDefaultExprsWithParams(table *catTable, ptypes *paramTypes) ([]*rExpr, error) {
+	return db.resolveDefaultExprsFor(table, nil, ptypes)
+}
+
+// resolveDefaultExprsFor is resolveDefaultExprsWithParams restricted to the columns need marks (nil =
+// every column): a statement resolves only the defaults it can apply, so a host function behind a
+// default it never applies need not be registered (spec/design/extensibility.md §7.1.1). An unneeded
+// column's slot stays nil.
+func (db *engine) resolveDefaultExprsFor(table *catTable, need []bool, ptypes *paramTypes) ([]*rExpr, error) {
 	out := make([]*rExpr, len(table.Columns))
 	for i := range table.Columns {
 		de := table.Columns[i].DefaultExpr
-		if de == nil {
+		if de == nil || (need != nil && !need[i]) {
 			continue
 		}
 		colScalar := table.Columns[i].Type.ScalarTy()
@@ -3307,14 +3381,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		}
 	}
 
-	// A stable on-disk / cross-core order (CLAUDE.md §8): sort the collected dependencies by (name,
-	// on-disk arg-type codes) so registration order never leaks into the file bytes.
-	slices.SortFunc(hostDeps, func(a, b hostFuncDep) int {
-		if c := strings.Compare(a.Name, b.Name); c != 0 {
-			return c
-		}
-		return bytes.Compare(hostDepArgCodes(a), hostDepArgCodes(b))
-	})
+	sortHostDeps(hostDeps)
 	if err := timezoneDeps.validate(); err != nil {
 		return outcome{}, err
 	}

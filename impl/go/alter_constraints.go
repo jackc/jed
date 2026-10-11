@@ -244,12 +244,16 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 		if err := rejectCheckStructure(d.Expr); err != nil {
 			return err
 		}
-		_, ty, err := resolve(singleScope(db, t), d.Expr, nil, &aggCtx{collecting: false}, &paramTypes{})
+		node, ty, err := resolve(singleScope(db, t), d.Expr, nil, &aggCtx{collecting: false}, &paramTypes{})
 		if err != nil {
 			return err
 		}
 		if ty.kind != rtBool && ty.kind != rtNull {
 			return typeError("argument of CHECK must be boolean")
+		}
+		hostDeps, err := collectCheckHostDeps(node, db.session.extensions)
+		if err != nil {
+			return err
 		}
 		name := d.Name
 		if name != "" {
@@ -267,7 +271,7 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 				name = base + strconv.Itoa(n)
 			}
 		}
-		t.Checks = append(t.Checks, checkConstraint{Name: name, ExprText: d.Text, Expr: d.Expr})
+		t.Checks = append(t.Checks, checkConstraint{Name: name, ExprText: d.Text, Expr: d.Expr, HostDeps: hostDeps})
 		sort.SliceStable(t.Checks, func(i, j int) bool { return strings.ToLower(t.Checks[i].Name) < strings.ToLower(t.Checks[j].Name) })
 		st.added[strings.ToLower(name)] = true
 		return nil
@@ -617,9 +621,26 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 		}
 		meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs))
 	}
-	checks, err := db.resolveChecks(t)
-	if err != nil {
-		return nil, err
+	// Only the checks this statement validates (an ADD CONSTRAINT, or every check after ALTER COLUMN
+	// TYPE) are resolved, so an existing stale check never blocks an unrelated ADD (spec/design/
+	// extensibility.md §7.1.2). Each validated check is evaluated against EVERY row with the current
+	// host-function implementations below, so its dependency list is re-collected from this end-state
+	// resolution rather than verified: that is the rebuild a DROP + ADD performs, and it lets a type
+	// change select a different host overload.
+	var checks []namedCheck
+	for i := range t.Checks {
+		c := &t.Checks[i]
+		if !st.added[strings.ToLower(c.Name)] {
+			continue
+		}
+		node, _, err := resolve(singleScope(db, t), c.Expr, nil, &aggCtx{collecting: false}, &paramTypes{})
+		if err != nil {
+			return nil, err
+		}
+		if c.HostDeps, err = collectCheckHostDeps(node, db.session.extensions); err != nil {
+			return nil, err
+		}
+		checks = append(checks, namedCheck{name: c.Name, node: node})
 	}
 	colls := db.columnCollations(t.Columns)
 	seen := map[string]map[string]bool{}
@@ -645,10 +666,8 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 			return nil, err
 		}
 		for _, c := range checks {
-			if st.added[strings.ToLower(c.name)] {
-				if err := evalChecks([]namedCheck{c}, t.Name, row, &evalEnv{exec: db, rng: newStmtRng()}, meter); err != nil {
-					return nil, err
-				}
+			if err := evalChecks([]namedCheck{c}, t.Name, row, &evalEnv{exec: db, rng: newStmtRng()}, meter); err != nil {
+				return nil, err
 			}
 		}
 		for _, ix := range t.Indexes {

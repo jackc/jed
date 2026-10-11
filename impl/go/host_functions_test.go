@@ -1118,3 +1118,238 @@ func TestHostBatchStreamingScanStorageErrorsMatchRowKernel(t *testing.T) {
 		t.Fatal("a corrupted leaf should fail a scan")
 	}
 }
+
+// ---- Host functions in DEFAULT / CHECK (spec/design/extensibility.md §7.1, step 4b). ----
+
+// scaledGeo is geo_hash(i64) -> i64 = a * factor under the given component/version, left VOLATILE
+// (the default): a CHECK has no volatility gate (§7.1.2), only a component-identity requirement.
+func scaledGeo(component string, version uint32, factor int64) *HostFunction {
+	return NewHostFunction("geo_hash", []string{"i64"}, "i64",
+		func(args []Value) (Value, error) { return IntValue(args[0].Int * factor), nil }).
+		WithComponentID(component).WithSemanticVersion(version)
+}
+
+// unversionedGeo is geo_hash(i64) -> i64 = a * 10 with NO component identity.
+func unversionedGeo() *HostFunction {
+	return NewHostFunction("geo_hash", []string{"i64"}, "i64",
+		func(args []Value) (Value, error) { return IntValue(args[0].Int * 10), nil })
+}
+
+func wantHostCode(t *testing.T, q valueQuerier, sql, code string) {
+	t.Helper()
+	if _, err := queryOutcome(q, sql, nil); errCodeOf(err) != code {
+		t.Fatalf("%q = %v, want %s", sql, err, code)
+	}
+}
+
+func wantHostOK(t *testing.T, q valueQuerier, sql string) {
+	t.Helper()
+	if _, err := queryOutcome(q, sql, nil); err != nil {
+		t.Fatalf("%q: %v", sql, err)
+	}
+}
+
+func TestHostFuncCheckAdmission(t *testing.T) {
+	t.Parallel()
+	// An unversioned host function cannot back a CHECK in any position (42P17)...
+	s := dbExt(t, regWith(t, unversionedGeo()), "CREATE TABLE u (a i64)")
+	wantErr(t, s, "CREATE TABLE t (a i64 CHECK (geo_hash(a) < 100))", "42P17")
+	wantErr(t, s, "CREATE TABLE t (a i64, CHECK (geo_hash(a) < 100))", "42P17")
+	wantErr(t, s, "ALTER TABLE u ADD CONSTRAINT c CHECK (geo_hash(a) < 100)", "42P17")
+	// ...but a DEFAULT has no admission rule: any host function, any volatility, no identity.
+	run(t, s, "CREATE TABLE d (id i64 PRIMARY KEY, b i64 DEFAULT geo_hash(5))")
+	run(t, s, "INSERT INTO d (id) VALUES (1)")
+	if got := oneVal(t, s, "SELECT b FROM d"); got.Int != 50 {
+		t.Fatalf("host-function default = %v, want 50", got)
+	}
+	// A VOLATILE but versioned host function is admitted into a CHECK and enforced.
+	s2 := dbExt(t, regWith(t, scaledGeo("com.example/geo_hash", 1, 10)),
+		"CREATE TABLE t (a i64 CHECK (geo_hash(a) < 100))")
+	run(t, s2, "INSERT INTO t VALUES (9)")
+	wantErr(t, s2, "INSERT INTO t VALUES (10)", "23514")
+}
+
+// createCheckFile writes a file whose CHECK `small` calls geo_hash v1 (a * 10 < 100, i.e. a < 10),
+// holding the row (1, 9).
+func createCheckFile(t *testing.T, path string) {
+	t.Helper()
+	createGeoFile(t, path, regWith(t, scaledGeo("com.example/geo_hash", 1, 10)),
+		"CREATE TABLE t (id i64 PRIMARY KEY, a i64, CONSTRAINT small CHECK (geo_hash(a) < 100))",
+		"INSERT INTO t VALUES (1, 9)")
+}
+
+func TestHostFuncCheckReopenMatching(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "hostfunc_check_match.jed")
+	createCheckFile(t, path)
+	db := openGeoFile(t, path, regWith(t, scaledGeo("com.example/geo_hash", 1, 10)))
+	defer db.Close()
+	wantHostOK(t, db, "INSERT INTO t VALUES (2, 5)")
+	wantHostCode(t, db, "INSERT INTO t VALUES (3, 10)", "23514")
+	wantHostOK(t, db, "UPDATE t SET a = 1 WHERE id = 2")
+}
+
+func TestHostFuncCheckReopenMissing(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "hostfunc_check_missing.jed")
+	createCheckFile(t, path)
+	db := openGeoFile(t, path, nil)
+	defer db.Close()
+	// Writes that evaluate the check cannot resolve it (42883); reads and DELETE never evaluate it.
+	if got := geoIDs(t, db, "SELECT id FROM t"); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("read = %v, want [1]", got)
+	}
+	wantHostCode(t, db, "INSERT INTO t VALUES (2, 1)", "42883")
+	wantHostCode(t, db, "UPDATE t SET a = 1", "42883")
+	wantHostOK(t, db, "DELETE FROM t WHERE id = 1")
+	if got := geoIDs(t, db, "SELECT id FROM t"); len(got) != 0 {
+		t.Fatalf("after delete = %v, want []", got)
+	}
+}
+
+func TestHostFuncCheckReopenMismatch(t *testing.T) {
+	t.Parallel()
+	for name, fn := range map[string]*HostFunction{
+		"version":   scaledGeo("com.example/geo_hash", 2, 10),
+		"component": scaledGeo("org.other/geo_hash", 1, 10),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "hostfunc_check_mismatch.jed")
+			createCheckFile(t, path)
+			db := openGeoFile(t, path, regWith(t, fn))
+			defer db.Close()
+			// Every write that evaluates the stale check is refused before mutating anything.
+			wantHostCode(t, db, "INSERT INTO t VALUES (2, 1)", "XX002")
+			wantHostCode(t, db, "UPDATE t SET a = 1", "XX002")
+			if got := geoIDs(t, db, "SELECT a FROM t WHERE id = 1"); len(got) != 1 || got[0] != 9 {
+				t.Fatalf("a after refused UPDATE = %v, want 9", got)
+			}
+			// Reads and DELETE never evaluate a check, so a stale one costs them nothing.
+			wantHostOK(t, db, "DELETE FROM t WHERE id = 1")
+		})
+	}
+}
+
+func TestHostFuncCheckRebuild(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "hostfunc_check_rebuild.jed")
+	createCheckFile(t, path)
+	// v2 doubles the factor: the rule becomes a < 5, which the stored row (1, 9) violates.
+	v2 := func() *ExtensionRegistry { return regWith(t, scaledGeo("com.example/geo_hash", 2, 20)) }
+	rebuild := "ALTER TABLE t DROP CONSTRAINT small, ADD CONSTRAINT small CHECK (geo_hash(a) < 100)"
+	db := openGeoFile(t, path, v2())
+	// The one-statement rebuild re-validates every row with the current implementation: 23514, and the
+	// statement rolls back whole, so the stale check is still in place.
+	wantHostCode(t, db, rebuild, "23514")
+	wantHostCode(t, db, "INSERT INTO t VALUES (2, 1)", "XX002")
+	wantHostOK(t, db, "DELETE FROM t WHERE id = 1")
+	wantHostOK(t, db, rebuild)
+	wantHostOK(t, db, "INSERT INTO t VALUES (2, 1)")
+	wantHostCode(t, db, "INSERT INTO t VALUES (3, 9)", "23514")
+	db.Close()
+	// The rebuild persisted the v2 dependency: v2 writes, v1 is now the stale one.
+	db = openGeoFile(t, path, v2())
+	wantHostOK(t, db, "INSERT INTO t VALUES (4, 2)")
+	db.Close()
+	db = openGeoFile(t, path, regWith(t, scaledGeo("com.example/geo_hash", 1, 10)))
+	defer db.Close()
+	wantHostCode(t, db, "INSERT INTO t VALUES (5, 2)", "XX002")
+}
+
+func TestHostFuncCheckUnrelatedStatements(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "hostfunc_check_unrelated.jed")
+	createGeoFile(t, path, regWith(t, scaledGeo("com.example/geo_hash", 1, 10)),
+		"CREATE TABLE p1 (id i64 PRIMARY KEY)",
+		"CREATE TABLE p2 (id i64 PRIMARY KEY)",
+		"CREATE TABLE c (id i64 PRIMARY KEY, pid i64 REFERENCES p1 ON DELETE SET NULL, a i64, CHECK (geo_hash(a) < 100))",
+		"CREATE TABLE k (id i64 PRIMARY KEY, pid i64 REFERENCES p2 ON DELETE CASCADE, a i64, CHECK (geo_hash(a) < 100))",
+		"INSERT INTO p1 VALUES (1)", "INSERT INTO p2 VALUES (1)",
+		"INSERT INTO c VALUES (1, 1, 1)", "INSERT INTO k VALUES (1, 1, 1)")
+	db := openGeoFile(t, path, regWith(t, scaledGeo("com.example/geo_hash", 2, 10)))
+	defer db.Close()
+	// Adding an unrelated constraint validates only the new one, so the stale check does not block it.
+	wantHostOK(t, db, "ALTER TABLE c ADD CONSTRAINT pos CHECK (a > -100)")
+	// An ON DELETE SET NULL action UPDATEs the child, evaluating its stale check: refused, nothing changes.
+	wantHostCode(t, db, "DELETE FROM p1", "XX002")
+	if got := geoIDs(t, db, "SELECT id FROM p1"); len(got) != 1 {
+		t.Fatalf("p1 after refused delete = %v, want [1]", got)
+	}
+	// An ON DELETE CASCADE action only deletes child rows, so it never evaluates the check.
+	wantHostOK(t, db, "DELETE FROM p2")
+	if got := geoIDs(t, db, "SELECT id FROM k"); len(got) != 0 {
+		t.Fatalf("k after cascade = %v, want []", got)
+	}
+}
+
+func TestHostFuncCheckAlterTypeRecollects(t *testing.T) {
+	t.Parallel()
+	lim32 := NewHostFunction("lim", []string{"i32"}, "i32",
+		func(args []Value) (Value, error) { return IntValue(args[0].Int), nil }).WithComponentID("a/lim")
+	lim64 := func() *HostFunction {
+		return NewHostFunction("lim", []string{"i64"}, "i64",
+			func(args []Value) (Value, error) { return IntValue(args[0].Int), nil }).WithComponentID("b/lim")
+	}
+	path := filepath.Join(t.TempDir(), "hostfunc_check_retype.jed")
+	createGeoFile(t, path, regWith(t, lim32, lim64()),
+		"CREATE TABLE t (id i64 PRIMARY KEY, a i32, CHECK (lim(a) < 100))",
+		"INSERT INTO t VALUES (1, 5)")
+	// The check depends on lim(i32), so a registry without it cannot write.
+	db := openGeoFile(t, path, regWith(t, lim64()))
+	if _, err := queryOutcome(db, "INSERT INTO t VALUES (2, 6)", nil); err == nil {
+		t.Fatal("a write without the lim(i32) dependency should be refused")
+	}
+	db.Close()
+	// ALTER COLUMN TYPE re-validates every row and re-collects the dependency from the new resolution.
+	db = openGeoFile(t, path, regWith(t, lim32, lim64()))
+	wantHostOK(t, db, "ALTER TABLE t ALTER COLUMN a TYPE i64")
+	db.Close()
+	db = openGeoFile(t, path, regWith(t, lim64()))
+	defer db.Close()
+	wantHostOK(t, db, "INSERT INTO t VALUES (2, 6)")
+	wantHostCode(t, db, "INSERT INTO t VALUES (3, 100)", "23514")
+}
+
+func TestHostFuncDefaultResolvedOnlyWhenApplied(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "hostfunc_default_lazy.jed")
+	createGeoFile(t, path, regWith(t, unversionedGeo()),
+		"CREATE TABLE t (id i64 PRIMARY KEY, b i64 DEFAULT geo_hash(5), c i64)",
+		"INSERT INTO t (id) VALUES (1)",
+		"CREATE TABLE p (id i64 PRIMARY KEY)",
+		"INSERT INTO p VALUES (0), (1)",
+		"CREATE TABLE ch (id i64 PRIMARY KEY, pid i64 DEFAULT geo_hash(0) REFERENCES p ON DELETE SET DEFAULT)",
+		"INSERT INTO ch VALUES (1, 1)")
+	db := openGeoFile(t, path, nil)
+	defer db.Close()
+	// Statements that never apply the default do not need its host function.
+	wantHostOK(t, db, "INSERT INTO t VALUES (2, 7, 7)")
+	wantHostOK(t, db, "INSERT INTO t (id, b) VALUES (3, 1)")
+	wantHostOK(t, db, "INSERT INTO t (id, b) VALUES (3, 1) ON CONFLICT DO NOTHING")
+	wantHostOK(t, db, "INSERT INTO t (id, b) SELECT 4, 4")
+	wantHostOK(t, db, "UPDATE t SET c = 1")
+	wantHostOK(t, db, "DELETE FROM p WHERE id = 99") // deletes no parent row, so SET DEFAULT never fires
+	// Statements that would apply it cannot resolve it.
+	wantHostCode(t, db, "INSERT INTO t (id) VALUES (5)", "42883")
+	wantHostCode(t, db, "INSERT INTO t VALUES (5, DEFAULT, 1)", "42883")
+	wantHostCode(t, db, "INSERT INTO t (id) SELECT 5", "42883")
+	wantHostCode(t, db, "INSERT INTO t DEFAULT VALUES", "42883")
+	wantHostCode(t, db, "UPDATE t SET b = DEFAULT", "42883")
+	// Deleting a parent row fires its SET DEFAULT action, whose child UPDATE resolves the default per
+	// statement — whether or not a child row matches (here one does).
+	wantHostCode(t, db, "DELETE FROM p WHERE id = 1", "42883")
+}
+
+func TestHostFuncCheckErrorPrecedesDefault(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "hostfunc_check_default_order.jed")
+	lim := NewHostFunction("lim", []string{"i64"}, "i64",
+		func(args []Value) (Value, error) { return IntValue(args[0].Int), nil })
+	createGeoFile(t, path, regWith(t, scaledGeo("com.example/geo_hash", 1, 10), lim),
+		"CREATE TABLE t (id i64 PRIMARY KEY, a i64, b i64 DEFAULT lim(1), CHECK (geo_hash(a) < 100))")
+	// A stale check (XX002) and a missing default function (42883): the check resolves first.
+	db := openGeoFile(t, path, regWith(t, scaledGeo("com.example/geo_hash", 2, 10)))
+	defer db.Close()
+	wantHostCode(t, db, "INSERT INTO t (id, a) VALUES (1, 1)", "XX002")
+}

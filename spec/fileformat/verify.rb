@@ -27,7 +27,11 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 34 # v34: meta offset 56 carries the exact live page count (memory.md S8.7).
+VERSION = 35 # v35: every CHECK entry gains a trailing check_flags byte (extensibility.md §7.1.3).
+# format_version 35: after each check's expression text, a u8 check_flags (bit0 has_host_deps; bits
+# 1-7 reserved, written 0) and, only when bit0 is set, the v31 host-function dependency list (same
+# bytes as the per-index list below). A fixture writes it as `host_deps:` on the check Hash.
+# format_version 34: meta offset 56 carries the exact live page count (memory.md S8.7).
 # format_version 32 adds timezone dependencies; v31: host-function index dependencies (extensibility.md §8.1) — the
 # per-index index_flags byte gains bit2 has_host_deps, and (only when set) after the v27 predicate a
 # u16 dep_count + per dependency name (u16 len + UTF-8) ‖ arg_count u16 ‖ arg type codes (u8 each) ‖
@@ -823,6 +827,24 @@ TIMEZONE_INDEX_TABLE = {
   rows: []
 }.freeze
 
+# A table with a HOST-FUNCTION check dependency (v35 — extensibility.md §7.1.3): pins the per-check
+# check_flags byte both clear (t_a_check, no host call) and set (t_a_check1, which calls the host
+# function geo_hash (i64 -> i64), component "com.example/geo_hash" at semantic version 1), and the
+# dependency list that follows it. EMPTY table — the fixture isolates the v35 catalog change. The
+# cores build this with a registered `geo_hash` host function via
+#   CREATE TABLE t (id i64 PRIMARY KEY, a i64 CHECK (a <> 0), CHECK (geo_hash(a) > 0))
+HOSTFUNC_CHECK_TABLE = {
+  name: "t",
+  columns: [col("id", "i64", pk: true), col("a", "i64")],
+  checks: [
+    { name: "t_a_check", expr: "a <> 0" },
+    { name: "t_a_check1", expr: "geo_hash ( a ) > 0",
+      host_deps: [{ name: "geo_hash", arg_types: [3], result: 3,
+                    component_id: "com.example/geo_hash", semantic_version: 1 }] }
+  ],
+  rows: []
+}.freeze
+
 HOSTFUNC_INDEX_TABLE = {
   name: "t",
   columns: [col("id", "i64", pk: true), col("a", "i64")],
@@ -1333,6 +1355,7 @@ FIXTURES = ([
   { file: "partial_index_table.jed", page_size: 256, tables: [PARTIAL_INDEX_TABLE] },
   { file: "timezone_index_table.jed", page_size: 256, tables: [TIMEZONE_INDEX_TABLE] },
   { file: "hostfunc_index_table.jed", page_size: 256, tables: [HOSTFUNC_INDEX_TABLE] },
+  { file: "hostfunc_check_table.jed", page_size: 256, tables: [HOSTFUNC_CHECK_TABLE] },
   { file: "gin_array_table.jed", page_size: 256, tables: [GIN_ARRAY_TABLE] },
   { file: "gin_uuid_table.jed", page_size: 256, tables: [GIN_UUID_TABLE] },
   { file: "fk_table.jed", page_size: 256, tables: FK_TABLE[:tables] },
@@ -1989,6 +2012,10 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
   checks.each do |ck|
     out << u16(ck[:name].bytesize) << ck[:name].b
     out << u16(ck[:expr].bytesize) << ck[:expr].b
+    # v35: check_flags (bit0 has_host_deps), then the dependency list when bit0 is set.
+    check_deps = ck[:host_deps] || []
+    out << [check_deps.empty? ? 0 : 1].pack("C")
+    write_host_deps(out, check_deps) unless check_deps.empty?
   end
   # Secondary indexes (v5): count, then per index the name, key-column ordinals (index-key
   # order), the v6 flags byte (bit0 unique — indexes.md §8), and the index tree's root
@@ -2023,17 +2050,7 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
     out << u16(ix[:predicate].bytesize) << ix[:predicate].b if ix[:predicate]
     # v31: the host-function dependency list (extensibility.md §8.1) after the predicate — only when
     # bit2 is set. Already in ascending (name, arg-type codes) order (a fixture writes them sorted).
-    unless host_deps.empty?
-      out << u16(host_deps.size)
-      host_deps.each do |dep|
-        out << u16(dep[:name].bytesize) << dep[:name].b
-        out << u16(dep[:arg_types].size)
-        dep[:arg_types].each { |tc| out << [tc].pack("C") }
-        out << [dep[:result]].pack("C")
-        out << u16(dep[:component_id].bytesize) << dep[:component_id].b
-        out << u32(dep[:semantic_version])
-      end
-    end
+    write_host_deps(out, host_deps) unless host_deps.empty?
     if has_timezone_deps
       out << [timezone_deps[:dynamic] ? 1 : 0].pack("C") << u16(timezone_deps[:zones].size)
       timezone_deps[:zones].each do |dep|
@@ -3136,6 +3153,45 @@ end
 
 # --- decoding (independent reader) ------------------------------------------
 
+# The v31 host-function dependency list (extensibility.md §8.1), shared by an index (v31) and a CHECK
+# (v35, §7.1.3): u16 dep_count, then per dependency name ‖ u16 arg_count ‖ arg type codes ‖ result
+# type code ‖ component_id ‖ u32 semantic_version, in ascending (name, arg-type codes) order.
+def write_host_deps(out, deps)
+  out << u16(deps.size)
+  deps.each do |dep|
+    out << u16(dep[:name].bytesize) << dep[:name].b
+    out << u16(dep[:arg_types].size)
+    dep[:arg_types].each { |tc| out << [tc].pack("C") }
+    out << [dep[:result]].pack("C")
+    out << u16(dep[:component_id].bytesize) << dep[:component_id].b
+    out << u32(dep[:semantic_version])
+  end
+end
+
+def read_host_deps(buf, pos)
+  deps = []
+  dc, pos = take(buf, pos, 2)
+  raise "a host-function dependency flag with an empty dependency list" if dc.unpack1("n").zero?
+  dc.unpack1("n").times do
+    dnl, pos = take(buf, pos, 2)
+    dname, pos = take(buf, pos, dnl.unpack1("n"))
+    ac, pos = take(buf, pos, 2)
+    arg_types = []
+    ac.unpack1("n").times do
+      tcb, pos = take(buf, pos, 1)
+      arg_types << tcb.getbyte(0)
+    end
+    rtcb, pos = take(buf, pos, 1)
+    cidl, pos = take(buf, pos, 2)
+    cid, pos = take(buf, pos, cidl.unpack1("n"))
+    svb, pos = take(buf, pos, 4)
+    deps << { name: dname.force_encoding("UTF-8"), arg_types: arg_types,
+              result: rtcb.getbyte(0), component_id: cid.force_encoding("UTF-8"),
+              semantic_version: svb.unpack1("N") }
+  end
+  [deps, pos]
+end
+
 def take(buf, pos, n)
   raise "unexpected end of page data" if pos + n > buf.bytesize
 
@@ -3429,7 +3485,12 @@ def decode_table_entry(buf, pos)
     cname, pos = take(buf, pos, nl.unpack1("n"))
     el, pos = take(buf, pos, 2)
     expr, pos = take(buf, pos, el.unpack1("n"))
-    checks << { name: cname, expr: expr }
+    # v35: check_flags (bit0 has_host_deps; reserved bits must be 0), then the optional dep list.
+    cfb, pos = take(buf, pos, 1)
+    raise "a check_flags reserved bit is set (v35)" if (cfb.getbyte(0) & 0xFE) != 0
+    check_deps = []
+    check_deps, pos = read_host_deps(buf, pos) if (cfb.getbyte(0) & 1) != 0
+    checks << { name: cname, expr: expr, host_deps: check_deps }
   end
   # Secondary indexes (v5): name + key-column ordinals + the v6 flags byte (bit0 unique)
   # + root page, in name order.
@@ -3470,26 +3531,7 @@ def decode_table_entry(buf, pos)
     end
     # v31: the host-function dependency list follows the predicate when bit2 is set (extensibility.md §8.1).
     host_deps = []
-    if has_host_deps
-      dc, pos = take(buf, pos, 2)
-      dc.unpack1("n").times do
-        dnl, pos = take(buf, pos, 2)
-        dname, pos = take(buf, pos, dnl.unpack1("n"))
-        ac, pos = take(buf, pos, 2)
-        arg_types = []
-        ac.unpack1("n").times do
-          tcb, pos = take(buf, pos, 1)
-          arg_types << tcb.getbyte(0)
-        end
-        rtcb, pos = take(buf, pos, 1)
-        cidl, pos = take(buf, pos, 2)
-        cid, pos = take(buf, pos, cidl.unpack1("n"))
-        svb, pos = take(buf, pos, 4)
-        host_deps << { name: dname.force_encoding("UTF-8"), arg_types: arg_types,
-                       result: rtcb.getbyte(0), component_id: cid.force_encoding("UTF-8"),
-                       semantic_version: svb.unpack1("N") }
-      end
-    end
+    host_deps, pos = read_host_deps(buf, pos) if has_host_deps
     timezone_deps = nil
     if (fb.getbyte(0) & 8) != 0
       raise "a non-btree index cannot have timezone dependencies" if kb.getbyte(0) != 0
@@ -4189,7 +4231,7 @@ def expected_tables(fx)
           collation: c[:collation] }
       end,
       pk: pk_order(t),
-      checks: (t[:checks] || []).map { |ck| { name: ck[:name], expr: ck[:expr] } },
+      checks: (t[:checks] || []).map { |ck| { name: ck[:name], expr: ck[:expr], host_deps: ck[:host_deps] || [] } },
       indexes: (t[:indexes] || []).map do |ix|
         if ix[:kind] == "gist"
           { name: ix[:name], cols: ix[:cols], timezone_deps: ix[:timezone_deps],

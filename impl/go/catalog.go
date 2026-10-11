@@ -553,6 +553,11 @@ type checkConstraint struct {
 	Name     string
 	ExprText string
 	Expr     exprNode
+	// HostDeps are the persisted HOST-FUNCTION dependencies of the check expression
+	// (spec/design/extensibility.md §7.1.2, format v35): one per distinct host signature it calls,
+	// sorted by (name, arg-type codes). Verified whenever the check is resolved for evaluation —
+	// a mismatched registration is XX002. nil for a check that calls no host function.
+	HostDeps []hostFuncDep
 }
 
 // ColumnIndex returns the index of the named column (case-insensitive), or -1.

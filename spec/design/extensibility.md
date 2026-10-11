@@ -672,7 +672,8 @@ against. Host *types* (§4.3, later) extend this to the full tuple in the persis
 
 ### 7.1 Host functions in table definitions — `DEFAULT` and `CHECK` (designed, §14 step 4b)
 
-> **Status: designed, not built.** This closes the §14 step-4 deferral. Generated columns are **out of
+> **Status: built in Go and in the Ruby format reference; Rust and TS ports in progress.** This
+> closes the §14 step-4 deferral. Generated columns are **out of
 > scope**: jed has no `GENERATED ALWAYS AS (expr) STORED` (only `GENERATED … AS IDENTITY`), so
 > there is nothing to extend. A future stored generated column would take the **index** rule (§8.1),
 > not this one. Its stored value is derived from the function the way an index key is, so a changed
@@ -722,8 +723,10 @@ never noticed the swap.
   - `INSERT`: the columns omitted from its target list, the columns of any `DEFAULT` slot, and every
     column of `DEFAULT VALUES`. All are static facts of the statement text.
   - `UPDATE … SET x = DEFAULT`: the assigned columns.
-  - The child columns of a foreign-key `ON DELETE`/`ON UPDATE SET DEFAULT` action the statement can
-    fire.
+  - The child columns of a foreign-key `ON DELETE`/`ON UPDATE SET DEFAULT` action. The action runs
+    as a child `UPDATE` whenever the statement deletes or re-keys a referenced parent row, and that
+    `UPDATE` resolves the default even if no child row matches (resolution is per statement, never
+    per row).
   - `ALTER TABLE … ADD COLUMN`: the backfill.
 
   A missing function is therefore `42883` only for statements that would call it. An `INSERT` that
@@ -761,11 +764,12 @@ never noticed the swap.
     - every `INSERT` (including `ON CONFLICT … DO UPDATE`) and `UPDATE` of the table;
     - a foreign-key action that updates a child row of the table (`SET NULL`, `SET DEFAULT`,
       `ON UPDATE CASCADE`);
-    - an `ALTER TABLE` form that re-validates existing checks (`ADD COLUMN`, `ALTER COLUMN …
-      TYPE`, and any other rewrite that §4 of [alter.md](alter.md) validates against the end state).
+    - `ALTER COLUMN … TYPE`, the one `ALTER TABLE` form that re-validates the existing checks (see
+      the re-collection rule below). `ADD COLUMN` validates only the constraints it adds.
   - **Statements that do not evaluate checks** must not resolve them, so they proceed: `SELECT`,
     `DELETE` (including `ON DELETE CASCADE` deletes of child rows), `DROP CONSTRAINT`, `RENAME`,
-    and `DROP TABLE`.
+    `DROP TABLE`, and an `ADD CONSTRAINT` of some other constraint (which validates only what it
+    adds).
 - **Rebuilding a stale check.** Use the one-statement, all-or-nothing ALTER frame:
 
   ```sql
@@ -778,12 +782,14 @@ never noticed the swap.
   ([index-dependencies.md](index-dependencies.md) *Rebuilding*), and it needs no `REINDEX`-style
   convenience. jed has no `NOT VALID` / `VALIDATE CONSTRAINT`; if that surface lands later, its
   `VALIDATE` would re-stamp in place.
-- **Re-resolution under a changed table.** `ALTER COLUMN … TYPE` re-resolves surviving checks
-  against the new column types, which can select a different host overload. It first verifies the
-  persisted list (`XX002` if stale), then **re-collects** the list from the new resolution. That is
-  sound because the same statement re-validates every row with the newly selected implementation.
-  `RENAME COLUMN` only re-renders the text, so the list carries over unchanged. A form that copies a
-  check copies its list.
+- **Re-collection whenever every row is re-validated.** A statement that evaluates a check against
+  **every row of the end state** re-collects that check's list from its end-state resolution instead
+  of verifying the old one. The two such statements are `ADD CONSTRAINT` (the rebuild above) and
+  `ALTER COLUMN … TYPE`, which re-validates every surviving check and can select a different host
+  overload for the retyped column. This is sound for the same reason the rebuild is: every stored
+  row has just been checked with the current implementation. So an `ALTER COLUMN … TYPE` over a
+  stale check also re-stamps it, or fails `23514` and changes nothing. `RENAME COLUMN` only
+  re-renders the text, so the list carries over unchanged.
 
 #### 7.1.3 Format (`format_version` 35)
 
@@ -803,8 +809,9 @@ nothing new.
 
 #### 7.1.4 Determinism, ordering, cost
 
-- **Error precedence within a write statement** is the existing resolution order, which all three
-  cores already share: the table's checks resolve before its defaults. So a statement that both hits
+- **Error precedence within an `INSERT`** is checks, then defaults, then indexes, and all three cores
+  follow it. The column-list analysis (`42703`/`42701`, the `OVERRIDING` adjustment) runs before
+  defaults resolve, because it determines which defaults the statement needs. So a statement that both hits
   a stale check (`XX002`) or a missing check function (`42883`) and needs a missing default function
   reports the **check** error. Checks verify in evaluation (lowercased-name) order and defaults in
   column-ordinal order, so the first failure is deterministic.

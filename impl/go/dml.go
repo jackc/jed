@@ -906,12 +906,6 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	if err != nil {
 		return outcome{}, err
 	}
-	// Each column's EXPRESSION default, resolved once per statement (constraints.md §2);
-	// applied per omitted column / DEFAULT slot, sharing one per-statement StmtRng.
-	defaultExprs, err := db.resolveDefaultExprs(table)
-	if err != nil {
-		return outcome{}, err
-	}
 	stmtRng := newStmtRng()
 
 	// Resolve the optional column list once. provided[i] >= 0 means table column i takes that
@@ -955,6 +949,14 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 				provided[i] = -1
 			}
 		}
+	}
+	// The EXPRESSION default of each column this INSERT can default, resolved once per statement
+	// (constraints.md §2); applied per omitted column / DEFAULT slot, sharing one per-statement
+	// StmtRng. A default the statement cannot apply is not resolved, so its host function need not
+	// be registered (spec/design/extensibility.md §7.1.1).
+	defaultExprs, err := db.resolveDefaultExprsFor(table, insertDefaultNeeds(provided, ins.Rows), &paramTypes{})
+	if err != nil {
+		return outcome{}, err
 	}
 	// The GENERATED ALWAYS columns still explicitly targeted (and not OVERRIDING SYSTEM VALUE):
 	// supplying a non-DEFAULT value to one is 428C9. Collected as (column ordinal, value position)
@@ -1304,14 +1306,6 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx) (*insertValue
 	if err != nil {
 		return nil, err
 	}
-	defaultExprs, err := db.resolveDefaultExprsWithParams(table, ptypes)
-	if err != nil {
-		return nil, err
-	}
-	rindexes, err := db.resolveTableIndexesWithParams(table, ptypes)
-	if err != nil {
-		return nil, err
-	}
 
 	n := len(table.Columns)
 	provided := make([]int, n)
@@ -1346,6 +1340,16 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx) (*insertValue
 				provided[i] = -1
 			}
 		}
+	}
+	// Only the defaults this INSERT can apply (spec/design/extensibility.md §7.1.1), then the indexes —
+	// the same check → default → index resolution order executeInsertCached follows.
+	defaultExprs, err := db.resolveDefaultExprsFor(table, insertDefaultNeeds(provided, ins.Rows), ptypes)
+	if err != nil {
+		return nil, err
+	}
+	rindexes, err := db.resolveTableIndexesWithParams(table, ptypes)
+	if err != nil {
+		return nil, err
 	}
 	var alwaysTargeted []insertAlwaysTarget
 	if !(ins.Overriding != nil && *ins.Overriding == overridingSystem) {
@@ -3282,9 +3286,17 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	// UPDATE SET col = DEFAULT reuses INSERT's once-per-statement resolution of expression
 	// defaults. Constant/no defaults become constant rExpr nodes below, so applying them is free;
 	// expression defaults evaluate once per matched row through the UPDATE meter and statement RNG.
+	// Only the assigned-DEFAULT columns resolve (spec/design/extensibility.md §7.1.1); an unknown
+	// column name is left to the per-assignment 42703 below.
 	var defaultExprs []*rExpr
 	if slices.ContainsFunc(upd.Assignments, func(a assignment) bool { return a.IsDefault }) {
-		defaultExprs, err = db.resolveDefaultExprs(table)
+		need := make([]bool, len(table.Columns))
+		for _, a := range upd.Assignments {
+			if idx := table.ColumnIndex(a.Column); a.IsDefault && idx >= 0 {
+				need[idx] = true
+			}
+		}
+		defaultExprs, err = db.resolveDefaultExprsFor(table, need, &paramTypes{})
 		if err != nil {
 			return outcome{}, err
 		}
@@ -3960,4 +3972,26 @@ func (db *engine) RowsInKeyOrder(name string) []storedRow {
 		}
 	}
 	return rows
+}
+
+// insertDefaultNeeds reports which columns an INSERT can apply a default to (spec/design/extensibility.md
+// §7.1.1): every omitted column (provided[i] < 0 — including DEFAULT VALUES and OVERRIDING USER VALUE
+// identity columns) and every column a VALUES row fills with a top-level DEFAULT. rows is nil for a
+// SELECT source, whose projection never yields DEFAULT. A row of the wrong arity is skipped here; the
+// caller reports it.
+func insertDefaultNeeds(provided []int, rows [][]insertValue) []bool {
+	need := make([]bool, len(provided))
+	for i, p := range provided {
+		if p < 0 {
+			need[i] = true
+			continue
+		}
+		for _, values := range rows {
+			if p < len(values) && values[p].IsDefault {
+				need[i] = true
+				break
+			}
+		}
+	}
+	return need
 }
