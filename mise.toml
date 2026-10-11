@@ -219,7 +219,9 @@ run = [
 description = "Run the stepped-threaded concurrency conformance under the race detector (Go + Rust)"
 run = [
   "cd impl/go && go test -race -run TestConcurrencySchedulesThreaded ./cmd/conformance",
-  "cargo test --bin conformance --manifest-path impl/rust/Cargo.toml",
+  # Run from impl/rust (not --manifest-path from the root) so cargo finds impl/rust/.cargo/config.toml
+  # and gives this DEBUG build's test threads the 8 MiB RUST_MIN_STACK; cargo reads config from the cwd.
+  "cd impl/rust && cargo test --bin conformance",
 ]
 
 # --- Unit suites --------------------------------------------------------------------------------
