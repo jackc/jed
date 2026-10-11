@@ -1157,6 +1157,11 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           `host function returned a value not matching its declared result type ${e.result}`,
         );
       }
+      // An integer must also fit the declared width: the "int" value is one bigint carrier for
+      // i16/i32/i64, so a kernel declared `-> i32` returning 2^40 matches the type above yet would
+      // leak an out-of-range i32 into comparisons / casts / key encodings. Trap 22003 here, on this
+      // row, exactly as a built-in's result-boundary check does.
+      if (out.kind === "int" && !inRange(e.result, out.int)) throw overflow(e.result);
       return out;
     }
     case "scalarFunc": {

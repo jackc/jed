@@ -715,3 +715,106 @@ test("exactly one of kernel and batchKernel is required", () => {
     "22023",
   );
 });
+
+// name(i64) -> result: f of its argument, unchecked — so the SQL picks the returned integer.
+function hostNarrow(
+  name: string,
+  result: HostFunctionSpec["result"],
+  f: (x: bigint) => bigint,
+): HostFunctionSpec {
+  return {
+    name,
+    argTypes: ["i64"],
+    result,
+    kernel: (args) => intValue(f(asInt(args[0]!))),
+    volatility: "immutable",
+  };
+}
+
+test("out-of-range integer result is 22003", () => {
+  // The "int" value carries every integer width, so a kernel declared `-> i32` can hand back 2^40:
+  // the kind matches, but the value does not fit. It is trapped 22003 at the call (spec/design/
+  // extensibility.md §4.2) — before the fix it surfaced as an "i32" 1099511627776, compared as one,
+  // and CAST to i64 silently kept it; only a column write's own range check caught it.
+  const id = (x: bigint) => x;
+  const s = dbExt(
+    regWith(
+      hostNarrow("host_i16", "i16", id),
+      hostNarrow("host_i32", "i32", id),
+      hostNarrow("host_i64", "i64", id),
+      // TS-only: the bigint carrier is unbounded, so even a declared i64 can be exceeded.
+      hostNarrow("host_i64_wide", "i64", (x) => x * 2n ** 32n),
+    ),
+    ["CREATE TABLE c (id i32 PRIMARY KEY, v i32)"],
+  );
+  // The declared width's boundaries are accepted; one past either end is 22003.
+  for (const [sql, want] of [
+    ["SELECT host_i16(32767)", 32767n],
+    ["SELECT host_i16(-32768)", -32768n],
+    ["SELECT host_i32(2147483647)", 2147483647n],
+    ["SELECT host_i32(-2147483648)", -2147483648n],
+    ["SELECT host_i64(9223372036854775807)", 9223372036854775807n],
+  ] as const) {
+    assert.equal(asInt(oneVal(s, sql)), want, sql);
+  }
+  for (const sql of [
+    "SELECT host_i16(32768)",
+    "SELECT host_i16(-32769)",
+    "SELECT host_i32(2147483648)",
+    "SELECT host_i32(-2147483649)",
+    "SELECT host_i64_wide(2147483648)",
+    // Formerly leaked: a comparison and a widening cast observed the out-of-range value.
+    "SELECT host_i32(1099511627776) > 5",
+    "SELECT CAST(host_i32(1099511627776) AS i64)",
+    // A write of it is the same 22003, and nothing is stored.
+    "INSERT INTO c SELECT 1, host_i32(1099511627776)",
+  ]) {
+    assert.equal(
+      errCodeOf(() => queryOutcome(s, sql)),
+      "22003",
+      sql,
+    );
+  }
+  // The error names the declared type (the built-in overflow shape).
+  const msg = runQ(s, "SELECT host_i32(1099511627776)");
+  assert.ok(
+    typeof msg === "string" && msg.endsWith("value out of range for type i32"),
+    String(msg),
+  );
+  assert.equal(rowsOf(s, "SELECT id FROM c").length, 0);
+});
+
+// host_scale(i64) -> i32 as a BATCH kernel returning x * 100_000_000 — in range for x <= 21, out of
+// range from x = 22. The kernel itself never fails; the engine's range check does. Its batch-of-one
+// reference is hostNarrow("host_scale", "i32", x * 100_000_000).
+const scaleBatched: HostFunctionSpec = {
+  name: "host_scale",
+  argTypes: ["i64"],
+  result: "i32",
+  batchKernel: (args, out) => {
+    for (const v of args[0]!) out.push(intValue(asInt(v) * 100_000_000n));
+  },
+  volatility: "immutable",
+};
+
+test("batch out-of-range raises at the scalar row", () => {
+  // A prefetched batch result is range-checked at replay, row by row, so the 22003 at a = 22 orders
+  // against other per-row errors exactly as the single-row kernel's does (§4.2.1): an earlier
+  // division by zero (id = 10) wins, a later one (id = 40) does not.
+  for (const [sql, want] of [
+    ["SELECT host_scale(a) FROM t", "22003"],
+    ["SELECT 1 / (id - 10), host_scale(a) FROM t", "22012"],
+    ["SELECT host_scale(a), 1 / (id - 10) FROM t", "22012"],
+    ["SELECT host_scale(a), 1 / (id - 40) FROM t", "22003"],
+    ["SELECT 1 / (id - 40), host_scale(a) FROM t", "22003"],
+  ] as const) {
+    const batched = batchDb(scaleBatched, 200);
+    const single = batchDb(
+      hostNarrow("host_scale", "i32", (x) => x * 100_000_000n),
+      200,
+    );
+    const got = runQ(batched, sql);
+    assert.ok(typeof got === "string" && got.startsWith(want), `${sql}: ${String(got)}`);
+    assert.deepEqual(got, runQ(single, sql), sql);
+  }
+});

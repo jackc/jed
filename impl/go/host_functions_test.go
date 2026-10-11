@@ -720,3 +720,92 @@ func TestHostZeroArgBatchKernelIsNeverPrefetched(t *testing.T) {
 		t.Fatalf("kernel called %d times, want 30", got)
 	}
 }
+
+// hostNarrow is name(i64) -> result: f of its argument, unchecked — so the SQL picks the returned
+// integer.
+func hostNarrow(name, result string, f func(int64) int64) *HostFunction {
+	return NewHostFunction(name, []string{"i64"}, result,
+		func(args []Value) (Value, error) {
+			return IntValue(f(args[0].Int)), nil
+		}).WithVolatility(VolatilityImmutable)
+}
+
+func TestOutOfRangeIntegerResultIs22003(t *testing.T) {
+	t.Parallel()
+	// ValInt carries every integer width, so a kernel declared `-> i32` can hand back 2^40: the kind
+	// matches, but the value does not fit. It is trapped 22003 at the call (spec/design/
+	// extensibility.md §4.2) — before the fix it surfaced as an "i32" 1099511627776, compared as one,
+	// and CAST to i64 silently kept it; only a column write's own range check caught it.
+	id := func(x int64) int64 { return x }
+	s := dbExt(t, regWith(t,
+		hostNarrow("host_i16", "i16", id),
+		hostNarrow("host_i32", "i32", id),
+		hostNarrow("host_i64", "i64", id)),
+		"CREATE TABLE c (id i32 PRIMARY KEY, v i32)")
+	// The declared width's boundaries are accepted; one past either end is 22003.
+	for sql, want := range map[string]int64{
+		"SELECT host_i16(32767)":               32767,
+		"SELECT host_i16(-32768)":              -32768,
+		"SELECT host_i32(2147483647)":          2147483647,
+		"SELECT host_i32(-2147483648)":         -2147483648,
+		"SELECT host_i64(9223372036854775807)": 9223372036854775807,
+	} {
+		if v := oneVal(t, s, sql); v.Int != want {
+			t.Fatalf("%s = %v, want %d", sql, v, want)
+		}
+	}
+	for _, sql := range []string{
+		"SELECT host_i16(32768)",
+		"SELECT host_i16(-32769)",
+		"SELECT host_i32(2147483648)",
+		"SELECT host_i32(-2147483649)",
+		// Formerly leaked: a comparison and a widening cast observed the out-of-range value.
+		"SELECT host_i32(1099511627776) > 5",
+		"SELECT CAST(host_i32(1099511627776) AS i64)",
+		// A write of it is the same 22003, and nothing is stored.
+		"INSERT INTO c SELECT 1, host_i32(1099511627776)",
+	} {
+		wantErr(t, s, sql, "22003")
+	}
+	// The error names the declared type (the built-in overflow shape).
+	if _, err := queryOutcome(s, "SELECT host_i32(1099511627776)", nil); err.(*EngineError).Message != "value out of range for type i32" {
+		t.Fatalf("message = %q", err.(*EngineError).Message)
+	}
+	if rows := hostRows(t, s, "SELECT id FROM c"); len(rows) != 0 {
+		t.Fatalf("c holds %v, want no rows", rows)
+	}
+}
+
+// scaleBatched is host_scale(i64) -> i32 as a BATCH kernel returning x * 100_000_000 — in range for
+// x <= 21, out of range from x = 22. The kernel itself never fails; the engine's range check does.
+// Its batch-of-one reference is hostNarrow("host_scale", "i32", x * 100_000_000).
+func scaleBatched() *HostFunction {
+	return NewHostBatchFunction("host_scale", []string{"i64"}, "i32",
+		func(args [][]Value, out []Value) ([]Value, error) {
+			for _, v := range args[0] {
+				out = append(out, IntValue(v.Int*100_000_000))
+			}
+			return out, nil
+		}).WithVolatility(VolatilityImmutable)
+}
+
+func TestHostBatchOutOfRangeRaisesAtTheScalarRow(t *testing.T) {
+	t.Parallel()
+	// A prefetched batch result is range-checked at replay, row by row, so the 22003 at a = 22 orders
+	// against other per-row errors exactly as the single-row kernel's does (§4.2.1): an earlier
+	// division by zero (id = 10) wins, a later one (id = 40) does not.
+	for _, c := range []struct{ sql, want string }{
+		{"SELECT host_scale(a) FROM t", "22003"},
+		{"SELECT 1 / (id - 10), host_scale(a) FROM t", "22012"},
+		{"SELECT host_scale(a), 1 / (id - 10) FROM t", "22012"},
+		{"SELECT host_scale(a), 1 / (id - 40) FROM t", "22003"},
+		{"SELECT 1 / (id - 40), host_scale(a) FROM t", "22003"},
+	} {
+		batched := batchDB(t, scaleBatched(), 200)
+		single := batchDB(t, hostNarrow("host_scale", "i32", func(x int64) int64 { return x * 100_000_000 }), 200)
+		b, r := batchRun(batched, c.sql), batchRun(single, c.sql)
+		if !strings.HasPrefix(b, "error "+c.want) || b != r {
+			t.Fatalf("%s:\nbatched %.200s\nsingle  %.200s", c.sql, b, r)
+		}
+	}
+}

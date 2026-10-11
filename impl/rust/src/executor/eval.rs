@@ -1679,6 +1679,15 @@ impl RExpr {
                         ),
                     ));
                 }
+                // An integer must also fit the declared width: `Value::Int` is one i64 carrier for
+                // i16/i32/i64, so a kernel declared `-> i32` returning 2^40 matches the type above
+                // yet would leak an out-of-range i32 into comparisons / casts / key encodings. Trap
+                // 22003 here, on this row, exactly as a built-in's result-boundary check does.
+                if let Value::Int(x) = out
+                    && !result.in_range(x)
+                {
+                    return Err(overflow(*result));
+                }
                 Ok(out)
             }
             RExpr::ScalarFunc { func, args, result } => {

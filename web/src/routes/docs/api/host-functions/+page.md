@@ -43,7 +43,8 @@ Two behaviors are guaranteed and free:
   never sees a NULL, so it can read its arguments as concrete typed values.
 - **Result-type checked.** A kernel that returns a value not matching its declared result type is
   caught (`22000`), so a misbehaving host function cannot leak a wrong-typed value into jed's strict
-  type system.
+  type system. An integer result must also fit its declared width: a function declared to return
+  `i32` that returns `2^40` raises `22003` (`value out of range for type i32`) on that row.
 
 ## Batch kernels
 

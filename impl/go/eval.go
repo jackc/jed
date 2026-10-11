@@ -2479,6 +2479,13 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if !valueMatchesResult(out, e.result) {
 			return Value{}, newError(DataException, "host function returned a value not matching its declared result type "+e.result.CanonicalName())
 		}
+		// An integer must also fit the declared width: ValInt is one int64 carrier for i16/i32/i64,
+		// so a kernel declared `-> i32` returning 2^40 matches the type above yet would leak an
+		// out-of-range i32 into comparisons / casts / key encodings. Trap 22003 here, on this row,
+		// exactly as a built-in's result-boundary check does.
+		if out.Kind == ValInt && !e.result.InRange(out.Int) {
+			return Value{}, overflowErr(e.result)
+		}
 		return out, nil
 	case reScalarFunc:
 		// One operator_eval per call (the uniform weight); arguments charge their own.

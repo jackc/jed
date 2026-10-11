@@ -318,6 +318,23 @@ must carry:
   - **cross-core-deterministic?** (default **no**) governs G2: an `immutable` function can *still* be
     non-cross-core (e.g. it calls the platform libm). Only a function declared *and harness-verified*
     cross-core-deterministic produces untainted results (§10).
+- **A checked result.** jed's strict type system is the engine's own invariant, so it does not take a
+  kernel's word for its result (CLAUDE.md §13 — the host owns its consequences, but jed's codecs,
+  comparators, and key encodings must never see a type violation). Every non-NULL result is checked
+  at the call, on the row that produced it, before anything consumes it:
+  - **wrong kind → `22000` `data_exception`**: the value's kind must match the declared result type
+    (a kernel declared `-> i64` that returns `text`).
+  - **integer out of the declared width → `22003` `numeric_value_out_of_range`**: one integer value
+    carries every width (Rust `Value::Int(i64)`, Go `ValInt`, TS `bigint`), so a kernel declared
+    `-> i32` returning `2^40` passes the kind check yet would otherwise surface as an "`i32`" holding
+    `1099511627776` — comparing as one, widening through `CAST … AS i64` unchanged, and reaching a
+    column write only to be caught by that site's own range check. It is trapped exactly like a
+    built-in's result boundary (`i16 + i16 → i16`, [functions.md](functions.md) §7): the message is
+    `value out of range for type <declared>`. TS's `bigint` carrier is unbounded, so there a declared
+    `i64` result is range-checked too; Rust/Go cannot represent one past `i64`.
+
+  Both checks run at replay, so a batched kernel's bad result raises at the same row, in the same
+  order against other per-row errors, as a single-row kernel's (§4.2.1).
 
 ### 4.2.1 The batched kernel ABI — column-in, column-out (✅ landed, all 3 cores)
 
@@ -349,8 +366,8 @@ processes rows in order and stops at the first row that fails, which is the row 
 have failed on. The engine defends its own invariants against a kernel that breaks the shape (all
 `22000`): a successful return with fewer results than rows raises at the first unanswered row; a
 return with more results than rows, or an error after answering every row, names no failing row and
-raises at the batch's first row. Each result is still checked against the declared type (`22000`, as
-for a single-row kernel).
+raises at the batch's first row. Each result is still checked against the declared type (`22000`
+wrong kind, `22003` integer out of the declared width — §4.2, as for a single-row kernel).
 
 **How the engine calls it — speculative batch, scalar replay.** Batching must not move the cost
 abort row, the error row, or any result (§4.2: "error ordering must be identical to scalar"). So the
@@ -846,7 +863,7 @@ cleanup, not a prerequisite. A suggested sequence:
    included); a separate `HostFunc`/`hostFunc` resolved node reached **by id** through the registry
    alongside the untouched built-in dispatch; built-ins win an exact-signature collision; `cost`
    (design (a) static weight) charged per call + guarded against the ceiling; wrong-typed kernel
-   results caught (`22000`); `42723` for a duplicate registration. **Since landed:** the
+   results caught (`22000`), and integer results outside the declared width (`22003`); `42723` for a duplicate registration. **Since landed:** the
    vectorized/batched kernel ABI (§4.2.1). **Deferred to later slices**: non-strict host functions, host
    functions over container args, and runtime *enforcement* of the `volatility`/`cross_core`
    declarations (recorded but not yet acted on — no host function is constant-folded, and there is no

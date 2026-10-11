@@ -846,3 +846,118 @@ fn zero_arg_batch_kernel_is_never_prefetched() {
     assert!(rows.iter().all(|r| r[1] == Value::Int(7)));
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 30);
 }
+
+/// `name(i64) -> result`: `f` of its argument, unchecked — so the SQL picks the returned integer.
+fn narrow(name: &str, result: ScalarType, f: fn(i64) -> i64) -> HostFunction {
+    HostFunction::new(
+        name,
+        vec![ScalarType::Int64],
+        result,
+        Box::new(move |args: &[Value]| -> jed::Result<Value> {
+            let Value::Int(x) = &args[0] else {
+                unreachable!("strict + resolved i64 arg")
+            };
+            Ok(Value::Int(f(*x)))
+        }),
+    )
+    .volatility(Volatility::Immutable)
+}
+
+#[test]
+fn out_of_range_integer_result_is_22003() {
+    // `Value::Int` carries every integer width, so a kernel declared `-> i32` can hand back 2^40: the
+    // kind matches, but the value does not fit. It is trapped 22003 at the call (spec/design/
+    // extensibility.md §4.2) — before the fix it surfaced as an "i32" 1099511627776, compared as one,
+    // and CAST to i64 silently kept it; only a column write's own range check caught it.
+    let mut db = db_with_ext(
+        registry(vec![
+            narrow("host_i16", ScalarType::Int16, |x| x),
+            narrow("host_i32", ScalarType::Int32, |x| x),
+            narrow("host_i64", ScalarType::Int64, |x| x),
+        ]),
+        &["CREATE TABLE c (id i32 PRIMARY KEY, v i32)"],
+    );
+    let code = |db: &mut Session, sql: &str| db.query_outcome(sql, &[]).unwrap_err().code();
+    // The declared width's boundaries are accepted; one past either end is 22003.
+    assert_eq!(one(&mut db, "SELECT host_i16(32767)"), Value::Int(32767));
+    assert_eq!(one(&mut db, "SELECT host_i16(-32768)"), Value::Int(-32768));
+    assert_eq!(code(&mut db, "SELECT host_i16(32768)"), "22003");
+    assert_eq!(code(&mut db, "SELECT host_i16(-32769)"), "22003");
+    assert_eq!(
+        one(&mut db, "SELECT host_i32(2147483647)"),
+        Value::Int(2147483647)
+    );
+    assert_eq!(
+        one(&mut db, "SELECT host_i32(-2147483648)"),
+        Value::Int(-2147483648)
+    );
+    assert_eq!(code(&mut db, "SELECT host_i32(2147483648)"), "22003");
+    assert_eq!(code(&mut db, "SELECT host_i32(-2147483649)"), "22003");
+    assert_eq!(
+        one(&mut db, "SELECT host_i64(9223372036854775807)"),
+        Value::Int(i64::MAX)
+    );
+    // Formerly leaked: a comparison and a widening cast observed the out-of-range value.
+    assert_eq!(code(&mut db, "SELECT host_i32(1099511627776) > 5"), "22003");
+    assert_eq!(
+        code(&mut db, "SELECT CAST(host_i32(1099511627776) AS i64)"),
+        "22003"
+    );
+    // The error names the declared type (the built-in overflow shape).
+    let err = db
+        .query_outcome("SELECT host_i32(1099511627776)", &[])
+        .unwrap_err();
+    assert_eq!(err.message, "value out of range for type i32");
+    // A write of it is the same 22003, and nothing is stored.
+    assert_eq!(
+        code(&mut db, "INSERT INTO c SELECT 1, host_i32(1099511627776)"),
+        "22003"
+    );
+    assert!(query(&mut db, "SELECT id FROM c").is_empty());
+}
+
+/// `host_scale(i64) -> i32` as a BATCH kernel returning `x * 100_000_000` — in range for x <= 21,
+/// out of range from x = 22. The kernel itself never fails; the engine's range check does. Its
+/// batch-of-one reference is `narrow("host_scale", Int32, |x| x * 100_000_000)`.
+fn scale_batched() -> HostFunction {
+    HostFunction::batched(
+        "host_scale",
+        vec![ScalarType::Int64],
+        ScalarType::Int32,
+        Box::new(
+            |args: &[Vec<Value>], out: &mut Vec<Value>| -> jed::Result<()> {
+                for v in &args[0] {
+                    let Value::Int(x) = v else {
+                        unreachable!("strict + resolved i64 arg")
+                    };
+                    out.push(Value::Int(x * 100_000_000));
+                }
+                Ok(())
+            },
+        ),
+    )
+    .volatility(Volatility::Immutable)
+}
+
+#[test]
+fn batch_out_of_range_raises_at_the_scalar_row() {
+    // A prefetched batch result is range-checked at replay, row by row, so the 22003 at a = 22
+    // orders against other per-row errors exactly as the single-row kernel's does (§4.2.1): an
+    // earlier division by zero (id = 10) wins, a later one (id = 40) does not.
+    for (sql, want) in [
+        ("SELECT host_scale(a) FROM t", "22003"),
+        ("SELECT 1 / (id - 10), host_scale(a) FROM t", "22012"),
+        ("SELECT host_scale(a), 1 / (id - 10) FROM t", "22012"),
+        ("SELECT host_scale(a), 1 / (id - 40) FROM t", "22003"),
+        ("SELECT 1 / (id - 40), host_scale(a) FROM t", "22003"),
+    ] {
+        let mut batched = batch_db(scale_batched(), 200);
+        let mut single = batch_db(
+            narrow("host_scale", ScalarType::Int32, |x| x * 100_000_000),
+            200,
+        );
+        let got = run(&mut batched, sql);
+        assert_eq!(got.as_ref().unwrap_err()[..5], *want, "{sql}");
+        assert_eq!(got, run(&mut single, sql), "{sql}");
+    }
+}
