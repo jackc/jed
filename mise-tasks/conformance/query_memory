@@ -17,54 +17,23 @@
 # carries main's committed storage bytes after the record, so the same comparison checks that the
 # cores allocate and compact pages identically — the basis of the 54P06 limit (memory.md §8.4).
 
-require "set"
 require "tmpdir"
 require_relative "../../scripts/lib/tasks"
+require_relative "../../scripts/lib/query_memory_peaks"
 include Tasks
 
-# Corpus files that open a pre-built `# fixture:` image. The Go harness opens the image as a file and
-# the Rust and TS harnesses load it in memory, and the two backings measure committed storage
-# differently (memory.md §8.2 vs §8.7), so only their peaks are compared.
-FIXTURE_FILES = Dir[File.join(ROOT, "spec/conformance/suites/**/*.test")].filter_map do |path|
-  path.delete_prefix(File.join(ROOT, "spec/conformance/suites/")) if File.read(path).match?(/^# fixture:/)
-end.to_set.freeze
-
-# Compare the per-record peaks the three runners wrote for one storage mode: each line is
-# file<TAB>record-ordinal<TAB>peak<TAB>main-storage-bytes. A record a core did not run (a capability
-# skip) is compared only among the cores that ran it.
-def peak_mismatches(mode, paths)
-  tables = paths.transform_values do |path|
-    next {} unless File.exist?(path)
-
-    File.readlines(path, chomp: true).to_h do |line|
-      file, ordinal, peak, storage = line.split("\t")
-      measured = FIXTURE_FILES.include?(file) ? "peak=#{peak}" : "peak=#{peak} storage=#{storage}"
-      [[file, ordinal.to_i], measured]
-    end
-  end
-  tables.values.flat_map(&:keys).uniq.sort.filter_map do |key|
-    seen = tables.filter_map { |core, table| [core, table[key]] if table.key?(key) }.to_h
-    next if seen.values.uniq.size <= 1
-
-    "#{mode} #{key[0]} record #{key[1]}: " + seen.map { |core, peak| "#{core}: #{peak}" }.join("; ")
-  end
-end
-
-env = { "JED_CONFORMANCE_QUERY_MEMORY" => ENV["usage_bytes"] || "1099511627776" }
+env = { "JED_CONFORMANCE_QUERY_MEMORY" => ENV["usage_bytes"] || QueryMemoryPeaks::DEFAULT_BUDGET }
 env["JED_CONFORMANCE_FILTER"] = ENV["usage_filter"] if ENV["usage_filter"]
 Dir.mktmpdir("jed-query-memory-peaks") do |dir|
   mismatches = []
-  # The third pass forces every spill-capable structure on disk to spill (work_mem 256), so the
-  # spill transitions' releases are cross-checked too (memory.md §6.6).
-  { "memory" => {}, "disk" => {}, "disk-spill" => { "JED_CONFORMANCE_WORK_MEM" => "256" } }.each do |mode, mode_env|
-    extra = mode.start_with?("disk") ? ["disk"] : []
+  QueryMemoryPeaks::MODES.each do |mode, (extra, mode_env)|
     peaks = %w[rust go ts].to_h { |core| [core, File.join(dir, "#{mode}-#{core}.tsv")] }
     peak_env = ->(core) { env.merge(mode_env, "JED_CONFORMANCE_QUERY_MEMORY_PEAKS" => peaks[core]) }
     sh "cargo", "run", "--release", "--quiet", "--bin", "conformance", "--manifest-path", RUST_MANIFEST, "--", *extra,
        env: peak_env.("rust")
     sh "go", "run", "./cmd/conformance", *extra, env: peak_env.("go"), chdir: GO_DIR
     sh "node", "src/bin/conformance.ts", *extra, env: peak_env.("ts"), chdir: TS_DIR
-    mismatches.concat(peak_mismatches(mode, peaks))
+    mismatches.concat(QueryMemoryPeaks.mismatches(mode, peaks))
   end
   unless mismatches.empty?
     warn mismatches.first(50).join("\n")

@@ -95,16 +95,18 @@ run = [{ task = "test" }]
 description = "Full merge gate: spec verification, formatting, lint, tests, real-process locking, metamorphic sweep"
 # A SUPERSET of `test`: adds spec-data + byte-fixture verification + codegen drift (`verify`), the
 # formatter gate (`fmt`), the TS linter (`lint`), the downstream web type check (`web:check`), the
-# Rust corpus walk with debug assertions + overflow checks (`conformance:rust:checked`), the
-# real-process shared-file corpus, and generative differential testing — the NoREC/TLP metamorphic
-# sweep + the reducer self-test.
+# Rust corpus walks with debug assertions + overflow checks (the `conformance:rust:checked` walks),
+# the real-process shared-file corpus, and generative differential testing — the NoREC/TLP
+# metamorphic sweep + the reducer self-test. The checked walks come from setting
+# JED_CONFORMANCE_CHECKED, which is `conformance:all --checked`: they join the walks `test` already
+# runs concurrently, instead of following them.
+env = { JED_CONFORMANCE_CHECKED = "1" }
 run = [
   { task = "verify" },
   { task = "fmt" },
   { task = "lint" },
   { task = "web:check" },
   { task = "test" },
-  { task = "conformance:rust:checked" },
   { task = "concurrency:process" },
   { task = "corpus:norec_sweep" },
   { task = "corpus:reduce_selftest" },
@@ -114,9 +116,7 @@ run = [
 description = "Engine test suites: conformance corpus (x3 cores; plain, forced-spill, query-memory) + unit + CLI + gem + migrate"
 # Example-based correctness against authored expectations — the inner dev loop.
 run = [
-  { task = "conformance" },
-  { task = "conformance:spill" },
-  { task = "conformance:query_memory" },
+  { task = "conformance:all" },
   { task = "unit" },
   { task = "cli:test" },
   { task = "ruby:test" },

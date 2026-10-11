@@ -435,6 +435,15 @@ capabilities are all satisfied (skipping the rest), executes each record, and co
 output under the rules above. Reporting a profile = checking that every test gated by that
 profile's capabilities passes. All three cores (Rust, Go, TS) ship this harness today.
 
+One run of a core's harness over the corpus in one configuration (storage mode plus harness
+settings) is a **walk**. `mise run test` and `mise run ci` do not invoke `conformance`,
+`conformance:spill`, `conformance:query_memory`, and `conformance:rust:checked` one after another;
+they run `mise run conformance:all [--checked] [filter]`, which builds each runner once and runs all
+of those walks concurrently (they are independent single-threaded processes), buffering each walk's
+output and reporting in a fixed order. It then applies the query-memory peak comparison above. `ci`
+passes `--checked` through `JED_CONFORMANCE_CHECKED`; `JED_CONFORMANCE_JOBS` caps concurrency (1 runs
+the walks serially). The individual tasks remain for running one family alone.
+
 ## 7. Open / deferred
 
 - **Result-type assertions** — ✅ **resolved**: the `# types:` directive (§1) asserts each result
