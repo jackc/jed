@@ -670,6 +670,175 @@ that bear on sound reopen are what a `HostFunction` carries and what an index de
 Both are what the index dependency list (§8.1) stores and what the reopen check (§11) compares
 against. Host *types* (§4.3, later) extend this to the full tuple in the persisted type catalog (§6).
 
+### 7.1 Host functions in table definitions — `DEFAULT` and `CHECK` (designed, §14 step 4b)
+
+> **Status: designed, not built.** This closes the §14 step-4 deferral. Generated columns are **out of
+> scope**: jed has no `GENERATED ALWAYS AS (expr) STORED` (only `GENERATED … AS IDENTITY`), so
+> there is nothing to extend. A future stored generated column would take the **index** rule (§8.1),
+> not this one. Its stored value is derived from the function the way an index key is, so a changed
+> implementation would leave stored values stale.
+
+**The gap this closes.** This is not a missing feature: a host function in a `DEFAULT` or `CHECK` is
+**accepted today, unchecked**. The `DEFAULT`/`CHECK` expression is persisted as text and re-resolved
+for every write statement ([constraints.md](constraints.md) §2/§4.5), and resolution finds a host
+function by name like any other call. Nothing records which implementation the definition was made
+against. The consequences were observed in the Go core; Rust and TS share the same per-statement
+resolve shape:
+
+- `CREATE TABLE t (b i64 DEFAULT f(5), CHECK (g(a) < 100))` is accepted with a **volatile,
+  unversioned** `g`. No dependency is persisted.
+- Reopened with `g` **missing**: reads and `DELETE` work; every `INSERT`/`UPDATE` is `42883`. That
+  includes an `INSERT` that supplies every column and so never applies the `DEFAULT`, because
+  defaults are resolved eagerly for the whole table.
+- Reopened with a **changed** `g`: no error. An existing row can now falsify its own `CHECK`, so an
+  unrelated `UPDATE t SET b = 1` on it traps `23514`, and new rows are judged by a rule the stored
+  rows were never checked against.
+
+This is the same defect class step 4 fixed for indexes (`42P17`): the engine never gated the use and
+never noticed the swap.
+
+**Why `DEFAULT` and `CHECK` get different rules.** They have opposite relationships to stored data:
+
+- A `DEFAULT` is evaluated **once, at write time**. The value it produces is ordinary stored data
+  with no lasting tie to the function. A changed implementation affects only future rows, and that
+  is the intended meaning of replacing a default function. PostgreSQL's `CREATE OR REPLACE
+  FUNCTION` behaves the same way.
+- A `CHECK` is a **standing claim about every stored row**. A changed implementation silently
+  invalidates that claim for rows already written. This is the stale-index problem without the
+  index.
+
+#### 7.1.1 `DEFAULT`
+
+- **Admission: unchanged.** Any registered host function, of any volatility, with or without a
+  component identity, may appear in a `DEFAULT` (`CREATE TABLE`, `ALTER COLUMN … SET DEFAULT`,
+  `ADD COLUMN … DEFAULT`). This matches the built-in rule: `DEFAULT uuidv7()` and `nextval` are
+  admitted.
+- **Nothing new is persisted.** There is no dependency list and no format change for defaults. A
+  version pin would buy no soundness: no stored value goes stale when the function changes. It
+  would also cost real friction, because every host upgrade that bumped `semantic_version` would
+  make the table unwritable until each default was re-stamped.
+- **Resolve a default only where it can be applied.** This narrows today's eager resolution. A write
+  statement resolves the default of exactly the columns it can default:
+  - `INSERT`: the columns omitted from its target list, the columns of any `DEFAULT` slot, and every
+    column of `DEFAULT VALUES`. All are static facts of the statement text.
+  - `UPDATE … SET x = DEFAULT`: the assigned columns.
+  - The child columns of a foreign-key `ON DELETE`/`ON UPDATE SET DEFAULT` action the statement can
+    fire.
+  - `ALTER TABLE … ADD COLUMN`: the backfill.
+
+  A missing function is therefore `42883` only for statements that would call it. An `INSERT` that
+  supplies the column, a `SELECT`, and a `DELETE` with no `SET DEFAULT` action are unaffected. This
+  is the §11 graded-verdict principle (contain the blast radius to what actually needs the code),
+  applied to the simplest dependent object.
+
+#### 7.1.2 `CHECK`
+
+- **Admission.** Every host function a `CHECK` calls must declare a **`component_id`** (§7);
+  otherwise `42P17`: `host function <f> used in a check constraint must declare a component
+  identity`. As for indexes, `semantic_version` defaults to `0`. This applies at `CREATE TABLE`
+  (column-level and table-level) and at `ALTER TABLE … ADD CONSTRAINT … CHECK`. A function missing
+  at definition time remains `42883`.
+- **No volatility gate.** This differs from §8.1, which requires `IMMUTABLE`. jed's built-in rule
+  for `CHECK` is PostgreSQL's: `CHECK (ts < now())` is admitted, and nothing in the engine (no
+  planner rule, no stored key) relies on a check being immutable. An index's correctness depends on
+  immutability; a check's does not. The version pin is what makes the check legible across opens,
+  and it is required regardless of volatility. A non-immutable or non-cross-core host check is the
+  host's call and the host's consequence (CLAUDE.md §13, the host-extension boundary).
+- **Persisted dependency list.** At admission the engine collects one dependency per **distinct host
+  signature** reachable anywhere in the expression: `(name, arg types, result, component_id,
+  semantic_version)`. It walks through casts, `CASE`, and function arguments, deduplicates, and
+  sorts exactly as §8.1 does, then persists the list with the check (format below).
+- **Verification on use.** Whenever a statement resolves a table's checks **in order to evaluate
+  them**, it verifies each check's resolved host calls against that check's persisted list, using
+  the same comparison as the index path. A call whose current registration has a different
+  `component_id` or `semantic_version`, or that now resolves to a signature not in the list, is
+  `XX002`: `check constraint <c> depends on host function <f> whose registered component/version no
+  longer matches the file; the constraint must be re-added`. A function absent from the registry is
+  `42883` from resolution itself. Both are raised **before any mutation**. Unlike a stale index,
+  there is no read-side fallback to take: reads never evaluate a check, so a stale check costs
+  reads nothing.
+  - **Statements that evaluate checks**, and so are refused:
+    - every `INSERT` (including `ON CONFLICT … DO UPDATE`) and `UPDATE` of the table;
+    - a foreign-key action that updates a child row of the table (`SET NULL`, `SET DEFAULT`,
+      `ON UPDATE CASCADE`);
+    - an `ALTER TABLE` form that re-validates existing checks (`ADD COLUMN`, `ALTER COLUMN …
+      TYPE`, and any other rewrite that §4 of [alter.md](alter.md) validates against the end state).
+  - **Statements that do not evaluate checks** must not resolve them, so they proceed: `SELECT`,
+    `DELETE` (including `ON DELETE CASCADE` deletes of child rows), `DROP CONSTRAINT`, `RENAME`,
+    and `DROP TABLE`.
+- **Rebuilding a stale check.** Use the one-statement, all-or-nothing ALTER frame:
+
+  ```sql
+  ALTER TABLE t DROP CONSTRAINT valid_sku, ADD CONSTRAINT valid_sku CHECK (valid_sku(sku));
+  ```
+
+  The `DROP` removes the stale check without resolving it. The `ADD` validates **every existing
+  row** against the *current* implementation (`23514` names the first row the new rule rejects, in
+  which case nothing changes) and persists the current dependency list. This is the index recipe
+  ([index-dependencies.md](index-dependencies.md) *Rebuilding*), and it needs no `REINDEX`-style
+  convenience. jed has no `NOT VALID` / `VALIDATE CONSTRAINT`; if that surface lands later, its
+  `VALIDATE` would re-stamp in place.
+- **Re-resolution under a changed table.** `ALTER COLUMN … TYPE` re-resolves surviving checks
+  against the new column types, which can select a different host overload. It first verifies the
+  persisted list (`XX002` if stale), then **re-collects** the list from the new resolution. That is
+  sound because the same statement re-validates every row with the newly selected implementation.
+  `RENAME COLUMN` only re-renders the text, so the list carries over unchanged. A form that copies a
+  check copies its list.
+
+#### 7.1.3 Format (`format_version` 35)
+
+Every `CHECK` entry in the table catalog gains a trailing flags byte, after `check_expr`:
+
+| field | encoding |
+|---|---|
+| `check_flags` | u8: bit0 `has_host_deps`; bits 1–7 reserved and written 0 (a set reserved bit is `XX001`) |
+| `host_deps` | present only when bit0 is set: the v31 dependency list, byte-for-byte the per-index encoding in [format.md](../fileformat/format.md) (`u16 dep_count`, then per dependency `name` ‖ `u16 arg_count` ‖ arg type codes ‖ result type code ‖ `component_id` ‖ `u32 semantic_version`, in ascending `(name, arg-type codes)` order) |
+
+A flags byte rather than a bare optional list leaves room for later per-check dependencies, such as
+the timezone pins of [index-dependencies.md](index-dependencies.md) if a stricter `CHECK` admission
+is ever adopted. The byte is written even for a check with no host calls, so every golden with a
+`CHECK` changes. Under the exact-version clean break, readers accept only v35, and no file with an
+unrecorded host check survives into v35. Column entries are unchanged, since `DEFAULT` persists
+nothing new.
+
+#### 7.1.4 Determinism, ordering, cost
+
+- **Error precedence within a write statement** is the existing resolution order, which all three
+  cores already share: the table's checks resolve before its defaults. So a statement that both hits
+  a stale check (`XX002`) or a missing check function (`42883`) and needs a missing default function
+  reports the **check** error. Checks verify in evaluation (lowercased-name) order and defaults in
+  column-ordinal order, so the first failure is deterministic.
+- **Cost.** Dependency collection and verification are resolution-time work and are unmetered, as
+  in §8.1. Evaluation cost is unchanged: a host call charges its declared `cost` per call (§9).
+  `CHECK` and `DEFAULT` evaluation stays batch-of-one; batching `INSERT … VALUES` is the separate
+  §4.2.1 follow-on.
+- **Privileges** are unchanged ([session.md](session.md) §5.3).
+- **Temporary tables and attached databases** take the same rules. A temp table's list never
+  outlives the handle, but a uniform admission rule is simpler than a scoped exception, and an
+  attached file written under another registry is exactly the case the list exists for.
+- **Introspection.** `jed_constraints` is unchanged; exposing the dependency list there is a
+  follow-on.
+
+#### 7.1.5 Verification
+
+None of this is reachable from the SQL corpus, which registers no host code. It is tested per core,
+mirrored one-for-one in Rust/Go/TS, as host-API surface (CLAUDE.md §10). The tests cover:
+
+- `42P17` for an unversioned host function in each `CHECK` position, and admission of a volatile
+  versioned one;
+- reopen with the function missing, then changed (component and version separately): writes
+  `42883`/`XX002` before mutation; `SELECT`, `DELETE`, and `ON DELETE CASCADE` still work;
+- the FK `SET NULL`/`SET DEFAULT` child path;
+- the one-statement drop/add rebuild, including its `23514` rollback;
+- `ALTER COLUMN … TYPE` re-collection;
+- lazy default resolution (an `INSERT` supplying the column succeeds with the default's function
+  missing; omitting it is `42883`);
+- check-before-default error precedence.
+
+Byte coverage adds a `hostfunc_check_table.jed` golden beside `hostfunc_index_table.jed` (all three
+cores plus `spec/fileformat/verify.rb`), and the regenerated goldens pick up the `check_flags` byte.
+There is no new error code: `42P17`, `42883`, and `XX002` are all registered.
+
 ---
 
 ## 8. The index connection — two distinct problems
@@ -939,10 +1108,12 @@ cleanup, not a prerequisite. A suggested sequence:
    host-function dependency list; the per-statement re-resolution re-checks it (read → skip index /
    heap scan; write → `XX002`/`42883`, read-only). Also closed the latent volatile-host-function leak
    (`42P17`). Reused `XX002` for the reopen verdict (the minimal per-object §11 verdict for indexes;
-   the full compatibility.md manifest stays step 5). **Deferred:** host functions in `DEFAULT` / `CHECK`
-   / generated columns (lower-risk — they produce no stored keys).
+   the full compatibility.md manifest stays step 5).
+   - **4b. Host functions in `DEFAULT` / `CHECK`** (§7.1) — **designed, not built.** A `CHECK`
+     persists a per-check dependency list (`format_version` 35) and refuses writes on mismatch; a
+     `DEFAULT` persists nothing and resolves lazily. Generated columns are out of scope: jed has none.
 5. **Opaque host scalar *types*** (Storable/Equatable/Ordered) + **derived `array<host-type>`** (§3.1,
-   §4.3, `type_code 21`, `format_version` 32 — 31 was taken by step 4) + the **graded reopen verdict**
+   §4.3, `type_code 21`, the next free `format_version`; 31–35 are taken) + the **graded reopen verdict**
    (§11, extended from the step-4 index-only form to all object kinds).
 6. **Keyable** host scalar types (order-preserving encoder + the invariant harness, §3.2/§12).
 7. **Host GIN/GiST opclasses** (§8.2) behind the unified seam.
@@ -966,7 +1137,9 @@ When a section here is ratified, update **in the same change** (mirrors [determi
   `CREATE FUNCTION … LANGUAGE HOST` / `CREATE TYPE … AS HOST`).
 - **[../fileformat/format.md](../fileformat/format.md)** — the per-index **host-function dependency
   list** (`index_flags` bit2 + the dep tuple) at **`format_version 31`** (✅ done, §14 step 4); the
-  `type_code = 21` host-type catalog + opaque-framed body come later at `format_version 32` (§14 step 5).
+  per-check dependency list (`check_flags` bit0) at **`format_version 35`** (§7.1, designed — step 4b);
+  the `type_code = 21` host-type catalog + opaque-framed body come later at the next free
+  `format_version` (§14 step 5).
 - **[../functions/catalog.toml](../functions/catalog.toml)** — confirm the runtime function registry
   reuses the entry shape; the `cost` field is already live.
 - **[../errors/registry.toml](../errors/registry.toml)** — `42723` duplicate_function (identical
@@ -996,8 +1169,8 @@ When a section here is ratified, update **in the same change** (mirrors [determi
 | §4.2 | Host scalar functions (registry, signature overloads, vectorized, cost, volatility) | **landed** (all 3 cores): registry + resolve + eval seam, exact-signature overloading, cost charged/gated, strict, wrong-type-caught, 42723 (§14 step 3); **plus** `component_id`/`semantic_version` + index-backing (§14 step 4); **plus** the batched column-in/column-out kernel ABI (§4.2.1), batched at the buffered projection, the streaming primary-key scan (projection + `WHERE`), and the streaming sort/spool emission. Non-strict, container args, cross-core *taint enforcement*, and batching at the remaining sites still deferred |
 | §4.3 | Host scalar types (Storable→Indexed ladder, `type_code 21`, opaque) | **proposed** |
 | §5 | Dispatch — registry the many, inline the few (§5.1 splits the **seam** from the **dogfood**; function seam first) | **built** for built-in scalar functions + aggregates *and* the **host function injection seam** (§14 step 3, all 3 cores): a host kernel is reached by id through the frozen registry alongside the inlined built-in arms. Type-vtable depth (Fork A) + the type-method seam (step 5) **proposed** |
-| §6 | Persisted host-type catalog + on-disk representation (`type_code 21`, `format_version 32`) | **proposed** (the per-index host-dep list of step 4 landed at `format_version 31`) |
-| §7 | Registration — **Model B (registry-only, no SQL DDL)**; lean `component_id` + `semantic_version` | **landed for functions** (§14 step 4, all 3 cores); the full 5-field tuple + host-type catalog **proposed** |
+| §6 | Persisted host-type catalog + on-disk representation (`type_code 21`, next free `format_version`) | **proposed** (the per-index host-dep list of step 4 landed at `format_version 31`) |
+| §7 | Registration — **Model B (registry-only, no SQL DDL)**; lean `component_id` + `semantic_version` | **landed for functions** (§14 step 4, all 3 cores); §7.1 host functions in `DEFAULT`/`CHECK` **designed** (step 4b, `format_version 35`); the full 5-field tuple + host-type catalog **proposed** |
 | §8 | The index connection — expression indexes (resolved-dependency persistence) + opclass registry | **§8.1 landed** (all 3 cores, `format_version 31`, §14 step 4); §8.2 opclass registry **proposed** |
 | §9 | Cost — cooperative accounting + admission, **not** a sandbox | **proposed** (adopts [cost.md](cost.md) §6) |
 | §10 | Determinism ledger + containment for host code | **proposed** (extends [determinism.md](determinism.md)) |
