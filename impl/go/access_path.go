@@ -2153,7 +2153,11 @@ func rexprEqShifted(a, b *rExpr, offset int) bool {
 	case reCompare:
 		// A comparison (status = 'active', amt > 0) is the canonical partial-index predicate shape
 		// (indexes.md §9): same operator + same derived collation + structurally-equal operands.
-		return a.op == b.op && collationsEqual(a.collation, b.collation) &&
+		// `=`/`<>` are byte identity under every collation (collation.md §7), so their collation
+		// never changes the value — only an ordering comparison must agree on it (a persisted index
+		// expression derives by the storage rule, §1 "Function results").
+		return a.op == b.op &&
+			(a.op == opEq || a.op == opNe || collationsEqual(a.collation, b.collation)) &&
 			rexprEqShifted(a.lhs, b.lhs, offset) && rexprEqShifted(a.rhs, b.rhs, offset)
 	case reAnd, reOr:
 		return rexprEqShifted(a.lhs, b.lhs, offset) && rexprEqShifted(a.rhs, b.rhs, offset)
@@ -2233,12 +2237,17 @@ func asBoundTerm(e *rExpr, key keyMatch, pkType scalarType, colColl string, sibl
 	// unicode column, COLLATE "de" over unicode — does NOT match: its order disagrees with the
 	// stored keys, so it stays a full scan + residual filter. (A *skewed* collated key never reaches
 	// here — keyCollationCtx refuses the whole bound, §12.) The probe is then encoded in the key
-	// column's form (sort key for a Full-collated column — buildKeyBound/indexBoundRows).
+	// column's form (sort key for a Full-collated column — buildKeyBound/indexBoundRows). One
+	// exception: an EQUALITY on an expression key bounds under any comparison collation (one that
+	// reaches here is C-keyed — a collated expression key stops the prefix first), since every
+	// deterministic collation's `=` is byte identity (§7) — so lower(email) = $1 still seeks when
+	// email is collated and the comparison inherits that collation through lower (§1 "Function
+	// results").
 	cmpColl := ""
 	if e.collation != nil {
 		cmpColl = e.collation.Name
 	}
-	if cmpColl != colColl {
+	if cmpColl != colColl && !(e.op == opEq && key.expr != nil) {
 		return boundTerm{}, false
 	}
 	switch e.op {

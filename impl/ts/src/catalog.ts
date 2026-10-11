@@ -58,6 +58,11 @@ export type Column = {
   // neighbour's collation, where a catalog column (absent/false) is implicitly `collation` (C if
   // null). A body output's implicit or explicit collation rides `collation` instead. Never persisted.
   noCollation?: boolean;
+  // collationConflict marks a SYNTHETIC relation's text column whose body output settled to NO
+  // determinable collation (a UNION ALL / VALUES column over conflicting implicit collations, or an
+  // indeterminate body expression — spec/design/collation.md §1): it yields to any neighbour's
+  // collation, but consuming it alone (a bare ORDER BY) is 42P22. Never persisted.
+  collationConflict?: boolean;
 };
 
 // IdentityKind is the kind of an IDENTITY column (spec/design/sequences.md §13). "always"

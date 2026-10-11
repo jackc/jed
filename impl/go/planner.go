@@ -1288,7 +1288,7 @@ func joinGroupOutputs(s *scope, projections *[]*rExpr, names *[]string, types *[
 	}
 	for _, pr := range *projections {
 		c := s.columnAt(pr.index)
-		group.columns = append(group.columns, catColumn{Name: c.Name, Type: c.Type, Collation: c.Collation, NoCollation: c.NoCollation})
+		group.columns = append(group.columns, catColumn{Name: c.Name, Type: c.Type, Collation: c.Collation, NoCollation: c.NoCollation, CollationConflict: c.CollationConflict})
 	}
 	for _, r := range s.rels {
 		if r.label == "" {

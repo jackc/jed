@@ -4990,19 +4990,26 @@ pub(crate) fn resolve_collation_name(
 /// `Implicit(name)` ⇒ a column's frozen collation (`C` is a *distinct* implicit collation, so
 /// `C`-vs-`en-US` conflicts — PG-matching). `Explicit(name)` ⇒ an explicit `COLLATE`.
 /// `Indeterminate` ⇒ two different implicit collations met with no explicit override — an error only
-/// when the collation is consumed (42P22, at `resolve_deriv`).
+/// when the collation is consumed (42P22, at `resolve_deriv`); it dominates an implicit neighbour.
+/// `Conflicted` ⇒ a collatable column whose inputs settled to NO collation (PostgreSQL's InvalidOid —
+/// a UNION ALL / VALUES column over conflicting implicit collations, or a derived column over an
+/// indeterminate body output): it yields to any neighbour, but consuming it alone is 42P22.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum Deriv {
     None,
     Implicit(String),
     Explicit(String),
     Indeterminate,
+    Conflicted,
 }
 
 /// Derive the collation + derivation level of a (text) expression subtree (spec/design/collation.md
 /// §1). A `COLLATE` is explicit; a column reference is implicit (its frozen collation, `C` if none);
-/// `||` combines its operands. Every other shape (literal, cast, function, CASE) resets to `None`
-/// (no collation — takes a neighbour's), a documented narrowing (collation.md §14).
+/// `||` combines its operands; a scalar function whose catalog result is `text` combines its
+/// arguments (PostgreSQL's rule — a collatable result inherits its collatable inputs' collation;
+/// [`function_result_collatable`]). Every other shape (literal, cast, CASE, aggregate) resets to
+/// `None` (no collation — takes a neighbour's), a documented narrowing (collation.md §14). A
+/// persisted index expression's scope (`storage_collation`) keeps the pre-function rule.
 pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
     Ok(match e {
         Expr::Collate { collation, .. } => Deriv::Explicit(collation.clone()),
@@ -5015,7 +5022,67 @@ pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
             lhs,
             rhs,
         } => combine_deriv(derive_collation(scope, lhs)?, derive_collation(scope, rhs)?)?,
+        Expr::FuncCall {
+            name,
+            args,
+            star: false,
+            filter: None,
+            over: None,
+            over_name: None,
+            within_group: None,
+            ..
+        } if !scope.storage_collation && function_result_collatable(name) => {
+            let mut d = Deriv::None;
+            for a in args {
+                d = combine_deriv(d, derive_collation(scope, a)?)?;
+            }
+            d
+        }
         _ => Deriv::None,
+    })
+}
+
+/// Whether a scalar function's result carries its arguments' collation (spec/design/collation.md §1
+/// "Function results"): read from the shared function catalog — any `kind = "function"` overload
+/// whose `result` is `text`. A non-text argument derives no collation, so an overload taking only
+/// non-text arguments (the range `lower`/`upper`) contributes nothing.
+fn function_result_collatable(name: &str) -> bool {
+    crate::operators::OPERATORS
+        .iter()
+        .any(|o| o.kind == "function" && o.result == "text" && o.name.eq_ignore_ascii_case(name))
+}
+
+/// The common collation of one set-operation / VALUES output column (spec/design/collation.md §1
+/// "Set operations", PostgreSQL's `select_common_collation`): the inputs combine like an operator's
+/// operands (two different explicit collations are 42P21). Two different implicit collations — or an
+/// indeterminate input — conflict: `none_ok` (UNION ALL, VALUES) settles the column to `Conflicted`,
+/// otherwise it is 42P21 now. An explicit result becomes the column's IMPLICIT collation (a
+/// reference to the output column is a plain column reference).
+pub(crate) fn common_collation(inputs: &[Deriv], none_ok: bool) -> Result<Deriv> {
+    let mut d = Deriv::None;
+    for x in inputs {
+        d = combine_deriv(d, x.clone())?;
+    }
+    Ok(match d {
+        Deriv::Explicit(name) => Deriv::Implicit(name),
+        Deriv::Indeterminate if none_ok => Deriv::Conflicted,
+        Deriv::Indeterminate => {
+            let names: Vec<&str> = inputs
+                .iter()
+                .filter_map(|x| match x {
+                    Deriv::Implicit(n) => Some(n.as_str()),
+                    _ => Option::None,
+                })
+                .collect();
+            let msg = match names.as_slice() {
+                [a, b, ..] if a != b => {
+                    format!("collation mismatch between implicit collations \"{a}\" and \"{b}\"")
+                }
+                _ => "collation mismatch between implicit collations".to_string(),
+            };
+            return Err(EngineError::new(SqlState::CollationMismatch, msg));
+        }
+        other => other,
     })
 }
 
@@ -5029,11 +5096,15 @@ pub(crate) fn column_deriv(scope: &Scope, r: Option<Resolved>) -> Deriv {
 }
 
 /// A column's derivation: implicit for a text column (its frozen collation, `C` if none), unless it
-/// is a synthetic relation's column whose body output derived no collation (`Column::no_collation`
-/// — spec/design/collation.md §1 "Derived relations").
+/// is a synthetic relation's column whose body output derived no collation (`Column::no_collation`)
+/// or settled to none over a conflict (`Column::collation_conflict` — spec/design/collation.md §1
+/// "Derived relations").
 pub(crate) fn cat_column_deriv(col: &Column) -> Deriv {
     if !col.ty.is_text() || col.no_collation {
         return Deriv::None;
+    }
+    if col.collation_conflict {
+        return Deriv::Conflicted;
     }
     Deriv::Implicit(col.collation.clone().unwrap_or_else(|| "C".to_string()))
 }
@@ -5053,6 +5124,8 @@ pub(crate) fn column_collation(
 pub(crate) fn combine_deriv(a: Deriv, b: Deriv) -> Result<Deriv> {
     use Deriv::*;
     Ok(match (a, b) {
+        // A conflicted (no-collation) input yields to anything — PostgreSQL's InvalidOid strength.
+        (Conflicted, x) | (x, Conflicted) => x,
         (Explicit(x), Explicit(y)) => {
             if x != y {
                 return Err(EngineError::new(
@@ -5086,7 +5159,7 @@ pub(crate) fn resolve_deriv(
     match d {
         Deriv::None => Ok(None),
         Deriv::Implicit(name) | Deriv::Explicit(name) => resolve_collation_name(catalog, &name),
-        Deriv::Indeterminate => Err(EngineError::new(
+        Deriv::Indeterminate | Deriv::Conflicted => Err(EngineError::new(
             SqlState::IndeterminateCollation,
             "could not determine which collation to use for string comparison",
         )),

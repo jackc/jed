@@ -57,6 +57,11 @@ pub struct Column {
     /// `None`). A body output's implicit or explicit collation rides `collation` instead. Never
     /// persisted.
     pub no_collation: bool,
+    /// Marks a SYNTHETIC relation's text column whose body output settled to NO determinable
+    /// collation (a UNION ALL / VALUES column over conflicting implicit collations, or an
+    /// indeterminate body expression — spec/design/collation.md §1): it yields to any neighbour's
+    /// collation, but consuming it alone (a bare ORDER BY) is 42P22. Never persisted.
+    pub collation_conflict: bool,
 }
 
 /// The kind of an IDENTITY column (spec/design/sequences.md §13). `Always` (`GENERATED ALWAYS`)

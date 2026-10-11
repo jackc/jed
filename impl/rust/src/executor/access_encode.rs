@@ -3964,8 +3964,12 @@ pub(crate) fn rexpr_eq_shifted(a: &RExpr, b: &RExpr, offset: usize) -> bool {
                 collation: cb,
             },
         ) => {
+            // `=`/`<>` are byte identity under every collation (collation.md §7), so their
+            // collation never changes the value — only an ordering comparison must agree on it (a
+            // persisted index expression derives by the storage rule, §1 "Function results").
             oa == ob
-                && ca.as_ref().map(|c| c.name.as_str()) == cb.as_ref().map(|c| c.name.as_str())
+                && (matches!(oa, CmpOp::Eq | CmpOp::Ne)
+                    || ca.as_ref().map(|c| c.name.as_str()) == cb.as_ref().map(|c| c.name.as_str()))
                 && rexpr_eq_shifted(la, lb, offset)
                 && rexpr_eq_shifted(ra, rb, offset)
         }
@@ -4019,14 +4023,20 @@ pub(crate) fn collect_bound_terms(
         // match: its order disagrees with the stored keys, so it stays a full scan + residual
         // filter. (A *skewed* collated key never reaches here — `key_collation_ctx` refuses the
         // whole bound, §12.) The probe is then encoded in the key column's form (sort key for a
-        // collated `Full` column — `build_key_bound`/`index_bound_rows`).
+        // collated `Full` column — `build_key_bound`/`index_bound_rows`). One exception: an EQUALITY
+        // on an expression key bounds under any comparison collation (one that reaches here is
+        // `C`-keyed — a collated expression key stops the prefix first), since every deterministic
+        // collation's `=` is byte identity (§7) — so `lower(email) = $1` still seeks when `email` is
+        // collated and the comparison inherits that collation through `lower` (§1 "Function
+        // results").
         RExpr::Compare {
             op,
             lhs,
             rhs,
             collation,
         } if !matches!(op, CmpOp::Ne)
-            && collation.as_ref().map(|c| c.name.as_str()) == col_coll =>
+            && (collation.as_ref().map(|c| c.name.as_str()) == col_coll
+                || (matches!(op, CmpOp::Eq) && matches!(key, KeyMatch::Expr(..)))) =>
         {
             let is_pk = |x: &RExpr| key.matches(x);
             // The key operand on either side (op flipped when it is on the right); the other side a
@@ -4654,6 +4664,10 @@ pub(crate) struct SetOpPlan {
     pub(crate) rhs: QueryPlan,
     pub(crate) column_names: Vec<String>,
     pub(crate) column_types: Vec<ResolvedType>,
+    /// Each output column's collation derivation (spec/design/collation.md §1 "Set operations"):
+    /// the inputs' common collation, implicit (an explicit input is demoted), `Conflicted` for a
+    /// UNION ALL column over conflicting implicit collations, `None` for a non-text column.
+    pub(crate) column_derivs: Vec<Deriv>,
     /// (output slot, descending, nulls_first) — the trailing ORDER BY resolved by output name.
     pub(crate) order: Vec<crate::spill::SortKey>,
     pub(crate) limit: Option<i64>,

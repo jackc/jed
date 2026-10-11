@@ -1497,7 +1497,7 @@ func (db *engine) resolveIndexWithParams(table *catTable, def indexDef, ptypes *
 			keys = append(keys, resolvedKey{Col: k.Col})
 			continue
 		}
-		s := singleScope(db, table)
+		s := indexScope(db, table)
 		node, rtype, err := resolve(s, k.Expr.Expr, nil, &aggCtx{collecting: false}, ptypes)
 		if err != nil {
 			return resolvedIndex{}, err
@@ -1520,7 +1520,7 @@ func (db *engine) resolveIndexWithParams(table *catTable, def indexDef, ptypes *
 	// validated boolean + immutable at CREATE INDEX, so this cannot newly fail.
 	var predicate *rExpr
 	if def.Predicate != nil {
-		s := singleScope(db, table)
+		s := indexScope(db, table)
 		node, err := resolveBooleanFilter(s, &def.Predicate.Expr, ptypes)
 		if err != nil {
 			return resolvedIndex{}, err
@@ -3220,7 +3220,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			}
 			// Resolve against the table (an aggregate 42803 / window 42P20 / bind parameter 42P02
 			// fall out of the resolver, as for a CHECK).
-			s := singleScope(db, table)
+			s := indexScope(db, table)
 			pt := &paramTypes{indexContext: true}
 			node, rtype, rerr := resolve(s, *elem.Expr, nil, &aggCtx{collecting: false}, pt)
 			if rerr != nil {
@@ -3341,7 +3341,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		if err := rejectIndexPredicateStructure(ci.Predicate.Expr); err != nil {
 			return outcome{}, err
 		}
-		s := singleScope(db, table)
+		s := indexScope(db, table)
 		pt := &paramTypes{indexContext: true}
 		pnode, err := resolveBooleanFilter(s, &ci.Predicate.Expr, pt)
 		if err != nil {

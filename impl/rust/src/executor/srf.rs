@@ -37,6 +37,7 @@ impl Engine {
             hidden: Vec::new(),
             sub_rels: Vec::new(),
             star: None,
+            storage_collation: false,
         };
         // Record-returning functions (R1, json-table.md §2): json[b]_to_record → one record row,
         // json[b]_to_recordset → setof record. They take their column shape from the C0 col-def list
@@ -317,6 +318,7 @@ impl Engine {
                 identity: None,
                 collation: None,
                 no_collation: false,
+                collation_conflict: false,
             });
         }
         let table = Box::new(Table {
@@ -386,6 +388,7 @@ impl Engine {
                 identity: None,
                 collation: None,
                 no_collation: false,
+                collation_conflict: false,
             })
             .collect();
         let want = if jsonb {
@@ -441,6 +444,7 @@ impl Engine {
             hidden: Vec::new(),
             sub_rels: Vec::new(),
             star: None,
+            storage_collation: false,
         };
         // The context item (json / jsonb / text, coerced to a jsonb document at eval).
         let (rctx, ctx_ty) = resolve(

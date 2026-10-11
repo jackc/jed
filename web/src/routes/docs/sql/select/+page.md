@@ -289,6 +289,12 @@ query level, like any correlated subquery: `SELECT (SELECT z FROM (SELECT a.x AS
 Each output column keeps its body column's collation, as in PostgreSQL: a `text COLLATE "unicode"`
 column selected through a derived table or a CTE still orders and compares by `unicode` outside it.
 
+A collation also flows through text functions and set operations. `ORDER BY btrim(name)` sorts by
+`name`'s collation, and a `UNION`, `INTERSECT`, or `EXCEPT` output column takes the collation its
+inputs share. Combining two columns with different collations is an error (`42P21`), except under
+`UNION ALL`: there the column has no collation, and sorting it needs an explicit
+`ORDER BY x COLLATE "…"` (otherwise `42P22`).
+
 ## `VALUES` lists in `FROM` (`FROM (VALUES …) AS v(x)`)
 
 A derived table's body may also be a `VALUES` list — a literal table of rows you write inline,

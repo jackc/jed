@@ -1244,17 +1244,19 @@ func (p *queryPlan) columnNames() []string {
 }
 
 // columnDerivs returns the plan's per-output-column collation derivations (spec/design/collation.md
-// §1 "Derived relations") — the basis for a derived table / CTE synthetic column's collation. A VALUES
-// body derives none, and a set operation's output does not yet propagate a collation (§14), so both
-// yield nil (none for every column).
+// §1 "Derived relations" / "Set operations") — the basis for a derived table / CTE synthetic
+// column's collation and a set operation's common collation.
 func (p *queryPlan) columnDerivs() []deriv {
 	if p.sel != nil {
 		return p.sel.columnDerivs
 	}
+	if p.values != nil {
+		return p.values.columnDerivs
+	}
 	if p.with != nil {
 		return p.with.body.columnDerivs()
 	}
-	return nil
+	return p.setop.columnDerivs
 }
 
 // valuesPlan is a resolved VALUES-body relation (spec/design/grammar.md §42), executable to its
@@ -1268,6 +1270,9 @@ type valuesPlan struct {
 	rows        [][]*rExpr
 	columnTypes []resolvedType
 	columnNames []string
+	// columnDerivs is each column's common collation across the rows (spec/design/collation.md §1),
+	// as for a UNION ALL column — a VALUES list never errors on an implicit conflict.
+	columnDerivs []deriv
 }
 
 // cteMode is how a referenced CTE is evaluated (spec/design/cte.md §3, cost.md §3). Decided per CTE
@@ -1755,9 +1760,14 @@ type setOpPlan struct {
 	rhs         queryPlan
 	columnNames []string
 	columnTypes []resolvedType
-	order       []orderSlot
-	limit       *int64
-	offset      *int64
+	// columnDerivs is each output column's collation derivation (spec/design/collation.md §1 "Set
+	// operations"): the inputs' common collation, implicit (an explicit input is demoted),
+	// derivConflicted for a UNION ALL column over conflicting implicit collations, derivNone for a
+	// non-text column.
+	columnDerivs []deriv
+	order        []orderSlot
+	limit        *int64
+	offset       *int64
 }
 
 // evalEnv is the environment threaded into the per-row evaluator (spec/design/grammar.md §26):

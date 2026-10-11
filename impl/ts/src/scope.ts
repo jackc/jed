@@ -24,7 +24,7 @@ import {
   outerOf,
 } from "./executor.ts";
 import type { Column, SeqDataType, SeqOwner, SequenceDef, Table } from "./catalog.ts";
-import type { Deriv } from "./resolve.ts";
+import { type Deriv, commonCollation } from "./resolve.ts";
 import {
   columnIndex,
   seqDataTypeDefaultBounds,
@@ -130,6 +130,11 @@ export class Scope {
   // right input's — concatenated across comma items. null for a scope the FROM-join planner did not
   // build (then `*` is every non-hidden column in FROM order).
   star: number[] | null = null;
+  // A PERSISTED index expression's scope (an expression key or a partial-index predicate —
+  // spec/design/collation.md §1 "Function results"): collation derivation keeps the storage rule (a
+  // column, COLLATE, ||; a function result carries none), so stored key bytes and partial-index
+  // membership never change meaning under the query-side function propagation.
+  storageCollation = false;
   constructor(
     rels: ScopeRel[],
     catalog: Engine,
@@ -150,6 +155,14 @@ export class Scope {
   // (spec/design/grammar.md §26). SELECT builds its own scope in planSelect.
   static single(catalog: Engine, t: Table): Scope {
     return new Scope([{ label: t.name.toLowerCase(), table: t, offset: 0 }], catalog, null, true);
+  }
+
+  // index is the scope a PERSISTED index expression (an expression key or a partial-index predicate)
+  // resolves against: single with the storage collation rule (storageCollation).
+  static index(catalog: Engine, t: Table): Scope {
+    const scope = Scope.single(catalog, t);
+    scope.storageCollation = true;
+    return scope;
   }
 
   // empty is the column-less scope a DEFAULT expression resolves against (constraints.md §2): a
@@ -871,7 +884,32 @@ export function checkRecursiveColumnTypes(
       );
     }
     if (!unionAll) requireSetopEquality(a[i]!);
+    // The non-recursive term fixed the relation's collation, so the UNION's overall common
+    // collation must equal it (PostgreSQL's recursive-CTE check, spec/design/collation.md §1): a
+    // recursive term cannot re-collate a column. Mismatch is 42P21.
+    if (a[i]!.kind === "text") {
+      const ad = queryPlanColumnDerivs(anchor)[i]!;
+      const overall = commonCollation([ad, queryPlanColumnDerivs(recursive)[i]!], unionAll);
+      const nonRec = collationIdentity(ad);
+      const all = collationIdentity(overall);
+      if (nonRec !== all) {
+        throw engineError(
+          "collation_mismatch",
+          `recursive query "${name}" column ${i + 1} has collation "${nonRec}" in non-recursive term but collation "${all}" overall`,
+        );
+      }
+    }
   }
+}
+
+// collationIdentity is the collation a derivation settles to, named as PostgreSQL reports it (the
+// recursive-CTE check, spec/design/collation.md §1): a collation's name, `default` for no collation
+// (PG's default collation — a literal's), `(null)` for a conflicted / indeterminate one (PG's
+// InvalidOid).
+function collationIdentity(d: Deriv): string {
+  if (d.kind === "implicit" || d.kind === "explicit") return d.name;
+  if (d.kind === "none") return "default";
+  return "(null)";
 }
 
 // cteSyntheticTable builds the synthetic relation a CTE reference resolves against
@@ -937,13 +975,16 @@ export function cteSyntheticTableCols(
 // setSyntheticCollation records a body output's collation derivation on its synthetic column
 // (spec/design/collation.md §1 "Derived relations", PostgreSQL's rule): an implicit OR explicit body
 // collation becomes the column's IMPLICIT collation (an outer reference is a plain column reference);
-// any other body output has no collation and takes a neighbour's (PG's default). An indeterminate
-// body output also has none in PG (unreachable today: no output expression combines collations).
+// any other body output has no collation and takes a neighbour's (PG's default). An indeterminate or
+// conflicted body output has none either (PG's InvalidOid) — it still yields to a neighbour, but
+// consuming it alone is 42P22.
 function setSyntheticCollation(col: Column, d: Deriv): void {
   if (d.kind === "implicit" || d.kind === "explicit") {
     if (d.name !== "C") col.collation = d.name;
-  } else {
+  } else if (d.kind === "none") {
     col.noCollation = true;
+  } else {
+    col.collationConflict = true;
   }
 }
 

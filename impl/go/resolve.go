@@ -93,6 +93,12 @@ type scope struct {
 	// then its right input's — concatenated across comma items. Nil for a scope with no FROM join
 	// planning (then `*` is every non-hidden column in FROM order).
 	star []int
+	// storageCollation marks a PERSISTED index expression's scope (an expression key or a
+	// partial-index predicate — spec/design/collation.md §1 "Function results"): collation
+	// derivation keeps the storage rule (a column, COLLATE, ||; a function result carries none), so
+	// stored key bytes and partial-index membership never change meaning under the query-side
+	// function propagation.
+	storageCollation bool
 }
 
 // subRel is one inner relation label of an unaliased parenthesized join (grammar.md §15): its
@@ -132,6 +138,14 @@ type mergeCol struct {
 // (spec/design/grammar.md §26). SELECT builds its own scope in planSelect.
 func singleScope(catalog *engine, t *catTable) *scope {
 	return &scope{rels: []scopeRel{{label: strings.ToLower(t.Name), table: t, offset: 0}}, catalog: catalog, allowSubquery: true}
+}
+
+// indexScope is the scope a PERSISTED index expression (an expression key or a partial-index
+// predicate) resolves against: singleScope with the storage collation rule (storageCollation).
+func indexScope(catalog *engine, t *catTable) *scope {
+	s := singleScope(catalog, t)
+	s.storageCollation = true
+	return s
 }
 
 // emptyScope is the column-less scope a DEFAULT expression resolves against (constraints.md
@@ -2269,13 +2283,18 @@ func resolveCollationName(catalog *engine, name string) (*Collation, error) {
 
 // A text expression's collation derivation (spec/design/collation.md §1, PG's rules). kind:
 // derivNone (no collation — a non-text expr or a bare literal), derivImplicit (a column's frozen
-// collation — C counts as a distinct implicit collation), derivExplicit (an explicit COLLATE), or
-// derivIndeterminate (two different implicit collations met — 42P22 when consumed).
+// collation — C counts as a distinct implicit collation), derivExplicit (an explicit COLLATE),
+// derivIndeterminate (two different implicit collations met — 42P22 when consumed; it dominates an
+// implicit neighbour), or derivConflicted (a collatable column whose inputs settled to NO collation —
+// PostgreSQL's InvalidOid: a UNION ALL / VALUES column over conflicting implicit collations, or a
+// derived column over an indeterminate body output — it yields to any neighbour, but consuming it
+// alone is 42P22).
 const (
 	derivNone = iota
 	derivImplicit
 	derivExplicit
 	derivIndeterminate
+	derivConflicted
 )
 
 type deriv struct {
@@ -2285,7 +2304,11 @@ type deriv struct {
 
 // deriveCollation derives the collation + derivation level of a (text) expression subtree. A COLLATE
 // is explicit; a column reference is implicit (its frozen collation, C if none); || combines its
-// operands. Every other shape resets to none (takes a neighbour's) — a documented narrowing (§14).
+// operands; a scalar function whose catalog result is text combines its arguments (PostgreSQL's
+// rule — a collatable result inherits its collatable inputs' collation; functionResultCollatable).
+// Every other shape (literal, cast, CASE, aggregate) resets to none (takes a neighbour's) — a
+// documented narrowing (§14). A persisted index expression's scope (storageCollation) keeps the
+// pre-function rule.
 func deriveCollation(s *scope, e exprNode) (deriv, error) {
 	switch e.Kind {
 	case exprCollate:
@@ -2309,8 +2332,78 @@ func deriveCollation(s *scope, e exprNode) (deriv, error) {
 			return combineDeriv(l, r)
 		}
 		return deriv{}, nil
+	case exprFuncCall:
+		f := e.FuncCall
+		if s.storageCollation || f.Star || f.Filter != nil || f.Over != nil || f.OverName != "" ||
+			f.WithinGroup != nil || !functionResultCollatable(f.Name) {
+			return deriv{}, nil
+		}
+		d := deriv{}
+		for _, a := range f.Args {
+			ad, err := deriveCollation(s, *a)
+			if err != nil {
+				return deriv{}, err
+			}
+			d, err = combineDeriv(d, ad)
+			if err != nil {
+				return deriv{}, err
+			}
+		}
+		return d, nil
 	default:
 		return deriv{}, nil
+	}
+}
+
+// functionResultCollatable reports whether a scalar function's result carries its arguments'
+// collation (spec/design/collation.md §1 "Function results"): read from the shared function catalog
+// — any kind = "function" overload whose result is text. A non-text argument derives no collation,
+// so an overload taking only non-text arguments (the range lower/upper) contributes nothing.
+func functionResultCollatable(name string) bool {
+	for i := range operators {
+		o := &operators[i]
+		if o.Kind == "function" && o.Result == "text" && strings.EqualFold(o.Name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// commonCollation is the common collation of one set-operation / VALUES output column
+// (spec/design/collation.md §1 "Set operations", PostgreSQL's select_common_collation): the inputs
+// combine like an operator's operands (two different explicit collations are 42P21). Two different
+// implicit collations — or an indeterminate input — conflict: noneOK (UNION ALL, VALUES) settles the
+// column to derivConflicted, otherwise it is 42P21 now. An explicit result becomes the column's
+// IMPLICIT collation (a reference to the output column is a plain column reference).
+func commonCollation(inputs []deriv, noneOK bool) (deriv, error) {
+	d := deriv{}
+	for _, x := range inputs {
+		var err error
+		d, err = combineDeriv(d, x)
+		if err != nil {
+			return deriv{}, err
+		}
+	}
+	switch d.kind {
+	case derivExplicit:
+		return deriv{name: d.name, kind: derivImplicit}, nil
+	case derivIndeterminate:
+		if noneOK {
+			return deriv{kind: derivConflicted}, nil
+		}
+		var names []string
+		for _, x := range inputs {
+			if x.kind == derivImplicit {
+				names = append(names, x.name)
+			}
+		}
+		msg := "collation mismatch between implicit collations"
+		if len(names) >= 2 && names[0] != names[1] {
+			msg = fmt.Sprintf("collation mismatch between implicit collations \"%s\" and \"%s\"", names[0], names[1])
+		}
+		return deriv{}, newError(CollationMismatch, msg)
+	default:
+		return d, nil
 	}
 }
 
@@ -2326,13 +2419,17 @@ func columnDeriv(s *scope, r resolved, err error) deriv {
 
 // catColumnDeriv is a column's derivation: implicit for a text column (its frozen collation, C if
 // none), unless it is a synthetic relation's column whose body output derived no collation
-// (catColumn.NoCollation — spec/design/collation.md §1 "Derived relations").
+// (catColumn.NoCollation) or settled to none over a conflict (catColumn.CollationConflict —
+// spec/design/collation.md §1 "Derived relations").
 func catColumnDeriv(col *catColumn) deriv {
 	if !col.Type.IsText() {
 		return deriv{}
 	}
 	if col.NoCollation {
 		return deriv{}
+	}
+	if col.CollationConflict {
+		return deriv{kind: derivConflicted}
 	}
 	name := col.Collation
 	if name == "" {
@@ -2351,6 +2448,13 @@ func columnCollation(s *scope, r resolved) (*Collation, error) {
 // Explicit dominates; two DIFFERENT explicit collations conflict eagerly (42P21); two different
 // implicit collations yield derivIndeterminate (deferred to 42P22 on use); explicit resolves it.
 func combineDeriv(a, b deriv) (deriv, error) {
+	// A conflicted (no-collation) input yields to anything — PostgreSQL's InvalidOid strength.
+	if a.kind == derivConflicted {
+		return b, nil
+	}
+	if b.kind == derivConflicted {
+		return a, nil
+	}
 	if a.kind == derivExplicit && b.kind == derivExplicit {
 		if a.name != b.name {
 			return deriv{}, newError(CollationMismatch,
@@ -2381,10 +2485,10 @@ func combineDeriv(a, b deriv) (deriv, error) {
 
 // resolveDeriv resolves a derivation to the concrete collation a comparison / ORDER BY uses. none
 // and C → nil (byte order, the fast path); a loaded name → its table (42704 if it vanished);
-// derivIndeterminate → 42P22 (the collation is required but ambiguous).
+// derivIndeterminate / derivConflicted → 42P22 (the collation is required but ambiguous).
 func resolveDeriv(catalog *engine, d deriv) (*Collation, error) {
 	switch d.kind {
-	case derivIndeterminate:
+	case derivIndeterminate, derivConflicted:
 		return nil, newError(IndeterminateCollation,
 			"could not determine which collation to use for string comparison")
 	case derivImplicit, derivExplicit:

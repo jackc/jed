@@ -1883,16 +1883,24 @@ export function resolveCollationName(catalog: Engine, name: string): Collation |
 // A text expression's collation derivation (spec/design/collation.md §1, PG's rules). "none" = no
 // collation (a non-text expr or a bare literal); "implicit" = a column's frozen collation (C counts
 // as a distinct implicit collation); "explicit" = an explicit COLLATE; "indeterminate" = two
-// different implicit collations met — 42P22 when consumed.
+// different implicit collations met — 42P22 when consumed; it dominates an implicit neighbour.
+// "conflicted" = a collatable column whose inputs settled to NO collation (PostgreSQL's InvalidOid —
+// a UNION ALL / VALUES column over conflicting implicit collations, or a derived column over an
+// indeterminate body output): it yields to any neighbour, but consuming it alone is 42P22.
 export type Deriv =
   | { kind: "none" }
   | { kind: "implicit"; name: string }
   | { kind: "explicit"; name: string }
-  | { kind: "indeterminate" };
+  | { kind: "indeterminate" }
+  | { kind: "conflicted" };
 
 // deriveCollation derives the collation + derivation level of a (text) expression subtree. A COLLATE
 // is explicit; a column reference is implicit (its frozen collation, C if none); || combines its
-// operands. Every other shape resets to none (takes a neighbour's) — a documented narrowing (§14).
+// operands; a scalar function whose catalog result is text combines its arguments (PostgreSQL's rule
+// — a collatable result inherits its collatable inputs' collation; functionResultCollatable). Every
+// other shape (literal, cast, CASE, aggregate) resets to none (takes a neighbour's) — a documented
+// narrowing (§14). A persisted index expression's scope (storageCollation) keeps the pre-function
+// rule.
 export function deriveCollation(scope: Scope, e: Expr): Deriv {
   if (e.kind === "collate") return { kind: "explicit", name: e.collation };
   if (e.kind === "column") return columnDeriv(scope, () => scope.resolveBare(e.name));
@@ -1902,7 +1910,70 @@ export function deriveCollation(scope: Scope, e: Expr): Deriv {
   if (e.kind === "binary" && e.op === "concat") {
     return combineDeriv(deriveCollation(scope, e.lhs), deriveCollation(scope, e.rhs));
   }
+  if (
+    e.kind === "funcCall" &&
+    !e.star &&
+    (e.filter ?? null) === null &&
+    (e.over ?? null) === null &&
+    (e.overName ?? null) === null &&
+    (e.withinGroup ?? null) === null &&
+    !scope.storageCollation &&
+    functionResultCollatable(e.name)
+  ) {
+    let d: Deriv = { kind: "none" };
+    for (const a of e.args) d = combineDeriv(d, deriveCollation(scope, a));
+    return d;
+  }
   return { kind: "none" };
+}
+
+// asciiLower lowercases only the ASCII letters A-Z (Rust's eq_ignore_ascii_case folding).
+function asciiLower(s: string): string {
+  return s.replace(/[A-Z]/g, (c) => c.toLowerCase());
+}
+
+// collatableFunctionNames is the (ASCII-lowercased) set of function names functionResultCollatable
+// admits, built once from the shared catalog.
+let collatableFunctionNames: Set<string> | null = null;
+
+// functionResultCollatable reports whether a scalar function's result carries its arguments'
+// collation (spec/design/collation.md §1 "Function results"): read from the shared function catalog —
+// any kind = "function" overload whose result is text. A non-text argument derives no collation, so
+// an overload taking only non-text arguments (the range lower/upper) contributes nothing.
+function functionResultCollatable(name: string): boolean {
+  if (collatableFunctionNames === null) {
+    collatableFunctionNames = new Set(
+      OPERATORS.filter((o) => o.kind === "function" && o.result === "text").map((o) =>
+        asciiLower(o.name),
+      ),
+    );
+  }
+  return collatableFunctionNames.has(asciiLower(name));
+}
+
+// commonCollation is the common collation of one set-operation / VALUES output column
+// (spec/design/collation.md §1 "Set operations", PostgreSQL's select_common_collation): the inputs
+// combine like an operator's operands (two different explicit collations are 42P21). Two different
+// implicit collations — or an indeterminate input — conflict: noneOk (UNION ALL, VALUES) settles the
+// column to "conflicted", otherwise it is 42P21 now. An explicit result becomes the column's IMPLICIT
+// collation (a reference to the output column is a plain column reference).
+export function commonCollation(inputs: Deriv[], noneOk: boolean): Deriv {
+  let d: Deriv = { kind: "none" };
+  for (const x of inputs) d = combineDeriv(d, x);
+  if (d.kind === "explicit") return { kind: "implicit", name: d.name };
+  if (d.kind === "indeterminate") {
+    if (noneOk) return { kind: "conflicted" };
+    const names: string[] = [];
+    for (const x of inputs) {
+      if (x.kind === "implicit") names.push(x.name);
+    }
+    const msg =
+      names.length >= 2 && names[0] !== names[1]
+        ? `collation mismatch between implicit collations "${names[0]}" and "${names[1]}"`
+        : "collation mismatch between implicit collations";
+    throw engineError("collation_mismatch", msg);
+  }
+  return d;
 }
 
 // columnDeriv is the implicit derivation of a resolved column reference: a text column carries its
@@ -1920,10 +1991,12 @@ export function columnDeriv(scope: Scope, resolve: () => Resolved): Deriv {
 
 // catColumnDeriv is a column's derivation: implicit for a text column (its frozen collation, C if
 // none), unless it is a synthetic relation's column whose body output derived no collation
-// (Column.noCollation — spec/design/collation.md §1 "Derived relations").
+// (Column.noCollation) or settled to none over a conflict (Column.collationConflict —
+// spec/design/collation.md §1 "Derived relations").
 export function catColumnDeriv(col: Column): Deriv {
   if (!typeIsText(col.type)) return { kind: "none" };
   if (col.noCollation === true) return { kind: "none" };
+  if (col.collationConflict === true) return { kind: "conflicted" };
   return { kind: "implicit", name: col.collation ?? "C" };
 }
 
@@ -1937,6 +2010,9 @@ export function columnCollation(scope: Scope, r: Resolved): Collation | null {
 // Explicit dominates; two DIFFERENT explicit collations conflict eagerly (42P21); two different
 // implicit collations yield "indeterminate" (deferred to 42P22 on use); explicit resolves it.
 export function combineDeriv(a: Deriv, b: Deriv): Deriv {
+  // A conflicted (no-collation) input yields to anything — PostgreSQL's InvalidOid strength.
+  if (a.kind === "conflicted") return b;
+  if (b.kind === "conflicted") return a;
   if (a.kind === "explicit" && b.kind === "explicit") {
     if (a.name !== b.name) {
       throw engineError(
@@ -1960,9 +2036,9 @@ export function combineDeriv(a: Deriv, b: Deriv): Deriv {
 
 // resolveDeriv resolves a derivation to the concrete collation a comparison / ORDER BY uses. "none"
 // and C → null (byte order, the fast path); a loaded name → its table (42704 if it vanished);
-// "indeterminate" → 42P22 (the collation is required but ambiguous).
+// "indeterminate" / "conflicted" → 42P22 (the collation is required but ambiguous).
 export function resolveDeriv(catalog: Engine, d: Deriv): Collation | null {
-  if (d.kind === "indeterminate") {
+  if (d.kind === "indeterminate" || d.kind === "conflicted") {
     throw engineError(
       "indeterminate_collation",
       "could not determine which collation to use for string comparison",

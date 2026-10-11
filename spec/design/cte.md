@@ -42,7 +42,9 @@ SELECT x, y FROM c CROSS JOIN a
   a collation — a collated column reference, or an explicit `COLLATE` — gives the CTE column that
   collation as an *implicit* one; any other body output has none and takes a neighbour's
   ([collation.md](collation.md) §1 "Derived relations"). A recursive CTE's columns take the
-  non-recursive term's; a data-modifying CTE's, its `RETURNING` items'. The same rule binds a derived
+  non-recursive term's, and a recursive term that would change one is `42P21` (PostgreSQL's check);
+  a data-modifying CTE's columns take its `RETURNING` items'. A body that is a set operation gives
+  each column its inputs' common collation (collation.md §1 "Set operations"). The same rule binds a derived
   table, which is mechanically an inline CTE.
 
 **Nested `WITH` is supported (§7).** Besides the statement top level, a `WITH` may prefix a

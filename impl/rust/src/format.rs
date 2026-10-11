@@ -4542,6 +4542,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
                 identity: None,
                 collation: None,
                 no_collation: false,
+                collation_conflict: false,
             });
             continue;
         }
@@ -4565,6 +4566,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
                 identity: None,
                 collation: None,
                 no_collation: false,
+                collation_conflict: false,
             });
             continue;
         }
@@ -4588,6 +4590,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
                 identity: None,
                 collation: None,
                 no_collation: false,
+                collation_conflict: false,
             });
             continue;
         }
@@ -4679,6 +4682,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
             identity,
             collation,
             no_collation: false,
+            collation_conflict: false,
         });
     }
     // The primary key (v5): member ordinals in KEY order. Each must name a real column,

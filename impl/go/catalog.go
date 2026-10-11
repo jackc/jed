@@ -53,6 +53,11 @@ type catColumn struct {
 	// neighbour's collation, where a catalog column (false) is implicitly Collation (C if ""). A body
 	// output's implicit or explicit collation rides Collation instead. Never persisted.
 	NoCollation bool
+	// CollationConflict marks a SYNTHETIC relation's text column whose body output settled to NO
+	// determinable collation (a UNION ALL / VALUES column over conflicting implicit collations, or an
+	// indeterminate body expression — spec/design/collation.md §1): it yields to any neighbour's
+	// collation, but consuming it alone (a bare ORDER BY) is 42P22. Never persisted.
+	CollationConflict bool
 }
 
 // IdentityKind is the kind of an IDENTITY column (spec/design/sequences.md §13). IdentityAlways

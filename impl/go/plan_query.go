@@ -1128,8 +1128,40 @@ func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string, unionA
 				return err
 			}
 		}
+		// The non-recursive term fixed the relation's collation, so the UNION's overall common
+		// collation must equal it (PostgreSQL's recursive-CTE check, spec/design/collation.md §1): a
+		// recursive term cannot re-collate a column. Mismatch is 42P21.
+		if a[i].kind == rtText {
+			ad := anchor.columnDerivs()[i]
+			overall, err := commonCollation([]deriv{ad, recursive.columnDerivs()[i]}, unionAll)
+			if err != nil {
+				return err
+			}
+			nonRec, all := collationIdentity(ad), collationIdentity(overall)
+			if nonRec != all {
+				return newError(CollationMismatch, fmt.Sprintf(
+					"recursive query \"%s\" column %d has collation \"%s\" in non-recursive term but collation \"%s\" overall",
+					name, i+1, nonRec, all,
+				))
+			}
+		}
 	}
 	return nil
+}
+
+// collationIdentity is the collation a derivation settles to, named as PostgreSQL reports it (the
+// recursive-CTE check, spec/design/collation.md §1): a collation's name, default for no collation
+// (PG's default collation — a literal's), (null) for a conflicted / indeterminate one (PG's
+// InvalidOid).
+func collationIdentity(d deriv) string {
+	switch d.kind {
+	case derivImplicit, derivExplicit:
+		return d.name
+	case derivIndeterminate, derivConflicted:
+		return "(null)"
+	default:
+		return "default"
+	}
 }
 
 // cteSyntheticTable builds the synthetic relation a CTE reference resolves against
@@ -1188,14 +1220,17 @@ func cteSyntheticTableCols(name string, bodyNames []string, bodyTypes []resolved
 // setSyntheticCollation records a body output's collation derivation on its synthetic column
 // (spec/design/collation.md §1 "Derived relations", PostgreSQL's rule): an implicit OR explicit body
 // collation becomes the column's IMPLICIT collation (an outer reference is a plain column reference);
-// any other body output has no collation and takes a neighbour's (PG's default). An indeterminate
-// body output also has none in PG (unreachable today: no output expression combines collations).
+// any other body output has no collation and takes a neighbour's (PG's default). An indeterminate or
+// conflicted body output has none either (PG's InvalidOid) — it still yields to a neighbour, but
+// consuming it alone is 42P22.
 func setSyntheticCollation(col *catColumn, d deriv) {
 	switch d.kind {
 	case derivImplicit, derivExplicit:
 		if d.name != "C" {
 			col.Collation = d.name
 		}
+	case derivIndeterminate, derivConflicted:
+		col.CollationConflict = true
 	default:
 		col.NoCollation = true
 	}
@@ -1440,6 +1475,21 @@ func (db *engine) planSetOp(so *setOp, parent *scope, ctes []*cteBinding, ptypes
 		}
 	}
 	columnNames := lhs.columnNames()
+	// Each text column's common collation (spec/design/collation.md §1 "Set operations",
+	// PostgreSQL): an implicit conflict is 42P21 except under UNION ALL, whose column then has none
+	// (42P22 only when consumed).
+	noneOK := so.Op == setOpUnion && so.All
+	columnDerivs := make([]deriv, len(columnTypes))
+	for i, t := range columnTypes {
+		if t.kind != rtText {
+			continue
+		}
+		d, err := commonCollation([]deriv{lhs.columnDerivs()[i], rhs.columnDerivs()[i]}, noneOK)
+		if err != nil {
+			return nil, err
+		}
+		columnDerivs[i] = d
+	}
 
 	order := make([]orderSlot, 0, len(so.OrderBy))
 	for i := range so.OrderBy {
@@ -1449,9 +1499,14 @@ func (db *engine) planSetOp(so *setOp, parent *scope, ctes []*cteBinding, ptypes
 			return nil, err
 		}
 		// An explicit COLLATE on a set-operation ORDER BY key (spec/design/collation.md §1): the
-		// output column must be text (42804); the name resolves ("C", else loaded or 42704).
+		// output column must be text (42804); the name resolves ("C", else loaded or 42704). Absent
+		// one, a text key sorts by the column's common collation.
 		var coll *Collation
-		if key.Collation != "" {
+		if key.Collation == "" && columnTypes[idx].kind == rtText {
+			if coll, err = resolveDeriv(db, columnDerivs[idx]); err != nil {
+				return nil, err
+			}
+		} else if key.Collation != "" {
 			if columnTypes[idx].kind != rtText {
 				return nil, typeError("collations are not supported by this column's type")
 			}
@@ -1464,7 +1519,7 @@ func (db *engine) planSetOp(so *setOp, parent *scope, ctes []*cteBinding, ptypes
 
 	return &setOpPlan{
 		op: so.Op, all: so.All, lhs: lhs, rhs: rhs,
-		columnNames: columnNames, columnTypes: columnTypes,
+		columnNames: columnNames, columnTypes: columnTypes, columnDerivs: columnDerivs,
 		order: order, limit: so.Limit, offset: so.Offset,
 	}, nil
 }
@@ -1556,6 +1611,8 @@ func (db *engine) planValues(rows [][]*exprNode, parent *scope, ctes []*cteBindi
 	// Per column: the 0-based bind-parameter slots appearing in it, typed in a second pass from the
 	// unified column type (a $N takes its column's type, like a set-operation operand).
 	colParams := make([][]int, arity)
+	// Per column: each row's collation derivation, combined after the loop (collation.md §1).
+	colDerivs := make([][]deriv, arity)
 	for ri, row := range rows {
 		if len(row) != arity {
 			return nil, newError(SyntaxError, "VALUES lists must all be the same length")
@@ -1569,6 +1626,11 @@ func (db *engine) planValues(rows [][]*exprNode, parent *scope, ctes []*cteBindi
 			if node.kind == reParam {
 				colParams[ci] = append(colParams[ci], node.index)
 			}
+			d, err := deriveCollation(s, *val)
+			if err != nil {
+				return nil, err
+			}
+			colDerivs[ci] = append(colDerivs[ci], d)
 			if ri == 0 {
 				colTypes[ci] = ty
 			} else {
@@ -1598,7 +1660,20 @@ func (db *engine) planValues(rows [][]*exprNode, parent *scope, ctes []*cteBindi
 	for i := range colNames {
 		colNames[i] = fmt.Sprintf("column%d", i+1)
 	}
-	return &valuesPlan{rows: resolvedRows, columnTypes: colTypes, columnNames: colNames}, nil
+	// Each text column's common collation across the rows — PostgreSQL treats a VALUES column like a
+	// UNION ALL one (an implicit conflict leaves it with none, never an error).
+	colDerivsOut := make([]deriv, arity)
+	for ci, t := range colTypes {
+		if t.kind != rtText {
+			continue
+		}
+		d, err := commonCollation(colDerivs[ci], true)
+		if err != nil {
+			return nil, err
+		}
+		colDerivsOut[ci] = d
+	}
+	return &valuesPlan{rows: resolvedRows, columnTypes: colTypes, columnNames: colNames, columnDerivs: colDerivsOut}, nil
 }
 
 // execValuesPlan executes a resolved VALUES-body relation (spec/design/grammar.md §42): evaluate

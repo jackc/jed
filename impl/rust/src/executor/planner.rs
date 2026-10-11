@@ -433,6 +433,7 @@ impl Engine {
                     hidden: Vec::new(),
                     sub_rels: Vec::new(),
                     star: None,
+                    storage_collation: false,
                 };
                 let left_names: Vec<&str> = seg_star
                     .iter()
@@ -468,6 +469,7 @@ impl Engine {
                     hidden: seg_hidden.clone(),
                     sub_rels: Vec::new(),
                     star: None,
+                    storage_collation: false,
                 };
                 // The synthesized predicate compares the two chosen columns through one-column pseudo
                 // relations at their flat slots, so it binds exactly those columns even when a side is
@@ -562,6 +564,7 @@ impl Engine {
                     hidden: Vec::new(),
                     sub_rels: Vec::new(),
                     star: None,
+                    storage_collation: false,
                 };
                 Some(resolve_boolean_filter(
                     &pair,
@@ -579,6 +582,7 @@ impl Engine {
                     hidden: seg_hidden,
                     sub_rels: sub_rels_within(&group_subs, seg, k + 1),
                     star: None,
+                    storage_collation: false,
                 };
                 seg_star.extend(rel_star(k + 1));
                 Some(resolve_boolean_filter(&partial, on_expr, ptypes)?)
@@ -600,6 +604,7 @@ impl Engine {
             hidden,
             sub_rels: sub_rels_within(&group_subs, 0, usize::MAX),
             star: Some(star),
+            storage_collation: false,
         };
 
         // Expand GROUP BY (including ROLLUP / CUBE / GROUPING SETS) into a list of grouping sets,
@@ -1452,6 +1457,7 @@ impl Engine {
                     rhs,
                     column_names,
                     column_types,
+                    column_derivs,
                     order,
                     limit,
                     offset,
@@ -1465,6 +1471,7 @@ impl Engine {
                     rhs,
                     column_names,
                     column_types,
+                    column_derivs,
                     order,
                     limit,
                     offset,
@@ -1680,6 +1687,7 @@ fn join_group_outputs(
             identity: None,
             collation: c.collation.clone(),
             no_collation: c.no_collation,
+            collation_conflict: c.collation_conflict,
         });
     }
     for r in &scope.rels {

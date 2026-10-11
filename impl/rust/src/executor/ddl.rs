@@ -930,6 +930,7 @@ impl Engine {
                 identity: identity_kind,
                 collation,
                 no_collation: false,
+                collation_conflict: false,
             });
         }
 
@@ -3691,6 +3692,7 @@ impl Engine {
             identity: None,
             collation,
             no_collation: false,
+            collation_conflict: false,
         };
         if def.primary_key {
             if !table.pk.is_empty() {
@@ -3854,7 +3856,7 @@ impl Engine {
             match k {
                 IndexKey::Column(ord) => keys.push(ResolvedKey::Column(*ord)),
                 IndexKey::Expr(e) => {
-                    let scope = Scope::single(self, table);
+                    let scope = Scope::index(self, table);
                     let (rexpr, rtype) =
                         resolve(&scope, &e.expr, None, &mut AggCtx::Forbidden, params)?;
                     let ty = resolved_to_key_type(&rtype)
@@ -3870,7 +3872,7 @@ impl Engine {
         let predicate = match &def.predicate {
             None => None,
             Some(p) => {
-                let scope = Scope::single(self, table);
+                let scope = Scope::index(self, table);
                 Some(resolve_boolean_filter(&scope, &p.expr, params)?)
             }
         };
@@ -4278,7 +4280,7 @@ impl Engine {
                     reject_index_predicate_structure(expr)?;
                     // Resolve against the table (an aggregate 42803 / window 42P20 / bind parameter
                     // 42P02 fall out of the resolver, as for a CHECK).
-                    let scope = Scope::single(self, table);
+                    let scope = Scope::index(self, table);
                     let mut pt = ParamTypes::for_index();
                     let (node, rtype) =
                         resolve(&scope, expr, None, &mut AggCtx::Forbidden, &mut pt)?;
@@ -4467,7 +4469,7 @@ impl Engine {
                 // by the resolver, so caught here). The aggregate 42803 / window 42P20 / non-boolean
                 // 42804 rejections then fall out of the Forbidden-context boolean resolve below.
                 reject_index_predicate_structure(&pred.expr)?;
-                let scope = Scope::single(self, table);
+                let scope = Scope::index(self, table);
                 let mut pt = ParamTypes::for_index();
                 let node = resolve_boolean_filter(&scope, &pred.expr, &mut pt)?;
                 // Dependencies accumulate at each resolved operation, through every child.

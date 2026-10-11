@@ -417,6 +417,7 @@ import {
   catColumnDeriv,
   collatedCmp,
   columnCollation,
+  commonCollation,
   deriveCollation,
   elemJsonText,
   jsonArgNode,
@@ -6170,7 +6171,7 @@ export class Engine {
     verifyIndexTimezoneDeps(def.timezoneDeps);
     const keys: ResolvedKey[] = def.keys.map((k) => {
       if (k.kind === "column") return { kind: "column", column: k.column };
-      const scope = Scope.single(this, table);
+      const scope = Scope.index(this, table);
       const { node, type } = resolve(
         scope,
         k.expr,
@@ -6190,7 +6191,7 @@ export class Engine {
     let predicate: RExpr | undefined;
     if (def.predicate) {
       predicate = resolveBooleanFilter(
-        Scope.single(this, table),
+        Scope.index(this, table),
         def.predicate.expr,
         ptypes,
       );
@@ -8160,7 +8161,7 @@ export class Engine {
         rejectIndexPredicateStructure(elem.expr);
         // Resolve against the table (an aggregate 42803 / window 42P20 / bind parameter 42P02 fall
         // out of the resolver, as for a CHECK).
-        const scope = Scope.single(this, table);
+        const scope = Scope.index(this, table);
         const pt = new ParamTypes();
         pt.indexContext = true;
         const { node, type: rtype } = resolve(
@@ -8316,7 +8317,7 @@ export class Engine {
       rejectIndexPredicateStructure(ci.predicate.expr);
       const predPt = new ParamTypes();
       predPt.indexContext = true;
-      const predNode = resolveBooleanFilter(Scope.single(this, table), ci.predicate.expr, predPt);
+      const predNode = resolveBooleanFilter(Scope.index(this, table), ci.predicate.expr, predPt);
       // Dependencies accumulate at each resolved operation, through every child.
       if (predPt.nonimmutable) {
         throw engineError(
@@ -12783,12 +12784,27 @@ export class Engine {
     // json / jsonpath, as PostgreSQL).
     if (so.op !== "union" || !so.all) for (const t of columnTypes) requireSetopEquality(t);
     const columnNames = lhs.columnNames;
+    // Each text column's common collation (spec/design/collation.md §1 "Set operations",
+    // PostgreSQL): an implicit conflict is 42P21 except under UNION ALL, whose column then has none
+    // (42P22 only when consumed).
+    const noneOk = so.op === "union" && so.all;
+    const lhsDerivs = queryPlanColumnDerivs(lhs);
+    const rhsDerivs = queryPlanColumnDerivs(rhs);
+    const columnDerivs: Deriv[] = columnTypes.map((t, i) => {
+      if (t.kind !== "text") return { kind: "none" };
+      return commonCollation([lhsDerivs[i]!, rhsDerivs[i]!], noneOk);
+    });
     const order: OrderSlot[] = so.orderBy.map((key) => {
       const idx = resolveSetopOrderKey(key, columnNames);
       // An explicit COLLATE on a set-operation ORDER BY key (spec/design/collation.md §1): the output
-      // column must be text (42804); the name resolves ("C", else loaded or 42704).
+      // column must be text (42804); the name resolves ("C", else loaded or 42704). Absent one, a text
+      // key sorts by the column's common collation.
       let collation: Collation | null = null;
-      if (key.collation !== null) {
+      if (key.collation === null) {
+        if (columnTypes[idx]!.kind === "text") {
+          collation = resolveDeriv(this, columnDerivs[idx]!);
+        }
+      } else {
         if (columnTypes[idx]!.kind !== "text") {
           throw typeError("collations are not supported by this column's type");
         }
@@ -12809,6 +12825,7 @@ export class Engine {
       rhs,
       columnNames,
       columnTypes,
+      columnDerivs,
       order,
       limit: so.limit,
       offset: so.offset,
@@ -12898,6 +12915,8 @@ export class Engine {
     // Per column: the 0-based bind-parameter slots in it, typed in a second pass from the unified
     // column type (a $N takes its column's type, like a set-operation operand).
     const colParams: number[][] = Array.from({ length: arity }, () => []);
+    // Per column: each row's collation derivation, combined after the loop (collation.md §1).
+    const colDerivs: Deriv[][] = Array.from({ length: arity }, () => []);
     rows.forEach((row, ri) => {
       if (row.length !== arity) {
         throw engineError("syntax_error", "VALUES lists must all be the same length");
@@ -12913,6 +12932,7 @@ export class Engine {
           ptypes,
         );
         if (node.kind === "param") colParams[ci]!.push(node.index);
+        colDerivs[ci]!.push(deriveCollation(scope, val));
         if (ri === 0) colTypes.push(type);
         else colTypes[ci] = unifyValuesColumn(colTypes[ci]!, type);
         resolvedRow.push(node);
@@ -12928,11 +12948,17 @@ export class Engine {
     // PostgreSQL names a VALUES relation's columns column1, column2, … ; the derived table's optional
     // column-rename list overrides them at the synthetic relation (cteSyntheticTable).
     const columnNames = Array.from({ length: arity }, (_, i) => `column${i + 1}`);
+    // Each text column's common collation across the rows — PostgreSQL treats a VALUES column like a
+    // UNION ALL one (an implicit conflict leaves it with none, never an error).
+    const columnDerivs: Deriv[] = colTypes.map((t, ci) =>
+      t.kind === "text" ? commonCollation(colDerivs[ci]!, true) : { kind: "none" },
+    );
     return {
       kind: "values",
       rows: resolvedRows,
       columnTypes: colTypes,
       columnNames,
+      columnDerivs,
     };
   }
 
@@ -23148,11 +23174,16 @@ export function rexprEqShifted(a: RExpr, b: RExpr, offset: number): boolean {
       return b.kind === "casing" && a.upper === b.upper && rexprEqShifted(a.arg, b.arg, offset);
     case "compare":
       // A comparison (status = 'active', amt > 0) is the canonical partial-index predicate shape
-      // (indexes.md §9): same operator + same derived collation + structurally-equal operands.
+      // (indexes.md §9): same operator + same derived collation + structurally-equal operands. =/<>
+      // are byte identity under every collation (collation.md §7), so their collation never changes
+      // the value — only an ordering comparison must agree on it (a persisted index expression
+      // derives by the storage rule, §1 "Function results").
       return (
         b.kind === "compare" &&
         a.op === b.op &&
-        (a.collation?.name ?? null) === (b.collation?.name ?? null) &&
+        (a.op === "eq" ||
+          a.op === "ne" ||
+          (a.collation?.name ?? null) === (b.collation?.name ?? null)) &&
         rexprEqShifted(a.lhs, b.lhs, offset) &&
         rexprEqShifted(a.rhs, b.rhs, offset)
       );
@@ -23218,9 +23249,13 @@ export function asBoundTerm(
   // unicode column, COLLATE "de" over unicode — does NOT match: its order disagrees with the stored
   // keys, so it stays a full scan + residual filter. (A *skewed* collated key never reaches here —
   // keyCollationCtx refuses the whole bound, §12.) The probe is then encoded in the key column's
-  // form (sort key for a Full-collated column — buildKeyBound/indexBoundRows).
+  // form (sort key for a Full-collated column — buildKeyBound/indexBoundRows). One exception: an
+  // EQUALITY on an expression key bounds under any comparison collation (one that reaches here is
+  // C-keyed — a collated expression key stops the prefix first), since every deterministic
+  // collation's = is byte identity (§7) — so lower(email) = $1 still seeks when email is collated and
+  // the comparison inherits that collation through lower (§1 "Function results").
   const cmpColl = e.collation !== null ? e.collation.name : null;
-  if (cmpColl !== colColl) return null;
+  if (cmpColl !== colColl && !(e.op === "eq" && km.kind === "expr")) return null;
   if (e.op !== "eq" && e.op !== "lt" && e.op !== "le" && e.op !== "gt" && e.op !== "ge")
     return null;
   const isPk = (x: RExpr): boolean => keyMatches(km, x);
@@ -24071,6 +24106,7 @@ function groupColumn(
   type: Type,
   collation: string | null,
   noCollation: boolean,
+  collationConflict: boolean,
 ): Column {
   const col: Column = {
     name,
@@ -24085,6 +24121,7 @@ function groupColumn(
     collation,
   };
   if (noCollation) col.noCollation = true;
+  if (collationConflict) col.collationConflict = true;
   return col;
 }
 
@@ -24122,7 +24159,15 @@ function joinGroupOutputs(
   }
   for (const pr of projections) {
     const c = s.columnAt(starColumnIndex(pr));
-    group.columns.push(groupColumn(c.name, c.type, c.collation, c.noCollation === true));
+    group.columns.push(
+      groupColumn(
+        c.name,
+        c.type,
+        c.collation,
+        c.noCollation === true,
+        c.collationConflict === true,
+      ),
+    );
   }
   for (const r of s.rels) {
     if (r.label === "") continue;
@@ -26910,6 +26955,10 @@ export type SetOpPlan = {
   rhs: QueryPlan;
   columnNames: string[];
   columnTypes: ResolvedType[];
+  // columnDerivs is each output column's collation derivation (spec/design/collation.md §1 "Set
+  // operations"): the inputs' common collation, implicit (an explicit input is demoted), "conflicted"
+  // for a UNION ALL column over conflicting implicit collations, none for a non-text column.
+  columnDerivs: Deriv[];
   order: OrderSlot[];
   limit: bigint | null;
   offset: bigint | null;
@@ -26927,6 +26976,9 @@ export type ValuesPlan = {
   rows: RExpr[][];
   columnTypes: ResolvedType[];
   columnNames: string[];
+  // columnDerivs is each column's common collation across the rows (spec/design/collation.md §1), as
+  // for a UNION ALL column — a VALUES list never errors on an implicit conflict.
+  columnDerivs: Deriv[];
 };
 
 // WithPlan is a planned nested `WITH … query_expr` (spec/design/cte.md §7): the nested CTE bindings
@@ -26962,13 +27014,11 @@ export function withBindingPlans(plan: WithPlan): QueryPlan[] {
 export type QueryPlan = SelectPlan | SetOpPlan | ValuesPlan | WithPlan;
 
 // queryPlanColumnDerivs returns the plan's per-output-column collation derivations
-// (spec/design/collation.md §1 "Derived relations") — the basis for a derived table / CTE synthetic
-// column's collation. A VALUES body derives none, and a set operation's output does not yet propagate
-// a collation (§14), so both yield null (none for every column).
-export function queryPlanColumnDerivs(plan: QueryPlan): Deriv[] | null {
-  if (plan.kind === "select") return plan.columnDerivs;
+// (spec/design/collation.md §1 "Derived relations" / "Set operations") — the basis for a derived
+// table / CTE synthetic column's collation and a set operation's common collation.
+export function queryPlanColumnDerivs(plan: QueryPlan): Deriv[] {
   if (plan.kind === "with") return queryPlanColumnDerivs(plan.body);
-  return null;
+  return plan.columnDerivs;
 }
 
 // ScanCache is a prepared statement's memoized scan plan (spec/design/api.md §2.4): the resolved

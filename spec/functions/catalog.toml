@@ -44,7 +44,10 @@ volatility     = "immutable"
 #                 reserved non-scalar id (functions.md): "promoted" = the common
 #                 promoted operand type (arithmetic). Comparisons/null tests/logical
 #                 connectives all yield "boolean"; unknown is represented as a NULL
-#                 boolean (the three-valued domain — types.md).
+#                 boolean (the three-valued domain — types.md). A scalar function with a
+#                 "text" result also CARRIES ITS ARGUMENTS' COLLATION (PostgreSQL's rule —
+#                 ../design/collation.md §1 "Function results"): each core reads this field,
+#                 so no per-core list of collation-propagating functions exists.
 # null            NULL behavior: "propagates" = any NULL operand makes the result
 #                 NULL/unknown; "detects" = inspects NULL-ness, always returns a
 #                 definite boolean, never unknown; "kleene" = three-valued connective

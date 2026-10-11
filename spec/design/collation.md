@@ -205,13 +205,46 @@ SELECT 'ä' < 'z' COLLATE "de"                      -- per-expression collation 
   the synthetic column's **implicit** collation — so `SELECT s FROM (SELECT s FROM t) d ORDER BY s`
   orders by `s`'s frozen collation, and a body `s COLLATE "C"` is implicit `C` outside (it conflicts
   `42P22` with an implicit `unicode` column, as a `C` table column would). A body output with **no**
-  collation — a literal, a non-propagating expression, every VALUES column, every set-operation
-  column (the deferred set-op narrowing, §14) — leaves the synthetic column with none, so it takes a
-  neighbour's like a literal does (PG's `default` collation, which yields to any other implicit one).
-  A recursive CTE's columns take the non-recursive term's derivations (PG additionally rejects a
-  recursive term whose combined collation differs, `42P21`; that check is deferred — §14). Renaming
-  (`AS d(x)`) never re-collates. An unaliased parenthesized join copies its inner columns verbatim
-  ([grammar.md](grammar.md) §15); an aliased one is an ordinary derived table.
+  collation — a literal, a non-propagating expression, a VALUES / set-operation column over literals
+  — leaves the synthetic column with none, so it takes a neighbour's like a literal does (PG's
+  `default` collation, which yields to any other implicit one). A body output whose inputs
+  **conflicted** — an indeterminate expression, or a UNION ALL / VALUES column over two different
+  implicit collations (below) — leaves the column with none too, but it is PostgreSQL's *missing*
+  collation rather than its default: it still yields to a neighbour, while consuming it alone (a bare
+  `ORDER BY x`) is `42P22`. A recursive CTE's columns take the non-recursive term's derivations, and
+  the recursive term may not change them (below). Renaming (`AS d(x)`) never re-collates. An
+  unaliased parenthesized join copies its inner columns verbatim ([grammar.md](grammar.md) §15); an
+  aliased one is an ordinary derived table.
+- **Function results carry their arguments' collation.** A scalar function whose result is `text`
+  combines its arguments' derivations like an operator's operands (PostgreSQL's rule: a collatable
+  result inherits its collatable inputs' collation), so `ORDER BY btrim(name)` sorts by `name`'s
+  collation and `lpad(a, 2, b) < 'x'` over two differently-collated columns is `42P22`. Which
+  functions propagate is **read from the shared function catalog**, not listed per core: every
+  scalar function with an overload whose `result` is `text`
+  ([../functions/catalog.toml](../functions/catalog.toml)) — a non-text argument derives nothing, so
+  the range overloads of `lower`/`upper` are unaffected, and a function returning a non-text type
+  (`length`, `strpos`) carries no collation. Casts, `CASE`, `COALESCE`, `GREATEST`/`LEAST`,
+  aggregates (`min`/`max`), and subquery outputs still derive none (§14). **Persisted index
+  expressions keep the earlier rule**: an expression key's collation and a partial-index predicate's
+  comparisons derive with the function rule off, so an index over `lower(name)` stays `C`-keyed and
+  its stored bytes and membership never change meaning. An equality on such a key still seeks it
+  under any comparison collation (`=` is byte identity under every deterministic collation, §7), so
+  `WHERE lower(name) = $1` keeps its index; an ordering comparison on it is a residual filter.
+- **Set operations take their inputs' common collation.** Each `UNION` / `INTERSECT` / `EXCEPT`
+  output column combines its two inputs' derivations (PostgreSQL's `select_common_collation`): an
+  explicit `COLLATE` in either input wins, two different explicit collations are `42P21`, and the
+  result is the column's *implicit* collation — so the set operation's own `ORDER BY`, and a derived
+  table / CTE over it, sort by it. Two different **implicit** collations are `42P21` at once
+  (`collation mismatch between implicit collations`, before any row is read) for every form except
+  **UNION ALL**, whose column instead settles to no collation (the conflicted state above): the rows
+  come back, but sorting the column without a `COLLATE` is `42P22`. A VALUES list's column takes its
+  rows' common collation the same way as UNION ALL (PostgreSQL). Set operations nest left to right,
+  and a conflicted column yields to the other input.
+- **A recursive CTE's recursive term cannot change a column's collation.** The non-recursive term
+  fixes each column's collation; if the UNION's common collation of the two terms differs from it,
+  that is `42P21` (`recursive query "r" column 1 has collation "default" in non-recursive term but
+  collation "unicode" overall`, PostgreSQL's check and wording — `default` names a literal's absent
+  collation, `(null)` a conflicted one). An explicit `COLLATE` on the non-recursive term fixes it.
 - **Provenance + introspection.** Each collation carries an optional, human-readable
   **description** recording where it came from — auto-filled at **build time** by
   `ExtractHostCollation` with the core/OS/library identity (e.g. `Go 1.26.3 / Linux 7.1 / ICU 73`),
@@ -830,12 +863,14 @@ sub-slices**, each independently testable (CLAUDE.md §10), in dependency order:
   comparison ops including `=`/`<>` (PG raises it regardless), even though `=`/`<>` ignore the
   collation at eval (byte equality, §7). (c) Collation **derivation propagates** through a column
   reference (implicit), `COLLATE` (explicit), and `||` (combine); every other shape resets to none
-  (takes a neighbour's) — the same documented narrowing as 1c. Set-operation output columns do not
-  yet propagate an implicit collation (an explicit `COLLATE` on a set-op ORDER BY key still works) — a
-  deferred follow-on; it would also flow into a derived table / CTE over a set operation, and enable
-  PG's recursive-CTE collation-consistency check (`42P21`). *(Since landed: a derived table / VALUES
-  body / CTE / writable-CTE `RETURNING` column carries its body output's derivation — §1 "Derived
-  relations".)*
+  (takes a neighbour's) — the same documented narrowing as 1c. *(Since landed: a derived table /
+  VALUES body / CTE / writable-CTE `RETURNING` column carries its body output's derivation; a
+  text-returning function's result carries its arguments' collation (read from the function
+  catalog); set-operation and VALUES columns take their inputs' common collation, with PG's eager
+  `42P21` for a non-ALL implicit conflict and UNION ALL's conflicted no-collation state; and PG's
+  recursive-CTE collation check (`42P21`) — §1 "Derived relations" / "Function results" / "Set
+  operations". Still deferred: casts, `CASE`/`COALESCE`/`GREATEST`/`LEAST`, `min`/`max`, and scalar
+  / `IN` subquery outputs derive none.)*
 - **1e — collated keys** ✅ *landed*: the sort-key key encoding as a new
   [encoding.md §2.12](encoding.md) sub-section (`text-collated-sortkey`), a collated text
   `PRIMARY KEY` / ordered secondary index / `UNIQUE` whose stored key is the column collation's UCA
@@ -1075,6 +1110,17 @@ Recorded per CLAUDE.md §1:
 - **No `CREATE COLLATION` and no host-collation import** (§14); a collation comes from a **loaded jed
   bundle** or it does not exist for that database — there is no SQL DDL to define one and no host-ICU
   import path (the only load is the privileged `db.LoadUnicodeData` of jed's own pinned bytes, §4).
+- **An `ORDER BY` key whose own collation is indeterminate is `42P22`**, where PostgreSQL
+  reports `42P21` (`collation mismatch between implicit collations`) for a sort target it can pin at
+  parse time. jed raises the one indeterminate-collation error wherever a conflicted collation is
+  consumed; the SQLSTATE differs, the outcome (an error, no rows) does not. Relatedly, PostgreSQL
+  also errors on a **conflicted UNION ALL column used as a `GROUP BY` or `min`/`max` input** (its hashing / comparison needs a collation); jed groups and de-duplicates by byte equality
+  (§7) and does not consult the collation there, so it returns the rows.
+- **Text functions never demand a collation of their own.** A few PostgreSQL string functions
+  (`replace`, `strpos`, `split_part`, …) look up their input collation to reject nondeterministic
+  collations, and so raise `42P22` when their arguments' collations conflict; jed has only
+  deterministic collations (§6) and collation-free kernels, so such a call succeeds and only a
+  *consumer* of its indeterminate result (a comparison, a sort) errors.
 - **The bare binary is `C` / ASCII-only, like stock SQLite** (§16); PG ships Unicode casing/collation
   linked to the OS. jed's `upper`/`lower` fold ASCII only until a Unicode property bundle is loaded —
   full Unicode casing and linguistic collation are opt-in data, not built into the binary.

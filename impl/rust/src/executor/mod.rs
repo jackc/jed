@@ -1536,6 +1536,7 @@ fn build_prefix_scope<'s>(
         hidden: Vec::new(),
         sub_rels,
         star: None,
+        storage_collation: false,
     }
 }
 
@@ -1646,6 +1647,11 @@ pub(crate) struct Scope<'a> {
     /// columns, then its right input's — concatenated across comma items. `None` for a scope the
     /// FROM-join planner did not build (then `*` is every non-hidden column in FROM order).
     star: Option<Vec<usize>>,
+    /// A PERSISTED index expression's scope (an expression key or a partial-index predicate —
+    /// spec/design/collation.md §1 "Function results"): collation derivation keeps the storage rule
+    /// (a column, `COLLATE`, `||`; a function result carries none), so stored key bytes and
+    /// partial-index membership never change meaning under the query-side function propagation.
+    storage_collation: bool,
 }
 
 /// One inner relation label of an unaliased parenthesized join (grammar.md §15): its table's
@@ -1713,7 +1719,16 @@ impl<'a> Scope<'a> {
             hidden: Vec::new(),
             sub_rels: Vec::new(),
             star: None,
+            storage_collation: false,
         }
+    }
+
+    /// The scope a PERSISTED index expression (an expression key or a partial-index predicate)
+    /// resolves against: [`Scope::single`] with the storage collation rule (`storage_collation`).
+    pub(crate) fn index(catalog: &'a Engine, table: &'a Table) -> Scope<'a> {
+        let mut scope = Scope::single(catalog, table);
+        scope.storage_collation = true;
+        scope
     }
 
     /// A column-less scope — the environment a `DEFAULT` expression resolves against
@@ -1731,6 +1746,7 @@ impl<'a> Scope<'a> {
             hidden: Vec::new(),
             sub_rels: Vec::new(),
             star: None,
+            storage_collation: false,
         }
     }
 
@@ -1808,6 +1824,7 @@ impl<'a> Scope<'a> {
             hidden: Vec::new(),
             sub_rels: Vec::new(),
             star: None,
+            storage_collation: false,
         })
     }
 
@@ -1848,6 +1865,7 @@ impl<'a> Scope<'a> {
             hidden: Vec::new(),
             sub_rels: Vec::new(),
             star: None,
+            storage_collation: false,
         }
     }
 
@@ -3275,13 +3293,13 @@ impl QueryPlan {
     }
 
     /// The per-output-column collation derivations (spec/design/collation.md §1 "Derived
-    /// relations") — the basis for a derived table / CTE synthetic column's collation. A VALUES body
-    /// derives none, and a set operation's output does not yet propagate a collation (§14), so both
-    /// yield `None` (none for every column).
-    fn column_derivs(&self) -> Option<&[Deriv]> {
+    /// relations" / "Set operations") — the basis for a derived table / CTE synthetic column's
+    /// collation and a set operation's common collation.
+    fn column_derivs(&self) -> &[Deriv] {
         match self {
-            QueryPlan::Select(s) => Some(&s.column_derivs),
-            QueryPlan::SetOp(_) | QueryPlan::Values(_) => None,
+            QueryPlan::Select(s) => &s.column_derivs,
+            QueryPlan::SetOp(s) => &s.column_derivs,
+            QueryPlan::Values(v) => &v.column_derivs,
             QueryPlan::With(w) => w.body.column_derivs(),
         }
     }
@@ -3298,6 +3316,9 @@ pub(crate) struct ValuesPlan {
     rows: Vec<Vec<RExpr>>,
     column_types: Vec<ResolvedType>,
     column_names: Vec<String>,
+    /// Each column's common collation across the rows (spec/design/collation.md §1), as for a
+    /// UNION ALL column — a VALUES list never errors on an implicit conflict.
+    column_derivs: Vec<Deriv>,
 }
 
 // === WITH RECURSIVE analysis (spec/design/recursive-cte.md) ==========================
@@ -3477,8 +3498,39 @@ fn check_recursive_column_types(
         if !union_all {
             require_setop_equality(at)?;
         }
+        // The non-recursive term fixed the relation's collation, so the UNION's overall common
+        // collation must equal it (PostgreSQL's recursive-CTE check, spec/design/collation.md §1):
+        // a recursive term cannot re-collate a column. Mismatch is 42P21.
+        if *at == ResolvedType::Text {
+            let ad = &anchor.column_derivs()[i];
+            let overall = common_collation(
+                &[ad.clone(), recursive.column_derivs()[i].clone()],
+                union_all,
+            )?;
+            let (non_rec, all) = (collation_identity(ad), collation_identity(&overall));
+            if non_rec != all {
+                return Err(EngineError::new(
+                    SqlState::CollationMismatch,
+                    format!(
+                        "recursive query \"{name}\" column {} has collation \"{non_rec}\" in non-recursive term but collation \"{all}\" overall",
+                        i + 1,
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
+}
+
+/// The collation a derivation settles to, named as PostgreSQL reports it (the recursive-CTE check,
+/// spec/design/collation.md §1): a collation's name, `default` for no collation (PG's default
+/// collation — a literal's), `(null)` for a conflicted / indeterminate one (PG's InvalidOid).
+fn collation_identity(d: &Deriv) -> &str {
+    match d {
+        Deriv::Implicit(n) | Deriv::Explicit(n) => n,
+        Deriv::None => "default",
+        Deriv::Indeterminate | Deriv::Conflicted => "(null)",
+    }
 }
 
 /// Total self-references to `name` anywhere in a query expression (deep — FROM relations at every
@@ -3812,7 +3864,7 @@ fn cte_synthetic_table(
         name,
         plan.column_names(),
         plan.column_types(),
-        plan.column_derivs(),
+        Some(plan.column_derivs()),
         rename,
     )
 }
@@ -3870,11 +3922,9 @@ fn cte_synthetic_table_cols(
                 identity: None,
                 collation: None,
                 no_collation: false,
+                collation_conflict: false,
             };
-            let d = match body_derivs {
-                Some(ds) => &ds[i],
-                None => &Deriv::None,
-            };
+            let d = body_derivs.map_or(&Deriv::None, |ds| &ds[i]);
             set_synthetic_collation(&mut col, d);
             Ok(col)
         })
@@ -3893,8 +3943,9 @@ fn cte_synthetic_table_cols(
 /// Record a body output's collation derivation on its synthetic column (spec/design/collation.md §1
 /// "Derived relations", PostgreSQL's rule): an implicit OR explicit body collation becomes the
 /// column's IMPLICIT collation (an outer reference is a plain column reference); any other body
-/// output has no collation and takes a neighbour's (PG's default). An indeterminate body output
-/// also has none in PG (unreachable today: no output expression combines collations).
+/// output has no collation and takes a neighbour's (PG's default). An indeterminate or conflicted
+/// body output has none either (PG's InvalidOid) — it still yields to a neighbour, but consuming it
+/// alone is 42P22.
 fn set_synthetic_collation(col: &mut Column, d: &Deriv) {
     match d {
         Deriv::Implicit(name) | Deriv::Explicit(name) => {
@@ -3902,7 +3953,8 @@ fn set_synthetic_collation(col: &mut Column, d: &Deriv) {
                 col.collation = Some(name.clone());
             }
         }
-        Deriv::None | Deriv::Indeterminate => col.no_collation = true,
+        Deriv::None => col.no_collation = true,
+        Deriv::Indeterminate | Deriv::Conflicted => col.collation_conflict = true,
     }
 }
 
@@ -4325,6 +4377,7 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
         identity: None,
         collation: None,
         no_collation: false,
+        collation_conflict: false,
     };
     let col = |name: &str, ty: ScalarType, not_null: bool| mk_col(name, Type::Scalar(ty), not_null);
     // A `text[]` member-list column (introspection.md §5.1 — the indexed / member column names).
@@ -4499,6 +4552,7 @@ fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> Box<Table> {
             identity: None,
             collation: None,
             no_collation: false,
+            collation_conflict: false,
         }],
         pk: Vec::new(),
         checks: Vec::new(),
@@ -4865,6 +4919,7 @@ fn jt_column(name: &str, ty: ScalarType, decimal: Option<DecimalTypmod>) -> Colu
         identity: None,
         collation: None,
         no_collation: false,
+        collation_conflict: false,
     }
 }
 
@@ -5084,6 +5139,7 @@ fn srf_table_cols(func_name: &str, alias: Option<&str>, cols: Vec<(&str, Type)>)
                 identity: None,
                 collation: None,
                 no_collation: false,
+                collation_conflict: false,
             })
             .collect(),
         pk: Vec::new(),

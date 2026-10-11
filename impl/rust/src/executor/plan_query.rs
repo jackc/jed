@@ -875,6 +875,24 @@ impl Engine {
             }
         }
         let column_names = lhs.column_names().to_vec();
+        // Each text column's common collation (spec/design/collation.md §1 "Set operations",
+        // PostgreSQL): an implicit conflict is 42P21 except under UNION ALL, whose column then has
+        // none (42P22 only when consumed).
+        let none_ok = so.op == SetOpKind::Union && so.all;
+        let column_derivs: Vec<Deriv> = column_types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                if *t != ResolvedType::Text {
+                    return Ok(Deriv::None);
+                }
+                let inputs = [
+                    lhs.column_derivs()[i].clone(),
+                    rhs.column_derivs()[i].clone(),
+                ];
+                common_collation(&inputs, none_ok)
+            })
+            .collect::<Result<_>>()?;
 
         // Trailing ORDER BY resolves keys by OUTPUT column name (no relation scope after a set
         // operation): a qualified key is 42P01, an unknown name is 42703.
@@ -883,7 +901,11 @@ impl Engine {
             let slot = resolve_setop_order_key(key, &column_names)?;
             // An explicit `COLLATE` on a set-operation ORDER BY key (spec/design/collation.md §1):
             // the output column must be text (42804); the name resolves ("C", else loaded or 42704).
+            // Absent one, a text key sorts by the column's common collation.
             let coll = match &key.collation {
+                None if column_types[slot] == ResolvedType::Text => {
+                    resolve_deriv(self, column_derivs[slot].clone())?
+                }
                 None => None,
                 Some(name) => {
                     if column_types[slot] != ResolvedType::Text {
@@ -904,6 +926,7 @@ impl Engine {
             rhs,
             column_names,
             column_types,
+            column_derivs,
             order,
             limit: so.limit,
             offset: so.offset,
@@ -942,12 +965,15 @@ impl Engine {
             hidden: Vec::new(),
             sub_rels: Vec::new(),
             star: None,
+            storage_collation: false,
         };
         let mut resolved_rows: Vec<Vec<RExpr>> = Vec::with_capacity(rows.len());
         let mut col_types: Vec<ResolvedType> = Vec::with_capacity(arity);
         // Per column: the 0-based bind-parameter slots appearing in it, typed in a second pass from
         // the unified column type (a $N takes its column's type, like a set-operation operand).
         let mut col_params: Vec<Vec<usize>> = vec![Vec::new(); arity];
+        // Per column: each row's collation derivation, combined after the loop (collation.md §1).
+        let mut col_derivs: Vec<Vec<Deriv>> = vec![Vec::with_capacity(rows.len()); arity];
         for (ri, row) in rows.iter().enumerate() {
             if row.len() != arity {
                 return Err(EngineError::new(
@@ -963,6 +989,7 @@ impl Engine {
                 if let RExpr::Param(idx0) = &node {
                     col_params[ci].push(*idx0);
                 }
+                col_derivs[ci].push(derive_collation(&scope, val)?);
                 if ri == 0 {
                     col_types.push(ty);
                 } else {
@@ -983,10 +1010,24 @@ impl Engine {
         // PostgreSQL names a VALUES relation's columns column1, column2, … ; the derived table's
         // optional column-rename list overrides them at the synthetic relation (cte_synthetic_table).
         let column_names = (1..=arity).map(|i| format!("column{i}")).collect();
+        // Each text column's common collation across the rows — PostgreSQL treats a VALUES column
+        // like a UNION ALL one (an implicit conflict leaves it with none, never an error).
+        let column_derivs = col_types
+            .iter()
+            .zip(&col_derivs)
+            .map(|(t, ds)| {
+                if *t == ResolvedType::Text {
+                    common_collation(ds, true)
+                } else {
+                    Ok(Deriv::None)
+                }
+            })
+            .collect::<Result<_>>()?;
         Ok(ValuesPlan {
             rows: resolved_rows,
             column_types: col_types,
             column_names,
+            column_derivs,
         })
     }
 
