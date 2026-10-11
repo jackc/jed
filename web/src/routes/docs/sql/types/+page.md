@@ -173,8 +173,9 @@ as UTC rather than in the session time zone, so in a non-UTC session it can diff
 same string held in a `text` column. Write the offset explicitly when it matters.
 
 jed's input grammars are stricter than PostgreSQL's, the same as for literals: the `'now'`, `'today'`,
-and `'epoch'` timestamp words, ISO-8601 (`P1D`) and SQL-standard interval input, and the `bytea`
-escape format are rejected.
+and `'epoch'` timestamp words, ISO-8601 (`P1D`) and SQL-standard interval input (`'1-2'`,
+`'1 1:00'`), and the `bytea` escape format are rejected. A unit-less interval number is read as
+seconds only when it is the last field (`'5'`, `'1 day 2'`).
 
 ## Casting to text
 

@@ -603,6 +603,10 @@ export function parseInterval(input: string): Interval {
 
   let ago = false;
   let sawField = false;
+  // Whether whitespace followed the previous field. Fields must be whitespace-separated, so
+  // run-together input such as the SQL-standard '1-2' (deferred, §3) fails closed rather than
+  // being read as two adjacent fields.
+  let separated = true;
   while (!c.done()) {
     const word0 = c.peekWord();
     if (word0 !== undefined && word0.toLowerCase() === "ago") {
@@ -611,6 +615,7 @@ export function parseInterval(input: string): Interval {
       c.skipWs();
       break;
     }
+    if (!separated) throw invalidInterval("interval fields must be separated by whitespace");
 
     let neg = false;
     const p = c.peek();
@@ -634,25 +639,27 @@ export function parseInterval(input: string): Interval {
         [fracNum, fracDen] = readUnitFrac(c);
       }
       c.skipWs();
-      // A bare number with no unit defaults to SECONDS (PG); a trailing `ago` is left for the
-      // loop top; a recognized unit applies its weights; else 22007.
-      const secs: [bigint, bigint, bigint] = [0n, 0n, MICROS_PER_SEC];
+      // A recognized unit applies its weights; else 22007. A number with no unit means SECONDS
+      // (PG), but only as the LAST field: elsewhere PG reads it positionally as a SQL-standard
+      // field ('1 1:00' is 1 day), which jed defers (§3), so it fails closed.
       let weights: [bigint, bigint, bigint];
       const word = c.peekWord();
-      if (word !== undefined && word.toLowerCase() === "ago") {
-        weights = secs;
-      } else if (word !== undefined) {
+      if (word !== undefined && word.toLowerCase() !== "ago") {
         c.i += word.length;
         const w = unitWeights(word);
         if (w === undefined) throw invalidInterval(`unknown interval unit "${word}"`);
         weights = w;
+      } else if (!c.done()) {
+        throw invalidInterval("a number without a unit must be the last interval field");
       } else {
-        weights = secs;
+        weights = [0n, 0n, MICROS_PER_SEC];
       }
       applyUnit(acc, neg, intPart, fracNum, fracDen, weights[0], weights[1], weights[2]);
       sawField = true;
     }
+    const before = c.i;
     c.skipWs();
+    separated = c.i > before;
   }
 
   if (!c.done()) throw invalidInterval("trailing characters in interval");

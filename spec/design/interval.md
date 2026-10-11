@@ -79,9 +79,11 @@ The accepted input is a whitespace-separated sequence of **segments**, optionall
 and optionally followed by `ago`:
 
 ```
-input   := '@'? segment (ws segment)* (ws 'ago')?
-segment := sign? number unit            # a unit value (with optional fractional part)
+input   := '@'? segment (ws segment)* (ws 'ago')?          # `ago` may also abut a bare time
+         | '@'? (segment ws)* bare                  # a unitless number only as the LAST field
+segment := sign? number ws? unit        # a unit value (with optional fractional part)
          | sign? HH ':' MM (':' SS ('.' frac)?)?   # a bare time (hours unbounded)
+bare    := sign? number                 # seconds, exactly as if `seconds` followed it
 sign    := '+' | '-'                    # per-segment
 ```
 
@@ -97,6 +99,30 @@ sign    := '+' | '-'                    # per-segment
   segment; the hour is **unbounded** (`'100:00:00'`), minutes/seconds are 0–59, and 0–6 fractional
   digits are exact, 7+ rounded to µs **half away from zero** (the engine's one mode — decimal.md
   §3, identical to timestamp).
+
+**Unitless numbers and the deferred SQL-standard forms — fail closed.** PostgreSQL reads interval
+input right to left and gives a unitless number a *positional* meaning: the rightmost one is
+seconds, but one left of a bare time is days (`'1 1:00'` = `1 day 01:00:00`), one left of an
+`hour` field is days (`'5 1 hour'` = `5 days 01:00:00`), and `N-M` is the SQL-standard year-month
+form (`'1-2'` = `1 year 2 mons`, `'1-2 3 4:05:06'` = `1 year 2 mons 3 days 04:05:06`). jed defers
+these SQL-standard forms, and must never *misread* them (an earlier parser read `'1-2'` as `1 s` +
+`-2 s` = `-00:00:01`). Two rules make the deferral fail closed with `22007`:
+
+1. **Fields are whitespace-separated.** A segment may not start immediately after the previous one
+   (`'1-2'`, `'1day-2'`, `'1hour2min'`, `'1:00-2'` all trap). Only a unit word may abut its own
+   number (`'1day'`), and `ago` may abut the field before it (`'1:00:00ago'`) — both as in PG.
+2. **A unitless number is accepted only as the last field**, where it means seconds (`'5'`,
+   `'-1.5'`, `'1 day 2'` = `1 day 00:00:02`). That is exactly where PG also reads seconds: in PG
+   `'X N'` is equivalent to `'X N seconds'`. Anywhere else — `'1 1:00'`, `'5 1 hour'`, `'1 2'`,
+   `'5 ago'` — it traps. PG rejects `'1 2'` / `'5 ago'` too; for `'1 1:00'` / `'5 1 hour'` /
+   `'1-2'` the trap is a **deliberate divergence** (PG accepts), pinned by the `parse_error`
+   vectors in [../encoding/intervals.toml](../encoding/intervals.toml) rather than the corpus.
+
+PG also accepts `'.5'` and `'5.'` (no digits on one side of the point); jed traps both — fail
+closed, not a misread. **Known remaining leniency:** PG rejects any input that sets the same field
+twice (`'1 day 1 day'`, `'1 sec 5'`, `'1:00 5'`, `'1 hour 1:00'`), via its per-field mask; jed
+instead *sums* repeated fields (`'1 day 1 day'` = `2 days`, `'1:00 5'` = `01:00:05`). That is jed
+accepting input PG rejects, never a different answer to input PG accepts.
 
 **Fractional-unit cascade.** A unit value may carry a fractional part, which cascades down using
 1 month = 30 days and 1 day = 24 h, **per token, independently** (PG semantics; jed computes it with

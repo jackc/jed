@@ -613,6 +613,10 @@ pub fn parse_interval(input: &str) -> Result<Interval> {
 
     let mut ago = false;
     let mut saw_field = false;
+    // Whether whitespace followed the previous field. Fields must be whitespace-separated, so
+    // run-together input such as the SQL-standard `'1-2'` (deferred, §3) fails closed rather than
+    // being read as two adjacent fields.
+    let mut separated = true;
     while !c.done() {
         // Trailing `ago` negates the whole interval; nothing may follow it.
         if let Some(word) = peek_word(&c)
@@ -622,6 +626,11 @@ pub fn parse_interval(input: &str) -> Result<Interval> {
             ago = true;
             c.skip_ws();
             break;
+        }
+        if !separated {
+            return Err(invalid_format(
+                "interval fields must be separated by whitespace",
+            ));
         }
 
         // Optional per-segment sign.
@@ -651,23 +660,29 @@ pub fn parse_interval(input: &str) -> Result<Interval> {
                 (0, 1)
             };
             c.skip_ws();
-            // A bare number with no unit defaults to SECONDS (PG `interval '5'` = 5 seconds);
-            // a trailing `ago` is left for the loop top. A recognized unit applies its weights;
-            // an unrecognized unit word is a 22007.
-            let secs = (0, 0, MICROS_PER_SEC as i128);
+            // A recognized unit applies its weights; an unrecognized unit word is a 22007. A
+            // number with no unit means SECONDS (PG `interval '5'` = 5 seconds), but only as the
+            // LAST field: elsewhere PG reads it positionally as a SQL-standard field (`'1 1:00'`
+            // is 1 day), which jed defers (§3), so it fails closed instead of misreading.
             let per = match peek_word(&c) {
-                Some(u) if u.eq_ignore_ascii_case("ago") => secs,
-                Some(u) => {
+                Some(u) if !u.eq_ignore_ascii_case("ago") => {
                     c.i += u.len();
                     unit_weights(&u)
                         .ok_or_else(|| invalid_format(format!("unknown interval unit \"{u}\"")))?
                 }
-                None => secs,
+                _ if !c.done() => {
+                    return Err(invalid_format(
+                        "a number without a unit must be the last interval field",
+                    ));
+                }
+                _ => (0, 0, MICROS_PER_SEC as i128),
             };
             apply_unit(&mut acc, neg, int_part, frac_num, frac_den, per)?;
             saw_field = true;
         }
+        let before = c.i;
         c.skip_ws();
+        separated = c.i > before;
     }
 
     if !c.done() {

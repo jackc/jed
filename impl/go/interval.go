@@ -596,6 +596,10 @@ func parseInterval(input string) (Interval, error) {
 
 	ago := false
 	sawField := false
+	// Whether whitespace followed the previous field. Fields must be whitespace-separated, so
+	// run-together input such as the SQL-standard '1-2' (deferred, §3) fails closed rather than
+	// being read as two adjacent fields.
+	separated := true
 	one := big.NewInt(1)
 	for !c.done() {
 		if word, ok := c.peekWord(); ok && strings.EqualFold(word, "ago") {
@@ -603,6 +607,9 @@ func parseInterval(input string) (Interval, error) {
 			ago = true
 			c.skipWS()
 			break
+		}
+		if !separated {
+			return Interval{}, invalidInterval("interval fields must be separated by whitespace")
 		}
 
 		neg := false
@@ -637,20 +644,19 @@ func parseInterval(input string) (Interval, error) {
 				}
 			}
 			c.skipWS()
-			// A bare number with no unit defaults to SECONDS (PG); a trailing `ago` is left for
-			// the loop top; a recognized unit applies its weights; else 22007.
+			// A recognized unit applies its weights; else 22007. A number with no unit means
+			// SECONDS (PG), but only as the LAST field: elsewhere PG reads it positionally as a
+			// SQL-standard field ('1 1:00' is 1 day), which jed defers (§3), so it fails closed.
 			var mper, dper, uper int64
-			if word, has := c.peekWord(); has {
-				if strings.EqualFold(word, "ago") {
-					mper, dper, uper = 0, 0, microsPerSec
-				} else {
-					c.i += len(word)
-					var known bool
-					mper, dper, uper, known = unitWeights(word)
-					if !known {
-						return Interval{}, invalidInterval(fmt.Sprintf("unknown interval unit %q", word))
-					}
+			if word, has := c.peekWord(); has && !strings.EqualFold(word, "ago") {
+				c.i += len(word)
+				var known bool
+				mper, dper, uper, known = unitWeights(word)
+				if !known {
+					return Interval{}, invalidInterval(fmt.Sprintf("unknown interval unit %q", word))
 				}
+			} else if !c.done() {
+				return Interval{}, invalidInterval("a number without a unit must be the last interval field")
 			} else {
 				mper, dper, uper = 0, 0, microsPerSec
 			}
@@ -659,7 +665,9 @@ func parseInterval(input string) (Interval, error) {
 			}
 			sawField = true
 		}
+		before := c.i
 		c.skipWS()
+		separated = c.i > before
 	}
 
 	if !c.done() {

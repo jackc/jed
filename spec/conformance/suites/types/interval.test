@@ -128,6 +128,23 @@ SELECT INTERVAL '90'
 ----
 00:01:30
 
+# ...also as the last field after unit fields (it reads as seconds there too)
+query T nosort
+SELECT INTERVAL '1 day 2'
+----
+1 day 00:00:02
+
+query T nosort
+SELECT INTERVAL '1 hour -5'
+----
+00:59:55
+
+# a unit word may directly follow its number
+query T nosort
+SELECT INTERVAL '1day 2hours'
+----
+1 day 02:00:00
+
 # --- parse errors (PG agrees: bad interval input fails) ---
 
 statement error 22007
@@ -139,6 +156,23 @@ SELECT INTERVAL 'not an interval'
 # a bare ambiguous `m` is not accepted (months vs minutes)
 statement error 22007
 SELECT INTERVAL '1 m'
+
+# a unitless number that is not the last field (spec/design/interval.md §3)
+statement error 22007
+SELECT INTERVAL '1 2'
+
+statement error 22007
+SELECT INTERVAL '5 ago'
+
+statement error 22007
+SELECT INTERVAL '1 day 5 ago'
+
+# fields run together without whitespace
+statement error 22007
+SELECT INTERVAL '1day-2'
+
+statement error 22007
+SELECT INTERVAL '1hour2min'
 
 # --- G24: mixed-sign render + field overflow ---
 
