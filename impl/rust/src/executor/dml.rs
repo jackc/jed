@@ -241,9 +241,6 @@ impl Engine {
         // The CHECK constraints, resolved once per statement in evaluation (name) order;
         // `insert_rows` evaluates them per candidate row (constraints.md §4.4).
         let checks = self.resolve_checks(tdef)?;
-        // Each column's EXPRESSION default, resolved once per statement (constraints.md §2);
-        // applied per omitted column / `DEFAULT` slot, sharing one per-statement `StmtRng`.
-        let default_exprs = self.resolve_default_exprs(tdef)?;
         // The columns' resolved `ColType`s (a scalar, or a composite resolved to its field tree),
         // for composite-aware materialization + store-coercion (spec/design/composite.md §4).
         let col_types: Vec<ColType> = self
@@ -295,6 +292,19 @@ impl Engine {
                 }
             }
         }
+        // The EXPRESSION default of each column this INSERT can default, resolved once per
+        // statement (constraints.md §2); applied per omitted column / `DEFAULT` slot, sharing one
+        // per-statement `StmtRng`. A default the statement cannot apply is not resolved, so its host
+        // function need not be registered (spec/design/extensibility.md §7.1.1).
+        let value_rows = match &source {
+            InsertSource::Values(rows) => rows.as_slice(),
+            InsertSource::Select(_) => &[],
+        };
+        let default_exprs = self.resolve_default_exprs_for(
+            tdef,
+            Some(&insert_default_needs(&provided, value_rows)),
+            &mut ParamTypes::default(),
+        )?;
         // The GENERATED ALWAYS columns still explicitly targeted (and not OVERRIDING SYSTEM VALUE):
         // supplying a non-DEFAULT value to one is `428C9`. Collected as (column ordinal, value
         // position) so the source branches can enforce it (VALUES per-row, SELECT up-front).
@@ -751,8 +761,6 @@ impl Engine {
             .to_vec();
         let mut ptypes = ParamTypes::default();
         let checks = self.resolve_checks_with_params(&table, &mut ptypes)?;
-        let default_exprs = self.resolve_default_exprs_with_params(&table, &mut ptypes)?;
-        let rindexes = self.resolve_table_indexes_with_params(&table, &mut ptypes)?;
         let colls = self.column_collations(&table.columns);
         let pk = table
             .pk_indices()
@@ -798,6 +806,17 @@ impl Engine {
                 }
             }
         }
+        let InsertSource::Values(rows) = &ins.source else {
+            unreachable!("plain VALUES cache called for a SELECT source")
+        };
+        // Only the defaults this INSERT can apply (spec/design/extensibility.md §7.1.1), then the
+        // indexes — the same check → default → index resolution order the general path follows.
+        let default_exprs = self.resolve_default_exprs_for(
+            &table,
+            Some(&insert_default_needs(&provided, rows)),
+            &mut ptypes,
+        )?;
+        let rindexes = self.resolve_table_indexes_with_params(&table, &mut ptypes)?;
         let always_targeted: Vec<InsertAlwaysTarget> = if ins.overriding == Some(Overriding::System)
         {
             Vec::new()
@@ -813,9 +832,6 @@ impl Engine {
                     _ => None,
                 })
                 .collect()
-        };
-        let InsertSource::Values(rows) = &ins.source else {
-            unreachable!("plain VALUES cache called for a SELECT source")
         };
         for values in rows {
             if values.len() != arity {
@@ -3083,9 +3099,17 @@ impl Engine {
         // UPDATE SET col = DEFAULT reuses INSERT's once-per-statement resolution of expression
         // defaults. Constant/no defaults become constant RExpr nodes below, so applying them is
         // free; expression defaults are evaluated once per matched row through the UPDATE meter
-        // and statement RNG (constraints.md §2).
+        // and statement RNG (constraints.md §2). Only the assigned-DEFAULT columns resolve
+        // (spec/design/extensibility.md §7.1.1); an unknown column name is left to the
+        // per-assignment 42703 below.
         let mut default_exprs = if upd.assignments.iter().any(|a| a.is_default) {
-            self.resolve_default_exprs(table)?
+            let mut need = vec![false; table.columns.len()];
+            for a in upd.assignments.iter().filter(|a| a.is_default) {
+                if let Some(idx) = table.column_index(&a.column) {
+                    need[idx] = true;
+                }
+            }
+            self.resolve_default_exprs_for(table, Some(&need), &mut ParamTypes::default())?
         } else {
             Vec::new()
         };
@@ -3696,4 +3720,21 @@ impl Engine {
             },
         })
     }
+}
+
+/// Which columns an INSERT can apply a default to (spec/design/extensibility.md §7.1.1): every omitted
+/// column (`provided[i] == None` — including `DEFAULT VALUES` and `OVERRIDING USER VALUE` identity
+/// columns) and every column a VALUES row fills with a top-level `DEFAULT`. `rows` is empty for a
+/// SELECT source, whose projection never yields `DEFAULT`. A row of the wrong arity is skipped here;
+/// the caller reports it.
+fn insert_default_needs(provided: &[Option<usize>], rows: &[Vec<InsertValue>]) -> Vec<bool> {
+    provided
+        .iter()
+        .map(|p| match p {
+            None => true,
+            Some(p) => rows
+                .iter()
+                .any(|values| matches!(values.get(*p), Some(InsertValue::Default))),
+        })
+        .collect()
 }

@@ -672,8 +672,9 @@ against. Host *types* (§4.3, later) extend this to the full tuple in the persis
 
 ### 7.1 Host functions in table definitions — `DEFAULT` and `CHECK` (designed, §14 step 4b)
 
-> **Status: built in Go and in the Ruby format reference; Rust and TS ports in progress.** This
-> closes the §14 step-4 deferral. Generated columns are **out of
+> **Status: landed (all three cores, `format_version` 35).** This closes the §14 step-4 deferral.
+> The Ruby gem cannot yet declare a `component_id`, so its host functions cannot back a `CHECK` (or
+> an index); that is a gem follow-on in [TODO.md](../../TODO.md). Generated columns are **out of
 > scope**: jed has no `GENERATED ALWAYS AS (expr) STORED` (only `GENERATED … AS IDENTITY`), so
 > there is nothing to extend. A future stored generated column would take the **index** rule (§8.1),
 > not this one. Its stored value is derived from the function the way an index key is, so a changed
@@ -1116,7 +1117,7 @@ cleanup, not a prerequisite. A suggested sequence:
    heap scan; write → `XX002`/`42883`, read-only). Also closed the latent volatile-host-function leak
    (`42P17`). Reused `XX002` for the reopen verdict (the minimal per-object §11 verdict for indexes;
    the full compatibility.md manifest stays step 5).
-   - **4b. Host functions in `DEFAULT` / `CHECK`** (§7.1) — **designed, not built.** A `CHECK`
+   - **4b. Host functions in `DEFAULT` / `CHECK`** (§7.1) ✅ **landed (all three cores).** A `CHECK`
      persists a per-check dependency list (`format_version` 35) and refuses writes on mismatch; a
      `DEFAULT` persists nothing and resolves lazily. Generated columns are out of scope: jed has none.
 5. **Opaque host scalar *types*** (Storable/Equatable/Ordered) + **derived `array<host-type>`** (§3.1,
@@ -1144,7 +1145,7 @@ When a section here is ratified, update **in the same change** (mirrors [determi
   `CREATE FUNCTION … LANGUAGE HOST` / `CREATE TYPE … AS HOST`).
 - **[../fileformat/format.md](../fileformat/format.md)** — the per-index **host-function dependency
   list** (`index_flags` bit2 + the dep tuple) at **`format_version 31`** (✅ done, §14 step 4); the
-  per-check dependency list (`check_flags` bit0) at **`format_version 35`** (§7.1, designed — step 4b);
+  per-check dependency list (`check_flags` bit0) at **`format_version 35`** (✅ done, §7.1 — step 4b);
   the `type_code = 21` host-type catalog + opaque-framed body come later at the next free
   `format_version` (§14 step 5).
 - **[../functions/catalog.toml](../functions/catalog.toml)** — confirm the runtime function registry
@@ -1177,7 +1178,7 @@ When a section here is ratified, update **in the same change** (mirrors [determi
 | §4.3 | Host scalar types (Storable→Indexed ladder, `type_code 21`, opaque) | **proposed** |
 | §5 | Dispatch — registry the many, inline the few (§5.1 splits the **seam** from the **dogfood**; function seam first) | **built** for built-in scalar functions + aggregates *and* the **host function injection seam** (§14 step 3, all 3 cores): a host kernel is reached by id through the frozen registry alongside the inlined built-in arms. Type-vtable depth (Fork A) + the type-method seam (step 5) **proposed** |
 | §6 | Persisted host-type catalog + on-disk representation (`type_code 21`, next free `format_version`) | **proposed** (the per-index host-dep list of step 4 landed at `format_version 31`) |
-| §7 | Registration — **Model B (registry-only, no SQL DDL)**; lean `component_id` + `semantic_version` | **landed for functions** (§14 step 4, all 3 cores); §7.1 host functions in `DEFAULT`/`CHECK` **designed** (step 4b, `format_version 35`); the full 5-field tuple + host-type catalog **proposed** |
+| §7 | Registration — **Model B (registry-only, no SQL DDL)**; lean `component_id` + `semantic_version` | **landed for functions** (§14 step 4, all 3 cores); §7.1 host functions in `DEFAULT`/`CHECK` **landed** (step 4b, all 3 cores, `format_version 35`); the full 5-field tuple + host-type catalog **proposed** |
 | §8 | The index connection — expression indexes (resolved-dependency persistence) + opclass registry | **§8.1 landed** (all 3 cores, `format_version 31`, §14 step 4); §8.2 opclass registry **proposed** |
 | §9 | Cost — cooperative accounting + admission, **not** a sandbox | **proposed** (adopts [cost.md](cost.md) §6) |
 | §10 | Determinism ledger + containment for host code | **proposed** (extends [determinism.md](determinism.md)) |

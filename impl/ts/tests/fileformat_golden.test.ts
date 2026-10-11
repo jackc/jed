@@ -223,6 +223,31 @@ function hostfuncIndexTableDB(): Engine {
   return db;
 }
 
+// hostfuncCheckTableDB has a HOST-FUNCTION check dependency (v35 — each check entry's check_flags byte
+// + the dependency list, extensibility.md §7.1.3): t_a_check calls no host function (flags 0) and
+// t_a_check1 calls geo_hash(a) (flags 1 + the list). EMPTY table, so the fixture isolates the v35
+// catalog change. Must match verify.rb's HOSTFUNC_CHECK_TABLE.
+function hostfuncCheckTableDB(): Engine {
+  const db = goldenDb();
+  const reg = new ExtensionRegistry();
+  reg.registerFunction({
+    name: "geo_hash",
+    argTypes: ["i64"],
+    result: "i64",
+    kernel: (args: Value[]) => {
+      const a = args[0]!;
+      if (a.kind !== "int") throw new Error("strict + resolved i64 arg");
+      return intValue(a.int * 10n);
+    },
+    volatility: "immutable",
+    componentId: "com.example/geo_hash",
+    semanticVersion: 1,
+  });
+  db.session.extensions = reg;
+  run(db, "CREATE TABLE t (id i64 PRIMARY KEY, a i64 CHECK (a <> 0), CHECK (geo_hash(a) > 0))");
+  return db;
+}
+
 // fkTableDB has FOREIGN KEY constraints (v11 — spec/design/constraints.md §6): pins the catalog
 // foreign-key list. Parent `p` (a PK + two UNIQUE constraints, the FK targets); child `c` with
 // four FKs covering every shape — a named FK to the UNIQUE column (c_code_fk), a self-reference to
@@ -1020,6 +1045,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "partial_index_table.jed", build: partialIndexTableDB },
     { name: "timezone_index_table.jed", build: timezoneIndexTableDB },
     { name: "hostfunc_index_table.jed", build: hostfuncIndexTableDB },
+    { name: "hostfunc_check_table.jed", build: hostfuncCheckTableDB },
     { name: "gin_array_table.jed", build: ginArrayTableDB },
     { name: "gin_uuid_table.jed", build: ginUuidTableDB },
     { name: "fk_table.jed", build: fkTableDB },
@@ -1095,6 +1121,7 @@ test("read goldens reproduces rows", () => {
     { name: "partial_index_table.jed", build: partialIndexTableDB, table: "t" },
     { name: "timezone_index_table.jed", build: timezoneIndexTableDB, table: "t" },
     { name: "hostfunc_index_table.jed", build: hostfuncIndexTableDB, table: "t" },
+    { name: "hostfunc_check_table.jed", build: hostfuncCheckTableDB, table: "t" },
     { name: "gin_array_table.jed", build: ginArrayTableDB, table: "t" },
     { name: "gin_uuid_table.jed", build: ginUuidTableDB, table: "t" },
     { name: "fk_table.jed", build: fkTableDB, table: "c" },

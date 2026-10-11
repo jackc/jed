@@ -105,7 +105,10 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // v32: persisted timezone dependencies (spec/design/index-dependencies.md).
 // v33: full-page meta CRC and inline/overflow validated-COW manifest.
 // v34: meta offset 56 carries the exact live page count (spec/design/memory.md §8.7).
-const FORMAT_VERSION: u16 = 34;
+// v35: every CHECK catalog entry gains a trailing `check_flags` byte (bit0 `has_host_deps`; bits 1-7
+// reserved 0) followed, when bit0 is set, by the v31 host-function dependency list
+// (spec/design/extensibility.md §7.1.3).
+const FORMAT_VERSION: u16 = 35;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -3561,6 +3564,13 @@ fn table_entry_bytes(
         let ce = check.expr_text.as_bytes();
         out.extend_from_slice(&(ce.len() as u16).to_be_bytes());
         out.extend_from_slice(ce);
+        // v35: check_flags (bit0 has_host_deps — extensibility.md §7.1.3), then the dependency list.
+        if check.host_deps.is_empty() {
+            out.push(0);
+        } else {
+            out.push(1);
+            push_host_deps(&mut out, &check.host_deps);
+        }
     }
     // Secondary indexes (v5): count, then per index the name, key-column ordinals
     // (index-key order, duplicates allowed), the v6 flags byte (bit0 unique —
@@ -3609,21 +3619,7 @@ fn table_entry_bytes(
         // when bit2 is set. Already sorted by (name, arg-type codes) at CREATE INDEX (a stable order,
         // CLAUDE.md §8).
         if !idx.host_deps.is_empty() {
-            out.extend_from_slice(&(idx.host_deps.len() as u16).to_be_bytes());
-            for dep in &idx.host_deps {
-                let dn = dep.name.as_bytes();
-                out.extend_from_slice(&(dn.len() as u16).to_be_bytes());
-                out.extend_from_slice(dn);
-                out.extend_from_slice(&(dep.arg_types.len() as u16).to_be_bytes());
-                for &a in &dep.arg_types {
-                    out.push(type_code_for_scalar(a));
-                }
-                out.push(type_code_for_scalar(dep.result));
-                let cid = dep.component_id.as_bytes();
-                out.extend_from_slice(&(cid.len() as u16).to_be_bytes());
-                out.extend_from_slice(cid);
-                out.extend_from_slice(&dep.semantic_version.to_be_bytes());
-            }
+            push_host_deps(&mut out, &idx.host_deps);
         }
         if !idx.timezone_deps.is_empty() {
             out.push(u8::from(idx.timezone_deps.dynamic));
@@ -4703,10 +4699,21 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         let expr_text = read_string(buf, pos)?;
         let expr = crate::parser::parse_expression(&expr_text)
             .map_err(|e| corrupt(&format!("stored check constraint does not parse: {e}")))?;
+        // v35: check_flags (bit0 has_host_deps; reserved bits are XX001), then the dependency list.
+        let cflags = read_u8(buf, pos)?;
+        if cflags & !1 != 0 {
+            return Err(corrupt("a check_flags reserved bit is set"));
+        }
+        let host_deps = if cflags & 1 != 0 {
+            read_host_deps(buf, pos)?
+        } else {
+            Vec::new()
+        };
         checks.push(CheckConstraint {
             name: check_name,
             expr_text,
             expr,
+            host_deps,
         });
     }
     // Secondary indexes (v5): name + key-column ordinals + the v6 flags byte (bit0
@@ -4790,36 +4797,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
             ));
         }
         let host_deps = if has_host_deps {
-            let dep_count = read_u16(buf, pos)? as usize;
-            if dep_count == 0 {
-                return Err(corrupt("has_host_deps index with an empty dependency list"));
-            }
-            let mut deps = Vec::with_capacity(dep_count);
-            for _ in 0..dep_count {
-                let name = read_string(buf, pos)?;
-                let ac = read_u16(buf, pos)? as usize;
-                let mut arg_types = Vec::with_capacity(ac);
-                for _ in 0..ac {
-                    let tc = read_u8(buf, pos)?;
-                    arg_types.push(
-                        scalar_for_type_code(tc)
-                            .ok_or_else(|| corrupt("invalid host-dep argument type code"))?,
-                    );
-                }
-                let rtc = read_u8(buf, pos)?;
-                let result = scalar_for_type_code(rtc)
-                    .ok_or_else(|| corrupt("invalid host-dep result type code"))?;
-                let component_id = read_string(buf, pos)?;
-                let semantic_version = read_u32(buf, pos)?;
-                deps.push(HostFuncDep {
-                    name,
-                    arg_types,
-                    result,
-                    component_id,
-                    semantic_version,
-                });
-            }
-            deps
+            read_host_deps(buf, pos)?
         } else {
             Vec::new()
         };
@@ -5645,6 +5623,61 @@ fn read_string(buf: &[u8], pos: &mut usize) -> Result<String> {
     let len = read_u16(buf, pos)? as usize;
     let bytes = take(buf, pos, len)?.to_vec();
     String::from_utf8(bytes).map_err(|_| corrupt("non-UTF-8 name"))
+}
+
+/// Write the v31 host-function dependency list (spec/design/extensibility.md §8.1), shared by an index
+/// (v31) and a CHECK (v35, §7.1.3): `u16 dep_count`, then per dependency `name ‖ u16 arg_count ‖ arg
+/// type codes ‖ result type code ‖ component_id ‖ u32 semantic_version`. The caller has already
+/// sorted `deps` by `(name, arg-type codes)`.
+fn push_host_deps(out: &mut Vec<u8>, deps: &[HostFuncDep]) {
+    out.extend_from_slice(&(deps.len() as u16).to_be_bytes());
+    for dep in deps {
+        push_string(out, &dep.name);
+        out.extend_from_slice(&(dep.arg_types.len() as u16).to_be_bytes());
+        for &a in &dep.arg_types {
+            out.push(type_code_for_scalar(a));
+        }
+        out.push(type_code_for_scalar(dep.result));
+        push_string(out, &dep.component_id);
+        out.extend_from_slice(&dep.semantic_version.to_be_bytes());
+    }
+}
+
+/// Read a list [`push_host_deps`] wrote. An empty list is `XX001`: a flag bit announces it, so a
+/// writer never emits a zero count.
+fn read_host_deps(buf: &[u8], pos: &mut usize) -> Result<Vec<HostFuncDep>> {
+    let dep_count = read_u16(buf, pos)? as usize;
+    if dep_count == 0 {
+        return Err(corrupt(
+            "a host-function dependency flag with an empty dependency list",
+        ));
+    }
+    let mut deps = Vec::with_capacity(dep_count);
+    for _ in 0..dep_count {
+        let name = read_string(buf, pos)?;
+        let ac = read_u16(buf, pos)? as usize;
+        let mut arg_types = Vec::with_capacity(ac);
+        for _ in 0..ac {
+            let tc = read_u8(buf, pos)?;
+            arg_types.push(
+                scalar_for_type_code(tc)
+                    .ok_or_else(|| corrupt("invalid host-dep argument type code"))?,
+            );
+        }
+        let rtc = read_u8(buf, pos)?;
+        let result = scalar_for_type_code(rtc)
+            .ok_or_else(|| corrupt("invalid host-dep result type code"))?;
+        let component_id = read_string(buf, pos)?;
+        let semantic_version = read_u32(buf, pos)?;
+        deps.push(HostFuncDep {
+            name,
+            arg_types,
+            result,
+            component_id,
+            semantic_version,
+        });
+    }
+    Ok(deps)
 }
 
 /// Write a `u16`-length-prefixed UTF-8 string (the catalog's name/string encoding — the inverse of

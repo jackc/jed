@@ -1288,3 +1288,327 @@ fn batch_streaming_scan_storage_errors_match_row_kernel() {
     let _ = std::fs::remove_file(&cpath);
     let _ = std::fs::remove_file(&spath);
 }
+
+// ---- Host functions in DEFAULT / CHECK (spec/design/extensibility.md §7.1, step 4b). ----
+
+/// `geo_hash(i64) -> i64 = a * factor` under the given component/version, left VOLATILE (the
+/// default): a CHECK has no volatility gate (§7.1.2), only a component-identity requirement.
+fn scaled_geo(component: &str, version: u32, factor: i64) -> HostFunction {
+    HostFunction::new(
+        "geo_hash",
+        vec![ScalarType::Int64],
+        ScalarType::Int64,
+        Box::new(move |args: &[Value]| -> jed::Result<Value> {
+            let Value::Int(a) = &args[0] else {
+                unreachable!("strict + resolved i64 arg")
+            };
+            Ok(Value::Int(a * factor))
+        }),
+    )
+    .component_id(component.to_string())
+    .semantic_version(version)
+}
+
+/// `geo_hash(i64) -> i64 = a * 10` with NO component identity.
+fn unversioned_geo() -> HostFunction {
+    HostFunction::new(
+        "geo_hash",
+        vec![ScalarType::Int64],
+        ScalarType::Int64,
+        Box::new(|args: &[Value]| -> jed::Result<Value> {
+            let Value::Int(a) = &args[0] else {
+                unreachable!("strict + resolved i64 arg")
+            };
+            Ok(Value::Int(a * 10))
+        }),
+    )
+}
+
+/// `lim(<ty>) -> <ty>` = the identity, under `component`, with no version (0).
+fn lim(ty: ScalarType, component: Option<&str>) -> HostFunction {
+    let f = HostFunction::new(
+        "lim",
+        vec![ty],
+        ty,
+        Box::new(|args: &[Value]| -> jed::Result<Value> { Ok(args[0].clone()) }),
+    );
+    match component {
+        Some(c) => f.component_id(c.to_string()),
+        None => f,
+    }
+}
+
+fn want_host_code(db: &mut Database, sql: &str, code: &str) {
+    match db.query_outcome(sql, &[]) {
+        Ok(_) => panic!("{sql:?} = Ok, want {code}"),
+        Err(e) => assert_eq!(e.code(), code, "{sql:?}: {}", e.message),
+    }
+}
+
+fn want_host_ok(db: &mut Database, sql: &str) {
+    db.query_outcome(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message));
+}
+
+#[test]
+fn hostfunc_check_admission() {
+    // An unversioned host function cannot back a CHECK in any position (42P17)...
+    let mut s = db_with_ext(
+        registry(vec![unversioned_geo()]),
+        &["CREATE TABLE u (a i64)"],
+    );
+    for sql in [
+        "CREATE TABLE t (a i64 CHECK (geo_hash(a) < 100))",
+        "CREATE TABLE t (a i64, CHECK (geo_hash(a) < 100))",
+        "ALTER TABLE u ADD CONSTRAINT c CHECK (geo_hash(a) < 100)",
+    ] {
+        assert_eq!(err_code(s.query_outcome(sql, &[])), "42P17", "{sql}");
+    }
+    // ...but a DEFAULT has no admission rule: any host function, any volatility, no identity.
+    for sql in [
+        "CREATE TABLE d (id i64 PRIMARY KEY, b i64 DEFAULT geo_hash(5))",
+        "INSERT INTO d (id) VALUES (1)",
+    ] {
+        s.query_outcome(sql, &[])
+            .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message));
+    }
+    assert_eq!(one(&mut s, "SELECT b FROM d"), Value::Int(50));
+    // A VOLATILE but versioned host function is admitted into a CHECK and enforced.
+    let mut s2 = db_with_ext(
+        registry(vec![scaled_geo("com.example/geo_hash", 1, 10)]),
+        &["CREATE TABLE t (a i64 CHECK (geo_hash(a) < 100))"],
+    );
+    s2.query_outcome("INSERT INTO t VALUES (9)", &[])
+        .unwrap_or_else(|e| panic!("INSERT 9: {}", e.message));
+    assert_eq!(
+        err_code(s2.query_outcome("INSERT INTO t VALUES (10)", &[])),
+        "23514"
+    );
+}
+
+/// A file whose CHECK `small` calls geo_hash v1 (a * 10 < 100, i.e. a < 10), holding the row (1, 9).
+fn create_check_file(path: &std::path::Path) {
+    create_file(
+        path,
+        registry(vec![scaled_geo("com.example/geo_hash", 1, 10)]),
+        &[
+            "CREATE TABLE t (id i64 PRIMARY KEY, a i64, CONSTRAINT small CHECK (geo_hash(a) < 100))",
+            "INSERT INTO t VALUES (1, 9)",
+        ],
+    );
+}
+
+#[test]
+fn hostfunc_check_reopen_matching() {
+    let path = tmp("hostfunc_check_match.jed");
+    create_check_file(&path);
+    let mut db = open_file(
+        &path,
+        registry(vec![scaled_geo("com.example/geo_hash", 1, 10)]),
+    );
+    want_host_ok(&mut db, "INSERT INTO t VALUES (2, 5)");
+    want_host_code(&mut db, "INSERT INTO t VALUES (3, 10)", "23514");
+    want_host_ok(&mut db, "UPDATE t SET a = 1 WHERE id = 2");
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn hostfunc_check_reopen_missing() {
+    let path = tmp("hostfunc_check_missing.jed");
+    create_check_file(&path);
+    let mut db = open_file(&path, Arc::new(ExtensionRegistry::new()));
+    // Writes that evaluate the check cannot resolve it (42883); reads and DELETE never evaluate it.
+    assert_eq!(ids(&mut db, "SELECT id FROM t"), vec![Value::Int(1)]);
+    want_host_code(&mut db, "INSERT INTO t VALUES (2, 1)", "42883");
+    want_host_code(&mut db, "UPDATE t SET a = 1", "42883");
+    want_host_ok(&mut db, "DELETE FROM t WHERE id = 1");
+    assert_eq!(ids(&mut db, "SELECT id FROM t"), Vec::<Value>::new());
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn hostfunc_check_reopen_mismatch() {
+    for (name, component, version) in [
+        ("version", "com.example/geo_hash", 2),
+        ("component", "org.other/geo_hash", 1),
+    ] {
+        let path = tmp(&format!("hostfunc_check_mismatch_{name}.jed"));
+        create_check_file(&path);
+        let mut db = open_file(&path, registry(vec![scaled_geo(component, version, 10)]));
+        // Every write that evaluates the stale check is refused before mutating anything.
+        want_host_code(&mut db, "INSERT INTO t VALUES (2, 1)", "XX002");
+        want_host_code(&mut db, "UPDATE t SET a = 1", "XX002");
+        assert_eq!(
+            ids(&mut db, "SELECT a FROM t WHERE id = 1"),
+            vec![Value::Int(9)],
+            "{name}: a after refused UPDATE"
+        );
+        // Reads and DELETE never evaluate a check, so a stale one costs them nothing.
+        want_host_ok(&mut db, "DELETE FROM t WHERE id = 1");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn hostfunc_check_rebuild() {
+    let path = tmp("hostfunc_check_rebuild.jed");
+    create_check_file(&path);
+    // v2 doubles the factor: the rule becomes a < 5, which the stored row (1, 9) violates.
+    let v2 = || registry(vec![scaled_geo("com.example/geo_hash", 2, 20)]);
+    let rebuild =
+        "ALTER TABLE t DROP CONSTRAINT small, ADD CONSTRAINT small CHECK (geo_hash(a) < 100)";
+    let mut db = open_file(&path, v2());
+    // The one-statement rebuild re-validates every row with the current implementation: 23514, and
+    // the statement rolls back whole, so the stale check is still in place.
+    want_host_code(&mut db, rebuild, "23514");
+    want_host_code(&mut db, "INSERT INTO t VALUES (2, 1)", "XX002");
+    want_host_ok(&mut db, "DELETE FROM t WHERE id = 1");
+    want_host_ok(&mut db, rebuild);
+    want_host_ok(&mut db, "INSERT INTO t VALUES (2, 1)");
+    want_host_code(&mut db, "INSERT INTO t VALUES (3, 9)", "23514");
+    drop(db);
+    // The rebuild persisted the v2 dependency: v2 writes, v1 is now the stale one.
+    let mut db = open_file(&path, v2());
+    want_host_ok(&mut db, "INSERT INTO t VALUES (4, 2)");
+    drop(db);
+    let mut db = open_file(
+        &path,
+        registry(vec![scaled_geo("com.example/geo_hash", 1, 10)]),
+    );
+    want_host_code(&mut db, "INSERT INTO t VALUES (5, 2)", "XX002");
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn hostfunc_check_unrelated_statements() {
+    let path = tmp("hostfunc_check_unrelated.jed");
+    create_file(
+        &path,
+        registry(vec![scaled_geo("com.example/geo_hash", 1, 10)]),
+        &[
+            "CREATE TABLE p1 (id i64 PRIMARY KEY)",
+            "CREATE TABLE p2 (id i64 PRIMARY KEY)",
+            "CREATE TABLE c (id i64 PRIMARY KEY, pid i64 REFERENCES p1 ON DELETE SET NULL, a i64, CHECK (geo_hash(a) < 100))",
+            "CREATE TABLE k (id i64 PRIMARY KEY, pid i64 REFERENCES p2 ON DELETE CASCADE, a i64, CHECK (geo_hash(a) < 100))",
+            "INSERT INTO p1 VALUES (1)",
+            "INSERT INTO p2 VALUES (1)",
+            "INSERT INTO c VALUES (1, 1, 1)",
+            "INSERT INTO k VALUES (1, 1, 1)",
+        ],
+    );
+    let mut db = open_file(
+        &path,
+        registry(vec![scaled_geo("com.example/geo_hash", 2, 10)]),
+    );
+    // Adding an unrelated constraint validates only the new one, so the stale check does not block it.
+    want_host_ok(&mut db, "ALTER TABLE c ADD CONSTRAINT pos CHECK (a > -100)");
+    // An ON DELETE SET NULL action UPDATEs the child, evaluating its stale check: refused, nothing
+    // changes.
+    want_host_code(&mut db, "DELETE FROM p1", "XX002");
+    assert_eq!(ids(&mut db, "SELECT id FROM p1"), vec![Value::Int(1)]);
+    // An ON DELETE CASCADE action only deletes child rows, so it never evaluates the check.
+    want_host_ok(&mut db, "DELETE FROM p2");
+    assert_eq!(ids(&mut db, "SELECT id FROM k"), Vec::<Value>::new());
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn hostfunc_check_alter_type_recollects() {
+    let lim32 = || lim(ScalarType::Int32, Some("a/lim"));
+    let lim64 = || lim(ScalarType::Int64, Some("b/lim"));
+    let path = tmp("hostfunc_check_retype.jed");
+    create_file(
+        &path,
+        registry(vec![lim32(), lim64()]),
+        &[
+            "CREATE TABLE t (id i64 PRIMARY KEY, a i32, CHECK (lim(a) < 100))",
+            "INSERT INTO t VALUES (1, 5)",
+        ],
+    );
+    // The check depends on lim(i32), so a registry without it cannot write.
+    let mut db = open_file(&path, registry(vec![lim64()]));
+    assert!(
+        db.query_outcome("INSERT INTO t VALUES (2, 6)", &[])
+            .is_err(),
+        "a write without the lim(i32) dependency should be refused"
+    );
+    drop(db);
+    // ALTER COLUMN TYPE re-validates every row and re-collects the dependency from the new
+    // resolution.
+    let mut db = open_file(&path, registry(vec![lim32(), lim64()]));
+    want_host_ok(&mut db, "ALTER TABLE t ALTER COLUMN a TYPE i64");
+    drop(db);
+    let mut db = open_file(&path, registry(vec![lim64()]));
+    want_host_ok(&mut db, "INSERT INTO t VALUES (2, 6)");
+    want_host_code(&mut db, "INSERT INTO t VALUES (3, 100)", "23514");
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn hostfunc_default_resolved_only_when_applied() {
+    let path = tmp("hostfunc_default_lazy.jed");
+    create_file(
+        &path,
+        registry(vec![unversioned_geo()]),
+        &[
+            "CREATE TABLE t (id i64 PRIMARY KEY, b i64 DEFAULT geo_hash(5), c i64)",
+            "INSERT INTO t (id) VALUES (1)",
+            "CREATE TABLE p (id i64 PRIMARY KEY)",
+            "INSERT INTO p VALUES (0), (1)",
+            "CREATE TABLE ch (id i64 PRIMARY KEY, pid i64 DEFAULT geo_hash(0) REFERENCES p ON DELETE SET DEFAULT)",
+            "INSERT INTO ch VALUES (1, 1)",
+        ],
+    );
+    let mut db = open_file(&path, Arc::new(ExtensionRegistry::new()));
+    // Statements that never apply the default do not need its host function.
+    want_host_ok(&mut db, "INSERT INTO t VALUES (2, 7, 7)");
+    want_host_ok(&mut db, "INSERT INTO t (id, b) VALUES (3, 1)");
+    want_host_ok(
+        &mut db,
+        "INSERT INTO t (id, b) VALUES (3, 1) ON CONFLICT DO NOTHING",
+    );
+    want_host_ok(&mut db, "INSERT INTO t (id, b) SELECT 4, 4");
+    want_host_ok(&mut db, "UPDATE t SET c = 1");
+    // Deletes no parent row, so SET DEFAULT never fires.
+    want_host_ok(&mut db, "DELETE FROM p WHERE id = 99");
+    // Statements that would apply it cannot resolve it.
+    want_host_code(&mut db, "INSERT INTO t (id) VALUES (5)", "42883");
+    want_host_code(&mut db, "INSERT INTO t VALUES (5, DEFAULT, 1)", "42883");
+    want_host_code(&mut db, "INSERT INTO t (id) SELECT 5", "42883");
+    want_host_code(&mut db, "INSERT INTO t DEFAULT VALUES", "42883");
+    want_host_code(&mut db, "UPDATE t SET b = DEFAULT", "42883");
+    // Deleting a parent row fires its SET DEFAULT action, whose child UPDATE resolves the default per
+    // statement — whether or not a child row matches (here one does).
+    want_host_code(&mut db, "DELETE FROM p WHERE id = 1", "42883");
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn hostfunc_check_error_precedes_default() {
+    let path = tmp("hostfunc_check_default_order.jed");
+    create_file(
+        &path,
+        registry(vec![
+            scaled_geo("com.example/geo_hash", 1, 10),
+            lim(ScalarType::Int64, None),
+        ]),
+        &[
+            "CREATE TABLE t (id i64 PRIMARY KEY, a i64, b i64 DEFAULT lim(1), CHECK (geo_hash(a) < 100))",
+        ],
+    );
+    // A stale check (XX002) and a missing default function (42883): the check resolves first.
+    let mut db = open_file(
+        &path,
+        registry(vec![scaled_geo("com.example/geo_hash", 2, 10)]),
+    );
+    want_host_code(&mut db, "INSERT INTO t (id, a) VALUES (1, 1)", "XX002");
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}

@@ -272,11 +272,6 @@ fn partial_index_table_db() -> Session {
     db
 }
 
-/// A table with a HOST-FUNCTION index dependency (v31 — the `index_flags` bit2 + the persisted
-/// dependency list after `index_root_page`, extensibility.md §8.1): the index `t_geo_idx` is on
-/// `geo_hash(a)`, a host scalar function (i64 -> i64), component "com.example/geo_hash" at semantic
-/// version 1. The table is EMPTY (the tree empty, root 0), so the fixture isolates the v31 catalog
-/// change. Must match verify.rb's HOSTFUNC_INDEX_TABLE.
 fn timezone_index_table_db() -> Session {
     jed::timezone::load_time_zone_data(include_bytes!("../../../spec/tz/fixtures/tzdata.jtz"))
         .unwrap();
@@ -297,7 +292,9 @@ fn timezone_index_table_db() -> Session {
     db
 }
 
-fn hostfunc_index_table_db() -> Session {
+/// The golden host-function registry: `geo_hash(i64) -> i64 = a * 10`, IMMUTABLE, component
+/// "com.example/geo_hash" at semantic version 1.
+fn geo_hash_golden_registry() -> jed::ExtensionRegistry {
     let mut reg = jed::ExtensionRegistry::new();
     reg.register_function(
         jed::HostFunction::new(
@@ -316,15 +313,43 @@ fn hostfunc_index_table_db() -> Session {
         .semantic_version(1),
     )
     .unwrap();
+    reg
+}
+
+/// A table with a HOST-FUNCTION index dependency (v31 — the `index_flags` bit2 + the persisted
+/// dependency list after `index_root_page`, extensibility.md §8.1): the index `t_geo_idx` is on
+/// `geo_hash(a)`, a host scalar function (i64 -> i64), component "com.example/geo_hash" at semantic
+/// version 1. The table is EMPTY (the tree empty, root 0), so the fixture isolates the v31 catalog
+/// change. Must match verify.rb's HOSTFUNC_INDEX_TABLE.
+fn hostfunc_index_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
         page_size: GOLDEN_PAGE_SIZE,
-        extensions: std::sync::Arc::new(reg),
+        extensions: std::sync::Arc::new(geo_hash_golden_registry()),
         ..Default::default()
     })
     .unwrap()
     .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i64 PRIMARY KEY, a i64)");
     run(&mut db, "CREATE INDEX t_geo_idx ON t (geo_hash(a))");
+    db
+}
+
+/// A table with a HOST-FUNCTION check dependency (v35 — each check entry's `check_flags` byte + the
+/// dependency list, extensibility.md §7.1.3): `t_a_check` calls no host function (flags 0) and
+/// `t_a_check1` calls `geo_hash(a)` (flags 1 + the list). EMPTY table, so the fixture isolates the
+/// v35 catalog change. Must match verify.rb's HOSTFUNC_CHECK_TABLE.
+fn hostfunc_check_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        page_size: GOLDEN_PAGE_SIZE,
+        extensions: std::sync::Arc::new(geo_hash_golden_registry()),
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TABLE t (id i64 PRIMARY KEY, a i64 CHECK (a <> 0), CHECK (geo_hash(a) > 0))",
+    );
     db
 }
 
@@ -1525,6 +1550,7 @@ fn write_matches_goldens() {
         ("partial_index_table.jed", partial_index_table_db),
         ("timezone_index_table.jed", timezone_index_table_db),
         ("hostfunc_index_table.jed", hostfunc_index_table_db),
+        ("hostfunc_check_table.jed", hostfunc_check_table_db),
         ("gin_array_table.jed", gin_array_table_db),
         ("gin_uuid_table.jed", gin_uuid_table_db),
         ("fk_table.jed", fk_table_db),

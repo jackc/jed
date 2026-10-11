@@ -18,20 +18,61 @@ fn collect_index_host_deps(
     reg: &crate::extension::ExtensionRegistry,
     out: &mut Vec<HostFuncDep>,
 ) -> Result<()> {
+    collect_host_deps(node, reg, true, "an index expression", out)
+}
+
+/// Collect a resolved `CHECK` expression's host-function dependencies
+/// (spec/design/extensibility.md §7.1.2), sorted for the on-disk order. Unlike an index, a check has
+/// no volatility gate — the built-in rule admits `CHECK (ts < now())`, and nothing relies on a check
+/// being immutable — but each host function must declare a component identity (`42P17`) so a swapped
+/// implementation is detectable. Empty for a check that calls no host function.
+pub(crate) fn collect_check_host_deps(
+    node: &RExpr,
+    reg: &crate::extension::ExtensionRegistry,
+) -> Result<Vec<HostFuncDep>> {
+    let mut deps = Vec::new();
+    collect_host_deps(node, reg, false, "a check constraint", &mut deps)?;
+    sort_host_deps(&mut deps);
+    Ok(deps)
+}
+
+/// A stable on-disk / cross-core order (CLAUDE.md §8): sort dependencies by (name, on-disk arg-type
+/// codes) so registration order never leaks into the file bytes.
+fn sort_host_deps(deps: &mut [HostFuncDep]) {
+    let dep_sort_key = |d: &HostFuncDep| {
+        (
+            d.name.clone(),
+            d.arg_types
+                .iter()
+                .map(|t| crate::format::type_code_for_scalar(*t))
+                .collect::<Vec<u8>>(),
+        )
+    };
+    deps.sort_by_key(dep_sort_key);
+}
+
+/// The shared walk behind [`collect_index_host_deps`] / [`collect_check_host_deps`]: it admits each
+/// host call (`require_immutable` only for an index) and appends one dependency per distinct
+/// `(name, arg types)` signature to `out`.
+fn collect_host_deps(
+    node: &RExpr,
+    reg: &crate::extension::ExtensionRegistry,
+    require_immutable: bool,
+    site: &str,
+    out: &mut Vec<HostFuncDep>,
+) -> Result<()> {
     if let RExpr::HostFunc { id, name, .. } = node {
         let hf = reg.function(*id);
-        if hf.volatility != crate::extension::Volatility::Immutable {
+        if require_immutable && hf.volatility != crate::extension::Volatility::Immutable {
             return Err(EngineError::new(
                 SqlState::InvalidObjectDefinition,
-                format!("host function {name} in an index expression must be IMMUTABLE"),
+                format!("host function {name} in {site} must be IMMUTABLE"),
             ));
         }
         let Some(component_id) = hf.component_id.clone() else {
             return Err(EngineError::new(
                 SqlState::InvalidObjectDefinition,
-                format!(
-                    "host function {name} used in an index expression must declare a component identity"
-                ),
+                format!("host function {name} used in {site} must declare a component identity"),
             ));
         };
         if !out
@@ -48,7 +89,7 @@ fn collect_index_host_deps(
         }
     }
     for child in estimator_expression_children(node) {
-        collect_index_host_deps(child, reg, out)?;
+        collect_host_deps(child, reg, require_immutable, site, out)?;
     }
     Ok(())
 }
@@ -68,14 +109,7 @@ fn verify_index_host_deps(
     deps: &[HostFuncDep],
 ) -> Result<()> {
     if let RExpr::HostFunc { id, name, .. } = node {
-        let hf = reg.function(*id);
-        let ok = deps.iter().any(|d| {
-            d.name == hf.name
-                && d.arg_types == hf.arg_types
-                && hf.component_id.as_deref() == Some(d.component_id.as_str())
-                && hf.semantic_version == d.semantic_version
-        });
-        if !ok {
+        if !host_dep_matches(reg.function(*id), deps) {
             return Err(EngineError::new(
                 // XX002 — the graded "a versioned dependency no longer matches" reopen verdict, shared
                 // with the collation version-skew case (extensibility.md §11/§15).
@@ -91,6 +125,44 @@ fn verify_index_host_deps(
         verify_index_host_deps(child, reg, deps)?;
     }
     Ok(())
+}
+
+/// [`verify_index_host_deps`] for a `CHECK` (spec/design/extensibility.md §7.1.2): every host call
+/// the resolved check makes must match a dependency persisted with it, else `XX002`. Unlike an index
+/// there is no read-side fallback to take — only a statement that evaluates the check resolves it. A
+/// check that persisted no dependency but now resolves to a host function fails the same way.
+fn verify_check_host_deps(
+    check_name: &str,
+    node: &RExpr,
+    reg: &crate::extension::ExtensionRegistry,
+    deps: &[HostFuncDep],
+) -> Result<()> {
+    if let RExpr::HostFunc { id, name, .. } = node {
+        if !host_dep_matches(reg.function(*id), deps) {
+            return Err(EngineError::new(
+                SqlState::CollationVersionMismatch,
+                format!(
+                    "check constraint {check_name} depends on host function {name} whose registered \
+                     component/version no longer matches the file; the constraint must be re-added"
+                ),
+            ));
+        }
+    }
+    for child in estimator_expression_children(node) {
+        verify_check_host_deps(check_name, child, reg, deps)?;
+    }
+    Ok(())
+}
+
+/// Whether a resolved host function's current registration matches one of `deps` by signature,
+/// component identity, and semantic version.
+fn host_dep_matches(hf: &crate::extension::HostFunction, deps: &[HostFuncDep]) -> bool {
+    deps.iter().any(|d| {
+        d.name == hf.name
+            && d.arg_types == hf.arg_types
+            && hf.component_id.as_deref() == Some(d.component_id.as_str())
+            && hf.semantic_version == d.semantic_version
+    })
 }
 
 fn constraint_name_taken(t: &Table, name: &str) -> bool {
@@ -952,13 +1024,14 @@ impl Engine {
             foreign_keys: Vec::new(),
             exclusions: Vec::new(),
         };
+        let mut check_deps: Vec<Vec<HostFuncDep>> = Vec::with_capacity(ct.checks.len());
         for def in &ct.checks {
             // Structural rejections first (a single pre-walk — a documented micro-order
             // divergence from PG, which interleaves them with name/type resolution):
             // subquery 0A000, aggregate 42803, bind parameter 42P02 (constraints.md §4.1).
             reject_check_structure(&def.expr)?;
             let scope = Scope::single(self, &table);
-            let (_, ty) = resolve(
+            let (node, ty) = resolve(
                 &scope,
                 &def.expr,
                 None,
@@ -986,6 +1059,9 @@ impl Engine {
                     return Err(type_error("argument of CHECK must be boolean"));
                 }
             }
+            // Host functions the check calls (spec/design/extensibility.md §7.1.2): each needs a
+            // component identity (42P17), and the resolved dependencies persist with the check.
+            check_deps.push(collect_check_host_deps(&node, &self.session.extensions)?);
         }
         // Naming (constraints.md §4.3): a single pass in textual order. An explicit name is
         // used as written; a derived name is built from the LOWERCASED table/column names —
@@ -994,7 +1070,7 @@ impl Engine {
         // A collision (case-insensitive, PG folds) is 42710; derived names never yield to a
         // later explicit one (oracle-probed).
         let mut checks: Vec<CheckConstraint> = Vec::with_capacity(ct.checks.len());
-        for def in &ct.checks {
+        for (def, host_deps) in ct.checks.iter().zip(check_deps) {
             let name = match &def.name {
                 Some(n) => {
                     if checks.iter().any(|c| c.name.eq_ignore_ascii_case(n)) {
@@ -1031,6 +1107,7 @@ impl Engine {
                 name,
                 expr_text: def.text.clone(),
                 expr: def.expr.clone(),
+                host_deps,
             });
         }
         // Evaluation (and on-disk) order: ascending byte order of the lowercased name
@@ -2190,7 +2267,7 @@ impl Engine {
                         match def {
                             AlterConstraintDef::Check(d) => {
                                 reject_check_structure(&d.expr)?;
-                                let (_, ty) = resolve(
+                                let (node, ty) = resolve(
                                     &Scope::single(self, &table),
                                     &d.expr,
                                     None,
@@ -2200,6 +2277,8 @@ impl Engine {
                                 if !matches!(ty, ResolvedType::Bool | ResolvedType::Null) {
                                     return Err(type_error("argument of CHECK must be boolean"));
                                 }
+                                let host_deps =
+                                    collect_check_host_deps(&node, &self.session.extensions)?;
                                 let mut name = d.name.clone().unwrap_or_else(|| {
                                     format!("{}_check", table.name.to_ascii_lowercase())
                                 });
@@ -2231,6 +2310,7 @@ impl Engine {
                                     name: name.clone(),
                                     expr_text: d.text,
                                     expr: d.expr,
+                                    host_deps,
                                 });
                                 table.checks.sort_by_key(|x| x.name.to_ascii_lowercase());
                                 added_constraints.insert(name.to_ascii_lowercase());
@@ -3148,7 +3228,28 @@ impl Engine {
                     .charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
                 rows
             };
-            let checks = self.resolve_checks(&table)?;
+            // Only the checks this statement validates (an ADD CONSTRAINT, or every check after ALTER
+            // COLUMN TYPE) are resolved, so an existing stale check never blocks an unrelated ADD
+            // (spec/design/extensibility.md §7.1.2). Each validated check is evaluated against EVERY
+            // row with the current host-function implementations below, so its dependency list is
+            // re-collected from this end-state resolution rather than verified: that is the rebuild a
+            // DROP + ADD performs, and it lets a type change select a different host overload.
+            let mut checks: Vec<(String, RExpr)> = Vec::new();
+            for i in 0..table.checks.len() {
+                if !added_constraints.contains(&table.checks[i].name.to_ascii_lowercase()) {
+                    continue;
+                }
+                let (node, _) = resolve(
+                    &Scope::single(self, &table),
+                    &table.checks[i].expr,
+                    None,
+                    &mut AggCtx::Forbidden,
+                    &mut ParamTypes::default(),
+                )?;
+                table.checks[i].host_deps =
+                    collect_check_host_deps(&node, &self.session.extensions)?;
+                checks.push((table.checks[i].name.clone(), node));
+            }
             let colls = self.column_collations(&table.columns);
             // Resolved column types for the new table shape (composite index key vehicle, §2.15).
             let col_types: Vec<ColType> = table
@@ -3165,10 +3266,7 @@ impl Engine {
                     meter.charge(COSTS.storage_row_read);
                 }
                 store.resolve_inline_columns(&mut row)?;
-                for ck in checks
-                    .iter()
-                    .filter(|(n, _)| added_constraints.contains(&n.to_ascii_lowercase()))
-                {
+                for ck in &checks {
                     self.eval_checks(
                         std::slice::from_ref(ck),
                         &row,
@@ -3705,6 +3803,9 @@ impl Engine {
         let mut out = Vec::with_capacity(table.checks.len());
         for c in &table.checks {
             let (node, _) = resolve(&scope, &c.expr, None, &mut AggCtx::Forbidden, params)?;
+            // Reopen soundness (spec/design/extensibility.md §7.1.2): every host call must still match
+            // the dependency persisted with the check, else XX002 before any mutation.
+            verify_check_host_deps(&c.name, &node, &self.session.extensions, &c.host_deps)?;
             out.push((c.name.clone(), node));
         }
         Ok(out)
@@ -3884,8 +3985,25 @@ impl Engine {
         table: &Table,
         params: &mut ParamTypes,
     ) -> Result<Vec<Option<RExpr>>> {
+        self.resolve_default_exprs_for(table, None, params)
+    }
+
+    /// [`resolve_default_exprs_with_params`](Self::resolve_default_exprs_with_params) restricted to
+    /// the columns `need` marks (`None` = every column): a statement resolves only the defaults it can
+    /// apply, so a host function behind a default it never applies need not be registered
+    /// (spec/design/extensibility.md §7.1.1). An unneeded column's slot stays `None`.
+    pub(crate) fn resolve_default_exprs_for(
+        &self,
+        table: &Table,
+        need: Option<&[bool]>,
+        params: &mut ParamTypes,
+    ) -> Result<Vec<Option<RExpr>>> {
         let mut out = Vec::with_capacity(table.columns.len());
-        for col in &table.columns {
+        for (i, col) in table.columns.iter().enumerate() {
+            if need.is_some_and(|n| !n[i]) {
+                out.push(None);
+                continue;
+            }
             match &col.default_expr {
                 Some(de) => {
                     let scope = Scope::empty(self);
@@ -4350,18 +4468,7 @@ impl Engine {
                 })
             }
         };
-        // A stable on-disk / cross-core order (CLAUDE.md §8): sort the collected dependencies by
-        // (name, on-disk arg-type codes) so registration order never leaks into the file bytes.
-        let dep_sort_key = |d: &HostFuncDep| {
-            (
-                d.name.clone(),
-                d.arg_types
-                    .iter()
-                    .map(|t| crate::format::type_code_for_scalar(*t))
-                    .collect::<Vec<u8>>(),
-            )
-        };
-        host_deps.sort_by(|a, b| dep_sort_key(a).cmp(&dep_sort_key(b)));
+        sort_host_deps(&mut host_deps);
         // `relation_taken` checks the namespace of the target scope: an attachment's OWN snapshot for an
         // attached table (each attached database is an independent namespace, §3), else the temp-aware
         // implicit namespace.

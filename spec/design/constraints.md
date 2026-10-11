@@ -152,7 +152,7 @@ uses and re-parsed on load — unparseable stored text in an otherwise-valid fil
 The two bits are mutually exclusive. The default survives serialize→load and is applied to
 inserts after a reload. (This is `format_version` **8**.)
 
-**Host functions in a default** ([extensibility.md §7.1.1](extensibility.md), designed). A host
+**Host functions in a default** ([extensibility.md §7.1.1](extensibility.md)). A host
 function of any volatility may appear in a default, and nothing beyond the expression text is
 persisted: a default's value is ordinary stored data once written, so a changed implementation
 affects only future rows. A statement resolves only the defaults it can apply, so a missing host
@@ -356,8 +356,8 @@ writes the retained text back verbatim, so the catalog bytes are stable across
 create → commit → load → commit. Unparseable stored text in an otherwise-valid file is
 **`XX001`** (`data_corrupted`) at open.
 
-**Host functions in a check** ([extensibility.md §7.1.2](extensibility.md), designed for
-`format_version` 35). A host function in a `CHECK` must declare a `component_id` (`42P17`), and its
+**Host functions in a check** ([extensibility.md §7.1.2](extensibility.md), `format_version`
+35). A host function in a `CHECK` must declare a `component_id` (`42P17`), and its
 volatility is not gated. Each check entry gains a `check_flags` byte and, when it calls host
 functions, persists their resolved `(signature, component_id, semantic_version)` dependency list. A
 statement that evaluates the check refuses a mismatched registration with `XX002` before mutation.

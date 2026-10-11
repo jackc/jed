@@ -34,6 +34,7 @@ import type {
   GroupItem,
   IndexKeyElem,
   Insert,
+  InsertValue,
   JoinKind,
   JsonOnBehavior,
   JsonPredicateKind,
@@ -234,7 +235,7 @@ import {
   uniqueViolation,
 } from "./errors.ts";
 import { type PrivilegeSet, Privileges } from "./privileges.ts";
-import type { ExtensionRegistry } from "./extension.ts";
+import type { ExtensionRegistry, HostFuncEntry } from "./extension.ts";
 import { type ScriptSummary, splitStatements } from "./split.ts";
 import type { SharedPaging } from "./paging.ts";
 import {
@@ -5586,13 +5587,14 @@ export class Engine {
       fks: [],
       exclusions: [],
     };
+    const checkDeps: (HostFuncDep[] | undefined)[] = [];
     for (const def of ct.checks) {
       // Structural rejections first (a single pre-walk — a documented micro-order
       // divergence from PG, which interleaves them with name/type resolution): subquery
       // 0A000, aggregate 42803, bind parameter 42P02 (constraints.md §4.1).
       rejectCheckStructure(def.expr);
       const scope = Scope.single(this, table);
-      const { type } = resolve(
+      const { node, type } = resolve(
         scope,
         def.expr,
         null,
@@ -5602,6 +5604,9 @@ export class Engine {
       if (type.kind !== "bool" && type.kind !== "null") {
         throw typeError("argument of CHECK must be boolean");
       }
+      // Host functions the check calls (spec/design/extensibility.md §7.1.2): each needs a component
+      // identity (42P17), and the resolved dependencies persist with the check.
+      checkDeps.push(collectCheckHostDeps(node, this.session.extensions));
     }
     // Naming (constraints.md §4.3): a single pass in textual order. An explicit name is
     // used as written; a derived name is built from the LOWERCASED table/column names —
@@ -5612,7 +5617,8 @@ export class Engine {
     const checks: CheckConstraint[] = [];
     const nameTaken = (name: string): boolean =>
       checks.some((c) => c.name.toLowerCase() === name.toLowerCase());
-    for (const def of ct.checks) {
+    for (let ci = 0; ci < ct.checks.length; ci++) {
+      const def = ct.checks[ci]!;
       let name: string;
       if (def.name !== null) {
         if (nameTaken(def.name)) {
@@ -5631,7 +5637,7 @@ export class Engine {
         name = base;
         for (let suffix = 1; nameTaken(name); suffix++) name = base + suffix.toString();
       }
-      checks.push({ name, exprText: def.text, expr: def.expr });
+      checks.push({ name, exprText: def.text, expr: def.expr, hostDeps: checkDeps[ci] });
     }
     // Evaluation (and on-disk) order: ascending byte order of the lowercased name
     // (constraints.md §4.4 — PG evaluates checks sorted by name, oracle-probed).
@@ -6042,16 +6048,19 @@ export class Engine {
   private resolveChecks(table: Table, ptypes: ParamTypes = new ParamTypes()): NamedCheck[] {
     if (table.checks.length === 0) return [];
     const scope = Scope.single(this, table);
-    return table.checks.map((c) => ({
-      name: c.name,
-      node: resolve(
+    return table.checks.map((c) => {
+      const node = resolve(
         scope,
         c.expr,
         null,
         { collecting: false, groupKeys: [], specs: [] },
         ptypes,
-      ).node,
-    }));
+      ).node;
+      // Reopen soundness (spec/design/extensibility.md §7.1.2): every host call must still match the
+      // dependency persisted with the check, else XX002 before any mutation.
+      verifyCheckHostDeps(c.name, node, this.session.extensions, c.hostDeps ?? []);
+      return { name: c.name, node };
+    });
   }
 
   // maintenanceEnv builds the unmetered eval env for phase-1 index-expression / CHECK evaluation
@@ -6196,8 +6205,20 @@ export class Engine {
     table: Table,
     ptypes: ParamTypes = new ParamTypes(),
   ): (RExpr | null)[] {
-    return table.columns.map((col) => {
-      if (col.defaultExpr === null) return null;
+    return this.resolveDefaultExprsFor(table, null, ptypes);
+  }
+
+  // resolveDefaultExprsFor is resolveDefaultExprs restricted to the columns need marks (null =
+  // every column): a statement resolves only the defaults it can apply, so a host function behind a
+  // default it never applies need not be registered (spec/design/extensibility.md §7.1.1). An unneeded
+  // column's slot stays null.
+  private resolveDefaultExprsFor(
+    table: Table,
+    need: readonly boolean[] | null,
+    ptypes: ParamTypes = new ParamTypes(),
+  ): (RExpr | null)[] {
+    return table.columns.map((col, i) => {
+      if (col.defaultExpr === null || (need !== null && !need[i])) return null;
       return resolve(
         Scope.empty(this),
         col.defaultExpr.expr,
@@ -6805,15 +6826,16 @@ export class Engine {
             if (c.kind === "check") {
               const d = c.def;
               rejectCheckStructure(d.expr);
-              const rt = resolve(
+              const { node: rn, type: rt } = resolve(
                 Scope.single(this, table),
                 d.expr,
                 null,
                 { collecting: false, groupKeys: [], specs: [] },
                 new ParamTypes(),
-              ).type;
+              );
               if (rt.kind !== "bool" && rt.kind !== "null")
                 throw typeError("argument of CHECK must be boolean");
+              const hostDeps = collectCheckHostDeps(rn, this.session.extensions);
               let name = d.name ?? `${table.name.toLowerCase()}_check`;
               if (d.name === null) {
                 const rs = checkReferencedColumns(d.expr, table.columns);
@@ -6825,7 +6847,7 @@ export class Engine {
                   "duplicate_object",
                   `constraint ${name} for relation ${table.name} already exists`,
                 );
-              table.checks.push({ name, exprText: d.text, expr: d.expr });
+              table.checks.push({ name, exprText: d.text, expr: d.expr, hostDeps });
               table.checks.sort(compareLowerName);
               added.add(name.toLowerCase());
             } else if (c.kind === "unique") {
@@ -7407,8 +7429,27 @@ export class Engine {
             : { entries: rewriteRows, pages: 0, slabs: 0 };
       if (rewriteRows === null)
         meter.charge(COSTS.pageRead * BigInt(all.pages) + COSTS.valueDecompress * BigInt(all.slabs));
-      const checks = this.resolveChecks(table),
-        colls = this.columnCollations(table.columns),
+      // Only the checks this statement validates (an ADD CONSTRAINT, or every check after ALTER COLUMN
+      // TYPE) are resolved, so an existing stale check never blocks an unrelated ADD (spec/design/
+      // extensibility.md §7.1.2). Each validated check is evaluated against EVERY row with the current
+      // host-function implementations below, so its dependency list is re-collected from this end-state
+      // resolution rather than verified: that is the rebuild a DROP + ADD performs, and it lets a type
+      // change select a different host overload.
+      const checks: NamedCheck[] = [];
+      for (let i = 0; i < table.checks.length; i++) {
+        const c = table.checks[i]!;
+        if (!addedConstraints.has(c.name.toLowerCase())) continue;
+        const node = resolve(
+          Scope.single(this, table),
+          c.expr,
+          null,
+          { collecting: false, groupKeys: [], specs: [] },
+          new ParamTypes(),
+        ).node;
+        table.checks[i] = { ...c, hostDeps: collectCheckHostDeps(node, this.session.extensions) };
+        checks.push({ name: c.name, node });
+      }
+      const colls = this.columnCollations(table.columns),
         // Resolved column types for the NEW table shape `table` (the composite index key vehicle,
         // §2.15). From table.columns — NOT store.columnTypes(), which still reflects the OLD shape
         // (fewer columns) when this ALTER also adds a column and the rows are the rewritten new-shape
@@ -7421,8 +7462,7 @@ export class Engine {
         if (rewriteRows === null) meter.charge(COSTS.storageRowRead);
         const row = store.resolveInlineColumns(entry.row);
         for (const ck of checks)
-          if (addedConstraints.has(ck.name.toLowerCase()))
-            evalChecks([ck], table.name, row, this.maintenanceEnv(new StmtRng()), meter);
+          evalChecks([ck], table.name, row, this.maintenanceEnv(new StmtRng()), meter);
         for (const ix of table.indexes) {
           const k = ix.name.toLowerCase();
           if (!addedConstraints.has(k)) continue;
@@ -8259,7 +8299,7 @@ export class Engine {
     // A stable on-disk / cross-core order (CLAUDE.md §8): sort the collected dependencies by (name,
     // on-disk arg-type codes) so registration order never leaks into the file bytes. undefined when
     // the index calls no host function, keeping the catalog entry byte-identical to v30.
-    hostDeps.sort(compareHostDeps);
+    sortHostDeps(hostDeps);
     validateTimezoneDeps(timezoneDeps);
     const def: IndexDef = {
       name,
@@ -9204,8 +9244,6 @@ export class Engine {
   private resolveInsertValuesPlan(ins: Insert, table: Table, ctx: CteCtx): InsertValuesPlan {
     const ptypes = new ParamTypes();
     const checks = this.resolveChecks(table, ptypes);
-    const defaultExprs = this.resolveDefaultExprs(table, ptypes);
-    const rindexes = this.resolveTableIndexes(table, ptypes);
     const colTypes = this.lkpStoreScoped(ins.db, table.name).columnTypes();
     const colls = this.columnCollations(table.columns);
     const pk = pkIndices(table);
@@ -9242,6 +9280,14 @@ export class Engine {
         if (table.columns[i]!.identity !== null) provided[i] = -1;
       }
     }
+    // Only the defaults this INSERT can apply (spec/design/extensibility.md §7.1.1), then the indexes —
+    // the same check → default → index resolution order executeInsert follows.
+    const defaultExprs = this.resolveDefaultExprsFor(
+      table,
+      insertDefaultNeeds(provided, ins.source.kind === "values" ? ins.source.rows : null),
+      ptypes,
+    );
+    const rindexes = this.resolveTableIndexes(table, ptypes);
     const alwaysTargeted: { col: number; pos: number }[] = [];
     if (ins.overriding !== "system") {
       for (let i = 0; i < n; i++) {
@@ -9426,9 +9472,6 @@ export class Engine {
     // The CHECK constraints, resolved once per statement in evaluation (name) order;
     // insertRows evaluates them per candidate row (constraints.md §4.4).
     const checks = this.resolveChecks(table);
-    // Each column's EXPRESSION default, resolved once per statement (constraints.md §2);
-    // applied per omitted column / DEFAULT slot, sharing one per-statement StmtRng.
-    const defaultExprs = this.resolveDefaultExprs(table);
     const stmtRng = new StmtRng();
 
     // Resolve the optional column list once. provided[i] >= 0 means table column i takes that
@@ -9471,6 +9514,14 @@ export class Engine {
         if (table.columns[i]!.identity !== null) provided[i] = -1;
       }
     }
+    // The EXPRESSION default of each column this INSERT can default, resolved once per statement
+    // (constraints.md §2); applied per omitted column / DEFAULT slot, sharing one per-statement
+    // StmtRng. A default the statement cannot apply is not resolved, so its host function need not
+    // be registered (spec/design/extensibility.md §7.1.1).
+    const defaultExprs = this.resolveDefaultExprsFor(
+      table,
+      insertDefaultNeeds(provided, ins.source.kind === "values" ? ins.source.rows : null),
+    );
     // The GENERATED ALWAYS columns still explicitly targeted (and not OVERRIDING SYSTEM VALUE):
     // supplying a non-DEFAULT value to one is 428C9. Collected as (column ordinal, value position)
     // so the source branches can enforce it (VALUES per-row, SELECT up-front).
@@ -11295,9 +11346,17 @@ export class Engine {
     // UPDATE SET col = DEFAULT reuses INSERT's once-per-statement resolution of expression
     // defaults. Constant/no defaults become constant RExpr nodes below, so applying them is free;
     // expression defaults evaluate once per matched row through the UPDATE meter and statement RNG.
-    const defaultExprs = upd.assignments.some((a) => a.isDefault)
-      ? this.resolveDefaultExprs(table)
-      : [];
+    // Only the assigned-DEFAULT columns resolve (spec/design/extensibility.md §7.1.1); an unknown
+    // column name is left to the per-assignment 42703 below.
+    let defaultExprs: (RExpr | null)[] = [];
+    if (upd.assignments.some((a) => a.isDefault)) {
+      const need = table.columns.map(() => false);
+      for (const a of upd.assignments) {
+        const idx = columnIndex(table, a.column);
+        if (a.isDefault && idx >= 0) need[idx] = true;
+      }
+      defaultExprs = this.resolveDefaultExprsFor(table, need);
+    }
     const pkMembers = pkIndices(table);
     const plans: AssignPlan[] = [];
     for (const a of upd.assignments) {
@@ -23781,20 +23840,55 @@ function collectHostFuncNodes(e: RExpr, out: HostFuncNode[]): void {
 //     re-check on reopen (42P17, §7).
 // Deduplicated by (name, argTypes); the caller sorts for a stable on-disk order.
 function collectIndexHostDeps(node: RExpr, reg: ExtensionRegistry, out: HostFuncDep[]): void {
+  collectHostDeps(node, reg, true, "an index expression", out);
+}
+
+// collectCheckHostDeps collects a resolved CHECK expression's host-function dependencies
+// (spec/design/extensibility.md §7.1.2), sorted for the on-disk order. Unlike an index, a check
+// has no volatility gate — the built-in rule admits CHECK (ts < now()), and nothing relies on a
+// check being immutable — but each host function must declare a component identity (42P17) so a
+// swapped implementation is detectable. undefined for a check that calls no host function.
+function collectCheckHostDeps(
+  node: RExpr,
+  reg: ExtensionRegistry | null,
+): HostFuncDep[] | undefined {
+  if (reg === null) return undefined;
+  const deps: HostFuncDep[] = [];
+  collectHostDeps(node, reg, false, "a check constraint", deps);
+  sortHostDeps(deps);
+  return deps.length > 0 ? deps : undefined;
+}
+
+// sortHostDeps fixes a stable on-disk / cross-core order (CLAUDE.md §8): by (name, on-disk arg-type
+// codes), so registration order never leaks into the file bytes.
+function sortHostDeps(deps: HostFuncDep[]): void {
+  deps.sort(compareHostDeps);
+}
+
+// collectHostDeps is the shared walk behind collectIndexHostDeps / collectCheckHostDeps: it admits
+// each host call (requireImmutable only for an index) and appends one dependency per distinct
+// (name, arg types) signature to out.
+function collectHostDeps(
+  node: RExpr,
+  reg: ExtensionRegistry,
+  requireImmutable: boolean,
+  site: string,
+  out: HostFuncDep[],
+): void {
   const nodes: HostFuncNode[] = [];
   collectHostFuncNodes(node, nodes);
   for (const hn of nodes) {
     const hf = reg.functionAt(hn.id);
-    if (hf.volatility !== "immutable") {
+    if (requireImmutable && hf.volatility !== "immutable") {
       throw engineError(
         "invalid_object_definition",
-        `host function ${hn.name} in an index expression must be IMMUTABLE`,
+        `host function ${hn.name} in ${site} must be IMMUTABLE`,
       );
     }
     if (hf.componentId === null) {
       throw engineError(
         "invalid_object_definition",
-        `host function ${hn.name} used in an index expression must declare a component identity`,
+        `host function ${hn.name} used in ${site} must declare a component identity`,
       );
     }
     if (!out.some((d) => d.name === hf.name && sameScalarSig(d.argTypes, hf.argTypes))) {
@@ -23821,15 +23915,7 @@ function verifyIndexHostDeps(node: RExpr, reg: ExtensionRegistry, deps: HostFunc
   const nodes: HostFuncNode[] = [];
   collectHostFuncNodes(node, nodes);
   for (const hn of nodes) {
-    const hf = reg.functionAt(hn.id);
-    const ok = deps.some(
-      (d) =>
-        d.name === hf.name &&
-        sameScalarSig(d.argTypes, hf.argTypes) &&
-        hf.componentId === d.componentId &&
-        hf.semanticVersion === d.semanticVersion,
-    );
-    if (!ok) {
+    if (!hostDepMatches(reg.functionAt(hn.id), deps)) {
       throw engineError(
         // XX002 — the graded "a versioned dependency no longer matches" reopen verdict, shared with
         // the collation version-skew case (extensibility.md §11/§15).
@@ -23839,6 +23925,41 @@ function verifyIndexHostDeps(node: RExpr, reg: ExtensionRegistry, deps: HostFunc
       );
     }
   }
+}
+
+// verifyCheckHostDeps is verifyIndexHostDeps for a CHECK (spec/design/extensibility.md §7.1.2): every
+// host call the resolved check makes must match a dependency persisted with it, else XX002. Unlike an
+// index there is no read-side fallback to take — only a statement that evaluates the check resolves it.
+// A check that persisted no dependency but now resolves to a host function fails the same way.
+function verifyCheckHostDeps(
+  name: string,
+  node: RExpr,
+  reg: ExtensionRegistry | null,
+  deps: readonly HostFuncDep[],
+): void {
+  const nodes: HostFuncNode[] = [];
+  collectHostFuncNodes(node, nodes);
+  for (const hn of nodes) {
+    if (!hostDepMatches(reg!.functionAt(hn.id), deps)) {
+      throw engineError(
+        "collation_version_mismatch",
+        `check constraint ${name} depends on host function ${hn.name} whose registered ` +
+          "component/version no longer matches the file; the constraint must be re-added",
+      );
+    }
+  }
+}
+
+// hostDepMatches reports whether a resolved host function's current registration matches one of deps
+// by signature, component identity, and semantic version.
+function hostDepMatches(hf: HostFuncEntry, deps: readonly HostFuncDep[]): boolean {
+  return deps.some(
+    (d) =>
+      d.name === hf.name &&
+      sameScalarSig(d.argTypes, hf.argTypes) &&
+      hf.componentId === d.componentId &&
+      hf.semanticVersion === d.semanticVersion,
+  );
 }
 
 // sameScalarSig reports whether two scalar argument signatures are identical (arity + per-position
@@ -31180,4 +31301,20 @@ function finalizeBlockingCollection(
     sorted?.close();
     sorter.close();
   }
+}
+
+// insertDefaultNeeds reports which columns an INSERT can apply a default to (spec/design/extensibility.md
+// §7.1.1): every omitted column (provided[i] < 0 — including DEFAULT VALUES and OVERRIDING USER VALUE
+// identity columns) and every column a VALUES row fills with a top-level DEFAULT. rows is null for a
+// SELECT source, whose projection never yields DEFAULT. A row of the wrong arity is skipped here; the
+// caller reports it.
+function insertDefaultNeeds(
+  provided: readonly number[],
+  rows: readonly InsertValue[][] | null,
+): boolean[] {
+  return provided.map((p) => {
+    if (p < 0) return true;
+    if (rows === null) return false;
+    return rows.some((values) => p < values.length && values[p]!.kind === "default");
+  });
 }

@@ -234,7 +234,16 @@ export function indexFirstColumn(def: IndexDef): number {
 // persisted expression text — written back verbatim at every commit so the catalog bytes
 // are stable (spec/fileformat/format.md "Check-expression text") — and the parsed
 // expression the write paths resolve and evaluate per candidate row (constraints.md §4).
-export type CheckConstraint = { name: string; exprText: string; expr: Expr };
+export type CheckConstraint = {
+  name: string;
+  exprText: string;
+  expr: Expr;
+  // hostDeps are the persisted HOST-FUNCTION dependencies of the check expression
+  // (spec/design/extensibility.md §7.1.2, format v35): one per distinct host signature it calls,
+  // sorted by (name, arg-type codes). Verified whenever the check is resolved for evaluation —
+  // a mismatched registration is XX002. undefined for a check that calls no host function.
+  hostDeps?: HostFuncDep[];
+};
 
 // CompositeType is a user-defined COMPOSITE (row) type (spec/design/composite.md): a named,
 // ordered list of typed fields, living in the database's type catalog (a database-level object,

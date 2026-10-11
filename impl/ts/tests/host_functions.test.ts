@@ -1081,3 +1081,267 @@ test("batch streaming scan storage errors match the row kernel", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---- Host functions in DEFAULT / CHECK (spec/design/extensibility.md §7.1, step 4b). ----
+
+// scaledGeo is geo_hash(i64) -> i64 = a * factor under the given component/version, left VOLATILE
+// (the default): a CHECK has no volatility gate (§7.1.2), only a component-identity requirement.
+function scaledGeo(component: string, version: number, factor: bigint): HostFunctionSpec {
+  return {
+    name: "geo_hash",
+    argTypes: ["i64"],
+    result: "i64",
+    kernel: (args) => intValue(asInt(args[0]!) * factor),
+    componentId: component,
+    semanticVersion: version,
+  };
+}
+
+// unversionedGeo is geo_hash(i64) -> i64 = a * 10 with NO component identity.
+function unversionedGeo(): HostFunctionSpec {
+  return {
+    name: "geo_hash",
+    argTypes: ["i64"],
+    result: "i64",
+    kernel: (args) => intValue(asInt(args[0]!) * 10n),
+  };
+}
+
+function wantHostCode(q: Session | Database, sql: string, code: string): void {
+  assert.equal(
+    errCodeOf(() => queryOutcome(q, sql)),
+    code,
+    sql,
+  );
+}
+
+function wantHostOK(q: Session | Database, sql: string): void {
+  queryOutcome(q, sql);
+}
+
+test("host function check admission", () => {
+  // An unversioned host function cannot back a CHECK in any position (42P17)...
+  const s = dbExt(regWith(unversionedGeo()), ["CREATE TABLE u (a i64)"]);
+  wantHostCode(s, "CREATE TABLE t (a i64 CHECK (geo_hash(a) < 100))", "42P17");
+  wantHostCode(s, "CREATE TABLE t (a i64, CHECK (geo_hash(a) < 100))", "42P17");
+  wantHostCode(s, "ALTER TABLE u ADD CONSTRAINT c CHECK (geo_hash(a) < 100)", "42P17");
+  // ...but a DEFAULT has no admission rule: any host function, any volatility, no identity.
+  s.execute("CREATE TABLE d (id i64 PRIMARY KEY, b i64 DEFAULT geo_hash(5))");
+  s.execute("INSERT INTO d (id) VALUES (1)");
+  assert.equal(asInt(oneVal(s, "SELECT b FROM d")), 50n);
+  // A VOLATILE but versioned host function is admitted into a CHECK and enforced.
+  const s2 = dbExt(regWith(scaledGeo("com.example/geo_hash", 1, 10n)), [
+    "CREATE TABLE t (a i64 CHECK (geo_hash(a) < 100))",
+  ]);
+  s2.execute("INSERT INTO t VALUES (9)");
+  wantHostCode(s2, "INSERT INTO t VALUES (10)", "23514");
+});
+
+// createCheckFile writes a file whose CHECK `small` calls geo_hash v1 (a * 10 < 100, i.e. a < 10),
+// holding the row (1, 9).
+function createCheckFile(path: string): void {
+  createFile(path, regWith(scaledGeo("com.example/geo_hash", 1, 10n)), [
+    "CREATE TABLE t (id i64 PRIMARY KEY, a i64, CONSTRAINT small CHECK (geo_hash(a) < 100))",
+    "INSERT INTO t VALUES (1, 9)",
+  ]);
+}
+
+test("host function check reopen matching", () => {
+  const path = tmpFile("hostfunc_check_match.jed");
+  createCheckFile(path);
+  const db = openFile(path, regWith(scaledGeo("com.example/geo_hash", 1, 10n)));
+  try {
+    wantHostOK(db, "INSERT INTO t VALUES (2, 5)");
+    wantHostCode(db, "INSERT INTO t VALUES (3, 10)", "23514");
+    wantHostOK(db, "UPDATE t SET a = 1 WHERE id = 2");
+  } finally {
+    db.close();
+  }
+});
+
+test("host function check reopen missing", () => {
+  const path = tmpFile("hostfunc_check_missing.jed");
+  createCheckFile(path);
+  const db = openFile(path, new ExtensionRegistry());
+  try {
+    // Writes that evaluate the check cannot resolve it (42883); reads and DELETE never evaluate it.
+    assert.deepEqual(idsFile(db, "SELECT id FROM t"), [1n]);
+    wantHostCode(db, "INSERT INTO t VALUES (2, 1)", "42883");
+    wantHostCode(db, "UPDATE t SET a = 1", "42883");
+    wantHostOK(db, "DELETE FROM t WHERE id = 1");
+    assert.deepEqual(idsFile(db, "SELECT id FROM t"), []);
+  } finally {
+    db.close();
+  }
+});
+
+for (const [name, fn] of [
+  ["version", scaledGeo("com.example/geo_hash", 2, 10n)],
+  ["component", scaledGeo("org.other/geo_hash", 1, 10n)],
+] as const) {
+  test(`host function check reopen mismatch (${name})`, () => {
+    const path = tmpFile(`hostfunc_check_mismatch_${name}.jed`);
+    createCheckFile(path);
+    const db = openFile(path, regWith(fn));
+    try {
+      // Every write that evaluates the stale check is refused before mutating anything.
+      wantHostCode(db, "INSERT INTO t VALUES (2, 1)", "XX002");
+      wantHostCode(db, "UPDATE t SET a = 1", "XX002");
+      assert.deepEqual(idsFile(db, "SELECT a FROM t WHERE id = 1"), [9n]);
+      // Reads and DELETE never evaluate a check, so a stale one costs them nothing.
+      wantHostOK(db, "DELETE FROM t WHERE id = 1");
+    } finally {
+      db.close();
+    }
+  });
+}
+
+test("host function check rebuild", () => {
+  const path = tmpFile("hostfunc_check_rebuild.jed");
+  createCheckFile(path);
+  // v2 doubles the factor: the rule becomes a < 5, which the stored row (1, 9) violates.
+  const v2 = () => regWith(scaledGeo("com.example/geo_hash", 2, 20n));
+  const rebuild =
+    "ALTER TABLE t DROP CONSTRAINT small, ADD CONSTRAINT small CHECK (geo_hash(a) < 100)";
+  let db = openFile(path, v2());
+  // The one-statement rebuild re-validates every row with the current implementation: 23514, and the
+  // statement rolls back whole, so the stale check is still in place.
+  wantHostCode(db, rebuild, "23514");
+  wantHostCode(db, "INSERT INTO t VALUES (2, 1)", "XX002");
+  wantHostOK(db, "DELETE FROM t WHERE id = 1");
+  wantHostOK(db, rebuild);
+  wantHostOK(db, "INSERT INTO t VALUES (2, 1)");
+  wantHostCode(db, "INSERT INTO t VALUES (3, 9)", "23514");
+  db.close();
+  // The rebuild persisted the v2 dependency: v2 writes, v1 is now the stale one.
+  db = openFile(path, v2());
+  wantHostOK(db, "INSERT INTO t VALUES (4, 2)");
+  db.close();
+  db = openFile(path, regWith(scaledGeo("com.example/geo_hash", 1, 10n)));
+  try {
+    wantHostCode(db, "INSERT INTO t VALUES (5, 2)", "XX002");
+  } finally {
+    db.close();
+  }
+});
+
+test("host function check unrelated statements", () => {
+  const path = tmpFile("hostfunc_check_unrelated.jed");
+  createFile(path, regWith(scaledGeo("com.example/geo_hash", 1, 10n)), [
+    "CREATE TABLE p1 (id i64 PRIMARY KEY)",
+    "CREATE TABLE p2 (id i64 PRIMARY KEY)",
+    "CREATE TABLE c (id i64 PRIMARY KEY, pid i64 REFERENCES p1 ON DELETE SET NULL, a i64, CHECK (geo_hash(a) < 100))",
+    "CREATE TABLE k (id i64 PRIMARY KEY, pid i64 REFERENCES p2 ON DELETE CASCADE, a i64, CHECK (geo_hash(a) < 100))",
+    "INSERT INTO p1 VALUES (1)",
+    "INSERT INTO p2 VALUES (1)",
+    "INSERT INTO c VALUES (1, 1, 1)",
+    "INSERT INTO k VALUES (1, 1, 1)",
+  ]);
+  const db = openFile(path, regWith(scaledGeo("com.example/geo_hash", 2, 10n)));
+  try {
+    // Adding an unrelated constraint validates only the new one, so the stale check does not block it.
+    wantHostOK(db, "ALTER TABLE c ADD CONSTRAINT pos CHECK (a > -100)");
+    // An ON DELETE SET NULL action UPDATEs the child, evaluating its stale check: refused, nothing changes.
+    wantHostCode(db, "DELETE FROM p1", "XX002");
+    assert.deepEqual(idsFile(db, "SELECT id FROM p1"), [1n]);
+    // An ON DELETE CASCADE action only deletes child rows, so it never evaluates the check.
+    wantHostOK(db, "DELETE FROM p2");
+    assert.deepEqual(idsFile(db, "SELECT id FROM k"), []);
+  } finally {
+    db.close();
+  }
+});
+
+test("host function check alter type recollects", () => {
+  const lim32: HostFunctionSpec = {
+    name: "lim",
+    argTypes: ["i32"],
+    result: "i32",
+    kernel: (args) => intValue(asInt(args[0]!)),
+    componentId: "a/lim",
+  };
+  const lim64 = (): HostFunctionSpec => ({
+    name: "lim",
+    argTypes: ["i64"],
+    result: "i64",
+    kernel: (args) => intValue(asInt(args[0]!)),
+    componentId: "b/lim",
+  });
+  const path = tmpFile("hostfunc_check_retype.jed");
+  createFile(path, regWith(lim32, lim64()), [
+    "CREATE TABLE t (id i64 PRIMARY KEY, a i32, CHECK (lim(a) < 100))",
+    "INSERT INTO t VALUES (1, 5)",
+  ]);
+  // The check depends on lim(i32), so a registry without it cannot write.
+  let db = openFile(path, regWith(lim64()));
+  assert.throws(
+    () => queryOutcome(db, "INSERT INTO t VALUES (2, 6)"),
+    EngineError,
+    "a write without the lim(i32) dependency should be refused",
+  );
+  db.close();
+  // ALTER COLUMN TYPE re-validates every row and re-collects the dependency from the new resolution.
+  db = openFile(path, regWith(lim32, lim64()));
+  wantHostOK(db, "ALTER TABLE t ALTER COLUMN a TYPE i64");
+  db.close();
+  db = openFile(path, regWith(lim64()));
+  try {
+    wantHostOK(db, "INSERT INTO t VALUES (2, 6)");
+    wantHostCode(db, "INSERT INTO t VALUES (3, 100)", "23514");
+  } finally {
+    db.close();
+  }
+});
+
+test("host function default resolved only when applied", () => {
+  const path = tmpFile("hostfunc_default_lazy.jed");
+  createFile(path, regWith(unversionedGeo()), [
+    "CREATE TABLE t (id i64 PRIMARY KEY, b i64 DEFAULT geo_hash(5), c i64)",
+    "INSERT INTO t (id) VALUES (1)",
+    "CREATE TABLE p (id i64 PRIMARY KEY)",
+    "INSERT INTO p VALUES (0), (1)",
+    "CREATE TABLE ch (id i64 PRIMARY KEY, pid i64 DEFAULT geo_hash(0) REFERENCES p ON DELETE SET DEFAULT)",
+    "INSERT INTO ch VALUES (1, 1)",
+  ]);
+  const db = openFile(path, new ExtensionRegistry());
+  try {
+    // Statements that never apply the default do not need its host function.
+    wantHostOK(db, "INSERT INTO t VALUES (2, 7, 7)");
+    wantHostOK(db, "INSERT INTO t (id, b) VALUES (3, 1)");
+    wantHostOK(db, "INSERT INTO t (id, b) VALUES (3, 1) ON CONFLICT DO NOTHING");
+    wantHostOK(db, "INSERT INTO t (id, b) SELECT 4, 4");
+    wantHostOK(db, "UPDATE t SET c = 1");
+    wantHostOK(db, "DELETE FROM p WHERE id = 99"); // deletes no parent row, so SET DEFAULT never fires
+    // Statements that would apply it cannot resolve it.
+    wantHostCode(db, "INSERT INTO t (id) VALUES (5)", "42883");
+    wantHostCode(db, "INSERT INTO t VALUES (5, DEFAULT, 1)", "42883");
+    wantHostCode(db, "INSERT INTO t (id) SELECT 5", "42883");
+    wantHostCode(db, "INSERT INTO t DEFAULT VALUES", "42883");
+    wantHostCode(db, "UPDATE t SET b = DEFAULT", "42883");
+    // Deleting a parent row fires its SET DEFAULT action, whose child UPDATE resolves the default per
+    // statement — whether or not a child row matches (here one does).
+    wantHostCode(db, "DELETE FROM p WHERE id = 1", "42883");
+  } finally {
+    db.close();
+  }
+});
+
+test("host function check error precedes default", () => {
+  const path = tmpFile("hostfunc_check_default_order.jed");
+  const lim: HostFunctionSpec = {
+    name: "lim",
+    argTypes: ["i64"],
+    result: "i64",
+    kernel: (args) => intValue(asInt(args[0]!)),
+  };
+  createFile(path, regWith(scaledGeo("com.example/geo_hash", 1, 10n), lim), [
+    "CREATE TABLE t (id i64 PRIMARY KEY, a i64, b i64 DEFAULT lim(1), CHECK (geo_hash(a) < 100))",
+  ]);
+  // A stale check (XX002) and a missing default function (42883): the check resolves first.
+  const db = openFile(path, regWith(scaledGeo("com.example/geo_hash", 2, 10n)));
+  try {
+    wantHostCode(db, "INSERT INTO t (id, a) VALUES (1, 1)", "XX002");
+  } finally {
+    db.close();
+  }
+});

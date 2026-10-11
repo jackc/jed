@@ -82,6 +82,12 @@ pub struct CheckConstraint {
     pub name: String,
     pub expr_text: String,
     pub expr: Expr,
+    /// The persisted **host-function** dependencies of the check expression
+    /// (spec/design/extensibility.md §7.1.2, `format_version` 35): one per distinct host signature it
+    /// calls, sorted by `(name, arg-type codes)`. Verified whenever the check is resolved for
+    /// evaluation — a mismatched registration is `XX002`. Empty for a check that calls no host
+    /// function.
+    pub host_deps: Vec<HostFuncDep>,
 }
 
 /// The KIND of a secondary index (spec/design/gin.md): an ordered B-tree (the default) or a

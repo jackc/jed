@@ -17,8 +17,10 @@ built-in catalog.
 
 A host builds an **`ExtensionRegistry`**, adds functions to it, and passes it in the create/open
 options. The engine **freezes the registry for the handle's lifetime** and shares it into every
-session, so the set of functions is fixed once the handle is open — registering code never mutates
-schema, and nothing about a host function is written to the file (a reopening host brings its own).
+session, so the set of functions is fixed once the handle is open. Registering code never mutates
+schema, and the function itself is never written to the file: a reopening host brings its own. Only
+an index or `CHECK` that uses a host function records which implementation it was built against
+(below).
 
 <CodeTabs topic="host-functions" />
 
@@ -115,10 +117,46 @@ it is refused (`XX002` on a mismatch, `42883` when the function is missing) — 
 result. A non-`immutable` or unversioned host function used in an index is rejected up front with
 `42P17`. (Rebuild the index to adopt the new version.)
 
+## In `DEFAULT` and `CHECK`
+
+A host function can supply a column default or enforce a check:
+
+```sql
+CREATE TABLE items (
+  id  i64 PRIMARY KEY DEFAULT next_item_id(),
+  sku text CHECK (valid_sku(sku))
+);
+```
+
+The two are treated differently, because they relate differently to stored rows:
+
+- **A `DEFAULT`** runs once, when a row is written, and the value it produces is ordinary data.
+  Changing the function later affects only new rows. So any host function may be a default (any
+  volatility, no `component_id` needed), and nothing about it is recorded in the file. A statement
+  calls the function only if it actually uses the default: an `INSERT` that supplies the column, or
+  an `UPDATE` that doesn't assign `DEFAULT`, works even when the host hasn't registered it. One
+  that needs the default gets `42883`.
+- **A `CHECK`** is a promise about every stored row, so a changed function could leave old rows
+  silently violating it. A check's host function must declare a **`component_id`** (`42P17`
+  otherwise), and the file records each one's identity and `semantic_version`, as for an index. Any
+  volatility is allowed. On reopen with a **different `component_id`** or **bumped
+  `semantic_version`**, every statement that would evaluate the check (`INSERT`, `UPDATE`, a
+  foreign-key action that updates the table) is refused with `XX002` before writing anything. With
+  the function missing, those statements get `42883`. Reads and `DELETE` never evaluate a check,
+  so they keep working.
+
+To adopt a new version, re-add the check in one statement. It re-checks every existing row with the
+current code (failing with `23514`, and changing nothing, if one no longer passes) and records the
+new version:
+
+```sql
+ALTER TABLE items DROP CONSTRAINT items_sku_check, ADD CONSTRAINT items_sku_check CHECK (valid_sku(sku));
+```
+
 Registration stays a **host-API act, never SQL** — there is no `CREATE FUNCTION` statement, so an
 untrusted query surface can never register or redefine host code. The registry itself is a handle
-setting a reopening host brings; only the *dependency* of an index on a function is written to the
-file.
+setting a reopening host brings; only the *dependency* of an index or check on a function is
+written to the file.
 
 ## The boundary
 
@@ -130,6 +168,5 @@ only a function that declared its cost. That is the whole trade: jed gives you a
 extension seam and a legible line where your code takes over.
 
 The surface is still deliberately narrow — **strict** and **exact scalar signatures** (no implicit
-promotion). Host functions in `DEFAULT`/`CHECK` columns, host *types*, and non-strict functions come
-later, as does batching at more sites (filters inside joins and blocking scans, aggregate
+promotion). Host *types* and non-strict functions come later, as does batching at more sites (filters inside joins and blocking scans, aggregate
 arguments, writes, index builds — today they call a batch kernel with one row).
