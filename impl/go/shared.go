@@ -2472,9 +2472,11 @@ func (s *Session) publish() error {
 	// Taken first, so any failure below drops the staged attachment commits unadopted.
 	staged := s.engine.stagedAttachments
 	s.engine.stagedAttachments = nil
-	// Only changed domains publish (transactions.md §2.1): an unchanged commit writes nothing and keeps
-	// main's version.
+	// Only changed domains publish (transactions.md §2.1). Consume the changes the preceding commit
+	// reported, so no later publish can reuse them; an unchanged commit writes nothing and keeps main's
+	// version.
 	changes := s.engine.commitChanges
+	s.engine.commitChanges.main, s.engine.commitChanges.attached = false, false
 	if !changes.main && !changes.attached {
 		return nil
 	}

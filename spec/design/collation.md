@@ -349,7 +349,10 @@ thereafter:
   engine-level call the host may invoke prior to `open` (Rust `jed::load_unicode_data`, Go
   `jed.LoadUnicodeData`, TS `loadUnicodeData`); both populate the one engine-global set.
 - **`db.SetDefaultCollation(name)` / `db.DefaultCollation()`** set/read the per-database default
-  (the name must be in a loaded bundle, else `42704`).
+  (the name must be in a loaded bundle, else `42704`). Like `db.UpgradeCollations()`, setting it is a
+  write: outside a block it commits (publishing only when the value changes); inside an open block it
+  stages into the working set and obeys the block's write rules (`25P02` when aborted, `25006` in a
+  READ ONLY block).
 - **`db.Collations()`** introspects **this database's referenced** collations; **`db.LoadedCollations()`**
   introspects the loaded set available on the handle: `name`, `(unicode, cldr)` version, `description`.
 - the SQL surface (`COLLATE`, per-column collation, `ORDER BY … COLLATE`) **references** loaded

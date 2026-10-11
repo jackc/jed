@@ -490,3 +490,41 @@ func TestCollationOpenRefusesAbsent(t *testing.T) {
 		t.Fatalf("message should name the collation + version: %v", err)
 	}
 }
+
+func TestCollationHostOpsRejectedInReadOnlyOrFailedBlock(t *testing.T) {
+	t.Parallel()
+	// A host collation op inside an open block follows the block's statement rules: a READ ONLY
+	// block is 25006 and an aborted block is 25P02, never a success that COMMIT then discards.
+	loadFixtureBundle(t)
+	db := memDB().Session(SessionOptions{})
+	if err := db.Begin(false); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetDefaultCollation("unicode"); err == nil || err.(*EngineError).Code() != "25006" {
+		t.Fatalf("read-only block set default: want 25006, got %v", err)
+	}
+	if _, err := db.UpgradeCollations(); err == nil || err.(*EngineError).Code() != "25006" {
+		t.Fatalf("read-only block upgrade: want 25006, got %v", err)
+	}
+	if err := db.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Begin(true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queryOutcome(db, "SELECT * FROM absent", nil); err == nil {
+		t.Fatal("expected failure")
+	}
+	if err := db.SetDefaultCollation("unicode"); err == nil || err.(*EngineError).Code() != "25P02" {
+		t.Fatalf("failed block set default: want 25P02, got %v", err)
+	}
+	if _, err := db.UpgradeCollations(); err == nil || err.(*EngineError).Code() != "25P02" {
+		t.Fatalf("failed block upgrade: want 25P02, got %v", err)
+	}
+	if err := db.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if db.DefaultCollation() != "C" {
+		t.Fatalf("default changed: %q", db.DefaultCollation())
+	}
+}

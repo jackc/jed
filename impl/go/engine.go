@@ -18,7 +18,8 @@ import (
 // commit swaps committed := working (rollback drops working, since committed was never touched).
 // Every write — autocommit included — runs as a transaction, which unifies the two paths.
 type engine struct {
-	// commitChanges survives the inner commit so the shared session persists only changed domains.
+	// commitChanges reports the changed domains of the last commit (or host catalog op) to the shared
+	// session, whose publish consumes and clears it so it persists only changed domains.
 	commitChanges struct{ main, attached bool }
 	committed     *snapshot
 	// explainActual is non-nil only while EXPLAIN ANALYZE executes its inner statement. Execution
@@ -1494,56 +1495,83 @@ func (db *engine) LoadedCollations() []collationInfo {
 // idempotent (no skew ⇒ a no-op returning 0). Persisted by the next explicit Commit. Returns the
 // number of collations re-pinned.
 func (db *engine) UpgradeCollations() (int, error) {
-	work := db.readSnap().clone()
+	base, err := db.hostWriteBase()
+	if err != nil {
+		return 0, err
+	}
+	work := base.clone()
 	n, err := work.upgradeCollations(db.pageSize)
 	if err != nil {
 		return 0, err
 	}
-	if db.session.tx != nil {
-		if n > 0 {
-			db.session.tx.working = work
-			db.session.tx.mainDirty = true
-		}
-	} else {
-		db.commitChanges.main, db.commitChanges.attached = n > 0, false
-		if n > 0 {
-			work.freezeMutationGenerations()
-			db.committed = work
-		}
-	}
+	db.adoptHostWrite(work, n > 0)
 	return n, nil
 }
 
 func (db *engine) SetDefaultCollation(name string) error {
-	work := db.readSnap().clone()
-	if name != "C" && work.resolveCollation(name) == nil {
+	base, err := db.hostWriteBase()
+	if err != nil {
+		return err
+	}
+	if name != "C" && base.resolveCollation(name) == nil {
 		return newError(UndefinedObject, fmt.Sprintf("collation %q does not exist", name))
 	}
 	value := name
 	if value == "C" {
 		value = ""
 	}
-	changed := work.defaultCollation != value
-	work.defaultCollation = value
-	if db.session.tx != nil {
-		db.session.tx.working = work
-		db.session.tx.mainDirty = db.session.tx.mainDirty || changed
-	} else {
-		db.commitChanges.main, db.commitChanges.attached = changed, false
-		if changed {
-			db.committed = work
-		}
+	if base.defaultCollation == value {
+		db.adoptHostWrite(nil, false)
+		return nil
 	}
+	work := base.clone()
+	work.defaultCollation = value
+	db.adoptHostWrite(work, true)
 	return nil
+}
+
+// hostWriteBase is the snapshot a host catalog op (SetDefaultCollation / UpgradeCollations) writes
+// on: the open block's working set, else committed. Inside a block the op obeys the block's write
+// rules — 25P02 when aborted, 25006 when READ ONLY — rather than staging a change COMMIT discards.
+func (db *engine) hostWriteBase() (*snapshot, error) {
+	tx := db.session.tx
+	if tx == nil {
+		return db.committed, nil
+	}
+	if tx.failed {
+		return nil, newError(InFailedSqlTransaction,
+			"current transaction is aborted, commands ignored until end of transaction block")
+	}
+	if !tx.writable {
+		return nil, newError(ReadOnlySqlTransaction, "cannot change collations in a read-only transaction")
+	}
+	return tx.working, nil
+}
+
+// adoptHostWrite installs a host catalog op's result: staged into the open block (published at its
+// COMMIT), or — outside a block — swapped in as committed and reported to the session's publish.
+func (db *engine) adoptHostWrite(work *snapshot, changed bool) {
+	if db.session.tx != nil {
+		if changed {
+			db.session.tx.working = work
+			db.session.tx.mainDirty = true
+		}
+		return
+	}
+	db.commitChanges.main, db.commitChanges.attached = changed, false
+	if changed {
+		work.freezeMutationGenerations()
+		db.committed = work
+	}
 }
 
 // DefaultCollation returns the per-database default collation name — "C" unless SetDefaultCollation
 // moved it (db.DefaultCollation, spec/design/collation.md §1).
 func (db *engine) DefaultCollation() string {
-	if db.readSnap().defaultCollation == "" {
-		return "C"
+	if name := db.readSnap().defaultCollation; name != "" {
+		return name
 	}
-	return db.readSnap().defaultCollation
+	return "C"
 }
 
 // Collations introspects the collations THIS DATABASE references (db.Collations,

@@ -2429,19 +2429,57 @@ export class Engine {
   // collation (else 42704). Persisted as the is_default flag on that collation's reference entry at
   // the next commit (the entry is emitted because the default references it — §5).
   setDefaultCollation(name: string): void {
-    const work = this.readSnap().clone();
-    if (name !== "C" && work.resolveCollation(name) === undefined) {
+    const base = this.hostWriteBase();
+    if (name !== "C" && base.resolveCollation(name) === undefined) {
       throw engineError("undefined_object", `collation "${name}" does not exist`);
     }
     const value = name === "C" ? null : name;
-    const changed = work.defaultCollation !== value;
+    if (base.defaultCollation === value) {
+      this.adoptHostWrite(null);
+      return;
+    }
+    const work = base.clone();
     work.defaultCollation = value;
-    if (this.session.tx !== null) {
-      this.session.tx.working = work;
-      this.session.tx.mainDirty ||= changed;
-    } else {
-      this.commitChanges = { main: changed, attached: false };
-      if (changed) this.committed = work;
+    this.adoptHostWrite(work);
+  }
+
+  // hostWriteBase is the snapshot a host catalog op (setDefaultCollation / upgradeCollations) writes
+  // on: the open block's working set, else committed. Inside a block the op obeys the block's write
+  // rules — 25P02 when aborted, 25006 when READ ONLY — rather than staging a change COMMIT discards.
+  private hostWriteBase(): Snapshot {
+    const tx = this.session.tx;
+    if (tx === null) return this.committed;
+    if (tx.failed) {
+      throw engineError(
+        "in_failed_sql_transaction",
+        "current transaction is aborted, commands ignored until end of transaction block",
+      );
+    }
+    if (!tx.writable) {
+      throw engineError(
+        "read_only_sql_transaction",
+        "cannot change collations in a read-only transaction",
+      );
+    }
+    return tx.working;
+  }
+
+  // adoptHostWrite installs a host catalog op's result (null = unchanged): staged into the open block
+  // (published at its COMMIT), or — outside a block — swapped in as committed and reported to the
+  // session's publish.
+  private adoptHostWrite(work: Snapshot | null): void {
+    const tx = this.session.tx;
+    if (tx !== null) {
+      if (work !== null) {
+        tx.working = work;
+        tx.mainDirty = true;
+      }
+      return;
+    }
+    this.commitChanges = { main: work !== null, attached: false };
+    if (work !== null) {
+      work.freezeMutationGenerations();
+      this.committed = work;
     }
   }
 
@@ -2461,20 +2499,9 @@ export class Engine {
   // idempotent (no skew ⇒ a no-op returning 0). Persisted by the next explicit commit. Returns the
   // number of collations re-pinned.
   upgradeCollations(): number {
-    const work = this.readSnap().clone();
+    const work = this.hostWriteBase().clone();
     const n = work.upgradeCollations(this.pageSize);
-    if (this.session.tx !== null) {
-      if (n > 0) {
-        this.session.tx.working = work;
-        this.session.tx.mainDirty = true;
-      }
-    } else {
-      this.commitChanges = { main: n > 0, attached: false };
-      if (n > 0) {
-        work.freezeMutationGenerations();
-        this.committed = work;
-      }
-    }
+    this.adoptHostWrite(n > 0 ? work : null);
     return n;
   }
 
@@ -7605,7 +7632,10 @@ export class Engine {
             fk.refTable.toLowerCase() !== table.name.toLowerCase() ||
             !sameSet(sortedUnique(fk.refColumns), cols),
         );
-        if (fks.length !== child.fks.length) ws.tables.set(key, { ...child, fks });
+        if (fks.length !== child.fks.length) {
+          ws.bumpCatGen(); // direct catalog writes must still mark main changed (changedSince)
+          ws.tables.set(key, { ...child, fks });
+        }
       }
     }
     if (rewriteNeeded) {

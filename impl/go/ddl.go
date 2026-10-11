@@ -2530,6 +2530,9 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	if err != nil {
 		return outcome{}, err
 	}
+	if len(constraintState.other) > 0 {
+		ws.bumpCatGen() // direct catalog writes must still mark main changed (snapshot.changedSince)
+	}
 	for key, changed := range constraintState.other {
 		ws.tables[key] = changed
 	}

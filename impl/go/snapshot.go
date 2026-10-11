@@ -1167,6 +1167,7 @@ func (s *snapshot) rebuildAlterIndexes(old, next *catTable, entries map[string][
 // COLUMN rewrite compacts the parent's dense ordinals. A -1 mapping means CASCADE removed the
 // referenced column and therefore removes that FK / owned sequence.
 func (s *snapshot) remapAlterColumnDependents(parent string, originalToNew []int, pending map[string]bool) {
+	s.bumpCatGen() // catalog writes below bypass the generation-bumping funnels
 	for key, child := range s.tables {
 		if strings.EqualFold(child.Name, parent) {
 			continue

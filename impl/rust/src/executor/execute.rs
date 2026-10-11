@@ -581,8 +581,8 @@ impl Engine {
     /// that collation's reference entry at the next `commit` (the entry is emitted because the default
     /// references it — §5).
     pub fn set_default_collation(&mut self, name: &str) -> Result<()> {
-        let mut work = self.read_snap().clone();
-        if name != "C" && work.resolve_collation(name).is_none() {
+        let base = self.host_write_base()?;
+        if name != "C" && base.resolve_collation(name).is_none() {
             return Err(EngineError::new(
                 SqlState::UndefinedObject,
                 format!("collation \"{name}\" does not exist"),
@@ -593,21 +593,56 @@ impl Engine {
         } else {
             Some(name.to_string())
         };
-        let changed = work.default_collation != value;
-        work.set_default_collation(value);
-        if let Some(tx) = self.session.tx.as_mut() {
-            tx.working = work;
-            tx.main_dirty |= changed;
-        } else {
-            self.commit_changes = CommitChanges {
-                main: changed,
-                attached: false,
-            };
-            if changed {
-                self.committed = work;
-            }
+        if base.default_collation == value {
+            self.adopt_host_write(None);
+            return Ok(());
         }
+        let mut work = base.clone();
+        work.set_default_collation(value);
+        self.adopt_host_write(Some(work));
         Ok(())
+    }
+
+    /// The snapshot a host catalog op (`set_default_collation` / `upgrade_collations`) writes on:
+    /// the open block's working set, else committed. Inside a block the op obeys the block's write
+    /// rules — 25P02 when aborted, 25006 when READ ONLY — rather than staging a change COMMIT discards.
+    fn host_write_base(&self) -> Result<&Snapshot> {
+        let Some(tx) = self.session.tx.as_ref() else {
+            return Ok(&self.committed);
+        };
+        if tx.is_failed() {
+            return Err(EngineError::new(
+                SqlState::InFailedSqlTransaction,
+                "current transaction is aborted, commands ignored until end of transaction block",
+            ));
+        }
+        if !tx.writable {
+            return Err(EngineError::new(
+                SqlState::ReadOnlySqlTransaction,
+                "cannot change collations in a read-only transaction",
+            ));
+        }
+        Ok(&tx.working)
+    }
+
+    /// Install a host catalog op's result (`None` = unchanged): staged into the open block (published
+    /// at its COMMIT), or — outside a block — swapped in as committed and reported to the session's
+    /// publish.
+    fn adopt_host_write(&mut self, work: Option<Snapshot>) {
+        if let Some(tx) = self.session.tx.as_mut() {
+            if let Some(work) = work {
+                tx.working = work;
+                tx.main_dirty = true;
+            }
+            return;
+        }
+        self.commit_changes = CommitChanges {
+            main: work.is_some(),
+            attached: false,
+        };
+        if let Some(work) = work {
+            self.committed = work;
+        }
     }
 
     /// Adopt a newly-loaded Unicode version for this database's skewed collations
@@ -621,22 +656,9 @@ impl Engine {
     /// change is persisted by the next explicit [`Engine::commit`]. Returns the number of collations
     /// re-pinned.
     pub fn upgrade_collations(&mut self) -> Result<usize> {
-        let mut work = self.read_snap().clone();
+        let mut work = self.host_write_base()?.clone();
         let n = work.upgrade_collations(self.page_size)?;
-        if let Some(tx) = self.session.tx.as_mut() {
-            if n > 0 {
-                tx.working = work;
-                tx.main_dirty = true;
-            }
-        } else {
-            self.commit_changes = CommitChanges {
-                main: n > 0,
-                attached: false,
-            };
-            if n > 0 {
-                self.committed = work;
-            }
-        }
+        self.adopt_host_write((n > 0).then_some(work));
         Ok(n)
     }
 

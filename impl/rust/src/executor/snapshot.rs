@@ -1048,6 +1048,7 @@ impl Snapshot {
         if dropped.is_empty() {
             return;
         }
+        self.bump_cat_gen(); // direct catalog writes must still mark main changed (changed_since)
         for child in std::sync::Arc::make_mut(&mut self.tables).values_mut() {
             if child.name.eq_ignore_ascii_case(parent) {
                 continue;
@@ -1068,6 +1069,7 @@ impl Snapshot {
         original_to_new: &[Option<usize>],
         pending_sequences: &std::collections::HashSet<String>,
     ) {
+        self.bump_cat_gen(); // catalog writes below bypass the generation-bumping funnels
         let parent_key = parent.to_ascii_lowercase();
         for (key, child) in std::sync::Arc::make_mut(&mut self.tables) {
             if key.eq_ignore_ascii_case(&parent_key) {

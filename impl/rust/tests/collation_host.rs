@@ -270,6 +270,32 @@ fn set_default_unknown_is_42704() {
     db.set_default_collation("C").unwrap(); // C always resolves (resets to byte order)
 }
 
+#[test]
+fn collation_host_ops_rejected_in_read_only_or_failed_block() {
+    // A host collation op inside an open block follows the block's statement rules: a READ ONLY
+    // block is 25006 and an aborted block is 25P02, never a success that COMMIT then discards.
+    load_unicode();
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    db.begin(false).unwrap();
+    assert_eq!(
+        db.set_default_collation("unicode").unwrap_err().code(),
+        "25006"
+    );
+    assert_eq!(db.upgrade_collations().unwrap_err().code(), "25006");
+    db.commit().unwrap();
+    db.begin(true).unwrap();
+    assert!(db.query_outcome("SELECT * FROM absent", &[]).is_err());
+    assert_eq!(
+        db.set_default_collation("unicode").unwrap_err().code(),
+        "25P02"
+    );
+    assert_eq!(db.upgrade_collations().unwrap_err().code(), "25P02");
+    db.rollback().unwrap();
+    assert_eq!(db.default_collation(), "C");
+}
+
 // ---- collated keys (slice 1e, on-disk/internal — the corpus cannot express it) ----
 
 #[test]

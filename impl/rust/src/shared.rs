@@ -1736,6 +1736,16 @@ impl Shared {
         r.attached = attached;
     }
 
+    /// Publish new attached roots beside the unchanged main root (an attachment-only commit,
+    /// transactions.md §2.1), under the same lock order as [`Shared::publish`].
+    fn publish_attached(&self, attached: HashMap<String, Arc<Snapshot>>) {
+        let _live = self.live.lock().expect("live lock not poisoned");
+        self.roots
+            .write()
+            .expect("roots lock not poisoned")
+            .attached = attached;
+    }
+
     /// The page size minted sessions serialize/split at: the file's page size for a file-backed core,
     /// else the in-memory default. A session's stores must split at the file's page size so they match
     /// the physical pages `persist` writes — and so every core builds byte-identical file-backed
@@ -3037,31 +3047,38 @@ impl Session {
     fn publish(&mut self) -> Result<()> {
         // Taken first, so any failure below drops the staged attachment commits unadopted.
         let staged = std::mem::take(&mut self.engine.staged_attachments);
-        // Only changed domains publish (transactions.md §2.1): an unchanged commit writes nothing and
-        // keeps main's version.
-        let changes = self.engine.commit_changes;
+        // Only changed domains publish (transactions.md §2.1). Consume the changes the preceding commit
+        // reported, so no later publish can reuse them; an unchanged commit writes nothing and keeps
+        // main's version.
+        let changes = std::mem::take(&mut self.engine.commit_changes);
         if !changes.main && !changes.attached {
             return Ok(());
         }
         self.shared.check_coordinator_pids()?;
-        let mut snap = self.engine.committed.clone();
-        if changes.main {
-            snap.txid = self.base_version + 1; // main-domain version and reclamation watermark
-            // durable before publish (packs into the byte store, any host)
-            self.shared.persist(&snap, self.engine.commit_stages_rows)?;
-            #[cfg(test)]
-            if let Some(hook) = AFTER_PERSIST_HOOK.lock().expect("hook lock").as_ref() {
-                hook(); // the persist→publish window (test seam; §8 fallback-reader race point)
-            }
-            // The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids
-            // to every dirty node it wrote, so the committed tree can shed its leaf payloads — clean
-            // leaves demote to `OnDisk` references faulted back through the pool on next touch. The
-            // session's own committed base takes the same flipped shape, so a long-lived writer sheds
-            // residency too (read-your-writes for the NEXT statement re-faults — one read path).
-            snap.demote_clean_leaves();
-            self.engine.committed = snap.clone();
-            self.base_version += 1;
+        if !changes.main {
+            // Attachment-only: main is unchanged, so its published root is reused as-is.
+            self.shared
+                .publish_attached(self.engine.attached_committed.clone());
+            self.shared
+                .adopt_attachments(staged, &self.engine.attached_committed);
+            return Ok(());
         }
+        let mut snap = self.engine.committed.clone();
+        snap.txid = self.base_version + 1; // main-domain version and reclamation watermark
+        // durable before publish (packs into the byte store, any host)
+        self.shared.persist(&snap, self.engine.commit_stages_rows)?;
+        #[cfg(test)]
+        if let Some(hook) = AFTER_PERSIST_HOOK.lock().expect("hook lock").as_ref() {
+            hook(); // the persist→publish window (test seam; §8 fallback-reader race point)
+        }
+        // The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids
+        // to every dirty node it wrote, so the committed tree can shed its leaf payloads — clean
+        // leaves demote to `OnDisk` references faulted back through the pool on next touch. The
+        // session's own committed base takes the same flipped shape, so a long-lived writer sheds
+        // residency too (read-your-writes for the NEXT statement re-faults — one read path).
+        snap.demote_clean_leaves();
+        self.engine.committed = snap.clone();
+        self.base_version += 1;
         // The N-root commit (attached-databases.md §5): publish the new main root TOGETHER with the
         // current attached roots in one atomic swap. `commit_tx` already adopted each dirtied
         // attachment's working root into `engine.attached_committed` (and staged its pages into the

@@ -196,6 +196,38 @@ test("set default unknown is 42704", () => {
   db.setDefaultCollation("C"); // C always resolves (resets to byte order)
 });
 
+test("collation host ops rejected in read-only or failed block", () => {
+  // A host collation op inside an open block follows the block's statement rules: a READ ONLY
+  // block is 25006 and an aborted block is 25P02, never a success that COMMIT then discards.
+  loadFixtureBundle();
+  const db = new Engine();
+  exec(db, "BEGIN READ ONLY");
+  assert.equal(
+    errCode(() => db.setDefaultCollation("unicode")),
+    "25006",
+  );
+  assert.equal(
+    errCode(() => db.upgradeCollations()),
+    "25006",
+  );
+  exec(db, "COMMIT");
+  exec(db, "BEGIN");
+  assert.equal(
+    errCode(() => exec(db, "SELECT * FROM absent")),
+    "42P01",
+  );
+  assert.equal(
+    errCode(() => db.setDefaultCollation("unicode")),
+    "25P02",
+  );
+  assert.equal(
+    errCode(() => db.upgradeCollations()),
+    "25P02",
+  );
+  exec(db, "ROLLBACK");
+  assert.equal(db.defaultCollation(), "C");
+});
+
 // ---- collated keys (slice 1e, on-disk/internal — the corpus cannot express it) ----
 
 test("collated primary key stored in collation order", () => {

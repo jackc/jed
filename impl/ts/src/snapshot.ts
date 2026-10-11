@@ -937,6 +937,7 @@ export class Snapshot {
     originalToNew: number[],
     pendingSequences: Set<string>,
   ): void {
+    this.bumpCatGen(); // catalog writes below bypass the generation-bumping funnels
     for (const [key, child] of [...this.tables]) {
       if (child.name.toLowerCase() === parent.toLowerCase()) continue;
       let changed = false;

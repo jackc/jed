@@ -1617,9 +1617,11 @@ export class Session {
     // Taken first, so any failure below drops the staged attachment commits unadopted.
     const staged = this.engine.stagedAttachments;
     this.engine.stagedAttachments = [];
-    // Only changed domains publish (transactions.md §2.1): an unchanged commit writes nothing and keeps
-    // main's version.
+    // Only changed domains publish (transactions.md §2.1). Consume the changes the preceding commit
+    // reported, so no later publish can reuse them; an unchanged commit writes nothing and keeps main's
+    // version.
     const changes = this.engine.commitChanges;
+    this.engine.commitChanges = { main: false, attached: false };
     if (!changes.main && !changes.attached) return;
     this.core.checkPid();
     const snap = this.engine.committed;

@@ -60,8 +60,14 @@ func TestUnchangedCommits(t *testing.T) {
 			continue
 		}
 		fields := strings.SplitN(line, "\t", 3)
+		if len(fields) != 3 {
+			t.Fatalf("malformed scenario row %q", line)
+		}
 		mode, sql := fields[0], fields[2]
-		delta, _ := strconv.ParseUint(fields[1], 10, 64)
+		delta, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			t.Fatalf("scenario row %q: %v", line, err)
+		}
 		t.Run(mode+" "+sql, func(t *testing.T) {
 			before, err := os.ReadFile(path)
 			if err != nil {
