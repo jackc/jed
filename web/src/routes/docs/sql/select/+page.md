@@ -277,8 +277,9 @@ column-rename list (`AS t (a, b)`):
 
 <LiveSql {seed} query={derived} rows={4} />
 
-By default the body is an independent query — it cannot see the enclosing query's other `FROM`
-relations. Mark it `LATERAL` (below) to correlate it.
+By default the body cannot see the other `FROM` relations beside it — mark it `LATERAL` (below) to
+correlate it with them. Inside a subquery, though, the body may reference columns of an *enclosing*
+query level, like any correlated subquery: `SELECT (SELECT z FROM (SELECT a.x AS z) d) FROM a`.
 
 ## `VALUES` lists in `FROM` (`FROM (VALUES …) AS v(x)`)
 

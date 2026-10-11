@@ -3249,7 +3249,8 @@ impl QueryPlan {
 
 /// A resolved VALUES-body relation (spec/design/grammar.md §42), executable to its literal rows.
 /// `rows` is the resolved value expressions — `rows[r][c]` is row `r`, column `c` — each resolved
-/// as a CONSTANT (the body is non-`LATERAL`, planned `parent = None`, so it reads no row).
+/// against no FROM row (a non-`LATERAL` body sees no sibling; it may correlate to an enclosing query
+/// level, §42).
 /// `column_types` is the per-column type unified across the rows like a set operation (§25), and
 /// `column_names` is `column1, column2, …` (PostgreSQL; the derived table's optional column-rename
 /// list overrides them at the synthetic relation). All rows have `column_types.len()` values.
@@ -3903,7 +3904,8 @@ pub(crate) struct PlanRel {
     /// (spec/design/grammar.md §42): a parenthesized subquery used as a relation, mechanically an
     /// anonymous always-inlined single-reference CTE. `table_name` is the alias (never looked up in
     /// the store); the executor runs `plan` in place, charging its intrinsic cost — no `cte_scan_row`.
-    /// Non-lateral (`lateral = false`) it reads no outer row; a lateral one reads the left-hand row.
+    /// Non-lateral (`lateral = false`) it was planned against the enclosing query's scope and reads
+    /// this query's outer rows as its own (§42); a lateral one reads the left-hand row.
     derived: Option<Box<QueryPlan>>,
     /// When true, this relation is a CORRELATED `LATERAL` item (spec/design/grammar.md §44): its
     /// derived body / SRF args reference an earlier sibling (or an enclosing query), so the executor
@@ -3911,6 +3913,16 @@ pub(crate) struct PlanRel {
     /// — the correlated-subquery mechanism), rather than materializing it once. Always `false` for the
     /// first relation. Only a `srf` or `derived` relation is ever lateral.
     lateral: bool,
+}
+
+impl PlanRel {
+    /// How many correlation frames this relation's derived body sits below its query: 1 for a
+    /// correlated LATERAL body, planned against the prefix scope of earlier siblings
+    /// (spec/design/grammar.md §44); 0 otherwise — a non-LATERAL body is planned against the
+    /// enclosing query's scope, and an uncorrelated LATERAL body holds no outer reference (§42).
+    pub(crate) fn derived_body_frame(&self) -> usize {
+        usize::from(self.lateral)
+    }
 }
 
 /// How a referenced CTE is evaluated (spec/design/cte.md §3, cost.md §3). Decided per CTE from its

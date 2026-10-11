@@ -957,8 +957,8 @@ pub(crate) fn query_plan_references_outer(plan: &QueryPlan, depth: usize) -> boo
             query_plan_references_outer(&sop.lhs, depth)
                 || query_plan_references_outer(&sop.rhs, depth)
         }
-        // A VALUES body is planned `parent = None`, so its values hold no outer reference of their
-        // own; a folded-in subquery, however, may correlate to the target scope.
+        // A VALUES body's values may correlate to an enclosing query level (§42), as may a
+        // subquery inside one.
         QueryPlan::Values(vp) => vp
             .rows
             .iter()
@@ -1008,13 +1008,15 @@ pub(crate) fn select_plan_references_outer(sp: &SelectPlan, depth: usize) -> boo
                 .as_ref()
                 .is_some_and(|srf| srf.args.iter().any(|a| rexpr_references_outer(a, depth)))
         })
-        // A LATERAL derived table's body is one frame deeper; a reference in it back into this
-        // query's outer (e.g. a nested lateral reaching a grandparent relation) counts here so the
-        // enclosing item is correctly flagged correlated (spec/design/grammar.md §44).
-        || sp
-            .rels
-            .iter()
-            .any(|r| r.derived.as_ref().is_some_and(|d| query_plan_references_outer(d, depth + 1)))
+        // A derived table's body may reference this query's outer: a LATERAL body is one frame
+        // deeper (spec/design/grammar.md §44), a non-LATERAL body is planned against the enclosing
+        // scope and so shares this frame (§42). Either way the enclosing item is correctly flagged
+        // correlated.
+        || sp.rels.iter().any(|r| {
+            r.derived
+                .as_ref()
+                .is_some_and(|d| query_plan_references_outer(d, depth + r.derived_body_frame()))
+        })
 }
 
 pub(crate) fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {

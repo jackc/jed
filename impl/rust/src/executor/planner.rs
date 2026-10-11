@@ -97,9 +97,10 @@ impl Engine {
             let src: RelSrc;
             if is_derived {
                 // Plan the body. LATERAL → `parent` is the prefix scope (earlier siblings chained to
-                // the enclosing query, so a sibling/outer column correlates); otherwise the body is an
-                // INDEPENDENT query (`parent = None`, §42). A LATERAL VALUES body resolves its values
-                // against the prefix too (a column ref then correlates instead of 42703).
+                // the enclosing query, so a sibling/outer column correlates); otherwise the
+                // ENCLOSING query's scope (§42): the body sees no sibling FROM item, but a column of
+                // an enclosing query level correlates in the same frame as this query's own outer
+                // references (PostgreSQL). A VALUES body resolves its values the same way.
                 let plan = if lateral_eligible {
                     let prefix =
                         build_prefix_scope(&finalized, &synthetic, &group_subs, parent, self, ctes);
@@ -115,9 +116,9 @@ impl Engine {
                     }
                 } else {
                     match (&tref.subquery, &tref.values) {
-                        (Some(body), _) => self.plan_query(body, None, ctes, ptypes)?,
+                        (Some(body), _) => self.plan_query(body, parent, ctes, ptypes)?,
                         (None, Some(rows)) => {
-                            QueryPlan::Values(self.plan_values(rows, None, ctes, ptypes)?)
+                            QueryPlan::Values(self.plan_values(rows, parent, ctes, ptypes)?)
                         }
                         _ => unreachable!(),
                     }
@@ -1383,7 +1384,7 @@ impl Engine {
         // fold_uncorrelated_in_plan is NOT a planner rewrite — it executes subqueries and needs
         // bound params, so it stays post-bind in run_query_expr.
         rewrite_where(&mut plan);
-        self.replan_pushed_bodies(&mut plan, &from_items, ctes, ptypes)?;
+        self.replan_pushed_bodies(&mut plan, &from_items, parent, ctes, ptypes)?;
         //
         // ——— Stage 3: physical/access-path selection (spec/design/planner.md §4) ———
         self.optimize_select(&mut plan, &scope);
@@ -1398,6 +1399,7 @@ impl Engine {
         &'a self,
         plan: &mut SelectPlan,
         from_items: &[&TableRef],
+        parent: Option<&Scope<'a>>,
         ctes: &'a [&'a CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<()> {
@@ -1413,7 +1415,7 @@ impl Engine {
                 .take()
                 .expect("a body-pushed relation has a planned body");
             let refs: Vec<usize> = ctes.iter().map(|b| b.refs.get()).collect();
-            let body = self.replan_pushed_query(body_expr, *first, &pushed, ctes, ptypes);
+            let body = self.replan_pushed_query(body_expr, *first, &pushed, parent, ctes, ptypes);
             for (b, r) in ctes.iter().zip(refs) {
                 b.refs.set(r);
             }
@@ -1432,6 +1434,7 @@ impl Engine {
         qe: &QueryExpr,
         first: QueryPlan,
         pushed: &[RExpr],
+        parent: Option<&Scope<'a>>,
         ctes: &'a [&'a CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<QueryPlan> {
@@ -1442,7 +1445,7 @@ impl Engine {
                     .map(|c| substitute_body_columns(c, &first))
                     .collect();
                 Ok(QueryPlan::Select(
-                    self.plan_select_pushed(sel, None, ctes, ptypes, moved)?,
+                    self.plan_select_pushed(sel, parent, ctes, ptypes, moved)?,
                 ))
             }
             (QueryExpr::SetOp(so), QueryPlan::SetOp(first)) => {
@@ -1457,8 +1460,8 @@ impl Engine {
                     limit,
                     offset,
                 } = *first;
-                let lhs = self.replan_pushed_query(&so.lhs, lhs, pushed, ctes, ptypes)?;
-                let rhs = self.replan_pushed_query(&so.rhs, rhs, pushed, ctes, ptypes)?;
+                let lhs = self.replan_pushed_query(&so.lhs, lhs, pushed, parent, ctes, ptypes)?;
+                let rhs = self.replan_pushed_query(&so.rhs, rhs, pushed, parent, ctes, ptypes)?;
                 Ok(QueryPlan::SetOp(Box::new(SetOpPlan {
                     op,
                     all,
@@ -1601,7 +1604,9 @@ fn compute_rel_masks(plan: &SelectPlan) -> Vec<Vec<bool>> {
                 collect_touched(a, 1, &mut touched);
             }
         }
-        if let Some(derived) = &r.derived {
+        // Only a LATERAL body sees this query's columns (one frame deeper); a non-LATERAL body is
+        // planned against the enclosing scope, so its outer references never reach this query.
+        if let Some(derived) = r.derived.as_ref().filter(|_| r.lateral) {
             collect_touched_plan(derived, 1, &mut touched);
         }
     }

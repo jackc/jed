@@ -861,7 +861,8 @@ FROM-clause entry").
 **begins** a chain — the first FROM item, the item after a comma, or the first item of an enclosing
 group — is the same left-deep chain without its parentheses (the same tree and the same `ON` scopes),
 so an unaliased one is **spliced** into the enclosing chain and the planner sees an ordinary chain.
-Any other unaliased group is an inline derived body (`parent = None`, like §42) marked as a join
+Any other unaliased group is an inline derived body (planned against the enclosing query's scope, like
+§42 — so its `ON` clauses may correlate to an enclosing query level, never to a sibling) marked as a join
 group: after its `*` columns it emits every slot the `*` omitted — the USING/NATURAL copies a merge
 superseded — so each inner relation is complete, and it records where each inner label's columns
 landed. The enclosing scope carries those labels as **qualifier-only views** over the group's slots
@@ -879,8 +880,8 @@ unaliased derived table or join group — no longer resolves to the first unlabe
   table** (`FROM (SELECT …) AS t`) and a **parenthesized join** are supported (§42, above); the
   **`t.*`** qualified star, **`USING`**, and **`NATURAL`** have landed (above).
 - **A `LATERAL` item inside a right-hand parenthesized join** cannot reference relations outside the
-  group (`42P01`; PostgreSQL allows it), because that group's body is planned as an independent derived
-  body. Inside a *spliced* (chain-leading) group it sees earlier relations normally.
+  group (`42P01`; PostgreSQL allows it), because that group's body is planned as a derived body, which
+  sees enclosing query levels but no sibling (§42). Inside a *spliced* (chain-leading) group it sees earlier relations normally.
 - **`((SELECT …)) AS s`** — redundant parentheses around a derived-table subquery — stay `42601` (the
   inner item is not a join).
 - **`UPDATE` / `DELETE` stay single-table** — they keep one table name and gain nothing here
@@ -2484,9 +2485,10 @@ always-inlined single-reference CTE — so the alias rules, the column-rename li
 - **Values are general constant expressions (matching PostgreSQL).** Unlike `INSERT … VALUES` (whose
   slot is a literal/`$N`/`DEFAULT`, §12/§16), a VALUES-body value is any expression — `(1+1)`,
   `(upper('a'))`, `(now())`, a cast, `CASE`, `ROW(…)`, `ARRAY[…]`, an uncorrelated scalar subquery.
-  Each is resolved as a **constant**: the body is **non-`LATERAL`** (`parent = None`, like every
-  derived table), so it has no FROM row and no outer row — a **column reference** inside is therefore
-  unresolved (`42703`/`42P01`), an **aggregate** is `42803`, and a bind parameter with no inferable
+  Each is resolved with **no FROM row**: the body is **non-`LATERAL`** (like every derived table, it
+  sees no FROM sibling), so a column reference inside resolves only as a **correlated reference to an
+  enclosing query level** (below) and is otherwise unresolved (`42703`/`42P01`); an **aggregate** is
+  `42803`, and a bind parameter with no inferable
   local type is `42P18` (jed does not infer a bare `$N` from sibling rows — the documented `$N`
   posture of §26; write `$1::int`). This is the one place a VALUES body is *richer* than
   `INSERT … VALUES`: lifting general expressions into the INSERT slot too is a separate future slice.
@@ -2504,14 +2506,24 @@ always-inlined single-reference CTE — so the alias rules, the column-rename li
   A documented PG divergence (PG accepts a VALUES query's trailing clauses), recorded in the override
   ledger.
 
-**The body is NOT correlated (no `LATERAL`).** A derived-table body is planned as an **independent
-query** (`parent = None`), exactly like a non-recursive CTE body ([cte.md](cte.md) §2): it sees its
-own FROM, the catalog, and the statement's **CTE bindings** (so `WITH c AS (…) SELECT * FROM (SELECT
-* FROM c) AS d` works), but **never** the enclosing query's FROM or a sibling FROM relation. A
-reference to an outer or sibling column inside the body is therefore unresolved (`42703`/`42P01`),
-*not* a correlated reference. This is the central behavioral rule, and it matches PostgreSQL:
-without the `LATERAL` keyword a FROM-subquery cannot see the other FROM items. (`LATERAL` — the body
-seeing earlier FROM relations — is a deferred follow-on.) A derived table itself nests freely: its
+**The body sees no sibling (no `LATERAL`), but does see enclosing query levels.** A derived-table
+body sees its own FROM, the catalog, and the statement's **CTE bindings** (so `WITH c AS (…) SELECT
+* FROM (SELECT * FROM c) AS d` works), but **never** a sibling FROM relation of the query that owns
+the FROM clause: a reference to a sibling column inside the body is unresolved (`42P01`/`42703`) —
+without the `LATERAL` keyword (§44) a FROM-subquery cannot see the other FROM items. It *is*,
+however, planned against the **enclosing query's scope** (the `parent` of the query that owns the
+FROM clause), so when that query is itself a subquery, a column of an **enclosing query level**
+inside the body is an ordinary correlated reference (§26), in the **same correlation frame** as the
+owning query's own outer references: `SELECT (SELECT z FROM (SELECT a.x AS z) d) FROM a` returns
+each row's `x`. This matches PostgreSQL, where the non-`LATERAL` rule hides only the FROM *siblings*
+(they are skipped and resolution continues outward — so a sibling label that shadows an enclosing
+one resolves to the enclosing relation). A body with such a reference makes the owning subquery
+correlated (it is never folded once, §26); it is re-executed per enclosing row, running the body in
+place each time (the body itself is still materialized once per run of the owning query — it is not
+re-run per sibling row, so a `RIGHT`/`FULL JOIN` to it stays legal). At top level there is no
+enclosing query, so such a reference is unresolved. Its cost is the ordinary per-outer-row sum of
+the inline body costs — no new unit. (Non-recursive **CTE** bodies stay independent, `parent =
+None` — [cte.md](cte.md) §2; a separate, documented narrowing.) A derived table itself nests freely: its
 body may contain further derived tables, joins, and the expression-position subqueries of §26, each
 counting toward the parser's `MAX_EXPR_DEPTH` nesting limit (`54001`, [cost.md](cost.md) §7) so a
 pathologically nested `FROM (SELECT * FROM (SELECT …))` aborts before overflowing the native stack.
@@ -2532,21 +2544,21 @@ by the body's own context (§26); a `$N` with no type context errors `42P18` as 
 | A column-rename list with no preceding alias name (`(SELECT …) (a)`) | `42601` | The bare `(` is a leftover token (matches PG). |
 | Duplicate explicit FROM label (alias collides) | `42712` | `duplicate_alias`; the general FROM-label rule (§15). Unaliased derived tables have no label and never collide. |
 | Ambiguous bare reference to a duplicated body output column | `42702` | Within one relation or across two (cte.md §2). |
-| Outer / sibling column referenced inside the body | `42703` / `42P01` | The body is not correlated / not LATERAL. |
+| Sibling column referenced inside the body | `42703` / `42P01` | The body is not LATERAL (§44). An enclosing query level's column correlates instead (above). |
 | Leading `(` in FROM not followed by `SELECT`, `VALUES`, or `WITH` | ✅ | **Landed** (§15): a parenthesized join. `FROM (a)` / `(a, b)` (no join inside) is `42601`, as in PG. |
 | Qualified reference to a duplicated body output column (`d.a`) | `42702` | Ambiguous, like the bare reference (PG). |
 | Nested `WITH` inside the body | ✅ | **Landed** (cte.md §7): a derived-table body may be a `WITH`-prefixed query, establishing a child scope over the enclosing visible CTEs. |
 | VALUES-body rows of differing arity | `42601` | `VALUES lists must all be the same length` (the §12 rule). |
 | VALUES-body columns whose row types do not unify | `42804` | `datatype_mismatch`, the set-operation unification rule (§25). |
-| Column reference / aggregate / no-context `$N` in a VALUES-body value | `42703` / `42803` / `42P18` | The body is a non-`LATERAL` constant relation (no FROM/outer row). |
+| Column reference (not of an enclosing query level) / aggregate / no-context `$N` in a VALUES-body value | `42703` / `42803` / `42P18` | The body is a non-`LATERAL` relation with no FROM row. |
 | Trailing `ORDER BY` / `LIMIT` on a VALUES body | `42601` | Leftover token — a deferred narrowing (PG accepts it on a VALUES query). |
 | Body nesting exceeds `MAX_EXPR_DEPTH` | `54001` | The parser depth gate (cost.md §7). |
 
 **Deliberate narrowings (each relaxable later, [../../TODO.md](../../TODO.md)).**
 
 - **`LATERAL`** — ✅ **landed** (§44): a derived table (or SRF, §35) preceded by `LATERAL` (SRFs
-  implicitly) sees earlier FROM relations. A *non-`LATERAL`* derived-table body stays independent
-  (`parent = None`), the rule above.
+  implicitly) sees earlier FROM relations. A *non-`LATERAL`* derived-table body sees no sibling but
+  correlates to enclosing query levels, the rule above.
 - **Parenthesized join / table-reference FROM** — ✅ **landed** (§15): `FROM (a JOIN b ON …) c` is
   the derived table `(SELECT * FROM a JOIN b ON …) AS c`; unaliased, the inner labels stay visible.
 - **A `WITH` *inside* the body** (nested `WITH`) — ✅ **landed** (cte.md §7): a derived-table body,
@@ -2617,7 +2629,8 @@ table has nothing to correlate, so the keyword is meaningless there). Two visibi
 matching PostgreSQL:
 
 - A **sub-SELECT / VALUES derived table is lateral only with the keyword.** Without it the body is the
-  independent, non-correlated relation of §42 (a sibling reference is `42P01`/`42703`). *With* it, the
+  sibling-blind relation of §42 (a sibling reference is `42P01`/`42703`; an enclosing query level
+  still correlates). *With* it, the
   body's `parent` is the scope of the **earlier** FROM relations, so `t.col` / a bare `col` of an
   earlier relation resolves as a correlated reference.
 - A **table function is *implicitly* lateral.** Its arguments may reference earlier FROM relations

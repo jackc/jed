@@ -12859,14 +12859,14 @@ export class Engine {
   }
 
   // planValues resolves a VALUES-body relation into a ValuesPlan (spec/design/grammar.md §42) — the
-  // body of a FROM (VALUES …) derived table. Each value resolves as a CONSTANT against an EMPTY
-  // scope with parent=null: the body is non-LATERAL, so a column reference is unresolved
-  // (42703/42P01) and an aggregate is 42803; it still sees the statement's CTE bindings (an
-  // uncorrelated subquery inside a value resolves like anywhere). Every row must have the same arity
-  // (42601); the columns' types unify across rows like a set operation (42804 on a mismatch). A bind
-  // parameter is then noted at its column's unified type (so VALUES (1),($1) types $1 as int); a
-  // column with no concrete type — all NULL/param — leaves its $N untyped, surfacing 42P18 at
-  // finalize (jed's no-cross-context inference posture, §26).
+  // body of a FROM (VALUES …) derived table. Each value resolves against an EMPTY scope whose parent
+  // is the enclosing query's scope: a non-LATERAL body sees no FROM sibling (42703/42P01) but
+  // correlates to an enclosing query level, and an aggregate is 42803; it still sees the statement's
+  // CTE bindings (an uncorrelated subquery inside a value resolves like anywhere). Every row must
+  // have the same arity (42601); the columns' types unify across rows like a set operation (42804 on
+  // a mismatch). A bind parameter is then noted at its column's unified type (so VALUES (1),($1)
+  // types $1 as int); a column with no concrete type — all NULL/param — leaves its $N untyped,
+  // surfacing 42P18 at finalize (jed's no-cross-context inference posture, §26).
   private planValues(
     rows: Expr[][],
     parent: Scope | null,
@@ -12874,10 +12874,10 @@ export class Engine {
     ptypes: ParamTypes,
   ): ValuesPlan {
     const arity = rows[0]!.length; // the parser guarantees at least one row, each with ≥1 value
-    // A constant scope: no local relations. With parent===null (the usual case) any column reference
-    // is unresolved (the non-LATERAL rule, §42); with a parent (a LATERAL VALUES body, §44) a column
-    // reference correlates to the earlier FROM relations instead. CTE bindings stay visible and
-    // subqueries are allowed (an uncorrelated one folds before the rows run).
+    // No local relations. A column reference correlates through parent — the enclosing query's scope
+    // (§42), or for a LATERAL VALUES body (§44) the earlier FROM relations first — else is
+    // unresolved. CTE bindings stay visible and subqueries are allowed (an uncorrelated one folds
+    // before the rows run).
     const scope = new Scope([], this, parent, true, ctes);
     const resolvedRows: RExpr[][] = [];
     const colTypes: ResolvedType[] = [];
@@ -13049,9 +13049,10 @@ export class Engine {
       }
       if (isDerived) {
         // Plan the body. LATERAL → parent is the prefix scope (a sibling/outer column correlates);
-        // otherwise an INDEPENDENT query (parent=null, §42). A LATERAL VALUES body resolves its
-        // values against the prefix too (a column ref then correlates instead of 42703).
-        const bodyParent = lateralEligible ? lateralParent : null;
+        // otherwise the ENCLOSING query's scope (§42): the body sees no sibling FROM item, but a
+        // column of an enclosing query level correlates in the same frame as this query's own outer
+        // references (PostgreSQL). A VALUES body resolves its values the same way.
+        const bodyParent = lateralEligible ? lateralParent : parent;
         const plan =
           tref.subquery !== undefined
             ? this.planQuery(tref.subquery, bodyParent, ctes, ptypes)
@@ -13921,7 +13922,7 @@ export class Engine {
     // foldUncorrelatedInPlan is NOT a planner rewrite — it executes subqueries and needs bound
     // params, so it stays post-bind in the statement drivers.
     rewriteWhere(plan);
-    this.replanPushedBodies(plan, tableRefs, ctes, ptypes);
+    this.replanPushedBodies(plan, tableRefs, parent, ctes, ptypes);
     //
     // ——— Stage 3: physical/access-path selection (spec/design/planner.md §4) ———
     optimizeSelect(plan, scope.rels, this.readSnap(), this);
@@ -13935,6 +13936,7 @@ export class Engine {
   private replanPushedBodies(
     plan: SelectPlan,
     tableRefs: TableRef[],
+    parent: Scope | null,
     ctes: CteBinding[],
     ptypes: ParamTypes,
   ): void {
@@ -13949,6 +13951,7 @@ export class Engine {
           tableRefs[i]!.subquery!,
           plan.rels[i]!.derived!,
           pushed,
+          parent,
           ctes,
           ptypes,
         );
@@ -13971,19 +13974,20 @@ export class Engine {
     qe: QueryExpr,
     first: QueryPlan,
     pushed: RExpr[],
+    parent: Scope | null,
     ctes: CteBinding[],
     ptypes: ParamTypes,
   ): QueryPlan {
     if (first.kind === "select") {
       const moved = pushed.map((c) => substituteBodyColumns(c, first));
-      return this.planSelectPushed(qe as Select, null, ctes, ptypes, moved);
+      return this.planSelectPushed(qe as Select, parent, ctes, ptypes, moved);
     }
     const so = first as SetOpPlan;
     const syntax = qe as SetOp;
     return {
       ...so,
-      lhs: this.replanPushedQuery(syntax.lhs, so.lhs, pushed, ctes, ptypes),
-      rhs: this.replanPushedQuery(syntax.rhs, so.rhs, pushed, ctes, ptypes),
+      lhs: this.replanPushedQuery(syntax.lhs, so.lhs, pushed, parent, ctes, ptypes),
+      rhs: this.replanPushedQuery(syntax.rhs, so.rhs, pushed, parent, ctes, ptypes),
     };
   }
 
@@ -16392,8 +16396,8 @@ export class Engine {
   // outer); an SRF is generated; a CTE / derived table is delivered / run in place. For a CORRELATED
   // LATERAL relation (§44) the caller passes outer EXTENDED with the combined left-hand row, so the
   // body / SRF args read that row as their immediate outer; a non-lateral relation is passed the
-  // query's own outer and its parent=null body simply ignores it (a parent=null plan holds no
-  // outerColumn, so the two are observably identical).
+  // query's own outer, which is exactly the frame its body was planned against (the enclosing
+  // query's scope, §42).
   private materializeRel(
     plan: SelectPlan,
     ri: number,
@@ -16520,8 +16524,8 @@ export class Engine {
       return r.rows;
     }
     // A DERIVED TABLE runs its body in place (grammar.md §42), charging its intrinsic cost — no
-    // cte_scan_row. Non-lateral it was planned parent=null and ignores outer; a LATERAL body (§44)
-    // reads the left-hand row from outer.
+    // cte_scan_row. Non-lateral it was planned against the enclosing scope and reads this query's
+    // outer as its own; a LATERAL body (§44) reads the left-hand row from outer.
     if (rel.derived !== undefined) {
       const r = this.execQueryPlan(rel.derived, outer, params, env.ctes);
       meter.charge(r.cost);
@@ -23788,13 +23792,21 @@ export function scanEntries(
 // have descended INTO this plan (0 = its own clauses); an outerColumn at level points above iff
 // level > depth. The fold pass calls it with depth 0 on a subquery's sub-plan to fold (uncorrelated)
 // or leave (correlated) it.
+// derivedBodyFrame is how many correlation frames a derived relation's body sits below its query: 1
+// for a correlated LATERAL body, planned against the prefix scope of earlier siblings (grammar.md
+// §44); 0 otherwise — a non-LATERAL body is planned against the enclosing query's scope, and an
+// uncorrelated LATERAL body holds no outer reference at all (§42).
+function derivedBodyFrame(rel: PlanRel): number {
+  return rel.lateral === true ? 1 : 0;
+}
+
 export function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolean {
   if (plan.kind === "setOp") {
     return queryPlanReferencesOuter(plan.lhs, depth) || queryPlanReferencesOuter(plan.rhs, depth);
   }
   if (plan.kind === "values") {
-    // A VALUES body is planned parent=null, so its values hold no outer reference of their own; a
-    // folded-in subquery, however, may correlate to the target scope.
+    // A VALUES body's values may correlate to an enclosing query level (§42), as may a subquery
+    // inside one.
     for (const row of plan.rows)
       for (const e of row) if (rexprReferencesOuter(e, depth)) return true;
     return false;
@@ -23816,13 +23828,14 @@ export function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolea
   for (const oe of plan.orderExprs) if (rexprReferencesOuter(oe, depth)) return true;
   // A set-returning relation's arguments may carry a correlated reference (an implicitly-lateral SRF
   // arg sees params / outer / an earlier sibling — functions.md §10, grammar.md §44), making the
-  // enclosing query correlated. A LATERAL derived table's body is one frame deeper; a reference in it
-  // back into this query's outer counts here too (§44).
+  // enclosing query correlated. A derived table's body may too: a LATERAL body is one frame deeper
+  // (§44), a non-LATERAL body is planned against the enclosing scope and so shares this frame (§42).
   for (const rel of plan.rels) {
     if (rel.srf !== undefined) {
       for (const a of rel.srf.args) if (rexprReferencesOuter(a, depth)) return true;
     }
-    if (rel.derived !== undefined && queryPlanReferencesOuter(rel.derived, depth + 1)) return true;
+    const bodyDepth = depth + derivedBodyFrame(rel);
+    if (rel.derived !== undefined && queryPlanReferencesOuter(rel.derived, bodyDepth)) return true;
   }
   return false;
 }
@@ -24014,7 +24027,9 @@ function computeRelMasks(plan: SelectPlan): boolean[][] {
       // sibling correlation, so depth 1 marks nothing there.
       for (const a of r.srf.args) collectTouched(a, 1, touched);
     }
-    if (r.derived !== undefined) collectTouchedPlan(r.derived, 1, touched);
+    // Only a LATERAL body sees this query's columns (one frame deeper); a non-LATERAL body is planned
+    // against the enclosing scope, so its outer references never reach this query.
+    if (r.derived !== undefined && r.lateral === true) collectTouchedPlan(r.derived, 1, touched);
   }
   return plan.rels.map((r) => touched.slice(r.offset, r.offset + r.colCount));
 }
@@ -24519,7 +24534,8 @@ export function collectTouchedPlan(plan: QueryPlan, depth: number, touched: bool
       if (rel.srf !== undefined) {
         for (const a of rel.srf.args) collectTouched(a, depth, touched);
       }
-      if (rel.derived !== undefined) collectTouchedPlan(rel.derived, depth + 1, touched);
+      if (rel.derived !== undefined)
+        collectTouchedPlan(rel.derived, depth + derivedBodyFrame(rel), touched);
     }
   } else if (plan.kind === "values") {
     for (const row of plan.rows) for (const e of row) collectTouched(e, depth, touched);
@@ -25819,8 +25835,8 @@ export type JsonSqlKind = "exists" | "value" | "query";
 // A `derived` plan marks a DERIVED TABLE — `FROM (SELECT …) [AS] t` (grammar.md §42): a
 // parenthesized subquery used as a relation, mechanically an anonymous always-inlined
 // single-reference CTE. tableName is the alias (never looked up in the store); the executor runs
-// this plan in place (it was planned parent=null, so it reads no outer row), charging its intrinsic
-// cost — no cte_scan_row.
+// this plan in place (non-LATERAL, it was planned against the enclosing query's scope and reads this
+// query's outer rows as its own), charging its intrinsic cost — no cte_scan_row.
 // `lateral` is true when this relation is a CORRELATED LATERAL item (spec/design/grammar.md §44):
 // its derived body / SRF args reference an earlier sibling (or an enclosing query), so the executor
 // re-materializes it ONCE PER combined left-hand row (with that row pushed as its immediate outer —
@@ -26869,7 +26885,8 @@ export type SetOpPlan = {
 
 // ValuesPlan is a resolved VALUES-body relation (spec/design/grammar.md §42), executable to its
 // literal rows — the FROM-position sibling of INSERT … VALUES. rows[r][c] is row r, column c, each
-// resolved as a CONSTANT (the body is non-LATERAL, planned parent=null, so it reads no row).
+// resolved against no FROM row (a non-LATERAL body sees no sibling; it may correlate to an enclosing
+// query level, §42).
 // columnTypes is the per-column type unified across the rows like a set operation (§25), and
 // columnNames is column1, column2, … (PostgreSQL; the derived table's optional column-rename list
 // overrides them at the synthetic relation). All rows have columnTypes.length values.

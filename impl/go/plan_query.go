@@ -1508,19 +1508,18 @@ func (db *engine) execSetOpPlan(plan *setOpPlan, outer []storedRow, params []Val
 }
 
 // planValues resolves a VALUES-body relation into a *valuesPlan (spec/design/grammar.md §42) — the
-// body of a FROM (VALUES …) derived table. Each value resolves as a CONSTANT against an EMPTY scope
-// with parent=nil: the body is non-LATERAL, so a column reference is unresolved (42703/42P01) and an
-// aggregate is 42803; it still sees the statement's CTE bindings (an uncorrelated subquery inside a
-// value resolves like anywhere). Every row must have the same arity (42601); the columns' types
+// body of a FROM (VALUES …) derived table. Each value resolves against an EMPTY scope whose parent is
+// the enclosing query's scope: a non-LATERAL body sees no FROM sibling (42703/42P01) but correlates to
+// an enclosing query level, and an aggregate is 42803; it still sees the statement's CTE bindings (an
+// uncorrelated subquery inside a value resolves like anywhere). Every row must have the same arity (42601); the columns' types
 // unify across rows like a set operation (42804 on a mismatch). A bind parameter is then noted at
 // its column's unified type (so VALUES (1),($1) types $1 as int); a column with no concrete type —
 // all NULL/param — leaves its $N untyped, surfacing 42P18 at finalize (jed's no-cross-context
 // inference posture, §26).
 func (db *engine) planValues(rows [][]*exprNode, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*valuesPlan, error) {
 	arity := len(rows[0]) // the parser guarantees at least one row, each with at least one value
-	// A constant scope: no local relations. With parent==nil (the usual case) any column reference is
-	// unresolved (the non-LATERAL rule, §42); with a parent (a LATERAL VALUES body, §44) a column
-	// reference correlates to the earlier FROM relations instead. CTE bindings stay visible and
+	// No local relations. A column reference correlates through parent — the enclosing query's scope
+	// (§42), or for a LATERAL VALUES body (§44) the earlier FROM relations first — else is unresolved. CTE bindings stay visible and
 	// subqueries are allowed (an uncorrelated one folds before the rows run).
 	s := &scope{parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
 	resolvedRows := make([][]*rExpr, len(rows))

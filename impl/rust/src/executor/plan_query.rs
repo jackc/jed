@@ -886,10 +886,10 @@ impl Engine {
     }
 
     /// Resolve a VALUES-body relation into a `ValuesPlan` (spec/design/grammar.md §42) — the body
-    /// of a `FROM (VALUES …)` derived table. Each value resolves as a CONSTANT against an EMPTY
-    /// scope with `parent = None`: the body is non-`LATERAL`, so a column reference is unresolved
-    /// (42703/42P01) and an aggregate is 42803; it still sees the statement's CTE bindings (an
-    /// uncorrelated subquery inside a value resolves like anywhere). Every row must have the same
+    /// of a `FROM (VALUES …)` derived table. Each value resolves against an EMPTY scope whose parent
+    /// is the enclosing query's scope: a non-`LATERAL` body sees no FROM sibling (42703/42P01) but
+    /// correlates to an enclosing query level, and an aggregate is 42803; it still sees the
+    /// statement's CTE bindings (an uncorrelated subquery inside a value resolves like anywhere). Every row must have the same
     /// arity (42601); the columns' types unify across rows like a set operation (42804 on a
     /// mismatch). A bind parameter is then noted at its column's unified type (so `VALUES (1),($1)`
     /// types `$1` as `int`); a column with no concrete type — all NULL/param — leaves its `$N`
@@ -903,9 +903,9 @@ impl Engine {
     ) -> Result<ValuesPlan> {
         // The parser guarantees at least one row, each with at least one value.
         let arity = rows[0].len();
-        // A constant scope: no local relations. With `parent = None` (the usual case) any column
-        // reference is unresolved (the non-`LATERAL` rule, §42); with a `parent` (a `LATERAL`
-        // VALUES body, §44) a column reference correlates to the earlier FROM relations instead.
+        // No local relations. A column reference correlates through `parent` — the enclosing
+        // query's scope (§42), or for a `LATERAL` VALUES body (§44) the earlier FROM relations
+        // first — else is unresolved.
         // CTE bindings stay visible and subqueries are allowed (an uncorrelated one folds early).
         let scope = Scope {
             rels: Vec::new(),

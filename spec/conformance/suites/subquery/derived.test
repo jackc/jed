@@ -4,8 +4,9 @@
 # cte_scan_row). The alias is OPTIONAL (PostgreSQL 18 relaxed the old mandatory-alias rule — an
 # unaliased derived table has no qualifier but its bare columns resolve); an optional column-rename
 # list AS t(a,b) renames body output columns left-to-right (42P10 if too many); an explicit label must
-# be distinct (42712). The body is an INDEPENDENT query (parent=None, NOT correlated / no LATERAL)
-# inheriting statement CTE bindings — an outer/sibling column inside is 42703/42P01. Rows verified
+# be distinct (42712). The body sees no FROM sibling (no LATERAL — a sibling column inside is
+# 42703/42P01) and inherits statement CTE bindings; it is planned against the ENCLOSING query's scope,
+# so a column of an enclosing query level correlates (subquery/derived_correlated.test). Rows verified
 # against the live PostgreSQL 18 oracle; cost assertions are jed's deterministic cross-core contract
 # (spec/design/cost.md §3, the inline path).
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.delete, dml.update, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.aggregates, query.group_by, query.join_inner, query.cross_join, query.union, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_in, query.cte, query.derived_table, expr.arithmetic, expr.in_list, types.i32, resource.cost_metering
@@ -126,7 +127,7 @@ SELECT x FROM (SELECT id AS x FROM (SELECT id FROM t) AS inner_d) AS d ORDER BY 
 3
 
 # A derived table referencing a CTE — the statement's CTE bindings are inherited into the body
-# (parent=None affects only correlation, not CTE visibility).
+# (sibling visibility does not affect CTE visibility).
 # names: id
 query I nosort
 WITH c AS (SELECT id, n FROM t) SELECT d.id FROM (SELECT id FROM c) AS d ORDER BY d.id
@@ -210,8 +211,9 @@ SELECT * FROM (SELECT id FROM t) AS d (a, b)
 statement error 42712
 SELECT 1 FROM t AS d CROSS JOIN (SELECT id FROM t) AS d
 
-# The body is NOT correlated / not LATERAL: a sibling FROM relation referenced inside the body is
-# unresolved -> 42P01 (the qualifier `t` is not in the body's own scope, only its alias `u`).
+# The body is not LATERAL: a sibling FROM relation referenced inside the body is unresolved -> 42P01
+# (the qualifier `t` is not in the body's own scope, only its alias `u`, and there is no enclosing
+# query to correlate to).
 statement error 42P01
 SELECT t.id FROM t JOIN (SELECT id FROM t AS u WHERE u.id = t.id) AS d ON t.id = d.id
 

@@ -1,0 +1,195 @@
+# Derived-table bodies that reference an ENCLOSING query level (spec/design/grammar.md §42). A
+# non-LATERAL derived body cannot see its FROM siblings (42P01 — subquery/derived.test), but it is
+# planned against the enclosing query's scope, so a column of an outer query level correlates exactly
+# as it would anywhere else in the subquery that owns the FROM clause (PostgreSQL). The enclosing
+# subquery is then correlated and re-executes per outer row, re-running the body each time. Covers
+# SELECT and VALUES bodies, multi-level references, a body on the right of a RIGHT JOIN (legal — it
+# is not LATERAL), a body pushdown target, an unaliased parenthesized join whose ON reads an outer
+# column, sibling shadowing, and a non-LATERAL body inside a LATERAL one. Rows verified against the
+# live PostgreSQL 18 oracle; cost assertions are jed's deterministic cross-core contract.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.aggregates, query.join_inner, query.join_right, query.cross_join, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_exists, query.subquery_correlated, query.derived_table, query.derived_pushdown, query.values, query.lateral, query.join_parenthesized, expr.arithmetic, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE o (id i32 PRIMARY KEY, x i32)
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, n i32)
+
+statement ok
+INSERT INTO o VALUES (1, 10), (2, 20), (3, 99)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)
+
+# A FROM-less derived body reading an outer column: the scalar subquery is correlated.
+query I nosort
+SELECT (SELECT z FROM (SELECT o.x AS z) d) FROM o ORDER BY 1
+----
+10
+20
+99
+
+# The body's WHERE reads the outer row.
+query II nosort
+SELECT o.id, (SELECT count(*) FROM (SELECT t.id FROM t WHERE t.n > o.x) d) FROM o ORDER BY o.id
+----
+1
+2
+2
+1
+3
+0
+
+# A derived body inside an EXISTS subquery.
+query I nosort
+SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM (SELECT t.id FROM t WHERE t.n = o.x) d) ORDER BY o.id
+----
+1
+2
+
+# Two levels out: the body reads `t` (the query that owns its FROM clause's enclosing query) and `o`
+# (one level further).
+query II nosort
+SELECT o.id, (SELECT (SELECT z FROM (SELECT o.x + t.n AS z) d) FROM t WHERE t.id = o.id) FROM o ORDER BY o.id
+----
+1
+20
+2
+40
+3
+129
+
+# Nested derived bodies each see the enclosing level.
+query II nosort
+SELECT o.id, (SELECT w FROM (SELECT z + o.id AS w FROM (SELECT o.x AS z) d1) d2) FROM o ORDER BY o.id
+----
+1
+11
+2
+22
+3
+102
+
+# A VALUES body reading an outer column.
+query II nosort
+SELECT o.id, (SELECT sum(v.c) FROM (VALUES (o.x), (o.x * 2)) AS v (c)) FROM o ORDER BY o.id
+----
+1
+30
+2
+60
+3
+297
+
+# A body on the right of a join: not LATERAL, so it is materialized once per run of the enclosing
+# subquery.
+query II nosort
+SELECT o.id, (SELECT sum(t.n + d.z) FROM t JOIN (SELECT o.x AS z) d ON true) FROM o ORDER BY o.id
+----
+1
+90
+2
+120
+3
+357
+
+# RIGHT JOIN to a body that reads only an enclosing level is legal (only a LATERAL reference to a left
+# sibling forbids RIGHT/FULL — 42P10); the unmatched body row is NULL-extended.
+query II nosort
+SELECT o.id, (SELECT count(t.id) FROM t RIGHT JOIN (SELECT o.x AS z) d ON t.n = d.z) FROM o ORDER BY o.id
+----
+1
+1
+2
+1
+3
+0
+
+# An explicit LATERAL on the first FROM item also reaches the enclosing level.
+query I nosort
+SELECT (SELECT z FROM LATERAL (SELECT o.x AS z) d) FROM o ORDER BY 1
+----
+10
+20
+99
+
+# A sibling stays invisible to a non-LATERAL body even when it shadows an outer label: `o` inside the
+# body skips the sibling `t AS o` and resolves to the enclosing query's `o`.
+query II nosort
+SELECT o.id, (SELECT d.v FROM t AS o, (SELECT o.x AS v) d WHERE o.id = 1) FROM o ORDER BY o.id
+----
+1
+10
+2
+20
+3
+99
+
+# A sibling with no outer namesake is still unresolved.
+statement error 42P01
+SELECT o.id, (SELECT d.v FROM t AS s, (SELECT s.n AS v) d LIMIT 1) FROM o
+
+# At top level there is no enclosing query: an outer-looking reference is unresolved.
+statement error 42P01
+SELECT * FROM (SELECT o.x) d
+
+statement error 42703
+SELECT * FROM (SELECT x) d
+
+# An unaliased parenthesized join on the right of a join is planned as a derived body: its ON clause
+# may read an enclosing query level (but not the left sibling — joins/parenthesized.test).
+query II nosort
+SELECT o.id, (SELECT count(*) FROM t AS t1 JOIN (t AS t2 JOIN t AS t3 ON t3.n = o.x AND t2.id <= o.id) ON t1.id = t2.id) FROM o ORDER BY o.id
+----
+1
+1
+2
+2
+3
+0
+
+# A non-LATERAL body inside a LATERAL one reads the lateral item's left sibling (its enclosing level).
+query II nosort
+SELECT t.id, l.z FROM t CROSS JOIN LATERAL (SELECT w AS z FROM (SELECT t.n AS w) d) l ORDER BY t.id
+----
+1
+10
+2
+20
+3
+30
+
+# --- body pushdown (spec/design/planner.md §3.2) ---
+
+# `d.id = 2` moves into a body that reads the outer row; the replanned body keeps the enclosing scope
+# and seeks t's primary key.
+query II nosort
+SELECT o.id, (SELECT d.n FROM (SELECT t.id, t.n + o.x AS n FROM t) d WHERE d.id = 2) FROM o ORDER BY o.id
+----
+1
+30
+2
+40
+3
+119
+
+# --- cost contract (spec/design/cost.md §3) ---
+
+# cost: 25
+query I nosort
+SELECT (SELECT z FROM (SELECT o.x AS z) d) FROM o ORDER BY 1
+----
+10
+20
+99
+
+# cost: 28
+query II nosort
+SELECT o.id, (SELECT d.n FROM (SELECT t.id, t.n + o.x AS n FROM t) d WHERE d.id = 2) FROM o ORDER BY o.id
+----
+1
+30
+2
+40
+3
+119

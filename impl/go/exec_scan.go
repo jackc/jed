@@ -2070,8 +2070,8 @@ func rowsFromValues(in [][]Value) []storedRow {
 // outer); an SRF is generated; a CTE / derived table is delivered / run in place. For a CORRELATED
 // LATERAL relation (§44) the caller passes outer EXTENDED with the combined left-hand row, so the
 // body / SRF args read that row as their immediate outer; a non-lateral relation is passed the
-// query's own outer and its parent=nil body simply ignores it (a parent=nil plan holds no
-// outerColumn, so the two are observably identical).
+// query's own outer, which is exactly the frame its body was planned against (the enclosing query's
+// scope, §42).
 func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer []storedRow, left storedRow, rng *stmtRng, ctes cteCtx, meter *costMeter) ([]storedRow, error) {
 	rel := plan.rels[ri]
 	_, pushed := plan.pushedFilter(ri)
@@ -2197,8 +2197,8 @@ func (db *engine) materializeRelRows(plan *selectPlan, ri int, params []Value, o
 		return nil, nil
 	}
 	// A DERIVED TABLE runs its body in place (grammar.md §42), charging its intrinsic cost — no
-	// cte_scan_row. Non-lateral it was planned parent=nil and ignores outer; a LATERAL body (§44)
-	// reads the left-hand row from outer.
+	// cte_scan_row. Non-lateral it was planned against the enclosing scope and reads this query's
+	// outer as its own; a LATERAL body (§44) reads the left-hand row from outer.
 	if rel.derived != nil {
 		r, err := db.execQueryPlan(rel.derived, outer, params, env.ctes)
 		if err != nil {

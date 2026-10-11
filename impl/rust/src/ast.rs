@@ -688,8 +688,9 @@ pub struct ReturningClause {
 /// (spec/design/grammar.md §42): a parenthesized `VALUES` list used as a relation, a computed
 /// relation of literal rows. It is the FROM-position alternative body to `subquery` (the two are
 /// mutually exclusive — at most one is `Some` on a derived table). Each value is a general
-/// constant expression (resolved `parent = None`, non-`LATERAL` unless this `TableRef` is marked
-/// `lateral`); the rows share arity and the columns' types unify across rows like a set operation.
+/// expression with no FROM sibling in scope (an enclosing query's column correlates; a sibling is
+/// visible only when this `TableRef` is marked `lateral`); the rows share arity and the columns'
+/// types unify across rows like a set operation.
 /// The outer `Vec` is the rows, each inner `Vec` one row's values, left to right.
 ///
 /// `lateral` is set when the FROM item is preceded by the `LATERAL` keyword (spec/design/grammar.md

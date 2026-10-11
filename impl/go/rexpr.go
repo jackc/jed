@@ -1207,7 +1207,8 @@ func (p *queryPlan) columnNames() []string {
 
 // valuesPlan is a resolved VALUES-body relation (spec/design/grammar.md §42), executable to its
 // literal rows — the FROM-position sibling of INSERT … VALUES. rows[r][c] is row r, column c, each
-// resolved as a CONSTANT (the body is non-LATERAL, planned parent=nil, so it reads no row).
+// resolved against no FROM row (a non-LATERAL body sees no sibling; it may correlate to an enclosing
+// query level, §42).
 // columnTypes is the per-column type unified across the rows like a set operation (§25), and
 // columnNames is column1, column2, … (PostgreSQL; the derived table's optional column-rename list
 // overrides them at the synthetic relation). All rows have len(columnTypes) values.

@@ -898,7 +898,8 @@ export type InsertValue =
 // v(c1,…) (grammar.md §42): a parenthesized VALUES list used as a relation, a computed relation of
 // literal rows. It is the FROM-position alternative body to `subquery` (the two are mutually
 // exclusive — at most one is set on a derived table). Each value is a general constant expression
-// (resolved parent=null, non-LATERAL unless this TableRef is marked `lateral`); the rows share arity
+// (no FROM sibling in scope unless this TableRef is marked `lateral`; an enclosing query's column
+// correlates); the rows share arity
 // and the columns' types unify across rows like a set operation. The outer array is the rows, each
 // inner array one row's values.
 // `lateral` is set when the FROM item is preceded by the LATERAL keyword (spec/design/grammar.md

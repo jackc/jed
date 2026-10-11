@@ -1613,8 +1613,8 @@ func queryPlanReferencesOuter(plan *queryPlan, depth int) bool {
 		return selectPlanReferencesOuter(plan.sel, depth)
 	}
 	if plan.values != nil {
-		// A VALUES body is planned parent=nil, so its values hold no outer reference of their own; a
-		// folded-in subquery, however, may correlate to the target scope.
+		// A VALUES body's values may correlate to an enclosing query level (§42), as may a subquery
+		// inside one.
 		for r := range plan.values.rows {
 			for c := range plan.values.rows[r] {
 				if rexprReferencesOuter(plan.values.rows[r][c], depth) {
@@ -1673,13 +1673,25 @@ func selectPlanReferencesOuter(sp *selectPlan, depth int) bool {
 				}
 			}
 		}
-		// A LATERAL derived table's body is one frame deeper; a reference in it back into this
-		// query's outer counts here so the enclosing item is correctly flagged correlated (§44).
-		if sp.rels[i].derived != nil && queryPlanReferencesOuter(sp.rels[i].derived, depth+1) {
+		// A derived table's body may reference this query's outer: a LATERAL body is one frame deeper
+		// (§44), a non-LATERAL body is planned against the enclosing scope and so shares this frame
+		// (§42). Either way the enclosing item is correctly flagged correlated.
+		if sp.rels[i].derived != nil && queryPlanReferencesOuter(sp.rels[i].derived, depth+derivedBodyFrame(&sp.rels[i])) {
 			return true
 		}
 	}
 	return false
+}
+
+// derivedBodyFrame is how many correlation frames a derived relation's body sits below its query: 1 for
+// a correlated LATERAL body, planned against the prefix scope of earlier siblings (grammar.md §44); 0
+// otherwise — a non-LATERAL body is planned against the enclosing query's scope, and an uncorrelated
+// LATERAL body holds no outer reference at all (§42).
+func derivedBodyFrame(rel *planRel) int {
+	if rel.lateral {
+		return 1
+	}
+	return 0
 }
 
 func rexprReferencesOuter(e *rExpr, depth int) bool {
@@ -2151,7 +2163,7 @@ func collectTouchedPlan(plan *queryPlan, depth int, touched []bool) {
 				}
 			}
 			if sp.rels[i].derived != nil {
-				collectTouchedPlan(sp.rels[i].derived, depth+1, touched)
+				collectTouchedPlan(sp.rels[i].derived, depth+derivedBodyFrame(&sp.rels[i]), touched)
 			}
 		}
 	}

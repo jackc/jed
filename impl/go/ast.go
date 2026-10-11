@@ -661,7 +661,8 @@ type returningClause struct {
 // (spec/design/grammar.md §42): a parenthesized VALUES list used as a relation, a computed
 // relation of literal rows. It is the FROM-position alternative body to Subquery (the two are
 // mutually exclusive — at most one is non-nil on a derived table). Each value is a general
-// constant expression (resolved parent=nil, non-LATERAL unless this TableRef is marked Lateral);
+// expression with no FROM sibling in scope (an enclosing query's column correlates; a sibling is
+// visible only when this TableRef is marked Lateral);
 // the rows share arity and the columns' types unify across rows like a set operation. The outer
 // slice is the rows, each inner slice one row's values, left to right.
 // Lateral is set when the FROM item is preceded by the LATERAL keyword (spec/design/grammar.md §44):

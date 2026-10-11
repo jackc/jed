@@ -327,7 +327,7 @@ pub(crate) fn collect_touched_plan(plan: &QueryPlan, depth: usize, touched: &mut
                     }
                 }
                 if let Some(derived) = &r.derived {
-                    collect_touched_plan(derived, depth + 1, touched);
+                    collect_touched_plan(derived, depth + r.derived_body_frame(), touched);
                 }
             }
         }

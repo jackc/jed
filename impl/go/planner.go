@@ -79,9 +79,10 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		}
 		if isDerived {
 			// Plan the body. LATERAL → parent is the prefix scope (a sibling/outer column correlates);
-			// otherwise an INDEPENDENT query (parent=nil, §42). A LATERAL VALUES body resolves its
-			// values against the prefix too (a column ref then correlates instead of 42703).
-			bodyParent := (*scope)(nil)
+			// otherwise the ENCLOSING query's scope (§42): the body sees no sibling FROM item, but a
+			// column of an enclosing query level correlates in the same frame as this query's own
+			// outer references (PostgreSQL). A VALUES body resolves its values the same way.
+			bodyParent := parent
 			if lateralEligible {
 				bodyParent = lateralParent
 			}
@@ -1062,7 +1063,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	// foldUncorrelatedInPlan is NOT a planner rewrite — it executes subqueries and needs bound
 	// params, so it stays post-bind in runQueryExpr.
 	rewriteWhere(plan)
-	if err := db.replanPushedBodies(plan, tableRefs, ctes, ptypes); err != nil {
+	if err := db.replanPushedBodies(plan, tableRefs, parent, ctes, ptypes); err != nil {
 		return nil, err
 	}
 	//
@@ -1075,7 +1076,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 // with those conjuncts appended to its WHERE (spec/design/planner.md §3.2), so the body's own
 // rewrite and access-path selection see them. Planning again must have no other effect: the CTE
 // reference counts the first planning recorded are restored, keeping every CTE's mode unchanged.
-func (db *engine) replanPushedBodies(plan *selectPlan, tableRefs []tableRef, ctes []*cteBinding, ptypes *paramTypes) error {
+func (db *engine) replanPushedBodies(plan *selectPlan, tableRefs []tableRef, parent *scope, ctes []*cteBinding, ptypes *paramTypes) error {
 	if plan.pushdown == nil || plan.pushdown.bodyPushes == nil {
 		return nil
 	}
@@ -1087,7 +1088,7 @@ func (db *engine) replanPushedBodies(plan *selectPlan, tableRefs []tableRef, cte
 		for ci, b := range ctes {
 			refs[ci] = b.refs
 		}
-		body, err := db.replanPushedQuery(*tableRefs[i].Subquery, plan.rels[i].derived, pushed, ctes, ptypes)
+		body, err := db.replanPushedQuery(*tableRefs[i].Subquery, plan.rels[i].derived, pushed, parent, ctes, ptypes)
 		for ci, b := range ctes {
 			b.refs = refs[ci]
 		}
@@ -1105,24 +1106,24 @@ func (db *engine) replanPushedBodies(plan *selectPlan, tableRefs []tableRef, cte
 // its grouping, when grouped) and appended to its WHERE; a set operation pushes them into each arm and
 // keeps its own unified types, ORDER BY, and operator. first is the expression's first plan, whose
 // output mapping the replanned SELECT reproduces.
-func (db *engine) replanPushedQuery(qe queryExpr, first *queryPlan, pushed []*rExpr, ctes []*cteBinding, ptypes *paramTypes) (queryPlan, error) {
+func (db *engine) replanPushedQuery(qe queryExpr, first *queryPlan, pushed []*rExpr, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (queryPlan, error) {
 	if first.sel != nil {
 		moved := make([]*rExpr, len(pushed))
 		for k, c := range pushed {
 			moved[k] = substituteBodyColumns(c, first.sel)
 		}
-		body, err := db.planSelectPushed(qe.Select, nil, ctes, ptypes, moved)
+		body, err := db.planSelectPushed(qe.Select, parent, ctes, ptypes, moved)
 		if err != nil {
 			return queryPlan{}, err
 		}
 		return queryPlan{sel: body}, nil
 	}
 	so := *first.setop
-	lhs, err := db.replanPushedQuery(qe.SetOp.Lhs, &first.setop.lhs, pushed, ctes, ptypes)
+	lhs, err := db.replanPushedQuery(qe.SetOp.Lhs, &first.setop.lhs, pushed, parent, ctes, ptypes)
 	if err != nil {
 		return queryPlan{}, err
 	}
-	rhs, err := db.replanPushedQuery(qe.SetOp.Rhs, &first.setop.rhs, pushed, ctes, ptypes)
+	rhs, err := db.replanPushedQuery(qe.SetOp.Rhs, &first.setop.rhs, pushed, parent, ctes, ptypes)
 	if err != nil {
 		return queryPlan{}, err
 	}
@@ -1243,7 +1244,9 @@ func computeRelMasks(plan *selectPlan) [][]bool {
 				collectTouched(a, 1, touched)
 			}
 		}
-		if plan.rels[i].derived != nil {
+		// Only a LATERAL body sees this query's columns (one frame deeper); a non-LATERAL body is
+		// planned against the enclosing scope, so its outer references never reach this query.
+		if plan.rels[i].derived != nil && plan.rels[i].lateral {
 			collectTouchedPlan(plan.rels[i].derived, 1, touched)
 		}
 	}
