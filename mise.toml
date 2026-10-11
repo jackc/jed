@@ -95,6 +95,7 @@ run = [{ task = "test" }]
 description = "Full merge gate: spec verification, formatting, lint, tests, real-process locking, metamorphic sweep"
 # A SUPERSET of `test`: adds spec-data + byte-fixture verification + codegen drift (`verify`), the
 # formatter gate (`fmt`), the TS linter (`lint`), the downstream web type check (`web:check`), the
+# Rust corpus walk with debug assertions + overflow checks (`conformance:rust:checked`), the
 # real-process shared-file corpus, and generative differential testing — the NoREC/TLP metamorphic
 # sweep + the reducer self-test.
 run = [
@@ -103,6 +104,7 @@ run = [
   { task = "lint" },
   { task = "web:check" },
   { task = "test" },
+  { task = "conformance:rust:checked" },
   { task = "concurrency:process" },
   { task = "corpus:norec_sweep" },
   { task = "corpus:reduce_selftest" },
@@ -153,7 +155,8 @@ run = ["ruby scripts/npm_ci.rb web", "npm run --silent --prefix web check"]
 # of spec/design/conformance.md §3: "memory" (a fresh in-memory Database) and "disk" (a file-backed
 # database reopened before every record, so committed reads fault their leaves from disk). Every
 # record's rows/error/cost must be IDENTICAL in both modes. Rust runs RELEASE: the debug evaluator's
-# giant frames overflow the native stack on resource/depth_limit.test's deep nesting.
+# giant frames overflow the native stack on resource/depth_limit.test's deep nesting. The `checked`
+# Cargo profile (release + debug assertions + overflow checks) is how Rust gets assertion coverage.
 
 [tasks.conformance]
 description = "Walk the conformance corpus on all three cores"
@@ -164,6 +167,16 @@ description = "Walk the conformance corpus on the Rust core, both storage modes 
 run = [
   "cargo run --release --quiet --bin conformance --manifest-path impl/rust/Cargo.toml",
   "cargo run --release --quiet --bin conformance --manifest-path impl/rust/Cargo.toml -- disk",
+]
+
+# The corpus's debug-assertion / integer-overflow-check pass, in CI (not `test`, to keep the inner
+# loop to one Rust build). The `checked` profile in impl/rust/Cargo.toml keeps release frames, so
+# resource/depth_limit.test fits the stack — a debug build aborts there and never reaches the rest.
+[tasks."conformance:rust:checked"]
+description = "Walk the conformance corpus on the Rust core, both storage modes, with debug assertions + overflow checks"
+run = [
+  "cargo run --profile checked --quiet --bin conformance --manifest-path impl/rust/Cargo.toml",
+  "cargo run --profile checked --quiet --bin conformance --manifest-path impl/rust/Cargo.toml -- disk",
 ]
 
 [tasks."conformance:go"]

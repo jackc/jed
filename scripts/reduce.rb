@@ -53,9 +53,11 @@ TMP_PATH = File.join(TMP_DIR, "candidate.test")
 def prepare_core(name)
   case name
   when "rust"
-    ok = system(*%w[cargo build --quiet --bin conformance], chdir: File.join(REPO, "impl/rust"))
+    # The `checked` profile (release + debug assertions + overflow checks), as the NoREC sweep uses.
+    ok = system(*%w[cargo build --profile checked --quiet --bin conformance],
+                chdir: File.join(REPO, "impl/rust"))
     abort "reduce: rust harness build failed" unless ok
-    { cmd: [File.join(REPO, "impl/rust/target/debug/conformance")], dir: REPO }
+    { cmd: [File.join(REPO, "impl/rust/target/checked/conformance")], dir: REPO }
   when "go"
     bin = File.join(REPO, "impl/go", ".reduce_conformance")
     ok = system(*%W[go build -o #{bin} ./cmd/conformance], chdir: File.join(REPO, "impl/go"))

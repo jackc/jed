@@ -29,3 +29,11 @@ getrandom = "0.3"
 # TOML is a TEST-TIME ONLY dependency (CLAUDE.md §5): the cross-check tests read the
 # canonical spec data tables to prove the hand-written constants match. No runtime use.
 toml = "0.9"
+
+# Release codegen with debug assertions and integer-overflow checks ON: the corpus walk's checked
+# pass (`mise run conformance:rust:checked`). Release-sized frames keep resource/depth_limit.test's
+# deep nesting within the default main-thread stack, which a debug build overflows.
+[profile.checked]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true

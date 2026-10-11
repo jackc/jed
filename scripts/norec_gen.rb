@@ -164,13 +164,13 @@ require "fileutils"
 # `PASS|FAIL|SKIP <relpath>` line per file (identical format across cores). So we generate every
 # file into the tree, then run each core ONCE — 3 harness runs total, not 3×(files).
 #
-# Go and TS walk only the generated files: their full-corpus walk is exactly what
-# `mise run conformance` already ran. Rust deliberately walks the WHOLE corpus here, in a DEBUG
-# build: it is the only pass that runs the corpus with debug assertions and integer-overflow
-# checks on (every other Rust corpus walk is --release), so narrowing it would lose coverage.
+# Every core walks only the generated files: the full-corpus walks are `mise run conformance` and,
+# for Rust's debug-assertion / overflow-check pass, `mise run conformance:rust:checked`. Rust runs
+# the generated files under that same `checked` profile, so random arithmetic hits overflow checks.
 NOREC_FILTER = { "JED_CONFORMANCE_FILTER" => "metamorphic/_norec_" }.freeze
 CORES = {
-  "rust" => { dir: %w[impl rust], env: {}, cmd: %w[cargo run --quiet --bin conformance] },
+  "rust" => { dir: %w[impl rust], env: NOREC_FILTER,
+              cmd: %w[cargo run --profile checked --quiet --bin conformance] },
   "go" => { dir: %w[impl go], env: NOREC_FILTER, cmd: %w[go run ./cmd/conformance] },
   "ts" => { dir: %w[impl ts], env: NOREC_FILTER, cmd: %w[npm run --silent conformance] },
 }.freeze
