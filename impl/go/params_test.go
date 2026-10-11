@@ -302,24 +302,13 @@ func TestParamCastOperatorNarrowsAndTraps22003(t *testing.T) {
 	}
 }
 
-func TestParamCastToDeferredTargetIs0A000(t *testing.T) {
+func TestCastOperatorInheritsMatrixAndRejectsLoneColon(t *testing.T) {
 	t.Parallel()
-	// Casting a parameter to a deferred target (interval) is 0A000, like any non-string-literal
-	// cast to interval.
+	// `::` desugars to CAST, so an integer → interval cast is the same forbidden pair (42804) the
+	// CAST spelling reports.
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	if c := paramErrCode(t, db, "SELECT $1::interval", IntValue(1)); c != "0A000" {
-		t.Fatalf("code = %s want 0A000", c)
-	}
-}
-
-func TestCastOperatorInheritsDeferralsAndRejectsLoneColon(t *testing.T) {
-	t.Parallel()
-	// `::` desugars to CAST, so casting a non-string-literal value to interval is the same deferred
-	// 0A000 narrowing the CAST spelling carries. The boolean and text casts have since landed —
-	// `5::boolean` / `5::text` are now valid (cast_bool_int_test.go, suites/cast/scalar_to_text.test).
-	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	if c := paramErrCode(t, db, "SELECT 5::interval"); c != "0A000" {
-		t.Fatalf("5::interval code = %s want 0A000", c)
+	if c := paramErrCode(t, db, "SELECT 5::interval"); c != "42804" {
+		t.Fatalf("5::interval code = %s want 42804", c)
 	}
 	// A lone `:` is not part of jed's surface — a 42601 syntax error from the lexer.
 	if c := paramErrCode(t, db, "SELECT 1 : 2"); c != "42601" {

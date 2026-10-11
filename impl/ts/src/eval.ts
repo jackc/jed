@@ -49,6 +49,7 @@ import {
   coerceStringToArray,
   collatedCmp,
   countNulls,
+  decodeByteaLiteral,
   decodeText,
   decodeUuidLiteral,
   elemJsonText,
@@ -127,6 +128,7 @@ import {
   intervalSub,
   makeInterval,
   mulByFraction,
+  parseInterval,
   tsDiff,
   tsShift,
 } from "./interval.ts";
@@ -2540,9 +2542,8 @@ function scalarToText(v: Value, env: EvalEnv, m: Meter): string {
 }
 
 export function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | null): Value {
-  // The JSON cast matrix (spec/design/json.md §6.1). text → json/jsonb is the only runtime text
-  // cast (every other text cast target is resolver-rejected): json validates + stores verbatim
-  // (22P02 on malformed); jsonb parses + canonicalizes.
+  // The JSON cast matrix (spec/design/json.md §6.1): text → json validates + stores verbatim
+  // (22P02 on malformed); text → jsonb parses + canonicalizes.
   if (v.kind === "text") {
     if (isJson(target)) {
       validateJson(v.text);
@@ -2552,10 +2553,14 @@ export function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | n
     // text → uuid (the uuid cast slice, casts.toml/types.md §14): the PG-flexible uuid_in parser; a
     // malformed string traps 22P02.
     if (isUuid(target)) return uuidValue(decodeUuidLiteral(v.text));
+    // text → interval / bytea (types.md §5): the literal's own input per row — parseInterval
+    // (22007/22008) and the `\x` hex bytea input (22P02).
+    if (isInterval(target)) return intervalValue(parseInterval(v.text));
+    if (isBytea(target)) return byteaValue(decodeByteaLiteral(v.text));
     // text → numeric/boolean (the runtime-text-cast slice, grammar.md §36): the same per-row
     // coercion the `type 'string'` literal folds at resolve, run here over the runtime string. The
-    // resolver admits only int/decimal/float/bool targets for a text source (uuid/json/jsonb are the
-    // arms above). Malformed → 22P02, out of range → 22003 (per row).
+    // resolver admits only int/decimal/float/bool targets for a text source
+    // (uuid/interval/bytea/json/jsonb are the arms above). Malformed → 22P02, out of range → 22003 (per row).
     if (isBool(target)) return boolValue(parseBoolLiteral(v.text));
     if (isDecimal(target)) return decimalValue(coerceDecimal(parseDecimalLiteral(v.text), typmod));
     if (isFloat(target)) {

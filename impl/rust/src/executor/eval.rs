@@ -191,9 +191,8 @@ impl RExpr {
                             Ok(Value::Int(i64::from(b)))
                         }
                     }
-                    // text → json/jsonb is the only runtime text cast (spec/design/json.md §6.1):
-                    // json validates + stores verbatim (22P02 on malformed); jsonb parses +
-                    // canonicalizes. Every other text cast target is still resolver-rejected.
+                    // text → json/jsonb (spec/design/json.md §6.1): json validates + stores
+                    // verbatim (22P02 on malformed); jsonb parses + canonicalizes.
                     Value::Text(s) if target.is_json() => {
                         json::validate_json(&s)?;
                         Ok(Value::Json(s))
@@ -202,11 +201,19 @@ impl RExpr {
                     // text → uuid (the uuid cast slice, casts.toml/types.md §14): the PG-flexible
                     // uuid_in parser; a malformed string traps 22P02.
                     Value::Text(s) if target.is_uuid() => Ok(Value::Uuid(decode_uuid_literal(&s)?)),
+                    // text → interval / bytea (types.md §5): the literal's own input per row —
+                    // parse_interval (22007/22008) and the `\x` hex bytea input (22P02).
+                    Value::Text(s) if target.is_interval() => {
+                        Ok(Value::Interval(crate::interval::parse_interval(&s)?))
+                    }
+                    Value::Text(s) if target.is_bytea() => {
+                        Ok(Value::Bytea(decode_bytea_literal(&s)?))
+                    }
                     // text → numeric/boolean (the runtime-text-cast slice, grammar.md §36): the same
                     // per-row coercion the `type 'string'` literal folds at resolve, run here over
                     // the runtime string. The resolver admits only int/decimal/float/bool targets
-                    // for a text source (uuid/json/jsonb are the guarded arms above), so this is
-                    // exhaustive. Malformed → 22P02, out of range → 22003 (per row).
+                    // for a text source (uuid/interval/bytea/json/jsonb are the guarded arms above),
+                    // so this is exhaustive. Malformed → 22P02, out of range → 22003 (per row).
                     Value::Text(s) if target.is_bool() => Ok(Value::Bool(parse_bool_literal(&s)?)),
                     Value::Text(s) if target.is_decimal() => Ok(Value::Decimal(coerce_decimal(
                         parse_decimal_literal(&s)?,

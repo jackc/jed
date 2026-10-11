@@ -1499,10 +1499,11 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		// A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
 		// (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32 /
 		// NULL / bool source is castable), so it is handled AFTER the inner is resolved, below.
-		// A bytea TARGET: the uuid cast slice admits uuid → bytea (the 16 raw bytes — a jed cast PG
-		// lacks; casts.toml, types.md §14). A string LITERAL was coerced above; a NULL adapts; a bytea
-		// operand is the identity. text → bytea and every other bytea cast stay deferred (0A000 — the
-		// bytea cast slice's own follow-on, types.md §13).
+		// A bytea TARGET: runtime text → bytea decodes the per-row string with the literal's own bytea
+		// input (types.md §5/§13 — immutable, like PG's byteain), and the uuid cast slice admits uuid →
+		// bytea (the 16 raw bytes — a jed cast PG lacks; casts.toml, types.md §14). A string LITERAL
+		// was coerced above; a NULL adapts; a bytea operand is the identity. Any other source is a
+		// forbidden pair (42804).
 		if target.IsBytea() {
 			if e.Cast.Inner.Kind == exprParam {
 				t := scalarBytea
@@ -1519,10 +1520,10 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			switch ity.kind {
 			case rtNull, rtBytea:
 				return rinner, resolvedType{kind: rtBytea}, nil
-			case rtUuid:
+			case rtText, rtUuid:
 				return &rExpr{kind: reCast, operand: rinner, result: target}, resolvedType{kind: rtBytea}, nil
 			default:
-				return nil, resolvedType{}, newError(FeatureNotSupported, "casting to bytea is not supported yet")
+				return nil, resolvedType{}, typeError("cannot cast " + rtName(ity) + " to bytea")
 			}
 		}
 		// The uuid cast slice (spec/types/casts.toml, types.md §14): a uuid TARGET from a runtime text
@@ -1552,11 +1553,11 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				return nil, resolvedType{}, typeError("cannot cast " + rtName(ity) + " to uuid")
 			}
 		}
-		// Cross-family datetime casts (timezones.md §9.3): a timestamp/timestamptz/date TARGET from
-		// another datetime family. A same-family cast is the identity; a cross-family cast becomes a
-		// reDateConvert node (the zone-crossing ones read the session zone at eval); any non-datetime
-		// source is the deferred 0A000. A NULL operand adapts to the target. text↔datetime casts stay
-		// deferred and fall through (a non-datetime source is rejected here).
+		// Datetime casts (timezones.md §9.3, types.md §5): a timestamp/timestamptz/date TARGET from
+		// another datetime family or from runtime text. A same-family cast is the identity; a
+		// cross-family or text cast becomes a reDateConvert node (the zone-crossing ones read the
+		// session zone at eval); any other source is a forbidden pair (42804). A NULL operand adapts
+		// to the target.
 		if target.IsTimestamp() || target.IsTimestamptz() || target.IsDate() {
 			if e.Cast.Inner.Kind == exprParam {
 				t := target
@@ -1581,23 +1582,46 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			case ity.kind == rtTimestamp || ity.kind == rtTimestamptz || ity.kind == rtDate:
 				params.nonimmutable = params.nonimmutable || ity.kind == rtTimestamptz || target == scalarTimestamptz
 				return &rExpr{kind: reDateConvert, operand: inner, result: target}, toRt, nil
-			case ity.kind == rtText && target.IsDate():
-				// The runtime text → date cast (date.md §6): a NON-literal text source (a string
-				// LITERAL operand was already folded by the literal-adaptation path above) parses
-				// per row via the same parseDate the literal uses (22007/22008 per row). STABLE,
-				// not immutable — the input grammar admits the clock-relative specials — so it
-				// flags the plan non-immutable (42P17 in an index expression, as in PG).
-				// text → timestamp / timestamptz stays deferred (the default arm).
+			case ity.kind == rtText:
+				// The runtime text → date / timestamp / timestamptz casts (date.md §6, types.md §5):
+				// a NON-literal text source (a string LITERAL operand was already folded by the
+				// literal-adaptation path above) parses per row via the literal's own parser
+				// (22007/22008 per row); text → timestamptz reads an offset-less string in the session
+				// zone. STABLE, not immutable — like PostgreSQL's date_in / timestamp_in /
+				// timestamptz_in — so it flags the plan non-immutable (42P17 in an index expression).
 				params.nonimmutable = true
 				return &rExpr{kind: reDateConvert, operand: inner, result: target}, toRt, nil
 			default:
-				return nil, resolvedType{}, newError(FeatureNotSupported,
-					"cannot cast "+rtName(ity)+" to "+target.CanonicalName())
+				return nil, resolvedType{}, typeError("cannot cast " + rtName(ity) + " to " + target.CanonicalName())
 			}
 		}
-		// interval casts are deferred (spec/design/interval.md): casting TO interval is 0A000.
+		// An interval TARGET (interval.md §6, types.md §5): runtime text → interval parses the per-row
+		// string with the literal's own parseInterval (22007/22008 per row) — STABLE, like
+		// PostgreSQL's interval_in, so it flags the plan non-immutable (42P17 in an index
+		// expression). An interval operand is the identity; $1::interval declares the param as
+		// interval; a NULL adapts. Any other source is a forbidden pair (42804).
 		if target.IsInterval() {
-			return nil, resolvedType{}, newError(FeatureNotSupported, "casting to an interval type is not supported yet")
+			if e.Cast.Inner.Kind == exprParam {
+				t := scalarInterval
+				pinner, _, err := resolve(s, e.Cast.Inner, &t, ag, params)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				return pinner, resolvedType{kind: rtInterval}, nil
+			}
+			rinner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			switch ity.kind {
+			case rtNull, rtInterval:
+				return rinner, resolvedType{kind: rtInterval}, nil
+			case rtText:
+				params.nonimmutable = true
+				return &rExpr{kind: reCast, operand: rinner, result: target}, resolvedType{kind: rtInterval}, nil
+			default:
+				return nil, resolvedType{}, typeError("cannot cast " + rtName(ity) + " to interval")
+			}
 		}
 		// A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int` (and
 		// `CAST($1 AS int)`) declares `$1` as int, the cast-target parameter-typing case

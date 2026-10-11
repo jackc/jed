@@ -791,6 +791,14 @@ pub fn local_to_instant_micros(zr: &ZoneRef, wall_micros: i64) -> i64 {
     wall_micros - chosen * 1_000_000
 }
 
+/// [`local_to_instant_micros`] for an unvalidated wall clock: `None` when the zone shift
+/// overflows `i64` (the caller's range error).
+pub fn local_to_instant_micros_checked(zr: &ZoneRef, wall_micros: i64) -> Option<i64> {
+    let wall_secs = wall_micros.div_euclid(1_000_000);
+    let chosen = determine_local_offset(zr, wall_secs);
+    wall_micros.checked_sub(chosen * 1_000_000)
+}
+
 /// Choose the UT offset (seconds) to interpret a wall-clock `wall_secs` reading with, matching
 /// PostgreSQL's `DetermineTimeZoneOffset` (src/timezone/pgtz.c) at a DST boundary. For a normal time
 /// both candidate offsets agree; for a spring-forward GAP (a nonexistent wall clock) PG uses the

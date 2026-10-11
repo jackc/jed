@@ -224,10 +224,21 @@ listed).
   / underscore / `NaN` trap `22P02`), metered by the cast node's `operator_eval`, trapping
   `22P02` / `22003` **per row**. The runtime `text → uuid` cast also landed (the uuid cast slice,
   §14: `uuid_in` at eval), and so did `text → date` (the literal's `parse_date` per row,
-  `22007`/`22008` — STABLE and un-indexable, [date.md](date.md) §6). The runtime text→`T` cast to
-  the remaining **string-native** scalars `timestamp` / `timestamptz` / `interval` / `bytea` stays
-  **deferred** (`0A000`), each its own
-  follow-on. The `text → text` identity is implicit, like any identity cast.
+  `22007`/`22008` — STABLE and un-indexable, [date.md](date.md) §6). The remaining
+  **string-native** scalars have landed too, each running its literal's parser per row: `timestamp`
+  (an offset validated then ignored), `interval` (the [interval.md](interval.md) §3 subset), and
+  `bytea` (the §13 `\x` hex input, `22P02`), with `22007` malformed / `22008` out of range for the
+  datetime pair. **`timestamptz` reads an offset-less string in the session zone**, as PostgreSQL's
+  `timestamptz_in` does (one `timezone` unit; DST gap/overlap as the `timestamp → timestamptz`
+  cast, [timezones.md](timezones.md) §9.3); an explicit offset or `±infinity` fixes the instant. The
+  `timestamptz` *string literal* still reads an offset-less string as UTC (folded at resolve) — a
+  recorded follow-on, so `'…'::timestamptz` and `s::timestamptz` can differ in a non-UTC session.
+  The three datetime casts are STABLE, like PostgreSQL's `timestamp_in` / `timestamptz_in` /
+  `interval_in` (`42P17` in an index expression); `text → bytea` is immutable (`byteain`) and
+  indexable. The jed-stricter grammars (`'now'`/`'epoch'` for timestamps, ISO-8601 and SQL-standard
+  interval input, the bytea escape format) are identical to the literal path. `CAST(interval AS
+  interval)` is the identity, and every other source to these four targets is a forbidden pair
+  (`42804`). The `text → text` identity is implicit, like any identity cast.
 - **Casting *to* text** (`CAST(x AS text)`, `x::text`, `x::varchar(n)`) is admitted from **every
   built-in scalar**, each rendered in its **own output form** — exactly the text a result cell of
   that type shows: integers and decimals in base 10 (decimal keeps its display scale), `true` /
@@ -670,9 +681,9 @@ over-`RECORD_MAX` bytea key is rejected `0A000` (the same node-fit limit as text
   the hex form `\x…` is the only input this slice. A deliberate, documented divergence from PG
   (which also accepts the escape format on input), justified by determinism and a smaller surface;
   the hex form is the modern canonical spelling and matches the render output.
-- **bytea ⇄ other casts** (§5) and **binary functions** (`length`, `||`, `substring`,
-  `encode`/`decode`, `get_byte`/`set_byte`, …) — separate slices; this slice is comparison +
-  storage only (`= < > <= >=`, `IS [NOT] DISTINCT FROM`).
+- **Binary functions** (`length`, `||`, `substring`, `get_byte`/`set_byte`, …) — separate slices.
+  (The `text ⇄ bytea` casts and `uuid ⇄ bytea` have landed — §5, §14; every other bytea cast is a
+  forbidden pair, `42804`.)
 
 **Practical size note.** As for text (§11), a single stored bytea value (or row) larger than one
 page trips the whole-image `0A000` oversized-item narrowing until overflow pages land.
@@ -765,7 +776,8 @@ narrowing the deferred note below originally recorded):
   the forbidden `boolean ⇄ i16`/`i64` pairs of §9).
 
 `text → uuid` / `uuid → text` agree with PostgreSQL and are oracle-checked in the conformance corpus.
-`text ⇄ bytea` and every other bytea cast remain deferred (the bytea cast slice's own follow-on, §13).
+The runtime `text → bytea` cast (the `\x` hex input per row, §5) and `bytea → text` have since landed;
+every other bytea cast is a forbidden pair (`42804`).
 
 **Deferred uuid sub-features** (relaxable narrowings, each its own follow-up):
 

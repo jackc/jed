@@ -161,20 +161,67 @@ pub(crate) fn read_frac(b: &[u8], i: &mut usize) -> Result<i64> {
     Ok(us)
 }
 
+/// A parsed `timestamptz` input string: either already an instant (±infinity, or a finite wall
+/// clock carrying an explicit offset, normalized to UTC) or a finite wall clock with **no** offset
+/// (not yet checked against the sentinels), which the caller interprets in a zone.
+pub enum TimestamptzInput {
+    Instant(i64),
+    Local(i64),
+}
+
 /// Parse a timestamp/timestamptz literal to µs since the epoch. For `timestamptz`
 /// (`apply_offset = true`) a trailing offset normalizes the wall clock to UTC; for
 /// `timestamp` an offset is parsed/validated but **ignored** (PG behavior). The type name
 /// is used only for error messages.
 fn parse(input: &str, apply_offset: bool, type_name: &str) -> Result<i64> {
+    let (micros, offset_secs) = match parse_wall(input, type_name)? {
+        Wall::Infinity(sentinel) => return Ok(sentinel),
+        Wall::Finite(micros, offset_secs) => (micros, offset_secs),
+    };
+    match offset_secs {
+        Some(off) if apply_offset => apply_utc_offset(micros, off),
+        _ => finite_instant(micros),
+    }
+}
+
+/// A parsed datetime string: a ±infinity sentinel, or a finite wall clock (µs since the epoch,
+/// not yet checked against the sentinels) with its explicit trailing offset in seconds, `None`
+/// when the text carries none.
+enum Wall {
+    Infinity(i64),
+    Finite(i64, Option<i64>),
+}
+
+/// A finite instant may not land on a ±infinity sentinel (22008).
+pub(crate) fn finite_instant(micros: i64) -> Result<i64> {
+    if micros == NEG_INFINITY || micros == POS_INFINITY {
+        return Err(field_overflow("value out of range")); // reserved for ±infinity
+    }
+    Ok(micros)
+}
+
+/// Normalize a finite wall clock carrying `offset_secs` to its UTC instant. Any overflow, or a
+/// result landing on a ±infinity sentinel, is a 22008 range error.
+fn apply_utc_offset(wall: i64, offset_secs: i64) -> Result<i64> {
+    let micros = offset_secs
+        .checked_mul(MICROS_PER_SEC)
+        .and_then(|o| wall.checked_sub(o))
+        .ok_or_else(|| field_overflow("value out of range"))?;
+    finite_instant(micros)
+}
+
+/// Parse a datetime string to its [`Wall`] reading. Shared by every timestamp/timestamptz input
+/// path; the type name is used only for error messages.
+fn parse_wall(input: &str, type_name: &str) -> Result<Wall> {
     let s = trim_ascii_ws(input);
     let low = s.to_ascii_lowercase();
 
     // Special values (checked first).
     if low == "infinity" || low == "+infinity" {
-        return Ok(POS_INFINITY);
+        return Ok(Wall::Infinity(POS_INFINITY));
     }
     if low == "-infinity" {
-        return Ok(NEG_INFINITY);
+        return Ok(Wall::Infinity(NEG_INFINITY));
     }
 
     // Trailing era ` BC` / ` AD` (case-insensitive); BC maps displayed year to astronomical.
@@ -222,11 +269,12 @@ fn parse(input: &str, apply_offset: bool, type_name: &str) -> Result<i64> {
     }
 
     // optional offset (Z / +HH[:MM[:SS]] / -HH[:MM[:SS]])
-    let mut offset_secs: i64 = 0;
+    let mut offset_secs: Option<i64> = None;
     if i < b.len() {
         match b[i] {
             b'Z' | b'z' => {
                 i += 1;
+                offset_secs = Some(0);
             }
             b'+' | b'-' => {
                 let sign = if b[i] == b'-' { -1 } else { 1 };
@@ -245,7 +293,7 @@ fn parse(input: &str, apply_offset: bool, type_name: &str) -> Result<i64> {
                 if oh > 15 || om > 59 || os > 59 {
                     return Err(field_overflow("time zone offset out of range"));
                 }
-                offset_secs = sign * (oh * 3600 + om * 60 + os);
+                offset_secs = Some(sign * (oh * 3600 + om * 60 + os));
             }
             _ => return Err(bad()),
         }
@@ -290,20 +338,11 @@ fn parse(input: &str, apply_offset: bool, type_name: &str) -> Result<i64> {
         .checked_mul(SECS_PER_DAY)
         .and_then(|s| s.checked_add(hour_part * 3600 + minute * 60 + second))
         .ok_or_else(|| field_overflow("value out of range"))?;
-    let mut micros = secs
+    let micros = secs
         .checked_mul(MICROS_PER_SEC)
         .and_then(|m| m.checked_add(micro))
         .ok_or_else(|| field_overflow("value out of range"))?;
-    if apply_offset {
-        micros = offset_secs
-            .checked_mul(MICROS_PER_SEC)
-            .and_then(|o| micros.checked_sub(o))
-            .ok_or_else(|| field_overflow("value out of range"))?;
-    }
-    if micros == NEG_INFINITY || micros == POS_INFINITY {
-        return Err(field_overflow("value out of range")); // reserved for ±infinity
-    }
-    Ok(micros)
+    Ok(Wall::Finite(micros, offset_secs))
 }
 
 /// Parse a `timestamp` (zoneless) literal: an offset in the text is accepted and ignored.
@@ -314,6 +353,20 @@ pub fn parse_timestamp(s: &str) -> Result<i64> {
 /// Parse a `timestamptz` literal: a trailing offset normalizes the value to UTC.
 pub fn parse_timestamptz(s: &str) -> Result<i64> {
     parse(s, true, "timestamptz")
+}
+
+/// Parse a `timestamptz` input for the runtime `text → timestamptz` cast (types.md §5): an explicit
+/// offset (or ±infinity) yields the instant, while an offset-less wall clock is returned as
+/// [`TimestamptzInput::Local`] for the caller to interpret in the session zone, as PostgreSQL's
+/// `timestamptz_in` does. (The literal path, [`parse_timestamptz`], still reads it as UTC.)
+pub fn parse_timestamptz_input(s: &str) -> Result<TimestamptzInput> {
+    Ok(match parse_wall(s, "timestamptz")? {
+        Wall::Infinity(sentinel) => TimestamptzInput::Instant(sentinel),
+        Wall::Finite(micros, Some(off)) => {
+            TimestamptzInput::Instant(apply_utc_offset(micros, off)?)
+        }
+        Wall::Finite(micros, None) => TimestamptzInput::Local(micros),
+    })
 }
 
 /// Build a zoneless `timestamp` (µs since the 1970 epoch) from calendar fields — the workhorse for

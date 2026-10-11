@@ -1,0 +1,362 @@
+# Runtime text → timestamp / timestamptz / interval / bytea casts (spec/types/casts.toml,
+# spec/design/types.md §5). CAST(text_expr AS T) / text_expr :: T on a NON-LITERAL text expression
+# (here a text COLUMN) runs the same input parser the T literal folds at resolve, but per ROW in the
+# evaluator: parse_timestamp (an offset validated then ignored), the timestamptz parse (an explicit
+# offset fixes the instant; an offset-LESS wall clock is read in the SESSION zone, as PostgreSQL's
+# timestamptz_in does, charging one timezone unit), parse_interval (the "unit + time" subset), and the
+# `\x` hex bytea input. Malformed input traps 22007 and an out-of-range field 22008, PER ROW during the
+# scan. The three datetime casts are STABLE, like PostgreSQL's timestamp_in / timestamptz_in /
+# interval_in, so an index expression containing one is 42P17; text → bytea is immutable (byteain)
+# and indexable. CAST(interval_expr AS interval) is the identity.
+#
+# OUT of this corpus (cannot live in the PG-clean oracle), covered by the per-core unit tests
+# (cast_text_string_native): the jed-stricter input grammars, identical to the literal path —
+# 'now'/'today'/'epoch' and DateStyle spellings for timestamp, ISO-8601 `P…` and SQL-standard
+# interval input, the traditional bytea escape format (all accepted by PG, rejected by jed); the
+# SQLSTATE subcode differences (an out-of-range offset 22008 vs PG 22009, interval overflow 22008 vs
+# PG 22015, malformed hex 22P02 vs PG 22023); and a forbidden source (1::interval, 42804 vs PG 42846).
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, ddl.index_partial, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.i32, types.text, types.timestamp, types.timestamptz, types.interval, types.bytea, cast.explicit, cast.operator, cast.string_literal, cast.text_string_native, expr.timestamp_arithmetic, session.timezone, expr.at_time_zone, expr.interval_arithmetic, query.aggregates, expr.in_list, resource.cost_metering
+
+# load-timezone: America/New_York
+# load-timezone: Asia/Kolkata
+
+# ============================================================================================
+# text → timestamp
+# ============================================================================================
+
+statement ok
+CREATE TABLE ts (id integer PRIMARY KEY, s text)
+
+# Every s here is well-formed for the timestamp grammar jed and PG share, so a full-table cast
+# never traps.
+statement ok
+INSERT INTO ts VALUES
+  (1, '2024-01-15 12:34:56'),
+  (2, '  2024-02-29T08:00:00.123456  '),
+  (3, '2024-01-01'),
+  (4, '2024-07-01 12:00:00+05:30'),
+  (5, '2024-12-31 24:00:00'),
+  (6, '0044-03-15 12:00:00 BC'),
+  (7, 'infinity'),
+  (8, '-infinity'),
+  (9, NULL),
+  (10, '2024-01-01 12:00:00Z')
+
+# The offset is validated and IGNORED (ids 4/10), 24:00:00 rolls into the next day (id 5), a date
+# alone is midnight (id 3), the era maps BC years (id 6), ±infinity parse (ids 7/8). NULL → NULL.
+query IT nosort
+SELECT id, s :: timestamp FROM ts ORDER BY id
+----
+1
+2024-01-15 12:34:56
+2
+2024-02-29 08:00:00.123456
+3
+2024-01-01 00:00:00
+4
+2024-07-01 12:00:00
+5
+2025-01-01 00:00:00
+6
+0044-03-15 12:00:00 BC
+7
+infinity
+8
+-infinity
+9
+NULL
+10
+2024-01-01 12:00:00
+
+# the CAST(...) spelling is identical
+query T nosort
+SELECT CAST(s AS timestamp) FROM ts WHERE id = 1
+----
+2024-01-15 12:34:56
+
+# the runtime cast composes (cast, then timestamp arithmetic and comparison)
+query T nosort
+SELECT s :: timestamp + INTERVAL '1 day' FROM ts WHERE id = 1
+----
+2024-01-16 12:34:56
+
+query I nosort
+SELECT id FROM ts WHERE s :: timestamp > TIMESTAMP '2024-06-01 00:00:00' ORDER BY id
+----
+4
+5
+7
+
+# ============================================================================================
+# text → timestamptz
+# ============================================================================================
+
+# In a UTC session an offset-less string is a UTC instant; an explicit offset normalizes to UTC.
+query IT nosort
+SELECT id, s :: timestamptz FROM ts ORDER BY id
+----
+1
+2024-01-15 12:34:56+00
+2
+2024-02-29 08:00:00.123456+00
+3
+2024-01-01 00:00:00+00
+4
+2024-07-01 06:30:00+00
+5
+2025-01-01 00:00:00+00
+6
+0044-03-15 12:00:00+00 BC
+7
+infinity
+8
+-infinity
+9
+NULL
+10
+2024-01-01 12:00:00+00
+
+# An offset-less string is read in the SESSION zone (EST here, -05); an explicit offset still fixes
+# the instant (id 4). Rendered back in UTC so the output is zone-independent.
+# timezone: America/New_York
+query IT nosort
+SELECT id, (s :: timestamptz) AT TIME ZONE 'UTC' FROM ts WHERE id IN (1, 3, 4, 7, 10) ORDER BY id
+----
+1
+2024-01-15 17:34:56
+3
+2024-01-01 05:00:00
+4
+2024-07-01 06:30:00
+7
+infinity
+10
+2024-01-01 12:00:00
+
+# a half-hour session zone
+# timezone: Asia/Kolkata
+query T nosort
+SELECT (s :: timestamptz) AT TIME ZONE 'UTC' FROM ts WHERE id = 1
+----
+2024-01-15 07:04:56
+
+# DST: a wall clock inside the spring-forward gap takes the earlier (standard) offset, and one in
+# the fall-back overlap takes the later (standard) offset — as the timestamp → timestamptz cast.
+statement ok
+CREATE TABLE dst (id integer PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO dst VALUES (1, '2024-03-10 02:30:00'), (2, '2024-11-03 01:30:00'), (3, '2024-07-04 12:00:00')
+
+# timezone: America/New_York
+query IT nosort
+SELECT id, (s :: timestamptz) AT TIME ZONE 'UTC' FROM dst ORDER BY id
+----
+1
+2024-03-10 07:30:00
+2
+2024-11-03 06:30:00
+3
+2024-07-04 16:00:00
+
+# the result matches casting the parsed timestamp into the session zone
+# timezone: America/New_York
+query I nosort
+SELECT count(*) FROM dst WHERE s :: timestamptz = (s :: timestamp) :: timestamptz
+----
+3
+
+# ============================================================================================
+# Per-row datetime errors that AGREE with PostgreSQL
+# ============================================================================================
+
+statement ok
+CREATE TABLE bad (id integer PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO bad VALUES (1, 'not-a-timestamp'), (2, '2024-13-01 00:00:00'), (3, '2024-02-30'), (4, '2024-01-01 25:00:00'), (5, '1 fortnight')
+
+# malformed syntax traps 22007 mid-scan (not at plan time)
+statement error 22007
+SELECT s :: timestamp FROM bad WHERE id = 1
+
+statement error 22007
+SELECT s :: timestamptz FROM bad WHERE id = 1
+
+# month 13 / Feb 30 / hour 25 are out of range → 22008
+statement error 22008
+SELECT s :: timestamp FROM bad WHERE id = 2
+
+statement error 22008
+SELECT s :: timestamptz FROM bad WHERE id = 3
+
+statement error 22008
+SELECT s :: timestamp FROM bad WHERE id = 4
+
+# an unknown interval unit → 22007
+statement error 22007
+SELECT s :: interval FROM bad WHERE id = 5
+
+statement error 22007
+SELECT s :: interval FROM bad WHERE id = 1
+
+# ============================================================================================
+# text → interval, and the interval identity cast
+# ============================================================================================
+
+statement ok
+CREATE TABLE iv (id integer PRIMARY KEY, s text, v interval)
+
+statement ok
+INSERT INTO iv VALUES
+  (1, '1 day', '1 day'),
+  (2, '1 year 2 months 3 days 04:05:06.5', '2 hours'),
+  (3, '-1 day +02:00', '-1 day'),
+  (4, '1.5 months', '1 mon 15 days'),
+  (5, '@ 3 hours ago', '00:00:00'),
+  (6, '  100:00:00  ', '100:00:00'),
+  (7, NULL, NULL)
+
+query IT nosort
+SELECT id, s :: interval FROM iv ORDER BY id
+----
+1
+1 day
+2
+1 year 2 mons 3 days 04:05:06.5
+3
+-1 days +02:00:00
+4
+1 mon 15 days
+5
+-03:00:00
+6
+100:00:00
+7
+NULL
+
+query T nosort
+SELECT CAST(s AS interval) FROM iv WHERE id = 2
+----
+1 year 2 mons 3 days 04:05:06.5
+
+# the runtime cast composes with interval arithmetic and comparison
+query T nosort
+SELECT TIMESTAMP '2024-01-31 00:00:00' + s :: interval FROM iv WHERE id = 4
+----
+2024-03-15 00:00:00
+
+query I nosort
+SELECT id FROM iv WHERE s :: interval > INTERVAL '1 day' ORDER BY id
+----
+2
+4
+6
+
+# CAST(interval AS interval) is the identity, in both spellings
+query IT nosort
+SELECT id, v :: interval FROM iv ORDER BY id
+----
+1
+1 day
+2
+02:00:00
+3
+-1 days
+4
+1 mon 15 days
+5
+00:00:00
+6
+100:00:00
+7
+NULL
+
+query T nosort
+SELECT CAST(CAST(v AS interval) AS interval) FROM iv WHERE id = 6
+----
+100:00:00
+
+query I nosort
+SELECT id FROM iv WHERE v :: interval = s :: interval ORDER BY id
+----
+1
+4
+6
+
+# ============================================================================================
+# text → bytea
+# ============================================================================================
+
+statement ok
+CREATE TABLE b (id integer PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO b VALUES (1, '\x'), (2, '\x00ff'), (3, '\xDEADbeef'), (4, NULL)
+
+query IT nosort
+SELECT id, s :: bytea FROM b ORDER BY id
+----
+1
+\x
+2
+\x00ff
+3
+\xdeadbeef
+4
+NULL
+
+query T nosort
+SELECT CAST(s AS bytea) FROM b WHERE id = 3
+----
+\xdeadbeef
+
+# a cast value compares like any bytea
+query I nosort
+SELECT id FROM b WHERE s :: bytea = '\xdeadbeef' :: bytea ORDER BY id
+----
+3
+
+# ============================================================================================
+# Indexability: the datetime casts are STABLE (42P17), text → bytea is immutable
+# ============================================================================================
+
+statement error 42P17
+CREATE INDEX ts_expr_idx ON ts ((s :: timestamp))
+
+statement error 42P17
+CREATE INDEX tstz_expr_idx ON ts ((s :: timestamptz))
+
+statement error 42P17
+CREATE INDEX iv_expr_idx ON iv ((s :: interval))
+
+statement error 42P17
+CREATE INDEX ts_pred_idx ON ts (id) WHERE s :: timestamp > TIMESTAMP '2024-01-01 00:00:00'
+
+statement ok
+CREATE INDEX b_expr_idx ON b ((s :: bytea))
+
+query I nosort
+SELECT id FROM b WHERE s :: bytea = '\x00ff' :: bytea
+----
+2
+
+# ============================================================================================
+# Metering — an offset-less timestamptz string charges one timezone unit for its zone lookup; an
+# explicit offset and ±infinity consult no zone (compare the two equal-shape lookups)
+# ============================================================================================
+
+# timezone: America/New_York
+# cost: 7
+query T nosort
+SELECT (s :: timestamptz) :: timestamp FROM ts WHERE id = 4
+----
+2024-07-01 02:30:00
+
+# timezone: America/New_York
+# cost: 8
+query T nosort
+SELECT (s :: timestamptz) :: timestamp FROM ts WHERE id = 1
+----
+2024-01-15 12:34:56

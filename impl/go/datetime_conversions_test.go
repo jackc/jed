@@ -56,13 +56,12 @@ func TestExtractFromInfinityTraps(t *testing.T) {
 	}
 }
 
-func TestNonDatetimeSourceToDatetimeIsDeferred(t *testing.T) {
+func TestNonDatetimeSourceToDatetimeIsForbidden(t *testing.T) {
 	t.Parallel()
+	// No integer → timestamp cast exists: jed's strict-matrix 42804 (PG 42846). (Runtime text →
+	// datetime has landed — cast_text_string_native_test.go.)
 	db := memDB().Session(SessionOptions{})
-	if c := dtErrCode(t, db, "SELECT CAST(1 + 1 AS timestamp)"); c != "0A000" {
-		t.Fatalf("int->timestamp: got %s, want 0A000", c)
-	}
-	if c := dtErrCode(t, db, "SELECT CAST(current_setting('x.y', true) AS timestamptz)"); c != "0A000" {
-		t.Fatalf("text->timestamptz: got %s, want 0A000", c)
+	if c := dtErrCode(t, db, "SELECT CAST(1 + 1 AS timestamp)"); c != "42804" {
+		t.Fatalf("int->timestamp: got %s, want 42804", c)
 	}
 }

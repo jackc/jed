@@ -11,7 +11,7 @@
 # OUT of this corpus (cannot live in the PG-clean oracle): the jed-stricter grammar divergences
 # (DateStyle-dependent spellings like 01/15/2024 / Jan 15 2024 and :60 seconds — accepted by PG,
 # 22007/22008 in jed — identical to the literal path), covered by the per-core unit tests
-# (cast_text_date). text → timestamp/timestamptz/interval/bytea stay deferred (0A000).
+# (cast_text_date). text → timestamp/timestamptz/interval/bytea is cast/text_to_string_native.test.
 # Format + the `requires` gate: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, ddl.index_partial, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.i32, types.date, types.text, cast.explicit, cast.operator, cast.string_literal, cast.runtime_text, cast.text_date, expr.date_arithmetic
 

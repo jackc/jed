@@ -9,8 +9,8 @@
 //!     and jed has no `float` type, so the function is deferred (timezones.md §9.2).
 //!   * `EXTRACT(field FROM ±infinity)` — jed's decimal is finite-only, so it traps `22003`; PG
 //!     returns numeric `±Infinity` (timezones.md §9.2).
-//!   * a non-datetime / non-literal-text source to a datetime target — jed `0A000` (text→datetime is
-//!     a valid PG cast; int→datetime is PG `42846`) (timezones.md §9.3, casts.toml).
+//!   * a non-datetime, non-text source to a datetime target — jed `42804` (PG `42846`)
+//!     (timezones.md §9.3, casts.toml).
 
 use jed::{CreateOptions, Database, Session, SessionOptions};
 
@@ -77,25 +77,16 @@ fn extract_from_infinity_traps() {
     );
 }
 
-/// A non-datetime / non-literal-text source to a datetime target is a deferred 0A000 in jed (where PG
-/// differs: text→datetime is a valid cast, int→datetime is 42846). The string-LITERAL form still
-/// works by literal adaptation (`'…'::timestamp`), so it is NOT tested here.
+/// A non-datetime source to a datetime target is a forbidden pair in jed (42804; PG 42846). The
+/// runtime text → datetime casts have landed (tests/cast_text_string_native.rs).
 #[test]
-fn non_datetime_source_to_datetime_is_deferred() {
+fn non_datetime_source_to_datetime_is_forbidden() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    // int → timestamp: jed 0A000, PG 42846.
+    // int → timestamp: jed 42804, PG 42846.
     assert_eq!(
         err_code(&mut db, "SELECT CAST(1 + 1 AS timestamp)"),
-        "0A000"
-    );
-    // a non-literal text → timestamptz: jed 0A000, PG parses the text.
-    assert_eq!(
-        err_code(
-            &mut db,
-            "SELECT CAST(current_setting('x.y', true) AS timestamptz)"
-        ),
-        "0A000"
+        "42804"
     );
 }

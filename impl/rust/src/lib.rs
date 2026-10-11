@@ -648,7 +648,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // coercion the LITERAL form folds at resolve, but per row in evalCast. Malformed → 22P02,
     // out of range → 22003. jed's own grammar (hex/underscore/NaN trap 22P02 — per-core tested);
     // the accepted-grammar cases agree with PG and are oracle-checked. text → uuid is cast.uuid;
-    // text → timestamp/timestamptz/interval/bytea stay deferred; text → date is cast.text_date.
+    // text → date is cast.text_date; text → timestamp/timestamptz/interval/bytea is
+    // cast.text_string_native.
     "cast.runtime_text",
     // Runtime text → date cast (date.md §6): CAST(text_expr AS date) / s :: date on a NON-LITERAL
     // text expression runs the same parse_date the literal form folds at resolve, per row — 22007
@@ -657,6 +658,11 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // PostgreSQL, whose date_in is stable. The strict-ISO accepted grammar agrees with PG and is
     // oracle-checked; the jed-stricter rejections (DateStyle spellings) are per-core tested.
     "cast.text_date",
+    // Runtime text → timestamp / timestamptz / interval / bytea (types.md §5): the literal's own
+    // parser per row; an offset-less timestamptz string reads in the session zone (one timezone
+    // unit). The datetime casts are STABLE (42P17 in an index expression, as PG's *_in); text →
+    // bytea is immutable. interval → interval is the identity.
+    "cast.text_string_native",
     // Any built-in scalar → text (casts.toml, types.md §5): each type's own output form,
     // timestamptz in the session zone (STABLE). Explicit only; composite/range → text stay 0A000.
     "cast.scalar_text",

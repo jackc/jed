@@ -3864,11 +3864,12 @@ pub(crate) fn resolve(
                 }
                 return coerce_string_literal(s, target, typmod, varchar_len);
             }
-            // Cross-family datetime casts (timezones.md §9.3): a `timestamp`/`timestamptz`/`date`
-            // TARGET from another datetime family. A same-family cast is the identity; a cross-family
-            // cast becomes a `DateConvert` node (the zone-crossing ones read the session zone at eval);
-            // any non-datetime source is the deferred `0A000`. `text`-literal operands and bind params
-            // are handled above / just below. A `NULL` operand adapts to the target.
+            // Datetime casts (timezones.md §9.3, types.md §5): a `timestamp`/`timestamptz`/`date`
+            // TARGET from another datetime family or from runtime text. A same-family cast is the
+            // identity; a cross-family or text cast becomes a `DateConvert` node (the zone-crossing
+            // ones read the session zone at eval); any other source is a forbidden pair (42804).
+            // `text`-literal operands and bind params are handled above / just below. A `NULL`
+            // operand adapts to the target.
             if target.is_timestamp() || target.is_timestamptz() || target.is_date() {
                 if matches!(inner.as_ref(), Expr::Param(_)) {
                     // `$1::timestamp` declares the parameter as the target type (the cast-target
@@ -3894,13 +3895,14 @@ pub(crate) fn resolve(
                             to_rt,
                         ))
                     }
-                    ResolvedType::Text if target.is_date() => {
-                        // The runtime text → date cast (date.md §6): a NON-literal text source (a
-                        // string LITERAL operand was folded by `coerce_string_literal` above) parses
-                        // per row via the same `parse_date` the literal uses (22007/22008 per row).
-                        // STABLE, not immutable — the input grammar admits the clock-relative
-                        // specials — so it flags the plan non-immutable (42P17 in an index
-                        // expression, as in PG). text → timestamp/timestamptz stays deferred.
+                    ResolvedType::Text => {
+                        // The runtime text → date / timestamp / timestamptz casts (date.md §6,
+                        // types.md §5): a NON-literal text source (a string LITERAL operand was folded
+                        // by `coerce_string_literal` above) parses per row via the literal's own parser
+                        // (22007/22008 per row); text → timestamptz reads an offset-less string in the
+                        // session zone. STABLE, not immutable — like PostgreSQL's date_in /
+                        // timestamp_in / timestamptz_in — so it flags the plan non-immutable (42P17 in
+                        // an index expression, as in PG).
                         params.nonimmutable = true;
                         Ok((
                             RExpr::DateConvert {
@@ -3910,14 +3912,11 @@ pub(crate) fn resolve(
                             to_rt,
                         ))
                     }
-                    _ => Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        format!(
-                            "cannot cast {} to {}",
-                            ity.type_name(),
-                            target.canonical_name()
-                        ),
-                    )),
+                    _ => Err(type_error(format!(
+                        "cannot cast {} to {}",
+                        ity.type_name(),
+                        target.canonical_name()
+                    ))),
                 };
             }
             // The JSON cast matrix (spec/design/json.md §6.1): casting TO json/jsonb from a runtime
@@ -4018,10 +4017,11 @@ pub(crate) fn resolve(
             // (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32
             // / NULL / bool source is castable), so it is handled AFTER the inner is resolved, below
             // — not guarded here.
-            // A bytea TARGET: the uuid cast slice admits uuid → bytea (the 16 raw bytes — a jed cast
-            // PG lacks; casts.toml, types.md §14). A string LITERAL was coerced above; a NULL adapts;
-            // a bytea operand is the identity. text → bytea and every other bytea cast stay deferred
-            // (0A000 — the bytea cast slice's own follow-on, types.md §13).
+            // A bytea TARGET: runtime text → bytea decodes the per-row string with the literal's own
+            // bytea input (types.md §5/§13 — immutable, like PG's byteain), and the uuid cast slice
+            // admits uuid → bytea (the 16 raw bytes — a jed cast PG lacks; casts.toml, types.md §14).
+            // A string LITERAL was coerced above; a NULL adapts; a bytea operand is the identity. Any
+            // other source is a forbidden pair (42804).
             if target.is_bytea() {
                 if matches!(inner.as_ref(), Expr::Param(_)) {
                     let (rinner, _) = resolve(scope, inner, Some(ScalarType::Bytea), agg, params)?;
@@ -4030,7 +4030,7 @@ pub(crate) fn resolve(
                 let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
                 return match ity {
                     ResolvedType::Null | ResolvedType::Bytea => Ok((rinner, ResolvedType::Bytea)),
-                    ResolvedType::Uuid => Ok((
+                    ResolvedType::Text | ResolvedType::Uuid => Ok((
                         RExpr::Cast {
                             inner: Box::new(rinner),
                             target,
@@ -4039,10 +4039,10 @@ pub(crate) fn resolve(
                         },
                         ResolvedType::Bytea,
                     )),
-                    _ => Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        "casting to bytea is not supported yet",
-                    )),
+                    _ => Err(type_error(format!(
+                        "cannot cast {} to bytea",
+                        ity.type_name()
+                    ))),
                 };
             }
             // The uuid cast slice (spec/types/casts.toml, types.md §14): a uuid TARGET from a runtime
@@ -4073,18 +4073,39 @@ pub(crate) fn resolve(
                     ))),
                 };
             }
-            // The timestamp/timestamptz/date cross-family cast matrix is handled above (the
-            // `DateConvert` block — timezones.md §9.3). `text`↔datetime casts (a string lands in a
-            // datetime column by literal adaptation, not a CAST) stay deferred and fall through to the
-            // generic logic below (which rejects a non-datetime source to a datetime target 0A000).
-            // interval casts are deferred (spec/design/interval.md): casting TO interval is 0A000
-            // (a string lands in an interval column by literal adaptation / the INTERVAL '...'
-            // keyword literal, not a CAST).
+            // An interval TARGET (interval.md §6, types.md §5): runtime text → interval parses the
+            // per-row string with the literal's own `parse_interval` (22007/22008 per row) — STABLE,
+            // like PostgreSQL's interval_in, so it flags the plan non-immutable (42P17 in an index
+            // expression). An interval operand is the identity; `$1::interval` declares the param as
+            // interval; a NULL adapts. Any other source is a forbidden pair (42804).
             if target.is_interval() {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "casting to an interval type is not supported yet",
-                ));
+                if matches!(inner.as_ref(), Expr::Param(_)) {
+                    let (rinner, _) =
+                        resolve(scope, inner, Some(ScalarType::Interval), agg, params)?;
+                    return Ok((rinner, ResolvedType::Interval));
+                }
+                let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
+                return match ity {
+                    ResolvedType::Null | ResolvedType::Interval => {
+                        Ok((rinner, ResolvedType::Interval))
+                    }
+                    ResolvedType::Text => {
+                        params.nonimmutable = true;
+                        Ok((
+                            RExpr::Cast {
+                                inner: Box::new(rinner),
+                                target,
+                                typmod: None,
+                                varchar_len: None,
+                            },
+                            ResolvedType::Interval,
+                        ))
+                    }
+                    _ => Err(type_error(format!(
+                        "cannot cast {} to interval",
+                        ity.type_name()
+                    ))),
+                };
             }
             // A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int`
             // (and `CAST($1 AS int)`) declares `$1` as int, the cast-target parameter-typing case

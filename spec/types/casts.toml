@@ -34,9 +34,9 @@
 #                  (invalid_text_representation, reused for the wrong-width body — there is no PG
 #                  precedent to match). Because these two pairs SUCCEED where PG errors, they cannot
 #                  live in the PG-clean oracle corpus and are covered by per-core unit tests.
-# bytea is otherwise still NEITHER a cast source NOR target except via uuid: text<->bytea and every
-# other bytea cast remain deferred (0A000), the bytea cast slice's own follow-on (../design/types.md
-# §13).
+# bytea's other casts: the runtime text -> bytea cast (the `\x` hex input per row) is in the runtime
+# text -> string-native section below and bytea -> text in the any-scalar -> text section; every other
+# source or target is a forbidden pair (42804).
 #
 # timestamp / timestamptz / date (scalars.toml) — the CROSS-FAMILY datetime cast matrix LANDED with
 # the tz conversion slice (../design/timezones.md §9.3): the six explicit (timestamp, timestamptz,
@@ -47,18 +47,19 @@
 # (timestamp<->date) are pure calendar arithmetic. All are EXPLICIT (PG makes the lossy/zone ones
 # explicit). A single-quoted string still lands in a timestamp/timestamptz/date column by LITERAL
 # ADAPTATION (the `TIMESTAMP '…'` / `DATE '…'` keyword literal / resolve-time coercion), NOT a (text,
-# T) cast pair — but the RUNTIME text -> date cast has since LANDED as a real (text, date) pair
-# (the runtime text→date section below, ../design/date.md §6), and datetime -> text is part of the
-# any-scalar -> text section at the end of this file (timestamptz renders in the SESSION zone).
-# STILL DEFERRED: text -> timestamp / timestamptz, and timestamp/timestamptz/date <-> interval
-# (interval is a span, not an instant).
+# T) cast pair — but the RUNTIME text -> date / timestamp / timestamptz casts have since LANDED as
+# real (text, T) pairs (the runtime text→date and text -> string-native sections below; the runtime
+# text -> timestamptz reads an offset-less string in the SESSION zone), and datetime -> text is part
+# of the any-scalar -> text section at the end of this file (timestamptz renders in the SESSION zone).
+# timestamp/timestamptz/date <-> interval does not exist (interval is a span, not an instant; PG has
+# no such cast either) — a forbidden pair (42804).
 #
-# interval (scalars.toml) is likewise STORABLE with NO cast rules here. A single-quoted string
-# lands in an interval column by LITERAL ADAPTATION (parsed in an interval context), and the
-# `INTERVAL '...'` keyword literal names the type directly — neither is a (text, interval) CAST.
-# `CAST(x AS interval)` and casting FROM an interval to anything but text are DEFERRED to a later
-# cast slice (0A000 / 42804) (../design/interval.md §6); interval -> text is in the any-scalar ->
-# text section at the end of this file.
+# interval (scalars.toml): a single-quoted string lands in an interval column by LITERAL ADAPTATION
+# (parsed in an interval context), and the `INTERVAL '...'` keyword literal names the type directly.
+# The RUNTIME text -> interval cast is the (text, interval) row in the runtime text -> string-native
+# section below; interval -> interval is the identity (implied, like every identity pair); interval
+# -> text is in the any-scalar -> text section at the end of this file. Every other cast into or out
+# of interval is a forbidden pair (42804) (../design/interval.md §6).
 #
 # STRING-LITERAL coercion is the one (text -> T) cast admitted ahead of the general cast slice,
 # and it is NOT a (from, to) pair in this matrix because its source is a string LITERAL, not the
@@ -67,9 +68,8 @@
 # (i16/i32/i64, decimal, boolean, text-identity, plus the string-native bytea/uuid/timestamp/
 # timestamptz/interval). Folded at resolve: 42704 unknown type, 22P02 malformed, 22003 out of range
 # (../design/grammar.md §36, ../design/types.md §5). This does NOT relax the matrix below: a RUNTIME
-# text->T cast on a non-literal text expression (`CAST(text_col AS int)`) stays DEFERRED (0A000), and
-# a BARE string never silently becomes a number/bool (`int_col = '42'` is 42804). Only the explicit,
-# named, literal spelling is admitted. For integer/decimal the coercion follows jed's OWN literal
+# text->T cast on a non-literal text expression (`CAST(text_col AS int)`) is admitted only by its own
+# (text, T) row, and a BARE string never silently becomes a number/bool (`int_col = '42'` is 42804). For integer/decimal the coercion follows jed's OWN literal
 # grammar (no hex/underscore/scientific/NaN — documented §36 divergences from PG).
 #
 # ARRAY casts (the array cast follow-ons — ../design/array.md §7) likewise do NOT add (from, to)
@@ -422,9 +422,8 @@ overflow_error = "22P02"
 # its numeric(p,s) typmod first). jed's OWN literal grammar governs — hex / digit-underscore /
 # NaN / +-Infinity trap 22P02 where PostgreSQL accepts them (the documented grammar.md §36
 # divergences, identical to the literal path; per-core tested). text -> uuid is the row above;
-# text -> date is the runtime text→date section below; the remaining string-native targets
-# (timestamp/timestamptz/interval/bytea) stay deferred (0A000), each its own follow-on. NULL ->
-# NULL throughout. These AGREE with PostgreSQL for jed's accepted grammar and are oracle-checked
+# text -> date is the runtime text→date section below; text -> timestamp/timestamptz/interval/bytea
+# the runtime text -> string-native section after it. NULL -> NULL throughout. These AGREE with PostgreSQL for jed's accepted grammar and are oracle-checked
 # (suites/cast/text_to_scalar.test, postgres:18).
 [[cast]]
 from = "text"
@@ -482,13 +481,56 @@ mode = "explicit"
 # unindexable. The strict-ISO accepted grammar AGREES with PostgreSQL and is oracle-checked
 # (suites/cast/text_to_date.test, postgres:18); the jed-stricter rejections (DateStyle-dependent
 # spellings, `:60` seconds) are per-core tested, identical to the literal path. text -> timestamp
-# / timestamptz / interval / bytea stay deferred (0A000), each its own follow-on.
+# / timestamptz / interval / bytea are the next section.
 [[cast]]
 from = "text"
 to = "date"
 mode = "explicit"
 on_overflow = "trap"
 overflow_error = "22008"
+
+# --- runtime text -> timestamp / timestamptz / interval / bytea (../design/types.md §5) --------
+# CAST(text_expr AS T) / text_expr :: T on a NON-LITERAL text expression runs the input parser the
+# T literal folds at resolve, per row: parse_timestamp (an offset validated then ignored); the
+# timestamptz parse, where an explicit offset (or ±infinity) fixes the instant and an offset-LESS
+# wall clock is read in the SESSION zone — PostgreSQL's timestamptz_in, a hand-written zone-dependent
+# transform like the datetime casts above, charging one timezone unit (DST gap/overlap as the
+# timestamp -> timestamptz cast; the string-LITERAL path still reads it as UTC, a recorded follow-on);
+# parse_interval (the "unit + time" subset); and the `\x` hex bytea input. 22007 malformed / 22008
+# out of range per row (bytea: 22P02). The three datetime casts are STABLE, like PostgreSQL's
+# timestamp_in / timestamptz_in / interval_in, so an index expression containing one is 42P17;
+# text -> bytea is immutable (byteain) and indexable. All EXPLICIT (PG's text -> T I/O casts are
+# explicit too). The accepted grammars AGREE with PostgreSQL and are oracle-checked
+# (suites/cast/text_to_string_native.test, postgres:18); the jed-stricter grammars (timestamp
+# 'now'/'today'/'epoch', ISO-8601 / SQL-standard interval input, the bytea escape format) and the
+# differing SQLSTATE subcodes are per-core tested, identical to the literal path. NULL -> NULL.
+[[cast]]
+from = "text"
+to = "timestamp"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22008"
+
+[[cast]]
+from = "text"
+to = "timestamptz"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22008"
+
+[[cast]]
+from = "text"
+to = "interval"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22008"
+
+[[cast]]
+from = "text"
+to = "bytea"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22P02"
 
 # --- any scalar -> text (../design/types.md §5) -------------------------------------------------
 # CAST(x AS text) / x::text / x::varchar(n) from every built-in scalar renders the type's OWN OUTPUT

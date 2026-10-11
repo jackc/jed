@@ -1030,11 +1030,11 @@ func typeError(msg string) error { return newError(DatatypeMismatch, msg) }
 // operands LHS-before-RHS); leaf nodes (column/constants) charge nothing. Both operands
 // are always evaluated — there is no short-circuit, so the count never depends on operand
 // values (spec/design/cost.md §3).
-// evalDateConvert evaluates a cross-family datetime cast (timezones.md §9.3) — or the runtime
-// text → date cast (date.md §6) — of the non-NULL value v to `to` (Timestamp/Timestamptz/Date).
-// The casts crossing the timestamptz boundary consult the session zone (charging timezone); the
-// others are zone-free. ±infinity maps to the target's own sentinel. The (source, to) pair is
-// guaranteed by the resolver: cross-family datetime, or text → date.
+// evalDateConvert evaluates a cross-family datetime cast (timezones.md §9.3) — or a runtime
+// text → datetime cast (date.md §6, types.md §5) — of the non-NULL value v to `to`
+// (Timestamp/Timestamptz/Date). The casts crossing the timestamptz boundary consult the session
+// zone (charging timezone); the others are zone-free. ±infinity maps to the target's own sentinel.
+// The (source, to) pair is guaranteed by the resolver: cross-family datetime, or text → datetime.
 func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value, error) {
 	const microsPerDay int64 = 86_400 * 1_000_000
 	microsToDate := func(mc int64) Value {
@@ -1084,6 +1084,37 @@ func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value,
 			return Value{}, err
 		}
 		return DateValue(d), nil
+	case v.Kind == ValText && to == scalarTimestamp:
+		// text → timestamp (types.md §5): the literal's parseTimestamp per row — an offset is
+		// validated and ignored; 22007 malformed / 22008 out of range. Zone-free.
+		mc, err := parseTimestamp(v.str())
+		if err != nil {
+			return Value{}, err
+		}
+		return TimestampValue(mc), nil
+	case v.Kind == ValText && to == scalarTimestamptz:
+		// text → timestamptz (types.md §5): an explicit offset (or ±infinity) fixes the instant;
+		// an offset-less wall clock is read in the SESSION zone, as PostgreSQL's timestamptz_in
+		// does (charging timezone; DST gap/overlap as the timestamp → timestamptz cast).
+		mc, local, err := parseTimestamptzInput(v.str())
+		if err != nil {
+			return Value{}, err
+		}
+		if !local {
+			return TimestamptzValue(mc), nil
+		}
+		zr, err := zoneCharge()
+		if err != nil {
+			return Value{}, err
+		}
+		inst, ok := localToInstantMicrosChecked(zr, mc)
+		if !ok {
+			return Value{}, datetimeFieldOverflow("timestamp out of range")
+		}
+		if inst, err = finiteInstant(inst); err != nil {
+			return Value{}, err
+		}
+		return TimestamptzValue(inst), nil
 	case v.Kind == ValTimestamp && to == scalarDate:
 		return microsToDate(v.Int), nil
 	case v.Kind == ValDate && to == scalarTimestamp:
@@ -1126,7 +1157,7 @@ func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value,
 		}
 		return TimestamptzValue(localToInstantMicros(zr, mid)), nil
 	default:
-		panic("resolver restricts DateConvert to cross-family datetime casts and text → date")
+		panic("resolver restricts DateConvert to cross-family datetime casts and text → datetime")
 	}
 }
 
@@ -3981,9 +4012,8 @@ func scalarToText(v Value, env *evalEnv, m *costMeter) (string, error) {
 // widens then coerces to the typmod; decimal→int rounds half-away to scale 0 then range-checks
 // (22003); decimal→decimal re-scales to the typmod (spec/design/decimal.md §6).
 func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) {
-	// The JSON cast matrix (spec/design/json.md §6.1). text → json/jsonb is the only runtime text
-	// cast (every other text cast target is resolver-rejected): json validates + stores verbatim
-	// (22P02 on malformed); jsonb parses + canonicalizes.
+	// The JSON cast matrix (spec/design/json.md §6.1): text → json validates + stores verbatim
+	// (22P02 on malformed); text → jsonb parses + canonicalizes.
 	if v.Kind == ValText {
 		if target.IsJson() {
 			if err := validateJSON(v.str()); err != nil {
@@ -4007,10 +4037,26 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 			}
 			return UuidValue(b), nil
 		}
+		// text → interval / bytea (types.md §5): the literal's own input per row — parseInterval
+		// (22007/22008) and the `\x` hex bytea input (22P02).
+		if target.IsInterval() {
+			iv, err := parseInterval(v.str())
+			if err != nil {
+				return Value{}, err
+			}
+			return IntervalValue(iv), nil
+		}
+		if target.IsBytea() {
+			b, err := decodeByteaLiteral(v.str())
+			if err != nil {
+				return Value{}, err
+			}
+			return ByteaValue(b), nil
+		}
 		// text → numeric/boolean (the runtime-text-cast slice, grammar.md §36): the same per-row
 		// coercion the `type 'string'` literal folds at resolve, run here over the runtime string.
-		// The resolver admits only int/decimal/float/bool targets for a text source (uuid/json/jsonb
-		// are the arms above). Malformed → 22P02, out of range → 22003 (per row).
+		// The resolver admits only int/decimal/float/bool targets for a text source
+		// (uuid/interval/bytea/json/jsonb are the arms above). Malformed → 22P02, out of range → 22003 (per row).
 		if target.IsBool() {
 			b, err := parseBoolLiteral(v.str())
 			if err != nil {

@@ -11,8 +11,8 @@
 # (hex / digit-underscore / NaN trap 22P02 where PG accepts them — identical to the literal path,
 # expr/typed_literal.test) and runtime text → f32/f64 (the float renderer is in the determinism
 # exception ledger), both covered by the per-core unit tests (cast_text_runtime). text → uuid is
-# the separate cast.uuid runtime cast (cast/uuid.test); text → date/timestamp/interval/bytea stay
-# deferred (0A000), each its own follow-on.
+# the separate cast.uuid runtime cast (cast/uuid.test); text → date is cast/text_to_date.test and
+# text → timestamp/timestamptz/interval/bytea cast/text_to_string_native.test.
 # Format + the `requires` gate: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.i16, types.i32, types.i64, types.decimal, types.boolean, types.text, cast.explicit, cast.operator, cast.string_literal, cast.runtime_text
 

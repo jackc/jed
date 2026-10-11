@@ -2082,11 +2082,12 @@ runtime path calls the identical `parse_int_literal` / `parse_decimal_literal` /
 `NaN` / `±Infinity` trap `22P02`, the same documented PG divergences as the literal form), the cast
 node's existing `operator_eval` charge meters it, and a malformed / out-of-range value traps
 `22P02` / `22003` **per row** during the scan rather than at plan time. The runtime text→`T` cast to
-the **string-native** targets lands per type: text→`date` has **landed** (the same rule — the
-literal's `parse_date` per row, `22007`/`22008`; STABLE and un-indexable, [date.md](date.md) §6);
-text→`timestamp` / `timestamptz` ([timezones.md](timezones.md) §9), text→`interval`
-([interval.md](interval.md) §6), and text→`bytea` ([types.md](types.md) §13) stay deferred `0A000`;
-text→`uuid` already landed (the uuid cast slice, [types.md](types.md) §14). A **bare** string still does **not**
+the **string-native** targets has landed by the same rule — each runs its literal's parser per row:
+text→`date` (`parse_date`, `22007`/`22008`; STABLE and un-indexable, [date.md](date.md) §6),
+text→`timestamp` / `timestamptz` (an offset-less `timestamptz` string read in the session zone —
+[timezones.md](timezones.md) §9.3), text→`interval` ([interval.md](interval.md) §6), and
+text→`bytea` (the `\x` hex input, `22P02`; immutable) — [types.md](types.md) §5 — and text→`uuid`
+(the uuid cast slice, [types.md](types.md) §14). A **bare** string still does **not**
 silently become a number/bool in a numeric context (`WHERE int_col = '42'` is `42804`, the strict
 rule — [types.md](types.md) §4): the type must be *named* for the string→number coercion to
 happen. So strictness is preserved; only the *explicit* spelling is admitted.
@@ -2131,10 +2132,9 @@ over unchanged:
   (`5 :: text` is `'5'`, identical to `CAST(5 AS text)`; a `timestamptz` renders in the session
   zone — [types.md](types.md) §5); `'5' :: text` is the string identity `'5'`. Casting **from**
   `text` reaches the numeric + boolean scalars at runtime (`s :: int`, `s :: numeric(10,2)`,
-  `s :: boolean`, the §36 runtime coercion), `uuid` (the uuid cast slice), and `date`;
-  text→`timestamp` / `timestamptz` / `interval` / `bytea` stay `0A000`, each its own follow-on.
-  Casting **to** `interval` (`interval` is a span, not a string-native scalar) stays `0A000` except
-  a string-literal operand;
+  `s :: boolean`, the §36 runtime coercion), `uuid` (the uuid cast slice), and the string-native
+  `date` / `timestamp` / `timestamptz` / `interval` / `bytea` ([types.md](types.md) §5). `iv ::
+  interval` is the identity; any other source to `interval` is `42804`;
 - the resolve codes `42704` (unknown type) / `22003` (out of range) / `22P02` (malformed string) /
   `22023` (bad typmod), and a **typmod on the type name** (`x :: numeric(10,2)`), exactly as CAST.
 
@@ -2758,7 +2758,8 @@ SELECT (tstz)::date                                          -- cross-family cas
   `date`→`timestamp` cast — [timezones.md §9.1](timezones.md)).
 - **Cross-family casts.** The `timestamp` / `timestamptz` / `date` cast matrix
   ([spec/types/casts.toml](../types/casts.toml), [timezones.md §9.3](timezones.md)); every cast crossing
-  the `timestamptz` boundary consults the session zone. The `text`↔datetime casts stay deferred.
+  the `timestamptz` boundary consults the session zone, as does the runtime `text → timestamptz` cast
+  for an offset-less string ([types.md](types.md) §5).
 - **Session zone & cost.** The session zone drives *computation*, not yet *rendering*
   ([timezones.md §9.5](timezones.md)). A zone consultation charges the `timezone` cost unit; the
   zone-free forms charge only `operator_eval`.

@@ -20,6 +20,12 @@
   ('3.14159'::text)::numeric(4,2)  AS text_to_numeric,
   ('yes'::text)::boolean           AS text_to_bool;`;
 
+	const textTemporalCastDemo = `SELECT
+  ('2024-01-15 10:30'::text)::timestamp        AS text_to_timestamp,
+  ('2024-01-15 10:30-05'::text)::timestamptz   AS with_offset,
+  ('1 day 2 hours'::text)::interval            AS text_to_interval,
+  ('\\x48656c6c6f'::text)::bytea               AS text_to_bytea;`;
+
 	const toTextDemo = `SELECT
   42::text                                      AS int_to_text,
   CAST(1.50 AS text)                            AS keeps_scale,
@@ -145,11 +151,30 @@ is trimmed, a leading sign is accepted, and a `boolean` follows PostgreSQL's spe
 
 The type must be **named** — a bare string never silently becomes a number, so `int_col = '42'` stays
 a type error (`42804`). jed uses its own literal grammar, so hex, digit underscores, and `NaN` are
-rejected (`22P02`) where PostgreSQL accepts them. A runtime `text` value also casts to **`date`**
-(the strict ISO form, `22007`/`22008` on a bad string) — but because a date string may name the
-current day (`'today'`), an index expression containing `::date` from text is rejected, exactly as
-in PostgreSQL. (Parsing a string into a `timestamp` /
-`interval` / `bytea` is a separate feature — use that type's literal form, e.g. `timestamp '2024-01-15 10:00'`.)
+rejected (`22P02`) where PostgreSQL accepts them. 
+
+## Parsing text into dates, times, intervals, and bytea
+
+A runtime `text` value also casts to **`date`**, **`timestamp`**, **`timestamptz`**, **`interval`**,
+and **`bytea`**, using the same input rules as that type's literal. A malformed date or time raises
+`22007` and an out-of-range field `22008`; a malformed `bytea` (only the `\x` hex form is accepted)
+raises `22P02`:
+
+<LiveSql query={textTemporalCastDemo} rows={1} />
+
+A `timestamp` ignores a trailing UTC offset. A `timestamptz` with an offset is that instant; one
+**without** an offset is read in the **session time zone**, as in PostgreSQL (the panel runs in
+`UTC`). Because the result can depend on the session or the current day (`'today'::date`), an index
+expression containing a text cast to `date`, `timestamp`, `timestamptz`, or `interval` is rejected
+(`42P17`), exactly as in PostgreSQL; `text → bytea` is fine in an index.
+
+A `timestamptz` *literal* such as `'2024-01-15 10:30'::timestamptz` still reads an offset-less string
+as UTC rather than in the session time zone, so in a non-UTC session it can differ from casting the
+same string held in a `text` column. Write the offset explicitly when it matters.
+
+jed's input grammars are stricter than PostgreSQL's, the same as for literals: the `'now'`, `'today'`,
+and `'epoch'` timestamp words, ISO-8601 (`P1D`) and SQL-standard interval input, and the `bytea`
+escape format are rejected.
 
 ## Casting to text
 
@@ -281,9 +306,8 @@ explicit zone:
 
 `date_part(field, source)` is the `double precision` twin of `EXTRACT` — same fields, but the field
 name is a runtime string, and over a `date` the timestamp fields exist (`date_part('hour', d)` is
-`0`), exactly as in PostgreSQL. (The `text → timestamp`/`timestamptz` casts are deferred — cast a
-string with the `timestamp '…'` literal form instead. A runtime `text` value **does** cast to
-`date`, and every datetime casts to `text` — a `timestamptz` in the session time zone.)
+`0`), exactly as in PostgreSQL. (A runtime `text` value casts to every datetime type, and every
+datetime casts to `text` — a `timestamptz` in the session time zone.)
 
 ### Date arithmetic
 

@@ -258,8 +258,8 @@ Two deliberate properties:
 The accepted grammar agrees with PostgreSQL and is oracle-checked
 (`suites/cast/text_to_date.test`); the jed-stricter rejections (DateStyle-dependent spellings,
 `:60`) are per-core tested, identical to the literal path. `text → timestamp`/`timestamptz` and
-`text → interval`/`bytea` stay deferred, each its own follow-on; `datetime → text` has landed with
-the any-scalar → text cast ([types.md](types.md) §5).
+`text → interval`/`bytea` have since landed the same way ([types.md](types.md) §5), and
+`datetime → text` with the any-scalar → text cast.
 
 ### Clock-relative literals — landed, as a STABLE node
 

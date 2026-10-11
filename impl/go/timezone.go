@@ -791,6 +791,14 @@ func localToInstantMicros(zr ZoneRef, wallMicros int64) int64 {
 	return wallMicros - chosen*1_000_000
 }
 
+// localToInstantMicrosChecked is localToInstantMicros for an unvalidated wall clock: ok = false
+// when the zone shift overflows int64 (the caller's range error).
+func localToInstantMicrosChecked(zr ZoneRef, wallMicros int64) (int64, bool) {
+	wallSecs := floorDiv(wallMicros, 1_000_000)
+	chosen := determineLocalOffset(zr, wallSecs)
+	return sub64(wallMicros, chosen*1_000_000)
+}
+
 // determineLocalOffset chooses the UT offset (seconds) to interpret a wall-clock wallSecs reading
 // with, matching PostgreSQL's DetermineTimeZoneOffset (src/timezone/pgtz.c) at a DST boundary. For a
 // normal time both candidate offsets agree; for a spring-forward GAP (a nonexistent wall clock) PG

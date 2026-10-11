@@ -7,8 +7,7 @@
 //   - EXTRACT(julian …) — jed defers the field (0A000); PG returns a value (timezones.md §9.2).
 //   - date_part('field', …) — jed has no such function (42883); PG returns double precision, deferred.
 //   - EXTRACT(field FROM ±infinity) — jed's decimal is finite-only, so 22003; PG returns ±Infinity.
-//   - a non-datetime / non-literal-text source to a datetime target — jed 0A000 (text→datetime is a
-//     valid PG cast; int→datetime is PG 42846).
+//   - a non-datetime, non-text source to a datetime target — jed 42804 (PG 42846).
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -51,14 +50,11 @@ test("EXTRACT over an infinite timestamp traps (22003 — jed decimal is finite)
   );
 });
 
-test("a non-datetime / non-literal-text source to a datetime target is deferred (0A000)", () => {
+test("a non-datetime, non-text source to a datetime target is forbidden (42804; PG 42846)", () => {
+  // Runtime text → datetime has landed (cast_text_string_native.test.ts).
   const db = dbWith([]);
   assert.equal(
     errCode(() => db.execute("SELECT CAST(1 + 1 AS timestamp)")),
-    "0A000",
-  );
-  assert.equal(
-    errCode(() => db.execute("SELECT CAST(current_setting('x.y', true) AS timestamptz)")),
-    "0A000",
+    "42804",
   );
 });

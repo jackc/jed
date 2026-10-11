@@ -195,8 +195,12 @@ exactly-representable `secs`).
   keyword literal names the type for context-free positions. With no interval context and no
   keyword, a string stays text.
 - **Casts** ([casts.toml](../types/casts.toml)): `interval → text` renders the `postgres`
-  IntervalStyle form above (the any-scalar → text cast, [types.md](types.md) §5). `CAST(x AS
-  interval)` and casting FROM interval to anything else are `0A000` / `42804` (a later cast slice).
+  IntervalStyle form above (the any-scalar → text cast, [types.md](types.md) §5). The runtime
+  `text → interval` cast (`CAST(s AS interval)` / `s::interval` on a non-literal text expression)
+  parses the per-row string with the same §3 parser, raising `22007`/`22008` per row; it is STABLE,
+  like PostgreSQL's `interval_in`, so an index expression containing it is `42P17`.
+  `CAST(interval AS interval)` is the identity and `$1::interval` types the parameter. Every other
+  cast into or out of interval is a forbidden pair (`42804`; PG `42846`).
 - **Keys.** interval **is** a key (method `interval-span-i128`, [encoding.md §2.10](encoding.md)):
   the 16-byte order-preserving encoding of the canonical 128-bit **span** (§2) — `int-be-signflip`
   at i128 width (bias `2^127`, big-endian). It is a valid `PRIMARY KEY` / ordered secondary index /

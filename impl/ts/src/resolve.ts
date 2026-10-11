@@ -1149,10 +1149,11 @@ export function resolve(
       // A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
       // (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32 / NULL
       // / bool source is castable), so it is handled AFTER the inner is resolved, below.
-      // A bytea TARGET: the uuid cast slice admits uuid → bytea (the 16 raw bytes — a jed cast PG
-      // lacks; casts.toml, types.md §14). A string LITERAL was coerced above; a NULL adapts; a bytea
-      // operand is the identity. text → bytea and every other bytea cast stay deferred (0A000 — the
-      // bytea cast slice's own follow-on, types.md §13).
+      // A bytea TARGET: runtime text → bytea decodes the per-row string with the literal's own bytea
+      // input (types.md §5/§13 — immutable, like PG's byteain), and the uuid cast slice admits uuid →
+      // bytea (the 16 raw bytes — a jed cast PG lacks; casts.toml, types.md §14). A string LITERAL
+      // was coerced above; a NULL adapts; a bytea operand is the identity. Any other source is a
+      // forbidden pair (42804).
       if (isBytea(target)) {
         if (e.inner.kind === "param") {
           const pinner = resolve(scope, e.inner, "bytea", ag, params);
@@ -1163,13 +1164,13 @@ export function resolve(
         if (ik === "null" || ik === "bytea") {
           return { node: inner.node, type: { kind: "bytea" } };
         }
-        if (ik === "uuid") {
+        if (ik === "text" || ik === "uuid") {
           return {
             node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
             type: { kind: "bytea" },
           };
         }
-        throw engineError("feature_not_supported", "casting to bytea is not supported yet");
+        throw typeError("cannot cast " + rtName(inner.type) + " to bytea");
       }
       // The uuid cast slice (spec/types/casts.toml, types.md §14): a uuid TARGET from a runtime text
       // or bytea expression. text → uuid runs uuid_in at eval (22P02 on malformed); bytea → uuid takes
@@ -1194,11 +1195,11 @@ export function resolve(
         }
         throw typeError("cannot cast " + rtName(inner.type) + " to uuid");
       }
-      // Cross-family datetime casts (timezones.md §9.3): a timestamp/timestamptz/date TARGET from
-      // another datetime family. A same-family cast is the identity; a cross-family cast becomes a
-      // dateConvert node (the zone-crossing ones read the session zone at eval); any non-datetime
-      // source is the deferred 0A000. A NULL operand adapts to the target. text↔datetime casts stay
-      // deferred and fall through (a non-datetime source is rejected here).
+      // Datetime casts (timezones.md §9.3, types.md §5): a timestamp/timestamptz/date TARGET from
+      // another datetime family or from runtime text. A same-family cast is the identity; a
+      // cross-family or text cast becomes a dateConvert node (the zone-crossing ones read the session
+      // zone at eval); any other source is a forbidden pair (42804). A NULL operand adapts to the
+      // target.
       if (isTimestamp(target) || isTimestamptz(target) || isDate(target)) {
         if (e.inner.kind === "param") {
           const pinner = resolve(scope, e.inner, target, ag, params);
@@ -1219,27 +1220,41 @@ export function resolve(
           params.nonimmutable ||= ik === "timestamptz" || isTimestamptz(target);
           return { node: { kind: "dateConvert", inner: inner.node, to: target }, type: toRt };
         }
-        if (ik === "text" && isDate(target)) {
-          // The runtime text → date cast (date.md §6): a NON-literal text source (a string
-          // LITERAL operand was already folded by the literal-adaptation path above) parses per
-          // row via the same parseDate the literal uses (22007/22008 per row). STABLE, not
-          // immutable — the input grammar admits the clock-relative specials — so it flags the
-          // plan non-immutable (42P17 in an index expression, as in PG). text → timestamp /
-          // timestamptz stays deferred (the throw below).
+        if (ik === "text") {
+          // The runtime text → date / timestamp / timestamptz casts (date.md §6, types.md §5): a
+          // NON-literal text source (a string LITERAL operand was already folded by the
+          // literal-adaptation path above) parses per row via the literal's own parser (22007/22008
+          // per row); text → timestamptz reads an offset-less string in the session zone. STABLE,
+          // not immutable — like PostgreSQL's date_in / timestamp_in / timestamptz_in — so it flags
+          // the plan non-immutable (42P17 in an index expression).
           params.nonimmutable = true;
           return { node: { kind: "dateConvert", inner: inner.node, to: target }, type: toRt };
         }
-        throw engineError(
-          "feature_not_supported",
-          `cannot cast ${rtName(inner.type)} to ${canonicalName(target)}`,
-        );
+        throw typeError(`cannot cast ${rtName(inner.type)} to ${canonicalName(target)}`);
       }
-      // interval casts are deferred (spec/design/interval.md): casting TO interval is 0A000.
+      // An interval TARGET (interval.md §6, types.md §5): runtime text → interval parses the per-row
+      // string with the literal's own parseInterval (22007/22008 per row) — STABLE, like PostgreSQL's
+      // interval_in, so it flags the plan non-immutable (42P17 in an index expression). An interval
+      // operand is the identity; $1::interval declares the param as interval; a NULL adapts. Any
+      // other source is a forbidden pair (42804).
       if (isInterval(target)) {
-        throw engineError(
-          "feature_not_supported",
-          "casting to an interval type is not supported yet",
-        );
+        if (e.inner.kind === "param") {
+          const pinner = resolve(scope, e.inner, "interval", ag, params);
+          return { node: pinner.node, type: { kind: "interval" } };
+        }
+        const inner = resolve(scope, e.inner, null, ag, params);
+        const ik = inner.type.kind;
+        if (ik === "null" || ik === "interval") {
+          return { node: inner.node, type: { kind: "interval" } };
+        }
+        if (ik === "text") {
+          params.nonimmutable = true;
+          return {
+            node: { kind: "cast", target, typmod, varcharLen: null, operand: inner.node },
+            type: { kind: "interval" },
+          };
+        }
+        throw typeError("cannot cast " + rtName(inner.type) + " to interval");
       }
       // The JSON cast matrix (spec/design/json.md §6.1): casting TO json/jsonb from a runtime
       // text/json/jsonb expression (a string LITERAL operand was already coerced above by

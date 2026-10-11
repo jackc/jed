@@ -208,14 +208,83 @@ func readFrac(b string, i *int) (int64, error) {
 // (applyOffset) a trailing offset normalizes the wall clock to UTC; for timestamp an offset is
 // parsed/validated but ignored (PG behavior). typeName is used only for error messages.
 func parseDatetime(input string, applyOffset bool, typeName string) (int64, error) {
+	w, err := parseDatetimeWall(input, typeName)
+	if err != nil {
+		return 0, err
+	}
+	if w.infinite {
+		return w.micros, nil
+	}
+	if applyOffset && w.hasOffset {
+		return applyUTCOffset(w.micros, w.offsetSecs)
+	}
+	return finiteInstant(w.micros)
+}
+
+// datetimeWall is a parsed datetime string: a ±infinity sentinel (infinite), or a finite wall
+// clock (µs since the epoch, not yet checked against the sentinels) with its explicit trailing
+// offset in seconds when hasOffset.
+type datetimeWall struct {
+	micros     int64
+	offsetSecs int64
+	hasOffset  bool
+	infinite   bool
+}
+
+// finiteInstant rejects a finite instant landing on a ±infinity sentinel (22008).
+func finiteInstant(micros int64) (int64, error) {
+	if micros == negInfinity || micros == posInfinity {
+		return 0, datetimeFieldOverflow("value out of range")
+	}
+	return micros, nil
+}
+
+// applyUTCOffset normalizes a finite wall clock carrying offsetSecs to its UTC instant. Any
+// overflow, or a result landing on a ±infinity sentinel, is a 22008 range error.
+func applyUTCOffset(wall, offsetSecs int64) (int64, error) {
+	off, ok := mul64(offsetSecs, microsPerSec)
+	if !ok {
+		return 0, datetimeFieldOverflow("value out of range")
+	}
+	micros, ok := sub64(wall, off)
+	if !ok {
+		return 0, datetimeFieldOverflow("value out of range")
+	}
+	return finiteInstant(micros)
+}
+
+// parseTimestamptzInput parses a timestamptz input for the runtime text → timestamptz cast
+// (types.md §5): an explicit offset (or ±infinity) yields the instant (local = false), while an
+// offset-less wall clock is returned with local = true for the caller to interpret in the session
+// zone, as PostgreSQL's timestamptz_in does. (The literal path, parseTimestamptz, still reads it
+// as UTC.) A local wall clock is not yet checked against the sentinels.
+func parseTimestamptzInput(s string) (micros int64, local bool, err error) {
+	w, err := parseDatetimeWall(s, "timestamptz")
+	if err != nil {
+		return 0, false, err
+	}
+	switch {
+	case w.infinite:
+		return w.micros, false, nil
+	case w.hasOffset:
+		mc, err := applyUTCOffset(w.micros, w.offsetSecs)
+		return mc, false, err
+	default:
+		return w.micros, true, nil
+	}
+}
+
+// parseDatetimeWall parses a datetime string to its datetimeWall reading. Shared by every
+// timestamp/timestamptz input path; typeName is used only for error messages.
+func parseDatetimeWall(input string, typeName string) (datetimeWall, error) {
 	s := trimASCIIWS(input)
 	low := strings.ToLower(s)
 
 	switch low {
 	case "infinity", "+infinity":
-		return posInfinity, nil
+		return datetimeWall{micros: posInfinity, infinite: true}, nil
 	case "-infinity":
-		return negInfinity, nil
+		return datetimeWall{micros: negInfinity, infinite: true}, nil
 	}
 
 	bc := false
@@ -230,21 +299,21 @@ func parseDatetime(input string, applyOffset bool, typeName string) (int64, erro
 	i := 0
 	year, err := readUint(body, &i)
 	if err != nil {
-		return 0, err
+		return datetimeWall{}, err
 	}
 	if err := expectByte(body, &i, '-'); err != nil {
-		return 0, err
+		return datetimeWall{}, err
 	}
 	month, err := readUint(body, &i)
 	if err != nil {
-		return 0, err
+		return datetimeWall{}, err
 	}
 	if err := expectByte(body, &i, '-'); err != nil {
-		return 0, err
+		return datetimeWall{}, err
 	}
 	day, err := readUint(body, &i)
 	if err != nil {
-		return 0, err
+		return datetimeWall{}, err
 	}
 
 	bad := invalidDatetime("invalid input syntax for type " + typeName)
@@ -253,33 +322,35 @@ func parseDatetime(input string, applyOffset bool, typeName string) (int64, erro
 	if i < len(body) && (body[i] == ' ' || body[i] == 'T' || body[i] == 't') {
 		i++
 		if hour, err = readUint(body, &i); err != nil {
-			return 0, err
+			return datetimeWall{}, err
 		}
 		if err = expectByte(body, &i, ':'); err != nil {
-			return 0, err
+			return datetimeWall{}, err
 		}
 		if minute, err = readUint(body, &i); err != nil {
-			return 0, err
+			return datetimeWall{}, err
 		}
 		if i < len(body) && body[i] == ':' {
 			i++
 			if second, err = readUint(body, &i); err != nil {
-				return 0, err
+				return datetimeWall{}, err
 			}
 			if i < len(body) && body[i] == '.' {
 				i++
 				if micro, err = readFrac(body, &i); err != nil {
-					return 0, err
+					return datetimeWall{}, err
 				}
 			}
 		}
 	}
 
 	var offsetSecs int64
+	hasOffset := false
 	if i < len(body) {
 		switch body[i] {
 		case 'Z', 'z':
 			i++
+			hasOffset = true
 		case '+', '-':
 			sign := int64(1)
 			if body[i] == '-' {
@@ -288,55 +359,56 @@ func parseDatetime(input string, applyOffset bool, typeName string) (int64, erro
 			i++
 			oh, err := readUint(body, &i)
 			if err != nil {
-				return 0, err
+				return datetimeWall{}, err
 			}
 			var om, os int64
 			if i < len(body) && body[i] == ':' {
 				i++
 				if om, err = readUint(body, &i); err != nil {
-					return 0, err
+					return datetimeWall{}, err
 				}
 				if i < len(body) && body[i] == ':' {
 					i++
 					if os, err = readUint(body, &i); err != nil {
-						return 0, err
+						return datetimeWall{}, err
 					}
 				}
 			}
 			if oh > 15 || om > 59 || os > 59 {
-				return 0, datetimeFieldOverflow("time zone offset out of range")
+				return datetimeWall{}, datetimeFieldOverflow("time zone offset out of range")
 			}
 			offsetSecs = sign * (oh*3600 + om*60 + os)
+			hasOffset = true
 		default:
-			return 0, bad
+			return datetimeWall{}, bad
 		}
 	}
 	if i != len(body) {
-		return 0, bad
+		return datetimeWall{}, bad
 	}
 
 	if year < 1 || year > 999_999 {
-		return 0, datetimeFieldOverflow("year out of range")
+		return datetimeWall{}, datetimeFieldOverflow("year out of range")
 	}
 	if month < 1 || month > 12 {
-		return 0, datetimeFieldOverflow("month out of range")
+		return datetimeWall{}, datetimeFieldOverflow("month out of range")
 	}
 	astro := year
 	if bc {
 		astro = 1 - year
 	}
 	if day < 1 || day > daysInMonth(astro, month) {
-		return 0, datetimeFieldOverflow("day out of range for month")
+		return datetimeWall{}, datetimeFieldOverflow("day out of range for month")
 	}
 	extraDay := hour == 24 && minute == 0 && second == 0 && micro == 0
 	if hour > 23 && !extraDay {
-		return 0, datetimeFieldOverflow("hour out of range")
+		return datetimeWall{}, datetimeFieldOverflow("hour out of range")
 	}
 	if minute > 59 {
-		return 0, datetimeFieldOverflow("minute out of range")
+		return datetimeWall{}, datetimeFieldOverflow("minute out of range")
 	}
 	if second > 59 {
-		return 0, datetimeFieldOverflow("second out of range")
+		return datetimeWall{}, datetimeFieldOverflow("second out of range")
 	}
 	hourPart := hour
 	if extraDay {
@@ -349,26 +421,13 @@ func parseDatetime(input string, applyOffset bool, typeName string) (int64, erro
 	}
 	micros, ok := mulAdd(days, secsPerDay, hourPart*3600+minute*60+second)
 	if !ok {
-		return 0, datetimeFieldOverflow("value out of range")
+		return datetimeWall{}, datetimeFieldOverflow("value out of range")
 	}
 	micros, ok = mulAdd(micros, microsPerSec, micro)
 	if !ok {
-		return 0, datetimeFieldOverflow("value out of range")
+		return datetimeWall{}, datetimeFieldOverflow("value out of range")
 	}
-	if applyOffset {
-		off, ok2 := mul64(offsetSecs, microsPerSec)
-		if !ok2 {
-			return 0, datetimeFieldOverflow("value out of range")
-		}
-		micros, ok = sub64(micros, off)
-		if !ok {
-			return 0, datetimeFieldOverflow("value out of range")
-		}
-	}
-	if micros == negInfinity || micros == posInfinity {
-		return 0, datetimeFieldOverflow("value out of range")
-	}
-	return micros, nil
+	return datetimeWall{micros: micros, offsetSecs: offsetSecs, hasOffset: hasOffset}, nil
 }
 
 // mulAdd computes a*b + c with i64 overflow detection.

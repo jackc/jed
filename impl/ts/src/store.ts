@@ -58,7 +58,14 @@ import {
   decodeByteaLiteral,
   decodeUuidLiteral,
 } from "./executor.ts";
-import { NEG_INFINITY, POS_INFINITY, parseTimestamp, parseTimestamptz } from "./timestamp.ts";
+import {
+  NEG_INFINITY,
+  POS_INFINITY,
+  finiteInstant,
+  parseTimestamp,
+  parseTimestamptz,
+  parseTimestamptzInput,
+} from "./timestamp.ts";
 import { DATE_NEG_INFINITY, DATE_POS_INFINITY, dateClockSpecial, parseDate } from "./date.ts";
 import { parseInterval, tsShift } from "./interval.ts";
 import { jsonbIn, jsonbOut, validateJson } from "./json.ts";
@@ -669,11 +676,11 @@ export function evalDateArith(op: BinaryOp, a: Value, b: Value, result: ScalarTy
   return dateValue(shifted);
 }
 
-// evalDateConvert evaluates a cross-family datetime cast (timezones.md §9.3) — or the runtime
-// text → date cast (date.md §6) — of the non-NULL value v to `to` (timestamp/timestamptz/date).
-// The casts crossing the timestamptz boundary consult the session zone (charging timezone); the
-// others are zone-free. ±infinity maps to the target's own sentinel. The (source, to) pair is
-// guaranteed by the resolver: cross-family datetime, or text → date.
+// evalDateConvert evaluates a cross-family datetime cast (timezones.md §9.3) — or a runtime
+// text → datetime cast (date.md §6, types.md §5) — of the non-NULL value v to `to`
+// (timestamp/timestamptz/date). The casts crossing the timestamptz boundary consult the session
+// zone (charging timezone); the others are zone-free. ±infinity maps to the target's own sentinel.
+// The (source, to) pair is guaranteed by the resolver: cross-family datetime, or text → datetime.
 export function evalDateConvert(v: Value, to: ScalarType, env: EvalEnv, m: Meter): Value {
   const MICROS_PER_DAY = 86_400n * 1_000_000n;
   const microsToDate = (mc: bigint): Value => {
@@ -707,6 +714,17 @@ export function evalDateConvert(v: Value, to: ScalarType, env: EvalEnv, m: Meter
     }
     return dateValue(parseDate(v.text));
   }
+  // text → timestamp (types.md §5): the literal's parseTimestamp per row — an offset is validated
+  // and ignored; 22007 malformed / 22008 out of range. Zone-free.
+  if (v.kind === "text" && to === "timestamp") return timestampValue(parseTimestamp(v.text));
+  // text → timestamptz (types.md §5): an explicit offset (or ±infinity) fixes the instant; an
+  // offset-less wall clock is read in the SESSION zone, as PostgreSQL's timestamptz_in does
+  // (charging timezone; DST gap/overlap as the timestamp → timestamptz cast).
+  if (v.kind === "text" && to === "timestamptz") {
+    const parsed = parseTimestamptzInput(v.text);
+    if (!parsed.local) return timestamptzValue(parsed.micros);
+    return timestamptzValue(finiteInstant(localToInstantMicros(zoneCharge(), parsed.micros)));
+  }
   if (v.kind === "timestamp" && to === "date") return microsToDate(v.micros);
   if (v.kind === "date" && to === "timestamp") return timestampValue(dateToMicros(v.days));
   if (v.kind === "timestamptz" && to === "timestamp") {
@@ -727,7 +745,7 @@ export function evalDateConvert(v: Value, to: ScalarType, env: EvalEnv, m: Meter
     return timestamptzValue(localToInstantMicros(zoneCharge(), mid));
   }
   throw new Error(
-    "unreachable: resolver restricts dateConvert to cross-family datetime casts and text → date",
+    "unreachable: resolver restricts dateConvert to cross-family datetime casts and text → datetime",
   );
 }
 

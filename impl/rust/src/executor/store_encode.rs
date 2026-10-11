@@ -871,11 +871,11 @@ pub(crate) fn rexpr_const_to_value(node: &RExpr) -> Result<Value> {
     })
 }
 
-/// Evaluate a cross-family datetime cast (timezones.md §9.3) — or the runtime text → date cast
-/// (date.md §6) — of the non-NULL value `v` to `to` (`Timestamp`/`Timestamptz`/`Date`). The casts
-/// crossing the `timestamptz` boundary consult the session zone (charging `timezone`); the others
-/// are zone-free. `±infinity` maps to the target's own sentinel. The `(source, to)` pair is
-/// guaranteed by the resolver: cross-family datetime, or text → date.
+/// Evaluate a cross-family datetime cast (timezones.md §9.3) — or a runtime text → datetime cast
+/// (date.md §6, types.md §5) — of the non-NULL value `v` to `to` (`Timestamp`/`Timestamptz`/`Date`).
+/// The casts crossing the `timestamptz` boundary consult the session zone (charging `timezone`);
+/// the others are zone-free. `±infinity` maps to the target's own sentinel. The `(source, to)` pair
+/// is guaranteed by the resolver: cross-family datetime, or text → datetime.
 pub(crate) fn eval_date_convert(
     v: Value,
     to: ScalarType,
@@ -919,6 +919,30 @@ pub(crate) fn eval_date_convert(
                 return date_clock_value(env.exec, env.rng, m, offset_days);
             }
             Ok(Value::Date(crate::date::parse_date(&s)?))
+        }
+        // text -> timestamp (types.md §5): the literal's parse_timestamp per row — an offset is
+        // validated and ignored; 22007 malformed / 22008 out of range. Zone-free.
+        (Value::Text(s), ScalarType::Timestamp) => {
+            Ok(Value::Timestamp(crate::timestamp::parse_timestamp(&s)?))
+        }
+        // text -> timestamptz (types.md §5): an explicit offset (or ±infinity) fixes the instant;
+        // an offset-less wall clock is read in the SESSION zone, as PostgreSQL's timestamptz_in
+        // does (charging timezone; DST gap/overlap as the timestamp -> timestamptz cast).
+        (Value::Text(s), ScalarType::Timestamptz) => {
+            use crate::timestamp::TimestamptzInput;
+            match crate::timestamp::parse_timestamptz_input(&s)? {
+                TimestamptzInput::Instant(mc) => Ok(Value::Timestamptz(mc)),
+                TimestamptzInput::Local(wall) => {
+                    let zr = env.exec.session.time_zone.clone();
+                    m.charge(COSTS.timezone);
+                    m.guard()?;
+                    let mc = crate::timezone::local_to_instant_micros_checked(&zr, wall)
+                        .ok_or_else(|| {
+                            crate::timestamp::field_overflow("timestamp out of range")
+                        })?;
+                    Ok(Value::Timestamptz(crate::timestamp::finite_instant(mc)?))
+                }
+            }
         }
         // timestamp -> date (zone-free): the date part.
         (Value::Timestamp(mc), ScalarType::Date) => Ok(micros_to_date(mc)),
@@ -974,7 +998,7 @@ pub(crate) fn eval_date_convert(
             ))
         }
         _ => unreachable!(
-            "resolver restricts DateConvert to cross-family datetime casts and text → date"
+            "resolver restricts DateConvert to cross-family datetime casts and text → datetime"
         ),
     }
 }

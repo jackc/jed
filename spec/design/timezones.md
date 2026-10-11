@@ -64,7 +64,8 @@ What it deliberately does **not** add: any change to how `timestamptz` is *store
 the `text`↔datetime casts, `make_timestamptz`, `to_char`/`to_timestamp`, and `date_part` (§9, the
 deferred remainder); and the **session-zone rendering** of a `timestamptz` to text — the session zone
 drives *computation* this slice, not *output formatting* (§9.5). Those land later, each oracle-checked
-against PostgreSQL (the `timestamptz → text` cast has since landed — §9.5).
+against PostgreSQL (the `timestamptz → text` cast and the runtime `text`→datetime casts have since
+landed — §9.5, §9.3).
 
 ## 2. The representation — `timestamptz` is UTC, and that buys structural immunity
 
@@ -262,7 +263,7 @@ derive*, not to *read a stored value*:
 |---|---|---|
 | `timestamptz` stored value / comparison / plain index | **No** | UTC `i64`; tz-free (§2). The common case. |
 | `AT TIME ZONE` in a query expression | the query reads it | Pure over the instant + loaded bytes; affects the *computed result*, never stored bytes or order. |
-| Parse a `timestamptz` literal in a zone (future) | — (write path) | One-time at INSERT; result is frozen UTC. |
+| Parse an offset-less `timestamptz` string in the session zone (the runtime `text` cast, §9.3; the literal is a follow-on) | — (write path) | The result is a UTC instant; STABLE, so never a persisted index key. |
 | Render a `timestamptz` as `text` in the session zone (the `::text` cast, §9.5) | the query reads it | Affects the computed text, never stored bytes or order; STABLE, so never a persisted index key. |
 | `tz`-dependent **expression DEFAULT** ([constraints.md §2](constraints.md)) | **No** | Evaluated once at INSERT, frozen as a stored value; a plain index over that value stays consistent. **Not exposed.** |
 | `tz`-dependent **functional index key** (future) | **No** for the base heap-scan; **yes** for index-accelerated lookup | The exposed case — §8. |
@@ -326,15 +327,14 @@ exactly as PostgreSQL does. Each is oracle-checked against `postgres:18` (CLAUDE
 **Already built** (clock seam, [entropy.md §5](entropy.md)): `now()` / `current_timestamp` (STABLE),
 `clock_timestamp()` (VOLATILE) → `timestamptz`.
 
-**Still deferred** (each oracle-checked against PG when it lands, CLAUDE.md §7): the `text`↔datetime
-casts for `timestamp`/`timestamptz` — the runtime **`text → date`** cast has since **landed**
-([date.md §6](date.md): the literal's `parse_date` per row, STABLE and un-indexable `42P17`), and so
-has **`date_part`** (§9.2 — `float` landed and unblocked its `double precision` result) —
-and `to_char` / `to_timestamp` (a parsing/formatting surface, a different axis from "in a zone"),
+**Still deferred** (each oracle-checked against PG when it lands, CLAUDE.md §7): reading an
+offset-less `timestamptz` **string literal** in the session zone (§9.3 — the runtime cast already
+does), `to_char` / `to_timestamp` (a parsing/formatting surface, a different axis from "in a zone"),
 `age`, and the
 session-zone rendering of a `timestamptz` **result cell** (§9.5 — the explicit `timestamptz → text`
-cast itself has landed and renders in the session zone). (`make_timestamptz` also landed —
-the make_timestamp slice, [functions.md §11](functions.md).) All remain
+cast itself has landed and renders in the session zone). The runtime `text → date` /
+`timestamp` / `timestamptz` casts ([date.md §6](date.md), §9.3), **`date_part`** (§9.2), and
+`make_timestamptz` (the make_timestamp slice, [functions.md §11](functions.md)) have landed. All remain
 **pure given the tz seam** (CLAUDE.md §13) — they read only the loaded tz data + the instant, never host
 state — so they stay inside the untrusted-query safety guarantee. The IMMUTABLE-vs-STABLE label of each
 is the §8 indexability decision, made when expression indexes land.
@@ -418,9 +418,19 @@ the others are zone-free:
 
 These reuse the §5 reader kernels (`instant_to_local_micros` / `local_to_instant_micros`) with the
 session zone, so they inherit `AT TIME ZONE`'s oracle-clean DST behavior. A session-zone-consulting cast
-charges the `timezone` unit. The **`text`↔datetime** casts stay deferred for `timestamp`/`timestamptz`
-(§9, above); the runtime **`text → date`** cast has landed ([date.md §6](date.md)). A string *literal*
-still adapts to a datetime context (`'2024-01-01'::timestamp`) by literal adaptation, unchanged.
+charges the `timezone` unit.
+
+The runtime **`text` → datetime** casts on a non-literal text expression have landed: `text → date`
+([date.md §6](date.md)), and `text → timestamp` / `timestamptz` ([types.md](types.md) §5), each running
+its literal's parser per row (`22007`/`22008`). `text → timestamp` ignores an offset. **`text →
+timestamptz` reads an offset-less string in the session zone** — the wall clock goes through
+`local_to_instant_micros` exactly like `timestamp → timestamptz` (same DST gap/overlap choice, one
+`timezone` unit; a shift past `i64` is `22008`) — while an explicit offset or `±infinity` fixes the
+instant with no zone consult. All three are STABLE (PG's `*_in` are), so `42P17` in an index expression.
+A string *literal* still adapts to a datetime context (`'2024-01-01'::timestamp`) by literal
+adaptation, folded at resolve; for `timestamptz` that fold still reads an offset-less string as **UTC**,
+not the session zone — a PostgreSQL divergence in a non-UTC session, and a follow-on (moving the fold
+to an eval-time node, like the clock-relative date literal).
 
 ### 9.4 Where the session zone is read — eval, not render
 
@@ -553,8 +563,9 @@ the tz database, the load seam, the TZif reader, `AT TIME ZONE`, and the convers
   merge step (§4).
 - **Plumbing + consumers.** Slice 1 shipped `AT TIME ZONE` (both directions, §6); Slice 2 shipped
   `date_trunc` / `EXTRACT` / the cross-family casts (§9); the runtime `text → date` cast and
-  `date_part` (§9.2) have since landed ([date.md §6](date.md)). Still deferred:
-  `text → timestamp`/`timestamptz` casts, `to_char`, `age`, and session-zone rendering of result
+  `date_part` (§9.2) have since landed ([date.md §6](date.md)), and so have the runtime
+  `text → timestamp`/`timestamptz` casts (§9.3). Still deferred: reading an offset-less `timestamptz`
+  string literal in the session zone (§9.3), `to_char`, `age`, and session-zone rendering of result
   cells (§9, §9.5 — the explicit `timestamptz → text` cast has landed and renders in the session zone).
   (`make_timestamptz` landed with the make_timestamp slice — [functions.md §11](functions.md).)
 - **Persisted dependencies.** Format 32 adds per-index timezone pins for derived keys and partial

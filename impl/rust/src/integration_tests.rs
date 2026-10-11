@@ -41,6 +41,8 @@ mod cast_scalar_text;
 mod cast_text_date;
 #[path = "../tests/cast_text_runtime.rs"]
 mod cast_text_runtime;
+#[path = "../tests/cast_text_string_native.rs"]
+mod cast_text_string_native;
 #[path = "../tests/cast_uuid.rs"]
 mod cast_uuid;
 #[path = "../tests/check_constraint.rs"]

@@ -166,11 +166,51 @@ export function readFrac(b: string, cur: Cur): bigint {
 }
 
 function parseDatetime(input: string, applyOffset: boolean, typeName: string): bigint {
+  const w = parseDatetimeWall(input, typeName);
+  if (w.infinite) return w.micros;
+  const micros =
+    applyOffset && w.offsetSecs !== null ? w.micros - w.offsetSecs * MICROS_PER_SEC : w.micros;
+  return finiteInstant(micros);
+}
+
+// A parsed datetime string: a ±infinity sentinel (infinite), or a finite wall clock (µs since the
+// epoch, not yet range-checked) with its explicit trailing offset in seconds, null when the text
+// carries none.
+type DatetimeWall = { micros: bigint; offsetSecs: bigint | null; infinite: boolean };
+
+// finiteInstant range-checks a composed instant against i64, rejecting the ±infinity sentinels
+// (22008).
+export function finiteInstant(micros: bigint): bigint {
+  if (micros < NEG_INFINITY || micros > POS_INFINITY) throw fieldOverflow("value out of range");
+  if (micros === NEG_INFINITY || micros === POS_INFINITY) throw fieldOverflow("value out of range");
+  return micros;
+}
+
+// parseTimestamptzInput parses a timestamptz input for the runtime text → timestamptz cast
+// (types.md §5): an explicit offset (or ±infinity) yields the instant (local = false), while an
+// offset-less wall clock is returned with local = true for the caller to interpret in the session
+// zone, as PostgreSQL's timestamptz_in does. (The literal path, parseTimestamptz, still reads it
+// as UTC.) A local wall clock is range-checked but may still be shifted onto a sentinel.
+export function parseTimestamptzInput(s: string): { micros: bigint; local: boolean } {
+  const w = parseDatetimeWall(s, "timestamptz");
+  if (w.infinite) return { micros: w.micros, local: false };
+  if (w.offsetSecs !== null) {
+    return { micros: finiteInstant(w.micros - w.offsetSecs * MICROS_PER_SEC), local: false };
+  }
+  if (w.micros < NEG_INFINITY || w.micros > POS_INFINITY) throw fieldOverflow("value out of range");
+  return { micros: w.micros, local: true };
+}
+
+// parseDatetimeWall parses a datetime string to its DatetimeWall reading. Shared by every
+// timestamp/timestamptz input path; typeName is used only for error messages.
+function parseDatetimeWall(input: string, typeName: string): DatetimeWall {
   const s = trimASCIIWS(input);
   const low = s.toLowerCase();
 
-  if (low === "infinity" || low === "+infinity") return POS_INFINITY;
-  if (low === "-infinity") return NEG_INFINITY;
+  if (low === "infinity" || low === "+infinity") {
+    return { micros: POS_INFINITY, offsetSecs: null, infinite: true };
+  }
+  if (low === "-infinity") return { micros: NEG_INFINITY, offsetSecs: null, infinite: true };
 
   let bc = false;
   let body = s;
@@ -209,11 +249,12 @@ function parseDatetime(input: string, applyOffset: boolean, typeName: string): b
     }
   }
 
-  let offsetSecs = 0n;
+  let offsetSecs: bigint | null = null;
   if (cur.i < body.length) {
     const ch = body[cur.i];
     if (ch === "Z" || ch === "z") {
       cur.i++;
+      offsetSecs = 0n;
     } else if (ch === "+" || ch === "-") {
       const sign = ch === "-" ? -1n : 1n;
       cur.i++;
@@ -252,10 +293,7 @@ function parseDatetime(input: string, applyOffset: boolean, typeName: string): b
   // bigint is arbitrary-precision; range-check against i64 explicitly after composing.
   let micros = days * SECS_PER_DAY + (hourPart * 3600n + minute * 60n + second);
   micros = micros * MICROS_PER_SEC + micro;
-  if (applyOffset) micros -= offsetSecs * MICROS_PER_SEC;
-  if (micros < NEG_INFINITY || micros > POS_INFINITY) throw fieldOverflow("value out of range");
-  if (micros === NEG_INFINITY || micros === POS_INFINITY) throw fieldOverflow("value out of range");
-  return micros;
+  return { micros, offsetSecs, infinite: false };
 }
 
 // parseTimestamp parses a timestamp (zoneless) literal: an offset in the text is accepted and
