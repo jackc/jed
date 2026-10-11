@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -780,8 +780,8 @@ func (a *acc) finalizeOrderedSet() (Value, error) {
 		})
 	case planPercentileCont:
 		fs := a.osaFloats
-		sort.SliceStable(fs, func(i, j int) bool {
-			return dirCmp(floatTotalCmp(fs[i], fs[j]), desc) < 0
+		slices.SortStableFunc(fs, func(a, b float64) int {
+			return dirCmp(floatTotalCmp(a, b), desc)
 		})
 		return finalizePercentile(a.osaFrac, len(fs) == 0, func(p float64) (Value, error) {
 			return Float64Value(percentileContAt(fs, p)), nil
@@ -1037,8 +1037,8 @@ func dirCmp(c int, desc bool) int {
 // the result is deterministic and cross-core identical.
 func sortOsaVals(vals []Value, collation *Collation, desc bool) error {
 	if collation == nil {
-		sort.SliceStable(vals, func(i, j int) bool {
-			return dirCmp(valueCmp(vals[i], vals[j]), desc) < 0
+		slices.SortStableFunc(vals, func(a, b Value) int {
+			return dirCmp(valueCmp(a, b), desc)
 		})
 		return nil
 	}
@@ -1060,8 +1060,8 @@ func sortOsaVals(vals []Value, collation *Collation, desc bool) error {
 		}
 		d[i] = deco{key: sk, val: v}
 	}
-	sort.SliceStable(d, func(i, j int) bool {
-		return dirCmp(bytes.Compare(d[i].key, d[j].key), desc) < 0
+	slices.SortStableFunc(d, func(a, b deco) int {
+		return dirCmp(bytes.Compare(a.key, b.key), desc)
 	})
 	for i := range d {
 		vals[i] = d[i].val

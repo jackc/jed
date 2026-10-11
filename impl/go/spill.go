@@ -17,7 +17,7 @@ import (
 	"encoding/binary"
 	"io"
 	"os"
-	"sort"
+	"slices"
 )
 
 // DefaultWorkMem is the default work-memory budget, in bytes (256 MiB) — the OpenOptions.WorkMem
@@ -35,7 +35,7 @@ func rowBytes(row storedRow) int {
 }
 
 // cmpRows is the stable comparator over the ORDER BY keys: the first non-equal key decides; a full
-// tie is 0 (the SliceStable keeps input order — spill.md §6).
+// tie is 0 (the stable sort keeps input order — spill.md §6).
 func cmpRows(keys []orderSlot, a, b storedRow) int {
 	for _, k := range keys {
 		if c := keyCmp(a[k.idx], b[k.idx], k.descending, k.nullsFirst); c != 0 {
@@ -103,7 +103,7 @@ func (s *sorter) push(row storedRow) error {
 }
 
 func (s *sorter) sortBuf() {
-	sort.SliceStable(s.buf, func(i, j int) bool { return cmpRows(s.keys, s.buf[i], s.buf[j]) < 0 })
+	slices.SortStableFunc(s.buf, func(a, b storedRow) int { return cmpRows(s.keys, a, b) })
 }
 
 // spillRun stable-sorts the in-memory buffer and writes it as one sorted run file, then clears it.

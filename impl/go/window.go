@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"math/big"
 	"slices"
-	"sort"
 	"strings"
 )
 
@@ -51,7 +50,7 @@ func sortRows[R ~[]Value](rows []R, order []orderSlot) error {
 			return sortRowsCollated(rows, order)
 		}
 	}
-	sort.SliceStable(rows, func(a, b int) bool { return cmpRowsByOrder(rows[a], rows[b], order) < 0 })
+	slices.SortStableFunc(rows, func(a, b R) int { return cmpRowsByOrder(a, b, order) })
 	return nil
 }
 
@@ -555,12 +554,12 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 		if err != nil {
 			return err
 		}
-		// Sort each partition by the shared window ORDER BY. SliceStable keeps a full tie at
+		// Sort each partition by the shared window ORDER BY. The stable sort keeps a full tie at
 		// ascending original index = PK scan order (the §3 PK tie-break).
 		if len(rep.order) > 0 {
 			for _, part := range partitions {
-				sort.SliceStable(part, func(a, b int) bool {
-					return cmpWindowRows(part[a], part[b], rows, rep.order, collKeys) < 0
+				slices.SortStableFunc(part, func(a, b int) int {
+					return cmpWindowRows(a, b, rows, rep.order, collKeys)
 				})
 			}
 		}
@@ -1185,8 +1184,8 @@ func sortRowsCollated[R ~[]Value](rows []R, order []orderSlot) error {
 		}
 		d[i] = deco{keys: keys, row: row}
 	}
-	sort.SliceStable(d, func(a, b int) bool {
-		return cmpDecorated(d[a].keys, d[a].row, d[b].keys, d[b].row, order) < 0
+	slices.SortStableFunc(d, func(a, b deco) int {
+		return cmpDecorated(a.keys, a.row, b.keys, b.row, order)
 	})
 	for i := range d {
 		rows[i] = d[i].row

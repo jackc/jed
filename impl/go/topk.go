@@ -6,7 +6,7 @@ package jed
 
 import (
 	"container/heap"
-	"sort"
+	"slices"
 )
 
 type topKItem struct {
@@ -109,8 +109,9 @@ func (t *topKKeeper) push(row storedRow) error {
 
 func (t *topKKeeper) finish() []storedRow {
 	items := t.selection.items
-	sort.Slice(items, func(i, j int) bool {
-		return compareTopKItems(items[i], items[j], t.selection.order, t.collated) < 0
+	// compareTopKItems is a total order (pos breaks every tie), so an unstable sort is exact.
+	slices.SortFunc(items, func(a, b topKItem) int {
+		return compareTopKItems(a, b, t.selection.order, t.collated)
 	})
 	rows := make([]storedRow, len(items))
 	for i := range items {
