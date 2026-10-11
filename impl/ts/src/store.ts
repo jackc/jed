@@ -61,7 +61,6 @@ import {
 import {
   NEG_INFINITY,
   POS_INFINITY,
-  finiteInstant,
   parseTimestamp,
   parseTimestamptz,
   parseTimestamptzInput,
@@ -701,11 +700,6 @@ export function evalDateConvert(v: Value, to: ScalarType, env: EvalEnv, m: Meter
     const days = mc >= 0n ? mc / MICROS_PER_DAY : -((-mc + (MICROS_PER_DAY - 1n)) / MICROS_PER_DAY);
     return dateValue(days);
   };
-  const dateToMicros = (d: bigint): bigint => {
-    if (d === DATE_POS_INFINITY) return POS_INFINITY;
-    if (d === DATE_NEG_INFINITY) return NEG_INFINITY;
-    return d * MICROS_PER_DAY;
-  };
   const isInf = (mc: bigint): boolean => mc === POS_INFINITY || mc === NEG_INFINITY;
   const zoneCharge = (): ZoneRef => {
     const zr = env.exec.session.timeZone;
@@ -735,10 +729,11 @@ export function evalDateConvert(v: Value, to: ScalarType, env: EvalEnv, m: Meter
   if (v.kind === "text" && to === "timestamptz") {
     const parsed = parseTimestamptzInput(v.text);
     if (!parsed.local) return timestamptzValue(parsed.micros);
-    return timestamptzValue(finiteInstant(localToInstantMicros(zoneCharge(), parsed.micros)));
+    return timestamptzValue(localToInstantMicros(zoneCharge(), parsed.micros));
   }
   if (v.kind === "timestamp" && to === "date") return microsToDate(v.micros);
-  if (v.kind === "date" && to === "timestamp") return timestampValue(dateToMicros(v.days));
+  // date → timestamp (zone-free): midnight; a date past the timestamp range traps 22008.
+  if (v.kind === "date" && to === "timestamp") return timestampValue(dateMidnightMicros(v.days));
   if (v.kind === "timestamptz" && to === "timestamp") {
     if (isInf(v.micros)) return timestampValue(v.micros);
     return timestampValue(instantToLocalMicros(zoneCharge(), v.micros));
@@ -752,7 +747,7 @@ export function evalDateConvert(v: Value, to: ScalarType, env: EvalEnv, m: Meter
     return microsToDate(instantToLocalMicros(zoneCharge(), v.micros));
   }
   if (v.kind === "date" && to === "timestamptz") {
-    const mid = dateToMicros(v.days);
+    const mid = dateMidnightMicros(v.days);
     if (isInf(mid)) return timestamptzValue(mid);
     return timestamptzValue(localToInstantMicros(zoneCharge(), mid));
   }
@@ -780,6 +775,7 @@ export function dateClockValue(
   m.charge(COSTS.timezone);
   m.guard();
   const clock = rng.statementClockMicros(seam);
+  // An injected extreme clock can shift past the timestamp range: 22008, like the day bound.
   const local = instantToLocalMicros(zr, clock);
   const floored =
     local >= 0n ? local / MICROS_PER_DAY : -((-local + (MICROS_PER_DAY - 1n)) / MICROS_PER_DAY);

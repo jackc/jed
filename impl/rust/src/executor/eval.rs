@@ -1438,10 +1438,17 @@ impl RExpr {
                         format!("time zone \"{zone_str}\" not recognized"),
                     )
                 })?;
+                // A finite reading shifted past the timestamp range traps 22008.
                 Ok(if *to_timestamptz {
-                    Value::Timestamptz(crate::timezone::local_to_instant_micros(&zr, micros))
+                    Value::Timestamptz(
+                        crate::timezone::local_to_instant_micros(&zr, micros)
+                            .ok_or_else(crate::timestamp::zone_shift_out_of_range)?,
+                    )
                 } else {
-                    Value::Timestamp(crate::timezone::instant_to_local_micros(&zr, micros))
+                    Value::Timestamp(
+                        crate::timezone::instant_to_local_micros(&zr, micros)
+                            .ok_or_else(crate::timestamp::zone_shift_out_of_range)?,
+                    )
                 })
             }
             RExpr::DateTrunc { unit, value, zone } => {
@@ -1493,10 +1500,12 @@ impl RExpr {
                         };
                         m.charge(COSTS.timezone);
                         m.guard()?;
-                        let local = crate::timezone::instant_to_local_micros(&zr, mc);
+                        let local = crate::timezone::instant_to_local_micros(&zr, mc)
+                            .ok_or_else(crate::timestamp::zone_shift_out_of_range)?;
                         let trunc = crate::datetime_fn::date_trunc_micros(unit_s, local)?;
                         Ok(Value::Timestamptz(
-                            crate::timezone::local_to_instant_micros(&zr, trunc),
+                            crate::timezone::local_to_instant_micros(&zr, trunc)
+                                .ok_or_else(crate::timestamp::zone_shift_out_of_range)?,
                         ))
                     }
                     _ => unreachable!("resolver restricts date_trunc to ts/tstz/interval"),
@@ -1527,7 +1536,8 @@ impl RExpr {
                             let zr = env.exec.session.time_zone.clone();
                             m.charge(COSTS.timezone);
                             m.guard()?;
-                            let local = crate::timezone::instant_to_local_micros(&zr, mc);
+                            let local = crate::timezone::instant_to_local_micros(&zr, mc)
+                                .ok_or_else(crate::timestamp::zone_shift_out_of_range)?;
                             let off =
                                 crate::timezone::offset_at_ref(&zr, mc.div_euclid(1_000_000)).utoff;
                             ExtractSrc::Timestamptz {
@@ -2125,22 +2135,22 @@ impl RExpr {
                         // make_timestamptz: interpret the wall clock in a zone → a UTC instant.
                         m.charge(COSTS.timezone);
                         m.guard()?;
-                        let instant = if vals.len() == 7 {
+                        let zr = if vals.len() == 7 {
                             let zone_str = match &vals[6] {
                                 Value::Text(s) => s.as_str(),
                                 _ => unreachable!("resolver restricts the timezone arg to text"),
                             };
-                            let zr = crate::timezone::resolve_zone(zone_str).ok_or_else(|| {
+                            crate::timezone::resolve_zone(zone_str).ok_or_else(|| {
                                 EngineError::new(
                                     SqlState::InvalidParameterValue,
                                     format!("time zone \"{zone_str}\" not recognized"),
                                 )
-                            })?;
-                            crate::timezone::local_to_instant_micros(&zr, wall)
+                            })?
                         } else {
-                            let zr = env.exec.session.time_zone.clone();
-                            crate::timezone::local_to_instant_micros(&zr, wall)
+                            env.exec.session.time_zone.clone()
                         };
+                        let instant = crate::timezone::local_to_instant_micros(&zr, wall)
+                            .ok_or_else(crate::timestamp::zone_shift_out_of_range)?;
                         Ok(Value::Timestamptz(instant))
                     }
                     ScalarFunc::MakeDate => {
@@ -2198,7 +2208,10 @@ impl RExpr {
                                     let zr = env.exec.session.time_zone.clone();
                                     m.charge(COSTS.timezone);
                                     m.guard()?;
-                                    let local = crate::timezone::instant_to_local_micros(&zr, mc);
+                                    let local = crate::timezone::instant_to_local_micros(&zr, mc)
+                                        .ok_or_else(
+                                        crate::timestamp::zone_shift_out_of_range,
+                                    )?;
                                     let off = crate::timezone::offset_at_ref(
                                         &zr,
                                         mc.div_euclid(1_000_000),

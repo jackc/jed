@@ -207,6 +207,8 @@ mod window_persisted;
 mod work_mem_options;
 #[path = "../tests/writable_cte.rs"]
 mod writable_cte;
+#[path = "../tests/zone_shift_range.rs"]
+mod zone_shift_range;
 
 #[path = "../tests/index_dependencies.rs"]
 mod index_dependencies;

@@ -731,10 +731,7 @@ pub(crate) fn scalar_to_text(v: Value, env: &EvalEnv, m: &mut Meter) -> Result<S
                 m.charge(COSTS.timezone);
                 m.guard()?;
             }
-            Ok(crate::timestamp::render_timestamptz_in(
-                mc,
-                &env.exec.session.time_zone,
-            ))
+            crate::timestamp::render_timestamptz_in(mc, &env.exec.session.time_zone)
         }
         v => Ok(v.render()),
     }
@@ -910,16 +907,6 @@ pub(crate) fn eval_date_convert(
             Value::Date(mc.div_euclid(MICROS_PER_DAY) as i32)
         }
     };
-    // Midnight-of-a-date as timestamp-micros, preserving the ±inf sentinels.
-    let date_to_micros = |d: i32| -> i64 {
-        if d == crate::date::POS_INFINITY {
-            TS_POS
-        } else if d == crate::date::NEG_INFINITY {
-            TS_NEG
-        } else {
-            d as i64 * MICROS_PER_DAY
-        }
-    };
     let is_inf = |mc: i64| mc == TS_POS || mc == TS_NEG;
     match (v, to) {
         // text -> date (the runtime text → date cast, date.md §6): the per-row string runs the
@@ -952,18 +939,16 @@ pub(crate) fn eval_date_convert(
                     let zr = env.exec.session.time_zone.clone();
                     m.charge(COSTS.timezone);
                     m.guard()?;
-                    let mc = crate::timezone::local_to_instant_micros_checked(&zr, wall)
-                        .ok_or_else(|| {
-                            crate::timestamp::field_overflow("timestamp out of range")
-                        })?;
-                    Ok(Value::Timestamptz(crate::timestamp::finite_instant(mc)?))
+                    let mc = crate::timezone::local_to_instant_micros(&zr, wall)
+                        .ok_or_else(crate::timestamp::zone_shift_out_of_range)?;
+                    Ok(Value::Timestamptz(mc))
                 }
             }
         }
         // timestamp -> date (zone-free): the date part.
         (Value::Timestamp(mc), ScalarType::Date) => Ok(micros_to_date(mc)),
-        // date -> timestamp (zone-free): midnight.
-        (Value::Date(d), ScalarType::Timestamp) => Ok(Value::Timestamp(date_to_micros(d))),
+        // date -> timestamp (zone-free): midnight; a date past the timestamp range traps 22008.
+        (Value::Date(d), ScalarType::Timestamp) => Ok(Value::Timestamp(date_midnight_micros(d)?)),
         // timestamptz -> timestamp: render the instant in the session zone.
         (Value::Timestamptz(mc), ScalarType::Timestamp) => {
             if is_inf(mc) {
@@ -972,9 +957,9 @@ pub(crate) fn eval_date_convert(
             let zr = env.exec.session.time_zone.clone();
             m.charge(COSTS.timezone);
             m.guard()?;
-            Ok(Value::Timestamp(crate::timezone::instant_to_local_micros(
-                &zr, mc,
-            )))
+            let local = crate::timezone::instant_to_local_micros(&zr, mc)
+                .ok_or_else(crate::timestamp::zone_shift_out_of_range)?;
+            Ok(Value::Timestamp(local))
         }
         // timestamp -> timestamptz: interpret the wall clock in the session zone.
         (Value::Timestamp(mc), ScalarType::Timestamptz) => {
@@ -984,9 +969,9 @@ pub(crate) fn eval_date_convert(
             let zr = env.exec.session.time_zone.clone();
             m.charge(COSTS.timezone);
             m.guard()?;
-            Ok(Value::Timestamptz(
-                crate::timezone::local_to_instant_micros(&zr, mc),
-            ))
+            let instant = crate::timezone::local_to_instant_micros(&zr, mc)
+                .ok_or_else(crate::timestamp::zone_shift_out_of_range)?;
+            Ok(Value::Timestamptz(instant))
         }
         // timestamptz -> date: the date of the session-zone wall clock.
         (Value::Timestamptz(mc), ScalarType::Date) => {
@@ -996,22 +981,22 @@ pub(crate) fn eval_date_convert(
             let zr = env.exec.session.time_zone.clone();
             m.charge(COSTS.timezone);
             m.guard()?;
-            Ok(micros_to_date(crate::timezone::instant_to_local_micros(
-                &zr, mc,
-            )))
+            let local = crate::timezone::instant_to_local_micros(&zr, mc)
+                .ok_or_else(crate::timestamp::zone_shift_out_of_range)?;
+            Ok(micros_to_date(local))
         }
         // date -> timestamptz: midnight in the session zone -> the instant.
         (Value::Date(d), ScalarType::Timestamptz) => {
-            let mid = date_to_micros(d);
+            let mid = date_midnight_micros(d)?;
             if is_inf(mid) {
                 return Ok(Value::Timestamptz(mid));
             }
             let zr = env.exec.session.time_zone.clone();
             m.charge(COSTS.timezone);
             m.guard()?;
-            Ok(Value::Timestamptz(
-                crate::timezone::local_to_instant_micros(&zr, mid),
-            ))
+            let instant = crate::timezone::local_to_instant_micros(&zr, mid)
+                .ok_or_else(crate::timestamp::zone_shift_out_of_range)?;
+            Ok(Value::Timestamptz(instant))
         }
         _ => unreachable!(
             "resolver restricts DateConvert to cross-family datetime casts and text → datetime"
@@ -1039,8 +1024,10 @@ pub(crate) fn date_clock_value(
     let mut r = rng.get();
     let clock = r.statement_clock_micros(&exec.session.seam);
     rng.set(r);
-    let days = crate::timezone::instant_to_local_micros(&zr, clock).div_euclid(MICROS_PER_DAY)
-        + offset_days as i64;
+    // An injected extreme clock can shift past the timestamp range: 22008, like the day bound.
+    let local = crate::timezone::instant_to_local_micros(&zr, clock)
+        .ok_or_else(crate::timestamp::zone_shift_out_of_range)?;
+    let days = local.div_euclid(MICROS_PER_DAY) + offset_days as i64;
     if !((i32::MIN as i64 + 1)..=(i32::MAX as i64 - 1)).contains(&days) {
         // Unreachable from a real clock; an injected extreme clock still traps deterministically.
         return Err(EngineError::new(

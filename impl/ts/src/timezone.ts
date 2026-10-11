@@ -10,7 +10,13 @@ import { compareTextC } from "./value.ts";
 import { engineError } from "./errors.ts";
 import { crc32Ieee } from "./format.ts";
 import { lz4Compress, lz4Decompress } from "./lz4.ts";
-import { civilFromDays, daysFromCivil } from "./timestamp.ts";
+import {
+  NEG_INFINITY,
+  POS_INFINITY,
+  civilFromDays,
+  daysFromCivil,
+  fieldOverflow,
+} from "./timestamp.ts";
 
 const SECS_PER_DAY = 86_400n;
 
@@ -619,19 +625,31 @@ export function offsetAtRef(zr: ZoneRef, instantSecs: bigint): Offset {
   return offsetAt(zr.zone.data, instantSecs);
 }
 
-// instantToLocalMicros is timestamptz AT TIME ZONE zone (§4): local = instant + utoff.
+// instantToLocalMicros is timestamptz AT TIME ZONE zone (§4): local = instant + utoff. A shift that
+// leaves the finite i64-µs range — past i64 or exactly onto a ±infinity sentinel — traps 22008
+// "timestamp out of range" (timezones.md §6). The caller passes a FINITE instant.
 export function instantToLocalMicros(zr: ZoneRef, instantMicros: bigint): bigint {
   const off = offsetAtRef(zr, floorDivBig(instantMicros, 1_000_000n));
-  return instantMicros + BigInt(off.utoff) * 1_000_000n;
+  return finiteShift(instantMicros + BigInt(off.utoff) * 1_000_000n);
 }
 
 // localToInstantMicros is timestamp AT TIME ZONE zone (§4): instant = wall − utoff. The offset is
 // chosen by determineLocalOffset, matching PostgreSQL's DetermineTimeZoneOffset at a DST gap/overlap
 // (oracle-pinned, timezones.md §6).
+// The range guard is instantToLocalMicros's; the caller passes a FINITE wall clock.
 export function localToInstantMicros(zr: ZoneRef, wallMicros: bigint): bigint {
   const wallSecs = floorDivBig(wallMicros, 1_000_000n);
   const chosen = determineLocalOffset(zr, wallSecs);
-  return wallMicros - chosen * 1_000_000n;
+  return finiteShift(wallMicros - chosen * 1_000_000n);
+}
+
+// finiteShift accepts a zone-shifted reading only when it stays strictly between the two values
+// reserved for ±infinity (bigint never overflows, so i64 is checked explicitly — mirroring Rust's
+// checked_add/checked_sub and Go's add64/sub64).
+function finiteShift(micros: bigint): bigint {
+  if (micros <= NEG_INFINITY || micros >= POS_INFINITY)
+    throw fieldOverflow("timestamp out of range");
+  return micros;
 }
 
 // determineLocalOffset chooses the UT offset (seconds) to interpret a wall-clock wallSecs reading

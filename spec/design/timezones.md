@@ -251,6 +251,16 @@ Details:
   [compatibility.md §8](compatibility.md) "never silently substitute an ordering the user did not ask
   for"). A named zone no loaded bundle provides raises this; so an untrusted query naming an unloaded
   zone gets `22023`, never a load and never I/O (§10).
+- **Range — a shift out of range is `22008`.** jed's timestamp range is the full `i64` of microseconds
+  (≈ 290309 BC … 294247 AD, [timestamp.md](timestamp.md) §1), with `i64::MIN`/`MAX` reserved for
+  `±infinity`. A finite value within an offset of either end can shift past it, so both kernels are
+  **checked**: a result that overflows `i64` *or lands exactly on a sentinel* (which would silently read
+  as `±infinity`) traps `22008` "timestamp out of range" — PostgreSQL's code for an out-of-range
+  timestamp. `±infinity` inputs pass through unshifted and never reach the kernels. Every zone-shift
+  consumer inherits the guard: `AT TIME ZONE`, the cross-family casts (§9.3), `date_trunc` (§9.1) and
+  `EXTRACT`/`date_part` (§9.2) in a zone, `make_timestamptz`, and the session-zone text render (§9.5).
+  These extremes lie far outside PostgreSQL's range, so they are not oracle-checkable; each core pins
+  them in its `zone_shift_range` test.
 - **Purity.** `AT TIME ZONE` is a pure function of `(instant, loaded TZif bytes)` — no host reach, no
   I/O, no nondeterminism — so it stays inside the untrusted-query safety guarantee (§10, CLAUDE.md §13).
 
@@ -417,8 +427,10 @@ the others are zone-free:
 | `date` → `timestamptz` | midnight **in the session zone** → the instant |
 
 These reuse the §5 reader kernels (`instant_to_local_micros` / `local_to_instant_micros`) with the
-session zone, so they inherit `AT TIME ZONE`'s oracle-clean DST behavior. A session-zone-consulting cast
-charges the `timezone` unit.
+session zone, so they inherit `AT TIME ZONE`'s oracle-clean DST behavior and its range guard (a shift
+out of range is `22008`, §6). A session-zone-consulting cast charges the `timezone` unit. `date` is wider
+than `timestamp` ([date.md](date.md) §1), so widening a date past the timestamp range (`date` →
+`timestamp`/`timestamptz`) is `22008` too.
 
 The runtime **`text` → datetime** casts on a non-literal text expression have landed: `text → date`
 ([date.md §6](date.md)), and `text → timestamp` / `timestamptz` ([types.md](types.md) §5), each running

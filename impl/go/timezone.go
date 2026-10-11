@@ -776,27 +776,32 @@ func offsetAtRef(zr ZoneRef, instantSecs int64) offset {
 	return offsetAt(&zr.zone.Data, instantSecs)
 }
 
-// InstantToLocalMicros is timestamptz AT TIME ZONE zone (§4): local = instant + utoff.
-func instantToLocalMicros(zr ZoneRef, instantMicros int64) int64 {
+// InstantToLocalMicros is timestamptz AT TIME ZONE zone (§4): local = instant + utoff. ok = false
+// when the shift leaves the finite int64-µs range — it overflows int64 or lands on a ±infinity
+// sentinel — which every caller raises as 22008 "timestamp out of range" (timezones.md §6). The
+// caller passes a FINITE instant.
+func instantToLocalMicros(zr ZoneRef, instantMicros int64) (int64, bool) {
 	off := offsetAtRef(zr, floorDiv(instantMicros, 1_000_000))
-	return instantMicros + int64(off.Utoff)*1_000_000
+	return finiteShift(add64(instantMicros, int64(off.Utoff)*1_000_000))
 }
 
 // LocalToInstantMicros is timestamp AT TIME ZONE zone (§4): instant = wall − utoff. The offset is
 // chosen by determineLocalOffset, matching PostgreSQL's DetermineTimeZoneOffset at a DST gap/overlap
-// (oracle-pinned, timezones.md §6).
-func localToInstantMicros(zr ZoneRef, wallMicros int64) int64 {
+// (oracle-pinned, timezones.md §6). ok exactly as instantToLocalMicros; the caller passes a FINITE
+// wall clock.
+func localToInstantMicros(zr ZoneRef, wallMicros int64) (int64, bool) {
 	wallSecs := floorDiv(wallMicros, 1_000_000)
 	chosen := determineLocalOffset(zr, wallSecs)
-	return wallMicros - chosen*1_000_000
+	return finiteShift(sub64(wallMicros, chosen*1_000_000))
 }
 
-// localToInstantMicrosChecked is localToInstantMicros for an unvalidated wall clock: ok = false
-// when the zone shift overflows int64 (the caller's range error).
-func localToInstantMicrosChecked(zr ZoneRef, wallMicros int64) (int64, bool) {
-	wallSecs := floorDiv(wallMicros, 1_000_000)
-	chosen := determineLocalOffset(zr, wallSecs)
-	return sub64(wallMicros, chosen*1_000_000)
+// finiteShift accepts a zone-shifted reading only when it stayed in int64 AND is not one of the two
+// values reserved for ±infinity (a finite input must never shift onto infinity).
+func finiteShift(micros int64, ok bool) (int64, bool) {
+	if !ok || micros == negInfinity || micros == posInfinity {
+		return 0, false
+	}
+	return micros, true
 }
 
 // determineLocalOffset chooses the UT offset (seconds) to interpret a wall-clock wallSecs reading

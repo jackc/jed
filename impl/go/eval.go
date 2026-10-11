@@ -1047,16 +1047,6 @@ func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value,
 			return DateValue(int32(floorDiv(mc, microsPerDay)))
 		}
 	}
-	dateToMicros := func(d int32) int64 {
-		switch d {
-		case datePosInfinity:
-			return posInfinity
-		case dateNegInfinity:
-			return negInfinity
-		default:
-			return int64(d) * microsPerDay
-		}
-	}
 	isInf := func(mc int64) bool { return mc == posInfinity || mc == negInfinity }
 	zoneCharge := func() (ZoneRef, error) {
 		zr := env.exec.session.timeZone
@@ -1107,18 +1097,20 @@ func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value,
 		if err != nil {
 			return Value{}, err
 		}
-		inst, ok := localToInstantMicrosChecked(zr, mc)
+		inst, ok := localToInstantMicros(zr, mc)
 		if !ok {
-			return Value{}, datetimeFieldOverflow("timestamp out of range")
-		}
-		if inst, err = finiteInstant(inst); err != nil {
-			return Value{}, err
+			return Value{}, errZoneShiftOutOfRange()
 		}
 		return TimestamptzValue(inst), nil
 	case v.Kind == ValTimestamp && to == scalarDate:
 		return microsToDate(v.Int), nil
 	case v.Kind == ValDate && to == scalarTimestamp:
-		return TimestampValue(dateToMicros(int32(v.Int))), nil
+		// Midnight; a date past the timestamp range traps 22008.
+		mid, err := dateMidnightMicros(int32(v.Int))
+		if err != nil {
+			return Value{}, err
+		}
+		return TimestampValue(mid), nil
 	case v.Kind == ValTimestamptz && to == scalarTimestamp:
 		if isInf(v.Int) {
 			return TimestampValue(v.Int), nil
@@ -1127,7 +1119,11 @@ func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value,
 		if err != nil {
 			return Value{}, err
 		}
-		return TimestampValue(instantToLocalMicros(zr, v.Int)), nil
+		local, ok := instantToLocalMicros(zr, v.Int)
+		if !ok {
+			return Value{}, errZoneShiftOutOfRange()
+		}
+		return TimestampValue(local), nil
 	case v.Kind == ValTimestamp && to == scalarTimestamptz:
 		if isInf(v.Int) {
 			return TimestamptzValue(v.Int), nil
@@ -1136,7 +1132,11 @@ func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value,
 		if err != nil {
 			return Value{}, err
 		}
-		return TimestamptzValue(localToInstantMicros(zr, v.Int)), nil
+		inst, ok := localToInstantMicros(zr, v.Int)
+		if !ok {
+			return Value{}, errZoneShiftOutOfRange()
+		}
+		return TimestamptzValue(inst), nil
 	case v.Kind == ValTimestamptz && to == scalarDate:
 		if isInf(v.Int) {
 			return microsToDate(v.Int), nil
@@ -1145,9 +1145,16 @@ func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value,
 		if err != nil {
 			return Value{}, err
 		}
-		return microsToDate(instantToLocalMicros(zr, v.Int)), nil
+		local, ok := instantToLocalMicros(zr, v.Int)
+		if !ok {
+			return Value{}, errZoneShiftOutOfRange()
+		}
+		return microsToDate(local), nil
 	case v.Kind == ValDate && to == scalarTimestamptz:
-		mid := dateToMicros(int32(v.Int))
+		mid, err := dateMidnightMicros(int32(v.Int))
+		if err != nil {
+			return Value{}, err
+		}
 		if isInf(mid) {
 			return TimestamptzValue(mid), nil
 		}
@@ -1155,7 +1162,11 @@ func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value,
 		if err != nil {
 			return Value{}, err
 		}
-		return TimestamptzValue(localToInstantMicros(zr, mid)), nil
+		inst, ok := localToInstantMicros(zr, mid)
+		if !ok {
+			return Value{}, errZoneShiftOutOfRange()
+		}
+		return TimestamptzValue(inst), nil
 	default:
 		panic("resolver restricts DateConvert to cross-family datetime casts and text → datetime")
 	}
@@ -1176,7 +1187,12 @@ func dateClockValue(exec *engine, rng *stmtRng, m *costMeter, offsetDays int64) 
 		return Value{}, err
 	}
 	clock := rng.statementClockMicros(&exec.session.seam)
-	days := floorDiv(instantToLocalMicros(zr, clock), microsPerDay) + offsetDays
+	// An injected extreme clock can shift past the timestamp range: 22008, like the day bound.
+	local, ok := instantToLocalMicros(zr, clock)
+	if !ok {
+		return Value{}, errZoneShiftOutOfRange()
+	}
+	days := floorDiv(local, microsPerDay) + offsetDays
 	if days < dateMinFinite || days > dateMaxFinite {
 		// Unreachable from a real clock; an injected extreme clock still traps deterministically.
 		return Value{}, newError(DatetimeFieldOverflow, "date out of range")
@@ -2275,10 +2291,19 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return Value{}, newError(InvalidParameterValue,
 				fmt.Sprintf("time zone %q not recognized", zv.str()))
 		}
+		// A finite reading shifted past the timestamp range traps 22008.
 		if e.atTzToTimestamptz {
-			return TimestamptzValue(localToInstantMicros(zr, micros)), nil
+			inst, ok := localToInstantMicros(zr, micros)
+			if !ok {
+				return Value{}, errZoneShiftOutOfRange()
+			}
+			return TimestamptzValue(inst), nil
 		}
-		return TimestampValue(instantToLocalMicros(zr, micros)), nil
+		local, ok := instantToLocalMicros(zr, micros)
+		if !ok {
+			return Value{}, errZoneShiftOutOfRange()
+		}
+		return TimestampValue(local), nil
 	case reDateTrunc:
 		m.Charge(costs.OperatorEval)
 		uv, err := e.sargs[0].eval(row, env, m)
@@ -2337,12 +2362,19 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err := m.Guard(); err != nil {
 				return Value{}, err
 			}
-			local := instantToLocalMicros(zr, mc)
+			local, ok := instantToLocalMicros(zr, mc)
+			if !ok {
+				return Value{}, errZoneShiftOutOfRange()
+			}
 			trunc, err := dateTruncMicros(unitS, local)
 			if err != nil {
 				return Value{}, err
 			}
-			return TimestamptzValue(localToInstantMicros(zr, trunc)), nil
+			inst, ok := localToInstantMicros(zr, trunc)
+			if !ok {
+				return Value{}, errZoneShiftOutOfRange()
+			}
+			return TimestamptzValue(inst), nil
 		default:
 			panic("resolver restricts date_trunc to ts/tstz/interval")
 		}
@@ -2375,7 +2407,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				if err := m.Guard(); err != nil {
 					return Value{}, err
 				}
-				local := instantToLocalMicros(zr, mc)
+				local, ok := instantToLocalMicros(zr, mc)
+				if !ok {
+					return Value{}, errZoneShiftOutOfRange()
+				}
 				off := int64(offsetAtRef(zr, floorDiv(mc, 1_000_000)).Utoff)
 				src = extractSrc{kind: srcTstz, instant: mc, local: local, offsetSecs: off}
 			}
@@ -2651,7 +2686,11 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			} else {
 				zr = env.exec.session.timeZone
 			}
-			return TimestamptzValue(localToInstantMicros(zr, wall)), nil
+			inst, ok := localToInstantMicros(zr, wall)
+			if !ok {
+				return Value{}, errZoneShiftOutOfRange()
+			}
+			return TimestamptzValue(inst), nil
 		case sfMakeDate:
 			// make_date(year, month, day) — the make_timestamp sibling (functions.md §11): a
 			// negative year is BC; year zero / a bad field / an out-of-range day count traps 22008.
@@ -2697,7 +2736,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 					if err := m.Guard(); err != nil {
 						return Value{}, err
 					}
-					local := instantToLocalMicros(zr, mc)
+					local, ok := instantToLocalMicros(zr, mc)
+					if !ok {
+						return Value{}, errZoneShiftOutOfRange()
+					}
 					off := int64(offsetAtRef(zr, floorDiv(mc, 1_000_000)).Utoff)
 					src = extractSrc{kind: srcTstz, instant: mc, local: local, offsetSecs: off}
 				}
@@ -4002,7 +4044,7 @@ func scalarToText(v Value, env *evalEnv, m *costMeter) (string, error) {
 				return "", err
 			}
 		}
-		return renderTimestamptzIn(v.Int, env.exec.session.timeZone), nil
+		return renderTimestamptzIn(v.Int, env.exec.session.timeZone)
 	default:
 		return v.Render(), nil
 	}

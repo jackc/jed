@@ -137,6 +137,10 @@ func datetimeFieldOverflow(detail string) error {
 	return newError(DatetimeFieldOverflow, detail)
 }
 
+// errZoneShiftOutOfRange is the 22008 raised when a zone shift (instantToLocalMicros /
+// localToInstantMicros) leaves the finite timestamp range (timezones.md §6).
+func errZoneShiftOutOfRange() error { return datetimeFieldOverflow("timestamp out of range") }
+
 func isWS(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\f' || b == '\r'
 }
@@ -588,11 +592,16 @@ func renderTimestamptz(micros int64) string {
 
 // renderTimestamptzIn renders a timestamptz instant as text in zone — the timestamptz → text cast,
 // which follows the session zone (timezones.md §9.5): the local wall clock plus the offset in effect
-// at the instant. ±infinity render bare.
-func renderTimestamptzIn(micros int64, zone ZoneRef) string {
+// at the instant. ±infinity render bare; a finite instant whose local reading leaves the timestamp
+// range traps 22008 (timezones.md §6).
+func renderTimestamptzIn(micros int64, zone ZoneRef) (string, error) {
 	if micros == negInfinity || micros == posInfinity {
-		return renderDatetime(micros, nil)
+		return renderDatetime(micros, nil), nil
 	}
 	off := offsetAtRef(zone, floorDiv(micros, 1_000_000))
-	return renderDatetime(micros+int64(off.Utoff)*1_000_000, &off.Utoff)
+	local, ok := instantToLocalMicros(zone, micros)
+	if !ok {
+		return "", errZoneShiftOutOfRange()
+	}
+	return renderDatetime(local, &off.Utoff), nil
 }

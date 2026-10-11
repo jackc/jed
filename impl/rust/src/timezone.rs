@@ -775,28 +775,30 @@ pub fn offset_at_ref(zr: &ZoneRef, instant_secs: i64) -> Offset {
 }
 
 /// `timestamptz AT TIME ZONE zone` (§4): render the UTC instant (micros) as the local wall-clock
-/// reading in `zone` — `local = instant + utoff`.
-pub fn instant_to_local_micros(zr: &ZoneRef, instant_micros: i64) -> i64 {
+/// reading in `zone` — `local = instant + utoff`. `None` when the shift leaves the finite i64-µs
+/// range — it overflows `i64` or lands on a `±infinity` sentinel — which every caller raises as
+/// `22008` "timestamp out of range" (timezones.md §6). The caller passes a FINITE instant.
+pub fn instant_to_local_micros(zr: &ZoneRef, instant_micros: i64) -> Option<i64> {
     let off = offset_at_ref(zr, instant_micros.div_euclid(1_000_000));
-    instant_micros + off.utoff as i64 * 1_000_000
+    finite_shift(instant_micros.checked_add(off.utoff as i64 * 1_000_000))
 }
 
 /// `timestamp AT TIME ZONE zone` (§4): interpret the wall-clock reading (micros) as local in `zone`,
 /// producing the UTC instant — `instant = wall − utoff`. The offset is chosen by
 /// [`determine_local_offset`], matching PostgreSQL's `DetermineTimeZoneOffset` at a DST gap/overlap
-/// (oracle-pinned, timezones.md §6).
-pub fn local_to_instant_micros(zr: &ZoneRef, wall_micros: i64) -> i64 {
+/// (oracle-pinned, timezones.md §6). `None` exactly as [`instant_to_local_micros`]; the caller
+/// passes a FINITE wall clock.
+pub fn local_to_instant_micros(zr: &ZoneRef, wall_micros: i64) -> Option<i64> {
     let wall_secs = wall_micros.div_euclid(1_000_000);
     let chosen = determine_local_offset(zr, wall_secs);
-    wall_micros - chosen * 1_000_000
+    finite_shift(wall_micros.checked_sub(chosen * 1_000_000))
 }
 
-/// [`local_to_instant_micros`] for an unvalidated wall clock: `None` when the zone shift
-/// overflows `i64` (the caller's range error).
-pub fn local_to_instant_micros_checked(zr: &ZoneRef, wall_micros: i64) -> Option<i64> {
-    let wall_secs = wall_micros.div_euclid(1_000_000);
-    let chosen = determine_local_offset(zr, wall_secs);
-    wall_micros.checked_sub(chosen * 1_000_000)
+/// A zone-shifted reading is valid only when it stayed in `i64` AND is not one of the two values
+/// reserved for `±infinity` (a finite input must never shift onto infinity).
+fn finite_shift(micros: Option<i64>) -> Option<i64> {
+    use crate::timestamp::{NEG_INFINITY, POS_INFINITY};
+    micros.filter(|&m| m != NEG_INFINITY && m != POS_INFINITY)
 }
 
 /// Choose the UT offset (seconds) to interpret a wall-clock `wall_secs` reading with, matching

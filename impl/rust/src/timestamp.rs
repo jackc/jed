@@ -90,6 +90,12 @@ pub(crate) fn field_overflow(detail: impl Into<String>) -> EngineError {
     EngineError::new(SqlState::DatetimeFieldOverflow, detail.into())
 }
 
+/// The `22008` raised when a zone shift (`timezone::instant_to_local_micros` /
+/// `local_to_instant_micros`) leaves the finite timestamp range (timezones.md §6).
+pub(crate) fn zone_shift_out_of_range() -> EngineError {
+    field_overflow("timestamp out of range")
+}
+
 /// An ASCII-whitespace byte (space, tab, LF, FF, CR) — the fixed set trimmed from the ends
 /// of a datetime literal, identical across cores (not locale/Unicode-dependent).
 fn is_ws(b: u8) -> bool {
@@ -475,11 +481,14 @@ pub fn render_timestamptz(micros: i64) -> String {
 
 /// Render a `timestamptz` instant as text in `zone` — the `timestamptz → text` cast, which follows
 /// the session zone (timezones.md §9.5): the local wall clock plus the offset in effect at the
-/// instant. ±infinity render bare.
-pub fn render_timestamptz_in(micros: i64, zone: &crate::timezone::ZoneRef) -> String {
+/// instant. ±infinity render bare; a finite instant whose local reading leaves the timestamp
+/// range traps `22008` (timezones.md §6).
+pub fn render_timestamptz_in(micros: i64, zone: &crate::timezone::ZoneRef) -> Result<String> {
     if micros == NEG_INFINITY || micros == POS_INFINITY {
-        return render(micros, None);
+        return Ok(render(micros, None));
     }
     let off = crate::timezone::offset_at_ref(zone, micros.div_euclid(MICROS_PER_SEC));
-    render(micros + off.utoff as i64 * MICROS_PER_SEC, Some(off.utoff))
+    let local = crate::timezone::instant_to_local_micros(zone, micros)
+        .ok_or_else(zone_shift_out_of_range)?;
+    Ok(render(local, Some(off.utoff)))
 }
