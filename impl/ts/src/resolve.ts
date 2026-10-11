@@ -18,6 +18,7 @@ import {
   noAggOverload,
   noFuncOverload,
   polyResultType,
+  queryPlanColumnDerivs,
   rangeBoundAssignable,
   resolveFuncCall,
   resolveHypotheticalSetAggregate,
@@ -40,6 +41,7 @@ import type {
   JsonOnBehavior,
   JsonPredicateKind,
   JsonWrapper,
+  OrderKey,
   QueryExpr,
   SelectItems,
 } from "./ast.ts";
@@ -127,7 +129,7 @@ import type { RegexProgram } from "./regex.ts";
 import { foldLowerSimple, loadedProperty, sortKey as collationSortKey } from "./collation.ts";
 import { compileRegex } from "./regex.ts";
 import type { Collation } from "./collation.ts";
-import { OPERATORS } from "./operators.ts";
+import { AGGREGATES, OPERATORS, WINDOWS } from "./operators.ts";
 import type { Value } from "./value.ts";
 import type { JsonNode, PathSetMode } from "./json.ts";
 import { Decimal } from "./decimal.ts";
@@ -875,6 +877,7 @@ export function resolve(
       if (plan.columnTypes.length !== 1) {
         throw engineError("syntax_error", "subquery must return only one column");
       }
+      noteSubqueryDeriv(scope, e.query, queryPlanColumnDerivs(plan)[0]!);
       return {
         node: {
           kind: "subquery",
@@ -911,6 +914,9 @@ export function resolve(
       const { node: lhs, type: lt } = resolve(scope, e.lhs, null, ag, params);
       const { plan, elem, rowValued } = planMembershipSubquery(scope, e.lhs, e.query, params);
       classifyComparable(lt, elem);
+      // = ignores the collation at eval (byte identity, collation.md §7), but a conflict between
+      // the operand and the body column is still 42P22 (PostgreSQL's texteq demands one).
+      membershipCollation(scope, e.lhs, lt, elem, rowValued, plan);
       return {
         node: {
           kind: "subquery",
@@ -938,6 +944,7 @@ export function resolve(
           `operator does not exist: ${rtName(lt)} ${binaryOpSymbol(e.op)} ${rtName(elem)}`,
         );
       }
+      const collation = membershipCollation(scope, e.lhs, lt, elem, rowValued, plan);
       return {
         node: {
           kind: "subquery",
@@ -948,6 +955,7 @@ export function resolve(
           rowValued,
           op: e.op,
           all: e.all,
+          collation,
         },
         type: { kind: "bool" },
       };
@@ -1894,13 +1902,14 @@ export type Deriv =
   | { kind: "indeterminate" }
   | { kind: "conflicted" };
 
-// deriveCollation derives the collation + derivation level of a (text) expression subtree. A COLLATE
-// is explicit; a column reference is implicit (its frozen collation, C if none); || combines its
-// operands; a scalar function whose catalog result is text combines its arguments (PostgreSQL's rule
-// — a collatable result inherits its collatable inputs' collation; functionResultCollatable). Every
-// other shape (literal, cast, CASE, aggregate) resets to none (takes a neighbour's) — a documented
-// narrowing (§14). A persisted index expression's scope (storageCollation) keeps the pre-function
-// rule.
+// deriveCollation derives the collation + derivation level of a (text) expression subtree. A
+// COLLATE is explicit; a column reference is implicit (its frozen collation, C if none); ||
+// combines its operands. Every other text-valued node carries its inputs' collation, PostgreSQL's
+// general rule: a scalar function whose catalog result is text (functionResultCollatable), a cast
+// to text, the CASE results, COALESCE / GREATEST / LEAST, an input-typed aggregate or window
+// function (aggResultCollatable), and a scalar subquery (its output column, implicit). A literal
+// and every other shape derive none (no collation — takes a neighbour's). A persisted index
+// expression's scope (storageCollation) keeps the earlier rule (column, COLLATE, ||).
 export function deriveCollation(scope: Scope, e: Expr): Deriv {
   if (e.kind === "collate") return { kind: "explicit", name: e.collation };
   if (e.kind === "column") return columnDeriv(scope, () => scope.resolveBare(e.name));
@@ -1920,11 +1929,145 @@ export function deriveCollation(scope: Scope, e: Expr): Deriv {
     !scope.storageCollation &&
     functionResultCollatable(e.name)
   ) {
+    return combineDerivs(scope, e.args);
+  }
+  if (scope.storageCollation) return { kind: "none" };
+  // A cast to text keeps its operand's derivation; a varchar(n) length coercion is a node of its
+  // own (PostgreSQL), so it combines like a function and a conflicted operand yields.
+  if (e.kind === "cast") {
+    const t = scalarTypeFromName(e.typeName);
+    if (t === undefined || !isText(t)) return { kind: "none" };
+    const d = deriveCollation(scope, e.inner);
+    return e.typeMod !== null ? combineDeriv({ kind: "none" }, d) : d;
+  }
+  // CASE combines its results only — never the simple-CASE operand or a WHEN condition.
+  if (e.kind === "case") {
     let d: Deriv = { kind: "none" };
-    for (const a of e.args) d = combineDeriv(d, deriveCollation(scope, a));
+    for (const w of e.whens) d = combineDeriv(d, deriveCollation(scope, w.result));
+    if (e.els !== null) d = combineDeriv(d, deriveCollation(scope, e.els));
     return d;
   }
+  if (e.kind === "coalesce" || e.kind === "greatestLeast") return combineDerivs(scope, e.args);
+  if (e.kind === "funcCall") {
+    // An input-typed aggregate / window function (min/max, lag/lead/first_value/…): its value
+    // arguments. FILTER and an in-aggregate ORDER BY contribute nothing.
+    if (!e.star && (e.withinGroup ?? null) === null && aggResultCollatable(e.name)) {
+      return combineDerivs(scope, e.args);
+    }
+    // An ordered-set aggregate returning its key's type (mode / percentile_disc): the one key.
+    const wg = e.withinGroup ?? null;
+    const lname = asciiLower(e.name);
+    if (wg !== null && (lname === "mode" || lname === "percentile_disc")) {
+      if (wg.length === 0) return { kind: "none" };
+      return combineDeriv({ kind: "none" }, orderKeyDeriv(scope, wg[0]!));
+    }
+    return { kind: "none" };
+  }
+  // A scalar subquery: its output column's collation, recorded when resolve planned it.
+  if (e.kind === "scalarSubquery") {
+    return scope.subqueryDerivs.get(e.query) ?? { kind: "none" };
+  }
   return { kind: "none" };
+}
+
+// combineDerivs combines the derivations of a node's inputs, starting from none — so a lone
+// conflicted input yields (PostgreSQL gives such a node its default collation).
+function combineDerivs(scope: Scope, args: Expr[]): Deriv {
+  let d: Deriv = { kind: "none" };
+  for (const a of args) d = combineDeriv(d, deriveCollation(scope, a));
+  return d;
+}
+
+// orderKeyDeriv is the derivation of an ORDER BY / WITHIN GROUP key: a trailing COLLATE is
+// explicit, else the key expression's (or bare / qualified column's) own derivation.
+export function orderKeyDeriv(scope: Scope, key: OrderKey): Deriv {
+  if (key.collation !== null && key.collation !== undefined) {
+    return { kind: "explicit", name: key.collation };
+  }
+  if (key.expr !== null && key.expr !== undefined) return deriveCollation(scope, key.expr);
+  const q = key.qualifier;
+  if (q !== null && q !== undefined && q !== "") {
+    return columnDeriv(scope, () => scope.resolveQualified(q, key.column));
+  }
+  return columnDeriv(scope, () => scope.resolveBare(key.column));
+}
+
+// aggResultCollatableNames is the (ASCII-lowercased) set of aggregate / window-only function names
+// aggResultCollatable admits, built once from the shared catalog.
+let aggResultCollatableNames: Set<string> | null = null;
+
+// aggResultCollatable reports whether an aggregate / window function's result is its input's type,
+// so it carries its value arguments' collation (spec/design/collation.md §1 "Aggregates and window
+// functions"): read from the shared catalog — an aggregate or window-only function whose result is
+// same_as_input. A non-text argument derives nothing, so sum/avg over numbers are unaffected.
+function aggResultCollatable(name: string): boolean {
+  if (aggResultCollatableNames === null) {
+    aggResultCollatableNames = new Set([
+      ...AGGREGATES.filter((a) => a.result === "same_as_input").map((a) => asciiLower(a.surface)),
+      ...WINDOWS.filter((w) => w.result === "same_as_input").map((w) => asciiLower(w.surface)),
+    ]);
+  }
+  return aggResultCollatableNames.has(asciiLower(name));
+}
+
+// noteSubqueryDeriv records a scalar subquery's output-column derivation on the scope it was
+// resolved against (Scope.subqueryDerivs), as the subquery expression derives it (collation.md §1
+// "Scalar subqueries"): a body collation, explicit or implicit, is implicit outside; a conflicted
+// or indeterminate body output makes the subquery indeterminate.
+function noteSubqueryDeriv(scope: Scope, q: QueryExpr, body: Deriv): void {
+  scope.subqueryDerivs.set(q, subqueryOutputDeriv(body));
+}
+
+// subqueryOutputDeriv is a subquery output column's derivation as seen from outside it
+// (collation.md §1): implicit for a body collation, none for none, indeterminate for a conflicted
+// or indeterminate body output.
+function subqueryOutputDeriv(body: Deriv): Deriv {
+  switch (body.kind) {
+    case "implicit":
+    case "explicit":
+      return { kind: "implicit", name: body.name };
+    case "none":
+      return { kind: "none" };
+    default:
+      return { kind: "indeterminate" };
+  }
+}
+
+// membershipCollation is the comparison collation of `lhs IN / op ANY|ALL (SELECT …)`
+// (spec/design/collation.md §1): the left operand's derivation combined with the body column's,
+// which is implicit outside the subquery. A conflict is 42P22. null for a non-text or row-valued
+// comparison.
+function membershipCollation(
+  scope: Scope,
+  lhs: Expr,
+  lt: ResolvedType,
+  elem: ResolvedType,
+  rowValued: boolean,
+  plan: QueryPlan,
+): Collation | null {
+  if (rowValued || lt.kind !== "text" || elem.kind !== "text") return null;
+  const d = combineDeriv(
+    deriveCollation(scope, lhs),
+    subqueryOutputDeriv(queryPlanColumnDerivs(plan)[0]!),
+  );
+  return resolveDeriv(scope.catalog, d);
+}
+
+// sortTargetCollation is the collation a sort / grouping target sorts under (collation.md §1 "A
+// sort or grouping target must not be indeterminate"): a key expression combining two different
+// implicit collations is 42P21 here, at plan time (PostgreSQL's parse-time check), while a key that
+// only reads a conflicted column stays 42P22 at resolveDeriv.
+export function sortTargetCollation(catalog: Engine, d: Deriv): Collation | null {
+  rejectIndeterminateTarget(d);
+  return resolveDeriv(catalog, d);
+}
+
+// rejectIndeterminateTarget is 42P21 for an indeterminate sort / grouping target (see
+// sortTargetCollation).
+export function rejectIndeterminateTarget(d: Deriv): void {
+  if (d.kind === "indeterminate") {
+    throw engineError("collation_mismatch", "collation mismatch between implicit collations");
+  }
 }
 
 // asciiLower lowercases only the ASCII letters A-Z (Rust's eq_ignore_ascii_case folding).
@@ -3261,8 +3404,14 @@ export function resolveQuantified(
       `operator does not exist: ${rtName(rl.type)} ${binaryOpSymbol(op)} ${rtName(elem)}`,
     );
   }
+  // A text quantifier compares under the left operand's derivation alone (spec/design/collation.md
+  // §1): an array carries no collation in jed (a recorded narrowing, §15).
+  const collation =
+    rl.type.kind === "text" && elem.kind === "text"
+      ? resolveDeriv(scope.catalog, deriveCollation(scope, lhs))
+      : null;
   return {
-    node: { kind: "quantified", op, all, lhs: rl.node, array: ra.node, rowWise: false },
+    node: { kind: "quantified", op, all, lhs: rl.node, array: ra.node, rowWise: false, collation },
     type: { kind: "bool" },
   };
 }

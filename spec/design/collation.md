@@ -223,13 +223,53 @@ SELECT 'ä' < 'z' COLLATE "de"                      -- per-expression collation 
   scalar function with an overload whose `result` is `text`
   ([../functions/catalog.toml](../functions/catalog.toml)) — a non-text argument derives nothing, so
   the range overloads of `lower`/`upper` are unaffected, and a function returning a non-text type
-  (`length`, `strpos`) carries no collation. Casts, `CASE`, `COALESCE`, `GREATEST`/`LEAST`,
-  aggregates (`min`/`max`), and subquery outputs still derive none (§14). **Persisted index
-  expressions keep the earlier rule**: an expression key's collation and a partial-index predicate's
-  comparisons derive with the function rule off, so an index over `lower(name)` stays `C`-keyed and
-  its stored bytes and membership never change meaning. An equality on such a key still seeks it
-  under any comparison collation (`=` is byte identity under every deterministic collation, §7), so
-  `WHERE lower(name) = $1` keeps its index; an ordering comparison on it is a residual filter.
+  (`length`, `strpos`) carries no collation. **Persisted index expressions keep the earlier rule**:
+  an expression key's collation and a partial-index predicate's comparisons derive with the function
+  rule — and every expression rule below — off (only a column, `COLLATE`, and `||` derive), so an
+  index over `lower(name)` stays `C`-keyed and its stored bytes and membership never change meaning.
+  An equality on such a key still seeks it under any comparison collation (`=` is byte identity
+  under every deterministic collation, §7), so `WHERE lower(name) = $1` keeps its index; an ordering
+  comparison on it is a residual filter.
+- **Every other text-valued expression carries its inputs' collation**, PostgreSQL's general rule
+  (`assign_collations_walker`): a node whose result is `text` combines the derivations of the inputs
+  that make up its value, so an explicit `COLLATE` anywhere inside stays explicit on the way up and
+  two different implicit inputs are indeterminate.
+  - **Casts.** A cast to `text` passes its operand's derivation through (`name::text` sorts by
+    `name`'s collation); a cast from a non-text type derives none. A cast to `varchar(n)` (a length
+    coercion — a node of its own in PostgreSQL) combines its operand like a function, so it turns a
+    conflicted column (below) into no collation, where a plain `::text` leaves it conflicted. A cast
+    to any non-text type derives none.
+  - **`CASE`, `COALESCE`, `GREATEST`/`LEAST`** combine their **result** inputs: every
+    `THEN` and the `ELSE` of a `CASE` (never the simple-`CASE` operand or a `WHEN` condition —
+    PostgreSQL's `CaseExpr` rule), and every argument of the others.
+  - **Aggregates and window functions** whose result is the input type — `min`/`max` (plain or
+    `OVER`), `lag`/`lead`/`first_value`/`last_value`/`nth_value`, and the ordered-set `mode` /
+    `percentile_disc` (their single `WITHIN GROUP` key) — carry their value arguments' collation;
+    `FILTER` and an in-aggregate `ORDER BY` contribute nothing. `min`/`max` also **compare** under
+    that collation, so `max(name)` over an `unicode` column is its `unicode` maximum: the comparison
+    collation is the argument's own derivation, so a conflicted or indeterminate argument is `42P22`
+    (PostgreSQL raises it once two values are compared; jed when the query is planned). The fold
+    stays unmetered, like the sort (§11). A `WITHIN GROUP` key, like a query `ORDER BY` key, takes
+    its expression's derivation (not only a bare column's).
+  - **Scalar subqueries** carry their single output column's collation as an **implicit** one (an
+    explicit body `COLLATE` is implicit outside, as for a derived table); a body output with an
+    indeterminate or conflicted collation makes the subquery indeterminate.
+  - **`IN (SELECT …)` and `op ANY/ALL (SELECT …)`** compare under the combination of the left
+    operand and the subquery column's implicit collation — an ordering quantifier sorts by it, and a
+    conflict is `42P22` (for `IN` / `= ANY` too: PostgreSQL's `texteq` demands a collation). The
+    **array** form `x op ANY/ALL (array)` compares under the left operand's derivation: an array
+    carries no collation in jed (a recorded narrowing — §15).
+  - A conflicted input (a UNION ALL / VALUES column over two implicit collations) **yields** inside
+    any of these nodes — PostgreSQL gives the node its default collation — so `coalesce(x, '')` over
+    such a column is usable where a bare `x` is `42P22` (the exceptions: a plain `::text` cast and
+    `min`/`max`'s own comparison, above).
+- **A sort or grouping target must not be indeterminate.** An `ORDER BY`, `GROUP BY`, `DISTINCT` /
+  `DISTINCT ON`, window `PARTITION BY` / `ORDER BY`, or `WITHIN GROUP` key whose expression combines
+  two different implicit collations (`ORDER BY lpad(a, 2, b)`, `GROUP BY coalesce(a, b)`) is **`42P21`**
+  (`collation mismatch between implicit collations "x" and "y"`) when the query is planned, before
+  any row is read — PostgreSQL's parse-time check on a sort/group target. A grouping or partitioning
+  key raises it although jed groups by byte equality (§7). A key that merely *reads* a conflicted
+  column (`ORDER BY x` over the UNION ALL column above) is still `42P22`, as in PostgreSQL.
 - **Set operations take their inputs' common collation.** Each `UNION` / `INTERSECT` / `EXCEPT`
   output column combines its two inputs' derivations (PostgreSQL's `select_common_collation`): an
   explicit `COLLATE` in either input wins, two different explicit collations are `42P21`, and the
@@ -869,8 +909,11 @@ sub-slices**, each independently testable (CLAUDE.md §10), in dependency order:
   catalog); set-operation and VALUES columns take their inputs' common collation, with PG's eager
   `42P21` for a non-ALL implicit conflict and UNION ALL's conflicted no-collation state; and PG's
   recursive-CTE collation check (`42P21`) — §1 "Derived relations" / "Function results" / "Set
-  operations". Still deferred: casts, `CASE`/`COALESCE`/`GREATEST`/`LEAST`, `min`/`max`, and scalar
-  / `IN` subquery outputs derive none.)*
+  operations"; and every other text-valued expression — casts, `CASE`/`COALESCE`/
+  `GREATEST`/`LEAST`, `min`/`max` (which also compare under it) and the input-typed window /
+  ordered-set functions, scalar subqueries, and the `IN`/`ANY`/`ALL` subquery comparisons — with
+  PG's parse-time `42P21` for an indeterminate sort/group target — §1 "Every other text-valued
+  expression". Still deferred: arrays carry no collation, §15.)*
 - **1e — collated keys** ✅ *landed*: the sort-key key encoding as a new
   [encoding.md §2.12](encoding.md) sub-section (`text-collated-sortkey`), a collated text
   `PRIMARY KEY` / ordered secondary index / `UNIQUE` whose stored key is the column collation's UCA
@@ -1110,12 +1153,14 @@ Recorded per CLAUDE.md §1:
 - **No `CREATE COLLATION` and no host-collation import** (§14); a collation comes from a **loaded jed
   bundle** or it does not exist for that database — there is no SQL DDL to define one and no host-ICU
   import path (the only load is the privileged `db.LoadUnicodeData` of jed's own pinned bytes, §4).
-- **An `ORDER BY` key whose own collation is indeterminate is `42P22`**, where PostgreSQL
-  reports `42P21` (`collation mismatch between implicit collations`) for a sort target it can pin at
-  parse time. jed raises the one indeterminate-collation error wherever a conflicted collation is
-  consumed; the SQLSTATE differs, the outcome (an error, no rows) does not. Relatedly, PostgreSQL
-  also errors on a **conflicted UNION ALL column used as a `GROUP BY` or `min`/`max` input** (its hashing / comparison needs a collation); jed groups and de-duplicates by byte equality
-  (§7) and does not consult the collation there, so it returns the rows.
+- **A conflicted UNION ALL / VALUES column used as a `GROUP BY` key** groups by byte equality
+  (§7) and returns the rows; PostgreSQL's hashing / sorting needs a collation and raises `42P22`.
+  Relatedly, jed raises a `min`/`max` comparison conflict (`42P22`) when the query is planned, where
+  PostgreSQL raises it only once two values are compared (so a one-row group succeeds there).
+- **Arrays carry no collation.** PostgreSQL gives a `text[]` expression its elements' collation, so
+  `x < ANY (ARRAY[y])` combines `x` and `y`, and an array comparison sorts its text elements under
+  it; jed compares a quantified array element under the left operand's derivation alone and orders
+  `text[]` values bytewise. (Equal results whenever the array holds literals or `C` values.)
 - **Text functions never demand a collation of their own.** A few PostgreSQL string functions
   (`replace`, `strpos`, `split_part`, …) look up their input collation to reject nondeterministic
   collations, and so raise `42P22` when their arguments' collations conflict; jed has only

@@ -1519,7 +1519,19 @@ func resolveQuantified(s *scope, q *quantifiedExpr, ag *aggCtx, params *paramTyp
 		return nil, resolvedType{}, newError(UndefinedFunction,
 			fmt.Sprintf("operator does not exist: %s %s %s", rtName(lt), binaryOpSymbol(q.Op), rtName(*at.elem)))
 	}
-	return &rExpr{kind: reQuantified, op: q.Op, quantAll: q.All, lhs: rl, rhs: ra}, resolvedType{kind: rtBool}, nil
+	// A text quantifier compares under the left operand's derivation alone (spec/design/collation.md
+	// §1): an array carries no collation in jed (a recorded narrowing, §15).
+	var coll *Collation
+	if lt.kind == rtText && at.elem.kind == rtText {
+		d, err := deriveCollation(s, q.Lhs)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if coll, err = resolveDeriv(s.catalog, d); err != nil {
+			return nil, resolvedType{}, err
+		}
+	}
+	return &rExpr{kind: reQuantified, op: q.Op, quantAll: q.All, lhs: rl, rhs: ra, collation: coll}, resolvedType{kind: rtBool}, nil
 }
 
 // resolveQuantifiedSubquery resolves `lhs op ANY/ALL ( SELECT … )` (array-functions.md §11.6) — the
@@ -1540,7 +1552,13 @@ func resolveQuantifiedSubquery(s *scope, q *quantifiedSubqueryExpr, ag *aggCtx, 
 		return nil, resolvedType{}, newError(UndefinedFunction,
 			fmt.Sprintf("operator does not exist: %s %s %s", rtName(lt), binaryOpSymbol(q.Op), rtName(elem)))
 	}
-	return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqQuantified, op: q.Op, quantAll: q.All, lhs: rlhs, rowValued: rowValued}, resolvedType{kind: rtBool}, nil
+	// The comparison collation: the left operand combined with the body column's implicit collation
+	// (spec/design/collation.md §1); a conflict is 42P22.
+	coll, err := membershipCollation(s, q.Lhs, lt, elem, rowValued, &plan)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqQuantified, op: q.Op, quantAll: q.All, lhs: rlhs, rowValued: rowValued, collation: coll}, resolvedType{kind: rtBool}, nil
 }
 
 // resolveJSONAccess resolves a jsonb accessor operator (`-> ->> #> #>>`,

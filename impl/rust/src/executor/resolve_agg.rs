@@ -1323,6 +1323,7 @@ pub(crate) fn resolve_aggregate(
                     filter: None,
                     osa: None,
                     hypo: None,
+                    collation: None,
                 });
                 Ok((RExpr::Column(slot), result))
             }
@@ -1339,6 +1340,7 @@ pub(crate) fn resolve_aggregate(
                     filter: None,
                     osa: None,
                     hypo: None,
+                    collation: None,
                 });
                 Ok((RExpr::Column(slot), result))
             }
@@ -1376,6 +1378,7 @@ pub(crate) fn resolve_aggregate(
         let (plan, result) = aggregate_plan(name, desc.result, &t);
         (plan, Some(r), result)
     };
+    let collation = minmax_collation(scope, plan, args, &result)?;
     // FILTER (WHERE cond): resolve the per-row predicate against the input row with aggregates
     // FORBIDDEN — an aggregate inside FILTER is 42803, matching PG (aggregates.md §11). A
     // non-boolean condition (or an untyped NULL, always unknown → folds no row) is 42804. The
@@ -1411,6 +1414,7 @@ pub(crate) fn resolve_aggregate(
                 filter: rfilter,
                 osa: None,
                 hypo: None,
+                collation: collation.clone(),
             });
             Ok((RExpr::Column(slot), result))
         }
@@ -1427,10 +1431,29 @@ pub(crate) fn resolve_aggregate(
                 filter: rfilter,
                 osa: None,
                 hypo: None,
+                collation: collation.clone(),
             });
             Ok((RExpr::Column(slot), result))
         }
         _ => unreachable!("an aggregate in a non-collecting context is handled above"),
+    }
+}
+
+/// The comparison collation of a text `MIN`/`MAX` (spec/design/collation.md §1 "Aggregates and
+/// window functions"): the operand's own derivation, so a conflicted or indeterminate operand is
+/// 42P22 (PostgreSQL raises it once two values compare). `None` for any other aggregate.
+pub(crate) fn minmax_collation(
+    scope: &Scope,
+    plan: AggPlan,
+    args: &[Expr],
+    result: &ResolvedType,
+) -> Result<Option<std::sync::Arc<Collation>>> {
+    if !matches!(plan, AggPlan::Min | AggPlan::Max) || *result != ResolvedType::Text {
+        return Ok(None);
+    }
+    match args.first() {
+        Some(arg) => resolve_deriv(scope.catalog, derive_collation(scope, arg)?),
+        None => Ok(None),
     }
 }
 
@@ -1501,17 +1524,12 @@ pub(crate) fn resolve_ordered_set_aggregate(
             }
             resolve_collation_name(scope.catalog, name)?
         }
-        None => match (&key.expr, &key.qualifier, &key.column) {
-            // A bare/qualified column key with no explicit COLLATE inherits the column's collation.
-            (None, q, col) => {
-                let r = match q {
-                    Some(q) => scope.resolve_qualified(q, col)?,
-                    None => scope.resolve_bare(col)?,
-                };
-                column_collation(scope, r)?
-            }
-            _ => None,
-        },
+        // Otherwise the key's derived collation (collation.md §1): a column key's frozen collation,
+        // an expression key's derivation; an indeterminate key is 42P21 (a sort target).
+        None if optype == ResolvedType::Text => {
+            sort_target_collation(scope.catalog, order_key_deriv(scope, key)?)?
+        }
+        None => None,
     };
 
     let lname = name.to_ascii_lowercase();
@@ -1590,6 +1608,7 @@ pub(crate) fn resolve_ordered_set_aggregate(
                 filter: rfilter,
                 osa: Some(osa),
                 hypo: None,
+                collation: None,
             });
             Ok((RExpr::Column(slot), result))
         }
@@ -1606,6 +1625,7 @@ pub(crate) fn resolve_ordered_set_aggregate(
                 filter: rfilter,
                 osa: Some(osa),
                 hypo: None,
+                collation: None,
             });
             Ok((RExpr::Column(slot), result))
         }
@@ -1691,16 +1711,10 @@ pub(crate) fn resolve_hypothetical_set_aggregate(
                 }
                 resolve_collation_name(scope.catalog, cn)?
             }
-            None => match (&key.expr, &key.qualifier, &key.column) {
-                (None, q, col) => {
-                    let r = match q {
-                        Some(q) => scope.resolve_qualified(q, col)?,
-                        None => scope.resolve_bare(col)?,
-                    };
-                    column_collation(scope, r)?
-                }
-                _ => None,
-            },
+            None if ktype == ResolvedType::Text => {
+                sort_target_collation(scope.catalog, order_key_deriv(scope, key)?)?
+            }
+            None => None,
         };
         // The hypothetical direct arg, evaluated per group (grouped context); a literal adapts to the
         // key's scalar type via the hint. Its type must match the key's family (else 42883).
@@ -1764,6 +1778,7 @@ pub(crate) fn resolve_hypothetical_set_aggregate(
                 filter: rfilter,
                 osa: None,
                 hypo: Some(hypo),
+                collation: None,
             });
             Ok((RExpr::Column(slot), result))
         }
@@ -1780,6 +1795,7 @@ pub(crate) fn resolve_hypothetical_set_aggregate(
                 filter: rfilter,
                 osa: None,
                 hypo: Some(hypo),
+                collation: None,
             });
             Ok((RExpr::Column(slot), result))
         }
@@ -2095,6 +2111,7 @@ pub(crate) fn resolve_window_call(
         _ => None,
     };
     let mut wargs: Vec<RExpr> = Vec::new();
+    let mut agg_collation = None;
     let (plan, result) = if let Some(p) = no_arg_i64 {
         if star || !args.is_empty() {
             return Err(EngineError::new(
@@ -2184,6 +2201,7 @@ pub(crate) fn resolve_window_call(
             wargs.push(r); // the aggregate operand → args[0]
             (plan, result)
         };
+        agg_collation = minmax_collation(scope, aggplan, args, &result)?;
         (WindowPlan::Agg(aggplan), result)
     } else if lname == "first_value" || lname == "last_value" || lname == "nth_value" {
         // Frame-sensitive value pickers (S4, window.md §4). first/last_value take one value
@@ -2250,6 +2268,7 @@ pub(crate) fn resolve_window_call(
         args: wargs,
         frame,
         filter: rfilter,
+        agg_collation,
     };
     // Append the spec and resolve the result slot (the PLACEHOLDER `WINDOW_RESULT_BASE + w`, rebased to
     // its real slot after the row layout is final — window.md §5.1). Restore the borrowed `agg_specs`
@@ -2314,7 +2333,12 @@ pub(crate) fn resolve_window_def(
 )> {
     let mut partition = Vec::with_capacity(wd.partition.len());
     for key in &wd.partition {
-        let (rexpr, _ty) = resolve(scope, key, None, key_ctx, params)?;
+        let (rexpr, ty) = resolve(scope, key, None, key_ctx, params)?;
+        // Partitioning groups by byte equality, but an indeterminate key is still 42P21
+        // (spec/design/collation.md §1 "A sort or grouping target").
+        if ty == ResolvedType::Text {
+            reject_indeterminate_target(&derive_collation(scope, key)?)?;
+        }
         partition.push(window_key_slot(rexpr, "PARTITION BY", window_keys)?);
     }
     let mut order: Vec<crate::spill::SortKey> = Vec::with_capacity(wd.order.len());
@@ -2339,7 +2363,7 @@ pub(crate) fn resolve_window_def(
                 }
                 resolve_collation_name(scope.catalog, cn)?
             }
-            None => resolve_deriv(scope.catalog, derive_collation(scope, &key.expr)?)?,
+            None => sort_target_collation(scope.catalog, derive_collation(scope, &key.expr)?)?,
         };
         let slot = window_key_slot(rexpr, "window ORDER BY", window_keys)?;
         order.push((slot, key.descending, key.nulls_first, coll));

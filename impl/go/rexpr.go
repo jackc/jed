@@ -1045,7 +1045,10 @@ type rExpr struct {
 	// C / default byte order (the unchanged fast path); non-nil is a loaded collation that orders the
 	// ORDERING comparisons (< <= > >=) by its UCA sort key. =/<> stay byte-equality regardless
 	// (deterministic-collation equality IS byte-identity), but it is derived + conflict-checked
-	// (42P21) for every comparison op.
+	// (42P21) for every comparison op. A reQuantified / sqQuantified reSubquery carries its text
+	// comparison collation here too (spec/design/collation.md §1 "IN / ANY / ALL"): the left
+	// operand's derivation for the array form (an array carries none), combined with the body
+	// column's implicit collation for the subquery form; an ordering quantifier sorts by it.
 	collation *Collation
 
 	// reCase: (condition, result) arms, the ELSE result (constNull for an implicit ELSE), and

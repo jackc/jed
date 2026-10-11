@@ -477,6 +477,17 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 					groupKeyExprs = append(groupKeyExprs, nil)
 				}
 			} else {
+				// Grouping is byte equality, but an indeterminate key is still 42P21
+				// (spec/design/collation.md §1 "A sort or grouping target").
+				if gr.ty.kind == rtText {
+					d, derr := deriveCollation(s, gr.canon)
+					if derr != nil {
+						return nil, derr
+					}
+					if err := rejectIndeterminateTarget(d); err != nil {
+						return nil, err
+					}
+				}
 				if gr.ty.kind == rtJson {
 					return nil, newError(UndefinedFunction, "could not identify an equality operator for type json")
 				}
@@ -614,6 +625,13 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		for _, t := range columnTypes {
 			if t.kind == rtJson {
 				return nil, newError(UndefinedFunction, "could not identify an equality operator for type json")
+			}
+		}
+		// Each DISTINCT output column is a grouping target: an indeterminate one is 42P21
+		// (spec/design/collation.md §1 "A sort or grouping target").
+		for _, d := range columnDerivs {
+			if err := rejectIndeterminateTarget(d); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -881,7 +899,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			if derr != nil {
 				return nil, derr
 			}
-			if coll, err = resolveDeriv(s.catalog, d); err != nil {
+			if coll, err = sortTargetCollation(s.catalog, d); err != nil {
 				return nil, err
 			}
 		}

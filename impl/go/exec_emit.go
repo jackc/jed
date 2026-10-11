@@ -5,6 +5,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Result emission and post-scan projection (the back half of SELECT execution). This file holds the
@@ -1555,7 +1556,7 @@ func (db *engine) foldUncorrelatedInRExpr(e *rExpr, bound []Value, ctes cteCtx, 
 				elems[i] = subqueryRowValue(row, e.rowValued)
 			}
 			arr := &rExpr{kind: reConstArray, cArray: oneDimArray(elems)}
-			*e = rExpr{kind: reQuantified, op: e.op, quantAll: e.quantAll, lhs: e.lhs, rhs: arr, rowWise: e.rowValued}
+			*e = rExpr{kind: reQuantified, op: e.op, quantAll: e.quantAll, lhs: e.lhs, rhs: arr, rowWise: e.rowValued, collation: e.collation}
 		default: // sqIn
 			list := make([]Value, len(r.rows))
 			for i, row := range r.rows {
@@ -2247,7 +2248,11 @@ func inMembership(lv Value, list []Value, negated bool, m *costMeter) (Value, er
 //
 // rowWise is the folded ROW-VALUED subquery form (grammar.md §26): each element compares by the
 // row-constructor 3VL (rowCmp3) rather than quantifiedCmp3's composite total order.
-func quantifiedMembership(op binaryOp, all, rowWise bool, lv, av Value, m *costMeter) (Value, error) {
+//
+// collation (non-nil) is the comparison collation of a text quantifier (spec/design/collation.md §1
+// "IN / ANY / ALL"): an ORDERING comparison of two text values sorts by it, charging collate per code
+// point exactly like a collated reCompare.
+func quantifiedMembership(op binaryOp, all, rowWise bool, lv, av Value, collation *Collation, m *costMeter) (Value, error) {
 	if av.Kind == ValNull {
 		return NullValue(), nil
 	}
@@ -2259,7 +2264,32 @@ func quantifiedMembership(op binaryOp, all, rowWise bool, lv, av Value, m *costM
 			return Value{}, err
 		}
 		var tv ThreeValued
-		if rowWise {
+		if collation != nil && (op == opLt || op == opGt || op == opLe || op == opGe) &&
+			lv.Kind == ValText && e.Kind == ValText {
+			m.Charge(costs.Collate * int64(utf8.RuneCountInString(lv.str())+utf8.RuneCountInString(e.str())))
+			if err := m.Guard(); err != nil {
+				return Value{}, err
+			}
+			c, err := collatedCmp(collation, lv.str(), e.str())
+			if err != nil {
+				return Value{}, err
+			}
+			var res bool
+			switch op {
+			case opLt:
+				res = c < 0
+			case opGt:
+				res = c > 0
+			case opLe:
+				res = c <= 0
+			default: // OpGe
+				res = c >= 0
+			}
+			tv = False
+			if res {
+				tv = True
+			}
+		} else if rowWise {
 			tv = rowCmp3(op, lv, e)
 		} else {
 			tv = quantifiedCmp3(op, lv, e)

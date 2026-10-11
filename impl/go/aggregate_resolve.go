@@ -79,6 +79,10 @@ func resolveAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 		plan, result = aggregatePlan(name, desc.Result, t)
 		operand = r
 	}
+	collation, err := minmaxCollation(s, plan, fc.Args, result)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
 	// FILTER (WHERE cond): resolve the per-row predicate against the input row with aggregates
 	// FORBIDDEN — an aggregate inside FILTER is 42803, matching PG (aggregates.md §11). A non-boolean
 	// condition (or an untyped NULL, always unknown → folds no row) is 42804. The fold loop evaluates
@@ -97,8 +101,22 @@ func resolveAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	}
 	// Aggregate results follow the group-key values in the synthetic row.
 	slot := len(ag.groupKeys) + len(ag.specs)
-	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand, distinct: fc.Distinct, filter: filter})
+	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand, distinct: fc.Distinct, filter: filter, collation: collation})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
+}
+
+// minmaxCollation is the comparison collation of a text MIN/MAX (spec/design/collation.md §1
+// "Aggregates and window functions"): the operand's own derivation, so a conflicted or indeterminate
+// operand is 42P22 (PostgreSQL raises it once two values compare). nil for any other aggregate.
+func minmaxCollation(s *scope, plan aggPlan, args []*exprNode, result resolvedType) (*Collation, error) {
+	if (plan != planMin && plan != planMax) || result.kind != rtText || len(args) == 0 {
+		return nil, nil
+	}
+	d, err := deriveCollation(s, *args[0])
+	if err != nil {
+		return nil, err
+	}
+	return resolveDeriv(s.catalog, d)
 }
 
 // resolveOrderedSetAggregate resolves agg(direct_args) WITHIN GROUP (ORDER BY key) — mode,
@@ -140,9 +158,10 @@ func resolveOrderedSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *
 	}
 	// The WITHIN GROUP key's COLLATION drives the sort (aggregates.md §13): an explicit COLLATE on the
 	// key (text operand only — else "collations are not supported by type T", like the query ORDER BY),
-	// else a bare/qualified column key inherits its column's frozen collation; otherwise the default C
-	// (byte) order. Resolved to the loaded Collation (42704 if not loaded). The finalize sort applies
-	// it (an unmapped code point → 0A000 there).
+	// else the key's derived collation (collation.md §1 — a column key's frozen collation, an
+	// expression key's derivation; an indeterminate key is 42P21, a sort target); otherwise the
+	// default C (byte) order. Resolved to the loaded Collation (42704 if not loaded). The finalize
+	// sort applies it (an unmapped code point → 0A000 there).
 	var collation *Collation
 	if key.Collation != "" {
 		if optype.kind != rtText && optype.kind != rtNull {
@@ -151,18 +170,12 @@ func resolveOrderedSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *
 		if collation, err = resolveCollationName(s.catalog, key.Collation); err != nil {
 			return nil, resolvedType{}, err
 		}
-	} else if key.Expr == nil {
-		// A bare/qualified column key with no explicit COLLATE inherits the column's frozen collation.
-		var r resolved
-		if key.Qualifier != "" {
-			r, err = s.resolveQualified(key.Qualifier, key.Column)
-		} else {
-			r, err = s.resolveBare(key.Column)
-		}
+	} else if optype.kind == rtText {
+		kd, err := orderKeyDeriv(s, &key)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		if collation, err = columnCollation(s, r); err != nil {
+		if collation, err = sortTargetCollation(s.catalog, kd); err != nil {
 			return nil, resolvedType{}, err
 		}
 	}
@@ -270,8 +283,8 @@ func resolveHypotheticalSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, par
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		// The key's collation (explicit COLLATE — text only — or a bare/qualified column's frozen
-		// collation), §13. An unknown name is 42704; a COLLATE on a non-text key is 42804.
+		// The key's collation (explicit COLLATE — text only — or the key's derived collation, an
+		// indeterminate one 42P21), §13. An unknown name is 42704; a COLLATE on a non-text key is 42804.
 		var collation *Collation
 		if key.Collation != "" {
 			if ktype.kind != rtText && ktype.kind != rtNull {
@@ -280,17 +293,12 @@ func resolveHypotheticalSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, par
 			if collation, err = resolveCollationName(s.catalog, key.Collation); err != nil {
 				return nil, resolvedType{}, err
 			}
-		} else if key.Expr == nil {
-			var r resolved
-			if key.Qualifier != "" {
-				r, err = s.resolveQualified(key.Qualifier, key.Column)
-			} else {
-				r, err = s.resolveBare(key.Column)
-			}
+		} else if ktype.kind == rtText {
+			kd, err := orderKeyDeriv(s, &key)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
-			if collation, err = columnCollation(s, r); err != nil {
+			if collation, err = sortTargetCollation(s.catalog, kd); err != nil {
 				return nil, resolvedType{}, err
 			}
 		}
@@ -499,6 +507,8 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 		plan   windowPlan
 		result resolvedType
 		wagg   aggPlan // the aggregate plan, valid only when plan == planAgg
+		// aggColl is a text MIN/MAX window aggregate's comparison collation (minmaxCollation).
+		aggColl *Collation
 	)
 	// The sub-context window ARGUMENTS resolve in (spec/design/window.md §5.1). In a grouped query
 	// (ag.collecting) they resolve against the grouped row — a nested aggregate collects into the
@@ -637,6 +647,10 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 			wagg, result = aggregatePlan(name, desc.Result, t)
 			wargs = append(wargs, r) // the aggregate operand → args[0]
 		}
+		var err error
+		if aggColl, err = minmaxCollation(s, wagg, fc.Args, result); err != nil {
+			return nil, resolvedType{}, err
+		}
 		plan = planAgg
 	case name == "first_value" || name == "last_value" || name == "nth_value":
 		// Frame-sensitive value pickers (S4, window.md §4). first/last_value take one value
@@ -714,7 +728,7 @@ func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx,
 		ag.groupingSpecs = sub.groupingSpecs
 	}
 	slot := ag.windowBase + len(ag.windowSpecs)
-	ag.windowSpecs = append(ag.windowSpecs, windowSpec{plan: plan, partition: partition, order: order, args: wargs, aggPlan: wagg, frame: frame, filter: rfilter})
+	ag.windowSpecs = append(ag.windowSpecs, windowSpec{plan: plan, partition: partition, order: order, args: wargs, aggPlan: wagg, frame: frame, filter: rfilter, aggCollation: aggColl})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
 }
 
@@ -747,9 +761,20 @@ func windowKeySlot(rexpr *rExpr, clause string, windowKeys *[]*rExpr) (int, erro
 func resolveWindowDef(s *scope, wd *windowDef, keyCtx *aggCtx, windowKeys *[]*rExpr, params *paramTypes) ([]int, []orderSlot, *resolvedFrame, error) {
 	partition := make([]int, 0, len(wd.Partition))
 	for _, key := range wd.Partition {
-		rexpr, _, err := resolve(s, key, nil, keyCtx, params)
+		rexpr, ty, err := resolve(s, key, nil, keyCtx, params)
 		if err != nil {
 			return nil, nil, nil, err
+		}
+		// Partitioning groups by byte equality, but an indeterminate key is still 42P21
+		// (spec/design/collation.md §1 "A sort or grouping target").
+		if ty.kind == rtText {
+			d, derr := deriveCollation(s, key)
+			if derr != nil {
+				return nil, nil, nil, derr
+			}
+			if err := rejectIndeterminateTarget(d); err != nil {
+				return nil, nil, nil, err
+			}
 		}
 		slot, err := windowKeySlot(rexpr, "PARTITION BY", windowKeys)
 		if err != nil {
@@ -769,9 +794,10 @@ func resolveWindowDef(s *scope, wd *windowDef, keyCtx *aggCtx, windowKeys *[]*rE
 		// The sort-key collation. An explicit trailing COLLATE (rare — parseExpr usually absorbs a
 		// COLLATE into the key expression) must be on a text key (42804); otherwise the collation is
 		// DERIVED from the key expression (collation.md §1) — a COLLATE inside it is explicit, a bare
-		// text column is its frozen implicit collation, every other shape resets to none (C). A
-		// collated window ORDER BY honors the collation in both the per-partition sort and peer
-		// determination (window.md §3/§5); COLLATE "C" resolves to nil (the raw-byte fast path).
+		// text column is its frozen implicit collation, any other text-valued node carries its inputs'
+		// (an indeterminate key is 42P21, a sort target). A collated window ORDER BY honors the
+		// collation in both the per-partition sort and peer determination (window.md §3/§5); COLLATE
+		// "C" resolves to nil (the raw-byte fast path).
 		var coll *Collation
 		if key.Collation != "" {
 			if ty.kind != rtText && ty.kind != rtNull {
@@ -785,7 +811,7 @@ func resolveWindowDef(s *scope, wd *windowDef, keyCtx *aggCtx, windowKeys *[]*rE
 			if derr != nil {
 				return nil, nil, nil, derr
 			}
-			if coll, err = resolveDeriv(s.catalog, d); err != nil {
+			if coll, err = sortTargetCollation(s.catalog, d); err != nil {
 				return nil, nil, nil, err
 			}
 		}

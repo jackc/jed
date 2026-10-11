@@ -295,6 +295,13 @@ inputs share. Combining two columns with different collations is an error (`42P2
 `UNION ALL`: there the column has no collation, and sorting it needs an explicit
 `ORDER BY x COLLATE "…"` (otherwise `42P22`).
 
+Every other text-valued expression carries a collation the same way: a cast to `text`, `CASE`,
+`COALESCE`, `GREATEST`/`LEAST`, `min`/`max`, `lag`/`lead`/`first_value`, `mode`, and a scalar
+subquery all keep their inputs' collation. `min(name)` and `max(name)` also compare by it, and
+`name < ANY (SELECT …)` compares by `name`'s collation. Sorting or grouping by an expression that
+mixes two columns' different collations (`ORDER BY coalesce(a, b)`) is `42P21`; add a `COLLATE` to
+pick one.
+
 ## `VALUES` lists in `FROM` (`FROM (VALUES …) AS v(x)`)
 
 A derived table's body may also be a `VALUES` list — a literal table of rows you write inline,

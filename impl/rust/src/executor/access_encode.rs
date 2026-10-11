@@ -4852,6 +4852,8 @@ pub(crate) struct WindowSpec {
     /// function (a non-aggregate window function with `FILTER` is `0A000`). A `FILTER` disables the
     /// sliding-frame optimization (a filtered row can't be cleanly un-folded) — every frame re-folds.
     pub(crate) filter: Option<RExpr>,
+    /// A text `MIN`/`MAX` window aggregate's comparison collation (see [`AggSpec::collation`]).
+    pub(crate) agg_collation: Option<std::sync::Arc<Collation>>,
 }
 
 /// A resolved window frame (spec/design/window.md §6). `ROWS` physical offsets, `GROUPS` peer-group
@@ -5007,6 +5009,10 @@ pub(crate) struct AggSpec {
     /// key operands + per-key sort specs. `None` otherwise. (`operand` is `None` here — the keys
     /// are buffered as a tuple per row from `hypo.keys`.)
     pub(crate) hypo: Option<HypoParams>,
+    /// The comparison collation of a text `MIN`/`MAX` (spec/design/collation.md §1 "Aggregates and
+    /// window functions"): the operand's derivation; `None` for `C`, a non-text operand, or any
+    /// other aggregate.
+    pub(crate) collation: Option<std::sync::Arc<Collation>>,
 }
 
 /// A single `WITHIN GROUP` ordering-key sort spec (aggregates.md §13/§19): direction, NULL
@@ -5064,6 +5070,8 @@ pub(crate) enum Acc {
     MinMax {
         cur: Option<Value>,
         is_min: bool,
+        /// A text MIN/MAX's comparison collation (spec/design/collation.md §1); `None` is `C`.
+        collation: Option<std::sync::Arc<Collation>>,
     },
     /// json_agg / jsonb_agg accumulator (B4): the inputs' JSON-image nodes in row order. `compact`
     /// selects the json vs jsonb finalize type; `strict` skips NULL inputs. `seen` records whether the

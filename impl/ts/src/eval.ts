@@ -166,7 +166,7 @@ import {
   typeofName as jsonTypeofName,
   validateJson,
 } from "./json.ts";
-import { foldCase, foldLowerSimple, loadedProperty } from "./collation.ts";
+import { type Collation, foldCase, foldLowerSimple, loadedProperty } from "./collation.ts";
 import {
   compileRegex,
   regexIsMatch,
@@ -2118,7 +2118,15 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // column into an array and run the SAME 3VL fold as the array form.
         const lv = evalExpr(e.lhs!, row, env, m);
         const elements = r.rows.map((rr) => subqueryRowValue(rr, e.rowValued));
-        out = quantifiedMembership(e.op!, e.all!, e.rowValued, lv, arrayValue(elements), m);
+        out = quantifiedMembership(
+          e.op!,
+          e.all!,
+          e.rowValued,
+          lv,
+          arrayValue(elements),
+          e.collation ?? null,
+          m,
+        );
       } else {
         // in
         const lv = evalExpr(e.lhs!, row, env, m);
@@ -2140,7 +2148,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       m.charge(COSTS.operatorEval);
       const lv = evalExpr(e.lhs, row, env, m);
       const av = evalExpr(e.array, row, env, m);
-      return quantifiedMembership(e.op, e.all, e.rowWise, lv, av, m);
+      return quantifiedMembership(e.op, e.all, e.rowWise, lv, av, e.collation, m);
     }
   }
 }
@@ -2167,6 +2175,7 @@ export function quantifiedMembership(
   rowWise: boolean,
   lv: Value,
   av: Value,
+  collation: Collation | null,
   m: Meter,
 ): Value {
   if (av.kind === "null") return nullValue();
@@ -2176,7 +2185,36 @@ export function quantifiedMembership(
     m.charge(COSTS.operatorEval);
     m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(lv, e) - 1));
     m.guard();
-    const t = rowWise ? rowCmp3(op, lv, e) : quantifiedCmp3(op, lv, e);
+    // A collated ORDERING comparison of two text values sorts by the collation (spec/design/
+    // collation.md §1 "IN / ANY / ALL"), charging collate per code point like the "compare" node.
+    let t: ThreeValued;
+    if (
+      collation !== null &&
+      (op === "lt" || op === "gt" || op === "le" || op === "ge") &&
+      lv.kind === "text" &&
+      e.kind === "text"
+    ) {
+      m.charge(COSTS.collate * BigInt([...lv.text].length + [...e.text].length));
+      m.guard();
+      const c = collatedCmp(collation, lv.text, e.text);
+      let res: boolean;
+      switch (op) {
+        case "lt":
+          res = c < 0;
+          break;
+        case "gt":
+          res = c > 0;
+          break;
+        case "le":
+          res = c <= 0;
+          break;
+        default: // "ge"
+          res = c >= 0;
+      }
+      t = res ? "true" : "false";
+    } else {
+      t = rowWise ? rowCmp3(op, lv, e) : quantifiedCmp3(op, lv, e);
+    }
     if (t === "true") {
       // ANY short-circuits TRUE; ALL keeps going (TRUE is its neutral element).
       if (!all) return { kind: "bool", value: true };

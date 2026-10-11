@@ -434,6 +434,7 @@ impl Engine {
                     sub_rels: Vec::new(),
                     star: None,
                     storage_collation: false,
+                    subquery_derivs: Default::default(),
                 };
                 let left_names: Vec<&str> = seg_star
                     .iter()
@@ -470,6 +471,7 @@ impl Engine {
                     sub_rels: Vec::new(),
                     star: None,
                     storage_collation: false,
+                    subquery_derivs: Default::default(),
                 };
                 // The synthesized predicate compares the two chosen columns through one-column pseudo
                 // relations at their flat slots, so it binds exactly those columns even when a side is
@@ -565,6 +567,7 @@ impl Engine {
                     sub_rels: Vec::new(),
                     star: None,
                     storage_collation: false,
+                    subquery_derivs: Default::default(),
                 };
                 Some(resolve_boolean_filter(
                     &pair,
@@ -583,6 +586,7 @@ impl Engine {
                     sub_rels: sub_rels_within(&group_subs, seg, k + 1),
                     star: None,
                     storage_collation: false,
+                    subquery_derivs: Default::default(),
                 };
                 seg_star.extend(rel_star(k + 1));
                 Some(resolve_boolean_filter(&partial, on_expr, ptypes)?)
@@ -605,6 +609,7 @@ impl Engine {
             sub_rels: sub_rels_within(&group_subs, 0, usize::MAX),
             star: Some(star),
             storage_collation: false,
+            subquery_derivs: Default::default(),
         };
 
         // Expand GROUP BY (including ROLLUP / CUBE / GROUPING SETS) into a list of grouping sets,
@@ -648,6 +653,11 @@ impl Engine {
                         idx
                     }
                     GroupKeyResolved::Expr(rexpr, ty, canon) => {
+                        // Grouping is byte equality, but an indeterminate key is still 42P21
+                        // (spec/design/collation.md §1 "A sort or grouping target").
+                        if ty == ResolvedType::Text {
+                            reject_indeterminate_target(&derive_collation(&scope, &canon)?)?;
+                        }
                         if matches!(ty, ResolvedType::Json) {
                             return Err(EngineError::new(
                                 SqlState::UndefinedFunction,
@@ -838,6 +848,13 @@ impl Engine {
                 SqlState::UndefinedFunction,
                 "could not identify an equality operator for type json",
             ));
+        }
+        // Each DISTINCT output column is a grouping target: an indeterminate one is 42P21
+        // (spec/design/collation.md §1 "A sort or grouping target").
+        if sel.distinct {
+            for d in &column_derivs {
+                reject_indeterminate_target(d)?;
+            }
         }
         // HAVING resolves in `Collect` mode — it may reference aggregates (collected into the SAME
         // `agg_specs`, so their slots follow the projection's) and grouping keys, a non-grouped column
@@ -1148,7 +1165,7 @@ impl Engine {
                             }
                             resolve_collation_name(scope.catalog, cn)?
                         }
-                        None => resolve_deriv(scope.catalog, derive_collation(&scope, e)?)?,
+                        None => sort_target_collation(scope.catalog, derive_collation(&scope, e)?)?,
                     };
                     let k = order_exprs.len();
                     order_exprs.push(rexpr);

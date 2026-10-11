@@ -813,8 +813,8 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 // exactly the state the scalar fold (executor.go acc.fold) would leave so acc.finalize is unchanged.
 // It charges aggregate_accumulate once per survivor (the scalar loop charges it per (row × spec)),
 // bulk on the unmetered lane. COUNT/SUM-int stride the int lane via a colBatch; MIN/MAX and the
-// float SUM/AVG folds run over the raw Values (valueCmp / floatSum.add — type-agnostic, matching the
-// scalar arm exactly).
+// float SUM/AVG folds run over the raw Values (valueCmp, or a collated MIN/MAX's sort-key compare /
+// floatSum.add — matching the scalar arm exactly).
 func foldAggBatch(a *acc, spec *aggSpec, survivors []storedRow, meter *costMeter) error {
 	meter.Charge(costs.AggregateAccumulate * int64(len(survivors)))
 	switch spec.plan {
@@ -866,7 +866,17 @@ func foldAggBatch(a *acc, spec *aggSpec, survivors []storedRow, meter *costMeter
 				a.cur, a.hasCur = v, true
 				continue
 			}
-			c := valueCmp(a.cur, v)
+			// A text MIN/MAX under a collation compares sort keys, exactly like acc.fold
+			// (spec/design/collation.md §1).
+			var c int
+			if a.collation != nil && a.cur.Kind == ValText && v.Kind == ValText {
+				var err error
+				if c, err = collatedCmp(a.collation, a.cur.str(), v.str()); err != nil {
+					return err
+				}
+			} else {
+				c = valueCmp(a.cur, v)
+			}
 			keepCur := (spec.plan == planMin && c <= 0) || (spec.plan == planMax && c >= 0)
 			if !keepCur {
 				a.cur = v

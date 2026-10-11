@@ -774,7 +774,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 					if np > 0 {
 						groups = append(groups, span{s, np})
 					}
-					a := newAcc(spec.aggPlan)
+					a := newAccWithCollation(spec.aggPlan, spec.aggCollation)
 					// What the running accumulator retains (memory.md §6.3), returned at the end of
 					// the partition's pass.
 					var accCharge int64
@@ -854,7 +854,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 							if err != nil {
 								return err
 							}
-							a := newAcc(spec.aggPlan)
+							a := newAccWithCollation(spec.aggPlan, spec.aggCollation)
 							var accCharge int64
 							for k := lo; k < hi; k++ {
 								if ctx.isExcluded(pos, k, exclude) {
@@ -891,7 +891,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 						// SLIDING (monotone carry). removable aggregates un-fold the left edge; the rest
 						// rebuild when lo advances (an expanding frame never advances lo, so it only adds).
 						removable := spec.aggPlan == planCountStar || spec.aggPlan == planCount
-						a := newAcc(spec.aggPlan)
+						a := newAccWithCollation(spec.aggPlan, spec.aggCollation)
 						var accCharge int64
 						curLo, curHi := 0, 0
 						for pos := 0; pos < np; pos++ {
@@ -901,7 +901,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 							}
 							if !removable && lo > curLo {
 								// Left edge advanced over a non-invertible aggregate ⇒ rebuild over [lo, hi).
-								a = newAcc(spec.aggPlan)
+								a = newAccWithCollation(spec.aggPlan, spec.aggCollation)
 								meter.releaseQuery(accCharge)
 								accCharge = 0
 								for k := lo; k < hi; k++ {

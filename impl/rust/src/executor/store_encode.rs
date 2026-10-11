@@ -1152,6 +1152,7 @@ pub(crate) fn quantified_membership(
     row_wise: bool,
     lv: &Value,
     av: &Value,
+    collation: Option<&Collation>,
     m: &mut Meter,
 ) -> Result<Value> {
     let arr = match av {
@@ -1164,7 +1165,35 @@ pub(crate) fn quantified_membership(
         m.charge(COSTS.operator_eval);
         m.charge(COSTS.decimal_work * ((decimal_cmp_work(lv, e) - 1) as i64));
         m.guard()?;
-        let tv = if row_wise {
+        // A collated ORDERING comparison of two text values sorts by the collation (spec/design/
+        // collation.md §1 "IN / ANY / ALL"), charging `collate` per code point like `RExpr::Compare`.
+        let collated = match (collation, op, lv, e) {
+            (
+                Some(c),
+                CmpOp::Lt | CmpOp::Gt | CmpOp::Le | CmpOp::Ge,
+                Value::Text(x),
+                Value::Text(y),
+            ) => {
+                m.charge(COSTS.collate * (x.chars().count() as i64 + y.chars().count() as i64));
+                m.guard()?;
+                let ord = collated_cmp(c, x, y)?;
+                let res = match op {
+                    CmpOp::Lt => ord.is_lt(),
+                    CmpOp::Gt => ord.is_gt(),
+                    CmpOp::Le => ord.is_le(),
+                    _ => ord.is_ge(),
+                };
+                Some(if res {
+                    ThreeValued::True
+                } else {
+                    ThreeValued::False
+                })
+            }
+            _ => Option::None,
+        };
+        let tv = if let Some(tv) = collated {
+            tv
+        } else if row_wise {
             row_cmp3(op, lv, e)
         } else {
             quantified_cmp3(op, lv, e)

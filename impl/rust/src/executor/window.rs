@@ -717,7 +717,7 @@ pub(crate) fn apply_window_stage(
                         if np > 0 {
                             groups.push((s, np));
                         }
-                        let mut acc = Acc::new(aggplan);
+                        let mut acc = Acc::with_collation(aggplan, spec.agg_collation.clone());
                         // What the running accumulator retains (memory.md §6.3), returned at the end
                         // of the partition's pass.
                         let mut acc_charge = 0i64;
@@ -780,7 +780,8 @@ pub(crate) fn apply_window_stage(
                             // cached operand. A FILTER additionally skips a non-TRUE frame row.
                             for pos in 0..np {
                                 let (lo, hi) = ctx.bounds(pos, &spec.frame)?;
-                                let mut acc = Acc::new(aggplan);
+                                let mut acc =
+                                    Acc::with_collation(aggplan, spec.agg_collation.clone());
                                 let mut acc_charge = 0i64;
                                 for k in lo..hi {
                                     if ctx.is_excluded(pos, k, exclude) {
@@ -803,7 +804,7 @@ pub(crate) fn apply_window_stage(
                             // the rest rebuild when `lo` advances (an expanding frame never advances
                             // `lo`, so it only ever adds — the universal byte-identical case).
                             let removable = matches!(aggplan, AggPlan::CountStar | AggPlan::Count);
-                            let mut acc = Acc::new(aggplan);
+                            let mut acc = Acc::with_collation(aggplan, spec.agg_collation.clone());
                             let mut acc_charge = 0i64;
                             let mut cur_lo = 0usize;
                             let mut cur_hi = 0usize;
@@ -811,7 +812,7 @@ pub(crate) fn apply_window_stage(
                                 let (lo, hi) = ctx.bounds(pos, &spec.frame)?;
                                 if !removable && lo > cur_lo {
                                     // Left edge advanced over a non-invertible aggregate ⇒ rebuild.
-                                    acc = Acc::new(aggplan);
+                                    acc = Acc::with_collation(aggplan, spec.agg_collation.clone());
                                     meter.release_query(acc_charge);
                                     acc_charge = 0;
                                     for k in lo..hi {

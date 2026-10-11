@@ -92,6 +92,8 @@ type windowSpec struct {
 	// function (a non-aggregate window function with FILTER is 0A000). A FILTER disables the
 	// sliding-frame optimization (a filtered row can't be cleanly un-folded) — every frame re-folds.
 	filter *rExpr
+	// aggCollation is a text MIN/MAX window aggregate's comparison collation (see aggSpec.collation).
+	aggCollation *Collation
 }
 
 // resolvedFrame is a resolved window frame (spec/design/window.md §6). ROWS physical offsets,
@@ -240,6 +242,10 @@ type aggSpec struct {
 	// WITHIN GROUP — aggregates.md §19), set only for the planHypo* plans, nil otherwise. (operand
 	// is nil here — the keys are buffered as a tuple per row from hypo.keys.)
 	hypo *hypoParams
+	// collation is the comparison collation of a text MIN/MAX (spec/design/collation.md §1
+	// "Aggregates and window functions"): the operand's derivation; nil for C, a non-text operand, or
+	// any other aggregate.
+	collation *Collation
 }
 
 // keySort is a single WITHIN GROUP ordering-key sort spec (aggregates.md §13/§19): direction, NULL
@@ -271,6 +277,8 @@ type acc struct {
 	cur      Value
 	hasCur   bool
 	floatSum *floatSumAcc // non-nil for the float SUM/AVG plans (the streaming scan-order fold — float.md §7)
+	// collation is a text MIN/MAX's comparison collation (spec/design/collation.md §1); nil is C.
+	collation *Collation
 	// json_agg / jsonb_agg accumulator (B4): the inputs' JSON-image nodes in row order. jsonAsJSON
 	// selects the `json` result type (vs jsonb); jsonStrict skips a NULL-valued row. `seen` is reused
 	// to mark the group non-empty even when the strict filter drops every row (empty group → NULL,
@@ -359,8 +367,18 @@ func newAccFromSpec(s aggSpec) *acc {
 		// it is finalized inline in the group-emission loop (it needs the spec's sort specs).
 		return &acc{plan: s.plan}
 	default:
-		return newAcc(s.plan)
+		return newAccWithCollation(s.plan, s.collation)
 	}
+}
+
+// newAccWithCollation is newAcc with a text MIN/MAX's comparison collation (spec/design/collation.md
+// §1); every other plan ignores it.
+func newAccWithCollation(plan aggPlan, coll *Collation) *acc {
+	a := newAcc(plan)
+	if plan == planMin || plan == planMax {
+		a.collation = coll
+	}
+	return a
 }
 
 // clone returns an independent snapshot of the running accumulator, so the window stage can
@@ -409,7 +427,8 @@ func (a *acc) clone() *acc {
 // ignores the value and always counts). Traps 22003 on SUM/AVG overflow at the result bound.
 // A decimal SUM/AVG fold charges size-scaled decimal_work against the running accumulator
 // (the `+` formula — spec/design/cost.md §3 "decimal_work"); MIN/MAX folds are direct Value
-// compares like the sort's and stay unmetered.
+// compares like the sort's and stay unmetered — under a collation too, where they compare sort keys
+// like a collated sort (spec/design/collation.md §11).
 func (a *acc) fold(v Value, m *costMeter) error {
 	switch a.plan {
 	case planCountStar:
@@ -464,7 +483,15 @@ func (a *acc) fold(v Value, m *costMeter) error {
 			if !a.hasCur {
 				a.cur, a.hasCur = v, true
 			} else {
-				c := valueCmp(a.cur, v)
+				var c int
+				if a.collation != nil && a.cur.Kind == ValText && v.Kind == ValText {
+					var err error
+					if c, err = collatedCmp(a.collation, a.cur.str(), v.str()); err != nil {
+						return err
+					}
+				} else {
+					c = valueCmp(a.cur, v)
+				}
 				keepCur := (a.plan == planMin && c <= 0) || (a.plan == planMax && c >= 0)
 				if !keepCur {
 					a.cur = v

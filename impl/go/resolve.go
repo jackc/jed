@@ -99,6 +99,13 @@ type scope struct {
 	// stored key bytes and partial-index membership never change meaning under the query-side
 	// function propagation.
 	storageCollation bool
+	// subqueryDerivs records each scalar subquery resolved against this scope, keyed by its AST
+	// node, with its output column's collation derivation (spec/design/collation.md §1 "Scalar
+	// subqueries"). resolve records it when it plans the body, so deriveCollation — which works on
+	// the AST — can read it without planning the body again. Nil until the first record (lazily
+	// allocated); a lookup always follows the resolve of the same node, which overwrites any stale
+	// entry.
+	subqueryDerivs map[*queryExpr]deriv
 }
 
 // subRel is one inner relation label of an unaliased parenthesized join (grammar.md §15): its
@@ -1353,6 +1360,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			return nil, resolvedType{}, newError(SyntaxError, "subquery must return only one column")
 		}
 		outType := plan.columnTypes()[0]
+		noteSubqueryDeriv(s, e.Subquery, plan.columnDerivs()[0])
 		return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqScalar}, outType, nil
 	case exprExists:
 		// EXISTS ignores the select list entirely; the result is boolean, never NULL. A NOT
@@ -1377,6 +1385,11 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			return nil, resolvedType{}, err
 		}
 		if err := classifyComparable(lt, elem); err != nil {
+			return nil, resolvedType{}, err
+		}
+		// `=` ignores the collation at eval (byte identity, collation.md §7), but a conflict between
+		// the operand and the body column is still 42P22 (PostgreSQL's texteq demands one).
+		if _, err := membershipCollation(s, is.Lhs, lt, elem, rowValued, &plan); err != nil {
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqIn, lhs: rlhs, negated: is.Negated, rowValued: rowValued}, resolvedType{kind: rtBool}, nil
@@ -2304,11 +2317,12 @@ type deriv struct {
 
 // deriveCollation derives the collation + derivation level of a (text) expression subtree. A COLLATE
 // is explicit; a column reference is implicit (its frozen collation, C if none); || combines its
-// operands; a scalar function whose catalog result is text combines its arguments (PostgreSQL's
-// rule — a collatable result inherits its collatable inputs' collation; functionResultCollatable).
-// Every other shape (literal, cast, CASE, aggregate) resets to none (takes a neighbour's) — a
-// documented narrowing (§14). A persisted index expression's scope (storageCollation) keeps the
-// pre-function rule.
+// operands. Every other text-valued node carries its inputs' collation, PostgreSQL's general rule: a
+// scalar function whose catalog result is text (functionResultCollatable), a cast to text, the CASE
+// results, COALESCE / GREATEST / LEAST, an input-typed aggregate or window function
+// (aggResultCollatable), and a scalar subquery (its output column, implicit). A literal and every
+// other shape derive none (no collation — takes a neighbour's). A persisted index expression's scope
+// (storageCollation) keeps the earlier rule (column, COLLATE, ||).
 func deriveCollation(s *scope, e exprNode) (deriv, error) {
 	switch e.Kind {
 	case exprCollate:
@@ -2332,27 +2346,209 @@ func deriveCollation(s *scope, e exprNode) (deriv, error) {
 			return combineDeriv(l, r)
 		}
 		return deriv{}, nil
+	}
+	if s.storageCollation {
+		return deriv{}, nil
+	}
+	switch e.Kind {
 	case exprFuncCall:
 		f := e.FuncCall
-		if s.storageCollation || f.Star || f.Filter != nil || f.Over != nil || f.OverName != "" ||
-			f.WithinGroup != nil || !functionResultCollatable(f.Name) {
+		switch {
+		case !f.Star && f.Filter == nil && f.Over == nil && f.OverName == "" && f.WithinGroup == nil &&
+			functionResultCollatable(f.Name):
+			return combineDerivPtrs(s, f.Args)
+		case !f.Star && f.WithinGroup == nil && aggResultCollatable(f.Name):
+			// An input-typed aggregate / window function (min/max, lag/lead/first_value/…): its value
+			// arguments. FILTER, OVER and an in-aggregate ORDER BY contribute nothing.
+			return combineDerivPtrs(s, f.Args)
+		case f.WithinGroup != nil && (strings.EqualFold(f.Name, "mode") || strings.EqualFold(f.Name, "percentile_disc")):
+			// An ordered-set aggregate returning its key's type (mode / percentile_disc): the one key.
+			if len(f.WithinGroup) == 0 {
+				return deriv{}, nil
+			}
+			kd, err := orderKeyDeriv(s, &f.WithinGroup[0])
+			if err != nil {
+				return deriv{}, err
+			}
+			return combineDeriv(deriv{}, kd)
+		}
+		return deriv{}, nil
+	case exprCast:
+		// A cast to text keeps its operand's derivation; a varchar(n) length coercion is a node of its
+		// own (PostgreSQL), so it combines like a function and a conflicted operand yields.
+		t, ok := scalarTypeFromName(e.Cast.TypeName)
+		if !ok || !t.IsText() {
 			return deriv{}, nil
 		}
+		d, err := deriveCollation(s, e.Cast.Inner)
+		if err != nil {
+			return deriv{}, err
+		}
+		if e.Cast.TypeMod != nil {
+			return combineDeriv(deriv{}, d)
+		}
+		return d, nil
+	case exprCase:
+		// CASE combines its results only — never the simple-CASE operand or a WHEN condition.
 		d := deriv{}
-		for _, a := range f.Args {
-			ad, err := deriveCollation(s, *a)
+		for i := range e.Case.Whens {
+			rd, err := deriveCollation(s, e.Case.Whens[i].Result)
 			if err != nil {
 				return deriv{}, err
 			}
-			d, err = combineDeriv(d, ad)
-			if err != nil {
+			if d, err = combineDeriv(d, rd); err != nil {
 				return deriv{}, err
 			}
 		}
+		if e.Case.Els != nil {
+			ed, err := deriveCollation(s, *e.Case.Els)
+			if err != nil {
+				return deriv{}, err
+			}
+			return combineDeriv(d, ed)
+		}
 		return d, nil
+	case exprCoalesce:
+		return combineDerivList(s, e.Coalesce)
+	case exprGreatestLeast:
+		return combineDerivList(s, e.GreatestLeast)
+	case exprScalarSubquery:
+		// A scalar subquery: its output column's collation, recorded when resolve planned it.
+		if d, ok := s.subqueryDerivs[e.Subquery]; ok {
+			return d, nil
+		}
+		return deriv{}, nil
 	default:
 		return deriv{}, nil
 	}
+}
+
+// combineDerivPtrs combines the derivations of a node's inputs, starting from none — so a lone
+// conflicted input yields (PostgreSQL gives such a node its default collation).
+func combineDerivPtrs(s *scope, args []*exprNode) (deriv, error) {
+	d := deriv{}
+	for _, a := range args {
+		ad, err := deriveCollation(s, *a)
+		if err != nil {
+			return deriv{}, err
+		}
+		if d, err = combineDeriv(d, ad); err != nil {
+			return deriv{}, err
+		}
+	}
+	return d, nil
+}
+
+// combineDerivList is combineDerivPtrs over an inline argument list (COALESCE / GREATEST / LEAST).
+func combineDerivList(s *scope, args []exprNode) (deriv, error) {
+	d := deriv{}
+	for i := range args {
+		ad, err := deriveCollation(s, args[i])
+		if err != nil {
+			return deriv{}, err
+		}
+		if d, err = combineDeriv(d, ad); err != nil {
+			return deriv{}, err
+		}
+	}
+	return d, nil
+}
+
+// orderKeyDeriv is the derivation of an ORDER BY / WITHIN GROUP key: a trailing COLLATE is explicit,
+// else the key expression's (or bare / qualified column's) own derivation.
+func orderKeyDeriv(s *scope, key *orderKey) (deriv, error) {
+	if key.Collation != "" {
+		return deriv{name: key.Collation, kind: derivExplicit}, nil
+	}
+	if key.Expr != nil {
+		return deriveCollation(s, *key.Expr)
+	}
+	if key.Qualifier != "" {
+		r, err := s.resolveQualified(key.Qualifier, key.Column)
+		return columnDeriv(s, r, err), nil
+	}
+	r, err := s.resolveBare(key.Column)
+	return columnDeriv(s, r, err), nil
+}
+
+// aggResultCollatable reports whether an aggregate / window function's result is its input's type,
+// so it carries its value arguments' collation (spec/design/collation.md §1 "Aggregates and window
+// functions"): read from the shared catalog — an aggregate or window-only function whose result is
+// same_as_input. A non-text argument derives nothing, so sum/avg over numbers are unaffected.
+func aggResultCollatable(name string) bool {
+	for i := range aggregates {
+		if aggregates[i].Result == "same_as_input" && strings.EqualFold(aggregates[i].Surface, name) {
+			return true
+		}
+	}
+	for i := range windows {
+		if windows[i].Result == "same_as_input" && strings.EqualFold(windows[i].Surface, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// noteSubqueryDeriv records a scalar subquery's output-column derivation on the scope it was resolved
+// against (scope.subqueryDerivs), as the subquery expression derives it (collation.md §1 "Scalar
+// subqueries"; subqueryOutputDeriv).
+func noteSubqueryDeriv(s *scope, q *queryExpr, body deriv) {
+	if s.subqueryDerivs == nil {
+		s.subqueryDerivs = make(map[*queryExpr]deriv)
+	}
+	s.subqueryDerivs[q] = subqueryOutputDeriv(body)
+}
+
+// subqueryOutputDeriv is a subquery output column's derivation as seen from outside it (collation.md
+// §1): implicit for a body collation, none for none, indeterminate for a conflicted or indeterminate
+// body output.
+func subqueryOutputDeriv(body deriv) deriv {
+	switch body.kind {
+	case derivImplicit, derivExplicit:
+		return deriv{name: body.name, kind: derivImplicit}
+	case derivIndeterminate, derivConflicted:
+		return deriv{kind: derivIndeterminate}
+	default:
+		return deriv{}
+	}
+}
+
+// membershipCollation is the comparison collation of `lhs IN / op ANY|ALL (SELECT …)`
+// (spec/design/collation.md §1): the left operand's derivation combined with the body column's, which
+// is implicit outside the subquery. A conflict is 42P22. nil for a non-text or row-valued comparison.
+func membershipCollation(s *scope, lhs exprNode, lt, elem resolvedType, rowValued bool, plan *queryPlan) (*Collation, error) {
+	if rowValued || lt.kind != rtText || elem.kind != rtText {
+		return nil, nil
+	}
+	ld, err := deriveCollation(s, lhs)
+	if err != nil {
+		return nil, err
+	}
+	d, err := combineDeriv(ld, subqueryOutputDeriv(plan.columnDerivs()[0]))
+	if err != nil {
+		return nil, err
+	}
+	return resolveDeriv(s.catalog, d)
+}
+
+// sortTargetCollation is the collation a sort / grouping target sorts under (collation.md §1 "A sort
+// or grouping target must not be indeterminate"): a key expression combining two different implicit
+// collations is 42P21 here, at plan time (PostgreSQL's parse-time check), while a key that only reads
+// a conflicted column stays 42P22 at resolveDeriv.
+func sortTargetCollation(catalog *engine, d deriv) (*Collation, error) {
+	if err := rejectIndeterminateTarget(d); err != nil {
+		return nil, err
+	}
+	return resolveDeriv(catalog, d)
+}
+
+// rejectIndeterminateTarget is 42P21 for an indeterminate sort / grouping target (see
+// sortTargetCollation).
+func rejectIndeterminateTarget(d deriv) error {
+	if d.kind == derivIndeterminate {
+		return newError(CollationMismatch, "collation mismatch between implicit collations")
+	}
+	return nil
 }
 
 // functionResultCollatable reports whether a scalar function's result carries its arguments'

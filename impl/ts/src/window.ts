@@ -12,6 +12,7 @@ import {
 } from "./value.ts";
 import type { Row } from "./storage.ts";
 import type {
+  Acc,
   EvalEnv,
   OrderSlot,
   RExpr,
@@ -429,6 +430,20 @@ export function materializeOrderExprs(
   }
 }
 
+// windowAcc builds a fresh accumulator for an aggregate window function (plan "agg"): its resolved
+// aggregate plan, float width, json[b]_agg flags, and a text MIN/MAX's comparison collation
+// (spec/design/collation.md §1).
+function windowAcc(spec: WindowSpec): Acc {
+  const acc = newAcc(
+    spec.aggPlan!,
+    spec.aggFloatWidth ?? "f64",
+    spec.aggJsonAsJson ?? false,
+    spec.aggJsonStrict ?? false,
+  );
+  acc.collation = spec.aggCollation ?? null;
+  return acc;
+}
+
 export function applyWindowStage(
   rows: Row[],
   specs: WindowSpec[],
@@ -676,12 +691,7 @@ export function applyWindowStage(
               }
             }
             if (np > 0) groups.push([s, np]);
-            const acc = newAcc(
-              spec.aggPlan!,
-              spec.aggFloatWidth ?? "f64",
-              spec.aggJsonAsJson ?? false,
-              spec.aggJsonStrict ?? false,
-            );
+            const acc = windowAcc(spec);
             // What the running accumulator retains (memory.md §6.3), returned at the end of the
             // partition's pass.
             let accCharge = 0;
@@ -738,12 +748,7 @@ export function applyWindowStage(
               // skips a non-TRUE frame row.
               for (let pos = 0; pos < np; pos++) {
                 const [lo, hi] = ctx.bounds(pos, spec.frame);
-                const acc = newAcc(
-                  spec.aggPlan!,
-                  spec.aggFloatWidth ?? "f64",
-                  spec.aggJsonAsJson ?? false,
-                  spec.aggJsonStrict ?? false,
-                );
+                const acc = windowAcc(spec);
                 let accCharge = 0;
                 for (let k = lo; k < hi; k++) {
                   if (ctx.isExcluded(pos, k, exclude)) continue;
@@ -760,12 +765,7 @@ export function applyWindowStage(
               // SLIDING (monotone carry). removable aggregates un-fold the left edge; the rest
               // rebuild when lo advances (an expanding frame never advances lo, so it only adds).
               const removable = spec.aggPlan === "countStar" || spec.aggPlan === "count";
-              let acc = newAcc(
-                spec.aggPlan!,
-                spec.aggFloatWidth ?? "f64",
-                spec.aggJsonAsJson ?? false,
-                spec.aggJsonStrict ?? false,
-              );
+              let acc = windowAcc(spec);
               let accCharge = 0;
               let curLo = 0;
               let curHi = 0;
@@ -773,12 +773,7 @@ export function applyWindowStage(
                 const [lo, hi] = ctx.bounds(pos, spec.frame);
                 if (!removable && lo > curLo) {
                   // Left edge advanced over a non-invertible aggregate ⇒ rebuild over [lo, hi).
-                  acc = newAcc(
-                    spec.aggPlan!,
-                    spec.aggFloatWidth ?? "f64",
-                    spec.aggJsonAsJson ?? false,
-                    spec.aggJsonStrict ?? false,
-                  );
+                  acc = windowAcc(spec);
                   meter.releaseQuery(accCharge);
                   accCharge = 0;
                   for (let k = lo; k < hi; k++) {

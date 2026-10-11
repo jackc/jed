@@ -135,6 +135,12 @@ export class Scope {
   // column, COLLATE, ||; a function result carries none), so stored key bytes and partial-index
   // membership never change meaning under the query-side function propagation.
   storageCollation = false;
+  // Each scalar subquery resolved against this scope, keyed by its AST node, with its output
+  // column's collation derivation (spec/design/collation.md §1 "Scalar subqueries"). resolve
+  // records it when it plans the body, so deriveCollation — which works on the AST — can read it
+  // without planning the body again. Keyed by identity: a lookup always follows the resolve of the
+  // same node, which overwrites any stale entry.
+  subqueryDerivs: Map<QueryExpr, Deriv> = new Map();
   constructor(
     rels: ScopeRel[],
     catalog: Engine,

@@ -1537,6 +1537,7 @@ fn build_prefix_scope<'s>(
         sub_rels,
         star: None,
         storage_collation: false,
+        subquery_derivs: Default::default(),
     }
 }
 
@@ -1652,6 +1653,12 @@ pub(crate) struct Scope<'a> {
     /// (a column, `COLLATE`, `||`; a function result carries none), so stored key bytes and
     /// partial-index membership never change meaning under the query-side function propagation.
     storage_collation: bool,
+    /// Each scalar subquery resolved against this scope, keyed by its AST node, with its output
+    /// column's collation derivation (spec/design/collation.md §1 "Scalar subqueries"). `resolve`
+    /// records it when it plans the body, so `derive_collation` — which works on the AST — can read
+    /// it without planning the body again. Keyed by address: a lookup always follows the resolve of
+    /// the same node, which overwrites any stale entry.
+    subquery_derivs: std::cell::RefCell<Vec<(*const crate::ast::QueryExpr, Deriv)>>,
 }
 
 /// One inner relation label of an unaliased parenthesized join (grammar.md §15): its table's
@@ -1720,6 +1727,7 @@ impl<'a> Scope<'a> {
             sub_rels: Vec::new(),
             star: None,
             storage_collation: false,
+            subquery_derivs: Default::default(),
         }
     }
 
@@ -1747,6 +1755,7 @@ impl<'a> Scope<'a> {
             sub_rels: Vec::new(),
             star: None,
             storage_collation: false,
+            subquery_derivs: Default::default(),
         }
     }
 
@@ -1825,6 +1834,7 @@ impl<'a> Scope<'a> {
             sub_rels: Vec::new(),
             star: None,
             storage_collation: false,
+            subquery_derivs: Default::default(),
         })
     }
 
@@ -1866,6 +1876,7 @@ impl<'a> Scope<'a> {
             sub_rels: Vec::new(),
             star: None,
             storage_collation: false,
+            subquery_derivs: Default::default(),
         }
     }
 
@@ -3198,11 +3209,15 @@ pub(crate) enum RExpr {
         /// compared by the row-constructor 3VL (`eq3`/`lt3`/`gt3`, like `RExpr::Compare`), not the
         /// composite total order the array form uses for composite elements (array-functions.md §13).
         row_wise: bool,
+        /// The comparison collation (spec/design/collation.md §1): an ordering quantifier over text
+        /// sorts by it. The left operand's derivation for the array form (an array carries none), the
+        /// subquery form's combined one when folded from it; `None` for `C` / a non-text pair.
+        collation: Option<std::sync::Arc<Collation>>,
     },
 }
 
 /// Which subquery form an `RExpr::Subquery` is (spec/design/grammar.md §26).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) enum SubqueryKind {
     Scalar,
     Exists,
@@ -3214,6 +3229,9 @@ pub(crate) enum SubqueryKind {
     Quantified {
         op: CmpOp,
         all: bool,
+        /// The comparison collation (spec/design/collation.md §1): the left operand combined with
+        /// the body column's implicit collation; `None` for `C` / a non-text pair.
+        collation: Option<std::sync::Arc<Collation>>,
     },
 }
 

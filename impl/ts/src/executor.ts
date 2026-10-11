@@ -423,6 +423,8 @@ import {
   jsonArgNode,
   objectKeyText,
   orderAliasMatch,
+  orderKeyDeriv,
+  rejectIndeterminateTarget,
   resolve,
   resolveBinary,
   resolveBooleanFilter,
@@ -434,6 +436,7 @@ import {
   resolveJsonpathArgs,
   resolveJsonpathFn,
   resolveProjections,
+  sortTargetCollation,
   valueToNode,
 } from "./resolve.ts";
 import {
@@ -13429,7 +13432,9 @@ export class Engine {
           }
           return idx;
         }
-        // A general EXPRESSION key.
+        // A general EXPRESSION key. Grouping is byte equality, but an indeterminate key is still
+        // 42P21 (spec/design/collation.md §1 "A sort or grouping target").
+        if (gr.ty.kind === "text") rejectIndeterminateTarget(deriveCollation(scope, gr.canon));
         if (gr.ty.kind === "json") {
           throw engineError(
             "undefined_function",
@@ -13553,6 +13558,11 @@ export class Engine {
         "undefined_function",
         "could not identify an equality operator for type json",
       );
+    }
+    // Each DISTINCT output column is a grouping target: an indeterminate one is 42P21
+    // (spec/design/collation.md §1 "A sort or grouping target").
+    if (sel.distinct) {
+      for (const d of columnDerivs) rejectIndeterminateTarget(d);
     }
     // HAVING resolves in collect mode with window functions FORBIDDEN (42P20 — HAVING runs BEFORE the
     // window stage, window.md §7), continuing the aggregate specs so its aggregates slot after the
@@ -13773,7 +13783,7 @@ export class Engine {
         }
         coll = resolveCollationName(scope.catalog, key.collation);
       } else {
-        coll = resolveDeriv(scope.catalog, deriveCollation(scope, orderExpr));
+        coll = sortTargetCollation(scope.catalog, deriveCollation(scope, orderExpr));
       }
       const k = orderExprs.length;
       orderExprs.push(node);
@@ -18874,6 +18884,7 @@ export class Engine {
             lhs: e.lhs!,
             array: valueToRExpr(arrayValue(elements)),
             rowWise: e.rowValued,
+            collation: e.collation ?? null,
           };
         }
         // in
@@ -25553,6 +25564,9 @@ export type RExpr =
       // body's single column folds through quantifiedMembership exactly like the array form.
       op?: BinaryOp;
       all?: boolean;
+      // For subKind "quantified": the comparison collation (spec/design/collation.md §1) — the left
+      // operand combined with the body column's implicit collation; null for C / a non-text pair.
+      collation?: Collation | null;
     }
   // A folded uncorrelated `IN (subquery)`: the subquery ran once yielding `list`; per row it tests
   // `lhs` for three-valued membership (empty → negated; a NULL with no positive match → NULL).
@@ -25570,6 +25584,10 @@ export type RExpr =
       // compared by the row-constructor 3VL (eq3/lt3/gt3, like "compare"), not the composite total
       // order the array form uses for composite elements (array-functions.md §13).
       rowWise: boolean;
+      // The comparison collation (spec/design/collation.md §1): an ordering quantifier over text
+      // sorts by it. The left operand's derivation for the array form (an array carries none), the
+      // subquery form's combined one when folded from it; null for C / a non-text pair.
+      collation: Collation | null;
     };
 
 // SubqueryKind selects which subquery form a "subquery" RExpr is (spec/design/grammar.md §26).
@@ -27310,6 +27328,10 @@ export type AggSpec = {
   // ROW during the fold and buffered as a tuple on the Acc), and the per-key sort specs. Null/undefined
   // otherwise. (operand is null here — the keys are buffered as a tuple from hypo.keys.)
   hypo?: HypoParams | null;
+  // The comparison collation of a text MIN/MAX (spec/design/collation.md §1 "Aggregates and window
+  // functions"): the operand's derivation; null/undefined for C, a non-text operand, or any other
+  // aggregate.
+  collation?: Collation | null;
 };
 
 // KeySort is a single WITHIN GROUP ordering-key sort spec (aggregates.md §13/§19): direction, NULL
@@ -27399,6 +27421,8 @@ export type WindowSpec = {
   // non-aggregate window function with FILTER is 0A000). A FILTER disables the sliding-frame
   // optimization (a filtered row can't be cleanly un-folded) — every frame re-folds.
   filter?: RExpr | null;
+  // A text MIN/MAX window aggregate's comparison collation (see AggSpec.collation).
+  aggCollation?: Collation | null;
 };
 
 // ResolvedFrame is a resolved window frame (spec/design/window.md §6): ROWS physical offsets,
@@ -27499,6 +27523,9 @@ export type Acc = {
   // per-group hypothetical row + the spec's sort specs are available) finalizeHypothetical counts how
   // that hypothetical row would rank. Undefined for every non-hypothetical plan.
   hypoRows?: Value[][];
+  // A text MIN/MAX's comparison collation (spec/design/collation.md §1); null/undefined is C.
+  // Ignored by every other plan.
+  collation?: Collation | null;
 };
 
 export function newAcc(
@@ -27561,14 +27588,17 @@ export function newAccFromSpec(s: AggSpec): Acc {
     a.hypoRows = [];
     return a;
   }
-  // Pass the json[b]_agg / object_agg flags through (the json plans ride them on the Acc, B4).
-  return newAcc(
+  // Pass the json[b]_agg / object_agg flags through (the json plans ride them on the Acc, B4), and
+  // a text MIN/MAX's comparison collation.
+  const a = newAcc(
     s.plan,
     s.floatWidth ?? "f64",
     s.jsonAsJson ?? false,
     s.jsonStrict ?? false,
     s.jsonUnique ?? false,
   );
+  a.collation = s.collation ?? null;
+  return a;
 }
 
 // cloneAcc deep-copies a running accumulator so the window stage can SNAPSHOT it at each peer-group
@@ -27593,7 +27623,8 @@ export function cloneAcc(a: Acc): Acc {
 // ignores the value and always counts). Traps 22003 on SUM overflow at the result bound.
 // A decimal SUM/AVG fold charges size-scaled decimal_work against the running accumulator
 // (the `+` formula — spec/design/cost.md §3 "decimal_work"); MIN/MAX folds are direct Value
-// compares like the sort's and stay unmetered.
+// compares like the sort's and stay unmetered — under a collation too, where they compare sort keys
+// like a collated sort (spec/design/collation.md §11).
 export function foldAcc(a: Acc, v: Value, m: Meter): void {
   switch (a.plan) {
     case "countStar":
@@ -27656,7 +27687,11 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
       if (v.kind !== "null") {
         if (a.cur === null) a.cur = v;
         else {
-          const c = valueCmp(a.cur, v);
+          const coll = a.collation ?? null;
+          const c =
+            coll !== null && a.cur.kind === "text" && v.kind === "text"
+              ? collatedCmp(coll, a.cur.text, v.text)
+              : valueCmp(a.cur, v);
           const keepCur = a.plan === "min" ? c <= 0 : c >= 0;
           if (!keepCur) a.cur = v;
         }
@@ -29116,6 +29151,7 @@ export function resolveAggregate(
     if (!desc) throw noAggOverload(name);
     [plan, result, floatWidth, jsonFlags] = aggregatePlan(name, desc.result, r.type);
   }
+  const collation = minmaxCollation(scope, plan, e.args, result);
   // FILTER (WHERE cond): resolve the per-row predicate against the input row with aggregates
   // FORBIDDEN — an aggregate inside FILTER is 42803, matching PG (aggregates.md §11). A non-boolean
   // condition (or an untyped NULL, always unknown → folds no row) is 42804. The fold loop evaluates
@@ -29139,8 +29175,24 @@ export function resolveAggregate(
     filter,
     jsonAsJson: jsonFlags?.asJson,
     jsonStrict: jsonFlags?.strict,
+    collation,
   });
   return { node: { kind: "column", index: slot }, type: result };
+}
+
+// minmaxCollation is the comparison collation of a text MIN/MAX (spec/design/collation.md §1
+// "Aggregates and window functions"): the operand's own derivation, so a conflicted or
+// indeterminate operand is 42P22 (PostgreSQL raises it once two values compare). null for any other
+// aggregate.
+export function minmaxCollation(
+  scope: Scope,
+  plan: AggPlan,
+  args: Expr[],
+  result: ResolvedType,
+): Collation | null {
+  if ((plan !== "min" && plan !== "max") || result.kind !== "text") return null;
+  if (args.length === 0) return null;
+  return resolveDeriv(scope.catalog, deriveCollation(scope, args[0]!));
 }
 
 // resolveOrderedSetAggregate resolves agg(direct_args) WITHIN GROUP (ORDER BY key) — mode,
@@ -29188,24 +29240,20 @@ export function resolveOrderedSetAggregate(
   const operand = r.node;
   const optype = r.type;
 
-  // The WITHIN GROUP key's COLLATION drives the sort (aggregates.md §13): an explicit COLLATE on the
-  // key (text operand only — else "collations are not supported by type T", like the query ORDER BY),
-  // else a bare/qualified column key inherits its column's frozen collation; otherwise the default C
-  // (byte) order. Resolved to the loaded Collation (42704 if not loaded). The finalize sort applies it
-  // (an unmapped code point → 0A000 there).
+  // The WITHIN GROUP key's COLLATION drives the sort (aggregates.md §13): an explicit COLLATE on
+  // the key (text operand only — else "collations are not supported by type T", like the query
+  // ORDER BY), else the key's derived collation (collation.md §1) — a column key's frozen
+  // collation, an expression key's derivation; an indeterminate key is 42P21 (a sort target).
+  // Resolved to the loaded Collation (42704 if not loaded). The finalize sort applies it (an
+  // unmapped code point → 0A000 there).
   let collation: Collation | null = null;
   if (key.collation !== null && key.collation !== undefined) {
     if (optype.kind !== "text" && optype.kind !== "null") {
       throw typeError(`collations are not supported by type ${rtName(optype)}`);
     }
     collation = resolveCollationName(scope.catalog, key.collation);
-  } else if (key.expr === null || key.expr === undefined) {
-    // A bare/qualified column key with no explicit COLLATE inherits the column's frozen collation.
-    const res =
-      key.qualifier !== null && key.qualifier !== undefined && key.qualifier !== ""
-        ? scope.resolveQualified(key.qualifier, key.column)
-        : scope.resolveBare(key.column);
-    collation = columnCollation(scope, res);
+  } else if (optype.kind === "text") {
+    collation = sortTargetCollation(scope.catalog, orderKeyDeriv(scope, key));
   }
 
   let plan: AggPlan;
@@ -29377,20 +29425,17 @@ export function resolveHypotheticalSetAggregate(
     const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
     const r = resolve(scope, keyExpr, null, sub, params);
     const ktype = r.type;
-    // The key's collation (explicit COLLATE — text only — or a bare/qualified column's frozen
-    // collation), §13. An unknown name is 42704; a COLLATE on a non-text key is 42804.
+    // The key's collation (explicit COLLATE — text only — else the key's derived collation, an
+    // indeterminate key 42P21), §13. An unknown name is 42704; a COLLATE on a non-text key is
+    // 42804.
     let collation: Collation | null = null;
     if (key.collation !== null && key.collation !== undefined) {
       if (ktype.kind !== "text" && ktype.kind !== "null") {
         throw typeError(`collations are not supported by type ${rtName(ktype)}`);
       }
       collation = resolveCollationName(scope.catalog, key.collation);
-    } else if (key.expr === null || key.expr === undefined) {
-      const res =
-        key.qualifier !== null && key.qualifier !== undefined && key.qualifier !== ""
-          ? scope.resolveQualified(key.qualifier, key.column)
-          : scope.resolveBare(key.column);
-      collation = columnCollation(scope, res);
+    } else if (ktype.kind === "text") {
+      collation = sortTargetCollation(scope.catalog, orderKeyDeriv(scope, key));
     }
     // The hypothetical direct arg, evaluated per group (grouped context); a literal adapts to the
     // key's scalar type via the hint. Its type must match the key's family (else 42883).
@@ -29666,6 +29711,7 @@ export function resolveWindowCall(
     let aggPlan: AggPlan;
     let aggFloatWidth: ScalarType | undefined;
     let aggJsonFlags: JsonAggFlags | undefined;
+    let aggCollation: Collation | null = null;
     if (e.star) {
       // Only COUNT has a star overload (aggregates.md §3); SUM(*) etc. is a syntax error.
       if (!aggregateHasStar(lname))
@@ -29686,6 +29732,7 @@ export function resolveWindowCall(
       if (!desc) throw noAggOverload(lname);
       [aggPlan, result, aggFloatWidth, aggJsonFlags] = aggregatePlan(lname, desc.result, r.type);
       wargs.push(r.node); // the aggregate operand → args[0]
+      aggCollation = minmaxCollation(scope, aggPlan, e.args, result);
     }
     plan = "agg";
     // Resolve the window definition + collect the spec here (it carries the extra aggPlan fields),
@@ -29724,6 +29771,7 @@ export function resolveWindowCall(
       aggJsonStrict: aggJsonFlags?.strict,
       frame,
       filter: rfilter,
+      aggCollation,
     });
     return { node: { kind: "column", index: slot }, type: result };
   } else if (lname === "first_value" || lname === "last_value" || lname === "nth_value") {
@@ -29807,7 +29855,10 @@ export function resolveWindowDef(
 ): [number[], OrderSlot[], ResolvedFrame | null] {
   const partition: number[] = [];
   for (const key of wd.partition) {
-    const { node } = resolve(scope, key, null, keyCtx, params);
+    const { node, type } = resolve(scope, key, null, keyCtx, params);
+    // Partitioning groups by byte equality, but an indeterminate key is still 42P21
+    // (spec/design/collation.md §1 "A sort or grouping target").
+    if (type.kind === "text") rejectIndeterminateTarget(deriveCollation(scope, key));
     partition.push(windowKeySlot(node, "PARTITION BY", windowKeys));
   }
   const order: OrderSlot[] = [];
@@ -29829,7 +29880,7 @@ export function resolveWindowDef(
       }
       collation = resolveCollationName(scope.catalog, key.collation);
     } else {
-      collation = resolveDeriv(scope.catalog, deriveCollation(scope, key.expr));
+      collation = sortTargetCollation(scope.catalog, deriveCollation(scope, key.expr));
     }
     const slot = windowKeySlot(node, "window ORDER BY", windowKeys);
     order.push({ idx: slot, descending: key.descending, nullsFirst: key.nullsFirst, collation });

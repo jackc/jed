@@ -2901,7 +2901,7 @@ impl RExpr {
                     }
                     // A correlated quantified subquery (array-functions.md §11.6): gather the body's
                     // single column into an array and run the SAME 3VL fold as the array form.
-                    SubqueryKind::Quantified { op, all } => {
+                    SubqueryKind::Quantified { op, all, collation } => {
                         let lv = lhs
                             .as_ref()
                             .expect("a quantified subquery carries its resolved lhs")
@@ -2920,7 +2920,15 @@ impl RExpr {
                                 elements,
                             }
                         };
-                        quantified_membership(*op, *all, *row_valued, &lv, &Value::Array(arr), m)
+                        quantified_membership(
+                            *op,
+                            *all,
+                            *row_valued,
+                            &lv,
+                            &Value::Array(arr),
+                            collation.as_deref(),
+                            m,
+                        )
                     }
                 };
                 m.release_query(held);
@@ -2940,11 +2948,12 @@ impl RExpr {
                 lhs,
                 array,
                 row_wise,
+                collation,
             } => {
                 m.charge(COSTS.operator_eval);
                 let lv = lhs.eval(row, env, m)?;
                 let av = array.eval(row, env, m)?;
-                quantified_membership(*op, *all, *row_wise, &lv, &av, m)
+                quantified_membership(*op, *all, *row_wise, &lv, &av, collation.as_deref(), m)
             }
         }
     }

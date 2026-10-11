@@ -3798,7 +3798,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			for i, rr := range r.rows {
 				elems[i] = subqueryRowValue(rr, e.rowValued)
 			}
-			v, qerr := quantifiedMembership(e.op, e.quantAll, e.rowValued, lv, ArrayValue(elems), m)
+			v, qerr := quantifiedMembership(e.op, e.quantAll, e.rowValued, lv, ArrayValue(elems), e.collation, m)
 			m.releaseQuery(held)
 			return v, qerr
 		default: // sqIn
@@ -3834,7 +3834,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		return quantifiedMembership(e.op, e.quantAll, e.rowWise, lv, av, m)
+		return quantifiedMembership(e.op, e.quantAll, e.rowWise, lv, av, e.collation, m)
 	default: // reDistinct
 		m.Charge(costs.OperatorEval)
 		a, err := e.lhs.eval(row, env, m)

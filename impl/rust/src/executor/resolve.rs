@@ -1288,6 +1288,13 @@ pub(crate) fn resolve_quantified(
         BinaryOp::Ge => CmpOp::Ge,
         _ => unreachable!("the parser only builds a Quantified node for a comparison operator"),
     };
+    // A text quantifier compares under the left operand's derivation alone (spec/design/collation.md
+    // §1): an array carries no collation in jed (a recorded narrowing, §15).
+    let collation = if lt == ResolvedType::Text && elem == ResolvedType::Text {
+        resolve_deriv(scope.catalog, derive_collation(scope, lhs)?)?
+    } else {
+        None
+    };
     Ok((
         RExpr::Quantified {
             op: cop,
@@ -1295,6 +1302,7 @@ pub(crate) fn resolve_quantified(
             lhs: Box::new(rl),
             array: Box::new(ra),
             row_wise: false,
+            collation,
         },
         ResolvedType::Bool,
     ))

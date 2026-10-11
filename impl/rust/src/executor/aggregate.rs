@@ -38,8 +38,18 @@ impl Acc {
                 kind: s.plan,
                 rows: Vec::new(),
             },
-            _ => Acc::new(s.plan),
+            _ => Acc::with_collation(s.plan, s.collation.clone()),
         }
+    }
+
+    /// [`Acc::new`] with a text MIN/MAX's comparison collation (spec/design/collation.md §1); the
+    /// collation is ignored by every other plan.
+    pub(crate) fn with_collation(plan: AggPlan, coll: Option<std::sync::Arc<Collation>>) -> Acc {
+        let mut acc = Acc::new(plan);
+        if let Acc::MinMax { collation, .. } = &mut acc {
+            *collation = coll;
+        }
+        acc
     }
 
     pub(crate) fn new(plan: AggPlan) -> Acc {
@@ -79,10 +89,12 @@ impl Acc {
             AggPlan::Min => Acc::MinMax {
                 cur: None,
                 is_min: true,
+                collation: None,
             },
             AggPlan::Max => Acc::MinMax {
                 cur: None,
                 is_min: false,
+                collation: None,
             },
             AggPlan::JsonAgg { compact, strict } => Acc::JsonAgg {
                 nodes: Vec::new(),
@@ -115,7 +127,8 @@ impl Acc {
     /// the value and always counts). Traps 22003 on SUM/AVG overflow at the result bound.
     /// A decimal SUM/AVG fold charges size-scaled `decimal_work` against the running
     /// accumulator (the `+` formula — spec/design/cost.md §3 "decimal_work"); MIN/MAX folds
-    /// are direct Value compares like the sort's and stay unmetered.
+    /// are direct Value compares like the sort's and stay unmetered — under a collation too, where
+    /// they compare sort keys like a collated sort (spec/design/collation.md §11).
     pub(crate) fn fold(&mut self, value: Value, m: &mut Meter) -> Result<()> {
         match self {
             Acc::CountStar(n) => *n += 1,
@@ -194,12 +207,21 @@ impl Acc {
                     }
                 }
             }
-            Acc::MinMax { cur, is_min } => {
+            Acc::MinMax {
+                cur,
+                is_min,
+                collation,
+            } => {
                 if !matches!(value, Value::Null) {
                     let next = match cur.take() {
                         None => value,
                         Some(c) => {
-                            let ord = value_cmp(&c, &value);
+                            let ord = match (collation.as_deref(), &c, &value) {
+                                (Some(coll), Value::Text(a), Value::Text(b)) => {
+                                    collated_cmp(coll, a, b)?
+                                }
+                                _ => value_cmp(&c, &value),
+                            };
                             let keep_current = if *is_min {
                                 ord != std::cmp::Ordering::Greater
                             } else {

@@ -362,8 +362,9 @@ where `sort_key` is a single key — a bare/qualified **column** *or* a general 
 an optional **`COLLATE`** (`query.within_group_expr`, the same general-expression key as the query
 `ORDER BY`, §10: a column key stays a leaf, any other expression is evaluated per row and the values
 are sorted). The key's **collation** drives the sort (`query.ordered_set_collation`): an explicit
-`COLLATE` (text operand only — else `42804`), else a text column key's frozen collation, else the
-default byte (`C`) order — so for `mode` / `percentile_disc` over text the collation chooses which
+`COLLATE` (text operand only — else `42804`), else the key's **derived** collation (a column key's
+frozen collation, an expression key's derivation — [collation.md](collation.md) §1; a key combining
+two different implicit collations is `42P21`), else the default byte (`C`) order — so for `mode` / `percentile_disc` over text the collation chooses which
 tied value is the mode and which value the discrete percentile lands on. One PG divergence
 from the query `ORDER BY`: a bare **integer** here is a **constant** (every row sorts equal), *not* an
 ordinal — PostgreSQL treats a `WITHIN GROUP` integer as a constant. The `WITHIN GROUP` clause comes

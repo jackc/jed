@@ -546,7 +546,7 @@ description = "Hypothetical-set aggregates rank/dense_rank/percent_rank/cume_dis
 
 [[capability]]
 id = "query.ordered_set_collation"
-description = "A collated WITHIN GROUP order key (aggregates.md §13): mode() / percentile_disc honor an explicit COLLATE on the WITHIN GROUP key (text operand only — else 'collations are not supported by type T'), or a text column's frozen collation, when sorting the buffered values; the default is byte (C) order. The collation drives the sort order (hence mode's tie-break and percentile_disc's index); run-equality stays value-canonical. An unmapped code point fails 0A000 at finalize. Builds on query.ordered_set_aggregate + types.collation"
+description = "A collated WITHIN GROUP order key (aggregates.md §13): mode() / percentile_disc honor an explicit COLLATE on the WITHIN GROUP key (text operand only — else 'collations are not supported by type T'), or the key's derived collation (a text column's frozen collation, an expression key's derivation — collation.md §1), when sorting the buffered values; the default is byte (C) order. The collation drives the sort order (hence mode's tie-break and percentile_disc's index); run-equality stays value-canonical. An unmapped code point fails 0A000 at finalize. Builds on query.ordered_set_aggregate + types.collation"
 
 [[capability]]
 id = "query.ordered_set_array_fraction"

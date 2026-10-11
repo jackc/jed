@@ -295,8 +295,10 @@ pipeline below is unchanged and the cost stays *sort-before-project*; the per-ro
 evaluation is **metered** like a projection (an `operator_eval` per node — the only new cost, and
 none for a bare-column key). A **non-orderable** result type — `json` (no btree opclass, json.md
 §5) — is `42883`; `jsonb` is orderable. A text-typed expression takes its **derived collation**
-(an inner `COLLATE`, else a bare column's frozen collation, else `C`/byte order — collation.md §1),
-overridable by a trailing `COLLATE` on the key. Because the key is a full expression, `ORDER BY
+(its expression's derivation — an inner `COLLATE`, a column's frozen collation carried through
+functions, casts, `CASE`/`COALESCE`, aggregates and subqueries, else `C`/byte order — collation.md
+§1; a key combining two different implicit collations is `42P21`), overridable by a trailing
+`COLLATE` on the key. Because the key is a full expression, `ORDER BY
 1 + 1` is a **constant expression** (a no-op sort — PostgreSQL's reading), **not** an ordinal.
 Materializing a key disables the PK-scan elision below, so an expression key always takes the
 blocking sort.

@@ -1873,7 +1873,7 @@ fn explain_subquery(kind: SubqueryKind, lhs: Option<&RExpr>, negated: bool) -> S
             render_rexpr(lhs.expect("IN subquery has an lhs")),
             if negated { "not " } else { "" }
         ),
-        SubqueryKind::Quantified { op, all } => format!(
+        SubqueryKind::Quantified { op, all, .. } => format!(
             "{} {} {}(<subquery>)",
             render_rexpr(lhs.expect("quantified subquery has an lhs")),
             bound_op_text(op),
@@ -2147,7 +2147,7 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
         ),
         RExpr::Subquery {
             kind, lhs, negated, ..
-        } => explain_subquery(*kind, lhs.as_deref(), *negated),
+        } => explain_subquery(kind.clone(), lhs.as_deref(), *negated),
     }
 }
 
@@ -3192,6 +3192,27 @@ pub(crate) fn plan_row_subquery(
 /// Plan the body of an `IN` / `ANY` / `ALL` subquery, returning the plan, the element type each body
 /// row contributes, and whether it is ROW-VALUED. A row-constructor `lhs` makes it row-valued
 /// (`plan_row_subquery`); any other `lhs` needs exactly one body column (42601 otherwise).
+/// The comparison collation of `lhs IN / op ANY|ALL (SELECT …)` (spec/design/collation.md §1): the
+/// left operand's derivation combined with the body column's, which is implicit outside the
+/// subquery. A conflict is 42P22. `None` for a non-text or row-valued comparison.
+fn membership_collation(
+    scope: &Scope,
+    lhs: &Expr,
+    lt: &ResolvedType,
+    elem: &ResolvedType,
+    row_valued: bool,
+    plan: &QueryPlan,
+) -> Result<Option<std::sync::Arc<Collation>>> {
+    if row_valued || *lt != ResolvedType::Text || *elem != ResolvedType::Text {
+        return Ok(None);
+    }
+    let d = combine_deriv(
+        derive_collation(scope, lhs)?,
+        subquery_output_deriv(&plan.column_derivs()[0]),
+    )?;
+    resolve_deriv(scope.catalog, d)
+}
+
 fn plan_membership_subquery(
     scope: &Scope,
     lhs: &Expr,
@@ -3707,6 +3728,7 @@ pub(crate) fn resolve(
                 ));
             }
             let out_type = plan.column_types()[0].clone();
+            note_subquery_deriv(scope, inner, &plan.column_derivs()[0]);
             Ok((
                 RExpr::Subquery {
                     plan: Box::new(plan),
@@ -3745,6 +3767,10 @@ pub(crate) fn resolve(
             let (rlhs, lt) = resolve(scope, lhs, None, agg, params)?;
             let (plan, elem, row_valued) = plan_membership_subquery(scope, lhs, query, params)?;
             classify_comparable(&lt, &elem)?;
+            // `=` ignores the collation at eval (byte identity, collation.md §7), but a conflict
+            // between the operand and the body column is still 42P22 (PostgreSQL's texteq demands
+            // one).
+            membership_collation(scope, lhs, &lt, &elem, row_valued, &plan)?;
             Ok((
                 RExpr::Subquery {
                     plan: Box::new(plan),
@@ -4668,10 +4694,15 @@ pub(crate) fn resolve(
                     "the parser only builds a quantified node for a comparison operator"
                 ),
             };
+            let collation = membership_collation(scope, lhs, &lt, &elem, row_valued, &plan)?;
             Ok((
                 RExpr::Subquery {
                     plan: Box::new(plan),
-                    kind: SubqueryKind::Quantified { op: cop, all: *all },
+                    kind: SubqueryKind::Quantified {
+                        op: cop,
+                        all: *all,
+                        collation,
+                    },
                     lhs: Some(Box::new(rlhs)),
                     negated: false,
                     row_valued,
@@ -5005,11 +5036,12 @@ pub(crate) enum Deriv {
 
 /// Derive the collation + derivation level of a (text) expression subtree (spec/design/collation.md
 /// §1). A `COLLATE` is explicit; a column reference is implicit (its frozen collation, `C` if none);
-/// `||` combines its operands; a scalar function whose catalog result is `text` combines its
-/// arguments (PostgreSQL's rule — a collatable result inherits its collatable inputs' collation;
-/// [`function_result_collatable`]). Every other shape (literal, cast, CASE, aggregate) resets to
-/// `None` (no collation — takes a neighbour's), a documented narrowing (collation.md §14). A
-/// persisted index expression's scope (`storage_collation`) keeps the pre-function rule.
+/// `||` combines its operands. Every other text-valued node carries its inputs' collation, PostgreSQL's
+/// general rule: a scalar function whose catalog result is `text` ([`function_result_collatable`]), a
+/// cast to text, the `CASE` results, `COALESCE` / `GREATEST` / `LEAST`, an input-typed aggregate or
+/// window function ([`agg_result_collatable`]), and a scalar subquery (its output column, implicit).
+/// A literal and every other shape derive `None` (no collation — takes a neighbour's). A persisted
+/// index expression's scope (`storage_collation`) keeps the earlier rule (column, `COLLATE`, `||`).
 pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
     Ok(match e {
         Expr::Collate { collation, .. } => Deriv::Explicit(collation.clone()),
@@ -5032,14 +5064,152 @@ pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
             within_group: None,
             ..
         } if !scope.storage_collation && function_result_collatable(name) => {
+            combine_derivs(scope, args)?
+        }
+        _ if scope.storage_collation => Deriv::None,
+        // A cast to text keeps its operand's derivation; a `varchar(n)` length coercion is a node of
+        // its own (PostgreSQL), so it combines like a function and a conflicted operand yields.
+        Expr::Cast {
+            inner,
+            type_name,
+            type_mod,
+        } if ScalarType::from_name(type_name).is_some_and(|t| t.is_text()) => {
+            let d = derive_collation(scope, inner)?;
+            if type_mod.is_some() {
+                combine_deriv(Deriv::None, d)?
+            } else {
+                d
+            }
+        }
+        // CASE combines its results only — never the simple-CASE operand or a WHEN condition.
+        Expr::Case { whens, els, .. } => {
             let mut d = Deriv::None;
-            for a in args {
-                d = combine_deriv(d, derive_collation(scope, a)?)?;
+            for (_, result) in whens {
+                d = combine_deriv(d, derive_collation(scope, result)?)?;
+            }
+            if let Some(e) = els {
+                d = combine_deriv(d, derive_collation(scope, e)?)?;
             }
             d
         }
+        Expr::Coalesce(args) | Expr::GreatestLeast { args, .. } => combine_derivs(scope, args)?,
+        // An input-typed aggregate / window function (min/max, lag/lead/first_value/…): its value
+        // arguments. FILTER and an in-aggregate ORDER BY contribute nothing.
+        Expr::FuncCall {
+            name,
+            args,
+            star: false,
+            within_group: None,
+            ..
+        } if agg_result_collatable(name) => combine_derivs(scope, args)?,
+        // An ordered-set aggregate returning its key's type (mode / percentile_disc): the one key.
+        Expr::FuncCall {
+            name,
+            within_group: Some(keys),
+            ..
+        } if name.eq_ignore_ascii_case("mode") || name.eq_ignore_ascii_case("percentile_disc") => {
+            match keys.first() {
+                Some(k) => combine_deriv(Deriv::None, order_key_deriv(scope, k)?)?,
+                None => Deriv::None,
+            }
+        }
+        // A scalar subquery: its output column's collation, recorded when `resolve` planned it.
+        Expr::ScalarSubquery(q) => {
+            let key: *const QueryExpr = q.as_ref();
+            scope
+                .subquery_derivs
+                .borrow()
+                .iter()
+                .rev()
+                .find(|(k, _)| *k == key)
+                .map_or(Deriv::None, |(_, d)| d.clone())
+        }
         _ => Deriv::None,
     })
+}
+
+/// Combine the derivations of a node's inputs, starting from none — so a lone conflicted input
+/// yields (PostgreSQL gives such a node its default collation).
+fn combine_derivs(scope: &Scope, args: &[Expr]) -> Result<Deriv> {
+    let mut d = Deriv::None;
+    for a in args {
+        d = combine_deriv(d, derive_collation(scope, a)?)?;
+    }
+    Ok(d)
+}
+
+/// The derivation of an ORDER BY / WITHIN GROUP key: a trailing `COLLATE` is explicit, else the key
+/// expression's (or bare / qualified column's) own derivation.
+pub(crate) fn order_key_deriv(scope: &Scope, key: &OrderKey) -> Result<Deriv> {
+    if let Some(name) = &key.collation {
+        return Ok(Deriv::Explicit(name.clone()));
+    }
+    match (&key.expr, &key.qualifier) {
+        (Some(e), _) => derive_collation(scope, e),
+        (None, Some(q)) => Ok(column_deriv(
+            scope,
+            scope.resolve_qualified(q, &key.column).ok(),
+        )),
+        (None, None) => Ok(column_deriv(scope, scope.resolve_bare(&key.column).ok())),
+    }
+}
+
+/// Whether an aggregate / window function's result is its input's type, so it carries its value
+/// arguments' collation (spec/design/collation.md §1 "Aggregates and window functions"): read from
+/// the shared catalog — an aggregate or window-only function whose `result` is `same_as_input`. A
+/// non-text argument derives nothing, so `sum`/`avg` over numbers are unaffected.
+fn agg_result_collatable(name: &str) -> bool {
+    crate::operators::AGGREGATES
+        .iter()
+        .any(|a| a.result == "same_as_input" && a.surface.eq_ignore_ascii_case(name))
+        || crate::operators::WINDOWS
+            .iter()
+            .any(|w| w.result == "same_as_input" && w.surface.eq_ignore_ascii_case(name))
+}
+
+/// Record a scalar subquery's output-column derivation on the scope it was resolved against
+/// (`Scope::subquery_derivs`), as the subquery expression derives it (collation.md §1 "Scalar
+/// subqueries"): a body collation, explicit or implicit, is implicit outside; a conflicted or
+/// indeterminate body output makes the subquery indeterminate.
+fn note_subquery_deriv(scope: &Scope, q: &QueryExpr, body: &Deriv) {
+    let d = subquery_output_deriv(body);
+    let key: *const QueryExpr = q;
+    let mut memo = scope.subquery_derivs.borrow_mut();
+    memo.retain(|(k, _)| *k != key);
+    memo.push((key, d));
+}
+
+/// A subquery output column's derivation as seen from outside it (collation.md §1): implicit for a
+/// body collation, none for none, indeterminate for a conflicted or indeterminate body output.
+fn subquery_output_deriv(body: &Deriv) -> Deriv {
+    match body {
+        Deriv::Implicit(n) | Deriv::Explicit(n) => Deriv::Implicit(n.clone()),
+        Deriv::None => Deriv::None,
+        Deriv::Indeterminate | Deriv::Conflicted => Deriv::Indeterminate,
+    }
+}
+
+/// The collation a sort / grouping target sorts under (collation.md §1 "A sort or grouping target
+/// must not be indeterminate"): a key expression combining two different implicit collations is
+/// 42P21 here, at plan time (PostgreSQL's parse-time check), while a key that only reads a
+/// conflicted column stays 42P22 at `resolve_deriv`.
+pub(crate) fn sort_target_collation(
+    catalog: &Engine,
+    d: Deriv,
+) -> Result<Option<std::sync::Arc<Collation>>> {
+    reject_indeterminate_target(&d)?;
+    resolve_deriv(catalog, d)
+}
+
+/// 42P21 for an indeterminate sort / grouping target (see [`sort_target_collation`]).
+pub(crate) fn reject_indeterminate_target(d: &Deriv) -> Result<()> {
+    if matches!(d, Deriv::Indeterminate) {
+        return Err(EngineError::new(
+            SqlState::CollationMismatch,
+            "collation mismatch between implicit collations",
+        ));
+    }
+    Ok(())
 }
 
 /// Whether a scalar function's result carries its arguments' collation (spec/design/collation.md §1

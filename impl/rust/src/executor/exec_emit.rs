@@ -1400,7 +1400,7 @@ impl Engine {
                 // An uncorrelated quantified subquery folds to a constant-array `Quantified`
                 // (array-functions.md §11.6): its single column becomes a 1-D array and the node
                 // reuses the array form's 3VL fold — no per-row re-execution.
-                SubqueryKind::Quantified { op, all } => {
+                SubqueryKind::Quantified { op, all, collation } => {
                     let elements: Vec<Value> = r
                         .rows
                         .into_iter()
@@ -1421,6 +1421,7 @@ impl Engine {
                         lhs: lhs.expect("a quantified subquery carries its resolved lhs"),
                         array: Box::new(RExpr::ConstArray(Box::new(arr))),
                         row_wise: row_valued,
+                        collation,
                     }
                 }
             };
