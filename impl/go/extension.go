@@ -156,8 +156,12 @@ type hostFuncEntry struct {
 }
 
 // batchable reports whether the executor may prefetch this function's results in a batch ahead of the
-// row-at-a-time replay (§4.2.1): any rung but Volatile, whose call set must stay exactly the scalar one.
-func (f *hostFuncEntry) batchable() bool { return f.volatility != VolatilityVolatile }
+// row-at-a-time replay (§4.2.1): a batch kernel (a single-row kernel is looped per row anyway, so
+// prefetching it would only add work and speculative calls) of any rung but Volatile, whose call set
+// must stay exactly the scalar one.
+func (f *hostFuncEntry) batchable() bool {
+	return f.batchKernel != nil && f.volatility != VolatilityVolatile
+}
 
 // callOne calls the kernel for ONE row (args non-NULL, one per parameter) — the batch-of-one path of
 // every site that does not prefetch. A batch kernel is handed a one-row batch and held to the same

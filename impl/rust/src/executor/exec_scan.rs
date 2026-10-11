@@ -48,6 +48,7 @@ fn process_streaming_row(
     out: &mut Vec<Vec<Value>>,
     actual: &mut StreamingActual,
     guarded: bool,
+    ahead: Option<(&ReadAhead, usize)>,
 ) -> Result<bool> {
     if !guarded {
         meter.guard()?;
@@ -62,9 +63,39 @@ fn process_streaming_row(
     } else {
         row
     };
+    // A read-ahead window's prefetches (extensibility.md §4.2.1): the filter's at every row, the
+    // projection's at each row that reaches it — each made current just before its evaluation.
+    let filter_env;
+    let project_env;
+    let (fenv, penv) = match ahead {
+        Some((ra, _)) => {
+            filter_env = EvalEnv {
+                host_batch: ra.filter.as_ref(),
+                ..*env
+            };
+            project_env = EvalEnv {
+                host_batch: ra.project.as_ref(),
+                ..*env
+            };
+            (&filter_env, &project_env)
+        }
+        None => (env, env),
+    };
+    let set_project_row = |meter: &Meter| {
+        if let Some((ra, i)) = ahead
+            && let Some(b) = &ra.project
+        {
+            ra.set_row(b, i, env, meter);
+        }
+    };
     if let Some(filter) = plan.filter.get() {
+        if let Some((ra, i)) = ahead
+            && let Some(b) = &ra.filter
+        {
+            ra.set_row(b, i, env, meter);
+        }
         let before = meter.accrued;
-        let keep = filter.eval(row, env, meter)?.is_true();
+        let keep = filter.eval(row, fenv, meter)?.is_true();
         actual.filter += meter.accrued - before;
         if !keep {
             return Ok(true);
@@ -72,9 +103,10 @@ fn process_streaming_row(
     }
     if plan.distinct {
         let before = meter.accrued;
+        set_project_row(meter);
         let mut projected = Vec::with_capacity(plan.projections.len());
         for p in &plan.projections {
-            projected.push(p.eval(row, env, meter)?);
+            projected.push(p.eval(row, penv, meter)?);
         }
         actual.distinct += meter.accrued - before;
         let inserted = seen.insert(projected.clone());
@@ -96,9 +128,10 @@ fn process_streaming_row(
         }
         let before = meter.accrued;
         meter.charge(COSTS.row_produced);
+        set_project_row(meter);
         let mut projected = Vec::with_capacity(plan.projections.len());
         for p in &plan.projections {
-            projected.push(p.eval(row, env, meter)?);
+            projected.push(p.eval(row, penv, meter)?);
         }
         actual.output += meter.accrued - before;
         meter.admit_row(&projected)?; // the buffered result collector (memory.md §5.1)
@@ -133,16 +166,48 @@ fn scan_stream_table_interval(
     out: &mut Vec<Vec<Value>>,
     actual: &mut StreamingActual,
     can_pull: bool,
+    ahead: &mut Option<ReadAhead>,
 ) -> Result<bool> {
     let (overlap, slabs) = store.overlap_scan_units(bound, &plan.rel_masks[0])?;
     meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
     if !can_pull {
         return Ok(false);
     }
+    // A host call in the WHERE or projection reads the interval ahead into a window and replays it
+    // row by row (extensibility.md §4.2.1 "In-hand and pulled sites"): the pull charges nothing, and
+    // a storage error is deferred to the row at which the per-row pull would have met it.
+    if let Some(ra) = ahead {
+        ra.restart();
+        let mut scan = store.store_scan(bound.clone(), reverse);
+        loop {
+            let remaining = plan.limit.map(|l| offset.saturating_add(l) - *passed);
+            let cap = || read_ahead_cap(meter, COSTS.storage_row_read, remaining);
+            let Some(i) = ra.next(cap, || scan.next_row())? else {
+                return Ok(true);
+            };
+            let ra: &ReadAhead = ra;
+            if !process_streaming_row(
+                store,
+                &ra.rows[i],
+                plan,
+                env,
+                meter,
+                offset,
+                passed,
+                seen,
+                out,
+                actual,
+                false,
+                Some((ra, i)),
+            )? {
+                return Ok(false);
+            }
+        }
+    }
     let mut more = true;
     let mut visit = |_key: &[u8], row: &Row| -> Result<bool> {
         more = process_streaming_row(
-            store, row, plan, env, meter, offset, passed, seen, out, actual, false,
+            store, row, plan, env, meter, offset, passed, seen, out, actual, false, None,
         )?;
         Ok(more)
     };
@@ -178,6 +243,11 @@ impl Engine {
         let can_pull = plan.limit != Some(0);
         let profile_start = meter.accrued;
         let mut actual = StreamingActual::default();
+        let mut ahead = ReadAhead::for_site(
+            plan.filter.get(),
+            &plan.projections,
+            &self.session.extensions,
+        );
 
         match &plan.phys.rel_bounds[0] {
             None => {
@@ -194,6 +264,7 @@ impl Engine {
                     &mut out,
                     &mut actual,
                     can_pull,
+                    &mut ahead,
                 )?;
             }
             Some(ScanBound::Pk(bp)) => {
@@ -211,6 +282,7 @@ impl Engine {
                         &mut out,
                         &mut actual,
                         can_pull,
+                        &mut ahead,
                     )?;
                 }
             }
@@ -240,6 +312,7 @@ impl Engine {
                                 &mut out,
                                 &mut actual,
                                 can_pull,
+                                &mut ahead,
                             )? {
                                 break;
                             }
@@ -259,6 +332,7 @@ impl Engine {
                                 &mut out,
                                 &mut actual,
                                 can_pull,
+                                &mut ahead,
                             )? {
                                 break;
                             }
@@ -296,6 +370,7 @@ impl Engine {
                                 &mut out,
                                 &mut actual,
                                 true,
+                                None,
                             )
                         };
                         istore.scan_range(&bound, &mut visit)?;
@@ -354,6 +429,7 @@ impl Engine {
                                 &mut out,
                                 &mut actual,
                                 true,
+                                None,
                             )?;
                             Ok(more)
                         };
@@ -410,6 +486,7 @@ impl Engine {
                             &mut out,
                             &mut actual,
                             true,
+                            None,
                         )? {
                             break;
                         }
@@ -462,6 +539,7 @@ impl Engine {
                             &mut out,
                             &mut actual,
                             true,
+                            None,
                         )? {
                             break;
                         }
@@ -949,6 +1027,11 @@ impl Engine {
             let distinct = plan.distinct;
             let done = empty || limit == Some(0);
             let seen_charge = meter.state_charge();
+            let ahead = ReadAhead::for_site(
+                plan.filter.get(),
+                &plan.projections,
+                &self.session.extensions,
+            );
             let stream = StreamingScan {
                 engine: snap,
                 plan,
@@ -967,6 +1050,7 @@ impl Engine {
                 passed: 0,
                 produced: 0,
                 done,
+                ahead,
             };
             return Ok(Some(Rows::from_streaming(
                 metadata.column_names,
@@ -2268,8 +2352,42 @@ impl Engine {
                     ctes,
                     host_batch: None,
                 };
+                // A projecting spool with an eligible host call reads ahead into a window and
+                // replays it row by row (extensibility.md §4.2.1).
+                let mut ahead = match mode {
+                    EmitMode::Project => {
+                        ReadAhead::for_site(None, &plan.projections, &self.session.extensions)
+                    }
+                    EmitMode::Identity => None,
+                };
                 let mut out = Vec::new();
-                for _ in 0..remaining {
+                for k in 0..remaining {
+                    if let Some(ra) = &mut ahead {
+                        let cap = || {
+                            read_ahead_cap(&meter, COSTS.row_produced, Some((remaining - k) as i64))
+                        };
+                        let i = ra.next(cap, || rows.next())?.expect("spool cardinality");
+                        if !charged {
+                            meter.guard()?;
+                            meter.charge(COSTS.row_produced);
+                        }
+                        let ra: &ReadAhead = ra;
+                        if let Some(b) = &ra.project {
+                            ra.set_row(b, i, &env, &meter);
+                        }
+                        let penv = EvalEnv {
+                            host_batch: ra.project.as_ref(),
+                            ..env
+                        };
+                        let o = plan
+                            .projections
+                            .iter()
+                            .map(|p| p.eval(&ra.rows[i], &penv, &mut meter))
+                            .collect::<Result<Row>>()?;
+                        meter.admit_row(&o)?;
+                        out.push(o);
+                        continue;
+                    }
                     let row = rows.next()?.expect("spool cardinality");
                     if !charged {
                         meter.guard()?;
@@ -2307,16 +2425,53 @@ impl Engine {
                     ctes,
                     host_batch: None,
                 };
+                // An eligible host call in the projection reads the sorted output ahead into a
+                // window and replays it row by row (extensibility.md §4.2.1): the pull is unmetered
+                // and the sort's charge is returned only below, so no charge moves.
+                let mut ahead =
+                    ReadAhead::for_site(None, &plan.projections, &self.session.extensions);
                 let mut out = Vec::with_capacity(remaining);
-                for _ in 0..remaining {
-                    let row = sorted
-                        .next()?
-                        .expect("the sorter yields exactly the windowed rows");
+                for k in 0..remaining {
+                    let pulled;
+                    let (row, at): (&Row, Option<(&ReadAhead, usize)>) = match &mut ahead {
+                        Some(ra) => {
+                            let cap = || {
+                                read_ahead_cap(
+                                    &meter,
+                                    COSTS.row_produced,
+                                    Some((remaining - k) as i64),
+                                )
+                            };
+                            let i = ra
+                                .next(cap, || sorted.next())?
+                                .expect("the sorter yields exactly the windowed rows");
+                            let ra: &ReadAhead = ra;
+                            (&ra.rows[i], Some((ra, i)))
+                        }
+                        None => {
+                            pulled = sorted
+                                .next()?
+                                .expect("the sorter yields exactly the windowed rows");
+                            (&pulled, None)
+                        }
+                    };
                     meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
                     meter.charge(COSTS.row_produced);
+                    let penv = match at {
+                        Some((ra, i)) => {
+                            if let Some(b) = &ra.project {
+                                ra.set_row(b, i, &env, &meter);
+                            }
+                            EvalEnv {
+                                host_batch: ra.project.as_ref(),
+                                ..env
+                            }
+                        }
+                        None => EvalEnv { ..env },
+                    };
                     let mut o = Vec::with_capacity(plan.projections.len());
                     for p in &plan.projections {
-                        o.push(p.eval(&row, &env, &mut meter)?);
+                        o.push(p.eval(row, &penv, &mut meter)?);
                     }
                     meter.admit_row(&o)?; // the buffered result collector (memory.md §5.1)
                     out.push(o);
@@ -2357,14 +2512,13 @@ impl Engine {
                     };
                     // Host calls in the projection prefetch a chunk at a time and replay row by
                     // row (extensibility.md §4.2.1).
-                    let mut batch =
-                        HostBatch::for_exprs(&plan.projections, &self.session.extensions);
+                    let batch = HostBatch::for_exprs(&plan.projections, &self.session.extensions);
                     let mut out = Vec::with_capacity(end - start);
                     for (i, row) in rows.iter().enumerate().take(end).skip(start) {
                         meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
                         meter.charge(COSTS.row_produced);
-                        if let Some(b) = &mut batch {
-                            b.set_row(i, &rows, end, &plan.projections, &base, &meter);
+                        if let Some(b) = &batch {
+                            b.set_row(i, &rows, end, &base, &meter);
                         }
                         let env = EvalEnv {
                             host_batch: batch.as_ref(),

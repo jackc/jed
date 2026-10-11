@@ -1110,9 +1110,11 @@ that also declares a **component identity** may back a **persisted index** (belo
 - **Batch kernels.** A function may instead carry a **batch kernel** — column-major arguments
   (`args[j][i]` is argument `j` of row `i`, never NULL) in, one appended result per row out; on
   error, the count of results appended is the failing row (extensibility.md §4.2.1). Where the
-  engine holds a chunk of rows (the buffered projection), a non-`volatile` function's kernel runs once
-  per chunk of up to 1,024 rows and the row-at-a-time evaluation replays against the results, so
-  rows, cost, and errors are identical to the single-row form; elsewhere it gets a one-row batch. A
+  engine holds a chunk of rows (the buffered projection) or reads one ahead (the streaming
+  primary-key scan's projection and `WHERE`, the streaming sort's output), a non-`volatile`
+  function's batch kernel runs once per chunk (up to 1,024 rows in hand, 64 read ahead) and the
+  row-at-a-time evaluation replays against the results, so rows, cost, and errors are identical to
+  the single-row form; elsewhere — and always for a single-row kernel — it is called per row. A
   malformed batch (too many results, too few on success, an error after answering every row) is
   `22000`. TypeScript rejects a spec with both or neither of `kernel`/`batchKernel` (`22023`).
 - **Resolve + evaluate.** A host name (or a host overload of a built-in name over a new signature)

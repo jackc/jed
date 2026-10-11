@@ -8,6 +8,7 @@ package jed
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -566,6 +567,23 @@ func TestHostVolatileBatchKernelIsCalledPerRow(t *testing.T) {
 	}
 }
 
+func TestHostSingleRowKernelIsNeverPrefetched(t *testing.T) {
+	t.Parallel()
+	// A single-row kernel gains nothing from a batch (the registry loops it per row), so it is called
+	// exactly on the rows replay evaluates — at the buffered projection and at a pulled site alike.
+	calls := &hostCalls{}
+	s := batchDB(t, twiceRow(calls, -1), 30)
+	hostRows(t, s, "SELECT host_twice(a) FROM t")
+	hostRows(t, s, "SELECT host_twice(a) FROM t ORDER BY id LIMIT 5 OFFSET 3")
+	want := make([]int, 27+5)
+	for i := range want {
+		want[i] = 1
+	}
+	if got := calls.get(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("call sizes = %v, want 32 one-row calls", got)
+	}
+}
+
 func TestHostBatchErrorRaisesAtTheScalarRow(t *testing.T) {
 	t.Parallel()
 	// The kernel fails at a = 57. Alone, that is the error; with an earlier per-row error in the same
@@ -807,5 +825,296 @@ func TestHostBatchOutOfRangeRaisesAtTheScalarRow(t *testing.T) {
 		if !strings.HasPrefix(b, "error "+c.want) || b != r {
 			t.Fatalf("%s:\nbatched %.200s\nsingle  %.200s", c.sql, b, r)
 		}
+	}
+}
+
+// ── Pulled sites: the read-ahead window (extensibility.md §4.2.1 "In-hand and pulled sites") ───────
+
+// batchRunVia is batchRun either streamed at top level through the lazy cursor, or materialized as a
+// CTE body (WITH c AS (…) SELECT * FROM c), which runs it through the eager drive.
+func batchRunVia(s valueQuerier, sql string, materialized bool) string {
+	if materialized {
+		sql = "WITH c AS (" + sql + ") SELECT * FROM c"
+	}
+	out, err := queryOutcome(s, sql, nil)
+	if err != nil {
+		return fmt.Sprintf("error %s %s", errCodeOf(err), err.(*EngineError).Message)
+	}
+	return fmt.Sprintf("rows %v cost %d", out.Rows, out.Cost)
+}
+
+// batchRowsVia is the rows of a query run as batchRunVia does.
+func batchRowsVia(t *testing.T, s *Session, sql string, materialized bool) [][]Value {
+	t.Helper()
+	if materialized {
+		sql = "WITH c AS (" + sql + ") SELECT * FROM c"
+	}
+	return hostRows(t, s, sql)
+}
+
+// windowCalls is the kernel call sizes a full streaming scan of batchDB(_, n) makes: one call per
+// 64-row read-ahead window, over that window's non-NULL rows (every 10th a is NULL).
+func windowCalls(n int) []int {
+	var calls []int
+	for lo := 1; lo <= n; lo += 64 {
+		c := 0
+		for id := lo; id < lo+64 && id <= n; id++ {
+			if id%10 != 0 {
+				c++
+			}
+		}
+		calls = append(calls, c)
+	}
+	return calls
+}
+
+func TestHostBatchStreamingScanReadsAheadOneWindowPerChunk(t *testing.T) {
+	t.Parallel()
+	// A full scan in primary-key order streams; with a host call in the projection it reads 64 rows
+	// ahead and the kernel runs once per window over its non-NULL rows — through both drives.
+	for _, materialized := range []bool{false, true} {
+		calls := &hostCalls{}
+		s := batchDB(t, twiceBatched(calls, VolatilityImmutable, -1), 2500)
+		rows := batchRowsVia(t, s, "SELECT id, host_twice(a) FROM t ORDER BY id", materialized)
+		if len(rows) != 2500 || rows[6][0].Int != 7 || rows[6][1].Int != 14 || !rows[9][1].IsNull() {
+			t.Fatalf("materialized=%v: rows[6] = %v, rows[9] = %v of %d", materialized, rows[6], rows[9], len(rows))
+		}
+		if got, want := calls.get(), windowCalls(2500); !reflect.DeepEqual(got, want) {
+			t.Fatalf("materialized=%v: call sizes = %v, want %v", materialized, got, want)
+		}
+	}
+}
+
+func TestHostBatchStreamingScanBatchesTheWhereFilter(t *testing.T) {
+	t.Parallel()
+	// The WHERE predicate's call (beneath a comparison) prefetches over every pulled row of the
+	// window; the projection's call prefetches from the first row that reaches it.
+	for _, materialized := range []bool{false, true} {
+		calls := &hostCalls{}
+		s := batchDB(t, twiceBatched(calls, VolatilityImmutable, -1), 2500)
+		rows := batchRowsVia(t, s, "SELECT id FROM t WHERE host_twice(a) > 4990 ORDER BY id", materialized)
+		if len(rows) != 4 { // a = 2496..2499 (2500 is NULL)
+			t.Fatalf("materialized=%v: got %d rows, want 4", materialized, len(rows))
+		}
+		if got, want := calls.get(), windowCalls(2500); !reflect.DeepEqual(got, want) {
+			t.Fatalf("materialized=%v: call sizes = %v, want %v", materialized, got, want)
+		}
+	}
+}
+
+func TestHostBatchStreamingWindowIsBoundedByLimit(t *testing.T) {
+	t.Parallel()
+	// LIMIT 5 OFFSET 3 can emit at most 8 rows, so the window is 8 rows and the projection's chunk
+	// starts at the first emitted row; LIMIT 1 degenerates to batch-of-one.
+	for _, materialized := range []bool{false, true} {
+		calls := &hostCalls{}
+		s := batchDB(t, twiceBatched(calls, VolatilityImmutable, -1), 2500)
+		batchRowsVia(t, s, "SELECT host_twice(a) FROM t ORDER BY id LIMIT 5 OFFSET 3", materialized)
+		batchRowsVia(t, s, "SELECT host_twice(a) FROM t ORDER BY id LIMIT 1", materialized)
+		if got := calls.get(); !reflect.DeepEqual(got, []int{5, 1}) {
+			t.Fatalf("materialized=%v: call sizes = %v, want [5 1]", materialized, got)
+		}
+	}
+}
+
+func TestHostBatchStreamingSortReadsAhead(t *testing.T) {
+	t.Parallel()
+	// A single-table ORDER BY a non-key column streams out of the sorter; its projection reads the
+	// sorted rows ahead one 64-row window at a time (250 NULLs sort first under DESC, so the fourth
+	// window holds the first 6 values; then 35 full windows and a 4-row tail).
+	for _, materialized := range []bool{false, true} {
+		calls := &hostCalls{}
+		s := batchDB(t, twiceBatched(calls, VolatilityImmutable, -1), 2500)
+		rows := batchRowsVia(t, s, "SELECT a, host_twice(a) FROM t ORDER BY a DESC", materialized)
+		if rows[250][0].Int != 2499 || rows[250][1].Int != 4998 {
+			t.Fatalf("materialized=%v: rows[250] = %v, want [2499 4998]", materialized, rows[250])
+		}
+		want := []int{6}
+		for i := 0; i < 35; i++ {
+			want = append(want, 64)
+		}
+		want = append(want, 4)
+		if got := calls.get(); !reflect.DeepEqual(got, want) {
+			t.Fatalf("materialized=%v: call sizes = %v, want %v", materialized, got, want)
+		}
+	}
+}
+
+func TestHostBatchPulledSitesMatchRowKernelRowsAndCost(t *testing.T) {
+	t.Parallel()
+	// Rows and cost are identical to the single-row kernel at every pulled site and shape, through
+	// both the lazy and the materialized drive.
+	for _, sql := range []string{
+		"SELECT id, host_twice(a) FROM t ORDER BY id",
+		"SELECT id, host_twice(a) + 1, -host_twice(id) FROM t WHERE host_twice(a) > 100 ORDER BY id DESC",
+		"SELECT id, host_twice(a) FROM t WHERE id BETWEEN 100 AND 1300 ORDER BY id",
+		"SELECT id, host_twice(a) FROM t WHERE id IN (5, 50, 500, 1400) ORDER BY id",
+		"SELECT DISTINCT id, host_twice(a) FROM t ORDER BY id",
+		"SELECT host_twice(a) FROM t ORDER BY id LIMIT 7 OFFSET 1000",
+		"SELECT id FROM t WHERE host_twice(a) IS NULL ORDER BY id",
+		"SELECT a, host_twice(a), host_twice(id) > 50 FROM t ORDER BY a DESC",
+		"SELECT a, host_twice(a) FROM t ORDER BY a LIMIT 9 OFFSET 1100",
+	} {
+		for _, materialized := range []bool{false, true} {
+			batched := batchDB(t, twiceBatched(&hostCalls{}, VolatilityImmutable, -1), 1500)
+			single := batchDB(t, twiceRow(&hostCalls{}, -1), 1500)
+			b, r := batchRunVia(batched, sql, materialized), batchRunVia(single, sql, materialized)
+			if strings.HasPrefix(b, "error") || b != r {
+				t.Fatalf("%s materialized=%v:\nbatched %.200s\nsingle  %.200s", sql, materialized, b, r)
+			}
+		}
+	}
+}
+
+func TestHostBatchPulledSitesRaiseAtTheScalarRow(t *testing.T) {
+	t.Parallel()
+	// The kernel fails at a = 57; an earlier per-row error (division by zero at id = 40, in the
+	// projection or the filter) still wins, exactly as the single-row kernel orders them.
+	for _, sql := range []string{
+		"SELECT host_twice(a) FROM t ORDER BY id",
+		"SELECT id FROM t WHERE host_twice(a) > 0 ORDER BY id",
+		"SELECT 1 / (id - 40), host_twice(a) FROM t ORDER BY id",
+		"SELECT host_twice(a) FROM t WHERE 1 / (id - 40) > 0 ORDER BY id",
+		"SELECT host_twice(a) FROM t WHERE host_twice(id) / (id - 60) > -10 ORDER BY id",
+		"SELECT a, host_twice(a) FROM t ORDER BY a",
+	} {
+		for _, materialized := range []bool{false, true} {
+			batched := batchDB(t, twiceBatched(&hostCalls{}, VolatilityImmutable, 57), 200)
+			single := batchDB(t, twiceRow(&hostCalls{}, 57), 200)
+			b, r := batchRunVia(batched, sql, materialized), batchRunVia(single, sql, materialized)
+			if !strings.HasPrefix(b, "error") || b != r {
+				t.Fatalf("%s materialized=%v:\nbatched %.200s\nsingle  %.200s", sql, materialized, b, r)
+			}
+		}
+	}
+}
+
+func TestHostBatchErrorOnAnUnreachedRowStartsANewChunk(t *testing.T) {
+	t.Parallel()
+	// The kernel fails at a = 57, but the WHERE rejects that row, so replay never evaluates the call
+	// there: the speculative error is dropped and the next row starts a new chunk.
+	for _, materialized := range []bool{false, true} {
+		calls := &hostCalls{}
+		batched := batchDB(t, twiceBatched(calls, VolatilityImmutable, 57), 2500)
+		single := batchDB(t, twiceRow(&hostCalls{}, 57), 2500)
+		const sql = "SELECT id, host_twice(a) FROM t WHERE id % 1000 <> 57 ORDER BY id"
+		b, r := batchRunVia(batched, sql, materialized), batchRunVia(single, sql, materialized)
+		if strings.HasPrefix(b, "error") || b != r {
+			t.Fatalf("materialized=%v:\nbatched %.200s\nsingle  %.200s", materialized, b, r)
+		}
+		// Window 1 (rows 1-64): the chunk from row 1 fails at 57; the chunk from row 58 covers the rest
+		// of the window (58, 59, 61..64). Every later window is one call.
+		w := windowCalls(2500)
+		want := append([]int{w[0], 6}, w[1:]...)
+		if got := calls.get(); !reflect.DeepEqual(got, want) {
+			t.Fatalf("materialized=%v: call sizes = %v, want %v", materialized, got, want)
+		}
+	}
+}
+
+func TestHostBatchPulledCostAbortMatchesRowKernel(t *testing.T) {
+	t.Parallel()
+	// Under a ceiling the abort row is the single-row kernel's — in the projection and in the filter,
+	// through both drives — and the kernel ran over no more rows than the budget could pay.
+	for _, sql := range []string{
+		"SELECT id, host_twice(a) FROM t ORDER BY id",
+		"SELECT id FROM t WHERE host_twice(a) > 0 ORDER BY id",
+		"SELECT a, host_twice(a) FROM t ORDER BY a",
+	} {
+		for _, materialized := range []bool{false, true} {
+			calls := &hostCalls{}
+			batched := batchDB(t, twiceBatched(calls, VolatilityImmutable, -1), 2000)
+			single := batchDB(t, twiceRow(&hostCalls{}, -1), 2000)
+			const budget = 300
+			batched.SetMaxCost(budget)
+			single.SetMaxCost(budget)
+			b, r := batchRunVia(batched, sql, materialized), batchRunVia(single, sql, materialized)
+			if !strings.HasPrefix(b, "error 54P01") || b != r {
+				t.Fatalf("%s materialized=%v:\nbatched %.200s\nsingle  %.200s", sql, materialized, b, r)
+			}
+			speculated := 0
+			for _, n := range calls.get() {
+				speculated += n
+			}
+			if speculated > budget/5+1 {
+				t.Fatalf("%s: kernel ran over %d rows", sql, speculated)
+			}
+		}
+	}
+}
+
+func TestHostBatchStreamingScanStorageErrorsMatchRowKernel(t *testing.T) {
+	t.Parallel()
+	// A corrupted page must surface exactly as under the single-row kernel — a read-ahead that meets
+	// it defers the error to the row the per-row pull would have met it at, so the kernel's own error
+	// at a = 57 still wins when it comes first, and a LIMIT that stops first never sees it. Corrupt
+	// each body page of a multi-leaf file in turn.
+	const page = 256
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seed.jed")
+	db, err := create(path, databaseOptions{PageSize: page, noSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{
+		"CREATE TABLE t (id i64 PRIMARY KEY, a i64)",
+		"INSERT INTO t SELECT g, CASE WHEN g % 10 = 0 THEN NULL ELSE g END FROM generate_series(1, 300) AS g",
+	} {
+		if _, err := execute(db, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	checkpointTestFile(t, path) // one clean generation, so a corrupted page cannot recover to an older root
+	clean, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Separate copies: each handle locks its own file.
+	open := func(name string, bytes []byte, f *HostFunction) *Database {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, bytes, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		d, err := OpenDatabaseWithOptions(p, OpenOptions{SkipFsync: true, Extensions: regWith(t, f)})
+		if err != nil {
+			return nil // a corrupted routing/catalog page fails at open, before any scan
+		}
+		return d
+	}
+	detected := 0
+	for i := 2; i < len(clean)/page; i++ {
+		bytes := append([]byte(nil), clean...)
+		bytes[i*page+16] ^= 0xFF
+		batched := open("batched.jed", bytes, twiceBatched(&hostCalls{}, VolatilityImmutable, 57))
+		single := open("single.jed", bytes, twiceRow(&hostCalls{}, 57))
+		if batched != nil && single != nil {
+			for _, sql := range []string{
+				"SELECT id, host_twice(a) FROM t ORDER BY id",
+				"SELECT id, host_twice(a) FROM t ORDER BY id LIMIT 40",
+				"SELECT id, host_twice(a) FROM t ORDER BY id LIMIT 200",
+				"SELECT id, host_twice(id) FROM t ORDER BY id",
+			} {
+				for _, materialized := range []bool{false, true} {
+					b, r := batchRunVia(batched, sql, materialized), batchRunVia(single, sql, materialized)
+					if strings.HasPrefix(r, "error XX001") {
+						detected++
+					}
+					if b != r {
+						t.Fatalf("page %d: %s materialized=%v:\nbatched %.200s\nsingle  %.200s", i, sql, materialized, b, r)
+					}
+				}
+			}
+		}
+		for _, d := range []*Database{batched, single} {
+			if d != nil {
+				d.Close()
+			}
+		}
+	}
+	if detected == 0 {
+		t.Fatal("a corrupted leaf should fail a scan")
 	}
 }

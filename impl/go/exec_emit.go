@@ -311,9 +311,32 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 		// execStreamingSort ran before its output went lazy (streaming.md §4/§7).
 		defer em.sorted.close() // a LIMIT/error may stop the merge early — release any undrained runs
 		env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
+		// An eligible host call in the projection reads the sorted output ahead into a window and
+		// replays it row by row (extensibility.md §4.2.1): the pull is unmetered and the sort's charge
+		// is returned only at close, so no charge moves.
+		var ra *readAhead
+		projectEnv := env
+		if !em.precharged && !em.identity {
+			if ra = newReadAhead(nil, plan.projections, db.session.extensions); ra != nil {
+				pe := *env
+				pe.hostBatch = ra.project
+				projectEnv = &pe
+			}
+		}
 		out := make([][]Value, 0, em.end)
 		for i := int64(0); i < em.end; i++ {
-			row, ok, err := em.sorted.next()
+			var row storedRow
+			var ok bool
+			var err error
+			at := -1
+			if ra != nil {
+				window := readAheadCap(meter, costs.RowProduced, em.end-i, true)
+				if at, ok, err = ra.next(window, em.sorted.next); ok {
+					row = ra.rows[at]
+				}
+			} else {
+				row, ok, err = em.sorted.next()
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -340,9 +363,12 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 				out = append(out, row)
 				continue
 			}
+			if at >= 0 {
+				ra.setRow(ra.project, at, env, meter)
+			}
 			projected := make([]Value, len(plan.projections))
 			for j, p := range plan.projections {
-				v, perr := p.eval(row, env, meter)
+				v, perr := p.eval(row, projectEnv, meter)
 				if perr != nil {
 					return nil, perr
 				}

@@ -55,20 +55,34 @@ failing row and raises; the results it already appended mark which row that was,
 reported for exactly the row a one-row kernel would have failed on.
 
 Both forms behave identically from SQL — same rows, same cost, same errors in the same order. The
-difference is how often your code is entered: where jed already holds a chunk of rows (a projection
-over a filtered or joined result), it calls a non-`volatile` batch kernel once per chunk of up to
-1,024 rows, then replays the row-by-row evaluation against those results. That matters most when a
-call crosses a language boundary — a binding that wraps jed in another language pays the crossing
-once per chunk instead of once per row. A `volatile` function is always called one row at a time,
-so its calls happen exactly as a one-row kernel's would. So is a function with **no arguments**: its
-batch kernel receives no columns to learn a row count from, so jed always hands it exactly one row,
-and it appends exactly one result.
+difference is how often your code is entered: jed calls a non-`volatile` batch kernel once per chunk
+of rows, then replays the row-by-row evaluation against those results. It does this
+
+- in a **projection** over a filtered, joined, grouped, or sorted result, up to 1,024 rows at a
+  time;
+- in a **streaming primary-key scan** — `SELECT f(x) FROM t ORDER BY id`, a key range, or a key
+  `IN` list — for both the projection and the `WHERE` clause (jed reads up to 64 rows ahead of the
+  scan to form the chunk);
+- in the output of a **streaming sort** (`ORDER BY` a non-key column), also up to 64 rows at a time.
+
+A call is batched when it is a projection item or `WHERE` predicate itself, or sits beneath only
+casts, arithmetic, comparisons, unary minus, `NOT`, or `IS [NOT] NULL` — `f(x) + 1` and
+`WHERE f(x) > 10` batch — and its arguments are columns, constants, or parameters. A call under
+`CASE`, `COALESCE`, `AND`/`OR`, or another function's arguments is called one row at a time. That
+matters most when a call crosses a language boundary — a binding that wraps jed in another language
+pays the crossing once per chunk instead of once per row. A single-row kernel is always called one row
+at a time, exactly on the rows the query evaluates — batching it would save nothing — and so is a
+`volatile` batch kernel, so its calls happen exactly as a one-row kernel's would. So is a function
+with **no arguments**: its batch kernel receives no columns to learn a row count from, so jed always
+hands it exactly one row, and it appends exactly one result.
 
 Because jed may compute a chunk ahead of the rows it emits, a batch kernel can run on rows a query
-never returns — the tail of a chunk after a `LIMIT` is satisfied, or after an earlier error. Your
-kernel must be a plain per-row map: result `i` depends only on row `i`'s arguments. On a session
-with a cost ceiling, the chunk is capped at what the remaining budget could pay for at the declared
-`cost`, so the speculation stays bounded.
+never returns — the tail of a chunk after a `LIMIT` is satisfied, a row the `WHERE` clause rejects,
+or a row after an earlier error. Your kernel must be a plain per-row map: result `i` depends only on
+row `i`'s arguments; an error it raises for a row the query never evaluates is discarded. With a
+`LIMIT`, the read-ahead never goes past the rows the limit can still return. On a session with a
+cost ceiling, the chunk is capped at what the remaining budget could pay for at the declared `cost`,
+so the speculation stays bounded.
 
 ## Resolution: built-ins win
 
@@ -117,5 +131,5 @@ extension seam and a legible line where your code takes over.
 
 The surface is still deliberately narrow — **strict** and **exact scalar signatures** (no implicit
 promotion). Host functions in `DEFAULT`/`CHECK` columns, host *types*, and non-strict functions come
-later, as does batching at more sites (filters, streaming scans, writes, index builds — today they
-call a batch kernel with one row).
+later, as does batching at more sites (filters inside joins and blocking scans, aggregate
+arguments, writes, index builds — today they call a batch kernel with one row).

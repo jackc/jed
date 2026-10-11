@@ -91,7 +91,7 @@ mod rewrite;
 pub(crate) use rewrite::*;
 mod engine;
 mod host_batch;
-pub(crate) use host_batch::HostBatch;
+pub(crate) use host_batch::{HostBatch, ReadAhead, read_ahead_cap};
 mod snapshot;
 mod statistics;
 pub(crate) use statistics::*;

@@ -238,6 +238,9 @@ pub(crate) struct StreamingScan {
     /// Set once the scan is exhausted, the `LIMIT` window is filled, or the bound is empty —
     /// after which `next_row` short-circuits without faulting another leaf.
     pub(crate) done: bool,
+    /// The read-ahead window, when the `WHERE` or projection has an eligible host call
+    /// (extensibility.md §4.2.1 "In-hand and pulled sites").
+    pub(crate) ahead: Option<ReadAhead>,
 }
 
 impl crate::cursor::RowStream for StreamingScan {
@@ -264,35 +267,86 @@ impl crate::cursor::RowStream for StreamingScan {
         };
         let mask = &self.plan.rel_masks[0];
         loop {
-            let mut row = match self.scan.next_row()? {
-                Some(row) => row,
+            // The next row: pulled directly, or handed out from the read-ahead window (whose pull
+            // charges nothing and defers a storage error to this same point — §4.2.1).
+            let mut pulled;
+            let (row, ahead): (&Row, Option<(&ReadAhead, usize)>) = match &mut self.ahead {
+                Some(ra) => {
+                    let remaining = self
+                        .limit
+                        .map(|l| self.offset.saturating_add(l) - self.passed);
+                    let cap = || read_ahead_cap(&self.meter, COSTS.storage_row_read, remaining);
+                    let Some(i) = ra.next(cap, || self.scan.next_row())? else {
+                        self.done = true;
+                        self.seen.release(); // the scan ended (memory.md §6.2)
+                        return Ok(None);
+                    };
+                    self.meter.guard()?; // enforce the cost ceiling / cancellation per scanned row
+                    self.meter.charge(COSTS.storage_row_read);
+                    if TableStore::needs_resolution(&ra.rows[i], mask) {
+                        self.scan.resolve_columns(&mut ra.rows[i], mask)?;
+                    }
+                    let ra: &ReadAhead = ra;
+                    (&ra.rows[i], Some((ra, i)))
+                }
                 None => {
-                    self.done = true;
-                    self.seen.release(); // the scan ended (memory.md §6.2)
-                    return Ok(None);
+                    pulled = match self.scan.next_row()? {
+                        Some(row) => row,
+                        None => {
+                            self.done = true;
+                            self.seen.release(); // the scan ended (memory.md §6.2)
+                            return Ok(None);
+                        }
+                    };
+                    self.meter.guard()?; // enforce the cost ceiling / cancellation per scanned row
+                    self.meter.charge(COSTS.storage_row_read);
+                    // Materialize the touched columns left unfetched by the lazy load
+                    // (large-values.md §14); the chain reads were already metered in the up-front
+                    // block (cost.md §3).
+                    if TableStore::needs_resolution(&pulled, mask) {
+                        self.scan.resolve_columns(&mut pulled, mask)?;
+                    }
+                    (&pulled, None)
                 }
             };
-            self.meter.guard()?; // enforce the cost ceiling / cancellation per scanned row
-            self.meter.charge(COSTS.storage_row_read);
-            // Materialize the touched columns left unfetched by the lazy load (large-values.md §14);
-            // the chain reads were already metered in the up-front block (cost.md §3).
-            if TableStore::needs_resolution(&row, mask) {
-                self.scan.resolve_columns(&mut row, mask)?;
-            }
+            let filter_env = EvalEnv {
+                host_batch: ahead.and_then(|(ra, _)| ra.filter.as_ref()),
+                ..env
+            };
+            let project_env = EvalEnv {
+                host_batch: ahead.and_then(|(ra, _)| ra.project.as_ref()),
+                ..env
+            };
             let keep = match self.plan.filter.get() {
-                Some(f) => f.eval(&row, &env, &mut self.meter)?.is_true(),
+                Some(f) => {
+                    if let Some((ra, i)) = ahead
+                        && let Some(b) = &ra.filter
+                    {
+                        ra.set_row(b, i, &env, &self.meter);
+                    }
+                    f.eval(row, &filter_env, &mut self.meter)?.is_true()
+                }
                 None => true,
             };
             if !keep {
                 continue;
             }
+            // The projection's prefetch is made current just before each projection evaluation.
+            let set_project_row = |meter: &Meter| {
+                if let Some((ra, i)) = ahead
+                    && let Some(b) = &ra.project
+                {
+                    ra.set_row(b, i, &env, meter);
+                }
+            };
             if self.distinct {
                 // DISTINCT (cost.md §3): project EVERY scanned filtered row (the dedup key, charged
                 // even for a duplicate — the §3 asymmetry), drop a value already seen, then OFFSET/LIMIT
                 // window the survivors — exactly `exec_streaming_scan`.
+                set_project_row(&self.meter);
                 let mut projected = Vec::with_capacity(self.plan.projections.len());
                 for p in &self.plan.projections {
-                    projected.push(p.eval(&row, &env, &mut self.meter)?);
+                    projected.push(p.eval(row, &project_env, &mut self.meter)?);
                 }
                 let inserted = self.seen.insert(projected.clone());
                 if !self.meter.cost_first(inserted)? {
@@ -311,9 +365,10 @@ impl crate::cursor::RowStream for StreamingScan {
                 continue;
             }
             self.meter.charge(COSTS.row_produced);
+            set_project_row(&self.meter);
             let mut projected = Vec::with_capacity(self.plan.projections.len());
             for p in &self.plan.projections {
-                projected.push(p.eval(&row, &env, &mut self.meter)?);
+                projected.push(p.eval(row, &project_env, &mut self.meter)?);
             }
             self.produced += 1;
             return Ok(Some(projected));
@@ -371,6 +426,8 @@ pub(crate) enum BufState {
         remaining: usize,
         project: bool,
         charged: bool,
+        /// The projection's read-ahead window (extensibility.md §4.2.1), if a call in it is eligible.
+        ahead: Option<ReadAhead>,
     },
     /// The blocking part has not run yet — the first `next_row` runs it (streaming.md §4).
     Pending,
@@ -397,6 +454,8 @@ pub(crate) enum BufState {
     Sorted {
         sorted: crate::spill::SortedRows,
         remaining: usize,
+        /// The projection's read-ahead window (extensibility.md §4.2.1), if a call in it is eligible.
+        ahead: Option<ReadAhead>,
     },
     /// The columnar projection fast path's lazy state (packed-leaf.md §11 Track A2/A3): the pre-gathered
     /// dense lanes + the projection's column indices, windowed to `[idx, end)`, with the optional A3
@@ -442,6 +501,14 @@ impl crate::cursor::RowStream for BufferedScan {
                     remaining,
                     project: matches!(mode, EmitMode::Project),
                     charged,
+                    ahead: match mode {
+                        EmitMode::Project => ReadAhead::for_site(
+                            None,
+                            &self.plan.projections,
+                            &self.engine.session.extensions,
+                        ),
+                        EmitMode::Identity => None,
+                    },
                 },
                 Emitter::Buffer {
                     rows,
@@ -464,7 +531,15 @@ impl crate::cursor::RowStream for BufferedScan {
                 Emitter::Final { rows } => BufState::Final {
                     iter: rows.into_iter(),
                 },
-                Emitter::Sorted { sorted, remaining } => BufState::Sorted { sorted, remaining },
+                Emitter::Sorted { sorted, remaining } => BufState::Sorted {
+                    sorted,
+                    remaining,
+                    ahead: ReadAhead::for_site(
+                        None,
+                        &self.plan.projections,
+                        &self.engine.session.extensions,
+                    ),
+                },
                 Emitter::Columnar {
                     cols,
                     proj_cols,
@@ -488,21 +563,43 @@ impl crate::cursor::RowStream for BufferedScan {
                 remaining,
                 project,
                 charged,
+                ahead,
             } => {
                 if *remaining == 0 {
                     self.state = BufState::Done;
                     return Ok(None);
                 }
-                let row = rows.next()?.expect("spool cardinality");
+                if !*project {
+                    let row = rows.next()?.expect("spool cardinality");
+                    *remaining -= 1;
+                    if !*charged {
+                        self.meter.guard()?;
+                        self.meter.charge(COSTS.row_produced);
+                    }
+                    return Ok(Some(row));
+                }
+                // The next spooled row: pulled directly, or from the read-ahead window (§4.2.1).
+                let pulled;
+                let (row, at): (&Row, Option<(&ReadAhead, usize)>) = match ahead {
+                    Some(ra) => {
+                        let cap = || {
+                            read_ahead_cap(&self.meter, COSTS.row_produced, Some(*remaining as i64))
+                        };
+                        let i = ra.next(cap, || rows.next())?.expect("spool cardinality");
+                        let ra: &ReadAhead = ra;
+                        (&ra.rows[i], Some((ra, i)))
+                    }
+                    None => {
+                        pulled = rows.next()?.expect("spool cardinality");
+                        (&pulled, None)
+                    }
+                };
                 *remaining -= 1;
                 if !*charged {
                     self.meter.guard()?;
                     self.meter.charge(COSTS.row_produced);
                 }
-                if !*project {
-                    return Ok(Some(row));
-                }
-                let env = EvalEnv {
+                let base = EvalEnv {
                     exec: &self.engine,
                     params: &self.params,
                     outer: &[],
@@ -510,11 +607,23 @@ impl crate::cursor::RowStream for BufferedScan {
                     ctes: CteCtx::empty(),
                     host_batch: None,
                 };
+                let env = match at {
+                    Some((ra, i)) => {
+                        if let Some(b) = &ra.project {
+                            ra.set_row(b, i, &base, &self.meter);
+                        }
+                        EvalEnv {
+                            host_batch: ra.project.as_ref(),
+                            ..base
+                        }
+                    }
+                    None => base,
+                };
                 Ok(Some(
                     self.plan
                         .projections
                         .iter()
-                        .map(|p| p.eval(&row, &env, &mut self.meter))
+                        .map(|p| p.eval(row, &env, &mut self.meter))
                         .collect::<Result<Row>>()?,
                 ))
             }
@@ -533,19 +642,42 @@ impl crate::cursor::RowStream for BufferedScan {
             // and project it (streaming.md §4/§7). Disjoint-field borrows: `sorted`/`remaining` come
             // from `self.state`, distinct from `self.meter`/`self.engine`/`self.plan`/`self.rng`/
             // `self.params` the projection reads.
-            BufState::Sorted { sorted, remaining } => {
+            BufState::Sorted {
+                sorted,
+                remaining,
+                ahead,
+            } => {
                 if *remaining == 0 {
                     // Exhausted: the sort state's charge is returned (memory.md §6.4).
                     sorted.release();
                     return Ok(None);
                 }
-                let row = sorted
-                    .next()?
-                    .expect("the sorter yields exactly the windowed rows");
+                // The next sorted row: pulled directly, or from the read-ahead window — the pull
+                // is unmetered and the sort's charge is returned only at the end, so reading ahead
+                // moves no charge (extensibility.md §4.2.1).
+                let pulled;
+                let (row, at): (&Row, Option<(&ReadAhead, usize)>) = match ahead {
+                    Some(ra) => {
+                        let cap = || {
+                            read_ahead_cap(&self.meter, COSTS.row_produced, Some(*remaining as i64))
+                        };
+                        let i = ra
+                            .next(cap, || sorted.next())?
+                            .expect("the sorter yields exactly the windowed rows");
+                        let ra: &ReadAhead = ra;
+                        (&ra.rows[i], Some((ra, i)))
+                    }
+                    None => {
+                        pulled = sorted
+                            .next()?
+                            .expect("the sorter yields exactly the windowed rows");
+                        (&pulled, None)
+                    }
+                };
                 *remaining -= 1;
                 self.meter.guard()?; // enforce the cost ceiling / cancellation per produced row
                 self.meter.charge(COSTS.row_produced);
-                let env = EvalEnv {
+                let base = EvalEnv {
                     exec: &self.engine,
                     params: &self.params,
                     outer: &[],
@@ -553,9 +685,21 @@ impl crate::cursor::RowStream for BufferedScan {
                     ctes: CteCtx::empty(),
                     host_batch: None,
                 };
+                let env = match at {
+                    Some((ra, i)) => {
+                        if let Some(b) = &ra.project {
+                            ra.set_row(b, i, &base, &self.meter);
+                        }
+                        EvalEnv {
+                            host_batch: ra.project.as_ref(),
+                            ..base
+                        }
+                    }
+                    None => base,
+                };
                 let mut out = Vec::with_capacity(self.plan.projections.len());
                 for p in &self.plan.projections {
-                    out.push(p.eval(&row, &env, &mut self.meter)?);
+                    out.push(p.eval(row, &env, &mut self.meter)?);
                 }
                 Ok(Some(out))
             }
@@ -584,7 +728,7 @@ impl crate::cursor::RowStream for BufferedScan {
                         host_batch: None,
                     };
                     if let Some(b) = batch {
-                        b.set_row(i, rows, *end, &self.plan.projections, &base, &self.meter);
+                        b.set_row(i, rows, *end, &base, &self.meter);
                     }
                     let env = EvalEnv {
                         host_batch: batch.as_ref(),

@@ -117,9 +117,11 @@ export class HostFuncEntry {
   }
 
   // Whether the executor may prefetch this function's results in a batch ahead of the row-at-a-time
-  // replay (§4.2.1): any rung but "volatile", whose call set must stay exactly the scalar one.
+  // replay (§4.2.1): a batch kernel (a single-row kernel is looped per row anyway, so prefetching it
+  // would only add work and speculative calls) of any rung but "volatile", whose call set must stay
+  // exactly the scalar one.
   batchable(): boolean {
-    return this.volatility !== "volatile";
+    return this.batchKernel !== null && this.volatility !== "volatile";
   }
 
   // Call the kernel for ONE row (`args` non-NULL, one per parameter) — the batch-of-one path of every

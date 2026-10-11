@@ -340,7 +340,8 @@ must carry:
 
 Every host function is evaluated through **one** kernel shape: a **batch kernel** over `n ≥ 1` rows.
 A host registers either a batch kernel directly or the familiar single-row kernel, which the
-registry adapts into a batch kernel (a loop over the rows). The executor never sees the difference.
+registry adapts into a batch kernel (a loop over the rows). Results never depend on the difference;
+only whether the executor prefetches does (rule 1 below).
 
 **The call.** `args` is **column-major**: `args[j][i]` is argument `j` of row `i`; every column has
 the same length `n ≥ 1`, and no value is NULL (the function is strict — a row with any NULL argument
@@ -374,25 +375,39 @@ abort row, the error row, or any result (§4.2: "error ordering must be identica
 observable evaluation **stays the row-at-a-time evaluation**, unchanged: for every row, the call node
 charges the declared cost, guards, evaluates its arguments, short-circuits a NULL, and type-checks the
 result, at exactly the points it always did. What changes is only *where the result comes from*.
-Before an evaluation site replays a chunk of rows it already holds, it **prefetches**: for each
-eligible call node it gathers the chunk's argument columns, calls the kernel once, and caches the
-per-row outcome (result, or the error at the reported row). Replay then takes row `i`'s outcome from
-the cache instead of calling the kernel; a row the cache cannot answer (past a reported error, or
-outside the prefetched chunk) falls back to a batch-of-one call. Rows, cost, abort points, and errors
-are therefore identical to batch-of-one **by construction**, metered or not — unlike the columnar
-lanes (packed-leaf.md §11), batching needs no unmetered gate. A call node is eligible when:
+Before an evaluation site evaluates an expression over a row of a chunk it holds, it **prefetches**:
+for each eligible call node not yet covered at that row, it gathers the argument columns of the chunk
+from that row on, calls the kernel once, and caches the per-row outcome (result, or the error at the
+reported row). Replay then takes row `i`'s outcome from the cache instead of calling the kernel. A
+row past a reported error starts a new chunk at that row (the error row itself is answered by the
+error); a row whose argument the prefetch could not read (below) falls back to a batch-of-one call.
+Rows, cost, abort points, and errors are therefore identical to batch-of-one **by construction**,
+metered or not — unlike the columnar lanes (packed-leaf.md §11), batching needs no unmetered gate. A
+call node is eligible when:
 
-1. its function is **not `volatile`** — a volatile function's call set stays exactly the scalar one.
-   An `immutable`/`stable` kernel may be invoked on rows replay never reaches (a later error, an early
-   cursor close, a LIMIT window that ends mid-chunk); those calls are wasted host work, not observable
-   SQL behavior;
+1. its function was registered with a **batch kernel** and is **not `volatile`**. A single-row
+   kernel is only ever looped per row by the registry, so prefetching it would add engine work and
+   speculative calls for no saving: it stays batch-of-one, called exactly on the rows replay
+   evaluates. A volatile function's call set stays exactly the scalar one. An `immutable`/`stable`
+   batch kernel may be invoked on rows replay never reaches (a later error, an early cursor close, a
+   LIMIT window that ends mid-chunk, a row the `WHERE` rejects, an `OFFSET` row); those calls are
+   wasted host work, not observable SQL behavior;
 2. it has **at least one argument**, and every argument is **trivially evaluable** — a column
    reference, constant, or parameter — so the prefetch can evaluate it without a meter: such an
-   argument is free (cost.md §3) and cannot raise, so the prefetch does no unmetered engine work. For the same reason a replayed row whose outcome
-   *was* prefetched (its arguments proven non-NULL) may skip re-evaluating them: doing so would charge
-   nothing, raise nothing, and not short-circuit, so it is unobservable;
-3. it is evaluated **unconditionally, once per row**, at the site — a direct item of the evaluated
-   expression list, not beneath `CASE`/`COALESCE`/`NULLIF`/`AND`/`OR` or inside a subquery.
+   argument is free (cost.md §3) and cannot raise, so the prefetch does no unmetered engine work. For
+   the same reason a replayed row whose outcome *was* prefetched (its arguments proven non-NULL) may
+   skip re-evaluating them: doing so would charge nothing, raise nothing, and not short-circuit, so it
+   is unobservable. A column whose stored value is still **unfetched** (a large value the lazy load
+   deferred, large-values.md §14) is not read by the prefetch — resolving it is engine I/O that can
+   raise — so that row is not prefetched and replay evaluates its arguments and calls the kernel for
+   it alone, after resolving it at the usual point;
+3. it is evaluated **unconditionally, once per row**, at the site — reached from a root of the
+   evaluated expression list (a projection item, or the `WHERE` predicate at a site that filters)
+   only through nodes that evaluate every operand: a cast, unary minus, `NOT`, `IS [NOT] NULL`, an
+   arithmetic operator, or a comparison. A call beneath `CASE`/`COALESCE`/`NULLIF`/`AND`/`OR`, another
+   function's arguments, or inside a subquery stays batch-of-one. (A failing *earlier* operand ends
+   the statement, so "unconditional" needs no exception for it.) The rule is about wasted work, not
+   correctness: a conditional call would run the kernel on rows the guard exists to protect.
 
 **Bounding the speculation.** A chunk is at most 1024 rows. On a metered handle the chunk for a node
 with declared cost `c > 0` is further capped at `⌊headroom / c⌋ + 1` rows, where `headroom` is the
@@ -400,16 +415,63 @@ smaller remaining statement/lifetime budget: every replayed row charges at least
 never runs on more rows than the budget could pay for, plus the one that trips it. A batch kernel is
 still host code (§9) — this bounds how far *jed* runs ahead, not what the kernel does per call.
 
-**Sites.** The prefetch is a helper an evaluation site calls over rows it already holds; it is wired
-into the **projection of the buffered blocking path** (the `Buffer` emitter: plain and filtered scans
-without a streaming order, index-bounded scans, joins, eager sorts, and grouped output) — wherever
-that SELECT runs, including as a derived table, a CTE body, a set-operation arm, or an
-`INSERT … SELECT` source. The other row-evaluation sites call the kernel batch-of-one and adopt the
-helper as follow-ons: streaming scan/sort/join projections (notably a full scan in `ORDER BY` primary
-key order), `WHERE`/`ON` filters inside scans, aggregate arguments, `INSERT … VALUES`,
-`UPDATE … SET`, `RETURNING`, and index build/maintenance over a host expression (§8.1). Which rows a
-kernel is called with, and how often, is host-observable only; it is not part of the cross-core
-contract.
+**In-hand and pulled sites.** An **in-hand** site already holds its rows (the `Buffer` emitter's
+windowed buffer) and prefetches straight from them. A **pulled** site produces rows one at a time
+from a source — the streaming scan's B-tree cursor, the streaming sort's (or spool's) pull iterator —
+so it first fills a **read-ahead window** from the source and then replays the window row by row
+through its unchanged per-row pipeline, prefetching from the window. This is sound because, at every
+pulled site, **pulling a row is not itself a metered event and has no other observable effect**:
+
+- **Cost.** The scan's `page_read`/`value_decompress` block is charged up front for the whole
+  interval, and its per-row `storage_row_read` is charged by the replay loop, not the pull (cost.md
+  §3); the streaming sort charged its input when it sorted, and its `row_produced` is charged on
+  emission. So reading a row early moves no charge and no guard.
+- **Errors.** A source error met while filling the window — an I/O or checksum failure faulting the
+  next leaf or reading a spill run — is **deferred**: the window ends there, and the error is raised
+  only after replay has handed out every row read before it, which is exactly where the batch-of-one
+  pull would have raised it (before that row's guard). If replay stops first — an earlier row's error
+  or cost abort, a filled `LIMIT`, a closed cursor — the deferred error is dropped, because the
+  batch-of-one pull would never have read that far.
+- **Memory.** The sort's and spool's query-memory charge (memory.md §6.4/§6.6) is returned when the
+  emission completes, not per pulled row, so moving a row from the sorter into the window changes no
+  reservation. The window itself is bounded scratch (≤ 64 stored rows, each under `RECORD_MAX`
+  inline) and, like the prefetch's argument columns, is not charged to the query-memory account: the
+  account's trip point stays the batch-of-one one.
+- **Lazy values.** Columns the lazy load left unfetched are resolved at replay, at the same point as
+  before (after the row's `storage_row_read`); see rule 2.
+
+A read-ahead window is used only when the site has an eligible call — otherwise the site pulls row by
+row exactly as before. Its size is the smallest of **64**; on a metered handle, `⌊headroom / u⌋ + 1`,
+where `u` is the per-row unit replay charges first (`storage_row_read` for a scan, `row_produced` for
+a sort); and the rows the site can still emit: for a scan with a `LIMIT`, `offset + limit − passed`
+(every pulled row raises `passed` by at most one, so the window never reaches past the row at which
+batch-of-one would stop pulling), and for a sort, its remaining windowed rows. With `LIMIT 1` the
+window is one row — batch-of-one. The window is narrower than the 1024-row in-hand chunk because,
+unlike a buffer the site already holds, it keeps freshly pulled rows alive only to batch: that
+retention is pure overhead in a core whose kernel call is cheap (Rust measured ~25–30 ns per row
+above a few rows, about the same from 32 to 1024 rows — benchmarks.md §8.2), so the window is kept
+small while still cutting a wrapped binding's boundary crossings 64-fold.
+
+**Sites.** The prefetch runs at:
+
+- the **projection of the buffered blocking path** (the `Buffer` emitter — in hand: plain and
+  filtered scans without a streaming order, index-bounded scans, joins, eager sorts, and grouped
+  output);
+- the **streaming primary-key scan** (pulled: a full or contiguous/interval-set primary-key scan whose
+  order is the `ORDER BY` — `SELECT f(x) FROM t ORDER BY pk`, with or without `WHERE`, `DISTINCT`,
+  `LIMIT`/`OFFSET`, through both the materialized drive and the lazy cursor) — for its projection
+  **and** its `WHERE` predicate, each with its own prefetch over the shared window (the filter's at
+  every pulled row, the projection's at each row that reaches it);
+- the **streaming sort's** and the **spooled blocking buffer's** projecting emission (pulled).
+
+Each applies wherever that SELECT runs, including as a derived table, a CTE body, a set-operation arm,
+or an `INSERT … SELECT` source. The other row-evaluation sites still call the kernel batch-of-one, as
+follow-ons: the index-driven streaming scans (an ordered secondary-index, GIN, or GiST feed charges a
+per-row point lookup at pull time, so its window would have to carry those charges to replay),
+streaming joins, `WHERE`/`ON` filters inside blocking scans and joins, aggregate arguments,
+`INSERT … VALUES`, `UPDATE … SET`, `RETURNING`, and index build/maintenance over a host expression
+(§8.1). Which rows a kernel is called with, and how often, is host-observable only; it is not part of
+the cross-core contract.
 
 ### 4.3 Host-defined core (scalar) types — reasonable; climb the §3 ladder, the host picks how high
 
@@ -929,7 +991,7 @@ When a section here is ratified, update **in the same change** (mirrors [determi
 | §2 | Determinism-ownership is the line that moves | **proposed** (the governing principle) |
 | §3 | The `TypeExpr` model + the capability ladder + the closed container axis | **proposed** (composite arm is **landed**) |
 | §4.1 | Composite types (derived codec, G2 free, self-describing) | **landed as a type**; composite-**as-key** **landed** (§14 step 2, `composite-field-slots` [encoding.md §2.15](encoding.md); array-of-composite element the lone remaining `0A000`) |
-| §4.2 | Host scalar functions (registry, signature overloads, vectorized, cost, volatility) | **landed** (all 3 cores): registry + resolve + eval seam, exact-signature overloading, cost charged/gated, strict, wrong-type-caught, 42723 (§14 step 3); **plus** `component_id`/`semantic_version` + index-backing (§14 step 4); **plus** the batched column-in/column-out kernel ABI (§4.2.1), batched at the buffered projection site. Non-strict, container args, cross-core *taint enforcement*, and batching at the remaining sites still deferred |
+| §4.2 | Host scalar functions (registry, signature overloads, vectorized, cost, volatility) | **landed** (all 3 cores): registry + resolve + eval seam, exact-signature overloading, cost charged/gated, strict, wrong-type-caught, 42723 (§14 step 3); **plus** `component_id`/`semantic_version` + index-backing (§14 step 4); **plus** the batched column-in/column-out kernel ABI (§4.2.1), batched at the buffered projection, the streaming primary-key scan (projection + `WHERE`), and the streaming sort/spool emission. Non-strict, container args, cross-core *taint enforcement*, and batching at the remaining sites still deferred |
 | §4.3 | Host scalar types (Storable→Indexed ladder, `type_code 21`, opaque) | **proposed** |
 | §5 | Dispatch — registry the many, inline the few (§5.1 splits the **seam** from the **dogfood**; function seam first) | **built** for built-in scalar functions + aggregates *and* the **host function injection seam** (§14 step 3, all 3 cores): a host kernel is reached by id through the frozen registry alongside the inlined built-in arms. Type-vtable depth (Fork A) + the type-method seam (step 5) **proposed** |
 | §6 | Persisted host-type catalog + on-disk representation (`type_code 21`, `format_version 32`) | **proposed** (the per-index host-dep list of step 4 landed at `format_version 31`) |

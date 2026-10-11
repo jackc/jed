@@ -184,9 +184,11 @@ impl HostFunction {
     }
 
     /// Whether the executor may prefetch this function's results in a batch ahead of the row-at-a-time
-    /// replay (§4.2.1): any rung but `Volatile`, whose call set must stay exactly the scalar one.
+    /// replay (§4.2.1): a batch kernel (a single-row kernel is looped per row anyway, so prefetching
+    /// it would only add work and speculative calls) of any rung but `Volatile`, whose call set must
+    /// stay exactly the scalar one.
     pub(crate) fn batchable(&self) -> bool {
-        self.volatility != Volatility::Volatile
+        matches!(self.kernel, Kernel::Batch(_)) && self.volatility != Volatility::Volatile
     }
 
     /// Call the kernel for ONE row (`args` non-NULL, one per parameter) — the batch-of-one path of
@@ -212,6 +214,24 @@ impl HostFunction {
     /// many results, or an error after answering every row, fails at the first row. Results are NOT
     /// type-checked here — the replay does that per row, so a type error surfaces at its own row.
     pub(crate) fn call_batch(&self, args: &[Vec<Value>], n: usize) -> Vec<Option<Result<Value>>> {
+        let (values, error) = self.call_batch_prefix(args, n);
+        let mut outcomes: Vec<Option<Result<Value>>> = Vec::with_capacity(n);
+        outcomes.extend(values.into_iter().map(|v| Some(Ok(v))));
+        if let Some(e) = error {
+            outcomes.push(Some(Err(e)));
+        }
+        outcomes.resize_with(n, || None);
+        outcomes
+    }
+
+    /// [`call_batch`](Self::call_batch) in prefix form: the results of the answered rows `0..k`, in
+    /// order, and the error of row `k` (every later row never computed), or `None` when all `n` rows
+    /// were answered. The same ABI-shape enforcement.
+    pub(crate) fn call_batch_prefix(
+        &self,
+        args: &[Vec<Value>],
+        n: usize,
+    ) -> (Vec<Value>, Option<EngineError>) {
         // A kernel learns the row count only from its columns, so a zero-argument call is always a
         // one-row batch (§4.2.1).
         debug_assert!(
@@ -231,21 +251,18 @@ impl HostFunction {
                 Ok(())
             })(),
         };
-        let mut outcomes: Vec<Option<Result<Value>>> = Vec::with_capacity(n);
         let got = out.len();
         if got > n || (got == n && res.is_err()) {
-            outcomes.push(Some(Err(self.shape_error(n, got))));
-        } else {
-            outcomes.extend(out.into_iter().map(|v| Some(Ok(v))));
-            if got < n {
-                outcomes.push(Some(Err(match res {
-                    Err(e) => e,
-                    Ok(()) => self.shape_error(n, got),
-                })));
-            }
+            return (Vec::new(), Some(self.shape_error(n, got)));
         }
-        outcomes.resize_with(n, || None);
-        outcomes
+        if got < n {
+            let e = match res {
+                Err(e) => e,
+                Ok(()) => self.shape_error(n, got),
+            };
+            return (out, Some(e));
+        }
+        (out, None)
     }
 
     fn shape_error(&self, n: usize, got: usize) -> EngineError {

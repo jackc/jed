@@ -382,6 +382,11 @@ func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, plabels, resu
 			} else {
 				cur.scan = store.storeScan(b, sp.phys.pkReverse)
 			}
+			if ra := newReadAhead(sp.filter, sp.projections, snap.session.extensions); ra != nil {
+				fe, pe := *cur.env, *cur.env
+				fe.hostBatch, pe.hostBatch = ra.filter, ra.project
+				cur.ahead, cur.filterEnv, cur.projectEnv = ra, &fe, &pe
+			}
 		}
 		return &Rows{columnNames: sp.columnNames, columnTypes: resultTypes, cursor: cur}, true, nil
 	}
@@ -424,6 +429,11 @@ type streamingCursor struct {
 	passed   int64     // survivors past the filter+dedup so far (OFFSET runs against this)
 	produced int64     // output rows produced so far (the LIMIT short-circuit runs against this)
 	done     bool      // scan exhausted, LIMIT window full, or empty bound — then nextRow is a no-op
+	// ahead is the read-ahead window when the WHERE or projection has an eligible host call
+	// (extensibility.md §4.2.1 "In-hand and pulled sites"), with the env each prefetch evaluates on.
+	ahead      *readAhead
+	filterEnv  *evalEnv
+	projectEnv *evalEnv
 }
 
 func (c *streamingCursor) nextRow() ([]Value, bool, error) {
@@ -441,7 +451,20 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 		var row storedRow
 		var ok bool
 		var err error
-		if c.point != nil {
+		at := -1 // the row's read-ahead window index, or -1
+		if c.ahead != nil {
+			// From the read-ahead window: its pull charges nothing and defers a storage error to this
+			// same point (§4.2.1).
+			var remaining int64
+			if c.limit != nil {
+				remaining = satAddInt64(c.offset, *c.limit) - c.passed
+			}
+			window := readAheadCap(c.meter, costs.StorageRowRead, remaining, c.limit != nil)
+			at, ok, err = c.ahead.next(window, c.pull)
+			if ok {
+				row = c.ahead.rows[at]
+			}
+		} else if c.point != nil {
 			row, ok, err = c.point.next()
 		} else {
 			_, row, ok, err = c.scan.next()
@@ -468,8 +491,15 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 		if err != nil {
 			return nil, false, err
 		}
+		filterEnv, projectEnv := c.env, c.env
+		if at >= 0 {
+			filterEnv, projectEnv = c.filterEnv, c.projectEnv
+		}
 		if c.plan.filter != nil {
-			v, err := c.plan.filter.eval(row, c.env, c.meter)
+			if at >= 0 {
+				c.ahead.setRow(c.ahead.filter, at, c.env, c.meter)
+			}
+			v, err := c.plan.filter.eval(row, filterEnv, c.meter)
 			if err != nil {
 				return nil, false, err
 			}
@@ -481,9 +511,12 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 			// DISTINCT (cost.md §3): project EVERY scanned filtered row (the dedup key, charged even
 			// for a duplicate — the §3 asymmetry), drop a value already seen, then OFFSET/LIMIT window
 			// the survivors — exactly execStreamingScan.
+			if at >= 0 {
+				c.ahead.setRow(c.ahead.project, at, c.env, c.meter)
+			}
 			projected := make([]Value, len(c.plan.projections))
 			for i, p := range c.plan.projections {
-				v, err := p.eval(row, c.env, c.meter)
+				v, err := p.eval(row, projectEnv, c.meter)
 				if err != nil {
 					return nil, false, err
 				}
@@ -509,9 +542,12 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 			continue
 		}
 		c.meter.Charge(costs.RowProduced)
+		if at >= 0 {
+			c.ahead.setRow(c.ahead.project, at, c.env, c.meter)
+		}
 		projected := make([]Value, len(c.plan.projections))
 		for i, p := range c.plan.projections {
-			v, err := p.eval(row, c.env, c.meter)
+			v, err := p.eval(row, projectEnv, c.meter)
 			if err != nil {
 				return nil, false, err
 			}
@@ -520,6 +556,15 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 		c.produced++
 		return projected, true, nil
 	}
+}
+
+// pull reads the next row from the cursor's scan feed — the read-ahead window's source.
+func (c *streamingCursor) pull() (storedRow, bool, error) {
+	if c.point != nil {
+		return c.point.next()
+	}
+	_, row, ok, err := c.scan.next()
+	return row, ok, err
 }
 
 func (c *streamingCursor) costAccrued() int64 { return c.meter.Accrued }
@@ -560,6 +605,11 @@ type bufferedScanCursor struct {
 	// batch is the emitProject projection's host-function batch prefetch (extensibility.md §4.2.1),
 	// or nil when no call in it is eligible. Built once the blocking part has run.
 	batch *hostBatch
+	// ahead is the emitSorted projection's read-ahead window (extensibility.md §4.2.1), or nil when no
+	// call in it is eligible; projectEnv is the env its prefetch evaluates on. Built once the
+	// blocking part has run.
+	ahead      *readAhead
+	projectEnv *evalEnv
 }
 
 func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
@@ -581,6 +631,12 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 		}
 		if em.mode == emitProject {
 			c.batch = newHostBatch(c.plan.projections, c.eng.session.extensions)
+		}
+		if em.mode == emitSorted && !em.precharged && !em.identity {
+			if ra := newReadAhead(nil, c.plan.projections, c.eng.session.extensions); ra != nil {
+				c.ahead = ra
+				c.projectEnv = &evalEnv{exec: c.eng, params: c.params, outer: nil, rng: c.rng, ctes: cteCtx{}, hostBatch: ra.project}
+			}
 		}
 	}
 	switch c.em.mode {
@@ -604,7 +660,18 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 			c.em.sorted.close()
 			return nil, false, nil
 		}
-		row, ok, err := c.em.sorted.next()
+		var row storedRow
+		var ok bool
+		var err error
+		at := -1 // the row's read-ahead window index, or -1
+		if c.ahead != nil {
+			window := readAheadCap(c.meter, costs.RowProduced, c.em.end-c.idx, true)
+			if at, ok, err = c.ahead.next(window, c.em.sorted.next); ok {
+				row = c.ahead.rows[at]
+			}
+		} else {
+			row, ok, err = c.em.sorted.next()
+		}
 		if err != nil {
 			return nil, false, err
 		}
@@ -625,6 +692,10 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 			return row, true, nil
 		}
 		env := &evalEnv{exec: c.eng, params: c.params, outer: nil, rng: c.rng, ctes: cteCtx{}}
+		if at >= 0 {
+			c.ahead.setRow(c.ahead.project, at, env, c.meter)
+			env = c.projectEnv
+		}
 		projected := make([]Value, len(c.plan.projections))
 		for i, p := range c.plan.projections {
 			v, perr := p.eval(row, env, c.meter)
@@ -871,7 +942,18 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 	seen := newStateMapCharged(db, meter.stateCharge())
 	defer seen.close()
 	var passed int64
-	visitRow := func(row storedRow, guarded bool) (bool, error) {
+	// A host call in the WHERE or projection reads each table interval ahead into a window and replays
+	// it row by row (extensibility.md §4.2.1 "In-hand and pulled sites"); the filter's and the
+	// projection's prefetches each run on their own env.
+	ra := newReadAhead(plan.filter, plan.projections, db.session.extensions)
+	filterEnv, projectEnv := env, env
+	if ra != nil {
+		fe, pe := *env, *env
+		fe.hostBatch, pe.hostBatch = ra.filter, ra.project
+		filterEnv, projectEnv = &fe, &pe
+	}
+	// visitRow runs one scanned row through the pipeline; at is its read-ahead window index, or -1.
+	visitRow := func(row storedRow, guarded bool, at int) (bool, error) {
 		if !guarded {
 			if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 				return false, err
@@ -885,8 +967,11 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 			return false, err
 		}
 		if plan.filter != nil {
+			if at >= 0 {
+				ra.setRow(ra.filter, at, env, meter)
+			}
 			before := meter.Accrued
-			v, err := plan.filter.eval(row, env, meter)
+			v, err := plan.filter.eval(row, filterEnv, meter)
 			filterWork += meter.Accrued - before
 			if err != nil {
 				return false, err
@@ -899,9 +984,12 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 			// Project per scanned filtered row (the dedup key) and drop duplicates by first
 			// occurrence; the OFFSET/LIMIT then window the DISTINCT rows.
 			before := meter.Accrued
+			if at >= 0 {
+				ra.setRow(ra.project, at, env, meter)
+			}
 			projected := make([]Value, len(plan.projections))
 			for i, p := range plan.projections {
-				v, err := p.eval(row, env, meter)
+				v, err := p.eval(row, projectEnv, meter)
 				if err != nil {
 					return false, err
 				}
@@ -932,9 +1020,12 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 			}
 			before := meter.Accrued
 			meter.Charge(costs.RowProduced)
+			if at >= 0 {
+				ra.setRow(ra.project, at, env, meter)
+			}
 			projected := make([]Value, len(plan.projections))
 			for i, p := range plan.projections {
-				v, err := p.eval(row, env, meter)
+				v, err := p.eval(row, projectEnv, meter)
 				if err != nil {
 					return false, err
 				}
@@ -966,10 +1057,38 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 		if !canPull {
 			return false, nil
 		}
+		if ra != nil {
+			// Read the interval ahead: the pull charges nothing, and a storage error is deferred to
+			// the row at which the per-row pull would have met it (§4.2.1).
+			ra.restart()
+			scan := store.storeScan(b, reverse)
+			pull := func() (storedRow, bool, error) {
+				_, row, ok, err := scan.next()
+				return row, ok, err
+			}
+			for {
+				var remaining int64
+				if plan.limit != nil {
+					remaining = satAddInt64(offset, *plan.limit) - passed
+				}
+				window := readAheadCap(meter, costs.StorageRowRead, remaining, plan.limit != nil)
+				i, ok, err := ra.next(window, pull)
+				if err != nil {
+					return false, err
+				}
+				if !ok {
+					return true, nil
+				}
+				more, err := visitRow(ra.rows[i], false, i)
+				if err != nil || !more {
+					return false, err
+				}
+			}
+		}
 		keepGoing := true
 		visit := func(_ []byte, row storedRow) (bool, error) {
 			var err error
-			keepGoing, err = visitRow(row, false)
+			keepGoing, err = visitRow(row, false, -1)
 			return keepGoing, err
 		}
 		var err error
@@ -1018,7 +1137,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 				panic("an index entry references a stored row")
 			}
 			meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs))
-			keepGoing, err = visitRow(row, true)
+			keepGoing, err = visitRow(row, true, -1)
 			return keepGoing, err
 		})
 		return keepGoing, err
@@ -1130,7 +1249,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 					}
 					meter.Charge(costs.PageRead*int64(n) + costs.ValueDecompress*int64(sl))
 				}
-				more, err := visitRow(row, true)
+				more, err := visitRow(row, true, -1)
 				if err != nil {
 					return selectResult{}, err
 				}

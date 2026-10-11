@@ -543,7 +543,7 @@ pub struct PMap {
 /// intersects this bound, so its `page_read` cost is proportional to what it touches, not the whole
 /// tree — and the unbounded bound (−∞..+∞) degenerates to the full scan, so existing full-scan costs
 /// do not move (overlap_node_count then equals node_count).
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct KeyBound {
     pub(crate) lo: Option<Vec<u8>>,
     pub(crate) lo_inc: bool,

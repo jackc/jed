@@ -27,7 +27,7 @@ import type { Value } from "./value.ts";
 import type { Row } from "./storage.ts";
 import { isTrue, nullValue } from "./value.ts";
 import { evalExpr } from "./eval.ts";
-import { HostBatch } from "./host_batch.ts";
+import { HostBatch, ReadAhead, readAheadCap } from "./host_batch.ts";
 import { COSTS, DEFAULT_SCALAR_BYTES } from "./costs.ts";
 import { entryBytes } from "./memsize.ts";
 import type { TableStore } from "./storage.ts";
@@ -648,23 +648,49 @@ export function* streamRows(
   const offset = sp.offset ?? 0n;
   const distinct = sp.distinct;
   const seen = new SpillSet(env.exec.session.workMem, env.exec.spillSink, meter.stateCharge());
+  // A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else forward.
+  const input = (
+    point === null ? store.scanRowsIter(bound, sp.phys.pkReverse) : pointRows(store, point)
+  )[Symbol.iterator]();
+  const pull = (): Row | null => {
+    const r = input.next();
+    return r.done === true ? null : r.value;
+  };
+  // A host call in the WHERE or projection reads the scan ahead into a window and replays it row by
+  // row (extensibility.md §4.2.1 "In-hand and pulled sites"): the pull charges nothing, and a storage
+  // error is deferred to the row at which the per-row pull would have met it.
+  const ra = ReadAhead.forSite(sp.filter, sp.projections, env.exec.session.extensions);
+  const filterEnv: EvalEnv = ra?.filter ? { ...env, hostBatch: ra.filter } : env;
+  const projectEnv: EvalEnv = ra?.project ? { ...env, hostBatch: ra.project } : env;
   try {
     let passed = 0n;
     let produced = 0n;
-    // A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else forward.
-    const input =
-      point === null ? store.scanRowsIter(bound, sp.phys.pkReverse) : pointRows(store, point);
-    for (const rawRow of input) {
+    for (;;) {
+      let rawRow: Row | null;
+      let at = -1; // the row's read-ahead window index, or -1
+      if (ra !== null) {
+        const remaining = sp.limit === null ? null : offset + sp.limit - passed;
+        const i = ra.next(readAheadCap(meter, COSTS.storageRowRead, remaining), pull);
+        rawRow = i === null ? null : ra.rows[i]!;
+        at = i ?? -1;
+      } else {
+        rawRow = pull();
+      }
+      if (rawRow === null) break;
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       meter.charge(COSTS.storageRowRead);
       // Materialize the touched columns left unfetched by the lazy load (large-values.md §14); the chain
       // reads were already metered in the up-front block (cost.md §3).
       const row = store.resolveColumns(rawRow, sp.relMasks[0]!);
-      if (sp.filter !== null && !isTrue(evalExpr(sp.filter, row, env, meter))) continue;
+      if (sp.filter !== null) {
+        if (at >= 0) ra!.setRow(ra!.filter, at, env, meter);
+        if (!isTrue(evalExpr(sp.filter, row, filterEnv, meter))) continue;
+      }
       if (distinct) {
         // DISTINCT (cost.md §3): project EVERY scanned filtered row (the dedup key, charged even for a
         // duplicate — the §3 asymmetry), drop a value already seen, then OFFSET/LIMIT window the survivors.
-        const tuple = sp.projections.map((p) => evalExpr(p, row, env, meter));
+        if (at >= 0) ra!.setRow(ra!.project, at, env, meter);
+        const tuple = sp.projections.map((p) => evalExpr(p, row, projectEnv, meter));
         const key = distinctRowKey(tuple);
         // A new value reserves its dedup entry until the scan ends (memory.md §6.2).
         if (!meter.costFirst(() => seen.insert(key, tuple))) continue;
@@ -678,14 +704,16 @@ export function* streamRows(
         if (passed <= offset) continue;
         meter.charge(COSTS.rowProduced);
         produced += 1n;
-        yield sp.projections.map((p) => evalExpr(p, row, env, meter));
+        if (at >= 0) ra!.setRow(ra!.project, at, env, meter);
+        yield sp.projections.map((p) => evalExpr(p, row, projectEnv, meter));
       }
       // The LIMIT short-circuit (cost.md §3): once the window is full, stop WITHOUT pulling another row —
       // so no further leaf is faulted (the streaming early-exit win). The check is after the yield, so the
-      // for-of pulls the next row only when another is actually needed.
+      // loop pulls the next row only when another is actually needed.
       if (sp.limit !== null && produced >= sp.limit) return;
     }
   } finally {
+    input.return?.(undefined);
     seen.close();
   }
 }
@@ -730,15 +758,37 @@ export function* bufferedRows(
     // rowProduced, and project it (streaming.md §4/§7). The try/finally releases any undrained spill runs
     // when the generator is returned early (a caller's early exit) or completes (§5).
     const sorted = em.sorted!;
+    // An eligible host call in the projection reads the sorted output ahead into a window and replays
+    // it row by row (extensibility.md §4.2.1): the pull is unmetered and the sort's charge is returned
+    // only at close, so no charge moves.
+    const ra =
+      em.sortedFinal || em.sortedIdentity
+        ? null
+        : ReadAhead.forSite(null, plan.projections, engine.session.extensions);
+    const projectEnv: EvalEnv = ra === null ? env : { ...env, hostBatch: ra.project! };
     try {
       for (let i = 0; i < em.end; i++) {
-        const row = sorted.next();
+        let row: Row | null;
+        let at = -1; // the row's read-ahead window index, or -1
+        if (ra !== null) {
+          const k = ra.next(readAheadCap(meter, COSTS.rowProduced, BigInt(em.end - i)), () =>
+            sorted.next(),
+          );
+          row = k === null ? null : ra.rows[k]!;
+          at = k ?? -1;
+        } else {
+          row = sorted.next();
+        }
         if (row === null) break;
         if (!em.sortedFinal) {
           meter.guard(); // enforce the cost ceiling / cancellation per produced row (CLAUDE.md §13)
           meter.charge(COSTS.rowProduced);
         }
-        yield em.sortedIdentity ? row : plan.projections.map((p) => evalExpr(p, row, env, meter));
+        if (at >= 0) ra!.setRow(ra!.project, at, env, meter);
+        const r = row;
+        yield em.sortedIdentity
+          ? r
+          : plan.projections.map((p) => evalExpr(p, r, projectEnv, meter));
       }
     } finally {
       sorted.close();

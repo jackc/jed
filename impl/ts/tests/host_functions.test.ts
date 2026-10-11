@@ -4,7 +4,7 @@
 // unit-test category). Mirrors impl/rust/tests/host_functions.rs one-for-one.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -18,6 +18,7 @@ import {
 import type { HostFunctionSpec } from "../src/lib.ts";
 import { intValue, textValue, type Value } from "../src/value.ts";
 import type { Session } from "../src/shared.ts";
+import { close, create, execute } from "../src/tooling.ts";
 import { queryOutcome } from "./util.ts";
 
 function asInt(v: Value): bigint {
@@ -551,6 +552,16 @@ test("volatile batch kernel is called per row", () => {
   assert.deepEqual(calls, new Array(27).fill(1));
 });
 
+test("single-row kernel is never prefetched", () => {
+  // A single-row kernel gains nothing from a batch (the registry loops it per row), so it is called
+  // exactly on the rows replay evaluates — at the buffered projection and at a pulled site alike.
+  const calls: number[] = [];
+  const s = batchDb(twiceRow(calls, null), 30);
+  runQ(s, "SELECT host_twice(a) FROM t");
+  runQ(s, "SELECT host_twice(a) FROM t ORDER BY id LIMIT 5 OFFSET 3");
+  assert.deepEqual(calls, new Array(27 + 5).fill(1));
+});
+
 test("batch error raises at the scalar row", () => {
   // The kernel fails at a = 57. Alone, that is the error; with an earlier per-row error in the same
   // projection (division by zero at id = 40) the earlier row still wins, exactly as the single-row
@@ -816,5 +827,257 @@ test("batch out-of-range raises at the scalar row", () => {
     const got = runQ(batched, sql);
     assert.ok(typeof got === "string" && got.startsWith(want), `${sql}: ${String(got)}`);
     assert.deepEqual(got, runQ(single, sql), sql);
+  }
+});
+
+// Pulled sites: the read-ahead window (extensibility.md §4.2.1 "In-hand and pulled sites").
+// ---------------------------------------------------------------------------------------------
+
+// runQ either streamed at top level through the lazy cursor, or materialized as a CTE body
+// (WITH c AS (…) SELECT * FROM c), which runs it through the eager drive.
+function runVia(
+  s: { query(sql: string, params: Value[]): ReturnType<Session["query"]> },
+  sql: string,
+  materialized: boolean,
+): { rows: Value[][]; cost: bigint } | string {
+  const q = materialized ? `WITH c AS (${sql}) SELECT * FROM c` : sql;
+  try {
+    const o = queryOutcome(s, q);
+    if (o.kind !== "query") throw new Error(`expected a query result for ${q}`);
+    return { rows: o.rows, cost: o.cost };
+  } catch (e) {
+    if (e instanceof EngineError) return `${e.code()} ${e.message}`;
+    throw e;
+  }
+}
+
+// The rows of a query run as runVia does (which must succeed).
+function rowsVia(s: Session, sql: string, materialized: boolean): Value[][] {
+  const got = runVia(s, sql, materialized);
+  if (typeof got === "string") throw new Error(`${sql}: ${got}`);
+  return got.rows;
+}
+
+// The kernel call sizes a full streaming scan of batchDb(_, n) makes: one call per 64-row read-ahead
+// window, over that window's non-NULL rows (every 10th `a` is NULL).
+function windowCalls(n: number): number[] {
+  const calls: number[] = [];
+  for (let lo = 1; lo <= n; lo += 64) {
+    let c = 0;
+    for (let id = lo; id < lo + 64 && id <= n; id++) if (id % 10 !== 0) c++;
+    calls.push(c);
+  }
+  return calls;
+}
+
+test("batch streaming scan reads ahead one window per chunk", () => {
+  // A full scan in primary-key order streams; with a host call in the projection it reads 64 rows
+  // ahead and the kernel runs once per window over its non-NULL rows — through both drives.
+  for (const materialized of [false, true]) {
+    const calls: number[] = [];
+    const s = batchDb(twiceBatched(calls, "immutable", null), 2500);
+    const rows = rowsVia(s, "SELECT id, host_twice(a) FROM t ORDER BY id", materialized);
+    assert.equal(rows.length, 2500);
+    assert.deepEqual(rows[6], [intValue(7n), intValue(14n)]);
+    assert.equal(rows[9]![1]!.kind, "null");
+    assert.deepEqual(calls, windowCalls(2500), `materialized=${materialized}`);
+  }
+});
+
+test("batch streaming scan batches the WHERE filter", () => {
+  // The WHERE predicate's call (beneath a comparison) prefetches over every pulled row of the window;
+  // the projection's call prefetches from the first row that reaches it.
+  for (const materialized of [false, true]) {
+    const calls: number[] = [];
+    const s = batchDb(twiceBatched(calls, "immutable", null), 2500);
+    const rows = rowsVia(
+      s,
+      "SELECT id FROM t WHERE host_twice(a) > 4990 ORDER BY id",
+      materialized,
+    );
+    assert.equal(rows.length, 4); // a = 2496..2499 (2500 is NULL)
+    assert.deepEqual(calls, windowCalls(2500), `materialized=${materialized}`);
+  }
+});
+
+test("batch streaming window is bounded by LIMIT", () => {
+  // LIMIT 5 OFFSET 3 can emit at most 8 rows, so the window is 8 rows and the projection's chunk
+  // starts at the first emitted row; LIMIT 1 degenerates to batch-of-one.
+  for (const materialized of [false, true]) {
+    const calls: number[] = [];
+    const s = batchDb(twiceBatched(calls, "immutable", null), 2500);
+    rowsVia(s, "SELECT host_twice(a) FROM t ORDER BY id LIMIT 5 OFFSET 3", materialized);
+    rowsVia(s, "SELECT host_twice(a) FROM t ORDER BY id LIMIT 1", materialized);
+    assert.deepEqual(calls, [5, 1], `materialized=${materialized}`);
+  }
+});
+
+test("batch streaming sort reads ahead", () => {
+  // A single-table ORDER BY a non-key column streams out of the sorter; its projection reads the
+  // sorted rows ahead one 64-row window at a time (250 NULLs sort first under DESC, so the fourth
+  // window holds the first 6 values; then 35 full windows and a 4-row tail).
+  for (const materialized of [false, true]) {
+    const calls: number[] = [];
+    const s = batchDb(twiceBatched(calls, "immutable", null), 2500);
+    const rows = rowsVia(s, "SELECT a, host_twice(a) FROM t ORDER BY a DESC", materialized);
+    assert.deepEqual(rows[250], [intValue(2499n), intValue(4998n)]);
+    assert.deepEqual(calls, [6, ...new Array(35).fill(64), 4], `materialized=${materialized}`);
+  }
+});
+
+test("batch pulled sites match the row kernel in rows and cost", () => {
+  // Rows and cost are identical to the single-row kernel at every pulled site and shape, through both
+  // the lazy and the materialized drive.
+  const sqls = [
+    "SELECT id, host_twice(a) FROM t ORDER BY id",
+    "SELECT id, host_twice(a) + 1, -host_twice(id) FROM t WHERE host_twice(a) > 100 ORDER BY id DESC",
+    "SELECT id, host_twice(a) FROM t WHERE id BETWEEN 100 AND 1300 ORDER BY id",
+    "SELECT id, host_twice(a) FROM t WHERE id IN (5, 50, 500, 1400) ORDER BY id",
+    "SELECT DISTINCT id, host_twice(a) FROM t ORDER BY id",
+    "SELECT host_twice(a) FROM t ORDER BY id LIMIT 7 OFFSET 1000",
+    "SELECT id FROM t WHERE host_twice(a) IS NULL ORDER BY id",
+    "SELECT a, host_twice(a), host_twice(id) > 50 FROM t ORDER BY a DESC",
+    "SELECT a, host_twice(a) FROM t ORDER BY a LIMIT 9 OFFSET 1100",
+  ];
+  for (const sql of sqls) {
+    for (const materialized of [false, true]) {
+      const batched = batchDb(twiceBatched([], "immutable", null), 1500);
+      const single = batchDb(twiceRow([], null), 1500);
+      const b = runVia(batched, sql, materialized);
+      assert.ok(typeof b !== "string", `${sql}: ${String(b)}`);
+      assert.deepEqual(b, runVia(single, sql, materialized), `${sql} materialized=${materialized}`);
+    }
+  }
+});
+
+test("batch pulled sites raise at the scalar row", () => {
+  // The kernel fails at a = 57; an earlier per-row error (division by zero at id = 40, in the
+  // projection or the filter) still wins, exactly as the single-row kernel orders them.
+  for (const sql of [
+    "SELECT host_twice(a) FROM t ORDER BY id",
+    "SELECT id FROM t WHERE host_twice(a) > 0 ORDER BY id",
+    "SELECT 1 / (id - 40), host_twice(a) FROM t ORDER BY id",
+    "SELECT host_twice(a) FROM t WHERE 1 / (id - 40) > 0 ORDER BY id",
+    "SELECT host_twice(a) FROM t WHERE host_twice(id) / (id - 60) > -10 ORDER BY id",
+    "SELECT a, host_twice(a) FROM t ORDER BY a",
+  ]) {
+    for (const materialized of [false, true]) {
+      const batched = batchDb(twiceBatched([], "immutable", 57n), 200);
+      const single = batchDb(twiceRow([], 57n), 200);
+      const b = runVia(batched, sql, materialized);
+      assert.equal(typeof b, "string", sql);
+      assert.deepEqual(b, runVia(single, sql, materialized), `${sql} materialized=${materialized}`);
+    }
+  }
+});
+
+test("batch error on an unreached row starts a new chunk", () => {
+  // The kernel fails at a = 57, but the WHERE rejects that row, so replay never evaluates the call
+  // there: the speculative error is dropped and the next row starts a new chunk.
+  for (const materialized of [false, true]) {
+    const calls: number[] = [];
+    const batched = batchDb(twiceBatched(calls, "immutable", 57n), 2500);
+    const single = batchDb(twiceRow([], 57n), 2500);
+    const sql = "SELECT id, host_twice(a) FROM t WHERE id % 1000 <> 57 ORDER BY id";
+    const b = runVia(batched, sql, materialized);
+    assert.ok(typeof b !== "string", String(b));
+    assert.deepEqual(b, runVia(single, sql, materialized));
+    // Window 1 (rows 1-64): the chunk from row 1 fails at 57; the chunk from row 58 covers the rest of
+    // the window (58, 59, 61..64). Every later window is one call.
+    const w = windowCalls(2500);
+    assert.deepEqual(calls, [w[0], 6, ...w.slice(1)], `materialized=${materialized}`);
+  }
+});
+
+test("batch pulled cost abort matches the row kernel", () => {
+  // Under a ceiling the abort row is the single-row kernel's — in the projection and in the filter,
+  // through both drives — and the kernel ran over no more rows than the budget could pay.
+  for (const sql of [
+    "SELECT id, host_twice(a) FROM t ORDER BY id",
+    "SELECT id FROM t WHERE host_twice(a) > 0 ORDER BY id",
+    "SELECT a, host_twice(a) FROM t ORDER BY a",
+  ]) {
+    for (const materialized of [false, true]) {
+      const calls: number[] = [];
+      const batched = batchDb(twiceBatched(calls, "immutable", null), 2000);
+      const single = batchDb(twiceRow([], null), 2000);
+      const budget = 300n;
+      batched.setMaxCost(budget);
+      single.setMaxCost(budget);
+      const b = runVia(batched, sql, materialized);
+      assert.ok(String(b).startsWith("54P01 "), `${sql}: ${String(b)}`);
+      assert.equal(b, runVia(single, sql, materialized), `${sql} materialized=${materialized}`);
+      const speculated = calls.reduce((a, c) => a + c, 0);
+      assert.ok(
+        speculated <= Number(budget / 5n) + 1,
+        `${sql}: kernel ran over ${speculated} rows`,
+      );
+    }
+  }
+});
+
+test("batch streaming scan storage errors match the row kernel", () => {
+  // A corrupted page must surface exactly as under the single-row kernel — a read-ahead that meets it
+  // defers the error to the row the per-row pull would have met it at, so the kernel's own error at
+  // a = 57 still wins when it comes first, and a LIMIT that stops first never sees it. Corrupt each
+  // body page of a multi-leaf file in turn.
+  const PAGE = 256;
+  const dir = mkdtempSync(join(tmpdir(), "jed-host-batch-"));
+  try {
+    const path = join(dir, "seed.jed");
+    const seed = create(path, { pageSize: PAGE });
+    execute(seed, "CREATE TABLE t (id i64 PRIMARY KEY, a i64)");
+    execute(
+      seed,
+      "INSERT INTO t SELECT g, CASE WHEN g % 10 = 0 THEN NULL ELSE g END FROM generate_series(1, 300) AS g",
+    );
+    // Publish the same contents once more, so a damaged newest generation cannot recover to an older,
+    // different root (the checksum.test.ts seed).
+    execute(seed, "BEGIN");
+    execute(seed, "COMMIT");
+    close(seed);
+    const clean = readFileSync(path);
+    // Separate copies: each handle locks its own file.
+    const openCopy = (name: string, bytes: Uint8Array, f: HostFunctionSpec): Database | null => {
+      const p = join(dir, name);
+      writeFileSync(p, bytes);
+      try {
+        return openDatabase(p, { skipFsync: true, extensions: regWith(f) });
+      } catch {
+        return null; // a corrupted routing/catalog page fails at open, before any scan
+      }
+    };
+    let detected = 0;
+    for (let i = 2; i < Math.floor(clean.length / PAGE); i++) {
+      const bytes = Uint8Array.from(clean);
+      bytes[i * PAGE + 16]! ^= 0xff;
+      const batched = openCopy("batched.jed", bytes, twiceBatched([], "immutable", 57n));
+      const single = openCopy("single.jed", bytes, twiceRow([], 57n));
+      try {
+        if (batched === null || single === null) continue;
+        for (const sql of [
+          "SELECT id, host_twice(a) FROM t ORDER BY id",
+          "SELECT id, host_twice(a) FROM t ORDER BY id LIMIT 40",
+          "SELECT id, host_twice(a) FROM t ORDER BY id LIMIT 200",
+          "SELECT id, host_twice(id) FROM t ORDER BY id",
+        ]) {
+          for (const materialized of [false, true]) {
+            const s = runVia(single, sql, materialized);
+            if (typeof s === "string" && s.startsWith("XX001")) detected++;
+            assert.deepEqual(
+              runVia(batched, sql, materialized),
+              s,
+              `page ${i}: ${sql} materialized=${materialized}`,
+            );
+          }
+        }
+      } finally {
+        batched?.close();
+        single?.close();
+      }
+    }
+    assert.ok(detected > 0, "a corrupted leaf should fail a scan");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

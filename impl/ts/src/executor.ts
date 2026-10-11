@@ -99,7 +99,7 @@ import {
   resolveColType,
 } from "./catalog.ts";
 import { Meter, type QueryAccount, queryMemoryPeak, StateCharge } from "./cost.ts";
-import { HostBatch } from "./host_batch.ts";
+import { HostBatch, ReadAhead, readAheadCap } from "./host_batch.ts";
 import { optimizeSelect } from "./optimize.ts";
 import {
   type WherePushdown,
@@ -15067,15 +15067,23 @@ export class Engine {
     const seen = new SpillSet(this.session.workMem, this.spillSink, meter.stateCharge());
     try {
     let passed = 0n;
-    const processRow = (rawRow: Row, guarded: boolean): boolean => {
+    // A host call in the WHERE or projection reads each table interval ahead into a window and replays
+    // it row by row (extensibility.md §4.2.1 "In-hand and pulled sites"); the filter's and the
+    // projection's prefetches each run on their own env.
+    const ra = ReadAhead.forSite(plan.filter, plan.projections, this.session.extensions);
+    const filterEnv: EvalEnv = ra?.filter ? { ...env, hostBatch: ra.filter } : env;
+    const projectEnv: EvalEnv = ra?.project ? { ...env, hostBatch: ra.project } : env;
+    // processRow runs one scanned row through the pipeline; `at` is its read-ahead window index, or -1.
+    const processRow = (rawRow: Row, guarded: boolean, at: number): boolean => {
         if (!guarded) meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
         meter.charge(COSTS.storageRowRead);
         // Materialize the touched columns if the lazy load left them unfetched
         // (large-values.md §14) — a fresh copy only when needed (resolveColumns).
         const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
         if (plan.filter !== null) {
+          if (at >= 0) ra!.setRow(ra!.filter, at, env, meter);
           const before = meter.accrued;
-          const keep = isTrue(evalExpr(plan.filter, row, env, meter));
+          const keep = isTrue(evalExpr(plan.filter, row, filterEnv, meter));
           filterWork += meter.accrued - before;
           if (!keep) return true;
         }
@@ -15083,7 +15091,8 @@ export class Engine {
           // Project per scanned filtered row (the dedup key) and drop duplicates by first occurrence;
           // the OFFSET/LIMIT then window the DISTINCT rows.
           const before = meter.accrued;
-          const tuple = plan.projections.map((p) => evalExpr(p, row, env, meter));
+          if (at >= 0) ra!.setRow(ra!.project, at, env, meter);
+          const tuple = plan.projections.map((p) => evalExpr(p, row, projectEnv, meter));
           distinctWork += meter.accrued - before;
           const key = distinctRowKey(tuple);
           // A duplicate of an already-emitted/seen value; a new one reserves its entry (memory.md §6.2).
@@ -15099,7 +15108,8 @@ export class Engine {
           if (passed <= offset) return true;
           const before = meter.accrued;
           meter.charge(COSTS.rowProduced);
-          const projected = plan.projections.map((p) => evalExpr(p, row, env, meter));
+          if (at >= 0) ra!.setRow(ra!.project, at, env, meter);
+          const projected = plan.projections.map((p) => evalExpr(p, row, projectEnv, meter));
           outputWork += meter.accrued - before;
           meter.admitRow(projected); // the buffered result collector (memory.md §5.1)
           out.push(projected);
@@ -15113,8 +15123,28 @@ export class Engine {
       const su = store.overlapScanUnits(bound, plan.relMasks[0]!);
       meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
       if (!canPull) return false;
+      if (ra !== null) {
+        // Read the interval ahead: the pull charges nothing, and a storage error is deferred to the
+        // row at which the per-row pull would have met it (§4.2.1).
+        ra.restart();
+        const input = store.scanRowsIter(bound, reverse)[Symbol.iterator]();
+        const pull = (): Row | null => {
+          const r = input.next();
+          return r.done === true ? null : r.value;
+        };
+        try {
+          for (;;) {
+            const remaining = limit === null ? null : offset + limit - passed;
+            const i = ra.next(readAheadCap(meter, COSTS.storageRowRead, remaining), pull);
+            if (i === null) return true;
+            if (!processRow(ra.rows[i]!, false, i)) return false;
+          }
+        } finally {
+          input.return?.(undefined);
+        }
+      }
       let more = true;
-      const visit = (_key: Uint8Array, row: Row): boolean => (more = processRow(row, false));
+      const visit = (_key: Uint8Array, row: Row): boolean => (more = processRow(row, false, -1));
       if (reverse) store.scanRangeRev(bound, visit);
       else store.scanRange(bound, visit);
       return more;
@@ -15145,7 +15175,7 @@ export class Engine {
         const u = store.getWithUnits(rowKey, plan.relMasks[0]!);
         if (u.row === undefined) throw new Error("an index entry references a stored row");
         meter.charge(COSTS.pageRead * BigInt(u.pages) + COSTS.valueDecompress * BigInt(u.slabs));
-        more = processRow(u.row, true);
+        more = processRow(u.row, true, -1);
         return more;
       });
       return more;
@@ -15241,7 +15271,7 @@ export class Engine {
             );
             row = u.row;
           }
-          if (!processRow(row, true)) break;
+          if (!processRow(row, true, -1)) break;
         }
       }
     }
@@ -16292,18 +16322,38 @@ export class Engine {
       // rowProduced + the projection per row — exactly the eager window loop execStreamingSort ran before
       // its output went lazy (streaming.md §4/§7).
       const sorted = em.sorted!;
+      // An eligible host call in the projection reads the sorted output ahead into a window and
+      // replays it row by row (extensibility.md §4.2.1): the pull is unmetered and the sort's charge
+      // is returned only at close, so no charge moves.
+      const ra =
+        em.sortedFinal || em.sortedIdentity
+          ? null
+          : ReadAhead.forSite(null, plan.projections, this.session.extensions);
+      const projectEnv: EvalEnv = ra === null ? env : { ...env, hostBatch: ra.project! };
       try {
         const out: Value[][] = [];
         for (let i = 0; i < em.end; i++) {
-          const row = sorted.next();
-          if (row === null) break;
+          let pulled: Row | null;
+          let at = -1; // the row's read-ahead window index, or -1
+          if (ra !== null) {
+            const k = ra.next(readAheadCap(meter, COSTS.rowProduced, BigInt(em.end - i)), () =>
+              sorted.next(),
+            );
+            pulled = k === null ? null : ra.rows[k]!;
+            at = k ?? -1;
+          } else {
+            pulled = sorted.next();
+          }
+          if (pulled === null) break;
+          const row = pulled;
           if (!em.sortedFinal) {
             meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
             meter.charge(COSTS.rowProduced);
           }
+          if (at >= 0) ra!.setRow(ra!.project, at, env, meter);
           const o = em.sortedIdentity
             ? row
-            : plan.projections.map((p) => evalExpr(p, row, env, meter));
+            : plan.projections.map((p) => evalExpr(p, row, projectEnv, meter));
           // Sort/spool residency is operator state; the collected result is a row buffer (memory.md
           // §5.1).
           meter.admitRow(o);

@@ -1281,8 +1281,8 @@ line and emit no result. **Deferred follow-on:** a cross-*engine* concurrent com
 
 ## 8.2 Host-function benchmarks (`host_functions = true`)
 
-The `host_function_{none,row,batch}` triple measures the cost of calling a host-registered scalar
-function and what the batched kernel ABI ([extensibility.md](extensibility.md) §4.2.1) saves. A
+The `host_function_*` triples measure the cost of calling a host-registered scalar function and
+what the batched kernel ABI ([extensibility.md](extensibility.md) §4.2.1) saves. A
 driver that supports the bench host functions registers both of these at open, on every handle,
 immutable with the default unit cost:
 
@@ -1292,27 +1292,56 @@ immutable with the default unit cost:
 | `bench_mix_batch` | `(i32) → i64` | batch: the same arithmetic over the column |
 
 The arithmetic is cheap on purpose, so the timings expose per-call overhead rather than kernel
-work, and identical in both forms, so the row and batch answers agree. The three benches share a
-parameter stream and SQL shape (`WHERE customer_id BETWEEN $1 AND $2 ORDER BY id`: 100 customers,
-≈1,000 rows of the resident 10k-row `small` table, so engine per-row work is small enough for the
-call to show); only the projected expression differs, so `(row − none) / rows` is the per-call cost
-of a single-row kernel and `(batch − none) / rows` the cost left after batching. The index-selected
-shape is chosen because it runs on the buffered projection, the site that prefetches; a full-table
-`ORDER BY id` streams and calls the kernel batch-of-one (extensibility.md §4.2.1 "Sites").
+work, and identical in both forms, so the row and batch answers agree. Two triples share that
+design and differ in the evaluation site:
+
+- `host_function_{none,row,batch}` — `WHERE customer_id BETWEEN $1 AND $2 ORDER BY id` (100
+  customers, ≈1,000 rows of the resident 10k-row `small` table). The index-selected rows are
+  buffered and sorted, so this is the **in-hand** site: the batch kernel is prefetched from the
+  buffer in chunks of up to 1,024 rows.
+- `host_function_stream_{none,row,batch}` — `WHERE id BETWEEN $1 AND $2 ORDER BY id` (a 1,000-wide
+  primary-key window). It streams, so this is the **pulled** site: the batch kernel is prefetched
+  from a 64-row read-ahead window (extensibility.md §4.2.1 "In-hand and pulled sites").
+
+Within a triple only the projected expression differs, so `(row − none) / rows` is the per-call
+cost of a single-row kernel and `(batch − none) / rows` the cost of the batch kernel as prefetched.
+A single-row kernel is never prefetched (§4.2.1 rule 1), so `row` is always the batch-of-one
+baseline.
 
 In the native cores a host call is an in-process closure call, so batching is roughly neutral there.
-Because both functions are immutable, both are prefetched at this site — `bench_mix_row` through the
-registry's single-row adapter — so `row` and `batch` differ only in kernel shape. At landing, Rust's
+At landing (when single-row kernels were still prefetched through the registry's adapter), Rust's
 batch saved ~15 ns of a ~70 ns per-row call, TS was within noise, and Go's batch was ~20–50 ns per row
 *slower* than its single-row kernel, both ~80 ns over `none`: the replay evaluated the arguments a
 second time into a fresh per-row slice, and the prefetch stored and copied a 56-byte outcome per row.
 After the replay began skipping argument evaluation for prefetched rows (extensibility.md §4.2.1,
-condition 2) and Go began storing results compactly in reused buffers, Go's `row`/`batch` sit ~5–15 ns
-over `none` (p50 per row, median of 5: none 915, row 921, batch 929), Rust's are ~6–8 ns faster
-than before (row 542, batch 528), and TS is unchanged within noise. The triple exists for the wrapped bindings, where each call crosses a language
-boundary and batching amortizes it. A wrapped driver joins the triple when its binding exposes host
-functions; the Ruby gem does (below). The Node/Rust and wasm drivers do not yet and skip it, like the
-PostgreSQL and SQLite drivers (`engines = ["jed"]`).
+condition 2) and Go began storing results compactly in reused buffers, Go's `row`/`batch` sat ~5–15 ns
+over `none` (p50 per row, median of 5: none 915, row 921, batch 929), Rust's were ~6–8 ns faster
+than before (row 542, batch 528), and TS was unchanged within noise.
+
+p50 per row when the pulled site landed (before = the commit it rebased onto, where every site but
+the buffer called batch-of-one and single-row kernels were still prefetched at the buffer; mean of
+two interleaved runs — TS's first run was noisy on the two `stream_none`/`stream_row` lines, its
+second run flat):
+
+| ns/row | Rust before → after | Go before → after | TS before → after |
+|---|---|---|---|
+| `none` | 502 → 510 | 739 → 722 | 1844 → 1778 |
+| `row` | 563 → 526 | 762 → 755 | 1985 → 1933 |
+| `batch` | 551 → 532 | 766 → 753 | 1971 → 1985 |
+| `stream_none` | 229 → 234 | 255 → 262 | 1298 → 1365 |
+| `stream_row` | 250 → 255 | 288 → 290 | 1406 → 1465 |
+| `stream_batch` | 274 → 300 | 331 → 292 | 1478 → 1406 |
+
+Batching the pulled site saves ~40 ns/row in Go and ~70 ns/row in TS, and costs Rust ~25 ns/row: the
+window must keep up to 64 freshly cloned rows alive, which defeats the allocator's per-row reuse (a
+window of ≤ 8 rows measured no overhead, and 32–1,024 rows all about the same). Recycling row buffers
+in the Rust scan is the follow-on if that matters. Not prefetching single-row kernels made the
+buffered `row` bench ~7% faster in Rust and ~3% in TS.
+
+The triples exist for the wrapped bindings, where each call crosses a language boundary and batching
+amortizes it. A wrapped driver joins them when its binding exposes host functions; the Ruby gem does
+(below). The Node/Rust and wasm drivers do not yet and skip them, like the PostgreSQL and SQLite
+drivers (`engines = ["jed"]`).
 
 **The Ruby gem — the first measured boundary (2026-10-10).** The gem (`jed/ruby/wrap`,
 [ruby.md](ruby.md) §5b) registers both functions as Ruby blocks behind Fiddle closures:

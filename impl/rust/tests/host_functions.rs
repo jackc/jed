@@ -695,6 +695,21 @@ fn volatile_batch_kernel_is_called_per_row() {
 }
 
 #[test]
+fn single_row_kernel_is_never_prefetched() {
+    // A single-row kernel gains nothing from a batch (the registry loops it per row), so it is called
+    // exactly on the rows replay evaluates — at the buffered projection and at a pulled site alike.
+    let calls = new_calls();
+    let mut db = batch_db(twice_row(calls.clone(), None), 30);
+    run(&mut db, "SELECT host_twice(a) FROM t").unwrap();
+    run(
+        &mut db,
+        "SELECT host_twice(a) FROM t ORDER BY id LIMIT 5 OFFSET 3",
+    )
+    .unwrap();
+    assert_eq!(*calls.lock().unwrap(), vec![1; 27 + 5]);
+}
+
+#[test]
 fn batch_error_raises_at_the_scalar_row() {
     // The kernel fails at a = 57. Alone, that is the error; with an earlier per-row error in the
     // same projection (division by zero at id = 40) the earlier row still wins, exactly as the
@@ -960,4 +975,316 @@ fn batch_out_of_range_raises_at_the_scalar_row() {
         assert_eq!(got.as_ref().unwrap_err()[..5], *want, "{sql}");
         assert_eq!(got, run(&mut single, sql), "{sql}");
     }
+}
+
+// ── Pulled sites: the read-ahead window (extensibility.md §4.2.1 "In-hand and pulled sites") ───────
+
+/// `(rows, cost)` of a query, or its error code + message — either streamed at top level through the
+/// lazy cursor, or `materialized` as a CTE body (`WITH c AS (…) SELECT * FROM c`), which runs it through
+/// the eager drive.
+fn run_via(
+    db: &mut Session,
+    sql: &str,
+    materialized: bool,
+) -> std::result::Result<(Vec<Vec<Value>>, i64), String> {
+    if materialized {
+        run(db, &format!("WITH c AS ({sql}) SELECT * FROM c"))
+    } else {
+        run(db, sql)
+    }
+}
+
+/// The kernel call sizes a full streaming scan of `batch_db(_, n)` makes: one call per 64-row read-ahead
+/// window, over that window's non-NULL rows (every 10th `a` is NULL).
+fn window_calls(n: i64) -> Vec<usize> {
+    (0..(n + 63) / 64)
+        .map(|w| {
+            let ids = w * 64 + 1..=(w * 64 + 64).min(n);
+            ids.filter(|id| id % 10 != 0).count()
+        })
+        .collect()
+}
+
+#[test]
+fn batch_streaming_scan_reads_ahead_one_window_per_chunk() {
+    // A full scan in primary-key order streams; with a host call in the projection it reads 64 rows
+    // ahead and the kernel runs once per window over its non-NULL rows — through both drives.
+    for materialized in [false, true] {
+        let calls = new_calls();
+        let mut db = batch_db(
+            twice_batched(calls.clone(), Volatility::Immutable, None),
+            2500,
+        );
+        let sql = "SELECT id, host_twice(a) FROM t ORDER BY id";
+        let (rows, _) = run_via(&mut db, sql, materialized).unwrap();
+        assert_eq!(rows.len(), 2500);
+        assert_eq!(rows[6], vec![Value::Int(7), Value::Int(14)]);
+        assert_eq!(rows[9], vec![Value::Int(10), Value::Null]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            window_calls(2500),
+            "materialized={materialized}"
+        );
+    }
+}
+
+#[test]
+fn batch_streaming_scan_batches_the_where_filter() {
+    // The WHERE predicate's call (beneath a comparison) prefetches over every pulled row of the
+    // window; the projection's call prefetches from the first row that reaches it.
+    for materialized in [false, true] {
+        let calls = new_calls();
+        let mut db = batch_db(
+            twice_batched(calls.clone(), Volatility::Immutable, None),
+            2500,
+        );
+        let sql = "SELECT id FROM t WHERE host_twice(a) > 4990 ORDER BY id";
+        let (rows, _) = run_via(&mut db, sql, materialized).unwrap();
+        assert_eq!(rows.len(), 4); // a = 2496..2499 (2500 is NULL)
+        assert_eq!(*calls.lock().unwrap(), window_calls(2500));
+    }
+}
+
+#[test]
+fn batch_streaming_window_is_bounded_by_limit() {
+    // LIMIT 5 OFFSET 3 can emit at most 8 rows, so the window is 8 rows and the projection's chunk
+    // starts at the first emitted row; LIMIT 1 degenerates to batch-of-one.
+    for materialized in [false, true] {
+        let calls = new_calls();
+        let mut db = batch_db(
+            twice_batched(calls.clone(), Volatility::Immutable, None),
+            2500,
+        );
+        let sql = "SELECT host_twice(a) FROM t ORDER BY id LIMIT 5 OFFSET 3";
+        run_via(&mut db, sql, materialized).unwrap();
+        let sql = "SELECT host_twice(a) FROM t ORDER BY id LIMIT 1";
+        run_via(&mut db, sql, materialized).unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![5, 1]);
+    }
+}
+
+#[test]
+fn batch_streaming_sort_reads_ahead() {
+    // A single-table ORDER BY a non-key column streams out of the sorter; its projection reads the
+    // sorted rows ahead one 64-row window at a time (250 NULLs sort first under DESC, so the fourth
+    // window holds the first 6 values; then 35 full windows and a 4-row tail).
+    for materialized in [false, true] {
+        let calls = new_calls();
+        let mut db = batch_db(
+            twice_batched(calls.clone(), Volatility::Immutable, None),
+            2500,
+        );
+        let sql = "SELECT a, host_twice(a) FROM t ORDER BY a DESC";
+        let (rows, _) = run_via(&mut db, sql, materialized).unwrap();
+        assert_eq!(rows[250], vec![Value::Int(2499), Value::Int(4998)]);
+        let mut want = vec![6];
+        want.extend([64; 35]);
+        want.push(4);
+        assert_eq!(*calls.lock().unwrap(), want, "materialized={materialized}");
+    }
+}
+
+#[test]
+fn batch_pulled_sites_match_row_kernel_rows_and_cost() {
+    // Rows and cost are identical to the single-row kernel at every pulled site and shape, through
+    // both the materialized and the lazy drive.
+    let sqls = [
+        "SELECT id, host_twice(a) FROM t ORDER BY id",
+        "SELECT id, host_twice(a) + 1, -host_twice(id) FROM t WHERE host_twice(a) > 100 ORDER BY id DESC",
+        "SELECT id, host_twice(a) FROM t WHERE id BETWEEN 100 AND 1300 ORDER BY id",
+        "SELECT id, host_twice(a) FROM t WHERE id IN (5, 50, 500, 1400) ORDER BY id",
+        "SELECT DISTINCT id, host_twice(a) FROM t ORDER BY id",
+        "SELECT host_twice(a) FROM t ORDER BY id LIMIT 7 OFFSET 1000",
+        "SELECT id FROM t WHERE host_twice(a) IS NULL ORDER BY id",
+        "SELECT a, host_twice(a), host_twice(id) > 50 FROM t ORDER BY a DESC",
+        "SELECT a, host_twice(a) FROM t ORDER BY a LIMIT 9 OFFSET 1100",
+    ];
+    for sql in sqls {
+        for materialized in [false, true] {
+            let mut batched = batch_db(
+                twice_batched(new_calls(), Volatility::Immutable, None),
+                1500,
+            );
+            let mut single = batch_db(twice_row(new_calls(), None), 1500);
+            let (b, s) = (
+                run_via(&mut batched, sql, materialized),
+                run_via(&mut single, sql, materialized),
+            );
+            assert!(b.is_ok(), "{sql}: {b:?}");
+            assert_eq!(b, s, "{sql} materialized={materialized}");
+        }
+    }
+}
+
+#[test]
+fn batch_pulled_sites_raise_at_the_scalar_row() {
+    // The kernel fails at a = 57; an earlier per-row error (division by zero at id = 40, in the
+    // projection or the filter) still wins, exactly as the single-row kernel orders them.
+    let sqls = [
+        "SELECT host_twice(a) FROM t ORDER BY id",
+        "SELECT id FROM t WHERE host_twice(a) > 0 ORDER BY id",
+        "SELECT 1 / (id - 40), host_twice(a) FROM t ORDER BY id",
+        "SELECT host_twice(a) FROM t WHERE 1 / (id - 40) > 0 ORDER BY id",
+        "SELECT host_twice(a) FROM t WHERE host_twice(id) / (id - 60) > -10 ORDER BY id",
+        "SELECT a, host_twice(a) FROM t ORDER BY a",
+    ];
+    for sql in sqls {
+        for materialized in [false, true] {
+            let mut batched = batch_db(
+                twice_batched(new_calls(), Volatility::Immutable, Some(57)),
+                200,
+            );
+            let mut single = batch_db(twice_row(new_calls(), Some(57)), 200);
+            let (b, s) = (
+                run_via(&mut batched, sql, materialized),
+                run_via(&mut single, sql, materialized),
+            );
+            assert!(b.is_err(), "{sql}");
+            assert_eq!(b, s, "{sql} materialized={materialized}");
+        }
+    }
+}
+
+#[test]
+fn batch_error_on_an_unreached_row_starts_a_new_chunk() {
+    // The kernel fails at a = 57, but the WHERE rejects that row, so replay never evaluates the call
+    // there: the speculative error is dropped and the next row starts a new chunk.
+    for materialized in [false, true] {
+        let calls = new_calls();
+        let mut batched = batch_db(
+            twice_batched(calls.clone(), Volatility::Immutable, Some(57)),
+            2500,
+        );
+        let mut single = batch_db(twice_row(new_calls(), Some(57)), 2500);
+        let sql = "SELECT id, host_twice(a) FROM t WHERE id % 1000 <> 57 ORDER BY id";
+        let got = run_via(&mut batched, sql, materialized);
+        assert!(got.is_ok());
+        assert_eq!(got, run_via(&mut single, sql, materialized));
+        // Window 1 (rows 1-64): the chunk from row 1 fails at 57; the chunk from row 58 covers the
+        // rest of the window (58, 59, 61..64). Every later window is one call.
+        let mut want = window_calls(2500);
+        want.insert(1, 6);
+        assert_eq!(*calls.lock().unwrap(), want);
+    }
+}
+
+#[test]
+fn batch_pulled_cost_abort_matches_row_kernel() {
+    // Under a ceiling the abort row is the single-row kernel's — in the projection and in the
+    // filter, through both drives — and the kernel ran over no more rows than the budget could pay.
+    for sql in [
+        "SELECT id, host_twice(a) FROM t ORDER BY id",
+        "SELECT id FROM t WHERE host_twice(a) > 0 ORDER BY id",
+        "SELECT a, host_twice(a) FROM t ORDER BY a",
+    ] {
+        for materialized in [false, true] {
+            let calls = new_calls();
+            let mut batched = batch_db(
+                twice_batched(calls.clone(), Volatility::Immutable, None),
+                2000,
+            );
+            let mut single = batch_db(twice_row(new_calls(), None), 2000);
+            let budget = 300;
+            batched.set_max_cost(budget);
+            single.set_max_cost(budget);
+            let (b, s) = (
+                run_via(&mut batched, sql, materialized),
+                run_via(&mut single, sql, materialized),
+            );
+            let b = b.unwrap_err();
+            assert!(b.starts_with("54P01"), "{sql}: {b}");
+            assert_eq!(b, s.unwrap_err(), "{sql} materialized={materialized}");
+            let speculated: usize = calls.lock().unwrap().iter().sum();
+            assert!(
+                speculated <= (budget / 5) as usize + 1,
+                "{sql}: kernel ran over {speculated} rows"
+            );
+        }
+    }
+}
+
+#[test]
+fn batch_streaming_scan_storage_errors_match_row_kernel() {
+    // A corrupted page must surface exactly as under the single-row kernel — a read-ahead that meets
+    // it defers the error to the row the per-row pull would have met it at, so the kernel's own error
+    // at a = 57 still wins when it comes first, and a LIMIT that stops first never sees it. Corrupt
+    // each body page of a multi-leaf file in turn.
+    const PAGE: u32 = 256;
+    let dir = std::env::temp_dir();
+    let path = dir.join("jed_host_batch_defer_seed.jed");
+    let cpath = dir.join("jed_host_batch_defer_corrupt.jed");
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::create(CreateOptions {
+            path: Some(path.clone()),
+            skip_fsync: true,
+            page_size: PAGE,
+            ..Default::default()
+        })
+        .unwrap()
+        .session(SessionOptions::default());
+        db.query_outcome("CREATE TABLE t (id i64 PRIMARY KEY, a i64)", &[])
+            .unwrap();
+        db.query_outcome(
+            "INSERT INTO t SELECT g, CASE WHEN g % 10 = 0 THEN NULL ELSE g END \
+             FROM generate_series(1, 300) AS g",
+            &[],
+        )
+        .unwrap();
+        let image = db.to_image(PAGE, db.txid()).unwrap();
+        drop(db);
+        std::fs::write(&path, image).unwrap();
+    }
+    // Separate copies: each handle locks its own file.
+    let spath = dir.join("jed_host_batch_defer_single.jed");
+    let open = |p: &std::path::Path, f: HostFunction| {
+        Database::open_with_options(
+            p,
+            OpenOptions {
+                skip_fsync: true,
+                extensions: registry(vec![f]),
+                ..OpenOptions::default()
+            },
+        )
+        .map(|d| d.session(SessionOptions::default()))
+    };
+    let clean = std::fs::read(&path).unwrap();
+    let ps = PAGE as usize;
+    let mut detected = 0;
+    for i in 2..clean.len() / ps {
+        let mut bytes = clean.clone();
+        bytes[i * ps + 16] ^= 0xFF;
+        std::fs::write(&cpath, &bytes).unwrap();
+        std::fs::write(&spath, &bytes).unwrap();
+        let (Ok(mut batched), Ok(mut single)) = (
+            open(
+                &cpath,
+                twice_batched(new_calls(), Volatility::Immutable, Some(57)),
+            ),
+            open(&spath, twice_row(new_calls(), Some(57))),
+        ) else {
+            continue; // a corrupted routing/catalog page fails at open, before any scan
+        };
+        for sql in [
+            "SELECT id, host_twice(a) FROM t ORDER BY id",
+            "SELECT id, host_twice(a) FROM t ORDER BY id LIMIT 40",
+            "SELECT id, host_twice(a) FROM t ORDER BY id LIMIT 200",
+            "SELECT id, host_twice(id) FROM t ORDER BY id",
+        ] {
+            for materialized in [false, true] {
+                let (b, s) = (
+                    run_via(&mut batched, sql, materialized),
+                    run_via(&mut single, sql, materialized),
+                );
+                if matches!(&s, Err(e) if e.starts_with("XX001")) {
+                    detected += 1;
+                }
+                assert_eq!(b, s, "page {i}: {sql} materialized={materialized}");
+            }
+        }
+    }
+    assert!(detected > 0, "a corrupted leaf should fail a scan");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&cpath);
+    let _ = std::fs::remove_file(&spath);
 }
