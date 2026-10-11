@@ -77,12 +77,14 @@ type engine struct {
 	readOnly bool
 	// tempStorage is the SESSION-LOCAL temp domain's storage identity (temp-tables.md §6): the private
 	// in-RAM memoryBlockStore + pager + pinned pool its temp tables ride, with within-session compaction
-	// on. Created lazily on the first session-local temp DDL (newTempStorage); nil until then. Its
-	// pageCount is the domain's footprint — the page-based temp budget.
+	// on — migrated to a scratch file with a bounded pool once it outgrows tempBuffers on a host with a
+	// spill directory. Created lazily on the first session-local temp DDL (newTempStorage); nil until
+	// then, and released (its scratch file closed) when the session closes (releaseTempDomain). Its
+	// pageCount is the domain's footprint — the page-based temp ceiling.
 	tempStorage *storage
 	// openStreams counts this handle's live streaming cursors (Query's pull source, not a materialized
 	// result). A streaming cursor pins a snapshot it faults lazily, so while one is open a temp-domain
-	// compaction (persistTemp → maybeCompact) must NOT reclaim pages — it could free one the cursor still
+	// compaction (adoptTemp → maybeCompact) must NOT reclaim pages — it could free one the cursor still
 	// faults. Incremented when a streaming Rows opens, decremented on Close (single-threaded per handle).
 	openStreams int
 	// commitStagesRows is whether the last commitTx staged any record version into main (memory.md
@@ -151,10 +153,16 @@ type SessionOptions struct {
 	// (back-compat: a session left as-is behaves as before, one gate governing all DDL). The
 	// untrusted-scratch pattern is AllowDDL=false + AllowTempDDL=&true — private scratch tables only.
 	AllowTempDDL *bool
-	// TempBuffers is the per-session storage budget for session-local temp tables, in BYTES
-	// (spec/design/temp-tables.md §7); 0 ⇒ unlimited; nil ⇒ the engine default (DefaultTempBuffers).
-	// Bounds the RETAINED temp storage neither cost ceiling covers — an over-budget temp write aborts 54P03.
+	// TempBuffers is the per-session RESIDENT budget for session-local temp tables, in BYTES
+	// (spec/design/temp-tables.md §6); 0 ⇒ never spill; nil ⇒ the engine default (DefaultTempBuffers).
+	// Past it a host with a spill directory moves the temp domain to a scratch file with a page cache
+	// this size. Residency only — it never changes results, cost, or the 54P03 point.
 	TempBuffers *int
+	// MaxTempStorageBytes is the per-session storage CEILING for session-local temp tables, in BYTES
+	// (spec/design/temp-tables.md §7); 0 ⇒ unlimited; nil ⇒ the engine default
+	// (DefaultMaxTempStorageBytes). Bounds the RETAINED temp storage neither cost ceiling covers — an
+	// over-ceiling temp write aborts 54P03, whether the domain is resident or spilled.
+	MaxTempStorageBytes *int
 	// TimeZone is the session time zone (spec/design/session.md §6.2, timezones.md §9.4): the zone a
 	// timestamptz is decomposed in by date_trunc / EXTRACT / the cross-family casts. "" ⇒ UTC. Accepts
 	// UTC, a fixed ±HH:MM offset, or a named IANA zone a loaded JTZ bundle provides; an invalid value
@@ -286,9 +294,12 @@ type sessionState struct {
 	// (spec/design/temp-tables.md §5); a denied temp DDL is 42501. Resolved at session creation from
 	// SessionOptions.AllowTempDDL (defaulting to allowDDL's value when unset).
 	allowTempDDL bool
-	// tempBuffers is the per-session temp-table storage budget in BYTES (temp-tables.md §7); 0 ⇒
-	// unlimited. An over-budget temp write aborts 54P03.
+	// tempBuffers is the per-session temp-table RESIDENT budget in BYTES (temp-tables.md §6); 0 ⇒
+	// never spill.
 	tempBuffers int
+	// maxTempStorageBytes is the per-session temp-table storage CEILING in BYTES (temp-tables.md §7);
+	// 0 ⇒ unlimited. An over-ceiling temp write aborts 54P03.
+	maxTempStorageBytes int
 	// tempCommitted is the session-local temporary-table catalog + stores (spec/design/temp-tables.md
 	// §2): a Snapshot holding only this session's temp tables, their stores, and their (UNIQUE) index
 	// stores. NEVER serialized — only Engine.committed is written to the file, so a temp table makes
@@ -359,7 +370,8 @@ func newSessionWithOptions(opts SessionOptions) sessionState {
 		workMem:             opts.WorkMem,
 		privileges:          newPrivileges(),
 		allowDDL:            true,
-		tempBuffers:         defaultTempBuffers,
+		tempBuffers:         DefaultTempBuffers,
+		maxTempStorageBytes: DefaultMaxTempStorageBytes,
 		tempCommitted:       newSnapshot(),
 		vars:                map[string]string{},
 	}
@@ -378,6 +390,9 @@ func newSessionWithOptions(opts SessionOptions) sessionState {
 	}
 	if opts.TempBuffers != nil {
 		s.tempBuffers = *opts.TempBuffers
+	}
+	if opts.MaxTempStorageBytes != nil {
+		s.maxTempStorageBytes = *opts.MaxTempStorageBytes
 	}
 	// Resolve the configured zone once; an invalid value falls back to UTC at mint (the validated
 	// path is SetTimeZone, which surfaces 22023). timezones.md §9.4.
@@ -568,6 +583,23 @@ func (db *engine) tempDomainPaging() *sharedPaging {
 		db.tempStorage = newTempStorage(db.pageSize)
 	}
 	return db.tempStorage.paging
+}
+
+// releaseTempDomain drops the session-local temp domain when its session closes (temp-tables.md §4/§6):
+// the temp tables go with the session, and the domain's store is closed — for a spilled domain that
+// closes (and, where it could not be unlinked while open, removes) its scratch file; an in-RAM store's
+// close is a no-op. A streaming cursor still open over the domain faults through its store, so then the
+// store is left to the garbage collector (an os.File closes its descriptor when collected, and the
+// scratch file is already unlinked on Unix). Idempotent.
+func (db *engine) releaseTempDomain() {
+	if db.tempStorage == nil {
+		return
+	}
+	if db.openStreams == 0 {
+		_ = db.tempStorage.paging.close()
+	}
+	db.tempStorage = nil
+	db.session.tempCommitted = newSnapshot()
 }
 
 // working is the snapshot a write mutates — the open transaction's working. A write only ever runs
@@ -1131,12 +1163,22 @@ func (db *engine) SetAllowTempDDL(allow bool) { db.session.allowTempDDL = allow 
 // AllowTempDDL reports whether session-local temporary-table DDL is permitted on the default session.
 func (db *engine) AllowTempDDL() bool { return db.session.allowTempDDL }
 
-// SetTempBuffers sets the default session's per-session temp-table storage budget in BYTES
-// (spec/design/temp-tables.md §7); 0 ⇒ unlimited. An over-budget temp write aborts 54P03.
+// SetTempBuffers sets the default session's temp-table RESIDENT budget in BYTES
+// (spec/design/temp-tables.md §6); 0 ⇒ never spill. Past it a file host moves the temp domain to a
+// scratch file whose page cache it bounds. A handle setting, not stored in the file; it never changes
+// results or cost.
 func (db *engine) SetTempBuffers(bytes int) { db.session.tempBuffers = bytes }
 
-// TempBuffers reports the default session's per-session temp-table storage budget (0 ⇒ unlimited).
+// TempBuffers reports the default session's temp-table resident budget (0 ⇒ never spill).
 func (db *engine) TempBuffers() int { return db.session.tempBuffers }
+
+// SetMaxTempStorageBytes sets the default session's temp-table storage CEILING in BYTES
+// (spec/design/temp-tables.md §7); 0 ⇒ unlimited. An over-ceiling temp write aborts 54P03. A handle
+// setting, not stored in the file.
+func (db *engine) SetMaxTempStorageBytes(bytes int) { db.session.maxTempStorageBytes = bytes }
+
+// MaxTempStorageBytes reports the default session's temp-table storage ceiling (0 ⇒ unlimited).
+func (db *engine) MaxTempStorageBytes() int { return db.session.maxTempStorageBytes }
 
 // SetVar sets a session variable on the default session (spec/design/session.md §6.1). Custom
 // variables must be namespaced (a dotted name); a non-dotted name is 42704. Read it back in SQL with
@@ -1273,10 +1315,15 @@ func (s *sessionState) SetAllowDDL(allow bool) { s.allowDDL = allow }
 func (s *sessionState) AllowTempDDL() bool         { return s.allowTempDDL }
 func (s *sessionState) SetAllowTempDDL(allow bool) { s.allowTempDDL = allow }
 
-// TempBuffers / SetTempBuffers — the per-session temp-table storage budget in BYTES
-// (spec/design/temp-tables.md §7); 0 ⇒ unlimited. An over-budget temp write aborts 54P03.
+// TempBuffers / SetTempBuffers — the per-session temp-table RESIDENT budget in BYTES
+// (spec/design/temp-tables.md §6); 0 ⇒ never spill.
 func (s *sessionState) TempBuffers() int         { return s.tempBuffers }
 func (s *sessionState) SetTempBuffers(bytes int) { s.tempBuffers = bytes }
+
+// MaxTempStorageBytes / SetMaxTempStorageBytes — the per-session temp-table storage CEILING in BYTES
+// (spec/design/temp-tables.md §7); 0 ⇒ unlimited. An over-ceiling temp write aborts 54P03.
+func (s *sessionState) MaxTempStorageBytes() int         { return s.maxTempStorageBytes }
+func (s *sessionState) SetMaxTempStorageBytes(bytes int) { s.maxTempStorageBytes = bytes }
 
 // SetVar sets a session variable (spec/design/session.md §6.1) — PostgreSQL's GUC model, scoped to
 // the session. Custom variables must be namespaced (a dotted name like myapp.tenant); a non-dotted
@@ -1557,7 +1604,7 @@ func (s *sessionState) resetStatementMemory() {
 
 // pendingWriteBytes is the stored bytes the open transaction's working snapshots (main and attached
 // databases) have staged — its pending writes (memory.md §7). Session-local temp tables are bounded by
-// tempBuffers instead. Zero with no open transaction.
+// maxTempStorageBytes instead. Zero with no open transaction.
 func (s *sessionState) pendingWriteBytes() int64 {
 	if s.tx == nil {
 		return 0

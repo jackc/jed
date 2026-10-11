@@ -264,7 +264,8 @@ so there is no interior-record interleaving to special-case.
   dirty nodes to memory pages (no `fsync`) — the file commit minus durability. **Session-local
   temp-table stores** back onto the same store kind; whether each temp store owns a
   `MemoryBlockStore` or a session shares one is a B3 decision. (A database-wide shared temp kind was
-  later removed — temp-tables.md §13.) The `temp_buffers` budget survives **by construction** — it is
+  later removed — temp-tables.md §13; the budget below was later re-based on page bytes and renamed
+  `max_temp_storage_bytes`, temp-tables.md §7.) The `temp_buffers` budget survives **by construction** — it is
   measured in on-disk record-encoding bytes, deliberately representation-independent
   ([temp-tables.md §7](temp-tables.md)) — so its *values* move only with the v24 record
   encoding itself (the change-2 NULL bytes), which is part of the one re-baseline.

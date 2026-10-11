@@ -64,7 +64,7 @@ func TestSessionLocalTempPageBudgetBoundsMultiLeaf(t *testing.T) {
 	// ~20 pages of budget: a single leaf (≤ ~240 record bytes) is far under it, so a record-byte measure
 	// would never abort; the page footprint crosses it as the tree grows past ~20 pages.
 	budget := 20 * 256
-	sess := db.Session(SessionOptions{TempBuffers: &budget})
+	sess := db.Session(SessionOptions{MaxTempStorageBytes: &budget})
 	sessExec(t, sess, "CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)")
 	pad := strings.Repeat("z", 40)
 	aborted := false

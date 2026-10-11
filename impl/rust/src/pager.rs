@@ -158,6 +158,24 @@ impl Pager {
         std::mem::replace(&mut self.store, store)
     }
 
+    /// Move the store's bytes into `store` and adopt it, dropping the old backing — a session-local
+    /// temp domain spilling from its in-RAM store to a scratch file (spec/design/temp-tables.md §6).
+    /// The page layout is unchanged byte for byte, so every page id stays valid. Copies in bounded
+    /// chunks; on an error the old store stays in place, untouched.
+    pub(crate) fn migrate_store(&mut self, mut store: Box<dyn BlockStore>) -> Result<()> {
+        const CHUNK: u64 = 1 << 20;
+        let size = self.store.size()?;
+        let mut offset = 0;
+        while offset < size {
+            let len = (size - offset).min(CHUNK) as usize;
+            let bytes = self.store.read_at(offset, len)?;
+            store.write_at(offset, &bytes)?;
+            offset += len as u64;
+        }
+        self.store = store;
+        Ok(())
+    }
+
     /// Whether the backing skips its durability barrier (`fsync=off`).
     pub(crate) fn skips_sync(&self) -> bool {
         self.store.skips_sync()

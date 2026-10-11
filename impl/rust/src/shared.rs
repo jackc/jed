@@ -148,7 +148,7 @@ pub(crate) enum AttachMode {
 /// [`Roots::attached`] under the same key so a reader pins it lock-free with every other root. An
 /// attachment is file-backed (Slice 2 — `storage.path` is `Some`, a `FileBlockStore`, committed durably
 /// via [`Storage::commit_durable`]) or in-memory (`storage.path` is `None`, a `MemoryBlockStore`,
-/// committed via `persist_temp`). The storage kind is the sole source of the file/memory distinction.
+/// committed via `stage_temp`). The storage kind is the sole source of the file/memory distinction.
 pub(crate) struct Attachment {
     /// Lowercased qualifier name (the map key).
     #[allow(dead_code)]
@@ -267,6 +267,10 @@ pub(crate) struct Storage {
     /// are reclaimed rather than leaked. The main file/in-memory domain ALSO sets it (v25 — continuous
     /// within-session reclamation); its within-session reuse is watermark-gated by `free_gen_txid` (§8).
     reclaim_within_session: bool,
+    /// Whether this temp domain has spilled from its in-RAM store to a scratch file in the host spill
+    /// directory (temp-tables.md §6). Once spilled it stays spilled; its pool is then bounded by
+    /// `temp_buffers` instead of pinned. Always `false` for a main or attached domain.
+    spilled: bool,
     /// The reachable page count recorded at the last compaction — the cheap trigger basis: compaction
     /// re-runs only once the high-water passes ~2× it (periodic ~2× bound, no per-commit walk).
     live_at_compaction: u32,
@@ -340,6 +344,11 @@ pub(crate) struct StagedCommit {
     catalog_pages: usize,
 }
 
+/// How many session-local temp domains have spilled to a scratch file in this process
+/// (temp-tables.md §6) — the conformance harness's forced temp-spill mode reports it, so a run that
+/// never actually spilled cannot pass silently.
+pub static TEMP_SPILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Storage {
     /// A fresh per-domain storage identity for a TEMP snapshot (temp-tables.md §6, bplus-reshape.md): a
     /// private in-RAM `MemoryBlockStore` read/written through the SAME pager + packed-leaf path as an
@@ -367,6 +376,7 @@ impl Storage {
             path: None,
             spill_dir: None,
             reclaim_within_session: true,
+            spilled: false,
             live_at_compaction: 0,
             free_gen_txid: 0,
             budget: StorageBudget::default(),
@@ -385,29 +395,54 @@ impl Storage {
         self.page_count
     }
 
-    /// Materialize a TEMP snapshot's dirty pages into the domain's in-RAM `MemoryBlockStore`
-    /// (temp-tables.md §6): the SAME incremental copy-on-write serialize as a file/in-memory commit, but
-    /// with NO meta slot and NO sync — a temp domain is never reopened and its memory host has no
-    /// durability barrier — then the residency flip (clean leaves demote to `OnDisk`) and within-session
-    /// compaction. ZERO main-file writes: only the temp byte store is touched. Assigns page ids on `snap`
-    /// in place; the caller adopts `snap` as the committed temp state afterward. `can_reclaim` is the
-    /// caller's cursor watermark (no open streaming cursor may hold an older temp tree).
-    pub(crate) fn persist_temp(
+    /// Stage a TEMP snapshot's dirty pages into the domain's store (temp-tables.md §6): the SAME
+    /// incremental copy-on-write serialize as a file/in-memory commit, but with NO meta slot and NO
+    /// sync — a temp domain is never reopened and has no durability barrier — then the residency flip
+    /// (clean leaves demote to `OnDisk`). ZERO main-file writes: only the temp byte store is touched.
+    /// Assigns page ids on `snap` in place. Staged pages occupy only free-list slots and pages past
+    /// the high-water, so the caller stages BEFORE the main persist and adopts
+    /// ([`adopt_staged`](Self::adopt_staged)) after it: a failure anywhere in between leaves the temp
+    /// store matching its still-committed root.
+    ///
+    /// Spill-to-disk (temp-tables.md §6): once the domain's page bytes exceed `temp_buffers` (`0` ⇒
+    /// never) and the host has a spill directory, the in-RAM store migrates to a scratch file there and
+    /// the pool is bounded by `temp_buffers`. Residency only — the page layout, and so results, cost,
+    /// and the `54P03` point, are unchanged.
+    pub(crate) fn stage_temp(
         &mut self,
         snap: &mut Snapshot,
-        can_reclaim: bool,
-        budget: Option<&BudgetCtx<'_>>,
-    ) -> Result<()> {
+        temp_buffers: usize,
+        spill_dir: Option<&std::path::Path>,
+    ) -> Result<StagedCommit> {
         // A temp/in-memory store keeps its free-list in RAM (no meta), so it persists no free-list
         // pages; within-session reclamation is the post-commit RAM rebuild (`maybe_compact`).
-        // A temp domain (and an in-memory attachment) is session-local / driven by one caller, so its only
-        // reader is the session's own streaming cursor — gated synchronously by `can_reclaim` (open_streams).
-        // There is no cross-thread pin-registration race, so reuse is always safe here (transactions.md §8).
-        let staged = self.stage_in_memory(snap, budget, String::new())?;
-        self.adopt_staged(snap, staged, can_reclaim)
+        let staged = self.stage_in_memory(snap, None, String::new())?;
+        let bytes = staged.page_count as u64 * self.page_size as u64;
+        if !self.spilled && temp_buffers > 0 && bytes > temp_buffers as u64 {
+            if let Some(dir) = spill_dir {
+                let store = crate::blockstore::ScratchBlockStore::create(dir)?;
+                self.paging.pager().migrate_store(Box::new(store))?;
+                self.spilled = true;
+                TEMP_SPILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        if self.spilled {
+            let capacity = if temp_buffers == 0 {
+                usize::MAX
+            } else {
+                crate::paging::cache_leaves(temp_buffers, self.page_size)
+            };
+            self.paging.set_capacity(capacity);
+        }
+        Ok(staged)
     }
 
-    /// The first half of [`persist_temp`](Self::persist_temp): write `snap`'s dirty pages into the
+    /// Whether this temp domain has spilled to a scratch file (temp-tables.md §6).
+    pub(crate) fn spilled(&self) -> bool {
+        self.spilled
+    }
+
+    /// The first half of a temp or in-memory attachment commit: write `snap`'s dirty pages into the
     /// in-RAM store and take the residency flip, but adopt none of the page accounting. An in-memory
     /// attachment stages in `commit_tx` and adopts only after main persists and the roots publish
     /// (attached-databases.md §5): adopting first would let a failed main persist leave a free list
@@ -444,7 +479,7 @@ impl Storage {
         })
     }
 
-    /// The second half of [`persist_temp`](Self::persist_temp): adopt a staged commit's page accounting
+    /// The second half of [`stage_temp`](Self::stage_temp) / [`stage_in_memory`](Self::stage_in_memory): adopt a staged commit's page accounting
     /// and run the post-commit compaction relative to `snap`, its now-committed root.
     pub(crate) fn adopt_staged(
         &mut self,
@@ -460,7 +495,7 @@ impl Storage {
 
     /// Plan an in-memory commit's page allocation under the domain's `max_storage_bytes` limit
     /// (memory.md §8.3), before any page is written. Without a budget context (a temp domain, which
-    /// `temp_buffers` bounds) or under an unlimited limit this is the plain incremental plan. A plan
+    /// `max_temp_storage_bytes` bounds) or under an unlimited limit this is the plain incremental plan. A plan
     /// that raises the high-water past the limit first compacts the committed snapshot when the
     /// watermark allows, then re-plans; if it still does not fit the commit fails `54P06`.
     fn plan_in_memory(
@@ -1432,7 +1467,7 @@ impl Shared {
     }
 
     /// Commit a dirtied attachment's working snapshot into its block store (attached-databases.md §5, the
-    /// N-root commit). An IN-MEMORY attachment only STAGES persist_temp-style (pages written, NO fsync —
+    /// N-root commit). An IN-MEMORY attachment only STAGES temp-style (pages written, NO fsync —
     /// no durability barrier) and returns the [`StagedCommit`] that [`adopt_attachments`] adopts once main
     /// has persisted and the roots have published. A FILE attachment (Slice 2) advances the version
     /// (`base_txid + 1`) for its alternating meta slot + reopen, commits DURABLY through
@@ -1970,6 +2005,7 @@ impl Database {
             // reads the persisted free-list and no longer reconstructs it, so mid-session orphans must
             // be returned at each commit or they would leak permanently (format.md *Reclamation*).
             reclaim_within_session: true,
+            spilled: false,
             live_at_compaction: engine.live_at_compaction,
             free_gen_txid: engine.free_gen_txid,
             budget: StorageBudget::default(),
@@ -2145,10 +2181,10 @@ impl Database {
         self.0.path()
     }
 
-    /// Override the host scratch directory for per-core spill tests. Production hosts install the
-    /// OS temp directory at open/create; keeping this crate-private and test-only avoids widening the
-    /// embedding API before the configurable spill-target slice.
-    #[cfg(test)]
+    /// Override the host scratch directory for per-core spill tests and the conformance harness's
+    /// forced temp-spill mode ([`crate::tooling::set_spill_dir`]). Production hosts install the OS temp
+    /// directory at open/create; keeping this crate-private avoids widening the embedding API before
+    /// the configurable spill-target slice. Sessions minted afterwards inherit it.
     pub(crate) fn set_spill_dir_for_test(&self, dir: std::path::PathBuf) {
         self.0
             .storage
@@ -2334,6 +2370,7 @@ impl Database {
                 spill_dir: engine.spill_dir.clone(),
                 // v25: a file attachment persists + reclaims like the main file domain (above).
                 reclaim_within_session: true,
+                spilled: false,
                 live_at_compaction: engine.live_at_compaction,
                 free_gen_txid: engine.free_gen_txid,
                 budget: StorageBudget {
@@ -3385,9 +3422,15 @@ impl Session {
     pub fn set_allow_temp_ddl(&mut self, allow: bool) {
         self.engine.session.set_allow_temp_ddl(allow);
     }
-    /// Set the per-session temporary-table storage budget in bytes; `0` ⇒ unlimited (temp-tables.md §7).
+    /// Set the per-session temporary-table resident budget in bytes; `0` ⇒ never spill
+    /// (temp-tables.md §6).
     pub fn set_temp_buffers(&mut self, bytes: usize) {
         self.engine.session.set_temp_buffers(bytes);
+    }
+    /// Set the per-session temporary-table storage ceiling in bytes; `0` ⇒ unlimited
+    /// (temp-tables.md §7). An over-ceiling temp write aborts `54P03`.
+    pub fn set_max_temp_storage_bytes(&mut self, bytes: usize) {
+        self.engine.session.set_max_temp_storage_bytes(bytes);
     }
     /// Clear every session variable (§6.1).
     pub fn reset_vars(&mut self) {
@@ -3815,7 +3858,7 @@ mod temp_reclaim_internal_tests {
         })
         .unwrap();
         let mut opts = SessionOptions::default();
-        opts.temp_buffers = 20 * 256;
+        opts.max_temp_storage_bytes = 20 * 256;
         let mut sess = db.session(opts);
         sess.query_outcome("CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)", &[])
             .unwrap();
@@ -4291,5 +4334,173 @@ mod multi_root_failure_tests {
             .unwrap()
             .collect();
         assert_eq!(n[0][0], Value::Int(6));
+    }
+}
+
+#[cfg(test)]
+mod temp_spill_internal_tests {
+    //! Temp-table spill-to-disk (spec/design/temp-tables.md §6, slice 3): once a session-local temp
+    //! domain's page bytes outgrow `temp_buffers` on a host with a spill directory, the domain migrates
+    //! from its in-RAM store to a scratch file and its page cache is bounded by `temp_buffers`. These
+    //! per-core tests reach what the corpus cannot (the corpus runs in-memory databases, which have no
+    //! spill target): the residency flip itself, the bounded pool, the unlinked scratch file, and the
+    //! results/cost/54P03 neutrality of spilling. Mirrors Go temp_spill_test.go and TS temp_spill.test.ts.
+
+    use super::*;
+
+    const WORKLOAD: &[&str] = &[
+        "CREATE TEMP TABLE s (id i32 PRIMARY KEY, grp i32, pad text)",
+        "CREATE INDEX s_grp ON s (grp)",
+        "INSERT INTO s SELECT g, g % 7, repeat('x', 40 + g % 13) FROM generate_series(1, 400) AS g",
+        "UPDATE s SET pad = repeat('y', 3 + id % 9) WHERE id % 5 = 0",
+        "DELETE FROM s WHERE id % 11 = 0",
+        "INSERT INTO s SELECT g, g % 7, repeat('z', g % 17) FROM generate_series(401, 600) AS g",
+    ];
+
+    const QUERIES: &[&str] = &[
+        "SELECT count(*), sum(id) FROM s",
+        "SELECT id, pad FROM s WHERE id = 250",
+        "SELECT id FROM s WHERE grp = 3 ORDER BY id",
+        "SELECT pad FROM s ORDER BY id DESC LIMIT 5",
+        "SELECT grp, count(*) FROM s GROUP BY grp ORDER BY grp",
+    ];
+
+    fn spill_db(dir: &std::path::Path) -> Database {
+        let db = Database::create(CreateOptions {
+            page_size: 256,
+            ..Default::default()
+        })
+        .unwrap();
+        db.set_spill_dir_for_test(dir.to_path_buf());
+        db
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "jed-temp-spill-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Run the workload + queries under `temp_buffers`, returning each query's rows and every
+    /// statement's cost, plus whether the domain spilled.
+    fn run(db: &Database, temp_buffers: usize) -> (Vec<(Vec<Vec<Value>>, i64)>, bool, Session) {
+        let mut opts = SessionOptions::default();
+        opts.temp_buffers = temp_buffers;
+        opts.max_temp_storage_bytes = 0;
+        let mut sess = db.session(opts);
+        let mut out = Vec::new();
+        for sql in WORKLOAD {
+            let o = sess.query_outcome(sql, &[]).unwrap();
+            out.push((Vec::new(), o.cost()));
+        }
+        for sql in QUERIES {
+            match sess.query_outcome(sql, &[]).unwrap() {
+                Outcome::Query { rows, cost, .. } => out.push((rows, cost)),
+                other => panic!("expected a query, got {other:?}"),
+            }
+        }
+        let spilled = sess.engine.temp_storage.as_ref().unwrap().spilled();
+        (out, spilled, sess)
+    }
+
+    #[test]
+    fn spilled_temp_domain_matches_resident_rows_and_cost() {
+        let dir = scratch_dir("parity");
+        let resident_db = spill_db(&dir);
+        let (resident, resident_spilled, _a) = run(&resident_db, 0);
+        assert!(!resident_spilled, "temp_buffers = 0 must never spill");
+
+        let spill_db = spill_db(&dir);
+        let (spilled, did_spill, sess) = run(&spill_db, 4 * 256);
+        assert!(did_spill, "a temp domain past temp_buffers should spill");
+        assert_eq!(resident, spilled, "spilling changed rows or cost");
+
+        // The page cache is bounded by temp_buffers (4 leaves at page 256), not pinned.
+        let ts = sess.engine.temp_storage.as_ref().unwrap();
+        assert_eq!(ts.paging().capacity(), 4);
+        assert!(ts.paging().resident_leaves() <= 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_needs_a_spill_target() {
+        // An in-memory database has no spill directory, so temp stays resident past temp_buffers.
+        let db = Database::create(CreateOptions {
+            page_size: 256,
+            ..Default::default()
+        })
+        .unwrap();
+        let (out, spilled, _s) = run(&db, 4 * 256);
+        assert!(!spilled);
+        assert_eq!(out.len(), WORKLOAD.len() + QUERIES.len());
+    }
+
+    #[test]
+    fn scratch_file_is_unlinked_and_released() {
+        let dir = scratch_dir("unlink");
+        let db = spill_db(&dir);
+        let (_, did_spill, sess) = run(&db, 4 * 256);
+        assert!(did_spill);
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "the scratch file should be unlinked while open",
+        );
+        drop(sess);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spilling_does_not_move_the_54p03_point() {
+        let dir = scratch_dir("ceiling");
+        let abort_at = |temp_buffers: usize| -> (usize, bool) {
+            let db = spill_db(&dir);
+            let mut opts = SessionOptions::default();
+            opts.temp_buffers = temp_buffers;
+            opts.max_temp_storage_bytes = 40 * 256;
+            let mut sess = db.session(opts);
+            sess.query_outcome("CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)", &[])
+                .unwrap();
+            let pad = "z".repeat(40);
+            for i in 1..=1000 {
+                if let Err(e) =
+                    sess.query_outcome(&format!("INSERT INTO lt VALUES ({i}, 'r-{pad}')"), &[])
+                {
+                    assert_eq!(e.code(), "54P03");
+                    let spilled = sess.engine.temp_storage.as_ref().unwrap().spilled();
+                    return (i, spilled);
+                }
+            }
+            panic!("never hit 54P03");
+        };
+        let (resident_at, resident_spilled) = abort_at(0);
+        let (spilled_at, did_spill) = abort_at(2 * 256);
+        assert!(!resident_spilled);
+        assert!(did_spill);
+        assert_eq!(resident_at, spilled_at);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pool_capacity_follows_a_later_temp_buffers_change() {
+        let dir = scratch_dir("retune");
+        let db = spill_db(&dir);
+        let (_, did_spill, mut sess) = run(&db, 4 * 256);
+        assert!(did_spill);
+        sess.set_temp_buffers(16 * 256);
+        sess.query_outcome("INSERT INTO s VALUES (100000, 1, 'x')", &[])
+            .unwrap();
+        let ts = sess.engine.temp_storage.as_ref().unwrap();
+        assert_eq!(ts.paging().capacity(), 16);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

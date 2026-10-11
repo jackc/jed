@@ -19,8 +19,8 @@ type Slot = { page: number; node: PNode; referenced: boolean };
 // A bounded CLOCK cache from page id to a decoded leaf node.
 export class BufferPool {
   // capacity is the most pages the pool holds at once (carried over to the replacement pool when
-  // compaction reopens the database, spec/design/api.md §2.6).
-  readonly capacity: number;
+  // compaction reopens the database, spec/design/api.md §2.6). Re-bounded only through setCapacity.
+  capacity: number;
   private slots: Slot[] = [];
   private index = new Map<number, number>();
   private hand = 0;
@@ -65,6 +65,17 @@ export class BufferPool {
       this.hand = (this.hand + 1) % this.slots.length;
       if (this.slots[i].referenced) this.slots[i].referenced = false;
       else return i;
+    }
+  }
+
+  // setCapacity re-bounds the pool to capacity pages (clamped to ≥ 1), evicting under CLOCK until the
+  // resident set fits — a spilled temp domain's pool tightens from pinned to temp_buffers
+  // (spec/design/temp-tables.md §6).
+  setCapacity(capacity: number): void {
+    this.capacity = Math.max(1, capacity);
+    while (this.slots.length > this.capacity) {
+      const victim = this.evictSlot();
+      this.invalidate(this.slots[victim].page);
     }
   }
 

@@ -103,6 +103,12 @@ impl SharedPaging {
         self.pool.capacity()
     }
 
+    /// Re-bound the pool to `capacity` leaves, evicting until the resident set fits (a spilled temp
+    /// domain, spec/design/temp-tables.md §6).
+    pub(crate) fn set_capacity(&self, capacity: usize) {
+        self.pool.set_capacity(capacity);
+    }
+
     /// The number of leaf pages currently resident in the pool — the gauge the public
     /// [`crate::Engine::resident_leaves`] reports and the `cache_pages` budget bounds (P6.4c,
     /// spec/design/pager.md §3).

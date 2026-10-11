@@ -4,11 +4,14 @@
 // The Node file host (file.ts) injects a FileSpillSink on the Engine handle; an in-memory or OPFS
 // database leaves it null and never spills (sorts stay resident — spill.md §2). Node stdlib I/O only
 // (no dependency — CLAUDE.md §14); the run file's bytes are a per-core internal codec, never the §8
-// on-disk format (spill.md §6).
+// on-disk format (spill.md §6). The same sink also creates the scratch BlockStore a session-local temp
+// domain spills to (createScratchStore, spec/design/temp-tables.md §6) — internal and out-of-contract.
 
 import { closeSync, openSync, readSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { engineError } from "./errors.ts";
+import type { BlockStore } from "./blockstore.ts";
+import { FileBlockStore } from "./fileblockstore.ts";
 import type { SpillByteReader, SpillRun, SpillSink, SpillScratch } from "./spill.ts";
 
 // A unique-per-process counter for spill file names (combined with the process id), so concurrent
@@ -33,6 +36,28 @@ export class FileSpillSink implements SpillSink {
       } catch (e) {
         if (!isAlreadyExists(e)) throw spillIoError(e);
       }
+    }
+  }
+
+  createScratchStore(): BlockStore {
+    for (;;) {
+      const path = join(this.dir, `jed-spill-${process.pid}-${spillSeq++}.tmp`);
+      let fd: number;
+      try {
+        fd = openSync(path, "wx+", 0o600);
+      } catch (e) {
+        if (isAlreadyExists(e)) continue;
+        throw spillIoError(e);
+      }
+      // Unlink at once where the OS allows removing an open file (Unix), so a crash leaves nothing
+      // behind; otherwise (Windows) the store removes it on close.
+      let pending: string | null = null;
+      try {
+        unlinkSync(path);
+      } catch {
+        pending = path;
+      }
+      return new ScratchBlockStore(fd, pending);
     }
   }
 
@@ -206,6 +231,80 @@ class FileScratch implements SpillScratch {
       try {
         unlinkSync(this.path);
       } catch {}
+    }
+  }
+}
+
+// ScratchBlockStore is the scratch storage host for a spilled session-local temp domain
+// (spec/design/temp-tables.md §6): a private file in the host spill directory, never the database
+// file. A temp domain is never reopened and has no durability barrier, so it is a FileBlockStore with
+// fsync off (sync and the grow barrier are no-ops). Node errors surface as 58030 (temp-tables.md §11).
+class ScratchBlockStore implements BlockStore {
+  private file: FileBlockStore;
+  // The path still to remove on close (the OS refused to unlink it while open); null once unlinked.
+  private path: string | null;
+  private closed = false;
+
+  constructor(fd: number, path: string | null) {
+    this.file = new FileBlockStore(fd, true);
+    this.path = path;
+  }
+
+  readAt(offset: number, len: number): Uint8Array {
+    try {
+      return this.file.readAt(offset, len);
+    } catch (e) {
+      throw spillIoError(e);
+    }
+  }
+
+  writeAt(offset: number, bytes: Uint8Array): void {
+    try {
+      this.file.writeAt(offset, bytes);
+    } catch (e) {
+      throw spillIoError(e);
+    }
+  }
+
+  sync(): void {
+    // Never reopened, never durable: no barrier.
+  }
+
+  size(): number {
+    try {
+      return this.file.size();
+    } catch (e) {
+      throw spillIoError(e);
+    }
+  }
+
+  setSize(bytes: number): void {
+    try {
+      this.file.setSize(bytes);
+    } catch (e) {
+      throw spillIoError(e);
+    }
+  }
+
+  skipsSync(): boolean {
+    return true;
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    // Close before unlinking: Windows cannot remove an open file.
+    try {
+      this.file.close();
+    } finally {
+      if (this.path !== null) {
+        try {
+          unlinkSync(this.path);
+        } catch {
+          // best-effort cleanup
+        }
+        this.path = null;
+      }
     }
   }
 }

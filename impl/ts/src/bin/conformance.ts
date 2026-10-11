@@ -24,6 +24,7 @@ import {
   createDatabase,
   Database,
   DEFAULT_MAX_SQL_LENGTH,
+  DEFAULT_TEMP_BUFFERS,
   EngineError,
   fixedClock,
   type Outcome,
@@ -37,7 +38,9 @@ import {
   seededRandomSource,
   openDatabase,
   type Session,
+  setSpillDirForTest,
   SUPPORTED_CAPABILITIES,
+  tempSpills,
   verifyLivePages,
 } from "../tooling.ts";
 
@@ -469,11 +472,12 @@ function parseWorkMemDirective(line: string): number | null {
   return Number.isSafeInteger(n) && n >= 0 ? n : null;
 }
 
-// parseTempBuffersDirective parses a `# temp_buffers: N` directive line (spec/design/temp-tables.md
-// §7): the per-session temp-table storage budget (bytes) to run the next record under (0 ⇒ unlimited).
-// Mirrors `# max_cost:` — per-record, reset after.
-function parseTempBuffersDirective(line: string): number | null {
-  const m = line.match(/^#\s*temp_buffers:\s*(\S+)/);
+// parseMaxTempStorageDirective parses a `# max_temp_storage_bytes: N` directive line
+// (spec/design/temp-tables.md §7): the per-session temp-table storage ceiling (bytes) to run the next
+// record under (0 ⇒ unlimited). Mirrors `# max_cost:` — per-record, reset after — so a record can set a
+// small ceiling and assert that an over-ceiling temp write traps 54P03.
+function parseMaxTempStorageDirective(line: string): number | null {
+  const m = line.match(/^#\s*max_temp_storage_bytes:\s*(\S+)/);
   if (!m) return null;
   const n = Number(m[1]);
   return Number.isInteger(n) ? n : null;
@@ -599,6 +603,26 @@ function recordPeak(ordinal: number, db: Database): void {
   appendFileSync(path, `${peakRel}\t${ordinal}\t${queryMemoryPeak.value}\t${storage}\n`);
 }
 
+// forcedTempBuffers is the forced temp-spill mode's resident budget (JED_CONFORMANCE_TEMP_BUFFERS,
+// bytes): memory-mode databases get a spill sink and every session this temp_buffers, so each temp
+// domain past it spills to a scratch file (spec/design/temp-tables.md §6). null when unset.
+function forcedTempBuffers(): number | null {
+  const v = process.env.JED_CONFORMANCE_TEMP_BUFFERS;
+  if (v === undefined) return null;
+  const n = Number(v);
+  if (!Number.isSafeInteger(n) || n < 0) {
+    throw new Error("JED_CONFORMANCE_TEMP_BUFFERS must be nonnegative bytes");
+  }
+  return n;
+}
+
+// createsTempTable reports whether a corpus file creates a session-local temp table (the forced
+// temp-spill mode's file set).
+function createsTempTable(text: string): boolean {
+  const upper = text.toUpperCase();
+  return upper.includes("CREATE TEMP ") || upper.includes("CREATE TEMPORARY ");
+}
+
 function runFile(text: string, disk: boolean): void {
   // In DISK mode the file is backed by a temp .jed image reopened before every record (below), so each
   // committed read faults from disk; in MEMORY mode it is a fresh in-memory Database
@@ -617,7 +641,15 @@ function runFile(text: string, disk: boolean): void {
   // The Database the current session was minted from, held so a `# attach:` directive (memory-mode only
   // — # skip: disk) can attach a fresh in-memory database into it. In disk mode it is the reopenable file
   // handle; in memory mode a fresh in-memory Database (never reopened).
-  let attachDb: Database = dbHandle ?? createDatabase({});
+  let attachDb: Database;
+  if (dbHandle !== null) {
+    attachDb = dbHandle;
+  } else {
+    attachDb = createDatabase({});
+    // Forced temp spill (JED_CONFORMANCE_TEMP_BUFFERS, temp-tables.md §6): an in-memory database has no
+    // spill target, so give it one — temp domains then spill to scratch files.
+    if (forcedTempBuffers() !== null) setSpillDirForTest(attachDb, tmpdir());
+  }
   let db = attachDb.session();
   // Main's `# max_storage_bytes:` limit, re-applied to each disk-mode reopen (a handle setting).
   let mainStorageLimit = 0n;
@@ -647,7 +679,7 @@ function runFile(text: string, disk: boolean): void {
     // The whole-corpus accounting mode: a budget applied to every record without its own directive,
     // so every query shape exercises the accounting (memory.md §5).
     const queryMemoryDefault = parseQueryMemoryEnv();
-    let pendingTempBuffers: number | null = null;
+    let pendingMaxTempStorage: number | null = null;
     let pendingWorkMem: number | null = null;
     const pendingVars: Array<[string, string]> = [];
     let pendingTimezone: string | null = null;
@@ -729,7 +761,7 @@ function runFile(text: string, disk: boolean): void {
           ? parseMaxCostDirective(line.replace("max_scalar_bytes:", "max_cost:"))
           : null;
         const qm = parseQueryMemoryDirective(line);
-        const tb = parseTempBuffersDirective(line);
+        const tb = parseMaxTempStorageDirective(line);
         const wm = parseWorkMemDirective(line);
         const sv = parseSetDirective(line);
         const tz = parseTimezoneDirective(line);
@@ -762,7 +794,7 @@ function runFile(text: string, disk: boolean): void {
         } else if (qm !== null) {
           pendingQueryMemory = qm;
         } else if (tb !== null) {
-          pendingTempBuffers = tb;
+          pendingMaxTempStorage = tb;
         } else if (wm !== null) {
           pendingWorkMem = wm;
         } else if (sv !== null) {
@@ -812,6 +844,9 @@ function runFile(text: string, disk: boolean): void {
         }
       }
       db.setWorkMem(workMem);
+      // The temp-table resident budget: the forced-spill override (JED_CONFORMANCE_TEMP_BUFFERS),
+      // otherwise the default. Residency only — results, cost, and 54P03 never depend on it.
+      db.setTempBuffers(forcedTempBuffers() ?? DEFAULT_TEMP_BUFFERS);
       const expectedCost = pendingCost;
       const expectedNames = pendingNames;
       const expectedTypes = pendingTypes;
@@ -858,8 +893,6 @@ function runFile(text: string, disk: boolean): void {
       pendingRevokes.length = 0;
       pendingAllowDdl = null;
       pendingAllowTempDdl = null;
-      // Apply the per-record temp-storage budget (temp-tables.md §7); absent ⇒ unlimited (0), so a
-      // `# temp_buffers:` directive never leaks past its record. Mirrors `# max_cost:`.
       db.setMaxScalarBytes(pendingScalarBytes ?? 0n);
       pendingScalarBytes = null;
       // `# max_query_memory_bytes:` (memory.md §2) decorates only its record; absent ⇒ unlimited, or
@@ -869,8 +902,10 @@ function runFile(text: string, disk: boolean): void {
       const underflowsBefore = queryMemoryUnderflows.count;
       queryMemoryPeak.value = 0;
       recordOrdinal++;
-      db.setTempBuffers(pendingTempBuffers ?? 0);
-      pendingTempBuffers = null;
+      // Apply the per-record temp-storage ceiling (temp-tables.md §7); absent ⇒ unlimited (0), so a
+      // `# max_temp_storage_bytes:` directive never leaks past its record. Mirrors `# max_cost:`.
+      db.setMaxTempStorageBytes(pendingMaxTempStorage ?? 0);
+      pendingMaxTempStorage = null;
       // Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
       // pending # set: pair, so a directive decorates only its record and never leaks forward.
       db.resetVars();
@@ -961,6 +996,9 @@ function runFile(text: string, disk: boolean): void {
       }
     }
   } finally {
+    // Closing the session drops its temp domain — a spilled one's scratch file included (temp-tables.md
+    // §6; JS has no destructor to release it).
+    db.close();
     if (dbHandle !== null) dbHandle.close();
     if (tmpDir !== null) rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -1330,13 +1368,20 @@ function main(): number {
     )
     .sort();
   if (files.length === 0) throw new Error("JED_CONFORMANCE_FILTER matched no tests");
+  // The forced temp-spill mode walks only the files that create temp tables: giving a memory-mode
+  // database a spill sink also lets blocking operators spill where the corpus pins that an in-memory
+  // database cannot (the 54P05 query-memory records).
+  const forcedTemp = forcedTempBuffers() !== null;
+  const walked = forcedTemp
+    ? files.filter((f) => createsTempTable(readFileSync(join(suites, f), "utf8")))
+    : files;
 
   const supported = new Set(SUPPORTED_CAPABILITIES);
 
   let passed = 0;
   let failed = 0;
   let skipped = 0;
-  for (const rel of files) {
+  for (const rel of walked) {
     const text = readFileSync(join(suites, rel), "utf8");
     const missing = parseRequires(text).filter((c) => !supported.has(c));
     if (missing.length > 0) {
@@ -1378,6 +1423,13 @@ function main(): number {
   }
 
   console.log(`\n[${mode}] ${passed} passed, ${failed} failed, ${skipped} skipped`);
+  if (forcedTemp) {
+    console.log(`[${mode}] forced temp spill: ${tempSpills.count} temp domain(s) spilled`);
+    if (tempSpills.count === 0 && !disk && passed > 0) {
+      console.error("JED_CONFORMANCE_TEMP_BUFFERS set but no temp domain spilled");
+      return 1;
+    }
+  }
   return failed !== 0 ? 1 : 0;
 }
 

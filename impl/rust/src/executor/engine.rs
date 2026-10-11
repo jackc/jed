@@ -638,14 +638,6 @@ impl Engine {
         }
     }
 
-    /// Enforce the per-session temp-table storage budget (`temp_buffers`, spec/design/temp-tables.md
-    /// §7) — the §13 gate on RETAINED temp bytes. Checked after each temp-writing statement: if the
-    /// session's temp footprint (byte-identical on-disk record bytes, summed over every temp table +
-    /// index) **exceeds** the budget, abort `54P03`. The over-budget write is in `temp_working`, so the
-    /// abort discards it (autocommit) or fails the block (rolled back at ROLLBACK) — nothing commits.
-    /// `temp_buffers = 0` is unlimited; a transaction that did not touch temp cannot have grown it, so
-    /// the check self-gates on `temp_dirty` and is a no-op for ordinary (persistent) statements. The
-    /// WITHIN-statement bound is `max_cost` (a single huge temp write hits the cost ceiling first).
     /// The `MemoryBlockStore` paging context for the session-local temp domain (temp-tables.md §6),
     /// lazily creating the domain's storage identity ([`Storage::new_temp`] — a private in-RAM store +
     /// pinned pool with within-session compaction on) on first use.
@@ -667,8 +659,17 @@ impl Engine {
         }
     }
 
+    /// Enforce the per-session temp-table storage ceiling (`max_temp_storage_bytes`,
+    /// spec/design/temp-tables.md §7) — the §13 gate on RETAINED temp bytes. Checked after each
+    /// temp-writing statement: if the session's temp footprint **exceeds** the ceiling, abort `54P03`.
+    /// The over-budget write is in `temp_working`, so the abort discards it (autocommit) or fails the
+    /// block (rolled back at ROLLBACK) — nothing commits. `0` is unlimited; a transaction that did not
+    /// touch temp cannot have grown it, so the check self-gates on `temp_dirty` and is a no-op for
+    /// ordinary (persistent) statements. The WITHIN-statement bound is `max_cost` (a single huge temp
+    /// write hits the cost ceiling first). Resident and spilled pages count alike (§6): residency never
+    /// moves the abort point.
     pub(crate) fn check_temp_budget(&self) -> Result<()> {
-        let limit = self.session.temp_buffers;
+        let limit = self.session.max_temp_storage_bytes;
         if limit == 0 {
             return Ok(());
         }

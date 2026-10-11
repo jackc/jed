@@ -1043,10 +1043,15 @@ export type SessionOptions = {
   // temp DDL is 42501. Absent ⇒ INHERIT allowDdl's value (back-compat: one gate governs all DDL). The
   // untrusted-scratch pattern is allowDdl=false + allowTempDdl=true — private scratch tables only.
   allowTempDdl?: boolean;
-  // The per-session storage budget for session-local temp tables, in BYTES (spec/design/temp-tables.md
-  // §7); 0 ⇒ unlimited; absent ⇒ the engine default (DEFAULT_TEMP_BUFFERS). An over-budget temp write
-  // aborts 54P03.
+  // The per-session RESIDENT budget for session-local temp tables, in BYTES (spec/design/temp-tables.md
+  // §6); 0 ⇒ never spill; absent ⇒ the engine default (DEFAULT_TEMP_BUFFERS). Past it a host with a
+  // spill sink moves the temp domain to a scratch file with a page cache this size.
   tempBuffers?: number;
+  // The per-session storage CEILING for session-local temp tables, in BYTES (spec/design/temp-tables.md
+  // §7); 0 ⇒ unlimited; absent ⇒ the engine default (DEFAULT_MAX_TEMP_STORAGE_BYTES). Bounds the
+  // RETAINED temp storage neither cost ceiling covers — an over-ceiling temp write aborts 54P03, whether
+  // the domain is resident or spilled.
+  maxTempStorageBytes?: number;
   // The session time zone (spec/design/session.md §6.2, timezones.md §9.4): the zone a timestamptz is
   // decomposed in by date_trunc / EXTRACT / the cross-family casts. Absent ⇒ UTC. Accepts UTC, a fixed
   // ±HH:MM offset, or a named IANA zone a loaded JTZ bundle provides; an invalid value falls back to

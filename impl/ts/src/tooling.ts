@@ -31,6 +31,8 @@ export { create, open, commit, rollback, close } from "./file.ts";
 export { queryMemoryPeak, queryMemoryUnderflows } from "./cost.ts";
 // Recount every file commit's live pages by reachability (spec/design/memory.md §8.7).
 export { verifyLivePages } from "./format.ts";
+// Session-local temp domains spilled to a scratch file (spec/design/temp-tables.md §6).
+export { tempSpills } from "./persist.ts";
 import { query } from "./api.ts";
 export {
   begin,
@@ -101,9 +103,11 @@ export function executeScript(db: Engine, sql: string): ScriptSummary {
   return db.executeScript(sql);
 }
 
-// setSpillDirForTest overrides a Database's host scratch directory for per-core spill tests. The
-// public embedding surface deliberately has no configurable spill-target knob yet; tooling.ts is the
-// white-box test barrel, so reaching the runtime-private core here does not widen lib.ts.
+// setSpillDirForTest overrides a Database's host scratch directory for per-core spill tests and the
+// conformance harness's forced temp-spill mode (an in-memory database otherwise has none — temp-tables.md
+// §6, spill.md §2). Sessions minted afterwards inherit it. The public embedding surface deliberately has
+// no configurable spill-target knob yet; tooling.ts is the white-box test barrel, so reaching the
+// runtime-private core here does not widen lib.ts.
 export function setSpillDirForTest(db: object, dir: string): void {
   const internal = db as { core: { storage: Engine } };
   internal.core.storage.spillSink = new FileSpillSink(dir);

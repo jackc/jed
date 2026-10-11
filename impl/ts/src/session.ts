@@ -9,6 +9,7 @@ import { Snapshot, requireCustomVarName, txStatusOf } from "./snapshot.ts";
 import type { ZoneRef } from "./timezone.ts";
 import {
   DEFAULT_MAX_SQL_LENGTH,
+  DEFAULT_MAX_TEMP_STORAGE_BYTES,
   DEFAULT_TEMP_BUFFERS,
   type Engine,
   distinctRowKey,
@@ -95,9 +96,11 @@ export class SessionState {
   // Whether session-local TEMPORARY-table DDL is permitted (spec/design/temp-tables.md §5); a denied
   // temp DDL is 42501. Resolved at construction from opts.allowTempDdl (defaulting to allowDdl's value).
   allowTempDdl: boolean;
-  // The per-session temp-table storage budget in BYTES (temp-tables.md §7); 0 ⇒ unlimited. An
-  // over-budget temp write aborts 54P03.
+  // The per-session temp-table RESIDENT budget in BYTES (temp-tables.md §6); 0 ⇒ never spill.
   tempBuffers: number;
+  // The per-session temp-table storage CEILING in BYTES (temp-tables.md §7); 0 ⇒ unlimited. An
+  // over-ceiling temp write aborts 54P03.
+  maxTempStorageBytes: number;
   // The session-local TEMPORARY-table catalog + stores (spec/design/temp-tables.md §2): a Snapshot
   // holding only this session's temp tables, their stores, and their (UNIQUE) index stores. NEVER
   // serialized — only Engine.committed is written to the file, so a temp table makes ZERO file
@@ -155,6 +158,7 @@ export class SessionState {
     // value, so a session configured before temp tables existed behaves as before.
     this.allowTempDdl = opts.allowTempDdl ?? this.allowDdl;
     this.tempBuffers = opts.tempBuffers ?? DEFAULT_TEMP_BUFFERS;
+    this.maxTempStorageBytes = opts.maxTempStorageBytes ?? DEFAULT_MAX_TEMP_STORAGE_BYTES;
     this.tempCommitted = new Snapshot();
     this.vars = new Map();
     // Resolve the configured zone once; an invalid value falls back to UTC at construction (the
@@ -193,6 +197,7 @@ export class SessionState {
     frozen.allowDdl = source.allowDdl;
     frozen.allowTempDdl = source.allowTempDdl;
     frozen.tempBuffers = source.tempBuffers;
+    frozen.maxTempStorageBytes = source.maxTempStorageBytes;
     frozen.tempCommitted = tempCommitted;
     frozen.vars = source.vars;
     frozen.timeZone = source.timeZone;
@@ -245,7 +250,7 @@ export class SessionState {
   }
   // pendingWriteBytes is the stored bytes the open transaction's working snapshots (main and attached
   // databases) have staged — its pending writes (memory.md §7). Session-local temp tables are bounded
-  // by tempBuffers instead. Zero with no open transaction.
+  // by maxTempStorageBytes instead. Zero with no open transaction.
   pendingWriteBytes(): number {
     const tx = this.tx;
     if (tx === null) return 0;
@@ -332,10 +337,15 @@ export class SessionState {
   setAllowTempDdl(allow: boolean): void {
     this.allowTempDdl = allow;
   }
-  // setTempBuffers sets the per-session temp-table storage budget in BYTES (temp-tables.md §7); 0 ⇒
-  // unlimited. An over-budget temp write aborts 54P03.
+  // setTempBuffers sets the per-session temp-table resident budget in BYTES (temp-tables.md §6); 0 ⇒
+  // never spill.
   setTempBuffers(bytes: number): void {
     this.tempBuffers = bytes;
+  }
+  // setMaxTempStorageBytes sets the per-session temp-table storage ceiling in BYTES (temp-tables.md §7);
+  // 0 ⇒ unlimited. An over-ceiling temp write aborts 54P03.
+  setMaxTempStorageBytes(bytes: number): void {
+    this.maxTempStorageBytes = bytes;
   }
   // setVar sets a session variable (spec/design/session.md §6.1) — PostgreSQL's GUC model, scoped to
   // the session. Custom variables must be namespaced (a dotted name like myapp.tenant); a non-dotted
@@ -843,7 +853,7 @@ export function* bufferedRows(
 // immutable committed snapshot lives in the core's attached roots under the same key, so a reader pins
 // it lock-free together with every other root. An attachment is file-backed (Slice 2 — storage.path is
 // non-null, a FileBlockStore behind the pager, committed durably via commitDurableAttachment) or
-// in-memory (storage.path is null, a MemoryBlockStore, committed via persistTemp). The storage Engine's
+// in-memory (storage.path is null, a MemoryBlockStore, committed via stageInMemory). The storage Engine's
 // path is the sole source of the file/memory distinction.
 export type LeaseState = "alone" | "shared" | "exclusive" | "poisoned";
 

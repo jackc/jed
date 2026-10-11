@@ -9,6 +9,7 @@
 // one query while the database file is unchanged — not the §8 on-disk record format. Node stdlib I/O
 // only (no dependency — CLAUDE.md §14).
 
+import type { BlockStore } from "./blockstore.ts";
 import { StateCharge } from "./cost.ts";
 import { Decimal } from "./decimal.ts";
 import { jsonbIn, jsonbOut } from "./json.ts";
@@ -36,6 +37,11 @@ export interface SpillSink {
   writeRun(bytes: Uint8Array): SpillRun;
   // Repeatable positional scratch for bounded blocking operators.
   createScratch?(): SpillScratch;
+  // createScratchStore creates the private scratch BlockStore a session-local temp domain spills to
+  // once it outgrows temp_buffers (spec/design/temp-tables.md §6): an empty, never-fsynced file in the
+  // host spill directory, unlinked at creation where the OS allows. The owner MUST close it (JS has no
+  // destructor), which also removes a file the OS would not unlink while open.
+  createScratchStore?(): BlockStore;
 }
 export interface SpillScratch {
   size: number;

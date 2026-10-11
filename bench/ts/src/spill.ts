@@ -4,7 +4,7 @@ import { createDatabase, openDatabase, render } from "../../../impl/ts/src/tooli
 
 const [mode, path, workMem, workload, cacheBytes] = process.argv.slice(2);
 if (!path || !workMem || !workload || !cacheBytes)
-  throw new Error("usage: spill create|open database work_mem sql.tsv cache_bytes");
+  throw new Error("usage: spill create|open|temp database budget sql.tsv cache_bytes");
 const budget = Number(workMem);
 if (!Number.isSafeInteger(budget) || budget < 0) throw new Error("invalid work_mem");
 const cache = Number(cacheBytes);
@@ -14,7 +14,13 @@ const db =
     ? createDatabase({ path, skipFsync: true, locking: "none" })
     : openDatabase(path, { cacheBytes: cache, locking: "none" });
 const session = db.session();
-session.setWorkMem(budget);
+if (mode === "temp") {
+  // Temp-table spill (spec/design/temp-tables.md §6): the budget is the resident temp_buffers.
+  session.setTempBuffers(budget);
+  session.setMaxTempStorageBytes(0);
+} else {
+  session.setWorkMem(budget);
+}
 try {
   for (const line of readFileSync(workload, "utf8").trimEnd().split("\n")) {
     const split = line.indexOf("\t");

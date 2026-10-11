@@ -59,6 +59,14 @@ fn main() -> ExitCode {
         files.retain(|path| path.to_string_lossy().contains(&filter));
         assert!(!files.is_empty(), "JED_CONFORMANCE_FILTER matched no tests");
     }
+    // The forced temp-spill mode walks only the files that create temp tables: giving a memory-mode
+    // database a spill directory also lets blocking operators spill where the corpus pins that an
+    // in-memory database cannot (the 54P05 query-memory records).
+    if forced_temp_buffers().is_some() {
+        files.retain(|path| {
+            std::fs::read_to_string(path).is_ok_and(|text| creates_temp_table(&text))
+        });
+    }
 
     // `--rebaseline` rewrites each `# cost: N` directive in place to the cost this core
     // actually accrues, then exits — the tool for re-baselining the corpus after a
@@ -174,6 +182,14 @@ fn main() -> ExitCode {
     }
 
     println!("\n[{mode}] {passed} passed, {failed} failed, {skipped} skipped");
+    if forced_temp_buffers().is_some() {
+        let spills = jed::tooling::TEMP_SPILLS.load(std::sync::atomic::Ordering::Relaxed);
+        println!("[{mode}] forced temp spill: {spills} temp domain(s) spilled");
+        if spills == 0 && !disk && passed > 0 {
+            eprintln!("JED_CONFORMANCE_TEMP_BUFFERS set but no temp domain spilled");
+            return ExitCode::FAILURE;
+        }
+    }
     if failed == 0 {
         ExitCode::SUCCESS
     } else {
@@ -513,13 +529,13 @@ fn parse_work_mem_directive(rest: &str) -> Option<usize> {
         .ok()
 }
 
-/// Parse a `# temp_buffers: N` directive body (spec/design/temp-tables.md §7): the per-session
-/// temp-table storage budget (bytes) to run the next record under (`0` ⇒ unlimited). Mirrors
-/// `# max_cost:` — per-record, reset after — so a record can set a small budget and assert that an
-/// over-budget temp write traps `54P03`.
-fn parse_temp_buffers_directive(rest: &str) -> Option<usize> {
+/// Parse a `# max_temp_storage_bytes: N` directive body (spec/design/temp-tables.md §7): the
+/// per-session temp-table storage ceiling (bytes) to run the next record under (`0` ⇒ unlimited).
+/// Mirrors `# max_cost:` — per-record, reset after — so a record can set a small ceiling and assert
+/// that an over-ceiling temp write traps `54P03`.
+fn parse_max_temp_storage_directive(rest: &str) -> Option<usize> {
     rest.trim_start()
-        .strip_prefix("temp_buffers:")?
+        .strip_prefix("max_temp_storage_bytes:")?
         .trim()
         .parse()
         .ok()
@@ -635,6 +651,25 @@ fn assert_types(
 
 /// Run all records in one .test file against a fresh database. Returns the first
 /// mismatch as an error string.
+/// The forced temp-spill mode's resident budget (`JED_CONFORMANCE_TEMP_BUFFERS`, bytes): memory-mode
+/// databases get a spill directory and every session this `temp_buffers`, so each temp domain past it
+/// spills to a scratch file (spec/design/temp-tables.md §6). `None` when unset.
+fn forced_temp_buffers() -> Option<usize> {
+    std::env::var("JED_CONFORMANCE_TEMP_BUFFERS")
+        .ok()
+        .map(|bytes| {
+            bytes
+                .parse()
+                .expect("JED_CONFORMANCE_TEMP_BUFFERS must be nonnegative bytes")
+        })
+}
+
+/// Whether a corpus file creates a session-local temp table (the forced temp-spill mode's file set).
+fn creates_temp_table(text: &str) -> bool {
+    let upper = text.to_ascii_uppercase();
+    upper.contains("CREATE TEMP ") || upper.contains("CREATE TEMPORARY ")
+}
+
 fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
     // A Drop guard removes the disk-mode temp image on every exit path (memory mode: no temp file),
     // together with the `<path>.lock/` coordination bundle opening it created beside it
@@ -667,7 +702,15 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
             ..Default::default()
         })
         .map_err(|e| format!("disk mode: create {}: {}", p.display(), e.message))?,
-        None => Database::create(CreateOptions::default()).unwrap(),
+        None => {
+            let db = Database::create(CreateOptions::default()).unwrap();
+            // Forced temp spill (`JED_CONFORMANCE_TEMP_BUFFERS`, temp-tables.md §6): an in-memory
+            // database has no spill target, so give it one — temp domains then spill to scratch files.
+            if forced_temp_buffers().is_some() {
+                jed::tooling::set_spill_dir(&db, std::env::temp_dir());
+            }
+            db
+        }
     };
     // `on_temp` tracks whether db/sess still point at the reopenable temp-file handle (a `# fixture:`
     // swap flips it off — but fixtures are `# skip: disk`, so that never coexists with disk mode).
@@ -712,7 +755,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                 .expect("JED_CONFORMANCE_QUERY_MEMORY must be integer bytes")
         })
         .unwrap_or(0);
-    let mut pending_temp_buffers: Option<usize> = None;
+    let mut pending_max_temp_storage: Option<usize> = None;
     let mut pending_work_mem: Option<usize> = None;
     let mut pending_vars: Vec<(String, String)> = Vec::new();
     let mut pending_timezone: Option<String> = None;
@@ -806,8 +849,8 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                 .and_then(|s| s.trim().parse::<i64>().ok())
             {
                 pending_query_memory = Some(n);
-            } else if let Some(n) = parse_temp_buffers_directive(rest) {
-                pending_temp_buffers = Some(n);
+            } else if let Some(n) = parse_max_temp_storage_directive(rest) {
+                pending_max_temp_storage = Some(n);
             } else if let Some(n) = parse_work_mem_directive(rest) {
                 pending_work_mem = Some(n);
             } else if let Some(vars) = parse_set_directive(rest) {
@@ -860,6 +903,9 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                     .expect("JED_CONFORMANCE_WORK_MEM must be nonnegative bytes")
             })
         }));
+        // The temp-table resident budget: the forced-spill override (`JED_CONFORMANCE_TEMP_BUFFERS`),
+        // otherwise the default. Residency only — results, cost, and 54P03 never depend on it.
+        sess.set_temp_buffers(forced_temp_buffers().unwrap_or(jed::DEFAULT_TEMP_BUFFERS));
         let expected_cost = pending_cost.take();
         let expected_names = pending_names.take();
         let expected_types = pending_types.take();
@@ -907,8 +953,6 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
         if let Some(a) = pending_allow_temp_ddl.take() {
             sess.set_allow_temp_ddl(a);
         }
-        // Apply the per-record temp-storage budget (temp-tables.md §7); absent ⇒ unlimited (`0`), so a
-        // `# temp_buffers:` directive never leaks past its record. Mirrors `# max_cost:`.
         sess.set_max_scalar_bytes(pending_scalar_bytes.take().unwrap_or(0));
         // `# max_query_memory_bytes:` (memory.md §2) decorates only its record; absent ⇒ unlimited,
         // or the whole-corpus accounting budget of `JED_CONFORMANCE_QUERY_MEMORY`.
@@ -926,7 +970,9 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
             jed::tooling::QUERY_MEMORY_UNDERFLOWS.load(std::sync::atomic::Ordering::Relaxed);
         jed::tooling::QUERY_MEMORY_PEAK.store(0, std::sync::atomic::Ordering::Relaxed);
         record_ordinal += 1;
-        sess.set_temp_buffers(pending_temp_buffers.take().unwrap_or(0));
+        // Apply the per-record temp-storage ceiling (temp-tables.md §7); absent ⇒ unlimited (`0`), so a
+        // `# max_temp_storage_bytes:` directive never leaks past its record. Mirrors `# max_cost:`.
+        sess.set_max_temp_storage_bytes(pending_max_temp_storage.take().unwrap_or(0));
         // Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
         // pending `# set:` pair, so a directive decorates only its record and never leaks forward.
         sess.reset_vars();

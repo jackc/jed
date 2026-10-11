@@ -522,5 +522,6 @@ Sequenced to put the durability-risky part last:
 non-goal, not a deferral.)
 - **Cross-database FKs / shared catalog types** (§8) — gated on the self-describing question (§7); a
   genuine design problem, not a quick lift.
-- **`temp` spill-to-disk as a `BlockStore` swap** (temp-tables.md slice 3) — now a special case of a
-  memory attachment swapping its backing to a file.
+- **In-memory attachment spill-to-disk** — temp spill has landed as a `BlockStore` swap
+  (temp-tables.md slice 3, `migrate_store` into a scratch file); an in-memory attachment could reuse
+  the same swap, bounded by its own resident budget.

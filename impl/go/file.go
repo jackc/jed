@@ -256,6 +256,7 @@ func (db *engine) Rollback() error {
 // committed work; durability is never hidden in a destructor. Idempotent.
 func (db *engine) Close() error {
 	_, _ = db.rollbackTx()
+	db.releaseTempDomain()
 	db.path = ""
 	if db.paging != nil {
 		_ = db.paging.close() // drop the open file (close it)

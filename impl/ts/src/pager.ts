@@ -249,6 +249,29 @@ export class Pager {
     return old;
   }
 
+  // migrateStore moves the store's bytes into store and adopts it, closing the old backing — a
+  // session-local temp domain spilling from its in-RAM store to a scratch file (spec/design/
+  // temp-tables.md §6). The page layout is unchanged byte for byte, so every page id stays valid.
+  // Copies in bounded chunks; on an error the old store stays in place, untouched, and the new one is
+  // closed (JS has no destructor to release it later).
+  migrateStore(store: BlockStore): void {
+    const CHUNK = 1 << 20;
+    try {
+      const size = this.store.size();
+      for (let offset = 0; offset < size; ) {
+        const len = Math.min(size - offset, CHUNK);
+        store.writeAt(offset, this.store.readAt(offset, len));
+        offset += len;
+      }
+    } catch (e) {
+      store.close();
+      throw e;
+    }
+    const old = this.store;
+    this.store = store;
+    old.close();
+  }
+
   // skipsSync reports whether the backing skips its durability barrier (fsync=off).
   skipsSync(): boolean {
     return this.store.skipsSync?.() ?? false;

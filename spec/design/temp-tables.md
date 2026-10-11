@@ -2,8 +2,8 @@
 
 > **Session-local** temporary tables that make **zero writes to the database file** — they live
 > entirely *outside* the serialized snapshot, so they cause no catalog write, no page write, and no
-> txid churn on the main file. Memory-only to start, with a designed-in (deferred) spill-to-disk seam;
-> bounded by a **deterministic storage budget** so they preserve the untrusted-SQL safety guarantee
+> txid churn on the main file. Resident in RAM until they outgrow `temp_buffers`, then spilled to a
+> private scratch file (§6); bounded by a **deterministic storage ceiling** so they preserve the untrusted-SQL safety guarantee
 > (CLAUDE.md §13). The **grammar is authoritative** for the surface
 > ([../grammar/grammar.ebnf](../grammar/grammar.ebnf) — `create_table`, `table_scope`); the **error
 > registry** ([../errors/registry.toml](../errors/registry.toml)) owns the codes (one new code —
@@ -12,11 +12,13 @@
 >
 > **Status: landed (all three cores); session-local temp rides a MemoryBlockStore.** Session-local temp
 > tables — `CREATE [TEMP|TEMPORARY] TABLE` + `DROP`, the per-session temp store, the namespace
-> preclude-overlaps check (§3), the `allow_temp_ddl` capability split (§5), `temp_buffers` + `54P03`
-> (§7), constraints / indexes / `serial` / composite columns (§8), cost (§9) — are implemented
+> preclude-overlaps check (§3), the `allow_temp_ddl` capability split (§5), `max_temp_storage_bytes` +
+> `54P03` (§7), constraints / indexes / `serial` / composite columns (§8), cost (§9) — are implemented
 > byte-identically in Rust, Go, and TS. The session-local domain rides a per-domain in-RAM
-> `MemoryBlockStore` + pager with within-session free-list compaction, and its `54P03` budget is the
-> domain's committed **page** bytes (§6/§7). This doc was written first, spec-first (CLAUDE.md §11).
+> `MemoryBlockStore` + pager with within-session free-list compaction, and its `54P03` ceiling is the
+> domain's committed **page** bytes (§6/§7). **Slice 3 (spill-to-disk) has landed:** past
+> `temp_buffers` a file host migrates the domain to a scratch file in its spill directory and bounds
+> the domain's page cache by `temp_buffers` (§6). This doc was written first, spec-first (CLAUDE.md §11).
 >
 > **A database-wide `SHARED` temp kind was designed and briefly shipped (former slice 2), then REMOVED**
 > — Slice 0 of the attached-databases plan (2026-07-03). Its `Database`-scoped, *in-process* sharing
@@ -25,8 +27,8 @@
 > The `SHARED` keyword, `allow_shared_temp_ddl`, `shared_temp_mem`, the `Database`-level temp snapshot,
 > and the two-root commit are gone; the commit publishes a single durable root again. This doc is now
 > **session-local only** — the shared kind survives only as a recorded, removed divergence (§12) and in
-> the slicing history (§13). **Slice 3 (spill-to-disk, §6) remains deferred** — the flip put temp on its
-> seam, so spill is now a `BlockStore` swap.
+> the slicing history (§13). **Slice 3 (spill-to-disk, §6) has landed** — the flip put temp on its
+> seam, so spill was a `BlockStore` swap plus a bounded pool.
 
 Temporary tables are jed's first relations whose lifetime is shorter than the database file's and
 whose data is **deliberately never durable**. They diverge from PostgreSQL in several recorded ways
@@ -186,25 +188,28 @@ off too until the host deliberately opts in) and relaxes the documented "one boo
 narrowing (session.md §5.3) only for temp tables. The gate is configured per record by the directives
 `# allow_ddl:` / `# allow_temp_ddl:` (§13).
 
-## 6. Storage model — a per-domain in-RAM MemoryBlockStore, spill-to-disk as a designed-in seam
+## 6. Storage model — a per-domain MemoryBlockStore that spills to a scratch file
 
 **Session-local temp rides a per-domain in-RAM `MemoryBlockStore` + pager** — the *same* storage path
 as an in-memory database (bplus-reshape.md B3), not a separate fully-resident decoded B-tree. The
 temp-blockstore slice retired the original slice-1 "`paging: None`, `Child::Resident`" mode: the
 session-local temp domain is now a private `MemoryBlockStore` seeded with the empty from-scratch image,
 read/written through the *same* pager + packed-leaf path (`newTempStorage` / `Storage::new_temp`), with
-a **pinned, unbounded pool** (a temp domain is resident by definition, §5). A temp `TableStore`
-`attach_paging`s that domain's `SharedPaging`, so its leaves demote to `OnDisk` after each commit and
-fault back through the temp pool — the **compact packed footprint** (resident memory ≈ `page_count ×
-page_size`, not the inflated `Value` tree), which is what makes the §7 byte budget honest. A temp
-commit runs `persist_temp`: the same incremental copy-on-write serialize as a file/in-memory commit,
-but **no meta slot and no `sync`** (a temp store is never reopened; its memory host has no durability
-barrier), so it makes **zero main-file writes** (D1) by construction.
+a **pinned, unbounded pool** while it is resident. A temp `TableStore` `attach_paging`s that domain's
+`SharedPaging`, so its leaves demote to `OnDisk` after each commit and fault back through the temp
+pool — the **compact packed footprint** (resident memory ≈ `page_count × page_size`, not the inflated
+`Value` tree). A temp commit **stages** its dirty pages (`stage_temp`): the same incremental
+copy-on-write serialize as a file/in-memory commit, but **no meta slot and no `sync`** (a temp store is
+never reopened; it has no durability barrier), so it makes **zero main-file writes** (D1) by
+construction. It stages **before** the main persist and adopts its page accounting only after it (the
+in-memory-attachment recipe, attached-databases.md §5): staged pages occupy only free-list slots and
+pages past the high-water, so a failure anywhere in between — a scratch-file I/O error, a failed main
+persist — leaves the temp store matching its still-committed root and commits nothing.
 
 **Within-session compaction** is the prerequisite the flip needed. A `MemoryBlockStore` commits
 copy-on-write, so every commit orphans its root→leaf path + the rewritten catalog; page reclamation
 was previously *reconstruct-on-open only*, and a temp store is **never reopened** — so without
-compaction it would leak a page per commit, breaking the `temp_buffers` budget the §13 untrusted-SQL
+compaction it would leak a page per commit, breaking the storage ceiling the §13 untrusted-SQL
 guarantee rests on. A reclaim domain (`reclaim_within_session`, set only by temp domains) instead
 rebuilds its free-list from the **live reachable set** at commit (`maybe_compact`, reusing the same
 reachability walk the open-time free-list reconstruction runs — the catalog chain + the in-memory tree
@@ -218,19 +223,42 @@ observables — rows, cost, and the `54P03` abort point — stay cross-core-iden
 the mechanism tractable versus the still-deferred general within-file reclamation. The main/file domain
 keeps reconstruct-on-open only (`reclaim_within_session` false) and can opt in later.
 
-**Spill-to-disk is the deferred follow-on, and the flip already put temp on the right seam.** Temp is
-now paged against a `MemoryBlockStore` through the pager, so spill is no longer a "flip from resident to
-paged" reshape — it is a **`BlockStore` swap plus a bounded pool**: replace the in-RAM
-`MemoryBlockStore` with a host-supplied temp-file `BlockStore` (storage.md §2, hosts.md §2), entirely
-separate from the main file's `BlockStore` (so the zero-main-file-writes invariant is preserved by
-construction), and give the temp pool an eviction bound instead of the pinned/unbounded one it runs
-today. The temp `BlockStore` is *not* the
-external-merge-sort spill path (spill.rs), which writes sequential run files for `ORDER BY`: a temp
-table needs random access by key (point lookups, index scans, ongoing mutation), so it reuses the
-**pager + buffer pool + B-tree** machinery (the right tool), while borrowing spill.rs's *idea* of a
-host temp directory and a per-core internal codec. Two budgets then apply: a **memory** ceiling
-(resident bytes, after which it spills) and a **disk** ceiling (temp-file bytes, after which it
-errors `54P03`). Both deterministic (§7), both preserving §13.
+**Spill-to-disk (slice 3) — a `BlockStore` swap plus a bounded pool.** When a temp commit leaves the
+domain's committed page bytes (`page_count × page_size`, measured on the staged commit — not one
+behind) **above `temp_buffers`**, and the host has a **spill directory**, the domain **spills**: a
+private scratch file is created in that directory (exclusive, mode `0600` — the external-sort spill
+file's creation rule, spill.md §6), the in-RAM store's bytes are copied into it in bounded chunks, and
+the pager adopts it in place of the `MemoryBlockStore` (`migrate_store`). The page layout is
+byte-for-byte unchanged, so every page id, every decoded pool entry, and every `OnDisk` reference
+stays valid across the swap — nothing above the pager notices. From then on the domain's leaf pool is
+**bounded** to `max(1, temp_buffers / page_size)` leaves (CLOCK eviction, pager.md §3) instead of
+pinned, re-applied at each temp commit so a later `temp_buffers` change takes effect; the interior
+skeleton stays resident, as in a demand-paged file (pager.md §2). A domain spills **once** and stays
+spilled until the session closes (dropping a table does not migrate it back). The trigger is evaluated
+only at commit, so a single large statement first stages in RAM and then spills — its working set was
+resident anyway (it is the transaction's pending write set, bounded by `max_query_memory_bytes`,
+memory.md §7).
+
+- **The scratch file is internal and out-of-contract** (§10): never the §8 file format, never read by
+  another core or host, never fsynced (its `sync` and grow barrier are no-ops — a crash loses only
+  session-scoped data that was never durable). It is **unlinked immediately after creation** where
+  the OS allows unlinking an open file (Unix), so a crash leaves nothing behind, and otherwise removed
+  when the session closes (Windows). It is entirely separate from the main database file's
+  `BlockStore`, so the zero-main-file-writes invariant (D1) holds by construction.
+- **Where the spill directory comes from** is the host's, exactly as for the external sort (spill.md
+  §2): a native file host uses the OS temp directory (never the database's own directory, so a
+  read-only database directory never receives scratch files). An **in-memory database, an OPFS
+  (browser) database, and a WASI host have no spill target**, so their temp domains stay resident past
+  `temp_buffers` — bounded then only by the `54P03` ceiling (§7), the same "no spill target keeps it
+  resident" rule the external sort follows.
+- **Residency is invisible to the contract.** Spilling changes *where* pages live and when they are
+  resident, never what a query observes: rows, cost (`page_read` is logical, §9), and the `54P03`
+  point (§7, measured on the logical page count whether resident or spilled) are identical with or
+  without a spill. Per-core white-box tests pin this neutrality (`temp_spill` tests).
+- **It is not the external-merge-sort spill path** (spill.md), which writes sequential run files: a
+  temp table needs random access by key (point lookups, index scans, ongoing mutation), so it reuses
+  the **pager + buffer pool + B-tree** machinery, borrowing only spill.md's host scratch directory and
+  creation rule.
 
 ## 7. Bounds — the deterministic storage budget (the §13 gate temp tables need)
 
@@ -242,13 +270,30 @@ held between cheap statements** — an adversary on a generously-budgeted sessio
 cost. So temp tables add a **dedicated storage budget**, a new §13 resource gate independent of the
 cost meter (the same way the depth gate is independent of the cost gate):
 
-- **`temp_buffers`** — a per-session byte budget for session-local temp storage. A **handle/session
-  setting** in the family of `work_mem` / `max_cost` / `cache_bytes` (api.md §8): not stored in the
-  file, never changes the contents, host-settable on an open handle. `0` means unlimited (a trusted
-  host). Default modest (32 MiB).
+Two per-session settings govern temp storage, split by what they bound (the PostgreSQL shape: PG's
+`temp_buffers` is the per-session temp *buffer* memory, and temp data beyond it lives in files):
+
+- **`max_temp_storage_bytes`** — the **storage ceiling**, the §13 gate: the temp domain's committed
+  page bytes may not exceed it, whether resident or spilled; an over-ceiling temp write aborts
+  **`54P03`**. In-contract. `0` means unlimited (a trusted host). Default **1 GiB**. Named for the
+  `max_storage_bytes` / `max_query_memory_bytes` family it belongs to (the same `page_count ×
+  page_size` measure `max_storage_bytes` applies to a database, memory.md §8) — not PG's
+  `temp_file_limit`, which counts only spilled file bytes and so would make the abort point depend on
+  out-of-contract residency.
+- **`temp_buffers`** — the **resident budget**: past it a host with a spill directory spills the
+  domain to a scratch file and bounds its page cache by it (§6). Out-of-contract (residency only — it
+  never changes results, cost, or the `54P03` point). `0` means never spill. Default **32 MiB**.
+
+Both are **handle/session settings** in the family of `work_mem` / `max_cost` / `cache_bytes` (api.md
+§8): not stored in the file, never change the contents, host-settable on an open handle. Before slice 3
+`temp_buffers` *was* the `54P03` ceiling (there was nothing to spill to); slice 3 moved that role to
+`max_temp_storage_bytes` and gave `temp_buffers` PostgreSQL's meaning. A host on a no-spill target (an
+in-memory, OPFS, or WASI database) holds its whole temp domain in RAM, so its RAM bound is
+`max_temp_storage_bytes` — an untrusted-SQL host there sets it as tight as it formerly set
+`temp_buffers`.
 
 **Determinism is the load-bearing requirement** (CLAUDE.md §8/§10, §13). For the **session-local**
-domain (which rides a `MemoryBlockStore` + pager since the temp-blockstore slice, §6) the budget is the
+domain (which rides a `MemoryBlockStore` + pager since the temp-blockstore slice, §6) the ceiling is the
 domain's **committed page bytes** — `page_count × page_size` off the temp domain's one pager. This is a
 deliberate **re-spec of the basis** from the original on-disk-record-bytes measure, for two reasons.
 (a) **Honesty about real RAM:** once temp is paged, its leaves demote to `OnDisk`, so a record-byte walk
@@ -263,21 +308,21 @@ measure uses the **logical** `page_count` (not the physical buffer length, which
 geometric-preallocation slack that is explicitly *not* a byte contract), and it reflects the state **one
 commit behind** (the check runs before the statement's own commit), so a domain already over budget
 aborts the *next* temp write — the "already over budget ⇒ further writes abort" contract. The page basis
-is deliberately **not** the `work_mem` spill estimator: spill is out-of-contract (per-core, §10),
-whereas `54P03` is **in**-contract. **The check is per-statement:**
+is deliberately **not** the `work_mem` spill estimator nor the spill state: spill is out-of-contract
+(per-core, §10), whereas `54P03` is **in**-contract. **The check is per-statement:**
 after a statement that writes a temp table the domain footprint is measured and the statement aborts
-**`54P03 temp_storage_limit_exceeded`** if it *exceeds* `temp_buffers` (`0` ⇒ unlimited); the
+**`54P03 temp_storage_limit_exceeded`** if it *exceeds* `max_temp_storage_bytes` (`0` ⇒ unlimited); the
 over-budget write is staged in `temp_working`, so the abort rolls it back (nothing commits). The
 **within-statement** bound is `max_cost` — a single huge temp write hits the cost ceiling first — so
 the two gates compose to bound temp resources both per-statement and across statements. Whether a temp
-table is resident or (later) spilled must **never** change query results or the deterministic cost —
-only the budget *error* (and, later, spill *timing*) is observable, and the error is itself
-deterministic and part of the cross-core contract.
+table is resident or spilled **never** changes query results, the deterministic cost, or the abort
+point — only the ceiling *error* is observable, and it is itself deterministic and part of the
+cross-core contract.
 
 This keeps the untrusted-SQL story whole: a host serves untrusted SQL through a session that is
 `{SELECT}`-or-narrow-privileged, `max_cost`/`lifetime_max_cost`-capped, `max_sql_length`/depth-bounded
-**and now `temp_buffers`-bounded** — so a scratch temp table can be offered safely, its memory (and
-later disk) provably bounded.
+**and now `max_temp_storage_bytes`-bounded** — so a scratch temp table can be offered safely, its
+storage provably bounded (and, on a host with a spill target, its RAM bounded by `temp_buffers`).
 
 ## 8. Constraints, indexes, sequences on temp tables
 
@@ -349,10 +394,10 @@ bytes), the two firing independently, mirroring the depth-vs-cost independence i
   rows, multiset, ordering under `ORDER BY`, types, names, errors, and **cost** — and the **`54P03`
   abort point** given a fixed budget. These hold by construction (§2: reused codec/comparator;
   §7: deterministic logical-byte budget).
-- **Out-of-contract (deliberately per-core, like spill.rs run files):** the eventual on-disk **temp
-  spill file** (§6). It is internal scratch, never the §8 file format, never read by another core or
-  host, deleted on close — so it carries no byte-identity obligation. This is the same exemption
-  external-merge-sort runs already enjoy.
+- **Out-of-contract (deliberately per-core, like spill.rs run files):** the on-disk **temp scratch
+  file** (§6) and *when* a domain spills. The file is internal scratch, never the §8 file format, never
+  read by another core or host, unlinked at creation or deleted on close — so it carries no
+  byte-identity obligation. This is the same exemption external-merge-sort runs already enjoy.
 
 ## 11. Errors
 
@@ -362,7 +407,8 @@ bytes), the two firing independently, mirroring the depth-vs-cost independence i
 | `42P01` *(reuse)* | `DROP`/reference of a temp name that resolves to nothing (§3). |
 | `42501` *(reuse)* | temp DDL on a session without `allow_ddl` (§5). |
 | `0A000` *(reuse)* | deferred temp surface — `ON COMMIT DELETE ROWS`/`DROP`, FK touching a temp table (§1, §8). |
-| **`54P03`** *(new)* | `temp_storage_limit_exceeded` — a temp store exceeded `temp_buffers`; later, the temp-spill disk ceiling (§7). |
+| **`54P03`** *(new)* | `temp_storage_limit_exceeded` — the temp domain's page bytes (resident or spilled) exceeded `max_temp_storage_bytes` (§7). |
+| `58030` *(reuse)* | a scratch-file I/O failure while spilling or writing a spilled temp domain (§6); the transaction commits nothing. |
 
 **`54P03`** joins the §13 untrusted-query safety gates in class **54** (`program limit exceeded`),
 the sibling of `54P01` (per-statement `max_cost`) and `54P02` (session `lifetime_max_cost`). It is a
@@ -380,8 +426,10 @@ The code lands in [../errors/registry.toml](../errors/registry.toml) with slice 
 - **D2 — preclude overlaps, no shadowing.** PG shadows a permanent table via an implicit `pg_temp`
   first in `search_path`; jed rejects the overlap at `CREATE` (`42P07`), with a deterministic
   session-local-wins tie-break for the one unpreventable cross-session race (§3).
-- **D4 — deterministic storage budget + `54P03`.** PG bounds temp storage only via OS limits
-  (nondeterministic); jed adds a deterministic, host-configured byte budget (§7).
+- **D4 — deterministic storage ceiling + `54P03`.** PG bounds temp storage only via OS limits and
+  `temp_file_limit` over spilled file bytes (residency-dependent); jed adds a deterministic,
+  host-configured ceiling over all temp pages, resident or spilled (§7). `temp_buffers` keeps PG's
+  meaning (resident temp memory).
 - **D6 — `ON COMMIT PRESERVE ROWS` only (this slice).** `DELETE ROWS` / `DROP` are deferred `0A000`
   (§1). Largely moot until cross-statement transactions are common (autocommit makes `ON COMMIT`
   semantics rarely observable).
@@ -399,7 +447,7 @@ and memory-only per the design decision:
 
 - **Slice 1 — session-local temp tables, memory-only (landed).** `CREATE [TEMP|TEMPORARY] TABLE` + `DROP`, the
   per-`Session` temp store, the namespace preclude-overlaps check (§3), the **`allow_temp_ddl`**
-  capability split (§5), `temp_buffers` + `54P03`, constraints/indexes/`serial` (§8), cost (§9),
+  capability split (§5), the storage budget + `54P03` (then named `temp_buffers`), constraints/indexes/`serial` (§8), cost (§9),
   dropped at session close. The grammar production (`table_scope` minus `SHARED`), the `54P03`
   registry entry, `allow_temp_ddl`, and `temp_buffers` land here. Driven by a new `ddl.temp_table`
   conformance capability; per-core unit tests for what the corpus can't reach (the §13 budget abort
@@ -420,9 +468,14 @@ and memory-only per the design decision:
   commit are gone; the commit publishes a single durable file root again. The capability is re-provided,
   if needed, by a `Database`-scoped in-memory **attachment** ([attached-databases.md](attached-databases.md)
   §6, of which this is "Slice 0"). No `format_version` change (shared temp was never serialized).
-- **Slice 3 — spill-to-disk (deferred).** With temp already paged (the temp-blockstore slice), spill is
-  the temp `BlockStore` swap + a bounded temp pool (§6), the memory→disk budget split, the disk ceiling.
-  Out-of-contract spill file (§10).
+- **Slice 3 — spill-to-disk (landed).** With temp already paged (the temp-blockstore slice), spill is
+  the temp `BlockStore` swap (`migrate_store` into an unlinked scratch file in the host spill
+  directory) + a bounded temp pool (§6), and the budget split: `temp_buffers` becomes the resident
+  budget, the new `max_temp_storage_bytes` the in-contract `54P03` ceiling (§7; the corpus directive
+  `# temp_buffers:` became `# max_temp_storage_bytes:`). Temp commits now stage before the main persist
+  and adopt after it. Out-of-contract scratch file (§10); per-core white-box tests pin the
+  results/cost/`54P03` neutrality of spilling (the corpus runs in-memory databases, which have no spill
+  target). No `format_version` change.
 
 ## 14. Deferred / follow-ons (none foreclosed)
 
@@ -432,6 +485,6 @@ and memory-only per the design decision:
 - `ON COMMIT DELETE ROWS` / `ON COMMIT DROP` (§1, D6).
 - `IF NOT EXISTS`, `CREATE TEMP TABLE … AS SELECT` (§1).
 - `FOREIGN KEY` involving temp tables (§8) — start with FKs among same-kind temp tables.
-- Spill-to-disk (Slice 3, §6) — the only deferred *storage* piece; the seam is already open
-  (CLAUDE.md §9).
+- A host-configurable spill directory (shared with the external sort — spill.md), so a WASI or OPFS
+  host could offer a temp spill target; and migrating a shrunken spilled domain back into RAM.
 - Temporary **views** / a session-local relation namespace object beyond tables.

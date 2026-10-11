@@ -71,3 +71,18 @@ test("bufferpool: capacity one evicts every time", () => {
   assert.equal(loads, 3);
   assert.equal(pool.resident(), 1);
 });
+
+test("bufferpool: setCapacity evicts down and then bounds inserts", () => {
+  const pool = new BufferPool(Number.MAX_SAFE_INTEGER);
+  for (let p = 0; p < 10; p++) pool.getOrLoad(p, () => leaf(p));
+  assert.equal(pool.resident(), 10);
+  pool.setCapacity(3);
+  assert.equal(pool.capacity, 3);
+  assert.equal(pool.resident(), 3);
+  for (let p = 10; p < 20; p++) {
+    pool.getOrLoad(p, () => leaf(p));
+    assert.ok(pool.resident() <= 3, `resident ${pool.resident()} exceeds capacity`);
+  }
+  pool.setCapacity(0); // clamped to one
+  assert.equal(pool.resident(), 1);
+});

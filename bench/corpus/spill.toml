@@ -10,3 +10,16 @@ hash_join = "SELECT a.k, b.s FROM wide a JOIN wide b ON a.k = b.k ORDER BY a.k"
 aggregate = "SELECT s, count(*), sum(v) FROM wide GROUP BY s ORDER BY s"
 distinct = "SELECT DISTINCT s FROM wide ORDER BY s"
 ordered_set = "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY s) FROM wide"
+
+# Session-local temp-table spill (spec/design/temp-tables.md §6): each worker process fills a temp
+# table from `wide` in autocommit batches, then queries it, once fully resident (temp_buffers = 0) and
+# once past a small resident budget that spills the temp domain to a scratch file.
+[temp]
+temp_buffers = 1048576
+batch_rows = 1024
+
+[temp.queries]
+temp_scan = "SELECT count(*), sum(v) FROM scratch"
+temp_point = "SELECT s FROM scratch WHERE id = 12345"
+temp_ordered = "SELECT id, v FROM scratch ORDER BY id DESC LIMIT 100"
+temp_group = "SELECT v, count(*) FROM scratch GROUP BY v ORDER BY v"

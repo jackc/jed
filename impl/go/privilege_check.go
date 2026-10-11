@@ -360,15 +360,16 @@ func (db *engine) checkPendingWrites(cost int64) error {
 	return newError(QueryMemoryLimitExceeded, fmt.Sprintf("query memory exceeded the limit of %d bytes", limit))
 }
 
-// checkTempBudget enforces the per-session temp-table storage budget (tempBuffers, spec/design/
-// temp-tables.md §7) — the §13 gate on RETAINED temp bytes. Checked after each temp-writing statement:
-// if the session's temp footprint (byte-identical on-disk record bytes, summed over every temp table +
-// index) EXCEEDS the budget, abort 54P03. The over-budget write is in tempWorking, so the abort
-// discards it (autocommit) or fails the block (rolled back at ROLLBACK) — nothing commits. tempBuffers
-// 0 ⇒ unlimited; a transaction that did not touch temp cannot have grown it, so the check self-gates on
-// tempDirty and is a no-op for ordinary (persistent) statements. The WITHIN-statement bound is maxCost.
+// checkTempBudget enforces the per-session temp-table storage ceiling (maxTempStorageBytes,
+// spec/design/temp-tables.md §7) — the §13 gate on RETAINED temp bytes. Checked after each
+// temp-writing statement: if the session's temp footprint EXCEEDS the ceiling, abort 54P03. The
+// over-ceiling write is in tempWorking, so the abort discards it (autocommit) or fails the block
+// (rolled back at ROLLBACK) — nothing commits. 0 ⇒ unlimited; a transaction that did not touch temp
+// cannot have grown it, so the check self-gates on tempDirty and is a no-op for ordinary (persistent)
+// statements. The WITHIN-statement bound is maxCost. Resident and spilled pages count alike (§6):
+// residency never moves the abort point.
 func (db *engine) checkTempBudget() error {
-	limit := db.session.tempBuffers
+	limit := db.session.maxTempStorageBytes
 	if limit == 0 {
 		return nil
 	}

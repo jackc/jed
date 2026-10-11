@@ -91,8 +91,8 @@ pub use decimal::Decimal;
 pub use ergonomic::{FromValue, Params, Row, ToValue};
 pub use error::{EngineError, Result, SqlState};
 pub use executor::{
-    CollationInfo, DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, ScriptSummary, SessionOptions,
-    TxStatus,
+    CollationInfo, DEFAULT_MAX_SQL_LENGTH, DEFAULT_MAX_TEMP_STORAGE_BYTES, DEFAULT_PAGE_SIZE,
+    DEFAULT_TEMP_BUFFERS, ScriptSummary, SessionOptions, TxStatus,
 };
 // Host extensibility (spec/design/extensibility.md §4.2) — the host registers scalar functions into
 // an `ExtensionRegistry` and hands it to `create`/`open` via `CreateOptions`/`OpenOptions`.
@@ -134,6 +134,15 @@ pub mod tooling {
     pub use crate::cost::{QUERY_MEMORY_PEAK, QUERY_MEMORY_UNDERFLOWS};
     /// Recount every file commit's live pages by reachability (spec/design/memory.md §8.7).
     pub use crate::format::VERIFY_LIVE_PAGES;
+    /// Session-local temp domains spilled to a scratch file (spec/design/temp-tables.md §6).
+    pub use crate::shared::TEMP_SPILLS;
+
+    /// Give `db` (and the sessions minted from it afterwards) a spill directory — the conformance
+    /// harness's forced temp-spill mode runs in-memory databases, which otherwise have none
+    /// (spec/design/temp-tables.md §6, spill.md §2).
+    pub fn set_spill_dir(db: &crate::Database, dir: std::path::PathBuf) {
+        db.set_spill_dir_for_test(dir);
+    }
     pub use crate::types::{ScalarType, Type};
 
     pub mod collation {
@@ -845,10 +854,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // network, process, environment) or adds nondeterminism outside the entropy seam; escape-hatch
     // calls are 42883 and escape-hatch statements 42601 (CLAUDE.md §13; functions.md §13).
     "resource.pure_builtins",
-    // Temp-table storage budget — `temp_buffers` bounds a session's RETAINED temporary-table bytes
-    // (the hazard no cost ceiling covers); an over-budget temp write aborts 54P03. Measured in
-    // byte-identical on-disk record bytes, checked per-statement, so the abort is cross-core-identical.
-    // The `# temp_buffers:` directive sets the per-record budget (spec/design/temp-tables.md §7).
+    // Temp-table storage ceiling — `max_temp_storage_bytes` bounds a session's RETAINED temporary-table
+    // bytes (the hazard no cost ceiling covers); an over-ceiling temp write aborts 54P03. Measured in
+    // the temp domain's committed page bytes, checked per-statement, so the abort is cross-core-identical.
+    // The `# max_temp_storage_bytes:` directive sets the per-record ceiling (spec/design/temp-tables.md §7).
     "resource.temp_budget",
     // Phase 5 — explicit transactions: BEGIN/COMMIT/ROLLBACK, READ ONLY/READ WRITE access modes,
     // failed-block poisoning (spec/design/transactions.md §4, grammar.md §27).

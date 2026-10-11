@@ -171,6 +171,19 @@ impl<T> BufferPool<T> {
             .capacity
     }
 
+    /// Re-bound the pool to `capacity` pages (clamped to ≥ 1), evicting under CLOCK until the resident
+    /// set fits — a spilled temp domain's pool tightens from pinned to `temp_buffers`
+    /// (spec/design/temp-tables.md §6).
+    pub(crate) fn set_capacity(&self, capacity: usize) {
+        let mut state = self.state.lock().expect("buffer pool mutex poisoned");
+        state.capacity = capacity.max(1);
+        while state.slots.len() > state.capacity {
+            let victim = state.evict_slot();
+            let page = state.slots[victim].page_id;
+            state.invalidate(page);
+        }
+    }
+
     /// The number of pages currently resident — the bound the pool enforces (`≤ capacity`), surfaced
     /// publicly via [`crate::Engine::resident_leaves`] (P6.4c, spec/design/pager.md §3).
     pub(crate) fn resident(&self) -> usize {
@@ -320,6 +333,25 @@ mod tests {
         assert_eq!(loads.get(), before, "0 was spared — still cached");
         pool.get_or_load(1, counting(&loads, 1)).unwrap();
         assert_eq!(loads.get(), before + 1, "1 was evicted — reloaded");
+    }
+
+    #[test]
+    fn set_capacity_evicts_down_and_then_bounds_inserts() {
+        let pool: BufferPool<u32> = BufferPool::new(usize::MAX);
+        let loads = Cell::new(0);
+        for p in 0..10u32 {
+            pool.get_or_load(p, counting(&loads, p)).unwrap();
+        }
+        assert_eq!(pool.resident(), 10);
+        pool.set_capacity(3);
+        assert_eq!(pool.capacity(), 3);
+        assert_eq!(pool.resident(), 3);
+        for p in 10..20u32 {
+            pool.get_or_load(p, counting(&loads, p)).unwrap();
+            assert!(pool.resident() <= 3);
+        }
+        pool.set_capacity(0); // clamped to one
+        assert_eq!(pool.resident(), 1);
     }
 
     #[test]

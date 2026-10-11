@@ -120,14 +120,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _deferred:_ identity management (`ALTER COLUMN … ADD/DROP/SET GENERATED …`) — plausible once
     scheduled; the rest of PG's menu (OWNER/RLS/triggers/partitions/tablespaces/schemas/storage knobs) is
     deliberately out of scope, `0A000` (alter.md §6).
-- [ ] **Temporary tables — slice 3: spill-to-disk** — the rest of the feature is landed: session-local
-  temp relations with zero writes to the database file, each domain a per-session in-RAM
-  `MemoryBlockStore` + pinned pager with within-session compaction and a page-based `54P03` budget;
-  CREATE/DROP INDEX, serial/IDENTITY, composite columns; `allow_temp_ddl`. (The database-wide `SHARED`
-  kind was removed in favor of in-memory attachments —
-  [attached-databases.md §6](spec/design/attached-databases.md).) Remaining: spill a temp domain to
-  disk — a temp-`BlockStore` swap + bounded pool (the blockstore flip already put temp on the seam).
-  → [temp-tables.md](spec/design/temp-tables.md) _(size: M–L; deps: storage seam (done))_
+- [x] **Temporary tables** — session-local temp relations with zero writes to the database file,
+  each domain a per-session `MemoryBlockStore` + pager with within-session compaction; CREATE/DROP
+  INDEX, serial/IDENTITY, composite columns; `allow_temp_ddl`; the `max_temp_storage_bytes` `54P03`
+  ceiling over the domain's page bytes. **Spill-to-disk (slice 3) landed:** past `temp_buffers` (the
+  resident budget) a file host migrates the domain into an unlinked scratch file in its spill directory
+  with a page cache bounded by `temp_buffers` — residency only, results/cost/`54P03`-neutral, run over
+  the whole temp corpus by `mise run conformance:spill`. (The database-wide `SHARED` kind was removed
+  in favor of in-memory attachments — [attached-databases.md §6](spec/design/attached-databases.md).)
+  → [temp-tables.md](spec/design/temp-tables.md)
+  - [ ] _follow-on:_ a host-configurable spill directory (shared with the external sort) so WASI/OPFS
+    hosts can offer a temp spill target; migrating a shrunken spilled domain back into RAM.
   - [ ] _follow-on:_ `ON COMMIT DELETE ROWS`/`DROP`; `IF NOT EXISTS`; `CREATE TEMP TABLE … AS SELECT`; FKs among same-kind temp tables; temporary views. → [temp-tables.md §14](spec/design/temp-tables.md)
 
 ---
@@ -407,7 +410,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   and they must fit after every statement. Thresholds pinned by
   `resource/query_memory_pending.test`. See [memory.md](spec/design/memory.md) §7.
   - [ ] _follow-on:_ a within-statement check (today a statement's own writes are checked once it
-    completes, like `temp_buffers`), and a net-residency measure (today a rewrite charges again).
+    completes, like `max_temp_storage_bytes`), and a net-residency measure (today a rewrite charges again).
 - [x] **Q4a — committed in-memory storage.** A database-owned `max_storage_bytes` (create/attach
   option + handle setter, unlimited by default; the file form is Q4c below) over
   `page_count × page_size`, checked at commit before any write; a commit that raises the

@@ -46,6 +46,39 @@ func counting(loads *int, page uint32) func() (*pnode, error) {
 	}
 }
 
+func TestBufferPoolSetCapacityEvictsDownAndThenBoundsInserts(t *testing.T) {
+	t.Parallel()
+	pool := newBufferPool(int(^uint(0) >> 1))
+	loads := 0
+	for p := uint32(0); p < 10; p++ {
+		if _, err := pool.getOrLoad(p, counting(&loads, p)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := pool.resident(); got != 10 {
+		t.Fatalf("resident = %d, want 10", got)
+	}
+	pool.setCapacity(3)
+	if got := pool.capacityPages(); got != 3 {
+		t.Fatalf("capacity = %d, want 3", got)
+	}
+	if got := pool.resident(); got != 3 {
+		t.Fatalf("resident after setCapacity(3) = %d, want 3", got)
+	}
+	for p := uint32(10); p < 20; p++ {
+		if _, err := pool.getOrLoad(p, counting(&loads, p)); err != nil {
+			t.Fatal(err)
+		}
+		if got := pool.resident(); got > 3 {
+			t.Fatalf("resident = %d after loading page %d, want ≤ 3", got, p)
+		}
+	}
+	pool.setCapacity(0) // clamped to one
+	if got := pool.resident(); got != 1 {
+		t.Fatalf("resident after setCapacity(0) = %d, want 1", got)
+	}
+}
+
 func TestBufferPoolHitReturnsCachedWithoutReloading(t *testing.T) {
 	t.Parallel()
 	pool := newBufferPool(4)

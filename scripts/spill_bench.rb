@@ -77,9 +77,38 @@ Dir.mktmpdir("jed-spill-bench-") do |scratch|
       end
     end
   end
+  # Temp-table spill: setup (CREATE TEMP TABLE + batched fills) and queries share one worker process,
+  # since a temp table lives only as long as its session.
+  temp = workload.fetch("temp")
+  temp_budget = temp.fetch("temp_buffers")
+  temp_input = "#{scratch}/temp.tsv"
+  File.open(temp_input, "w") do |f|
+    f.puts "-\tCREATE TEMP TABLE scratch (id bigint PRIMARY KEY, k bigint, v integer, s text)"
+    step = temp.fetch("batch_rows")
+    (1..rows).step(step) do |first|
+      f.puts "-\tINSERT INTO scratch SELECT id, k, v, s FROM wide WHERE id BETWEEN #{first} AND #{first + step - 1}"
+    end
+    temp.fetch("queries").each { |name, sql| f.puts "#{name}\t#{sql}" }
+  end
+  commands.each do |core, command|
+    [0, temp_budget].each do |temp_buffers|
+      rss = "#{scratch}/rss"
+      argv = ["/usr/bin/time", "-f", "%M", "-o", rss, *command, "temp", database, temp_buffers.to_s, temp_input, cache.to_s]
+      stdout, stderr, status = Open3.capture3(*argv)
+      abort "#{core}/temp/#{temp_buffers}: #{stderr}" unless status.success?
+      peak = Integer(File.read(rss))
+      stdout.each_line do |line|
+        result = JSON.parse(line)
+        result.merge!("core" => core, "temp_buffers" => temp_buffers, "peak_rss_kib" => peak, "input_rows" => rows)
+        results << result
+        puts JSON.generate(result)
+        File.open("#{out}/results.jsonl", "a") { |f| f.puts JSON.generate(result) }
+      end
+    end
+  end
   results.group_by { |result| result.fetch("name") }.each do |name, group|
     signatures = group.map { |result| result.values_at("rows", "cost", "checksum") }.uniq
     abort "results or costs diverged for #{name}: #{signatures.inspect}" unless signatures.one?
   end
 end
-puts "Spill results and costs agree across all cores and budgets: #{out}"
+puts "Spill results and costs agree across all cores and budgets (operators and temp tables): #{out}"

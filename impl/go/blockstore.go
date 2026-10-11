@@ -211,3 +211,59 @@ func (s *memoryBlockStore) setSize(n int64) error {
 }
 
 func (s *memoryBlockStore) close() error { return nil }
+
+// scratchBlockStore is the SCRATCH storage host for a spilled session-local temp domain
+// (spec/design/temp-tables.md §6): a private file in the host spill directory, never the database file.
+// A temp domain is never reopened and has no durability barrier, so sync and the grow barrier are
+// no-ops. The file is unlinked as soon as it is created where the OS allows an open file to be
+// unlinked (so a crash leaves nothing behind), and otherwise removed by close (Windows). Go has no
+// destructor, so the owner must close it: the session's temp domain is released on Session.Close
+// (engine.releaseTempDomain).
+type scratchBlockStore struct {
+	file *fileBlockStore
+	// path is the path still to remove on close; "" once unlinked.
+	path string
+}
+
+// newScratchBlockStore creates an empty scratch file under dir — exclusive, private mode, the
+// external-sort spill file's creation rule (spill.go spillRun, spill.md §6) — and unlinks it at once.
+func newScratchBlockStore(dir string) (*scratchBlockStore, error) {
+	f, err := os.CreateTemp(dir, "jed-spill-*.tmp")
+	if err != nil {
+		return nil, ioError(err)
+	}
+	path := f.Name()
+	if os.Remove(path) == nil {
+		path = ""
+	}
+	return &scratchBlockStore{file: &fileBlockStore{f: f, noSync: true}, path: path}, nil
+}
+
+func (s *scratchBlockStore) readAt(off int64, length int) ([]byte, error) {
+	return s.file.readAt(off, length)
+}
+
+func (s *scratchBlockStore) writeAt(off int64, p []byte) error { return s.file.writeAt(off, p) }
+
+func (s *scratchBlockStore) sync() error { return nil }
+
+func (s *scratchBlockStore) size() (int64, error) { return s.file.size() }
+
+// setSize grows or truncates; the wrapped store's noSync makes the durable-grow barrier a no-op.
+func (s *scratchBlockStore) setSize(n int64) error { return s.file.setSize(n) }
+
+// close closes the file, then removes it if it could not be unlinked while open (Windows cannot
+// remove an open file). Idempotent.
+func (s *scratchBlockStore) close() error {
+	err := s.file.close()
+	if s.path != "" {
+		_ = os.Remove(s.path)
+		s.path = ""
+	}
+	if errors.Is(err, os.ErrClosed) {
+		return nil
+	}
+	return err
+}
+
+func (s *scratchBlockStore) skipsSync() bool { return true }

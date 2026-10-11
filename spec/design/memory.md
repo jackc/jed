@@ -19,7 +19,7 @@ cross-core identical ([determinism.md](determinism.md) §3: a limit hit is part 
 G1/G2, not a ledger exception). None equals process RSS, and all allow bounded
 overshoot: a row may be constructed before it is admitted, and a base relation's
 storage read may decode before its rows are admitted one by one. Hosts bound
-deployment memory with these accounts, `work_mem`, `temp_buffers`, the page-pool
+deployment memory with these accounts, `work_mem`, `temp_buffers` (the resident temp budget), the page-pool
 budget, and process-level limits together.
 
 ## 1. Scalar allocation allowance (implemented)
@@ -526,7 +526,7 @@ The bytes belong to the transaction's working snapshots, the main database's and
 each attached database's ([attached-databases.md](attached-databases.md) §5), and
 travel with them. A rollback, a failed block's COMMIT, or a failed autocommit
 statement discards them; a commit releases them. Session-local temp tables are
-excluded, since `temp_buffers` bounds them ([temp-tables.md](temp-tables.md) §7).
+excluded, since `max_temp_storage_bytes` bounds them ([temp-tables.md](temp-tables.md) §7).
 Bytes are tracked whether or not a budget is active, so a budget set in the middle
 of a transaction sees the writes already staged.
 
@@ -544,7 +544,7 @@ Under a finite budget:
   commits nothing, and an explicit block enters the failed state.
 
 Both count toward the statement's peak, so in memory mode a record's peak is still
-its minimal passing budget. Like `temp_buffers`, the check runs at the statement
+its minimal passing budget. Like `max_temp_storage_bytes`, the check runs at the statement
 boundary: within one statement, writes are bounded by `max_cost` and by the Q1
 buffers that feed them (INSERT … SELECT keeps its source rows charged), and they
 are checked once the statement completes. Thresholds are pinned by
@@ -569,7 +569,7 @@ contracts:
 | **Committed storage** — non-refaultable bytes the database *is* | the `MemoryBlockStore` of an in-memory database and of each in-memory attachment; the live pages of a file-backed database and of each file attachment (§8.7) | `max_storage_bytes` (§8.1) | the growing commit fails `54P06` | deterministic, cross-core (§8.4, §8.7) |
 | **Caches** — refaultable copies of durable pages | the file-backed leaf pool | `cache_bytes` (existing, [pager.md](pager.md) §3) | evict; **never fails** | none; residency is unobservable (§8.6) |
 
-Session-local temp domains are neither. A session owns them, and `temp_buffers`
+Session-local temp domains are neither. A session owns them, and `max_temp_storage_bytes`
 already bounds them with the same page basis ([temp-tables.md](temp-tables.md) §7),
 so Q4 does not count them again.
 
@@ -613,7 +613,7 @@ storage_bytes(domain) = page_count × page_size
 `page_count` is the domain's **logical high-water mark**: meta slots, live pages,
 and pages on the free list, everything the byte store holds. The free pages count
 because an in-memory store keeps them allocated for reuse. This is the
-`temp_buffers` basis, taken over unchanged
+temp storage ceiling's basis (`max_temp_storage_bytes`, formerly `temp_buffers`), taken over unchanged
 ([temp-tables.md](temp-tables.md) §7), and it is honest in the same way: it charges
 interior nodes, page headers, and space left sparse after deletes, which a
 record-byte sum would miss. It is **not** the physical buffer length, which also

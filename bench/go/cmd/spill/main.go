@@ -23,7 +23,7 @@ func main() {
 
 func run() error {
 	if len(os.Args) != 6 {
-		return fmt.Errorf("usage: spill create|open database work_mem sql.tsv cache_bytes")
+		return fmt.Errorf("usage: spill create|open|temp database budget sql.tsv cache_bytes")
 	}
 	budget, err := strconv.Atoi(os.Args[3])
 	if err != nil || budget < 0 {
@@ -45,7 +45,13 @@ func run() error {
 	defer db.Close()
 	sess := db.Session(jed.SessionOptions{})
 	defer sess.Close()
-	sess.SetWorkMem(budget)
+	if os.Args[1] == "temp" {
+		// Temp-table spill (spec/design/temp-tables.md §6): the budget is the resident temp_buffers.
+		sess.SetTempBuffers(budget)
+		sess.SetMaxTempStorageBytes(0)
+	} else {
+		sess.SetWorkMem(budget)
+	}
 	f, err := os.Open(os.Args[4])
 	if err != nil {
 		return err

@@ -86,7 +86,7 @@ test("a multi-leaf temp table past its page budget aborts 54P03", () => {
   const db = memDb(256);
   // ~20 pages of budget: a single leaf (≤ ~240 record bytes) is far under it, so a record-byte measure
   // would never abort; the page footprint crosses it as the tree grows past ~20 pages.
-  const sess = db.session({ tempBuffers: 20 * 256 });
+  const sess = db.session({ maxTempStorageBytes: 20 * 256 });
   sess.execute("CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)");
   const pad = "z".repeat(40);
   let aborted = false;

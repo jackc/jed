@@ -52,6 +52,7 @@ package jed
 // drives the single-handle path and mints additional concurrent sessions.
 
 import (
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -483,7 +484,7 @@ const (
 // committed snapshot lives in roots.attached[name] so a reader pins it lock-free with every other
 // root. An attachment is file-backed (Slice 2 — storage.path != "", a fileBlockStore behind the pager,
 // committed durably via storage.commitDurable) or in-memory (storage.path == "", a memoryBlockStore
-// committed via persistTemp). The storage kind is the sole source of the file/memory distinction — no
+// committed via stageInMemory). The storage kind is the sole source of the file/memory distinction — no
 // separate flag.
 type attachment struct {
 	name        string           // lowercased qualifier name (the map key)
@@ -494,7 +495,7 @@ type attachment struct {
 
 // isFile reports whether this attachment is file-backed (durable, Slice 2) rather than in-memory. A
 // file-backed database has a non-empty backing path; an in-memory one has "". The write-commit path
-// branches on it (durable commitDurable vs pointer-swap persistTemp) and the one-durable-writer rule
+// branches on it (durable commitDurable vs pointer-swap stageInMemory) and the one-durable-writer rule
 // (§5) counts only file-backed attachments.
 func (a *attachment) isFile() bool { return a.storage.path != "" }
 
@@ -539,6 +540,10 @@ type storage struct {
 	// live is the live-page accounting of a file-backed domain's committed state (memory.md §8.7);
 	// unused for an in-memory domain.
 	live liveCount
+	// spilled is whether this temp domain has migrated from its in-RAM store to a scratch file in the
+	// host spill directory (temp-tables.md §6). Once spilled it stays spilled; its pool is then bounded
+	// by tempBuffers instead of pinned. Always false for a main or attached domain.
+	spilled bool
 }
 
 // storageBudget is the max_storage_bytes state of one domain (memory.md §8.1–§8.3, §8.7): the
@@ -848,7 +853,7 @@ func (st *storage) commitInMemory(snap *snapshot, write incrementalWrite, canRec
 
 // planInMemory plans an in-memory commit's page allocation under the domain's max_storage_bytes limit
 // (memory.md §8.3), before any page is written. Without a budget context (a temp domain, which
-// temp_buffers bounds) or under an unlimited limit this is the plain incremental plan. A plan that
+// max_temp_storage_bytes bounds) or under an unlimited limit this is the plain incremental plan. A plan that
 // raises the high-water past the limit first compacts the committed snapshot when the watermark
 // allows, then re-plans; if it still does not fit the commit fails 54P06. Caller holds st.mu.
 func (st *storage) planInMemory(snap *snapshot, reuse bool, budget *budgetCtx) (incrementalWrite, error) {
@@ -1141,27 +1146,70 @@ func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, written []uint32
 	return nil
 }
 
-// persistTemp materializes a TEMP snapshot's dirty pages into the domain's in-RAM MemoryBlockStore
-// (temp-tables.md §6): the SAME incremental copy-on-write serialize as a file/in-memory commit, but with
-// NO meta slot and NO sync — a temp domain is never reopened and its memory host has no durability
-// barrier — then the residency flip (clean leaves demote to OnDisk, faulted back through the temp pool:
-// the compact packed footprint) and within-session compaction (Phase A). ZERO main-file writes: only the
-// temp byte store is touched, so the zero-file-write invariant (temp-tables.md §2, D1) is preserved by
-// construction. Assigns page ids on snap in place; the caller adopts snap as the committed temp state
-// afterward. canReclaim is the caller's cursor watermark (no open streaming cursor may hold an older
-// temp tree). budget is an in-memory attachment's max_storage_bytes context (memory.md §8.3); nil for a
-// temp domain, which temp_buffers bounds instead.
-func (st *storage) persistTemp(snap *snapshot, canReclaim bool, budget *budgetCtx) error {
+// tempSpills counts the session-local temp domains spilled to a scratch file in this process
+// (temp-tables.md §6) — the conformance harness's forced temp-spill mode reports it (TempSpills), so a
+// run that never actually spilled cannot pass silently.
+var tempSpills atomic.Uint64
+
+// TempSpills reports how many session-local temp domains have spilled to a scratch file in this
+// process (spec/design/temp-tables.md §6) — conformance tooling, never a production signal.
+func TempSpills() uint64 { return tempSpills.Load() }
+
+// stageTemp stages a TEMP snapshot's dirty pages into the domain's store (temp-tables.md §6): the SAME
+// incremental copy-on-write serialize as a file/in-memory commit, but with NO meta slot and NO sync — a
+// temp domain is never reopened and has no durability barrier — then the residency flip (clean leaves
+// demote to OnDisk, faulted back through the temp pool: the compact packed footprint). ZERO main-file
+// writes: only the temp byte store is touched, so the zero-file-write invariant (temp-tables.md §2, D1)
+// is preserved by construction. Assigns page ids on snap in place. Staged pages occupy only free-list
+// slots and pages past the high-water, so the caller stages BEFORE the main persist and adopts
+// (adoptTemp) after it: a failure anywhere in between leaves the temp store matching its
+// still-committed root. No budget context — a temp domain is bounded by maxTempStorageBytes instead.
+//
+// Spill-to-disk (temp-tables.md §6): once the domain's page bytes exceed tempBuffers (0 ⇒ never) and
+// the host has a spill directory, the in-RAM store migrates to a scratch file there and the pool is
+// bounded by tempBuffers — re-applied every commit so a later tempBuffers change takes effect.
+// Residency only: the page layout, and so results, cost, and the 54P03 point, are unchanged.
+func (st *storage) stageTemp(snap *snapshot, tempBuffers int, spillDir string) (stagedCommit, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	staged, err := st.stageInMemoryLocked(snap, budget, "")
+	// A temp/in-memory store keeps its free-list in RAM (no meta), so it persists no free-list pages;
+	// within-session reclamation is the post-commit RAM rebuild (maybeCompact, run by adoptTemp).
+	staged, err := st.stageInMemoryLocked(snap, nil, "")
 	if err != nil {
-		return err
+		return stagedCommit{}, err
 	}
+	bytes := uint64(staged.pageCount) * uint64(st.pageSize)
+	if !st.spilled && tempBuffers > 0 && bytes > uint64(tempBuffers) && spillDir != "" {
+		store, err := newScratchBlockStore(spillDir)
+		if err != nil {
+			return stagedCommit{}, err
+		}
+		if err := st.paging.withPager(func(p *pager) error { return p.migrateStore(store) }); err != nil {
+			return stagedCommit{}, err
+		}
+		st.spilled = true
+		tempSpills.Add(1)
+	}
+	if st.spilled {
+		capacity := math.MaxInt
+		if tempBuffers > 0 {
+			capacity = cacheLeaves(tempBuffers, st.pageSize)
+		}
+		st.paging.setCapacity(capacity)
+	}
+	return staged, nil
+}
+
+// adoptTemp is the second half of a temp commit (stageTemp): adopt the staged page accounting and run
+// within-session compaction relative to snap, the now-committed temp root. canReclaim is the caller's
+// cursor watermark (no open streaming cursor may hold an older temp tree).
+func (st *storage) adoptTemp(snap *snapshot, staged stagedCommit, canReclaim bool) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
 	return st.adoptStagedLocked(snap, staged, canReclaim)
 }
 
-// stageInMemory is the first half of persistTemp: write snap's dirty pages into the in-RAM store and
+// stageInMemory is the first half of an in-memory attachment commit: write snap's dirty pages into the in-RAM store and
 // take the residency flip, but adopt none of the page accounting. An in-memory attachment stages in
 // commitTx and adopts only after main persists and the roots publish (attached-databases.md §5):
 // adopting first would let a failed main persist leave a free list computed from an unpublished root,
@@ -1201,7 +1249,7 @@ func (st *storage) stageInMemoryLocked(snap *snapshot, budget *budgetCtx, name s
 	return newStagedCommit(name, write), nil
 }
 
-// adoptStagedLocked is the second half of persistTemp: adopt a staged commit's page accounting and run
+// adoptStagedLocked is the second half of stageTemp / stageInMemory: adopt a staged commit's page accounting and run
 // the post-commit compaction relative to snap, its now-committed root. Caller holds st.mu.
 func (st *storage) adoptStagedLocked(snap *snapshot, staged stagedCommit, canReclaim bool) error {
 	st.pageCount = staged.pageCount
@@ -1891,10 +1939,16 @@ func (s *Database) PageCount() uint32 { return s.core.pageCount() }
 // Path is the backing file path for a file-backed database; "" in-memory.
 func (s *Database) Path() string { return s.core.path() }
 
-// setSpillDirForTest overrides the host scratch directory for per-core spill tests. Production file
-// hosts install os.TempDir at open/create; this unexported hook keeps the configurable spill-target
-// follow-on out of the embedding API.
+// setSpillDirForTest overrides the host scratch directory for per-core spill tests and the conformance
+// harness's forced temp-spill mode (SetSpillDirForTooling). Production file hosts install os.TempDir at
+// open/create; keeping this a tooling hook keeps the configurable spill-target follow-on out of the
+// embedding API. Sessions minted afterwards inherit it.
 func (s *Database) setSpillDirForTest(dir string) { s.core.storage.spillDir = dir }
+
+// SetSpillDirForTooling gives db (and the sessions minted from it afterwards) a spill directory — the
+// conformance harness's forced temp-spill mode runs in-memory databases, which otherwise have none
+// (spec/design/temp-tables.md §6, spill.md §2). Conformance tooling, never a production setting.
+func SetSpillDirForTooling(db *Database, dir string) { db.setSpillDirForTest(dir) }
 
 // ReadOnly reports whether this database was opened read-only. In-memory databases are writable.
 func (s *Database) ReadOnly() bool { return s.core.readOnlyMode() }
@@ -2479,6 +2533,7 @@ func (s *Session) Close() {
 	} else {
 		s.finishBlock()
 	}
+	s.engine.releaseTempDomain() // session-local temp tables (and any scratch file) go with the session
 }
 
 // Begin opens an explicit transaction block on this session (spec/design/session.md §2.2 — the
@@ -2713,9 +2768,14 @@ func (s *Session) ResetPrivileges() { s.engine.ResetPrivileges() }
 // spec/design/temp-tables.md §5); a denied temp DDL is 42501.
 func (s *Session) SetAllowTempDDL(allow bool) { s.engine.session.allowTempDDL = allow }
 
-// SetTempBuffers — the per-session temp-table storage budget in bytes (0 ⇒ unlimited,
-// spec/design/temp-tables.md §7); an over-budget temp write aborts 54P03.
+// SetTempBuffers — the per-session temp-table RESIDENT budget in bytes (0 ⇒ never spill,
+// spec/design/temp-tables.md §6): past it a host with a spill directory moves the temp domain to a
+// scratch file whose page cache it bounds. Residency only — never results, cost, or the 54P03 point.
 func (s *Session) SetTempBuffers(bytes int) { s.engine.session.tempBuffers = bytes }
+
+// SetMaxTempStorageBytes — the per-session temp-table storage CEILING in bytes (0 ⇒ unlimited,
+// spec/design/temp-tables.md §7); an over-ceiling temp write aborts 54P03.
+func (s *Session) SetMaxTempStorageBytes(bytes int) { s.engine.session.maxTempStorageBytes = bytes }
 
 // ResetVars clears every session variable — PostgreSQL's RESET ALL for the variable map (§6.1).
 func (s *Session) ResetVars() { s.engine.session.ResetVars() }

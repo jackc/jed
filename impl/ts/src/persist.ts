@@ -16,6 +16,8 @@ import {
 } from "./commit_manifest.ts";
 import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "./costs.ts";
 import { engineError } from "./errors.ts";
+import { cacheLeaves } from "./paging.ts";
+import type { SpillSink } from "./spill.ts";
 import {
   catalogPageCount,
   incrementalImage,
@@ -137,9 +139,10 @@ function stagedFromWrite(name: string, write: IncrementalWrite): StagedCommit {
 
 // planInMemory plans an in-memory commit's page allocation under the domain's max_storage_bytes limit
 // (memory.md §8.3), before any page is written. Without a budget context (a temp domain, which
-// temp_buffers bounds) or under an unlimited limit this is the plain incremental plan. A plan that raises
-// the high-water past the limit first compacts the committed snapshot when the watermark allows, then
-// re-plans; if it still does not fit the commit fails 54P06 (unless the repair exemption admits it).
+// max_temp_storage_bytes bounds) or under an unlimited limit this is the plain incremental plan. A plan
+// that raises the high-water past the limit first compacts the committed snapshot when the watermark
+// allows, then re-plans; if it still does not fit the commit fails 54P06 (unless the repair exemption
+// admits it).
 function planInMemory(
   db: Engine,
   snap: Snapshot,
@@ -418,7 +421,7 @@ function commitInMemory(
 // byte store (attached-databases.md §5, Slice 2): the SAME durable recipe as the main persist
 // (persistImpl — v25 persists the free-list in-commit for a file store), then the post-commit residency
 // flip (demoteCleanLeaves — bplus-reshape.md B4). The caller advances snap.txid before calling. Runs
-// under the writer gate. An in-memory attachment uses persistTemp instead (no fsync). budget is the
+// under the writer gate. An in-memory attachment uses stageInMemory instead (no fsync). budget is the
 // attachment's committed-storage context (memory.md §8.7).
 export function commitDurableAttachment(
   db: Engine,
@@ -465,28 +468,55 @@ export function maybeCompact(
   db.freeGenTxid = snap.txid; // the recomputed list is proven dead at snap.txid (the §8 reuse gate)
 }
 
-// persistTemp materializes a TEMP snapshot's dirty pages into the domain's in-RAM MemoryBlockStore
-// (temp-tables.md §6): the SAME incremental copy-on-write serialize as a file/in-memory commit, but with
-// NO meta slot and NO sync — a temp domain is never reopened and its memory host has no durability
-// barrier — then the residency flip (clean leaves demote to OnDisk, faulted back through the temp pool:
-// the compact packed footprint) and within-session compaction (maybeCompact). ZERO main-file writes:
-// only the temp byte store is touched, so the zero-file-write invariant (temp-tables.md §2, D1) is
-// preserved by construction. Assigns page ids on snap in place; the caller adopts snap as the committed
-// temp state afterward. canReclaim is the caller's cursor watermark (no open streaming cursor may hold an
-// older temp tree). budget is an in-memory attachment's committed-storage context (memory.md §8.3);
-// null for a session temp domain, which temp_buffers bounds instead.
-export function persistTemp(
+// tempSpills counts the session-local temp domains spilled to a scratch file in this process
+// (temp-tables.md §6) — the conformance harness's forced temp-spill mode reports it, so a run that never
+// actually spilled cannot pass silently. Rust's TEMP_SPILLS.
+export const tempSpills = { count: 0 };
+
+// stageTemp stages a TEMP snapshot's dirty pages into the domain's store (temp-tables.md §6): the SAME
+// incremental copy-on-write serialize as a file/in-memory commit, but with NO meta slot and NO sync — a
+// temp domain is never reopened and has no durability barrier — then the residency flip (clean leaves
+// demote to OnDisk, faulted back through the temp pool: the compact packed footprint). ZERO main-file
+// writes: only the temp byte store is touched, so the zero-file-write invariant (temp-tables.md §2, D1)
+// holds by construction. Assigns page ids on snap in place. Staged pages occupy only free-list slots and
+// pages past the high-water, so the caller stages BEFORE the main persist and adopts (adoptStaged) after
+// it: a failure anywhere in between leaves the temp store matching its still-committed root.
+//
+// Spill-to-disk (temp-tables.md §6): once the domain's page bytes exceed tempBuffers (0 ⇒ never) and the
+// host has a spill sink, the in-RAM store migrates to a scratch file and the pool is bounded by
+// tempBuffers. Residency only — the page layout, and so results, cost, and the 54P03 point, are
+// unchanged. An in-memory or OPFS database passes a null sink (or one without createScratchStore) and
+// stays resident.
+export function stageTemp(
   db: Engine,
   snap: Snapshot,
-  canReclaim: boolean,
-  budget: BudgetCtx | null = null,
-): void {
-  if (db.paging === null) return;
-  adoptStaged(db, snap, stageInMemory(db, snap, budget, ""), canReclaim);
+  tempBuffers: number,
+  sink: SpillSink | null,
+): StagedCommit {
+  const paging = db.paging!;
+  const staged = stageInMemory(db, snap, null, "");
+  const bytes = staged.pageCount * db.pageSize;
+  if (
+    !db.spilled &&
+    tempBuffers > 0 &&
+    bytes > tempBuffers &&
+    sink?.createScratchStore !== undefined
+  ) {
+    paging.migrateStore(sink.createScratchStore());
+    db.spilled = true;
+    tempSpills.count++;
+  }
+  if (db.spilled) {
+    // Re-applied every commit, so a later temp_buffers change takes effect.
+    paging.setCapacity(
+      tempBuffers === 0 ? Number.MAX_SAFE_INTEGER : cacheLeaves(tempBuffers, db.pageSize),
+    );
+  }
+  return staged;
 }
 
-// stageInMemory is the first half of persistTemp: write snap's dirty pages into the in-RAM store and
-// take the residency flip, but adopt none of the page accounting. An in-memory attachment stages in
+// stageInMemory is the first half of a temp or in-memory attachment commit: write snap's dirty pages
+// into the in-RAM store and take the residency flip, but adopt none of the page accounting. An in-memory attachment stages in
 // commitTx and adopts only after main persists and the roots publish (attached-databases.md §5):
 // adopting first would let a failed main persist leave a free list computed from an unpublished root,
 // so a later commit could overwrite pages the published root still references.
@@ -510,8 +540,8 @@ export function stageInMemory(
   return stagedFromWrite(name, write);
 }
 
-// adoptStaged is the second half of persistTemp: adopt a staged commit's page accounting and run the
-// post-commit compaction relative to snap, its now-committed root.
+// adoptStaged is the second half of stageTemp / stageInMemory: adopt a staged commit's page accounting
+// and run the post-commit compaction relative to snap, its now-committed root.
 export function adoptStaged(
   db: Engine,
   snap: Snapshot,

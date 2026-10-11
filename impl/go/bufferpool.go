@@ -176,9 +176,27 @@ func (p *bufferPool) invalidateLocked(page uint32) {
 	}
 }
 
-// capacityPages is the most pages the pool holds at once (fixed at construction).
+// capacityPages is the most pages the pool holds at once (set at construction, re-bounded only by
+// setCapacity).
 func (p *bufferPool) capacityPages() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return p.capacity
+}
+
+// setCapacity re-bounds the pool to capacity pages (clamped to ≥ 1), evicting under CLOCK until the
+// resident set fits — a spilled temp domain's pool tightens from pinned to tempBuffers
+// (spec/design/temp-tables.md §6). An in-flight load still inserts afterward, evicting as usual.
+func (p *bufferPool) setCapacity(capacity int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if capacity < 1 {
+		capacity = 1
+	}
+	p.capacity = capacity
+	for len(p.slots) > p.capacity {
+		p.invalidateLocked(p.slots[p.evictSlot()].page)
+	}
 }
 
 // resident is the number of pages currently resident — the bound the pool enforces (≤ capacity).

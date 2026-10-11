@@ -24,6 +24,14 @@ environment variables belong to the tooling, never to the built-in SQL engine.
 The forced run complements internal spill/cleanup/retained-state assertions; a corpus
 pass alone cannot prove that an implementation actually spilled.
 
+The same task then walks the **temp-table files** (those that `CREATE TEMP`/`CREATE TEMPORARY`) in
+memory mode with `JED_CONFORMANCE_TEMP_BUFFERS=1`: each memory database is given the OS temp
+directory as its spill target and every session a 1-byte `temp_buffers`, so each temp domain spills
+to a scratch file at its first commit and runs on a one-leaf page cache
+([temp-tables.md](temp-tables.md) §6). Only those files run, because a spill target would also let
+blocking operators spill where the corpus pins that an in-memory database cannot. Each harness
+prints how many temp domains spilled and fails when none did, so the pass cannot be vacuous.
+
 `mise run conformance:query_memory [bytes] [filter]` walks the corpus on all three cores in
 both storage modes, and once more on disk with `work_mem` forced to 256 bytes, with the
 query-memory account ([memory.md](memory.md)) active: every record without its own
@@ -607,6 +615,13 @@ are jed-specific; successful scalar values remain PostgreSQL-comparable.
 Requires `resource.query_memory`. The logical size schedule is cross-core
 identical, so a record may pin an exact `54P05` threshold (a passing record at
 `N`, a failing one at `N - 1`).
+
+### Temp-storage directive
+
+`# max_temp_storage_bytes: N` sets the session-local temp-table storage ceiling
+([temp-tables.md](temp-tables.md) §7) for the next record only, in bytes; absent or zero is
+unlimited. An over-ceiling temp write is `54P03`. (It replaced `# temp_buffers:` when that setting
+became the resident budget, which never changes a record's outcome.)
 
 ### Work-memory directive
 

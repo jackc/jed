@@ -23,11 +23,12 @@ scratch table. It behaves like an ordinary table — full `INSERT` / `SELECT` / 
 plus `PRIMARY KEY`, `NOT NULL`, `DEFAULT`, `CHECK`, and `UNIQUE` constraints — with three deliberate
 differences:
 
-- **It makes zero writes to the database file.** A temp table lives entirely in memory, outside the
-  durable on-disk image, so creating or filling one never touches the file.
+- **It makes zero writes to the database file.** A temp table lives outside the durable on-disk
+  image — in memory, or in a private scratch file once it grows large — so creating or filling one
+  never touches the database file.
 - **It is private to your session** and is dropped automatically when the session ends.
-- **Its storage is bounded.** A per-session byte budget (`temp_buffers`) caps how much a session's
-  temp tables can hold, so a temp table is safe to expose even to untrusted queries.
+- **Its storage is bounded.** A per-session byte ceiling (`max_temp_storage_bytes`) caps how much a
+  session's temp tables can hold, so a temp table is safe to expose even to untrusted queries.
 
 <LiveSql {seed} {query} rows={6} />
 
@@ -60,9 +61,17 @@ CREATE TABLE temp (id i32 PRIMARY KEY);     -- a persistent table called "temp"
 ## Bounded storage
 
 Temp tables retain rows across statements, which the per-statement cost ceiling does not bound — so
-a session carries a `temp_buffers` budget (in bytes; the host sets it, default 32 MiB, `0` means
-unlimited). A write that would push the session's total temp storage past the budget is rejected
-with error `54P03` and rolled back, leaving the already-committed rows intact. This bounds retained temp storage. Configure the
+a session carries a `max_temp_storage_bytes` ceiling (in bytes; the host sets it, default 1 GiB, `0`
+means unlimited). A write that would push the session's total temp storage past the ceiling is
+rejected with error `54P03` and rolled back, leaving the already-committed rows intact. This bounds
+retained temp storage.
+
+A second setting, `temp_buffers` (default 32 MiB, `0` means never spill), bounds how much of it stays
+in memory. Once a session's temp tables outgrow it, a database opened from a file moves them into a
+private scratch file in the operating system's temp directory (removed when the session ends) and
+keeps only a `temp_buffers`-sized page cache in memory. Spilling never changes results, costs, or
+where `54P03` fires. In-memory and browser (OPFS) databases have no scratch directory, so their temp
+tables stay in memory, bounded by `max_temp_storage_bytes` alone. Configure the
 [execution and scalar limits](../../api/resource-limits/) separately; transient query memory
 and pending writes still need broader memory admission.
 

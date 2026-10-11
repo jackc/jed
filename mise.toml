@@ -180,17 +180,23 @@ run = ["npm run --silent conformance", "npm run --silent conformance -- disk"]
 # Disk storage mode with a tiny work_mem, so every spill-capable operator spills
 # (spec/design/spill.md). Results, errors, and costs must be unchanged.
 [tasks."conformance:spill"]
-description = "Run the shared SQL corpus on all cores with forced file spill"
+description = "Run the shared SQL corpus on all cores with forced file spill (operators, then temp tables)"
 usage = '''
 arg "[bytes]" default="256" help="work_mem in bytes"
 arg "[filter]" help="Run only corpus files whose path contains this substring"
 '''
 run = '''
-export JED_CONFORMANCE_WORK_MEM="$usage_bytes"
 if [ -n "${usage_filter:-}" ]; then export JED_CONFORMANCE_FILTER="$usage_filter"; fi
-cargo run --release --quiet --bin conformance --manifest-path impl/rust/Cargo.toml -- disk
-(cd impl/go && go run ./cmd/conformance disk)
-(cd impl/ts && node src/bin/conformance.ts disk)
+JED_CONFORMANCE_WORK_MEM="$usage_bytes" cargo run --release --quiet --bin conformance --manifest-path impl/rust/Cargo.toml -- disk
+(cd impl/go && JED_CONFORMANCE_WORK_MEM="$usage_bytes" go run ./cmd/conformance disk)
+(cd impl/ts && JED_CONFORMANCE_WORK_MEM="$usage_bytes" node src/bin/conformance.ts disk)
+# Temp-table spill (spec/design/temp-tables.md §6): the temp-table files in memory mode, each memory
+# database given a spill directory and every session a 1-byte temp_buffers, so each temp domain
+# spills to a scratch file at its first commit and runs on a one-leaf page cache.
+export JED_CONFORMANCE_TEMP_BUFFERS=1
+cargo run --release --quiet --bin conformance --manifest-path impl/rust/Cargo.toml
+(cd impl/go && go run ./cmd/conformance)
+(cd impl/ts && node src/bin/conformance.ts)
 '''
 
 # Layer 4 of the concurrency contract (CLAUDE.md §7): spec/conformance/process/*.process.toml drives
@@ -515,7 +521,7 @@ arg "[baseline]" help="The results directory to diff against"
 run = 'ruby scripts/bench_diff.rb ${usage_dir:+"$usage_dir"} ${usage_baseline:+"$usage_baseline"}'
 
 [tasks."bench:spill"]
-description = "Compare bounded JOIN/aggregate/DISTINCT with unlimited work_mem (larger than work memory)"
+description = "Compare bounded JOIN/aggregate/DISTINCT with unlimited work_mem, and spilled vs resident temp tables (larger than work memory)"
 usage = '''
 arg "[rows]" help="Rows per input"
 arg "[width]" help="Payload width in bytes"

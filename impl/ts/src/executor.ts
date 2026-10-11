@@ -212,10 +212,11 @@ import {
 } from "./format.ts";
 import {
   commitDurableAttachment,
+  adoptStaged,
   persistSharedBody,
-  persistTemp,
   type StagedCommit,
   stageInMemory,
+  stageTemp,
   type StorageBudget,
 } from "./persist.ts";
 import { Decimal, workLinear } from "./decimal.ts";
@@ -673,13 +674,20 @@ export const DEFAULT_PAGE_SIZE = 8192;
 // setMaxSqlLength. Identical across cores (§8).
 export const DEFAULT_MAX_SQL_LENGTH = 1 << 20;
 
-// DEFAULT_TEMP_BUFFERS is the default per-session storage budget for SESSION-LOCAL temporary tables,
-// in BYTES (spec/design/temp-tables.md §7). Temp tables RETAIN bytes across statements, which neither
-// the per-statement cost ceiling (maxCost) nor the cumulative budget (lifetimeMaxCost) bounds, so
-// tempBuffers is the §13 gate that does: the instant a session's resident temp storage (byte-identical
-// on-disk record bytes) would exceed it, the write aborts 54P03. 0 ⇒ unlimited (a trusted handle).
-// Identical across cores (§8); the abort point is part of the cross-core contract.
+// DEFAULT_TEMP_BUFFERS is the default per-session RESIDENT budget for SESSION-LOCAL temporary tables, in
+// BYTES (spec/design/temp-tables.md §6/§7) — PostgreSQL's temp_buffers. Once a session's temp domain
+// outgrows it, a host with a spill sink migrates the domain to a scratch file and bounds its page cache
+// by it. Residency only: results, cost, and the 54P03 point never depend on it. 0 ⇒ never spill
+// (unbounded residency).
 export const DEFAULT_TEMP_BUFFERS = 32 << 20;
+
+// DEFAULT_MAX_TEMP_STORAGE_BYTES is the default per-session storage CEILING for SESSION-LOCAL temporary
+// tables, in BYTES (spec/design/temp-tables.md §7). Temp tables RETAIN bytes across statements, which
+// neither the per-statement cost ceiling (maxCost) nor the cumulative budget (lifetimeMaxCost) bounds,
+// so maxTempStorageBytes is the §13 gate that does: once the temp domain's committed page bytes exceed
+// it — resident or spilled alike — the next temp write aborts 54P03. 0 ⇒ unlimited (a trusted handle).
+// Identical across cores (§8); the abort point is part of the cross-core contract.
+export const DEFAULT_MAX_TEMP_STORAGE_BYTES = 1 << 30;
 
 // MAX_COMPOSITE_DEPTH is the maximum composite-type nesting depth (CLAUDE.md §13; cost.md §7b). A
 // composite type's depth is the length of its deepest chain of nested composites, counting itself: a
@@ -1335,11 +1343,16 @@ export class Engine {
   // tempStorage is the SESSION-LOCAL temp domain's storage Engine (temp-tables.md §6): the private in-RAM
   // MemoryBlockStore + pager + pinned pool its temp tables ride, with within-session compaction on.
   // Created lazily on the first session-local temp DDL (newTempStorage); null until then. Its pageCount
-  // is the domain's footprint — the page-based temp budget.
+  // is the domain's footprint — the page-based temp ceiling. Released (its scratch file closed, if it
+  // spilled) by releaseTempStorage when the session closes.
   tempStorage: Engine | null;
+  // spilled is whether this TEMP storage Engine has spilled from its in-RAM store to a scratch file from
+  // the host spill sink (temp-tables.md §6, persist.ts stageTemp). Once spilled it stays spilled; its
+  // pool is then bounded by temp_buffers instead of pinned. Always false for a main or attached domain.
+  spilled: boolean;
   // openStreams counts this handle's live streaming cursors (Query's pull source, not a materialized
   // result). A streaming cursor pins a snapshot it faults lazily, so while one is open a temp-domain
-  // compaction (persistTemp → maybeCompact) must NOT reclaim pages — it could free one the cursor still
+  // compaction (adoptStaged → maybeCompact) must NOT reclaim pages — it could free one the cursor still
   // faults. Incremented when a streaming Rows opens (shared.ts), decremented on Close.
   openStreams: number;
   // storageBudget is this storage domain's committed-storage limit (memory.md §8.1, Q4a) plus what its
@@ -1385,6 +1398,7 @@ export class Engine {
     this.freeGenTxid = 0n;
     this.live = { live: 0, catalog: 0, gist: 0 };
     this.tempStorage = null;
+    this.spilled = false;
     this.openStreams = 0;
     this.storageBudget = { limit: 0n, lastCatRoot: 0, lastWritten: [], lastCatalogPages: 0 };
     this.commitStagesRows = false;
@@ -1476,15 +1490,43 @@ export class Engine {
     return this.session.allowTempDdl;
   }
 
-  // setTempBuffers sets the default session's per-session temp-table storage budget in BYTES
-  // (spec/design/temp-tables.md §7); 0 ⇒ unlimited. An over-budget temp write aborts 54P03.
+  // setTempBuffers sets the default session's temp-table RESIDENT budget in BYTES (spec/design/
+  // temp-tables.md §6); 0 ⇒ never spill. Past it a file host moves the temp domain to a scratch file
+  // whose page cache it bounds. A handle setting, not stored in the file; it never changes results or
+  // cost.
   setTempBuffers(bytes: number): void {
     this.session.tempBuffers = bytes;
   }
 
-  // tempBuffers reports the default session's per-session temp-table storage budget (0 ⇒ unlimited).
+  // tempBuffers reports the default session's temp-table resident budget (0 ⇒ never spill).
   tempBuffers(): number {
     return this.session.tempBuffers;
+  }
+
+  // setMaxTempStorageBytes sets the default session's temp-table storage CEILING in BYTES (spec/design/
+  // temp-tables.md §7); 0 ⇒ unlimited. An over-ceiling temp write aborts 54P03. A handle setting, not
+  // stored in the file.
+  setMaxTempStorageBytes(bytes: number): void {
+    this.session.maxTempStorageBytes = bytes;
+  }
+
+  // maxTempStorageBytes reports the default session's temp-table storage ceiling (0 ⇒ unlimited).
+  maxTempStorageBytes(): number {
+    return this.session.maxTempStorageBytes;
+  }
+
+  // releaseTempStorage drops the session-local temp domain (temp-tables.md §6) when its session closes:
+  // its committed temp tables vanish and its store is closed — a spilled domain's scratch file is
+  // released (and removed, where the OS could not unlink it while open). JS has no destructor, so the
+  // closing handle must call this. Idempotent.
+  releaseTempStorage(): void {
+    const ts = this.tempStorage;
+    this.tempStorage = null;
+    this.session.tempCommitted = new Snapshot();
+    if (ts !== null && ts.paging !== null) {
+      ts.paging.close();
+      ts.paging = null;
+    }
   }
 
   // setVar sets a session variable on the default session (spec/design/session.md §6.1). Custom
@@ -2682,6 +2724,15 @@ export class Engine {
     // block (no kind dirty) still persists, preserving prior behavior. Temp state is adopted regardless
     // — never serialized, only swapped into the in-memory committed temp snapshot.
     const pureTemp = !tx.mainDirty && tx.tempDirty;
+    // A dirty session-local temp domain stages its working snapshot into its store (compact packed
+    // leaves; a spill to the host scratch sink once it outgrows temp_buffers) BEFORE the main persist,
+    // and adopts the page accounting only after it — so a failed temp write (a scratch-file I/O error)
+    // commits nothing, and a failed main persist leaves the temp store matching its still-committed
+    // root. Zero main-file writes (temp-tables.md §6).
+    const tempStaged =
+      tx.tempDirty && this.tempStorage !== null
+        ? stageTemp(this.tempStorage, tx.tempWorking, this.session.tempBuffers, this.spillSink)
+        : null;
     this.commitStagesRows = false;
     if (!pureTemp) {
       // The txid advances for a durable database, signalled by the presence of a persistHook (the file
@@ -2701,19 +2752,18 @@ export class Engine {
       working.freezeMutationGenerations();
       this.committed = working;
     }
+    // Adopt the staged temp commit's page accounting and run within-session compaction relative to the
+    // new temp root. Compaction is safe iff no streaming cursor holds an older temp tree.
+    if (tempStaged !== null && this.tempStorage !== null) {
+      adoptStaged(this.tempStorage, tx.tempWorking, tempStaged, this.openStreams === 0);
+    }
     // Adopt the transaction's temp changes into the committed temp snapshot (temp-tables.md §5) — the
     // temp analogue of publishing committed, but purely in memory. Session-local temp lives on the
     // session.
-    // A dirty session-local temp domain materializes its working snapshot into its MemoryBlockStore
-    // (compact packed leaves + within-session compaction) before it is adopted — zero main-file writes
-    // (temp-tables.md §6). Compaction is safe iff no streaming cursor holds an older temp tree.
-    if (tx.tempDirty && this.tempStorage !== null) {
-      persistTemp(this.tempStorage, tx.tempWorking, this.openStreams === 0);
-    }
     tx.tempWorking.freezeMutationGenerations();
     this.session.tempCommitted = tx.tempWorking;
     // Adopt each dirtied host-attached database (attached-databases.md §5, the N-root commit):
-    // materialize its working snapshot into the attachment's in-RAM block store (persistTemp-style — the
+    // materialize its working snapshot into the attachment's in-RAM block store (stageInMemory — the
     // same incremental copy-on-write pack as temp, NO fsync, since an in-memory attachment has no
     // durability barrier) and adopt it into this engine's pinned attached view, so publish (shared.ts)
     // swaps the new attached roots in one atomic step. Like temp this touches no MAIN file; unlike temp
@@ -2742,7 +2792,7 @@ export class Engine {
         // an in-memory one's forced compaction both start from the attachment's committed root.
         const prev = core.committedAttachment(name);
         // A FILE attachment commits DURABLY (dirty pages + alternating meta slot + fsync, its own page
-        // space); an in-memory one packs persist_temp-style (NO fsync). At most one file attachment is
+        // space); an in-memory one packs via stageInMemory (NO fsync). At most one file attachment is
         // dirty here (the one-durable-writer check above), so ≤1 fsync path runs.
         if (att.storage.path !== null) {
           ws.txid = (this.attachedCommitted.get(name)?.txid ?? 0n) + 1n; // alternating meta slot + reopen
@@ -2869,16 +2919,16 @@ export class Engine {
     );
   }
 
-  // checkTempBudget enforces the per-session temp-table storage budget (tempBuffers, spec/design/
-  // temp-tables.md §7) — the §13 gate on RETAINED temp bytes. Checked after each temp-writing
-  // statement: if the session's temp footprint (byte-identical on-disk record bytes, summed over every
-  // temp table + index) EXCEEDS the budget, throw 54P03. The over-budget write is in tempWorking, so
-  // the abort discards it (autocommit) or fails the block (rolled back at ROLLBACK) — nothing commits.
-  // tempBuffers 0 ⇒ unlimited; a transaction that did not touch temp cannot have grown it, so the check
-  // self-gates on tempDirty and is a no-op for ordinary (persistent) statements. Within-statement bound
-  // is maxCost.
+  // checkTempBudget enforces the per-session temp-table storage ceiling (maxTempStorageBytes,
+  // spec/design/temp-tables.md §7) — the §13 gate on RETAINED temp bytes. Checked after each
+  // temp-writing statement: if the session's temp footprint EXCEEDS the ceiling, throw 54P03. The
+  // over-budget write is in tempWorking, so the abort discards it (autocommit) or fails the block
+  // (rolled back at ROLLBACK) — nothing commits. 0 ⇒ unlimited; a transaction that did not touch temp
+  // cannot have grown it, so the check self-gates on tempDirty and is a no-op for ordinary (persistent)
+  // statements. Within-statement bound is maxCost. Resident and spilled pages count alike (§6):
+  // residency never moves the abort point.
   private checkTempBudget(): void {
-    const limit = this.session.tempBuffers;
+    const limit = this.session.maxTempStorageBytes;
     if (limit === 0) return;
     if (this.session.tx === null || !this.session.tx.tempDirty) return;
     // Page-based footprint of the session-local temp domain (temp-tables.md §7, Design decision 3): the
@@ -14674,6 +14724,7 @@ export class Engine {
     e.freeGenTxid = 0n;
     e.live = { live: 0, catalog: 0, gist: 0 };
     e.tempStorage = null;
+    e.spilled = false;
     e.openStreams = 0;
     e.estimatorTouched = new Set();
     // Not profiling EXPLAIN ANALYZE: the lane gates test `explainActualProfile === null`, so leaving it

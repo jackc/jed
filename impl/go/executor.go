@@ -60,13 +60,20 @@ const DefaultPageSize uint32 = 8192
 // SetMaxSQLLength. Identical across cores (§8).
 const DefaultMaxSQLLength = 1 << 20
 
-// DefaultTempBuffers is the default per-session storage budget for SESSION-LOCAL temporary tables, in
-// BYTES (spec/design/temp-tables.md §7). Temp tables RETAIN bytes across statements, which neither the
-// per-statement cost ceiling (maxCost) nor the cumulative budget (lifetimeMaxCost) bounds, so
-// tempBuffers is the §13 gate that does: the instant a session's resident temp storage (byte-identical
-// on-disk record bytes) would exceed it, the write aborts 54P03. 0 ⇒ unlimited (a trusted handle).
+// DefaultTempBuffers is the default per-session RESIDENT budget for SESSION-LOCAL temporary tables, in
+// BYTES (spec/design/temp-tables.md §6/§7) — PostgreSQL's temp_buffers. Once a session's temp domain
+// outgrows it, a host with a spill directory migrates the domain to a scratch file and bounds its page
+// cache by it. Residency only: results, cost, and the 54P03 point never depend on it. 0 ⇒ never spill
+// (unbounded residency).
+const DefaultTempBuffers = 32 << 20
+
+// DefaultMaxTempStorageBytes is the default per-session storage ceiling for SESSION-LOCAL temporary
+// tables, in BYTES (spec/design/temp-tables.md §7). Temp tables RETAIN bytes across statements, which
+// neither the per-statement cost ceiling (maxCost) nor the cumulative budget (lifetimeMaxCost) bounds,
+// so maxTempStorageBytes is the §13 gate that does: once the temp domain's committed page bytes exceed
+// it — resident or spilled alike — the next temp write aborts 54P03. 0 ⇒ unlimited (a trusted handle).
 // Identical across cores (§8); the abort point is part of the cross-core contract.
-const defaultTempBuffers = 32 << 20
+const DefaultMaxTempStorageBytes = 1 << 30
 
 // maxCompositeDepth is the maximum composite-type nesting depth (CLAUDE.md §13; spec/design/cost.md
 // §7b). A composite type's depth is the length of its deepest chain of nested composites, counting

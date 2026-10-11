@@ -538,8 +538,12 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   temporary tables ride the same host** (`spec/design/temp-tables.md` §6, the temp-blockstore slice):
   each session-local temp domain is its own in-RAM `MemoryBlockStore` + pinned pager with
   **within-session free-list compaction** (a never-reopened store reclaims its copy-on-write orphans
-  rather than leaking a page per commit), so temp is compact + bounded (its `54P03` budget is now the
-  domain's committed page bytes) and spill-to-disk is a clean `BlockStore` swap. (A database-wide
+  rather than leaking a page per commit), so temp is compact + bounded (its `54P03` ceiling,
+  `max_temp_storage_bytes`, is the domain's committed page bytes). **Temp spill-to-disk has landed as
+  exactly that `BlockStore` swap:** past `temp_buffers` (now the *resident* budget, PG's meaning) a file
+  host migrates the domain into an unlinked scratch file in its spill directory and bounds the domain's
+  page cache by `temp_buffers` — residency only, results/cost/`54P03`-neutral; in-memory/OPFS/WASI
+  hosts have no spill target and stay resident. (A database-wide
   `SHARED` temp kind was briefly shipped, then removed — `spec/design/attached-databases.md` §6 — so
   temp is now session-local only.)
   Designing this seam early is what makes "single-file, embeddable, everywhere" work — the OPFS host

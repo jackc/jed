@@ -98,7 +98,7 @@ transaction commits or rolls back. Each statement starts with those bytes alread
 every statement they must still fit, so a long transaction of many small `INSERT`s fails with
 `54P05` instead of growing without bound. Rewriting the same row counts again: the budget bounds how
 much a transaction writes, not how much it ends up holding. Temporary tables are bounded by
-`temp_buffers` instead.
+`max_temp_storage_bytes` instead.
 
 ## Storage limit
 
@@ -173,6 +173,8 @@ sort, hash JOIN, aggregation, and DISTINCT spill when they exceed `work_mem` —
 query-memory budget would otherwise reject them, so a large sort or aggregate spills rather than
 fails and releases its charge as it spills. Row buffers that cannot spill, such as a derived
 table's result, still fail at the budget; `work_mem = 0` disables spilling entirely. Spill scratch storage preserves results and deterministic costs;
-in-memory and OPFS databases remain resident. `temp_buffers` limits retained temporary storage.
+in-memory and OPFS databases remain resident. `max_temp_storage_bytes` limits retained temporary
+storage (`54P03`); `temp_buffers` bounds how much of it stays in memory before a file-backed
+database spills temp tables to a scratch file.
 Hosts exposing arbitrary untrusted SQL should combine these settings with process-level memory
 limits and account for host-retained results.

@@ -288,14 +288,20 @@ pub const DEFAULT_PAGE_SIZE: u32 = 8192;
 /// [`Engine::set_max_sql_length`]. Identical across cores (§8).
 pub const DEFAULT_MAX_SQL_LENGTH: usize = 1 << 20;
 
-/// The default per-session storage budget for SESSION-LOCAL temporary tables, in **bytes**
+/// The default per-session RESIDENT budget for SESSION-LOCAL temporary tables, in **bytes**
+/// (spec/design/temp-tables.md §6/§7) — PostgreSQL's `temp_buffers`. Once a session's temp domain
+/// outgrows it, a host with a spill directory migrates the domain to a scratch file and bounds its
+/// page cache by it. Residency only: results, cost, and the `54P03` point never depend on it. `0` ⇒
+/// never spill (unbounded residency).
+pub const DEFAULT_TEMP_BUFFERS: usize = 32 << 20;
+
+/// The default per-session storage ceiling for SESSION-LOCAL temporary tables, in **bytes**
 /// (spec/design/temp-tables.md §7). Temp tables RETAIN bytes across statements, which neither the
 /// per-statement cost ceiling (`max_cost`) nor the cumulative budget (`lifetime_max_cost`) bounds, so
-/// `temp_buffers` is the §13 gate that does: the instant a session's resident temp storage (measured
-/// in the same deterministic logical-byte estimator `work_mem` uses) would exceed it, the write
-/// aborts `54P03`. `0` ⇒ unlimited (a trusted handle); the untrusted-scratch pattern leaves this at a
-/// modest default. Identical across cores (§8); the abort point is part of the cross-core contract.
-pub const DEFAULT_TEMP_BUFFERS: usize = 32 << 20;
+/// `max_temp_storage_bytes` is the §13 gate that does: once the temp domain's committed page bytes
+/// exceed it — resident or spilled alike — the next temp write aborts `54P03`. `0` ⇒ unlimited (a
+/// trusted handle). Identical across cores (§8); the abort point is part of the cross-core contract.
+pub const DEFAULT_MAX_TEMP_STORAGE_BYTES: usize = 1 << 30;
 
 /// The maximum composite-type nesting depth (CLAUDE.md §13; spec/design/cost.md §7b). A composite
 /// type's depth is the length of its deepest chain of nested composites, counting itself: a row of
@@ -496,7 +502,7 @@ pub struct Engine {
     pub(crate) temp_storage: Option<crate::shared::Storage>,
     /// The count of this handle's live streaming cursors (a `query` pull source, not a materialized
     /// result). A streaming cursor pins a snapshot it faults lazily, so while one is open a temp-domain
-    /// compaction (`persist_temp` → `maybe_compact`) must NOT reclaim pages — it could free one the cursor
+    /// compaction (`adopt_staged` → `maybe_compact`) must NOT reclaim pages — it could free one the cursor
     /// still faults. Incremented when a streaming `Rows` opens (shared.rs), decremented on its `Drop`
     /// (via an `OpenStreamGuard` bundled into the cursor's pin) — hence the `Arc<AtomicUsize>`: the guard
     /// outlives the `&mut self` borrow that built the cursor.
@@ -744,10 +750,15 @@ pub struct SessionOptions {
     /// all DDL). The untrusted-scratch pattern is `allow_ddl = false` + `allow_temp_ddl = Some(true)`
     /// — private scratch tables only, everything else denied, the §5.3 default-deny posture intact.
     pub allow_temp_ddl: Option<bool>,
-    /// The per-session storage budget for session-local temp tables, in **bytes**
-    /// (spec/design/temp-tables.md §7); `0` ⇒ unlimited. Default [`DEFAULT_TEMP_BUFFERS`]. Bounds the
-    /// RETAINED temp storage neither cost ceiling covers — an over-budget temp write aborts `54P03`.
+    /// The per-session RESIDENT budget for session-local temp tables, in **bytes**
+    /// (spec/design/temp-tables.md §6); `0` ⇒ never spill. Default [`DEFAULT_TEMP_BUFFERS`]. Past it a
+    /// host with a spill directory moves the temp domain to a scratch file with a page cache this size.
     pub temp_buffers: usize,
+    /// The per-session storage CEILING for session-local temp tables, in **bytes**
+    /// (spec/design/temp-tables.md §7); `0` ⇒ unlimited. Default [`DEFAULT_MAX_TEMP_STORAGE_BYTES`].
+    /// Bounds the RETAINED temp storage neither cost ceiling covers — an over-ceiling temp write aborts
+    /// `54P03`, whether the domain is resident or spilled.
+    pub max_temp_storage_bytes: usize,
     /// The session **time zone** (spec/design/session.md §6.2, timezones.md §9.4): the zone a
     /// `timestamptz` is decomposed *in* by `date_trunc` / `EXTRACT` / the cross-family datetime casts.
     /// Default `"UTC"`. Accepts `UTC`, a fixed `±HH:MM` offset, or a **named** IANA zone a loaded
@@ -771,6 +782,7 @@ impl Default for SessionOptions {
             allow_ddl: true,
             allow_temp_ddl: None,
             temp_buffers: DEFAULT_TEMP_BUFFERS,
+            max_temp_storage_bytes: DEFAULT_MAX_TEMP_STORAGE_BYTES,
             time_zone: "UTC".to_string(),
         }
     }
@@ -895,9 +907,12 @@ pub struct SessionState {
     /// denied temp DDL is `42501`. Resolved at session creation from
     /// [`SessionOptions::allow_temp_ddl`] (defaulting to `allow_ddl`'s value when unset).
     pub(crate) allow_temp_ddl: bool,
-    /// The per-session temp-table storage budget in **bytes** (spec/design/temp-tables.md §7); `0` ⇒
-    /// unlimited. An over-budget temp write aborts `54P03`.
+    /// The per-session temp-table RESIDENT budget in **bytes** (spec/design/temp-tables.md §6); `0` ⇒
+    /// never spill.
     pub(crate) temp_buffers: usize,
+    /// The per-session temp-table storage CEILING in **bytes** (spec/design/temp-tables.md §7); `0` ⇒
+    /// unlimited. An over-ceiling temp write aborts `54P03`.
+    pub(crate) max_temp_storage_bytes: usize,
     /// The session variables (spec/design/session.md §6.1): PostgreSQL's GUC model scoped to the
     /// session — a `string→string` map (PG GUCs are all text) the host sets (`set_var`/`reset_var`)
     /// and SQL reads with `current_setting`. Custom (dotted) names only in v1. **SessionState state, not
@@ -1084,6 +1099,7 @@ impl SessionState {
             // as it did (one gate governing all DDL).
             allow_temp_ddl: opts.allow_temp_ddl.unwrap_or(opts.allow_ddl),
             temp_buffers: opts.temp_buffers,
+            max_temp_storage_bytes: opts.max_temp_storage_bytes,
             temp_committed: Snapshot::default(),
             vars: HashMap::new(),
             // Resolve the configured zone once; an invalid value falls back to UTC at mint (the
@@ -1196,13 +1212,21 @@ impl SessionState {
     pub fn allow_temp_ddl(&self) -> bool {
         self.allow_temp_ddl
     }
-    /// Set the per-session temp-table storage budget in bytes; `0` ⇒ unlimited.
+    /// Set the per-session temp-table resident budget in bytes; `0` ⇒ never spill.
     pub fn set_temp_buffers(&mut self, bytes: usize) {
         self.temp_buffers = bytes;
     }
-    /// The current per-session temp-table storage budget.
+    /// The current per-session temp-table resident budget.
     pub fn temp_buffers(&self) -> usize {
         self.temp_buffers
+    }
+    /// Set the per-session temp-table storage ceiling in bytes; `0` ⇒ unlimited.
+    pub fn set_max_temp_storage_bytes(&mut self, bytes: usize) {
+        self.max_temp_storage_bytes = bytes;
+    }
+    /// The current per-session temp-table storage ceiling.
+    pub fn max_temp_storage_bytes(&self) -> usize {
+        self.max_temp_storage_bytes
     }
     /// Replace the default table-privilege set — the `GRANT … ON ALL TABLES` default (§5.3). A
     /// read-only session is `PrivilegeSet::EMPTY.with(Privilege::Select)`.

@@ -653,10 +653,10 @@ var SupportedCapabilities = []string{
 	// network, process, environment) or adds nondeterminism outside the entropy seam; escape-hatch
 	// calls are 42883 and escape-hatch statements 42601 (CLAUDE.md §13; functions.md §13).
 	"resource.pure_builtins",
-	// Temp-table storage budget — temp_buffers bounds a session's RETAINED temporary-table bytes (the
-	// hazard no cost ceiling covers); an over-budget temp write aborts 54P03. Measured in byte-identical
-	// on-disk record bytes, checked per-statement, so the abort is cross-core-identical. The
-	// # temp_buffers: directive sets the per-record budget (spec/design/temp-tables.md §7).
+	// Temp-table storage ceiling — max_temp_storage_bytes bounds a session's RETAINED temporary-table
+	// bytes (the hazard no cost ceiling covers); an over-ceiling temp write aborts 54P03. Measured in the
+	// temp domain's committed page bytes, checked per-statement, so the abort is cross-core-identical.
+	// The # max_temp_storage_bytes: directive sets the per-record ceiling (spec/design/temp-tables.md §7).
 	"resource.temp_budget",
 	// Session privileges — the GRANT/REVOKE envelope (per-table SELECT/INSERT/UPDATE/DELETE +
 	// function EXECUTE), enforced at name resolution with 42501; the # default_privileges: /

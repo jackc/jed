@@ -301,6 +301,36 @@ func (p *pager) swapStore(store blockStore) blockStore {
 	return old
 }
 
+// migrateStore moves the store's bytes into store and adopts it, closing the old backing — a
+// session-local temp domain spilling from its in-RAM store to a scratch file (spec/design/temp-tables.md
+// §6). The page layout is unchanged byte for byte, so every page id stays valid. Copies in bounded 1 MiB
+// chunks; on an error the old store stays in place, untouched, and the new one is closed.
+func (p *pager) migrateStore(store blockStore) error {
+	const chunk = 1 << 20
+	size, err := p.store.size()
+	if err == nil {
+		for off := int64(0); off < size; {
+			n := min(size-off, chunk)
+			var bytes []byte
+			if bytes, err = p.store.readAt(off, int(n)); err != nil {
+				break
+			}
+			if err = store.writeAt(off, bytes); err != nil {
+				break
+			}
+			off += n
+		}
+	}
+	if err != nil {
+		_ = store.close()
+		return err
+	}
+	old := p.store
+	p.store = store
+	_ = old.close()
+	return nil
+}
+
 // skipsSync reports whether the backing skips its durability barrier (fsync=off).
 func (p *pager) skipsSync() bool {
 	s, ok := p.store.(syncSkipper)

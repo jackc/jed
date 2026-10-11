@@ -232,6 +232,19 @@ func (db *engine) commitTx() (outcome, error) {
 	// kind dirty) still persists, preserving prior behavior. Temp state is adopted regardless — never
 	// serialized, only swapped into the in-memory committed temp snapshot.
 	pureTemp := !tx.mainDirty && tx.tempDirty
+	// A dirty session-local temp domain stages its working snapshot into its store (compact packed
+	// leaves; a spill to the host scratch directory once it outgrows tempBuffers) BEFORE the main
+	// persist, and adopts the page accounting only after it — so a failed temp write (a scratch-file I/O
+	// error) commits nothing, and a failed main persist leaves the temp store matching its
+	// still-committed root. Zero main-file writes (temp-tables.md §6).
+	var tempStaged *stagedCommit
+	if tx.tempDirty && db.tempStorage != nil {
+		staged, err := db.tempStorage.stageTemp(tx.tempWorking, db.session.tempBuffers, db.spillDir)
+		if err != nil {
+			return outcome{}, err
+		}
+		tempStaged = &staged
+	}
 	db.commitStagesRows = false
 	if !pureTemp {
 		if db.path != "" {
@@ -247,11 +260,10 @@ func (db *engine) commitTx() (outcome, error) {
 		working.freezeMutationGenerations()
 		db.committed = working
 	}
-	// A dirty session-local temp domain materializes its working snapshot into its MemoryBlockStore
-	// (compact packed leaves + within-session compaction) before it is adopted — zero main-file writes
-	// (temp-tables.md §6). Compaction is safe iff no streaming cursor holds an older temp tree.
-	if tx.tempDirty && db.tempStorage != nil {
-		if err := db.tempStorage.persistTemp(tx.tempWorking, db.openStreams == 0, nil); err != nil {
+	// Adopt the staged temp commit's page accounting and run within-session compaction relative to the
+	// new temp root. Compaction is safe iff no streaming cursor holds an older temp tree.
+	if tempStaged != nil {
+		if err := db.tempStorage.adoptTemp(tx.tempWorking, *tempStaged, db.openStreams == 0); err != nil {
 			return outcome{}, err
 		}
 	}
@@ -259,7 +271,7 @@ func (db *engine) commitTx() (outcome, error) {
 	db.session.tempCommitted = tx.tempWorking
 	// Adopt each dirtied host-attached database (attached-databases.md §5, the N-root commit) and adopt it
 	// into this engine's pinned attached view, so publish swaps a new roots.attached. An IN-MEMORY
-	// attachment STAGES into its block store persistTemp-style (the same incremental copy-on-write pack as
+	// attachment STAGES into its block store temp-style (the same incremental copy-on-write pack as
 	// temp, NO fsync — no durability barrier) into free or past-high-water pages; its page accounting and
 	// compaction are adopted only after main persists and the roots publish, so a failure anywhere before
 	// that leaves its storage matching its still-published root. A FILE attachment (Slice 2) commits

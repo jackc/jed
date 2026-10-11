@@ -255,6 +255,73 @@ impl BlockStore for MemoryBlockStore {
     }
 }
 
+/// The **scratch** storage host for a spilled session-local temp domain (spec/design/temp-tables.md
+/// §6): a private file in the host spill directory, never the database file. A temp domain is never
+/// reopened and has no durability barrier, so `sync` and the grow barrier are no-ops. The file is
+/// unlinked as soon as it is created where the OS allows an open file to be unlinked (so a crash
+/// leaves nothing behind), and otherwise when this store drops.
+pub(crate) struct ScratchBlockStore {
+    /// The open scratch file; `None` only while dropping (closed before the unlink, for Windows).
+    inner: Option<FileBlockStore>,
+    /// The path still to remove on drop; `None` once unlinked.
+    path: Option<std::path::PathBuf>,
+}
+
+impl ScratchBlockStore {
+    /// Create an empty scratch file under `dir` (exclusive, private mode — spill.rs).
+    pub(crate) fn create(dir: &std::path::Path) -> Result<ScratchBlockStore> {
+        let (path, file) = crate::spill::create_spill_file(dir)?;
+        let path = match std::fs::remove_file(&path) {
+            Ok(()) => None,
+            Err(_) => Some(path),
+        };
+        Ok(ScratchBlockStore {
+            inner: Some(FileBlockStore::new(file, true)),
+            path,
+        })
+    }
+
+    fn file(&mut self) -> &mut FileBlockStore {
+        self.inner.as_mut().expect("scratch file open until drop")
+    }
+}
+
+impl Drop for ScratchBlockStore {
+    fn drop(&mut self) {
+        // Close before unlinking: Windows cannot remove an open file.
+        drop(self.inner.take());
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl BlockStore for ScratchBlockStore {
+    fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        self.file().read_at(offset, len)
+    }
+
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        self.file().write_at(offset, bytes)
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn size(&mut self) -> Result<u64> {
+        self.file().size()
+    }
+
+    fn set_size(&mut self, bytes: u64) -> Result<()> {
+        self.file().set_size(bytes)
+    }
+
+    fn skips_sync(&self) -> bool {
+        true
+    }
+}
+
 fn io_error(e: std::io::Error) -> EngineError {
     EngineError::new(SqlState::IoError, format!("I/O error: {e}"))
 }

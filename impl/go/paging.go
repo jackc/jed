@@ -106,6 +106,12 @@ func (s *sharedPaging) capacity() int {
 	return s.pool.capacityPages()
 }
 
+// setCapacity re-bounds the pool to capacity leaves, evicting until the resident set fits (a spilled
+// temp domain, spec/design/temp-tables.md §6).
+func (s *sharedPaging) setCapacity(capacity int) {
+	s.pool.setCapacity(capacity)
+}
+
 // residentLeaves is the number of leaf pages currently resident in the pool — the bound the
 // demand-paging tests assert stays below the budget even for a database far larger than it. P6.4c
 // promotes it to the public memory-budget surface.

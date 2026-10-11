@@ -414,9 +414,11 @@ export function rollback(db: Engine): void {
 // close releases the handle (spec/design/api.md §2.3). It rolls back any open explicit transaction
 // (its in-progress work is discarded) and does not commit one. Under autocommit every prior
 // statement is already durable, so — unlike the original model — close does NOT drop committed
-// work; durability is never hidden in a destructor. Idempotent.
+// work; durability is never hidden in a destructor. The default session's temp domain is dropped too
+// (a spilled one's scratch file released — temp-tables.md §6). Idempotent.
 export function close(db: Engine): void {
   db.rollbackTx();
+  db.releaseTempStorage();
   db.path = null;
   if (db.paging !== null) {
     db.paging.close(); // drop the open fd (close it)

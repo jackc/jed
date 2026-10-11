@@ -328,16 +328,28 @@ impl Engine {
         self.session.allow_temp_ddl
     }
 
-    /// Set the default session's per-session temp-table storage budget in **bytes**
-    /// (spec/design/temp-tables.md §7); `0` ⇒ unlimited. An over-budget temp write aborts `54P03`. A
-    /// handle setting, not stored in the file.
+    /// Set the default session's temp-table RESIDENT budget in **bytes** (spec/design/temp-tables.md
+    /// §6); `0` ⇒ never spill. Past it a file host moves the temp domain to a scratch file whose page
+    /// cache it bounds. A handle setting, not stored in the file; it never changes results or cost.
     pub fn set_temp_buffers(&mut self, bytes: usize) {
         self.session.temp_buffers = bytes;
     }
 
-    /// The default session's per-session temp-table storage budget (`0` ⇒ unlimited).
+    /// The default session's temp-table resident budget (`0` ⇒ never spill).
     pub fn temp_buffers(&self) -> usize {
         self.session.temp_buffers
+    }
+
+    /// Set the default session's temp-table storage CEILING in **bytes** (spec/design/temp-tables.md
+    /// §7); `0` ⇒ unlimited. An over-ceiling temp write aborts `54P03`. A handle setting, not stored
+    /// in the file.
+    pub fn set_max_temp_storage_bytes(&mut self, bytes: usize) {
+        self.session.max_temp_storage_bytes = bytes;
+    }
+
+    /// The default session's temp-table storage ceiling (`0` ⇒ unlimited).
+    pub fn max_temp_storage_bytes(&self) -> usize {
+        self.session.max_temp_storage_bytes
     }
 
     /// Set a session variable on the default session (spec/design/session.md §6.1). Custom variables
@@ -929,6 +941,19 @@ impl Engine {
         // adopted regardless — it is never serialized, only swapped into the in-memory committed temp
         // snapshot.
         let pure_temp = !main_dirty && temp_dirty;
+        // A dirty session-local temp domain stages its working snapshot into its store (compact packed
+        // leaves; a spill to the host scratch directory once it outgrows `temp_buffers`) BEFORE the main
+        // persist, and adopts the page accounting only after it — so a failed temp write (a scratch-file
+        // I/O error) commits nothing, and a failed main persist leaves the temp store matching its
+        // still-committed root. Zero main-file writes (temp-tables.md §6).
+        let temp_staged = match (temp_dirty, self.temp_storage.as_mut()) {
+            (true, Some(ts)) => Some(ts.stage_temp(
+                &mut temp_working,
+                self.session.temp_buffers,
+                self.spill_dir.as_deref(),
+            )?),
+            _ => None,
+        };
         self.commit_stages_rows = false;
         if !pure_temp {
             // The txid is the durable commit counter (spec/design/api.md §2): it advances only on a
@@ -943,14 +968,11 @@ impl Engine {
             self.persist(&working)?; // no-op for an in-memory database
             self.committed = working;
         }
-        // A dirty session-local temp domain materializes its working snapshot into its `MemoryBlockStore`
-        // (compact packed leaves + within-session compaction) before it is adopted — zero main-file
-        // writes (temp-tables.md §6). Compaction is safe iff no streaming cursor holds an older temp tree.
-        if temp_dirty {
+        // Adopt the staged temp commit's page accounting and run within-session compaction relative to
+        // the new temp root. Compaction is safe iff no streaming cursor holds an older temp tree.
+        if let (Some(staged), Some(ts)) = (temp_staged, self.temp_storage.as_mut()) {
             let can_reclaim = self.open_streams.load(std::sync::atomic::Ordering::Relaxed) == 0;
-            if let Some(ts) = self.temp_storage.as_mut() {
-                ts.persist_temp(&mut temp_working, can_reclaim, None)?;
-            }
+            ts.adopt_staged(&temp_working, staged, can_reclaim)?;
         }
         // Adopt the transaction's temp changes into the committed temp snapshot (temp-tables.md §5) — the
         // temp analogue of publishing `committed`, but purely in memory. SessionState-local temp lives on
@@ -958,7 +980,7 @@ impl Engine {
         self.session.temp_committed = temp_working;
         // Adopt each dirtied host-attached database (attached-databases.md §5, the N-root commit) and
         // adopt it into this engine's pinned attached view, so `publish` swaps a new `Roots::attached`. An
-        // IN-MEMORY attachment STAGES persist_temp-style (the same incremental copy-on-write pack as temp,
+        // IN-MEMORY attachment STAGES temp-style (the same incremental copy-on-write pack as temp,
         // NO fsync — no durability barrier) into free or past-high-water pages; its page accounting and
         // compaction are adopted only after main persists and the roots publish, so a failure anywhere
         // before that leaves its storage matching its still-published root. A FILE attachment (Slice 2)

@@ -129,6 +129,11 @@ export class SharedPaging {
   skipsSync(): boolean {
     return this.pager.skipsSync();
   }
+  // migrateStore moves the pager's bytes into store and adopts it (a spilling temp domain,
+  // spec/design/temp-tables.md §6 — Pager.migrateStore).
+  migrateStore(store: BlockStore): void {
+    this.pager.migrateStore(store);
+  }
   poison(): void {
     this.pager.poison();
   }
@@ -137,6 +142,12 @@ export class SharedPaging {
   // reopens the database (spec/design/api.md §2.6).
   capacity(): number {
     return this.pool.capacity;
+  }
+
+  // setCapacity re-bounds the pool to capacity leaves, evicting until the resident set fits (a spilled
+  // temp domain, spec/design/temp-tables.md §6).
+  setCapacity(capacity: number): void {
+    this.pool.setCapacity(capacity);
   }
 
   // armFault arms a one-shot commit fault on the backing pager — the fault-injection seam

@@ -7,7 +7,7 @@ use jed::{CreateOptions, Database, Locking, OpenOptions, SessionOptions};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 6 {
-        return Err("usage: spill create|open database work_mem sql.tsv cache_bytes".into());
+        return Err("usage: spill create|open|temp database budget sql.tsv cache_bytes".into());
     }
     let budget: usize = args[3].parse()?;
     let cache: usize = args[5].parse()?;
@@ -32,7 +32,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?
     };
     let mut session = db.session(SessionOptions::default());
-    session.set_work_mem(budget);
+    if args[1] == "temp" {
+        // Temp-table spill (spec/design/temp-tables.md §6): the budget is the resident temp_buffers.
+        session.set_temp_buffers(budget);
+        session.set_max_temp_storage_bytes(0);
+    } else {
+        session.set_work_mem(budget);
+    }
     for line in BufReader::new(std::fs::File::open(&args[4])?).lines() {
         let line = line?;
         let (name, sql) = line.split_once('\t').ok_or("invalid workload line")?;

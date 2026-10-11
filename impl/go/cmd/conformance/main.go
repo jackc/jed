@@ -67,6 +67,24 @@ func run() int {
 		}
 	}
 
+	// The forced temp-spill mode walks only the files that create temp tables: giving a memory-mode
+	// database a spill directory also lets blocking operators spill where the corpus pins that an
+	// in-memory database cannot (the 54P05 query-memory records).
+	forced, err := forcedTempBuffers()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if forced >= 0 {
+		var selected []string
+		for _, path := range files {
+			if data, err := os.ReadFile(path); err == nil && createsTempTable(string(data)) {
+				selected = append(selected, path)
+			}
+		}
+		files = selected
+	}
+
 	supported := map[string]bool{}
 	for _, c := range jed.SupportedCapabilities {
 		supported[c] = true
@@ -134,6 +152,14 @@ func run() int {
 	}
 
 	fmt.Printf("\n[%s] %d passed, %d failed, %d skipped\n", mode, passed, failed, skipped)
+	if forced >= 0 {
+		spills := jed.TempSpills()
+		fmt.Printf("[%s] forced temp spill: %d temp domain(s) spilled\n", mode, spills)
+		if spills == 0 && !disk && passed > 0 {
+			fmt.Fprintln(os.Stderr, "JED_CONFORMANCE_TEMP_BUFFERS set but no temp domain spilled")
+			return 1
+		}
+	}
 	if failed != 0 {
 		return 1
 	}
@@ -617,12 +643,34 @@ func parseWorkMemDirective(line string) (int, bool) {
 	return n, true
 }
 
-// parseTempBuffersDirective parses a `# temp_buffers: N` directive line (spec/design/temp-tables.md
-// §7): the per-session temp-table storage budget (bytes) to run the next record under (0 ⇒ unlimited).
-// Mirrors `# max_cost:` — per-record, reset after — so a record can set a small budget and assert that
-// an over-budget temp write traps 54P03.
-func parseTempBuffersDirective(line string) (int, bool) {
-	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "temp_buffers:")
+// forcedTempBuffers is the forced temp-spill mode's resident budget (JED_CONFORMANCE_TEMP_BUFFERS,
+// bytes): memory-mode databases get a spill directory and every session this temp_buffers, so each temp
+// domain past it spills to a scratch file (spec/design/temp-tables.md §6). -1 when unset.
+func forcedTempBuffers() (int, error) {
+	bytes := os.Getenv("JED_CONFORMANCE_TEMP_BUFFERS")
+	if bytes == "" {
+		return -1, nil
+	}
+	n, err := strconv.Atoi(bytes)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("JED_CONFORMANCE_TEMP_BUFFERS must be nonnegative bytes")
+	}
+	return n, nil
+}
+
+// createsTempTable reports whether a corpus file creates a session-local temp table (the forced
+// temp-spill mode's file set).
+func createsTempTable(text string) bool {
+	upper := strings.ToUpper(text)
+	return strings.Contains(upper, "CREATE TEMP ") || strings.Contains(upper, "CREATE TEMPORARY ")
+}
+
+// parseMaxTempStorageDirective parses a `# max_temp_storage_bytes: N` directive line
+// (spec/design/temp-tables.md §7): the per-session temp-table storage ceiling (bytes) to run the next
+// record under (0 ⇒ unlimited). Mirrors `# max_cost:` — per-record, reset after — so a record can set a
+// small ceiling and assert that an over-ceiling temp write traps 54P03.
+func parseMaxTempStorageDirective(line string) (int, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "max_temp_storage_bytes:")
 	if !ok {
 		return 0, false
 	}
@@ -803,6 +851,10 @@ func recordPeak(ordinal int, db *jed.Database) {
 }
 
 func runFile(text string, disk bool) error {
+	forcedTemp, err := forcedTempBuffers()
+	if err != nil {
+		return err
+	}
 	// In DISK mode the file is backed by a temp .jed image reopened before every record (below), so each
 	// committed read faults from disk; in MEMORY mode it is a fresh in-memory Database. tmpPath is "" in
 	// memory mode. (spec/design/conformance.md §3.)
@@ -829,6 +881,11 @@ func runFile(text string, disk bool) error {
 		db, err = jed.CreateDatabase(jed.CreateOptions{}) // in-memory: no path
 		if err != nil {
 			return fmt.Errorf("in-memory create: %w", err)
+		}
+		// Forced temp spill (JED_CONFORMANCE_TEMP_BUFFERS, temp-tables.md §6): an in-memory database has
+		// no spill target, so give it one — temp domains then spill to scratch files.
+		if forcedTemp >= 0 {
+			jed.SetSpillDirForTooling(db, os.TempDir())
 		}
 	}
 	// Database no longer owns a persistent default session (it mints a fresh session per convenience
@@ -895,7 +952,7 @@ func runFile(text string, disk bool) error {
 	var pendingRevokes []privDelta
 	var pendingAllowDDL *bool
 	var pendingAllowTempDDL *bool
-	var pendingTempBuffers *int
+	var pendingMaxTempStorage *int
 	var pendingWorkMem *int
 	var pendingScalarBytes *int64
 	var pendingQueryMemory *int64
@@ -1015,8 +1072,8 @@ func runFile(text string, disk bool) error {
 				pendingScalarBytes = &n
 			} else if n, ok := parseMaxCostDirective(strings.Replace(line, "max_query_memory_bytes:", "max_cost:", 1)); ok {
 				pendingQueryMemory = &n
-			} else if n, ok := parseTempBuffersDirective(line); ok {
-				pendingTempBuffers = &n
+			} else if n, ok := parseMaxTempStorageDirective(line); ok {
+				pendingMaxTempStorage = &n
 			} else if n, ok := parseWorkMemDirective(line); ok {
 				pendingWorkMem = &n
 			} else if vars, ok := parseSetDirective(line); ok {
@@ -1061,6 +1118,13 @@ func runFile(text string, disk bool) error {
 			workMem = budget
 		}
 		sess.SetWorkMem(workMem)
+		// The temp-table resident budget: the forced-spill override (JED_CONFORMANCE_TEMP_BUFFERS),
+		// otherwise the default. Residency only — results, cost, and 54P03 never depend on it.
+		if forcedTemp >= 0 {
+			sess.SetTempBuffers(forcedTemp)
+		} else {
+			sess.SetTempBuffers(jed.DefaultTempBuffers)
+		}
 		expectedCost := pendingCost
 		expectedNames := pendingNames
 		expectedTypes := pendingTypes
@@ -1128,11 +1192,11 @@ func runFile(text string, disk bool) error {
 		pendingRevokes = nil
 		pendingAllowDDL = nil
 		pendingAllowTempDDL = nil
-		// Apply the per-record temp-storage budget (temp-tables.md §7); absent ⇒ unlimited (0), so a
-		// `# temp_buffers:` directive never leaks past its record. Mirrors `# max_cost:`.
-		tempBuffers := 0
-		if pendingTempBuffers != nil {
-			tempBuffers = *pendingTempBuffers
+		// Apply the per-record temp-storage ceiling (temp-tables.md §7); absent ⇒ unlimited (0), so a
+		// `# max_temp_storage_bytes:` directive never leaks past its record. Mirrors `# max_cost:`.
+		maxTempStorage := 0
+		if pendingMaxTempStorage != nil {
+			maxTempStorage = *pendingMaxTempStorage
 		}
 		scalarBytes := int64(0)
 		if pendingScalarBytes != nil {
@@ -1151,8 +1215,8 @@ func runFile(text string, disk bool) error {
 		underflowsBefore := jed.QueryMemoryUnderflows()
 		jed.ResetQueryMemoryPeak()
 		recordOrdinal++
-		sess.SetTempBuffers(tempBuffers)
-		pendingTempBuffers = nil
+		sess.SetMaxTempStorageBytes(maxTempStorage)
+		pendingMaxTempStorage = nil
 		// Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
 		// pending # set: pair, so a directive decorates only its record and never leaks forward.
 		sess.ResetVars()

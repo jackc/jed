@@ -1660,14 +1660,19 @@ export class Session {
     if (this.engine.session.tx !== null) this.endBlock(false);
   }
 
-  // close closes the session (spec/design/session.md §2.3): roll back any open block and deregister
-  // its snapshot pin (advancing the watermark). Idempotent; the caller must call it (no destructor in
+  // close closes the session (spec/design/session.md §2.3): roll back any open block, deregister its
+  // snapshot pin (advancing the watermark), and drop its session-local temp domain — closing a spilled
+  // domain's scratch file (temp-tables.md §6). Idempotent; the caller must call it (no destructor in
   // JS), idiomatically in a finally.
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    if (this.engine.session.tx !== null) this.endBlock(false);
-    else this.finishBlock();
+    try {
+      if (this.engine.session.tx !== null) this.endBlock(false);
+      else this.finishBlock();
+    } finally {
+      this.engine.releaseTempStorage();
+    }
   }
 
   // view runs fn in a READ ONLY transaction on this session (bbolt-style, §2.2): open a read block,
@@ -1816,8 +1821,15 @@ export class Session {
   setAllowTempDdl(allow: boolean): void {
     this.engine.setAllowTempDdl(allow);
   }
+  // setTempBuffers sets the per-session temporary-table resident budget in bytes; 0 ⇒ never spill
+  // (temp-tables.md §6).
   setTempBuffers(bytes: number): void {
     this.engine.setTempBuffers(bytes);
+  }
+  // setMaxTempStorageBytes sets the per-session temporary-table storage ceiling in bytes; 0 ⇒ unlimited
+  // (temp-tables.md §7). An over-ceiling temp write aborts 54P03.
+  setMaxTempStorageBytes(bytes: number): void {
+    this.engine.setMaxTempStorageBytes(bytes);
   }
   setVar(name: string, value: string): void {
     this.engine.session.setVar(name, value);
