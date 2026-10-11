@@ -303,7 +303,7 @@ func (db *engine) tryScanQuery(stmt statement, params []Value, sc *stmtCache) (*
 // full/contiguous-PK scans; generalized bounded streams run through the buffered cursor on first pull.
 // Under full drain the rows + total cost are byte-identical to the eager path.
 func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, plabels, resultTypes []string, params []Value, doFold bool) (*Rows, bool, error) {
-	bound, err := bindParamsWithLabels(params, ptys, plabels)
+	bound, err := bindParamsWithLabels(params, ptys, plabels, db.inputZone())
 	if err != nil {
 		return nil, false, err
 	}

@@ -58,6 +58,7 @@ import {
 } from "./range.ts";
 import { engineError } from "./errors.ts";
 import { storeValue, typeError } from "./store.ts";
+import type { InputZone } from "./timezone.ts";
 import { valueCmp } from "./window.ts";
 import type { Row } from "./storage.ts";
 import type { Meter } from "./cost.ts";
@@ -182,11 +183,11 @@ export function evalRangeFunc(func: RangeFuncName, vals: Value[]): Value {
 // the bounds flags are read (default `[)`; a NULL 3-arg flags → 22000; an invalid flags string →
 // 42601), and finalizeRange produces the canonical value (order-check 22000, canonicalize,
 // empty-normalize).
-export function evalRangeCtor(elem: ScalarType, vals: Value[]): Value {
+export function evalRangeCtor(elem: ScalarType, vals: Value[], iz: InputZone): Value {
   const desc = rangeForElement(elem);
   if (desc === undefined) throw new Error("a range constructor's elem has a range");
-  const lower = coerceRangeBound(vals[0]!, elem);
-  const upper = coerceRangeBound(vals[1]!, elem);
+  const lower = coerceRangeBound(vals[0]!, elem, iz);
+  const upper = coerceRangeBound(vals[1]!, elem, iz);
   let lowerInc: boolean;
   let upperInc: boolean;
   const flags = vals[2];
@@ -208,8 +209,8 @@ export function evalRangeCtor(elem: ScalarType, vals: Value[]): Value {
 // for a NULL bound (an infinite bound). Reuses storeValue (the INSERT/UPDATE assignment coercion):
 // an integer range-checks into the element (22003), an int→decimal widens, a text→temporal parses,
 // and a non-assignable value is 42804 (the resolver already screened the common 42883 cases).
-export function coerceRangeBound(v: Value, elem: ScalarType): Value | null {
-  const stored = storeValue(v, elem, null, null, false, "range bound");
+export function coerceRangeBound(v: Value, elem: ScalarType, iz: InputZone): Value | null {
+  const stored = storeValue(v, elem, null, null, false, "range bound", iz);
   return stored.kind === "null" ? null : stored;
 }
 
@@ -225,19 +226,25 @@ export function expectRange(v: Value): Value & { kind: "range" } {
 // operators both operands are ranges; for the element overloads (containsElem/elemContainedBy) the
 // non-range operand is coerced to the range's element type `elem` (assignment-style, matching the
 // resolver's hint). The boolean kernels live in range.ts.
-export function evalRangeOp(op: RangeOpName, l: Value, r: Value, elem: ScalarType): Value {
+export function evalRangeOp(
+  op: RangeOpName,
+  l: Value,
+  r: Value,
+  elem: ScalarType,
+  iz: InputZone,
+): Value {
   if (l.kind === "null" || r.kind === "null") return nullValue();
   let result: boolean;
   switch (op) {
     // `range @> element`: l is the range, r the element (coerced to the range's element type).
     case "containsElem": {
-      const e = storeValue(r, elem, null, null, false, "range element");
+      const e = storeValue(r, elem, null, null, false, "range element", iz);
       result = rangeContainsElem(expectRange(l), e);
       break;
     }
     // `element <@ range`: l is the element, r the range.
     case "elemContainedBy": {
-      const e = storeValue(l, elem, null, null, false, "range element");
+      const e = storeValue(l, elem, null, null, false, "range element", iz);
       result = rangeContainsElem(expectRange(r), e);
       break;
     }

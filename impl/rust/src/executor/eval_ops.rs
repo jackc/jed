@@ -132,11 +132,11 @@ pub(crate) fn eval_range_func(func: &RangeFunc, vals: &[Value]) -> Result<Value>
 /// adapts), the bounds flags are read (default `[)`; a NULL 3-arg flags → 22000; an invalid flags
 /// string → 42601), and `finalize` produces the canonical value (order-check 22000, canonicalize,
 /// empty-normalize).
-pub(crate) fn eval_range_ctor(elem: ScalarType, vals: &[Value]) -> Result<Value> {
+pub(crate) fn eval_range_ctor(elem: ScalarType, vals: &[Value], iz: &InputZone) -> Result<Value> {
     let desc =
         crate::range::range_for_element(elem).expect("a range constructor's elem has a range");
-    let lower = coerce_range_bound(vals[0].clone(), elem)?;
-    let upper = coerce_range_bound(vals[1].clone(), elem)?;
+    let lower = coerce_range_bound(vals[0].clone(), elem, iz)?;
+    let upper = coerce_range_bound(vals[1].clone(), elem, iz)?;
     let (lower_inc, upper_inc) = match vals.get(2) {
         None => (true, false), // 2-arg form defaults to `[)`
         Some(Value::Null) => {
@@ -157,8 +157,12 @@ pub(crate) fn eval_range_ctor(elem: ScalarType, vals: &[Value]) -> Result<Value>
 /// (an infinite bound). Reuses [`store_value`] (the INSERT/UPDATE assignment coercion): an integer
 /// range-checks into the element (22003), an int→decimal widens, a text→temporal parses, and a
 /// non-assignable value is 42804 (the resolver already screened the common 42883 cases).
-pub(crate) fn coerce_range_bound(v: Value, elem: ScalarType) -> Result<Option<Value>> {
-    match store_value(v, elem, None, None, false, "range bound")? {
+pub(crate) fn coerce_range_bound(
+    v: Value,
+    elem: ScalarType,
+    iz: &InputZone,
+) -> Result<Option<Value>> {
+    match store_value(v, elem, None, None, false, "range bound", iz)? {
         Value::Null => Ok(None),
         other => Ok(Some(other)),
     }
@@ -169,19 +173,25 @@ pub(crate) fn coerce_range_bound(v: Value, elem: ScalarType) -> Result<Option<Va
 /// ranges; for the element overloads (`ContainsElem`/`ElemContainedBy`) the non-range operand is
 /// coerced to the range's element type `elem` (assignment-style, matching the resolver's hint). The
 /// boolean kernels live in `range.rs`.
-pub(crate) fn eval_range_op(op: RangeOp, l: &Value, r: &Value, elem: ScalarType) -> Result<Value> {
+pub(crate) fn eval_range_op(
+    op: RangeOp,
+    l: &Value,
+    r: &Value,
+    elem: ScalarType,
+    iz: &InputZone,
+) -> Result<Value> {
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(Value::Null);
     }
     let result = match op {
         // `range @> element`: l is the range, r the element (coerced to the range's element type).
         RangeOp::ContainsElem => {
-            let e = store_value(r.clone(), elem, None, None, false, "range element")?;
+            let e = store_value(r.clone(), elem, None, None, false, "range element", iz)?;
             crate::range::range_contains_elem(expect_range(l), &e)
         }
         // `element <@ range`: l is the element, r the range.
         RangeOp::ElemContainedBy => {
-            let e = store_value(l.clone(), elem, None, None, false, "range element")?;
+            let e = store_value(l.clone(), elem, None, None, false, "range element", iz)?;
             crate::range::range_contains_elem(expect_range(r), &e)
         }
         _ => {
@@ -1276,6 +1286,7 @@ pub(crate) fn coerce_string_to_composite(
     text: &str,
     ct: &CompositeType,
     catalog: &Engine,
+    iz: &InputZone,
 ) -> Result<(RExpr, ResolvedType)> {
     let malformed = || {
         EngineError::new(
@@ -1302,17 +1313,17 @@ pub(crate) fn coerce_string_to_composite(
                         let nested = catalog
                             .composite_type(&r.name)
                             .expect("nested composite type resolved at CREATE TYPE / load");
-                        coerce_string_to_composite(&s, nested, catalog)?
+                        coerce_string_to_composite(&s, nested, catalog, iz)?
                     }
                     Type::Scalar(scalar) => {
-                        coerce_string_literal(&s, *scalar, f.decimal, f.varchar_len)?
+                        coerce_string_literal(&s, *scalar, f.decimal, f.varchar_len, iz)?
                     }
                     // An array-typed field (spec/design/array.md §12): the token is an array text
                     // literal, coerced through `array_in` against the element type — the same path a
                     // bare `'{…}'::T[]` cast uses, one level down. Folds to a constant array.
                     Type::Array(elem_ty) => {
                         let elem_col = resolve_col_type(elem_ty, &catalog.read_snap().types);
-                        let val = coerce_string_to_array(&s, &elem_col)?;
+                        let val = coerce_string_to_array(&s, &elem_col, iz)?;
                         let rt = resolved_type_of_col(&f.ty, catalog);
                         (value_to_rexpr(&val), rt)
                     }
@@ -1357,16 +1368,19 @@ pub(crate) fn resolve_container_assign(
     // A bare string literal adapts to the container context (the same string-adapts-to-context
     // rule the cast and INSERT VALUES paths use).
     if let Expr::Literal(Literal::Text(s)) = e {
+        let iz = scope.catalog.input_zone();
         match &col.ty {
             Type::Range(elem) => {
                 let desc = crate::range::range_for_element(elem.scalar())
                     .expect("a range column's element always has a range type");
-                let (node, _) = coerce_string_to_range_expr(s, desc)?;
+                let (node, _) = coerce_string_to_range_expr(s, desc, &iz)?;
+                params.note_input_zone(&iz);
                 return Ok(node);
             }
             Type::Array(elem) => {
                 let elem_col = resolve_col_type(elem, &scope.catalog.read_snap().types);
-                let val = coerce_string_to_array(s, &elem_col)?;
+                let val = coerce_string_to_array(s, &elem_col, &iz)?;
+                params.note_input_zone(&iz);
                 return Ok(value_to_rexpr(&val));
             }
             _ => unreachable!("resolve_container_assign is only called for range/array columns"),
@@ -1411,8 +1425,9 @@ pub(crate) fn resolve_container_assign(
 pub(crate) fn coerce_string_to_range_expr(
     text: &str,
     desc: &crate::ranges_gen::RangeDesc,
+    iz: &InputZone,
 ) -> Result<(RExpr, ResolvedType)> {
-    let val = coerce_string_to_range(text, desc)?;
+    let val = coerce_string_to_range(text, desc, iz)?;
     let elem_rt = resolved_type_of(crate::range::element_scalar(desc));
     Ok((
         RExpr::ConstRange(Box::new(val)),
@@ -1425,6 +1440,7 @@ pub(crate) fn coerce_string_to_range_expr(
 pub(crate) fn coerce_string_to_range(
     text: &str,
     desc: &crate::ranges_gen::RangeDesc,
+    iz: &InputZone,
 ) -> Result<RangeVal> {
     let parsed = crate::range::parse_range_text(text)?;
     if parsed.empty {
@@ -1435,7 +1451,7 @@ pub(crate) fn coerce_string_to_range(
         match b {
             None => Ok(None),
             Some(s) => {
-                let (node, _) = coerce_string_literal(s, elem, None, None)?;
+                let (node, _) = coerce_string_literal(s, elem, None, None, iz)?;
                 Ok(Some(rexpr_const_to_value(&node)?))
             }
         }
@@ -1450,6 +1466,7 @@ pub(crate) fn coerce_string_literal(
     target: ScalarType,
     typmod: Option<DecimalTypmod>,
     varchar_len: Option<u32>,
+    iz: &InputZone,
 ) -> Result<(RExpr, ResolvedType)> {
     Ok(match target {
         ScalarType::Bytea => (
@@ -1465,7 +1482,7 @@ pub(crate) fn coerce_string_literal(
             ResolvedType::Timestamp,
         ),
         ScalarType::Timestamptz => (
-            RExpr::ConstTimestamptz(parse_timestamptz(s)?),
+            RExpr::ConstTimestamptz(iz.parse_timestamptz(s)?),
             ResolvedType::Timestamptz,
         ),
         ScalarType::Interval => (

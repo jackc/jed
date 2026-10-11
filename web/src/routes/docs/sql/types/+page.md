@@ -168,9 +168,9 @@ A `timestamp` ignores a trailing UTC offset. A `timestamptz` with an offset is t
 expression containing a text cast to `date`, `timestamp`, `timestamptz`, or `interval` is rejected
 (`42P17`), exactly as in PostgreSQL; `text → bytea` is fine in an index.
 
-A `timestamptz` *literal* such as `'2024-01-15 10:30'::timestamptz` still reads an offset-less string
-as UTC rather than in the session time zone, so in a non-UTC session it can differ from casting the
-same string held in a `text` column. Write the offset explicitly when it matters.
+A `timestamptz` *literal* such as `'2024-01-15 10:30'::timestamptz` reads an offset-less string the
+same way, in the session time zone (see [Time zones](#time-zones)), so the literal and the `text`
+column cast agree.
 
 jed's input grammars are stricter than PostgreSQL's, the same as for literals: the `'now'`, `'today'`,
 and `'epoch'` timestamp words, ISO-8601 (`P1D`) and SQL-standard interval input (`'1-2'`,
@@ -292,6 +292,21 @@ Named IANA zones (`America/New_York`, `Europe/Paris`, …) come from a time-zone
 already-loaded zone (an unknown zone raises `22023`). This is the same host-loaded-data model jed
 uses for Unicode collation; see the design notes for the `JTZ` bundle and the `db.loadTimeZoneData`
 host call.
+
+### Strings without an offset
+
+Any `timestamptz` input written **without** an offset — a literal (`'2024-01-15 10:30'::timestamptz`,
+`timestamptz '…'`, or a string compared against a `timestamptz` column), an `INSERT`/`UPDATE` value, a
+column `DEFAULT`, a text value bound to a `timestamptz` parameter, or a `timestamptz` inside array,
+range, or composite text — is a wall-clock time **in the session time zone**, as in PostgreSQL. An
+explicit offset (`'2024-01-15 10:30-05'`) or `infinity` names the instant directly. A constant
+`DEFAULT` is fixed when the table is created, in the creating session's zone.
+
+Two places differ from PostgreSQL. A prepared statement reads the session zone again on every
+execution, where PostgreSQL keeps the zone in effect when it was prepared. And an index expression or
+partial-index predicate cannot contain an offset-less `timestamptz` literal (`42P17`), because its
+meaning would change with the session zone; write the offset, for example
+`WHERE created_at > '2024-01-01 00:00+00'`.
 
 ### Truncating, extracting, and converting
 

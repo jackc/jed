@@ -165,12 +165,12 @@ export function readFrac(b: string, cur: Cur): bigint {
   return us;
 }
 
-function parseDatetime(input: string, applyOffset: boolean, typeName: string): bigint {
+// parseDatetime parses a zoneless timestamp to µs since the epoch: an offset is parsed/validated but
+// ignored (PG behavior). The type name is used only for error messages.
+function parseDatetime(input: string, typeName: string): bigint {
   const w = parseDatetimeWall(input, typeName);
   if (w.infinite) return w.micros;
-  const micros =
-    applyOffset && w.offsetSecs !== null ? w.micros - w.offsetSecs * MICROS_PER_SEC : w.micros;
-  return finiteInstant(micros);
+  return finiteInstant(w.micros);
 }
 
 // A parsed datetime string: a ±infinity sentinel (infinite), or a finite wall clock (µs since the
@@ -186,11 +186,12 @@ export function finiteInstant(micros: bigint): bigint {
   return micros;
 }
 
-// parseTimestamptzInput parses a timestamptz input for the runtime text → timestamptz cast
-// (types.md §5): an explicit offset (or ±infinity) yields the instant (local = false), while an
-// offset-less wall clock is returned with local = true for the caller to interpret in the session
-// zone, as PostgreSQL's timestamptz_in does. (The literal path, parseTimestamptz, still reads it
-// as UTC.) A local wall clock is range-checked but may still be shifted onto a sentinel.
+// parseTimestamptzInput parses a timestamptz input: an explicit offset (or ±infinity) yields the
+// instant (local = false), while an offset-less wall clock is returned with local = true for the
+// caller to interpret in the session zone, as PostgreSQL's timestamptz_in does. The runtime
+// text → timestamptz cast uses it directly so it can charge the zone consult only when one happens;
+// every other input path goes through InputZone (timezone.ts). A local wall clock is range-checked
+// but may still be shifted onto a sentinel.
 export function parseTimestamptzInput(s: string): { micros: bigint; local: boolean } {
   const w = parseDatetimeWall(s, "timestamptz");
   if (w.infinite) return { micros: w.micros, local: false };
@@ -299,12 +300,7 @@ function parseDatetimeWall(input: string, typeName: string): DatetimeWall {
 // parseTimestamp parses a timestamp (zoneless) literal: an offset in the text is accepted and
 // ignored (PG behavior).
 export function parseTimestamp(s: string): bigint {
-  return parseDatetime(s, false, "timestamp");
-}
-
-// parseTimestamptz parses a timestamptz literal: a trailing offset normalizes the value to UTC.
-export function parseTimestamptz(s: string): bigint {
-  return parseDatetime(s, true, "timestamptz");
+  return parseDatetime(s, "timestamp");
 }
 
 // makeTimestamp builds a zoneless timestamp (µs since the 1970 epoch) from calendar fields — the

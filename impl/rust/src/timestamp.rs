@@ -175,18 +175,12 @@ pub enum TimestamptzInput {
     Local(i64),
 }
 
-/// Parse a timestamp/timestamptz literal to µs since the epoch. For `timestamptz`
-/// (`apply_offset = true`) a trailing offset normalizes the wall clock to UTC; for
-/// `timestamp` an offset is parsed/validated but **ignored** (PG behavior). The type name
-/// is used only for error messages.
-fn parse(input: &str, apply_offset: bool, type_name: &str) -> Result<i64> {
-    let (micros, offset_secs) = match parse_wall(input, type_name)? {
-        Wall::Infinity(sentinel) => return Ok(sentinel),
-        Wall::Finite(micros, offset_secs) => (micros, offset_secs),
-    };
-    match offset_secs {
-        Some(off) if apply_offset => apply_utc_offset(micros, off),
-        _ => finite_instant(micros),
+/// Parse a zoneless `timestamp` to µs since the epoch: an offset is parsed/validated but
+/// **ignored** (PG behavior). The type name is used only for error messages.
+fn parse(input: &str, type_name: &str) -> Result<i64> {
+    match parse_wall(input, type_name)? {
+        Wall::Infinity(sentinel) => Ok(sentinel),
+        Wall::Finite(micros, _) => finite_instant(micros),
     }
 }
 
@@ -353,18 +347,61 @@ fn parse_wall(input: &str, type_name: &str) -> Result<Wall> {
 
 /// Parse a `timestamp` (zoneless) literal: an offset in the text is accepted and ignored.
 pub fn parse_timestamp(s: &str) -> Result<i64> {
-    parse(s, false, "timestamp")
+    parse(s, "timestamp")
 }
 
-/// Parse a `timestamptz` literal: a trailing offset normalizes the value to UTC.
-pub fn parse_timestamptz(s: &str) -> Result<i64> {
-    parse(s, true, "timestamptz")
+/// Parse a `timestamptz` input string, as PostgreSQL's `timestamptz_in` does (timezones.md §9.3): a
+/// trailing offset normalizes the wall clock to UTC, `±infinity` is its sentinel, and an
+/// offset-less wall clock is read in `zone` — the session zone at every caller (DST gap/overlap
+/// as the `timestamp → timestamptz` cast; a shift past the range is 22008). The one parser behind
+/// the literal, typed-literal, cast-of-a-literal, assignment, and container (array/range/record
+/// text) inputs. It meters nothing: a caller that evaluates per row charges the zone consult.
+pub fn parse_timestamptz(s: &str, zone: &crate::timezone::ZoneRef) -> Result<i64> {
+    InputZone::new(zone).parse_timestamptz(s)
 }
 
-/// Parse a `timestamptz` input for the runtime `text → timestamptz` cast (types.md §5): an explicit
-/// offset (or ±infinity) yields the instant, while an offset-less wall clock is returned as
-/// [`TimestamptzInput::Local`] for the caller to interpret in the session zone, as PostgreSQL's
-/// `timestamptz_in` does. (The literal path, [`parse_timestamptz`], still reads it as UTC.)
+/// The zone a text input reads an offset-less `timestamptz` in — always the session zone
+/// (timezones.md §9.3) — plus a record of whether any parse actually consulted it. Threaded through
+/// every text-input path (literal folding, assignment coercion, bound parameters, and the
+/// array/range/record text parsers). The resolver reads [`InputZone::consulted`] after folding a
+/// literal: a folded instant that depended on the session zone makes the plan uncacheable (a plan is
+/// shared across sessions) and nonimmutable (a persisted expression is re-resolved in whatever zone
+/// the next statement runs under — 42P17). Explicit offsets and `±infinity` never consult it.
+pub(crate) struct InputZone<'a> {
+    zone: &'a crate::timezone::ZoneRef,
+    consulted: std::cell::Cell<bool>,
+}
+
+impl<'a> InputZone<'a> {
+    pub(crate) fn new(zone: &'a crate::timezone::ZoneRef) -> Self {
+        Self {
+            zone,
+            consulted: std::cell::Cell::new(false),
+        }
+    }
+
+    /// [`parse_timestamptz`] in this zone, recording a zone consult for an offset-less wall clock.
+    pub(crate) fn parse_timestamptz(&self, s: &str) -> Result<i64> {
+        match parse_timestamptz_input(s)? {
+            TimestamptzInput::Instant(micros) => Ok(micros),
+            TimestamptzInput::Local(wall) => {
+                self.consulted.set(true);
+                crate::timezone::local_to_instant_micros(self.zone, wall)
+                    .ok_or_else(zone_shift_out_of_range)
+            }
+        }
+    }
+
+    /// Whether any parse through this input read the zone.
+    pub(crate) fn consulted(&self) -> bool {
+        self.consulted.get()
+    }
+}
+
+/// Parse a `timestamptz` input to its [`TimestamptzInput`]: an explicit offset (or ±infinity)
+/// yields the instant, while an offset-less wall clock is returned as [`TimestamptzInput::Local`]
+/// for the caller to interpret in the session zone. The runtime `text → timestamptz` cast uses it
+/// directly so it can charge the zone consult only when one happens.
 pub fn parse_timestamptz_input(s: &str) -> Result<TimestamptzInput> {
     Ok(match parse_wall(s, "timestamptz")? {
         Wall::Infinity(sentinel) => TimestamptzInput::Instant(sentinel),

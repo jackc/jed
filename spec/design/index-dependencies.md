@@ -25,6 +25,7 @@ and overloads apply these argument-sensitive rules:
 | Named zone | loaded zone's name, tzdata version, and TZif CRC-32 |
 | Nonconstant zone expression | the complete loaded named-zone set |
 | Clock, entropy, sequences, session variables, runtime text-to-date / relative date inputs | nonimmutable |
+| A `timestamptz` string (literal, or inside array/range/record text) with no explicit offset | nonimmutable — folded in the session zone ([timezones.md](timezones.md) §9.3); an explicit offset or `±infinity` is a constant |
 
 Session/clock/entropy/state dependencies reject CREATE INDEX with `42P17`, even under a
 null test or an unselected CASE arm. This is compositional analysis, not a theorem prover.

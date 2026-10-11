@@ -58,13 +58,7 @@ import {
   decodeByteaLiteral,
   decodeUuidLiteral,
 } from "./executor.ts";
-import {
-  NEG_INFINITY,
-  POS_INFINITY,
-  parseTimestamp,
-  parseTimestamptz,
-  parseTimestamptzInput,
-} from "./timestamp.ts";
+import { NEG_INFINITY, POS_INFINITY, parseTimestamp, parseTimestamptzInput } from "./timestamp.ts";
 import { DATE_NEG_INFINITY, DATE_POS_INFINITY, dateClockSpecial, parseDate } from "./date.ts";
 import { parseInterval, tsShift } from "./interval.ts";
 import { jsonbIn, jsonbOut, validateJson } from "./json.ts";
@@ -76,7 +70,7 @@ import type { Seam, StmtRng } from "./seam.ts";
 import type { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
 import type { Interval } from "./interval.ts";
-import type { ZoneRef } from "./timezone.ts";
+import type { InputZone, ZoneRef } from "./timezone.ts";
 import { instantToLocalMicros, localToInstantMicros } from "./timezone.ts";
 export function storeValue(
   v: Value,
@@ -85,6 +79,7 @@ export function storeValue(
   varcharLen: number | null,
   notNull: boolean,
   colName: string,
+  iz: InputZone,
 ): Value {
   switch (v.kind) {
     case "null":
@@ -141,7 +136,8 @@ export function storeValue(
       if (isUuid(colTy)) return uuidValue(decodeUuidLiteral(v.text));
       // ... or to a timestamp column (spec/design/timestamp.md); bad input traps 22007/22008.
       if (isTimestamp(colTy)) return timestampValue(parseTimestamp(v.text));
-      if (isTimestamptz(colTy)) return timestamptzValue(parseTimestamptz(v.text));
+      // An offset-less string reads in the session zone (timezones.md §9.3).
+      if (isTimestamptz(colTy)) return timestamptzValue(iz.parseTimestamptz(v.text));
       if (isDate(colTy)) return dateValue(parseDate(v.text));
       // ... or to an interval column (spec/design/interval.md); bad input traps 22007/22008.
       if (isInterval(colTy)) return intervalValue(parseInterval(v.text));
@@ -273,11 +269,13 @@ export function coerceForStore(
   varcharLen: number | null,
   notNull: boolean,
   colName: string,
+  iz: InputZone,
 ): Value {
-  if (ty.kind === "scalar") return storeValue(v, ty.scalar, typmod, varcharLen, notNull, colName);
-  if (ty.kind === "array") return storeArray(v, ty.elem, notNull, colName);
-  if (ty.kind === "range") return storeRange(v, ty.elem, notNull, colName);
-  return storeComposite(v, ty.name, ty.fields, notNull, colName);
+  if (ty.kind === "scalar")
+    return storeValue(v, ty.scalar, typmod, varcharLen, notNull, colName, iz);
+  if (ty.kind === "array") return storeArray(v, ty.elem, notNull, colName, iz);
+  if (ty.kind === "range") return storeRange(v, ty.elem, notNull, colName, iz);
+  return storeComposite(v, ty.name, ty.fields, notNull, colName, iz);
 }
 
 // storeRange coerces a value into a RANGE column (spec/design/ranges.md §4): NULL honours NOT NULL
@@ -287,7 +285,13 @@ export function coerceForStore(
 // the value passes through; any other value is a 42804. An infinite bound is null and skipped;
 // bounds are never NULL here (a null bound is infinite, not NULL), so the element store is never
 // NOT NULL.
-export function storeRange(v: Value, elem: ColType, notNull: boolean, colName: string): Value {
+export function storeRange(
+  v: Value,
+  elem: ColType,
+  notNull: boolean,
+  colName: string,
+  iz: InputZone,
+): Value {
   if (v.kind === "null") {
     if (notNull) {
       throw notNullViolation(colName);
@@ -299,14 +303,20 @@ export function storeRange(v: Value, elem: ColType, notNull: boolean, colName: s
   }
   if (v.empty) return v;
   const coerce = (b: Value | null): Value | null =>
-    b === null ? null : coerceForStore(b, elem, null, null, false, colName);
+    b === null ? null : coerceForStore(b, elem, null, null, false, colName, iz);
   return rangeValue(coerce(v.lower), coerce(v.upper), v.lowerInc, v.upperInc);
 }
 
 // storeArray coerces a value into an ARRAY column (spec/design/array.md §4): NULL honours NOT NULL
 // (23502); an array value coerces each element to the declared element type via coerceForStore (a
 // NULL element is allowed — array elements are nullable). Any other value is a 42804.
-export function storeArray(v: Value, elem: ColType, notNull: boolean, colName: string): Value {
+export function storeArray(
+  v: Value,
+  elem: ColType,
+  notNull: boolean,
+  colName: string,
+  iz: InputZone,
+): Value {
   if (v.kind === "null") {
     if (notNull) {
       throw notNullViolation(colName);
@@ -318,7 +328,7 @@ export function storeArray(v: Value, elem: ColType, notNull: boolean, colName: s
   }
   // Elements are nullable; the element typmod is unconstrained this slice (numeric(p,s)[] deferred).
   // The shape (dims/lbounds) is preserved.
-  const out = v.elements.map((el) => coerceForStore(el, elem, null, null, false, colName));
+  const out = v.elements.map((el) => coerceForStore(el, elem, null, null, false, colName, iz));
   return { kind: "array", dims: v.dims, lbounds: v.lbounds, elements: out };
 }
 
@@ -332,6 +342,7 @@ export function storeComposite(
   fields: ColField[],
   notNull: boolean,
   colName: string,
+  iz: InputZone,
 ): Value {
   if (v.kind === "null") {
     if (notNull) {
@@ -357,7 +368,7 @@ export function storeComposite(
   const out: Value[] = new Array(fields.length);
   for (let i = 0; i < fields.length; i++) {
     const f = fields[i]!;
-    out[i] = coerceForStore(v.fields[i]!, f.type, f.typmod, f.varcharLen, f.notNull, f.name);
+    out[i] = coerceForStore(v.fields[i]!, f.type, f.typmod, f.varcharLen, f.notNull, f.name, iz);
   }
   return compositeValue(out);
 }
@@ -367,7 +378,12 @@ export function storeComposite(
 // composite slot is a ROW(…) whose fields recurse against the composite's field types, or a bound
 // $N. The result is then fully coerced/range-checked by coerceForStore. DEFAULT is handled by the
 // caller at the top level (it is not a valid field inside a ROW(…)).
-export function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Value[]): Value {
+export function materializeInsertValue(
+  iv: InsertValue,
+  ty: ColType,
+  bound: Value[],
+  iz: InputZone,
+): Value {
   if (ty.kind === "array") {
     switch (iv.kind) {
       case "array": {
@@ -376,10 +392,10 @@ export function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Valu
         // §4); otherwise each element materializes against the element type into a flat 1-D array. A
         // scalar mixed with an array sub-element errors 42804 (materialized against the array type).
         if (iv.elements.some((el) => el.kind === "array")) {
-          const subs = iv.elements.map((el) => materializeInsertValue(el, ty, bound));
+          const subs = iv.elements.map((el) => materializeInsertValue(el, ty, bound, iz));
           return buildNestedArray(subs);
         }
-        const vals = iv.elements.map((el) => materializeInsertValue(el, ty.elem, bound));
+        const vals = iv.elements.map((el) => materializeInsertValue(el, ty.elem, bound, iz));
         return arrayValue(vals);
       }
       case "param":
@@ -389,7 +405,7 @@ export function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Valu
       case "lit":
         // A bare string literal adapts to the array context via array_in (the same
         // string-adapts-to-context rule bytea/uuid use — spec/design/array.md §7).
-        if (iv.lit.kind === "text") return coerceStringToArray(iv.lit.text, ty.elem);
+        if (iv.lit.kind === "text") return coerceStringToArray(iv.lit.text, ty.elem, iz);
         if (iv.lit.kind === "null") return nullValue();
         throw typeError("cannot assign a scalar value to an array column");
       case "expr":
@@ -410,7 +426,7 @@ export function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Valu
       case "lit":
         // A bare string literal adapts to the range context via range_in (the same
         // string-adapts-to-context rule array/bytea/uuid use — spec/design/ranges.md §5).
-        if (iv.lit.kind === "text") return coerceStringToRange(iv.lit.text, desc);
+        if (iv.lit.kind === "text") return coerceStringToRange(iv.lit.text, desc, iz);
         if (iv.lit.kind === "null") return nullValue();
         throw typeError("cannot assign a scalar value to a range column");
       case "param":
@@ -458,7 +474,7 @@ export function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Valu
       }
       const vals: Value[] = new Array(ty.fields.length);
       for (let i = 0; i < ty.fields.length; i++)
-        vals[i] = materializeInsertValue(iv.fields[i]!, ty.fields[i]!.type, bound);
+        vals[i] = materializeInsertValue(iv.fields[i]!, ty.fields[i]!.type, bound, iz);
       return compositeValue(vals);
     }
     case "param":
@@ -478,7 +494,7 @@ export function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Valu
 // coerceStringToArray parses a text array literal into an array Value against the element ColType
 // via array_in (spec/design/array.md §7): each token is coerced to the element type (an unquoted
 // NULL token → NULL element). A malformed literal is 22P02.
-export function coerceStringToArray(s: string, elem: ColType): Value {
+export function coerceStringToArray(s: string, elem: ColType, iz: InputZone): Value {
   const parsed: ArrayInResult = parseArrayLiteral(s);
   if (!parsed.ok) {
     if (parsed.err === "boundflip")
@@ -489,7 +505,7 @@ export function coerceStringToArray(s: string, elem: ColType): Value {
     if (tok === null) return nullValue();
     // Coerce the token to the element type (a scalar via the string-literal coercion, a composite
     // via record_in — array-of-composite, spec/design/array.md §12 AC1 / §7).
-    return coerceArrayElementText(tok, elem);
+    return coerceArrayElementText(tok, elem, iz);
   });
   return {
     kind: "array",
@@ -504,14 +520,14 @@ export function coerceStringToArray(s: string, elem: ColType): Value {
 // composite via record_in (recursive — the array-of-composite quoting nests, §12 AC1). Self-contained
 // over the resolved ColType (no catalog re-walk). A nested-array element would recurse, but
 // array-of-array is not a jed type, so it is unreachable in v1.
-export function coerceArrayElementText(tok: string, elem: ColType): Value {
-  if (elem.kind === "composite") return coerceRecordTextToValue(tok, elem);
-  if (elem.kind === "array") return coerceStringToArray(tok, elem.elem);
+export function coerceArrayElementText(tok: string, elem: ColType, iz: InputZone): Value {
+  if (elem.kind === "composite") return coerceRecordTextToValue(tok, elem, iz);
+  if (elem.kind === "array") return coerceStringToArray(tok, elem.elem, iz);
   // A range element is unreachable: array-of-range is not a storable jed type (R2), so an array
   // element ColType is never a range.
   if (elem.kind === "range")
     throw new Error("array-of-range is not a storable type (ranges.md §2)");
-  const { node } = coerceStringLiteral(tok, elem.scalar, null, null);
+  const { node } = coerceStringLiteral(tok, elem.scalar, null, null, iz);
   return rexprConstToValue(node);
 }
 
@@ -523,6 +539,7 @@ export function coerceArrayElementText(tok: string, elem: ColType): Value {
 export function coerceRecordTextToValue(
   text: string,
   ct: { kind: "composite"; name: string; fields: ColField[] },
+  iz: InputZone,
 ): Value {
   const tokens = parseRecordTokens(text);
   if (tokens === null || tokens.length !== ct.fields.length) {
@@ -534,12 +551,12 @@ export function coerceRecordTextToValue(
   const vals = tokens.map((tok, i) => {
     if (tok === null) return nullValue();
     const f = ct.fields[i]!;
-    if (f.type.kind === "composite") return coerceRecordTextToValue(tok, f.type);
-    if (f.type.kind === "array") return coerceStringToArray(tok, f.type.elem);
+    if (f.type.kind === "composite") return coerceRecordTextToValue(tok, f.type, iz);
+    if (f.type.kind === "array") return coerceStringToArray(tok, f.type.elem, iz);
     // A composite range field is unreachable: CREATE TYPE rejects a range field (R2).
     if (f.type.kind === "range")
       throw new Error("a composite range field is rejected at CREATE TYPE (R2)");
-    const { node } = coerceStringLiteral(tok, f.type.scalar, f.typmod, f.varcharLen);
+    const { node } = coerceStringLiteral(tok, f.type.scalar, f.typmod, f.varcharLen, iz);
     return rexprConstToValue(node);
   });
   return compositeValue(vals);

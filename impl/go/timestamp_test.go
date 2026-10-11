@@ -70,7 +70,8 @@ func tsParse(typ, in string) (int64, error) {
 	if typ == "timestamp" {
 		return parseTimestamp(in)
 	}
-	return parseTimestamptz(in)
+	// The vectors are UTC-session parses (an offset-less wall clock reads as UTC).
+	return parseTimestamptz(in, ZoneRef{Fixed: true, Off: 0})
 }
 
 func tsRender(typ string, m int64) string {

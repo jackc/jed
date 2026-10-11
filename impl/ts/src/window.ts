@@ -42,6 +42,7 @@ import { rangeTotalCmp } from "./range.ts";
 import { jsonNodeCmp } from "./json.ts";
 import type { DecimalTypmod, ScalarType } from "./types.ts";
 import type { ColType } from "./catalog.ts";
+import type { InputZone } from "./timezone.ts";
 export function or3(
   a: "true" | "false" | "unknown",
   b: "true" | "false" | "unknown",
@@ -1283,8 +1284,8 @@ export type AssignPlan = {
 // INSERT uses (NULL into NOT NULL → 23502; an integer out of range → 22003; a decimal rounds to
 // scale; a boolean into a boolean column is accepted as-is; a range/array re-coerces its
 // elements). The resolver proved the value's family is assignable.
-export function checkAssign(p: AssignPlan, v: Value): Value {
+export function checkAssign(p: AssignPlan, v: Value, iz: InputZone): Value {
   if (p.colType !== undefined)
-    return coerceForStore(v, p.colType, p.decimal, p.varcharLen, p.notNull, p.name);
-  return storeValue(v, p.target, p.decimal, p.varcharLen, p.notNull, p.name);
+    return coerceForStore(v, p.colType, p.decimal, p.varcharLen, p.notNull, p.name, iz);
+  return storeValue(v, p.target, p.decimal, p.varcharLen, p.notNull, p.name, iz);
 }

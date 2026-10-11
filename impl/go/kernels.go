@@ -1133,7 +1133,7 @@ func floatConstFromDecimal(d Decimal, ctx scalarType) (*rExpr, resolvedType, err
 // (the same string-literal coercion as a typed literal), and a composite field recurses. The folded
 // result is an reRow of the coerced const field nodes, typed as the named composite — the inverse of
 // recordOut.
-func coerceStringToComposite(text string, ct *compositeType, catalog *engine) (*rExpr, resolvedType, error) {
+func coerceStringToComposite(text string, ct *compositeType, catalog *engine, iz *inputZone) (*rExpr, resolvedType, error) {
 	snap := catalog.readSnap()
 	malformed := func() error {
 		return newError(InvalidTextRepresentation,
@@ -1155,7 +1155,7 @@ func coerceStringToComposite(text string, ct *compositeType, catalog *engine) (*
 		case f.Type.Comp != nil:
 			// A nested composite field: the token is its own quoted record literal — recurse.
 			nested := snap.compositeType(f.Type.Comp.Name)
-			node, ty, err := coerceStringToComposite(*tokens[i], nested, catalog)
+			node, ty, err := coerceStringToComposite(*tokens[i], nested, catalog, iz)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -1166,14 +1166,14 @@ func coerceStringToComposite(text string, ct *compositeType, catalog *engine) (*
 			// coerced through array_in against the element type — the same path a bare `'{…}'::T[]`
 			// cast uses, one level down. Folds to a constant array.
 			elemCol := resolveColType(*f.Type.Array, snap.types)
-			val, err := coerceStringToArray(*tokens[i], elemCol)
+			val, err := coerceStringToArray(*tokens[i], elemCol, iz)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
 			nodes[i] = valueToRExpr(val)
 			fields[i] = compositeRField{name: f.Name, ty: resolvedTypeOfCol(f.Type, snap)}
 		default:
-			node, ty, err := coerceStringLiteral(*tokens[i], f.Type.Scalar, f.Decimal, f.VarcharLen)
+			node, ty, err := coerceStringLiteral(*tokens[i], f.Type.Scalar, f.Decimal, f.VarcharLen, iz)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -1213,14 +1213,18 @@ func resolveContainerAssign(s *scope, col catColumn, e exprNode, ag *aggCtx, par
 			if !ok {
 				panic("a range column's element always has a range type")
 			}
-			node, _, err := coerceStringToRangeExpr(e.Literal.Str, desc)
+			iz := s.catalog.inputZone()
+			node, _, err := coerceStringToRangeExpr(e.Literal.Str, desc, iz)
+			params.noteInputZone(iz)
 			return node, err
 		}
 		// array
-		val, err := coerceStringToArray(e.Literal.Str, resolveColType(*col.Type.Array, snap.types))
+		iz := s.catalog.inputZone()
+		val, err := coerceStringToArray(e.Literal.Str, resolveColType(*col.Type.Array, snap.types), iz)
 		if err != nil {
 			return nil, err
 		}
+		params.noteInputZone(iz)
 		return valueToRExpr(val), nil
 	}
 	if e.Kind == exprLiteral && e.Literal != nil && e.Literal.Kind == literalNull {
@@ -1279,8 +1283,8 @@ func containerAssignable(rhs, col resolvedType) bool {
 	}
 }
 
-func coerceStringToRangeExpr(text string, desc rangeDesc) (*rExpr, resolvedType, error) {
-	val, err := coerceStringToRange(text, desc)
+func coerceStringToRangeExpr(text string, desc rangeDesc, iz *inputZone) (*rExpr, resolvedType, error) {
+	val, err := coerceStringToRange(text, desc, iz)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
@@ -1290,7 +1294,7 @@ func coerceStringToRangeExpr(text string, desc rangeDesc) (*rExpr, resolvedType,
 
 // coerceStringToRange parses a range text literal and coerces its bounds to the element type,
 // producing a canonical RangeVal (spec/design/ranges.md §4). Shared by the cast / typed-literal paths.
-func coerceStringToRange(text string, desc rangeDesc) (*RangeVal, error) {
+func coerceStringToRange(text string, desc rangeDesc, iz *inputZone) (*RangeVal, error) {
 	parsed, err := parseRangeText(text)
 	if err != nil {
 		return nil, err
@@ -1303,7 +1307,7 @@ func coerceStringToRange(text string, desc rangeDesc) (*RangeVal, error) {
 		if b == nil {
 			return nil, nil
 		}
-		v, err := coerceStringLiteralToValue(*b, elem)
+		v, err := coerceStringLiteralToValue(*b, elem, iz)
 		if err != nil {
 			return nil, err
 		}
@@ -1320,7 +1324,7 @@ func coerceStringToRange(text string, desc rangeDesc) (*RangeVal, error) {
 	return finalizeRange(desc, lower, upper, parsed.lowerInc, parsed.upperInc)
 }
 
-func coerceStringLiteral(s string, target scalarType, typmod *decimalTypmod, varcharLen *uint32) (*rExpr, resolvedType, error) {
+func coerceStringLiteral(s string, target scalarType, typmod *decimalTypmod, varcharLen *uint32, iz *inputZone) (*rExpr, resolvedType, error) {
 	switch target {
 	case scalarBytea:
 		b, err := decodeByteaLiteral(s)
@@ -1341,7 +1345,8 @@ func coerceStringLiteral(s string, target scalarType, typmod *decimalTypmod, var
 		}
 		return &rExpr{kind: reConstTimestamp, cInt: m}, resolvedType{kind: rtTimestamp}, nil
 	case scalarTimestamptz:
-		m, err := parseTimestamptz(s)
+		// An offset-less string reads in the session zone (timezones.md §9.3).
+		m, err := iz.parseTimestamptz(s)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}

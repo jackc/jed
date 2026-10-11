@@ -1316,7 +1316,7 @@ func coerceJSONMember(node *JsonNode, colTy dataType, decimal *decimalTypmod, en
 		if !ok {
 			return NullValue(), nil
 		}
-		rexpr, _, err := coerceStringLiteral(text, st, decimal, nil)
+		rexpr, _, err := coerceStringLiteral(text, st, decimal, nil, env.exec.inputZone())
 		if err != nil {
 			return Value{}, err
 		}

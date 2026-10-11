@@ -328,7 +328,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (v.kind === "text") {
         // runtime text → T[]: coerce the per-row string via array_in against the target element
         // ColType (22P02 malformed / 2202E inverted bound — the same as the '{…}'::T[] literal).
-        return coerceStringToArray(v.text, e.toElem);
+        return coerceStringToArray(v.text, e.toElem, env.exec.inputZone());
       }
       if (v.kind !== "array")
         throw new Error("an arrayCast operand is text or array (resolver-gated)");
@@ -1818,7 +1818,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       m.charge(COSTS.operatorEval);
       const vals: Value[] = [];
       for (const a of e.args) vals.push(evalExpr(a, row, env, m));
-      return evalRangeCtor(e.elem, vals);
+      return evalRangeCtor(e.elem, vals, env.exec.inputZone());
     }
     case "rangeOp": {
       // A range BOOLEAN operator (spec/design/range-functions.md §3, RF3). One operator_eval; the
@@ -1827,7 +1827,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       m.charge(COSTS.operatorEval);
       const l = evalExpr(e.args[0]!, row, env, m);
       const r = evalExpr(e.args[1]!, row, env, m);
-      return evalRangeOp(e.op, l, r, e.elem);
+      return evalRangeOp(e.op, l, r, e.elem, env.exec.inputZone());
     }
     case "rangeSetOp": {
       // A range SET operator (spec/design/range-functions.md §4). One operator_eval; the operands

@@ -32,7 +32,8 @@ import type { Column, CompositeType } from "./catalog.ts";
 import { elementScalar, finalizeRange, parseRangeText, rangeForElement } from "./range.ts";
 import type { RangeDesc } from "./ranges_gen.ts";
 import type { Value } from "./value.ts";
-import { parseTimestamp, parseTimestamptz } from "./timestamp.ts";
+import { parseTimestamp } from "./timestamp.ts";
+import type { InputZone } from "./timezone.ts";
 import { parseDate } from "./date.ts";
 import { parseFactorDecimal, parseInterval } from "./interval.ts";
 import { jsonbIn, validateJson } from "./json.ts";
@@ -372,16 +373,21 @@ export function resolveContainerAssign(
   // A bare string literal adapts to the container context (the same string-adapts-to-context rule
   // the cast and INSERT VALUES paths use).
   if (e.kind === "literal" && e.literal.kind === "text") {
+    const iz = scope.catalog.inputZone();
     if (col.type.kind === "range") {
       if (col.type.elem.kind !== "scalar")
         throw new Error("a range element is always a scalar (ranges.md §2)");
       const desc = rangeForElement(col.type.elem.scalar);
       if (desc === undefined) throw new Error("a range column's element always has a range type");
-      return coerceStringToRangeExpr(e.literal.text, desc).node;
+      const node = coerceStringToRangeExpr(e.literal.text, desc, iz).node;
+      params.noteInputZone(iz);
+      return node;
     }
     // array
     const elem = (col.type as { kind: "array"; elem: Type }).elem;
-    return valueToRExpr(coerceStringToArray(e.literal.text, scope.catalog.colTypeOf(elem)));
+    const val = coerceStringToArray(e.literal.text, scope.catalog.colTypeOf(elem), iz);
+    params.noteInputZone(iz);
+    return valueToRExpr(val);
   }
   if (e.kind === "literal" && e.literal.kind === "null") {
     return { kind: "constNull" };
@@ -415,8 +421,9 @@ export function resolveContainerAssign(
 export function coerceStringToRangeExpr(
   text: string,
   desc: RangeDesc,
+  iz: InputZone,
 ): { node: RExpr; type: ResolvedType } {
-  const val = coerceStringToRange(text, desc);
+  const val = coerceStringToRange(text, desc, iz);
   const elemRt = resolvedTypeOf(elementScalar(desc));
   return {
     node: { kind: "constRange", value: val },
@@ -424,13 +431,13 @@ export function coerceStringToRangeExpr(
   };
 }
 
-export function coerceStringToRange(text: string, desc: RangeDesc): Value {
+export function coerceStringToRange(text: string, desc: RangeDesc, iz: InputZone): Value {
   const parsed = parseRangeText(text);
   if (parsed.empty) return emptyRangeValue();
   const elem = elementScalar(desc);
   const coerceBound = (b: string | null): Value | null => {
     if (b === null) return null;
-    const { node } = coerceStringLiteral(b, elem, null, null);
+    const { node } = coerceStringLiteral(b, elem, null, null, iz);
     return rexprConstToValue(node);
   };
   const lower = coerceBound(parsed.lower);
@@ -449,6 +456,7 @@ export function coerceStringLiteral(
   target: ScalarType,
   typmod: DecimalTypmod | null,
   varcharLen: number | null,
+  iz: InputZone,
 ): { node: RExpr; type: ResolvedType } {
   switch (target) {
     case "bytea":
@@ -468,7 +476,7 @@ export function coerceStringLiteral(
       };
     case "timestamptz":
       return {
-        node: { kind: "constTimestamptz", value: parseTimestamptz(s) },
+        node: { kind: "constTimestamptz", value: iz.parseTimestamptz(s) },
         type: { kind: "timestamptz" },
       };
     case "date":
@@ -552,6 +560,7 @@ export function coerceStringToComposite(
   text: string,
   ct: CompositeType,
   db: Engine,
+  iz: InputZone,
 ): { node: RExpr; type: ResolvedType } {
   const malformed = (): Error =>
     engineError(
@@ -573,7 +582,7 @@ export function coerceStringToComposite(
       const nested = db.compositeType(f.type.name);
       if (nested === undefined)
         throw new Error("nested composite type resolved at CREATE TYPE / load");
-      const { node, type } = coerceStringToComposite(tok, nested, db);
+      const { node, type } = coerceStringToComposite(tok, nested, db, iz);
       nodes.push(node);
       fieldTypes.push({ name: f.name, type });
     } else if (f.type.kind === "array") {
@@ -581,7 +590,7 @@ export function coerceStringToComposite(
       // coerced through array_in against the element type — the same path a bare `'{…}'::T[]` cast
       // uses, one level down. Folds to a constant array.
       const elemCol = db.colTypeOf(f.type.elem);
-      const val = coerceStringToArray(tok, elemCol);
+      const val = coerceStringToArray(tok, elemCol, iz);
       nodes.push(valueToRExpr(val));
       fieldTypes.push({ name: f.name, type: resolvedTypeOfCol(f.type, db) });
     } else if (f.type.kind === "range") {
@@ -589,7 +598,7 @@ export function coerceStringToComposite(
       // storable yet — R2).
       throw new Error("a composite range field is rejected at CREATE TYPE (R2)");
     } else {
-      const { node, type } = coerceStringLiteral(tok, f.type.scalar, f.decimal, f.varcharLen);
+      const { node, type } = coerceStringLiteral(tok, f.type.scalar, f.decimal, f.varcharLen, iz);
       nodes.push(node);
       fieldTypes.push({ name: f.name, type });
     }

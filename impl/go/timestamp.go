@@ -208,19 +208,15 @@ func readFrac(b string, i *int) (int64, error) {
 	return us, nil
 }
 
-// parseDatetime parses a timestamp/timestamptz literal to µs since the epoch. For timestamptz
-// (applyOffset) a trailing offset normalizes the wall clock to UTC; for timestamp an offset is
-// parsed/validated but ignored (PG behavior). typeName is used only for error messages.
-func parseDatetime(input string, applyOffset bool, typeName string) (int64, error) {
+// parseDatetime parses a zoneless timestamp to µs since the epoch: an offset is parsed/validated
+// but ignored (PG behavior). typeName is used only for error messages.
+func parseDatetime(input string, typeName string) (int64, error) {
 	w, err := parseDatetimeWall(input, typeName)
 	if err != nil {
 		return 0, err
 	}
 	if w.infinite {
 		return w.micros, nil
-	}
-	if applyOffset && w.hasOffset {
-		return applyUTCOffset(w.micros, w.offsetSecs)
 	}
 	return finiteInstant(w.micros)
 }
@@ -257,11 +253,11 @@ func applyUTCOffset(wall, offsetSecs int64) (int64, error) {
 	return finiteInstant(micros)
 }
 
-// parseTimestamptzInput parses a timestamptz input for the runtime text → timestamptz cast
-// (types.md §5): an explicit offset (or ±infinity) yields the instant (local = false), while an
-// offset-less wall clock is returned with local = true for the caller to interpret in the session
-// zone, as PostgreSQL's timestamptz_in does. (The literal path, parseTimestamptz, still reads it
-// as UTC.) A local wall clock is not yet checked against the sentinels.
+// parseTimestamptzInput parses a timestamptz input to its reading: an explicit offset (or
+// ±infinity) yields the instant (local = false), while an offset-less wall clock is returned with
+// local = true for the caller to interpret in the session zone. The runtime text → timestamptz cast
+// (types.md §5) uses it directly so it can charge the zone consult only when one happens. A local
+// wall clock is not yet checked against the sentinels.
 func parseTimestamptzInput(s string) (micros int64, local bool, err error) {
 	w, err := parseDatetimeWall(s, "timestamptz")
 	if err != nil {
@@ -472,10 +468,48 @@ func sub64(a, b int64) (int64, bool) {
 
 // ParseTimestamp parses a timestamp (zoneless) literal: an offset in the text is accepted and
 // ignored (PG behavior).
-func parseTimestamp(s string) (int64, error) { return parseDatetime(s, false, "timestamp") }
+func parseTimestamp(s string) (int64, error) { return parseDatetime(s, "timestamp") }
 
-// ParseTimestamptz parses a timestamptz literal: a trailing offset normalizes the value to UTC.
-func parseTimestamptz(s string) (int64, error) { return parseDatetime(s, true, "timestamptz") }
+// ParseTimestamptz parses a timestamptz input string, as PostgreSQL's timestamptz_in does
+// (timezones.md §9.3): a trailing offset normalizes the wall clock to UTC, ±infinity is its
+// sentinel, and an offset-less wall clock is read in zone — the session zone at every caller (DST
+// gap/overlap as the timestamp → timestamptz cast; a shift past the range is 22008). It meters
+// nothing: a caller that evaluates per row charges the zone consult.
+func parseTimestamptz(s string, zone ZoneRef) (int64, error) {
+	iz := inputZone{zone: zone}
+	return iz.parseTimestamptz(s)
+}
+
+// inputZone is the zone a text input reads an offset-less timestamptz in — always the session zone
+// (timezones.md §9.3) — plus a record of whether any parse actually consulted it. Threaded through
+// every text-input path (literal folding, assignment coercion, bound parameters, and the
+// array/range/record text parsers). The resolver reads consulted after folding a literal
+// (paramTypes.noteInputZone): a folded instant that depended on the session zone makes the plan
+// uncacheable (a plan is shared across sessions) and nonimmutable (a persisted expression is
+// re-resolved in whatever zone the next statement runs under — 42P17). Explicit offsets and
+// ±infinity never consult it.
+type inputZone struct {
+	zone      ZoneRef
+	consulted bool
+}
+
+// parseTimestamptz is the package parseTimestamptz in this zone, recording a zone consult for an
+// offset-less wall clock.
+func (iz *inputZone) parseTimestamptz(s string) (int64, error) {
+	mc, local, err := parseTimestamptzInput(s)
+	if err != nil {
+		return 0, err
+	}
+	if !local {
+		return mc, nil
+	}
+	iz.consulted = true
+	inst, ok := localToInstantMicros(iz.zone, mc)
+	if !ok {
+		return 0, errZoneShiftOutOfRange()
+	}
+	return inst, nil
+}
 
 // MakeTimestamp builds a zoneless timestamp (µs since the 1970 epoch) from calendar fields — the
 // workhorse for make_timestamp / make_timestamptz (functions.md §11; PG make_timestamp_internal). A

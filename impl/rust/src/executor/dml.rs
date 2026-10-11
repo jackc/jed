@@ -408,7 +408,7 @@ impl Engine {
                     Some(oc) => Some(self.resolve_on_conflict(&table, oc, &mut ptypes)?),
                     None => None,
                 };
-                let bound = bind_params(params, &ptypes.finalize()?)?;
+                let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
 
                 // INSERT ... VALUES reads no rows; with only literal values and constant
                 // defaults it evaluates no expression tree (leaves), so a plain fully-inline
@@ -477,7 +477,12 @@ impl Engine {
                                         date_clock_value(self, &stmt_rng, &mut meter, offset_days)?
                                     }
                                 }
-                                other => materialize_insert_value(other, &col_types[i], &bound)?,
+                                other => materialize_insert_value(
+                                    other,
+                                    &col_types[i],
+                                    &bound,
+                                    &self.input_zone(),
+                                )?,
                             };
                         }
                     }
@@ -593,7 +598,7 @@ impl Engine {
                     Some(oc) => Some(self.resolve_on_conflict(&table, oc, &mut ptypes)?),
                     None => None,
                 };
-                let bound = bind_params(params, &ptypes.finalize()?)?;
+                let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
                 let mut meter = self.session.new_meter();
                 self.fold_uncorrelated_in_plan(&mut plan, &bound, ctx, &mut meter.accrued)?;
                 self.fold_conflict_plan(&mut conflict_plan, &bound, &mut meter.accrued)?;
@@ -1066,7 +1071,7 @@ impl Engine {
         ctx: CteCtx,
         mut plan: InsertValuesPlan,
     ) -> Result<Outcome> {
-        let bound = bind_params(params, &plan.param_types)?;
+        let bound = bind_params(params, &plan.param_types, &self.input_zone())?;
         let mut meter = self.session.new_meter();
         self.fold_value_exprs(&mut plan.value_exprs, &bound, ctx, &mut meter)?;
         // The RETURNING sublinks fold after the rows materialize (below), so a VALUES evaluation
@@ -1085,7 +1090,7 @@ impl Engine {
         ctx: CteCtx,
         plan: &InsertValuesPlan,
     ) -> Result<Outcome> {
-        let bound = bind_params(params, &plan.param_types)?;
+        let bound = bind_params(params, &plan.param_types, &self.input_zone())?;
         let meter = self.session.new_meter();
         self.execute_insert_values_plan_with_bound(ins, &bound, ctx, plan, meter, None)
     }
@@ -1137,7 +1142,12 @@ impl Engine {
                                 date_clock_value(self, &stmt_rng, &mut meter, offset_days)?
                             }
                         }
-                        other => materialize_insert_value(other, &plan.col_types[i], bound)?,
+                        other => materialize_insert_value(
+                            other,
+                            &plan.col_types[i],
+                            bound,
+                            &self.input_zone(),
+                        )?,
                     };
                 }
             }
@@ -1312,6 +1322,7 @@ impl Engine {
                         col.varchar_len,
                         col.not_null,
                         &col.name,
+                        &self.input_zone(),
                     )
                     // Stamp the target relation onto a column-store failure (23502/22003/
                     // 22001) — the relation name is in scope here, not inside the coercion
@@ -1573,6 +1584,7 @@ impl Engine {
                     col.varchar_len,
                     col.not_null,
                     &col.name,
+                    &self.input_zone(),
                 )
                 .map_err(|e| e.with_table(&relation))?,
             );
@@ -1941,6 +1953,7 @@ impl Engine {
                         col.varchar_len,
                         col.not_null,
                         &col.name,
+                        &self.input_zone(),
                     )
                     // Stamp the target relation onto a column-store failure (23502/22003/
                     // 22001) — the relation name is in scope here, not inside the coercion
@@ -2038,8 +2051,9 @@ impl Engine {
                                 let mut new_row = erow.clone();
                                 for ap in assignments {
                                     let raw = ap.source.eval(&combined, &env, meter)?;
-                                    new_row[ap.idx] =
-                                        ap.check(raw).map_err(|e| e.with_table(&relation))?;
+                                    new_row[ap.idx] = ap
+                                        .check(raw, &self.input_zone())
+                                        .map_err(|e| e.with_table(&relation))?;
                                 }
                                 self.eval_checks(checks, &new_row, rng, &relation, meter)?;
                                 updates.push((ekey, new_row, erow));
@@ -3010,7 +3024,7 @@ impl Engine {
             }
             None => None,
         };
-        let bound = bind_params(params, &ptypes.finalize()?)?;
+        let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
 
         // Fold globally-uncorrelated subqueries (in the WHERE or the RETURNING list) once
         // (their cost is added a single time — spec/design/grammar.md §26, cost.md §3); a
@@ -3439,7 +3453,7 @@ impl Engine {
         let relation = table.name.clone();
         // All assignment RHSs + the WHERE + the RETURNING are resolved: finalize + bind
         // before any scan.
-        let bound = bind_params(params, &ptypes.finalize()?)?;
+        let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
 
         // Fold globally-uncorrelated subqueries (in any assignment RHS or the WHERE) once — their
         // cost is added a single time (grammar.md §26, cost.md §3); a correlated one stays and
@@ -3588,7 +3602,9 @@ impl Engine {
                         .expect("a CASCADE assignment is one of the FK's local columns");
                     raw = mapped[slot].clone();
                 }
-                new_row[plan.idx] = plan.check(raw).map_err(|e| e.with_table(&relation))?;
+                new_row[plan.idx] = plan
+                    .check(raw, &self.input_zone())
+                    .map_err(|e| e.with_table(&relation))?;
             }
             // The rewritten row is stored fully resident: resolve any still-unfetched (untouched)
             // columns so its weight/disposition re-plan exactly as an eager writer's would —

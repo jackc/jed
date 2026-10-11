@@ -108,7 +108,8 @@ import {
   scalarTypeFromName,
   typeIsText,
 } from "./types.ts";
-import { parseTimestamp, parseTimestamptz } from "./timestamp.ts";
+import { parseTimestamp } from "./timestamp.ts";
+import type { InputZone } from "./timezone.ts";
 import { dateClockSpecial, parseDate } from "./date.ts";
 import { parseInterval } from "./interval.ts";
 import { jsonCompactOut, jsonbIn, jsonbOut, parsePreservingJson, validateJson } from "./json.ts";
@@ -390,6 +391,16 @@ function dateClockLiteral(
   return { node: { kind: "dateClock", offsetDays: sp.offsetDays }, type: { kind: "date" } };
 }
 
+// foldInSessionZone runs a resolve-time text-input fold (a string literal adapting to a
+// datetime/container context) in the session zone, recording on params whether it read the zone
+// (ParamTypes.noteInputZone — timezones.md §9.3).
+function foldInSessionZone<T>(scope: Scope, params: ParamTypes, fold: (iz: InputZone) => T): T {
+  const iz = scope.catalog.inputZone();
+  const out = fold(iz);
+  params.noteInputZone(iz);
+  return out;
+}
+
 // resolve resolves one Expr into an RExpr plus its static type. ctx (non-null) is the
 // type an untyped integer literal should adapt to (spec/design/types.md §6); null
 // defaults a bare literal to i64.
@@ -631,11 +642,15 @@ export function resolve(
       // A composite type name (`addr '(Main,90210)'`) coerces the string via record_in
       // (spec/design/composite.md §8) — the same primitive as `'(…)'::addr`.
       const ct = scope.catalog.compositeType(e.typeName);
-      if (ct !== undefined) return coerceStringToComposite(e.text, ct, scope.catalog);
+      if (ct !== undefined)
+        return foldInSessionZone(scope, params, (iz) =>
+          coerceStringToComposite(e.text, ct, scope.catalog, iz),
+        );
       // A range type name (`i32range '[1,5)'`, `int4range '…'`) coerces the string via range_in
       // against the element type (spec/design/ranges.md §5) — the same primitive as the cast.
       const rdesc = rangeByName(e.typeName);
-      if (rdesc !== undefined) return coerceStringToRangeExpr(e.text, rdesc);
+      if (rdesc !== undefined)
+        return foldInSessionZone(scope, params, (iz) => coerceStringToRangeExpr(e.text, rdesc, iz));
       const [target] = resolveTypeAndTypmod(e.typeName, null);
       // DATE 'today' / DATE 'now' / … — the clock-relative specials become the STABLE dateClock
       // node, exactly like the ctx-adaptation form (date.md §6).
@@ -643,7 +658,9 @@ export function resolve(
         const clock = dateClockLiteral(e.text, params);
         if (clock !== null) return clock;
       }
-      return coerceStringLiteral(e.text, target, null, null);
+      return foldInSessionZone(scope, params, (iz) =>
+        coerceStringLiteral(e.text, target, null, null, iz),
+      );
     }
     case "literal":
       switch (e.literal.kind) {
@@ -688,11 +705,14 @@ export function resolve(
               type: { kind: "timestamp" },
             };
           }
+          // An offset-less string reads in the SESSION zone, as PostgreSQL's timestamptz_in does
+          // (timezones.md §9.3).
           if (ctx !== null && isTimestamptz(ctx)) {
+            const text = e.literal.text;
             return {
               node: {
                 kind: "constTimestamptz",
-                value: parseTimestamptz(e.literal.text),
+                value: foldInSessionZone(scope, params, (iz) => iz.parseTimestamptz(text)),
               },
               type: { kind: "timestamptz" },
             };
@@ -946,7 +966,9 @@ export function resolve(
           throw engineError("undefined_object", "type does not exist: " + base);
         }
         if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
-          const val = coerceStringToArray(e.inner.literal.text, elemCol);
+          const text = e.inner.literal.text;
+          const col = elemCol;
+          const val = foldInSessionZone(scope, params, (iz) => coerceStringToArray(text, col, iz));
           return {
             node: valueToRExpr(val),
             type: { kind: "array", elem: elemRt },
@@ -1032,7 +1054,10 @@ export function resolve(
           }
           const elemRt = resolvedTypeOf(elementScalar(rdesc));
           if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
-            return coerceStringToRangeExpr(e.inner.literal.text, rdesc);
+            const text = e.inner.literal.text;
+            return foldInSessionZone(scope, params, (iz) =>
+              coerceStringToRangeExpr(text, rdesc, iz),
+            );
           }
           if (e.inner.kind === "literal" && e.inner.literal.kind === "null") {
             return {
@@ -1061,7 +1086,10 @@ export function resolve(
           );
         }
         if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
-          return coerceStringToComposite(e.inner.literal.text, ct, scope.catalog);
+          const text = e.inner.literal.text;
+          return foldInSessionZone(scope, params, (iz) =>
+            coerceStringToComposite(text, ct, scope.catalog, iz),
+          );
         }
         const inner = resolve(scope, e.inner, null, ag, params);
         if (inner.type.kind === "null") {
@@ -1095,7 +1123,10 @@ export function resolve(
           const clock = dateClockLiteral(e.inner.literal.text, params);
           if (clock !== null) return clock;
         }
-        return coerceStringLiteral(e.inner.literal.text, target, typmod, varcharLen);
+        const text = e.inner.literal.text;
+        return foldInSessionZone(scope, params, (iz) =>
+          coerceStringLiteral(text, target, typmod, varcharLen, iz),
+        );
       }
       // Casting TO text (casts.toml, types.md §5): every built-in scalar renders its own output form,
       // the text a result cell shows — json verbatim, jsonb canonical, uuid lowercase, bytea \x hex,
@@ -2286,7 +2317,11 @@ export function resolveJsonAccess(
     // `#>` / `#>>` take a text[] path. A bare string literal `'{a,b}'` adapts via array_in;
     // otherwise the resolved argument must be a text[] (else 42883).
     if (rhs.kind === "literal" && rhs.literal.kind === "text") {
-      const val = coerceStringToArray(rhs.literal.text, { kind: "scalar", scalar: "text" });
+      const val = coerceStringToArray(
+        rhs.literal.text,
+        { kind: "scalar", scalar: "text" },
+        scope.catalog.inputZone(),
+      );
       rarg = valueToRExpr(val);
     } else {
       const ra = resolve(scope, rhs, null, ag, params);
@@ -2529,7 +2564,11 @@ export function resolveJsonHasKey(
   } else {
     // `?|` / `?&` take a text[] (a bare string literal adapts via array_in).
     if (rhs.kind === "literal" && rhs.literal.kind === "text") {
-      const val = coerceStringToArray(rhs.literal.text, { kind: "scalar", scalar: "text" });
+      const val = coerceStringToArray(
+        rhs.literal.text,
+        { kind: "scalar", scalar: "text" },
+        scope.catalog.inputZone(),
+      );
       rarg = valueToRExpr(val);
     } else {
       const ra = resolve(scope, rhs, null, ag, params);
@@ -2640,7 +2679,11 @@ export function resolveTextArrayArg(
   params: ParamTypes,
 ): RExpr {
   if (rhs.kind === "literal" && rhs.literal.kind === "text") {
-    const val = coerceStringToArray(rhs.literal.text, { kind: "scalar", scalar: "text" });
+    const val = coerceStringToArray(
+      rhs.literal.text,
+      { kind: "scalar", scalar: "text" },
+      scope.catalog.inputZone(),
+    );
     return valueToRExpr(val);
   }
   const r = resolve(scope, rhs, null, ag, params);

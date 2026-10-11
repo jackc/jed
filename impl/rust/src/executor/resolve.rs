@@ -343,7 +343,11 @@ pub(crate) fn resolve_json_access(
         // `#>` / `#>>` take a text[] path. A bare string literal `'{a,b}'` adapts via array_in;
         // otherwise the resolved argument must be a text[] (else 42883).
         if let Expr::Literal(Literal::Text(s)) = rhs {
-            let val = coerce_string_to_array(s, &ColType::Scalar(ScalarType::Text))?;
+            let val = coerce_string_to_array(
+                s,
+                &ColType::Scalar(ScalarType::Text),
+                &scope.catalog.input_zone(),
+            )?;
             value_to_rexpr(&val)
         } else {
             let (rarg, arg_ty) = resolve(scope, rhs, None, agg, params)?;
@@ -702,7 +706,11 @@ pub(crate) fn resolve_json_has_key(
         HasKeyKind::Any | HasKeyKind::All => {
             // `?|` / `?&` take a text[] (a bare string literal adapts via array_in).
             if let Expr::Literal(Literal::Text(s)) = rhs {
-                let val = coerce_string_to_array(s, &ColType::Scalar(ScalarType::Text))?;
+                let val = coerce_string_to_array(
+                    s,
+                    &ColType::Scalar(ScalarType::Text),
+                    &scope.catalog.input_zone(),
+                )?;
                 value_to_rexpr(&val)
             } else {
                 let (r, t) = resolve(scope, rhs, None, agg, params)?;
@@ -833,7 +841,11 @@ pub(crate) fn resolve_text_array_arg(
     params: &mut ParamTypes,
 ) -> Result<RExpr> {
     if let Expr::Literal(Literal::Text(s)) = rhs {
-        let val = coerce_string_to_array(s, &ColType::Scalar(ScalarType::Text))?;
+        let val = coerce_string_to_array(
+            s,
+            &ColType::Scalar(ScalarType::Text),
+            &scope.catalog.input_zone(),
+        )?;
         return Ok(value_to_rexpr(&val));
     }
     let (r, t) = resolve(scope, rhs, None, agg, params)?;

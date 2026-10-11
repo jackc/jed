@@ -1587,7 +1587,7 @@ func resolveJSONAccess(s *scope, op binaryOp, lhs, rhs exprNode, ag *aggCtx, par
 		// `#>` / `#>>` take a text[] path. A bare string literal `'{a,b}'` adapts via array_in;
 		// otherwise the resolved argument must be a text[] (else 42883).
 		if rhs.Kind == exprLiteral && rhs.Literal != nil && rhs.Literal.Kind == literalText {
-			val, err := coerceStringToArray(rhs.Literal.Str, scalarColType(scalarText))
+			val, err := coerceStringToArray(rhs.Literal.Str, scalarColType(scalarText), s.catalog.inputZone())
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -1831,7 +1831,7 @@ func resolveJSONHasKey(s *scope, kind hasKeyKind, lhs, rhs exprNode, ag *aggCtx,
 	default: // hkAny / hkAll
 		// `?|` / `?&` take a text[] (a bare string literal adapts via array_in).
 		if rhs.Kind == exprLiteral && rhs.Literal != nil && rhs.Literal.Kind == literalText {
-			val, err := coerceStringToArray(rhs.Literal.Str, scalarColType(scalarText))
+			val, err := coerceStringToArray(rhs.Literal.Str, scalarColType(scalarText), s.catalog.inputZone())
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -1944,7 +1944,7 @@ func resolveJSONbDelete(s *scope, isPath bool, rhs exprNode, rbase *rExpr, ag *a
 // `sym` is the operator symbol for the error message.
 func resolveTextArrayArg(s *scope, rhs exprNode, sym string, ag *aggCtx, params *paramTypes) (*rExpr, error) {
 	if rhs.Kind == exprLiteral && rhs.Literal != nil && rhs.Literal.Kind == literalText {
-		val, err := coerceStringToArray(rhs.Literal.Str, scalarColType(scalarText))
+		val, err := coerceStringToArray(rhs.Literal.Str, scalarColType(scalarText), s.catalog.inputZone())
 		if err != nil {
 			return nil, err
 		}

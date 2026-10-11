@@ -560,7 +560,8 @@ The time zone is the one **built-in** session variable, `TimeZone`, defaulting t
 default is deliberately UTC, **not the host's local zone** — a fixed deterministic value (§6 above).
 
 **Implemented** with the tz conversion slice ([timezones.md §9](timezones.md)): the slot is the zone a
-`timestamptz` is **decomposed in** by `date_trunc` / `EXTRACT` / the cross-family datetime casts. It is
+`timestamptz` is **decomposed in** by `date_trunc` / `EXTRACT` / the cross-family datetime casts, and
+the zone an offset-less `timestamptz` string is **read in** on every input path (timezones.md §9.3). It is
 set through the **host API** (`set_time_zone` / `SessionOptions::time_zone` — Rust
 `Session::set_time_zone`, Go `SetTimeZone`, TS `setTimeZone`), **validated against the loaded zone set**
 (`UTC` and fixed numeric offsets like `+05:00` always; a **named** IANA zone now accepted when a loaded

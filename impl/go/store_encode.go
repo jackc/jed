@@ -42,11 +42,11 @@ type assignPlan struct {
 // column widens to the typmod; a decimal rounds to scale; a boolean into a boolean column is
 // accepted as-is; a range/array re-coerces its elements). The resolver proved the value's family
 // is assignable.
-func (p assignPlan) check(v Value) (Value, error) {
+func (p assignPlan) check(v Value, iz *inputZone) (Value, error) {
 	if p.colType != nil {
-		return coerceForStore(v, *p.colType, p.decimal, p.varcharLen, p.notNull, p.name)
+		return coerceForStore(v, *p.colType, p.decimal, p.varcharLen, p.notNull, p.name, iz)
 	}
-	return storeValue(v, p.target, p.decimal, p.varcharLen, p.notNull, p.name)
+	return storeValue(v, p.target, p.decimal, p.varcharLen, p.notNull, p.name, iz)
 }
 
 // storeValue coerces a value into a column for storage (shared by INSERT and UPDATE). NULL
@@ -54,7 +54,7 @@ func (p assignPlan) check(v Value) (Value, error) {
 // integer into a decimal column widens (int→decimal) then coerces to the typmod; a decimal into
 // a decimal column coerces to the typmod (rounds to scale, precision-checks → 22003); a
 // cross-family value (decimal→int, text→int, etc.) is a 42804 (decimal→int is explicit-CAST only).
-func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *uint32, notNull bool, colName string) (Value, error) {
+func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *uint32, notNull bool, colName string, iz *inputZone) (Value, error) {
 	switch v.Kind {
 	case ValNull:
 		if notNull {
@@ -149,7 +149,8 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 			return TimestampValue(m), nil
 		}
 		if colTy.IsTimestamptz() {
-			m, err := parseTimestamptz(v.str())
+			// An offset-less string reads in the session zone (timezones.md §9.3).
+			m, err := iz.parseTimestamptz(v.str())
 			if err != nil {
 				return Value{}, err
 			}
@@ -273,17 +274,17 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 
 // coerceForStore coerces a value into a column of resolved type ty for storage
 // (spec/design/composite.md §4): a scalar dispatches to storeValue; a composite to storeComposite.
-func coerceForStore(v Value, ty colType, typmod *decimalTypmod, varcharLen *uint32, notNull bool, colName string) (Value, error) {
+func coerceForStore(v Value, ty colType, typmod *decimalTypmod, varcharLen *uint32, notNull bool, colName string, iz *inputZone) (Value, error) {
 	if ty.Elem != nil {
-		return storeArray(v, *ty.Elem, notNull, colName)
+		return storeArray(v, *ty.Elem, notNull, colName, iz)
 	}
 	if ty.RangeElem != nil {
-		return storeRange(v, *ty.RangeElem, notNull, colName)
+		return storeRange(v, *ty.RangeElem, notNull, colName, iz)
 	}
 	if ty.Composite {
-		return storeComposite(v, ty.Name, ty.Fields, notNull, colName)
+		return storeComposite(v, ty.Name, ty.Fields, notNull, colName, iz)
 	}
-	return storeValue(v, ty.Scalar, typmod, varcharLen, notNull, colName)
+	return storeValue(v, ty.Scalar, typmod, varcharLen, notNull, colName, iz)
 }
 
 // storeRange coerces a value into a RANGE column (spec/design/ranges.md §4): NULL honours NOT NULL
@@ -291,7 +292,7 @@ func coerceForStore(v Value, ty colType, typmod *decimalTypmod, varcharLen *uint
 // canonicalized it), so each present bound is re-coerced to the element type as a belt-and-suspenders
 // identity (an unconstrained scalar coercion — no typmod, NULL-tolerant) and the value passes through;
 // any other value is a 42804.
-func storeRange(v Value, elem colType, notNull bool, colName string) (Value, error) {
+func storeRange(v Value, elem colType, notNull bool, colName string, iz *inputZone) (Value, error) {
 	switch v.Kind {
 	case ValNull:
 		if notNull {
@@ -310,7 +311,7 @@ func storeRange(v Value, elem colType, notNull bool, colName string) (Value, err
 			if b == nil {
 				return nil, nil
 			}
-			cv, err := coerceForStore(*b, elem, nil, nil, false, colName)
+			cv, err := coerceForStore(*b, elem, nil, nil, false, colName, iz)
 			if err != nil {
 				return nil, err
 			}
@@ -339,7 +340,7 @@ func storeRange(v Value, elem colType, notNull bool, colName string) (Value, err
 // storeArray coerces a value into an ARRAY column (spec/design/array.md §4): NULL honours NOT NULL
 // (23502); a ValArray coerces each element to the declared element type via coerceForStore (a NULL
 // element is allowed — array elements are nullable). Any other value is a 42804.
-func storeArray(v Value, elem colType, notNull bool, colName string) (Value, error) {
+func storeArray(v Value, elem colType, notNull bool, colName string, iz *inputZone) (Value, error) {
 	switch v.Kind {
 	case ValNull:
 		if notNull {
@@ -352,7 +353,7 @@ func storeArray(v Value, elem colType, notNull bool, colName string) (Value, err
 		for i, el := range a.Elements {
 			// Elements are nullable; the element typmod is unconstrained this slice (numeric(p,s)[]
 			// and varchar(n)[] are deferred — §12, types.md §15).
-			cv, err := coerceForStore(el, elem, nil, nil, false, colName)
+			cv, err := coerceForStore(el, elem, nil, nil, false, colName, iz)
 			if err != nil {
 				return Value{}, err
 			}
@@ -368,7 +369,7 @@ func storeArray(v Value, elem colType, notNull bool, colName string) (Value, err
 // NOT NULL (23502); a composite must have exactly the declared field count (42804) and each field is
 // coerced to its declared field type via coerceForStore (recursing); any other value is a 42804. A
 // NULL field of a NOT NULL composite field traps 23502.
-func storeComposite(v Value, typeName string, fields []colField, notNull bool, colName string) (Value, error) {
+func storeComposite(v Value, typeName string, fields []colField, notNull bool, colName string, iz *inputZone) (Value, error) {
 	switch v.Kind {
 	case ValNull:
 		if notNull {
@@ -384,7 +385,7 @@ func storeComposite(v Value, typeName string, fields []colField, notNull bool, c
 		}
 		out := make([]Value, len(vals))
 		for i, f := range fields {
-			cv, err := coerceForStore(vals[i], f.Type, f.Typmod, f.VarcharLen, f.NotNull, f.Name)
+			cv, err := coerceForStore(vals[i], f.Type, f.Typmod, f.VarcharLen, f.NotNull, f.Name, iz)
 			if err != nil {
 				return Value{}, err
 			}
@@ -473,7 +474,7 @@ func literalToValue(lit literal) Value {
 // composite slot is a ROW(...) whose fields recurse against the composite's field types, or a bound
 // $N. The result is then fully coerced/range-checked by coerceForStore. DEFAULT is handled by the
 // caller at the top level (it is not a valid field inside a ROW(...)).
-func materializeInsertValue(iv insertValue, ty colType, bound []Value) (Value, error) {
+func materializeInsertValue(iv insertValue, ty colType, bound []Value, iz *inputZone) (Value, error) {
 	if ty.Elem != nil {
 		switch {
 		case iv.IsExpr:
@@ -495,7 +496,7 @@ func materializeInsertValue(iv insertValue, ty colType, bound []Value) (Value, e
 			if nested {
 				subs := make([]Value, len(iv.Array))
 				for i := range iv.Array {
-					sv, err := materializeInsertValue(iv.Array[i], ty, bound)
+					sv, err := materializeInsertValue(iv.Array[i], ty, bound, iz)
 					if err != nil {
 						return Value{}, err
 					}
@@ -505,7 +506,7 @@ func materializeInsertValue(iv insertValue, ty colType, bound []Value) (Value, e
 			}
 			vals := make([]Value, len(iv.Array))
 			for i := range iv.Array {
-				ev, err := materializeInsertValue(iv.Array[i], *ty.Elem, bound)
+				ev, err := materializeInsertValue(iv.Array[i], *ty.Elem, bound, iz)
 				if err != nil {
 					return Value{}, err
 				}
@@ -521,7 +522,7 @@ func materializeInsertValue(iv insertValue, ty colType, bound []Value) (Value, e
 		case iv.Lit.Kind == literalText:
 			// A bare string literal adapts to the array context via array_in (the same
 			// string-adapts-to-context rule bytea/uuid use — spec/design/array.md §7).
-			return coerceStringToArray(iv.Lit.Str, *ty.Elem)
+			return coerceStringToArray(iv.Lit.Str, *ty.Elem, iz)
 		case iv.Lit.Kind == literalNull:
 			return NullValue(), nil
 		default:
@@ -551,7 +552,7 @@ func materializeInsertValue(iv insertValue, ty colType, bound []Value) (Value, e
 		case iv.Lit.Kind == literalText:
 			// A bare string literal adapts to the range context via range_in (the same
 			// string-adapts-to-context rule array/bytea/uuid use — spec/design/ranges.md §5).
-			rv, err := coerceStringToRange(iv.Lit.Str, desc)
+			rv, err := coerceStringToRange(iv.Lit.Str, desc, iz)
 			if err != nil {
 				return Value{}, err
 			}
@@ -591,7 +592,7 @@ func materializeInsertValue(iv insertValue, ty colType, bound []Value) (Value, e
 		}
 		vals := make([]Value, len(ty.Fields))
 		for i, f := range ty.Fields {
-			fv, err := materializeInsertValue(iv.Row[i], f.Type, bound)
+			fv, err := materializeInsertValue(iv.Row[i], f.Type, bound, iz)
 			if err != nil {
 				return Value{}, err
 			}
@@ -612,7 +613,7 @@ func materializeInsertValue(iv insertValue, ty colType, bound []Value) (Value, e
 // coerceStringToArray parses a text array literal into a ValArray against the element ColType via
 // array_in (spec/design/array.md §7): each token is coerced to the element type (an unquoted NULL
 // token → NULL element). A malformed literal is 22P02.
-func coerceStringToArray(s string, elem colType) (Value, error) {
+func coerceStringToArray(s string, elem colType, iz *inputZone) (Value, error) {
 	parsed, errKind := parseArrayLiteral(s)
 	switch errKind {
 	case arrayMalformed:
@@ -626,7 +627,7 @@ func coerceStringToArray(s string, elem colType) (Value, error) {
 			vals[i] = NullValue()
 			continue
 		}
-		ev, err := coerceArrayElementText(*tok, elem)
+		ev, err := coerceArrayElementText(*tok, elem, iz)
 		if err != nil {
 			return Value{}, err
 		}
@@ -640,18 +641,18 @@ func coerceStringToArray(s string, elem colType) (Value, error) {
 // composite via record_in (recursive — the array-of-composite quoting nests, §12 AC1 / §7).
 // Self-contained over the resolved ColType, so no catalog re-walk. A nested-array element token
 // would recurse, but array-of-array is not a jed type, so it is unreachable in v1.
-func coerceArrayElementText(tok string, elem colType) (Value, error) {
+func coerceArrayElementText(tok string, elem colType, iz *inputZone) (Value, error) {
 	switch {
 	case elem.Composite:
-		return coerceRecordTextToValue(tok, elem)
+		return coerceRecordTextToValue(tok, elem, iz)
 	case elem.Elem != nil:
-		return coerceStringToArray(tok, *elem.Elem)
+		return coerceStringToArray(tok, *elem.Elem, iz)
 	case elem.RangeElem != nil:
 		// A range element token is unreachable: array-of-range is not a storable jed type (R2), so an
 		// array element ColType is never a range.
 		panic("array-of-range is not a storable type (ranges.md §2)")
 	default:
-		return coerceStringLiteralToValue(tok, elem.Scalar)
+		return coerceStringLiteralToValue(tok, elem.Scalar, iz)
 	}
 }
 
@@ -660,7 +661,7 @@ func coerceArrayElementText(tok string, elem colType) (Value, error) {
 // parseRecordTokens and recursively coerced per field (a scalar field respects its decimal typmod).
 // Mirrors coerceStringToComposite but produces a Value directly and walks ColType (no Engine). A
 // bad shape / field count is 22P02.
-func coerceRecordTextToValue(text string, ct colType) (Value, error) {
+func coerceRecordTextToValue(text string, ct colType, iz *inputZone) (Value, error) {
 	malformed := func() error {
 		return newError(InvalidTextRepresentation,
 			fmt.Sprintf("malformed record literal: %q for type %s", text, ct.Name))
@@ -680,15 +681,15 @@ func coerceRecordTextToValue(text string, ct colType) (Value, error) {
 		var err error
 		switch {
 		case f.Type.Composite:
-			v, err = coerceRecordTextToValue(*tokens[i], f.Type)
+			v, err = coerceRecordTextToValue(*tokens[i], f.Type, iz)
 		case f.Type.Elem != nil:
-			v, err = coerceStringToArray(*tokens[i], *f.Type.Elem)
+			v, err = coerceStringToArray(*tokens[i], *f.Type.Elem, iz)
 		case f.Type.RangeElem != nil:
 			// A composite range field is unreachable: CREATE TYPE rejects a range field (R2).
 			panic("a composite range field is rejected at CREATE TYPE (R2)")
 		default:
 			var node *rExpr
-			node, _, err = coerceStringLiteral(*tokens[i], f.Type.Scalar, f.Typmod, f.VarcharLen)
+			node, _, err = coerceStringLiteral(*tokens[i], f.Type.Scalar, f.Typmod, f.VarcharLen, iz)
 			if err == nil {
 				v, err = rExprConstToValue(node)
 			}
@@ -704,8 +705,8 @@ func coerceRecordTextToValue(text string, ct colType) (Value, error) {
 // coerceStringLiteralToValue coerces an array-element token string to a runtime Value of the
 // element scalar type, via the same string-literal coercion the typed-literal path uses (22P02 /
 // 22003 on bad input).
-func coerceStringLiteralToValue(s string, target scalarType) (Value, error) {
-	node, _, err := coerceStringLiteral(s, target, nil, nil)
+func coerceStringLiteralToValue(s string, target scalarType, iz *inputZone) (Value, error) {
+	node, _, err := coerceStringLiteral(s, target, nil, nil, iz)
 	if err != nil {
 		return Value{}, err
 	}

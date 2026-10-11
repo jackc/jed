@@ -888,7 +888,12 @@ impl Engine {
                     .map(|cp| {
                         Ok((
                             std::rc::Rc::clone(&cp.plan),
-                            bind_params_with_labels(params, &cp.param_types, &cp.param_labels)?,
+                            bind_params_with_labels(
+                                params,
+                                &cp.param_types,
+                                &cp.param_labels,
+                                &self.input_zone(),
+                            )?,
                             cp.metadata.clone(),
                         ))
                     })
@@ -909,7 +914,7 @@ impl Engine {
         let uncacheable = ptypes.uncacheable;
         let ptys = ptypes.finalize()?;
         let labels = param_labels(ptys.len());
-        let bound_params = bind_params_with_labels(params, &ptys, &labels)?;
+        let bound_params = bind_params_with_labels(params, &ptys, &labels, &self.input_zone())?;
         // Fold globally-uncorrelated subqueries to constants (at top level every surviving subquery is
         // uncorrelated) so the per-row eval re-enters nothing — keeping the cursor self-contained. The
         // fold's own cost was already charged to the shared lifetime gauge by its sub-executions; it is

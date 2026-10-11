@@ -1,0 +1,185 @@
+# An offset-less timestamptz STRING is read in the SESSION zone wherever it is input — the literal
+# adapting to a timestamptz context, the `timestamptz '…'` typed literal, a cast of a string literal,
+# an INSERT VALUES / UPDATE SET assignment, a constant column DEFAULT (folded at CREATE TABLE, in the
+# zone of the session that creates it), and a timestamptz inside array / range / record text and the
+# range constructor — as PostgreSQL's timestamptz_in does (spec/design/timezones.md §9.3). An explicit
+# offset or ±infinity fixes the instant with no zone consult. DST gap/overlap resolve as the
+# timestamp → timestamptz cast. Results are rendered through AT TIME ZONE 'UTC' (a zone-free
+# timestamp) so the output does not depend on result-cell rendering.
+#
+# OUT of this corpus (PG divergences, per-core tested): an offset-less timestamptz literal inside an
+# index expression or partial-index predicate is 42P17 (jed re-resolves persisted expressions per
+# statement; PG folds the literal into the definition), and a prepared statement re-reads the session
+# zone on each execution (PG freezes the prepare-time zone).
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, query.select, query.where_eq, query.order_by, types.i32, types.text, types.timestamp, types.timestamptz, types.array, types.range, types.composite, func.range_constructors, func.range_accessors, cast.explicit, cast.operator, cast.string_literal, session.timezone, expr.at_time_zone, types.timestamptz_session_input
+
+# load-timezone: America/New_York
+# load-timezone: Asia/Kolkata
+
+# ============================================================================================
+# scalar literals: the typed literal, a cast of a literal, and context adaptation
+# ============================================================================================
+
+# New York is EST (-05) in January and EDT (-04) in July.
+# timezone: America/New_York
+query TT nosort
+SELECT timestamptz '2024-01-15 12:00:00' AT TIME ZONE 'UTC', timestamptz '2024-07-01 00:00:00' AT TIME ZONE 'UTC'
+----
+2024-01-15 17:00:00
+2024-07-01 04:00:00
+
+# timezone: America/New_York
+query TT nosort
+SELECT '2024-01-15 12:00:00'::timestamptz AT TIME ZONE 'UTC', CAST('2024-01-15' AS timestamptz) AT TIME ZONE 'UTC'
+----
+2024-01-15 17:00:00
+2024-01-15 05:00:00
+
+# a half-hour session zone
+# timezone: Asia/Kolkata
+query T nosort
+SELECT timestamptz '2024-01-15 12:00:00' AT TIME ZONE 'UTC'
+----
+2024-01-15 06:30:00
+
+# An explicit offset fixes the instant whatever the session zone; ±infinity consults no zone.
+# timezone: America/New_York
+query TTT nosort
+SELECT timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE 'UTC', timestamptz '2024-01-15 12:00:00+05:30' AT TIME ZONE 'UTC', timestamptz 'infinity' AT TIME ZONE 'UTC'
+----
+2024-01-15 12:00:00
+2024-01-15 06:30:00
+infinity
+
+# The same string names a different instant in a different session zone.
+# timezone: America/New_York
+query B nosort
+SELECT timestamptz '2024-01-15 12:00:00' = timestamptz '2024-01-15 17:00:00+00'
+----
+true
+
+query B nosort
+SELECT timestamptz '2024-01-15 12:00:00' = timestamptz '2024-01-15 17:00:00+00'
+----
+false
+
+# DST: a wall clock in the spring-forward gap takes the earlier (standard) offset; one in the
+# fall-back overlap takes the later (standard) offset — as the timestamp → timestamptz cast.
+# timezone: America/New_York
+query TT nosort
+SELECT timestamptz '2024-03-10 02:30:00' AT TIME ZONE 'UTC', timestamptz '2024-11-03 01:30:00' AT TIME ZONE 'UTC'
+----
+2024-03-10 07:30:00
+2024-11-03 06:30:00
+
+# Agrees with interpreting the zoneless timestamp in the session zone.
+# timezone: Asia/Kolkata
+query B nosort
+SELECT '2024-03-10 02:30:00'::timestamptz = ('2024-03-10 02:30:00'::timestamp)::timestamptz
+----
+true
+
+# ============================================================================================
+# assignment: INSERT VALUES, UPDATE SET, comparison against a column, a constant DEFAULT
+# ============================================================================================
+
+statement ok
+CREATE TABLE ev (id integer PRIMARY KEY, at timestamptz)
+
+# timezone: America/New_York
+statement ok
+INSERT INTO ev VALUES (1, '2024-01-15 12:00:00'), (2, '2024-07-01 00:00:00'), (3, '2024-01-15 12:00:00+00')
+
+# timezone: Asia/Kolkata
+statement ok
+INSERT INTO ev VALUES (4, '2024-01-15 12:00:00')
+
+query IT nosort
+SELECT id, at AT TIME ZONE 'UTC' FROM ev ORDER BY id
+----
+1
+2024-01-15 17:00:00
+2
+2024-07-01 04:00:00
+3
+2024-01-15 12:00:00
+4
+2024-01-15 06:30:00
+
+# a string compared against a timestamptz column adapts to it — read in the session zone
+# timezone: America/New_York
+query I nosort
+SELECT id FROM ev WHERE at = '2024-01-15 12:00:00'
+----
+1
+
+query I nosort
+SELECT id FROM ev WHERE at = '2024-01-15 12:00:00'
+----
+3
+
+# timezone: America/New_York
+statement ok
+UPDATE ev SET at = '2024-12-25 09:00:00' WHERE id = 3
+
+query T nosort
+SELECT at AT TIME ZONE 'UTC' FROM ev WHERE id = 3
+----
+2024-12-25 14:00:00
+
+# A constant DEFAULT folds once, at CREATE TABLE, in the creating session's zone — a later INSERT
+# under another zone stores the same instant.
+# timezone: America/New_York
+statement ok
+CREATE TABLE dflt (id integer PRIMARY KEY, at timestamptz DEFAULT '2024-01-15 12:00:00')
+
+# timezone: Asia/Kolkata
+statement ok
+INSERT INTO dflt (id) VALUES (1)
+
+query T nosort
+SELECT at AT TIME ZONE 'UTC' FROM dflt
+----
+2024-01-15 17:00:00
+
+# ============================================================================================
+# container text: array, range, and record input, and the range constructor
+# ============================================================================================
+
+# timezone: America/New_York
+query TT nosort
+SELECT ('{"2024-01-15 12:00:00","2024-07-01 00:00:00+00"}'::timestamptz[])[1] AT TIME ZONE 'UTC', ('{"2024-01-15 12:00:00","2024-07-01 00:00:00+00"}'::timestamptz[])[2] AT TIME ZONE 'UTC'
+----
+2024-01-15 17:00:00
+2024-07-01 00:00:00
+
+# timezone: America/New_York
+query TT nosort
+SELECT lower('[2024-01-15 00:00:00,2024-01-16 00:00:00)'::tstzrange) AT TIME ZONE 'UTC', upper(tstzrange('2024-01-15 00:00:00', '2024-01-16 00:00:00')) AT TIME ZONE 'UTC'
+----
+2024-01-15 05:00:00
+2024-01-16 05:00:00
+
+statement ok
+CREATE TYPE stamp AS (at timestamptz, n integer)
+
+# timezone: Asia/Kolkata
+query TI nosort
+SELECT ('("2024-01-15 12:00:00",7)'::stamp).at AT TIME ZONE 'UTC', ('("2024-01-15 12:00:00",7)'::stamp).n
+----
+2024-01-15 06:30:00
+7
+
+statement ok
+CREATE TABLE spans (id integer PRIMARY KEY, ats timestamptz[], span tstzrange)
+
+# timezone: America/New_York
+statement ok
+INSERT INTO spans VALUES (1, '{"2024-01-15 12:00:00"}', '[2024-07-01 00:00:00,2024-07-02 00:00:00)')
+
+query TT nosort
+SELECT ats[1] AT TIME ZONE 'UTC', lower(span) AT TIME ZONE 'UTC' FROM spans
+----
+2024-01-15 17:00:00
+2024-07-01 04:00:00

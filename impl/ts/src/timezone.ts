@@ -16,6 +16,7 @@ import {
   civilFromDays,
   daysFromCivil,
   fieldOverflow,
+  parseTimestamptzInput,
 } from "./timestamp.ts";
 
 const SECS_PER_DAY = 86_400n;
@@ -641,6 +642,40 @@ export function localToInstantMicros(zr: ZoneRef, wallMicros: bigint): bigint {
   const wallSecs = floorDivBig(wallMicros, 1_000_000n);
   const chosen = determineLocalOffset(zr, wallSecs);
   return finiteShift(wallMicros - chosen * 1_000_000n);
+}
+
+// parseTimestamptz parses a timestamptz input string, as PostgreSQL's timestamptz_in does
+// (timezones.md §9.3): a trailing offset normalizes the wall clock to UTC, ±infinity is its
+// sentinel, and an offset-less wall clock is read in zr — the session zone at every caller (DST
+// gap/overlap as the timestamp → timestamptz cast; a shift past the range is 22008). The one parser
+// behind the literal, typed-literal, cast-of-a-literal, assignment, and container (array/range/record
+// text) inputs. It meters nothing: a caller that evaluates per row charges the zone consult.
+export function parseTimestamptz(s: string, zr: ZoneRef): bigint {
+  return new InputZone(zr).parseTimestamptz(s);
+}
+
+// InputZone is the zone a text input reads an offset-less timestamptz in — always the session zone
+// (timezones.md §9.3) — plus a record of whether any parse actually consulted it. Threaded through
+// every text-input path (literal folding, assignment coercion, bound parameters, and the
+// array/range/record text parsers). The resolver reads `consulted` after folding a literal: a folded
+// instant that depended on the session zone makes the plan uncacheable (a plan is shared across
+// sessions) and nonimmutable (a persisted expression is re-resolved in whatever zone the next
+// statement runs under — 42P17). Explicit offsets and ±infinity never consult it.
+export class InputZone {
+  readonly zone: ZoneRef;
+  consulted = false;
+
+  constructor(zone: ZoneRef) {
+    this.zone = zone;
+  }
+
+  // parseTimestamptz in this zone, recording a zone consult for an offset-less wall clock.
+  parseTimestamptz(s: string): bigint {
+    const parsed = parseTimestamptzInput(s);
+    if (!parsed.local) return parsed.micros;
+    this.consulted = true;
+    return localToInstantMicros(this.zone, parsed.micros);
+  }
 }
 
 // finiteShift accepts a zone-shifted reading only when it stays strictly between the two values

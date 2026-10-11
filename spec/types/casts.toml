@@ -495,7 +495,8 @@ overflow_error = "22008"
 # timestamptz parse, where an explicit offset (or ±infinity) fixes the instant and an offset-LESS
 # wall clock is read in the SESSION zone — PostgreSQL's timestamptz_in, a hand-written zone-dependent
 # transform like the datetime casts above, charging one timezone unit (DST gap/overlap as the
-# timestamp -> timestamptz cast; the string-LITERAL path still reads it as UTC, a recorded follow-on);
+# timestamp -> timestamptz cast; the string-LITERAL path reads it in the session zone too, folded at
+# resolve — ../design/timezones.md §9.3);
 # parse_interval (the "unit + time" subset); and the `\x` hex bytea input. 22007 malformed / 22008
 # out of range per row (bytea: 22P02). The three datetime casts are STABLE, like PostgreSQL's
 # timestamp_in / timestamptz_in / interval_in, so an index expression containing one is 42P17;

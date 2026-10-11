@@ -19,7 +19,10 @@ fn vectors() -> toml::Value {
 fn parse(ty: &str, input: &str) -> jed::Result<i64> {
     match ty {
         "timestamp" => parse_timestamp(input),
-        "timestamptz" => parse_timestamptz(input),
+        // The vectors are UTC-session parses (an offset-less wall clock reads as UTC).
+        "timestamptz" => {
+            parse_timestamptz(input, &jed::tooling::timezone::resolve_zone("UTC").unwrap())
+        }
         other => panic!("unknown type {other}"),
     }
 }

@@ -235,7 +235,7 @@ func (db *engine) runWith(wq *withQuery, params []Value) (selectResult, error) {
 	if err != nil {
 		return selectResult{}, err
 	}
-	bound, err := bindParams(params, ptys)
+	bound, err := bindParams(params, ptys, db.inputZone())
 	if err != nil {
 		return selectResult{}, err
 	}
@@ -500,7 +500,7 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 	if err != nil {
 		return outcome{}, err
 	}
-	bound, err := bindParams(params, ptys)
+	bound, err := bindParams(params, ptys, db.inputZone())
 	if err != nil {
 		return outcome{}, err
 	}
@@ -1251,7 +1251,7 @@ func (db *engine) runQueryExpr(qe queryExpr, params []Value) (selectResult, erro
 	if err != nil {
 		return selectResult{}, err
 	}
-	bound, err := bindParams(params, ptys)
+	bound, err := bindParams(params, ptys, db.inputZone())
 	if err != nil {
 		return selectResult{}, err
 	}

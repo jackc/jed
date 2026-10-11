@@ -856,6 +856,7 @@ impl Engine {
                                 varchar_len,
                                 false,
                                 &def.name,
+                                &self.input_zone(),
                             )?),
                             None,
                             None,
@@ -3151,6 +3152,7 @@ impl Engine {
                                 column.varchar_len,
                                 column.not_null,
                                 &column.name,
+                                &self.input_zone(),
                             )?);
                         }
                         RowStep::Drop(column) => {
@@ -3519,6 +3521,7 @@ impl Engine {
                     col.varchar_len,
                     false,
                     &col.name,
+                    &self.input_zone(),
                 )?),
                 None,
             ));

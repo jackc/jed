@@ -68,7 +68,7 @@ impl Engine {
     pub(crate) fn run_query_expr(&self, qe: QueryExpr, params: &[Value]) -> Result<SelectResult> {
         let mut ptypes = ParamTypes::default();
         let mut plan = self.plan_query(&qe, None, &[], &mut ptypes)?;
-        let bound = bind_params(params, &ptypes.finalize()?)?;
+        let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
         let mut subquery_cost: i64 = 0;
         self.fold_uncorrelated_in_plan(&mut plan, &bound, CteCtx::empty(), &mut subquery_cost)?;
         let mut r = self.exec_query_plan(&plan, &[], &bound, CteCtx::empty())?;
@@ -278,7 +278,7 @@ impl Engine {
         let body_q = wq.body.as_query().expect("run_with is the pure-query path");
         let visible: Vec<&CteBinding> = bindings.iter().collect();
         let mut plan = self.plan_query(body_q, None, &visible, &mut ptypes)?;
-        let bound = bind_params(params, &ptypes.finalize()?)?;
+        let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
         let modes = cte_modes(&bindings);
         let (buffers, total_cost) =
             self.materialize_ctes(&bindings, &modes, &bound, CteCtx::empty())?;
@@ -526,7 +526,7 @@ impl Engine {
                     .set(b.refs.get() + count_cte_refs_dml(&body, &b.name));
             }
         }
-        let bound = bind_params(params, &ptypes.finalize()?)?;
+        let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
         let modes = cte_modes(&bindings);
 
         // (3) Run each CTE in list order, filling its buffer. A data-modifying CTE executes for its

@@ -158,7 +158,7 @@ class PgOracle
 
   def initialize(label: "oracle", tz: "UTC")
     @label = label    # used only in the "sentinels missing" raise message
-    @applied = []      # PG-rewritten SQL of statements known to succeed (the replay prefix)
+    @applied = []      # [PG-rewritten SQL, zone] of statements known to succeed (the replay prefix)
     @tz = tz           # the session zone for the CURRENT probe (`# timezone:` directive)
     PgOracle.assert_profile!
   end
@@ -170,8 +170,10 @@ class PgOracle
     self
   end
 
-  # Record a successfully-applied statement into the replay prefix (PG-rewritten).
-  def add_applied(sql) = @applied << rewrite(sql)
+  # Record a successfully-applied statement into the replay prefix (PG-rewritten), with the session
+  # zone it ran under: a statement's effect can depend on the zone (an offset-less timestamptz
+  # literal is read in it — timezones.md §9.3), so the replay re-runs it in that same zone.
+  def add_applied(sql) = @applied << [rewrite(sql), @tz]
 
   def rewrite(sql)
     TYPE_REWRITE.reduce(sql) { |s, (jed, pg)| s.gsub(/\b#{jed}\b/, pg) }
@@ -189,7 +191,7 @@ class PgOracle
     args += ["-F", fieldsep] if fieldsep
     script = +"BEGIN;\n"
     script << session_preamble
-    @applied.each { |s| script << s.rstrip << ";\n" unless s.strip.empty? }
+    script << replay_prefix
     script << "\\echo @@@S\n" << body << "\n\\echo @@@E\n" << "ROLLBACK;\n"
     out, err, = Open3.capture3(*args, stdin_data: script)
     s = out.lines.index { |l| l.chomp == "@@@S" }
@@ -269,10 +271,26 @@ class PgOracle
 
   private
 
+  # The applied prefix, each statement under the zone it originally ran in, then the probe's own
+  # zone restored for the body.
+  def replay_prefix
+    out = +""
+    zone = @tz
+    @applied.each do |sql, tz|
+      next if sql.strip.empty?
+
+      out << "SET LOCAL TimeZone='#{tz}';\n" if tz != zone
+      zone = tz
+      out << sql.rstrip << ";\n"
+    end
+    out << "SET LOCAL TimeZone='#{@tz}';\n" if zone != @tz
+    out
+  end
+
   def value_script(pg_sql)
     script = +"BEGIN;\n"
     script << session_preamble
-    @applied.each { |s| script << s.rstrip << ";\n" unless s.strip.empty? }
+    script << replay_prefix
     script << "\\echo @@@S\n" << pg_sql << ";\n" << "\\echo @@@E\n" << "ROLLBACK;\n"
     script
   end

@@ -1227,7 +1227,31 @@ fn date_clock_literal(s: &str, params: &mut ParamTypes) -> Option<(RExpr, Resolv
     Some((RExpr::DateClock { offset_days }, ResolvedType::Date))
 }
 
+/// Run a resolve-time text-input fold (a string literal adapting to a datetime/container context) in
+/// the session zone, recording on `params` whether it read the zone ([`ParamTypes::note_input_zone`]).
+fn fold_in_session_zone<T>(
+    scope: &Scope,
+    params: &mut ParamTypes,
+    fold: impl FnOnce(&InputZone) -> Result<T>,
+) -> Result<T> {
+    let iz = scope.catalog.input_zone();
+    let out = fold(&iz)?;
+    params.note_input_zone(&iz);
+    Ok(out)
+}
+
 impl ParamTypes {
+    /// Record a resolve-time literal fold that read an offset-less `timestamptz` in the session zone
+    /// (timezones.md §9.3): the folded instant depends on the zone, so the plan must not be shared
+    /// through a cache (a cached plan serves every session) and must not persist (an index expression
+    /// or predicate is re-resolved per statement, in whatever zone that statement runs under — 42P17).
+    pub(crate) fn note_input_zone(&mut self, iz: &InputZone) {
+        if iz.consulted() {
+            self.uncacheable = true;
+            self.nonimmutable = true;
+        }
+    }
+
     /// Record that `$(idx0+1)` appears with context type `ty` (`None` = no context here).
     /// Unifies with any prior inference for the same index: equal types agree, two integer
     /// widths widen to the wider, an incompatible concrete pair is 42804.
@@ -1282,9 +1306,13 @@ pub(crate) fn unify_param_type(a: ScalarType, b: ScalarType, idx0: usize) -> Res
 /// Coerce each supplied bind value to its inferred parameter type, two-phase / all-or-nothing
 /// like INSERT (spec/design/api.md §5): a count mismatch is 42601 and every value is validated
 /// up front (22003/42804/22P02/23502 via `store_value`) before any row is touched.
-pub(crate) fn bind_params(supplied: &[Value], types: &[ScalarType]) -> Result<Vec<Value>> {
+pub(crate) fn bind_params(
+    supplied: &[Value],
+    types: &[ScalarType],
+    iz: &InputZone,
+) -> Result<Vec<Value>> {
     let labels = param_labels(types.len());
-    bind_params_with_labels(supplied, types, &labels)
+    bind_params_with_labels(supplied, types, &labels, iz)
 }
 
 pub(crate) fn param_labels(len: usize) -> Vec<String> {
@@ -1295,6 +1323,7 @@ pub(crate) fn bind_params_with_labels(
     supplied: &[Value],
     types: &[ScalarType],
     labels: &[String],
+    iz: &InputZone,
 ) -> Result<Vec<Value>> {
     if supplied.len() != types.len() {
         return Err(EngineError::new(
@@ -1311,7 +1340,17 @@ pub(crate) fn bind_params_with_labels(
         // A bound parameter is coerced exactly like a literal in that position: typmod is
         // unconstrained (a comparison/insert against a column re-applies the column typmod),
         // not_null is false (NULL is a legal bound value; a NOT NULL target re-checks at store).
-        bound.push(store_value(v.clone(), *ty, None, None, false, &labels[i])?);
+        // A text value bound to a timestamptz parameter reads an offset-less string in the session
+        // zone, as PostgreSQL's text-format parameter input does (timezones.md §9.3).
+        bound.push(store_value(
+            v.clone(),
+            *ty,
+            None,
+            None,
+            false,
+            &labels[i],
+            iz,
+        )?);
     }
     Ok(bound)
 }
@@ -3477,8 +3516,12 @@ pub(crate) fn resolve(
                     RExpr::ConstTimestamp(parse_timestamp(s)?),
                     ResolvedType::Timestamp,
                 )),
+                // An offset-less string reads in the SESSION zone, as PostgreSQL's timestamptz_in
+                // does (timezones.md §9.3).
                 Some(t) if t.is_timestamptz() => Ok((
-                    RExpr::ConstTimestamptz(parse_timestamptz(s)?),
+                    RExpr::ConstTimestamptz(fold_in_session_zone(scope, params, |iz| {
+                        iz.parse_timestamptz(s)
+                    })?),
                     ResolvedType::Timestamptz,
                 )),
                 // A string adapts to a DATE context (parse the ISO date, dropping any time/offset;
@@ -3541,13 +3584,17 @@ pub(crate) fn resolve(
             // A composite type name (`addr '(Main,90210)'`) coerces the string via `record_in`
             // (spec/design/composite.md §8) — the same primitive as `'(…)'::addr`.
             if let Some(ct) = scope.catalog.composite_type(type_name) {
-                return coerce_string_to_composite(text, ct, scope.catalog);
+                return fold_in_session_zone(scope, params, |iz| {
+                    coerce_string_to_composite(text, ct, scope.catalog, iz)
+                });
             }
             // A range type name (`i32range '[1,5)'`, `int4range '…'`) coerces the string via
             // `range_in` against the element type (spec/design/ranges.md §5) — the same primitive
             // as `'[1,5)'::i32range`.
             if let Some(desc) = crate::range::range_by_name(type_name) {
-                return coerce_string_to_range_expr(text, desc);
+                return fold_in_session_zone(scope, params, |iz| {
+                    coerce_string_to_range_expr(text, desc, iz)
+                });
             }
             let (target, _, _) = resolve_type_and_typmod(type_name, &None)?;
             // DATE 'today' / DATE 'now' / … — the clock-relative specials become the STABLE
@@ -3557,7 +3604,9 @@ pub(crate) fn resolve(
                     return Ok((node, rt));
                 }
             }
-            coerce_string_literal(text, target, None, None)
+            fold_in_session_zone(scope, params, |iz| {
+                coerce_string_literal(text, target, None, None, iz)
+            })
         }
         // A subquery in expression position (spec/design/grammar.md §26): PLANNED ONCE against the
         // scope chain here, so its column-count / type errors fire even over an empty outer.
@@ -3726,7 +3775,9 @@ pub(crate) fn resolve(
                     },
                 };
                 if let Expr::Literal(Literal::Text(s)) = inner.as_ref() {
-                    let val = coerce_string_to_array(s, &elem_col)?;
+                    let val = fold_in_session_zone(scope, params, |iz| {
+                        coerce_string_to_array(s, &elem_col, iz)
+                    })?;
                     return Ok((value_to_rexpr(&val), ResolvedType::Array(Box::new(elem_rt))));
                 }
                 if let Expr::Literal(Literal::Null) = inner.as_ref() {
@@ -3808,7 +3859,9 @@ pub(crate) fn resolve(
                 }
                 let elem_rt = resolved_type_of(crate::range::element_scalar(desc));
                 if let Expr::Literal(Literal::Text(s)) = inner.as_ref() {
-                    return coerce_string_to_range_expr(s, desc);
+                    return fold_in_session_zone(scope, params, |iz| {
+                        coerce_string_to_range_expr(s, desc, iz)
+                    });
                 }
                 if let Expr::Literal(Literal::Null) = inner.as_ref() {
                     return Ok((RExpr::ConstNull, ResolvedType::Range(Box::new(elem_rt))));
@@ -3833,7 +3886,9 @@ pub(crate) fn resolve(
                     ));
                 }
                 if let Expr::Literal(Literal::Text(s)) = inner.as_ref() {
-                    return coerce_string_to_composite(s, ct, scope.catalog);
+                    return fold_in_session_zone(scope, params, |iz| {
+                        coerce_string_to_composite(s, ct, scope.catalog, iz)
+                    });
                 }
                 let ct_name = ct.name.clone();
                 let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
@@ -3869,7 +3924,9 @@ pub(crate) fn resolve(
                         return Ok((node, rt));
                     }
                 }
-                return coerce_string_literal(s, target, typmod, varchar_len);
+                return fold_in_session_zone(scope, params, |iz| {
+                    coerce_string_literal(s, target, typmod, varchar_len, iz)
+                });
             }
             // Datetime casts (timezones.md §9.3, types.md §5): a `timestamp`/`timestamptz`/`date`
             // TARGET from another datetime family or from runtime text. A same-family cast is the

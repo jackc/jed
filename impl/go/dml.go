@@ -1011,7 +1011,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		if err != nil {
 			return outcome{}, err
 		}
-		bound, err := bindParams(params, ptys)
+		bound, err := bindParams(params, ptys, db.inputZone())
 		if err != nil {
 			return outcome{}, err
 		}
@@ -1170,7 +1170,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	if err != nil {
 		return outcome{}, err
 	}
-	bound, err := bindParams(params, ptys)
+	bound, err := bindParams(params, ptys, db.inputZone())
 	if err != nil {
 		return outcome{}, err
 	}
@@ -1243,7 +1243,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 				} else {
 					// A ROW(...) / literal / $N slot is materialized against the column's resolved type
 					// (composite-aware — spec/design/composite.md §1/§4).
-					mv, err := materializeInsertValue(iv, store.colTypes[i], bound)
+					mv, err := materializeInsertValue(iv, store.colTypes[i], bound, db.inputZone())
 					if err != nil {
 						return outcome{}, err
 					}
@@ -1568,7 +1568,7 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx) (*insertValue
 // (before materialization) and RETURNING list (after it) fold their uncorrelated subqueries in place
 // against this execution's params (a cacheable plan has no subquery to fold).
 func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCtx, plan *insertValuesPlan, fold bool) (outcome, error) {
-	bound, err := bindParams(params, plan.ptys)
+	bound, err := bindParams(params, plan.ptys, db.inputZone())
 	if err != nil {
 		return outcome{}, err
 	}
@@ -1618,7 +1618,7 @@ func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCt
 						rv[p] = dv
 					}
 				} else {
-					mv, err := materializeInsertValue(iv, plan.colTypes[i], bound)
+					mv, err := materializeInsertValue(iv, plan.colTypes[i], bound, db.inputZone())
 					if err != nil {
 						return outcome{}, err
 					}
@@ -1724,7 +1724,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 			}
 			// The columns' resolved ColTypes (a scalar, or a composite resolved to its field tree),
 			// for composite-aware store coercion (spec/design/composite.md §4).
-			v, err := coerceForStore(candidate, store.colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name)
+			v, err := coerceForStore(candidate, store.colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name, db.inputZone())
 			if err != nil {
 				// Stamp the target relation onto a column-store failure (23502/22003/22001) —
 				// in scope here, not inside the coercion (spec/design/error-fields.md §4).
@@ -1986,7 +1986,7 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 				return nil, err
 			}
 		}
-		row[i], err = coerceForStore(candidate, store.colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name)
+		row[i], err = coerceForStore(candidate, store.colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name, db.inputZone())
 		if err != nil {
 			return nil, stampTable(err, table.Name)
 		}
@@ -2263,7 +2263,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 				}
 				candidate = dv
 			}
-			v, err := coerceForStore(candidate, store.colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name)
+			v, err := coerceForStore(candidate, store.colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name, db.inputZone())
 			if err != nil {
 				return 0, nil, stampTable(err, relation)
 			}
@@ -2388,7 +2388,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 			if err != nil {
 				return 0, nil, err
 			}
-			checked, err := ap.check(raw)
+			checked, err := ap.check(raw, db.inputZone())
 			if err != nil {
 				return 0, nil, stampTable(err, relation)
 			}
@@ -3197,7 +3197,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 	if err != nil {
 		return outcome{}, err
 	}
-	bound, err := bindParams(params, ptys)
+	bound, err := bindParams(params, ptys, db.inputZone())
 	if err != nil {
 		return outcome{}, err
 	}
@@ -3571,7 +3571,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	if err != nil {
 		return outcome{}, err
 	}
-	bound, err := bindParams(params, ptys)
+	bound, err := bindParams(params, ptys, db.inputZone())
 	if err != nil {
 		return outcome{}, err
 	}
@@ -3731,7 +3731,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			if mapped != nil {
 				raw = mapped[slices.Index(upd.fkTarget.fk.Columns, p.idx)]
 			}
-			checked, err := p.check(raw)
+			checked, err := p.check(raw, db.inputZone())
 			if err != nil {
 				return outcome{}, stampTable(err, table.Name)
 			}

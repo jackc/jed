@@ -477,6 +477,12 @@ func withPageSize(pageSize uint32) *engine {
 	return &engine{committed: newSnapshot(), pageSize: pageSize, session: newSession()}
 }
 
+// inputZone is the session zone as a text-input context (timezones.md §9.3): every parse of an
+// offset-less timestamptz string — literal, assignment, bound parameter, container text — reads it.
+func (db *engine) inputZone() *inputZone {
+	return &inputZone{zone: db.session.timeZone}
+}
+
 // readSnap is the snapshot a read sees: the read pin if one is set (a data-modifying WITH statement
 // pins the pre-statement snapshot so every sub-statement reads it — writable-cte.md §2), else the
 // open transaction's working (read-your-writes for a writable tx; the pinned snapshot for a

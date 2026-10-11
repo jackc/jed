@@ -233,16 +233,16 @@ func evalRangeFunc(fn rangeFunc, vals []Value) (Value, error) {
 // int→decimal / text→temporal adapts), the bounds flags are read (default `[)`; a NULL 3-arg flags →
 // 22000; an invalid flags string → 42601), and finalizeRange produces the canonical value (order-check
 // 22000, canonicalize, empty-normalize).
-func evalRangeCtor(elem scalarType, vals []Value) (Value, error) {
+func evalRangeCtor(elem scalarType, vals []Value, iz *inputZone) (Value, error) {
 	desc, ok := rangeForElement(elem)
 	if !ok {
 		panic("evalRangeCtor: a range constructor's elem has a range")
 	}
-	lower, err := coerceRangeBound(vals[0], elem)
+	lower, err := coerceRangeBound(vals[0], elem, iz)
 	if err != nil {
 		return Value{}, err
 	}
-	upper, err := coerceRangeBound(vals[1], elem)
+	upper, err := coerceRangeBound(vals[1], elem, iz)
 	if err != nil {
 		return Value{}, err
 	}
@@ -271,8 +271,8 @@ func evalRangeCtor(elem scalarType, vals []Value) (Value, error) {
 // NULL bound (an infinite bound). Reuses storeValue (the INSERT/UPDATE assignment coercion): an
 // integer range-checks into the element (22003), an int→decimal widens, a text→temporal parses, and a
 // non-assignable value is 42804 (the resolver already screened the common 42883 cases).
-func coerceRangeBound(v Value, elem scalarType) (*Value, error) {
-	out, err := storeValue(v, elem, nil, nil, false, "range bound")
+func coerceRangeBound(v Value, elem scalarType, iz *inputZone) (*Value, error) {
+	out, err := storeValue(v, elem, nil, nil, false, "range bound", iz)
 	if err != nil {
 		return nil, err
 	}
@@ -287,7 +287,7 @@ func coerceRangeBound(v Value, elem scalarType) (*Value, error) {
 // operands are ranges; for the element overloads (roContainsElem/roElemContainedBy) the non-range
 // operand is coerced to the range's element type elem (assignment-style, matching the resolver's hint).
 // The boolean kernels live in range.go.
-func evalRangeOp(op rangeOp, l, r Value, elem scalarType) (Value, error) {
+func evalRangeOp(op rangeOp, l, r Value, elem scalarType, iz *inputZone) (Value, error) {
 	if l.Kind == ValNull || r.Kind == ValNull {
 		return NullValue(), nil
 	}
@@ -295,14 +295,14 @@ func evalRangeOp(op rangeOp, l, r Value, elem scalarType) (Value, error) {
 	switch op {
 	// `range @> element`: l is the range, r the element (coerced to the range's element type).
 	case roContainsElem:
-		e, err := storeValue(r, elem, nil, nil, false, "range element")
+		e, err := storeValue(r, elem, nil, nil, false, "range element", iz)
 		if err != nil {
 			return Value{}, err
 		}
 		result = rangeContainsElem(expectRange(l), e)
 	// `element <@ range`: l is the element, r the range.
 	case roElemContainedBy:
-		e, err := storeValue(l, elem, nil, nil, false, "range element")
+		e, err := storeValue(l, elem, nil, nil, false, "range element", iz)
 		if err != nil {
 			return Value{}, err
 		}
@@ -1389,7 +1389,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if v.Kind == ValText {
 			// runtime text → T[]: coerce the per-row string via array_in against the target element
 			// ColType (22P02 malformed / 2202E inverted bound — the same as the '{…}'::T[] literal).
-			return coerceStringToArray(v.str(), *e.castElem)
+			return coerceStringToArray(v.str(), *e.castElem, env.exec.inputZone())
 		}
 		// element-wise array → other-element-array: every non-null element through the scalar element
 		// cast to the target element (22003 per element on overflow); the shape (dims/lbounds) is
@@ -3370,7 +3370,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			vals[i] = v
 		}
-		return evalRangeCtor(e.relem, vals)
+		return evalRangeCtor(e.relem, vals, env.exec.inputZone())
 	case reRangeOp:
 		// A range BOOLEAN operator (spec/design/range-functions.md §3). One operator_eval; the operands
 		// charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in evalRangeOp.
@@ -3383,7 +3383,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		return evalRangeOp(e.rop, l, r, e.relem)
+		return evalRangeOp(e.rop, l, r, e.relem, env.exec.inputZone())
 	case reRangeSetOp:
 		// A range SET operator (spec/design/range-functions.md §4). One operator_eval; the operands
 		// charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in evalRangeSetOp.

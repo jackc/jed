@@ -319,7 +319,11 @@ impl RExpr {
                     // runtime text → T[]: coerce the per-row string via `array_in` against the
                     // target element ColType (22P02 malformed / 2202E inverted bound — the same
                     // errors the `'{…}'::T[]` literal path raises).
-                    Value::Text(s) => coerce_string_to_array(&s, to_elem.as_ref().unwrap()),
+                    Value::Text(s) => coerce_string_to_array(
+                        &s,
+                        to_elem.as_ref().unwrap(),
+                        &env.exec.input_zone(),
+                    ),
                     // element-wise array → other-element-array: every non-null element through the
                     // scalar element cast to the target element (22003 per element on overflow); the
                     // shape (dims/lbounds) is preserved and a NULL element stays NULL. The target
@@ -2702,7 +2706,7 @@ impl RExpr {
                 for a in args {
                     vals.push(a.eval(row, env, m)?);
                 }
-                eval_range_ctor(*elem, &vals)
+                eval_range_ctor(*elem, &vals, &env.exec.input_zone())
             }
             // A range BOOLEAN operator (spec/design/range-functions.md §3). One operator_eval; the
             // operands charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in
@@ -2711,7 +2715,7 @@ impl RExpr {
                 m.charge(COSTS.operator_eval);
                 let l = args[0].eval(row, env, m)?;
                 let r = args[1].eval(row, env, m)?;
-                eval_range_op(*op, &l, &r, *elem)
+                eval_range_op(*op, &l, &r, *elem, &env.exec.input_zone())
             }
             // A range SET operator (spec/design/range-functions.md §4). One operator_eval; the
             // operands charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in

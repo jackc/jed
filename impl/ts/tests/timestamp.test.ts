@@ -5,16 +5,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EngineError } from "../src/errors.ts";
-import {
-  parseTimestamp,
-  parseTimestamptz,
-  renderTimestamp,
-  renderTimestamptz,
-} from "../src/timestamp.ts";
+import { parseTimestamp, renderTimestamp, renderTimestamptz } from "../src/timestamp.ts";
+import { parseTimestamptz, resolveZone } from "../src/timezone.ts";
 import { readTimestampCases, specPath } from "./tomlmini.ts";
 
+// The vectors are UTC-session parses (an offset-less wall clock reads as UTC).
+const UTC = resolveZone("UTC")!;
+
 function tsParse(typ: string, input: string): bigint {
-  return typ === "timestamp" ? parseTimestamp(input) : parseTimestamptz(input);
+  return typ === "timestamp" ? parseTimestamp(input) : parseTimestamptz(input, UTC);
 }
 
 function tsRender(typ: string, m: bigint): string {

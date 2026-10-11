@@ -34,7 +34,7 @@ pub(crate) use crate::operators::{AGGREGATES, AggregateDesc, OPERATORS, Operator
 pub(crate) use crate::pmap::KeyBound;
 pub(crate) use crate::privileges::{Privilege, PrivilegeSet};
 pub(crate) use crate::storage::{Row, TableStore};
-pub(crate) use crate::timestamp::{parse_timestamp, parse_timestamptz};
+pub(crate) use crate::timestamp::{InputZone, parse_timestamp};
 pub(crate) use crate::types::{DecimalTypmod, ScalarType, Type};
 pub(crate) use crate::value::{
     ArrayVal, RangeVal, ThreeValued, Value, and3, from3, not3, or3, parse_bytea_hex, parse_uuid,
@@ -4619,7 +4619,8 @@ fn coerce_json_member(
         Type::Scalar(st) => match json::node_to_text(node) {
             None => Ok(Value::Null),
             Some(text) => {
-                let (rexpr, _) = coerce_string_literal(&text, *st, decimal, None)?;
+                let (rexpr, _) =
+                    coerce_string_literal(&text, *st, decimal, None, &env.exec.input_zone())?;
                 rexpr.eval(&[], env, meter)
             }
         },

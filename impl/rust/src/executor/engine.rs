@@ -6,6 +6,12 @@
 use super::*;
 
 impl Engine {
+    /// The session zone as a text-input context (timezones.md §9.3): every parse of an offset-less
+    /// `timestamptz` string — literal, assignment, bound parameter, container text — reads it.
+    pub(crate) fn input_zone(&self) -> InputZone<'_> {
+        InputZone::new(&self.session.time_zone)
+    }
+
     pub fn new() -> Self {
         Engine::with_page_size(DEFAULT_PAGE_SIZE)
     }

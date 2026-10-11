@@ -192,7 +192,9 @@ CREATE UNIQUE INDEX active_email ON accounts (email) WHERE deleted_at IS NULL;
 
 Instant comparisons and explicit-zone conversions are allowed. A cast such as `deleted_at::date`
 reads the session timezone and is rejected with `42P17`; `(deleted_at AT TIME ZONE 'UTC')::date`
-is safe. The same rules compose through CASE, COALESCE, arrays, and nested function calls.
+is safe. A `timestamptz` literal needs an explicit offset for the same reason:
+`WHERE deleted_at > '2024-01-01 00:00+00'` is accepted, while `'2024-01-01 00:00'` (read in the session
+timezone) is `42P17`. The same rules compose through CASE, COALESCE, arrays, and nested function calls.
 
 Named zones must be loaded when the index is created. jed stores their version and checksum with
 the index; a computed zone argument pins the entire loaded zone set. If the loaded data differs,

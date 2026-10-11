@@ -198,6 +198,7 @@ import { Cursor, type RowSource } from "./cursor.ts";
 // Type-only (erased) — no runtime cycle: the executor↔api value edge stays one-directional.
 import type { RunResult } from "./ergonomic.ts";
 import {
+  InputZone,
   loadTimeZoneData as loadTimeZoneDataGlobal,
   loadedTimeZones as loadedTimeZonesGlobal,
   type TimeZoneInfo,
@@ -1404,6 +1405,13 @@ export class Engine {
     this.openStreams = 0;
     this.storageBudget = { limit: 0n, lastCatRoot: 0, lastWritten: [], lastCatalogPages: 0 };
     this.commitStagesRows = false;
+  }
+
+  // inputZone is the session zone as a text-input context (timezones.md §9.3): every parse of an
+  // offset-less timestamptz string — literal, assignment, bound parameter, container text — reads
+  // it.
+  inputZone(): InputZone {
+    return new InputZone(this.session.timeZone);
   }
 
   // setMaxCost sets the execution-cost ceiling for statements run on this handle (CLAUDE.md §13;
@@ -5502,6 +5510,7 @@ export class Engine {
             varcharLen,
             false,
             def.name,
+            this.inputZone(),
           );
         } else {
           rejectDefaultStructure(def.default.expr);
@@ -7425,6 +7434,7 @@ export class Engine {
                 step.column.varcharLen,
                 step.column.notNull,
                 step.column.name,
+                this.inputZone(),
               ),
             );
           } else if (step.kind === "drop") row.splice(step.column, 1);
@@ -7685,6 +7695,7 @@ export class Engine {
           col.varcharLen,
           false,
           col.name,
+          this.inputZone(),
         ),
         defaultExpr: null,
       };
@@ -9524,7 +9535,7 @@ export class Engine {
     params: Value[],
     ctx: CteCtx,
   ): Outcome {
-    const bound = bindParams(params, plan.ptys);
+    const bound = bindParams(params, plan.ptys, this.inputZone());
     const meter = this.session.newMeter();
     const rng = new StmtRng();
     const store = this.writeStoreScoped(ins.db, ins.table);
@@ -9560,7 +9571,7 @@ export class Engine {
             ? dateValue(0n)
             : dateClockValue(this, rng, this.session.seam, meter, sp.offsetDays);
         } else {
-          rv[p] = materializeInsertValue(iv, ct, bound);
+          rv[p] = materializeInsertValue(iv, ct, bound, this.inputZone());
         }
       }
       if (useSingle) singleValues = rv;
@@ -9740,7 +9751,7 @@ export class Engine {
           : null;
       const cplan =
         ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ptypes) : null;
-      const bound = bindParams(params, ptypes.finalize());
+      const bound = bindParams(params, ptypes.finalize(), this.inputZone());
       const meter = this.session.newMeter();
       const foldCost = { value: 0n };
       this.foldUncorrelatedInPlan(plan, bound, ctx, foldCost);
@@ -9875,7 +9886,7 @@ export class Engine {
         : null;
     const cplan =
       ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ptypes) : null;
-    const bound = bindParams(params, ptypes.finalize());
+    const bound = bindParams(params, ptypes.finalize(), this.inputZone());
 
     // INSERT ... VALUES reads no rows; with only literal values and constant defaults it
     // evaluates no expression tree (leaves), so a plain fully-inline insert still costs zero. An
@@ -9932,7 +9943,7 @@ export class Engine {
               ? dateValue(0n)
               : dateClockValue(this, stmtRng, this.session.seam, meter, sp.offsetDays);
           } else {
-            rv[p] = materializeInsertValue(iv, ct, bound);
+            rv[p] = materializeInsertValue(iv, ct, bound, this.inputZone());
           }
         }
       }
@@ -10068,6 +10079,7 @@ export class Engine {
             col.varcharLen,
             col.notNull,
             col.name,
+            this.inputZone(),
           );
         } catch (e) {
           // Stamp the target relation onto a column-store failure (23502/22003/22001) — the
@@ -10294,6 +10306,7 @@ export class Engine {
           col.varcharLen,
           col.notNull,
           col.name,
+          this.inputZone(),
         );
       } catch (e) {
         throw stampTable(e, table.name);
@@ -10715,6 +10728,7 @@ export class Engine {
             col.varcharLen,
             col.notNull,
             col.name,
+            this.inputZone(),
           );
         } catch (e) {
           // Stamp the target relation onto a column-store failure (23502/22003/22001) — the
@@ -10796,7 +10810,11 @@ export class Engine {
       const newRow = existing.row.slice();
       for (const ap of plan.assignments) {
         try {
-          newRow[ap.idx] = checkAssign(ap, evalExpr(ap.source, combined, env, meter));
+          newRow[ap.idx] = checkAssign(
+            ap,
+            evalExpr(ap.source, combined, env, meter),
+            this.inputZone(),
+          );
         } catch (e) {
           throw stampTable(e, table.name);
         }
@@ -11329,7 +11347,7 @@ export class Engine {
       del.returning !== null
         ? this.resolveReturning(table, del.returning, true, ctx.bindings, ptypes)
         : null;
-    const bound = bindParams(params, ptypes.finalize());
+    const bound = bindParams(params, ptypes.finalize(), this.inputZone());
 
     // Fold globally-uncorrelated WHERE subqueries once (their cost is added a single time —
     // spec/design/grammar.md §26, cost.md §3); a correlated one stays and re-runs per row via the
@@ -11661,7 +11679,7 @@ export class Engine {
     const checks = this.resolveChecks(table);
     // All assignment RHSs + the WHERE + the RETURNING are resolved: finalize + bind before
     // any scan.
-    const bound = bindParams(params, ptypes.finalize());
+    const bound = bindParams(params, ptypes.finalize(), this.inputZone());
 
     // Fold globally-uncorrelated subqueries (in any assignment RHS or the WHERE) once — their
     // cost is added a single time (grammar.md §26, cost.md §3); a correlated one stays and re-runs
@@ -11782,7 +11800,7 @@ export class Engine {
         try {
           let raw = evalExpr(p.source, row, env, meter);
           if (mapped !== null) raw = mapped[upd.fkTarget!.fk.columns.indexOf(p.idx)]!;
-          newRow[p.idx] = checkAssign(p, raw);
+          newRow[p.idx] = checkAssign(p, raw, this.inputZone());
         } catch (e) {
           throw stampTable(e, table.name);
         }
@@ -12063,7 +12081,7 @@ export class Engine {
   private runQueryExpr(qe: QueryExpr, params: Value[]): SelectResult {
     const ptypes = new ParamTypes();
     const plan = this.planQuery(qe, null, [], ptypes);
-    const bound = bindParams(params, ptypes.finalize());
+    const bound = bindParams(params, ptypes.finalize(), this.inputZone());
     const subqueryCost = { value: 0n };
     this.foldUncorrelatedInPlan(plan, bound, EMPTY_CTE_CTX, subqueryCost);
     const r = this.execQueryPlan(plan, [], bound, EMPTY_CTE_CTX);
@@ -12254,7 +12272,7 @@ export class Engine {
       throw new Error("runWith is the pure-query path");
     }
     const plan = this.planQuery(bodyQuery, null, bindings, ptypes);
-    const bound = bindParams(params, ptypes.finalize());
+    const bound = bindParams(params, ptypes.finalize(), this.inputZone());
     const modes = cteModes(bindings);
     const { buffers, totalCost } = this.materializeCtes(bindings, modes, bound, EMPTY_CTE_CTX);
 
@@ -12490,7 +12508,7 @@ export class Engine {
         b.refs += countCteRefsDml(body, b.name);
       }
     }
-    const bound = bindParams(params, ptypes.finalize());
+    const bound = bindParams(params, ptypes.finalize(), this.inputZone());
     const modes = cteModes(bindings);
 
     // (3) Run each CTE in list order, filling its buffer. A data-modifying CTE executes for its
@@ -15014,7 +15032,12 @@ export class Engine {
       this.estimatorInputsMatch(holder.cache.sp, holder.cache.inputs)
     ) {
       const c = holder.cache;
-      return this.buildScanRows(c.sp, bindParams(params, c.ptys, c.plabels), 0n, c.resultTypes);
+      return this.buildScanRows(
+        c.sp,
+        bindParams(params, c.ptys, this.inputZone(), c.plabels),
+        0n,
+        c.resultTypes,
+      );
     }
     // MISS: plan once.
     const ptypes = new ParamTypes();
@@ -15023,7 +15046,7 @@ export class Engine {
     const sp = plan;
     const ptys = ptypes.finalize();
     const plabels = paramLabels(ptys.length);
-    const bound = bindParams(params, ptys, plabels);
+    const bound = bindParams(params, ptys, this.inputZone(), plabels);
     const resultTypes = typeNames(sp.columnTypes);
     // Fold globally-uncorrelated subqueries to constants (at top level every surviving subquery is
     // uncorrelated) so the per-row eval re-enters nothing — keeping the cursor self-contained. The
@@ -26043,7 +26066,7 @@ export function coerceJsonMember(
   if (st === "json") return jsonValue(jsonbOut(node));
   const text = nodeToText(node);
   if (text === null) return nullValue();
-  const { node: rexpr } = coerceStringLiteral(text, st, decimal, null);
+  const { node: rexpr } = coerceStringLiteral(text, st, decimal, null, env.exec.inputZone());
   return evalExpr(rexpr, [], env, meter);
 }
 

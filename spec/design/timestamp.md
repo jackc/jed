@@ -22,7 +22,9 @@ PostgreSQL *instant* model, not the SQL-standard *offset-bearing* model:
 - **`timestamp`** = a zoneless wall clock. No zone, ever; never converted.
 - **`timestamptz`** = an absolute UTC instant. Input text **may** carry a numeric offset
   (`Z`, `±HH`, `±HH:MM`, `±HH:MM:SS`), which normalizes the value to UTC and is then
-  **discarded** — only the UTC instant is stored, no offset retained.
+  **discarded** — only the UTC instant is stored, no offset retained. Input **without** an offset
+  is read in the session time zone (default `UTC`), since the time-zone slice
+  ([timezones.md](timezones.md) §9.3).
 
 Any zone-aware behavior beyond offset-on-input belongs to the host (native value projection at
 the embedding boundary) or to a much later slice introducing a host-supplied, version-pinned

@@ -343,7 +343,9 @@ commit. `close` is idempotent.
   result/plan/estimate/cost-**identical** to a fresh
   plan — so a plan with an uncorrelated subquery (whose per-execution constant-fold bakes in one
   execution's params), a precompiled-regex node (whose one-shot compile-cost flag mutates during
-  eval), or a temp / SRF / CTE / derived relation is **never** cached and re-plans each execute.
+  eval), an offset-less `timestamptz` string literal folded in the resolving session's zone (so the
+  next session's zone would be ignored — [timezones.md](timezones.md) §9.3), or a temp / SRF / CTE /
+  derived relation is **never** cached and re-plans each execute.
   The routing was also unified to plan a scan-shaped query **once** (streaming and buffered were
   formerly two separate plans), which speeds the ad-hoc `query()`/`Session.query` path too. The
   behavior is result/cost/byte-neutral (planning is unmetered) — no on-disk format change, no

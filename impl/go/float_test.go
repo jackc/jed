@@ -184,7 +184,7 @@ func TestFloat32ImplicitWidenStoresIntoFloat64Column(t *testing.T) {
 	t.Parallel()
 	// f32 → f64 is the implicit, lossless widen (the tower): a f32 VALUE stores into a
 	// f64 column (storeValue widens), and assignableTo permits the family pairing.
-	got, err := storeValue(Float32Value(1.5), scalarFloat64, nil, nil, false, "x")
+	got, err := storeValue(Float32Value(1.5), scalarFloat64, nil, nil, false, "x", &inputZone{zone: ZoneRef{Fixed: true}})
 	if err != nil {
 		t.Fatalf("f32 → f64 column store: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestFloat32ImplicitWidenStoresIntoFloat64Column(t *testing.T) {
 	if assignableTo(resolvedType{kind: rtFloat64}, scalarFloat32) {
 		t.Errorf("f64 should NOT be implicitly assignable to a f32 column")
 	}
-	if _, err := storeValue(Float64Value(1.5), scalarFloat32, nil, nil, false, "x"); err == nil {
+	if _, err := storeValue(Float64Value(1.5), scalarFloat32, nil, nil, false, "x", &inputZone{zone: ZoneRef{Fixed: true}}); err == nil {
 		t.Errorf("storing a f64 value into a f32 column should be a 42804")
 	}
 }

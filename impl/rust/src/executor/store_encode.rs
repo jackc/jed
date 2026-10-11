@@ -11,7 +11,7 @@ impl AssignPlan {
     /// to its scale; a boolean into a boolean column is accepted as-is; a range/array re-coerces
     /// its elements). The resolver already proved the value's family is assignable (never
     /// decimal→int implicitly).
-    pub(crate) fn check(&self, v: Value) -> Result<Value> {
+    pub(crate) fn check(&self, v: Value, iz: &InputZone) -> Result<Value> {
         match &self.col_type {
             Some(ct) => coerce_for_store(
                 v,
@@ -20,6 +20,7 @@ impl AssignPlan {
                 self.varchar_len,
                 self.not_null,
                 &self.name,
+                iz,
             ),
             None => store_value(
                 v,
@@ -28,6 +29,7 @@ impl AssignPlan {
                 self.varchar_len,
                 self.not_null,
                 &self.name,
+                iz,
             ),
         }
     }
@@ -45,6 +47,7 @@ pub(crate) fn store_value(
     varchar_len: Option<u32>,
     not_null: bool,
     col_name: &str,
+    iz: &InputZone,
 ) -> Result<Value> {
     match v {
         Value::Null => {
@@ -100,7 +103,8 @@ pub(crate) fn store_value(
                 // malformed input traps 22007, an out-of-range field 22008.
                 Ok(Value::Timestamp(parse_timestamp(&s)?))
             } else if col_ty.is_timestamptz() {
-                Ok(Value::Timestamptz(parse_timestamptz(&s)?))
+                // An offset-less string reads in the session zone (timezones.md §9.3).
+                Ok(Value::Timestamptz(iz.parse_timestamptz(&s)?))
             } else if col_ty.is_interval() {
                 // A string literal adapts to an interval column (spec/design/interval.md);
                 // malformed input traps 22007, an out-of-range field 22008.
@@ -282,12 +286,15 @@ pub(crate) fn coerce_for_store(
     varchar_len: Option<u32>,
     not_null: bool,
     col_name: &str,
+    iz: &InputZone,
 ) -> Result<Value> {
     match ty {
-        ColType::Scalar(s) => store_value(v, *s, typmod, varchar_len, not_null, col_name),
-        ColType::Composite { name, fields } => store_composite(v, name, fields, not_null, col_name),
-        ColType::Array(elem) => store_array(v, elem, not_null, col_name),
-        ColType::Range(elem) => store_range(v, elem, not_null, col_name),
+        ColType::Scalar(s) => store_value(v, *s, typmod, varchar_len, not_null, col_name, iz),
+        ColType::Composite { name, fields } => {
+            store_composite(v, name, fields, not_null, col_name, iz)
+        }
+        ColType::Array(elem) => store_array(v, elem, not_null, col_name, iz),
+        ColType::Range(elem) => store_range(v, elem, not_null, col_name, iz),
     }
 }
 
@@ -301,6 +308,7 @@ pub(crate) fn store_range(
     elem: &ColType,
     not_null: bool,
     col_name: &str,
+    iz: &InputZone,
 ) -> Result<Value> {
     match v {
         Value::Null => {
@@ -320,7 +328,7 @@ pub(crate) fn store_range(
                 match b {
                     None => Ok(None),
                     Some(val) => Ok(Some(Box::new(coerce_for_store(
-                        *val, elem, None, None, false, col_name,
+                        *val, elem, None, None, false, col_name, iz,
                     )?))),
                 }
             };
@@ -347,6 +355,7 @@ pub(crate) fn store_array(
     elem: &ColType,
     not_null: bool,
     col_name: &str,
+    iz: &InputZone,
 ) -> Result<Value> {
     match v {
         Value::Null => {
@@ -360,7 +369,9 @@ pub(crate) fn store_array(
             for val in arr.elements {
                 // Elements are nullable (not_null = false); the element typmod is unconstrained
                 // this slice (numeric(p,s)[] and varchar(n)[] are deferred — §12, types.md §15).
-                out.push(coerce_for_store(val, elem, None, None, false, col_name)?);
+                out.push(coerce_for_store(
+                    val, elem, None, None, false, col_name, iz,
+                )?);
             }
             Ok(Value::Array(ArrayVal {
                 dims: arr.dims,
@@ -384,6 +395,7 @@ pub(crate) fn store_composite(
     fields: &[ColField],
     not_null: bool,
     col_name: &str,
+    iz: &InputZone,
 ) -> Result<Value> {
     match v {
         Value::Null => {
@@ -409,6 +421,7 @@ pub(crate) fn store_composite(
                     f.varchar_len,
                     f.not_null,
                     &f.name,
+                    iz,
                 )?);
             }
             Ok(Value::Composite(out))
@@ -506,6 +519,7 @@ pub(crate) fn materialize_insert_value(
     iv: &InsertValue,
     ty: &ColType,
     bound: &[Value],
+    iz: &InputZone,
 ) -> Result<Value> {
     match ty {
         ColType::Scalar(s) => match iv {
@@ -539,7 +553,7 @@ pub(crate) fn materialize_insert_value(
                 }
                 let mut vals = Vec::with_capacity(fields.len());
                 for (fiv, f) in field_ivs.iter().zip(fields.iter()) {
-                    vals.push(materialize_insert_value(fiv, &f.ty, bound)?);
+                    vals.push(materialize_insert_value(fiv, &f.ty, bound, iz)?);
                 }
                 Ok(Value::Composite(vals))
             }
@@ -569,20 +583,20 @@ pub(crate) fn materialize_insert_value(
                 if elem_ivs.iter().any(|e| matches!(e, InsertValue::Array(_))) {
                     let mut subs = Vec::with_capacity(elem_ivs.len());
                     for eiv in elem_ivs {
-                        subs.push(materialize_insert_value(eiv, ty, bound)?);
+                        subs.push(materialize_insert_value(eiv, ty, bound, iz)?);
                     }
                     build_nested_array(subs)
                 } else {
                     let mut vals = Vec::with_capacity(elem_ivs.len());
                     for eiv in elem_ivs {
-                        vals.push(materialize_insert_value(eiv, elem, bound)?);
+                        vals.push(materialize_insert_value(eiv, elem, bound, iz)?);
                     }
                     Ok(Value::Array(ArrayVal::one_dim(vals)))
                 }
             }
             // A bare string literal adapts to the array context via `array_in` (the same
             // string-adapts-to-context rule bytea/uuid use — types.md §6; spec/design/array.md §7).
-            InsertValue::Lit(Literal::Text(s)) => coerce_string_to_array(s, elem),
+            InsertValue::Lit(Literal::Text(s)) => coerce_string_to_array(s, elem, iz),
             InsertValue::Lit(Literal::Null) => Ok(Value::Null),
             InsertValue::Param(nn) => Ok(bound[(*nn as usize) - 1].clone()),
             InsertValue::Lit(_) => Err(type_error(
@@ -612,7 +626,7 @@ pub(crate) fn materialize_insert_value(
                 // A bare string literal adapts to the range context via `range_in` (the same
                 // string-adapts-to-context rule array/bytea/uuid use — spec/design/ranges.md §5).
                 InsertValue::Lit(Literal::Text(s)) => {
-                    Ok(Value::Range(coerce_string_to_range(s, desc)?))
+                    Ok(Value::Range(coerce_string_to_range(s, desc, iz)?))
                 }
                 InsertValue::Lit(Literal::Null) => Ok(Value::Null),
                 InsertValue::Param(nn) => Ok(bound[(*nn as usize) - 1].clone()),
@@ -768,7 +782,7 @@ pub(crate) fn scalar_pair_castable(from: ScalarType, to: ScalarType) -> bool {
     false
 }
 
-pub(crate) fn coerce_string_to_array(s: &str, elem: &ColType) -> Result<Value> {
+pub(crate) fn coerce_string_to_array(s: &str, elem: &ColType, iz: &InputZone) -> Result<Value> {
     let parsed = crate::value::parse_array_literal(s).map_err(|e| match e {
         crate::value::ArrayInError::Malformed => EngineError::new(
             SqlState::InvalidTextRepresentation,
@@ -785,7 +799,7 @@ pub(crate) fn coerce_string_to_array(s: &str, elem: &ColType) -> Result<Value> {
             None => elements.push(Value::Null),
             // Coerce the token to the element type (a scalar via the string-literal coercion, a
             // composite via record_in — array-of-composite, spec/design/array.md §12 AC1).
-            Some(t) => elements.push(coerce_array_element_text(&t, elem)?),
+            Some(t) => elements.push(coerce_array_element_text(&t, elem, iz)?),
         }
     }
     Ok(Value::Array(ArrayVal {
@@ -801,14 +815,18 @@ pub(crate) fn coerce_string_to_array(s: &str, elem: &ColType) -> Result<Value> {
 /// array-of-composite quoting nests, §12 AC1 / §7). Self-contained over the resolved `ColType`, so
 /// no catalog re-walk (the [`ColType`] design intent). A nested-array element token would recurse,
 /// but array-of-array is not a jed type, so it is unreachable in v1.
-pub(crate) fn coerce_array_element_text(tok: &str, elem: &ColType) -> Result<Value> {
+pub(crate) fn coerce_array_element_text(
+    tok: &str,
+    elem: &ColType,
+    iz: &InputZone,
+) -> Result<Value> {
     match elem {
         ColType::Scalar(s) => {
-            let (node, _) = coerce_string_literal(tok, *s, None, None)?;
+            let (node, _) = coerce_string_literal(tok, *s, None, None, iz)?;
             rexpr_const_to_value(&node)
         }
-        ColType::Composite { name, fields } => coerce_record_text(tok, name, fields),
-        ColType::Array(inner) => coerce_string_to_array(tok, inner),
+        ColType::Composite { name, fields } => coerce_record_text(tok, name, fields, iz),
+        ColType::Array(inner) => coerce_string_to_array(tok, inner, iz),
         // A range element token is unreachable: array-of-range is not a storable jed type (R2),
         // so an array element ColType is never a range.
         ColType::Range(_) => {
@@ -825,6 +843,7 @@ pub(crate) fn coerce_record_text(
     text: &str,
     name: &str,
     fields: &[crate::catalog::ColField],
+    iz: &InputZone,
 ) -> Result<Value> {
     let malformed = || {
         EngineError::new(
@@ -842,14 +861,14 @@ pub(crate) fn coerce_record_text(
             None => vals.push(Value::Null),
             Some(s) => vals.push(match &f.ty {
                 ColType::Scalar(sc) => {
-                    let (node, _) = coerce_string_literal(&s, *sc, f.typmod, f.varchar_len)?;
+                    let (node, _) = coerce_string_literal(&s, *sc, f.typmod, f.varchar_len, iz)?;
                     rexpr_const_to_value(&node)?
                 }
                 ColType::Composite {
                     name: n2,
                     fields: f2,
-                } => coerce_record_text(&s, n2, f2)?,
-                ColType::Array(inner) => coerce_string_to_array(&s, inner)?,
+                } => coerce_record_text(&s, n2, f2, iz)?,
+                ColType::Array(inner) => coerce_string_to_array(&s, inner, iz)?,
                 // A composite range field is unreachable: CREATE TYPE rejects a range field (R2).
                 ColType::Range(_) => {
                     unreachable!("a composite range field is rejected at CREATE TYPE (R2)")

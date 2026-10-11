@@ -1,4 +1,5 @@
 import type { TimeZoneDeps } from "./catalog.ts";
+import type { InputZone } from "./timezone.ts";
 import { noteIndexZone } from "./index_dependencies.ts";
 // relOfIndex returns the [label, column-name] of the relation owning a flat row index — used to
 // synthesize a USING/NATURAL join predicate's qualified column references (spec/design/grammar.md
@@ -953,6 +954,18 @@ export class ParamTypes {
     if (this.indexContext) noteIndexZone(this.timezoneDeps, node);
   }
 
+  // noteInputZone records a resolve-time literal fold that read an offset-less timestamptz in the
+  // session zone (timezones.md §9.3): the folded instant depends on the zone, so the plan must not be
+  // shared through a cache (a cached plan serves every session) and must not persist (an index
+  // expression or predicate is re-resolved per statement, in whatever zone that statement runs
+  // under — 42P17).
+  noteInputZone(iz: InputZone): void {
+    if (iz.consulted) {
+      this.uncacheable = true;
+      this.nonimmutable = true;
+    }
+  }
+
   // note records that $(idx0+1) appears with context type ty (null = no context here). It unifies
   // with any prior inference: equal types agree, two integer widths widen to the wider, an
   // incompatible concrete pair is 42804.
@@ -999,6 +1012,7 @@ export function paramLabels(n: number): string[] {
 export function bindParams(
   supplied: Value[],
   types: ScalarType[],
+  iz: InputZone,
   labels: readonly string[] = paramLabels(types.length),
 ): Value[] {
   if (supplied.length !== types.length) {
@@ -1007,7 +1021,9 @@ export function bindParams(
       `bind parameter count mismatch: statement expects ${types.length}, got ${supplied.length}`,
     );
   }
-  return types.map((ty, i) => storeValue(supplied[i]!, ty, null, null, false, labels[i]!));
+  // A text value bound to a timestamptz parameter reads an offset-less string in the session zone,
+  // as PostgreSQL's text-format parameter input does (timezones.md §9.3).
+  return types.map((ty, i) => storeValue(supplied[i]!, ty, null, null, false, labels[i]!, iz));
 }
 
 // rejectParamsForDDL throws 42601 if bind parameters are supplied to a CREATE/DROP TABLE (which

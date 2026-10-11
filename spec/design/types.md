@@ -231,8 +231,8 @@ listed).
   datetime pair. **`timestamptz` reads an offset-less string in the session zone**, as PostgreSQL's
   `timestamptz_in` does (one `timezone` unit; DST gap/overlap as the `timestamp → timestamptz`
   cast, [timezones.md](timezones.md) §9.3); an explicit offset or `±infinity` fixes the instant. The
-  `timestamptz` *string literal* still reads an offset-less string as UTC (folded at resolve) — a
-  recorded follow-on, so `'…'::timestamptz` and `s::timestamptz` can differ in a non-UTC session.
+  `timestamptz` *string literal* reads it in the session zone too (folded at resolve), so
+  `'…'::timestamptz` and `s::timestamptz` agree in every session.
   The three datetime casts are STABLE, like PostgreSQL's `timestamp_in` / `timestamptz_in` /
   `interval_in` (`42P17` in an index expression); `text → bytea` is immutable (`byteain`) and
   indexable. The jed-stricter grammars (`'now'`/`'epoch'` for timestamps, ISO-8601 and SQL-standard

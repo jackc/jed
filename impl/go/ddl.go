@@ -700,7 +700,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 				def.Default.Expr.Literal.Kind == literalText &&
 				dateClockIsRelative(def.Default.Expr.Literal.Str)
 			if def.Default.Expr.Kind == exprLiteral && !clockDefault {
-				dv, err := storeValue(literalToValue(*def.Default.Expr.Literal), ty, decimal, varcharLen, false, def.Name)
+				dv, err := storeValue(literalToValue(*def.Default.Expr.Literal), ty, decimal, varcharLen, false, def.Name, db.inputZone())
 				if err != nil {
 					return outcome{}, err
 				}
@@ -2406,7 +2406,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 					if err != nil {
 						return outcome{}, err
 					}
-					v, err = coerceForStore(v, step.addedType, step.added.Decimal, step.added.VarcharLen, step.added.NotNull, step.added.Name)
+					v, err = coerceForStore(v, step.addedType, step.added.Decimal, step.added.VarcharLen, step.added.NotNull, step.added.Name, db.inputZone())
 					if err != nil {
 						return outcome{}, err
 					}
@@ -2645,7 +2645,7 @@ func (db *engine) buildAlterDefault(col catColumn, def *defaultDef) (*Value, *de
 	ty := col.Type.Scalar
 	clockDefault := ty == scalarDate && def.Expr.Kind == exprLiteral && def.Expr.Literal.Kind == literalText && dateClockIsRelative(def.Expr.Literal.Str)
 	if def.Expr.Kind == exprLiteral && !clockDefault {
-		v, err := storeValue(literalToValue(*def.Expr.Literal), ty, col.Decimal, col.VarcharLen, false, col.Name)
+		v, err := storeValue(literalToValue(*def.Expr.Literal), ty, col.Decimal, col.VarcharLen, false, col.Name, db.inputZone())
 		if err != nil {
 			return nil, nil, err
 		}

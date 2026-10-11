@@ -185,6 +185,8 @@ mod streaming;
 mod subquery;
 #[path = "../tests/timestamp.rs"]
 mod timestamp;
+#[path = "../tests/timestamptz_session_input.rs"]
+mod timestamptz_session_input;
 #[path = "../tests/timezone.rs"]
 mod timezone;
 #[path = "../tests/transactions.rs"]

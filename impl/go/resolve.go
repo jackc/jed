@@ -409,6 +409,18 @@ func (p *paramTypes) note(idx0 int, ty *scalarType) error {
 	return nil
 }
 
+// noteInputZone records a resolve-time literal fold that read an offset-less timestamptz in the
+// session zone (timezones.md §9.3): the folded instant depends on the zone, so the plan must not be
+// shared through a cache (a cached plan serves every session) and must not persist (an index
+// expression or predicate is re-resolved per statement, in whatever zone that statement runs under —
+// 42P17).
+func (p *paramTypes) noteInputZone(iz *inputZone) {
+	if iz.consulted {
+		p.uncacheable = true
+		p.nonimmutable = true
+	}
+}
+
 // finalize returns the ordered parameter types. A slot referenced but never typed — including a
 // gap in $1..$N — is 42P18 indeterminate_datatype.
 func (p *paramTypes) finalize() ([]scalarType, error) {
@@ -464,8 +476,8 @@ func dateClockLiteral(s string, params *paramTypes) (*rExpr, resolvedType, bool)
 // bindParams coerces each supplied bind value to its inferred parameter type, two-phase /
 // all-or-nothing like INSERT (spec/design/api.md §5): a count mismatch is 42601 and every value
 // is validated up front (22003/42804/22P02/23502 via storeValue) before any row is touched.
-func bindParams(supplied []Value, types []scalarType) ([]Value, error) {
-	return bindParamsWithLabels(supplied, types, paramLabels(len(types)))
+func bindParams(supplied []Value, types []scalarType, iz *inputZone) ([]Value, error) {
+	return bindParamsWithLabels(supplied, types, paramLabels(len(types)), iz)
 }
 
 func paramLabels(n int) []string {
@@ -476,7 +488,7 @@ func paramLabels(n int) []string {
 	return labels
 }
 
-func bindParamsWithLabels(supplied []Value, types []scalarType, labels []string) ([]Value, error) {
+func bindParamsWithLabels(supplied []Value, types []scalarType, labels []string, iz *inputZone) ([]Value, error) {
 	if len(supplied) != len(types) {
 		return nil, newError(SyntaxError, fmt.Sprintf(
 			"bind parameter count mismatch: statement expects %d, got %d", len(types), len(supplied),
@@ -484,7 +496,9 @@ func bindParamsWithLabels(supplied []Value, types []scalarType, labels []string)
 	}
 	bound := make([]Value, len(types))
 	for i, ty := range types {
-		v, err := storeValue(supplied[i], ty, nil, nil, false, labels[i])
+		// A text value bound to a timestamptz parameter reads an offset-less string in the session
+		// zone, as PostgreSQL's text-format parameter input does (timezones.md §9.3).
+		v, err := storeValue(supplied[i], ty, nil, nil, false, labels[i], iz)
 		if err != nil {
 			return nil, err
 		}
@@ -1067,10 +1081,14 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				}
 				return &rExpr{kind: reConstTimestamp, cInt: m}, resolvedType{kind: rtTimestamp}, nil
 			case ctx != nil && ctx.IsTimestamptz():
-				m, err := parseTimestamptz(e.Literal.Str)
+				// An offset-less string reads in the SESSION zone, as PostgreSQL's timestamptz_in
+				// does (timezones.md §9.3).
+				iz := s.catalog.inputZone()
+				m, err := iz.parseTimestamptz(e.Literal.Str)
 				if err != nil {
 					return nil, resolvedType{}, err
 				}
+				params.noteInputZone(iz)
 				return &rExpr{kind: reConstTimestamptz, cInt: m}, resolvedType{kind: rtTimestamptz}, nil
 			case ctx != nil && ctx.IsDate():
 				// A string adapts to a DATE context (parse the ISO date, dropping any time/offset;
@@ -1164,12 +1182,18 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		// A composite type name (`addr '(Main,90210)'`) coerces the string via record_in
 		// (spec/design/composite.md §8) — the same primitive as `'(…)'::addr`.
 		if ct := s.catalog.readSnap().compositeType(e.TypeLitName); ct != nil {
-			return coerceStringToComposite(e.TypeLitText, ct, s.catalog)
+			iz := s.catalog.inputZone()
+			node, rt, err := coerceStringToComposite(e.TypeLitText, ct, s.catalog, iz)
+			params.noteInputZone(iz)
+			return node, rt, err
 		}
 		// A range type name (`i32range '[1,5)'`, `int4range '…'`) coerces the string via range_in
 		// against the element type (spec/design/ranges.md §5) — the same primitive as the cast.
 		if desc, ok := rangeByName(e.TypeLitName); ok {
-			return coerceStringToRangeExpr(e.TypeLitText, desc)
+			iz := s.catalog.inputZone()
+			node, rt, err := coerceStringToRangeExpr(e.TypeLitText, desc, iz)
+			params.noteInputZone(iz)
+			return node, rt, err
 		}
 		target, _, _, err := resolveTypeAndTypmod(e.TypeLitName, nil)
 		if err != nil {
@@ -1182,7 +1206,10 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				return node, rt, nil
 			}
 		}
-		return coerceStringLiteral(e.TypeLitText, target, nil, nil)
+		iz := s.catalog.inputZone()
+		node, rt, err := coerceStringLiteral(e.TypeLitText, target, nil, nil, iz)
+		params.noteInputZone(iz)
+		return node, rt, err
 	case exprScalarSubquery:
 		// A subquery in expression position (§26): PLANNED ONCE against the scope chain here, so
 		// its column-count / type errors fire even over an empty outer. planSubquery rejects a
@@ -1298,10 +1325,12 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				return nil, resolvedType{}, newError(UndefinedObject, "type does not exist: "+base)
 			}
 			if in := e.Cast.Inner; in.Kind == exprLiteral && in.Literal != nil && in.Literal.Kind == literalText {
-				val, err := coerceStringToArray(in.Literal.Str, elemCol)
+				iz := s.catalog.inputZone()
+				val, err := coerceStringToArray(in.Literal.Str, elemCol, iz)
 				if err != nil {
 					return nil, resolvedType{}, err
 				}
+				params.noteInputZone(iz)
 				return valueToRExpr(val), resolvedType{kind: rtArray, elem: &elemRT}, nil
 			}
 			if in := e.Cast.Inner; in.Kind == exprLiteral && in.Literal != nil && in.Literal.Kind == literalNull {
@@ -1363,7 +1392,10 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			}
 			elemRT := resolvedTypeOf(elementScalar(desc))
 			if in := e.Cast.Inner; in.Kind == exprLiteral && in.Literal != nil && in.Literal.Kind == literalText {
-				return coerceStringToRangeExpr(in.Literal.Str, desc)
+				iz := s.catalog.inputZone()
+				node, rt, err := coerceStringToRangeExpr(in.Literal.Str, desc, iz)
+				params.noteInputZone(iz)
+				return node, rt, err
 			}
 			if in := e.Cast.Inner; in.Kind == exprLiteral && in.Literal != nil && in.Literal.Kind == literalNull {
 				return &rExpr{kind: reConstNull}, resolvedType{kind: rtRange, elem: &elemRT}, nil
@@ -1383,7 +1415,10 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 					"a type modifier is not supported on a composite type")
 			}
 			if in := e.Cast.Inner; in.Kind == exprLiteral && in.Literal != nil && in.Literal.Kind == literalText {
-				return coerceStringToComposite(in.Literal.Str, ct, s.catalog)
+				iz := s.catalog.inputZone()
+				node, rt, err := coerceStringToComposite(in.Literal.Str, ct, s.catalog, iz)
+				params.noteInputZone(iz)
+				return node, rt, err
 			}
 			rinner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
 			if err != nil {
@@ -1417,7 +1452,10 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 					return node, rt, nil
 				}
 			}
-			return coerceStringLiteral(in.Literal.Str, target, typmod, varcharLen)
+			iz := s.catalog.inputZone()
+			node, rt, err := coerceStringLiteral(in.Literal.Str, target, typmod, varcharLen, iz)
+			params.noteInputZone(iz)
+			return node, rt, err
 		}
 		// The JSON cast matrix (spec/design/json.md §6.1): casting TO json/jsonb from a runtime
 		// text/json/jsonb expression (a string LITERAL operand was already coerced above by
