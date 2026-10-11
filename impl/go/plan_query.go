@@ -933,10 +933,16 @@ func countCteRefsDml(body *cteBody, name string) int {
 	case body.Insert != nil:
 		ins := body.Insert
 		n := 0
-		// VALUES slots hold literals / params / ROW / ARRAY (no sublinks this slice); only a SELECT
-		// source can reference a CTE.
 		if ins.Select != nil {
 			n += countSelfRefsSelect(ins.Select, name)
+		}
+		// A VALUES expression slot may hold a sublink (grammar.md §16).
+		for _, values := range ins.Rows {
+			for _, v := range values {
+				if v.IsExpr {
+					n += countSelfRefsExpr(*v.Expr, name)
+				}
+			}
 		}
 		if ins.OnConflict != nil && ins.OnConflict.DoUpdate {
 			for i := range ins.OnConflict.Assignments {

@@ -3532,8 +3532,15 @@ fn count_cte_refs_dml(body: &CteBody, name: &str) -> usize {
         CteBody::Insert(ins) => {
             let mut n = match &ins.source {
                 InsertSource::Select(sel) => count_self_refs_select(sel, name),
-                // VALUES slots hold literals / params / ROW / ARRAY (no sublinks this slice).
-                InsertSource::Values(_) => 0,
+                // A VALUES expression slot may hold a sublink (grammar.md §16).
+                InsertSource::Values(rows) => rows
+                    .iter()
+                    .flatten()
+                    .map(|v| match v {
+                        InsertValue::Expr(e) => count_self_refs_expr(e, name),
+                        _ => 0,
+                    })
+                    .sum(),
             };
             if let Some(oc) = &ins.on_conflict {
                 if let ConflictAction::DoUpdate {

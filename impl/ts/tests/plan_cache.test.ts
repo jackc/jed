@@ -192,6 +192,33 @@ test("insert cache: mutable and complex shapes remain uncached", () => {
   }
 });
 
+// A VALUES expression slot without a subquery caches with the plan; reuse rebinds params and is
+// result- and cost-identical (grammar.md §16).
+test("insert cache: VALUES expressions cache and reuse cost-identically", () => {
+  const db = new Engine();
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+  const stmt = prepare(db, "INSERT INTO t VALUES ($1, $2 * 10 + 1) RETURNING v");
+  const first = drain(db, stmt, [intValue(1n), intValue(2n)]);
+  assert.deepEqual(first.rows, [[intValue(21n)]]);
+  const plan = insertCacheOf(stmt)!.plan;
+  const second = drain(db, stmt, [intValue(2n), intValue(3n)]);
+  assert.deepEqual(second.rows, [[intValue(31n)]]);
+  assert.equal(insertCacheOf(stmt)!.plan, plan, "expression INSERT re-planned");
+  assert.equal(second.cost, first.cost);
+});
+
+// A VALUES subquery folds against each execution's snapshot, so the plan is never cached and every
+// execute re-reads the table.
+test("insert cache: a VALUES subquery is not cached and re-reads per execute", () => {
+  const db = new Engine();
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+  execute(db, "INSERT INTO t VALUES (1, 0)");
+  const stmt = prepare(db, "INSERT INTO t VALUES ((SELECT max(id) FROM t) + 1, $1) RETURNING id");
+  assert.deepEqual(drain(db, stmt, [intValue(10n)]).rows, [[intValue(2n)]]);
+  assert.equal(insertCacheOf(stmt), null);
+  assert.deepEqual(drain(db, stmt, [intValue(20n)]).rows, [[intValue(3n)]]);
+});
+
 test("insert cache: catalog, database, attachment, and temp identities invalidate", () => {
   const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");

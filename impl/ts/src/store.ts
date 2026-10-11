@@ -393,6 +393,9 @@ export function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Valu
         if (iv.lit.kind === "text") return coerceStringToArray(iv.lit.text, ty.elem);
         if (iv.lit.kind === "null") return nullValue();
         throw typeError("cannot assign a scalar value to an array column");
+      case "expr":
+        // Only a top-level slot is a general expression; the caller evaluates it.
+        throw new Error("a VALUES expression slot is evaluated by the caller");
       default: // default
         throw engineError("syntax_error", "DEFAULT is not allowed inside ARRAY[...]");
     }
@@ -417,6 +420,9 @@ export function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Valu
         throw typeError("cannot assign an array value to a range column");
       case "row":
         throw typeError("cannot assign a record value to a range column");
+      case "expr":
+        // Only a top-level slot is a general expression; the caller evaluates it.
+        throw new Error("a VALUES expression slot is evaluated by the caller");
       default: // default
         throw engineError("syntax_error", "DEFAULT is not allowed inside ROW(...)");
     }
@@ -431,6 +437,9 @@ export function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Valu
         throw typeError("cannot assign a record value to a " + canonicalName(ty.scalar) + " field");
       case "array":
         throw typeError("cannot assign an array value to a " + canonicalName(ty.scalar) + " field");
+      case "expr":
+        // Only a top-level slot is a general expression; the caller evaluates it.
+        throw new Error("a VALUES expression slot is evaluated by the caller");
       default: // default
         throw engineError("syntax_error", "DEFAULT is not allowed inside ROW(...)");
     }
@@ -459,6 +468,9 @@ export function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Valu
       throw typeError("cannot assign a scalar value to composite column (type " + ty.name + ")");
     case "array":
       throw typeError("cannot assign an array value to composite column (type " + ty.name + ")");
+    case "expr":
+      // Only a top-level slot is a general expression; the caller evaluates it.
+      throw new Error("a VALUES expression slot is evaluated by the caller");
     default: // default
       throw engineError("syntax_error", "DEFAULT is not allowed inside ROW(...)");
   }

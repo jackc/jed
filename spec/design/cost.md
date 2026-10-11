@@ -1390,6 +1390,16 @@ per **scanned** row that reaches its node, adding `operator_eval + cost(s | r)` 
 identical to the `SELECT` case, since both mutations drive the same per-row evaluator. The
 phase-2 writes evaluate nothing and stay unmetered (below).
 
+An **`INSERT … VALUES` expression slot** (grammar.md §16) has no outer row, so every subquery in
+it is uncorrelated: each folds **once**, after parameters bind and before any row materializes,
+in row-major value-position order. The slot's remaining tree then charges its `operator_eval`s
+(and its functions' own units) **per row**, under a ceiling guard before each slot — the
+expression-default rule (constraints.md §2). Only after every row materializes do the `RETURNING`
+sublinks fold (then `ON CONFLICT`'s), so a VALUES evaluation error or ceiling abort precedes them,
+as in PostgreSQL. Literal,
+`$N`, `DEFAULT`-constant, and literal-field `ROW(…)`/`ARRAY[…]` slots stay free, so
+`VALUES (2, 10 + 1), (3, 10 + 2)` costs **2**.
+
 ### `RETURNING` — DML that produces rows
 
 A DML statement's `RETURNING` clause ([grammar.md](grammar.md) §32) is metered as a
@@ -1698,8 +1708,9 @@ input-size cap never sees it, and the depth is a property of the *catalog graph*
 use/codec time), not a single statement's AST — so the nesting counter never sees it either. It has
 its own catalog-resolution depth gate — the composite-type nesting limit in §7b. Any future grammar
 that recurses outside the expression / query-expression / set-op cascade is the same shape; both are
-noted so the seam's coverage boundary stays explicit. (Nested `ROW(…)` in `INSERT … VALUES` is
-already capped by an earlier engine error — `42601` at depth 2 — so it is not a vector.)
+noted so the seam's coverage boundary stays explicit. (A literal-field `ROW(…)` / `ARRAY[…]` nest in
+an `INSERT … VALUES` slot is parsed outside `parse_expr`, so it counts one nesting level per
+constructor itself and aborts `54001` like the expression form — grammar.md §16.)
 
 ## 7a. Input-size and identifier-length limits (landed)
 

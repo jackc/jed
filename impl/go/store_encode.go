@@ -476,6 +476,9 @@ func literalToValue(lit literal) Value {
 func materializeInsertValue(iv insertValue, ty colType, bound []Value) (Value, error) {
 	if ty.Elem != nil {
 		switch {
+		case iv.IsExpr:
+			// Only a top-level slot is a general expression; the caller evaluates it.
+			panic("a VALUES expression slot is evaluated by the caller")
 		case iv.IsArray:
 			// ARRAY[e, …]: a nested constructor (an element is itself ARRAY[…]) stacks the sub-arrays
 			// into a higher dimension (mirrors the evaluator's buildNestedArray, spec/design/array.md
@@ -534,6 +537,9 @@ func materializeInsertValue(iv insertValue, ty colType, bound []Value) (Value, e
 			panic("a range column's element always has a range type")
 		}
 		switch {
+		case iv.IsExpr:
+			// Only a top-level slot is a general expression; the caller evaluates it.
+			panic("a VALUES expression slot is evaluated by the caller")
 		case iv.IsParam:
 			return bound[int(iv.Param)-1], nil
 		case iv.IsRow:
@@ -558,6 +564,9 @@ func materializeInsertValue(iv insertValue, ty colType, bound []Value) (Value, e
 	}
 	if !ty.Composite {
 		switch {
+		case iv.IsExpr:
+			// Only a top-level slot is a general expression; the caller evaluates it.
+			panic("a VALUES expression slot is evaluated by the caller")
 		case iv.IsDefault:
 			return Value{}, newError(SyntaxError, "DEFAULT is not allowed inside ROW(...)")
 		case iv.IsRow:
@@ -571,6 +580,9 @@ func materializeInsertValue(iv insertValue, ty colType, bound []Value) (Value, e
 		}
 	}
 	switch {
+	case iv.IsExpr:
+		// Only a top-level slot is a general expression; the caller evaluates it.
+		panic("a VALUES expression slot is evaluated by the caller")
 	case iv.IsRow:
 		if len(iv.Row) != len(ty.Fields) {
 			return Value{}, typeError(fmt.Sprintf(

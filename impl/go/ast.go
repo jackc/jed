@@ -577,6 +577,13 @@ type insertValue struct {
 	// slots, in order (each a literal or a $N). An array-typed column takes an ARRAY[...] value.
 	IsArray bool
 	Array   []insertValue // valid when IsArray
+	// IsExpr marks any other top-level slot: a general expression (`1 + 1`, `now()`, `CASE …`, a
+	// scalar subquery — spec/design/grammar.md §16). Resolved against a column-less scope with the
+	// target column's type as the literal hint, then evaluated once per row. Only a top-level slot
+	// is a general expression; ROW(...)/ARRAY[...] fields keep the literal forms above, and a
+	// constructor holding any other field parses whole as an expression instead.
+	IsExpr bool
+	Expr   *exprNode // valid when IsExpr
 }
 
 // Update is `UPDATE <table> SET <col> = <expr> [, ...] [WHERE <expr>]`. Each

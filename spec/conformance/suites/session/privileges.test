@@ -10,7 +10,7 @@
 # NONE / ALL accepted), `# grant: PRIVS ON object`, `# revoke: PRIVS ON object` (revoke wins), and
 # `# allow_ddl: on|off`. Effective privilege for OP on object X is OP ∈ (default ∪ grant[X]) \
 # revoke[X]. Format + the `requires` gate: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.column_default_expr, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.update, dml.update_default, dml.delete, query.select, query.select_no_from, query.where_eq, query.cte, query.cte_nested, func.abs, types.i32, session.privileges, session.allow_ddl
+# requires: ddl.create_table, ddl.primary_key, ddl.column_default_expr, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.insert_values_expr, query.subquery_scalar, query.aggregates, dml.update, dml.update_default, dml.delete, query.select, query.select_no_from, query.where_eq, query.cte, query.cte_nested, func.abs, types.i32, session.privileges, session.allow_ddl
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32)
@@ -75,6 +75,17 @@ SELECT v FROM (WITH inner_c AS (SELECT v FROM e) SELECT v FROM inner_c) s
 # grant: INSERT ON t
 statement ok
 INSERT INTO t VALUES (5, 50)
+
+# A VALUES expression slot's subquery reads its table, so it also needs SELECT there (grammar.md §16).
+# default_privileges: NONE
+# grant: INSERT ON t
+statement error 42501
+INSERT INTO t VALUES (7, (SELECT max(v) FROM t))
+
+# A VALUES expression slot's function call needs EXECUTE.
+# revoke: EXECUTE ON abs
+statement error 42501
+INSERT INTO t VALUES (7, abs(-70))
 
 # SELECT granted over NONE permits the read of the row just inserted.
 # default_privileges: NONE

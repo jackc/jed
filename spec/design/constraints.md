@@ -159,7 +159,8 @@ affects only future rows. A statement resolves only the defaults it can apply, s
 function is `42883` only for a statement that would call it.
 
 **Cost.** A constant default is pre-evaluated, so applying one evaluates no expression tree — an
-`INSERT` with only literal defaults accrues the same zero cost as one with literal values. An
+`INSERT` with only literal defaults accrues the same zero cost as one with literal values (a
+general expression *slot*, grammar.md §16, charges like an expression default). An
 **expression default** evaluates a tree per row, so each application accrues `operator_eval` per
 interior node (and the function's own units) — the same documented exception `CHECK` carries to
 "VALUES inserts cost zero" (§4.4, grammar.md §12, CLAUDE.md §13). The ceiling (`max_cost`) aborts

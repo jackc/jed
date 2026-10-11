@@ -2592,11 +2592,18 @@ pub(crate) fn collect_stmt_privs(stmt: &Statement, req: &mut PrivReq) {
 }
 
 pub(crate) fn collect_insert_privs(ins: &Insert, req: &mut PrivReq, locals: &HashSet<String>) {
-    // The write target needs INSERT. A bare `INSERT … VALUES` reads nothing (the slots are literals
-    // / params), so it needs only INSERT; an `INSERT … SELECT` source needs SELECT on its tables.
+    // The write target needs INSERT. A `VALUES` expression slot needs what its sublinks read and
+    // the functions it calls (grammar.md §16); an `INSERT … SELECT` source needs SELECT on its tables.
     req.need_table(&ins.table, Privilege::Insert);
-    if let InsertSource::Select(sel) = &ins.source {
-        collect_select_privs(sel, req, locals);
+    match &ins.source {
+        InsertSource::Select(sel) => collect_select_privs(sel, req, locals),
+        InsertSource::Values(rows) => {
+            for value in rows.iter().flatten() {
+                if let InsertValue::Expr(e) = value {
+                    collect_expr_privs(e, req, locals);
+                }
+            }
+        }
     }
     if let Some(oc) = &ins.on_conflict {
         if let ConflictAction::DoUpdate {

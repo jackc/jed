@@ -116,18 +116,16 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   `NATURAL JOIN` all execute (subqueries / derived tables / `IN` / `EXISTS` / correlated landed too).
   Only **`FULL JOIN USING`** / `NATURAL FULL JOIN` (the `COALESCE` merge) and a parenthesized-join
   FROM remain deferred join forms.
-- **`INSERT` values are *literals only*** (not general expressions; see the `literal`
-  production) — but the `DEFAULT` keyword is now also a value slot, and an explicit **column
-  list** (`INSERT INTO t (a, c) VALUES ...`) landed alongside `DEFAULT` (§12, §16).
-  `INSERT ... SELECT` — inserting the rows a query produces — now also lands (§24). What stays
-  deferred is **general expressions in a `VALUES` value slot**.
+- **`INSERT` values** were originally *literals only*; the `DEFAULT` keyword, an explicit
+  **column list** (`INSERT INTO t (a, c) VALUES ...`, §12, §16), `INSERT ... SELECT` (§24), and
+  finally **general expressions in a `VALUES` value slot** (arithmetic, function calls, `CASE`,
+  casts, scalar subqueries — §16) have all landed.
 - **`ORDER BY` keys are a column or an output-column ordinal** — a sort key is a table column
   or an **ordinal** (`ORDER BY 1`, the 1-based position of a select-list item), never a general
   expression (`ORDER BY a + 1`) or an output alias; those stay deferred. The richer surface that
   *did* land — multiple keys, per-key `ASC` / `DESC`, per-key `NULLS FIRST | LAST`, and the
   ordinal form — is described in §10.
-- **`LIMIT` / `OFFSET` take a non-negative integer literal**, not a general expression
-  (the same literal-only narrowing `INSERT` makes). The two clauses may appear in either
+- **`LIMIT` / `OFFSET` take a non-negative integer literal**, not a general expression. The two clauses may appear in either
   order, each at most once (§9). There is **no `LIMIT ALL`**, **no `OFFSET … ROWS` /
   `FETCH NEXT … ROWS ONLY`**, and **no SQLite `LIMIT off, cnt` comma form**.
 - **ASCII-only identifiers**; the one double-quoted token is a collation name after `COLLATE`,
@@ -466,8 +464,7 @@ hand-written parsers.
 three rows in one statement. It is the obvious PostgreSQL surface and a near-free extension
 of the single-row form — one extra parse loop and one validation pass. The optional **column
 list** and the **`DEFAULT` keyword** are covered in §16; inserting the rows a query produces
-(`INSERT ... SELECT`) is §24. General expressions in a `VALUES` value slot stay deferred
-(§5, [../../TODO.md](../../TODO.md)).
+(`INSERT ... SELECT`) is §24. General expressions in a `VALUES` value slot are §16.
 
 **Every row has the same arity.** Each `row` is validated against the catalog independently; a
 row whose arity differs from the column count (or, with a column list, the list length) is a
@@ -499,8 +496,9 @@ left-to-right. This keeps the assignment deterministic and identical across the 
 constant defaults** (folded to a value at CREATE TABLE — §16), an `INSERT ... VALUES` reads no
 storage and evaluates no expression tree, so it accrues **zero** cost ([cost.md](cost.md)). An
 **expression default** (`DEFAULT now()` / `1 + 1`, §16) is the exception: it evaluates an
-expression tree per row at INSERT, accruing that evaluation's cost. An `INSERT ... SELECT` is
-different again: it accrues exactly the embedded `SELECT`'s cost (§24).
+expression tree per row at INSERT, accruing that evaluation's cost, and so does a **general
+expression slot** (`VALUES (1 + 1)`, §16). An `INSERT ... SELECT` is different again: it accrues
+exactly the embedded `SELECT`'s cost (§24).
 
 ## 13. `DROP TABLE`
 
@@ -882,6 +880,51 @@ a constant — no expression is evaluated and cost stays zero (§12). **Expressi
 row at INSERT through the per-statement seam ([constraints.md](constraints.md) §2), accruing
 that evaluation's cost. The column list and `DEFAULT` keyword apply unchanged when the source is
 a `SELECT` (§24).
+
+### General expressions in a value slot
+
+A `VALUES` slot may hold any expression: `INSERT INTO t VALUES (1 + 1, upper('x'))`,
+`VALUES (now())`, `VALUES (CASE WHEN … END)`, `VALUES ((SELECT max(id) FROM t) + 1)`. The grammar's
+`insert_value` is `"DEFAULT" | expr`, with one parse rule that keeps the literal forms' meaning:
+
+- **Literal-shaped slots keep contextual adaptation.** A slot that is *exactly* a `literal`
+  (including the folded `-5`), a `parameter`, `DEFAULT`, or a `ROW(…)` / `ARRAY[…]` whose fields are
+  themselves only those forms — i.e. the token after it closes the slot (`,` or `)`) — is parsed and
+  materialized as before: a string literal adapts to the column type (`'2024-01-01'` into a `date`,
+  `'{1,2}'` into an array, `'[1,5)'` into a range, `'today'` per date.md §6), a `ROW(…)` materializes
+  field by field against a composite column, and a bare `$N` takes its target column's type. Any
+  other slot re-parses from its start as a general `expr`. A constructor with an expression field
+  (`ARRAY[1 + 1, 3]`) is therefore one general expression, not a literal constructor. A non-syntax
+  error from the literal form (an out-of-range integer, `22003`; the nesting limit, `54001`, which
+  also bounds literal-field constructors) is the slot's own error.
+- **Resolution.** An expression slot resolves against a scope with **no columns** (a column
+  reference is `42703`) that admits **subqueries** and sees the statement's CTEs; an aggregate
+  outside a subquery is `42803`, as in PostgreSQL. The target column's type is
+  the literal hint, exactly as for `UPDATE … SET` (§12/decimal.md §6), so `100 + 23` into an `i16`
+  column types as `i16`. The result must be **assignable** to the column — the scalar gate
+  `INSERT ... SELECT` and `UPDATE` use (`42804`); a range/array column follows `UPDATE`'s container
+  rule (a NULL, or the same container type — array.md §4 / ranges.md §4); a composite column takes
+  NULL or a value of its own composite type (e.g. a scalar subquery over a composite column). An
+  anonymous `ROW(…)` *expression* into a composite column is `0A000`, the same deferred
+  anonymous-record → named-composite assignment `UPDATE` carries (composite.md §12) — a documented
+  narrowing (PostgreSQL accepts it); a literal-field `ROW(…)` is unaffected. A `$N` inside an
+  expression is typed by its operator context (api.md §5), not by the column. Slots are resolved
+  row by row, left to right, before `RETURNING` and `ON CONFLICT` (PostgreSQL's analysis order), so
+  every resolution error precedes the `428C9` GENERATED ALWAYS gate — an expression is an explicit
+  value there, like a literal.
+- **Evaluation.** Uncorrelated subqueries fold **once**, after parameters bind and before any row is
+  materialized (cost.md §3); they read the pre-statement snapshot, like an `INSERT ... SELECT`
+  source. Each expression slot then evaluates **per row** during phase one — rows in `VALUES` order,
+  slots in column declaration order, interleaved with `DEFAULT`-keyword expression defaults — so a
+  volatile call (`nextval`, `uuidv4()`) advances per row and every evaluation error (`22012`, `21000`)
+  aborts before any write. `RETURNING` subqueries fold only after every row materializes, so a
+  VALUES error precedes theirs (PostgreSQL's order). The value is then store-coerced like any other (`22003`, `22001`, `23502`,
+  CHECK `23514`).
+- **Cost and privileges.** An expression slot accrues its evaluated tree (`operator_eval` per node
+  plus its functions' own units) per row; literal slots stay free. The statement needs `SELECT` on
+  any table a slot's subquery reads and `EXECUTE` on the functions it calls, in addition to
+  `INSERT` (session.md §5.3). A prepared `INSERT … VALUES` with expression slots caches its resolved
+  plan like a literal-only one unless a slot holds a subquery (which folds per execution).
 
 ## 17. Function-call syntax, aggregate and scalar functions
 
@@ -1478,9 +1521,10 @@ available wherever an expression resolves against a relation: a `SELECT`, and a 
 **target row**, which the per-row evaluator supplies, so `DELETE FROM t WHERE id IN (SELECT …)`
 and `UPDATE t SET c = (SELECT … WHERE … = t.k)` both work). The mutation stays two-phase /
 all-or-nothing (§6): every subquery reads the **pre-statement snapshot** (`DELETE` collects its
-keys before removing; `UPDATE` validates all rows before writing). A subquery in an
-`INSERT ... VALUES` slot is not reachable — a `VALUES` slot is not yet a general expression
-(§12) — while `INSERT ... SELECT` (§24) already admits subqueries inside its source query.
+keys before removing; `UPDATE` validates all rows before writing). An `INSERT ... VALUES` slot
+admits a subquery too (§16): with no outer row it is always uncorrelated, folds once against the
+pre-statement snapshot, and runs before any row is written — as `INSERT ... SELECT` (§24) does for
+subqueries inside its source query.
 
 - **Scalar subquery** — `( query_expr )` in expression position, anywhere a `primary` is
   allowed: `WHERE x = (SELECT max(id) FROM t)`, in the select list, or nested in a larger

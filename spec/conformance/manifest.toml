@@ -161,6 +161,10 @@ id = "dml.insert_select"
 description = "INSERT ... SELECT — insert the rows a query produces, through the same two-phase / all-or-nothing validation; output arity must match the target (42601) and projected types must be assignable up front (42804, even over an empty source); cost = the embedded SELECT's accrued cost (grammar.md §24)"
 
 [[capability]]
+id = "dml.insert_values_expr"
+description = "General expressions in INSERT ... VALUES slots — arithmetic, function calls, CASE, casts, and scalar subqueries (grammar.md §16). A slot that is exactly a literal / $N / DEFAULT / literal-field ROW(…) or ARRAY[…] keeps its contextual adaptation; any other slot resolves against a column-less scope (no columns: 42703; aggregates: 42803) with the target column's type as its literal hint and must be assignable to it (42804, the INSERT ... SELECT gate; a range/array column follows UPDATE's container rule; a composite column takes a value of its own type, an anonymous ROW expression is 0A000). Every slot is evaluated before any row is written; uncorrelated subqueries fold once against the pre-statement snapshot; each expression slot accrues its evaluated tree per row (cost.md §3)"
+
+[[capability]]
 id = "dml.update"
 description = "UPDATE ... SET ... [WHERE] — two-phase/all-or-nothing value replacement. Scalar assignment uses the same authoritative storage-assignability predicate as INSERT ... SELECT, expression defaults, and ON CONFLICT DO UPDATE: identities for every storable scalar, the declared lossless widenings/assignment casts, and 42804 for forbidden pairs; the storage boundary then applies range/typmod/input coercion. Assignments read the old row, RETURNING sees the new row, and a primary-key assignment re-keys against the statement end state"
 
@@ -1455,6 +1459,7 @@ capabilities = [
   "dml.insert_column_list",
   "dml.insert_default_values",
   "dml.insert_select",
+  "dml.insert_values_expr",
   "dml.update",
   "dml.update_default",
 ]

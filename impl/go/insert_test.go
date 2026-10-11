@@ -128,3 +128,37 @@ func TestInsertSelectCostIsEmbeddedSelectCost(t *testing.T) {
 		t.Errorf("got kind=%v cost=%d, want statement cost=7", out.Kind, out.Cost)
 	}
 }
+
+// --- General expressions in INSERT ... VALUES (spec/design/grammar.md §16) ------------------
+// The shared corpus (suites/dml/insert_values_expr.test) pins the agreeing behavior. These cover
+// param binding (the corpus is param-free) and a deliberate PG divergence.
+
+// A $N inside a VALUES expression slot is typed by the resolver from its operator context
+// (api.md §5), unlike a bare $N slot, which takes its target column's type.
+func TestValuesExpressionParamsTypedByContext(t *testing.T) {
+	t.Parallel()
+	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, name text)")
+	if _, err := queryOutcome(db, "INSERT INTO t VALUES ($1 + 1, upper($2))", []Value{IntValue(1), TextValue("ab")}); err != nil {
+		t.Fatalf("INSERT with expression params: %v", err)
+	}
+	rows := db.RowsInKeyOrder("t")
+	if len(rows) != 1 || rows[0][0].Int != 2 || rows[0][1].Kind != ValText || rows[0][1].str() != "AB" {
+		t.Fatalf("got %v, want [[2 AB]]", rows)
+	}
+}
+
+// A deliberate narrowing (PostgreSQL accepts it): a ROW(…) whose fields are not all literals is a
+// general expression of an anonymous record type, and anonymous-record → named-composite assignment
+// is deferred exactly as for UPDATE (composite.md §12). A literal-field ROW(…) and a value of the
+// column's own composite type are accepted (the shared corpus covers both).
+func TestValuesAnonymousRowExpressionIntoCompositeIs0A000(t *testing.T) {
+	t.Parallel()
+	db := dbWith(t,
+		"CREATE TYPE pt AS (x i32, y i32)",
+		"CREATE TABLE t (id i32 PRIMARY KEY, p pt)",
+	)
+	_, err := queryOutcome(db, "INSERT INTO t VALUES (1, ROW(1 + 1, 2))", nil)
+	if ee, ok := err.(*EngineError); !ok || ee.Code() != "0A000" {
+		t.Fatalf("want 0A000, got %v", err)
+	}
+}

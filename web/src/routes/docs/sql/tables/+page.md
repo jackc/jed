@@ -87,6 +87,21 @@ UPDATE job SET state = DEFAULT, attempts = DEFAULT WHERE id = 1;
 A column with no declared default takes `NULL`, so the ordinary `NOT NULL` check still applies.
 Expression defaults are evaluated separately for each inserted or updated row.
 
+## Expressions in VALUES
+
+A `VALUES` slot can hold any expression: arithmetic, function calls, `CASE`, casts, and scalar
+subqueries.
+
+```sql
+INSERT INTO account VALUES
+  ((SELECT max(id) FROM account) + 1, upper('linus'), 20 * 2.50);
+```
+
+An expression has no columns in scope, and its result must be assignable to the target column
+(error `42804` otherwise). A subquery runs once, against the table as it was before the statement.
+Every expression is evaluated before any row is written, so an error such as division by zero
+stores nothing.
+
 ## Altering a table
 
 `ALTER TABLE` can add or drop columns, rename a table, column, or constraint; change a column's

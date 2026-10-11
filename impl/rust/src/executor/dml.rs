@@ -51,10 +51,16 @@ pub(crate) struct InsertValuesPlan {
     colls: Vec<Option<std::sync::Arc<Collation>>>,
     provided: Vec<Option<usize>>,
     arity: usize,
+    value_exprs: ValueExprs,
     returning: Option<(Vec<RExpr>, Vec<String>, Vec<String>)>,
     param_types: Vec<ScalarType>,
     cacheable: bool,
 }
+
+/// The resolved general-expression slots of an INSERT `VALUES` list (spec/design/grammar.md §16),
+/// indexed `[row][value position]`. A row with no expression slot holds an empty vec, so a
+/// literal-only list allocates nothing per row.
+pub(crate) type ValueExprs = Vec<Vec<Option<RExpr>>>;
 
 const MAX_FK_ACTION_DEPTH: usize = 256;
 
@@ -328,6 +334,7 @@ impl Engine {
                 // checking each row's arity (42601) as it is visited, then bind the supplied
                 // values up front so a bad bind fails before any store.
                 let mut ptypes = ParamTypes::default();
+                let mut value_exprs: ValueExprs = Vec::with_capacity(rows_in.len());
                 for values in &rows_in {
                     if values.len() != arity {
                         return Err(EngineError::new(
@@ -356,6 +363,13 @@ impl Engine {
                             }
                         }
                     }
+                    value_exprs.push(self.resolve_insert_row_exprs(
+                        values,
+                        &columns,
+                        &provided,
+                        ctx.bindings,
+                        &mut ptypes,
+                    )?);
                 }
                 // GENERATED ALWAYS gate (sequences.md §13.3): an explicit (non-`DEFAULT`) value
                 // targeting an ALWAYS identity column without `OVERRIDING SYSTEM VALUE` is `428C9`.
@@ -405,6 +419,9 @@ impl Engine {
                 // RETURNING projection. The meter is created here (before materialization) so a
                 // `DEFAULT`-keyword expression default charges it too.
                 let mut meter = self.session.new_meter();
+                // Uncorrelated subqueries in VALUES expression slots fold once, before any row is
+                // materialized (cost.md §3) — a VALUES slot has no outer row to correlate with.
+                self.fold_value_exprs(&mut value_exprs, &bound, ctx, &mut meter)?;
 
                 // Materialize each row into its value-position-indexed candidates (length
                 // `arity`, checked above), resolving each slot: a literal, a bound `$N`, or a
@@ -417,7 +434,7 @@ impl Engine {
                 let mut single_values: Option<Vec<Value>> = None;
                 let mut rows: Vec<Vec<Value>> =
                     Vec::with_capacity(if use_single { 0 } else { rows_in.len() });
-                for values in &rows_in {
+                for (r, values) in rows_in.iter().enumerate() {
                     let mut rv = vec![Value::Null; arity];
                     for (i, col) in columns.iter().enumerate() {
                         if let Some(p) = provided[i] {
@@ -429,6 +446,15 @@ impl Engine {
                                     col,
                                     default_exprs[i].as_ref(),
                                     &stmt_rng,
+                                    &mut meter,
+                                )?,
+                                // A general expression → its resolved tree, evaluated for this row
+                                // (metered); `insert_rows` then store-coerces the value.
+                                InsertValue::Expr(_) => self.eval_value_expr(
+                                    &value_exprs[r][p],
+                                    &bound,
+                                    &stmt_rng,
+                                    ctx,
                                     &mut meter,
                                 )?,
                                 // A date-special string in a VALUES slot is LITERAL adaptation
@@ -688,6 +714,128 @@ impl Engine {
         }
     }
 
+    /// Resolve one `VALUES` row's general-expression slots (spec/design/grammar.md §16), in value
+    /// position order, against a column-less scope that admits subqueries and sees the statement's
+    /// CTE bindings. Each expression takes its target column's type as the literal hint and must
+    /// be storable there: a scalar column requires an assignable type (42804, the INSERT … SELECT
+    /// gate); a range/array column shares UPDATE's container rule; a composite column takes a NULL
+    /// or a value of that same composite type (an anonymous `ROW(…)` expression is 0A000, as for
+    /// UPDATE). A slot discarded by `OVERRIDING USER VALUE` is not resolved. Returns an empty vec
+    /// for a row with no expression slot.
+    fn resolve_insert_row_exprs(
+        &self,
+        values: &[InsertValue],
+        columns: &[Column],
+        provided: &[Option<usize>],
+        ctes: &[&CteBinding],
+        ptypes: &mut ParamTypes,
+    ) -> Result<Vec<Option<RExpr>>> {
+        if !values.iter().any(|v| matches!(v, InsertValue::Expr(_))) {
+            return Ok(Vec::new());
+        }
+        let mut scope = Scope::empty(self);
+        scope.allow_subquery = true;
+        scope.ctes = ctes;
+        let mut column_at: Vec<Option<usize>> = vec![None; values.len()];
+        for (i, p) in provided.iter().enumerate() {
+            if let Some(p) = p {
+                column_at[*p] = Some(i);
+            }
+        }
+        let mut out: Vec<Option<RExpr>> = (0..values.len()).map(|_| None).collect();
+        for (p, value) in values.iter().enumerate() {
+            let (InsertValue::Expr(e), Some(i)) = (value, column_at[p]) else {
+                continue;
+            };
+            let col = &columns[i];
+            let node = match &col.ty {
+                Type::Scalar(target) => {
+                    let (node, ty) =
+                        resolve(&scope, e, Some(*target), &mut AggCtx::Forbidden, ptypes)?;
+                    if !ty.assignable_to(*target) {
+                        return Err(type_error(format!(
+                            "column {} is of type {} but expression is of type {}",
+                            col.name,
+                            col.ty.canonical_name(),
+                            ty.type_name(),
+                        )));
+                    }
+                    node
+                }
+                Type::Range(_) | Type::Array(_) => {
+                    resolve_container_assign(&scope, col, e, &mut AggCtx::Forbidden, ptypes)?
+                }
+                Type::Composite(_) => {
+                    let (node, ty) = resolve(&scope, e, None, &mut AggCtx::Forbidden, ptypes)?;
+                    match &ty {
+                        ResolvedType::Null => {}
+                        ResolvedType::Composite(c) if c.name.is_none() => {
+                            return Err(EngineError::new(
+                                SqlState::FeatureNotSupported,
+                                format!(
+                                    "inserting a ROW expression into composite column {} is not supported yet",
+                                    col.name
+                                ),
+                            ));
+                        }
+                        _ if ty == resolved_type_of_col(&col.ty, self) => {}
+                        _ => {
+                            return Err(type_error(format!(
+                                "column {} is of type {} but expression is of type {}",
+                                col.name,
+                                col.ty.canonical_name(),
+                                ty.type_name(),
+                            )));
+                        }
+                    }
+                    node
+                }
+            };
+            out[p] = Some(node);
+        }
+        Ok(out)
+    }
+
+    /// Fold the uncorrelated subqueries of every resolved `VALUES` expression once, in row-major
+    /// value-position order (cost.md §3). A VALUES slot has no outer row, so every subquery folds.
+    fn fold_value_exprs(
+        &self,
+        value_exprs: &mut ValueExprs,
+        bound: &[Value],
+        ctx: CteCtx,
+        meter: &mut Meter,
+    ) -> Result<()> {
+        for node in value_exprs.iter_mut().flatten().flatten() {
+            self.fold_uncorrelated_in_rexpr(node, bound, ctx, &mut meter.accrued)?;
+        }
+        Ok(())
+    }
+
+    /// Evaluate one resolved `VALUES` expression slot for its row: a ceiling guard, then the
+    /// metered tree over the empty row (cost.md §3, like an expression default).
+    fn eval_value_expr(
+        &self,
+        node: &Option<RExpr>,
+        params: &[Value],
+        rng: &std::cell::Cell<crate::seam::StmtRng>,
+        ctes: CteCtx,
+        meter: &mut Meter,
+    ) -> Result<Value> {
+        let node = node
+            .as_ref()
+            .expect("every VALUES expression slot is resolved before materialization");
+        meter.guard()?;
+        let env = EvalEnv {
+            exec: self,
+            params,
+            outer: &[],
+            rng,
+            ctes,
+            host_batch: None,
+        };
+        node.eval(&[], &env, meter)
+    }
+
     fn execute_insert_values_cached(
         &mut self,
         ins: &Insert,
@@ -837,6 +985,7 @@ impl Engine {
                 })
                 .collect()
         };
+        let mut value_exprs: ValueExprs = Vec::with_capacity(rows.len());
         for values in rows {
             if values.len() != arity {
                 return Err(EngineError::new(
@@ -863,6 +1012,13 @@ impl Engine {
                     }
                 }
             }
+            value_exprs.push(self.resolve_insert_row_exprs(
+                values,
+                &table.columns,
+                &provided,
+                ctx.bindings,
+                &mut ptypes,
+            )?);
         }
         for target in &always_targeted {
             if rows
@@ -896,6 +1052,7 @@ impl Engine {
             colls,
             provided,
             arity,
+            value_exprs,
             returning,
             param_types,
             cacheable,
@@ -911,12 +1068,14 @@ impl Engine {
     ) -> Result<Outcome> {
         let bound = bind_params(params, &plan.param_types)?;
         let mut meter = self.session.new_meter();
-        if let Some((nodes, _, _)) = &mut plan.returning {
-            for node in nodes {
-                self.fold_uncorrelated_in_rexpr(node, &bound, ctx, &mut meter.accrued)?;
-            }
-        }
-        self.execute_insert_values_plan_with_bound(ins, &bound, ctx, &plan, meter)
+        self.fold_value_exprs(&mut plan.value_exprs, &bound, ctx, &mut meter)?;
+        // The RETURNING sublinks fold after the rows materialize (below), so a VALUES evaluation
+        // error precedes a RETURNING subquery's — the general path's (and PostgreSQL's) order.
+        let returning = plan
+            .returning
+            .as_mut()
+            .map(|(nodes, _, _)| std::mem::take(nodes));
+        self.execute_insert_values_plan_with_bound(ins, &bound, ctx, &plan, meter, returning)
     }
 
     fn execute_insert_values_plan(
@@ -928,7 +1087,7 @@ impl Engine {
     ) -> Result<Outcome> {
         let bound = bind_params(params, &plan.param_types)?;
         let meter = self.session.new_meter();
-        self.execute_insert_values_plan_with_bound(ins, &bound, ctx, plan, meter)
+        self.execute_insert_values_plan_with_bound(ins, &bound, ctx, plan, meter, None)
     }
 
     fn execute_insert_values_plan_with_bound(
@@ -938,6 +1097,7 @@ impl Engine {
         ctx: CteCtx,
         plan: &InsertValuesPlan,
         mut meter: Meter,
+        unfolded_returning: Option<Vec<RExpr>>,
     ) -> Result<Outcome> {
         let InsertSource::Values(rows_in) = &ins.source else {
             unreachable!("plain VALUES cache called for a SELECT source")
@@ -947,7 +1107,7 @@ impl Engine {
         let mut single_values: Option<Vec<Value>> = None;
         let mut rows: Vec<Vec<Value>> =
             Vec::with_capacity(if use_single { 0 } else { rows_in.len() });
-        for values in rows_in {
+        for (r, values) in rows_in.iter().enumerate() {
             let mut rv = vec![Value::Null; plan.arity];
             for (i, col) in plan.table.columns.iter().enumerate() {
                 if let Some(p) = plan.provided[i] {
@@ -956,6 +1116,13 @@ impl Engine {
                             col,
                             plan.default_exprs[i].as_ref(),
                             &stmt_rng,
+                            &mut meter,
+                        )?,
+                        InsertValue::Expr(_) => self.eval_value_expr(
+                            &plan.value_exprs[r][p],
+                            bound,
+                            &stmt_rng,
+                            ctx,
                             &mut meter,
                         )?,
                         InsertValue::Lit(Literal::Text(s))
@@ -980,10 +1147,21 @@ impl Engine {
                 rows.push(rv);
             }
         }
-        let returning = plan
-            .returning
-            .as_ref()
-            .map(|(nodes, _, _)| nodes.as_slice());
+        // An uncached plan's RETURNING nodes arrive unfolded: their uncorrelated subqueries fold
+        // once here, after every row materialized. A cached plan's RETURNING has no subquery.
+        let mut late_returning = unfolded_returning;
+        if let Some(nodes) = &mut late_returning {
+            for node in nodes {
+                self.fold_uncorrelated_in_rexpr(node, bound, ctx, &mut meter.accrued)?;
+            }
+        }
+        let returning = match &late_returning {
+            Some(nodes) => Some(nodes.as_slice()),
+            None => plan
+                .returning
+                .as_ref()
+                .map(|(nodes, _, _)| nodes.as_slice()),
+        };
         let (affected, returned) = match single_values {
             Some(values) => (
                 1,

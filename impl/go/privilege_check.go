@@ -605,11 +605,18 @@ func collectStmtPrivs(stmt statement, req *privReq) {
 }
 
 func collectInsertPrivs(ins *insert, req *privReq, locals map[string]bool) {
-	// The write target needs INSERT. A bare INSERT … VALUES reads nothing (the slots are literals /
-	// params), so it needs only INSERT; an INSERT … SELECT source needs SELECT on its tables.
+	// The write target needs INSERT. A VALUES expression slot needs what its sublinks read and the
+	// functions it calls (grammar.md §16); an INSERT … SELECT source needs SELECT on its tables.
 	req.needTable(ins.Table, PrivInsert)
 	if ins.Select != nil {
 		collectSelectPrivs(ins.Select, req, locals)
+	}
+	for _, values := range ins.Rows {
+		for _, v := range values {
+			if v.IsExpr {
+				collectExprPrivs(v.Expr, req, locals)
+			}
+		}
 	}
 	if ins.OnConflict != nil && ins.OnConflict.DoUpdate {
 		for i := range ins.OnConflict.Assignments {

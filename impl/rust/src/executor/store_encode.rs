@@ -523,6 +523,10 @@ pub(crate) fn materialize_insert_value(
                 SqlState::SyntaxError,
                 "DEFAULT is not allowed inside ROW(...)",
             )),
+            // Only a top-level slot is a general expression; the caller evaluates it.
+            InsertValue::Expr(_) => {
+                unreachable!("a VALUES expression slot is evaluated by the caller")
+            }
         },
         ColType::Composite { name, fields } => match iv {
             InsertValue::Row(field_ivs) => {
@@ -550,6 +554,10 @@ pub(crate) fn materialize_insert_value(
                 SqlState::SyntaxError,
                 "DEFAULT is not allowed inside ROW(...)",
             )),
+            // Only a top-level slot is a general expression; the caller evaluates it.
+            InsertValue::Expr(_) => {
+                unreachable!("a VALUES expression slot is evaluated by the caller")
+            }
         },
         ColType::Array(elem) => match iv {
             // ARRAY[e, …]: a nested constructor (an element is itself `ARRAY[…]`) stacks the
@@ -587,6 +595,10 @@ pub(crate) fn materialize_insert_value(
                 SqlState::SyntaxError,
                 "DEFAULT is not allowed inside ARRAY[...]",
             )),
+            // Only a top-level slot is a general expression; the caller evaluates it.
+            InsertValue::Expr(_) => {
+                unreachable!("a VALUES expression slot is evaluated by the caller")
+            }
         },
         ColType::Range(elem) => {
             // A range column's element is always a scalar; the descriptor (for canonicalization)
@@ -617,6 +629,10 @@ pub(crate) fn materialize_insert_value(
                     SqlState::SyntaxError,
                     "DEFAULT is not allowed inside ROW(...)",
                 )),
+                // Only a top-level slot is a general expression; the caller evaluates it.
+                InsertValue::Expr(_) => {
+                    unreachable!("a VALUES expression slot is evaluated by the caller")
+                }
             }
         }
     }

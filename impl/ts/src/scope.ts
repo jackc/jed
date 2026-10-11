@@ -564,11 +564,15 @@ export function countCteRefsDml(body: CteBody, name: string): number {
     return countSelfRefsQuery(body, name);
   }
   if (body.kind === "insert") {
-    let n =
-      body.source.kind === "select"
-        ? countSelfRefsSelect(body.source.select, name)
-        : // VALUES slots hold literals / params / ROW / ARRAY (no sublinks this slice).
-          0;
+    let n = 0;
+    if (body.source.kind === "select") {
+      n = countSelfRefsSelect(body.source.select, name);
+    } else {
+      // A VALUES expression slot may hold a sublink (grammar.md §16).
+      for (const values of body.source.rows) {
+        for (const v of values) if (v.kind === "expr") n += countSelfRefsExpr(v.expr, name);
+      }
+    }
     if (body.onConflict?.doUpdate) {
       for (const a of body.onConflict.assignments) n += countSelfRefsExpr(a.value, name);
       if (body.onConflict.filter !== null) n += countSelfRefsExpr(body.onConflict.filter, name);
@@ -1464,11 +1468,15 @@ export function collectStmtPrivs(stmt: Statement, req: PrivReq): void {
 }
 
 export function collectInsertPrivs(ins: Insert, req: PrivReq, locals: Set<string>): void {
-  // The write target needs INSERT. A bare INSERT … VALUES reads nothing (the slots are literals /
-  // params), so it needs only INSERT; an INSERT … SELECT source needs SELECT on its tables.
+  // The write target needs INSERT. A VALUES expression slot needs what its sublinks read and the
+  // functions it calls (grammar.md §16); an INSERT … SELECT source needs SELECT on its tables.
   req.tables.push({ name: ins.table, priv: "insert" });
   if (ins.source.kind === "select") {
     collectSelectPrivs(ins.source.select, req, locals);
+  } else {
+    for (const values of ins.source.rows) {
+      for (const v of values) if (v.kind === "expr") collectExprPrivs(v.expr, req, locals);
+    }
   }
   if (ins.onConflict?.doUpdate) {
     for (const a of ins.onConflict.assignments) collectExprPrivs(a.value, req, locals);

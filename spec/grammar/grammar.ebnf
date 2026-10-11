@@ -411,7 +411,15 @@ insert         ::= "INSERT" "INTO" qualified_table
 
 row            ::= "(" insert_value ("," insert_value)* ")"
 
-insert_value   ::= "DEFAULT" | parameter | literal
+/* A VALUES slot (../design/grammar.md §16). A slot that is exactly a literal, a parameter,
+ * DEFAULT, or a ROW(…) / ARRAY[…] whose fields are only those forms keeps its contextual adaptation
+ * to the target column (literal_value); any other slot is a general expression — resolved with no
+ * columns in scope, subqueries allowed, the target column's type as its literal hint. */
+insert_value   ::= "DEFAULT" | literal_value | expr
+
+literal_value  ::= literal | parameter
+                 | "ROW" "(" (literal_value ("," literal_value)*)? ")"
+                 | "ARRAY" "[" (literal_value ("," literal_value)*)? "]"
 
 /* ON CONFLICT (UPSERT — ../design/upsert.md): a row that would violate a UNIQUE / PRIMARY KEY
  * constraint takes the conflict_action instead of trapping 23505. "DO NOTHING" skips it;
@@ -1192,7 +1200,7 @@ frame_exclusion ::= "EXCLUDE" ("CURRENT" "ROW" | "GROUP" | "TIES" | "NO" "OTHERS
  * column_ref (see select_item). */
 column_ref     ::= identifier ("." identifier)?
 
-/* INSERT takes literals only (no expressions, no columns). A leading "-" before
+/* The literal form of an INSERT value slot (insert_value). A leading "-" before
  * a number here is the unary-minus operator applied to the literal, folded at
  * parse time. A `number` is an integer or a decimal (with a "." fractional part);
  * a decimal literal lands in a decimal column (rounded to its scale) and is a 42804

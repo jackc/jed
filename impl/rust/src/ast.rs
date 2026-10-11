@@ -578,6 +578,12 @@ pub enum InsertValue {
     /// An `ARRAY[…]` constructor in a VALUES slot (spec/design/array.md §1) — an array value for an
     /// array target column. Elements are themselves `InsertValue`s (a literal or a `$N`).
     Array(Vec<InsertValue>),
+    /// Any other top-level slot: a general expression (`1 + 1`, `now()`, `CASE …`, a scalar
+    /// subquery — spec/design/grammar.md §16). Resolved against a column-less scope with the target
+    /// column's type as the literal hint, then evaluated once per row. Only a top-level slot is a
+    /// general expression; `ROW(…)`/`ARRAY[…]` fields keep the literal forms above, and a
+    /// constructor holding any other field parses whole as an expression instead.
+    Expr(Box<Expr>),
 }
 
 /// `UPDATE <table> SET <col> = <expr> [, ...] [WHERE <expr>]`. Each assignment's

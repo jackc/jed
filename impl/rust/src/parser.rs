@@ -2022,7 +2022,7 @@ impl Parser {
         self.expect(&Token::LParen)?;
         let mut values = Vec::new();
         loop {
-            values.push(self.parse_insert_value()?);
+            values.push(self.parse_insert_slot()?);
             match self.advance() {
                 Token::Comma => continue,
                 Token::RParen => break,
@@ -2035,7 +2035,25 @@ impl Parser {
         Ok(values)
     }
 
-    /// One INSERT value slot: the `DEFAULT` keyword (not reserved — §3), a `ROW(…)` composite
+    /// One top-level INSERT value slot (spec/design/grammar.md §16). The literal-shaped forms
+    /// (`DEFAULT`, a literal, `$N`, a literal-field `ROW(…)` / `ARRAY[…]`) keep their contextual
+    /// adaptation to the target column when the slot is exactly that form — the next token closes
+    /// the slot. Anything else (`1 + 1`, `now()`, `CASE …`, `(SELECT …)`, a constructor with an
+    /// expression field) re-parses from the slot's start as a general expression. A non-syntax
+    /// error from the literal form (an out-of-range integer, 22003) is the slot's own error.
+    fn parse_insert_slot(&mut self) -> Result<InsertValue> {
+        let (pos, depth) = (self.pos, self.depth);
+        match self.parse_insert_value() {
+            Ok(v) if matches!(self.peek(), Token::Comma | Token::RParen) => return Ok(v),
+            Err(e) if e.state != SqlState::SyntaxError => return Err(e),
+            _ => {}
+        }
+        self.pos = pos;
+        self.depth = depth;
+        Ok(InsertValue::Expr(Box::new(self.parse_expr()?)))
+    }
+
+    /// One literal-shaped INSERT value: the `DEFAULT` keyword (not reserved — §3), a `ROW(…)` composite
     /// constructor (spec/design/composite.md §1), a bind parameter (`$N`, bound at execute —
     /// spec/design/api.md §5), else a literal.
     fn parse_insert_value(&mut self) -> Result<InsertValue> {
@@ -2046,6 +2064,8 @@ impl Parser {
             && matches!(self.peek_at(1), Token::LParen)
         {
             // ROW(field, field, …) — recurse on each field (a literal, a `$N`, or a nested ROW).
+            // Each constructor level is one nesting level (MAX_EXPR_DEPTH, cost.md §7).
+            self.deepen()?;
             self.advance(); // ROW
             self.expect(&Token::LParen)?;
             let mut fields = Vec::new();
@@ -2063,11 +2083,13 @@ impl Parser {
             } else {
                 self.advance(); // the empty ROW() — consume ')'
             }
+            self.undeepen();
             Ok(InsertValue::Row(fields))
         } else if self.peek_keyword().as_deref() == Some("array")
             && matches!(self.peek_at(1), Token::LBracket)
         {
             // ARRAY[elem, …] — recurse on each element (a literal or a `$N`).
+            self.deepen()?;
             self.advance(); // ARRAY
             self.expect(&Token::LBracket)?;
             let mut elems = Vec::new();
@@ -2085,6 +2107,7 @@ impl Parser {
             } else {
                 self.advance(); // the empty ARRAY[] — consume ']'
             }
+            self.undeepen();
             Ok(InsertValue::Array(elems))
         } else if let Token::Param(n) = self.peek() {
             let n = *n;
@@ -2096,8 +2119,9 @@ impl Parser {
     }
 
     /// A literal value for INSERT: an integer (with an optional leading unary minus,
-    /// folded here), or one of the keywords `NULL` / `TRUE` / `FALSE`. INSERT takes
-    /// literals only — not general expressions (spec/grammar/grammar.ebnf `literal`).
+    /// folded here), or one of the keywords `NULL` / `TRUE` / `FALSE`
+    /// (spec/grammar/grammar.ebnf `literal`). A slot that is not exactly a literal is a
+    /// general expression (`parse_insert_slot`).
     fn parse_literal(&mut self) -> Result<Literal> {
         let negate = if matches!(self.peek(), Token::Minus) {
             self.advance();

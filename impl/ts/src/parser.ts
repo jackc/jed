@@ -59,7 +59,7 @@ import type {
 } from "./ast.ts";
 import { emptySeqOptions, seqOptionsHasAny } from "./ast.ts";
 import { Decimal } from "./decimal.ts";
-import { engineError } from "./errors.ts";
+import { EngineError, engineError } from "./errors.ts";
 import { lex } from "./lexer.ts";
 import type { Token, TokenKind } from "./token.ts";
 
@@ -1813,7 +1813,7 @@ class Parser {
     this.expect("lparen");
     const values: InsertValue[] = [];
     for (;;) {
-      values.push(this.parseInsertValue());
+      values.push(this.parseInsertSlot());
       const k = this.advance().kind;
       if (k === "comma") continue;
       if (k === "rparen") break;
@@ -1825,9 +1825,30 @@ class Parser {
     return values;
   }
 
-  // parseInsertValue parses one INSERT value slot: the DEFAULT keyword (not reserved — §3), a
-  // ROW(…) composite constructor (spec/design/composite.md §1), a bind parameter ($N, bound at
-  // execute — spec/design/api.md §5), else a literal.
+  // parseInsertSlot parses one top-level INSERT value slot (spec/design/grammar.md §16). The
+  // literal-shaped forms (DEFAULT, a literal, $N, a literal-field ROW(…) / ARRAY[…]) keep their
+  // contextual adaptation to the target column when the slot is exactly that form — the next token
+  // closes the slot. Anything else (`1 + 1`, `now()`, `CASE …`, `(SELECT …)`, a constructor with an
+  // expression field) re-parses from the slot's start as a general expression. A non-syntax error
+  // from the literal form (an out-of-range integer, 22003) is the slot's own error.
+  private parseInsertSlot(): InsertValue {
+    const pos = this.pos;
+    const depth = this.depth;
+    try {
+      const v = this.parseInsertValue();
+      const k = this.peek().kind;
+      if (k === "comma" || k === "rparen") return v;
+    } catch (e) {
+      if (!(e instanceof EngineError) || e.state !== "syntax_error") throw e;
+    }
+    this.pos = pos;
+    this.depth = depth;
+    return { kind: "expr", expr: this.parseExpr() };
+  }
+
+  // parseInsertValue parses one literal-shaped INSERT value: the DEFAULT keyword (not reserved —
+  // §3), a ROW(…) composite constructor (spec/design/composite.md §1), a bind parameter ($N, bound
+  // at execute — spec/design/api.md §5), else a literal.
   private parseInsertValue(): InsertValue {
     if (this.peekKeyword() === "default") {
       this.advance();
@@ -1835,6 +1856,8 @@ class Parser {
     }
     if (this.peekKeyword() === "row" && this.peekKindAt(1) === "lparen") {
       // ROW(field, field, …) — recurse on each field (a literal, a $N, or a nested ROW).
+      // Each constructor level is one nesting level (MAX_EXPR_DEPTH, cost.md §7).
+      this.deepen();
       this.advance(); // ROW
       this.expect("lparen");
       const fields: InsertValue[] = [];
@@ -1849,10 +1872,13 @@ class Parser {
       } else {
         this.advance(); // the empty ROW() — consume ')'
       }
+      this.undeepen();
       return { kind: "row", fields };
     }
     if (this.peekKeyword() === "array" && this.peekKindAt(1) === "lbracket") {
       // ARRAY[elem, …] — recurse on each element (a literal or a $N).
+      // Each constructor level is one nesting level (MAX_EXPR_DEPTH, cost.md §7).
+      this.deepen();
       this.advance(); // ARRAY
       this.expect("lbracket");
       const elements: InsertValue[] = [];
@@ -1867,6 +1893,7 @@ class Parser {
       } else {
         this.advance(); // the empty ARRAY[] — consume ']'
       }
+      this.undeepen();
       return { kind: "array", elements };
     }
     if (this.peek().kind === "param") {
@@ -1876,8 +1903,9 @@ class Parser {
   }
 
   // parseLiteral parses a literal value for INSERT: an integer (with an optional leading
-  // unary minus, folded here), or one of the keywords NULL / TRUE / FALSE. INSERT takes
-  // literals only — not general expressions (spec/grammar/grammar.ebnf `literal`).
+  // unary minus, folded here), or one of the keywords NULL / TRUE / FALSE
+  // (spec/grammar/grammar.ebnf `literal`). A slot that is not exactly a literal is a general
+  // expression (parseInsertSlot).
   private parseLiteral(): Literal {
     let negate = false;
     if (this.peek().kind === "minus") {

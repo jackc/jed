@@ -59,6 +59,7 @@ type insertValuesPlan struct {
 	colls          []*Collation
 	provided       []int
 	arity          int
+	valueExprs     valueExprs
 	retNodes       []*rExpr
 	retNames       []string
 	retTypes       []string
@@ -1099,6 +1100,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	// types across every row (a $N reused under two columns unifies; spec/design/api.md §5), then
 	// bind the supplied values up front so a bad bind fails before any row is stored.
 	ptypes := &paramTypes{}
+	exprs := make(valueExprs, 0, len(ins.Rows))
 	for _, values := range ins.Rows {
 		if len(values) != arity {
 			expected := "columns are"
@@ -1122,6 +1124,11 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 				}
 			}
 		}
+		rowExprs, err := db.resolveInsertRowExprs(values, table.Columns, provided, ctx.bindings, ptypes)
+		if err != nil {
+			return outcome{}, err
+		}
+		exprs = append(exprs, rowExprs)
 	}
 	// GENERATED ALWAYS gate (sequences.md §13.3): an explicit (non-DEFAULT) value targeting an
 	// ALWAYS identity column without OVERRIDING SYSTEM VALUE is 428C9. Statement-level — fires
@@ -1176,6 +1183,11 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	// RETURNING projection. The meter is created here (before materialization) so a
 	// DEFAULT-keyword expression default charges it too.
 	meter := db.session.newMeter()
+	// Uncorrelated subqueries in VALUES expression slots fold once, before any row is materialized
+	// (cost.md §3) — a VALUES slot has no outer row to correlate with.
+	if err := db.foldValueExprs(exprs, bound, ctx, meter); err != nil {
+		return outcome{}, err
+	}
 
 	// Materialize each row into its value-position-indexed candidates (length arity, checked
 	// above) resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that column's
@@ -1188,7 +1200,7 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		rowCap = 0
 	}
 	rows := make([][]Value, 0, rowCap)
-	for _, values := range ins.Rows {
+	for r, values := range ins.Rows {
 		rv := make([]Value, arity)
 		for i, col := range table.Columns {
 			if p := provided[i]; p >= 0 {
@@ -1200,6 +1212,14 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 						return outcome{}, err
 					}
 					rv[p] = dv
+				} else if iv.IsExpr {
+					// A general expression → its resolved tree, evaluated for this row (metered);
+					// insertRows then store-coerces the value.
+					ev, err := db.evalValueExpr(exprs[r][p], bound, stmtRng, ctx, meter)
+					if err != nil {
+						return outcome{}, err
+					}
+					rv[p] = ev
 				} else if ct := store.colTypes[i]; ct.Elem == nil && ct.RangeElem == nil && !ct.Composite &&
 					ct.Scalar == scalarDate && !iv.IsParam && !iv.IsArray && !iv.IsRow &&
 					iv.Lit.Kind == literalText && dateClockIsSpecial(iv.Lit.Str) {
@@ -1262,6 +1282,116 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 		db.markEstimatorMutation(ins.DB, ins.Table)
 	}
 	return dmlOutcome(retNames, retTypes, returned, affected, meter.Accrued), nil
+}
+
+// valueExprs is the resolved general-expression slots of an INSERT VALUES list
+// (spec/design/grammar.md §16), indexed [row][value position]. A row with no expression slot holds
+// nil, so a literal-only list allocates nothing per row.
+type valueExprs [][]*rExpr
+
+// resolveInsertRowExprs resolves one VALUES row's general-expression slots (spec/design/grammar.md
+// §16), in value position order, against a column-less scope that admits subqueries and sees the
+// statement's CTE bindings. Each expression takes its target column's type as the literal hint and
+// must be storable there: a scalar column requires an assignable type (42804, the INSERT … SELECT
+// gate); a range/array column shares UPDATE's container rule; a composite column takes a NULL or a
+// value of that same composite type (an anonymous ROW(…) expression is 0A000, as for UPDATE). A slot
+// discarded by OVERRIDING USER VALUE is not resolved. Returns nil for a row with no expression slot.
+func (db *engine) resolveInsertRowExprs(values []insertValue, columns []catColumn, provided []int, ctes []*cteBinding, ptypes *paramTypes) ([]*rExpr, error) {
+	if !slices.ContainsFunc(values, func(v insertValue) bool { return v.IsExpr }) {
+		return nil, nil
+	}
+	s := emptyScope(db)
+	s.allowSubquery = true
+	s.ctes = ctes
+	columnAt := make([]int, len(values))
+	for p := range columnAt {
+		columnAt[p] = -1
+	}
+	for i, p := range provided {
+		if p >= 0 {
+			columnAt[p] = i
+		}
+	}
+	out := make([]*rExpr, len(values))
+	for p, v := range values {
+		if !v.IsExpr || columnAt[p] < 0 {
+			continue
+		}
+		col := columns[columnAt[p]]
+		var node *rExpr
+		switch {
+		case col.Type.IsRange() || col.Type.IsArray():
+			n, err := resolveContainerAssign(s, col, *v.Expr, &aggCtx{collecting: false}, ptypes)
+			if err != nil {
+				return nil, err
+			}
+			node = n
+		case col.Type.IsComposite():
+			n, ty, err := resolve(s, *v.Expr, nil, &aggCtx{collecting: false}, ptypes)
+			if err != nil {
+				return nil, err
+			}
+			switch {
+			case ty.kind == rtNull:
+			case ty.kind == rtComposite && !ty.comp.named:
+				return nil, newError(FeatureNotSupported, fmt.Sprintf(
+					"inserting a ROW expression into composite column %s is not supported yet", col.Name,
+				))
+			case resolvedTypeEqual(ty, resolvedTypeOfCol(col.Type, db.readSnap())):
+			default:
+				return nil, typeError(fmt.Sprintf(
+					"column %s is of type %s but expression is of type %s",
+					col.Name, col.Type.CanonicalName(), rtName(ty),
+				))
+			}
+			node = n
+		default:
+			target := col.Type.ScalarTy()
+			n, ty, err := resolve(s, *v.Expr, &target, &aggCtx{collecting: false}, ptypes)
+			if err != nil {
+				return nil, err
+			}
+			if !assignableTo(ty, target) {
+				return nil, typeError(fmt.Sprintf(
+					"column %s is of type %s but expression is of type %s",
+					col.Name, col.Type.CanonicalName(), rtName(ty),
+				))
+			}
+			node = n
+		}
+		out[p] = node
+	}
+	return out, nil
+}
+
+// foldValueExprs folds the uncorrelated subqueries of every resolved VALUES expression once, in
+// row-major value-position order (cost.md §3). A VALUES slot has no outer row, so every subquery
+// folds.
+func (db *engine) foldValueExprs(exprs valueExprs, bound []Value, ctx cteCtx, meter *costMeter) error {
+	for _, row := range exprs {
+		for _, node := range row {
+			if node == nil {
+				continue
+			}
+			if err := db.foldUncorrelatedInRExpr(node, bound, ctx, &meter.Accrued); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// evalValueExpr evaluates one resolved VALUES expression slot for its row: a ceiling guard, then
+// the metered tree over the empty row (cost.md §3, like an expression default).
+func (db *engine) evalValueExpr(node *rExpr, params []Value, rng *stmtRng, ctes cteCtx, meter *costMeter) (Value, error) {
+	if node == nil {
+		panic("every VALUES expression slot is resolved before materialization")
+	}
+	if err := meter.Guard(); err != nil {
+		return Value{}, err
+	}
+	env := &evalEnv{exec: db, params: params, rng: rng, ctes: ctes}
+	return node.eval(nil, env, meter)
 }
 
 // executeInsertValuesCached resolves or reuses the immutable part of a plain INSERT ... VALUES,
@@ -1364,6 +1494,7 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx) (*insertValue
 		}
 	}
 
+	exprs := make(valueExprs, 0, len(ins.Rows))
 	for _, values := range ins.Rows {
 		if len(values) != arity {
 			expected := "columns are"
@@ -1385,6 +1516,11 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx) (*insertValue
 				}
 			}
 		}
+		rowExprs, err := db.resolveInsertRowExprs(values, table.Columns, provided, ctx.bindings, ptypes)
+		if err != nil {
+			return nil, err
+		}
+		exprs = append(exprs, rowExprs)
 	}
 	for _, at := range alwaysTargeted {
 		for _, values := range ins.Rows {
@@ -1418,6 +1554,7 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx) (*insertValue
 		colls:          db.columnCollations(table.Columns),
 		provided:       provided,
 		arity:          arity,
+		valueExprs:     exprs,
 		retNodes:       retNodes,
 		retNames:       retNames,
 		retTypes:       retTypes,
@@ -1427,7 +1564,10 @@ func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx) (*insertValue
 	}, nil
 }
 
-func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCtx, plan *insertValuesPlan, foldReturning bool) (outcome, error) {
+// fold is set for an uncacheable plan, which this execution alone uses: its VALUES expression slots
+// (before materialization) and RETURNING list (after it) fold their uncorrelated subqueries in place
+// against this execution's params (a cacheable plan has no subquery to fold).
+func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCtx, plan *insertValuesPlan, fold bool) (outcome, error) {
 	bound, err := bindParams(params, plan.ptys)
 	if err != nil {
 		return outcome{}, err
@@ -1435,6 +1575,11 @@ func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCt
 	store := db.writeStoreScoped(ins.DB, ins.Table)
 	stmtRng := newStmtRng()
 	meter := db.session.newMeter()
+	if fold {
+		if err := db.foldValueExprs(plan.valueExprs, bound, ctx, meter); err != nil {
+			return outcome{}, err
+		}
+	}
 	useSingle := len(ins.Rows) == 1
 	var singleValues []Value
 	rowCap := len(ins.Rows)
@@ -1442,7 +1587,7 @@ func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCt
 		rowCap = 0
 	}
 	rows := make([][]Value, 0, rowCap)
-	for _, values := range ins.Rows {
+	for r, values := range ins.Rows {
 		rv := make([]Value, plan.arity)
 		for i, col := range plan.table.Columns {
 			if p := plan.provided[i]; p >= 0 {
@@ -1453,6 +1598,12 @@ func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCt
 						return outcome{}, err
 					}
 					rv[p] = dv
+				} else if iv.IsExpr {
+					ev, err := db.evalValueExpr(plan.valueExprs[r][p], bound, stmtRng, ctx, meter)
+					if err != nil {
+						return outcome{}, err
+					}
+					rv[p] = ev
 				} else if ct := plan.colTypes[i]; ct.Elem == nil && ct.RangeElem == nil && !ct.Composite &&
 					ct.Scalar == scalarDate && !iv.IsParam && !iv.IsArray && !iv.IsRow &&
 					iv.Lit.Kind == literalText && dateClockIsSpecial(iv.Lit.Str) {
@@ -1481,7 +1632,9 @@ func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCt
 			rows = append(rows, rv)
 		}
 	}
-	if foldReturning {
+	// The RETURNING list folds after the rows are materialized (PostgreSQL's order: a VALUES
+	// expression error precedes a RETURNING subquery's), reading the pre-statement snapshot.
+	if fold {
 		for _, node := range plan.retNodes {
 			if err := db.foldUncorrelatedInRExpr(node, bound, ctx, &meter.Accrued); err != nil {
 				return outcome{}, err

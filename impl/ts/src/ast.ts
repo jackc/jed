@@ -871,7 +871,13 @@ export type InsertValue =
   // An ARRAY[…] constructor in a VALUES slot (spec/design/array.md §1) — an array value for an array
   // target column. Elements are themselves InsertValues (a literal or a $N).
   | { kind: "array"; elements: InsertValue[] }
-  | { kind: "default" };
+  | { kind: "default" }
+  // Any other top-level slot: a general expression (`1 + 1`, `now()`, `CASE …`, a scalar subquery
+  // — spec/design/grammar.md §16). Resolved against a column-less scope with the target column's
+  // type as the literal hint, then evaluated once per row. Only a top-level slot is a general
+  // expression; ROW(…)/ARRAY[…] fields keep the literal forms above, and a constructor holding any
+  // other field parses whole as an expression instead.
+  | { kind: "expr"; expr: Expr };
 
 // TableRef is a table reference in a FROM clause: a table name with an optional alias
 // (`orders o` or `orders AS o`). The alias, or the table name when there is none, is the

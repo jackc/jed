@@ -174,3 +174,39 @@ fn insert_select_cost_is_the_embedded_select_cost() {
         }
     );
 }
+
+#[test]
+fn values_expression_params_typed_by_context() {
+    // A `$N` inside a VALUES expression slot is typed by the resolver from its operator context
+    // (api.md §5), unlike a bare `$N` slot, which takes its target column's type.
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY, name text)"]);
+    db.query_outcome(
+        "INSERT INTO t VALUES ($1 + 1, upper($2))",
+        &[Value::Int(1), Value::Text("ab".into())],
+    )
+    .unwrap();
+    let rows = db.rows_in_key_order("t").unwrap();
+    assert_eq!(
+        rows[0].to_vec(),
+        vec![Value::Int(2), Value::Text("AB".into())]
+    );
+}
+
+#[test]
+fn values_anonymous_row_expression_into_composite_is_0a000() {
+    // A deliberate narrowing (PostgreSQL accepts it): a ROW(…) whose fields are not all literals is
+    // a general expression of an anonymous record type, and anonymous-record → named-composite
+    // assignment is deferred exactly as for UPDATE (composite.md §12). A literal-field ROW(…) and a
+    // value of the column's own composite type are accepted (the shared corpus covers both).
+    let mut db = db_with(&[
+        "CREATE TYPE pt AS (x i32, y i32)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, p pt)",
+    ]);
+    let code = db
+        .query_outcome("INSERT INTO t VALUES (1, ROW(1 + 1, 2))", &[])
+        .err()
+        .expect("anonymous ROW expression is rejected")
+        .code()
+        .to_string();
+    assert_eq!(code, "0A000");
+}

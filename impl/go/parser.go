@@ -2426,7 +2426,7 @@ func (p *parser) parseInsertRow() ([]insertValue, error) {
 	}
 	var values []insertValue
 	for {
-		v, err := p.parseInsertValue()
+		v, err := p.parseInsertSlot()
 		if err != nil {
 			return nil, err
 		}
@@ -2446,7 +2446,31 @@ func (p *parser) parseInsertRow() ([]insertValue, error) {
 	return values, nil
 }
 
-// parseInsertValue parses one INSERT value slot: the DEFAULT keyword (not reserved — §3), a
+// parseInsertSlot parses one top-level INSERT value slot (spec/design/grammar.md §16). The
+// literal-shaped forms (DEFAULT, a literal, $N, a literal-field ROW(...) / ARRAY[...]) keep their
+// contextual adaptation to the target column when the slot is exactly that form — the next token
+// closes the slot. Anything else (`1 + 1`, `now()`, `CASE …`, `(SELECT …)`, a constructor with an
+// expression field) re-parses from the slot's start as a general expression. A non-syntax error
+// from the literal form (an out-of-range integer, 22003) is the slot's own error.
+func (p *parser) parseInsertSlot() (insertValue, error) {
+	pos, depth := p.pos, p.depth
+	v, err := p.parseInsertValue()
+	if err == nil {
+		if k := p.peek().Kind; k == tokComma || k == tokRParen {
+			return v, nil
+		}
+	} else if ee, ok := err.(*EngineError); !ok || ee.State != SyntaxError {
+		return insertValue{}, err
+	}
+	p.pos, p.depth = pos, depth
+	e, err := p.parseExpr()
+	if err != nil {
+		return insertValue{}, err
+	}
+	return insertValue{IsExpr: true, Expr: &e}, nil
+}
+
+// parseInsertValue parses one literal-shaped INSERT value: the DEFAULT keyword (not reserved — §3), a
 // ROW(...) composite constructor (spec/design/composite.md §1), a bind parameter ($N, bound at
 // execute — spec/design/api.md §5), else a literal.
 func (p *parser) parseInsertValue() (insertValue, error) {
@@ -2456,6 +2480,10 @@ func (p *parser) parseInsertValue() (insertValue, error) {
 	}
 	if p.peekKeyword() == "row" && p.peekKindAt(1) == tokLParen {
 		// ROW(field, field, …) — recurse on each field (a literal, a $N, or a nested ROW).
+		// Each constructor level is one nesting level (maxExprDepth, cost.md §7).
+		if err := p.deepen(); err != nil {
+			return insertValue{}, err
+		}
 		p.advance() // ROW
 		if err := p.expect(tokLParen); err != nil {
 			return insertValue{}, err
@@ -2480,10 +2508,14 @@ func (p *parser) parseInsertValue() (insertValue, error) {
 		} else {
 			p.advance() // the empty ROW() — consume ')'
 		}
+		p.undeepen()
 		return insertValue{IsRow: true, Row: fields}, nil
 	}
 	if p.peekKeyword() == "array" && p.peekKindAt(1) == tokLBracket {
 		// ARRAY[elem, …] — recurse on each element (a literal or a $N).
+		if err := p.deepen(); err != nil {
+			return insertValue{}, err
+		}
 		p.advance() // ARRAY
 		if err := p.expect(tokLBracket); err != nil {
 			return insertValue{}, err
@@ -2508,6 +2540,7 @@ func (p *parser) parseInsertValue() (insertValue, error) {
 		} else {
 			p.advance() // the empty ARRAY[] — consume ']'
 		}
+		p.undeepen()
 		return insertValue{IsArray: true, Array: elems}, nil
 	}
 	if p.peek().Kind == tokParam {
@@ -2522,8 +2555,9 @@ func (p *parser) parseInsertValue() (insertValue, error) {
 }
 
 // parseLiteral parses a literal value for INSERT: an integer (with an optional leading
-// unary minus, folded here), or one of the keywords NULL / TRUE / FALSE. INSERT takes
-// literals only — not general expressions (spec/grammar/grammar.ebnf `literal`).
+// unary minus, folded here), or one of the keywords NULL / TRUE / FALSE
+// (spec/grammar/grammar.ebnf `literal`). A slot that is not exactly a literal is a general
+// expression (parseInsertSlot).
 func (p *parser) parseLiteral() (literal, error) {
 	negate := false
 	if p.peek().Kind == tokMinus {

@@ -188,6 +188,41 @@ fn insert_cache_excludes_mutable_and_complex_shapes() {
 }
 
 #[test]
+fn insert_cache_reuses_values_expressions() {
+    // A VALUES expression slot without a subquery caches with the plan; reuse rebinds params and
+    // is result- and cost-identical (grammar.md §16).
+    let mut s = mem();
+    exec(&mut s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+    let stmt = s
+        .prepare("INSERT INTO t VALUES ($1, $2 * 10 + 1) RETURNING v")
+        .unwrap();
+    let (first, first_cost) = drain(&mut s, &stmt, &[Value::Int(1), Value::Int(2)]);
+    assert_eq!(first, vec![vec![Value::Int(21)]]);
+    let plan = insert_plan_ptr(&stmt);
+    let (second, second_cost) = drain(&mut s, &stmt, &[Value::Int(2), Value::Int(3)]);
+    assert_eq!(second, vec![vec![Value::Int(31)]]);
+    assert_eq!(insert_plan_ptr(&stmt), plan, "expression INSERT re-planned");
+    assert_eq!(second_cost, first_cost);
+}
+
+#[test]
+fn insert_values_subquery_is_not_cached() {
+    // A VALUES subquery folds against each execution's snapshot, so the plan is never cached and
+    // every execute re-reads the table.
+    let mut s = mem();
+    exec(&mut s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+    exec(&mut s, "INSERT INTO t VALUES (1, 0)");
+    let stmt = s
+        .prepare("INSERT INTO t VALUES ((SELECT max(id) FROM t) + 1, $1) RETURNING id")
+        .unwrap();
+    let (first, _) = drain(&mut s, &stmt, &[Value::Int(10)]);
+    assert_eq!(first, vec![vec![Value::Int(2)]]);
+    assert!(stmt.insert_cache().borrow().is_none());
+    let (second, _) = drain(&mut s, &stmt, &[Value::Int(20)]);
+    assert_eq!(second, vec![vec![Value::Int(3)]]);
+}
+
+#[test]
 fn insert_cache_invalidation_identities() {
     let mut s = mem();
     exec(&mut s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");

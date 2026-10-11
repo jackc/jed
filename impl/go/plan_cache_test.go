@@ -245,6 +245,72 @@ func TestInsertCacheEligibilityExcludesMutableAndComplexShapes(t *testing.T) {
 	}
 }
 
+// A VALUES expression slot without a subquery caches with the plan; reuse rebinds params and is
+// result- and cost-identical (grammar.md §16).
+func TestInsertCacheReusesValuesExpressions(t *testing.T) {
+	t.Parallel()
+	s := memDB().Session(SessionOptions{})
+	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+	stmt, err := s.Prepare("INSERT INTO t VALUES ($1, $2 * 10 + 1) RETURNING v")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := prepOutcome(s, stmt, []Value{IntValue(1), IntValue(2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Rows) != 1 || first.Rows[0][0].Int != 21 {
+		t.Fatalf("first rows = %v", first.Rows)
+	}
+	entry := stmt.ic.p.Load()
+	if entry == nil {
+		t.Fatal("expected INSERT cache fill")
+	}
+	second, err := prepOutcome(s, stmt, []Value{IntValue(2), IntValue(3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Rows) != 1 || second.Rows[0][0].Int != 31 {
+		t.Fatalf("second rows = %v", second.Rows)
+	}
+	if got := stmt.ic.p.Load(); got == nil || got.plan != entry.plan {
+		t.Fatal("expression INSERT re-planned")
+	}
+	if second.Cost != first.Cost {
+		t.Fatalf("cache-hit cost = %d, want %d", second.Cost, first.Cost)
+	}
+}
+
+// A VALUES subquery folds against each execution's snapshot, so the plan is never cached and every
+// execute re-reads the table.
+func TestInsertValuesSubqueryIsNotCached(t *testing.T) {
+	t.Parallel()
+	s := memDB().Session(SessionOptions{})
+	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+	mustExec(t, s, "INSERT INTO t VALUES (1, 0)")
+	stmt, err := s.Prepare("INSERT INTO t VALUES ((SELECT max(id) FROM t) + 1, $1) RETURNING id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := prepOutcome(s, stmt, []Value{IntValue(10)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Rows) != 1 || first.Rows[0][0].Int != 2 {
+		t.Fatalf("first rows = %v", first.Rows)
+	}
+	if stmt.ic.p.Load() != nil {
+		t.Fatal("VALUES subquery plan must not cache")
+	}
+	second, err := prepOutcome(s, stmt, []Value{IntValue(20)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Rows) != 1 || second.Rows[0][0].Int != 3 {
+		t.Fatalf("second rows = %v", second.Rows)
+	}
+}
+
 func TestInsertCacheInvalidationIdentities(t *testing.T) {
 	t.Parallel()
 	s := memDB().Session(SessionOptions{})

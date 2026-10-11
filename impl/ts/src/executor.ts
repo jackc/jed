@@ -9257,6 +9257,110 @@ export class Engine {
     );
   }
 
+  // resolveInsertRowExprs resolves one VALUES row's general-expression slots
+  // (spec/design/grammar.md §16), in value-position order, against a column-less scope that admits
+  // subqueries and sees the statement's CTE bindings. Each expression takes its target column's type
+  // as the literal hint and must be storable there: a scalar column requires an assignable type
+  // (42804, the INSERT … SELECT gate); a range/array column shares UPDATE's container rule; a
+  // composite column takes a NULL or a value of that same composite type (an anonymous ROW(…)
+  // expression is 0A000, as for UPDATE). A slot discarded by OVERRIDING USER VALUE is not resolved.
+  // Returns an empty array for a row with no expression slot.
+  private resolveInsertRowExprs(
+    values: InsertValue[],
+    columns: Column[],
+    provided: number[],
+    ctes: CteBinding[],
+    ptypes: ParamTypes,
+  ): (RExpr | null)[] {
+    if (!values.some((v) => v.kind === "expr")) return [];
+    const scope = Scope.empty(this);
+    scope.allowSubquery = true;
+    scope.ctes = ctes;
+    const columnAt: number[] = new Array(values.length).fill(-1);
+    for (let i = 0; i < provided.length; i++) {
+      const p = provided[i]!;
+      if (p >= 0) columnAt[p] = i;
+    }
+    const out: (RExpr | null)[] = new Array(values.length).fill(null);
+    for (let p = 0; p < values.length; p++) {
+      const value = values[p]!;
+      const i = columnAt[p]!;
+      if (value.kind !== "expr" || i < 0) continue;
+      const col = columns[i]!;
+      const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+      if (col.type.kind === "scalar") {
+        const { node, type } = resolve(scope, value.expr, col.type.scalar, forbidden, ptypes);
+        if (!assignableTo(type, col.type.scalar)) {
+          throw typeError(
+            `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(type)}`,
+          );
+        }
+        out[p] = node;
+      } else if (col.type.kind === "range" || col.type.kind === "array") {
+        out[p] = resolveContainerAssign(scope, col, value.expr, forbidden, ptypes);
+      } else {
+        const { node, type } = resolve(scope, value.expr, null, forbidden, ptypes);
+        if (type.kind === "composite" && type.name === null) {
+          throw engineError(
+            "feature_not_supported",
+            `inserting a ROW expression into composite column ${col.name} is not supported yet`,
+          );
+        }
+        if (type.kind !== "null" && !resolvedTypeEqual(type, resolvedTypeOfCol(col.type, this))) {
+          throw typeError(
+            `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(type)}`,
+          );
+        }
+        out[p] = node;
+      }
+    }
+    return out;
+  }
+
+  // foldValueExprs folds the uncorrelated subqueries of every resolved VALUES expression once, in
+  // row-major value-position order (cost.md §3), charging their cost. A VALUES slot has no outer
+  // row, so every subquery folds.
+  private foldValueExprs(
+    valueExprs: (RExpr | null)[][],
+    bound: Value[],
+    ctx: CteCtx,
+    meter: Meter,
+  ): void {
+    const foldCost = { value: 0n };
+    for (const row of valueExprs) {
+      for (let p = 0; p < row.length; p++) {
+        const node = row[p]!;
+        if (node !== null) row[p] = this.foldUncorrelatedInRExpr(node, bound, ctx, foldCost);
+      }
+    }
+    meter.charge(foldCost.value);
+  }
+
+  // evalValueExpr evaluates one resolved VALUES expression slot for its row: a ceiling guard, then
+  // the metered tree over the empty row (cost.md §3, like an expression default).
+  private evalValueExpr(
+    node: RExpr | null | undefined,
+    params: Value[],
+    rng: StmtRng,
+    ctx: CteCtx,
+    meter: Meter,
+  ): Value {
+    if (node === null || node === undefined) {
+      throw new Error("every VALUES expression slot is resolved before materialization");
+    }
+    meter.guard();
+    const env: EvalEnv = {
+      params,
+      outer: [],
+      runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, params, ctx),
+      seam: this.session.seam,
+      rng,
+      ctes: ctx,
+      exec: this,
+    };
+    return evalExpr(node, [], env, meter);
+  }
+
   private executeInsertValuesCached(
     ins: Insert,
     params: Value[],
@@ -9363,6 +9467,7 @@ export class Engine {
     }
 
     const rows = ins.source.kind === "values" ? ins.source.rows : [];
+    const valueExprs: (RExpr | null)[][] = [];
     for (const values of rows) {
       if (values.length !== arity) {
         const which = ins.columns !== null ? "target columns are" : "columns are";
@@ -9379,6 +9484,9 @@ export class Engine {
           if (iv.kind === "param" && ct.kind === "scalar") ptypes.note(iv.index - 1, ct.scalar);
         }
       }
+      valueExprs.push(
+        this.resolveInsertRowExprs(values, table.columns, provided, ctx.bindings, ptypes),
+      );
     }
     for (const at of alwaysTargeted) {
       if (rows.some((values) => values[at.pos]!.kind !== "default")) {
@@ -9403,6 +9511,7 @@ export class Engine {
       colls,
       provided,
       arity,
+      valueExprs,
       returning,
       ptys,
       cacheable: !ptypes.uncacheable,
@@ -9423,7 +9532,11 @@ export class Engine {
     const rows: Value[][] = [];
     let singleValues: Value[] | null = null;
     const useSingle = singleValuesInsertEligible(rowsIn.length, false);
-    for (const values of rowsIn) {
+    // Uncorrelated subqueries in VALUES expression slots fold once, before any row is materialized
+    // (cost.md §3). Any subquery makes the plan uncacheable, so a cached plan has nothing to fold.
+    if (!plan.cacheable) this.foldValueExprs(plan.valueExprs, bound, ctx, meter);
+    for (let r = 0; r < rowsIn.length; r++) {
+      const values = rowsIn[r]!;
       const rv: Value[] = new Array(plan.arity);
       for (let i = 0; i < plan.table.columns.length; i++) {
         const col = plan.table.columns[i]!;
@@ -9433,6 +9546,8 @@ export class Engine {
         const ct = plan.colTypes[i]!;
         if (iv.kind === "default") {
           rv[p] = this.evalDefault(col, plan.defaultExprs[i]!, rng, meter);
+        } else if (iv.kind === "expr") {
+          rv[p] = this.evalValueExpr(plan.valueExprs[r]![p], bound, rng, ctx, meter);
         } else if (
           ct.kind === "scalar" &&
           ct.scalar === "date" &&
@@ -9715,6 +9830,7 @@ export class Engine {
     // bind the supplied values up front so a bad bind fails before any row is stored.
     const rowsIn = ins.source.rows;
     const ptypes = new ParamTypes();
+    const valueExprs: (RExpr | null)[][] = [];
     for (const values of rowsIn) {
       if (values.length !== arity) {
         const which = ins.columns !== null ? "target columns are" : "columns are";
@@ -9735,6 +9851,9 @@ export class Engine {
           }
         }
       }
+      valueExprs.push(
+        this.resolveInsertRowExprs(values, table.columns, provided, ctx.bindings, ptypes),
+      );
     }
     // GENERATED ALWAYS gate (sequences.md §13.3): an explicit (non-DEFAULT) value targeting an
     // ALWAYS identity column without OVERRIDING SYSTEM VALUE is 428C9. Statement-level — fires
@@ -9766,6 +9885,9 @@ export class Engine {
     // RETURNING projection. The meter is created here (before materialization) so a
     // DEFAULT-keyword expression default charges it too.
     const meter = this.session.newMeter();
+    // Uncorrelated subqueries in VALUES expression slots fold once, before any row is materialized
+    // (cost.md §3) — a VALUES slot has no outer row to correlate with.
+    this.foldValueExprs(valueExprs, bound, ctx, meter);
 
     // Materialize each row into its value-position-indexed candidates (length arity, checked
     // above), resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that column's
@@ -9774,7 +9896,8 @@ export class Engine {
     const useSingle = singleValuesInsertEligible(rowsIn.length, cplan !== null);
     let singleValues: Value[] | null = null;
     const rows: Value[][] = [];
-    for (const values of rowsIn) {
+    for (let r = 0; r < rowsIn.length; r++) {
+      const values = rowsIn[r]!;
       const rv: Value[] = new Array(arity);
       for (let i = 0; i < n; i++) {
         const col = table.columns[i]!;
@@ -9787,6 +9910,10 @@ export class Engine {
           const ct = store.columnTypes()[i]!;
           if (iv.kind === "default") {
             rv[p] = this.evalDefault(col, defaultExprs[i]!, stmtRng, meter);
+          } else if (iv.kind === "expr") {
+            // A general expression → its resolved tree, evaluated for this row (metered);
+            // insertRows then store-coerces the value.
+            rv[p] = this.evalValueExpr(valueExprs[r]![p], bound, stmtRng, ctx, meter);
           } else if (
             ct.kind === "scalar" &&
             ct.scalar === "date" &&
@@ -26605,6 +26732,9 @@ export type InsertValuesPlan = {
   colls: (Collation | null)[];
   provided: number[];
   arity: number;
+  // The resolved general-expression slots of the VALUES list (spec/design/grammar.md §16), indexed
+  // [row][value position]. A row with no expression slot holds an empty array.
+  valueExprs: (RExpr | null)[][];
   returning: { nodes: RExpr[]; names: string[]; types: string[] } | null;
   ptys: ScalarType[];
   cacheable: boolean;
