@@ -1334,9 +1334,14 @@ second run flat):
 
 Batching the pulled site saves ~40 ns/row in Go and ~70 ns/row in TS, and costs Rust ~25 ns/row: the
 window must keep up to 64 freshly cloned rows alive, which defeats the allocator's per-row reuse (a
-window of ≤ 8 rows measured no overhead, and 32–1,024 rows all about the same). Recycling row buffers
-in the Rust scan is the follow-on if that matters. Not prefetching single-row kernels made the
-buffered `row` bench ~7% faster in Rust and ~3% in TS.
+window of ≤ 8 rows measured no overhead, and 32–1,024 rows all about the same). Not prefetching
+single-row kernels made the buffered `row` bench ~7% faster in Rust and ~3% in TS.
+
+The Rust storage scan then began decoding each window refill into the spent window's row buffers
+(`StoreScan::next_row_into`; the sort/spool windows still take owned rows), so a steady-state refill
+allocates no rows. Rust p50 per row, median of three runs before → after: `stream_none` 228 → 224,
+`stream_row` 248 → 244, `stream_batch` 291 → 247 — the window's retention cost is gone, and batching
+the pulled site now costs Rust nothing measurable against the single-row kernel.
 
 The triples exist for the wrapped bindings, where each call crosses a language boundary and batching
 amortizes it. A wrapped driver joins them when its binding exposes host functions; the Ruby gem does

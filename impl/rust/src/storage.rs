@@ -72,6 +72,15 @@ impl StoreScan {
         self.cursor.next_row(src_ref)
     }
 
+    /// [`next_row`](Self::next_row) into a caller-owned buffer, reusing its allocation (the read-ahead
+    /// window's recycled rows, extensibility.md §4.2.1): `false` at the end. On error `out` holds a
+    /// partial row the caller must discard.
+    pub(crate) fn next_row_into(&mut self, out: &mut Row) -> Result<bool> {
+        let src = make_src(&self.store.paging, &self.store.col_types);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        self.cursor.next_row_into(src_ref, out)
+    }
+
     /// Materialize the unfetched values in the columns `mask` selects, in place, through the snapshot's
     /// pager (large-values.md §14) — the per-row resolve step of a streaming pipeline. Delegates to the
     /// owned snapshot store, so it reads through the same pinned pages the scan walks.

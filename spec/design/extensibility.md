@@ -449,8 +449,10 @@ batch-of-one would stop pulling), and for a sort, its remaining windowed rows. W
 window is one row — batch-of-one. The window is narrower than the 1024-row in-hand chunk because,
 unlike a buffer the site already holds, it keeps freshly pulled rows alive only to batch: that
 retention is pure overhead in a core whose kernel call is cheap (Rust measured ~25–30 ns per row
-above a few rows, about the same from 32 to 1024 rows — benchmarks.md §8.2), so the window is kept
-small while still cutting a wrapped binding's boundary crossings 64-fold.
+above a few rows, about the same from 32 to 1024 rows, until its storage-scan window began decoding
+each refill into the spent window's row buffers — benchmarks.md §8.2), so the window is kept small
+while still cutting a wrapped binding's boundary crossings 64-fold. Recycling is a per-core
+allocation choice, invisible to rows, cost, and errors.
 
 **Sites.** The prefetch runs at:
 

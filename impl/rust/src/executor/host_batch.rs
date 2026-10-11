@@ -19,9 +19,9 @@ use std::cell::{Cell, RefCell};
 /// The largest chunk a site prefetches (extensibility.md §4.2.1).
 pub(crate) const HOST_BATCH_ROWS: usize = 1024;
 
-/// The largest read-ahead window a pulled site fills (extensibility.md §4.2.1): every pulled row is a
-/// fresh allocation the window keeps alive only to batch, so the window stays small — still 64× fewer
-/// kernel crossings.
+/// The largest read-ahead window a pulled site fills (extensibility.md §4.2.1): the window keeps its
+/// rows alive only to batch, so it stays small — still 64× fewer kernel crossings. A storage-scan
+/// window decodes each refill into its spent rows, so it allocates no rows in steady state.
 pub(crate) const READ_AHEAD_ROWS: usize = 64;
 
 /// One eligible call node's prefetched outcomes over the site's current chunk.
@@ -326,21 +326,23 @@ impl ReadAhead {
         })
     }
 
-    /// Point the window at a new source (the next interval of an interval-set scan).
+    /// Point the window at a new source (the next interval of an interval-set scan). The spent
+    /// window's rows are kept, to be overwritten by the next fill.
     pub(crate) fn restart(&mut self) {
-        self.rows.clear();
-        self.pos = 0;
+        self.pos = self.rows.len();
         self.deferred = None;
         self.ended = false;
     }
 
     /// The window index of the next source row, refilling the window with up to `cap()` rows from
-    /// `pull` once it is spent (`cap` is asked only then); `None` at the source's end; or the deferred source error once every
-    /// row read before it has been handed out.
+    /// `pull` once it is spent (`cap` is asked only then); `None` at the source's end; or the deferred
+    /// source error once every row read before it has been handed out. `pull` decodes the next source
+    /// row into the buffer it is handed — a spent window row, so a steady-state refill allocates no
+    /// rows — and reports `false` at the source's end.
     pub(crate) fn next(
         &mut self,
         cap: impl FnOnce() -> usize,
-        mut pull: impl FnMut() -> Result<Option<Row>>,
+        mut pull: impl FnMut(&mut Row) -> Result<bool>,
     ) -> Result<Option<usize>> {
         if self.pos == self.rows.len() {
             if let Some(e) = self.deferred.take() {
@@ -349,16 +351,19 @@ impl ReadAhead {
             if self.ended {
                 return Ok(None);
             }
-            self.rows.clear();
             self.pos = 0;
             for b in [&self.filter, &self.project].into_iter().flatten() {
                 b.reset();
             }
             let cap = cap().max(1);
-            while self.rows.len() < cap {
-                match pull() {
-                    Ok(Some(row)) => self.rows.push(row),
-                    Ok(None) => {
+            let mut filled = 0;
+            while filled < cap {
+                if filled == self.rows.len() {
+                    self.rows.push(Row::new());
+                }
+                match pull(&mut self.rows[filled]) {
+                    Ok(true) => filled += 1,
+                    Ok(false) => {
                         self.ended = true;
                         break;
                     }
@@ -368,7 +373,10 @@ impl ReadAhead {
                     }
                 }
             }
-            if self.rows.is_empty() {
+            // Drop the rows past this fill (a short fill, or the slot a failed pull left partial) so
+            // the window holds exactly the rows it hands out — no stale row pins a page block.
+            self.rows.truncate(filled);
+            if filled == 0 {
                 return match self.deferred.take() {
                     Some(e) => Err(e),
                     None => Ok(None),
@@ -377,6 +385,24 @@ impl ReadAhead {
         }
         self.pos += 1;
         Ok(Some(self.pos - 1))
+    }
+
+    /// [`next`](Self::next) over a source that hands out owned rows (the sort / spool emitters): each
+    /// pulled row replaces a spent window row.
+    pub(crate) fn next_owned(
+        &mut self,
+        cap: impl FnOnce() -> usize,
+        mut pull: impl FnMut() -> Result<Option<Row>>,
+    ) -> Result<Option<usize>> {
+        self.next(cap, |out| {
+            Ok(match pull()? {
+                Some(row) => {
+                    *out = row;
+                    true
+                }
+                None => false,
+            })
+        })
     }
 
     /// Make window row `i` current for `batch` (one of this window's), prefetching from it if needed.

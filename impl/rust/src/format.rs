@@ -4137,6 +4137,16 @@ impl PackedLeaf {
             .collect()
     }
 
+    /// [`row`](Self::row) into a caller-owned buffer, reusing its allocation. On error `out` holds a
+    /// partial row the caller must discard.
+    pub(crate) fn row_into(&self, i: usize, out: &mut Vec<Value>) -> Result<()> {
+        out.clear();
+        for c in 0..self.col_types.len() {
+            out.push(self.value(c, i)?);
+        }
+        Ok(())
+    }
+
     /// The shared page block — the buffer-pool pin (§7). Exposed for the fault-path invariant tests.
     #[cfg(test)]
     pub(crate) fn block(&self) -> &Arc<Vec<u8>> {

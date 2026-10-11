@@ -182,7 +182,7 @@ fn scan_stream_table_interval(
         loop {
             let remaining = plan.limit.map(|l| offset.saturating_add(l) - *passed);
             let cap = || read_ahead_cap(meter, COSTS.storage_row_read, remaining);
-            let Some(i) = ra.next(cap, || scan.next_row())? else {
+            let Some(i) = ra.next(cap, |out| scan.next_row_into(out))? else {
                 return Ok(true);
             };
             let ra: &ReadAhead = ra;
@@ -2366,7 +2366,9 @@ impl Engine {
                         let cap = || {
                             read_ahead_cap(&meter, COSTS.row_produced, Some((remaining - k) as i64))
                         };
-                        let i = ra.next(cap, || rows.next())?.expect("spool cardinality");
+                        let i = ra
+                            .next_owned(cap, || rows.next())?
+                            .expect("spool cardinality");
                         if !charged {
                             meter.guard()?;
                             meter.charge(COSTS.row_produced);
@@ -2443,7 +2445,7 @@ impl Engine {
                                 )
                             };
                             let i = ra
-                                .next(cap, || sorted.next())?
+                                .next_owned(cap, || sorted.next())?
                                 .expect("the sorter yields exactly the windowed rows");
                             let ra: &ReadAhead = ra;
                             (&ra.rows[i], Some((ra, i)))

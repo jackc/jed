@@ -283,6 +283,19 @@ impl Node {
         }
     }
 
+    /// [`row_at`](Self::row_at) into a caller-owned buffer, reusing its allocation (the read-ahead
+    /// window's recycled rows, extensibility.md §4.2.1). On error `out` holds a partial row the caller
+    /// must discard.
+    pub(crate) fn row_at_into(&self, i: usize, out: &mut Row) -> Result<()> {
+        match &self.packed {
+            None => {
+                out.clone_from(&self.vals[i]);
+                Ok(())
+            }
+            Some(p) => p.row_into(i, out),
+        }
+    }
+
     /// Reconstruct **only** column `c` of row `i` — the touched-column path (packed-leaf.md §4/§6,
     /// the `OP_Column`/`slot_getsomeattrs` model PAX's column regions make O(1)). A **Decoded** leaf
     /// clones `vals[i][c]`; a **Packed** leaf decodes the single column span and reads no other column.
@@ -1109,64 +1122,60 @@ impl RangeCursor {
     /// or pops an exhausted frame. `src` is supplied per call (rebuilt cheaply by the caller) so the
     /// cursor itself borrows nothing — see [`RangeCursor`].
     pub(crate) fn next(&mut self, src: Option<&dyn LeafSource>) -> Result<Option<(Vec<u8>, Row)>> {
-        self.next_inner(src, true)
-            .map(|entry| entry.map(|(key, row)| (key.expect("key requested"), row)))
+        self.advance(src, |node, p| {
+            Ok((node.key_at(p).to_vec(), node.row_at(p)?))
+        })
     }
 
     /// Row-only pull used by SELECT. It follows the same frame transitions as [`next`](Self::next)
     /// but does not copy the leaf's storage key merely to discard it in the executor.
     pub(crate) fn next_row(&mut self, src: Option<&dyn LeafSource>) -> Result<Option<Row>> {
-        self.next_inner(src, false)
-            .map(|entry| entry.map(|(_, row)| row))
+        self.advance(src, |node, p| node.row_at(p))
     }
 
-    fn next_inner(
+    /// [`next_row`](Self::next_row) into a caller-owned buffer, reusing its allocation: `false` at the
+    /// end (`out` untouched). On error `out` holds a partial row the caller must discard.
+    pub(crate) fn next_row_into(
         &mut self,
         src: Option<&dyn LeafSource>,
-        with_key: bool,
-    ) -> Result<Option<(Option<Vec<u8>>, Row)>> {
+        out: &mut Row,
+    ) -> Result<bool> {
+        Ok(self
+            .advance(src, |node, p| node.row_at_into(p, out))?
+            .is_some())
+    }
+
+    /// Advance the frame stack to the next in-bound leaf entry and `emit` it, or `None` when the
+    /// traversal is exhausted. Each step emits a leaf entry, descends into (and faults `src`) a
+    /// child, or pops an exhausted frame.
+    fn advance<T>(
+        &mut self,
+        src: Option<&dyn LeafSource>,
+        emit: impl FnOnce(&Node, usize) -> Result<T>,
+    ) -> Result<Option<T>> {
         let reverse = self.reverse;
         loop {
-            let (emit, descend) = {
-                let frame = match self.stack.last_mut() {
-                    Some(f) => f,
-                    None => return Ok(None),
-                };
-                if frame.lo >= frame.hi {
-                    (None, None)
-                } else {
-                    let p = if reverse {
-                        frame.hi -= 1;
-                        frame.hi
-                    } else {
-                        let x = frame.lo;
-                        frame.lo += 1;
-                        x
-                    };
-                    if frame.is_leaf {
-                        (
-                            Some((
-                                with_key.then(|| frame.node.key_at(p).to_vec()),
-                                frame.node.row_at(p)?,
-                            )),
-                            None,
-                        )
-                    } else {
-                        (None, Some(p))
-                    }
-                }
+            let frame = match self.stack.last_mut() {
+                Some(f) => f,
+                None => return Ok(None),
             };
-            match (emit, descend) {
-                (Some(pair), _) => return Ok(Some(pair)),
-                (None, Some(i)) => {
-                    let parent = self.stack.last().expect("top frame present for descend");
-                    let ch = child(&parent.node, i, src)?;
-                    self.stack.push(ScanFrame::new(ch, &self.bound));
-                }
-                (None, None) => {
-                    self.stack.pop();
-                }
+            if frame.lo >= frame.hi {
+                self.stack.pop();
+                continue;
             }
+            let p = if reverse {
+                frame.hi -= 1;
+                frame.hi
+            } else {
+                let x = frame.lo;
+                frame.lo += 1;
+                x
+            };
+            if frame.is_leaf {
+                return emit(&frame.node, p).map(Some);
+            }
+            let ch = child(&frame.node, p, src)?;
+            self.stack.push(ScanFrame::new(ch, &self.bound));
         }
     }
 }

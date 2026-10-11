@@ -208,6 +208,20 @@ impl StreamingFeed {
         }
     }
 
+    /// [`next_row`](Self::next_row) into a recycled read-ahead row (extensibility.md §4.2.1).
+    fn next_row_into(&mut self, out: &mut Row) -> Result<bool> {
+        match self {
+            StreamingFeed::Range(scan) => scan.next_row_into(out),
+            StreamingFeed::Point(scan) => Ok(match scan.next_row()? {
+                Some(row) => {
+                    *out = row;
+                    true
+                }
+                None => false,
+            }),
+        }
+    }
+
     fn resolve_columns(&self, row: &mut Row, mask: &[bool]) -> Result<()> {
         match self {
             StreamingFeed::Range(scan) => scan.resolve_columns(row, mask),
@@ -276,7 +290,7 @@ impl crate::cursor::RowStream for StreamingScan {
                         .limit
                         .map(|l| self.offset.saturating_add(l) - self.passed);
                     let cap = || read_ahead_cap(&self.meter, COSTS.storage_row_read, remaining);
-                    let Some(i) = ra.next(cap, || self.scan.next_row())? else {
+                    let Some(i) = ra.next(cap, |out| self.scan.next_row_into(out))? else {
                         self.done = true;
                         self.seen.release(); // the scan ended (memory.md §6.2)
                         return Ok(None);
@@ -585,7 +599,9 @@ impl crate::cursor::RowStream for BufferedScan {
                         let cap = || {
                             read_ahead_cap(&self.meter, COSTS.row_produced, Some(*remaining as i64))
                         };
-                        let i = ra.next(cap, || rows.next())?.expect("spool cardinality");
+                        let i = ra
+                            .next_owned(cap, || rows.next())?
+                            .expect("spool cardinality");
                         let ra: &ReadAhead = ra;
                         (&ra.rows[i], Some((ra, i)))
                     }
@@ -662,7 +678,7 @@ impl crate::cursor::RowStream for BufferedScan {
                             read_ahead_cap(&self.meter, COSTS.row_produced, Some(*remaining as i64))
                         };
                         let i = ra
-                            .next(cap, || sorted.next())?
+                            .next_owned(cap, || sorted.next())?
                             .expect("the sorter yields exactly the windowed rows");
                         let ra: &ReadAhead = ra;
                         (&ra.rows[i], Some((ra, i)))
