@@ -842,7 +842,7 @@ func (db *engine) deferredColumnMeta(stmt statement) ([]string, []string, error)
 		// The planning prefix of runWith (cte.md): plan the CTE bindings, then the body with them
 		// visible. The body's columns are the WITH's output columns.
 		var bindings []*cteBinding
-		bindings, err = db.planCteBindings(stmt.With.Ctes, stmt.With.Recursive, nil, ptypes)
+		bindings, err = db.planCteBindings(stmt.With.Ctes, stmt.With.Recursive, nil, nil, ptypes)
 		if err == nil {
 			bodyQ := stmt.With.Body.AsQuery() // pure-query WITH (DML excluded by stmtIsWrite)
 			plan, err = db.planQuery(*bodyQ, nil, bindings, ptypes)
@@ -2183,8 +2183,10 @@ func (db *engine) materializeRelRows(plan *selectPlan, ri int, params []Value, o
 		case cteInline:
 			// Only a plain (query) CTE is ever inlined; a data-modifying CTE is always materialized
 			// (writable-cte.md §3), so its buffer was filled above.
+			// The body runs in the frame of the WITH node that declared it (cte.md §7) — not this
+			// reference site's, which may sit deeper.
 			cplan := env.ctes.bindings[ci].plan
-			r, err := db.execQueryPlan(&cplan, outer, params, env.ctes)
+			r, err := db.execQueryPlan(&cplan, env.ctes.outers[ci], params, env.ctes)
 			if err != nil {
 				return nil, err
 			}

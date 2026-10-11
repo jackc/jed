@@ -316,7 +316,7 @@ impl Engine {
         wq: &WithQuery,
     ) -> Result<(Vec<CteBinding>, Vec<CteMode>, Option<QueryPlan>)> {
         let mut ptypes = ParamTypes::default();
-        let bindings = self.plan_cte_bindings(&wq.ctes, wq.recursive, &[], &mut ptypes)?;
+        let bindings = self.plan_cte_bindings(&wq.ctes, wq.recursive, &[], None, &mut ptypes)?;
         let primary = match &wq.body {
             CteBody::Query(query) => {
                 let visible: Vec<&CteBinding> = bindings.iter().collect();

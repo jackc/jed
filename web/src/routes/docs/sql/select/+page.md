@@ -268,6 +268,11 @@ shadows the outer one after it is declared; its own non-recursive body still see
 because a CTE cannot see itself. Data-modifying CTEs (`INSERT`/`UPDATE`/`DELETE`) stay top-level only,
 as in PostgreSQL.
 
+Inside a subquery, a nested CTE's body may reference columns of an *enclosing* query level, like any
+correlated subquery: `SELECT o.id, (WITH c AS (SELECT o.x AS v) SELECT v FROM c) FROM o` returns each
+row's `x`. It still cannot see the `FROM` of the query its `WITH` belongs to. The subquery then runs
+once per outer row, and a materialized CTE is recomputed for each of those runs.
+
 ## Derived tables (`FROM (SELECT …) AS t`)
 
 A `FROM` item can be a parenthesized subquery used as a relation — a **derived table**. It is an

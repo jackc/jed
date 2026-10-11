@@ -397,7 +397,7 @@ type explainWithPlan struct {
 
 func (db *engine) planExplainWithDml(wq *withQuery) (*explainWithPlan, error) {
 	ptypes := &paramTypes{}
-	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, nil, ptypes)
+	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, nil, nil, ptypes)
 	if err != nil {
 		return nil, err
 	}

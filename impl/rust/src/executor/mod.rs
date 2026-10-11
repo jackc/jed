@@ -3235,6 +3235,22 @@ pub(crate) struct WithPlan {
     inherited_len: usize,
 }
 
+impl WithPlan {
+    /// Every planned query of this node's own CTE bindings — each body and, for a recursive CTE, its
+    /// recursive term. They are planned against the same scope as the body (spec/design/cte.md §7),
+    /// so an outer reference in one sits in the node's own correlation frame.
+    pub(crate) fn binding_plans(&self) -> impl Iterator<Item = &QueryPlan> {
+        self.bindings.iter().flat_map(|b| {
+            let body = match &b.source {
+                CteSource::Query(plan) => Some(plan),
+                CteSource::Dml(_) => None,
+            };
+            body.into_iter()
+                .chain(b.recursive.as_ref().map(|rt| &rt.plan))
+        })
+    }
+}
+
 impl QueryPlan {
     /// The output column types — for a scalar/IN subquery's plan-time column-count check (42601)
     /// and its folded/element type.
@@ -4002,11 +4018,16 @@ pub(crate) enum CteMode {
 /// placeholder for an `Inline` one, whose body is run in place from `bindings[ci].source` instead).
 /// `bindings` also serves a data-modifying CTE's own inner queries, which resolve against the
 /// earlier bindings when the writable-CTE orchestrator executes them (writable-cte.md §2).
+/// `outers` holds, per binding, the outer-row environment of the `WITH` node that declared it: a
+/// nested `WITH`'s CTE bodies are planned against the scope enclosing that node (cte.md §7), so an
+/// inlined body run at a deeper reference site still reads that node's frames. Top-level bindings
+/// have an empty environment.
 #[derive(Clone, Copy)]
 pub(crate) struct CteCtx<'a> {
     modes: &'a [CteMode],
     bindings: &'a [&'a CteBinding],
     buffers: &'a [&'a [Row]],
+    outers: &'a [&'a [&'a [Value]]],
 }
 
 impl<'a> CteCtx<'a> {
@@ -4016,6 +4037,7 @@ impl<'a> CteCtx<'a> {
             modes: &[],
             bindings: &[],
             buffers: &[],
+            outers: &[],
         }
     }
 
@@ -4027,6 +4049,7 @@ impl<'a> CteCtx<'a> {
             modes: &self.modes[..len],
             bindings: &self.bindings[..len],
             buffers: &self.buffers[..len],
+            outers: &self.outers[..len],
         }
     }
 }
@@ -4037,11 +4060,25 @@ pub(crate) struct CteCtxView<'a> {
     modes: Vec<CteMode>,
     bindings: Vec<&'a CteBinding>,
     buffers: Vec<&'a [Row]>,
+    outers: Vec<&'a [&'a [Value]]>,
 }
 
 impl<'a> CteCtxView<'a> {
+    /// Layer top-level bindings (no enclosing outer-row environment) over `inherited`.
     fn extend(
         inherited: CteCtx<'a>,
+        modes: &'a [CteMode],
+        bindings: &'a [CteBinding],
+        buffers: &'a [Vec<Row>],
+    ) -> CteCtxView<'a> {
+        CteCtxView::extend_at(inherited, &[], modes, bindings, buffers)
+    }
+
+    /// Layer a `WITH` node's bindings over `inherited`, recording `outer` — the node's outer-row
+    /// environment — as each new binding's body frame (spec/design/cte.md §7).
+    fn extend_at(
+        inherited: CteCtx<'a>,
+        outer: &'a [&'a [Value]],
         modes: &'a [CteMode],
         bindings: &'a [CteBinding],
         buffers: &'a [Vec<Row>],
@@ -4050,6 +4087,7 @@ impl<'a> CteCtxView<'a> {
             modes: Vec::with_capacity(inherited.modes.len() + modes.len()),
             bindings: Vec::with_capacity(inherited.bindings.len() + bindings.len()),
             buffers: Vec::with_capacity(inherited.buffers.len() + buffers.len()),
+            outers: Vec::with_capacity(inherited.outers.len() + bindings.len()),
         };
         view.modes.extend_from_slice(inherited.modes);
         view.modes.extend_from_slice(modes);
@@ -4057,6 +4095,9 @@ impl<'a> CteCtxView<'a> {
         view.bindings.extend(bindings.iter());
         view.buffers.extend_from_slice(inherited.buffers);
         view.buffers.extend(buffers.iter().map(Vec::as_slice));
+        view.outers.extend_from_slice(inherited.outers);
+        view.outers
+            .extend(std::iter::repeat_n(outer, bindings.len()));
         view
     }
 
@@ -4065,6 +4106,7 @@ impl<'a> CteCtxView<'a> {
             modes: &self.modes,
             bindings: &self.bindings,
             buffers: &self.buffers,
+            outers: &self.outers,
         }
     }
 }

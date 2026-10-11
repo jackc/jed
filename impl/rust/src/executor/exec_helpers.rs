@@ -964,10 +964,14 @@ pub(crate) fn query_plan_references_outer(plan: &QueryPlan, depth: usize) -> boo
             .iter()
             .flatten()
             .any(|e| rexpr_references_outer(e, depth)),
-        // A nested `WITH` adds no correlation frame: its body is at the same depth, and the CTE
-        // bodies are planned `parent = None` (they hold no outer reference), so only the body can
-        // correlate to an enclosing scope (spec/design/cte.md §7).
-        QueryPlan::With(wp) => query_plan_references_outer(&wp.body, depth),
+        // A nested `WITH` adds no correlation frame: its body and its CTE bodies are planned
+        // against the same enclosing scope, so each is walked at this depth (spec/design/cte.md §7).
+        QueryPlan::With(wp) => {
+            query_plan_references_outer(&wp.body, depth)
+                || wp
+                    .binding_plans()
+                    .any(|p| query_plan_references_outer(p, depth))
+        }
     }
 }
 

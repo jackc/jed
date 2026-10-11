@@ -2522,8 +2522,8 @@ correlated (it is never folded once, §26); it is re-executed per enclosing row,
 place each time (the body itself is still materialized once per run of the owning query — it is not
 re-run per sibling row, so a `RIGHT`/`FULL JOIN` to it stays legal). At top level there is no
 enclosing query, so such a reference is unresolved. Its cost is the ordinary per-outer-row sum of
-the inline body costs — no new unit. (Non-recursive **CTE** bodies stay independent, `parent =
-None` — [cte.md](cte.md) §2; a separate, documented narrowing.) A derived table itself nests freely: its
+the inline body costs — no new unit. (A nested `WITH`'s **CTE** bodies follow the same rule — they
+see the levels enclosing the query that owns the `WITH`, never its FROM, [cte.md](cte.md) §7.) A derived table itself nests freely: its
 body may contain further derived tables, joins, and the expression-position subqueries of §26, each
 counting toward the parser's `MAX_EXPR_DEPTH` nesting limit (`54001`, [cost.md](cost.md) §7) so a
 pathologically nested `FROM (SELECT * FROM (SELECT …))` aborts before overflowing the native stack.

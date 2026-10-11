@@ -4595,7 +4595,7 @@ export class Engine {
     body: CteBody;
   } {
     const ptypes = new ParamTypes();
-    const bindings = this.planCteBindings(wq.ctes, wq.recursive, [], ptypes);
+    const bindings = this.planCteBindings(wq.ctes, wq.recursive, [], null, ptypes);
     const query = cteBodyAsQuery(wq.body);
     const primary = query === null ? null : this.planQuery(query, null, bindings, ptypes);
     for (const cte of wq.ctes) {
@@ -12123,18 +12123,22 @@ export class Engine {
   }
 
   // planCteBindings plans every CTE in a WITH list into bindings (spec/design/cte.md §2,
-  // writable-cte.md). Each body is planned against the prefix of EARLIER bindings (parent = null — a
-  // body is an independent query, NOT correlated to a reference site). Under WITH RECURSIVE a query
-  // CTE that references its own name is the recursive shape (its binding is pushed BEFORE planning the
-  // recursive term, so the self-reference resolves to it). A DATA-MODIFYING CTE body resolves only its
-  // RETURNING schema here (its effect runs later, in the orchestrator) — a data-modifying body is
-  // never the recursive UNION shape, so it is always non-recursive. The `refs` counters are bumped as
-  // later query bodies / a query primary reference each binding (a data-modifying part's references
-  // are static-counted by the orchestrator, since it is not planned here).
+  // writable-cte.md). Each body is planned against the prefix of EARLIER bindings and against
+  // `parent` — the scope enclosing the query that owns the WITH (null at the statement top level; a
+  // nested WITH passes its own parent, so a body may correlate to an enclosing query level but never
+  // sees the owning query's FROM, cte.md §7). A body is never correlated to a reference site. Under
+  // WITH RECURSIVE a query CTE that references its own name is the recursive shape (its binding is
+  // pushed BEFORE planning the recursive term, so the self-reference resolves to it). A
+  // DATA-MODIFYING CTE body resolves only its RETURNING schema here (its effect runs later, in the
+  // orchestrator) — a data-modifying body is never the recursive UNION shape, so it is always
+  // non-recursive. The `refs` counters are bumped as later query bodies / a query primary reference
+  // each binding (a data-modifying part's references are static-counted by the orchestrator, since
+  // it is not planned here).
   private planCteBindings(
     ctes: Cte[],
     recursive: boolean,
     inherited: CteBinding[],
+    parent: Scope | null,
     ptypes: ParamTypes,
   ): CteBinding[] {
     const bindings: CteBinding[] = [];
@@ -12151,7 +12155,7 @@ export class Engine {
       if (shape.recursive) {
         // The body is `anchor UNION[ALL] recursive_term` (analyzeRecursiveCte verified).
         const so = bodyQuery as SetOp;
-        const anchorPlan = this.planQuery(so.lhs, null, [...inherited, ...bindings], ptypes);
+        const anchorPlan = this.planQuery(so.lhs, parent, [...inherited, ...bindings], ptypes);
         const table = cteSyntheticTable(lname, anchorPlan, cte.columns);
         bindings.push({
           name: lname,
@@ -12162,7 +12166,7 @@ export class Engine {
           refs: 0,
         });
         const bi = bindings.length - 1;
-        const rhsPlan = this.planQuery(so.rhs, null, [...inherited, ...bindings], ptypes);
+        const rhsPlan = this.planQuery(so.rhs, parent, [...inherited, ...bindings], ptypes);
         const anchorSrc = bindings[bi]!.source;
         if (anchorSrc.kind !== "query") {
           throw new Error("the anchor binding was just pushed as a query source");
@@ -12172,7 +12176,7 @@ export class Engine {
         continue;
       }
       if (bodyQuery !== null) {
-        const plan = this.planQuery(bodyQuery, null, [...inherited, ...bindings], ptypes);
+        const plan = this.planQuery(bodyQuery, parent, [...inherited, ...bindings], ptypes);
         const table = cteSyntheticTable(lname, plan, cte.columns);
         bindings.push({
           name: lname,
@@ -12268,7 +12272,7 @@ export class Engine {
   // operations — a sum of the parts.
   private runWith(wq: WithQuery, params: Value[]): SelectResult {
     const ptypes = new ParamTypes();
-    const bindings = this.planCteBindings(wq.ctes, wq.recursive, [], ptypes);
+    const bindings = this.planCteBindings(wq.ctes, wq.recursive, [], null, ptypes);
     // (2) Plan the main body with all bindings visible (the pure-query path always has a query
     //     primary — a data-modifying primary routes to executeWithDml).
     const bodyQuery = cteBodyAsQuery(wq.body);
@@ -12278,10 +12282,10 @@ export class Engine {
     const plan = this.planQuery(bodyQuery, null, bindings, ptypes);
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
     const modes = cteModes(bindings);
-    const { buffers, totalCost } = this.materializeCtes(bindings, modes, bound, EMPTY_CTE_CTX);
+    const { buffers, totalCost } = this.materializeCtes(bindings, modes, bound, EMPTY_CTE_CTX, []);
 
     // (5) Fold + execute the main body against the full CTE context.
-    const ctx: CteCtx = { modes, bindings, buffers };
+    const ctx = topLevelCteCtx(modes, bindings, buffers);
     const subqueryCost = { value: 0n };
     this.foldUncorrelatedInPlan(plan, bound, ctx, subqueryCost);
     const r = this.execQueryPlan(plan, [], bound, ctx);
@@ -12295,12 +12299,14 @@ export class Engine {
   // loop for the pure-query and writable-CTE paths' query/recursive CTEs. A data-modifying CTE is NOT
   // run here (the orchestrator runs it for its effect — runWithDml); its buffer slot is left empty for
   // the orchestrator to fill. Returns the filled buffers + the accrued materialization cost (a later
-  // body sees the earlier buffers).
+  // body sees the earlier buffers). `outer` is the declaring WITH node's outer-row environment (empty
+  // at top level), the frame every body runs in (cte.md §7).
   private materializeCtes(
     bindings: CteBinding[],
     modes: CteMode[],
     bound: Value[],
     inherited: CteCtx,
+    outer: Row[],
   ): { buffers: Row[][]; totalCost: bigint } {
     const totalCost = { value: 0n };
     const buffers: Row[][] = [];
@@ -12324,18 +12330,25 @@ export class Engine {
           buffers,
           bound,
           inherited,
+          outer,
           totalCost,
         );
       } else if (bindings[i]!.source.kind === "dml") {
         // A data-modifying CTE's buffer is filled by the orchestrator, not here.
         buf = [];
       } else if (modes[i] === "materialize") {
-        const ctx = extendCteCtx(inherited, modes.slice(0, i), bindings.slice(0, i), buffers);
+        const ctx = extendCteCtx(
+          inherited,
+          outer,
+          modes.slice(0, i),
+          bindings.slice(0, i),
+          buffers,
+        );
         const src = bindings[i]!.source;
         if (src.kind !== "query") {
           throw new Error("the data-modifying arm was handled above");
         }
-        const r = this.execQueryPlan(src.plan, [], bound, ctx);
+        const r = this.execQueryPlan(src.plan, outer, bound, ctx);
         totalCost.value += r.cost;
         buf = r.rows;
       } else {
@@ -12361,6 +12374,7 @@ export class Engine {
     priorBuffers: Row[][],
     params: Value[],
     inherited: CteCtx,
+    outer: Row[],
     totalCost: { value: bigint },
   ): Row[] {
     const anchorSrc = bindings[ci]!.source;
@@ -12387,9 +12401,9 @@ export class Engine {
     // Evaluate the anchor: its rows seed both the result and the first working table.
     const ar = this.execQueryPlan(
       anchorPlan,
-      [],
+      outer,
       params,
-      extendCteCtx(inherited, modes.slice(0, ci), bindings.slice(0, ci), priorBuffers),
+      extendCteCtx(inherited, outer, modes.slice(0, ci), bindings.slice(0, ci), priorBuffers),
     );
     totalCost.value += ar.cost;
     guard(totalCost.value);
@@ -12433,10 +12447,11 @@ export class Engine {
       working = [];
       const rr = this.execQueryPlan(
         rt.plan,
-        [],
+        outer,
         params,
         extendCteCtx(
           inherited,
+          outer,
           modes.slice(0, ci + 1),
           bindings.slice(0, ci + 1),
           rhsBuffers,
@@ -12488,7 +12503,7 @@ export class Engine {
     const { ctes, body, recursive } = wq;
     const ptypes = new ParamTypes();
     // (1) Plan every CTE binding (query plans + data-modifying RETURNING schemas).
-    const bindings = this.planCteBindings(ctes, recursive, [], ptypes);
+    const bindings = this.planCteBindings(ctes, recursive, [], null, ptypes);
     // (2) Plan a query primary now (to bump refs + surface resolution errors, incl. a 0A000 FROM
     //     reference to a no-RETURNING data-modifying CTE). A data-modifying primary is resolved and
     //     run later (it sees the bindings via the threaded context); its references are
@@ -12539,23 +12554,16 @@ export class Engine {
           buffers,
           bound,
           EMPTY_CTE_CTX,
+          [],
           totalCost,
         );
       } else if (bindings[i]!.source.kind === "dml") {
-        const ctx: CteCtx = {
-          modes: modes.slice(0, i),
-          bindings: bindings.slice(0, i),
-          buffers,
-        };
+        const ctx = topLevelCteCtx(modes.slice(0, i), bindings.slice(0, i), buffers);
         const { rows, cost } = this.execDmCte(i, bindings, bound, ctx);
         totalCost.value += cost;
         buf = rows;
       } else if (modes[i] === "materialize") {
-        const ctx: CteCtx = {
-          modes: modes.slice(0, i),
-          bindings: bindings.slice(0, i),
-          buffers,
-        };
+        const ctx = topLevelCteCtx(modes.slice(0, i), bindings.slice(0, i), buffers);
         const src = bindings[i]!.source;
         if (src.kind !== "query") {
           throw new Error("the data-modifying arm was handled above");
@@ -12571,7 +12579,7 @@ export class Engine {
     }
 
     // (4) Execute the primary against the full CTE context, adding the materialization cost.
-    const ctx: CteCtx = { modes, bindings, buffers };
+    const ctx = topLevelCteCtx(modes, bindings, buffers);
     let outcome: Outcome;
     if (body.kind === "select" || body.kind === "setOp" || body.kind === "withExpr") {
       const plan = primaryPlan!;
@@ -12655,8 +12663,9 @@ export class Engine {
 
   // planWithExpr plans a nested `WITH … query_expr` (spec/design/cte.md §7) into a WithPlan. Its CTEs
   // inherit the enclosing bindings and shadow same-named bindings from their declaration onward.
-  // The inner main query keeps the enclosing parent (so a LATERAL derived-table body still
-  // correlates to its left siblings), while CTE bodies stay independent (parent=null).
+  // The inner main query and the CTE bodies are both planned against the enclosing parent (so a
+  // LATERAL derived-table body still correlates to its left siblings, and a CTE body may read an
+  // enclosing query level — PostgreSQL; it never sees the owning query's FROM).
   // A data-modifying CTE here is rejected 0A000 — PostgreSQL restricts a DML-WITH to the top level.
   private planWithExpr(
     we: WithExpr,
@@ -12672,7 +12681,7 @@ export class Engine {
         );
       }
     }
-    const bindings = this.planCteBindings(we.ctes, we.recursive, ctes, ptypes);
+    const bindings = this.planCteBindings(we.ctes, we.recursive, ctes, parent, ptypes);
     const body = this.planQuery(we.body, parent, [...ctes, ...bindings], ptypes);
     return {
       kind: "with",
@@ -12723,8 +12732,9 @@ export class Engine {
 
   // execWithPlan executes a nested WITH plan (spec/design/cte.md §7): retain the exact inherited
   // prefix visible at plan time, materialize the local bindings once, layer them over that prefix,
-  // and run the inner body. The body still sees the outer row environment (so a
-  // LATERAL nested-WITH derived-table body correlates to its left siblings). The materialization cost
+  // and run the inner body. The body and the CTE bodies still see the outer row environment (so a
+  // LATERAL nested-WITH derived-table body correlates to its left siblings, and a CTE body reads an
+  // enclosing query level — each binding records `outer` as its body frame). The materialization cost
   // folds into the body's cost — the same shape as the top-level runWith (cte.md §3).
   private execWithPlan(
     plan: WithPlan,
@@ -12738,8 +12748,9 @@ export class Engine {
       plan.modes,
       params,
       inherited,
+      outer,
     );
-    const ctx = extendCteCtx(inherited, plan.modes, plan.bindings, buffers);
+    const ctx = extendCteCtx(inherited, outer, plan.modes, plan.bindings, buffers);
     const r = this.execQueryPlan(plan.body, outer, params, ctx);
     releaseCteBuffers(this.session.queryAccount, buffers);
     r.cost += totalCost;
@@ -15455,7 +15466,7 @@ export class Engine {
       return { columnNames: plan.columnNames, columnTypes: typeNames(plan.columnTypes) };
     }
     // The planning prefix of runWith (cte.md): plan the CTE bindings, then the body with them visible.
-    const bindings = this.planCteBindings(stmt.ctes, stmt.recursive, [], ptypes);
+    const bindings = this.planCteBindings(stmt.ctes, stmt.recursive, [], null, ptypes);
     const bodyQuery = cteBodyAsQuery(stmt.body); // pure-query WITH (DML excluded by stmtIsWrite)
     if (bodyQuery === null) throw new Error("a pure-query WITH is required here");
     const plan = this.planQuery(bodyQuery, null, bindings, ptypes);
@@ -16520,7 +16531,9 @@ export class Engine {
       if (src.kind !== "query") {
         throw new Error("a data-modifying CTE is always materialized, never inlined");
       }
-      const r = this.execQueryPlan(src.plan, outer, params, env.ctes);
+      // The body runs in the frame of the WITH node that declared it (cte.md §7) — not this
+      // reference site's, which may sit deeper.
+      const r = this.execQueryPlan(src.plan, env.ctes.outers[ci]!, params, env.ctes);
       meter.charge(r.cost);
       // The body's charged result becomes this relation's rows (memory.md §5.2), re-measured under
       // the relation's touched mask.
@@ -23816,9 +23829,11 @@ export function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolea
     return false;
   }
   if (plan.kind === "with") {
-    // A nested WITH adds no correlation frame: its body is at the same depth, and the CTE bodies are
-    // planned parent=null (no outer reference), so only the body can correlate (cte.md §7).
-    return queryPlanReferencesOuter(plan.body, depth);
+    // A nested WITH adds no correlation frame: its body and its CTE bodies are planned against the
+    // same enclosing scope, so each is walked at this depth (cte.md §7).
+    if (queryPlanReferencesOuter(plan.body, depth)) return true;
+    for (const p of withBindingPlans(plan)) if (queryPlanReferencesOuter(p, depth)) return true;
+    return false;
   }
   for (const j of plan.joins) if (j.on !== null && rexprReferencesOuter(j.on, depth)) return true;
   if (plan.filter !== null && rexprReferencesOuter(plan.filter, depth)) return true;
@@ -24553,9 +24568,10 @@ export function collectTouchedPlan(plan: QueryPlan, depth: number, touched: bool
   } else if (plan.kind === "values") {
     for (const row of plan.rows) for (const e of row) collectTouched(e, depth, touched);
   } else if (plan.kind === "with") {
-    // A nested WITH's correlated references live in its body (the CTE bodies are parent=null);
-    // recurse into the body at the same depth (spec/design/cte.md §7).
+    // A nested WITH's correlated references live in its body and its CTE bodies, all planned
+    // against the same enclosing scope; recurse into each at the same depth (cte.md §7).
     collectTouchedPlan(plan.body, depth, touched);
+    for (const p of withBindingPlans(plan)) collectTouchedPlan(p, depth, touched);
   } else {
     collectTouchedPlan(plan.lhs, depth, touched);
     collectTouchedPlan(plan.rhs, depth, touched);
@@ -26927,6 +26943,19 @@ export type WithPlan = {
   columnTypes: ResolvedType[];
 };
 
+// withBindingPlans returns every planned query of a nested WITH node's own CTE bindings — each body
+// and, for a recursive CTE, its recursive term (a data-modifying source has none). They are planned
+// against the same scope as the body (spec/design/cte.md §7), so an outer reference in one sits in
+// the node's own correlation frame.
+export function withBindingPlans(plan: WithPlan): QueryPlan[] {
+  const plans: QueryPlan[] = [];
+  for (const b of plan.bindings) {
+    if (b.source.kind === "query") plans.push(b.source.plan);
+    if (b.recursive !== null) plans.push(b.recursive.plan);
+  }
+  return plans;
+}
+
 // QueryPlan is a resolved query expression: a SELECT plan, a set-op plan, a VALUES-body relation, or
 // a nested WITH plan (mirrors QueryExpr's bodies). A VALUES plan is only ever produced as a
 // derived-table body.
@@ -27054,10 +27083,28 @@ export type DmStmt = Insert | Update | Delete;
 // CTE in list order, holding the materialized rows of a "materialize" CTE (an empty placeholder for
 // an "inline" one, whose body is run in place from `bindings[ci].source` instead). `bindings` also
 // serves a data-modifying CTE's own inner queries, which resolve against the earlier bindings when
-// the writable-CTE orchestrator executes them (writable-cte.md §2). EMPTY_CTE_CTX is the empty
-// context for every non-WITH execution path.
-export type CteCtx = { modes: CteMode[]; bindings: CteBinding[]; buffers: Row[][] };
-export const EMPTY_CTE_CTX: CteCtx = { modes: [], bindings: [], buffers: [] };
+// the writable-CTE orchestrator executes them (writable-cte.md §2). `outers` holds, per binding, the
+// outer-row environment of the WITH node that declared it: a nested WITH's CTE bodies are planned
+// against the scope enclosing that node (cte.md §7), so an inlined body run at a deeper reference
+// site still reads that node's frames. Top-level bindings have an empty environment. EMPTY_CTE_CTX
+// is the empty context for every non-WITH execution path.
+export type CteCtx = {
+  modes: CteMode[];
+  bindings: CteBinding[];
+  buffers: Row[][];
+  outers: Row[][];
+};
+export const EMPTY_CTE_CTX: CteCtx = { modes: [], bindings: [], buffers: [], outers: [] };
+
+// topLevelCteCtx builds the context of a statement-top-level WITH: its bindings have no enclosing
+// outer-row environment.
+export function topLevelCteCtx(
+  modes: CteMode[],
+  bindings: CteBinding[],
+  buffers: Row[][],
+): CteCtx {
+  return { modes, bindings, buffers, outers: bindings.map(() => []) };
+}
 
 export function prefixCteCtx(ctx: CteCtx, count: number): CteCtx {
   if (count < 0 || count > ctx.bindings.length) throw new Error("invalid inherited CTE prefix");
@@ -27065,11 +27112,15 @@ export function prefixCteCtx(ctx: CteCtx, count: number): CteCtx {
     modes: ctx.modes.slice(0, count),
     bindings: ctx.bindings.slice(0, count),
     buffers: ctx.buffers.slice(0, count),
+    outers: ctx.outers.slice(0, count),
   };
 }
 
+// extendCteCtx layers a WITH node's bindings over `inherited`, recording `outer` — the node's
+// outer-row environment (empty at top level) — as each new binding's body frame (cte.md §7).
 export function extendCteCtx(
   inherited: CteCtx,
+  outer: Row[],
   modes: CteMode[],
   bindings: CteBinding[],
   buffers: Row[][],
@@ -27078,6 +27129,7 @@ export function extendCteCtx(
     modes: [...inherited.modes, ...modes],
     bindings: [...inherited.bindings, ...bindings],
     buffers: [...inherited.buffers, ...buffers],
+    outers: [...inherited.outers, ...bindings.map(() => outer)],
   };
 }
 

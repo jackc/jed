@@ -67,11 +67,13 @@ A CTE is a **statement-local relation** resolved by name, ahead of the catalog:
   `WITH orders AS (SELECT * FROM orders)` resolves the inner `orders` to the **base table** (PG
   semantics), and is `42P01` only if no base table exists. Lookup is case-insensitive, like table
   names.
-- **Bodies are independent queries — not correlated.** A non-recursive CTE body is planned as a
-  top-level query (`parent = None`): it sees only its own FROM, the catalog, and the **earlier CTE
-  bindings**, never the scope at the reference site. An outer-query column referenced inside a CTE
-  body is therefore unresolved (`42703`/`42P01`), *not* a correlated reference. This is the most
-  important behavioral rule — a CTE is **not** a lateral/correlated subquery.
+- **Bodies are not correlated to the reference site.** A CTE body sees its own FROM, the catalog,
+  and the **earlier CTE bindings**, never the scope at a reference site — a CTE is **not** a
+  lateral subquery of the query that references it. A body is planned against the scope that
+  *encloses* the query owning the `WITH`: at the statement top level there is none (`parent =
+  None`), so an outer column inside a top-level CTE body is unresolved (`42703`/`42P01`); a
+  *nested* `WITH`'s bodies may correlate to an enclosing query level (§7). Either way the owning
+  query's own FROM is invisible to its CTE bodies.
 - **Duplicate CTE name** in one `WITH` list is `42712` (`duplicate_alias`), matching PostgreSQL.
 - **Duplicate output columns.** A body that produces two columns of the same name
   (`WITH t AS (SELECT 1 AS a, 2 AS a)`) is allowed; `SELECT *` emits both, but a later **bare**
@@ -117,7 +119,7 @@ The deterministic cost formula for both paths is specified in [cost.md](cost.md)
 | Duplicate CTE name in one `WITH` list | `42712` | `duplicate_alias` (PG's code). |
 | Self / forward reference (non-recursive) | `42P01` | The name is not in scope yet; falls out of §2. |
 | MORE column-rename aliases than body columns | `42P10` | `invalid_column_reference`; fewer is a legal partial rename. |
-| Outer column referenced inside a body | `42703` / `42P01` | A body is not correlated (§2). |
+| Column of the `WITH`-owning query's FROM (or, top level, any outer column) inside a body | `42703` / `42P01` | A body sees only the scope enclosing the owning query (§2, §7). |
 | Data-modifying CTE in a nested `WITH` | `0A000` | DML-`WITH` is top-level only (§7), matching PostgreSQL. |
 
 ## 5. Cross-core determinism
@@ -204,7 +206,27 @@ that inherited prefix, and runs the body — the same materialize-then-execute s
 the inherited binding's ordinary static reference count, preserving the §3 inline/materialize rule.
 A nested `WITH` adds **no** correlation frame: its body sees the same outer-row environment as the
 node's position (so a `LATERAL` derived-table body whose `WITH` wraps it still correlates to its left
-siblings), while the CTE bodies stay independent (`parent = None`).
+siblings).
+
+**Correlated CTE bodies.** The CTE bodies are planned against that **same** scope — the one
+enclosing the query that owns the `WITH`, not that query's own FROM — so a column of an enclosing
+query level (or of a `LATERAL` wrapper's left siblings) is an ordinary correlated reference (grammar.md
+§26) in the node's own correlation frame, matching PostgreSQL:
+
+```
+SELECT o.id, (WITH c AS (SELECT o.x AS v) SELECT v FROM c) FROM o          -- each row's x
+SELECT (WITH c AS (SELECT t.n) SELECT max(n) FROM t) FROM o                  -- 42P01: t is the owner's FROM
+SELECT * FROM o, (WITH c AS (SELECT o.x) SELECT * FROM c) d                   -- 42P01: not LATERAL
+```
+
+Such a reference makes the owning subquery correlated (never folded once), so the node re-runs per
+outer row and its evaluation rule (§3) applies **per run**: a materialized CTE is materialized once
+per run of the node — its buffer is the rows for that outer row — and an inlined CTE runs in place at
+its reference, as at top level. Each binding records the node's outer-row environment at execution,
+and its body always runs in that frame — including an inlined body reached from a reference nested
+deeper (inside a subquery of the node's body, or a later CTE body), so its outer references still name
+the node's enclosing levels. Recursive bodies (anchor and recursive term) may correlate the same way.
+No new cost unit: the cost is the ordinary per-outer-row sum of the node's runs (cost.md §3).
 
 **Data-modifying CTEs stay top-level only.** A nested `WITH` whose CTE body is an
 `INSERT`/`UPDATE`/`DELETE` is rejected `0A000` (`is only supported at the top level`) — this

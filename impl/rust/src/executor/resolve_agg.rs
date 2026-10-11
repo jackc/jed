@@ -342,9 +342,14 @@ pub(crate) fn collect_touched_plan(plan: &QueryPlan, depth: usize, touched: &mut
                 }
             }
         }
-        // A nested `WITH`'s correlated references live in its body (the CTE bodies are `parent =
-        // None`); recurse into the body at the same depth (spec/design/cte.md §7).
-        QueryPlan::With(wp) => collect_touched_plan(&wp.body, depth, touched),
+        // A nested `WITH`'s correlated references live in its body and its CTE bodies, all planned
+        // against the same enclosing scope; recurse into each at the same depth (cte.md §7).
+        QueryPlan::With(wp) => {
+            collect_touched_plan(&wp.body, depth, touched);
+            for p in wp.binding_plans() {
+                collect_touched_plan(p, depth, touched);
+            }
+        }
     }
 }
 

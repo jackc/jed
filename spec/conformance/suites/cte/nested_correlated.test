@@ -1,0 +1,200 @@
+# Nested-WITH CTE bodies that reference an ENCLOSING query level (spec/design/cte.md §7). A CTE body
+# in a nested WITH is planned against the scope enclosing the query that owns the WITH — the same
+# scope that query's own FROM items see (a LATERAL wrapper's left siblings included) — so a column of
+# an outer query level correlates exactly as it would in the owning subquery (PostgreSQL). It never
+# sees the owning query's own FROM (42P01), and a top-level WITH has no enclosing level. The owning
+# subquery is correlated and re-executes per outer row; within one execution an inlined CTE runs in
+# place per reference and a materialized one runs once. Covers inline, MATERIALIZED, multi-reference,
+# recursive, EXISTS / IN, a reference from a nested subquery and from a later CTE body, two levels
+# out, a WITH nested in a CTE body, a LATERAL wrapper, and a WITH inside a top-level CTE body. Rows
+# verified against the live PostgreSQL 18 oracle; cost assertions are jed's deterministic cross-core
+# contract.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.aggregates, query.cross_join, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, query.derived_table, query.lateral, query.cte, query.cte_nested, query.cte_recursive, expr.arithmetic, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE o (id i32 PRIMARY KEY, x i32)
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, n i32)
+
+statement ok
+INSERT INTO o VALUES (1, 10), (2, 20), (3, NULL)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)
+
+# A single-reference (inlined) CTE whose body reads only the outer row.
+query II nosort
+SELECT o.id, (WITH c AS (SELECT o.x AS v) SELECT v FROM c) FROM o ORDER BY o.id
+----
+1
+10
+2
+20
+3
+NULL
+
+# MATERIALIZED: the body runs once per execution of the owning subquery, i.e. once per outer row.
+query II nosort
+SELECT o.id, (WITH c AS MATERIALIZED (SELECT o.x AS v) SELECT sum(v) FROM c) FROM o ORDER BY o.id
+----
+1
+10
+2
+20
+3
+NULL
+
+# Two references make the CTE materialized; both read the same per-row buffer.
+query II nosort
+SELECT o.id, (WITH c AS (SELECT o.x AS v) SELECT c1.v + c2.v FROM c c1, c c2) FROM o ORDER BY o.id
+----
+1
+20
+2
+40
+3
+NULL
+
+# The body's WHERE reads the outer row.
+query II nosort
+SELECT o.id, (WITH c AS (SELECT t.n FROM t WHERE t.n > o.x) SELECT count(*) FROM c) FROM o ORDER BY o.id
+----
+1
+2
+2
+1
+3
+0
+
+# EXISTS and IN subqueries prefixed by a correlated WITH.
+query I nosort
+SELECT o.id FROM o WHERE EXISTS (WITH c AS (SELECT t.id FROM t WHERE t.n = o.x) SELECT 1 FROM c) ORDER BY o.id
+----
+1
+2
+
+query I nosort
+SELECT o.id FROM o WHERE o.x IN (WITH c AS (SELECT o.x AS v) SELECT v FROM c) ORDER BY o.id
+----
+1
+2
+
+# A recursive CTE whose anchor and recursive term both read the outer row.
+query II nosort
+SELECT o.id, (WITH RECURSIVE r (k) AS (SELECT o.id UNION ALL SELECT k + 1 FROM r WHERE k < o.id + 2) SELECT sum(k) FROM r) FROM o ORDER BY o.id
+----
+1
+6
+2
+9
+3
+12
+
+# An inlined CTE referenced from a subquery nested inside the WITH's body still reads the row of the
+# level enclosing the WITH, not the nested subquery's.
+query II nosort
+SELECT o.id, (WITH c AS (SELECT t.n FROM t WHERE t.id = o.id) SELECT (SELECT max(n) FROM c)) FROM o ORDER BY o.id
+----
+1
+10
+2
+20
+3
+30
+
+# A later CTE body reads an earlier correlated CTE.
+query II nosort
+SELECT o.id, (WITH c AS (SELECT o.x AS v), d AS (SELECT v + 1 AS w FROM c) SELECT w FROM d) FROM o ORDER BY o.id
+----
+1
+11
+2
+21
+3
+NULL
+
+# Two levels out: the CTE body reads `t` (the query enclosing the WITH-owning subquery) and `o` (one
+# level further).
+query II nosort
+SELECT o.id, (SELECT (WITH c AS (SELECT o.x + t.n AS s) SELECT s FROM c) FROM t WHERE t.id = o.id) FROM o ORDER BY o.id
+----
+1
+20
+2
+40
+3
+NULL
+
+# A WITH nested in a nested CTE's body: the inner body sees the same enclosing level.
+query II nosort
+SELECT o.id, (WITH c AS (WITH d AS (SELECT o.x AS v) SELECT v * 2 AS v FROM d) SELECT v FROM c) FROM o ORDER BY o.id
+----
+1
+20
+2
+40
+3
+NULL
+
+# A LATERAL derived table whose nested WITH reads a left sibling.
+query II nosort
+SELECT o.id, d.v FROM o, LATERAL (WITH c AS (SELECT o.x AS v) SELECT v FROM c) d ORDER BY o.id
+----
+1
+10
+2
+20
+3
+NULL
+
+# A correlated nested WITH inside a top-level CTE's body.
+query II nosort
+WITH w AS (SELECT o.id, (WITH c AS (SELECT o.x AS v) SELECT v FROM c) AS v FROM o) SELECT id, v FROM w ORDER BY id
+----
+1
+10
+2
+20
+3
+NULL
+
+# Without LATERAL a derived table's nested WITH cannot see the FROM siblings.
+statement error 42P01
+SELECT o.id, d.v FROM o, (WITH c AS (SELECT o.x AS v) SELECT v FROM c) d
+
+# A CTE body never sees the FROM of the query that owns its WITH.
+statement error 42P01
+SELECT (WITH c AS (SELECT t.n) SELECT max(n) FROM t) FROM o
+
+# A top-level WITH has no enclosing query level.
+statement error 42P01
+WITH c AS (SELECT o.x) SELECT * FROM c, o
+
+# --- cost contract (spec/design/cost.md §3) ---
+
+# Inlined: per outer row the CTE body runs in place at its single reference. The scan of `o` is 7
+# (page_read 1 + 3 storage_row_read + 3 row_produced); each of the 3 outer rows adds 3 (the subquery's
+# operator_eval + the inlined body's row + the WITH body's row) = 16.
+# cost: 16
+query II nosort
+SELECT o.id, (WITH c AS (SELECT o.x AS v) SELECT v FROM c) FROM o ORDER BY o.id
+----
+1
+10
+2
+20
+3
+NULL
+
+# Materialized: per outer row the body runs once and each of the two references scans the buffer.
+# cost: 48
+query II nosort
+SELECT o.id, (WITH c AS (SELECT t.n FROM t WHERE t.n > o.x) SELECT count(*) FROM c c1, c c2) FROM o ORDER BY o.id
+----
+1
+4
+2
+1
+3
+0

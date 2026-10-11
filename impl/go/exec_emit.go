@@ -1625,9 +1625,17 @@ func queryPlanReferencesOuter(plan *queryPlan, depth int) bool {
 		return false
 	}
 	if plan.with != nil {
-		// A nested WITH adds no correlation frame: its body is at the same depth, and the CTE bodies
-		// are planned parent=nil (no outer reference), so only the body can correlate (cte.md §7).
-		return queryPlanReferencesOuter(&plan.with.body, depth)
+		// A nested WITH adds no correlation frame: its body and its CTE bodies are planned against the
+		// same enclosing scope, so each is walked at this depth (cte.md §7).
+		if queryPlanReferencesOuter(&plan.with.body, depth) {
+			return true
+		}
+		for _, p := range plan.with.bindingPlans() {
+			if queryPlanReferencesOuter(p, depth) {
+				return true
+			}
+		}
+		return false
 	}
 	return queryPlanReferencesOuter(&plan.setop.lhs, depth) || queryPlanReferencesOuter(&plan.setop.rhs, depth)
 }
@@ -2179,9 +2187,12 @@ func collectTouchedPlan(plan *queryPlan, depth int, touched []bool) {
 		collectTouchedPlan(&plan.setop.rhs, depth, touched)
 	}
 	if plan.with != nil {
-		// A nested WITH's correlated references live in its body (the CTE bodies are parent=nil);
-		// recurse into the body at the same depth (spec/design/cte.md §7).
+		// A nested WITH's correlated references live in its body and its CTE bodies, all planned
+		// against the same enclosing scope; recurse into each at the same depth (cte.md §7).
 		collectTouchedPlan(&plan.with.body, depth, touched)
+		for _, p := range plan.with.bindingPlans() {
+			collectTouchedPlan(p, depth, touched)
+		}
 	}
 }
 

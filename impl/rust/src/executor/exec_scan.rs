@@ -1245,7 +1245,8 @@ impl Engine {
             Statement::With(wq) => {
                 // The planning prefix of `run_with` (cte.md): plan the CTE bindings, then the body with
                 // them visible. The body's column names/types are the WITH's output names/types.
-                let bindings = self.plan_cte_bindings(&wq.ctes, wq.recursive, &[], &mut ptypes)?;
+                let bindings =
+                    self.plan_cte_bindings(&wq.ctes, wq.recursive, &[], None, &mut ptypes)?;
                 let body_q = wq
                     .body
                     .as_query()
@@ -2122,7 +2123,9 @@ impl Engine {
                     let CteSource::Query(plan) = &env.ctes.bindings[ci].source else {
                         unreachable!("a data-modifying CTE is always materialized, never inlined")
                     };
-                    let r = self.exec_query_plan(plan, outer, params, env.ctes)?;
+                    // The body runs in the frame of the WITH node that declared it (cte.md §7) —
+                    // not this reference site's, which may sit deeper.
+                    let r = self.exec_query_plan(plan, env.ctes.outers[ci], params, env.ctes)?;
                     meter.charge(r.cost);
                     // The body's charged result becomes this relation's rows (memory.md §5.2),
                     // re-measured under the relation's touched mask.

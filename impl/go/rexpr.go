@@ -1197,6 +1197,22 @@ type withPlan struct {
 	inheritedLen int
 }
 
+// bindingPlans returns every planned query of this node's own CTE bindings — each body and, for a
+// recursive CTE, its recursive term. They are planned against the same scope as the body
+// (spec/design/cte.md §7), so an outer reference in one sits in the node's own correlation frame.
+func (wp *withPlan) bindingPlans() []*queryPlan {
+	var plans []*queryPlan
+	for _, b := range wp.bindings {
+		if !b.isDml() {
+			plans = append(plans, &b.plan)
+		}
+		if b.recursive != nil {
+			plans = append(plans, &b.recursive.plan)
+		}
+	}
+	return plans
+}
+
 // columnTypes returns the plan's output column types (for a subquery's plan-time column-count
 // check + element type).
 func (p *queryPlan) columnTypes() []resolvedType {
@@ -1322,12 +1338,22 @@ type recursiveTerm struct {
 // order, holding the materialized rows of a cteMaterialize CTE (an empty placeholder for a cteInline
 // one, whose body is run in place from bindings[ci].plan instead). bindings also serves a
 // data-modifying CTE's own inner queries, which resolve against the earlier bindings when the
-// writable-CTE orchestrator executes them (writable-cte.md §2). The zero value (all nil) is the empty
-// context — no CTEs in scope (every non-WITH execution path).
+// writable-CTE orchestrator executes them (writable-cte.md §2). outers holds, per binding, the
+// outer-row environment of the WITH node that declared it: a nested WITH's CTE bodies are planned
+// against the scope enclosing that node (cte.md §7), so an inlined body run at a deeper reference
+// site still reads that node's frames. Top-level bindings have a nil environment. The zero value (all
+// nil) is the empty context — no CTEs in scope (every non-WITH execution path).
 type cteCtx struct {
 	modes    []cteMode
 	bindings []*cteBinding
 	buffers  [][]storedRow
+	outers   [][]storedRow
+}
+
+// topLevelCteCtx builds the context of a statement-top-level WITH: its bindings, no enclosing
+// outer-row environment (a nil one per binding).
+func topLevelCteCtx(modes []cteMode, bindings []*cteBinding, buffers [][]storedRow) cteCtx {
+	return cteCtx{modes: modes, bindings: bindings, buffers: buffers, outers: make([][]storedRow, len(bindings))}
 }
 
 // prefix returns the exact enclosing CTE prefix visible when a nested WITH was planned. A CTE body
@@ -1337,16 +1363,19 @@ func (c cteCtx) prefix(n int) cteCtx {
 	if n < 0 || n > len(c.bindings) {
 		panic("invalid inherited CTE prefix")
 	}
-	return cteCtx{modes: c.modes[:n], bindings: c.bindings[:n], buffers: c.buffers[:n]}
+	return cteCtx{modes: c.modes[:n], bindings: c.bindings[:n], buffers: c.buffers[:n], outers: c.outers[:n]}
 }
 
-// extend layers local CTE bindings over an inherited context while preserving the flat indices
-// stored in planned FROM relations. The returned slices are independent headers/backing arrays.
-func (c cteCtx) extend(modes []cteMode, bindings []*cteBinding, buffers [][]storedRow) cteCtx {
+// extend layers a WITH node's local CTE bindings over an inherited context while preserving the flat
+// indices stored in planned FROM relations, recording outer — the node's outer-row environment (nil
+// at top level) — as each new binding's body frame (cte.md §7). The returned slices are independent
+// headers/backing arrays.
+func (c cteCtx) extend(outer []storedRow, modes []cteMode, bindings []*cteBinding, buffers [][]storedRow) cteCtx {
 	out := cteCtx{
 		modes:    make([]cteMode, 0, len(c.modes)+len(modes)),
 		bindings: make([]*cteBinding, 0, len(c.bindings)+len(bindings)),
 		buffers:  make([][]storedRow, 0, len(c.buffers)+len(buffers)),
+		outers:   make([][]storedRow, 0, len(c.outers)+len(bindings)),
 	}
 	out.modes = append(out.modes, c.modes...)
 	out.modes = append(out.modes, modes...)
@@ -1354,6 +1383,10 @@ func (c cteCtx) extend(modes []cteMode, bindings []*cteBinding, buffers [][]stor
 	out.bindings = append(out.bindings, bindings...)
 	out.buffers = append(out.buffers, c.buffers...)
 	out.buffers = append(out.buffers, buffers...)
+	out.outers = append(out.outers, c.outers...)
+	for range bindings {
+		out.outers = append(out.outers, outer)
+	}
 	return out
 }
 

@@ -82,7 +82,8 @@ error.
 `WITH RECURSIVE` changes one thing in the [cte.md](cte.md) §2 scope rules: a recursive CTE's own
 name **is** in scope inside its own body (so the recursive term resolves the self-reference to the
 CTE's synthetic relation, whose columns are the anchor's). Every other rule is unchanged — earlier
-CTEs are visible, the catalog is shadowed, a body is an independent (non-correlated) query.
+CTEs are visible, the catalog is shadowed, a body is not correlated to its reference site (a nested
+`WITH RECURSIVE` body may still correlate to an enclosing query level — [cte.md](cte.md) §7).
 
 **Mutual recursion is not supported.** A reference to a *later* CTE in the same list stays out of
 scope and resolves to `42P01` (the forward-only rule). PostgreSQL detects the mutual-recursion case
