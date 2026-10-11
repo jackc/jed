@@ -1,7 +1,7 @@
 # JOIN ... USING (col, …) (spec/design/grammar.md §15): an equi-join on the named columns that
 # MERGES each into a single output column. `a JOIN b USING(k)` matches on `a.k = b.k` (3-valued,
 # like any ON) and the output carries ONE `k` — placed FIRST, before a's other columns then b's
-# (PostgreSQL). A bare `k` resolves to the merged column (never the 42702 ambiguity of the two
+# (PostgreSQL; applied per join, so in a chain the newest join's merges lead). A bare `k` resolves to the merged column (never the 42702 ambiguity of the two
 # underlying copies); the qualified `a.k`/`b.k` still reach each side. The merge is the SURVIVING
 # side: the left for INNER/LEFT, the right for RIGHT. `FULL JOIN ... USING` (whose merge is a
 # COALESCE) is a deferred 0A000 narrowing, and a type-mismatched USING column is jed's strict-
@@ -165,3 +165,107 @@ CREATE TABLE tt (k text, w i32)
 
 statement error 42804
 SELECT * FROM a JOIN tt USING(k)
+
+# A chain of USING joins on DIFFERENT columns lays `*` out per join, PostgreSQL's rule: each join's
+# output is its OWN merged columns, then the left input's remaining columns (already laid out by
+# the earlier join), then the right's. So the NEWEST join's merges come first.
+statement ok
+CREATE TABLE ua (id i32 PRIMARY KEY, x i32)
+
+statement ok
+CREATE TABLE ud (k i32, x i32)
+
+statement ok
+CREATE TABLE ue (k i32, y i32)
+
+statement ok
+CREATE TABLE ub (id i32, z i32)
+
+statement ok
+CREATE TABLE uc (k i32, w i32)
+
+statement ok
+INSERT INTO ua VALUES (1, 10)
+
+statement ok
+INSERT INTO ud VALUES (5, 10)
+
+statement ok
+INSERT INTO ue VALUES (5, 7)
+
+statement ok
+INSERT INTO ub VALUES (1, 2)
+
+statement ok
+INSERT INTO uc VALUES (5, 3)
+
+# (ua JOIN ud USING (x)) is x, id, k; joining ue USING (k) puts k first: k, x, id, y.
+# names: k, x, id, y
+# cost: 9
+query IIII nosort
+SELECT * FROM ua JOIN ud USING (x) JOIN ue USING (k)
+----
+5
+10
+1
+7
+
+# A third merge on yet another column again leads: id, then k, x, y, then ub's z.
+# names: id, k, x, y, z
+# cost: 12
+query IIIII nosort
+SELECT * FROM ua JOIN ud USING (x) JOIN ue USING (k) JOIN ub USING (id)
+----
+1
+5
+10
+7
+2
+
+# A RIGHT join's merged column (the right copy) leads its join's output the same way.
+# names: k, x, id, y
+# cost: 9
+query IIII nosort
+SELECT * FROM ua JOIN ud USING (x) RIGHT JOIN ue USING (k)
+----
+5
+10
+1
+7
+
+# A parenthesized join on the RIGHT is one input whose own `*` order (x, id, k) follows ue's
+# remaining column: k, y, x, id.
+# names: k, y, x, id
+# cost: 26
+query IIII nosort
+SELECT * FROM ue JOIN (ua JOIN ud USING (x)) USING (k)
+----
+5
+7
+10
+1
+
+# Comma-separated FROM items each lay out their OWN merged columns at the item's position — the
+# second item's k is not hoisted to the front.
+# names: id, x, z, k, x, w
+# cost: 11
+query IIIIII nosort
+SELECT * FROM ua JOIN ub USING (id), ud JOIN uc USING (k)
+----
+1
+10
+2
+5
+10
+3
+
+# names: id, x, k, x, y
+# cost: 8
+query IIIII nosort
+SELECT * FROM ua, ud JOIN ue USING (k)
+----
+1
+10
+5
+10
+7

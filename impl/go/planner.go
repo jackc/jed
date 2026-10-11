@@ -284,9 +284,32 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	// is 0A000). Both copies are hidden from `*`. Merges/predicates respect the comma SEGMENT (commit 1).
 	var merges []mergeCol
 	hidden := groupHidden
+	// The `*` expansion order is built per comma item, PostgreSQL's rule (grammar.md §15): each join's
+	// output is (its merged columns, in USING order) ++ (the left input's columns minus those merged
+	// here) ++ (the right input's columns minus its merged copies), so in a left-deep chain the NEWEST
+	// join's merges come first. star holds the completed comma items; segStar the current one.
+	flat := &scope{rels: rels}
+	relStar := func(i int) []int {
+		var out []int
+		for c := range rels[i].table.Columns {
+			if idx := rels[i].offset + c; !slices.Contains(groupHidden, idx) {
+				out = append(out, idx)
+			}
+		}
+		return out
+	}
+	var star, segStar []int
+	if len(rels) > 0 {
+		segStar = relStar(0)
+	}
 	joinPreds := make([]*rExpr, len(sel.Joins))
 	for k := range sel.Joins {
 		j := &sel.Joins[k]
+		if j.Comma {
+			star = append(star, segStar...)
+			segStar = relStar(k + 1)
+			continue
+		}
 		seg := k + 1
 		for seg >= 1 && !sel.Joins[seg-1].Comma {
 			seg--
@@ -311,8 +334,13 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		if j.Using != nil {
 			usingCols = j.Using
 		} else if j.Natural {
-			usingCols = naturalCommonCols(rels, seg, k)
+			leftNames := make([]string, len(segStar))
+			for n, idx := range segStar {
+				leftNames[n] = flat.columnAt(idx).Name
+			}
+			usingCols = naturalCommonCols(leftNames, &rels[k+1])
 		}
+		rightStar := relStar(k + 1)
 		switch {
 		case len(usingCols) > 0:
 			if j.Kind == joinFull {
@@ -324,6 +352,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			// unlabeled relation or carries a second column of the same name.
 			var pairRels []scopeRel
 			var predAST *exprNode
+			var merged, leftDrop, rightDrop []int
 			for n, name := range usingCols {
 				lr, lerr := left.resolveBare(name)
 				if lerr != nil || lr.level != 0 {
@@ -356,7 +385,19 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				merges = slices.DeleteFunc(merges, func(m mergeCol) bool { return strings.EqualFold(m.name, name) })
 				merges = append(merges, mergeCol{name: strings.ToLower(name), index: mi})
 				hidden = append(hidden, li, ri)
+				merged, leftDrop, rightDrop = append(merged, mi), append(leftDrop, li), append(rightDrop, ri)
 			}
+			for _, idx := range segStar {
+				if !slices.Contains(leftDrop, idx) {
+					merged = append(merged, idx)
+				}
+			}
+			for _, idx := range rightStar {
+				if !slices.Contains(rightDrop, idx) {
+					merged = append(merged, idx)
+				}
+			}
+			segStar = merged
 			pair := &scope{rels: pairRels, catalog: db, ctes: ctes}
 			pred, perr := resolveBooleanFilter(pair, predAST, ptypes)
 			if perr != nil {
@@ -370,10 +411,14 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				return nil, perr
 			}
 			joinPreds[k] = pred
+			segStar = append(segStar, rightStar...)
+		default:
+			segStar = append(segStar, rightStar...)
 		}
 	}
+	star = append(star, segStar...)
 
-	s := &scope{rels: rels, parent: parent, catalog: db, allowSubquery: true, ctes: ctes, merges: merges, hidden: hidden, subRels: subRels}
+	s := &scope{rels: rels, parent: parent, catalog: db, allowSubquery: true, ctes: ctes, merges: merges, hidden: hidden, subRels: subRels, star: star}
 
 	// Resolve projections (paired with output names — §8), the optional WHERE (must be
 	// boolean), and the ORDER BY keys against the full scope. A bare key ambiguous across

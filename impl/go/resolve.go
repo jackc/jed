@@ -88,6 +88,11 @@ type scope struct {
 	// (spec/design/grammar.md §15): `(a JOIN b ON …)` is one FROM relation, yet `a.x` and `b.*`
 	// still name its inner relations. Reached only by qualified references; never physical.
 	subRels []subRel
+	// star is the flat indices bare `*` expands to, in order (grammar.md §15): PostgreSQL's per-join
+	// layout — each USING/NATURAL join's merged columns, then its left input's remaining columns,
+	// then its right input's — concatenated across comma items. Nil for a scope with no FROM join
+	// planning (then `*` is every non-hidden column in FROM order).
+	star []int
 }
 
 // subRel is one inner relation label of an unaliased parenthesized join (grammar.md §15): its
@@ -336,23 +341,19 @@ func (s *scope) columnAt(flat int) *catColumn {
 }
 
 // naturalCommonCols is the USING column list a NATURAL join derives (grammar.md §15): the column
-// names common to the LEFT relations of the join (rels[seg:k+1]) and the right relation (rels[k+1]),
-// in LEFT order with each name taken once (its first occurrence). An empty result degenerates the
-// join to a CROSS join. (A merged column on the left keeps its underlying name, so a re-merge via a
-// NATURAL chain is found here too.)
-func naturalCommonCols(rels []scopeRel, seg, k int) []string {
-	right := &rels[k+1]
+// names common to the join's LEFT input (leftNames, its `*` columns in output order) and the right
+// relation, in LEFT order with each name taken once (its first occurrence). An empty result
+// degenerates the join to a CROSS join. (A merged column on the left keeps its underlying name, so
+// a re-merge via a NATURAL chain is found here too.)
+func naturalCommonCols(leftNames []string, right *scopeRel) []string {
 	seen := map[string]bool{}
 	var out []string
-	for i := seg; i <= k; i++ {
-		for ci := range rels[i].table.Columns {
-			name := rels[i].table.Columns[ci].Name
-			lc := strings.ToLower(name)
-			if !seen[lc] {
-				seen[lc] = true
-				if right.table.ColumnIndex(name) >= 0 {
-					out = append(out, name)
-				}
+	for _, name := range leftNames {
+		lc := strings.ToLower(name)
+		if !seen[lc] {
+			seen[lc] = true
+			if right.table.ColumnIndex(name) >= 0 {
+				out = append(out, name)
 			}
 		}
 	}
@@ -629,15 +630,16 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 		var ps []*rExpr
 		var names []string
 		var types []resolvedType
-		// USING/NATURAL merged columns come FIRST, in join order (PostgreSQL — grammar.md §15):
-		// `SELECT * FROM a JOIN b USING(k)` is `k, <a's other cols>, <b's other cols>`. Each merge
-		// emits its surviving-side column; its underlying copies are in hidden and so are skipped by
-		// the per-relation loop below (otherwise the plain `*` expansion).
-		for _, m := range s.merges {
-			c := s.columnAt(m.index)
-			ps = append(ps, &rExpr{kind: reColumn, index: m.index})
-			names = append(names, c.Name)
-			types = append(types, resolvedTypeOfCol(c.Type, s.catalog.readSnap()))
+		// The FROM planner fixed the `*` order (USING/NATURAL merges per join — PostgreSQL,
+		// grammar.md §15); a merge's underlying copies are hidden and so absent from it.
+		if s.star != nil {
+			for _, idx := range s.star {
+				c := s.columnAt(idx)
+				ps = append(ps, &rExpr{kind: reColumn, index: idx})
+				names = append(names, c.Name)
+				types = append(types, resolvedTypeOfCol(c.Type, s.catalog.readSnap()))
+			}
+			return ps, names, types, nil
 		}
 		// The RETURNING old/new pseudo-relations are qualifier-only: `*` expands the real
 		// relations' columns exactly as before (grammar.md §32).

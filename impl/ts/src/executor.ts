@@ -13214,10 +13214,32 @@ export class Engine {
     // single merge column — the left for INNER/LEFT, the right for RIGHT (FULL JOIN USING, a COALESCE,
     // is 0A000). Both copies are hidden from `*`. Merges/predicates respect the comma SEGMENT (commit 1).
     const merges: MergeCol[] = [];
-    const hidden: number[] = groupHidden;
+    const hidden: number[] = [...groupHidden];
+    // The `*` expansion order is built per comma item, PostgreSQL's rule (grammar.md §15): each
+    // join's output is (its merged columns, in USING order) ++ (the left input's columns minus those
+    // merged here) ++ (the right input's columns minus its merged copies), so in a left-deep chain
+    // the NEWEST join's merges come first. star holds the completed comma items; segStar the
+    // current one.
+    const flat = new Scope(rels, this, null, false, ctes);
+    const relStar = (i: number): number[] => {
+      const out: number[] = [];
+      for (let c = 0; c < rels[i]!.table.columns.length; c++) {
+        const idx = rels[i]!.offset + c;
+        if (!groupHidden.includes(idx)) out.push(idx);
+      }
+      return out;
+    };
+    const star: number[] = [];
+    let segStar: number[] = rels.length > 0 ? relStar(0) : [];
     const joinPreds: (RExpr | null)[] = [];
     for (let k = 0; k < sel.joins.length; k++) {
       const j = sel.joins[k]!;
+      if (j.comma) {
+        star.push(...segStar);
+        segStar = relStar(k + 1);
+        joinPreds.push(null);
+        continue;
+      }
       let seg = k + 1;
       while (seg >= 1 && !sel.joins[seg - 1]!.comma) seg--;
       const segOff = rels[seg]!.offset;
@@ -13236,8 +13258,12 @@ export class Engine {
         j.using !== undefined
           ? j.using
           : j.natural === true
-            ? naturalCommonCols(rels, seg, k)
+            ? naturalCommonCols(
+                segStar.map((idx) => flat.columnAt(idx).name),
+                rels[k + 1]!,
+              )
             : undefined;
+      const rightStar = relStar(k + 1);
       if (usingCols !== undefined && usingCols.length > 0) {
         if (j.kind === "full") {
           throw engineError(
@@ -13251,6 +13277,9 @@ export class Engine {
         // unlabeled relation or carries a second column of the same name.
         const pairRels: ScopeRel[] = [];
         let predAst: Expr | null = null;
+        const merged: number[] = [];
+        const leftDrop: number[] = [];
+        const rightDrop: number[] = [];
         for (let n = 0; n < usingCols.length; n++) {
           const name = usingCols[n]!;
           let li = -1;
@@ -13293,22 +13322,32 @@ export class Engine {
           if (ex >= 0) merges.splice(ex, 1);
           merges.push({ name: name.toLowerCase(), index: mi });
           hidden.push(li, ri);
+          merged.push(mi);
+          leftDrop.push(li);
+          rightDrop.push(ri);
         }
+        for (const idx of segStar) if (!leftDrop.includes(idx)) merged.push(idx);
+        for (const idx of rightStar) if (!rightDrop.includes(idx)) merged.push(idx);
+        segStar = merged;
         const pair = new Scope(pairRels, this, null, false, ctes);
         joinPreds.push(resolveBooleanFilter(pair, predAst!, ptypes));
       } else if (j.on !== null) {
         const partial = mkScope(seg, k + 1);
         partial.subRels = subRelsWithin(subRels, seg, k + 1);
         joinPreds.push(resolveBooleanFilter(partial, j.on, ptypes));
+        segStar.push(...rightStar);
       } else {
         joinPreds.push(null);
+        segStar.push(...rightStar);
       }
     }
+    star.push(...segStar);
 
     const scope = new Scope(rels, this, parent, true, ctes);
     scope.merges = merges;
     scope.hidden = hidden;
     scope.subRels = subRels;
+    scope.star = star;
 
     // Expand GROUP BY (including ROLLUP / CUBE / GROUPING SETS) into a list of grouping sets, resolve
     // each set's columns to flat row indices, and build the master grouping-column list (groupKeys) —
@@ -31315,21 +31354,18 @@ export function outerOf(r: Resolved): Resolved {
 }
 
 // naturalCommonCols is the USING column list a NATURAL join derives (spec/design/grammar.md §15):
-// the column names common to the LEFT relations of the join (rels[seg..k]) and the right relation
-// (rels[k+1]), in LEFT order with each name taken once (its first occurrence). An empty result
-// degenerates the join to a CROSS join. (A merged column on the left keeps its underlying name, so a
-// re-merge via a NATURAL chain is found here too.)
-export function naturalCommonCols(rels: ScopeRel[], seg: number, k: number): string[] {
-  const right = rels[k + 1]!;
+// the column names common to the join's LEFT input (leftNames, its `*` columns in output order) and
+// the right relation, in LEFT order with each name taken once (its first occurrence). An empty
+// result degenerates the join to a CROSS join. (A merged column on the left keeps its underlying
+// name, so a re-merge via a NATURAL chain is found here too.)
+export function naturalCommonCols(leftNames: string[], right: ScopeRel): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
-  for (let i = seg; i <= k; i++) {
-    for (const c of rels[i]!.table.columns) {
-      const lc = c.name.toLowerCase();
-      if (!seen.has(lc)) {
-        seen.add(lc);
-        if (columnIndex(right.table, c.name) >= 0) out.push(c.name);
-      }
+  for (const name of leftNames) {
+    const lc = name.toLowerCase();
+    if (!seen.has(lc)) {
+      seen.add(lc);
+      if (columnIndex(right.table, name) >= 0) out.push(name);
     }
   }
   return out;

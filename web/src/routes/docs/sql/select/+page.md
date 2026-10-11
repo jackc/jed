@@ -317,7 +317,8 @@ JOIN b ON …` expands all of `a`'s columns followed by `b.label`.
 
 `JOIN ... USING (col, …)` is an equi-join on the named columns that **merges** each into a single
 output column — `a JOIN b USING (k)` joins on `a.k = b.k` and the result carries one `k` (listed
-first, before the other columns). A bare `k` then refers to the merged column; `a.k` and `b.k` still
+first, before the other columns; in a chain of joins each join's merged columns lead its own output,
+so the last join's come first, as in PostgreSQL). A bare `k` then refers to the merged column; `a.k` and `b.k` still
 reach each side. It works with `LEFT`/`RIGHT` joins and multi-column lists; `FULL JOIN ... USING` is
 not yet supported.
 

@@ -723,8 +723,14 @@ Cartesian product (no condition). An `INNER`/bare `JOIN` with **neither `ON` nor
 the named columns** that **merges** each into a single output column (PostgreSQL — grammar.md §15).
 Equivalent to `a JOIN b ON a.k = b.k`, *except* the output carries **one** `k`, not two. The merge
 shows up in three places: (1) `SELECT *` lists the merged columns **first** (in `USING` order), then
-the left relation's other columns, then the right's — so `SELECT * FROM a JOIN b USING(k)` is
-`k, <a's rest>, <b's rest>`; (2) a **bare** `k` resolves to the merged column, never the `42702`
+the left input's other columns, then the right's — so `SELECT * FROM a JOIN b USING(k)` is
+`k, <a's rest>, <b's rest>`. This is PostgreSQL's rule applied **per join**, recursively: a join's
+output columns are (its own merged columns) ++ (its left input's output columns minus those merged
+here) ++ (its right input's columns minus its merged copy), so in a left-deep chain the **newest**
+join's merges lead — `a(id, x) JOIN d(k, x) USING (x) JOIN e(k, y) USING (k)` is `k, x, id, y`, not
+`x, k, id, y` — and each comma-separated FROM item lays out its own merges at that item's position
+(`a JOIN b USING (id), d JOIN c USING (k)` is `id, <a's rest>, <b's rest>, k, <d's rest>, <c's rest>`,
+the `k` not hoisted to the front); (2) a **bare** `k` resolves to the merged column, never the `42702`
 ambiguity the two underlying copies would otherwise raise; (3) the qualified `a.k` / `b.k` still
 reach each side directly. The merge value is the **surviving side**: the **left** column for
 `INNER`/`LEFT` (always present for a left-preserved row), the **right** column for `RIGHT` — both
@@ -737,14 +743,16 @@ type-mismatched pair reaches jed's **strict comparison** (`42804`, a documented 
 **chain** (`a JOIN b USING(k) JOIN c USING(k)` keeps one `k`). Implementation: the planner
 synthesizes the `left.col = right.col` predicate and records each merge as `(name → surviving flat
 index)` on the scope, with both underlying copies marked **hidden** so `*` and bare resolution skip
-them; this is computed **before** GROUP BY / DISTINCT / projection so every clause sees the merge.
+them, and builds the `*` column order join by join alongside; this is computed **before** GROUP BY /
+DISTINCT / projection so every clause sees the merge.
 `USING` is non-reserved (§3) — it is the join condition only as the keyword immediately following the
 right `table_ref`, joining the implicit-alias stop set so `JOIN b USING (…)` never reads `using` as
 `b`'s alias.
 
 **`NATURAL` — the derived `USING`.** A `NATURAL` prefix (`a NATURAL JOIN b`, `a NATURAL LEFT JOIN b`)
 **derives** the `USING` column list at resolution as the column names **common to both sides**, in
-**left order** (each taken once), then merges them exactly like `USING` — so all the merge behavior
+**left order** — the left input's `*` order above, so after a `USING` join its merged column comes
+first (each taken once) — then merges them exactly like `USING` — so all the merge behavior
 above (merged-first `*`, unambiguous bare reference, surviving-side value, the `FULL` `0A000`) carries
 over unchanged. With **no** common column the join degenerates to a **`CROSS` join** (the Cartesian
 product — an empty derived list means no predicate and no merge). `NATURAL` is a parser prefix on the

@@ -146,15 +146,16 @@ export function resolveProjections(
     const nodes: RExpr[] = [];
     const names: string[] = [];
     const types: ResolvedType[] = [];
-    // USING/NATURAL merged columns come FIRST, in join order (PostgreSQL — grammar.md §15):
-    // `SELECT * FROM a JOIN b USING(k)` is `k, <a's other cols>, <b's other cols>`. Each merge emits
-    // its surviving-side column; its underlying copies are in `hidden` and so are skipped by the
-    // per-relation loop below (otherwise the plain `*` expansion).
-    for (const m of scope.merges) {
-      const c = scope.columnAt(m.index);
-      nodes.push({ kind: "column", index: m.index });
-      names.push(c.name);
-      types.push(resolvedTypeOfCol(c.type, scope.catalog));
+    // The FROM planner fixed the `*` order (USING/NATURAL merges per join — PostgreSQL,
+    // grammar.md §15); a merge's underlying copies are hidden and so absent from it.
+    if (scope.star !== null) {
+      for (const idx of scope.star) {
+        const c = scope.columnAt(idx);
+        nodes.push({ kind: "column", index: idx });
+        names.push(c.name);
+        types.push(resolvedTypeOfCol(c.type, scope.catalog));
+      }
+      return { nodes, names, types };
     }
     // The RETURNING old/new pseudo-relations are qualifier-only: `*` expands the real
     // relations' columns exactly as before (grammar.md §32).

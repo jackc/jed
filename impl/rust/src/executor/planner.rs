@@ -382,9 +382,31 @@ impl Engine {
         // Both underlying copies are hidden from `*`. Merges/predicates respect the comma SEGMENT
         // (commit-1): a join sees only its own comma item, and an earlier item's merge is out of scope.
         let mut merges: Vec<MergeCol> = Vec::new();
-        let mut hidden: Vec<usize> = group_hidden;
+        // The `*` expansion order is built per comma item, PostgreSQL's rule (grammar.md §15): each
+        // join's output is (its merged columns, in USING order) ++ (the left input's columns minus
+        // those merged here) ++ (the right input's columns minus its merged copies), so in a
+        // left-deep chain the NEWEST join's merges come first. `star` holds the completed comma
+        // items; `seg_star` the current one.
+        let rel_star = |i: usize| -> Vec<usize> {
+            (rels[i].offset..rels[i].offset + rels[i].table.columns.len())
+                .filter(|idx| !group_hidden.contains(idx))
+                .collect()
+        };
+        let mut star: Vec<usize> = Vec::new();
+        let mut seg_star: Vec<usize> = if rels.is_empty() {
+            Vec::new()
+        } else {
+            rel_star(0)
+        };
+        let mut hidden: Vec<usize> = group_hidden.clone();
         let mut join_preds: Vec<Option<RExpr>> = Vec::with_capacity(sel.joins.len());
         for (k, j) in sel.joins.iter().enumerate() {
+            if j.comma {
+                star.append(&mut seg_star);
+                seg_star = rel_star(k + 1);
+                join_preds.push(None);
+                continue;
+            }
             let mut seg = k + 1;
             while seg >= 1 && !sel.joins[seg - 1].comma {
                 seg -= 1;
@@ -400,7 +422,22 @@ impl Engine {
             // both sides (left order); an explicit USING uses its written list. A NATURAL join with
             // NO common column degenerates to a CROSS join (an empty list → no predicate, no merge).
             let derived: Vec<String> = if j.natural && j.using.is_none() {
-                natural_common_cols(&rels, seg, k)
+                let flat = Scope {
+                    rels: rels.clone(),
+                    parent: None,
+                    catalog: self,
+                    allow_subquery: false,
+                    ctes,
+                    merges: Vec::new(),
+                    hidden: Vec::new(),
+                    sub_rels: Vec::new(),
+                    star: None,
+                };
+                let left_names: Vec<&str> = seg_star
+                    .iter()
+                    .map(|&idx| flat.column_at(idx).name.as_str())
+                    .collect();
+                natural_common_cols(&left_names, &rels[k + 1])
             } else {
                 Vec::new()
             };
@@ -429,12 +466,15 @@ impl Engine {
                     merges: seg_merges.clone(),
                     hidden: seg_hidden.clone(),
                     sub_rels: Vec::new(),
+                    star: None,
                 };
                 // The synthesized predicate compares the two chosen columns through one-column pseudo
                 // relations at their flat slots, so it binds exactly those columns even when a side is
                 // an unlabeled relation or carries a second column of the same name.
                 let mut pair_tables: Vec<(Table, usize)> = Vec::new();
                 let mut pred_ast: Option<Expr> = None;
+                let (mut merged, mut left_drop, mut right_drop) =
+                    (Vec::new(), Vec::new(), Vec::new());
                 for (n, name) in cols.iter().enumerate() {
                     let li = match left.resolve_bare(name) {
                         Ok(Resolved::Local(i)) => i,
@@ -490,7 +530,17 @@ impl Engine {
                     });
                     hidden.push(li);
                     hidden.push(ri);
+                    merged.push(mi);
+                    left_drop.push(li);
+                    right_drop.push(ri);
                 }
+                merged.extend(seg_star.iter().copied().filter(|i| !left_drop.contains(i)));
+                merged.extend(
+                    rel_star(k + 1)
+                        .into_iter()
+                        .filter(|i| !right_drop.contains(i)),
+                );
+                seg_star = merged;
                 let pair = Scope {
                     rels: pair_tables
                         .iter()
@@ -510,6 +560,7 @@ impl Engine {
                     merges: Vec::new(),
                     hidden: Vec::new(),
                     sub_rels: Vec::new(),
+                    star: None,
                 };
                 Some(resolve_boolean_filter(
                     &pair,
@@ -526,13 +577,17 @@ impl Engine {
                     merges: seg_merges,
                     hidden: seg_hidden,
                     sub_rels: sub_rels_within(&group_subs, seg, k + 1),
+                    star: None,
                 };
+                seg_star.extend(rel_star(k + 1));
                 Some(resolve_boolean_filter(&partial, on_expr, ptypes)?)
             } else {
+                seg_star.extend(rel_star(k + 1));
                 None
             };
             join_preds.push(pred);
         }
+        star.append(&mut seg_star);
 
         let scope = Scope {
             rels,
@@ -543,6 +598,7 @@ impl Engine {
             merges,
             hidden,
             sub_rels: sub_rels_within(&group_subs, 0, usize::MAX),
+            star: Some(star),
         };
 
         // Expand GROUP BY (including ROLLUP / CUBE / GROUPING SETS) into a list of grouping sets,

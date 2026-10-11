@@ -1535,6 +1535,7 @@ fn build_prefix_scope<'s>(
         merges: Vec::new(),
         hidden: Vec::new(),
         sub_rels,
+        star: None,
     }
 }
 
@@ -1640,6 +1641,11 @@ pub(crate) struct Scope<'a> {
     /// §15): `(a JOIN b ON …)` is one FROM relation, yet `a.x` and `b.*` still name its inner
     /// relations. Reached only by qualified references; never physical.
     sub_rels: Vec<SubRel<'a>>,
+    /// The flat indices bare `*` expands to, in order (grammar.md §15): PostgreSQL's per-join
+    /// layout — each `USING`/`NATURAL` join's merged columns, then its left input's remaining
+    /// columns, then its right input's — concatenated across comma items. `None` for a scope the
+    /// FROM-join planner did not build (then `*` is every non-hidden column in FROM order).
+    star: Option<Vec<usize>>,
 }
 
 /// One inner relation label of an unaliased parenthesized join (grammar.md §15): its table's
@@ -1706,6 +1712,7 @@ impl<'a> Scope<'a> {
             merges: Vec::new(),
             hidden: Vec::new(),
             sub_rels: Vec::new(),
+            star: None,
         }
     }
 
@@ -1723,6 +1730,7 @@ impl<'a> Scope<'a> {
             merges: Vec::new(),
             hidden: Vec::new(),
             sub_rels: Vec::new(),
+            star: None,
         }
     }
 
@@ -1799,6 +1807,7 @@ impl<'a> Scope<'a> {
             merges: Vec::new(),
             hidden: Vec::new(),
             sub_rels: Vec::new(),
+            star: None,
         })
     }
 
@@ -1838,6 +1847,7 @@ impl<'a> Scope<'a> {
             merges: Vec::new(),
             hidden: Vec::new(),
             sub_rels: Vec::new(),
+            star: None,
         }
     }
 

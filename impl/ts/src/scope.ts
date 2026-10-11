@@ -123,6 +123,11 @@ export class Scope {
   // `(a JOIN b ON …)` is one FROM relation, yet `a.x` and `b.*` still name its inner relations.
   // Reached only by qualified references; never physical.
   subRels: SubRel[] = [];
+  // The flat indices bare `*` expands to, in order (grammar.md §15): PostgreSQL's per-join layout —
+  // each USING/NATURAL join's merged columns, then its left input's remaining columns, then its
+  // right input's — concatenated across comma items. null for a scope the FROM-join planner did not
+  // build (then `*` is every non-hidden column in FROM order).
+  star: number[] | null = null;
   constructor(
     rels: ScopeRel[],
     catalog: Engine,

@@ -36,6 +36,7 @@ impl Engine {
             merges: Vec::new(),
             hidden: Vec::new(),
             sub_rels: Vec::new(),
+            star: None,
         };
         // Record-returning functions (R1, json-table.md §2): json[b]_to_record → one record row,
         // json[b]_to_recordset → setof record. They take their column shape from the C0 col-def list
@@ -437,6 +438,7 @@ impl Engine {
             merges: Vec::new(),
             hidden: Vec::new(),
             sub_rels: Vec::new(),
+            star: None,
         };
         // The context item (json / jsonb / text, coerced to a jsonb document at eval).
         let (rctx, ctx_ty) = resolve(

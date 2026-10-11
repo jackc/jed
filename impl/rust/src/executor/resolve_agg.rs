@@ -396,21 +396,16 @@ pub(crate) fn binary_expr(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
 }
 
 /// The `USING` column list a `NATURAL` join derives (spec/design/grammar.md §15): the column names
-/// common to the LEFT relations of the join (`rels[seg..=k]`) and the right relation (`rels[k+1]`),
-/// in LEFT order with each name taken once (its first occurrence). An empty result degenerates the
-/// join to a `CROSS` join. (A merged column on the left keeps its underlying name, so a re-merge via
-/// a NATURAL chain is found here too.)
-pub(crate) fn natural_common_cols(rels: &[ScopeRel], seg: usize, k: usize) -> Vec<String> {
-    let right = &rels[k + 1];
+/// common to the join's LEFT input (`left_names`, its `*` columns in output order) and the right
+/// relation, in LEFT order with each name taken once (its first occurrence). An empty result
+/// degenerates the join to a `CROSS` join. (A merged column on the left keeps its underlying name,
+/// so a re-merge via a NATURAL chain is found here too.)
+pub(crate) fn natural_common_cols(left_names: &[&str], right: &ScopeRel) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for r in &rels[seg..=k] {
-        for c in &r.table.columns {
-            if seen.insert(c.name.to_ascii_lowercase())
-                && right.table.column_index(&c.name).is_some()
-            {
-                out.push(c.name.clone());
-            }
+    for &name in left_names {
+        if seen.insert(name.to_ascii_lowercase()) && right.table.column_index(name).is_some() {
+            out.push(name.to_string());
         }
     }
     out

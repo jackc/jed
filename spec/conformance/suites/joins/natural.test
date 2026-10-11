@@ -156,3 +156,33 @@ SELECT * FROM a NATURAL JOIN b ON a.k = b.k
 # JOIN USING (PostgreSQL supports it via a COALESCE merge).
 statement error 0A000
 SELECT * FROM a NATURAL FULL JOIN b
+
+# NATURAL derives its common columns in the LEFT input's `*` order, which after a USING join puts
+# that join's merge first: (na JOIN nd USING (x)) is x, id, k, so the columns common with ne
+# (id, x) are x, id — merged in that order, then nd's k.
+statement ok
+CREATE TABLE na (id i32 PRIMARY KEY, x i32)
+
+statement ok
+CREATE TABLE nd (k i32, x i32)
+
+statement ok
+CREATE TABLE ne (id i32, x i32)
+
+statement ok
+INSERT INTO na VALUES (1, 10)
+
+statement ok
+INSERT INTO nd VALUES (5, 10)
+
+statement ok
+INSERT INTO ne VALUES (1, 10)
+
+# names: x, id, k
+# cost: 11
+query III nosort
+SELECT * FROM na JOIN nd USING (x) NATURAL JOIN ne
+----
+10
+1
+5

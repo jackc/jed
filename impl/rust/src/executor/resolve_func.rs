@@ -987,15 +987,16 @@ pub(crate) fn resolve_projections(
             let mut nodes = Vec::new();
             let mut names = Vec::new();
             let mut types = Vec::new();
-            // USING/NATURAL merged columns come FIRST, in join order (PostgreSQL — grammar.md §15):
-            // `SELECT * FROM a JOIN b USING(k)` is `k, <a's other cols>, <b's other cols>`. Each
-            // merge emits its surviving-side column; its underlying copies are in `hidden` and so are
-            // skipped by the per-relation loop below (which is otherwise the plain `*` expansion).
-            for m in &scope.merges {
-                let c = scope.column_at(m.index);
-                nodes.push(RExpr::Column(m.index));
-                names.push(c.name.clone());
-                types.push(resolved_type_of_col(&c.ty, scope.catalog));
+            // The FROM planner fixed the `*` order (USING/NATURAL merges per join — PostgreSQL,
+            // grammar.md §15); a merge's underlying copies are hidden and so absent from it.
+            if let Some(star) = &scope.star {
+                for &idx in star {
+                    let c = scope.column_at(idx);
+                    nodes.push(RExpr::Column(idx));
+                    names.push(c.name.clone());
+                    types.push(resolved_type_of_col(&c.ty, scope.catalog));
+                }
+                return Ok((nodes, names, types));
             }
             // The RETURNING `old`/`new` pseudo-relations are qualifier-only: `*` expands the
             // real relations' columns exactly as before (grammar.md §32).
