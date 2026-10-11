@@ -125,6 +125,18 @@ impl RExpr {
                 m.charge(COSTS.operator_eval);
                 let out = match inner.eval(row, env, m)? {
                     Value::Null => Ok(Value::Null),
+                    // Any scalar → text (casts.toml, types.md §5): the type's own output form,
+                    // timestamptz in the session zone. Rendering bytea (hex) and jsonb (escapes) can
+                    // grow the value, so those two are growth kernels (cost.md §8.1), charged for the
+                    // full render before any varchar(n) truncation below.
+                    v if target.is_text() => {
+                        let grows = matches!(v, Value::Bytea(_) | Value::Jsonb(_));
+                        let out = Value::Text(scalar_to_text(v, env, m)?);
+                        if grows && !rexpr_is_constant(inner) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
+                    }
                     Value::Int(n) => {
                         if target.is_bool() {
                             // i32 → boolean (the boolean cast slice, casts.toml): 0 → false, any
@@ -190,10 +202,6 @@ impl RExpr {
                     // text → uuid (the uuid cast slice, casts.toml/types.md §14): the PG-flexible
                     // uuid_in parser; a malformed string traps 22P02.
                     Value::Text(s) if target.is_uuid() => Ok(Value::Uuid(decode_uuid_literal(&s)?)),
-                    // text → text: the identity (a `varchar(n)` length, if any, truncates in the
-                    // post-match step below — types.md §15). The resolver only produces a text→text
-                    // Cast node when a length is present, so this arm is unreachable without one.
-                    Value::Text(s) if target.is_text() => Ok(Value::Text(s)),
                     // text → numeric/boolean (the runtime-text-cast slice, grammar.md §36): the same
                     // per-row coercion the `type 'string'` literal folds at resolve, run here over
                     // the runtime string. The resolver admits only int/decimal/float/bool targets
@@ -224,9 +232,8 @@ impl RExpr {
                         Ok(Value::Uuid(arr))
                     }
                     Value::Bytea(_) => unreachable!("resolver rejects a bytea cast operand"),
-                    // uuid → text (canonical lowercase 8-4-4-4-12) and uuid → bytea (the 16 raw
-                    // bytes) — the uuid cast slice (casts.toml/types.md §14).
-                    Value::Uuid(u) if target.is_text() => Ok(Value::Text(render_uuid(&u))),
+                    // uuid → bytea (the 16 raw bytes) — the uuid cast slice (casts.toml/types.md
+                    // §14). uuid → text is the any-scalar → text arm above.
                     Value::Uuid(u) if target.is_bytea() => Ok(Value::Bytea(u.to_vec())),
                     Value::Uuid(_) => unreachable!("resolver rejects a uuid cast operand"),
                     Value::Timestamp(_) | Value::Timestamptz(_) => {
@@ -246,33 +253,23 @@ impl RExpr {
                     Value::JsonPath(_) => {
                         unreachable!("resolver rejects a jsonpath cast operand this slice")
                     }
-                    // The JSON cast matrix (spec/design/json.md §6.1). json → text is the identity
-                    // on the verbatim bytes; json → jsonb re-parses + canonicalizes; json → json is
-                    // the identity.
+                    // The JSON cast matrix (spec/design/json.md §6.1). json → jsonb re-parses +
+                    // canonicalizes; json → json is the identity (json → text is the any-scalar →
+                    // text arm above: the identity on the verbatim bytes).
                     Value::Json(s) => {
-                        if target.is_text() || target.is_json() {
-                            Ok(if target.is_text() {
-                                Value::Text(s)
-                            } else {
-                                Value::Json(s)
-                            })
+                        if target.is_json() {
+                            Ok(Value::Json(s))
                         } else if target.is_jsonb() {
                             Ok(Value::Jsonb(json::jsonb_in(&s)?))
                         } else {
                             unreachable!("resolver rejects this json cast target")
                         }
                     }
-                    // jsonb → text / json renders the canonical form (jsonb_out); jsonb → jsonb is
-                    // the identity.
-                    // Rendering is a growth kernel: escapes can expand strings (cost.md §8.1). The
-                    // full render is charged, before any varchar(n) truncation below.
-                    Value::Jsonb(n) if target.is_text() || target.is_json() => {
-                        let text = json::jsonb_out(&n);
-                        let out = if target.is_text() {
-                            Value::Text(text)
-                        } else {
-                            Value::Json(text)
-                        };
+                    // jsonb → json renders the canonical form (jsonb_out); jsonb → jsonb is the
+                    // identity (jsonb → text is the any-scalar → text arm above).
+                    // Rendering is a growth kernel: escapes can expand strings (cost.md §8.1).
+                    Value::Jsonb(n) if target.is_json() => {
+                        let out = Value::Json(json::jsonb_out(&n));
                         if !rexpr_is_constant(inner) {
                             charge_output(m, &out)?;
                         }
@@ -325,18 +322,26 @@ impl RExpr {
                         let ColType::Scalar(scalar) = to_elem.as_ref().unwrap() else {
                             unreachable!("an array→array element cast has a scalar target element")
                         };
+                        // bytea → text renders hex, so a bytea[] → text[] cast is a growth kernel
+                        // (cost.md §8.1), charged for the whole result array.
+                        let grows = scalar.is_text()
+                            && a.elements.iter().any(|e| matches!(e, Value::Bytea(_)));
                         let mut elements = Vec::with_capacity(a.elements.len());
                         for e in a.elements {
                             elements.push(match e {
                                 Value::Null => Value::Null,
-                                v => cast_array_element(v, *scalar)?,
+                                v => cast_array_element(v, *scalar, env, m)?,
                             });
                         }
-                        Ok(Value::Array(ArrayVal {
+                        let out = Value::Array(ArrayVal {
                             dims: a.dims,
                             lbounds: a.lbounds,
                             elements,
-                        }))
+                        });
+                        if grows && !rexpr_is_constant(inner) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
                     }
                     _ => unreachable!("an ArrayCast operand is text or array (resolver-gated)"),
                 }

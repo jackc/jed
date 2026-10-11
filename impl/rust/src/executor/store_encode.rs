@@ -629,13 +629,19 @@ pub(crate) fn materialize_insert_value(
 /// Cast one **non-null array element** value to the target element scalar — the eval kernel of the
 /// element-wise `array → other-element-array` cast (spec/design/array.md §7). It runs the *same*
 /// per-value conversions the scalar `RExpr::Cast` node does, for the pairs [`scalar_pair_castable`]
-/// admits at resolve (numeric↔numeric, text→numeric/bool/uuid, bool↔i32, uuid↔text/bytea,
-/// bytea→uuid); an array element has no `numeric(p,s)` typmod (an array type takes no modifier), so
+/// admits at resolve (numeric↔numeric, text→numeric/bool/uuid, bool↔i32, any scalar→text,
+/// uuid↔bytea); an array element has no `numeric(p,s)` typmod (an array type takes no modifier), so
 /// every decimal target is the unconstrained form. Overflow traps `22003`, a malformed text element
 /// `22P02` — per element, exactly like the scalar cast. The resolver gate guarantees only the
 /// admitted `(source, target)` pairs reach here, so the value/target combinations are exhaustive.
-pub(crate) fn cast_array_element(v: Value, target: ScalarType) -> Result<Value> {
+pub(crate) fn cast_array_element(
+    v: Value,
+    target: ScalarType,
+    env: &EvalEnv,
+    m: &mut Meter,
+) -> Result<Value> {
     match v {
+        v if target.is_text() => Ok(Value::Text(scalar_to_text(v, env, m)?)),
         Value::Int(n) => {
             if target.is_bool() {
                 Ok(Value::Bool(n != 0))
@@ -680,7 +686,6 @@ pub(crate) fn cast_array_element(v: Value, target: ScalarType) -> Result<Value> 
         }
         Value::Text(s) if target.is_float() => Ok(Value::Float64(parse_f64_literal(&s)?)),
         Value::Text(s) => Ok(Value::Int(parse_int_literal(&s, target)?)),
-        Value::Uuid(u) if target.is_text() => Ok(Value::Text(render_uuid(&u))),
         Value::Uuid(u) if target.is_bytea() => Ok(Value::Bytea(u.to_vec())),
         Value::Bytea(b) if target.is_uuid() => {
             let len = b.len();
@@ -696,10 +701,33 @@ pub(crate) fn cast_array_element(v: Value, target: ScalarType) -> Result<Value> 
     }
 }
 
+/// Render one non-null scalar as text — the `* → text` cast (spec/types/casts.toml, types.md §5).
+/// Every type uses its own output form, the same text a result cell renders (`Value::render`),
+/// except `timestamptz`, which renders in the SESSION zone (timezones.md §9.5) and charges the
+/// `timezone` unit for a finite instant (±infinity consult no zone). Shared by the scalar cast and
+/// the element-wise `T[] → text[]` cast.
+pub(crate) fn scalar_to_text(v: Value, env: &EvalEnv, m: &mut Meter) -> Result<String> {
+    use crate::timestamp::{NEG_INFINITY, POS_INFINITY};
+    match v {
+        Value::Text(s) | Value::Json(s) | Value::JsonPath(s) => Ok(s),
+        Value::Timestamptz(mc) => {
+            if mc != NEG_INFINITY && mc != POS_INFINITY {
+                m.charge(COSTS.timezone);
+                m.guard()?;
+            }
+            Ok(crate::timestamp::render_timestamptz_in(
+                mc,
+                &env.exec.session.time_zone,
+            ))
+        }
+        v => Ok(v.render()),
+    }
+}
+
 /// Whether jed admits an element-wise `array → other-element-array` cast from source element scalar
 /// `from` to target element scalar `to` (spec/design/array.md §7). Mirrors the scalar cast matrix
 /// (spec/types/casts.toml) for the pairs an array element can take: numeric↔numeric, text→numeric/
-/// boolean/uuid, boolean⇄i32, uuid⇄text, uuid⇄bytea. The identity (`from == to`) is handled by the
+/// boolean/uuid, boolean⇄i32, any scalar→text, uuid⇄bytea. The identity (`from == to`) is handled by the
 /// caller (it needs no cast node). A pair outside this set is rejected `0A000` at resolve.
 pub(crate) fn scalar_pair_castable(from: ScalarType, to: ScalarType) -> bool {
     let numeric = |t: ScalarType| t.is_integer() || t.is_decimal() || t.is_float();
@@ -715,8 +743,11 @@ pub(crate) fn scalar_pair_castable(from: ScalarType, to: ScalarType) -> bool {
     if from == ScalarType::Int32 && to.is_bool() {
         return true; // i32 → boolean
     }
-    if from.is_uuid() && (to.is_text() || to.is_bytea()) {
-        return true; // uuid → text / bytea (the uuid cast slice)
+    if to.is_text() {
+        return true; // any scalar → text (each type's output form — the scalar text cast)
+    }
+    if from.is_uuid() && to.is_bytea() {
+        return true; // uuid → bytea (the uuid cast slice)
     }
     if from.is_bytea() && to.is_uuid() {
         return true; // bytea → uuid (the jed-only uuid cast)

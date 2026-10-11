@@ -1,0 +1,272 @@
+# Casting any built-in scalar to text (spec/types/casts.toml, spec/design/types.md §5).
+# CAST(x AS text) / x::text / x::varchar(n) renders each type's own output form — the same text a
+# result cell shows: integers and decimals in base 10 (decimal keeps its display scale), booleans as
+# true/false, bytea as \x hex, uuid lowercase 8-4-4-4-12, timestamp/date/interval in the ISO /
+# `postgres` styles, json verbatim, jsonb and jsonpath canonical. A timestamptz renders in the
+# SESSION zone (timezones.md §9.5) with PostgreSQL's offset spelling (+HH, +HH:MM, +HH:MM:SS), so the
+# cast is STABLE and an index expression containing it is 42P17, as in PostgreSQL. Element-wise
+# T[] -> text[] casts each element the same way (array.md §7). Float renders are limited here to
+# values whose shortest round-trip layout every core and PostgreSQL agree on (the float-render-layout
+# determinism exception).
+#
+# OUT of this corpus (cannot live in the PG-clean oracle): the casts stay EXPLICIT — an implicit or
+# assignment use (INSERT INTO text_col VALUES (1), text_col = 1) is 42804 where PostgreSQL accepts
+# it — and composite/range -> text stay 0A000; both are covered by per-core unit tests
+# (cast_scalar_text).
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, dml.insert, query.select, query.select_no_from, query.where_eq, query.order_by, types.i16, types.i32, types.i64, types.decimal, types.f32, types.f64, types.boolean, types.text, types.varchar_length, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.date, types.interval, types.json, types.jsonb, types.jsonpath, types.array, cast.explicit, cast.operator, cast.string_literal, cast.array, cast.scalar_text, session.timezone, resource.cost_metering
+
+# load-timezone: America/New_York
+# load-timezone: Asia/Kolkata
+
+# ============================================================================================
+# Scalars from literals and expressions
+# ============================================================================================
+
+# integers render in base 10 (the bare literal, an i16/i64 typed value, a negative expression)
+query TTTT nosort
+SELECT 1::text, CAST(smallint '-32768' AS text), (9223372036854775807::bigint)::text, (2 - 7)::text
+----
+1
+-32768
+9223372036854775807
+-5
+
+# decimal keeps its display scale; numeric(p,s) re-scales first
+query TTT nosort
+SELECT 1.50::text, (-0.001)::text, (CAST(2.345 AS numeric(5,2)))::text
+----
+1.50
+-0.001
+2.35
+
+# boolean renders as true/false (PostgreSQL's bool -> text cast, not boolout's t/f)
+query TT nosort
+SELECT true::text, (1 > 2)::text
+----
+true
+false
+
+# floats whose shortest round-trip layout every core agrees on, plus the special values
+query TTTTTT nosort
+SELECT 1.5::float8::text, (-0.25::float8)::text, 0.1::real::text, 'NaN'::float8::text, 'Infinity'::float8::text, '-Infinity'::real::text
+----
+1.5
+-0.25
+0.1
+NaN
+Infinity
+-Infinity
+
+# bytea renders as \x lowercase hex; the empty value is the bare prefix
+query TT nosort
+SELECT '\x00ff7A'::bytea::text, '\x'::bytea::text
+----
+\x00ff7a
+\x
+
+# uuid renders as canonical lowercase
+query T nosort
+SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid::text
+----
+a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+
+# timestamp / date: ISO, trailing fractional zeros trimmed, BC suffix, infinities bare
+query TTTTT nosort
+SELECT (timestamp '2024-03-15 13:47:23.500')::text, (timestamp '0044-03-15 12:00:00 BC')::text, ('infinity'::timestamp)::text, (date '2024-02-29')::text, ('-infinity'::date)::text
+----
+2024-03-15 13:47:23.5
+0044-03-15 12:00:00 BC
+infinity
+2024-02-29
+-infinity
+
+# interval renders in the postgres IntervalStyle
+query TTT nosort
+SELECT (interval '1 year 2 months 3 days 04:05:06.7')::text, (interval '-1 day 2 hours')::text, (interval '0 seconds')::text
+----
+1 year 2 mons 3 days 04:05:06.7
+-1 days +02:00:00
+00:00:00
+
+# json verbatim, jsonb canonical, jsonpath canonical
+query TTT nosort
+SELECT '{"b": 1,  "a": [1, 2]}'::json::text, '{"b": 1,  "a": [1, 2]}'::jsonb::text, '$.a[*] ? (@ > 1)'::jsonpath::text
+----
+{"b": 1,  "a": [1, 2]}
+{"a": [1, 2], "b": 1}
+$."a"[*]?(@ > 1)
+
+# text -> text is the identity; varchar(n) truncates the rendered text to n characters
+query TTTT nosort
+SELECT 'abc'::text, 12345::varchar(3), CAST(true AS varchar(2)), (timestamp '2024-03-15 13:47:23')::varchar(10)
+----
+abc
+123
+tr
+2024-03-15
+
+# NULL -> NULL for every source type
+query TTTT nosort
+SELECT CAST(NULL::int AS text), (NULL::date)::text, (NULL::jsonb)::text, (NULL::bytea)::varchar(1)
+----
+NULL
+NULL
+NULL
+NULL
+
+# the result is a real text value: text functions take it, and it compares as text
+query TIB nosort
+SELECT upper(true::text), length(3.14159::text), 10::text < 9::text
+----
+TRUE
+7
+true
+
+# ============================================================================================
+# timestamptz renders in the session zone
+# ============================================================================================
+
+# UTC (the default session zone): a +00 suffix
+query TT nosort
+SELECT (timestamptz '2024-03-15 02:30:00.25+00')::text, ('infinity'::timestamptz)::text
+----
+2024-03-15 02:30:00.25+00
+infinity
+
+# timezone: America/New_York
+query TTT nosort
+SELECT (timestamptz '2024-03-15 02:30:00+00')::text, (timestamptz '2024-01-15 12:00:00+00')::text, ('-infinity'::timestamptz)::text
+----
+2024-03-14 22:30:00-04
+2024-01-15 07:00:00-05
+-infinity
+
+# a pre-standard-time instant renders the zone's local mean time offset, seconds included
+# timezone: America/New_York
+query T nosort
+SELECT (timestamptz '1800-06-01 12:00:00+00')::text
+----
+1800-06-01 07:03:58-04:56:02
+
+# a half-hour offset renders minutes
+# timezone: Asia/Kolkata
+query T nosort
+SELECT (timestamptz '2024-03-15 02:30:00+00')::text
+----
+2024-03-15 08:00:00+05:30
+
+# a finite instant charges one timezone unit for its zone lookup; ±infinity consult no zone
+# timezone: America/New_York
+# cost: 4
+query TT nosort
+SELECT (timestamptz '2024-03-15 02:30:00+00')::text, ('infinity'::timestamptz)::text
+----
+2024-03-14 22:30:00-04
+infinity
+
+# varchar(n) truncates the session-zone rendering
+# timezone: America/New_York
+query T nosort
+SELECT (timestamptz '2024-03-15 02:30:00+00')::varchar(10)
+----
+2024-03-14
+
+# ============================================================================================
+# Over table columns
+# ============================================================================================
+
+statement ok
+CREATE TABLE t (id integer PRIMARY KEY, i i64, d numeric(8,3), b boolean, by bytea, ts timestamp, tz timestamptz, iv interval, jb jsonb)
+
+statement ok
+INSERT INTO t VALUES
+  (1, 10, 1.5, true, '\xdeadbeef', '2024-01-01 00:00:00', '2024-07-04 16:00:00+00', '90 minutes', '{"k": [true, null]}'),
+  (2, -3, 0, false, '\x', '1999-12-31 23:59:59.999999', '2024-12-25 05:00:00+00', '1 mon -1 day', '"s"'),
+  (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+
+query TTTTTTT rowsort
+SELECT i::text, d::text, b::text, by::text, ts::text, iv::text, jb::text FROM t
+----
+-3
+0.000
+false
+\x
+1999-12-31 23:59:59.999999
+1 mon -1 days
+"s"
+10
+1.500
+true
+\xdeadbeef
+2024-01-01 00:00:00
+01:30:00
+{"k": [true, null]}
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+# timezone: America/New_York
+query IT rowsort
+SELECT id, tz::text FROM t
+----
+1
+2024-07-04 12:00:00-04
+2
+2024-12-25 00:00:00-05
+3
+NULL
+
+# a cast in WHERE and ORDER BY compares as text (so '10' < '-3' is false, '10' sorts before '9')
+query I nosort
+SELECT id FROM t WHERE i::text = '10'
+----
+1
+
+query T nosort
+SELECT i::text FROM t WHERE i IS NOT NULL ORDER BY i::text
+----
+-3
+10
+
+# an immutable text cast is a valid index expression
+statement ok
+CREATE INDEX t_i_text ON t ((i::text))
+
+query I nosort
+SELECT id FROM t WHERE i::text = '-3'
+----
+2
+
+# the timestamptz cast reads the session zone, so it is not immutable
+statement error 42P17
+CREATE INDEX t_tz_text ON t ((tz::text))
+
+# ============================================================================================
+# Element-wise T[] -> text[]
+# ============================================================================================
+
+query TTTT nosort
+SELECT (ARRAY[1, NULL, 3]::text[])::text, (ARRAY[true, false]::text[])::text, (ARRAY[1.50, 2.0]::text[])::text, (ARRAY[date '2024-01-02']::text[])::text
+----
+{1,NULL,3}
+{true,false}
+{1.50,2.0}
+{2024-01-02}
+
+# a rendered element that needs quoting is quoted by the outer array_out
+query TT nosort
+SELECT (ARRAY['\x01'::bytea]::text[])::text, (ARRAY[timestamp '2024-01-02 03:04:05']::text[])::text
+----
+{"\\x01"}
+{"2024-01-02 03:04:05"}
+
+# timezone: America/New_York
+query T nosort
+SELECT (ARRAY[timestamptz '2024-01-15 12:00:00+00']::text[])::text
+----
+{"2024-01-15 07:00:00-05"}

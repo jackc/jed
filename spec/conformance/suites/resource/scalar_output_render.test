@@ -1,9 +1,9 @@
 # Output-constructing kernels (spec/design/cost.md §8.1), slice S3: escaping renders. encode, the
-# quote_* functions, array → text, and jsonb → text/json are growth kernels: escaping or hex can expand
+# quote_* functions, array → text, bytea → text, and jsonb → text/json are growth kernels: escaping or hex can expand
 # their input, so they charge scalar_byte × the rendered UTF-8 bytes after rendering, never reserve the
 # scalar allowance, and are free over constant operands.
 # jed-SPECIFIC resource contract (PostgreSQL has no cost meter or scalar allowance).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, query.aggregates, types.array, types.bytea, types.json, types.jsonb, types.varchar_length, types.i32, types.text, cast.array, cast.explicit, cast.operator, resource.cost_metering, resource.cost_limit, resource.scalar_memory
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, query.aggregates, types.array, types.bytea, types.json, types.jsonb, types.varchar_length, types.i32, types.text, cast.array, cast.explicit, cast.operator, cast.scalar_text, resource.cost_metering, resource.cost_limit, resource.scalar_memory
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, b bytea, s text, n text, a text[], j jsonb, js json)
@@ -77,6 +77,21 @@ query T nosort
 SELECT js::text FROM t
 ----
 {"k": 1}
+
+# bytea → text renders \x hex: \x6162 is 6 bytes. A fixed-width render (i32 → text) is not charged.
+# cost: 11
+query TT nosort
+SELECT b::text, id::text FROM t
+----
+\x6162
+1
+
+# bytea[] → text[] is charged for the whole result array.
+# cost: 203
+query T nosort
+SELECT (ARRAY[b, b]::text[])::text FROM t
+----
+{"\\x6162","\\x6162"}
 
 # Renders never reserve the allowance, so a tiny budget still admits them.
 # max_scalar_bytes: 1

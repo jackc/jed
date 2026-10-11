@@ -102,7 +102,7 @@ test("missing_ok turns the unset error into NULL", () => {
 
 test("a NULL name propagates to NULL", () => {
   // null = "propagates": a NULL name short-circuits to NULL before the lookup. A text column holding
-  // a NULL is the typed-NULL the corpus cannot write (jed defers text casts, so no NULL::text yet).
+  // a NULL is the typed-NULL the corpus cannot write.
   const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY, n text)");
   db.execute("INSERT INTO t VALUES (1, NULL)");

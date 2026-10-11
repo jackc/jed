@@ -335,16 +335,18 @@ bytea/uuid/composite; [conformance.md §1](conformance.md)) — **no new tag**.
     inverted `[l:u]` bound `2202E`, a bad element its own parse error — all *per row*);
   - **`array → text`** (`xs::text`) — `array_out` renders `{…}` per row (multidim nested braces, the
     `[l:u]=` bound prefix). **Explicit only** — stricter than PG's assignment-cast-to-text, the same
-    strict-matrix convention as `uuid`/`json` → text (so `INSERT INTO text_col VALUES (arr)` and
+    strict-matrix convention as the scalar → text casts (so `INSERT INTO text_col VALUES (arr)` and
     `text_col = arr` stay `42804`; §10.11);
   - **element-wise `array → other-element-array`** (`xs::i64[]`, `numeric[]::i32[]`) — each non-null
     element through the **scalar** cast to the target element (the shape — dims/lbounds — is
     preserved, a NULL element stays NULL), for the [casts.toml](../types/casts.toml)-admitted element
-    pairs (numeric↔numeric, `text`→numeric/boolean/uuid, boolean⇄`i32`, `uuid`⇄`text`/`bytea`,
-    `bytea`→`uuid`); an array of the **same** element type is the identity. A scalar element pair with
-    no cast is `42804` (jed's strict-matrix convention — PG reports `42846`); a composite-element
-    array cast is `0A000` (the composite cast surface stays deferred). Overflow traps `22003` per
-    element.
+    pairs (numeric↔numeric, `text`→numeric/boolean/uuid, boolean⇄`i32`, any scalar→`text`,
+    `uuid`⇄`bytea`); an array of the **same** element type is the identity. A `→ text[]` cast renders
+    each element exactly as the scalar `→ text` cast does (a `timestamptz` element in the session zone,
+    making the cast STABLE — [types.md](types.md) §5). A scalar element pair with no cast is `42804`
+    (jed's strict-matrix convention — PG reports `42846`); a composite-element — or `json`/`jsonb`/
+    `jsonpath`-element — array cast is `0A000` (the container cast surface stays deferred). Overflow
+    traps `22003` per element.
 
   A bind parameter into an array type (`$1::i32[]`) stays `0A000` (the container-param narrowing, §4).
   No on-disk format change. The numeric/text element pairs agree with PostgreSQL and are oracle-checked

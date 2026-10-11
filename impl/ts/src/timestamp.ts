@@ -328,7 +328,11 @@ function pad(n: bigint, width: number): string {
   return n.toString().padStart(width, "0");
 }
 
-function renderDatetime(micros: bigint, isTz: boolean): string {
+// renderDatetime renders micros (a wall-clock reading) as ISO text. offset is the UT offset in seconds
+// to suffix for a timestamptz (null for a timestamp): PostgreSQL's EncodeTimezone spelling — +HH,
+// +HH:MM when the minutes are nonzero, +HH:MM:SS when the seconds are (an LMT offset), placed before
+// any " BC" era.
+function renderDatetime(micros: bigint, offset: number | null): string {
   if (micros === NEG_INFINITY) return "-infinity";
   if (micros === POS_INFINITY) return "infinity";
   const [y, mo, d, h, mi, s, us] = civilFromMicros(micros);
@@ -339,17 +343,32 @@ function renderDatetime(micros: bigint, isTz: boolean): string {
     const frac = pad(us, 6).replace(/0+$/, "");
     out += `.${frac}`;
   }
-  if (isTz) out += "+00";
+  if (offset !== null) {
+    const a = Math.abs(offset);
+    const [h, mi, sec] = [Math.floor(a / 3600), Math.floor(a / 60) % 60, a % 60];
+    const two = (n: number) => String(n).padStart(2, "0");
+    out += `${offset < 0 ? "-" : "+"}${two(h)}`;
+    if (sec !== 0) out += `:${two(mi)}:${two(sec)}`;
+    else if (mi !== 0) out += `:${two(mi)}`;
+  }
   out += era;
   return out;
 }
 
 // renderTimestamp renders a timestamp value to its canonical text.
 export function renderTimestamp(micros: bigint): string {
-  return renderDatetime(micros, false);
+  return renderDatetime(micros, null);
 }
 
 // renderTimestamptz renders a timestamptz value to its canonical text (always UTC, fixed +00).
 export function renderTimestamptz(micros: bigint): string {
-  return renderDatetime(micros, true);
+  return renderDatetime(micros, 0);
+}
+
+// renderTimestamptzAt renders a timestamptz instant as text at UT offset utoff (seconds) — the
+// timestamptz → text cast, whose caller supplies the session zone's offset in effect at the instant
+// (timezones.md §9.5): the local wall clock plus the offset suffix. ±infinity render bare.
+export function renderTimestamptzAt(micros: bigint, utoff: number): string {
+  if (micros === NEG_INFINITY || micros === POS_INFINITY) return renderDatetime(micros, null);
+  return renderDatetime(micros + BigInt(utoff) * 1_000_000n, utoff);
 }

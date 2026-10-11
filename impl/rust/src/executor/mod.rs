@@ -38,7 +38,6 @@ pub(crate) use crate::timestamp::{parse_timestamp, parse_timestamptz};
 pub(crate) use crate::types::{DecimalTypmod, ScalarType, Type};
 pub(crate) use crate::value::{
     ArrayVal, RangeVal, ThreeValued, Value, and3, from3, not3, or3, parse_bytea_hex, parse_uuid,
-    render_uuid,
 };
 pub(crate) use std::borrow::Cow;
 pub(crate) use std::collections::{BTreeSet, HashMap, HashSet};

@@ -62,8 +62,8 @@ Functions whose output is at most a small multiple of their inputs do not use th
 large bulk statements are not capped by it. These are the array builders (`ARRAY[…]`,
 `array_append`, `array_cat`, array `||`), the JSON builders (`jsonb_build_object`, `to_jsonb`,
 `jsonb_set`, jsonb `||`, and the like), and the functions and casts that render text with escapes
-(`encode`, `quote_literal`, `quote_ident`, `quote_nullable`, and casts from an array or `jsonb` to
-text). Instead they charge one cost unit per byte they build (32 per array element or JSON node
+or hex (`encode`, `quote_literal`, `quote_ident`, `quote_nullable`, and casts from an array,
+`bytea`, or `jsonb` to text). Instead they charge one cost unit per byte they build (32 per array element or JSON node
 plus its contents), which lets `max_cost` stop a query that doubles a value over and over. A value
 built only from constants, such as `ARRAY[1, 2, 3]` in a `WHERE` clause, costs nothing extra.
 

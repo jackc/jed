@@ -28,7 +28,7 @@ import {
   lt3,
   notDistinctFrom,
   nullValue,
-  renderUuid,
+  render as renderValue,
   textValue,
   timestampValue,
   timestamptzValue,
@@ -173,7 +173,7 @@ import {
   regexpNthMatch,
 } from "./regex.ts";
 import type { RegexProgram } from "./regex.ts";
-import { NEG_INFINITY, POS_INFINITY, makeTimestamp } from "./timestamp.ts";
+import { NEG_INFINITY, POS_INFINITY, makeTimestamp, renderTimestamptzAt } from "./timestamp.ts";
 import {
   instantToLocalMicros,
   localToInstantMicros,
@@ -288,11 +288,15 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       m.charge(COSTS.operatorEval);
       const v = evalExpr(e.operand, row, env, m);
       if (v.kind === "null") return nullValue();
-      const out = evalCast(v, e.target, e.typmod);
-      // Rendering jsonb to text/json is a growth kernel: escapes can expand strings (cost.md §8.1).
-      // The full render is charged, before any varchar(n) truncation below.
+      // Any scalar → text (casts.toml, types.md §5): the type's own output form, timestamptz in the
+      // session zone.
+      const out = isText(e.target)
+        ? textValue(scalarToText(v, env, m))
+        : evalCast(v, e.target, e.typmod);
+      // Rendering bytea (hex) or jsonb (escapes) to text, and jsonb to json, is a growth kernel
+      // (cost.md §8.1). The full render is charged, before any varchar(n) truncation below.
       if (
-        v.kind === "jsonb" &&
+        (v.kind === "jsonb" || v.kind === "bytea") &&
         (out.kind === "text" || out.kind === "json") &&
         !rexprIsConstant(e.operand)
       )
@@ -335,9 +339,19 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
       const scalar = e.toElem.scalar;
       const elements = v.elements.map((el) =>
-        el.kind === "null" ? nullValue() : evalCast(el, scalar, null),
+        el.kind === "null"
+          ? nullValue()
+          : isText(scalar)
+            ? textValue(scalarToText(el, env, m))
+            : evalCast(el, scalar, null),
       );
-      return { kind: "array", dims: v.dims, lbounds: v.lbounds, elements };
+      const out: Value = { kind: "array", dims: v.dims, lbounds: v.lbounds, elements };
+      // bytea → text renders hex, so a bytea[] → text[] cast is a growth kernel (cost.md §8.1),
+      // charged for the whole result array.
+      if (isText(scalar) && v.elements.some((el) => el.kind === "bytea")) {
+        return growthResult(m, [e.operand], out);
+      }
+      return out;
     }
     case "neg": {
       m.charge(operatorCost("neg"));
@@ -2502,14 +2516,34 @@ export function roundFloatHalfAway(x: number, places: number): number {
 // evalCast evaluates a (non-NULL) CAST to target. int→int range-checks (22003); int→decimal
 // widens then coerces to the typmod; decimal→int rounds half-away to scale 0 then range-checks
 // (22003); decimal→decimal re-scales to the typmod (spec/design/decimal.md §6).
+// scalarToText renders one non-null scalar as text — the any-scalar → text cast (spec/types/casts.toml,
+// types.md §5). Every type uses its own output form, the same text a result cell renders (render),
+// except timestamptz, which renders in the SESSION zone (timezones.md §9.5) and charges the timezone
+// unit for a finite instant (±infinity consult no zone). Shared by the scalar cast and the
+// element-wise T[] → text[] cast.
+function scalarToText(v: Value, env: EvalEnv, m: Meter): string {
+  switch (v.kind) {
+    case "text":
+    case "json":
+    case "jsonpath":
+      return v.text;
+    case "timestamptz": {
+      if (v.micros === NEG_INFINITY || v.micros === POS_INFINITY) return renderValue(v);
+      m.charge(COSTS.timezone);
+      m.guard();
+      const local = instantToLocalMicros(env.exec.session.timeZone, v.micros);
+      return renderTimestamptzAt(v.micros, Number((local - v.micros) / 1_000_000n));
+    }
+    default:
+      return renderValue(v);
+  }
+}
+
 export function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | null): Value {
   // The JSON cast matrix (spec/design/json.md §6.1). text → json/jsonb is the only runtime text
   // cast (every other text cast target is resolver-rejected): json validates + stores verbatim
   // (22P02 on malformed); jsonb parses + canonicalizes.
   if (v.kind === "text") {
-    // text → text: the identity (a varchar(n) length, if any, truncates at the cast eval site —
-    // types.md §15). The resolver only produces a text→text cast node when a length is present.
-    if (isText(target)) return v;
     if (isJson(target)) {
       validateJson(v.text);
       return jsonValue(v.text);
@@ -2531,10 +2565,9 @@ export function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | n
     // An int target (i16/i32/i64): parseIntLiteral range-checks against target (22003).
     return intValue(parseIntLiteral(v.text, target));
   }
-  // uuid → text (canonical lowercase 8-4-4-4-12) and uuid → bytea (the 16 raw bytes) — the uuid
-  // cast slice (casts.toml/types.md §14).
+  // uuid → bytea (the 16 raw bytes) — the uuid cast slice (casts.toml/types.md §14). uuid → text is
+  // scalarToText.
   if (v.kind === "uuid") {
-    if (isText(target)) return textValue(renderUuid(v.bytes));
     if (isBytea(target)) return byteaValue(v.bytes);
     throw new Error("BUG: resolver rejects this uuid cast target");
   }
@@ -2552,17 +2585,16 @@ export function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | n
     }
     throw new Error("BUG: resolver rejects this bytea cast target");
   }
-  // json → text is the identity on the verbatim bytes; json → jsonb re-parses + canonicalizes;
-  // json → json is the identity.
+  // json → jsonb re-parses + canonicalizes; json → json is the identity (json → text is
+  // scalarToText: the identity on the verbatim bytes).
   if (v.kind === "json") {
-    if (isText(target)) return textValue(v.text);
     if (isJson(target)) return jsonValue(v.text);
     if (isJsonb(target)) return jsonbValue(jsonbIn(v.text));
     throw new Error("BUG: resolver rejects this json cast target");
   }
-  // jsonb → text / json renders the canonical form (jsonb_out); jsonb → jsonb is the identity.
+  // jsonb → json renders the canonical form (jsonb_out); jsonb → jsonb is the identity (jsonb →
+  // text is scalarToText).
   if (v.kind === "jsonb") {
-    if (isText(target)) return textValue(jsonbOut(v.node));
     if (isJson(target)) return jsonValue(jsonbOut(v.node));
     if (isJsonb(target)) return v;
     throw new Error("BUG: resolver rejects this jsonb cast target");

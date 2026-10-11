@@ -493,7 +493,7 @@ func resolvedToScalar(t resolvedType) (scalarType, bool) {
 // scalarPairCastable reports whether jed admits an element-wise array→array cast from source element
 // scalar `from` to target element scalar `to` (spec/design/array.md §7). Mirrors the scalar cast
 // matrix (spec/types/casts.toml) for the pairs an array element can take: numeric↔numeric,
-// text→numeric/boolean/uuid, boolean⇄i32, uuid⇄text, uuid⇄bytea. The identity (from == to) is
+// text→numeric/boolean/uuid, boolean⇄i32, any scalar→text, uuid⇄bytea. The identity (from == to) is
 // handled by the caller. A pair outside this set is rejected (42804) at resolve.
 func scalarPairCastable(from, to scalarType) bool {
 	numeric := func(t scalarType) bool { return t.IsInteger() || t.IsDecimal() || t.IsFloat() }
@@ -506,7 +506,9 @@ func scalarPairCastable(from, to scalarType) bool {
 		return true
 	case from == scalarInt32 && to.IsBool():
 		return true
-	case from.IsUuid() && (to.IsText() || to.IsBytea()):
+	case to.IsText():
+		return true // any scalar → text (each type's output form)
+	case from.IsUuid() && to.IsBytea():
 		return true
 	case from.IsBytea() && to.IsUuid():
 		return true

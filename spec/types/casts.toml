@@ -25,11 +25,8 @@
 #   text -> uuid : runtime uuid_in (the same PG-flexible parser as the literal cast); 22P02 on a
 #                  malformed string. EXPLICIT — matches PostgreSQL exactly (PG's text->uuid is an
 #                  explicit I/O cast; there is no pg_cast row, so it is never implicit/assignment).
-#   uuid -> text : the canonical lowercase 8-4-4-4-12 spelling (uuid_out). EXPLICIT — STRICTER than
-#                  PostgreSQL (which assignment-casts any type to text via I/O), the same strict-matrix
-#                  convention as decimal->int (below) and jed's json/jsonb->text casts: jed forbids the
-#                  silent (assignment/implicit) coercion, only the explicit CAST/`::` spelling. So
-#                  `INSERT INTO text_col VALUES (uuid_expr)` / `text_col = uuid_expr` stay 42804.
+#   uuid -> text : the canonical lowercase 8-4-4-4-12 spelling (uuid_out) — one of the any-scalar ->
+#                  text casts (the section at the end of this file).
 #   uuid -> bytea / bytea -> uuid : the 16 raw bytes, both directions. A jed cast PostgreSQL LACKS
 #                  (PG `bytea::uuid` / `uuid::bytea` is 42846 cannot_coerce) — a deliberate, documented
 #                  divergence: a uuid IS exactly 16 bytes, so the conversion is natural and lossless.
@@ -51,15 +48,17 @@
 # explicit). A single-quoted string still lands in a timestamp/timestamptz/date column by LITERAL
 # ADAPTATION (the `TIMESTAMP '…'` / `DATE '…'` keyword literal / resolve-time coercion), NOT a (text,
 # T) cast pair — but the RUNTIME text -> date cast has since LANDED as a real (text, date) pair
-# (the runtime text→date section below, ../design/date.md §6). STILL DEFERRED: text -> timestamp /
-# timestamptz, datetime -> text (a formatting surface — to_char / session-zone rendering), and
-# timestamp/timestamptz/date <-> interval (interval is a span, not an instant).
+# (the runtime text→date section below, ../design/date.md §6), and datetime -> text is part of the
+# any-scalar -> text section at the end of this file (timestamptz renders in the SESSION zone).
+# STILL DEFERRED: text -> timestamp / timestamptz, and timestamp/timestamptz/date <-> interval
+# (interval is a span, not an instant).
 #
 # interval (scalars.toml) is likewise STORABLE with NO cast rules here. A single-quoted string
 # lands in an interval column by LITERAL ADAPTATION (parsed in an interval context), and the
 # `INTERVAL '...'` keyword literal names the type directly — neither is a (text, interval) CAST.
-# `CAST(x AS interval)` and casting FROM an interval are DEFERRED to a later cast slice (0A000 /
-# 42804), exactly like the deferred text casts (../design/interval.md §6).
+# `CAST(x AS interval)` and casting FROM an interval to anything but text are DEFERRED to a later
+# cast slice (0A000 / 42804) (../design/interval.md §6); interval -> text is in the any-scalar ->
+# text section at the end of this file.
 #
 # STRING-LITERAL coercion is the one (text -> T) cast admitted ahead of the general cast slice,
 # and it is NOT a (from, to) pair in this matrix because its source is a string LITERAL, not the
@@ -78,10 +77,10 @@
 # object), so the three array casts route through the same out-of-matrix path the array literal uses,
 # keeping this matrix scalar-only. (1) runtime text -> T[]: array_in per row. (2) array -> text:
 # array_out per row, EXPLICIT-only (stricter than PG's assignment-cast-to-text, the same convention
-# as uuid/json -> text below — INSERT INTO text_col VALUES (arr) stays 42804). (3) element-wise
+# as the scalar -> text casts below — INSERT INTO text_col VALUES (arr) stays 42804). (3) element-wise
 # array -> other-element-array: each element through the SCALAR cast defined HERE (so the admitted
 # element pairs are exactly numeric<->numeric, text->numeric/boolean/uuid, boolean<->i32,
-# uuid<->text/bytea, bytea->uuid — this file is the source of truth); a forbidden scalar element pair
+# any scalar->text, uuid<->bytea — this file is the source of truth); a forbidden scalar element pair
 # is 42804 (PG 42846), a composite-element array cast 0A000. The element cast reuses each scalar pair's
 # rule below (typmod-free — an array type takes no modifier), so it inherits their 22003/22P02 traps.
 #
@@ -250,8 +249,8 @@ overflow_error = "22003"
 # text <-> f64: the `float '...'` typed literal / CAST(<string literal> AS f64) is the
 # text-LITERAL -> f64 coercion (the string-literal cast above, ../design/grammar.md §36 — and
 # f64's string parse DOES accept e-notation and Infinity/NaN, unlike a bare decimal literal).
-# A RUNTIME CAST(text_col AS f64) and CAST(float_expr AS text) stay DEFERRED (0A000), the
-# general runtime-text-cast slice — so they are NOT (from,to) pairs here, exactly like decimal.
+# The RUNTIME CAST(text_col AS f64) is the (text, f64) row in the runtime-text section below, and
+# CAST(float_expr AS text) the (f64, text) row in the any-scalar -> text section at the end.
 
 # --- within the float family: f32 <-> f64 (the tower) -------------------------
 # f32 -> f64 is LOSSLESS (every binary32 is an exact binary64), so it is IMPLICIT — the
@@ -275,8 +274,8 @@ overflow_error = "22003"
 # Same strict rules as f64: int/decimal -> f32 explicit (lossy; nearest binary32,
 # round-ties-to-even; finite overflow traps 22003); f32 -> integer explicit (round half-away,
 # range-check 22003; NaN/±Inf -> 22003); f32 -> decimal explicit (exact decimal of the
-# binary32, then typmod scale; NaN/±Inf -> 22003). text <-> f32 via the `real '...'` typed
-# literal only; runtime text casts deferred (0A000) — not (from,to) pairs, like f64.
+# binary32, then typmod scale; NaN/±Inf -> 22003). text <-> f32: the runtime-text and any-scalar ->
+# text sections below, like f64.
 [[cast]]
 from = "i16"
 to = "f32"
@@ -490,3 +489,93 @@ to = "date"
 mode = "explicit"
 on_overflow = "trap"
 overflow_error = "22008"
+
+# --- any scalar -> text (../design/types.md §5) -------------------------------------------------
+# CAST(x AS text) / x::text / x::varchar(n) from every built-in scalar renders the type's OWN OUTPUT
+# FORM — the text a result cell of that type shows: base-10 integers and decimals (decimal keeps its
+# display scale), true/false (PostgreSQL's bool -> text cast, not boolout's t/f), each core's shortest
+# round-trip float (layout core-specific under the float-render-layout determinism exception), bytea
+# \x hex, uuid canonical lowercase, timestamp/date/interval in the ISO / `postgres` styles, json
+# verbatim, jsonb/jsonpath canonical. timestamptz renders in the SESSION zone with PostgreSQL's offset
+# spelling (+HH, +HH:MM, +HH:MM:SS) — a hand-written, zone-dependent transform (like the datetime
+# casts above), charging one timezone unit per finite instant, and STABLE (an index expression
+# containing it is 42P17); every other pair is immutable. All EXPLICIT — STRICTER than PostgreSQL,
+# which assignment-casts any type to text via I/O: jed forbids the silent coercion, so
+# `INSERT INTO text_col VALUES (1)` / `text_col = 1` stay 42804. Never traps; NULL -> NULL. A
+# varchar(n) target truncates the rendered text (types.md §15). bytea and jsonb renders are growth
+# kernels charged for their output (../design/cost.md §8.1). Oracle-checked
+# (suites/cast/scalar_to_text.test, postgres:18). text -> text is the identity (not listed).
+[[cast]]
+from = "i16"
+to = "text"
+mode = "explicit"
+
+[[cast]]
+from = "i32"
+to = "text"
+mode = "explicit"
+
+[[cast]]
+from = "i64"
+to = "text"
+mode = "explicit"
+
+[[cast]]
+from = "decimal"
+to = "text"
+mode = "explicit"
+
+[[cast]]
+from = "f32"
+to = "text"
+mode = "explicit"
+
+[[cast]]
+from = "f64"
+to = "text"
+mode = "explicit"
+
+[[cast]]
+from = "boolean"
+to = "text"
+mode = "explicit"
+
+[[cast]]
+from = "bytea"
+to = "text"
+mode = "explicit"
+
+[[cast]]
+from = "timestamp"
+to = "text"
+mode = "explicit"
+
+[[cast]]
+from = "timestamptz"
+to = "text"
+mode = "explicit"
+
+[[cast]]
+from = "date"
+to = "text"
+mode = "explicit"
+
+[[cast]]
+from = "interval"
+to = "text"
+mode = "explicit"
+
+[[cast]]
+from = "json"
+to = "text"
+mode = "explicit"
+
+[[cast]]
+from = "jsonb"
+to = "text"
+mode = "explicit"
+
+[[cast]]
+from = "jsonpath"
+to = "text"
+mode = "explicit"

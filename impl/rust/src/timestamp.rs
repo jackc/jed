@@ -376,7 +376,11 @@ pub fn make_timestamp(
 
 // --- rendering ---------------------------------------------------------------
 
-fn render(micros: i64, is_tz: bool) -> String {
+/// Render `micros` (a wall-clock reading) as ISO text. `offset` is the UT offset in seconds to
+/// suffix for a `timestamptz` (`None` for a `timestamp`): PostgreSQL's `EncodeTimezone` spelling —
+/// `+HH`, `+HH:MM` when the minutes are nonzero, `+HH:MM:SS` when the seconds are (an LMT offset),
+/// placed before any ` BC` era.
+fn render(micros: i64, offset: Option<i32>) -> String {
     if micros == NEG_INFINITY {
         return "-infinity".to_string();
     }
@@ -391,8 +395,16 @@ fn render(micros: i64, is_tz: bool) -> String {
         out.push('.');
         out.push_str(frac.trim_end_matches('0'));
     }
-    if is_tz {
-        out.push_str("+00");
+    if let Some(utoff) = offset {
+        let sign = if utoff < 0 { '-' } else { '+' };
+        let a = utoff.unsigned_abs();
+        let (h, mi, s) = (a / 3600, a / 60 % 60, a % 60);
+        out.push_str(&format!("{sign}{h:02}"));
+        if s != 0 {
+            out.push_str(&format!(":{mi:02}:{s:02}"));
+        } else if mi != 0 {
+            out.push_str(&format!(":{mi:02}"));
+        }
     }
     out.push_str(era);
     out
@@ -400,10 +412,21 @@ fn render(micros: i64, is_tz: bool) -> String {
 
 /// Render a `timestamp` value to its canonical text.
 pub fn render_timestamp(micros: i64) -> String {
-    render(micros, false)
+    render(micros, None)
 }
 
 /// Render a `timestamptz` value to its canonical text (always UTC, fixed `+00`).
 pub fn render_timestamptz(micros: i64) -> String {
-    render(micros, true)
+    render(micros, Some(0))
+}
+
+/// Render a `timestamptz` instant as text in `zone` — the `timestamptz → text` cast, which follows
+/// the session zone (timezones.md §9.5): the local wall clock plus the offset in effect at the
+/// instant. ±infinity render bare.
+pub fn render_timestamptz_in(micros: i64, zone: &crate::timezone::ZoneRef) -> String {
+    if micros == NEG_INFINITY || micros == POS_INFINITY {
+        return render(micros, None);
+    }
+    let off = crate::timezone::offset_at_ref(zone, micros.div_euclid(MICROS_PER_SEC));
+    render(micros + off.utoff as i64 * MICROS_PER_SEC, Some(off.utoff))
 }

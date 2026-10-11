@@ -132,9 +132,9 @@ test("finite float rows survive an on-disk round-trip (toImage → loadEngine)",
   ]);
   const image = db.toImage(GOLDEN_PAGE_SIZE, 1n);
   const loaded = Database.fromImage(image);
-  // f32 0.1 frounds to 0.10000000149011612 — its shortest binary32 form.
+  // f32 0.1 frounds to 0.100000001490116…; its shortest binary32 form renders "0.1".
   assert.deepEqual(query(loaded, "SELECT a, b FROM t ORDER BY id"), [
-    ["1.5", "0.10000000149011612"],
+    ["1.5", "0.1"],
     ["-2.25", "-3.5"],
     ["100000.5", "1"],
   ]);
@@ -144,9 +144,10 @@ test("finite float rows survive an on-disk round-trip (toImage → loadEngine)",
 
 test("f32 0.1 differs from f64 0.1 (Math.fround applied)", () => {
   const db = memDb().session();
-  assert.deepEqual(query(db, "SELECT CAST('0.1' AS f32), CAST('0.1' AS f64)"), [
-    ["0.10000000149011612", "0.1"],
-  ]);
+  // Both render "0.1" (each width's shortest round trip), but the f32 is the binary32 nearest 0.1,
+  // which widened to f64 is visibly not the f64 0.1.
+  assert.deepEqual(query(db, "SELECT CAST('0.1' AS f32), CAST('0.1' AS f64)"), [["0.1", "0.1"]]);
+  assert.deepEqual(query(db, "SELECT CAST(CAST('0.1' AS f32) AS f64)"), [["0.10000000149011612"]]);
   // Aliases real / float resolve to the two widths.
   assert.deepEqual(query(db, "SELECT CAST('1.5' AS real)"), [["1.5"]]);
   assert.deepEqual(query(db, "SELECT float '2.5'"), [["2.5"]]); // `float` = f64

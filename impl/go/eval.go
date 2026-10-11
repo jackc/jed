@@ -1294,13 +1294,24 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if v.Kind == ValNull {
 			return NullValue(), nil
 		}
-		out, err := evalCast(v, e.result, e.typmod)
-		if err != nil {
-			return Value{}, err
+		var out Value
+		if e.result.IsText() {
+			// Any scalar → text (casts.toml, types.md §5): the type's own output form, timestamptz in
+			// the session zone.
+			s, err := scalarToText(v, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			out = TextValue(s)
+		} else {
+			out, err = evalCast(v, e.result, e.typmod)
+			if err != nil {
+				return Value{}, err
+			}
 		}
-		// Rendering jsonb to text/json is a growth kernel: escapes can expand strings (cost.md §8.1).
-		// The full render is charged, before any varchar(n) truncation below.
-		if v.Kind == ValJsonb && (out.Kind == ValText || out.Kind == ValJson) && !rexprIsConstant(e.operand) {
+		// Rendering bytea (hex) or jsonb (escapes) to text, and jsonb to json, is a growth kernel
+		// (cost.md §8.1). The full render is charged, before any varchar(n) truncation below.
+		if (v.Kind == ValJsonb || v.Kind == ValBytea) && (out.Kind == ValText || out.Kind == ValJson) && !rexprIsConstant(e.operand) {
 			if err := chargeOutput(m, out); err != nil {
 				return Value{}, err
 			}
@@ -1340,21 +1351,37 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		scalar := e.castElem.Scalar
 		src := v.arrayVal()
 		newElems := make([]Value, len(src.Elements))
+		// bytea → text renders hex, so a bytea[] → text[] cast is a growth kernel (cost.md §8.1),
+		// charged for the whole result array.
+		grows := false
 		for i, el := range src.Elements {
 			if el.Kind == ValNull {
 				newElems[i] = NullValue()
 				continue
 			}
-			// The element cast runs the SAME scalar conversion evalCast does (an array type takes no
-			// typmod, so a decimal target is the unconstrained form — typmod nil). The resolver gate
-			// (scalarPairCastable) guarantees the (element, target) pair is admitted.
+			// The element cast runs the SAME scalar conversion the scalar cast does (an array type
+			// takes no typmod, so a decimal target is the unconstrained form — typmod nil). The
+			// resolver gate (scalarPairCastable) guarantees the (element, target) pair is admitted.
+			if scalar.IsText() {
+				grows = grows || el.Kind == ValBytea
+				s, err := scalarToText(el, env, m)
+				if err != nil {
+					return Value{}, err
+				}
+				newElems[i] = TextValue(s)
+				continue
+			}
 			ce, err := evalCast(el, scalar, nil)
 			if err != nil {
 				return Value{}, err
 			}
 			newElems[i] = ce
 		}
-		return arrayValueOf(&ArrayVal{Dims: src.Dims, Lbounds: src.Lbounds, Elements: newElems}), nil
+		out := arrayValueOf(&ArrayVal{Dims: src.Dims, Lbounds: src.Lbounds, Elements: newElems})
+		if grows {
+			return growthResult(m, []*rExpr{e.operand}, out)
+		}
+		return out, nil
 	case reNeg:
 		m.Charge(operatorCost("neg"))
 		v, err := e.operand.eval(row, env, m)
@@ -3928,6 +3955,28 @@ func evalArith(op binaryOp, x, y int64, result scalarType) (Value, error) {
 	return IntValue(v), nil
 }
 
+// scalarToText renders one non-null scalar as text — the any-scalar → text cast (spec/types/casts.toml,
+// types.md §5). Every type uses its own output form, the same text a result cell renders (Render),
+// except timestamptz, which renders in the SESSION zone (timezones.md §9.5) and charges the timezone
+// unit for a finite instant (±infinity consult no zone). Shared by the scalar cast and the
+// element-wise T[] → text[] cast.
+func scalarToText(v Value, env *evalEnv, m *costMeter) (string, error) {
+	switch v.Kind {
+	case ValText, ValJson, ValJsonPath:
+		return v.str(), nil
+	case ValTimestamptz:
+		if v.Int != negInfinity && v.Int != posInfinity {
+			m.Charge(costs.Timezone)
+			if err := m.Guard(); err != nil {
+				return "", err
+			}
+		}
+		return renderTimestamptzIn(v.Int, env.exec.session.timeZone), nil
+	default:
+		return v.Render(), nil
+	}
+}
+
 // evalCast evaluates a (non-NULL) CAST to target. int→int range-checks (22003); int→decimal
 // widens then coerces to the typmod; decimal→int rounds half-away to scale 0 then range-checks
 // (22003); decimal→decimal re-scales to the typmod (spec/design/decimal.md §6).
@@ -3936,12 +3985,6 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 	// cast (every other text cast target is resolver-rejected): json validates + stores verbatim
 	// (22P02 on malformed); jsonb parses + canonicalizes.
 	if v.Kind == ValText {
-		// text → text: the identity (a varchar(n) length, if any, truncates at the reCast call
-		// site — types.md §15). The resolver only produces a text→text reCast node when a length is
-		// present, so this arm is unreachable without one.
-		if target.IsText() {
-			return TextValue(v.str()), nil
-		}
 		if target.IsJson() {
 			if err := validateJSON(v.str()); err != nil {
 				return Value{}, err
@@ -4007,12 +4050,9 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 		}
 		return IntValue(n), nil
 	}
-	// uuid → text (canonical lowercase 8-4-4-4-12) and uuid → bytea (the 16 raw bytes) — the uuid
-	// cast slice (casts.toml/types.md §14).
+	// uuid → bytea (the 16 raw bytes) — the uuid cast slice (casts.toml/types.md §14). uuid → text
+	// is scalarToText.
 	if v.Kind == ValUuid {
-		if target.IsText() {
-			return TextValue(renderUUID([]byte(v.str()))), nil
-		}
 		if target.IsBytea() {
 			return ByteaValue([]byte(v.str())), nil
 		}
@@ -4030,12 +4070,10 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 		}
 		panic("BUG: resolver rejects this bytea cast target")
 	}
-	// json → text is the identity on the verbatim bytes; json → jsonb re-parses + canonicalizes;
-	// json → json is the identity.
+	// json → jsonb re-parses + canonicalizes; json → json is the identity (json → text is
+	// scalarToText: the identity on the verbatim bytes).
 	if v.Kind == ValJson {
 		switch {
-		case target.IsText():
-			return TextValue(v.str()), nil
 		case target.IsJson():
 			return JsonValue(v.str()), nil
 		case target.IsJsonb():
@@ -4048,11 +4086,10 @@ func evalCast(v Value, target scalarType, typmod *decimalTypmod) (Value, error) 
 			panic("BUG: resolver rejects this json cast target")
 		}
 	}
-	// jsonb → text / json renders the canonical form (jsonb_out); jsonb → jsonb is the identity.
+	// jsonb → json renders the canonical form (jsonb_out); jsonb → jsonb is the identity (jsonb →
+	// text is scalarToText).
 	if v.Kind == ValJsonb {
 		switch {
-		case target.IsText():
-			return TextValue(jsonbOut(v.jsonb())), nil
 		case target.IsJson():
 			return JsonValue(jsonbOut(v.jsonb())), nil
 		case target.IsJsonb():

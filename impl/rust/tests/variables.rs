@@ -116,7 +116,7 @@ fn missing_ok_turns_the_unset_error_into_null() {
 #[test]
 fn a_null_name_propagates_to_null() {
     // null = "propagates": a NULL name short-circuits to NULL before the lookup. A text column holding
-    // a NULL is the typed-NULL the corpus cannot write (jed defers text casts, so no NULL::text yet).
+    // a NULL is the typed-NULL the corpus cannot write.
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());

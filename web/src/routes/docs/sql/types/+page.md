@@ -20,6 +20,15 @@
   ('3.14159'::text)::numeric(4,2)  AS text_to_numeric,
   ('yes'::text)::boolean           AS text_to_bool;`;
 
+	const toTextDemo = `SELECT
+  42::text                                      AS int_to_text,
+  CAST(1.50 AS text)                            AS keeps_scale,
+  true::text                                    AS bool_to_text,
+  '\\x00ff'::bytea::text                        AS bytea_to_text,
+  (timestamptz '2024-03-15 02:30:00+00')::text  AS in_session_zone,
+  (interval '90 minutes')::text                 AS interval_to_text,
+  12345::varchar(3)                             AS truncated;`;
+
 	const varcharDemo = `SELECT
   'hello world'::varchar(5)  AS truncated,
   'café'::varchar(4)         AS fits_by_codepoint,
@@ -142,6 +151,26 @@ current day (`'today'`), an index expression containing `::date` from text is re
 in PostgreSQL. (Parsing a string into a `timestamp` /
 `interval` / `bytea` is a separate feature — use that type's literal form, e.g. `timestamp '2024-01-15 10:00'`.)
 
+## Casting to text
+
+Every built-in scalar casts **to** `text` with an explicit `CAST` / `::` (or `::varchar(n)`, which
+truncates the result). The text is the type's own output form — exactly what a result cell of that
+type shows: numbers in base 10 (a `numeric` keeps its scale), `true` / `false`, `bytea` as `\x` hex,
+`uuid` in lowercase, dates, timestamps, and intervals in PostgreSQL's ISO / `postgres` styles, `json`
+verbatim and `jsonb` canonical:
+
+<LiveSql query={toTextDemo} rows={1} />
+
+A `timestamptz` renders **in the session time zone**, with PostgreSQL's offset spelling (`-05`,
+`+05:30`); the panel runs in the default `UTC` session. Because the result depends on the session,
+an index expression containing `timestamptz::text` is rejected (`42P17`), as in PostgreSQL; every
+other cast to text is fine in an index. An `array → text[]` cast renders each element the same way.
+A `float` uses each engine's shortest round-trip form, so very large or small values may differ in
+exponent spelling between the Rust, Go, and TypeScript engines.
+
+Unlike PostgreSQL, the cast is **explicit only**: `INSERT INTO t (name) VALUES (42)` and
+`name = 42` stay type errors (`42804`). A composite or range value does not cast to `text` yet.
+
 ## varchar(n) length limits
 
 `varchar(n)` (and the jed alias `string(n)`) is `text` with a **maximum length**, counted in Unicode
@@ -181,7 +210,7 @@ different element type casts **each element** through the scalar cast, preservin
 
 The element cast follows the scalar matrix exactly — so widening (`i32[] → i64[]`), `numeric[] → i32[]`
 (rounding half away from zero), and `text[] → i32[]` all work, while an element pair with no scalar
-cast is a type error (`42804`). Like `uuid`/`json → text`, `array → text` is explicit-only: an array
+cast is a type error (`42804`). Like every cast to `text`, `array → text` is explicit-only: an array
 never silently lands in a `text` column.
 
 ## JSON assignment
@@ -252,9 +281,9 @@ explicit zone:
 
 `date_part(field, source)` is the `double precision` twin of `EXTRACT` — same fields, but the field
 name is a runtime string, and over a `date` the timestamp fields exist (`date_part('hour', d)` is
-`0`), exactly as in PostgreSQL. (The `text`↔`timestamp`/`timestamptz` casts are deferred — cast a
+`0`), exactly as in PostgreSQL. (The `text → timestamp`/`timestamptz` casts are deferred — cast a
 string with the `timestamp '…'` literal form instead. A runtime `text` value **does** cast to
-`date`.)
+`date`, and every datetime casts to `text` — a `timestamptz` in the session time zone.)
 
 ### Date arithmetic
 

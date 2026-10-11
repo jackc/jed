@@ -1909,7 +1909,8 @@ existing members.
 | `array_replace(a, old, new)` | amplifier | S1 | `payload(a)` | `payload(result)` |
 | jsonb `\|\|`, `jsonb_set`, `jsonb_insert`, `json[b]_build_array`/`_object` (spread or `VARIADIC`), `json[b]_object(text[] [, text[]])`, `to_json`, `to_jsonb`, `array_to_json`, `JSON_SCALAR`, `JSON_SERIALIZE`, `jsonb_path_query_array`, `JSON_QUERY` when a wrapper builds an array | growth | S2 | — | `payload(result)` |
 | `jsonb_pretty` | amplifier | S2 | `payload(jsonb)` | UTF-8 bytes of the result |
-| `encode`, `quote_literal`, `quote_ident`, `quote_nullable`; casts from an array to `text`, and from `jsonb` to `text` or `json` | growth | S3 | — | UTF-8 bytes of the result |
+| `encode`, `quote_literal`, `quote_ident`, `quote_nullable`; casts from an array, `bytea`, or `jsonb` to `text`, and from `jsonb` to `json` | growth | S3 | — | UTF-8 bytes of the result |
+| element-wise `bytea[]` → `text[]` cast | growth | S3 | — | `payload(array)` |
 
 The amplifiers' exact sizes:
 
@@ -1982,10 +1983,12 @@ Rules for both classes:
   one character of at most 4 bytes), `upper`/`lower`/`initcap`, `reverse`,
   `decode`.
 - Renders of fixed-width or decimal values (casts to `text` from integer, float,
-  decimal, uuid, and date/time types, `to_hex`, `chr`): bounded by a constant or by
-  a digit count that `decimal_work` already charges.
-- Casts that return their input's text unchanged (`json` to `text`), and renders
-  that jed does not implement yet (casts to `text` from `bytea`, composites, and
+  decimal, boolean, uuid, and date/time/interval types, and the element-wise array
+  casts from them, `to_hex`, `chr`): bounded by a constant or by a digit count that
+  `decimal_work` already charges. A `timestamptz` render additionally charges one
+  `timezone` unit per finite instant for its session-zone lookup.
+- Casts that return their input's text unchanged (`json` and `jsonpath` to `text`),
+  and renders that jed does not implement yet (casts to `text` from composites and
   ranges). The missing renders join the table when they land: each escapes its
   input, so each can grow it.
 - Parsing text into an array, `json`, `jsonb`, composite, or range: the result is

@@ -3758,6 +3758,8 @@ pub(crate) fn resolve(
                             (Some(src_s), ColType::Scalar(tgt_s))
                                 if scalar_pair_castable(src_s, *tgt_s) =>
                             {
+                                // timestamptz elements render in the session zone (STABLE).
+                                params.nonimmutable |= src_s.is_timestamptz() && tgt_s.is_text();
                                 Ok((
                                     RExpr::ArrayCast {
                                         inner: Box::new(rinner),
@@ -3948,53 +3950,57 @@ pub(crate) fn resolve(
                     ))),
                 };
             }
-            // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11), EXCEPT
-            // json/jsonb → text (the JSON cast matrix, json.md §6.1): json → text is the identity on
-            // the verbatim bytes, jsonb → text renders the canonical form. A NULL adapts. Every other
-            // text cast target is still a 0A000 this slice — including `$1::text` (declaring a bind
-            // param as text via a cast stays deferred, the params.rs contract — guarded first so it
-            // does not resolve to an untyped-NULL text node and trip 42P18).
+            // Casting TO text (casts.toml, types.md §5): every built-in scalar renders its own output
+            // form, the text a result cell shows — json verbatim, jsonb canonical, uuid lowercase,
+            // bytea `\x` hex, timestamptz in the SESSION zone (timezones.md §9.5). Explicit only —
+            // stricter than PG's assignment cast to text (a documented divergence), so `INSERT INTO
+            // text_col VALUES (1)` / `text_col = 1` stay 42804. A `varchar(n)` length truncates the
+            // rendered text (types.md §15). `$1::text` declares the parameter as text, like every
+            // other cast target (api.md §5). Composite and range sources stay 0A000.
             if target.is_text() {
-                if matches!(inner.as_ref(), Expr::Param(_)) {
-                    return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        "casting to text is not supported yet",
-                    ));
-                }
-                let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
+                let (rinner, ity) = if matches!(inner.as_ref(), Expr::Param(_)) {
+                    resolve(scope, inner, Some(ScalarType::Text), agg, params)?
+                } else {
+                    resolve(scope, inner, None, agg, params)?
+                };
+                let cast = |rinner: RExpr| RExpr::Cast {
+                    inner: Box::new(rinner),
+                    target,
+                    typmod: None,
+                    varchar_len,
+                };
                 return match ity {
-                    // text → text: the identity, UNLESS a `varchar(n)` length is present — then it
-                    // becomes a real Cast node that silently truncates to n code points at eval
-                    // (types.md §15). A NULL adapts (NULL → NULL, no truncation needed).
+                    // A NULL adapts (NULL → NULL, no truncation needed).
                     ResolvedType::Null => Ok((rinner, ResolvedType::Text)),
+                    // text → text: the identity, UNLESS a `varchar(n)` length is present — then it
+                    // becomes a real Cast node that silently truncates to n code points at eval.
                     ResolvedType::Text => Ok((
                         match varchar_len {
-                            Some(_) => RExpr::Cast {
-                                inner: Box::new(rinner),
-                                target,
-                                typmod: None,
-                                varchar_len,
-                            },
+                            Some(_) => cast(rinner),
                             None => rinner,
                         },
                         ResolvedType::Text,
                     )),
-                    // json/jsonb → text (the JSON cast matrix) and uuid → text (the uuid cast slice,
-                    // casts.toml/types.md §14: the canonical lowercase 8-4-4-4-12 form). Explicit —
-                    // stricter than PG's assignment-cast-to-text (a documented divergence). A
-                    // `varchar(n)` length truncates the rendered text (types.md §15).
-                    ResolvedType::Json | ResolvedType::Jsonb | ResolvedType::Uuid => Ok((
-                        RExpr::Cast {
-                            inner: Box::new(rinner),
-                            target,
-                            typmod: None,
-                            varchar_len,
-                        },
-                        ResolvedType::Text,
-                    )),
+                    // timestamptz → text reads the session zone, so it is STABLE (42P17 in an index
+                    // expression), as PG's timestamptz_out is.
+                    ResolvedType::Timestamptz => {
+                        params.nonimmutable = true;
+                        Ok((cast(rinner), ResolvedType::Text))
+                    }
+                    ResolvedType::Int(_)
+                    | ResolvedType::Decimal
+                    | ResolvedType::Float(_)
+                    | ResolvedType::Bool
+                    | ResolvedType::Bytea
+                    | ResolvedType::Uuid
+                    | ResolvedType::Timestamp
+                    | ResolvedType::Date
+                    | ResolvedType::Interval
+                    | ResolvedType::Json
+                    | ResolvedType::Jsonb
+                    | ResolvedType::JsonPath => Ok((cast(rinner), ResolvedType::Text)),
                     // array → text (spec/design/array.md §7): `array_out` renders `{…}` per row.
-                    // Explicit only — like uuid/json → text, stricter than PG's assignment cast (so
-                    // `INSERT INTO text_col VALUES (arr)` stays 42804). Handled by `ArrayCast`.
+                    // Explicit only — like the scalar casts above. Handled by `ArrayCast`.
                     ResolvedType::Array(_) => Ok((
                         RExpr::ArrayCast {
                             inner: Box::new(rinner),
@@ -4002,7 +4008,7 @@ pub(crate) fn resolve(
                         },
                         ResolvedType::Text,
                     )),
-                    _ => Err(EngineError::new(
+                    ResolvedType::Composite(_) | ResolvedType::Range(_) => Err(EngineError::new(
                         SqlState::FeatureNotSupported,
                         "casting to text is not supported yet",
                     )),

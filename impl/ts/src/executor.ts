@@ -30485,7 +30485,7 @@ export function resolvedToScalar(t: ResolvedType): ScalarType | null {
 // Whether jed admits an element-wise array→array cast from source element scalar `from` to target
 // element scalar `to` (spec/design/array.md §7). Mirrors the scalar cast matrix (spec/types/casts.toml)
 // for the pairs an array element can take: numeric↔numeric, text→numeric/boolean/uuid, boolean⇄i32,
-// uuid⇄text, uuid⇄bytea. The identity (from === to) is handled by the caller. A pair outside this set
+// any scalar→text, uuid⇄bytea. The identity (from === to) is handled by the caller. A pair outside this set
 // is rejected (42804) at resolve.
 export function scalarPairCastable(from: ScalarType, to: ScalarType): boolean {
   const numeric = (t: ScalarType) => isInteger(t) || isDecimal(t) || isFloat(t);
@@ -30493,7 +30493,8 @@ export function scalarPairCastable(from: ScalarType, to: ScalarType): boolean {
   if (isText(from) && (numeric(to) || isBool(to) || isUuid(to))) return true;
   if (isBool(from) && to === "i32") return true;
   if (from === "i32" && isBool(to)) return true;
-  if (isUuid(from) && (isText(to) || isBytea(to))) return true;
+  if (isText(to)) return true; // any scalar → text (each type's output form)
+  if (isUuid(from) && isBytea(to)) return true;
   if (isBytea(from) && isUuid(to)) return true;
   return false;
 }

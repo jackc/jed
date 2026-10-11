@@ -227,8 +227,25 @@ listed).
   `22007`/`22008` — STABLE and un-indexable, [date.md](date.md) §6). The runtime text→`T` cast to
   the remaining **string-native** scalars `timestamp` / `timestamptz` / `interval` / `bytea` stays
   **deferred** (`0A000`), each its own
-  follow-on. `CAST(1 AS text)` (casting *to* text) is likewise deferred, **except** `uuid → text`
-  (§14) and `json`/`jsonb → text`. The `text → text` identity is implicit, like any identity cast.
+  follow-on. The `text → text` identity is implicit, like any identity cast.
+- **Casting *to* text** (`CAST(x AS text)`, `x::text`, `x::varchar(n)`) is admitted from **every
+  built-in scalar**, each rendered in its **own output form** — exactly the text a result cell of
+  that type shows: integers and decimals in base 10 (decimal keeps its display scale), `true` /
+  `false` (PostgreSQL's `bool → text` cast, not `boolout`'s `t`/`f`), floats via each core's
+  shortest round-trip formatter, `bytea` as `\x` hex, `uuid` canonical lowercase, `timestamp` /
+  `date` / `interval` in the ISO / `postgres` styles, `json` verbatim, `jsonb` / `jsonpath`
+  canonical. The one context-dependent render is **`timestamptz`, which renders in the session
+  zone** with PostgreSQL's offset spelling (`+HH`, `+HH:MM`, `+HH:MM:SS` for a local-mean-time
+  offset — [timezones.md](timezones.md) §9.5); that cast charges one `timezone` unit per finite
+  instant and is **STABLE**, so an index expression containing it is `42P17` (as PG's
+  `timestamptz_out` is). Every other render is immutable and indexable. A `varchar(n)` target
+  truncates the rendered text (§15); `$1::text` types the parameter as text. All pairs are
+  **explicit only** — stricter than PostgreSQL, which assignment-casts any type to text — so
+  `INSERT INTO text_col VALUES (1)` and `text_col = 1` stay `42804`. A float render's *layout*
+  (exponent threshold) is core-specific under the `float-render-layout` determinism exception;
+  its shortest round-trip *digits* agree. Rendering `bytea` and `jsonb` can expand the value, so
+  those two casts are growth kernels charged for their output ([cost.md](cost.md) §8.1).
+  Composite and range sources stay `0A000`.
 - **Strictness is preserved.** The string→number/bool coercion fires only when the type is
   **named** (a literal or CAST). A **bare** string in a numeric context does **not** silently
   become a number: `WHERE int_col = '42'` is `42804` (§4), and a bare string adapts *only* to the

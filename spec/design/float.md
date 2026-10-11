@@ -226,7 +226,7 @@ one is lossy or representation-changing:
 | `decimal → f64` | explicit | nearest binary64 to the exact decimal value, round-ties-to-even. Never traps (a huge decimal → ±Inf? **traps `22003`** rather than yielding Inf, matching the finite-overflow rule §3). |
 | `f64 → int{16,32,64}` | explicit | round **half away from zero** to an integer (jed's one rounding mode — decimal.md §3), then range-check (`22003`). NaN/±Inf → `22003`. **Documented divergence from PG**, which rounds half-to-even (`rint`); jed keeps one engine-wide mode. |
 | `f64 → decimal` | explicit | the exact decimal of the binary64 value, then the target typmod's scale coercion (decimal.md §3). NaN/±Inf → `22003` (decimal is finite). |
-| `text ⇄ f64` | — | the `float '…'` literal coercion (§4) is the text→float *literal* path; a **runtime** `CAST(text_col AS f64)` and `CAST(float_expr AS text)` are **deferred `0A000`** (the general runtime-text-cast slice — types.md §5), exactly as for the other types. |
+| `text ⇄ f64` | explicit | the `float '…'` literal coercion (§4) is the text→float *literal* path; a **runtime** `CAST(text_col AS f64)` parses per row (the runtime-text-cast slice), and `CAST(float_expr AS text)` renders the value with the §9 shortest round-trip formatter (types.md §5) — so a float's text *layout* reaches a text value, under the `float-render-layout` exception. |
 
 `int`/`decimal` → `f64` is explicit (not implicit like `int → decimal`) precisely because
 it is **lossy** — the whole point of the strict matrix.
@@ -331,6 +331,17 @@ render PG-style: `Infinity`, `-Infinity`, `NaN` (and `-0` renders `-0`). The *di
 shortest-round-trip are mathematically unique, so the cores already agree on them; only the
 *layout* (exponent threshold/spelling) may differ — which the `R` tag absorbs, so jed does
 **not** hand-roll a shared formatter (the exemption's payoff, determinism.md §6).
+
+An `f32` renders the **binary32** shortest round trip — the fewest digits that read back to the same
+binary32 (Rust's `f32` `Display`, Go's `FormatFloat(f, 'g', -1, 32)`; TypeScript, which holds an
+`f32` widened in a `Number`, searches the precisions 1–9 for the shortest that `Math.fround`s back),
+so `real '0.1'` renders `0.1` in every core, not the widened binary64's `0.10000000149011612`.
+
+The explicit `CAST(x AS text)` of a float ([types.md](types.md) §5) produces exactly this rendering
+as a `text` value. That is the one path by which a float's layout leaves the terminal render and
+reaches a value that can be compared, measured, or stored; it is covered by the same
+`float-render-layout` exception. The corpus pins such casts only for values whose layout every core
+and PostgreSQL agree on.
 
 **The `R` (real) render tag** (conformance.md §1 — long reserved, now in use). A column tagged
 `R` is compared **by value, not by string**: both expected and actual are parsed to f64 and

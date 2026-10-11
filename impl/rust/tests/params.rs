@@ -383,22 +383,23 @@ fn param_cast_operator_narrows_and_traps_22003() {
 
 #[test]
 fn param_cast_to_deferred_target_is_0a000() {
-    // Casting a parameter to a deferred target (text) is 0A000, like any non-string-literal
-    // cast to text — the `::` operator adds no behavior of its own beyond the spelling.
+    // Casting a parameter to a deferred target (interval) is 0A000, like any non-string-literal
+    // cast to interval — the `::` operator adds no behavior of its own beyond the spelling.
     let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
     assert_eq!(
-        err_code(&mut db, "SELECT $1::text", &[Value::Int(1)]),
+        err_code(&mut db, "SELECT $1::interval", &[Value::Int(1)]),
         "0A000"
     );
 }
 
 #[test]
 fn cast_operator_inherits_deferred_narrowings_and_rejects_lone_colon() {
-    // `::` desugars to CAST, so casting a non-string-literal value to text is the same deferred
-    // 0A000 narrowing the CAST spelling carries (a documented PG divergence). The boolean cast has
-    // since landed — `5::boolean` is now valid (→ true; tests/cast_bool_int.rs).
+    // `::` desugars to CAST, so casting a non-string-literal value to interval is the same deferred
+    // 0A000 narrowing the CAST spelling carries (a documented PG divergence). The boolean and text
+    // casts have since landed — `5::boolean` / `5::text` are now valid (tests/cast_bool_int.rs,
+    // suites/cast/scalar_to_text.test).
     let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
-    assert_eq!(err_code(&mut db, "SELECT 5::text", &[]), "0A000");
+    assert_eq!(err_code(&mut db, "SELECT 5::interval", &[]), "0A000");
     // A lone `:` is not part of jed's surface — a 42601 syntax error from the lexer.
     assert_eq!(err_code(&mut db, "SELECT 1 : 2", &[]), "42601");
 }

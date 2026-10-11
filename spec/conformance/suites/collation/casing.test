@@ -82,7 +82,7 @@ SELECT upper('𐐨'), lower('𐐀')
 # ============================================================================================
 
 # A bare NULL adapts to text in a casing argument slot (the resolver offers text as the hint), so
-# upper/lower(NULL) is a text NULL — no ::text cast needed (jed has none yet).
+# upper/lower(NULL) is a text NULL — no ::text cast needed.
 query BB nosort
 SELECT upper(NULL) IS NULL, lower(NULL) IS NULL
 ----

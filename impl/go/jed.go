@@ -477,6 +477,9 @@ var SupportedCapabilities = []string{
 	// PostgreSQL, whose date_in is stable. The strict-ISO accepted grammar agrees with PG and is
 	// oracle-checked; the jed-stricter rejections (DateStyle spellings) are per-core tested.
 	"cast.text_date",
+	// Any built-in scalar → text (casts.toml, types.md §5): each type's own output form,
+	// timestamptz in the session zone (STABLE). Explicit only; composite/range → text stay 0A000.
+	"cast.scalar_text",
 	// Clock-relative date literals (date.md §6): 'today' / 'now' (0), 'tomorrow' (+1),
 	// 'yesterday' (−1) — the STATEMENT clock's day in the SESSION zone (one timezone unit) —
 	// plus the constant 'epoch' (1970-01-01, folds like any literal). Accepted by LITERAL

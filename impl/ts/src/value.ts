@@ -511,10 +511,11 @@ export function render(v: Value): string {
       // (the D tag — spec/design/decimal.md §6).
       return v.dec.render();
     case "f32":
+      // The binary32 shortest round trip (renderFloat32) — what Rust/Go print for an f32.
+      return renderFloat32(v.value);
     case "f64":
       // Native shortest-round-trip (JS Number#toString), the R tag (spec/design/float.md §9).
-      // f32's value is already Math.fround'd (binary32), so its toString is the shortest
-      // form of the binary32 value. Specials render PG-style. NOTE the JS quirk: (-0).toString()
+      // Specials render PG-style. NOTE the JS quirk: (-0).toString()
       // is "0" (and (+0).toString() is "0"), so -0 is special-cased to "-0"; Infinity.toString()
       // is already "Infinity"/"−" handled, and NaN.toString() is "NaN". Layout (exponent
       // threshold) may differ cross-core — absorbed by the R tag's parse-to-value compare.
@@ -1011,6 +1012,20 @@ export function parseRecordTokens(input: string): (string | null)[] | null {
 export function renderFloat(n: number): string {
   if (Object.is(n, -0)) return "-0";
   return n.toString();
+}
+
+// renderFloat32 renders a binary32 value (held widened in a Number) with the fewest significant
+// digits that read back to the same binary32 — the shortest round trip Rust's f32 Display and Go's
+// FormatFloat(…, 32) print. Number#toString alone gives the binary64 shortest form of the widened
+// value (0.1f32 → "0.10000000149011612"), which differs in digits, not just layout. Specials and
+// -0 go through renderFloat.
+export function renderFloat32(n: number): string {
+  if (!Number.isFinite(n) || n === 0) return renderFloat(n);
+  for (let p = 1; p < 9; p++) {
+    const shortest = Number(n.toPrecision(p));
+    if (Math.fround(shortest) === n) return renderFloat(shortest);
+  }
+  return renderFloat(Number(n.toPrecision(9))); // 9 significant digits always round-trip binary32
 }
 
 // eq3 is three-valued equality. NULL compared with anything (including NULL) is

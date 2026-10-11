@@ -2127,13 +2127,13 @@ over unchanged:
   coercion, the same primitive as the `integer '42'` typed literal of §36), `x :: int8` (widen),
   `x :: int2` (narrow, traps `22003`), `d :: int` (decimal→int, round half-away), `n :: numeric(10,2)`
   (re-scale to the typmod);
-- the **deferred narrowings** — casting **to** `text` (the `T → text` render direction, except
-  the landed `json`/`jsonb`/`uuid → text`) is `0A000`: `5 :: text` is `0A000`, identical to
-  `CAST(5 AS text)`; `'5' :: text` is the string identity `'5'`. Casting **from** `text` now
-  reaches the numeric + boolean scalars at runtime (`s :: int`, `s :: numeric(10,2)`,
-  `s :: boolean`, the §36 runtime coercion) and `uuid` (the uuid cast slice); text→`date` /
-  `timestamp` / `timestamptz` / `interval` / `bytea` stay `0A000`, each its own follow-on. Casting
-  **to or from** `interval` (`interval` is a span, not a string-native scalar) stays `0A000` except
+- the **text casts** — casting **to** `text` renders any built-in scalar in its output form
+  (`5 :: text` is `'5'`, identical to `CAST(5 AS text)`; a `timestamptz` renders in the session
+  zone — [types.md](types.md) §5); `'5' :: text` is the string identity `'5'`. Casting **from**
+  `text` reaches the numeric + boolean scalars at runtime (`s :: int`, `s :: numeric(10,2)`,
+  `s :: boolean`, the §36 runtime coercion), `uuid` (the uuid cast slice), and `date`;
+  text→`timestamp` / `timestamptz` / `interval` / `bytea` stay `0A000`, each its own follow-on.
+  Casting **to** `interval` (`interval` is a span, not a string-native scalar) stays `0A000` except
   a string-literal operand;
 - the resolve codes `42704` (unknown type) / `22003` (out of range) / `22P02` (malformed string) /
   `22023` (bad typmod), and a **typmod on the type name** (`x :: numeric(10,2)`), exactly as CAST.

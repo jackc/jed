@@ -1336,6 +1336,8 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				srcS, srcScalar := resolvedToScalar(*ity.elem)
 				tgtScalar := !elemCol.Composite && elemCol.Elem == nil && elemCol.RangeElem == nil
 				if srcScalar && tgtScalar && scalarPairCastable(srcS, elemCol.Scalar) {
+					// timestamptz elements render in the session zone (STABLE).
+					params.nonimmutable = params.nonimmutable || (srcS == scalarTimestamptz && elemCol.Scalar.IsText())
 					ec := elemCol
 					return &rExpr{kind: reArrayCast, operand: rinner, castElem: &ec}, resultRT, nil
 				}
@@ -1448,40 +1450,48 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				)
 			}
 		}
-		// Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11), EXCEPT
-		// json/jsonb → text (the JSON cast matrix, json.md §6.1): json → text is the identity on the
-		// verbatim bytes, jsonb → text renders the canonical form. A NULL adapts. Every other text
-		// cast target is still a 0A000 this slice.
+		// Casting TO text (casts.toml, types.md §5): every built-in scalar renders its own output form,
+		// the text a result cell shows — json verbatim, jsonb canonical, uuid lowercase, bytea \x hex,
+		// timestamptz in the SESSION zone (timezones.md §9.5). Explicit only — stricter than PG's
+		// assignment cast to text (a documented divergence), so INSERT INTO text_col VALUES (1) /
+		// text_col = 1 stay 42804. A varchar(n) length truncates the rendered text (types.md §15).
+		// `$1::text` declares the parameter as text, like every other cast target (api.md §5).
+		// Composite and range sources stay 0A000.
 		if target.IsText() {
-			// A bare parameter has no inferable source type for a text target (text is not a
-			// json/jsonb-target case that declares it), so `$1::text` stays the deferred 0A000 it
-			// was before J3 rather than resolving to an untyped-NULL text node.
+			var innerCtx *scalarType
 			if e.Cast.Inner.Kind == exprParam {
-				return nil, resolvedType{}, newError(FeatureNotSupported, "casting to text is not supported yet")
+				t := scalarText
+				innerCtx = &t
 			}
-			rinner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
+			rinner, ity, err := resolve(s, e.Cast.Inner, innerCtx, ag, params)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
+			textRt := resolvedType{kind: rtText}
+			cast := &rExpr{kind: reCast, operand: rinner, result: target, varchar: varcharLen}
 			switch ity.kind {
 			case rtNull:
-				return rinner, resolvedType{kind: rtText}, nil
+				// A NULL adapts (NULL → NULL, no truncation needed).
+				return rinner, textRt, nil
 			case rtText:
 				// text → text: the identity, UNLESS a varchar(n) length is present — then it becomes a
-				// reCast node that silently truncates to n code points at eval (types.md §15).
+				// reCast node that silently truncates to n code points at eval.
 				if varcharLen != nil {
-					return &rExpr{kind: reCast, operand: rinner, result: target, varchar: varcharLen}, resolvedType{kind: rtText}, nil
+					return cast, textRt, nil
 				}
-				return rinner, resolvedType{kind: rtText}, nil
-			// json/jsonb → text (the JSON cast matrix) and uuid → text (the uuid cast slice,
-			// casts.toml/types.md §14: canonical lowercase 8-4-4-4-12). Explicit — stricter than PG's
-			// assignment-cast-to-text (a documented divergence). A varchar(n) length truncates the result.
-			case rtJson, rtJsonb, rtUuid:
-				return &rExpr{kind: reCast, operand: rinner, result: target, varchar: varcharLen}, resolvedType{kind: rtText}, nil
-			// array → text (spec/design/array.md §7): array_out renders {…} per row. Explicit-only,
-			// like uuid/json → text (stricter than PG's assignment cast). Handled by reArrayCast.
+				return rinner, textRt, nil
+			case rtTimestamptz:
+				// timestamptz → text reads the session zone, so it is STABLE (42P17 in an index
+				// expression), as PG's timestamptz_out is.
+				params.nonimmutable = true
+				return cast, textRt, nil
+			case rtInt, rtDecimal, rtFloat32, rtFloat64, rtBool, rtBytea, rtUuid, rtTimestamp, rtDate,
+				rtInterval, rtJson, rtJsonb, rtJsonPath:
+				return cast, textRt, nil
 			case rtArray:
-				return &rExpr{kind: reArrayCast, operand: rinner}, resolvedType{kind: rtText}, nil
+				// array → text (spec/design/array.md §7): array_out renders {…} per row. Explicit only,
+				// like the scalar casts above. Handled by reArrayCast.
+				return &rExpr{kind: reArrayCast, operand: rinner}, textRt, nil
 			default:
 				return nil, resolvedType{}, newError(FeatureNotSupported, "casting to text is not supported yet")
 			}

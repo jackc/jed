@@ -992,6 +992,8 @@ export function resolve(
             elemCol.kind === "scalar" &&
             scalarPairCastable(srcS, elemCol.scalar)
           ) {
+            // timestamptz elements render in the session zone (STABLE).
+            params.nonimmutable ||= srcS === "timestamptz" && isText(elemCol.scalar);
             return {
               node: { kind: "arrayCast", toElem: elemCol, operand: inner.node },
               type: resultType,
@@ -1095,51 +1097,54 @@ export function resolve(
         }
         return coerceStringLiteral(e.inner.literal.text, target, typmod, varcharLen);
       }
-      // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11), EXCEPT
-      // json/jsonb → text (the JSON cast matrix, json.md §6.1): json → text is the identity on the
-      // verbatim bytes, jsonb → text renders the canonical form. A NULL adapts. Every other text
-      // cast target is still a 0A000 this slice — including `$1::text` (declaring a bind param as
-      // text via a cast stays deferred, the params contract — guarded FIRST so it does not resolve
-      // to an untyped-NULL text node and trip 42P18).
+      // Casting TO text (casts.toml, types.md §5): every built-in scalar renders its own output form,
+      // the text a result cell shows — json verbatim, jsonb canonical, uuid lowercase, bytea \x hex,
+      // timestamptz in the SESSION zone (timezones.md §9.5). Explicit only — stricter than PG's
+      // assignment cast to text (a documented divergence), so INSERT INTO text_col VALUES (1) /
+      // text_col = 1 stay 42804. A varchar(n) length truncates the rendered text (types.md §15).
+      // `$1::text` declares the parameter as text, like every other cast target (api.md §5).
+      // Composite and range sources stay 0A000.
       if (isText(target)) {
-        if (e.inner.kind === "param") {
-          throw engineError("feature_not_supported", "casting to text is not supported yet");
-        }
-        const inner = resolve(scope, e.inner, null, ag, params);
+        const inner = resolve(scope, e.inner, e.inner.kind === "param" ? "text" : null, ag, params);
         const ik = inner.type.kind;
-        // A NULL adapts (NULL → NULL, no truncation needed).
-        if (ik === "null") {
-          return { node: inner.node, type: { kind: "text" } };
-        }
-        // text → text: the identity, UNLESS a varchar(n) length is present — then it becomes a real
-        // cast node that silently truncates to n code points at eval (types.md §15).
-        if (ik === "text") {
-          if (varcharLen !== null) {
+        const textType: ResolvedType = { kind: "text" };
+        const cast: RExpr = { kind: "cast", target, typmod: null, varcharLen, operand: inner.node };
+        switch (ik) {
+          // A NULL adapts (NULL → NULL, no truncation needed).
+          case "null":
+            return { node: inner.node, type: textType };
+          // text → text: the identity, UNLESS a varchar(n) length is present — then it becomes a
+          // real cast node that silently truncates to n code points at eval.
+          case "text":
+            return { node: varcharLen !== null ? cast : inner.node, type: textType };
+          // timestamptz → text reads the session zone, so it is STABLE (42P17 in an index
+          // expression), as PG's timestamptz_out is.
+          case "timestamptz":
+            params.nonimmutable = true;
+            return { node: cast, type: textType };
+          case "int":
+          case "decimal":
+          case "float":
+          case "bool":
+          case "bytea":
+          case "uuid":
+          case "timestamp":
+          case "date":
+          case "interval":
+          case "json":
+          case "jsonb":
+          case "jsonpath":
+            return { node: cast, type: textType };
+          // array → text (spec/design/array.md §7): array_out renders {…} per row. Explicit only,
+          // like the scalar casts above. Handled by arrayCast (toElem null).
+          case "array":
             return {
-              node: { kind: "cast", target, typmod: null, varcharLen, operand: inner.node },
-              type: { kind: "text" },
+              node: { kind: "arrayCast", toElem: null, operand: inner.node },
+              type: textType,
             };
-          }
-          return { node: inner.node, type: { kind: "text" } };
+          default:
+            throw engineError("feature_not_supported", "casting to text is not supported yet");
         }
-        // json/jsonb → text (the JSON cast matrix) and uuid → text (the uuid cast slice,
-        // casts.toml/types.md §14: canonical lowercase 8-4-4-4-12). Explicit — stricter than PG's
-        // assignment-cast-to-text (a documented divergence). A varchar(n) length truncates the result.
-        if (ik === "json" || ik === "jsonb" || ik === "uuid") {
-          return {
-            node: { kind: "cast", target, typmod, varcharLen, operand: inner.node },
-            type: { kind: "text" },
-          };
-        }
-        // array → text (spec/design/array.md §7): array_out renders {…} per row. Explicit-only, like
-        // uuid/json → text (stricter than PG's assignment cast). Handled by arrayCast (toElem null).
-        if (ik === "array") {
-          return {
-            node: { kind: "arrayCast", toElem: null, operand: inner.node },
-            type: { kind: "text" },
-          };
-        }
-        throw engineError("feature_not_supported", "casting to text is not supported yet");
       }
       // A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
       // (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32 / NULL

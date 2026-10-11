@@ -127,7 +127,7 @@ func TestVarMissingOkTurnsTheUnsetErrorIntoNull(t *testing.T) {
 func TestVarNullNamePropagatesToNull(t *testing.T) {
 	t.Parallel()
 	// null = "propagates": a NULL name short-circuits to NULL before the lookup. A text column holding
-	// a NULL is the typed-NULL the corpus cannot write (jed defers text casts, so no NULL::text yet).
+	// a NULL is the typed-NULL the corpus cannot write.
 	db := memDB().Session(SessionOptions{})
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, n text)")
 	sessExec(t, db, "INSERT INTO t VALUES (1, NULL)")

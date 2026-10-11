@@ -472,7 +472,11 @@ func makeTimestamp(year, month, day, hour, minute int64, sec float64) (int64, er
 
 // --- rendering ---------------------------------------------------------------
 
-func renderDatetime(micros int64, isTz bool) string {
+// renderDatetime renders micros (a wall-clock reading) as ISO text. offset is the UT offset in
+// seconds to suffix for a timestamptz (nil for a timestamp): PostgreSQL's EncodeTimezone spelling —
+// +HH, +HH:MM when the minutes are nonzero, +HH:MM:SS when the seconds are (an LMT offset), placed
+// before any " BC" era.
+func renderDatetime(micros int64, offset *int32) string {
 	if micros == negInfinity {
 		return "-infinity"
 	}
@@ -494,15 +498,42 @@ func renderDatetime(micros int64, isTz bool) string {
 		b.WriteByte('.')
 		b.WriteString(frac)
 	}
-	if isTz {
-		b.WriteString("+00")
+	if offset != nil {
+		sign := byte('+')
+		a := int64(*offset)
+		if a < 0 {
+			sign = '-'
+			a = -a
+		}
+		h, mi, sec := a/3600, a/60%60, a%60
+		b.WriteByte(sign)
+		fmt.Fprintf(&b, "%02d", h)
+		if sec != 0 {
+			fmt.Fprintf(&b, ":%02d:%02d", mi, sec)
+		} else if mi != 0 {
+			fmt.Fprintf(&b, ":%02d", mi)
+		}
 	}
 	b.WriteString(era)
 	return b.String()
 }
 
 // RenderTimestamp renders a timestamp value to its canonical text.
-func renderTimestamp(micros int64) string { return renderDatetime(micros, false) }
+func renderTimestamp(micros int64) string { return renderDatetime(micros, nil) }
 
 // RenderTimestamptz renders a timestamptz value to its canonical text (always UTC, fixed +00).
-func renderTimestamptz(micros int64) string { return renderDatetime(micros, true) }
+func renderTimestamptz(micros int64) string {
+	var utc int32
+	return renderDatetime(micros, &utc)
+}
+
+// renderTimestamptzIn renders a timestamptz instant as text in zone — the timestamptz → text cast,
+// which follows the session zone (timezones.md §9.5): the local wall clock plus the offset in effect
+// at the instant. ±infinity render bare.
+func renderTimestamptzIn(micros int64, zone ZoneRef) string {
+	if micros == negInfinity || micros == posInfinity {
+		return renderDatetime(micros, nil)
+	}
+	off := offsetAtRef(zone, floorDiv(micros, 1_000_000))
+	return renderDatetime(micros+int64(off.Utoff)*1_000_000, &off.Utoff)
+}

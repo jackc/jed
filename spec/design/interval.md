@@ -3,7 +3,7 @@
 > The reasoning behind the interval type. The **data is authoritative**
 > ([../types/scalars.toml](../types/scalars.toml) — the type, family, encoding method;
 > [../types/compare.toml](../types/compare.toml) — comparability/ordering;
-> [../types/casts.toml](../types/casts.toml) — casts (deferred);
+> [../types/casts.toml](../types/casts.toml) — casts (only `interval → text` so far);
 > [../functions/catalog.toml](../functions/catalog.toml) — comparison + arithmetic operators;
 > [../fileformat/format.md](../fileformat/format.md) — the on-disk value codec + type code;
 > [../encoding/intervals.toml](../encoding/intervals.toml) — the parse/render vectors).
@@ -194,8 +194,9 @@ exactly-representable `secs`).
 - **Literals.** A single-quoted string adapts in an interval context (§3); the `INTERVAL '…'`
   keyword literal names the type for context-free positions. With no interval context and no
   keyword, a string stays text.
-- **Casts** ([casts.toml](../types/casts.toml)): **deferred**. `CAST(x AS interval)` and casting
-  FROM interval are `0A000` / `42804` (a later cast slice) — exactly like timestamp.
+- **Casts** ([casts.toml](../types/casts.toml)): `interval → text` renders the `postgres`
+  IntervalStyle form above (the any-scalar → text cast, [types.md](types.md) §5). `CAST(x AS
+  interval)` and casting FROM interval to anything else are `0A000` / `42804` (a later cast slice).
 - **Keys.** interval **is** a key (method `interval-span-i128`, [encoding.md §2.10](encoding.md)):
   the 16-byte order-preserving encoding of the canonical 128-bit **span** (§2) — `int-be-signflip`
   at i128 width (bias `2^127`, big-endian). It is a valid `PRIMARY KEY` / ordered secondary index /
