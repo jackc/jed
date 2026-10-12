@@ -4,7 +4,8 @@
 //! The CLI owns splitting: `;` outside strings and comments terminates a statement; the
 //! semicolon is stripped and everything else — including comments, which the engine
 //! accepts (grammar.md §33) — passes through verbatim. The state machine mirrors the
-//! engine lexer's rules exactly: `'...'` with `''` escaping is the only quoting; `--`
+//! engine lexer's rules exactly: `'...'` strings and `"..."` quoted identifiers, each escaping
+//! its delimiter by doubling it (`''`, `""` — grammar.md §3), are the only quoting; `--`
 //! runs to end of line; `/* */` nests. Whitespace-/comment-only statements are skipped.
 
 /// One split statement: its SQL text (terminator stripped, outer whitespace trimmed)
@@ -24,13 +25,14 @@ pub struct SplitError {
 
 enum State {
     Normal,
-    InString,
+    /// Inside a `'…'` string literal or a `"…"` quoted identifier; the byte is the delimiter.
+    Quoted(u8),
     LineComment,
     BlockComment(u32),
 }
 
 /// Split `input` into complete statements. The final statement needs no `;` — a
-/// non-empty remainder at end of input is a statement. An unterminated string or
+/// non-empty remainder at end of input is a statement. An unterminated string, quoted identifier, or
 /// block comment is a `SplitError` (the engine would reject it too; reporting it at
 /// split time gives an input line number).
 ///
@@ -76,10 +78,10 @@ pub fn split(input: &str) -> Result<Vec<Stmt>, SplitError> {
                     finalize(&mut buf, &mut content_line);
                     i += 1;
                 }
-                b'\'' => {
+                b'\'' | b'"' => {
                     content_line.get_or_insert(line);
                     opener_line = line;
-                    state = State::InString;
+                    state = State::Quoted(c);
                     buf.push(c);
                     i += 1;
                 }
@@ -102,21 +104,18 @@ pub fn split(input: &str) -> Result<Vec<Stmt>, SplitError> {
                     i += 1;
                 }
             },
-            State::InString => match c {
-                b'\'' if bytes.get(i + 1) == Some(&b'\'') => {
-                    buf.extend_from_slice(b"''");
+            State::Quoted(q) => {
+                if c == q && bytes.get(i + 1) == Some(&q) {
+                    buf.extend_from_slice(&[q, q]);
                     i += 2;
-                }
-                b'\'' => {
-                    state = State::Normal;
+                } else {
+                    if c == q {
+                        state = State::Normal;
+                    }
                     buf.push(c);
                     i += 1;
                 }
-                _ => {
-                    buf.push(c);
-                    i += 1;
-                }
-            },
+            }
             State::LineComment => {
                 if c == b'\n' || c == b'\r' {
                     state = State::Normal;
@@ -146,9 +145,13 @@ pub fn split(input: &str) -> Result<Vec<Stmt>, SplitError> {
     }
 
     match state {
-        State::InString => {
+        State::Quoted(q) => {
             return Err(SplitError {
-                message: "unterminated string literal".to_string(),
+                message: if q == b'"' {
+                    "unterminated quoted identifier".to_string()
+                } else {
+                    "unterminated string literal".to_string()
+                },
                 line: opener_line,
             });
         }
@@ -209,6 +212,14 @@ mod tests {
                     ("SELECT 1 FROM t", 1),
                 ],
             ),
+            // `;`, `'`, and `--` inside a quoted identifier are text; `""` doubling stays inside.
+            (
+                "CREATE TABLE \"a;b\" (\"it's\" i32, \"x\"\";--\" i32); SELECT 1",
+                &[
+                    ("CREATE TABLE \"a;b\" (\"it's\" i32, \"x\"\";--\" i32)", 1),
+                    ("SELECT 1", 1),
+                ],
+            ),
             // `--` inside a string is text, not a comment.
             (
                 "INSERT INTO t VALUES ('--not a comment;')",
@@ -252,6 +263,11 @@ mod tests {
         assert_eq!(
             (e.message.as_str(), e.line),
             ("unterminated string literal", 2)
+        );
+        let e = split("SELECT 1;\nSELECT \"oops").unwrap_err();
+        assert_eq!(
+            (e.message.as_str(), e.line),
+            ("unterminated quoted identifier", 2)
         );
         let e = split("SELECT /* outer /* inner */ still open").unwrap_err();
         assert_eq!((e.message.as_str(), e.line), ("unterminated /* comment", 1));

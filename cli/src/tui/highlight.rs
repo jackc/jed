@@ -116,6 +116,23 @@ fn highlight_line(line: &str, mut state: State) -> (Vec<Span>, State) {
                     state = State::InString;
                     push(Class::Str, "'".to_string(), &mut spans);
                     i += 1;
+                } else if c == '"' {
+                    // A quoted identifier is a name, never a keyword (grammar.md §3): consume it as
+                    // plain text to its closing quote (`""` is an escaped quote) or end of line.
+                    let start = i;
+                    i += 1;
+                    while i < chars.len() {
+                        if chars[i] == '"' {
+                            if chars.get(i + 1) == Some(&'"') {
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    push(Class::Plain, chars[start..i].iter().collect(), &mut spans);
                 } else if c.is_ascii_alphabetic() || c == '_' {
                     let start = i;
                     while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
@@ -184,6 +201,19 @@ mod tests {
         assert_eq!(
             one("select Users"),
             vec![s(Class::Keyword, "select"), s(Class::Plain, " Users")]
+        );
+    }
+
+    #[test]
+    fn quoted_identifiers_are_never_keywords() {
+        assert_eq!(
+            one("SELECT \"from\", \"a\"\"b\" FROM t"),
+            vec![
+                s(Class::Keyword, "SELECT"),
+                s(Class::Plain, " \"from\", \"a\"\"b\" "),
+                s(Class::Keyword, "FROM"),
+                s(Class::Plain, " t"),
+            ]
         );
     }
 
