@@ -466,8 +466,8 @@ type alterView struct {
 }
 
 // dropView is `DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]` (spec/design/views.md §1). Each
-// name may carry a database qualifier. Cascade only changes the error a dependent view raises (0A000
-// instead of 2BP01, §6).
+// name may carry a database qualifier. Cascade also drops every view that depends on a dropped one,
+// transitively, where RESTRICT raises 2BP01 (§6).
 type dropView struct {
 	Names    []qualifiedName
 	IfExists bool

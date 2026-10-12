@@ -709,6 +709,41 @@ func (s *snapshot) viewsDependingOn(kind viewDepKind, name string) []*viewDef {
 	return out
 }
 
+// viewDropClosure returns the views a CASCADE drop removes (spec/design/views.md §6): the seeds and
+// every view that depends on one of them, transitively, in name byte order.
+func (s *snapshot) viewDropClosure(seeds []string) []string {
+	closure := map[string]bool{}
+	for _, name := range seeds {
+		closure[name] = true
+	}
+	for {
+		var added []string
+		for _, v := range s.viewsSorted() {
+			if closure[v.Name] {
+				continue
+			}
+			for _, d := range v.Deps {
+				if d.Kind == viewDepView && closure[d.Name] {
+					added = append(added, v.Name)
+					break
+				}
+			}
+		}
+		if len(added) == 0 {
+			break
+		}
+		for _, name := range added {
+			closure[name] = true
+		}
+	}
+	out := make([]string, 0, len(closure))
+	for name := range closure {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // sequencesOwnedBy returns the exact keys of every sequence OWNED BY the table name
 // (exact name) — the serial-created sequences DROP TABLE must auto-drop
 // (spec/design/sequences.md §12). Sorted so the auto-drop is deterministic (no map-iteration

@@ -777,8 +777,11 @@ func (db *engine) executeDropView(dv *dropView) (outcome, error) {
 		}
 		return outcome{}, newError(UndefinedTable, fmt.Sprintf("view \"%s\" does not exist", name))
 	}
-	// Phase 2: a dependent view outside the drop set blocks (RESTRICT 2BP01; CASCADE would drop it —
-	// a follow-on, 0A000). The first blocking view in name byte order is named.
+	// Phase 2: under RESTRICT a dependent view outside the drop set blocks (2BP01), naming the first
+	// in name byte order; under CASCADE every dependent view is dropped too, transitively.
+	if dv.Cascade {
+		targets = db.readSnap().viewDropClosure(targets)
+	}
 	for _, dependent := range db.readSnap().viewsSorted() {
 		if slices.Contains(targets, dependent.Name) {
 			continue
@@ -786,10 +789,6 @@ func (db *engine) executeDropView(dv *dropView) (outcome, error) {
 		for _, d := range dependent.Deps {
 			if d.Kind != viewDepView || !slices.Contains(targets, d.Name) {
 				continue
-			}
-			if dv.Cascade {
-				return outcome{}, viewNotSupported(fmt.Sprintf(
-					"DROP VIEW ... CASCADE of view %s with dependent view %s is not supported", d.Name, dependent.Name))
 			}
 			return outcome{}, newError(DependentObjectsStillExist, fmt.Sprintf(
 				"cannot drop view %s because view %s depends on it", d.Name, dependent.Name))
@@ -936,24 +935,27 @@ func (db *engine) collectViewFunctionPrivs(req *privReq) {
 
 // --- Dependencies on tables (views.md §6) ----------------------------------------------------------
 
-// checkDropTableViews is the DROP TABLE view-dependency check (§6): a view depending on a table being
-// dropped blocks the statement — 2BP01 under RESTRICT, 0A000 under CASCADE (dropping dependent views
-// is a follow-on). The first blocking view in name byte order is named.
-func (db *engine) checkDropTableViews(targets []string, cascade bool) error {
-	for _, view := range db.readSnap().viewsSorted() {
+// dropTableViews is the DROP TABLE view-dependency check (§6). Under RESTRICT a view depending on a
+// table being dropped blocks the statement (2BP01), naming the first in name byte order. Under
+// CASCADE it returns the views to drop with the tables: every view depending on one of them, and
+// every view depending on one of those, transitively.
+func (db *engine) dropTableViews(targets []string, cascade bool) ([]string, error) {
+	snap := db.readSnap()
+	var seeds []string
+	for _, view := range snap.viewsSorted() {
 		for _, d := range view.Deps {
 			if d.Kind != viewDepTable || !slices.Contains(targets, d.Name) {
 				continue
 			}
-			if cascade {
-				return viewNotSupported(fmt.Sprintf(
-					"DROP TABLE ... CASCADE of table %s with dependent view %s is not supported", d.Name, view.Name))
+			if !cascade {
+				return nil, newError(DependentObjectsStillExist, fmt.Sprintf(
+					"cannot drop table %s because view %s depends on it", d.Name, view.Name))
 			}
-			return newError(DependentObjectsStillExist, fmt.Sprintf(
-				"cannot drop table %s because view %s depends on it", d.Name, view.Name))
+			seeds = append(seeds, view.Name)
+			break
 		}
 	}
-	return nil
+	return snap.viewDropClosure(seeds), nil
 }
 
 // --- ALTER TABLE: rewrites (views.md §7) and re-validation (§8) -------------------------------------
@@ -993,15 +995,40 @@ type viewAlterPlan struct {
 // viewUsing returns the first dependent view (name byte order) that references the table's column at
 // the pre-statement ordinal (§6), or "".
 func (vp *viewAlterPlan) viewUsing(ordinal int) string {
+	if users := vp.viewsUsing(ordinal); len(users) > 0 {
+		return users[0]
+	}
+	return ""
+}
+
+// viewsUsing returns every dependent view (name byte order) that references the table's column at the
+// pre-statement ordinal (§6).
+func (vp *viewAlterPlan) viewsUsing(ordinal int) []string {
 	column := vp.columns[ordinal]
+	var out []string
 	for _, v := range vp.views {
 		for _, d := range v.Deps {
 			if d.Kind == viewDepTable && d.Name == vp.table && slices.Contains(d.Columns, column) {
-				return v.Name
+				out = append(out, v.Name)
+				break
 			}
 		}
 	}
-	return ""
+	return out
+}
+
+// forget stops tracking the views a DROP COLUMN … CASCADE drops (§6): they no longer block the
+// statement and are neither rewritten nor re-validated.
+func (vp *viewAlterPlan) forget(dropped []string) {
+	var views []*viewDef
+	var items [][]traceItem
+	for i, v := range vp.views {
+		if !slices.Contains(dropped, v.Name) {
+			views = append(views, v)
+			items = append(items, vp.items[i])
+		}
+	}
+	vp.views, vp.items = views, items
 }
 
 // alterBreaksView is the 0A000 an ALTER TABLE / ALTER VIEW raises when a dependent view would not

@@ -1731,15 +1731,16 @@ func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 	// snapshot; a dependent whose referencing table is itself in the drop set does not count (the
 	// drop-set exclusion is the whole seen set, so `DROP TABLE parent, child` succeeds even under
 	// RESTRICT).
-	// A view depending on a table being dropped blocks the statement (views.md §6): a DROP TABLE
-	// never drops views, and CASCADE dropping them is a follow-on.
+	// A view depending on a table being dropped blocks the statement under RESTRICT; CASCADE drops
+	// it, with every view depending on it (views.md §6).
 	var persistent []string
 	for _, tgt := range targets {
 		if tgt.scope == dropPersistent {
 			persistent = append(persistent, tgt.key)
 		}
 	}
-	if err := db.checkDropTableViews(persistent, dt.Cascade); err != nil {
+	cascadeViews, err := db.dropTableViews(persistent, dt.Cascade)
+	if err != nil {
 		return outcome{}, err
 	}
 	deps := db.readSnap().foreignKeyDependentsExcluding(seen)
@@ -1754,9 +1755,13 @@ func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 			"cannot drop table "+d.droppedName+" because other objects depend on it: constraint "+
 				d.fkName+" on table "+d.refTableName)
 	}
-	// ---- Phase 3: apply. CASCADE first drops each surviving table's now-dangling FK constraint (in
-	// place, preserving its rows). A FK only ever lives on a persistent table (temp tables reject FKs
-	// at CREATE), so the removal routes to the main working snapshot.
+	// ---- Phase 3: apply. CASCADE first drops the dependent views and each surviving table's
+	// now-dangling FK constraint (in place, preserving its rows). Views and FKs only ever live in the
+	// main database (temp tables reject FKs at CREATE, and views cannot read them), so the removals
+	// route to the main working snapshot.
+	for _, name := range cascadeViews {
+		db.working().removeView(name)
+	}
 	for _, d := range cascadeRemovals {
 		db.working().removeForeignKey(d.refTableKey, d.fkName)
 	}
@@ -1934,6 +1939,11 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		}
 	}
 	viewChange := viewAlterChange{kind: viewAlterOther}
+	// The views a DROP COLUMN … CASCADE drops (views.md §6), and the pre-statement ordinals of the
+	// columns whose type changes — checked against the surviving views after every action, as
+	// PostgreSQL runs type changes after the drops.
+	var cascadeDroppedViews []string
+	var viewTypeChecks []int
 
 	if at.RenameTable != "" {
 		if err := checkReservedName("table", at.RenameTable); err != nil {
@@ -2113,16 +2123,17 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			}
 			if a.DropColumn != nil {
 				ci := table.ColumnIndex(a.DropColumn.Name)
-				// A column a view references cannot be dropped (views.md §6): 2BP01, and 0A000 under
-				// CASCADE (dropping the view is a follow-on).
+				// A column a view references cannot be dropped (views.md §6): 2BP01. Under CASCADE those
+				// views are dropped, with every view depending on them.
 				if ci >= 0 && !slices.Contains(table.PK, ci) && viewPlan != nil && columnSources[ci].original >= 0 {
-					if view := viewPlan.viewUsing(columnSources[ci].original); view != "" {
-						if a.DropColumn.Cascade {
-							return outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
-								"DROP COLUMN ... CASCADE of column %s with dependent view %s is not supported", a.DropColumn.Name, view))
+					if users := viewPlan.viewsUsing(columnSources[ci].original); len(users) > 0 {
+						if !a.DropColumn.Cascade {
+							return outcome{}, newError(DependentObjectsStillExist, fmt.Sprintf(
+								"cannot drop column %s of table %s because view %s depends on it", a.DropColumn.Name, original.Name, users[0]))
 						}
-						return outcome{}, newError(DependentObjectsStillExist, fmt.Sprintf(
-							"cannot drop column %s of table %s because view %s depends on it", a.DropColumn.Name, original.Name, view))
+						closure := snap.viewDropClosure(users)
+						viewPlan.forget(closure)
+						cascadeDroppedViews = append(cascadeDroppedViews, closure...)
 					}
 				}
 				if err := dropAlterColumn(&table, a.DropColumn, snap, original, oldKey, &columnSources, &pendingSerials, constraintState); err != nil {
@@ -2267,9 +2278,10 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				}
 				table.Columns[ci].NotNull = false
 			case alterSetType:
-				// A column a view references cannot change type (views.md §6).
-				if viewPlan != nil && columnSources[ci].original >= 0 && viewPlan.viewUsing(columnSources[ci].original) != "" {
-					return outcome{}, newError(FeatureNotSupported, "cannot alter type of a column used by a view")
+				// A column a view references cannot change type (views.md §6); checked after every
+				// action, so a view a DROP COLUMN … CASCADE drops does not block it.
+				if columnSources[ci].original >= 0 {
+					viewTypeChecks = append(viewTypeChecks, columnSources[ci].original)
 				}
 				oldColumn := table.Columns[ci]
 				target, err := db.buildAlterAddedColumn(&table, &columnDef{Name: table.Columns[ci].Name, TypeName: edit.TypeName, TypeMod: edit.TypeMod}, &[]*sequenceDef{}, nil, snap == db.tempSnap(), isAttachmentScope(at.DB))
@@ -2345,6 +2357,13 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				for _, ex := range table.Exclusions {
 					constraintState.added[ex.Name] = true
 				}
+			}
+		}
+	}
+	if viewPlan != nil {
+		for _, old := range viewTypeChecks {
+			if viewPlan.viewUsing(old) != "" {
+				return outcome{}, newError(FeatureNotSupported, "cannot alter type of a column used by a view")
 			}
 		}
 	}
@@ -2652,8 +2671,12 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		}
 		ws.remapAlterColumnDependents(table.Name, originalToNew, pending)
 	}
-	// Rewrite and re-validate the dependent views against the post-statement catalog (views.md
-	// §7/§8); a failure is 0A000 and discards the whole statement.
+	// Drop the views a DROP COLUMN … CASCADE took (views.md §6), then rewrite and re-validate the
+	// surviving dependent views against the post-statement catalog (§7/§8); a failure is 0A000 and
+	// discards the whole statement.
+	for _, name := range cascadeDroppedViews {
+		db.working().removeView(name)
+	}
 	if viewPlan != nil {
 		if viewChange.kind == viewAlterOther {
 			for old := range original.Columns {
