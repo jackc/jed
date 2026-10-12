@@ -210,17 +210,26 @@ export type ViewAlterPlan = {
 // viewUsing is the first dependent view (name byte order) that references the table's column at the
 // pre-statement ordinal `ordinal` (§6), or null.
 export function viewUsing(plan: ViewAlterPlan, ordinal: number): string | null {
+  return viewsUsing(plan, ordinal)[0] ?? null;
+}
+
+// viewsUsing is every dependent view (name byte order) that references the table's column at the
+// pre-statement ordinal `ordinal` (§6).
+export function viewsUsing(plan: ViewAlterPlan, ordinal: number): string[] {
   const column = plan.columns[ordinal]!;
-  for (const { view } of plan.views) {
-    if (
+  return plan.views
+    .filter(({ view }) =>
       view.deps.some(
         (d) => d.kind === "table" && d.name === plan.table && d.columns.includes(column),
-      )
-    ) {
-      return view.name;
-    }
-  }
-  return null;
+      ),
+    )
+    .map(({ view }) => view.name);
+}
+
+// forgetViews stops tracking the views a DROP COLUMN … CASCADE drops (§6): they no longer block the
+// statement and are neither rewritten nor re-validated.
+export function forgetViews(plan: ViewAlterPlan, dropped: Set<string>): void {
+  plan.views = plan.views.filter(({ view }) => !dropped.has(view.name));
 }
 
 // alterBreaksView is the 0A000 an ALTER TABLE / ALTER VIEW raises when a dependent view would not

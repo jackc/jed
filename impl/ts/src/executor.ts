@@ -273,6 +273,8 @@ import {
   viewNotSupported,
   viewOutputNames,
   viewUsing,
+  viewsUsing,
+  forgetViews,
   viewsInDependencyOrder,
 } from "./views.ts";
 import { type KeyBound, type PNode, colAt, compareBytes, unboundedBound } from "./pmap.ts";
@@ -6509,9 +6511,9 @@ export class Engine {
     // snapshot; a dependent whose referencing table is itself in the drop set does not count (the
     // drop-set exclusion is the whole `seen` set, so `DROP TABLE parent, child` succeeds even under
     // RESTRICT).
-    // A view depending on a table being dropped blocks the statement (views.md §6): a DROP TABLE
-    // never drops views, and CASCADE dropping them is a follow-on.
-    this.checkDropTableViews(
+    // A view depending on a table being dropped blocks the statement under RESTRICT; CASCADE drops
+    // it, with every view depending on it (views.md §6).
+    const cascadeViews = this.dropTableViews(
       targets.filter((t) => t.scope === "persistent").map((t) => t.key),
       dt.cascade,
     );
@@ -6533,9 +6535,11 @@ export class Engine {
           d.refTableName,
       );
     }
-    // ---- Phase 3: apply. CASCADE first drops each surviving table's now-dangling FK constraint (in
-    // place, preserving its rows). A FK only ever lives on a persistent table (temp tables reject FKs
-    // at CREATE), so the removal routes to the main working snapshot.
+    // ---- Phase 3: apply. CASCADE first drops the dependent views and each surviving table's
+    // now-dangling FK constraint (in place, preserving its rows). Views and FKs only ever live in the
+    // main database (temp tables reject FKs at CREATE, and views cannot read them), so the removals
+    // route to the main working snapshot.
+    for (const name of cascadeViews) this.working().removeView(name);
     for (const d of cascadeRemovals) {
       this.working().removeForeignKey(d.refTableKey, d.fkName);
     }
@@ -6658,6 +6662,11 @@ export class Engine {
       viewPlan = this.prepareViewAlter(original, rewrites);
     }
     let viewChange: ViewAlterChange | null = null;
+    // The views a DROP COLUMN … CASCADE drops (views.md §6), and the pre-statement ordinals of the
+    // columns whose type changes — checked against the surviving views after every action, as
+    // PostgreSQL runs type changes after the drops.
+    const cascadeDroppedViews = new Set<string>();
+    const viewTypeChecks: number[] = [];
     const pendingSerials: SequenceDef[] = [];
     const workingRelationTaken = (name: string): boolean => {
       if (pendingSerials.some((s) => s.name === name)) return true;
@@ -6883,22 +6892,21 @@ export class Engine {
                 "feature_not_supported",
                 "dropping a primary-key column is not supported yet",
               );
-            // A column a view references cannot be dropped (views.md §6): 2BP01, and 0A000 under
-            // CASCADE (dropping the view is a follow-on).
+            // A column a view references cannot be dropped (views.md §6): 2BP01. Under CASCADE
+            // those views are dropped, with every view depending on them.
             const dropSource = columnSources[ci]!;
             if (dropSource.kind === "original" && viewPlan !== null) {
-              const view = viewUsing(viewPlan, dropSource.column);
-              if (view !== null) {
-                if (action.cascade) {
+              const users = viewsUsing(viewPlan, dropSource.column);
+              if (users.length > 0) {
+                if (!action.cascade) {
                   throw engineError(
-                    "feature_not_supported",
-                    `DROP COLUMN ... CASCADE of column ${action.name} with dependent view ${view} is not supported`,
+                    "dependent_objects_still_exist",
+                    `cannot drop column ${action.name} of table ${original.name} because view ${users[0]} depends on it`,
                   );
                 }
-                throw engineError(
-                  "dependent_objects_still_exist",
-                  `cannot drop column ${action.name} of table ${original.name} because view ${view} depends on it`,
-                );
+                const closure = this.readSnap().viewDropClosure(users);
+                forgetViews(viewPlan, closure);
+                for (const name of closure) cascadeDroppedViews.add(name);
               }
             }
             const usesExpr = (expr: Expr) => checkReferencedColumns(expr, table.columns).includes(ci);
@@ -7401,18 +7409,10 @@ export class Engine {
               table.columns[ci] = { ...col, notNull: false };
               break;
             case "setType": {
-              // A column a view references cannot change type (views.md §6).
+              // A column a view references cannot change type (views.md §6); checked after every
+              // action, so a view a DROP COLUMN … CASCADE drops does not block it.
               const typeSource = columnSources[ci]!;
-              if (
-                typeSource.kind === "original" &&
-                viewPlan !== null &&
-                viewUsing(viewPlan, typeSource.column) !== null
-              ) {
-                throw engineError(
-                  "feature_not_supported",
-                  "cannot alter type of a column used by a view",
-                );
-              }
+              if (typeSource.kind === "original") viewTypeChecks.push(typeSource.column);
               const oldColumn = col;
               let target = this.buildAlterAddedColumn(
                 table,
@@ -7553,6 +7553,10 @@ export class Engine {
         }
         break;
       }
+    }
+    const survivors = viewPlan;
+    if (survivors !== null && viewTypeChecks.some((old) => viewUsing(survivors, old) !== null)) {
+      throw engineError("feature_not_supported", "cannot alter type of a column used by a view");
     }
 
     if (typeChanged) {
@@ -7892,8 +7896,10 @@ export class Engine {
         new Set(pendingSerials.map((seq) => seq.name)),
       );
     }
-    // Rewrite and re-validate the dependent views against the post-statement catalog (views.md
-    // §7/§8); a failure is 0A000 and discards the whole statement.
+    // Drop the views a DROP COLUMN … CASCADE took (views.md §6), then rewrite and re-validate the
+    // surviving dependent views against the post-statement catalog (§7/§8); a failure is 0A000 and
+    // discards the whole statement.
+    for (const name of cascadeDroppedViews) this.working().removeView(name);
     if (viewPlan !== null) {
       const change: ViewAlterChange = viewChange ?? {
         kind: "other",
@@ -13666,7 +13672,7 @@ export class Engine {
   // executeDropView runs DROP VIEW (views.md §1, §6).
   private executeDropView(dv: DropView): Outcome {
     // Phase 1: resolve every name (42P01 / 42809) before any dependency check.
-    const targets: string[] = [];
+    let targets: string[] = [];
     for (const { db, name } of dv.names) {
       if (isCatalogRelName(name)) {
         throw engineError("wrong_object_type", `cannot drop system relation "${name}"`);
@@ -13697,17 +13703,13 @@ export class Engine {
       if (dv.ifExists) continue;
       throw engineError("undefined_table", `view "${name}" does not exist`);
     }
-    // Phase 2: a dependent view outside the drop set blocks (RESTRICT 2BP01; CASCADE would drop it —
-    // a follow-on, 0A000). The first blocking view in name byte order is named.
+    // Phase 2: under RESTRICT a dependent view outside the drop set blocks (2BP01), naming the first
+    // in name byte order; under CASCADE every dependent view is dropped too, transitively.
+    if (dv.cascade) targets = [...this.readSnap().viewDropClosure(targets)];
     for (const dependent of this.readSnap().viewsSorted()) {
       if (targets.includes(dependent.name)) continue;
       const dep = dependent.deps.find((d) => d.kind === "view" && targets.includes(d.name));
       if (dep === undefined) continue;
-      if (dv.cascade) {
-        throw viewNotSupported(
-          `DROP VIEW ... CASCADE of view ${dep.name} with dependent view ${dependent.name} is not supported`,
-        );
-      }
       throw engineError(
         "dependent_objects_still_exist",
         `cannot drop view ${dep.name} because view ${dependent.name} depends on it`,
@@ -13793,23 +13795,25 @@ export class Engine {
     req.functions.push(...functions);
   }
 
-  // checkDropTableViews is the DROP TABLE view-dependency check (§6): a view depending on a table
-  // being dropped blocks the statement — 2BP01 under RESTRICT, 0A000 under CASCADE (dropping
-  // dependent views is a follow-on). The first blocking view in name byte order is named.
-  private checkDropTableViews(targets: string[], cascade: boolean): void {
-    for (const view of this.readSnap().viewsSorted()) {
+  // dropTableViews is the DROP TABLE view-dependency check (§6). Under RESTRICT a view depending on
+  // a table being dropped blocks the statement (2BP01), naming the first in name byte order. Under
+  // CASCADE it returns the views to drop with the tables: every view depending on one of them, and
+  // every view depending on one of those, transitively.
+  private dropTableViews(targets: string[], cascade: boolean): Set<string> {
+    const snap = this.readSnap();
+    const seeds: string[] = [];
+    for (const view of snap.viewsSorted()) {
       const dep = view.deps.find((d) => d.kind === "table" && targets.includes(d.name));
       if (dep === undefined) continue;
-      if (cascade) {
-        throw viewNotSupported(
-          `DROP TABLE ... CASCADE of table ${dep.name} with dependent view ${view.name} is not supported`,
+      if (!cascade) {
+        throw engineError(
+          "dependent_objects_still_exist",
+          `cannot drop table ${dep.name} because view ${view.name} depends on it`,
         );
       }
-      throw engineError(
-        "dependent_objects_still_exist",
-        `cannot drop table ${dep.name} because view ${view.name} depends on it`,
-      );
+      seeds.push(view.name);
     }
+    return snap.viewDropClosure(seeds);
   }
 
   // prepareViewAlter captures the views that depend on `table` (of the main database) before an

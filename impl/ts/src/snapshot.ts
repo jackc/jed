@@ -440,6 +440,19 @@ export class Snapshot {
     return this.viewsSorted().filter((v) => v.deps.some((d) => d.kind === kind && d.name === name));
   }
 
+  // viewDropClosure is the views a CASCADE drop removes (spec/design/views.md §6): the seeds and every
+  // view that depends on one of them, transitively.
+  viewDropClosure(seeds: Iterable<string>): Set<string> {
+    const closure = new Set(seeds);
+    for (;;) {
+      const added = this.viewsSorted().filter(
+        (v) => !closure.has(v.name) && v.deps.some((d) => d.kind === "view" && closure.has(d.name)),
+      );
+      if (added.length === 0) return closure;
+      for (const v of added) closure.add(v.name);
+    }
+  }
+
   // sequencesSorted is all sequences in ascending name byte order — the on-disk emission
   // order (spec/fileformat/format.md) and a deterministic order with no map-iteration leak (§8).
   sequencesSorted(): SequenceDef[] {

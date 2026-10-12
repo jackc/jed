@@ -874,6 +874,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "ddl.view_replace",
   "ddl.view_alter",
   "dml.view_write",
+  "ddl.view_cascade",
 ];
 
 // THIS FILE IS THE PUBLIC API of the TS core (CLAUDE.md §2 — the embedding surface): the converged
