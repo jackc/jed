@@ -598,6 +598,8 @@ func catalogRelTable(kind srfKind) *catTable {
 			{Name: "type", Type: scalarT(scalarText), NotNull: true},
 			{Name: "not_null", Type: scalarT(scalarBool), NotNull: true},
 			{Name: "pk_ordinal", Type: scalarT(scalarInt32)},
+			// The DEFAULT as canonical SQL text; NULL for none (introspection.md §5).
+			{Name: "column_default", Type: scalarT(scalarText)},
 		}}
 	case srfJedIndexes:
 		return &catTable{Name: "jed_indexes", Columns: []catColumn{
@@ -742,7 +744,8 @@ func (db *engine) jedTablesRows(sp *srfPlan, m *costMeter) ([]storedRow, error) 
 // order. ordinal is 1-based CREATE TABLE order; type is the canonical type text (catalogTypeText);
 // not_null covers a declared NOT NULL and PRIMARY KEY membership; pk_ordinal is the 1-based
 // position in the PRIMARY KEY in KEY order (which may differ from declaration order —
-// constraints.md §3), NULL for a non-member. Cost mirrors jedTablesRows.
+// constraints.md §3), NULL for a non-member; column_default is the canonical DEFAULT text
+// (catColumn.defaultText). Cost mirrors jedTablesRows.
 func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
 	snap := db.snapForScope(sp.introspectScope)
 	if snap == nil {
@@ -762,6 +765,10 @@ func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 					break
 				}
 			}
+			columnDefault := NullValue()
+			if text, ok := c.defaultText(); ok {
+				columnDefault = TextValue(text)
+			}
 			out = append(out, storedRow{
 				TextValue(t.Name),
 				TextValue(c.Name),
@@ -769,6 +776,7 @@ func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 				TextValue(catalogTypeText(c.Type, c.Decimal, c.VarcharLen)),
 				BoolValue(c.NotNull || c.PrimaryKey),
 				pkOrdinal,
+				columnDefault,
 			})
 		}
 	}

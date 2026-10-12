@@ -838,7 +838,7 @@ var SupportedCapabilities = []string{
 	"maintenance.analyze",
 	"introspect.statistics",
 	// The jed_columns catalog relation (I1): one row per column of every user table — ordinal,
-	// canonical type text, not_null, pk_ordinal (introspection.md §5).
+	// canonical type text, not_null, pk_ordinal, column_default (introspection.md §5).
 	"introspect.columns",
 	// The jed_indexes catalog relation (I2, introspection.md §5.1): one row per secondary index —
 	// name, table_name, columns (text[]), is_unique, method (btree/gin/gist).

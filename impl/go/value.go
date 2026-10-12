@@ -510,6 +510,17 @@ const (
 // UNKNOWN (NULL) and FALSE both reject (CLAUDE.md §4).
 func (t ThreeValued) IsTrue() bool { return t == True }
 
+// sqlLiteral renders v as a SQL literal that re-parses to v when assigned to a column of its type
+// (introspection.md §5 column_default): an integer, decimal, or boolean renders bare by Render; every
+// other value renders its canonical text quoted, ' doubled. NULL renders NULL.
+func (v Value) sqlLiteral() string {
+	switch v.Kind {
+	case ValNull, ValInt, ValBool, ValDecimal:
+		return v.Render()
+	}
+	return "'" + strings.ReplaceAll(v.Render(), "'", "''") + "'"
+}
+
 // Render formats for conformance output: integers as shortest decimal, booleans as
 // the canonical "true"/"false", NULL (including a NULL/unknown boolean) as the literal
 // "NULL" (spec/design/conformance.md §1; the canonical spelling is a §8 decision). This is the
