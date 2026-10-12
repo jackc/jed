@@ -476,6 +476,12 @@ impl Engine {
                 format!("there is no parameter ${n}"),
             ));
         }
+        // A check option needs the view's own body to be updatable for INSERT / UPDATE (§15.6).
+        if cv.check_option.is_some() && self.updatable_shape(&body, true).is_none() {
+            return Err(view_not_supported(
+                "WITH CHECK OPTION is supported only on automatically updatable views",
+            ));
+        }
         // 5. Column-list arity, then duplicate final output names, from the body as planned.
         let body_names = plan.column_names().to_vec();
         let body_types = plan.column_types().to_vec();
@@ -556,6 +562,7 @@ impl Engine {
             deps,
             body: std::sync::Arc::new(body),
             depth,
+            check_option: cv.check_option,
         };
         self.check_view_entry_fits(&def)?;
         self.working_mut().put_view(def);
@@ -1298,6 +1305,7 @@ impl Engine {
                     deps: expected.clone(),
                     body: std::sync::Arc::new(body),
                     depth,
+                    check_option: view.check_option,
                 };
                 self.check_view_entry_fits(&updated)?;
                 self.working_mut().put_view(updated);

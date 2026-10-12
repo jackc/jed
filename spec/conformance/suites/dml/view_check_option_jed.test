@@ -4,10 +4,10 @@
 # before the check option; `WITH ( check_option = … )` is 0A000; CREATE VIEW IF NOT EXISTS), and
 # cost (the check is metered expression work on each new row; EXPLAIN is unchanged).
 # CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
-# requires: ddl.view, dml.view_write, dml.view_check_option, ddl.view_alter, ddl.create_table, ddl.primary_key, ddl.check, ddl.exclusion_constraint, types.range, dml.insert, dml.insert_multi_row, dml.update, dml.returning, query.select, query.where_eq, query.order_by, query.explain, dml.explain, func.abs, expr.arithmetic, expr.case, resource.cost_metering, types.i32, session.privileges
+# requires: ddl.view, dml.view_write, dml.view_check_option, ddl.view_alter, ddl.create_table, ddl.primary_key, ddl.check, ddl.column_default, ddl.exclusion_constraint, types.range, dml.insert, dml.insert_multi_row, dml.update, dml.returning, query.select, query.where_eq, query.order_by, query.explain, dml.explain, func.abs, expr.arithmetic, expr.case, resource.cost_metering, types.i32, session.privileges
 
 statement ok
-CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32 DEFAULT 0)
 
 statement ok
 INSERT INTO t VALUES (1, 10, 1), (2, 20, 2)
@@ -139,12 +139,12 @@ EXPLAIN UPDATE mcy SET x = x + 1 WHERE id = 4
 Update m
 sets=1
 1
-5
+7
 1
 Filter
 conjuncts=3
 1
-5
+7
 2
 Scan m
 PK bound: id = 4; touched=3
@@ -160,12 +160,12 @@ EXPLAIN UPDATE mv SET x = x + 1 WHERE id = 4
 Update m
 sets=1
 1
-5
+7
 1
 Filter
 conjuncts=3
 1
-5
+7
 2
 Scan m
 PK bound: id = 4; touched=3

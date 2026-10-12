@@ -850,6 +850,14 @@ impl Engine {
                 Value::Text(v.name.clone()),
                 Value::Text(v.definition.clone()),
                 Value::Array(ArrayVal::one_dim(cols)),
+                Value::Text(
+                    match v.check_option {
+                        None => "NONE",
+                        Some(CheckOption::Local) => "LOCAL",
+                        Some(CheckOption::Cascaded) => "CASCADED",
+                    }
+                    .to_string(),
+                ),
             ]);
         }
         Ok(out)

@@ -1416,9 +1416,10 @@ fn sequence_table_db() -> Session {
     db
 }
 
-/// view_table (v38): three `entry_kind = 5` view entries after the table entry, in name order
-/// (`n`, `v`, `w`) — the frozen `*` expansion, a column-list rename with a view dependency, and a
-/// table dependency with zero columns. Must match the Ruby reference's VIEW_TABLE
+/// view_table (v38, check options v39): three `entry_kind = 5` view entries after the table entry,
+/// in name order (`n`, `v`, `w`) — the frozen `*` expansion with a CASCADED check option, a
+/// column-list rename with a view dependency and a LOCAL check option, and a table dependency with
+/// zero columns and no check option. Must match the Ruby reference's VIEW_TABLE
 /// (spec/fileformat/verify.rb), spec/design/views.md §3.
 fn view_table_db() -> Session {
     let mut db = Database::create(CreateOptions {
@@ -1429,8 +1430,14 @@ fn view_table_db() -> Session {
     .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (a i32 PRIMARY KEY, b text)");
     run(&mut db, "INSERT INTO t VALUES (1, 'x'), (2, 'y')");
-    run(&mut db, "CREATE VIEW v AS SELECT * FROM t WHERE a > 0");
-    run(&mut db, "CREATE VIEW w (x) AS SELECT a FROM v");
+    run(
+        &mut db,
+        "CREATE VIEW v AS SELECT * FROM t WHERE a > 0 WITH CHECK OPTION",
+    );
+    run(
+        &mut db,
+        "CREATE VIEW w (x) AS SELECT a FROM v WITH LOCAL CHECK OPTION",
+    );
     run(&mut db, "CREATE VIEW n AS SELECT count(*) AS c FROM t");
     db
 }
@@ -1475,6 +1482,39 @@ fn view_golden_reads_back() {
         query_rows(&mut db, "SELECT c FROM n"),
         vec![vec![Value::Int(2)]]
     );
+    assert_eq!(
+        query_rows(
+            &mut db,
+            "SELECT name, check_option FROM jed_views ORDER BY name"
+        ),
+        vec![
+            vec![text("n"), text("NONE")],
+            vec![text("v"), text("CASCADED")],
+            vec![text("w"), text("LOCAL")],
+        ]
+    );
+}
+
+/// A view entry's `check_option` byte outside 0–2 is corruption (`XX001`, format.md *View entry*).
+#[test]
+fn view_unknown_check_option_is_rejected() {
+    let mut image = fixture("view_table.jed");
+    // View n's entry ends with its one dependency (kind 0, "t", zero columns), then check_option 0.
+    let ends = b"select count ( * ) as c from t";
+    let def_at = image
+        .windows(ends.len())
+        .position(|bytes| bytes == ends)
+        .expect("locate view n's definition");
+    let option_at = def_at + ends.len() + 2 + 6; // after dep_count and the dependency
+    assert_eq!(image[option_at], 0);
+    image[option_at] = 3;
+    let page_start = option_at / GOLDEN_PAGE_SIZE as usize * GOLDEN_PAGE_SIZE as usize;
+    refresh_test_page_crc(&mut image, page_start);
+    let error = match Database::from_image(&image) {
+        Ok(_) => panic!("an unknown view check option must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "XX001");
 }
 
 /// A stored view definition that no longer parses is corruption (`XX001`) at open — the body is

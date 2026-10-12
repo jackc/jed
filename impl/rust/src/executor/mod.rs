@@ -7,7 +7,7 @@
 pub(crate) use crate::api::Rows;
 pub(crate) use crate::ast::{
     AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence, AlterTable,
-    AlterTableAction, AlterTableEdit, AlterView, AlterViewAction, Analyze, BinaryOp,
+    AlterTableAction, AlterTableEdit, AlterView, AlterViewAction, Analyze, BinaryOp, CheckOption,
     ConflictAction, ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType,
     CreateView, Cte, CteBody, DefaultDef, Delete, DropIndex, DropSequence, DropTable, DropType,
     DropView, Expr, FkTarget, GroupItem, IndexKeyElem, Insert, InsertSource, InsertValue, JoinKind,
@@ -4775,6 +4775,7 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
                 col("name", ScalarType::Text, true),
                 col("definition", ScalarType::Text, true),
                 text_arr("columns", true),
+                col("check_option", ScalarType::Text, true),
             ],
         ),
         _ => unreachable!("only catalog-relation kinds reach catalog_rel_table"),

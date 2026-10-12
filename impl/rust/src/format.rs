@@ -119,7 +119,9 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // v38: views — `entry_kind = 5` view catalog entries (name, output columns, canonical definition
 // text, dependency list) emitted last in view-name byte order (spec/design/views.md §3); no other
 // byte layout change.
-const FORMAT_VERSION: u16 = 38;
+// v39: every view entry gains a trailing `u8 check_option` (0 none, 1 LOCAL, 2 CASCADED —
+// spec/design/views.md §15.6); no other byte layout change.
+const FORMAT_VERSION: u16 = 39;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -4433,8 +4435,8 @@ fn view_catalog_entries(snapshot: &Snapshot) -> Vec<Vec<u8>> {
 }
 
 /// Serialize a view catalog entry's BODY (after its `entry_kind = 5` byte) — format.md *View
-/// entry*: the name, the output column names, the definition (`u32` length), and the dependency
-/// list (already in name byte order, each table's columns in name byte order).
+/// entry*: the name, the output column names, the definition (`u32` length), the dependency list
+/// (already in name byte order, each table's columns in name byte order), and the check option.
 pub(crate) fn view_entry_bytes(v: &crate::catalog::ViewDef) -> Vec<u8> {
     let mut out = Vec::new();
     let put_str = |out: &mut Vec<u8>, s: &str| {
@@ -4460,6 +4462,11 @@ pub(crate) fn view_entry_bytes(v: &crate::catalog::ViewDef) -> Vec<u8> {
             put_str(&mut out, c);
         }
     }
+    out.push(match v.check_option {
+        None => 0,
+        Some(crate::ast::CheckOption::Local) => 1,
+        Some(crate::ast::CheckOption::Cascaded) => 2,
+    });
     out
 }
 
@@ -4506,6 +4513,12 @@ fn decode_view_entry(buf: &[u8], pos: &mut usize) -> Result<crate::catalog::View
             columns: cols,
         });
     }
+    let check_option = match read_u8(buf, pos)? {
+        0 => None,
+        1 => Some(crate::ast::CheckOption::Local),
+        2 => Some(crate::ast::CheckOption::Cascaded),
+        _ => return Err(corrupt("unknown view check option")),
+    };
     let (body, depth) = crate::parser::parse_view_definition(&definition)
         .map_err(|_| corrupt("a view definition does not parse"))?;
     Ok(crate::catalog::ViewDef {
@@ -4515,6 +4528,7 @@ fn decode_view_entry(buf: &[u8], pos: &mut usize) -> Result<crate::catalog::View
         deps,
         body: Arc::new(body),
         depth,
+        check_option,
     })
 }
 

@@ -385,6 +385,8 @@ pub struct ViewDef {
     pub body: std::sync::Arc<crate::ast::QueryExpr>,
     /// The body's nesting depth (spec/design/views.md §4.1), from the same parse as `body`.
     pub depth: usize,
+    /// The view's check option, if any (spec/design/views.md §15.6).
+    pub check_option: Option<crate::ast::CheckOption>,
 }
 
 /// What a view dependency names (format.md *View entry* `dep_kind`).

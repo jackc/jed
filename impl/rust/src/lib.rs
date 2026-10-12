@@ -129,6 +129,7 @@ pub use value::Value;
 pub mod tooling {
     // The CLI renders query results + dumps schema using these internal types (returned by
     // `Database::table` / `Session::table`).
+    pub use crate::ast::CheckOption;
     pub use crate::catalog::{CompositeType, IndexKey, IndexKeyExpr, Table, ViewDef};
     /// Query-memory accounting underflows (spec/design/memory.md) — the conformance harness's check.
     pub use crate::cost::{QUERY_MEMORY_PEAK, QUERY_MEMORY_UNDERFLOWS};
@@ -1040,6 +1041,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "ddl.view_replace",
     "ddl.view_alter",
     "dml.view_write",
+    "dml.view_check_option",
     "ddl.view_cascade",
 ];
 

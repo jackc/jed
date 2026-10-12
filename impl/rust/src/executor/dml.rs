@@ -250,6 +250,9 @@ impl Engine {
         // The CHECK constraints, resolved once per statement in evaluation (name) order;
         // `insert_rows` evaluates them per candidate row (constraints.md §4.4).
         let checks = self.resolve_checks(tdef)?;
+        // The check-option checks of a write through a view (views.md §15.6), nearest the table
+        // first; `insert_rows` evaluates them per candidate row after its UNIQUE checks.
+        let mut view_checks = self.resolve_view_checks(tdef, vw.as_ref())?;
         // The columns' resolved `ColType`s (a scalar, or a composite resolved to its field tree),
         // for composite-aware materialization + store-coercion (spec/design/composite.md §4).
         let col_types: Vec<ColType> = self
@@ -507,6 +510,10 @@ impl Engine {
                     }
                 }
                 self.fold_conflict_plan(&mut conflict_plan, &bound, &mut meter.accrued)?;
+                // A check option's uncorrelated subqueries fold once too (views.md §15.6).
+                for (_, check) in &mut view_checks {
+                    self.fold_uncorrelated_in_rexpr(check, &bound, ctx, &mut meter.accrued)?;
+                }
                 let returning_nodes = ret_nodes.as_ref().map(|(nodes, _, _)| nodes.as_slice());
                 let (affected, returned) = match single_values {
                     Some(values) => (1, {
@@ -523,6 +530,7 @@ impl Engine {
                             &columns,
                             &pk,
                             &checks,
+                            &view_checks,
                             &default_exprs,
                             &rindexes,
                             &colls,
@@ -542,6 +550,7 @@ impl Engine {
                         &columns,
                         &pk,
                         &checks,
+                        &view_checks,
                         &default_exprs,
                         &stmt_rng,
                         &provided,
@@ -618,6 +627,9 @@ impl Engine {
                     for node in nodes {
                         self.fold_uncorrelated_in_rexpr(node, &bound, ctx, &mut meter.accrued)?;
                     }
+                }
+                for (_, check) in &mut view_checks {
+                    self.fold_uncorrelated_in_rexpr(check, &bound, ctx, &mut meter.accrued)?;
                 }
                 let q = self.exec_query_plan(&plan, &[], &bound, ctx)?;
 
@@ -701,6 +713,7 @@ impl Engine {
                     &columns,
                     &pk,
                     &checks,
+                    &view_checks,
                     &default_exprs,
                     &stmt_rng,
                     &provided,
@@ -1197,6 +1210,7 @@ impl Engine {
                     &plan.table.columns,
                     &plan.pk,
                     &plan.checks,
+                    &[],
                     &plan.default_exprs,
                     &plan.rindexes,
                     &plan.colls,
@@ -1217,6 +1231,7 @@ impl Engine {
                     &plan.table.columns,
                     &plan.pk,
                     &plan.checks,
+                    &[],
                     &plan.default_exprs,
                     &plan.rindexes,
                     &plan.colls,
@@ -1274,6 +1289,7 @@ impl Engine {
         columns: &[Column],
         pk: &[(usize, Type)],
         checks: &[(String, RExpr)],
+        view_checks: &[(String, RExpr)],
         default_exprs: &[Option<RExpr>],
         rindexes: &[ResolvedIndex],
         colls: &[Option<std::sync::Arc<Collation>>],
@@ -1422,6 +1438,9 @@ impl Engine {
                     &env,
                 )?);
             }
+            // The check option (views.md §15.6), after the row's own NOT NULL / CHECK / PK / UNIQUE
+            // checks and its index keys, before the batch FOREIGN KEY and EXCLUDE passes.
+            eval_view_checks(view_checks, &row, &env, meter)?;
             entry_prefixes.push(row_prefixes);
             prepared.push((key, row));
         }
@@ -1569,6 +1588,7 @@ impl Engine {
         columns: &[Column],
         pk: &[(usize, Type)],
         checks: &[(String, RExpr)],
+        view_checks: &[(String, RExpr)],
         default_exprs: &[Option<RExpr>],
         rindexes: &[ResolvedIndex],
         colls: &[Option<std::sync::Arc<Collation>>],
@@ -1663,6 +1683,7 @@ impl Engine {
                 &env,
             )?);
         }
+        eval_view_checks(view_checks, &row, &env, meter)?;
 
         for fk in self
             .table(table)
@@ -2456,6 +2477,7 @@ impl Engine {
         columns: &[Column],
         pk: &[(usize, Type)],
         checks: &[(String, RExpr)],
+        view_checks: &[(String, RExpr)],
         default_exprs: &[Option<RExpr>],
         rng: &std::cell::Cell<crate::seam::StmtRng>,
         provided: &[Option<usize>],
@@ -2500,6 +2522,7 @@ impl Engine {
                     columns,
                     pk,
                     checks,
+                    view_checks,
                     default_exprs,
                     &rindexes,
                     &colls,
@@ -3478,6 +3501,9 @@ impl Engine {
         // The CHECK constraints, resolved once per statement in evaluation (name) order;
         // phase 1 evaluates them on each post-assignment row (constraints.md §4.4).
         let checks = self.resolve_checks(table)?;
+        // The check-option checks of an UPDATE through a view (views.md §15.6), evaluated on the
+        // new rows after the end-state key checks.
+        let mut view_checks = self.resolve_view_checks(table, vw.as_ref())?;
         let relation = table.name.clone();
         // All assignment RHSs + the WHERE + the RETURNING are resolved: finalize + bind
         // before any scan.
@@ -3500,6 +3526,9 @@ impl Engine {
             for node in nodes {
                 self.fold_uncorrelated_in_rexpr(node, &bound, ctx, &mut meter.accrued)?;
             }
+        }
+        for (_, check) in &mut view_checks {
+            self.fold_uncorrelated_in_rexpr(check, &bound, ctx, &mut meter.accrued)?;
         }
 
         // Phase 1: build + validate every matching row's new values; no writes yet. Each
@@ -3715,6 +3744,12 @@ impl Engine {
                     }
                 }
             }
+        }
+
+        // The check option (views.md §15.6): each new row, in scan order, after the end-state PK and
+        // UNIQUE checks and before EXCLUDE and FOREIGN KEY.
+        for (_, _, new_row, _) in &updates {
+            eval_view_checks(&view_checks, new_row, &env, &mut meter)?;
         }
 
         // EXCLUDE end-state validation (spec/design/gist.md §7), mirroring UNIQUE's: each updated

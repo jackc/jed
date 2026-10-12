@@ -434,6 +434,16 @@ pub struct CreateView {
     pub if_not_exists: bool,
     pub columns: Option<Vec<String>>,
     pub body: String,
+    /// A trailing `WITH [CASCADED | LOCAL] CHECK OPTION` (views.md §15.6); bare `WITH CHECK
+    /// OPTION` is `Cascaded`.
+    pub check_option: Option<CheckOption>,
+}
+
+/// A view's check option (spec/design/views.md §15.6).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CheckOption {
+    Local,
+    Cascaded,
 }
 
 /// `DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]` (spec/design/views.md §1). Each name may

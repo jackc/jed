@@ -8,7 +8,7 @@
 use std::io::{self, Write};
 
 use jed::Value;
-use jed::tooling::Table;
+use jed::tooling::{CheckOption, Table};
 
 /// Write the whole database as SQL. Tables come out in the catalog's standing order
 /// (sorted by lowercased name — api.md §6); rows in primary-key order via `ORDER BY`
@@ -70,12 +70,18 @@ pub fn dump(db: &mut jed::Session, out: &mut dyn Write) -> io::Result<()> {
     }
     // Views come after every table, its rows, and its indexes, in dependency order (a view after
     // every view it reads; ties in name byte order). The output column list is always written, so
-    // the recreated view keeps its column names even when the body's own names differ.
+    // the recreated view keeps its column names even when the body's own names differ. A check
+    // option follows the body (views.md §15.6).
     for view in db.views_in_dependency_order() {
         let cols: Vec<String> = view.columns.iter().map(|c| q(c)).collect();
+        let check = match view.check_option {
+            None => "",
+            Some(CheckOption::Local) => " WITH LOCAL CHECK OPTION",
+            Some(CheckOption::Cascaded) => " WITH CASCADED CHECK OPTION",
+        };
         writeln!(
             out,
-            "CREATE VIEW {} ({}) AS {};",
+            "CREATE VIEW {} ({}) AS {}{check};",
             q(&view.name),
             cols.join(", "),
             view.definition
@@ -195,7 +201,7 @@ mod tests {
             "INSERT INTO nopk VALUES (10), (20)",
             // `a_top` reads `z_base`, so dependency order puts it after `z_base` even though it
             // sorts first by name; `Mixed` leads by name byte order.
-            "CREATE VIEW z_base AS SELECT id, name FROM users WHERE age > 18",
+            "CREATE VIEW z_base AS SELECT id, name FROM users WHERE age > 18 WITH LOCAL CHECK OPTION",
             "CREATE VIEW a_top (n) AS SELECT name FROM z_base",
             "CREATE VIEW \"Mixed\" AS SELECT * FROM nopk",
         ] {
@@ -230,7 +236,7 @@ mod tests {
              CREATE UNIQUE INDEX users_age_key ON users (age);\n\
              CREATE INDEX users_ok_idx ON users (age) WHERE ok;\n\
              CREATE VIEW \"Mixed\" (v) AS select \"nopk\" . \"v\" from nopk;\n\
-             CREATE VIEW z_base (id, name) AS select id , name from users where age > 18;\n\
+             CREATE VIEW z_base (id, name) AS select id , name from users where age > 18 WITH LOCAL CHECK OPTION;\n\
              CREATE VIEW a_top (n) AS select name from z_base;\n\
              COMMIT;\n"
         );

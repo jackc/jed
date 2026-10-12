@@ -9,7 +9,8 @@
 //! (`Resolved::Layer`). An updatable column resolves to the base column itself; a read-only one to
 //! its select item, resolved in the view body's isolated scope at the depth of the reference
 //! ([`resolve_layer_ref`]). The views' WHERE clauses resolve the same way and are AND-ed ahead of
-//! the statement's own ([`Engine::resolve_write_filter`]).
+//! the statement's own ([`Engine::resolve_write_filter`]); the checked views' WHERE clauses become
+//! the statement's check-option checks ([`Engine::resolve_view_checks`], §15.6).
 
 use super::*;
 
@@ -54,6 +55,8 @@ pub(crate) struct WriteLayer {
     pub(crate) below_label: String,
     /// The view's WHERE, written against `below`.
     pub(crate) filter: Option<Expr>,
+    /// The view's own check option (views.md §15.6); `None` for the table.
+    pub(crate) check: Option<CheckOption>,
 }
 
 /// Where a layer column leads: a base table column, or the read-only select item that defines it
@@ -105,6 +108,34 @@ struct ChainLevel {
     label: String,
     cols: Vec<LayerCol>,
     filter: Option<Expr>,
+}
+
+/// The 44000 a new row that fails a checked view's WHERE raises (views.md §15.6).
+pub(crate) fn check_option_violation(view: &str) -> EngineError {
+    EngineError::new(
+        SqlState::WithCheckOptionViolation,
+        format!("new row violates check option for view \"{view}\""),
+    )
+}
+
+/// Evaluate the check-option checks (views.md §15.6) on one new row, nearest the table first: each
+/// WHERE is a filter, so FALSE or NULL fails with 44000 naming the view. Metered expression work.
+pub(crate) fn eval_view_checks(
+    checks: &[(String, RExpr)],
+    row: &Row,
+    env: &EvalEnv,
+    meter: &mut Meter,
+) -> Result<()> {
+    if checks.is_empty() {
+        return Ok(());
+    }
+    meter.guard()?;
+    for (view, check) in checks {
+        if !check.eval_filter(row, env, meter)? {
+            return Err(check_option_violation(view));
+        }
+    }
+    Ok(())
 }
 
 fn not_updatable(kind: WriteKind, view: &str) -> EngineError {
@@ -160,8 +191,9 @@ impl Engine {
 
     /// The single FROM item of an automatically updatable body (views.md §15.1), or `None`. For
     /// `INSERT` / `UPDATE` (`check_cols`) the body must also output at least one plain column
-    /// reference.
-    fn updatable_shape<'b>(
+    /// reference. A stored body has no `*`; at `CREATE VIEW` a `*` or `label.*` item counts as plain
+    /// column references, which it expands to (§1.1 step 4).
+    pub(crate) fn updatable_shape<'b>(
         &self,
         body: &'b QueryExpr,
         check_cols: bool,
@@ -179,8 +211,9 @@ impl Engine {
         {
             return None;
         }
-        let SelectItems::Items(items) = &sel.items else {
-            return None;
+        let items: &[crate::ast::SelectItem] = match &sel.items {
+            SelectItems::Items(items) => items,
+            SelectItems::All(_) => &[],
         };
         let level_has = |e: &Expr| expr_has_aggregate(e) || expr_has_window(e);
         if items.iter().any(|it| level_has(&it.expr))
@@ -209,11 +242,13 @@ impl Engine {
         }
         if check_cols {
             let label = tref.alias.as_deref().unwrap_or(&tref.name);
-            let plain = items.iter().any(|it| match &it.expr {
-                Expr::Column(_) => true,
-                Expr::QualifiedColumn { qualifier, .. } => qualifier == label,
-                _ => false,
-            });
+            let plain = matches!(sel.items, SelectItems::All(_))
+                || items.iter().any(|it| match &it.expr {
+                    Expr::Column(_) => true,
+                    Expr::QualifiedColumn { qualifier, .. }
+                    | Expr::QualifiedStar { qualifier, .. } => qualifier == label,
+                    _ => false,
+                });
             if !plain {
                 return None;
             }
@@ -381,6 +416,7 @@ impl Engine {
             below: None,
             below_label: String::new(),
             filter: None,
+            check: None,
         };
         for level in levels.into_iter().rev() {
             let (_, types, derivs) = metas
@@ -398,6 +434,7 @@ impl Engine {
                 below: Some(Box::new(layer)),
                 below_label: level.label,
                 filter: level.filter,
+                check: level.view.check_option,
             };
         }
         let top_name = layer.view.clone().expect("a view layer");
@@ -468,6 +505,43 @@ impl Engine {
                 Some(prev) => RExpr::And(Box::new(prev), Box::new(node)),
             });
         }
+        Ok(out)
+    }
+
+    /// The check-option checks of a write through a view (views.md §15.6): the WHERE of every
+    /// checked view — one with its own check option, or below a CASCADED one — nearest the table
+    /// first, each resolved in its body's isolated scope over the base row. Empty when the target is
+    /// a table or no view in the chain is checked.
+    pub(crate) fn resolve_view_checks(
+        &self,
+        table: &Table,
+        vw: Option<&ViewWrite>,
+    ) -> Result<Vec<(String, RExpr)>> {
+        let mut out = Vec::new();
+        let Some(vw) = vw else {
+            return Ok(out);
+        };
+        let mut cascaded = false;
+        let mut layer = Some(&vw.top);
+        while let Some(l) = layer {
+            if let Some(view) = &l.view {
+                if l.check.is_some() || cascaded {
+                    if let Some(filter) = &l.filter {
+                        let below = l
+                            .below
+                            .as_deref()
+                            .expect("a view layer reads a level below");
+                        let lscope = Scope::layer_body(self, table, 0, &l.below_label, below);
+                        let node =
+                            resolve_boolean_filter(&lscope, filter, &mut ParamTypes::default())?;
+                        out.push((view.clone(), node));
+                    }
+                }
+                cascaded |= l.check == Some(CheckOption::Cascaded);
+            }
+            layer = l.below.as_deref();
+        }
+        out.reverse();
         Ok(out)
     }
 }

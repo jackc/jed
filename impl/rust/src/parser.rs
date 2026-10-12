@@ -16,7 +16,7 @@ use crate::ast::{
     SeqOptions, SetOp, SetOpKind, StarPos, Statement, SubscriptSpec, TableRef, TableRefPos,
     TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
 };
-use crate::ast::{FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
+use crate::ast::{CheckOption, FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
 use crate::lexer::lex;
@@ -250,10 +250,9 @@ impl Parser {
 
     /// `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr` (views.md
     /// §1, grammar.md §54). The body runs from the token after `AS` to the end of the statement and
-    /// is captured as its canonical token text. A `WITH ( … )` option list after the name and a
-    /// trailing `WITH [CASCADED | LOCAL] CHECK OPTION` are deferred forms (0A000); the check option
-    /// is detected after the body is parsed, so a body syntax error is reported first. `OR REPLACE`
-    /// with `IF NOT EXISTS` is 42601.
+    /// is captured as its canonical token text. A trailing `WITH [CASCADED | LOCAL] CHECK OPTION`
+    /// is cut off before the body and gives the view a check option (§15.6). A `WITH ( … )` option
+    /// list after the name is a deferred form (0A000). `OR REPLACE` with `IF NOT EXISTS` is 42601.
     fn parse_create_view(&mut self) -> Result<CreateView> {
         self.expect_keyword("create")?;
         let or_replace = self.peek_keyword().as_deref() == Some("or");
@@ -298,25 +297,22 @@ impl Parser {
         };
         self.expect_keyword("as")?;
         // A trailing `WITH [CASCADED | LOCAL] CHECK OPTION` is cut off before the body is parsed
-        // (an unreserved `with` would otherwise be read as a table alias) and refused after it.
-        let check_option = self.trailing_check_option();
-        if let Some(at) = check_option {
+        // (an unreserved `with` would otherwise be read as a table alias).
+        let trailing = self.trailing_check_option();
+        let check_option = trailing.map(|(at, option)| {
             self.tokens[at] = Token::Eof;
-        }
+            option
+        });
         let start = self.pos;
         self.parse_subquery()?;
         let end = self.pos;
-        if let Some(at) = check_option {
+        if let Some((at, _)) = trailing {
             if end != at {
                 return Err(syntax(format!(
                     "unexpected trailing input: {:?}",
                     self.peek()
                 )));
             }
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "WITH CHECK OPTION is not supported",
-            ));
         }
         let body = render_tokens(&self.tokens[start..end]);
         Ok(CreateView {
@@ -326,12 +322,14 @@ impl Parser {
             if_not_exists,
             columns,
             body,
+            check_option,
         })
     }
 
-    /// The index of a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` at the end of the token stream
-    /// (views.md §12), if the statement ends with one.
-    fn trailing_check_option(&self) -> Option<usize> {
+    /// The index and option of a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` at the end of the
+    /// token stream (views.md §15.6), if the statement ends with one. Bare `WITH CHECK OPTION` is
+    /// `CASCADED`.
+    fn trailing_check_option(&self) -> Option<(usize, CheckOption)> {
         let mut end = self.tokens.len();
         if matches!(self.tokens.last(), Some(Token::Eof)) {
             end -= 1;
@@ -341,13 +339,15 @@ impl Parser {
             return None;
         }
         if word(end - 3, "with") {
-            return Some(end - 3);
+            return Some((end - 3, CheckOption::Cascaded));
         }
-        if end >= self.pos + 4
-            && (word(end - 3, "cascaded") || word(end - 3, "local"))
-            && word(end - 4, "with")
-        {
-            return Some(end - 4);
+        if end >= self.pos + 4 && word(end - 4, "with") {
+            if word(end - 3, "cascaded") {
+                return Some((end - 4, CheckOption::Cascaded));
+            }
+            if word(end - 3, "local") {
+                return Some((end - 4, CheckOption::Local));
+            }
         }
         None
     }
