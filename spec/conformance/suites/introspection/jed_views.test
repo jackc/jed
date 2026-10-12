@@ -4,7 +4,8 @@
 # sequence rendered by format.md's per-token table (bare words folded, single spaces, comments
 # gone) with every expanded `*` frozen into quoted
 # `"label" . "column"` references (bare `"column"` for an unlabelled relation or a USING merge).
-# Views are not listed in jed_tables or jed_columns. Scoping, read-only rejection, privileges, and
+# Views are not listed in jed_tables; jed_columns lists their columns (pinned in
+# jed_columns.test). Scoping, read-only rejection, privileges, and
 # cost follow jed_tables. jed-specific, so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
 # requires: introspect.views, dml.view_check_option, ddl.view_replace, introspect.tables, introspect.columns, ddl.view, ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.join_using, query.qualified_star, query.subquery_exists, query.derived_table, query.cte, query.explain, session.privileges, resource.cost_metering, types.i32, types.text
 
@@ -135,7 +136,7 @@ SELECT definition, columns FROM jed_views WHERE name = 'Mixed'
 select b as "Bee" , 'it''s' as s , 1.50 as d from t where a <> 2 and c is not null
 {Bee,s,d}
 
-# --- one row per view, in any order; views are not tables and have no jed_columns rows -------------
+# --- one row per view, in any order; views are not tables, but jed_columns lists their columns ------
 
 query T rowsort
 SELECT name FROM jed_views
@@ -157,8 +158,15 @@ u
 query T rowsort
 SELECT DISTINCT table_name FROM jed_columns
 ----
+Mixed
+d
+e
+j
 t
 u
+v
+v2
+w
 
 # --- scope: the temp domain has no views; an unknown qualifier is 42P01 -----------------------------
 

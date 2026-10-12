@@ -4800,6 +4800,15 @@ fn index_method_name(kind: IndexKind) -> &'static str {
     }
 }
 
+/// The operator symbol rendered by `jed_constraints.operators` (introspection.md §5.1): the `WITH`
+/// operator of an `EXCLUDE` element as written.
+fn exclusion_op_symbol(op: ExclusionOp) -> &'static str {
+    match op {
+        ExclusionOp::Overlaps => "&&",
+        ExclusionOp::Equal => "=",
+    }
+}
+
 /// Reject a mutation target (INSERT / UPDATE / DELETE / CREATE INDEX ON) naming a built-in catalog
 /// relation: `42809` wrong_object_type, `cannot modify system relation` (introspection.md §5 — the
 /// relations are read-only computed views of the catalog). Checked by NAME, before qualifier
@@ -4892,6 +4901,8 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
                 col("expression", ScalarType::Text, false),
                 col("ref_table", ScalarType::Text, false),
                 text_arr("ref_columns", false),
+                // EXCLUDE: the WITH operators in element order; NULL otherwise (§5.1).
+                text_arr("operators", false),
             ],
         ),
         SrfKind::JedStatistics => table(

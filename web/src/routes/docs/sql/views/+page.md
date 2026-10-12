@@ -371,8 +371,9 @@ Privileges are configured by the host. See [Authorization](../../api/authorizati
 `jed_views` lists each view's `name`, its stored `definition` (normalized: lowercase keywords,
 single-spaced tokens, `*` expanded, renames applied), its output `columns` as a `text[]`, and its
 `check_option` (`NONE`, `LOCAL`, or `CASCADED`). Views
-are not listed in `jed_tables` or `jed_columns`. To learn a view's column types, prepare
-`SELECT * FROM v`. See [Introspection](../introspection/).
+are not listed in `jed_tables`, but `jed_columns` lists each view column with the type a query
+over the view produces (with no length or precision: `text`, not `varchar(80)`). See
+[Introspection](../introspection/).
 
 ## Not supported yet
 

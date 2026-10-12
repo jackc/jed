@@ -354,6 +354,32 @@ func (db *engine) planViewReference(viewName string, body *queryExpr, written *t
 	return plan, err
 }
 
+// viewColumnTypes returns the canonical type text of each output column of view (introspection.md
+// §5): the body is planned exactly as a reference to the view would plan it, so a body that cannot be
+// planned raises the error reading the view would. An untyped NULL column reads as text, the type a
+// derived-table column of unknown type takes.
+func (db *engine) viewColumnTypes(view *viewDef) ([]string, error) {
+	var plan queryPlan
+	err := db.inViewBody(viewSite{depth: 0, bodyDepth: view.Depth}, func() error {
+		var perr error
+		plan, perr = db.planQuery(*view.Body, nil, nil, &paramTypes{})
+		return perr
+	})
+	if err != nil {
+		return nil, err
+	}
+	types := plan.columnTypes()
+	out := make([]string, len(types))
+	for i, t := range types {
+		if t.kind == rtNull {
+			out[i] = "text"
+		} else {
+			out[i] = rtName(t)
+		}
+	}
+	return out, nil
+}
+
 // viewStandIn is the stand-in for a view reference inside a shape (planner.md §3.2) whose view was
 // already planned during this expansion: a row-less VALUES relation with the view's output columns.
 // A shape is read only for its own outputs and pushability, never for its relations' bodies.

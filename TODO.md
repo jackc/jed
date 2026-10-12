@@ -151,8 +151,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ `ON CONFLICT` on an updatable view, view column defaults,
     view options and the other `ALTER VIEW` actions, materialized and recursive views, temporary views, views in or over attached
     databases, dependency tracking for
-    sequences/types/collations/host functions, view columns in `jed_columns`, definitions longer
-    than one catalog page. → [views.md §12](spec/design/views.md)
+    sequences/types/collations/host functions, definitions longer than one catalog page. (View
+    columns in `jed_columns` have landed — [introspection.md §5](spec/design/introspection.md).) → [views.md §12](spec/design/views.md)
 
 ---
 
@@ -292,7 +292,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [x] **`jed_columns.column_default`** — ✅ LANDED (all 3 cores). An expression default shows its
     persisted canonical token text, a constant its stored value as a SQL literal, `DEFAULT NULL` NULL
     (PG stores none). No storage change. → [introspection.md §5](spec/design/introspection.md)
-  - [ ] _follow-on:_ the EXCLUDE operator list as a `jed_constraints` column addition. _(size: S)_
+  - [x] **View columns in `jed_columns`; `jed_constraints.operators`** — ✅ LANDED (all 3 cores). Each
+    main-database view contributes one row per output column, typed by planning its body (result
+    types, no typmods); an EXCLUDE row's `operators text[]` lists each element's `WITH` operator,
+    parallel to `columns`. No storage change.
+    → [introspection.md §5/§5.1](spec/design/introspection.md)
 - [x] **Structured error fields** ([error-fields.md](spec/design/error-fields.md)) — ✅ LANDED (all 3 cores). `EngineError` gained four optional identifier fields modeled on pgx's `pgconn.PgError` — `ConstraintName`/`TableName`/`ColumnName`/`DataTypeName` (Rust `Option<String>`, Go `string`, TS optional) — so a host identifies *which* constraint fired without regexing the (non-contractual) message. Populated via **typed constructor helpers** that own message *and* fields together (no drift): 23505/23514/23503/23P01 → constraint+table; 23502 → column (+ table stamped at the DML boundary via `stampTable`/`.map_err`); 22003 routes through the `overflow(ty)` helper + 22001 varchar → data type (+ column). `Display`/`Error()` unchanged; per-core `error_fields` tests (corpus can't assert structured fields). **Hard-excluded:** pgx's `File`/`Line`/`Routine` (core source location differs across cores → would break §8 byte-identity). No format bump, no cost/determinism change.
   - [x] **`Detail`** — ✅ LANDED (all 3 cores). PostgreSQL's DETAIL sentences (`Key (id)=(1) already exists.`, `… is not present in table "t".`, `Failing row contains (…).`) as a fifth structured field, never appended to the one-line message (house style kept; the CLI prints a psql-style `DETAIL:` line). Values through the result-cell renderer, 64-byte cap, withheld without `SELECT` on the table; NOT NULL now checks the complete row (PostgreSQL's order). Pinned by the shared `spec/errors/detail_cases.txt`. → [error-fields.md §9](spec/design/error-fields.md)
   - [x] **`Position` + `Hint`** — ✅ LANDED (all 3 cores). `Position` is the 1-based character offset of the offending token (PostgreSQL's unit): every lexer/parser error except the class-54 limits, column-reference `42703`/`42702`/`42P01`, unknown INSERT/SET targets, unknown FROM tables; script errors count from the script start. Tokens carry character positions; the AST records equality-invisible `SrcPos` on named nodes; stored text records none. `Hint` is PostgreSQL's misspelled-column (Levenshtein, `errorMissingColumn`) and table-alias suggestions. The CLI prints psql's `LINE n:` cursor and `HINT:` line. Pinned by the shared `spec/errors/position_cases.txt` (PostgreSQL-captured). → [error-fields.md §10–§11](spec/design/error-fields.md)

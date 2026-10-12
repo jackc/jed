@@ -3,14 +3,15 @@
 # table: name / table_name / type ('check' | 'unique' | 'foreign_key' | 'exclude') / columns
 # (text[], member/local columns; NULL for a CHECK) / expression (the persisted canonical CHECK text,
 # constraints.md §4.5 — cross-core byte-identical; NULL otherwise) / ref_table + ref_columns (FK
-# parent, NULL otherwise). It covers those FOUR kinds only: the PRIMARY KEY and NOT NULL constraints
+# parent, NULL otherwise) / operators (text[], an EXCLUDE's WITH operators in element order, parallel
+# to columns; NULL otherwise). It covers those FOUR kinds only: the PRIMARY KEY and NOT NULL constraints
 # own no named catalog object and are described by jed_columns (pk_ordinal, not_null). A jed UNIQUE
 # constraint IS its backing unique index (constraints.md §5 — the catalog cannot distinguish a
 # UNIQUE table constraint from a bare CREATE UNIQUE INDEX), so type='unique' lists every unique
 # b-tree index; a constraint-backing index appears in both jed_constraints and jed_indexes under the
 # same name. Resolution / scoping / read-only / privileges / cost are the jed_tables model.
 # jed-specific, so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
-# requires: introspect.constraints, introspect.indexes, introspect.tables, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.check, ddl.unique, ddl.foreign_key, ddl.exclusion_constraint, ddl.not_null, ddl.drop_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.cte, query.join_inner, query.qualified_table, query.explain, query.aggregates, session.privileges, resource.cost_metering, types.i32, types.text, types.range
+# requires: introspect.constraints, introspect.indexes, introspect.tables, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.check, ddl.unique, ddl.foreign_key, ddl.exclusion_constraint, ddl.not_null, ddl.drop_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.cte, query.join_inner, query.qualified_table, query.explain, query.aggregates, session.privileges, resource.cost_metering, types.i32, types.text, types.range, types.array, expr.array_subscript, ddl.gist_scalar_index
 
 # --- an empty database lists no constraints -------------------------------------------------------
 
@@ -38,8 +39,8 @@ CREATE TABLE child (
 # every constraint across both tables — the PRIMARY KEY (parent's (code, id), child's x) is ABSENT
 # (owns no named object; described by jed_columns.pk_ordinal), so is NOT NULL. Per-table generation
 # order is by KIND (check, unique, foreign_key, exclude), then name.
-query TTTTTTT nosort
-SELECT name, table_name, type, columns, expression, ref_table, ref_columns
+query TTTTTTTT nosort
+SELECT name, table_name, type, columns, expression, ref_table, ref_columns, operators
   FROM jed_constraints ORDER BY table_name, type, name
 ----
 child_amt_check
@@ -49,11 +50,13 @@ NULL
 amt >= 0
 NULL
 NULL
+NULL
 chk_note
 child
 check
 NULL
 note <> ''
+NULL
 NULL
 NULL
 child_span_excl
@@ -63,6 +66,7 @@ exclude
 NULL
 NULL
 NULL
+{&&}
 child_pid_fk
 child
 foreign_key
@@ -70,6 +74,7 @@ foreign_key
 NULL
 parent
 {id}
+NULL
 parent_id_uq
 parent
 unique
@@ -77,6 +82,31 @@ unique
 NULL
 NULL
 NULL
+NULL
+
+# --- EXCLUDE: operators is parallel to columns, in element order ---------------------------------
+
+statement ok
+CREATE TABLE booking (id i32 PRIMARY KEY, room i32, span i32range, CONSTRAINT no_overlap EXCLUDE USING gist (room WITH =, span WITH &&))
+
+query TTT nosort
+SELECT name, columns, operators FROM jed_constraints WHERE table_name = 'booking'
+----
+no_overlap
+{room,span}
+{=,&&}
+
+# element i pairs columns[i] with operators[i]
+query TTTT nosort
+SELECT columns[1], operators[1], columns[2], operators[2] FROM jed_constraints WHERE name = 'no_overlap'
+----
+room
+=
+span
+&&
+
+statement ok
+DROP TABLE booking
 
 # --- CHECK: the canonical expression text is a compatibility surface (constraints.md §4.5) --------
 

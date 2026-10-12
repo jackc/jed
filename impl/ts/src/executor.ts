@@ -3783,6 +3783,10 @@ export class Engine {
       return fields;
     }
     let rows = 0n;
+    // jed_columns lists the main database's view columns after its tables' (introspection.md §5).
+    if (srf.kind === "jed_columns" && srf.introspectScope === "main") {
+      for (const view of snap.viewsSorted()) rows = saturatingEstimateAdd(rows, BigInt(view.columns.length));
+    }
     for (const table of snap.tablesSorted()) {
       switch (srf.kind) {
         case "jed_tables": rows = saturatingEstimateAdd(rows, 1n); break;
@@ -13306,6 +13310,17 @@ export class Engine {
     };
   }
 
+  // viewColumnTypes returns the canonical type text of each output column of view
+  // (introspection.md §5): the body is planned exactly as a reference to the view would plan it, so
+  // a body that cannot be planned raises the error reading the view would. An untyped NULL column
+  // reads as text, the type a derived-table column of unknown type takes.
+  private viewColumnTypes(view: ViewDef): string[] {
+    const plan = this.inViewBody({ depth: 0, bodyDepth: view.depth }, () =>
+      this.planQuery(view.body, null, [], new ParamTypes()),
+    );
+    return plan.columnTypes.map((t) => (t.kind === "null" ? "text" : rtName(t)));
+  }
+
   // planViewReference plans a view reference's body (views.md §4.1): a fresh top-level scope with no
   // correlation, no outer CTEs, and no parameters. While a view body is traced, the reference records
   // the dependency on the view itself.
@@ -16384,7 +16399,9 @@ export class Engine {
   // (catalogTypeText); not_null covers a declared NOT NULL and PRIMARY KEY membership; pk_ordinal
   // is the 1-based position in the PRIMARY KEY in KEY order (which may differ from declaration
   // order — constraints.md §3), NULL for a non-member; column_default is the canonical DEFAULT
-  // text (columnDefaultText). Cost mirrors jedTablesRows.
+  // text (columnDefaultText). The main database's views follow, in (view name, ordinal) order
+  // (introspection.md §5): a view column's type is the type its planned body produces, and it is
+  // nullable, keyless, and has no default. Cost mirrors jedTablesRows.
   private jedColumnsRows(srf: SrfPlan, meter: Meter): Row[] {
     const snap = this.snapForScope(srf.introspectScope!);
     if (snap === undefined) {
@@ -16407,6 +16424,26 @@ export class Engine {
           k >= 0 ? intValue(BigInt(k + 1)) : nullValue(),
           columnDefault === null ? nullValue() : textValue(columnDefault),
         ]);
+      }
+    }
+    // Views live only in the main database; an attached database's views are not readable
+    // (views.md §10), so their columns are not listed.
+    if (srf.introspectScope === "main") {
+      for (const v of snap.viewsSorted()) {
+        const types = this.viewColumnTypes(v);
+        for (let i = 0; i < v.columns.length; i++) {
+          meter.guard();
+          meter.charge(COSTS.generatedRow);
+          out.push([
+            textValue(v.name),
+            textValue(v.columns[i]!),
+            intValue(BigInt(i + 1)),
+            textValue(types[i]!),
+            boolValue(false),
+            nullValue(),
+            nullValue(),
+          ]);
+        }
       }
     }
     return out;
@@ -16622,6 +16659,7 @@ export class Engine {
           textValue(ck.exprText),
           nullValue(),
           nullValue(),
+          nullValue(),
         ]);
       }
       // UNIQUE: every unique b-tree index (a UNIQUE constraint IS its unique index).
@@ -16634,6 +16672,7 @@ export class Engine {
           textValue(t.name),
           textValue("unique"),
           textArr(idx.keys.map((k) => indexKeyLabel(k, t))),
+          nullValue(),
           nullValue(),
           nullValue(),
           nullValue(),
@@ -16655,10 +16694,10 @@ export class Engine {
           nullValue(),
           textValue(refTable),
           textArr(fk.refColumns.map((ord) => parent?.columns[ord]?.name ?? "")),
+          nullValue(),
         ]);
       }
-      // EXCLUDE: the excluded columns in element order (the &&/= operators are a deferred column
-      // addition — introspection.md §5.1).
+      // EXCLUDE: the excluded columns and their WITH operators, both in element order.
       for (const exc of t.exclusions) {
         meter.guard();
         meter.charge(COSTS.generatedRow);
@@ -16670,6 +16709,7 @@ export class Engine {
           nullValue(),
           nullValue(),
           nullValue(),
+          textArr(exc.elements.map((el) => exclusionOpSymbol(el.op))),
         ]);
       }
     }
@@ -27877,6 +27917,12 @@ export function checkCatalogRelWrite(name: string): void {
   }
 }
 
+// exclusionOpSymbol is the operator symbol rendered by jed_constraints.operators (introspection.md
+// §5.1): the WITH operator of an EXCLUDE element as written.
+function exclusionOpSymbol(op: ExclusionOp): string {
+  return op === "equal" ? "=" : "&&";
+}
+
 // catalogRelTable builds the FIXED synthetic schema of a catalog relation (introspection.md §5).
 // Unlike an SRF's single-column alias rule, a FROM alias renames the RELATION only — the column
 // names are part of the introspection surface. Growth is by ADDING columns (consumers select by
@@ -27941,6 +27987,8 @@ export function catalogRelTable(kind: CatalogRelKind): Table {
         col("expression", "text", false),
         col("ref_table", "text", false),
         textArr("ref_columns", false),
+        // EXCLUDE: the WITH operators in element order; NULL otherwise (introspection.md §5.1).
+        textArr("operators", false),
       ]);
     case "jed_sequences":
       return table("jed_sequences", [

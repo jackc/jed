@@ -39,20 +39,26 @@ the database's catalog. Nothing is stored, so they are always current.
 Nine relations ship today:
 
 - **`jed_tables`** — one row per user table: `name` (the table name as written in `CREATE TABLE`).
-- **`jed_columns`** — one row per column of every user table: `table_name`, `name`, `ordinal`
+- **`jed_columns`** — one row per column of every user table and [view](../views/): `table_name`
+  (the table or view name), `name`, `ordinal`
   (1-based, declaration order), `type` (the canonical type text — `i32`, `varchar(80)`,
   `decimal(8,2)`, `i32[]`, `i32range`, a composite's name, …), `not_null` (declared `NOT NULL`
   or a `PRIMARY KEY` member), `pk_ordinal` (the column's 1-based position in the primary
   key, in **key** order; `NULL` for a non-member), and `column_default` (the `DEFAULT` as SQL
   text — an expression default in its stored canonical form, such as `uuidv7 ( )`, or a constant
-  as a literal of its stored value, such as `1.50` or `'draft'`; `NULL` for no default).
+  as a literal of its stored value, such as `1.50` or `'draft'`; `NULL` for no default). A view
+  column's `type` is the type a query over the view produces, so it carries no length or precision
+  (`text`, not `varchar(80)`); a view column is never `not_null`, keyed, or defaulted. Views
+  in attached databases are not listed.
 - **`jed_indexes`** — one row per secondary index: `name`, `table_name`, `columns` (a `text[]` of
   the indexed column names in key order), `is_unique`, and `method` (`btree` / `gin` / `gist`).
   The primary key owns no index object, so it is not listed here — see `jed_columns.pk_ordinal`.
 - **`jed_constraints`** — one row per `CHECK` / `UNIQUE` / `FOREIGN KEY` / `EXCLUDE` constraint:
   `name`, `table_name`, `type`, `columns` (a `text[]` of the member/local columns; `NULL` for a
   `CHECK`), `expression` (the `CHECK` text; `NULL` otherwise), and `ref_table` / `ref_columns`
-  (the foreign-key parent; `NULL` otherwise). A `UNIQUE` constraint *is* its backing unique index,
+  (the foreign-key parent; `NULL` otherwise), and `operators` (an `EXCLUDE` constraint's `WITH`
+  operators, `&&` or `=`, in the same order as `columns`; `NULL` otherwise). A `UNIQUE` constraint
+  *is* its backing unique index,
   so it appears in both `jed_indexes` and `jed_constraints` under the same name.
 - **`jed_statistics`** — one summary per analyzed column: table/column name, analyzed row and NULL
   counts, stale flag, optional distinct count, sample rows, average width, and MCV/histogram counts.
@@ -70,8 +76,8 @@ Nine relations ship today:
 - **`jed_views`** — one row per [view](../views/): `name`, `definition` (the stored query text,
   normalized: lowercase keywords, single-spaced tokens, `*` expanded into explicit columns, and
   renames applied), `columns` (a `text[]` of the output column names, in order), and
-  `check_option` (`NONE`, `LOCAL`, or `CASCADED`). Views are not listed in `jed_tables` or
-  `jed_columns`.
+  `check_option` (`NONE`, `LOCAL`, or `CASCADED`). Views are not listed in `jed_tables`; their
+  columns are listed in `jed_columns`.
 
 <LiveSql {seed} {query} rows={10} />
 
@@ -80,7 +86,7 @@ Things to try in the panel above:
 - List the tables — `SELECT name FROM jed_tables ORDER BY name;`
 - Reconstruct a key — `SELECT name FROM jed_columns WHERE table_name = 'booking' AND pk_ordinal IS NOT NULL ORDER BY pk_ordinal;`
 - List the indexes — `SELECT name, table_name, columns, is_unique, method FROM jed_indexes ORDER BY table_name, name;`
-- List the constraints — `SELECT name, table_name, type, columns, expression, ref_table, ref_columns FROM jed_constraints ORDER BY table_name, type, name;`
+- List the constraints — `SELECT name, table_name, type, columns, expression, ref_table, ref_columns, operators FROM jed_constraints ORDER BY table_name, type, name;`
 - Inspect planner facts — `SELECT table_name, column_name, analyzed_rows, is_stale, distinct_count FROM jed_statistics ORDER BY table_name, column_name;`
 - List the sequences — `SELECT name, start_value, last_value, owned_by_table, owned_by_column FROM jed_sequences ORDER BY name;`
 - Advance one, then look again — `SELECT nextval('invoice_no');`
@@ -90,6 +96,7 @@ Things to try in the panel above:
 - Count columns per table — `SELECT table_name, count(*) FROM jed_columns GROUP BY table_name;`
 - Show the column defaults — `SELECT table_name, name, column_default FROM jed_columns WHERE column_default IS NOT NULL;` (the `serial` key shows the `nextval` default it expands to; `DEFAULT 0` on `decimal(8,2)` shows the stored `0.00`)
 - Create a view, then list it — `CREATE VIEW adults AS SELECT id, name FROM customer WHERE age >= 18; SELECT name, definition, columns FROM jed_views;`
+- Then list its columns and their types — `SELECT name, type FROM jed_columns WHERE table_name = 'adults' ORDER BY ordinal;`
 - Create a table or index, then re-run the query — the new rows appear immediately.
 
 ## Scoping — one catalog per database

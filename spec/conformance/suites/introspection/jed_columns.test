@@ -1,8 +1,9 @@
 # The jed_columns catalog relation (spec/design/introspection.md §5, slice I1): one row per column
-# of every USER table of the qualified database — table_name / name / ordinal (1-based, CREATE
-# TABLE order) / type (the CANONICAL type text) / not_null (declared NOT NULL or PRIMARY KEY
-# member) / pk_ordinal (1-based position in the PRIMARY KEY in KEY order; NULL for a non-member) /
-# column_default (the DEFAULT as canonical SQL text; NULL for none or DEFAULT NULL).
+# of every USER table of the qualified database, then of every view of the main database —
+# table_name / name / ordinal (1-based, CREATE TABLE order) / type (the CANONICAL type text) /
+# not_null (declared NOT NULL or PRIMARY KEY member) / pk_ordinal (1-based position in the PRIMARY
+# KEY in KEY order; NULL for a non-member) / column_default (the DEFAULT as canonical SQL text; NULL
+# for none or DEFAULT NULL).
 # The canonical `type` text is a COMPATIBILITY SURFACE from the moment it ships — this file pins
 # every renderable type: the scalar canonical names, the typmods applied at the leaf (varchar(10),
 # decimal(8,2) — including through an array element: varchar(5)[]), a composite's name as created,
@@ -10,7 +11,7 @@
 # select by name, never `SELECT *` positionally. Scoping / read-only / privileges / cost are the
 # same model as jed_tables (pinned there). jed-specific, so CROSS-CORE-checked, NOT
 # PostgreSQL-oracle-checked.
-# requires: introspect.columns, introspect.tables, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.not_null, dml.insert, query.select, query.where_eq, query.order_by, query.join_inner, query.aggregates, resource.cost_metering, ddl.column_default, ddl.column_default_expr, ddl.serial, ddl.identity, ddl.alter_table, func.uuid_generate, session.timezone, types.i16, types.i32, types.i64, types.text, types.varchar_length, types.boolean_storable, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.interval, types.f32, types.f64, types.date, types.json, types.jsonb, types.composite, types.array, types.array_composite, types.range
+# requires: introspect.columns, introspect.tables, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.not_null, dml.insert, query.select, query.where_eq, query.order_by, query.join_inner, query.aggregates, resource.cost_metering, ddl.column_default, ddl.column_default_expr, ddl.serial, ddl.identity, ddl.alter_table, func.uuid_generate, session.timezone, types.i16, types.i32, types.i64, types.text, types.varchar_length, types.boolean_storable, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.interval, types.f32, types.f64, types.date, types.json, types.jsonb, types.composite, types.array, types.array_composite, types.range, ddl.view, ddl.view_alter, introspect.views, session.privileges
 # load-timezone: America/New_York
 
 # --- an empty database yields no column rows ------------------------------------------------------
@@ -334,3 +335,162 @@ b
 NULL
 e
 not false
+
+# --- views: one row per output column, after the tables ------------------------------------------
+# A view column's `type` is the type its planned body produces: the result-column type, which
+# carries no typmod (a varchar(10) column reads as text, decimal(8,2) as decimal), and an untyped
+# NULL reads as text. A view column is nullable, keyless, and has no default. Names are the view's
+# stored output names, so a column list renames them.
+statement ok
+CREATE TABLE vbase (id i32 PRIMARY KEY, label varchar(10) NOT NULL DEFAULT 'x', amount decimal(8,2), tags text[], at addr)
+
+statement ok
+CREATE VIEW vcols (ident, label, total, doubled, tags, at, nothing) AS SELECT id, label, amount, id::i64 * 2, tags, at, NULL FROM vbase
+
+query ITTBIT nosort
+SELECT ordinal, name, type, not_null, pk_ordinal, column_default FROM jed_columns WHERE table_name = 'vcols' ORDER BY ordinal
+----
+1
+ident
+i32
+false
+NULL
+NULL
+2
+label
+text
+false
+NULL
+NULL
+3
+total
+decimal
+false
+NULL
+NULL
+4
+doubled
+i64
+false
+NULL
+NULL
+5
+tags
+text[]
+false
+NULL
+NULL
+6
+at
+addr
+false
+NULL
+NULL
+7
+nothing
+text
+false
+NULL
+NULL
+
+# a view over a view, and an aggregate body
+statement ok
+CREATE VIEW vstack AS SELECT ident, doubled + 1 AS next FROM vcols
+
+statement ok
+CREATE VIEW vagg AS SELECT count(*) AS n, sum(amount) AS total, max(label) AS top FROM vbase
+
+query TTIT nosort
+SELECT table_name, name, ordinal, type FROM jed_columns WHERE table_name IN ('vstack', 'vagg') ORDER BY table_name, ordinal
+----
+vagg
+n
+1
+i64
+vagg
+total
+2
+decimal
+vagg
+top
+3
+text
+vstack
+ident
+1
+i32
+vstack
+next
+2
+i64
+
+# views are not tables: joining jed_tables drops them, joining jed_views keeps only them
+query TI nosort
+SELECT v.name, count(*) FROM jed_views v JOIN jed_columns c ON c.table_name = v.name GROUP BY v.name ORDER BY v.name
+----
+vagg
+3
+vcols
+7
+vstack
+2
+
+# renames are reflected (the view's stored names change; the body still plans to the same types)
+statement ok
+ALTER VIEW vstack RENAME COLUMN next TO following
+
+statement ok
+ALTER VIEW vagg RENAME TO vsummary
+
+query TTT nosort
+SELECT table_name, name, type FROM jed_columns WHERE table_name IN ('vstack', 'vagg', 'vsummary') ORDER BY table_name, ordinal
+----
+vstack
+ident
+i32
+vstack
+following
+i64
+vsummary
+n
+i64
+vsummary
+total
+decimal
+vsummary
+top
+text
+
+# DROP VIEW removes its rows
+statement ok
+DROP VIEW vsummary
+
+query I nosort
+SELECT count(*) FROM jed_columns WHERE table_name = 'vsummary'
+----
+0
+
+# listing a view's columns needs SELECT on jed_columns only — not on the view or what it reads
+# default_privileges: NONE
+# grant: SELECT ON jed_columns
+query TT nosort
+SELECT name, type FROM jed_columns WHERE table_name = 'vstack' ORDER BY ordinal
+----
+ident
+i32
+following
+i64
+
+# the temp domain and an unqualified-to-temp read list no view columns (views live only in main)
+query I nosort
+SELECT count(*) FROM temp.jed_columns
+----
+0
+
+# The cost is one generated_row per produced row, views included (the 62 table columns + the 9
+# view columns), the aggregate fold over each, and 1 output row. Planning a view body is not metered.
+# cost: 143
+query I nosort
+SELECT count(*) FROM jed_columns
+----
+71

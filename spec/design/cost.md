@@ -1239,7 +1239,9 @@ construction** ([pager.md](pager.md)'s catalog residency) — so a catalog scan 
 `generated_row` per produced row (guarded, at the source) and **zero** `page_read` /
 `storage_row_read`. This holds regardless of a row's shape: a `jed_indexes` / `jed_constraints` row
 carries a `text[]` member-list column, but building that array is part of generating the row (like
-the `text` columns) and adds nothing beyond the one `generated_row`. Everything downstream meters as
+the `text` columns) and adds nothing beyond the one `generated_row`. A `jed_columns` row for a view
+column is generated after planning the view's body to learn its type (introspection.md §5); that
+planning is unmetered like all planning, so the row still costs one `generated_row`. Everything downstream meters as
 usual: `row_produced` per emitted row, `operator_eval` (+ `varlen_compare` for a text comparison)
 per `WHERE` evaluation, `aggregate_accumulate` per folded row. Worked examples (asserted in
 `suites/introspection/`): `SELECT name FROM jed_tables` over 2 tables — 2 `generated_row` + 2

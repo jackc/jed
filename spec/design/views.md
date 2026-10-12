@@ -591,10 +591,12 @@ jed_views(
 )
 ```
 
-`check_option` uses `information_schema.views.check_option`'s spelling. Views are **not** listed in `jed_tables` or `jed_columns`, which describe stored tables. This is
-PostgreSQL's `pg_tables` / `pg_views` split. A view's column types are not catalog facts (§3); a
-client finds them by preparing `SELECT * FROM v`. Listing view columns in `jed_columns` is a
-follow-on.
+`check_option` uses `information_schema.views.check_option`'s spelling. Views are **not** listed in
+`jed_tables`, which describes stored tables. This is PostgreSQL's `pg_tables` / `pg_views` split.
+Their columns **are** listed in `jed_columns`, as in PostgreSQL's `information_schema.columns`: one
+row per output column, nullable, keyless, with no default. A view's column types are not catalog
+facts (§3), so reading `jed_columns` plans each view's body to type its columns; the types are
+result types and carry no typmod ([introspection.md](introspection.md) §5 *View columns*).
 
 **The CLI dump** (`jed --dump`, [cli.md](cli.md)) emits each view as
 `CREATE VIEW <name> (<columns>) AS <definition>;`, after every table, its rows, and its indexes, and
@@ -648,7 +650,6 @@ Deferred follow-ons, none foreclosed:
 - temporary views and views in or over attached databases (`0A000`), including `ALTER TABLE` of an
   attached table that one of its database's views depends on;
 - dependency tracking for sequences, composite types, collations, and host functions;
-- view columns in `jed_columns`;
 - definitions longer than one catalog page (`0A000`), which would need an overflow chain.
 
 ## 13. Determinism and the cross-core contract

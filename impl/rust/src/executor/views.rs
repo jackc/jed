@@ -372,6 +372,29 @@ impl Engine {
         })
     }
 
+    /// The canonical type text of each output column of `view` (introspection.md §5): the body is
+    /// planned exactly as a reference to the view would plan it, so a body that cannot be planned
+    /// raises the error reading the view would. An untyped NULL column reads as `text`, the type a
+    /// derived-table column of unknown type takes.
+    pub(crate) fn view_column_types(&self, view: &ViewDef) -> Result<Vec<String>> {
+        let site = ViewSite {
+            depth: 0,
+            body_depth: view.depth,
+        };
+        let plan = self.in_view_body(site, || {
+            let mut ptypes = ParamTypes::default();
+            self.plan_query(&view.body, None, &[], &mut ptypes)
+        })?;
+        Ok(plan
+            .column_types()
+            .iter()
+            .map(|t| match t {
+                ResolvedType::Null => "text".to_string(),
+                t => t.type_name(),
+            })
+            .collect())
+    }
+
     /// The stand-in for a view reference inside a shape (planner.md §3.2) whose view was already
     /// planned during this expansion: a row-less VALUES relation with the view's output columns.
     /// A shape is read only for its own outputs and pushability, never for its relations' bodies.

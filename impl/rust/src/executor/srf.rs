@@ -756,7 +756,10 @@ impl Engine {
     /// (`catalog_type_text`); `not_null` covers a declared NOT NULL and PRIMARY KEY membership;
     /// `pk_ordinal` is the 1-based position in the PRIMARY KEY in KEY order (which may differ from
     /// declaration order — constraints.md §3), NULL for a non-member; `column_default` is the
-    /// canonical DEFAULT text (`Column::default_text`). Cost mirrors jed_tables_rows.
+    /// canonical DEFAULT text (`Column::default_text`). The main database's views follow, in
+    /// (view name, ordinal) order (introspection.md §5): a view column's `type` is the type its
+    /// planned body produces, and it is nullable, keyless, and has no default. Cost mirrors
+    /// jed_tables_rows.
     pub(crate) fn jed_columns_rows(&self, srf: &SrfPlan, meter: &mut Meter) -> Result<Vec<Row>> {
         let Some(snap) = self.snap_for_scope(&srf.introspect_scope) else {
             return Err(EngineError::new(
@@ -782,6 +785,26 @@ impl Engine {
                     pk_ordinal,
                     c.default_text().map_or(Value::Null, Value::Text),
                 ]);
+            }
+        }
+        // Views live only in the main database; an attached database's views are not readable
+        // (views.md §10), so their columns are not listed.
+        if srf.introspect_scope == "main" {
+            for v in snap.views_sorted() {
+                let types = self.view_column_types(v)?;
+                for (i, (name, ty)) in v.columns.iter().zip(types).enumerate() {
+                    meter.guard()?;
+                    meter.charge(COSTS.generated_row);
+                    out.push(vec![
+                        Value::Text(v.name.clone()),
+                        Value::Text(name.clone()),
+                        Value::Int(i as i64 + 1),
+                        Value::Text(ty),
+                        Value::Bool(false),
+                        Value::Null,
+                        Value::Null,
+                    ]);
+                }
             }
         }
         Ok(out)
@@ -1049,6 +1072,7 @@ impl Engine {
                     Value::Text(ck.expr_text.clone()),
                     Value::Null,
                     Value::Null,
+                    Value::Null,
                 ]);
             }
             // UNIQUE: every unique b-tree index (a UNIQUE constraint IS its unique index).
@@ -1068,6 +1092,7 @@ impl Engine {
                     Value::Text(t.name.clone()),
                     Value::Text("unique".to_string()),
                     text_arr(cols),
+                    Value::Null,
                     Value::Null,
                     Value::Null,
                     Value::Null,
@@ -1106,10 +1131,10 @@ impl Engine {
                     Value::Null,
                     Value::Text(ref_table),
                     text_arr(ref_cols),
+                    Value::Null,
                 ]);
             }
-            // EXCLUDE: the excluded columns in element order (the &&/= operators are a deferred
-            // column addition — introspection.md §5.1).
+            // EXCLUDE: the excluded columns and their WITH operators, both in element order.
             for exc in &t.exclusions {
                 meter.guard()?;
                 meter.charge(COSTS.generated_row);
@@ -1117,6 +1142,11 @@ impl Engine {
                     .elements
                     .iter()
                     .map(|el| t.columns[el.column].name.clone())
+                    .collect();
+                let ops: Vec<String> = exc
+                    .elements
+                    .iter()
+                    .map(|el| exclusion_op_symbol(el.op).to_string())
                     .collect();
                 out.push(vec![
                     Value::Text(exc.name.clone()),
@@ -1126,6 +1156,7 @@ impl Engine {
                     Value::Null,
                     Value::Null,
                     Value::Null,
+                    text_arr(ops),
                 ]);
             }
         }

@@ -214,7 +214,7 @@ explicit-grant sessions.
 
 **Determinism & cost** (implemented; pinned in [cost.md](cost.md) "`generated_row`"). Content is
 a pure function of the pinned snapshot (CLAUDE.md §10). Rows are generated in ascending
-name byte order (jed_columns: then ordinal) — a deterministic internal order with no
+name byte order (jed_columns: then ordinal, tables before views) — a deterministic internal order with no
 map-iteration leak; the observable contract is the **multiset**, row order without `ORDER BY`
 stays unspecified (§8 — the corpus compares `rowsort`). Each produced row charges one
 **`generated_row`** at the source, under the meter guard (a ceiling aborts mid-generation,
@@ -230,7 +230,7 @@ jed_tables(
 )
 
 jed_columns(
-  table_name  text NOT NULL,     -- canonical owning-table name
+  table_name  text NOT NULL,     -- canonical owning-table (or view) name
   name        text NOT NULL,     -- canonical column name
   ordinal     i32  NOT NULL,     -- 1-based, CREATE TABLE order
   type        text NOT NULL,     -- canonical type rendering (below)
@@ -279,6 +279,36 @@ and each renders without new state:
 The column needs no storage change and no `format_version` bump: both forms are already in the
 catalog. Generating it adds no cost unit (one `generated_row` per row, as before).
 
+**View columns** (added after I1). `jed_columns` also lists one row per output column of every view of
+the **main** database, after the tables, as PostgreSQL's `information_schema.columns` does.
+`table_name` is the view name, `name` its stored output name (views.md §3), and `ordinal` its 1-based
+position. A view column has no `NOT NULL` constraint, key, or default (view column defaults are a
+deferred views follow-on), so `not_null` is `false` and `pk_ordinal` and `column_default` are NULL.
+A consumer tells a view's columns from a table's by joining `jed_views` or `jed_tables`; no column was
+added for it.
+
+A view's output types are not persisted (views.md §3), so generating these rows **plans each view's
+body**, exactly as a reference to the view would plan it. The `type` text is therefore the type a
+query over the view produces, rendered by the same rules as above with two consequences of being a
+*result* type:
+
+- **No typmods.** A planned result type carries no typmod, so a `varchar(10)` column reads as
+  `text` and `decimal(8,2)` as `decimal`. This is the comparison `CREATE OR REPLACE VIEW` already
+  makes ("type without typmods", views.md §1.2). PostgreSQL keeps a typmod through a bare column
+  reference; jed does not track one through a query, so this is a recorded divergence.
+- **An untyped NULL reads as `text`**, the type a derived-table column of unknown type takes, and
+  what PostgreSQL resolves an `unknown` view column to.
+
+A body that cannot be planned (for example, one calling a host function the reopening host has not
+registered — views.md §3) makes the read raise that planning error, the same error reading the view
+raises; a view is never silently omitted. Planning is unmetered, as all planning is; the cost is
+still one `generated_row` per produced row. Planning needs no privilege on the view or on what it
+reads — `SELECT` on `jed_columns` is the whole gate, as for every other row.
+
+An attached database's views are not readable (views.md §10), so a `<attachment>.jed_columns` read
+lists no view columns; `temp` holds no views. Listing an attachment's view columns arrives with views
+over attachments.
+
 Deliberately minimal otherwise: no row-count column yet (v28 persists the fact for planning, but
 exposing it is a separate introspection-surface decision), and no identity or collation column yet.
 **Growth is by adding columns**, so consumers should select columns by name, not `SELECT *`
@@ -321,8 +351,10 @@ jed_constraints(
   expression  text,              -- the CHECK expression text (the persisted canonical token form,
                                  --   constraints.md §4.5 — cross-core byte-identical); NULL otherwise
   ref_table   text,              -- FOREIGN KEY: the referenced (parent) table name; NULL otherwise
-  ref_columns text[]             -- FOREIGN KEY: the referenced parent column names (list order);
+  ref_columns text[],            -- FOREIGN KEY: the referenced parent column names (list order);
                                  --   NULL otherwise
+  operators   text[]             -- EXCLUDE: each element's WITH operator ('&&' | '='), in element
+                                 --   order, parallel to columns; NULL otherwise
 )
 ```
 
@@ -344,8 +376,12 @@ unique index** (constraints.md §5 — there is no separate constraint object, a
 distinguish a `UNIQUE` table constraint from a bare `CREATE UNIQUE INDEX`), `type = 'unique'` lists
 **every unique b-tree index**; this is honest to jed's model (a unique index *is* a uniqueness
 constraint) and gives a consumer the complete uniqueness picture in one relation. `type =
-'exclude'` lists the exclusion constraints (columns = the excluded columns in element order — the
-`&&`/`=` operators are a deferred column addition, the §5 "growth by adding columns" rule).
+'exclude'` lists the exclusion constraints: `columns` holds the excluded columns and `operators` the
+`WITH` operator of each, both in element order, so `columns[i] WITH operators[i]` is element `i`
+(`EXCLUDE USING gist (room WITH =, span WITH &&)` shows `{room,span}` and `{=,&&}`). The operator
+renders as written in SQL (`&&`, `=`) — PostgreSQL's `pg_constraint.conexclop` holds operator OIDs,
+which jed does not have. `operators` was added after I2 under the §5 "growth by adding columns"
+rule.
 `expression` is populated for `type = 'check'` only, from the persisted canonical expression text
 (constraints.md §4.5), which is already cross-core byte-identical, so it needs no new
 canonical-form work (contrast the deferred `DEFAULT` rendering of §5).
@@ -487,9 +523,9 @@ One row per view of the qualified database, generated in ascending name byte ord
 §5 gate inherited unchanged (resolution, scoping, read-only `42809` — including `DROP VIEW
 jed_views` — privileges, `generated_row` cost, `EXPLAIN` `Catalog Scan jed_views`). The definition is
 the stored text, not a deparse: keywords lowercase, tokens single-spaced, every expanded `*` frozen
-into quoted references, and `RENAME` rewrites visible. Views are **not** rows of `jed_tables` or
-`jed_columns` (PostgreSQL's `pg_tables`/`pg_views` split); a view's column types are not catalog
-facts ([views.md](views.md) §3/§11). Corpus: `suites/introspection/jed_views.test` and
+into quoted references, and `RENAME` rewrites visible. Views are **not** rows of `jed_tables`
+(PostgreSQL's `pg_tables`/`pg_views` split); their columns are rows of `jed_columns`, typed by
+planning the body (§5 *View columns*; [views.md](views.md) §3/§11). Corpus: `suites/introspection/jed_views.test` and
 `jed_views_rename.test`.
 
 ## 6. The host API carries no introspection convenience
@@ -508,8 +544,8 @@ surface to keep consistent.
 **What remains is not a convenience but a doc-hidden tooling seam.** `table()` (and
 `composite_type()`) survive as the `#[doc(hidden)]` `tooling` introspection accessors the **in-repo
 CLI and white-box tests** reach for (api.md §6) — the CLI's `.dump` reconstructs `CREATE TABLE` from
-the full catalog `Table`, which the `jed_` relations do not yet fully expose (column DEFAULTs are
-still un-rendered in `jed_columns`, §5). These are internal machinery, explicitly not the embedding
+the full catalog `Table`, which the `jed_` relations do not yet fully expose (identity, collation,
+and the row count have no column yet, §5). These are internal machinery, explicitly not the embedding
 API, and a host is never pointed at them. Per core the seam differs by necessity (api.md §6): Rust
 keeps `table`/`table_names` as `#[doc(hidden)]` handle accessors because its CLI is a separate crate;
 Go drops the `TableNames` wrappers entirely; TS's tools reach `Engine.tableNames()` directly.
@@ -539,4 +575,5 @@ The later relations' own errors (if any new arise) are pinned by their implement
 | **P9** | `jed_statistics` (§5.2): one summary row per analyzed column, qualified-domain scoping, stale/NDV/width/count visibility, capability `introspect.statistics`, corpus + `/web` docs | ✅ landed with column statistics |
 | **V1** | `jed_views` (§5.4), capability `introspect.views`, `/web` docs | ✅ landed ([views.md](views.md)) |
 | **I3** | `jed_sequences` + `jed_types` + `jed_type_fields` (§5.3): three classifier entries + three row generators (every gate inherited from I1), PG `pg_sequences`-spelled sequence columns with the `OWNED BY` link, composite types with their fields as a separate relation, capabilities `introspect.sequences`/`introspect.types`/`introspect.type_fields`, corpus (`suites/introspection/jed_sequences.test` + `jed_sequences_txn.test` + `jed_types.test`, temp + attachment scoping), cost.md worked examples, `/web` docs | ✅ landed |
+| — | view columns in `jed_columns` (§5) and `jed_constraints.operators` (§5.1), added under the growth-by-adding-columns rule | ✅ landed |
 | — | `information_schema` compat views over the `jed_` relations | door open, **not planned** |

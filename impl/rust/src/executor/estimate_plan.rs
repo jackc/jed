@@ -413,21 +413,31 @@ impl Engine {
             }
             _ => {}
         }
-        snap.tables_sorted().into_iter().fold(0, |rows, table| {
-            let count = match srf.kind {
-                SrfKind::JedTables => 1,
-                SrfKind::JedColumns => table.columns.len(),
-                SrfKind::JedIndexes => table.indexes.len(),
-                SrfKind::JedConstraints => {
-                    table.checks.len()
-                        + table.foreign_keys.len()
-                        + table.exclusions.len()
-                        + table.indexes.iter().filter(|index| index.unique).count()
-                }
-                _ => 0,
-            };
-            sat_add(rows, count as i64)
-        })
+        // jed_columns lists the main database's view columns after its tables' (introspection.md §5).
+        let view_rows = if srf.kind == SrfKind::JedColumns && srf.introspect_scope == "main" {
+            snap.views_sorted()
+                .into_iter()
+                .fold(0, |rows, view| sat_add(rows, view.columns.len() as i64))
+        } else {
+            0
+        };
+        snap.tables_sorted()
+            .into_iter()
+            .fold(view_rows, |rows, table| {
+                let count = match srf.kind {
+                    SrfKind::JedTables => 1,
+                    SrfKind::JedColumns => table.columns.len(),
+                    SrfKind::JedIndexes => table.indexes.len(),
+                    SrfKind::JedConstraints => {
+                        table.checks.len()
+                            + table.foreign_keys.len()
+                            + table.exclusions.len()
+                            + table.indexes.iter().filter(|index| index.unique).count()
+                    }
+                    _ => 0,
+                };
+                sat_add(rows, count as i64)
+            })
     }
 
     /// Estimate one FROM relation as the executor reads it. A WHERE contradiction reads no relation

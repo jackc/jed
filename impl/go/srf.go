@@ -560,6 +560,15 @@ func indexMethodName(kind indexKind) string {
 	}
 }
 
+// exclusionOpSymbol is the operator symbol rendered by jed_constraints.operators (introspection.md
+// §5.1): the WITH operator of an EXCLUDE element as written.
+func exclusionOpSymbol(op exclusionOp) string {
+	if op == exclEqual {
+		return "="
+	}
+	return "&&"
+}
+
 // isCatalogRelName reports whether name is a built-in catalog relation (introspection.md §5).
 // The write paths use it to reject a catalog relation as a mutation/DDL target (42809 — a catalog
 // relation is read-only, introspection.md §5); the privilege gate uses it so a built-in is
@@ -620,6 +629,8 @@ func catalogRelTable(kind srfKind) *catTable {
 			{Name: "expression", Type: scalarT(scalarText)},
 			{Name: "ref_table", Type: scalarT(scalarText)},
 			{Name: "ref_columns", Type: textArr},
+			// EXCLUDE: the WITH operators in element order; NULL otherwise (introspection.md §5.1).
+			{Name: "operators", Type: textArr},
 		}}
 	case srfJedSequences:
 		return &catTable{Name: "jed_sequences", Columns: []catColumn{
@@ -745,7 +756,9 @@ func (db *engine) jedTablesRows(sp *srfPlan, m *costMeter) ([]storedRow, error) 
 // not_null covers a declared NOT NULL and PRIMARY KEY membership; pk_ordinal is the 1-based
 // position in the PRIMARY KEY in KEY order (which may differ from declaration order —
 // constraints.md §3), NULL for a non-member; column_default is the canonical DEFAULT text
-// (catColumn.defaultText). Cost mirrors jedTablesRows.
+// (catColumn.defaultText). The main database's views follow, in (view name, ordinal) order
+// (introspection.md §5): a view column's type is the type its planned body produces, and it is
+// nullable, keyless, and has no default. Cost mirrors jedTablesRows.
 func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
 	snap := db.snapForScope(sp.introspectScope)
 	if snap == nil {
@@ -778,6 +791,31 @@ func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 				pkOrdinal,
 				columnDefault,
 			})
+		}
+	}
+	// Views live only in the main database; an attached database's views are not readable
+	// (views.md §10), so their columns are not listed.
+	if sp.introspectScope == "main" {
+		for _, v := range snap.viewsSorted() {
+			types, err := db.viewColumnTypes(v)
+			if err != nil {
+				return nil, err
+			}
+			for i, name := range v.Columns {
+				if err := m.Guard(); err != nil {
+					return nil, err
+				}
+				m.Charge(costs.GeneratedRow)
+				out = append(out, storedRow{
+					TextValue(v.Name),
+					TextValue(name),
+					IntValue(int64(i + 1)),
+					TextValue(types[i]),
+					BoolValue(false),
+					NullValue(),
+					NullValue(),
+				})
+			}
 		}
 	}
 	return out, nil
@@ -900,6 +938,7 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 				TextValue(ck.ExprText),
 				NullValue(),
 				NullValue(),
+				NullValue(),
 			})
 		}
 		// UNIQUE: every unique b-tree index (a UNIQUE constraint IS its unique index).
@@ -925,6 +964,7 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 				TextValue(t.Name),
 				TextValue("unique"),
 				textArr(cols),
+				NullValue(),
 				NullValue(),
 				NullValue(),
 				NullValue(),
@@ -961,18 +1001,20 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 				NullValue(),
 				TextValue(refTable),
 				textArr(refCols),
+				NullValue(),
 			})
 		}
-		// EXCLUDE: the excluded columns in element order (the &&/= operators are a deferred column
-		// addition — introspection.md §5.1).
+		// EXCLUDE: the excluded columns and their WITH operators, both in element order.
 		for _, exc := range t.Exclusions {
 			if err := m.Guard(); err != nil {
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
 			cols := make([]string, len(exc.Elements))
+			ops := make([]string, len(exc.Elements))
 			for j, el := range exc.Elements {
 				cols[j] = t.Columns[el.Column].Name
+				ops[j] = exclusionOpSymbol(el.Op)
 			}
 			out = append(out, storedRow{
 				TextValue(exc.Name),
@@ -982,6 +1024,7 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 				NullValue(),
 				NullValue(),
 				NullValue(),
+				textArr(ops),
 			})
 		}
 	}
