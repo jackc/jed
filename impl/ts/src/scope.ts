@@ -1573,6 +1573,9 @@ export function exprCallsSeqMutator(e: Expr): boolean {
 // (mirroring exprCallsSeqMutator).
 export type PrivReq = {
   tables: { name: string; priv: Privilege }[];
+  // relations is every FROM relation reference that is not a CTE, in source-walk order — what a view
+  // reference may resolve to (views.md §4). db is the qualifier (undefined = bare).
+  relations: { db: string | undefined; name: string }[];
   functions: string[];
   isDdl: boolean;
   // isTempDdl is whether the DDL targets a SESSION-LOCAL temporary table (CREATE TEMP TABLE) — gated
@@ -1751,6 +1754,7 @@ export function collectTableRefPrivs(t: TableRef, req: PrivReq, locals: Set<stri
     // A base-table reference (not a CTE / derived-table label) — needs SELECT. A qualified name
     // never resolves to a CTE (attached-databases.md §3), so a CTE cannot shadow it.
     req.tables.push({ name: t.name, priv: "select" });
+    req.relations.push({ db: t.db, name: t.name });
   }
 }
 

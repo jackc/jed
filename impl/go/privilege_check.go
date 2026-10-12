@@ -286,11 +286,20 @@ type privTableReq struct {
 	priv Privilege
 }
 
+// relationRef is a FROM relation reference: its database qualifier (nil = bare) and name.
+type relationRef struct {
+	db   *string
+	name string
+}
+
 // privReq is the privilege requirements collected from one statement (spec/design/session.md §5.3):
 // the per-table privileges, the named functions (each needs EXECUTE), and whether the statement is
 // DDL (gated by allowDDL). Collected by an exhaustive AST walk (mirroring exprCallsSeqMutator).
 type privReq struct {
-	tables    []privTableReq
+	tables []privTableReq
+	// relations is every FROM relation reference that is not a CTE, in source-walk order — what a view
+	// reference may resolve to (views.md §4).
+	relations []relationRef
 	functions []string
 	isDDL     bool
 	// isTempDDL is whether the DDL targets a SESSION-LOCAL temporary table (CREATE TEMP TABLE) — gated
@@ -777,6 +786,7 @@ func collectTableRefPrivs(t *tableRef, req *privReq, locals map[string]bool) {
 		// never resolves to a CTE (attached-databases.md §3), so a CTE cannot shadow it.
 		if t.DB != nil || !locals[t.Name] {
 			req.needTable(t.Name, PrivSelect)
+			req.relations = append(req.relations, relationRef{db: t.DB, name: t.Name})
 		}
 	}
 }

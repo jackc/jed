@@ -232,6 +232,16 @@ WITH vs AS (SELECT 7 AS n) SELECT * FROM main.vs
 statement ok
 ROLLBACK
 
+# a temp. qualifier never names a view: the missing relation is 42P01, not a write refused as 25006
+statement ok
+BEGIN READ ONLY
+
+statement error 42P01
+SELECT * FROM temp.vs
+
+statement ok
+ROLLBACK
+
 query I nosort
 SELECT * FROM vs
 ----

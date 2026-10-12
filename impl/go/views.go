@@ -199,6 +199,31 @@ func (db *engine) traceViewBody(body *queryExpr) (queryPlan, *viewTrace, error) 
 
 // --- Reading a view (views.md §4) ------------------------------------------------------------------
 
+// relationView returns the view a relation reference that is not a CTE names, or nil (§4): a built-in
+// catalog relation, then a table (session-local temp first for a bare name), then a view. Only bare
+// and main. names reach a view; another qualifier never does (§10).
+func (db *engine) relationView(qualifier *string, name string) *viewDef {
+	if qualifier != nil && *qualifier != "main" {
+		return nil
+	}
+	snap := db.readSnap()
+	view := snap.view(name)
+	if view == nil {
+		return nil
+	}
+	if _, ok := catalogRelKind(name); ok {
+		return nil
+	}
+	if qualifier == nil {
+		if _, ok := db.lkpTable(name); ok {
+			return nil
+		}
+	} else if _, ok := snap.table(name); ok {
+		return nil
+	}
+	return view
+}
+
 // viewReference reports whether the FROM item tref names a view and, if so, returns the equivalent
 // derived table `( <definition> ) AS <label> ( <columns> )` and the view's name. A name resolves to
 // a statement-local CTE, then a built-in catalog relation, then a table, then a view (§4); tables
@@ -209,36 +234,16 @@ func (db *engine) viewReference(tref *tableRef, ctes []*cteBinding) (tableRef, s
 	if tref.IsFunc || tref.Subquery != nil || tref.Values != nil || tref.JsonTable != nil {
 		return tableRef{}, "", false
 	}
-	if tref.DB != nil && *tref.DB != "main" {
-		return tableRef{}, "", false
-	}
-	snap := db.readSnap()
-	if len(snap.views) == 0 {
-		return tableRef{}, "", false
-	}
-	view := snap.view(tref.Name)
-	if view == nil {
-		return tableRef{}, "", false
-	}
 	if tref.DB == nil {
 		for _, b := range ctes {
 			if b.name == tref.Name {
 				return tableRef{}, "", false
 			}
 		}
-		if _, ok := catalogRelKind(tref.Name); ok {
-			return tableRef{}, "", false
-		}
-		if _, ok := db.lkpTable(tref.Name); ok {
-			return tableRef{}, "", false
-		}
-	} else {
-		if _, ok := catalogRelKind(tref.Name); ok {
-			return tableRef{}, "", false
-		}
-		if _, ok := snap.table(tref.Name); ok {
-			return tableRef{}, "", false
-		}
+	}
+	view := db.relationView(tref.DB, tref.Name)
+	if view == nil {
+		return tableRef{}, "", false
 	}
 	label := view.Name
 	if tref.Alias != nil {
@@ -662,40 +667,35 @@ func (db *engine) stmtIsWriteWithViews(stmt statement) bool {
 	}
 	var req privReq
 	collectStmtPrivs(stmt, &req)
-	pending := make([]string, 0, len(req.tables))
-	for _, t := range req.tables {
-		pending = append(pending, t.name)
-	}
-	return db.viewsCallSeqMutator(pending)
+	found := false
+	db.walkReadViews(req.relations, func(view *viewDef, _ *privReq) bool {
+		found = queryCallsSeqMutator(view.Body)
+		return found
+	})
+	return found
 }
 
-// viewsCallSeqMutator reports whether any of the views named in pending (of the main database) calls
-// a sequence-mutating function in its body or in the body of any view it reads. The walk visits each
-// view once, so it terminates whatever names a body holds.
-func (db *engine) viewsCallSeqMutator(pending []string) bool {
-	snap := db.readSnap()
+// walkReadViews visits each view the relation references in pending read, then each view their bodies
+// read in turn (§4), resolving every reference as the planner does (relationView). visit receives the
+// view and its body's collected requirements; returning true stops the walk. Each view is visited
+// once, so the walk terminates whatever names a body holds.
+func (db *engine) walkReadViews(pending []relationRef, visit func(*viewDef, *privReq) bool) {
 	seen := map[string]bool{}
 	for len(pending) > 0 {
-		name := pending[len(pending)-1]
+		ref := pending[len(pending)-1]
 		pending = pending[:len(pending)-1]
-		if seen[name] {
+		view := db.relationView(ref.db, ref.name)
+		if view == nil || seen[view.Name] {
 			continue
 		}
-		seen[name] = true
-		view := snap.view(name)
-		if view == nil {
-			continue
-		}
-		if queryCallsSeqMutator(view.Body) {
-			return true
-		}
+		seen[view.Name] = true
 		var body privReq
 		collectQueryPrivs(view.Body, &body, map[string]bool{})
-		for _, t := range body.tables {
-			pending = append(pending, t.name)
+		if visit(view, &body) {
+			return
 		}
+		pending = append(pending, body.relations...)
 	}
-	return false
 }
 
 // collectViewFunctionPrivs adds the functions called in the bodies of the views a statement reads
@@ -703,33 +703,15 @@ func (db *engine) viewsCallSeqMutator(pending []string) bool {
 // for a derived table. The relations inside a body are NOT added — the view is the privilege
 // boundary.
 func (db *engine) collectViewFunctionPrivs(req *privReq) {
-	snap := db.readSnap()
-	if len(snap.views) == 0 {
+	if len(db.readSnap().views) == 0 {
 		return
 	}
-	var pending []string
-	for _, t := range req.tables {
-		pending = append(pending, t.name)
-	}
-	seen := map[string]bool{}
-	for len(pending) > 0 {
-		name := pending[len(pending)-1]
-		pending = pending[:len(pending)-1]
-		if seen[name] {
-			continue
-		}
-		seen[name] = true
-		view := snap.view(name)
-		if view == nil {
-			continue
-		}
-		var body privReq
-		collectQueryPrivs(view.Body, &body, map[string]bool{})
-		req.functions = append(req.functions, body.functions...)
-		for _, t := range body.tables {
-			pending = append(pending, t.name)
-		}
-	}
+	var functions []string
+	db.walkReadViews(append([]relationRef(nil), req.relations...), func(_ *viewDef, body *privReq) bool {
+		functions = append(functions, body.functions...)
+		return false
+	})
+	req.functions = append(req.functions, functions...)
 }
 
 // --- Dependencies on tables (views.md §6) ----------------------------------------------------------

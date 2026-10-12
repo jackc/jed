@@ -3084,6 +3084,7 @@ export class Engine {
     }
     const req: PrivReq = {
       tables: [],
+      relations: [],
       functions: [],
       isDdl: false,
       isTempDdl: false,
@@ -12926,6 +12927,18 @@ export class Engine {
     }
   }
 
+  // relationView returns the view a relation reference that is not a CTE names, if any (§4): a
+  // built-in catalog relation, then a table (session-local temp first for a bare name), then a view.
+  // Only bare and main. names reach a view; another qualifier never does (§10).
+  private relationView(db: string | undefined, name: string): ViewDef | undefined {
+    if (db !== undefined && db !== "main") return undefined;
+    const snap = this.readSnap();
+    const view = snap.view(name);
+    if (view === undefined || catalogRelKind(name) !== undefined) return undefined;
+    const table = db === undefined ? this.lkpTable(name) : snap.table(name);
+    return table === undefined ? view : undefined;
+  }
+
   // viewReference returns, if the FROM item tref names a view, the equivalent derived table
   // `( <definition> ) AS <label> ( <columns> )` and the view's name. A name resolves to a
   // statement-local CTE, then a built-in catalog relation, then a table, then a view (§4); tables and
@@ -12944,22 +12957,8 @@ export class Engine {
     ) {
       return null;
     }
-    if (tref.db === undefined) {
-      if (
-        ctes.some((b) => b.name === tref.name) ||
-        catalogRelKind(tref.name) !== undefined ||
-        this.lkpTable(tref.name) !== undefined
-      ) {
-        return null;
-      }
-    } else if (tref.db === "main") {
-      if (catalogRelKind(tref.name) !== undefined || this.readSnap().table(tref.name) !== undefined) {
-        return null;
-      }
-    } else {
-      return null;
-    }
-    const view = this.readSnap().view(tref.name);
+    if (tref.db === undefined && ctes.some((b) => b.name === tref.name)) return null;
+    const view = this.relationView(tref.db, tref.name);
     if (view === undefined) return null;
     const label = tref.alias ?? view.name;
     let columnAliases: string[];
@@ -13211,29 +13210,47 @@ export class Engine {
       inner = inner.inner;
     }
     if (inner.kind !== "select" && inner.kind !== "setOp" && inner.kind !== "with") return false;
-    const req: PrivReq = { tables: [], functions: [], isDdl: false, isTempDdl: false };
+    const req: PrivReq = {
+      tables: [],
+      relations: [],
+      functions: [],
+      isDdl: false,
+      isTempDdl: false,
+    };
     collectStmtPrivs(inner, req);
-    return this.viewsCallSeqMutator(req.tables.map((t) => t.name));
+    let found = false;
+    this.walkReadViews(req.relations, (view) => {
+      found = queryCallsSeqMutator(view.body);
+      return found;
+    });
+    return found;
   }
 
-  // viewsCallSeqMutator reports whether any of the views named in `pending` (of the main database)
-  // calls a sequence-mutating function in its body or in the body of any view it reads. The walk
-  // visits each view once, so it terminates whatever names a body holds.
-  private viewsCallSeqMutator(pending: string[]): boolean {
-    const snap = this.readSnap();
+  // walkReadViews visits each view the relation references in `pending` read, then each view their
+  // bodies read in turn (§4), resolving every reference as the planner does (relationView). `visit`
+  // receives the view and its body's collected requirements; returning true stops the walk. Each view
+  // is visited once, so the walk terminates whatever names a body holds.
+  private walkReadViews(
+    pending: { db: string | undefined; name: string }[],
+    visit: (view: ViewDef, body: PrivReq) => boolean,
+  ): void {
     const seen = new Set<string>();
     while (pending.length > 0) {
-      const name = pending.pop()!;
-      if (seen.has(name)) continue;
-      seen.add(name);
-      const view = snap.view(name);
-      if (view === undefined) continue;
-      if (queryCallsSeqMutator(view.body)) return true;
-      const body: PrivReq = { tables: [], functions: [], isDdl: false, isTempDdl: false };
+      const ref = pending.pop()!;
+      const view = this.relationView(ref.db, ref.name);
+      if (view === undefined || seen.has(view.name)) continue;
+      seen.add(view.name);
+      const body: PrivReq = {
+        tables: [],
+        relations: [],
+        functions: [],
+        isDdl: false,
+        isTempDdl: false,
+      };
       collectQueryPrivs(view.body, body, new Set());
-      pending.push(...body.tables.map((t) => t.name));
+      if (visit(view, body)) return;
+      pending.push(...body.relations);
     }
-    return false;
   }
 
   // collectViewFunctionPrivs adds the functions called in the bodies of the views a statement reads
@@ -13241,21 +13258,13 @@ export class Engine {
   // for a derived table. The relations inside a body are NOT added — the view is the privilege
   // boundary.
   private collectViewFunctionPrivs(req: PrivReq): void {
-    const snap = this.readSnap();
-    if (snap.views.size === 0) return;
-    const pending = req.tables.map((t) => t.name);
-    const seen = new Set<string>();
-    while (pending.length > 0) {
-      const name = pending.pop()!;
-      if (seen.has(name)) continue;
-      seen.add(name);
-      const view = snap.view(name);
-      if (view === undefined) continue;
-      const body: PrivReq = { tables: [], functions: [], isDdl: false, isTempDdl: false };
-      collectQueryPrivs(view.body, body, new Set());
-      req.functions.push(...body.functions);
-      pending.push(...body.tables.map((t) => t.name));
-    }
+    if (this.readSnap().views.size === 0) return;
+    const functions: string[] = [];
+    this.walkReadViews([...req.relations], (_view, body) => {
+      functions.push(...body.functions);
+      return false;
+    });
+    req.functions.push(...functions);
   }
 
   // checkDropTableViews is the DROP TABLE view-dependency check (§6): a view depending on a table

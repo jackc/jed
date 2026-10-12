@@ -1,0 +1,60 @@
+# skip: disk — in-memory host attachments do not survive the disk-mode per-record reopen
+# (spec/design/conformance.md §3, attached-databases.md §5).
+# Views beside an attached database (spec/design/views.md §4, §10). A reference resolves exactly as
+# the planner resolves it, so a table in an attachment named like a main view is that table: reading
+# it is not classified as a write because the view calls nextval, and it needs no EXECUTE on the
+# view body's functions. jed-specific (PostgreSQL has no attached databases), so CROSS-CORE-checked,
+# NOT PostgreSQL-oracle-checked.
+# attach: mydb
+# requires: attach.in_memory, harness.attach, query.qualified_table, ddl.view, ddl.create_table, ddl.sequence, dml.insert, query.select, query.select_star, types.i64, session.privileges, txn.explicit, txn.read_only
+
+statement ok
+CREATE SEQUENCE s
+
+statement ok
+CREATE VIEW vs AS SELECT nextval('s') AS n
+
+statement ok
+CREATE TABLE mydb.vs (n i64)
+
+statement ok
+INSERT INTO mydb.vs VALUES (42)
+
+# the attachment's table is a plain read, even inside a READ ONLY transaction
+statement ok
+BEGIN READ ONLY
+
+query I nosort
+SELECT n FROM mydb.vs
+----
+42
+
+statement ok
+ROLLBACK
+
+# reading it needs no EXECUTE on what the main view's body calls
+# revoke: EXECUTE ON nextval
+query I nosort
+SELECT n FROM mydb.vs
+----
+42
+
+# the main view itself is still a write and still needs the body's EXECUTE
+statement ok
+BEGIN READ ONLY
+
+statement error 25006
+SELECT n FROM vs
+
+statement ok
+ROLLBACK
+
+# revoke: EXECUTE ON nextval
+statement error 42501
+SELECT n FROM main.vs
+
+statement ok
+DROP VIEW vs
+
+statement ok
+DROP SEQUENCE s

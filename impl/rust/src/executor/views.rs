@@ -221,25 +221,10 @@ impl Engine {
         {
             return None;
         }
-        match tref.db.as_deref() {
-            None => {
-                if ctes.iter().any(|b| b.name == tref.name)
-                    || catalog_rel_kind(&tref.name).is_some()
-                    || self.table(&tref.name).is_some()
-                {
-                    return None;
-                }
-            }
-            Some("main") => {
-                if catalog_rel_kind(&tref.name).is_some()
-                    || self.read_snap().table(&tref.name).is_some()
-                {
-                    return None;
-                }
-            }
-            Some(_) => return None,
+        if tref.db.is_none() && ctes.iter().any(|b| b.name == tref.name) {
+            return None;
         }
-        let view = self.read_snap().view(&tref.name)?;
+        let view = self.relation_view(tref.db.as_deref(), &tref.name)?;
         let label = tref.alias.clone().unwrap_or_else(|| view.name.clone());
         let column_aliases = match &tref.column_aliases {
             Some(list) if list.len() > view.columns.len() => list.clone(),
@@ -266,6 +251,22 @@ impl Engine {
             pos: TableRefPos::default(),
         };
         Some((derived, view.name.clone()))
+    }
+
+    /// The view a relation reference that is not a CTE names, if any (§4): a built-in catalog
+    /// relation, then a table (session-local temp first for a bare name), then a view. Only bare and
+    /// `main.` names reach a view; another qualifier never does (§10).
+    fn relation_view(&self, db: Option<&str>, name: &str) -> Option<&ViewDef> {
+        let view = self.read_snap().view(name)?;
+        let shadowed = match db {
+            None => self.table(name).is_some(),
+            Some("main") => self.read_snap().table(name).is_some(),
+            Some(_) => return None,
+        };
+        if shadowed || catalog_rel_kind(name).is_some() {
+            return None;
+        }
+        Some(view)
     }
 
     /// Plan a view reference's body (views.md §4.1): a fresh top-level scope with no correlation,
@@ -725,30 +726,38 @@ impl Engine {
         }
         let mut req = PrivReq::default();
         collect_stmt_privs(stmt, &mut req);
-        self.views_call_seq_mutator(req.tables.into_iter().map(|(n, _)| n).collect())
+        let mut found = false;
+        self.walk_read_views(req.relations, |view, _| {
+            found = query_calls_seq_mutator(&view.body);
+            found
+        });
+        found
     }
 
-    /// Whether any of the views named in `pending` (of the main database) calls a sequence-mutating
-    /// function in its body or in the body of any view it reads. The walk visits each view once, so
-    /// it terminates whatever names a body holds.
-    fn views_call_seq_mutator(&self, mut pending: Vec<String>) -> bool {
-        let snap = self.read_snap();
+    /// Visit each view the relation references `pending` read, then each view their bodies read in
+    /// turn (§4), resolving every reference as the planner does ([`Self::relation_view`]). `visit`
+    /// receives the view and its body's collected requirements; returning true stops the walk. Each
+    /// view is visited once, so the walk terminates whatever names a body holds.
+    fn walk_read_views(
+        &self,
+        mut pending: Vec<(Option<String>, String)>,
+        mut visit: impl FnMut(&ViewDef, &PrivReq) -> bool,
+    ) {
         let mut seen: HashSet<String> = HashSet::new();
-        while let Some(name) = pending.pop() {
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            let Some(view) = snap.view(&name) else {
+        while let Some((db, name)) = pending.pop() {
+            let Some(view) = self.relation_view(db.as_deref(), &name) else {
                 continue;
             };
-            if query_calls_seq_mutator(&view.body) {
-                return true;
+            if !seen.insert(view.name.clone()) {
+                continue;
             }
             let mut body = PrivReq::default();
             collect_query_privs(&view.body, &mut body, &HashSet::new());
-            pending.extend(body.tables.into_iter().map(|(n, _)| n));
+            if visit(view, &body) {
+                return;
+            }
+            pending.extend(body.relations);
         }
-        false
     }
 
     /// Add the functions called in the bodies of the views a statement reads (transitively) to its
@@ -758,20 +767,12 @@ impl Engine {
         if self.read_snap().views.is_empty() {
             return;
         }
-        let mut pending: Vec<String> = req.tables.iter().map(|(n, _)| n.clone()).collect();
-        let mut seen: HashSet<String> = HashSet::new();
-        while let Some(name) = pending.pop() {
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            let Some(view) = self.read_snap().view(&name) else {
-                continue;
-            };
-            let mut body = PrivReq::default();
-            collect_query_privs(&view.body, &mut body, &HashSet::new());
-            req.functions.extend(body.functions);
-            pending.extend(body.tables.into_iter().map(|(n, _)| n));
-        }
+        let mut functions = Vec::new();
+        self.walk_read_views(req.relations.clone(), |_, body| {
+            functions.extend(body.functions.iter().cloned());
+            false
+        });
+        req.functions.extend(functions);
     }
 
     // ---------------------------------------------------------------------------------------------

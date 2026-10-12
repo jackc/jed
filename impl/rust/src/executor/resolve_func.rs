@@ -2622,6 +2622,9 @@ pub(crate) struct PrivReq {
     /// `(table name, required privilege)` in source-walk order; deduplication is unnecessary (the
     /// check is idempotent and a fully-permissive session never reaches the walk).
     pub(crate) tables: Vec<(String, Privilege)>,
+    /// `(database qualifier, name)` of every FROM relation reference that is not a CTE, in
+    /// source-walk order — what a view reference may resolve to (views.md §4).
+    pub(crate) relations: Vec<(Option<String>, String)>,
     /// Named functions called (each requires `EXECUTE`), in source-walk order.
     pub(crate) functions: Vec<String>,
     /// Whether the statement is DDL (CREATE / DROP / ALTER) — gated by `allow_ddl`.
@@ -2839,6 +2842,7 @@ pub(crate) fn collect_table_ref_privs(t: &TableRef, req: &mut PrivReq, locals: &
         // A base-table reference (not a CTE / derived-table label) — needs SELECT. A qualified
         // name never resolves to a CTE (attached-databases.md §3), so a CTE cannot shadow it.
         req.need_table(&t.name, Privilege::Select);
+        req.relations.push((t.db.clone(), t.name.clone()));
     }
 }
 
