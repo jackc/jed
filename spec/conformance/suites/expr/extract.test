@@ -7,7 +7,7 @@
 # tests, not here: the oracle corpus is PG-clean.)
 #
 # Format + the `requires` gate: ../../../design/conformance.md.
-# requires: query.select, query.select_no_from, types.timestamp, types.timestamptz, types.date, types.interval, expr.extract, session.timezone
+# requires: query.select, query.select_no_from, query.derived_table, types.timestamp, types.timestamptz, types.date, types.interval, expr.extract, session.timezone
 
 # ============================================================================================
 # timestamp: every supported field of 2024-03-15 13:47:23.456789
@@ -229,6 +229,183 @@ SELECT EXTRACT(hour FROM interval '25:00:00'), EXTRACT(day FROM interval '25:00:
 
 statement error 0A000
 SELECT EXTRACT(dow FROM interval '3 days')
+
+# --- every interval field at once (PostgreSQL's interval_part_common), in the order
+# microseconds milliseconds second minute hour day week month quarter year decade century
+# millennium epoch. The months/days/micros components decompose independently: year = months/12
+# and month = months%12 (truncating, so both carry the months' sign), week = days/7, and
+# hour/minute/second come from the micros; decade/century/millennium truncate the year toward
+# zero. A field of a negative interval is the negation of the sign-reversed interval's field.
+query DDDDDDDDDDDDDD nosort
+SELECT EXTRACT(microseconds FROM i), EXTRACT(milliseconds FROM i), EXTRACT(second FROM i), EXTRACT(minute FROM i), EXTRACT(hour FROM i), EXTRACT(day FROM i), EXTRACT(week FROM i), EXTRACT(month FROM i), EXTRACT(quarter FROM i), EXTRACT(year FROM i), EXTRACT(decade FROM i), EXTRACT(century FROM i), EXTRACT(millennium FROM i), EXTRACT(epoch FROM i) FROM (SELECT interval '-3 years -5 mons -17 days -13:47:23.456789' AS i) AS s
+----
+-23456789
+-23456.789
+-23.456789
+-47
+-13
+-17
+-2
+-5
+-2
+-3
+0
+0
+0
+-109151243.456789
+
+query DDDDDDDDDDDDDD nosort
+SELECT EXTRACT(microseconds FROM i), EXTRACT(milliseconds FROM i), EXTRACT(second FROM i), EXTRACT(minute FROM i), EXTRACT(hour FROM i), EXTRACT(day FROM i), EXTRACT(week FROM i), EXTRACT(month FROM i), EXTRACT(quarter FROM i), EXTRACT(year FROM i), EXTRACT(decade FROM i), EXTRACT(century FROM i), EXTRACT(millennium FROM i), EXTRACT(epoch FROM i) FROM (SELECT interval '1234 years 11 mons 45 days 99:59:59.999999' AS i) AS s
+----
+59999999
+59999.999
+59.999999
+59
+99
+45
+6
+11
+4
+1234
+123
+12
+1
+38974838399.999999
+
+# mixed signs: each component keeps its own sign (the time is not borrowed into days)
+query DDDDDDDDDDDDDD nosort
+SELECT EXTRACT(microseconds FROM i), EXTRACT(milliseconds FROM i), EXTRACT(second FROM i), EXTRACT(minute FROM i), EXTRACT(hour FROM i), EXTRACT(day FROM i), EXTRACT(week FROM i), EXTRACT(month FROM i), EXTRACT(quarter FROM i), EXTRACT(year FROM i), EXTRACT(decade FROM i), EXTRACT(century FROM i), EXTRACT(millennium FROM i), EXTRACT(epoch FROM i) FROM (SELECT interval '-1 year 2 mons -3 days 4 hours' AS i) AS s
+----
+0
+0.000
+0.000000
+0
+4
+-3
+0
+-10
+-4
+0
+0
+0
+0
+-26164800.000000
+
+# the extreme finite intervals: epoch's exact seconds exceed i64 microseconds, so the result is
+# carried exactly (PostgreSQL's numeric fallback), never rounded; the zero interval's quarter is 1
+query DDDDDDDDDDDDDD nosort
+SELECT EXTRACT(microseconds FROM i), EXTRACT(milliseconds FROM i), EXTRACT(second FROM i), EXTRACT(minute FROM i), EXTRACT(hour FROM i), EXTRACT(day FROM i), EXTRACT(week FROM i), EXTRACT(month FROM i), EXTRACT(quarter FROM i), EXTRACT(year FROM i), EXTRACT(decade FROM i), EXTRACT(century FROM i), EXTRACT(millennium FROM i), EXTRACT(epoch FROM i) FROM (SELECT interval '178956970 years 7 mons 2147483647 days 2562047788:00:54.775806' AS i) AS s
+----
+54775806
+54775.806
+54.775806
+0
+2562047788
+2147483647
+306783378
+7
+3
+178956970
+17895697
+1789569
+178956
+5842218453753654.775806
+
+query DDDDDDDDDDDDDD nosort
+SELECT EXTRACT(microseconds FROM i), EXTRACT(milliseconds FROM i), EXTRACT(second FROM i), EXTRACT(minute FROM i), EXTRACT(hour FROM i), EXTRACT(day FROM i), EXTRACT(week FROM i), EXTRACT(month FROM i), EXTRACT(quarter FROM i), EXTRACT(year FROM i), EXTRACT(decade FROM i), EXTRACT(century FROM i), EXTRACT(millennium FROM i), EXTRACT(epoch FROM i) FROM (SELECT interval '-178956970 years -7 mons -2147483647 days -2562047788:00:54.775807' AS i) AS s
+----
+-54775807
+-54775.807
+-54.775807
+0
+-2562047788
+-2147483647
+-306783378
+-7
+-3
+-178956970
+-17895697
+-1789569
+-178956
+-5842218453753654.775807
+
+query DDDDDDDDDDDDDD nosort
+SELECT EXTRACT(microseconds FROM i), EXTRACT(milliseconds FROM i), EXTRACT(second FROM i), EXTRACT(minute FROM i), EXTRACT(hour FROM i), EXTRACT(day FROM i), EXTRACT(week FROM i), EXTRACT(month FROM i), EXTRACT(quarter FROM i), EXTRACT(year FROM i), EXTRACT(decade FROM i), EXTRACT(century FROM i), EXTRACT(millennium FROM i), EXTRACT(epoch FROM i) FROM (SELECT interval '0 days' AS i) AS s
+----
+0
+0.000
+0.000000
+0
+0
+0
+0
+0
+1
+0
+0
+0
+0
+0.000000
+
+# quarter works from the signed months field, not the truncated month-of-year: a nonnegative
+# months count gives (months % 12)/3 + 1 (1..4, so 12 months is quarter 1); a negative one gives
+# -((-months % 12)/3 + 1) (-1..-4, so -12 months is quarter -1, not 1). In order:
+# -13 -12 -11 -3 -2 -1 1 2 3 11 12 13 months
+query DDDDDDDDDDDD nosort
+SELECT EXTRACT(quarter FROM interval '-13 mons'), EXTRACT(quarter FROM interval '-12 mons'), EXTRACT(quarter FROM interval '-11 mons'), EXTRACT(quarter FROM interval '-3 mons'), EXTRACT(quarter FROM interval '-2 mons'), EXTRACT(quarter FROM interval '-1 mons'), EXTRACT(quarter FROM interval '1 mons'), EXTRACT(quarter FROM interval '2 mons'), EXTRACT(quarter FROM interval '3 mons'), EXTRACT(quarter FROM interval '11 mons'), EXTRACT(quarter FROM interval '12 mons'), EXTRACT(quarter FROM interval '13 mons')
+----
+-1
+-1
+-4
+-2
+-1
+-1
+1
+1
+2
+4
+1
+1
+
+# week = days/7, truncating toward zero. In order: -14 -13 -7 -6 6 7 13 14 days
+query DDDDDDDD nosort
+SELECT EXTRACT(week FROM interval '-14 days'), EXTRACT(week FROM interval '-13 days'), EXTRACT(week FROM interval '-7 days'), EXTRACT(week FROM interval '-6 days'), EXTRACT(week FROM interval '6 days'), EXTRACT(week FROM interval '7 days'), EXTRACT(week FROM interval '13 days'), EXTRACT(week FROM interval '14 days')
+----
+-2
+-1
+-1
+0
+0
+1
+1
+2
+
+# the date-of fields are 0A000 for an interval ("unit X not supported for type interval") —
+# julian too, which PostgreSQL also rejects for an interval
+statement error 0A000
+SELECT EXTRACT(isodow FROM interval '3 days')
+
+statement error 0A000
+SELECT EXTRACT(doy FROM interval '3 days')
+
+statement error 0A000
+SELECT EXTRACT(isoyear FROM interval '3 days')
+
+statement error 0A000
+SELECT EXTRACT(julian FROM interval '3 days')
+
+statement error 0A000
+SELECT EXTRACT(timezone FROM interval '3 days')
+
+statement error 0A000
+SELECT EXTRACT(timezone_hour FROM interval '3 days')
+
+statement error 0A000
+SELECT EXTRACT(timezone_minute FROM interval '3 days')
+
+# an unrecognized field is 22023 ("unit X not recognized for type interval")
+statement error 22023
+SELECT EXTRACT(bogus FROM interval '3 days')
 
 # ============================================================================================
 # timestamptz under a non-UTC session zone: the wall-clock fields shift; epoch is zone-independent

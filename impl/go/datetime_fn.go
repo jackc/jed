@@ -109,15 +109,15 @@ func extractMillennium(pgYear int64) int64 {
 	return -((999 - pgYear) / 1000)
 }
 
-func intervalQuarter(mo int64) int64 {
-	if mo == 0 {
-		return 1
+// intervalQuarter is EXTRACT(quarter FROM interval) from the signed months field — PG's
+// interval_part_common, which works from the months count rather than the truncated month-of-year so
+// that a negative interval's quarter is the negation of the sign-reversed interval's: (months%12)/3+1
+// for months >= 0, else -((-months%12)/3+1) (so -12 mons is -1, not 1; oracle-pinned).
+func intervalQuarter(months int64) int64 {
+	if months >= 0 {
+		return (months%12)/3 + 1
 	}
-	sign := int64(1)
-	if mo < 0 {
-		sign = -1
-	}
-	return sign * (absI64(mo)/3 + 1)
+	return -(((-months)%12)/3 + 1)
 }
 
 // DateTruncMicros truncates a wall-clock instant `micros` down to the start of `unit`. ±infinity
@@ -324,7 +324,11 @@ func extractDatetime(field string, micros int64, isTz bool, instant, offsetSecs 
 	case "julian":
 		return Decimal{}, newError(FeatureNotSupported, "unit \"julian\" not supported yet (jed deferred)")
 	default:
-		return Decimal{}, newError(InvalidParameterValue, "unit \""+field+"\" not recognized")
+		typ := "timestamp without time zone"
+		if isTz {
+			typ = "timestamp with time zone"
+		}
+		return Decimal{}, newError(InvalidParameterValue, "unit \""+field+"\" not recognized for type "+typ)
 	}
 }
 
@@ -363,7 +367,7 @@ func extractDate(field string, days int64) (Decimal, error) {
 		"timezone", "timezone_hour", "timezone_minute", "julian":
 		return Decimal{}, newError(FeatureNotSupported, "unit \""+field+"\" not supported for type date")
 	default:
-		return Decimal{}, newError(InvalidParameterValue, "unit \""+field+"\" not recognized")
+		return Decimal{}, newError(InvalidParameterValue, "unit \""+field+"\" not recognized for type date")
 	}
 }
 
@@ -392,7 +396,7 @@ func extractInterval(field string, iv Interval) (Decimal, error) {
 	case "month":
 		return decimalFromInt64(mo), nil
 	case "quarter":
-		return decimalFromInt64(intervalQuarter(mo)), nil
+		return decimalFromInt64(intervalQuarter(months)), nil
 	case "year":
 		return decimalFromInt64(years), nil
 	case "decade":
@@ -408,6 +412,6 @@ func extractInterval(field string, iv Interval) (Decimal, error) {
 		"timezone", "timezone_hour", "timezone_minute":
 		return Decimal{}, newError(FeatureNotSupported, "unit \""+field+"\" not supported for type interval")
 	default:
-		return Decimal{}, newError(InvalidParameterValue, "unit \""+field+"\" not recognized")
+		return Decimal{}, newError(InvalidParameterValue, "unit \""+field+"\" not recognized for type interval")
 	}
 }

@@ -89,11 +89,13 @@ function extractCentury(pgYear: bigint): bigint {
 function extractMillennium(pgYear: bigint): bigint {
   return pgYear >= 0n ? (pgYear + 999n) / 1000n : -((999n - pgYear) / 1000n);
 }
-function intervalQuarter(mo: bigint): bigint {
-  if (mo === 0n) return 1n;
-  const sign = mo < 0n ? -1n : 1n;
-  const abs = mo < 0n ? -mo : mo;
-  return sign * (abs / 3n + 1n);
+// EXTRACT(quarter FROM interval) from the signed months field — PG's interval_part_common, which
+// works from the months count rather than the truncated month-of-year so that a negative interval's
+// quarter is the negation of the sign-reversed interval's: (months%12)/3+1 for months >= 0, else
+// -((-months%12)/3+1) (so -12 mons is -1, not 1; oracle-pinned).
+function intervalQuarter(months: bigint): bigint {
+  if (months >= 0n) return (months % 12n) / 3n + 1n;
+  return -((-months % 12n) / 3n + 1n);
 }
 
 const unrecognizedUnit = (u: string) =>
@@ -300,7 +302,10 @@ function extractDatetime(
     case "julian":
       throw engineError("feature_not_supported", 'unit "julian" not supported yet (jed deferred)');
     default:
-      throw engineError("invalid_parameter_value", `unit "${field}" not recognized`);
+      throw engineError(
+        "invalid_parameter_value",
+        `unit "${field}" not recognized for type ${isTz ? "timestamp with time zone" : "timestamp without time zone"}`,
+      );
   }
 }
 
@@ -344,7 +349,7 @@ function extractDate(field: string, days: bigint): Decimal {
     case "julian":
       throw engineError("feature_not_supported", `unit "${field}" not supported for type date`);
     default:
-      throw engineError("invalid_parameter_value", `unit "${field}" not recognized`);
+      throw engineError("invalid_parameter_value", `unit "${field}" not recognized for type date`);
   }
 }
 
@@ -373,7 +378,7 @@ function extractInterval(field: string, iv: Interval): Decimal {
     case "month":
       return Decimal.fromBigInt(mo);
     case "quarter":
-      return Decimal.fromBigInt(intervalQuarter(mo));
+      return Decimal.fromBigInt(intervalQuarter(months));
     case "year":
       return Decimal.fromBigInt(years);
     case "decade":
@@ -397,6 +402,9 @@ function extractInterval(field: string, iv: Interval): Decimal {
     case "timezone_minute":
       throw engineError("feature_not_supported", `unit "${field}" not supported for type interval`);
     default:
-      throw engineError("invalid_parameter_value", `unit "${field}" not recognized`);
+      throw engineError(
+        "invalid_parameter_value",
+        `unit "${field}" not recognized for type interval`,
+      );
   }
 }

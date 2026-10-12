@@ -12,7 +12,7 @@
 # `julian` (0A000, the deferred EXTRACT field — PG computes it) is a documented divergence kept
 # OUT of this oracle file (per-core date_part tests).
 # Format + the `requires` gate: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, types.i32, types.f64, types.date, types.timestamp, types.timestamptz, types.interval, types.text, func.date_part, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.derived_table, query.where_eq, query.order_by, types.i32, types.f64, types.date, types.timestamp, types.timestamptz, types.interval, types.text, func.date_part, resource.cost_metering
 
 # --- over a timestamp ----------------------------------------------------------
 # cost: 2
@@ -76,6 +76,52 @@ SELECT date_part('month', INTERVAL '1 year 7 months')
 ----
 7
 
+# every interval field, the same values as EXTRACT's in the same order (microseconds
+# milliseconds second minute hour day week month quarter year decade century millennium epoch)
+query RRRRRRRRRRRRRR nosort
+SELECT date_part('microseconds', i), date_part('milliseconds', i), date_part('second', i), date_part('minute', i), date_part('hour', i), date_part('day', i), date_part('week', i), date_part('month', i), date_part('quarter', i), date_part('year', i), date_part('decade', i), date_part('century', i), date_part('millennium', i), date_part('epoch', i) FROM (SELECT INTERVAL '-3 years -5 mons -17 days -13:47:23.456789' AS i) AS s
+----
+-23456789
+-23456.789
+-23.456789
+-47
+-13
+-17
+-2
+-5
+-2
+-3
+0
+0
+0
+-109151243.456789
+
+query RRRRRRRRRRRRRR nosort
+SELECT date_part('microseconds', i), date_part('milliseconds', i), date_part('second', i), date_part('minute', i), date_part('hour', i), date_part('day', i), date_part('week', i), date_part('month', i), date_part('quarter', i), date_part('year', i), date_part('decade', i), date_part('century', i), date_part('millennium', i), date_part('epoch', i) FROM (SELECT INTERVAL '178956970 years 7 mons 2147483647 days 2562047788:00:54.775806' AS i) AS s
+----
+54775806
+54775.806
+54.775806
+0
+2562047788
+2147483647
+306783378
+7
+3
+178956970
+17895697
+1789569
+178956
+5.842218453753655e+15
+
+# a whole negative year: month 0 but quarter -1 (quarter follows the signed months field)
+query RRR nosort
+SELECT date_part('month', INTERVAL '-1 year'), date_part('quarter', INTERVAL '-1 year'), date_part('year', INTERVAL '-1 year')
+----
+0
+-1
+-1
+
 # --- the field is a RUNTIME text value: a column works, validated per row --------
 statement ok
 CREATE TABLE t (id integer PRIMARY KEY, f text)
@@ -117,6 +163,10 @@ SELECT date_part('timezone', TIMESTAMP '2024-01-15 12:00:00')
 # dow is a datetime field, not an interval's
 statement error 0A000
 SELECT date_part('dow', INTERVAL '1 day')
+
+# an unrecognized unit over an interval is 22023 too
+statement error 22023
+SELECT date_part('nosuch', INTERVAL '1 day')
 
 # julian stays EXTRACT's deferred field (0A000 — PG computes it; the documented divergence the
 # oracle_overrides ledger records)

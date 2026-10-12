@@ -402,12 +402,19 @@ interval)` → `0A000`, etc.):
 | `julian` | **`0A000` (deferred)** | **`0A000` (deferred)** | `0A000` |
 
 An unsupported field-for-type is **`0A000`** (`feature_not_supported`, PG's "unit X not supported for
-type Y"); an **unrecognized** field name is **`22023`** ("unit X not recognized"). `julian` is a
-**deferred** field on all types (PG supports it on date/timestamp; for timestamp it is a non-terminating
+type Y"); an **unrecognized** field name is **`22023`** (PG's "unit X not recognized for type Y").
+`julian` is a **deferred** field on all types (PG supports it on date/timestamp; for timestamp it is a non-terminating
 decimal whose exact scale is PG-internal — a documented divergence, revisit if needed). Field formulas:
-`second`/`milliseconds`/`microseconds` carry the fractional seconds (exact decimal); `epoch` of an
+`second`/`milliseconds`/`microseconds` carry the fractional seconds (exact decimal); an `interval`'s
+fields follow PG's `interval_part_common` — its months/days/micros decompose independently, each keeping
+its own sign (`year = months/12`, `month = months%12`, truncating; `week = days/7`; `hour` = whole hours of
+the time, unbounded, then `minute`/`second` of the remainder; `decade`/`century`/`millennium` truncate
+`year` toward zero), and `quarter` works from the *signed months count*, not the month-of-year:
+`(months%12)/3 + 1` for `months ≥ 0`, else `−((−months%12)/3 + 1)` — so `−12 mons` is quarter `−1` (the
+negation of `12 mons`'s `1`); `epoch` of an
 `interval` is `(months/12)·31557600 + (months%12)·2592000 + days·86400 + time` (PG's `365.25`-day year,
-`30`-day month — exact, since `365.25·86400 = 31557600` is integral); `century = (year−1)/100 + 1`,
+`30`-day month — exact, since `365.25·86400 = 31557600` is integral, and carried exactly even past i64
+microseconds — PG's numeric fallback); `century = (year−1)/100 + 1`,
 `decade = ⌊year/10⌋`, ISO `week`/`isoyear`/`isodow` per ISO-8601.
 
 ### 9.3 Cross-family datetime casts

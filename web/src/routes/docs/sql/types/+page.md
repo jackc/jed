@@ -396,6 +396,10 @@ explicit zone:
 
 <LiveSql demo="convDemo" query={convDemo} rows={1} />
 
+Over an `interval`, `EXTRACT` reads its separate fields, each keeping its sign: `year`/`month`/`quarter`
+from the months, `day`/`week` from the days, `hour`/`minute`/`second` from the time, and `epoch` counts
+a year as 365.25 days and a month as 30.
+
 `date_part(field, source)` is the `double precision` twin of `EXTRACT` — same fields, but the field
 name is a runtime string, and over a `date` the timestamp fields exist (`date_part('hour', d)` is
 `0`), exactly as in PostgreSQL. (A runtime `text` value casts to every datetime type, and every

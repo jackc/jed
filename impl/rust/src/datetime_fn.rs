@@ -296,7 +296,16 @@ fn extract_datetime(field: &str, micros: i64, tz: Option<(i64, i64)>) -> Result<
                 "unit \"julian\" not supported yet (jed deferred)".to_string(),
             ));
         }
-        _ => return Err(invalid_param(format!("unit \"{field}\" not recognized"))),
+        _ => {
+            return Err(invalid_param(format!(
+                "unit \"{field}\" not recognized for type {}",
+                if tz.is_some() {
+                    "timestamp with time zone"
+                } else {
+                    "timestamp without time zone"
+                }
+            )));
+        }
     };
     Ok(v)
 }
@@ -330,7 +339,11 @@ fn extract_date(field: &str, days: i32) -> Result<Decimal> {
                 "unit \"{field}\" not supported for type date"
             )));
         }
-        _ => return Err(invalid_param(format!("unit \"{field}\" not recognized"))),
+        _ => {
+            return Err(invalid_param(format!(
+                "unit \"{field}\" not recognized for type date"
+            )));
+        }
     };
     Ok(v)
 }
@@ -355,7 +368,7 @@ fn extract_interval(field: &str, iv: Interval) -> Result<Decimal> {
         "day" => Decimal::from_i64(days),
         "week" => Decimal::from_i64(days / 7),
         "month" => Decimal::from_i64(mo),
-        "quarter" => Decimal::from_i64(interval_quarter(mo)),
+        "quarter" => Decimal::from_i64(interval_quarter(months)),
         "year" => Decimal::from_i64(years),
         "decade" => Decimal::from_i64(years / 10),
         "century" => Decimal::from_i64(years / 100),
@@ -373,7 +386,11 @@ fn extract_interval(field: &str, iv: Interval) -> Result<Decimal> {
                 "unit \"{field}\" not supported for type interval"
             )));
         }
-        _ => return Err(invalid_param(format!("unit \"{field}\" not recognized"))),
+        _ => {
+            return Err(invalid_param(format!(
+                "unit \"{field}\" not recognized for type interval"
+            )));
+        }
     };
     Ok(v)
 }
@@ -406,13 +423,15 @@ fn extract_millennium(pg_year: i64) -> i64 {
     }
 }
 
-/// `EXTRACT(quarter FROM interval)` from the month-of-year `mo` (signed, ±11). PG's discontinuous
-/// formula: `1` at `mo == 0`, else `sign(mo) * (|mo|/3 + 1)` (oracle-pinned).
-fn interval_quarter(mo: i64) -> i64 {
-    if mo == 0 {
-        1
+/// `EXTRACT(quarter FROM interval)` from the signed `months` field — PG's `interval_part_common`, which
+/// works from the months count rather than the truncated month-of-year so that a negative interval's
+/// quarter is the negation of the sign-reversed interval's: `(months % 12)/3 + 1` for `months >= 0`,
+/// else `-((-months % 12)/3 + 1)` (so `-12 mons` is `-1`, not `1`; oracle-pinned).
+fn interval_quarter(months: i64) -> i64 {
+    if months >= 0 {
+        (months % 12) / 3 + 1
     } else {
-        mo.signum() * (mo.abs() / 3 + 1)
+        -(((-months) % 12) / 3 + 1)
     }
 }
 
