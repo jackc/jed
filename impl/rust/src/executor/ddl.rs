@@ -165,6 +165,21 @@ fn host_dep_matches(hf: &crate::extension::HostFunction, deps: &[HostFuncDep]) -
     })
 }
 
+/// The error for a FOREIGN KEY parent that is not a table of the parent's database: a view is the
+/// wrong object kind (42809, views.md §2); any other name is missing (42P01).
+fn fk_parent_missing(snap: &Snapshot, name: &str) -> EngineError {
+    if snap.view(name).is_some() {
+        return EngineError::new(
+            SqlState::WrongObjectType,
+            format!("referenced relation \"{name}\" is not a table"),
+        );
+    }
+    EngineError::new(
+        SqlState::UndefinedTable,
+        format!("table does not exist: {name}"),
+    )
+}
+
 fn constraint_name_taken(t: &Table, name: &str) -> bool {
     t.checks.iter().any(|c| c.name == name)
         || t.indexes.iter().any(|i| i.unique && i.name == name)
@@ -423,6 +438,14 @@ impl Engine {
                 reject_params_for_ddl(params)?;
                 self.execute_alter_sequence(als)
             }
+            Statement::CreateView(cv) => {
+                reject_params_for_ddl(params)?;
+                self.execute_create_view(cv)
+            }
+            Statement::DropView(dv) => {
+                reject_params_for_ddl(params)?;
+                self.execute_drop_view(dv)
+            }
             Statement::Insert(ins) => self.execute_insert_cached(
                 ins,
                 params,
@@ -462,7 +485,9 @@ impl Engine {
                 let as_snap = self
                     .attach_read_snap(attach)
                     .expect("attachment resolved by the caller");
-                as_snap.table(name).is_some() || as_snap.find_index(name).is_some()
+                as_snap.table(name).is_some()
+                    || as_snap.find_index(name).is_some()
+                    || as_snap.view(name).is_some()
             }
             None => self.relation_exists(name),
         }
@@ -1242,12 +1267,9 @@ impl Engine {
             let parent: &Table = if self_ref {
                 &table
             } else {
-                self.read_snap().table(&fk.ref_table).ok_or_else(|| {
-                    EngineError::new(
-                        SqlState::UndefinedTable,
-                        format!("table does not exist: {}", fk.ref_table),
-                    )
-                })?
+                self.read_snap()
+                    .table(&fk.ref_table)
+                    .ok_or_else(|| fk_parent_missing(self.read_snap(), &fk.ref_table))?
             };
             // 3. Referenced columns into the parent (default to the parent's primary key).
             let refs: Vec<usize> = match &fk.ref_columns {
@@ -1633,6 +1655,23 @@ impl Engine {
         }
         .clone();
         let Some(original_ref) = snap.table(&at.name) else {
+            // A view: its renames are a follow-on (0A000); every other action is the wrong object
+            // kind (42809, views.md §2).
+            if snap.view(&at.name).is_some() {
+                if matches!(
+                    at.action,
+                    AlterTableAction::RenameTable(_) | AlterTableAction::RenameColumn { .. }
+                ) {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "renaming a view is not supported",
+                    ));
+                }
+                return Err(EngineError::new(
+                    SqlState::WrongObjectType,
+                    format!("{} is not a table", at.name),
+                ));
+            }
             if snap.find_index(&at.name).is_some() || snap.sequence(&at.name).is_some() {
                 return Err(EngineError::new(
                     SqlState::WrongObjectType,
@@ -1692,15 +1731,49 @@ impl Engine {
             .is_some_and(|q| !matches!(q.to_string().as_str(), "main" | "temp"));
         let main_namespace = self.read_snap().clone();
         let temp_namespace = self.temp_read_snap().clone();
+        // Views that depend on the table (spec/design/views.md §6–§8). A main-database table's
+        // dependents are captured now — traced against the pre-statement catalog when the action
+        // edits their text — and rewritten + re-validated after the change. A table of an attached
+        // database with dependent views refuses every ALTER TABLE: re-validating views there is a
+        // follow-on (views.md §10).
+        let view_plan = if temp_scope {
+            None
+        } else if attachment_scope {
+            if let Some(v) = snap
+                .views_depending_on(ViewDepKind::Table, &original.name)
+                .first()
+            {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    format!(
+                        "cannot alter table {} because view {} depends on it",
+                        original.name, v.name
+                    ),
+                ));
+            }
+            None
+        } else {
+            let rewrites = match &at.action {
+                AlterTableAction::RenameTable(_) | AlterTableAction::RenameColumn { .. } => true,
+                AlterTableAction::Actions(actions) => actions
+                    .iter()
+                    .any(|a| matches!(a, AlterTableEdit::DropColumn { .. })),
+                AlterTableAction::RenameConstraint { .. } => false,
+            };
+            self.prepare_view_alter(&original, rewrites)?
+        };
+        let mut view_change: Option<ViewAlterChange> = None;
         let relation_taken = |name: &str| {
             if attachment_scope {
                 snap.table(name).is_some()
                     || snap.find_index(name).is_some()
                     || snap.sequence(name).is_some()
+                    || snap.view(name).is_some()
             } else {
                 main_namespace.table(name).is_some()
                     || main_namespace.find_index(name).is_some()
                     || main_namespace.sequence(name).is_some()
+                    || main_namespace.view(name).is_some()
                     || temp_namespace.table(name).is_some()
                     || temp_namespace.find_index(name).is_some()
                     || temp_namespace.sequence(name).is_some()
@@ -1737,6 +1810,7 @@ impl Engine {
                     ));
                 }
                 self.rewrite_table_expressions(&mut table, None, Some(&new_name))?;
+                view_change = Some(ViewAlterChange::RenameTable(new_name.clone()));
                 table.name = new_name;
                 rename_table = true;
             }
@@ -1754,6 +1828,10 @@ impl Engine {
                     ));
                 }
                 self.rewrite_table_expressions(&mut table, Some((&old, &new)), None)?;
+                view_change = Some(ViewAlterChange::RenameColumn {
+                    ordinal: ci,
+                    new: new.clone(),
+                });
                 table.columns[ci].name = new;
             }
             AlterTableAction::RenameConstraint { old, new } => {
@@ -1920,6 +1998,28 @@ impl Engine {
                             return Err(EngineError::new(
                                 SqlState::FeatureNotSupported,
                                 "dropping a primary-key column is not supported yet".to_string(),
+                            ));
+                        }
+                        // A column a view references cannot be dropped (views.md §6): 2BP01, and
+                        // 0A000 under CASCADE (dropping the view is a follow-on).
+                        if let (ColumnSource::Original(old_ci), Some(vp)) =
+                            (&column_sources[ci], &view_plan)
+                            && let Some(view) = vp.view_using(*old_ci)
+                        {
+                            if cascade {
+                                return Err(EngineError::new(
+                                    SqlState::FeatureNotSupported,
+                                    format!(
+                                        "DROP COLUMN ... CASCADE of column {name} with dependent view {view} is not supported"
+                                    ),
+                                ));
+                            }
+                            return Err(EngineError::new(
+                                SqlState::DependentObjectsStillExist,
+                                format!(
+                                    "cannot drop column {name} of table {} because view {view} depends on it",
+                                    original.name
+                                ),
                             ));
                         }
                         let dropped_source = column_sources[ci].clone();
@@ -2363,12 +2463,9 @@ impl Engine {
                                 let parent = if d.ref_table == table.name {
                                     table.clone()
                                 } else {
-                                    snap.table(&d.ref_table).cloned().ok_or_else(|| {
-                                        EngineError::new(
-                                            SqlState::UndefinedTable,
-                                            format!("table does not exist: {}", d.ref_table),
-                                        )
-                                    })?
+                                    snap.table(&d.ref_table)
+                                        .cloned()
+                                        .ok_or_else(|| fk_parent_missing(&snap, &d.ref_table))?
                                 };
                                 let refs = if let Some(ns) = d.ref_columns {
                                     let mut r = Vec::new();
@@ -2699,6 +2796,16 @@ impl Engine {
                             type_mod,
                             using,
                         } => {
+                            // A column a view references cannot change type (views.md §6).
+                            if let (ColumnSource::Original(old_ci), Some(vp)) =
+                                (&column_sources[ci], &view_plan)
+                                && vp.view_using(*old_ci).is_some()
+                            {
+                                return Err(EngineError::new(
+                                    SqlState::FeatureNotSupported,
+                                    "cannot alter type of a column used by a view",
+                                ));
+                            }
                             let old_column = table.columns[ci].clone();
                             let mut target = self.build_alter_added_column(
                                 &table,
@@ -3330,6 +3437,20 @@ impl Engine {
             let pending: std::collections::HashSet<String> =
                 pending_serials.iter().map(|s| s.name.to_string()).collect();
             ws.remap_alter_column_dependents(&table.name, &original_to_new, &pending);
+        }
+        // Rewrite and re-validate the dependent views against the post-statement catalog
+        // (views.md §7/§8); a failure is 0A000 and discards the whole statement.
+        if let Some(plan) = view_plan {
+            let change = view_change.unwrap_or_else(|| ViewAlterChange::Other {
+                dropped: (0..original.columns.len())
+                    .filter(|old| {
+                        !column_sources
+                            .iter()
+                            .any(|s| matches!(s, ColumnSource::Original(o) if o == old))
+                    })
+                    .collect(),
+            });
+            self.finish_view_alter(plan, &change)?;
         }
         Ok(Outcome::Statement {
             cost: meter.accrued,
@@ -4000,7 +4121,7 @@ impl Engine {
                 // indexes.md §2); `IF EXISTS` does NOT suppress this. Otherwise a missing table is
                 // 42P01, unless `IF EXISTS` makes it a no-op for just this name (PG turns the
                 // missing-table error into a notice).
-                if self.find_index(name).is_some() {
+                if self.find_index(name).is_some() || self.is_view(name) {
                     return Err(EngineError::new(
                         SqlState::WrongObjectType,
                         format!("{name} is not a table"),
@@ -4022,6 +4143,14 @@ impl Engine {
         // persistent snapshot; a dependent whose referencing table is itself in the drop set does not
         // count (the drop-set exclusion is the whole `seen` set, so `DROP TABLE parent, child`
         // succeeds even under RESTRICT).
+        // A view depending on a table being dropped blocks the statement (views.md §6): a DROP
+        // TABLE never drops views, and CASCADE dropping them is a follow-on.
+        let persistent: Vec<String> = targets
+            .iter()
+            .filter(|(_, scope)| matches!(scope, Scope::Persistent))
+            .map(|(key, _)| key.clone())
+            .collect();
+        self.check_drop_table_views(&persistent, dt.cascade)?;
         let deps = self.read_snap().foreign_key_dependents_excluding(&seen);
         let cascade_removals = if dt.cascade {
             deps
@@ -4096,6 +4225,16 @@ impl Engine {
         // A DDL write to a READ-ONLY host attachment is 25006 before any work — checked BEFORE the
         // qualifier existence gate so a read-only attachment refuses the write deterministically (§4).
         self.check_attachment_writable(ci.db.as_deref())?;
+        // An index on a view is the wrong object kind (views.md §2).
+        if matches!(ci.db.as_deref(), None | Some("main"))
+            && self.table_scoped(ci.db.as_deref(), &ci.table).is_none()
+            && self.is_view(&ci.table)
+        {
+            return Err(EngineError::new(
+                SqlState::WrongObjectType,
+                format!("cannot create index on relation \"{}\"", ci.table),
+            ));
+        }
         self.check_table_qualifier(ci.db.as_deref(), &ci.table)?; // attached-databases.md §3
         let attach_name: Option<String> = if is_attachment_scope(ci.db.as_deref()) {
             ci.db.as_ref().map(|d| d.to_string())
@@ -4379,7 +4518,9 @@ impl Engine {
                 let as_snap = self
                     .attach_read_snap(name)
                     .expect("attachment resolved above");
-                as_snap.table(n).is_some() || as_snap.find_index(n).is_some()
+                as_snap.table(n).is_some()
+                    || as_snap.find_index(n).is_some()
+                    || as_snap.view(n).is_some()
             } else {
                 self.relation_exists(n)
             }
@@ -4542,7 +4683,7 @@ impl Engine {
     /// that owns it, so dropping a temp table's index makes zero file writes.
     pub(crate) fn execute_drop_index(&mut self, di: DropIndex) -> Result<Outcome> {
         // `table` covers both scopes, so DROP INDEX naming a table is 42809 regardless of kind.
-        if self.table(&di.name).is_some() {
+        if self.table(&di.name).is_some() || self.is_view(&di.name) {
             return Err(EngineError::new(
                 SqlState::WrongObjectType,
                 format!("{} is not an index", di.name),

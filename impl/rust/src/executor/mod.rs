@@ -8,18 +8,19 @@ pub(crate) use crate::api::Rows;
 pub(crate) use crate::ast::{
     AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence, AlterTable,
     AlterTableAction, AlterTableEdit, Analyze, BinaryOp, ConflictAction, ConflictTarget,
-    CreateIndex, CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef, Delete,
-    DropIndex, DropSequence, DropTable, DropType, Expr, FkTarget, GroupItem, IndexKeyElem, Insert,
-    InsertSource, InsertValue, JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper,
-    JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, ReturningClause,
-    Select, SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef,
-    TypeFieldDef, TypeMod, UnaryOp, Update, WindowDef, WithExpr, WithQuery,
+    CreateIndex, CreateSequence, CreateTable, CreateType, CreateView, Cte, CteBody, DefaultDef,
+    Delete, DropIndex, DropSequence, DropTable, DropType, DropView, Expr, FkTarget, GroupItem,
+    IndexKeyElem, Insert, InsertSource, InsertValue, JoinKind, JsonOnBehavior, JsonPredicateKind,
+    JsonTable, JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr,
+    RefAction, ReturningClause, Select, SelectItems, SeqOptions, SetOp, SetOpKind, Statement,
+    SubscriptSpec, TableRef, TableRefPos, TypeFieldDef, TypeMod, UnaryOp, Update, WindowDef,
+    WithExpr, WithQuery,
 };
 pub(crate) use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
     ExclusionConstraint, ExclusionElement, ExclusionOp, FkAction, ForeignKeyConstraint,
     HostFuncDep, IdentityKind, IndexDef, IndexKey, IndexKeyExpr, IndexKind, SeqDataType, SeqOwner,
-    SequenceDef, Table, TimeZoneDep, TimeZoneDeps, resolve_col_type,
+    SequenceDef, Table, TimeZoneDep, TimeZoneDeps, ViewDef, ViewDep, ViewDepKind, resolve_col_type,
 };
 pub(crate) use crate::collation::{self, Collation};
 pub(crate) use crate::cost::{Lifetime, Meter};
@@ -94,6 +95,8 @@ pub(crate) use host_batch::{HostBatch, ReadAhead, read_ahead_cap};
 mod snapshot;
 mod statistics;
 pub(crate) use statistics::*;
+mod views;
+pub(crate) use views::*;
 // __SUBMODULES__
 
 /// The outcome of executing one statement. Both variants carry the deterministic
@@ -370,6 +373,9 @@ pub struct Snapshot {
     /// (spec/fileformat/format.md, `entry_kind = 2`). The mutable counter (`last_value`/`is_called`)
     /// lives here, so `nextval` advances the working snapshot and rolls back with it (sequences.md §5).
     sequences: std::sync::Arc<HashMap<String, SequenceDef>>,
+    /// Views, keyed by exact name (spec/design/views.md). They share the relation namespace with
+    /// tables, indexes, and sequences; serialized as `entry_kind = 5` catalog entries (format v38).
+    views: std::sync::Arc<HashMap<String, ViewDef>>,
     /// Loaded collations, keyed by their exact (CASE-SENSITIVE) name — collation names are quoted
     /// identifiers (`"en-US"`, spec/design/collation.md §1). `C` is never stored (table-free, built
     /// in). Imported by the host `db.import_collation`. `Arc` so a resolved comparison / sort key can
@@ -545,6 +551,13 @@ pub struct Engine {
     /// Populated only while EXPLAIN ANALYZE executes its inner statement. Exact operator sub-meter
     /// snapshots are recorded here; ordinary execution pays only a RefCell/Option nil check.
     pub(crate) explain_actual: std::cell::RefCell<Option<ActualCostProfile>>,
+    /// Populated only while a view body is planned at `CREATE VIEW`, view re-validation, or a
+    /// rename rewrite (spec/design/views.md §5–§8): the FROM items, columns, and `*` expansions the
+    /// planner binds. `None` on every ordinary statement, which then pays one `RefCell` nil check.
+    pub(crate) view_trace: std::cell::RefCell<Option<ViewTrace>>,
+    /// How many view references are being expanded inside one another right now (views.md §4.1):
+    /// nesting counts toward `MAX_EXPR_DEPTH` (54001).
+    pub(crate) view_depth: std::cell::Cell<usize>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1405,6 +1418,10 @@ pub(crate) struct ScopeRel<'a> {
     table: &'a Table,
     offset: usize,
     qualifier_only: bool,
+    /// Whether this relation is a catalog **base table** (possibly under a column alias list —
+    /// grammar.md §15). A view body's planning trace records the columns resolved against such a
+    /// relation as dependencies (spec/design/views.md §6); every other relation kind records none.
+    base: bool,
     /// `Some(i)` when this relation is a reference to CTE `i` (spec/design/cte.md) rather than a
     /// base table — its `table` is the binding's synthetic relation and exec delivers its rows from
     /// the `CteCtx`. `None` for a base table / SRF / pseudo-relation.
@@ -1473,6 +1490,27 @@ pub(crate) enum RelSrc<'a> {
     Base(&'a Table),
     Cte(&'a Table, usize),
     Synthetic(usize),
+    /// A base table under a column alias list (grammar.md §15): a relabeled copy of the catalog
+    /// table in the synthetic vec, still read from the table's own store — the rename is a pure
+    /// resolution-time relabeling.
+    BaseRenamed(usize),
+    /// A CTE reference under a column alias list: a relabeled copy of the binding's relation.
+    CteRenamed(usize, usize),
+}
+
+impl RelSrc<'_> {
+    /// Whether the relation is a catalog base table (renamed or not).
+    fn is_base(&self) -> bool {
+        matches!(self, RelSrc::Base(_) | RelSrc::BaseRenamed(_))
+    }
+
+    /// The CTE binding index of a CTE reference (renamed or not).
+    fn cte(&self) -> Option<usize> {
+        match self {
+            RelSrc::Cte(_, ci) | RelSrc::CteRenamed(_, ci) => Some(*ci),
+            _ => None,
+        }
+    }
 }
 
 /// A FROM relation finalized during the §44 LATERAL-aware build: its label, flat column offset, and
@@ -1496,7 +1534,9 @@ impl<'a> FinalRel<'a> {
     {
         match self.src {
             RelSrc::Base(t) | RelSrc::Cte(t, _) => t,
-            RelSrc::Synthetic(idx) => &synthetic[idx],
+            RelSrc::Synthetic(idx) | RelSrc::BaseRenamed(idx) | RelSrc::CteRenamed(idx, _) => {
+                &synthetic[idx]
+            }
         }
     }
 }
@@ -1523,6 +1563,7 @@ fn build_prefix_scope<'s>(
                 table: fr.table(synthetic),
                 offset: fr.offset,
                 qualifier_only: false,
+                base: fr.src.is_base(),
                 // The prefix is only for column resolution; a correlated reference into a CTE-backed
                 // relation reads its already-delivered row, so it adds no CTE reference here.
                 cte: None,
@@ -1716,6 +1757,7 @@ impl<'a> Scope<'a> {
                 table,
                 offset: 0,
                 qualifier_only: false,
+                base: false,
                 cte: None,
                 db: None,
             }],
@@ -1784,6 +1826,7 @@ impl<'a> Scope<'a> {
             table,
             offset: 0,
             qualifier_only: false,
+            base: false,
             cte: None,
             db: None,
         }];
@@ -1804,6 +1847,7 @@ impl<'a> Scope<'a> {
                     table,
                     offset,
                     qualifier_only: true,
+                    base: false,
                     cte: None,
                     db: None,
                 });
@@ -1819,6 +1863,7 @@ impl<'a> Scope<'a> {
                     table,
                     offset,
                     qualifier_only: true,
+                    base: false,
                     cte: None,
                     db: None,
                 });
@@ -1853,6 +1898,7 @@ impl<'a> Scope<'a> {
             table,
             offset: 0,
             qualifier_only: false,
+            base: false,
             cte: None,
             db: None,
         }];
@@ -1862,6 +1908,7 @@ impl<'a> Scope<'a> {
                 table,
                 offset: n,
                 qualifier_only: true,
+                base: false,
                 cte: None,
                 db: None,
             });
@@ -1917,11 +1964,54 @@ impl<'a> Scope<'a> {
             }
         }
         if let Some(idx) = found {
+            self.trace_flat(idx);
             return Ok(Resolved::Local(idx));
         }
         match self.parent {
             Some(p) => Ok(outer_of(p.resolve_bare(name)?)),
             None => Err(undefined_column(name)),
+        }
+    }
+
+    /// The label a frozen `*` column renders with (spec/design/views.md §5): `None` (a bare
+    /// `"column"`) for a `USING`/`NATURAL` merged column and for a relation with no label (an
+    /// unaliased derived table); an unaliased parenthesized join's column takes its inner relation's
+    /// label; any other column its relation's label.
+    fn star_label(&self, idx: usize) -> Option<String> {
+        if self.merges.iter().any(|m| m.index == idx) {
+            return None;
+        }
+        for r in &self.rels {
+            let n = r.table.columns.len();
+            if idx >= r.offset && idx < r.offset + n {
+                if !r.label.is_empty() {
+                    return Some(r.label.clone());
+                }
+                return self
+                    .sub_rels
+                    .iter()
+                    .find(|sr| sr.slots.contains(&idx))
+                    .map(|sr| sr.label.clone());
+            }
+        }
+        None
+    }
+
+    /// Record a resolved column of this scope as a view dependency when a view body is being
+    /// traced and the column belongs to a catalog base table (spec/design/views.md §6). A no-op on
+    /// every ordinary statement.
+    fn trace_flat(&self, idx: usize) {
+        if !self.catalog.view_tracing() {
+            return;
+        }
+        for r in &self.rels {
+            let n = r.table.columns.len();
+            if idx >= r.offset && idx < r.offset + n {
+                if r.base {
+                    self.catalog.trace_column(&r.table.name, idx - r.offset);
+                }
+                return;
+            }
         }
     }
 
@@ -1954,7 +2044,10 @@ impl<'a> Scope<'a> {
             return match (found, visible) {
                 (None, _) => Err(undefined_column(name)),
                 _ if ambiguous => Err(ambiguous_column(name)),
-                (_, Some(idx)) | (Some(idx), None) => Ok(Resolved::Local(idx)),
+                (_, Some(idx)) | (Some(idx), None) => {
+                    self.trace_flat(idx);
+                    Ok(Resolved::Local(idx))
+                }
             };
         }
         if let Some(sr) = self.sub_rels.iter().find(|sr| sr.label == q) {
@@ -4248,6 +4341,9 @@ pub(crate) enum SrfKind {
     /// The `jed_type_fields` catalog relation (introspection.md §5.3, slice I3) — one row per field
     /// of every user-defined type, in (type, ordinal) order.
     JedTypeFields,
+    /// The `jed_views` catalog relation (introspection.md §5.4, views V1) — one row per view of the
+    /// qualified database, in ascending name byte order.
+    JedViews,
 }
 
 impl SrfKind {
@@ -4264,6 +4360,7 @@ impl SrfKind {
                 | SrfKind::JedSequences
                 | SrfKind::JedTypes
                 | SrfKind::JedTypeFields
+                | SrfKind::JedViews
         )
     }
 }
@@ -4344,6 +4441,7 @@ fn catalog_rel_kind(name: &str) -> Option<SrfKind> {
         "jed_sequences" => Some(SrfKind::JedSequences),
         "jed_types" => Some(SrfKind::JedTypes),
         "jed_type_fields" => Some(SrfKind::JedTypeFields),
+        "jed_views" => Some(SrfKind::JedViews),
         _ => None,
     }
 }
@@ -4506,6 +4604,14 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
                 col("ordinal", ScalarType::Int32, true),
                 col("type", ScalarType::Text, true),
                 col("not_null", ScalarType::Bool, true),
+            ],
+        ),
+        SrfKind::JedViews => table(
+            "jed_views",
+            vec![
+                col("name", ScalarType::Text, true),
+                col("definition", ScalarType::Text, true),
+                text_arr("columns", true),
             ],
         ),
         _ => unreachable!("only catalog-relation kinds reach catalog_rel_table"),

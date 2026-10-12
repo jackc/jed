@@ -45,7 +45,7 @@ usage: jed [OPTIONS] [DBFILE]
   -f FILE                 execute a SQL file, then exit (repeatable; '-' = stdin)
   --import-csv TABLE=FILE import an RFC 4180 CSV (header row required) into TABLE as one
                           atomic INSERT (repeatable; runs in command-line order with -c/-f)
-  --dump                  write the database as SQL (schema + rows + indexes), then exit;
+  --dump                  write the database as SQL (schema, rows, indexes, views), then exit;
                           composes with --readonly and -o
   --format FORMAT         script-mode output: aligned (default) | box | markdown | csv | json
   -o FILE                 script mode: write results to FILE instead of stdout ('-' = stdout);

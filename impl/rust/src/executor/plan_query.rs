@@ -232,6 +232,13 @@ impl Engine {
             ),
             CteBody::Query(_) => unreachable!("plan_dm_cte requires a data-modifying body"),
         };
+        // A view target is 55000, as for a top-level write (views.md §2).
+        let verb = match body {
+            CteBody::Insert(_) => "insert into",
+            CteBody::Update(_) => "update",
+            _ => "delete from",
+        };
+        self.check_view_write(None, table_name, verb)?;
         let tdef = self.table(table_name).ok_or_else(|| {
             EngineError::new(
                 SqlState::UndefinedTable,

@@ -964,6 +964,18 @@ impl Engine {
     pub(crate) fn execute_analyze(&mut self, analyze: Analyze) -> Result<Outcome> {
         self.check_attachment_writable(analyze.db.as_deref())?;
         check_catalog_rel_write(&analyze.name)?;
+        // ANALYZE of a view is a no-op success (views.md §2; PostgreSQL also warns).
+        if self
+            .table_scoped(analyze.db.as_deref(), &analyze.name)
+            .is_none()
+            && matches!(analyze.db.as_deref(), None | Some("main"))
+            && self.is_view(&analyze.name)
+        {
+            return Ok(Outcome::Statement {
+                cost: 0,
+                rows_affected: None,
+            });
+        }
         let table = self
             .table_scoped(analyze.db.as_deref(), &analyze.name)
             .cloned()

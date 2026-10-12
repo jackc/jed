@@ -19,7 +19,7 @@ pub(crate) fn resolve_group_term(
     // range. The select list fixes the position count: `*` expands to the scope width.
     if let Expr::Literal(Literal::Int(n)) = term {
         let ncols = match items {
-            SelectItems::All => scope.width() as i64,
+            SelectItems::All(_) => scope.width() as i64,
             SelectItems::Items(its) => its.len() as i64,
         };
         if *n < 1 || *n > ncols {
@@ -31,7 +31,7 @@ pub(crate) fn resolve_group_term(
         let pos = (*n - 1) as usize;
         return match items {
             // `SELECT *` — the ordinal names the column at that scope position directly.
-            SelectItems::All => Ok(GroupKeyResolved::Column(pos)),
+            SelectItems::All(_) => Ok(GroupKeyResolved::Column(pos)),
             SelectItems::Items(its) => resolve_group_expr(scope, &its[pos].expr, params),
         };
     }

@@ -769,7 +769,7 @@ impl Engine {
                 ));
             }
             // Run the statement; ANY error aborts the block (it enters the failed state — §6).
-            let result = if stmt_is_write(&stmt) && !writable {
+            let result = if self.stmt_is_write_with_views(&stmt) && !writable {
                 Err(EngineError::new(
                     SqlState::ReadOnlySqlTransaction,
                     format!(
@@ -801,7 +801,7 @@ impl Engine {
         // transaction — open a working snapshot off `committed`, run, then commit on success /
         // discard on error. Because the write mutates only `working`, an error leaves `committed`
         // untouched (no restore needed); rolled-back rowid allocations vanish with `working` (§7).
-        if !stmt_is_write(&stmt) {
+        if !self.stmt_is_write_with_views(&stmt) {
             return self.dispatch_stmt(stmt, params);
         }
         // On a read-only handle the implicit transaction is READ ONLY (PostgreSQL hot-standby
@@ -1144,6 +1144,8 @@ impl Engine {
         }
         let mut req = PrivReq::default();
         collect_stmt_privs(stmt, &mut req);
+        // The functions a read view's body calls need the reader's EXECUTE (views.md §9).
+        self.collect_view_function_privs(&mut req);
         // The UPDATE DEFAULT marker has no expression subtree. Add the selected catalog default's
         // named functions during preflight so a revoked function cannot be invoked through
         // `SET column = DEFAULT` (session.md §5.3).
@@ -1187,7 +1189,9 @@ impl Engine {
             // per-table SELECT on its own name under the session envelope, no special case
             // (introspection.md §5) — so an explicit-grant session sees the schema only if the host
             // granted it.
-            let exists = is_catalog_rel_name(&key) || snap.table(&key).is_some();
+            let exists = is_catalog_rel_name(&key)
+                || snap.table(&key).is_some()
+                || snap.view(&key).is_some();
             if exists && !self.session.privileges.allows_table(&key, *priv_) {
                 return Err(EngineError::new(
                     SqlState::InsufficientPrivilege,

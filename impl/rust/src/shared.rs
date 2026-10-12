@@ -78,7 +78,7 @@ use crate::coordinator::{FileCoordinator, LeaseState};
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{
     CachedInsert, CachedPlan, CollationInfo, Engine, Outcome, ScriptSummary, SessionOptions,
-    SessionState, Snapshot, TxStatus, stmt_is_write,
+    SessionState, Snapshot, TxStatus,
 };
 use crate::file::{CreateOptions, DatabaseOptions, Locking, OpenOptions};
 use crate::privileges::{PrivilegeSet, Privileges};
@@ -2724,7 +2724,7 @@ impl Session {
         if let Some(error) = &self.pending_error {
             return Err(error.clone());
         }
-        if !self.engine.in_transaction() && !stmt_is_write(ast) {
+        if !self.engine.in_transaction() && !self.engine.stmt_is_write_with_views(ast) {
             if self.access == Access::ReadOnly {
                 self.refresh_initial_read()?;
             } else {
@@ -2749,7 +2749,10 @@ impl Session {
         // adopts it (its drop deregisters), else it drops here (a materialized dispatch / an early return),
         // so a read that pins no long-lived cursor leaks nothing.
         let mut provisional: Option<Box<dyn std::any::Any>> = None;
-        if self.access != Access::ReadOnly && !self.engine.in_transaction() && !stmt_is_write(ast) {
+        if self.access != Access::ReadOnly
+            && !self.engine.in_transaction()
+            && !self.engine.stmt_is_write_with_views(ast)
+        {
             let (snap, attached, version) = self.shared.pin_latest();
             self.base_version = version;
             self.engine.committed = (*snap).clone();
@@ -2764,7 +2767,7 @@ impl Session {
         if !matches!(
             ast,
             Statement::Begin { .. } | Statement::Commit | Statement::Rollback
-        ) && !stmt_is_write(ast)
+        ) && !self.engine.stmt_is_write_with_views(ast)
         {
             if let Err(e) = self.engine.gate_read_lanes(ast) {
                 return Err(self.engine.poison_on_lane_err(e));
@@ -2917,7 +2920,7 @@ impl Session {
                 .engine
                 .execute_stmt_params_cached(ast, params, insert_cache);
         }
-        if !stmt_is_write(&ast) {
+        if !self.engine.stmt_is_write_with_views(&ast) {
             // Autocommit read: the snapshot was already pinned + committed set upstream (query_ast_cached's
             // atomic autocommit-read pin for a writable session; the mint pin for a read-only session), and
             // that pin is held across this synchronous materialize (transactions.md §8) — so the read's
@@ -3221,6 +3224,15 @@ impl Session {
     /// [`Database::composite_type`]).
     pub fn composite_type(&self, name: &str) -> Option<&CompositeType> {
         self.engine.composite_type(name)
+    }
+
+    /// Every view of the main database this session sees, in dependency order — a view after every
+    /// view it reads, ties in name byte order (spec/design/views.md §11, the CLI dump order). The
+    /// [`ViewDef`](crate::tooling::ViewDef) return is the doc-hidden `tooling` introspection seam;
+    /// SQL's `jed_views` is the introspection surface.
+    #[doc(hidden)]
+    pub fn views_in_dependency_order(&self) -> Vec<crate::catalog::ViewDef> {
+        self.engine.views_in_dependency_order()
     }
 
     /// White-box test helper (CLAUDE.md §10): all rows of table `name` in primary-key order as this

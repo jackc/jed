@@ -27,7 +27,9 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 37 # v37: exact (folded) identifier names — no byte layout change; catalog groups sort by
+VERSION = 38 # v38: views — entry_kind 5 view entries emitted last, in name byte order (views.md §3);
+# no other byte layout change.
+# v37: exact (folded) identifier names — no byte layout change; catalog groups sort by
 # exact-name bytes and persisted expression text renders bare words folded (grammar.md §3).
 # v36: an array column entry's flags gain bit6 has_collation (a text[] column's
 # non-C collation, the name after the element descriptor) and a collated text[] key stores each
@@ -1211,6 +1213,27 @@ IDENTITY_TABLE = {
              rows: [[1, 1, "hi"]] }]
 }.freeze
 
+# VIEWS (v38 — spec/design/views.md §3, format.md *View entry*): pins the entry_kind 5 view entry and
+# its emission LAST (after the table and statistics entries), in view-name byte order. A table t(a, b)
+# with two rows and three views: `v` stores the frozen `*` expansion and depends on t's columns a, b;
+# `w` renames its one output column through a column list and depends on the view v (a view dependency
+# carries no columns); `n` depends on t with ZERO columns. The cores build this via
+#   CREATE TABLE t (a i32 PRIMARY KEY, b text); INSERT INTO t VALUES (1, 'x'), (2, 'y');
+#   CREATE VIEW v AS SELECT * FROM t WHERE a > 0; CREATE VIEW w (x) AS SELECT a FROM v;
+#   CREATE VIEW n AS SELECT count(*) AS c FROM t
+VIEW_TABLE = {
+  tables: [{ name: "t", columns: [col("a", "i32", pk: true), col("b", "text")],
+             rows: [[1, "x"], [2, "y"]] }],
+  views: [
+    { name: "v", columns: %w[a b], definition: 'select "t" . "a" , "t" . "b" from t where a > 0',
+      deps: [{ kind: 0, name: "t", columns: %w[a b] }] },
+    { name: "w", columns: %w[x], definition: "select a from v",
+      deps: [{ kind: 1, name: "v", columns: [] }] },
+    { name: "n", columns: %w[c], definition: "select count ( * ) as c from t",
+      deps: [{ kind: 0, name: "t", columns: [] }] }
+  ]
+}.freeze
+
 # collation_table (v18): a reference-only COLLATION entry (entry_kind 3) + per-column collations. The
 # real `unicode` collation (the version-pinned CLDR-DUCET root, UCA/UCD 17.0.0) is referenced and set
 # as the per-database default (the is_default flag); the entry is metadata only — name + version pin +
@@ -1403,6 +1426,7 @@ FIXTURES = ([
     sequences: SERIAL_TABLE[:sequences], tables: SERIAL_TABLE[:tables] },
   { file: "identity_table.jed", page_size: 256,
     sequences: IDENTITY_TABLE[:sequences], tables: IDENTITY_TABLE[:tables] },
+  { file: "view_table.jed", page_size: 256, tables: VIEW_TABLE[:tables], views: VIEW_TABLE[:views] },
   { file: "collation_table.jed", page_size: 256,
     collations: COLLATION_TABLE[:collations], tables: COLLATION_TABLE[:tables] },
   { file: "collation_pk_table.jed", page_size: 256,
@@ -2209,6 +2233,68 @@ def sequence_entry_bytes(s)
   out
 end
 
+# Serialize a view catalog entry's BODY (after the entry_kind=5 byte, v38 — format.md *View entry*):
+# the name, the output column names, the definition (u32 length + canonical token text), then the
+# dependency list in name byte order — per dependency a kind byte (0 table, 1 view), the name, and the
+# table's referenced column names in byte order (none for a view).
+def view_entry_bytes(v)
+  str = ->(x) { u16(x.bytesize) + x.b }
+  out = str.(v[:name])
+  out << u16(v[:columns].size)
+  v[:columns].each { |c| out << str.(c) }
+  out << u32(v[:definition].bytesize) << v[:definition].b
+  deps = v[:deps].sort_by { |d| d[:name] }
+  out << u16(deps.size)
+  deps.each do |d|
+    out << [d[:kind]].pack("C") << str.(d[:name])
+    cols = d[:columns].sort
+    out << u16(cols.size)
+    cols.each { |c| out << str.(c) }
+  end
+  out.b
+end
+
+# Decode a view catalog entry's body (inverse of view_entry_bytes); the caller consumed the
+# entry_kind byte.
+def decode_view_entry(buf, pos)
+  name, pos = take_str(buf, pos)
+  ncols, pos = take(buf, pos, 2)
+  columns = []
+  ncols.unpack1("n").times do
+    c, pos = take_str(buf, pos)
+    columns << c
+  end
+  dl, pos = take(buf, pos, 4)
+  definition, pos = take(buf, pos, dl.unpack1("N"))
+  nd, pos = take(buf, pos, 2)
+  deps = []
+  nd.unpack1("n").times do
+    kb, pos = take(buf, pos, 1)
+    kind = kb.getbyte(0)
+    raise "unknown view dependency kind" unless [0, 1].include?(kind)
+
+    dname, pos = take_str(buf, pos)
+    nc, pos = take(buf, pos, 2)
+    cols = []
+    nc.unpack1("n").times do
+      c, pos = take_str(buf, pos)
+      cols << c
+    end
+    raise "a view dependency lists columns" if kind == 1 && !cols.empty?
+
+    deps << { kind: kind, name: dname, columns: cols }
+  end
+  [{ name: name, columns: columns, definition: definition.force_encoding("UTF-8"), deps: deps }, pos]
+end
+
+# The view content a fixture should decode to (name-sorted, dependencies and their columns sorted).
+def expected_views(fx)
+  (fx[:views] || []).sort_by { |v| v[:name] }.map do |v|
+    { name: v[:name], columns: v[:columns], definition: v[:definition],
+      deps: v[:deps].sort_by { |d| d[:name] }.map { |d| { kind: d[:kind], name: d[:name], columns: d[:columns].sort } } }
+  end
+end
+
 # Serialize a collation reference entry's BODY (after its entry_kind = 3 byte, v18): a flags byte
 # (bit0 is_default), then the metadata — name + unicode_version + cldr_version + description, each
 # u16-len + UTF-8. NO table: it is vendored into the binary and resolved by name on open
@@ -2994,7 +3080,7 @@ end
 # A from-scratch image (format.md "Allocation & incremental commit"): the special case where
 # every node is dirty — data B-trees post-order (per table, name order) from page 2, then the
 # catalog chain, then both meta slots at txid 1.
-def build_image(types, sequences, tables, page_size, collations = [], start_page: ROOT_PAGE)
+def build_image(types, sequences, tables, page_size, collations = [], start_page: ROOT_PAGE, views: [])
   ps = page_size
   cap = ps - PAGE_HEADER
   # Composite types in scope for the recursive value codec, keyed by lowercased name (§4).
@@ -3041,6 +3127,8 @@ def build_image(types, sequences, tables, page_size, collations = [], start_page
     cat_entries << ("\x00".b + table_entry_bytes(t, root_data[ti], index_roots[ti], t[:rows].length))
   end
   sorted.each { |t| cat_entries.concat(statistics_entries(t)) }
+  # View entries (kind 5, v38) come last, in view-name byte order (format.md *View entry*).
+  views.sort_by { |v| v[:name] }.each { |v| cat_entries << ("\x05".b + view_entry_bytes(v)) }
   cat_groups = pack(cat_entries.map(&:bytesize), cap)
   page_count = cat_root + cat_groups.size
 
@@ -3065,7 +3153,7 @@ def fixture_image(fx)
   return cow_fixture_image(fx) if fx[:cow]
 
   image = build_image(fx[:types] || [], fx[:sequences] || [], fx[:tables], fx[:page_size],
-                      fx[:collations] || [])
+                      fx[:collations] || [], views: fx[:views] || [])
   if fx[:corrupt_slot]
     off = fx[:corrupt_slot] * fx[:page_size] + 35 # last CRC byte of that slot
     image.setbyte(off, image.getbyte(off) ^ 0xFF)
@@ -4135,6 +4223,7 @@ def decode_image(image)
   sequences = []
   collations = []
   tables = []
+  views = []
   statistics = []
   statistics_expected = {}
   # Composite types in scope for the recursive value codec; populated as the (types-first) catalog
@@ -4169,6 +4258,11 @@ def decode_image(image)
         pos = decode_statistics_entry(pg[:payload], pos, tables, statistics, statistics_expected)
         next
       end
+      if kind == 5
+        v, pos = decode_view_entry(pg[:payload], pos)
+        views << v
+        next
+      end
       raise "unknown catalog entry kind #{kind}" unless kind.zero?
 
       entry, pos = decode_table_entry(pg[:payload], pos)
@@ -4196,7 +4290,7 @@ def decode_image(image)
   $reached = nil
   raise "live page count #{meta[:live]} does not match #{reached} reachable pages" unless meta[:live] == reached
   { types: types, sequences: sequences, collations: collations, tables: tables,
-    statistics: statistics }
+    statistics: statistics, views: views }
 end
 
 # Decode a sequence catalog entry's body (inverse of sequence_entry_bytes); the caller has consumed
@@ -4433,6 +4527,10 @@ def verify
       unless content_equal?(c, want_colls[i])
         fail!("#{fx[:file]}: collation #{i} mismatch\n  got:  #{c.inspect}\n  want: #{want_colls[i].inspect}")
       end
+    end
+    want_views = expected_views(fx)
+    unless content_equal?(decoded[:views], want_views)
+      fail!("#{fx[:file]}: views mismatch\n  got:  #{decoded[:views].inspect}\n  want: #{want_views.inspect}")
     end
     want_statistics = expected_statistics(fx)
     unless content_equal?(decoded[:statistics], want_statistics)

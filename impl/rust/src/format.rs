@@ -116,7 +116,10 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // compared byte-exactly, every name-ordered group sorts by ascending byte order of the exact name,
 // and persisted expression text renders bare words folded and quoted identifiers as `"…"`
 // (spec/design/grammar.md §3).
-const FORMAT_VERSION: u16 = 37;
+// v38: views — `entry_kind = 5` view catalog entries (name, output columns, canonical definition
+// text, dependency list) emitted last in view-name byte order (spec/design/views.md §3); no other
+// byte layout change.
+const FORMAT_VERSION: u16 = 38;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -1460,6 +1463,7 @@ impl Snapshot {
             cat_entries.push(e);
         }
         cat_entries.extend(statistics_catalog_entries(self));
+        cat_entries.extend(view_catalog_entries(self));
         let entry_sizes: Vec<usize> = cat_entries.iter().map(|e| e.len()).collect();
         let cat_groups = pack(&entry_sizes, cap)?;
         let page_count = cat_root + cat_groups.len() as u32;
@@ -1986,6 +1990,7 @@ impl Snapshot {
             cat_entries.push(e);
         }
         cat_entries.extend(statistics_catalog_entries(self));
+        cat_entries.extend(view_catalog_entries(self));
         let entry_sizes: Vec<usize> = cat_entries.iter().map(|e| e.len()).collect();
         let cat_groups = pack(&entry_sizes, cap)?;
         let cat_pages: Vec<u32> = (0..cat_groups.len()).map(|_| alloc.take()).collect();
@@ -2323,6 +2328,7 @@ impl Engine {
         let mut cat_page = meta.root_page;
         let mut statistics_expected: std::collections::HashMap<(String, usize), (usize, usize)> =
             std::collections::HashMap::new();
+        let mut loaded_views: Vec<crate::catalog::ViewDef> = Vec::new();
         let mut live = LiveCount {
             live: meta.live_pages,
             catalog: 0,
@@ -2369,6 +2375,12 @@ impl Engine {
                         &mut snap,
                         &mut statistics_expected,
                     )?;
+                    continue;
+                }
+                if kind == 5 {
+                    // A view entry (v38): parsed now, validated once every table and view is
+                    // registered (its dependencies may name later entries).
+                    loaded_views.push(decode_view_entry(page.payload, &mut pos)?);
                     continue;
                 }
                 if kind != 0 {
@@ -2454,6 +2466,8 @@ impl Engine {
         // Two-pass: validate the composite-type catalog (existence + acyclicity) — XX001 on a bad
         // reference (spec/design/composite.md §3).
         snap.validate_composite_types()?;
+        // Views (v38): structural checks only — the bodies are parsed, never planned (views.md §3).
+        install_views(&mut snap, loaded_views)?;
         // Build each GiST index's resident R-tree from its eager-loaded leaf store (gist.md §4.1).
         snap.rebuild_gist_trees()?;
         let mut db = Engine::new();
@@ -4402,6 +4416,179 @@ fn decode_composite_type_entry(buf: &[u8], pos: &mut usize) -> Result<CompositeT
         });
     }
     Ok(CompositeType { name, fields })
+}
+
+/// The view catalog entries (`entry_kind = 5`, v38), emitted last in ascending name byte order
+/// (format.md *View entry*).
+fn view_catalog_entries(snapshot: &Snapshot) -> Vec<Vec<u8>> {
+    snapshot
+        .views_sorted()
+        .into_iter()
+        .map(|v| {
+            let mut e = vec![5u8];
+            e.extend_from_slice(&view_entry_bytes(v));
+            e
+        })
+        .collect()
+}
+
+/// Serialize a view catalog entry's BODY (after its `entry_kind = 5` byte) — format.md *View
+/// entry*: the name, the output column names, the definition (`u32` length), and the dependency
+/// list (already in name byte order, each table's columns in name byte order).
+pub(crate) fn view_entry_bytes(v: &crate::catalog::ViewDef) -> Vec<u8> {
+    let mut out = Vec::new();
+    let put_str = |out: &mut Vec<u8>, s: &str| {
+        out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+        out.extend_from_slice(s.as_bytes());
+    };
+    put_str(&mut out, &v.name);
+    out.extend_from_slice(&(v.columns.len() as u16).to_be_bytes());
+    for c in &v.columns {
+        put_str(&mut out, c);
+    }
+    out.extend_from_slice(&(v.definition.len() as u32).to_be_bytes());
+    out.extend_from_slice(v.definition.as_bytes());
+    out.extend_from_slice(&(v.deps.len() as u16).to_be_bytes());
+    for d in &v.deps {
+        out.push(match d.kind {
+            crate::catalog::ViewDepKind::Table => 0,
+            crate::catalog::ViewDepKind::View => 1,
+        });
+        put_str(&mut out, &d.name);
+        out.extend_from_slice(&(d.columns.len() as u16).to_be_bytes());
+        for c in &d.columns {
+            put_str(&mut out, c);
+        }
+    }
+    out
+}
+
+/// Decode a view catalog entry's body (inverse of `view_entry_bytes`); the caller has consumed the
+/// `entry_kind` byte. The definition is parsed (XX001 if it does not parse as a `subquery_expr`) but
+/// never planned (views.md §3).
+fn decode_view_entry(buf: &[u8], pos: &mut usize) -> Result<crate::catalog::ViewDef> {
+    use crate::catalog::{ViewDep, ViewDepKind};
+    let name = read_string(buf, pos)?;
+    let col_count = read_u16(buf, pos)?;
+    let mut columns = Vec::with_capacity(col_count as usize);
+    for _ in 0..col_count {
+        columns.push(read_string(buf, pos)?);
+    }
+    let def_len = read_u32(buf, pos)? as usize;
+    let end = pos
+        .checked_add(def_len)
+        .filter(|&e| e <= buf.len())
+        .ok_or_else(|| corrupt("truncated view definition"))?;
+    let definition = std::str::from_utf8(&buf[*pos..end])
+        .map_err(|_| corrupt("view definition is not UTF-8"))?
+        .to_string();
+    *pos = end;
+    let dep_count = read_u16(buf, pos)?;
+    let mut deps = Vec::with_capacity(dep_count as usize);
+    for _ in 0..dep_count {
+        let kind = match read_u8(buf, pos)? {
+            0 => ViewDepKind::Table,
+            1 => ViewDepKind::View,
+            _ => return Err(corrupt("unknown view dependency kind")),
+        };
+        let dep_name = read_string(buf, pos)?;
+        let n = read_u16(buf, pos)?;
+        if kind == ViewDepKind::View && n != 0 {
+            return Err(corrupt("a view dependency lists columns"));
+        }
+        let mut cols = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            cols.push(read_string(buf, pos)?);
+        }
+        deps.push(ViewDep {
+            kind,
+            name: dep_name,
+            columns: cols,
+        });
+    }
+    let body = crate::parser::parse_view_definition(&definition)
+        .map_err(|_| corrupt("a view definition does not parse"))?;
+    Ok(crate::catalog::ViewDef {
+        name,
+        columns,
+        definition,
+        deps,
+        body: Arc::new(body),
+    })
+}
+
+/// Validate the loaded views against the catalog and register them (format.md *View entry*): each
+/// dependency names an existing table / view of its kind, each listed column exists in its table,
+/// the view-dependency graph is acyclic, output names are non-empty and unique, and no dependency or
+/// column repeats. Any violation is XX001.
+fn install_views(snap: &mut Snapshot, views: Vec<crate::catalog::ViewDef>) -> Result<()> {
+    use crate::catalog::ViewDepKind;
+    let names: HashSet<String> = views.iter().map(|v| v.name.clone()).collect();
+    if names.len() != views.len() {
+        return Err(corrupt("duplicate view name"));
+    }
+    for v in &views {
+        if v.columns.is_empty() {
+            return Err(corrupt("a view has no column"));
+        }
+        for (i, c) in v.columns.iter().enumerate() {
+            if c.is_empty() || v.columns[..i].contains(c) {
+                return Err(corrupt("empty or duplicate view column name"));
+            }
+        }
+        if snap.table(&v.name).is_some() || snap.sequence(&v.name).is_some() {
+            return Err(corrupt("a view name collides with another relation"));
+        }
+        for (i, d) in v.deps.iter().enumerate() {
+            if v.deps[..i].iter().any(|e| e.name == d.name) {
+                return Err(corrupt("duplicate view dependency"));
+            }
+            match d.kind {
+                ViewDepKind::Table => {
+                    let table = snap
+                        .table(&d.name)
+                        .ok_or_else(|| corrupt("a view depends on a missing table"))?;
+                    for (k, c) in d.columns.iter().enumerate() {
+                        if d.columns[..k].contains(c) {
+                            return Err(corrupt("duplicate view dependency column"));
+                        }
+                        if !table.columns.iter().any(|col| &col.name == c) {
+                            return Err(corrupt("a view depends on a missing column"));
+                        }
+                    }
+                }
+                ViewDepKind::View => {
+                    if !names.contains(&d.name) {
+                        return Err(corrupt("a view depends on a missing view"));
+                    }
+                }
+            }
+        }
+    }
+    // Acyclicity: repeatedly settle a view whose view dependencies are all settled.
+    let mut settled: HashSet<&str> = HashSet::new();
+    while settled.len() < views.len() {
+        let before = settled.len();
+        for v in &views {
+            if settled.contains(v.name.as_str()) {
+                continue;
+            }
+            if v.deps
+                .iter()
+                .filter(|d| d.kind == ViewDepKind::View)
+                .all(|d| settled.contains(d.name.as_str()))
+            {
+                settled.insert(v.name.as_str());
+            }
+        }
+        if settled.len() == before {
+            return Err(corrupt("a cycle through view dependencies"));
+        }
+    }
+    for v in views {
+        snap.put_view(v);
+    }
+    Ok(())
 }
 
 /// Serialize a sequence catalog entry's BODY (after its `entry_kind = 2` byte): name, then the six

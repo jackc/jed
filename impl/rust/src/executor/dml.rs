@@ -207,6 +207,8 @@ impl Engine {
         // A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
         // existence gate so a read-only attachment refuses the write deterministically (§4).
         self.check_attachment_writable(db.as_deref())?;
+        // A view is not automatically updatable in this slice (views.md §2): 55000.
+        self.check_view_write(db.as_deref(), &table, "insert into")?;
         // Validate an optional database qualifier on the target (attached-databases.md §3).
         self.check_table_qualifier(db.as_deref(), &table)?;
         // ON CONFLICT into a host attachment is a deferred narrowing this slice (attached-databases.md
@@ -848,6 +850,7 @@ impl Engine {
     ) -> Result<Outcome> {
         check_catalog_rel_write(&ins.table)?;
         self.check_attachment_writable(ins.db.as_deref())?;
+        self.check_view_write(ins.db.as_deref(), &ins.table, "insert into")?;
         self.check_table_qualifier(ins.db.as_deref(), &ins.table)?;
 
         if let Some(cell) = insert_cache {
@@ -2959,6 +2962,7 @@ impl Engine {
         check_catalog_rel_write(&del.table)?;
         // A write to a READ-ONLY host attachment is 25006 before any I/O — BEFORE the existence gate (§4).
         self.check_attachment_writable(del.db.as_deref())?;
+        self.check_view_write(del.db.as_deref(), &del.table, "delete from")?;
         // Validate an optional database qualifier on the target (attached-databases.md §3).
         self.check_table_qualifier(del.db.as_deref(), &del.table)?;
         let table = self
@@ -3237,6 +3241,7 @@ impl Engine {
         check_catalog_rel_write(&upd.table)?;
         // A write to a READ-ONLY host attachment is 25006 before any I/O — BEFORE the existence gate (§4).
         self.check_attachment_writable(upd.db.as_deref())?;
+        self.check_view_write(upd.db.as_deref(), &upd.table, "update")?;
         // Validate an optional database qualifier on the target (attached-databases.md §3).
         self.check_table_qualifier(upd.db.as_deref(), &upd.table)?;
         let table = self

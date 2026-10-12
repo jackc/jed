@@ -56,11 +56,24 @@ impl Engine {
         // WHILE later ones are still being pushed, the build runs in FROM order, recording each
         // finalized relation in `finalized` (a synthetic table by INDEX, holding no borrow that would
         // block a later push); the persistent `rels`/scope is assembled from `finalized` afterwards.
-        let from_items: Vec<&TableRef> = sel
+        let written_items: Vec<&TableRef> = sel
             .from
             .iter()
             .chain(sel.joins.iter().map(|j| &j.table))
             .collect();
+        // A base name that resolves to a VIEW (after a CTE, a catalog relation, and a table —
+        // spec/design/views.md §4) is the equivalent derived table `(<definition>) AS <label>
+        // (<columns>)`, planned in the isolated view scope below.
+        let view_items: Vec<Option<(TableRef, String)>> = written_items
+            .iter()
+            .map(|t| self.view_reference(t, ctes))
+            .collect();
+        let from_items: Vec<&TableRef> = written_items
+            .iter()
+            .zip(&view_items)
+            .map(|(w, v)| v.as_ref().map_or(*w, |(tref, _)| tref))
+            .collect();
+        let isolated: Vec<bool> = view_items.iter().map(Option::is_some).collect();
         let mut synthetic: Vec<Box<Table>> = Vec::new();
         // Per FROM item: `None` = a base table; `Some((synthetic_index, srf_args, kind, jt, scope))`
         // = an SRF or a computed catalog relation (`jt` is the JSON_TABLE plan for a `JsonTable`
@@ -101,7 +114,13 @@ impl Engine {
                 // ENCLOSING query's scope (§42): the body sees no sibling FROM item, but a column of
                 // an enclosing query level correlates in the same frame as this query's own outer
                 // references (PostgreSQL). A VALUES body resolves its values the same way.
-                let plan = if lateral_eligible {
+                let plan = if let Some((_, view_name)) = &view_items[i] {
+                    let body = tref
+                        .subquery
+                        .as_deref()
+                        .expect("a view reference has a body");
+                    self.plan_view_reference(view_name, body, written_items[i], ptypes)?
+                } else if lateral_eligible {
                     let prefix =
                         build_prefix_scope(&finalized, &synthetic, &group_subs, parent, self, ctes);
                     match (&tref.subquery, &tref.values) {
@@ -234,26 +253,43 @@ impl Engine {
                 derived_plans.push(None);
                 if let Some(kind) = catalog_rel_kind(&tref.name) {
                     let scope = self.resolve_catalog_scope(tref.db.as_deref())?;
-                    synthetic.push(catalog_rel_table(kind));
+                    let mut table = catalog_rel_table(kind);
+                    apply_srf_column_aliases(
+                        &mut table,
+                        tref.alias.as_deref().unwrap_or(&tref.name),
+                        tref.column_aliases.as_deref(),
+                    )?;
+                    self.trace_catalog_item(tref)?;
+                    synthetic.push(table);
                     let si = synthetic.len() - 1;
                     srf_meta.push(Some((si, Vec::new(), kind, None, scope)));
                     src = RelSrc::Synthetic(si);
                 } else {
                     srf_meta.push(None);
+                    // A view reached through an attachment qualifier is a follow-on (views.md §10).
+                    self.reject_attached_view(tref.db.as_deref(), &tref.name)?;
                     self.check_table_qualifier(tref.db.as_deref(), &tref.name)?;
-                    src = RelSrc::Base(
-                        self.table_scoped(tref.db.as_deref(), &tref.name)
-                            .ok_or_else(|| {
-                                EngineError::new(
-                                    SqlState::UndefinedTable,
-                                    format!(
-                                        "table does not exist: {}.{}",
-                                        tref.db.as_deref().unwrap_or_default(),
-                                        tref.name
-                                    ),
-                                )
-                            })?,
-                    );
+                    let table = match self.table_scoped(tref.db.as_deref(), &tref.name) {
+                        Some(t) => t,
+                        None => {
+                            return Err(EngineError::new(
+                                SqlState::UndefinedTable,
+                                format!(
+                                    "table does not exist: {}.{}",
+                                    tref.db.as_deref().unwrap_or_default(),
+                                    tref.name
+                                ),
+                            ));
+                        }
+                    };
+                    self.trace_table_item(tref, table)?;
+                    src = match &tref.column_aliases {
+                        Some(list) => {
+                            synthetic.push(renamed_base_table(table, tref, list)?);
+                            RelSrc::BaseRenamed(synthetic.len() - 1)
+                        }
+                        None => RelSrc::Base(table),
+                    };
                 }
             } else {
                 // A base table NAME — may resolve to a CTE, which SHADOWS a catalog table of the same
@@ -280,23 +316,44 @@ impl Engine {
                         }
                         ctes[ci].refs.set(ctes[ci].refs.get() + 1);
                         srf_meta.push(None);
-                        RelSrc::Cte(&*ctes[ci].table, ci)
+                        match &tref.column_aliases {
+                            Some(list) => {
+                                synthetic.push(renamed_base_table(&ctes[ci].table, tref, list)?);
+                                RelSrc::CteRenamed(synthetic.len() - 1, ci)
+                            }
+                            None => RelSrc::Cte(&*ctes[ci].table, ci),
+                        }
                     }
                     None => match catalog_rel_kind(&tref.name) {
                         Some(kind) => {
-                            synthetic.push(catalog_rel_table(kind));
+                            let mut table = catalog_rel_table(kind);
+                            apply_srf_column_aliases(
+                                &mut table,
+                                tref.alias.as_deref().unwrap_or(&tref.name),
+                                tref.column_aliases.as_deref(),
+                            )?;
+                            self.trace_catalog_item(tref)?;
+                            synthetic.push(table);
                             let si = synthetic.len() - 1;
                             srf_meta.push(Some((si, Vec::new(), kind, None, "main".to_string())));
                             RelSrc::Synthetic(si)
                         }
                         None => {
                             srf_meta.push(None);
-                            RelSrc::Base(self.table(&tref.name).ok_or_else(|| {
+                            let table = self.table(&tref.name).ok_or_else(|| {
                                 EngineError::new(
                                     SqlState::UndefinedTable,
                                     format!("table does not exist: {}", tref.name),
                                 )
-                            })?)
+                            })?;
+                            self.trace_table_item(tref, table)?;
+                            match &tref.column_aliases {
+                                Some(list) => {
+                                    synthetic.push(renamed_base_table(table, tref, list)?);
+                                    RelSrc::BaseRenamed(synthetic.len() - 1)
+                                }
+                                None => RelSrc::Base(table),
+                            }
                         }
                     },
                 };
@@ -314,7 +371,9 @@ impl Engine {
             // table, which has no qualifier and never collides). A duplicate explicit label is 42712.
             let table: &Table = match src {
                 RelSrc::Base(t) | RelSrc::Cte(t, _) => t,
-                RelSrc::Synthetic(idx) => &synthetic[idx],
+                RelSrc::Synthetic(idx) | RelSrc::BaseRenamed(idx) | RelSrc::CteRenamed(idx, _) => {
+                    &synthetic[idx]
+                }
             };
             let label = tref
                 .alias
@@ -365,10 +424,8 @@ impl Engine {
                 table: fr.table(&synthetic),
                 offset: fr.offset,
                 qualifier_only: false,
-                cte: match fr.src {
-                    RelSrc::Cte(_, ci) => Some(ci),
-                    _ => None,
-                },
+                base: fr.src.is_base(),
+                cte: fr.src.cte(),
                 db: fr.db.clone(),
             })
             .collect();
@@ -501,6 +558,9 @@ impl Engine {
                             ),
                         )
                     })?;
+                    if right_rel.base {
+                        self.trace_column(&right_rel.table.name, rl);
+                    }
                     let ri = right_rel.offset + rl;
                     let (lq, rq) = (format!("\0l{n}"), format!("\0r{n}"));
                     pair_tables.push((one_column_table(&lq, left.column_at(li).clone()), li));
@@ -554,6 +614,7 @@ impl Engine {
                             table: t,
                             offset: *off,
                             qualifier_only: false,
+                            base: false,
                             cte: None,
                             db: None,
                         })
@@ -960,7 +1021,7 @@ impl Engine {
             let target = if let Some(ord) = key.ordinal {
                 // An ordinal indexes the select list by 1-based position; out of `[1, ncols]` is 42P10.
                 let ncols = match items_ref {
-                    SelectItems::All => scope.width() as i64,
+                    SelectItems::All(_) => scope.width() as i64,
                     SelectItems::Items(its) => its.len() as i64,
                 };
                 if ord < 1 || ord > ncols {
@@ -971,7 +1032,7 @@ impl Engine {
                 }
                 let pos = (ord - 1) as usize;
                 match items_ref {
-                    SelectItems::All => Target::Slot(Resolved::Local(pos)),
+                    SelectItems::All(_) => Target::Slot(Resolved::Local(pos)),
                     SelectItems::Items(its) => match &its[pos].expr {
                         Expr::Column(name) => Target::Slot(scope.resolve_bare(name)?),
                         Expr::QualifiedColumn { qualifier, name } => {
@@ -1402,7 +1463,7 @@ impl Engine {
         // fold_uncorrelated_in_plan is NOT a planner rewrite — it executes subqueries and needs
         // bound params, so it stays post-bind in run_query_expr.
         rewrite_where(&mut plan);
-        self.replan_pushed_bodies(&mut plan, &from_items, parent, ctes, ptypes)?;
+        self.replan_pushed_bodies(&mut plan, &from_items, &isolated, parent, ctes, ptypes)?;
         //
         // ——— Stage 3: physical/access-path selection (spec/design/planner.md §4) ———
         self.optimize_select(&mut plan, &scope);
@@ -1417,6 +1478,7 @@ impl Engine {
         &'a self,
         plan: &mut SelectPlan,
         from_items: &[&TableRef],
+        isolated: &[bool],
         parent: Option<&Scope<'a>>,
         ctes: &'a [&'a CteBinding],
         ptypes: &mut ParamTypes,
@@ -1433,7 +1495,14 @@ impl Engine {
                 .take()
                 .expect("a body-pushed relation has a planned body");
             let refs: Vec<usize> = ctes.iter().map(|b| b.refs.get()).collect();
-            let body = self.replan_pushed_query(body_expr, *first, &pushed, parent, ctes, ptypes);
+            // A view body is planned again in its isolated scope (views.md §4.1).
+            let body = if isolated[i] {
+                self.in_view_body(|| {
+                    self.replan_pushed_query(body_expr, *first, &pushed, None, &[], ptypes)
+                })
+            } else {
+                self.replan_pushed_query(body_expr, *first, &pushed, parent, ctes, ptypes)
+            };
             for (b, r) in ctes.iter().zip(refs) {
                 b.refs.set(r);
             }

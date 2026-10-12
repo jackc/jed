@@ -1416,6 +1416,114 @@ fn sequence_table_db() -> Session {
     db
 }
 
+/// view_table (v38): three `entry_kind = 5` view entries after the table entry, in name order
+/// (`n`, `v`, `w`) — the frozen `*` expansion, a column-list rename with a view dependency, and a
+/// table dependency with zero columns. Must match the Ruby reference's VIEW_TABLE
+/// (spec/fileformat/verify.rb), spec/design/views.md §3.
+fn view_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(&mut db, "CREATE TABLE t (a i32 PRIMARY KEY, b text)");
+    run(&mut db, "INSERT INTO t VALUES (1, 'x'), (2, 'y')");
+    run(&mut db, "CREATE VIEW v AS SELECT * FROM t WHERE a > 0");
+    run(&mut db, "CREATE VIEW w (x) AS SELECT a FROM v");
+    run(&mut db, "CREATE VIEW n AS SELECT count(*) AS c FROM t");
+    db
+}
+
+fn query_rows(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
+    match db
+        .query_outcome(sql, &[])
+        .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
+    {
+        jed::Outcome::Query { rows, .. } => rows,
+        other => panic!("expected rows from {sql:?}, got {other:?}"),
+    }
+}
+
+/// Loading `view_table.jed` restores the three views: their stored text and columns, and reading
+/// each one (spec/design/views.md §3/§4).
+#[test]
+fn view_golden_reads_back() {
+    let mut db = Database::from_image(&fixture("view_table.jed"))
+        .unwrap_or_else(|e| panic!("load view_table.jed: {}", e.message))
+        .session(SessionOptions::default());
+    let text = |s: &str| Value::Text(s.to_string());
+    assert_eq!(
+        query_rows(
+            &mut db,
+            "SELECT name, definition FROM jed_views ORDER BY name"
+        ),
+        vec![
+            vec![text("n"), text("select count ( * ) as c from t")],
+            vec![
+                text("v"),
+                text("select \"t\" . \"a\" , \"t\" . \"b\" from t where a > 0")
+            ],
+            vec![text("w"), text("select a from v")],
+        ]
+    );
+    assert_eq!(
+        query_rows(&mut db, "SELECT x FROM w ORDER BY x"),
+        vec![vec![Value::Int(1)], vec![Value::Int(2)]]
+    );
+    assert_eq!(
+        query_rows(&mut db, "SELECT c FROM n"),
+        vec![vec![Value::Int(2)]]
+    );
+}
+
+/// A stored view definition that no longer parses is corruption (`XX001`) at open — the body is
+/// parsed (never planned) when the catalog loads (spec/design/views.md §3).
+#[test]
+fn view_corrupt_definition_is_rejected() {
+    let mut image = fixture("view_table.jed");
+    // Turn the `select` of view w's definition into `selecT` would still lex; replace the `a` in
+    // `select a from v` with `(` so the definition no longer parses, keeping its length.
+    let pattern = b"select a from v";
+    let at = image
+        .windows(pattern.len())
+        .position(|bytes| bytes == pattern)
+        .expect("locate view w's definition");
+    image[at + 7] = b'(';
+    let page_start = at / GOLDEN_PAGE_SIZE as usize * GOLDEN_PAGE_SIZE as usize;
+    refresh_test_page_crc(&mut image, page_start);
+    let error = match Database::from_image(&image) {
+        Ok(_) => panic!("an unparseable view definition must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "XX001");
+}
+
+/// A dependency on a missing table is corruption (`XX001`): the loader checks every dependency
+/// names an existing relation of its kind (format.md *View entry*).
+#[test]
+fn view_dangling_dependency_is_rejected() {
+    let mut image = fixture("view_table.jed");
+    // View n's dependency entry: kind 0, name "t" (u16 1), zero columns. Rename the dependency to
+    // "u" (no such table).
+    let pattern = [0u8, 0, 1, b't', 0, 0];
+    let ends = b"select count ( * ) as c from t";
+    let def_at = image
+        .windows(ends.len())
+        .position(|bytes| bytes == ends)
+        .expect("locate view n's definition");
+    let dep_at = def_at + ends.len() + 2; // after the u16 dep_count
+    assert_eq!(&image[dep_at..dep_at + pattern.len()], &pattern);
+    image[dep_at + 3] = b'u';
+    let page_start = dep_at / GOLDEN_PAGE_SIZE as usize * GOLDEN_PAGE_SIZE as usize;
+    refresh_test_page_crc(&mut image, page_start);
+    let error = match Database::from_image(&image) {
+        Ok(_) => panic!("a dangling view dependency must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "XX001");
+}
+
 /// serial_table (v13): the OWNED-sequence link (the has_owner flag bit + the owner table-name/
 /// column-ordinal tail). The serial column id desugars to an i32 column that is NOT NULL (via the
 /// PK) with an expression DEFAULT nextval('t_id_seq'), and an OWNED sequence t_id_seq created
@@ -1584,6 +1692,7 @@ fn write_matches_goldens() {
         ("sequence_table.jed", sequence_table_db),
         ("serial_table.jed", serial_table_db),
         ("identity_table.jed", identity_table_db),
+        ("view_table.jed", view_table_db),
         ("array_table.jed", array_table_db),
         ("range_table.jed", range_table_db),
         ("range_pk_table.jed", range_pk_table_db),
@@ -1698,6 +1807,7 @@ fn read_goldens_reproduces_rows() {
         ("jsonb_table.jed", jsonb_table_db, "t"),
         ("serial_table.jed", serial_table_db, "t"),
         ("identity_table.jed", identity_table_db, "t"),
+        ("view_table.jed", view_table_db, "t"),
         ("tall_tree.jed", tall_tree_db, "t"),
         ("max_sep_table.jed", max_sep_table_db, "m"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),

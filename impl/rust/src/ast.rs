@@ -17,6 +17,10 @@ pub enum Statement {
     CreateSequence(CreateSequence),
     AlterSequence(AlterSequence),
     DropSequence(DropSequence),
+    /// `CREATE VIEW` (spec/design/views.md §1).
+    CreateView(CreateView),
+    /// `DROP VIEW` (spec/design/views.md §1).
+    DropView(DropView),
     Insert(Insert),
     Select(Select),
     /// A set operation (`UNION`/`INTERSECT`/`EXCEPT`) combining two query expressions
@@ -415,6 +419,29 @@ pub struct DropSequence {
     pub if_exists: bool,
 }
 
+/// `CREATE VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr` (spec/design/views.md §1,
+/// grammar.md §54). `body` is the canonical token text of the body (format.md *Check-expression
+/// text*) — the definition before `*` freezing; the executor parses it again on its own, so every
+/// token position the planner trace records is relative to the stored text.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CreateView {
+    pub name: String,
+    pub db: Option<String>,
+    pub if_not_exists: bool,
+    pub columns: Option<Vec<String>>,
+    pub body: String,
+}
+
+/// `DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]` (spec/design/views.md §1). Each name may
+/// carry a database qualifier. `cascade` only changes the error a dependent view raises (`0A000`
+/// instead of `2BP01`, §6).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DropView {
+    pub names: Vec<(Option<String>, String)>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
 /// `ALTER SEQUENCE [IF EXISTS] <name> <action>` (spec/design/sequences.md §4/§15). A missing
 /// sequence without `IF EXISTS` is 42P01. The two action forms are in `AlterSeqAction`.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -721,7 +748,47 @@ pub struct TableRef {
     /// unused. Implicitly lateral (its `ctx` may reference earlier FROM siblings).
     pub json_table: Option<Box<JsonTable>>,
     pub lateral: bool,
+    /// The token positions of a base-table reference (views.md §7): where a stored view body's
+    /// rename rewrites edit this FROM item. Meaningful only when parsing a view definition; ignored
+    /// (and invisible to AST equality) everywhere else.
+    pub pos: TableRefPos,
 }
+
+/// The token positions a base-table FROM item occupies in its statement's token stream (views.md
+/// §5/§7): the table-name token, the alias identifier token (when aliased), and the `(` / `)` of
+/// its column alias list (when present). Recorded by the parser for every base-table reference; the
+/// view rewrites use them to edit a stored definition token by token. Never part of AST equality —
+/// two references that differ only in position compare equal, so structural expression matching
+/// (GROUP BY keys, index expressions) is unaffected.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct TableRefPos {
+    pub name: usize,
+    pub alias: Option<usize>,
+    pub list: Option<(usize, usize)>,
+}
+
+impl PartialEq for TableRefPos {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for TableRefPos {}
+
+/// The token position of a written `*` / `rel.*` select item (views.md §5): the `*` token for a
+/// bare star, the qualifier token for `rel . *` (a three-token span). `None` for a star the parser
+/// synthesized (an unparenthesized join group's `SELECT *`) — never frozen. Invisible to AST
+/// equality, like [`TableRefPos`].
+#[derive(Clone, Copy, Default, Debug)]
+pub struct StarPos(pub Option<usize>);
+
+impl PartialEq for StarPos {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for StarPos {}
 
 /// A `JSON_TABLE(ctx, path [AS name] COLUMNS (col, …))` table source (json-table.md §3, T1). The
 /// root `path` is evaluated over `ctx` to a sequence of row items; the `COLUMNS` tree projects each
@@ -966,7 +1033,8 @@ pub struct WithQuery {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum SelectItems {
-    All,
+    /// `*` — every column; the position of the written `*` (views.md §5).
+    All(StarPos),
     /// Projected expressions, one per output column.
     Items(Vec<SelectItem>),
 }
@@ -1072,6 +1140,8 @@ pub enum Expr {
     /// produces this only for the bare `identifier "." "*"` shape.
     QualifiedStar {
         qualifier: String,
+        /// The qualifier token's position (views.md §5); invisible to equality.
+        pos: StarPos,
     },
     /// Array subscript `base[..][..]` (spec/design/array.md §6) — one or more bracketed specs
     /// applied to an array `base`. Each spec is an index `[i]` or a slice `[m:n]` (with optionally-

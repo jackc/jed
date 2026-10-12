@@ -43,6 +43,8 @@ impl Engine {
             estimator_touched: HashSet::new(),
             commit_changes: CommitChanges::default(),
             explain_actual: std::cell::RefCell::new(None),
+            view_trace: std::cell::RefCell::new(None),
+            view_depth: std::cell::Cell::new(0),
         }
     }
 
@@ -74,6 +76,8 @@ impl Engine {
             estimator_touched: HashSet::new(),
             commit_changes: CommitChanges::default(),
             explain_actual: std::cell::RefCell::new(None),
+            view_trace: std::cell::RefCell::new(None),
+            view_depth: std::cell::Cell::new(0),
         }
     }
 

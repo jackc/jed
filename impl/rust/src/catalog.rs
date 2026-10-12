@@ -366,6 +366,41 @@ pub struct SequenceDef {
     pub owned_by: Option<SeqOwner>,
 }
 
+/// A view (spec/design/views.md §3): a named, persisted query, the fifth database-level catalog
+/// object. It has no storage of its own. The definition is the canonical token text of its body
+/// after `*` freezing and `RENAME` rewrites; reading the view plans it again as the equivalent
+/// derived table (§4). Output types are never stored — planning derives them.
+#[derive(Clone, Debug)]
+pub struct ViewDef {
+    /// The exact view name (grammar.md §3).
+    pub name: String,
+    /// The output column names, in order (the column list applied over the body's names).
+    pub columns: Vec<String>,
+    /// The stored canonical definition (format.md *Check-expression text*).
+    pub definition: String,
+    /// The tables and views the body reads, in ascending name byte order (§6).
+    pub deps: Vec<ViewDep>,
+    /// The parsed definition — parsed at create and at load, never persisted. Shared, so a
+    /// snapshot clone stays cheap.
+    pub body: std::sync::Arc<crate::ast::QueryExpr>,
+}
+
+/// What a view dependency names (format.md *View entry* `dep_kind`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+pub enum ViewDepKind {
+    Table,
+    View,
+}
+
+/// One persisted view dependency (spec/design/views.md §6): a table with the exact set of its
+/// columns the body references (ascending byte order), or a view (no columns).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ViewDep {
+    pub kind: ViewDepKind,
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
 /// The `OWNED BY` reference of a `serial`-created sequence (spec/design/sequences.md §12): the
 /// owning table (original case) and the owning column's 0-based ordinal. Persisted on the sequence
 /// catalog entry (format.md *Sequence entry*, v13).

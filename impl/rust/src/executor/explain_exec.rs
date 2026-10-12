@@ -257,7 +257,7 @@ impl Engine {
     fn explain_lane(&self, inner: &Statement) -> String {
         // Public Query checks write classification before either lazy lane. Sequence-mutating SELECTs
         // and top-level WITH statements containing DML therefore use the buffered write dispatcher.
-        if stmt_is_write(inner) {
+        if self.stmt_is_write_with_views(inner) {
             return "buffered".to_string();
         }
         if matches!(inner, Statement::With(_) | Statement::SetOp(_)) {

@@ -84,7 +84,9 @@ fn syntax_errors_are_reported() {
         "42601"
     );
     // DROP INDEX is its own statement now (spec/design/indexes.md §2): a missing index is
-    // 42704, not a syntax error; DROP of any other object kind is still unparsed.
+    // 42704, not a syntax error; so is DROP VIEW (a missing view is 42P01, views.md §1). DROP of
+    // any other object kind is still unparsed.
     assert_eq!(run(&mut db, "DROP INDEX x").unwrap_err().code(), "42704");
-    assert_eq!(run(&mut db, "DROP VIEW v").unwrap_err().code(), "42601");
+    assert_eq!(run(&mut db, "DROP VIEW v").unwrap_err().code(), "42P01");
+    assert_eq!(run(&mut db, "DROP FUNCTION f").unwrap_err().code(), "42601");
 }

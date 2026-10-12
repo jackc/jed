@@ -831,6 +831,30 @@ impl Engine {
         Ok(out)
     }
 
+    /// Generate the rows of the `jed_views` catalog relation (introspection.md §5.4): one row per
+    /// view of the scope's snapshot, in ascending name byte order — the stored definition text and
+    /// the output column names. Cost mirrors jed_tables_rows.
+    pub(crate) fn jed_views_rows(&self, srf: &SrfPlan, meter: &mut Meter) -> Result<Vec<Row>> {
+        let Some(snap) = self.snap_for_scope(&srf.introspect_scope) else {
+            return Err(EngineError::new(
+                SqlState::UndefinedTable,
+                format!("database \"{}\" is not attached", srf.introspect_scope),
+            ));
+        };
+        let mut out: Vec<Row> = Vec::new();
+        for v in snap.views_sorted() {
+            meter.guard()?;
+            meter.charge(COSTS.generated_row);
+            let cols: Vec<Value> = v.columns.iter().map(|c| Value::Text(c.clone())).collect();
+            out.push(vec![
+                Value::Text(v.name.clone()),
+                Value::Text(v.definition.clone()),
+                Value::Array(ArrayVal::one_dim(cols)),
+            ]);
+        }
+        Ok(out)
+    }
+
     /// Generate the rows of the `jed_sequences` catalog relation (introspection.md §5.3): one row per
     /// sequence of the scope's snapshot, in ascending name byte order. The definition fields
     /// render as stored; `last_value` is NULL until the sequence has been read (`!is_called` — PG's

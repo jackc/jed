@@ -209,6 +209,7 @@ impl Engine {
             table,
             offset: rel.offset,
             qualifier_only: false,
+            base: false,
             cte: None,
             db: rel.db.clone(),
         })
@@ -398,6 +399,9 @@ impl Engine {
                     .composite_types_sorted()
                     .len()
                     .min(MAX_ESTIMATE as usize) as i64;
+            }
+            SrfKind::JedViews => {
+                return snap.views_sorted().len().min(MAX_ESTIMATE as usize) as i64;
             }
             SrfKind::JedTypeFields => {
                 return snap
@@ -1253,6 +1257,7 @@ impl Engine {
             table,
             offset: 0,
             qualifier_only: false,
+            base: false,
             cte: None,
             db: db.map(str::to_owned),
         };

@@ -383,9 +383,11 @@ other query. The built-in surface stays pure.
   ([temp-tables.md](temp-tables.md) §3) a temp table cannot later shadow a name a view reads.
 - **Attached databases.** `CREATE VIEW reports.v`, a body naming `reports.t`, and a reference to a
   view through an attachment qualifier (`FROM reports.v`) are all `0A000` in this slice. A file
-  containing views can still be attached. Its views are unreachable through the attachment, but its
-  dependencies are still enforced: `DROP TABLE reports.t` is `2BP01` if a view in `reports` depends
-  on `t`. `main.`-qualified names work everywhere and are stored as written.
+  containing views can still be attached. Its views are unreachable through the attachment, but they
+  are kept intact: because rewriting and re-validating a view (§7/§8) plans its body in its own
+  database, any `ALTER TABLE reports.t …` is `0A000` while a view in `reports` depends on `t` (a
+  follow-on). (`DROP TABLE` takes no database qualifier, so it cannot reach an attachment's table.)
+  `main.`-qualified names work everywhere and are stored as written.
 
 ## 11. Introspection and the dump
 
@@ -435,7 +437,8 @@ Deferred follow-ons, none foreclosed:
 - `WITH [CASCADED | LOCAL] CHECK OPTION` and `WITH (options)` (`0A000`);
 - updatable views and `INSTEAD OF` behavior;
 - `CREATE MATERIALIZED VIEW` and `CREATE RECURSIVE VIEW` (`0A000`);
-- temporary views and views in or over attached databases (`0A000`);
+- temporary views and views in or over attached databases (`0A000`), including `ALTER TABLE` of an
+  attached table that one of its database's views depends on;
 - `DROP … CASCADE` that drops dependent views (`0A000`);
 - dependency tracking for sequences, composite types, collations, and host functions;
 - view columns in `jed_columns`;

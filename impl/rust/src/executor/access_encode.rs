@@ -1817,6 +1817,7 @@ impl Engine {
                 table,
                 offset: 0,
                 qualifier_only: false,
+                base: false,
                 cte: None,
                 db: db.map(str::to_owned),
             };
@@ -5542,7 +5543,7 @@ pub(crate) fn percentile_input_f64(v: &Value) -> Result<f64> {
 /// Whether any select item contains an aggregate call — i.e. this is an aggregate query.
 pub(crate) fn items_have_aggregate(items: &SelectItems) -> bool {
     match items {
-        SelectItems::All => false,
+        SelectItems::All(_) => false,
         SelectItems::Items(items) => items.iter().any(|it| expr_has_aggregate(&it.expr)),
     }
 }
@@ -5660,7 +5661,7 @@ pub(crate) fn expr_has_aggregate(e: &Expr) -> bool {
 /// window query resolves its projection in `AggCtx::Window` mode (spec/design/window.md §5.1).
 pub(crate) fn items_have_window(items: &SelectItems) -> bool {
     match items {
-        SelectItems::All => false,
+        SelectItems::All(_) => false,
         SelectItems::Items(items) => items.iter().any(|it| expr_has_window(&it.expr)),
     }
 }
@@ -6692,6 +6693,7 @@ mod candidate_inventory_tests {
             table: &table,
             offset: 0,
             qualifier_only: false,
+            base: false,
             cte: None,
             db: None,
         };

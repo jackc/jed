@@ -1,3 +1,5 @@
+# skip: disk — temp tables and transactions spanning records cannot survive the disk-mode per-record
+# reopen (spec/design/conformance.md §3); views persist and reload in the other views files' disk pass.
 # Views — the jed-specific behavior of spec/design/views.md that PostgreSQL cannot oracle-check:
 # the IF NOT EXISTS extension, the jed_ reservation, 55000 on writes to views PostgreSQL would
 # update, 0A000 for the deferred forms, temp scope, untracked dependencies, CASCADE to a view,

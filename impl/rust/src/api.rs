@@ -499,7 +499,7 @@ impl Engine {
         if !matches!(
             ast,
             Statement::Begin { .. } | Statement::Commit | Statement::Rollback
-        ) && !crate::executor::stmt_is_write(ast)
+        ) && !self.stmt_is_write_with_views(ast)
         {
             if let Err(e) = self.gate_read_lanes(ast) {
                 return Err(self.poison_on_lane_err(e));

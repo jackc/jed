@@ -863,7 +863,7 @@ impl Engine {
         let Statement::Select(sel) = ast else {
             return Ok(None);
         };
-        if stmt_is_write(ast) {
+        if self.stmt_is_write_with_views(ast) {
             return Ok(None);
         }
         let from_committed = {
@@ -1197,7 +1197,7 @@ impl Engine {
     ) -> Result<Option<Rows>> {
         // A write-classified statement (a data-modifying WITH, a sequence mutator) must take the write
         // gate and never streams (streaming.md §7 / sequences.md §4).
-        if stmt_is_write(ast) {
+        if self.stmt_is_write_with_views(ast) {
             return Ok(None);
         }
         let query = match ast {
@@ -2094,6 +2094,7 @@ impl Engine {
                 SrfKind::JedSequences => self.jed_sequences_rows(srf, meter),
                 SrfKind::JedTypes => self.jed_types_rows(srf, meter),
                 SrfKind::JedTypeFields => self.jed_type_fields_rows(srf, meter),
+                SrfKind::JedViews => self.jed_views_rows(srf, meter),
             }?;
             for row in &rows {
                 meter.admit_row_masked(row, mask)?;

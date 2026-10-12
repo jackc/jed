@@ -224,6 +224,41 @@ impl Snapshot {
         std::sync::Arc::make_mut(&mut self.sequences).remove(key);
     }
 
+    /// Look up a view by exact name (spec/design/views.md).
+    pub fn view(&self, name: &str) -> Option<&ViewDef> {
+        self.views.get(name)
+    }
+
+    /// Register (or replace, for a rewrite) a view. A schema change: bumps the catalog generation,
+    /// which also marks the main domain changed for commit.
+    pub(crate) fn put_view(&mut self, view: ViewDef) {
+        self.bump_cat_gen();
+        std::sync::Arc::make_mut(&mut self.views).insert(view.name.clone(), view);
+    }
+
+    /// Remove a view (DROP VIEW). The caller has checked it exists and has no dependent.
+    pub(crate) fn remove_view(&mut self, key: &str) {
+        self.bump_cat_gen();
+        std::sync::Arc::make_mut(&mut self.views).remove(key);
+    }
+
+    /// Every view in ascending name byte order (no map-iteration leak, CLAUDE.md §8): the catalog
+    /// emission order and the `jed_views` generation order.
+    pub(crate) fn views_sorted(&self) -> Vec<&ViewDef> {
+        let mut keys: Vec<&String> = self.views.keys().collect();
+        keys.sort();
+        keys.into_iter().map(|k| &self.views[k]).collect()
+    }
+
+    /// The views that depend on the table or view `name` of the given kind, in name byte order
+    /// (spec/design/views.md §6).
+    pub(crate) fn views_depending_on(&self, kind: ViewDepKind, name: &str) -> Vec<&ViewDef> {
+        self.views_sorted()
+            .into_iter()
+            .filter(|v| v.deps.iter().any(|d| d.kind == kind && d.name == name))
+            .collect()
+    }
+
     /// Resolve a collation name for USE — query resolution and key encoding (spec/design/collation.md
     /// §2/§9). The collations the database has resolved (a cache populated on open from the file's
     /// reference entries, carrying their version pin) first, then the engine-global **loaded** set

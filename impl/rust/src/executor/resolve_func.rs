@@ -968,7 +968,7 @@ pub(crate) fn resolve_projections(
     params: &mut ParamTypes,
 ) -> Result<(Vec<RExpr>, Vec<String>, Vec<ResolvedType>, Vec<Deriv>)> {
     match items {
-        SelectItems::All => {
+        SelectItems::All(star_pos) => {
             // `*` with nothing to expand — a FROM-less SELECT — is PostgreSQL's exact error
             // (grammar.md §34). Qualifier-only rels don't count: they are RETURNING's old/new
             // pseudo-relations, and that scope always also carries the real relation.
@@ -991,6 +991,17 @@ pub(crate) fn resolve_projections(
                     names.push(c.name.clone());
                     types.push(resolved_type_of_col(&c.ty, scope.catalog));
                     derivs.push(cat_column_deriv(c));
+                    scope.trace_flat(idx);
+                }
+                // A written `*` in a view body is frozen into its expansion (views.md §5).
+                if let Some(pos) = star_pos.0 {
+                    if scope.catalog.view_tracing() {
+                        let cols = star
+                            .iter()
+                            .map(|&idx| (scope.star_label(idx), scope.column_at(idx).name.clone()))
+                            .collect();
+                        scope.catalog.trace_star(pos, false, cols);
+                    }
                 }
                 return Ok((nodes, names, types, derivs));
             }
@@ -1020,7 +1031,7 @@ pub(crate) fn resolve_projections(
                 // column, in catalog order (grammar.md §15) — like bare `*` but for one named
                 // relation and mixable with other items. Resolved against the LOCAL scope only
                 // (like bare `*`); an unknown label is 42P01, exactly as a qualified column ref.
-                if let Expr::QualifiedStar { qualifier } = &it.expr {
+                if let Expr::QualifiedStar { qualifier, pos } = &it.expr {
                     let want = qualifier.to_string();
                     let (table, slots): (&Table, Vec<usize>) =
                         match scope.rels.iter().find(|r| r.label == want) {
@@ -1046,6 +1057,19 @@ pub(crate) fn resolve_projections(
                         names.push(c.name.clone());
                         types.push(resolved_type_of_col(&c.ty, scope.catalog));
                         derivs.push(cat_column_deriv(c));
+                        scope.trace_flat(slots[i]);
+                    }
+                    // A written `rel.*` in a view body is frozen into `"rel" . "col"` references
+                    // (views.md §5).
+                    if let Some(pos) = pos.0 {
+                        if scope.catalog.view_tracing() {
+                            let cols = table
+                                .columns
+                                .iter()
+                                .map(|c| (Some(want.clone()), c.name.clone()))
+                                .collect();
+                            scope.catalog.trace_star(pos, true, cols);
+                        }
                     }
                     continue;
                 }
@@ -2427,6 +2451,8 @@ pub(crate) fn stmt_is_write(stmt: &Statement) -> bool {
             | Statement::CreateSequence(_)
             | Statement::AlterSequence(_)
             | Statement::DropSequence(_)
+            | Statement::CreateView(_)
+            | Statement::DropView(_)
             | Statement::Insert(_)
             | Statement::Update(_)
             | Statement::Delete(_)
@@ -2486,7 +2512,7 @@ pub(crate) fn setop_calls_seq_mutator(so: &SetOp) -> bool {
 
 pub(crate) fn select_calls_seq_mutator(s: &Select) -> bool {
     let item_calls = match &s.items {
-        SelectItems::All => false,
+        SelectItems::All(_) => false,
         SelectItems::Items(items) => items.iter().any(|i| expr_calls_seq_mutator(&i.expr)),
     };
     item_calls
@@ -2638,7 +2664,9 @@ pub(crate) fn collect_stmt_privs(stmt: &Statement, req: &mut PrivReq) {
         | Statement::CreateSequence(_)
         | Statement::DropSequence(_)
         | Statement::AlterSequence(_)
-        | Statement::AlterTable(_) => req.is_ddl = true,
+        | Statement::AlterTable(_)
+        | Statement::CreateView(_)
+        | Statement::DropView(_) => req.is_ddl = true,
         Statement::Insert(ins) => collect_insert_privs(ins, req, &locals),
         Statement::Select(sel) => collect_select_privs(sel, req, &locals),
         Statement::SetOp(so) => collect_setop_privs(so, req, &locals),
@@ -3009,6 +3037,8 @@ pub(crate) fn stmt_kind(stmt: &Statement) -> &'static str {
         Statement::CreateSequence(_) => "CREATE SEQUENCE",
         Statement::AlterSequence(_) => "ALTER SEQUENCE",
         Statement::DropSequence(_) => "DROP SEQUENCE",
+        Statement::CreateView(_) => "CREATE VIEW",
+        Statement::DropView(_) => "DROP VIEW",
         Statement::Insert(_) => "INSERT",
         Statement::Update(_) => "UPDATE",
         Statement::Delete(_) => "DELETE",
@@ -3423,6 +3453,14 @@ pub(crate) fn resolve(
             "t.* is only allowed in a select list",
         )),
         Expr::Param(n1) => {
+            // A view body has no parameters (views.md §1.1/§4.1): 42P02 where the planner meets
+            // it, so earlier resolution errors keep PostgreSQL's order.
+            if scope.catalog.view_tracing() {
+                return Err(EngineError::new(
+                    SqlState::UndefinedParameter,
+                    format!("there is no parameter ${n1}"),
+                ));
+            }
             // A bind parameter is an adaptable operand (like an integer/string literal): it
             // takes its type from `ctx` — the sibling operand, target column, or CAST target.
             // Record the inferred type (None = no context here; `finalize` 42P18s a parameter

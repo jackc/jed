@@ -8,13 +8,13 @@ use crate::ast::{
     AlterColumnAction, AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence,
     AlterTable, AlterTableAction, AlterTableEdit, Analyze, Assignment, BinaryOp, CheckDef,
     ColumnDef, ConflictAction, ConflictTarget, CreateIndex, CreateSequence, CreateTable,
-    CreateType, Cte, CteBody, DefaultDef, Delete, DropIndex, DropSequence, DropTable, DropType,
-    ExcludeDef, Expr, ForeignKeyDef, GroupItem, IdentitySpec, IndexKeyElem, IndexPredicate, Insert,
-    InsertSource, InsertValue, JoinClause, JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable,
-    JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction,
-    ReturningClause, Select, SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, Statement,
-    SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WindowDef,
-    WithExpr, WithQuery,
+    CreateType, CreateView, Cte, CteBody, DefaultDef, Delete, DropIndex, DropSequence, DropTable,
+    DropType, DropView, ExcludeDef, Expr, ForeignKeyDef, GroupItem, IdentitySpec, IndexKeyElem,
+    IndexPredicate, Insert, InsertSource, InsertValue, JoinClause, JoinKind, JsonOnBehavior,
+    JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding,
+    QueryExpr, RefAction, ReturningClause, Select, SelectItem, SelectItems, SeqOptions, SetOp,
+    SetOpKind, StarPos, Statement, SubscriptSpec, TableRef, TableRefPos, TypeFieldDef, TypeMod,
+    UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::decimal::Decimal;
@@ -123,6 +123,16 @@ impl Parser {
             Some("create") if self.peek_keyword_at(1).as_deref() == Some("sequence") => {
                 Ok(Statement::CreateSequence(self.parse_create_sequence()?))
             }
+            // CREATE VIEW (views.md §1, grammar.md §54) — VIEW is recognized positionally, so
+            // `CREATE TABLE view (…)` still names a table. The deferred forms are recognized by their
+            // keyword sequence and refused with 0A000 before the body is parsed (§12).
+            Some("create") if self.at_deferred_create_view() => Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "this form of CREATE VIEW is not supported",
+            )),
+            Some("create") if self.peek_keyword_at(1).as_deref() == Some("view") => {
+                Ok(Statement::CreateView(self.parse_create_view()?))
+            }
             Some("create") => Ok(Statement::CreateTable(self.parse_create_table()?)),
             Some("drop") if self.peek_keyword_at(1).as_deref() == Some("index") => {
                 Ok(Statement::DropIndex(self.parse_drop_index()?))
@@ -133,6 +143,9 @@ impl Parser {
             Some("drop") if self.peek_keyword_at(1).as_deref() == Some("sequence") => {
                 Ok(Statement::DropSequence(self.parse_drop_sequence()?))
             }
+            Some("drop") if self.peek_keyword_at(1).as_deref() == Some("view") => {
+                Ok(Statement::DropView(self.parse_drop_view()?))
+            }
             Some("drop") => Ok(Statement::DropTable(self.parse_drop_table()?)),
             // ALTER SEQUENCE — the only ALTER statement this slice (sequences.md §4). A 2-token
             // lookahead recognizes it; any other `ALTER …` (TABLE, SYSTEM, …) is not a statement
@@ -141,6 +154,10 @@ impl Parser {
             Some("alter") if self.peek_keyword_at(1).as_deref() == Some("sequence") => {
                 Ok(Statement::AlterSequence(self.parse_alter_sequence()?))
             }
+            // ALTER VIEW is a deferred follow-on (views.md §12).
+            Some("alter") if self.peek_keyword_at(1).as_deref() == Some("view") => Err(
+                EngineError::new(SqlState::FeatureNotSupported, "ALTER VIEW is not supported"),
+            ),
             Some("alter") if self.peek_keyword_at(1).as_deref() == Some("table") => {
                 Ok(Statement::AlterTable(self.parse_alter_table()?))
             }
@@ -158,6 +175,146 @@ impl Parser {
             Some(other) => Err(syntax(format!("unexpected keyword '{other}'"))),
             None => Err(syntax("expected a SQL statement")),
         }
+    }
+
+    /// Whether the statement is one of the deferred `CREATE … VIEW` forms (views.md §12): `CREATE
+    /// OR REPLACE VIEW`, `CREATE TEMP | TEMPORARY VIEW`, `CREATE RECURSIVE VIEW`, `CREATE
+    /// MATERIALIZED VIEW`. Recognized by keyword sequence so each fails 0A000, not 42601.
+    fn at_deferred_create_view(&self) -> bool {
+        let kw = |i: usize| self.peek_keyword_at(i);
+        match kw(1).as_deref() {
+            Some("or") => kw(2).as_deref() == Some("replace") && kw(3).as_deref() == Some("view"),
+            Some("temp") | Some("temporary") | Some("recursive") | Some("materialized") => {
+                kw(2).as_deref() == Some("view")
+            }
+            _ => false,
+        }
+    }
+
+    /// `CREATE VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr` (views.md §1, grammar.md
+    /// §54). The body runs from the token after `AS` to the end of the statement and is captured as
+    /// its canonical token text. A `WITH ( … )` option list after the name and a trailing `WITH
+    /// [CASCADED | LOCAL] CHECK OPTION` are deferred forms (0A000); the check option is detected
+    /// after the body is parsed, so a body syntax error is reported first.
+    fn parse_create_view(&mut self) -> Result<CreateView> {
+        self.expect_keyword("create")?;
+        self.expect_keyword("view")?;
+        // A two-token lookahead keeps a lone `if` an ordinary view name (`CREATE VIEW if AS …`).
+        let if_not_exists = if self.peek_keyword().as_deref() == Some("if")
+            && self.peek_keyword_at(1).as_deref() == Some("not")
+        {
+            self.parse_if_not_exists()?
+        } else {
+            false
+        };
+        let (db, name) = self.parse_qualified_table_name()?;
+        if self.peek_keyword().as_deref() == Some("with")
+            && matches!(self.peek_at(1), Token::LParen)
+        {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "view options (WITH ( … )) are not supported",
+            ));
+        }
+        let columns = if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let mut cols = vec![self.expect_identifier()?];
+            while matches!(self.peek(), Token::Comma) {
+                self.advance();
+                cols.push(self.expect_identifier()?);
+            }
+            self.expect(&Token::RParen)?;
+            Some(cols)
+        } else {
+            None
+        };
+        self.expect_keyword("as")?;
+        // A trailing `WITH [CASCADED | LOCAL] CHECK OPTION` is cut off before the body is parsed
+        // (an unreserved `with` would otherwise be read as a table alias) and refused after it.
+        let check_option = self.trailing_check_option();
+        if let Some(at) = check_option {
+            self.tokens[at] = Token::Eof;
+        }
+        let start = self.pos;
+        self.parse_subquery()?;
+        let end = self.pos;
+        if let Some(at) = check_option {
+            if end != at {
+                return Err(syntax(format!(
+                    "unexpected trailing input: {:?}",
+                    self.peek()
+                )));
+            }
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "WITH CHECK OPTION is not supported",
+            ));
+        }
+        let body = render_tokens(&self.tokens[start..end]);
+        Ok(CreateView {
+            name,
+            db,
+            if_not_exists,
+            columns,
+            body,
+        })
+    }
+
+    /// The index of a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` at the end of the token stream
+    /// (views.md §12), if the statement ends with one.
+    fn trailing_check_option(&self) -> Option<usize> {
+        let mut end = self.tokens.len();
+        if matches!(self.tokens.last(), Some(Token::Eof)) {
+            end -= 1;
+        }
+        let word = |i: usize, w: &str| matches!(self.tokens.get(i), Some(Token::Word(x)) if x == w);
+        if end < self.pos + 3 || !word(end - 1, "option") || !word(end - 2, "check") {
+            return None;
+        }
+        if word(end - 3, "with") {
+            return Some(end - 3);
+        }
+        if end >= self.pos + 4
+            && (word(end - 3, "cascaded") || word(end - 3, "local"))
+            && word(end - 4, "with")
+        {
+            return Some(end - 4);
+        }
+        None
+    }
+
+    /// `DROP VIEW [IF EXISTS] [db.]name [, …] [CASCADE | RESTRICT]` (views.md §1). `IF EXISTS` is a
+    /// two-token lookahead, so `DROP VIEW if` drops a view named `if`.
+    fn parse_drop_view(&mut self) -> Result<DropView> {
+        self.expect_keyword("drop")?;
+        self.expect_keyword("view")?;
+        let if_exists = self.peek_keyword().as_deref() == Some("if")
+            && self.peek_keyword_at(1).as_deref() == Some("exists");
+        if if_exists {
+            self.advance(); // IF
+            self.advance(); // EXISTS
+        }
+        let mut names = vec![self.parse_qualified_table_name()?];
+        while matches!(self.peek(), Token::Comma) {
+            self.advance();
+            names.push(self.parse_qualified_table_name()?);
+        }
+        let cascade = match self.peek_keyword().as_deref() {
+            Some("cascade") => {
+                self.advance();
+                true
+            }
+            Some("restrict") => {
+                self.advance();
+                false
+            }
+            _ => false,
+        };
+        Ok(DropView {
+            names,
+            if_exists,
+            cascade,
+        })
     }
 
     /// Parse `ANALYZE qualified_table [(identifier [, identifier ...])]`.
@@ -2830,7 +2987,7 @@ impl Parser {
         self.undeepen();
         Ok(QueryExpr::Select(Box::new(Select {
             distinct: false,
-            items: SelectItems::All,
+            items: SelectItems::All(StarPos(None)),
             from: Some(from),
             joins,
             filter: None,
@@ -2880,6 +3037,7 @@ impl Parser {
         {
             return self.parse_json_table();
         }
+        let mut name_pos = self.pos;
         let mut name = self.expect_identifier()?;
         // An optional DATABASE qualifier `db "." table` (attached-databases.md §3): a `.` after the
         // first identifier makes it the database qualifier and the next identifier the table name. A
@@ -2888,6 +3046,7 @@ impl Parser {
         // `parse_column_ref`'s one-`.`-lookahead, the only dotted-name precedent.
         let db = if matches!(self.peek(), Token::Dot) {
             self.advance(); // .
+            name_pos = self.pos;
             let table = self.expect_identifier()?;
             let qualifier = name;
             name = table;
@@ -2914,36 +3073,46 @@ impl Parser {
         } else {
             None
         };
+        let mut alias_pos = None;
         let alias = if self.peek_keyword().as_deref() == Some("as") {
             self.advance();
+            alias_pos = Some(self.pos);
             Some(self.expect_identifier()?)
         } else {
             match self.peek() {
                 Token::QuotedIdent(w) => {
                     let alias = w.clone();
+                    alias_pos = Some(self.pos);
                     self.advance();
                     Some(alias)
                 }
                 Token::Word(w) if !is_table_ref_stop_keyword(w) => {
                     let alias = w.clone();
+                    alias_pos = Some(self.pos);
                     self.advance();
                     Some(alias)
                 }
                 _ => None,
             }
         };
-        // A `(` after a table-function alias is either the rename-only column-alias list
-        // `AS g(c1, …)` (grammar.md §35) or the typed column-definition list `AS g(c type, …)`
-        // used by record-returning functions (C0, json-table.md §1). A base table's corresponding
-        // list remains a deferred 0A000 narrowing.
+        // A `(` after an alias is a column alias list. On a base table (or view) it is the
+        // rename-only list `AS x(p, q)` (grammar.md §15). On a table function it is either the
+        // rename-only list `AS g(c1, …)` (§35) or the typed column-definition list
+        // `AS g(c type, …)` used by record-returning functions (C0, json-table.md §1).
+        let mut list_pos = None;
         let (column_aliases, column_defs) =
-            if alias.is_some() && matches!(self.peek(), Token::LParen) {
-                if args.is_none() {
-                    return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        "column alias list on a base table is not supported yet",
-                    ));
+            if alias.is_some() && matches!(self.peek(), Token::LParen) && args.is_none() {
+                let open = self.pos;
+                self.advance(); // (
+                let mut aliases = vec![self.expect_identifier()?];
+                while matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    aliases.push(self.expect_identifier()?);
                 }
+                list_pos = Some((open, self.pos));
+                self.expect(&Token::RParen)?;
+                (Some(aliases), None)
+            } else if alias.is_some() && matches!(self.peek(), Token::LParen) {
                 self.advance(); // (
                 // Disambiguate: a col-def list has `name type`; a rename list has `name ,`/`name )`.
                 // After the opening `(`, the current token is the first column name, so a `Word` in the
@@ -2975,6 +3144,11 @@ impl Parser {
             json_table: None,
             // An SRF is implicitly lateral; `lateral` records only whether the keyword was written.
             lateral,
+            pos: TableRefPos {
+                name: name_pos,
+                alias: alias_pos,
+                list: list_pos,
+            },
         })
     }
 
@@ -3067,6 +3241,7 @@ impl Parser {
             json_table: None,
             // The caller (`parse_table_ref`) sets `lateral` from a leading `LATERAL` keyword.
             lateral: false,
+            pos: TableRefPos::default(),
         })
     }
 
@@ -3135,6 +3310,7 @@ impl Parser {
                 columns,
             })),
             lateral: false,
+            pos: TableRefPos::default(),
         })
     }
 
@@ -3738,8 +3914,9 @@ impl Parser {
 
     fn parse_select_items(&mut self) -> Result<SelectItems> {
         if matches!(self.peek(), Token::Star) {
+            let pos = self.pos;
             self.advance();
-            return Ok(SelectItems::All);
+            return Ok(SelectItems::All(StarPos(Some(pos))));
         }
         let mut items = Vec::new();
         loop {
@@ -3752,11 +3929,15 @@ impl Parser {
                 && matches!(self.peek_at(1), Token::Dot)
                 && matches!(self.peek_at(2), Token::Star)
             {
+                let pos = self.pos;
                 let qualifier = self.expect_identifier()?;
                 self.advance(); // .
                 self.advance(); // *
                 items.push(SelectItem {
-                    expr: Expr::QualifiedStar { qualifier },
+                    expr: Expr::QualifiedStar {
+                        qualifier,
+                        pos: StarPos(Some(pos)),
+                    },
                     alias: None,
                 });
                 if matches!(self.peek(), Token::Comma) {
@@ -5235,6 +5416,17 @@ pub fn parse_expression(text: &str) -> Result<Expr> {
     let expr = p.parse_expr()?;
     p.expect_eof()?;
     Ok(expr)
+}
+
+/// Parse a stored view definition (spec/design/views.md §3): the canonical body text as a
+/// `subquery_expr`. Every token position the AST records (`TableRefPos`, `StarPos`) is an index
+/// into `lex(text)`, which is what the rename rewrites and `*` freezing edit.
+pub fn parse_view_definition(text: &str) -> Result<QueryExpr> {
+    let tokens = lex(text)?;
+    let mut p = Parser::new(tokens);
+    let body = p.parse_subquery()?;
+    p.expect_eof()?;
+    Ok(body)
 }
 
 /// Re-render a token slice as the persisted check-expression text: each token rendered by

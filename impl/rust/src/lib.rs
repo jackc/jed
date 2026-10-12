@@ -129,7 +129,7 @@ pub use value::Value;
 pub mod tooling {
     // The CLI renders query results + dumps schema using these internal types (returned by
     // `Database::table` / `Session::table`).
-    pub use crate::catalog::{CompositeType, IndexKey, IndexKeyExpr, Table};
+    pub use crate::catalog::{CompositeType, IndexKey, IndexKeyExpr, Table, ViewDef};
     /// Query-memory accounting underflows (spec/design/memory.md) — the conformance harness's check.
     pub use crate::cost::{QUERY_MEMORY_PEAK, QUERY_MEMORY_UNDERFLOWS};
     /// Recount every file commit's live pages by reachability (spec/design/memory.md §8.7).
@@ -1021,6 +1021,17 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "introspect.type_fields",
     // Stable lock-bundle protocol for safe shared multi-process main files and file attachments.
     "file.shared_process",
+    // Base-table column alias lists `FROM t AS x (p, q)` (grammar.md §15, views V3): a pure
+    // resolution-time relabeling of the columns a FROM item exposes.
+    "query.table_column_alias",
+    // Read-only views (spec/design/views.md, V1): CREATE / DROP VIEW, reading a view as the
+    // equivalent derived table, `*` freezing, dependencies, re-validation, and privileges.
+    "ddl.view",
+    // The jed_views catalog relation (introspection.md §5.4).
+    "introspect.views",
+    // View text rewrites for ALTER TABLE RENAME TO / RENAME COLUMN / DROP COLUMN (views.md §7,
+    // V2 + V4).
+    "ddl.view_rename",
 ];
 
 /// Parse and execute one SQL statement against a low-level [`Engine`] (no bind parameters).

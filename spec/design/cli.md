@@ -57,7 +57,7 @@ jed [OPTIONS] [DBFILE]
   -c SQL                  execute the statements, then exit (repeatable) — script mode
   -f FILE                 execute a SQL file, then exit (repeatable; '-' = stdin) — script mode
   --import-csv TABLE=FILE import an RFC 4180 CSV into TABLE (repeatable) — script mode
-  --dump                  write the database as SQL (schema + rows + indexes), then exit
+  --dump                  write the database as SQL (schema, rows, indexes, views), then exit
   --format FORMAT         script-mode output format:
                           aligned (default) | box | markdown | csv | json
   -o FILE                 script mode: write results to FILE instead of stdout
@@ -142,7 +142,10 @@ table-level `PRIMARY KEY` in key order; named `CHECK`s from their persisted text
 `INSERT` per row in primary-key order (a no-PK table dumps in storage order, which replays
 into the same rowids), then `CREATE [UNIQUE] INDEX` statements (after the rows, so a
 replay builds each index once — a UNIQUE *constraint* dumps as its backing unique index,
-which recreates the same state). The script is wrapped in one `BEGIN`/`COMMIT` so a
+which recreates the same state). After every table, each view follows as `CREATE VIEW name
+(columns) AS definition;` — its stored canonical text, in dependency order (a view after every view
+it reads; ties in name byte order — [views.md](views.md) §11). The script is wrapped in one
+`BEGIN`/`COMMIT` so a
 file-backed replay commits durably once. Round-trip contract: dump → replay into a fresh
 database → dump is **byte-identical**. `--dump` requires a DBFILE, excludes `-c`/`-f`/
 `--import-csv`, and composes with `--readonly` (the natural pairing) and `-o`.

@@ -346,8 +346,8 @@ Kept deliberately narrow, and each consistent with an existing jed deferral:
   attachment is DDL). A persisted definition inside that DDL may not name a *different* database (§7).
 - **No views in or over attachments (v1).** `CREATE VIEW reports.v`, a view body naming
   `reports.t`, and reading a view through an attachment qualifier are `0A000`. An attached file that
-  already contains views keeps enforcing their dependencies (`DROP TABLE reports.t` is `2BP01` when a
-  view in `reports` reads `t`) ([views.md](views.md) §10).
+  already contains views keeps them intact: `ALTER TABLE reports.t …` is `0A000` while a view in
+  `reports` reads `t` ([views.md](views.md) §10).
 - **Detach-while-referenced.** `db.detach(name)` fails (`55006`-style *object_in_use*, §11) while any
   live transaction/cursor pins a snapshot of that attachment — the watermark (§5) already tracks this.
 
