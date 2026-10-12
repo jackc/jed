@@ -145,12 +145,13 @@ statement ok
 UPDATE t SET x = x WHERE 1 = 1 AND x = 77
 
 # A touching closed range is satisfiable: the scan runs and the one matching row is updated or
-# deleted. 1 page + 4 rows + the AND (3 nodes, 2 where its left `x >= …` is FALSE).
-# cost: 15
+# deleted. 1 page + 4 rows + the WHERE's AND (3 nodes, 2 where its left `x >= …` is not TRUE —
+# a filter's top-level AND also stops at NULL).
+# cost: 14
 statement ok
 UPDATE t SET s = 'e' WHERE x >= 5 AND x <= 5
 
-# cost: 17
+# cost: 16
 statement ok
 DELETE FROM t WHERE x >= 0 AND x <= 0
 

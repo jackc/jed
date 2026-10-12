@@ -201,7 +201,7 @@ NULL
 NULL
 
 # ON and WHERE conjuncts on the same relation form one pushed filter (ON first, source order).
-# cost: 36
+# cost: 35
 query II nosort
 SELECT a.id, b.id FROM a JOIN b ON a.k = b.k AND b.w > 0 WHERE b.w < 7 AND a.v > 0 ORDER BY a.id, b.id
 ----

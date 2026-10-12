@@ -31,8 +31,8 @@ SELECT id FROM t WHERE x = 1 AND x = 2
 ----
 
 # A touching closed range is satisfiable: the scan runs (1 page + 4 rows + the AND: 3 nodes, 2 where
-# `x >= 5` is FALSE = 10) and produces one row.
-# cost: 16
+# `x >= 5` is not TRUE = 9) and produces one row.
+# cost: 15
 query I nosort
 SELECT id FROM t WHERE x >= 5 AND x <= 5
 ----
@@ -167,7 +167,7 @@ SELECT id FROM t WHERE (x > 5 AND x < 3) OR x = 1
 ----
 1
 
-# cost: 19
+# cost: 17
 query I nosort
 SELECT id FROM t WHERE x + 0 > 5 AND x + 0 < 3
 ----

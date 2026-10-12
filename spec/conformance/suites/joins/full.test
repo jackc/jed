@@ -132,11 +132,11 @@ orphan
 # fails it is simply unmatched — but FULL keeps unmatched rows from BOTH sides, so failing the
 # predicate moves a row from "matched pair" to "preserved on both sides". `a.k = 10` in ON leaves
 # only a(1)/b(10) matched; every other a row is left-preserved and every other b row is
-# right-preserved, so the cardinality GROWS to 7. 2 page + 8 materialize + 42 ON (AND + a.k=b.k on
-# all 16 pairs; a.k=10 only on the 10 pairs where a.k=b.k is not FALSE — 3 TRUE, 7 NULL) + 7
-# produced = 59.
+# right-preserved, so the cardinality GROWS to 7. 2 page + 8 materialize + 35 ON (AND + a.k=b.k on
+# all 16 pairs; a.k=10 only on the 3 pairs where a.k=b.k is TRUE — the ON's top-level AND stops at
+# FALSE and at NULL) + 7 produced = 52.
 # names: id, id
-# cost: 59
+# cost: 52
 query II nosort
 SELECT a.id, b.id FROM a FULL JOIN b ON a.k = b.k AND a.k = 10 ORDER BY a.id, b.id
 ----

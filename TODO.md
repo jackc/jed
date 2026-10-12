@@ -51,13 +51,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ LIKE `ESCAPE 'c'`; `SIMILAR TO` (deliberately excluded — the SQL-standard surface); set-returning `regexp_matches` / `regexp_split_to_table`; the Oracle-compat `regexp_count`/`instr`/`substr`/`like`; Unicode-property char classes (`\p{…}`).
 - [x] **Left-to-right short-circuit `AND` / `OR`** — a FALSE left operand decides `AND` and a TRUE
   one decides `OR`; the right operand is then neither evaluated nor charged, so the guard idiom
-  `d <> 0 AND 10 / d > 1` no longer traps `22012` (PostgreSQL returns the guarded rows). The node
-  still charges its `operator_eval`; estimates count every node (an upper bound), so plans are
-  unchanged. A fixed order is a stronger promise than PostgreSQL's unspecified one. →
+  `d <> 0 AND 10 / d > 1` no longer traps `22012` (PostgreSQL returns the guarded rows). In a filter
+  (`WHERE`, `ON`, `HAVING`, a partial index's `WHERE`, `ON CONFLICT … WHERE`) the top-level `AND`
+  chain also stops at a NULL conjunct — PostgreSQL's qual-list rule — while value contexts (select
+  list, `CASE`, `CHECK`, aggregate `FILTER`) continue past NULL, as in PostgreSQL. The node still
+  charges its `operator_eval`; estimates count every node (an upper bound), so plans are unchanged.
+  A fixed order is a stronger promise than PostgreSQL's unspecified one. →
   [cost.md §3](spec/design/cost.md), `expr/short_circuit.test`
-  - [ ] _follow-on:_ PostgreSQL also stops a top-level WHERE/ON qual list at a NULL conjunct and
-    cost-sorts its conjuncts, so `WHERE g > 0 AND 10 / d > 1` with a NULL `g` (or a guard written
-    second) can succeed there and trap here. Matching that would make evaluation context-dependent.
+  - [ ] _follow-on:_ PostgreSQL cost-sorts a filter's conjuncts, so a guard written *second*
+    (`WHERE 10 / d > 1 AND d <> 0`) can succeed there and traps here; jed keeps source order.
 - [x] **Scalar functions `abs` / `round`** — first named per-row functions. → [functions.md §9](spec/design/functions.md)
   - [ ] _follow-on:_ a general implicit argument-coercion pass. (`ceil`/`floor`/`mod`/`sign` and text `length`/`lower`/`upper` have since landed in their own slices.)
 - [x] **Scalar string / text functions** — PG's string surface as built-ins with code-point semantics (`length`/`substr`/`lpad`/`btrim`/`replace`/`translate`/`repeat`/`strpos`/`split_part`/`encode`/`decode`/`quote_*`/…). → [string-functions.md](spec/design/string-functions.md)

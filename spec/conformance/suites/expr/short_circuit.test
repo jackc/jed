@@ -1,15 +1,18 @@
 # AND / OR evaluate left to right with short-circuit (spec/design/cost.md §3): a FALSE left operand
 # decides AND, a TRUE one decides OR, and the right operand is then never evaluated — it charges
-# nothing and cannot trap. A NULL left operand decides neither, so the right operand runs. The
-# guard idiom `d <> 0 AND 10 / d > 1` therefore never divides by zero.
+# nothing and cannot trap. The guard idiom `d <> 0 AND 10 / d > 1` therefore never divides by zero.
+# A NULL left operand decides neither as a value, so in a value context (the select list, CASE,
+# CHECK, an aggregate FILTER, an AND under OR/NOT) the right operand runs. In a filter context (WHERE,
+# ON, HAVING, a partial index's WHERE, ON CONFLICT … WHERE) the top-level AND chain also stops at a
+# NULL conjunct, since the predicate can no longer be TRUE.
 #
-# PostgreSQL leaves the operand order unspecified: its planner sorts a WHERE's top-level conjuncts
-# by estimated cost (stable), and its executor stops a qual list at the first FALSE *or NULL*
-# conjunct. Every query here puts the guard first and makes it the cheaper conjunct, so PostgreSQL's
-# order is the source order too; the NULL-left case runs in the select list, where PostgreSQL's
-# boolean AND/OR, like jed's, continues past a NULL. Verified against PostgreSQL 18.
+# Both rules are PostgreSQL's executor: a filter is an implicit-AND qual list that stops at the first
+# FALSE or NULL qual, and a boolean AND/OR value continues past a NULL. PostgreSQL's planner also
+# sorts a filter's conjuncts by estimated cost (stable); every query here puts the guard first and
+# makes it the cheaper conjunct, so PostgreSQL's order is the source order too. Verified against
+# PostgreSQL 18.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.check, dml.insert, dml.insert_multi_row, dml.delete, query.select, query.where_eq, query.comparison_order, query.order_by, query.logical_connectives, query.join_inner, query.table_alias, query.qualified_column, query.where_pushdown, expr.arithmetic, expr.in_list, expr.between, expr.comparison_value, error.division_by_zero, types.i32, null.three_valued, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.check, dml.insert, dml.insert_multi_row, dml.delete, query.select, query.where_eq, query.comparison_order, query.order_by, query.logical_connectives, query.join_inner, query.table_alias, query.qualified_column, query.where_pushdown, query.join_left, query.group_by, query.having, query.aggregates, query.aggregate_filter, query.subquery_scalar, dml.update, dml.insert_on_conflict, ddl.index_partial, expr.case, expr.arithmetic, expr.in_list, expr.between, expr.comparison_value, error.division_by_zero, types.i32, null.three_valued, resource.cost_metering
 
 statement ok
 CREATE TABLE z (id i32 PRIMARY KEY, d i32, g i32)
@@ -17,10 +20,10 @@ CREATE TABLE z (id i32 PRIMARY KEY, d i32, g i32)
 statement ok
 INSERT INTO z VALUES (1, 0, NULL), (2, 5, 1), (3, 20, 0), (4, NULL, 1)
 
-# The guard idiom: `d <> 0` is FALSE on row 1, so `10 / d` never runs there. Row 4's NULL guard
-# continues, and `10 / NULL` is NULL. 1 page + 4 rows + 4 `and` + 4 `<>` + the 2-node right operand
-# on rows 2-4 (6) + 1 produced = 20.
-# cost: 20
+# The guard idiom: `d <> 0` is FALSE on row 1, so `10 / d` never runs there; row 4's guard is NULL,
+# which also stops a WHERE's top-level AND. 1 page + 4 rows + 4 `and` + 4 `<>` + the 2-node right
+# operand on rows 2-3 (4) + 1 produced = 18.
+# cost: 18
 query I nosort
 SELECT id FROM z WHERE d <> 0 AND 10 / d > 1 ORDER BY id
 ----
@@ -59,22 +62,95 @@ SELECT id, g > 0 AND 10 / d > 1 FROM z ORDER BY id
 statement error 22012
 SELECT id, g = 0 OR 10 / d > 1 FROM z ORDER BY id
 
+# A NULL guard stops a filter: row 1's `g > 0` is NULL, so the WHERE never divides by its d = 0.
+query I nosort
+SELECT id FROM z WHERE g > 0 AND 10 / d > 1 ORDER BY id
+----
+2
+
+# Only the TOP-LEVEL chain of a filter stops at NULL: under OR the AND is a value again, and traps.
+statement error 22012
+SELECT id FROM z WHERE (g > 0 AND 10 / d > 1) OR id = 9
+
+# HAVING is a filter.
+query I nosort
+SELECT id FROM z GROUP BY id, g, d HAVING g > 0 AND 10 / d > 1 ORDER BY id
+----
+2
+
+# So is a LEFT JOIN's ON: b(1)'s NULL `b.g > 0` rejects the pair (a(1) is NULL-extended) without
+# dividing by its d = 0.
+query II nosort
+SELECT a.id, b.id FROM z a LEFT JOIN z b ON a.id = b.id AND b.g > 0 AND 10 / b.d > 1 ORDER BY a.id
+----
+1
+NULL
+2
+2
+3
+NULL
+4
+NULL
+
+# And a WHERE inside a subquery, and an UPDATE's WHERE.
+query I nosort
+SELECT (SELECT count(*) FROM z WHERE g > 0 AND 10 / d > 1)
+----
+1
+
+statement ok
+UPDATE z SET d = d WHERE g > 0 AND 10 / d > 1
+
+# An aggregate's FILTER (WHERE …), a CASE condition, and a CHECK constraint are values, as in
+# PostgreSQL: the NULL `g > 0` does not stop the AND.
+statement error 22012
+SELECT count(*) FILTER (WHERE g > 0 AND 10 / d > 1) FROM z
+
+statement error 22012
+SELECT CASE WHEN g > 0 AND 10 / d > 1 THEN 1 END FROM z
+
+statement ok
+CREATE TABLE ck2 (id i32 PRIMARY KEY, g i32, d i32, CHECK (g > 0 AND 10 / d > 1))
+
+statement error 22012
+INSERT INTO ck2 VALUES (1, NULL, 0)
+
+# A partial index's WHERE is a filter: building it, and maintaining it, skip the division.
+statement ok
+CREATE INDEX z_p ON z (id) WHERE g > 0 AND 10 / d > 1
+
+statement ok
+INSERT INTO z VALUES (5, 0, NULL)
+
+# ON CONFLICT … DO UPDATE … WHERE is a filter: row 1's NULL `z.g > 0` skips the update.
+statement ok
+INSERT INTO z VALUES (1, 0, NULL) ON CONFLICT (id) DO UPDATE SET d = 9 WHERE z.g > 0 AND 10 / z.d > 1
+
+query II nosort
+SELECT id, d FROM z WHERE id IN (1, 5) ORDER BY id
+----
+1
+0
+5
+0
+
 # A chain `a AND b AND c` stops at its first FALSE conjunct: `d IS NOT NULL` keeps the rest off
-# row 4 and `d <> 0` keeps `100 / d` off row 1. Every `and` node still charges (both sit on the
-# left spine): 1 + 4 + 2 x 4 `and` + 4 `IS NOT NULL` + 3 `<>` + 2 x 2 for `100 / d > 10` + 1 = 25.
-# cost: 25
+# row 4 and `d <> 0` keeps `100 / d` off rows 1 and 5. Every `and` node still charges (both sit on
+# the left spine): 1 + 5 + 2 x 5 `and` + 5 `IS NOT NULL` + 4 `<>` + 2 x 2 for `100 / d > 10` + 1 = 30.
+# cost: 30
 query I nosort
 SELECT id FROM z WHERE d IS NOT NULL AND d <> 0 AND 100 / d > 10 ORDER BY id
 ----
 2
 
 # IN (list) is a left-to-right OR chain, so it stops at the first matching element: row 1 matches
-# `0 = d` and never computes `10 / d`.
+# `0 = d` and never computes `10 / d` (nor does row 5).
 query I nosort
 SELECT id FROM z WHERE 0 IN (d, 10 / d) ORDER BY id
 ----
 1
 3
+5
 
 # BETWEEN is an AND of its two bounds, so a FALSE lower bound skips the upper one (row 1: 0 >= 1).
 query I nosort
@@ -109,3 +185,4 @@ SELECT id FROM z ORDER BY id
 1
 2
 4
+5

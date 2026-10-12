@@ -22,7 +22,8 @@ DROP INDEX name
 
 The optional **`WHERE predicate`** makes the index **partial** (§9): only rows for which the
 predicate evaluates to **TRUE** are indexed (and, for a `UNIQUE` partial index, only those rows
-are constrained). A partial index is **B-tree only** this slice; a `WHERE` clause on a
+are constrained). The predicate is a filter context ([cost.md](cost.md) §3): its top-level `AND`
+chain stops at the first conjunct that is not TRUE. A partial index is **B-tree only** this slice; a `WHERE` clause on a
 `USING gin` / `USING gist` index is `0A000`.
 
 Each **key element** is one of three forms, matching PostgreSQL's `index_elem` (oracle-probed):

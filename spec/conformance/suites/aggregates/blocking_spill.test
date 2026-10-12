@@ -23,7 +23,7 @@ SELECT DISTINCT id FROM spill_left ORDER BY id LIMIT 1
 ----
 1
 
-# cost: 517
+# cost: 484
 query III nosort
 SELECT l.id, r.id, r.v FROM spill_left l JOIN spill_right r ON l.k = r.k AND r.v > l.id ORDER BY l.id, r.id LIMIT 14 OFFSET 2
 ----

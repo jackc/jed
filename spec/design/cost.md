@@ -141,6 +141,23 @@ hard-fenced inputs retain their staged policies ([estimator.md §9–§10](estim
   cost-ordering may evaluate the cheaper guard first and succeed; write the guard first (or use
   `CASE`). An **uncorrelated** subquery operand is still folded once at plan setup (§"Subqueries"
   below) whether or not a row reaches it, exactly as inside a `CASE` arm.
+- **A filter's top-level `AND` chain also stops at NULL.** A **filter context** is a predicate whose
+  value is used only to keep a row when it is TRUE: a `WHERE` (of a `SELECT`, `UPDATE`, or `DELETE`,
+  at any nesting depth, and a view's `WHERE` read or written through — views.md §15), a join's `ON`,
+  `HAVING`, a partial index's `WHERE` ([indexes.md](indexes.md) §9), and `ON CONFLICT … DO UPDATE …
+  WHERE`. There, the predicate's **top-level `AND` chain** — the `and` nodes reached from its root
+  through `and` nodes only — evaluates its conjuncts in source order and stops at the first one that
+  is **not TRUE**, FALSE *or NULL*: the predicate can no longer be TRUE, so the row is rejected
+  without evaluating or charging the rest. Each top-level `and` node reached charges its
+  `operator_eval` on entry as usual (the whole left spine of a left-deep chain, before its first
+  conjunct). Every other node — a conjunct itself, and an `AND` under an `OR`, `NOT`, `CASE`, or
+  function — evaluates with the value semantics above. This is PostgreSQL's executor: a `WHERE`,
+  `ON`, `HAVING`, or partial-index predicate becomes an implicit-AND qual list whose evaluation stops
+  at the first FALSE or NULL qual. The **value contexts** keep the value rule, as in PostgreSQL: the
+  select list, `RETURNING`, assignments, `CASE` conditions, aggregate and window `FILTER (WHERE …)`
+  (evaluated as a value, then tested), and `CHECK` constraints, where NULL passes and so the exact
+  value matters. So `WHERE g > 0 AND 10 / d > 1` never divides on a row whose `g` is NULL, while the
+  same expression in the select list does.
 - **`CASE` and `COALESCE` short-circuit too.** A `CASE`
   ([grammar.md](grammar.md) §23) charges its own `operator_eval` for the node, then evaluates
   its `WHEN` conditions **in source order, stopping at the first one that is TRUE** — a FALSE

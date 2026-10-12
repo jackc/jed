@@ -249,7 +249,9 @@ parenthesization, integer arithmetic, the `boolean` type, and the `AND`/`OR`/`NO
 connectives — landed together as the `expr` tower above (`AND`/`OR` are Kleene three-valued and
 evaluate **left to right with short-circuit**: a FALSE left operand decides `AND` and a TRUE one
 decides `OR` without evaluating the right operand, so `d <> 0 AND 10 / d > 1` never divides by
-zero — [cost.md](cost.md) §3, a stronger promise than PostgreSQL's unspecified operand order); [../../TODO.md](../../TODO.md)
+zero; in a `WHERE`/`ON`/`HAVING` the top-level `AND` chain also stops at a NULL conjunct, as
+PostgreSQL's qual list does — [cost.md](cost.md) §3, a stronger promise than PostgreSQL's
+unspecified operand order); [../../TODO.md](../../TODO.md)
 is the roadmap of what comes next (richer `ORDER BY`, more predicate forms, and onward).
 Because the parser is hand-written rather than
 generated, "conform to the grammar" is verified by cross-reading each production against

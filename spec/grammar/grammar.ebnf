@@ -937,8 +937,9 @@ expr           ::= or_expr
 
 /* OR / AND are left-associative, Kleene three-valued, and evaluated LEFT TO RIGHT with
  * short-circuit: a TRUE left operand decides OR and a FALSE one decides AND, and the right
- * operand is then not evaluated (so it cannot trap) — ../design/cost.md §3. PostgreSQL leaves
- * the operand order unspecified; jed's fixed order is a stronger promise. */
+ * operand is then not evaluated (so it cannot trap). In a filter (WHERE, ON, HAVING, a partial
+ * index's WHERE) the top-level AND chain also stops at a NULL conjunct — ../design/cost.md §3.
+ * PostgreSQL leaves the operand order unspecified; jed's fixed order is a stronger promise. */
 or_expr        ::= and_expr ("OR" and_expr)*
 
 and_expr       ::= not_expr ("AND" not_expr)*

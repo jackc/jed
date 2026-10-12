@@ -1106,7 +1106,7 @@ description = "The not-equal operator `<>` (and its `!=` alias) — the 3VL nega
 
 [[capability]]
 id = "query.logical_connectives"
-description = "AND / OR / NOT with three-valued (Kleene) truth tables; AND / OR evaluate left to right and skip the right operand once the left decides (FALSE for AND, TRUE for OR)"
+description = "AND / OR / NOT with three-valued (Kleene) truth tables; AND / OR evaluate left to right and skip the right operand once the left decides (FALSE for AND, TRUE for OR); a filter's (WHERE / ON / HAVING) top-level AND chain also stops at NULL"
 
 # Predicate forms (Phase 2, spec/design/grammar.md §20-§23). IN/BETWEEN are sugar over the
 # existing =/OR/AND/NOT machinery; LIKE is a text operator; CASE is a primary-level form.

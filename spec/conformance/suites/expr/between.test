@@ -14,9 +14,9 @@ statement ok
 INSERT INTO t VALUES (1, 5), (2, 15), (3, 25), (4, NULL)
 
 # Range test: only a=15 falls in [10,20]; a=NULL is UNKNOWN (dropped). Cost: 1 page + 4 scanned, the
-# desugared `And(Ge(a,10), Le(a,20))` is 3 interior nodes per scanned row except a=5, where the FALSE
-# `a >= 10` decides the AND (2) = 11, plus 1 produced = 17.
-# cost: 17
+# desugared `And(Ge(a,10), Le(a,20))` is 3 interior nodes per scanned row except a=5 and a=NULL,
+# where `a >= 10` is not TRUE and stops the WHERE's AND (2) = 10, plus 1 produced = 16.
+# cost: 16
 query I nosort
 SELECT id FROM t WHERE a BETWEEN 10 AND 20 ORDER BY id
 ----
@@ -61,9 +61,9 @@ SELECT id FROM t WHERE a NOT BETWEEN 20 AND 10 ORDER BY id
 
 # Expression bounds: both endpoints are general expressions, evaluated per row. `a BETWEEN id AND
 # id + 20` keeps id 1 (5 in [1,21]) and id 2 (15 in [2,22]); id 3 (25 > 23) and the NULL row drop.
-# `And(Ge(a,id), Le(a, id+20))` is 4 interior nodes per row (the `id + 20` Add included). 4 scanned
-# + 16 + 2 produced + 1 page = 23.
-# cost: 23
+# `And(Ge(a,id), Le(a, id+20))` is 4 interior nodes per row (the `id + 20` Add included), 2 on the
+# NULL row, whose NULL `a >= id` stops the WHERE's AND. 4 scanned + 14 + 2 produced + 1 page = 21.
+# cost: 21
 query I nosort
 SELECT id FROM t WHERE a BETWEEN id AND id + 20 ORDER BY id
 ----
