@@ -13,8 +13,8 @@ pub(crate) use crate::ast::{
     DropView, Expr, FkTarget, GroupItem, IndexKeyElem, Insert, InsertSource, InsertValue, JoinKind,
     JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict,
     OrderKey, Overriding, QueryExpr, RefAction, ReturningClause, Select, SelectItems, SeqOptions,
-    SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TableRefPos, TypeFieldDef, TypeMod,
-    UnaryOp, Update, WindowDef, WithExpr, WithQuery,
+    SetOp, SetOpKind, SrcPos, Statement, SubscriptSpec, TableRef, TableRefPos, TypeFieldDef,
+    TypeMod, UnaryOp, Update, WindowDef, WithExpr, WithQuery,
 };
 pub(crate) use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -57,6 +57,7 @@ mod index_dependencies;
 pub(crate) use index_dependencies::*;
 mod dml;
 mod error_detail;
+mod error_hint;
 pub(crate) use dml::CachedInsert;
 pub(crate) use error_detail::{DUPLICATED, EXISTS};
 mod blocking_spill;
@@ -2217,6 +2218,110 @@ impl<'a> Scope<'a> {
         }
     }
 
+    /// [`resolve_bare`](Scope::resolve_bare) for a column reference written at `pos`: a
+    /// name-resolution error carries the reference's position and its hint
+    /// (spec/design/error-fields.md §10.2, §11).
+    pub(crate) fn resolve_bare_at(&self, name: &str, pos: SrcPos) -> Result<Resolved> {
+        self.resolve_bare(name)
+            .map_err(|e| self.locate_column_error(e, None, name, pos))
+    }
+
+    /// [`resolve_qualified`](Scope::resolve_qualified) for a reference written at `pos` (§10.2, §11).
+    pub(crate) fn resolve_qualified_at(
+        &self,
+        qualifier: &str,
+        name: &str,
+        pos: SrcPos,
+    ) -> Result<Resolved> {
+        self.resolve_qualified(qualifier, name)
+            .map_err(|e| self.locate_column_error(e, Some(qualifier), name, pos))
+    }
+
+    /// Stamp a column reference's `42703` / `42702` / `42P01` with its position, and add the
+    /// misspelled-column (§11.1) or table-alias (§11.2) hint. An error already positioned came from
+    /// an inner site, which wins.
+    fn locate_column_error(
+        &self,
+        e: EngineError,
+        qualifier: Option<&str>,
+        name: &str,
+        pos: SrcPos,
+    ) -> EngineError {
+        if e.position.is_some()
+            || !matches!(
+                e.state,
+                SqlState::UndefinedColumn | SqlState::AmbiguousColumn | SqlState::UndefinedTable
+            )
+        {
+            return e;
+        }
+        let hint = match (e.state, qualifier) {
+            (SqlState::UndefinedColumn, _) => self.fuzzy_column_hint(qualifier, name),
+            (SqlState::UndefinedTable, Some(q)) => self.table_alias_hint(q),
+            _ => None,
+        };
+        e.with_position(pos.0).with_hint(hint)
+    }
+
+    /// The labeled relations of the §11.1 walk at this level: the FROM relations in order, then the
+    /// inner relations of an unaliased parenthesized join. Each yields its label and column names.
+    fn hint_relations(&self) -> Vec<(&str, Vec<&str>)> {
+        let mut out = Vec::new();
+        for r in &self.rels {
+            if r.label.is_empty() {
+                continue;
+            }
+            let cols = match r.layer {
+                Some(layer) => layer.columns.iter().map(|c| c.name.as_str()).collect(),
+                None => r.table.columns.iter().map(|c| c.name.as_str()).collect(),
+            };
+            out.push((r.label.as_str(), cols));
+        }
+        for sr in &self.sub_rels {
+            if !sr.label.is_empty() {
+                let cols = sr.table.columns.iter().map(|c| c.name.as_str()).collect();
+                out.push((sr.label.as_str(), cols));
+            }
+        }
+        out
+    }
+
+    /// PostgreSQL's misspelled-column hint over the scope chain (spec/design/error-fields.md §11.1).
+    fn fuzzy_column_hint(&self, qualifier: Option<&str>, name: &str) -> Option<String> {
+        let mut m = error_hint::FuzzyColumnMatch::new(qualifier, name);
+        let mut level = Some(self);
+        while let Some(s) = level {
+            for (label, cols) in s.hint_relations() {
+                let penalty = m.penalty(label);
+                for col in cols {
+                    m.offer(label, penalty, col);
+                }
+            }
+            level = s.parent;
+        }
+        m.hint()
+    }
+
+    /// The table-alias hint (spec/design/error-fields.md §11.2): the first base table or view
+    /// reference in the scope chain whose catalog name is `qualifier` under a different label.
+    fn table_alias_hint(&self, qualifier: &str) -> Option<String> {
+        let mut level = Some(self);
+        while let Some(s) = level {
+            for r in &s.rels {
+                let catalog_name = match &r.view {
+                    Some(v) => Some(v.as_str()),
+                    None if r.base => Some(r.table.name.as_str()),
+                    None => None,
+                };
+                if catalog_name == Some(qualifier) && r.label != qualifier && !r.label.is_empty() {
+                    return Some(error_hint::alias_hint(&r.label));
+                }
+            }
+            level = s.parent;
+        }
+        None
+    }
+
     /// The column at a flat index in THIS scope (the index is known valid — resolution made it).
     fn column_at(&self, flat: usize) -> &Column {
         for r in &self.rels {
@@ -3893,7 +3998,7 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
         Expr::InSubquery { lhs, query, .. } | Expr::QuantifiedSubquery { lhs, query, .. } => {
             sub(lhs) + count_self_refs_query(query, name)
         }
-        Expr::Column(_)
+        Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_)
         | Expr::TypedLiteral { .. }

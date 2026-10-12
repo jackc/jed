@@ -61,6 +61,8 @@ fn the_exact_boundary_is_max_expr_depth() {
     assert!(Parser::parse_sql(&chain(MAX_EXPR_DEPTH - 1)).is_ok());
     let err = Parser::parse_sql(&chain(MAX_EXPR_DEPTH)).unwrap_err();
     assert_eq!(err.code(), "54001");
+    // A program limit is not a mistake at a place: no Position (spec/design/error-fields.md §10.2).
+    assert_eq!(err.position, None);
 }
 
 #[test]

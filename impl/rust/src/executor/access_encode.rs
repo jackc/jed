@@ -5600,7 +5600,7 @@ pub(crate) fn expr_has_aggregate(e: &Expr) -> bool {
                 || args.iter().any(expr_has_aggregate)
                 || over.as_deref().is_some_and(window_def_has_aggregate)
         }
-        Expr::Column(_)
+        Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_)
         | Expr::TypedLiteral { .. }
@@ -5688,7 +5688,7 @@ pub(crate) fn expr_has_window(e: &Expr) -> bool {
             args,
             ..
         } => over.is_some() || over_name.is_some() || args.iter().any(expr_has_window),
-        Expr::Column(_)
+        Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_)
         | Expr::TypedLiteral { .. }
@@ -5968,7 +5968,7 @@ pub(crate) fn reject_check_structure(e: &Expr) -> Result<()> {
             }
             args.iter().try_for_each(reject_check_structure)
         }
-        Expr::Column(_)
+        Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_)
         | Expr::TypedLiteral { .. } => Ok(()),
@@ -6058,7 +6058,7 @@ pub(crate) fn reject_check_structure(e: &Expr) -> Result<()> {
 /// a bind parameter `42P02`.
 pub(crate) fn reject_default_structure(e: &Expr) -> Result<()> {
     match e {
-        Expr::Column(_) | Expr::QualifiedColumn { .. } => Err(EngineError::new(
+        Expr::Column(_, _) | Expr::QualifiedColumn { .. } => Err(EngineError::new(
             SqlState::FeatureNotSupported,
             "cannot use column reference in DEFAULT expression",
         )),
@@ -6177,7 +6177,7 @@ pub(crate) fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usiz
             }
         };
         match e {
-            Expr::Column(name) | Expr::QualifiedColumn { name, .. } => note(name),
+            Expr::Column(name, _) | Expr::QualifiedColumn { name, .. } => note(name),
             Expr::Literal(_) | Expr::TypedLiteral { .. } | Expr::Param(_) => {}
             Expr::Cast { inner, .. }
             | Expr::Collate { inner, .. }
@@ -6299,7 +6299,7 @@ pub(crate) fn reject_index_predicate_structure(e: &Expr) -> Result<()> {
 pub(crate) fn index_expr_first_param(e: &Expr) -> Option<u32> {
     match e {
         Expr::Param(n) => Some(*n),
-        Expr::Column(_)
+        Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_)
         | Expr::TypedLiteral { .. }
@@ -6374,7 +6374,7 @@ pub(crate) fn index_expr_has_subquery(e: &Expr) -> bool {
         | Expr::Exists(_)
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. } => true,
-        Expr::Column(_)
+        Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_)
         | Expr::TypedLiteral { .. }

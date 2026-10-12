@@ -13,13 +13,13 @@ use crate::ast::{
     IndexKeyElem, IndexPredicate, Insert, InsertSource, InsertValue, JoinClause, JoinKind,
     JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict,
     OrderKey, Overriding, QueryExpr, RefAction, ReturningClause, Select, SelectItem, SelectItems,
-    SeqOptions, SetOp, SetOpKind, StarPos, Statement, SubscriptSpec, TableRef, TableRefPos,
+    SeqOptions, SetOp, SetOpKind, SrcPos, StarPos, Statement, SubscriptSpec, TableRef, TableRefPos,
     TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{CheckOption, FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
-use crate::lexer::lex;
+use crate::lexer::{lex, lex_with_positions};
 use crate::token::Token;
 
 /// Maximum expression / subquery / set-operation **nesting depth** a statement may reach
@@ -64,12 +64,26 @@ pub struct Parser {
     /// grammar.md §25). Precomputed once in one backward pass so every probe is O(1) — a long run
     /// of `(` costs linear time, not time per nesting level.
     paren_query: Vec<bool>,
+    /// Each token's 1-based character position in the statement text (spec/design/error-fields.md
+    /// §10.1), index-aligned with `tokens`; empty for a parse of stored text, which records none.
+    positions: Vec<u32>,
+    /// The furthest token index the parse has examined through `peek` / `advance` — the token a
+    /// parse error is positioned at (spec/design/error-fields.md §10.3).
+    furthest: std::cell::Cell<usize>,
 }
 
 impl Parser {
+    /// A parser over stored text: no source positions are recorded (error-fields.md §10.1).
     pub fn new(tokens: Vec<Token>) -> Self {
+        Self::with_positions(tokens, Vec::new())
+    }
+
+    /// A parser over host-written text, recording each token's character position.
+    pub fn with_positions(tokens: Vec<Token>, positions: Vec<u32>) -> Self {
         let mut p = Parser {
             tokens,
+            positions,
+            furthest: std::cell::Cell::new(0),
             pos: 0,
             depth: 0,
             max_depth: 0,
@@ -136,13 +150,41 @@ impl Parser {
         self.depth -= 1;
     }
 
-    /// Parse a single complete statement from `sql`.
+    /// Parse a single complete statement from `sql`. An error carries the character position of
+    /// the token the parse stopped at (spec/design/error-fields.md §10.2/§10.3), except a class-54
+    /// program limit.
     pub fn parse_sql(sql: &str) -> Result<Statement> {
-        let tokens = lex(sql)?;
-        let mut p = Parser::new(tokens);
-        let stmt = p.parse_statement()?;
-        p.expect_eof()?;
-        Ok(stmt)
+        let (tokens, positions) = lex_with_positions(sql)?;
+        let mut p = Parser::with_positions(tokens, positions);
+        let parsed = p.parse_statement().and_then(|stmt| {
+            p.expect_eof()?;
+            Ok(stmt)
+        });
+        parsed.map_err(|e| {
+            if e.code().starts_with("54") {
+                e
+            } else {
+                let at = p.src_pos(p.furthest.get()).0;
+                e.with_position(at)
+            }
+        })
+    }
+
+    /// The character position of token `i` (`SrcPos::NONE` for stored text).
+    fn src_pos(&self, i: usize) -> SrcPos {
+        SrcPos(self.positions.get(i).copied().unwrap_or(0))
+    }
+
+    /// The character position of the current token.
+    fn here(&self) -> SrcPos {
+        self.src_pos(self.pos)
+    }
+
+    /// Record that the parse examined token `i` (error-fields.md §10.3).
+    fn note(&self, i: usize) {
+        if i > self.furthest.get() {
+            self.furthest.set(i);
+        }
     }
 
     fn parse_statement(&mut self) -> Result<Statement> {
@@ -315,6 +357,12 @@ impl Parser {
             }
         }
         let body = render_tokens(&self.tokens[start..end]);
+        // `render_tokens` re-lexes to the same token sequence, so the body's tokens keep the
+        // statement's positions (and its `Eof` the position of the token after the body).
+        let body_positions = self
+            .positions
+            .get(start..=end)
+            .map_or_else(Vec::new, <[u32]>::to_vec);
         Ok(CreateView {
             name,
             db,
@@ -322,6 +370,7 @@ impl Parser {
             if_not_exists,
             columns,
             body,
+            body_positions,
             check_option,
         })
     }
@@ -1320,7 +1369,7 @@ impl Parser {
     /// `((a))`) becomes a column key (PG-matched), anything else an expression key carrying
     /// its canonical text (rendered from the captured token span, like CHECK/DEFAULT).
     fn index_key_from_expr(tokens: &[Token], expr: Expr, start: usize, end: usize) -> IndexKeyElem {
-        if let Expr::Column(name) = &expr {
+        if let Expr::Column(name, _) = &expr {
             return IndexKeyElem::Column(name.clone());
         }
         let text = render_tokens(&tokens[start..end]);
@@ -2143,10 +2192,12 @@ impl Parser {
 
         // Optional column list `( col [, col]* )` before VALUES. An empty `()` is rejected
         // (the first `expect_identifier` errors 42601 on `)`).
+        let mut column_pos = Vec::new();
         let mut columns = if matches!(self.peek(), Token::LParen) {
             self.advance(); // '('
             let mut names = Vec::new();
             loop {
+                column_pos.push(self.here());
                 names.push(self.expect_identifier()?);
                 match self.advance() {
                     Token::Comma => continue,
@@ -2215,6 +2266,7 @@ impl Parser {
             table,
             db,
             columns,
+            column_pos,
             overriding,
             source,
             on_conflict,
@@ -2267,11 +2319,13 @@ impl Parser {
                 self.expect_keyword("set")?;
                 let mut assignments = Vec::new();
                 loop {
+                    let pos = self.here();
                     let column = self.expect_identifier()?;
                     self.expect(&Token::Eq)?;
                     let value = self.parse_expr()?;
                     assignments.push(Assignment {
                         column,
+                        pos,
                         is_default: false,
                         value,
                     });
@@ -3167,6 +3221,7 @@ impl Parser {
             return self.parse_json_table();
         }
         let mut name_pos = self.pos;
+        let src = self.here();
         let mut name = self.expect_identifier()?;
         // An optional DATABASE qualifier `db "." table` (attached-databases.md §3): a `.` after the
         // first identifier makes it the database qualifier and the next identifier the table name. A
@@ -3278,6 +3333,7 @@ impl Parser {
                 alias: alias_pos,
                 list: list_pos,
                 depth: self.depth,
+                src,
             },
         })
     }
@@ -3716,23 +3772,26 @@ impl Parser {
         nulls_first: bool,
         allow_ordinal: bool,
     ) -> OrderKey {
-        let mk = |ordinal, expr, qualifier, column, collation| OrderKey {
+        let mk = |ordinal, expr, qualifier, column, pos, collation| OrderKey {
             ordinal,
             expr,
             qualifier,
             column,
+            pos,
             collation,
             descending,
             nulls_first,
         };
         match expr {
             Expr::Literal(Literal::Int(n)) if allow_ordinal => {
-                mk(Some(n), None, None, String::new(), collation)
+                mk(Some(n), None, None, String::new(), SrcPos::NONE, collation)
             }
-            Expr::Column(name) => mk(None, None, None, name, collation),
-            Expr::QualifiedColumn { qualifier, name } => {
-                mk(None, None, Some(qualifier), name, collation)
-            }
+            Expr::Column(name, pos) => mk(None, None, None, name, pos, collation),
+            Expr::QualifiedColumn {
+                qualifier,
+                name,
+                pos,
+            } => mk(None, None, Some(qualifier), name, pos, collation),
             // `parse_expr` folds a trailing `COLLATE "x"` into the key (collation.md §1). When it wraps a
             // bare column, unwrap back to a column key carrying that explicit collation — exactly the
             // OrderKey the old column-only parser built, so the column fast path is byte-identical.
@@ -3740,10 +3799,12 @@ impl Parser {
                 inner,
                 collation: c,
             } => match *inner {
-                Expr::Column(name) => mk(None, None, None, name, Some(c)),
-                Expr::QualifiedColumn { qualifier, name } => {
-                    mk(None, None, Some(qualifier), name, Some(c))
-                }
+                Expr::Column(name, pos) => mk(None, None, None, name, pos, Some(c)),
+                Expr::QualifiedColumn {
+                    qualifier,
+                    name,
+                    pos,
+                } => mk(None, None, Some(qualifier), name, pos, Some(c)),
                 other => mk(
                     None,
                     Some(Expr::Collate {
@@ -3752,10 +3813,18 @@ impl Parser {
                     }),
                     None,
                     String::new(),
+                    SrcPos::NONE,
                     collation,
                 ),
             },
-            other => mk(None, Some(other), None, String::new(), collation),
+            other => mk(
+                None,
+                Some(other),
+                None,
+                String::new(),
+                SrcPos::NONE,
+                collation,
+            ),
         }
     }
 
@@ -3909,6 +3978,7 @@ impl Parser {
 
         let mut assignments = Vec::new();
         loop {
+            let pos = self.here();
             let column = self.expect_identifier()?;
             self.expect(&Token::Eq)?;
             // `DEFAULT` is special only when it is the complete assignment RHS. Keywords are
@@ -3929,6 +3999,7 @@ impl Parser {
             };
             assignments.push(Assignment {
                 column,
+                pos,
                 is_default,
                 value,
             });
@@ -4689,10 +4760,15 @@ impl Parser {
         // below as literals or keyword-led expressions. Recognize the unambiguous
         // `identifier.identifier` shape first so aliases such as `null`, `cast`, or `case` work.
         if self.at_qualified_column_ref() {
+            let pos = self.here();
             let qualifier = self.expect_identifier()?;
             self.expect(&Token::Dot)?;
             let name = self.expect_identifier()?;
-            return Ok(Expr::QualifiedColumn { qualifier, name });
+            return Ok(Expr::QualifiedColumn {
+                qualifier,
+                name,
+                pos,
+            });
         }
         if matches!(self.peek(), Token::LParen) {
             self.advance();
@@ -5128,10 +5204,15 @@ impl Parser {
                 if matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) {
                     return self.parse_function_call();
                 }
+                let pos = self.here();
                 let (qualifier, name) = self.parse_column_ref()?;
                 Ok(match qualifier {
-                    Some(qualifier) => Expr::QualifiedColumn { qualifier, name },
-                    None => Expr::Column(name),
+                    Some(qualifier) => Expr::QualifiedColumn {
+                        qualifier,
+                        name,
+                        pos,
+                    },
+                    None => Expr::Column(name, pos),
                 })
             }
             other => Err(syntax(format!("expected an expression, found {other:?}"))),
@@ -5459,6 +5540,7 @@ impl Parser {
 
     /// Peek the current token without consuming it.
     pub fn peek(&self) -> &Token {
+        self.note(self.pos);
         &self.tokens[self.pos]
     }
 
@@ -5489,6 +5571,7 @@ impl Parser {
 
     /// Consume and return the current token.
     pub fn advance(&mut self) -> Token {
+        self.note(self.pos);
         let t = self.tokens[self.pos].clone();
         if self.pos + 1 < self.tokens.len() {
             self.pos += 1;
@@ -5564,8 +5647,21 @@ pub fn parse_expression(text: &str) -> Result<Expr> {
 /// (`TableRefPos`, `StarPos`) is an index into `lex(text)`, which is what the rename rewrites and
 /// `*` freezing edit.
 pub fn parse_view_definition(text: &str) -> Result<(QueryExpr, usize)> {
+    parse_view_definition_at(text, &[])
+}
+
+/// [`parse_view_definition`] for a body just written by the host, recording `positions` (one per
+/// token of `lex(text)`, as [`CreateView::body_positions`](crate::ast::CreateView) holds) on the
+/// AST so a resolution error points into the statement (spec/design/error-fields.md §10.1). A
+/// position list that does not line up with the tokens is ignored.
+pub fn parse_view_definition_at(text: &str, positions: &[u32]) -> Result<(QueryExpr, usize)> {
     let tokens = lex(text)?;
-    let mut p = Parser::new(tokens);
+    let positions = if positions.len() == tokens.len() {
+        positions.to_vec()
+    } else {
+        Vec::new()
+    };
+    let mut p = Parser::with_positions(tokens, positions);
     let body = p.parse_subquery()?;
     p.expect_eof()?;
     Ok((body, p.max_depth))
@@ -6050,6 +6146,6 @@ mod tests {
         let Expr::Binary { lhs, .. } = &assignment.value else {
             panic!("expected binary RHS");
         };
-        assert!(matches!(lhs.as_ref(), Expr::Column(name) if name == "default"));
+        assert!(matches!(lhs.as_ref(), Expr::Column(name, _) if name == "default"));
     }
 }

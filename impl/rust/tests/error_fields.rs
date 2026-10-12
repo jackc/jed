@@ -151,6 +151,35 @@ fn unrelated_error_has_no_fields() {
     assert_eq!(e.column_name, None);
     assert_eq!(e.data_type_name, None);
     assert_eq!(e.detail, None);
+    assert_eq!(e.hint, None);
+}
+
+/// A prepared statement resolves at execute; its name errors still point into the prepared text
+/// (spec/design/error-fields.md §10.1).
+#[test]
+fn prepared_statement_error_has_position() {
+    let mut db = db_with(&["CREATE TABLE t (name i32)"]);
+    let stmt = db.prepare("SELECT 1, nme FROM t").unwrap();
+    let e = db.execute_prepared(&stmt, &[]).unwrap_err();
+    assert_eq!(e.code(), "42703");
+    assert_eq!(e.position, Some(11));
+    assert_eq!(
+        e.hint.as_deref(),
+        Some("Perhaps you meant to reference the column \"t.name\".")
+    );
+}
+
+/// An error that is not about a place in the query carries no position or hint, and stored text
+/// (a persisted expression) is parsed without positions (spec/design/error-fields.md §10.1/§10.2).
+#[test]
+fn position_absent_off_the_named_paths() {
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
+    let e = err(&mut db, "SELECT 1 / 0");
+    assert_eq!((e.code(), e.position, e.hint), ("22012", None, None));
+    let e = jed::parser::parse_expression("'abc").unwrap_err();
+    assert_eq!((e.code(), e.position), ("42601", None));
+    let e = jed::parser::parse_expression("a +").unwrap_err();
+    assert_eq!((e.code(), e.position), ("42601", None));
 }
 
 /// One case of the shared Detail fixture (spec/errors/detail_cases.txt).
@@ -250,6 +279,94 @@ fn detail_shared_cases() {
                         e.message,
                         c.code,
                         c.detail
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// One case of the shared Position/Hint fixture (spec/errors/position_cases.txt).
+#[derive(Default)]
+struct PositionCase {
+    name: String,
+    setup: Vec<String>,
+    run: String,
+    script: bool,
+    code: String,
+    position: Option<u32>,
+    hint: Option<String>,
+}
+
+fn parse_position_cases(text: &str) -> Vec<PositionCase> {
+    let mut cases: Vec<PositionCase> = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix("case: ") {
+            cases.push(PositionCase {
+                name: name.to_string(),
+                ..PositionCase::default()
+            });
+            continue;
+        }
+        let c = cases.last_mut().expect("a directive before the first case");
+        if let Some(v) = line.strip_prefix("setup: ") {
+            c.setup.push(v.to_string());
+        } else if let Some(v) = line.strip_prefix("run: ") {
+            c.run = v.to_string();
+        } else if let Some(v) = line.strip_prefix("script: ") {
+            c.run = v.to_string();
+            c.script = true;
+        } else if let Some(v) = line.strip_prefix("code: ") {
+            c.code = v.to_string();
+        } else if let Some(v) = line.strip_prefix("position: ") {
+            c.position = Some(v.parse().expect("a position number"));
+        } else if let Some(v) = line.strip_prefix("hint: ") {
+            c.hint = Some(v.to_string());
+        } else if line != "no-position" {
+            panic!("unknown position_cases directive: {line}");
+        }
+    }
+    cases
+}
+
+/// The `Position` and `Hint` fields (spec/design/error-fields.md §10, §11): every case of the
+/// shared, language-neutral fixture — the same file the Go and TS cores run.
+#[test]
+fn position_hint_shared_cases() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../spec/errors/position_cases.txt"
+    );
+    let text = std::fs::read_to_string(path).expect("read position_cases.txt");
+    let cases = parse_position_cases(&text);
+    assert!(!cases.is_empty());
+    let mut failures = Vec::new();
+    for c in &cases {
+        let setup: Vec<&str> = c.setup.iter().map(String::as_str).collect();
+        let mut db = db_with(&setup);
+        let result = if c.script {
+            db.execute_script(&c.run).map(|_| ())
+        } else {
+            db.query_outcome(&c.run, &[]).map(|_| ())
+        };
+        match result {
+            Ok(()) => failures.push(format!("{}: expected {} but succeeded", c.name, c.code)),
+            Err(e) => {
+                if e.code() != c.code || e.position != c.position || e.hint != c.hint {
+                    failures.push(format!(
+                        "{}: got {} {:?} {:?} ({}), want {} {:?} {:?}",
+                        c.name,
+                        e.code(),
+                        e.position,
+                        e.hint,
+                        e.message,
+                        c.code,
+                        c.position,
+                        c.hint
                     ));
                 }
             }

@@ -17,7 +17,7 @@
 //! reference records only the view itself: its own body is planned with the trace suspended.
 
 use super::*;
-use crate::parser::{parse_view_definition, render_tokens};
+use crate::parser::{parse_view_definition, parse_view_definition_at, render_tokens};
 use crate::token::Token;
 use std::collections::BTreeMap;
 
@@ -465,7 +465,7 @@ impl Engine {
         //    one consumed by a special-cased form (a parameter CAST) is caught on the tokens right
         //    after planning.
         let tokens = crate::lexer::lex(&cv.body)?;
-        let (body, depth) = parse_view_definition(&cv.body)?;
+        let (body, depth) = parse_view_definition_at(&cv.body, &cv.body_positions)?;
         let (plan, trace) = self.trace_view_body(&body)?;
         if let Some(n) = tokens.iter().find_map(|t| match t {
             Token::Param(n) => Some(*n),
@@ -489,6 +489,13 @@ impl Engine {
         let columns = view_output_names(&body_names, cv.columns.as_deref())?;
         // 6. Freeze every expanded `*` and verify the expanded text plans to the same output.
         let (definition, body, depth, trace) = if trace.stars.is_empty() {
+            // The stored body carries no positions: they point into this statement, not into the
+            // view's later uses (spec/design/error-fields.md §10.1).
+            let body = if cv.body_positions.is_empty() {
+                body
+            } else {
+                parse_view_definition(&cv.body)?.0
+            };
             (cv.body.clone(), body, depth, trace)
         } else {
             let frozen = freeze_stars(&tokens, &trace)?;

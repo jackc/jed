@@ -1054,13 +1054,15 @@ pub(crate) fn resolve_setop_order_key(key: &OrderKey, names: &[String]) -> Resul
         return Err(EngineError::new(
             SqlState::UndefinedTable,
             format!("missing FROM-clause entry for table {q}"),
-        ));
+        )
+        .with_position(key.pos.0));
     }
     names.iter().position(|n| n == &key.column).ok_or_else(|| {
         EngineError::new(
             SqlState::UndefinedColumn,
             format!("column {} does not exist", key.column),
         )
+        .with_position(key.pos.0)
     })
 }
 

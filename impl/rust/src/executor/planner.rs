@@ -311,7 +311,15 @@ impl Engine {
                     srf_meta.push(None);
                     // A view reached through an attachment qualifier is a follow-on (views.md §10).
                     self.reject_attached_view(tref.db.as_deref(), &tref.name)?;
-                    self.check_table_qualifier(tref.db.as_deref(), &tref.name)?;
+                    self.check_table_qualifier(tref.db.as_deref(), &tref.name)
+                        .map_err(|e| {
+                            // An unknown qualified relation is positioned at the name (§10.2).
+                            if e.state == SqlState::UndefinedTable {
+                                e.with_position(tref.pos.src.0)
+                            } else {
+                                e
+                            }
+                        })?;
                     let table = match self.table_scoped(tref.db.as_deref(), &tref.name) {
                         Some(t) => t,
                         None => {
@@ -322,7 +330,8 @@ impl Engine {
                                     tref.db.as_deref().unwrap_or_default(),
                                     tref.name
                                 ),
-                            ));
+                            )
+                            .with_position(tref.pos.src.0));
                         }
                     };
                     self.trace_table_item(tref, table)?;
@@ -388,6 +397,7 @@ impl Engine {
                                     SqlState::UndefinedTable,
                                     format!("table does not exist: {}", tref.name),
                                 )
+                                .with_position(tref.pos.src.0)
                             })?;
                             self.trace_table_item(tref, table)?;
                             match &tref.column_aliases {
@@ -617,10 +627,12 @@ impl Engine {
                         Expr::QualifiedColumn {
                             qualifier: lq,
                             name: name.clone(),
+                            pos: SrcPos::NONE,
                         },
                         Expr::QualifiedColumn {
                             qualifier: rq,
                             name: name.clone(),
+                            pos: SrcPos::NONE,
                         },
                     );
                     pred_ast = Some(match pred_ast {
@@ -1080,10 +1092,10 @@ impl Engine {
                 match items_ref {
                     SelectItems::All(_) => Target::Slot(Resolved::Local(pos)),
                     SelectItems::Items(its) => match &its[pos].expr {
-                        Expr::Column(name) => Target::Slot(scope.resolve_bare(name)?),
-                        Expr::QualifiedColumn { qualifier, name } => {
-                            Target::Slot(scope.resolve_qualified(qualifier, name)?)
-                        }
+                        Expr::Column(name, _) => Target::Slot(scope.resolve_bare(name)?),
+                        Expr::QualifiedColumn {
+                            qualifier, name, ..
+                        } => Target::Slot(scope.resolve_qualified(qualifier, name)?),
                         // An ordinal at a computed item sorts by that item's value (grammar.md §10).
                         e => Target::Expr(e),
                     },
@@ -1092,19 +1104,19 @@ impl Engine {
                 Target::Expr(e)
             } else if let Some(q) = &key.qualifier {
                 // A qualified key (`t.a`) is always an input column — never an output alias (PG; §10).
-                Target::Slot(scope.resolve_qualified(q, &key.column)?)
+                Target::Slot(scope.resolve_qualified_at(q, &key.column, key.pos)?)
             } else {
                 // A bare name resolves an OUTPUT column (an `AS` alias or an item's derived name) BEFORE
                 // an input column — PostgreSQL's SQL92 rule (grammar.md §10). A match routes the item
                 // EXACTLY like the same ORDER BY ordinal (a plain column to a slot, a computed item to a
                 // materialized key); no match falls through to the FROM scope, the prior behavior.
                 match order_alias_match(items_ref, &key.column, &scope)? {
-                    Some(Expr::Column(name)) => Target::Slot(scope.resolve_bare(name)?),
-                    Some(Expr::QualifiedColumn { qualifier, name }) => {
-                        Target::Slot(scope.resolve_qualified(qualifier, name)?)
-                    }
+                    Some(Expr::Column(name, _)) => Target::Slot(scope.resolve_bare(name)?),
+                    Some(Expr::QualifiedColumn {
+                        qualifier, name, ..
+                    }) => Target::Slot(scope.resolve_qualified(qualifier, name)?),
                     Some(e) => Target::Expr(e),
-                    None => Target::Slot(scope.resolve_bare(&key.column)?),
+                    None => Target::Slot(scope.resolve_bare_at(&key.column, key.pos)?),
                 }
             };
 
@@ -1390,16 +1402,16 @@ impl Engine {
                 let mut projected: HashSet<usize> = HashSet::new();
                 for it in items {
                     let idx = match &it.expr {
-                        Expr::Column(name) => match scope.resolve_bare(name) {
+                        Expr::Column(name, _) => match scope.resolve_bare(name) {
                             Ok(Resolved::Local(i)) => Some(i),
                             _ => None,
                         },
-                        Expr::QualifiedColumn { qualifier, name } => {
-                            match scope.resolve_qualified(qualifier, name) {
-                                Ok(Resolved::Local(i)) => Some(i),
-                                _ => None,
-                            }
-                        }
+                        Expr::QualifiedColumn {
+                            qualifier, name, ..
+                        } => match scope.resolve_qualified(qualifier, name) {
+                            Ok(Resolved::Local(i)) => Some(i),
+                            _ => None,
+                        },
                         _ => None,
                     };
                     if let Some(i) = idx {

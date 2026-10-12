@@ -38,6 +38,12 @@ pub struct EngineError {
     /// set on the class-23 violations, subject to the session's SELECT privilege
     /// (spec/design/error-fields.md §9). Never part of the rendered message.
     pub detail: Option<String>,
+    /// The 1-based **character** offset into the statement text of the offending token —
+    /// set for lexer/parser errors and name-resolution errors (spec/design/error-fields.md §10).
+    pub position: Option<u32>,
+    /// PostgreSQL's HINT suggestion (`Perhaps you meant to reference the column "t.name".`) —
+    /// spec/design/error-fields.md §11. Never part of the rendered message.
+    pub hint: Option<String>,
 }
 
 impl EngineError {
@@ -50,6 +56,8 @@ impl EngineError {
             column_name: None,
             data_type_name: None,
             detail: None,
+            position: None,
+            hint: None,
         }
     }
 
@@ -84,6 +92,35 @@ impl EngineError {
     #[must_use]
     pub(crate) fn with_detail(mut self, detail: Option<String>) -> Self {
         self.detail = detail;
+        self
+    }
+
+    /// Set `Position` unless one is already set: the innermost site that knows a location wins
+    /// (spec/design/error-fields.md §10.2). A `0` position means "unknown" and is ignored.
+    #[must_use]
+    pub(crate) fn with_position(mut self, pos: u32) -> Self {
+        if self.position.is_none() && pos > 0 {
+            self.position = Some(pos);
+        }
+        self
+    }
+
+    /// Shift `Position` by `chars` characters — a statement's error moved into the coordinates of
+    /// the script that contains it (spec/design/error-fields.md §10.1).
+    #[must_use]
+    pub(crate) fn shift_position(mut self, chars: u32) -> Self {
+        if let Some(p) = self.position {
+            self.position = Some(p + chars);
+        }
+        self
+    }
+
+    /// Set `Hint` unless one is already set (spec/design/error-fields.md §11).
+    #[must_use]
+    pub(crate) fn with_hint(mut self, hint: Option<String>) -> Self {
+        if self.hint.is_none() {
+            self.hint = hint;
+        }
         self
     }
 

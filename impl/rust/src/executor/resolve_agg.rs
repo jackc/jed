@@ -48,7 +48,7 @@ pub(crate) fn resolve_group_named(
     params: &mut ParamTypes,
 ) -> Result<GroupKeyResolved> {
     match term {
-        Expr::Column(name) => match scope.resolve_bare(name) {
+        Expr::Column(name, pos) => match scope.resolve_bare_at(name, *pos) {
             Ok(Resolved::Local(idx)) => Ok(GroupKeyResolved::Column(idx)),
             Ok(Resolved::Outer { .. } | Resolved::Layer { .. }) => Err(EngineError::new(
                 SqlState::FeatureNotSupported,
@@ -64,15 +64,17 @@ pub(crate) fn resolve_group_named(
             }
             Err(e) => Err(e),
         },
-        Expr::QualifiedColumn { qualifier, name } => {
-            match scope.resolve_qualified(qualifier, name)? {
-                Resolved::Local(idx) => Ok(GroupKeyResolved::Column(idx)),
-                Resolved::Outer { .. } | Resolved::Layer { .. } => Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "GROUP BY may not reference an outer query column",
-                )),
-            }
-        }
+        Expr::QualifiedColumn {
+            qualifier,
+            name,
+            pos,
+        } => match scope.resolve_qualified_at(qualifier, name, *pos)? {
+            Resolved::Local(idx) => Ok(GroupKeyResolved::Column(idx)),
+            Resolved::Outer { .. } | Resolved::Layer { .. } => Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "GROUP BY may not reference an outer query column",
+            )),
+        },
         _ => resolve_group_expr(scope, term, params),
     }
 }
@@ -87,13 +89,17 @@ pub(crate) fn resolve_group_expr(
     params: &mut ParamTypes,
 ) -> Result<GroupKeyResolved> {
     match e {
-        Expr::Column(name) => {
-            if let Resolved::Local(idx) = scope.resolve_bare(name)? {
+        Expr::Column(name, pos) => {
+            if let Resolved::Local(idx) = scope.resolve_bare_at(name, *pos)? {
                 return Ok(GroupKeyResolved::Column(idx));
             }
         }
-        Expr::QualifiedColumn { qualifier, name } => {
-            if let Resolved::Local(idx) = scope.resolve_qualified(qualifier, name)? {
+        Expr::QualifiedColumn {
+            qualifier,
+            name,
+            pos,
+        } => {
+            if let Resolved::Local(idx) = scope.resolve_qualified_at(qualifier, name, *pos)? {
                 return Ok(GroupKeyResolved::Column(idx));
             }
         }
@@ -1513,8 +1519,9 @@ pub(crate) fn resolve_ordered_set_aggregate(
                 Some(q) => Expr::QualifiedColumn {
                     qualifier: q.clone(),
                     name: key.column.clone(),
+                    pos: key.pos,
                 },
-                None => Expr::Column(key.column.clone()),
+                None => Expr::Column(key.column.clone(), key.pos),
             };
             resolve(scope, &key_expr, None, &mut sub, params)?
         }
@@ -1704,8 +1711,9 @@ pub(crate) fn resolve_hypothetical_set_aggregate(
                     Some(q) => Expr::QualifiedColumn {
                         qualifier: q.clone(),
                         name: key.column.clone(),
+                        pos: key.pos,
                     },
-                    None => Expr::Column(key.column.clone()),
+                    None => Expr::Column(key.column.clone(), key.pos),
                 };
                 resolve(scope, &key_expr, None, &mut sub, params)?
             }
@@ -1940,10 +1948,12 @@ pub(crate) fn resolve_grouping(
     let mut positions: Vec<usize> = Vec::with_capacity(args.len());
     for arg in args {
         let r = match arg {
-            Expr::Column(name) => scope.resolve_bare(name)?,
-            Expr::QualifiedColumn { qualifier, name } => {
-                scope.resolve_qualified(qualifier, name)?
-            }
+            Expr::Column(name, pos) => scope.resolve_bare_at(name, *pos)?,
+            Expr::QualifiedColumn {
+                qualifier,
+                name,
+                pos,
+            } => scope.resolve_qualified_at(qualifier, name, *pos)?,
             // A non-column argument is never a grouping column (jed groups by columns only).
             _ => return Err(grouping_arg_err()),
         };

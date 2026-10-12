@@ -577,8 +577,15 @@ impl Engine {
     pub(crate) fn run_script_body(&mut self, sql: &str) -> Result<crate::executor::ScriptSummary> {
         use crate::ast::Statement;
         let mut summary = crate::executor::ScriptSummary::default();
+        // The characters before the current statement, counted incrementally: a statement's error
+        // position is shifted into the script's coordinates (spec/design/error-fields.md §10.1).
+        let (mut counted, mut before) = (0usize, 0u32);
         for span in crate::split::split_statements(sql) {
-            let ast = self.parse(span.text())?;
+            before += sql[counted..span.offset()].chars().count() as u32;
+            counted = span.offset();
+            let ast = self
+                .parse(span.text())
+                .map_err(|e| e.shift_position(before))?;
             // Transaction control inside a script is the v1 narrowing (session.md §4.2): the implicit
             // wrapper owns the boundary, so BEGIN/COMMIT/ROLLBACK is 0A000 (partitioning deferred).
             if matches!(
@@ -591,7 +598,9 @@ impl Engine {
                      use split_statements to run a self-managed multi-statement transaction",
                 ));
             }
-            let outcome = self.execute_stmt_params(ast, &[])?;
+            let outcome = self
+                .execute_stmt_params(ast, &[])
+                .map_err(|e| e.shift_position(before))?;
             summary.statements_run += 1;
             if let Outcome::Statement {
                 rows_affected: Some(n),

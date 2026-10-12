@@ -2853,8 +2853,9 @@ impl Engine {
                                         .to_string(),
                                 ));
                             }
-                            let source = using
-                                .unwrap_or_else(|| Expr::Column(table.columns[ci].name.clone()));
+                            let source = using.unwrap_or_else(|| {
+                                Expr::Column(table.columns[ci].name.clone(), SrcPos::NONE)
+                            });
                             let cast = Expr::Cast {
                                 inner: Box::new(source),
                                 type_name: type_name.clone(),
@@ -2887,7 +2888,10 @@ impl Engine {
                                     exclusions: Vec::new(),
                                 };
                                 let default_cast = Expr::Cast {
-                                    inner: Box::new(Expr::Column(old_column.name.clone())),
+                                    inner: Box::new(Expr::Column(
+                                        old_column.name.clone(),
+                                        SrcPos::NONE,
+                                    )),
                                     type_name: type_name.clone(),
                                     type_mod,
                                 };

@@ -94,6 +94,24 @@ fn script_stops_at_the_first_error_with_exit_2() {
 }
 
 #[test]
+fn error_cursor_and_hint_follow_the_error_line() {
+    // psql's `LINE n:` cursor (line within the statement) and the structured Hint
+    // (spec/design/cli.md §5, error-fields.md §10/§11).
+    let r = run(
+        &[],
+        "CREATE TABLE t (name i32);\nSELECT 1,\n  nme FROM t;\n",
+    );
+    assert_eq!(r.code, 2);
+    assert_eq!(
+        r.stderr,
+        "<stdin>:2: ERROR 42703: column does not exist: nme\n\
+         LINE 2:   nme FROM t\n\
+         \x20         ^\n\
+         HINT:  Perhaps you meant to reference the column \"t.name\".\n"
+    );
+}
+
+#[test]
 fn continue_on_error_runs_the_rest_but_still_exits_2() {
     let r = run(&["--continue-on-error"], &testdata("errors.sql"));
     assert_eq!(r.code, 2);

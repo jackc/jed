@@ -92,9 +92,16 @@ pub fn run(
                 }
                 Err(e) => {
                     let _ = writeln!(err, "{name}:{line}: ERROR {}: {}", e.code(), e.message);
-                    // The structured Detail as psql's second line (spec/design/cli.md §5).
+                    // psql's error cursor, then the structured Detail and Hint as psql's
+                    // following lines (spec/design/cli.md §5).
+                    if let Some(cursor) = e.position.and_then(|p| cursor_lines(&sql, p)) {
+                        let _ = writeln!(err, "{cursor}");
+                    }
                     if let Some(detail) = &e.detail {
                         let _ = writeln!(err, "DETAIL:  {detail}");
+                    }
+                    if let Some(hint) = &e.hint {
+                        let _ = writeln!(err, "HINT:  {hint}");
                     }
                     if let Some(hint) = hint_for(e.code()) {
                         let _ = writeln!(err, "hint: {hint}");
@@ -121,6 +128,31 @@ fn import_statement(session: &Session, table: &str, text: &str) -> Result<Option
         .table(&name)
         .ok_or_else(|| format!("table does not exist: {name}"))?;
     csv::import_statement(def, &records)
+}
+
+/// psql's error cursor for an error at 1-based character `position` of `sql` (cli.md §5): the
+/// statement line holding it as `LINE n: text`, then a `^` under that character. `n` counts lines
+/// within the statement, as psql does. A tab shows as one space so the caret stays aligned.
+pub fn cursor_lines(sql: &str, position: u32) -> Option<String> {
+    let chars: Vec<char> = sql.chars().collect();
+    let at = (position as usize).checked_sub(1)?;
+    if at > chars.len() {
+        return None;
+    }
+    let before = &chars[..at];
+    let line_start = before.iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1);
+    let line_no = before.iter().filter(|&&c| c == '\n').count() + 1;
+    let line_end = chars[at..]
+        .iter()
+        .position(|&c| c == '\n' || c == '\r')
+        .map_or(chars.len(), |i| at + i);
+    let text: String = chars[line_start..line_end]
+        .iter()
+        .map(|&c| if c == '\t' { ' ' } else { c })
+        .collect();
+    let prefix = format!("LINE {line_no}: ");
+    let pad = " ".repeat(prefix.len() + (at - line_start));
+    Some(format!("{prefix}{text}\n{pad}^"))
 }
 
 /// CLI-generated hints for the errors a CLI user can act on (cli.md §5).

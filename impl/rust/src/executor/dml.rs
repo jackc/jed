@@ -207,6 +207,7 @@ impl Engine {
             table,
             db,
             columns: col_list,
+            column_pos,
             overriding,
             source,
             on_conflict,
@@ -279,6 +280,7 @@ impl Engine {
                                 SqlState::UndefinedColumn,
                                 format!("column {name} of relation {table_name} does not exist"),
                             )
+                            .with_position(column_pos.get(p).map_or(0, |pos| pos.0))
                         })?;
                     if provided[idx].is_some() {
                         return Err(EngineError::new(
@@ -964,6 +966,7 @@ impl Engine {
                                 SqlState::UndefinedColumn,
                                 format!("column {name} of relation {} does not exist", table.name),
                             )
+                            .with_position(ins.column_pos.get(p).map_or(0, |pos| pos.0))
                         })?;
                     if provided[idx].is_some() {
                         return Err(EngineError::new(
@@ -1797,7 +1800,7 @@ impl Engine {
                 let pk_members = tdef.pk_indices();
                 let mut plans: Vec<AssignPlan> = Vec::with_capacity(assignments.len());
                 for a in assignments {
-                    let idx = col_idx(tdef, &a.column)?;
+                    let idx = col_idx(tdef, &a.column).map_err(|e| e.with_position(a.pos.0))?;
                     // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md
                     // §13.4). This conflict-action path has no DEFAULT form yet, so any assignment
                     // here is 428C9 (before the PK 0A000).
@@ -2790,6 +2793,7 @@ impl Engine {
                     .iter()
                     .map(|&column| crate::ast::Assignment {
                         column: child.columns[column].name.clone(),
+                        pos: SrcPos::NONE,
                         is_default: fk.on_delete == FkAction::SetDefault,
                         value: Expr::Literal(Literal::Null),
                     })
@@ -2836,8 +2840,9 @@ impl Engine {
                 .iter()
                 .map(|&column| crate::ast::Assignment {
                     column: child.columns[column].name.clone(),
+                    pos: SrcPos::NONE,
                     is_default: false,
-                    value: Expr::Column(child.columns[column].name.clone()),
+                    value: Expr::Column(child.columns[column].name.clone(), SrcPos::NONE),
                 })
                 .collect(),
             FkAction::SetNull | FkAction::SetDefault => fk
@@ -2845,6 +2850,7 @@ impl Engine {
                 .iter()
                 .map(|&column| crate::ast::Assignment {
                     column: child.columns[column].name.clone(),
+                    pos: SrcPos::NONE,
                     is_default: fk.on_update == FkAction::SetDefault,
                     value: Expr::Literal(Literal::Null),
                 })
@@ -3458,7 +3464,7 @@ impl Engine {
         let mut ptypes = ParamTypes::default();
         let mut plans: Vec<AssignPlan> = Vec::with_capacity(upd.assignments.len());
         for a in &upd.assignments {
-            let idx = col_idx(table, &a.column)?;
+            let idx = col_idx(table, &a.column).map_err(|e| e.with_position(a.pos.0))?;
             // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4).
             // An ordinary assignment is 428C9; the DEFAULT form below is allowed and advances the
             // owned sequence through its expression default.

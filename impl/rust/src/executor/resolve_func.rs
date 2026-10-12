@@ -1193,12 +1193,13 @@ pub(crate) fn output_name(scope: &Scope, e: &Expr) -> String {
     match e {
         // A bare/qualified column takes the catalog's canonical name, whether it resolves to a
         // local relation or (correlated) an enclosing one — `column_of` handles both.
-        Expr::Column(name) => match scope.resolve_bare(name) {
+        Expr::Column(name, _) => match scope.resolve_bare(name) {
             Ok(r) => scope.column_of(r).name.clone(),
             Err(_) => name.clone(),
         },
-        Expr::QualifiedColumn { qualifier, name } => match scope.resolve_qualified(qualifier, name)
-        {
+        Expr::QualifiedColumn {
+            qualifier, name, ..
+        } => match scope.resolve_qualified(qualifier, name) {
             Ok(r) => scope.column_of(r).name.clone(),
             Err(_) => name.clone(),
         },
@@ -2607,7 +2608,7 @@ pub(crate) fn expr_calls_seq_mutator(e: &Expr) -> bool {
         Expr::FuncCall { name, args, .. } => {
             name == "nextval" || name == "setval" || args.iter().any(expr_calls_seq_mutator)
         }
-        Expr::Column(_)
+        Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_)
         | Expr::TypedLiteral { .. }
@@ -2932,7 +2933,7 @@ pub(crate) fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<S
                 collect_expr_privs(a, req, locals);
             }
         }
-        Expr::Column(_)
+        Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_)
         | Expr::TypedLiteral { .. }
@@ -3039,7 +3040,7 @@ pub(crate) fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<S
 /// parameter expression does not. Exhaustive over `Expr` (compiler-enforced).
 pub(crate) fn expr_reads_columns(e: &Expr) -> bool {
     match e {
-        Expr::Column(_) | Expr::QualifiedColumn { .. } => true,
+        Expr::Column(_, _) | Expr::QualifiedColumn { .. } => true,
         Expr::ScalarSubquery(_) | Expr::Exists(_) => true,
         Expr::Literal(_) | Expr::TypedLiteral { .. } | Expr::Param(_) => false,
         Expr::Row(es) | Expr::Array(es) => es.iter().any(expr_reads_columns),
@@ -3377,7 +3378,7 @@ pub(crate) fn resolve(
     // a+b … GROUP BY a+b` projects the grouped value, like a grouping column. Columns keep their own
     // path (matched by index); an aggregate operand / FILTER resolves under `Forbidden`, so this is
     // correctly inert there (its `a+b` is a per-row value, not the group key).
-    if !matches!(e, Expr::Column(_) | Expr::QualifiedColumn { .. })
+    if !matches!(e, Expr::Column(_, _) | Expr::QualifiedColumn { .. })
         && let Some((slot, ty)) = match_group_expr(agg, e)
     {
         return Ok((RExpr::Column(slot), ty));
@@ -3438,20 +3439,24 @@ pub(crate) fn resolve(
                 result_ty,
             ))
         }
-        Expr::Column(name) => {
+        Expr::Column(name, pos) => {
             // Resolve against the scope CHAIN (§26). Existence first (42703/42702 take priority,
             // matching PostgreSQL); a Local match then obeys the grouping rule, an Outer
             // (correlated) match is a per-outer-row constant exempt from it (see helper).
-            let r = scope.resolve_bare(name)?;
+            let r = scope.resolve_bare_at(name, *pos)?;
             resolve_column_ref(scope, agg, r, name)
         }
-        Expr::QualifiedColumn { qualifier, name } => {
+        Expr::QualifiedColumn {
+            qualifier,
+            name,
+            pos,
+        } => {
             // A bare `rel.col` resolves strictly against the FROM relations — `qualifier` MUST name
             // a relation (else 42P01), matching PostgreSQL. Composite field access on a column is
             // the **parens-required** `(col).field` form (spec/design/composite.md §1/§S4), an
             // `Expr::FieldAccess`, never this bare qualified-column path (PG raises 42P01 for the
             // unparenthesized `col.field` / `t.col.field` spellings).
-            let r = scope.resolve_qualified(qualifier, name)?;
+            let r = scope.resolve_qualified_at(qualifier, name, *pos)?;
             resolve_column_ref(scope, agg, r, name)
         }
         // `(expr).field` — composite field selection (spec/design/composite.md §S4).
@@ -5139,10 +5144,10 @@ pub(crate) enum Deriv {
 pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
     Ok(match e {
         Expr::Collate { collation, .. } => Deriv::Explicit(collation.clone()),
-        Expr::Column(name) => column_deriv(scope, scope.resolve_bare(name).ok()),
-        Expr::QualifiedColumn { qualifier, name } => {
-            column_deriv(scope, scope.resolve_qualified(qualifier, name).ok())
-        }
+        Expr::Column(name, _) => column_deriv(scope, scope.resolve_bare(name).ok()),
+        Expr::QualifiedColumn {
+            qualifier, name, ..
+        } => column_deriv(scope, scope.resolve_qualified(qualifier, name).ok()),
         Expr::Binary {
             op: BinaryOp::Concat,
             lhs,

@@ -434,6 +434,11 @@ pub struct CreateView {
     pub if_not_exists: bool,
     pub columns: Option<Vec<String>>,
     pub body: String,
+    /// The character positions (spec/design/error-fields.md §10) of the body's tokens in the
+    /// statement text, index-aligned with `lex(body)` (its `Eof` gets the position just past the
+    /// body), so validating the body reports positions into the text the host wrote. Empty when
+    /// the statement was itself stored text.
+    pub body_positions: Vec<u32>,
     /// A trailing `WITH [CASCADED | LOCAL] CHECK OPTION` (views.md §15.6); bare `WITH CHECK
     /// OPTION` is `Cascaded`.
     pub check_option: Option<CheckOption>,
@@ -552,6 +557,9 @@ pub struct Insert {
     /// execution time (unknown → 42703, duplicate → 42701); an unlisted column takes its default
     /// else NULL (spec/design/constraints.md §2).
     pub columns: Option<Vec<String>>,
+    /// Each `columns` name's character position (spec/design/error-fields.md §10.2), index-aligned;
+    /// empty when there is no list or no positions were recorded.
+    pub column_pos: Vec<SrcPos>,
     /// The optional `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md §13),
     /// governing IDENTITY columns. `None` is the default (no override).
     pub overriding: Option<Overriding>,
@@ -670,6 +678,8 @@ pub struct Update {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Assignment {
     pub column: String,
+    /// The target name's character position (spec/design/error-fields.md §10.2).
+    pub pos: SrcPos,
     /// `true` for the standalone UPDATE-only `SET column = DEFAULT` form. The `value` field is
     /// a parser placeholder in that case and is never resolved; ON CONFLICT keeps parsing its RHS
     /// as an ordinary expression until its separate DEFAULT follow-on lands.
@@ -800,6 +810,9 @@ pub struct TableRefPos {
     pub alias: Option<usize>,
     pub list: Option<(usize, usize)>,
     pub depth: usize,
+    /// The table name's character position (spec/design/error-fields.md §10.2) — the database
+    /// qualifier's for `db.t` — for a `42P01` on this reference.
+    pub src: SrcPos,
 }
 
 impl PartialEq for TableRefPos {
@@ -824,6 +837,26 @@ impl PartialEq for StarPos {
 }
 
 impl Eq for StarPos {}
+
+/// A 1-based **character** position in the statement text the host passed
+/// (spec/design/error-fields.md §10), recorded on the AST nodes that name things so a resolution
+/// error can carry `Position`. `SrcPos(0)` is "no position" — a parse of stored text, or a node
+/// jed synthesized. Invisible to AST equality, like [`TableRefPos`]: `a + b` written twice still
+/// matches structurally.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct SrcPos(pub u32);
+
+impl SrcPos {
+    pub const NONE: SrcPos = SrcPos(0);
+}
+
+impl PartialEq for SrcPos {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for SrcPos {}
 
 /// A `JSON_TABLE(ctx, path [AS name] COLUMNS (col, …))` table source (json-table.md §3, T1). The
 /// root `path` is evaluated over `ctx` to a sequence of row items; the `COLUMNS` tree projects each
@@ -1133,13 +1166,16 @@ pub enum SubscriptSpec {
 /// boolean-valued; arithmetic and columns/integer-literals are integer-valued.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Expr {
-    Column(String),
+    /// A bare column reference and its character position (spec/design/error-fields.md §10.2).
+    Column(String, SrcPos),
     /// A qualified column reference `rel.col`, where `rel` is a relation label in the FROM
     /// clause (its alias, else its table name). Resolved against exactly that one relation —
     /// never ambiguous (spec/design/grammar.md §15). Bare `Column` stays the unqualified form.
     QualifiedColumn {
         qualifier: String,
         name: String,
+        /// The qualifier's character position (spec/design/error-fields.md §10.2).
+        pos: SrcPos,
     },
     Literal(Literal),
     /// A `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Builds a row value
@@ -1589,6 +1625,8 @@ pub struct OrderKey {
     /// column-reference key (`ordinal` and `expr` both `None`).
     pub qualifier: Option<String>,
     pub column: String,
+    /// The column-reference key's character position (spec/design/error-fields.md §10.2).
+    pub pos: SrcPos,
     /// An optional explicit `COLLATE "name"` on this sort key (`ORDER BY name COLLATE "en-US"`,
     /// spec/design/collation.md §1). `None` ⇒ the column's collation (the database default, `C`,
     /// until per-column collation lands in slice 1d). A non-`C` name orders this key by that

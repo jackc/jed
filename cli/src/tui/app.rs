@@ -304,13 +304,21 @@ impl App {
                         "25P02" => "  (ROLLBACK to end the failed transaction)",
                         _ => "",
                     };
-                    // The one-line message log carries the structured Detail inline (cli.md §5).
+                    // The one-line message log carries the structured Detail and Hint inline (cli.md §5).
                     let detail = match &e.detail {
                         Some(d) => format!("  DETAIL: {d}"),
                         None => String::new(),
                     };
+                    let engine_hint = match &e.hint {
+                        Some(h) => format!("  HINT: {h}"),
+                        None => String::new(),
+                    };
                     self.set_message(
-                        format!("ERROR {}: {}{detail}{hint}", e.code(), e.message),
+                        format!(
+                            "ERROR {}: {}{detail}{engine_hint}{hint}",
+                            e.code(),
+                            e.message
+                        ),
                         true,
                     );
                     break;

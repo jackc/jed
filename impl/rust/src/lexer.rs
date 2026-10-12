@@ -42,12 +42,63 @@ fn scan_exponent(bytes: &[u8], i: &mut usize) -> Option<i64> {
 /// tokens; an integer literal is an unsigned magnitude (the leading `-`, if any, is
 /// the `Minus` operator, folded by the parser). Errors are structured (SQLSTATE
 /// 42601 syntax error).
+///
+/// This is the stored-text entry point (a view body, a CHECK expression, a rename rewrite), so an
+/// error carries no position: it would point into text the host never wrote (§10.1).
 pub fn lex(sql: &str) -> Result<Vec<Token>> {
+    lex_with_positions(sql)
+        .map(|(tokens, _)| tokens)
+        .map_err(|mut e| {
+            e.position = None;
+            e
+        })
+}
+
+/// [`lex`], also returning each token's 1-based **character** position in `sql`
+/// (spec/design/error-fields.md §10.1), index-aligned with the tokens. `Eof`'s position is
+/// one past the last character — PostgreSQL's "at end of input". An error carries the position of
+/// the lexeme being scanned (spec/design/error-fields.md §10.2).
+pub fn lex_with_positions(sql: &str) -> Result<(Vec<Token>, Vec<u32>)> {
+    let mut starts = Vec::new();
+    let mut tok_start = 0;
+    match lex_raw(sql, &mut starts, &mut tok_start) {
+        Ok(tokens) => Ok((tokens, char_positions(sql, &starts))),
+        Err(e) => {
+            let pos = char_positions(sql, &[tok_start])[0];
+            Err(e.with_position(pos))
+        }
+    }
+}
+
+/// Convert ascending byte offsets into `sql` to 1-based character positions in one pass. A
+/// character is a code point: count the bytes that are not UTF-8 continuation bytes.
+pub(crate) fn char_positions(sql: &str, starts: &[usize]) -> Vec<u32> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::with_capacity(starts.len());
+    let (mut b, mut chars) = (0usize, 0u32);
+    for &s in starts {
+        while b < s {
+            if bytes[b] & 0xC0 != 0x80 {
+                chars += 1;
+            }
+            b += 1;
+        }
+        out.push(chars + 1);
+    }
+    out
+}
+
+/// The lexer proper: pushes each token's start byte offset to `starts`, and keeps `tok_start` at
+/// the byte where the lexeme being scanned began, so the caller can position an error.
+fn lex_raw(sql: &str, starts: &mut Vec<usize>, tok_start: &mut usize) -> Result<Vec<Token>> {
     let bytes = sql.as_bytes();
     let mut i = 0;
     let mut tokens = Vec::new();
 
     while i < bytes.len() {
+        // The previous iteration's tokens started at its `tok_start`; this one's start at `i`.
+        starts.resize(tokens.len(), *tok_start);
+        *tok_start = i;
         let c = bytes[i];
         match c {
             b' ' | b'\t' | b'\r' | b'\n' => {
@@ -496,7 +547,10 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
         }
     }
 
+    starts.resize(tokens.len(), *tok_start);
+    *tok_start = bytes.len();
     tokens.push(Token::Eof);
+    starts.push(bytes.len());
     Ok(tokens)
 }
 

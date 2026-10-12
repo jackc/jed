@@ -149,8 +149,10 @@ fn not_updatable(kind: WriteKind, view: &str) -> EngineError {
 /// reference (bare, or qualified by the FROM item's label) — an updatable view column (§15.1).
 fn column_ref_position(e: &Expr, label: &str, below: &[String]) -> Option<usize> {
     let name = match e {
-        Expr::Column(name) => name,
-        Expr::QualifiedColumn { qualifier, name } if qualifier == label => name,
+        Expr::Column(name, _) => name,
+        Expr::QualifiedColumn {
+            qualifier, name, ..
+        } if qualifier == label => name,
         _ => return None,
     };
     below.iter().position(|n| n == name)
@@ -244,7 +246,7 @@ impl Engine {
             let label = tref.alias.as_deref().unwrap_or(&tref.name);
             let plain = matches!(sel.items, SelectItems::All(_))
                 || items.iter().any(|it| match &it.expr {
-                    Expr::Column(_) => true,
+                    Expr::Column(_, _) => true,
                     Expr::QualifiedColumn { qualifier, .. }
                     | Expr::QualifiedStar { qualifier, .. } => qualifier == label,
                     _ => false,
@@ -259,7 +261,8 @@ impl Engine {
     /// Validate a write through `name` and build its layer chain (views.md §15.3 steps 2–7), or
     /// `Ok(None)` when the target is not a view. `targets` are the statement's target view columns:
     /// the INSERT column list (`None` = every view column) or the UPDATE `SET` columns, in order;
-    /// DELETE has none.
+    /// DELETE has none. `target_pos` holds each target's character position, index-aligned (empty
+    /// when unknown), for a `42703` (spec/design/error-fields.md §10.2).
     pub(crate) fn prepare_view_write(
         &self,
         db: Option<&str>,
@@ -267,6 +270,7 @@ impl Engine {
         kind: WriteKind,
         on_conflict: bool,
         targets: Option<&[String]>,
+        target_pos: &[SrcPos],
     ) -> Result<Option<ViewWrite>> {
         let Some(view) = self.dml_target_view(db, name)? else {
             return Ok(None);
@@ -294,12 +298,13 @@ impl Engine {
             match targets {
                 None => cur = (0..view.columns.len()).collect(),
                 Some(list) => {
-                    for t in list {
+                    for (i, t) in list.iter().enumerate() {
                         let idx = view.columns.iter().position(|c| c == t).ok_or_else(|| {
                             EngineError::new(
                                 SqlState::UndefinedColumn,
                                 format!("column {t} of relation {} does not exist", view.name),
                             )
+                            .with_position(target_pos.get(i).map_or(0, |p| p.0))
                         })?;
                         if cur.contains(&idx) {
                             let msg = match kind {
@@ -613,6 +618,7 @@ impl Engine {
             WriteKind::Insert,
             ins.on_conflict.is_some(),
             ins.columns.as_deref(),
+            &ins.column_pos,
         )?
         else {
             return Ok(None);
@@ -628,12 +634,14 @@ impl Engine {
     /// which is NULL (jed has no view column defaults).
     pub(crate) fn rewrite_update_target(&self, upd: &mut Update) -> Result<Option<ViewWrite>> {
         let targets: Vec<String> = upd.assignments.iter().map(|a| a.column.clone()).collect();
+        let target_pos: Vec<SrcPos> = upd.assignments.iter().map(|a| a.pos).collect();
         let Some(vw) = self.prepare_view_write(
             upd.db.as_deref(),
             &upd.table,
             WriteKind::Update,
             false,
             Some(&targets),
+            &target_pos,
         )?
         else {
             return Ok(None);
@@ -658,6 +666,7 @@ impl Engine {
             WriteKind::Delete,
             false,
             None,
+            &[],
         )?
         else {
             return Ok(None);
