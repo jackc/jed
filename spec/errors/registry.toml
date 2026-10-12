@@ -633,9 +633,12 @@ template = "SQL statement exceeds the maximum length of {max} bytes"
 # regex compiled-program size cap (spec/design/cost.md §7c, regex.md §6): a well-formed pattern
 # whose compiled NFA program would exceed MAX_REGEX_PROGRAM (32768 instructions, after {n,m} unroll)
 # aborts 54001 at compile — the same native-stack/allocation-bound structural-complexity gate reached
-# via pattern size (a MALFORMED pattern is 2201B instead). Asserted by the conformance corpus (the
-# resource.depth_limit, resource.composite_depth_limit and resource.regex_program_limit capabilities),
-# since the abort point is part of the cross-core contract (no reference impl, §2).
+# via pattern size (a MALFORMED pattern is 2201B instead). The view expansion limit
+# (spec/design/cost.md §7e, views.md §4.1) raises it when one view reference would expand to more than
+# MAX_VIEW_EXPANSIONS (1024) views, bounding unmetered planning work. Asserted by the conformance
+# corpus (the resource.depth_limit, resource.composite_depth_limit, resource.regex_program_limit and
+# resource.view_expansion_limit capabilities), since the abort point is part of the cross-core
+# contract (no reference impl, §2).
 [[error]]
 code = "54001"
 name = "statement_too_complex"

@@ -1859,6 +1859,20 @@ own nesting against the same 256 (`54001`). A deterministic cross-core constant 
 [../conformance/suites/resource/json_depth_limit.test](../conformance/suites/resource/json_depth_limit.test)
 (gated by `resource.json_depth_limit`; jed-specific, **not** oracle-checked).
 
+## 7e. View expansion limit (landed)
+
+The **sixth** structural-complexity trigger of `54001`. Planning is unmetered, and a view expands like
+a macro: views that each name the previous view twice expand to `2^d` view bodies, and each costs a
+planning pass. §7 does not see this, because the expansion lives in the catalog, built by many small
+`CREATE VIEW` statements, as §7b's composite chains do. A fixed **`MAX_VIEW_EXPANSIONS = 1024`**
+bounds the views one view reference written outside any view body may expand to, itself included
+(full rule: [views.md §4.1](views.md)). The planner's own repeated planning of pushed-down bodies
+is kept linear separately ([planner.md §3.2](planner.md), *Planning work*), so with this limit a
+statement's planning work is bounded by its text and the catalog it reads. A deterministic,
+cross-core constant (§8), pinned by
+[../conformance/suites/resource/view_expansion_limit.test](../conformance/suites/resource/view_expansion_limit.test)
+(gated by `resource.view_expansion_limit`; jed-specific, **not** oracle-checked).
+
 ## 8. Result-amplifying scalars and decimal transcendental work
 
 `repeat`, `lpad`, and `rpad` retain their one `operator_eval`. After strict NULL

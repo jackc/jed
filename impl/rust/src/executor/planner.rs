@@ -83,6 +83,16 @@ impl Engine {
             Vec::with_capacity(from_items.len());
         // Per FROM item: the planned body of a DERIVED TABLE (grammar.md §42), else `None`.
         let mut derived_plans: Vec<Option<QueryPlan>> = Vec::with_capacity(from_items.len());
+        // Per FROM item: true when `derived_plans` holds only the body's SHAPE (planner.md §3.2),
+        // which stage 2 reads and `plan_derived_bodies` then replaces with the body's real plan.
+        // Only a SELECT with a WHERE, an ON, or pushed conjuncts can push into a body, so only its
+        // bodies are shaped. Inside a shape (`plan_shape` set) bodies are planned once and kept.
+        let shaping = self.plan_shape.get();
+        let shape_bodies = !shaping
+            && (sel.filter.is_some()
+                || !pushed.is_empty()
+                || sel.joins.iter().any(|j| j.on.is_some()));
+        let mut shaped: Vec<bool> = vec![false; from_items.len()];
         // Per FROM item: the index into `synthetic` of a derived table's relation, else `None`.
         let mut derived_meta: Vec<Option<usize>> = Vec::with_capacity(from_items.len());
         // Per FROM item: true when it is a CORRELATED lateral relation (§44) — its body / SRF args
@@ -114,17 +124,40 @@ impl Engine {
                 // ENCLOSING query's scope (§42): the body sees no sibling FROM item, but a column of
                 // an enclosing query level correlates in the same frame as this query's own outer
                 // references (PostgreSQL). A VALUES body resolves its values the same way.
-                let plan = if let Some((_, view_name)) = &view_items[i] {
+                //   A query body is first planned as a SHAPE (planner.md §3.2): stage 2 needs only
+                // its output columns and pushability, and the body is planned for real once stage 2
+                // knows what it pushes into it. A correlated LATERAL body takes no pushdown, so it is
+                // planned for real right away, against the same prefix scope.
+                let stand_in = match &view_items[i] {
+                    Some((_, view_name)) if shaping => self.view_stand_in(view_name),
+                    _ => None,
+                };
+                let plan = if let Some(stand_in) = stand_in {
+                    stand_in
+                } else if let Some((_, view_name)) = &view_items[i] {
                     let body = tref
                         .subquery
                         .as_deref()
                         .expect("a view reference has a body");
-                    self.plan_view_reference(view_name, body, written_items[i], ptypes)?
+                    self.plan_body_first(shape_bodies, || {
+                        self.plan_view_reference(view_name, body, written_items[i], ptypes)
+                    })?
                 } else if lateral_eligible {
                     let prefix =
                         build_prefix_scope(&finalized, &synthetic, &group_subs, parent, self, ctes);
                     match (&tref.subquery, &tref.values) {
-                        (Some(body), _) => self.plan_query(body, Some(&prefix), ctes, ptypes)?,
+                        (Some(body), _) => {
+                            let shape = self.plan_body_first(shape_bodies, || {
+                                self.plan_query(body, Some(&prefix), ctes, ptypes)
+                            })?;
+                            if shape_bodies && query_plan_references_outer(&shape, 0) {
+                                self.plan_again(ctes, || {
+                                    self.plan_query(body, Some(&prefix), ctes, ptypes)
+                                })?
+                            } else {
+                                shape
+                            }
+                        }
                         (None, Some(rows)) => QueryPlan::Values(self.plan_values(
                             rows,
                             Some(&prefix),
@@ -135,14 +168,18 @@ impl Engine {
                     }
                 } else {
                     match (&tref.subquery, &tref.values) {
-                        (Some(body), _) => self.plan_query(body, parent, ctes, ptypes)?,
+                        (Some(body), _) => self.plan_body_first(shape_bodies, || {
+                            self.plan_query(body, parent, ctes, ptypes)
+                        })?,
                         (None, Some(rows)) => {
                             QueryPlan::Values(self.plan_values(rows, parent, ctes, ptypes)?)
                         }
                         _ => unreachable!(),
                     }
                 };
-                lateral_flags.push(lateral_eligible && query_plan_references_outer(&plan, 0));
+                let lateral = lateral_eligible && query_plan_references_outer(&plan, 0);
+                shaped[i] = shape_bodies && tref.subquery.is_some() && !lateral;
+                lateral_flags.push(lateral);
                 let label = tref.alias.clone().unwrap_or_default().to_string();
                 let mut table = cte_synthetic_table(&label, &plan, tref.column_aliases.as_deref())?;
                 // An unaliased parenthesized join's columns are its inner columns, collation included.
@@ -1463,50 +1500,99 @@ impl Engine {
         // fold_uncorrelated_in_plan is NOT a planner rewrite — it executes subqueries and needs
         // bound params, so it stays post-bind in run_query_expr.
         rewrite_where(&mut plan);
-        self.replan_pushed_bodies(&mut plan, &from_items, &isolated, parent, ctes, ptypes)?;
+        // A shape is read for its outputs and pushability only, then discarded (planner.md §3.2).
+        if shaping {
+            return Ok(plan);
+        }
+        self.plan_derived_bodies(
+            &mut plan,
+            &from_items,
+            &isolated,
+            &shaped,
+            parent,
+            ctes,
+            ptypes,
+        )?;
         //
         // ——— Stage 3: physical/access-path selection (spec/design/planner.md §4) ———
         self.optimize_select(&mut plan, &scope);
         Ok(plan)
     }
 
-    /// Plan each derived body that stage 2 moved conjuncts into again from its syntax, with those
-    /// conjuncts appended to its WHERE (spec/design/planner.md §3.2), so the body's own rewrite and
-    /// access-path selection see them. Planning again must have no other effect: the CTE reference
-    /// counts the first planning recorded are restored, keeping every CTE's mode unchanged.
-    fn replan_pushed_bodies<'a>(
+    /// Run `f`, the first planning of a derived body: as its shape when `shape` (planner.md §3.2),
+    /// else as its real plan.
+    fn plan_body_first<T>(&self, shape: bool, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        if !shape {
+            return f();
+        }
+        // A shape's view expansions are counted again when the body is planned for real.
+        let saved = self.plan_shape.replace(true);
+        let expansions = self.view_expansions.get();
+        let out = f();
+        self.plan_shape.set(saved);
+        self.view_expansions.set(expansions);
+        out
+    }
+
+    /// Run `f` as the second planning of a body whose shape was already planned. Planning again
+    /// must have no other effect: the CTE reference counts the shape recorded are restored, keeping
+    /// every CTE's mode unchanged.
+    fn plan_again<T>(&self, ctes: &[&CteBinding], f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let refs: Vec<usize> = ctes.iter().map(|b| b.refs.get()).collect();
+        let out = f();
+        for (b, r) in ctes.iter().zip(refs) {
+            b.refs.set(r);
+        }
+        out
+    }
+
+    /// Plan each derived body whose shape stage 2 read for real, from its syntax (spec/design/
+    /// planner.md §3.2). A body that stage 2 moved conjuncts into gets them appended to its WHERE, so
+    /// its own rewrite and access-path selection see them; any other body is planned as written.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_derived_bodies<'a>(
         &'a self,
         plan: &mut SelectPlan,
         from_items: &[&TableRef],
         isolated: &[bool],
+        shaped: &[bool],
         parent: Option<&Scope<'a>>,
         ctes: &'a [&'a CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<()> {
-        for (i, pushed) in plan.take_body_pushes().into_iter().enumerate() {
-            if pushed.is_empty() {
+        let mut pushes = plan.take_body_pushes();
+        pushes.resize_with(shaped.len(), Vec::new);
+        for (i, pushed) in pushes.into_iter().enumerate() {
+            debug_assert!(
+                pushed.is_empty() || shaped[i],
+                "only a shaped body takes a pushdown"
+            );
+            if !shaped[i] {
                 continue;
             }
             let Some(body_expr) = from_items[i].subquery.as_deref() else {
-                unreachable!("a body-pushed relation is a derived table")
+                unreachable!("a shaped relation is a derived table")
             };
-            let first = plan.rels[i]
+            let shape = plan.rels[i]
                 .derived
                 .take()
-                .expect("a body-pushed relation has a planned body");
-            let refs: Vec<usize> = ctes.iter().map(|b| b.refs.get()).collect();
-            // A view body is planned again in its isolated scope (views.md §4.1).
-            let body = if isolated[i] {
-                self.in_view_body(|| {
-                    self.replan_pushed_query(body_expr, *first, &pushed, None, &[], ptypes)
-                })
-            } else {
-                self.replan_pushed_query(body_expr, *first, &pushed, parent, ctes, ptypes)
+                .expect("a shaped relation has a planned body");
+            let replan = |parent: Option<&Scope<'a>>, ctes: &'a [&'a CteBinding], ptypes| {
+                if pushed.is_empty() {
+                    self.plan_query(body_expr, parent, ctes, ptypes)
+                } else {
+                    self.replan_pushed_query(body_expr, *shape, &pushed, parent, ctes, ptypes)
+                }
             };
-            for (b, r) in ctes.iter().zip(refs) {
-                b.refs.set(r);
-            }
-            plan.rels[i].derived = Some(Box::new(body?));
+            // A view body is planned in its isolated scope (views.md §4.1).
+            let body = self.plan_again(ctes, || {
+                if isolated[i] {
+                    self.in_view_body(|| replan(None, &[], ptypes))
+                } else {
+                    replan(parent, ctes, ptypes)
+                }
+            })?;
+            plan.rels[i].derived = Some(Box::new(body));
         }
         Ok(())
     }

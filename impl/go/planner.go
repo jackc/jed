@@ -69,6 +69,17 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	// SRF args reference an earlier sibling (or an enclosing query), so the executor re-materializes
 	// it per combined left-hand row. A non-correlated item (or the first item) is materialized once.
 	lateralFlags := make([]bool, len(tableRefs))
+	// shaped[i] is true when derivedPlans[i] holds only the body's SHAPE (planner.md §3.2), which
+	// stage 2 reads and planDerivedBodies then replaces with the body's real plan. Only a SELECT with
+	// a WHERE, an ON, or pushed conjuncts can push into a body, so only its bodies are shaped. Inside
+	// a shape (db.planShape set) bodies are planned once and kept.
+	shaping := db.planShape
+	mayPush := sel.Filter != nil || len(pushed) > 0
+	for _, j := range sel.Joins {
+		mayPush = mayPush || j.On != nil
+	}
+	shapeBodies := !shaping && mayPush
+	shaped := make([]bool, len(tableRefs))
 	seenLabels := make(map[string]bool)
 	offset := 0
 	// The inner labels and hidden USING copies of each unaliased parenthesized join (§15).
@@ -102,19 +113,45 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			if lateralEligible {
 				bodyParent = lateralParent
 			}
+			//   A query body is first planned as a SHAPE (planner.md §3.2): stage 2 needs only its output
+			// columns and pushability, and the body is planned for real once stage 2 knows what it pushes
+			// into it. A correlated LATERAL body takes no pushdown, so it is planned for real right away,
+			// against the same prefix scope.
 			var plan queryPlan
-			if isolated[i] {
-				p, perr := db.planViewReference(viewNames[i], tref.Subquery, &writtenRefs[i], ptypes)
-				if perr != nil {
-					return nil, perr
+			standIn, isStandIn := queryPlan{}, false
+			if isolated[i] && shaping {
+				standIn, isStandIn = db.viewStandIn(viewNames[i])
+			}
+			if isStandIn {
+				plan = standIn
+			} else if isolated[i] {
+				err := db.planBodyFirst(shapeBodies, func() error {
+					p, perr := db.planViewReference(viewNames[i], tref.Subquery, &writtenRefs[i], ptypes)
+					plan = p
+					return perr
+				})
+				if err != nil {
+					return nil, err
 				}
-				plan = p
 			} else if tref.Subquery != nil {
-				p, perr := db.planQuery(*tref.Subquery, bodyParent, ctes, ptypes)
-				if perr != nil {
-					return nil, perr
+				err := db.planBodyFirst(shapeBodies, func() error {
+					p, perr := db.planQuery(*tref.Subquery, bodyParent, ctes, ptypes)
+					plan = p
+					return perr
+				})
+				if err != nil {
+					return nil, err
 				}
-				plan = p
+				if shapeBodies && lateralEligible && queryPlanReferencesOuter(&plan, 0) {
+					err := db.planAgain(ctes, func() error {
+						p, perr := db.planQuery(*tref.Subquery, bodyParent, ctes, ptypes)
+						plan = p
+						return perr
+					})
+					if err != nil {
+						return nil, err
+					}
+				}
 			} else {
 				vp, verr := db.planValues(tref.Values, bodyParent, ctes, ptypes)
 				if verr != nil {
@@ -123,6 +160,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				plan = queryPlan{values: vp}
 			}
 			lateralFlags[i] = lateralEligible && queryPlanReferencesOuter(&plan, 0)
+			shaped[i] = shapeBodies && tref.Subquery != nil && !lateralFlags[i]
 			label := ""
 			if tref.Alias != nil {
 				label = *tref.Alias
@@ -1146,7 +1184,11 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	// foldUncorrelatedInPlan is NOT a planner rewrite — it executes subqueries and needs bound
 	// params, so it stays post-bind in runQueryExpr.
 	rewriteWhere(plan)
-	if err := db.replanPushedBodies(plan, tableRefs, isolated, parent, ctes, ptypes); err != nil {
+	// A shape is read for its outputs and pushability only, then discarded (planner.md §3.2).
+	if shaping {
+		return plan, nil
+	}
+	if err := db.planDerivedBodies(plan, tableRefs, isolated, shaped, parent, ctes, ptypes); err != nil {
 		return nil, err
 	}
 	//
@@ -1155,43 +1197,77 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	return plan, nil
 }
 
-// replanPushedBodies plans each derived body that stage 2 moved conjuncts into again from its syntax,
-// with those conjuncts appended to its WHERE (spec/design/planner.md §3.2), so the body's own
-// rewrite and access-path selection see them. Planning again must have no other effect: the CTE
-// reference counts the first planning recorded are restored, keeping every CTE's mode unchanged.
-func (db *engine) replanPushedBodies(plan *selectPlan, tableRefs []tableRef, isolated []bool, parent *scope, ctes []*cteBinding, ptypes *paramTypes) error {
-	if plan.pushdown == nil || plan.pushdown.bodyPushes == nil {
-		return nil
+// planBodyFirst runs f, the first planning of a derived body: as its shape when shape (planner.md
+// §3.2), else as its real plan. A shape's view expansions are counted again when the body is planned
+// for real.
+func (db *engine) planBodyFirst(shape bool, f func() error) error {
+	if !shape {
+		return f()
 	}
-	for i, pushed := range plan.pushdown.bodyPushes {
-		if len(pushed) == 0 {
+	saved, expansions := db.planShape, db.viewExpansions
+	db.planShape = true
+	err := f()
+	db.planShape, db.viewExpansions = saved, expansions
+	return err
+}
+
+// planAgain runs f as the second planning of a body whose shape was already planned. Planning again
+// must have no other effect: the CTE reference counts the shape recorded are restored, keeping every
+// CTE's mode unchanged.
+func (db *engine) planAgain(ctes []*cteBinding, f func() error) error {
+	refs := make([]int, len(ctes))
+	for ci, b := range ctes {
+		refs[ci] = b.refs
+	}
+	err := f()
+	for ci, b := range ctes {
+		b.refs = refs[ci]
+	}
+	return err
+}
+
+// planDerivedBodies plans each derived body whose shape stage 2 read for real, from its syntax
+// (spec/design/planner.md §3.2). A body that stage 2 moved conjuncts into gets them appended to its
+// WHERE, so its own rewrite and access-path selection see them; any other body is planned as written.
+func (db *engine) planDerivedBodies(plan *selectPlan, tableRefs []tableRef, isolated, shaped []bool, parent *scope, ctes []*cteBinding, ptypes *paramTypes) error {
+	var pushes [][]*rExpr
+	if plan.pushdown != nil {
+		pushes = plan.pushdown.bodyPushes
+		plan.pushdown.bodyPushes = nil
+	}
+	for i := range shaped {
+		if !shaped[i] {
 			continue
 		}
-		refs := make([]int, len(ctes))
-		for ci, b := range ctes {
-			refs[ci] = b.refs
+		var pushed []*rExpr
+		if i < len(pushes) {
+			pushed = pushes[i]
+		}
+		shape := plan.rels[i].derived
+		replan := func(parent *scope, ctes []*cteBinding) (queryPlan, error) {
+			if len(pushed) == 0 {
+				return db.planQuery(*tableRefs[i].Subquery, parent, ctes, ptypes)
+			}
+			return db.replanPushedQuery(*tableRefs[i].Subquery, shape, pushed, parent, ctes, ptypes)
 		}
 		var body queryPlan
-		var err error
-		if isolated[i] {
-			// A view body is planned again in its isolated scope (views.md §4.1).
-			err = db.inViewBody(func() error {
-				var rerr error
-				body, rerr = db.replanPushedQuery(*tableRefs[i].Subquery, plan.rels[i].derived, pushed, nil, nil, ptypes)
-				return rerr
-			})
-		} else {
-			body, err = db.replanPushedQuery(*tableRefs[i].Subquery, plan.rels[i].derived, pushed, parent, ctes, ptypes)
-		}
-		for ci, b := range ctes {
-			b.refs = refs[ci]
-		}
+		err := db.planAgain(ctes, func() error {
+			var rerr error
+			if isolated[i] {
+				// A view body is planned in its isolated scope (views.md §4.1).
+				return db.inViewBody(func() error {
+					body, rerr = replan(nil, nil)
+					return rerr
+				})
+			}
+			body, rerr = replan(parent, ctes)
+			return rerr
+		})
 		if err != nil {
 			return err
 		}
 		plan.rels[i].derived = &body
 	}
-	plan.pushdown.bodyPushes = nil
 	return nil
 }
 

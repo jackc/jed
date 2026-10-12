@@ -21,6 +21,10 @@ use crate::parser::{parse_view_definition, render_tokens};
 use crate::token::Token;
 use std::collections::BTreeMap;
 
+/// The most views one view reference written outside any view body may expand to, itself and
+/// every view reached through it included (spec/design/views.md §4.1; 54001).
+pub(crate) const MAX_VIEW_EXPANSIONS: usize = 1024;
+
 /// What one traced planning pass of a view body binds (spec/design/views.md §5/§6/§7).
 #[derive(Default)]
 pub(crate) struct ViewTrace {
@@ -168,7 +172,8 @@ impl Engine {
 
     /// Run `f` as the planning of a view body (views.md §4.1): the trace of an enclosing view body
     /// is suspended (a nested view's own relations are not the outer view's dependencies), and the
-    /// expansion nesting counts toward `MAX_EXPR_DEPTH` (54001).
+    /// expansion nesting counts toward `MAX_EXPR_DEPTH` and the expansion toward
+    /// `MAX_VIEW_EXPANSIONS` (54001).
     pub(crate) fn in_view_body<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let depth = self.view_depth.get() + 1;
         if depth > crate::parser::MAX_EXPR_DEPTH {
@@ -180,10 +185,28 @@ impl Engine {
                 ),
             ));
         }
+        // A view reference written outside any view body starts a new expansion count.
+        let expansions = if depth == 1 {
+            1
+        } else {
+            self.view_expansions.get() + 1
+        };
+        if expansions > MAX_VIEW_EXPANSIONS {
+            return Err(EngineError::new(
+                SqlState::StatementTooComplex,
+                format!(
+                    "statement too complex: a view reference expands to more than {MAX_VIEW_EXPANSIONS} views"
+                ),
+            ));
+        }
+        self.view_expansions.set(expansions);
         let saved = self.view_trace.borrow_mut().take();
         self.view_depth.set(depth);
         let out = f();
         self.view_depth.set(depth - 1);
+        if depth == 1 {
+            self.view_columns.borrow_mut().clear();
+        }
         *self.view_trace.borrow_mut() = saved;
         out
     }
@@ -289,7 +312,34 @@ impl Engine {
                 },
             );
         }
-        self.in_view_body(|| self.plan_query(body, None, &[], ptypes))
+        self.in_view_body(|| {
+            let plan = self.plan_query(body, None, &[], ptypes)?;
+            self.view_columns
+                .borrow_mut()
+                .entry(view_name.to_string())
+                .or_insert_with(|| {
+                    (
+                        plan.column_names().to_vec(),
+                        plan.column_types().to_vec(),
+                        plan.column_derivs().to_vec(),
+                    )
+                });
+            Ok(plan)
+        })
+    }
+
+    /// The stand-in for a view reference inside a shape (planner.md §3.2) whose view was already
+    /// planned during this expansion: a row-less VALUES relation with the view's output columns.
+    /// A shape is read only for its own outputs and pushability, never for its relations' bodies.
+    pub(crate) fn view_stand_in(&self, view_name: &str) -> Option<QueryPlan> {
+        let columns = self.view_columns.borrow();
+        let (names, types, derivs) = columns.get(view_name)?;
+        Some(QueryPlan::Values(ValuesPlan {
+            rows: Vec::new(),
+            column_types: types.clone(),
+            column_names: names.clone(),
+            column_derivs: derivs.clone(),
+        }))
     }
 
     /// A view reached through an attachment qualifier (`FROM reports.v`) is 0A000 in this slice

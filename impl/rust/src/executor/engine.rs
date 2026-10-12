@@ -45,6 +45,9 @@ impl Engine {
             explain_actual: std::cell::RefCell::new(None),
             view_trace: std::cell::RefCell::new(None),
             view_depth: std::cell::Cell::new(0),
+            plan_shape: std::cell::Cell::new(false),
+            view_expansions: std::cell::Cell::new(0),
+            view_columns: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -78,6 +81,9 @@ impl Engine {
             explain_actual: std::cell::RefCell::new(None),
             view_trace: std::cell::RefCell::new(None),
             view_depth: std::cell::Cell::new(0),
+            plan_shape: std::cell::Cell::new(false),
+            view_expansions: std::cell::Cell::new(0),
+            view_columns: std::cell::RefCell::new(HashMap::new()),
         }
     }
 

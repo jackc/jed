@@ -679,6 +679,7 @@ var SupportedCapabilities = []string{
 	// jsonpath compiler's nesting (54001), keeping every recursive walk stack-safe (CLAUDE.md §13;
 	// json.md §6.4).
 	"resource.json_depth_limit",
+	"resource.view_expansion_limit",
 	// Pure built-in surface — no function/operator or statement reaches the host (filesystem,
 	// network, process, environment) or adds nondeterminism outside the entropy seam; escape-hatch
 	// calls are 42883 and escape-hatch statements 42601 (CLAUDE.md §13; functions.md §13).

@@ -228,6 +228,31 @@ pushed conjunct can now bound the body's key) treat it exactly as if it had been
 in particular the statement's CTE reference counts, and so every CTE's inline/materialize mode, are
 unchanged. A conjunct that moved into a body is evaluated nowhere in the outer SELECT.
 
+**Planning work.** Planning is unmetered, so its work must not grow faster than the statement.
+Planning each body in full and then again with its pushed conjuncts doubles the work per nesting
+level: a chain of `d` derived tables or views, each with a `WHERE` that pushes into the next, took
+`2^d` plannings. Each core therefore plans a derived body in two passes when the enclosing SELECT
+has a WHERE, an ON, or pushed conjuncts of its own (the only SELECTs that can push into a body):
+
+1. The body's **shape** is planned first. A shape is resolved like any body, through stage 2, but
+   its own derived bodies are planned once, as shapes, and it skips the second pass below and
+   stage 3. Stage 2 of the enclosing SELECT reads only the shape's output columns and the
+   pushability above, never the plans of the shape's own relations. Inside a shape, a reference to
+   a view already planned during the same outermost view expansion is therefore replaced by a
+   row-less relation with that view's output columns.
+2. After stage 2, every shaped body is planned for real from its syntax, with whatever stage 2
+   pushed into it (possibly nothing). A correlated LATERAL body takes no pushdown, so it is planned
+   for real as soon as its shape shows the correlation.
+
+A SELECT with no WHERE, ON, or pushed conjunct plans each body once, for real. Every body is
+therefore planned for real exactly once per real planning of its enclosing SELECT, and shapes are
+linear in the size of the expansion, so a chain of `d` views plans in `O(d)` and `d` nested derived
+tables in one statement in `O(d²)` (`d` is bounded by `MAX_EXPR_DEPTH`, [cost.md](cost.md) §7).
+The passes change no result, cost, estimate, plan, or error. A shape counts each CTE reference its
+body makes, and the real plan that replaces it restores those counts, so every CTE keeps its mode. A
+shape's view expansions are discarded instead, and only the real plans count them toward
+`MAX_VIEW_EXPANSIONS`, which bounds the expansion itself ([views.md](views.md) §4.1).
+
 **Scan form.** The conjuncts scan-pushed to a relation form its **pushed filter**; all conjuncts that
 were neither scan- nor body-pushed form the **residual**. Each is rebuilt as the **left-deep AND of its
 conjuncts in source order** (so a filter of `n` conjuncts has `n − 1` AND nodes; the original WHERE's

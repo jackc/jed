@@ -167,20 +167,37 @@ func (db *engine) traceTableItem(tref *tableRef, table *catTable) error {
 	return nil
 }
 
+// maxViewExpansions is the most views one view reference written outside any view body may expand
+// to, itself and every view reached through it included (spec/design/views.md §4.1; 54001).
+const maxViewExpansions = 1024
+
 // inViewBody runs f as the planning of a view body (views.md §4.1): the trace of an enclosing view
 // body is suspended (a nested view's own relations are not the outer view's dependencies), and the
-// expansion nesting counts toward maxExprDepth (54001).
+// expansion nesting counts toward maxExprDepth and the expansion toward maxViewExpansions (54001).
 func (db *engine) inViewBody(f func() error) error {
 	depth := db.viewDepth + 1
 	if depth > maxExprDepth {
 		return newError(StatementTooComplex, fmt.Sprintf(
 			"statement too complex: nesting depth exceeds the maximum of %d", maxExprDepth))
 	}
+	// A view reference written outside any view body starts a new expansion count.
+	expansions := db.viewExpansions + 1
+	if depth == 1 {
+		expansions = 1
+	}
+	if expansions > maxViewExpansions {
+		return newError(StatementTooComplex, fmt.Sprintf(
+			"statement too complex: a view reference expands to more than %d views", maxViewExpansions))
+	}
+	db.viewExpansions = expansions
 	saved := db.viewTrace
 	db.viewTrace = nil
 	db.viewDepth = depth
 	err := f()
 	db.viewDepth = depth - 1
+	if depth == 1 {
+		db.viewColumns = nil
+	}
 	db.viewTrace = saved
 	return err
 }
@@ -278,9 +295,31 @@ func (db *engine) planViewReference(viewName string, body *queryExpr, written *t
 	err := db.inViewBody(func() error {
 		var perr error
 		plan, perr = db.planQuery(*body, nil, nil, ptypes)
-		return perr
+		if perr != nil {
+			return perr
+		}
+		if db.viewColumns == nil {
+			db.viewColumns = make(map[string]*valuesPlan)
+		}
+		if _, ok := db.viewColumns[viewName]; !ok {
+			db.viewColumns[viewName] = &valuesPlan{
+				columnTypes: plan.columnTypes(), columnNames: plan.columnNames(), columnDerivs: plan.columnDerivs(),
+			}
+		}
+		return nil
 	})
 	return plan, err
+}
+
+// viewStandIn is the stand-in for a view reference inside a shape (planner.md §3.2) whose view was
+// already planned during this expansion: a row-less VALUES relation with the view's output columns.
+// A shape is read only for its own outputs and pushability, never for its relations' bodies.
+func (db *engine) viewStandIn(viewName string) (queryPlan, bool) {
+	cols, ok := db.viewColumns[viewName]
+	if !ok {
+		return queryPlan{}, false
+	}
+	return queryPlan{values: cols}, true
 }
 
 // rejectAttachedView refuses a view reached through an attachment qualifier (`FROM reports.v`) with

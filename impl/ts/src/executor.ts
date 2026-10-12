@@ -746,6 +746,10 @@ export const DEFAULT_MAX_TEMP_STORAGE_BYTES = 1 << 30;
 // input-size cap nor the parser nesting counter sees it (cost.md §7).
 export const MAX_COMPOSITE_DEPTH = 32;
 
+// MAX_VIEW_EXPANSIONS is the most views one view reference written outside any view body may expand
+// to, itself and every view reached through it included (spec/design/views.md §4.1; 54001).
+export const MAX_VIEW_EXPANSIONS = 1024;
+
 // SQL_BYTE_ENCODER measures a statement's UTF-8 byte length for the input-size gate (cost.md §7),
 // matching the byte counts Rust (&str::len) and Go (len(string)) use, so the cap accepts / rejects
 // identically across cores (§8). A TextEncoder is available in Node and the browser (the OPFS
@@ -1438,6 +1442,19 @@ export class Engine {
   // How many view references are being expanded inside one another right now (views.md §4.1):
   // nesting counts toward MAX_EXPR_DEPTH (54001).
   private viewDepth = 0;
+  // Whether the planner is building a derived body's SHAPE (spec/design/planner.md §3.2): a first
+  // plan read only for its output columns and pushability, then discarded and planned again. A shape
+  // skips its own bodies' second planning and stage 3, so every derived body is planned at most twice
+  // per enclosing planning and nesting depth d costs O(d²), not 2^d.
+  private planShape = false;
+  // How many views the outermost view reference being expanded has expanded so far, itself included
+  // (views.md §4.1): at most MAX_VIEW_EXPANSIONS (54001).
+  private viewExpansions = 0;
+  // The output columns of every view planned during the outermost view expansion in progress, by
+  // view name: a view reference inside a shape reads them instead of planning the view body again
+  // (planner.md §3.2), so a chain of d views is planned in O(d). Cleared when the outermost
+  // expansion ends.
+  private viewColumns = new Map<string, ValuesPlan>();
   // Inbound NO ACTION/RESTRICT probes deferred until the outermost recursive action closure has
   // reached its fixed point (§6.6). Empty between statements.
   private fkDeferredChecks: {
@@ -12892,7 +12909,8 @@ export class Engine {
 
   // inViewBody runs f as the planning of a view body (views.md §4.1): the trace of an enclosing view
   // body is suspended (a nested view's own relations are not the outer view's dependencies), and the
-  // expansion nesting counts toward MAX_EXPR_DEPTH (54001).
+  // expansion nesting counts toward MAX_EXPR_DEPTH and the expansion toward MAX_VIEW_EXPANSIONS
+  // (54001).
   private inViewBody<T>(f: () => T): T {
     const depth = this.viewDepth + 1;
     if (depth > MAX_EXPR_DEPTH) {
@@ -12901,6 +12919,15 @@ export class Engine {
         `statement too complex: nesting depth exceeds the maximum of ${MAX_EXPR_DEPTH}`,
       );
     }
+    // A view reference written outside any view body starts a new expansion count.
+    const expansions = depth === 1 ? 1 : this.viewExpansions + 1;
+    if (expansions > MAX_VIEW_EXPANSIONS) {
+      throw engineError(
+        "statement_too_complex",
+        `statement too complex: a view reference expands to more than ${MAX_VIEW_EXPANSIONS} views`,
+      );
+    }
+    this.viewExpansions = expansions;
     const saved = this.viewTrace;
     this.viewTrace = null;
     this.viewDepth = depth;
@@ -12908,6 +12935,7 @@ export class Engine {
       return f();
     } finally {
       this.viewDepth = depth - 1;
+      if (depth === 1) this.viewColumns.clear();
       this.viewTrace = saved;
     }
   }
@@ -12991,7 +13019,19 @@ export class Engine {
       const pos = written.pos ?? { name: -1, alias: null, list: null };
       this.viewTrace.items.set(pos.name, { kind: "view", name: viewName, pos });
     }
-    return this.inViewBody(() => this.planQuery(body, null, [], ptypes));
+    return this.inViewBody(() => {
+      const plan = this.planQuery(body, null, [], ptypes);
+      if (!this.viewColumns.has(viewName)) {
+        this.viewColumns.set(viewName, {
+          kind: "values",
+          rows: [],
+          columnTypes: plan.columnTypes,
+          columnNames: plan.columnNames,
+          columnDerivs: queryPlanColumnDerivs(plan),
+        });
+      }
+      return plan;
+    });
   }
 
   // rejectAttachedView: a view reached through an attachment qualifier (FROM reports.v) is 0A000 in
@@ -13750,6 +13790,15 @@ export class Engine {
     // SRF args reference an earlier sibling (or an enclosing query), so the executor re-materializes
     // it per combined left-hand row. A non-correlated item (or the first item) is materialized once.
     const lateralFlags: boolean[] = [];
+    // shaped[i] is true when FROM item i's derived plan is only the body's SHAPE (planner.md §3.2),
+    // which stage 2 reads and planDerivedBodies then replaces with the body's real plan. Only a
+    // SELECT with a WHERE, an ON, or pushed conjuncts can push into a body, so only its bodies are
+    // shaped. Inside a shape (planShape set) bodies are planned once and kept.
+    const shaping = this.planShape;
+    const shapeBodies =
+      !shaping &&
+      (sel.filter !== null || pushed.length > 0 || sel.joins.some((j) => j.on !== null));
+    const shaped: boolean[] = tableRefs.map(() => false);
     const seenLabels = new Set<string>();
     let offset = 0;
     // The inner labels and hidden USING copies of each unaliased parenthesized join (§15).
@@ -13789,14 +13838,37 @@ export class Engine {
         // column of an enclosing query level correlates in the same frame as this query's own outer
         // references (PostgreSQL). A VALUES body resolves its values the same way.
         const bodyParent = lateralEligible ? lateralParent : parent;
+        //   A query body is first planned as a SHAPE (planner.md §3.2): stage 2 needs only its output
+        // columns and pushability, and the body is planned for real once stage 2 knows what it pushes
+        // into it. A correlated LATERAL body takes no pushdown, so it is planned for real right away,
+        // against the same prefix scope.
         const viewItem = viewItems[i];
-        const plan =
-          viewItem != null
-            ? this.planViewReference(viewItem.viewName, tref.subquery!, writtenItems[i]!, ptypes)
+        // A view reference inside a shape whose view was already planned during this expansion is a
+        // row-less VALUES stand-in with the view's output columns: a shape is read only for its own
+        // outputs and pushability, never for its relations' bodies.
+        const standIn = viewItem != null && shaping ? this.viewColumns.get(viewItem.viewName) : undefined;
+        let plan =
+          standIn !== undefined
+            ? standIn
+            : viewItem != null
+            ? this.planBodyFirst(shapeBodies, () =>
+                this.planViewReference(viewItem.viewName, tref.subquery!, writtenItems[i]!, ptypes),
+              )
             : tref.subquery !== undefined
-              ? this.planQuery(tref.subquery, bodyParent, ctes, ptypes)
+              ? this.planBodyFirst(shapeBodies, () =>
+                  this.planQuery(tref.subquery!, bodyParent, ctes, ptypes),
+                )
               : this.planValues(tref.values!, bodyParent, ctes, ptypes);
+        if (
+          shapeBodies &&
+          lateralEligible &&
+          tref.subquery !== undefined &&
+          queryPlanReferencesOuter(plan, 0)
+        ) {
+          plan = this.planAgain(ctes, () => this.planQuery(tref.subquery!, bodyParent, ctes, ptypes));
+        }
         lateral = lateralEligible && queryPlanReferencesOuter(plan, 0);
+        shaped[i] = shapeBodies && tref.subquery !== undefined && !lateral;
         const label = tref.alias === null ? "" : tref.alias;
         t = cteSyntheticTable(label, plan, tref.columnAliases ?? null);
         // An unaliased parenthesized join's columns are its inner columns, collation included.
@@ -14689,60 +14761,75 @@ export class Engine {
     // foldUncorrelatedInPlan is NOT a planner rewrite — it executes subqueries and needs bound
     // params, so it stays post-bind in the statement drivers.
     rewriteWhere(plan);
-    this.replanPushedBodies(plan, tableRefs, isolated, parent, ctes, ptypes);
+    // A shape is read for its outputs and pushability only, then discarded (planner.md §3.2).
+    if (shaping) return plan;
+    this.planDerivedBodies(plan, tableRefs, isolated, shaped, parent, ctes, ptypes);
     //
     // ——— Stage 3: physical/access-path selection (spec/design/planner.md §4) ———
     optimizeSelect(plan, scope.rels, this.readSnap(), this);
     return plan;
   }
 
-  // replanPushedBodies plans each derived body that stage 2 moved conjuncts into again from its
-  // syntax, with those conjuncts appended to its WHERE (spec/design/planner.md §3.2), so the body's
-  // own rewrite and access-path selection see them. Planning again must have no other effect: the
-  // CTE reference counts the first planning recorded are restored, keeping every CTE's mode unchanged.
-  private replanPushedBodies(
+  // planBodyFirst runs f, the first planning of a derived body: as its shape when shape (planner.md
+  // §3.2), else as its real plan. A shape's view expansions are counted again when the body is
+  // planned for real.
+  private planBodyFirst<T>(shape: boolean, f: () => T): T {
+    if (!shape) return f();
+    const saved = this.planShape;
+    const expansions = this.viewExpansions;
+    this.planShape = true;
+    try {
+      return f();
+    } finally {
+      this.planShape = saved;
+      this.viewExpansions = expansions;
+    }
+  }
+
+  // planAgain runs f as the second planning of a body whose shape was already planned. Planning
+  // again must have no other effect: the CTE reference counts the shape recorded are restored,
+  // keeping every CTE's mode unchanged.
+  private planAgain<T>(ctes: CteBinding[], f: () => T): T {
+    const refs = ctes.map((b) => b.refs);
+    try {
+      return f();
+    } finally {
+      ctes.forEach((b, ci) => {
+        b.refs = refs[ci]!;
+      });
+    }
+  }
+
+  // planDerivedBodies plans each derived body whose shape stage 2 read for real, from its syntax
+  // (spec/design/planner.md §3.2). A body that stage 2 moved conjuncts into gets them appended to its
+  // WHERE, so its own rewrite and access-path selection see them; any other body is planned as
+  // written.
+  private planDerivedBodies(
     plan: SelectPlan,
     tableRefs: TableRef[],
     isolated: boolean[],
+    shaped: boolean[],
     parent: Scope | null,
     ctes: CteBinding[],
     ptypes: ParamTypes,
   ): void {
     const pd = plan.pushdown;
-    if (pd === null || pd.bodyPushes === null) return;
-    pd.bodyPushes.forEach((pushed, i) => {
-      if (pushed.length === 0) return;
-      const refs = ctes.map((b) => b.refs);
-      let body: QueryPlan;
-      try {
-        // A view body is planned again in its isolated scope (views.md §4.1).
-        body = isolated[i]
-          ? this.inViewBody(() =>
-              this.replanPushedQuery(
-                tableRefs[i]!.subquery!,
-                plan.rels[i]!.derived!,
-                pushed,
-                null,
-                [],
-                ptypes,
-              ),
-            )
-          : this.replanPushedQuery(
-              tableRefs[i]!.subquery!,
-              plan.rels[i]!.derived!,
-              pushed,
-              parent,
-              ctes,
-              ptypes,
-            );
-      } finally {
-        ctes.forEach((b, ci) => {
-          b.refs = refs[ci]!;
-        });
-      }
-      plan.rels[i]!.derived = body;
+    const pushes = pd?.bodyPushes ?? [];
+    if (pd !== null) pd.bodyPushes = null;
+    shaped.forEach((isShaped, i) => {
+      if (!isShaped) return;
+      const pushed = pushes[i] ?? [];
+      const body = tableRefs[i]!.subquery!;
+      const shape = plan.rels[i]!.derived!;
+      const replan = (parent: Scope | null, ctes: CteBinding[]): QueryPlan =>
+        pushed.length === 0
+          ? this.planQuery(body, parent, ctes, ptypes)
+          : this.replanPushedQuery(body, shape, pushed, parent, ctes, ptypes);
+      // A view body is planned in its isolated scope (views.md §4.1).
+      plan.rels[i]!.derived = this.planAgain(ctes, () =>
+        isolated[i] ? this.inViewBody(() => replan(null, [])) : replan(parent, ctes),
+      );
     });
-    pd.bodyPushes = null;
   }
 
   // replanPushedQuery plans a body-pushable query expression again with conjuncts in its
@@ -15893,6 +15980,9 @@ export class Engine {
     // Never tracing a view body: an ordinary read plans view references untraced (views.md §5–§8).
     e.viewTrace = null;
     e.viewDepth = 0;
+    e.planShape = false;
+    e.viewExpansions = 0;
+    e.viewColumns = new Map();
     // Not profiling EXPLAIN ANALYZE: the lane gates test `explainActualProfile === null`, so leaving it
     // undefined would silently disable the vectorized/columnar lanes on every cursor — a lane choice
     // that must match the other cores (memory.md §5.4).

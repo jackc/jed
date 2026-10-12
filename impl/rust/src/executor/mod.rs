@@ -558,7 +558,23 @@ pub struct Engine {
     /// How many view references are being expanded inside one another right now (views.md §4.1):
     /// nesting counts toward `MAX_EXPR_DEPTH` (54001).
     pub(crate) view_depth: std::cell::Cell<usize>,
+    /// Whether the planner is building a derived body's **shape** (spec/design/planner.md §3.2): a
+    /// first plan read only for its output columns and pushability, then discarded and planned
+    /// again. A shape skips its own bodies' second planning and stage 3, so every derived body is
+    /// planned at most twice per enclosing planning and nesting depth `d` costs `O(d²)`, not `2^d`.
+    pub(crate) plan_shape: std::cell::Cell<bool>,
+    /// How many views the outermost view reference being expanded has expanded so far, itself
+    /// included (views.md §4.1): at most `MAX_VIEW_EXPANSIONS` (54001).
+    pub(crate) view_expansions: std::cell::Cell<usize>,
+    /// The output columns of every view planned during the outermost view expansion in progress,
+    /// by view name: a view reference inside a shape reads them instead of planning the view body
+    /// again (planner.md §3.2), so a chain of `d` views is planned in `O(d)`. Cleared when the
+    /// outermost expansion ends.
+    pub(crate) view_columns: std::cell::RefCell<HashMap<String, ViewColumns>>,
 }
+
+/// A view body's output columns: names, types, and collation derivations.
+pub(crate) type ViewColumns = (Vec<String>, Vec<ResolvedType>, Vec<Deriv>);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ActualCostKey {

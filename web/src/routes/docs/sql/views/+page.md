@@ -108,6 +108,11 @@ for the view, and the planner can push a filter into the view's query, so an out
 A view's query cannot see anything from the query that reads it: not its other tables, not its
 `WITH` names, and not an enclosing query's columns. A view can read other views.
 
+Each view reference expands to its whole query, including the views that query reads. One reference
+may expand to at most **1024** views, counting itself and every view reference reached through it.
+More is error `54001`, at `CREATE VIEW` too. This keeps views that each read the previous view
+twice, which double at every level, from making planning unbounded. PostgreSQL has no such limit.
+
 As with any query, rows come back in a defined order only when the outer query has an `ORDER BY`.
 
 ## `*` is fixed when the view is created

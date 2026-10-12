@@ -205,6 +205,18 @@ nesting counts toward the parser's `MAX_EXPR_DEPTH` (`54001`, [cost.md](cost.md)
 is parsed. Cycles cannot exist: a view can name only relations that already exist, and nothing in
 this slice redefines a view (§12).
 
+**Expansion limit.** A view expands like a macro, so views that each name the previous view twice
+expand to `2^d` view bodies at depth `d`. Planning is unmetered, so the expansion is bounded
+structurally. One view reference written outside any view body (in the statement, or in the body a
+`CREATE VIEW` defines) may expand to at most **`MAX_VIEW_EXPANSIONS = 1024`** views. The count
+includes the view itself and every view reference reached through it, at any depth, each counted
+once per reference. One more is **`54001`** (`statement_too_complex`, [cost.md](cost.md) §7e), also
+at `CREATE VIEW`, whose body is planned. Two written references are counted separately, so
+`FROM v9 a, v9 b` is within the limit when `v9` alone is. The count is a property of the statement
+and the catalog. It does not depend on how often the planner plans a body
+([planner.md](planner.md) §3.2): every view in the expansion is counted exactly once whatever is
+pushed into it.
+
 ## 5. Freezing `*` at `CREATE VIEW`
 
 PostgreSQL expands `*` when the view is defined, so a column later added to the base table does not
@@ -430,6 +442,7 @@ Recorded divergences from PostgreSQL (CLAUDE.md §1):
 | A zero-column view is `0A000` | the canonical text cannot express an empty select list after `*` expansion |
 | `ANALYZE v` succeeds silently; PG also emits a warning | jed has no notice channel |
 | `DROP SEQUENCE v` / `ALTER SEQUENCE v` are `42P01`; PG says `42809` | sequence statements already treat a table this way |
+| A reference that expands to more than 1024 views is `54001`; PG has no limit | planning is unmetered, so it is bounded structurally (CLAUDE.md §13; §4.1) |
 
 Deferred follow-ons, none foreclosed:
 

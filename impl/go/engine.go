@@ -120,6 +120,19 @@ type engine struct {
 	// viewDepth is how many view references are being expanded inside one another right now
 	// (views.md §4.1): nesting counts toward maxExprDepth (54001).
 	viewDepth int
+	// planShape is whether the planner is building a derived body's SHAPE (spec/design/planner.md
+	// §3.2): a first plan read only for its output columns and pushability, then discarded and
+	// planned again. A shape skips its own bodies' second planning and stage 3, so every derived body
+	// is planned at most twice per enclosing planning and nesting depth d costs O(d²), not 2^d.
+	planShape bool
+	// viewExpansions is how many views the outermost view reference being expanded has expanded so
+	// far, itself included (views.md §4.1): at most maxViewExpansions (54001).
+	viewExpansions int
+	// viewColumns holds the output columns of every view planned during the outermost view expansion
+	// in progress, by view name: a view reference inside a shape reads them instead of planning the
+	// view body again (planner.md §3.2), so a chain of d views is planned in O(d). Cleared when the
+	// outermost expansion ends.
+	viewColumns map[string]*valuesPlan
 }
 
 type estimatorTouchedRelation struct {

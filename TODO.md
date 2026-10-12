@@ -390,14 +390,23 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ## Resource admission follow-through
 
-- [ ] **Bound planning work for nested derived tables and views.** Predicate pushdown into a
-  derived body plans that body again, so planning roughly doubles per nesting level, and planning
-  is unmetered. Views make deep nesting a one-line definition each: in the Rust core, 258 chained
-  views with a `WHERE` did not finish planning in 10 minutes. This is a CLAUDE.md §13 gap for an
-  untrusted session that may create views (and already reachable with nested derived tables):
-  either make re-planning linear (plan a pushed body once, or memoize) or meter planning work
-  against the statement's cost ceiling. _(size: M)_ → [planner.md §3.2](spec/design/planner.md),
-  [views.md](spec/design/views.md)
+- [x] **Bound planning work for nested derived tables and views.** Predicate pushdown planned a
+  derived body in full and again with its pushed conjuncts, so planning doubled per nesting level
+  (258 chained views did not finish planning in 10 minutes). Each body is now planned first as a
+  cheap *shape* (outputs and pushability only, reusing the columns of views already planned in the
+  same expansion) and then once for real, so a chain of `d` views plans in `O(d)` and `d` nested
+  derived tables in `O(d²)`. View fan-out (views that each name the previous view twice) is bounded
+  by `MAX_VIEW_EXPANSIONS = 1024` per written view reference (`54001`). Planning stays unmetered.
+  → [planner.md §3.2](spec/design/planner.md), [views.md §4.1](spec/design/views.md),
+  [cost.md §7e](spec/design/cost.md)
+
+- [ ] **Count view nesting toward the native-stack depth limit.** Each view body is parsed with its
+  own `MAX_EXPR_DEPTH` budget, and view references are counted separately (≤ 256), so the planner's
+  recursion depth is the *sum* over a view chain. A chain of 40 views whose bodies each nest 100
+  derived tables overflows the stack: the Rust core aborts the process and TS fails with an uncoded
+  error. views.md §4.1 says the nesting counts toward `MAX_EXPR_DEPTH`; make it so, by parsing a
+  view body with the depth of its reference site. _(size: M)_ → [views.md §4.1](spec/design/views.md),
+  [cost.md §7](spec/design/cost.md)
 
 - [x] **JSON nesting-depth limit.** A fixed `MAX_JSON_DEPTH = 256` bounds every `json`/`jsonb`
   document where it is produced: the text parser and every nesting constructor (builders,
