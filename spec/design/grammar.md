@@ -3197,3 +3197,5 @@ matrix, dependencies, `RENAME` rewrites, and privileges are specified in [views.
 
 A view reference in `FROM` is the equivalent derived table (§42), so §8's output-name rules, §15's
 labels and column alias lists, and §42's column-rename rules apply to it unchanged.
+An automatically updatable view is also a valid `INSERT` / `UPDATE` / `DELETE` target, with the
+statement's grammar unchanged ([views.md](views.md) §15).

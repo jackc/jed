@@ -136,8 +136,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ a host-configurable spill directory (shared with the external sort) so WASI/OPFS
     hosts can offer a temp spill target; migrating a shrunken spilled domain back into RAM.
   - [ ] _follow-on:_ `ON COMMIT DELETE ROWS`/`DROP`; `CREATE TEMP TABLE … AS SELECT`; FKs among same-kind temp tables; temporary views. → [temp-tables.md §14](spec/design/temp-tables.md)
-- [x] **Views** (`CREATE [OR REPLACE] VIEW` / `ALTER VIEW … RENAME` / `DROP VIEW`, read-only) — a
-  named persisted query read as the equivalent derived table (identical rows, cost, plan);
+- [x] **Views** (`CREATE [OR REPLACE] VIEW` / `ALTER VIEW … RENAME` / `DROP VIEW`, writes through
+  updatable views) — a named persisted query read as the equivalent derived table (identical rows,
+  cost, plan);
   canonical token text with `*` frozen at
   CREATE, persisted table/column/view dependencies (`2BP01`, `0A000` for a referenced column's type
   change), `RENAME` text rewrites through base-table column alias lists, re-validation after `ALTER
@@ -147,9 +148,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   V5 (`CREATE OR REPLACE VIEW`: PG's column-compatibility rule `42P16`, a `42P17` cycle check, and
   re-validation of every reader with an appended-column capture check), and V6 (`ALTER VIEW … RENAME
   TO` / `RENAME [COLUMN]` and the same `ALTER TABLE` forms on a view, rewriting dependents) all
-  landed in every core. → [views.md](spec/design/views.md)
-  - [ ] _follow-on:_ `WITH CHECK OPTION`, view options and the other `ALTER VIEW` actions,
-    updatable views, materialized and recursive views, temporary views, views in or over attached
+  landed in every core. V7 (automatically updatable views: `INSERT`/`UPDATE`/`DELETE` through a view
+  of PostgreSQL's simple single-relation shape, chains, staged view `WHERE`s, `RETURNING`, writable
+  CTEs, privileges checked on the view as for a table, and the `view_write` NoREC relation) landed
+  in every core too. → [views.md](spec/design/views.md)
+  - [ ] _follow-on:_ `WITH CHECK OPTION`, `ON CONFLICT` on an updatable view, view column defaults,
+    view options and the other `ALTER VIEW` actions, materialized and recursive views, temporary views, views in or over attached
     databases, `DROP … CASCADE` of dependent views, dependency tracking for
     sequences/types/collations/host functions, view columns in `jed_columns`, definitions longer
     than one catalog page. → [views.md §12](spec/design/views.md)

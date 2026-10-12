@@ -1,0 +1,471 @@
+# Writing through an automatically updatable view (spec/design/views.md §15). A view whose body is
+# a single SELECT over one table or view — no WITH, DISTINCT, GROUP BY, HAVING, LIMIT/OFFSET,
+# aggregate, window function, or set operation — takes INSERT / UPDATE / DELETE, which write its
+# base relation (the equivalent base statement, §15.2). A select item that is a bare column is
+# updatable; any other is read-only: readable everywhere in the write, assigning it is 0A000. The
+# view's WHERE limits which rows UPDATE and DELETE reach (it applies before the statement's own
+# WHERE) but is not checked on INSERT. Omitted base columns take their defaults; `SET c = DEFAULT`
+# assigns the view column's default, NULL. RETURNING projects the view's columns. A view that is
+# not updatable refuses every write with 55000. Every record here is PostgreSQL-oracle-checked;
+# jed-only behavior (privileges, cost and EXPLAIN, divergences) lives in view_write_jed.test.
+# requires: ddl.view, dml.view_write, ddl.create_table, ddl.primary_key, ddl.column_default, ddl.identity, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_select, dml.update, dml.update_default, dml.delete, dml.returning, dml.returning_old_new, query.select, query.select_star, query.where_eq, query.order_by, query.table_alias, query.table_column_alias, query.qualified_column, query.qualified_star, query.subquery_scalar, query.subquery_correlated, query.subquery_exists, query.cte, query.cte_data_modifying, query.distinct, query.group_by, query.aggregates, query.union, query.limit, query.join_inner, query.derived_table, query.window, query.window_ranking, expr.arithmetic, null.three_valued, types.i32, types.text
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32 DEFAULT 7, b text DEFAULT 'bd', c i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'x', 100), (2, 20, 'y', 200), (3, 30, 'z', 300)
+
+statement ok
+CREATE VIEW v AS SELECT id, a, a * 2 AS a2, b FROM t WHERE a > 10
+
+# --- INSERT ------------------------------------------------------------------------------------------
+
+# Omitted base columns take their defaults (a = 7, c = NULL). The view's WHERE is not checked, so the
+# new row is one the view does not show; RETURNING still projects the view's columns over it.
+query IIIT nosort
+INSERT INTO v (id, b) VALUES (4, 'w') RETURNING *
+----
+4
+7
+14
+w
+
+query IITI nosort
+SELECT * FROM t WHERE id = 4
+----
+4
+7
+w
+NULL
+
+query I nosort
+SELECT id FROM v ORDER BY id
+----
+2
+3
+
+query II rowsort
+INSERT INTO v (id, a) VALUES (5, 50), (6, 60) RETURNING id, a2
+----
+5
+100
+6
+120
+
+# A DEFAULT slot of an updatable column is the base column's default.
+query IIIT nosort
+INSERT INTO v (id, a, b) VALUES (7, DEFAULT, DEFAULT) RETURNING *
+----
+7
+7
+14
+bd
+
+query IIT nosort
+INSERT INTO v (id, b) SELECT id + 100, b FROM t WHERE id = 2 RETURNING id, a, b
+----
+102
+7
+y
+
+# A read-only column cannot be assigned, also through a list-less INSERT or a DEFAULT slot.
+statement error 0A000
+INSERT INTO v (id, a2) VALUES (8, 1)
+
+statement error 0A000
+INSERT INTO v VALUES (8, 1, DEFAULT, 'q')
+
+statement error 42703
+INSERT INTO v (nosuch) VALUES (8)
+
+statement error 42701
+INSERT INTO v (id, a, a) VALUES (8, 1, 2)
+
+# The base table's own constraints apply.
+statement error 23505
+INSERT INTO v (id) VALUES (1)
+
+statement error 23502
+INSERT INTO v (a) VALUES (1)
+
+# --- UPDATE ------------------------------------------------------------------------------------------
+
+query IIIT nosort
+UPDATE v SET a = a + 1 WHERE id = 2 RETURNING *
+----
+2
+21
+42
+y
+
+# Row 1 (a = 10) is not in the view, so the UPDATE does not reach it.
+query IIIT nosort
+UPDATE v SET b = 'nope' WHERE id = 1 RETURNING *
+----
+
+# An UPDATE may move a row out of the view; it stays updated.
+query III nosort
+UPDATE v SET a = 5 WHERE a2 = 100 RETURNING id, a, a2
+----
+5
+5
+10
+
+query II nosort
+SELECT id, a FROM t WHERE id = 5
+----
+5
+5
+
+statement error 0A000
+UPDATE v SET a2 = 1
+
+# A base column the view does not output is not visible.
+statement error 42703
+UPDATE v SET c = 1
+
+# The target's label is the view's name.
+query IIIT nosort
+UPDATE v SET a = v.a + 1 WHERE v.id = 2 RETURNING v.*
+----
+2
+22
+44
+y
+
+# old. / new. are the view's columns of the row's two versions.
+query II nosort
+UPDATE v SET a = a + 5 WHERE id = 2 RETURNING old.a2, new.a2
+----
+44
+54
+
+# A correlated subquery reads the view's columns of the row being updated.
+query IT nosort
+UPDATE v SET b = (SELECT b FROM t AS t2 WHERE t2.id = v.id - 1) WHERE id = 2 RETURNING id, b
+----
+2
+x
+
+# SET c = DEFAULT assigns the view column's default, which is NULL (not the base default 7).
+query III nosort
+UPDATE v SET a = DEFAULT WHERE id = 3 RETURNING id, a, a2
+----
+3
+NULL
+NULL
+
+# --- DELETE ------------------------------------------------------------------------------------------
+
+query I nosort
+DELETE FROM v WHERE a2 > 100 RETURNING id
+----
+6
+
+query I nosort
+DELETE FROM v WHERE id = 1 RETURNING id
+----
+
+query IIT nosort
+SELECT id, a, b FROM t ORDER BY id
+----
+1
+10
+x
+2
+27
+x
+3
+NULL
+z
+4
+7
+w
+5
+5
+bd
+7
+7
+bd
+102
+7
+y
+
+# The view's WHERE applies before the statement's: row 1 (d = 0) is never divided by.
+statement ok
+CREATE TABLE z (id i32 PRIMARY KEY, d i32)
+
+statement ok
+INSERT INTO z VALUES (1, 0), (2, 5), (3, 20)
+
+statement ok
+CREATE VIEW vz AS SELECT id, d FROM z WHERE d <> 0
+
+query I rowsort
+UPDATE vz SET d = d + 1 WHERE 10 / d > 1 RETURNING id
+----
+2
+
+query I rowsort
+DELETE FROM vz WHERE 10 / d < 1 RETURNING id
+----
+3
+
+# --- writable CTEs -----------------------------------------------------------------------------------
+
+query I nosort
+WITH u AS (UPDATE v SET b = 'cte' WHERE id = 2 RETURNING id) SELECT count(*) FROM u
+----
+1
+
+query IT nosort
+WITH d AS (DELETE FROM v WHERE id = 2 RETURNING id, b) SELECT id, b FROM d
+----
+2
+cte
+
+# --- chains of views ---------------------------------------------------------------------------------
+
+statement ok
+CREATE VIEW v2 AS SELECT id, a2, b AS bb FROM v WHERE id < 100
+
+query IIT nosort
+INSERT INTO v2 (id, bb) VALUES (50, 'n') RETURNING *
+----
+50
+14
+n
+
+# a2 is a read-only column of v, so v2's a2 cannot be assigned either.
+statement error 0A000
+INSERT INTO v2 (id, a2) VALUES (51, 1)
+
+statement ok
+UPDATE t SET a = 40 WHERE id = 50
+
+query IIT nosort
+UPDATE v2 SET bb = 'up' WHERE id = 50 RETURNING *
+----
+50
+80
+up
+
+# Both views' WHERE clauses apply: id 102 fails v2's, id 4 fails v's.
+query I nosort
+DELETE FROM v2 WHERE id IN (4, 50, 102) RETURNING id
+----
+50
+
+statement ok
+CREATE VIEW v3 AS SELECT id, a2 + 1 AS a3 FROM v
+
+statement error 0A000
+UPDATE v3 SET a3 = 1
+
+# --- other updatable shapes --------------------------------------------------------------------------
+
+# A column list renames the view's columns.
+statement ok
+CREATE VIEW o2 (k, aa) AS SELECT id, a FROM t
+
+query II nosort
+INSERT INTO o2 (k) VALUES (11) RETURNING *
+----
+11
+7
+
+# A column alias list on the base table.
+statement ok
+CREATE VIEW o3 AS SELECT p, q FROM t AS x (p, q)
+
+query II nosort
+INSERT INTO o3 VALUES (12, 3) RETURNING *
+----
+12
+3
+
+query II nosort
+UPDATE o3 SET q = q + 1 WHERE p = 12 RETURNING p, q
+----
+12
+4
+
+# ORDER BY in the body is allowed and ignored.
+statement ok
+CREATE VIEW o1 AS SELECT id, a FROM t ORDER BY a DESC
+
+query II nosort
+INSERT INTO o1 VALUES (13, 1) RETURNING *
+----
+13
+1
+
+# A constant column is read-only but readable.
+statement ok
+CREATE VIEW o6 AS SELECT 1 AS one, id FROM t
+
+query II nosort
+INSERT INTO o6 (id) VALUES (14) RETURNING *
+----
+1
+14
+
+# Two view columns over one base column; either one is assignable.
+statement ok
+CREATE VIEW vdup AS SELECT id, a, a AS aa FROM t
+
+query III nosort
+UPDATE vdup SET aa = 3 WHERE id = 1 RETURNING *
+----
+1
+3
+3
+
+# A subquery in the view's WHERE, and a subquery column evaluated over the new row.
+statement ok
+CREATE TABLE s (id i32 PRIMARY KEY, x i32)
+
+statement ok
+INSERT INTO s VALUES (1, 100), (3, 300)
+
+statement ok
+CREATE VIEW o4 AS SELECT id, (SELECT x FROM s WHERE s.id = t.id) AS sx FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.id = t.id)
+
+query II rowsort
+UPDATE o4 SET id = id + 1000 RETURNING *
+----
+1001
+NULL
+1003
+NULL
+
+query I nosort
+SELECT count(*) FROM o4
+----
+0
+
+# A view with no updatable column still takes DELETE.
+statement ok
+CREATE VIEW nc AS SELECT a + 1 AS x FROM t
+
+statement error 55000
+INSERT INTO nc VALUES (1)
+
+statement error 55000
+UPDATE nc SET x = 1
+
+query I nosort
+DELETE FROM nc WHERE x = 2 RETURNING x
+----
+2
+
+# --- identity base columns ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE g (id i32 PRIMARY KEY, n i32 GENERATED ALWAYS AS IDENTITY)
+
+statement ok
+CREATE VIEW vg AS SELECT id, n FROM g
+
+query II nosort
+INSERT INTO vg (id) VALUES (1) RETURNING *
+----
+1
+1
+
+statement error 428C9
+INSERT INTO vg VALUES (2, 5)
+
+# DEFAULT is the view column's default (NULL), which a GENERATED ALWAYS column refuses.
+statement error 428C9
+UPDATE vg SET n = DEFAULT
+
+# --- views that are not automatically updatable: 55000 -----------------------------------------------
+
+statement ok
+CREATE VIEW n_distinct AS SELECT DISTINCT a FROM t
+
+statement ok
+CREATE VIEW n_group AS SELECT a, count(*) AS n FROM t GROUP BY a
+
+statement ok
+CREATE VIEW n_union AS SELECT id FROM t UNION SELECT id FROM s
+
+statement ok
+CREATE VIEW n_limit AS SELECT id FROM t LIMIT 1
+
+statement ok
+CREATE VIEW n_offset AS SELECT id FROM t OFFSET 1
+
+statement ok
+CREATE VIEW n_with AS WITH w AS (SELECT id FROM t) SELECT id FROM w
+
+statement ok
+CREATE VIEW n_join AS SELECT t.id FROM t JOIN s ON t.id = s.id
+
+statement ok
+CREATE VIEW n_derived AS SELECT id FROM (SELECT id FROM t) AS d
+
+statement ok
+CREATE VIEW n_nofrom AS SELECT 1 AS one
+
+statement ok
+CREATE VIEW n_window AS SELECT id, row_number() OVER () AS r FROM t
+
+statement ok
+CREATE VIEW n_agg AS SELECT count(*) AS n FROM t
+
+statement error 55000
+INSERT INTO n_distinct VALUES (1)
+
+statement error 55000
+UPDATE n_distinct SET a = 1
+
+statement error 55000
+DELETE FROM n_distinct
+
+statement error 55000
+INSERT INTO n_group VALUES (1, 1)
+
+statement error 55000
+DELETE FROM n_group
+
+statement error 55000
+INSERT INTO n_union VALUES (1)
+
+statement error 55000
+DELETE FROM n_limit
+
+statement error 55000
+DELETE FROM n_offset
+
+statement error 55000
+DELETE FROM n_with
+
+statement error 55000
+DELETE FROM n_join
+
+statement error 55000
+DELETE FROM n_derived
+
+statement error 55000
+INSERT INTO n_nofrom VALUES (1)
+
+statement error 55000
+DELETE FROM n_window
+
+statement error 55000
+DELETE FROM n_agg
+
+# A chain stops at the first view that is not updatable.
+statement ok
+CREATE VIEW over_group AS SELECT a FROM n_group
+
+statement error 55000
+DELETE FROM over_group
+
+query I nosort
+SELECT count(*) FROM t
+----
+9

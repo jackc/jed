@@ -489,7 +489,10 @@ relations its body reads are not checked against the reading session (PostgreSQL
 semantics, with the "owner" check done once at `CREATE VIEW`: the creating session needs
 `allow_ddl` and `SELECT` on every relation the body reads). Function `EXECUTE` inside a view body is
 checked against the reading session. So a host can expose some rows or columns of a table through a
-view to a session that has no grant on the table.
+view to a session that has no grant on the table. Writing through an updatable view
+([views.md](views.md) §15.4) is checked like a table: the writer's `INSERT`/`UPDATE`/`DELETE` (and
+`SELECT` when it reads view columns) on the view, nothing on the base relation. A host can thus expose
+a writable subset of a table too.
 
 ### 5.4 Session lifetime cost budget
 

@@ -1,12 +1,12 @@
 # skip: disk — temp tables and transactions spanning records cannot survive the disk-mode per-record
 # reopen (spec/design/conformance.md §3); views persist and reload in the other views files' disk pass.
 # Views — the jed-specific behavior of spec/design/views.md that PostgreSQL cannot oracle-check:
-# the IF NOT EXISTS extension, the jed_ reservation, 55000 on writes to views PostgreSQL would
-# update, 0A000 for the deferred forms, temp scope, untracked dependencies, CASCADE to a view,
+# the IF NOT EXISTS extension, the jed_ reservation, 0A000 for ON CONFLICT on a view and the
+# deferred forms, temp scope, untracked dependencies, CASCADE to a view,
 # re-validation after ALTER TABLE, CREATE OR REPLACE VIEW, and ALTER VIEW (§8), the cycle check and
 # typmod rule of OR REPLACE (§1.2), the session privilege envelope (§9), and transactions.
 # CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
-# requires: ddl.view, ddl.view_replace, ddl.view_alter, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.alter_table, ddl.sequence, ddl.temp_table, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.insert_on_conflict, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.aggregates, query.subquery_scalar, query.subquery_correlated, query.derived_table, query.cte, query.cte_recursive, query.cte_data_modifying, types.i32, types.i64, types.text, types.decimal, types.varchar_length, types.composite, cast.operator, session.privileges, session.allow_ddl, session.allow_temp_ddl, txn.explicit, txn.read_only
+# requires: ddl.view, dml.view_write, ddl.view_replace, ddl.view_alter, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.alter_table, ddl.sequence, ddl.temp_table, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.insert_on_conflict, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.aggregates, query.subquery_scalar, query.subquery_correlated, query.derived_table, query.cte, query.cte_recursive, query.cte_data_modifying, types.i32, types.i64, types.text, types.decimal, types.varchar_length, types.composite, cast.operator, session.privileges, session.allow_ddl, session.allow_temp_ddl, txn.explicit, txn.read_only
 
 statement ok
 CREATE TABLE t (a i32 PRIMARY KEY, b text)
@@ -68,25 +68,21 @@ SELECT name FROM tabs ORDER BY name
 ----
 t
 
+# a view over a catalog relation is not updatable (its FROM item is not a table or view)
+statement error 55000
+DELETE FROM tabs
+
+statement error 55000
+WITH d AS (DELETE FROM tabs RETURNING name) SELECT count(*) FROM d
+
 statement ok
 DROP VIEW tabs
 
-# --- every view refuses writes with 55000, even one PostgreSQL would update ----------------------
+# --- ON CONFLICT on an updatable view is a follow-on (views.md §15.2); writes through updatable
+# views are covered by dml/view_write.test and dml/view_write_jed.test ---------------------------
 
-statement error 55000
-INSERT INTO v VALUES (3, 'z')
-
-statement error 55000
+statement error 0A000
 INSERT INTO v VALUES (1, 'x') ON CONFLICT DO NOTHING
-
-statement error 55000
-UPDATE v SET b = 'q' WHERE a = 1
-
-statement error 55000
-DELETE FROM v WHERE a = 1
-
-statement error 55000
-WITH d AS (DELETE FROM v RETURNING a) SELECT count(*) FROM d
 
 query IT nosort
 SELECT * FROM v ORDER BY a

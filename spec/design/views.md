@@ -6,9 +6,10 @@
 > [grammar.md](grammar.md) §54. The byte layout is in [../fileformat/format.md](../fileformat/format.md)
 > (`format_version` 38). The errors are existing codes in [../errors/registry.toml](../errors/registry.toml).
 > PostgreSQL behavior was pinned against the live `postgres:18` oracle (CLAUDE.md §1).
-> Views are **read-only**: no updatable views, `CHECK OPTION`, materialized, recursive, or
-> temporary views (§12). `CREATE OR REPLACE VIEW` (§1.2) and view renames (§7.1) redefine a view in
-> place.
+> A view with PostgreSQL's simple single-relation shape is **automatically updatable**: `INSERT`,
+> `UPDATE`, and `DELETE` on it write its base relation (§15). There is no `CHECK OPTION`, and no
+> materialized, recursive, or temporary view (§12). `CREATE OR REPLACE VIEW` (§1.2) and view renames
+> (§7.1) redefine a view in place.
 
 A view is the fifth kind of database-level catalog object, after tables, composite types, sequences,
 and collation references. It has no storage of its own. Reading a view plans its stored query in
@@ -140,10 +141,11 @@ Statements that name a relation of a specific kind treat a view as the wrong kin
 | `DROP TABLE v` (also `IF EXISTS`) | `42809` *"v" is not a table* | same |
 | `DROP INDEX v` | `42809` | same |
 | `DROP SEQUENCE v`, `ALTER SEQUENCE v`, `nextval('v')` | `42P01`, as for a table: sequence statements look up sequences only | PG: `42809` |
-| `INSERT INTO v`, `INSERT … ON CONFLICT` | `55000` *cannot insert into view "v"* | PG updates simple views |
-| `UPDATE v` | `55000` *cannot update view "v"* | PG updates simple views |
-| `DELETE FROM v` | `55000` *cannot delete from view "v"* | PG updates simple views |
-| A writable CTE targeting `v` | `55000`, as above | same rule |
+| `INSERT INTO v` | writes the base relation if `v` is updatable (§15), else `55000` *cannot insert into view "v"* | same |
+| `UPDATE v` | writes the base relation if `v` is updatable, else `55000` *cannot update view "v"* | same |
+| `DELETE FROM v` | writes the base relation if `v` is updatable, else `55000` *cannot delete from view "v"* | same |
+| `INSERT INTO v … ON CONFLICT` | `55000` if `v` is not updatable, else `0A000` (§15.2) | PG supports it on an updatable view |
+| A writable CTE targeting `v` | as the statement it holds | same |
 | `CREATE INDEX … ON v` | `42809` *cannot create index on relation "v"* | same |
 | `REFERENCES v` (a foreign-key parent) | `42809` *referenced relation "v" is not a table* | same |
 | `ALTER TABLE v RENAME TO …` / `RENAME [COLUMN] …` | the view rename (§7.1) | same |
@@ -154,10 +156,8 @@ Statements that name a relation of a specific kind treat a view as the wrong kin
 | `DROP VIEW t` (`t` a table, index, or sequence) | `42809` *"t" is not a view* | same |
 
 `55000` (`object_not_in_prerequisite_state`) is PostgreSQL's code for writing to a view that is
-not automatically updatable. Every jed view is non-updatable in this slice, so jed raises it for
-every view. PostgreSQL accepts writes to a simple single-table view, and that is the recorded
-divergence (§12). The rejection happens when the DML target is resolved, before any column, value,
-or `RETURNING` check.
+not automatically updatable (§15.1). The rejection happens when the DML target is resolved, before
+any column, value, or `RETURNING` check (§15.3).
 
 ## 3. Persistence (`format_version` 38)
 
@@ -511,8 +511,10 @@ when the owner would be fixed:
   invoker.
 - **`CREATE OR REPLACE VIEW`** has `CREATE VIEW`'s requirements, checked against the new body.
 - **`DROP VIEW`** and **`ALTER VIEW`** require `allow_ddl`.
+- **Writing through a view** (§15.4) requires the writer's privilege on the view only, as for a
+  table.
 
-This keeps CLAUDE.md §13 intact. A view grants nothing its creator lacked. Reading through it is
+This keeps CLAUDE.md §13 intact. A view grants no read its creator lacked. Reading through it is
 bounded by the reading session's cost ceiling, lifetime budget, and query-memory limit like any
 other query. The built-in surface stays pure.
 
@@ -525,7 +527,8 @@ other query. The built-in surface stays pure.
   temporary views yet (§12). Under the preclude-overlaps rule
   ([temp-tables.md](temp-tables.md) §3) a temp table cannot later shadow a name a view reads.
 - **Attached databases.** `CREATE VIEW reports.v`, a body naming `reports.t`, and a reference to a
-  view through an attachment qualifier (`FROM reports.v`) are all `0A000` in this slice. A file
+  view through an attachment qualifier (`FROM reports.v`, or a write target `INSERT INTO reports.v`)
+  are all `0A000` in this slice. A file
   containing views can still be attached. Its views are unreachable through the attachment, but they
   are kept intact: because rewriting and re-validating a view (§7/§8) plans its body in its own
   database, any `ALTER TABLE reports.t …` is `0A000` while a view in `reports` depends on `t` (a
@@ -563,7 +566,11 @@ Recorded divergences from PostgreSQL (CLAUDE.md §1):
 
 | Divergence | Reason |
 |---|---|
-| Writes to every view are `55000`; PG updates simple single-table views | updatable views are a follow-on |
+| A write to a view that is not updatable is `55000` before any column or expression error; PG reports its parse-analysis errors (`42703`, `42601`, a bad literal) first | updatability is checked when the target resolves (§15.3) |
+| Assigning a read-only view column is `0A000` before the statement's expressions are resolved; PG reports it after them | the check belongs to the target columns (§15.3) |
+| Two view columns that reach the same base column, assigned together, are `42701`; PG says `42601` | jed's duplicate-assignment code for tables (`UPDATE t SET a = 1, a = 2`) |
+| `INSERT … ON CONFLICT` on an updatable view is `0A000`; PG supports it | a follow-on (§15.2) |
+| A write through a view checks only the writer's privilege on the view; PG also checks the view owner's privilege on the base relation | jed has no persistent owners, and the session that creates a view already holds `allow_ddl`, which is trusted schema authority (§15.4) |
 | `CREATE VIEW IF NOT EXISTS` is accepted; PG has no such syntax | SQLite parity; the `CREATE TABLE` precedent |
 | A view whose `*` expansion is not referenceable by name is `0A000` | jed stores text; PG invents aliases in its deparser |
 | `ALTER TABLE` that would capture or make ambiguous a view's reference is `0A000` | text binds by name (§8) |
@@ -583,10 +590,13 @@ Recorded divergences from PostgreSQL (CLAUDE.md §1):
 
 Deferred follow-ons, none foreclosed:
 
-- the other `ALTER VIEW` actions: column defaults (meaningful only for updatable views), `SET` /
-  `RESET` view options;
+- the other `ALTER VIEW` actions: column defaults (`UPDATE v SET c = DEFAULT` would then assign
+  them, §15.2), `SET` / `RESET` view options;
 - `WITH [CASCADED | LOCAL] CHECK OPTION` and `WITH (options)` (`0A000`);
-- updatable views and `INSTEAD OF` behavior;
+- `INSERT … ON CONFLICT` on an updatable view (`0A000`, §15.2);
+- `INSTEAD OF` behavior for views that are not automatically updatable (jed has no triggers or
+  rules);
+- an updatability column in `jed_views` (PostgreSQL's `information_schema.views.is_updatable`);
 - `CREATE MATERIALIZED VIEW` and `CREATE RECURSIVE VIEW` (`0A000`);
 - temporary views and views in or over attached databases (`0A000`), including `ALTER TABLE` of an
   attached table that one of its database's views depends on;
@@ -606,6 +616,9 @@ Deferred follow-ons, none foreclosed:
 - The `2BP01` and `0A000` messages name the first blocking view in name byte order.
 - `CREATE OR REPLACE VIEW` compares columns in position order and reports the first difference in
   PostgreSQL's order (count, then per column name, type, collation).
+- A write through a view is a write to the base table with a staged `WHERE` (§15.2, §15.5), which is
+  deterministic in rows, end state, cost, plan, and errors. The `0A000` for a read-only column names the first one in the
+  view's column order, and the view-level checks run from the target view down (§15.3).
 
 ## 14. Slices
 
@@ -624,6 +637,170 @@ Deferred follow-ons, none foreclosed:
    re-validation of the views that read the replaced view (§8).
 6. **V6 — view renames** (§7.1): `ALTER VIEW … RENAME TO` / `RENAME [COLUMN]`, and the same
    `ALTER TABLE` forms on a view, with the §7 rewrites of dependent views.
+7. **V7 — automatically updatable views** (§15): `INSERT` / `UPDATE` / `DELETE` through a view,
+   chains of views, `RETURNING`, writable CTEs, privileges checked on the view as for a table, and
+   the view-vs-base-statement NoREC relation.
 
 Capabilities: `ddl.view` (V1), `ddl.view_rename` (V2 + V4), `query.table_column_alias` (V3),
-`introspect.views` (V1), `ddl.view_replace` (V5), `ddl.view_alter` (V6).
+`introspect.views` (V1), `ddl.view_replace` (V5), `ddl.view_alter` (V6), `dml.view_write` (V7).
+
+## 15. Writing through a view
+
+A view with the simple shape of §15.1 is **automatically updatable**, as in PostgreSQL: an `INSERT`,
+`UPDATE`, or `DELETE` that names it writes the relation its body reads. Every other view refuses
+writes with `55000`. Behavior below was pinned against the PostgreSQL 18 oracle; the divergences are
+in §12.
+
+### 15.1 Updatable views and columns
+
+A view is **updatable** when its stored body (§3) is a single `SELECT`, not a set operation, with:
+
+- no `WITH` clause;
+- no `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT`, or `OFFSET`;
+- no aggregate or window function at the `SELECT`'s own level (one inside a subquery does not
+  count), and no set-returning function in its select list;
+- exactly one `FROM` item, and that item is a table or a view, with or without an alias and a column
+  alias list. A join, a derived table, a CTE reference, a set-returning function, `VALUES`, and a
+  `jed_` catalog relation are not.
+
+The body may have a `WHERE`, including subqueries over any relation, and an `ORDER BY`, which a
+write ignores. The table or view the `FROM` item names is the view's **base relation**.
+
+A view column is **updatable** when its select item is a reference to a column of the `FROM` item,
+bare or qualified, optionally parenthesized. That column is the view column's **base column**. Every
+other select item (an expression, a cast, a literal, a function call, a subquery, `COLLATE`, a
+composite field selection) makes a **read-only** column. A read-only column can be read anywhere in
+a write but cannot be assigned. Two view columns may share a base column (`SELECT a, a AS a2`).
+
+For `INSERT` and `UPDATE` a view also needs at least one updatable column. `DELETE` does not, so
+`DELETE FROM v` works on `CREATE VIEW v AS SELECT a + 1 AS x FROM t`, but `INSERT` and `UPDATE` on it
+are `55000`.
+
+Updatability is a property of one view's body. When the base relation is itself a view, whether
+that view is updatable is checked when the write reaches it (§15.3). A write through a chain of
+views writes the table at the bottom of the chain.
+
+### 15.2 What a write means
+
+A write through an updatable view `v` with base relation `b` is a write to `b`, called the
+**equivalent base statement**. Its parts are defined as follows.
+
+**Names.** The statement's target is the view. It exposes `v`'s output columns under the view's
+name, exactly as a table target exposes its columns under the table's. A column of `b` that `v`
+does not output is not visible: `UPDATE v SET c = 1` is `42703` (*column "c" of
+relation "v" does not exist*) even when `b` has a column `c`.
+
+**View column references.** A reference to a column of `v` anywhere in the statement (a `SET`
+source, the `WHERE`, `RETURNING`, or a subquery inside any of them) denotes that column's select
+item evaluated on the base row the statement is processing. The select item keeps the body's
+bindings (§4.1): its names resolve in the view's isolated scope against the body's `FROM` item, with
+the body's label and column alias list, and never against the statement's relations or CTEs. A
+reference to an updatable column is therefore the base column itself. A reference to a read-only
+column evaluates its select item each time, exactly as if the expression were written in its place.
+
+**`DELETE FROM v WHERE p`** deletes the rows of `b` that satisfy `w` and then `p`, where `w` is
+`v`'s `WHERE` (just `p` when `v` has none, just `w` when the statement has none). `w` is a separate
+**stage**, not an operand of an `AND`: `p` is evaluated only on the rows `w` keeps, so a row the view
+does not show can never raise an error from `p`. This is the order the two conditions apply when the
+view is read (§4), where `w` filters the derived table's body. (jed's `AND` evaluates both operands,
+[cost.md](cost.md) §3, so `w AND p` would not be the same statement.)
+
+**`UPDATE v SET c = e, … WHERE p`** updates the rows of `b` that satisfy `w` and then `p`, staged
+as for `DELETE`. Each assignment to view column `c` assigns `c`'s base column the value of `e`.
+`SET c = DEFAULT` assigns the view column's own default, as in PostgreSQL. jed has no view column
+defaults (§12), so that is NULL, not the base column's default; on a `GENERATED ALWAYS` identity
+base column it is therefore `428C9`. An update may change a row so that `w` no longer holds; the
+row stays updated and leaves the view.
+
+**`INSERT INTO v [(c, …)] source`** inserts into `b`. The target view columns are the listed ones,
+or, without a list, every column of `v` in order. The source supplies exactly one value per target,
+as for a table ([grammar.md](grammar.md) §12; PostgreSQL also accepts fewer values without a list, a
+recorded narrowing for tables too), so a list-less `INSERT` into a view with a read-only column is
+`0A000`. Each target assigns its base column. Every column of `b` that no target assigns takes its
+own default, else NULL, exactly like an omitted column of a direct `INSERT INTO b`. That covers the columns `v`
+does not output, the view columns the statement omits, and a `DEFAULT` slot. `DEFAULT VALUES`
+assigns no column. `OVERRIDING SYSTEM VALUE` and `OVERRIDING USER VALUE` apply to `b`'s identity
+columns. `w` is not checked, so an inserted row may be one the view does not show. (`WITH CHECK
+OPTION` is a follow-on, §12.)
+
+**`RETURNING`** projects `v`'s columns over each affected base row: the stored row for `INSERT`, the
+new row for `UPDATE`, the deleted row for `DELETE`. `*` expands to `v`'s output columns, and
+`old.c` / `new.c` are view column `c` of the row's two versions. A subquery in a read-only column's
+select item observes the pre-statement snapshot, like any `RETURNING` subquery.
+
+**Chains.** When `b` is a view, the equivalent base statement is itself a write through `b`, so the
+rule applies again until it reaches a table. Every view's `WHERE` is a stage, the view nearest the
+table first, then the statement's `p`.
+
+**Everything else** is the base statement's own behavior: two-phase validation, `NOT NULL`, `CHECK`,
+`UNIQUE`, primary-key re-keying, foreign keys, identity and serial columns, collated keys, the
+transaction and access-mode checks (`25006`), and error messages, which name `b` and its columns. A
+writable CTE may target an updatable view, with the same meaning.
+
+**`ON CONFLICT`.** `INSERT INTO v … ON CONFLICT` is `0A000` (*ON CONFLICT on a view is not supported
+yet*) when `v` is updatable, and `55000` when it is not. PostgreSQL supports it; it is a follow-on
+(§12).
+
+### 15.3 Validation order
+
+1. The checks every DML target gets, unchanged: the writing session's privileges (`42501`,
+   session.md §5.3), the catalog-relation check (`42809`), a read-only attachment (`25006`), and the
+   database qualifier.
+2. The target view is updatable for the statement's kind (§15.1), else **`55000`** (*cannot insert
+   into view "v"*, *cannot update view "v"*, *cannot delete from view "v"*).
+3. `ON CONFLICT` is `0A000` (§15.2).
+4. The view is planned as a read of it at the statement's top level would plan it (§4, §4.1): an
+   error in its body or in a view it reads, or the nesting and expansion limits (`54001`).
+5. The statement's target columns resolve against `v`'s output columns, with the rules and codes of
+   a table target: an unknown column is `42703`, and a column listed twice in `INSERT` or assigned
+   twice in `UPDATE` is `42701`. (An `INSERT` source whose arity differs from its targets is `42601`
+   where the table path checks it, which is later.)
+6. For each view from `v` down the chain:
+   1. a view after the first must be updatable for the statement's kind (`55000`, naming it);
+   2. for `INSERT` and `UPDATE`, every target column of the view must be updatable, else **`0A000`**
+      (*cannot insert into column "c" of view "v"*, *cannot update column "c" of view "v"*), naming
+      the first read-only target in the view's column order. A `DEFAULT` slot or `SET c = DEFAULT`
+      still targets `c`.
+
+   The targets then map to the base relation's columns.
+7. Two targets that reach the same column of the table are `42701` (*column "a" assigned more than
+   once*).
+8. The equivalent base statement's own validation follows in its existing order: identity
+   (`428C9`), the `SET`, `VALUES`, `WHERE`, and `RETURNING` expressions, types, and then execution.
+
+### 15.4 Privileges
+
+A view is checked like a table. The writing session needs, on the view, the operation's privilege,
+and `SELECT` when the statement reads the view's columns (in a `WHERE`, a `SET` source, or
+`RETURNING`): the table rule of [session.md](session.md) §5.3 applied to the view. Nothing else is
+checked against the writer. Neither the base relation nor, in a chain, the views below the target
+are checked, just as reading a view needs `SELECT` on that view only (§9). A function a select item
+or the view's `WHERE` calls needs the writer's `EXECUTE`, as when the view is read.
+
+A host can therefore let a session write a subset of a table without any grant on the table: grant
+`INSERT`, `UPDATE`, or `DELETE` on an updatable view over it.
+
+PostgreSQL also checks the base relation, against the view's owner. jed has no persistent owners
+(§9), and it does not record the creating session's write privileges either: the creating session
+holds `allow_ddl`, which is trusted schema authority (it can already drop or rewrite the table), so a
+recorded check would add persistent state while protecting little. A session with `allow_ddl` can
+therefore write a table through a view it creates even when it lacks the privilege on the table. A
+host that must prevent that withholds `allow_ddl`.
+
+### 15.5 Plan, cost, and EXPLAIN
+
+A write through a view is planned and executed as a write to the base table, with no charge for the
+view. Its **complete predicate** is every stage's condition joined by `AND`, left-deep, in stage order
+(`w AND p` for one view): that is what access-path selection, estimation, contradiction detection,
+and `EXPLAIN` read, so `UPDATE v SET b = 1 WHERE id = 5` on a view that outputs the primary key `id`
+is a point lookup, and `EXPLAIN` renders exactly the plan of `UPDATE t SET b = 1 WHERE w AND id = 5`,
+its root naming the table (`Update t`). Only the per-row evaluation differs: each row the scan reads
+is charged `storage_row_read` and evaluated stage by stage, each stage's nodes charged as usual, and a
+row a stage does not keep (FALSE or NULL) is not evaluated by the later stages. The `AND` nodes that
+join stages perform no `AND` and charge nothing. Everything else (assignments, defaults, checks,
+`RETURNING`, the writes) costs what the base statement's does.
+
+The NoREC generator pins the rows with a **view-write-vs-base-statement** relation: the same write
+through a view and written by hand against the base table, with the view's conditions inlined, must
+return the same `RETURNING` rows and leave the same table contents ([conformance.md](conformance.md)
+§8). Cost is pinned by `dml/view_write_jed.test`.

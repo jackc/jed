@@ -1,9 +1,10 @@
-# CREATE VIEW / DROP VIEW — read-only views (spec/design/views.md). A view is a named, persisted
-# query that FROM references like a table; reading it is the equivalent derived table (§4). `*` is
-# frozen at CREATE (§5), so a later ADD COLUMN does not change the view. Views share the relation
-# namespace (42P07), are the wrong kind for table/index/sequence statements (42809), refuse writes
-# (55000, the non-updatable-view code), and block DROP TABLE / DROP VIEW / DROP COLUMN of what they
-# read (2BP01) and a referenced column's type change (0A000). Every record here is PostgreSQL-
+# CREATE VIEW / DROP VIEW (spec/design/views.md). A view is a named, persisted query that FROM
+# references like a table; reading it is the equivalent derived table (§4). `*` is frozen at CREATE
+# (§5), so a later ADD COLUMN does not change the view. Views share the relation namespace (42P07),
+# are the wrong kind for table/index/sequence statements (42809), refuse writes when they are not
+# automatically updatable (55000; writes through updatable views are dml/view_write.test), and block
+# DROP TABLE / DROP VIEW / DROP COLUMN of what they read (2BP01) and a referenced column's type
+# change (0A000). Every record here is PostgreSQL-
 # oracle-checked; jed-only behavior lives in views_jed.test and introspection/jed_views.test.
 # requires: ddl.view, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_if_exists, ddl.drop_table_multi, ddl.alter_table, ddl.sequence, maintenance.analyze, ddl.secondary_index, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.join_using, query.join_natural, query.aggregates, query.group_by, query.table_alias, query.qualified_column, query.qualified_star, query.column_alias, query.cte, query.cte_recursive, query.cte_data_modifying, query.subquery_scalar, query.subquery_exists, query.subquery_correlated, query.derived_table, query.union, query.limit, types.i32, types.i64, types.text
 

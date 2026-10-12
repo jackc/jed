@@ -1,0 +1,237 @@
+# Writing through an updatable view — the jed-specific behavior of spec/design/views.md §15 that
+# PostgreSQL cannot oracle-check: the session privilege envelope, which checks the written view like a
+# table (§15.4), the recorded divergences (§12: 55000 before column errors, 0A000 before
+# expression errors, 42701 for two view columns over one base column, ON CONFLICT 0A000, the
+# list-less INSERT arity rule), and the plan/cost equivalence with the base statement (§15.5).
+# CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# requires: ddl.view, dml.view_write, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_on_conflict, dml.update, dml.delete, dml.returning, query.select, query.where_eq, query.order_by, query.group_by, query.aggregates, query.explain, dml.explain, func.abs, expr.arithmetic, resource.cost_metering, types.i32, types.text, session.privileges
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b text)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'x'), (2, 20, 'y'), (3, 30, 'z')
+
+statement ok
+CREATE VIEW v AS SELECT id, a, a * 2 AS a2 FROM t WHERE a > 5
+
+# --- the writer's privileges are checked on the view, never on the base table ---------------------
+
+# default_privileges: NONE
+# grant: UPDATE, SELECT ON v
+query II nosort
+UPDATE v SET a = a + 1 WHERE id = 1 RETURNING id, a2
+----
+1
+22
+
+# a bare INSERT reads nothing, so INSERT on the view is enough
+# default_privileges: NONE
+# grant: INSERT ON v
+statement ok
+INSERT INTO v (id, a) VALUES (4, 40)
+
+# reading the view's columns (here in WHERE) also needs SELECT on the view
+# default_privileges: NONE
+# grant: DELETE ON v
+statement error 42501
+DELETE FROM v WHERE id = 4
+
+# default_privileges: NONE
+# grant: DELETE, SELECT ON v
+query I nosort
+DELETE FROM v WHERE id = 4 RETURNING id
+----
+4
+
+# the table itself stays out of reach
+# default_privileges: NONE
+# grant: INSERT ON v
+statement error 42501
+INSERT INTO t VALUES (9, 9, 'q')
+
+# default_privileges: NONE
+# grant: SELECT ON v
+statement error 42501
+UPDATE v SET a = 1
+
+# a function in a read-only column needs the writer's EXECUTE when the write evaluates it
+statement ok
+CREATE VIEW vf AS SELECT id, abs(a) AS aa FROM t
+
+# revoke: EXECUTE ON abs
+statement error 42501
+UPDATE vf SET id = id WHERE aa > 100
+
+query I nosort
+UPDATE vf SET id = id WHERE aa > 100 RETURNING id
+----
+
+# --- only the target view is checked, as for a table: its creator's privileges on the base table and
+# the views below it in a chain do not matter (views.md §15.4) ----------------------------------------
+
+# revoke: UPDATE ON t
+statement ok
+CREATE VIEW vr AS SELECT id, a FROM t
+
+# the creator could not UPDATE t, but the writer's privilege on vr is all that is checked
+query II nosort
+UPDATE vr SET a = 12 WHERE id = 1 RETURNING *
+----
+1
+12
+
+statement ok
+CREATE VIEW vr2 AS SELECT id, a FROM vr
+
+# a chain needs the privilege on the view written to only
+# default_privileges: NONE
+# grant: UPDATE, SELECT ON vr2
+query II nosort
+UPDATE vr2 SET a = 13 WHERE id = 1 RETURNING *
+----
+1
+13
+
+# default_privileges: NONE
+# grant: UPDATE, SELECT ON vr2
+statement error 42501
+UPDATE vr SET a = 14
+
+statement ok
+DROP VIEW vr2, vr, vf
+
+# --- recorded divergences (views.md §12) ------------------------------------------------------------
+
+statement ok
+CREATE VIEW vg AS SELECT a, count(*) AS n FROM t GROUP BY a
+
+# 55000 is reported when the target resolves, before a column error (PG reports 42703 first)
+statement error 55000
+INSERT INTO vg (nosuch) VALUES (1)
+
+statement error 55000
+UPDATE vg SET nosuch = 1
+
+# a read-only column is 0A000 before the statement's expressions resolve (PG reports 42883 first)
+statement error 0A000
+UPDATE v SET a2 = nosuch_fn()
+
+# two view columns over one base column assigned together are 42701 (PG: 42601)
+statement ok
+CREATE VIEW vdup AS SELECT id, a, a AS aa FROM t
+
+statement error 42701
+UPDATE vdup SET a = 1, aa = 2
+
+statement error 42701
+INSERT INTO vdup (id, a, aa) VALUES (9, 1, 2)
+
+# ON CONFLICT is 0A000 on an updatable view (PG supports it), 55000 on one that is not
+statement error 0A000
+INSERT INTO v (id, a) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET a = excluded.a
+
+statement error 0A000
+INSERT INTO v (id, a) VALUES (1, 1) ON CONFLICT DO NOTHING
+
+statement error 55000
+INSERT INTO vg VALUES (1, 1) ON CONFLICT DO NOTHING
+
+# a list-less INSERT supplies every view column, as for a table (PG accepts fewer)
+statement ok
+CREATE VIEW vab AS SELECT id, a FROM t
+
+statement error 42601
+INSERT INTO vab VALUES (9)
+
+statement ok
+DROP VIEW vg, vdup, vab
+
+# --- plan and cost (views.md §15.2, §15.5) -----------------------------------------------------------
+
+statement ok
+CREATE TABLE m (id i32 PRIMARY KEY, x i32, y i32)
+
+statement ok
+INSERT INTO m VALUES (1, 10, 1), (2, 20, 0), (3, 30, 1)
+
+statement ok
+CREATE VIEW mv AS SELECT id, x, x + y AS s FROM m WHERE y > 0
+
+# The complete WHERE (the view's, then the statement's) selects the access path: a primary-key
+# point lookup, as for the same statement on the table.
+# names: depth, node, detail, est_rows, est_cost
+# types: i32, text, text, i64, i64
+query ITTII nosort
+EXPLAIN UPDATE mv SET x = x + 1 WHERE id = 3
+----
+0
+Update m
+sets=1
+1
+5
+1
+Filter
+conjuncts=2
+1
+5
+2
+Scan m
+PK bound: id = 3; touched=3
+1
+2
+
+# names: depth, node, detail, est_rows, est_cost
+# types: i32, text, text, i64, i64
+query ITTII nosort
+EXPLAIN UPDATE m SET x = x + 1 WHERE y > 0 AND id = 3
+----
+0
+Update m
+sets=1
+1
+5
+1
+Filter
+conjuncts=2
+1
+5
+2
+Scan m
+PK bound: id = 3; touched=3
+1
+2
+
+# cost: 7
+query II nosort
+UPDATE mv SET x = x + 1 WHERE id = 3 RETURNING id, s
+----
+3
+32
+
+# The view's WHERE is a stage, not an AND operand: it runs on every row the scan reads and the
+# statement's WHERE only on the rows it keeps (here 2 of 3), with no AND between them.
+# cost: 12
+query I nosort
+DELETE FROM mv WHERE x * 2 > 50 RETURNING id
+----
+3
+
+# On the table, both conjuncts and the AND run on every row (the two rows left).
+# cost: 11
+query I nosort
+DELETE FROM m WHERE y > 0 AND x * 2 > 50 RETURNING id
+----
+
+query III nosort
+SELECT * FROM v ORDER BY id
+----
+1
+13
+26
+2
+20
+40
+3
+30
+60
