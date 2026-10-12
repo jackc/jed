@@ -31,7 +31,7 @@ reason       = "IEEE 754 does NOT mandate correctly-rounded transcendentals (the
 # --- f64: text rendering layout ------------------------------------------
 [[exception]]
 id           = "float-render-layout"
-surface      = "f32/f64 value -> text (each core's native shortest-round-trip formatter), as a result cell and through the explicit CAST(float AS text)"
+surface      = "f32/f64 value -> text (each core's native shortest-round-trip formatter), as a result cell, through the explicit CAST(float AS text), and inside an error's structured Detail field (../design/error-fields.md §9.6)"
 class        = "A"
 drops        = ["G2", "G3"]
 blast_radius = "the rendered STRING layout only (exponent threshold/spelling). The shortest-round-trip DIGITS are mathematically unique (per width — an f32 renders its binary32 shortest form in every core), so the cores agree on value; only layout may differ, and the `R` tag compares by parsed value, so layout never affects a test result. A result cell is terminal. The one promotion path is the explicit CAST(float AS text) (../design/types.md §5): its text value carries the layout into whatever consumes it (a text comparison, length(), ORDER BY, a stored text column or key), so a query that branches on a float's rendered text can differ cross-core for values whose layouts differ (typically large or small magnitudes in exponent form). The value-level comparison, arithmetic, and key encoding of the float itself are unaffected."

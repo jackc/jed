@@ -93,3 +93,24 @@ SELECT a, b FROM t2 ORDER BY a
 ----
 1
 10
+
+# NOT NULL is enforced over the COMPLETE candidate row (spec/design/error-fields.md §9.5): the row is
+# formed first (every value coerced, every default evaluated), so a later column's out-of-range value
+# wins over an earlier column's NULL — PostgreSQL's order. A single fault still traps 23502.
+statement ok
+CREATE TABLE nn_order (a i32 NOT NULL, b i16)
+
+statement error 22003
+INSERT INTO nn_order VALUES (NULL, 100000)
+
+statement error 23502
+INSERT INTO nn_order VALUES (NULL, 1)
+
+statement ok
+INSERT INTO nn_order VALUES (1, 1)
+
+statement error 22003
+UPDATE nn_order SET a = NULL, b = 100000
+
+statement error 23502
+UPDATE nn_order SET a = NULL, b = 2

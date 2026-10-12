@@ -216,7 +216,9 @@ an `ON CONFLICT`-specific message needs no registry edit. The codes:
 - **No `INSERT INTO t AS alias`.** Table aliasing on `INSERT` is not in the grammar this
   slice, so the existing row is referenced by the table's own name (PG allows an alias). A
   relaxable narrowing.
-- **No single-line `DETAIL`.** jed's messages are single-line house style; the codes match.
+- **No `DETAIL` line in the message.** jed's messages are single-line house style; the codes match.
+  The `Key (…)=(…) already exists.` text is the structured `Detail` field
+  ([error-fields.md](error-fields.md) §9).
 
 ## 10. Deferred (each its own later slice)
 

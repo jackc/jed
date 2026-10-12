@@ -720,8 +720,9 @@ and compression work **does** accrue to the originating statement's cost and to 
   jed has no deferred-constraint machinery, so both inspect the statement's final action closure
   (§6.6). Both use the same `23503` violation in jed; PostgreSQL 18 uses `23001` for a
   `RESTRICT` violation. This preserves the single validation/error path for the two actions.
-- **No DETAIL line.** The `23503` message is a single line in jed's house style (no PG `DETAIL: Key
-  (…)=(…) is …` second line); the code matches.
+- **No DETAIL line in the message.** The `23503` message is a single line in jed's house style. The
+  PostgreSQL `Key (…)=(…) is not present in table "…".` / `is still referenced from table "…".` text is
+  carried in the structured `Detail` field instead ([error-fields.md](error-fields.md) §9).
 - **Constraint namespace only.** An FK name lives in the per-table **constraint** namespace (with
   CHECK), not the relation namespace — `CREATE TABLE fk_name (…)` does not collide with an FK named
   `fk_name`. PG keeps constraint names per-table too, so this matches PG; the note is only that, like
@@ -821,8 +822,11 @@ Runtime errors in a `SET DEFAULT` expression propagate as themselves.
 Plain `INSERT` uses the following canonical two-phase order. The order is observable through error
 precedence and deterministic cost, so a specialized execution path must reproduce it exactly.
 
-1. Build each declaration-order candidate row: apply `DEFAULT`/omission, coerce and range-check each
-   value, and enforce `NOT NULL`, all in column order.
+1. Build each declaration-order candidate row: apply `DEFAULT`/omission and coerce and range-check each
+   value, in column order. Then enforce `NOT NULL` over the complete row, in column order. A later
+   column's coercion or default error therefore wins over an earlier column's NULL, as in PostgreSQL,
+   which forms the row before `ExecConstraints` ([error-fields.md](error-fields.md) §9.5). UPDATE's
+   new-row build uses the same order.
 2. Evaluate `CHECK` constraints in their name order.
 3. Encode and probe the primary key. For a multi-row statement, also reject a key claimed by an
    earlier candidate.

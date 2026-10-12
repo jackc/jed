@@ -290,8 +290,9 @@ class = "integrity constraint violation"
 # Raised by an EXCLUDE constraint (spec/design/gist.md §7): an INSERT/UPDATE produces a row that,
 # under the constraint's WITH operators, conflicts with an existing row (every element comparison
 # TRUE). A NULL in any excluded expression exempts the row (PG-matched). {name} is the constraint's
-# backing GiST index name. (Unlike PostgreSQL, jed carries no separate DETAIL line — house style,
-# code matches.) Reserved at GX0; first raised when GX3 lands.
+# backing GiST index name. (Unlike PostgreSQL, the message carries no DETAIL line — house style;
+# the "Key (…)=(…) conflicts with existing key …" text is the structured Detail field,
+# spec/design/error-fields.md §9.) Reserved at GX0; first raised when GX3 lands.
 template = "conflicting key value violates exclusion constraint: {name}"
 
 # --- invalid transaction state (class 25) -----------------------------------

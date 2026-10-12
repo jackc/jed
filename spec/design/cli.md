@@ -217,7 +217,10 @@ sessions run in `UTC`, where the canonical render equals the session render the 
 
 **Errors** print to **stderr** as one line — `ERROR 23505: duplicate key value violates
 unique constraint: t_pkey` — the SQLSTATE inline (errors are structured data, §5/§10),
-prefixed `FILE:LINE: ` in script mode. CLI-generated hints (a second `hint: ...` line):
+prefixed `FILE:LINE: ` in script mode. When the error carries a structured `Detail`
+([error-fields.md](error-fields.md) §9), a psql-style second line follows, `DETAIL:  Key (id)=(1)
+already exists.` (two spaces after the colon, as psql prints it). The TUI's one-line message log
+appends it inline (`…  DETAIL: Key (id)=(1) already exists.`). CLI-generated hints (a second `hint: ...` line):
 missing file → `pass --create`; `54P01` → `raise the ceiling with --max-cost`.
 
 ## 6. TUI mode

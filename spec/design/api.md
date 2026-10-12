@@ -746,6 +746,13 @@ on the integrity violations (23505/23514/23503/23P01 → constraint + table; 235
 and the type errors (22003/22001 → data type). Absent fields are `None`/`""`/`undefined`. Additive:
 `.code()` and the rendered message format are unchanged.
 
+A fifth field, **`detail`** (Rust `detail: Option<String>`, Go `Detail`, TS `detail?`), carries
+PostgreSQL's DETAIL sentence naming the offending values: `Key (id)=(1) already exists.`,
+`Key (p)=(99) is not present in table "t".`, `Failing row contains (1, null).`. It is set on the
+class-23 violations, renders each value through the result-cell text path (64-byte cap per value), and
+is withheld when the session lacks `SELECT` on the table whose values it would show
+([error-fields.md](error-fields.md) §9). It is never appended to the rendered message.
+
 ## 8. Cost ceiling (`max_cost`)
 
 A first-class use case is **safely evaluating untrusted, user-supplied queries** (CLAUDE.md

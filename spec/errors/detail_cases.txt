@@ -1,0 +1,298 @@
+# Shared error-Detail cases (spec/design/error-fields.md §9.8).
+#
+# Every core's error_fields test runs every case and asserts the failing statement's SQLSTATE and its
+# structured Detail field, byte-for-byte. The corpus cannot assert a structured field, so this one
+# language-neutral file stands in for three hand-mirrored test lists (CLAUDE.md §5/§10).
+#
+# Format: line-oriented. A case starts at `case: <name>` and ends at the next `case:` or end of file.
+# Blank lines and lines starting with `#` are ignored. Directives, in this order within a case:
+#
+#   setup: <sql>               run with the default (fully permissive) session; repeatable
+#   default_privileges: <list> then replace the session's default table privileges; the list is
+#                              comma-separated privilege names, or `-` for none
+#   grant: <PRIV> <object>     then grant one privilege on one object; repeatable
+#   revoke: <PRIV> <object>    then revoke one privilege on one object; repeatable
+#   run: <sql>                 the statement that must fail
+#   code: <sqlstate>           its SQLSTATE
+#   detail: <text>             its exact Detail; the text runs to end of line (leading `detail: ` removed)
+#   no-detail                  instead of `detail:`: the Detail field must be absent
+#
+# Expected text matches PostgreSQL 18's DETAIL wherever a PostgreSQL equivalent exists. A case marked
+# `# jed:` differs from PostgreSQL by design (error-fields.md §9.7).
+
+# --- 23505 unique ---------------------------------------------------------------------------------
+
+case: unique primary key
+setup: CREATE TABLE t (id i32 PRIMARY KEY)
+setup: INSERT INTO t VALUES (1)
+run: INSERT INTO t VALUES (1)
+code: 23505
+detail: Key (id)=(1) already exists.
+
+case: unique quoted column label
+setup: CREATE TABLE t (id i32 PRIMARY KEY, "Mixed Col" text UNIQUE)
+setup: INSERT INTO t VALUES (1, 'a')
+run: INSERT INTO t VALUES (2, 'a')
+code: 23505
+detail: Key ("Mixed Col")=(a) already exists.
+
+case: unique composite primary key
+setup: CREATE TABLE m (a i32, b text, PRIMARY KEY (a, b))
+run: INSERT INTO m VALUES (1, 'x'), (1, 'x')
+code: 23505
+detail: Key (a, b)=(1, x) already exists.
+
+# jed: PostgreSQL does not truncate index key values; jed caps every value at 64 bytes.
+case: unique long key truncated
+setup: CREATE TABLE m (a i32, b text, PRIMARY KEY (a, b))
+setup: INSERT INTO m VALUES (1, repeat('y', 100))
+run: INSERT INTO m VALUES (1, repeat('y', 100))
+code: 23505
+detail: Key (a, b)=(1, yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy...) already exists.
+
+case: unique in-statement duplicate
+setup: CREATE TABLE t (id i32 PRIMARY KEY)
+run: INSERT INTO t VALUES (2), (3), (2)
+code: 23505
+detail: Key (id)=(2) already exists.
+
+case: unique secondary index on update
+setup: CREATE TABLE t (id i32 PRIMARY KEY, email text)
+setup: CREATE UNIQUE INDEX t_email_key ON t (email)
+setup: INSERT INTO t VALUES (1, 'a@x'), (2, 'b@x')
+run: UPDATE t SET email = 'a@x' WHERE id = 2
+code: 23505
+detail: Key (email)=(a@x) already exists.
+
+case: unique primary key re-key on update
+setup: CREATE TABLE u (a i32 PRIMARY KEY, b i32)
+setup: INSERT INTO u VALUES (1, 1), (2, 2)
+run: UPDATE u SET a = 1 WHERE a = 2
+code: 23505
+detail: Key (a)=(1) already exists.
+
+# jed: an expression key's label is the persisted canonical token text (as jed_constraints.expression
+# shows it); PostgreSQL prints lower(e).
+case: unique expression index label
+setup: CREATE TABLE t (id i32 PRIMARY KEY, e text)
+setup: CREATE UNIQUE INDEX t_lower ON t (lower(e))
+setup: INSERT INTO t VALUES (1, 'x')
+run: INSERT INTO t VALUES (2, 'X')
+code: 23505
+detail: Key (lower ( e ))=(x) already exists.
+
+case: unique float key
+setup: CREATE TABLE f (k f64 PRIMARY KEY)
+setup: INSERT INTO f VALUES (1.5)
+run: INSERT INTO f VALUES (1.5)
+code: 23505
+detail: Key (k)=(1.5) already exists.
+
+case: unique create index over duplicates
+setup: CREATE TABLE t (id i32 PRIMARY KEY, a i32)
+setup: INSERT INTO t VALUES (1, 1), (2, 1)
+run: CREATE UNIQUE INDEX tu ON t (a)
+code: 23505
+detail: Key (a)=(1) is duplicated.
+
+case: unique add constraint over duplicates
+setup: CREATE TABLE t (id i32 PRIMARY KEY, a i32)
+setup: INSERT INTO t VALUES (1, 1), (2, 1)
+run: ALTER TABLE t ADD UNIQUE (a)
+code: 23505
+detail: Key (a)=(1) is duplicated.
+
+# --- 23503 foreign key ----------------------------------------------------------------------------
+
+case: foreign key child insert
+setup: CREATE TABLE t (id i32 PRIMARY KEY)
+setup: CREATE TABLE c (id i32 PRIMARY KEY, p i32 REFERENCES t (id))
+run: INSERT INTO c VALUES (1, 99)
+code: 23503
+detail: Key (p)=(99) is not present in table "t".
+
+case: foreign key multi-column child insert
+setup: CREATE TABLE m (a i32, b text, PRIMARY KEY (a, b))
+setup: CREATE TABLE cm (id i32 PRIMARY KEY, k1 i32, k2 text, FOREIGN KEY (k1, k2) REFERENCES m (a, b))
+run: INSERT INTO cm VALUES (1, 7, 'q')
+code: 23503
+detail: Key (k1, k2)=(7, q) is not present in table "m".
+
+case: foreign key parent delete
+setup: CREATE TABLE t (id i32 PRIMARY KEY)
+setup: CREATE TABLE c (id i32 PRIMARY KEY, p i32 REFERENCES t (id))
+setup: INSERT INTO t VALUES (1)
+setup: INSERT INTO c VALUES (1, 1)
+run: DELETE FROM t WHERE id = 1
+code: 23503
+detail: Key (id)=(1) is still referenced from table "c".
+
+case: foreign key parent update
+setup: CREATE TABLE t (id i32 PRIMARY KEY)
+setup: CREATE TABLE c (id i32 PRIMARY KEY, p i32 REFERENCES t (id))
+setup: INSERT INTO t VALUES (1)
+setup: INSERT INTO c VALUES (1, 1)
+run: UPDATE t SET id = 2 WHERE id = 1
+code: 23503
+detail: Key (id)=(1) is still referenced from table "c".
+
+case: foreign key add constraint validation
+setup: CREATE TABLE p (id i32 PRIMARY KEY)
+setup: CREATE TABLE t (id i32 PRIMARY KEY, a i32)
+setup: INSERT INTO t VALUES (1, 1)
+run: ALTER TABLE t ADD FOREIGN KEY (a) REFERENCES p (id)
+code: 23503
+detail: Key (a)=(1) is not present in table "p".
+
+# --- 23P01 exclusion ------------------------------------------------------------------------------
+
+case: exclusion against stored row
+setup: CREATE TABLE ex (id i32 PRIMARY KEY, r i32range, EXCLUDE USING gist (r WITH &&))
+setup: INSERT INTO ex VALUES (1, '[1,5)')
+run: INSERT INTO ex VALUES (2, '[3,7)')
+code: 23P01
+detail: Key (r)=([3,7)) conflicts with existing key (r)=([1,5)).
+
+case: exclusion within one statement
+setup: CREATE TABLE ex (id i32 PRIMARY KEY, r i32range, EXCLUDE USING gist (r WITH &&))
+run: INSERT INTO ex VALUES (1, '[1,5)'), (2, '[3,7)')
+code: 23P01
+detail: Key (r)=([3,7)) conflicts with existing key (r)=([1,5)).
+
+case: exclusion add constraint over existing rows
+setup: CREATE TABLE ex (id i32 PRIMARY KEY, r i32range)
+setup: INSERT INTO ex VALUES (1, '[1,5)'), (2, '[3,7)')
+run: ALTER TABLE ex ADD EXCLUDE USING gist (r WITH &&)
+code: 23P01
+detail: Key (r)=([3,7)) conflicts with key (r)=([1,5)).
+
+# --- 23514 check / 23502 not null: "Failing row contains" ----------------------------------------
+
+case: check failing row
+setup: CREATE TABLE t (id i32 PRIMARY KEY, s text, n decimal CHECK (n > 0), ts timestamptz, b bytea)
+run: INSERT INTO t VALUES (4, 'd', -1, '2020-01-01 00:00:00+00', '\xdeadbeef')
+code: 23514
+detail: Failing row contains (4, d, -1, 2020-01-01 00:00:00+00, \xdeadbeef).
+
+case: check failing row truncates long values
+setup: CREATE TABLE t (id i32 PRIMARY KEY, s text, n i32 CHECK (n > 0), x text)
+run: INSERT INTO t VALUES (5, repeat('ab', 100), -1, NULL)
+code: 23514
+detail: Failing row contains (5, abababababababababababababababababababababababababababababababab..., -1, null).
+
+case: check truncation keeps whole characters
+setup: CREATE TABLE mb (id i32 PRIMARY KEY, s text CHECK (length(s) < 5))
+run: INSERT INTO mb VALUES (1, lpad(repeat('é', 40), 41, 'a'))
+code: 23514
+detail: Failing row contains (1, aééééééééééééééééééééééééééééééé...).
+
+# jed: booleans render true/false (jed's result-cell text); PostgreSQL's DETAIL shows t/f.
+case: check failing row with containers
+setup: CREATE TYPE addr AS (street text, zip i32)
+setup: CREATE TABLE ct (id i32 CHECK (id > 0), a i32[], r i32range, ad addr, d decimal(5,2), b boolean)
+run: INSERT INTO ct VALUES (-1, '{1,NULL,3}', '[1,5)', ROW('Main "St"', 12345), 1.5, true)
+code: 23514
+detail: Failing row contains (-1, {1,NULL,3}, [1,5), ("Main ""St""",12345), 1.50, true).
+
+case: check on update shows the new row
+setup: CREATE TABLE t (id i32 PRIMARY KEY, n i32 CHECK (n < 10))
+setup: INSERT INTO t VALUES (1, 1)
+run: UPDATE t SET n = 50 WHERE id = 1
+code: 23514
+detail: Failing row contains (1, 50).
+
+case: not null failing row
+setup: CREATE TABLE nn (a i32, b text NOT NULL)
+run: INSERT INTO nn VALUES (1, NULL)
+code: 23502
+detail: Failing row contains (1, null).
+
+case: not null failing row includes later defaults
+setup: CREATE TABLE nn (a i32 NOT NULL, b text, c i32 DEFAULT 7)
+run: INSERT INTO nn (b) VALUES ('e')
+code: 23502
+detail: Failing row contains (null, e, 7).
+
+case: not null on update
+setup: CREATE TABLE nn (a i32 PRIMARY KEY, b text NOT NULL)
+setup: INSERT INTO nn VALUES (1, 'x')
+run: UPDATE nn SET b = NULL
+code: 23502
+detail: Failing row contains (1, null).
+
+# PostgreSQL forms the whole row before checking NOT NULL (error-fields.md §9.5): the later column's
+# overflow wins over the earlier column's NULL.
+case: later coercion error wins over not null
+setup: CREATE TABLE z (a i32 NOT NULL, b i16)
+run: INSERT INTO z VALUES (NULL, 100000)
+code: 22003
+no-detail
+
+case: check added over existing rows has no detail
+setup: CREATE TABLE t (id i32 PRIMARY KEY, a i32)
+setup: INSERT INTO t VALUES (1, 1)
+run: ALTER TABLE t ADD CHECK (a > 1)
+code: 23514
+no-detail
+
+case: set not null over existing rows has no detail
+setup: CREATE TABLE t (id i32 PRIMARY KEY, a i32)
+setup: INSERT INTO t VALUES (1, NULL)
+run: ALTER TABLE t ALTER COLUMN a SET NOT NULL
+code: 23502
+no-detail
+
+# --- privilege gate (error-fields.md §9.4) --------------------------------------------------------
+
+# jed: PostgreSQL's rule, through jed's session envelope.
+case: gate withholds unique key without select
+setup: CREATE TABLE t (id i32 PRIMARY KEY)
+setup: INSERT INTO t VALUES (1)
+default_privileges: INSERT
+run: INSERT INTO t VALUES (1)
+code: 23505
+no-detail
+
+case: gate degrades foreign key child without select
+setup: CREATE TABLE t (id i32 PRIMARY KEY)
+setup: CREATE TABLE c (id i32 PRIMARY KEY, p i32 REFERENCES t (id))
+default_privileges: INSERT
+run: INSERT INTO c VALUES (1, 99)
+code: 23503
+detail: Key is not present in table "t".
+
+case: gate degrades foreign key parent without select
+setup: CREATE TABLE t (id i32 PRIMARY KEY)
+setup: CREATE TABLE c (id i32 PRIMARY KEY, p i32 REFERENCES t (id))
+setup: INSERT INTO t VALUES (1)
+setup: INSERT INTO c VALUES (1, 1)
+default_privileges: DELETE
+run: DELETE FROM t
+code: 23503
+detail: Key is still referenced from table "c".
+
+case: gate withholds failing row without select
+setup: CREATE TABLE t (id i32 PRIMARY KEY, n i32 CHECK (n > 0))
+default_privileges: INSERT
+run: INSERT INTO t VALUES (1, -1)
+code: 23514
+no-detail
+
+case: gate allows with a per-table select grant
+setup: CREATE TABLE t (id i32 PRIMARY KEY)
+setup: INSERT INTO t VALUES (1)
+default_privileges: INSERT
+grant: SELECT t
+run: INSERT INTO t VALUES (1)
+code: 23505
+detail: Key (id)=(1) already exists.
+
+case: gate checks the base table under a view write
+setup: CREATE TABLE w (a i32 PRIMARY KEY, b i32)
+setup: CREATE VIEW v AS SELECT a, b FROM w
+setup: INSERT INTO w VALUES (1, 1)
+default_privileges: -
+grant: INSERT v
+run: INSERT INTO v VALUES (1, 2)
+code: 23505
+no-detail
