@@ -51,6 +51,10 @@ type scopeRel struct {
 	// binding's synthetic relation and exec delivers its rows from the cteCtx. nil for a base
 	// table / SRF / pseudo-relation.
 	cte *int
+	// base is whether this relation is a catalog BASE TABLE (possibly under a column alias list —
+	// grammar.md §15). A view body's planning trace records the columns resolved against such a
+	// relation as dependencies (spec/design/views.md §6); every other relation kind records none.
+	base bool
 }
 
 // resolved is how a column reference resolved against the scope CHAIN (spec/design/grammar.md
@@ -274,6 +278,7 @@ func (s *scope) resolveBare(name string) (resolved, error) {
 		}
 	}
 	if found >= 0 {
+		s.traceFlat(found)
 		return resolved{level: 0, index: found}, nil
 	}
 	if s.parent != nil {
@@ -284,6 +289,49 @@ func (s *scope) resolveBare(name string) (resolved, error) {
 		return outerOf(r), nil
 	}
 	return resolved{}, undefinedColumn(name)
+}
+
+// starLabel is the label a frozen `*` column renders with (spec/design/views.md §5): hasLabel false
+// (a bare "column") for a USING/NATURAL merged column and for a relation with no label (an unaliased
+// derived table); an unaliased parenthesized join's column takes its inner relation's label; any
+// other column its relation's label.
+func (s *scope) starLabel(idx int) (string, bool) {
+	for _, m := range s.merges {
+		if m.index == idx {
+			return "", false
+		}
+	}
+	for _, r := range s.rels {
+		if idx >= r.offset && idx < r.offset+len(r.table.Columns) {
+			if r.label != "" {
+				return r.label, true
+			}
+			for _, sr := range s.subRels {
+				if slices.Contains(sr.slots, idx) {
+					return sr.label, true
+				}
+			}
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// traceFlat records a resolved column of this scope as a view dependency when a view body is being
+// traced and the column belongs to a catalog base table (spec/design/views.md §6). A no-op on every
+// ordinary statement.
+func (s *scope) traceFlat(idx int) {
+	if s.catalog == nil || s.catalog.viewTrace == nil {
+		return
+	}
+	for _, r := range s.rels {
+		if idx >= r.offset && idx < r.offset+len(r.table.Columns) {
+			if r.base {
+				s.catalog.traceColumn(r.table.Name, idx-r.offset)
+			}
+			return
+		}
+	}
 }
 
 // resolveQualified resolves a qualified rel.col against THIS scope, then outward. A qualifier
@@ -316,8 +364,10 @@ func (s *scope) resolveQualified(qualifier, name string) (resolved, error) {
 			case ambiguous:
 				return resolved{}, ambiguousColumn(name)
 			case visible >= 0:
+				s.traceFlat(visible)
 				return resolved{level: 0, index: visible}, nil
 			}
+			s.traceFlat(found)
 			return resolved{level: 0, index: found}, nil
 		}
 	}
@@ -655,32 +705,45 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 		var derivs []deriv
 		// The FROM planner fixed the `*` order (USING/NATURAL merges per join — PostgreSQL,
 		// grammar.md §15); a merge's underlying copies are hidden and so absent from it.
-		if s.star != nil {
-			for _, idx := range s.star {
-				c := s.columnAt(idx)
-				ps = append(ps, &rExpr{kind: reColumn, index: idx})
-				names = append(names, c.Name)
-				types = append(types, resolvedTypeOfCol(c.Type, s.catalog.readSnap()))
-				derivs = append(derivs, catColumnDeriv(c))
-			}
-			return ps, names, types, derivs, nil
-		}
-		// The RETURNING old/new pseudo-relations are qualifier-only: `*` expands the real
-		// relations' columns exactly as before (grammar.md §32).
-		for _, r := range s.rels {
-			if r.qualifierOnly {
-				continue
-			}
-			for i := range r.table.Columns {
-				idx := r.offset + i
-				if slices.Contains(s.hidden, idx) {
+		star := s.star
+		var starCols []*catColumn
+		if star == nil {
+			// The RETURNING old/new pseudo-relations are qualifier-only: `*` expands the real
+			// relations' columns exactly as before (grammar.md §32).
+			for _, r := range s.rels {
+				if r.qualifierOnly {
 					continue
 				}
-				ps = append(ps, &rExpr{kind: reColumn, index: idx})
-				names = append(names, r.table.Columns[i].Name)
-				types = append(types, resolvedTypeOfCol(r.table.Columns[i].Type, s.catalog.readSnap()))
-				derivs = append(derivs, catColumnDeriv(&r.table.Columns[i]))
+				for i := range r.table.Columns {
+					idx := r.offset + i
+					if slices.Contains(s.hidden, idx) {
+						continue
+					}
+					star = append(star, idx)
+					starCols = append(starCols, &r.table.Columns[i])
+				}
 			}
+		} else {
+			for _, idx := range star {
+				starCols = append(starCols, s.columnAt(idx))
+			}
+		}
+		for k, idx := range star {
+			c := starCols[k]
+			ps = append(ps, &rExpr{kind: reColumn, index: idx})
+			names = append(names, c.Name)
+			types = append(types, resolvedTypeOfCol(c.Type, s.catalog.readSnap()))
+			derivs = append(derivs, catColumnDeriv(c))
+			s.traceFlat(idx)
+		}
+		// A written `*` in a view body is frozen into its expansion (views.md §5).
+		if items.StarPos != 0 && s.catalog != nil && s.catalog.viewTracing() {
+			cols := make([]starColumn, len(star))
+			for k, idx := range star {
+				label, hasLabel := s.starLabel(idx)
+				cols[k] = starColumn{label: label, hasLabel: hasLabel, column: starCols[k].Name}
+			}
+			s.catalog.traceStar(items.StarPos, false, cols)
 		}
 		return ps, names, types, derivs, nil
 	}
@@ -720,6 +783,15 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 				names = append(names, table.Columns[i].Name)
 				types = append(types, resolvedTypeOfCol(table.Columns[i].Type, s.catalog.readSnap()))
 				derivs = append(derivs, catColumnDeriv(&table.Columns[i]))
+				s.traceFlat(slots[i])
+			}
+			// A written `rel.*` in a view body is frozen into `"rel" . "col"` references (views.md §5).
+			if it.Expr.StarPos != 0 && s.catalog != nil && s.catalog.viewTracing() {
+				cols := make([]starColumn, len(table.Columns))
+				for i := range table.Columns {
+					cols[i] = starColumn{label: want, hasLabel: true, column: table.Columns[i].Name}
+				}
+				s.catalog.traceStar(it.Expr.StarPos, true, cols)
 			}
 			continue
 		}
@@ -977,6 +1049,11 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 	}
 	switch e.Kind {
 	case exprParam:
+		// A view body has no parameters (views.md §1.1/§4.1): 42P02 where the planner meets it, so
+		// earlier resolution errors keep PostgreSQL's order.
+		if s.catalog != nil && s.catalog.viewTracing() {
+			return nil, resolvedType{}, newError(UndefinedParameter, fmt.Sprintf("there is no parameter $%d", e.Param))
+		}
 		// A bind parameter is an adaptable operand (like an integer/string literal): it takes its
 		// type from ctx — the sibling operand, target column, or CAST target. Record the inferred
 		// type (nil = no context here; finalize 42P18s a parameter that never gets one).

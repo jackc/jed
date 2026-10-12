@@ -69,7 +69,7 @@ func (db *engine) executeStmtParamsCached(stmt statement, params []Value, ic *in
 		// Run the statement; ANY error aborts the block (it enters the failed state — §6).
 		var out outcome
 		var err error
-		if stmtIsWrite(stmt) && !db.session.tx.writable {
+		if db.stmtIsWriteWithViews(stmt) && !db.session.tx.writable {
 			err = newError(ReadOnlySqlTransaction,
 				"cannot execute "+stmtKind(stmt)+" in a read-only transaction")
 		} else {
@@ -94,7 +94,7 @@ func (db *engine) executeStmtParamsCached(stmt statement, params []Value, ic *in
 	// transaction — open a working snapshot off committed, run, then commit on success / discard on
 	// error. Because the write mutates only working, an error leaves committed untouched (no restore
 	// needed); rolled-back rowid allocations vanish with working (§7).
-	if !stmtIsWrite(stmt) {
+	if !db.stmtIsWriteWithViews(stmt) {
 		return db.dispatchStmt(stmt, params)
 	}
 	// On a read-only handle the implicit transaction is READ ONLY (PostgreSQL hot-standby

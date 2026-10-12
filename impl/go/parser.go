@@ -150,6 +150,19 @@ func (p *parser) parseStatement() (statement, error) {
 			}
 			return statement{CreateSequence: cs}, nil
 		}
+		// CREATE VIEW (views.md §1, grammar.md §54) — VIEW is recognized positionally, so `CREATE
+		// TABLE view (…)` still names a table. The deferred forms are recognized by their keyword
+		// sequence and refused with 0A000 before the body is parsed (§12).
+		if p.atDeferredCreateView() {
+			return statement{}, newError(FeatureNotSupported, "this form of CREATE VIEW is not supported")
+		}
+		if p.peekKeywordAt(1) == "view" {
+			cv, err := p.parseCreateView()
+			if err != nil {
+				return statement{}, err
+			}
+			return statement{CreateView: cv}, nil
+		}
 		ct, err := p.parseCreateTable()
 		if err != nil {
 			return statement{}, err
@@ -177,6 +190,13 @@ func (p *parser) parseStatement() (statement, error) {
 			}
 			return statement{DropSequence: ds}, nil
 		}
+		if p.peekKeywordAt(1) == "view" {
+			dv, err := p.parseDropView()
+			if err != nil {
+				return statement{}, err
+			}
+			return statement{DropView: dv}, nil
+		}
 		dt, err := p.parseDropTable()
 		if err != nil {
 			return statement{}, err
@@ -193,6 +213,10 @@ func (p *parser) parseStatement() (statement, error) {
 				return statement{}, err
 			}
 			return statement{AlterSequence: as}, nil
+		}
+		// ALTER VIEW is a deferred follow-on (views.md §12).
+		if p.peekKeywordAt(1) == "view" {
+			return statement{}, newError(FeatureNotSupported, "ALTER VIEW is not supported")
 		}
 		if p.peekKeywordAt(1) == "table" {
 			at, err := p.parseAlterTable()
@@ -239,6 +263,147 @@ func (p *parser) parseStatement() (statement, error) {
 	default:
 		return statement{}, newError(SyntaxError, fmt.Sprintf("unexpected keyword '%s'", p.peekKeyword()))
 	}
+}
+
+// atDeferredCreateView reports whether the statement is one of the deferred `CREATE … VIEW` forms
+// (views.md §12): `CREATE OR REPLACE VIEW`, `CREATE TEMP | TEMPORARY VIEW`, `CREATE RECURSIVE VIEW`,
+// `CREATE MATERIALIZED VIEW`. Recognized by keyword sequence so each fails 0A000, not 42601.
+func (p *parser) atDeferredCreateView() bool {
+	switch p.peekKeywordAt(1) {
+	case "or":
+		return p.peekKeywordAt(2) == "replace" && p.peekKeywordAt(3) == "view"
+	case "temp", "temporary", "recursive", "materialized":
+		return p.peekKeywordAt(2) == "view"
+	}
+	return false
+}
+
+// parseCreateView parses `CREATE VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr`
+// (views.md §1, grammar.md §54). The body runs from the token after `AS` to the end of the statement
+// and is captured as its canonical token text. A `WITH ( … )` option list after the name and a
+// trailing `WITH [CASCADED | LOCAL] CHECK OPTION` are deferred forms (0A000); the check option is
+// detected after the body is parsed, so a body syntax error is reported first.
+func (p *parser) parseCreateView() (*createView, error) {
+	if err := p.expectKeyword("create"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("view"); err != nil {
+		return nil, err
+	}
+	// A two-token lookahead keeps a lone `if` an ordinary view name (`CREATE VIEW if AS …`).
+	ifNotExists := false
+	if p.peekKeyword() == "if" && p.peekKeywordAt(1) == "not" {
+		var err error
+		if ifNotExists, err = p.parseIfNotExists(); err != nil {
+			return nil, err
+		}
+	}
+	db, name, err := p.parseQualifiedTableName()
+	if err != nil {
+		return nil, err
+	}
+	if p.peekKeyword() == "with" && p.peekKindAt(1) == tokLParen {
+		return nil, newError(FeatureNotSupported, "view options (WITH ( … )) are not supported")
+	}
+	var columns []string
+	if p.peek().Kind == tokLParen {
+		p.advance()
+		for {
+			col, err := p.expectIdentifier()
+			if err != nil {
+				return nil, err
+			}
+			columns = append(columns, col)
+			if p.peek().Kind != tokComma {
+				break
+			}
+			p.advance()
+		}
+		if err := p.expect(tokRParen); err != nil {
+			return nil, err
+		}
+	}
+	if err := p.expectKeyword("as"); err != nil {
+		return nil, err
+	}
+	// A trailing `WITH [CASCADED | LOCAL] CHECK OPTION` is cut off before the body is parsed (an
+	// unreserved `with` would otherwise be read as a table alias) and refused after it.
+	checkOption := p.trailingCheckOption()
+	if checkOption >= 0 {
+		p.tokens[checkOption] = token{Kind: tokEof}
+	}
+	start := p.pos
+	if _, err := p.parseSubquery(); err != nil {
+		return nil, err
+	}
+	end := p.pos
+	if checkOption >= 0 {
+		if end != checkOption {
+			return nil, newError(SyntaxError, "unexpected trailing input")
+		}
+		return nil, newError(FeatureNotSupported, "WITH CHECK OPTION is not supported")
+	}
+	body := renderTokens(p.tokens[start:end])
+	return &createView{Name: name, DB: db, IfNotExists: ifNotExists, Columns: columns, Body: body}, nil
+}
+
+// trailingCheckOption returns the index of a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` at the
+// end of the token stream (views.md §12), or -1 if the statement does not end with one.
+func (p *parser) trailingCheckOption() int {
+	end := len(p.tokens)
+	if end > 0 && p.tokens[end-1].Kind == tokEof {
+		end--
+	}
+	word := func(i int, w string) bool {
+		return i >= 0 && i < len(p.tokens) && p.tokens[i].Kind == tokWord && p.tokens[i].Word == w
+	}
+	if end < p.pos+3 || !word(end-1, "option") || !word(end-2, "check") {
+		return -1
+	}
+	if word(end-3, "with") {
+		return end - 3
+	}
+	if end >= p.pos+4 && (word(end-3, "cascaded") || word(end-3, "local")) && word(end-4, "with") {
+		return end - 4
+	}
+	return -1
+}
+
+// parseDropView parses `DROP VIEW [IF EXISTS] [db.]name [, …] [CASCADE | RESTRICT]` (views.md §1).
+// `IF EXISTS` is a two-token lookahead, so `DROP VIEW if` drops a view named `if`.
+func (p *parser) parseDropView() (*dropView, error) {
+	if err := p.expectKeyword("drop"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("view"); err != nil {
+		return nil, err
+	}
+	ifExists := p.peekKeyword() == "if" && p.peekKeywordAt(1) == "exists"
+	if ifExists {
+		p.advance() // IF
+		p.advance() // EXISTS
+	}
+	var names []qualifiedName
+	for {
+		db, name, err := p.parseQualifiedTableName()
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, qualifiedName{DB: db, Name: name})
+		if p.peek().Kind != tokComma {
+			break
+		}
+		p.advance()
+	}
+	cascade := false
+	switch p.peekKeyword() {
+	case "cascade":
+		p.advance()
+		cascade = true
+	case "restrict":
+		p.advance()
+	}
+	return &dropView{Names: names, IfExists: ifExists, Cascade: cascade}, nil
 }
 
 // parseAnalyze parses `ANALYZE qualified_table [(identifier [, identifier ...])]`.
@@ -3249,6 +3414,7 @@ func (p *parser) parseTableRef() (tableRef, error) {
 	if p.peekKeyword() == "json_table" && p.peekKindAt(1) == tokLParen {
 		return p.parseJsonTable()
 	}
+	namePos := p.pos
 	name, err := p.expectIdentifier()
 	if err != nil {
 		return tableRef{}, err
@@ -3260,6 +3426,7 @@ func (p *parser) parseTableRef() (tableRef, error) {
 	var dbQualifier *string
 	if p.peek().Kind == tokDot {
 		p.advance() // .
+		namePos = p.pos
 		tbl, err := p.expectIdentifier()
 		if err != nil {
 			return tableRef{}, err
@@ -3293,8 +3460,10 @@ func (p *parser) parseTableRef() (tableRef, error) {
 		}
 	}
 	var alias *string
+	var aliasPos tokPos
 	if p.peekKeyword() == "as" {
 		p.advance()
+		aliasPos = tokPos(p.pos)
 		a, err := p.expectIdentifier()
 		if err != nil {
 			return tableRef{}, err
@@ -3302,20 +3471,36 @@ func (p *parser) parseTableRef() (tableRef, error) {
 		alias = &a
 	} else if t := p.peek(); t.Kind == tokQuotedIdent || (t.Kind == tokWord && !isTableRefStopKeyword(t.Word)) {
 		a := t.Word
+		aliasPos = tokPos(p.pos)
 		p.advance()
 		alias = &a
 	}
-	// A `(` after a table-function alias is either the rename-only column-alias list
-	// `AS g(c1, …)` (grammar.md §35) or the typed column-definition list `AS g(c type, …)`
-	// used by record-returning functions (C0, json-table.md §1). A base table's corresponding
-	// list remains a deferred 0A000 narrowing.
+	// A `(` after an alias is a column alias list. On a base table (or view) it is the rename-only
+	// list `AS x(p, q)` (grammar.md §15). On a table function it is either the rename-only list
+	// `AS g(c1, …)` (§35) or the typed column-definition list `AS g(c type, …)` used by
+	// record-returning functions (C0, json-table.md §1).
 	var columnAliases []string
 	var columnDefs []typeFieldDef
-	if alias != nil && p.peek().Kind == tokLParen {
-		if !isFunc {
-			return tableRef{}, newError(FeatureNotSupported,
-				"column alias list on a base table is not supported yet")
+	var listOpen, listClose tokPos
+	if alias != nil && p.peek().Kind == tokLParen && !isFunc {
+		listOpen = tokPos(p.pos)
+		p.advance() // (
+		for {
+			column, err := p.expectIdentifier()
+			if err != nil {
+				return tableRef{}, err
+			}
+			columnAliases = append(columnAliases, column)
+			if p.peek().Kind != tokComma {
+				break
+			}
+			p.advance()
 		}
+		listClose = tokPos(p.pos)
+		if err := p.expect(tokRParen); err != nil {
+			return tableRef{}, err
+		}
+	} else if alias != nil && p.peek().Kind == tokLParen {
 		// Disambiguate: a col-def list has `name type`; a rename list has `name ,`/`name )`. With the
 		// cursor still on `(`, the first column name is at offset 1, so a `Word` at offset 2 means a
 		// type follows (col-def list).
@@ -3345,7 +3530,10 @@ func (p *parser) parseTableRef() (tableRef, error) {
 		}
 	}
 	// An SRF is implicitly lateral; Lateral records only whether the keyword was written.
-	return tableRef{Name: name, DB: dbQualifier, Alias: alias, IsFunc: isFunc, Args: args, ColumnAliases: columnAliases, ColumnDefs: columnDefs, Lateral: lateral}, nil
+	return tableRef{
+		Name: name, DB: dbQualifier, Alias: alias, IsFunc: isFunc, Args: args, ColumnAliases: columnAliases, ColumnDefs: columnDefs, Lateral: lateral,
+		NamePos: tokPos(namePos), AliasPos: aliasPos, ListOpen: listOpen, ListClose: listClose,
+	}, nil
 }
 
 // parseJsonTable parses `JSON_TABLE(ctx, path [AS n] COLUMNS (col, …)) [AS alias]` (json-table.md §3,
@@ -4327,8 +4515,9 @@ func (p *parser) parseReturning() (*returningClause, error) {
 
 func (p *parser) parseSelectItems() (selectItems, error) {
 	if p.peek().Kind == tokStar {
+		starPos := tokPos(p.pos)
 		p.advance()
-		return selectItems{All: true}, nil
+		return selectItems{All: true, StarPos: starPos}, nil
 	}
 	var items []selectItem
 	for {
@@ -4337,13 +4526,14 @@ func (p *parser) parseSelectItems() (selectItems, error) {
 		// shape `identifier "." "*"` before the general expr parser, so `t.col` (Dot then a word)
 		// and `a * b` (no Dot) are untouched, and a bare `*` was already handled above. No `AS` alias.
 		if isIdentKind(p.peek().Kind) && p.peekKindAt(1) == tokDot && p.peekKindAt(2) == tokStar {
+			starPos := tokPos(p.pos)
 			qualifier, err := p.expectIdentifier()
 			if err != nil {
 				return selectItems{}, err
 			}
 			p.advance() // .
 			p.advance() // *
-			items = append(items, selectItem{Expr: exprNode{Kind: exprQualifiedStar, Qualifier: qualifier}})
+			items = append(items, selectItem{Expr: exprNode{Kind: exprQualifiedStar, Qualifier: qualifier, StarPos: starPos}})
 			if p.peek().Kind == tokComma {
 				p.advance()
 				continue
@@ -6041,6 +6231,25 @@ func parseExpression(text string) (exprNode, error) {
 		return exprNode{}, err
 	}
 	return expr, nil
+}
+
+// parseViewDefinition parses a stored view definition (spec/design/views.md §3): the canonical body
+// text as a subquery_expr. Every token position the AST records (tableRef NamePos/AliasPos/List*,
+// StarPos) is an index into lex(text), which is what the rename rewrites and `*` freezing edit.
+func parseViewDefinition(text string) (*queryExpr, error) {
+	tokens, err := lex(text)
+	if err != nil {
+		return nil, err
+	}
+	p := newParser(tokens)
+	body, err := p.parseSubquery()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectEof(); err != nil {
+		return nil, err
+	}
+	return &body, nil
 }
 
 // renderTokens re-renders a token slice as the persisted check-expression text: each token

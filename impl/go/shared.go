@@ -2178,7 +2178,7 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *i
 	if s.pendingErr != nil {
 		return nil, s.pendingErr
 	}
-	if s.engine.session.tx == nil && !stmtIsWrite(stmt) {
+	if s.engine.session.tx == nil && !s.engine.stmtIsWriteWithViews(stmt) {
 		if s.access == accessReadOnly {
 			if err := s.refreshInitialRead(); err != nil {
 				return nil, err
@@ -2205,7 +2205,7 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *i
 	// so a read that pins no long-lived snapshot leaks nothing.
 	autoPin := false
 	var autoPinVer uint64
-	if s.access != accessReadOnly && s.engine.session.tx == nil && !stmtIsWrite(stmt) {
+	if s.access != accessReadOnly && s.engine.session.tx == nil && !s.engine.stmtIsWriteWithViews(stmt) {
 		s.core.liveMu.Lock()
 		rt := s.core.roots.Load()
 		s.baseVersion = rt.committed.txid
@@ -2226,7 +2226,7 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *i
 	// privilege resolution sees the snapshot the read will use. Reads only: transaction control must
 	// still work in a failed block, and a write is gated inside dispatch when it falls through below
 	// (executor.go gateReadLanes — the safe-total-Query contract, CLAUDE.md §13).
-	if stmt.Begin == nil && stmt.Commit == nil && stmt.Rollback == nil && !stmtIsWrite(stmt) {
+	if stmt.Begin == nil && stmt.Commit == nil && stmt.Rollback == nil && !s.engine.stmtIsWriteWithViews(stmt) {
 		if err := s.engine.gateReadLanes(stmt); err != nil {
 			return nil, s.engine.poisonOnLaneErr(err)
 		}
@@ -2345,7 +2345,7 @@ func (s *Session) dispatch(stmt statement, params []Value, ic *insertStmtCache) 
 		// working set. The gate is already held for a writable block.
 		return s.engine.executeStmtParamsCached(stmt, params, ic)
 	}
-	if !stmtIsWrite(stmt) {
+	if !s.engine.stmtIsWriteWithViews(stmt) {
 		// Autocommit read: the snapshot was already pinned + committed set upstream (queryStmt's atomic
 		// autocommit-read pin for a writable session; the mint pin for a read-only session), and that pin
 		// is held across this synchronous materialize (transactions.md §8) — so the read's version is

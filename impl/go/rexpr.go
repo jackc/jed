@@ -1504,6 +1504,9 @@ const (
 	// srfJedTypeFields is the jed_type_fields catalog relation (introspection.md §5.3, slice I3) —
 	// one row per field of every user-defined type, in (type, ordinal) order.
 	srfJedTypeFields
+	// srfJedViews is the jed_views catalog relation (introspection.md §5.4, views V1) — one row per
+	// view of the qualified database, in ascending name byte order.
+	srfJedViews
 )
 
 // isCatalog reports whether the kind is a built-in catalog relation (introspection.md §5) rather
@@ -1511,7 +1514,7 @@ const (
 func (k srfKind) isCatalog() bool {
 	switch k {
 	case srfJedTables, srfJedColumns, srfJedIndexes, srfJedConstraints, srfJedStatistics,
-		srfJedSequences, srfJedTypes, srfJedTypeFields:
+		srfJedSequences, srfJedTypes, srfJedTypeFields, srfJedViews:
 		return true
 	}
 	return false

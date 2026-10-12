@@ -938,6 +938,20 @@ func identityTableDB(t *testing.T) *Session {
 	return db
 }
 
+// viewTableDB (v38): three entry_kind = 5 view entries after the table entry, in name order (n, v,
+// w) — the frozen `*` expansion, a column-list rename with a view dependency, and a table dependency
+// with zero columns. Must match the Ruby reference's VIEW_TABLE (spec/fileformat/verify.rb),
+// spec/design/views.md §3.
+func viewTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE t (a i32 PRIMARY KEY, b text)")
+	run(t, db, "INSERT INTO t VALUES (1, 'x'), (2, 'y')")
+	run(t, db, "CREATE VIEW v AS SELECT * FROM t WHERE a > 0")
+	run(t, db, "CREATE VIEW w (x) AS SELECT a FROM v")
+	run(t, db, "CREATE VIEW n AS SELECT count(*) AS c FROM t")
+	return db
+}
+
 // collationTableDB is a reference-only COLLATION (v18 — entry_kind 3 metadata entry + per-column
 // collations): the loaded unicode collation (the real version-pinned CLDR-DUCET root, UCA/UCD
 // 17.0.0) as the per-database default (is_default), a column with explicit COLLATE "unicode" (flags
@@ -1049,6 +1063,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"sequence_table.jed", sequenceTableDB},
 		{"serial_table.jed", serialTableDB},
 		{"identity_table.jed", identityTableDB},
+		{"view_table.jed", viewTableDB},
 		{"collation_table.jed", collationTableDB},
 		{"collation_pk_table.jed", collationPKTableDB},
 		{"collation_array_table.jed", collationArrayTableDB},
@@ -1128,6 +1143,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"sequence_table.jed", sequenceTableDB, "t"},
 		{"serial_table.jed", serialTableDB, "t"},
 		{"identity_table.jed", identityTableDB, "t"},
+		{"view_table.jed", viewTableDB, "t"},
 		{"collation_table.jed", collationTableDB, "t"},
 		{"collation_pk_table.jed", collationPKTableDB, "t"},
 		{"collation_array_table.jed", collationArrayTableDB, "t"},
@@ -1348,6 +1364,81 @@ func TestStatisticsSemanticCorruptionRejected(t *testing.T) {
 	_, err := loadEngine(image)
 	if err == nil || err.(*EngineError).Code() != "XX001" {
 		t.Fatalf("reserved statistics flag: want XX001, got %v", err)
+	}
+}
+
+// refreshGoldenPageCRC recomputes the per-page CRC of the golden page holding byte offset at, so a
+// semantic corruption is rejected by its decoder rather than the checksum guard.
+func refreshGoldenPageCRC(image []byte, at int) {
+	pageStart := at / goldenPageSize * goldenPageSize
+	covered := append([]byte(nil), image[pageStart:pageStart+12]...)
+	covered = append(covered, image[pageStart+16:pageStart+goldenPageSize]...)
+	binary.BigEndian.PutUint32(image[pageStart+12:pageStart+16], crc32IEEE(covered))
+}
+
+// Loading view_table.jed restores the three views: their stored text and columns, and reading each
+// one (spec/design/views.md §3/§4).
+func TestViewGoldenReadsBack(t *testing.T) {
+	loaded, err := loadEngine(fixture(t, "view_table.jed"))
+	if err != nil {
+		t.Fatalf("load view_table.jed: %v", err)
+	}
+	got := queryRows(t, loaded, "SELECT name, definition FROM jed_views ORDER BY name")
+	want := [][]Value{
+		{TextValue("n"), TextValue("select count ( * ) as c from t")},
+		{TextValue("v"), TextValue(`select "t" . "a" , "t" . "b" from t where a > 0`)},
+		{TextValue("w"), TextValue("select a from v")},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("jed_views = %v, want %v", got, want)
+	}
+	if got := queryRows(t, loaded, "SELECT x FROM w ORDER BY x"); !reflect.DeepEqual(got, [][]Value{{IntValue(1)}, {IntValue(2)}}) {
+		t.Fatalf("SELECT x FROM w = %v", got)
+	}
+	if got := queryRows(t, loaded, "SELECT c FROM n"); !reflect.DeepEqual(got, [][]Value{{IntValue(2)}}) {
+		t.Fatalf("SELECT c FROM n = %v", got)
+	}
+}
+
+// A stored view definition that no longer parses is corruption (XX001) at open — the body is parsed
+// (never planned) when the catalog loads (spec/design/views.md §3).
+func TestViewCorruptDefinitionIsRejected(t *testing.T) {
+	image := fixture(t, "view_table.jed")
+	// Replace the `a` in view w's `select a from v` with `(`, keeping its length, so the definition
+	// no longer parses.
+	at := bytes.Index(image, []byte("select a from v"))
+	if at < 0 {
+		t.Fatal("locate view w's definition")
+	}
+	image[at+7] = '('
+	refreshGoldenPageCRC(image, at)
+	_, err := loadEngine(image)
+	if err == nil || err.(*EngineError).Code() != "XX001" {
+		t.Fatalf("unparseable view definition: want XX001, got %v", err)
+	}
+}
+
+// A dependency on a missing table is corruption (XX001): the loader checks every dependency names an
+// existing relation of its kind (format.md *View entry*).
+func TestViewDanglingDependencyIsRejected(t *testing.T) {
+	image := fixture(t, "view_table.jed")
+	// View n's dependency entry: kind 0, name "t" (u16 1), zero columns. Rename the dependency to "u"
+	// (no such table).
+	def := []byte("select count ( * ) as c from t")
+	defAt := bytes.Index(image, def)
+	if defAt < 0 {
+		t.Fatal("locate view n's definition")
+	}
+	depAt := defAt + len(def) + 2 // after the u16 dep_count
+	pattern := []byte{0, 0, 1, 't', 0, 0}
+	if !bytes.Equal(image[depAt:depAt+len(pattern)], pattern) {
+		t.Fatalf("unexpected dependency bytes %v", image[depAt:depAt+len(pattern)])
+	}
+	image[depAt+3] = 'u'
+	refreshGoldenPageCRC(image, depAt)
+	_, err := loadEngine(image)
+	if err == nil || err.(*EngineError).Code() != "XX001" {
+		t.Fatalf("dangling view dependency: want XX001, got %v", err)
 	}
 }
 

@@ -217,6 +217,10 @@ func stmtKind(stmt statement) string {
 		return "ALTER SEQUENCE"
 	case stmt.DropSequence != nil:
 		return "DROP SEQUENCE"
+	case stmt.CreateView != nil:
+		return "CREATE VIEW"
+	case stmt.DropView != nil:
+		return "DROP VIEW"
 	case stmt.Insert != nil:
 		return "INSERT"
 	case stmt.Update != nil:
@@ -340,6 +344,16 @@ func (db *engine) dispatchStmtBodyCached(stmt statement, params []Value, ic *ins
 			return outcome{}, err
 		}
 		return db.executeDropSequence(stmt.DropSequence)
+	case stmt.CreateView != nil:
+		if err := rejectParamsForDDL(params); err != nil {
+			return outcome{}, err
+		}
+		return db.executeCreateView(stmt.CreateView)
+	case stmt.DropView != nil:
+		if err := rejectParamsForDDL(params); err != nil {
+			return outcome{}, err
+		}
+		return db.executeDropView(stmt.DropView)
 	case stmt.Insert != nil:
 		return db.executeInsertCached(stmt.Insert, params, cteCtx{}, ic, allowInsertFill)
 	case stmt.Select != nil:
@@ -406,7 +420,7 @@ func (db *engine) createTableNameTaken(name, attachName string) bool {
 		return db.relationExists(name)
 	}
 	as := db.attachReadSnap(attachName)
-	if _, ok := as.table(name); ok {
+	if _, ok := as.table(name); ok || as.view(name) != nil {
 		return true
 	}
 	_, _, ok := as.findIndex(name)
@@ -1041,7 +1055,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		} else {
 			p, ok := db.Table(fk.RefTable)
 			if !ok {
-				return outcome{}, newError(UndefinedTable, "table does not exist: "+fk.RefTable)
+				return outcome{}, fkParentMissing(db.readSnap(), fk.RefTable)
 			}
 			parent = p
 		}
@@ -1693,7 +1707,7 @@ func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 				// Not a table in any scope. An index's name is the wrong object kind (42809 —
 				// indexes.md §2); IF EXISTS does NOT suppress this. Otherwise a missing table is
 				// 42P01, unless IF EXISTS makes it a no-op for just this name.
-				if _, _, ok := db.findIndex(name); ok {
+				if _, _, ok := db.findIndex(name); ok || db.isView(name) {
 					return outcome{}, newError(WrongObjectType, name+" is not a table")
 				}
 				if dt.IfExists {
@@ -1710,6 +1724,17 @@ func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 	// snapshot; a dependent whose referencing table is itself in the drop set does not count (the
 	// drop-set exclusion is the whole seen set, so `DROP TABLE parent, child` succeeds even under
 	// RESTRICT).
+	// A view depending on a table being dropped blocks the statement (views.md §6): a DROP TABLE
+	// never drops views, and CASCADE dropping them is a follow-on.
+	var persistent []string
+	for _, tgt := range targets {
+		if tgt.scope == dropPersistent {
+			persistent = append(persistent, tgt.key)
+		}
+	}
+	if err := db.checkDropTableViews(persistent, dt.Cascade); err != nil {
+		return outcome{}, err
+	}
 	deps := db.readSnap().foreignKeyDependentsExcluding(seen)
 	var cascadeRemovals []fkDependent
 	if dt.Cascade {
@@ -1787,6 +1812,14 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	}
 	original, ok := snap.table(at.Name)
 	if !ok {
+		// A view: its renames are a follow-on (0A000); every other action is the wrong object kind
+		// (42809, views.md §2).
+		if snap.view(at.Name) != nil {
+			if at.RenameTable != "" || at.RenameColumn != nil {
+				return outcome{}, newError(FeatureNotSupported, "renaming a view is not supported")
+			}
+			return outcome{}, newError(WrongObjectType, at.Name+" is not a table")
+		}
 		if _, _, found := snap.findIndex(at.Name); found || snap.sequence(at.Name) != nil {
 			return outcome{}, newError(WrongObjectType, at.Name+" is not a table")
 		}
@@ -1841,7 +1874,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		if isAttachmentScope(at.DB) {
 			_, _, found := snap.findIndex(name)
 			_, tableFound := snap.table(name)
-			return tableFound || found || snap.sequence(name) != nil
+			return tableFound || found || snap.sequence(name) != nil || snap.view(name) != nil
 		}
 		return db.relationExists(name)
 	}
@@ -1867,6 +1900,31 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		return relationTaken(name)
 	}
 
+	// Views that depend on the table (spec/design/views.md §6–§8). A main-database table's dependents
+	// are captured now — traced against the pre-statement catalog when the action edits their text —
+	// and rewritten + re-validated after the change. A table of an attached database with dependent
+	// views refuses every ALTER TABLE: re-validating views there is a follow-on (views.md §10).
+	var viewPlan *viewAlterPlan
+	if snap != db.tempSnap() {
+		if isAttachmentScope(at.DB) {
+			if deps := snap.viewsDependingOn(viewDepTable, original.Name); len(deps) > 0 {
+				return outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
+					"cannot alter table %s because view %s depends on it", original.Name, deps[0].Name))
+			}
+		} else {
+			rewrites := at.RenameTable != "" || at.RenameColumn != nil
+			for _, a := range at.Actions {
+				rewrites = rewrites || a.DropColumn != nil
+			}
+			vp, err := db.prepareViewAlter(original, rewrites)
+			if err != nil {
+				return outcome{}, err
+			}
+			viewPlan = vp
+		}
+	}
+	viewChange := viewAlterChange{kind: viewAlterOther}
+
 	if at.RenameTable != "" {
 		if err := checkReservedName("table", at.RenameTable); err != nil {
 			return outcome{}, err
@@ -1878,6 +1936,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		if err := rewriteAlterTableExpressions(&table, table.Name, renameTable, true); err != nil {
 			return outcome{}, err
 		}
+		viewChange = viewAlterChange{kind: viewAlterRenameTable, newName: renameTable}
 		table.Name = renameTable
 	} else if at.RenameColumn != nil {
 		old, next := at.RenameColumn.Old, at.RenameColumn.New
@@ -1898,6 +1957,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		if err := rewriteAlterTableExpressions(&table, old, next, false); err != nil {
 			return outcome{}, err
 		}
+		viewChange = viewAlterChange{kind: viewAlterRenameColumn, ordinal: ci, newName: next}
 		table.Columns[ci].Name = next
 	} else if at.RenameConstraint != nil {
 		old, next := at.RenameConstraint.Old, at.RenameConstraint.New
@@ -2043,6 +2103,18 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			}
 			if a.DropColumn != nil {
 				ci := table.ColumnIndex(a.DropColumn.Name)
+				// A column a view references cannot be dropped (views.md §6): 2BP01, and 0A000 under
+				// CASCADE (dropping the view is a follow-on).
+				if ci >= 0 && !slices.Contains(table.PK, ci) && viewPlan != nil && columnSources[ci].original >= 0 {
+					if view := viewPlan.viewUsing(columnSources[ci].original); view != "" {
+						if a.DropColumn.Cascade {
+							return outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
+								"DROP COLUMN ... CASCADE of column %s with dependent view %s is not supported", a.DropColumn.Name, view))
+						}
+						return outcome{}, newError(DependentObjectsStillExist, fmt.Sprintf(
+							"cannot drop column %s of table %s because view %s depends on it", a.DropColumn.Name, original.Name, view))
+					}
+				}
 				if err := dropAlterColumn(&table, a.DropColumn, snap, original, oldKey, &columnSources, &pendingSerials, constraintState); err != nil {
 					return outcome{}, err
 				}
@@ -2185,6 +2257,10 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				}
 				table.Columns[ci].NotNull = false
 			case alterSetType:
+				// A column a view references cannot change type (views.md §6).
+				if viewPlan != nil && columnSources[ci].original >= 0 && viewPlan.viewUsing(columnSources[ci].original) != "" {
+					return outcome{}, newError(FeatureNotSupported, "cannot alter type of a column used by a view")
+				}
 				oldColumn := table.Columns[ci]
 				target, err := db.buildAlterAddedColumn(&table, &columnDef{Name: table.Columns[ci].Name, TypeName: edit.TypeName, TypeMod: edit.TypeMod}, &[]*sequenceDef{}, nil, snap == db.tempSnap(), isAttachmentScope(at.DB))
 				if err != nil {
@@ -2565,6 +2641,27 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			pending[seq.Name] = true
 		}
 		ws.remapAlterColumnDependents(table.Name, originalToNew, pending)
+	}
+	// Rewrite and re-validate the dependent views against the post-statement catalog (views.md
+	// §7/§8); a failure is 0A000 and discards the whole statement.
+	if viewPlan != nil {
+		if viewChange.kind == viewAlterOther {
+			for old := range original.Columns {
+				kept := false
+				for _, source := range columnSources {
+					if source.original == old {
+						kept = true
+						break
+					}
+				}
+				if !kept {
+					viewChange.dropped = append(viewChange.dropped, old)
+				}
+			}
+		}
+		if err := db.finishViewAlter(viewPlan, viewChange); err != nil {
+			return outcome{}, err
+		}
 	}
 	return outcome{Kind: outcomeStatement, Cost: meter.Accrued}, nil
 }
@@ -3099,6 +3196,15 @@ func (db *engine) findIndex(name string) (string, indexDef, bool) {
 	return db.readSnap().findIndex(name)
 }
 
+// fkParentMissing is the error for a FOREIGN KEY parent that is not a table of the parent's
+// database: a view is the wrong object kind (42809, views.md §2); any other name is missing (42P01).
+func fkParentMissing(snap *snapshot, name string) error {
+	if snap.view(name) != nil {
+		return newError(WrongObjectType, `referenced relation "`+name+`" is not a table`)
+	}
+	return newError(UndefinedTable, "table does not exist: "+name)
+}
+
 // checkReservedName rejects a USER-written catalog object name beginning jed_ — the prefix is
 // reserved for the engine's own catalog relations (spec/design/introspection.md §4). Checked on
 // the exact name, byte-exact: a quoted "JED_x" is allowed, a bare JED_x folds and is rejected
@@ -3132,6 +3238,10 @@ func (db *engine) relationExists(name string) bool {
 	if _, _, ok := db.tempSnap().findIndex(name); ok {
 		return true
 	}
+	// A view shares the relation namespace (spec/design/views.md §2).
+	if db.readSnap().view(name) != nil {
+		return true
+	}
 	// The sequence funnel walks session-local → persistent, so an owned TEMP sequence's name joins the
 	// namespace (temp-tables.md §8) — a collision with it is 42P07 too.
 	return db.sequence(name) != nil
@@ -3161,6 +3271,12 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 	// existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
 	if err := db.checkAttachmentWritable(ci.DB); err != nil {
 		return outcome{}, err
+	}
+	// An index on a view is the wrong object kind (views.md §2).
+	if ci.DB == nil || *ci.DB == "main" {
+		if _, ok := db.lkpTableScoped(ci.DB, ci.Table); !ok && db.isView(ci.Table) {
+			return outcome{}, newError(WrongObjectType, `cannot create index on relation "`+ci.Table+`"`)
+		}
 	}
 	if err := db.checkTableQualifier(ci.DB, ci.Table); err != nil { // attached-databases.md §3
 		return outcome{}, err
@@ -3367,7 +3483,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 	relationTaken := func(n string) bool {
 		if attachName != "" {
 			as := db.attachReadSnap(attachName)
-			if _, ok := as.table(n); ok {
+			if _, ok := as.table(n); ok || as.view(n) != nil {
 				return true
 			}
 			_, _, ok := as.findIndex(n)
@@ -3523,7 +3639,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 // from the snapshot that owns it, so dropping a temp table's index makes zero file writes.
 func (db *engine) executeDropIndex(di *dropIndex) (outcome, error) {
 	// lkpTable covers both scopes, so DROP INDEX naming a table is 42809 regardless of kind.
-	if _, ok := db.lkpTable(di.Name); ok {
+	if _, ok := db.lkpTable(di.Name); ok || db.isView(di.Name) {
 		return outcome{}, newError(WrongObjectType, di.Name+" is not an index")
 	}
 	nameKey := di.Name

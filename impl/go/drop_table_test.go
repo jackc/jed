@@ -80,7 +80,9 @@ func TestDropTableSyntaxErrors(t *testing.T) {
 	mustCreate(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	wantErr(t, db, "DROP TABLE t extra", "42601") // trailing input
 	// DROP INDEX is its own statement now (spec/design/indexes.md §2): a missing index
-	// is 42704, not a syntax error; DROP of any other object kind is still unparsed.
+	// is 42704, not a syntax error; so is DROP VIEW (a missing view is 42P01, views.md §1).
+	// DROP of any other object kind is still unparsed.
 	wantErr(t, db, "DROP INDEX x", "42704")
-	wantErr(t, db, "DROP VIEW v", "42601")
+	wantErr(t, db, "DROP VIEW v", "42P01")
+	wantErr(t, db, "DROP FUNCTION f", "42601")
 }

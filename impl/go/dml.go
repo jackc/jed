@@ -874,6 +874,10 @@ func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, i
 	if err := db.checkAttachmentWritable(ins.DB); err != nil {
 		return outcome{}, err
 	}
+	// A view is not automatically updatable in this slice (views.md §2): 55000.
+	if err := db.checkViewWrite(ins.DB, ins.Table, "insert into"); err != nil {
+		return outcome{}, err
+	}
 	if err := db.checkTableQualifier(ins.DB, ins.Table); err != nil { // attached-databases.md §3
 		return outcome{}, err
 	}
@@ -3153,6 +3157,10 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 	if err := db.checkAttachmentWritable(del.DB); err != nil {
 		return outcome{}, err
 	}
+	// A view is not automatically updatable in this slice (views.md §2): 55000.
+	if err := db.checkViewWrite(del.DB, del.Table, "delete from"); err != nil {
+		return outcome{}, err
+	}
 	if err := db.checkTableQualifier(del.DB, del.Table); err != nil { // attached-databases.md §3
 		return outcome{}, err
 	}
@@ -3405,6 +3413,10 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	// A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
 	// existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
 	if err := db.checkAttachmentWritable(upd.DB); err != nil {
+		return outcome{}, err
+	}
+	// A view is not automatically updatable in this slice (views.md §2): 55000.
+	if err := db.checkViewWrite(upd.DB, upd.Table, "update"); err != nil {
 		return outcome{}, err
 	}
 	if err := db.checkTableQualifier(upd.DB, upd.Table); err != nil { // attached-databases.md §3

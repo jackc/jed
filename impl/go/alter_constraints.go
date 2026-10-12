@@ -339,7 +339,7 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 			parent, _ = snap.table(d.RefTable)
 		}
 		if parent == nil {
-			return newError(UndefinedTable, "table does not exist: "+d.RefTable)
+			return fkParentMissing(snap, d.RefTable)
 		}
 		var refs []int
 		if d.RefColumns == nil {

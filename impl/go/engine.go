@@ -113,6 +113,13 @@ type engine struct {
 	// estimatorTouched de-duplicates per-relation revision advances within one top-level statement.
 	// A data-modifying CTE may target the same table more than once; P2 advances it exactly once.
 	estimatorTouched map[estimatorTouchedRelation]struct{}
+	// viewTrace is non-nil only while a view body is planned at CREATE VIEW, view re-validation, or
+	// a rename rewrite (spec/design/views.md §5–§8): the FROM items, columns, and `*` expansions the
+	// planner binds. nil on every ordinary statement, which then pays one nil check.
+	viewTrace *viewTrace
+	// viewDepth is how many view references are being expanded inside one another right now
+	// (views.md §4.1): nesting counts toward maxExprDepth (54001).
+	viewDepth int
 }
 
 type estimatorTouchedRelation struct {

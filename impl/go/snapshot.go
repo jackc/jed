@@ -62,6 +62,10 @@ type snapshot struct {
 	// (LastValue/IsCalled) lives here, so nextval advances the working snapshot and rolls back
 	// with it (sequences.md §5).
 	sequences map[string]*sequenceDef
+	// views holds views, keyed by exact name (spec/design/views.md). They share the relation
+	// namespace with tables, indexes, and sequences; serialized as entry_kind = 5 catalog entries
+	// (format v38). A viewDef is never mutated in place, so clone copies the map shallowly.
+	views map[string]*viewDef
 	// collations caches collations RESOLVED from the file's reference entries on open, keyed by their
 	// exact (CASE-SENSITIVE) name — collation names are quoted identifiers ("en-US",
 	// spec/design/collation.md §1). C is never stored (table-free, built in). Under the reference-only
@@ -111,6 +115,7 @@ func newSnapshot() *snapshot {
 		stores:                make(map[string]*tableStore),
 		indexStores:           make(map[string]*tableStore),
 		sequences:             make(map[string]*sequenceDef),
+		views:                 make(map[string]*viewDef),
 		collations:            make(map[string]*Collation),
 		gistTrees:             make(map[string]*gistTree),
 	}
@@ -143,6 +148,10 @@ func (s *snapshot) clone() *snapshot {
 	for k, v := range s.sequences {
 		sequences[k] = v
 	}
+	views := make(map[string]*viewDef, len(s.views))
+	for k, v := range s.views {
+		views[k] = v
+	}
 	// Collations, like Table, are never mutated in place — only added — so the map copy is shallow
 	// (spec/design/collation.md §4).
 	collations := make(map[string]*Collation, len(s.collations))
@@ -170,7 +179,7 @@ func (s *snapshot) clone() *snapshot {
 		}
 		statistics[table] = copyColumns
 	}
-	return &snapshot{txid: s.txid, catGen: s.catGen, dataGen: s.dataGen, estimatorIdentity: s.estimatorIdentity, estimatorBaseRevision: s.estimatorBaseRevision, estimatorRevisions: estimatorRevisions, statistics: statistics, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees, storePaging: s.storePaging}
+	return &snapshot{txid: s.txid, catGen: s.catGen, dataGen: s.dataGen, estimatorIdentity: s.estimatorIdentity, estimatorBaseRevision: s.estimatorBaseRevision, estimatorRevisions: estimatorRevisions, statistics: statistics, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, views: views, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees, storePaging: s.storePaging}
 }
 
 // changedSince refines candidate dirty domains without reading rows or serializing. A cloned
@@ -648,6 +657,54 @@ func (s *snapshot) sequencesSorted() []*sequenceDef {
 	out := make([]*sequenceDef, len(keys))
 	for i, k := range keys {
 		out[i] = s.sequences[k]
+	}
+	return out
+}
+
+// view looks up a view by exact name (spec/design/views.md); nil if absent.
+func (s *snapshot) view(name string) *viewDef {
+	return s.views[name]
+}
+
+// putView registers (or replaces, for a rewrite) a view. A schema change: bumps the catalog
+// generation, which also marks the main domain changed for commit.
+func (s *snapshot) putView(v *viewDef) {
+	s.catGen++
+	s.views[v.Name] = v
+}
+
+// removeView removes a view (DROP VIEW). The caller has checked it exists and has no dependent.
+func (s *snapshot) removeView(key string) {
+	s.catGen++
+	delete(s.views, key)
+}
+
+// viewsSorted returns every view in ascending name byte order (no map-iteration leak, CLAUDE.md §8):
+// the catalog emission order and the jed_views generation order.
+func (s *snapshot) viewsSorted() []*viewDef {
+	keys := make([]string, 0, len(s.views))
+	for k := range s.views {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]*viewDef, len(keys))
+	for i, k := range keys {
+		out[i] = s.views[k]
+	}
+	return out
+}
+
+// viewsDependingOn returns the views that depend on the table or view name of the given kind, in
+// name byte order (spec/design/views.md §6).
+func (s *snapshot) viewsDependingOn(kind viewDepKind, name string) []*viewDef {
+	var out []*viewDef
+	for _, v := range s.viewsSorted() {
+		for _, d := range v.Deps {
+			if d.Kind == kind && d.Name == name {
+				out = append(out, v)
+				break
+			}
+		}
 	}
 	return out
 }

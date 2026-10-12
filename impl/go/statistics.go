@@ -931,6 +931,10 @@ func (db *engine) executeAnalyze(analyze *analyzeStmt) (outcome, error) {
 		return outcome{}, newError(WrongObjectType, "cannot modify system relation "+analyze.Name)
 	}
 	table, ok := db.lkpTableScoped(analyze.DB, analyze.Name)
+	// ANALYZE of a view is a no-op success (views.md §2; PostgreSQL also warns).
+	if !ok && (analyze.DB == nil || *analyze.DB == "main") && db.isView(analyze.Name) {
+		return outcome{Kind: outcomeStatement}, nil
+	}
 	if !ok {
 		return outcome{}, newError(UndefinedTable, "table does not exist: "+analyze.Name)
 	}

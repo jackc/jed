@@ -18,8 +18,11 @@ type statement struct {
 	CreateSequence *createSequence
 	AlterSequence  *alterSequence
 	DropSequence   *dropSequence
-	Insert         *insert
-	Select         *selectStmt
+	// CreateView/DropView are the view DDL statements (spec/design/views.md §1).
+	CreateView *createView
+	DropView   *dropView
+	Insert     *insert
+	Select     *selectStmt
 	// SetOp is a set operation (UNION/INTERSECT/EXCEPT) combining two query expressions
 	// (spec/design/grammar.md §25). Non-nil only when at least one set operator is present; a
 	// lone SELECT stays in Select, so the plain-query path and host API are untouched.
@@ -437,6 +440,41 @@ type dropSequence struct {
 	IfExists bool
 }
 
+// createView is `CREATE VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr`
+// (spec/design/views.md §1, grammar.md §54). Body is the canonical token text of the body
+// (format.md *Check-expression text*) — the definition before `*` freezing; the executor parses it
+// again on its own, so every token position the planner trace records is relative to the stored
+// text.
+type createView struct {
+	Name        string
+	DB          *string
+	IfNotExists bool
+	Columns     []string // nil = no column list
+	Body        string
+}
+
+// dropView is `DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]` (spec/design/views.md §1). Each
+// name may carry a database qualifier. Cascade only changes the error a dependent view raises (0A000
+// instead of 2BP01, §6).
+type dropView struct {
+	Names    []qualifiedName
+	IfExists bool
+	Cascade  bool
+}
+
+// qualifiedName is an optionally database-qualified relation name.
+type qualifiedName struct {
+	DB   *string
+	Name string
+}
+
+// tokPos is a token index into the statement's token stream (spec/design/views.md §5/§7): where a
+// stored view body's `*` freezing and rename rewrites edit it. 0 means "no position" — a body never
+// starts with a FROM item, a star, or an alias, so 0 is never a meaningful position. Positions are
+// invisible to structural AST equality (exprEqual skips every tokPos field), so two references that
+// differ only in position compare equal.
+type tokPos int
+
 // AlterSequence is an ALTER SEQUENCE [IF EXISTS] <name> <action> statement (spec/design/sequences.md
 // §4/§15). A missing sequence without IfExists is 42P01. RenameTo != "" selects the RENAME TO form;
 // otherwise the option form (Options + Restart) applies. The two are mutually exclusive (the parser
@@ -693,6 +731,14 @@ type tableRef struct {
 	// are unused. Implicitly lateral (its `Ctx` may reference earlier FROM siblings).
 	JsonTable *jsonTable
 	Lateral   bool
+	// NamePos / AliasPos / ListOpen / ListClose are the token positions of a base-table reference
+	// (views.md §7): the table-name token, the alias identifier token (0 = no alias), and the `(` /
+	// `)` of its column alias list (0 = no list). Meaningful only when parsing a view definition;
+	// invisible to AST equality.
+	NamePos   tokPos
+	AliasPos  tokPos
+	ListOpen  tokPos
+	ListClose tokPos
 }
 
 // JsonTable is a `JSON_TABLE(ctx, path [AS name] COLUMNS (col, …))` table source (json-table.md §3,
@@ -987,6 +1033,9 @@ type withQuery struct {
 type selectItems struct {
 	All   bool
 	Items []selectItem
+	// StarPos is the token position of a written `*` (views.md §5); 0 for a star the parser
+	// synthesized (an unparenthesized join group's `SELECT *`) — never frozen.
+	StarPos tokPos
 }
 
 // SelectItem is one select-list expression with its optional output-name alias
@@ -1286,6 +1335,9 @@ type exprNode struct {
 	// Subscripts are the bracketed specs of an ExprSubscript (`Base[..][..]`) — one or more index /
 	// slice specs (spec/design/array.md §6). Base holds the array operand.
 	Subscripts []subscriptSpec
+	// StarPos is an ExprQualifiedStar's qualifier-token position (views.md §5: `rel . *` is a
+	// three-token span); invisible to equality.
+	StarPos tokPos
 }
 
 // InSubqueryExpr is `Lhs [NOT] IN ( Query )` (spec/design/grammar.md §26) — membership of Lhs in

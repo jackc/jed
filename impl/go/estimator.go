@@ -1427,6 +1427,8 @@ func (db *engine) estimateCatalogRows(srf *srfPlan) int64 {
 		return satEstimateAdd(0, int64(len(snap.sequences)))
 	case srfJedTypes:
 		return satEstimateAdd(0, int64(len(snap.types)))
+	case srfJedViews:
+		return satEstimateAdd(0, int64(len(snap.views)))
 	case srfJedTypeFields:
 		var rows int64
 		for _, ct := range snap.types {

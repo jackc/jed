@@ -44,6 +44,20 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	for _, j := range sel.Joins {
 		tableRefs = append(tableRefs, j.Table)
 	}
+	// A base name that resolves to a VIEW (after a CTE, a catalog relation, and a table —
+	// spec/design/views.md §4) is the equivalent derived table `(<definition>) AS <label>
+	// (<columns>)`, planned in the isolated view scope below. writtenRefs keeps the written items (their
+	// token positions are what a traced view body records).
+	writtenRefs := append([]tableRef(nil), tableRefs...)
+	viewNames := make([]string, len(tableRefs))
+	isolated := make([]bool, len(tableRefs))
+	for i := range tableRefs {
+		if derived, name, ok := db.viewReference(&tableRefs[i], ctes); ok {
+			tableRefs[i] = derived
+			viewNames[i] = name
+			isolated[i] = true
+		}
+	}
 	// A FROM item is a base table, a set-returning function (grammar.md §35), or a derived table
 	// (§42). For a LATERAL item (§44) the body / SRF args resolve against the PREFIX of relations to
 	// its left (a dependent join), so the build runs in FROM order and a prefix scope over the
@@ -63,6 +77,9 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	for i, tref := range tableRefs {
 		var t *catTable
 		var cteIdx *int
+		// base is whether this relation is a catalog base table (possibly under a column alias list);
+		// a traced view body records the columns resolved against it (views.md §6).
+		base := false
 		isDerived := tref.Subquery != nil || tref.Values != nil
 		// A FROM item is lateral-ELIGIBLE when it can see earlier siblings: a derived table / VALUES
 		// body explicitly marked LATERAL, or ANY table function (implicitly lateral — §44). The first
@@ -86,7 +103,13 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				bodyParent = lateralParent
 			}
 			var plan queryPlan
-			if tref.Subquery != nil {
+			if isolated[i] {
+				p, perr := db.planViewReference(viewNames[i], tref.Subquery, &writtenRefs[i], ptypes)
+				if perr != nil {
+					return nil, perr
+				}
+				plan = p
+			} else if tref.Subquery != nil {
 				p, perr := db.planQuery(*tref.Subquery, bodyParent, ctes, ptypes)
 				if perr != nil {
 					return nil, perr
@@ -178,8 +201,18 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 					return nil, serr
 				}
 				t = catalogRelTable(kind)
+				if err := applySRFColumnAliases(t, tableRefLabel(&tref), tref.ColumnAliases); err != nil {
+					return nil, err
+				}
+				if err := db.traceCatalogItem(&tref); err != nil {
+					return nil, err
+				}
 				srfPlans[i] = &srfPlan{kind: kind, introspectScope: scope}
 			} else {
+				// A view reached through an attachment qualifier is a follow-on (views.md §10).
+				if err := db.rejectAttachedView(tref.DB, tref.Name); err != nil {
+					return nil, err
+				}
 				// Validate the qualifier against the implicit scope, then resolve through the temp-first
 				// funnel (which, by preclude-overlaps, lands in the validated scope).
 				if err := db.checkTableQualifier(tref.DB, tref.Name); err != nil {
@@ -191,6 +224,16 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				tbl, ok := db.lkpTableScoped(tref.DB, tref.Name)
 				if !ok {
 					return nil, newError(UndefinedTable, "table does not exist: "+*tref.DB+"."+tref.Name)
+				}
+				if err := db.traceTableItem(&tref, tbl); err != nil {
+					return nil, err
+				}
+				base = true
+				if tref.ColumnAliases != nil {
+					var rerr error
+					if tbl, rerr = renamedBaseTable(tbl, &tref, tref.ColumnAliases); rerr != nil {
+						return nil, rerr
+					}
 				}
 				t = tbl
 			}
@@ -218,16 +261,40 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				idx := ci
 				cteIdx = &idx
 				t = ctes[ci].table
+				if tref.ColumnAliases != nil {
+					var rerr error
+					if t, rerr = renamedBaseTable(t, &tref, tref.ColumnAliases); rerr != nil {
+						return nil, rerr
+					}
+				}
 			} else if kind, ok := catalogRelKind(tref.Name); ok {
 				// A built-in catalog relation (introspection.md §5), checked AFTER a CTE (a CTE
 				// shadows it — PG-matching) and BEFORE the user catalog. Unqualified = the implicit
 				// scope (main).
 				t = catalogRelTable(kind)
+				if err := applySRFColumnAliases(t, tableRefLabel(&tref), tref.ColumnAliases); err != nil {
+					return nil, err
+				}
+				if err := db.traceCatalogItem(&tref); err != nil {
+					return nil, err
+				}
 				srfPlans[i] = &srfPlan{kind: kind, introspectScope: "main"}
 			} else {
 				tbl, ok := db.lkpTable(tref.Name) // temp-first (temp-tables.md §3)
 				if !ok {
 					return nil, newError(UndefinedTable, "table does not exist: "+tref.Name)
+				}
+				if err := db.traceTableItem(&tref, tbl); err != nil {
+					return nil, err
+				}
+				base = true
+				// A column alias list relabels the table's columns (grammar.md §15): a copy read
+				// from the table's own store.
+				if tref.ColumnAliases != nil {
+					var rerr error
+					if tbl, rerr = renamedBaseTable(tbl, &tref, tref.ColumnAliases); rerr != nil {
+						return nil, rerr
+					}
 				}
 				t = tbl
 			}
@@ -271,7 +338,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			}
 			seenLabels[label] = true
 		}
-		rels = append(rels, scopeRel{label: label, table: t, offset: offset, cte: cteIdx, db: tref.DB})
+		rels = append(rels, scopeRel{label: label, table: t, offset: offset, cte: cteIdx, db: tref.DB, base: base})
 		offset += len(t.Columns)
 	}
 
@@ -363,6 +430,9 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				rl := rightRel.table.ColumnIndex(name)
 				if rl < 0 {
 					return nil, newError(UndefinedColumn, "column \""+name+"\" specified in USING clause does not exist in right table")
+				}
+				if rightRel.base {
+					db.traceColumn(rightRel.table.Name, rl)
 				}
 				ri := rightRel.offset + rl
 				lq, rq := fmt.Sprintf("\x00l%d", n), fmt.Sprintf("\x00r%d", n)
@@ -1076,7 +1146,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	// foldUncorrelatedInPlan is NOT a planner rewrite — it executes subqueries and needs bound
 	// params, so it stays post-bind in runQueryExpr.
 	rewriteWhere(plan)
-	if err := db.replanPushedBodies(plan, tableRefs, parent, ctes, ptypes); err != nil {
+	if err := db.replanPushedBodies(plan, tableRefs, isolated, parent, ctes, ptypes); err != nil {
 		return nil, err
 	}
 	//
@@ -1089,7 +1159,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 // with those conjuncts appended to its WHERE (spec/design/planner.md §3.2), so the body's own
 // rewrite and access-path selection see them. Planning again must have no other effect: the CTE
 // reference counts the first planning recorded are restored, keeping every CTE's mode unchanged.
-func (db *engine) replanPushedBodies(plan *selectPlan, tableRefs []tableRef, parent *scope, ctes []*cteBinding, ptypes *paramTypes) error {
+func (db *engine) replanPushedBodies(plan *selectPlan, tableRefs []tableRef, isolated []bool, parent *scope, ctes []*cteBinding, ptypes *paramTypes) error {
 	if plan.pushdown == nil || plan.pushdown.bodyPushes == nil {
 		return nil
 	}
@@ -1101,7 +1171,18 @@ func (db *engine) replanPushedBodies(plan *selectPlan, tableRefs []tableRef, par
 		for ci, b := range ctes {
 			refs[ci] = b.refs
 		}
-		body, err := db.replanPushedQuery(*tableRefs[i].Subquery, plan.rels[i].derived, pushed, parent, ctes, ptypes)
+		var body queryPlan
+		var err error
+		if isolated[i] {
+			// A view body is planned again in its isolated scope (views.md §4.1).
+			err = db.inViewBody(func() error {
+				var rerr error
+				body, rerr = db.replanPushedQuery(*tableRefs[i].Subquery, plan.rels[i].derived, pushed, nil, nil, ptypes)
+				return rerr
+			})
+		} else {
+			body, err = db.replanPushedQuery(*tableRefs[i].Subquery, plan.rels[i].derived, pushed, parent, ctes, ptypes)
+		}
 		for ci, b := range ctes {
 			b.refs = refs[ci]
 		}

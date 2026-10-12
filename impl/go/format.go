@@ -909,6 +909,7 @@ func (s *snapshot) writeImage(pageSize uint32, txid uint64, sink func(index uint
 		catEntries = append(catEntries, append([]byte{0}, tableEntryBytes(s.tables[k], rootDataPage[ti], indexRoots[ti], rowCount)...))
 	}
 	catEntries = append(catEntries, statisticsCatalogEntries(s)...)
+	catEntries = append(catEntries, viewCatalogEntries(s)...)
 	entrySizes := make([]int, len(catEntries))
 	for i, e := range catEntries {
 		entrySizes[i] = len(e)
@@ -1227,6 +1228,7 @@ func (s *snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, r
 		catEntries = append(catEntries, append([]byte{0}, tableEntryBytes(s.tables[k], rootDataPage[ti], indexRoots[ti], rowCount)...))
 	}
 	catEntries = append(catEntries, statisticsCatalogEntries(s)...)
+	catEntries = append(catEntries, viewCatalogEntries(s)...)
 	entrySizes := make([]int, len(catEntries))
 	for i, e := range catEntries {
 		entrySizes[i] = len(e)
@@ -1460,6 +1462,7 @@ func loadEngineSharedPaging(paging *sharedPaging) (*engine, error) {
 	snap := newSnapshot()
 	snap.txid = mt.txid
 	statisticsExpected := make(map[string][2]int)
+	var loadedViews []*viewDef
 	// v25: the free-list is read from the persisted chain (below), not reconstructed by a reachability
 	// walk — so the catalog + skeleton load no longer tracks a reached set. The live count is the meta's
 	// (v34); the catalog chain and the GiST R-trees it rewrites whole are counted as they are read.
@@ -1520,6 +1523,16 @@ func loadEngineSharedPaging(paging *sharedPaging) (*engine, error) {
 				if err := decodeStatisticsEntry(pg.payload, &pos, snap, statisticsExpected); err != nil {
 					return nil, err
 				}
+				continue
+			}
+			if kind == 5 {
+				// A view entry (v38): parsed now, validated once every table and view is registered
+				// (its dependencies may name later entries).
+				v, err := decodeViewEntry(pg.payload, &pos)
+				if err != nil {
+					return nil, err
+				}
+				loadedViews = append(loadedViews, v)
 				continue
 			}
 			if kind != 0 {
@@ -1619,6 +1632,10 @@ func loadEngineSharedPaging(paging *sharedPaging) (*engine, error) {
 	// Two-pass: validate the composite-type catalog (existence + acyclicity) — XX001 on a bad
 	// reference (spec/design/composite.md §3).
 	if err := snap.validateCompositeTypes(); err != nil {
+		return nil, err
+	}
+	// Views (v38): structural checks only — the bodies are parsed, never planned (views.md §3).
+	if err := installViews(snap, loadedViews); err != nil {
 		return nil, err
 	}
 	// Build each GiST index's resident R-tree from its eager-loaded leaf store (gist.md §4.1).
@@ -3194,6 +3211,195 @@ func decodeCollationEntry(buf []byte, pos *int) (*Collation, bool, error) {
 
 // tableEntryBytes builds one table's catalog entry (format.md). indexRoots is each
 // index's tree root page, parallel to table.Indexes.
+// viewCatalogEntries returns the view catalog entries (entry_kind = 5, v38), emitted last in
+// ascending name byte order (format.md *View entry*).
+func viewCatalogEntries(s *snapshot) [][]byte {
+	var entries [][]byte
+	for _, v := range s.viewsSorted() {
+		entries = append(entries, append([]byte{5}, viewEntryBytes(v)...))
+	}
+	return entries
+}
+
+// viewEntryBytes serializes a view catalog entry's BODY (after its entry_kind = 5 byte) — format.md
+// *View entry*: the name, the output column names, the definition (u32 length), and the dependency
+// list (already in name byte order, each table's columns in name byte order).
+func viewEntryBytes(v *viewDef) []byte {
+	var out []byte
+	out = appendString(out, v.Name)
+	out = appendU16(out, uint16(len(v.Columns)))
+	for _, c := range v.Columns {
+		out = appendString(out, c)
+	}
+	out = appendU32(out, uint32(len(v.Definition)))
+	out = append(out, v.Definition...)
+	out = appendU16(out, uint16(len(v.Deps)))
+	for _, d := range v.Deps {
+		out = append(out, byte(d.Kind))
+		out = appendString(out, d.Name)
+		out = appendU16(out, uint16(len(d.Columns)))
+		for _, c := range d.Columns {
+			out = appendString(out, c)
+		}
+	}
+	return out
+}
+
+// decodeViewEntry decodes a view catalog entry's body (inverse of viewEntryBytes); the caller has
+// consumed the entry_kind byte. The definition is parsed (XX001 if it does not parse as a
+// subquery_expr) but never planned (views.md §3).
+func decodeViewEntry(buf []byte, pos *int) (*viewDef, error) {
+	name, err := readString(buf, pos)
+	if err != nil {
+		return nil, err
+	}
+	colCount, err := readU16(buf, pos)
+	if err != nil {
+		return nil, err
+	}
+	columns := make([]string, 0, colCount)
+	for i := 0; i < int(colCount); i++ {
+		c, err := readString(buf, pos)
+		if err != nil {
+			return nil, err
+		}
+		columns = append(columns, c)
+	}
+	defLen, err := readU32(buf, pos)
+	if err != nil {
+		return nil, err
+	}
+	if uint64(*pos)+uint64(defLen) > uint64(len(buf)) {
+		return nil, newError(DataCorrupted, "truncated view definition")
+	}
+	defBytes := buf[*pos : *pos+int(defLen)]
+	if !utf8.Valid(defBytes) {
+		return nil, newError(DataCorrupted, "view definition is not UTF-8")
+	}
+	definition := string(defBytes)
+	*pos += int(defLen)
+	depCount, err := readU16(buf, pos)
+	if err != nil {
+		return nil, err
+	}
+	deps := make([]viewDep, 0, depCount)
+	for i := 0; i < int(depCount); i++ {
+		kind, err := readU8(buf, pos)
+		if err != nil {
+			return nil, err
+		}
+		if kind > 1 {
+			return nil, newError(DataCorrupted, "unknown view dependency kind")
+		}
+		depName, err := readString(buf, pos)
+		if err != nil {
+			return nil, err
+		}
+		n, err := readU16(buf, pos)
+		if err != nil {
+			return nil, err
+		}
+		if viewDepKind(kind) == viewDepView && n != 0 {
+			return nil, newError(DataCorrupted, "a view dependency lists columns")
+		}
+		var cols []string
+		for k := 0; k < int(n); k++ {
+			c, err := readString(buf, pos)
+			if err != nil {
+				return nil, err
+			}
+			cols = append(cols, c)
+		}
+		deps = append(deps, viewDep{Kind: viewDepKind(kind), Name: depName, Columns: cols})
+	}
+	body, err := parseViewDefinition(definition)
+	if err != nil {
+		return nil, newError(DataCorrupted, "a view definition does not parse")
+	}
+	return &viewDef{Name: name, Columns: columns, Definition: definition, Deps: deps, Body: body}, nil
+}
+
+// installViews validates the loaded views against the catalog and registers them (format.md *View
+// entry*): each dependency names an existing table / view of its kind, each listed column exists in
+// its table, the view-dependency graph is acyclic, output names are non-empty and unique, and no
+// dependency or column repeats. Any violation is XX001.
+func installViews(snap *snapshot, views []*viewDef) error {
+	corrupt := func(msg string) error { return newError(DataCorrupted, msg) }
+	names := map[string]bool{}
+	for _, v := range views {
+		if names[v.Name] {
+			return corrupt("duplicate view name")
+		}
+		names[v.Name] = true
+	}
+	for _, v := range views {
+		if len(v.Columns) == 0 {
+			return corrupt("a view has no column")
+		}
+		for i, c := range v.Columns {
+			if c == "" || slices.Contains(v.Columns[:i], c) {
+				return corrupt("empty or duplicate view column name")
+			}
+		}
+		if _, ok := snap.table(v.Name); ok || snap.sequence(v.Name) != nil {
+			return corrupt("a view name collides with another relation")
+		}
+		for i, d := range v.Deps {
+			for _, e := range v.Deps[:i] {
+				if e.Name == d.Name {
+					return corrupt("duplicate view dependency")
+				}
+			}
+			switch d.Kind {
+			case viewDepTable:
+				table, ok := snap.table(d.Name)
+				if !ok {
+					return corrupt("a view depends on a missing table")
+				}
+				for k, c := range d.Columns {
+					if slices.Contains(d.Columns[:k], c) {
+						return corrupt("duplicate view dependency column")
+					}
+					if table.ColumnIndex(c) < 0 {
+						return corrupt("a view depends on a missing column")
+					}
+				}
+			case viewDepView:
+				if !names[d.Name] {
+					return corrupt("a view depends on a missing view")
+				}
+			}
+		}
+	}
+	// Acyclicity: repeatedly settle a view whose view dependencies are all settled.
+	settled := map[string]bool{}
+	for len(settled) < len(views) {
+		before := len(settled)
+		for _, v := range views {
+			if settled[v.Name] {
+				continue
+			}
+			ready := true
+			for _, d := range v.Deps {
+				if d.Kind == viewDepView && !settled[d.Name] {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				settled[v.Name] = true
+			}
+		}
+		if len(settled) == before {
+			return corrupt("a cycle through view dependencies")
+		}
+	}
+	for _, v := range views {
+		snap.views[v.Name] = v
+	}
+	return nil
+}
+
 // statisticsCatalogEntries writes P9 kind-4 entries in canonical
 // (table, column, subkind, ordinal) order.
 func statisticsCatalogEntries(s *snapshot) [][]byte {

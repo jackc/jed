@@ -6,10 +6,86 @@ import (
 
 // exprEqual reports whether two parsed expression trees are STRUCTURALLY equal (spec/design/grammar.md
 // §10) — the Go equivalent of the Rust core's derived PartialEq on Expr. Used by the SELECT DISTINCT
-// ORDER BY restriction to decide whether an expression sort key matches a select-list expression. The
-// AST carries no source positions, so textually-identical fragments (`a + b` here and there) compare
-// equal; following the node pointers is exactly the recursive tree comparison.
-func exprEqual(a, b exprNode) bool { return reflect.DeepEqual(a, b) }
+// ORDER BY restriction (and GROUP BY key matching) to decide whether an expression matches another.
+// Token positions (tokPos fields — recorded for view-definition rewrites, spec/design/views.md §5/§7)
+// are ignored, so textually-identical fragments (`a + b` here and there) compare equal; everything
+// else is reflect.DeepEqual's recursive tree comparison.
+func exprEqual(a, b exprNode) bool { return astEqual(reflect.ValueOf(a), reflect.ValueOf(b)) }
+
+var tokPosType = reflect.TypeOf(tokPos(0))
+
+// astEqual is reflect.DeepEqual over an acyclic AST, except that a tokPos value always compares
+// equal.
+func astEqual(a, b reflect.Value) bool {
+	if a.Type() != b.Type() {
+		return false
+	}
+	if a.Type() == tokPosType {
+		return true
+	}
+	switch a.Kind() {
+	case reflect.Struct:
+		for i := 0; i < a.NumField(); i++ {
+			if !astEqual(a.Field(i), b.Field(i)) {
+				return false
+			}
+		}
+		return true
+	case reflect.Pointer:
+		if a.IsNil() || b.IsNil() {
+			return a.IsNil() == b.IsNil()
+		}
+		if a.Pointer() == b.Pointer() {
+			return true
+		}
+		return astEqual(a.Elem(), b.Elem())
+	case reflect.Interface:
+		if a.IsNil() || b.IsNil() {
+			return a.IsNil() == b.IsNil()
+		}
+		return astEqual(a.Elem(), b.Elem())
+	case reflect.Slice:
+		if a.IsNil() != b.IsNil() || a.Len() != b.Len() {
+			return false
+		}
+		fallthrough
+	case reflect.Array:
+		for i := 0; i < a.Len(); i++ {
+			if !astEqual(a.Index(i), b.Index(i)) {
+				return false
+			}
+		}
+		return true
+	case reflect.Map:
+		if a.IsNil() != b.IsNil() || a.Len() != b.Len() {
+			return false
+		}
+		iter := a.MapRange()
+		for iter.Next() {
+			other := b.MapIndex(iter.Key())
+			if !other.IsValid() || !astEqual(iter.Value(), other) {
+				return false
+			}
+		}
+		return true
+	case reflect.Func:
+		return a.IsNil() && b.IsNil()
+	case reflect.Bool:
+		return a.Bool() == b.Bool()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return a.Int() == b.Int()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return a.Uint() == b.Uint()
+	case reflect.Float32, reflect.Float64:
+		return a.Float() == b.Float()
+	case reflect.Complex64, reflect.Complex128:
+		return a.Complex() == b.Complex()
+	case reflect.String:
+		return a.String() == b.String()
+	default:
+		return a.Pointer() == b.Pointer()
+	}
+}
 
 // Statement executor (CLAUDE.md §10).
 //

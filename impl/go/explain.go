@@ -342,7 +342,7 @@ func (db *engine) explainOutcome(rows [][]Value, ex *explain) (outcome, error) {
 func (db *engine) explainLane(inner *statement) string {
 	// Query checks stmtIsWrite before either lazy lane. A SELECT containing nextval/setval and a
 	// top-level WITH containing DML therefore use the buffered write dispatcher regardless of shape.
-	if stmtIsWrite(*inner) {
+	if db.stmtIsWriteWithViews(*inner) {
 		return "buffered"
 	}
 	if inner.With != nil || inner.SetOp != nil {

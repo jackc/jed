@@ -541,6 +541,8 @@ func catalogRelKind(name string) (srfKind, bool) {
 		return srfJedTypes, true
 	case "jed_type_fields":
 		return srfJedTypeFields, true
+	case "jed_views":
+		return srfJedViews, true
 	}
 	return 0, false
 }
@@ -644,6 +646,12 @@ func catalogRelTable(kind srfKind) *catTable {
 			{Name: "ordinal", Type: scalarT(scalarInt32), NotNull: true},
 			{Name: "type", Type: scalarT(scalarText), NotNull: true},
 			{Name: "not_null", Type: scalarT(scalarBool), NotNull: true},
+		}}
+	case srfJedViews:
+		return &catTable{Name: "jed_views", Columns: []catColumn{
+			{Name: "name", Type: scalarT(scalarText), NotNull: true},
+			{Name: "definition", Type: scalarT(scalarText), NotNull: true},
+			{Name: "columns", Type: textArr, NotNull: true},
 		}}
 	default: // srfJedStatistics
 		return &catTable{Name: "jed_statistics", Columns: []catColumn{
@@ -1062,6 +1070,29 @@ func (db *engine) jedTypeFieldsRows(sp *srfPlan, m *costMeter) ([]storedRow, err
 				BoolValue(f.NotNull),
 			})
 		}
+	}
+	return out, nil
+}
+
+// jedViewsRows generates the rows of the jed_views catalog relation (introspection.md §5.4): one row
+// per view of the scope's snapshot, in ascending name byte order — the stored definition text and the
+// output column names. Cost mirrors jedTablesRows.
+func (db *engine) jedViewsRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
+	snap := db.snapForScope(sp.introspectScope)
+	if snap == nil {
+		return nil, newError(UndefinedTable, `database "`+sp.introspectScope+`" is not attached`)
+	}
+	var out []storedRow
+	for _, v := range snap.viewsSorted() {
+		if err := m.Guard(); err != nil {
+			return nil, err
+		}
+		m.Charge(costs.GeneratedRow)
+		cols := make([]Value, len(v.Columns))
+		for i, c := range v.Columns {
+			cols[i] = TextValue(c)
+		}
+		out = append(out, storedRow{TextValue(v.Name), TextValue(v.Definition), ArrayValue(cols)})
 	}
 	return out, nil
 }

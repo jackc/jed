@@ -254,7 +254,7 @@ func (db *engine) estimatorInputsMatch(sp *selectPlan, want []estimatorInputSign
 // through queryValues), cross-checked to yield identical rows + total cost as the materialized drive
 // under full drain (streaming.md §6).
 func (db *engine) tryScanQuery(stmt statement, params []Value, sc *stmtCache) (*Rows, bool, error) {
-	if stmt.Select == nil || stmtIsWrite(stmt) {
+	if stmt.Select == nil || db.stmtIsWriteWithViews(stmt) {
 		return nil, false, nil
 	}
 	// Cache HIT: the statement still belongs to the same shared Database and every ordered base
@@ -801,7 +801,7 @@ func (c *bufferedScanCursor) close() {
 func (db *engine) tryDeferredQuery(stmt statement, params []Value) (*Rows, bool, error) {
 	// A write-classified statement (a data-modifying WITH, a sequence mutator) must take the write gate
 	// and never streams (streaming.md §7 / sequences.md §4).
-	if stmtIsWrite(stmt) {
+	if db.stmtIsWriteWithViews(stmt) {
 		return nil, false, nil
 	}
 	var q deferredQuery
@@ -2143,6 +2143,8 @@ func (db *engine) materializeRelRows(plan *selectPlan, ri int, params []Value, o
 			rows, err = db.jedTypesRows(rel.srf, meter)
 		case srfJedTypeFields:
 			rows, err = db.jedTypeFieldsRows(rel.srf, meter)
+		case srfJedViews:
+			rows, err = db.jedViewsRows(rel.srf, meter)
 		}
 		if err != nil {
 			return nil, err

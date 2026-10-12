@@ -25,6 +25,7 @@ func stmtIsWrite(stmt statement) bool {
 		stmt.CreateIndex != nil || stmt.DropIndex != nil ||
 		stmt.CreateType != nil || stmt.DropType != nil ||
 		stmt.CreateSequence != nil || stmt.AlterSequence != nil || stmt.DropSequence != nil ||
+		stmt.CreateView != nil || stmt.DropView != nil ||
 		stmt.Insert != nil || stmt.Update != nil || stmt.Delete != nil {
 		return true
 	}
@@ -402,6 +403,8 @@ func (db *engine) checkPrivileges(stmt statement) error {
 	}
 	var req privReq
 	collectStmtPrivs(stmt, &req)
+	// The functions a read view's body calls need the reader's EXECUTE (views.md §9).
+	db.collectViewFunctionPrivs(&req)
 	// UPDATE's DEFAULT marker carries no expression tree of its own. Preflight must therefore walk
 	// the selected catalog default explicitly, before execution resolves/evaluates it, so a revoked
 	// function cannot be invoked through `SET column = DEFAULT` (session.md §5.3).
@@ -440,6 +443,7 @@ func (db *engine) checkPrivileges(stmt statement) error {
 		if !exists {
 			_, exists = snap.table(key)
 		}
+		exists = exists || snap.view(key) != nil
 		if exists && !db.session.privileges.AllowsTable(key, t.priv) {
 			return newError(InsufficientPrivilege, "permission denied for table "+key)
 		}
@@ -582,7 +586,7 @@ func collectStmtPrivs(stmt statement, req *privReq) {
 		req.isTempDDL = stmt.CreateTable.Temp
 	case stmt.DropTable != nil, stmt.AlterTable != nil, stmt.CreateIndex != nil, stmt.DropIndex != nil,
 		stmt.CreateType != nil, stmt.DropType != nil, stmt.CreateSequence != nil, stmt.DropSequence != nil,
-		stmt.AlterSequence != nil:
+		stmt.AlterSequence != nil, stmt.CreateView != nil, stmt.DropView != nil:
 		req.isDDL = true
 	case stmt.Insert != nil:
 		collectInsertPrivs(stmt.Insert, req, locals)

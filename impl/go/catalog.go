@@ -296,6 +296,40 @@ func (d *indexDef) firstColumn() int {
 	return c
 }
 
+// viewDef is a view (spec/design/views.md §3): a named, persisted query, the fifth database-level
+// catalog object. It has no storage of its own. Definition is the canonical token text of its body
+// after `*` freezing and RENAME rewrites; reading the view plans it again as the equivalent derived
+// table (§4). Output types are never stored — planning derives them. Never mutated in place (a
+// rewrite installs a fresh viewDef), so snapshot clones share it.
+type viewDef struct {
+	// Name is the exact view name (grammar.md §3).
+	Name string
+	// Columns are the output column names, in order (the column list applied over the body's names).
+	Columns []string
+	// Definition is the stored canonical definition (format.md *Check-expression text*).
+	Definition string
+	// Deps are the tables and views the body reads, in ascending name byte order (§6).
+	Deps []viewDep
+	// Body is the parsed definition — parsed at create and at load, never persisted.
+	Body *queryExpr
+}
+
+// viewDepKind is what a view dependency names (format.md *View entry* dep_kind).
+type viewDepKind uint8
+
+const (
+	viewDepTable viewDepKind = 0
+	viewDepView  viewDepKind = 1
+)
+
+// viewDep is one persisted view dependency (spec/design/views.md §6): a table with the exact set of
+// its columns the body references (ascending byte order), or a view (no columns).
+type viewDep struct {
+	Kind    viewDepKind
+	Name    string
+	Columns []string
+}
+
 // SequenceDef is a sequence (spec/design/sequences.md): a named, persisted, monotonic i64
 // generator — the third database-level catalog-object kind (after tables and composite types).
 // The definition fields (Increment/MinValue/MaxValue/Start/Cache/Cycle) are immutable; LastValue

@@ -850,6 +850,17 @@ var SupportedCapabilities = []string{
 	"introspect.type_fields",
 	// Stable lock-bundle protocol for safe shared multi-process main files and file attachments.
 	"file.shared_process",
+	// Base-table column alias lists `FROM t AS x (p, q)` (grammar.md §15, views V3): a pure
+	// resolution-time relabeling of the columns a FROM item exposes.
+	"query.table_column_alias",
+	// Read-only views (spec/design/views.md, V1): CREATE / DROP VIEW, reading a view as the
+	// equivalent derived table, `*` freezing, dependencies, re-validation, and privileges.
+	"ddl.view",
+	// The jed_views catalog relation (introspection.md §5.4).
+	"introspect.views",
+	// View text rewrites for ALTER TABLE RENAME TO / RENAME COLUMN / DROP COLUMN (views.md §7, V2 +
+	// V4).
+	"ddl.view_rename",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

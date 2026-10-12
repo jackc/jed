@@ -132,7 +132,7 @@ func (db *engine) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *i
 	// gates (25P02 / 54P02 / 42501) up front — reads only (transaction control must work in a failed
 	// block; a write is gated inside dispatch on the fall-through). Keeps the bare-engine queryValues a
 	// safe total seam like the shared-core Session.queryValues (executor.go gateReadLanes, CLAUDE.md §13).
-	if stmt.Begin == nil && stmt.Commit == nil && stmt.Rollback == nil && !stmtIsWrite(stmt) {
+	if stmt.Begin == nil && stmt.Commit == nil && stmt.Rollback == nil && !db.stmtIsWriteWithViews(stmt) {
 		if err := db.gateReadLanes(stmt); err != nil {
 			return nil, db.poisonOnLaneErr(err)
 		}
