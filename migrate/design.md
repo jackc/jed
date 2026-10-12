@@ -182,9 +182,9 @@ mark**.
 is the *simple* choice the brief asks for: it is trivial to read (`select version from
 schema_version`), trivial to reason about, and it makes the up/down algorithm a plain integer walk
 (§6). Its known limitation — it records only *how far*, not *which* files ran, and cannot detect a
-migration file edited after it was applied — is accepted for v1. A richer per-migration ledger with
-content checksums (drift detection, out-of-order support) is a deliberate future option (§11), not a
-v1 feature; it would be an additive second table, not a change to this one.
+migration file edited after it was applied — is accepted. A richer per-migration ledger with
+content checksums (drift detection, out-of-order support) is not planned; it stays a potential option
+only if a definite need arises (§11), and would be an additive second table, not a change to this one.
 
 ---
 
@@ -353,11 +353,12 @@ hermetic — no live server, unlike tern's PostgreSQL-backed suite.
 
 Called out explicitly so they can be settled before or shortly after the first slice:
 
-- **Version model — confirm the high-water mark (§5).** The tern single-integer model is the v1
-  default (simple, matches the brief). The alternative — a per-migration **ledger** table recording
-  each applied `(sequence, name, checksum, applied_at)` — buys drift detection, out-of-order
-  application, and a truthful `status`. It would be an additive second table. Deferred unless wanted
-  in v1.
+- **Version model — the high-water mark is settled (§5).** The tern single-integer model is the
+  version model. A per-migration **ledger** table recording each applied
+  `(sequence, name, checksum, applied_at)` — drift detection, out-of-order application, a truthful
+  `status` — remains only a *potential* future option: **not planned**, and revisited only if a
+  definite need arises. If it ever lands it would be an additive second table, leaving
+  `schema_version` unchanged.
 - **Baseline / adopt-an-existing-database.** tern's `override-version` (set the version without
   running migrations, to adopt a database whose schema already matches migration N). Small, useful,
   likely v1.1. Named `set-version` here to avoid tern's wording.
