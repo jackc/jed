@@ -709,8 +709,8 @@ querying them, and there is deliberately **no host-API introspection convenience
 `table` (the last row), a **`#[doc(hidden)]` `tooling` accessor, not the embedding API**: the in-repo
 CLI and white-box tests reach the full catalog definition — columns (name, type, typmod, NOT NULL, PK
 membership, default), the primary key's ordinals in key order, CHECK constraints, and secondary
-indexes — through it, richer than the `jed_` relations expose today (e.g. column DEFAULTs, still
-un-rendered in `jed_columns`). It reads the **currently-visible snapshot** (an open transaction's
+indexes — through it, richer than the `jed_` relations expose today (e.g. a column's identity kind
+or collation). It reads the **currently-visible snapshot** (an open transaction's
 working set, else the committed state) and returns the exact catalog names,
 sorted ascending by **name byte order** so no hash-map iteration order leaks (CLAUDE.md §8);
 secondary indexes are relations but not tables and are excluded. Per core the tooling seam differs

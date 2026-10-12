@@ -235,9 +235,11 @@ jed_columns(
   ordinal     i32  NOT NULL,     -- 1-based, CREATE TABLE order
   type        text NOT NULL,     -- canonical type rendering (below)
   not_null    boolean NOT NULL,  -- declared NOT NULL or PRIMARY KEY member
-  pk_ordinal  i32                -- 1-based position in the PRIMARY KEY, in KEY order
+  pk_ordinal  i32,               -- 1-based position in the PRIMARY KEY, in KEY order
                                  --   (constraints.md §3 — may differ from declaration order);
                                  --   NULL if not a member
+  column_default text            -- the column's DEFAULT as canonical SQL text (below);
+                                 --   NULL when it has none (or `DEFAULT NULL`)
 )
 ```
 
@@ -248,11 +250,39 @@ leaf** — `varchar(10)`, `decimal(8,2)`; a composite renders **its name as crea
 canonical id from ranges.toml (`i32range`, `numrange`, …); an array appends `[]` to its element's
 rendering (`i32[]`, `addr[]` — and when the element-typmod narrowing lifts, `varchar(5)[]`).
 
-Deliberately minimal: no row-count column yet (v28 persists the fact for planning, but exposing it is
-a separate introspection-surface decision), no `DEFAULT` rendering yet (it needs a pinned canonical
-expression-text form; deferred to a later column addition). **Growth is by adding columns**, so
-consumers should select columns by name, not `SELECT *` positionally — documented at the
-relation, PG's own catalog posture.
+**The canonical `column_default` text** (added after I1 — the first use of the "growth by adding
+columns" rule below; pinned in `suites/introspection/jed_columns.test`). The column is named for
+PostgreSQL's `information_schema.columns.column_default` (DuckDB's `duckdb_columns` agrees; a bare
+`default` would be a reserved word). A default is persisted in one of two forms (constraints.md §2),
+and each renders without new state:
+
+- An **expression** default renders its persisted expression text verbatim — the canonical token
+  text a `CHECK` stores ([../fileformat/format.md](../fileformat/format.md) *Check-expression
+  text*): `DEFAULT 1+1` shows `1 + 1`, `DEFAULT uuidv7()` shows `uuidv7 ( )`. The text is already
+  cross-core byte-identical; views store their bodies in the same form (views.md §3). A `serial`
+  or `GENERATED … AS IDENTITY` column shows the `nextval ( '<table>_<col>_seq' )` default it
+  desugars to (sequences.md §12/§13) — jed's identity *is* that owned-sequence default.
+- A **constant** default is stored as its value, already coerced to the column type at `CREATE
+  TABLE`, so it renders as a SQL literal of that value: an integer, `decimal`, or `boolean` value
+  renders bare by the canonical render (`-5`, `1.50`, `true`); every other value renders the
+  canonical text quoted — `'` + the text with each `'` doubled + `'` (`'it''s'`, `'\x6869'`,
+  `'2024-01-01'`). The canonical render is the zone-free one, so a `timestamptz` renders
+  in UTC (`+00`) whatever the session time zone — the relation stays a pure function of the
+  snapshot. The text re-parses to the same value when assigned to the column. Because the stored
+  value is the coerced one, `DEFAULT 1.5` on `decimal(6,2)` shows `1.50`. A float value renders by
+  its core's native shortest round-trip formatter, quoted (`'1.5'`), under the existing
+  `float-render-layout` determinism-ledger entry.
+- **`DEFAULT NULL` renders NULL**, the same as no default. The two behave identically, and
+  PostgreSQL stores no default at all for `DEFAULT NULL` (`heap.c`, `AddRelationNewConstraints`),
+  so its `column_default` is also NULL.
+
+The column needs no storage change and no `format_version` bump: both forms are already in the
+catalog. Generating it adds no cost unit (one `generated_row` per row, as before).
+
+Deliberately minimal otherwise: no row-count column yet (v28 persists the fact for planning, but
+exposing it is a separate introspection-surface decision), and no identity or collation column yet.
+**Growth is by adding columns**, so consumers should select columns by name, not `SELECT *`
+positionally — documented at the relation, PG's own catalog posture.
 
 ## 5.1 `jed_indexes` + `jed_constraints` (I2) — implemented
 
