@@ -119,14 +119,14 @@ Every example below is a **live database in your browser**. Edit the SQL and run
 `numeric` / `decimal` is exact base-10, not binary floating point. So `0.1 + 0.2` is exactly `0.3`,
 `1.50` equals `1.5` by value, and a value keeps its display scale.
 
-<LiveSql query={decimalDemo} rows={5} />
+<LiveSql demo="decimalDemo" query={decimalDemo} rows={5} />
 
 ## Integers with defined overflow
 
 Integers are fixed-width (`i16`, `i32`, `i64`) and **trap on overflow** — there is no silent
 wraparound. Adding `1` to the largest `i16` raises error `22003`:
 
-<LiveSql query={overflowDemo} rows={3} />
+<LiveSql demo="overflowDemo" query={overflowDemo} rows={3} />
 
 ## Boolean ⇄ integer casts
 
@@ -134,7 +134,7 @@ Following PostgreSQL, `boolean` casts to and from `int` (`i32`) only, and always
 `CAST` / `::` — never implicitly. `true` becomes `1` and `false` becomes `0`; an integer becomes
 `false` when it is `0` and `true` for any nonzero value (including negatives):
 
-<LiveSql query={boolCastDemo} rows={3} />
+<LiveSql demo="boolCastDemo" query={boolCastDemo} rows={3} />
 
 Only `i32` is involved: a `boolean ⇄ i16` or `boolean ⇄ i64` cast is rejected (`42804`), matching
 PostgreSQL's choice of `int4` as the sole boolean-integer cast.
@@ -147,7 +147,7 @@ is trimmed, a leading sign is accepted, and a `boolean` follows PostgreSQL's spe
 (`t`/`true`/`yes`/`on`/`1` …). A malformed string raises `22P02` and an out-of-range integer raises
 `22003`:
 
-<LiveSql query={textNumCastDemo} rows={1} />
+<LiveSql demo="textNumCastDemo" query={textNumCastDemo} rows={1} />
 
 The type must be **named** — a bare string never silently becomes a number, so `int_col = '42'` stays
 a type error (`42804`). jed uses its own literal grammar, so hex, digit underscores, and `NaN` are
@@ -160,7 +160,7 @@ and **`bytea`**, using the same input rules as that type's literal. A malformed 
 `22007` and an out-of-range field `22008`; a malformed `bytea` (only the `\x` hex form is accepted)
 raises `22P02`:
 
-<LiveSql query={textTemporalCastDemo} rows={1} />
+<LiveSql demo="textTemporalCastDemo" query={textTemporalCastDemo} rows={1} />
 
 A `timestamp` ignores a trailing UTC offset. A `timestamptz` with an offset is that instant; one
 **without** an offset is read in the **session time zone**, as in PostgreSQL (the panel runs in
@@ -185,7 +185,7 @@ type shows: numbers in base 10 (a `numeric` keeps its scale), `true` / `false`, 
 `uuid` in lowercase, dates, timestamps, and intervals in PostgreSQL's ISO / `postgres` styles, `json`
 verbatim and `jsonb` canonical:
 
-<LiveSql query={toTextDemo} rows={1} />
+<LiveSql demo="toTextDemo" query={toTextDemo} rows={1} />
 
 A `timestamptz` renders **in the session time zone**, with PostgreSQL's offset spelling (`-05`,
 `+05:30`); the panel runs in the default `UTC` session. Because the result depends on the session,
@@ -205,7 +205,7 @@ Unlike PostgreSQL, the cast is **explicit only**: `INSERT INTO t (name) VALUES (
 **code points** — so `'café'` (4 code points) fits `varchar(4)`. An explicit `CAST` / `::` silently
 **truncates** to `n`, exactly like PostgreSQL, so `'hello world'::varchar(5)` is `'hello'`:
 
-<LiveSql query={varcharDemo} rows={1} />
+<LiveSql demo="varcharDemo" query={varcharDemo} rows={1} />
 
 Storing into a `varchar(n)` **column** is stricter: an over-length value raises `22001`
 (`string_data_right_truncation`), *unless* the excess characters are all spaces — then it is
@@ -221,7 +221,7 @@ parses PostgreSQL-flexibly (braces, hyphens after any byte pair, a bare 32-hex r
 16 bytes, it also casts to and from `bytea` (those 16 raw bytes); `bytea → uuid` requires exactly 16
 bytes and raises `22P02` otherwise:
 
-<LiveSql query={uuidCastDemo} rows={1} />
+<LiveSql demo="uuidCastDemo" query={uuidCastDemo} rows={1} />
 
 `text → uuid` matches PostgreSQL. The other three are deliberately stricter or additional: jed makes
 `uuid → text` explicit-only (PostgreSQL assignment-casts any type to `text`), and the `bytea` ↔ `uuid`
@@ -234,7 +234,7 @@ An array casts three ways, all with an explicit `CAST` / `::`. `array → text` 
 different element type casts **each element** through the scalar cast, preserving the array's shape
 (its dimensions, lengths, and lower bounds):
 
-<LiveSql query={arrayCastDemo} rows={1} />
+<LiveSql demo="arrayCastDemo" query={arrayCastDemo} rows={1} />
 
 The element cast follows the scalar matrix exactly — so widening (`i32[] → i64[]`), `numeric[] → i32[]`
 (rounding half away from zero), and `text[] → i32[]` all work, while an element pair with no scalar
@@ -249,7 +249,7 @@ while the reverse direction needs an explicit `::jsonb` because it can discard w
 order, and duplicate keys. In a multi-column `UPDATE`, every right-hand side reads the old row, so
 `raw = body` below captures the pre-update canonical document:
 
-<LiveSql query={jsonUpdateDemo} rows={1} />
+<LiveSql demo="jsonUpdateDemo" query={jsonUpdateDemo} rows={1} />
 
 A JSON document may nest at most **256** arrays/objects deep. Parsing a deeper document, or
 building one with `jsonb_build_array`, `jsonb_agg`, `||`, `jsonb_set`, and the like, fails with
@@ -261,7 +261,7 @@ default). jed's fixed limit is the same in every core.
 Comparisons with `NULL` yield `NULL` (unknown), not `false` — three-valued logic, as in PostgreSQL.
 Note that `NULL = NULL` is `NULL`, while `NULL IS NULL` is `true`:
 
-<LiveSql query={nullDemo} rows={5} />
+<LiveSql demo="nullDemo" query={nullDemo} rows={5} />
 
 ## Range types
 
@@ -276,7 +276,7 @@ adjacent), and combine ranges with the set operators — `+` (union), `*` (inter
 (difference), and `range_merge`. A union of non-adjacent ranges raises `22000`; `range_merge` spans
 the gap instead:
 
-<LiveSql query={rangeDemo} rows={3} />
+<LiveSql demo="rangeDemo" query={rangeDemo} rows={3} />
 
 <a id="time-zones"></a>
 
@@ -289,7 +289,7 @@ stored value or its order (PostgreSQL's model). The `AT TIME ZONE` operator conv
 instant. `UTC` and fixed offsets like `+05:30` are built in (note the **POSIX sign**: `'+05:30'`
 means UTC−5:30, matching PostgreSQL):
 
-<LiveSql query={tzDemo} rows={1} />
+<LiveSql demo="tzDemo" query={tzDemo} rows={1} />
 
 Named IANA zones (`America/New_York`, `Europe/Paris`, …) come from a time-zone database the host
 **loads** as bytes — the engine ships none by itself, so a query can only ever *use* an
@@ -337,7 +337,7 @@ field out as exact `numeric` (`year`, `dow`, `epoch`, `doy`, ISO `week`, …); a
 panel below runs in the default `UTC` session, and `date_trunc(unit, timestamptz, zone)` takes an
 explicit zone:
 
-<LiveSql query={convDemo} rows={1} />
+<LiveSql demo="convDemo" query={convDemo} rows={1} />
 
 `date_part(field, source)` is the `double precision` twin of `EXTRACT` — same fields, but the field
 name is a runtime string, and over a `date` the timestamp fields exist (`date_part('hour', d)` is
@@ -352,7 +352,7 @@ between** as an `i32`; and adding or subtracting an **interval** widens the date
 returns a `timestamp` (month steps clamp the day-of-month, so Jan 31 + 1 month is Feb 29 in a leap
 year). The `±infinity` dates absorb any shift, and an out-of-range result raises `22008`:
 
-<LiveSql query={dateArithDemo} rows={1} />
+<LiveSql demo="dateArithDemo" query={dateArithDemo} rows={1} />
 
 A date literal also accepts PostgreSQL's special words: `'epoch'` (1970-01-01) and the
 **clock-relative** `'today'` / `'now'` / `'tomorrow'` / `'yesterday'` — the current day in the
@@ -362,7 +362,7 @@ jed **never freezes** a clock-relative word into a constant:
 prepared statement tracks the clock, and an index expression containing one is rejected rather
 than silently frozen. `make_date(year, month, day)` builds a date from parts:
 
-<LiveSql query={dateClockDemo} rows={1} />
+<LiveSql demo="dateClockDemo" query={dateClockDemo} rows={1} />
 
 
 See the full [type reference](../../reference/types/) for every scalar type and its range.

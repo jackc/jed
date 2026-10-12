@@ -210,7 +210,7 @@ quotes (`1 AS year`, `1 "year"`); the full list is in
 
 Grouping and aggregation:
 
-<LiveSql {seed} query={grouped} rows={6} />
+<LiveSql demo="grouped" {seed} query={grouped} rows={6} />
 
 `AND` and `OR` evaluate their operands **left to right and stop early**: a `FALSE` left operand
 decides `AND` and a `TRUE` one decides `OR`, so the right operand is never evaluated. A guard
@@ -222,14 +222,14 @@ jed guarantees it.
 
 Filtering and ordering — edit the `WHERE` and `ORDER BY` and re-run:
 
-<LiveSql {seed} query={filtered} rows={6} />
+<LiveSql demo="filtered" {seed} query={filtered} rows={6} />
 
 ## Common table expressions (`WITH`)
 
 A `WITH` clause names a query and exposes it to the `FROM` clause like a table. Define one or more —
 each is visible to later ones and to the main query:
 
-<LiveSql {seed} query={cte} rows={4} />
+<LiveSql demo="cte" {seed} query={cte} rows={4} />
 
 CTEs follow PostgreSQL's evaluation rule: a CTE referenced once is **inlined**, one referenced
 several times (or marked `MATERIALIZED`) runs once and its rows are **buffered** and reused. Add an
@@ -240,7 +240,7 @@ optional column-rename list (`WITH t (a, b) AS (…)`).
 A CTE's body — and the statement a `WITH` prefixes — may be an `INSERT`, `UPDATE`, or `DELETE`. Its
 `RETURNING` rows flow forward like any CTE's, so one statement can write and read its own changes:
 
-<LiveSql {seed} query={dataModifying} rows={2} />
+<LiveSql demo="dataModifying" {seed} query={dataModifying} rows={2} />
 
 The canonical use is moving rows between tables atomically:
 
@@ -261,7 +261,7 @@ hierarchy walks, graph reachability, generated series. The body is a `UNION`: th
 **non-recursive term**) seeds the result, and the right side (the **recursive term**) is re-evaluated
 against the rows the previous step produced until it yields none:
 
-<LiveSql {seed} query={recursive} rows={5} />
+<LiveSql demo="recursive" {seed} query={recursive} rows={5} />
 
 `UNION ALL` keeps every row; `UNION` drops rows that duplicate one already produced (which is what
 makes a cyclic graph walk terminate). The column types are fixed by the non-recursive term. A
@@ -275,7 +275,7 @@ A `WITH` clause may also prefix any **parenthesized** query — a subquery, a de
 CTE's body — so you can scope helper CTEs to just the part of the statement that needs them. The
 nested CTEs (including `WITH RECURSIVE`) get the full machinery above:
 
-<LiveSql {seed} query={nestedWith} rows={2} />
+<LiveSql demo="nestedWith" {seed} query={nestedWith} rows={2} />
 
 A nested `WITH` establishes a **child** scope: its CTEs are visible only inside that parenthesized
 query, and it inherits CTEs visible in the enclosing statement. An inner CTE with the same name
@@ -295,7 +295,7 @@ anonymous, always-inlined single-reference CTE: the body runs in place, and you 
 columns through the alias. The alias is optional (matching PostgreSQL 18); when present it may carry a
 column-rename list (`AS t (a, b)`):
 
-<LiveSql {seed} query={derived} rows={4} />
+<LiveSql demo="derived" {seed} query={derived} rows={4} />
 
 A table or [view](../views/) in `FROM` takes the same column-rename list after its alias:
 `FROM product AS p (pid, pname)` exposes `product`'s first two columns as `p.pid` and `p.pname`
@@ -336,7 +336,7 @@ without a base table. The columns default to `column1`, `column2`, … (overrida
 column-rename list), and each column's type unifies across the rows the way `UNION` does. Each value
 is a general constant expression (`qty * 2` below):
 
-<LiveSql {seed} query={valuesBody} rows={3} />
+<LiveSql demo="valuesBody" {seed} query={valuesBody} rows={3} />
 
 Order or limit the **outer** query (`FROM (VALUES …) v ORDER BY x`); a trailing `ORDER BY` / `LIMIT`
 inside the parentheses is not yet supported.
@@ -347,7 +347,7 @@ A `LATERAL` `FROM` item may reference columns of the `FROM` relations that appea
 dependent join re-evaluated once per left-hand row. It is the idiomatic way to express
 **top-N-per-group**: for each category, the single most expensive product.
 
-<LiveSql {seed} query={lateral} rows={2} />
+<LiveSql demo="lateral" {seed} query={lateral} rows={2} />
 
 Reach it through explicit join syntax — `CROSS JOIN LATERAL`, `JOIN LATERAL … ON …`, or `LEFT JOIN
 LATERAL … ON …` (a `LEFT JOIN` keeps a left row even when the lateral side produces no rows) — or
@@ -381,7 +381,7 @@ Parentheses group joins into a single `FROM` item and so set the join tree. Belo
 kept, and a customer's orders appear only where the inner join of `orders` and `product` matched —
 Linus, with no orders, still gets a row:
 
-<LiveSql seed={parenSeed} query={parenthesized} rows={4} />
+<LiveSql demo="parenthesized" seed={parenSeed} query={parenthesized} rows={4} />
 
 Without an alias the inner tables' names stay visible (`o.customer_id`, `p.name`, `p.*`) and must not
 repeat another `FROM` name. With an alias, `(a JOIN b ON …) AS g` behaves exactly like the derived
@@ -410,7 +410,7 @@ deduplicating set operations (all but `UNION ALL`) also need an equality operato
 unification. Unlike `CASE`/`COALESCE` they are **eager** — every argument is evaluated, so
 `greatest(1, 1/0)` does divide by zero:
 
-<LiveSql {seed} query={conditional} rows={4} />
+<LiveSql demo="conditional" {seed} query={conditional} rows={4} />
 
 ## Set-returning functions in `FROM`
 
@@ -423,7 +423,7 @@ function or its alias by default. Add a column-alias list when the output deserv
 left-to-right renaming, and a shorter list leaves the remaining output names unchanged. The relation
 composes with `WHERE` / `ORDER BY` / `LIMIT` / joins like any other:
 
-<LiveSql query={unnestExample} rows={6} />
+<LiveSql demo="unnestExample" query={unnestExample} rows={6} />
 
 ## Array containment and overlap
 
@@ -432,7 +432,7 @@ The `@>` (contains), `<@` (contained by), and `&&` (overlaps) operators compare 
 element. Matching is strict — a `NULL` element matches nothing, including another `NULL` — and a
 `NULL` whole array yields `NULL`:
 
-<LiveSql query={containmentExample} rows={2} />
+<LiveSql demo="containmentExample" query={containmentExample} rows={2} />
 
 ## Quantified comparisons (`ANY` / `ALL`)
 
@@ -442,13 +442,13 @@ element; `x op ALL(arr)` is true when the comparison holds for every element. Bo
 exactly like `IN`: a `NULL` element (or a `NULL` `x`) makes the result `NULL` when no element settles
 it, an empty array makes `ANY` false and `ALL` true, and a `NULL` whole array yields `NULL`:
 
-<LiveSql query={quantifiedExample} rows={2} />
+<LiveSql demo="quantifiedExample" query={quantifiedExample} rows={2} />
 
 The operand may also be a **subquery** — `x op ANY/ALL(SELECT …)`, the subquery spelling of `IN`.
 `x = ANY(SELECT …)` is exactly `x IN (SELECT …)`; the other operators generalize it over the
 subquery's single column, with the same three-valued fold (and no row-count limit):
 
-<LiveSql {seed} query={quantifiedSubquery} rows={4} />
+<LiveSql demo="quantifiedSubquery" {seed} query={quantifiedSubquery} rows={4} />
 
 ## Row comparisons and row-valued subqueries
 
@@ -462,7 +462,7 @@ A row on the left of a comparison, `IN`, or `ANY` / `ALL` makes the subquery on 
 each of its rows is compared as a row. The single-row comparison `(a, b) = (SELECT x, y …)` still
 requires at most one row (`21000`); `IN`, `ANY`, and `ALL` take any number:
 
-<LiveSql {seed} query={rowSubquery} rows={4} />
+<LiveSql demo="rowSubquery" {seed} query={rowSubquery} rows={4} />
 
 ## Variadic functions (`VARIADIC`)
 
@@ -471,7 +471,7 @@ count the `NULL` / non-`NULL` arguments — either as a spread of values, or, wi
 keyword, by passing one array whose elements are the arguments. The two forms agree, and the spread
 form never returns `NULL` (it counts), while `VARIADIC` over a `NULL` array yields `NULL`:
 
-<LiveSql query={variadicExample} rows={2} />
+<LiveSql demo="variadicExample" query={variadicExample} rows={2} />
 
 ## Arrays of composite types
 
@@ -482,18 +482,18 @@ Comparison, `ORDER BY`, `DISTINCT`, and `GROUP BY` all work — a `NULL` field i
 element is comparable (so two arrays with matching `NULL` fields are equal and sort together), unlike
 a bare row comparison:
 
-<LiveSql seed={arrayCompositeSeed} query={arrayCompositeExample} rows={2} />
+<LiveSql demo="arrayCompositeExample" seed={arrayCompositeSeed} query={arrayCompositeExample} rows={2} />
 
 `unnest` expands a composite array into one **composite row** per element — read the whole row
 (`u`) or reach into a field (`(u).zip`):
 
-<LiveSql seed={arrayCompositeSeed} query={unnestCompositeExample} rows={2} />
+<LiveSql demo="unnestCompositeExample" seed={arrayCompositeSeed} query={unnestCompositeExample} rows={2} />
 
 The array functions and operators work over composite elements too — `array_append`, `||`,
 `cardinality`, `@>`/`<@`/`&&`, `array_remove`, and `= ANY` / `= ALL` (which compares whole rows,
 so a matching `NULL` field still counts as equal):
 
-<LiveSql seed={arrayCompositeSeed} query={arrayCompositeFnExample} rows={2} />
+<LiveSql demo="arrayCompositeFnExample" seed={arrayCompositeSeed} query={arrayCompositeFnExample} rows={2} />
 
 ## Composite types with array fields
 
@@ -503,7 +503,7 @@ ARRAY[…])` (or write the field as a text literal, `ROW(name, '{10,20,30}')`), 
 with `(p).pts`, and subscript it with `(p).pts[1]`. Comparison and `ORDER BY` follow the row order
 field-by-field, using the array's element-wise order for the array field:
 
-<LiveSql seed={compositeArrayFieldSeed} query={compositeArrayFieldExample} rows={2} />
+<LiveSql demo="compositeArrayFieldExample" seed={compositeArrayFieldSeed} query={compositeArrayFieldExample} rows={2} />
 
 ## Dates
 
@@ -512,7 +512,7 @@ A `date` is a calendar date — year/month/day, no time or zone. Write one as a 
 and sort chronologically, and `infinity` / `-infinity` are first-class values. (A literal carrying
 a time keeps only the date part, so `'2024-01-15 09:30:00'` stores `2024-01-15`.)
 
-<LiveSql seed={dateSeed} query={dateExample} rows={3} />
+<LiveSql demo="dateExample" seed={dateSeed} query={dateExample} rows={3} />
 
 ## Cost
 

@@ -88,7 +88,7 @@ A view stores no rows. Each time a query reads it, jed runs its saved query in p
 over one table can also be written to: `INSERT`, `UPDATE`, and `DELETE` on it change the table
 underneath ([below](#writing-through-a-view)).
 
-<LiveSql {seed} {query} rows={4} />
+<LiveSql demo="query" {seed} {query} rows={4} />
 
 Things to try in the panel above:
 
@@ -134,7 +134,7 @@ return the same rows and errors, cost the same, and get the same plan. jed adds 
 for the view, and the planner can push a filter into the view's query, so an outer
 `WHERE id = 2` still becomes a primary-key lookup on `employee`:
 
-<LiveSql {seed} query={explain} rows={3} />
+<LiveSql demo="explain" {seed} query={explain} rows={3} />
 
 A view's query cannot see anything from the query that reads it: not its other tables, not its
 `WITH` names, and not an enclosing query's columns. A view can read other views.
@@ -156,7 +156,7 @@ As with any query, rows come back in a defined order only when the outer query h
 As in PostgreSQL, `SELECT *` in a view means the columns that exist **when the view is created**. A
 column added to the table later does not appear in the view:
 
-<LiveSql seed={starSeed} query={starQuery} rows={3} />
+<LiveSql demo="starQuery" seed={starSeed} query={starQuery} rows={3} />
 
 jed stores the expanded column list in the view's definition, so `jed_views.definition` shows the
 explicit columns rather than `*`.
@@ -197,7 +197,7 @@ Renaming a table or column that a view reads keeps the view working, with the sa
 jed rewrites each affected view's stored definition, using a [column alias list](../select/)
 (`FROM staff AS employee (id, name)`) to keep the old names. Run this to see the rewritten text:
 
-<LiveSql {seed} query={rename} rows={2} />
+<LiveSql demo="rename" {seed} query={rename} rows={2} />
 
 After the renames, `SELECT name FROM active_staff` still works and returns the same rows.
 
@@ -208,7 +208,7 @@ exist yet. The views that read it keep working and see the new query. As in Post
 query must keep the view's existing columns, with the same names, types, and collations in the same
 order. It may add new columns at the end:
 
-<LiveSql {seed} query={replace} rows={2} />
+<LiveSql demo="replace" {seed} query={replace} rows={2} />
 
 A change to an existing column is `42P16`: fewer columns, a different name, a different type, or a
 different collation. To rename a column, use `ALTER VIEW … RENAME COLUMN` (below). Two details
@@ -234,7 +234,7 @@ ALTER VIEW [IF EXISTS] name RENAME [COLUMN] column TO new_column
 working with the same column names: jed rewrites their stored definitions, as it does for a renamed
 table.
 
-<LiveSql {seed} query={renameView} rows={3} />
+<LiveSql demo="renameView" {seed} query={renameView} rows={3} />
 
 A missing view is `42P01` unless you write `IF EXISTS`. Naming a table, index, or sequence is
 `42809`. A new name that is taken is `42P07`. Renaming a column that does not exist is `42703`, and
@@ -264,7 +264,7 @@ As in PostgreSQL, a view whose query reads exactly one table (or one such view),
 **updatable**. `INSERT`, `UPDATE`, and `DELETE` on it, and a data-modifying `WITH` that targets it,
 write the table underneath:
 
-<LiveSql seed={writeSeed} query={writeQuery} rows={4} />
+<LiveSql demo="writeQuery" seed={writeSeed} query={writeQuery} rows={4} />
 
 - A column that is a plain column of the table (`id`, `title` above) can be written. Any other
   column (`owner_tag`, computed with `upper`) can be read in `WHERE`, `SET`, and `RETURNING`, but

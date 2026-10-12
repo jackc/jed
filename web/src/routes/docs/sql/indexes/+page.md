@@ -115,7 +115,7 @@ edit the `WHERE` to `region = 2` — the selective equality chooses the index an
 the matching rows. A broad range may deliberately choose the full scan instead, avoiding an index
 walk followed by a table point lookup for nearly every row. Either way the result is the same:
 
-<LiveSql seed={orderedSeed} query={orderedQuery} rows={6} />
+<LiveSql demo="orderedQuery" seed={orderedSeed} query={orderedQuery} rows={6} />
 
 The same ordered bound narrows an **`UPDATE` or `DELETE` target scan**. Equality, range, composite
 prefix, expression-index, and eligible partial-index predicates gather every matching old row and
@@ -141,7 +141,7 @@ The canonical use is **case-insensitive uniqueness**: a `UNIQUE` index on `lower
 rows whose emails differ only in case. Insert a second row with `'ADA@EXAMPLE.COM'` below to see the
 `23505` unique violation, then run the case-insensitive lookup:
 
-<LiveSql seed={exprSeed} query={exprQuery} rows={4} />
+<LiveSql demo="exprQuery" seed={exprSeed} query={exprQuery} rows={4} />
 
 The expression must be **immutable** — a deterministic function of the row. jed rejects, at
 `CREATE INDEX`, an expression that calls a non-immutable function (`now()`, `uuidv4()`, `nextval(…)`)
@@ -168,7 +168,7 @@ takes a full scan (it can't assume all `customer = 10` rows are active). Run the
 then edit it to drop `status = 'active'` and watch the plan fall back to a full scan — the rows are
 identical either way, because the `WHERE` stays the residual filter.
 
-<LiveSql seed={partialSeed} query={partialQuery} rows={4} />
+<LiveSql demo="partialQuery" seed={partialSeed} query={partialQuery} rows={4} />
 
 A **`UNIQUE`** partial index constrains only the qualifying rows: `CREATE UNIQUE INDEX ON orders
 (customer) WHERE status = 'active'` forbids two *active* orders from sharing a customer, while a
@@ -188,7 +188,7 @@ CREATE TABLE accounts (id int PRIMARY KEY, email text, deleted_at timestamptz);
 CREATE UNIQUE INDEX active_email ON accounts (email) WHERE deleted_at IS NULL;
 ```
 
-<LiveSql seed={nullSeed} query={nullQuery} rows={4} />
+<LiveSql demo="nullQuery" seed={nullSeed} query={nullQuery} rows={4} />
 
 Instant comparisons and explicit-zone conversions are allowed. A cast such as `deleted_at::date`
 reads the session timezone and is rejected with `42P17`; `(deleted_at AT TIME ZONE 'UTC')::date`
@@ -250,20 +250,20 @@ incompatible order still consumes and sorts the complete candidate set.
 
 Containment (`intro` and `gin` both hold `{10, 20}`):
 
-<LiveSql seed={ginSeed} query={containsQuery} rows={6} />
+<LiveSql demo="containsQuery" seed={ginSeed} query={containsQuery} rows={6} />
 
 Overlap (`intro` holds `30`; `arrays` and `storage` hold `40`):
 
-<LiveSql seed={ginSeed} query={overlapsQuery} rows={6} />
+<LiveSql demo="overlapsQuery" seed={ginSeed} query={overlapsQuery} rows={6} />
 
 Membership (`intro`, `arrays`, and `gin` all hold `20`):
 
-<LiveSql seed={ginSeed} query={memberQuery} rows={6} />
+<LiveSql demo="memberQuery" seed={ginSeed} query={memberQuery} rows={6} />
 
 Equality is stricter than containment — `tags = ARRAY[10, 20]` keeps only `gin` (whose `tags`
 *are* `{10, 20}`), not `intro` (whose `{10, 20, 30}` merely *contains* them):
 
-<LiveSql seed={ginSeed} query={equalQuery} rows={6} />
+<LiveSql demo="equalQuery" seed={ginSeed} query={equalQuery} rows={6} />
 
 ### Current scope
 

@@ -117,7 +117,7 @@ adds `top-k=K` to the Sort: jed retains only `K = OFFSET + LIMIT` rows while pre
 stable full-sort result. `touched=` reports how many stored columns the statement actually references;
 UPDATE/DELETE include filter and assignment sources plus the storage-reading side of `RETURNING`.
 
-<LiveSql seed={seed} query={fullScan} rows={8} />
+<LiveSql demo="fullScan" seed={seed} query={fullScan} rows={8} />
 
 ## A primary-key lookup
 
@@ -128,7 +128,7 @@ For a composite primary key, the detail lists the usable members in key order. j
 tuple when every member has an equality, or scans a leading equality prefix with an optional range
 on the next member; a predicate on only a non-leading member remains a full scan.
 
-<LiveSql seed={seed} query={pkBound} rows={8} />
+<LiveSql demo="pkBound" seed={seed} query={pkBound} rows={8} />
 
 ## A secondary-index bound
 
@@ -136,13 +136,13 @@ An applicable predicate on an indexed non-key column contributes an index candid
 estimate wins, EXPLAIN shows `Index bound: using <index>`. An **equality** (`region = 1`) is normally
 selective enough to seek the matching entries:
 
-<LiveSql seed={seed} query={indexBound} rows={8} />
+<LiveSql demo="indexBound" seed={seed} query={indexBound} rows={8} />
 
 A **range** on an indexed column (`region > 1`, `<`, `<=`, `>=`, `BETWEEN`) is also a candidate, but
 a broad secondary-index range can cost more than reading the table once because every admitted index
 entry needs a table point fetch. This tiny-table example therefore chooses the full scan:
 
-<LiveSql seed={seed} query={indexRange} rows={8} />
+<LiveSql demo="indexRange" seed={seed} query={indexRange} rows={8} />
 
 On a **composite** index over `(a, b, …)` the candidate bound extends to a **multi-column prefix**: an equality
 on the leading columns, optionally followed by a range on the next (`a = 1 AND b > 3`). The `WHERE`
@@ -160,7 +160,7 @@ canonical interval set, not a full scan. jed encodes runtime values, clips a co-
 and merges duplicates/overlaps before scanning each disjoint interval once. The same applies to an
 indexed non-key column (`Index interval set: using <index>`).
 
-<LiveSql seed={seed} query={pointSet} rows={8} />
+<LiveSql demo="pointSet" seed={seed} query={pointSet} rows={8} />
 
 ## An index-nested-loop join
 
@@ -176,7 +176,7 @@ The indexed relation need not appear second in SQL. This example deliberately wr
 the planner chooses `trip` as the physical outer and `city` as the bounded inner, while projection
 still uses the resolved source columns normally.
 
-<LiveSql seed={seed} query={indexNestedLoop} rows={8} />
+<LiveSql demo="indexNestedLoop" seed={seed} query={indexNestedLoop} rows={8} />
 
 ## A hash join
 
@@ -188,7 +188,7 @@ checked on candidates. `keys=N` makes the choice visible. `LEFT` joins retain th
 and a `CROSS JOIN ... WHERE a = b` is not rewritten into hash form. The build table is currently
 in-memory; grace-hash spill is a later storage slice.
 
-<LiveSql seed={seed} query={hashJoin} rows={8} />
+<LiveSql demo="hashJoin" seed={seed} query={hashJoin} rows={8} />
 
 ## Bounded N-way join ordering
 
@@ -199,7 +199,7 @@ its original right-side owner and every referenced relation are present. With an
 materializes the selected left subtree and streams only the final join step, so its estimates never
 discount work the executor still performs.
 
-<LiveSql seed={seed} query={nwayJoin} rows={11} />
+<LiveSql demo="nwayJoin" seed={seed} query={nwayJoin} rows={11} />
 
 ## Pushed filters and contradictions
 
@@ -211,7 +211,7 @@ so rejected rows never reach the join. EXPLAIN shows it on the `Scan` as `filter
 both sides (it disappears when nothing is left). Conditions on the NULL-extended side of an outer join
 stay above the join, where they see the NULL-extended rows.
 
-<LiveSql seed={seed} query={pushdown} rows={8} />
+<LiveSql demo="pushdown" seed={seed} query={pushdown} rows={8} />
 
 If the `WHERE`'s literals rule out every row — `zone > 5 AND zone < 3`, `x = 1 AND x = 2`,
 `WHERE false` — the statement reads no table at all. The plan keeps its shape, the `Filter` detail
@@ -219,7 +219,7 @@ ends in `contradiction`, and every scan estimates (and costs) zero. An ungrouped
 its one row. `UPDATE` and `DELETE` get the same check: a contradictory mutation reads no row, evaluates
 none of its `SET` or `RETURNING` expressions, and changes nothing.
 
-<LiveSql seed={seed} query={contradiction} rows={4} />
+<LiveSql demo="contradiction" seed={seed} query={contradiction} rows={4} />
 
 A condition on a subquery in `FROM` moves **into** the subquery when it only compares the subquery's
 plain output columns and the subquery has no window function, `LIMIT`, or `OFFSET`. The subquery is
@@ -228,21 +228,21 @@ then planned as if you had written the condition inside it — here it becomes a
 `WITH` query, or a set-returning function in a join still gets the condition applied to its rows
 before the join, shown as `filter:conjuncts=N` on its node.)
 
-<LiveSql seed={seed} query={derivedPushdown} rows={4} />
+<LiveSql demo="derivedPushdown" seed={seed} query={derivedPushdown} rows={4} />
 
 A grouped subquery takes the condition too when it only compares **grouping columns**: it then decides
 which whole groups exist, so it runs before the grouping — here it bounds the `city_region` index under
 the `Aggregate`, and only one region's cities are counted. A condition on an aggregate result, or on a
 `ROLLUP`/`CUBE`/`GROUPING SETS` subquery, stays outside.
 
-<LiveSql seed={seed} query={groupedPushdown} rows={4} />
+<LiveSql demo="groupedPushdown" seed={seed} query={groupedPushdown} rows={4} />
 
 A `UNION`, `INTERSECT`, or `EXCEPT` subquery takes the condition into **every branch**, and each branch
 plans it on its own table: here it is a primary-key lookup on `city` and a filter on `trip`'s scan.
 A branch whose column jed widens to the combined type (an `i32` branch of an `i64` column, say) keeps
 the condition outside.
 
-<LiveSql seed={seed} query={setopPushdown} rows={6} />
+<LiveSql demo="setopPushdown" seed={seed} query={setopPushdown} rows={6} />
 
 The same applies to a join's `ON`: a condition on one table moves to that table when the join allows
 it — either side of an inner join, or the side an outer join fills with NULLs. Here `t.id > 5` only
@@ -250,13 +250,13 @@ decides which `trip` rows can match, so it runs in `trip`'s scan (and bounds its
 `c.id = t.city_id`, and cities without a matching trip are still returned with NULLs. A condition on
 the side an outer join preserves stays in the `ON`.
 
-<LiveSql seed={seed} query={onPushdown} rows={4} />
+<LiveSql demo="onPushdown" seed={seed} query={onPushdown} rows={4} />
 
 ## Aggregation
 
 `GROUP BY` adds an `Aggregate` node over the scan, carrying the grouping-key and aggregate counts.
 
-<LiveSql seed={seed} query={aggregate} rows={8} />
+<LiveSql demo="aggregate" seed={seed} query={aggregate} rows={8} />
 
 ## EXPLAIN ANALYZE — the real cost
 
@@ -268,7 +268,7 @@ measured attribution for every plan node; `est_rows` and `est_cost` remain the i
 estimate columns. Nested query frames keep same-labeled scans distinct, and work from a folded
 uncorrelated expression subquery is included at its containing visible operator and parents.
 
-<LiveSql seed={seed} query={analyze} rows={8} />
+<LiveSql demo="analyze" seed={seed} query={analyze} rows={8} />
 
 > `EXPLAIN ANALYZE` of an `INSERT` / `UPDATE` / `DELETE` **does** run the mutation (and commits it),
 > exactly like PostgreSQL. Use plain `EXPLAIN` to inspect a write's plan without changing any data.

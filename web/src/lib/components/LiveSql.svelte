@@ -17,8 +17,18 @@
     query = '',
     autorun = true,
     rows = 6,
-    title = ''
-  }: { seed?: string; query?: string; autorun?: boolean; rows?: number; title?: string } = $props();
+    title = '',
+    demo = undefined
+  }: {
+    seed?: string;
+    query?: string;
+    autorun?: boolean;
+    rows?: number;
+    title?: string;
+    // A stable name for this panel, rendered as `data-demo`, so e2e tests locate it by name rather
+    // than by its position on the page (which shifts whenever a panel is added above it).
+    demo?: string;
+  } = $props();
 
   let db: JedDb | null = null;
   // `sql` is an independent editable copy seeded from the `query` prop's initial value (intentional).
@@ -84,7 +94,11 @@
   }
 </script>
 
-<div class="not-prose rounded-lg border border-slate-200 bg-white shadow-sm" data-testid="live-sql">
+<div
+  class="not-prose rounded-lg border border-slate-200 bg-white shadow-sm"
+  data-testid="live-sql"
+  data-demo={demo}
+>
   {#if title}
     <div class="border-b border-slate-200 px-3 py-2 text-sm font-semibold text-jed-ink">
       {title}
