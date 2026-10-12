@@ -818,8 +818,12 @@ impl Engine {
                 format!("view \"{name}\" does not exist"),
             ));
         }
-        // Phase 2: a dependent view outside the drop set blocks (RESTRICT 2BP01; CASCADE would
-        // drop it — a follow-on, 0A000). The first blocking view in name byte order is named.
+        // Phase 2: under RESTRICT a dependent view outside the drop set blocks (2BP01), naming the
+        // first in name byte order; under CASCADE every dependent view is dropped too, transitively.
+        if dv.cascade {
+            let closure = self.read_snap().view_drop_closure(targets.iter().cloned());
+            targets = closure.into_iter().collect();
+        }
         let snap = self.read_snap();
         for dependent in snap.views_sorted() {
             if targets.contains(&dependent.name) {
@@ -832,12 +836,6 @@ impl Engine {
             else {
                 continue;
             };
-            if dv.cascade {
-                return Err(view_not_supported(format!(
-                    "DROP VIEW ... CASCADE of view {} with dependent view {} is not supported",
-                    dep.name, dependent.name
-                )));
-            }
             return Err(EngineError::new(
                 SqlState::DependentObjectsStillExist,
                 format!(
@@ -1016,11 +1014,18 @@ impl Engine {
     // Dependencies on tables (views.md §6).
     // ---------------------------------------------------------------------------------------------
 
-    /// The `DROP TABLE` view-dependency check (§6): a view depending on a table being dropped
-    /// blocks the statement — 2BP01 under RESTRICT, 0A000 under CASCADE (dropping dependent views
-    /// is a follow-on). The first blocking view in name byte order is named.
-    pub(crate) fn check_drop_table_views(&self, targets: &[String], cascade: bool) -> Result<()> {
-        for view in self.read_snap().views_sorted() {
+    /// The `DROP TABLE` view-dependency check (§6). Under RESTRICT a view depending on a table
+    /// being dropped blocks the statement (2BP01), naming the first in name byte order. Under
+    /// CASCADE the views to drop with the tables are returned: every view depending on one of them,
+    /// and every view depending on one of those, transitively.
+    pub(crate) fn drop_table_views(
+        &self,
+        targets: &[String],
+        cascade: bool,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let snap = self.read_snap();
+        let mut seeds = Vec::new();
+        for view in snap.views_sorted() {
             let Some(dep) = view
                 .deps
                 .iter()
@@ -1028,21 +1033,18 @@ impl Engine {
             else {
                 continue;
             };
-            if cascade {
-                return Err(view_not_supported(format!(
-                    "DROP TABLE ... CASCADE of table {} with dependent view {} is not supported",
-                    dep.name, view.name
-                )));
+            if !cascade {
+                return Err(EngineError::new(
+                    SqlState::DependentObjectsStillExist,
+                    format!(
+                        "cannot drop table {} because view {} depends on it",
+                        dep.name, view.name
+                    ),
+                ));
             }
-            return Err(EngineError::new(
-                SqlState::DependentObjectsStillExist,
-                format!(
-                    "cannot drop table {} because view {} depends on it",
-                    dep.name, view.name
-                ),
-            ));
+            seeds.push(view.name.clone());
         }
-        Ok(())
+        Ok(snap.view_drop_closure(seeds))
     }
 }
 
@@ -1075,11 +1077,17 @@ impl ViewAlterPlan {
     /// The first dependent view (name byte order) that references the table's column at the
     /// pre-statement ordinal `ordinal` (§6).
     pub(crate) fn view_using(&self, ordinal: usize) -> Option<&str> {
+        self.views_using(ordinal).next()
+    }
+
+    /// Every dependent view (name byte order) that references the table's column at the
+    /// pre-statement ordinal `ordinal` (§6).
+    pub(crate) fn views_using(&self, ordinal: usize) -> impl Iterator<Item = &str> {
         let column = &self.columns[ordinal];
         self.views
             .iter()
             .map(|(v, _)| v)
-            .find(|v| {
+            .filter(move |v| {
                 v.deps.iter().any(|d| {
                     d.kind == ViewDepKind::Table
                         && d.name == self.table
@@ -1087,6 +1095,12 @@ impl ViewAlterPlan {
                 })
             })
             .map(|v| v.name.as_str())
+    }
+
+    /// Stop tracking the views a `DROP COLUMN … CASCADE` drops (§6): they no longer block the
+    /// statement and are neither rewritten nor re-validated.
+    pub(crate) fn forget(&mut self, dropped: &std::collections::BTreeSet<String>) {
+        self.views.retain(|(v, _)| !dropped.contains(&v.name));
     }
 }
 

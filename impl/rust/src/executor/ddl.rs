@@ -1746,7 +1746,7 @@ impl Engine {
         // edits their text — and rewritten + re-validated after the change. A table of an attached
         // database with dependent views refuses every ALTER TABLE: re-validating views there is a
         // follow-on (views.md §10).
-        let view_plan = if temp_scope {
+        let mut view_plan = if temp_scope {
             None
         } else if attachment_scope {
             if let Some(v) = snap
@@ -1773,6 +1773,11 @@ impl Engine {
             self.prepare_view_alter(&original, rewrites)?
         };
         let mut view_change: Option<ViewAlterChange> = None;
+        // The views a `DROP COLUMN … CASCADE` drops (views.md §6), and the pre-statement ordinals of
+        // the columns whose type changes — checked against the surviving views after every action,
+        // as PostgreSQL runs type changes after the drops.
+        let mut cascade_dropped_views = std::collections::BTreeSet::<String>::new();
+        let mut view_type_checks = Vec::<usize>::new();
         let relation_taken = |name: &str| {
             if attachment_scope {
                 snap.table(name).is_some()
@@ -2010,27 +2015,29 @@ impl Engine {
                                 "dropping a primary-key column is not supported yet".to_string(),
                             ));
                         }
-                        // A column a view references cannot be dropped (views.md §6): 2BP01, and
-                        // 0A000 under CASCADE (dropping the view is a follow-on).
+                        // A column a view references cannot be dropped (views.md §6): 2BP01. Under
+                        // CASCADE those views are dropped, with every view depending on them.
                         if let (ColumnSource::Original(old_ci), Some(vp)) =
-                            (&column_sources[ci], &view_plan)
-                            && let Some(view) = vp.view_using(*old_ci)
+                            (&column_sources[ci], &mut view_plan)
                         {
-                            if cascade {
+                            let users: Vec<String> =
+                                vp.views_using(*old_ci).map(str::to_string).collect();
+                            if let Some(view) = users.first()
+                                && !cascade
+                            {
                                 return Err(EngineError::new(
-                                    SqlState::FeatureNotSupported,
+                                    SqlState::DependentObjectsStillExist,
                                     format!(
-                                        "DROP COLUMN ... CASCADE of column {name} with dependent view {view} is not supported"
+                                        "cannot drop column {name} of table {} because view {view} depends on it",
+                                        original.name
                                     ),
                                 ));
                             }
-                            return Err(EngineError::new(
-                                SqlState::DependentObjectsStillExist,
-                                format!(
-                                    "cannot drop column {name} of table {} because view {view} depends on it",
-                                    original.name
-                                ),
-                            ));
+                            if !users.is_empty() {
+                                let closure = main_namespace.view_drop_closure(users);
+                                vp.forget(&closure);
+                                cascade_dropped_views.extend(closure);
+                            }
                         }
                         let dropped_source = column_sources[ci].clone();
                         // PostgreSQL owns an FK through its local (referencing) columns. Dropping
@@ -2806,15 +2813,11 @@ impl Engine {
                             type_mod,
                             using,
                         } => {
-                            // A column a view references cannot change type (views.md §6).
-                            if let (ColumnSource::Original(old_ci), Some(vp)) =
-                                (&column_sources[ci], &view_plan)
-                                && vp.view_using(*old_ci).is_some()
-                            {
-                                return Err(EngineError::new(
-                                    SqlState::FeatureNotSupported,
-                                    "cannot alter type of a column used by a view",
-                                ));
+                            // A column a view references cannot change type (views.md §6); checked
+                            // after every action, so a view a DROP COLUMN … CASCADE drops does not
+                            // block it.
+                            if let ColumnSource::Original(old_ci) = &column_sources[ci] {
+                                view_type_checks.push(*old_ci);
                             }
                             let old_column = table.columns[ci].clone();
                             let mut target = self.build_alter_added_column(
@@ -2998,6 +3001,14 @@ impl Engine {
                     }
                 }
             }
+        }
+        if let Some(vp) = &view_plan
+            && view_type_checks.iter().any(|&o| vp.view_using(o).is_some())
+        {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "cannot alter type of a column used by a view",
+            ));
         }
 
         if type_changed {
@@ -3448,8 +3459,12 @@ impl Engine {
                 pending_serials.iter().map(|s| s.name.to_string()).collect();
             ws.remap_alter_column_dependents(&table.name, &original_to_new, &pending);
         }
-        // Rewrite and re-validate the dependent views against the post-statement catalog
-        // (views.md §7/§8); a failure is 0A000 and discards the whole statement.
+        // Drop the views a DROP COLUMN … CASCADE took (views.md §6), then rewrite and re-validate
+        // the surviving dependent views against the post-statement catalog (§7/§8); a failure is
+        // 0A000 and discards the whole statement.
+        for name in &cascade_dropped_views {
+            self.working_mut().remove_view(name);
+        }
         if let Some(plan) = view_plan {
             let change = view_change.unwrap_or_else(|| ViewAlterChange::Other {
                 dropped: (0..original.columns.len())
@@ -4153,14 +4168,14 @@ impl Engine {
         // persistent snapshot; a dependent whose referencing table is itself in the drop set does not
         // count (the drop-set exclusion is the whole `seen` set, so `DROP TABLE parent, child`
         // succeeds even under RESTRICT).
-        // A view depending on a table being dropped blocks the statement (views.md §6): a DROP
-        // TABLE never drops views, and CASCADE dropping them is a follow-on.
+        // A view depending on a table being dropped blocks the statement under RESTRICT; CASCADE
+        // drops it, with every view depending on it (views.md §6).
         let persistent: Vec<String> = targets
             .iter()
             .filter(|(_, scope)| matches!(scope, Scope::Persistent))
             .map(|(key, _)| key.clone())
             .collect();
-        self.check_drop_table_views(&persistent, dt.cascade)?;
+        let cascade_views = self.drop_table_views(&persistent, dt.cascade)?;
         let deps = self.read_snap().foreign_key_dependents_excluding(&seen);
         let cascade_removals = if dt.cascade {
             deps
@@ -4178,9 +4193,13 @@ impl Engine {
             }
             Vec::new()
         };
-        // ---- Phase 3: apply. CASCADE first drops each surviving table's now-dangling FK constraint
-        // (in place, preserving its rows). A FK only ever lives on a persistent table (temp tables
-        // reject FKs at CREATE), so the removal routes to the main working snapshot.
+        // ---- Phase 3: apply. CASCADE first drops the dependent views and each surviving table's
+        // now-dangling FK constraint (in place, preserving its rows). Views and FKs only ever live
+        // in the main database (temp tables reject FKs at CREATE, and views cannot read them), so
+        // the removals route to the main working snapshot.
+        for name in &cascade_views {
+            self.working_mut().remove_view(name);
+        }
         for d in &cascade_removals {
             self.working_mut()
                 .remove_foreign_key(&d.ref_table_key, &d.fk_name);

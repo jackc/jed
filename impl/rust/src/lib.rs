@@ -1037,6 +1037,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "ddl.view_replace",
     "ddl.view_alter",
     "dml.view_write",
+    "ddl.view_cascade",
 ];
 
 /// Parse and execute one SQL statement against a low-level [`Engine`] (no bind parameters).

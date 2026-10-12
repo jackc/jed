@@ -259,6 +259,32 @@ impl Snapshot {
             .collect()
     }
 
+    /// The views a `CASCADE` drop removes (spec/design/views.md §6): the `seeds` and every view
+    /// that depends on one of them, transitively.
+    pub(crate) fn view_drop_closure(
+        &self,
+        seeds: impl IntoIterator<Item = String>,
+    ) -> std::collections::BTreeSet<String> {
+        let mut closure: std::collections::BTreeSet<String> = seeds.into_iter().collect();
+        loop {
+            let added: Vec<String> = self
+                .views_sorted()
+                .into_iter()
+                .filter(|v| {
+                    !closure.contains(&v.name)
+                        && v.deps
+                            .iter()
+                            .any(|d| d.kind == ViewDepKind::View && closure.contains(&d.name))
+                })
+                .map(|v| v.name.clone())
+                .collect();
+            if added.is_empty() {
+                return closure;
+            }
+            closure.extend(added);
+        }
+    }
+
     /// Resolve a collation name for USE — query resolution and key encoding (spec/design/collation.md
     /// §2/§9). The collations the database has resolved (a cache populated on open from the file's
     /// reference entries, carrying their version pin) first, then the engine-global **loaded** set

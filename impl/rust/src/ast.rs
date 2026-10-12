@@ -437,8 +437,8 @@ pub struct CreateView {
 }
 
 /// `DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]` (spec/design/views.md §1). Each name may
-/// carry a database qualifier. `cascade` only changes the error a dependent view raises (`0A000`
-/// instead of `2BP01`, §6).
+/// carry a database qualifier. `cascade` also drops every view that depends on a dropped one,
+/// transitively, where RESTRICT raises `2BP01` (§6).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DropView {
     pub names: Vec<(Option<String>, String)>,
