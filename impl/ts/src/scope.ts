@@ -84,6 +84,7 @@ import { render, renderFloat } from "./value.ts";
 import { storeValue } from "./store.ts";
 import type { Privilege } from "./privileges.ts";
 import type { TableStore } from "./storage.ts";
+import type { ViewWrite, WriteLayer } from "./view_write.ts";
 // SubRel is one inner relation label of an unaliased parenthesized join (grammar.md §15): its
 // table's columns live at the flat slots `slots` of the join's single FROM relation (slot k holds
 // column k). rel is the owning FROM ordinal, so a partial ON scope sees only the labels of the
@@ -163,6 +164,31 @@ export class Scope {
     return new Scope([{ label: t.name, table: t, offset: 0 }], catalog, null, true);
   }
 
+  // writeTarget is the target scope of a write (UPDATE / DELETE): single, or, for a write through a
+  // view, the base table relabeled with the view's name and exposing the view's columns
+  // (spec/design/views.md §15.2).
+  static writeTarget(catalog: Engine, t: Table, vw: ViewWrite | null): Scope {
+    const scope = Scope.single(catalog, t);
+    if (vw !== null) {
+      scope.rels[0]!.label = vw.view;
+      scope.rels[0]!.layer = vw.top;
+    }
+    return scope;
+  }
+
+  // layerBody is the isolated scope a view body's select items and WHERE resolve in during a write
+  // through the view (views.md §4.1, §15.2): the body's single FROM item, labeled `label`, exposing
+  // `layer`'s columns over the base row at flat `offset`. No parent and no CTEs.
+  static layerBody(
+    catalog: Engine,
+    t: Table,
+    offset: number,
+    label: string,
+    layer: WriteLayer,
+  ): Scope {
+    return new Scope([{ label, table: t, offset, layer }], catalog, null, true);
+  }
+
   // index is the scope a PERSISTED index expression (an expression key or a partial-index predicate)
   // resolves against: single with the storage collation rule (storageCollation).
   static index(catalog: Engine, t: Table): Scope {
@@ -194,12 +220,15 @@ export class Scope {
     t: Table,
     baseIsOld: boolean,
     returning: ReturningClause,
+    vw: ViewWrite | null = null,
   ): Scope {
     const n = t.columns.length;
-    const label = t.name;
+    // A write through a view returns the view's columns under the view's name (views.md §15.2).
+    const label = vw === null ? t.name : vw.view;
+    const layer = vw === null ? {} : { layer: vw.top };
     const oldOffset = baseIsOld ? 0 : n;
     const newOffset = baseIsOld ? n : 0;
-    const rels: ScopeRel[] = [{ label, table: t, offset: 0 }];
+    const rels: ScopeRel[] = [{ label, table: t, offset: 0, ...layer }];
     for (const explicit of [
       { alias: returning.oldAlias, offset: oldOffset },
       { alias: returning.newAlias, offset: newOffset },
@@ -214,6 +243,7 @@ export class Scope {
           table: t,
           offset: explicit.offset,
           qualifierOnly: true,
+          ...layer,
         });
       }
     }
@@ -227,6 +257,7 @@ export class Scope {
           table: t,
           offset: pseudo.offset,
           qualifierOnly: true,
+          ...layer,
         });
       }
     }
@@ -273,8 +304,19 @@ export class Scope {
         break;
       }
     }
-    for (const r of this.rels) {
+    let layered: Resolved | null = null;
+    for (let ri = 0; ri < this.rels.length; ri++) {
+      const r = this.rels[ri]!;
       if (r.qualifierOnly) continue;
+      // A write through a view exposes the view's columns (views.md §15.2).
+      if (r.layer !== undefined) {
+        for (let col = 0; col < r.layer.columns.length; col++) {
+          if (r.layer.columns[col]!.name !== lower) continue;
+          if (found >= 0 || layered !== null) throw ambiguousColumn(name);
+          layered = { level: 0, index: -1, layer: { rel: ri, col } };
+        }
+        continue;
+      }
       // Count EVERY matching column, not just the first per relation: a synthetic relation (a CTE or
       // derived table) may carry two columns of the same name, and a bare reference to that name is
       // ambiguous (42702) exactly as a match across two relations is (cte.md §2, grammar.md §42).
@@ -284,11 +326,12 @@ export class Scope {
         // A merge's underlying copies are superseded by the merge above — skip them.
         if (this.hidden.includes(idx)) continue;
         if (r.table.columns[local]!.name === lower) {
-          if (found >= 0) throw ambiguousColumn(name);
+          if (found >= 0 || layered !== null) throw ambiguousColumn(name);
           found = idx;
         }
       }
     }
+    if (layered !== null) return layered;
     if (found >= 0) {
       this.traceFlat(found);
       return { level: 0, index: found };
@@ -333,6 +376,18 @@ export class Scope {
   // unknown qualifier walks outward (42P01 if no ancestor has it).
   resolveQualified(qualifier: string, name: string): Resolved {
     const q = qualifier;
+    for (let ri = 0; ri < this.rels.length; ri++) {
+      const layer = this.rels[ri]!.layer;
+      if (this.rels[ri]!.label !== q || layer === undefined) continue;
+      let found = -1;
+      for (let col = 0; col < layer.columns.length; col++) {
+        if (layer.columns[col]!.name !== name) continue;
+        if (found >= 0) throw ambiguousColumn(name);
+        found = col;
+      }
+      if (found < 0) throw undefinedColumn(name);
+      return { level: 0, index: -1, layer: { rel: ri, col: found } };
+    }
     for (const r of this.rels) {
       if (r.label === q) {
         // A synthetic relation (a derived table, an aliased parenthesized join) may carry two
@@ -387,6 +442,9 @@ export class Scope {
 
   // columnOf returns the column a resolution refers to — local here, or outer in an ancestor.
   columnOf(r: Resolved): Column {
+    if (r.layer !== undefined) {
+      return this.ancestor(r.level).rels[r.layer.rel]!.layer!.columns[r.layer.col]!;
+    }
     return this.ancestor(r.level).columnAt(r.index);
   }
 

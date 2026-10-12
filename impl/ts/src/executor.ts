@@ -469,10 +469,22 @@ import {
   resolveJsonbSetInsert,
   resolveJsonpathArgs,
   resolveJsonpathFn,
+  resolveColumnRef,
   resolveProjections,
   sortTargetCollation,
   valueToNode,
 } from "./resolve.ts";
+import {
+  type LayerCol,
+  type ViewWrite,
+  type WriteKind,
+  type WriteLayer,
+  columnRefPosition,
+  evalWriteFilter,
+  renamedNames,
+  viewsBottomUp,
+  writeVerb,
+} from "./view_write.ts";
 import {
   ExplainRender,
   ParamTypes,
@@ -4386,20 +4398,26 @@ export class Engine {
     ctx: EstimateCteContext | null,
   ): PlanEstimate[] {
     if (inner.kind === "insert") {
-      if (this.lkpTableScoped(inner.db, inner.table) === undefined) throw engineError("undefined_table", "table does not exist: " + inner.table);
-      const source = inner.source.kind === "select"
+      // A write through an updatable view estimates its base-table statement (views.md §15.5).
+      const ins = this.rewriteInsertTarget(inner).ins;
+      if (this.lkpTableScoped(ins.db, ins.table) === undefined) throw engineError("undefined_table", "table does not exist: " + ins.table);
+      const source = ins.source.kind === "select"
         ? this.estimateQueryPlan(
-            this.planQuery(inner.source.select, null, bindings, new ParamTypes()),
+            this.planQuery(ins.source.select, null, bindings, new ParamTypes()),
             ctx,
           )
-        : leafEstimatedPlan(emptyPlanEstimate(BigInt(inner.source.rows.length)));
+        : leafEstimatedPlan(emptyPlanEstimate(BigInt(ins.source.rows.length)));
       return parentEstimatedPlan(source.root, source).nodes;
     }
     if (inner.kind === "update" || inner.kind === "delete") {
-      const table = this.lkpTableScoped(inner.db, inner.table);
-      if (table === undefined) throw engineError("undefined_table", "table does not exist: " + inner.table);
-      const filter = this.explainDmlFilter(table, inner.filter, bindings);
-      const scan = this.estimateMutationScan(table, inner.db, filter, ctx);
+      let stmt: Update | Delete;
+      let vw: ViewWrite | null;
+      if (inner.kind === "update") ({ upd: stmt, vw } = this.rewriteUpdateTarget(inner));
+      else ({ del: stmt, vw } = this.rewriteDeleteTarget(inner));
+      const table = this.lkpTableScoped(stmt.db, stmt.table);
+      if (table === undefined) throw engineError("undefined_table", "table does not exist: " + stmt.table);
+      const filter = this.explainDmlFilter(table, stmt.filter, bindings, vw);
+      const scan = this.estimateMutationScan(table, stmt.db, filter, ctx);
       return parentEstimatedPlan(scan.root, scan).nodes;
     }
     return this.estimateQueryPlan(this.planExplainInner(inner), null).nodes;
@@ -4735,10 +4753,12 @@ export class Engine {
   // the source but never writes.
   private explainInsert(
     r: ExplainRender,
-    ins: Insert,
+    written: Insert,
     depth: number,
     bindings: CteBinding[],
   ): void {
+    // A write through an updatable view renders its base-table statement (views.md §15.5).
+    const ins = this.rewriteInsertTarget(written).ins;
     if (this.lkpTable(ins.table) === undefined) {
       throw engineError("undefined_table", "table does not exist: " + ins.table);
     }
@@ -4756,22 +4776,24 @@ export class Engine {
   // via the same detectors the executor uses, but never writes.
   private explainUpdate(
     r: ExplainRender,
-    upd: Update,
+    written: Update,
     depth: number,
     bindings: CteBinding[],
   ): void {
+    // A write through an updatable view renders its base-table statement (views.md §15.5).
+    const { upd, vw } = this.rewriteUpdateTarget(written);
     const table = this.lkpTable(upd.table);
     if (table === undefined) {
       throw engineError("undefined_table", "table does not exist: " + upd.table);
     }
-    const filter = this.explainDmlFilter(table, upd.filter, bindings);
+    const filter = this.explainDmlFilter(table, upd.filter, bindings, vw);
     r.emit(depth, "Update " + upd.table, `sets=${upd.assignments.length}`);
     this.renderDmlScan(
       r,
       table,
       upd.table,
       filter,
-      this.explainUpdateTouched(table, upd, filter, bindings),
+      this.explainUpdateTouched(table, upd, filter, bindings, vw),
       depth + 1,
     );
   }
@@ -4780,37 +4802,40 @@ export class Engine {
   // with its chosen access path. It resolves the WHERE and the scan bound but never writes.
   private explainDelete(
     r: ExplainRender,
-    del: Delete,
+    written: Delete,
     depth: number,
     bindings: CteBinding[],
   ): void {
+    // A write through an updatable view renders its base-table statement (views.md §15.5).
+    const { del, vw } = this.rewriteDeleteTarget(written);
     const table = this.lkpTable(del.table);
     if (table === undefined) {
       throw engineError("undefined_table", "table does not exist: " + del.table);
     }
-    const filter = this.explainDmlFilter(table, del.filter, bindings);
+    const filter = this.explainDmlFilter(table, del.filter, bindings, vw);
     r.emit(depth, "Delete " + del.table, "-");
     this.renderDmlScan(
       r,
       table,
       del.table,
       filter,
-      this.explainDeleteTouched(table, del, filter, bindings),
+      this.explainDeleteTouched(table, del, filter, bindings, vw),
       depth + 1,
     );
   }
 
   // explainDmlFilter resolves an UPDATE/DELETE WHERE predicate against a single-table scope (the same
-  // prologue the executors use), or returns null for a bare (no-WHERE) statement.
+  // prologue the executors use), or returns null for a bare (no-WHERE) statement. A write through a
+  // view puts its views' WHERE clauses first (views.md §15.2).
   private explainDmlFilter(
     table: Table,
     where: Expr | null,
     bindings: CteBinding[],
+    vw: ViewWrite | null,
   ): RExpr | null {
-    if (where === null) return null;
-    const scope = Scope.single(this, table);
+    const scope = Scope.writeTarget(this, table, vw);
     scope.ctes = bindings;
-    return resolveBooleanFilter(scope, where, new ParamTypes());
+    return this.resolveWriteFilter(scope, table, vw, where, new ParamTypes()).filter;
   }
 
   // renderDmlScan emits the residual Filter (when present) and the target Scan for an UPDATE/DELETE,
@@ -4840,11 +4865,12 @@ export class Engine {
     del: Delete,
     filter: RExpr | null,
     bindings: CteBinding[],
+    vw: ViewWrite | null,
   ): boolean[] {
     const mask = new Array<boolean>(table.columns.length).fill(false);
     if (filter !== null) collectTouched(filter, 0, mask);
     if (del.returning !== null) {
-      const ret = this.resolveReturning(table, del.returning, true, bindings, new ParamTypes());
+      const ret = this.resolveReturning(table, del.returning, true, bindings, new ParamTypes(), vw);
       const retMask = new Array<boolean>(2 * mask.length).fill(false);
       for (const node of ret.nodes) collectTouched(node, 0, retMask);
       for (let i = 0; i < mask.length; i++) mask[i] ||= retMask[i]!;
@@ -4857,10 +4883,11 @@ export class Engine {
     upd: Update,
     filter: RExpr | null,
     bindings: CteBinding[],
+    vw: ViewWrite | null,
   ): boolean[] {
     const mask = new Array<boolean>(table.columns.length).fill(false);
     if (filter !== null) collectTouched(filter, 0, mask);
-    const scope = Scope.single(this, table);
+    const scope = Scope.writeTarget(this, table, vw);
     scope.ctes = bindings;
     const ptypes = new ParamTypes();
     const assigned = new Array<boolean>(mask.length).fill(false);
@@ -4888,7 +4915,7 @@ export class Engine {
       collectTouched(source, 0, mask);
     }
     if (upd.returning !== null) {
-      const ret = this.resolveReturning(table, upd.returning, false, bindings, ptypes);
+      const ret = this.resolveReturning(table, upd.returning, false, bindings, ptypes, vw);
       const n = mask.length;
       const retMask = new Array<boolean>(2 * n).fill(false);
       for (const node of ret.nodes) collectTouched(node, 0, retMask);
@@ -9419,10 +9446,14 @@ export class Engine {
     allowFill: boolean,
   ): Outcome {
     // INSERT ... SELECT and ON CONFLICT keep the general planner. Writable-CTE INSERTs call
-    // executeInsert directly, so this route is necessarily a top-level plain VALUES statement.
+    // executeInsert directly, so this route is necessarily a top-level plain VALUES statement. A write
+    // through a view (views.md §15) also takes the general path, which retargets it.
     if (ins.source.kind !== "values" || ins.onConflict !== null) {
       return this.executeInsert(ins, params, ctx);
     }
+    checkCatalogRelWrite(ins.table);
+    this.checkAttachmentWritable(ins.db);
+    if (this.dmlTargetView(ins.db, ins.table) !== undefined) return this.executeInsert(ins, params, ctx);
     return this.executeInsertValuesCached(ins, params, ctx, holder, allowFill);
   }
 
@@ -9602,7 +9633,6 @@ export class Engine {
     // dispatch already checked lifetime admission and privileges for this execution.
     checkCatalogRelWrite(ins.table);
     this.checkAttachmentWritable(ins.db);
-    this.checkViewWrite(ins.db, ins.table, "insert into");
     this.checkTableQualifier(ins.db, ins.table);
     const table = this.lkpTableScoped(ins.db, ins.table);
     if (!table) throw engineError("undefined_table", "table does not exist: " + ins.table);
@@ -9853,15 +9883,16 @@ export class Engine {
     );
   }
 
-  private executeInsert(ins: Insert, params: Value[], ctx: CteCtx): Outcome {
+  private executeInsert(written: Insert, params: Value[], ctx: CteCtx): Outcome {
     // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
     // checked by NAME before qualifier validation (the built-in resolves in every database).
-    checkCatalogRelWrite(ins.table);
+    checkCatalogRelWrite(written.table);
     // A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
     // existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
-    this.checkAttachmentWritable(ins.db);
-    // A view is not automatically updatable in this slice (views.md §2): 55000.
-    this.checkViewWrite(ins.db, ins.table, "insert into");
+    this.checkAttachmentWritable(written.db);
+    // A write through an updatable view inserts into its base table (views.md §15); a view that is
+    // not updatable is 55000.
+    const { ins, vw } = this.rewriteInsertTarget(written);
     this.checkTableQualifier(ins.db, ins.table); // attached-databases.md §3
     // ON CONFLICT into a host attachment is a deferred narrowing this slice (attached-databases.md §8):
     // the conflict path resolves index stores unscoped. A clean 0A000 before any planning.
@@ -9969,7 +10000,7 @@ export class Engine {
       const plan = this.planQuery(ins.source.select, null, ctx.bindings, ptypes);
       const ret =
         ins.returning !== null
-          ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes)
+          ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes, vw)
           : null;
       const cplan =
         ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ptypes) : null;
@@ -10104,7 +10135,7 @@ export class Engine {
     // before binding/execution — a 42703 here beats a would-be 23505 (grammar.md §32).
     const ret =
       ins.returning !== null
-        ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes)
+        ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes, vw)
         : null;
     const cplan =
       ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ptypes) : null;
@@ -11221,8 +11252,9 @@ export class Engine {
     baseIsOld: boolean,
     ctes: CteBinding[],
     ptypes: ParamTypes,
+    vw: ViewWrite | null = null,
   ): { nodes: RExpr[]; names: string[]; types: string[] } {
-    const scope = Scope.returning(this, table, baseIsOld, returning);
+    const scope = Scope.returning(this, table, baseIsOld, returning, vw);
     scope.ctes = ctes;
     const { nodes, names, types } = resolveProjections(
       scope,
@@ -11539,14 +11571,16 @@ export class Engine {
   // executeDelete resolves the table and optional predicate, collects the keys of
   // matching rows (only a TRUE predicate matches — Kleene), then removes them. No WHERE
   // deletes every row. Keys are collected before mutating.
-  private executeDelete(del: Delete, params: Value[], ctx: CteCtx): Outcome {
+  private executeDelete(written: Delete, params: Value[], ctx: CteCtx): Outcome {
     // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
     // checked by NAME before qualifier validation (the built-in resolves in every database).
-    checkCatalogRelWrite(del.table);
+    checkCatalogRelWrite(written.table);
     // A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
     // existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
-    this.checkAttachmentWritable(del.db);
-    this.checkViewWrite(del.db, del.table, "delete from");
+    this.checkAttachmentWritable(written.db);
+    // A write through an updatable view deletes from its base table (views.md §15); a view that is
+    // not updatable is 55000.
+    const { del, vw } = this.rewriteDeleteTarget(written);
     this.checkTableQualifier(del.db, del.table); // attached-databases.md §3
     const table = this.lkpTableScoped(del.db, del.table); // scope-aware temp-first (temp-tables.md §3)
     if (!table) {
@@ -11562,13 +11596,13 @@ export class Engine {
     // projection resolves after it (PostgreSQL's analysis order), against the same scope
     // (grammar.md §32). The statement's CTE bindings (writable-cte.md) are visible so a WHERE /
     // RETURNING sublink may reference an earlier CTE.
-    const scope = Scope.single(this, table);
+    const scope = Scope.writeTarget(this, table, vw);
     scope.ctes = ctx.bindings;
     const ptypes = new ParamTypes();
-    let filter = del.filter ? resolveBooleanFilter(scope, del.filter, ptypes) : null;
+    let { filter, stages } = this.resolveWriteFilter(scope, table, vw, del.filter, ptypes);
     const ret =
       del.returning !== null
-        ? this.resolveReturning(table, del.returning, true, ctx.bindings, ptypes)
+        ? this.resolveReturning(table, del.returning, true, ctx.bindings, ptypes, vw)
         : null;
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
 
@@ -11667,7 +11701,7 @@ export class Engine {
       // touched set the block above charged (large-values.md §14).
       const row = store.resolveColumns(e.row, mask);
       const beforeFilter = meter.accrued;
-      let keep = filter === null || isTrue(evalExpr(filter, row, env, meter));
+      let keep = filter === null || evalWriteFilter(filter, stages, row, env, meter);
       filterActual += meter.accrued - beforeFilter;
       if (del.fkTarget !== undefined) keep = fkKeyedMatch(del.fkTarget, row) !== null;
       if (keep) {
@@ -11739,14 +11773,16 @@ export class Engine {
   // row moves, §11 step 6); the new keys are validated against the statement's end state —
   // a collision with another row's key traps 23505 (<table>_pkey). A duplicate target
   // column traps 42701. No WHERE updates every row.
-  private executeUpdate(upd: Update, params: Value[], ctx: CteCtx): Outcome {
+  private executeUpdate(written: Update, params: Value[], ctx: CteCtx): Outcome {
     // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
     // checked by NAME before qualifier validation (the built-in resolves in every database).
-    checkCatalogRelWrite(upd.table);
+    checkCatalogRelWrite(written.table);
     // A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
     // existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
-    this.checkAttachmentWritable(upd.db);
-    this.checkViewWrite(upd.db, upd.table, "update");
+    this.checkAttachmentWritable(written.db);
+    // A write through an updatable view updates its base table (views.md §15); a view that is not
+    // updatable is 55000.
+    const { upd, vw } = this.rewriteUpdateTarget(written);
     this.checkTableQualifier(upd.db, upd.table); // attached-databases.md §3
     const table = this.lkpTableScoped(upd.db, upd.table); // scope-aware temp-first (temp-tables.md §3)
     if (!table) {
@@ -11767,7 +11803,7 @@ export class Engine {
     // shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
     // The statement's CTE bindings (writable-cte.md) are visible so a SET / WHERE / RETURNING
     // sublink may reference an earlier CTE.
-    const scope = Scope.single(this, table);
+    const scope = Scope.writeTarget(this, table, vw);
     scope.ctes = ctx.bindings;
     const ptypes = new ParamTypes();
 
@@ -11891,12 +11927,12 @@ export class Engine {
     // keeps every storage key in place — the in-place fast path (writeStore.replace).
     const pkChanged = pkMembers.length > 0 && plans.some((p) => pkMembers.includes(p.idx));
 
-    let filter = upd.filter ? resolveBooleanFilter(scope, upd.filter, ptypes) : null;
+    let { filter, stages } = this.resolveWriteFilter(scope, table, vw, upd.filter, ptypes);
     // The RETURNING projection resolves last (PostgreSQL's analysis order), against the same
     // one-relation scope; it evaluates each matched row's NEW values (grammar.md §32).
     const ret =
       upd.returning !== null
-        ? this.resolveReturning(table, upd.returning, false, ctx.bindings, ptypes)
+        ? this.resolveReturning(table, upd.returning, false, ctx.bindings, ptypes, vw)
         : null;
     // The CHECK constraints, resolved once per statement in evaluation (name) order;
     // phase 1 evaluates them on each post-assignment row (constraints.md §4.4).
@@ -12003,7 +12039,7 @@ export class Engine {
       const filtered = store.resolveColumns(e.row, mask);
       if (filter !== null) {
         const beforeFilter = meter.accrued;
-        const keep = isTrue(evalExpr(filter, filtered, env, meter));
+        const keep = evalWriteFilter(filter, stages, filtered, env, meter);
         filterActual += meter.accrued - beforeFilter;
         if (!keep) continue;
       }
@@ -12463,13 +12499,16 @@ export class Engine {
     } else {
       throw new Error("planDmCte requires a data-modifying body");
     }
-    // A view target is 55000, as for a top-level write (views.md §2).
-    this.checkViewWrite(
-      undefined,
-      tableName,
-      body.kind === "insert" ? "insert into" : body.kind === "update" ? "update" : "delete from",
-    );
-    const tdef = this.lkpTable(tableName); // temp-first (temp-tables.md §3)
+    // A write through an updatable view targets its base table, and its RETURNING projects the
+    // view's columns (views.md §15); a view that is not updatable is 55000. The CTE keeps the written
+    // statement, which its execution retargets again.
+    const vw =
+      body.kind === "insert"
+        ? this.rewriteInsertTarget(body).vw
+        : body.kind === "update"
+          ? this.rewriteUpdateTarget(body).vw
+          : this.rewriteDeleteTarget(body).vw;
+    const tdef = this.lkpTable(vw === null ? tableName : vw.table); // temp-first (temp-tables.md §3)
     if (tdef === undefined) {
       throw engineError("undefined_table", "table does not exist: " + tableName);
     }
@@ -12477,7 +12516,7 @@ export class Engine {
       const table = cteSyntheticTableCols(lname, [], [], null, rename);
       return { table, dm: { stmt, noReturning: true } };
     }
-    const scope = Scope.returning(this, tdef, baseIsOld, returning);
+    const scope = Scope.returning(this, tdef, baseIsOld, returning, vw);
     scope.ctes = bindings;
     const { names, types, derivs } = resolveProjections(
       scope,
@@ -13096,20 +13135,287 @@ export class Engine {
     }
   }
 
-  // checkViewWrite: a DML target that is a view is 55000 (views.md §2) — every view is non-updatable
-  // in this slice. Checked when the target is resolved, before any column, value, or RETURNING check.
-  private checkViewWrite(db: string | undefined, name: string, verb: string): void {
-    let snap: Snapshot | undefined;
+  // dmlTargetView returns the view a DML target names, if any: tables and views share one namespace,
+  // and only bare and main. names reach a view. A view behind an attachment qualifier is 0A000
+  // (views.md §10).
+  private dmlTargetView(db: string | undefined, name: string): ViewDef | undefined {
+    this.rejectAttachedView(db, name);
     if (db === undefined) {
-      if (this.lkpTable(name) !== undefined) return;
-      snap = this.readSnap();
-    } else {
-      snap = this.snapForScope(db);
-      if (snap === undefined) return;
+      if (this.lkpTable(name) !== undefined) return undefined;
+    } else if (db !== "main") {
+      return undefined;
     }
-    if (snap.table(name) === undefined && snap.view(name) !== undefined) {
-      throw engineError("object_not_in_prerequisite_state", `cannot ${verb} view "${name}"`);
+    const snap = this.readSnap();
+    if (snap.table(name) !== undefined) return undefined;
+    return snap.view(name);
+  }
+
+  // updatableShape returns the single FROM item of an automatically updatable body (views.md §15.1),
+  // or null. For INSERT / UPDATE (checkCols) the body must also output at least one plain column
+  // reference.
+  private updatableShape(body: QueryExpr, checkCols: boolean): { sel: Select; tref: TableRef } | null {
+    if (body.kind !== "select") return null;
+    const sel = body;
+    if (
+      sel.distinct ||
+      sel.groupBy.length > 0 ||
+      sel.having !== null ||
+      sel.limit !== null ||
+      sel.offset !== null ||
+      sel.joins.length > 0 ||
+      sel.joinGroup === true ||
+      sel.items.kind !== "list"
+    ) {
+      return null;
     }
+    const items = sel.items.items;
+    const levelHas = (e: Expr) => exprHasAggregate(e) || exprHasWindow(e);
+    if (items.some((it) => levelHas(it.expr))) return null;
+    if (sel.orderBy.some((k) => k.expr !== null && levelHas(k.expr))) return null;
+    const tref = sel.from;
+    if (
+      tref === null ||
+      tref.args !== null ||
+      tref.subquery !== undefined ||
+      tref.values !== undefined ||
+      tref.jsonTable !== undefined ||
+      tref.lateral === true ||
+      (tref.db !== undefined && tref.db !== "main") ||
+      catalogRelKind(tref.name) !== undefined
+    ) {
+      return null;
+    }
+    const snap = this.readSnap();
+    if (snap.table(tref.name) === undefined && snap.view(tref.name) === undefined) return null;
+    if (checkCols) {
+      const label = tref.alias ?? tref.name;
+      const plain = items.some(
+        (it) =>
+          it.expr.kind === "column" || (it.expr.kind === "qualifiedColumn" && it.expr.qualifier === label),
+      );
+      if (!plain) return null;
+    }
+    return { sel, tref };
+  }
+
+  // prepareViewWrite validates a write through name and builds its layer chain (views.md §15.3 steps
+  // 2–6), or returns null when the target is not a view. targets are the statement's target view
+  // columns: the INSERT column list (null = every view column) or the UPDATE SET columns, in order;
+  // DELETE has none.
+  private prepareViewWrite(
+    db: string | undefined,
+    name: string,
+    kind: WriteKind,
+    onConflict: boolean,
+    targets: string[] | null,
+  ): ViewWrite | null {
+    const view = this.dmlTargetView(db, name);
+    if (view === undefined) return null;
+    const checkCols = kind !== "delete";
+    const notUpdatable = (v: string) =>
+      engineError("object_not_in_prerequisite_state", `cannot ${writeVerb(kind)} view "${v}"`);
+    // 2. The target view is updatable for the statement's kind (55000).
+    if (this.updatableShape(view.body, checkCols) === null) throw notUpdatable(view.name);
+    // 3. ON CONFLICT on a view is a follow-on.
+    if (onConflict) {
+      throw engineError("feature_not_supported", "ON CONFLICT on a view is not supported yet");
+    }
+    // 4. The view is planned as a read of it would be (§4): its body's errors and the nesting and
+    // expansion limits. The plan yields every chain view's output types and collations.
+    const metas = this.planWriteTarget(view);
+    // 5. The statement's targets against the view's output columns.
+    let cur: number[] = [];
+    if (checkCols) {
+      if (targets === null) {
+        cur = view.columns.map((_c, i) => i);
+      } else {
+        for (const t of targets) {
+          const idx = view.columns.indexOf(t);
+          if (idx < 0) {
+            throw engineError("undefined_column", `column ${t} of relation ${view.name} does not exist`);
+          }
+          if (cur.includes(idx)) {
+            throw engineError(
+              "duplicate_column",
+              kind === "insert"
+                ? `column ${t} specified more than once`
+                : `column ${t} assigned more than once`,
+            );
+          }
+          cur.push(idx);
+        }
+      }
+    }
+    // 6. Each view from the target down: updatable, then its target columns.
+    type Level = { view: ViewDef; rename: string[] | undefined; label: string; cols: LayerCol[]; filter: Expr | null };
+    const levels: Level[] = [];
+    let levelView = view;
+    let rename: string[] | undefined;
+    let table: Table;
+    let tableRename: string[] | undefined;
+    for (;;) {
+      const shape = this.updatableShape(levelView.body, checkCols);
+      if (shape === null) throw notUpdatable(levelView.name);
+      const { sel, tref } = shape;
+      const label = tref.alias ?? tref.name;
+      const snap = this.readSnap();
+      const base = snap.table(tref.name);
+      const belowNames = renamedNames(
+        base !== undefined ? base.columns.map((c) => c.name) : snap.view(tref.name)!.columns,
+        tref.columnAliases,
+      );
+      const items = sel.items.kind === "list" ? sel.items.items : [];
+      const cols: LayerCol[] = items.map((it) => {
+        const j = columnRefPosition(it.expr, label, belowNames);
+        return j >= 0 ? { kind: "ref", ref: j } : { kind: "expr", expr: it.expr };
+      });
+      if (checkCols) {
+        const readOnly = cur.filter((c) => cols[c]!.kind === "expr");
+        if (readOnly.length > 0) {
+          const first = Math.min(...readOnly);
+          const verb = kind === "insert" ? "insert into" : "update";
+          throw engineError(
+            "feature_not_supported",
+            `cannot ${verb} column "${levelView.columns[first]}" of view "${levelView.name}"`,
+          );
+        }
+        cur = cur.map((c) => (cols[c] as { kind: "ref"; ref: number }).ref);
+      }
+      levels.push({ view: levelView, rename, label, cols, filter: sel.filter });
+      if (base !== undefined) {
+        table = base;
+        tableRename = tref.columnAliases;
+        break;
+      }
+      levelView = snap.view(tref.name)!;
+      rename = tref.columnAliases;
+    }
+    // 7. Two targets that reach the same table column (42701).
+    cur.forEach((c, i) => {
+      if (cur.slice(0, i).includes(c)) {
+        throw engineError("duplicate_column", `column ${table.columns[c]!.name} assigned more than once`);
+      }
+    });
+    // Build the layers bottom-up: the table, then each view.
+    const tableCols = table.columns.map((c, i) =>
+      tableRename !== undefined && i < tableRename.length ? { ...c, name: tableRename[i]! } : c,
+    );
+    let layer: WriteLayer = {
+      view: null,
+      columns: tableCols,
+      cols: tableCols.map((_c, i) => ({ kind: "ref", ref: i })),
+      below: null,
+      belowLabel: "",
+      filter: null,
+    };
+    for (let i = levels.length - 1; i >= 0; i--) {
+      const level = levels[i]!;
+      const meta = metas.get(level.view.name)!;
+      const names = renamedNames(level.view.columns, level.rename);
+      const synth = cteSyntheticTableCols(level.view.name, names, meta.columnTypes, meta.columnDerivs, null);
+      layer = {
+        view: level.view.name,
+        columns: synth.columns,
+        cols: level.cols,
+        below: layer,
+        belowLabel: level.label,
+        filter: level.filter,
+      };
+    }
+    return {
+      view: layer.view!,
+      table: table.name,
+      top: layer,
+      targets: cur.map((c) => table.columns[c]!.name),
+    };
+  }
+
+  // planWriteTarget plans the target view as a read of it at the statement's top level would
+  // (views.md §4/§4.1), returning the output names, types, and collation derivations of every view
+  // in its expansion.
+  private planWriteTarget(view: ViewDef): Map<string, ValuesPlan> {
+    return this.inViewBody({ depth: 0, bodyDepth: view.depth }, () => {
+      const plan = this.planQuery(view.body, null, [], new ParamTypes());
+      const metas = new Map(this.viewColumns);
+      metas.set(view.name, {
+        kind: "values",
+        rows: [],
+        columnTypes: plan.columnTypes,
+        columnNames: plan.columnNames,
+        columnDerivs: queryPlanColumnDerivs(plan),
+      });
+      return metas;
+    });
+  }
+
+  // resolveWriteFilter resolves the complete WHERE of a write (views.md §15.2): every view's WHERE,
+  // the one nearest the table first, then the statement's own, AND-ed left-deep, with the number of
+  // those AND nodes, from the top, that join a stage (evalWriteFilter). Each view's WHERE resolves in
+  // its body's isolated scope over the base row. The complete tree is what access-path selection,
+  // estimation, and EXPLAIN read.
+  resolveWriteFilter(
+    scope: Scope,
+    table: Table,
+    vw: ViewWrite | null,
+    user: Expr | null,
+    ptypes: ParamTypes,
+  ): { filter: RExpr | null; stages: number } {
+    let filter: RExpr | null = null;
+    let parts = 0;
+    const join = (node: RExpr) => {
+      parts++;
+      filter = filter === null ? node : { kind: "and", lhs: filter, rhs: node };
+    };
+    if (vw !== null) {
+      for (const layer of viewsBottomUp(vw.top)) {
+        if (layer.filter === null) continue;
+        const lscope = Scope.layerBody(this, table, 0, layer.belowLabel, layer.below!);
+        join(resolveBooleanFilter(lscope, layer.filter, new ParamTypes()));
+      }
+    }
+    if (user !== null) join(resolveBooleanFilter(scope, user, ptypes));
+    return { filter, stages: Math.max(parts - 1, 0) };
+  }
+
+  // rewriteInsertTarget retargets an INSERT through an updatable view at its base table (views.md
+  // §15.2): the column list becomes the base columns the view's targets map to. It returns a copy of
+  // the statement (the written one is left intact) and the write, or the statement unchanged and null
+  // when the target is not a view.
+  rewriteInsertTarget(ins: Insert): { ins: Insert; vw: ViewWrite | null } {
+    const vw = this.prepareViewWrite(ins.db, ins.table, "insert", ins.onConflict !== null, ins.columns);
+    if (vw === null) return { ins, vw };
+    const { db: _db, ...rest } = ins;
+    return { ins: { ...rest, table: vw.table, columns: vw.targets.slice() }, vw };
+  }
+
+  // rewriteUpdateTarget retargets an UPDATE through an updatable view at its base table (views.md
+  // §15.2): each assignment names its base column, and `SET c = DEFAULT` assigns the view column's
+  // default, which is NULL (jed has no view column defaults).
+  rewriteUpdateTarget(upd: Update): { upd: Update; vw: ViewWrite | null } {
+    const vw = this.prepareViewWrite(
+      upd.db,
+      upd.table,
+      "update",
+      false,
+      upd.assignments.map((a) => a.column),
+    );
+    if (vw === null) return { upd, vw };
+    const { db: _db, ...rest } = upd;
+    const assignments = upd.assignments.map((a, i) =>
+      a.isDefault
+        ? { column: vw.targets[i]!, isDefault: false, value: { kind: "literal", literal: { kind: "null" } } as Expr }
+        : { ...a, column: vw.targets[i]! },
+    );
+    return { upd: { ...rest, table: vw.table, assignments }, vw };
+  }
+
+  // rewriteDeleteTarget retargets a DELETE through an updatable view at its base table (views.md
+  // §15.2).
+  rewriteDeleteTarget(del: Delete): { del: Delete; vw: ViewWrite | null } {
+    const vw = this.prepareViewWrite(del.db, del.table, "delete", false, null);
+    if (vw === null) return { del, vw };
+    const { db: _db, ...rest } = del;
+    return { del: { ...rest, table: vw.table }, vw };
   }
 
   // viewsInDependencyOrder is every view of the main database in dependency order: a view after
@@ -13472,13 +13778,19 @@ export class Engine {
   }
 
   // collectViewFunctionPrivs adds the functions called in the bodies of the views a statement reads
-  // (transitively) to its privilege requirements (views.md §9): function EXECUTE is the reader's, as
-  // for a derived table. The relations inside a body are NOT added — the view is the privilege
-  // boundary.
+  // or writes through (transitively) to its privilege requirements (views.md §9, §15.4): function
+  // EXECUTE is the reader's or writer's, as for a derived table. The relations inside a body are NOT
+  // added — the view is the privilege boundary.
   private collectViewFunctionPrivs(req: PrivReq): void {
     if (this.readSnap().views.size === 0) return;
+    const pending = [...req.relations];
+    for (const t of req.tables) {
+      if (t.priv === "insert" || t.priv === "update" || t.priv === "delete") {
+        pending.push({ db: undefined, name: t.name });
+      }
+    }
     const functions: string[] = [];
-    this.walkReadViews([...req.relations], (_view, body) => {
+    this.walkReadViews(pending, (_view, body) => {
       functions.push(...body.functions);
       return false;
     });
@@ -14755,7 +15067,12 @@ export class Engine {
             oCollation = columnCollation(scope, r);
           }
           const k = orderExprs.length;
-          orderExprs.push({ kind: "outerColumn", level: r.level, index: r.index });
+          // A column of a view being written through is its column or select item (views.md §15.2).
+          orderExprs.push(
+            r.layer === undefined
+              ? { kind: "outerColumn", level: r.level, index: r.index }
+              : resolveColumnRef(scope, { collecting: false, groupKeys: [], specs: [] }, r, key.column).node,
+          );
           order.push({
             idx: ORDER_EXPR_BASE + k,
             descending: key.descending,
@@ -32680,13 +32997,20 @@ export type ScopeRel = {
   // traced view body records the columns resolved against it, so re-validation after CREATE OR
   // REPLACE VIEW can tell whether a dependent binds a column the replacement appended (§8).
   view?: string;
+  // layer is the target of a write through a view (spec/design/views.md §15.2): the names this
+  // relation exposes are the layer's columns, not table's, and each resolves through the layer to a
+  // base column or a read-only select item. table stays the base table, so flat indices keep the
+  // base row's layout. Undefined for every other relation.
+  layer?: WriteLayer;
 };
 
 // Resolved is how a column reference resolved against the scope CHAIN (spec/design/grammar.md
 // §26): level === 0 is a LOCAL column of this query (a flat index into the joined row); level >= 1
 // is a correlated OUTER reference to an enclosing query (level hops outward, index the flat column
 // index within that ancestor's row).
-export type Resolved = { level: number; index: number };
+// `layer` marks column `col` of the layered relation `rel` (a write through a view, views.md §15.2);
+// `index` is then unused, and resolveColumnRef resolves it through the layer.
+export type Resolved = { level: number; index: number; layer?: { rel: number; col: number } };
 
 // MergeCol is a USING/NATURAL merged column (spec/design/grammar.md §15): `name` is the (exact)
 // join column and `index` the flat row index a bare reference resolves to — the surviving side (the
@@ -32696,7 +33020,9 @@ export type MergeCol = { name: string; index: number };
 
 // outerOf lifts a parent-scope resolution into the child's frame: one more hop outward.
 export function outerOf(r: Resolved): Resolved {
-  return { level: r.level + 1, index: r.index };
+  return r.layer === undefined
+    ? { level: r.level + 1, index: r.index }
+    : { level: r.level + 1, index: r.index, layer: r.layer };
 }
 
 // naturalCommonCols is the USING column list a NATURAL join derives (spec/design/grammar.md §15):

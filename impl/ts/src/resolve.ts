@@ -4,8 +4,8 @@
 // each relation's columns in catalog order (§15).
 import {
   type Engine,
-  type ParamTypes,
-  type Scope,
+  ParamTypes,
+  Scope,
   cmpBytes,
   collectColumn,
   elemScalarHint,
@@ -68,6 +68,7 @@ import { type EngineError, engineError } from "./errors.ts";
 import { exprEqual, resolveTypeAndTypmod, scalarForParamHint, unifyCaseTypes } from "./eval_ops.ts";
 import { coerceStringToArray, overflow, typeError } from "./store.ts";
 import type { ScalarType } from "./types.ts";
+import { followLayer } from "./view_write.ts";
 import {
   classifyComparable,
   coerceStringLiteral,
@@ -181,8 +182,14 @@ export function resolveProjections(
     }
     // The RETURNING old/new pseudo-relations are qualifier-only: `*` expands the real
     // relations' columns exactly as before (grammar.md §32).
-    for (const r of scope.rels) {
+    for (let ri = 0; ri < scope.rels.length; ri++) {
+      const r = scope.rels[ri]!;
       if (r.qualifierOnly) continue;
+      // A write through a view returns the view's columns (views.md §15.2).
+      if (r.layer !== undefined) {
+        expandLayerColumns(scope, ri, ag, { nodes, names, types, derivs });
+        continue;
+      }
       r.table.columns.forEach((c, i) => {
         const idx = r.offset + i;
         if (scope.hidden.includes(idx)) return;
@@ -205,6 +212,12 @@ export function resolveProjections(
     // exactly as a qualified column ref.
     if (it.expr.kind === "qualifiedStar") {
       const want = it.expr.qualifier;
+      // `v.*` (or `old.*` / `new.*`) over a write through a view (views.md §15.2).
+      const layered = scope.rels.findIndex((r) => r.label === want && r.layer !== undefined);
+      if (layered >= 0) {
+        expandLayerColumns(scope, layered, ag, { nodes, names, types, derivs });
+        continue;
+      }
       let table: Table | undefined;
       let slots: number[] = [];
       const rel = scope.rels.find((r) => r.label === want);
@@ -362,11 +375,67 @@ export function resolveColumnRef(
   r: Resolved,
   name: string,
 ): { node: RExpr; type: ResolvedType } {
+  if (r.layer !== undefined) return resolveLayerRef(scope, ag, r, name);
   if (r.level === 0) return collectColumn(scope, ag, r.index, name);
   return {
     node: { kind: "outerColumn", level: r.level, index: r.index },
     type: resolvedTypeOfCol(scope.columnOf(r).type, scope.catalog),
   };
+}
+
+// resolveLayerRef resolves a reference to a column of a layered relation (a write through a view,
+// views.md §15.2): an updatable column is the base column itself; a read-only one is its select
+// item, resolved in the owning view body's isolated scope placed r.level scopes out, so its column
+// references read the same base row.
+export function resolveLayerRef(
+  scope: Scope,
+  ag: AggCtx,
+  r: Resolved,
+  name: string,
+): { node: RExpr; type: ResolvedType } {
+  const anc = scope.ancestor(r.level);
+  const rel = anc.rels[r.layer!.rel]!;
+  const f = followLayer(rel.layer!, r.layer!.col);
+  if (f.kind === "base") {
+    const idx = rel.offset + f.index;
+    if (r.level === 0) return collectColumn(scope, ag, idx, name);
+    return {
+      node: { kind: "outerColumn", level: r.level, index: idx },
+      type: resolvedTypeOfCol(anc.columnAt(idx).type, scope.catalog),
+    };
+  }
+  let at = Scope.layerBody(
+    scope.catalog,
+    rel.table,
+    rel.offset,
+    f.owner.belowLabel,
+    f.owner.below!,
+  );
+  for (let i = 0; i < r.level; i++) at = new Scope([], scope.catalog, at, true);
+  const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+  return resolve(at, f.expr, null, forbidden, new ParamTypes());
+}
+
+// expandLayerColumns expands a layered relation's `*` (a write through a view, views.md §15.2): each
+// of the view's columns, by name, resolved through the layer.
+function expandLayerColumns(
+  scope: Scope,
+  rel: number,
+  ag: AggCtx,
+  out: { nodes: RExpr[]; names: string[]; types: ResolvedType[]; derivs: Deriv[] },
+): void {
+  scope.rels[rel]!.layer!.columns.forEach((c, col) => {
+    const { node, type } = resolveColumnRef(
+      scope,
+      ag,
+      { level: 0, index: -1, layer: { rel, col } },
+      c.name,
+    );
+    out.nodes.push(node);
+    out.names.push(c.name);
+    out.types.push(type);
+    out.derivs.push(catColumnDeriv(c));
+  });
 }
 
 // resolveFieldOf resolves a composite field selection `base.field` (spec/design/composite.md §S4)
