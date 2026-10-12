@@ -60,17 +60,56 @@ pub struct Parser {
     /// (0 = none). A bare row is not a parenthesized base, so `parse_postfix` refuses `.field` on it
     /// (PostgreSQL: `(1,2).f1` is a syntax error, `((1,2)).f1` is field access).
     bare_row_end: usize,
+    /// For each token index, whether a PARENTHESIZED QUERY begins there (`is_query_start_at`,
+    /// grammar.md §25). Precomputed once in one backward pass so every probe is O(1) — a long run
+    /// of `(` costs linear time, not time per nesting level.
+    paren_query: Vec<bool>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser {
+        let mut p = Parser {
             tokens,
             pos: 0,
             depth: 0,
             max_depth: 0,
             bare_row_end: 0,
+            paren_query: Vec::new(),
+        };
+        p.paren_query = p.compute_paren_query();
+        p
+    }
+
+    /// Build the `paren_query` table: the `(` at `i` begins a parenthesized query when what follows
+    /// it is a query start (a `SELECT`, a `WITH` clause, or — recursively — another parenthesized
+    /// query) AND its matching `)` is followed by a token that can only continue a query
+    /// (`is_query_follow_at`). Computed back to front, so the recursion is a table lookup.
+    fn compute_paren_query(&self) -> Vec<bool> {
+        let n = self.tokens.len();
+        let mut close = vec![n; n];
+        let mut open: Vec<usize> = Vec::new();
+        for (i, t) in self.tokens.iter().enumerate() {
+            match t {
+                Token::LParen => open.push(i),
+                Token::RParen => {
+                    if let Some(o) = open.pop() {
+                        close[o] = i;
+                    }
+                }
+                _ => {}
+            }
         }
+        let mut q = vec![false; n];
+        for i in (0..n).rev() {
+            if !matches!(self.tokens[i], Token::LParen) {
+                continue;
+            }
+            let inner = self.is_select_at(i + 1)
+                || self.is_with_clause_at(i + 1)
+                || q.get(i + 1).copied().unwrap_or(false);
+            q[i] = inner && self.is_query_follow_at(close[i] + 1);
+        }
+        q
     }
 
     /// Descend one nesting level, enforcing `MAX_EXPR_DEPTH` (spec/design/cost.md §7). Call at
@@ -178,6 +217,8 @@ impl Parser {
             Some("commit") | Some("end") => self.parse_commit(),
             Some("rollback") => self.parse_rollback(),
             Some(other) => Err(syntax(format!("unexpected keyword '{other}'"))),
+            // A leading `(` can only begin a parenthesized query (grammar.md §25).
+            None if matches!(self.peek(), Token::LParen) => self.parse_query_expr(),
             None => Err(syntax("expected a SQL statement")),
         }
     }
@@ -489,7 +530,12 @@ impl Parser {
         let (mut analyze, mut verbose, mut costs, mut lane) = (false, false, true, false);
         let mut seen = std::collections::HashSet::new();
         let mut option_list = false;
-        if matches!(self.peek(), Token::LParen) {
+        // A `(` opens the option list unless a parenthesized query follows (`EXPLAIN (SELECT 1)`,
+        // grammar.md §25): an option is a plain word, never `(`, `SELECT`, or a `WITH` clause.
+        let paren_query = matches!(self.peek_at(1), Token::LParen)
+            || self.is_select_at(self.pos + 1)
+            || self.is_with_clause_at(self.pos + 1);
+        if matches!(self.peek(), Token::LParen) && !paren_query {
             option_list = true;
             self.advance();
             loop {
@@ -552,9 +598,9 @@ impl Parser {
         })
     }
 
-    /// The statement EXPLAIN wraps — restricted to a query (`SELECT` / `WITH`) or a DML statement
-    /// (`INSERT` / `UPDATE` / `DELETE`). DDL, transaction control, and a nested `EXPLAIN` have no
-    /// query plan to render and are rejected `42601`.
+    /// The statement EXPLAIN wraps — restricted to a query (`SELECT` / `WITH` / a parenthesized
+    /// query) or a DML statement (`INSERT` / `UPDATE` / `DELETE`). DDL, transaction control, and a
+    /// nested `EXPLAIN` have no query plan to render and are rejected `42601`.
     fn parse_explain_inner(&mut self) -> Result<Statement> {
         match self.peek_keyword().as_deref() {
             Some("select") => self.parse_query_expr(),
@@ -563,6 +609,7 @@ impl Parser {
             Some("update") => Ok(Statement::Update(self.parse_update()?)),
             Some("delete") => Ok(Statement::Delete(self.parse_delete()?)),
             Some(other) => Err(syntax(format!("EXPLAIN does not support '{other}'"))),
+            None if matches!(self.peek(), Token::LParen) => self.parse_query_expr(),
             None => Err(syntax("expected a statement after EXPLAIN")),
         }
     }
@@ -2407,10 +2454,13 @@ impl Parser {
         Ok(match self.parse_query_expr_node()? {
             QueryExpr::Select(sel) => Statement::Select(*sel),
             QueryExpr::SetOp(so) => Statement::SetOp(*so),
-            // `parse_set_expr` always begins with `parse_select_core`, so a top-level query_expr
-            // never yields a nested `WITH` (a leading `WITH` statement routes to
-            // `parse_with_statement`); the arm is for match exhaustiveness only.
-            QueryExpr::With(_) => unreachable!("a top-level query_expr never begins with WITH"),
+            // A parenthesized `(WITH … query)` statement is the top-level WITH query itself
+            // (PostgreSQL: the parentheses add nothing — grammar.md §25).
+            QueryExpr::With(we) => Statement::With(WithQuery {
+                ctes: we.ctes,
+                body: CteBody::Query(*we.body),
+                recursive: we.recursive,
+            }),
         })
     }
 
@@ -2422,22 +2472,7 @@ impl Parser {
         let node = self.parse_set_expr()?;
         let order_by = self.parse_order_by(true)?;
         let (limit, offset) = self.parse_limit_offset()?;
-        Ok(match node {
-            QueryExpr::Select(mut sel) => {
-                sel.order_by = order_by;
-                sel.limit = limit;
-                sel.offset = offset;
-                QueryExpr::Select(sel)
-            }
-            QueryExpr::SetOp(mut so) => {
-                so.order_by = order_by;
-                so.limit = limit;
-                so.offset = offset;
-                QueryExpr::SetOp(so)
-            }
-            // `parse_set_expr` never yields a nested `WITH`; passthrough for exhaustiveness.
-            QueryExpr::With(w) => QueryExpr::With(w),
-        })
+        fold_trailing(node, order_by, limit, offset)
     }
 
     /// `query_statement ::= with_clause? query_expr` — a top-level query prefixed by a `WITH`
@@ -2505,7 +2540,9 @@ impl Parser {
         } else if parenthesized {
             Ok(CteBody::Query(self.parse_subquery()?))
         } else {
-            Ok(CteBody::Query(self.parse_query_expr_node()?))
+            let body = self.parse_query_expr_node()?;
+            reject_second_with(&body)?;
+            Ok(CteBody::Query(body))
         }
     }
 
@@ -2577,22 +2614,7 @@ impl Parser {
         let node = self.parse_set_expr()?;
         let order_by = self.parse_order_by(true)?;
         let (limit, offset) = self.parse_limit_offset()?;
-        Ok(match node {
-            QueryExpr::Select(mut sel) => {
-                sel.order_by = order_by;
-                sel.limit = limit;
-                sel.offset = offset;
-                QueryExpr::Select(sel)
-            }
-            QueryExpr::SetOp(mut so) => {
-                so.order_by = order_by;
-                so.limit = limit;
-                so.offset = offset;
-                QueryExpr::SetOp(so)
-            }
-            // `parse_set_expr` never yields a nested `WITH`; passthrough for exhaustiveness.
-            QueryExpr::With(w) => QueryExpr::With(w),
-        })
+        fold_trailing(node, order_by, limit, offset)
     }
 
     /// Whether a `SELECT` keyword sits at token index `idx`.
@@ -2618,10 +2640,31 @@ impl Parser {
         }
     }
 
-    /// Whether a query expression — a `SELECT` or a nested `WITH` clause (cte.md §7) — begins at
-    /// token index `idx`. The §26 leading-`SELECT` lookahead, extended with `WITH`.
+    /// Whether a query expression — a `SELECT`, a nested `WITH` clause (cte.md §7), or a
+    /// parenthesized query (grammar.md §25) — begins at token index `idx`. The §26 leading-`SELECT`
+    /// lookahead, extended with `WITH`, and with a run of `(`s that ends at a `SELECT`/`WITH` where
+    /// EVERY `(` in the run is closed by a `)` followed by a token that can only continue a query —
+    /// `UNION`/`INTERSECT`/`EXCEPT`/`ORDER`/`LIMIT`/`OFFSET` or a further `)`. Thus
+    /// `((SELECT 1) UNION SELECT 2)` and `((SELECT 1))` are subqueries but `((SELECT 1) + 1)` and
+    /// `((SELECT 1), 2)` are expressions. Precomputed (`compute_paren_query`), so a long run of `(`
+    /// can neither exhaust the stack nor cost time per probe; a §8 cross-core surface.
     fn is_query_start_at(&self, idx: usize) -> bool {
-        self.is_select_at(idx) || self.is_with_clause_at(idx)
+        self.is_select_at(idx)
+            || self.is_with_clause_at(idx)
+            || self.paren_query.get(idx).copied().unwrap_or(false)
+    }
+
+    /// Whether the token at `idx` may follow a parenthesized query but never a parenthesized
+    /// expression: a set operator, a trailing `ORDER`/`LIMIT`/`OFFSET`, or a closing `)`.
+    fn is_query_follow_at(&self, idx: usize) -> bool {
+        match self.tokens.get(idx) {
+            Some(Token::RParen) => true,
+            Some(Token::Word(w)) => matches!(
+                w.to_ascii_lowercase().as_str(),
+                "union" | "intersect" | "except" | "order" | "limit" | "offset"
+            ),
+            _ => false,
+        }
     }
 
     /// Whether the NEXT token begins a query expression (a `SELECT` or nested `WITH`) — the
@@ -2659,6 +2702,7 @@ impl Parser {
             }
         }
         let body = self.parse_subquery_inner()?;
+        reject_second_with(&body)?;
         Ok(QueryExpr::With(Box::new(WithExpr {
             ctes,
             recursive,
@@ -2700,12 +2744,12 @@ impl Parser {
     /// higher-precedence, left-associative `INTERSECT` level.
     fn parse_intersect_expr(&mut self) -> Result<QueryExpr> {
         let base = self.depth;
-        let mut left = QueryExpr::Select(Box::new(self.parse_select_core()?));
+        let mut left = self.parse_set_operand()?;
         while self.peek_keyword().as_deref() == Some("intersect") {
             self.deepen()?; // each chained INTERSECT is one more set-op nesting level
             self.advance(); // INTERSECT
             let all = self.parse_setop_quantifier();
-            let right = QueryExpr::Select(Box::new(self.parse_select_core()?));
+            let right = self.parse_set_operand()?;
             left = QueryExpr::SetOp(Box::new(SetOp {
                 op: SetOpKind::Intersect,
                 all,
@@ -2718,6 +2762,20 @@ impl Parser {
         }
         self.depth = base;
         Ok(left)
+    }
+
+    /// A set-operation operand (grammar.md §25): a `select_core`, or a parenthesized query — a full
+    /// `subquery_expr` (its own `WITH`, set operations, and trailing `ORDER BY`/`LIMIT`/`OFFSET`)
+    /// between `(` and `)`, one nesting level deeper. In operand position a `(` can only begin a
+    /// query, so no lookahead is needed.
+    fn parse_set_operand(&mut self) -> Result<QueryExpr> {
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let q = self.parse_subquery()?;
+            self.expect(&Token::RParen)?;
+            return Ok(q);
+        }
+        Ok(QueryExpr::Select(Box::new(self.parse_select_core()?)))
     }
 
     /// The optional quantifier after a set operator: `ALL` (multiset) or `DISTINCT` (the explicit
@@ -3242,11 +3300,21 @@ impl Parser {
         // The body is EITHER a query_expr (a leading `SELECT`) OR a VALUES list (a leading
         // `VALUES`) — `(VALUES (e…),(e…))`, a computed relation of literal rows (grammar.md §42).
         // The VALUES body's values are GENERAL expressions (resolved as constants at plan time,
-        // parent = None) and it takes NO trailing ORDER BY / LIMIT (a deferred narrowing — that
-        // surfaces as a 42601 leftover token at the expected `)`).
+        // parent = None). A trailing ORDER BY / LIMIT / OFFSET makes the body the query
+        // `SELECT * FROM (VALUES …) ORDER BY … LIMIT …` (`values_query`).
         let mut join_group = false;
         let (mut subquery, values) = if self.peek_keyword().as_deref() == Some("values") {
-            (None, Some(self.parse_values_body()?))
+            let rows = self.parse_values_body()?;
+            let order_by = self.parse_order_by(true)?;
+            let (limit, offset) = self.parse_limit_offset()?;
+            if order_by.is_empty() && limit.is_none() && offset.is_none() {
+                (None, Some(rows))
+            } else {
+                (
+                    Some(Box::new(values_query(rows, order_by, limit, offset))),
+                    None,
+                )
+            }
         } else if self.at_subquery_start() {
             (Some(Box::new(self.parse_subquery()?)), None)
         } else if lateral {
@@ -3486,8 +3554,8 @@ impl Parser {
     /// `VALUES` (here consumed). Each row is a parenthesized list of GENERAL expressions (unlike the
     /// `INSERT … VALUES` slot, which is a literal/`$N`/`DEFAULT`); arity equality across rows and
     /// per-column type unification are resolve-time concerns (the executor's `plan_values`). At
-    /// least one row, each with at least one value (an empty `()` is a 42601). NO trailing
-    /// ORDER BY / LIMIT is consumed — the caller's `)` follows the last row.
+    /// least one row, each with at least one value (an empty `()` is a 42601). A trailing
+    /// ORDER BY / LIMIT / OFFSET is the caller's (`parse_derived_table`).
     fn parse_values_body(&mut self) -> Result<Vec<Vec<Expr>>> {
         self.expect_keyword("values")?;
         let mut rows = Vec::new();
@@ -5730,6 +5798,134 @@ fn splice_leading_group(item: TableRef, joins: Vec<JoinClause>) -> (TableRef, Ve
     let mut out = group.joins;
     out.extend(joins);
     (group.from.expect("a join group has a FROM item"), out)
+}
+
+/// A VALUES body with trailing `ORDER BY` / `LIMIT` / `OFFSET` (grammar.md §42) as the query
+/// `SELECT * FROM (VALUES …) ORDER BY … LIMIT … OFFSET …` over an UNALIASED inner VALUES relation:
+/// the keys resolve against `column1`, `column2`, … by name or ordinal (a qualified key has no
+/// label to name, 42P01, as in PostgreSQL), and the enclosing derived table's alias and
+/// column-rename list apply to the query's output unchanged.
+fn values_query(
+    rows: Vec<Vec<Expr>>,
+    order_by: Vec<OrderKey>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> QueryExpr {
+    let inner = TableRef {
+        name: String::new(),
+        db: None,
+        alias: None,
+        args: None,
+        subquery: None,
+        values: Some(rows),
+        column_aliases: None,
+        column_defs: None,
+        json_table: None,
+        lateral: false,
+        pos: TableRefPos::default(),
+    };
+    QueryExpr::Select(Box::new(Select {
+        distinct: false,
+        items: SelectItems::All(StarPos(None)),
+        from: Some(inner),
+        joins: Vec::new(),
+        filter: None,
+        group_by: Vec::new(),
+        having: None,
+        order_by,
+        limit,
+        offset,
+        windows: Vec::new(),
+        join_group: false,
+    }))
+}
+
+/// Fold a query expression's trailing `ORDER BY` / `LIMIT` / `OFFSET` onto its node (grammar.md
+/// §25). A parenthesized query is the SAME query as its contents (PostgreSQL), so its own trailing
+/// clauses are already set: giving one of them a second time — `(SELECT … ORDER BY a) ORDER BY b`,
+/// `(SELECT … LIMIT 2) LIMIT 1` — is 42601, while a clause the contents lack is simply added. A
+/// parenthesized nested `WITH` folds onto its main query.
+fn fold_trailing(
+    node: QueryExpr,
+    order_by: Vec<OrderKey>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<QueryExpr> {
+    fn fold(
+        cur_order: &mut Vec<OrderKey>,
+        cur_limit: &mut Option<i64>,
+        cur_offset: &mut Option<i64>,
+        order_by: Vec<OrderKey>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<()> {
+        if !order_by.is_empty() {
+            if !cur_order.is_empty() {
+                return Err(syntax("multiple ORDER BY clauses not allowed"));
+            }
+            *cur_order = order_by;
+        }
+        if offset.is_some() {
+            if cur_offset.is_some() {
+                return Err(syntax("multiple OFFSET clauses not allowed"));
+            }
+            *cur_offset = offset;
+        }
+        if limit.is_some() {
+            if cur_limit.is_some() {
+                return Err(syntax("multiple LIMIT clauses not allowed"));
+            }
+            *cur_limit = limit;
+        }
+        Ok(())
+    }
+    Ok(match node {
+        QueryExpr::Select(mut sel) => {
+            fold(
+                &mut sel.order_by,
+                &mut sel.limit,
+                &mut sel.offset,
+                order_by,
+                limit,
+                offset,
+            )?;
+            QueryExpr::Select(sel)
+        }
+        QueryExpr::SetOp(mut so) => {
+            fold(
+                &mut so.order_by,
+                &mut so.limit,
+                &mut so.offset,
+                order_by,
+                limit,
+                offset,
+            )?;
+            QueryExpr::SetOp(so)
+        }
+        QueryExpr::With(we) => {
+            let WithExpr {
+                ctes,
+                recursive,
+                body,
+            } = *we;
+            let body = Box::new(fold_trailing(*body, order_by, limit, offset)?);
+            QueryExpr::With(Box::new(WithExpr {
+                ctes,
+                recursive,
+                body,
+            }))
+        }
+    })
+}
+
+/// A `WITH` clause whose main query is itself a parenthesized `WITH` query — `WITH a AS (…)
+/// (WITH b AS (…) SELECT …)` — is 42601 (PostgreSQL: both clauses would attach to one query). A
+/// parenthesized `WITH` query as a set-operation operand is a separate query and is fine.
+fn reject_second_with(body: &QueryExpr) -> Result<()> {
+    if matches!(body, QueryExpr::With(_)) {
+        return Err(syntax("multiple WITH clauses not allowed"));
+    }
+    Ok(())
 }
 
 /// Whether `kw` (already folded) may NOT be a select item's bare output label — after a complete

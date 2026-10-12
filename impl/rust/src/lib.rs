@@ -583,6 +583,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.union",
     "query.intersect",
     "query.except",
+    // Parenthesized set-operation operands / queries — spec/design/grammar.md §25.
+    "query.setop_parenthesized",
     // Subqueries: scalar / IN / EXISTS, both uncorrelated (folded once) and correlated
     // (re-executed per outer row, any depth) — spec/design/grammar.md §26.
     "query.subquery_scalar",
@@ -621,6 +623,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // as a FROM relation, a computed relation of literal rows (general constant expressions,
     // per-column type unification across rows) — spec/design/grammar.md §42.
     "query.values",
+    "query.values_order_by",
     // LATERAL joins — a FROM item (LATERAL derived table / VALUES, or an implicitly-lateral table
     // function) whose body / args reference the EARLIER FROM relations, a dependent join
     // re-evaluated per left-hand row — spec/design/grammar.md §44.

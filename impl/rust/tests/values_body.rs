@@ -207,8 +207,6 @@ fn errors() {
         ("SELECT * FROM (VALUES (sum(1))) AS v", "42803"),
         // A bare $1 with no inferable type -> 42P18.
         ("SELECT * FROM (VALUES ($1)) AS v", "42P18"),
-        // A trailing ORDER BY on the VALUES body is a deferred narrowing -> 42601.
-        ("SELECT * FROM (VALUES (1), (2) ORDER BY 1) AS v", "42601"),
         // A column-rename list longer than the body's column count -> 42P10.
         ("SELECT * FROM (VALUES (1)) AS v(a, b)", "42P10"),
     ];
