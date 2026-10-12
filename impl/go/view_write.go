@@ -439,11 +439,11 @@ func (db *engine) resolveWriteFilter(s *scope, table *catTable, vw *viewWrite, u
 // (and charges) as usual.
 func evalWriteFilter(f *rExpr, stages int, row storedRow, env *evalEnv, m *costMeter) (bool, error) {
 	if stages == 0 {
-		v, err := f.eval(row, env, m)
+		v, err := f.evalFilter(row, env, m)
 		if err != nil {
 			return false, err
 		}
-		return v.IsTrue(), nil
+		return v, nil
 	}
 	if f.kind != reAnd {
 		panic("a staged write filter joins its stages with AND")
@@ -452,11 +452,11 @@ func evalWriteFilter(f *rExpr, stages int, row storedRow, env *evalEnv, m *costM
 	if err != nil || !keep {
 		return false, err
 	}
-	v, err := f.rhs.eval(row, env, m)
+	v, err := f.rhs.evalFilter(row, env, m)
 	if err != nil {
 		return false, err
 	}
-	return v.IsTrue(), nil
+	return v, nil
 }
 
 // writeTargetScope is the target scope of a write (UPDATE / DELETE): singleScope, or, for a write

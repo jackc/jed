@@ -1027,9 +1027,9 @@ func typeError(msg string) error { return newError(DatatypeMismatch, msg) }
 // always definite.
 //
 // Cost: each INTERIOR node charges operator_eval once, pre-order (the node, then its
-// operands LHS-before-RHS); leaf nodes (column/constants) charge nothing. Both operands
-// are always evaluated — there is no short-circuit, so the count never depends on operand
-// values (spec/design/cost.md §3).
+// operands LHS-before-RHS); leaf nodes (column/constants) charge nothing. Operands are
+// evaluated eagerly except where cost.md §3 sanctions a short-circuit (AND / OR, CASE,
+// COALESCE), whose fixed left-to-right rule makes the skipped work deterministic.
 // evalDateConvert evaluates a cross-family datetime cast (timezones.md §9.3) — or a runtime
 // text → datetime cast (date.md §6, types.md §5) — of the non-NULL value v to `to`
 // (Timestamp/Timestamptz/Date). The casts crossing the timestamptz boundary consult the session
@@ -1198,6 +1198,27 @@ func dateClockValue(exec *engine, rng *stmtRng, m *costMeter, offsetDays int64) 
 		return Value{}, newError(DatetimeFieldOverflow, "date out of range")
 	}
 	return DateValue(int32(days)), nil
+}
+
+// evalFilter evaluates a predicate in a filter context — WHERE, ON, HAVING, a partial index's
+// WHERE, ON CONFLICT … WHERE — and reports whether it keeps the row (it is TRUE). The top-level AND
+// chain stops at the first conjunct that is not TRUE (FALSE or NULL: the predicate can no longer be
+// TRUE), PostgreSQL's qual-list rule; each AND node charges on entry as in eval, and every other
+// node evaluates as a value (spec/design/cost.md §3).
+func (e *rExpr) evalFilter(row storedRow, env *evalEnv, m *costMeter) (bool, error) {
+	if e.kind != reAnd {
+		v, err := e.eval(row, env, m)
+		return v.IsTrue(), err
+	}
+	if err := m.Guard(); err != nil {
+		return false, err
+	}
+	m.Charge(operatorCost("and"))
+	keep, err := e.lhs.evalFilter(row, env, m)
+	if err != nil || !keep {
+		return false, err
+	}
+	return e.rhs.evalFilter(row, env, m)
 }
 
 func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
@@ -2483,7 +2504,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		m.Charge(costs.OperatorEval)
 		return dateClockValue(env.exec, env.rng, m, e.cInt)
 	case reCase:
-		// CASE is the ONE deliberate exception to "no short-circuit" (cost.md §3): conditions are
+		// CASE is a sanctioned short-circuit (cost.md §3), like AND / OR and COALESCE: conditions are
 		// evaluated in order and evaluation STOPS at the first TRUE — a FALSE or NULL/UNKNOWN
 		// condition falls through, and later arms (and their results) are NOT evaluated. Required
 		// for PG semantics (e.g. `CASE WHEN a=0 THEN 0 ELSE 1/a END` must not divide by zero).

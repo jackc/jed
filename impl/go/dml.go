@@ -279,11 +279,11 @@ func indexRowQualifies(rindex *resolvedIndex, row storedRow, env *evalEnv) (bool
 	if rindex.Predicate == nil {
 		return true, nil
 	}
-	v, err := rindex.Predicate.eval(row, env, env.exec.session.scratchMeter())
+	v, err := rindex.Predicate.evalFilter(row, env, env.exec.session.scratchMeter())
 	if err != nil {
 		return false, err
 	}
-	return v.IsTrue(), nil
+	return v, nil
 }
 
 // indexEntryKeys returns the index entries a row contributes (spec/design/gin.md §4/§5): exactly
@@ -2381,11 +2381,11 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 		// An optional WHERE that is not TRUE skips the update (existing row unchanged, not
 		// returned) — but the arbiter key was already proposed, so a second row still trips §4.
 		if plan.filter != nil {
-			v, err := plan.filter.eval(combined, env, meter)
+			v, err := plan.filter.evalFilter(combined, env, meter)
 			if err != nil {
 				return 0, nil, err
 			}
-			if !v.IsTrue() {
+			if !v {
 				continue
 			}
 		}

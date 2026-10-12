@@ -239,11 +239,11 @@ func (db *engine) execVectorizedAgg(plan *selectPlan, outer []storedRow, params 
 	if plan.filter != nil {
 		survivors = rows[:0]
 		for _, r := range rows {
-			v, ferr := plan.filter.eval(r, env, meter)
+			v, ferr := plan.filter.evalFilter(r, env, meter)
 			if ferr != nil {
 				return emitter{}, ferr
 			}
-			if v.IsTrue() {
+			if v {
 				survivors = append(survivors, r)
 			} else {
 				meter.releaseRowMasked(r, mask)
@@ -424,11 +424,11 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 						scratch[c] = v
 					}
 				}
-				fv, e := plan.filter.eval(scratch, env, meter)
+				fv, e := plan.filter.evalFilter(scratch, env, meter)
 				if e != nil {
 					return e
 				}
-				if !fv.IsTrue() {
+				if !fv {
 					return nil
 				}
 			}
@@ -533,11 +533,11 @@ func filterColumnar(filter *rExpr, cols [][]Value, mask []bool, rowCount int, en
 				scratch[c] = cols[c][i]
 			}
 		}
-		v, err := filter.eval(scratch, env, meter)
+		v, err := filter.evalFilter(scratch, env, meter)
 		if err != nil {
 			return nil, err
 		}
-		if v.IsTrue() {
+		if v {
 			sel = append(sel, int32(i))
 		}
 	}

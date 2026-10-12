@@ -71,7 +71,7 @@ func TestMaskedWideFixedWidthMatchesResident(t *testing.T) {
 		"SELECT id FROM w WHERE c7 < 8",
 		"SELECT c6 FROM w WHERE c4 IS NULL",
 		"SELECT c2 FROM w WHERE c5 IS NOT NULL",
-		"SELECT c1 FROM w WHERE c0 > 5 AND c7 < 9",    // AND predicate — every node charged per row (no short-circuit)
+		"SELECT c1 FROM w WHERE c0 > 5 AND c7 < 9",    // AND predicate — the WHERE's AND stops at a non-TRUE left conjunct
 		"SELECT c0, c6 FROM w WHERE c7 = 5 OR c7 = 8", // OR predicate, multi-column projection
 		"SELECT c0 FROM w WHERE c0 > 1000",            // empty selection vector — zero survivors
 		"SELECT id FROM w WHERE id > 0",               // full selection vector — every row survives

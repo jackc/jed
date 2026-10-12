@@ -141,11 +141,11 @@ func (db *engine) scanBlockingRel(p *selectPlan, i int, env *evalEnv, m *costMet
 		}
 		// The relation's pushed WHERE conjuncts (planner.md §3.2), exactly as materializeRel runs them.
 		if pushed != nil {
-			v, err := pushed.eval(row, env, m)
+			v, err := pushed.evalFilter(row, env, m)
 			if err != nil {
 				return false, err
 			}
-			if !v.IsTrue() {
+			if !v {
 				return true, nil
 			}
 		}
@@ -337,11 +337,11 @@ func (db *engine) execBoundedBlockingLane(p *selectPlan, env *evalEnv, m *costMe
 	filtered := own.spool()
 	err := rows.each(func(row storedRow) error {
 		if p.postJoinFilter() != nil {
-			v, err := p.postJoinFilter().eval(row, env, m)
+			v, err := p.postJoinFilter().evalFilter(row, env, m)
 			if err != nil {
 				return err
 			}
-			if !v.IsTrue() {
+			if !v {
 				return nil
 			}
 		}
@@ -367,11 +367,11 @@ func (db *engine) execBoundedBlockingLane(p *selectPlan, env *evalEnv, m *costMe
 		if p.having != nil {
 			kept := own.spool()
 			err := rows.each(func(row storedRow) error {
-				v, err := p.having.eval(row, env, m)
+				v, err := p.having.evalFilter(row, env, m)
 				if err != nil {
 					return err
 				}
-				if v.IsTrue() {
+				if v {
 					return kept.push(row)
 				}
 				return nil
@@ -673,11 +673,11 @@ func (db *engine) blockingJoinSteps(p *selectPlan, inputs []*rowSpool, env *eval
 				copy(combined[offset:], right)
 				for _, onIndex := range onIndices {
 					if on := p.joinOn(onIndex); on != nil {
-						v, err := on.eval(combined, env, m)
+						v, err := on.evalFilter(combined, env, m)
 						if err != nil {
 							return err
 						}
-						if !v.IsTrue() {
+						if !v {
 							return nil
 						}
 					}
@@ -825,23 +825,23 @@ func (db *engine) boundedJoinTopN(p *selectPlan, own *blockingOwner, env *evalEn
 				copy(combined[innerOffset:], right)
 				for _, i := range onIndices {
 					if on := p.joinOn(i); on != nil {
-						v, err := on.eval(combined, env, m)
+						v, err := on.evalFilter(combined, env, m)
 						if err != nil {
 							return err
 						}
-						if !v.IsTrue() {
+						if !v {
 							return nil
 						}
 					}
 				}
 				if p.postJoinFilter() != nil {
 					before := m.Accrued
-					v, err := p.postJoinFilter().eval(combined, env, m)
+					v, err := p.postJoinFilter().evalFilter(combined, env, m)
 					filterWork += m.Accrued - before
 					if err != nil {
 						return err
 					}
-					if !v.IsTrue() {
+					if !v {
 						return nil
 					}
 				}

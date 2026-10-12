@@ -498,11 +498,11 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 			if at >= 0 {
 				c.ahead.setRow(c.ahead.filter, at, c.env, c.meter)
 			}
-			v, err := c.plan.filter.eval(row, filterEnv, c.meter)
+			v, err := c.plan.filter.evalFilter(row, filterEnv, c.meter)
 			if err != nil {
 				return nil, false, err
 			}
-			if !v.IsTrue() {
+			if !v {
 				continue
 			}
 		}
@@ -970,12 +970,12 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 				ra.setRow(ra.filter, at, env, meter)
 			}
 			before := meter.Accrued
-			v, err := plan.filter.eval(row, filterEnv, meter)
+			v, err := plan.filter.evalFilter(row, filterEnv, meter)
 			filterWork += meter.Accrued - before
 			if err != nil {
 				return false, err
 			}
-			if !v.IsTrue() {
+			if !v {
 				return true, nil
 			}
 		}
@@ -1332,12 +1332,12 @@ func (db *engine) execWindowTopN(plan *selectPlan, env *evalEnv, meter *costMete
 			}
 			if plan.filter != nil {
 				before := meter.Accrued
-				v, err := plan.filter.eval(row, env, meter)
+				v, err := plan.filter.evalFilter(row, env, meter)
 				filterWork += meter.Accrued - before
 				if err != nil {
 					return false, err
 				}
-				if !v.IsTrue() {
+				if !v {
 					return true, nil
 				}
 			}
@@ -1437,12 +1437,12 @@ func (db *engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *
 			}
 			if plan.filter != nil {
 				before := meter.Accrued
-				v, err := plan.filter.eval(row, env, meter)
+				v, err := plan.filter.evalFilter(row, env, meter)
 				filterWork += meter.Accrued - before
 				if err != nil {
 					return false, err
 				}
-				if !v.IsTrue() {
+				if !v {
 					return true, nil
 				}
 			}
@@ -1555,12 +1555,12 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 				keep := true
 				if plan.filter != nil {
 					before := meter.Accrued
-					v, err := plan.filter.eval(row, env, meter)
+					v, err := plan.filter.evalFilter(row, env, meter)
 					filterWork += meter.Accrued - before
 					if err != nil {
 						return false, err
 					}
-					keep = v.IsTrue()
+					keep = v
 				}
 				if keep {
 					// Sort state holds only the touched columns (memory.md §6.1).
@@ -1627,12 +1627,12 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 				keep := true
 				if plan.filter != nil {
 					before := meter.Accrued
-					v, err := plan.filter.eval(row, env, meter)
+					v, err := plan.filter.evalFilter(row, env, meter)
 					filterWork += meter.Accrued - before
 					if err != nil {
 						return false, err
 					}
-					keep = v.IsTrue()
+					keep = v
 				}
 				if keep {
 					survivorCount++
@@ -1829,23 +1829,23 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 				combined := combinePhysicalRelationRows(plan, outerOrdinal, left, innerOrdinal, right)
 				// INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).
 				if on != nil {
-					v, err := on.eval(combined, env, meter)
+					v, err := on.evalFilter(combined, env, meter)
 					if err != nil {
 						return selectResult{}, err
 					}
-					if !v.IsTrue() {
+					if !v {
 						continue
 					}
 				}
 				// The residual WHERE over the combined row (per surviving pair).
 				if plan.postJoinFilter() != nil {
 					before = meter.Accrued
-					v, err := plan.postJoinFilter().eval(combined, env, meter)
+					v, err := plan.postJoinFilter().evalFilter(combined, env, meter)
 					filterWork += meter.Accrued - before
 					if err != nil {
 						return selectResult{}, err
 					}
-					if !v.IsTrue() {
+					if !v {
 						continue
 					}
 				}
@@ -1973,11 +1973,11 @@ func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *c
 					if on == nil {
 						continue
 					}
-					v, err := on.eval(combined, env, meter)
+					v, err := on.evalFilter(combined, env, meter)
 					if err != nil {
 						return selectResult{}, err
 					}
-					if !v.IsTrue() {
+					if !v {
 						keep = false
 						break
 					}
@@ -1987,12 +1987,12 @@ func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *c
 				}
 				if plan.postJoinFilter() != nil {
 					before := meter.Accrued
-					v, err := plan.postJoinFilter().eval(combined, env, meter)
+					v, err := plan.postJoinFilter().evalFilter(combined, env, meter)
 					filterWork += meter.Accrued - before
 					if err != nil {
 						return selectResult{}, err
 					}
-					if !v.IsTrue() {
+					if !v {
 						continue
 					}
 				}
@@ -2086,11 +2086,11 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
 	kept := rows[:0]
 	for _, row := range rows {
-		v, err := pushed.eval(row, env, meter)
+		v, err := pushed.evalFilter(row, env, meter)
 		if err != nil {
 			return nil, err
 		}
-		if v.IsTrue() {
+		if v {
 			kept = append(kept, row)
 		} else {
 			meter.releaseRowMasked(row, plan.relMasks[ri])
@@ -2379,11 +2379,11 @@ func (db *engine) materializeRelRows(plan *selectPlan, ri int, params []Value, o
 			break
 		}
 		if pushed != nil {
-			v, err := pushed.eval(row, env, meter)
+			v, err := pushed.evalFilter(row, env, meter)
 			if err != nil {
 				return nil, err
 			}
-			if !v.IsTrue() {
+			if !v {
 				continue
 			}
 		}

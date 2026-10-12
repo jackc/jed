@@ -147,11 +147,11 @@ func (db *engine) execCostedTwoRelationJoin(plan *selectPlan, env *evalEnv, mete
 		for _, innerRow := range candidates {
 			combined := combinePhysicalRelationRows(plan, outerOrdinal, outerRow, innerOrdinal, innerRow)
 			if on != nil {
-				v, err := on.eval(combined, env, meter)
+				v, err := on.evalFilter(combined, env, meter)
 				if err != nil {
 					return nil, err
 				}
-				if !v.IsTrue() {
+				if !v {
 					continue
 				}
 			}
@@ -241,11 +241,11 @@ func (db *engine) execCostedNWayJoin(plan *selectPlan, env *evalEnv, meter *cost
 					if predicate == nil {
 						continue
 					}
-					v, err := predicate.eval(combined, env, meter)
+					v, err := predicate.evalFilter(combined, env, meter)
 					if err != nil {
 						return nil, err
 					}
-					if !v.IsTrue() {
+					if !v {
 						keep = false
 						break
 					}
@@ -687,11 +687,11 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 						combined = append(combined, right...)
 						keep := true
 						if on != nil {
-							v, err := on.eval(combined, env, meter)
+							v, err := on.evalFilter(combined, env, meter)
 							if err != nil {
 								return emitter{}, err
 							}
-							keep = v.IsTrue()
+							keep = v
 						}
 						if keep {
 							if err := meter.admitRowMasked(combined, memMask); err != nil {
@@ -740,11 +740,11 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 						combined = append(combined, right...)
 						keep := true
 						if on != nil {
-							v, err := on.eval(combined, env, meter)
+							v, err := on.evalFilter(combined, env, meter)
 							if err != nil {
 								return emitter{}, err
 							}
-							keep = v.IsTrue()
+							keep = v
 						}
 						if keep {
 							if err := meter.admitRowMasked(combined, memMask); err != nil {
@@ -791,11 +791,11 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 						combined := make(storedRow, 0, len(left)+len(right))
 						combined = append(combined, left...)
 						combined = append(combined, right...)
-						v, err := on.eval(combined, env, meter)
+						v, err := on.evalFilter(combined, env, meter)
 						if err != nil {
 							return emitter{}, err
 						}
-						if v.IsTrue() {
+						if v {
 							if err := meter.admitRowMasked(combined, memMask); err != nil {
 								return emitter{}, err
 							}
@@ -828,11 +828,11 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					combined = append(combined, right...)
 					keep := true
 					if on != nil {
-						v, err := on.eval(combined, env, meter)
+						v, err := on.evalFilter(combined, env, meter)
 						if err != nil {
 							return emitter{}, err
 						}
-						keep = v.IsTrue()
+						keep = v
 					}
 					if keep {
 						if err := meter.admitRowMasked(combined, memMask); err != nil {
@@ -918,11 +918,11 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	for _, row := range running {
 		keep := true
 		if filter != nil {
-			v, err := filter.eval(row, env, meter)
+			v, err := filter.evalFilter(row, env, meter)
 			if err != nil {
 				return emitter{}, err
 			}
-			keep = v.IsTrue()
+			keep = v
 		}
 		if keep {
 			rows = append(rows, row)
@@ -1261,11 +1261,11 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		if plan.having != nil {
 			kept := groupRows[:0:0]
 			for _, srow := range groupRows {
-				v, herr := plan.having.eval(srow, env, meter)
+				v, herr := plan.having.evalFilter(srow, env, meter)
 				if herr != nil {
 					return emitter{}, herr
 				}
-				if v.IsTrue() {
+				if v {
 					kept = append(kept, srow)
 				} else {
 					meter.releaseRow(srow)
