@@ -10,15 +10,10 @@
 // target relation carries the top layer, so a name binds to the view's column (a layered
 // resolution). An updatable column resolves to the base column itself; a read-only one to its
 // select item, resolved in the view body's isolated scope at the depth of the reference. The views'
-// WHERE clauses resolve the same way and run as stages ahead of the statement's own.
+// WHERE clauses resolve the same way and are AND-ed ahead of the statement's own.
 
 import type { Expr } from "./ast.ts";
 import type { Column } from "./catalog.ts";
-import type { Meter } from "./cost.ts";
-import { evalExpr, evalFilter } from "./eval.ts";
-import type { EvalEnv, RExpr } from "./executor.ts";
-import type { Row } from "./storage.ts";
-import { isTrue } from "./value.ts";
 
 // WriteKind is the statement kind a write through a view performs.
 export type WriteKind = "insert" | "update" | "delete";
@@ -92,22 +87,4 @@ export function renamedNames(names: string[], list: string[] | undefined): strin
     for (let i = 0; i < list.length && i < out.length; i++) out[i] = list[i]!;
   }
   return out;
-}
-
-// evalWriteFilter evaluates a write's complete WHERE on one row (views.md §15.2). Its top `stages`
-// AND nodes join stages: each view's WHERE, then the statement's, in order, and a row a stage does
-// not keep is not evaluated by the stages after it — the order in which the conditions apply when
-// the view is read. The joining nodes perform no AND and charge nothing; every other node evaluates
-// (and charges) as usual.
-export function evalWriteFilter(
-  f: RExpr,
-  stages: number,
-  row: Row,
-  env: EvalEnv,
-  m: Meter,
-): boolean {
-  if (stages === 0) return evalFilter(f, row, env, m);
-  if (f.kind !== "and") throw new Error("a staged write filter joins its stages with AND");
-  if (!evalWriteFilter(f.lhs, stages - 1, row, env, m)) return false;
-  return evalFilter(f.rhs, row, env, m);
 }

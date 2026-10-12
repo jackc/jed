@@ -480,7 +480,6 @@ import {
   type WriteKind,
   type WriteLayer,
   columnRefPosition,
-  evalWriteFilter,
   renamedNames,
   viewsBottomUp,
   writeVerb,
@@ -4835,7 +4834,7 @@ export class Engine {
   ): RExpr | null {
     const scope = Scope.writeTarget(this, table, vw);
     scope.ctes = bindings;
-    return this.resolveWriteFilter(scope, table, vw, where, new ParamTypes()).filter;
+    return this.resolveWriteFilter(scope, table, vw, where, new ParamTypes());
   }
 
   // renderDmlScan emits the residual Filter (when present) and the target Scan for an UPDATE/DELETE,
@@ -11599,7 +11598,7 @@ export class Engine {
     const scope = Scope.writeTarget(this, table, vw);
     scope.ctes = ctx.bindings;
     const ptypes = new ParamTypes();
-    let { filter, stages } = this.resolveWriteFilter(scope, table, vw, del.filter, ptypes);
+    let filter = this.resolveWriteFilter(scope, table, vw, del.filter, ptypes);
     const ret =
       del.returning !== null
         ? this.resolveReturning(table, del.returning, true, ctx.bindings, ptypes, vw)
@@ -11701,7 +11700,7 @@ export class Engine {
       // touched set the block above charged (large-values.md §14).
       const row = store.resolveColumns(e.row, mask);
       const beforeFilter = meter.accrued;
-      let keep = filter === null || evalWriteFilter(filter, stages, row, env, meter);
+      let keep = filter === null || evalFilter(filter, row, env, meter);
       filterActual += meter.accrued - beforeFilter;
       if (del.fkTarget !== undefined) keep = fkKeyedMatch(del.fkTarget, row) !== null;
       if (keep) {
@@ -11927,7 +11926,7 @@ export class Engine {
     // keeps every storage key in place — the in-place fast path (writeStore.replace).
     const pkChanged = pkMembers.length > 0 && plans.some((p) => pkMembers.includes(p.idx));
 
-    let { filter, stages } = this.resolveWriteFilter(scope, table, vw, upd.filter, ptypes);
+    let filter = this.resolveWriteFilter(scope, table, vw, upd.filter, ptypes);
     // The RETURNING projection resolves last (PostgreSQL's analysis order), against the same
     // one-relation scope; it evaluates each matched row's NEW values (grammar.md §32).
     const ret =
@@ -12039,7 +12038,7 @@ export class Engine {
       const filtered = store.resolveColumns(e.row, mask);
       if (filter !== null) {
         const beforeFilter = meter.accrued;
-        const keep = evalWriteFilter(filter, stages, filtered, env, meter);
+        const keep = evalFilter(filter, filtered, env, meter);
         filterActual += meter.accrued - beforeFilter;
         if (!keep) continue;
       }
@@ -13349,21 +13348,18 @@ export class Engine {
   }
 
   // resolveWriteFilter resolves the complete WHERE of a write (views.md §15.2): every view's WHERE,
-  // the one nearest the table first, then the statement's own, AND-ed left-deep, with the number of
-  // those AND nodes, from the top, that join a stage (evalWriteFilter). Each view's WHERE resolves in
-  // its body's isolated scope over the base row. The complete tree is what access-path selection,
-  // estimation, and EXPLAIN read.
+  // the one nearest the table first, then the statement's own, AND-ed left-deep — the WHERE of the
+  // equivalent base statement, a filter whose top-level AND chain stops at the first conjunct that is
+  // not TRUE (cost.md §3). Each view's WHERE resolves in its body's isolated scope over the base row.
   resolveWriteFilter(
     scope: Scope,
     table: Table,
     vw: ViewWrite | null,
     user: Expr | null,
     ptypes: ParamTypes,
-  ): { filter: RExpr | null; stages: number } {
+  ): RExpr | null {
     let filter: RExpr | null = null;
-    let parts = 0;
     const join = (node: RExpr) => {
-      parts++;
       filter = filter === null ? node : { kind: "and", lhs: filter, rhs: node };
     };
     if (vw !== null) {
@@ -13374,7 +13370,7 @@ export class Engine {
       }
     }
     if (user !== null) join(resolveBooleanFilter(scope, user, ptypes));
-    return { filter, stages: Math.max(parts - 1, 0) };
+    return filter;
   }
 
   // rewriteInsertTarget retargets an INSERT through an updatable view at its base table (views.md
