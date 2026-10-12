@@ -46,13 +46,16 @@ test('the types page autoruns the runtime text → number/boolean cast demo', as
 test('the types page autoruns the varchar(n) truncation demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
   // The varchar(n) demo: 'hello world'::varchar(5) truncates to 'hello', 'café'
-  // fits varchar(4) by code point, 'ok' is within varchar(8).
+  // fits varchar(4) by code point, 'ok' is within varchar(8), and the two-word
+  // 'jedi'::character varying(3) truncates to 'jed'.
   const varcharPanel = livePanel(page, 'varcharDemo');
   const rows = varcharPanel.getByTestId('result-rows');
   await expect(rows).toContainText('hello');
   await expect(rows).not.toContainText('hello world');
   await expect(rows).toContainText('café');
   await expect(rows).toContainText('ok');
+  await expect(rows).toContainText('jed');
+  await expect(rows).not.toContainText('jedi');
 });
 
 test('the types page autoruns the uuid ⇄ text/bytea cast demo', async ({ page }) => {

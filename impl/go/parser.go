@@ -1208,7 +1208,7 @@ func (p *parser) parseColumnDef(tableName string, checks *[]checkDef, uniques *[
 	if err != nil {
 		return columnDef{}, err
 	}
-	typeName, err := p.expectIdentifier()
+	typeName, err := p.expectTypeName()
 	if err != nil {
 		return columnDef{}, err
 	}
@@ -1673,7 +1673,7 @@ func (p *parser) parseJSONReturning() (*string, error) {
 		return nil, nil
 	}
 	p.advance() // RETURNING
-	ty, err := p.expectIdentifier()
+	ty, err := p.expectTypeName()
 	if err != nil {
 		return nil, err
 	}
@@ -1853,7 +1853,7 @@ func (p *parser) parseFieldDefList() ([]typeFieldDef, error) {
 		if err != nil {
 			return nil, err
 		}
-		typeName, err := p.expectIdentifier()
+		typeName, err := p.expectTypeName()
 		if err != nil {
 			return nil, err
 		}
@@ -2008,7 +2008,7 @@ loop:
 				return seqOptions{}, nil, err
 			}
 			p.advance()
-			name, err := p.expectIdentifier()
+			name, err := p.expectTypeName()
 			if err != nil {
 				return seqOptions{}, nil, err
 			}
@@ -2422,7 +2422,7 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 }
 
 func (p *parser) parseAlterColumnType(a *alterColumnAction) error {
-	base, err := p.expectIdentifier()
+	base, err := p.expectTypeName()
 	if err != nil {
 		return err
 	}
@@ -3882,7 +3882,7 @@ func (p *parser) parseJtColumn() (jtColumn, error) {
 		return &jtColumnOrdinality{Name: name}, nil
 	}
 	// `name type …` — parse the type name + optional `[]`.
-	typeName, err := p.expectIdentifier()
+	typeName, err := p.expectTypeName()
 	if err != nil {
 		return nil, err
 	}
@@ -5352,7 +5352,7 @@ func (p *parser) parsePostfix() (exprNode, error) {
 			fieldAccessible = false
 		case p.peek().Kind == tokDoubleColon:
 			p.advance()
-			typeName, err := p.expectIdentifier()
+			typeName, err := p.expectTypeName()
 			if err != nil {
 				return exprNode{}, err
 			}
@@ -5590,7 +5590,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		if err := p.expectKeyword("as"); err != nil {
 			return exprNode{}, err
 		}
-		typeName, err := p.expectIdentifier()
+		typeName, err := p.expectTypeName()
 		if err != nil {
 			return exprNode{}, err
 		}
@@ -5651,6 +5651,15 @@ func (p *parser) parsePrimary() (exprNode, error) {
 	// literals). The type name is resolved (and the string coerced to it) at resolve; unknown → 42704.
 	if t0 := p.peek(); isIdentKind(t0.Kind) && !(t0.Kind == tokWord && (t0.Word == "null" || t0.Word == "true" || t0.Word == "false")) && p.peekKindAt(1) == tokStr {
 		name := p.advance().Word // the named type (folded or quoted; resolved byte-exactly)
+		t := p.advance()
+		return exprNode{Kind: exprTypedLiteral, TypeLitName: name, TypeLitText: t.Word}, nil
+	}
+	// The two-word `character varying '...'` typed literal (types.md §15).
+	if p.peekKeyword() == "character" && p.peekKeywordAt(1) == "varying" && p.peekKindAt(2) == tokStr {
+		name, err := p.expectTypeName()
+		if err != nil {
+			return exprNode{}, err
+		}
 		t := p.advance()
 		return exprNode{Kind: exprTypedLiteral, TypeLitName: name, TypeLitText: t.Word}, nil
 	}
@@ -6433,6 +6442,22 @@ func (p *parser) expectKeyword(kw string) error {
 		return nil
 	}
 	return newError(SyntaxError, fmt.Sprintf("expected keyword '%s'", kw))
+}
+
+// expectTypeName consumes a type name in any type position (column/field definition, ALTER … TYPE,
+// CAST, `::`, a typed literal, RETURNING, a JSON_TABLE column, CREATE SEQUENCE … AS): an identifier,
+// or PostgreSQL's two-word `character varying` (types.md §15). The two-word form is recognized only
+// as two bare words — `character` then `varying` (a quoted word is an ordinary identifier) — and
+// returns the alias "character varying", which the catalog resolves to text exactly like varchar.
+// Any other `character` stays a one-word name (unknown type → 42704 at resolve). A CLAUDE.md §8
+// cross-core determinism surface (spec/design/grammar.md §14).
+func (p *parser) expectTypeName() (string, error) {
+	if p.peekKeyword() == "character" && p.peekKeywordAt(1) == "varying" {
+		p.advance() // CHARACTER
+		p.advance() // VARYING
+		return "character varying", nil
+	}
+	return p.expectIdentifier()
 }
 
 // expectIdentifier consumes the current token, requiring it to be an identifier — a bare word

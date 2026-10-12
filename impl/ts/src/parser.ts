@@ -1151,7 +1151,7 @@ class Parser {
     fks: ForeignKeyDef[],
   ): ColumnDef {
     const name = this.expectIdentifier();
-    const baseType = this.expectIdentifier();
+    const baseType = this.expectTypeName();
     const typeMod = this.parseTypeMod();
     const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
     // Zero or more order-free column constraints: PRIMARY KEY, NOT NULL, DEFAULT <literal>,
@@ -1474,7 +1474,7 @@ class Parser {
     const fields: TypeFieldDef[] = [];
     for (;;) {
       const fname = this.expectIdentifier();
-      const baseType = this.expectIdentifier();
+      const baseType = this.expectTypeName();
       const typeMod = this.parseTypeMod();
       // An array-typed field (`xs i32[]`) — the same `[]` suffix a column type takes
       // (spec/design/array.md §12); the canonical spelling carries the brackets.
@@ -1585,7 +1585,7 @@ class Parser {
         case "as": {
           this.dupCheck(seq.dataType !== null, "AS");
           this.advance();
-          seq.dataType = this.expectIdentifier();
+          seq.dataType = this.expectTypeName();
           break;
         }
         case "increment": {
@@ -1884,7 +1884,7 @@ class Parser {
   }
 
   private parseAlterColumnType(): Extract<AlterColumnAction["action"], { kind: "setType" }> {
-    let typeName = this.expectIdentifier();
+    let typeName = this.expectTypeName();
     const typeMod = this.parseTypeMod();
     if (this.consumeArrayBrackets()) typeName += "[]";
     let using: Expr | null = null;
@@ -3273,7 +3273,7 @@ class Parser {
       return { kind: "ordinality", name };
     }
     // `name type …` — parse the type name + optional `[]`.
-    const typeName = this.expectIdentifier();
+    const typeName = this.expectTypeName();
     let array = false;
     if (this.peek().kind === "lbracket") {
       this.advance();
@@ -4110,7 +4110,7 @@ class Parser {
         fieldAccessible = false;
       } else if (k === "doubleColon") {
         this.advance();
-        const baseType = this.expectIdentifier();
+        const baseType = this.expectTypeName();
         const typeMod = this.parseTypeMod();
         const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
         expr = { kind: "cast", inner: expr, typeName, typeMod };
@@ -4278,6 +4278,16 @@ class Parser {
       const t = this.advance();
       return { kind: "typedLiteral", typeName, text: t.str! };
     }
+    // The two-word `character varying '...'` typed literal (types.md §15).
+    if (
+      tlKw === "character" &&
+      this.peekKeywordAt(1) === "varying" &&
+      this.tokens[this.pos + 2]?.kind === "str"
+    ) {
+      const typeName = this.expectTypeName();
+      const t = this.advance();
+      return { kind: "typedLiteral", typeName, text: t.str! };
+    }
     // The SQL/JSON query functions `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY`
     // (json-sql-functions.md §5, S2) — keyword-led primaries with sub-clauses, recognized when the
     // keyword is immediately followed by `(` (so the words stay usable as identifiers otherwise).
@@ -4345,7 +4355,7 @@ class Parser {
       this.expect("lparen");
       const inner = this.parseExpr();
       this.expectKeyword("as");
-      const baseType = this.expectIdentifier();
+      const baseType = this.expectTypeName();
       const typeMod = this.parseTypeMod();
       const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
       this.expect("rparen");
@@ -4812,7 +4822,7 @@ class Parser {
   private parseJsonReturning(): string | null {
     if (this.peekKeyword() !== "returning") return null;
     this.advance(); // RETURNING
-    const ty = this.expectIdentifier();
+    const ty = this.expectTypeName();
     this.skipFormatJson();
     return ty;
   }
@@ -5042,6 +5052,22 @@ class Parser {
     const t = this.advance();
     if (t.kind === "word" && t.word! === kw) return;
     throw engineError("syntax_error", `expected keyword '${kw}'`);
+  }
+
+  // expectTypeName consumes a type name in any type position (column/field definition, ALTER …
+  // TYPE, CAST, `::`, a typed literal, RETURNING, a JSON_TABLE column, CREATE SEQUENCE … AS): an
+  // identifier, or PostgreSQL's two-word `character varying` (types.md §15). The two-word form is
+  // recognized only as two bare words — `character` then `varying` (a quoted word is an ordinary
+  // identifier) — and returns the alias "character varying", which the catalog resolves to text
+  // exactly like varchar. Any other `character` stays a one-word name (unknown type → 42704 at
+  // resolve). A CLAUDE.md §8 cross-core determinism surface (spec/design/grammar.md §14).
+  private expectTypeName(): string {
+    if (this.peekKeyword() === "character" && this.peekKeywordAt(1) === "varying") {
+      this.advance(); // CHARACTER
+      this.advance(); // VARYING
+      return "character varying";
+    }
+    return this.expectIdentifier();
   }
 
   // expectIdentifier consumes an identifier — a bare word (folded) or a quoted identifier (exact) —

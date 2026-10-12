@@ -416,7 +416,13 @@ alter_sequence_option ::= sequence_option | "RESTART" ("WITH"? signed_integer)?
  * with 1 <= p <= 1000 and 0 <= s <= p (a bad typmod traps 22023; ../design/grammar.md).
  * A typmod on a non-decimal type, or empty parens `numeric()`, is a 42601 syntax error.
  * type_name appears in a column_def and in CAST(expr AS type_name). */
-type_name      ::= identifier ("(" integer ("," integer)? ")")?
+type_name      ::= type_word ("(" integer ("," integer)? ")")?
+/* The one two-word type name: PostgreSQL's "character varying" (two BARE words — a quoted
+ * "character" is an ordinary identifier), the alias of text/varchar, so `character varying(n)` is
+ * varchar(n) (../design/types.md §15). Every type position (column/field definition, ALTER … TYPE,
+ * CAST, `::`, a typed literal, JSON RETURNING, a JSON_TABLE column, CREATE SEQUENCE … AS) reads
+ * type_word. ../design/grammar.md §14. */
+type_word      ::= "character" "varying" | identifier
 
 /* --- DML ----------------------------------------------------------------- */
 
@@ -1142,7 +1148,7 @@ primary        ::= number
  * literal — typmod rides only on CAST). For the native-syntax types (integer/decimal/boolean) the
  * coercion matches jed's OWN literal grammar, not PG's extras (no hex/underscore/scientific/NaN —
  * documented §36 divergences). */
-typed_literal  ::= identifier string
+typed_literal  ::= type_word string
 
 /* A bind parameter — "$" followed by a 1-based decimal index ($1, $2, …). NOT part of
  * the conformance corpus (which is literal-only, ../design/conformance.md §1.2): a

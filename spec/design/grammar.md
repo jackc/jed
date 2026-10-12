@@ -743,11 +743,23 @@ the point (`0 ≤ s ≤ p`); an out-of-range or malformed typmod — `numeric(0)
 `numeric(5,7)` — traps **`22023`** (`invalid_parameter_value`,
 [../errors/registry.toml](../errors/registry.toml)), PostgreSQL's SQLSTATE. The grammar
 accepts the typmod shape on *any* type name (one production, §6); a typmod on a type that
-takes none (`i32(5)`, `text(10)`) is a resolve-time error this slice (`0A000` — `varchar(n)`
-length limits and other parameterized types are deferred, [types.md](types.md) §11). The
+takes none (`i32(5)`) is a resolve-time error (`0A000`; `text`'s `varchar(n)` length limit is the
+second parameterized type, [types.md](types.md) §15). The
 limits, the p/s interaction (integer-part digits ≤ `p − s`), and the rounding-on-coercion rule
 are the type system's, detailed in [decimal.md](decimal.md) §2–3; the grammar fixes only that
-the *syntax* is `identifier "(" integer ("," integer)? ")"`.
+the *syntax* is `type_word "(" integer ("," integer)? ")"`.
+
+**The two-word `character varying`** ([grammar.ebnf](../grammar/grammar.ebnf) `type_word`). A type
+name is one identifier, with exactly one exception: PostgreSQL's `character varying`, the alias of
+`text` ([types.md](types.md) §15), so `character varying(n)` is `varchar(n)`. Every type position
+— a column or composite-field definition, `ALTER COLUMN … TYPE`, `CAST(… AS …)`, `::`, a typed
+literal (`character varying 'x'`, recognized by a two-token lookahead to the string), a SQL/JSON
+`RETURNING`, a `JSON_TABLE` column, and `CREATE SEQUENCE … AS` — reads it the same way: the bare
+word `character` immediately followed by the bare word `varying` (either case) is the one name
+`character varying`. A quoted `"character"` is an ordinary identifier, so `"character" varying`
+leaves `varying` as stray input (`42601`). A `character` not followed by `varying` stays a one-word
+name, which no type has (`42704` at resolve; the blank-padded `char(n)` / `character(n)` is out of
+scope). This two-token lookahead is a §8 determinism surface the three parsers match exactly.
 
 ## 15. Multi-table `FROM` and `JOIN`
 

@@ -1014,7 +1014,7 @@ impl Parser {
         foreign_keys: &mut Vec<ForeignKeyDef>,
     ) -> Result<ColumnDef> {
         let name = self.expect_identifier()?;
-        let base_type = self.expect_identifier()?;
+        let base_type = self.expect_type_name()?;
         let type_mod = self.parse_type_mod()?;
         let is_array = self.consume_array_brackets()?;
         let type_name = if is_array {
@@ -1420,7 +1420,7 @@ impl Parser {
             return Ok(None);
         }
         self.advance(); // RETURNING
-        let ty = self.expect_identifier()?;
+        let ty = self.expect_type_name()?;
         self.skip_format_json();
         Ok(Some(ty))
     }
@@ -1594,7 +1594,7 @@ impl Parser {
         let mut fields = Vec::new();
         loop {
             let fname = self.expect_identifier()?;
-            let base_type = self.expect_identifier()?;
+            let base_type = self.expect_type_name()?;
             let type_mod = self.parse_type_mod()?;
             // An array-typed field (`xs i32[]`) — the same `[]` suffix a column type takes
             // (spec/design/array.md §1); the canonical spelling carries the brackets.
@@ -1721,7 +1721,7 @@ impl Parser {
                 Some("as") => {
                     self.dup_check(seq.data_type.is_some(), "AS")?;
                     self.advance();
-                    seq.data_type = Some(self.expect_identifier()?);
+                    seq.data_type = Some(self.expect_type_name()?);
                 }
                 Some("increment") => {
                     self.dup_check(seq.increment.is_some(), "INCREMENT")?;
@@ -2108,7 +2108,7 @@ impl Parser {
     }
 
     fn parse_alter_column_type(&mut self) -> Result<AlterColumnKind> {
-        let base = self.expect_identifier()?;
+        let base = self.expect_type_name()?;
         let type_mod = self.parse_type_mod()?;
         let type_name = if self.consume_array_brackets()? {
             format!("{base}[]")
@@ -3555,7 +3555,7 @@ impl Parser {
             return Ok(JtColumn::Ordinality { name });
         }
         // `name type …` — parse the type name + optional `[]`.
-        let type_name = self.expect_identifier()?;
+        let type_name = self.expect_type_name()?;
         let array = if matches!(self.peek(), Token::LBracket) {
             self.advance();
             self.expect(&Token::RBracket)?;
@@ -4673,7 +4673,7 @@ impl Parser {
                 }
                 Token::DoubleColon => {
                     self.advance();
-                    let base_type = self.expect_identifier()?;
+                    let base_type = self.expect_type_name()?;
                     let type_mod = self.parse_type_mod()?;
                     let is_array = self.consume_array_brackets()?;
                     let type_name = if is_array {
@@ -4815,7 +4815,7 @@ impl Parser {
             self.expect(&Token::LParen)?;
             let inner = self.parse_expr()?;
             self.expect_keyword("as")?;
-            let base_type = self.expect_identifier()?;
+            let base_type = self.expect_type_name()?;
             let type_mod = self.parse_type_mod()?;
             let is_array = self.consume_array_brackets()?;
             let type_name = if is_array {
@@ -4926,6 +4926,17 @@ impl Parser {
             && !matches!(self.peek(), Token::Word(w) if matches!(w.as_str(), "null" | "true" | "false"))
         {
             let type_name = self.expect_identifier()?;
+            if let Token::Str(text) = self.advance() {
+                return Ok(Expr::TypedLiteral { type_name, text });
+            }
+            unreachable!("peeked a string literal after the type name");
+        }
+        // The two-word `character varying '...'` typed literal (types.md §15).
+        if self.peek_keyword().as_deref() == Some("character")
+            && self.peek_keyword_at(1).as_deref() == Some("varying")
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::Str(_)))
+        {
+            let type_name = self.expect_type_name()?;
             if let Token::Str(text) = self.advance() {
                 return Ok(Expr::TypedLiteral { type_name, text });
             }
@@ -5596,6 +5607,25 @@ impl Parser {
             Token::Word(w) if w.eq_ignore_ascii_case(kw) => Ok(()),
             other => Err(syntax(format!("expected keyword '{kw}', found {other:?}"))),
         }
+    }
+
+    /// Consume a type name in any type position (column/field definition, `ALTER … TYPE`, `CAST`,
+    /// `::`, a typed literal, `RETURNING`, a `JSON_TABLE` column, `CREATE SEQUENCE … AS`): an
+    /// identifier, or PostgreSQL's two-word `character varying` (types.md §15). The two-word form
+    /// is recognized only as two bare words — `character` then `varying` (a quoted word is an
+    /// ordinary identifier) — and returns the alias `"character varying"`, which the catalog
+    /// resolves to `text` exactly like `varchar`. Any other `character` stays a one-word name
+    /// (unknown type → 42704 at resolve). A CLAUDE.md §8 cross-core determinism surface
+    /// (spec/design/grammar.md §14).
+    fn expect_type_name(&mut self) -> Result<String> {
+        if self.peek_keyword().as_deref() == Some("character")
+            && self.peek_keyword_at(1).as_deref() == Some("varying")
+        {
+            self.advance(); // CHARACTER
+            self.advance(); // VARYING
+            return Ok("character varying".to_string());
+        }
+        self.expect_identifier()
     }
 
     /// Consume the current token, requiring it to be an identifier — a bare word (folded) or a

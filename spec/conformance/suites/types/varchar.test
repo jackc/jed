@@ -139,3 +139,70 @@ query I nosort
 SELECT n FROM k WHERE code = 'beta'
 ----
 2
+
+# --- the two-word `character varying` spelling (types.md §15) ---------------------------------
+# `character varying(n)` is exactly `varchar(n)`; bare `character varying` is unbounded text. The
+# words are keywords, so any case works.
+statement ok
+CREATE TABLE cv (id i32 PRIMARY KEY, s character varying(3), u CHARACTER VARYING)
+
+statement ok
+INSERT INTO cv VALUES (1, 'abc', 'a value with no length limit at all')
+
+statement error 22001
+INSERT INTO cv VALUES (2, 'abcd', 'x')
+
+# the trailing-space exception applies exactly as for varchar(n)
+statement ok
+INSERT INTO cv VALUES (2, 'xy    ', 'y')
+
+query TT nosort
+SELECT s, u FROM cv WHERE id = 1
+----
+abc
+a value with no length limit at all
+
+query I nosort
+SELECT length(s) FROM cv WHERE id = 2
+----
+3
+
+# explicit casts truncate silently, through both `::` and CAST
+query TT nosort
+SELECT 'abcd'::character varying(2), CAST('héllo' AS Character Varying(3))
+----
+ab
+hél
+
+query T nosort
+SELECT 'unbounded'::character varying
+----
+unbounded
+
+# the typed-literal form `character varying '...'`
+query T nosort
+SELECT character varying 'typed'
+----
+typed
+
+# an array of unbounded character varying is text[]
+query T nosort
+SELECT '{a,b}'::character varying[]
+----
+{a,b}
+
+# ALTER COLUMN ... TYPE takes the two-word spelling too
+statement ok
+ALTER TABLE cv ALTER COLUMN u TYPE character varying(40)
+
+statement error 22001
+UPDATE cv SET u = 'this replacement value is far too long for forty' WHERE id = 1
+
+# typmod validation is the same 22023
+statement error 22023
+CREATE TABLE cv_bad (x character varying(0))
+
+# a quoted "character" is an ordinary identifier, never the keyword: the stray `varying` is a
+# syntax error
+statement error 42601
+CREATE TABLE cv_quoted (x "character" varying)

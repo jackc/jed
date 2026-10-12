@@ -36,9 +36,10 @@
   12345::varchar(3)                             AS truncated;`;
 
 	const varcharDemo = `SELECT
-  'hello world'::varchar(5)  AS truncated,
-  'café'::varchar(4)         AS fits_by_codepoint,
-  'ok'::varchar(8)           AS within_limit;`;
+  'hello world'::varchar(5)     AS truncated,
+  'café'::varchar(4)            AS fits_by_codepoint,
+  'ok'::varchar(8)              AS within_limit,
+  'jedi'::character varying(3)  AS two_word;`;
 
 	const uuidCastDemo = `SELECT
   ('550E8400-E29B-41D4-A716-446655440000'::text)::uuid  AS text_to_uuid,
@@ -201,8 +202,8 @@ Unlike PostgreSQL, the cast is **explicit only**: `INSERT INTO t (name) VALUES (
 
 ## varchar(n) length limits
 
-`varchar(n)` (and the jed alias `string(n)`) is `text` with a **maximum length**, counted in Unicode
-**code points** — so `'café'` (4 code points) fits `varchar(4)`. An explicit `CAST` / `::` silently
+`varchar(n)` (also spelled `character varying(n)`, and the jed alias `string(n)`) is `text` with a
+**maximum length**, counted in Unicode **code points** — so `'café'` (4 code points) fits `varchar(4)`. An explicit `CAST` / `::` silently
 **truncates** to `n`, exactly like PostgreSQL, so `'hello world'::varchar(5)` is `'hello'`:
 
 <LiveSql demo="varcharDemo" query={varcharDemo} rows={1} />

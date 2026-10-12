@@ -579,8 +579,7 @@ golden. A text value too large to fit a node (its key cannot spill to overflow) 
   carries a max-length **type modifier** (the second parameterized type after `decimal`), counted
   in **code points**; an over-length assignment traps `22001` (`string_data_right_truncation`),
   while an explicit `::varchar(n)` cast silently truncates (the PostgreSQL split). The two-word
-  `character varying(n)` spelling stays deferred under the existing single-word-type-name parser
-  narrowing.
+  `character varying(n)` spelling is accepted everywhere a type name is (grammar.md §14).
 - **Text ⇄ other casts** (§5), **string functions** (`length`, `lower`/`upper`, `substring`),
   **concatenation `||`**, and **`LIKE`** — separate slices; this slice is comparison + storage
   only (`= < > <= >=`, `IS [NOT] DISTINCT FROM`).
@@ -793,7 +792,8 @@ every other bytea cast is a forbidden pair (`42804`).
 
 ## 15. The `varchar(n)` length limit
 
-`varchar(n)` (and the jed alias `string(n)`) is a `text` column/field/cast-target that carries a
+`varchar(n)` (also PostgreSQL's two-word `character varying(n)` — grammar.md §14 — and the jed
+alias `string(n)`) is a `text` column/field/cast-target that carries a
 **maximum length** — the **second parameterized type** after `decimal(p,s)` (§12), reusing the same
 `type_name "(" integer ")"` grammar (grammar.md §6/§14). The type is still `text` (canonical name
 `text`, type code 4, the `C` collation, the same value codec, comparison, and key encoding — §11);
@@ -830,9 +830,6 @@ value is already truncated/checked before it reaches the codec).
 
 **Deferred sub-features** (relaxable, each its own follow-on):
 
-- **`character varying(n)`** — the two-word PostgreSQL spelling stays deferred under the existing
-  single-word-type-name parser narrowing (§11); `varchar(n)` / `string(n)` are the spellings this
-  slice accepts.
 - **`char(n)` / `character(n)`** — the blank-padded fixed-length string type is out of scope (a
   different storage/compare model); only `varchar(n)` (variable length, max `n`) is implemented.
 - **`varchar(n)[]`** — an array of length-limited text. A type modifier on an array type stays
