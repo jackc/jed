@@ -79,6 +79,7 @@ if let Err(e) = session.run("INSERT INTO users (email) VALUES ($1)", ("a@b.com",
     if e.code() == "23505" {
         // e.g. route the failure back to the offending form field
         eprintln!("duplicate on {:?}", e.constraint_name.as_deref()); // Some("users_email_key")
+        eprintln!("{:?}", e.detail.as_deref()); // Some("Key (email)=(a@b.com) already exists.")
     }
 }
 ```
@@ -89,6 +90,7 @@ _, err := session.Exec(ctx, "INSERT INTO users (email) VALUES ($1)", "a@b.com")
 var ee *jed.EngineError
 if errors.As(err, &ee) && ee.Code() == "23505" {
     fmt.Println("duplicate on", ee.ConstraintName) // users_email_key
+    fmt.Println(ee.Detail)                         // Key (email)=(a@b.com) already exists.
 }
 ```
 
@@ -99,9 +101,26 @@ try {
 } catch (e) {
   if (e instanceof EngineError && e.code() === "23505") {
     console.log("duplicate on", e.constraintName); // users_email_key
+    console.log(e.detail); // Key (email)=(a@b.com) already exists.
   }
 }
 ```
+
+A fifth field, **`detail`** (`Detail` in Go), carries PostgreSQL's DETAIL sentence naming the
+offending values, so you can tell the user _which_ value was the problem without re-querying:
+
+| Error | `detail` |
+|---|---|
+| `23505` unique | `Key (email)=(a@b.com) already exists.` |
+| `23503` foreign key, insert/update side | `Key (customer_id)=(99) is not present in table "customers".` |
+| `23503` foreign key, delete/update side | `Key (id)=(1) is still referenced from table "orders".` |
+| `23P01` exclusion | `Key (span)=([3,7)) conflicts with existing key (span)=([1,5)).` |
+| `23514` check, `23502` not null | `Failing row contains (4, null, -1).` |
+
+Each value is rendered as a `SELECT` would show it, cut to 64 bytes (`...` marks a cut). A session
+that lacks `SELECT` on the table gets no values: the field is absent, or for a foreign key the
+value-free `Key is not present in table "customers".`. Like the other fields, `detail` is never
+part of the rendered message.
 
 The rendered error message is unchanged — these fields are additive metadata alongside it.
 
