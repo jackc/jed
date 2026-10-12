@@ -10,8 +10,8 @@ package jed
 // target relation carries the top layer, so a name binds to the view's column (a layered
 // resolution). An updatable column resolves to the base column itself; a read-only one to its
 // select item, resolved in the view body's isolated scope at the depth of the reference
-// (resolveLayerRef). The views' WHERE clauses resolve the same way and run as stages ahead of the
-// statement's own (resolveWriteFilter, evalWriteFilter).
+// (resolveLayerRef). The views' WHERE clauses resolve the same way and are AND-ed ahead of the
+// statement's own (resolveWriteFilter).
 
 import "fmt"
 
@@ -390,15 +390,12 @@ func (db *engine) planWriteTarget(view *viewDef) (map[string]*valuesPlan, error)
 }
 
 // resolveWriteFilter resolves the complete WHERE of a write (views.md §15.2): every view's WHERE, the
-// one nearest the table first, then the statement's own, AND-ed left-deep, with the number of those
-// AND nodes, from the top, that join a stage (evalWriteFilter). Each view's WHERE resolves in its
-// body's isolated scope over the base row. The complete tree is what access-path selection,
-// estimation, and EXPLAIN read.
-func (db *engine) resolveWriteFilter(s *scope, table *catTable, vw *viewWrite, user *exprNode, ptypes *paramTypes) (*rExpr, int, error) {
+// one nearest the table first, then the statement's own, AND-ed left-deep — the WHERE of the
+// equivalent base statement, a filter whose top-level AND chain stops at the first conjunct that is
+// not TRUE (cost.md §3). Each view's WHERE resolves in its body's isolated scope over the base row.
+func (db *engine) resolveWriteFilter(s *scope, table *catTable, vw *viewWrite, user *exprNode, ptypes *paramTypes) (*rExpr, error) {
 	var out *rExpr
-	parts := 0
 	join := func(node *rExpr) {
-		parts++
 		if out == nil {
 			out = node
 		} else {
@@ -413,7 +410,7 @@ func (db *engine) resolveWriteFilter(s *scope, table *catTable, vw *viewWrite, u
 			ls := layerBodyScope(db, table, 0, layer.belowLabel, layer.below)
 			node, err := resolveBooleanFilter(ls, layer.filter, &paramTypes{})
 			if err != nil {
-				return nil, 0, err
+				return nil, err
 			}
 			join(node)
 		}
@@ -421,42 +418,11 @@ func (db *engine) resolveWriteFilter(s *scope, table *catTable, vw *viewWrite, u
 	if user != nil {
 		node, err := resolveBooleanFilter(s, user, ptypes)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 		join(node)
 	}
-	stages := parts - 1
-	if stages < 0 {
-		stages = 0
-	}
-	return out, stages, nil
-}
-
-// evalWriteFilter evaluates a write's complete WHERE on one row (views.md §15.2). Its top `stages`
-// AND nodes join stages: each view's WHERE, then the statement's, in order, and a row a stage does
-// not keep is not evaluated by the stages after it — the order in which the conditions apply when
-// the view is read. The joining nodes perform no AND and charge nothing; every other node evaluates
-// (and charges) as usual.
-func evalWriteFilter(f *rExpr, stages int, row storedRow, env *evalEnv, m *costMeter) (bool, error) {
-	if stages == 0 {
-		v, err := f.evalFilter(row, env, m)
-		if err != nil {
-			return false, err
-		}
-		return v, nil
-	}
-	if f.kind != reAnd {
-		panic("a staged write filter joins its stages with AND")
-	}
-	keep, err := evalWriteFilter(f.lhs, stages-1, row, env, m)
-	if err != nil || !keep {
-		return false, err
-	}
-	v, err := f.rhs.evalFilter(row, env, m)
-	if err != nil {
-		return false, err
-	}
-	return v, nil
+	return out, nil
 }
 
 // writeTargetScope is the target scope of a write (UPDATE / DELETE): singleScope, or, for a write

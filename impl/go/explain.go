@@ -541,7 +541,7 @@ func (db *engine) explainDelete(r *explainRender, del *deleteStmt, depth int, bi
 func (db *engine) explainDmlFilter(table *catTable, where *exprNode, bindings []*cteBinding, vw *viewWrite) (*rExpr, error) {
 	s := writeTargetScope(db, table, vw)
 	s.ctes = bindings
-	filter, _, err := db.resolveWriteFilter(s, table, vw, where, &paramTypes{})
+	filter, err := db.resolveWriteFilter(s, table, vw, where, &paramTypes{})
 	return filter, err
 }
 

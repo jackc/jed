@@ -3190,7 +3190,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 	s := writeTargetScope(db, table, vw)
 	s.ctes = ctx.bindings
 	ptypes := &paramTypes{}
-	filter, stages, err := db.resolveWriteFilter(s, table, vw, del.Filter, ptypes)
+	filter, err := db.resolveWriteFilter(s, table, vw, del.Filter, ptypes)
 	if err != nil {
 		return outcome{}, err
 	}
@@ -3311,7 +3311,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 		keep := true
 		if filter != nil {
 			beforeFilter := meter.Accrued
-			k, err := evalWriteFilter(filter, stages, row, env, meter)
+			k, err := filter.evalFilter(row, env, meter)
 			if err != nil {
 				return outcome{}, err
 			}
@@ -3556,7 +3556,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 		return slices.Contains(pkMembers, p.idx)
 	})
 
-	filter, stages, err := db.resolveWriteFilter(s, table, vw, upd.Filter, ptypes)
+	filter, err := db.resolveWriteFilter(s, table, vw, upd.Filter, ptypes)
 	if err != nil {
 		return outcome{}, err
 	}
@@ -3702,7 +3702,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 		}
 		if filter != nil {
 			beforeFilter := meter.Accrued
-			matched, err := evalWriteFilter(filter, stages, row, env, meter)
+			matched, err := filter.evalFilter(row, env, meter)
 			if err != nil {
 				return outcome{}, err
 			}
