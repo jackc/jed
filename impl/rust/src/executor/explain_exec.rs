@@ -495,9 +495,7 @@ impl Engine {
         let mut scope = Scope::write_target(self, table, vw);
         scope.ctes = bindings;
         let mut ptypes = ParamTypes::default();
-        Ok(self
-            .resolve_write_filter(&scope, table, vw, where_, &mut ptypes)?
-            .0)
+        self.resolve_write_filter(&scope, table, vw, where_, &mut ptypes)
     }
 
     /// Emit the residual Filter (when present) and the target Scan for an UPDATE/DELETE, choosing the

@@ -3024,7 +3024,7 @@ impl Engine {
         let mut scope = Scope::write_target(self, table, vw.as_ref());
         scope.ctes = ctx.bindings;
         let mut ptypes = ParamTypes::default();
-        let (mut filter, stages) = self.resolve_write_filter(
+        let mut filter = self.resolve_write_filter(
             &scope,
             table,
             vw.as_ref(),
@@ -3153,7 +3153,7 @@ impl Engine {
                 None => true,
                 Some(f) => {
                     let before = meter.accrued;
-                    let keep = eval_write_filter(f, stages, &row, &env, &mut meter)?;
+                    let keep = f.eval_filter(&row, &env, &mut meter)?;
                     filter_actual += meter.accrued - before;
                     keep
                 }
@@ -3451,7 +3451,7 @@ impl Engine {
         let pk_changed =
             !pk_members.is_empty() && plans.iter().any(|p| pk_members.contains(&p.idx));
 
-        let (mut filter, stages) = self.resolve_write_filter(
+        let mut filter = self.resolve_write_filter(
             &scope,
             table,
             vw.as_ref(),
@@ -3593,7 +3593,7 @@ impl Engine {
                 None => true,
                 Some(f) => {
                     let before = meter.accrued;
-                    let matched = eval_write_filter(f, stages, &row, &env, &mut meter)?;
+                    let matched = f.eval_filter(&row, &env, &mut meter)?;
                     filter_actual += meter.accrued - before;
                     matched
                 }

@@ -432,10 +432,9 @@ impl Engine {
     }
 
     /// The complete WHERE of a write (views.md §15.2): every view's WHERE, the one nearest the table
-    /// first, then the statement's own, AND-ed left-deep, with the number of those AND nodes, from
-    /// the top, that join a stage ([`eval_write_filter`]). Each view's WHERE resolves in its body's
-    /// isolated scope over the base row. The complete tree is what access-path selection,
-    /// estimation, and EXPLAIN read.
+    /// first, then the statement's own, AND-ed left-deep — the WHERE of the equivalent base
+    /// statement, a filter whose top-level AND chain stops at the first conjunct that is not TRUE
+    /// (cost.md §3). Each view's WHERE resolves in its body's isolated scope over the base row.
     pub(crate) fn resolve_write_filter(
         &self,
         scope: &Scope,
@@ -443,9 +442,8 @@ impl Engine {
         vw: Option<&ViewWrite>,
         user: Option<&Expr>,
         ptypes: &mut ParamTypes,
-    ) -> Result<(Option<RExpr>, usize)> {
+    ) -> Result<Option<RExpr>> {
         let mut out: Option<RExpr> = None;
-        let mut parts = 0usize;
         if let Some(vw) = vw {
             for layer in vw.top.views_bottom_up() {
                 let Some(filter) = &layer.filter else {
@@ -457,7 +455,6 @@ impl Engine {
                     .expect("a view layer reads a level below");
                 let lscope = Scope::layer_body(self, table, 0, &layer.below_label, below);
                 let node = resolve_boolean_filter(&lscope, filter, &mut ParamTypes::default())?;
-                parts += 1;
                 out = Some(match out {
                     None => node,
                     Some(prev) => RExpr::And(Box::new(prev), Box::new(node)),
@@ -466,38 +463,13 @@ impl Engine {
         }
         if let Some(p) = user {
             let node = resolve_boolean_filter(scope, p, ptypes)?;
-            parts += 1;
             out = Some(match out {
                 None => node,
                 Some(prev) => RExpr::And(Box::new(prev), Box::new(node)),
             });
         }
-        Ok((out, parts.saturating_sub(1)))
+        Ok(out)
     }
-}
-
-/// Evaluate a write's complete WHERE on one row (views.md §15.2). Its top `stages` AND nodes join
-/// stages: each view's WHERE, then the statement's, in order, and a row a stage does not keep is
-/// not evaluated by the stages after it — the order in which the conditions apply when the view is
-/// read. The joining nodes perform no AND and charge nothing; every other node evaluates (and
-/// charges) as usual.
-pub(crate) fn eval_write_filter(
-    f: &RExpr,
-    stages: usize,
-    row: &[Value],
-    env: &EvalEnv,
-    meter: &mut Meter,
-) -> Result<bool> {
-    if stages == 0 {
-        return Ok(f.eval_filter(row, env, meter)?);
-    }
-    let RExpr::And(first, rest) = f else {
-        unreachable!("a staged write filter joins its stages with AND")
-    };
-    if !eval_write_filter(first, stages - 1, row, env, meter)? {
-        return Ok(false);
-    }
-    Ok(rest.eval_filter(row, env, meter)?)
 }
 
 /// A view's output names, types, and collation derivations (the `Engine::view_columns` value).
