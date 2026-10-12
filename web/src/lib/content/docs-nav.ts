@@ -35,6 +35,7 @@ export const DOCS_NAV: readonly DocSection[] = [
       { title: 'Tables & constraints', href: '/docs/sql/tables/' },
       { title: 'Temporary tables', href: '/docs/sql/temp-tables/' },
       { title: 'Indexes', href: '/docs/sql/indexes/' },
+      { title: 'Views', href: '/docs/sql/views/' },
       { title: 'Querying', href: '/docs/sql/select/' },
       { title: 'EXPLAIN', href: '/docs/sql/explain/' },
       { title: 'Statistics & ANALYZE', href: '/docs/sql/statistics/' },

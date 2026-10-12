@@ -289,6 +289,12 @@ column-rename list (`AS t (a, b)`):
 
 <LiveSql {seed} query={derived} rows={4} />
 
+A table or [view](../views/) in `FROM` takes the same column-rename list after its alias:
+`FROM product AS p (pid, pname)` exposes `product`'s first two columns as `p.pid` and `p.pname`
+(the rest keep their names). As in PostgreSQL, the old names are no longer visible through that
+alias, `*` expands under the new names, and a list longer than the table's columns is `42P10`. The
+list needs an alias: `FROM product (pid)` would be a call of a function named `product`.
+
 By default the body cannot see the other `FROM` relations beside it — mark it `LATERAL` (below) to
 correlate it with them. Inside a subquery, though, the body may reference columns of an *enclosing*
 query level, like any correlated subquery: `SELECT (SELECT z FROM (SELECT a.x AS z) d) FROM a`.

@@ -73,6 +73,10 @@ function commandTag(stmt: Statement, rowsAffected: number | null): string {
       return 'CREATE TYPE';
     case 'dropType':
       return 'DROP TYPE';
+    case 'createView':
+      return 'CREATE VIEW';
+    case 'dropView':
+      return 'DROP VIEW';
     case 'insert':
       return `INSERT 0 ${rowsAffected ?? 0}`;
     case 'update':

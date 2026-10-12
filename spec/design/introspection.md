@@ -442,7 +442,7 @@ another parallel array.
 name byte order. `jed_types`: ascending name byte order. `jed_type_fields`: types in ascending
 name byte order, then ordinal.
 
-## 5.4 `jed_views` (views V1) — specified
+## 5.4 `jed_views` (views V1) — implemented
 
 ```
 jed_views(
@@ -506,6 +506,6 @@ The later relations' own errors (if any new arise) are pinned by their implement
 | **I1** | `jed_tables` + `jed_columns`: resolution funnel interception (CTE-shadow / built-in-first / qualifier scoping), computed-relation execution riding the SRF plan shape, privilege gating, the 42809 read-only rejections, `generated_row` cost pinning (cost.md), `EXPLAIN` `Catalog Scan`, capabilities `introspect.tables`/`introspect.columns`, the canonical-type-text corpus (`suites/introspection/`, 4 files incl. temp + attachment scoping), `/web` docs | ✅ landed |
 | **I2** | `jed_indexes` + `jed_constraints` (§5.1): two more built-in-name-classifier entries + two row generators (every gate inherited from I1), the `text[]` member-list columns, the CHECK `expression` from the persisted canonical text, capabilities `introspect.indexes`/`introspect.constraints`, corpus (`suites/introspection/jed_indexes.test` + `jed_constraints.test`), cost.md worked examples, `/web` docs | ✅ landed |
 | **P9** | `jed_statistics` (§5.2): one summary row per analyzed column, qualified-domain scoping, stale/NDV/width/count visibility, capability `introspect.statistics`, corpus + `/web` docs | ✅ landed with column statistics |
-| **V1** | `jed_views` (§5.4), capability `introspect.views`, `/web` docs | specified ([views.md](views.md)) |
+| **V1** | `jed_views` (§5.4), capability `introspect.views`, `/web` docs | ✅ landed ([views.md](views.md)) |
 | **I3** | `jed_sequences` + `jed_types` + `jed_type_fields` (§5.3): three classifier entries + three row generators (every gate inherited from I1), PG `pg_sequences`-spelled sequence columns with the `OWNED BY` link, composite types with their fields as a separate relation, capabilities `introspect.sequences`/`introspect.types`/`introspect.type_fields`, corpus (`suites/introspection/jed_sequences.test` + `jed_sequences_txn.test` + `jed_types.test`, temp + attachment scoping), cost.md worked examples, `/web` docs | ✅ landed |
 | — | `information_schema` compat views over the `jed_` relations | door open, **not planned** |

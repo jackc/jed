@@ -27,7 +27,7 @@ ORDER BY table_name, ordinal;`;
 
 <svelte:head>
 	<title>Introspection — jed</title>
-	<meta name="description" content="The jed_ catalog relations — discover tables, columns, indexes, constraints, sequences, user-defined types, and planner statistics from SQL, queryable and joinable per attached database." />
+	<meta name="description" content="The jed_ catalog relations — discover tables, columns, indexes, constraints, sequences, user-defined types, views, and planner statistics from SQL, queryable and joinable per attached database." />
 </svelte:head>
 
 # Introspection
@@ -36,7 +36,7 @@ The `jed_` catalog relations describe a database *from SQL*. They are ordinary r
 relations — select from them, filter them, join them — whose rows are computed on the fly from
 the database's catalog. Nothing is stored, so they are always current.
 
-Eight relations ship today:
+Nine relations ship today:
 
 - **`jed_tables`** — one row per user table: `name` (the table name as written in `CREATE TABLE`).
 - **`jed_columns`** — one row per column of every user table: `table_name`, `name`, `ordinal`
@@ -65,6 +65,10 @@ Eight relations ship today:
   you can create today). Built-in types are not listed.
 - **`jed_type_fields`** — one row per field of every composite type, shaped like `jed_columns`:
   `type_name`, `name`, `ordinal`, `type` (the same canonical type text), and `not_null`.
+- **`jed_views`** — one row per [view](../views/): `name`, `definition` (the stored query text,
+  normalized: lowercase keywords, single-spaced tokens, `*` expanded into explicit columns, and
+  renames applied), and `columns` (a `text[]` of the output column names, in order). Views are not
+  listed in `jed_tables` or `jed_columns`.
 
 <LiveSql {seed} {query} rows={10} />
 
@@ -81,6 +85,7 @@ Things to try in the panel above:
 - Find the columns typed at a user-defined type — `SELECT c.table_name, c.name, t.name FROM jed_types t JOIN jed_columns c ON c.type = t.name;`
 - Find every foreign key and its parent — `SELECT table_name, columns, ref_table, ref_columns FROM jed_constraints WHERE type = 'foreign_key';`
 - Count columns per table — `SELECT table_name, count(*) FROM jed_columns GROUP BY table_name;`
+- Create a view, then list it — `CREATE VIEW adults AS SELECT id, name FROM customer WHERE age >= 18; SELECT name, definition, columns FROM jed_views;`
 - Create a table or index, then re-run the query — the new rows appear immediately.
 
 ## Scoping — one catalog per database

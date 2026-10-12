@@ -322,6 +322,53 @@ test('the indexes page runs the GIN = array-equality scan live', async ({ page }
   await expect(panel.getByTestId('result-rows')).not.toContainText('intro');
 });
 
+test('the views page reads views live and rejects writes and breaking drops', async ({ page }) => {
+  await page.goto('/docs/sql/views/');
+  // First panel = active_staff JOIN dept_payroll (spec/design/views.md §4): Ada in eng with the eng
+  // payroll 19400.00; Ken is inactive, so the view hides him.
+  const panel = page.getByTestId('live-sql').first();
+  await expect(panel.getByTestId('result-rows')).toContainText('19400.00');
+  await expect(panel.getByTestId('result-rows')).not.toContainText('Ken');
+
+  // Views are read-only (55000), and a table a view reads cannot be dropped (2BP01).
+  await panel.getByTestId('sql-input').fill("INSERT INTO active_staff VALUES (6, 'Dennis', 'eng')");
+  await panel.getByTestId('run-button').click();
+  await expect(panel.getByTestId('error-code')).toHaveText('55000');
+  await panel.getByTestId('sql-input').fill('DROP TABLE employee');
+  await panel.getByTestId('run-button').click();
+  await expect(panel.getByTestId('error-code')).toHaveText('2BP01');
+
+  await panel.getByTestId('reset-button').click();
+  await expect(panel.getByTestId('result-rows')).toContainText('19400.00');
+});
+
+test('the views page plans a view like its derived table', async ({ page }) => {
+  await page.goto('/docs/sql/views/');
+  // Second panel = EXPLAIN over the view: a Subquery node whose outer id = 2 became a PK lookup.
+  const panel = page.getByTestId('live-sql').nth(1);
+  await expect(panel.getByTestId('result-rows')).toContainText('Subquery active_staff');
+  await expect(panel.getByTestId('result-rows')).toContainText('PK bound: id = 2');
+});
+
+test('the views page freezes * at CREATE VIEW', async ({ page }) => {
+  await page.goto('/docs/sql/views/');
+  // Third panel = SELECT * FROM all_notes after note gained a pinned column: the view still has
+  // only id and body (views.md §5).
+  const panel = page.getByTestId('live-sql').nth(2);
+  await expect(panel.getByTestId('result-rows')).toContainText('hello');
+  await expect(panel.locator('thead')).toContainText('body');
+  await expect(panel.locator('thead')).not.toContainText('pinned');
+});
+
+test('the views page rewrites view definitions on RENAME', async ({ page }) => {
+  await page.goto('/docs/sql/views/');
+  // Fourth panel = RENAME COLUMN + RENAME TO, then jed_views: the stored text now reads the renamed
+  // table under its old label with a column alias list keeping the old column name (views.md §7).
+  const panel = page.getByTestId('live-sql').nth(3);
+  await expect(panel.getByTestId('result-rows')).toContainText('"staff" as "employee"');
+  await expect(panel.getByTestId('error-code')).toHaveCount(0);
+});
+
 test('the queries API page wires up the idiomatic example for each language', async ({ page }) => {
   await page.goto('/docs/api/queries/');
   // Default (Rust): the rusqlite-style run/query_row methods.
