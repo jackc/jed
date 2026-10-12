@@ -15,7 +15,7 @@ CREATE TABLE booking (
   room     i32,
   during   i32range,
   customer i32 REFERENCES customer (id),
-  price    decimal(8,2),
+  price    decimal(8,2) DEFAULT 0,
   PRIMARY KEY (room, during),
   EXCLUDE USING gist (during WITH &&)
 );`;
@@ -42,8 +42,10 @@ Nine relations ship today:
 - **`jed_columns`** — one row per column of every user table: `table_name`, `name`, `ordinal`
   (1-based, declaration order), `type` (the canonical type text — `i32`, `varchar(80)`,
   `decimal(8,2)`, `i32[]`, `i32range`, a composite's name, …), `not_null` (declared `NOT NULL`
-  or a `PRIMARY KEY` member), and `pk_ordinal` (the column's 1-based position in the primary
-  key, in **key** order; `NULL` for a non-member).
+  or a `PRIMARY KEY` member), `pk_ordinal` (the column's 1-based position in the primary
+  key, in **key** order; `NULL` for a non-member), and `column_default` (the `DEFAULT` as SQL
+  text — an expression default in its stored canonical form, such as `uuidv7 ( )`, or a constant
+  as a literal of its stored value, such as `1.50` or `'draft'`; `NULL` for no default).
 - **`jed_indexes`** — one row per secondary index: `name`, `table_name`, `columns` (a `text[]` of
   the indexed column names in key order), `is_unique`, and `method` (`btree` / `gin` / `gist`).
   The primary key owns no index object, so it is not listed here — see `jed_columns.pk_ordinal`.
@@ -86,6 +88,7 @@ Things to try in the panel above:
 - Find the columns typed at a user-defined type — `SELECT c.table_name, c.name, t.name FROM jed_types t JOIN jed_columns c ON c.type = t.name;`
 - Find every foreign key and its parent — `SELECT table_name, columns, ref_table, ref_columns FROM jed_constraints WHERE type = 'foreign_key';`
 - Count columns per table — `SELECT table_name, count(*) FROM jed_columns GROUP BY table_name;`
+- Show the column defaults — `SELECT table_name, name, column_default FROM jed_columns WHERE column_default IS NOT NULL;` (the `serial` key shows the `nextval` default it expands to; `DEFAULT 0` on `decimal(8,2)` shows the stored `0.00`)
 - Create a view, then list it — `CREATE VIEW adults AS SELECT id, name FROM customer WHERE age >= 18; SELECT name, definition, columns FROM jed_views;`
 - Create a table or index, then re-run the query — the new rows appear immediately.
 
