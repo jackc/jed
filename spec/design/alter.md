@@ -232,8 +232,8 @@ side is likewise dropped automatically. An FK that uses the column only on its r
 `CASCADE` drops it. Dropping a column also rewrites any stored expression text (§0.2) that survives;
 a `CHECK`, expression index, or partial-index predicate that referenced the column is removed with
 its owning object.
-A column a **view** references is an external dependency too: `2BP01` under `RESTRICT`, `0A000`
-under `CASCADE` (dropping dependent views is a follow-on). Dropping an unreferenced column removes
+A column a **view** references is an external dependency too: `2BP01` under `RESTRICT`; `CASCADE`
+drops those views and every view depending on them ([views.md](views.md) §6.1). Dropping an unreferenced column removes
 its entry from any view column alias list that reaches it ([views.md](views.md) §6/§7).
 Dropping a **PK member** implies dropping the whole PK and re-keying to synthetic rowid (§3.4)
 — the hairy case; deferred to its own slice. A column referenced by a **parent** FK (this

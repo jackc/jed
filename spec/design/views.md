@@ -333,7 +333,7 @@ entry rather than recomputed. Dependency checks are then catalog lookups, and op
 (§3). `RENAME` keeps it current (§7). Re-validation (§8) recomputes it and requires that it is
 unchanged.
 
-The dependencies are enforced as follows, all **RESTRICT**:
+The dependencies are enforced as follows:
 
 | Operation | Effect | Code |
 |---|---|---|
@@ -341,7 +341,7 @@ The dependencies are enforced as follows, all **RESTRICT**:
 | `DROP VIEW v` while another view depends on `v` | refused | `2BP01` |
 | `ALTER TABLE t DROP COLUMN c` while a view depends on `t.c` | refused | `2BP01` |
 | `ALTER TABLE t ALTER COLUMN c TYPE …` while a view depends on `t.c` | refused (*cannot alter type of a column used by a view*) | `0A000` |
-| `… CASCADE` of any of the above when a **view** is the dependent | refused (a follow-on, §12) | `0A000` |
+| `DROP TABLE t CASCADE` / `DROP VIEW v CASCADE` / `ALTER TABLE t DROP COLUMN c CASCADE` | the dependent views are dropped too (§6.1) | — |
 | `ALTER TABLE t RENAME TO …` / `RENAME COLUMN …` | the view's text is rewritten (§7) | — |
 | Any other `ALTER TABLE t` while a view depends on `t` | allowed, then re-validated (§8) | — |
 | `ALTER VIEW u RENAME TO …` / `RENAME COLUMN …` while a view depends on `u` | the view's text is rewritten (§7.1) | — |
@@ -350,14 +350,40 @@ The dependencies are enforced as follows, all **RESTRICT**:
 The drop-set exclusion of `DROP TABLE` ([grammar.md](grammar.md) §13) applies to `DROP VIEW`: a
 dependent that is itself dropped by the same statement does not block. `DROP VIEW v1, v2` succeeds
 when `v2` depends on `v1`, in either order. A `DROP TABLE` statement cannot drop views, so a
-dependent view always blocks it. `DROP TABLE … CASCADE` still drops dependent foreign keys, but
-when a view depends on a table being dropped it raises `0A000` instead. `DROP VIEW … CASCADE` with
-no dependent view behaves like `RESTRICT`. The check order is the same as for foreign keys: every
+dependent view blocks it under `RESTRICT`. The check order is the same as for foreign keys: every
 name is resolved (`42P01`/`42809`) before any dependency is checked.
 
 The `2BP01` message names the first blocking view in name byte order:
 *cannot drop table t because view v depends on it*, *cannot drop view v because view w depends on
 it*, *cannot drop column c of table t because view v depends on it*.
+
+### 6.1 `CASCADE`
+
+Under `CASCADE`, a dependent view is dropped instead of blocking the statement, as in PostgreSQL. The
+views dropped are the **closure**: every view that depends on a dropped table (`DROP TABLE`), on a
+dropped view (`DROP VIEW`), or on a dropped column (`ALTER TABLE … DROP COLUMN`), and then every view
+that depends on one of those, repeated until no view is added. A view that depends on none of them
+is untouched. A view dependency is on the whole view, so a view that reads any column of a dropped
+view is dropped.
+
+- **`DROP TABLE t [, …] CASCADE`** drops the closure of the views depending on any listed table,
+  together with the foreign keys `CASCADE` already drops (grammar.md §13).
+- **`DROP VIEW v [, …] CASCADE`** drops the listed views and their closure. A view in both is
+  dropped once.
+- **`ALTER TABLE t DROP COLUMN c CASCADE`** drops the closure of the views whose dependency list
+  names `t.c` (§6: a column reference, a `USING`/`NATURAL` column, or a frozen `*`). A view that
+  depends on `t` but not on `c` survives, and is rewritten (§7) and re-validated (§8) as for any
+  `DROP COLUMN`.
+
+Within one `ALTER TABLE`, the actions run in order, so a view an earlier `DROP COLUMN … CASCADE`
+dropped no longer blocks a later `DROP COLUMN` under `RESTRICT`, while a `RESTRICT` drop written
+before the `CASCADE` one still fails with `2BP01`. The `ALTER COLUMN … TYPE` view check runs after
+every action, because PostgreSQL executes all drops before any type change: `ALTER COLUMN g TYPE
+i64, DROP COLUMN f CASCADE` succeeds when the only view using `g` also uses `f`.
+
+Dropping views is a catalog edit with zero cost, like the drop itself. PostgreSQL also emits a
+*drop cascades to* notice; jed has no notice channel (§12). The statement is all-or-nothing: a
+later failure, or a rollback of its transaction, restores every view it dropped.
 
 **Not tracked.** A view does not record dependencies on sequences named in `nextval('s')`, on
 composite types named in casts, on collations, or on host functions. Dropping such an object
@@ -585,6 +611,7 @@ Recorded divergences from PostgreSQL (CLAUDE.md §1):
 | Dropping a sequence or composite type a view uses succeeds; the view fails at use | those dependencies are not tracked (§6) |
 | A zero-column view is `0A000` | the canonical text cannot express an empty select list after `*` expansion |
 | `ANALYZE v` succeeds silently; PG also emits a warning | jed has no notice channel |
+| `DROP … CASCADE` drops dependent views silently; PG also emits a *drop cascades to* notice | jed has no notice channel |
 | `DROP SEQUENCE v` / `ALTER SEQUENCE v` are `42P01`; PG says `42809` | sequence statements already treat a table this way |
 | A reference that expands to more than 1024 views is `54001`; PG has no limit | planning is unmetered, so it is bounded structurally (CLAUDE.md §13; §4.1) |
 
@@ -600,7 +627,6 @@ Deferred follow-ons, none foreclosed:
 - `CREATE MATERIALIZED VIEW` and `CREATE RECURSIVE VIEW` (`0A000`);
 - temporary views and views in or over attached databases (`0A000`), including `ALTER TABLE` of an
   attached table that one of its database's views depends on;
-- `DROP … CASCADE` that drops dependent views (`0A000`);
 - dependency tracking for sequences, composite types, collations, and host functions;
 - view columns in `jed_columns`;
 - definitions longer than one catalog page (`0A000`), which would need an overflow chain.
@@ -614,6 +640,8 @@ Deferred follow-ons, none foreclosed:
 - Reading a view is the equivalent derived table, which is already deterministic in rows, cost,
   plan, and errors.
 - The `2BP01` and `0A000` messages name the first blocking view in name byte order.
+- A `CASCADE` closure (§6.1) is a set computed from the persisted dependency lists, so which views
+  it drops never depends on iteration order.
 - `CREATE OR REPLACE VIEW` compares columns in position order and reports the first difference in
   PostgreSQL's order (count, then per column name, type, collation).
 - A write through a view is its equivalent base statement on the base table (§15.2, §15.5), which is
@@ -640,9 +668,12 @@ Deferred follow-ons, none foreclosed:
 7. **V7 — automatically updatable views** (§15): `INSERT` / `UPDATE` / `DELETE` through a view,
    chains of views, `RETURNING`, writable CTEs, privileges checked on the view as for a table, and
    the view-vs-base-statement NoREC relation.
+8. **V8 — `DROP … CASCADE` of dependent views** (§6.1): `DROP TABLE`, `DROP VIEW`, and `ALTER TABLE
+   … DROP COLUMN` drop the closure of the views that depend on what they drop.
 
 Capabilities: `ddl.view` (V1), `ddl.view_rename` (V2 + V4), `query.table_column_alias` (V3),
-`introspect.views` (V1), `ddl.view_replace` (V5), `ddl.view_alter` (V6), `dml.view_write` (V7).
+`introspect.views` (V1), `ddl.view_replace` (V5), `ddl.view_alter` (V6), `dml.view_write` (V7),
+`ddl.view_cascade` (V8).
 
 ## 15. Writing through a view
 

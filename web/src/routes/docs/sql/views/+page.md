@@ -170,7 +170,7 @@ DROP VIEW [IF EXISTS] name [, …] [RESTRICT | CASCADE]
 A missing view is `42P01` unless you write `IF EXISTS`. Naming a table (or index or sequence) is
 `42809` (*not a view*), even with `IF EXISTS`. A list is all-or-nothing, and a view that depends on
 another view in the same list does not block the drop. `DROP VIEW` on a view that another view reads
-is `2BP01`. `CASCADE`, which would also drop the dependent views, is not supported yet (`0A000`).
+is `2BP01`. `CASCADE` drops the dependent views too, and every view that depends on those.
 
 ## Dependencies
 
@@ -182,9 +182,13 @@ jed tracks which tables and columns each view reads and refuses changes that wou
 | `DROP VIEW v` when another view reads `v` | `2BP01` |
 | `ALTER TABLE t DROP COLUMN c` when a view reads `c` | `2BP01` |
 | `ALTER TABLE t ALTER COLUMN c TYPE …` when a view reads `c` | `0A000` |
-| `CASCADE` on any of these, when the dependent is a view | `0A000` (not supported yet) |
+| `DROP TABLE t CASCADE`, `DROP VIEW v CASCADE`, `ALTER TABLE t DROP COLUMN c CASCADE` | drops the dependent views too |
 
-The error message names the blocking view. Drop the dependent views first, then the table or column.
+The error message names the blocking view. Either drop the dependent views first, or add `CASCADE`.
+`CASCADE` drops every view that depends on what the statement drops, then every view that depends
+on one of those, and so on. `DROP COLUMN … CASCADE` drops only the views that read that column; the
+table's other views keep working. Unlike PostgreSQL, jed does not print a *drop cascades to* notice,
+so check `jed_views` if you need to know what went.
 
 Dependencies cover tables, columns, and other views. A view does **not** track the sequences,
 composite types, or collations its query names. Dropping one of those succeeds, and the view then
@@ -325,4 +329,3 @@ Each of these is `0A000` today:
 - `CREATE MATERIALIZED VIEW` and `CREATE RECURSIVE VIEW`.
 - Temporary views, and a view that reads a temporary table.
 - Views in an attached database, and views whose query reads an attached database.
-- `DROP … CASCADE` that would drop a dependent view.

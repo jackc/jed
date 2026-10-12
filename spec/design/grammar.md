@@ -677,10 +677,10 @@ either mode: dropping the referencing table removes the dependency, so `DROP TAB
 child` (or `child, parent`) succeeds even under `RESTRICT`. The drop-set exclusion — a
 dependent that is *itself* being dropped does not count — is what the two-phase resolve buys.
 
-**Still narrowed (relaxable later, §5).** `CASCADE` reaches only FK dependents. A **view** that
-reads a table being dropped always blocks the drop: `2BP01` under `RESTRICT`, `0A000` under
-`CASCADE` (dropping dependent views is a follow-on, [views.md](views.md) §6). A view itself is
-dropped with `DROP VIEW` (§54); `DROP TABLE v` of a view is `42809`.
+**Views.** A **view** that reads a table being dropped blocks the drop under `RESTRICT` (`2BP01`);
+`CASCADE` drops it, and every view depending on it, along with the FK dependents
+([views.md](views.md) §6.1). A view itself is dropped with `DROP VIEW` (§54); `DROP TABLE v` of a
+view is `42809`.
 
 **Cost is zero.** Like `CREATE TABLE`, a drop reads no rows and evaluates no expression
 tree — it is a pure catalog edit — so it accrues zero cost ([cost.md](cost.md)). Removing a

@@ -2,11 +2,11 @@
 # reopen (spec/design/conformance.md §3); views persist and reload in the other views files' disk pass.
 # Views — the jed-specific behavior of spec/design/views.md that PostgreSQL cannot oracle-check:
 # the IF NOT EXISTS extension, the jed_ reservation, 0A000 for ON CONFLICT on a view and the
-# deferred forms, temp scope, untracked dependencies, CASCADE to a view,
+# deferred forms, temp scope, untracked dependencies, a rolled-back CASCADE,
 # re-validation after ALTER TABLE, CREATE OR REPLACE VIEW, and ALTER VIEW (§8), the cycle check and
 # typmod rule of OR REPLACE (§1.2), the session privilege envelope (§9), and transactions.
 # CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
-# requires: ddl.view, dml.view_write, ddl.view_replace, ddl.view_alter, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.alter_table, ddl.sequence, ddl.temp_table, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.insert_on_conflict, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.aggregates, query.subquery_scalar, query.subquery_correlated, query.derived_table, query.cte, query.cte_recursive, query.cte_data_modifying, types.i32, types.i64, types.text, types.decimal, types.varchar_length, types.composite, cast.operator, session.privileges, session.allow_ddl, session.allow_temp_ddl, txn.explicit, txn.read_only
+# requires: ddl.view, ddl.view_cascade, dml.view_write, ddl.view_replace, ddl.view_alter, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.alter_table, ddl.sequence, ddl.temp_table, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.insert_on_conflict, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.aggregates, query.subquery_scalar, query.subquery_correlated, query.derived_table, query.cte, query.cte_recursive, query.cte_data_modifying, types.i32, types.i64, types.text, types.decimal, types.varchar_length, types.composite, cast.operator, session.privileges, session.allow_ddl, session.allow_temp_ddl, txn.explicit, txn.read_only
 
 statement ok
 CREATE TABLE t (a i32 PRIMARY KEY, b text)
@@ -215,19 +215,40 @@ CREATE VIEW tv AS SELECT a FROM t WHERE a IN (SELECT z FROM tt)
 statement ok
 DROP TABLE tt
 
-# --- CASCADE never drops a dependent view (a follow-on) ---------------------------------------------
-
-statement error 0A000
-DROP TABLE t CASCADE
+# --- a rolled-back CASCADE restores every view it dropped -------------------------------------------
 
 statement ok
 CREATE VIEW vv AS SELECT a FROM v
 
-statement error 0A000
-DROP VIEW v CASCADE
+statement ok
+BEGIN
 
-statement error 0A000
+statement ok
+DROP TABLE t CASCADE
+
+statement error 42P01
+SELECT * FROM vv
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
 ALTER TABLE t DROP COLUMN b CASCADE
+
+statement error 42P01
+SELECT * FROM v
+
+statement ok
+ROLLBACK
+
+query I rowsort
+SELECT a FROM vv
+----
+1
+2
 
 statement ok
 DROP VIEW vv

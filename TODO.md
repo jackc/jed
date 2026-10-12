@@ -162,10 +162,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   landed in every core. V7 (automatically updatable views: `INSERT`/`UPDATE`/`DELETE` through a view
   of PostgreSQL's simple single-relation shape, chains, view `WHERE`s AND-ed ahead of the
   statement's, `RETURNING`, writable CTEs, privileges checked on the view as for a table, and the
-  `view_write` NoREC relation) landed in every core too. → [views.md](spec/design/views.md)
+  `view_write` NoREC relation) landed in every core too, and so did V8 (`DROP TABLE` / `DROP VIEW` /
+  `ALTER TABLE … DROP COLUMN` `CASCADE` dropping the closure of dependent views).
+  → [views.md](spec/design/views.md)
   - [ ] _follow-on:_ `WITH CHECK OPTION`, `ON CONFLICT` on an updatable view, view column defaults,
     view options and the other `ALTER VIEW` actions, materialized and recursive views, temporary views, views in or over attached
-    databases, `DROP … CASCADE` of dependent views, dependency tracking for
+    databases, dependency tracking for
     sequences/types/collations/host functions, view columns in `jed_columns`, definitions longer
     than one catalog page. → [views.md §12](spec/design/views.md)
 
