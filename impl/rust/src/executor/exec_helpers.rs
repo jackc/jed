@@ -338,7 +338,7 @@ impl crate::cursor::RowStream for StreamingScan {
                     {
                         ra.set_row(b, i, &env, &self.meter);
                     }
-                    f.eval(row, &filter_env, &mut self.meter)?.is_true()
+                    f.eval_filter(row, &filter_env, &mut self.meter)?
                 }
                 None => true,
             };

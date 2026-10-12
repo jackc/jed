@@ -142,23 +142,20 @@ pub(crate) struct FilterChain<'a> {
 }
 
 impl FilterChain<'_> {
-    /// Evaluate the left-deep AND: each AND node guards and charges on entry (outermost first), then
-    /// the conjuncts evaluate in source order, stopping at the first FALSE — `RExpr::And`'s
-    /// short-circuit eval, unrolled (every AND node sits on the left spine, so all of them charge).
-    pub(crate) fn eval(&self, row: &[Value], env: &EvalEnv, m: &mut Meter) -> Result<Value> {
+    /// `RExpr::eval_filter` of the left-deep AND, unrolled: each AND node guards and charges on
+    /// entry (outermost first — every one sits on the left spine), then the conjuncts evaluate in
+    /// source order, stopping at the first that is not TRUE.
+    pub(crate) fn eval_filter(&self, row: &[Value], env: &EvalEnv, m: &mut Meter) -> Result<bool> {
         for _ in 1..self.conjuncts.len() {
             m.guard()?;
             m.charge(operator_cost("and"));
         }
-        let mut acc = self.conjuncts[0].eval(row, env, m)?;
-        for c in &self.conjuncts[1..] {
-            if matches!(acc, Value::Bool(false)) {
-                break;
+        for c in &self.conjuncts {
+            if !c.eval_filter(row, env, m)? {
+                return Ok(false);
             }
-            let v = c.eval(row, env, m)?;
-            acc = and3(&acc, &v);
         }
-        Ok(acc)
+        Ok(true)
     }
 
     /// `render_rexpr` of the left-deep AND.

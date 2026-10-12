@@ -5,14 +5,28 @@
 use super::*;
 
 impl RExpr {
+    /// Evaluate a predicate in a **filter context** — WHERE, ON, HAVING, a partial index's WHERE,
+    /// ON CONFLICT … WHERE — returning whether it keeps the row (it is TRUE). The top-level AND
+    /// chain stops at the first conjunct that is not TRUE (FALSE or NULL: the predicate can no
+    /// longer be TRUE), PostgreSQL's qual-list rule; each AND node charges on entry as in `eval`,
+    /// and every other node evaluates as a value (spec/design/cost.md §3).
+    pub(crate) fn eval_filter(&self, row: &[Value], env: &EvalEnv, m: &mut Meter) -> Result<bool> {
+        if let RExpr::And(l, r) = self {
+            m.guard()?;
+            m.charge(operator_cost("and"));
+            return Ok(l.eval_filter(row, env, m)? && r.eval_filter(row, env, m)?);
+        }
+        Ok(self.eval(row, env, m)?.is_true())
+    }
+
     /// Evaluate against a row, accruing cost into `m`. Returns a `Value` (which may be a
     /// boolean for comparisons/connectives). Arithmetic traps 22003 on overflow and 22012
     /// on a zero divisor; NULL propagates through arithmetic; the connectives are Kleene.
     ///
     /// Cost: each **interior** node charges `operator_eval` once, pre-order (the node, then
-    /// its operands LHS-before-RHS); leaf nodes (column/constants) charge nothing. Both
-    /// operands are always evaluated — there is no short-circuit, so the count never
-    /// depends on operand values (spec/design/cost.md §3).
+    /// its operands LHS-before-RHS); leaf nodes (column/constants) charge nothing. Operands are
+    /// evaluated eagerly except where cost.md §3 sanctions a short-circuit (AND / OR, CASE,
+    /// COALESCE), whose fixed left-to-right rule makes the skipped work deterministic.
     pub(crate) fn eval(&self, row: &[Value], env: &EvalEnv, m: &mut Meter) -> Result<Value> {
         // Enforce the cost ceiling before evaluating this node (CLAUDE.md §13). `eval` recurses
         // once per expression node, so guarding here bounds a pathological expression to ~O(1)
@@ -1609,7 +1623,7 @@ impl RExpr {
                 els,
                 coerce_decimal,
             } => {
-                // CASE is the ONE deliberate exception to "no short-circuit" (cost.md §3):
+                // CASE is a sanctioned short-circuit (cost.md §3), like AND / OR and COALESCE:
                 // conditions are evaluated in order and evaluation STOPS at the first TRUE — a
                 // FALSE or NULL/UNKNOWN condition falls through, and later arms (and their
                 // results) are NOT evaluated. This is required for PG semantics (e.g.

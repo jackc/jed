@@ -95,7 +95,7 @@ fn process_streaming_row(
             ra.set_row(b, i, env, meter);
         }
         let before = meter.accrued;
-        let keep = filter.eval(row, fenv, meter)?.is_true();
+        let keep = filter.eval_filter(row, fenv, meter)?;
         actual.filter += meter.accrued - before;
         if !keep {
             return Ok(true);
@@ -738,7 +738,7 @@ impl Engine {
                 let keep = match plan.filter.get() {
                     Some(f) => {
                         let before = meter.accrued;
-                        let keep = f.eval(row, env, meter)?.is_true();
+                        let keep = f.eval_filter(row, env, meter)?;
                         filter_work += meter.accrued - before;
                         keep
                     }
@@ -1314,7 +1314,7 @@ impl Engine {
                 let keep = match plan.filter.get() {
                     Some(f) => {
                         let before = meter.accrued;
-                        let keep = f.eval(&row, env, meter)?.is_true();
+                        let keep = f.eval_filter(&row, env, meter)?;
                         filter_work += meter.accrued - before;
                         keep
                     }
@@ -1442,7 +1442,7 @@ impl Engine {
                     let keep = match plan.filter.get() {
                         Some(f) => {
                             let before = meter.accrued;
-                            let keep = f.eval(row_ref, env, meter)?.is_true();
+                            let keep = f.eval_filter(row_ref, env, meter)?;
                             filter_work += meter.accrued - before;
                             keep
                         }
@@ -1508,7 +1508,7 @@ impl Engine {
                     let keep = match plan.filter.get() {
                         Some(f) => {
                             let before = meter.accrued;
-                            let keep = f.eval(row_ref, env, meter)?.is_true();
+                            let keep = f.eval_filter(row_ref, env, meter)?;
                             filter_work += meter.accrued - before;
                             keep
                         }
@@ -1732,7 +1732,7 @@ impl Engine {
                     );
                     // INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).
                     let keep = match &on {
-                        Some(pred) => pred.eval(&combined, env, meter)?.is_true(),
+                        Some(pred) => pred.eval_filter(&combined, env, meter)?,
                         None => true,
                     };
                     if !keep {
@@ -1742,7 +1742,7 @@ impl Engine {
                     let pass = match &post_join_filter {
                         Some(f) => {
                             before = meter.accrued;
-                            let pass = f.eval(&combined, env, meter)?.is_true();
+                            let pass = f.eval_filter(&combined, env, meter)?;
                             filter_work += meter.accrued - before;
                             pass
                         }
@@ -1903,7 +1903,7 @@ impl Engine {
                         let Some(predicate) = &join_ons[on_index] else {
                             continue;
                         };
-                        if !predicate.eval(&combined, env, meter)?.is_true() {
+                        if !predicate.eval_filter(&combined, env, meter)? {
                             keep = false;
                             break;
                         }
@@ -1914,7 +1914,7 @@ impl Engine {
                     let pass = match &post_join_filter {
                         Some(filter) => {
                             let before = meter.accrued;
-                            let pass = filter.eval(&combined, env, meter)?.is_true();
+                            let pass = filter.eval_filter(&combined, env, meter)?;
                             filter_work += meter.accrued - before;
                             pass
                         }
@@ -2028,7 +2028,7 @@ impl Engine {
         };
         let mut kept = Vec::with_capacity(rows.len());
         for row in rows {
-            if pushed.eval(&row, &env, meter)?.is_true() {
+            if pushed.eval_filter(&row, &env, meter)? {
                 kept.push(row);
             } else {
                 meter.release_row_masked(&row, &plan.rel_masks[ri]);
@@ -2317,7 +2317,7 @@ impl Engine {
         let mut table_rows: Vec<Row> = Vec::new();
         while let Some(row) = src.next(meter)? {
             if let Some(f) = pushed
-                && !f.eval(&row, &env, meter)?.is_true()
+                && !f.eval_filter(&row, &env, meter)?
             {
                 continue;
             }
@@ -2835,7 +2835,7 @@ impl Engine {
                     Some(f) => {
                         let mut out: Vec<Row> = Vec::new();
                         for r in rows {
-                            if f.eval(&r, env, meter)?.is_true() {
+                            if f.eval_filter(&r, env, meter)? {
                                 out.push(r);
                             } else {
                                 meter.release_row_masked(&r, mask);
@@ -2984,7 +2984,7 @@ impl Engine {
                             scratch[c] = node.col_at(i, c)?;
                         }
                     }
-                    if !filter.eval(&scratch, env, meter)?.is_true() {
+                    if !filter.eval_filter(&scratch, env, meter)? {
                         return Ok(());
                     }
                 }

@@ -2904,7 +2904,7 @@ fn index_row_qualifies(rindex: &ResolvedIndex, row: &Row, env: &EvalEnv) -> Resu
         None => Ok(true),
         Some(pred) => {
             let mut m = env.exec.session.scratch_meter(); // maintenance eval is unmetered (cost.md §3)
-            Ok(matches!(pred.eval(row, env, &mut m)?, Value::Bool(true)))
+            pred.eval_filter(row, env, &mut m)
         }
     }
 }
@@ -6597,7 +6597,7 @@ pub(crate) fn filter_columnar(
                 scratch[c] = cols[c][i].clone();
             }
         }
-        if filter.eval(&scratch, env, meter)?.is_true() {
+        if filter.eval_filter(&scratch, env, meter)? {
             sel.push(i as i32);
         }
     }

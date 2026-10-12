@@ -489,7 +489,7 @@ pub(crate) fn eval_write_filter(
     meter: &mut Meter,
 ) -> Result<bool> {
     if stages == 0 {
-        return Ok(f.eval(row, env, meter)?.is_true());
+        return Ok(f.eval_filter(row, env, meter)?);
     }
     let RExpr::And(first, rest) = f else {
         unreachable!("a staged write filter joins its stages with AND")
@@ -497,7 +497,7 @@ pub(crate) fn eval_write_filter(
     if !eval_write_filter(first, stages - 1, row, env, meter)? {
         return Ok(false);
     }
-    Ok(rest.eval(row, env, meter)?.is_true())
+    Ok(rest.eval_filter(row, env, meter)?)
 }
 
 /// A view's output names, types, and collation derivations (the `Engine::view_columns` value).

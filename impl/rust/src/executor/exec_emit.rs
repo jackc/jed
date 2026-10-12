@@ -138,7 +138,7 @@ impl Engine {
                         let Some(predicate) = &join_ons[on_index] else {
                             continue;
                         };
-                        if !predicate.eval(&combined, env, meter)?.is_true() {
+                        if !predicate.eval_filter(&combined, env, meter)? {
                             keep = false;
                             break;
                         }
@@ -263,7 +263,7 @@ impl Engine {
                 );
                 let keep = match &on {
                     None => true,
-                    Some(pred) => pred.eval(&combined, env, meter)?.is_true(),
+                    Some(pred) => pred.eval_filter(&combined, env, meter)?,
                 };
                 if keep {
                     meter.admit_row_masked(&combined, &mask)?;
@@ -555,7 +555,7 @@ impl Engine {
                             combined.extend_from_slice(right);
                             let keep = match &on {
                                 None => true,
-                                Some(pred) => pred.eval(&combined, &env, meter)?.is_true(),
+                                Some(pred) => pred.eval_filter(&combined, &env, meter)?,
                             };
                             if keep {
                                 meter.admit_row_masked(&combined, &mem_mask)?;
@@ -603,7 +603,7 @@ impl Engine {
                             combined.extend_from_slice(right);
                             let keep = match &on {
                                 None => true,
-                                Some(pred) => pred.eval(&combined, &env, meter)?.is_true(),
+                                Some(pred) => pred.eval_filter(&combined, &env, meter)?,
                             };
                             if keep {
                                 meter.admit_row_masked(&combined, &mem_mask)?;
@@ -645,7 +645,7 @@ impl Engine {
                         for ri in candidates {
                             let mut combined = left.clone();
                             combined.extend_from_slice(&right_rows[ri]);
-                            if pred.eval(&combined, &env, meter)?.is_true() {
+                            if pred.eval_filter(&combined, &env, meter)? {
                                 meter.admit_row_masked(&combined, &mem_mask)?;
                                 next.push(combined);
                                 left_matched = true;
@@ -670,7 +670,7 @@ impl Engine {
                         combined.extend_from_slice(right);
                         let keep = match &on {
                             None => true,
-                            Some(pred) => pred.eval(&combined, &env, meter)?.is_true(),
+                            Some(pred) => pred.eval_filter(&combined, &env, meter)?,
                         };
                         if keep {
                             meter.admit_row_masked(&combined, &mem_mask)?;
@@ -755,7 +755,7 @@ impl Engine {
         for row in running {
             let keep = match &filter {
                 None => true,
-                Some(f) => f.eval(&row, &env, meter)?.is_true(),
+                Some(f) => f.eval_filter(&row, &env, meter)?,
             };
             if keep {
                 rows.push(row);
@@ -1053,7 +1053,7 @@ impl Engine {
             if let Some(h) = &plan.having {
                 let mut kept: Vec<Vec<Value>> = Vec::with_capacity(group_rows.len());
                 for srow in group_rows {
-                    if h.eval(&srow, &env, meter)?.is_true() {
+                    if h.eval_filter(&srow, &env, meter)? {
                         kept.push(srow);
                     } else {
                         meter.release_row(&srow);

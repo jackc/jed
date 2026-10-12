@@ -129,7 +129,7 @@ impl Engine {
             // The relation's pushed WHERE conjuncts (planner.md §3.2), exactly as materialize_rel
             // runs them.
             if let Some(f) = pushed
-                && !f.eval(&row, env, meter)?.is_true()
+                && !f.eval_filter(&row, env, meter)?
             {
                 return Ok(true);
             }
@@ -237,7 +237,7 @@ impl Engine {
         let mut scan = rows.into_reader()?;
         while let Some(row) = scan.next()? {
             if match &filter {
-                Some(f) => f.eval(&row, env, meter)?.is_true(),
+                Some(f) => f.eval_filter(&row, env, meter)?,
                 None => true,
             } {
                 filtered.push(row)?;
@@ -259,7 +259,7 @@ impl Engine {
                 let mut kept = self.blocking_spool();
                 let mut scan = rows.into_reader()?;
                 while let Some(row) = scan.next()? {
-                    if having.eval(&row, env, meter)?.is_true() {
+                    if having.eval_filter(&row, env, meter)? {
                         kept.push(row)?;
                     }
                 }
@@ -457,7 +457,7 @@ impl Engine {
                     let mut keep = true;
                     for &oi in &on_indices {
                         if let Some(on) = &join_ons[oi] {
-                            if !on.eval(&combined, env, meter)?.is_true() {
+                            if !on.eval_filter(&combined, env, meter)? {
                                 keep = false;
                                 break;
                             }
@@ -468,7 +468,7 @@ impl Engine {
                     }
                     if let Some(filter) = &post_join_filter {
                         let before = meter.accrued;
-                        keep = filter.eval(&combined, env, meter)?.is_true();
+                        keep = filter.eval_filter(&combined, env, meter)?;
                         filter_work += meter.accrued - before;
                         if !keep {
                             continue;
@@ -660,7 +660,7 @@ impl Engine {
                     let mut keep = true;
                     for &on_index in &on_indices {
                         if let Some(predicate) = &join_ons[on_index] {
-                            if !predicate.eval(&combined, env, meter)?.is_true() {
+                            if !predicate.eval_filter(&combined, env, meter)? {
                                 keep = false;
                                 break;
                             }

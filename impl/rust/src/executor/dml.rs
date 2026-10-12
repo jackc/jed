@@ -2060,7 +2060,7 @@ impl Engine {
                                 // unchanged, not returned) — but the arbiter key was already
                                 // proposed, so a second row still trips §4 (probed).
                                 if let Some(f) = filter {
-                                    if !f.eval(&combined, &env, meter)?.is_true() {
+                                    if !f.eval_filter(&combined, &env, meter)? {
                                         continue;
                                     }
                                 }
