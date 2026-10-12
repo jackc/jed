@@ -54,7 +54,6 @@ import {
   Engine,
   SessionState,
   Snapshot,
-  stmtIsWrite,
   type Outcome,
   type InsertCacheHolder,
   type ScanCacheHolder,
@@ -69,7 +68,7 @@ import {
   newAttachedStorage,
   toImage as toImageBytes,
 } from "./format.ts";
-import type { CompositeType, Table } from "./catalog.ts";
+import type { CompositeType, Table, ViewDef } from "./catalog.ts";
 import type { ExtensionRegistry } from "./extension.ts";
 import type { Row } from "./storage.ts";
 import type { Cursor } from "./cursor.ts";
@@ -1369,7 +1368,11 @@ export class Session {
     // Route the read before building the lazy cursor: an autocommit (non-block, writable access) read
     // re-pins the latest committed so the snapshot is current; a read-only session uses its existing
     // pin, and an open block uses its working set.
-    if (this.access !== "ro" && this.engine.session.tx === null && !stmtIsWrite(stmt)) {
+    if (
+      this.access !== "ro" &&
+      this.engine.session.tx === null &&
+      !this.engine.stmtIsWriteWithViews(stmt)
+    ) {
       this.core.refreshShared();
       this.refreshCommitted();
     }
@@ -1387,7 +1390,7 @@ export class Session {
       stmt.kind !== "begin" &&
       stmt.kind !== "commit" &&
       stmt.kind !== "rollback" &&
-      !stmtIsWrite(stmt);
+      !this.engine.stmtIsWriteWithViews(stmt);
     // pin registers the cursor's snapshot version in the watermark (streaming.md §5); the deregister
     // runs on cursor close (JS has no destructor), advancing oldestLiveTxid.
     const pin = (built: { columnNames: string[]; columnTypes: string[]; cursor: Cursor }): Rows => {
@@ -1501,7 +1504,7 @@ export class Session {
     insertHolder: InsertCacheHolder | null,
   ): Outcome {
     if (this.access === "ro") {
-      if (stmtIsWrite(stmt)) {
+      if (this.engine.stmtIsWriteWithViews(stmt)) {
         throw engineError(
           "read_only_sql_transaction",
           "cannot execute a write statement against a read-only snapshot",
@@ -1517,7 +1520,7 @@ export class Session {
       // working set. The gate is already held for a writable block.
       return this.engine.executeStmtParams(stmt, params, insertHolder);
     }
-    if (!stmtIsWrite(stmt)) {
+    if (!this.engine.stmtIsWriteWithViews(stmt)) {
       // Autocommit read: pin the latest committed for this one statement (PG-faithful); no gate.
       this.refreshCommitted();
       return this.engine.executeStmtParams(stmt, params, insertHolder);
@@ -1891,6 +1894,12 @@ export class Session {
   }
   compositeType(name: string): CompositeType | undefined {
     return this.engine.compositeType(name);
+  }
+  // viewsInDependencyOrder is every view of the main database this session sees, in dependency order
+  // — a view after every view it reads, ties in name byte order (spec/design/views.md §11, the CLI
+  // dump order). SQL's jed_views is the introspection surface.
+  viewsInDependencyOrder(): ViewDef[] {
+    return this.engine.viewsInDependencyOrder();
   }
   rowsInKeyOrder(name: string): Row[] {
     return this.engine.rowsInKeyOrder(name);

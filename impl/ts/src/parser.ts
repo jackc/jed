@@ -48,6 +48,7 @@ import type {
   Statement,
   SubscriptSpec,
   TableRef,
+  TableRefPos,
   TypeFieldDef,
   TypeMod,
   Update,
@@ -373,17 +374,29 @@ class Parser {
         if (this.peekKeywordAt(1) === "type") return this.parseCreateType();
         // CREATE SEQUENCE — a 2-token lookahead keeps SEQUENCE non-reserved (sequences.md §1).
         if (this.peekKeywordAt(1) === "sequence") return this.parseCreateSequence();
+        // CREATE VIEW (views.md §1, grammar.md §54) — VIEW is recognized positionally, so
+        // `CREATE TABLE view (…)` still names a table. The deferred forms are recognized by their
+        // keyword sequence and refused with 0A000 before the body is parsed (§12).
+        if (this.atDeferredCreateView()) {
+          throw engineError("feature_not_supported", "this form of CREATE VIEW is not supported");
+        }
+        if (this.peekKeywordAt(1) === "view") return this.parseCreateView();
         return this.parseCreateTable();
       case "drop":
         if (this.peekKeywordAt(1) === "index") return this.parseDropIndex();
         if (this.peekKeywordAt(1) === "type") return this.parseDropType();
         if (this.peekKeywordAt(1) === "sequence") return this.parseDropSequence();
+        if (this.peekKeywordAt(1) === "view") return this.parseDropView();
         return this.parseDropTable();
       // ALTER SEQUENCE — the only ALTER statement this slice (sequences.md §4). A 2-token lookahead
       // recognizes it; any other `ALTER …` (TABLE, SYSTEM, …) is not a statement keyword jed knows
       // and falls through to the generic unknown-keyword 42601 (the no-escape-hatch surface).
       case "alter":
         if (this.peekKeywordAt(1) === "sequence") return this.parseAlterSequence();
+        // ALTER VIEW is a deferred follow-on (views.md §12).
+        if (this.peekKeywordAt(1) === "view") {
+          throw engineError("feature_not_supported", "ALTER VIEW is not supported");
+        }
         if (this.peekKeywordAt(1) === "table") return this.parseAlterTable();
         throw engineError("syntax_error", "unexpected keyword 'alter'");
       case "insert":
@@ -413,6 +426,116 @@ class Parser {
       default:
         throw engineError("syntax_error", `unexpected keyword '${this.peekKeyword()}'`);
     }
+  }
+
+  // atDeferredCreateView reports whether the statement is one of the deferred `CREATE … VIEW` forms
+  // (views.md §12): `CREATE OR REPLACE VIEW`, `CREATE TEMP | TEMPORARY VIEW`, `CREATE RECURSIVE
+  // VIEW`, `CREATE MATERIALIZED VIEW`. Recognized by keyword sequence so each fails 0A000, not 42601.
+  private atDeferredCreateView(): boolean {
+    switch (this.peekKeywordAt(1)) {
+      case "or":
+        return this.peekKeywordAt(2) === "replace" && this.peekKeywordAt(3) === "view";
+      case "temp":
+      case "temporary":
+      case "recursive":
+      case "materialized":
+        return this.peekKeywordAt(2) === "view";
+      default:
+        return false;
+    }
+  }
+
+  // parseCreateView parses `CREATE VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr`
+  // (views.md §1, grammar.md §54). The body runs from the token after `AS` to the end of the
+  // statement and is captured as its canonical token text. A `WITH ( … )` option list after the name
+  // and a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` are deferred forms (0A000); the check option
+  // is detected after the body is parsed, so a body syntax error is reported first.
+  private parseCreateView(): Statement {
+    this.expectKeyword("create");
+    this.expectKeyword("view");
+    // A two-token lookahead keeps a lone `if` an ordinary view name (`CREATE VIEW if AS …`).
+    const ifNotExists =
+      this.peekKeyword() === "if" && this.peekKeywordAt(1) === "not"
+        ? this.parseIfNotExists()
+        : false;
+    const [db, name] = this.parseQualifiedTableName();
+    if (this.peekKeyword() === "with" && this.peekKindAt(1) === "lparen") {
+      throw engineError("feature_not_supported", "view options (WITH ( … )) are not supported");
+    }
+    let columns: string[] | null = null;
+    if (this.peek().kind === "lparen") {
+      this.advance();
+      columns = [this.expectIdentifier()];
+      while (this.peek().kind === "comma") {
+        this.advance();
+        columns.push(this.expectIdentifier());
+      }
+      this.expect("rparen");
+    }
+    this.expectKeyword("as");
+    // A trailing `WITH [CASCADED | LOCAL] CHECK OPTION` is cut off before the body is parsed (an
+    // unreserved `with` would otherwise be read as a table alias) and refused after it.
+    const checkOption = this.trailingCheckOption();
+    if (checkOption !== null) this.tokens[checkOption] = { kind: "eof" };
+    const start = this.pos;
+    this.parseSubquery();
+    const end = this.pos;
+    if (checkOption !== null) {
+      if (end !== checkOption) throw engineError("syntax_error", "unexpected trailing input");
+      throw engineError("feature_not_supported", "WITH CHECK OPTION is not supported");
+    }
+    const body = renderTokens(this.tokens.slice(start, end));
+    return { kind: "createView", name, db, ifNotExists, columns, body };
+  }
+
+  // trailingCheckOption returns the index of a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` at the
+  // end of the token stream (views.md §12), or null if the statement does not end with one.
+  private trailingCheckOption(): number | null {
+    let end = this.tokens.length;
+    if (this.tokens[end - 1]?.kind === "eof") end--;
+    const word = (i: number, w: string): boolean => {
+      const t = this.tokens[i];
+      return t !== undefined && t.kind === "word" && t.word === w;
+    };
+    if (end < this.pos + 3 || !word(end - 1, "option") || !word(end - 2, "check")) return null;
+    if (word(end - 3, "with")) return end - 3;
+    if (
+      end >= this.pos + 4 &&
+      (word(end - 3, "cascaded") || word(end - 3, "local")) &&
+      word(end - 4, "with")
+    ) {
+      return end - 4;
+    }
+    return null;
+  }
+
+  // parseDropView parses `DROP VIEW [IF EXISTS] [db.]name [, …] [CASCADE | RESTRICT]` (views.md §1).
+  // IF EXISTS is a two-token lookahead, so `DROP VIEW if` drops a view named `if`.
+  private parseDropView(): Statement {
+    this.expectKeyword("drop");
+    this.expectKeyword("view");
+    const ifExists = this.peekKeyword() === "if" && this.peekKeywordAt(1) === "exists";
+    if (ifExists) {
+      this.advance(); // IF
+      this.advance(); // EXISTS
+    }
+    const qualified = (): { db: string | undefined; name: string } => {
+      const [db, name] = this.parseQualifiedTableName();
+      return { db, name };
+    };
+    const names = [qualified()];
+    while (this.peek().kind === "comma") {
+      this.advance();
+      names.push(qualified());
+    }
+    let cascade = false;
+    if (this.peekKeyword() === "cascade") {
+      this.advance();
+      cascade = true;
+    } else if (this.peekKeyword() === "restrict") {
+      this.advance();
+    }
+    return { kind: "dropView", names, ifExists, cascade };
   }
 
   // parseAnalyze parses `ANALYZE qualified_table [(identifier [, identifier ...])]`.
@@ -2655,6 +2778,7 @@ class Parser {
     if (this.peekKeyword() === "json_table" && this.peekKindAt(1) === "lparen") {
       return this.parseJsonTable();
     }
+    let namePos = this.pos;
     let name = this.expectIdentifier();
     // An optional DATABASE qualifier `db "." table` (spec/design/attached-databases.md §3): a `.`
     // after the first identifier makes it the database qualifier and the next identifier the table
@@ -2664,6 +2788,7 @@ class Parser {
     if (this.peek().kind === "dot") {
       this.advance(); // .
       db = name;
+      namePos = this.pos;
       name = this.expectIdentifier();
     }
     // A `(` right after the name = a set-returning function call (no `*`/`DISTINCT`).
@@ -2681,32 +2806,41 @@ class Parser {
       this.expect("rparen");
     }
     let alias: string | null = null;
+    let aliasPos: number | null = null;
     if (this.peekKeyword() === "as") {
       this.advance();
+      aliasPos = this.pos;
       alias = this.expectIdentifier();
     } else {
       const t = this.peek();
       if (t.kind === "quotedIdent") {
         alias = t.str!;
+        aliasPos = this.pos;
         this.advance();
       } else if (t.kind === "word" && !isTableRefStopKeyword(t.word!)) {
         alias = t.word!;
+        aliasPos = this.pos;
         this.advance();
       }
     }
-    // A `(` after a table-function alias is either the rename-only column-alias list
-    // `AS g(c1, …)` (grammar.md §35) or the typed column-definition list `AS g(c type, …)`
-    // used by record-returning functions (C0, json-table.md §1). A base table's corresponding
-    // list remains a deferred 0A000 narrowing.
+    // A `(` after an alias is a column alias list. On a base table (or view) it is the rename-only
+    // list `AS x(p, q)` (grammar.md §15). On a table function it is either the rename-only list
+    // `AS g(c1, …)` (§35) or the typed column-definition list `AS g(c type, …)` used by
+    // record-returning functions (C0, json-table.md §1).
     let columnAliases: string[] | undefined;
     let columnDefs: TypeFieldDef[] | undefined;
-    if (alias !== null && this.peek().kind === "lparen") {
-      if (args === null) {
-        throw engineError(
-          "feature_not_supported",
-          "column alias list on a base table is not supported yet",
-        );
+    let listPos: [number, number] | null = null;
+    if (alias !== null && this.peek().kind === "lparen" && args === null) {
+      const open = this.pos;
+      this.advance(); // (
+      columnAliases = [this.expectIdentifier()];
+      while (this.peek().kind === "comma") {
+        this.advance();
+        columnAliases.push(this.expectIdentifier());
       }
+      listPos = [open, this.pos];
+      this.expect("rparen");
+    } else if (alias !== null && this.peek().kind === "lparen") {
       this.advance(); // (
       // Disambiguate: a col-def list has `name type`; a rename list has `name ,`/`name )`. After the
       // opening `(`, the current token is the first column name, so a `word` in the NEXT slot means a
@@ -2723,7 +2857,8 @@ class Parser {
       }
     }
     // An SRF is implicitly lateral; `lateral` records only whether the keyword was written.
-    return { name, db, alias, args, columnAliases, columnDefs, lateral };
+    const pos: TableRefPos = { name: namePos, alias: aliasPos, list: listPos };
+    return { name, db, alias, args, columnAliases, columnDefs, lateral, pos };
   }
 
   // parseDerivedTable parses a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42)
@@ -3290,8 +3425,9 @@ class Parser {
 
   private parseSelectItems(): SelectItems {
     if (this.peek().kind === "star") {
+      const pos = this.pos;
       this.advance();
-      return { kind: "all" };
+      return { kind: "all", pos };
     }
     const items: SelectItem[] = [];
     for (;;) {
@@ -3304,10 +3440,11 @@ class Parser {
         this.peekKindAt(1) === "dot" &&
         this.peekKindAt(2) === "star"
       ) {
+        const pos = this.pos;
         const qualifier = this.expectIdentifier();
         this.advance(); // .
         this.advance(); // *
-        items.push({ expr: { kind: "qualifiedStar", qualifier }, alias: null });
+        items.push({ expr: { kind: "qualifiedStar", qualifier, pos }, alias: null });
         if (this.peek().kind === "comma") {
           this.advance();
           continue;
@@ -4687,6 +4824,11 @@ class Parser {
     return t.str!;
   }
 
+  // parseViewBody parses a whole token stream's `subquery_expr` (parseViewDefinition's entry).
+  parseViewBody(): QueryExpr {
+    return this.parseSubquery();
+  }
+
   expectEof(): void {
     if (this.peek().kind !== "eof") {
       throw engineError("syntax_error", "unexpected trailing input");
@@ -4703,6 +4845,16 @@ export function parseExpression(text: string): Expr {
   const expr = p.parseExpr();
   p.expectEof();
   return expr;
+}
+
+// parseViewDefinition parses a stored view definition (spec/design/views.md §3): the canonical body
+// text as a `subquery_expr`. Every token position the AST records (TableRef.pos, a star's pos) is an
+// index into lex(text), which is what the rename rewrites and `*` freezing edit.
+export function parseViewDefinition(text: string): QueryExpr {
+  const p = new Parser(lex(text));
+  const body = p.parseViewBody();
+  p.expectEof();
+  return body;
 }
 
 // renderTokens re-renders a token slice as the persisted check-expression text: each token

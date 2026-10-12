@@ -14,13 +14,7 @@ import {
   type RunResult,
   Statement as ErgoStatement,
 } from "./ergonomic.ts";
-import {
-  type Engine,
-  type InsertCacheHolder,
-  type Outcome,
-  type ScanCacheHolder,
-  stmtIsWrite,
-} from "./executor.ts";
+import type { Engine, InsertCacheHolder, Outcome, ScanCacheHolder } from "./executor.ts";
 import { renderIn, type Value } from "./value.ts";
 
 // PreparedStatement is a parsed, reusable statement (spec/design/api.md §2.4): a standalone value
@@ -269,7 +263,7 @@ function queryStmt(
     stmt.kind !== "begin" &&
     stmt.kind !== "commit" &&
     stmt.kind !== "rollback" &&
-    !stmtIsWrite(stmt);
+    !db.stmtIsWriteWithViews(stmt);
   try {
     if (isRead) db.gateReadLanes(stmt);
     const scanned = db.tryScanQuery(stmt, params, holder);

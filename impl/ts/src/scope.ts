@@ -289,9 +289,43 @@ export class Scope {
         }
       }
     }
-    if (found >= 0) return { level: 0, index: found };
+    if (found >= 0) {
+      this.traceFlat(found);
+      return { level: 0, index: found };
+    }
     if (this.parent !== null) return outerOf(this.parent.resolveBare(name));
     throw undefinedColumn(name);
+  }
+
+  // starLabel is the label a frozen `*` column renders with (spec/design/views.md §5): null (a bare
+  // `"column"`) for a USING/NATURAL merged column and for a relation with no label (an unaliased
+  // derived table); an unaliased parenthesized join's column takes its inner relation's label; any
+  // other column its relation's label.
+  starLabel(idx: number): string | null {
+    if (this.merges.some((m) => m.index === idx)) return null;
+    for (const r of this.rels) {
+      const n = r.table.columns.length;
+      if (idx >= r.offset && idx < r.offset + n) {
+        if (r.label !== "") return r.label;
+        const sr = this.subRels.find((sub) => sub.slots.includes(idx));
+        return sr === undefined ? null : sr.label;
+      }
+    }
+    return null;
+  }
+
+  // traceFlat records a resolved column of this scope as a view dependency when a view body is being
+  // traced and the column belongs to a catalog base table (spec/design/views.md §6). A no-op on every
+  // ordinary statement.
+  traceFlat(idx: number): void {
+    if (this.catalog.viewTrace === null) return;
+    for (const r of this.rels) {
+      const n = r.table.columns.length;
+      if (idx >= r.offset && idx < r.offset + n) {
+        if (r.base === true) this.catalog.traceColumn(r.table.name, idx - r.offset);
+        return;
+      }
+    }
   }
 
   // resolveQualified resolves a qualified rel.col against THIS scope, then outward. A qualifier
@@ -319,8 +353,9 @@ export class Scope {
         }
         if (found < 0) throw undefinedColumn(name);
         if (ambiguous) throw ambiguousColumn(name);
-        if (visible >= 0) return { level: 0, index: visible };
-        return { level: 0, index: found };
+        const idx = visible >= 0 ? visible : found;
+        this.traceFlat(idx);
+        return { level: 0, index: idx };
       }
     }
     for (const sr of this.subRels) {
@@ -1369,6 +1404,8 @@ export function stmtIsWrite(stmt: Statement): boolean {
     stmt.kind === "createSequence" ||
     stmt.kind === "alterSequence" ||
     stmt.kind === "dropSequence" ||
+    stmt.kind === "createView" ||
+    stmt.kind === "dropView" ||
     stmt.kind === "insert" ||
     stmt.kind === "update" ||
     stmt.kind === "delete" ||
@@ -1568,6 +1605,8 @@ export function collectStmtPrivs(stmt: Statement, req: PrivReq): void {
     case "createSequence":
     case "dropSequence":
     case "alterSequence":
+    case "createView":
+    case "dropView":
       req.isDdl = true;
       break;
     case "insert":
@@ -1924,6 +1963,10 @@ export function stmtKind(stmt: Statement): string {
       return "ALTER SEQUENCE";
     case "dropSequence":
       return "DROP SEQUENCE";
+    case "createView":
+      return "CREATE VIEW";
+    case "dropView":
+      return "DROP VIEW";
     case "insert":
       return "INSERT";
     case "update":

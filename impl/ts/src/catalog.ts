@@ -1,7 +1,7 @@
 // Table metadata: column definitions and lookups. Data-shaped (a type + free
 // functions) to match the boring/explicit style (CLAUDE.md §10).
 
-import type { Expr } from "./ast.ts";
+import type { Expr, QueryExpr } from "./ast.ts";
 import {
   type DecimalTypmod,
   type ScalarType,
@@ -288,6 +288,31 @@ export type CompositeField = {
 // isCalled are the mutable counter state a nextval advances. The whole struct lives in the snapshot
 // catalog, so the counter is transactional by construction (sequences.md §5). The i64 fields are
 // bigint (the TS core's exact-i64 representation).
+// ViewDef is a view (spec/design/views.md §3): a named, persisted query, the fifth database-level
+// catalog object. It has no storage of its own. The definition is the canonical token text of its
+// body after `*` freezing and RENAME rewrites; reading the view plans it again as the equivalent
+// derived table (§4). Output types are never stored — planning derives them. ViewDef objects are
+// never mutated in place (only replaced/removed), so a snapshot's shallow Map copy is safe.
+export type ViewDef = {
+  // The exact view name (grammar.md §3).
+  name: string;
+  // The output column names, in order (the column list applied over the body's names).
+  columns: string[];
+  // The stored canonical definition (format.md *Check-expression text*).
+  definition: string;
+  // The tables and views the body reads, in ascending name byte order (§6).
+  deps: ViewDep[];
+  // The parsed definition — parsed at create and at load, never persisted.
+  body: QueryExpr;
+};
+
+// ViewDepKind is what a view dependency names (format.md *View entry* dep_kind: table 0, view 1).
+export type ViewDepKind = "table" | "view";
+
+// ViewDep is one persisted view dependency (spec/design/views.md §6): a table with the exact set of
+// its columns the body references (ascending byte order), or a view (no columns).
+export type ViewDep = { kind: ViewDepKind; name: string; columns: string[] };
+
 export type SequenceDef = {
   // The exact sequence name (grammar.md §3); looked up byte-exactly.
   name: string;

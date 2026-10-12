@@ -59,13 +59,18 @@ test("DROP TABLE syntax errors trap 42601", () => {
     "42601",
   ); // trailing input
   // DROP INDEX is its own statement now (spec/design/indexes.md §2): a missing index is
-  // 42704, not a syntax error; DROP of any other object kind is still unparsed.
+  // 42704, not a syntax error; so is DROP VIEW (a missing view is 42P01, views.md §1). DROP of any
+  // other object kind is still unparsed.
   assert.equal(
     errCode(() => db.execute("DROP INDEX x")),
     "42704",
   );
   assert.equal(
     errCode(() => db.execute("DROP VIEW v")),
+    "42P01",
+  );
+  assert.equal(
+    errCode(() => db.execute("DROP FUNCTION f")),
     "42601",
   );
 });

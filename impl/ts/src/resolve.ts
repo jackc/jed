@@ -164,6 +164,18 @@ export function resolveProjections(
         names.push(c.name);
         types.push(resolvedTypeOfCol(c.type, scope.catalog));
         derivs.push(catColumnDeriv(c));
+        scope.traceFlat(idx);
+      }
+      // A written `*` in a view body is frozen into its expansion (views.md §5).
+      if (items.pos !== undefined && scope.catalog.viewTrace !== null) {
+        scope.catalog.traceStar(
+          items.pos,
+          false,
+          scope.star.map((idx): [string | null, string] => [
+            scope.starLabel(idx),
+            scope.columnAt(idx).name,
+          ]),
+        );
       }
       return { nodes, names, types, derivs };
     }
@@ -218,7 +230,16 @@ export function resolveProjections(
         names.push(c.name);
         types.push(resolvedTypeOfCol(c.type, scope.catalog));
         derivs.push(catColumnDeriv(c));
+        scope.traceFlat(slots[i]!);
       });
+      // A written `rel.*` in a view body is frozen into `"rel" . "col"` references (views.md §5).
+      if (it.expr.pos !== undefined && scope.catalog.viewTrace !== null) {
+        scope.catalog.traceStar(
+          it.expr.pos,
+          true,
+          table.columns.map((c): [string | null, string] => [want, c.name]),
+        );
+      }
       continue;
     }
     // `(expr).*` expands a composite base into one output column per field, in declaration order
@@ -616,6 +637,11 @@ export function resolve(
       };
     }
     case "param": {
+      // A view body has no parameters (views.md §1.1/§4.1): 42P02 where the planner meets it, so
+      // earlier resolution errors keep PostgreSQL's order.
+      if (scope.catalog.viewTrace !== null) {
+        throw engineError("undefined_parameter", `there is no parameter $${e.index}`);
+      }
       // A bind parameter is an adaptable operand (like an integer/string literal): it takes its
       // type from ctx — the sibling operand, target column, or CAST target. Record the inferred
       // type (null = no context here; finalize 42P18s a parameter that never gets one).

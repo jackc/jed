@@ -11,6 +11,8 @@ import type {
   IndexDef,
   SequenceDef,
   Table,
+  ViewDef,
+  ViewDepKind,
 } from "./catalog.ts";
 import { indexColumnOrdinals } from "./catalog.ts";
 import { TableStore } from "./storage.ts";
@@ -78,6 +80,10 @@ export class Snapshot {
   // it (sequences.md §5). SequenceDef objects are never mutated in place (only replaced/removed),
   // so the shallow Map copy in clone is safe.
   sequences: Map<string, SequenceDef>;
+  // views holds the database's views, keyed by exact name (spec/design/views.md). They share the
+  // relation namespace with tables, indexes, and sequences; serialized as `entry_kind = 5` catalog
+  // entries (format v38). ViewDef objects are never mutated in place, so clone's shallow copy is safe.
+  views: Map<string, ViewDef> = new Map();
   // collations caches collations RESOLVED from the file's reference entries on open, keyed by their
   // exact (CASE-SENSITIVE) name — collation names are quoted identifiers ("en-US",
   // spec/design/collation.md §1). C is never stored (table-free, built in). Under the reference-only
@@ -143,6 +149,7 @@ export class Snapshot {
     );
     // GiST trees are never mutated in place — only replaced wholesale — so a shallow Map copy is safe.
     c.gistTrees = new Map(this.gistTrees);
+    c.views = new Map(this.views);
     c.catGen = this.catGen;
     c.dataGen = this.dataGen;
     c.estimatorIdentity = this.estimatorIdentity;
@@ -401,6 +408,36 @@ export class Snapshot {
   removeSequence(key: string): void {
     this.dataGen++;
     this.sequences.delete(key);
+  }
+
+  // view looks up a view by exact name (spec/design/views.md).
+  view(name: string): ViewDef | undefined {
+    return this.views.get(name);
+  }
+
+  // putView registers (or replaces, for a rewrite) a view. A schema change: bumps the catalog
+  // generation, which also marks the main domain changed for commit.
+  putView(view: ViewDef): void {
+    this.bumpCatGen();
+    this.views.set(view.name, view);
+  }
+
+  // removeView removes a view (DROP VIEW). The caller has checked it exists and has no dependent.
+  removeView(key: string): void {
+    this.bumpCatGen();
+    this.views.delete(key);
+  }
+
+  // viewsSorted is every view in ascending name byte order (no map-iteration leak, CLAUDE.md §8):
+  // the catalog emission order and the jed_views generation order.
+  viewsSorted(): ViewDef[] {
+    return [...this.views.keys()].sort(compareTextC).map((k) => this.views.get(k)!);
+  }
+
+  // viewsDependingOn is the views that depend on the table or view `name` of the given kind, in name
+  // byte order (spec/design/views.md §6).
+  viewsDependingOn(kind: ViewDepKind, name: string): ViewDef[] {
+    return this.viewsSorted().filter((v) => v.deps.some((d) => d.kind === kind && d.name === name));
   }
 
   // sequencesSorted is all sequences in ascending name byte order — the on-disk emission

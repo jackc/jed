@@ -944,6 +944,20 @@ function identityTableDB(): Engine {
   return db;
 }
 
+// viewTableDB (v38): three entry_kind = 5 view entries after the table entry, in name order (n, v,
+// w) — the frozen `*` expansion, a column-list rename with a view dependency, and a table dependency
+// with zero columns. Must match the Ruby reference's VIEW_TABLE (spec/fileformat/verify.rb),
+// spec/design/views.md §3.
+function viewTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (a i32 PRIMARY KEY, b text)");
+  run(db, "INSERT INTO t VALUES (1, 'x'), (2, 'y')");
+  run(db, "CREATE VIEW v AS SELECT * FROM t WHERE a > 0");
+  run(db, "CREATE VIEW w (x) AS SELECT a FROM v");
+  run(db, "CREATE VIEW n AS SELECT count(*) AS c FROM t");
+  return db;
+}
+
 // collationTableDB is a reference-only COLLATION (v18 — entry_kind 3 metadata entry + per-column
 // collations): the loaded unicode collation (the real version-pinned CLDR-DUCET root, UCA/UCD
 // 17.0.0) as the per-database default (is_default), a column with explicit COLLATE "unicode" (flags
@@ -1071,6 +1085,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "sequence_table.jed", build: sequenceTableDB },
     { name: "serial_table.jed", build: serialTableDB },
     { name: "identity_table.jed", build: identityTableDB },
+    { name: "view_table.jed", build: viewTableDB },
     { name: "collation_table.jed", build: collationTableDB },
     { name: "collation_pk_table.jed", build: collationPKTableDB },
     { name: "collation_array_table.jed", build: collationArrayTableDB },
@@ -1148,6 +1163,7 @@ test("read goldens reproduces rows", () => {
     { name: "sequence_table.jed", build: sequenceTableDB, table: "t" },
     { name: "serial_table.jed", build: serialTableDB, table: "t" },
     { name: "identity_table.jed", build: identityTableDB, table: "t" },
+    { name: "view_table.jed", build: viewTableDB, table: "t" },
     { name: "collation_table.jed", build: collationTableDB, table: "t" },
     { name: "collation_pk_table.jed", build: collationPKTableDB, table: "t" },
     { name: "collation_array_table.jed", build: collationArrayTableDB, table: "t" },
@@ -1360,6 +1376,82 @@ test("statistics semantic corruption is rejected", () => {
   assert.throws(
     () => loadEngine(image),
     (error: unknown) => error instanceof Error && error.message.startsWith("XX001"),
+  );
+});
+
+// rows runs a query against an engine and returns its result rows.
+function rows(db: Engine, sql: string): Value[][] {
+  const out = execute(db, sql);
+  assert.equal(out.kind, "query", sql);
+  return out.kind === "query" ? out.rows : [];
+}
+
+// refreshPageCrc recomputes the per-page CRC of the page containing byte `at` after a forged edit,
+// so the edit reaches the catalog decoder instead of failing at the checksum guard.
+function refreshPageCrc(image: Uint8Array, at: number): void {
+  const pageStart = Math.floor(at / GOLDEN_PAGE_SIZE) * GOLDEN_PAGE_SIZE;
+  const covered = new Uint8Array(GOLDEN_PAGE_SIZE - 4);
+  covered.set(image.subarray(pageStart, pageStart + 12), 0);
+  covered.set(image.subarray(pageStart + 16, pageStart + GOLDEN_PAGE_SIZE), 12);
+  new DataView(image.buffer, image.byteOffset, image.byteLength).setUint32(
+    pageStart + 12,
+    crc32Ieee(covered),
+    false,
+  );
+}
+
+// findBytes returns the offset of the unique occurrence of `pattern` in `image`.
+function findBytes(image: Uint8Array, pattern: Uint8Array): number {
+  const matches: number[] = [];
+  for (let i = 0; i <= image.length - pattern.length; i++) {
+    if (pattern.every((b, j) => image[i + j] === b)) matches.push(i);
+  }
+  assert.equal(matches.length, 1, "locate the pattern uniquely");
+  return matches[0]!;
+}
+
+const text = (s: string): Value => ({ kind: "text", text: s });
+
+// Loading view_table.jed restores the three views: their stored text and columns, and reading each
+// one (spec/design/views.md §3/§4).
+test("view golden reads back", () => {
+  const db = loadEngine(fixture("view_table.jed"));
+  assert.deepStrictEqual(rows(db, "SELECT name, definition FROM jed_views ORDER BY name"), [
+    [text("n"), text("select count ( * ) as c from t")],
+    [text("v"), text('select "t" . "a" , "t" . "b" from t where a > 0')],
+    [text("w"), text("select a from v")],
+  ]);
+  assert.deepStrictEqual(rows(db, "SELECT x FROM w ORDER BY x"), [[intValue(1n)], [intValue(2n)]]);
+  assert.deepStrictEqual(rows(db, "SELECT c FROM n"), [[intValue(2n)]]);
+});
+
+// A stored view definition that no longer parses is corruption (XX001) at open — the body is parsed
+// (never planned) when the catalog loads (spec/design/views.md §3).
+test("view corrupt definition is rejected", () => {
+  const image = fixture("view_table.jed");
+  // Replace the `a` in view w's `select a from v` with `(`, keeping its length.
+  const at = findBytes(image, new TextEncoder().encode("select a from v"));
+  image[at + 7] = "(".charCodeAt(0);
+  refreshPageCrc(image, at);
+  assert.throws(
+    () => loadEngine(image),
+    (e: unknown) => e instanceof Error && e.message.startsWith("XX001"),
+  );
+});
+
+// A dependency on a missing table is corruption (XX001): the loader checks every dependency names
+// an existing relation of its kind (format.md *View entry*).
+test("view dangling dependency is rejected", () => {
+  const image = fixture("view_table.jed");
+  // View n's dependency entry: kind 0, name "t" (u16 1), zero columns — renamed to "u".
+  const ends = new TextEncoder().encode("select count ( * ) as c from t");
+  const depAt = findBytes(image, ends) + ends.length + 2; // after the u16 dep_count
+  assert.deepStrictEqual([...image.subarray(depAt, depAt + 6)], [0, 0, 1, "t".charCodeAt(0), 0, 0]);
+  image[depAt + 3] = "u".charCodeAt(0);
+  refreshPageCrc(image, depAt);
+  assert.throws(
+    () => loadEngine(image),
+    (e: unknown) => e instanceof Error && e.message.startsWith("XX001"),
   );
 });
 

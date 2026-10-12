@@ -954,8 +954,11 @@ export function astDeepEqual(a: unknown, b: unknown): boolean {
   }
   const ao = a as Record<string, unknown>;
   const bo = b as Record<string, unknown>;
-  const ak = Object.keys(ao);
-  if (ak.length !== Object.keys(bo).length) return false;
+  // A `pos` key is a token position a view-definition parse records (TableRef / `*` / `rel.*` —
+  // spec/design/views.md §5/§7); it is invisible to structural equality, like Rust's always-equal
+  // TableRefPos / StarPos.
+  const ak = Object.keys(ao).filter((k) => k !== "pos");
+  if (ak.length !== Object.keys(bo).filter((k) => k !== "pos").length) return false;
   for (const k of ak) {
     if (!Object.hasOwn(bo, k)) return false;
     if (!astDeepEqual(ao[k], bo[k])) return false;

@@ -338,7 +338,9 @@ export type Expr =
   // named relation, and (unlike bare `*`) MIXABLE with other select items (`SELECT t.*, u.x`). Valid
   // only in a SELECT/RETURNING projection list; in a scalar position it is 42601. An unknown qualifier
   // is 42P01. Distinct from the composite `(expr).*` (fieldStar): `t.*` names a relation.
-  | { kind: "qualifiedStar"; qualifier: string }
+  // `pos` is the qualifier token's position (views.md §5) — set by the parser for a written `rel.*`,
+  // used only when freezing a view body's `*`; ignored by structural AST equality (astDeepEqual).
+  | { kind: "qualifiedStar"; qualifier: string; pos?: number }
   // Array subscript `base[..][..]` (spec/design/array.md §6) — one or more bracketed specs applied
   // to an array `base`. Each spec is an index `[i]` or a slice `[m:n]` (with optionally-omitted
   // bounds). All-index access reads a single 1-based element (the element type); if any spec is a
@@ -360,8 +362,10 @@ export type SubscriptSpec =
 // resolver: a bare column's canonical name, or the fixed "?column?" otherwise.
 export type SelectItem = { expr: Expr; alias: string | null };
 
-// SelectItems is either all columns (*) or a list of projected expressions.
-export type SelectItems = { kind: "all" } | { kind: "list"; items: SelectItem[] };
+// SelectItems is either all columns (*) or a list of projected expressions. `pos` is the written
+// `*` token's position (views.md §5); absent for a star the parser synthesized (an unparenthesized
+// join group's `SELECT *`), which is never frozen. Ignored by structural AST equality.
+export type SelectItems = { kind: "all"; pos?: number } | { kind: "list"; items: SelectItem[] };
 
 // OrderKey is one ORDER BY sort key, in one of three modes resolved at parse time
 // (spec/design/grammar.md §10): an output-column ordinal (ordinal != null), a general expression
@@ -929,6 +933,19 @@ export type TableRef = {
   columnDefs?: TypeFieldDef[];
   jsonTable?: JsonTable;
   lateral?: boolean;
+  // The token positions of a base-table reference (views.md §7): where a stored view body's rename
+  // rewrites edit this FROM item. Meaningful only when parsing a view definition; ignored by
+  // structural AST equality (astDeepEqual skips every `pos` key).
+  pos?: TableRefPos;
+};
+
+// TableRefPos is the token positions a base-table FROM item occupies in its statement's token
+// stream (views.md §5/§7): the table-name token, the alias identifier token (when aliased), and the
+// `(` / `)` of its column alias list (when present). Indices into lex(text), Eof excluded.
+export type TableRefPos = {
+  name: number;
+  alias: number | null;
+  list: [number, number] | null;
 };
 
 // JsonTable is a `JSON_TABLE(ctx, path [AS name] COLUMNS (col, …))` table source (json-table.md §3,
@@ -1232,6 +1249,29 @@ export type Analyze = {
   columns: string[];
 };
 
+// CreateView is `CREATE VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr`
+// (spec/design/views.md §1, grammar.md §54). `body` is the canonical token text of the body
+// (format.md *Check-expression text*) — the definition before `*` freezing; the executor parses it
+// again on its own, so every token position the planner trace records is relative to the stored text.
+export type CreateView = {
+  kind: "createView";
+  name: string;
+  db?: string;
+  ifNotExists: boolean;
+  columns: string[] | null;
+  body: string;
+};
+
+// DropView is `DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]` (spec/design/views.md §1).
+// Each name may carry a database qualifier. `cascade` only changes the error a dependent view raises
+// (0A000 instead of 2BP01, §6).
+export type DropView = {
+  kind: "dropView";
+  names: { db: string | undefined; name: string }[];
+  ifExists: boolean;
+  cascade: boolean;
+};
+
 // Statement is a parsed top-level statement. A lone SELECT stays `Select`; `SetOp` appears only
 // when at least one set operator is present, and `With` only when a WITH prefix is present, so the
 // plain-query path and host API are untouched.
@@ -1247,6 +1287,8 @@ export type Statement =
   | AlterSequence
   | AlterTable
   | DropSequence
+  | CreateView
+  | DropView
   | Insert
   | Select
   | SetOp

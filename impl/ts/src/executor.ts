@@ -18,6 +18,7 @@ import type {
   CreateSequence,
   CreateTable,
   CreateType,
+  CreateView,
   ConflictTarget,
   ColumnDef,
   Cte,
@@ -28,6 +29,7 @@ import type {
   DropSequence,
   DropTable,
   DropType,
+  DropView,
   ExcludeDef,
   Explain,
   Expr,
@@ -86,6 +88,8 @@ import {
   type SeqOwner,
   type SequenceDef,
   type Table,
+  type ViewDef,
+  type ViewDep,
   columnIndex,
   indexColumnOrdinals,
   indexFirstColumn,
@@ -210,7 +214,9 @@ import {
   pagePayload,
   recordCompressUnits,
   resolveUnfetchedSelf,
+  PAGE_HEADER,
   typeCodeForScalar,
+  viewEntryBytes,
 } from "./format.ts";
 import {
   commitDurableAttachment,
@@ -240,12 +246,32 @@ import type { ExtensionRegistry, HostFuncEntry } from "./extension.ts";
 import { type ScriptSummary, splitStatements } from "./split.ts";
 import type { SharedPaging } from "./paging.ts";
 import {
+  MAX_EXPR_DEPTH,
   parseExpression,
   parseSQL,
+  parseViewDefinition,
   quoteIdentifier,
   rewriteColumnIdentifier,
   rewriteTableQualifier,
 } from "./parser.ts";
+import { lex } from "./lexer.ts";
+import {
+  type TraceItem,
+  type ViewAlterChange,
+  type ViewAlterPlan,
+  ViewTrace,
+  alterBreaksView,
+  depsEqual,
+  freezeStars,
+  renamedBaseTable,
+  renamedDeps,
+  rewriteViewText,
+  sortDeps,
+  viewNotSupported,
+  viewOutputNames,
+  viewUsing,
+  viewsInDependencyOrder,
+} from "./views.ts";
 import { type KeyBound, type PNode, colAt, compareBytes, unboundedBound } from "./pmap.ts";
 import { type RowCompare, SortedRows, type SpillSink, Sorter } from "./spill.ts";
 import { RowSpool, SpillMap, SpillMultiMap, SpillSet, SpoolSorter } from "./blocking.ts";
@@ -395,6 +421,7 @@ import {
 import { dateClockIsRelative, dateClockSpecial } from "./date.ts";
 import {
   assignableTo,
+  astDeepEqual,
   coerceSetopRows,
   combineSetop,
   exprEqual,
@@ -455,6 +482,7 @@ import {
   buildSequenceDef,
   checkRecursiveColumnTypes,
   collectExprPrivs,
+  collectQueryPrivs,
   collectStmtPrivs,
   conjunctCount,
   countCteRefsDml,
@@ -469,6 +497,7 @@ import {
   joinDetail,
   limitDetail,
   paramLabels,
+  queryCallsSeqMutator,
   rejectParamsForDDL,
   seqBoundCheckLast,
   seqBoundCheckStart,
@@ -737,6 +766,15 @@ export function compareName(a: { name: string }, b: { name: string }): number {
 // the check sits with each site's namespace-collision check so established validation orders
 // (42P01/42703 before name checks) are preserved. kind is the object word in the message: table /
 // index / sequence / type / constraint.
+// fkParentMissing is the error for a FOREIGN KEY parent that is not a table of the parent's
+// database: a view is the wrong object kind (42809, views.md §2); any other name is missing (42P01).
+function fkParentMissing(snap: Snapshot, name: string): EngineError {
+  if (snap.view(name) !== undefined) {
+    return engineError("wrong_object_type", `referenced relation "${name}" is not a table`);
+  }
+  return engineError("undefined_table", "table does not exist: " + name);
+}
+
 export function checkReservedName(kind: string, name: string): void {
   if (name.startsWith("jed_")) {
     throw engineError(
@@ -1393,6 +1431,13 @@ export class Engine {
   stagedAttachments: StagedCommit[] = [];
   // Per-top-level-statement de-duplication for transactional estimator-revision advances.
   private estimatorTouched = new Set<string>();
+  // Populated only while a view body is planned at CREATE VIEW, view re-validation, or a rename
+  // rewrite (spec/design/views.md §5–§8): the FROM items, columns, and `*` expansions the planner
+  // binds. null on every ordinary statement, which then pays one null check.
+  viewTrace: ViewTrace | null = null;
+  // How many view references are being expanded inside one another right now (views.md §4.1):
+  // nesting counts toward MAX_EXPR_DEPTH (54001).
+  private viewDepth = 0;
   // Inbound NO ACTION/RESTRICT probes deferred until the outermost recursive action closure has
   // reached its fixed point (§6.6). Empty between statements.
   private fkDeferredChecks: {
@@ -2632,7 +2677,7 @@ export class Engine {
       }
       // Run the statement; ANY error aborts the block (it enters the failed state — §6).
       try {
-        if (stmtIsWrite(stmt) && !tx.writable) {
+        if (this.stmtIsWriteWithViews(stmt) && !tx.writable) {
           throw engineError(
             "read_only_sql_transaction",
             "cannot execute " + stmtKind(stmt) + " in a read-only transaction",
@@ -2658,7 +2703,7 @@ export class Engine {
     // transaction — open a working snapshot off committed, run, then commit on success / discard on
     // error. Because the write mutates only working, an error leaves committed untouched (no restore
     // needed); rolled-back rowid allocations vanish with working (§7).
-    if (!stmtIsWrite(stmt)) {
+    if (!this.stmtIsWriteWithViews(stmt)) {
       return this.dispatchStmt(stmt, params, null, false);
     }
     // On a read-only handle the implicit transaction is READ ONLY (PostgreSQL hot-standby
@@ -3044,6 +3089,8 @@ export class Engine {
       isTempDdl: false,
     };
     collectStmtPrivs(stmt, req);
+    // The functions a read view's body calls need the reader's EXECUTE (views.md §9).
+    this.collectViewFunctionPrivs(req);
     // UPDATE's DEFAULT marker has no expression subtree. Add the selected catalog default's named
     // functions during preflight so a revoked function cannot be invoked through
     // `SET column = DEFAULT` (session.md §5.3).
@@ -3085,7 +3132,8 @@ export class Engine {
       // (jed_tables / jed_columns) is gated exactly like a user table — per-table SELECT on its own
       // name under the session envelope, no special case (introspection.md §5) — so an explicit-grant
       // session sees the schema only if the host granted it.
-      const exists = isCatalogRelName(key) || snap.table(key) !== undefined;
+      const exists =
+        isCatalogRelName(key) || snap.table(key) !== undefined || snap.view(key) !== undefined;
       if (exists && !this.session.privileges.allowsTable(key, t.priv)) {
         throw engineError("insufficient_privilege", "permission denied for table " + key);
       }
@@ -3233,6 +3281,12 @@ export class Engine {
       case "dropSequence":
         rejectParamsForDDL(params);
         return this.executeDropSequence(stmt);
+      case "createView":
+        rejectParamsForDDL(params);
+        return this.executeCreateView(stmt);
+      case "dropView":
+        rejectParamsForDDL(params);
+        return this.executeDropView(stmt);
       case "insert":
         return this.executeInsertCached(
           stmt,
@@ -3264,6 +3318,14 @@ export class Engine {
     this.checkAttachmentWritable(analyze.db);
     if (isCatalogRelName(analyze.name)) {
       throw engineError("wrong_object_type", `cannot modify system relation ${analyze.name}`);
+    }
+    // ANALYZE of a view is a no-op success (views.md §2; PostgreSQL also warns).
+    if (
+      this.lkpTableScoped(analyze.db, analyze.name) === undefined &&
+      (analyze.db === undefined || analyze.db === "main") &&
+      this.isView(analyze.name)
+    ) {
+      return { kind: "statement", cost: 0n, rowsAffected: null };
     }
     const table = this.lkpTableScoped(analyze.db, analyze.name);
     if (table === undefined)
@@ -3636,6 +3698,7 @@ export class Engine {
       return count > MAX_ESTIMATE ? MAX_ESTIMATE : count;
     }
     if (srf.kind === "jed_sequences") return saturatingEstimateAdd(0n, BigInt(snap.sequences.size));
+    if (srf.kind === "jed_views") return saturatingEstimateAdd(0n, BigInt(snap.views.size));
     if (srf.kind === "jed_types") return saturatingEstimateAdd(0n, BigInt(snap.types.size));
     if (srf.kind === "jed_type_fields") {
       let fields = 0n;
@@ -4560,7 +4623,7 @@ export class Engine {
   private explainLane(inner: Statement): "streaming" | "buffered" | "deferred" {
     // Public Query classifies writes before either lazy lane. Sequence-mutating SELECTs and a
     // top-level WITH containing DML therefore use the buffered write dispatcher regardless of shape.
-    if (stmtIsWrite(inner)) return "buffered";
+    if (this.stmtIsWriteWithViews(inner)) return "buffered";
     if (inner.kind === "with" || inner.kind === "setOp") return "deferred";
     if (inner.kind === "select") {
       const plan = this.planExplainInner(inner);
@@ -5200,7 +5263,9 @@ export class Engine {
   private createTableNameTaken(name: string, attachName: string): boolean {
     if (attachName === "") return this.relationExists(name);
     const as = this.attachReadSnap(attachName)!;
-    return as.table(name) !== undefined || as.findIndex(name) !== null;
+    return (
+      as.table(name) !== undefined || as.findIndex(name) !== null || as.view(name) !== undefined
+    );
   }
 
   // executeCreateTable resolves each column's type name, enforces a single primary key
@@ -5831,9 +5896,7 @@ export class Engine {
         parent = table;
       } else {
         const found = this.table(fk.refTable);
-        if (found === undefined) {
-          throw engineError("undefined_table", "table does not exist: " + fk.refTable);
-        }
+        if (found === undefined) throw fkParentMissing(this.readSnap(), fk.refTable);
         parent = found;
       }
       // 3. Referenced columns into the parent (default to the parent's primary key).
@@ -6376,7 +6439,7 @@ export class Engine {
         // Not a table in any scope. An index's name is the wrong object kind (42809 — indexes.md
         // §2); IF EXISTS does NOT suppress this. Otherwise a missing table is 42P01, unless IF
         // EXISTS makes it a no-op for just this name (PG turns the missing-table error into a notice).
-        if (this.findIndex(name)) {
+        if (this.findIndex(name) || this.isView(name)) {
           throw engineError("wrong_object_type", name + " is not a table");
         }
         if (dt.ifExists) continue;
@@ -6390,6 +6453,12 @@ export class Engine {
     // snapshot; a dependent whose referencing table is itself in the drop set does not count (the
     // drop-set exclusion is the whole `seen` set, so `DROP TABLE parent, child` succeeds even under
     // RESTRICT).
+    // A view depending on a table being dropped blocks the statement (views.md §6): a DROP TABLE
+    // never drops views, and CASCADE dropping them is a follow-on.
+    this.checkDropTableViews(
+      targets.filter((t) => t.scope === "persistent").map((t) => t.key),
+      dt.cascade,
+    );
     const deps = this.readSnap().fkDependentsExcluding(seen);
     let cascadeRemovals: FkDependent[] = [];
     if (dt.cascade) {
@@ -6461,6 +6530,14 @@ export class Engine {
       }
     const original = snap.table(at.name);
     if (original === undefined) {
+      // A view: its renames are a follow-on (0A000); every other action is the wrong object kind
+      // (42809, views.md §2).
+      if (snap.view(at.name) !== undefined) {
+        if (at.action.kind === "renameTable" || at.action.kind === "renameColumn") {
+          throw engineError("feature_not_supported", "renaming a view is not supported");
+        }
+        throw engineError("wrong_object_type", `${at.name} is not a table`);
+      }
       if (snap.findIndex(at.name) !== null || snap.sequence(at.name) !== undefined)
         throw engineError("wrong_object_type", `${at.name} is not a table`);
       if (at.ifExists) return { kind: "statement", cost: 0n, rowsAffected: null };
@@ -6485,8 +6562,31 @@ export class Engine {
       attachmentScope
         ? snap.table(name) !== undefined ||
           snap.findIndex(name) !== null ||
-          snap.sequence(name) !== undefined
+          snap.sequence(name) !== undefined ||
+          snap.view(name) !== undefined
         : this.relationExists(name);
+    // Views that depend on the table (spec/design/views.md §6–§8). A main-database table's
+    // dependents are captured now — traced against the pre-statement catalog when the action edits
+    // their text — and rewritten + re-validated after the change. A table of an attached database
+    // with dependent views refuses every ALTER TABLE: re-validating views there is a follow-on
+    // (views.md §10).
+    let viewPlan: ViewAlterPlan | null = null;
+    if (attachmentScope) {
+      const dependent = snap.viewsDependingOn("table", original.name)[0];
+      if (dependent !== undefined) {
+        throw engineError(
+          "feature_not_supported",
+          `cannot alter table ${original.name} because view ${dependent.name} depends on it`,
+        );
+      }
+    } else if (!tempScope) {
+      const rewrites =
+        at.action.kind === "renameTable" ||
+        at.action.kind === "renameColumn" ||
+        (at.action.kind === "actions" && at.action.actions.some((a) => a.kind === "dropColumn"));
+      viewPlan = this.prepareViewAlter(original, rewrites);
+    }
+    let viewChange: ViewAlterChange | null = null;
     const pendingSerials: SequenceDef[] = [];
     const workingRelationTaken = (name: string): boolean => {
       if (pendingSerials.some((s) => s.name === name)) return true;
@@ -6560,6 +6660,7 @@ export class Engine {
           throw engineError("duplicate_table", `relation already exists: ${at.action.newName}`);
         }
         rewriteExprs(undefined, at.action.newName);
+        viewChange = { kind: "renameTable", newName: at.action.newName };
         table = { ...table, name: at.action.newName };
         renameTable = true;
         break;
@@ -6571,6 +6672,7 @@ export class Engine {
         if (columnIndex(table, at.action.newName) >= 0)
           throw engineError("duplicate_column", `column already exists: ${at.action.newName}`);
         rewriteExprs({ oldName: at.action.oldName, newName: at.action.newName });
+        viewChange = { kind: "renameColumn", ordinal: ci, newName: at.action.newName };
         table.columns[ci] = { ...table.columns[ci]!, name: at.action.newName };
         break;
       }
@@ -6710,6 +6812,24 @@ export class Engine {
                 "feature_not_supported",
                 "dropping a primary-key column is not supported yet",
               );
+            // A column a view references cannot be dropped (views.md §6): 2BP01, and 0A000 under
+            // CASCADE (dropping the view is a follow-on).
+            const dropSource = columnSources[ci]!;
+            if (dropSource.kind === "original" && viewPlan !== null) {
+              const view = viewUsing(viewPlan, dropSource.column);
+              if (view !== null) {
+                if (action.cascade) {
+                  throw engineError(
+                    "feature_not_supported",
+                    `DROP COLUMN ... CASCADE of column ${action.name} with dependent view ${view} is not supported`,
+                  );
+                }
+                throw engineError(
+                  "dependent_objects_still_exist",
+                  `cannot drop column ${action.name} of table ${original.name} because view ${view} depends on it`,
+                );
+              }
+            }
             const usesExpr = (expr: Expr) => checkReferencedColumns(expr, table.columns).includes(ci);
             const indexUses = (index: IndexDef) =>
               index.keys.some((key) =>
@@ -7008,8 +7128,7 @@ export class Engine {
                 d.refTable === table.name
                   ? table
                   : snap.table(d.refTable);
-              if (!parent)
-                throw engineError("undefined_table", `table does not exist: ${d.refTable}`);
+              if (!parent) throw fkParentMissing(snap, d.refTable);
               let refs: number[];
               if (d.refColumns === null) refs = [...parent.pk];
               else {
@@ -7211,6 +7330,18 @@ export class Engine {
               table.columns[ci] = { ...col, notNull: false };
               break;
             case "setType": {
+              // A column a view references cannot change type (views.md §6).
+              const typeSource = columnSources[ci]!;
+              if (
+                typeSource.kind === "original" &&
+                viewPlan !== null &&
+                viewUsing(viewPlan, typeSource.column) !== null
+              ) {
+                throw engineError(
+                  "feature_not_supported",
+                  "cannot alter type of a column used by a view",
+                );
+              }
               const oldColumn = col;
               let target = this.buildAlterAddedColumn(
                 table,
@@ -7690,6 +7821,19 @@ export class Engine {
         new Set(pendingSerials.map((seq) => seq.name)),
       );
     }
+    // Rewrite and re-validate the dependent views against the post-statement catalog (views.md
+    // §7/§8); a failure is 0A000 and discards the whole statement.
+    if (viewPlan !== null) {
+      const change: ViewAlterChange = viewChange ?? {
+        kind: "other",
+        dropped: original.columns
+          .map((_, old) => old)
+          .filter(
+            (old) => !columnSources.some((src) => src.kind === "original" && src.column === old),
+          ),
+      };
+      this.finishViewAlter(viewPlan, change);
+    }
     return { kind: "statement", cost: meter.accrued, rowsAffected: null };
   }
 
@@ -7914,7 +8058,9 @@ export class Engine {
       this.tempSnap().findIndex(name) !== null ||
       // The sequence funnel walks session-local → persistent, so an owned TEMP sequence's name joins
       // the namespace (temp-tables.md §8) — a collision with it is 42P07 too.
-      this.sequence(name) !== undefined
+      this.sequence(name) !== undefined ||
+      // Views share the relation namespace (spec/design/views.md §2).
+      this.readSnap().view(name) !== undefined
     );
   }
 
@@ -8129,6 +8275,14 @@ export class Engine {
     // A DDL write to a READ-ONLY host attachment is 25006 before any work — checked BEFORE the qualifier
     // existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
     this.checkAttachmentWritable(ci.db);
+    // An index on a view is the wrong object kind (views.md §2).
+    if (
+      (ci.db === undefined || ci.db === "main") &&
+      this.lkpTableScoped(ci.db, ci.table) === undefined &&
+      this.isView(ci.table)
+    ) {
+      throw engineError("wrong_object_type", `cannot create index on relation "${ci.table}"`);
+    }
     this.checkTableQualifier(ci.db, ci.table); // attached-databases.md §3
     const attachName = isAttachmentScope(ci.db) ? ci.db! : "";
     const table = this.lkpTableScoped(ci.db, ci.table);
@@ -8354,7 +8508,7 @@ export class Engine {
     const relationTaken = (n: string): boolean => {
       if (attachName !== "") {
         const as = this.attachReadSnap(attachName)!;
-        return as.table(n) !== undefined || as.findIndex(n) !== null;
+        return as.table(n) !== undefined || as.findIndex(n) !== null || as.view(n) !== undefined;
       }
       return this.relationExists(n);
     };
@@ -8476,7 +8630,7 @@ export class Engine {
   // from the snapshot that owns it, so dropping a temp table's index makes zero file writes.
   private executeDropIndex(di: DropIndex): Outcome {
     // lkpTable covers both scopes, so DROP INDEX naming a table is 42809 regardless of kind.
-    if (this.lkpTable(di.name)) {
+    if (this.lkpTable(di.name) || this.isView(di.name)) {
       throw engineError("wrong_object_type", di.name + " is not an index");
     }
     const nameKey = di.name;
@@ -9403,6 +9557,7 @@ export class Engine {
     // dispatch already checked lifetime admission and privileges for this execution.
     checkCatalogRelWrite(ins.table);
     this.checkAttachmentWritable(ins.db);
+    this.checkViewWrite(ins.db, ins.table, "insert into");
     this.checkTableQualifier(ins.db, ins.table);
     const table = this.lkpTableScoped(ins.db, ins.table);
     if (!table) throw engineError("undefined_table", "table does not exist: " + ins.table);
@@ -9660,6 +9815,8 @@ export class Engine {
     // A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
     // existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
     this.checkAttachmentWritable(ins.db);
+    // A view is not automatically updatable in this slice (views.md §2): 55000.
+    this.checkViewWrite(ins.db, ins.table, "insert into");
     this.checkTableQualifier(ins.db, ins.table); // attached-databases.md §3
     // ON CONFLICT into a host attachment is a deferred narrowing this slice (attached-databases.md §8):
     // the conflict path resolves index stores unscoped. A clean 0A000 before any planning.
@@ -11344,6 +11501,7 @@ export class Engine {
     // A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
     // existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
     this.checkAttachmentWritable(del.db);
+    this.checkViewWrite(del.db, del.table, "delete from");
     this.checkTableQualifier(del.db, del.table); // attached-databases.md §3
     const table = this.lkpTableScoped(del.db, del.table); // scope-aware temp-first (temp-tables.md §3)
     if (!table) {
@@ -11543,6 +11701,7 @@ export class Engine {
     // A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
     // existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
     this.checkAttachmentWritable(upd.db);
+    this.checkViewWrite(upd.db, upd.table, "update");
     this.checkTableQualifier(upd.db, upd.table); // attached-databases.md §3
     const table = this.lkpTableScoped(upd.db, upd.table); // scope-aware temp-first (temp-tables.md §3)
     if (!table) {
@@ -12259,6 +12418,12 @@ export class Engine {
     } else {
       throw new Error("planDmCte requires a data-modifying body");
     }
+    // A view target is 55000, as for a top-level write (views.md §2).
+    this.checkViewWrite(
+      undefined,
+      tableName,
+      body.kind === "insert" ? "insert into" : body.kind === "update" ? "update" : "delete from",
+    );
     const tdef = this.lkpTable(tableName); // temp-first (temp-tables.md §3)
     if (tdef === undefined) {
       throw engineError("undefined_table", "table does not exist: " + tableName);
@@ -12677,6 +12842,487 @@ export class Engine {
     return this.planSetOp(qe, parent, ctes, ptypes);
   }
 
+  // ---------------------------------------------------------------------------------------------
+  // Views (spec/design/views.md): the planning trace, reading a view (§4), CREATE / DROP VIEW,
+  // write classification + function privileges through view bodies, and the ALTER TABLE rewrite +
+  // re-validation (§6–§8). The pure text helpers live in views.ts.
+  // ---------------------------------------------------------------------------------------------
+
+  // traceColumn records a referenced base-table column (views.md §6).
+  traceColumn(table: string, ordinal: number): void {
+    this.viewTrace?.addColumn(table, ordinal);
+  }
+
+  // traceStar records a written star's expansion (views.md §5).
+  traceStar(pos: number, qualified: boolean, cols: [string | null, string][]): void {
+    this.viewTrace?.stars.set(pos, { qualified, cols });
+  }
+
+  // traceCatalogItem records a built-in catalog relation named by the body (views.md §9). The body
+  // reads only its own database (§4.1/§10), so a temp. or attachment-qualified catalog relation is
+  // 0A000.
+  private traceCatalogItem(tref: TableRef): void {
+    const trace = this.viewTrace;
+    if (trace === null) return;
+    if (tref.db !== undefined && tref.db !== "main") {
+      throw viewNotSupported(
+        `a view cannot read the relation "${tref.db}.${tref.name}" of another database`,
+      );
+    }
+    trace.catalogRels.add(tref.name);
+  }
+
+  // traceTableItem records a FROM item that binds a base table. A persistent view may read only the
+  // persistent relations of its own database: a temporary table (bare or temp.-qualified) or an
+  // attached database's table is 0A000 (views.md §10).
+  private traceTableItem(tref: TableRef, table: Table): void {
+    const trace = this.viewTrace;
+    if (trace === null) return;
+    const temp = tref.db === undefined ? this.isTempTable(tref.name) : tref.db === "temp";
+    if (temp) {
+      throw viewNotSupported(`a view cannot read the temporary relation "${tref.name}"`);
+    }
+    if (isAttachmentScope(tref.db)) {
+      throw viewNotSupported(`a view cannot read the attached relation "${tref.db}.${tref.name}"`);
+    }
+    const pos = tref.pos ?? { name: -1, alias: null, list: null };
+    trace.items.set(pos.name, { kind: "table", name: table.name, pos });
+  }
+
+  // inViewBody runs f as the planning of a view body (views.md §4.1): the trace of an enclosing view
+  // body is suspended (a nested view's own relations are not the outer view's dependencies), and the
+  // expansion nesting counts toward MAX_EXPR_DEPTH (54001).
+  private inViewBody<T>(f: () => T): T {
+    const depth = this.viewDepth + 1;
+    if (depth > MAX_EXPR_DEPTH) {
+      throw engineError(
+        "statement_too_complex",
+        `statement too complex: nesting depth exceeds the maximum of ${MAX_EXPR_DEPTH}`,
+      );
+    }
+    const saved = this.viewTrace;
+    this.viewTrace = null;
+    this.viewDepth = depth;
+    try {
+      return f();
+    } finally {
+      this.viewDepth = depth - 1;
+      this.viewTrace = saved;
+    }
+  }
+
+  // traceViewBody plans body (a view definition) in the isolated view scope with a fresh trace,
+  // returning the plan and what it bound (views.md §5–§8). Used at CREATE, at re-validation, and
+  // before a rename rewrite; never for an ordinary read.
+  private traceViewBody(body: QueryExpr): { plan: QueryPlan; trace: ViewTrace } {
+    const saved = this.viewTrace;
+    const trace = new ViewTrace();
+    this.viewTrace = trace;
+    try {
+      const plan = this.planQuery(body, null, [], new ParamTypes());
+      return { plan, trace };
+    } finally {
+      this.viewTrace = saved;
+    }
+  }
+
+  // viewReference returns, if the FROM item tref names a view, the equivalent derived table
+  // `( <definition> ) AS <label> ( <columns> )` and the view's name. A name resolves to a
+  // statement-local CTE, then a built-in catalog relation, then a table, then a view (§4); tables and
+  // views share one namespace. A column list on the reference renames over the view's stored names (a
+  // longer list is left in place so the derived-table planning raises its 42P10). A view behind an
+  // attachment qualifier is rejected by the FROM build (§10), so only bare and main. names expand.
+  private viewReference(
+    tref: TableRef,
+    ctes: CteBinding[],
+  ): { tref: TableRef; viewName: string } | null {
+    if (
+      tref.args !== null ||
+      tref.subquery !== undefined ||
+      tref.values !== undefined ||
+      tref.jsonTable !== undefined
+    ) {
+      return null;
+    }
+    if (tref.db === undefined) {
+      if (
+        ctes.some((b) => b.name === tref.name) ||
+        catalogRelKind(tref.name) !== undefined ||
+        this.lkpTable(tref.name) !== undefined
+      ) {
+        return null;
+      }
+    } else if (tref.db === "main") {
+      if (catalogRelKind(tref.name) !== undefined || this.readSnap().table(tref.name) !== undefined) {
+        return null;
+      }
+    } else {
+      return null;
+    }
+    const view = this.readSnap().view(tref.name);
+    if (view === undefined) return null;
+    const label = tref.alias ?? view.name;
+    let columnAliases: string[];
+    if (tref.columnAliases === undefined) {
+      columnAliases = view.columns.slice();
+    } else if (tref.columnAliases.length > view.columns.length) {
+      columnAliases = tref.columnAliases.slice();
+    } else {
+      columnAliases = view.columns.slice();
+      tref.columnAliases.forEach((n, i) => {
+        columnAliases[i] = n;
+      });
+    }
+    return {
+      tref: { name: label, alias: label, args: null, subquery: view.body, columnAliases },
+      viewName: view.name,
+    };
+  }
+
+  // planViewReference plans a view reference's body (views.md §4.1): a fresh top-level scope with no
+  // correlation, no outer CTEs, and no parameters. While a view body is traced, the reference records
+  // the dependency on the view itself.
+  private planViewReference(
+    viewName: string,
+    body: QueryExpr,
+    written: TableRef,
+    ptypes: ParamTypes,
+  ): QueryPlan {
+    if (this.viewTrace !== null) {
+      const pos = written.pos ?? { name: -1, alias: null, list: null };
+      this.viewTrace.items.set(pos.name, { kind: "view", name: viewName, pos });
+    }
+    return this.inViewBody(() => this.planQuery(body, null, [], ptypes));
+  }
+
+  // rejectAttachedView: a view reached through an attachment qualifier (FROM reports.v) is 0A000 in
+  // this slice (views.md §10). Only an attachment that holds a VIEW of that name (and no table) is
+  // refused.
+  private rejectAttachedView(db: string | undefined, name: string): void {
+    if (!isAttachmentScope(db)) return;
+    const snap = this.attachReadSnap(db!);
+    if (snap !== undefined && snap.table(name) === undefined && snap.view(name) !== undefined) {
+      throw viewNotSupported(`views in an attached database are not supported: ${db}.${name}`);
+    }
+  }
+
+  // checkViewWrite: a DML target that is a view is 55000 (views.md §2) — every view is non-updatable
+  // in this slice. Checked when the target is resolved, before any column, value, or RETURNING check.
+  private checkViewWrite(db: string | undefined, name: string, verb: string): void {
+    let snap: Snapshot | undefined;
+    if (db === undefined) {
+      if (this.lkpTable(name) !== undefined) return;
+      snap = this.readSnap();
+    } else {
+      snap = this.snapForScope(db);
+      if (snap === undefined) return;
+    }
+    if (snap.table(name) === undefined && snap.view(name) !== undefined) {
+      throw engineError("object_not_in_prerequisite_state", `cannot ${verb} view "${name}"`);
+    }
+  }
+
+  // viewsInDependencyOrder is every view of the main database in dependency order: a view after
+  // every view it reads, ties in name byte order (views.md §11 — the CLI dump order).
+  viewsInDependencyOrder(): ViewDef[] {
+    return viewsInDependencyOrder(this.readSnap().viewsSorted());
+  }
+
+  // isView reports whether name names a view of the main database (the relation namespace, §2).
+  private isView(name: string): boolean {
+    return this.readSnap().view(name) !== undefined;
+  }
+
+  // executeCreateView runs CREATE VIEW (views.md §1.1).
+  private executeCreateView(cv: CreateView): Outcome {
+    const done: Outcome = { kind: "statement", cost: 0n, rowsAffected: null };
+    // 1. The database qualifier (the allow_ddl gate already ran in admission): main is the only
+    //    database a view may live in this slice.
+    if (cv.db !== undefined && cv.db !== "main") {
+      if (cv.db === "temp") throw viewNotSupported("temporary views are not supported");
+      if (this.attachReadSnap(cv.db) === undefined) {
+        throw engineError("undefined_table", `database "${cv.db}" is not attached`);
+      }
+      throw viewNotSupported("views in an attached database are not supported");
+    }
+    // 2. The jed_ reservation (not suppressed by IF NOT EXISTS — introspection.md §4).
+    checkReservedName("view", cv.name);
+    // 3. IF NOT EXISTS: a taken name is a silent no-op; the body is not validated.
+    if (cv.ifNotExists && this.relationExists(cv.name)) return done;
+    // 4. Plan the body in the isolated view scope. A $N is 42P02 where the resolver meets it; one
+    //    consumed by a special-cased form (a parameter CAST) is caught on the tokens right after
+    //    planning.
+    const tokens = lex(cv.body);
+    let body = parseViewDefinition(cv.body);
+    const first = this.traceViewBody(body);
+    const param = tokens.find((t) => t.kind === "param");
+    if (param !== undefined) {
+      throw engineError("undefined_parameter", `there is no parameter $${param.paramIndex}`);
+    }
+    // 5. Column-list arity, then duplicate final output names, from the body as planned.
+    const bodyNames = first.plan.columnNames;
+    const bodyTypes = first.plan.columnTypes;
+    const columns = viewOutputNames(bodyNames, cv.columns);
+    // 6. Freeze every expanded `*` and verify the expanded text plans to the same output.
+    let definition = cv.body;
+    let trace = first.trace;
+    if (trace.stars.size > 0) {
+      const cannot = (): EngineError =>
+        viewNotSupported("a view's * expansion cannot be written by name");
+      const frozen = freezeStars(tokens, trace);
+      let refrozen: QueryExpr;
+      let second: { plan: QueryPlan; trace: ViewTrace };
+      try {
+        refrozen = parseViewDefinition(frozen);
+        second = this.traceViewBody(refrozen);
+      } catch {
+        throw cannot();
+      }
+      if (
+        !astDeepEqual(second.plan.columnNames, bodyNames) ||
+        !astDeepEqual(second.plan.columnTypes, bodyTypes)
+      ) {
+        throw cannot();
+      }
+      definition = frozen;
+      body = refrozen;
+      trace = second.trace;
+    }
+    const deps = this.traceDependencies(trace);
+    // 7. The creating session's SELECT privilege on every relation the body reads (§9).
+    const privileges = this.session.privileges;
+    if (!privileges.isPermissive()) {
+      for (const name of [...deps.map((d) => d.name), ...trace.catalogRels]) {
+        if (!privileges.allowsTable(name, "select")) {
+          throw engineError("insufficient_privilege", `permission denied for table ${name}`);
+        }
+      }
+    }
+    // 8. A taken name.
+    if (this.relationExists(cv.name)) {
+      throw engineError("duplicate_table", `relation "${cv.name}" already exists`);
+    }
+    // 9. Write the catalog entry; it must fit one catalog page.
+    const def: ViewDef = { name: cv.name, columns, definition, deps, body };
+    this.checkViewEntryFits(def);
+    this.working().putView(def);
+    return done;
+  }
+
+  // checkViewEntryFits: a view's catalog entry must fit one catalog page (format.md *Catalog*); a
+  // longer definition is 0A000 (views.md §1.1 step 9).
+  private checkViewEntryFits(def: ViewDef): void {
+    const cap = this.pageSize - PAGE_HEADER;
+    if (1 + viewEntryBytes(def).length > cap) {
+      throw viewNotSupported(`the definition of view "${def.name}" is too long`);
+    }
+  }
+
+  // traceDependencies is the persisted dependency list of a traced view body (views.md §6): every
+  // bound table (with its referenced columns, by current name) and view, in ascending name byte
+  // order.
+  private traceDependencies(trace: ViewTrace): ViewDep[] {
+    const deps = new Map<string, ViewDep>();
+    for (const item of trace.itemsInOrder()) {
+      if (!deps.has(item.name)) deps.set(item.name, { kind: item.kind, name: item.name, columns: [] });
+    }
+    const snap = this.readSnap();
+    for (const [table, ordinals] of trace.columns) {
+      const t = snap.table(table);
+      if (t === undefined) continue;
+      for (const ordinal of ordinals) {
+        const col = t.columns[ordinal];
+        if (col === undefined) continue;
+        let dep = deps.get(table);
+        if (dep === undefined) {
+          dep = { kind: "table", name: table, columns: [] };
+          deps.set(table, dep);
+        }
+        if (!dep.columns.includes(col.name)) dep.columns.push(col.name);
+      }
+    }
+    return sortDeps([...deps.values()]);
+  }
+
+  // executeDropView runs DROP VIEW (views.md §1, §6).
+  private executeDropView(dv: DropView): Outcome {
+    // Phase 1: resolve every name (42P01 / 42809) before any dependency check.
+    const targets: string[] = [];
+    for (const { db, name } of dv.names) {
+      if (targets.includes(name)) continue;
+      if (isCatalogRelName(name)) {
+        throw engineError("wrong_object_type", `cannot drop system relation "${name}"`);
+      }
+      if (db !== undefined && db !== "main") {
+        if (db === "temp") {
+          if (this.isTempTable(name) || this.isTempSequence(name)) {
+            throw engineError("wrong_object_type", `"${name}" is not a view`);
+          }
+          if (dv.ifExists) continue;
+          throw engineError("undefined_table", `view "temp.${name}" does not exist`);
+        }
+        if (this.attachReadSnap(db) === undefined) {
+          throw engineError("undefined_table", `database "${db}" is not attached`);
+        }
+        throw viewNotSupported("views in an attached database are not supported");
+      }
+      if (this.isView(name)) {
+        targets.push(name);
+        continue;
+      }
+      if (this.relationExists(name)) {
+        throw engineError("wrong_object_type", `"${name}" is not a view`);
+      }
+      if (dv.ifExists) continue;
+      throw engineError("undefined_table", `view "${name}" does not exist`);
+    }
+    // Phase 2: a dependent view outside the drop set blocks (RESTRICT 2BP01; CASCADE would drop it —
+    // a follow-on, 0A000). The first blocking view in name byte order is named.
+    for (const dependent of this.readSnap().viewsSorted()) {
+      if (targets.includes(dependent.name)) continue;
+      const dep = dependent.deps.find((d) => d.kind === "view" && targets.includes(d.name));
+      if (dep === undefined) continue;
+      if (dv.cascade) {
+        throw viewNotSupported(
+          `DROP VIEW ... CASCADE of view ${dep.name} with dependent view ${dependent.name} is not supported`,
+        );
+      }
+      throw engineError(
+        "dependent_objects_still_exist",
+        `cannot drop view ${dep.name} because view ${dependent.name} depends on it`,
+      );
+    }
+    // Phase 3: remove.
+    for (const name of targets) this.working().removeView(name);
+    return { kind: "statement", cost: 0n, rowsAffected: null };
+  }
+
+  // stmtIsWriteWithViews is stmtIsWrite plus the view check: a read-shaped statement that reads a
+  // view whose body (transitively) calls a sequence-mutating function is a write (sequences.md §4,
+  // views.md §4.1).
+  stmtIsWriteWithViews(stmt: Statement): boolean {
+    if (stmtIsWrite(stmt)) return true;
+    if (this.readSnap().views.size === 0) return false;
+    let inner = stmt;
+    if (inner.kind === "explain") {
+      if (!inner.analyze) return false;
+      inner = inner.inner;
+    }
+    if (inner.kind !== "select" && inner.kind !== "setOp" && inner.kind !== "with") return false;
+    const req: PrivReq = { tables: [], functions: [], isDdl: false, isTempDdl: false };
+    collectStmtPrivs(inner, req);
+    return req.tables.some((t) => this.viewCallsSeqMutator(t.name));
+  }
+
+  // viewCallsSeqMutator reports whether the view `name` (of the main database) calls a
+  // sequence-mutating function in its body or in the body of any view it reads. Views are acyclic,
+  // so the recursion terminates.
+  private viewCallsSeqMutator(name: string): boolean {
+    const view = this.readSnap().view(name);
+    if (view === undefined) return false;
+    if (queryCallsSeqMutator(view.body)) return true;
+    const req: PrivReq = { tables: [], functions: [], isDdl: false, isTempDdl: false };
+    collectQueryPrivs(view.body, req, new Set());
+    return req.tables.some((t) => this.viewCallsSeqMutator(t.name));
+  }
+
+  // collectViewFunctionPrivs adds the functions called in the bodies of the views a statement reads
+  // (transitively) to its privilege requirements (views.md §9): function EXECUTE is the reader's, as
+  // for a derived table. The relations inside a body are NOT added — the view is the privilege
+  // boundary.
+  private collectViewFunctionPrivs(req: PrivReq): void {
+    const snap = this.readSnap();
+    if (snap.views.size === 0) return;
+    const pending = req.tables.map((t) => t.name);
+    const seen = new Set<string>();
+    while (pending.length > 0) {
+      const name = pending.pop()!;
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const view = snap.view(name);
+      if (view === undefined) continue;
+      const body: PrivReq = { tables: [], functions: [], isDdl: false, isTempDdl: false };
+      collectQueryPrivs(view.body, body, new Set());
+      req.functions.push(...body.functions);
+      pending.push(...body.tables.map((t) => t.name));
+    }
+  }
+
+  // checkDropTableViews is the DROP TABLE view-dependency check (§6): a view depending on a table
+  // being dropped blocks the statement — 2BP01 under RESTRICT, 0A000 under CASCADE (dropping
+  // dependent views is a follow-on). The first blocking view in name byte order is named.
+  private checkDropTableViews(targets: string[], cascade: boolean): void {
+    for (const view of this.readSnap().viewsSorted()) {
+      const dep = view.deps.find((d) => d.kind === "table" && targets.includes(d.name));
+      if (dep === undefined) continue;
+      if (cascade) {
+        throw viewNotSupported(
+          `DROP TABLE ... CASCADE of table ${dep.name} with dependent view ${view.name} is not supported`,
+        );
+      }
+      throw engineError(
+        "dependent_objects_still_exist",
+        `cannot drop table ${dep.name} because view ${view.name} depends on it`,
+      );
+    }
+  }
+
+  // prepareViewAlter captures the views that depend on `table` (of the main database) before an
+  // ALTER TABLE runs. When the action edits view text (`rewrites`), each view is planned against the
+  // pre-statement catalog to find the FROM items that bind the table; a view that cannot be planned
+  // fails the statement (0A000). null when no view depends on the table.
+  private prepareViewAlter(table: Table, rewrites: boolean): ViewAlterPlan | null {
+    const dependents = this.readSnap().viewsDependingOn("table", table.name);
+    if (dependents.length === 0) return null;
+    const views: { view: ViewDef; items: TraceItem[] }[] = [];
+    for (const view of dependents) {
+      let items: TraceItem[] = [];
+      if (rewrites) {
+        let trace: ViewTrace;
+        try {
+          trace = this.traceViewBody(view.body).trace;
+        } catch {
+          throw alterBreaksView(table.name, view.name);
+        }
+        items = trace
+          .itemsInOrder()
+          .filter((i) => i.kind === "table" && i.name === table.name);
+      }
+      views.push({ view, items });
+    }
+    return { table: table.name, columns: table.columns.map((c) => c.name), views };
+  }
+
+  // finishViewAlter runs after an ALTER TABLE changed the working catalog: rewrite each dependent
+  // view's text for the statement's renames / dropped columns (§7), then re-validate it — it must
+  // plan in the post-statement catalog and bind exactly its (renamed) dependency list (§8). A failure
+  // is 0A000 and the statement fails, which discards every change it made.
+  private finishViewAlter(plan: ViewAlterPlan, change: ViewAlterChange): void {
+    const updated: ViewDef[] = [];
+    for (const { view, items } of plan.views) {
+      const definition = rewriteViewText(view.definition, items, plan, change);
+      const expected = renamedDeps(view.deps, plan, change);
+      let body: QueryExpr;
+      let trace: ViewTrace;
+      try {
+        body = parseViewDefinition(definition);
+        trace = this.traceViewBody(body).trace;
+      } catch {
+        throw alterBreaksView(plan.table, view.name);
+      }
+      if (!depsEqual(this.traceDependencies(trace), expected)) {
+        throw alterBreaksView(plan.table, view.name);
+      }
+      if (definition !== view.definition || !depsEqual(expected, view.deps)) {
+        updated.push({ name: view.name, columns: view.columns.slice(), definition, deps: expected, body });
+      }
+    }
+    for (const view of updated) {
+      this.checkViewEntryFits(view);
+      this.working().putView(view);
+    }
+  }
+
   // planWithExpr plans a nested `WITH … query_expr` (spec/design/cte.md §7) into a WithPlan. Its CTEs
   // inherit the enclosing bindings and shadow same-named bindings from their declaration onward.
   // The inner main query and the CTE bodies are both planned against the enclosing parent (so a
@@ -13064,7 +13710,13 @@ export class Engine {
     // (§42). For a LATERAL item (§44) the body / SRF args resolve against the PREFIX of relations to
     // its left (a dependent join), so the build runs in FROM order and a prefix scope over the
     // already-resolved rels is handed to the body.
-    const tableRefs = sel.from === null ? [] : [sel.from, ...sel.joins.map((j) => j.table)];
+    const writtenItems = sel.from === null ? [] : [sel.from, ...sel.joins.map((j) => j.table)];
+    // A base name that resolves to a VIEW (after a CTE, a catalog relation, and a table —
+    // spec/design/views.md §4) is the equivalent derived table `(<definition>) AS <label>
+    // (<columns>)`, planned in the isolated view scope below.
+    const viewItems = writtenItems.map((t) => this.viewReference(t, ctes));
+    const tableRefs = writtenItems.map((w, i) => viewItems[i]?.tref ?? w);
+    const isolated = viewItems.map((v) => v !== null);
     const rels: ScopeRel[] = [];
     const srfPlans: (SrfPlan | undefined)[] = []; // aligned with rels; undefined = a base table
     const derivedPlans: (QueryPlan | undefined)[] = []; // aligned with rels; non-undefined = derived
@@ -13084,6 +13736,9 @@ export class Engine {
       let cteIdx: number | undefined;
       let derived: QueryPlan | undefined;
       let lateral = false;
+      // Whether the relation is a catalog BASE table (possibly under a column alias list): a view
+      // body's planning trace records the columns resolved against it (views.md §6).
+      let base = false;
       const isDerived = tref.subquery !== undefined || tref.values !== undefined;
       // A FROM item is lateral-ELIGIBLE when it can see earlier siblings: a derived table / VALUES
       // body explicitly marked LATERAL, or ANY table function (implicitly lateral — §44). The first
@@ -13108,10 +13763,13 @@ export class Engine {
         // column of an enclosing query level correlates in the same frame as this query's own outer
         // references (PostgreSQL). A VALUES body resolves its values the same way.
         const bodyParent = lateralEligible ? lateralParent : parent;
+        const viewItem = viewItems[i];
         const plan =
-          tref.subquery !== undefined
-            ? this.planQuery(tref.subquery, bodyParent, ctes, ptypes)
-            : this.planValues(tref.values!, bodyParent, ctes, ptypes);
+          viewItem != null
+            ? this.planViewReference(viewItem.viewName, tref.subquery!, writtenItems[i]!, ptypes)
+            : tref.subquery !== undefined
+              ? this.planQuery(tref.subquery, bodyParent, ctes, ptypes)
+              : this.planValues(tref.values!, bodyParent, ctes, ptypes);
         lateral = lateralEligible && queryPlanReferencesOuter(plan, 0);
         const label = tref.alias === null ? "" : tref.alias;
         t = cteSyntheticTable(label, plan, tref.columnAliases ?? null);
@@ -13166,8 +13824,12 @@ export class Engine {
         if (kind !== undefined) {
           const scope = this.resolveCatalogScope(tref.db);
           t = catalogRelTable(kind);
+          applySrfColumnAliases(t, tref.alias ?? tref.name, tref.columnAliases ?? null);
+          this.traceCatalogItem(tref);
           srf = { kind, args: [], introspectScope: scope };
         } else {
+          // A view reached through an attachment qualifier is a follow-on (views.md §10).
+          this.rejectAttachedView(tref.db, tref.name);
           // Validate the qualifier against the implicit scope, then resolve through the temp-first
           // funnel (which, by preclude-overlaps, lands in the validated scope).
           this.checkTableQualifier(tref.db, tref.name);
@@ -13182,7 +13844,12 @@ export class Engine {
               "table does not exist: " + tref.db + "." + tref.name,
             );
           }
-          t = tbl;
+          this.traceTableItem(tref, tbl);
+          t =
+            tref.columnAliases !== undefined
+              ? renamedBaseTable(tbl, tref, tref.columnAliases)
+              : tbl;
+          base = true;
         }
       } else {
         // A plain FROM name (not an SRF call) may resolve to a CTE, which SHADOWS a catalog table of
@@ -13208,7 +13875,10 @@ export class Engine {
             );
           }
           ctes[ci]!.refs += 1;
-          t = ctes[ci]!.table;
+          t =
+            tref.columnAliases !== undefined
+              ? renamedBaseTable(ctes[ci]!.table, tref, tref.columnAliases)
+              : ctes[ci]!.table;
           cteIdx = ci;
         } else {
           // A built-in catalog relation (introspection.md §5), checked AFTER a CTE (a CTE shadows
@@ -13216,11 +13886,18 @@ export class Engine {
           const kind = catalogRelKind(tref.name);
           if (kind !== undefined) {
             t = catalogRelTable(kind);
+            applySrfColumnAliases(t, tref.alias ?? tref.name, tref.columnAliases ?? null);
+            this.traceCatalogItem(tref);
             srf = { kind, args: [], introspectScope: "main" };
           } else {
             const tbl = this.lkpTable(tref.name); // temp-first (temp-tables.md §3)
             if (!tbl) throw engineError("undefined_table", "table does not exist: " + tref.name);
-            t = tbl;
+            this.traceTableItem(tref, tbl);
+            t =
+              tref.columnAliases !== undefined
+                ? renamedBaseTable(tbl, tref, tref.columnAliases)
+                : tbl;
+            base = true;
           }
         }
       }
@@ -13255,7 +13932,7 @@ export class Engine {
         }
         seenLabels.add(l);
       }
-      rels.push({ label, table: t, offset, cte: cteIdx, db: tref.db });
+      rels.push({ label, table: t, offset, cte: cteIdx, db: tref.db, base });
       srfPlans.push(srf);
       derivedPlans.push(derived);
       lateralFlags.push(lateral);
@@ -13359,6 +14036,7 @@ export class Engine {
               `column "${name}" specified in USING clause does not exist in right table`,
             );
           }
+          if (rightRel.base === true) this.traceColumn(rightRel.table.name, rl);
           const ri = rightRel.offset + rl;
           const lq = "\u0000l" + n;
           const rq = "\u0000r" + n;
@@ -13985,7 +14663,7 @@ export class Engine {
     // foldUncorrelatedInPlan is NOT a planner rewrite — it executes subqueries and needs bound
     // params, so it stays post-bind in the statement drivers.
     rewriteWhere(plan);
-    this.replanPushedBodies(plan, tableRefs, parent, ctes, ptypes);
+    this.replanPushedBodies(plan, tableRefs, isolated, parent, ctes, ptypes);
     //
     // ——— Stage 3: physical/access-path selection (spec/design/planner.md §4) ———
     optimizeSelect(plan, scope.rels, this.readSnap(), this);
@@ -13999,6 +14677,7 @@ export class Engine {
   private replanPushedBodies(
     plan: SelectPlan,
     tableRefs: TableRef[],
+    isolated: boolean[],
     parent: Scope | null,
     ctes: CteBinding[],
     ptypes: ParamTypes,
@@ -14010,14 +14689,26 @@ export class Engine {
       const refs = ctes.map((b) => b.refs);
       let body: QueryPlan;
       try {
-        body = this.replanPushedQuery(
-          tableRefs[i]!.subquery!,
-          plan.rels[i]!.derived!,
-          pushed,
-          parent,
-          ctes,
-          ptypes,
-        );
+        // A view body is planned again in its isolated scope (views.md §4.1).
+        body = isolated[i]
+          ? this.inViewBody(() =>
+              this.replanPushedQuery(
+                tableRefs[i]!.subquery!,
+                plan.rels[i]!.derived!,
+                pushed,
+                null,
+                [],
+                ptypes,
+              ),
+            )
+          : this.replanPushedQuery(
+              tableRefs[i]!.subquery!,
+              plan.rels[i]!.derived!,
+              pushed,
+              parent,
+              ctes,
+              ptypes,
+            );
       } finally {
         ctes.forEach((b, ci) => {
           b.refs = refs[ci]!;
@@ -14721,6 +15412,27 @@ export class Engine {
     return out;
   }
 
+  // jedViewsRows generates the rows of the jed_views catalog relation (introspection.md §5.4): one
+  // row per view of the scope's snapshot, in ascending name byte order — the stored definition text
+  // and the output column names. Cost mirrors jedTablesRows.
+  private jedViewsRows(srf: SrfPlan, meter: Meter): Row[] {
+    const snap = this.snapForScope(srf.introspectScope!);
+    if (snap === undefined) {
+      throw engineError("undefined_table", `database "${srf.introspectScope}" is not attached`);
+    }
+    const out: Row[] = [];
+    for (const v of snap.viewsSorted()) {
+      meter.guard();
+      meter.charge(COSTS.generatedRow);
+      out.push([
+        textValue(v.name),
+        textValue(v.definition),
+        arrayValue(v.columns.map((c) => textValue(c))),
+      ]);
+    }
+    return out;
+  }
+
   // jedSequencesRows generates the rows of the jed_sequences catalog relation (introspection.md
   // §5.3): one row per sequence of the scope's snapshot, in ascending name byte order. The
   // definition fields render as stored; last_value is NULL until the sequence has been read
@@ -15152,6 +15864,9 @@ export class Engine {
     e.spilled = false;
     e.openStreams = 0;
     e.estimatorTouched = new Set();
+    // Never tracing a view body: an ordinary read plans view references untraced (views.md §5–§8).
+    e.viewTrace = null;
+    e.viewDepth = 0;
     // Not profiling EXPLAIN ANALYZE: the lane gates test `explainActualProfile === null`, so leaving it
     // undefined would silently disable the vectorized/columnar lanes on every cursor — a lane choice
     // that must match the other cores (memory.md §5.4).
@@ -15175,7 +15890,7 @@ export class Engine {
     params: Value[],
     holder: ScanCacheHolder | null,
   ): { columnNames: string[]; columnTypes: string[]; cursor: Cursor } | null {
-    if (stmt.kind !== "select" || stmtIsWrite(stmt)) return null;
+    if (stmt.kind !== "select" || this.stmtIsWriteWithViews(stmt)) return null;
     const snap = this.readSnap();
     // The cache entry's identity key: the shared core when this engine belongs to one, else the bare
     // Engine itself (the low-level tooling path — object identity is GC-safe in JS, so a bare engine
@@ -15455,7 +16170,7 @@ export class Engine {
   ): { columnNames: string[]; columnTypes: string[]; cursor: Cursor } | null {
     // A write-classified statement (a data-modifying WITH, a sequence mutator) must take the write gate
     // and never streams (streaming.md §7 / sequences.md §4).
-    if (stmtIsWrite(stmt)) return null;
+    if (this.stmtIsWriteWithViews(stmt)) return null;
     if (stmt.kind !== "setOp" && stmt.kind !== "with") return null;
     // Resolve the output column names + types up front (the Rows cursor exposes them before the first
     // pull). Planning is unmetered + deterministic, so the names read here are IDENTICAL to what the
@@ -16558,6 +17273,9 @@ export class Engine {
           break;
         case "jed_type_fields":
           srfRows = this.jedTypeFieldsRows(rel.srf, meter);
+          break;
+        case "jed_views":
+          srfRows = this.jedViewsRows(rel.srf, meter);
           break;
       }
       for (const row of srfRows) meter.admitRowMasked(row, mask);
@@ -26018,7 +26736,10 @@ export type SrfKind =
   // slice I3) — one row per sequence, per user-defined type, and per composite field.
   | "jed_sequences"
   | "jed_types"
-  | "jed_type_fields";
+  | "jed_type_fields"
+  // The jed_views catalog relation (introspection.md §5.4, views V1) — one row per view of the
+  // qualified database, in ascending name byte order.
+  | "jed_views";
 
 // SrfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,
 // array-functions.md §9). kind selects the generator: generate_series(start, stop[, step]) (args =
@@ -26056,7 +26777,8 @@ export type CatalogRelKind =
   | "jed_statistics"
   | "jed_sequences"
   | "jed_types"
-  | "jed_type_fields";
+  | "jed_type_fields"
+  | "jed_views";
 
 export function catalogRelKind(name: string): CatalogRelKind | undefined {
   const lname = name;
@@ -26068,7 +26790,8 @@ export function catalogRelKind(name: string): CatalogRelKind | undefined {
     lname === "jed_statistics" ||
     lname === "jed_sequences" ||
     lname === "jed_types" ||
-    lname === "jed_type_fields"
+    lname === "jed_type_fields" ||
+    lname === "jed_views"
   ) {
     return lname;
   }
@@ -26181,6 +26904,12 @@ export function catalogRelTable(kind: CatalogRelKind): Table {
       ]);
     case "jed_types":
       return table("jed_types", [col("name", "text", true), col("kind", "text", true)]);
+    case "jed_views":
+      return table("jed_views", [
+        col("name", "text", true),
+        col("definition", "text", true),
+        textArr("columns", true),
+      ]);
     case "jed_type_fields":
       return table("jed_type_fields", [
         col("type_name", "text", true),
@@ -31554,6 +32283,10 @@ export type ScopeRel = {
   // the temp-first walk, so this is behavior-neutral for every unqualified query. It also gates off
   // index-bound pushdown for an attachment relation (detectScanBound / detectINLBound).
   db?: string;
+  // base is whether this relation is a catalog BASE table (possibly under a column alias list —
+  // grammar.md §15). A view body's planning trace records the columns resolved against such a
+  // relation as dependencies (spec/design/views.md §6); every other relation kind records none.
+  base?: boolean;
 };
 
 // Resolved is how a column reference resolved against the scope CHAIN (spec/design/grammar.md

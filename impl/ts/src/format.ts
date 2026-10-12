@@ -11,7 +11,7 @@ import { compareTextC } from "./value.ts";
 // TextEncoder/TextDecoder (name_len is the UTF-8 byte length, not String#length);
 // big-endian via DataView (never host order); CRC-32 backend results normalized unsigned.
 
-import type { Expr } from "./ast.ts";
+import type { Expr, QueryExpr } from "./ast.ts";
 import {
   type CheckConstraint,
   type ColField,
@@ -32,10 +32,12 @@ import {
   type SeqOwner,
   type SequenceDef,
   type Table,
+  type ViewDef,
+  type ViewDep,
   indexColumnOrdinals,
   pkIndices,
 } from "./catalog.ts";
-import { parseExpression } from "./parser.ts";
+import { parseExpression, parseViewDefinition } from "./parser.ts";
 import { type Collation, loadedCollation } from "./collation.ts";
 import { Decimal } from "./decimal.ts";
 import { crc32Update } from "./crc32.ts";
@@ -125,7 +127,7 @@ import {
 } from "./estimator_constants.ts";
 
 const FORMAT_VERSION = 38; // 38 = views: entry_kind 5 view catalog entries emitted last in view-name byte order (spec/design/views.md §3); no other byte layout change; 37 = exact (folded) identifier names: no byte layout change; catalog names are byte-exact and name-ordered groups sort by exact-name bytes; persisted expression text renders bare words folded and quoted identifiers as "…" (spec/design/grammar.md §3); 36 = an array column entry's flags byte gains bit6 has_collation (legal only for a text element), the collation name (u16 len + UTF-8) following the element descriptor; a collated text[] key encodes each present element as its UCA sort key (spec/design/collation.md §1, encoding.md §2.14); 35 = every CHECK catalog entry gains a trailing check_flags byte (bit0 has_host_deps; bits 1-7 reserved 0) followed, when bit0 is set, by the v31 host-function dependency list (spec/design/extensibility.md §7.1.3); 34 = meta offset 56 carries the exact live page count (spec/design/memory.md §8.7); 33 = validated COW commit descriptors; 32 = timezone index dependencies (index-dependencies.md); 31 = host-function index dependencies (spec/design/extensibility.md §8.1, delivery step 4): the per-index index_flags byte gains bit2 has_host_deps, and — only when set — after the v27 predicate a u16 dep_count + per dependency name (u16 len + UTF-8) ‖ arg_count u16 ‖ arg type codes (u8 each) ‖ result type code (u8) ‖ component_id (u16 len + UTF-8) ‖ semantic_version u32, in ascending (name, arg-type codes) order. An index with no host-function key is byte-identical to v30, so a file with no such index moves to v31 only by its version byte + meta CRC. 30 = three-bit FOREIGN KEY action codes for CASCADE / SET NULL / SET DEFAULT; 29 = deterministic per-column statistics (kind 4; spec/design/statistics.md); 28 = exact table row count: each table catalog entry appends a nonnegative i64 row_count after root_data_page, with (root_data_page == 0) == (row_count == 0); on-disk format version (27 = partial-index predicates — spec/design/indexes.md §9: the per-index index_flags byte gains bit1 has_predicate, and (only when set) a u16 length + the canonical predicate text (the *Check-expression text* form) follows index_root_page; on load a partial predicate re-parses that text (XX001 on failure, like a stored CHECK) and a non-btree index with bit1 set is data_corrupted. B-tree only. A non-partial index is byte-identical to v26, so a file with no partial index moves to v27 only by its version byte + meta CRC. 26 = expression index keys — spec/design/indexes.md §1/§6: a per-index key element is a u16 column ordinal OR the 0xFFFF sentinel (never a valid ordinal, col_count ≤ 65535) + a u16 length + the expression's canonical UTF-8 text (the *Check-expression text* form, re-parsed on load — XX001 on failure, like a stored CHECK; a GIN/GiST index with a non-column key is data_corrupted). Only the index-list changes; a plain column index is byte-identical to v6, so a file with no expression index moves to v26 only by its version byte + meta CRC. 25 = on-disk free-list persistence — spec/fileformat/format.md; storage.md §6: meta offset 28 becomes free_list_head (0 = empty), and a page_type 7 free-list page persists the unconsumed free-list so open reads it directly instead of reconstructing it by walking every leaf; paired with continuous within-session reclamation. A from-scratch image (create/goldens) has an EMPTY free-list, so free_list_head = 0 and no page_type 7 page: every golden's only v25 change is its version byte + meta CRC. 24 = the B+tree reshape — spec/design/bplus-reshape.md, spec/fileformat/format.md "The per-table data B+tree": records live ONLY in leaves; an INTERIOR page (page_type 3) is a record-free routing skeleton — N+1 child pointers (u32 BE) ‖ an N-entry END-OFFSET separator directory (u32 BE) ‖ the separator key blob. A separator is a COPY of a boundary key (a leaf split copies the right half's first key up; an interior split pushes its median separator up; leaf merges remove the parent separator, interior merges pull it down — the regenerated "Fan-out" byte contract). The LEAF column regions gain a leading flags byte (reserved 0 — the dictionary door) and split by column CLASS: a FIXED-WIDTH column region is a null bitmap (ceil(N/8), MSB-first, set = NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled); a VARIABLE-WIDTH region is an N-entry end-offset value directory + the v23 tagged codec bytes with NULL a ZERO-LENGTH SPAN — the presence tag 0x01 never appears inside a v24 leaf (the single-value codec elsewhere — catalog defaults, overflow content, composite/array element bodies — is byte-unchanged). Directories throughout drop the redundant leading zero (N end offsets, not N+1 prefix sums). record_size is restated as key_len + Σ value_size (fixed → width, NULL variable → 0; the v23 phantom 2+ is dropped); RECORD_MAX keeps its value (C − max(12, 12+16K))/2, re-derived leaf-only. 23 = PAX leaf layout — a B-tree LEAF page stored its records COLUMN-MAJOR (key directory ‖ key blob ‖ column directory ‖ per column a value directory + tagged bodies, NULL = a 0x01 byte); interior pages stayed row-major and carried full records. 22 = varchar(n) length limits — spec/design/types.md §15: a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints — spec/design/gist.md §7/§8, GX3: a per-table exclusion list after the foreign-key list, each entry the constraint name + its backing GiST index name + a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes — spec/design/gist.md GX1: a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encodeRangeBody(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encodeRangeBody(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index moves to v20 only by its version byte. 19 = storable json/jsonb columns — spec/design/json.md, slice J1/J1b: a column type can be json (type_code 18) or jsonb (type_code 19), plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + unsigned LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
-const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
+export const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const RECORD_MAX_RESERVE = 12; // bytes reserved inside RECORD_MAX beyond the per-column term — independent of PAGE_HEADER (format.md "Why the record cap"). Historically the two-key interior node's 3 child pointers (4·3); since v24 the value is kept as the K=0 floor of the leaf-only re-derivation (a two-record index leaf is exactly 2·(C−12)/2 + 4·2 + 4 = C).
 const PAGE_CATALOG = 1; // page_type for a catalog page
 const PAGE_LEAF = 2; // page_type for a B-tree leaf node
@@ -1371,6 +1373,134 @@ function statisticsDistributionEligible(type: Type): boolean {
   );
 }
 
+// viewCatalogEntries is the view catalog entries (entry_kind = 5, v38), emitted last in ascending
+// name byte order (format.md *View entry*).
+function viewCatalogEntries(snap: Snapshot): Uint8Array[] {
+  return snap.viewsSorted().map((v) => concat([Uint8Array.of(5), viewEntryBytes(v)]));
+}
+
+// viewEntryBytes serializes a view catalog entry's BODY (after its entry_kind = 5 byte) — format.md
+// *View entry*: the name, the output column names, the definition (u32 length), and the dependency
+// list (already in name byte order, each table's columns in name byte order).
+export function viewEntryBytes(v: ViewDef): Uint8Array {
+  const w = new ByteWriter();
+  wstr(w, v.name);
+  w.u16(v.columns.length);
+  for (const c of v.columns) wstr(w, c);
+  const def = UTF8.encode(v.definition);
+  w.u32(def.length);
+  w.bytes(def);
+  w.u16(v.deps.length);
+  for (const d of v.deps) {
+    w.u8(d.kind === "table" ? 0 : 1);
+    wstr(w, d.name);
+    w.u16(d.columns.length);
+    for (const c of d.columns) wstr(w, c);
+  }
+  return w.toBytes();
+}
+
+// decodeViewEntry decodes a view catalog entry's body (inverse of viewEntryBytes); the caller has
+// consumed the entry_kind byte. The definition is parsed (XX001 if it does not parse as a
+// subquery_expr) but never planned (views.md §3).
+function decodeViewEntry(buf: Uint8Array, cur: Cursor): ViewDef {
+  const name = readString(buf, cur);
+  const colCount = readU16(buf, cur);
+  const columns: string[] = [];
+  for (let i = 0; i < colCount; i++) columns.push(readString(buf, cur));
+  const defLen = readU32(buf, cur);
+  if (cur.pos + defLen > buf.length) {
+    throw engineError("data_corrupted", "truncated view definition");
+  }
+  let definition: string;
+  try {
+    definition = UTF8_DECODE.decode(buf.subarray(cur.pos, cur.pos + defLen));
+  } catch {
+    throw engineError("data_corrupted", "view definition is not UTF-8");
+  }
+  cur.pos += defLen;
+  const depCount = readU16(buf, cur);
+  const deps: ViewDep[] = [];
+  for (let i = 0; i < depCount; i++) {
+    const code = readU8(buf, cur);
+    if (code !== 0 && code !== 1) {
+      throw engineError("data_corrupted", "unknown view dependency kind");
+    }
+    const kind = code === 0 ? "table" : "view";
+    const depName = readString(buf, cur);
+    const n = readU16(buf, cur);
+    if (kind === "view" && n !== 0) {
+      throw engineError("data_corrupted", "a view dependency lists columns");
+    }
+    const cols: string[] = [];
+    for (let k = 0; k < n; k++) cols.push(readString(buf, cur));
+    deps.push({ kind, name: depName, columns: cols });
+  }
+  let body: QueryExpr;
+  try {
+    body = parseViewDefinition(definition);
+  } catch {
+    throw engineError("data_corrupted", "a view definition does not parse");
+  }
+  return { name, columns, definition, deps, body };
+}
+
+// installViews validates the loaded views against the catalog and registers them (format.md *View
+// entry*): each dependency names an existing table / view of its kind, each listed column exists in
+// its table, the view-dependency graph is acyclic, output names are non-empty and unique, and no
+// dependency or column repeats. Any violation is XX001.
+function installViews(snap: Snapshot, views: ViewDef[]): void {
+  const corrupt = (msg: string) => engineError("data_corrupted", msg);
+  const names = new Set(views.map((v) => v.name));
+  if (names.size !== views.length) throw corrupt("duplicate view name");
+  for (const v of views) {
+    if (v.columns.length === 0) throw corrupt("a view has no column");
+    for (let i = 0; i < v.columns.length; i++) {
+      const c = v.columns[i]!;
+      if (c === "" || v.columns.slice(0, i).includes(c)) {
+        throw corrupt("empty or duplicate view column name");
+      }
+    }
+    if (snap.table(v.name) !== undefined || snap.sequence(v.name) !== undefined) {
+      throw corrupt("a view name collides with another relation");
+    }
+    for (let i = 0; i < v.deps.length; i++) {
+      const d = v.deps[i]!;
+      if (v.deps.slice(0, i).some((e) => e.name === d.name)) {
+        throw corrupt("duplicate view dependency");
+      }
+      if (d.kind === "table") {
+        const table = snap.table(d.name);
+        if (table === undefined) throw corrupt("a view depends on a missing table");
+        for (let k = 0; k < d.columns.length; k++) {
+          const c = d.columns[k]!;
+          if (d.columns.slice(0, k).includes(c)) {
+            throw corrupt("duplicate view dependency column");
+          }
+          if (!table.columns.some((col) => col.name === c)) {
+            throw corrupt("a view depends on a missing column");
+          }
+        }
+      } else if (!names.has(d.name)) {
+        throw corrupt("a view depends on a missing view");
+      }
+    }
+  }
+  // Acyclicity: repeatedly settle a view whose view dependencies are all settled.
+  const settled = new Set<string>();
+  while (settled.size < views.length) {
+    const before = settled.size;
+    for (const v of views) {
+      if (settled.has(v.name)) continue;
+      if (v.deps.filter((d) => d.kind === "view").every((d) => settled.has(d.name))) {
+        settled.add(v.name);
+      }
+    }
+    if (settled.size === before) throw corrupt("a cycle through view dependencies");
+  }
+  for (const v of views) snap.putView(v);
+}
+
 // P9 kind-4 catalog entries in canonical (table, column, subkind, ordinal) order.
 function statisticsCatalogEntries(snap: Snapshot): Uint8Array[] {
   const entries: Uint8Array[] = [];
@@ -2219,6 +2349,7 @@ export function writeImage(
     );
   }
   catEntries.push(...statisticsCatalogEntries(snap));
+  catEntries.push(...viewCatalogEntries(snap));
   const entrySizes = catEntries.map((e) => e.length);
   const catGroups = pack(entrySizes, capacity);
   const pageCount = catRoot + catGroups.length;
@@ -2651,6 +2782,7 @@ export function incrementalImage(
     );
   }
   catEntries.push(...statisticsCatalogEntries(snap));
+  catEntries.push(...viewCatalogEntries(snap));
   const entrySizes = catEntries.map((e) => e.length);
   const catGroups = pack(entrySizes, capacity);
   const catPages = catGroups.map(() => alloc.take());
@@ -3173,6 +3305,7 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
 
   const snap = new Snapshot(mt.txid);
   const statisticsExpected = new Map<string, readonly [number, number]>();
+  const loadedViews: ViewDef[] = [];
   // v25: the free-list is read from the persisted chain (below), not reconstructed by a reachability
   // walk — so the catalog + skeleton load no longer tracks a reached set. The live-page count comes
   // from the meta (v34); its catalog and GiST parts are counted as the load reads them (memory.md §8.7).
@@ -3207,6 +3340,12 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
       }
       if (kind === 4) {
         decodeStatisticsEntry(pg.payload, cur, snap, statisticsExpected);
+        continue;
+      }
+      if (kind === 5) {
+        // A view entry (v38): parsed now, validated once every table and view is registered (its
+        // dependencies may name later entries).
+        loadedViews.push(decodeViewEntry(pg.payload, cur));
         continue;
       }
       if (kind !== 0) throw engineError("data_corrupted", "unknown catalog entry kind");
@@ -3277,6 +3416,8 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
   // Two-pass: validate the composite-type catalog (existence + acyclicity) — XX001 on a bad
   // reference (spec/design/composite.md §3).
   snap.validateCompositeTypes();
+  // Views (v38): structural checks only — the bodies are parsed, never planned (views.md §3).
+  installViews(snap, loadedViews);
   // Build each GiST index's resident R-tree from its eager-loaded leaf store (gist.md §4.1).
   snap.rebuildGistTrees();
 
