@@ -64,16 +64,19 @@ impl Engine {
         // A base name that resolves to a VIEW (after a CTE, a catalog relation, and a table —
         // spec/design/views.md §4) is the equivalent derived table `(<definition>) AS <label>
         // (<columns>)`, planned in the isolated view scope below.
-        let view_items: Vec<Option<(TableRef, String)>> = written_items
+        let view_items: Vec<Option<(TableRef, String, ViewSite)>> = written_items
             .iter()
             .map(|t| self.view_reference(t, ctes))
             .collect();
         let from_items: Vec<&TableRef> = written_items
             .iter()
             .zip(&view_items)
-            .map(|(w, v)| v.as_ref().map_or(*w, |(tref, _)| tref))
+            .map(|(w, v)| v.as_ref().map_or(*w, |(tref, _, _)| tref))
             .collect();
-        let isolated: Vec<bool> = view_items.iter().map(Option::is_some).collect();
+        let isolated: Vec<Option<ViewSite>> = view_items
+            .iter()
+            .map(|v| v.as_ref().map(|(_, _, site)| *site))
+            .collect();
         let mut synthetic: Vec<Box<Table>> = Vec::new();
         // Per FROM item: `None` = a base table; `Some((synthetic_index, srf_args, kind, jt, scope))`
         // = an SRF or a computed catalog relation (`jt` is the JSON_TABLE plan for a `JsonTable`
@@ -129,18 +132,21 @@ impl Engine {
                 // knows what it pushes into it. A correlated LATERAL body takes no pushdown, so it is
                 // planned for real right away, against the same prefix scope.
                 let stand_in = match &view_items[i] {
-                    Some((_, view_name)) if shaping => self.view_stand_in(view_name),
+                    Some((_, view_name, site)) if shaping => {
+                        self.view_site_base(*site)?;
+                        self.view_stand_in(view_name)
+                    }
                     _ => None,
                 };
                 let plan = if let Some(stand_in) = stand_in {
                     stand_in
-                } else if let Some((_, view_name)) = &view_items[i] {
+                } else if let Some((_, view_name, site)) = &view_items[i] {
                     let body = tref
                         .subquery
                         .as_deref()
                         .expect("a view reference has a body");
                     self.plan_body_first(shape_bodies, || {
-                        self.plan_view_reference(view_name, body, written_items[i], ptypes)
+                        self.plan_view_reference(view_name, body, written_items[i], *site, ptypes)
                     })?
                 } else if lateral_eligible {
                     let prefix =
@@ -1554,7 +1560,7 @@ impl Engine {
         &'a self,
         plan: &mut SelectPlan,
         from_items: &[&TableRef],
-        isolated: &[bool],
+        isolated: &[Option<ViewSite>],
         shaped: &[bool],
         parent: Option<&Scope<'a>>,
         ctes: &'a [&'a CteBinding],
@@ -1586,8 +1592,8 @@ impl Engine {
             };
             // A view body is planned in its isolated scope (views.md §4.1).
             let body = self.plan_again(ctes, || {
-                if isolated[i] {
-                    self.in_view_body(|| replan(None, &[], ptypes))
+                if let Some(site) = isolated[i] {
+                    self.in_view_body(site, || replan(None, &[], ptypes))
                 } else {
                     replan(parent, ctes, ptypes)
                 }

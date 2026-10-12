@@ -304,6 +304,8 @@ export type ViewDef = {
   deps: ViewDep[];
   // The parsed definition — parsed at create and at load, never persisted.
   body: QueryExpr;
+  // The body's nesting depth (spec/design/views.md §4.1), from the same parse as `body`.
+  depth: number;
 };
 
 // ViewDepKind is what a view dependency names (format.md *View entry* dep_kind: table 0, view 1).

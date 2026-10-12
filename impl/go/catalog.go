@@ -312,6 +312,8 @@ type viewDef struct {
 	Deps []viewDep
 	// Body is the parsed definition — parsed at create and at load, never persisted.
 	Body *queryExpr
+	// Depth is the body's nesting depth (spec/design/views.md §4.1), from the same parse as Body.
+	Depth int
 }
 
 // viewDepKind is what a view dependency names (format.md *View entry* dep_kind).

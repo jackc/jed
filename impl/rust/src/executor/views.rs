@@ -54,6 +54,14 @@ pub(crate) struct TraceStar {
     pub(crate) cols: Vec<(Option<String>, String)>,
 }
 
+/// Where a view reference sits (spec/design/views.md §4.1): the parser's nesting depth at the
+/// written FROM item, within the text that names the view, and the view body's own nesting depth.
+#[derive(Clone, Copy)]
+pub(crate) struct ViewSite {
+    pub(crate) depth: usize,
+    pub(crate) body_depth: usize,
+}
+
 /// The 0A000 every view-only narrowing raises.
 fn view_not_supported(msg: impl Into<String>) -> EngineError {
     EngineError::new(SqlState::FeatureNotSupported, msg)
@@ -170,21 +178,17 @@ impl Engine {
         Ok(())
     }
 
-    /// Run `f` as the planning of a view body (views.md §4.1): the trace of an enclosing view body
-    /// is suspended (a nested view's own relations are not the outer view's dependencies), and the
-    /// expansion nesting counts toward `MAX_EXPR_DEPTH` and the expansion toward
-    /// `MAX_VIEW_EXPANSIONS` (54001).
-    pub(crate) fn in_view_body<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    /// Run `f` as the planning of a view body (views.md §4.1) referenced at `site`: the trace of an
+    /// enclosing view body is suspended (a nested view's own relations are not the outer view's
+    /// dependencies), the body's nesting depth counts from the reference's toward `MAX_EXPR_DEPTH`,
+    /// and the expansion toward `MAX_VIEW_EXPANSIONS` (54001).
+    pub(crate) fn in_view_body<T>(
+        &self,
+        site: ViewSite,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let base = self.view_site_base(site)?;
         let depth = self.view_depth.get() + 1;
-        if depth > crate::parser::MAX_EXPR_DEPTH {
-            return Err(EngineError::new(
-                SqlState::StatementTooComplex,
-                format!(
-                    "statement too complex: nesting depth exceeds the maximum of {}",
-                    crate::parser::MAX_EXPR_DEPTH
-                ),
-            ));
-        }
         // A view reference written outside any view body starts a new expansion count.
         let expansions = if depth == 1 {
             1
@@ -202,13 +206,33 @@ impl Engine {
         self.view_expansions.set(expansions);
         let saved = self.view_trace.borrow_mut().take();
         self.view_depth.set(depth);
+        let saved_base = self.view_base.replace(base);
         let out = f();
+        self.view_base.set(saved_base);
         self.view_depth.set(depth - 1);
         if depth == 1 {
             self.view_columns.borrow_mut().clear();
         }
         *self.view_trace.borrow_mut() = saved;
         out
+    }
+
+    /// The depth a view body referenced at `site` starts from, within the statement (views.md
+    /// §4.1). The reference sits at `site.depth` within the text that names it, which itself starts
+    /// at `view_base`, so the body nests as it would with every view reference replaced by its
+    /// parenthesized body. 54001 when the body would reach past `MAX_EXPR_DEPTH`.
+    pub(crate) fn view_site_base(&self, site: ViewSite) -> Result<usize> {
+        let base = self.view_base.get() + site.depth;
+        if base + site.body_depth > crate::parser::MAX_EXPR_DEPTH {
+            return Err(EngineError::new(
+                SqlState::StatementTooComplex,
+                format!(
+                    "statement too complex: nesting depth exceeds the maximum of {}",
+                    crate::parser::MAX_EXPR_DEPTH
+                ),
+            ));
+        }
+        Ok(base)
     }
 
     /// Plan `body` (a view definition) in the isolated view scope with a fresh trace, returning the
@@ -227,7 +251,7 @@ impl Engine {
     // ---------------------------------------------------------------------------------------------
 
     /// If the FROM item `tref` names a view, the equivalent derived table `( <definition> ) AS
-    /// <label> ( <columns> )` and the view's name. A name resolves to a statement-local CTE, then a
+    /// <label> ( <columns> )`, the view's name, and where the reference sits. A name resolves to a statement-local CTE, then a
     /// built-in catalog relation, then a table, then a view (§4); tables and views share one
     /// namespace. A column list on the reference renames over the view's stored names (a longer list
     /// is left in place so the derived-table planning raises its 42P10). A view behind an attachment
@@ -236,7 +260,7 @@ impl Engine {
         &self,
         tref: &TableRef,
         ctes: &[&CteBinding],
-    ) -> Option<(TableRef, String)> {
+    ) -> Option<(TableRef, String, ViewSite)> {
         if tref.args.is_some()
             || tref.subquery.is_some()
             || tref.values.is_some()
@@ -273,7 +297,11 @@ impl Engine {
             lateral: false,
             pos: TableRefPos::default(),
         };
-        Some((derived, view.name.clone()))
+        let site = ViewSite {
+            depth: tref.pos.depth,
+            body_depth: view.depth,
+        };
+        Some((derived, view.name.clone(), site))
     }
 
     /// The view a relation reference that is not a CTE names, if any (§4): a built-in catalog
@@ -300,6 +328,7 @@ impl Engine {
         view_name: &str,
         body: &QueryExpr,
         written: &TableRef,
+        site: ViewSite,
         ptypes: &mut ParamTypes,
     ) -> Result<QueryPlan> {
         if let Some(trace) = self.view_trace.borrow_mut().as_mut() {
@@ -312,7 +341,7 @@ impl Engine {
                 },
             );
         }
-        self.in_view_body(|| {
+        self.in_view_body(site, || {
             let plan = self.plan_query(body, None, &[], ptypes)?;
             self.view_columns
                 .borrow_mut()
@@ -445,7 +474,7 @@ impl Engine {
         //    one consumed by a special-cased form (a parameter CAST) is caught on the tokens right
         //    after planning.
         let tokens = crate::lexer::lex(&cv.body)?;
-        let body = parse_view_definition(&cv.body)?;
+        let (body, depth) = parse_view_definition(&cv.body)?;
         let (plan, trace) = self.trace_view_body(&body)?;
         if let Some(n) = tokens.iter().find_map(|t| match t {
             Token::Param(n) => Some(*n),
@@ -461,11 +490,11 @@ impl Engine {
         let body_types = plan.column_types().to_vec();
         let columns = view_output_names(&body_names, cv.columns.as_deref())?;
         // 6. Freeze every expanded `*` and verify the expanded text plans to the same output.
-        let (definition, body, trace) = if trace.stars.is_empty() {
-            (cv.body.clone(), body, trace)
+        let (definition, body, depth, trace) = if trace.stars.is_empty() {
+            (cv.body.clone(), body, depth, trace)
         } else {
             let frozen = freeze_stars(&tokens, &trace)?;
-            let refrozen = parse_view_definition(&frozen).map_err(|_| {
+            let (refrozen, depth) = parse_view_definition(&frozen).map_err(|_| {
                 view_not_supported("a view's * expansion cannot be written by name")
             })?;
             let (plan2, trace2) = self.trace_view_body(&refrozen).map_err(|_| {
@@ -478,7 +507,7 @@ impl Engine {
                     "a view's * expansion cannot be written by name",
                 ));
             }
-            (frozen, refrozen, trace2)
+            (frozen, refrozen, depth, trace2)
         };
         let deps = self.trace_dependencies(&trace);
         // 7. The creating session's SELECT privilege on every relation the body reads (§9).
@@ -514,6 +543,7 @@ impl Engine {
             definition,
             deps,
             body: std::sync::Arc::new(body),
+            depth,
         };
         self.check_view_entry_fits(&def)?;
         self.working_mut().put_view(def);
@@ -965,7 +995,7 @@ impl Engine {
         for (view, items) in &plan.views {
             let definition = rewrite_view_text(&view.definition, items, &plan, change)?;
             let expected = renamed_deps(&view.deps, &plan, change);
-            let body = parse_view_definition(&definition)
+            let (body, depth) = parse_view_definition(&definition)
                 .map_err(|_| alter_breaks_view(&plan.table, &view.name))?;
             if definition != view.definition || expected != view.deps {
                 let updated = ViewDef {
@@ -974,6 +1004,7 @@ impl Engine {
                     definition,
                     deps: expected.clone(),
                     body: std::sync::Arc::new(body),
+                    depth,
                 };
                 self.check_view_entry_fits(&updated)?;
                 self.working_mut().put_view(updated);

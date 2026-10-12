@@ -757,7 +757,9 @@ pub struct TableRef {
 /// The token positions a base-table FROM item occupies in its statement's token stream (views.md
 /// §5/§7): the table-name token, the alias identifier token (when aliased), and the `(` / `)` of
 /// its column alias list (when present). Recorded by the parser for every base-table reference; the
-/// view rewrites use them to edit a stored definition token by token. Never part of AST equality —
+/// view rewrites use them to edit a stored definition token by token. `depth` is the parser's
+/// nesting depth at the item, which a view reference adds its body's depth to (views.md §4.1).
+/// Never part of AST equality —
 /// two references that differ only in position compare equal, so structural expression matching
 /// (GROUP BY keys, index expressions) is unaffected.
 #[derive(Clone, Copy, Default, Debug)]
@@ -765,6 +767,7 @@ pub struct TableRefPos {
     pub name: usize,
     pub alias: Option<usize>,
     pub list: Option<(usize, usize)>,
+    pub depth: usize,
 }
 
 impl PartialEq for TableRefPos {

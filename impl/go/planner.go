@@ -50,12 +50,12 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	// token positions are what a traced view body records).
 	writtenRefs := append([]tableRef(nil), tableRefs...)
 	viewNames := make([]string, len(tableRefs))
-	isolated := make([]bool, len(tableRefs))
+	isolated := make([]*viewSite, len(tableRefs))
 	for i := range tableRefs {
-		if derived, name, ok := db.viewReference(&tableRefs[i], ctes); ok {
+		if derived, name, site := db.viewReference(&tableRefs[i], ctes); site != nil {
 			tableRefs[i] = derived
 			viewNames[i] = name
-			isolated[i] = true
+			isolated[i] = site
 		}
 	}
 	// A FROM item is a base table, a set-returning function (grammar.md §35), or a derived table
@@ -119,14 +119,17 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			// against the same prefix scope.
 			var plan queryPlan
 			standIn, isStandIn := queryPlan{}, false
-			if isolated[i] && shaping {
+			if isolated[i] != nil && shaping {
+				if _, err := db.viewSiteBase(*isolated[i]); err != nil {
+					return nil, err
+				}
 				standIn, isStandIn = db.viewStandIn(viewNames[i])
 			}
 			if isStandIn {
 				plan = standIn
-			} else if isolated[i] {
+			} else if isolated[i] != nil {
 				err := db.planBodyFirst(shapeBodies, func() error {
-					p, perr := db.planViewReference(viewNames[i], tref.Subquery, &writtenRefs[i], ptypes)
+					p, perr := db.planViewReference(viewNames[i], tref.Subquery, &writtenRefs[i], *isolated[i], ptypes)
 					plan = p
 					return perr
 				})
@@ -1229,7 +1232,7 @@ func (db *engine) planAgain(ctes []*cteBinding, f func() error) error {
 // planDerivedBodies plans each derived body whose shape stage 2 read for real, from its syntax
 // (spec/design/planner.md §3.2). A body that stage 2 moved conjuncts into gets them appended to its
 // WHERE, so its own rewrite and access-path selection see them; any other body is planned as written.
-func (db *engine) planDerivedBodies(plan *selectPlan, tableRefs []tableRef, isolated, shaped []bool, parent *scope, ctes []*cteBinding, ptypes *paramTypes) error {
+func (db *engine) planDerivedBodies(plan *selectPlan, tableRefs []tableRef, isolated []*viewSite, shaped []bool, parent *scope, ctes []*cteBinding, ptypes *paramTypes) error {
 	var pushes [][]*rExpr
 	if plan.pushdown != nil {
 		pushes = plan.pushdown.bodyPushes
@@ -1253,9 +1256,9 @@ func (db *engine) planDerivedBodies(plan *selectPlan, tableRefs []tableRef, isol
 		var body queryPlan
 		err := db.planAgain(ctes, func() error {
 			var rerr error
-			if isolated[i] {
+			if isolated[i] != nil {
 				// A view body is planned in its isolated scope (views.md §4.1).
-				return db.inViewBody(func() error {
+				return db.inViewBody(*isolated[i], func() error {
 					body, rerr = replan(nil, nil)
 					return rerr
 				})

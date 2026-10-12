@@ -111,7 +111,8 @@ serving untrusted SQL. The scalar allocation budget below covers specific expand
   `SELECT` is just bytes).
 
 Five further limits are fixed engine constants (no configuration): a statement may not nest
-expressions/subqueries more than **256** deep (`54001`), a single identifier may not exceed
+expressions/subqueries more than **256** deep (`54001`; a view's query counts as if it were written
+as a subquery where the view is read), a single identifier may not exceed
 **63 bytes** (`42622`), a composite type may not nest more than **32** composites deep
 (`54001` at `CREATE TYPE` — a chain of small `CREATE TYPE`s that the input-size cap can't see),
 and a `json`/`jsonb` document or `jsonpath` may not nest more than **256** levels deep (`54001`

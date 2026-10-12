@@ -326,6 +326,9 @@ class Parser {
   // descended (deepen), restored on the way back up; left stale on the error path because a depth
   // error aborts the whole parse.
   private depth: number;
+  // The deepest depth the parse has reached. A stored view body's is its nesting depth
+  // (spec/design/views.md §4.1), which a reference adds to its own.
+  maxDepth: number;
   // The token position just past the `)` of the most recent bare `(a, b, …)` row constructor (0 =
   // none). A bare row is not a parenthesized base, so parsePostfix refuses `.field` on it
   // (PostgreSQL: `(1,2).f1` is a syntax error, `((1,2)).f1` is field access).
@@ -335,6 +338,7 @@ class Parser {
     this.tokens = tokens;
     this.pos = 0;
     this.depth = 0;
+    this.maxDepth = 0;
     this.bareRowEnd = 0;
   }
 
@@ -345,6 +349,7 @@ class Parser {
   // parse is aborting).
   private deepen(): void {
     this.depth++;
+    this.maxDepth = Math.max(this.maxDepth, this.depth);
     if (this.depth > MAX_EXPR_DEPTH) {
       throw engineError(
         "statement_too_complex",
@@ -2857,7 +2862,7 @@ class Parser {
       }
     }
     // An SRF is implicitly lateral; `lateral` records only whether the keyword was written.
-    const pos: TableRefPos = { name: namePos, alias: aliasPos, list: listPos };
+    const pos: TableRefPos = { name: namePos, alias: aliasPos, list: listPos, depth: this.depth };
     return { name, db, alias, args, columnAliases, columnDefs, lateral, pos };
   }
 
@@ -4848,13 +4853,15 @@ export function parseExpression(text: string): Expr {
 }
 
 // parseViewDefinition parses a stored view definition (spec/design/views.md §3): the canonical body
-// text as a `subquery_expr`. Every token position the AST records (TableRef.pos, a star's pos) is an
-// index into lex(text), which is what the rename rewrites and `*` freezing edit.
-export function parseViewDefinition(text: string): QueryExpr {
+// text as a `subquery_expr`, with the body's nesting depth (§4.1) — the deepest level its parse
+// reached, the body's own `subquery_expr` level included. Every token position the AST records
+// (TableRef.pos, a star's pos) is an index into lex(text), which is what the rename rewrites and `*`
+// freezing edit.
+export function parseViewDefinition(text: string): { body: QueryExpr; depth: number } {
   const p = new Parser(lex(text));
   const body = p.parseViewBody();
   p.expectEof();
-  return body;
+  return { body, depth: p.maxDepth };
 }
 
 // renderTokens re-renders a token slice as the persisted check-expression text: each token

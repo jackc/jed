@@ -750,6 +750,10 @@ export const MAX_COMPOSITE_DEPTH = 32;
 // to, itself and every view reached through it included (spec/design/views.md §4.1; 54001).
 export const MAX_VIEW_EXPANSIONS = 1024;
 
+// ViewSite is where a view reference sits (spec/design/views.md §4.1): the parser's nesting depth at
+// the written FROM item, within the text that names the view, and the view body's own nesting depth.
+type ViewSite = { depth: number; bodyDepth: number };
+
 // SQL_BYTE_ENCODER measures a statement's UTF-8 byte length for the input-size gate (cost.md §7),
 // matching the byte counts Rust (&str::len) and Go (len(string)) use, so the cap accepts / rejects
 // identically across cores (§8). A TextEncoder is available in Node and the browser (the OPFS
@@ -1439,9 +1443,11 @@ export class Engine {
   // rewrite (spec/design/views.md §5–§8): the FROM items, columns, and `*` expansions the planner
   // binds. null on every ordinary statement, which then pays one null check.
   viewTrace: ViewTrace | null = null;
-  // How many view references are being expanded inside one another right now (views.md §4.1):
-  // nesting counts toward MAX_EXPR_DEPTH (54001).
+  // How many view references are being expanded inside one another right now (views.md §4.1).
   private viewDepth = 0;
+  // The nesting depth, within the statement, at which the text being planned starts: 0 for the
+  // statement, else the depth of the view body being expanded (views.md §4.1).
+  private viewBase = 0;
   // Whether the planner is building a derived body's SHAPE (spec/design/planner.md §3.2): a first
   // plan read only for its output columns and pushability, then discarded and planned again. A shape
   // skips its own bodies' second planning and stage 3, so every derived body is planned at most twice
@@ -12903,22 +12909,32 @@ export class Engine {
     if (isAttachmentScope(tref.db)) {
       throw viewNotSupported(`a view cannot read the attached relation "${tref.db}.${tref.name}"`);
     }
-    const pos = tref.pos ?? { name: -1, alias: null, list: null };
+    const pos = tref.pos ?? { name: -1, alias: null, list: null, depth: 0 };
     trace.items.set(pos.name, { kind: "table", name: table.name, pos });
   }
 
-  // inViewBody runs f as the planning of a view body (views.md §4.1): the trace of an enclosing view
-  // body is suspended (a nested view's own relations are not the outer view's dependencies), and the
-  // expansion nesting counts toward MAX_EXPR_DEPTH and the expansion toward MAX_VIEW_EXPANSIONS
-  // (54001).
-  private inViewBody<T>(f: () => T): T {
-    const depth = this.viewDepth + 1;
-    if (depth > MAX_EXPR_DEPTH) {
+  // viewSiteBase returns the depth a view body referenced at site starts from, within the statement
+  // (views.md §4.1). The reference sits at site.depth within the text that names it, which itself
+  // starts at viewBase, so the body nests as it would with every view reference replaced by its
+  // parenthesized body. 54001 when the body would reach past MAX_EXPR_DEPTH.
+  private viewSiteBase(site: ViewSite): number {
+    const base = this.viewBase + site.depth;
+    if (base + site.bodyDepth > MAX_EXPR_DEPTH) {
       throw engineError(
         "statement_too_complex",
         `statement too complex: nesting depth exceeds the maximum of ${MAX_EXPR_DEPTH}`,
       );
     }
+    return base;
+  }
+
+  // inViewBody runs f as the planning of a view body (views.md §4.1) referenced at site: the trace of
+  // an enclosing view body is suspended (a nested view's own relations are not the outer view's
+  // dependencies), the body's nesting depth counts from the reference's toward MAX_EXPR_DEPTH, and
+  // the expansion toward MAX_VIEW_EXPANSIONS (54001).
+  private inViewBody<T>(site: ViewSite, f: () => T): T {
+    const base = this.viewSiteBase(site);
+    const depth = this.viewDepth + 1;
     // A view reference written outside any view body starts a new expansion count.
     const expansions = depth === 1 ? 1 : this.viewExpansions + 1;
     if (expansions > MAX_VIEW_EXPANSIONS) {
@@ -12931,9 +12947,12 @@ export class Engine {
     const saved = this.viewTrace;
     this.viewTrace = null;
     this.viewDepth = depth;
+    const savedBase = this.viewBase;
+    this.viewBase = base;
     try {
       return f();
     } finally {
+      this.viewBase = savedBase;
       this.viewDepth = depth - 1;
       if (depth === 1) this.viewColumns.clear();
       this.viewTrace = saved;
@@ -12968,7 +12987,7 @@ export class Engine {
   }
 
   // viewReference returns, if the FROM item tref names a view, the equivalent derived table
-  // `( <definition> ) AS <label> ( <columns> )` and the view's name. A name resolves to a
+  // `( <definition> ) AS <label> ( <columns> )`, the view's name, and where the reference sits. A name resolves to a
   // statement-local CTE, then a built-in catalog relation, then a table, then a view (§4); tables and
   // views share one namespace. A column list on the reference renames over the view's stored names (a
   // longer list is left in place so the derived-table planning raises its 42P10). A view behind an
@@ -12976,7 +12995,7 @@ export class Engine {
   private viewReference(
     tref: TableRef,
     ctes: CteBinding[],
-  ): { tref: TableRef; viewName: string } | null {
+  ): { tref: TableRef; viewName: string; site: ViewSite } | null {
     if (
       tref.args !== null ||
       tref.subquery !== undefined ||
@@ -13003,6 +13022,7 @@ export class Engine {
     return {
       tref: { name: label, alias: label, args: null, subquery: view.body, columnAliases },
       viewName: view.name,
+      site: { depth: tref.pos?.depth ?? 0, bodyDepth: view.depth },
     };
   }
 
@@ -13013,13 +13033,14 @@ export class Engine {
     viewName: string,
     body: QueryExpr,
     written: TableRef,
+    site: ViewSite,
     ptypes: ParamTypes,
   ): QueryPlan {
     if (this.viewTrace !== null) {
-      const pos = written.pos ?? { name: -1, alias: null, list: null };
+      const pos = written.pos ?? { name: -1, alias: null, list: null, depth: 0 };
       this.viewTrace.items.set(pos.name, { kind: "view", name: viewName, pos });
     }
-    return this.inViewBody(() => {
+    return this.inViewBody(site, () => {
       const plan = this.planQuery(body, null, [], ptypes);
       if (!this.viewColumns.has(viewName)) {
         this.viewColumns.set(viewName, {
@@ -13092,7 +13113,7 @@ export class Engine {
     //    consumed by a special-cased form (a parameter CAST) is caught on the tokens right after
     //    planning.
     const tokens = lex(cv.body);
-    let body = parseViewDefinition(cv.body);
+    let { body, depth } = parseViewDefinition(cv.body);
     const first = this.traceViewBody(body);
     const param = tokens.find((t) => t.kind === "param");
     if (param !== undefined) {
@@ -13109,11 +13130,11 @@ export class Engine {
       const cannot = (): EngineError =>
         viewNotSupported("a view's * expansion cannot be written by name");
       const frozen = freezeStars(tokens, trace);
-      let refrozen: QueryExpr;
+      let refrozen: { body: QueryExpr; depth: number };
       let second: { plan: QueryPlan; trace: ViewTrace };
       try {
         refrozen = parseViewDefinition(frozen);
-        second = this.traceViewBody(refrozen);
+        second = this.traceViewBody(refrozen.body);
       } catch {
         throw cannot();
       }
@@ -13124,7 +13145,7 @@ export class Engine {
         throw cannot();
       }
       definition = frozen;
-      body = refrozen;
+      ({ body, depth } = refrozen);
       trace = second.trace;
     }
     const deps = this.traceDependencies(trace);
@@ -13142,7 +13163,7 @@ export class Engine {
       throw engineError("duplicate_table", `relation "${cv.name}" already exists`);
     }
     // 9. Write the catalog entry; it must fit one catalog page.
-    const def: ViewDef = { name: cv.name, columns, definition, deps, body };
+    const def: ViewDef = { name: cv.name, columns, definition, deps, body, depth };
     this.checkViewEntryFits(def);
     this.working().putView(def);
     return done;
@@ -13364,13 +13385,21 @@ export class Engine {
       const definition = rewriteViewText(view.definition, items, plan, change);
       const expected = renamedDeps(view.deps, plan, change);
       let body: QueryExpr;
+      let depth: number;
       try {
-        body = parseViewDefinition(definition);
+        ({ body, depth } = parseViewDefinition(definition));
       } catch {
         throw alterBreaksView(plan.table, view.name);
       }
       if (definition !== view.definition || !depsEqual(expected, view.deps)) {
-        const updated: ViewDef = { name: view.name, columns: view.columns.slice(), definition, deps: expected, body };
+        const updated: ViewDef = {
+          name: view.name,
+          columns: view.columns.slice(),
+          definition,
+          deps: expected,
+          body,
+          depth,
+        };
         this.checkViewEntryFits(updated);
         this.working().putView(updated);
       }
@@ -13782,7 +13811,7 @@ export class Engine {
     // (<columns>)`, planned in the isolated view scope below.
     const viewItems = writtenItems.map((t) => this.viewReference(t, ctes));
     const tableRefs = writtenItems.map((w, i) => viewItems[i]?.tref ?? w);
-    const isolated = viewItems.map((v) => v !== null);
+    const isolated = viewItems.map((v) => v?.site ?? null);
     const rels: ScopeRel[] = [];
     const srfPlans: (SrfPlan | undefined)[] = []; // aligned with rels; undefined = a base table
     const derivedPlans: (QueryPlan | undefined)[] = []; // aligned with rels; non-undefined = derived
@@ -13846,13 +13875,20 @@ export class Engine {
         // A view reference inside a shape whose view was already planned during this expansion is a
         // row-less VALUES stand-in with the view's output columns: a shape is read only for its own
         // outputs and pushability, never for its relations' bodies.
+        if (viewItem != null && shaping) this.viewSiteBase(viewItem.site);
         const standIn = viewItem != null && shaping ? this.viewColumns.get(viewItem.viewName) : undefined;
         let plan =
           standIn !== undefined
             ? standIn
             : viewItem != null
             ? this.planBodyFirst(shapeBodies, () =>
-                this.planViewReference(viewItem.viewName, tref.subquery!, writtenItems[i]!, ptypes),
+                this.planViewReference(
+                  viewItem.viewName,
+                  tref.subquery!,
+                  writtenItems[i]!,
+                  viewItem.site,
+                  ptypes,
+                ),
               )
             : tref.subquery !== undefined
               ? this.planBodyFirst(shapeBodies, () =>
@@ -14807,7 +14843,7 @@ export class Engine {
   private planDerivedBodies(
     plan: SelectPlan,
     tableRefs: TableRef[],
-    isolated: boolean[],
+    isolated: (ViewSite | null)[],
     shaped: boolean[],
     parent: Scope | null,
     ctes: CteBinding[],
@@ -14826,8 +14862,9 @@ export class Engine {
           ? this.planQuery(body, parent, ctes, ptypes)
           : this.replanPushedQuery(body, shape, pushed, parent, ctes, ptypes);
       // A view body is planned in its isolated scope (views.md §4.1).
+      const site = isolated[i] ?? null;
       plan.rels[i]!.derived = this.planAgain(ctes, () =>
-        isolated[i] ? this.inViewBody(() => replan(null, [])) : replan(parent, ctes),
+        site !== null ? this.inViewBody(site, () => replan(null, [])) : replan(parent, ctes),
       );
     });
   }
@@ -15980,6 +16017,7 @@ export class Engine {
     // Never tracing a view body: an ordinary read plans view references untraced (views.md §5–§8).
     e.viewTrace = null;
     e.viewDepth = 0;
+    e.viewBase = 0;
     e.planShape = false;
     e.viewExpansions = 0;
     e.viewColumns = new Map();

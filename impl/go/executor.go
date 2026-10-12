@@ -12,15 +12,18 @@ import (
 // else is reflect.DeepEqual's recursive tree comparison.
 func exprEqual(a, b exprNode) bool { return astEqual(reflect.ValueOf(a), reflect.ValueOf(b)) }
 
-var tokPosType = reflect.TypeOf(tokPos(0))
+var (
+	tokPosType    = reflect.TypeOf(tokPos(0))
+	nestDepthType = reflect.TypeOf(nestDepth(0))
+)
 
-// astEqual is reflect.DeepEqual over an acyclic AST, except that a tokPos value always compares
-// equal.
+// astEqual is reflect.DeepEqual over an acyclic AST, except that a tokPos or nestDepth value always
+// compares equal.
 func astEqual(a, b reflect.Value) bool {
 	if a.Type() != b.Type() {
 		return false
 	}
-	if a.Type() == tokPosType {
+	if a.Type() == tokPosType || a.Type() == nestDepthType {
 		return true
 	}
 	switch a.Kind() {

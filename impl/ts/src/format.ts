@@ -1436,13 +1436,13 @@ function decodeViewEntry(buf: Uint8Array, cur: Cursor): ViewDef {
     for (let k = 0; k < n; k++) cols.push(readString(buf, cur));
     deps.push({ kind, name: depName, columns: cols });
   }
-  let body: QueryExpr;
+  let parsed: { body: QueryExpr; depth: number };
   try {
-    body = parseViewDefinition(definition);
+    parsed = parseViewDefinition(definition);
   } catch {
     throw engineError("data_corrupted", "a view definition does not parse");
   }
-  return { name, columns, definition, deps, body };
+  return { name, columns, definition, deps, body: parsed.body, depth: parsed.depth };
 }
 
 // installViews validates the loaded views against the catalog and registers them (format.md *View

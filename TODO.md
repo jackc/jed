@@ -400,14 +400,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   → [planner.md §3.2](spec/design/planner.md), [views.md §4.1](spec/design/views.md),
   [cost.md §7e](spec/design/cost.md)
 
-- [ ] **Count view nesting toward the native-stack depth limit.** Each view body is parsed with its
-  own `MAX_EXPR_DEPTH` budget, and view references are counted separately (≤ 256), so the planner's
-  recursion depth is the *sum* over a view chain. A chain of 40 views whose bodies each nest 100
-  derived tables overflows the stack: the Rust core aborts the process and TS fails with an uncoded
-  error. views.md §4.1 says the nesting counts toward `MAX_EXPR_DEPTH`; make it so, by parsing a
-  view body with the depth of its reference site. _(size: M)_ → [views.md §4.1](spec/design/views.md),
-  [cost.md §7](spec/design/cost.md)
-
 - [x] **JSON nesting-depth limit.** A fixed `MAX_JSON_DEPTH = 256` bounds every `json`/`jsonb`
   document where it is produced: the text parser and every nesting constructor (builders,
   aggregates, `to_json[b]`/`array_to_json`, `||`, `jsonb_set`/`jsonb_insert`,

@@ -3312,11 +3312,11 @@ func decodeViewEntry(buf []byte, pos *int) (*viewDef, error) {
 		}
 		deps = append(deps, viewDep{Kind: viewDepKind(kind), Name: depName, Columns: cols})
 	}
-	body, err := parseViewDefinition(definition)
+	body, depth, err := parseViewDefinition(definition)
 	if err != nil {
 		return nil, newError(DataCorrupted, "a view definition does not parse")
 	}
-	return &viewDef{Name: name, Columns: columns, Definition: definition, Deps: deps, Body: body}, nil
+	return &viewDef{Name: name, Columns: columns, Definition: definition, Deps: deps, Body: body, Depth: depth}, nil
 }
 
 // installViews validates the loaded views against the catalog and registers them (format.md *View

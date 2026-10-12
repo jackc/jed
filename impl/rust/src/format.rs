@@ -4506,7 +4506,7 @@ fn decode_view_entry(buf: &[u8], pos: &mut usize) -> Result<crate::catalog::View
             columns: cols,
         });
     }
-    let body = crate::parser::parse_view_definition(&definition)
+    let (body, depth) = crate::parser::parse_view_definition(&definition)
         .map_err(|_| corrupt("a view definition does not parse"))?;
     Ok(crate::catalog::ViewDef {
         name,
@@ -4514,6 +4514,7 @@ fn decode_view_entry(buf: &[u8], pos: &mut usize) -> Result<crate::catalog::View
         definition,
         deps,
         body: Arc::new(body),
+        depth,
     })
 }
 

@@ -200,10 +200,34 @@ ceiling, and its query-memory account. A function with a side effect on statemen
 `nextval`, has that effect in the referencing statement, as it would in a derived table: a `SELECT`
 from a view that calls `nextval` is a write ([sequences.md](sequences.md) §4).
 
-A view may reference other views. Each nested reference expands to its own derived table, and the
-nesting counts toward the parser's `MAX_EXPR_DEPTH` (`54001`, [cost.md](cost.md) §7) when its body
-is parsed. Cycles cannot exist: a view can name only relations that already exist, and nothing in
-this slice redefines a view (§12).
+A view may reference other views. Each nested reference expands to its own derived table. Cycles
+cannot exist: a view can name only relations that already exist, and nothing in this slice
+redefines a view (§12).
+
+**Nesting depth.** A view body is parsed once, on its own, but every use plans it inside the
+referencing statement, so the planner recurses through every view the statement reaches. The nesting
+counts toward the parser's `MAX_EXPR_DEPTH` (`54001`, [cost.md](cost.md) §7) as it would in the
+statement's **textual expansion**, the statement with every view reference replaced by its
+parenthesized body (`FROM v` by `FROM ( <body> ) AS v`), recursively. A statement whose expansion
+would not parse within the limit is `54001`; at `CREATE VIEW` the body planned is the new view's,
+so a view whose expansion is too deep cannot be created.
+
+The check needs no expansion text. When a stored definition is parsed, at `CREATE VIEW` and at open,
+its **body depth** is recorded: the deepest nesting level the parse reached, counting the body's own
+`subquery_expr` level. The parser also records the nesting depth at each base-table FROM item. A
+body planned for a view reference starts at
+
+```
+base = enclosing base + depth of the reference within its own text
+```
+
+where the enclosing base is 0 for the statement and, inside a view body, that body's own base. The
+reference is `54001` when `base + body depth > MAX_EXPR_DEPTH`. Parsing the derived table
+`( <body> )` at the reference's depth reaches exactly that depth, so the check accepts a statement
+exactly when its textual expansion parses. It is made at every view reference the planner meets,
+including one a shape reads from the columns of a view already planned (planner.md §3.2), before the
+expansion count below. Each nested view adds at least one level, so this also bounds how many views
+nest inside one another.
 
 **Expansion limit.** A view expands like a macro, so views that each name the previous view twice
 expand to `2^d` view bodies at depth `d`. Planning is unmetered, so the expansion is bounded

@@ -555,9 +555,11 @@ pub struct Engine {
     /// rename rewrite (spec/design/views.md §5–§8): the FROM items, columns, and `*` expansions the
     /// planner binds. `None` on every ordinary statement, which then pays one `RefCell` nil check.
     pub(crate) view_trace: std::cell::RefCell<Option<ViewTrace>>,
-    /// How many view references are being expanded inside one another right now (views.md §4.1):
-    /// nesting counts toward `MAX_EXPR_DEPTH` (54001).
+    /// How many view references are being expanded inside one another right now (views.md §4.1).
     pub(crate) view_depth: std::cell::Cell<usize>,
+    /// The nesting depth, within the statement, at which the text being planned starts: 0 for the
+    /// statement, else the depth of the view body being expanded (views.md §4.1).
+    pub(crate) view_base: std::cell::Cell<usize>,
     /// Whether the planner is building a derived body's **shape** (spec/design/planner.md §3.2): a
     /// first plan read only for its output columns and pushability, then discarded and planned
     /// again. A shape skips its own bodies' second planning and stage 3, so every derived body is

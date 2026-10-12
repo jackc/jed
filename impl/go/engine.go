@@ -118,8 +118,11 @@ type engine struct {
 	// planner binds. nil on every ordinary statement, which then pays one nil check.
 	viewTrace *viewTrace
 	// viewDepth is how many view references are being expanded inside one another right now
-	// (views.md §4.1): nesting counts toward maxExprDepth (54001).
+	// (views.md §4.1).
 	viewDepth int
+	// viewBase is the nesting depth, within the statement, at which the text being planned starts: 0
+	// for the statement, else the depth of the view body being expanded (views.md §4.1).
+	viewBase int
 	// planShape is whether the planner is building a derived body's SHAPE (spec/design/planner.md
 	// §3.2): a first plan read only for its output columns and pushability, then discarded and
 	// planned again. A shape skips its own bodies' second planning and stage 3, so every derived body

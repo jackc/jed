@@ -383,6 +383,8 @@ pub struct ViewDef {
     /// The parsed definition — parsed at create and at load, never persisted. Shared, so a
     /// snapshot clone stays cheap.
     pub body: std::sync::Arc<crate::ast::QueryExpr>,
+    /// The body's nesting depth (spec/design/views.md §4.1), from the same parse as `body`.
+    pub depth: usize,
 }
 
 /// What a view dependency names (format.md *View entry* `dep_kind`).

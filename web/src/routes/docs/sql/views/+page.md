@@ -113,6 +113,11 @@ may expand to at most **1024** views, counting itself and every view reference r
 More is error `54001`, at `CREATE VIEW` too. This keeps views that each read the previous view
 twice, which double at every level, from making planning unbounded. PostgreSQL has no such limit.
 
+The expanded query must also stay within the **256**-level nesting limit that applies to every
+statement. A view's query counts from the depth at which the view is read, as if the reference were
+replaced by the query in parentheses, so a chain of views with deeply nested queries is `54001` once
+the whole chain would be too deep, at `CREATE VIEW` or when it is read.
+
 As with any query, rows come back in a defined order only when the outer query has an `ORDER BY`.
 
 ## `*` is fixed when the view is created

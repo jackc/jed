@@ -635,10 +635,12 @@ template = "SQL statement exceeds the maximum length of {max} bytes"
 # aborts 54001 at compile — the same native-stack/allocation-bound structural-complexity gate reached
 # via pattern size (a MALFORMED pattern is 2201B instead). The view expansion limit
 # (spec/design/cost.md §7e, views.md §4.1) raises it when one view reference would expand to more than
-# MAX_VIEW_EXPANSIONS (1024) views, bounding unmetered planning work. Asserted by the conformance
-# corpus (the resource.depth_limit, resource.composite_depth_limit, resource.regex_program_limit and
-# resource.view_expansion_limit capabilities), since the abort point is part of the cross-core
-# contract (no reference impl, §2).
+# MAX_VIEW_EXPANSIONS (1024) views, bounding unmetered planning work, and when a statement's view
+# references, each adding its body's nesting depth to the depth at which it is written, would nest
+# past MAX_EXPR_DEPTH (views.md §4.1). Asserted by the conformance corpus (the resource.depth_limit,
+# resource.composite_depth_limit, resource.regex_program_limit, resource.view_expansion_limit and
+# resource.view_depth_limit capabilities), since the abort point is part of the cross-core contract
+# (no reference impl, §2).
 [[error]]
 code = "54001"
 name = "statement_too_complex"

@@ -171,15 +171,36 @@ func (db *engine) traceTableItem(tref *tableRef, table *catTable) error {
 // to, itself and every view reached through it included (spec/design/views.md §4.1; 54001).
 const maxViewExpansions = 1024
 
-// inViewBody runs f as the planning of a view body (views.md §4.1): the trace of an enclosing view
-// body is suspended (a nested view's own relations are not the outer view's dependencies), and the
-// expansion nesting counts toward maxExprDepth and the expansion toward maxViewExpansions (54001).
-func (db *engine) inViewBody(f func() error) error {
-	depth := db.viewDepth + 1
-	if depth > maxExprDepth {
-		return newError(StatementTooComplex, fmt.Sprintf(
+// viewSite is where a view reference sits (spec/design/views.md §4.1): the parser's nesting depth at
+// the written FROM item, within the text that names the view, and the view body's own nesting depth.
+type viewSite struct {
+	depth     int
+	bodyDepth int
+}
+
+// viewSiteBase returns the depth a view body referenced at site starts from, within the statement
+// (views.md §4.1). The reference sits at site.depth within the text that names it, which itself starts
+// at viewBase, so the body nests as it would with every view reference replaced by its parenthesized
+// body. 54001 when the body would reach past maxExprDepth.
+func (db *engine) viewSiteBase(site viewSite) (int, error) {
+	base := db.viewBase + site.depth
+	if base+site.bodyDepth > maxExprDepth {
+		return 0, newError(StatementTooComplex, fmt.Sprintf(
 			"statement too complex: nesting depth exceeds the maximum of %d", maxExprDepth))
 	}
+	return base, nil
+}
+
+// inViewBody runs f as the planning of a view body (views.md §4.1) referenced at site: the trace of
+// an enclosing view body is suspended (a nested view's own relations are not the outer view's
+// dependencies), the body's nesting depth counts from the reference's toward maxExprDepth, and the
+// expansion toward maxViewExpansions (54001).
+func (db *engine) inViewBody(site viewSite, f func() error) error {
+	base, err := db.viewSiteBase(site)
+	if err != nil {
+		return err
+	}
+	depth := db.viewDepth + 1
 	// A view reference written outside any view body starts a new expansion count.
 	expansions := db.viewExpansions + 1
 	if depth == 1 {
@@ -193,7 +214,10 @@ func (db *engine) inViewBody(f func() error) error {
 	saved := db.viewTrace
 	db.viewTrace = nil
 	db.viewDepth = depth
-	err := f()
+	savedBase := db.viewBase
+	db.viewBase = base
+	err = f()
+	db.viewBase = savedBase
 	db.viewDepth = depth - 1
 	if depth == 1 {
 		db.viewColumns = nil
@@ -242,25 +266,26 @@ func (db *engine) relationView(qualifier *string, name string) *viewDef {
 }
 
 // viewReference reports whether the FROM item tref names a view and, if so, returns the equivalent
-// derived table `( <definition> ) AS <label> ( <columns> )` and the view's name. A name resolves to
+// derived table `( <definition> ) AS <label> ( <columns> )`, the view's name, and where the reference
+// sits. A name resolves to
 // a statement-local CTE, then a built-in catalog relation, then a table, then a view (§4); tables
 // and views share one namespace. A column list on the reference renames over the view's stored names
 // (a longer list is left in place so the derived-table planning raises its 42P10). A view behind an
 // attachment qualifier is rejected by the FROM build (§10), so only bare and main. names expand.
-func (db *engine) viewReference(tref *tableRef, ctes []*cteBinding) (tableRef, string, bool) {
+func (db *engine) viewReference(tref *tableRef, ctes []*cteBinding) (tableRef, string, *viewSite) {
 	if tref.IsFunc || tref.Subquery != nil || tref.Values != nil || tref.JsonTable != nil {
-		return tableRef{}, "", false
+		return tableRef{}, "", nil
 	}
 	if tref.DB == nil {
 		for _, b := range ctes {
 			if b.name == tref.Name {
-				return tableRef{}, "", false
+				return tableRef{}, "", nil
 			}
 		}
 	}
 	view := db.relationView(tref.DB, tref.Name)
 	if view == nil {
-		return tableRef{}, "", false
+		return tableRef{}, "", nil
 	}
 	label := view.Name
 	if tref.Alias != nil {
@@ -278,13 +303,13 @@ func (db *engine) viewReference(tref *tableRef, ctes []*cteBinding) (tableRef, s
 	}
 	l := label
 	derived := tableRef{Name: label, Alias: &l, Subquery: view.Body, ColumnAliases: columnAliases}
-	return derived, view.Name, true
+	return derived, view.Name, &viewSite{depth: int(tref.Depth), bodyDepth: view.Depth}
 }
 
 // planViewReference plans a view reference's body (views.md §4.1): a fresh top-level scope with no
 // correlation, no outer CTEs, and no parameters. While a view body is traced, the reference records
 // the dependency on the view itself.
-func (db *engine) planViewReference(viewName string, body *queryExpr, written *tableRef, ptypes *paramTypes) (queryPlan, error) {
+func (db *engine) planViewReference(viewName string, body *queryExpr, written *tableRef, site viewSite, ptypes *paramTypes) (queryPlan, error) {
 	if db.viewTrace != nil {
 		db.viewTrace.items[written.NamePos] = traceItem{
 			kind: viewDepView, name: viewName,
@@ -292,7 +317,7 @@ func (db *engine) planViewReference(viewName string, body *queryExpr, written *t
 		}
 	}
 	var plan queryPlan
-	err := db.inViewBody(func() error {
+	err := db.inViewBody(site, func() error {
 		var perr error
 		plan, perr = db.planQuery(*body, nil, nil, ptypes)
 		if perr != nil {
@@ -428,7 +453,7 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 	if err != nil {
 		return outcome{}, err
 	}
-	body, err := parseViewDefinition(cv.Body)
+	body, depth, err := parseViewDefinition(cv.Body)
 	if err != nil {
 		return outcome{}, err
 	}
@@ -453,7 +478,7 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 	if len(trace.stars) > 0 {
 		frozen := freezeStars(tokens, trace)
 		notByName := viewNotSupported("a view's * expansion cannot be written by name")
-		refrozen, perr := parseViewDefinition(frozen)
+		refrozen, refrozenDepth, perr := parseViewDefinition(frozen)
 		if perr != nil {
 			return outcome{}, notByName
 		}
@@ -470,7 +495,7 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 				return outcome{}, notByName
 			}
 		}
-		definition, body, trace = frozen, refrozen, trace2
+		definition, body, depth, trace = frozen, refrozen, refrozenDepth, trace2
 	}
 	deps := db.traceDependencies(trace)
 	// 7. The creating session's SELECT privilege on every relation the body reads (§9).
@@ -496,7 +521,7 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 		return outcome{}, newError(DuplicateTable, fmt.Sprintf("relation \"%s\" already exists", cv.Name))
 	}
 	// 9. Write the catalog entry; it must fit one catalog page.
-	def := &viewDef{Name: cv.Name, Columns: columns, Definition: definition, Deps: deps, Body: body}
+	def := &viewDef{Name: cv.Name, Columns: columns, Definition: definition, Deps: deps, Body: body, Depth: depth}
 	if err := db.checkViewEntryFits(def); err != nil {
 		return outcome{}, err
 	}
@@ -875,7 +900,7 @@ func (db *engine) finishViewAlter(vp *viewAlterPlan, change viewAlterChange) err
 			return err
 		}
 		expected := renamedDeps(view.Deps, vp, change)
-		body, err := parseViewDefinition(definition)
+		body, depth, err := parseViewDefinition(definition)
 		if err != nil {
 			return alterBreaksView(vp.table, view.Name)
 		}
@@ -883,6 +908,7 @@ func (db *engine) finishViewAlter(vp *viewAlterPlan, change viewAlterChange) err
 		if definition != view.Definition || !viewDepsEqual(expected, view.Deps) {
 			updated := &viewDef{
 				Name: view.Name, Columns: view.Columns, Definition: definition, Deps: expected, Body: body,
+				Depth: depth,
 			}
 			if err := db.checkViewEntryFits(updated); err != nil {
 				return err

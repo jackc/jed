@@ -1,0 +1,106 @@
+# View nesting counts toward the parser's nesting-depth limit (spec/design/views.md §4.1,
+# spec/design/cost.md §7). A view body is parsed once, on its own, but every use plans it inside the
+# referencing statement, so the planner recurses through the whole chain of views. A statement is
+# accepted exactly when it would parse with every view reference replaced by its parenthesized
+# body: each view reference adds its body's nesting depth to the depth at which the reference is
+# written, and past MAX_EXPR_DEPTH = 256 the statement is 54001 (statement_too_complex). Before
+# this, each body counted from zero, and a chain of views with deeply nested bodies overflowed the
+# native stack while planning.
+#
+# A query with n nested derived tables over t reaches depth n + 1 (the innermost select item is one
+# level more), so `SELECT a FROM (…255 levels…)` is the deepest accepted textual form. Each view below
+# is 50 nested derived tables over the previous view; its reference costs one more level for the
+# view's own parentheses, so five views reach 5 × 51 + 1 = 256.
+#
+# jed-specific (PostgreSQL bounds this only by its runtime stack probe), so cross-core-checked, not
+# oracle-checked.
+# requires: ddl.view, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.aggregates, query.cross_join, query.subquery_scalar, query.subquery_in, query.derived_table, types.i32, resource.depth_limit, resource.view_depth_limit
+
+statement ok
+CREATE TABLE t (a i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+# --- five views of 50 nested derived tables each: exactly at the limit -----------------------------
+
+statement ok
+CREATE VIEW d1 AS SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM t) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d
+
+statement ok
+CREATE VIEW d2 AS SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM d1) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d
+
+statement ok
+CREATE VIEW d3 AS SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM d2) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d
+
+statement ok
+CREATE VIEW d4 AS SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM d3) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d
+
+statement ok
+CREATE VIEW d5 AS SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM d4) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d
+
+query I
+SELECT a FROM d5
+----
+1
+
+# The same chain one level deeper: any enclosing level is one too many.
+
+statement error 54001
+SELECT a FROM (SELECT a FROM d5) x
+
+statement error 54001
+SELECT a FROM t WHERE a IN (SELECT a FROM d5)
+
+statement error 54001
+SELECT (SELECT a FROM d5)
+
+statement error 54001
+CREATE VIEW d6 AS SELECT a FROM d5
+
+# One view down there is room for one more enclosing level per 51 removed.
+
+query I
+SELECT a FROM (SELECT a FROM d4) x
+----
+1
+
+statement ok
+CREATE VIEW e5 AS SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM d4) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d
+
+statement error 54001
+CREATE VIEW e6 AS SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM d4) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d
+
+query I
+SELECT a FROM e5
+----
+1
+
+# --- the reported shape: views of 100 nested derived tables each ------------------------------------
+# w1 reaches 102 and w2 203; w3 would reach 304. Before, each CREATE VIEW counted only its own body,
+# so the chain could grow until planning it overflowed the stack.
+
+statement ok
+CREATE VIEW w1 AS SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM t) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d
+
+statement ok
+CREATE VIEW w2 AS SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM w1) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d
+
+statement error 54001
+CREATE VIEW w3 AS SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM (SELECT a FROM w2) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d) d
+
+query I
+SELECT a FROM w2
+----
+1
+
+# The limit is a property of the statement and the catalog: a failed statement leaves nothing
+# behind, and the views under the limit still read.
+
+statement error 42P01
+SELECT a FROM w3
+
+query I
+SELECT count(*) FROM d5, w2
+----
+1

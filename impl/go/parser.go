@@ -68,6 +68,9 @@ type parser struct {
 	// per AST level descended (deepen), restored on the way back up; left stale on the error path
 	// because a depth error aborts the whole parse.
 	depth int
+	// maxDepth is the deepest depth the parse has reached. A stored view body's is its nesting depth
+	// (spec/design/views.md §4.1), which a reference adds to its own.
+	maxDepth int
 	// bareRowEnd is the token position just past the `)` of the most recent bare `(a, b, …)` row
 	// constructor (0 = none). A bare row is not a parenthesized base, so parsePostfix refuses
 	// `.field` on it (PostgreSQL: `(1,2).f1` is a syntax error, `((1,2)).f1` is field access).
@@ -86,6 +89,7 @@ func newParser(tokens []token) *parser {
 // parse is aborting).
 func (p *parser) deepen() error {
 	p.depth++
+	p.maxDepth = max(p.maxDepth, p.depth)
 	if p.depth > maxExprDepth {
 		return newError(StatementTooComplex, fmt.Sprintf(
 			"statement too complex: nesting depth exceeds the maximum of %d", maxExprDepth,
@@ -3533,6 +3537,7 @@ func (p *parser) parseTableRef() (tableRef, error) {
 	return tableRef{
 		Name: name, DB: dbQualifier, Alias: alias, IsFunc: isFunc, Args: args, ColumnAliases: columnAliases, ColumnDefs: columnDefs, Lateral: lateral,
 		NamePos: tokPos(namePos), AliasPos: aliasPos, ListOpen: listOpen, ListClose: listClose,
+		Depth: nestDepth(p.depth),
 	}, nil
 }
 
@@ -6234,22 +6239,24 @@ func parseExpression(text string) (exprNode, error) {
 }
 
 // parseViewDefinition parses a stored view definition (spec/design/views.md §3): the canonical body
-// text as a subquery_expr. Every token position the AST records (tableRef NamePos/AliasPos/List*,
-// StarPos) is an index into lex(text), which is what the rename rewrites and `*` freezing edit.
-func parseViewDefinition(text string) (*queryExpr, error) {
+// text as a subquery_expr, with the body's nesting depth (§4.1) — the deepest level its parse
+// reached, the body's own subquery_expr level included. Every token position the AST records
+// (tableRef NamePos/AliasPos/List*, StarPos) is an index into lex(text), which is what the rename
+// rewrites and `*` freezing edit.
+func parseViewDefinition(text string) (*queryExpr, int, error) {
 	tokens, err := lex(text)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	p := newParser(tokens)
 	body, err := p.parseSubquery()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if err := p.expectEof(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return &body, nil
+	return &body, p.maxDepth, nil
 }
 
 // renderTokens re-renders a token slice as the persisted check-expression text: each token

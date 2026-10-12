@@ -53,6 +53,9 @@ pub struct Parser {
     /// level descended (`deepen`), restored on the way back up; left stale on the error path
     /// because a depth error aborts the whole parse.
     depth: usize,
+    /// The deepest `depth` the parse has reached. A stored view body's is its nesting depth
+    /// (spec/design/views.md §4.1), which a reference adds to its own.
+    max_depth: usize,
     /// The token position just past the `)` of the most recent bare `(a, b, …)` row constructor
     /// (0 = none). A bare row is not a parenthesized base, so `parse_postfix` refuses `.field` on it
     /// (PostgreSQL: `(1,2).f1` is a syntax error, `((1,2)).f1` is field access).
@@ -65,6 +68,7 @@ impl Parser {
             tokens,
             pos: 0,
             depth: 0,
+            max_depth: 0,
             bare_row_end: 0,
         }
     }
@@ -76,6 +80,7 @@ impl Parser {
     /// harmless: the parse is aborting).
     fn deepen(&mut self) -> Result<()> {
         self.depth += 1;
+        self.max_depth = self.max_depth.max(self.depth);
         if self.depth > MAX_EXPR_DEPTH {
             return Err(EngineError::new(
                 SqlState::StatementTooComplex,
@@ -3148,6 +3153,7 @@ impl Parser {
                 name: name_pos,
                 alias: alias_pos,
                 list: list_pos,
+                depth: self.depth,
             },
         })
     }
@@ -5419,14 +5425,16 @@ pub fn parse_expression(text: &str) -> Result<Expr> {
 }
 
 /// Parse a stored view definition (spec/design/views.md §3): the canonical body text as a
-/// `subquery_expr`. Every token position the AST records (`TableRefPos`, `StarPos`) is an index
-/// into `lex(text)`, which is what the rename rewrites and `*` freezing edit.
-pub fn parse_view_definition(text: &str) -> Result<QueryExpr> {
+/// `subquery_expr`, with the body's nesting depth (§4.1) — the deepest level its parse reached,
+/// the body's own `subquery_expr` level included. Every token position the AST records
+/// (`TableRefPos`, `StarPos`) is an index into `lex(text)`, which is what the rename rewrites and
+/// `*` freezing edit.
+pub fn parse_view_definition(text: &str) -> Result<(QueryExpr, usize)> {
     let tokens = lex(text)?;
     let mut p = Parser::new(tokens);
     let body = p.parse_subquery()?;
     p.expect_eof()?;
-    Ok(body)
+    Ok((body, p.max_depth))
 }
 
 /// Re-render a token slice as the persisted check-expression text: each token rendered by

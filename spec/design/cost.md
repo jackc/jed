@@ -1717,7 +1717,13 @@ input-size cap never sees it, and the depth is a property of the *catalog graph*
 use/codec time), not a single statement's AST — so the nesting counter never sees it either. It has
 its own catalog-resolution depth gate — the composite-type nesting limit in §7b. Any future grammar
 that recurses outside the expression / query-expression / set-op cascade is the same shape; both are
-noted so the seam's coverage boundary stays explicit. (A literal-field `ROW(…)` / `ARRAY[…]` nest in
+noted so the seam's coverage boundary stays explicit. **View bodies** are a third such vector: each
+body is parsed on its own, but planning recurses through every view a statement reaches. A view
+reference therefore adds its body's parsed depth to the depth at which it is written, and the sum
+counts toward `MAX_EXPR_DEPTH` as if the statement were written with every view replaced by its
+parenthesized body ([views.md §4.1](views.md), conformance
+[../conformance/suites/resource/view_depth_limit.test](../conformance/suites/resource/view_depth_limit.test),
+gated by `resource.view_depth_limit`). (A literal-field `ROW(…)` / `ARRAY[…]` nest in
 an `INSERT … VALUES` slot is parsed outside `parse_expr`, so it counts one nesting level per
 constructor itself and aborts `54001` like the expression form — grammar.md §16.)
 

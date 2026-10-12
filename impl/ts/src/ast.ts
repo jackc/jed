@@ -941,11 +941,14 @@ export type TableRef = {
 
 // TableRefPos is the token positions a base-table FROM item occupies in its statement's token
 // stream (views.md §5/§7): the table-name token, the alias identifier token (when aliased), and the
-// `(` / `)` of its column alias list (when present). Indices into lex(text), Eof excluded.
+// `(` / `)` of its column alias list (when present). Indices into lex(text), Eof excluded. `depth` is
+// the parser's nesting depth at the item, which a view reference adds its body's depth to (views.md
+// §4.1).
 export type TableRefPos = {
   name: number;
   alias: number | null;
   list: [number, number] | null;
+  depth: number;
 };
 
 // JsonTable is a `JSON_TABLE(ctx, path [AS name] COLUMNS (col, …))` table source (json-table.md §3,

@@ -475,6 +475,11 @@ type qualifiedName struct {
 // differ only in position compare equal.
 type tokPos int
 
+// nestDepth is the parser's nesting depth (maxExprDepth) at a FROM item, which a view reference adds
+// its body's depth to (spec/design/views.md §4.1). Like a tokPos it is invisible to structural AST
+// equality: the same reference written at two depths compares equal.
+type nestDepth int
+
 // AlterSequence is an ALTER SEQUENCE [IF EXISTS] <name> <action> statement (spec/design/sequences.md
 // §4/§15). A missing sequence without IfExists is 42P01. RenameTo != "" selects the RENAME TO form;
 // otherwise the option form (Options + Restart) applies. The two are mutually exclusive (the parser
@@ -739,6 +744,8 @@ type tableRef struct {
 	AliasPos  tokPos
 	ListOpen  tokPos
 	ListClose tokPos
+	// Depth is the parser's nesting depth at the item (views.md §4.1).
+	Depth nestDepth
 }
 
 // JsonTable is a `JSON_TABLE(ctx, path [AS name] COLUMNS (col, …))` table source (json-table.md §3,
