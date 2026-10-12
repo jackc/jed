@@ -48,11 +48,29 @@ SELECT * FROM active_staff ORDER BY id;`;
 ALTER VIEW active_staff RENAME TO on_duty;
 ALTER VIEW on_duty RENAME COLUMN dept TO team;
 SELECT name, definition FROM jed_views ORDER BY name;`;
+
+	const writeSeed = `CREATE TABLE task (
+  id    i32 PRIMARY KEY,
+  title text NOT NULL,
+  done  boolean NOT NULL DEFAULT false,
+  owner text
+);
+INSERT INTO task VALUES
+  (1, 'write docs', false, 'ada'),
+  (2, 'ship it',    true,  'ada'),
+  (3, 'review',     false, 'ken');
+CREATE VIEW open_tasks AS
+  SELECT id, title, upper(owner) AS owner_tag FROM task WHERE NOT done;`;
+
+	const writeQuery = `UPDATE open_tasks SET title = 'write more docs' WHERE id = 1;
+INSERT INTO open_tasks (id, title) VALUES (4, 'plan');
+DELETE FROM open_tasks WHERE owner_tag = 'KEN';
+SELECT * FROM task ORDER BY id;`;
 </script>
 
 <svelte:head>
 	<title>Views — jed</title>
-	<meta name="description" content="CREATE [OR REPLACE] VIEW, ALTER VIEW, and DROP VIEW in jed — named, persisted, read-only queries that read exactly like the equivalent subquery, with dependency tracking, rename rewriting, and per-view privileges." />
+	<meta name="description" content="CREATE [OR REPLACE] VIEW, ALTER VIEW, and DROP VIEW in jed — named, persisted queries that read exactly like the equivalent subquery, writable when they select from one table, with dependency tracking, rename rewriting, and per-view privileges." />
 </svelte:head>
 
 # Views
@@ -66,8 +84,9 @@ CREATE VIEW active_staff AS
 SELECT name FROM active_staff WHERE dept = 'eng';
 ```
 
-A view stores no rows. Each time a query reads it, jed runs its saved query in place. Views are
-**read-only** in this release.
+A view stores no rows. Each time a query reads it, jed runs its saved query in place. A simple view
+over one table can also be written to: `INSERT`, `UPDATE`, and `DELETE` on it change the table
+underneath ([below](#writing-through-a-view)).
 
 <LiveSql {seed} {query} rows={4} />
 
@@ -76,7 +95,8 @@ Things to try in the panel above:
 - Read a view — `SELECT dept, headcount, payroll FROM dept_payroll ORDER BY dept;`
 - Rename a view's columns where you use it — `SELECT p, q FROM active_staff AS s (p, q) ORDER BY p;`
 - See the stored definitions — `SELECT name, definition, columns FROM jed_views ORDER BY name;`
-- Write to a view — `INSERT INTO active_staff VALUES (6, 'Dennis', 'eng');` &rarr; error `55000`
+- Write through a view — `UPDATE active_staff SET dept = 'ops' WHERE id = 1;`
+- Write to a view that groups its rows — `DELETE FROM dept_payroll;` &rarr; error `55000`
 - Drop a table a view reads — `DROP TABLE employee;` &rarr; error `2BP01`
 - Drop a column a view reads — `ALTER TABLE employee DROP COLUMN salary;` &rarr; error `2BP01`
 - Drop both views in one statement — `DROP VIEW active_staff, dept_payroll;`
@@ -235,11 +255,37 @@ that reads the replaced view uses a bare name that the new column would capture.
 PostgreSQL accepts such changes. To avoid the error, qualify column references in view queries
 (`e.name` rather than `name`).
 
-## Views are read-only
+<a id="writing-through-a-view"></a>
 
-`INSERT`, `UPDATE`, `DELETE`, `INSERT … ON CONFLICT`, and a data-modifying `WITH` that targets a
-view all fail with `55000` (*cannot insert into view …*). PostgreSQL can write through simple
-single-table views; jed does not support that yet. Write to the underlying table instead.
+## Writing through a view
+
+As in PostgreSQL, a view whose query reads exactly one table (or one such view), with no `DISTINCT`,
+`GROUP BY`, `HAVING`, `LIMIT`, `OFFSET`, `WITH`, aggregate, window function, or set operation, is
+**updatable**. `INSERT`, `UPDATE`, and `DELETE` on it, and a data-modifying `WITH` that targets it,
+write the table underneath:
+
+<LiveSql seed={writeSeed} query={writeQuery} rows={4} />
+
+- A column that is a plain column of the table (`id`, `title` above) can be written. Any other
+  column (`owner_tag`, computed with `upper`) can be read in `WHERE`, `SET`, and `RETURNING`, but
+  assigning it is `0A000`.
+- `UPDATE` and `DELETE` reach only the rows the view shows: its `WHERE` is applied first, and only
+  the rows it keeps are tested against the statement's own `WHERE`. Task 2 is done, so the view
+  cannot change it.
+- `INSERT` fills every table column the view does not set with its default (`done` becomes
+  `false`). The view's `WHERE` is not checked on insert, so an inserted row may be one the view
+  does not show (`WITH CHECK OPTION` is not supported yet).
+- `UPDATE v SET c = DEFAULT` sets `c` to `NULL`, as in PostgreSQL, because a view column has no
+  default of its own.
+- `RETURNING` returns the view's columns, including computed ones.
+- A view over a view writes through both, down to the table.
+- The table's own rules still apply: `NOT NULL`, `CHECK`, `UNIQUE`, primary and foreign keys.
+
+A write through a view is planned like the same write on the table: `UPDATE open_tasks … WHERE id =
+1` is a primary-key lookup on `task`, and `EXPLAIN` shows `Update task`.
+
+Writing to any other view, such as `dept_payroll` (which groups its rows), is `55000` (*cannot
+delete from view …*). `INSERT … ON CONFLICT` on a view is not supported yet (`0A000`).
 
 `CREATE INDEX … ON` a view and a foreign key that references a view are `42809`. `ANALYZE` on a view
 succeeds and does nothing.
@@ -254,7 +300,11 @@ A view is a privilege boundary, as in PostgreSQL:
 - **Creating or replacing a view** needs `allow_ddl` and `SELECT` on every table and view its query
   reads, checked against the creating session (`42501`). A session cannot create a view over data it
   could not read itself. Renaming a view needs `allow_ddl`.
-- Functions the view calls still need `EXECUTE` for the session reading the view.
+- **Writing through a view** is checked like writing a table: `INSERT`, `UPDATE`, or `DELETE` on the
+  view, plus `SELECT` on it when the statement reads the view's columns. The table underneath is not
+  checked, so a host can let a session change some rows of a table without any grant on the table.
+  (PostgreSQL also checks the view owner's privileges on the table; jed has no owners.)
+- Functions the view calls still need `EXECUTE` for the session reading or writing the view.
 
 Privileges are configured by the host. See [Authorization](../../api/authorization/).
 
@@ -271,7 +321,7 @@ Each of these is `0A000` today:
 
 - `ALTER VIEW` forms other than `RENAME`.
 - `WITH CHECK OPTION` and `WITH (options)`.
-- Writing through a view (updatable views).
+- `INSERT … ON CONFLICT` on a view.
 - `CREATE MATERIALIZED VIEW` and `CREATE RECURSIVE VIEW`.
 - Temporary views, and a view that reads a temporary table.
 - Views in an attached database, and views whose query reads an attached database.

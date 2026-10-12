@@ -322,7 +322,9 @@ test('the indexes page runs the GIN = array-equality scan live', async ({ page }
   await expect(panel.getByTestId('result-rows')).not.toContainText('intro');
 });
 
-test('the views page reads views live and rejects writes and breaking drops', async ({ page }) => {
+test('the views page reads views live and rejects bad writes and breaking drops', async ({
+  page
+}) => {
   await page.goto('/docs/sql/views/');
   // First panel = active_staff JOIN dept_payroll (spec/design/views.md §4): Ada in eng with the eng
   // payroll 19400.00; Ken is inactive, so the view hides him.
@@ -330,8 +332,8 @@ test('the views page reads views live and rejects writes and breaking drops', as
   await expect(panel.getByTestId('result-rows')).toContainText('19400.00');
   await expect(panel.getByTestId('result-rows')).not.toContainText('Ken');
 
-  // Views are read-only (55000), and a table a view reads cannot be dropped (2BP01).
-  await panel.getByTestId('sql-input').fill("INSERT INTO active_staff VALUES (6, 'Dennis', 'eng')");
+  // A grouped view is not updatable (55000), and a table a view reads cannot be dropped (2BP01).
+  await panel.getByTestId('sql-input').fill('DELETE FROM dept_payroll');
   await panel.getByTestId('run-button').click();
   await expect(panel.getByTestId('error-code')).toHaveText('55000');
   await panel.getByTestId('sql-input').fill('DROP TABLE employee');
@@ -391,6 +393,24 @@ test('the views page renames a view and rewrites its dependents', async ({ page 
   const panel = page.getByTestId('live-sql').nth(5);
   await expect(panel.getByTestId('result-rows')).toContainText('"on_duty" as "active_staff"');
   await expect(panel.getByTestId('error-code')).toHaveCount(0);
+});
+
+test('the views page writes through an updatable view', async ({ page }) => {
+  await page.goto('/docs/sql/views/');
+  // Seventh panel = UPDATE / INSERT / DELETE through open_tasks, then the table (views.md §15): task 1
+  // renamed, task 4 inserted with done defaulted to false, Ken's open task 3 deleted, and the done
+  // task 2 untouched.
+  const panel = page.getByTestId('live-sql').nth(6);
+  await expect(panel.getByTestId('result-rows')).toContainText('write more docs');
+  await expect(panel.getByTestId('result-rows')).toContainText('plan');
+  await expect(panel.getByTestId('result-rows')).toContainText('ship it');
+  await expect(panel.getByTestId('result-rows')).not.toContainText('review');
+  await expect(panel.getByTestId('error-code')).toHaveCount(0);
+
+  // A computed view column is read-only (0A000).
+  await panel.getByTestId('sql-input').fill("UPDATE open_tasks SET owner_tag = 'X'");
+  await panel.getByTestId('run-button').click();
+  await expect(panel.getByTestId('error-code')).toHaveText('0A000');
 });
 
 test('the queries API page wires up the idiomatic example for each language', async ({ page }) => {
