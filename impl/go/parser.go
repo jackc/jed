@@ -75,11 +75,48 @@ type parser struct {
 	// constructor (0 = none). A bare row is not a parenthesized base, so parsePostfix refuses
 	// `.field` on it (PostgreSQL: `(1,2).f1` is a syntax error, `((1,2)).f1` is field access).
 	bareRowEnd int
+	// parenQuery records, per token index, whether a PARENTHESIZED QUERY begins there
+	// (isQueryStartAtOffset, grammar.md §25). Precomputed once in one backward pass so every probe is
+	// O(1) — a long run of `(` costs linear time, not time per nesting level.
+	parenQuery []bool
 }
 
 // NewParser builds a parser over the given tokens.
 func newParser(tokens []token) *parser {
-	return &parser{tokens: tokens}
+	p := &parser{tokens: tokens}
+	p.parenQuery = p.computeParenQuery()
+	return p
+}
+
+// computeParenQuery builds the parenQuery table: the `(` at i begins a parenthesized query when what
+// follows it is a query start (a SELECT, a WITH clause, or — recursively — another parenthesized
+// query) AND its matching `)` is followed by a token that can only continue a query
+// (isQueryFollowAt). Computed back to front, so the recursion is a table lookup.
+func (p *parser) computeParenQuery() []bool {
+	n := len(p.tokens)
+	closeAt := make([]int, n)
+	var open []int
+	for i, t := range p.tokens {
+		closeAt[i] = n
+		switch t.Kind {
+		case tokLParen:
+			open = append(open, i)
+		case tokRParen:
+			if len(open) > 0 {
+				closeAt[open[len(open)-1]] = i
+				open = open[:len(open)-1]
+			}
+		}
+	}
+	q := make([]bool, n)
+	for i := n - 1; i >= 0; i-- {
+		if p.tokens[i].Kind != tokLParen {
+			continue
+		}
+		inner := p.isSelectAtIndex(i+1) || p.isWithClauseAtIndex(i+1) || (i+1 < n && q[i+1])
+		q[i] = inner && p.isQueryFollowAtIndex(closeAt[i]+1)
+	}
+	return q
 }
 
 // deepen descends one nesting level, enforcing maxExprDepth (spec/design/cost.md §7). Call at
@@ -267,6 +304,10 @@ func (p *parser) parseStatement() (statement, error) {
 	case "rollback":
 		return p.parseRollback()
 	case "":
+		// A leading `(` can only begin a parenthesized query (grammar.md §25).
+		if p.peek().Kind == tokLParen {
+			return p.parseQueryExpr()
+		}
 		return statement{}, newError(SyntaxError, "expected a SQL statement")
 	default:
 		return statement{}, newError(SyntaxError, fmt.Sprintf("unexpected keyword '%s'", p.peekKeyword()))
@@ -593,7 +634,10 @@ func (p *parser) parseExplain() (statement, error) {
 	analyze, verbose, costs, lane := false, false, true, false
 	seen := make(map[string]bool)
 	optionList := false
-	if p.peek().Kind == tokLParen {
+	// A `(` opens the option list unless a parenthesized query follows (`EXPLAIN (SELECT 1)`,
+	// grammar.md §25): an option is a plain word, never `(`, SELECT, or a WITH clause.
+	parenQuery := p.peekKindAt(1) == tokLParen || p.peekKeywordAt(1) == "select" || p.isWithClauseAtOffset(1)
+	if p.peek().Kind == tokLParen && !parenQuery {
 		optionList = true
 		p.advance()
 		for {
@@ -650,9 +694,9 @@ func (p *parser) parseExplain() (statement, error) {
 	return statement{Explain: &explain{Analyze: analyze, Verbose: verbose, Costs: costs, Lane: lane, Inner: &inner}}, nil
 }
 
-// parseExplainInner parses the statement EXPLAIN wraps — restricted to a query (SELECT / WITH) or a
-// DML statement (INSERT / UPDATE / DELETE). DDL, transaction control, and a nested EXPLAIN have no
-// query plan to render and are rejected 42601.
+// parseExplainInner parses the statement EXPLAIN wraps — restricted to a query (SELECT / WITH / a
+// parenthesized query) or a DML statement (INSERT / UPDATE / DELETE). DDL, transaction control, and
+// a nested EXPLAIN have no query plan to render and are rejected 42601.
 func (p *parser) parseExplainInner() (statement, error) {
 	switch p.peekKeyword() {
 	case "select":
@@ -678,6 +722,9 @@ func (p *parser) parseExplainInner() (statement, error) {
 		}
 		return statement{Delete: del}, nil
 	case "":
+		if p.peek().Kind == tokLParen {
+			return p.parseQueryExpr()
+		}
 		return statement{}, newError(SyntaxError, "expected a statement after EXPLAIN")
 	default:
 		return statement{}, newError(SyntaxError, fmt.Sprintf("EXPLAIN does not support '%s'", p.peekKeyword()))
@@ -2855,10 +2902,17 @@ func (p *parser) parseQueryExpr() (statement, error) {
 	if err != nil {
 		return statement{}, err
 	}
-	if node.Select != nil {
+	switch {
+	case node.Select != nil:
 		return statement{Select: node.Select}, nil
+	case node.SetOp != nil:
+		return statement{SetOp: node.SetOp}, nil
+	default:
+		// A parenthesized `(WITH … query)` statement is the top-level WITH query itself
+		// (PostgreSQL: the parentheses add nothing — grammar.md §25).
+		w := node.With
+		return statement{With: &withQuery{Ctes: w.Ctes, Body: cteBody{Query: w.Body}, Recursive: w.Recursive}}, nil
 	}
-	return statement{SetOp: node.SetOp}, nil
 }
 
 // parseQueryExprNode parses a top-level query_expr as a QueryExpr node — a set expression plus an
@@ -2870,7 +2924,7 @@ func (p *parser) parseQueryExprNode() (queryExpr, error) {
 	if err != nil {
 		return queryExpr{}, err
 	}
-	// Trailing ORDER BY / LIMIT / OFFSET parse once, onto a scratch Select, then move onto the
+	// Trailing ORDER BY / LIMIT / OFFSET parse once, onto a scratch Select, then fold onto the
 	// outermost node (the lone Select, or the outermost SetOp).
 	var trailing selectStmt
 	if err := p.parseOrderBy(&trailing); err != nil {
@@ -2879,14 +2933,8 @@ func (p *parser) parseQueryExprNode() (queryExpr, error) {
 	if err := p.parseLimitOffset(&trailing); err != nil {
 		return queryExpr{}, err
 	}
-	if node.Select != nil {
-		node.Select.OrderBy = trailing.OrderBy
-		node.Select.Limit = trailing.Limit
-		node.Select.Offset = trailing.Offset
-	} else {
-		node.SetOp.OrderBy = trailing.OrderBy
-		node.SetOp.Limit = trailing.Limit
-		node.SetOp.Offset = trailing.Offset
+	if err := foldTrailing(node, &trailing); err != nil {
+		return queryExpr{}, err
 	}
 	return node, nil
 }
@@ -2974,6 +3022,9 @@ func (p *parser) parseCteBody(parenthesized bool) (cteBody, error) {
 		}
 		q, err := p.parseQueryExprNode()
 		if err != nil {
+			return cteBody{}, err
+		}
+		if err := rejectSecondWith(q); err != nil {
 			return cteBody{}, err
 		}
 		return cteBody{Query: &q}, nil
@@ -3080,14 +3131,8 @@ func (p *parser) parseSubqueryInner() (queryExpr, error) {
 	if err := p.parseLimitOffset(&trailing); err != nil {
 		return queryExpr{}, err
 	}
-	if node.Select != nil {
-		node.Select.OrderBy = trailing.OrderBy
-		node.Select.Limit = trailing.Limit
-		node.Select.Offset = trailing.Offset
-	} else {
-		node.SetOp.OrderBy = trailing.OrderBy
-		node.SetOp.Limit = trailing.Limit
-		node.SetOp.Offset = trailing.Offset
+	if err := foldTrailing(node, &trailing); err != nil {
+		return queryExpr{}, err
 	}
 	return node, nil
 }
@@ -3120,6 +3165,9 @@ func (p *parser) parseWithQueryExpr() (queryExpr, error) {
 	}
 	body, err := p.parseSubqueryInner()
 	if err != nil {
+		return queryExpr{}, err
+	}
+	if err := rejectSecondWith(body); err != nil {
 		return queryExpr{}, err
 	}
 	return queryExpr{With: &withExpr{Ctes: ctes, Recursive: recursive, Body: &body}}, nil
@@ -3161,25 +3209,47 @@ func (p *parser) parseSetExpr() (queryExpr, error) {
 // parseIntersectExpr parses the higher-precedence, left-associative INTERSECT level.
 func (p *parser) parseIntersectExpr() (queryExpr, error) {
 	base := p.depth
-	core, err := p.parseSelectCore()
+	left, err := p.parseSetOperand()
 	if err != nil {
 		return queryExpr{}, err
 	}
-	left := queryExpr{Select: core}
 	for p.peekKeyword() == "intersect" {
 		if err := p.deepen(); err != nil { // each chained INTERSECT is one more set-op level
 			return queryExpr{}, err
 		}
 		p.advance() // INTERSECT
 		all := p.parseSetOpQuantifier()
-		right, err := p.parseSelectCore()
+		right, err := p.parseSetOperand()
 		if err != nil {
 			return queryExpr{}, err
 		}
-		left = queryExpr{SetOp: &setOp{Op: setOpIntersect, All: all, Lhs: left, Rhs: queryExpr{Select: right}}}
+		left = queryExpr{SetOp: &setOp{Op: setOpIntersect, All: all, Lhs: left, Rhs: right}}
 	}
 	p.depth = base
 	return left, nil
+}
+
+// parseSetOperand parses a set-operation operand (grammar.md §25): a select_core, or a parenthesized
+// query — a full subquery_expr (its own WITH, set operations, and trailing ORDER BY/LIMIT/OFFSET)
+// between `(` and `)`, one nesting level deeper. In operand position a `(` can only begin a query,
+// so no lookahead is needed.
+func (p *parser) parseSetOperand() (queryExpr, error) {
+	if p.peek().Kind == tokLParen {
+		p.advance()
+		q, err := p.parseSubquery()
+		if err != nil {
+			return queryExpr{}, err
+		}
+		if err := p.expect(tokRParen); err != nil {
+			return queryExpr{}, err
+		}
+		return q, nil
+	}
+	core, err := p.parseSelectCore()
+	if err != nil {
+		return queryExpr{}, err
+	}
+	return queryExpr{Select: core}, nil
 }
 
 // parseSetOpQuantifier consumes the optional ALL (multiset) or DISTINCT (explicit default)
@@ -3848,7 +3918,21 @@ func (p *parser) parseDerivedTable(lateral bool) (tableRef, error) {
 		if err != nil {
 			return tableRef{}, err
 		}
-		values = v
+		// A trailing ORDER BY / LIMIT / OFFSET makes the body the query
+		// `SELECT * FROM (VALUES …) ORDER BY … LIMIT …` (valuesQuery).
+		var trailing selectStmt
+		if err := p.parseOrderBy(&trailing); err != nil {
+			return tableRef{}, err
+		}
+		if err := p.parseLimitOffset(&trailing); err != nil {
+			return tableRef{}, err
+		}
+		if len(trailing.OrderBy) == 0 && trailing.Limit == nil && trailing.Offset == nil {
+			values = v
+		} else {
+			b := valuesQuery(v, &trailing)
+			body = &b
+		}
 	case p.atSubqueryStart():
 		// A leading SELECT, or a nested WITH (cte.md §7), is a query_expr body.
 		b, err := p.parseSubquery()
@@ -3920,8 +4004,8 @@ func (p *parser) parseDerivedTable(lateral bool) (tableRef, error) {
 // verified the next keyword is VALUES (here consumed). Each row is a parenthesized list of GENERAL
 // expressions (unlike the INSERT … VALUES slot, which is a literal/$N/DEFAULT); arity equality
 // across rows and per-column type unification are resolve-time concerns (the executor's planValues).
-// At least one row, each with at least one value. NO trailing ORDER BY / LIMIT is consumed — the
-// caller's `)` follows the last row.
+// At least one row, each with at least one value. A trailing ORDER BY / LIMIT / OFFSET is the
+// caller's (parseDerivedTable).
 func (p *parser) parseValuesBody() ([][]*exprNode, error) {
 	if err := p.expectKeyword("values"); err != nil {
 		return nil, err
@@ -6216,10 +6300,45 @@ func (p *parser) isWithClauseAtOffset(offset int) bool {
 	return false
 }
 
-// isQueryStartAtOffset reports whether a query expression — a SELECT or a nested WITH clause
-// (cte.md §7) — begins at p.pos+offset. The §26 leading-SELECT lookahead, extended with WITH.
+// isQueryStartAtOffset reports whether a query expression — a SELECT, a nested WITH clause (cte.md
+// §7), or a parenthesized query (grammar.md §25) — begins at p.pos+offset. The §26 leading-SELECT
+// lookahead, extended with WITH, and with a run of `(`s that ends at a SELECT/WITH where EVERY `(` in
+// the run is closed by a `)` followed by a token that can only continue a query — UNION / INTERSECT /
+// EXCEPT / ORDER / LIMIT / OFFSET or a further `)`. Thus `((SELECT 1) UNION SELECT 2)` and
+// `((SELECT 1))` are subqueries but `((SELECT 1) + 1)` and `((SELECT 1), 2)` are expressions.
+// Precomputed (computeParenQuery), so a long run of `(` can neither exhaust the stack nor cost time
+// per probe; a §8 cross-core surface.
 func (p *parser) isQueryStartAtOffset(offset int) bool {
-	return p.peekKeywordAt(offset) == "select" || p.isWithClauseAtOffset(offset)
+	i := p.pos + offset
+	return p.isSelectAtIndex(i) || p.isWithClauseAtIndex(i) || (i < len(p.parenQuery) && p.parenQuery[i])
+}
+
+// isSelectAtIndex reports whether a SELECT keyword sits at token index i.
+func (p *parser) isSelectAtIndex(i int) bool {
+	return i < len(p.tokens) && p.tokens[i].Kind == tokWord && p.tokens[i].Word == "select"
+}
+
+// isWithClauseAtIndex is isWithClauseAtOffset at an absolute token index.
+func (p *parser) isWithClauseAtIndex(i int) bool { return p.isWithClauseAtOffset(i - p.pos) }
+
+// isQueryFollowAtIndex reports whether the token at index i may follow a parenthesized query but
+// never a parenthesized expression: a set operator, a trailing ORDER/LIMIT/OFFSET, or a closing `)`.
+func (p *parser) isQueryFollowAtIndex(i int) bool {
+	if i >= len(p.tokens) {
+		return false
+	}
+	t := p.tokens[i]
+	if t.Kind == tokRParen {
+		return true
+	}
+	if t.Kind != tokWord {
+		return false
+	}
+	switch t.Word {
+	case "union", "intersect", "except", "order", "limit", "offset":
+		return true
+	}
+	return false
 }
 
 // atSubqueryStart reports whether the NEXT token begins a query expression (a SELECT or nested
@@ -6305,7 +6424,7 @@ func parseExpression(text string) (exprNode, error) {
 	if err != nil {
 		return exprNode{}, err
 	}
-	p := &parser{tokens: tokens}
+	p := newParser(tokens)
 	expr, err := p.parseExpr()
 	if err != nil {
 		return exprNode{}, err
@@ -6616,3 +6735,66 @@ func renderToken(t token) string {
 // isIdentKind reports whether a token kind can be an identifier: a bare word or a quoted
 // identifier (grammar.md §3).
 func isIdentKind(k tokenKind) bool { return k == tokWord || k == tokQuotedIdent }
+
+// valuesQuery builds a VALUES body with trailing ORDER BY / LIMIT / OFFSET (grammar.md §42) as the
+// query `SELECT * FROM (VALUES …) ORDER BY … LIMIT … OFFSET …` over an UNALIASED inner VALUES
+// relation: the keys resolve against column1, column2, … by name or ordinal (a qualified key has no
+// label to name, 42P01, as in PostgreSQL), and the enclosing derived table's alias and column-rename
+// list apply to the query's output unchanged. trailing carries the parsed clauses.
+func valuesQuery(rows [][]*exprNode, trailing *selectStmt) queryExpr {
+	inner := tableRef{Values: rows}
+	return queryExpr{Select: &selectStmt{
+		Items:   selectItems{All: true},
+		From:    &inner,
+		OrderBy: trailing.OrderBy,
+		Limit:   trailing.Limit,
+		Offset:  trailing.Offset,
+	}}
+}
+
+// foldTrailing folds a query expression's trailing ORDER BY / LIMIT / OFFSET (carried on trailing)
+// onto its node (grammar.md §25). A parenthesized query is the SAME query as its contents
+// (PostgreSQL), so its own trailing clauses are already set: giving one of them a second time —
+// `(SELECT … ORDER BY a) ORDER BY b`, `(SELECT … LIMIT 2) LIMIT 1` — is 42601, while a clause the
+// contents lack is simply added. A parenthesized nested WITH folds onto its main query.
+func foldTrailing(node queryExpr, trailing *selectStmt) error {
+	var order *[]orderKey
+	var limit, offset **int64
+	switch {
+	case node.Select != nil:
+		order, limit, offset = &node.Select.OrderBy, &node.Select.Limit, &node.Select.Offset
+	case node.SetOp != nil:
+		order, limit, offset = &node.SetOp.OrderBy, &node.SetOp.Limit, &node.SetOp.Offset
+	default:
+		return foldTrailing(*node.With.Body, trailing)
+	}
+	if len(trailing.OrderBy) > 0 {
+		if len(*order) > 0 {
+			return newError(SyntaxError, "multiple ORDER BY clauses not allowed")
+		}
+		*order = trailing.OrderBy
+	}
+	if trailing.Offset != nil {
+		if *offset != nil {
+			return newError(SyntaxError, "multiple OFFSET clauses not allowed")
+		}
+		*offset = trailing.Offset
+	}
+	if trailing.Limit != nil {
+		if *limit != nil {
+			return newError(SyntaxError, "multiple LIMIT clauses not allowed")
+		}
+		*limit = trailing.Limit
+	}
+	return nil
+}
+
+// rejectSecondWith reports 42601 for a WITH clause whose main query is itself a parenthesized WITH
+// query — `WITH a AS (…) (WITH b AS (…) SELECT …)` (PostgreSQL: both clauses would attach to one
+// query). A parenthesized WITH query as a set-operation operand is a separate query and is fine.
+func rejectSecondWith(body queryExpr) error {
+	if body.With != nil {
+		return newError(SyntaxError, "multiple WITH clauses not allowed")
+	}
+	return nil
+}
