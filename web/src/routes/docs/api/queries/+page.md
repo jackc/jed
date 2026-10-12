@@ -122,6 +122,45 @@ that lacks `SELECT` on the table gets no values: the field is absent, or for a f
 value-free `Key is not present in table "customers".`. Like the other fields, `detail` is never
 part of the rendered message.
 
+## Pointing at the mistake: `position` and `hint`
+
+For a query tool that shows errors to the person who typed the SQL, two more fields locate and
+explain the mistake. **`position`** (`Position` in Go) is the 1-based **character** offset of the
+offending token, as in PostgreSQL. It is set on syntax errors (`42601` and every other error the
+parser raises, except the `54xxx` limits), on an unknown or ambiguous column reference (`42703`,
+`42702`, `42P01`), on an unknown `INSERT` column or `SET` target, and on an unknown FROM table. It
+counts characters, not bytes, and a syntax error at end of input points one past the last
+character. For `execute_script` it counts from the start of the whole script. It is absent
+(`None` / `0` / `undefined`) otherwise. **`hint`** (`Hint`) carries PostgreSQL's suggestion for a
+misspelled column or a table name used in place of its alias:
+
+| Statement | `code` | `position` | `hint` |
+|---|---|---|---|
+| `SELECT 1 +` | `42601` | `11` | |
+| `SELECT nme FROM users` | `42703` | `8` | `Perhaps you meant to reference the column "users.name".` |
+| `SELECT users.id FROM users u` | `42P01` | `8` | `Perhaps you meant to reference the table alias "u".` |
+
+```ts
+// TypeScript: underline the offending character. Positions count code points, so index
+// Array.from(sql), not the UTF-16 string.
+try {
+  session.execute(sql);
+} catch (e) {
+  if (e instanceof EngineError && e.position !== undefined) {
+    const chars = Array.from(sql);
+    const at = e.position - 1;
+    const lineStart = at === 0 ? 0 : chars.lastIndexOf("\n", at - 1) + 1;
+    const lineEnd = chars.indexOf("\n", at);
+    console.log(chars.slice(lineStart, lineEnd < 0 ? chars.length : lineEnd).join(""));
+    console.log(" ".repeat(at - lineStart) + "^");
+    if (e.hint) console.log("HINT: " + e.hint);
+  }
+}
+```
+
+The `jed` CLI prints both the way psql does: a `LINE n:` excerpt with a `^` under the position, then
+`HINT:  …`.
+
 The rendered error message is unchanged — these fields are additive metadata alongside it.
 
 ## The raw `Value` path is still there
