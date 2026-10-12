@@ -5,8 +5,8 @@
 # Scalar functions are valid anywhere an expression is (incl. WHERE), unlike aggregates, and
 # charge one operator_eval per call. PostgreSQL-oracle-verified (postgres:18). Note: PG's
 # one-arg round(integer) is double precision; jed has no float type, so it returns numeric —
-# value-identical. A bare untyped NULL / parameter as an argument (ambiguous overload) is out
-# of scope; NULL is exercised here through typed NULL columns, which propagate.
+# value-identical. A bare NULL argument is expr/unknown_function_args.test (abs(NULL) is 42725);
+# NULL is exercised here through typed NULL columns, which propagate.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.i16, types.i32, types.i64, types.decimal, types.text, func.abs, func.round, resource.cost_metering
 
 statement ok

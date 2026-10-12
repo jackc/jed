@@ -318,6 +318,54 @@ uniform per-evaluation weight every operator charges — with its arguments char
 costs recursively. The cost is deterministic and cross-core-identical (CLAUDE.md §13), and
 is asserted in the conformance corpus alongside the rows.
 
+### 9.1 Unknown-typed arguments — a bare `NULL` or `$N` adopts its slot's family
+
+An argument is **unknown-typed** when nothing in it fixes a type: a bare `NULL` literal, or a bind
+parameter with no context of its own ([api.md](api.md) §5). PostgreSQL resolves such an argument
+from the function's signatures (`translate($1, 'a', 'b')` types `$1` text; `translate(NULL, 'a',
+'b')` is NULL). jed does the same for every call resolved through the generic catalog path (the
+`kind = "function"` rows matched by `arg_families`), by this deterministic rule:
+
+1. **Candidates.** The catalog rows with the call's name and arity whose family matches every
+   *typed* argument. An unknown argument matches any slot. No candidate is `42883`, as before.
+2. **One candidate** is selected.
+3. **Several candidates.** At each unknown position, pick a family: `text` if any candidate
+   accepts `text` there (PostgreSQL's preference for the string category), else the family every
+   candidate agrees on. If the candidates disagree and none accepts `text`, the call is **`42725`**
+   (`ambiguous_function`). Then keep the candidates that accept the picked family at every unknown
+   position; exactly one is selected, and anything else is `42725`. The rule depends only on the
+   set of candidates, never on catalog order.
+4. **Adoption.** An unknown parameter takes the concrete type of its selected slot's family:
+   `integer` → `i64` (the engine's default integer, as for `$1 = 5`), `float` → `f64`, and each
+   other family its own scalar (`decimal`, `text`, `boolean`, `bytea`, `uuid`, `date`, `timestamp`,
+   `timestamptz`, `interval`, `json`, `jsonb`, `jsonpath`). An `any` slot fixes no type, so a
+   parameter there stays `42P18` (PostgreSQL raises `42804` for its polymorphic `anyelement`); a
+   bare `NULL` there resolves as it always has. A bare `NULL` evaluates as the NULL of its slot's
+   family, so a strict function returns NULL.
+
+So `length($1)` and `substr(NULL, 1)` pick the `text` overloads over `bytea`, `json_typeof($1)`
+types `$1` json, `uuidv7($1)` types it interval, and `date_part('year', NULL)` is `42725`, as in
+PostgreSQL.
+
+**Two PostgreSQL heuristics are deliberately left out.** PostgreSQL then prefers a category's
+*preferred* type (`float8` among the numeric types) and, failing that, assumes an unknown argument
+has the type shared by the known ones. Neither carries over to jed's catalog, which is
+family-based and holds jed-only overloads (the integer `round`/`ceil`/`floor`/`trunc` rows, which
+stand in for PostgreSQL's implicit int→numeric cast, and `round(float, integer)`). Applied here
+they would pick overloads PostgreSQL does not have: `round($1, 2)` would type `$1` as `f64` or
+`i64`, where PostgreSQL types it numeric. Silently choosing binary float over exact `decimal` is
+also against the strict type system (CLAUDE.md §4, §8). So jed stops at `42725`, and the caller
+writes the cast: `abs(NULL)`, `abs($1)`, `sqrt(NULL)`, `round($1, 2)` and `pow(NULL, NULL)` are
+`42725` in jed, where PostgreSQL resolves them (`abs(NULL)` is a `float8` NULL). The catalogs also
+differ the other way: `to_hex($1)` types `$1` as `i64` because jed has one `to_hex(integer)` row,
+where PostgreSQL's `int4`/`int8` pair is `42725`.
+
+**Scope.** The rule covers the generic path only. The functions with their own resolvers
+(`make_interval`/`make_timestamp`/`make_date`, `lower`/`upper`, the regex, range, array, json-set
+and VARIADIC functions, aggregates) keep their own argument typing. An unknown argument never
+matches a host-registered function's signature ([extensibility.md](extensibility.md) §4.2), so it
+stays `42883` there.
+
 ## 10. Set-returning functions (`generate_series`) — the fourth function mold
 
 A **set-returning function (SRF)** is the fourth function shape, distinct from the three

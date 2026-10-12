@@ -131,6 +131,8 @@ const (
 	GroupingError
 	// UndefinedFunction is 42883 — function does not exist: {name}.
 	UndefinedFunction
+	// AmbiguousFunction is 42725 — function {name} is not unique.
+	AmbiguousFunction
 	// DuplicateFunction is 42723 — duplicate function: {detail}.
 	DuplicateFunction
 	// IndeterminateDatatype is 42P18 — could not determine data type of parameter ${index}.
@@ -318,6 +320,8 @@ func (s SqlState) Code() string {
 		return "42803"
 	case UndefinedFunction:
 		return "42883"
+	case AmbiguousFunction:
+		return "42725"
 	case DuplicateFunction:
 		return "42723"
 	case IndeterminateDatatype:
@@ -458,6 +462,7 @@ var errorDescs = []errorDesc{
 	{Code: "42P16", Name: "invalid_table_definition", Class: "syntax error or access rule violation"},
 	{Code: "42803", Name: "grouping_error", Class: "syntax error or access rule violation"},
 	{Code: "42883", Name: "undefined_function", Class: "syntax error or access rule violation"},
+	{Code: "42725", Name: "ambiguous_function", Class: "syntax error or access rule violation"},
 	{Code: "42723", Name: "duplicate_function", Class: "syntax error or access rule violation"},
 	{Code: "42P18", Name: "indeterminate_datatype", Class: "syntax error or access rule violation"},
 	{Code: "42P19", Name: "invalid_recursion", Class: "syntax error or access rule violation"},

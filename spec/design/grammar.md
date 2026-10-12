@@ -1395,7 +1395,9 @@ operator (one `[[operator]]` catalog row, `name = "like"`, text×text → boolea
   pattern operator, exactly like the text comparisons. NULL on either side yields NULL
   (`null = "propagates"`): `NULL LIKE 'a'` and `'a' LIKE NULL` are both NULL, and a NULL
   operand short-circuits to NULL **before** the matcher runs (so a malformed pattern against a
-  NULL subject is still NULL, not an error — verified against PostgreSQL 18).
+  NULL subject is still NULL, not an error — verified against PostgreSQL 18). A bind parameter
+  operand adopts `text`, the only operand type `LIKE` declares, whatever its sibling: `'x%' LIKE
+  $1` and `$1 LIKE $2` bind text, as in PostgreSQL ([api.md](api.md) §5).
 - **Wildcards and the default `\` escape.** `%` = any run, `_` = one character. The default
   escape character is **backslash** (PostgreSQL's default): `\%`, `\_`, and `\\` match a
   literal `%`, `_`, and `\`; a `\` before any other character matches that character literally
@@ -1411,11 +1413,10 @@ operator (one `[[operator]]` catalog row, `name = "like"`, text×text → boolea
   (all verified against PostgreSQL 18):
   - `e` is any text expression (a column works); a non-text `e` is **42883** (no `like_escape`
     function for those argument types — PostgreSQL's code). A bare `NULL` or `$N` pattern or escape
-    is typed `text`, the type `like_escape` declares — PostgreSQL's inference for an unknown-typed
-    argument — so `s LIKE $1 ESCAPE '#'` and `s LIKE 'a#%' ESCAPE $1` bind like `s LIKE $1`, and
-    `'a' LIKE NULL ESCAPE '#'` is NULL like `'a' LIKE NULL`. The parser does this as it desugars
-    (wrapping the operand in a cast to `text`); a direct `like_escape(NULL, …)` call keeps the
-    general function rule.
+    is typed `text`, the type `like_escape` declares, by the general rule for an unknown-typed
+    function argument ([functions.md](functions.md) §9.1) — so `s LIKE $1 ESCAPE '#'` and
+    `s LIKE 'a#%' ESCAPE $1` bind like `s LIKE $1`, and `'a' LIKE NULL ESCAPE '#'` is NULL like
+    `'a' LIKE NULL`.
   - `e = ''` turns escaping **off**: `\` is an ordinary character (`'a\b' LIKE 'a\b' ESCAPE ''` is
     TRUE). Once any other escape is chosen, `\` is ordinary too (`'a\b' LIKE 'a\b' ESCAPE '#'` is
     TRUE). The escape may be a wildcard: `'a%' LIKE 'a%%' ESCAPE '%'` is TRUE.
@@ -1479,7 +1480,7 @@ determinism + untrusted-query safety (the engine is a linear-time **Pike VM**, i
 - **Text only / NULL propagates.** Both operands must be `text`; a non-text operand is **42804**
   (`compare.toml` lists only text×text). NULL on either side yields NULL (`null = "propagates"`),
   short-circuiting **before** the matcher — so a malformed pattern against a NULL subject is NULL,
-  not an error (the LIKE rule).
+  not an error (the LIKE rule). A bind parameter operand adopts `text`, as for LIKE.
 - **`~*` — case-insensitive** via the **ILIKE mechanism** ([collation.md §16](collation.md)): both
   operands are simple-lowercased (1:1; ASCII baseline without a Unicode property bundle, full simple
   mappings with one) before compiling/matching. So `'FOO' ~* 'f.o'` is TRUE.

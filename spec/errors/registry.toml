@@ -451,6 +451,12 @@ class = "syntax error or access rule violation"
 template = "function does not exist: {name}"
 
 [[error]]
+code = "42725"
+name = "ambiguous_function"
+class = "syntax error or access rule violation"
+template = "function {name} is not unique"
+
+[[error]]
 code = "42723"
 name = "duplicate_function"
 class = "syntax error or access rule violation"

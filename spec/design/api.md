@@ -625,9 +625,15 @@ SET`, or a `CAST` target. The cast-target case covers **both** spellings — `CA
 and the postfix `$1 :: int` ([grammar.md](grammar.md) §37) — so `$1 :: int` types `$1` as int
 and `$1 :: numeric(10,2)` types it decimal and re-scales the bound value to `(10,2)`. A bare
 parameter in a `CASE` result arm or a `COALESCE`/`GREATEST`/`LEAST` argument adopts the
-expression's unified scalar result type. A bare parameter as the pattern or the escape of a
-`LIKE`/`ILIKE … ESCAPE` is `text`, the type the `like_escape` desugar declares
-([grammar.md](grammar.md) §22). A parameter with **no derivable type** (e.g. a bare
+expression's unified scalar result type. A bare parameter as a scalar-function argument adopts
+the family the function declares for that slot, chosen among its overloads by
+[functions.md](functions.md) §9.1: `translate($1, 'a', 'b')` and `length($1)` type `$1` text,
+`left($1, $2)` types `$2` i64, and an overload set that cannot decide (`abs($1)`, `round($1, 2)`)
+is `42725 ambiguous_function`, so the caller writes a cast. A parameter operand of `LIKE`/`ILIKE`
+or a regex match (`~`, `~*`, `!~`, `!~*`) adopts `text`, the only operand type those operators
+declare, so `'x%' LIKE $1` and `$1 LIKE $2` bind text. The pattern or escape of a `LIKE … ESCAPE`
+is a `like_escape(text, text)` argument ([grammar.md](grammar.md) §22), so a parameter there is
+`text` by the function rule. A parameter with **no derivable type** (e.g. a bare
 `SELECT $1`, or a gap in `$1..$N`) is `42P18 indeterminate_datatype`. Conflicting inferences for
 the same index (`i16` here, `text` there) are `42804 datatype_mismatch`. Two adaptable operands
 with no anchoring type (`$1 = $2`, `$1 = 5`) default the parameter to `i64`, matching the

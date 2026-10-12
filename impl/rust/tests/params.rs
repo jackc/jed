@@ -484,3 +484,165 @@ fn text_concat_bound_parameters() {
         "42804"
     );
 }
+
+/// A bare $N scalar-function argument adopts the family the catalog declares for its slot
+/// (functions.md §9.1): one candidate decides outright, `text` wins among several, and an overload
+/// set that cannot decide is 42725. An `any` slot fixes no type (42P18).
+#[test]
+fn function_argument_param_adopts_declared_family() {
+    let mut db = db_with(&[
+        "CREATE TABLE t (id i32 PRIMARY KEY, s text)",
+        "INSERT INTO t VALUES (1, 'xyz')",
+    ]);
+    let text = |s: &str| Value::Text(s.to_string());
+    let one = |db: &mut Session, sql: &str, params: &[Value]| rows(db, sql, params)[0][0].clone();
+    assert_eq!(
+        one(&mut db, "SELECT translate($1, 'a', 'b')", &[text("banana")]),
+        text("bbnbnb")
+    );
+    assert_eq!(
+        one(
+            &mut db,
+            "SELECT translate($1, $2, $3)",
+            &[text("abc"), text("b"), text("x")]
+        ),
+        text("axc")
+    );
+    // An integer slot types the parameter i64; a wrong-family value is a binding error.
+    assert_eq!(
+        one(
+            &mut db,
+            "SELECT left($1, $2)",
+            &[text("abcd"), Value::Int(2)]
+        ),
+        text("ab")
+    );
+    assert_eq!(
+        err_code(&mut db, "SELECT left($1, $2)", &[text("abcd"), text("2")]),
+        "42804"
+    );
+    assert_eq!(one(&mut db, "SELECT chr($1)", &[Value::Int(65)]), text("A"));
+    // length/substr have text and bytea overloads: the unknown argument takes text.
+    assert_eq!(
+        one(&mut db, "SELECT length($1)", &[text("héllo")]),
+        Value::Int(5)
+    );
+    assert_eq!(
+        err_code(&mut db, "SELECT length($1)", &[Value::Bytea(vec![1, 2])]),
+        "42804"
+    );
+    assert_eq!(
+        one(&mut db, "SELECT substr($1, 2)", &[text("abc")]),
+        text("bc")
+    );
+    // A typed argument narrows the candidates first: bytea picks the bytea overload.
+    assert_eq!(
+        one(
+            &mut db,
+            "SELECT substr('\\x010203'::bytea, $1)",
+            &[Value::Int(2)]
+        ),
+        Value::Bytea(vec![2, 3])
+    );
+    // A family other than text/integer: encode(bytea, text), json_typeof(json).
+    assert_eq!(
+        one(
+            &mut db,
+            "SELECT encode($1, 'hex')",
+            &[Value::Bytea(vec![0xab])]
+        ),
+        text("ab")
+    );
+    assert_eq!(
+        one(&mut db, "SELECT json_typeof($1)", &[text("[1]")]),
+        text("array")
+    );
+    // A NULL bound to an adopted slot propagates.
+    assert_eq!(
+        one(&mut db, "SELECT translate($1, 'a', 'b')", &[Value::Null]),
+        Value::Null
+    );
+    // The parameter's adopted type unifies with its other uses.
+    assert_eq!(
+        one(
+            &mut db,
+            "SELECT left($1, 1) FROM t WHERE s = $1",
+            &[text("xyz")]
+        ),
+        text("x")
+    );
+    assert_eq!(
+        err_code(
+            &mut db,
+            "SELECT left($1, 1) FROM t WHERE id = $1",
+            &[text("x")]
+        ),
+        "42804"
+    );
+    // Overloads the rule cannot decide among are 42725; a cast chooses one.
+    for sql in [
+        "SELECT abs($1)",
+        "SELECT round($1, 2)",
+        "SELECT sqrt($1)",
+        "SELECT pow($1, $2)",
+        "SELECT date_part('year', $1)",
+    ] {
+        assert_eq!(
+            err_code(&mut db, sql, &[Value::Int(1), Value::Int(1)]),
+            "42725",
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        one(&mut db, "SELECT abs($1::i32)", &[Value::Int(-3)]),
+        Value::Int(3)
+    );
+    // An `any` slot fixes no type.
+    assert_eq!(
+        err_code(&mut db, "SELECT to_jsonb($1)", &[text("x")]),
+        "42P18"
+    );
+    // No candidate stays 42883.
+    assert_eq!(
+        err_code(&mut db, "SELECT left($1, 'x')", &[text("abc")]),
+        "42883"
+    );
+}
+
+/// A $N operand of LIKE/ILIKE or a regex match adopts text whatever its sibling (api.md §5).
+#[test]
+fn like_and_regex_param_operand_is_text() {
+    let mut db = db_with(&[]);
+    let text = |s: &str| Value::Text(s.to_string());
+    let one = |db: &mut Session, sql: &str, params: &[Value]| rows(db, sql, params)[0][0].clone();
+    assert_eq!(
+        one(&mut db, "SELECT 'x%' LIKE $1", &[text("x\\%")]),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        one(&mut db, "SELECT $1 LIKE $2", &[text("abc"), text("a%")]),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        one(&mut db, "SELECT $1 ILIKE 'A%'", &[text("abc")]),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        one(&mut db, "SELECT 'abc' ~ $1", &[text("^a.c$")]),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        one(&mut db, "SELECT $1 !~ $2", &[text("abc"), text("z")]),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        one(&mut db, "SELECT 'x' LIKE $1", &[Value::Null]),
+        Value::Null
+    );
+    assert_eq!(
+        err_code(&mut db, "SELECT 'x' LIKE $1", &[Value::Int(1)]),
+        "42804"
+    );
+    // A non-text sibling is still a LIKE type error.
+    assert_eq!(err_code(&mut db, "SELECT 5 LIKE $1", &[text("5")]), "42804");
+}

@@ -2205,7 +2205,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		// LIKE is text×text → boolean (grammar.md §22). Resolve the pair (a string literal stays
 		// text), then require BOTH operands be text (or a bare NULL); a non-text operand is
 		// 42804. We do NOT use classifyComparable here — it would wrongly accept bytea×bytea.
-		rl, lt, rr, rt, err := resolveOperandPair(s, e.Like.Lhs, e.Like.Rhs, ag, params)
+		rl, lt, rr, rt, err := resolveTextOperandPair(s, e.Like.Lhs, e.Like.Rhs, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -2220,7 +2220,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 	case exprRegex:
 		// ~ / ~* / !~ / !~* — text×text → boolean (grammar.md §22b, regex.md). Same operand typing
 		// as LIKE: resolve the pair, require both text (or a bare NULL); a non-text operand is 42804.
-		rl, lt, rr, rt, err := resolveOperandPair(s, e.Regex.Lhs, e.Regex.Rhs, ag, params)
+		rl, lt, rr, rt, err := resolveTextOperandPair(s, e.Regex.Lhs, e.Regex.Rhs, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -3197,6 +3197,32 @@ func resolveBinary(s *scope, b *binaryExpr, ag *aggCtx, params *paramTypes) (*rE
 // context (ctxOf returns nil) and defaults to i64 — the caller's family check then
 // reports the mismatch. This does NOT enforce a family — resolveIntPair (arithmetic) and
 // classifyComparable (comparison) layer that on top.
+// resolveTextOperandPair resolves the operand pair of a text-only operator (LIKE/ILIKE, the regex
+// matches): as resolveOperandPair, except a bind parameter operand adopts text, the only operand
+// type the operator declares, whatever its sibling ('x%' LIKE $1, $1 LIKE $2 — api.md §5).
+func resolveTextOperandPair(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
+	lhsParam, rhsParam := lhs.Kind == exprParam, rhs.Kind == exprParam
+	if !lhsParam && !rhsParam {
+		return resolveOperandPair(s, lhs, rhs, ag, params)
+	}
+	text := scalarText
+	hint := func(isParam bool) *scalarType {
+		if isParam {
+			return &text
+		}
+		return nil
+	}
+	rl, lt, err := resolve(s, lhs, hint(lhsParam), ag, params)
+	if err != nil {
+		return nil, resolvedType{}, nil, resolvedType{}, err
+	}
+	rr, rt, err := resolve(s, rhs, hint(rhsParam), ag, params)
+	if err != nil {
+		return nil, resolvedType{}, nil, resolvedType{}, err
+	}
+	return rl, lt, rr, rt, nil
+}
+
 func resolveOperandPair(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
 	lhsLit := isAdaptableOperand(lhs)
 	rhsLit := isAdaptableOperand(rhs)

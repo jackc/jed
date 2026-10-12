@@ -86,6 +86,7 @@ import {
   requireNumericOperand,
   requireTextOrNull,
   resolveOperandPair,
+  resolveTextOperandPair,
   temporalArithResult,
   unifyArrayElementTypes,
   widenFloatTo,
@@ -1755,7 +1756,7 @@ export function resolve(
       // LIKE / ILIKE is text×text → boolean (grammar.md §22). Resolve the pair (a string literal
       // stays text), then require BOTH operands be text (or a bare NULL); a non-text operand is
       // 42804. We do NOT use classifyComparable here — it would wrongly accept bytea×bytea.
-      const p = resolveOperandPair(scope, e.lhs, e.rhs, ag, params);
+      const p = resolveTextOperandPair(scope, e.lhs, e.rhs, ag, params);
       requireTextOrNull(p.lt);
       requireTextOrNull(p.rt);
       return {
@@ -1772,7 +1773,7 @@ export function resolve(
     case "regex": {
       // ~ / ~* / !~ / !~* — text×text → boolean (grammar.md §22b, regex.md). Same operand typing as
       // LIKE: resolve the pair, require both text (or a bare NULL); a non-text operand is 42804.
-      const p = resolveOperandPair(scope, e.lhs, e.rhs, ag, params);
+      const p = resolveTextOperandPair(scope, e.lhs, e.rhs, ag, params);
       requireTextOrNull(p.lt);
       requireTextOrNull(p.rt);
       // Precompile a CONSTANT pattern ONCE (regex.md §5); a non-constant pattern compiles per row at

@@ -496,6 +496,85 @@ pub(crate) fn lookup_scalar_overload(
     })
 }
 
+/// Select the scalar-function overload for `name` over the resolved argument types, where an
+/// argument of the untyped NULL type (a bare NULL, or a `$N` with no context) is unknown-typed and
+/// adopts a slot's family (functions.md §9.1). `Ok(None)` when no built-in row matches (the caller
+/// tries the host registry, then 42883); 42725 when the overloads cannot decide.
+pub(crate) fn select_scalar_overload(
+    name: &str,
+    arg_tys: &[ResolvedType],
+) -> Result<Option<&'static OperatorDesc>> {
+    let unknown = |t: &ResolvedType| matches!(t, ResolvedType::Null);
+    if !arg_tys.iter().any(unknown) {
+        return Ok(lookup_scalar_overload(name, arg_tys));
+    }
+    let candidates: Vec<&'static OperatorDesc> = OPERATORS
+        .iter()
+        .filter(|o| {
+            o.kind == "function"
+                && o.name == name
+                && o.arg_families.len() == arg_tys.len()
+                && std::iter::zip(o.arg_families, arg_tys)
+                    .all(|(slot, t)| unknown(t) || family_matches(slot, t))
+        })
+        .collect();
+    if candidates.len() <= 1 {
+        return Ok(candidates.first().copied());
+    }
+    // At each unknown position pick `text` if any candidate accepts it, else the one family every
+    // candidate agrees on; a disagreement without `text` is ambiguous.
+    let mut picked: Vec<Option<&str>> = vec![None; arg_tys.len()];
+    for (i, t) in arg_tys.iter().enumerate() {
+        if !unknown(t) {
+            continue;
+        }
+        let first = candidates[0].arg_families[i];
+        picked[i] = if candidates.iter().any(|o| o.arg_families[i] == "text") {
+            Some("text")
+        } else if candidates.iter().all(|o| o.arg_families[i] == first) {
+            Some(first)
+        } else {
+            return Err(ambiguous_func_overload(name));
+        };
+    }
+    let kept: Vec<&'static OperatorDesc> = candidates
+        .into_iter()
+        .filter(|o| {
+            picked
+                .iter()
+                .enumerate()
+                .all(|(i, p)| p.is_none_or(|f| o.arg_families[i] == f))
+        })
+        .collect();
+    match kept.as_slice() {
+        [one] => Ok(Some(*one)),
+        _ => Err(ambiguous_func_overload(name)),
+    }
+}
+
+/// The concrete type an unknown-typed bind parameter adopts in a function slot of `family`
+/// (functions.md §9.1): the integer family's default `i64`, the float family's `f64`, and each
+/// single-type family its own scalar. `None` for `any` (and the polymorphic pseudo-families).
+pub(crate) fn family_param_type(family: &str) -> Option<ScalarType> {
+    Some(match family {
+        "integer" => ScalarType::Int64,
+        "float" => ScalarType::Float64,
+        "decimal" => ScalarType::Decimal,
+        "text" => ScalarType::Text,
+        "boolean" => ScalarType::Bool,
+        "bytea" => ScalarType::Bytea,
+        "uuid" => ScalarType::Uuid,
+        "date" => ScalarType::Date,
+        "timestamp" => ScalarType::Timestamp,
+        "timestamptz" => ScalarType::Timestamptz,
+        "interval" => ScalarType::Interval,
+        "json" => ScalarType::Json,
+        "jsonb" => ScalarType::Jsonb,
+        "jsonpath" => ScalarType::JsonPath,
+        _ => return None,
+    })
+}
+
 /// The kernel id for scalar function `name` — the per-core hand-written half of the registry
 /// (§5: the kernel is reached by id, never codegenned). Total over the catalog's function names
 /// (`registry_covers_catalog` proves it); for Rust the id depends only on the name (one `Abs`
@@ -2587,5 +2666,14 @@ pub(crate) fn no_func_overload(func: &str) -> EngineError {
     EngineError::new(
         SqlState::UndefinedFunction,
         format!("no {func} function for those argument types"),
+    )
+}
+
+/// The 42725 raised when an unknown-typed argument leaves several overloads of `func` standing
+/// (functions.md §9.1) — the caller writes a cast to choose one.
+pub(crate) fn ambiguous_func_overload(func: &str) -> EngineError {
+    EngineError::new(
+        SqlState::AmbiguousFunction,
+        format!("function {func} is not unique for those argument types"),
     )
 }

@@ -31525,6 +31525,12 @@ export function noFuncOverload(fn: string): EngineError {
   return engineError("undefined_function", "no " + fn + " function for those argument types");
 }
 
+// ambiguousFuncOverload is the 42725 raised when an unknown-typed argument leaves several overloads
+// of fn standing (functions.md §9.1) — the caller writes a cast to choose one.
+export function ambiguousFuncOverload(fn: string): EngineError {
+  return engineError("ambiguous_function", "function " + fn + " is not unique for those argument types");
+}
+
 // isWindowOnlyName reports whether name is a registered WINDOW-only function surface
 // (row_number/rank/…). Data-driven over the catalog (WINDOWS). Such a function REQUIRES an OVER
 // clause — used without one it is 42809 (spec/design/window.md §7). The catalog aggregates double
@@ -32073,6 +32079,64 @@ export function lookupScalarOverload(name: string, tys: ResolvedType[]): Operato
       o.argFamilies.length === tys.length &&
       o.argFamilies.every((slot, i) => familyMatches(slot, tys[i]!)),
   );
+}
+
+// selectScalarOverload selects the scalar-function overload for name over the resolved argument
+// types, where an argument of the untyped NULL type (a bare NULL, or a $N with no context) is
+// unknown-typed and adopts a slot's family (functions.md §9.1). undefined when no built-in row
+// matches (the caller tries the host registry, then 42883); 42725 when the overloads cannot decide.
+export function selectScalarOverload(name: string, tys: ResolvedType[]): OperatorDesc | undefined {
+  if (!tys.some((t) => t.kind === "null")) return lookupScalarOverload(name, tys);
+  const candidates = OPERATORS.filter(
+    (o) =>
+      o.kind === "function" &&
+      o.name === name &&
+      o.argFamilies.length === tys.length &&
+      o.argFamilies.every((slot, i) => tys[i]!.kind === "null" || familyMatches(slot, tys[i]!)),
+  );
+  if (candidates.length <= 1) return candidates[0];
+  // At each unknown position pick text if any candidate accepts it, else the one family every
+  // candidate agrees on; a disagreement without text is ambiguous.
+  const picked: (string | null)[] = tys.map(() => null);
+  for (let i = 0; i < tys.length; i++) {
+    if (tys[i]!.kind !== "null") continue;
+    const first = candidates[0]!.argFamilies[i]!;
+    if (candidates.some((o) => o.argFamilies[i] === "text")) picked[i] = "text";
+    else if (candidates.every((o) => o.argFamilies[i] === first)) picked[i] = first;
+    else throw ambiguousFuncOverload(name);
+  }
+  const kept = candidates.filter((o) =>
+    picked.every((p, i) => p === null || o.argFamilies[i] === p)
+  );
+  if (kept.length !== 1) throw ambiguousFuncOverload(name);
+  return kept[0];
+}
+
+// familyParamType is the concrete type an unknown-typed bind parameter adopts in a function slot of
+// family (functions.md §9.1): the integer family's default i64, the float family's f64, and each
+// single-type family its own scalar. null for "any" (and the polymorphic pseudo-families).
+export function familyParamType(family: string): ScalarType | null {
+  switch (family) {
+    case "integer":
+      return "i64";
+    case "float":
+      return "f64";
+    case "decimal":
+    case "text":
+    case "boolean":
+    case "bytea":
+    case "uuid":
+    case "date":
+    case "timestamp":
+    case "timestamptz":
+    case "interval":
+    case "json":
+    case "jsonb":
+    case "jsonpath":
+      return family;
+    default:
+      return null;
+  }
 }
 
 // resolvedScalarType is the concrete ScalarType carried by a numeric resolved type (for the
@@ -32734,7 +32798,7 @@ export function resolveScalarFunc(
   // Pick the overload by argument families and its result type by the catalog `result` code
   // (extensibility.md §5) — by the SPELLED name, so `power(numeric,numeric)` and `power(float,float)`
   // both resolve (the decimal `power` row has no `pow` alias, matching Rust/Go).
-  const desc = lookupScalarOverload(name, tys);
+  const desc = selectScalarOverload(name, tys);
   if (!desc) {
     // Host-registered scalar function (extensibility.md §4.2): exact scalar signature, no implicit
     // promotion. A built-in overload (above) always wins; a host function is reached only when no
@@ -32743,6 +32807,20 @@ export function resolveScalarFunc(
     const host = resolveHostScalar(scope, e.name, rargs, tys);
     if (host) return host;
     throw noFuncOverload(name);
+  }
+  // An unknown-typed argument adopts its slot's family (functions.md §9.1): a bare $N is re-resolved
+  // with that family's type, recording it; a bare NULL stays a NULL node of that type.
+  for (let i = 0; i < tys.length; i++) {
+    if (tys[i]!.kind !== "null") continue;
+    const st = familyParamType(desc.argFamilies[i]!);
+    if (st === null) continue;
+    if (e.args[i]!.kind === "param") {
+      const r = resolve(scope, e.args[i]!, st, ag, params);
+      rargs[i] = r.node;
+      tys[i] = r.type;
+    } else {
+      tys[i] = resolvedTypeOf(st);
+    }
   }
   // Eval-kernel aliases that share a backing kernel id: `power(x, y)` is PG's name for jed's pow (the
   // name gap, float.md §8); `ceiling` is PG's alias of `ceil` (functions.md §9). The catalog lookup

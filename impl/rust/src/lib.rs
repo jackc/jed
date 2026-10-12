@@ -633,6 +633,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // spec/design/functions.md §9.
     "func.abs",
     "func.round",
+    "func.unknown_args",
     "func.casing",
     // Named-argument notation + DEFAULT parameter values, via make_interval — functions.md §11.
     "func.named_arguments",

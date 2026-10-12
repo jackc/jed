@@ -5011,8 +5011,8 @@ func (p *parser) parseComparison() (exprNode, error) {
 		return exprNode{Kind: exprBetween, Between: &betweenExpr{Lhs: lhs, Lo: lo, Hi: hi, Negated: predNegated}}, nil
 	}
 	// LIKE / ILIKE (exact name) — grammar.md §22. `ilike` is just another peeked keyword.
-	// An `ESCAPE e` clause desugars, as in PostgreSQL, to the pattern `like_escape(p, e)`. A bare NULL
-	// or `$N` pattern/escape is typed text, the type like_escape declares (grammar.md §22).
+	// An `ESCAPE e` clause desugars, as in PostgreSQL, to the pattern `like_escape(p, e)`; a bare NULL
+	// or `$N` pattern/escape is typed text by the function's signature (grammar.md §22).
 	if p.peekKeyword() == "like" || p.peekKeyword() == "ilike" {
 		insensitive := p.peekKeyword() == "ilike"
 		p.advance()
@@ -5026,15 +5026,10 @@ func (p *parser) parseComparison() (exprNode, error) {
 			if err != nil {
 				return exprNode{}, err
 			}
-			textIfUntyped := func(e exprNode) *exprNode {
-				if e.Kind == exprParam || (e.Kind == exprLiteral && e.Literal.Kind == literalNull) {
-					e = exprNode{Kind: exprCast, Cast: &castExpr{Inner: e, TypeName: "text"}}
-				}
-				return &e
-			}
+			pattern := rhs
 			rhs = exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{
 				Name: "like_escape",
-				Args: []*exprNode{textIfUntyped(rhs), textIfUntyped(escape)},
+				Args: []*exprNode{&pattern, &escape},
 			}}
 		}
 		return exprNode{Kind: exprLike, Like: &likeExpr{Lhs: lhs, Rhs: rhs, Negated: predNegated, Insensitive: insensitive}}, nil

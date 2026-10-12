@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EngineError, intValue, nullValue } from "../src/tooling.ts";
 import type { Value } from "../src/lib.ts";
-import { float64Value } from "../src/value.ts";
+import { float64Value, render } from "../src/value.ts";
 import { type Handle, dbWith, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
@@ -321,4 +321,77 @@ test("text || with a bound operand", () => {
   }
   // The parameter is declared text, so an integer binding does not coerce.
   assert.equal(paramErrCode(db, "SELECT $1 || id FROM t", [intValue(5n)]), "42804");
+});
+
+// A bare $N scalar-function argument adopts the family the catalog declares for its slot
+// (functions.md §9.1): one candidate decides outright, text wins among several, and an overload set
+// that cannot decide is 42725. An `any` slot fixes no type (42P18).
+test("a function-argument parameter adopts the declared family", () => {
+  const db = dbWith([
+    "CREATE TABLE t (id i32 PRIMARY KEY, s text)",
+    "INSERT INTO t VALUES (1, 'xyz')",
+  ]);
+  const bytea = (b: number[]): Value => ({ kind: "bytea", bytes: new Uint8Array(b) });
+  const cases: [string, Value[], string][] = [
+    ["SELECT translate($1, 'a', 'b')", [text("banana")], "bbnbnb"],
+    ["SELECT translate($1, $2, $3)", [text("abc"), text("b"), text("x")], "axc"],
+    // An integer slot types the parameter i64.
+    ["SELECT left($1, $2)", [text("abcd"), intValue(2n)], "ab"],
+    ["SELECT chr($1)", [intValue(65n)], "A"],
+    // length/substr have text and bytea overloads: the unknown argument takes text.
+    ["SELECT length($1)", [text("héllo")], "5"],
+    ["SELECT substr($1, 2)", [text("abc")], "bc"],
+    // A typed argument narrows the candidates first: bytea picks the bytea overload.
+    ["SELECT substr('\\x010203'::bytea, $1)", [intValue(2n)], "\\x0203"],
+    // Families other than text/integer: encode(bytea, text), json_typeof(json).
+    ["SELECT encode($1, 'hex')", [bytea([0xab])], "ab"],
+    ["SELECT json_typeof($1)", [text("[1]")], "array"],
+    // A NULL bound to an adopted slot propagates.
+    ["SELECT translate($1, 'a', 'b')", [nullValue()], "NULL"],
+    // The parameter's adopted type unifies with its other uses.
+    ["SELECT left($1, 1) FROM t WHERE s = $1", [text("xyz")], "x"],
+    // A cast chooses among ambiguous overloads.
+    ["SELECT abs($1::i32)", [intValue(-3n)], "3"],
+  ];
+  for (const [sql, params, want] of cases) {
+    assert.equal(render(rows(db, sql, params)[0]![0]!), want, sql);
+  }
+  const errors: [string, Value[], string][] = [
+    // A wrong-family value for an adopted slot is a binding error.
+    ["SELECT left($1, $2)", [text("abcd"), text("2")], "42804"],
+    ["SELECT length($1)", [bytea([1, 2])], "42804"],
+    ["SELECT left($1, 1) FROM t WHERE id = $1", [text("x")], "42804"],
+    // Overloads the rule cannot decide among are 42725.
+    ["SELECT abs($1)", [intValue(1n)], "42725"],
+    ["SELECT round($1, 2)", [intValue(1n)], "42725"],
+    ["SELECT sqrt($1)", [intValue(1n)], "42725"],
+    ["SELECT pow($1, $2)", [intValue(1n), intValue(1n)], "42725"],
+    ["SELECT date_part('year', $1)", [intValue(1n)], "42725"],
+    // An `any` slot fixes no type.
+    ["SELECT to_jsonb($1)", [text("x")], "42P18"],
+    // No candidate stays 42883.
+    ["SELECT left($1, 'x')", [text("abc")], "42883"],
+  ];
+  for (const [sql, params, code] of errors) {
+    assert.equal(paramErrCode(db, sql, params), code, sql);
+  }
+});
+
+// A $N operand of LIKE/ILIKE or a regex match adopts text whatever its sibling (api.md §5).
+test("a LIKE or regex parameter operand is text", () => {
+  const db = dbWith([]);
+  const cases: [string, Value[], string][] = [
+    ["SELECT 'x%' LIKE $1", [text("x\\%")], "true"],
+    ["SELECT $1 LIKE $2", [text("abc"), text("a%")], "true"],
+    ["SELECT $1 ILIKE 'A%'", [text("abc")], "true"],
+    ["SELECT 'abc' ~ $1", [text("^a.c$")], "true"],
+    ["SELECT $1 !~ $2", [text("abc"), text("z")], "true"],
+    ["SELECT 'x' LIKE $1", [nullValue()], "NULL"],
+  ];
+  for (const [sql, params, want] of cases) {
+    assert.equal(render(rows(db, sql, params)[0]![0]!), want, sql);
+  }
+  assert.equal(paramErrCode(db, "SELECT 'x' LIKE $1", [intValue(1n)]), "42804");
+  // A non-text sibling is still a LIKE type error.
+  assert.equal(paramErrCode(db, "SELECT 5 LIKE $1", [text("5")]), "42804");
 });

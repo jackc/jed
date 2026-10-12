@@ -1186,6 +1186,10 @@ id = "func.round"
 description = "round(x[, n]) scalar function — numeric/integer → numeric, half-away-from-zero to scale 0 or n places; integer overloads return numeric (PG round(5)); NULL propagates (spec/design/functions.md §9)"
 
 [[capability]]
+id = "func.unknown_args"
+description = "A bare NULL scalar-function argument adopts its slot's declared family (spec/design/functions.md §9.1): one candidate decides, text wins among several, an undecidable overload set is 42725 (no preferred-type step); a strict function returns NULL. The same rule types a bind parameter (api.md §5)"
+
+[[capability]]
 id = "func.casing"
 description = "lower(text) / upper(text) — Unicode case folding (spec/design/collation.md §16), the text OVERLOAD of the range accessors (the resolver branches on the argument type). With no property bundle loaded they fold ASCII a–z/A–Z only and pass other code points through (the SQLite default, version-independent); with a bundle's property section loaded they fold via the full Unicode case mappings incl. SpecialCasing (ß→SS, a divergence from glibc's 1:1 — unit-tested, not oracle). text → text, NULL propagates; one operator_eval. Builds on types.text"
 

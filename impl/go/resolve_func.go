@@ -128,6 +128,125 @@ func lookupScalarOverload(name string, tys []resolvedType) *operatorDesc {
 	return nil
 }
 
+// selectScalarOverload selects the scalar-function overload for name over the resolved argument
+// types, where an argument of the untyped NULL type (a bare NULL, or a $N with no context) is
+// unknown-typed and adopts a slot's family (functions.md §9.1). nil, nil when no built-in row
+// matches (the caller tries the host registry, then 42883); 42725 when the overloads cannot decide.
+func selectScalarOverload(name string, tys []resolvedType) (*operatorDesc, error) {
+	anyUnknown := false
+	for _, t := range tys {
+		if t.kind == rtNull {
+			anyUnknown = true
+		}
+	}
+	if !anyUnknown {
+		return lookupScalarOverload(name, tys), nil
+	}
+	var candidates []*operatorDesc
+	for i := range operators {
+		o := &operators[i]
+		if o.Kind != "function" || o.Name != name || len(o.ArgFamilies) != len(tys) {
+			continue
+		}
+		match := true
+		for j, slot := range o.ArgFamilies {
+			if tys[j].kind != rtNull && !familyMatches(slot, tys[j]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			candidates = append(candidates, o)
+		}
+	}
+	switch len(candidates) {
+	case 0:
+		return nil, nil
+	case 1:
+		return candidates[0], nil
+	}
+	// At each unknown position pick text if any candidate accepts it, else the one family every
+	// candidate agrees on; a disagreement without text is ambiguous.
+	picked := make([]string, len(tys))
+	for i, t := range tys {
+		if t.kind != rtNull {
+			continue
+		}
+		first := candidates[0].ArgFamilies[i]
+		hasText, agree := false, true
+		for _, o := range candidates {
+			if o.ArgFamilies[i] == "text" {
+				hasText = true
+			}
+			if o.ArgFamilies[i] != first {
+				agree = false
+			}
+		}
+		switch {
+		case hasText:
+			picked[i] = "text"
+		case agree:
+			picked[i] = first
+		default:
+			return nil, ambiguousFuncOverload(name)
+		}
+	}
+	var kept []*operatorDesc
+	for _, o := range candidates {
+		keep := true
+		for i, p := range picked {
+			if p != "" && o.ArgFamilies[i] != p {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			kept = append(kept, o)
+		}
+	}
+	if len(kept) != 1 {
+		return nil, ambiguousFuncOverload(name)
+	}
+	return kept[0], nil
+}
+
+// familyParamType is the concrete type an unknown-typed bind parameter adopts in a function slot
+// of family (functions.md §9.1): the integer family's default i64, the float family's f64, and
+// each single-type family its own scalar. ok=false for "any" (and the polymorphic pseudo-families).
+func familyParamType(family string) (scalarType, bool) {
+	switch family {
+	case "integer":
+		return scalarInt64, true
+	case "float":
+		return scalarFloat64, true
+	case "decimal":
+		return scalarDecimal, true
+	case "text":
+		return scalarText, true
+	case "boolean":
+		return scalarBool, true
+	case "bytea":
+		return scalarBytea, true
+	case "uuid":
+		return scalarUuid, true
+	case "date":
+		return scalarDate, true
+	case "timestamp":
+		return scalarTimestamp, true
+	case "timestamptz":
+		return scalarTimestamptz, true
+	case "interval":
+		return scalarInterval, true
+	case "json":
+		return scalarJson, true
+	case "jsonb":
+		return scalarJsonb, true
+	case "jsonpath":
+		return scalarJsonPath, true
+	}
+	return 0, false
+}
+
 // scalarFuncID is the kernel id for scalar function name over its argument types — the per-core
 // hand-written half of the registry (§5: the kernel is reached by id, never codegenned). abs and
 // round split by operand family (the Go core has distinct int/decimal vs float kernels); the rest
@@ -3032,7 +3151,32 @@ func resolveScalarFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramType
 	// so the built-in catalog is consulted first; a host function is reached only when no built-in
 	// matches (a host-only name, or a host overload over a signature the built-in name does not
 	// accept).
-	if desc := lookupScalarOverload(name, tys); desc != nil {
+	desc, err := selectScalarOverload(name, tys)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	if desc != nil {
+		// An unknown-typed argument adopts its slot's family (functions.md §9.1): a bare $N is
+		// re-resolved with that family's type, recording it; a bare NULL stays a NULL node of
+		// that type.
+		for i := range tys {
+			if tys[i].kind != rtNull {
+				continue
+			}
+			st, ok := familyParamType(desc.ArgFamilies[i])
+			if !ok {
+				continue
+			}
+			if fc.Args[i].Kind == exprParam {
+				r, t, err := resolve(s, *fc.Args[i], &st, ag, params)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				rargs[i], tys[i] = r, t
+			} else {
+				tys[i] = resolvedTypeOf(st)
+			}
+		}
 		epoch := name == "date_part" && len(rargs) > 0 && rargs[0].kind == reConstText && strings.EqualFold(rargs[0].cText, "epoch")
 		params.nonimmutable = params.nonimmutable || (desc.Volatility != "immutable" && !epoch)
 		fn := scalarFuncID(name, tys)

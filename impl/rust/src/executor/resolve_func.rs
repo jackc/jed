@@ -762,7 +762,25 @@ pub(crate) fn resolve_scalar_func(
     // so the built-in catalog is consulted first; a host function is reached only when no built-in
     // matches (a host-only name, or a host overload over a signature the built-in name does not
     // accept).
-    if let Some(desc) = lookup_scalar_overload(name, &tys) {
+    if let Some(desc) = select_scalar_overload(name, &tys)? {
+        // An unknown-typed argument adopts its slot's family (functions.md §9.1): a bare `$N` is
+        // re-resolved with that family's type, recording it; a bare NULL stays a NULL node of
+        // that type.
+        for (i, t) in tys.iter_mut().enumerate() {
+            if !matches!(t, ResolvedType::Null) {
+                continue;
+            }
+            let Some(st) = family_param_type(desc.arg_families[i]) else {
+                continue;
+            };
+            if matches!(args[i], Expr::Param(_)) {
+                let (r, rt) = resolve(scope, &args[i], Some(st), agg, params)?;
+                rargs[i] = r;
+                *t = rt;
+            } else {
+                *t = resolved_type_of(st);
+            }
+        }
         // Catalog volatility is executable admission data. date_part's epoch overload
         // is refined by its constant field, without erasing dependencies of either child.
         let epoch = name == "date_part"
@@ -4827,7 +4845,7 @@ pub(crate) fn resolve(
             // stays text), then require BOTH operands be text (or a bare NULL); a non-text
             // operand is 42804. We do NOT use classify_comparable here — it would wrongly accept
             // bytea×bytea, which LIKE does not define.
-            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
+            let (rl, lt, rr, rt) = resolve_text_operand_pair(scope, lhs, rhs, agg, params)?;
             require_text_or_null(&lt)?;
             require_text_or_null(&rt)?;
             Ok((
@@ -4848,7 +4866,7 @@ pub(crate) fn resolve(
         } => {
             // ~ / ~* / !~ / !~* — text×text → boolean (grammar.md §22b, regex.md). Same operand
             // typing as LIKE: resolve the pair, require both text (or a bare NULL); non-text 42804.
-            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
+            let (rl, lt, rr, rt) = resolve_text_operand_pair(scope, lhs, rhs, agg, params)?;
             require_text_or_null(&lt)?;
             require_text_or_null(&rt)?;
             // Precompile a CONSTANT pattern ONCE (regex.md §5); a non-constant pattern compiles per

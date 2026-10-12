@@ -87,6 +87,24 @@ export function widthBucketFloat(op: number, low: number, high: number, count: b
   return BigInt(Math.floor(((low - op) / (low - high)) * cf)) + 1n;
 }
 
+// resolveTextOperandPair resolves the operand pair of a text-only operator (LIKE/ILIKE, the regex
+// matches): as resolveOperandPair, except a bind parameter operand adopts text, the only operand
+// type the operator declares, whatever its sibling ('x%' LIKE $1, $1 LIKE $2 — api.md §5).
+export function resolveTextOperandPair(
+  scope: Scope,
+  lhs: Expr,
+  rhs: Expr,
+  ag: AggCtx,
+  params: ParamTypes,
+): { rl: RExpr; lt: ResolvedType; rr: RExpr; rt: ResolvedType } {
+  const lhsParam = lhs.kind === "param";
+  const rhsParam = rhs.kind === "param";
+  if (!lhsParam && !rhsParam) return resolveOperandPair(scope, lhs, rhs, ag, params);
+  const l = resolve(scope, lhs, lhsParam ? "text" : null, ag, params);
+  const r = resolve(scope, rhs, rhsParam ? "text" : null, ag, params);
+  return { rl: l.node, lt: l.type, rr: r.node, rt: r.type };
+}
+
 export function resolveOperandPair(
   scope: Scope,
   lhs: Expr,

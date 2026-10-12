@@ -1768,6 +1768,27 @@ pub(crate) fn resolve_operand_pair(
     Ok((rl, lt, rr, rt))
 }
 
+/// Resolve the operand pair of a text-only operator (LIKE/ILIKE, the regex matches): as
+/// [`resolve_operand_pair`], except a bind parameter operand adopts `text`, the only operand type
+/// the operator declares, whatever its sibling (`'x%' LIKE $1`, `$1 LIKE $2` — api.md §5).
+pub(crate) fn resolve_text_operand_pair(
+    scope: &Scope,
+    lhs: &Expr,
+    rhs: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType, RExpr, ResolvedType)> {
+    let lhs_param = matches!(lhs, Expr::Param(_));
+    let rhs_param = matches!(rhs, Expr::Param(_));
+    if !lhs_param && !rhs_param {
+        return resolve_operand_pair(scope, lhs, rhs, agg, params);
+    }
+    let text = Some(ScalarType::Text);
+    let (rl, lt) = resolve(scope, lhs, if lhs_param { text } else { None }, agg, params)?;
+    let (rr, rt) = resolve(scope, rhs, if rhs_param { text } else { None }, agg, params)?;
+    Ok((rl, lt, rr, rt))
+}
+
 /// Whether `e` is an *adaptable operand* — one that takes its type from its sibling: an integer
 /// or string literal, or a bind parameter `$N` (spec/design/api.md §5). NULL, boolean, and
 /// decimal literals do not take a sibling's context here.

@@ -814,6 +814,17 @@ file = "expr/scalar_functions.test"
 sql = "SELECT abs(DISTINCT i32) FROM n"
 reason = "jed: DISTINCT inside a scalar (non-aggregate) function call is a 42601 parse error (DISTINCT is valid only in an aggregate). PostgreSQL parses it and reports 42809 (abs is not an aggregate function). Both reject; jed names it a syntax error, PG a wrong-object-type. A documented error-class divergence."
 
+# --- expr/unknown_function_args.test: no preferred-type step for an unknown-typed argument.
+[[override]]
+file = "expr/unknown_function_args.test"
+sql = "SELECT abs(NULL)"
+reason = "jed: a bare NULL argument adopts a slot family only when the overloads decide it (functions.md §9.1). abs has integer, decimal, and float rows and none accepts text, so the call is 42725. PostgreSQL continues to its preferred-type step, picks float8 (the numeric category's preferred type), and returns a double-precision NULL. jed omits that step: silently choosing binary float over exact decimal is against the strict type system (CLAUDE.md §4, §8), and it would pick jed-only overloads PostgreSQL lacks. A cast chooses the overload."
+
+[[override]]
+file = "expr/unknown_function_args.test"
+sql = "SELECT round(NULL, 2)"
+reason = "jed: round has (decimal, integer), (integer, integer), and (float, integer) rows, so a bare NULL first argument cannot decide among them: 42725 (functions.md §9.1). PostgreSQL has only round(numeric, integer) for two arguments and returns a numeric NULL. The catalogs differ (jed's integer rows stand in for PG's implicit int-to-numeric cast; round(float, integer) is a jed extension), and jed applies no preferred-type or same-as-known-argument heuristic, which here would pick an overload PostgreSQL does not have."
+
 # --- expr/type_errors.test: strict-typing on boolean expressions, and the deferred boolean casts.
 [[override]]
 file = "expr/type_errors.test"

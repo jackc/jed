@@ -1031,3 +1031,9 @@ func noAggOverload(fn string) error {
 func noFuncOverload(fn string) error {
 	return newError(UndefinedFunction, "no "+fn+" function for those argument types")
 }
+
+// ambiguousFuncOverload is the 42725 raised when an unknown-typed argument leaves several overloads
+// of fn standing (functions.md §9.1) — the caller writes a cast to choose one.
+func ambiguousFuncOverload(fn string) error {
+	return newError(AmbiguousFunction, "function "+fn+" is not unique for those argument types")
+}

@@ -414,3 +414,98 @@ func TestTextConcatBoundParameters(t *testing.T) {
 		t.Errorf("an integer binding for a text parameter: code %s, want 42804", code)
 	}
 }
+
+// A bare $N scalar-function argument adopts the family the catalog declares for its slot
+// (functions.md §9.1): one candidate decides outright, text wins among several, and an overload set
+// that cannot decide is 42725. An `any` slot fixes no type (42P18).
+func TestFunctionArgumentParamAdoptsDeclaredFamily(t *testing.T) {
+	t.Parallel()
+	db := dbWith(t,
+		"CREATE TABLE t (id i32 PRIMARY KEY, s text)",
+		"INSERT INTO t VALUES (1, 'xyz')",
+	)
+	for _, tc := range []struct {
+		sql    string
+		params []Value
+		want   string
+	}{
+		{"SELECT translate($1, 'a', 'b')", []Value{TextValue("banana")}, "bbnbnb"},
+		{"SELECT translate($1, $2, $3)", []Value{TextValue("abc"), TextValue("b"), TextValue("x")}, "axc"},
+		// An integer slot types the parameter i64.
+		{"SELECT left($1, $2)", []Value{TextValue("abcd"), IntValue(2)}, "ab"},
+		{"SELECT chr($1)", []Value{IntValue(65)}, "A"},
+		// length/substr have text and bytea overloads: the unknown argument takes text.
+		{"SELECT length($1)", []Value{TextValue("héllo")}, "5"},
+		{"SELECT substr($1, 2)", []Value{TextValue("abc")}, "bc"},
+		// A typed argument narrows the candidates first: bytea picks the bytea overload.
+		{"SELECT substr('\\x010203'::bytea, $1)", []Value{IntValue(2)}, "\\x0203"},
+		// Families other than text/integer: encode(bytea, text), json_typeof(json).
+		{"SELECT encode($1, 'hex')", []Value{ByteaValue([]byte{0xab})}, "ab"},
+		{"SELECT json_typeof($1)", []Value{TextValue("[1]")}, "array"},
+		// A NULL bound to an adopted slot propagates.
+		{"SELECT translate($1, 'a', 'b')", []Value{NullValue()}, "NULL"},
+		// The parameter's adopted type unifies with its other uses.
+		{"SELECT left($1, 1) FROM t WHERE s = $1", []Value{TextValue("xyz")}, "x"},
+		// A cast chooses among ambiguous overloads.
+		{"SELECT abs($1::i32)", []Value{IntValue(-3)}, "3"},
+	} {
+		rows := queryRows(t, db, tc.sql, tc.params...)
+		if got := rows[0][0].Render(); got != tc.want {
+			t.Errorf("%q: got %s, want %s", tc.sql, got, tc.want)
+		}
+	}
+	for _, tc := range []struct {
+		sql    string
+		params []Value
+		code   string
+	}{
+		// A wrong-family value for an adopted slot is a binding error.
+		{"SELECT left($1, $2)", []Value{TextValue("abcd"), TextValue("2")}, "42804"},
+		{"SELECT length($1)", []Value{ByteaValue([]byte{1, 2})}, "42804"},
+		{"SELECT left($1, 1) FROM t WHERE id = $1", []Value{TextValue("x")}, "42804"},
+		// Overloads the rule cannot decide among are 42725.
+		{"SELECT abs($1)", []Value{IntValue(1)}, "42725"},
+		{"SELECT round($1, 2)", []Value{IntValue(1)}, "42725"},
+		{"SELECT sqrt($1)", []Value{IntValue(1)}, "42725"},
+		{"SELECT pow($1, $2)", []Value{IntValue(1), IntValue(1)}, "42725"},
+		{"SELECT date_part('year', $1)", []Value{IntValue(1)}, "42725"},
+		// An `any` slot fixes no type.
+		{"SELECT to_jsonb($1)", []Value{TextValue("x")}, "42P18"},
+		// No candidate stays 42883.
+		{"SELECT left($1, 'x')", []Value{TextValue("abc")}, "42883"},
+	} {
+		if code := paramErrCode(t, db, tc.sql, tc.params...); code != tc.code {
+			t.Errorf("%q: code %s, want %s", tc.sql, code, tc.code)
+		}
+	}
+}
+
+// A $N operand of LIKE/ILIKE or a regex match adopts text whatever its sibling (api.md §5).
+func TestLikeAndRegexParamOperandIsText(t *testing.T) {
+	t.Parallel()
+	db := dbWith(t)
+	for _, tc := range []struct {
+		sql    string
+		params []Value
+		want   string
+	}{
+		{"SELECT 'x%' LIKE $1", []Value{TextValue("x\\%")}, "true"},
+		{"SELECT $1 LIKE $2", []Value{TextValue("abc"), TextValue("a%")}, "true"},
+		{"SELECT $1 ILIKE 'A%'", []Value{TextValue("abc")}, "true"},
+		{"SELECT 'abc' ~ $1", []Value{TextValue("^a.c$")}, "true"},
+		{"SELECT $1 !~ $2", []Value{TextValue("abc"), TextValue("z")}, "true"},
+		{"SELECT 'x' LIKE $1", []Value{NullValue()}, "NULL"},
+	} {
+		rows := queryRows(t, db, tc.sql, tc.params...)
+		if got := rows[0][0].Render(); got != tc.want {
+			t.Errorf("%q: got %s, want %s", tc.sql, got, tc.want)
+		}
+	}
+	if code := paramErrCode(t, db, "SELECT 'x' LIKE $1", IntValue(1)); code != "42804" {
+		t.Errorf("int pattern: code %s, want 42804", code)
+	}
+	// A non-text sibling is still a LIKE type error.
+	if code := paramErrCode(t, db, "SELECT 5 LIKE $1", TextValue("5")); code != "42804" {
+		t.Errorf("int subject: code %s, want 42804", code)
+	}
+}

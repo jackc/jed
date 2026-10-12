@@ -166,8 +166,8 @@ SELECT substr('héllo', 2, 3)
 statement error 22011
 SELECT substr('abc', 1, -1)
 
-# any NULL argument propagates (typed NULLs — a bare untyped NULL argument matches no overload
-# family, 42883, jed's documented scalar-function behavior; here the NULLs carry a type)
+# any NULL argument propagates (typed NULLs here; a bare NULL argument adopts its slot's family,
+# expr/unknown_function_args.test)
 query T
 SELECT substr('abc', NULL::int, 2), substr(NULL::text, 1, 2), substr('abc', 2, NULL::int)
 ----

@@ -4377,8 +4377,8 @@ impl Parser {
         }
         // LIKE / ILIKE (case-insensitive) — grammar.md §22. Both bind at the comparison level; the
         // pattern is one CONCAT expression. `ilike` is just another peeked keyword (no lexer change).
-        // An `ESCAPE e` clause desugars, as in PostgreSQL, to the pattern `like_escape(p, e)`. A bare
-        // NULL or `$N` pattern/escape is typed text, the type like_escape declares (grammar.md §22).
+        // An `ESCAPE e` clause desugars, as in PostgreSQL, to the pattern `like_escape(p, e)`; a bare
+        // NULL or `$N` pattern/escape is typed text by the function's signature (grammar.md §22).
         if matches!(self.peek_keyword().as_deref(), Some("like") | Some("ilike")) {
             let insensitive = self.peek_keyword().as_deref() == Some("ilike");
             self.advance();
@@ -4386,17 +4386,9 @@ impl Parser {
             if self.peek_keyword().as_deref() == Some("escape") {
                 self.advance();
                 let escape = self.parse_concat()?;
-                let text_if_untyped = |e: Expr| match e {
-                    Expr::Literal(Literal::Null) | Expr::Param(_) => Expr::Cast {
-                        inner: Box::new(e),
-                        type_name: "text".to_string(),
-                        type_mod: None,
-                    },
-                    e => e,
-                };
                 rhs = Expr::FuncCall {
                     name: "like_escape".to_string(),
-                    args: vec![text_if_untyped(rhs), text_if_untyped(escape)],
+                    args: vec![rhs, escape],
                     arg_names: None,
                     star: false,
                     distinct: false,

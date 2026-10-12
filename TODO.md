@@ -272,6 +272,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     (`max_storage_bytes` has landed as the storage limit, memory.md §8 / Q4a and Q4c; next a spill `temp_dir`, then a thread count);
     optionally sweep the async OPFS/browser host (`createOpfs`/`OpfsDatabase.create`) into the
     unified `create(opts)` shape.
+- [x] **Unknown-typed function arguments** — a bare `$N` or `NULL` scalar-function argument adopts
+  the family the catalog declares for its slot (one candidate decides, `text` wins among several,
+  undecidable is `42725`; no preferred-type step), and a `$N` operand of `LIKE`/`ILIKE`/`~` adopts
+  `text`. The `LIKE … ESCAPE` desugar's cast workaround is gone. → [functions.md §9.1](spec/design/functions.md), [api.md §5](spec/design/api.md)
+  - [ ] _follow-on:_ the same rule over host-registered function signatures (an unknown argument is
+    `42883` there today); the dedicated resolvers (array, range-constructor, json-set functions)
+    still type their own arguments; a parameter already typed by an earlier occurrence still counts
+    as unknown in a later function argument.
 - [ ] **Storage hosts** — the five-method `BlockStore` byte device, host catalog, and decoration layering (encryption codec above the seam, replication tee below) authored in [hosts.md](spec/design/hosts.md). **Landed:** the per-core `FileBlockStore`s, the Node `fs` host, and the **Browser/OPFS host** (`FileSystemSyncAccessHandle` → engine in a Web Worker, file-host parity vs goldens, a Playwright real-browser e2e run inside `mise run ci`). **Open:** OPFS disk-spill. → [hosts.md §3/§5/§7](spec/design/hosts.md)
 - [x] **jed-migrate — the schema-migration library** — tern-modeled, opt-in migration packages at
   `/migrate` (Go + Rust + TS; a NON-CORE consumer per language) over one shared contract +

@@ -1,0 +1,119 @@
+# A bare NULL as a scalar-function argument (spec/design/functions.md §9.1). An unknown-typed
+# argument adopts the family the catalog declares for its slot: a single candidate decides
+# outright, `text` wins among several (length/substr pick text over bytea), and an overload set
+# that cannot decide is 42725 (ambiguous_function). A strict function then returns NULL. The
+# same rule types a bind parameter, which the literal-only corpus cannot express (per-core params
+# tests). jed omits PostgreSQL's preferred-type step, so abs(NULL) / round(NULL, 2) are 42725 where
+# PostgreSQL picks float8 / numeric (oracle_overrides.toml). PostgreSQL-oracle-verified (postgres:18).
+# requires: query.select_no_from, types.i32, types.text, types.bytea, types.date, func.unknown_args
+
+# === one candidate: the NULL takes the declared family ===================================
+
+query T nosort
+SELECT translate(NULL, 'a', 'b')
+----
+NULL
+
+query TT nosort
+SELECT translate('abc', NULL, 'b'), replace('abc', 'b', NULL)
+----
+NULL
+NULL
+
+query TTT nosort
+SELECT left(NULL, 2), repeat('ab', NULL), lpad(NULL, NULL, NULL)
+----
+NULL
+NULL
+NULL
+
+query II nosort
+SELECT strpos(NULL, 'a'), ascii(NULL)
+----
+NULL
+NULL
+
+query TTT nosort
+SELECT chr(NULL), initcap(NULL), reverse(NULL)
+----
+NULL
+NULL
+NULL
+
+query TT nosort
+SELECT encode(NULL, 'hex'), quote_literal(NULL)
+----
+NULL
+NULL
+
+query BB nosort
+SELECT decode(NULL, 'hex') IS NULL, starts_with('abc', NULL) IS NULL
+----
+true
+true
+
+# quote_nullable is not strict: its NULL argument is the text NULL it quotes.
+query T nosort
+SELECT quote_nullable(NULL)
+----
+NULL
+
+# A typed argument narrows the candidates first: date_part(text, date) is the only row left.
+query R nosort
+SELECT date_part(NULL, date '2024-08-15')
+----
+NULL
+
+# The LIKE … ESCAPE desugar's like_escape(text, text), called directly.
+query TT nosort
+SELECT like_escape(NULL, '#'), like_escape('a#%', NULL)
+----
+NULL
+NULL
+
+# === several candidates: text wins over bytea ============================================
+
+query III nosort
+SELECT length(NULL), octet_length(NULL), bit_length(NULL)
+----
+NULL
+NULL
+NULL
+
+query TT nosort
+SELECT substr(NULL, 2), substr(NULL, 2, 1)
+----
+NULL
+NULL
+
+# A bytea argument picks the bytea overload; the NULL then fills the integer slot.
+query B nosort
+SELECT substr('\x0102'::bytea, NULL) IS NULL
+----
+true
+
+# === several candidates, no text: ambiguous ==============================================
+
+# date_part's value slot is date, timestamp, timestamptz, or interval.
+statement error 42725
+SELECT date_part('year', NULL)
+
+# Numeric overloads: jed has no preferred type to break the tie (PostgreSQL picks float8 here).
+statement error 42725
+SELECT abs(NULL)
+
+# Integer, decimal, and float rows all take (_, integer) (PostgreSQL has only round(numeric, int)).
+statement error 42725
+SELECT round(NULL, 2)
+
+# A cast chooses the overload.
+query ID nosort
+SELECT abs(NULL::i32), round(NULL::numeric, 2)
+----
+NULL
+NULL
+
+# === no candidate stays 42883 ============================================================
+
+statement error 42883
+SELECT left(NULL, true)

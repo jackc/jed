@@ -33,9 +33,12 @@ floats, booleans, strings, byte arrays, and `NULL` all map across. This keeps us
 SQL string**, so there is no string-interpolation injection surface.
 
 Each placeholder's static type comes from its SQL context: a compared column, an arithmetic sibling,
-an `INSERT`/`UPDATE` target, a cast, or the common result type of `CASE`, `COALESCE`, `GREATEST`, and
-`LEAST`. For example, `COALESCE($1, 0)` infers an integer parameter. A bare `SELECT $1` has no type
-context and reports `42P18`; write an explicit cast when the surrounding expression cannot supply one.
+an `INSERT`/`UPDATE` target, a cast, the common result type of `CASE`, `COALESCE`, `GREATEST`, and
+`LEAST`, or the argument type a function declares. For example, `COALESCE($1, 0)` infers an integer
+parameter, `translate($1, 'a', 'b')` a text one, and `s LIKE $1` or `'x%' LIKE $1` a text pattern. A
+bare `SELECT $1` has no type context and reports `42P18`, and a function whose overloads leave the type
+open (`abs($1)`, `round($1, 2)`) reports `42725`; write an explicit cast when the surrounding expression
+cannot supply one.
 
 A note on integers, because it is the one place the type systems differ. jed integers are 64-bit and
 **exact**. In Rust and Go that is the natural integer type. In TypeScript a `number` is a float, so
