@@ -136,6 +136,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ a host-configurable spill directory (shared with the external sort) so WASI/OPFS
     hosts can offer a temp spill target; migrating a shrunken spilled domain back into RAM.
   - [ ] _follow-on:_ `ON COMMIT DELETE ROWS`/`DROP`; `CREATE TEMP TABLE … AS SELECT`; FKs among same-kind temp tables; temporary views. → [temp-tables.md §14](spec/design/temp-tables.md)
+- [ ] **Views** (`CREATE VIEW` / `DROP VIEW`, read-only) — a named persisted query read as the
+  equivalent derived table (identical rows, cost, plan); canonical token text with `*` frozen at
+  CREATE, persisted table/column/view dependencies (`2BP01`, `0A000` for a referenced column's type
+  change), `RENAME` text rewrites through base-table column alias lists, re-validation after `ALTER
+  TABLE`, `SELECT`-on-the-view privileges with the owner check at CREATE, `55000` on writes, the
+  `jed_views` catalog relation, and the CLI dump; `format_version` 38. Slices V1 (create/read/drop),
+  V2 (`RENAME TO` rewrite), V3 (base-table column alias lists), V4 (`RENAME`/`DROP COLUMN` rewrites).
+  _(size: L)_ → [views.md](spec/design/views.md)
+  - [ ] _follow-on:_ `CREATE OR REPLACE VIEW`, `ALTER VIEW` / view renames, `WITH CHECK OPTION`,
+    view options, updatable views, materialized and recursive views, temporary views, views in or
+    over attached databases, `DROP … CASCADE` of dependent views, dependency tracking for
+    sequences/types/collations/host functions, view columns in `jed_columns`, definitions longer
+    than one catalog page. → [views.md §12](spec/design/views.md)
 
 ---
 

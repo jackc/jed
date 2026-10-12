@@ -1,0 +1,527 @@
+# CREATE VIEW / DROP VIEW — read-only views (spec/design/views.md). A view is a named, persisted
+# query that FROM references like a table; reading it is the equivalent derived table (§4). `*` is
+# frozen at CREATE (§5), so a later ADD COLUMN does not change the view. Views share the relation
+# namespace (42P07), are the wrong kind for table/index/sequence statements (42809), refuse writes
+# (55000, the non-updatable-view code), and block DROP TABLE / DROP VIEW / DROP COLUMN of what they
+# read (2BP01) and a referenced column's type change (0A000). Every record here is PostgreSQL-
+# oracle-checked; jed-only behavior lives in views_jed.test and introspection/jed_views.test.
+# requires: ddl.view, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_if_exists, ddl.drop_table_multi, ddl.alter_table, ddl.sequence, maintenance.analyze, ddl.secondary_index, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.join_using, query.join_natural, query.aggregates, query.group_by, query.table_alias, query.qualified_column, query.qualified_star, query.column_alias, query.cte, query.cte_recursive, query.cte_data_modifying, query.subquery_scalar, query.subquery_exists, query.subquery_correlated, query.derived_table, query.union, query.limit, types.i32, types.i64, types.text
+
+statement ok
+CREATE TABLE t (a i32 PRIMARY KEY, b text, c i32)
+
+statement ok
+INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20), (3, 'z', NULL)
+
+statement ok
+CREATE VIEW v AS SELECT * FROM t WHERE c > 5
+
+# names: a, b, c
+query ITI nosort
+SELECT * FROM v ORDER BY a
+----
+1
+x
+10
+2
+y
+20
+
+# --- a view reads its base table's current rows ----------------------------------------------------
+
+statement ok
+INSERT INTO t VALUES (4, 'w', 40)
+
+query I nosort
+SELECT a FROM v ORDER BY a
+----
+1
+2
+4
+
+statement ok
+UPDATE t SET c = 1 WHERE a = 1
+
+query I rowsort
+SELECT a FROM v
+----
+2
+4
+
+statement ok
+DELETE FROM t WHERE a = 4
+
+query I rowsort
+SELECT a FROM v
+----
+2
+
+statement ok
+UPDATE t SET c = 10 WHERE a = 1
+
+# --- the column list renames the output, left to right; a shorter list is a partial rename --------
+
+statement ok
+CREATE VIEW v2 (p, q) AS SELECT a, b FROM t
+
+# names: p, q
+query IT nosort
+SELECT * FROM v2 ORDER BY p
+----
+1
+x
+2
+y
+3
+z
+
+statement ok
+CREATE VIEW v3 (p) AS SELECT a, b FROM t
+
+# names: p, b
+query IT nosort
+SELECT * FROM v3 WHERE p = 2
+----
+2
+y
+
+# --- output names follow grammar.md §8: an expression is ?column?, an aggregate its function name -
+
+statement ok
+CREATE VIEW vexpr AS SELECT a + 1 FROM t
+
+# names: ?column?
+query I nosort
+SELECT * FROM vexpr ORDER BY 1
+----
+2
+3
+4
+
+statement ok
+CREATE VIEW vagg AS SELECT b, sum(c) AS total, count(*) FROM t GROUP BY b
+
+# names: b, total, count
+query TII nosort
+SELECT * FROM vagg ORDER BY b
+----
+x
+10
+1
+y
+20
+1
+z
+NULL
+1
+
+query TI nosort
+SELECT b, total FROM vagg WHERE total > 15
+----
+y
+20
+
+# --- a view reference takes an alias, qualified columns, and a column alias list -------------------
+
+query I nosort
+SELECT x.p FROM v2 AS x ORDER BY x.p
+----
+1
+2
+3
+
+# names: m, q
+query IT nosort
+SELECT * FROM v2 AS x (m) ORDER BY m
+----
+1
+x
+2
+y
+3
+z
+
+query I nosort
+SELECT m FROM v2 x (m) WHERE x.q = 'y'
+----
+2
+
+statement error 42P10
+SELECT * FROM v2 AS x (m, n, o)
+
+# --- joins: a view joins a table, another view, and itself -----------------------------------------
+
+query IIT nosort
+SELECT v2.p, t.c, v.b FROM v2 JOIN t ON v2.p = t.a JOIN v ON v.a = t.a ORDER BY v2.p
+----
+1
+10
+x
+2
+20
+y
+
+query II nosort
+SELECT l.p, r.p FROM v2 AS l JOIN v2 AS r ON r.p = l.p + 1 ORDER BY l.p
+----
+1
+2
+2
+3
+
+query I nosort
+SELECT a FROM t WHERE EXISTS (SELECT 1 FROM v WHERE v.a = t.a) ORDER BY a
+----
+1
+2
+
+query II nosort
+SELECT a, (SELECT count(*) FROM v WHERE v.a <= t.a) FROM t ORDER BY a
+----
+1
+1
+2
+2
+3
+2
+
+query I nosort
+SELECT d.p FROM (SELECT p FROM v2 WHERE p > 1) AS d ORDER BY d.p
+----
+2
+3
+
+# --- views over views ------------------------------------------------------------------------------
+
+statement ok
+CREATE VIEW w AS SELECT p FROM v2 WHERE p >= 2
+
+query I nosort
+SELECT * FROM w ORDER BY p
+----
+2
+3
+
+statement ok
+CREATE VIEW ww (k) AS SELECT w.p * 10 FROM w JOIN v ON v.a = w.p
+
+query I nosort
+SELECT k FROM ww
+----
+20
+
+# --- the body is bound at CREATE: the referencing statement's CTE does not capture `t` -------------
+
+query I nosort
+WITH t AS (SELECT 99 AS a, 'q' AS b, 99 AS c) SELECT count(*) FROM v
+----
+2
+
+# --- body forms: ORDER BY / LIMIT, WITH RECURSIVE, set operations, correlated subqueries ----------
+
+statement ok
+CREATE VIEW vtop AS SELECT a FROM t ORDER BY a DESC LIMIT 2
+
+query I nosort
+SELECT * FROM vtop ORDER BY a
+----
+2
+3
+
+statement ok
+CREATE VIEW vr AS WITH RECURSIVE r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r
+
+query I nosort
+SELECT * FROM vr ORDER BY n
+----
+1
+2
+3
+
+statement ok
+CREATE VIEW vu AS SELECT a FROM t WHERE a = 1 UNION SELECT a FROM t WHERE a = 3
+
+query I rowsort
+SELECT * FROM vu
+----
+1
+3
+
+statement ok
+CREATE VIEW vc AS SELECT o.a, (SELECT count(*) FROM t AS i WHERE i.a <= o.a) AS rnk FROM t AS o
+
+query II nosort
+SELECT * FROM vc ORDER BY a
+----
+1
+1
+2
+2
+3
+3
+
+# --- USING / NATURAL join bodies, with `*` and `rel.*` -----------------------------------------------
+
+statement ok
+CREATE TABLE u (a i32 PRIMARY KEY, e text)
+
+statement ok
+INSERT INTO u VALUES (1, 'one'), (3, 'three')
+
+statement ok
+CREATE VIEW vj AS SELECT * FROM t JOIN u USING (a)
+
+# names: a, b, c, e
+query ITIT nosort
+SELECT * FROM vj ORDER BY a
+----
+1
+x
+10
+one
+3
+z
+NULL
+three
+
+statement ok
+CREATE VIEW vn AS SELECT * FROM t NATURAL JOIN u
+
+# names: a, b, c, e
+query ITIT nosort
+SELECT * FROM vn ORDER BY a
+----
+1
+x
+10
+one
+3
+z
+NULL
+three
+
+statement ok
+CREATE VIEW vq AS SELECT u.*, t.b FROM t JOIN u ON u.a = t.a
+
+# names: a, e, b
+query ITT nosort
+SELECT * FROM vq ORDER BY a
+----
+1
+one
+x
+3
+three
+z
+
+# --- `*` is frozen at CREATE: a column added later does not appear in the view ---------------------
+
+statement ok
+ALTER TABLE t ADD COLUMN d i32
+
+statement ok
+ALTER TABLE u ADD COLUMN f i32
+
+# names: a, b, c
+query ITI nosort
+SELECT * FROM v ORDER BY a
+----
+1
+x
+10
+2
+y
+20
+
+# names: a, b, c, e
+query ITIT nosort
+SELECT * FROM vj WHERE a = 1
+----
+1
+x
+10
+one
+
+# names: a, e, b
+query ITT nosort
+SELECT * FROM vq WHERE a = 3
+----
+3
+three
+z
+
+# an unreferenced column can be dropped again
+statement ok
+ALTER TABLE t DROP COLUMN d
+
+statement ok
+ALTER TABLE u DROP COLUMN f
+
+# --- CREATE errors -----------------------------------------------------------------------------------
+
+# the name is taken in the shared relation namespace
+statement error 42P07
+CREATE VIEW v AS SELECT 1 AS one
+
+statement error 42P07
+CREATE VIEW t AS SELECT 1 AS one
+
+statement error 42P07
+CREATE TABLE v (x i32)
+
+statement error 42P07
+CREATE SEQUENCE v
+
+statement error 42P07
+CREATE INDEX v ON t (b)
+
+# body errors surface first, even when the name is taken
+statement error 42P01
+CREATE VIEW v AS SELECT * FROM nosuch
+
+statement error 42P01
+CREATE VIEW nv AS SELECT * FROM nosuch
+
+statement error 42703
+CREATE VIEW nv AS SELECT nosuch FROM t
+
+statement error 42601
+CREATE VIEW nv (x, y, z) AS SELECT 1 AS one
+
+statement error 42701
+CREATE VIEW nv AS SELECT a, a FROM t
+
+statement error 42701
+CREATE VIEW nv (x, x) AS SELECT a, b FROM t
+
+statement error 42701
+CREATE VIEW nv AS SELECT 1, 2
+
+statement error 42P02
+CREATE VIEW nv AS SELECT $1
+
+statement error 0A000
+CREATE VIEW nv AS WITH d AS (INSERT INTO t VALUES (9, 'q', 9) RETURNING *) SELECT * FROM d
+
+# --- the view is the wrong kind for table / index / sequence statements -----------------------------
+
+statement error 42809
+DROP TABLE v
+
+statement error 42809
+DROP TABLE IF EXISTS v
+
+statement error 42809
+DROP VIEW t
+
+statement error 42809
+DROP VIEW IF EXISTS t
+
+statement error 42809
+DROP INDEX v
+
+statement error 42809
+CREATE INDEX ON v (a)
+
+statement error 42809
+CREATE TABLE child (r i32 REFERENCES v (a))
+
+statement error 42809
+ALTER TABLE v ADD COLUMN z i32
+
+statement ok
+ANALYZE v
+
+# a view that is not automatically updatable refuses every write with 55000
+statement error 55000
+INSERT INTO vagg VALUES ('q', 1, 1)
+
+statement error 55000
+UPDATE vagg SET total = 1
+
+statement error 55000
+DELETE FROM vagg
+
+# --- dependencies: RESTRICT ---------------------------------------------------------------------------
+
+statement error 2BP01
+DROP TABLE t
+
+statement error 2BP01
+DROP TABLE u
+
+statement error 2BP01
+ALTER TABLE t DROP COLUMN c
+
+statement error 2BP01
+ALTER TABLE u DROP COLUMN e
+
+statement error 0A000
+ALTER TABLE t ALTER COLUMN c TYPE i64
+
+statement error 2BP01
+DROP VIEW v2
+
+statement error 2BP01
+DROP VIEW w
+
+statement error 2BP01
+DROP VIEW v
+
+# a dependent in the same drop set does not block, in either order
+statement ok
+DROP VIEW ww, w
+
+statement ok
+DROP VIEW v2, v3
+
+# --- DROP VIEW: missing names, IF EXISTS, dedup, all-or-nothing, CASCADE with no dependent --------
+
+statement error 42P01
+DROP VIEW nosuch
+
+statement ok
+DROP VIEW IF EXISTS nosuch
+
+statement error 42P01
+DROP VIEW vr, nosuch
+
+query I nosort
+SELECT count(*) FROM vr
+----
+3
+
+statement ok
+DROP VIEW IF EXISTS nosuch, vr
+
+statement error 42P01
+SELECT * FROM vr
+
+statement ok
+DROP VIEW vtop, vtop
+
+statement ok
+DROP VIEW vu CASCADE
+
+statement ok
+DROP VIEW vc RESTRICT
+
+# the name is free again
+statement ok
+CREATE VIEW vu AS SELECT b FROM t WHERE a = 2
+
+query T nosort
+SELECT * FROM vu
+----
+y
+
+# --- dropping every dependent frees the tables -------------------------------------------------------
+
+statement ok
+DROP VIEW v, vexpr, vagg, vj, vn, vq, vu
+
+statement ok
+ALTER TABLE t DROP COLUMN c
+
+statement ok
+DROP TABLE t, u

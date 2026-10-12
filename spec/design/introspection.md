@@ -92,7 +92,7 @@ attached-database model already provides for free.
 ## 4. The `jed_` name reservation — normative, implemented
 
 **Rule.** A **user-supplied** name for an object in the **relation namespace** — a table
-(persistent, `TEMP`, or in an attached database), an index, or a sequence
+(persistent, `TEMP`, or in an attached database), a view, an index, or a sequence
 ([sequences.md](sequences.md) §2: one shared namespace) — or in the **type namespace** (a
 composite type, [composite.md](composite.md)) must not begin with `jed_`. The check is on the
 **name** — the byte string after identifier folding (grammar.md §3) — and is **byte-exact**: a
@@ -103,7 +103,7 @@ different name that does not begin with `jed_` and is **allowed** — PostgreSQL
 byte-exact, so `"JED_TABLES"` can never shadow or be shadowed by `jed_tables`.
 Violation is **`42939 reserved_name`** (PG's own code — PG uses it for the `pg_` schema prefix),
 message `{kind} name {name} is reserved (the jed_ prefix is reserved for system objects)` with
-*kind* ∈ `table` / `index` / `sequence` / `type` / `constraint` and the (folded) name.
+*kind* ∈ `table` / `view` / `index` / `sequence` / `type` / `constraint` and the (folded) name.
 
 **Checked sites** — every statement that introduces a user-supplied name into either namespace:
 
@@ -111,6 +111,7 @@ message `{kind} name {name} is reserved (the jed_ prefix is reserved for system 
 |---|---|
 | `CREATE TABLE` (all scopes: bare, `TEMP`, `main.`/`temp.`/attachment-qualified; incl. `IF NOT EXISTS`, **not** suppressed) | the table name |
 | `CREATE INDEX name ON …` | the **explicit** index name only |
+| `CREATE VIEW` (incl. `IF NOT EXISTS`, **not** suppressed — [views.md](views.md) §1.1) | the view name |
 | `CREATE SEQUENCE` (incl. `IF NOT EXISTS` — reservation is not a collision, so it is **not** suppressed) | the sequence name |
 | `CREATE TYPE … AS (…)` | the type name |
 | `ALTER SEQUENCE … RENAME TO` | the **new** name |
@@ -441,6 +442,25 @@ another parallel array.
 name byte order. `jed_types`: ascending name byte order. `jed_type_fields`: types in ascending
 name byte order, then ordinal.
 
+## 5.4 `jed_views` (views V1) — specified
+
+```
+jed_views(
+  name        text   NOT NULL,  -- the view name (exact, grammar.md §3)
+  definition  text   NOT NULL,  -- the stored canonical definition (views.md §3/§5/§7)
+  columns     text[] NOT NULL   -- the output column names, in order
+)
+```
+
+One row per view of the qualified database, generated in ascending name byte order, with every
+§5 gate inherited unchanged (resolution, scoping, read-only `42809` — including `DROP VIEW
+jed_views` — privileges, `generated_row` cost, `EXPLAIN` `Catalog Scan jed_views`). The definition is
+the stored text, not a deparse: keywords lowercase, tokens single-spaced, every expanded `*` frozen
+into quoted references, and `RENAME` rewrites visible. Views are **not** rows of `jed_tables` or
+`jed_columns` (PostgreSQL's `pg_tables`/`pg_views` split); a view's column types are not catalog
+facts ([views.md](views.md) §3/§11). Corpus: `suites/introspection/jed_views.test` and
+`jed_views_rename.test`.
+
 ## 6. The host API carries no introspection convenience
 
 **Decision (2026-07-04): the host handle exposes no schema-introspection convenience — introspection
@@ -486,5 +506,6 @@ The later relations' own errors (if any new arise) are pinned by their implement
 | **I1** | `jed_tables` + `jed_columns`: resolution funnel interception (CTE-shadow / built-in-first / qualifier scoping), computed-relation execution riding the SRF plan shape, privilege gating, the 42809 read-only rejections, `generated_row` cost pinning (cost.md), `EXPLAIN` `Catalog Scan`, capabilities `introspect.tables`/`introspect.columns`, the canonical-type-text corpus (`suites/introspection/`, 4 files incl. temp + attachment scoping), `/web` docs | ✅ landed |
 | **I2** | `jed_indexes` + `jed_constraints` (§5.1): two more built-in-name-classifier entries + two row generators (every gate inherited from I1), the `text[]` member-list columns, the CHECK `expression` from the persisted canonical text, capabilities `introspect.indexes`/`introspect.constraints`, corpus (`suites/introspection/jed_indexes.test` + `jed_constraints.test`), cost.md worked examples, `/web` docs | ✅ landed |
 | **P9** | `jed_statistics` (§5.2): one summary row per analyzed column, qualified-domain scoping, stale/NDV/width/count visibility, capability `introspect.statistics`, corpus + `/web` docs | ✅ landed with column statistics |
+| **V1** | `jed_views` (§5.4), capability `introspect.views`, `/web` docs | specified ([views.md](views.md)) |
 | **I3** | `jed_sequences` + `jed_types` + `jed_type_fields` (§5.3): three classifier entries + three row generators (every gate inherited from I1), PG `pg_sequences`-spelled sequence columns with the `OWNED BY` link, composite types with their fields as a separate relation, capabilities `introspect.sequences`/`introspect.types`/`introspect.type_fields`, corpus (`suites/introspection/jed_sequences.test` + `jed_sequences_txn.test` + `jed_types.test`, temp + attachment scoping), cost.md worked examples, `/web` docs | ✅ landed |
 | — | `information_schema` compat views over the `jed_` relations | door open, **not planned** |

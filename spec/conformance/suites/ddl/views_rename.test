@@ -1,0 +1,234 @@
+# RENAME and DROP COLUMN under views (spec/design/views.md §7). jed stores a view as text bound by
+# name, so ALTER TABLE … RENAME TO rewrites the FROM items that bind the table (keeping their
+# label), RENAME COLUMN gives each FROM item a column alias list that keeps the old names visible,
+# and DROP COLUMN of an unreferenced column removes that column's alias entry. The observable result
+# is PostgreSQL's (whose views are bound by object id): the view keeps working and keeps its column
+# names. Every record is PostgreSQL-oracle-checked; the rewritten text is pinned by
+# introspection/jed_views_rename.test.
+# requires: ddl.view, ddl.view_rename, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.alter_table, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.join_using, query.aggregates, query.table_alias, query.qualified_column, query.cte, query.subquery_scalar, query.subquery_correlated, types.i32, types.i64, types.text
+
+statement ok
+CREATE TABLE t (a i32 PRIMARY KEY, b text, c i32)
+
+statement ok
+INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20), (3, 'z', NULL)
+
+statement ok
+CREATE VIEW v AS SELECT * FROM t WHERE t.c > 5
+
+statement ok
+CREATE VIEW v2 AS SELECT x.b FROM t AS x WHERE x.a = 2
+
+statement ok
+CREATE VIEW v3 AS SELECT a, c FROM t
+
+# the CTE body's FROM t is the table; the outer FROM t is the CTE
+statement ok
+CREATE VIEW vcte AS WITH t AS (SELECT a FROM t WHERE a < 3) SELECT count(*) AS n FROM t
+
+# --- RENAME TO -----------------------------------------------------------------------------------------
+
+statement ok
+ALTER TABLE t RENAME TO t2
+
+statement error 42P01
+SELECT * FROM t
+
+# names: a, b, c
+query ITI nosort
+SELECT * FROM v ORDER BY a
+----
+1
+x
+10
+2
+y
+20
+
+query T nosort
+SELECT * FROM v2
+----
+y
+
+query I nosort
+SELECT * FROM vcte
+----
+2
+
+# the dependency follows the rename
+statement error 2BP01
+DROP TABLE t2
+
+# a new table may now take the old name; the views still read t2
+statement ok
+CREATE TABLE t (a i32 PRIMARY KEY, b text, c i32)
+
+query I nosort
+SELECT count(*) FROM v3
+----
+3
+
+statement ok
+DROP TABLE t
+
+# --- RENAME COLUMN: the view keeps the old column names -----------------------------------------------
+
+statement ok
+ALTER TABLE t2 RENAME COLUMN c TO cc
+
+# names: a, b, c
+query ITI nosort
+SELECT * FROM v ORDER BY a
+----
+1
+x
+10
+2
+y
+20
+
+# names: a, c
+query II nosort
+SELECT * FROM v3 ORDER BY a
+----
+1
+10
+2
+20
+3
+NULL
+
+statement ok
+ALTER TABLE t2 RENAME COLUMN a TO aa
+
+query T nosort
+SELECT * FROM v2
+----
+y
+
+query I nosort
+SELECT * FROM vcte
+----
+2
+
+# the dependencies follow the renamed columns
+statement error 2BP01
+ALTER TABLE t2 DROP COLUMN cc
+
+statement error 0A000
+ALTER TABLE t2 ALTER COLUMN cc TYPE i64
+
+# a second RENAME TO after column renames
+statement ok
+ALTER TABLE t2 RENAME TO t3
+
+# names: a, b, c
+query ITI nosort
+SELECT * FROM v WHERE a = 2
+----
+2
+y
+20
+
+# --- DROP COLUMN of an unreferenced column after a rename shifts the alias list -------------------
+
+statement ok
+CREATE TABLE r (a i32 PRIMARY KEY, junk i32, b text)
+
+statement ok
+INSERT INTO r VALUES (1, 100, 'one'), (2, 200, 'two')
+
+statement ok
+CREATE VIEW rv AS SELECT a, b FROM r
+
+statement ok
+ALTER TABLE r RENAME COLUMN b TO bb
+
+statement ok
+ALTER TABLE r DROP COLUMN junk
+
+# names: a, b
+query IT nosort
+SELECT * FROM rv ORDER BY a
+----
+1
+one
+2
+two
+
+statement ok
+ALTER TABLE r ADD COLUMN junk i32
+
+statement ok
+ALTER TABLE r RENAME COLUMN junk TO b
+
+# names: a, b
+query IT nosort
+SELECT * FROM rv ORDER BY a
+----
+1
+one
+2
+two
+
+# --- a rename never captures a view's reference -----------------------------------------------------
+
+statement ok
+CREATE TABLE p (k i32 PRIMARY KEY, x i32)
+
+statement ok
+CREATE TABLE q (k i32 PRIMARY KEY, y i32)
+
+statement ok
+INSERT INTO p VALUES (1, 1), (2, 5)
+
+statement ok
+INSERT INTO q VALUES (1, 0), (2, 0), (3, 0)
+
+statement ok
+CREATE VIEW cap AS SELECT k, (SELECT count(*) FROM q WHERE q.k <= x) AS n FROM p
+
+statement ok
+ALTER TABLE q RENAME COLUMN y TO x
+
+query II nosort
+SELECT * FROM cap ORDER BY k
+----
+1
+1
+2
+3
+
+# --- a USING join keeps matching on the old names -----------------------------------------------------
+
+statement ok
+CREATE TABLE m (id i32 PRIMARY KEY, mv text)
+
+statement ok
+CREATE TABLE n (id i32 PRIMARY KEY, nv text)
+
+statement ok
+INSERT INTO m VALUES (1, 'm1'), (2, 'm2')
+
+statement ok
+INSERT INTO n VALUES (2, 'n2'), (3, 'n3')
+
+statement ok
+CREATE VIEW mn AS SELECT * FROM m JOIN n USING (id)
+
+statement ok
+ALTER TABLE m RENAME COLUMN id TO mid
+
+# names: id, mv, nv
+query ITT nosort
+SELECT * FROM mn
+----
+2
+m2
+n2
+
+statement ok
+DROP VIEW v, v2, v3, vcte, rv, cap, mn
+
+statement ok
+DROP TABLE t3, r, p, q, m, n

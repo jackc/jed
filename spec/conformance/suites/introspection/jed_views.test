@@ -1,0 +1,191 @@
+# The jed_views catalog relation (spec/design/views.md §11, introspection.md §5.4) and the stored
+# canonical definition (views.md §3/§5): `name text`, `definition text`, `columns text[]`, one row per
+# view. The definition is the body's token sequence rendered by format.md's per-token table (bare
+# words folded, single spaces, comments gone) with every expanded `*` frozen into quoted
+# `"label" . "column"` references (bare `"column"` for an unlabelled relation or a USING merge).
+# Views are not listed in jed_tables or jed_columns. Scoping, read-only rejection, privileges, and
+# cost follow jed_tables. jed-specific, so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# requires: introspect.views, introspect.tables, introspect.columns, ddl.view, ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.join_using, query.qualified_star, query.subquery_exists, query.derived_table, query.cte, query.explain, session.privileges, resource.cost_metering, types.i32, types.text
+
+# --- an empty database lists no views ----------------------------------------------------------------
+
+query T rowsort
+SELECT name FROM jed_views
+----
+
+statement ok
+CREATE TABLE t (a i32 PRIMARY KEY, b text, c i32)
+
+statement ok
+CREATE TABLE u (a i32 PRIMARY KEY, e text)
+
+# --- `*` is frozen into quoted, qualified column references ----------------------------------------
+
+statement ok
+CREATE VIEW v AS SELECT * FROM t WHERE c > 5
+
+query TTT nosort
+SELECT name, definition, columns FROM jed_views WHERE name = 'v'
+----
+v
+select "t" . "a" , "t" . "b" , "t" . "c" from t where c > 5
+{a,b,c}
+
+# a column list renames the stored output columns; the body text is unchanged
+statement ok
+CREATE VIEW v2 (p, q) AS SELECT a, b FROM t
+
+query TT nosort
+SELECT definition, columns FROM jed_views WHERE name = 'v2'
+----
+select a , b from t
+{p,q}
+
+# rel.* under an alias, over another view
+statement ok
+CREATE VIEW w AS SELECT x.* FROM v2 AS x
+
+query TT nosort
+SELECT definition, columns FROM jed_views WHERE name = 'w'
+----
+select "x" . "p" , "x" . "q" from v2 as x
+{p,q}
+
+# an unlabelled derived table's columns and a USING merge column render bare
+statement ok
+CREATE VIEW d AS SELECT * FROM (SELECT a AS k FROM t)
+
+query T nosort
+SELECT definition FROM jed_views WHERE name = 'd'
+----
+select "k" from ( select a as k from t )
+
+statement ok
+CREATE VIEW j AS SELECT * FROM t JOIN u USING (a)
+
+query TT nosort
+SELECT definition, columns FROM jed_views WHERE name = 'j'
+----
+select "a" , "t" . "b" , "t" . "c" , "u" . "e" from t join u using ( a )
+{a,b,c,e}
+
+# a `*` inside a subquery and inside a CTE body is frozen too
+statement ok
+CREATE VIEW e AS WITH cte AS (SELECT * FROM u) SELECT a FROM t WHERE EXISTS (SELECT * FROM cte WHERE cte.a = t.a)
+
+query T nosort
+SELECT definition FROM jed_views WHERE name = 'e'
+----
+with cte as ( select "u" . "a" , "u" . "e" from u ) select a from t where exists ( select "cte" . "a" , "cte" . "e" from cte where cte . a = t . a )
+
+# --- canonical rendering: keywords and bare names fold, quoted names stay quoted, literals render
+# canonically, comments are dropped ------------------------------------------------------------------
+
+statement ok
+CREATE VIEW "Mixed" AS SELECT B AS "Bee", 'it''s' AS s, 1.50 AS d -- a comment
+  FROM T WHERE A != 2 /* another */ AND C IS NOT NULL
+
+query TT nosort
+SELECT definition, columns FROM jed_views WHERE name = 'Mixed'
+----
+select b as "Bee" , 'it''s' as s , 1.50 as d from t where a <> 2 and c is not null
+{Bee,s,d}
+
+# --- one row per view, in any order; views are not tables and have no jed_columns rows -------------
+
+query T rowsort
+SELECT name FROM jed_views
+----
+Mixed
+d
+e
+j
+v
+v2
+w
+
+query T rowsort
+SELECT name FROM jed_tables
+----
+t
+u
+
+query T rowsort
+SELECT DISTINCT table_name FROM jed_columns
+----
+t
+u
+
+# --- scope: the temp domain has no views; an unknown qualifier is 42P01 -----------------------------
+
+query T rowsort
+SELECT name FROM temp.jed_views
+----
+
+query I nosort
+SELECT count(*) FROM main.jed_views
+----
+7
+
+statement error 42P01
+SELECT name FROM nosuchdb.jed_views
+
+# --- read-only, and its name is reserved ---------------------------------------------------------------
+
+statement error 42809
+INSERT INTO jed_views VALUES ('x', 'select 1', '{x}')
+
+statement error 42809
+DROP VIEW jed_views
+
+statement error 42809
+DROP VIEW IF EXISTS jed_views
+
+statement error 42939
+CREATE VIEW jed_views AS SELECT 1 AS one
+
+# --- cost: one generated_row per produced row; no page is read ---------------------------------------
+
+# 7 views: 7 generated_row + 7 row_produced = 14
+# cost: 14
+query T rowsort
+SELECT name FROM jed_views
+----
+Mixed
+d
+e
+j
+v
+v2
+w
+
+query ITTII nosort
+EXPLAIN SELECT name FROM jed_views
+----
+0
+Catalog Scan jed_views
+db=main
+7
+14
+
+# --- privileges: gated like a user table -----------------------------------------------------------
+
+# default_privileges: NONE
+statement error 42501
+SELECT name FROM jed_views
+
+# default_privileges: NONE
+# grant: SELECT ON jed_views
+query I nosort
+SELECT count(*) FROM jed_views
+----
+7
+
+# --- dropping a view removes its row --------------------------------------------------------------
+
+statement ok
+DROP VIEW "Mixed", d, e, j, w, v2, v
+
+query T rowsort
+SELECT name FROM jed_views
+----

@@ -1,0 +1,134 @@
+# The stored view text after RENAME / DROP COLUMN rewrites (spec/design/views.md §7). Each rewrite
+# is a token edit on the stored definition: RENAME TO replaces the table-name token of every FROM
+# item that binds the table with the quoted new name and, when the item had no alias, inserts
+# `as "<old name>"` so its label is unchanged; RENAME COLUMN gives every such item a quoted column
+# alias list covering positions 0..k with the names it exposed before the rename (inserting the
+# alias first when there is none); DROP COLUMN of an unreferenced column removes its entry from a
+# list that reaches it. A FROM item that binds a CTE is never touched. jed-specific, so
+# CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# requires: introspect.views, ddl.view, ddl.view_rename, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.alter_table, dml.insert, query.select, query.where_eq, query.order_by, query.table_alias, query.qualified_column, query.qualified_table, query.cte, query.aggregates, types.i32, types.text
+
+statement ok
+CREATE TABLE t (a i32 PRIMARY KEY, b text, c i32)
+
+statement ok
+INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20)
+
+statement ok
+CREATE VIEW v AS SELECT b FROM t WHERE t.a > 1
+
+statement ok
+CREATE VIEW vx AS SELECT x.b FROM t x
+
+statement ok
+CREATE VIEW vm AS SELECT a FROM main.t
+
+statement ok
+CREATE VIEW vcte AS WITH t AS (SELECT a FROM t) SELECT count(*) AS n FROM t
+
+# --- RENAME TO -------------------------------------------------------------------------------------
+
+statement ok
+ALTER TABLE t RENAME TO t2
+
+query TT nosort
+SELECT name, definition FROM jed_views ORDER BY name
+----
+v
+select b from "t2" as "t" where t . a > 1
+vcte
+with t as ( select a from "t2" as "t" ) select count ( * ) as n from t
+vm
+select a from main . "t2" as "t"
+vx
+select x . b from "t2" x
+
+query T nosort
+SELECT * FROM v
+----
+y
+
+query I nosort
+SELECT * FROM vm ORDER BY a
+----
+1
+2
+
+query I nosort
+SELECT * FROM vcte
+----
+2
+
+# --- RENAME COLUMN: a quoted alias list freezes positions 0..k ---------------------------------------
+
+statement ok
+ALTER TABLE t2 RENAME COLUMN c TO cc
+
+query TT nosort
+SELECT name, definition FROM jed_views ORDER BY name
+----
+v
+select b from "t2" as "t" ( "a" , "b" , "c" ) where t . a > 1
+vcte
+with t as ( select a from "t2" as "t" ( "a" , "b" , "c" ) ) select count ( * ) as n from t
+vm
+select a from main . "t2" as "t" ( "a" , "b" , "c" )
+vx
+select x . b from "t2" x ( "a" , "b" , "c" )
+
+# a rename of an earlier column leaves a list that already covers it unchanged
+statement ok
+ALTER TABLE t2 RENAME COLUMN a TO aa
+
+query T nosort
+SELECT definition FROM jed_views WHERE name = 'vm'
+----
+select a from main . "t2" as "t" ( "a" , "b" , "c" )
+
+query I nosort
+SELECT * FROM vm ORDER BY a
+----
+1
+2
+
+# --- an item with no alias gets one before its list; DROP COLUMN removes an unreferenced entry -----
+
+statement ok
+CREATE TABLE r (a i32 PRIMARY KEY, junk i32, b text)
+
+statement ok
+CREATE VIEW rv AS SELECT a, b FROM r
+
+statement ok
+ALTER TABLE r RENAME COLUMN b TO bb
+
+query T nosort
+SELECT definition FROM jed_views WHERE name = 'rv'
+----
+select a , b from r as "r" ( "a" , "junk" , "b" )
+
+statement ok
+ALTER TABLE r DROP COLUMN junk
+
+query T nosort
+SELECT definition FROM jed_views WHERE name = 'rv'
+----
+select a , b from r as "r" ( "a" , "b" )
+
+# a column past the list needs no edit
+statement ok
+ALTER TABLE r ADD COLUMN extra i32
+
+statement ok
+ALTER TABLE r DROP COLUMN extra
+
+query T nosort
+SELECT definition FROM jed_views WHERE name = 'rv'
+----
+select a , b from r as "r" ( "a" , "b" )
+
+statement ok
+DROP VIEW v, vx, vm, vcte, rv
+
+statement ok
+DROP TABLE t2, r

@@ -17,7 +17,13 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 37)
+## Version scope (`format_version` 38)
+
+`format_version` **38** — **views** ([../design/views.md](../design/views.md)). The catalog stream
+gains `entry_kind = 5` view entries, emitted **last** (after the statistics group) in ascending byte
+order of the view name (*View entry* below). A view owns no B-tree and no page of its own. No other
+byte layout changes, so a file with no view changes only by its version byte + meta CRC. Readers
+accept only the exact current version.
 
 `format_version` **37** — **exact (folded) identifier names**
 ([../design/grammar.md §3](../design/grammar.md)). No byte layout changes; the *meaning* of every
@@ -702,13 +708,14 @@ B-tree root moves). Its **encoding is byte-identical to v1**; only its location 
 (`root_page`) and `root_data_page` now points at a **B-tree root node** instead of a record
 chain head.
 
-**Each catalog entry is kind-tagged (v9, extended v12/v18/v29):** a leading `entry_kind` u8 — `0` = a
+**Each catalog entry is kind-tagged (v9, extended v12/v18/v29/v38):** a leading `entry_kind` u8 — `0` = a
 table entry, `1` = a composite-type entry ([../design/composite.md §3](../design/composite.md)), `2` =
 a sequence entry ([../design/sequences.md §3](../design/sequences.md)), `3` = a collation reference entry
 ([../design/collation.md §5](../design/collation.md)), `4` = a column-statistics entry
-([../design/statistics.md §7](../design/statistics.md)). Entries are emitted in kind order
-**composite-type (1), then sequence (2), then collation (3), table (0), then statistics (4)**, each
-object group in ascending
+([../design/statistics.md §7](../design/statistics.md)), `5` = a view entry
+([../design/views.md §3](../design/views.md)). Entries are emitted in kind order
+**composite-type (1), then sequence (2), then collation (3), table (0), then statistics (4), then
+view (5)**, each object group in ascending
 name byte order (v37: every group, collations included, sorts by its exact name). Each page's `item_count` is the number of entries (of any kind) it holds;
 entries are packed greedily into the chain, kind-tagged in stream order, exactly as table entries
 were through v8 (a single entry must fit one page, i.e. ≤ `C`, else `0A000`; the `RECORD_MAX = C/2`
@@ -887,6 +894,40 @@ comparison key no longer than 128 bytes. Distribution-ineligible summaries have 
 items. MCV values are distinct and ordered by descending frequency then comparison key; histogram
 bounds are nondecreasing. Bad flags/counts/order/references/types/bytes are `XX001`.
 
+### View entry (`entry_kind = 5`, v38)
+
+A view entry records a `CREATE VIEW` definition ([../design/views.md](../design/views.md)). It owns
+no B-tree.
+
+| field | encoding |
+|---|---|
+| `entry_kind` | u8 = `5` |
+| `name_len` | u16 |
+| `name` | `name_len` bytes UTF-8 — the exact view name |
+| `col_count` | u16 — ≥ 1 |
+| per output column (×`col_count`): | |
+| &nbsp;&nbsp;`col_name_len` | u16 — ≥ 1 |
+| &nbsp;&nbsp;`col_name` | UTF-8 — the output column name, in output order |
+| `def_len` | u32 |
+| `def` | `def_len` bytes UTF-8 — the definition: the body's canonical token text (*Check-expression text* below) after `*` expansion and `RENAME` rewrites (views.md §5/§7) |
+| `dep_count` | u16 — the tables and views the body reads (≥ 1 is not required: a body over only CTEs, `VALUES`, functions, or `jed_` relations has none) |
+| per dependency (×`dep_count`): | |
+| &nbsp;&nbsp;`dep_kind` | u8 — `0` = table, `1` = view; other values `XX001` |
+| &nbsp;&nbsp;`dep_name_len` | u16 |
+| &nbsp;&nbsp;`dep_name` | UTF-8 — the exact table or view name, in the same database |
+| &nbsp;&nbsp;`dep_col_count` | u16 — `0` for a view dependency (a non-zero count there is `XX001`); for a table, the number of its referenced columns (may be `0`, e.g. `SELECT count(*) FROM t`) |
+| &nbsp;&nbsp;per referenced column (×`dep_col_count`): `u16` length + UTF-8 | the exact column name |
+
+Dependencies are emitted in ascending byte order of `dep_name` (a table and a view cannot share a
+name). Each dependency's columns are emitted in ascending byte order of the column name. Output
+columns are emitted in output order. The reader trusts these orders and rejects, as `XX001`:
+a dependency naming no table or view of its kind in this catalog, a listed column missing from its
+table, a dependency on the view itself or any cycle through view dependencies, an empty or
+duplicate output column name, a duplicate dependency or column, and a `def` that does not parse as
+a `subquery_expr`. The definition is **parsed but not planned** at open (views.md §3). A commit
+writes the retained text and lists back verbatim, so the bytes are stable across create → commit →
+load → commit.
+
 ### Composite-type entry (`entry_kind = 1`, v9)
 
 A composite-type entry records a `CREATE TYPE name AS (field type, …)` definition
@@ -994,7 +1035,7 @@ at open.
 | decimal literal `(coeff, scale)` | the digit string `coeff` with `.` inserted `scale` digits from the right — `("150", 2)` → `1.50`, `("5", 1)` → `.5`, `("1", 0)` → `1.` (always contains the `.`, so it re-lexes as a decimal) |
 | string literal | `'` + content with each `'` doubled + `'` |
 | bind parameter | `$N` (unreachable in a *stored* check — rejected at CREATE TABLE, 42P02) |
-| punctuation / operators | their fixed spelling: `,` `.` `(` `)` `*` `+` `-` `/` `%` `=` `<` `>` `<=` `>=` |
+| punctuation / operators | their one canonical spelling: `,` `.` `(` `)` `[` `]` `:` `::` `*` `+` `-` `/` `%` `=` `<>` (also for `!=`) `<` `>` `<=` `>=` `=>` `\|\|` `@>` `<@` `&&` `@?` `@@` `<<` `>>` `&<` `&>` `-\|-` `->` `->>` `#>` `#>>` `?` `?\|` `?&` `#-` `~` `~*` `!~` `!~*` — every token the lexer produces, so a whole view body (v38) renders by the same table |
 
 Example: `CHECK (a>0 AND b IS NOT NULL)` persists as `a > 0 and b is not null`; `CHECK
 (price * qty <= 10000.00)` persists as `price * qty <= 10000.00`; `CHECK ("Qty" > 0)` persists as
@@ -1616,6 +1657,7 @@ the interior-node format and the split contract.
 | `partial_index_table.jed` | **partial-index predicates** (v27) — the `index_flags` bit1 + the predicate canonical text after `index_root_page`: a plain partial index `t_amt_idx` (`WHERE status = 'active'`) beside a `UNIQUE` partial index `t_uact` (`WHERE status = 'active'`) and a non-partial index `t_status_idx` (bit1 clear, byte-identical to v26) in one catalog; the table is empty, so all three trees are empty (root 0) and the fixture isolates the v27 catalog change ([../design/indexes.md §9](../design/indexes.md)) |
 | `gin_array_table.jed` | **GIN inverted index** (v13) — the per-index `index_kind` byte: a `USING gin` index over an `i32[]` column (rows with multi-element, duplicate-element, empty, and NULL arrays — exercising term dedup and the zero-entry cases; entries are `encode(elem) ‖ storage-key`, empty payload — [../design/gin.md §4](../design/gin.md)) beside one ordinary ordered index (`index_kind = 0`) in the same catalog |
 | `gin_uuid_table.jed` | **GIN over a non-integer element type** (no version bump — `uuid` is a fixed-width key encoding already on disk) — a `USING gin` index over a `uuid[]` column: each GIN term is the element's 16-byte `uuid-raw16` key encoding, so entries are `encode_uuid(elem) ‖ storage-key` (empty payload — [../design/gin.md §3/§4](../design/gin.md)). Same row shape as `gin_array_table` (term dedup, empty/NULL arrays, a NULL element), pinning that a uuid-element GIN serializes byte-identically across cores |
+| `view_table.jed` | **views** (v38) — a table `t(a, b)` with two rows and three views: `v` = `SELECT * FROM t WHERE a > 0` (its stored text shows the frozen `"t" . "a" , "t" . "b"` expansion; dependency on `t` columns `a`, `b`), `w (x) AS SELECT a FROM v` (a column-list rename, a view dependency with no column list), and `n AS SELECT count(*) AS c FROM t` (a table dependency with zero columns); entries emitted after the table entry in name order `n`, `v`, `w` ([../design/views.md](../design/views.md)) |
 | `check_table.jed` | **`CHECK` constraints** (v4) — the catalog check list: an auto-named single-column check, an explicitly-named multi-column check, and a check whose text exercises the token rendering (string + decimal literals, `<=`); stored in name order |
 | `hostfunc_check_table.jed` | **host-function check dependencies** (v35) — `t_a_check` with `check_flags` 0 beside `t_a_check1`, which calls the host function `geo_hash(i64) -> i64` (component `com.example/geo_hash`, semantic version 1) and so carries flags 1 + the dependency list (empty table) |
 | `tall_tree.jed` | enough small int rows to force a **two-level interior** (height-2 tree) — exercises interior-of-interior child pointers and post-order page allocation |

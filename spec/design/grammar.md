@@ -672,8 +672,10 @@ either mode: dropping the referencing table removes the dependency, so `DROP TAB
 child` (or `child, parent`) succeeds even under `RESTRICT`. The drop-set exclusion — a
 dependent that is *itself* being dropped does not count — is what the two-phase resolve buys.
 
-**Still narrowed (relaxable later, §5).** `CASCADE` reaches only FK dependents (the one
-cross-table dependency kind today); views and other dependency classes do not exist yet.
+**Still narrowed (relaxable later, §5).** `CASCADE` reaches only FK dependents. A **view** that
+reads a table being dropped always blocks the drop: `2BP01` under `RESTRICT`, `0A000` under
+`CASCADE` (dropping dependent views is a follow-on, [views.md](views.md) §6). A view itself is
+dropped with `DROP VIEW` (§54); `DROP TABLE v` of a view is `42809`.
 
 **Cost is zero.** Like `CREATE TABLE`, a drop reads no rows and evaluates no expression
 tree — it is a pure catalog edit — so it accrues zero cost ([cost.md](cost.md)). Removing a
@@ -760,6 +762,19 @@ once"*, [../errors/registry.toml](../errors/registry.toml)), matching PostgreSQL
 therefore written with two distinct aliases (`FROM t AS a JOIN t AS b ON ...`). Labels compare
 byte-exactly after folding (§3), like every other name — `FROM t AS A JOIN u AS a` is `42712`, while
 `FROM t AS "A" JOIN u AS a` is two distinct labels.
+
+**Base-table column alias lists.** An aliased base table (or view, [views.md](views.md) §4) may carry
+a parenthesized **column alias list** after its alias: `FROM t AS x (p, q)`. It renames the table's
+columns left to right **as this FROM item exposes them**, PostgreSQL's rule. A shorter list is a
+partial rename (the remaining columns keep their names). A longer list is **`42P10`** (*table "x"
+has 3 columns available but 4 columns specified*). There is no list without an alias: `FROM t (p)`
+is the table-function form (§35), a call of a function `t`, exactly as in PostgreSQL. The renamed names are the only names that FROM item exposes:
+`x.p` resolves, `x.a` is `42703`, `x.*` and `*` expand under the new names, and a `USING`/`NATURAL`
+join matches on them. The rename is a pure resolution-time relabeling. Storage, access paths, index
+eligibility, cost, and plan are those of the same query written with the original names. A
+duplicate name in the list follows PostgreSQL: it is accepted, and a later bare reference to the
+duplicated name is `42702`. Views use this list to keep seeing a column under its old name after
+`RENAME COLUMN` ([views.md](views.md) §7).
 
 **The database qualifier (`qualified_table`).** `qualified_table ::= (identifier ".")? identifier`
 — an OPTIONAL leading `db "."` names the **attached database** a table lives in (`reports.sales`),
@@ -3151,3 +3166,30 @@ using an unknown option, writing an empty list, or mixing the legacy positional 
 with a parenthesized list is `42601`. These words remain non-reserved: they acquire option meaning
 only between the parentheses immediately following the leading `EXPLAIN`. The result shape and each
 option's behavior are specified in [explain.md](explain.md).
+
+## 54. `CREATE VIEW` / `DROP VIEW` ([views.md](views.md))
+
+```
+CREATE VIEW [IF NOT EXISTS] [main.]name [( col [, …] )] AS subquery_expr
+DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]
+```
+
+`VIEW` is recognized **positionally** after `CREATE` and `DROP` and is not reserved (§3): `CREATE
+TABLE view (…)` names a table `view`, and `SELECT view FROM t` reads a column. The body runs from
+the token after `AS` to the end of the statement and is a `subquery_expr` (an optional `WITH`, then
+a query expression with its own `ORDER BY` / `LIMIT`). Its token sequence is the persisted
+definition, rendered by the closed per-token table of
+[../fileformat/format.md](../fileformat/format.md) *Check-expression text*, after the planner has
+frozen every expanded `*` into an explicit, quoted column list ([views.md](views.md) §3/§5). `IF NOT
+EXISTS` (a jed extension) and `IF EXISTS` are two-token lookaheads, so `CREATE VIEW if AS …` creates a
+view named `if`.
+
+Deferred forms are **recognized** so they fail with `0A000` rather than a syntax error: `CREATE OR
+REPLACE VIEW`, `CREATE TEMP`/`TEMPORARY VIEW`, `CREATE RECURSIVE VIEW`, `CREATE MATERIALIZED VIEW`,
+`CREATE VIEW v WITH ( … )` (view options), a trailing `WITH [CASCADED | LOCAL] CHECK OPTION`, and
+`ALTER VIEW`. Each is detected by its keyword sequence before the body is parsed, except `CHECK
+OPTION`, which is detected after it. Every error code, the validation order, the namespace matrix,
+dependencies, `RENAME` rewrites, and privileges are specified in [views.md](views.md).
+
+A view reference in `FROM` is the equivalent derived table (§42), so §8's output-name rules, §15's
+labels and column alias lists, and §42's column-rename rules apply to it unchanged.

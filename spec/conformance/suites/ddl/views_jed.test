@@ -1,0 +1,392 @@
+# Views — the jed-specific behavior of spec/design/views.md that PostgreSQL cannot oracle-check:
+# the IF NOT EXISTS extension, the jed_ reservation, 55000 on writes to views PostgreSQL would
+# update, 0A000 for the deferred forms, temp scope, untracked dependencies, CASCADE to a view,
+# re-validation after ALTER TABLE (§8), the session privilege envelope (§9), and transactions.
+# CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# requires: ddl.view, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.alter_table, ddl.sequence, ddl.temp_table, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.insert_on_conflict, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.aggregates, query.subquery_scalar, query.subquery_correlated, query.derived_table, query.cte, query.cte_data_modifying, types.i32, types.i64, types.text, session.privileges, session.allow_ddl, session.allow_temp_ddl, txn.explicit, txn.read_only
+
+statement ok
+CREATE TABLE t (a i32 PRIMARY KEY, b text)
+
+statement ok
+INSERT INTO t VALUES (1, 'x'), (2, 'y')
+
+statement ok
+CREATE VIEW v AS SELECT a, b FROM t
+
+# --- IF NOT EXISTS (a jed extension): a taken name is a silent no-op, decided before the body -----
+
+statement ok
+CREATE VIEW IF NOT EXISTS v AS SELECT * FROM nosuch
+
+statement ok
+CREATE VIEW IF NOT EXISTS t AS SELECT 1 AS one
+
+statement ok
+CREATE VIEW IF NOT EXISTS vn AS SELECT a FROM t WHERE a = 2
+
+query I nosort
+SELECT * FROM vn
+----
+2
+
+# a lone `if` is an identifier: this creates a view named `if`
+statement ok
+CREATE VIEW if AS SELECT 1 AS one
+
+query I nosort
+SELECT one FROM if
+----
+1
+
+statement ok
+DROP VIEW if
+
+# --- the jed_ reservation applies to views; it is not suppressed by IF NOT EXISTS ----------------
+
+statement error 42939
+CREATE VIEW jed_v AS SELECT 1 AS one
+
+statement error 42939
+CREATE VIEW IF NOT EXISTS jed_v AS SELECT 1 AS one
+
+statement ok
+CREATE VIEW "JED_v" AS SELECT 1 AS one
+
+statement ok
+DROP VIEW "JED_v"
+
+# a view over a jed_ catalog relation is allowed (no dependency is recorded)
+statement ok
+CREATE VIEW tabs AS SELECT name FROM jed_tables
+
+query T nosort
+SELECT name FROM tabs ORDER BY name
+----
+t
+
+statement ok
+DROP VIEW tabs
+
+# --- every view refuses writes with 55000, even one PostgreSQL would update ----------------------
+
+statement error 55000
+INSERT INTO v VALUES (3, 'z')
+
+statement error 55000
+INSERT INTO v VALUES (1, 'x') ON CONFLICT DO NOTHING
+
+statement error 55000
+UPDATE v SET b = 'q' WHERE a = 1
+
+statement error 55000
+DELETE FROM v WHERE a = 1
+
+statement error 55000
+WITH d AS (DELETE FROM v RETURNING a) SELECT count(*) FROM d
+
+query IT nosort
+SELECT * FROM v ORDER BY a
+----
+1
+x
+2
+y
+
+# --- deferred forms are recognized and refused with 0A000 -------------------------------------------
+
+statement error 0A000
+CREATE OR REPLACE VIEW v AS SELECT a FROM t
+
+statement error 0A000
+CREATE TEMP VIEW tv AS SELECT a FROM t
+
+statement error 0A000
+CREATE TEMPORARY VIEW tv AS SELECT a FROM t
+
+statement error 0A000
+CREATE RECURSIVE VIEW rv (n) AS SELECT 1
+
+statement error 0A000
+CREATE MATERIALIZED VIEW mv AS SELECT a FROM t
+
+statement error 0A000
+CREATE VIEW ov WITH (security_barrier) AS SELECT a FROM t
+
+statement error 0A000
+CREATE VIEW cv AS SELECT a FROM t WITH CHECK OPTION
+
+statement error 0A000
+CREATE VIEW cv AS SELECT a FROM t WITH LOCAL CHECK OPTION
+
+statement error 0A000
+CREATE VIEW cv AS SELECT a FROM t WITH CASCADED CHECK OPTION
+
+statement error 0A000
+ALTER VIEW v RENAME TO v9
+
+statement error 0A000
+ALTER TABLE v RENAME TO v9
+
+statement error 0A000
+ALTER TABLE v RENAME COLUMN a TO a9
+
+statement error 42P01
+SELECT * FROM cv
+
+# a qualifier other than main
+statement ok
+CREATE VIEW main.mv AS SELECT b FROM main.t WHERE a = 1
+
+query T nosort
+SELECT * FROM main.mv
+----
+x
+
+statement error 0A000
+CREATE VIEW temp.tv AS SELECT a FROM t
+
+# --- sequence statements look up sequences only (as for a table) ------------------------------------
+
+statement error 42P01
+DROP SEQUENCE v
+
+# --- a persistent view may not read a temporary relation --------------------------------------------
+
+statement ok
+CREATE TEMP TABLE tt (z i32)
+
+statement error 0A000
+CREATE VIEW tv AS SELECT z FROM tt
+
+statement error 0A000
+CREATE VIEW tv AS SELECT z FROM temp.tt
+
+statement error 0A000
+CREATE VIEW tv AS SELECT a FROM t WHERE a IN (SELECT z FROM tt)
+
+statement ok
+DROP TABLE tt
+
+# --- CASCADE never drops a dependent view (a follow-on) ---------------------------------------------
+
+statement error 0A000
+DROP TABLE t CASCADE
+
+statement ok
+CREATE VIEW vv AS SELECT a FROM v
+
+statement error 0A000
+DROP VIEW v CASCADE
+
+statement error 0A000
+ALTER TABLE t DROP COLUMN b CASCADE
+
+statement ok
+DROP VIEW vv
+
+# a FOREIGN KEY dependent is still dropped by CASCADE when no view depends on the table
+statement ok
+CREATE TABLE parent (k i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE child (r i32 REFERENCES parent (k))
+
+statement ok
+DROP TABLE parent CASCADE
+
+# --- untracked dependencies: a dropped sequence fails the view when it is used ----------------------
+
+statement ok
+CREATE SEQUENCE s
+
+statement ok
+CREATE VIEW vs AS SELECT nextval('s') AS n
+
+# reading a view that calls nextval is a write
+statement ok
+BEGIN READ ONLY
+
+statement error 25006
+SELECT * FROM vs
+
+statement ok
+ROLLBACK
+
+query I nosort
+SELECT * FROM vs
+----
+1
+
+statement ok
+DROP SEQUENCE s
+
+statement error 42P01
+SELECT * FROM vs
+
+statement ok
+DROP VIEW vs
+
+# --- `*` that cannot be expanded by name -------------------------------------------------------------
+
+# without a column list the duplicate output name is 42701 (as in PostgreSQL)
+statement error 42701
+CREATE VIEW sx AS SELECT * FROM (SELECT 1 AS a, 2 AS a) d
+
+# with one, the frozen expansion "d"."a", "d"."a" is ambiguous: 0A000 (PostgreSQL accepts)
+statement error 0A000
+CREATE VIEW sx (p, q) AS SELECT * FROM (SELECT 1 AS a, 2 AS a) d
+
+# --- re-validation after ALTER TABLE (§8) -----------------------------------------------------------
+
+statement ok
+CREATE TABLE p (k i32 PRIMARY KEY, x i32)
+
+statement ok
+CREATE TABLE q (k i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO p VALUES (1, 1), (2, 5)
+
+statement ok
+INSERT INTO q VALUES (1), (2), (3)
+
+# `x` inside the subquery is p.x (q has no x)
+statement ok
+CREATE VIEW cap AS SELECT k, (SELECT count(*) FROM q WHERE q.k <= x) AS n FROM p
+
+query II nosort
+SELECT * FROM cap ORDER BY k
+----
+1
+1
+2
+3
+
+# a new q.x would capture it: the ALTER is refused and nothing changes
+statement error 0A000
+ALTER TABLE q ADD COLUMN x i32
+
+query II nosort
+SELECT * FROM cap ORDER BY k
+----
+1
+1
+2
+3
+
+# a bare `x` read beside q would become ambiguous
+statement ok
+CREATE VIEW amb AS SELECT x FROM p JOIN q ON p.k = q.k
+
+statement error 0A000
+ALTER TABLE q ADD COLUMN x i32
+
+# a column that captures nothing is fine, and dropping it again is fine
+statement ok
+ALTER TABLE q ADD COLUMN y i32
+
+statement ok
+ALTER TABLE q DROP COLUMN y
+
+statement ok
+DROP VIEW cap, amb
+
+statement ok
+ALTER TABLE q ADD COLUMN x i32
+
+# --- transactions: CREATE / DROP VIEW roll back --------------------------------------------------
+
+statement ok
+BEGIN
+
+statement ok
+CREATE VIEW txv AS SELECT a FROM t
+
+query I nosort
+SELECT count(*) FROM txv
+----
+2
+
+statement ok
+ROLLBACK
+
+statement error 42P01
+SELECT * FROM txv
+
+statement ok
+BEGIN
+
+statement ok
+DROP VIEW vn
+
+statement ok
+ROLLBACK
+
+query I nosort
+SELECT * FROM vn
+----
+2
+
+statement ok
+BEGIN READ ONLY
+
+statement error 25006
+CREATE VIEW rov AS SELECT a FROM t
+
+statement ok
+ROLLBACK
+
+# --- privileges (§9): CREATE needs allow_ddl + SELECT on what the body reads; reading needs only
+# SELECT on the view ---------------------------------------------------------------------------------
+
+# allow_ddl: off
+statement error 42501
+CREATE VIEW pv AS SELECT a FROM t
+
+# allow_ddl: off
+statement error 42501
+DROP VIEW vn
+
+# default_privileges: NONE
+statement error 42501
+CREATE VIEW pv AS SELECT a FROM t
+
+# default_privileges: NONE
+# grant: SELECT ON t
+statement ok
+CREATE VIEW pv AS SELECT a FROM t WHERE a = 1
+
+# the view alone is enough to read through it
+# default_privileges: NONE
+# grant: SELECT ON pv
+query I nosort
+SELECT * FROM pv
+----
+1
+
+# default_privileges: NONE
+statement error 42501
+SELECT * FROM pv
+
+# default_privileges: NONE
+# grant: SELECT ON pv
+statement error 42501
+SELECT * FROM t
+
+# a view over a view: the outer view is enough
+statement ok
+CREATE VIEW pv2 AS SELECT a FROM pv
+
+# default_privileges: NONE
+# grant: SELECT ON pv2
+query I nosort
+SELECT * FROM pv2
+----
+1
+
+statement ok
+DROP VIEW pv2, pv, vn, v, mv
+
+statement ok
+DROP TABLE t, p, q, child

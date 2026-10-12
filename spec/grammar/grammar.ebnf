@@ -55,6 +55,8 @@ sql_statement  ::= create_table
                  | create_sequence
                  | alter_sequence
                  | drop_sequence
+                 | create_view
+                 | drop_view
                  | insert
                  | query_statement
                  | update
@@ -331,6 +333,27 @@ sequence_option ::= "AS" type_name
                   | "CYCLE" | "NO" "CYCLE"
 signed_integer ::= "-"? integer
 drop_sequence  ::= "DROP" "SEQUENCE" ("IF" "EXISTS")? identifier ("," identifier)* "RESTRICT"?
+
+/* CREATE VIEW / DROP VIEW (../design/views.md, ../design/grammar.md §54). A view is a named,
+ * persisted query in the relation namespace (a collision with a table/index/sequence/view is 42P07).
+ * The body is a subquery_expr planned in an isolated scope (no correlation, no outer CTEs, no $N —
+ * 42P02); it is stored as canonical token text with every expanded "*" frozen into an explicit
+ * column list. The optional column list renames the output columns (longer than the body is 42601;
+ * a duplicate final output name is 42701). "IF NOT EXISTS" is a jed extension (PG has no such
+ * syntax): a taken name is a silent no-op decided before the body is planned. A database qualifier
+ * other than "main" is 0A000. Recognized with 0A000, never 42601 (deferred follow-ons): "OR REPLACE",
+ * "TEMP"/"TEMPORARY", "RECURSIVE", "MATERIALIZED", a "WITH ( … )" option list after the name, and a
+ * trailing "WITH [CASCADED | LOCAL] CHECK OPTION"; "ALTER VIEW" is 0A000 too. VIEW is non-reserved
+ * and recognized positionally after CREATE / DROP, so "CREATE TABLE view (…)" still names a table.
+ *
+ * DROP VIEW is DROP TABLE's shape: two-phase / all-or-nothing, deduplicated; a missing view is 42P01
+ * unless IF EXISTS; a non-view relation is 42809 (not suppressed by IF EXISTS); a view another view
+ * depends on is 2BP01 unless that dependent is in the same drop set. CASCADE behaves like RESTRICT
+ * when no view depends on a target, and is 0A000 when one does (a follow-on). */
+create_view    ::= "CREATE" "VIEW" ("IF" "NOT" "EXISTS")? qualified_table
+                   ("(" identifier ("," identifier)* ")")? "AS" subquery_expr
+drop_view      ::= "DROP" "VIEW" ("IF" "EXISTS")? qualified_table ("," qualified_table)*
+                   ("CASCADE" | "RESTRICT")?
 
 /* ALTER SEQUENCE [IF EXISTS] name <action> (../design/sequences.md §4/§15). Two action forms:
  *   (a) the order-free option set — the SAME sequence_option list as CREATE (MINUS "AS", which is
@@ -705,7 +728,12 @@ from_item      ::= table_ref join_clause*
 table_ref      ::= "LATERAL"? derived_table derived_alias?
                  | joined_group derived_alias?
                  | "LATERAL"? table_function table_function_alias?
-                 | qualified_table ("AS"? identifier)?
+                 | qualified_table base_alias?
+
+/* A base table's (or view's) alias may carry a column alias list renaming the columns this FROM
+ * item exposes, left to right (../design/grammar.md §15): a shorter list is a partial rename, a
+ * longer one 42P10. A list needs the alias — "t (p)" is the table_function form. */
+base_alias     ::= "AS"? identifier ("(" identifier ("," identifier)* ")")?
 
 joined_group   ::= "(" (table_ref join_clause+ | joined_group) ")"
 

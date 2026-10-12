@@ -622,6 +622,12 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   minus the previous catalog chain, GiST forest, and the B-tree pages outside the subtrees the two
   snapshots share — so open never walks the file. The file form of `max_storage_bytes` limits it
   (§13; [spec/design/memory.md](spec/design/memory.md) §8.7).
+- **Views (format v38).** A view is a catalog entry (`entry_kind 5`) holding its output column
+  names, its definition as canonical token text (the CHECK-text rendering, with `*` frozen at
+  CREATE), and its persisted table/column/view dependencies. Open parses but never plans a view;
+  each use plans it as the equivalent derived table. `RENAME` rewrites the stored text and `ALTER
+  TABLE` re-validates dependent views, because text binds by name
+  ([spec/design/views.md](spec/design/views.md)).
 - On-disk format and key encoding are spec'd with byte fixtures (§8). **Status:** the
   single-file on-disk format is authored in `spec/fileformat/format.md` and is now the
   **page-backed copy-on-write B+tree** (`format_version` 24 — the B+tree reshape,
