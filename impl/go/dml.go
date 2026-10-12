@@ -1708,7 +1708,6 @@ func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCt
 // observe the pre-statement snapshot and a ceiling abort stays all-or-nothing; params feeds
 // its $Ns. Returns the projected output rows, nil without a clause.
 func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, viewChecks []viewCheck, defaultExprs []*rExpr, rindexes []resolvedIndex, colls []*Collation, rng *stmtRng, provided []int, rows [][]Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
-	n := len(table.Columns)
 	// The eval env for phase-1 index-expression evaluation (index eval is unmetered; params/CTEs
 	// are empty — an index expression cannot reference them). The per-statement rng is shared with
 	// the CHECK / default evaluation.
@@ -1739,31 +1738,9 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 	}
 	var cunits int64
 	for _, values := range rows {
-		row := make(storedRow, n)
-		for i, col := range table.Columns {
-			var candidate Value
-			if p := provided[i]; p >= 0 {
-				candidate = values[p]
-			} else {
-				// An omitted column takes its default — a constant, or its expression
-				// evaluated for this row through the shared per-statement seam/clock
-				// (constraints.md §2). evalDefault charges operator_eval for an expression
-				// default; a constant (or no default → NULL) is free.
-				dv, err := db.evalDefault(col, defaultExprs[i], rng, meter)
-				if err != nil {
-					return nil, err
-				}
-				candidate = dv
-			}
-			// The columns' resolved ColTypes (a scalar, or a composite resolved to its field tree),
-			// for composite-aware store coercion (spec/design/composite.md §4).
-			v, err := coerceForStore(candidate, store.colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name, db.inputZone())
-			if err != nil {
-				// Stamp the target relation onto a column-store failure (23502/22003/22001) —
-				// in scope here, not inside the coercion (spec/design/error-fields.md §4).
-				return nil, stampTable(err, table.Name)
-			}
-			row[i] = v
+		row, err := db.buildInsertRow(table, store.colTypes, provided, values, defaultExprs, rng, meter)
+		if err != nil {
+			return nil, err
 		}
 
 		// CHECK constraints, in name order, on the fully-coerced candidate row — after NOT
@@ -1795,7 +1772,8 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 			// The PK's 23505 reports PostgreSQL's derived auto-name for the PK index,
 			// `<table>_pkey` — jed persists/reserves no such relation (constraints.md §5.4).
 			if _, dup := seenKeys[string(key)]; dup {
-				return nil, newUniqueViolation(table.Name, pkeyName(table.Name))
+				return nil, newUniqueViolation(table.Name, pkeyName(table.Name)).
+					withDetail(db.pkDetail(table.Name, table.Columns, pk, row, detailExists))
 			}
 			// The duplicate probe reads the pin (readSnap) — under the writable-CTE read pin
 			// (writable-cte.md §2) it sees the PRE-statement table, not an earlier sub-statement's
@@ -1804,7 +1782,8 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 			if _, exists, err := db.lkpStoreScoped(dbScope, table.Name).Get(key); err != nil {
 				return nil, err
 			} else if exists {
-				return nil, newUniqueViolation(table.Name, pkeyName(table.Name))
+				return nil, newUniqueViolation(table.Name, pkeyName(table.Name)).
+					withDetail(db.pkDetail(table.Name, table.Columns, pk, row, detailExists))
 			}
 			seenKeys[string(key)] = struct{}{}
 		}
@@ -1827,7 +1806,8 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 				return nil, err
 			}
 			if _, dup := seenPrefixes[u][string(prefix)]; dup || len(stored) > 0 {
-				return nil, newUniqueViolation(table.Name, rindex.Name)
+				return nil, newUniqueViolation(table.Name, rindex.Name).
+					withDetail(db.indexDetailByName(table, rindex, row, detailExists))
 			}
 			seenPrefixes[u][string(prefix)] = struct{}{}
 		}
@@ -1902,7 +1882,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 			if _, inBatch := batch[string(probe.bytes)]; inBatch {
 				continue
 			}
-			if err := db.validateInsertFKStored(relation, fk, probe); err != nil {
+			if err := db.validateInsertFKStored(relation, table.Columns, fk, probe, pr.row); err != nil {
 				return nil, err
 			}
 		}
@@ -1917,22 +1897,25 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 		tcols := table.Columns
 		for _, exc := range table.Exclusions {
 			for _, pr := range prepared {
-				conflict, err := db.insertExclusionConflictsStored(tcols, exc, pr.row)
+				other, conflict, err := db.insertExclusionConflictsStored(dbScope, table.Name, tcols, exc, pr.row)
 				if err != nil {
 					return nil, err
 				}
 				if conflict {
-					return nil, newExclusionViolation(table.Name, exc.Name)
+					return nil, newExclusionViolation(table.Name, exc.Name).
+						withDetail(db.exclusionDetail(table.Name, tcols, exc, pr.row, other, true))
 				}
 			}
 			for i := range prepared {
 				for j := 0; j < i; j++ {
-					conflict, err := exclusionPairConflicts(tcols, exc, prepared[i].row, prepared[j].row)
+					newRow, other := prepared[i].row, prepared[j].row
+					conflict, err := exclusionPairConflicts(tcols, exc, newRow, other)
 					if err != nil {
 						return nil, err
 					}
 					if conflict {
-						return nil, newExclusionViolation(table.Name, exc.Name)
+						return nil, newExclusionViolation(table.Name, exc.Name).
+							withDetail(db.exclusionDetail(table.Name, tcols, exc, newRow, other, true))
 					}
 				}
 			}
@@ -2011,25 +1994,12 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 // path's validation and write order (constraints.md §7) but needs no within-batch maps, stringified
 // byte keys, prepared-row slice, or per-index write buffers.
 func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, viewChecks []viewCheck, defaultExprs []*rExpr, rindexes []resolvedIndex, colls []*Collation, rng *stmtRng, provided []int, values []Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
-	n := len(table.Columns)
 	var err error
 	env := &evalEnv{exec: db, rng: rng}
 
-	row := make(storedRow, n)
-	for i, col := range table.Columns {
-		var candidate Value
-		if p := provided[i]; p >= 0 {
-			candidate = values[p]
-		} else {
-			candidate, err = db.evalDefault(col, defaultExprs[i], rng, meter)
-			if err != nil {
-				return nil, err
-			}
-		}
-		row[i], err = coerceForStore(candidate, store.colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name, db.inputZone())
-		if err != nil {
-			return nil, stampTable(err, table.Name)
-		}
+	row, err := db.buildInsertRow(table, store.colTypes, provided, values, defaultExprs, rng, meter)
+	if err != nil {
+		return nil, err
 	}
 
 	if len(checks) > 0 {
@@ -2050,7 +2020,8 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 		if _, exists, err := db.lkpStoreScoped(dbScope, table.Name).Get(key); err != nil {
 			return nil, err
 		} else if exists {
-			return nil, newUniqueViolation(table.Name, pkeyName(table.Name))
+			return nil, newUniqueViolation(table.Name, pkeyName(table.Name)).
+				withDetail(db.pkDetail(table.Name, table.Columns, pk, row, detailExists))
 		}
 	}
 
@@ -2071,7 +2042,8 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 			return nil, err
 		}
 		if len(stored) > 0 {
-			return nil, newUniqueViolation(table.Name, rindex.Name)
+			return nil, newUniqueViolation(table.Name, rindex.Name).
+				withDetail(db.indexDetailByName(table, rindex, row, detailExists))
 		}
 	}
 
@@ -2121,18 +2093,19 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 		if suppliedOK && bytes.Equal(supplied.bytes, probe.bytes) {
 			continue
 		}
-		if err := db.validateInsertFKStored(relation, fk, probe); err != nil {
+		if err := db.validateInsertFKStored(relation, table.Columns, fk, probe, row); err != nil {
 			return nil, err
 		}
 	}
 
 	for _, exc := range table.Exclusions {
-		conflict, err := db.insertExclusionConflictsStored(table.Columns, exc, row)
+		other, conflict, err := db.insertExclusionConflictsStored(dbScope, table.Name, table.Columns, exc, row)
 		if err != nil {
 			return nil, err
 		}
 		if conflict {
-			return nil, newExclusionViolation(table.Name, exc.Name)
+			return nil, newExclusionViolation(table.Name, exc.Name).
+				withDetail(db.exclusionDetail(table.Name, table.Columns, exc, row, other, true))
 		}
 	}
 
@@ -2179,32 +2152,87 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 	return returned, nil
 }
 
+// buildInsertRow builds + coerces one INSERT candidate row in column order (constraints.md §7 step
+// 1): an omitted column takes its default — a constant, or its expression evaluated for this row
+// through the shared per-statement seam/clock (constraints.md §2; evalDefault charges operator_eval
+// for an expression default). NOT NULL is enforced over the COMPLETE row, so a later column's
+// coercion/default error wins over an earlier NULL, and the 23502 can carry the whole failing row
+// (PostgreSQL's order — error-fields.md §9.5). A column-store failure (23502/22003/22001) is stamped
+// with the target relation, which is in scope here, not inside the coercion (error-fields.md §4).
+// colTypes are the columns' resolved ColTypes (a scalar, or a composite resolved to its field tree),
+// for composite-aware store coercion (spec/design/composite.md §4).
+func (db *engine) buildInsertRow(table *catTable, colTypes []colType, provided []int, values []Value, defaultExprs []*rExpr, rng *stmtRng, meter *costMeter) (storedRow, error) {
+	row := make(storedRow, len(table.Columns))
+	nullCol := -1
+	for i, col := range table.Columns {
+		var candidate Value
+		if p := provided[i]; p >= 0 {
+			candidate = values[p]
+		} else {
+			dv, err := db.evalDefault(col, defaultExprs[i], rng, meter)
+			if err != nil {
+				return nil, err
+			}
+			candidate = dv
+		}
+		if col.NotNull && candidate.Kind == ValNull {
+			if nullCol < 0 {
+				nullCol = i
+			}
+			row[i] = NullValue()
+			continue
+		}
+		v, err := coerceForStore(candidate, colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name, db.inputZone())
+		if err != nil {
+			return nil, stampTable(err, table.Name)
+		}
+		row[i] = v
+	}
+	if nullCol >= 0 {
+		return nil, db.notNullRowViolation(table.Name, table.Columns[nullCol].Name, row)
+	}
+	return row, nil
+}
+
 // validateInsertFKStored completes one child-side FK check after the caller handles the statement
 // end-state match. The batch and one-row paths share the stored probe and violation construction.
-func (db *engine) validateInsertFKStored(relation string, fk *foreignKey, probe fkProbe) error {
+func (db *engine) validateInsertFKStored(relation string, columns []catColumn, fk *foreignKey, probe fkProbe, row storedRow) error {
 	hit, err := db.fkProbeHits(probe, fk.RefTable)
 	if err != nil {
 		return err
 	}
 	if !hit {
-		return newFKViolationInsert(relation, fk.Name)
+		return newFKViolationInsert(relation, fk.Name).
+			withDetail(db.fkChildDetail(relation, columns, fk, row))
 	}
 	return nil
 }
 
 // insertExclusionConflictsStored probes the resident GiST rows for one candidate. The batch caller
-// separately retains its pairwise end-state pass; the stored-row semantics are shared.
-func (db *engine) insertExclusionConflictsStored(columns []catColumn, exc exclusionConstraint, row storedRow) (bool, error) {
+// separately retains its pairwise end-state pass; the stored-row semantics are shared. On a conflict
+// it returns the conflicting stored row — the least storage key among the matches, for a
+// deterministic Detail (error-fields.md §9.2).
+func (db *engine) insertExclusionConflictsStored(dbScope *string, table string, columns []catColumn, exc exclusionConstraint, row storedRow) (storedRow, bool, error) {
 	query, strats, ok, err := exclusionProbeQuery(columns, exc, row)
 	if err != nil || !ok {
-		return false, err
+		return nil, false, err
 	}
 	tree := db.readSnap().gistTreeFor(exc.Index)
 	if tree == nil {
-		return false, nil
+		return nil, false, nil
 	}
 	hits, _, _ := tree.search(query, strats)
-	return len(hits) > 0, nil
+	first, found := leastKey(hits, nil)
+	if !found {
+		return nil, false, nil
+	}
+	// A matched entry always names a stored row; should it not, a nil row only omits the Detail
+	// (the 23P01 itself is decided by the match).
+	other, _, err := db.lkpStoreScoped(dbScope, table).Get(first)
+	if err != nil {
+		return nil, false, err
+	}
+	return other, true, nil
 }
 
 // foldConflictPlan folds globally-uncorrelated subqueries in a DO UPDATE's SET/WHERE once (their
@@ -2294,23 +2322,9 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 	for _, values := range rows {
 		// Build + coerce the candidate row, then CHECK — the INSERT per-row order (NOT NULL
 		// before CHECK before conflict; constraints.md §4.4).
-		row := make(storedRow, n)
-		for i, col := range table.Columns {
-			var candidate Value
-			if p := provided[i]; p >= 0 {
-				candidate = values[p]
-			} else {
-				dv, err := db.evalDefault(col, defaultExprs[i], rng, meter)
-				if err != nil {
-					return 0, nil, err
-				}
-				candidate = dv
-			}
-			v, err := coerceForStore(candidate, store.colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name, db.inputZone())
-			if err != nil {
-				return 0, nil, stampTable(err, relation)
-			}
-			row[i] = v
+		row, err := db.buildInsertRow(table, store.colTypes, provided, values, defaultExprs, rng, meter)
+		if err != nil {
+			return 0, nil, err
 		}
 		if len(checks) > 0 {
 			if err := meter.Guard(); err != nil {
@@ -2426,16 +2440,28 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 		}
 		newRow := make(storedRow, n)
 		copy(newRow, existRow)
+		nullCol := ""
 		for _, ap := range plan.assignments {
 			raw, err := ap.source.eval(combined, env, meter)
 			if err != nil {
 				return 0, nil, err
+			}
+			// NOT NULL over the complete new row (error-fields.md §9.5).
+			if ap.notNull && raw.Kind == ValNull {
+				if nullCol == "" {
+					nullCol = ap.name
+				}
+				newRow[ap.idx] = NullValue()
+				continue
 			}
 			checked, err := ap.check(raw, db.inputZone())
 			if err != nil {
 				return 0, nil, stampTable(err, relation)
 			}
 			newRow[ap.idx] = checked
+		}
+		if nullCol != "" {
+			return 0, nil, db.notNullRowViolation(relation, nullCol, newRow)
 		}
 		if len(checks) > 0 {
 			cenv := &evalEnv{exec: db, rng: rng}
@@ -2459,10 +2485,12 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 			if _, exists, err := store.Get(k); err != nil {
 				return 0, nil, err
 			} else if exists {
-				return 0, nil, newUniqueViolation(relation, pkeyName(relation))
+				return 0, nil, newUniqueViolation(relation, pkeyName(relation)).
+					withDetail(db.pkDetail(relation, table.Columns, pk, row, detailExists))
 			}
 			if _, dup := seen[string(k)]; dup {
-				return 0, nil, newUniqueViolation(relation, pkeyName(relation))
+				return 0, nil, newUniqueViolation(relation, pkeyName(relation)).
+					withDetail(db.pkDetail(relation, table.Columns, pk, row, detailExists))
 			}
 			seen[string(k)] = struct{}{}
 		}
@@ -2509,7 +2537,8 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 					}
 				}
 				if conflict {
-					return 0, nil, newUniqueViolation(table.Name, def.Name)
+					return 0, nil, newUniqueViolation(table.Name, def.Name).
+						withDetail(db.indexDetail(table.Name, table.Columns, &def, rindex, newRow, detailExists))
 				}
 				batch[string(prefix)] = struct{}{}
 			}
@@ -2586,7 +2615,8 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 				return 0, nil, err
 			}
 			if !hit {
-				return 0, nil, newFKViolationInsert(relation, fk.Name)
+				return 0, nil, newFKViolationInsert(relation, fk.Name).
+					withDetail(db.fkChildDetail(relation, table.Columns, fk, row))
 			}
 		}
 	}
@@ -3005,7 +3035,8 @@ func (db *engine) flushFkDeferredChecks(meter *costMeter) error {
 			return err
 		}
 		if referenced {
-			return newFKViolationDelete(check.parent.Name, check.fk.Name, check.childTable)
+			return newFKViolationDelete(check.parent.Name, check.fk.Name, check.childTable).
+				withDetail(db.fkParentDetail(check.parent, &check.fk, check.childTable, check.values))
 		}
 	}
 	return nil
@@ -3779,6 +3810,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 		}
 		newRow := make(storedRow, len(row))
 		copy(newRow, row)
+		nullCol := ""
 		for _, p := range plans {
 			raw, err := p.source.eval(row, env, meter)
 			if err != nil {
@@ -3787,11 +3819,22 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			if mapped != nil {
 				raw = mapped[slices.Index(upd.fkTarget.fk.Columns, p.idx)]
 			}
+			// NOT NULL over the complete new row, after every assignment (error-fields.md §9.5).
+			if p.notNull && raw.Kind == ValNull {
+				if nullCol == "" {
+					nullCol = p.name
+				}
+				newRow[p.idx] = NullValue()
+				continue
+			}
 			checked, err := p.check(raw, db.inputZone())
 			if err != nil {
 				return outcome{}, stampTable(err, table.Name)
 			}
 			newRow[p.idx] = checked
+		}
+		if nullCol != "" {
+			return outcome{}, db.notNullRowViolation(table.Name, nullCol, newRow)
 		}
 		// The rewritten row is stored fully resident: resolve any still-unfetched (untouched)
 		// columns so its weight/disposition re-plan exactly as an eager writer's would —
@@ -3844,7 +3887,8 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 				collides = true
 			}
 			if collides {
-				return outcome{}, newUniqueViolation(table.Name, pkeyName(table.Name))
+				return outcome{}, newUniqueViolation(table.Name, pkeyName(table.Name)).
+					withDetail(db.pkDetail(table.Name, table.Columns, pkMembers, u.row, detailExists))
 			}
 			batch[string(u.newKey)] = struct{}{}
 		}
@@ -3894,7 +3938,8 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 					}
 				}
 				if conflict {
-					return outcome{}, newUniqueViolation(table.Name, def.Name)
+					return outcome{}, newUniqueViolation(table.Name, def.Name).
+						withDetail(db.indexDetail(table.Name, table.Columns, &def, rindex, u.row, detailExists))
 				}
 				batch[string(prefix)] = struct{}{}
 			}
@@ -3930,28 +3975,32 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 				if !ok {
 					continue
 				}
+				// The least non-vacated stored match (a deterministic Detail, error-fields.md §9.2).
+				var hit []byte
 				conflict := false
 				if tree := db.readSnap().gistTreeFor(ikey); tree != nil {
 					hits, _, _ := tree.search(q, strats)
-					for _, h := range hits {
-						if _, own := rewritten[string(h)]; !own {
-							conflict = true
-							break
-						}
-					}
+					hit, conflict = leastKey(hits, rewritten)
 				}
 				if conflict {
-					return outcome{}, newExclusionViolation(table.Name, exc.Name)
+					other, _, err := store.Get(hit)
+					if err != nil {
+						return outcome{}, err
+					}
+					return outcome{}, newExclusionViolation(table.Name, exc.Name).
+						withDetail(db.exclusionDetail(table.Name, table.Columns, exc, u.row, other, true))
 				}
 			}
 			for i := range updates {
 				for j := 0; j < i; j++ {
-					conflict, err := exclusionPairConflicts(table.Columns, exc, updates[i].row, updates[j].row)
+					newRow, other := updates[i].row, updates[j].row
+					conflict, err := exclusionPairConflicts(table.Columns, exc, newRow, other)
 					if err != nil {
 						return outcome{}, err
 					}
 					if conflict {
-						return outcome{}, newExclusionViolation(table.Name, exc.Name)
+						return outcome{}, newExclusionViolation(table.Name, exc.Name).
+							withDetail(db.exclusionDetail(table.Name, table.Columns, exc, newRow, other, true))
 					}
 				}
 			}
@@ -4015,7 +4064,8 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 				return outcome{}, err
 			}
 			if !hit {
-				return outcome{}, newFKViolationInsert(relation, fk.Name)
+				return outcome{}, newFKViolationInsert(relation, fk.Name).
+					withDetail(db.fkChildDetail(relation, table.Columns, fk, u.row))
 			}
 		}
 	}

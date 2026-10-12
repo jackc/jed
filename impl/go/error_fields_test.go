@@ -6,7 +6,13 @@ package jed
 // CLAUDE.md §10), so this is the host-API surface test. Mirrors impl/rust/tests/error_fields.rs
 // and impl/ts/tests/error_fields.test.ts.
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+)
 
 func efErr(t *testing.T, db dbHandle, sql string) *EngineError {
 	t.Helper()
@@ -130,4 +136,119 @@ func TestErrorFieldsUnrelatedErrorHasNoFields(t *testing.T) {
 	efEq(t, e.TableName, "", "TableName")
 	efEq(t, e.ColumnName, "", "ColumnName")
 	efEq(t, e.DataTypeName, "", "DataTypeName")
+	efEq(t, e.Detail, "", "Detail")
+}
+
+// detailCase is one case of the shared Detail fixture (spec/errors/detail_cases.txt).
+type detailCase struct {
+	name              string
+	setup             []string
+	defaultPrivileges *string
+	grants            [][2]string
+	revokes           [][2]string
+	run               string
+	code              string
+	detail            string // "" = the Detail must be absent (`no-detail`)
+}
+
+func parseDetailCases(t *testing.T, text string) []detailCase {
+	t.Helper()
+	var cases []detailCase
+	privObj := func(rest string) [2]string {
+		p, o, ok := strings.Cut(rest, " ")
+		if !ok {
+			t.Fatalf("PRIV object: %q", rest)
+		}
+		return [2]string{p, o}
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if name, ok := strings.CutPrefix(line, "case: "); ok {
+			cases = append(cases, detailCase{name: name})
+			continue
+		}
+		if len(cases) == 0 {
+			t.Fatalf("a directive before the first case: %q", line)
+		}
+		c := &cases[len(cases)-1]
+		if v, ok := strings.CutPrefix(line, "setup: "); ok {
+			c.setup = append(c.setup, v)
+		} else if v, ok := strings.CutPrefix(line, "default_privileges: "); ok {
+			c.defaultPrivileges = &v
+		} else if v, ok := strings.CutPrefix(line, "grant: "); ok {
+			c.grants = append(c.grants, privObj(v))
+		} else if v, ok := strings.CutPrefix(line, "revoke: "); ok {
+			c.revokes = append(c.revokes, privObj(v))
+		} else if v, ok := strings.CutPrefix(line, "run: "); ok {
+			c.run = v
+		} else if v, ok := strings.CutPrefix(line, "code: "); ok {
+			c.code = v
+		} else if v, ok := strings.CutPrefix(line, "detail: "); ok {
+			c.detail = v
+		} else if line != "no-detail" {
+			t.Fatalf("unknown detail_cases directive: %q", line)
+		}
+	}
+	return cases
+}
+
+func detailPrivilegeSet(t *testing.T, list string) PrivilegeSet {
+	t.Helper()
+	set := PrivSetEmpty
+	if list == "-" {
+		return set
+	}
+	for _, name := range strings.Split(list, ",") {
+		p, ok := PrivilegeFromName(name)
+		if !ok {
+			t.Fatalf("privilege name %q", name)
+		}
+		set = set.With(p)
+	}
+	return set
+}
+
+// The Detail field (spec/design/error-fields.md §9): every case of the shared, language-neutral
+// fixture — the same file the Rust and TS cores run, so the text is pinned byte-identical.
+func TestErrorFieldsDetailSharedCases(t *testing.T) {
+	text, err := os.ReadFile("../../spec/errors/detail_cases.txt")
+	if err != nil {
+		t.Fatalf("read detail_cases.txt: %v", err)
+	}
+	cases := parseDetailCases(t, string(text))
+	if len(cases) == 0 {
+		t.Fatal("no detail cases")
+	}
+	var failures []string
+	for _, c := range cases {
+		db := fkSetup(t, c.setup...)
+		if c.defaultPrivileges != nil {
+			db.SetDefaultPrivileges(detailPrivilegeSet(t, *c.defaultPrivileges))
+		}
+		for _, g := range c.grants {
+			db.Grant(detailPrivilegeSet(t, g[0]), g[1])
+		}
+		for _, r := range c.revokes {
+			db.Revoke(detailPrivilegeSet(t, r[0]), r[1])
+		}
+		_, err := queryOutcome(db, c.run, nil)
+		if err == nil {
+			failures = append(failures, fmt.Sprintf("%s: expected %s but succeeded", c.name, c.code))
+			continue
+		}
+		var e *EngineError
+		if !errors.As(err, &e) {
+			failures = append(failures, fmt.Sprintf("%s: non-engine error %v", c.name, err))
+			continue
+		}
+		if e.Code() != c.code || e.Detail != c.detail {
+			failures = append(failures, fmt.Sprintf("%s: got %s %q (%s), want %s %q",
+				c.name, e.Code(), e.Detail, e.Message, c.code, c.detail))
+		}
+	}
+	if len(failures) > 0 {
+		t.Error(strings.Join(failures, "\n"))
+	}
 }

@@ -1656,7 +1656,11 @@ func evalChecks(checks []namedCheck, relation string, row storedRow, env *evalEn
 			return err
 		}
 		if v.Kind == ValBool && !v.boolVal() {
-			return newCheckViolation(relation, c.name)
+			e := newCheckViolation(relation, c.name)
+			if env.exec != nil {
+				e.withDetail(env.exec.failingRowDetail(relation, row))
+			}
+			return e
 		}
 	}
 	return nil
@@ -2544,7 +2548,8 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 					return outcome{}, err
 				}
 				if seenKeys[string(key)] {
-					return outcome{}, newUniqueViolation(table.Name, pkeyName(table.Name))
+					return outcome{}, newUniqueViolation(table.Name, pkeyName(table.Name)).
+						withDetail(db.pkDetail(table.Name, table.Columns, table.PK, row, detailDuplicated))
 				}
 				seenKeys[string(key)] = true
 				rows[i].Key = key
@@ -3614,7 +3619,8 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			}
 			if ok {
 				if seenPrefixes[string(prefix)] {
-					return outcome{}, newUniqueViolation(ci.Table, def.Name)
+					return outcome{}, newUniqueViolation(ci.Table, def.Name).
+						withDetail(db.indexDetail(table.Name, columns, &def, &rindex, row, detailDuplicated))
 				}
 				seenPrefixes[string(prefix)] = true
 			}

@@ -2,6 +2,7 @@ package jed
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -666,6 +667,11 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 		}
 		for _, c := range checks {
 			if err := evalChecks([]namedCheck{c}, t.Name, row, &evalEnv{exec: db, rng: newStmtRng()}, meter); err != nil {
+				// PostgreSQL's ADD CHECK validation carries no DETAIL (error-fields.md §9.2).
+				var ee *EngineError
+				if errors.As(err, &ee) {
+					ee.withDetail("")
+				}
 				return nil, err
 			}
 		}
@@ -688,7 +694,8 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 						seen[nk] = map[string]bool{}
 					}
 					if seen[nk][string(p)] {
-						return nil, newUniqueViolation(t.Name, ix.Name)
+						return nil, newUniqueViolation(t.Name, ix.Name).
+							withDetail(db.indexDetail(t.Name, t.Columns, &ix, &ri, row, detailDuplicated))
 					}
 					seen[nk][string(p)] = true
 				}
@@ -752,7 +759,8 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 				}
 			}
 			if !hit {
-				return nil, newFKViolationInsert(t.Name, fk.Name)
+				return nil, newFKViolationInsert(t.Name, fk.Name).
+					withDetail(db.fkChildDetail(t.Name, t.Columns, &fk, row))
 			}
 		}
 	}
@@ -779,7 +787,8 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 					return nil, err
 				}
 				if conflict {
-					return nil, newExclusionViolation(t.Name, ex.Name)
+					return nil, newExclusionViolation(t.Name, ex.Name).
+						withDetail(db.exclusionDetail(t.Name, t.Columns, ex, a, b, false))
 				}
 			}
 		}

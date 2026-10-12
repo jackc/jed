@@ -29,6 +29,10 @@ type EngineError struct {
 	ColumnName string
 	// DataTypeName is the data type at fault — set for 22003 / 22001.
 	DataTypeName string
+	// Detail is PostgreSQL's DETAIL sentence naming the offending values (`Key (id)=(1) already
+	// exists.`) — set on the class-23 violations, subject to the session's SELECT privilege
+	// (spec/design/error-fields.md §9). Never part of the rendered message.
+	Detail string
 }
 
 // newError builds an EngineError.
@@ -55,6 +59,10 @@ func (e *EngineError) withConstraint(name string) *EngineError { e.ConstraintNam
 func (e *EngineError) withTable(name string) *EngineError      { e.TableName = name; return e }
 func (e *EngineError) withColumn(name string) *EngineError     { e.ColumnName = name; return e }
 func (e *EngineError) withDataType(name string) *EngineError   { e.DataTypeName = name; return e }
+
+// withDetail attaches a Detail (spec/design/error-fields.md §9). "" (a gated or inapplicable detail)
+// leaves the field absent, so a raise site can pass a helper's result straight through.
+func (e *EngineError) withDetail(detail string) *EngineError { e.Detail = detail; return e }
 
 // stampTable annotates a column-store failure (23502 / 22003 / 22001) with the target
 // relation: the relation name is in scope at the DML boundary, not inside the coercion
