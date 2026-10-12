@@ -302,6 +302,12 @@ subquery all keep their inputs' collation. `min(name)` and `max(name)` also comp
 mixes two columns' different collations (`ORDER BY coalesce(a, b)`) is `42P21`; add a `COLLATE` to
 pick one.
 
+A `text[]` carries its elements' collation in the same way. A `text[]` column takes a `COLLATE`
+clause (`tags text[] COLLATE "unicode"`) or the database default, and `ORDER BY tags`, `tags < …`,
+`min(tags)`, and a primary key or index over it order the elements by that collation. `ARRAY[name]`,
+`tags[1]`, `array_append(tags, …)`, and `unnest(tags)` keep it, and `name < ANY (tags)` combines
+`name`'s collation with the array's.
+
 ## `VALUES` lists in `FROM` (`FROM (VALUES …) AS v(x)`)
 
 A derived table's body may also be a `VALUES` list — a literal table of rows you write inline,

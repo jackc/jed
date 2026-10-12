@@ -703,12 +703,18 @@ impl Engine {
             return Err(no_func_overload("unnest"));
         }
         let (rarg, t) = resolve(arg_scope, &args[0], None, &mut AggCtx::Forbidden, ptypes)?;
-        let elem_ty = match t {
-            ResolvedType::Array(elem) => type_from_resolved(&elem)?,
+        let elem_ty = match &t {
+            ResolvedType::Array(elem) => type_from_resolved(elem)?,
             ResolvedType::Null => return Err(indeterminate_poly()),
             _ => return Err(no_func_overload("unnest")),
         };
-        let table = srf_table("unnest", alias, elem_ty);
+        let mut table = srf_table("unnest", alias, elem_ty);
+        // The column carries the array's collation as an implicit one, like a derived-table column
+        // (spec/design/collation.md §1 "A text[] carries its elements' collation").
+        if t.collatable() {
+            let d = derive_collation(arg_scope, &args[0])?;
+            set_synthetic_collation(&mut table.columns[0], &d);
+        }
         Ok((table, vec![rarg], SrfKind::Unnest))
     }
 

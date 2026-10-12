@@ -1095,7 +1095,7 @@ pub(crate) fn resolve_projections(
                 // The output column's collation derivation (spec/design/collation.md §1 "Derived
                 // relations"), which a derived table / CTE over this body carries into its synthetic
                 // column.
-                let d = if matches!(ty, ResolvedType::Text) {
+                let d = if ty.collatable() {
                     derive_collation(scope, &it.expr)?
                 } else {
                     Deriv::None
@@ -3194,7 +3194,7 @@ pub(crate) fn plan_row_subquery(
 /// (`plan_row_subquery`); any other `lhs` needs exactly one body column (42601 otherwise).
 /// The comparison collation of `lhs IN / op ANY|ALL (SELECT …)` (spec/design/collation.md §1): the
 /// left operand's derivation combined with the body column's, which is implicit outside the
-/// subquery. A conflict is 42P22. `None` for a non-text or row-valued comparison.
+/// subquery. A conflict is 42P22. `None` for a non-collatable or row-valued comparison.
 fn membership_collation(
     scope: &Scope,
     lhs: &Expr,
@@ -3203,7 +3203,7 @@ fn membership_collation(
     row_valued: bool,
     plan: &QueryPlan,
 ) -> Result<Option<std::sync::Arc<Collation>>> {
-    if row_valued || *lt != ResolvedType::Text || *elem != ResolvedType::Text {
+    if row_valued || !lt.collatable() || !elem.collatable() {
         return Ok(None);
     }
     let d = combine_deriv(
@@ -3783,14 +3783,14 @@ pub(crate) fn resolve(
             ))
         }
         // `expr COLLATE "name"` (spec/design/collation.md §1) — a postfix collation operator. Resolve
-        // the inner expression, require a collatable (text) type (42804, PG-matching), and validate
+        // the inner expression, require a collatable (text / text[]) type (42804, PG-matching), and validate
         // the named collation exists ("C" or loaded, else 42704). The node is a runtime PASSTHROUGH:
         // a collation only changes the ORDERING comparisons / ORDER BY, derived from the AST at those
         // sites (`explicit_collation` / `OrderKey.collation`), so resolving returns the inner resolved
         // expr + type unchanged. The hint flows through (COLLATE never changes the type).
         Expr::Collate { inner, collation } => {
             let (rinner, ty) = resolve(scope, inner, ctx, agg, params)?;
-            if !matches!(ty, ResolvedType::Text | ResolvedType::Null) {
+            if !ty.collatable() && ty != ResolvedType::Null {
                 return Err(type_error(format!(
                     "collations are not supported by type {}",
                     ty.type_name()
@@ -4974,8 +4974,8 @@ pub(crate) fn resolve(
                     .map(|(node, ty)| widen_float_to_f64(node, ty))
                     .collect();
             }
-            // Text arguments derive one comparison collation (42P21/42P22 on conflict — §52).
-            let collation = if unified == ResolvedType::Text {
+            // Text / text[] arguments derive one comparison collation (42P21/42P22 on conflict — §52).
+            let collation = if unified.collatable() {
                 let mut deriv = Deriv::None;
                 for a in args {
                     deriv = combine_deriv(deriv, derive_collation(scope, a)?)?;
@@ -5067,13 +5067,14 @@ pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
             combine_derivs(scope, args)?
         }
         _ if scope.storage_collation => Deriv::None,
-        // A cast to text keeps its operand's derivation; a `varchar(n)` length coercion is a node of
-        // its own (PostgreSQL), so it combines like a function and a conflicted operand yields.
+        // A cast to text / text[] keeps its operand's derivation (a non-collatable operand derives
+        // none); a `varchar(n)` length coercion is a node of its own (PostgreSQL), so it combines
+        // like a function and a conflicted operand yields.
         Expr::Cast {
             inner,
             type_name,
             type_mod,
-        } if ScalarType::from_name(type_name).is_some_and(|t| t.is_text()) => {
+        } if cast_target_collatable(type_name) => {
             let d = derive_collation(scope, inner)?;
             if type_mod.is_some() {
                 combine_deriv(Deriv::None, d)?
@@ -5092,6 +5093,11 @@ pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
             }
             d
         }
+        // `ARRAY[e1, …]` combines its elements, like a function's arguments (collation.md §1 "A
+        // text[] carries its elements' collation").
+        Expr::Array(items) => combine_derivs(scope, items)?,
+        // A subscript or slice carries its array's collation (the subscripts are integers).
+        Expr::Subscript { base, .. } => combine_deriv(Deriv::None, derive_collation(scope, base)?)?,
         Expr::Coalesce(args) | Expr::GreatestLeast { args, .. } => combine_derivs(scope, args)?,
         // An input-typed aggregate / window function (min/max, lag/lead/first_value/…): its value
         // arguments. FILTER and an in-aggregate ORDER BY contribute nothing.
@@ -5214,12 +5220,22 @@ pub(crate) fn reject_indeterminate_target(d: &Deriv) -> Result<()> {
 
 /// Whether a scalar function's result carries its arguments' collation (spec/design/collation.md §1
 /// "Function results"): read from the shared function catalog — any `kind = "function"` overload
-/// whose `result` is `text`. A non-text argument derives no collation, so an overload taking only
-/// non-text arguments (the range `lower`/`upper`) contributes nothing.
+/// whose `result` is `text`, `text[]`, or `anyarray`. A non-collatable argument derives no
+/// collation, so an overload taking only non-text arguments (the range `lower`/`upper`,
+/// `array_append` over `i32[]`) contributes nothing.
 fn function_result_collatable(name: &str) -> bool {
-    crate::operators::OPERATORS
-        .iter()
-        .any(|o| o.kind == "function" && o.result == "text" && o.name.eq_ignore_ascii_case(name))
+    crate::operators::OPERATORS.iter().any(|o| {
+        o.kind == "function"
+            && (o.result == "text" || o.result == "text[]" || o.result == "anyarray")
+            && o.name.eq_ignore_ascii_case(name)
+    })
+}
+
+/// Whether a cast's target type name is collatable — text (any of its spellings, `varchar(n)`
+/// included) or an array of text.
+fn cast_target_collatable(type_name: &str) -> bool {
+    let base = type_name.strip_suffix("[]").unwrap_or(type_name);
+    ScalarType::from_name(base).is_some_and(|t| t.is_text())
 }
 
 /// The common collation of one set-operation / VALUES output column (spec/design/collation.md §1
@@ -5265,12 +5281,12 @@ pub(crate) fn column_deriv(scope: &Scope, r: Option<Resolved>) -> Deriv {
     }
 }
 
-/// A column's derivation: implicit for a text column (its frozen collation, `C` if none), unless it
+/// A column's derivation: implicit for a text / text[] column (its frozen collation, `C` if none), unless it
 /// is a synthetic relation's column whose body output derived no collation (`Column::no_collation`)
 /// or settled to none over a conflict (`Column::collation_conflict` — spec/design/collation.md §1
 /// "Derived relations").
 pub(crate) fn cat_column_deriv(col: &Column) -> Deriv {
-    if !col.ty.is_text() || col.no_collation {
+    if !col.ty.is_collatable() || col.no_collation {
         return Deriv::None;
     }
     if col.collation_conflict {
@@ -5343,4 +5359,61 @@ pub(crate) fn collated_cmp(coll: &Collation, a: &str, b: &str) -> Result<std::cm
     let ka = collation::sort_key(coll, a)?;
     let kb = collation::sort_key(coll, b)?;
     Ok(ka.cmp(&kb))
+}
+
+/// The array total order (`array_total_cmp`, array.md §5) over two text[] values with their text
+/// elements compared under `coll` (spec/design/collation.md §1). Each walked pair of present elements
+/// charges `collate` per code point of both (collation.md §11) when `meter` is `Some` — the
+/// comparison operators, the array quantifier, and GREATEST/LEAST; the unmetered sort/min/max paths
+/// pass `None`. A NULL element or the array shape decides without a charge.
+pub(crate) fn collated_array_cmp(
+    coll: &Collation,
+    a: &ArrayVal,
+    b: &ArrayVal,
+    mut meter: Option<&mut Meter>,
+) -> Result<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    for (x, y) in a.elements.iter().zip(b.elements.iter()) {
+        let (xs, ys) = match (x, y) {
+            (Value::Null, Value::Null) => continue,
+            (Value::Null, _) => return Ok(Ordering::Greater), // NULL sorts last
+            (_, Value::Null) => return Ok(Ordering::Less),
+            (Value::Text(xs), Value::Text(ys)) => (xs, ys),
+            _ => unreachable!("a collated array comparison is over text[] values"),
+        };
+        if let Some(m) = meter.as_deref_mut() {
+            m.charge(COSTS.collate * (xs.chars().count() as i64 + ys.chars().count() as i64));
+            m.guard()?;
+        }
+        let c = collated_cmp(coll, xs, ys)?;
+        if c != Ordering::Equal {
+            return Ok(c);
+        }
+    }
+    Ok(crate::value::array_shape_cmp(a, b))
+}
+
+/// A collated sort's decoration for one value (spec/design/collation.md §8): a text value's UCA sort
+/// key, a text[] value's collated array key (encoding.md §2.14 — `memcmp`-ordered exactly like
+/// [`collated_array_cmp`]), `None` for NULL. An unmapped code point is 0A000.
+pub(crate) fn collation_sort_key(coll: &Collation, v: &Value) -> Result<Option<Vec<u8>>> {
+    match v {
+        Value::Text(s) => Ok(Some(collation::sort_key(coll, s)?)),
+        Value::Array(a) => Ok(Some(encode_array_key(ScalarType::Text, a, Some(coll))?)),
+        _ => Ok(None),
+    }
+}
+
+/// Compare two non-NULL values under `coll` when it is set and they are text or text[] (unmetered),
+/// else by the value order — the min/max fold and the hypothetical-set key comparison.
+pub(crate) fn collated_or_value_cmp(
+    coll: Option<&Collation>,
+    a: &Value,
+    b: &Value,
+) -> Result<std::cmp::Ordering> {
+    match (coll, a, b) {
+        (Some(c), Value::Text(x), Value::Text(y)) => collated_cmp(c, x, y),
+        (Some(c), Value::Array(x), Value::Array(y)) => collated_array_cmp(c, x, y, None),
+        _ => Ok(value_cmp(a, b)),
+    }
 }

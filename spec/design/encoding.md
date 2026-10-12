@@ -638,7 +638,10 @@ shape suffix:
    (§2.4/§2.6), `decimal-order-preserving` (§2.5), `uuid-raw16` (§2.7), `bool-byte` (§2.9), the i64/i32
    timestamp/date rule, `interval-span-i128` (§2.10), or `float-order-preserving` (§2.8) — each
    self-delimiting (fixed-width or `0x00`-terminated), so the next marker (or the terminator) follows
-   unambiguously under `memcmp`. The element is a **key-encodable scalar**; a **composite** element
+   unambiguously under `memcmp`. A **collated** `text[]` column (a non-`C` column collation,
+   [collation.md §1](collation.md)) encodes each present text element as its `text-collated-sortkey`
+   (§2.12) instead — also self-delimiting (it ends with the element's §2.4 C-key), so the array
+   orders by its elements' collation order and the rest of the layout is unchanged. The element is a **key-encodable scalar**; a **composite** element
    makes the whole array `0A000` at the DDL gate, never reaching this rule — this is the lone
    deferred key case even though the bare `composite` container is itself now keyable (§2.15): the
    array element key path admits only scalars, so an `array`-of-`composite` key is a follow-on. A

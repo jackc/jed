@@ -1439,7 +1439,7 @@ pub(crate) fn resolve_aggregate(
     }
 }
 
-/// The comparison collation of a text `MIN`/`MAX` (spec/design/collation.md §1 "Aggregates and
+/// The comparison collation of a text / text[] `MIN`/`MAX` (spec/design/collation.md §1 "Aggregates and
 /// window functions"): the operand's own derivation, so a conflicted or indeterminate operand is
 /// 42P22 (PostgreSQL raises it once two values compare). `None` for any other aggregate.
 pub(crate) fn minmax_collation(
@@ -1448,7 +1448,7 @@ pub(crate) fn minmax_collation(
     args: &[Expr],
     result: &ResolvedType,
 ) -> Result<Option<std::sync::Arc<Collation>>> {
-    if !matches!(plan, AggPlan::Min | AggPlan::Max) || *result != ResolvedType::Text {
+    if !matches!(plan, AggPlan::Min | AggPlan::Max) || !result.collatable() {
         return Ok(None);
     }
     match args.first() {
@@ -1516,7 +1516,7 @@ pub(crate) fn resolve_ordered_set_aggregate(
     // finalize sort applies it (an unmapped code point → 0A000 there).
     let collation: Option<std::sync::Arc<Collation>> = match &key.collation {
         Some(name) => {
-            if !matches!(optype, ResolvedType::Text) {
+            if !optype.collatable() {
                 return Err(type_error(format!(
                     "collations are not supported by type {}",
                     optype.type_name()
@@ -1526,7 +1526,7 @@ pub(crate) fn resolve_ordered_set_aggregate(
         }
         // Otherwise the key's derived collation (collation.md §1): a column key's frozen collation,
         // an expression key's derivation; an indeterminate key is 42P21 (a sort target).
-        None if optype == ResolvedType::Text => {
+        None if optype.collatable() => {
             sort_target_collation(scope.catalog, order_key_deriv(scope, key)?)?
         }
         None => None,
@@ -1703,7 +1703,7 @@ pub(crate) fn resolve_hypothetical_set_aggregate(
         // The key's collation (explicit COLLATE — text only — or a column's frozen collation), §13.
         let collation: Option<std::sync::Arc<Collation>> = match &key.collation {
             Some(cn) => {
-                if !matches!(ktype, ResolvedType::Text) {
+                if !ktype.collatable() {
                     return Err(type_error(format!(
                         "collations are not supported by type {}",
                         ktype.type_name()
@@ -1711,7 +1711,7 @@ pub(crate) fn resolve_hypothetical_set_aggregate(
                 }
                 resolve_collation_name(scope.catalog, cn)?
             }
-            None if ktype == ResolvedType::Text => {
+            None if ktype.collatable() => {
                 sort_target_collation(scope.catalog, order_key_deriv(scope, key)?)?
             }
             None => None,
@@ -2336,7 +2336,7 @@ pub(crate) fn resolve_window_def(
         let (rexpr, ty) = resolve(scope, key, None, key_ctx, params)?;
         // Partitioning groups by byte equality, but an indeterminate key is still 42P21
         // (spec/design/collation.md §1 "A sort or grouping target").
-        if ty == ResolvedType::Text {
+        if ty.collatable() {
             reject_indeterminate_target(&derive_collation(scope, key)?)?;
         }
         partition.push(window_key_slot(rexpr, "PARTITION BY", window_keys)?);
@@ -2355,7 +2355,7 @@ pub(crate) fn resolve_window_def(
         // determination (window.md §3/§5); `COLLATE "C"` resolves to `None` (the raw-byte fast path).
         let coll = match &key.collation {
             Some(cn) => {
-                if !matches!(ty, ResolvedType::Text | ResolvedType::Null) {
+                if !ty.collatable() && ty != ResolvedType::Null {
                     return Err(type_error(format!(
                         "collations are not supported by type {}",
                         ty.type_name()

@@ -26,6 +26,7 @@ import {
   cloneAcc,
   cmpBytes,
   coerceForStore,
+  collatedSortKey,
   distinctRowKey,
   evalExpr,
   finalizeAcc,
@@ -37,7 +38,6 @@ import {
 import { COSTS } from "./costs.ts";
 import { entryBytes, rowBytes } from "./memsize.ts";
 import { engineError } from "./errors.ts";
-import { sortKey as collationSortKey } from "./collation.ts";
 import { intervalCmp } from "./interval.ts";
 import { rangeTotalCmp } from "./range.ts";
 import { jsonNodeCmp } from "./json.ts";
@@ -915,7 +915,7 @@ export function windowCollKeys(rows: Row[], order: OrderSlot[]): (Uint8Array | n
     for (const k of order) {
       if (k.collation === null) continue;
       const v = row[k.idx]!;
-      keys.push(v.kind === "text" ? collationSortKey(k.collation, v.text) : null);
+      keys.push(collatedSortKey(k.collation, v)); // NULL → null, handled by NULL placement
     }
     return keys;
   });
@@ -980,7 +980,7 @@ function collationKeysForRow(row: Row, order: OrderSlot[]): (Uint8Array | null)[
   for (const k of order) {
     if (k.collation === null) continue;
     const v = row[k.idx]!;
-    keys.push(v.kind === "text" ? collationSortKey(k.collation, v.text) : null);
+    keys.push(collatedSortKey(k.collation, v)); // NULL → null, handled by NULL placement
   }
   return keys;
 }

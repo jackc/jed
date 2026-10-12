@@ -257,12 +257,38 @@ SELECT 'ä' < 'z' COLLATE "de"                      -- per-expression collation 
   - **`IN (SELECT …)` and `op ANY/ALL (SELECT …)`** compare under the combination of the left
     operand and the subquery column's implicit collation — an ordering quantifier sorts by it, and a
     conflict is `42P22` (for `IN` / `= ANY` too: PostgreSQL's `texteq` demands a collation). The
-    **array** form `x op ANY/ALL (array)` compares under the left operand's derivation: an array
-    carries no collation in jed (a recorded narrowing — §15).
+    **array** form `x op ANY/ALL (array)` combines the left operand with the array's derivation
+    (below), the same way.
   - A conflicted input (a UNION ALL / VALUES column over two implicit collations) **yields** inside
     any of these nodes — PostgreSQL gives the node its default collation — so `coalesce(x, '')` over
     such a column is usable where a bare `x` is `42P22` (the exceptions: a plain `::text` cast and
     `min`/`max`'s own comparison, above).
+- **A `text[]` carries its elements' collation**, PostgreSQL's rule (an array of a collatable type
+  is itself collatable): every rule above applies to a `text[]` expression as to a `text` one, and
+  the collation orders the array's text elements.
+  - **Columns.** A `text[]` column takes a `COLLATE` clause, or inherits the database default,
+    frozen at `CREATE TABLE` / `ADD COLUMN` like a `text` column's; a column reference is implicit.
+    `COLLATE` on any other array (`i32[] COLLATE "C"`) is `42804`, as on any non-text type.
+  - **Expressions.** `COLLATE` applies to a `text[]` expression (explicit). `ARRAY[e1, …]` combines
+    its elements; a subscript or slice (`a[1]`, `a[1:2]`) carries its array's; a cast to `text[]`
+    or `text` passes its operand's through (`a::text` renders under `a`'s collation, a
+    `'{…}'::text[]` literal has none); an array-returning function (`array_append`, `array_cat`,
+    `regexp_match`, … — every catalog overload whose result is `anyarray` or `text[]`) combines its
+    arguments; `||` combines its operands; and the input-typed rules above (`CASE`, `COALESCE`,
+    `GREATEST`/`LEAST`, `min`/`max`, scalar subqueries, derived-relation and set-operation columns)
+    carry it unchanged. `unnest(a)`'s column carries `a`'s derivation as an implicit one, like a
+    derived-table column.
+  - **Comparison.** An ordering comparison of two `text[]` values (`<`, `ORDER BY`, `min`/`max`,
+    `GREATEST`/`LEAST`, a window or `WITHIN GROUP` key) walks the element pairs under the derived
+    collation; the array order is otherwise unchanged ([array.md §5](array.md)). Equality is byte
+    identity, as for `text` (§7), but `=`/`<>` and the containment operators `@>`/`<@`/`&&` still
+    combine their operands' derivations, so two different implicit collations are `42P22`
+    (PostgreSQL's element `texteq` demands one). `x op ANY/ALL (a)` combines `x` with `a`.
+  - **Keys.** A collated `text[]` `PRIMARY KEY` / ordered index / `UNIQUE` column stores each
+    present element as its UCA sort key ([encoding.md §2.14](encoding.md)), so its tree iterates in
+    collation order and the skew guards and the upgrade migration (§12) cover it like a text key.
+    Array functions that compare elements (`array_position`, `array_remove`, `array_replace`) never
+    demand a collation (§15).
 - **A sort or grouping target must not be indeterminate.** An `ORDER BY`, `GROUP BY`, `DISTINCT` /
   `DISTINCT ON`, window `PARTITION BY` / `ORDER BY`, or `WITHIN GROUP` key whose expression combines
   two different implicit collations (`ORDER BY lpad(a, 2, b)`, `GROUP BY coalesce(a, b)`) is **`42P21`**
@@ -480,7 +506,8 @@ table.** Two pieces, both small:
 
 The per-column collation rides the slot [format.md](../fileformat/format.md) already reserves
 for it (the per-column flags + typmod-adjacent field, where `varchar(n)` and the composite/array
-type descriptors live). An **index entry** records the collation it was built under by
+type descriptors live); a `text[]` column's rides its array entry the same way (`format_version`
+36). An **index entry** records the collation it was built under by
 `(name, unicode_version, cldr_version)`.
 
 The on-disk bytes are version-independent of any table: every core with a **loaded bundle at the same
@@ -745,7 +772,11 @@ Collation is a §8 divergence hotspot handled by the established machinery:
   `row_produced`, and its decorate sorter builds each row's sort key exactly once. (The original plan
   named ORDER BY as a metering site; the comparison evaluator is the one deterministic, meterable
   point — the set-operation sort path carries no `Meter` at all — so the spec is refined to charge
-  there, which is consistent with sorts being unmetered.)
+  there, which is consistent with sorts being unmetered.) A collated ordering comparison of two
+  `text[]` values charges the same unit per element pair it walks: `collate × (codepoints(x) +
+  codepoints(y))` for each pair of present text elements compared, up to and including the pair
+  that decides (a NULL element or the array shape decides without a charge), in place of the
+  uncollated array comparison's flat `operator_eval`.
 - **Collation *use* stays OUT of the determinism ledger.** Because a query runs over a **loaded**
   table with a jed-owned executor, it is a deterministic function of its inputs — precisely the
   outcome [determinism.md §3](determinism.md) demands. Which collations are loaded is a
@@ -913,7 +944,8 @@ sub-slices**, each independently testable (CLAUDE.md §10), in dependency order:
   `GREATEST`/`LEAST`, `min`/`max` (which also compare under it) and the input-typed window /
   ordered-set functions, scalar subqueries, and the `IN`/`ANY`/`ALL` subquery comparisons — with
   PG's parse-time `42P21` for an indeterminate sort/group target — §1 "Every other text-valued
-  expression". Still deferred: arrays carry no collation, §15.)*
+  expression"; and `text[]` columns, expressions, comparisons, and keys — §1 "A `text[]` carries
+  its elements' collation" (`format_version` 36).)*
 - **1e — collated keys** ✅ *landed*: the sort-key key encoding as a new
   [encoding.md §2.12](encoding.md) sub-section (`text-collated-sortkey`), a collated text
   `PRIMARY KEY` / ordered secondary index / `UNIQUE` whose stored key is the column collation's UCA
@@ -1157,13 +1189,14 @@ Recorded per CLAUDE.md §1:
   (§7) and returns the rows; PostgreSQL's hashing / sorting needs a collation and raises `42P22`.
   Relatedly, jed raises a `min`/`max` comparison conflict (`42P22`) when the query is planned, where
   PostgreSQL raises it only once two values are compared (so a one-row group succeeds there).
-- **Arrays carry no collation.** PostgreSQL gives a `text[]` expression its elements' collation, so
-  `x < ANY (ARRAY[y])` combines `x` and `y`, and an array comparison sorts its text elements under
-  it; jed compares a quantified array element under the left operand's derivation alone and orders
-  `text[]` values bytewise. (Equal results whenever the array holds literals or `C` values.)
+- **A `text[]` conflict is raised when the query is planned.** PostgreSQL raises `42P22` for
+  `a = b` / `a @> b` over two differently-collated `text[]` values only once its element `texteq` runs,
+  so arrays of different lengths (compared without reaching an element) or an empty input succeed
+  there; jed raises it at plan time, as for `text` (§1).
 - **Text functions never demand a collation of their own.** A few PostgreSQL string functions
-  (`replace`, `strpos`, `split_part`, …) look up their input collation to reject nondeterministic
-  collations, and so raise `42P22` when their arguments' collations conflict; jed has only
+  (`replace`, `strpos`, `split_part`, …) and the element-comparing array functions
+  (`array_position`, `array_positions`, `array_remove`, `array_replace`) look up their input
+  collation, and so raise `42P22` when their arguments' collations conflict; jed has only
   deterministic collations (§6) and collation-free kernels, so such a call succeeds and only a
   *consumer* of its indeterminate result (a comparison, a sort) errors.
 - **The bare binary is `C` / ASCII-only, like stock SQLite** (§16); PG ships Unicode casing/collation

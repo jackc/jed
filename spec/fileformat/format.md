@@ -17,7 +17,15 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 35)
+## Version scope (`format_version` 36)
+
+`format_version` **36** — **`text[]` column collations**
+([../design/collation.md §1](../design/collation.md)). An array column entry's `flags` byte gains
+bit6 `has_collation` — legal only when the element type is `text` (else `XX001`) — and, when set,
+the collation name (`u16` length + UTF-8) follows the element type descriptor. A collated `text[]`
+key encodes each present element as its UCA sort key ([../design/encoding.md
+§2.14](../design/encoding.md)). A file with no collated `text[]` column changes only by its version
+byte + meta CRC. Readers accept only the exact current version.
 
 `format_version` **35** — **host-function check dependencies**
 ([../design/extensibility.md §7.1](../design/extensibility.md)). Every `CHECK` entry in the table
@@ -800,7 +808,10 @@ An **array column** (a structural `T[]` type — `type_code == 15`, **v10**;
 descriptor**: a `u8 element_type_code` (the *Stable type codes* table — a scalar `1`–`13`, or `14`
 + a `u16 name_len` + name for a composite element; a nested-array element `15` is not a jed type).
 The element type is carried **inline** (no array-type catalog object — arrays are structural, not
-nominal), so an array column is self-describing. An array column is **not** a key this slice — an
+nominal), so an array column is self-describing. The entry's `flags` byte is a scalar column's bit1
+`not_null` plus, **new in v36**, bit6 `has_collation` for a `text[]` column with a non-`C`
+collation, whose name (`u16` length + UTF-8) then follows the element descriptor; the bit on a
+non-`text` element is `XX001`. An array column is **not** a key this slice — an
 array `PRIMARY KEY` / index / `UNIQUE` is rejected `0A000` at DDL ([../design/array.md §8](../design/array.md)).
 
 An **IDENTITY column** (`flags` bit 4 `is_identity`, **v15**; [../design/sequences.md §13](../design/sequences.md))

@@ -1165,8 +1165,9 @@ pub(crate) fn quantified_membership(
         m.charge(COSTS.operator_eval);
         m.charge(COSTS.decimal_work * ((decimal_cmp_work(lv, e) - 1) as i64));
         m.guard()?;
-        // A collated ORDERING comparison of two text values sorts by the collation (spec/design/
-        // collation.md §1 "IN / ANY / ALL"), charging `collate` per code point like `RExpr::Compare`.
+        // A collated ORDERING comparison of two text (or text[]) values sorts by the collation
+        // (spec/design/collation.md §1 "IN / ANY / ALL"), charging `collate` per code point like
+        // `RExpr::Compare`.
         let collated = match (collation, op, lv, e) {
             (
                 Some(c),
@@ -1177,6 +1178,27 @@ pub(crate) fn quantified_membership(
                 m.charge(COSTS.collate * (x.chars().count() as i64 + y.chars().count() as i64));
                 m.guard()?;
                 let ord = collated_cmp(c, x, y)?;
+                let res = match op {
+                    CmpOp::Lt => ord.is_lt(),
+                    CmpOp::Gt => ord.is_gt(),
+                    CmpOp::Le => ord.is_le(),
+                    _ => ord.is_ge(),
+                };
+                Some(if res {
+                    ThreeValued::True
+                } else {
+                    ThreeValued::False
+                })
+            }
+            // Two text[] values (an array-valued `x op ANY/ALL (SELECT …)`) walk their element pairs
+            // under the collation, charging `collate` per compared pair (collation.md §11).
+            (
+                Some(c),
+                CmpOp::Lt | CmpOp::Gt | CmpOp::Le | CmpOp::Ge,
+                Value::Array(x),
+                Value::Array(y),
+            ) => {
+                let ord = collated_array_cmp(c, x, y, Some(m))?;
                 let res = match op {
                     CmpOp::Lt => ord.is_lt(),
                     CmpOp::Gt => ord.is_gt(),

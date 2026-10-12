@@ -655,7 +655,7 @@ impl Engine {
                     GroupKeyResolved::Expr(rexpr, ty, canon) => {
                         // Grouping is byte equality, but an indeterminate key is still 42P21
                         // (spec/design/collation.md §1 "A sort or grouping target").
-                        if ty == ResolvedType::Text {
+                        if ty.collatable() {
                             reject_indeterminate_target(&derive_collation(&scope, &canon)?)?;
                         }
                         if matches!(ty, ResolvedType::Json) {
@@ -1016,7 +1016,7 @@ impl Engine {
                     }
                     let coll = match &key.collation {
                         Some(name) => {
-                            if !scope.column_of(r).ty.is_text() {
+                            if !scope.column_of(r).ty.is_collatable() {
                                 return Err(type_error(format!(
                                     "collations are not supported by type {}",
                                     scope.column_of(r).ty.canonical_name()
@@ -1044,11 +1044,11 @@ impl Engine {
                         ));
                     }
                     // The sort key's collation (collation.md §1/§7). An explicit `COLLATE` must be on a
-                    // text column (42804) and name a loaded collation ("C" → byte order, else 42704);
+                    // text / text[] column (42804) and name a loaded collation ("C" → byte order, else 42704);
                     // absent a clause, the key inherits the column's frozen (implicit) collation.
                     let coll = match &key.collation {
                         Some(name) => {
-                            if !scope.column_of(r).ty.is_text() {
+                            if !scope.column_of(r).ty.is_collatable() {
                                 return Err(type_error(format!(
                                     "collations are not supported by type {}",
                                     scope.column_of(r).ty.canonical_name()
@@ -1157,7 +1157,7 @@ impl Engine {
                     // explicit, a bare text column its frozen collation, every other shape resets to C).
                     let coll = match &key.collation {
                         Some(cn) => {
-                            if !matches!(ty, ResolvedType::Text | ResolvedType::Null) {
+                            if !ty.collatable() && ty != ResolvedType::Null {
                                 return Err(type_error(format!(
                                     "collations are not supported by type {}",
                                     ty.type_name()

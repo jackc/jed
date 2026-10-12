@@ -9,6 +9,7 @@ import {
   cmpBytes,
   collectColumn,
   elemScalarHint,
+  encodeArrayKey,
   isAggregateName,
   isHypotheticalSetName,
   isOrderedSetAggregateName,
@@ -30,6 +31,7 @@ import {
   resolvedTypeEqual,
   resolvedTypeOf,
   resolvedTypeOfCol,
+  rtCollatable,
   rtName,
   scalarPairCastable,
   undefinedColumn,
@@ -109,7 +111,7 @@ import {
   promoteFloat,
   roundToWidth,
   scalarTypeFromName,
-  typeIsText,
+  typeIsCollatable,
 } from "./types.ts";
 import { parseTimestamp } from "./timestamp.ts";
 import type { InputZone } from "./timezone.ts";
@@ -130,7 +132,10 @@ import { foldLowerSimple, loadedProperty, sortKey as collationSortKey } from "./
 import { compileRegex } from "./regex.ts";
 import type { Collation } from "./collation.ts";
 import { AGGREGATES, OPERATORS, WINDOWS } from "./operators.ts";
-import type { Value } from "./value.ts";
+import type { ArrayShape, Value } from "./value.ts";
+import { arrayShapeCmp } from "./value.ts";
+import { COSTS } from "./costs.ts";
+import { valueCmp } from "./window.ts";
 import type { JsonNode, PathSetMode } from "./json.ts";
 import { Decimal } from "./decimal.ts";
 export function resolveProjections(
@@ -244,7 +249,7 @@ export function resolveProjections(
     types.push(type);
     // The output column's collation derivation (spec/design/collation.md §1 "Derived relations"),
     // which a derived table / CTE over this body carries into its synthetic column.
-    derivs.push(type.kind === "text" ? deriveCollation(scope, it.expr) : { kind: "none" });
+    derivs.push(rtCollatable(type) ? deriveCollation(scope, it.expr) : { kind: "none" });
     names.push(it.alias ?? outputName(scope, it.expr));
   }
   return { nodes, names, types, derivs };
@@ -962,13 +967,13 @@ export function resolve(
     }
     case "collate": {
       // `expr COLLATE "name"` (spec/design/collation.md §1) — a postfix collation operator. Resolve
-      // the inner expression, require a collatable (text) type (42804, PG-matching), and validate the
+      // the inner expression, require a collatable (text / text[]) type (42804, PG-matching), and validate the
       // named collation exists ("C" or loaded, else 42704). A runtime PASSTHROUGH: a collation only
       // changes the ORDERING comparisons / ORDER BY, derived from the AST at those sites
       // (explicitCollation / OrderKey.collation), so resolving returns the inner node + type
       // unchanged. The hint flows through (COLLATE never changes the type).
       const r = resolve(scope, e.inner, ctx, ag, params);
-      if (r.type.kind !== "text" && r.type.kind !== "null") {
+      if (!rtCollatable(r.type) && r.type.kind !== "null") {
         throw typeError(`collations are not supported by type ${rtName(r.type)}`);
       }
       resolveCollationName(scope.catalog, e.collation); // surfaces 42704 for an unknown name
@@ -1854,9 +1859,9 @@ export function resolve(
       const args = resolved.map((r) =>
         unified.kind === "float" ? widenTo(r.node, r.type, unified.ty) : r.node,
       );
-      // Text arguments derive one comparison collation (42P21/42P22 on conflict — §52).
+      // Text / text[] arguments derive one comparison collation (42P21/42P22 on conflict — §52).
       let collation: Collation | null = null;
-      if (unified.kind === "text") {
+      if (rtCollatable(unified)) {
         let deriv: Deriv = { kind: "none" };
         for (const a of e.args) deriv = combineDeriv(deriv, deriveCollation(scope, a));
         collation = resolveDeriv(scope.catalog, deriv);
@@ -1932,11 +1937,11 @@ export function deriveCollation(scope: Scope, e: Expr): Deriv {
     return combineDerivs(scope, e.args);
   }
   if (scope.storageCollation) return { kind: "none" };
-  // A cast to text keeps its operand's derivation; a varchar(n) length coercion is a node of its
-  // own (PostgreSQL), so it combines like a function and a conflicted operand yields.
+  // A cast to text / text[] keeps its operand's derivation (a non-collatable operand derives none);
+  // a varchar(n) length coercion is a node of its own (PostgreSQL), so it combines like a function
+  // and a conflicted operand yields.
   if (e.kind === "cast") {
-    const t = scalarTypeFromName(e.typeName);
-    if (t === undefined || !isText(t)) return { kind: "none" };
+    if (!castTargetCollatable(e.typeName)) return { kind: "none" };
     const d = deriveCollation(scope, e.inner);
     return e.typeMod !== null ? combineDeriv({ kind: "none" }, d) : d;
   }
@@ -1948,6 +1953,11 @@ export function deriveCollation(scope: Scope, e: Expr): Deriv {
     return d;
   }
   if (e.kind === "coalesce" || e.kind === "greatestLeast") return combineDerivs(scope, e.args);
+  // ARRAY[e1, …] combines its elements, like a function's arguments (collation.md §1 "A text[]
+  // carries its elements' collation").
+  if (e.kind === "array") return combineDerivs(scope, e.elements);
+  // A subscript or slice carries its array's collation (the subscripts are integers).
+  if (e.kind === "subscript") return combineDeriv({ kind: "none" }, deriveCollation(scope, e.base));
   if (e.kind === "funcCall") {
     // An input-typed aggregate / window function (min/max, lag/lead/first_value/…): its value
     // arguments. FILTER and an in-aggregate ORDER BY contribute nothing.
@@ -1968,6 +1978,13 @@ export function deriveCollation(scope: Scope, e: Expr): Deriv {
     return scope.subqueryDerivs.get(e.query) ?? { kind: "none" };
   }
   return { kind: "none" };
+}
+
+// castTargetCollatable reports whether a cast's target type name is collatable — text (any of its
+// spellings, varchar(n) included) or an array of text.
+function castTargetCollatable(name: string): boolean {
+  const t = scalarTypeFromName(name.endsWith("[]") ? name.slice(0, -2) : name);
+  return t !== undefined && isText(t);
 }
 
 // combineDerivs combines the derivations of a node's inputs, starting from none — so a lone
@@ -2035,8 +2052,8 @@ function subqueryOutputDeriv(body: Deriv): Deriv {
 
 // membershipCollation is the comparison collation of `lhs IN / op ANY|ALL (SELECT …)`
 // (spec/design/collation.md §1): the left operand's derivation combined with the body column's,
-// which is implicit outside the subquery. A conflict is 42P22. null for a non-text or row-valued
-// comparison.
+// which is implicit outside the subquery. A conflict is 42P22. null for a non-collatable or
+// row-valued comparison.
 function membershipCollation(
   scope: Scope,
   lhs: Expr,
@@ -2045,7 +2062,7 @@ function membershipCollation(
   rowValued: boolean,
   plan: QueryPlan,
 ): Collation | null {
-  if (rowValued || lt.kind !== "text" || elem.kind !== "text") return null;
+  if (rowValued || !rtCollatable(lt) || !rtCollatable(elem)) return null;
   const d = combineDeriv(
     deriveCollation(scope, lhs),
     subqueryOutputDeriv(queryPlanColumnDerivs(plan)[0]!),
@@ -2081,14 +2098,17 @@ let collatableFunctionNames: Set<string> | null = null;
 
 // functionResultCollatable reports whether a scalar function's result carries its arguments'
 // collation (spec/design/collation.md §1 "Function results"): read from the shared function catalog —
-// any kind = "function" overload whose result is text. A non-text argument derives no collation, so
-// an overload taking only non-text arguments (the range lower/upper) contributes nothing.
+// any kind = "function" overload whose result is text, text[], or anyarray. A non-collatable
+// argument derives no collation, so an overload taking only non-text arguments (the range
+// lower/upper, array_append over i32[]) contributes nothing.
 function functionResultCollatable(name: string): boolean {
   if (collatableFunctionNames === null) {
     collatableFunctionNames = new Set(
-      OPERATORS.filter((o) => o.kind === "function" && o.result === "text").map((o) =>
-        asciiLower(o.name),
-      ),
+      OPERATORS.filter(
+        (o) =>
+          o.kind === "function" &&
+          (o.result === "text" || o.result === "text[]" || o.result === "anyarray"),
+      ).map((o) => asciiLower(o.name)),
     );
   }
   return collatableFunctionNames.has(asciiLower(name));
@@ -2132,12 +2152,12 @@ export function columnDeriv(scope: Scope, resolve: () => Resolved): Deriv {
   return catColumnDeriv(col);
 }
 
-// catColumnDeriv is a column's derivation: implicit for a text column (its frozen collation, C if
-// none), unless it is a synthetic relation's column whose body output derived no collation
+// catColumnDeriv is a column's derivation: implicit for a text / text[] column (its frozen
+// collation, C if none), unless it is a synthetic relation's column whose body output derived no collation
 // (Column.noCollation) or settled to none over a conflict (Column.collationConflict —
 // spec/design/collation.md §1 "Derived relations").
 export function catColumnDeriv(col: Column): Deriv {
-  if (!typeIsText(col.type)) return { kind: "none" };
+  if (!typeIsCollatable(col.type)) return { kind: "none" };
   if (col.noCollation === true) return { kind: "none" };
   if (col.collationConflict === true) return { kind: "conflicted" };
   return { kind: "implicit", name: col.collation ?? "C" };
@@ -2198,6 +2218,59 @@ export function resolveDeriv(catalog: Engine, d: Deriv): Collation | null {
 // the collate cost and handles NULLs. Returns <0, 0, >0.
 export function collatedCmp(coll: Collation, a: string, b: string): number {
   return cmpBytes(collationSortKey(coll, a), collationSortKey(coll, b));
+}
+
+// collatedArrayCmp is arrayTotalCmp over two text[] values with their text elements compared under
+// coll (spec/design/collation.md §1, array.md §5). Each walked pair of present elements charges
+// collate per code point of both (collation.md §11) when m is non-null — the comparison operators and
+// GREATEST/LEAST; the unmetered sort/min/max paths pass null. A NULL element or the array shape
+// decides without a charge. [...s] counts code points (NOT s.length — the UTF-16 trap).
+export function collatedArrayCmp(
+  coll: Collation,
+  a: ArrayShape,
+  b: ArrayShape,
+  m: Meter | null,
+): number {
+  const n = Math.min(a.elements.length, b.elements.length);
+  for (let i = 0; i < n; i++) {
+    const x = a.elements[i]!;
+    const y = b.elements[i]!;
+    const xn = x.kind === "null";
+    const yn = y.kind === "null";
+    if (xn && yn) continue;
+    if (xn) return 1; // NULL sorts last
+    if (yn) return -1;
+    if (x.kind !== "text" || y.kind !== "text") {
+      throw new Error("BUG: a collated array comparison walks only text elements");
+    }
+    if (m !== null) {
+      m.charge(COSTS.collate * BigInt([...x.text].length + [...y.text].length));
+      m.guard();
+    }
+    const c = collatedCmp(coll, x.text, y.text);
+    if (c !== 0) return c;
+  }
+  return arrayShapeCmp(a, b);
+}
+
+// collatedSortKey is a collated sort's decoration for one value (spec/design/collation.md §8): a text
+// value's UCA sort key, a text[] value's collated array key (encoding.md §2.14 — memcmp-ordered
+// exactly like collatedArrayCmp), null for NULL. An unmapped code point is 0A000.
+export function collatedSortKey(coll: Collation, v: Value): Uint8Array | null {
+  if (v.kind === "text") return collationSortKey(coll, v.text);
+  if (v.kind === "array") return encodeArrayKey("text", v, coll);
+  return null;
+}
+
+// collatedOrValueCmp compares two non-NULL values under coll when it is set and they are text or
+// text[] (unmetered), else by the value order — the min/max fold and the hypothetical-set key
+// comparison.
+export function collatedOrValueCmp(coll: Collation | null, a: Value, b: Value): number {
+  if (coll !== null) {
+    if (a.kind === "text" && b.kind === "text") return collatedCmp(coll, a.text, b.text);
+    if (a.kind === "array" && b.kind === "array") return collatedArrayCmp(coll, a, b, null);
+  }
+  return valueCmp(a, b);
 }
 
 export function resolveBinary(
@@ -2345,15 +2418,15 @@ export function resolveBinary(
         cl = widenFloatTo(p.rl, p.lt.ty, w);
         cr = widenFloatTo(p.rr, p.rt.ty, w);
       }
-      // Derive the comparison's collation (spec/design/collation.md §1/§7). Only a text×text
-      // comparison is collatable; a COLLATE on a non-text operand was already rejected 42804 at the
-      // collate node. Each operand's derivation (explicit COLLATE / implicit column collation / none)
+      // Derive the comparison's collation (spec/design/collation.md §1/§7). Only a text×text or
+      // text[]×text[] comparison is collatable; a COLLATE on a non-collatable operand was already
+      // rejected 42804 at the collate node. Each operand's derivation (explicit COLLATE / implicit column collation / none)
       // is combined per PG's rules: two different EXPLICIT collations conflict (42P21); two different
       // IMPLICIT collations are indeterminate (42P22 when consumed here). Derived for ALL comparison
       // ops incl =/<> (PG raises regardless), even though =/<> ignore the collation at eval (byte
       // equality, §7).
       let collation: Collation | null = null;
-      if (p.lt.kind === "text" && p.rt.kind === "text") {
+      if (rtCollatable(p.lt) && rtCollatable(p.rt)) {
         const d = combineDeriv(deriveCollation(scope, lhs), deriveCollation(scope, rhs));
         collation = resolveDeriv(scope.catalog, d);
       }
@@ -2568,6 +2641,15 @@ export function resolveSetOp(
   // Both slots are anyarray: the element types must unify (a non-array / mismatch is 42883).
   const tys: ResolvedType[] = [rl.type, rr.type];
   if (!matchPoly(["anyarray", "anyarray"], tys).matched) throw noSetOpOverload();
+  // Element equality ignores the collation (byte identity, collation.md §7), but two text[] operands
+  // still combine their derivations, so two different implicit collations are 42P22 (PostgreSQL's
+  // element texteq demands one).
+  if (rtCollatable(rl.type) && rtCollatable(rr.type)) {
+    resolveDeriv(
+      scope.catalog,
+      combineDeriv(deriveCollation(scope, lhs), deriveCollation(scope, rhs)),
+    );
+  }
   return {
     node: { kind: "arrayFunc", func, args: [rl.node, rr.node] },
     type: { kind: "bool" },
@@ -3404,11 +3486,14 @@ export function resolveQuantified(
       `operator does not exist: ${rtName(rl.type)} ${binaryOpSymbol(op)} ${rtName(elem)}`,
     );
   }
-  // A text quantifier compares under the left operand's derivation alone (spec/design/collation.md
-  // §1): an array carries no collation in jed (a recorded narrowing, §15).
+  // A text quantifier compares under the left operand's derivation combined with the array's
+  // (spec/design/collation.md §1); a conflict is 42P22.
   const collation =
     rl.type.kind === "text" && elem.kind === "text"
-      ? resolveDeriv(scope.catalog, deriveCollation(scope, lhs))
+      ? resolveDeriv(
+          scope.catalog,
+          combineDeriv(deriveCollation(scope, lhs), deriveCollation(scope, array)),
+        )
       : null;
   return {
     node: { kind: "quantified", op, all, lhs: rl.node, array: ra.node, rowWise: false, collation },

@@ -108,7 +108,11 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // v35: every CHECK catalog entry gains a trailing `check_flags` byte (bit0 `has_host_deps`; bits 1-7
 // reserved 0) followed, when bit0 is set, by the v31 host-function dependency list
 // (spec/design/extensibility.md §7.1.3).
-const FORMAT_VERSION: u16 = 35;
+// v36: an array column entry's flags byte gains bit6 `has_collation` (legal only for a text
+// element), the collation name (u16 len + UTF-8) following the element descriptor; a collated
+// text[] key encodes each present element as its UCA sort key (spec/design/collation.md §1,
+// encoding.md §2.14).
+const FORMAT_VERSION: u16 = 36;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -3466,11 +3470,22 @@ fn table_entry_bytes(
             }
             Type::Array(elem) => {
                 // An array column (v10): type_code 15, flags, then the element type descriptor
-                // (spec/design/array.md §3). Arrays carry no default this slice (flags bits 2/3 = 0).
+                // (spec/design/array.md §3), then (v36, flags bit6) a text[] column's collation name.
+                // Arrays carry no default this slice (flags bits 2/3 = 0).
                 out.push(15);
-                let flags = if col.not_null { 0b10u8 } else { 0 };
+                let mut flags = if col.not_null { 0b10u8 } else { 0 };
+                // bit6 has_collation (v36) — a text[] column with a non-`C` effective collation;
+                // the name follows the element descriptor (spec/design/array.md §3).
+                if col.collation.is_some() {
+                    flags |= 0b100_0000;
+                }
                 out.push(flags);
                 push_array_element_type(&mut out, elem);
+                if let Some(coll) = &col.collation {
+                    let cb = coll.as_bytes();
+                    out.extend_from_slice(&(cb.len() as u16).to_be_bytes());
+                    out.extend_from_slice(cb);
+                }
             }
             Type::Range(elem) => {
                 // A range column (v16): type_code 17, flags, then the element type descriptor — one
@@ -4554,6 +4569,16 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
                 return Err(corrupt("reserved column flag bit0 set"));
             }
             let elem = read_array_element_type(buf, pos)?;
+            // bit6 has_collation (v36): a text[] column's non-`C` collation name follows the
+            // element descriptor; the bit on any other element type is corrupt (array.md §3).
+            let collation = if flags & 0b100_0000 != 0 {
+                if !elem.is_text() {
+                    return Err(corrupt("has_collation set on a non-text array column"));
+                }
+                Some(read_string(buf, pos)?)
+            } else {
+                None
+            };
             columns.push(Column {
                 name: cname,
                 ty: Type::Array(Box::new(elem)),
@@ -4564,7 +4589,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
                 default: None,
                 default_expr: None,
                 identity: None,
-                collation: None,
+                collation,
                 no_collation: false,
                 collation_conflict: false,
             });

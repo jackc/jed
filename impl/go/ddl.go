@@ -723,12 +723,12 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			}
 		}
 		// The column's effective collation, frozen now (spec/design/collation.md §1). An explicit
-		// COLLATE "name" is text-only (42804) and must name a loaded collation or C (42704); a text
-		// column without a clause inherits the per-database default. A C effective collation stores
-		// as "" (the fast path).
+		// COLLATE "name" is text / text[] only (42804) and must name a loaded collation or C (42704); a
+		// collatable column without a clause inherits the per-database default. A C effective
+		// collation stores as "" (the fast path).
 		collation := ""
 		if def.Collation != "" {
-			if !colType.IsText() {
+			if !colType.IsCollatable() {
 				return outcome{}, typeError(fmt.Sprintf(
 					"collations are not supported by type %s", colType.CanonicalName(),
 				))
@@ -739,7 +739,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			if def.Collation != "C" {
 				collation = def.Collation
 			}
-		} else if colType.IsText() {
+		} else if colType.IsCollatable() {
 			collation = db.readSnap().defaultCollation
 		}
 		columns = append(columns, catColumn{
@@ -2710,7 +2710,7 @@ func (db *engine) buildAlterAddedColumn(table *catTable, def *columnDef, pending
 
 	collation := ""
 	if def.Collation != "" {
-		if !ty.IsText() {
+		if !ty.IsCollatable() {
 			return catColumn{}, typeError("collations are not supported by type " + ty.CanonicalName())
 		}
 		if _, err := resolveCollationName(db, def.Collation); err != nil {
@@ -2719,7 +2719,7 @@ func (db *engine) buildAlterAddedColumn(table *catTable, def *columnDef, pending
 		if def.Collation != "C" {
 			collation = def.Collation
 		}
-	} else if ty.IsText() {
+	} else if ty.IsCollatable() {
 		collation = db.readSnap().defaultCollation
 	}
 	if tempScope && collation != "" {

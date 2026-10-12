@@ -1131,7 +1131,7 @@ func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string, unionA
 		// The non-recursive term fixed the relation's collation, so the UNION's overall common
 		// collation must equal it (PostgreSQL's recursive-CTE check, spec/design/collation.md §1): a
 		// recursive term cannot re-collate a column. Mismatch is 42P21.
-		if a[i].kind == rtText {
+		if a[i].collatable() {
 			ad := anchor.columnDerivs()[i]
 			overall, err := commonCollation([]deriv{ad, recursive.columnDerivs()[i]}, unionAll)
 			if err != nil {
@@ -1481,7 +1481,7 @@ func (db *engine) planSetOp(so *setOp, parent *scope, ctes []*cteBinding, ptypes
 	noneOK := so.Op == setOpUnion && so.All
 	columnDerivs := make([]deriv, len(columnTypes))
 	for i, t := range columnTypes {
-		if t.kind != rtText {
+		if !t.collatable() {
 			continue
 		}
 		d, err := commonCollation([]deriv{lhs.columnDerivs()[i], rhs.columnDerivs()[i]}, noneOK)
@@ -1502,12 +1502,12 @@ func (db *engine) planSetOp(so *setOp, parent *scope, ctes []*cteBinding, ptypes
 		// output column must be text (42804); the name resolves ("C", else loaded or 42704). Absent
 		// one, a text key sorts by the column's common collation.
 		var coll *Collation
-		if key.Collation == "" && columnTypes[idx].kind == rtText {
+		if key.Collation == "" && columnTypes[idx].collatable() {
 			if coll, err = resolveDeriv(db, columnDerivs[idx]); err != nil {
 				return nil, err
 			}
 		} else if key.Collation != "" {
-			if columnTypes[idx].kind != rtText {
+			if !columnTypes[idx].collatable() {
 				return nil, typeError("collations are not supported by this column's type")
 			}
 			if coll, err = resolveCollationName(db, key.Collation); err != nil {
@@ -1664,7 +1664,7 @@ func (db *engine) planValues(rows [][]*exprNode, parent *scope, ctes []*cteBindi
 	// UNION ALL one (an implicit conflict leaves it with none, never an error).
 	colDerivsOut := make([]deriv, arity)
 	for ci, t := range colTypes {
-		if t.kind != rtText {
+		if !t.collatable() {
 			continue
 		}
 		d, err := commonCollation(colDerivs[ci], true)

@@ -1342,6 +1342,26 @@ func resolveSetOp(s *scope, op binaryOp, lhs, rhs exprNode, ag *aggCtx, params *
 	if _, matched := matchPoly([]string{"anyarray", "anyarray"}, tys); !matched {
 		return nil, resolvedType{}, noSetOpOverload()
 	}
+	// Element equality ignores the collation (byte identity, collation.md §7), but two text[] operands
+	// still combine their derivations, so two different implicit collations are 42P22 (PostgreSQL's
+	// element texteq demands one).
+	if lt.collatable() && rt.collatable() {
+		ld, err := deriveCollation(s, lhs)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		rd, err := deriveCollation(s, rhs)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		d, err := combineDeriv(ld, rd)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if _, err := resolveDeriv(s.catalog, d); err != nil {
+			return nil, resolvedType{}, err
+		}
+	}
 	return &rExpr{kind: reArrayFunc, afunc: fn, sargs: []*rExpr{rl, rr}}, resolvedType{kind: rtBool}, nil
 }
 
@@ -1519,11 +1539,19 @@ func resolveQuantified(s *scope, q *quantifiedExpr, ag *aggCtx, params *paramTyp
 		return nil, resolvedType{}, newError(UndefinedFunction,
 			fmt.Sprintf("operator does not exist: %s %s %s", rtName(lt), binaryOpSymbol(q.Op), rtName(*at.elem)))
 	}
-	// A text quantifier compares under the left operand's derivation alone (spec/design/collation.md
-	// §1): an array carries no collation in jed (a recorded narrowing, §15).
+	// A text quantifier compares under the left operand's derivation combined with the array's
+	// (spec/design/collation.md §1); a conflict is 42P22.
 	var coll *Collation
 	if lt.kind == rtText && at.elem.kind == rtText {
-		d, err := deriveCollation(s, q.Lhs)
+		ld, err := deriveCollation(s, q.Lhs)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		ad, err := deriveCollation(s, q.Array)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		d, err := combineDeriv(ld, ad)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}

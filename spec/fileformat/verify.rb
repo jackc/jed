@@ -27,7 +27,9 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 35 # v35: every CHECK entry gains a trailing check_flags byte (extensibility.md §7.1.3).
+VERSION = 36 # v36: an array column entry's flags gain bit6 has_collation (a text[] column's
+# non-C collation, the name after the element descriptor) and a collated text[] key stores each
+# element's sort key (collation.md §1, encoding.md §2.14). v35: every CHECK entry gains a trailing check_flags byte (extensibility.md §7.1.3).
 # format_version 35: after each check's expression text, a u8 check_flags (bit0 has_host_deps; bits
 # 1-7 reserved, written 0) and, only when bit0 is set, the v31 host-function dependency list (same
 # bytes as the per-index list below). A fixture writes it as `host_deps:` on the check Hash.
@@ -1243,6 +1245,21 @@ COLLATION_PK_TABLE = {
              rows: [["a", "b"], ["z", "a"]] }]
 }.freeze
 
+# collation_array_table (v36): a collated text[] PRIMARY KEY + a collated text[] secondary index
+# (collation.md §1, encoding.md §2.14): each present element of both keys is the `unicode` UCA SORT
+# KEY (the pinned sortkey.toml vectors), so the B-tree iterates in collation order — {a} < {a,Z} <
+# {A} < {b}. Must match the cores' collation_array_table_db.
+COLLATION_ARRAY_TABLE = {
+  collations: [
+    { name: "unicode", default: false, unicode: "17.0.0", cldr: "", desc: "" }
+  ],
+  tables: [{ name: "t",
+             columns: [col("k", "text[]", pk: true, collation: "unicode"),
+                       col("tags", "text[]", collation: "unicode")],
+             indexes: [{ name: "t_tags_idx", cols: [1] }],
+             rows: [[["A"], ["b", nil]], [["a", "Z"], ["a"]], [["b"], ["z"]], [["a"], nil]] }]
+}.freeze
+
 # collation_skew_corrupt (v18): a version-SKEWED collated table — the read-safety regression fixture
 # for the deferred collated-index pushdown follow-on (spec/design/collation.md §8/§12/§14). The
 # `unicode` reference entry is pinned to a BOGUS 9999.0.0 (≠ the loaded 17.0.0 bundle), so on open the
@@ -1388,6 +1405,8 @@ FIXTURES = ([
     collations: COLLATION_TABLE[:collations], tables: COLLATION_TABLE[:tables] },
   { file: "collation_pk_table.jed", page_size: 256,
     collations: COLLATION_PK_TABLE[:collations], tables: COLLATION_PK_TABLE[:tables] },
+  { file: "collation_array_table.jed", page_size: 256,
+    collations: COLLATION_ARRAY_TABLE[:collations], tables: COLLATION_ARRAY_TABLE[:tables] },
   { file: "collation_skew_corrupt.jed", page_size: 256,
     collations: COLLATION_SKEW_CORRUPT_TABLE[:collations], tables: COLLATION_SKEW_CORRUPT_TABLE[:tables] },
   { file: "collation_skew_twin.jed", page_size: 256,
@@ -1571,7 +1590,7 @@ def key_body(type, v, collation = nil)
   end
 
   if (aelem = array_elem(type))
-    return encode_array_key(aelem, v)
+    return encode_array_key(aelem, v, collation)
   end
 
   if (cfields = composite_fields(type))
@@ -1713,8 +1732,9 @@ end
 # suffix (ndim, per-dim u32 BE length + i32 int-be-signflip lower bound). memcmp reproduces
 # array_total_cmp (array.md §5). `val` is the array fixture value (a flat Array = 1-D lower bound 1,
 # or a Hash {dims:, lbounds:, elements:}). The element is a key-encodable scalar (the DDL gate), so
-# key_body with the C byte order encodes each present element.
-def encode_array_key(elem, val)
+# key_body encodes each present element — under `collation`, a collated text[] column's (v36), each
+# text element's UCA sort key; nil is the C byte order.
+def encode_array_key(elem, val, collation = nil)
   if val.is_a?(Hash)
     dims = val[:dims]
     lbounds = val[:lbounds]
@@ -1730,7 +1750,7 @@ def encode_array_key(elem, val)
       out << [0x02].pack("C") # NULL element — sorts after every present element
     else
       out << [0x01].pack("C") # present element marker
-      out << key_body(elem, e)
+      out << key_body(elem, e, collation)
     end
   end
   out << [0x00].pack("C") # terminator — a shorter element list sorts before a longer one
@@ -1948,11 +1968,16 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
       next
     end
     # An array column (v10): type_code 15, flags, then the element-type descriptor
-    # (spec/design/array.md §3). Array columns carry no default this slice (bits 2/3 = 0).
+    # (spec/design/array.md §3). Array columns carry no default this slice (bits 2/3 = 0). A text[]
+    # column with a non-C collation sets bit6 has_collation (v36) and appends the name after the
+    # element descriptor.
     if (elem = array_elem(c[:type]))
       out << [15].pack("C")
-      out << [c[:not_null] ? 0b10 : 0].pack("C")
+      aflags = c[:not_null] ? 0b10 : 0
+      aflags |= 0b100_0000 if c[:collation]
+      out << [aflags].pack("C")
       push_array_element_type(out, elem)
+      out << u16(c[:collation].bytesize) << c[:collation].b if c[:collation]
       next
     end
     # A range column (v15): type_code 17, flags, then the element-type descriptor — one scalar
@@ -3399,9 +3424,18 @@ def decode_table_entry(buf, pos)
       raise "reserved flag bit0 set (retired primary_key bit — v5)" if (af & 0b01) != 0
 
       elem_type, pos = read_array_element_type(buf, pos)
+      # bit6 has_collation (v36): a text[] column's collation name follows the element descriptor.
+      collation = nil
+      if (af & 0b100_0000) != 0
+        raise "has_collation set on a non-text array column (v36)" unless elem_type == "text"
+
+        cl, pos = take(buf, pos, 2)
+        cb, pos = take(buf, pos, cl.unpack1("n"))
+        collation = cb.force_encoding("UTF-8")
+      end
       columns << { name: cname, type: "#{elem_type}[]", pk: false, not_null: (af & 0b10) != 0,
                    precision: nil, scale: nil, varchar_len: nil, default: :none,
-                   default_expr: nil, identity: nil, collation: nil }
+                   default_expr: nil, identity: nil, collation: collation }
       next
     end
     # A range column (v15, type_code 17): flags, then the element-type descriptor — one scalar code

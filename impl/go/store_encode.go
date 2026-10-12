@@ -879,7 +879,7 @@ func encodeTypedKey(ty dataType, value Value, coll *Collation) ([]byte, error) {
 		if ty.Array == nil {
 			panic("an array key value has an array column type")
 		}
-		return encodeArrayKey(ty.Array.ScalarTy(), value.arrayVal())
+		return encodeArrayKey(ty.Array.ScalarTy(), value.arrayVal(), coll)
 	}
 	return encodeKeyValue(ty.ScalarTy(), value, coll)
 }
@@ -891,9 +891,9 @@ func encodeTypedKey(ty dataType, value Value, coll *Collation) ([]byte, error) {
 // shorter list reaches the 0x00 terminator first; then the shape suffix (ndim, then per dimension a
 // u32 BE length and the i32 int-be-signflip lower bound). The element is a key-encodable scalar (float
 // elements included since the §2.8 lift; the DDL gate rejects only a composite element 0A000), so the
-// per-element key is encodeKeyValue with the C byte order (a collated array-element key is not a
-// feature this slice).
-func encodeArrayKey(elem scalarType, a *ArrayVal) ([]byte, error) {
+// per-element key is encodeKeyValue — under coll, a collated text[] column's collation, each text
+// element's §2.12 sort key (nil is the C byte order).
+func encodeArrayKey(elem scalarType, a *ArrayVal, coll *Collation) ([]byte, error) {
 	var out []byte
 	for _, e := range a.Elements {
 		if e.Kind == ValNull {
@@ -901,7 +901,7 @@ func encodeArrayKey(elem scalarType, a *ArrayVal) ([]byte, error) {
 			continue
 		}
 		out = append(out, 0x01) // present element marker
-		eb, err := encodeKeyValue(elem, e, nil)
+		eb, err := encodeKeyValue(elem, e, coll)
 		if err != nil {
 			return nil, err
 		}
@@ -922,8 +922,8 @@ func encodeArrayKey(elem scalarType, a *ArrayVal) ([]byte, error) {
 // composite's fields). Used at the column-key sites (PK member, index entry/prefix slot) where the
 // store's resolved colTypes are on hand; expression keys (never composite) stay on encodeTypedKey.
 // Scalar/array/range produce byte-identical output to encodeTypedKey; the extra arm is composite
-// (encoding.md §2.15). value is non-NULL (callers tag the §2.2 slot). coll selects a text column's
-// collated key form (§2.12); it never applies to a container element or a composite field.
+// (encoding.md §2.15). value is non-NULL (callers tag the §2.2 slot). coll selects a text / text[]
+// column's collated key form (§2.12/§2.14); it never applies to a composite field.
 func encodeColTypeKey(ct colType, value Value, coll *Collation) ([]byte, error) {
 	value, err := residentValue(value)
 	if err != nil {
@@ -935,7 +935,7 @@ func encodeColTypeKey(ct colType, value Value, coll *Collation) ([]byte, error) 
 	case ct.RangeElem != nil:
 		return encodeRangeKey(ct.RangeElem.Scalar, value.rangeVal()), nil
 	case ct.Elem != nil:
-		return encodeArrayKey(ct.Elem.Scalar, value.arrayVal())
+		return encodeArrayKey(ct.Elem.Scalar, value.arrayVal(), coll)
 	default:
 		return encodeKeyValue(ct.Scalar, value, coll)
 	}

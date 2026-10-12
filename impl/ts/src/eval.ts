@@ -48,6 +48,7 @@ import {
   coerceCaseValue,
   coerceDecimal,
   coerceStringToArray,
+  collatedArrayCmp,
   collatedCmp,
   countNulls,
   decodeByteaLiteral,
@@ -487,6 +488,26 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           m.charge(COSTS.collate * BigInt([...a.text].length + [...b.text].length));
           m.guard();
           const c = collatedCmp(e.collation, a.text, b.text);
+          let res: boolean;
+          switch (e.op) {
+            case "lt":
+              res = c < 0;
+              break;
+            case "gt":
+              res = c > 0;
+              break;
+            case "le":
+              res = c <= 0;
+              break;
+            default: // "ge"
+              res = c >= 0;
+          }
+          return { kind: "bool", value: res };
+        }
+        // Two text[] values walk their element pairs under the collation, charging collate per
+        // compared pair (collation.md §11).
+        if (a.kind === "array" && b.kind === "array") {
+          const c = collatedArrayCmp(e.collation, a, b, m);
           let res: boolean;
           switch (e.op) {
             case "lt":
@@ -1131,6 +1152,8 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           );
           m.guard();
           c = collatedCmp(e.collation, cv.text, best.text);
+        } else if (e.collation !== null && cv.kind === "array" && best.kind === "array") {
+          c = collatedArrayCmp(e.collation, cv, best, m);
         } else {
           m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(cv, best) - 1));
           m.charge(COSTS.varlenCompare * BigInt(varlenCompareWork(cv, best) - 1));
@@ -2197,6 +2220,30 @@ export function quantifiedMembership(
       m.charge(COSTS.collate * BigInt([...lv.text].length + [...e.text].length));
       m.guard();
       const c = collatedCmp(collation, lv.text, e.text);
+      let res: boolean;
+      switch (op) {
+        case "lt":
+          res = c < 0;
+          break;
+        case "gt":
+          res = c > 0;
+          break;
+        case "le":
+          res = c <= 0;
+          break;
+        default: // "ge"
+          res = c >= 0;
+      }
+      t = res ? "true" : "false";
+    } else if (
+      collation !== null &&
+      (op === "lt" || op === "gt" || op === "le" || op === "ge") &&
+      lv.kind === "array" &&
+      e.kind === "array"
+    ) {
+      // Two text[] values (an array-valued `x op ANY/ALL (SELECT …)`) walk their element pairs
+      // under the collation, charging collate per compared pair (collation.md §11).
+      const c = collatedArrayCmp(collation, lv, e, m);
       let res: boolean;
       switch (op) {
         case "lt":

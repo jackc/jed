@@ -1154,7 +1154,7 @@ export function eq3(a: Value, b: Value): ThreeValued {
 }
 
 // ArrayShape is the structural view of an array value (its shape + flattened elements).
-type ArrayShape = { dims: number[]; lbounds: number[]; elements: Value[] };
+export type ArrayShape = { dims: number[]; lbounds: number[]; elements: Value[] };
 
 function numArrEqual(a: number[], b: number[]): boolean {
   return a.length === b.length && a.every((x, i) => x === b[i]);
@@ -1185,6 +1185,12 @@ function arrayTotalCmp(a: ArrayShape, b: ArrayShape): number {
     const c = elemTotalCmp(a.elements[i]!, b.elements[i]!);
     if (c !== 0) return c;
   }
+  return arrayShapeCmp(a, b);
+}
+
+// arrayShapeCmp is arrayTotalCmp's tail once every shared element pair compared equal: fewer total
+// elements first, then smaller ndim, then per dimension smaller length and smaller lower bound.
+export function arrayShapeCmp(a: ArrayShape, b: ArrayShape): number {
   if (a.elements.length !== b.elements.length)
     return a.elements.length < b.elements.length ? -1 : 1;
   if (a.dims.length !== b.dims.length) return a.dims.length < b.dims.length ? -1 : 1;

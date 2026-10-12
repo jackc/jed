@@ -429,7 +429,17 @@ func (db *engine) resolveUnnest(args []*exprNode, alias *string, argScope *scope
 		if err != nil {
 			return nil, nil, err
 		}
-		return srfTable("unnest", alias, elemTy), &srfPlan{kind: srfUnnest, args: []*rExpr{r}}, nil
+		table := srfTable("unnest", alias, elemTy)
+		// The column carries the array's collation as an implicit one, like a derived-table column
+		// (spec/design/collation.md §1 "A text[] carries its elements' collation").
+		if t.collatable() {
+			d, err := deriveCollation(argScope, *args[0])
+			if err != nil {
+				return nil, nil, err
+			}
+			setSyntheticCollation(&table.Columns[0], d)
+		}
+		return table, &srfPlan{kind: srfUnnest, args: []*rExpr{r}}, nil
 	case rtNull:
 		return nil, nil, indeterminatePoly()
 	default:

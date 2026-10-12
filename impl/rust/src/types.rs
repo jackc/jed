@@ -553,6 +553,14 @@ impl Type {
     pub fn is_text(&self) -> bool {
         matches!(self, Type::Scalar(s) if s.is_text())
     }
+    /// Whether this type carries a collation (spec/design/collation.md §1): text, or an array of
+    /// text (an array of a collatable type is itself collatable, PostgreSQL's rule).
+    pub fn is_collatable(&self) -> bool {
+        match self {
+            Type::Array(e) => e.is_text(),
+            _ => self.is_text(),
+        }
+    }
     pub fn is_bytea(&self) -> bool {
         matches!(self, Type::Scalar(s) if s.is_bytea())
     }

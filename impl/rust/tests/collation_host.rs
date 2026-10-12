@@ -415,3 +415,90 @@ fn reference_only_file_round_trip() {
     drop(re);
     remove_db(&path);
 }
+
+// ---- text[] collation (format_version 36 — collation.md §1 "A text[] carries its elements' collation") ----
+
+fn array_texts(rows: Vec<Vec<Value>>) -> Vec<String> {
+    rows.into_iter()
+        .map(|r| match &r[0] {
+            v @ Value::Array(_) => v.render(),
+            other => panic!("expected an array, got {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn text_array_collation_inherits_default_and_round_trips() {
+    // An un-annotated text[] column inherits the per-database default (frozen), and a collated text[]
+    // PRIMARY KEY stores its elements' sort keys — both survive a close + reopen (the array column
+    // entry's has_collation bit + name), and a write after reopen keys under the same collation.
+    load_unicode();
+    let path = tmp("text_array_collation.jed");
+    remove_db(&path);
+    let mut db = Database::create(CreateOptions {
+        path: Some(path.clone()),
+        skip_fsync: true,
+        page_size: 256,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    db.set_default_collation("unicode").unwrap();
+    db.query_outcome(
+        "CREATE TABLE t (k text[] PRIMARY KEY, c text[] COLLATE \"C\")",
+        &[],
+    )
+    .unwrap();
+    db.query_outcome(
+        "INSERT INTO t VALUES ('{b}','{b}'),('{A}','{A}'),('{a}','{a}')",
+        &[],
+    )
+    .unwrap();
+    db.commit().unwrap();
+    drop(db);
+
+    let mut re = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
+    re.query_outcome("INSERT INTO t VALUES ('{B}','{B}')", &[])
+        .unwrap();
+    // No ORDER BY: a single-table scan returns the stored (unicode-keyed) PK order.
+    assert_eq!(
+        array_texts(query(&mut re, "SELECT k FROM t")),
+        vec!["{a}", "{A}", "{b}", "{B}"]
+    );
+    assert_eq!(
+        array_texts(query(&mut re, "SELECT c FROM t ORDER BY c")),
+        vec!["{A}", "{B}", "{a}", "{b}"]
+    );
+    drop(re);
+    remove_db(&path);
+}
+
+#[test]
+fn text_array_collation_conflict_is_raised_at_plan_time() {
+    // A deliberate PG divergence (collation.md §15): PostgreSQL raises 42P22 for `a = c` over two
+    // differently-collated text[] values only once its element texteq runs, so an empty table (or
+    // arrays of different lengths) succeeds there; jed derives the conflict when the query is planned.
+    load_unicode();
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    db.query_outcome(
+        "CREATE TABLE t (a text[] COLLATE \"unicode\", c text[] COLLATE \"C\")",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        db.query_outcome("SELECT a = c FROM t", &[])
+            .unwrap_err()
+            .code(),
+        "42P22"
+    );
+}

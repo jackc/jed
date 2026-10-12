@@ -383,3 +383,44 @@ test("upgradeCollations clears the skew", () => {
   exec(reopened, `INSERT INTO t VALUES ('c')`); // writable after upgrade
   assert.equal(reopened.upgradeCollations(), 0); // idempotent no-op
 });
+
+// ---- text[] collation (format_version 36 — collation.md §1 "A text[] carries its elements' collation") ----
+
+test("text[] collation inherits the default and round trips", () => {
+  // An un-annotated text[] column inherits the per-database default (frozen), and a collated text[]
+  // PRIMARY KEY stores its elements' sort keys — both survive a close + reopen (the array column
+  // entry's has_collation bit + name), and a write after reopen keys under the same collation.
+  loadFixtureBundle();
+  const dir = mkdtempSync(join(tmpdir(), "jed-coll-"));
+  const path = join(dir, "text_array_collation.jed");
+  try {
+    const db = create(path, { pageSize: 256 });
+    db.setDefaultCollation("unicode");
+    exec(db, `CREATE TABLE t (k text[] PRIMARY KEY, c text[] COLLATE "C")`);
+    exec(db, `INSERT INTO t VALUES ('{b}','{b}'),('{A}','{A}'),('{a}','{a}')`);
+    commit(db);
+    close(db);
+
+    const re = open(path);
+    exec(re, `INSERT INTO t VALUES ('{B}','{B}')`);
+    // No ORDER BY: a single-table scan returns the stored (unicode-keyed) PK order.
+    assert.deepEqual(query(re, `SELECT k FROM t`), [["{a}"], ["{A}"], ["{b}"], ["{B}"]]);
+    assert.deepEqual(query(re, `SELECT c FROM t ORDER BY c`), [["{A}"], ["{B}"], ["{a}"], ["{b}"]]);
+    close(re);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("text[] collation conflict is raised at plan time", () => {
+  // A deliberate PG divergence (collation.md §15): PostgreSQL raises 42P22 for `a = c` over two
+  // differently-collated text[] values only once its element texteq runs, so an empty table (or
+  // arrays of different lengths) succeeds there; jed derives the conflict when the query is planned.
+  loadFixtureBundle();
+  const db = new Engine();
+  exec(db, `CREATE TABLE t (a text[] COLLATE "unicode", c text[] COLLATE "C")`);
+  assert.equal(
+    errCode(() => query(db, `SELECT a = c FROM t`)),
+    "42P22",
+  );
+});

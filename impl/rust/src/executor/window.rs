@@ -436,10 +436,8 @@ pub(crate) fn window_coll_keys(
         let mut keys = Vec::new();
         for (idx, _, _, coll) in order {
             if let Some(c) = coll {
-                keys.push(match &row[*idx] {
-                    Value::Text(s) => Some(collation::sort_key(c, s)?),
-                    _ => None, // NULL (a collated slot is text) — handled by NULL placement
-                });
+                // NULL (a collated slot is text / text[]) is `None` — handled by NULL placement.
+                keys.push(collation_sort_key(c, &row[*idx])?);
             }
         }
         all.push(keys);
@@ -1066,10 +1064,7 @@ fn collation_keys_for_row(
     let mut keys = Vec::new();
     for (idx, _, _, coll) in order {
         if let Some(c) = coll {
-            keys.push(match &row[*idx] {
-                Value::Text(s) => Some(collation::sort_key(c, s)?),
-                _ => None,
-            });
+            keys.push(collation_sort_key(c, &row[*idx])?);
         }
     }
     Ok(keys)

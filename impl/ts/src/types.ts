@@ -579,6 +579,11 @@ export function typeIsBoolean(t: Type): boolean {
 export function typeIsText(t: Type): boolean {
   return t.kind === "scalar" && isText(t.scalar);
 }
+// typeIsCollatable reports whether this type carries a collation (spec/design/collation.md §1): text,
+// or an array of text (an array of a collatable type is itself collatable, PostgreSQL's rule).
+export function typeIsCollatable(t: Type): boolean {
+  return typeIsText(t) || (t.kind === "array" && typeIsText(t.elem));
+}
 export function typeIsBytea(t: Type): boolean {
   return t.kind === "scalar" && isBytea(t.scalar);
 }

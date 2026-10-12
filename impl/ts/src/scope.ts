@@ -425,6 +425,12 @@ export function typeNames(ts: ResolvedType[]): string[] {
   return ts.map(rtName);
 }
 
+// rtCollatable reports whether a resolved type carries a collation (spec/design/collation.md §1):
+// text or text[].
+export function rtCollatable(t: ResolvedType): boolean {
+  return t.kind === "text" || (t.kind === "array" && t.elem.kind === "text");
+}
+
 export function rtName(t: ResolvedType): string {
   switch (t.kind) {
     case "int":
@@ -893,7 +899,7 @@ export function checkRecursiveColumnTypes(
     // The non-recursive term fixed the relation's collation, so the UNION's overall common
     // collation must equal it (PostgreSQL's recursive-CTE check, spec/design/collation.md §1): a
     // recursive term cannot re-collate a column. Mismatch is 42P21.
-    if (a[i]!.kind === "text") {
+    if (rtCollatable(a[i]!)) {
       const ad = queryPlanColumnDerivs(anchor)[i]!;
       const overall = commonCollation([ad, queryPlanColumnDerivs(recursive)[i]!], unionAll);
       const nonRec = collationIdentity(ad);
@@ -984,7 +990,7 @@ export function cteSyntheticTableCols(
 // any other body output has no collation and takes a neighbour's (PG's default). An indeterminate or
 // conflicted body output has none either (PG's InvalidOid) — it still yields to a neighbour, but
 // consuming it alone is 42P22.
-function setSyntheticCollation(col: Column, d: Deriv): void {
+export function setSyntheticCollation(col: Column, d: Deriv): void {
   if (d.kind === "implicit" || d.kind === "explicit") {
     if (d.name !== "C") col.collation = d.name;
   } else if (d.kind === "none") {

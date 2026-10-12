@@ -883,7 +883,7 @@ impl Engine {
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                if *t != ResolvedType::Text {
+                if !t.collatable() {
                     return Ok(Deriv::None);
                 }
                 let inputs = [
@@ -903,12 +903,12 @@ impl Engine {
             // the output column must be text (42804); the name resolves ("C", else loaded or 42704).
             // Absent one, a text key sorts by the column's common collation.
             let coll = match &key.collation {
-                None if column_types[slot] == ResolvedType::Text => {
+                None if column_types[slot].collatable() => {
                     resolve_deriv(self, column_derivs[slot].clone())?
                 }
                 None => None,
                 Some(name) => {
-                    if column_types[slot] != ResolvedType::Text {
+                    if !column_types[slot].collatable() {
                         return Err(type_error(
                             "collations are not supported by this column's type".to_string(),
                         ));
@@ -1017,7 +1017,7 @@ impl Engine {
             .iter()
             .zip(&col_derivs)
             .map(|(t, ds)| {
-                if *t == ResolvedType::Text {
+                if t.collatable() {
                     common_collation(ds, true)
                 } else {
                     Ok(Deriv::None)

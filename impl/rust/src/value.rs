@@ -1087,6 +1087,13 @@ fn array_total_cmp(a: &ArrayVal, b: &ArrayVal) -> std::cmp::Ordering {
             return o;
         }
     }
+    array_shape_cmp(a, b)
+}
+
+/// [`array_total_cmp`]'s tail once every shared element pair compared equal: fewer total elements
+/// first, then smaller `ndim`, then per dimension smaller length and smaller lower bound.
+pub(crate) fn array_shape_cmp(a: &ArrayVal, b: &ArrayVal) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
     // Equal up to the shorter element list: fewer elements sorts first, then dimensionality.
     match a.elements.len().cmp(&b.elements.len()) {
         Ordering::Equal => {}

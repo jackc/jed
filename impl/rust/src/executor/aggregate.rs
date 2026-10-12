@@ -216,12 +216,7 @@ impl Acc {
                     let next = match cur.take() {
                         None => value,
                         Some(c) => {
-                            let ord = match (collation.as_deref(), &c, &value) {
-                                (Some(coll), Value::Text(a), Value::Text(b)) => {
-                                    collated_cmp(coll, a, b)?
-                                }
-                                _ => value_cmp(&c, &value),
-                            };
+                            let ord = collated_or_value_cmp(collation.as_deref(), &c, &value)?;
                             let keep_current = if *is_min {
                                 ord != std::cmp::Ordering::Greater
                             } else {

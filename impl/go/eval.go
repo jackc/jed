@@ -1638,6 +1638,24 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 					return BoolValue(c >= 0), nil
 				}
 			}
+			// Two text[] values walk their element pairs under the collation, charging collate per
+			// compared pair (collation.md §11).
+			if a.Kind == ValArray && b.Kind == ValArray {
+				c, err := collatedArrayCmp(e.collation, a.arrayVal(), b.arrayVal(), m)
+				if err != nil {
+					return Value{}, err
+				}
+				switch e.op {
+				case opLt:
+					return BoolValue(c < 0), nil
+				case opGt:
+					return BoolValue(c > 0), nil
+				case opLe:
+					return BoolValue(c <= 0), nil
+				default: // OpGe
+					return BoolValue(c >= 0), nil
+				}
+			}
 			// Either operand NULL ⇒ Unknown (text comparison is three-valued).
 			return Value{Kind: ValNull}, nil
 		}
@@ -2529,6 +2547,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 					return Value{}, err
 				}
 				if c, err = collatedCmp(e.collation, v.str(), best.str()); err != nil {
+					return Value{}, err
+				}
+			} else if e.collation != nil && v.Kind == ValArray {
+				if c, err = collatedArrayCmp(e.collation, v.arrayVal(), best.arrayVal(), m); err != nil {
 					return Value{}, err
 				}
 			} else {

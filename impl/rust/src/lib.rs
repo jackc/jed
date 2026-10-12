@@ -733,6 +733,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // different implicit collations conflict 42P22. Persisted via format_version 17 (goldens, not
     // corpus).
     "ddl.collate_column",
+    "types.array_collation",
     "types.i16",
     "types.i32",
     "types.i64",

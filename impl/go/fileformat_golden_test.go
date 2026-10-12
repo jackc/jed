@@ -970,6 +970,22 @@ func collationPKTableDB(t *testing.T) *Session {
 	return db
 }
 
+// collationArrayTableDB builds collation_array_table.jed (format v36): a collated text[] PRIMARY KEY
+// + a collated text[] secondary index. Each present element of both keys stores its `unicode` sort
+// key (encoding.md §2.14), so the rows are stored {a} < {a,Z} < {A} < {b}. Must match the Ruby
+// reference's COLLATION_ARRAY_TABLE.
+func collationArrayTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	run(t, db, `CREATE TABLE t (k text[] COLLATE "unicode" PRIMARY KEY, tags text[] COLLATE "unicode")`)
+	run(t, db, `CREATE INDEX t_tags_idx ON t (tags)`)
+	// Inserted in collation key order — the tree shape the Ruby reference builds.
+	run(t, db, `INSERT INTO t VALUES ('{a}', NULL)`)
+	run(t, db, `INSERT INTO t VALUES ('{a,Z}', '{a}')`)
+	run(t, db, `INSERT INTO t VALUES ('{A}', '{b,NULL}')`)
+	run(t, db, `INSERT INTO t VALUES ('{b}', '{z}')`)
+	return db
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 func TestWriteMatchesGoldens(t *testing.T) {
 	loadFixtureBundle(t) // the unicode-collated goldens need the bundle loaded (collation.md §4)
@@ -1035,6 +1051,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"identity_table.jed", identityTableDB},
 		{"collation_table.jed", collationTableDB},
 		{"collation_pk_table.jed", collationPKTableDB},
+		{"collation_array_table.jed", collationArrayTableDB},
 		{"json_table.jed", jsonTableDB},
 		{"jsonb_table.jed", jsonbTableDB},
 		{"tall_tree.jed", tallTreeDB},
@@ -1113,6 +1130,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"identity_table.jed", identityTableDB, "t"},
 		{"collation_table.jed", collationTableDB, "t"},
 		{"collation_pk_table.jed", collationPKTableDB, "t"},
+		{"collation_array_table.jed", collationArrayTableDB, "t"},
 		{"json_table.jed", jsonTableDB, "t"},
 		{"jsonb_table.jed", jsonbTableDB, "t"},
 		{"tall_tree.jed", tallTreeDB, "t"},

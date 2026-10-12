@@ -280,6 +280,7 @@ import {
   typeIsFloat,
   typeIsInteger,
   typeIsJson,
+  typeIsCollatable,
   typeIsText,
   typeIsTimestamp,
   typeIsTimestamptz,
@@ -415,7 +416,8 @@ import {
 import {
   type Deriv,
   catColumnDeriv,
-  collatedCmp,
+  collatedOrValueCmp,
+  collatedSortKey,
   columnCollation,
   commonCollation,
   deriveCollation,
@@ -475,9 +477,11 @@ import {
   renderRExpr,
   resolvedTypeOf,
   resolvedTypeOfCol,
+  rtCollatable,
   rtName,
   serialPseudoType,
   setOpNodeName,
+  setSyntheticCollation,
   stmtIsWrite,
   stmtKind,
   typeFromResolved,
@@ -5541,17 +5545,17 @@ export class Engine {
         }
       }
       // The column's effective collation, frozen now (spec/design/collation.md §1). An explicit
-      // COLLATE "name" is text-only (42804) and must name a loaded collation or C (42704); a text
-      // column without a clause inherits the per-database default. A C effective collation stores as
+      // COLLATE "name" is text / text[] only (42804) and must name a loaded collation or C (42704); a
+      // collatable column without a clause inherits the per-database default. A C effective collation stores as
       // null (the fast path).
       let collation: string | null = null;
       if (def.collation !== null) {
-        if (!typeIsText(colType)) {
+        if (!typeIsCollatable(colType)) {
           throw typeError(`collations are not supported by type ${typeCanonicalName(colType)}`);
         }
         resolveCollationName(this, def.collation); // validates loaded; 42704 if not
         if (def.collation !== "C") collation = def.collation;
-      } else if (typeIsText(colType)) {
+      } else if (typeIsCollatable(colType)) {
         collation = this.readSnap().defaultCollation;
       }
       columns.push({
@@ -7782,11 +7786,11 @@ export class Engine {
 
     let collation: string | null = null;
     if (def.collation !== null) {
-      if (!typeIsText(type))
+      if (!typeIsCollatable(type))
         throw typeError(`collations are not supported by type ${typeCanonicalName(type)}`);
       resolveCollationName(this, def.collation);
       if (def.collation !== "C") collation = def.collation;
-    } else if (typeIsText(type)) collation = this.readSnap().defaultCollation;
+    } else if (typeIsCollatable(type)) collation = this.readSnap().defaultCollation;
     if (tempScope && collation !== null)
       throw engineError(
         "feature_not_supported",
@@ -12794,7 +12798,7 @@ export class Engine {
     const lhsDerivs = queryPlanColumnDerivs(lhs);
     const rhsDerivs = queryPlanColumnDerivs(rhs);
     const columnDerivs: Deriv[] = columnTypes.map((t, i) => {
-      if (t.kind !== "text") return { kind: "none" };
+      if (!rtCollatable(t)) return { kind: "none" };
       return commonCollation([lhsDerivs[i]!, rhsDerivs[i]!], noneOk);
     });
     const order: OrderSlot[] = so.orderBy.map((key) => {
@@ -12804,11 +12808,11 @@ export class Engine {
       // key sorts by the column's common collation.
       let collation: Collation | null = null;
       if (key.collation === null) {
-        if (columnTypes[idx]!.kind === "text") {
+        if (rtCollatable(columnTypes[idx]!)) {
           collation = resolveDeriv(this, columnDerivs[idx]!);
         }
       } else {
-        if (columnTypes[idx]!.kind !== "text") {
+        if (!rtCollatable(columnTypes[idx]!)) {
           throw typeError("collations are not supported by this column's type");
         }
         collation = resolveCollationName(this, key.collation);
@@ -12954,7 +12958,7 @@ export class Engine {
     // Each text column's common collation across the rows — PostgreSQL treats a VALUES column like a
     // UNION ALL one (an implicit conflict leaves it with none, never an error).
     const columnDerivs: Deriv[] = colTypes.map((t, ci) =>
-      t.kind === "text" ? commonCollation(colDerivs[ci]!, true) : { kind: "none" },
+      rtCollatable(t) ? commonCollation(colDerivs[ci]!, true) : { kind: "none" },
     );
     return {
       kind: "values",
@@ -13434,7 +13438,7 @@ export class Engine {
         }
         // A general EXPRESSION key. Grouping is byte equality, but an indeterminate key is still
         // 42P21 (spec/design/collation.md §1 "A sort or grouping target").
-        if (gr.ty.kind === "text") rejectIndeterminateTarget(deriveCollation(scope, gr.canon));
+        if (rtCollatable(gr.ty)) rejectIndeterminateTarget(deriveCollation(scope, gr.canon));
         if (gr.ty.kind === "json") {
           throw engineError(
             "undefined_function",
@@ -13686,7 +13690,7 @@ export class Engine {
           }
           let oCollation: Collation | null = null;
           if (key.collation !== null) {
-            if (!typeIsText(col.type)) {
+            if (!typeIsCollatable(col.type)) {
               throw typeError(
                 `collations are not supported by type ${typeCanonicalName(col.type)}`,
               );
@@ -13719,7 +13723,7 @@ export class Engine {
         // clause, the key inherits the column's frozen (implicit) collation.
         let collation: Collation | null = null;
         if (key.collation !== null) {
-          if (!typeIsText(scope.columnAt(idx).type)) {
+          if (!typeIsCollatable(scope.columnAt(idx).type)) {
             throw typeError(
               `collations are not supported by type ${typeCanonicalName(scope.columnAt(idx).type)}`,
             );
@@ -13778,7 +13782,7 @@ export class Engine {
       // DERIVED from the key expression.
       let coll: Collation | null = null;
       if (key.collation !== null) {
-        if (type.kind !== "text" && type.kind !== "null") {
+        if (!rtCollatable(type) && type.kind !== "null") {
           throw typeError(`collations are not supported by type ${rtName(type)}`);
         }
         coll = resolveCollationName(scope.catalog, key.collation);
@@ -14592,6 +14596,11 @@ export class Engine {
     if (type.kind === "array") {
       const elemTy = typeFromResolved(type.elem);
       const table = srfTable("unnest", alias, elemTy);
+      // The column carries the array's collation as an implicit one, like a derived-table column
+      // (spec/design/collation.md §1 "A text[] carries its elements' collation").
+      if (rtCollatable(type)) {
+        setSyntheticCollation(table.columns[0]!, deriveCollation(argScope, args[0]!));
+      }
       return { table, srf: { kind: "unnest", args: [node] } };
     }
     if (type.kind === "null") throw indeterminatePoly();
@@ -17958,8 +17967,8 @@ export class Engine {
           for (const order of plan.order) {
             const value = row[order.idx]!;
             decorated.push(
-              order.collation !== null && value.kind === "text"
-                ? byteaValue(collationSortKey(order.collation, value.text))
+              order.collation !== null && (value.kind === "text" || value.kind === "array")
+                ? byteaValue(collatedSortKey(order.collation, value)!)
                 : value,
             );
           }
@@ -22653,8 +22662,8 @@ export function encodeKeyValue(ty: ScalarType, value: Value, coll: Collation | n
 // recurses into the range-bounds container codec (encoding.md §2.11), pulling its element scalar from
 // the column type; every other keyable value ignores the wrapper and dispatches on its scalar via
 // encodeKeyValue. value is non-NULL (callers handle the NULL slot tag), and a range column always
-// holds a range value, so the scalar arm never sees a range type. coll selects a text column's key
-// form (§2.12); it never applies to a range element (no range subtype is text).
+// holds a range value, so the scalar arm never sees a range type. coll selects a text / text[]
+// column's key form (§2.12/§2.14); it never applies to a range element (no range subtype is text).
 export function encodeTypedKey(ty: Type, value: Value, coll: Collation | null): Uint8Array {
   value = residentValue(value);
   if (value.kind === "range") {
@@ -22667,7 +22676,7 @@ export function encodeTypedKey(ty: Type, value: Value, coll: Collation | null): 
     if (ty.kind !== "array") {
       throw new Error("an array key value has an array column type");
     }
-    return encodeArrayKey(typeScalar(ty.elem), value);
+    return encodeArrayKey(typeScalar(ty.elem), value, coll);
   }
   return encodeKeyValue(typeScalar(ty), value, coll);
 }
@@ -22677,8 +22686,8 @@ export function encodeTypedKey(ty: Type, value: Value, coll: Collation | null): 
 // composite's fields). Used at the column-key sites (PK member, index entry/prefix slot) where the
 // store's resolved colTypes are on hand; expression keys (never composite) stay on encodeTypedKey.
 // Scalar/array/range produce byte-identical output to encodeTypedKey; the extra arm is composite
-// (encoding.md §2.15). value is non-NULL (callers tag the §2.2 slot). coll selects a text column's
-// collated key form (§2.12); it never applies to a container element or a composite field.
+// (encoding.md §2.15). value is non-NULL (callers tag the §2.2 slot). coll selects a text / text[]
+// column's collated key form (§2.12/§2.14); it never applies to a composite field.
 export function encodeColTypeKey(ct: ColType, value: Value, coll: Collation | null): Uint8Array {
   value = residentValue(value);
   if (ct.kind === "composite") {
@@ -22691,7 +22700,7 @@ export function encodeColTypeKey(ct: ColType, value: Value, coll: Collation | nu
   }
   if (ct.kind === "array") {
     if (value.kind !== "array") throw new Error("array ColType requires an array value");
-    return encodeArrayKey(colTypeScalar(ct.elem), value);
+    return encodeArrayKey(colTypeScalar(ct.elem), value, coll);
   }
   return encodeKeyValue(ct.scalar, value, coll);
 }
@@ -22824,11 +22833,12 @@ function hashJoinFnv1a(key: Uint8Array): bigint {
 // shorter list reaches the 0x00 terminator first; then the shape suffix (ndim, then per dimension a
 // u32 BE length and the i32 int-be-signflip lower bound). The element is a key-encodable scalar (float
 // elements included since the §2.8 lift; the DDL gate rejects only a composite element 0A000), so the
-// per-element key is encodeKeyValue with the C byte order (a collated array-element key is not a
-// feature this slice).
+// per-element key is encodeKeyValue — under coll, a collated text[] column's collation, each text
+// element's §2.12 sort key (null is the C byte order).
 export function encodeArrayKey(
   elem: ScalarType,
   a: { dims: number[]; lbounds: number[]; elements: Value[] },
+  coll: Collation | null,
 ): Uint8Array {
   const out: number[] = [];
   for (const e of a.elements) {
@@ -22837,7 +22847,7 @@ export function encodeArrayKey(
       continue;
     }
     out.push(0x01); // present element marker
-    for (const b of encodeKeyValue(elem, e, null)) out.push(b);
+    for (const b of encodeKeyValue(elem, e, coll)) out.push(b);
   }
   out.push(0x00); // terminator — a shorter element list sorts before a longer one
   out.push(a.dims.length & 0xff); // ndim
@@ -27687,11 +27697,7 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
       if (v.kind !== "null") {
         if (a.cur === null) a.cur = v;
         else {
-          const coll = a.collation ?? null;
-          const c =
-            coll !== null && a.cur.kind === "text" && v.kind === "text"
-              ? collatedCmp(coll, a.cur.text, v.text)
-              : valueCmp(a.cur, v);
+          const c = collatedOrValueCmp(a.collation ?? null, a.cur, v);
           const keepCur = a.plan === "min" ? c <= 0 : c >= 0;
           if (!keepCur) a.cur = v;
         }
@@ -28059,14 +28065,14 @@ export function sortOsaVals(vals: Value[], collation: Collation | null, desc: bo
     vals.sort((a, b) => dirCmp(valueCmp(a, b), desc));
     return;
   }
-  // Decorate each value with its collation sort key (text only), sort stably by the key bytes, then
+  // Decorate each value with its collation sort key (text / text[]), sort stably by the key bytes, then
   // undecorate. The keys are built once up front so a sortKey failure (0A000 for an unmapped code
   // point) surfaces at this deterministic point rather than inside the comparator.
   const deco: { key: Uint8Array; val: Value }[] = vals.map((v) => {
-    if (v.kind !== "text") {
-      throw new Error("a collated WITHIN GROUP key buffers only text");
+    if (v.kind !== "text" && v.kind !== "array") {
+      throw new Error("a collated WITHIN GROUP key buffers only text or text[]");
     }
-    return { key: collationSortKey(collation, v.text), val: v };
+    return { key: collatedSortKey(collation, v)!, val: v };
   });
   deco.sort((a, b) => dirCmp(cmpBytes(a.key, b.key), desc));
   for (let i = 0; i < deco.length; i++) vals[i] = deco[i]!.val;
@@ -28145,13 +28151,7 @@ export function compareHypoKey(a: Value, b: Value, ks: KeySort): number {
   if (a.kind === "null" && b.kind === "null") return 0;
   if (a.kind === "null") return ks.nullsFirst ? -1 : 1;
   if (b.kind === "null") return ks.nullsFirst ? 1 : -1;
-  let base: number;
-  if (ks.collation !== null && a.kind === "text" && b.kind === "text") {
-    base = collatedCmp(ks.collation, a.text, b.text);
-  } else {
-    base = valueCmp(a, b);
-  }
-  return dirCmp(base, ks.desc);
+  return dirCmp(collatedOrValueCmp(ks.collation, a, b), ks.desc);
 }
 
 // checkPercentileFraction is the percentile fraction range gate (aggregates.md §13): < 0, > 1, or
@@ -29190,7 +29190,7 @@ export function minmaxCollation(
   args: Expr[],
   result: ResolvedType,
 ): Collation | null {
-  if ((plan !== "min" && plan !== "max") || result.kind !== "text") return null;
+  if ((plan !== "min" && plan !== "max") || !rtCollatable(result)) return null;
   if (args.length === 0) return null;
   return resolveDeriv(scope.catalog, deriveCollation(scope, args[0]!));
 }
@@ -29248,11 +29248,11 @@ export function resolveOrderedSetAggregate(
   // unmapped code point → 0A000 there).
   let collation: Collation | null = null;
   if (key.collation !== null && key.collation !== undefined) {
-    if (optype.kind !== "text" && optype.kind !== "null") {
+    if (!rtCollatable(optype) && optype.kind !== "null") {
       throw typeError(`collations are not supported by type ${rtName(optype)}`);
     }
     collation = resolveCollationName(scope.catalog, key.collation);
-  } else if (optype.kind === "text") {
+  } else if (rtCollatable(optype)) {
     collation = sortTargetCollation(scope.catalog, orderKeyDeriv(scope, key));
   }
 
@@ -29430,11 +29430,11 @@ export function resolveHypotheticalSetAggregate(
     // 42804.
     let collation: Collation | null = null;
     if (key.collation !== null && key.collation !== undefined) {
-      if (ktype.kind !== "text" && ktype.kind !== "null") {
+      if (!rtCollatable(ktype) && ktype.kind !== "null") {
         throw typeError(`collations are not supported by type ${rtName(ktype)}`);
       }
       collation = resolveCollationName(scope.catalog, key.collation);
-    } else if (ktype.kind === "text") {
+    } else if (rtCollatable(ktype)) {
       collation = sortTargetCollation(scope.catalog, orderKeyDeriv(scope, key));
     }
     // The hypothetical direct arg, evaluated per group (grouped context); a literal adapts to the
@@ -29858,7 +29858,7 @@ export function resolveWindowDef(
     const { node, type } = resolve(scope, key, null, keyCtx, params);
     // Partitioning groups by byte equality, but an indeterminate key is still 42P21
     // (spec/design/collation.md §1 "A sort or grouping target").
-    if (type.kind === "text") rejectIndeterminateTarget(deriveCollation(scope, key));
+    if (rtCollatable(type)) rejectIndeterminateTarget(deriveCollation(scope, key));
     partition.push(windowKeySlot(node, "PARTITION BY", windowKeys));
   }
   const order: OrderSlot[] = [];
@@ -29875,7 +29875,7 @@ export function resolveWindowDef(
     // (window.md §3/§5); COLLATE "C" resolves to null (the raw-byte fast path).
     let collation: Collation | null = null;
     if (key.collation !== null) {
-      if (type.kind !== "text" && type.kind !== "null") {
+      if (!rtCollatable(type) && type.kind !== "null") {
         throw typeError(`collations are not supported by type ${rtName(type)}`);
       }
       collation = resolveCollationName(scope.catalog, key.collation);
@@ -31859,7 +31859,7 @@ function finalizeBlockingCollection(
       sorter.push(
         a.osaCollation == null
           ? row
-          : [value, byteaValue(collationSortKey(a.osaCollation, (value as { text: string }).text))],
+          : [value, byteaValue(collatedSortKey(a.osaCollation, value)!)],
       );
     }
     sorted = sorter.finishSpool();

@@ -112,6 +112,12 @@ func (t resolvedType) containsTimestamptz() bool {
 	return false
 }
 
+// collatable reports whether a resolved type carries a collation (spec/design/collation.md §1): text
+// or text[].
+func (t resolvedType) collatable() bool {
+	return t.kind == rtText || (t.kind == rtArray && t.elem != nil && t.elem.kind == rtText)
+}
+
 func intType(t resolvedType) (scalarType, bool) {
 	if t.kind == rtInt {
 		return t.intTy, true

@@ -3390,7 +3390,7 @@ pub(crate) fn encode_typed_key(
                 .array_element()
                 .expect("an array key value has an array column type")
                 .scalar();
-            encode_array_key(elem, a)
+            encode_array_key(elem, a, coll)
         }
         _ => encode_key_value(ty.scalar(), value, coll),
     }
@@ -3402,8 +3402,8 @@ pub(crate) fn encode_typed_key(
 /// slot) where the store's resolved `col_types` are on hand; expression keys (never composite) stay
 /// on [`encode_typed_key`]. Scalar/array/range produce byte-identical output to `encode_typed_key`;
 /// the extra arm is `composite` (spec/design/encoding.md §2.15). `value` is non-NULL (callers tag
-/// the §2.2 slot). `coll` selects a text column's collated key form (§2.12); it never applies to a
-/// container element or a composite field (those key by the `C` byte order).
+/// the §2.2 slot). `coll` selects a text / text[] column's collated key form (§2.12/§2.14); it never
+/// applies to a composite field (that keys by the `C` byte order).
 pub(crate) fn encode_key_ct(
     ct: &ColType,
     value: &Value,
@@ -3419,7 +3419,7 @@ pub(crate) fn encode_key_ct(
         (ColType::Range(elem), Value::Range(rv)) => {
             Ok(crate::range::encode_range_key(elem.scalar(), rv))
         }
-        (ColType::Array(elem), Value::Array(a)) => encode_array_key(elem.scalar(), a),
+        (ColType::Array(elem), Value::Array(a)) => encode_array_key(elem.scalar(), a, coll),
         (ColType::Scalar(s), _) => encode_key_value(*s, value, coll),
         _ => unreachable!("ColType/Value kind mismatch in encode_key_ct (resolver-checked)"),
     }
@@ -3486,16 +3486,20 @@ pub(crate) fn is_keyable_scalar(ty: &Type) -> bool {
 /// length and the `i32` `int-be-signflip` lower bound) breaks ties among equal-element-prefix,
 /// equal-count arrays. The element is a key-encodable **scalar** (`float` elements included since the
 /// §2.8 lift; the DDL gate rejects only a composite element `0A000`), so the per-element key is
-/// [`encode_key_value`]; an array element key uses the `C` byte order (a collated array-element key is
-/// not a feature this slice).
-pub(crate) fn encode_array_key(elem: ScalarType, a: &ArrayVal) -> Result<Vec<u8>> {
+/// [`encode_key_value`] — under `coll`, a collated text[] column's collation, each text element's
+/// §2.12 sort key (`None` is the `C` byte order).
+pub(crate) fn encode_array_key(
+    elem: ScalarType,
+    a: &ArrayVal,
+    coll: Option<&Collation>,
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     for e in &a.elements {
         match e {
             Value::Null => out.push(0x02), // NULL element — sorts after every present element
             v => {
                 out.push(0x01); // present element marker
-                out.extend_from_slice(&encode_key_value(elem, v, None)?);
+                out.extend_from_slice(&encode_key_value(elem, v, coll)?);
             }
         }
     }
@@ -5070,7 +5074,8 @@ pub(crate) enum Acc {
     MinMax {
         cur: Option<Value>,
         is_min: bool,
-        /// A text MIN/MAX's comparison collation (spec/design/collation.md §1); `None` is `C`.
+        /// A text / text[] MIN/MAX's comparison collation (spec/design/collation.md §1); `None` is
+        /// `C`.
         collation: Option<std::sync::Arc<Collation>>,
     },
     /// json_agg / jsonb_agg accumulator (B4): the inputs' JSON-image nodes in row order. `compact`
@@ -5413,10 +5418,7 @@ pub(crate) fn compare_hypo_key(a: &Value, b: &Value, ks: &KeySort) -> Result<std
             }
         }
         _ => {
-            let base = match (&ks.collation, a, b) {
-                (Some(c), Value::Text(x), Value::Text(y)) => collated_cmp(c, x, y)?,
-                _ => value_cmp(a, b),
-            };
+            let base = collated_or_value_cmp(ks.collation.as_deref(), a, b)?;
             if ks.desc { base.reverse() } else { base }
         }
     })
@@ -5496,11 +5498,11 @@ pub(crate) fn sort_osa_vals(
         Some(c) => {
             let mut decorated: Vec<(Vec<u8>, Value)> = Vec::with_capacity(vals.len());
             for v in vals.drain(..) {
-                let key = match &v {
-                    Value::Text(s) => collation::sort_key(c, s)?,
-                    other => {
-                        unreachable!("a collated WITHIN GROUP key buffers only text: {other:?}")
-                    }
+                let key = match collation_sort_key(c, &v)? {
+                    Some(k) => k,
+                    None => unreachable!(
+                        "a collated WITHIN GROUP key buffers only text or text[]: {v:?}"
+                    ),
                 };
                 decorated.push((key, v));
             }

@@ -469,7 +469,7 @@ func (db *engine) blockingOrderedSet(a *acc, fraction *Value, collections *hashR
 	defer s.close()
 	err := collections.each(owner, func(row storedRow) error {
 		if a.osaCollation != nil {
-			b, err := sortKey(a.osaCollation, row[0].str())
+			b, err := collationSortKey(a.osaCollation, row[0])
 			if err != nil {
 				return err
 			}

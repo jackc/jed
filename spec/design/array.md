@@ -130,6 +130,10 @@ The on-disk shape (full byte layout in [../fileformat/format.md](../fileformat/f
   element descriptor is inline, an array file is self-describing with no extra catalog object —
   *more* portable than composite (which persists a field list) and far simpler than PG (no
   `typarray` id stability across the byte-exact cores).
+- **The column collation (`format_version` 36).** A `text[]` column with a non-`C` collation
+  ([collation.md §1](collation.md)) sets the array entry's `flags` bit6 `has_collation` and appends
+  the name (`u16` length + UTF-8) after the element descriptor — a text column's bit and name, one
+  level down. The bit on any other array is `XX001`.
 - **`format_version` 10** is a clean break (the v10 reader rejects v9 and earlier, as v5/v6/v9 did).
   All existing `.jed` goldens regenerate at the bump (the version byte; array columns appear only in
   new goldens).
@@ -236,7 +240,10 @@ oracle (the composite `IS NULL` rule was oracle-corrected — expect the same sc
   well-defined, and equal-including-NULLs-and-shape arrays group together. The recursion bottoms out
   in the per-element scalar comparators (so the TS UTF-8 text-ordering trap recurses correctly for
   `text[]`) — **or, for a composite element type, in the composite *total-order* comparator** (see the
-  composite-element rule below). (Caveat: PostgreSQL's *single-array-column* `ORDER BY` can disagree with its own `<`
+  composite-element rule below). A `text[]` compares its text elements under the comparison's
+  derived collation ([collation.md §1](collation.md) — a column's frozen collation, a `COLLATE`, …),
+  `C` byte order when it has none; only the order of unequal elements changes, never which arrays
+  are equal. (Caveat: PostgreSQL's *single-array-column* `ORDER BY` can disagree with its own `<`
   operator on the lower-bound tiebreak — an abbreviated-key artifact; jed implements the consistent
   `array_cmp` order, so it matches PG's `=`/`<` operators and avoids that inconsistency.)
 - **`IS NULL` / `IS NOT NULL` — whole-value only, NOT element-wise** (the contrast with composite's
@@ -369,6 +376,10 @@ then per dimension a `u32` BE length and the `i32` `int-be-signflip` lower bound
 among equal-element-prefix, equal-count arrays exactly as `array_total_cmp` ranks them (smaller `ndim`,
 then per-dimension smaller length, then smaller lower bound).
 
+- **Collated `text[]` keys.** A `text[]` key column with a non-`C` collation encodes each present
+  element as its UCA sort key ([encoding.md §2.14](encoding.md)), so the tree stores the collation
+  order; skew and the upgrade migration treat it like a collated text key
+  ([collation.md §12](collation.md)).
 - **Element gate.** The element must be a **key-encodable scalar** (the same set a scalar key uses —
   integers, `bool`, `text`, `bytea`, `decimal`, `uuid`, `timestamp`/`timestamptz`/`date`, `interval`,
   and now `float`, the §2.8 carve-out lifted). A **composite-element** array is still rejected `0A000`

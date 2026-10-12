@@ -977,6 +977,22 @@ function collationPKTableDB(): Engine {
   return db;
 }
 
+// collationArrayTableDB builds collation_array_table.jed (format v36): a collated text[] PRIMARY KEY
+// + a collated text[] secondary index. Each present element of both keys stores its `unicode` sort
+// key (encoding.md §2.14), so the rows are stored {a} < {a,Z} < {A} < {b}. Must match the Ruby
+// reference's COLLATION_ARRAY_TABLE.
+function collationArrayTableDB(): Engine {
+  const db = goldenDb();
+  run(db, `CREATE TABLE t (k text[] COLLATE "unicode" PRIMARY KEY, tags text[] COLLATE "unicode")`);
+  run(db, `CREATE INDEX t_tags_idx ON t (tags)`);
+  // Inserted in collation key order — the tree shape the Ruby reference builds.
+  run(db, `INSERT INTO t VALUES ('{a}', NULL)`);
+  run(db, `INSERT INTO t VALUES ('{a,Z}', '{a}')`);
+  run(db, `INSERT INTO t VALUES ('{A}', '{b,NULL}')`);
+  run(db, `INSERT INTO t VALUES ('{b}', '{z}')`);
+  return db;
+}
+
 // jsonTableDB has a json column (verbatim text body, type_code 18 — spec/design/json.md §4). The
 // stored bytes are the input text exactly (whitespace/key-order preserved), so this pins the
 // length-prefixed text-shaped json body. Pins json_table.jed cross-core.
@@ -1057,6 +1073,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "identity_table.jed", build: identityTableDB },
     { name: "collation_table.jed", build: collationTableDB },
     { name: "collation_pk_table.jed", build: collationPKTableDB },
+    { name: "collation_array_table.jed", build: collationArrayTableDB },
     { name: "array_table.jed", build: arrayTableDB },
     { name: "range_table.jed", build: rangeTableDB },
     { name: "range_pk_table.jed", build: rangePkTableDB },
@@ -1133,6 +1150,7 @@ test("read goldens reproduces rows", () => {
     { name: "identity_table.jed", build: identityTableDB, table: "t" },
     { name: "collation_table.jed", build: collationTableDB, table: "t" },
     { name: "collation_pk_table.jed", build: collationPKTableDB, table: "t" },
+    { name: "collation_array_table.jed", build: collationArrayTableDB, table: "t" },
     { name: "array_table.jed", build: arrayTableDB, table: "t" },
     { name: "range_table.jed", build: rangeTableDB, table: "t" },
     { name: "range_pk_table.jed", build: rangePkTableDB, table: "t" },

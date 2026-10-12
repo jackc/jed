@@ -486,8 +486,8 @@ func (db *engine) blockingOrder(p *selectPlan, rows *rowSpool, env *evalEnv, m *
 		}
 		for _, k := range p.order {
 			key := row[k.idx]
-			if k.collation != nil && key.Kind == ValText {
-				b, err := sortKey(k.collation, key.str())
+			if k.collation != nil && (key.Kind == ValText || key.Kind == ValArray) {
+				b, err := collationSortKey(k.collation, key)
 				if err != nil {
 					return err
 				}

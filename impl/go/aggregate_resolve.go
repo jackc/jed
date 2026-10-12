@@ -109,7 +109,7 @@ func resolveAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 // "Aggregates and window functions"): the operand's own derivation, so a conflicted or indeterminate
 // operand is 42P22 (PostgreSQL raises it once two values compare). nil for any other aggregate.
 func minmaxCollation(s *scope, plan aggPlan, args []*exprNode, result resolvedType) (*Collation, error) {
-	if (plan != planMin && plan != planMax) || result.kind != rtText || len(args) == 0 {
+	if (plan != planMin && plan != planMax) || !result.collatable() || len(args) == 0 {
 		return nil, nil
 	}
 	d, err := deriveCollation(s, *args[0])
@@ -164,13 +164,13 @@ func resolveOrderedSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *
 	// sort applies it (an unmapped code point → 0A000 there).
 	var collation *Collation
 	if key.Collation != "" {
-		if optype.kind != rtText && optype.kind != rtNull {
+		if !optype.collatable() && optype.kind != rtNull {
 			return nil, resolvedType{}, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(optype)))
 		}
 		if collation, err = resolveCollationName(s.catalog, key.Collation); err != nil {
 			return nil, resolvedType{}, err
 		}
-	} else if optype.kind == rtText {
+	} else if optype.collatable() {
 		kd, err := orderKeyDeriv(s, &key)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -287,13 +287,13 @@ func resolveHypotheticalSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, par
 		// indeterminate one 42P21), §13. An unknown name is 42704; a COLLATE on a non-text key is 42804.
 		var collation *Collation
 		if key.Collation != "" {
-			if ktype.kind != rtText && ktype.kind != rtNull {
+			if !ktype.collatable() && ktype.kind != rtNull {
 				return nil, resolvedType{}, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(ktype)))
 			}
 			if collation, err = resolveCollationName(s.catalog, key.Collation); err != nil {
 				return nil, resolvedType{}, err
 			}
-		} else if ktype.kind == rtText {
+		} else if ktype.collatable() {
 			kd, err := orderKeyDeriv(s, &key)
 			if err != nil {
 				return nil, resolvedType{}, err
@@ -767,7 +767,7 @@ func resolveWindowDef(s *scope, wd *windowDef, keyCtx *aggCtx, windowKeys *[]*rE
 		}
 		// Partitioning groups by byte equality, but an indeterminate key is still 42P21
 		// (spec/design/collation.md §1 "A sort or grouping target").
-		if ty.kind == rtText {
+		if ty.collatable() {
 			d, derr := deriveCollation(s, key)
 			if derr != nil {
 				return nil, nil, nil, derr
@@ -800,7 +800,7 @@ func resolveWindowDef(s *scope, wd *windowDef, keyCtx *aggCtx, windowKeys *[]*rE
 		// "C" resolves to nil (the raw-byte fast path).
 		var coll *Collation
 		if key.Collation != "" {
-			if ty.kind != rtText && ty.kind != rtNull {
+			if !ty.collatable() && ty.kind != rtNull {
 				return nil, nil, nil, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(ty)))
 			}
 			if coll, err = resolveCollationName(s.catalog, key.Collation); err != nil {

@@ -1210,6 +1210,12 @@ func arrayTotalCmp(a, b *ArrayVal) int {
 			return c
 		}
 	}
+	return arrayShapeCmp(a, b)
+}
+
+// arrayShapeCmp is arrayTotalCmp's tail once every shared element pair compared equal: fewer total
+// elements first, then smaller ndim, then per dimension smaller length and smaller lower bound.
+func arrayShapeCmp(a, b *ArrayVal) int {
 	if c := cmpInt(len(a.Elements), len(b.Elements)); c != 0 {
 		return c
 	}

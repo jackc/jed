@@ -1501,6 +1501,30 @@ fn collation_pk_table_db() -> Session {
     db
 }
 
+// collation_array_table.jed (format v36): a collated text[] PRIMARY KEY + a collated text[]
+// secondary index. Each present element of both keys stores its `unicode` sort key (encoding.md
+// §2.14), so the rows are stored {a} < {a,Z} < {A} < {b}. Must match the Ruby reference's
+// COLLATION_ARRAY_TABLE.
+fn collation_array_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TABLE t (k text[] COLLATE \"unicode\" PRIMARY KEY, tags text[] COLLATE \"unicode\")",
+    );
+    run(&mut db, "CREATE INDEX t_tags_idx ON t (tags)");
+    // Inserted in collation key order — the tree shape the Ruby reference builds.
+    run(&mut db, "INSERT INTO t VALUES ('{a}', NULL)");
+    run(&mut db, "INSERT INTO t VALUES ('{a,Z}', '{a}')");
+    run(&mut db, "INSERT INTO t VALUES ('{A}', '{b,NULL}')");
+    run(&mut db, "INSERT INTO t VALUES ('{b}', '{z}')");
+    db
+}
+
 /// WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 #[test]
 fn write_matches_goldens() {
@@ -1574,6 +1598,7 @@ fn write_matches_goldens() {
         ),
         ("collation_table.jed", collation_table_db),
         ("collation_pk_table.jed", collation_pk_table_db),
+        ("collation_array_table.jed", collation_array_table_db),
         ("json_table.jed", json_table_db),
         ("jsonb_table.jed", jsonb_table_db),
         ("tall_tree.jed", tall_tree_db),
@@ -1668,6 +1693,7 @@ fn read_goldens_reproduces_rows() {
         ),
         ("collation_table.jed", collation_table_db, "t"),
         ("collation_pk_table.jed", collation_pk_table_db, "t"),
+        ("collation_array_table.jed", collation_array_table_db, "t"),
         ("json_table.jed", json_table_db, "t"),
         ("jsonb_table.jed", jsonb_table_db, "t"),
         ("serial_table.jed", serial_table_db, "t"),

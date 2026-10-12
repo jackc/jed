@@ -6,6 +6,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"unicode/utf8"
 )
 
 // Name/expression resolution — the parser-AST → resolved-expression (rExpr) pass. This file holds the
@@ -754,7 +755,7 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 		// The output column's collation derivation (spec/design/collation.md §1 "Derived relations"),
 		// which a derived table / CTE over this body carries into its synthetic column.
 		d := deriv{}
-		if ty.kind == rtText {
+		if ty.collatable() {
 			if d, err = deriveCollation(s, it.Expr); err != nil {
 				return nil, nil, nil, nil, err
 			}
@@ -1395,7 +1396,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqIn, lhs: rlhs, negated: is.Negated, rowValued: rowValued}, resolvedType{kind: rtBool}, nil
 	case exprCollate:
 		// `expr COLLATE "name"` (spec/design/collation.md §1) — a postfix collation operator. Resolve
-		// the inner expression, require a collatable (text) type (42804, PG-matching), and validate
+		// the inner expression, require a collatable (text / text[]) type (42804, PG-matching), and validate
 		// the named collation exists ("C" or loaded, else 42704). A runtime PASSTHROUGH: a collation
 		// only changes the ORDERING comparisons / ORDER BY, derived from the AST at those sites
 		// (explicitCollation / OrderKey.Collation), so resolving returns the inner node + type
@@ -1404,7 +1405,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		if ty.kind != rtText && ty.kind != rtNull {
+		if !ty.collatable() && ty.kind != rtNull {
 			return nil, resolvedType{}, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(ty)))
 		}
 		if _, err := resolveCollationName(s.catalog, e.Collate.Collation); err != nil {
@@ -2251,9 +2252,9 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				args[i] = widenFloatToF64(args[i], t)
 			}
 		}
-		// Text arguments derive one comparison collation (42P21/42P22 on conflict — §52).
+		// Text / text[] arguments derive one comparison collation (42P21/42P22 on conflict — §52).
 		var coll *Collation
-		if unified.kind == rtText {
+		if unified.collatable() {
 			d := deriv{}
 			for _, a := range e.GreatestLeast {
 				ad, e2 := deriveCollation(s, a)
@@ -2374,10 +2375,10 @@ func deriveCollation(s *scope, e exprNode) (deriv, error) {
 		}
 		return deriv{}, nil
 	case exprCast:
-		// A cast to text keeps its operand's derivation; a varchar(n) length coercion is a node of its
-		// own (PostgreSQL), so it combines like a function and a conflicted operand yields.
-		t, ok := scalarTypeFromName(e.Cast.TypeName)
-		if !ok || !t.IsText() {
+		// A cast to text / text[] keeps its operand's derivation (a non-collatable operand derives
+		// none); a varchar(n) length coercion is a node of its own (PostgreSQL), so it combines like a
+		// function and a conflicted operand yields.
+		if !castTargetCollatable(e.Cast.TypeName) {
 			return deriv{}, nil
 		}
 		d, err := deriveCollation(s, e.Cast.Inner)
@@ -2408,6 +2409,17 @@ func deriveCollation(s *scope, e exprNode) (deriv, error) {
 			return combineDeriv(d, ed)
 		}
 		return d, nil
+	case exprArray:
+		// ARRAY[e1, …] combines its elements, like a function's arguments (collation.md §1 "A text[]
+		// carries its elements' collation").
+		return combineDerivList(s, e.RowItems)
+	case exprSubscript:
+		// A subscript or slice carries its array's collation (the subscripts are integers).
+		d, err := deriveCollation(s, *e.Base)
+		if err != nil {
+			return deriv{}, err
+		}
+		return combineDeriv(deriv{}, d)
 	case exprCoalesce:
 		return combineDerivList(s, e.Coalesce)
 	case exprGreatestLeast:
@@ -2515,9 +2527,9 @@ func subqueryOutputDeriv(body deriv) deriv {
 
 // membershipCollation is the comparison collation of `lhs IN / op ANY|ALL (SELECT …)`
 // (spec/design/collation.md §1): the left operand's derivation combined with the body column's, which
-// is implicit outside the subquery. A conflict is 42P22. nil for a non-text or row-valued comparison.
+// is implicit outside the subquery. A conflict is 42P22. nil for a non-collatable or row-valued comparison.
 func membershipCollation(s *scope, lhs exprNode, lt, elem resolvedType, rowValued bool, plan *queryPlan) (*Collation, error) {
-	if rowValued || lt.kind != rtText || elem.kind != rtText {
+	if rowValued || !lt.collatable() || !elem.collatable() {
 		return nil, nil
 	}
 	ld, err := deriveCollation(s, lhs)
@@ -2553,16 +2565,25 @@ func rejectIndeterminateTarget(d deriv) error {
 
 // functionResultCollatable reports whether a scalar function's result carries its arguments'
 // collation (spec/design/collation.md §1 "Function results"): read from the shared function catalog
-// — any kind = "function" overload whose result is text. A non-text argument derives no collation,
-// so an overload taking only non-text arguments (the range lower/upper) contributes nothing.
+// — any kind = "function" overload whose result is text, text[], or anyarray. A non-collatable
+// argument derives no collation, so an overload taking only non-text arguments (the range
+// lower/upper, array_append over i32[]) contributes nothing.
 func functionResultCollatable(name string) bool {
 	for i := range operators {
 		o := &operators[i]
-		if o.Kind == "function" && o.Result == "text" && strings.EqualFold(o.Name, name) {
+		if o.Kind == "function" && (o.Result == "text" || o.Result == "text[]" || o.Result == "anyarray") &&
+			strings.EqualFold(o.Name, name) {
 			return true
 		}
 	}
 	return false
+}
+
+// castTargetCollatable reports whether a cast's target type name is collatable — text (any of its
+// spellings, varchar(n) included) or an array of text.
+func castTargetCollatable(name string) bool {
+	t, ok := scalarTypeFromName(strings.TrimSuffix(name, "[]"))
+	return ok && t.IsText()
 }
 
 // commonCollation is the common collation of one set-operation / VALUES output column
@@ -2613,12 +2634,12 @@ func columnDeriv(s *scope, r resolved, err error) deriv {
 	return catColumnDeriv(s.columnOf(r))
 }
 
-// catColumnDeriv is a column's derivation: implicit for a text column (its frozen collation, C if
+// catColumnDeriv is a column's derivation: implicit for a text / text[] column (its frozen collation, C if
 // none), unless it is a synthetic relation's column whose body output derived no collation
 // (catColumn.NoCollation) or settled to none over a conflict (catColumn.CollationConflict —
 // spec/design/collation.md §1 "Derived relations").
 func catColumnDeriv(col *catColumn) deriv {
-	if !col.Type.IsText() {
+	if !col.Type.IsCollatable() {
 		return deriv{}
 	}
 	if col.NoCollation {
@@ -2707,6 +2728,78 @@ func collatedCmp(coll *Collation, a, b string) (int, error) {
 		return 0, err
 	}
 	return bytes.Compare(ka, kb), nil
+}
+
+// collatedArrayCmp is arrayTotalCmp over two text[] values with their text elements compared under
+// coll (spec/design/collation.md §1, array.md §5). Each walked pair of present elements charges
+// collate per code point of both (collation.md §11) when m is non-nil — the comparison operators and
+// GREATEST/LEAST; the unmetered sort/min/max paths pass nil. A NULL element or the array shape
+// decides without a charge.
+func collatedArrayCmp(coll *Collation, a, b *ArrayVal, m *costMeter) (int, error) {
+	n := len(a.Elements)
+	if len(b.Elements) < n {
+		n = len(b.Elements)
+	}
+	for i := 0; i < n; i++ {
+		x, y := a.Elements[i], b.Elements[i]
+		xn, yn := x.Kind == ValNull, y.Kind == ValNull
+		switch {
+		case xn && yn:
+			continue
+		case xn: // NULL sorts last
+			return 1, nil
+		case yn:
+			return -1, nil
+		}
+		if m != nil {
+			m.Charge(costs.Collate * int64(utf8.RuneCountInString(x.str())+utf8.RuneCountInString(y.str())))
+			if err := m.Guard(); err != nil {
+				return 0, err
+			}
+		}
+		c, err := collatedCmp(coll, x.str(), y.str())
+		if err != nil {
+			return 0, err
+		}
+		if c != 0 {
+			return c, nil
+		}
+	}
+	return arrayShapeCmp(a, b), nil
+}
+
+// collationSortKey is a collated sort's decoration for one value (spec/design/collation.md §8): a
+// text value's UCA sort key, a text[] value's collated array key (encoding.md §2.14 — memcmp-ordered
+// exactly like collatedArrayCmp), nil for NULL. An unmapped code point is 0A000.
+func collationSortKey(coll *Collation, v Value) ([]byte, error) {
+	switch v.Kind {
+	case ValText:
+		return sortKey(coll, v.str())
+	case ValArray:
+		return encodeArrayKey(scalarText, v.arrayVal(), coll)
+	default:
+		return nil, nil
+	}
+}
+
+// collatedOrValueCmp compares two non-NULL values under coll when it is set and they are text or
+// text[] (collatedValueCmp, unmetered), else by the value order — the min/max fold and the
+// hypothetical-set key comparison.
+func collatedOrValueCmp(coll *Collation, a, b Value) (int, error) {
+	if coll != nil && ((a.Kind == ValText && b.Kind == ValText) || (a.Kind == ValArray && b.Kind == ValArray)) {
+		return collatedValueCmp(coll, a, b, nil)
+	}
+	return valueCmp(a, b), nil
+}
+
+// collatedValueCmp compares two non-NULL values of one collatable type under coll: text by its sort
+// key, text[] element-wise (collatedArrayCmp, metered when m is non-nil). The caller handles NULL and
+// charges a text pair's collate itself.
+func collatedValueCmp(coll *Collation, a, b Value, m *costMeter) (int, error) {
+	if a.Kind == ValArray {
+		return collatedArrayCmp(coll, a.arrayVal(), b.arrayVal(), m)
+	}
+	return collatedCmp(coll, a.str(), b.str())
 }
 
 func resolveBinary(s *scope, b *binaryExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
@@ -2833,15 +2926,15 @@ func resolveBinary(s *scope, b *binaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		if err := classifyComparable(lt, rt); err != nil {
 			return nil, resolvedType{}, err
 		}
-		// Derive the comparison's collation (spec/design/collation.md §1/§7). Only a text×text
-		// comparison is collatable; a COLLATE on a non-text operand was already rejected 42804 at the
-		// Collate node. Each operand's derivation (explicit COLLATE / implicit column collation / none)
+		// Derive the comparison's collation (spec/design/collation.md §1/§7). Only a text×text or
+		// text[]×text[] comparison is collatable; a COLLATE on a non-collatable operand was already
+		// rejected 42804 at the Collate node. Each operand's derivation (explicit COLLATE / implicit column collation / none)
 		// is combined per PG's rules: two different EXPLICIT collations conflict (42P21); two different
 		// IMPLICIT collations are indeterminate (42P22 when consumed here). Derived for ALL comparison
 		// ops incl =/<> (PG raises the conflict regardless), even though =/<> ignore the collation at
 		// eval (byte equality, §7).
 		var coll *Collation
-		if lt.kind == rtText && rt.kind == rtText {
+		if lt.collatable() && rt.collatable() {
 			ld, err := deriveCollation(s, b.Lhs)
 			if err != nil {
 				return nil, resolvedType{}, err

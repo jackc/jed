@@ -892,11 +892,11 @@ impl Engine {
                 }
             };
             // The column's effective collation, frozen now (spec/design/collation.md §1). An explicit
-            // `COLLATE "name"` is text-only (42804 otherwise, PG-matching) and must name a loaded
-            // collation or `C` (42704); a text column without a clause inherits the per-database
-            // default. A `C` effective collation stores as `None` (the fast path).
+            // `COLLATE "name"` is text / text[] only (42804 otherwise, PG-matching) and must name a
+            // loaded collation or `C` (42704); a collatable column without a clause inherits the
+            // per-database default. A `C` effective collation stores as `None` (the fast path).
             let collation: Option<String> = if let Some(name) = &def.collation {
-                if !ty.is_text() {
+                if !ty.is_collatable() {
                     return Err(type_error(format!(
                         "collations are not supported by type {}",
                         ty.canonical_name()
@@ -908,7 +908,7 @@ impl Engine {
                 } else {
                     Some(name.clone())
                 }
-            } else if ty.is_text() {
+            } else if ty.is_collatable() {
                 self.read_snap().default_collation().map(str::to_string)
             } else {
                 None
@@ -3647,7 +3647,7 @@ impl Engine {
             };
 
         let collation = if let Some(name) = &def.collation {
-            if !ty.is_text() {
+            if !ty.is_collatable() {
                 return Err(type_error(format!(
                     "collations are not supported by type {}",
                     ty.canonical_name()
@@ -3659,7 +3659,7 @@ impl Engine {
             } else {
                 Some(name.clone())
             }
-        } else if ty.is_text() {
+        } else if ty.is_collatable() {
             self.read_snap().default_collation().map(str::to_string)
         } else {
             None

@@ -2249,9 +2249,9 @@ func inMembership(lv Value, list []Value, negated bool, m *costMeter) (Value, er
 // rowWise is the folded ROW-VALUED subquery form (grammar.md §26): each element compares by the
 // row-constructor 3VL (rowCmp3) rather than quantifiedCmp3's composite total order.
 //
-// collation (non-nil) is the comparison collation of a text quantifier (spec/design/collation.md §1
-// "IN / ANY / ALL"): an ORDERING comparison of two text values sorts by it, charging collate per code
-// point exactly like a collated reCompare.
+// collation (non-nil) is the comparison collation of a text / text[] quantifier
+// (spec/design/collation.md §1 "IN / ANY / ALL"): an ORDERING comparison of two text (or text[])
+// values sorts by it, charging collate per code point exactly like a collated reCompare.
 func quantifiedMembership(op binaryOp, all, rowWise bool, lv, av Value, collation *Collation, m *costMeter) (Value, error) {
 	if av.Kind == ValNull {
 		return NullValue(), nil
@@ -2271,6 +2271,29 @@ func quantifiedMembership(op binaryOp, all, rowWise bool, lv, av Value, collatio
 				return Value{}, err
 			}
 			c, err := collatedCmp(collation, lv.str(), e.str())
+			if err != nil {
+				return Value{}, err
+			}
+			var res bool
+			switch op {
+			case opLt:
+				res = c < 0
+			case opGt:
+				res = c > 0
+			case opLe:
+				res = c <= 0
+			default: // OpGe
+				res = c >= 0
+			}
+			tv = False
+			if res {
+				tv = True
+			}
+		} else if collation != nil && (op == opLt || op == opGt || op == opLe || op == opGe) &&
+			lv.Kind == ValArray && e.Kind == ValArray {
+			// Two text[] values (an array-valued `x op ANY/ALL (SELECT …)`) walk their element pairs
+			// under the collation, charging collate per compared pair (collation.md §11).
+			c, err := collatedArrayCmp(collation, lv.arrayVal(), e.arrayVal(), m)
 			if err != nil {
 				return Value{}, err
 			}

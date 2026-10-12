@@ -203,16 +203,16 @@ pub(crate) fn resolve_binary(
                 BinaryOp::Ge => CmpOp::Ge,
                 _ => unreachable!(),
             };
-            // Derive the comparison's collation (spec/design/collation.md §1/§7). Only a text×text
-            // comparison is collatable; for any other operand family collation is irrelevant (and a
-            // COLLATE on a non-text operand was already rejected 42804 at the Collate node). Each
+            // Derive the comparison's collation (spec/design/collation.md §1/§7). Only a text×text or
+            // text[]×text[] comparison is collatable; for any other operand family collation is
+            // irrelevant (and a COLLATE on a non-collatable operand was already rejected 42804 at the
+            // Collate node). Each
             // operand's derivation (explicit COLLATE / implicit column collation / none) is combined
             // per PG's rules: two different EXPLICIT collations conflict (42P21); two different
             // IMPLICIT collations are indeterminate (42P22 when consumed here). The derivation runs
             // for ALL comparison ops including `=`/`<>` (PG raises the conflict regardless), even
             // though `=`/`<>` ignore the collation at eval (byte equality, §7).
-            let collation = if matches!(lt, ResolvedType::Text) && matches!(rt, ResolvedType::Text)
-            {
+            let collation = if lt.collatable() && rt.collatable() {
                 let d =
                     combine_deriv(derive_collation(scope, lhs)?, derive_collation(scope, rhs)?)?;
                 resolve_deriv(scope.catalog, d)?
@@ -628,6 +628,13 @@ pub(crate) fn resolve_set_op(
     // Both slots are `anyarray`: the element types must unify (a non-array / mismatch is 42883).
     let tys = [lt, rt];
     match_poly(&["anyarray", "anyarray"], &tys).ok_or_else(no_set_op_overload)?;
+    // Element equality ignores the collation (byte identity, collation.md §7), but two text[]
+    // operands still combine their derivations, so two different implicit collations are 42P22
+    // (PostgreSQL's element texteq demands one).
+    if tys[0].collatable() && tys[1].collatable() {
+        let d = combine_deriv(derive_collation(scope, lhs)?, derive_collation(scope, rhs)?)?;
+        resolve_deriv(scope.catalog, d)?;
+    }
     Ok((
         RExpr::ArrayFunc {
             func,
@@ -1288,10 +1295,14 @@ pub(crate) fn resolve_quantified(
         BinaryOp::Ge => CmpOp::Ge,
         _ => unreachable!("the parser only builds a Quantified node for a comparison operator"),
     };
-    // A text quantifier compares under the left operand's derivation alone (spec/design/collation.md
-    // §1): an array carries no collation in jed (a recorded narrowing, §15).
+    // A text quantifier compares under the left operand's derivation combined with the array's
+    // (spec/design/collation.md §1); a conflict is 42P22.
     let collation = if lt == ResolvedType::Text && elem == ResolvedType::Text {
-        resolve_deriv(scope.catalog, derive_collation(scope, lhs)?)?
+        let d = combine_deriv(
+            derive_collation(scope, lhs)?,
+            derive_collation(scope, array)?,
+        )?;
+        resolve_deriv(scope.catalog, d)?
     } else {
         None
     };

@@ -1,0 +1,437 @@
+# A text[] carries its elements' collation (spec/design/collation.md §1 "A text[] carries its
+# elements' collation", PostgreSQL's rule — an array of a collatable type is itself collatable):
+#   - a text[] column takes a COLLATE clause (a non-text array is 42804) and is implicit;
+#   - COLLATE applies to a text[] expression; ARRAY[…], subscripts / slices, casts to text[] / text,
+#     array-returning functions, ||, and unnest's column carry the derivation;
+#   - ordering comparisons, ORDER BY, min/max, GREATEST/LEAST, and window keys compare the text
+#     elements under it; =, @> and ANY/ALL still combine both sides (42P22 on an implicit conflict);
+#   - a collated text[] key stores each element's sort key, so its tree is in collation order.
+#
+# The vendored `unicode` collation is the CLDR-DUCET root: a < A < b < B (lowercase before its
+# uppercase). Built-in C is byte / code-point order: A(0x41) < B < a(0x61) < b.
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, query.order_by_expr, query.where_eq, query.comparison_order, query.derived_table, query.union, query.distinct, query.aggregates, query.group_by, query.window, query.limit, types.array, expr.array_subscript, func.array, func.array_quantified, func.array_containment, func.unnest, query.lateral, expr.greatest_least, expr.coalesce, expr.collate, ddl.collate_column, types.array_collation, cast.explicit, cast.operator, types.i32, types.text, resource.cost_metering
+
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+statement ok
+CREATE TABLE at (id i32 PRIMARY KEY, a text[] COLLATE "unicode", c text[] COLLATE "C", s text COLLATE "unicode", t text COLLATE "C")
+
+statement ok
+INSERT INTO at VALUES (1, '{b,a}', '{b,a}', 'b', 'b'), (2, '{A}', '{A}', 'A', 'A'), (3, '{a}', '{a}', 'a', 'a'), (4, '{B}', '{B}', 'B', 'B'), (5, '{a,NULL}', '{a,NULL}', 'a', 'a')
+
+# ============================================================================================
+# Columns: a text[] column orders by its collation; COLLATE overrides it.
+# ============================================================================================
+
+query T nosort
+SELECT a FROM at ORDER BY a, id
+----
+{a}
+{a,NULL}
+{A}
+{b,a}
+{B}
+
+query T nosort
+SELECT c FROM at ORDER BY c, id
+----
+{A}
+{B}
+{a}
+{a,NULL}
+{b,a}
+
+query T nosort
+SELECT a FROM at ORDER BY a COLLATE "C", id
+----
+{A}
+{B}
+{a}
+{a,NULL}
+{b,a}
+
+query T nosort
+SELECT c FROM at ORDER BY c COLLATE "unicode" DESC, id
+----
+{B}
+{b,a}
+{A}
+{a,NULL}
+{a}
+
+query TT nosort
+SELECT min(a), max(a) FROM at
+----
+{a}
+{B}
+
+query TT nosort
+SELECT min(c), max(c) FROM at
+----
+{A}
+{b,a}
+
+query I rowsort
+SELECT id FROM at WHERE a < '{b}'::text[]
+----
+2
+3
+5
+
+query I rowsort
+SELECT id FROM at WHERE c < '{b}'::text[]
+----
+2
+3
+4
+5
+
+query I rowsort
+SELECT id FROM at WHERE a >= ARRAY['B'] COLLATE "C"
+----
+1
+3
+4
+5
+
+query T nosort
+SELECT greatest(a, '{a,b}'::text[]) FROM at ORDER BY id
+----
+{b,a}
+{A}
+{a,b}
+{B}
+{a,NULL}
+
+query T nosort
+SELECT a FROM at GROUP BY a ORDER BY a DESC
+----
+{B}
+{b,a}
+{A}
+{a,NULL}
+{a}
+
+query T nosort
+SELECT DISTINCT c FROM at ORDER BY c
+----
+{A}
+{B}
+{a}
+{a,NULL}
+{b,a}
+
+query IT nosort
+SELECT row_number() OVER (ORDER BY a), a FROM at ORDER BY 1
+----
+1
+{a}
+2
+{a,NULL}
+3
+{A}
+4
+{b,a}
+5
+{B}
+
+# A derived-table column keeps the body's collation.
+query T nosort
+SELECT x FROM (SELECT a AS x FROM at) d ORDER BY x, x[2]
+----
+{a}
+{a,NULL}
+{A}
+{b,a}
+{B}
+
+# ============================================================================================
+# Expressions: COLLATE, ARRAY[…], subscripts, casts, array functions, ||, unnest.
+# ============================================================================================
+
+query B nosort
+SELECT '{b,A,a,B}'::text[] COLLATE "unicode" < '{b,A,a,b}'::text[]
+----
+false
+
+query B nosort
+SELECT ARRAY['a','B'] COLLATE "unicode" < ARRAY['B','a']
+----
+true
+
+query B nosort
+SELECT ARRAY['a','B'] < ARRAY['B','a']
+----
+false
+
+query T nosort
+SELECT ARRAY[s, 'z'] FROM at ORDER BY 1, id
+----
+{a,z}
+{a,z}
+{A,z}
+{b,z}
+{B,z}
+
+query T nosort
+SELECT ARRAY[t, 'z'] FROM at ORDER BY 1, id
+----
+{A,z}
+{B,z}
+{a,z}
+{a,z}
+{b,z}
+
+query T nosort
+SELECT a[1] FROM at ORDER BY a[1], id
+----
+a
+a
+A
+b
+B
+
+query T nosort
+SELECT a[1:1] FROM at ORDER BY a[1:1] DESC, id
+----
+{B}
+{b}
+{A}
+{a}
+{a}
+
+query T nosort
+SELECT array_append(a, 'q') FROM at ORDER BY 1, id
+----
+{a,q}
+{a,NULL,q}
+{A,q}
+{b,a,q}
+{B,q}
+
+query T nosort
+SELECT a || '{z}'::text[] FROM at ORDER BY 1, id
+----
+{a,z}
+{a,NULL,z}
+{A,z}
+{b,a,z}
+{B,z}
+
+query T nosort
+SELECT x FROM at, unnest(a) x WHERE x IS NOT NULL ORDER BY x, id
+----
+a
+a
+a
+A
+b
+B
+
+query T nosort
+SELECT x FROM at, unnest(c) x WHERE x IS NOT NULL ORDER BY x, id
+----
+A
+B
+a
+a
+a
+b
+
+query T nosort
+SELECT x FROM unnest('{b,A,a,B}'::text[] COLLATE "unicode") x ORDER BY x
+----
+a
+A
+b
+B
+
+query T nosort
+SELECT x FROM unnest('{b,A,a,B}'::text[]) x ORDER BY x
+----
+A
+B
+a
+b
+
+# A literal text[] has no collation, so its unnest column takes its neighbour's.
+query T nosort
+SELECT x FROM unnest('{b,A,a,B}'::text[]) x, at WHERE at.id = 2 AND x >= s ORDER BY x
+----
+A
+B
+b
+
+# A cast to text keeps the operand's collation.
+query T nosort
+SELECT a::text FROM at WHERE id IN (1, 2, 4) ORDER BY 1
+----
+{A}
+{b,a}
+{B}
+
+# ============================================================================================
+# Comparisons that combine both sides: ANY/ALL, =, @>, and the 42P22 / 42P21 conflicts.
+# ============================================================================================
+
+query I rowsort
+SELECT id FROM at WHERE 'a' < ANY (a)
+----
+1
+2
+4
+
+query I rowsort
+SELECT id FROM at WHERE 'a' < ANY (c)
+----
+1
+
+query I rowsort
+SELECT id FROM at WHERE 'a' < ANY (a COLLATE "C")
+----
+1
+
+query I rowsort
+SELECT id FROM at WHERE s <= ALL (a)
+----
+2
+3
+4
+
+query I rowsort
+SELECT id FROM at WHERE a < ANY (SELECT ARRAY['b'])
+----
+2
+3
+5
+
+query I rowsort
+SELECT id FROM at WHERE c < ANY (SELECT ARRAY['b'])
+----
+2
+3
+4
+5
+
+statement error 42P22
+SELECT id FROM at WHERE a < ANY (SELECT c FROM at)
+
+statement error 42P22
+SELECT id FROM at WHERE s < ANY (c)
+
+statement error 42P22
+SELECT id FROM at WHERE s = ANY (c)
+
+statement error 42P22
+SELECT id FROM at WHERE a = c
+
+statement error 42P22
+SELECT id FROM at WHERE a < c
+
+statement error 42P22
+SELECT id FROM at WHERE a @> c
+
+statement error 42P22
+SELECT id FROM at WHERE ARRAY[s] < ARRAY[t]
+
+query I rowsort
+SELECT id FROM at WHERE a = c COLLATE "C"
+----
+1
+2
+3
+4
+5
+
+query I rowsort
+SELECT id FROM at WHERE a @> c COLLATE "unicode"
+----
+1
+2
+3
+4
+
+statement error 42P21
+SELECT a FROM at ORDER BY a || c
+
+statement error 42P21
+SELECT a FROM at ORDER BY coalesce(a, c)
+
+statement error 42P21
+SELECT a FROM at UNION SELECT c FROM at
+
+statement error 42P21
+SELECT id FROM at WHERE a COLLATE "unicode" = c COLLATE "C"
+
+# COLLATE applies only to a collatable type.
+statement error 42804
+SELECT ARRAY[1] COLLATE "C"
+
+statement error 42804
+CREATE TABLE bad (a i32[] COLLATE "C")
+
+# ============================================================================================
+# Keys: a collated text[] PRIMARY KEY / UNIQUE index is stored in collation order.
+# ============================================================================================
+
+statement ok
+CREATE TABLE ak (k text[] COLLATE "unicode" PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO ak VALUES ('{b}', 1), ('{A}', 2), ('{a}', 3), ('{B}', 4), ('{a,b}', 5)
+
+query T nosort
+SELECT k FROM ak ORDER BY k
+----
+{a}
+{a,b}
+{A}
+{b}
+{B}
+
+query T nosort
+SELECT k FROM ak ORDER BY k DESC LIMIT 2
+----
+{B}
+{b}
+
+query T nosort
+SELECT k FROM ak WHERE k < '{b}'::text[] ORDER BY k
+----
+{a}
+{a,b}
+{A}
+
+statement error 23505
+INSERT INTO ak VALUES ('{a,b}', 6)
+
+statement ok
+CREATE TABLE au (id i32 PRIMARY KEY, k text[] COLLATE "unicode")
+
+statement ok
+CREATE UNIQUE INDEX au_k ON au (k)
+
+statement ok
+INSERT INTO au VALUES (1, '{b}'), (2, '{A}'), (3, '{a}'), (4, '{B}')
+
+query T nosort
+SELECT k FROM au ORDER BY k LIMIT 3
+----
+{a}
+{A}
+{b}
+
+statement error 23505
+INSERT INTO au VALUES (5, '{A}')
+
+# ============================================================================================
+# Cost — a collated text[] ordering comparison charges collate per code point of each element pair
+# it walks (collation.md §11): operator_eval(1) + collate((b,b) 2 + (a,c) 2) + row_produced(1).
+# ============================================================================================
+
+# cost: 6
+query B nosort
+SELECT '{b,a,z}'::text[] < '{b,c}'::text[] COLLATE "unicode"
+----
+true

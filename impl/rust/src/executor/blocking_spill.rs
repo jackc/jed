@@ -300,8 +300,8 @@ impl Engine {
                     .collect();
                 for (column, _, _, coll) in &plan.order {
                     let key = match (coll, &row[*column]) {
-                        (Some(coll), Value::Text(text)) => {
-                            Value::Bytea(collation::sort_key(coll, text)?)
+                        (Some(coll), v @ (Value::Text(_) | Value::Array(_))) => {
+                            Value::Bytea(collation_sort_key(coll, v)?.expect("a non-NULL key"))
                         }
                         _ => row[*column].clone(),
                     };
@@ -912,10 +912,9 @@ impl Engine {
                 let mut sorter = self.new_sorter(&[(key_slot, desc, false, None)]);
                 while let Some(mut row) = values.next()? {
                     if let Some(c) = &collation {
-                        let Value::Text(text) = &row[0] else {
-                            unreachable!()
-                        };
-                        row.push(Value::Bytea(collation::sort_key(c, text)?));
+                        let key = collation_sort_key(c, &row[0])?
+                            .expect("a collated WITHIN GROUP key buffers only text or text[]");
+                        row.push(Value::Bytea(key));
                     }
                     sorter.push(row)?;
                 }

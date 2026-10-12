@@ -1103,14 +1103,14 @@ func windowCollKeys(rows []storedRow, order []orderSlot) ([][][]byte, error) {
 			if k.collation == nil {
 				continue
 			}
-			if row[k.idx].Kind == ValText {
-				sk, err := sortKey(k.collation, row[k.idx].str())
+			if v := row[k.idx]; v.Kind == ValText || v.Kind == ValArray {
+				sk, err := collationSortKey(k.collation, v)
 				if err != nil {
 					return nil, err
 				}
 				keys = append(keys, sk)
 			} else {
-				keys = append(keys, nil) // NULL (a collated slot is text) — handled by NULL placement
+				keys = append(keys, nil) // NULL (a collated slot is text / text[]) — handled by NULL placement
 			}
 		}
 		all[i] = keys
@@ -1201,14 +1201,14 @@ func collationKeysForRow[R ~[]Value](row R, order []orderSlot) ([][]byte, error)
 		if k.collation == nil {
 			continue
 		}
-		if row[k.idx].Kind == ValText {
-			sk, err := sortKey(k.collation, row[k.idx].str())
+		if v := row[k.idx]; v.Kind == ValText || v.Kind == ValArray {
+			sk, err := collationSortKey(k.collation, v)
 			if err != nil {
 				return nil, err
 			}
 			keys = append(keys, sk)
 		} else {
-			keys = append(keys, nil) // NULL (a collated slot is text) — handled by NULL placement
+			keys = append(keys, nil) // NULL (a collated slot is text / text[]) — handled by NULL placement
 		}
 	}
 	return keys, nil

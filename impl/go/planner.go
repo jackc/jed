@@ -479,7 +479,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			} else {
 				// Grouping is byte equality, but an indeterminate key is still 42P21
 				// (spec/design/collation.md §1 "A sort or grouping target").
-				if gr.ty.kind == rtText {
+				if gr.ty.collatable() {
 					d, derr := deriveCollation(s, gr.canon)
 					if derr != nil {
 						return nil, derr
@@ -798,7 +798,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				}
 				var coll *Collation
 				if key.Collation != "" {
-					if ty.kind != rtText && ty.kind != rtNull {
+					if !ty.collatable() && ty.kind != rtNull {
 						return nil, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(ty)))
 					}
 					if coll, err = resolveCollationName(s.catalog, key.Collation); err != nil {
@@ -823,7 +823,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			// clause, the key inherits the column's frozen (implicit) collation.
 			var coll *Collation
 			if key.Collation != "" {
-				if !s.columnOf(r).Type.IsText() {
+				if !s.columnOf(r).Type.IsCollatable() {
 					return nil, typeError(fmt.Sprintf(
 						"collations are not supported by type %s", s.columnOf(r).Type.CanonicalName(),
 					))
@@ -888,7 +888,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		// DERIVED from the key expression.
 		var coll *Collation
 		if key.Collation != "" {
-			if ty.kind != rtText && ty.kind != rtNull {
+			if !ty.collatable() && ty.kind != rtNull {
 				return nil, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(ty)))
 			}
 			if coll, err = resolveCollationName(s.catalog, key.Collation); err != nil {

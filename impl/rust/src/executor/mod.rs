@@ -2108,6 +2108,15 @@ impl ResolvedType {
         }
     }
 
+    /// Whether this type carries a collation (spec/design/collation.md §1): text or text[].
+    pub(crate) fn collatable(&self) -> bool {
+        match self {
+            ResolvedType::Text => true,
+            ResolvedType::Array(e) => matches!(**e, ResolvedType::Text),
+            _ => false,
+        }
+    }
+
     /// This type's name, for the `# types:` output and a `42804` assignability message (the integer
     /// width is exact). A named composite is its type name; an anonymous `ROW(...)` is `record` (PG).
     fn type_name(&self) -> String {
@@ -3519,7 +3528,7 @@ fn check_recursive_column_types(
         // The non-recursive term fixed the relation's collation, so the UNION's overall common
         // collation must equal it (PostgreSQL's recursive-CTE check, spec/design/collation.md §1):
         // a recursive term cannot re-collate a column. Mismatch is 42P21.
-        if *at == ResolvedType::Text {
+        if at.collatable() {
             let ad = &anchor.column_derivs()[i];
             let overall = common_collation(
                 &[ad.clone(), recursive.column_derivs()[i].clone()],

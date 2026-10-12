@@ -560,6 +560,19 @@ impl RExpr {
                         };
                         return Ok(Value::Bool(res));
                     }
+                    // Two text[] values walk their element pairs under the collation, charging
+                    // `collate` per compared pair (collation.md §11).
+                    if let (Value::Array(x), Value::Array(y)) = (&a, &b) {
+                        let ord = collated_array_cmp(coll, x, y, Some(m))?;
+                        let res = match op {
+                            CmpOp::Lt => ord.is_lt(),
+                            CmpOp::Gt => ord.is_gt(),
+                            CmpOp::Le => ord.is_le(),
+                            CmpOp::Ge => ord.is_ge(),
+                            _ => unreachable!(),
+                        };
+                        return Ok(Value::Bool(res));
+                    }
                     // Either operand NULL ⇒ Unknown (text comparison is 3-valued).
                     return Ok(Value::Null);
                 }
@@ -1629,7 +1642,7 @@ impl RExpr {
                 // GREATEST/LEAST is EAGER (grammar.md §52): charge the node, then evaluate EVERY
                 // argument (all must be, to be compared — GREATEST(1, 1/0) traps). NULL arguments
                 // are ignored; the running winner is the max (greatest) or min (least) under the
-                // unified type's total order (`value_cmp`, or `collation` for text). All-NULL →
+                // unified type's total order (`value_cmp`, or `collation` for text / text[]). All-NULL →
                 // NULL. Non-NULL values are coerced to the unified type (integer → decimal) before
                 // comparison so the comparator sees a single type. Each comparison after the first
                 // charges its size-scaled work (decimal_work / varlen_compare / collate), the same
@@ -1652,6 +1665,10 @@ impl RExpr {
                                 );
                                 m.guard()?;
                                 collated_cmp(coll, a, b)?
+                            } else if let (Some(coll), Value::Array(a), Value::Array(b)) =
+                                (collation, &v, cur)
+                            {
+                                collated_array_cmp(coll, a, b, Some(m))?
                             } else {
                                 m.charge(
                                     COSTS.decimal_work * (decimal_cmp_work(&v, cur) - 1) as i64,

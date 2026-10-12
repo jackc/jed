@@ -528,3 +528,67 @@ func TestCollationHostOpsRejectedInReadOnlyOrFailedBlock(t *testing.T) {
 		t.Fatalf("default changed: %q", db.DefaultCollation())
 	}
 }
+
+// ---- text[] collation (format_version 36 — collation.md §1 "A text[] carries its elements' collation") ----
+
+func arrayTexts(t *testing.T, rows [][]Value) []string {
+	t.Helper()
+	out := make([]string, len(rows))
+	for i, r := range rows {
+		if r[0].Kind != ValArray {
+			t.Fatalf("expected an array, got %v", r[0])
+		}
+		out[i] = arrayOut(r[0].arrayVal())
+	}
+	return out
+}
+
+func TestTextArrayCollationInheritsDefaultAndRoundTrips(t *testing.T) {
+	t.Parallel()
+	// An un-annotated text[] column inherits the per-database default (frozen), and a collated text[]
+	// PRIMARY KEY stores its elements' sort keys — both survive a close + reopen (the array column
+	// entry's has_collation bit + name), and a write after reopen keys under the same collation.
+	loadFixtureBundle(t)
+	path := t.TempDir() + "/text_array_collation.jed"
+	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := db.SetDefaultCollation("unicode"); err != nil {
+		t.Fatalf("set default: %v", err)
+	}
+	run(t, db, `CREATE TABLE t (k text[] PRIMARY KEY, c text[] COLLATE "C")`)
+	run(t, db, `INSERT INTO t VALUES ('{b}','{b}'),('{A}','{A}'),('{a}','{a}')`)
+	if err := db.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	re, err := openWithOptions(path, OpenOptions{SkipFsync: true})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer re.Close()
+	run(t, re, `INSERT INTO t VALUES ('{B}','{B}')`)
+	// No ORDER BY: a single-table scan returns the stored (unicode-keyed) PK order.
+	if got := arrayTexts(t, query(t, re, `SELECT k FROM t`)); !eqStrings(got, []string{"{a}", "{A}", "{b}", "{B}"}) {
+		t.Fatalf("reopened collated text[] key order: got %v", got)
+	}
+	if got := arrayTexts(t, query(t, re, `SELECT c FROM t ORDER BY c`)); !eqStrings(got, []string{"{A}", "{B}", "{a}", "{b}"}) {
+		t.Fatalf("reopened C text[] column: got %v", got)
+	}
+}
+
+func TestTextArrayCollationConflictIsRaisedAtPlanTime(t *testing.T) {
+	t.Parallel()
+	// A deliberate PG divergence (collation.md §15): PostgreSQL raises 42P22 for `a = c` over two
+	// differently-collated text[] values only once its element texteq runs, so an empty table (or
+	// arrays of different lengths) succeeds there; jed derives the conflict when the query is planned.
+	loadFixtureBundle(t)
+	db := memDB().Session(SessionOptions{})
+	run(t, db, `CREATE TABLE t (a text[] COLLATE "unicode", c text[] COLLATE "C")`)
+	if _, err := queryOutcome(db, `SELECT a = c FROM t`, nil); err == nil || err.(*EngineError).Code() != "42P22" {
+		t.Fatalf("empty-table text[] conflict: want 42P22, got %v", err)
+	}
+}

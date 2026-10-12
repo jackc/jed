@@ -868,14 +868,9 @@ func foldAggBatch(a *acc, spec *aggSpec, survivors []storedRow, meter *costMeter
 			}
 			// A text MIN/MAX under a collation compares sort keys, exactly like acc.fold
 			// (spec/design/collation.md §1).
-			var c int
-			if a.collation != nil && a.cur.Kind == ValText && v.Kind == ValText {
-				var err error
-				if c, err = collatedCmp(a.collation, a.cur.str(), v.str()); err != nil {
-					return err
-				}
-			} else {
-				c = valueCmp(a.cur, v)
+			c, err := collatedOrValueCmp(a.collation, a.cur, v)
+			if err != nil {
+				return err
 			}
 			keepCur := (spec.plan == planMin && c <= 0) || (spec.plan == planMax && c >= 0)
 			if !keepCur {

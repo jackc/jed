@@ -483,14 +483,9 @@ func (a *acc) fold(v Value, m *costMeter) error {
 			if !a.hasCur {
 				a.cur, a.hasCur = v, true
 			} else {
-				var c int
-				if a.collation != nil && a.cur.Kind == ValText && v.Kind == ValText {
-					var err error
-					if c, err = collatedCmp(a.collation, a.cur.str(), v.str()); err != nil {
-						return err
-					}
-				} else {
-					c = valueCmp(a.cur, v)
+				c, err := collatedOrValueCmp(a.collation, a.cur, v)
+				if err != nil {
+					return err
 				}
 				keepCur := (a.plan == planMin && c <= 0) || (a.plan == planMax && c >= 0)
 				if !keepCur {
@@ -1078,10 +1073,10 @@ func sortOsaVals(vals []Value, collation *Collation, desc bool) error {
 	}
 	d := make([]deco, len(vals))
 	for i, v := range vals {
-		if v.Kind != ValText {
-			panic("a collated WITHIN GROUP key buffers only text")
+		if v.Kind != ValText && v.Kind != ValArray {
+			panic("a collated WITHIN GROUP key buffers only text or text[]")
 		}
-		sk, err := sortKey(collation, v.str())
+		sk, err := collationSortKey(collation, v)
 		if err != nil {
 			return err
 		}
@@ -1183,15 +1178,9 @@ func compareHypoKey(a, b Value, ks keySort) (int, error) {
 		}
 		return -1, nil
 	default:
-		var base int
-		if ks.collation != nil && a.Kind == ValText && b.Kind == ValText {
-			c, err := collatedCmp(ks.collation, a.str(), b.str())
-			if err != nil {
-				return 0, err
-			}
-			base = c
-		} else {
-			base = valueCmp(a, b)
+		base, err := collatedOrValueCmp(ks.collation, a, b)
+		if err != nil {
+			return 0, err
 		}
 		return dirCmp(base, ks.desc), nil
 	}

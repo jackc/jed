@@ -489,6 +489,12 @@ func (t dataType) IsBool() bool { return t.isScalar() && t.Scalar.IsBool() }
 // IsText reports whether this is the scalar text type (false for a composite/array).
 func (t dataType) IsText() bool { return t.isScalar() && t.Scalar.IsText() }
 
+// IsCollatable reports whether this type carries a collation (spec/design/collation.md §1): text, or
+// an array of text (an array of a collatable type is itself collatable, PostgreSQL's rule).
+func (t dataType) IsCollatable() bool {
+	return t.IsText() || (t.Array != nil && t.Array.IsText())
+}
+
 // IsBytea reports whether this is the scalar bytea type (false for a composite/array).
 func (t dataType) IsBytea() bool { return t.isScalar() && t.Scalar.IsBytea() }
 
