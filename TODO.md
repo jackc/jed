@@ -286,8 +286,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   `testdata` corpus; one committed transaction per step (resumable); bundled by the CLI as
   `jed migrate`. → [/migrate/design.md](migrate/design.md)
   - [ ] _follow-on ([design.md §11](migrate/design.md)):_ an all-or-nothing whole-run transaction
-    mode; a `renumber` collision helper. (A per-migration ledger table — drift detection, out-of-order,
-    truthful status — is **not planned**; a potential option only on a definite need.)
+    mode. (A per-migration ledger table — drift detection, out-of-order, truthful status — is **not
+    planned**; a potential option only on a definite need.)
 - [x] **Schema introspection — the `jed_` catalog relations** — I0 (the `jed_` name reservation,
   `42939`), I1 (`jed_tables` + `jed_columns`), I2 (`jed_indexes` + `jed_constraints`), and I3
   (`jed_sequences` + `jed_types` + `jed_type_fields`) are landed (all 3 cores): read-only computed

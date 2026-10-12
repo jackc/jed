@@ -106,6 +106,29 @@ jed migrate set-version 2 app.jed   # adopt an existing database: record version
 jed migrate new add_posts           # scaffold migrations/NNN_add_posts.sql
 ```
 
+### Renumbering after a merge
+
+When two branches each add migration `002`, merging them leaves a duplicate sequence. tern's
+`renumber` workflow fixes it: on the branch whose migrations should keep their numbers, run
+`jed migrate renumber start` (it records the current set in `migrations/.jed-renumber.tmp`); merge or
+rebase the other branch; then run `jed migrate renumber finish`, which renumbers every migration not
+in the recorded set after it, in order:
+
+```
+$ ls migrations                         # main
+001_create_users.sql  002_add_last_login_to_users.sql
+$ jed migrate renumber start
+recorded 2 migrations in migrations/.jed-renumber.tmp; merge the other branch, then run `jed migrate renumber finish`
+$ git switch feature && git rebase main
+$ ls migrations
+001_create_users.sql  002_add_last_login_to_users.sql  002_create_todos.sql
+$ jed migrate renumber finish
+renamed 002_create_todos.sql -> 003_create_todos.sql
+renumbered 1 migration
+```
+
+It is CLI-only (as in tern) and needs no database. See [`design.md`](design.md) §9.1.
+
 See [`design.md`](design.md) §9 and [`spec/design/cli.md`](../spec/design/cli.md) §3.1.
 
 ## Tests

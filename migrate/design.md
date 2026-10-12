@@ -47,8 +47,7 @@ worth stating because they remove tern concepts a reader would otherwise look fo
   an already-open `Database` handle (the embedded case) or the CLI opens a database *file* (§9).
 
 **Non-goals for v1** (kept out on purpose, revisited in §11): a per-migration ledger /
-checksums / drift detection, out-of-order migration application, migration squashing, and a
-`renumber`-style collision helper.
+checksums / drift detection, out-of-order migration application, and migration squashing.
 
 ---
 
@@ -360,6 +359,7 @@ jed migrate [-d TARGET] [-m DIR] [--version-table NAME] DBFILE   # apply up/down
 jed migrate status       [-m DIR] [--version-table NAME] DBFILE  # current version, target, pending count
 jed migrate set-version VERSION [-m DIR] [--version-table NAME] DBFILE  # baseline: record VERSION, run nothing
 jed migrate new NAME     [-m DIR]                                # scaffold NNN_NAME.sql (next sequence), no DB
+jed migrate renumber start|finish [-m DIR]                       # resolve merged-branch collisions (§9.1), no DB
 
   -d, --destination TARGET   integer | +N | -N | -+N | last   (tern's target grammar; default: last)
   -m, --migrations DIR       migrations directory              (default: ./migrations)
@@ -369,20 +369,56 @@ jed migrate new NAME     [-m DIR]                                # scaffold NNN_
 - **Bare `jed migrate DBFILE` applies to `last`** — the tern-parity default (`tern migrate`), the
   dominant startup case. `-d`/`--destination` carries tern's relative grammar (`+N` / `-N` / `-+N` /
   `last` / an integer), resolved to an absolute target before calling the library (§6).
-- **`status`, `set-version`, and `new` are sub-sub-commands of `migrate`**, so the top level gains
-  no generic verbs. The `migrate`-subverb vocabulary is fixed and small (`status`, `set-version`,
-  `new`); a first argument after `migrate` that is not one of them is treated as the DBFILE for the
-  default apply action.
+- **`status`, `set-version`, `new`, and `renumber` are sub-sub-commands of `migrate`**, so the top
+  level gains no generic verbs. The `migrate`-subverb vocabulary is fixed and small (`status`,
+  `set-version`, `new`, `renumber`); a first argument after `migrate` that is not one of them is
+  treated as the DBFILE for the default apply action.
 - **`set-version` takes an absolute VERSION** (a non-negative integer, range-checked by the library,
   §6.1) — not `-d`'s relative grammar — and **requires an existing DBFILE**, like `status`: adopting
   is for a database that already exists, so it never creates one.
 - **`migrate new` needs no database** — it writes a stub file (the next sequence number, the `----
   create above / drop below ----` separator) into the migrations directory.
+- **`migrate renumber` needs no database** either — it renames files in the migrations directory
+  (§9.1).
 
 Migration output (which migration ran, which direction, the resulting version) prints through the
 CLI's normal script-mode channel; errors carry the migration name and SQLSTATE (§8). Exit codes
 follow cli.md (`0` success, `1` usage/open error, `2` a migration failed). The interactive TUI is out
 of scope for migrations in v1.
+
+### 9.1 Renumbering after a merge: `renumber start` / `finish`
+
+Two branches that each add a migration both take the next sequence number, so merging them leaves a
+duplicate (the loader refuses it, §4). tern's `renumber` workflow resolves this, and it is ported as
+tern places it: **in the CLI only**, not in the library packages — it is a developer tool over a
+migrations directory, not something a host runs at startup.
+
+```
+git switch main && jed migrate renumber start     # on the branch whose migrations keep their numbers
+git switch feature && git rebase main             # merge or rebase in the other branch
+jed migrate renumber finish                       # renumber the merged-in migrations after them
+```
+
+- **`start`** reads the migration file names in the directory (`-m`, default `./migrations`), which
+  must form `1 … N` with no gap or duplicate (a name-only check, as tern's — file contents are not
+  read), and writes them, one per line in sequence order, to the state file **`.jed-renumber.tmp`**
+  in that directory (tern's `.tern-renumber.tmp`). It overwrites any earlier state file, so a start
+  can be redone. The file does not match the migration pattern, so loaders ignore it; it is left
+  untracked and carried across the branch switch.
+- **`finish`** reads the state file and scans the directory **without validation** (duplicates and
+  gaps are the point). Every migration file whose name is **not** recorded in the state file is
+  renumbered after the highest recorded sequence: ordered by its current sequence (ties by file
+  name — tern leaves that order unspecified), each takes the next number, zero-padded to three
+  digits (`%03d`), keeping the rest of its name (`002_create_todos.sql` → `003_create_todos.sql`).
+  Recorded files keep their names. The state file is then removed (failing to remove it is only a
+  warning: a repeated `finish` renames nothing). `finish` without a state file is an error.
+- **No file is ever overwritten** — a deliberate hardening over tern, whose `rename` would silently
+  replace one. A new name may be held only by another merged-in migration that is itself about to
+  be renamed (e.g. `001_t.sql` → `002_t.sql` while `002_t.sql` → `003_t.sql`); renames run in an
+  order that frees each name first. Because both the old sequences and the new numbers increase
+  along the ordering, these dependencies form chains, never a cycle. A new name held by anything
+  else is refused before any file is renamed.
+- Errors exit `1`; nothing touches a database.
 
 ---
 
@@ -415,8 +451,6 @@ Called out explicitly so they can be settled before or shortly after the first s
   `schema_version` unchanged.
 - **All-or-nothing run mode.** An option to wrap the entire run in one transaction rather than one
   per step (§6). Deferred; the per-step default is safer for large runs.
-- **Renumbering helper.** tern's `renumber start/finish` resolves sequence collisions from parallel
-  branches. Nice-to-have tooling; deferred.
 - **CLI spelling.** §9 fixes the shape — a `migrate` subcommand with `status` / `new` sub-verbs — but
   the exact flag names and output formatting are settled in [cli.md](../spec/design/cli.md) when the
   CLI slice lands. Introducing the first reserved first-token verb (`migrate`) is itself a small

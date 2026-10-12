@@ -679,6 +679,134 @@ fn migrate_new_without_name_exits_1() {
     assert!(r.stderr.contains("needs a NAME"), "{}", r.stderr);
 }
 
+/// Write each `(file name, contents)` into `dir`.
+fn write_files(dir: &std::path::Path, files: &[(&str, &str)]) {
+    for (name, contents) in files {
+        std::fs::write(dir.join(name), contents).unwrap();
+    }
+}
+
+/// The migration-looking file names in `dir`, sorted.
+fn sql_files(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sql"))
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn migrate_renumber_moves_merged_migrations_after_the_recorded_set() {
+    // tern's TestRenumber: start on 001–003, merge in 002–004, finish renumbers them 004–006.
+    let dir = tmp_dir("migrate_renumber");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+    write_files(
+        &dir,
+        &[("001_a.sql", "a"), ("002_b.sql", "b"), ("003_c.sql", "c")],
+    );
+
+    let r = run(&["migrate", "renumber", "start", "-m", dir_str], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert!(r.stdout.contains("recorded 3 migrations"), "{}", r.stdout);
+    let state = std::fs::read_to_string(dir.join(".jed-renumber.tmp")).unwrap();
+    assert_eq!(state, "001_a.sql\n002_b.sql\n003_c.sql\n");
+
+    write_files(
+        &dir,
+        &[("002_d.sql", "d"), ("003_e.sql", "e"), ("004_f.sql", "f")],
+    );
+    let r = run(&["migrate", "renumber", "finish", "-m", dir_str], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert!(
+        r.stdout.contains("renamed 002_d.sql -> 004_d.sql"),
+        "{}",
+        r.stdout
+    );
+    assert!(r.stdout.contains("renumbered 3 migrations"), "{}", r.stdout);
+    assert_eq!(
+        sql_files(&dir),
+        [
+            "001_a.sql",
+            "002_b.sql",
+            "003_c.sql",
+            "004_d.sql",
+            "005_e.sql",
+            "006_f.sql"
+        ]
+    );
+    assert_eq!(std::fs::read_to_string(dir.join("004_d.sql")).unwrap(), "d");
+    assert!(!dir.join(".jed-renumber.tmp").exists());
+
+    // The state file is gone, so a second finish has nothing to work from.
+    let r = run(&["migrate", "renumber", "finish", "-m", dir_str], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("renumber start"), "{}", r.stderr);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn migrate_renumber_never_overwrites_a_pending_migration() {
+    // 001_t.sql → 002_t.sql would land on the not-yet-moved 002_t.sql: it moves first.
+    let dir = tmp_dir("migrate_renumber_chain");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+    write_files(&dir, &[("001_base.sql", "base")]);
+    let r = run(&["migrate", "renumber", "start", "-m", dir_str], "");
+    assert_eq!(r.code, 0, "{}", r.stderr);
+
+    write_files(&dir, &[("001_t.sql", "first"), ("002_t.sql", "second")]);
+    let r = run(&["migrate", "renumber", "finish", "-m", dir_str], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert_eq!(sql_files(&dir), ["001_base.sql", "002_t.sql", "003_t.sql"]);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("002_t.sql")).unwrap(),
+        "first"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("003_t.sql")).unwrap(),
+        "second"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn migrate_renumber_errors_exit_1() {
+    let dir = tmp_dir("migrate_renumber_err");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+
+    // finish before start: no state file.
+    let r = run(&["migrate", "renumber", "finish", "-m", dir_str], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains(".jed-renumber.tmp"), "{}", r.stderr);
+
+    // start refuses a set that is not 1 … N (a gap, then a duplicate), writing no state.
+    write_files(&dir, &[("001_a.sql", "a"), ("003_c.sql", "c")]);
+    let r = run(&["migrate", "renumber", "start", "-m", dir_str], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("non-contiguous"), "{}", r.stderr);
+    write_files(&dir, &[("001_b.sql", "b")]);
+    let r = run(&["migrate", "renumber", "start", "-m", dir_str], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("duplicate sequence 1"), "{}", r.stderr);
+    assert!(!dir.join(".jed-renumber.tmp").exists());
+
+    // A missing or unknown action is a usage error.
+    let r = run(&["migrate", "renumber", "-m", dir_str], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("needs start or finish"), "{}", r.stderr);
+    let r = run(&["migrate", "renumber", "begin", "-m", dir_str], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("unknown renumber action"), "{}", r.stderr);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_dbfile_is_not_shadowed_by_the_migrate_verb() {
     // The reserved word is only the *first* token; a normal invocation is untouched.
