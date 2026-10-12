@@ -610,6 +610,50 @@ fn migrate_status_on_missing_db_exits_1() {
 }
 
 #[test]
+fn migrate_set_version_records_without_running() {
+    let db = tmp("migrate_setv.jed");
+    let db_str = db.to_str().unwrap();
+    let migs = migrate_testdata("blog");
+
+    // set-version never creates the database: adopting is for an existing one.
+    let r = run(&["migrate", "set-version", "1", "-m", &migs, db_str], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("does not exist"), "{}", r.stderr);
+
+    let r = run(&["migrate", "-d", "1", "-m", &migs, db_str], "");
+    assert_eq!(r.code, 0, "{}", r.stderr);
+
+    // Baseline at 3: the version moves, no migration runs.
+    let r = run(&["migrate", "set-version", "3", "-m", &migs, db_str], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert!(r.stdout.contains("version set to 3"), "{}", r.stdout);
+    assert!(!r.stdout.contains("up "), "{}", r.stdout);
+    let r = run(&["migrate", "status", "-m", &migs, db_str], "");
+    assert!(r.stdout.contains("version:  3 of 3"), "{}", r.stdout);
+    let r = run(
+        &["-c", "SELECT name FROM jed_tables ORDER BY name", db_str],
+        "",
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.stdout.contains("users"), "{}", r.stdout);
+    assert!(
+        !r.stdout.contains("posts"),
+        "002 must not have run: {}",
+        r.stdout
+    );
+
+    // Out of range is a BadVersion (exit 1); a non-integer VERSION is a usage error (exit 1).
+    let r = run(&["migrate", "set-version", "9", "-m", &migs, db_str], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("out of range"), "{}", r.stderr);
+    let r = run(&["migrate", "set-version", "last", "-m", &migs, db_str], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("invalid VERSION"), "{}", r.stderr);
+
+    remove_db(&db);
+}
+
+#[test]
 fn migrate_new_scaffolds_next_sequence() {
     let dir = tmp_dir("migrate_new");
     let dir_str = dir.to_str().unwrap();

@@ -232,6 +232,61 @@ fn status_reports_progress() {
     assert_eq!((s.current, s.target, s.pending), (2, 3, 1));
 }
 
+/// Run SQL on a throwaway session (outside the migrator).
+fn exec(db: &Database, sql: &str) {
+    db.session(SessionOptions::default())
+        .execute_script(sql)
+        .expect("execute_script");
+}
+
+#[test]
+fn set_version_adopts_an_existing_database() {
+    let db = mem_db();
+    let migrations = load_migrations(&testdata("blog")).unwrap();
+    let mut m = Migrator::new(&db, migrations, Options::default()).unwrap();
+    // The database already has migration 001's schema, built outside the migrator.
+    let up = m.migrations()[0].up.clone();
+    exec(&db, &up);
+    // Baseline at 1: records the version and runs nothing.
+    m.set_version(1).unwrap();
+    assert_eq!(m.current_version().unwrap(), 1);
+    assert_eq!(table_names(&db), ["schema_version", "users"]);
+    // Migrating from the baseline applies only 002 and 003.
+    m.migrate().unwrap();
+    assert_eq!(table_names(&db), ["posts", "schema_version", "users"]);
+    // Setting the version back to 0 runs no down migration either.
+    m.set_version(0).unwrap();
+    assert_eq!(m.current_version().unwrap(), 0);
+    assert_eq!(table_names(&db), ["posts", "schema_version", "users"]);
+}
+
+#[test]
+fn set_version_range_and_repair() {
+    let db = mem_db();
+    let migrations = load_migrations(&testdata("blog")).unwrap();
+    let mut m = Migrator::new(&db, migrations, Options::default()).unwrap();
+    assert!(matches!(
+        m.set_version(4),
+        Err(MigrateError::BadVersion {
+            whence: "target",
+            ..
+        })
+    ));
+    assert_eq!(m.current_version().unwrap(), 0, "unmoved");
+    // A version table outside 0 … N blocks migrate_to but not set_version, which repairs it.
+    exec(&db, "update schema_version set version = 99");
+    assert!(matches!(
+        m.migrate(),
+        Err(MigrateError::BadVersion {
+            whence: "database",
+            ..
+        })
+    ));
+    m.set_version(3).unwrap();
+    let s = m.status().unwrap();
+    assert_eq!((s.current, s.target, s.pending), (3, 3, 0));
+}
+
 #[test]
 fn custom_version_table() {
     let db = mem_db();

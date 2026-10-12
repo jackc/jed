@@ -101,6 +101,21 @@ export class Migrator {
     }
   }
 
+  // setVersion records version as the current version without running any migration — the
+  // baseline that adopts an existing database whose schema already matches migration version
+  // (design.md §6.1). version must be in 0 … N, else BadVersionError; the value already in the
+  // version table is not checked, so setVersion also repairs a table that disagrees with the
+  // migrations directory. It ensures the version table exists first.
+  setVersion(version: number): void {
+    this.ensureVersionTable();
+    const n = this._migrations.length;
+    // The integer check keeps the interpolation below a plain integer literal.
+    if (!Number.isInteger(version) || version < 0 || version > n) {
+      throw new BadVersionError(version, n, "target");
+    }
+    this.session.executeScript(`update ${this._versionTable} set version = ${version}`);
+  }
+
   // status reports the current version, the target (N), and the number of pending migrations
   // (design.md §9). It ensures the version table exists first.
   status(): Status {

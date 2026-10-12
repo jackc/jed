@@ -99,6 +99,8 @@ carry a `.jed` extension, so it is a non-issue in practice.
 ```
 jed migrate [-d TARGET] [-m DIR] [--version-table NAME] DBFILE   apply migrations up/down to TARGET
 jed migrate status       [-m DIR] [--version-table NAME] DBFILE  current version, target, pending count
+jed migrate set-version VERSION [-m DIR] [--version-table NAME] DBFILE
+                                                                 record VERSION without running migrations
 jed migrate new NAME     [-m DIR]                                scaffold NNN_NAME.sql (no database)
 
   -d, --destination TARGET   integer | +N | -N | -+N | last   (tern's grammar; default: last)
@@ -106,12 +108,14 @@ jed migrate new NAME     [-m DIR]                                scaffold NNN_NA
       --version-table NAME   override the default `schema_version`
 ```
 
-`status` and `new` are the fixed, small set of `migrate` sub-verbs; a first argument after `migrate`
+`status`, `set-version`, and `new` are the fixed, small set of `migrate` sub-verbs; a first argument after `migrate`
 that is not one of them is the DBFILE for the default apply action. Bare `jed migrate DBFILE` applies
 to `last` (the tern-parity default), **creating DBFILE if it does not exist** (the migration-bootstrap
 workflow — the one place the CLI opens-or-creates, since a migrate run is expected to bring a fresh
 project's database into being); `-d`'s relative grammar is resolved to an absolute target before the
-library runs (design.md §6/§9). `migrate new` needs no database. Migration progress prints one line
+library runs (design.md §6/§9). `migrate set-version VERSION` is the baseline that adopts an
+existing database (design.md §6.1): VERSION is an absolute integer in `0 … N` (out of range exits
+`1`), DBFILE must already exist, and no migration runs. `migrate new` needs no database. Migration progress prints one line
 per applied migration; errors carry the migration name, direction, failing statement, and SQLSTATE.
 Exit codes extend §3's: `0` success · `1` usage/open/load error · **`2` a migration failed** (a
 statement error, or a down through an irreversible migration). The interactive TUI is out of scope

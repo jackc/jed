@@ -77,6 +77,7 @@ The `jed` CLI bundles the Rust crate as the `jed migrate` subcommand:
 jed migrate app.jed                 # apply every migration (creates app.jed if absent)
 jed migrate -d 2 app.jed            # migrate up/down to version 2
 jed migrate status app.jed          # current version, target, pending count
+jed migrate set-version 2 app.jed   # adopt an existing database: record version 2, run nothing
 jed migrate new add_posts           # scaffold migrations/NNN_add_posts.sql
 ```
 

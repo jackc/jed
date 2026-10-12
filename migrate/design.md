@@ -176,7 +176,7 @@ mark**.
   `integer` (32-bit) is ample — a project will never author two billion migrations.
 - **Created on first use.** The migrator ensures the table exists (and is seeded with `0`) before
   reading or writing it, idempotently, in its own committed transaction. Adopting an existing
-  populated database is a `set-version` / baseline operation (§11).
+  populated database is a `set-version` / baseline operation (§6.1).
 
 **Why a high-water mark and not a per-migration ledger.** The single integer is tern's model and it
 is the *simple* choice the brief asks for: it is trivial to read (`select version from
@@ -240,6 +240,24 @@ commit gives resumability. An *all-or-nothing across the entire run* mode (wrap 
 outer transaction) is a possible option flag (§11) but is **not** the default — a giant migration run
 would otherwise hold the single writer and the whole staging buffer for its entire duration.
 
+### 6.1 Baseline: `set-version`
+
+The second public operation **records a version without running any migration** — the baseline
+that adopts an existing database whose schema already matches migration `v` (built by hand, by an
+older tool, or restored from elsewhere), so a later migrate applies only `v+1 … N`. It is tern's
+version-override operation, named `set-version` here.
+
+1. Ensure the version table exists (§5) — on a never-migrated database this creates it, seeded `0`.
+2. Range-check the requested version against `0 … N` exactly as the walk checks its target (§6
+   step 3): an out-of-range value is `BadVersion` (whence `target`) and nothing is written.
+3. `update schema_version set version = v` — one statement, so one write transaction.
+
+It **does not read or check the version already in the table**: overriding it is the point, and
+that includes repairing a table whose value lies outside `0 … N` (which the walk refuses with a
+`database` `BadVersion`). It runs no up or down half in either direction — setting a lower version
+leaves the schema untouched, so it is the caller's assertion that the schema matches, not something
+the library verifies (the high-water mark records only *how far*, §5).
+
 ---
 
 ## 7. Loading migrations (the source seam)
@@ -271,7 +289,8 @@ adding migration context:
   analogue, retargeted to jed's error type). Unwraps to the `EngineError`.
 - **`IrreversibleMigration`** — a down-migration was requested through a migration that has no down
   half.
-- **`BadVersion`** — the requested target, or the version read from the table, is outside `0 … N`.
+- **`BadVersion`** — the requested target (of a migrate or a `set-version`), or the version read
+  from the table, is outside `0 … N`.
 - **load-time errors** — missing/duplicate sequence number, empty up half, unreadable source.
 
 Under stop-on-first-error (the only mode), a failed step's transaction has already rolled back
@@ -309,6 +328,7 @@ stays minimal and predictable:
 ```
 jed migrate [-d TARGET] [-m DIR] [--version-table NAME] DBFILE   # apply up/down to TARGET (default: last)
 jed migrate status       [-m DIR] [--version-table NAME] DBFILE  # current version, target, pending count
+jed migrate set-version VERSION [-m DIR] [--version-table NAME] DBFILE  # baseline: record VERSION, run nothing
 jed migrate new NAME     [-m DIR]                                # scaffold NNN_NAME.sql (next sequence), no DB
 
   -d, --destination TARGET   integer | +N | -N | -+N | last   (tern's target grammar; default: last)
@@ -319,9 +339,13 @@ jed migrate new NAME     [-m DIR]                                # scaffold NNN_
 - **Bare `jed migrate DBFILE` applies to `last`** — the tern-parity default (`tern migrate`), the
   dominant startup case. `-d`/`--destination` carries tern's relative grammar (`+N` / `-N` / `-+N` /
   `last` / an integer), resolved to an absolute target before calling the library (§6).
-- **`status` and `new` are sub-sub-commands of `migrate`**, so the top level gains no generic verbs.
-  The `migrate`-subverb vocabulary is fixed and small (`status`, `new`); a first argument after
-  `migrate` that is not one of them is treated as the DBFILE for the default apply action.
+- **`status`, `set-version`, and `new` are sub-sub-commands of `migrate`**, so the top level gains
+  no generic verbs. The `migrate`-subverb vocabulary is fixed and small (`status`, `set-version`,
+  `new`); a first argument after `migrate` that is not one of them is treated as the DBFILE for the
+  default apply action.
+- **`set-version` takes an absolute VERSION** (a non-negative integer, range-checked by the library,
+  §6.1) — not `-d`'s relative grammar — and **requires an existing DBFILE**, like `status`: adopting
+  is for a database that already exists, so it never creates one.
 - **`migrate new` needs no database** — it writes a stub file (the next sequence number, the `----
   create above / drop below ----` separator) into the migrations directory.
 
@@ -359,9 +383,6 @@ Called out explicitly so they can be settled before or shortly after the first s
   `status` — remains only a *potential* future option: **not planned**, and revisited only if a
   definite need arises. If it ever lands it would be an additive second table, leaving
   `schema_version` unchanged.
-- **Baseline / adopt-an-existing-database.** tern's `override-version` (set the version without
-  running migrations, to adopt a database whose schema already matches migration N). Small, useful,
-  likely v1.1. Named `set-version` here to avoid tern's wording.
 - **All-or-nothing run mode.** An option to wrap the entire run in one transaction rather than one
   per step (§6). Deferred; the per-step default is safer for large runs.
 - **A start/redo/`OnStart` hook.** tern exposes an `OnStart` callback (sequence, name, direction,

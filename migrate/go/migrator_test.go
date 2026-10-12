@@ -300,3 +300,67 @@ func TestInvalidVersionTableName(t *testing.T) {
 		t.Fatal("expected an error for an invalid version table name")
 	}
 }
+
+func TestSetVersionAdoptsExistingDatabase(t *testing.T) {
+	db := memDB(t)
+	m := newBlogMigrator(t, db)
+	// The database already has migration 001's schema, built outside the migrator.
+	if _, err := db.ExecuteScript(m.Migrations()[0].Up); err != nil {
+		t.Fatalf("pre-build schema: %v", err)
+	}
+	// Baseline at 1: records the version and runs nothing.
+	if err := m.SetVersion(1); err != nil {
+		t.Fatalf("SetVersion(1): %v", err)
+	}
+	if v, err := m.CurrentVersion(); err != nil || v != 1 {
+		t.Fatalf("version after SetVersion(1) = %d, %v; want 1, nil", v, err)
+	}
+	if got := tableNames(t, db); !reflect.DeepEqual(got, []string{"schema_version", "users"}) {
+		t.Fatalf("tables after SetVersion(1) = %v; want [schema_version users]", got)
+	}
+	// Migrating from the baseline applies only 002 and 003.
+	if err := m.Migrate(); err != nil {
+		t.Fatalf("Migrate after baseline: %v", err)
+	}
+	want := []string{"posts", "schema_version", "users"}
+	if got := tableNames(t, db); !reflect.DeepEqual(got, want) {
+		t.Fatalf("tables after Migrate = %v; want %v", got, want)
+	}
+	// Setting the version back to 0 runs no down migration either.
+	if err := m.SetVersion(0); err != nil {
+		t.Fatalf("SetVersion(0): %v", err)
+	}
+	if v, _ := m.CurrentVersion(); v != 0 {
+		t.Fatalf("version after SetVersion(0) = %d, want 0", v)
+	}
+	if got := tableNames(t, db); !reflect.DeepEqual(got, want) {
+		t.Fatalf("tables after SetVersion(0) = %v; want %v (unchanged)", got, want)
+	}
+}
+
+func TestSetVersionRangeAndRepair(t *testing.T) {
+	db := memDB(t)
+	m := newBlogMigrator(t, db)
+	var bv *BadVersion
+	for _, v := range []int{4, -1} {
+		if err := m.SetVersion(v); !errors.As(err, &bv) || bv.Whence != "target" {
+			t.Fatalf("SetVersion(%d) error = %v; want *BadVersion (target)", v, err)
+		}
+	}
+	if v, _ := m.CurrentVersion(); v != 0 {
+		t.Fatalf("version after rejected SetVersion = %d, want 0 (unmoved)", v)
+	}
+	// A version table outside 0 … N blocks MigrateTo but not SetVersion, which repairs it.
+	if _, err := db.ExecuteScript("update schema_version set version = 99"); err != nil {
+		t.Fatalf("corrupt version: %v", err)
+	}
+	if err := m.Migrate(); !errors.As(err, &bv) || bv.Whence != "database" {
+		t.Fatalf("Migrate error = %v; want *BadVersion (database)", err)
+	}
+	if err := m.SetVersion(3); err != nil {
+		t.Fatalf("SetVersion(3): %v", err)
+	}
+	if s, _ := m.Status(); s != (Status{Current: 3, Target: 3, Pending: 0}) {
+		t.Fatalf("status after repair = %+v, want {3 3 0}", s)
+	}
+}

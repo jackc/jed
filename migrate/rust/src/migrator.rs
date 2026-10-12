@@ -123,6 +123,26 @@ impl Migrator {
         Ok(())
     }
 
+    /// Record `version` as the current version without running any migration — the baseline
+    /// that adopts an existing database whose schema already matches migration `version`
+    /// (design.md §6.1). `version` must be in `0 … N`, else [`MigrateError::BadVersion`]; the
+    /// value already in the version table is not checked, so this also repairs a table that
+    /// disagrees with the migrations directory. Ensures the version table exists first.
+    pub fn set_version(&mut self, version: u32) -> Result<(), MigrateError> {
+        self.ensure_version_table()?;
+        let n = self.migrations.len() as u32;
+        if version > n {
+            return Err(MigrateError::BadVersion {
+                version: version as i64,
+                n,
+                whence: "target",
+            });
+        }
+        let set = format!("update {} set version = {}", self.version_table, version);
+        self.session.execute_script(&set)?;
+        Ok(())
+    }
+
     /// Report the current version, the target (`N`), and the number of pending migrations
     /// (design.md §9). Ensures the version table exists first.
     pub fn status(&mut self) -> Result<Status, MigrateError> {

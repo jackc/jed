@@ -1,4 +1,5 @@
-//! The `jed migrate` subcommand (spec/design/cli.md, design.md §9): apply / status / new,
+//! The `jed migrate` subcommand (spec/design/cli.md, design.md §9): apply / status /
+//! set-version / new,
 //! bundling the `jed-migrate` crate so migrations ship in the CLI with no separate binary.
 //!
 //! Dispatched from `main.rs` when the first CLI token is the literal `migrate`; everything
@@ -15,6 +16,8 @@ use jed_migrate::{
 pub const USAGE: &str = "\
 usage: jed migrate [OPTIONS] DBFILE          apply migrations up/down to a target
        jed migrate status [OPTIONS] DBFILE   show current version, target, pending count
+       jed migrate set-version VERSION [OPTIONS] DBFILE
+                                             record VERSION without running migrations
        jed migrate new NAME [-m DIR]         scaffold the next migration file (no database)
 
   -d, --destination TARGET   integer | +N | -N | -+N | last   (default: last)
@@ -23,6 +26,7 @@ usage: jed migrate [OPTIONS] DBFILE          apply migrations up/down to a targe
   -h, --help                 print this help, then exit
 
 `jed migrate DBFILE` creates DBFILE if it does not exist, then applies every migration.
+`set-version` adopts an existing DBFILE whose schema already matches migration VERSION.
 A DBFILE literally named `migrate` is reached by qualifying its path (`jed ./migrate`).";
 
 /// Dispatch the migrate subcommand. `argv` is the arguments *after* the `migrate` token.
@@ -33,6 +37,7 @@ pub fn run(argv: &[String]) -> u8 {
             0
         }
         Some("status") => run_status(&argv[1..]),
+        Some("set-version") => run_set_version(&argv[1..]),
         Some("new") => run_new(&argv[1..]),
         _ => run_apply(argv),
     }
@@ -58,7 +63,7 @@ impl Default for Common {
     }
 }
 
-/// Parse the flags shared by `apply` and `status` (`-d`/`-m`/`--version-table`) plus one
+/// Parse the flags shared by `apply`, `status`, and `set-version` (`-d`/`-m`/`--version-table`) plus one
 /// positional DBFILE. `allow_dest` gates whether `-d`/`--destination` is accepted.
 fn parse_common(argv: &[String], allow_dest: bool) -> Result<Common, String> {
     let mut c = Common::default();
@@ -153,20 +158,9 @@ fn run_status(argv: &[String]) -> u8 {
     let Some(db_path) = c.db.clone() else {
         return usage_error("a DBFILE is required");
     };
-    if !db_path.exists() {
-        eprintln!(
-            "jed migrate: {}: database does not exist (run `jed migrate {}` to create and migrate it)",
-            db_path.display(),
-            db_path.display()
-        );
-        return 1;
-    }
-    let db = match Database::open(&db_path) {
+    let db = match open_existing(&db_path) {
         Ok(db) => db,
-        Err(e) => {
-            eprintln!("jed migrate: {}: {e}", db_path.display());
-            return 1;
-        }
+        Err(code) => return code,
     };
     let mut m = match build_migrator(&db, &c) {
         Ok(m) => m,
@@ -192,6 +186,45 @@ fn run_status(argv: &[String]) -> u8 {
         }
     }
     0
+}
+
+// ───────────────────────────── set-version ─────────────────────────────
+
+/// `jed migrate set-version VERSION [OPTIONS] DBFILE` — the baseline (design.md §6.1): record
+/// VERSION in the version table without running any migration. VERSION comes first; it is an
+/// absolute integer in `0 … N` (the library range-checks it, a `BadVersion` exiting 1). The
+/// database must already exist — adopting is for an existing database, so it is never created.
+fn run_set_version(argv: &[String]) -> u8 {
+    let Some(version_arg) = argv.first() else {
+        return usage_error("`jed migrate set-version` needs a VERSION");
+    };
+    let Ok(version) = version_arg.parse::<u32>() else {
+        return usage_error(&format!(
+            "invalid VERSION {version_arg:?}: expected a non-negative integer"
+        ));
+    };
+    let c = match parse_common(&argv[1..], false) {
+        Ok(c) => c,
+        Err(e) => return usage_error(&e),
+    };
+    let Some(db_path) = c.db.clone() else {
+        return usage_error("a DBFILE is required");
+    };
+    let db = match open_existing(&db_path) {
+        Ok(db) => db,
+        Err(code) => return code,
+    };
+    let mut m = match build_migrator(&db, &c) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    match m.set_version(version) {
+        Ok(()) => {
+            println!("version set to {version} (no migrations run)");
+            0
+        }
+        Err(e) => migrate_error(&e),
+    }
 }
 
 // ───────────────────────────── new ─────────────────────────────
@@ -251,6 +284,23 @@ fn open_or_create(path: &Path) -> Result<Database, u8> {
         })
     };
     result.map_err(|e| {
+        eprintln!("jed migrate: {}: {e}", path.display());
+        1
+    })
+}
+
+/// Open an existing DBFILE (`status`, `set-version`); a missing file is an error pointing at
+/// the apply action, which is the one that creates it.
+fn open_existing(path: &Path) -> Result<Database, u8> {
+    if !path.exists() {
+        eprintln!(
+            "jed migrate: {}: database does not exist (run `jed migrate {}` to create and migrate it)",
+            path.display(),
+            path.display()
+        );
+        return Err(1);
+    }
+    Database::open(path).map_err(|e| {
         eprintln!("jed migrate: {}: {e}", path.display());
         1
     })

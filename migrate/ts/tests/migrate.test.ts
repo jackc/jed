@@ -233,6 +233,52 @@ test("status reports progress", () => {
   }
 });
 
+test("setVersion adopts an existing database", () => {
+  const db = memDb();
+  const m = new Migrator(db, loadMigrations(testdata("blog")));
+  try {
+    // The database already has migration 001's schema, built outside the migrator.
+    db.executeScript(m.migrations[0].up);
+    // Baseline at 1: records the version and runs nothing.
+    m.setVersion(1);
+    assert.equal(m.currentVersion(), 1);
+    assert.deepEqual(tableNames(db), ["schema_version", "users"]);
+    // Migrating from the baseline applies only 002 and 003.
+    m.migrate();
+    assert.deepEqual(tableNames(db), ["posts", "schema_version", "users"]);
+    // Setting the version back to 0 runs no down migration either.
+    m.setVersion(0);
+    assert.equal(m.currentVersion(), 0);
+    assert.deepEqual(tableNames(db), ["posts", "schema_version", "users"]);
+  } finally {
+    m.close();
+  }
+});
+
+test("setVersion range-checks and repairs", () => {
+  const db = memDb();
+  const m = new Migrator(db, loadMigrations(testdata("blog")));
+  try {
+    for (const v of [4, -1, 1.5]) {
+      assert.throws(
+        () => m.setVersion(v),
+        (e: unknown) => e instanceof BadVersionError && e.whence === "target",
+      );
+    }
+    assert.equal(m.currentVersion(), 0);
+    // A version table outside 0 … N blocks migrateTo but not setVersion, which repairs it.
+    db.executeScript("update schema_version set version = 99");
+    assert.throws(
+      () => m.migrate(),
+      (e: unknown) => e instanceof BadVersionError && e.whence === "database",
+    );
+    m.setVersion(3);
+    assert.deepEqual(m.status(), { current: 3, target: 3, pending: 0 });
+  } finally {
+    m.close();
+  }
+});
+
 test("custom version table", () => {
   const db = memDb();
   const m = new Migrator(db, loadMigrations(testdata("blog")), { versionTable: "migration_state" });

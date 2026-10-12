@@ -116,6 +116,26 @@ func (m *Migrator) MigrateTo(target int) error {
 	return nil
 }
 
+// SetVersion records version as the current version without running any migration — the
+// baseline that adopts an existing database whose schema already matches migration version
+// (design.md §6.1). version must be in 0 … N, else a *BadVersion error; the value already in
+// the version table is not checked, so SetVersion also repairs a table that disagrees with the
+// migrations directory. It ensures the version table exists first.
+func (m *Migrator) SetVersion(version int) error {
+	if err := m.ensureVersionTable(); err != nil {
+		return err
+	}
+	n := len(m.migrations)
+	if version < 0 || version > n {
+		return &BadVersion{Version: version, N: n, Whence: "target"}
+	}
+	set := fmt.Sprintf("update %s set version = %d", m.versionTable, version)
+	if _, err := m.session.ExecuteScript(set); err != nil {
+		return fmt.Errorf("migrate: setting %s to version %d: %w", m.versionTable, version, err)
+	}
+	return nil
+}
+
 // Status reports the current version, the target (the latest version N), and the number of
 // pending migrations (design.md §9). It ensures the version table exists first.
 func (m *Migrator) Status() (Status, error) {
