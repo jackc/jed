@@ -108,6 +108,11 @@
 #              (planner.md §3.1); the `col + 0` spelling is not proven and scans. Applied to
 #              identically-seeded tables, both leave every row unchanged, and satisfiable near-miss
 #              mutations reach the same by-construction end state.
+#   view     — a view reference IS the equivalent derived table `(<definition>) AS v(<columns>)`
+#              (spec/design/views.md §4): the same query over a view and over its inlined spelling
+#              must return the same rows — a pushed-down predicate, a view over a view, a join with a
+#              table, an aggregate body, and a column alias list over the reference. Expected rows
+#              by construction; view_plan.test pins the matching cost and EXPLAIN.
 #   tlp      — Ternary-Logic Partitioning (SQLancer): for ANY predicate p, every row is in exactly
 #              one of `WHERE p` (TRUE) / `WHERE NOT p` (FALSE) / `WHERE p IS NULL` (UNKNOWN), so the
 #              three partitions UNION ALL must reconstruct the whole table (and COUNT over the whole
@@ -361,6 +366,12 @@ GROUPED_SETOP_PUSHDOWN_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.
                                 query.is_null query.is_distinct_from query.where_pushdown
                                 query.derived_pushdown query.derived_table expr.arithmetic expr.between
                                 expr.comparison_value null.three_valued types.i32].freeze
+VIEW_REQ = %w[ddl.view ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+              query.where_eq query.comparison_order query.logical_connectives query.order_by
+              query.order_by_keys query.qualified_column query.join_inner query.aggregates
+              query.group_by query.is_null query.is_distinct_from query.derived_table
+              query.derived_pushdown query.table_alias expr.arithmetic expr.between
+              expr.comparison_value null.three_valued types.i32].freeze
 CONTRADICTION_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
                        query.where_eq query.comparison_order query.logical_connectives query.order_by
                        query.aggregates query.qualified_column query.join_inner
@@ -2899,6 +2910,93 @@ def gen_derived_pushdown(seed)
   out.join("\n") + "\n"
 end
 
+# A view reference against its inlined derived-table spelling (spec/design/views.md §4). Every view
+# body is written once and reused verbatim as the derived-table body, so the pair differs only in
+# how the relation is named; the rows must match the by-construction result.
+def gen_view(seed)
+  rng = Random.new(seed)
+  val = -> { rng.rand < 0.2 ? nil : rng.rand(0..10) }
+  t = (1..30).to_a.sample(10, random: rng).sort.map { |id| [id, rng.rand(1..5), val.call] }
+  u = (1..6).to_a.sample(4, random: rng).sort.map { |id| [id, val.call] }
+  lit = ->(x) { x.nil? ? "NULL" : x.to_s }
+  nkey = ->(x) { x.nil? ? [1, 0] : [0, x] }
+  flat = lambda do |rows|
+    rows.sort_by { |r| r.flat_map { |x| nkey.call(x) } }.flat_map { |r| r.map { |x| lit.call(x) } }
+  end
+  pick = ->(col) { WHERE_PUSHDOWN_TEMPLATES.sample(random: rng).call(col, rng) }
+  cut = rng.rand(0..12)
+  bodies = {
+    "v1" => ["(id, k, v)", "SELECT * FROM t WHERE v IS NOT NULL"],
+    "v2" => ["(a, b)", "SELECT t.id, u.w FROM t JOIN u ON t.k = u.id"],
+    "v3" => ["(k, n, s)", "SELECT k, count(*) AS n, sum(v) AS s FROM t GROUP BY k"],
+    "v4" => ["(id, v)", "SELECT id, v FROM (SELECT * FROM t WHERE v IS NOT NULL) AS v1 (id, k, v) WHERE id > #{cut}"]
+  }
+  # A FROM item over view `name`, optionally aliased with a column alias list: the view reference
+  # itself, or its inlined derived table `(<body>) AS <label> (<columns>)`.
+  as_view = lambda do |name, label = nil, cols = nil|
+    label ? "#{name} AS #{label}#{cols ? " (#{cols})" : ''}" : name
+  end
+  as_derived = ->(name, label = nil, cols = nil) { "(#{bodies[name][1]}) AS #{label || name} #{cols ? "(#{cols})" : bodies[name][0]}" }
+  pair = lambda do |out, cols, sql, exp|
+    out << "# over the view"
+    q(out, cols, sql.call(as_view), flat.call(exp))
+    out << "# over the inlined derived table — MUST match"
+    q(out, cols, sql.call(as_derived), flat.call(exp))
+  end
+
+  out = header(seed, VIEW_REQ, "view reference vs its inlined derived table")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, k i32, v i32)")
+  stmt(out, "CREATE TABLE u (id i32 PRIMARY KEY, w i32)")
+  stmt(out, "INSERT INTO t VALUES #{t.map { |id, k, v| "(#{id}, #{k}, #{lit.call(v)})" }.join(', ')}")
+  stmt(out, "INSERT INTO u VALUES #{u.map { |id, w| "(#{id}, #{lit.call(w)})" }.join(', ')}")
+  stmt(out, "CREATE VIEW v1 AS #{bodies['v1'][1]}")
+  stmt(out, "CREATE VIEW v2 (a, b) AS #{bodies['v2'][1]}")
+  stmt(out, "CREATE VIEW v3 AS #{bodies['v3'][1]}")
+  stmt(out, "CREATE VIEW v4 AS SELECT id, v FROM v1 WHERE id > #{cut}")
+
+  v1 = t.reject { |_, _, v| v.nil? }
+  # A predicate on each view column is pushed into the body (planner.md §3.2).
+  pi_sql, pi = pick.call("v1.id")
+  pv_sql, pv = pick.call("v1.v")
+  exp = v1.select { |id, _, v| pi.call(id) == true && pv.call(v) == true }.map { |id, k, _| [id, k] }
+  out << "# predicates over a view's columns"
+  pair.call(out, "II", lambda { |r|
+    "SELECT v1.id, v1.k FROM #{r.call('v1')} WHERE #{pi_sql} AND #{pv_sql} ORDER BY v1.id"
+  }, exp)
+
+  # A join body, joined back to t.
+  pb_sql, pb = pick.call("v2.b")
+  v2 = t.flat_map { |tr| u.select { |ur| ur[0] == tr[1] }.map { |ur| [tr[0], ur[1]] } }
+  exp = v2.select { |_, b| pb.call(b) == true }
+          .flat_map { |a, b| t.select { |tr| tr[0] == a }.map { |tr| [a, b, tr[2]] } }
+  out << "# a join view joined to a table"
+  pair.call(out, "III", lambda { |r|
+    "SELECT v2.a, v2.b, t.v FROM #{r.call('v2')} JOIN t ON t.id = v2.a WHERE #{pb_sql} ORDER BY v2.a, v2.b"
+  }, exp)
+
+  # An aggregate body: a predicate over the grouping column.
+  pk_sql, pk = pick.call("v3.k")
+  groups = t.group_by { |_, k, _| k }.map do |k, rows|
+    vs = rows.map { |r| r[2] }.compact
+    [k, rows.size, vs.empty? ? nil : vs.sum]
+  end
+  exp = groups.select { |k, _, _| pk.call(k) == true }
+  out << "# an aggregate view"
+  pair.call(out, "III", lambda { |r|
+    "SELECT v3.k, v3.n, v3.s FROM #{r.call('v3')} WHERE #{pk_sql} ORDER BY v3.k"
+  }, exp)
+
+  # A view over a view, under a column alias list on the reference.
+  pv_sql, pv = pick.call("x.w")
+  exp = v1.select { |id, _, _| id > cut }.select { |_, _, v| pv.call(v) == true }.map { |id, _, v| [id, v] }
+  out << "# a view over a view, renamed by a column alias list"
+  pair.call(out, "II", lambda { |r|
+    "SELECT x.i, x.w FROM #{r.call('v4', 'x', 'i, w')} WHERE #{pv_sql} ORDER BY x.i"
+  }, exp)
+
+  out.join("\n") + "\n"
+end
+
 # Pushdown into grouped bodies and set-operation arms (planner.md §3.2). A conjunct over a grouping
 # column moves below the grouping; a conjunct over a set operation's output moves into every arm. The
 # `+ 0` spelling never moves. Grouped bodies (with HAVING, and joined to u), a ROLLUP body (never
@@ -3048,6 +3146,7 @@ SCENARIOS = {
   "on_pushdown" => method(:gen_on_pushdown),
   "derived_pushdown" => method(:gen_derived_pushdown),
   "grouped_setop_pushdown" => method(:gen_grouped_setop_pushdown),
+  "view" => method(:gen_view),
 }.freeze
 
 # Run one core's harness once; return {basename => "PASS"/"FAIL"/"SKIP"} and the detail line per

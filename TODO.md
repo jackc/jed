@@ -390,6 +390,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ## Resource admission follow-through
 
+- [ ] **Bound planning work for nested derived tables and views.** Predicate pushdown into a
+  derived body plans that body again, so planning roughly doubles per nesting level, and planning
+  is unmetered. Views make deep nesting a one-line definition each: in the Rust core, 258 chained
+  views with a `WHERE` did not finish planning in 10 minutes. This is a CLAUDE.md §13 gap for an
+  untrusted session that may create views (and already reachable with nested derived tables):
+  either make re-planning linear (plan a pushed body once, or memoize) or meter planning work
+  against the statement's cost ceiling. _(size: M)_ → [planner.md §3.2](spec/design/planner.md),
+  [views.md](spec/design/views.md)
+
 - [x] **JSON nesting-depth limit.** A fixed `MAX_JSON_DEPTH = 256` bounds every `json`/`jsonb`
   document where it is produced: the text parser and every nesting constructor (builders,
   aggregates, `to_json[b]`/`array_to_json`, `||`, `jsonb_set`/`jsonb_insert`,
