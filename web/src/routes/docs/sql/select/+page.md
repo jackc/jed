@@ -212,6 +212,12 @@ Grouping and aggregation:
 
 <LiveSql {seed} query={grouped} rows={6} />
 
+`AND` and `OR` evaluate their operands **left to right and stop early**: a `FALSE` left operand
+decides `AND` and a `TRUE` one decides `OR`, so the right operand is never evaluated. A guard
+written first therefore protects what follows it — `WHERE qty <> 0 AND total / qty > 5` never
+divides by zero. (A `NULL` left operand decides neither, so the right operand still runs.)
+PostgreSQL leaves this order unspecified; jed guarantees it.
+
 Filtering and ordering — edit the `WHERE` and `ORDER BY` and re-run:
 
 <LiveSql {seed} query={filtered} rows={6} />
