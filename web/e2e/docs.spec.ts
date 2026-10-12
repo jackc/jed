@@ -99,6 +99,17 @@ test('the types page autoruns the interval justify demo', async ({ page }) => {
   await expect(rows).toContainText('29 days 23:00:00');
 });
 
+test('the types page autoruns the bytea position / overlay demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // position = 3, overlay(… PLACING \xaabb FROM 2) = \x01aabb0405, set_byte(…, 0, 255) = \xff0203,
+  // get_bit(\x0102, 9) = 1, btrim(…, \x0001) = \x02.
+  const panel = livePanel(page, 'byteaEditDemo');
+  const rows = panel.getByTestId('result-rows');
+  await expect(rows).toContainText('\\x01aabb0405');
+  await expect(rows).toContainText('\\xff0203');
+  await expect(rows).toContainText('\\x02');
+});
+
 test('the types page autoruns the array cast demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
   // The array cast demo: array→text ({1,2,3}), text→i32[], i32[]→i64[] widening, and

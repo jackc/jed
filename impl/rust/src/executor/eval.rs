@@ -2577,9 +2577,14 @@ impl RExpr {
                     }
                     // btrim(text[, chars]) → text — trim `chars`-set characters from both ends.
                     ScalarFunc::Btrim => {
+                        // btrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
+                        if let (Value::Bytea(b), Some(Value::Bytea(set))) = (&vals[0], vals.get(1))
+                        {
+                            return Ok(Value::Bytea(trim_bytes(b, set, true, true)));
+                        }
                         let s = match &vals[0] {
                             Value::Text(s) => s,
-                            _ => unreachable!("resolver restricts btrim to text"),
+                            _ => unreachable!("resolver restricts btrim to text/bytea"),
                         };
                         let set = match vals.get(1) {
                             Some(Value::Text(c)) => c.as_str(),
@@ -2590,9 +2595,14 @@ impl RExpr {
                     }
                     // ltrim(text[, chars]) → text — trim `chars`-set characters from the LEFT end.
                     ScalarFunc::Ltrim => {
+                        // ltrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
+                        if let (Value::Bytea(b), Some(Value::Bytea(set))) = (&vals[0], vals.get(1))
+                        {
+                            return Ok(Value::Bytea(trim_bytes(b, set, true, false)));
+                        }
                         let s = match &vals[0] {
                             Value::Text(s) => s,
-                            _ => unreachable!("resolver restricts ltrim to text"),
+                            _ => unreachable!("resolver restricts ltrim to text/bytea"),
                         };
                         let set = match vals.get(1) {
                             Some(Value::Text(c)) => c.as_str(),
@@ -2603,9 +2613,14 @@ impl RExpr {
                     }
                     // rtrim(text[, chars]) → text — trim `chars`-set characters from the RIGHT end.
                     ScalarFunc::Rtrim => {
+                        // rtrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
+                        if let (Value::Bytea(b), Some(Value::Bytea(set))) = (&vals[0], vals.get(1))
+                        {
+                            return Ok(Value::Bytea(trim_bytes(b, set, false, true)));
+                        }
                         let s = match &vals[0] {
                             Value::Text(s) => s,
-                            _ => unreachable!("resolver restricts rtrim to text"),
+                            _ => unreachable!("resolver restricts rtrim to text/bytea"),
                         };
                         let set = match vals.get(1) {
                             Some(Value::Text(c)) => c.as_str(),
@@ -2644,10 +2659,15 @@ impl RExpr {
                         _ => unreachable!("resolver restricts reverse to text"),
                     },
                     // strpos(text, substring) → i32 — 1-based code-point position, else 0.
+                    // position(string, substring) shares this kernel; over bytea it is the 1-based
+                    // byte position (§4).
                     ScalarFunc::Strpos => {
                         let (s, sub) = match (&vals[0], &vals[1]) {
                             (Value::Text(s), Value::Text(sub)) => (s, sub),
-                            _ => unreachable!("resolver restricts strpos to text"),
+                            (Value::Bytea(b), Value::Bytea(sub)) => {
+                                return Ok(Value::Int(position_bytes(b, sub)));
+                            }
+                            _ => unreachable!("resolver restricts strpos/position to text/bytea"),
                         };
                         // find returns a BYTE offset; convert to a 1-based CODE-POINT position by
                         // counting the code points in the prefix (empty substring → byte 0 → 1).
@@ -2713,6 +2733,56 @@ impl RExpr {
                         Value::Bytea(b) => Ok(Value::Int(get_byte(b, int_value(&vals[1]))?)),
                         _ => unreachable!("resolver restricts get_byte to (bytea, int)"),
                     },
+                    // set_byte(bytea, n, v) → bytea — the n-th byte replaced by v's low 8 bits.
+                    ScalarFunc::SetByte => match &vals[0] {
+                        Value::Bytea(b) => Ok(Value::Bytea(set_byte(
+                            b,
+                            int_value(&vals[1]),
+                            int_value(&vals[2]),
+                        )?)),
+                        _ => unreachable!("resolver restricts set_byte to (bytea, int, int)"),
+                    },
+                    // get_bit(bytea, n) → i32 — the n-th bit (0-based), 0 or 1.
+                    ScalarFunc::GetBit => match &vals[0] {
+                        Value::Bytea(b) => Ok(Value::Int(get_bit(b, int_value(&vals[1]))?)),
+                        _ => unreachable!("resolver restricts get_bit to (bytea, int)"),
+                    },
+                    // set_bit(bytea, n, v) → bytea — the n-th bit set to v (0 or 1).
+                    ScalarFunc::SetBit => match &vals[0] {
+                        Value::Bytea(b) => Ok(Value::Bytea(set_bit(
+                            b,
+                            int_value(&vals[1]),
+                            int_value(&vals[2]),
+                        )?)),
+                        _ => unreachable!("resolver restricts set_bit to (bytea, int, int)"),
+                    },
+                    // overlay(string, new, start[, count]) → text / bytea — the SQL OVERLAY splice;
+                    // count defaults to length(new) (characters for text, bytes for bytea). A growth
+                    // kernel (cost.md §8.1), free over constant operands.
+                    ScalarFunc::Overlay => {
+                        let start = int_value(&vals[2]);
+                        let out = match (&vals[0], &vals[1]) {
+                            (Value::Text(s), Value::Text(r)) => {
+                                let count = match vals.get(3) {
+                                    Some(c) => int_value(c),
+                                    None => r.chars().count() as i64,
+                                };
+                                Value::Text(overlay_chars(s, r, start, count)?)
+                            }
+                            (Value::Bytea(b), Value::Bytea(r)) => {
+                                let count = match vals.get(3) {
+                                    Some(c) => int_value(c),
+                                    None => r.len() as i64,
+                                };
+                                Value::Bytea(overlay_bytes(b, r, start, count)?)
+                            }
+                            _ => unreachable!("resolver restricts overlay to text/bytea"),
+                        };
+                        if !args.iter().all(rexpr_is_constant) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
+                    }
                     // bytea || bytea → bytea. A growth kernel (cost.md §8.1), free over constant
                     // operands.
                     ScalarFunc::ByteaConcat => {

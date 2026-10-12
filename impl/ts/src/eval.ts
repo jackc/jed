@@ -103,6 +103,13 @@ import {
   substrBytes,
   substrChars,
   getByte,
+  setByte,
+  getBit,
+  setBit,
+  overlayChars,
+  overlayBytes,
+  trimBytes,
+  positionBytes,
   translateChars,
   trimChars,
   truncateToChars,
@@ -1562,18 +1569,33 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
       if (e.func === "btrim") {
         // btrim(text[, chars]) → text — trim `chars`-set characters from both ends.
+        if (vals[0]!.kind === "bytea") {
+          // btrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
+          const set = (vals[1] as { bytes: Uint8Array }).bytes;
+          return byteaValue(trimBytes(vals[0]!.bytes, set, true, true));
+        }
         const s = (vals[0] as { text: string }).text;
         const set = vals.length > 1 ? (vals[1] as { text: string }).text : " ";
         return textValue(trimChars(s, set, true, true));
       }
       if (e.func === "ltrim") {
         // ltrim(text[, chars]) → text — trim `chars`-set characters from the LEFT end.
+        if (vals[0]!.kind === "bytea") {
+          // ltrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
+          const set = (vals[1] as { bytes: Uint8Array }).bytes;
+          return byteaValue(trimBytes(vals[0]!.bytes, set, true, false));
+        }
         const s = (vals[0] as { text: string }).text;
         const set = vals.length > 1 ? (vals[1] as { text: string }).text : " ";
         return textValue(trimChars(s, set, true, false));
       }
       if (e.func === "rtrim") {
         // rtrim(text[, chars]) → text — trim `chars`-set characters from the RIGHT end.
+        if (vals[0]!.kind === "bytea") {
+          // rtrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
+          const set = (vals[1] as { bytes: Uint8Array }).bytes;
+          return byteaValue(trimBytes(vals[0]!.bytes, set, false, true));
+        }
         const s = (vals[0] as { text: string }).text;
         const set = vals.length > 1 ? (vals[1] as { text: string }).text : " ";
         return textValue(trimChars(s, set, false, true));
@@ -1607,6 +1629,10 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // strpos(text, substring) → i32 — 1-based code-point position, else 0. indexOf gives a
         // UTF-16-unit offset; the match begins at a code-point boundary, so the code-point
         // position is the code-point count of the prefix + 1 (empty sub → 1, string-functions.md §3).
+        if (vals[0]!.kind === "bytea") {
+          // position(bytea, sub) → i32 — the 1-based byte position (§4).
+          return intValue(positionBytes(vals[0]!.bytes, (vals[1] as { bytes: Uint8Array }).bytes));
+        }
         const s = (vals[0] as { text: string }).text;
         const sub = (vals[1] as { text: string }).text;
         const idx = s.indexOf(sub);
@@ -1661,6 +1687,44 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // get_byte(bytea, n) → i32 — the n-th byte (0-based), unsigned.
         const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
         return intValue(getByte(bytes, (vals[1] as { int: bigint }).int));
+      }
+      if (e.func === "set_byte") {
+        // set_byte(bytea, n, v) → bytea — the n-th byte replaced by v's low 8 bits.
+        const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
+        const n = (vals[1] as { int: bigint }).int;
+        return byteaValue(setByte(bytes, n, (vals[2] as { int: bigint }).int));
+      }
+      if (e.func === "get_bit") {
+        // get_bit(bytea, n) → i32 — the n-th bit (0-based), 0 or 1.
+        const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
+        return intValue(getBit(bytes, (vals[1] as { int: bigint }).int));
+      }
+      if (e.func === "set_bit") {
+        // set_bit(bytea, n, v) → bytea — the n-th bit set to v (0 or 1).
+        const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
+        const n = (vals[1] as { int: bigint }).int;
+        return byteaValue(setBit(bytes, n, (vals[2] as { int: bigint }).int));
+      }
+      if (e.func === "overlay") {
+        // overlay(string, new, start[, count]) → text / bytea — the SQL OVERLAY splice; count
+        // defaults to length(new) (characters for text, bytes for bytea). A growth kernel (cost.md
+        // §8.1), free over constant operands.
+        const start = (vals[2] as { int: bigint }).int;
+        const v0 = vals[0]!;
+        const v1 = vals[1]!;
+        if (v0.kind === "bytea" && v1.kind === "bytea") {
+          const count =
+            vals.length > 3 ? (vals[3] as { int: bigint }).int : BigInt(v1.bytes.length);
+          return growthResult(
+            m,
+            e.args,
+            byteaValue(overlayBytes(v0.bytes, v1.bytes, start, count)),
+          );
+        }
+        const s = (v0 as { text: string }).text;
+        const r = (v1 as { text: string }).text;
+        const count = vals.length > 3 ? (vals[3] as { int: bigint }).int : BigInt([...r].length);
+        return growthResult(m, e.args, textValue(overlayChars(s, r, start, count)));
       }
       if (e.func === "bytea_concat") {
         // bytea || bytea → bytea. A growth kernel (cost.md §8.1), free over constant operands.

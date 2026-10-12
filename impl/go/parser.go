@@ -5953,8 +5953,14 @@ func (p *parser) parsePrimary() (exprNode, error) {
 // one (42601). ArgNames stays nil when every argument is positional. DISTINCT inside the parens is
 // deferred (rejected 42601). Resolution checks per-function arity and fills defaults.
 func (p *parser) parseFunctionCall() (exprNode, error) {
-	// An UNQUOTED `substring` admits the SQL special form after its first argument (below).
+	// An UNQUOTED `position` is only the SQL special form `POSITION(sub IN s)`.
+	if p.peekKeyword() == "position" {
+		return p.parsePositionForm()
+	}
+	// An UNQUOTED `substring` / `overlay` admits its SQL special form after the first argument
+	// (below).
 	substringForm := p.peekKeyword() == "substring"
+	overlayForm := p.peekKeyword() == "overlay"
 	name, err := p.expectIdentifier()
 	if err != nil {
 		return exprNode{}, err
@@ -6036,6 +6042,12 @@ func (p *parser) parseFunctionCall() (exprNode, error) {
 				if kw := p.peekKeyword(); kw == "from" || kw == "for" {
 					return p.parseSubstringTail(name, arg)
 				}
+			}
+			// `OVERLAY(s PLACING r FROM start [FOR count])` (grammar.ebnf `overlay_expr`,
+			// string-functions.md §3): a PLACING keyword after the first positional argument
+			// selects the special form.
+			if overlayForm && argName == nil && !fc.Distinct && len(fc.Args) == 1 && p.peekKeyword() == "placing" {
+				return p.parseOverlayTail(name, arg)
 			}
 			if p.peek().Kind != tokComma {
 				break
@@ -6396,6 +6408,74 @@ func (p *parser) parseSubstringTail(name string, source exprNode) (exprNode, err
 	args := []*exprNode{&source, start}
 	if count != nil {
 		args = append(args, count)
+	}
+	return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: name, Args: args}}, nil
+}
+
+// parsePositionForm parses the SQL special form `POSITION(substring IN string)` (grammar.ebnf
+// `position_expr`, string-functions.md §3), the cursor on the unquoted `position`. It desugars to the
+// ordinary call `position(string, substring)` — PostgreSQL's rewrite, arguments swapped. Each operand
+// is an "any other operator" (parseConcat) expression, so the operand's own IN is never taken as an
+// IN predicate; anything else after the first operand (a comma) is 42601, as in PostgreSQL.
+func (p *parser) parsePositionForm() (exprNode, error) {
+	name, err := p.expectIdentifier()
+	if err != nil {
+		return exprNode{}, err
+	}
+	if err := p.expect(tokLParen); err != nil {
+		return exprNode{}, err
+	}
+	if err := p.deepen(); err != nil {
+		return exprNode{}, err
+	}
+	sub, err := p.parseConcat()
+	if err != nil {
+		return exprNode{}, err
+	}
+	if err := p.expectKeyword("in"); err != nil {
+		return exprNode{}, err
+	}
+	str, err := p.parseConcat()
+	if err != nil {
+		return exprNode{}, err
+	}
+	p.undeepen()
+	if err := p.expect(tokRParen); err != nil {
+		return exprNode{}, err
+	}
+	return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: name, Args: []*exprNode{&str, &sub}}}, nil
+}
+
+// parseOverlayTail parses the tail of the SQL special form `OVERLAY(s PLACING r FROM start [FOR
+// count])` (grammar.ebnf `overlay_expr`), the cursor on PLACING. It desugars to the ordinary call
+// `overlay(s, r, start[, count])` — PostgreSQL's rewrite. FROM is required. No FILTER / OVER may
+// follow (the form is not a function application).
+func (p *parser) parseOverlayTail(name string, source exprNode) (exprNode, error) {
+	if err := p.expectKeyword("placing"); err != nil {
+		return exprNode{}, err
+	}
+	replacement, err := p.parseExpr()
+	if err != nil {
+		return exprNode{}, err
+	}
+	if err := p.expectKeyword("from"); err != nil {
+		return exprNode{}, err
+	}
+	start, err := p.parseExpr()
+	if err != nil {
+		return exprNode{}, err
+	}
+	args := []*exprNode{&source, &replacement, &start}
+	if p.peekKeyword() == "for" {
+		p.advance()
+		count, err := p.parseExpr()
+		if err != nil {
+			return exprNode{}, err
+		}
+		args = append(args, &count)
+	}
+	if err := p.expect(tokRParen); err != nil {
+		return exprNode{}, err
 	}
 	return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: name, Args: args}}, nil
 }

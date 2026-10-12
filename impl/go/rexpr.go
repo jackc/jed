@@ -863,6 +863,8 @@ const (
 	// reverse(text) → text — the code points in reverse order (§3).
 	sfReverse
 	// strpos(text, substring) → i32 — 1-based code-point position of the first match, else 0 (§3).
+	// position(string, substring) (the POSITION(sub IN s) special form's call) shares it, over text
+	// and bytea (byte position, §4).
 	sfStrpos
 	// split_part(text, delimiter, n) → text — the n-th field of the split; n=0 traps 22023 (§3).
 	sfSplitPart
@@ -882,6 +884,16 @@ const (
 	sfDecode
 	// get_byte(bytea, n) → i32 — the n-th byte (0-based); out of range traps 2202E (§4).
 	sfGetByte
+	// set_byte(bytea, n, v) → bytea — a copy with the n-th byte set to v's low 8 bits; 2202E (§4).
+	sfSetByte
+	// get_bit(bytea, n) → i32 — the n-th bit (0-based, LSB first in each byte); 2202E (§4).
+	sfGetBit
+	// set_bit(bytea, n, v) → bytea — a copy with the n-th bit set to v (0/1, else 22023); 2202E (§4).
+	sfSetBit
+	// overlay(string, new, start[, count]) → text / bytea — the SQL OVERLAY splice: count units from
+	// start replaced by new (count defaults to length(new)); start ≤ 0 is 22011, a start + count past
+	// int4 is 22003. A growth kernel (cost.md §8.1; string-functions.md §3/§4).
+	sfOverlay
 	// bytea || bytea → bytea — the operands' bytes appended (§4). Reached only through the `||`
 	// resolver (it has no function-call name); a growth kernel (cost.md §8.1).
 	sfByteaConcat

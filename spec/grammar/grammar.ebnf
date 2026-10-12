@@ -1126,6 +1126,8 @@ primary        ::= number
                  | "CAST" "(" expr "AS" type_name ")"
                  | extract_expr
                  | substring_expr
+                 | position_expr
+                 | overlay_expr
                  | case_expr
                  | coalesce_expr
                  | greatest_least_expr
@@ -1235,6 +1237,23 @@ extract_expr   ::= "EXTRACT" "(" ( bare_identifier | string ) "FROM" expr ")"
  * reserved. PG's regular-expression forms (substring(text FROM pattern), SIMILAR … ESCAPE) parse as
  * this form and fail resolution (42883). */
 substring_expr ::= "SUBSTRING" "(" expr ( "FROM" expr ( "FOR" expr )? | "FOR" expr ( "FROM" expr )? ) ")"
+
+/* POSITION(substring IN string) (../design/string-functions.md §3/§4, ../design/grammar.md §56) —
+ * the SQL special form, desugared by the parser to the ordinary call position(string, substring)
+ * (arguments swapped — PostgreSQL's rewrite) and labelled `position`. Each operand is a
+ * concat (the "any other operator" level), so it holds no predicate: its own IN is never an IN
+ * list (parenthesize a comparison). An UNQUOTED `position(` is ALWAYS this form, so the comma form
+ * position(a, b) is 42601 as in PostgreSQL; the quoted "position"(string, substring) is an ordinary
+ * function_call. No WITHIN GROUP / FILTER / OVER may follow. */
+position_expr  ::= "POSITION" "(" concat "IN" concat ")"
+
+/* OVERLAY(string PLACING new FROM start [FOR count]) (../design/string-functions.md §3/§4,
+ * ../design/grammar.md §56) — the SQL special form, desugared by the parser to the ordinary call
+ * overlay(string, new, start[, count]) — PostgreSQL's rewrite — and labelled `overlay`. Recognized
+ * only for an UNQUOTED `overlay` call whose FIRST argument (positional, no DISTINCT) is followed by
+ * PLACING; otherwise the call is an ordinary function_call (overlay(s, n, start[, count])). FROM is
+ * required. No WITHIN GROUP / FILTER / OVER may follow. Neither word is reserved. */
+overlay_expr   ::= "OVERLAY" "(" expr "PLACING" expr "FROM" expr ( "FOR" expr )? ")"
 
 /* The shared function-call syntax. A name resolves to an AGGREGATE function
  * (../functions/catalog.toml, kind = "aggregate" — COUNT/SUM/MIN/MAX/AVG) or a SCALAR

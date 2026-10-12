@@ -5270,8 +5270,14 @@ impl Parser {
     /// rejects named notation on a function with no parameter names, and fills defaults. The
     /// function name is resolved (byte-exactly) against the catalog later.
     fn parse_function_call(&mut self) -> Result<Expr> {
-        // An UNQUOTED `substring` admits the SQL special form after its first argument (below).
+        // An UNQUOTED `position` is only the SQL special form `POSITION(sub IN s)`.
+        if matches!(self.peek(), Token::Word(w) if w == "position") {
+            return self.parse_position_form();
+        }
+        // An UNQUOTED `substring` / `overlay` admits its SQL special form after the first argument
+        // (below).
         let substring_form = matches!(self.peek(), Token::Word(w) if w == "substring");
+        let overlay_form = matches!(self.peek(), Token::Word(w) if w == "overlay");
         let name = self.expect_identifier()?;
         self.expect(&Token::LParen)?;
         // A leading DISTINCT (`COUNT(DISTINCT x)`, aggregates.md §5) folds only the distinct
@@ -5347,6 +5353,18 @@ impl Parser {
                 {
                     let source = args.pop().expect("one argument parsed");
                     return self.parse_substring_tail(name, source);
+                }
+                // `OVERLAY(s PLACING r FROM start [FOR count])` (grammar.ebnf `overlay_expr`,
+                // string-functions.md §3): a PLACING keyword after the first positional argument
+                // selects the special form.
+                if overlay_form
+                    && positional
+                    && !distinct
+                    && args.len() == 1
+                    && self.peek_keyword().as_deref() == Some("placing")
+                {
+                    let source = args.pop().expect("one argument parsed");
+                    return self.parse_overlay_tail(name, source);
                 }
                 if matches!(self.peek(), Token::Comma) {
                     self.advance();
@@ -5474,6 +5492,63 @@ impl Parser {
         self.expect(&Token::RParen)?;
         let mut args = vec![source, start.unwrap_or(Expr::Literal(Literal::Int(1)))];
         args.extend(count);
+        Ok(Expr::FuncCall {
+            name,
+            args,
+            arg_names: None,
+            star: false,
+            distinct: false,
+            filter: None,
+            variadic: false,
+            over: None,
+            over_name: None,
+            within_group: None,
+        })
+    }
+
+    /// The SQL special form `POSITION(substring IN string)` (grammar.ebnf `position_expr`,
+    /// string-functions.md §3), the cursor on the unquoted `position`. Desugars to the ordinary call
+    /// `position(string, substring)` — PostgreSQL's rewrite, arguments swapped. Each operand is an
+    /// "any other operator" (`parse_concat`) expression, so the operand's own `IN` is never taken as
+    /// an IN predicate; anything else after the first operand (a comma) is 42601, as in PostgreSQL.
+    fn parse_position_form(&mut self) -> Result<Expr> {
+        let name = self.expect_identifier()?;
+        self.expect(&Token::LParen)?;
+        self.deepen()?;
+        let sub = self.parse_concat()?;
+        self.expect_keyword("in")?;
+        let string = self.parse_concat()?;
+        self.undeepen();
+        self.expect(&Token::RParen)?;
+        Ok(Expr::FuncCall {
+            name,
+            args: vec![string, sub],
+            arg_names: None,
+            star: false,
+            distinct: false,
+            filter: None,
+            variadic: false,
+            over: None,
+            over_name: None,
+            within_group: None,
+        })
+    }
+
+    /// The tail of the SQL special form `OVERLAY(s PLACING r FROM start [FOR count])` (grammar.ebnf
+    /// `overlay_expr`), the cursor on PLACING. Desugars to the ordinary call
+    /// `overlay(s, r, start[, count])` — PostgreSQL's rewrite. FROM is required. No FILTER / OVER may
+    /// follow (the form is not a function application).
+    fn parse_overlay_tail(&mut self, name: String, source: Expr) -> Result<Expr> {
+        self.expect_keyword("placing")?;
+        let replacement = self.parse_expr()?;
+        self.expect_keyword("from")?;
+        let start = self.parse_expr()?;
+        let mut args = vec![source, replacement, start];
+        if self.peek_keyword().as_deref() == Some("for") {
+            self.advance();
+            args.push(self.parse_expr()?);
+        }
+        self.expect(&Token::RParen)?;
         Ok(Expr::FuncCall {
             name,
             args,

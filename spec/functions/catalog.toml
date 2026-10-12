@@ -4082,6 +4082,58 @@ result         = "bytea"
 null           = "propagates"
 errors         = ["22011"]
 
+# overlay(string PLACING new FROM start [FOR count]) — the SQL standard's splice: the string with
+# `count` units starting at the 1-based `start` replaced by `new` (count defaults to length(new)).
+# Equivalent to substring(s, 1, start-1) || new || substring(s, start+count) (PostgreSQL's own
+# definition): text is code-point indexed, bytea byte indexed. start ≤ 0 traps 22011 ("negative
+# substring length not allowed"); start + count outside the int4 range traps 22003; a negative
+# count is NOT an error (the tail then starts before `start`). The parser desugars the special form
+# OVERLAY(s PLACING n FROM st [FOR c]) to these calls (grammar.ebnf `overlay_expr`). A growth kernel
+# (cost.md §8.1). (string-functions.md §3/§4)
+[[operator]]
+volatility     = "immutable"
+name           = "overlay"
+kind           = "function"
+arity          = 3
+arg_families   = ["text", "text", "integer"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["22011", "22003"]
+
+[[operator]]
+volatility     = "immutable"
+name           = "overlay"
+kind           = "function"
+arity          = 4
+arg_families   = ["text", "text", "integer", "integer"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["22011", "22003"]
+
+[[operator]]
+volatility     = "immutable"
+name           = "overlay"
+kind           = "function"
+arity          = 3
+arg_families   = ["bytea", "bytea", "integer"]
+arg_resolution = "none"
+result         = "bytea"
+null           = "propagates"
+errors         = ["22011", "22003"]
+
+[[operator]]
+volatility     = "immutable"
+name           = "overlay"
+kind           = "function"
+arity          = 4
+arg_families   = ["bytea", "bytea", "integer", "integer"]
+arg_resolution = "none"
+result         = "bytea"
+null           = "propagates"
+errors         = ["22011", "22003"]
+
 # left(text, n int) → text — the first n characters (code points); a NEGATIVE n returns all but the
 # last |n| characters. left('abcde', 2) = 'ab', left('abcde', -2) = 'abc'. NULL args propagate.
 [[operator]]
@@ -4185,6 +4237,19 @@ result         = "text"
 null           = "propagates"
 errors         = []
 
+# btrim(bytea, bytes bytea) → bytea — remove from BOTH ends the longest run of bytes that each
+# appear in the `bytes` SET (string-functions.md §4). No 1-arg bytea form (PG has none).
+[[operator]]
+volatility     = "immutable"
+name           = "btrim"
+kind           = "function"
+arity          = 2
+arg_families   = ["bytea", "bytea"]
+arg_resolution = "none"
+result         = "bytea"
+null           = "propagates"
+errors         = []
+
 # ltrim(text[, characters text]) → text — like btrim but trims only the LEADING (left) run. The
 # function form of TRIM(LEADING …). ltrim('xxhixx','x') = 'hixx'. NULL args propagate.
 [[operator]]
@@ -4209,6 +4274,18 @@ result         = "text"
 null           = "propagates"
 errors         = []
 
+# ltrim(bytea, bytes bytea) → bytea — the LEADING run only (PG 14+; string-functions.md §4).
+[[operator]]
+volatility     = "immutable"
+name           = "ltrim"
+kind           = "function"
+arity          = 2
+arg_families   = ["bytea", "bytea"]
+arg_resolution = "none"
+result         = "bytea"
+null           = "propagates"
+errors         = []
+
 # rtrim(text[, characters text]) → text — like btrim but trims only the TRAILING (right) run. The
 # function form of TRIM(TRAILING …). rtrim('xxhixx','x') = 'xxhi'. NULL args propagate.
 [[operator]]
@@ -4230,6 +4307,18 @@ arity          = 2
 arg_families   = ["text", "text"]
 arg_resolution = "none"
 result         = "text"
+null           = "propagates"
+errors         = []
+
+# rtrim(bytea, bytes bytea) → bytea — the TRAILING run only (PG 14+; string-functions.md §4).
+[[operator]]
+volatility     = "immutable"
+name           = "rtrim"
+kind           = "function"
+arity          = 2
+arg_families   = ["bytea", "bytea"]
+arg_resolution = "none"
+result         = "bytea"
 null           = "propagates"
 errors         = []
 
@@ -4299,6 +4388,34 @@ name           = "strpos"
 kind           = "function"
 arity          = 2
 arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = []
+
+# position(string, substring) → int — the 1-based position of the first occurrence of `substring`,
+# else 0; an empty substring is 1 (text: code points, the strpos kernel; bytea: bytes). This is the
+# call the SQL special form POSITION(substring IN string) desugars to — note the swapped argument
+# order (PostgreSQL's rewrite; grammar.ebnf `position_expr`). An unquoted `position(a, b)` is a
+# syntax error as in PostgreSQL; the quoted "position"(string, substring) is an ordinary call.
+# (string-functions.md §3/§4)
+[[operator]]
+volatility     = "immutable"
+name           = "position"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+volatility     = "immutable"
+name           = "position"
+kind           = "function"
+arity          = 2
+arg_families   = ["bytea", "bytea"]
 arg_resolution = "none"
 result         = "i32"
 null           = "propagates"
@@ -4433,6 +4550,48 @@ arg_resolution = "none"
 result         = "i32"
 null           = "propagates"
 errors         = ["2202E"]
+
+# set_byte(bytea, n int, newbyte int) → bytea — a copy with the n-th byte (0-based) replaced by the
+# low 8 bits of `newbyte` (PG stores the int as an unsigned char: 256 → 0, -1 → 255). An index
+# outside [0, length-1] traps 2202E with get_byte's message. (string-functions.md §4)
+[[operator]]
+volatility     = "immutable"
+name           = "set_byte"
+kind           = "function"
+arity          = 3
+arg_families   = ["bytea", "integer", "integer"]
+arg_resolution = "none"
+result         = "bytea"
+null           = "propagates"
+errors         = ["2202E"]
+
+# get_bit(bytea, n bigint) → int — the n-th bit (0-based; bit n%8 of byte n/8, least-significant bit
+# first) as 0 or 1. An index outside [0, length*8-1] traps 2202E "index n out of valid range,
+# 0..length*8-1". (string-functions.md §4)
+[[operator]]
+volatility     = "immutable"
+name           = "get_bit"
+kind           = "function"
+arity          = 2
+arg_families   = ["bytea", "integer"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = ["2202E"]
+
+# set_bit(bytea, n bigint, newbit int) → bytea — a copy with the n-th bit set to `newbit`. The index
+# is checked first (2202E, get_bit's message), then `newbit` must be 0 or 1 (22023 "new bit must be
+# 0 or 1"). (string-functions.md §4)
+[[operator]]
+volatility     = "immutable"
+name           = "set_bit"
+kind           = "function"
+arity          = 3
+arg_families   = ["bytea", "integer", "integer"]
+arg_resolution = "none"
+result         = "bytea"
+null           = "propagates"
+errors         = ["2202E", "22023"]
 
 # quote_literal(text) → text — the string wrapped as a SQL string literal: surrounded by single
 # quotes with each internal quote doubled, and (if it contains a backslash) doubled backslashes plus

@@ -162,6 +162,43 @@ SELECT id || s FROM t
 statement error 54P01
 WITH RECURSIVE r(n, v) AS (SELECT 1, s FROM t UNION ALL SELECT n + 1, v || v FROM r WHERE n < 30) SELECT max(length(v)) FROM r
 
+# === overlay ===
+
+# OVERLAY splices new bytes into its operand, so it is a growth kernel too: payload(\x61ffff62) = 4
+# bytes over the bytea baseline's 3, plus the evaluation.
+# cost: 8
+query T nosort
+SELECT overlay(b PLACING bytea '\xffff' FROM 2 FOR 0) FROM tb
+----
+\x61ffff62
+
+# Over text it charges the UTF-8 bytes of the result: payload(bXYana) = 6.
+# cost: 10
+query T nosort
+SELECT overlay(s PLACING 'XY' FROM 2) FROM t
+----
+bXYana
+
+# Constant operands are free.
+# cost: 2
+query T nosort
+SELECT overlay('banana' PLACING 'XY' FROM 2)
+----
+bXYana
+
+# A ceiling stops thirty self-overlays (each doubles the value) long before they build gigabytes.
+# max_cost: 100000
+statement error 54P01
+WITH RECURSIVE r(n, v) AS (SELECT 1, b FROM tb UNION ALL SELECT n + 1, overlay(v PLACING v FROM 1 FOR 0) FROM r WHERE n < 30) SELECT max(length(v)) FROM r
+
+# set_byte / set_bit return a copy the size of their operand, so they charge no output bytes.
+# cost: 5
+query TT nosort
+SELECT set_byte(b, 0, 0), set_bit(b, 0, 0) FROM tb
+----
+\x0062
+\x6062
+
 # === replace ===
 
 # Charged even over constants: input 6 + output 12 bytes.

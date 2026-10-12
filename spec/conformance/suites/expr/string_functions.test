@@ -175,6 +175,63 @@ NULL
 NULL
 NULL
 
+# === OVERLAY(string PLACING new FROM start [FOR count]) → text: splice ==================
+
+# FOR defaults to the length of the new string
+query TTT nosort
+SELECT overlay('abcdef' PLACING 'XY' FROM 2), overlay('abcdef' PLACING 'XY' FROM 2 FOR 3), overlay('abcdef' PLACING '' FROM 2 FOR 3)
+----
+aXYdef
+aXYef
+aef
+
+# code-point indexed: é and 😀 are one character each
+query TT nosort
+SELECT overlay('héllo' PLACING 'E' FROM 2 FOR 1), overlay('a😀b' PLACING 'xyz' FROM 2 FOR 1)
+----
+hEllo
+axyzb
+
+# a start past the end appends; FOR 0 inserts; a negative FOR re-includes the head in the tail
+query TTT nosort
+SELECT overlay('abc' PLACING 'X' FROM 9), overlay('abc' PLACING 'X' FROM 1 FOR 0), overlay('abc' PLACING 'X' FROM 2 FOR -5)
+----
+abcX
+Xabc
+aXabc
+
+# the ordinary four- and three-argument calls
+query TT nosort
+SELECT overlay('abc', 'X', 2, 1), overlay('abc', 'XY', 2)
+----
+aXc
+aXY
+
+query TTT nosort
+SELECT overlay(NULL PLACING 'X' FROM 1), overlay('abc' PLACING 'X' FROM NULL), overlay('abc' PLACING 'X' FROM 1 FOR NULL)
+----
+NULL
+NULL
+NULL
+
+# a start ≤ 0 is a negative substring length
+statement error 22011
+SELECT overlay('abc' PLACING 'X' FROM 0)
+
+statement error 22011
+SELECT overlay('abc' PLACING 'X' FROM -1 FOR 2)
+
+# start + count past the int4 range
+statement error 22003
+SELECT overlay('abc' PLACING 'X' FROM 2147483647 FOR 1)
+
+# FROM is required in the special form
+statement error 42601
+SELECT overlay('abc' PLACING 'X')
+
+statement error 42601
+SELECT overlay('abc' PLACING 'X' FOR 1)
+
 # === left(text, n) → text: the first n characters (negative drops from the right) =====
 
 query T
@@ -520,6 +577,48 @@ SELECT strpos(NULL::text, 'a'), strpos('abc', NULL::text)
 ----
 NULL
 NULL
+
+# === POSITION(substring IN string) → int: the SQL special form of strpos ================
+
+# the special form desugars to position(string, substring) — the strpos kernel
+query IIII nosort
+SELECT position('ig' IN 'high'), position('llo' IN 'héllo'), position('x' IN 'abc'), position('' IN 'abc')
+----
+2
+3
+0
+1
+
+# an astral character is one code point
+query I nosort
+SELECT position('b' IN 'a😀b')
+----
+3
+
+# each operand is an expression without a predicate: || binds inside it
+query I nosort
+SELECT position('c' || 'd' IN 'ab' || 'cd')
+----
+3
+
+query II nosort
+SELECT position(NULL IN 'abc'), position('a' IN NULL)
+----
+NULL
+NULL
+
+# the quoted name is an ordinary call, (string, substring) order
+query I nosort
+SELECT "position"('high', 'ig')
+----
+2
+
+# the unquoted name is only the special form: the comma form is a syntax error
+statement error 42601
+SELECT position('high', 'ig')
+
+statement error 42883
+SELECT position(1 IN 2)
 
 # === split_part(text, delimiter, n) → text: the n-th field ============================
 

@@ -61,6 +61,15 @@ EXPLAIN (VERBOSE, COSTS FALSE) SELECT 'a' || 'b', 'a' || 1
 Result
 output=[('a' || 'b'), ('a' || cast(1 as text))]
 
+# The POSITION and OVERLAY special forms print as their desugared calls; position shares strpos's
+# kernel name.
+query ITT nosort
+EXPLAIN (VERBOSE, COSTS FALSE) SELECT position(bytea '\x02' IN bytea '\x0102'), overlay('abc' PLACING 'X' FROM 2), set_bit(bytea '\x01', 0, 0)
+----
+0
+Result
+output=[strpos('\\x0102', '\\x02'), overlay('abc', 'X', 2), set_bit('\\x01', 0, 0)]
+
 statement error 42601
 EXPLAIN (COSTS, COSTS FALSE) SELECT 1
 

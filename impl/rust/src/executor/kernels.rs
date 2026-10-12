@@ -655,6 +655,129 @@ pub(crate) fn get_byte(b: &[u8], n: i64) -> Result<i64> {
     }
 }
 
+/// The 2202E index error the bytea byte/bit accessors share: PostgreSQL's exact message,
+/// `index n out of valid range, 0..max` (`0..-1` for an empty value).
+fn bytea_index_error(n: i64, max: i64) -> EngineError {
+    EngineError::new(
+        SqlState::ArraySubscriptError,
+        format!("index {n} out of valid range, 0..{max}"),
+    )
+}
+
+/// `set_byte(b, n, v)` (string-functions.md §4): a copy of `b` with the 0-based `n`-th byte set to
+/// the low 8 bits of `v` (PostgreSQL stores the int as an unsigned char: 256 → 0, -1 → 255). An
+/// index outside `[0, len-1]` is get_byte's 2202E.
+pub(crate) fn set_byte(b: &[u8], n: i64, v: i64) -> Result<Vec<u8>> {
+    let i = match usize::try_from(n) {
+        Ok(i) if i < b.len() => i,
+        _ => return Err(bytea_index_error(n, b.len() as i64 - 1)),
+    };
+    let mut out = b.to_vec();
+    out[i] = v as u8;
+    Ok(out)
+}
+
+/// The `(byte, bit)` address of bit `n` of a bytea of `len` bytes for get_bit / set_bit
+/// (string-functions.md §4): bit `n % 8` (least-significant first) of byte `n / 8`. An index outside
+/// `[0, len*8-1]` is 2202E with PostgreSQL's message.
+fn bit_address(len: usize, n: i64) -> Result<(usize, u32)> {
+    let bits = len as i64 * 8;
+    if n < 0 || n >= bits {
+        return Err(bytea_index_error(n, bits - 1));
+    }
+    Ok(((n / 8) as usize, (n % 8) as u32))
+}
+
+/// `get_bit(b, n)` (string-functions.md §4): the 0-based `n`-th bit as 0 or 1.
+pub(crate) fn get_bit(b: &[u8], n: i64) -> Result<i64> {
+    let (byte, bit) = bit_address(b.len(), n)?;
+    Ok(i64::from((b[byte] >> bit) & 1))
+}
+
+/// `set_bit(b, n, v)` (string-functions.md §4): a copy of `b` with the `n`-th bit set to `v`. The
+/// index is checked first (2202E), then `v` must be 0 or 1 (22023), PostgreSQL's order.
+pub(crate) fn set_bit(b: &[u8], n: i64, v: i64) -> Result<Vec<u8>> {
+    let (byte, bit) = bit_address(b.len(), n)?;
+    if v != 0 && v != 1 {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            "new bit must be 0 or 1",
+        ));
+    }
+    let mut out = b.to_vec();
+    if v == 0 {
+        out[byte] &= !(1u8 << bit);
+    } else {
+        out[byte] |= 1u8 << bit;
+    }
+    Ok(out)
+}
+
+/// The tail start `start + count` of `overlay(s PLACING r FROM start FOR count)` (string-functions.md
+/// §3/§4), checked as PostgreSQL does: a start ≤ 0 is 22011 ("negative substring length not
+/// allowed", the standard's definition through substring), and a `start + count` outside the int4
+/// range is 22003. The result is `substr(s, 1, start-1) || r || substr(s, start+count)`.
+pub(crate) fn overlay_tail_start(start: i64, count: i64) -> Result<i64> {
+    if start <= 0 {
+        return Err(EngineError::new(
+            SqlState::SubstringError,
+            "negative substring length not allowed",
+        ));
+    }
+    match start.checked_add(count) {
+        Some(t) if ScalarType::Int32.in_range(t) => Ok(t),
+        _ => Err(overflow(ScalarType::Int32)),
+    }
+}
+
+/// `overlay` over CODE POINTS (string-functions.md §3): `s` with `count` characters from the 1-based
+/// `start` replaced by `r` (see [`overlay_tail_start`]).
+pub(crate) fn overlay_chars(s: &str, r: &str, start: i64, count: i64) -> Result<String> {
+    let tail = overlay_tail_start(start, count)?;
+    let mut out = substr_chars(s, 1, Some(start - 1))?;
+    out.push_str(r);
+    out.push_str(&substr_chars(s, tail, None)?);
+    Ok(out)
+}
+
+/// `overlay` over BYTES (string-functions.md §4): [`overlay_chars`]'s splice over a bytea.
+pub(crate) fn overlay_bytes(b: &[u8], r: &[u8], start: i64, count: i64) -> Result<Vec<u8>> {
+    let tail = overlay_tail_start(start, count)?;
+    let mut out = substr_bytes(b, 1, Some(start - 1))?;
+    out.extend_from_slice(r);
+    out.extend_from_slice(&substr_bytes(b, tail, None)?);
+    Ok(out)
+}
+
+/// `btrim`/`ltrim`/`rtrim(bytea, bytes)` (string-functions.md §4): remove from the chosen end(s) the
+/// longest run of bytes each present in the `set` bytes. An empty `set` trims nothing.
+pub(crate) fn trim_bytes(b: &[u8], set: &[u8], do_left: bool, do_right: bool) -> Vec<u8> {
+    let mut start = 0;
+    let mut end = b.len();
+    if do_left {
+        while start < end && set.contains(&b[start]) {
+            start += 1;
+        }
+    }
+    if do_right {
+        while end > start && set.contains(&b[end - 1]) {
+            end -= 1;
+        }
+    }
+    b[start..end].to_vec()
+}
+
+/// `position(bytea, sub)` (string-functions.md §4): the 1-based byte position of the first
+/// occurrence of `sub` in `b`, else 0; an empty `sub` is 1. PostgreSQL's byteapos.
+pub(crate) fn position_bytes(b: &[u8], sub: &[u8]) -> i64 {
+    if sub.is_empty() {
+        return 1;
+    }
+    b.windows(sub.len())
+        .position(|w| w == sub)
+        .map_or(0, |i| i as i64 + 1)
+}
+
 /// `left(s, n)` over CODE POINTS (string-functions.md §3): the first `n` characters; a negative
 /// `n` returns all but the last `|n|`. Matches PostgreSQL's `left`.
 pub(crate) fn left_chars(s: &str, n: i64) -> String {

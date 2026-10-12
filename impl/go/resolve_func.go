@@ -434,7 +434,7 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfRepeat
 	case "reverse":
 		return sfReverse
-	case "strpos":
+	case "strpos", "position":
 		return sfStrpos
 	case "split_part":
 		return sfSplitPart
@@ -454,6 +454,14 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfDecode
 	case "get_byte":
 		return sfGetByte
+	case "set_byte":
+		return sfSetByte
+	case "get_bit":
+		return sfGetBit
+	case "set_bit":
+		return sfSetBit
+	case "overlay":
+		return sfOverlay
 	case "quote_literal":
 		return sfQuoteLiteral
 	case "quote_ident":

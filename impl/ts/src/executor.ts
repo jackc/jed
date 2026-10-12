@@ -1331,6 +1331,100 @@ export function getByte(b: Uint8Array, n: bigint): bigint {
   return BigInt(b[Number(n)]!);
 }
 
+// byteaIndexError is the 2202E index error the bytea byte/bit accessors share: PostgreSQL's exact
+// message, `index n out of valid range, 0..max` (0..-1 for an empty value).
+function byteaIndexError(n: bigint, max: bigint): Error {
+  return engineError("array_subscript_error", `index ${n} out of valid range, 0..${max}`);
+}
+
+// setByte is set_byte(b, n, v) (string-functions.md §4): a copy of b with the 0-based n-th byte set
+// to the low 8 bits of v (PostgreSQL stores the int as an unsigned char: 256 → 0, -1 → 255). An
+// index outside [0, len-1] is get_byte's 2202E.
+export function setByte(b: Uint8Array, n: bigint, v: bigint): Uint8Array {
+  if (n < 0n || n >= BigInt(b.length)) throw byteaIndexError(n, BigInt(b.length) - 1n);
+  const out = b.slice();
+  out[Number(n)] = Number(BigInt.asUintN(8, v));
+  return out;
+}
+
+// bitAddress is the [byte, bit] address of bit n of a bytea of `length` bytes for get_bit / set_bit
+// (string-functions.md §4): bit n % 8 (least-significant first) of byte n / 8. An index outside
+// [0, length*8-1] is 2202E with PostgreSQL's message.
+function bitAddress(length: number, n: bigint): [number, number] {
+  const bits = BigInt(length) * 8n;
+  if (n < 0n || n >= bits) throw byteaIndexError(n, bits - 1n);
+  return [Number(n / 8n), Number(n % 8n)];
+}
+
+// getBit is get_bit(b, n) (string-functions.md §4): the 0-based n-th bit as 0 or 1.
+export function getBit(b: Uint8Array, n: bigint): bigint {
+  const [byteNo, bitNo] = bitAddress(b.length, n);
+  return BigInt((b[byteNo]! >> bitNo) & 1);
+}
+
+// setBit is set_bit(b, n, v) (string-functions.md §4): a copy of b with the n-th bit set to v. The
+// index is checked first (2202E), then v must be 0 or 1 (22023), PostgreSQL's order.
+export function setBit(b: Uint8Array, n: bigint, v: bigint): Uint8Array {
+  const [byteNo, bitNo] = bitAddress(b.length, n);
+  if (v !== 0n && v !== 1n) throw engineError("invalid_parameter_value", "new bit must be 0 or 1");
+  const out = b.slice();
+  out[byteNo] = v === 0n ? out[byteNo]! & ~(1 << bitNo) : out[byteNo]! | (1 << bitNo);
+  return out;
+}
+
+// overlayTailStart is the tail start `start + count` of overlay(s PLACING r FROM start FOR count)
+// (string-functions.md §3/§4), checked as PostgreSQL does: a start ≤ 0 is 22011 ("negative substring
+// length not allowed", the standard's definition through substring), and a start + count outside
+// the int4 range is 22003. The result is substr(s, 1, start-1) || r || substr(s, start+count).
+function overlayTailStart(start: bigint, count: bigint): bigint {
+  if (start <= 0n) throw engineError("substring_error", "negative substring length not allowed");
+  const tail = start + count;
+  if (!inRange("i32", tail)) throw overflow("i32");
+  return tail;
+}
+
+// overlayChars is overlay over CODE POINTS (string-functions.md §3): s with count characters from
+// the 1-based start replaced by r (see overlayTailStart).
+export function overlayChars(s: string, r: string, start: bigint, count: bigint): string {
+  const tail = overlayTailStart(start, count);
+  return substrChars(s, 1n, start - 1n) + r + substrChars(s, tail, null);
+}
+
+// overlayBytes is overlay over BYTES (string-functions.md §4): overlayChars's splice over a bytea.
+export function overlayBytes(b: Uint8Array, r: Uint8Array, start: bigint, count: bigint): Uint8Array {
+  const tail = overlayTailStart(start, count);
+  const head = substrBytes(b, 1n, start - 1n);
+  const rest = substrBytes(b, tail, null);
+  const out = new Uint8Array(head.length + r.length + rest.length);
+  out.set(head, 0);
+  out.set(r, head.length);
+  out.set(rest, head.length + r.length);
+  return out;
+}
+
+// trimBytes is btrim/ltrim/rtrim(bytea, bytes) (string-functions.md §4): remove from the chosen
+// end(s) the longest run of bytes each present in the set bytes. An empty set trims nothing.
+export function trimBytes(b: Uint8Array, set: Uint8Array, doLeft: boolean, doRight: boolean): Uint8Array {
+  let start = 0;
+  let end = b.length;
+  if (doLeft) while (start < end && set.includes(b[start]!)) start++;
+  if (doRight) while (end > start && set.includes(b[end - 1]!)) end--;
+  return b.slice(start, end);
+}
+
+// positionBytes is position(bytea, sub) (string-functions.md §4): the 1-based byte position of the
+// first occurrence of sub in b, else 0; an empty sub is 1. PostgreSQL's byteapos.
+export function positionBytes(b: Uint8Array, sub: Uint8Array): bigint {
+  if (sub.length === 0) return 1n;
+  outer: for (let i = 0; i + sub.length <= b.length; i++) {
+    for (let j = 0; j < sub.length; j++) {
+      if (b[i + j] !== sub[j]) continue outer;
+    }
+    return BigInt(i + 1);
+  }
+  return 0n;
+}
+
 // leftChars is left(s, n) over CODE POINTS (string-functions.md §3): the first n characters; a
 // negative n returns all but the last |n|. Matches PostgreSQL's left.
 export function leftChars(s: string, n: bigint): string {
@@ -27706,6 +27800,16 @@ export type ScalarFuncName =
   | "decode"
   // get_byte(bytea, n) → i32 — the n-th byte (0-based); out of range traps 2202E (§4).
   | "get_byte"
+  // set_byte(bytea, n, v) → bytea — a copy with the n-th byte set to v's low 8 bits; 2202E (§4).
+  | "set_byte"
+  // get_bit(bytea, n) → i32 — the n-th bit (0-based, LSB first in each byte); 2202E (§4).
+  | "get_bit"
+  // set_bit(bytea, n, v) → bytea — a copy with the n-th bit set to v (0/1, else 22023); 2202E (§4).
+  | "set_bit"
+  // overlay(string, new, start[, count]) → text / bytea — the SQL OVERLAY splice: count units from
+  // start replaced by new (count defaults to length(new)); start ≤ 0 is 22011, a start + count past
+  // int4 is 22003. A growth kernel (cost.md §8.1; string-functions.md §3/§4).
+  | "overlay"
   // bytea || bytea → bytea — the operands' bytes appended (§4). Reached only through the `||`
   // resolver (it has no function-call name); a growth kernel (cost.md §8.1).
   | "bytea_concat"
@@ -32839,6 +32943,9 @@ export function resolveScalarFunc(
   if ((func as string) === "ceiling") func = "ceil";
   // `substring` is the SQL name of substr (string-functions.md §4); both share the substr kernel.
   if ((func as string) === "substring") func = "substr";
+  // `position(string, substring)` — the POSITION(sub IN s) special form's call — shares the strpos
+  // kernel, over text and bytea (string-functions.md §3/§4).
+  if ((func as string) === "position") func = "strpos";
   // Every float function computes at the operand's float width (argWidth), so a f32 operand
   // rounds at binary32 even where the catalog's result is f64; abs(float) also keeps that width
   // as its result. Non-float args carry no width. pow is the one (float, float) function — it

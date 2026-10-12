@@ -3113,6 +3113,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return TextValue(r), nil
 		case sfBtrim:
 			// btrim(text[, chars]) → text — trim `chars`-set characters from both ends.
+			if vals[0].Kind == ValBytea {
+				// btrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
+				return ByteaValue(trimBytes([]byte(vals[0].str()), []byte(vals[1].str()), true, true)), nil
+			}
 			set := " "
 			if len(vals) > 1 {
 				set = vals[1].str()
@@ -3120,6 +3124,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return TextValue(trimChars(vals[0].str(), set, true, true)), nil
 		case sfLtrim:
 			// ltrim(text[, chars]) → text — trim `chars`-set characters from the LEFT end.
+			if vals[0].Kind == ValBytea {
+				// ltrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
+				return ByteaValue(trimBytes([]byte(vals[0].str()), []byte(vals[1].str()), true, false)), nil
+			}
 			set := " "
 			if len(vals) > 1 {
 				set = vals[1].str()
@@ -3127,6 +3135,10 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return TextValue(trimChars(vals[0].str(), set, true, false)), nil
 		case sfRtrim:
 			// rtrim(text[, chars]) → text — trim `chars`-set characters from the RIGHT end.
+			if vals[0].Kind == ValBytea {
+				// rtrim(bytea, bytes) → bytea — the same trim over a byte set (§4).
+				return ByteaValue(trimBytes([]byte(vals[0].str()), []byte(vals[1].str()), false, true)), nil
+			}
 			set := " "
 			if len(vals) > 1 {
 				set = vals[1].str()
@@ -3159,6 +3171,11 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		case sfStrpos:
 			// strpos(text, substring) → i32 — 1-based code-point position, else 0. strings.Index
 			// gives a BYTE offset; convert by counting code points in the prefix (empty sub → 1).
+			if vals[0].Kind == ValBytea {
+				// position(bytea, sub) → i32 — the 1-based byte position (§4); empty sub → 1, absent
+				// (Index -1) → 0.
+				return IntValue(int64(strings.Index(vals[0].str(), vals[1].str())) + 1), nil
+			}
 			idx := strings.Index(vals[0].str(), vals[1].str())
 			if idx < 0 {
 				return IntValue(0), nil
@@ -3215,6 +3232,52 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return Value{}, err
 			}
 			return IntValue(r), nil
+		case sfSetByte:
+			// set_byte(bytea, n, v) → bytea — the n-th byte replaced by v's low 8 bits.
+			r, err := setByte([]byte(vals[0].str()), vals[1].Int, vals[2].Int)
+			if err != nil {
+				return Value{}, err
+			}
+			return ByteaValue(r), nil
+		case sfGetBit:
+			// get_bit(bytea, n) → i32 — the n-th bit (0-based), 0 or 1.
+			r, err := getBit([]byte(vals[0].str()), vals[1].Int)
+			if err != nil {
+				return Value{}, err
+			}
+			return IntValue(r), nil
+		case sfSetBit:
+			// set_bit(bytea, n, v) → bytea — the n-th bit set to v (0 or 1).
+			r, err := setBit([]byte(vals[0].str()), vals[1].Int, vals[2].Int)
+			if err != nil {
+				return Value{}, err
+			}
+			return ByteaValue(r), nil
+		case sfOverlay:
+			// overlay(string, new, start[, count]) → text / bytea — the SQL OVERLAY splice; count
+			// defaults to length(new) (characters for text, bytes for bytea). A growth kernel
+			// (cost.md §8.1), free over constant operands.
+			start := vals[2].Int
+			if vals[0].Kind == ValBytea {
+				count := int64(len(vals[1].str()))
+				if len(vals) > 3 {
+					count = vals[3].Int
+				}
+				r, err := overlayBytes([]byte(vals[0].str()), []byte(vals[1].str()), start, count)
+				if err != nil {
+					return Value{}, err
+				}
+				return growthResult(m, e.sargs, ByteaValue(r))
+			}
+			count := int64(utf8.RuneCountInString(vals[1].str()))
+			if len(vals) > 3 {
+				count = vals[3].Int
+			}
+			r, err := overlayChars(vals[0].str(), vals[1].str(), start, count)
+			if err != nil {
+				return Value{}, err
+			}
+			return growthResult(m, e.sargs, TextValue(r))
 		case sfByteaConcat:
 			// bytea || bytea → bytea. A growth kernel (cost.md §8.1), free over constant operands.
 			a, b := vals[0].str(), vals[1].str()

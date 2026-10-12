@@ -3349,3 +3349,33 @@ SELECT substring('hello' FOR 2 FROM 3)               -- ll     (either order)
 - **Not supported.** PostgreSQL also uses this syntax for regular-expression extraction
   (`substring(text FROM pattern)`, `substring(text SIMILAR pattern ESCAPE e)`). jed parses the first
   as this form, where `substring(text, text)` has no overload (`42883`); `SIMILAR` is a syntax error.
+
+## 56. `POSITION` and `OVERLAY` ([string-functions.md §3/§4](string-functions.md))
+
+`POSITION(substring IN string)` and `OVERLAY(string PLACING new FROM start [FOR count])` are the SQL
+special forms of `position` and `overlay`, for `text` and `bytea`.
+
+```sql
+SELECT position('ig' IN 'high')                          -- 2      = position('high', 'ig')
+SELECT position(bytea '\x02' IN bytea '\x010203')        -- 2
+SELECT overlay('abcdef' PLACING 'XY' FROM 2 FOR 3)       -- aXYef  = overlay('abcdef', 'XY', 2, 3)
+SELECT overlay(bytea '\x0102' PLACING bytea '\xff' FROM 2)  -- \x01ff (FOR defaults to length(new))
+```
+
+- **Grammar.** `POSITION "(" concat IN concat ")"` and
+  `OVERLAY "(" expr PLACING expr FROM expr [FOR expr] ")"` ([grammar.ebnf](../grammar/grammar.ebnf)
+  `position_expr`, `overlay_expr`). Neither word is reserved.
+- **`POSITION`.** An unquoted `position(` always starts the special form, as in PostgreSQL, where
+  `POSITION` is a column-name keyword: the comma form `position(a, b)` is `42601`. The quoted name
+  `"position"(string, substring)` is an ordinary call. Each operand is parsed at the "any other
+  operator" level (`||`, `+`, …), one above the predicates, so the operand's own `IN` ends it rather
+  than starting an `IN (…)` list. A predicate operand must be parenthesized; PostgreSQL's `b_expr`
+  also admits a bare comparison there, but no `position` overload takes a `boolean`.
+- **`OVERLAY`.** Like `SUBSTRING` (§55): the parser starts an ordinary `function_call`, and when the
+  callee is an unquoted `overlay` and its first positional argument is followed by `PLACING`, the
+  call switches to the special form. `FROM` is required (`42601` without it). The comma form
+  `overlay(s, new, start[, count])` is an ordinary call, as in PostgreSQL.
+- **Desugaring.** `POSITION(sub IN s)` becomes `position(s, sub)` (arguments swapped) and
+  `OVERLAY(s PLACING n FROM st [FOR c])` becomes `overlay(s, n, st[, c])` — PostgreSQL's own
+  rewrites — so resolution, NULL handling, errors, cost, and the output labels (`position`,
+  `overlay`) are those of the calls. No `WITHIN GROUP`, `FILTER`, or `OVER` may follow.

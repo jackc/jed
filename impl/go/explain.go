@@ -1724,6 +1724,14 @@ func explainScalarFunc(f scalarFunc) string {
 		return "decode"
 	case sfGetByte:
 		return "get_byte"
+	case sfSetByte:
+		return "set_byte"
+	case sfGetBit:
+		return "get_bit"
+	case sfSetBit:
+		return "set_bit"
+	case sfOverlay:
+		return "overlay"
 	case sfQuoteLiteral:
 		return "quote_literal"
 	case sfQuoteIdent:

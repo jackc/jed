@@ -59,6 +59,13 @@
   substring('\\x0102030405'::bytea FROM 2 FOR 3)  AS middle,
   get_byte('\\x0102ff'::bytea, 2)                 AS last_byte;`;
 
+	const byteaEditDemo = `SELECT
+  position('\\x03'::bytea IN '\\x010203'::bytea)                  AS pos,
+  overlay('\\x0102030405'::bytea PLACING '\\xaabb'::bytea FROM 2)  AS spliced,
+  set_byte('\\x010203'::bytea, 0, 255)                           AS patched,
+  get_bit('\\x0102'::bytea, 9)                                    AS bit9,
+  btrim('\\x0001020100'::bytea, '\\x0001'::bytea)                 AS trimmed;`;
+
 	const arrayCastDemo = `SELECT
   (ARRAY[1, 2, 3])::text                     AS array_to_text,
   ('{10,20,30}'::text)::i32[]                AS text_to_array,
@@ -268,6 +275,14 @@ spelled `SUBSTRING(b FROM start FOR count)`; and `get_byte` reads one 0-based by
 0–255, raising `2202E` for an index outside the value:
 
 <LiveSql demo="byteaDemo" query={byteaDemo} rows={1} />
+
+`position(sub IN b)` finds a byte string (1-based, `0` when absent), `overlay(b PLACING new FROM
+start [FOR count])` splices one in, `set_byte` / `set_bit` return a copy with one byte or bit
+changed (bits count from the least-significant bit of each byte, so bit 9 is bit 1 of byte 1), and
+`btrim` / `ltrim` / `rtrim(b, bytes)` strip any of a set of bytes from the ends. `position` and
+`overlay` work the same way on `text`, counting characters:
+
+<LiveSql demo="byteaEditDemo" query={byteaEditDemo} rows={1} />
 
 ## Array casts
 

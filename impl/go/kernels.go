@@ -1,6 +1,7 @@
 package jed
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"math/big"
@@ -751,6 +752,136 @@ func getByte(b []byte, n int64) (int64, error) {
 			fmt.Sprintf("index %d out of valid range, 0..%d", n, int64(len(b))-1))
 	}
 	return int64(b[n]), nil
+}
+
+// byteaIndexError is the 2202E index error the bytea byte/bit accessors share: PostgreSQL's exact
+// message, `index n out of valid range, 0..max` (`0..-1` for an empty value).
+func byteaIndexError(n, max int64) error {
+	return newError(ArraySubscriptError, fmt.Sprintf("index %d out of valid range, 0..%d", n, max))
+}
+
+// setByte is set_byte(b, n, v) (string-functions.md §4): a copy of b with the 0-based n-th byte set
+// to the low 8 bits of v (PostgreSQL stores the int as an unsigned char: 256 → 0, -1 → 255). An
+// index outside [0, len-1] is get_byte's 2202E.
+func setByte(b []byte, n, v int64) ([]byte, error) {
+	if n < 0 || n >= int64(len(b)) {
+		return nil, byteaIndexError(n, int64(len(b))-1)
+	}
+	out := append([]byte(nil), b...)
+	out[n] = byte(v)
+	return out, nil
+}
+
+// bitAddress is the (byte, bit) address of bit n of a bytea of length bytes for get_bit / set_bit
+// (string-functions.md §4): bit n % 8 (least-significant first) of byte n / 8. An index outside
+// [0, length*8-1] is 2202E with PostgreSQL's message.
+func bitAddress(length int, n int64) (int64, uint, error) {
+	bits := int64(length) * 8
+	if n < 0 || n >= bits {
+		return 0, 0, byteaIndexError(n, bits-1)
+	}
+	return n / 8, uint(n % 8), nil
+}
+
+// getBit is get_bit(b, n) (string-functions.md §4): the 0-based n-th bit as 0 or 1.
+func getBit(b []byte, n int64) (int64, error) {
+	byteNo, bitNo, err := bitAddress(len(b), n)
+	if err != nil {
+		return 0, err
+	}
+	return int64((b[byteNo] >> bitNo) & 1), nil
+}
+
+// setBit is set_bit(b, n, v) (string-functions.md §4): a copy of b with the n-th bit set to v. The
+// index is checked first (2202E), then v must be 0 or 1 (22023), PostgreSQL's order.
+func setBit(b []byte, n, v int64) ([]byte, error) {
+	byteNo, bitNo, err := bitAddress(len(b), n)
+	if err != nil {
+		return nil, err
+	}
+	if v != 0 && v != 1 {
+		return nil, newError(InvalidParameterValue, "new bit must be 0 or 1")
+	}
+	out := append([]byte(nil), b...)
+	if v == 0 {
+		out[byteNo] &^= 1 << bitNo
+	} else {
+		out[byteNo] |= 1 << bitNo
+	}
+	return out, nil
+}
+
+// overlayTailStart is the tail start `start + count` of overlay(s PLACING r FROM start FOR count)
+// (string-functions.md §3/§4), checked as PostgreSQL does: a start ≤ 0 is 22011 ("negative substring
+// length not allowed", the standard's definition through substring), and a start + count outside
+// the int4 range is 22003. The result is substr(s, 1, start-1) || r || substr(s, start+count).
+func overlayTailStart(start, count int64) (int64, error) {
+	if start <= 0 {
+		return 0, newError(SubstringError, "negative substring length not allowed")
+	}
+	tail := start + count
+	// Signed overflow wraps to the wrong sign: both operands share a sign the sum lacks.
+	if (start > 0 && count > 0 && tail < 0) || !scalarInt32.InRange(tail) {
+		return 0, overflowErr(scalarInt32)
+	}
+	return tail, nil
+}
+
+// overlayChars is overlay over CODE POINTS (string-functions.md §3): s with count characters from
+// the 1-based start replaced by r (see overlayTailStart).
+func overlayChars(s, r string, start, count int64) (string, error) {
+	tail, err := overlayTailStart(start, count)
+	if err != nil {
+		return "", err
+	}
+	headLen := start - 1
+	head, err := substrChars(s, 1, &headLen)
+	if err != nil {
+		return "", err
+	}
+	rest, err := substrChars(s, tail, nil)
+	if err != nil {
+		return "", err
+	}
+	return head + r + rest, nil
+}
+
+// overlayBytes is overlay over BYTES (string-functions.md §4): overlayChars's splice over a bytea.
+func overlayBytes(b, r []byte, start, count int64) ([]byte, error) {
+	tail, err := overlayTailStart(start, count)
+	if err != nil {
+		return nil, err
+	}
+	headLen := start - 1
+	head, err := substrBytes(b, 1, &headLen)
+	if err != nil {
+		return nil, err
+	}
+	rest, err := substrBytes(b, tail, nil)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, len(head)+len(r)+len(rest))
+	out = append(out, head...)
+	out = append(out, r...)
+	return append(out, rest...), nil
+}
+
+// trimBytes is btrim/ltrim/rtrim(bytea, bytes) (string-functions.md §4): remove from the chosen
+// end(s) the longest run of bytes each present in the set bytes. An empty set trims nothing.
+func trimBytes(b, set []byte, doLeft, doRight bool) []byte {
+	start, end := 0, len(b)
+	if doLeft {
+		for start < end && bytes.IndexByte(set, b[start]) >= 0 {
+			start++
+		}
+	}
+	if doRight {
+		for end > start && bytes.IndexByte(set, b[end-1]) >= 0 {
+			end--
+		}
+	}
+	return b[start:end]
 }
 
 // leftChars is left(s, n) over CODE POINTS (string-functions.md §3): the first n characters; a

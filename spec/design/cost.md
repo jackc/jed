@@ -1992,6 +1992,7 @@ existing members.
 | array `\|\|`, `array_append`, `array_prepend`, `array_cat` | growth | S1 | — | `payload(array)` |
 | bytea `\|\|` | growth | S1 | — | byte length of the result |
 | text `\|\|` | growth | S1 | — | UTF-8 bytes of the result |
+| `overlay` (text, bytea) | growth | S1 | — | UTF-8 bytes (text) or byte length (bytea) of the result |
 | `replace(s, from, to)` | amplifier | S1 | UTF-8 bytes of `s` | UTF-8 bytes of the result |
 | `regexp_replace` | amplifier | S1 | none beyond `regex_step` | UTF-8 bytes of the result |
 | `array_replace(a, old, new)` | amplifier | S1 | `payload(a)` | `payload(result)` |
@@ -2062,7 +2063,8 @@ Rules for both classes:
   nesting limit (§7b) bounds it. Row-value comparisons build transient rows on
   every evaluation, and charging them would tax keyset predicates such as
   `(a, b) > (1, 'x')` for no protection.
-- Results that are an operand or part of one: substrings, trims, `split_part`,
+- Results that are an operand or part of one, or an operand-sized copy:
+  substrings, trims, `split_part`, `set_byte` / `set_bit`,
   subscripts and slices, jsonb extraction (`->`, `->>`, `#>`, `#>>`),
   `jsonb_strip_nulls`, `array_remove`, jsonb `-`, `CASE`, `COALESCE`,
   `GREATEST`/`LEAST`.

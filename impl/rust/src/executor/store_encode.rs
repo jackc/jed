@@ -1861,6 +1861,10 @@ pub(crate) fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) ->
         | ScalarFunc::ToHex
         | ScalarFunc::Encode
         | ScalarFunc::GetByte
+        | ScalarFunc::SetByte
+        | ScalarFunc::GetBit
+        | ScalarFunc::SetBit
+        | ScalarFunc::Overlay
         | ScalarFunc::ByteaConcat
         | ScalarFunc::TextConcat
         | ScalarFunc::Decode

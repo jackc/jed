@@ -32,7 +32,7 @@ matches PG by counting **code points**:
 
 - **Character-counting / character-indexing** functions — `length`, `char_length`,
   `character_length`, `substr`, `left`, `right`, `lpad`, `rpad`, `reverse`, `strpos`,
-  `split_part`, `position` — operate on the code-point sequence.
+  `split_part`, `position`, `overlay` — operate on the code-point sequence.
 - **Byte / bit functions** — `octet_length`, `bit_length` — operate on the **UTF-8 encoded
   bytes** (`bit_length = octet_length × 8`).
 
@@ -97,6 +97,31 @@ NULL argument propagates. The shared per-core kernel works on a code-point vecto
 huge `start + count` cannot overflow (TS bigint is already exact). PostgreSQL's `substr` accepts
 `bigint` positions; jed's `integer` family accepts any width (a bare integer literal is `i64`),
 so `substr('x', 1, 2)` resolves directly without an int4 cast.
+
+### `overlay(text, new, start [, count]) → text`
+
+The SQL standard's splice, normally spelled with its special form `OVERLAY(s PLACING new FROM start
+[FOR count])` ([grammar.md](grammar.md) §56), which the parser rewrites to `overlay(s, new, start[,
+count])`; the comma form is an ordinary call. The `count` characters of `s` starting at the 1-based
+`start` are replaced by `new`, and `count` defaults to `length(new)`. PostgreSQL defines it, and jed
+computes it, as `substr(s, 1, start − 1) || new || substr(s, start + count)`:
+`overlay('abcdef' PLACING 'XY' FROM 2 FOR 3) = 'aXYef'`, `overlay('abcdef' PLACING 'XY' FROM 2) =
+'aXYdef'`, `overlay('héllo' PLACING 'E' FROM 2 FOR 1) = 'hEllo'` (code points). Consequences of
+that definition, all PostgreSQL's:
+
+- A `start` past the end appends (`overlay('abc' PLACING 'X' FROM 9) = 'abcX'`), and `count = 0`
+  inserts.
+- A **negative `count`** is not an error: the tail starts `|count|` characters before `start`, so
+  part of `s` repeats (`overlay('abc' PLACING 'X' FROM 2 FOR -5) = 'aXabc'`).
+- A **`start ≤ 0`** traps **`22011`** (*"negative substring length not allowed"*): the head
+  `substr(s, 1, start − 1)` has a negative length.
+- A **`start + count` outside the `i32` range** traps **`22003`** (PostgreSQL's int4 overflow
+  check). jed's `integer` family also admits `bigint` arguments, which PG's `int4` parameters reject
+  (`42883`); the same rule applies to them — the sum, computed exactly, must lie in the `i32` range.
+
+NULL arguments propagate. A **growth kernel** ([cost.md](cost.md) §8.1): the result can be longer
+than either operand and a recursive CTE can repeat the splice, so a call with any non-constant
+argument charges `scalar_byte` per UTF-8 byte of the result.
 
 ### `left(text, n) → text`
 
@@ -191,7 +216,7 @@ Reverses the **code-point** sequence, not the bytes nor the UTF-16 units — so 
 stays intact (`reverse('a😀b') = 'b😀a'`; a naïve TS `s.split('').reverse()` would break the
 surrogate pair, the §2 trap). NULL args propagate.
 
-### `strpos(text, substring) → int`
+### `strpos(text, substring) → int`, `position(text, substring) → int`
 
 The function spelling of `POSITION(substring IN string)`: the 1-based **character** (code-point)
 position of the first occurrence of `substring`, or `0` if absent; an empty substring is `1`.
@@ -199,6 +224,11 @@ position of the first occurrence of `substring`, or `0` if absent; an empty subs
 the match's **byte** (or UTF-16-unit, in TS) offset with its native search, then converts to a
 code-point position by counting the code points in the prefix — so the result is the same character
 position cross-core regardless of the encoding the search uses. NULL args propagate.
+
+The special form `POSITION(substring IN string)` ([grammar.md](grammar.md) §56) desugars to
+`position(string, substring)` — the operands swap — which shares the `strpos` kernel (so EXPLAIN
+prints it as `strpos`). As in PostgreSQL, the unquoted `position(a, b)` is a syntax error (`42601`);
+`"position"(string, substring)` is the callable spelling.
 
 ### `split_part(text, delimiter, n) → text`
 
@@ -395,12 +425,38 @@ are STRICT and ride the scalar-function mold (§1), except `||`, which has its o
   PostgreSQL's message, `index n out of valid range, 0..length−1` (`0..-1` for an empty value).
   jed's `integer` family also accepts a `bigint` index, which PG's `int4` parameter rejects
   (`42883`); such an index is always out of range.
+- **`set_byte(bytea, n, newbyte)` → bytea** — a copy with the `n`-th byte replaced by the **low 8
+  bits** of `newbyte`: PostgreSQL stores the `int` into an `unsigned char`, so `256` writes `0` and
+  `-1` writes `255`. The index rule and `2202E` message are `get_byte`'s.
+- **`get_bit(bytea, n)` → int** — bit `n` as `0` or `1`, numbered **least-significant bit first**
+  within each byte: bit `n mod 8` of byte `n / 8`, so `get_bit(bytea '\x0102', 9) = 1`. The index is
+  a `bigint` in PostgreSQL too. An index outside `[0, length × 8 − 1]` traps **`2202E`**,
+  `index n out of valid range, 0..length×8−1`.
+- **`set_bit(bytea, n, newbit)` → bytea** — a copy with bit `n` set to `newbit`. The index is
+  checked first (`2202E`, as `get_bit`), then `newbit` must be `0` or `1`, else **`22023`** *new bit
+  must be 0 or 1* — PostgreSQL's order and messages.
+- **`overlay(bytea, new, start [, count])` → bytea** and its special form `OVERLAY(b PLACING new
+  FROM start [FOR count])` — §3's splice over bytes, with `count` defaulting to `length(new)` in
+  bytes: `overlay(bytea '\x0102030405' PLACING bytea '\xaabb' FROM 2 FOR 3) = \x01aabb05`. The same
+  `22011` / `22003` rules apply. A **growth kernel** charging the result's byte length.
+- **`position(bytea, substring)` → int** and its special form `POSITION(substring IN bytea)` — the
+  1-based **byte** position of the first occurrence, `0` if absent, `1` for an empty substring
+  (PostgreSQL's `byteapos`); the bytea branch of the `strpos` kernel (§3).
+- **`btrim(bytea, bytes)`, `ltrim(bytea, bytes)`, `rtrim(bytea, bytes)` → bytea** — remove from
+  both ends / the start / the end the longest run of bytes that each occur in the **set** `bytes`
+  (`btrim(bytea '\x0001020100', bytea '\x0001') = \x02`). An empty set trims nothing. There is no
+  one-argument bytea form (`42883`, as in PostgreSQL). The result is a slice of the operand, so it
+  charges no output bytes.
+
+`set_byte` and `set_bit` return a value exactly the size of their operand, so like the slices they
+are not growth kernels and charge only their `operator_eval` ([cost.md](cost.md) §8.1 *Not
+covered*): applying them again cannot grow a value.
 
 The argument must already be `bytea`: as with `encode`, a bare string literal argument resolves as
-`text`, so `get_byte('\x01', 0)` is `42883` (write `bytea '\x01'` or `'\x01'::bytea`). Only `||`
-adapts a literal, through its operand hint. Not implemented yet: `set_byte`, `get_bit` / `set_bit`,
-`overlay`, `position(bytea IN bytea)`, `btrim(bytea, bytea)`, and the hash functions (`md5`,
-`sha256`, …).
+`text`, so `get_byte('\x01', 0)` is `42883` (write `bytea '\x01'` or `'\x01'::bytea`), and likewise
+`position('\x02' IN b)`. Only `||` adapts a literal, through its operand hint. Not implemented yet:
+the hash functions (`md5`, `sha256`, …), which need a cryptography dependency decision
+(CLAUDE.md §14).
 
 ## 5. Text concatenation (`||`)
 
