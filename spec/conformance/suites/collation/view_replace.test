@@ -1,0 +1,59 @@
+# CREATE OR REPLACE VIEW keeps each existing column's collation (spec/design/views.md §1.2 step 9):
+# a different collation is 42P16. A column's collation is the name its derivation carries; a column
+# that derives none (a literal) has the database default (`C` here), PostgreSQL's `default`. jed has
+# no separate default-collation object, so naming a column's own collation explicitly is accepted
+# where PostgreSQL refuses `default` -> "C" (a recorded divergence, views.md §12). Loads the vendored
+# `unicode` collation, so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# requires: ddl.view, ddl.view_replace, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, expr.collate, ddl.collate_column, types.i32, types.text
+
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+statement ok
+CREATE TABLE t (k i32 PRIMARY KEY, b text, u text COLLATE "unicode")
+
+statement ok
+INSERT INTO t VALUES (1, 'b', 'b'), (2, 'A', 'A'), (3, 'a', 'a')
+
+statement ok
+CREATE VIEW v AS SELECT b, u FROM t
+
+# a changed collation, either way
+statement error 42P16
+CREATE OR REPLACE VIEW v AS SELECT b COLLATE "unicode" AS b, u FROM t
+
+statement error 42P16
+CREATE OR REPLACE VIEW v AS SELECT b, u COLLATE "C" AS u FROM t
+
+statement error 42P16
+CREATE OR REPLACE VIEW v AS SELECT b, 'x' AS u FROM t
+
+# the same collations, named explicitly or carried by a literal (the database default, C)
+statement ok
+CREATE OR REPLACE VIEW v AS SELECT b COLLATE "C" AS b, u COLLATE "unicode" AS u FROM t
+
+statement ok
+CREATE OR REPLACE VIEW v AS SELECT 'x' AS b, u FROM t
+
+statement ok
+CREATE OR REPLACE VIEW v AS SELECT b, u FROM t
+
+# the dependent view keeps ordering by each column's collation
+statement ok
+CREATE VIEW w AS SELECT u FROM v
+
+statement ok
+CREATE OR REPLACE VIEW v AS SELECT b, u, 1::i32 AS one FROM t
+
+query T nosort
+SELECT u FROM w ORDER BY u
+----
+a
+A
+b
+
+query T nosort
+SELECT b FROM v ORDER BY b
+----
+A
+a
+b

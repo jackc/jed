@@ -1034,6 +1034,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // View text rewrites for ALTER TABLE RENAME TO / RENAME COLUMN / DROP COLUMN (views.md §7,
     // V2 + V4).
     "ddl.view_rename",
+    "ddl.view_replace",
+    "ddl.view_alter",
 ];
 
 /// Parse and execute one SQL statement against a low-level [`Engine`] (no bind parameters).

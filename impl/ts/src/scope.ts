@@ -322,7 +322,7 @@ export class Scope {
     for (const r of this.rels) {
       const n = r.table.columns.length;
       if (idx >= r.offset && idx < r.offset + n) {
-        if (r.base === true) this.catalog.traceColumn(r.table.name, idx - r.offset);
+        this.catalog.traceRelColumn(r, idx - r.offset);
         return;
       }
     }
@@ -1406,6 +1406,7 @@ export function stmtIsWrite(stmt: Statement): boolean {
     stmt.kind === "dropSequence" ||
     stmt.kind === "createView" ||
     stmt.kind === "dropView" ||
+    stmt.kind === "alterView" ||
     stmt.kind === "insert" ||
     stmt.kind === "update" ||
     stmt.kind === "delete" ||
@@ -1610,6 +1611,7 @@ export function collectStmtPrivs(stmt: Statement, req: PrivReq): void {
     case "alterSequence":
     case "createView":
     case "dropView":
+    case "alterView":
       req.isDdl = true;
       break;
     case "insert":
@@ -1975,6 +1977,8 @@ export function stmtKind(stmt: Statement): string {
       return "CREATE VIEW";
     case "dropView":
       return "DROP VIEW";
+    case "alterView":
+      return "ALTER VIEW";
     case "insert":
       return "INSERT";
     case "update":

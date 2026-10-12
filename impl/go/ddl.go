@@ -221,6 +221,8 @@ func stmtKind(stmt statement) string {
 		return "CREATE VIEW"
 	case stmt.DropView != nil:
 		return "DROP VIEW"
+	case stmt.AlterView != nil:
+		return "ALTER VIEW"
 	case stmt.Insert != nil:
 		return "INSERT"
 	case stmt.Update != nil:
@@ -354,6 +356,11 @@ func (db *engine) dispatchStmtBodyCached(stmt statement, params []Value, ic *ins
 			return outcome{}, err
 		}
 		return db.executeDropView(stmt.DropView)
+	case stmt.AlterView != nil:
+		if err := rejectParamsForDDL(params); err != nil {
+			return outcome{}, err
+		}
+		return db.executeAlterView(stmt.AlterView)
 	case stmt.Insert != nil:
 		return db.executeInsertCached(stmt.Insert, params, cteCtx{}, ic, allowInsertFill)
 	case stmt.Select != nil:
@@ -1812,11 +1819,14 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	}
 	original, ok := snap.table(at.Name)
 	if !ok {
-		// A view: its renames are a follow-on (0A000); every other action is the wrong object kind
-		// (42809, views.md §2).
+		// A view: its renames are the view renames (views.md §7.1); every other action is the wrong
+		// object kind (42809, views.md §2).
 		if snap.view(at.Name) != nil {
 			if at.RenameTable != "" || at.RenameColumn != nil {
-				return outcome{}, newError(FeatureNotSupported, "renaming a view is not supported")
+				return db.executeAlterView(&alterView{
+					Name: at.Name, DB: at.DB, IfExists: at.IfExists,
+					RenameTo: at.RenameTable, RenameColumn: at.RenameColumn,
+				})
 			}
 			return outcome{}, newError(WrongObjectType, at.Name+" is not a table")
 		}
@@ -1936,7 +1946,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		if err := rewriteAlterTableExpressions(&table, table.Name, renameTable, true); err != nil {
 			return outcome{}, err
 		}
-		viewChange = viewAlterChange{kind: viewAlterRenameTable, newName: renameTable}
+		viewChange = viewAlterChange{kind: viewAlterRenameRelation, newName: renameTable}
 		table.Name = renameTable
 	} else if at.RenameColumn != nil {
 		old, next := at.RenameColumn.Old, at.RenameColumn.New

@@ -43,20 +43,31 @@ export class ViewTrace {
   columns: Map<string, Set<number>> = new Map();
   // Each written star's expansion, keyed by its token position.
   stars: Map<number, TraceStar> = new Map();
+  // Every referenced column of a view: view name → column ordinals. Not a persisted dependency (§6):
+  // re-validation after CREATE OR REPLACE VIEW reads it (§8).
+  viewColumns: Map<string, Set<number>> = new Map();
 
   addColumn(table: string, ordinal: number): void {
-    let set = this.columns.get(table);
-    if (set === undefined) {
-      set = new Set();
-      this.columns.set(table, set);
-    }
-    set.add(ordinal);
+    addOrdinal(this.columns, table, ordinal);
+  }
+
+  addViewColumn(view: string, ordinal: number): void {
+    addOrdinal(this.viewColumns, view, ordinal);
   }
 
   // itemsInOrder is the traced FROM items in ascending token-position order.
   itemsInOrder(): TraceItem[] {
     return [...this.items.keys()].sort((a, b) => a - b).map((k) => this.items.get(k)!);
   }
+}
+
+function addOrdinal(map: Map<string, Set<number>>, name: string, ordinal: number): void {
+  let set = map.get(name);
+  if (set === undefined) {
+    set = new Set();
+    map.set(name, set);
+  }
+  set.add(ordinal);
 }
 
 // viewNotSupported is the 0A000 every view-only narrowing raises.
@@ -177,18 +188,20 @@ export function viewsInDependencyOrder(sorted: ViewDef[]): ViewDef[] {
 // ALTER TABLE: rewrites (views.md §7) and re-validation (§8).
 // ---------------------------------------------------------------------------------------------
 
-// ViewAlterChange is what an ALTER TABLE statement changed that the dependent views' text must
-// follow (§7): RENAME TO, RENAME COLUMN of the column at `ordinal`, or any other action with the
-// original ordinals of the columns it dropped (possibly none).
+// ViewAlterChange is what an ALTER TABLE / ALTER VIEW statement changed that the dependent views'
+// text must follow (§7, §7.1): RENAME TO of the table or view, RENAME COLUMN of the column at
+// `ordinal`, or any other action with the original ordinals of the columns it dropped (possibly
+// none).
 export type ViewAlterChange =
-  | { kind: "renameTable"; newName: string }
+  | { kind: "renameRelation"; newName: string }
   | { kind: "renameColumn"; ordinal: number; newName: string }
   | { kind: "other"; dropped: number[] };
 
-// ViewAlterPlan is the dependent views of a table captured before an ALTER TABLE runs (§7/§8): each
-// view with the FROM items that bind the table, as traced against the pre-statement catalog, and the
-// table's pre-statement name and column names.
+// ViewAlterPlan is the dependent views of a table or view captured before an ALTER TABLE / ALTER VIEW
+// runs (§7/§7.1/§8): each view with the FROM items that bind the altered relation, as traced against
+// the pre-statement catalog, and the relation's kind, pre-statement name, and column names.
 export type ViewAlterPlan = {
+  kind: ViewDepKind;
   table: string;
   columns: string[];
   views: { view: ViewDef; items: TraceItem[] }[];
@@ -210,11 +223,17 @@ export function viewUsing(plan: ViewAlterPlan, ordinal: number): string | null {
   return null;
 }
 
-// alterBreaksView is the 0A000 an ALTER TABLE raises when a dependent view would not survive it (§8).
-export function alterBreaksView(table: string, view: string): EngineError {
+// alterBreaksView is the 0A000 an ALTER TABLE / ALTER VIEW raises when a dependent view would not
+// survive it (§8).
+export function alterBreaksView(plan: ViewAlterPlan, view: string): EngineError {
   return viewNotSupported(
-    `cannot alter table ${table} because it would change the definition of view ${view}`,
+    `cannot alter ${plan.kind} ${plan.table} because it would change the definition of view ${view}`,
   );
+}
+
+// notAView is the 42809 a statement that names views only raises for any other relation.
+export function notAView(name: string): EngineError {
+  return engineError("wrong_object_type", `"${name}" is not a view`);
 }
 
 // renamedDeps is a view's dependency list after the statement's own renames (§8): the table's entry
@@ -230,8 +249,8 @@ export function renamedDeps(
     columns: d.columns.slice(),
   }));
   for (const dep of out) {
-    if (dep.kind !== "table" || dep.name !== plan.table) continue;
-    if (change.kind === "renameTable") {
+    if (dep.kind !== plan.kind || dep.name !== plan.table) continue;
+    if (change.kind === "renameRelation") {
       dep.name = change.newName;
     } else if (change.kind === "renameColumn") {
       const old = plan.columns[change.ordinal]!;
@@ -257,7 +276,7 @@ export function rewriteViewText(
   const edits = new TokenEdits();
   for (const item of items) {
     const pos = item.pos;
-    if (change.kind === "renameTable") {
+    if (change.kind === "renameRelation") {
       edits.replace(pos.name, [quoted(change.newName)]);
       if (pos.alias === null) edits.insertAfter(pos.name, [AS_TOKEN, quoted(plan.table)]);
     } else if (change.kind === "renameColumn") {

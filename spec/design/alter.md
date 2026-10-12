@@ -313,7 +313,7 @@ Incoming-FK validation reads this final cascade-adjusted state, so an FK removed
 reads, each such view is planned again against the end state; if it no longer plans or a name in
 it would bind differently, the whole statement fails with `0A000` and nothing changes
 ([views.md](views.md) §8). `ALTER TABLE` naming a view is `42809`, except `RENAME TO` /
-`RENAME COLUMN`, which are `0A000` follow-ons.
+`RENAME [COLUMN]`, which rename the view as `ALTER VIEW` does ([views.md](views.md) §7.1).
 
 ## 5. Conformance and cost obligations
 

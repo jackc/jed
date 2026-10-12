@@ -385,7 +385,7 @@ class Parser {
         if (this.atDeferredCreateView()) {
           throw engineError("feature_not_supported", "this form of CREATE VIEW is not supported");
         }
-        if (this.peekKeywordAt(1) === "view") return this.parseCreateView();
+        if (this.atCreateView()) return this.parseCreateView();
         return this.parseCreateTable();
       case "drop":
         if (this.peekKeywordAt(1) === "index") return this.parseDropIndex();
@@ -398,10 +398,8 @@ class Parser {
       // and falls through to the generic unknown-keyword 42601 (the no-escape-hatch surface).
       case "alter":
         if (this.peekKeywordAt(1) === "sequence") return this.parseAlterSequence();
-        // ALTER VIEW is a deferred follow-on (views.md §12).
-        if (this.peekKeywordAt(1) === "view") {
-          throw engineError("feature_not_supported", "ALTER VIEW is not supported");
-        }
+        // ALTER VIEW … RENAME (views.md §7.1); its other actions are recognized and refused.
+        if (this.peekKeywordAt(1) === "view") return this.parseAlterView();
         if (this.peekKeywordAt(1) === "table") return this.parseAlterTable();
         throw engineError("syntax_error", "unexpected keyword 'alter'");
       case "insert":
@@ -434,35 +432,103 @@ class Parser {
   }
 
   // atDeferredCreateView reports whether the statement is one of the deferred `CREATE … VIEW` forms
-  // (views.md §12): `CREATE OR REPLACE VIEW`, `CREATE TEMP | TEMPORARY VIEW`, `CREATE RECURSIVE
+  // (views.md §12): `CREATE [OR REPLACE] TEMP | TEMPORARY VIEW`, `CREATE [OR REPLACE] RECURSIVE
   // VIEW`, `CREATE MATERIALIZED VIEW`. Recognized by keyword sequence so each fails 0A000, not 42601.
   private atDeferredCreateView(): boolean {
-    switch (this.peekKeywordAt(1)) {
-      case "or":
-        return this.peekKeywordAt(2) === "replace" && this.peekKeywordAt(3) === "view";
+    const at = this.peekKeywordAt(1) === "or" && this.peekKeywordAt(2) === "replace" ? 3 : 1;
+    switch (this.peekKeywordAt(at)) {
       case "temp":
       case "temporary":
       case "recursive":
       case "materialized":
-        return this.peekKeywordAt(2) === "view";
+        return this.peekKeywordAt(at + 1) === "view";
       default:
         return false;
     }
   }
 
-  // parseCreateView parses `CREATE VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr`
-  // (views.md §1, grammar.md §54). The body runs from the token after `AS` to the end of the
-  // statement and is captured as its canonical token text. A `WITH ( … )` option list after the name
-  // and a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` are deferred forms (0A000); the check option
-  // is detected after the body is parsed, so a body syntax error is reported first.
+  // atCreateView reports whether the statement is `CREATE [OR REPLACE] VIEW` (views.md §1).
+  private atCreateView(): boolean {
+    return (
+      this.peekKeywordAt(1) === "view" ||
+      (this.peekKeywordAt(1) === "or" &&
+        this.peekKeywordAt(2) === "replace" &&
+        this.peekKeywordAt(3) === "view")
+    );
+  }
+
+  // parseAlterView parses `ALTER VIEW [IF EXISTS] [db.]name RENAME { TO new | [COLUMN] old TO new }`
+  // (views.md §7.1). The other ALTER VIEW actions (`ALTER [COLUMN]`, `OWNER TO`, `SET …`, `RESET …`)
+  // are recognized by their first keyword and refused with 0A000.
+  private parseAlterView(): Statement {
+    this.expectKeyword("alter");
+    this.expectKeyword("view");
+    let ifExists = false;
+    if (this.peekKeyword() === "if") {
+      this.advance();
+      this.expectKeyword("exists");
+      ifExists = true;
+    }
+    const [db, name] = this.parseQualifiedTableName();
+    switch (this.peekKeyword()) {
+      case "rename":
+        break;
+      case "alter":
+      case "owner":
+      case "set":
+      case "reset":
+        throw engineError("feature_not_supported", "this form of ALTER VIEW is not supported");
+      default:
+        throw engineError("syntax_error", "expected RENAME after ALTER VIEW name");
+    }
+    this.advance(); // RENAME
+    if (this.peekKeyword() === "to") {
+      this.advance();
+      return {
+        kind: "alterView",
+        name,
+        db,
+        ifExists,
+        action: { kind: "renameTo", newName: this.expectIdentifier() },
+      };
+    }
+    if (this.peekKeyword() === "column") this.advance();
+    const oldName = this.expectIdentifier();
+    this.expectKeyword("to");
+    return {
+      kind: "alterView",
+      name,
+      db,
+      ifExists,
+      action: { kind: "renameColumn", oldName, newName: this.expectIdentifier() },
+    };
+  }
+
+  // parseCreateView parses `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS
+  // subquery_expr` (views.md §1, grammar.md §54). The body runs from the token after `AS` to the end
+  // of the statement and is captured as its canonical token text. A `WITH ( … )` option list after
+  // the name and a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` are deferred forms (0A000); the
+  // check option is detected after the body is parsed, so a body syntax error is reported first.
+  // `OR REPLACE` with `IF NOT EXISTS` is 42601.
   private parseCreateView(): Statement {
     this.expectKeyword("create");
+    const orReplace = this.peekKeyword() === "or";
+    if (orReplace) {
+      this.advance(); // OR
+      this.expectKeyword("replace");
+    }
     this.expectKeyword("view");
     // A two-token lookahead keeps a lone `if` an ordinary view name (`CREATE VIEW if AS …`).
     const ifNotExists =
       this.peekKeyword() === "if" && this.peekKeywordAt(1) === "not"
         ? this.parseIfNotExists()
         : false;
+    if (orReplace && ifNotExists) {
+      throw engineError(
+        "syntax_error",
+        "CREATE OR REPLACE VIEW cannot be combined with IF NOT EXISTS",
+      );
+    }
     const [db, name] = this.parseQualifiedTableName();
     if (this.peekKeyword() === "with" && this.peekKindAt(1) === "lparen") {
       throw engineError("feature_not_supported", "view options (WITH ( … )) are not supported");
@@ -490,7 +556,7 @@ class Parser {
       throw engineError("feature_not_supported", "WITH CHECK OPTION is not supported");
     }
     const body = renderTokens(this.tokens.slice(start, end));
-    return { kind: "createView", name, db, ifNotExists, columns, body };
+    return { kind: "createView", name, db, orReplace, ifNotExists, columns, body };
   }
 
   // trailingCheckOption returns the index of a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` at the

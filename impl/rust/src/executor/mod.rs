@@ -7,14 +7,14 @@
 pub(crate) use crate::api::Rows;
 pub(crate) use crate::ast::{
     AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence, AlterTable,
-    AlterTableAction, AlterTableEdit, Analyze, BinaryOp, ConflictAction, ConflictTarget,
-    CreateIndex, CreateSequence, CreateTable, CreateType, CreateView, Cte, CteBody, DefaultDef,
-    Delete, DropIndex, DropSequence, DropTable, DropType, DropView, Expr, FkTarget, GroupItem,
-    IndexKeyElem, Insert, InsertSource, InsertValue, JoinKind, JsonOnBehavior, JsonPredicateKind,
-    JsonTable, JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr,
-    RefAction, ReturningClause, Select, SelectItems, SeqOptions, SetOp, SetOpKind, Statement,
-    SubscriptSpec, TableRef, TableRefPos, TypeFieldDef, TypeMod, UnaryOp, Update, WindowDef,
-    WithExpr, WithQuery,
+    AlterTableAction, AlterTableEdit, AlterView, AlterViewAction, Analyze, BinaryOp,
+    ConflictAction, ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType,
+    CreateView, Cte, CteBody, DefaultDef, Delete, DropIndex, DropSequence, DropTable, DropType,
+    DropView, Expr, FkTarget, GroupItem, IndexKeyElem, Insert, InsertSource, InsertValue, JoinKind,
+    JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict,
+    OrderKey, Overriding, QueryExpr, RefAction, ReturningClause, Select, SelectItems, SeqOptions,
+    SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TableRefPos, TypeFieldDef, TypeMod,
+    UnaryOp, Update, WindowDef, WithExpr, WithQuery,
 };
 pub(crate) use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -1440,6 +1440,10 @@ pub(crate) struct ScopeRel<'a> {
     /// grammar.md §15). A view body's planning trace records the columns resolved against such a
     /// relation as dependencies (spec/design/views.md §6); every other relation kind records none.
     base: bool,
+    /// The view this relation is a reference to (spec/design/views.md §4), else `None`. A traced
+    /// view body records the columns resolved against it, so re-validation after `CREATE OR REPLACE
+    /// VIEW` can tell whether a dependent binds a column the replacement appended (§8).
+    view: Option<String>,
     /// `Some(i)` when this relation is a reference to CTE `i` (spec/design/cte.md) rather than a
     /// base table — its `table` is the binding's synthetic relation and exec delivers its rows from
     /// the `CteCtx`. `None` for a base table / SRF / pseudo-relation.
@@ -1542,6 +1546,8 @@ pub(crate) struct FinalRel<'a> {
     /// `TableRef` into the `ScopeRel`/`PlanRel` so the store routes to the right database at exec.
     /// `None` for a bare (implicit-scope) name / a synthetic relation.
     db: Option<String>,
+    /// The view this FROM item references, carried into the `ScopeRel` (views.md §8).
+    view: Option<String>,
 }
 
 impl<'a> FinalRel<'a> {
@@ -1581,6 +1587,7 @@ fn build_prefix_scope<'s>(
                 table: fr.table(synthetic),
                 offset: fr.offset,
                 qualifier_only: false,
+                view: fr.view.clone(),
                 base: fr.src.is_base(),
                 // The prefix is only for column resolution; a correlated reference into a CTE-backed
                 // relation reads its already-delivered row, so it adds no CTE reference here.
@@ -1775,6 +1782,7 @@ impl<'a> Scope<'a> {
                 table,
                 offset: 0,
                 qualifier_only: false,
+                view: None,
                 base: false,
                 cte: None,
                 db: None,
@@ -1844,6 +1852,7 @@ impl<'a> Scope<'a> {
             table,
             offset: 0,
             qualifier_only: false,
+            view: None,
             base: false,
             cte: None,
             db: None,
@@ -1865,6 +1874,7 @@ impl<'a> Scope<'a> {
                     table,
                     offset,
                     qualifier_only: true,
+                    view: None,
                     base: false,
                     cte: None,
                     db: None,
@@ -1881,6 +1891,7 @@ impl<'a> Scope<'a> {
                     table,
                     offset,
                     qualifier_only: true,
+                    view: None,
                     base: false,
                     cte: None,
                     db: None,
@@ -1916,6 +1927,7 @@ impl<'a> Scope<'a> {
             table,
             offset: 0,
             qualifier_only: false,
+            view: None,
             base: false,
             cte: None,
             db: None,
@@ -1926,6 +1938,7 @@ impl<'a> Scope<'a> {
                 table,
                 offset: n,
                 qualifier_only: true,
+                view: None,
                 base: false,
                 cte: None,
                 db: None,
@@ -2025,9 +2038,7 @@ impl<'a> Scope<'a> {
         for r in &self.rels {
             let n = r.table.columns.len();
             if idx >= r.offset && idx < r.offset + n {
-                if r.base {
-                    self.catalog.trace_column(&r.table.name, idx - r.offset);
-                }
+                self.catalog.trace_rel_column(r, idx - r.offset);
                 return;
             }
         }

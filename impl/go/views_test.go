@@ -2,10 +2,10 @@ package jed
 
 // Views through the host API (spec/design/views.md). The corpus pins view semantics through the
 // materialized execute path; these per-core tests pin only what it cannot express: a prepared
-// statement over a view never serves a stale plan, the lazy Query lanes classify a read of a nextval
-// view as a write, function EXECUTE is checked against the reader through a view body, views survive
-// a file commit + reopen + compaction, and the dependency-order accessor the CLI dump uses. Mirrors
-// impl/rust/tests/views.rs.
+// statement over a view never serves a stale plan (across OR REPLACE and renames too), the lazy Query
+// lanes classify a read of a nextval view as a write, function EXECUTE is checked against the reader
+// through a view body, views survive a file commit + reopen + compaction, and the dependency-order
+// accessor the CLI dump uses. Mirrors impl/rust/tests/views.rs.
 
 import (
 	"path/filepath"
@@ -72,6 +72,54 @@ func TestPreparedViewQueryNeverServesAStalePlan(t *testing.T) {
 	if err == nil || err.(*EngineError).Code() != "42P01" {
 		t.Fatalf("query over a dropped view: want 42P01, got %v", err)
 	}
+}
+
+// A prepared statement over a view follows CREATE OR REPLACE VIEW and a view rename (views.md
+// §1.2/§7.1): the replacement's rows come back on the next execution, and a renamed view is gone under
+// its old name while a view that reads it keeps working.
+func TestPreparedViewQueryFollowsReplaceAndRename(t *testing.T) {
+	s := memDB().Session(SessionOptions{})
+	viewsExec(t, s, "CREATE TABLE t (a i32 PRIMARY KEY, b i32)")
+	viewsExec(t, s, "INSERT INTO t VALUES (1, 10), (2, 20)")
+	viewsExec(t, s, "CREATE VIEW v AS SELECT a, b FROM t WHERE a = 1")
+	viewsExec(t, s, "CREATE VIEW w AS SELECT b FROM v")
+	direct, err := s.Prepare("SELECT b FROM v")
+	if err != nil {
+		t.Fatal(err)
+	}
+	through, err := s.Prepare("SELECT b FROM w")
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(stmt *PreparedStatement, want int64) {
+		t.Helper()
+		rows, _ := drainQ(t, s, stmt)
+		if !planCacheRowsEq(rows, [][]int64{{want}}) {
+			t.Fatalf("rows = %v, want [[%d]]", rows, want)
+		}
+	}
+	check(direct, 10)
+	check(through, 10)
+
+	viewsExec(t, s, "CREATE OR REPLACE VIEW v AS SELECT a, b, a + b AS c FROM t WHERE a = 2")
+	check(direct, 20)
+	check(through, 20)
+
+	viewsExec(t, s, "ALTER VIEW v RENAME TO v2")
+	rows, err := s.queryStmt(direct.ast, nil, &direct.sc, &direct.ic)
+	if err == nil {
+		for rows.Next() {
+		}
+		err = rows.Err()
+		rows.Close()
+	}
+	if err == nil || err.(*EngineError).Code() != "42P01" {
+		t.Fatalf("query over a renamed view: want 42P01, got %v", err)
+	}
+	check(through, 20)
+
+	viewsExec(t, s, "ALTER VIEW v2 RENAME COLUMN b TO bb")
+	check(through, 20)
 }
 
 // The lazy Query lanes classify a read of a view whose body calls nextval as a write (views.md §4.1,

@@ -625,9 +625,9 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
 - **Views (format v38).** A view is a catalog entry (`entry_kind 5`) holding its output column
   names, its definition as canonical token text (the CHECK-text rendering, with `*` frozen at
   CREATE), and its persisted table/column/view dependencies. Open parses but never plans a view;
-  each use plans it as the equivalent derived table. `RENAME` rewrites the stored text and `ALTER
-  TABLE` re-validates dependent views, because text binds by name
-  ([spec/design/views.md](spec/design/views.md)).
+  each use plans it as the equivalent derived table. `RENAME` (of a table or a view) rewrites the
+  stored text, and `ALTER TABLE` and `CREATE OR REPLACE VIEW` re-validate dependent views, because
+  text binds by name ([spec/design/views.md](spec/design/views.md)).
 - On-disk format and key encoding are spec'd with byte fixtures (§8). **Status:** the
   single-file on-disk format is authored in `spec/fileformat/format.md` and is now the
   **page-backed copy-on-write B+tree** (`format_version` 24 — the B+tree reshape,

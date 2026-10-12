@@ -1,7 +1,7 @@
 // Views through the host API (spec/design/views.md). The corpus pins view semantics through the
 // materialized execute path; these per-core tests pin only what it cannot express (CLAUDE.md §10): a
-// prepared statement over a view never serves a stale plan, the lazy query() lanes classify a read of
-// a nextval view as a write, function EXECUTE is checked against the reader through a view body,
+// prepared statement over a view never serves a stale plan (across OR REPLACE and renames too), the
+// lazy query() lanes classify a read of a nextval view as a write, function EXECUTE is checked against the reader through a view body,
 // views survive a file commit + reopen + compaction, and the dependency-order tooling accessor.
 // Mirrors impl/rust/tests/views.rs.
 
@@ -64,6 +64,36 @@ test("prepared view query never serves a stale plan", () => {
     code(() => stmt.all()),
     "42P01",
   );
+});
+
+// A prepared statement over a view follows CREATE OR REPLACE VIEW and a view rename (views.md
+// §1.2/§7.1): the replacement's rows come back on the next execution, and a renamed view is gone
+// under its old name while a view that reads it keeps working.
+test("prepared view query follows replace and rename", () => {
+  const s = memDb().session();
+  s.execute("CREATE TABLE t (a i32 PRIMARY KEY, b i32)");
+  s.execute("INSERT INTO t VALUES (1, 10), (2, 20)");
+  s.execute("CREATE VIEW v AS SELECT a, b FROM t WHERE a = 1");
+  s.execute("CREATE VIEW w AS SELECT b FROM v");
+  const direct = s.prepare("SELECT b FROM v");
+  const through = s.prepare("SELECT b FROM w");
+  assert.deepStrictEqual(direct.all(), [{ b: 10n }]);
+  assert.deepStrictEqual(through.all(), [{ b: 10n }]);
+
+  s.execute("CREATE OR REPLACE VIEW v AS SELECT a, b, a + b AS c FROM t WHERE a = 2");
+  assert.deepStrictEqual(direct.all(), [{ b: 20n }]);
+  assert.deepStrictEqual(through.all(), [{ b: 20n }]);
+
+  s.execute("ALTER VIEW v RENAME TO v2");
+  assert.equal(
+    code(() => direct.all()),
+    "42P01",
+  );
+  assert.deepStrictEqual(through.all(), [{ b: 20n }]);
+
+  s.execute("ALTER VIEW v2 RENAME COLUMN b TO bb");
+  assert.deepStrictEqual(through.all(), [{ b: 20n }]);
+  assert.deepStrictEqual(rows(s, "SELECT bb FROM v2"), [[int(20n)]]);
 });
 
 // The lazy query() lanes classify a read of a view whose body calls nextval as a write (views.md

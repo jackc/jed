@@ -446,6 +446,10 @@ impl Engine {
                 reject_params_for_ddl(params)?;
                 self.execute_drop_view(dv)
             }
+            Statement::AlterView(av) => {
+                reject_params_for_ddl(params)?;
+                self.execute_alter_view(av)
+            }
             Statement::Insert(ins) => self.execute_insert_cached(
                 ins,
                 params,
@@ -1655,17 +1659,23 @@ impl Engine {
         }
         .clone();
         let Some(original_ref) = snap.table(&at.name) else {
-            // A view: its renames are a follow-on (0A000); every other action is the wrong object
-            // kind (42809, views.md §2).
+            // A view: its renames are the view renames (views.md §7.1); every other action is the
+            // wrong object kind (42809, views.md §2).
             if snap.view(&at.name).is_some() {
-                if matches!(
-                    at.action,
-                    AlterTableAction::RenameTable(_) | AlterTableAction::RenameColumn { .. }
-                ) {
-                    return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        "renaming a view is not supported",
-                    ));
+                let action = match at.action {
+                    AlterTableAction::RenameTable(new) => Some(AlterViewAction::RenameTo(new)),
+                    AlterTableAction::RenameColumn { old, new } => {
+                        Some(AlterViewAction::RenameColumn { old, new })
+                    }
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    return self.execute_alter_view(AlterView {
+                        name: at.name,
+                        db: at.db,
+                        if_exists: at.if_exists,
+                        action,
+                    });
                 }
                 return Err(EngineError::new(
                     SqlState::WrongObjectType,
@@ -1810,7 +1820,7 @@ impl Engine {
                     ));
                 }
                 self.rewrite_table_expressions(&mut table, None, Some(&new_name))?;
-                view_change = Some(ViewAlterChange::RenameTable(new_name.clone()));
+                view_change = Some(ViewAlterChange::RenameRelation(new_name.clone()));
                 table.name = new_name;
                 rename_table = true;
             }

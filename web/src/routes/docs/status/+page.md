@@ -62,8 +62,7 @@ jed implements a broad surface, but notable gaps remain. As representative (not 
 - Spill-to-disk covers `ORDER BY`; the spilling hash join, aggregate, and `DISTINCT` are still in
   progress.
 - Composite (row) types cannot yet be a `PRIMARY KEY` or index key.
-- Views are read-only; updatable, materialized, and temporary views and `CREATE OR REPLACE VIEW` are
-  pending.
+- Views are read-only; updatable, materialized, and temporary views are pending.
 - A file does not yet shrink back to the OS (dead space is reused internally, but not returned).
 
 The authoritative, always-current picture lives in the project's

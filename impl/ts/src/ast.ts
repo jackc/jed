@@ -1252,17 +1252,30 @@ export type Analyze = {
   columns: string[];
 };
 
-// CreateView is `CREATE VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr`
-// (spec/design/views.md §1, grammar.md §54). `body` is the canonical token text of the body
+// CreateView is `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr`
+// (spec/design/views.md §1/§1.2, grammar.md §54). `body` is the canonical token text of the body
 // (format.md *Check-expression text*) — the definition before `*` freezing; the executor parses it
 // again on its own, so every token position the planner trace records is relative to the stored text.
 export type CreateView = {
   kind: "createView";
   name: string;
   db?: string;
+  orReplace: boolean;
   ifNotExists: boolean;
   columns: string[] | null;
   body: string;
+};
+
+// AlterView is `ALTER VIEW [IF EXISTS] [db.]name RENAME …` (spec/design/views.md §7.1). `ALTER TABLE v
+// RENAME …` on a view executes the same rename.
+export type AlterView = {
+  kind: "alterView";
+  name: string;
+  db?: string;
+  ifExists: boolean;
+  action:
+    | { kind: "renameTo"; newName: string }
+    | { kind: "renameColumn"; oldName: string; newName: string };
 };
 
 // DropView is `DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]` (spec/design/views.md §1).
@@ -1292,6 +1305,7 @@ export type Statement =
   | DropSequence
   | CreateView
   | DropView
+  | AlterView
   | Insert
   | Select
   | SetOp

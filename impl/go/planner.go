@@ -379,7 +379,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			}
 			seenLabels[label] = true
 		}
-		rels = append(rels, scopeRel{label: label, table: t, offset: offset, cte: cteIdx, db: tref.DB, base: base})
+		rels = append(rels, scopeRel{label: label, table: t, offset: offset, cte: cteIdx, db: tref.DB, base: base, view: viewNames[i]})
 		offset += len(t.Columns)
 	}
 
@@ -472,9 +472,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				if rl < 0 {
 					return nil, newError(UndefinedColumn, "column \""+name+"\" specified in USING clause does not exist in right table")
 				}
-				if rightRel.base {
-					db.traceColumn(rightRel.table.Name, rl)
-				}
+				db.traceRelColumn(rightRel, rl)
 				ri := rightRel.offset + rl
 				lq, rq := fmt.Sprintf("\x00l%d", n), fmt.Sprintf("\x00r%d", n)
 				pairRels = append(pairRels,

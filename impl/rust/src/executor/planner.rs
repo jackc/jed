@@ -455,6 +455,7 @@ impl Engine {
                 offset,
                 src,
                 db: tref.db.clone(),
+                view: view_items[i].as_ref().map(|(_, name, _)| name.clone()),
             });
             offset += col_count;
         }
@@ -467,6 +468,7 @@ impl Engine {
                 table: fr.table(&synthetic),
                 offset: fr.offset,
                 qualifier_only: false,
+                view: fr.view.clone(),
                 base: fr.src.is_base(),
                 cte: fr.src.cte(),
                 db: fr.db.clone(),
@@ -601,9 +603,7 @@ impl Engine {
                             ),
                         )
                     })?;
-                    if right_rel.base {
-                        self.trace_column(&right_rel.table.name, rl);
-                    }
+                    self.trace_rel_column(right_rel, rl);
                     let ri = right_rel.offset + rl;
                     let (lq, rq) = (format!("\0l{n}"), format!("\0r{n}"));
                     pair_tables.push((one_column_table(&lq, left.column_at(li).clone()), li));
@@ -657,6 +657,7 @@ impl Engine {
                             table: t,
                             offset: *off,
                             qualifier_only: false,
+                            view: None,
                             base: false,
                             cte: None,
                             db: None,

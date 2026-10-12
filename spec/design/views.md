@@ -1,13 +1,14 @@
 # Views — design
 
-> `CREATE VIEW name [(cols)] AS query` / `DROP VIEW`: a **named, persisted query** that the FROM
-> clause references like a table. This doc is the contract all three cores implement in lockstep
+> `CREATE [OR REPLACE] VIEW name [(cols)] AS query` / `DROP VIEW` / `ALTER VIEW … RENAME`: a
+> **named, persisted query** that the FROM clause references like a table. This doc is the contract all three cores implement in lockstep
 > (CLAUDE.md §2). The grammar is in [../grammar/grammar.ebnf](../grammar/grammar.ebnf) and
 > [grammar.md](grammar.md) §54. The byte layout is in [../fileformat/format.md](../fileformat/format.md)
 > (`format_version` 38). The errors are existing codes in [../errors/registry.toml](../errors/registry.toml).
 > PostgreSQL behavior was pinned against the live `postgres:18` oracle (CLAUDE.md §1).
-> This first slice is **read-only**: no updatable views, `OR REPLACE`, `CHECK OPTION`, materialized,
-> recursive, or temporary views (§12).
+> Views are **read-only**: no updatable views, `CHECK OPTION`, materialized, recursive, or
+> temporary views (§12). `CREATE OR REPLACE VIEW` (§1.2) and view renames (§7.1) redefine a view in
+> place.
 
 A view is the fifth kind of database-level catalog object, after tables, composite types, sequences,
 and collation references. It has no storage of its own. Reading a view plans its stored query in
@@ -28,8 +29,10 @@ Everything below follows from three choices:
 ## 1. Surface
 
 ```
-CREATE VIEW [IF NOT EXISTS] [main.]name [( col [, …] )] AS query
+CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [main.]name [( col [, …] )] AS query
 DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]
+ALTER VIEW [IF EXISTS] [main.]name RENAME TO new_name
+ALTER VIEW [IF EXISTS] [main.]name RENAME [COLUMN] col TO new_col
 ```
 
 - **`query`** is a `subquery_expr`: an optional `WITH` clause, then a `SELECT`, set operation,
@@ -49,16 +52,21 @@ DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]
   name is already taken in the relation namespace, the statement is a silent no-op. The skip is
   decided before the body is parsed into a plan, as for `CREATE TABLE IF NOT EXISTS`
   ([grammar.md](grammar.md) §13). The skipped body is not validated. The `allow_ddl` gate,
-  qualifier validation, and the `jed_` reservation still run first.
+  qualifier validation, and the `jed_` reservation still run first. `OR REPLACE` and `IF NOT
+  EXISTS` together are **`42601`**: the two disagree about a taken name, and PostgreSQL has neither
+  combination.
+- **`OR REPLACE`** redefines an existing view in place (§1.2).
+- **`ALTER VIEW … RENAME`** renames a view or one of its output columns (§7.1).
 - **`DROP VIEW`** follows `DROP TABLE`'s shape ([grammar.md](grammar.md) §13). It is two-phase and
   all-or-nothing over a comma list. A repeated name is deduplicated. A missing name is **`42P01`**
   (*view does not exist*) unless `IF EXISTS`, which skips just that name. A name that resolves to
   a table, index, or sequence is **`42809`** (*"t" is not a view*), and `IF EXISTS` does not
   suppress it.
-- **Transactional.** `CREATE VIEW` and `DROP VIEW` are DDL in the §3 staging model. They roll back
+- **Transactional.** `CREATE [OR REPLACE] VIEW`, `DROP VIEW`, and `ALTER VIEW` are DDL in the §3
+  staging model. They roll back
   with their transaction, are refused in a read-only transaction (`25006`), and are gated by the
   session's `allow_ddl` (`42501`, [session.md](session.md) §5).
-- **Cost is zero** for both statements. Planning is unmetered, and the statements read no rows
+- **Cost is zero** for every view statement. Planning is unmetered, and the statements read no rows
   ([cost.md](cost.md)).
 
 ### 1.1 Validation order at `CREATE VIEW` (deterministic, PG-matched)
@@ -77,10 +85,46 @@ DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]
 7. The creating session's `SELECT` privilege on every relation the body reads (`42501`, §9).
 8. A taken name is **`42P07`** (*relation "v" already exists*). PostgreSQL also reports body errors
    before the name collision, so `CREATE VIEW v AS SELECT * FROM nosuch` is `42P01` even when `v`
-   exists.
+   exists. Under `OR REPLACE`, a name taken by a view continues at §1.2 step 9, and a name taken by
+   any other relation is **`42809`** (*"t" is not a view*).
 9. The catalog entry is written. A definition whose entry does not fit one catalog page is
    `0A000` (the catalog's one-page-per-entry rule, format.md *Catalog*).
 
+### 1.2 `CREATE OR REPLACE VIEW` (PG-matched)
+
+`CREATE OR REPLACE VIEW v …` where no relation `v` exists is exactly `CREATE VIEW v …`. Where `v` is
+a view, steps 1–7 of §1.1 run unchanged (body errors, the column list, `*` freezing, and the
+privilege check all come first, as in PostgreSQL), and then:
+
+9. **Column compatibility** (`42P16`, *invalid_table_definition*), in PostgreSQL's order. Fewer
+   output columns than the view has is *cannot drop columns from view*. Then each of the view's
+   existing columns is compared, left to right, with the new column at its position: a different
+   name is *cannot change name of view column "a" to "b"*, then a different type is *cannot change
+   data type of view column "a" from i32 to i64*, then a different collation is *cannot change
+   collation of view column "b" from "C" to "es"*. New columns may be **appended** after the
+   existing ones. Names are the final output names (the column list applied over the body's names).
+   A type is the resolved output type, without typmods (§12). A collation is the collation name the
+   column's derivation carries ([collation.md](collation.md) §1); a column that derives no collation
+   (a literal) has the database's default collation, PostgreSQL's `default`; an indeterminate
+   collation is a value of its own.
+   The existing columns' types and collations are not persisted (§3); they come from planning the
+   view's current body against the current catalog. If that body no longer plans (an untracked
+   dependency was dropped, §6), only the names and the column count are compared, so a broken view
+   can always be repaired by replacing it.
+10. **No cycle** (`42P17`, *infinite recursion detected in rules for relation "v"*). The new body is
+    planned against the view's current definition, so it may read `v` itself or a view that reads
+    `v`. A body that depends on `v`, directly or through other views, would make the catalog cyclic,
+    which open rejects (§3). PostgreSQL accepts such a definition and fails each later use with this
+    error; jed fails the definition (§12).
+11. **Dependent views are re-validated** (§8) against the catalog with the replacement installed.
+    A failure is **`0A000`** (*cannot replace view v because it would change the definition of view
+    w*).
+12. The catalog entry is replaced: the new definition, output columns, dependency list, and depth,
+    under the same name. A definition that does not fit one catalog page is `0A000`, as at create.
+
+The replacement changes nothing else. Dependent views keep their stored text, which binds `v` and
+its existing columns by name, so they read the new definition with the same output names and
+types. This is PostgreSQL's observable behavior.
 ## 2. Namespace
 
 A view lives in the **relation namespace**, which tables, indexes, sequences, and named
@@ -102,9 +146,10 @@ Statements that name a relation of a specific kind treat a view as the wrong kin
 | A writable CTE targeting `v` | `55000`, as above | same rule |
 | `CREATE INDEX … ON v` | `42809` *cannot create index on relation "v"* | same |
 | `REFERENCES v` (a foreign-key parent) | `42809` *referenced relation "v" is not a table* | same |
-| `ALTER TABLE v RENAME TO …` / `RENAME COLUMN …` | `0A000` (a follow-on, §12) | PG renames |
+| `ALTER TABLE v RENAME TO …` / `RENAME [COLUMN] …` | the view rename (§7.1) | same |
 | Any other `ALTER TABLE v …` action | `42809` | same |
-| `ALTER VIEW …` | `0A000` (a follow-on, §12) | PG supports |
+| `ALTER VIEW t RENAME …` (`t` a table, index, or sequence) | `42809` *"t" is not a view*, also with `IF EXISTS` | PG renames a table's column through `ALTER VIEW` |
+| `CREATE OR REPLACE VIEW t …` (`t` not a view) | `42809` *"t" is not a view* | same |
 | `ANALYZE v` | a no-op success | PG warns and succeeds |
 | `DROP VIEW t` (`t` a table, index, or sequence) | `42809` *"t" is not a view* | same |
 
@@ -201,8 +246,9 @@ ceiling, and its query-memory account. A function with a side effect on statemen
 from a view that calls `nextval` is a write ([sequences.md](sequences.md) §4).
 
 A view may reference other views. Each nested reference expands to its own derived table. Cycles
-cannot exist: a view can name only relations that already exist, and nothing in this slice
-redefines a view (§12).
+cannot exist: a view can name only relations that already exist, `CREATE OR REPLACE VIEW` refuses a
+definition that would read the view itself (`42P17`, §1.2), and a rename rewrites every reference
+consistently (§7.1).
 
 **Nesting depth.** A view body is parsed once, on its own, but every use plans it inside the
 referencing statement, so the planner recurses through every view the statement reaches. The nesting
@@ -298,6 +344,8 @@ The dependencies are enforced as follows, all **RESTRICT**:
 | `… CASCADE` of any of the above when a **view** is the dependent | refused (a follow-on, §12) | `0A000` |
 | `ALTER TABLE t RENAME TO …` / `RENAME COLUMN …` | the view's text is rewritten (§7) | — |
 | Any other `ALTER TABLE t` while a view depends on `t` | allowed, then re-validated (§8) | — |
+| `ALTER VIEW u RENAME TO …` / `RENAME COLUMN …` while a view depends on `u` | the view's text is rewritten (§7.1) | — |
+| `CREATE OR REPLACE VIEW u` while a view depends on `u` | allowed, then re-validated (§8) | — |
 
 The drop-set exclusion of `DROP TABLE` ([grammar.md](grammar.md) §13) applies to `DROP VIEW`: a
 dependent that is itself dropped by the same statement does not block. `DROP VIEW v1, v2` succeeds
@@ -361,7 +409,48 @@ The `RENAME` forms of `ALTER TABLE` (alter.md §2.1/§2.2) and `DROP COLUMN` (al
 these rewrites. Their other behavior is unchanged. All view rewrites happen in the same
 all-or-nothing statement as the catalog change.
 
-## 8. Re-validation after `ALTER TABLE`
+### 7.1 Renaming a view
+
+```
+ALTER VIEW [IF EXISTS] [main.]v RENAME TO v2
+ALTER VIEW [IF EXISTS] [main.]v RENAME [COLUMN] a TO b
+```
+
+`ALTER TABLE v RENAME TO …` and `ALTER TABLE v RENAME [COLUMN] …` on a view are the same
+statements, as in PostgreSQL. Validation, in order:
+
+1. The `allow_ddl` gate (`42501`), then the qualifier: `main` is accepted, `temp` and any
+   attachment are `0A000` (§10), and an unknown qualifier is `42P01`.
+2. The name. No relation `v` is **`42P01`** (*relation "v" does not exist*), or a silent no-op
+   under `IF EXISTS`. Under `ALTER VIEW`, a table, index, or sequence `v` is **`42809`** (*"v" is
+   not a view*), and `IF EXISTS` does not suppress it.
+3. `RENAME TO`: the `jed_` reservation (`42939`, kind `view`), then a taken name, including `v`
+   itself, is **`42P07`** (*relation "v2" already exists*).
+   `RENAME COLUMN`: a column `a` the view does not have is **`42703`** (*column "a" does not
+   exist*), then a column `b` the view already has, including `a` itself, is **`42701`** (*column "b"
+   of relation "v" already exists*). Names are exact (grammar.md §3), so `RENAME COLUMN A TO c`
+   renames `a`.
+4. The rename, and the rewrite of each view that depends on `v`, below.
+5. Re-validation of those dependent views (§8). A failure is **`0A000`** (*cannot alter view v
+   because it would change the definition of view w*).
+
+**`RENAME TO`** changes the view's catalog key and nothing in its own entry. Each view that depends
+on `v` is rewritten exactly as for a table rename (§7): the name token of each FROM item that binds
+`v` becomes `"v2"`, with `as "v"` inserted when the item has no alias, and its dependency entry is
+renamed.
+
+**`RENAME COLUMN`** changes the view's stored output column list; the definition is unchanged. Each
+view that depends on `v` keeps seeing the column as `a`, exactly as for a table column rename (§7):
+each FROM item that binds `v` gets a column alias list covering positions `0 … k` with the names it
+exposed before the statement. Over `v(a, b)`, a dependent's `FROM v` becomes
+`from v as "v" ( "a" )` when `a` is renamed. This is PostgreSQL's behavior: its dependents keep the
+names they were defined with (`pg_get_viewdef` shows `aa AS a`).
+
+Other `ALTER VIEW` actions (`ALTER COLUMN … SET/DROP DEFAULT`, `OWNER TO`, `SET SCHEMA`, `SET` /
+`RESET` options) are **`0A000`** (§12). Statements that rename a view are zero-cost, transactional
+DDL like the others (§1).
+
+## 8. Re-validation after a change to a dependency
 
 Name binding can change silently when a table changes. Suppose a view's subquery mentions `x`,
 meaning the outer query's `u.x`. If `t` gains a column `x`, `x` now binds to `t.x` and the view's
@@ -378,6 +467,22 @@ Equal dependencies mean every name in the body binds to the same columns, so the
 rows are unchanged. Only direct dependents are re-validated. A view that reads another view sees
 the same output names and types, so it cannot be affected.
 
+The same rule applies after `ALTER VIEW u RENAME …` (§7.1) to each view that depends on `u`, with
+the *alter view* message.
+
+**After `CREATE OR REPLACE VIEW u`** (§1.2) the rule is stronger, because the replacement can add
+columns to `u` and changes its body. Every view that reads `u`, directly or through other views, is
+planned again in name byte order with the replacement installed, and must plan successfully. That
+catches a replacement whose deeper body or wider expansion would push a reader past the nesting or
+expansion limit (§4.1). Each **direct** dependent must also keep its persisted dependency list and
+must not reference a column that the replacement appended. Which columns of `u` a body references
+is observed while it is planned, as for table columns (§6), but it is not persisted. A reference to
+an appended column can only be a capture: a name that bound elsewhere before the replacement, such
+as a correlated reference to an outer relation's `x`, now binds to `u`'s new `x`. The first failing
+view in name byte order is named in the `0A000` (*cannot replace view u because it would change the
+definition of view w*). The view's existing columns keep their names and types (§1.2 step 9), so
+no other binding can change.
+
 In practice this blocks an `ADD COLUMN` (or a rename of an unreferenced column into a new name)
 only when the new name would capture or make ambiguous an unqualified reference in a view body.
 PostgreSQL accepts those, and jed records the divergence (§12). Qualifying column references in
@@ -385,7 +490,8 @@ view bodies avoids it. The other `ALTER TABLE` actions cannot change a binding a
 They are re-validated anyway because one uniform rule is simpler to keep correct than a list of
 exempt actions.
 
-Re-validation is DDL planning: it is unmetered and charges nothing.
+Re-validation is DDL planning: it is unmetered and charges nothing. PostgreSQL binds views by object
+id and accepts every one of these changes; each refusal is a recorded divergence (§12).
 
 ## 9. Privileges
 
@@ -403,7 +509,8 @@ when the owner would be fixed:
 - **Function `EXECUTE`** for functions called in the body is checked against the reading session,
   as it would be in a derived table. PostgreSQL also checks function privileges against the
   invoker.
-- **`DROP VIEW`** requires `allow_ddl`.
+- **`CREATE OR REPLACE VIEW`** has `CREATE VIEW`'s requirements, checked against the new body.
+- **`DROP VIEW`** and **`ALTER VIEW`** require `allow_ddl`.
 
 This keeps CLAUDE.md §13 intact. A view grants nothing its creator lacked. Reading through it is
 bounded by the reading session's cost ceiling, lifetime budget, and query-memory limit like any
@@ -460,9 +567,15 @@ Recorded divergences from PostgreSQL (CLAUDE.md §1):
 | `CREATE VIEW IF NOT EXISTS` is accepted; PG has no such syntax | SQLite parity; the `CREATE TABLE` precedent |
 | A view whose `*` expansion is not referenceable by name is `0A000` | jed stores text; PG invents aliases in its deparser |
 | `ALTER TABLE` that would capture or make ambiguous a view's reference is `0A000` | text binds by name (§8) |
+| `CREATE OR REPLACE VIEW` whose appended column would capture or make ambiguous a dependent view's reference is `0A000` | text binds by name (§8) |
+| `CREATE OR REPLACE VIEW` of a view that would read itself, directly or through other views, is `42P17`; PG accepts it and fails every use with `42P17` | the catalog stays acyclic, so open can check it (§3) |
+| `CREATE OR REPLACE VIEW` compares column types without typmods: `varchar(3)` → `varchar(4)` or `text`, and `decimal(5,2)` → `decimal(6,2)`, are accepted; PG refuses them (`42P16`) | jed's query output columns carry no typmod |
+| A bare integer literal cannot replace an `i32` view column (`0 AS d`); PG accepts it | a projected integer literal is `i64` in jed ([types.md](types.md) §6) |
+| `CREATE OR REPLACE VIEW` compares collation names: a column of the default collation replaced by the same collation named explicitly is accepted; PG refuses (`default` and `"C"` are different collation objects there) | jed has no separate default-collation object |
+| `ALTER VIEW t RENAME COLUMN …` on a table is `42809`; PG renames the table's column | `ALTER VIEW` names views only, as its `RENAME TO` already does in PG |
+| `ALTER VIEW` actions other than `RENAME` are `0A000` | defaults, owners, schemas, and view options are follow-ons or absent |
 | A view over a temp relation is `0A000`; PG makes it temporary | temporary views are a follow-on |
 | Dropping a sequence or composite type a view uses succeeds; the view fails at use | those dependencies are not tracked (§6) |
-| `ALTER TABLE v RENAME …` and `ALTER VIEW` are `0A000` | view renames are a follow-on |
 | A zero-column view is `0A000` | the canonical text cannot express an empty select list after `*` expansion |
 | `ANALYZE v` succeeds silently; PG also emits a warning | jed has no notice channel |
 | `DROP SEQUENCE v` / `ALTER SEQUENCE v` are `42P01`; PG says `42809` | sequence statements already treat a table this way |
@@ -470,7 +583,8 @@ Recorded divergences from PostgreSQL (CLAUDE.md §1):
 
 Deferred follow-ons, none foreclosed:
 
-- `CREATE OR REPLACE VIEW`, `ALTER VIEW`, view renames (`0A000` today);
+- the other `ALTER VIEW` actions: column defaults (meaningful only for updatable views), `SET` /
+  `RESET` view options;
 - `WITH [CASCADED | LOCAL] CHECK OPTION` and `WITH (options)` (`0A000`);
 - updatable views and `INSTEAD OF` behavior;
 - `CREATE MATERIALIZED VIEW` and `CREATE RECURSIVE VIEW` (`0A000`);
@@ -490,6 +604,8 @@ Deferred follow-ons, none foreclosed:
 - Reading a view is the equivalent derived table, which is already deterministic in rows, cost,
   plan, and errors.
 - The `2BP01` and `0A000` messages name the first blocking view in name byte order.
+- `CREATE OR REPLACE VIEW` compares columns in position order and reports the first difference in
+  PostgreSQL's order (count, then per column name, type, collation).
 
 ## 14. Slices
 
@@ -504,5 +620,10 @@ Deferred follow-ons, none foreclosed:
    PostgreSQL feature in its own right and the mechanism V4 needs.
 4. **V4 — `RENAME COLUMN` and `DROP COLUMN` rewrites** (§7).
 
+5. **V5 — `CREATE OR REPLACE VIEW`** (§1.2): column compatibility, the cycle check, and
+   re-validation of the views that read the replaced view (§8).
+6. **V6 — view renames** (§7.1): `ALTER VIEW … RENAME TO` / `RENAME [COLUMN]`, and the same
+   `ALTER TABLE` forms on a view, with the §7 rewrites of dependent views.
+
 Capabilities: `ddl.view` (V1), `ddl.view_rename` (V2 + V4), `query.table_column_alias` (V3),
-`introspect.views` (V1).
+`introspect.views` (V1), `ddl.view_replace` (V5), `ddl.view_alter` (V6).

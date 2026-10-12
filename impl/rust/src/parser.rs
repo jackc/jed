@@ -6,15 +6,15 @@
 
 use crate::ast::{
     AlterColumnAction, AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence,
-    AlterTable, AlterTableAction, AlterTableEdit, Analyze, Assignment, BinaryOp, CheckDef,
-    ColumnDef, ConflictAction, ConflictTarget, CreateIndex, CreateSequence, CreateTable,
-    CreateType, CreateView, Cte, CteBody, DefaultDef, Delete, DropIndex, DropSequence, DropTable,
-    DropType, DropView, ExcludeDef, Expr, ForeignKeyDef, GroupItem, IdentitySpec, IndexKeyElem,
-    IndexPredicate, Insert, InsertSource, InsertValue, JoinClause, JoinKind, JsonOnBehavior,
-    JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding,
-    QueryExpr, RefAction, ReturningClause, Select, SelectItem, SelectItems, SeqOptions, SetOp,
-    SetOpKind, StarPos, Statement, SubscriptSpec, TableRef, TableRefPos, TypeFieldDef, TypeMod,
-    UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
+    AlterTable, AlterTableAction, AlterTableEdit, AlterView, AlterViewAction, Analyze, Assignment,
+    BinaryOp, CheckDef, ColumnDef, ConflictAction, ConflictTarget, CreateIndex, CreateSequence,
+    CreateTable, CreateType, CreateView, Cte, CteBody, DefaultDef, Delete, DropIndex, DropSequence,
+    DropTable, DropType, DropView, ExcludeDef, Expr, ForeignKeyDef, GroupItem, IdentitySpec,
+    IndexKeyElem, IndexPredicate, Insert, InsertSource, InsertValue, JoinClause, JoinKind,
+    JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict,
+    OrderKey, Overriding, QueryExpr, RefAction, ReturningClause, Select, SelectItem, SelectItems,
+    SeqOptions, SetOp, SetOpKind, StarPos, Statement, SubscriptSpec, TableRef, TableRefPos,
+    TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::decimal::Decimal;
@@ -135,7 +135,7 @@ impl Parser {
                 SqlState::FeatureNotSupported,
                 "this form of CREATE VIEW is not supported",
             )),
-            Some("create") if self.peek_keyword_at(1).as_deref() == Some("view") => {
+            Some("create") if self.at_create_view() => {
                 Ok(Statement::CreateView(self.parse_create_view()?))
             }
             Some("create") => Ok(Statement::CreateTable(self.parse_create_table()?)),
@@ -159,10 +159,10 @@ impl Parser {
             Some("alter") if self.peek_keyword_at(1).as_deref() == Some("sequence") => {
                 Ok(Statement::AlterSequence(self.parse_alter_sequence()?))
             }
-            // ALTER VIEW is a deferred follow-on (views.md §12).
-            Some("alter") if self.peek_keyword_at(1).as_deref() == Some("view") => Err(
-                EngineError::new(SqlState::FeatureNotSupported, "ALTER VIEW is not supported"),
-            ),
+            // ALTER VIEW … RENAME (views.md §7.1); its other actions are recognized and refused.
+            Some("alter") if self.peek_keyword_at(1).as_deref() == Some("view") => {
+                Ok(Statement::AlterView(self.parse_alter_view()?))
+            }
             Some("alter") if self.peek_keyword_at(1).as_deref() == Some("table") => {
                 Ok(Statement::AlterTable(self.parse_alter_table()?))
             }
@@ -183,26 +183,43 @@ impl Parser {
     }
 
     /// Whether the statement is one of the deferred `CREATE … VIEW` forms (views.md §12): `CREATE
-    /// OR REPLACE VIEW`, `CREATE TEMP | TEMPORARY VIEW`, `CREATE RECURSIVE VIEW`, `CREATE
+    /// [OR REPLACE] TEMP | TEMPORARY VIEW`, `CREATE [OR REPLACE] RECURSIVE VIEW`, `CREATE
     /// MATERIALIZED VIEW`. Recognized by keyword sequence so each fails 0A000, not 42601.
     fn at_deferred_create_view(&self) -> bool {
         let kw = |i: usize| self.peek_keyword_at(i);
-        match kw(1).as_deref() {
-            Some("or") => kw(2).as_deref() == Some("replace") && kw(3).as_deref() == Some("view"),
-            Some("temp") | Some("temporary") | Some("recursive") | Some("materialized") => {
-                kw(2).as_deref() == Some("view")
-            }
-            _ => false,
-        }
+        let at = if kw(1).as_deref() == Some("or") && kw(2).as_deref() == Some("replace") {
+            3
+        } else {
+            1
+        };
+        matches!(
+            kw(at).as_deref(),
+            Some("temp") | Some("temporary") | Some("recursive") | Some("materialized")
+        ) && kw(at + 1).as_deref() == Some("view")
     }
 
-    /// `CREATE VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr` (views.md §1, grammar.md
-    /// §54). The body runs from the token after `AS` to the end of the statement and is captured as
-    /// its canonical token text. A `WITH ( … )` option list after the name and a trailing `WITH
-    /// [CASCADED | LOCAL] CHECK OPTION` are deferred forms (0A000); the check option is detected
-    /// after the body is parsed, so a body syntax error is reported first.
+    /// Whether the statement is `CREATE [OR REPLACE] VIEW` (views.md §1).
+    fn at_create_view(&self) -> bool {
+        let kw = |i: usize| self.peek_keyword_at(i);
+        kw(1).as_deref() == Some("view")
+            || (kw(1).as_deref() == Some("or")
+                && kw(2).as_deref() == Some("replace")
+                && kw(3).as_deref() == Some("view"))
+    }
+
+    /// `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr` (views.md
+    /// §1, grammar.md §54). The body runs from the token after `AS` to the end of the statement and
+    /// is captured as its canonical token text. A `WITH ( … )` option list after the name and a
+    /// trailing `WITH [CASCADED | LOCAL] CHECK OPTION` are deferred forms (0A000); the check option
+    /// is detected after the body is parsed, so a body syntax error is reported first. `OR REPLACE`
+    /// with `IF NOT EXISTS` is 42601.
     fn parse_create_view(&mut self) -> Result<CreateView> {
         self.expect_keyword("create")?;
+        let or_replace = self.peek_keyword().as_deref() == Some("or");
+        if or_replace {
+            self.advance(); // OR
+            self.expect_keyword("replace")?;
+        }
         self.expect_keyword("view")?;
         // A two-token lookahead keeps a lone `if` an ordinary view name (`CREATE VIEW if AS …`).
         let if_not_exists = if self.peek_keyword().as_deref() == Some("if")
@@ -212,6 +229,11 @@ impl Parser {
         } else {
             false
         };
+        if or_replace && if_not_exists {
+            return Err(syntax(
+                "CREATE OR REPLACE VIEW cannot be combined with IF NOT EXISTS",
+            ));
+        }
         let (db, name) = self.parse_qualified_table_name()?;
         if self.peek_keyword().as_deref() == Some("with")
             && matches!(self.peek_at(1), Token::LParen)
@@ -259,6 +281,7 @@ impl Parser {
         Ok(CreateView {
             name,
             db,
+            or_replace,
             if_not_exists,
             columns,
             body,
@@ -286,6 +309,49 @@ impl Parser {
             return Some(end - 4);
         }
         None
+    }
+
+    /// `ALTER VIEW [IF EXISTS] [db.]name RENAME { TO new | [COLUMN] old TO new }` (views.md §7.1).
+    /// The other `ALTER VIEW` actions (`ALTER [COLUMN]`, `OWNER TO`, `SET …`, `RESET …`) are
+    /// recognized by their first keyword and refused with 0A000.
+    fn parse_alter_view(&mut self) -> Result<AlterView> {
+        self.expect_keyword("alter")?;
+        self.expect_keyword("view")?;
+        let if_exists = self.peek_keyword().as_deref() == Some("if");
+        if if_exists {
+            self.advance();
+            self.expect_keyword("exists")?;
+        }
+        let (db, name) = self.parse_qualified_table_name()?;
+        match self.peek_keyword().as_deref() {
+            Some("rename") => {}
+            Some("alter") | Some("owner") | Some("set") | Some("reset") => {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "this form of ALTER VIEW is not supported",
+                ));
+            }
+            _ => return Err(syntax("expected RENAME after ALTER VIEW name")),
+        }
+        self.advance(); // RENAME
+        let action = if self.peek_keyword().as_deref() == Some("to") {
+            self.advance();
+            AlterViewAction::RenameTo(self.expect_identifier()?)
+        } else {
+            if self.peek_keyword().as_deref() == Some("column") {
+                self.advance();
+            }
+            let old = self.expect_identifier()?;
+            self.expect_keyword("to")?;
+            let new = self.expect_identifier()?;
+            AlterViewAction::RenameColumn { old, new }
+        };
+        Ok(AlterView {
+            name,
+            db,
+            if_exists,
+            action,
+        })
     }
 
     /// `DROP VIEW [IF EXISTS] [db.]name [, …] [CASCADE | RESTRICT]` (views.md §1). `IF EXISTS` is a

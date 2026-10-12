@@ -55,6 +55,10 @@ type scopeRel struct {
 	// grammar.md §15). A view body's planning trace records the columns resolved against such a
 	// relation as dependencies (spec/design/views.md §6); every other relation kind records none.
 	base bool
+	// view is the view this relation is a reference to (spec/design/views.md §4), else "". A traced
+	// view body records the columns resolved against it, so re-validation after CREATE OR REPLACE
+	// VIEW can tell whether a dependent binds a column the replacement appended (§8).
+	view string
 }
 
 // resolved is how a column reference resolved against the scope CHAIN (spec/design/grammar.md
@@ -326,9 +330,7 @@ func (s *scope) traceFlat(idx int) {
 	}
 	for _, r := range s.rels {
 		if idx >= r.offset && idx < r.offset+len(r.table.Columns) {
-			if r.base {
-				s.catalog.traceColumn(r.table.Name, idx-r.offset)
-			}
+			s.catalog.traceRelColumn(&r, idx-r.offset)
 			return
 		}
 	}

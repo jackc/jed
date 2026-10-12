@@ -160,7 +160,7 @@ func (p *parser) parseStatement() (statement, error) {
 		if p.atDeferredCreateView() {
 			return statement{}, newError(FeatureNotSupported, "this form of CREATE VIEW is not supported")
 		}
-		if p.peekKeywordAt(1) == "view" {
+		if p.atCreateView() {
 			cv, err := p.parseCreateView()
 			if err != nil {
 				return statement{}, err
@@ -218,9 +218,13 @@ func (p *parser) parseStatement() (statement, error) {
 			}
 			return statement{AlterSequence: as}, nil
 		}
-		// ALTER VIEW is a deferred follow-on (views.md §12).
+		// ALTER VIEW … RENAME (views.md §7.1); its other actions are recognized and refused.
 		if p.peekKeywordAt(1) == "view" {
-			return statement{}, newError(FeatureNotSupported, "ALTER VIEW is not supported")
+			av, err := p.parseAlterView()
+			if err != nil {
+				return statement{}, err
+			}
+			return statement{AlterView: av}, nil
 		}
 		if p.peekKeywordAt(1) == "table" {
 			at, err := p.parseAlterTable()
@@ -270,26 +274,42 @@ func (p *parser) parseStatement() (statement, error) {
 }
 
 // atDeferredCreateView reports whether the statement is one of the deferred `CREATE … VIEW` forms
-// (views.md §12): `CREATE OR REPLACE VIEW`, `CREATE TEMP | TEMPORARY VIEW`, `CREATE RECURSIVE VIEW`,
+// (views.md §12): `CREATE [OR REPLACE] TEMP | TEMPORARY VIEW`, `CREATE [OR REPLACE] RECURSIVE VIEW`,
 // `CREATE MATERIALIZED VIEW`. Recognized by keyword sequence so each fails 0A000, not 42601.
 func (p *parser) atDeferredCreateView() bool {
-	switch p.peekKeywordAt(1) {
-	case "or":
-		return p.peekKeywordAt(2) == "replace" && p.peekKeywordAt(3) == "view"
+	at := 1
+	if p.peekKeywordAt(1) == "or" && p.peekKeywordAt(2) == "replace" {
+		at = 3
+	}
+	switch p.peekKeywordAt(at) {
 	case "temp", "temporary", "recursive", "materialized":
-		return p.peekKeywordAt(2) == "view"
+		return p.peekKeywordAt(at+1) == "view"
 	}
 	return false
 }
 
-// parseCreateView parses `CREATE VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr`
-// (views.md §1, grammar.md §54). The body runs from the token after `AS` to the end of the statement
-// and is captured as its canonical token text. A `WITH ( … )` option list after the name and a
-// trailing `WITH [CASCADED | LOCAL] CHECK OPTION` are deferred forms (0A000); the check option is
-// detected after the body is parsed, so a body syntax error is reported first.
+// atCreateView reports whether the statement is `CREATE [OR REPLACE] VIEW` (views.md §1).
+func (p *parser) atCreateView() bool {
+	return p.peekKeywordAt(1) == "view" ||
+		(p.peekKeywordAt(1) == "or" && p.peekKeywordAt(2) == "replace" && p.peekKeywordAt(3) == "view")
+}
+
+// parseCreateView parses `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS
+// subquery_expr` (views.md §1, grammar.md §54). The body runs from the token after `AS` to the end of
+// the statement and is captured as its canonical token text. A `WITH ( … )` option list after the name
+// and a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` are deferred forms (0A000); the check option is
+// detected after the body is parsed, so a body syntax error is reported first. `OR REPLACE` with `IF
+// NOT EXISTS` is 42601.
 func (p *parser) parseCreateView() (*createView, error) {
 	if err := p.expectKeyword("create"); err != nil {
 		return nil, err
+	}
+	orReplace := p.peekKeyword() == "or"
+	if orReplace {
+		p.advance() // OR
+		if err := p.expectKeyword("replace"); err != nil {
+			return nil, err
+		}
 	}
 	if err := p.expectKeyword("view"); err != nil {
 		return nil, err
@@ -301,6 +321,9 @@ func (p *parser) parseCreateView() (*createView, error) {
 		if ifNotExists, err = p.parseIfNotExists(); err != nil {
 			return nil, err
 		}
+	}
+	if orReplace && ifNotExists {
+		return nil, newError(SyntaxError, "CREATE OR REPLACE VIEW cannot be combined with IF NOT EXISTS")
 	}
 	db, name, err := p.parseQualifiedTableName()
 	if err != nil {
@@ -348,7 +371,62 @@ func (p *parser) parseCreateView() (*createView, error) {
 		return nil, newError(FeatureNotSupported, "WITH CHECK OPTION is not supported")
 	}
 	body := renderTokens(p.tokens[start:end])
-	return &createView{Name: name, DB: db, IfNotExists: ifNotExists, Columns: columns, Body: body}, nil
+	return &createView{Name: name, DB: db, OrReplace: orReplace, IfNotExists: ifNotExists, Columns: columns, Body: body}, nil
+}
+
+// parseAlterView parses `ALTER VIEW [IF EXISTS] [db.]name RENAME { TO new | [COLUMN] old TO new }`
+// (views.md §7.1). The other ALTER VIEW actions (`ALTER [COLUMN]`, `OWNER TO`, `SET …`, `RESET …`) are
+// recognized by their first keyword and refused with 0A000.
+func (p *parser) parseAlterView() (*alterView, error) {
+	if err := p.expectKeyword("alter"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("view"); err != nil {
+		return nil, err
+	}
+	av := &alterView{}
+	if p.peekKeyword() == "if" {
+		p.advance()
+		if err := p.expectKeyword("exists"); err != nil {
+			return nil, err
+		}
+		av.IfExists = true
+	}
+	var err error
+	if av.DB, av.Name, err = p.parseQualifiedTableName(); err != nil {
+		return nil, err
+	}
+	switch p.peekKeyword() {
+	case "rename":
+	case "alter", "owner", "set", "reset":
+		return nil, newError(FeatureNotSupported, "this form of ALTER VIEW is not supported")
+	default:
+		return nil, newError(SyntaxError, "expected RENAME after ALTER VIEW name")
+	}
+	p.advance() // RENAME
+	if p.peekKeyword() == "to" {
+		p.advance()
+		if av.RenameTo, err = p.expectIdentifier(); err != nil {
+			return nil, err
+		}
+		return av, nil
+	}
+	if p.peekKeyword() == "column" {
+		p.advance()
+	}
+	old, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("to"); err != nil {
+		return nil, err
+	}
+	next, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	av.RenameColumn = &renamePair{Old: old, New: next}
+	return av, nil
 }
 
 // trailingCheckOption returns the index of a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` at the

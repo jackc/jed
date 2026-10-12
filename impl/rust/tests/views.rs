@@ -1,8 +1,9 @@
 // Views through the host API (spec/design/views.md). The corpus pins view semantics through the
 // materialized execute path; these per-core tests pin only what it cannot express: a prepared
-// statement over a view never serves a stale plan, the lazy `query()` lanes classify a read of a
-// `nextval` view as a write, function EXECUTE is checked against the reader through a view body,
-// views survive a file commit + reopen, and the dependency-order tooling accessor the CLI dump uses.
+// statement over a view never serves a stale plan (across OR REPLACE and renames too), the lazy
+// `query()` lanes classify a read of a `nextval` view as a write, function EXECUTE is checked
+// against the reader through a view body, views survive a file commit + reopen, and the
+// dependency-order tooling accessor the CLI dump uses.
 
 use jed::value::Value;
 use jed::{CreateOptions, Database, Outcome, Privilege, PrivilegeSet, Session, SessionOptions};
@@ -74,6 +75,45 @@ fn prepared_view_query_never_serves_a_stale_plan() {
             .err()
             .map(|e| e.code().to_string()),
         Some("42P01".to_string())
+    );
+}
+
+/// A prepared statement over a view follows `CREATE OR REPLACE VIEW` and a view rename (views.md
+/// §1.2/§7.1): the replacement's rows come back on the next execution, and a renamed view is gone
+/// under its old name while a view that reads it keeps working.
+#[test]
+fn prepared_view_query_follows_replace_and_rename() {
+    let mut s = mem();
+    exec(&mut s, "CREATE TABLE t (a i32 PRIMARY KEY, b i32)");
+    exec(&mut s, "INSERT INTO t VALUES (1, 10), (2, 20)");
+    exec(&mut s, "CREATE VIEW v AS SELECT a, b FROM t WHERE a = 1");
+    exec(&mut s, "CREATE VIEW w AS SELECT b FROM v");
+    let direct = s.prepare("SELECT b FROM v").unwrap();
+    let through = s.prepare("SELECT b FROM w").unwrap();
+    assert_eq!(drain(&mut s, &direct), vec![vec![Value::Int(10)]]);
+    assert_eq!(drain(&mut s, &through), vec![vec![Value::Int(10)]]);
+
+    exec(
+        &mut s,
+        "CREATE OR REPLACE VIEW v AS SELECT a, b, a + b AS c FROM t WHERE a = 2",
+    );
+    assert_eq!(drain(&mut s, &direct), vec![vec![Value::Int(20)]]);
+    assert_eq!(drain(&mut s, &through), vec![vec![Value::Int(20)]]);
+
+    exec(&mut s, "ALTER VIEW v RENAME TO v2");
+    assert_eq!(
+        s.query_prepared(&direct, &[])
+            .err()
+            .map(|e| e.code().to_string()),
+        Some("42P01".to_string())
+    );
+    assert_eq!(drain(&mut s, &through), vec![vec![Value::Int(20)]]);
+
+    exec(&mut s, "ALTER VIEW v2 RENAME COLUMN b TO bb");
+    assert_eq!(drain(&mut s, &through), vec![vec![Value::Int(20)]]);
+    assert_eq!(
+        rows(&mut s, "SELECT bb FROM v2"),
+        vec![vec![Value::Int(20)]]
     );
 }
 

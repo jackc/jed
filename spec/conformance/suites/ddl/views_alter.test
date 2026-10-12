@@ -1,0 +1,250 @@
+# ALTER VIEW … RENAME TO / RENAME [COLUMN] (spec/design/views.md §7.1, slice V6), and the same
+# ALTER TABLE forms on a view. The views that read the renamed view keep working: a view rename
+# rewrites their FROM items to the new name (keeping the label), and a column rename gives those FROM
+# items a column alias list that keeps the old name visible, so dependents keep their column names
+# (PostgreSQL's behavior, whose views are bound by object id). A missing view is 42P01 unless IF
+# EXISTS; a non-view is 42809; a taken new name is 42P07; RENAME COLUMN of a missing column is 42703
+# and to an existing name 42701. Every record is PostgreSQL-oracle-checked; the rewritten text is
+# pinned by introspection/jed_views_alter.test.
+# requires: ddl.view, ddl.view_alter, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.sequence, ddl.alter_table, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.aggregates, query.table_alias, query.qualified_column, query.cte, query.subquery_scalar, query.subquery_correlated, types.i32, types.text
+
+statement ok
+CREATE TABLE t (a i32 PRIMARY KEY, b text)
+
+statement ok
+INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z')
+
+statement ok
+CREATE VIEW v AS SELECT a, b FROM t
+
+statement ok
+CREATE VIEW w AS SELECT a, v.b FROM v WHERE v.a > 1
+
+statement ok
+CREATE VIEW wx AS SELECT x.b FROM v AS x WHERE x.a = 3
+
+# the inner FROM v is a CTE over the view; the outer FROM v is the CTE
+statement ok
+CREATE VIEW wc AS WITH v AS (SELECT a FROM v WHERE a < 3) SELECT count(*) AS n FROM v
+
+# --- RENAME TO ---------------------------------------------------------------------------------------
+
+statement ok
+ALTER VIEW v RENAME TO v2
+
+statement error 42P01
+SELECT * FROM v
+
+query IT nosort
+SELECT * FROM v2 ORDER BY a
+----
+1
+x
+2
+y
+3
+z
+
+query IT nosort
+SELECT * FROM w ORDER BY a
+----
+2
+y
+3
+z
+
+query T nosort
+SELECT * FROM wx
+----
+z
+
+query I nosort
+SELECT * FROM wc
+----
+2
+
+# the dependency follows the rename
+statement error 2BP01
+DROP VIEW v2
+
+# ALTER TABLE renames a view too
+statement ok
+ALTER TABLE v2 RENAME TO v3
+
+query IT nosort
+SELECT * FROM w ORDER BY a
+----
+2
+y
+3
+z
+
+# --- RENAME COLUMN: the view's output name changes, its dependents keep the old one -----------------
+
+statement ok
+ALTER VIEW v3 RENAME COLUMN a TO aa
+
+query IT nosort
+SELECT aa, b FROM v3 ORDER BY aa
+----
+1
+x
+2
+y
+3
+z
+
+statement error 42703
+SELECT a FROM v3
+
+query IT nosort
+SELECT a, b FROM w ORDER BY a
+----
+2
+y
+3
+z
+
+query T nosort
+SELECT * FROM wx
+----
+z
+
+query I nosort
+SELECT * FROM wc
+----
+2
+
+# COLUMN is optional; ALTER TABLE renames a view's column too
+statement ok
+ALTER VIEW v3 RENAME b TO bb
+
+statement ok
+ALTER TABLE v3 RENAME COLUMN bb TO b3
+
+query IT nosort
+SELECT aa, b3 FROM v3 ORDER BY aa
+----
+1
+x
+2
+y
+3
+z
+
+query IT nosort
+SELECT a, b FROM w ORDER BY a
+----
+2
+y
+3
+z
+
+# a second view rename after column renames
+statement ok
+ALTER VIEW v3 RENAME TO v4
+
+query IT nosort
+SELECT * FROM w ORDER BY a
+----
+2
+y
+3
+z
+
+query T nosort
+SELECT * FROM wx
+----
+z
+
+# a dependent of a dependent is unaffected; a rename of the middle view rewrites the top one
+statement ok
+CREATE VIEW top AS SELECT count(*) AS n FROM w
+
+statement ok
+ALTER VIEW w RENAME TO w2
+
+statement ok
+ALTER VIEW w2 RENAME COLUMN a TO k
+
+query I nosort
+SELECT * FROM top
+----
+2
+
+query IT nosort
+SELECT k, b FROM w2 ORDER BY k
+----
+2
+y
+3
+z
+
+# --- errors ------------------------------------------------------------------------------------------
+
+statement error 42P01
+ALTER VIEW nosuch RENAME TO x
+
+statement error 42P01
+ALTER VIEW nosuch RENAME COLUMN a TO b
+
+statement ok
+ALTER VIEW IF EXISTS nosuch RENAME TO x
+
+statement ok
+ALTER VIEW IF EXISTS nosuch RENAME COLUMN a TO b
+
+# a table is not a view, also under IF EXISTS
+statement error 42809
+ALTER VIEW t RENAME TO t9
+
+statement error 42809
+ALTER VIEW IF EXISTS t RENAME TO t9
+
+statement ok
+CREATE SEQUENCE s
+
+statement error 42809
+ALTER VIEW s RENAME TO s9
+
+# a taken name, the view's own name included
+statement error 42P07
+ALTER VIEW v4 RENAME TO t
+
+statement error 42P07
+ALTER VIEW v4 RENAME TO wx
+
+statement error 42P07
+ALTER VIEW v4 RENAME TO s
+
+statement error 42P07
+ALTER VIEW v4 RENAME TO v4
+
+# a missing column, then a taken column name, the column's own name included
+statement error 42703
+ALTER VIEW v4 RENAME COLUMN nosuch TO z
+
+statement error 42701
+ALTER VIEW v4 RENAME COLUMN aa TO b3
+
+statement error 42701
+ALTER VIEW v4 RENAME COLUMN aa TO aa
+
+query IT nosort
+SELECT aa, b3 FROM v4 ORDER BY aa
+----
+1
+x
+2
+y
+3
+z
+
+statement ok
+DROP VIEW top, wc, wx, w2, v4
+
+statement ok
+DROP SEQUENCE s
+
+statement ok
+DROP TABLE t

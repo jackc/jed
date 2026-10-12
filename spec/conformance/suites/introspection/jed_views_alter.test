@@ -1,0 +1,118 @@
+# The stored view text after CREATE OR REPLACE VIEW and the view renames (spec/design/views.md §1.2,
+# §7.1). A replacement stores its own definition and output columns and leaves every dependent's text
+# alone. ALTER VIEW v RENAME TO replaces the name token of every FROM item in a dependent view that
+# binds v with the quoted new name and, when the item had no alias, inserts `as "<old name>"`; RENAME
+# COLUMN changes the view's stored column list and gives every such item a quoted column alias list
+# covering positions 0..k with the names it exposed before the rename. A FROM item that binds a CTE
+# is never touched. jed-specific, so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# requires: introspect.views, ddl.view, ddl.view_replace, ddl.view_alter, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.alter_table, dml.insert, query.select, query.where_eq, query.order_by, query.table_alias, query.qualified_column, query.qualified_table, query.cte, query.aggregates, types.i32, types.text
+
+statement ok
+CREATE TABLE t (a i32 PRIMARY KEY, b text)
+
+statement ok
+INSERT INTO t VALUES (1, 'x'), (2, 'y')
+
+statement ok
+CREATE VIEW v AS SELECT a, b FROM t
+
+statement ok
+CREATE VIEW w AS SELECT b FROM v WHERE v.a > 1
+
+statement ok
+CREATE VIEW wx AS SELECT x.b FROM v x
+
+statement ok
+CREATE VIEW wm AS SELECT a FROM main.v
+
+statement ok
+CREATE VIEW wcte AS WITH v AS (SELECT a FROM v) SELECT count(*) AS n FROM v
+
+# --- CREATE OR REPLACE VIEW: the view's own entry changes, its dependents' text does not -------------
+
+statement ok
+CREATE OR REPLACE VIEW v (a) AS SELECT * FROM t WHERE a > 0
+
+query TTT nosort
+SELECT name, definition, columns FROM jed_views ORDER BY name
+----
+v
+select "t" . "a" , "t" . "b" from t where a > 0
+{a,b}
+w
+select b from v where v . a > 1
+{b}
+wcte
+with v as ( select a from v ) select count ( * ) as n from v
+{n}
+wm
+select a from main . v
+{a}
+wx
+select x . b from v x
+{b}
+
+# --- RENAME TO -------------------------------------------------------------------------------------
+
+statement ok
+ALTER VIEW v RENAME TO v2
+
+query TT nosort
+SELECT name, definition FROM jed_views ORDER BY name
+----
+v2
+select "t" . "a" , "t" . "b" from t where a > 0
+w
+select b from "v2" as "v" where v . a > 1
+wcte
+with v as ( select a from "v2" as "v" ) select count ( * ) as n from v
+wm
+select a from main . "v2" as "v"
+wx
+select x . b from "v2" x
+
+query T nosort
+SELECT * FROM w
+----
+y
+
+query I nosort
+SELECT * FROM wcte
+----
+2
+
+# --- RENAME COLUMN ---------------------------------------------------------------------------------
+
+statement ok
+ALTER VIEW v2 RENAME COLUMN b TO bb
+
+query TTT nosort
+SELECT name, definition, columns FROM jed_views ORDER BY name
+----
+v2
+select "t" . "a" , "t" . "b" from t where a > 0
+{a,bb}
+w
+select b from "v2" as "v" ( "a" , "b" ) where v . a > 1
+{b}
+wcte
+with v as ( select a from "v2" as "v" ( "a" , "b" ) ) select count ( * ) as n from v
+{n}
+wm
+select a from main . "v2" as "v" ( "a" , "b" )
+{a}
+wx
+select x . b from "v2" x ( "a" , "b" )
+{b}
+
+query T nosort
+SELECT * FROM wx ORDER BY b
+----
+x
+y
+
+statement ok
+DROP VIEW w, wx, wm, wcte, v2
+
+statement ok
+DROP TABLE t

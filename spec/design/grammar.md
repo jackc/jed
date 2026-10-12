@@ -3167,29 +3167,33 @@ with a parenthesized list is `42601`. These words remain non-reserved: they acqu
 only between the parentheses immediately following the leading `EXPLAIN`. The result shape and each
 option's behavior are specified in [explain.md](explain.md).
 
-## 54. `CREATE VIEW` / `DROP VIEW` ([views.md](views.md))
+## 54. `CREATE VIEW` / `DROP VIEW` / `ALTER VIEW` ([views.md](views.md))
 
 ```
-CREATE VIEW [IF NOT EXISTS] [main.]name [( col [, …] )] AS subquery_expr
+CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [main.]name [( col [, …] )] AS subquery_expr
 DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]
+ALTER VIEW [IF EXISTS] [main.]name RENAME TO new_name
+ALTER VIEW [IF EXISTS] [main.]name RENAME [COLUMN] col TO new_col
 ```
 
-`VIEW` is recognized **positionally** after `CREATE` and `DROP` and is not reserved (§3): `CREATE
-TABLE view (…)` names a table `view`, and `SELECT view FROM t` reads a column. The body runs from
-the token after `AS` to the end of the statement and is a `subquery_expr` (an optional `WITH`, then
-a query expression with its own `ORDER BY` / `LIMIT`). Its token sequence is the persisted
-definition, rendered by the closed per-token table of
+`VIEW` is recognized **positionally** after `CREATE`, `CREATE OR REPLACE`, `DROP`, and `ALTER`, and is
+not reserved (§3): `CREATE TABLE view (…)` names a table `view`, and `SELECT view FROM t` reads a
+column. The body runs from the token after `AS` to the end of the statement and is a `subquery_expr`
+(an optional `WITH`, then a query expression with its own `ORDER BY` / `LIMIT`). Its token sequence
+is the persisted definition, rendered by the closed per-token table of
 [../fileformat/format.md](../fileformat/format.md) *Check-expression text*, after the planner has
 frozen every expanded `*` into an explicit, quoted column list ([views.md](views.md) §3/§5). `IF NOT
 EXISTS` (a jed extension) and `IF EXISTS` are two-token lookaheads, so `CREATE VIEW if AS …` creates a
-view named `if`.
+view named `if`. `OR REPLACE` with `IF NOT EXISTS` is `42601`. In `ALTER VIEW … RENAME`, `TO` right after
+`RENAME` selects the view rename, as in `ALTER TABLE … RENAME` ([alter.md](alter.md) §1), so a column
+named `to` is renamed with `RENAME COLUMN to TO x`.
 
-Deferred forms are **recognized** so they fail with `0A000` rather than a syntax error: `CREATE OR
-REPLACE VIEW`, `CREATE TEMP`/`TEMPORARY VIEW`, `CREATE RECURSIVE VIEW`, `CREATE MATERIALIZED VIEW`,
-`CREATE VIEW v WITH ( … )` (view options), a trailing `WITH [CASCADED | LOCAL] CHECK OPTION`, and
-`ALTER VIEW`. Each is detected by its keyword sequence before the body is parsed, except `CHECK
-OPTION`, which is detected after it. Every error code, the validation order, the namespace matrix,
-dependencies, `RENAME` rewrites, and privileges are specified in [views.md](views.md).
+Deferred forms are **recognized** so they fail with `0A000` rather than a syntax error: `CREATE TEMP`/
+`TEMPORARY VIEW`, `CREATE RECURSIVE VIEW`, `CREATE MATERIALIZED VIEW`, `CREATE VIEW v WITH ( … )`
+(view options), a trailing `WITH [CASCADED | LOCAL] CHECK OPTION`, and every `ALTER VIEW` action
+other than `RENAME`. Each is detected by its keyword sequence before the body is parsed, except
+`CHECK OPTION`, which is detected after it. Every error code, the validation order, the namespace
+matrix, dependencies, `RENAME` rewrites, and privileges are specified in [views.md](views.md).
 
 A view reference in `FROM` is the equivalent derived table (§42), so §8's output-name rules, §15's
 labels and column alias lists, and §42's column-rename rules apply to it unchanged.

@@ -863,6 +863,8 @@ var SupportedCapabilities = []string{
 	// View text rewrites for ALTER TABLE RENAME TO / RENAME COLUMN / DROP COLUMN (views.md §7, V2 +
 	// V4).
 	"ddl.view_rename",
+	"ddl.view_replace",
+	"ddl.view_alter",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

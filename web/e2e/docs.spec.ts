@@ -369,6 +369,30 @@ test('the views page rewrites view definitions on RENAME', async ({ page }) => {
   await expect(panel.getByTestId('error-code')).toHaveCount(0);
 });
 
+test('the views page replaces a view and refuses dropping its columns', async ({ page }) => {
+  await page.goto('/docs/sql/views/');
+  // Fifth panel = CREATE OR REPLACE VIEW appending salary and narrowing to eng (views.md §1.2).
+  const panel = page.getByTestId('live-sql').nth(4);
+  await expect(panel.getByTestId('result-rows')).toContainText('9900.00');
+  await expect(panel.getByTestId('result-rows')).not.toContainText('Linus');
+
+  // Dropping an existing column is 42P16.
+  await panel
+    .getByTestId('sql-input')
+    .fill('CREATE OR REPLACE VIEW active_staff AS SELECT id, name FROM employee');
+  await panel.getByTestId('run-button').click();
+  await expect(panel.getByTestId('error-code')).toHaveText('42P16');
+});
+
+test('the views page renames a view and rewrites its dependents', async ({ page }) => {
+  await page.goto('/docs/sql/views/');
+  // Sixth panel = ALTER VIEW RENAME TO + RENAME COLUMN, then jed_views: the dependent view reads the
+  // renamed view under its old label, with a column alias list keeping the old column name (§7.1).
+  const panel = page.getByTestId('live-sql').nth(5);
+  await expect(panel.getByTestId('result-rows')).toContainText('"on_duty" as "active_staff"');
+  await expect(panel.getByTestId('error-code')).toHaveCount(0);
+});
+
 test('the queries API page wires up the idiomatic example for each language', async ({ page }) => {
   await page.goto('/docs/api/queries/');
   // Default (Rust): the rusqlite-style run/query_row methods.

@@ -18,6 +18,7 @@ import type {
   CreateSequence,
   CreateTable,
   CreateType,
+  AlterView,
   CreateView,
   ConflictTarget,
   ColumnDef,
@@ -90,6 +91,7 @@ import {
   type Table,
   type ViewDef,
   type ViewDep,
+  type ViewDepKind,
   columnIndex,
   indexColumnOrdinals,
   indexFirstColumn,
@@ -263,6 +265,7 @@ import {
   alterBreaksView,
   depsEqual,
   freezeStars,
+  notAView,
   renamedBaseTable,
   renamedDeps,
   rewriteViewText,
@@ -3311,6 +3314,9 @@ export class Engine {
       case "dropView":
         rejectParamsForDDL(params);
         return this.executeDropView(stmt);
+      case "alterView":
+        rejectParamsForDDL(params);
+        return this.executeAlterView(stmt);
       case "insert":
         return this.executeInsertCached(
           stmt,
@@ -6554,11 +6560,26 @@ export class Engine {
       }
     const original = snap.table(at.name);
     if (original === undefined) {
-      // A view: its renames are a follow-on (0A000); every other action is the wrong object kind
-      // (42809, views.md §2).
+      // A view: its renames are the view renames (views.md §7.1); every other action is the wrong
+      // object kind (42809, views.md §2).
       if (snap.view(at.name) !== undefined) {
-        if (at.action.kind === "renameTable" || at.action.kind === "renameColumn") {
-          throw engineError("feature_not_supported", "renaming a view is not supported");
+        if (at.action.kind === "renameTable") {
+          return this.executeAlterView({
+            kind: "alterView",
+            name: at.name,
+            db: at.db,
+            ifExists: at.ifExists,
+            action: { kind: "renameTo", newName: at.action.newName },
+          });
+        }
+        if (at.action.kind === "renameColumn") {
+          return this.executeAlterView({
+            kind: "alterView",
+            name: at.name,
+            db: at.db,
+            ifExists: at.ifExists,
+            action: at.action,
+          });
         }
         throw engineError("wrong_object_type", `${at.name} is not a table`);
       }
@@ -6684,7 +6705,7 @@ export class Engine {
           throw engineError("duplicate_table", `relation already exists: ${at.action.newName}`);
         }
         rewriteExprs(undefined, at.action.newName);
-        viewChange = { kind: "renameTable", newName: at.action.newName };
+        viewChange = { kind: "renameRelation", newName: at.action.newName };
         table = { ...table, name: at.action.newName };
         renameTable = true;
         break;
@@ -12877,6 +12898,15 @@ export class Engine {
     this.viewTrace?.addColumn(table, ordinal);
   }
 
+  // traceRelColumn records a column resolved against a FROM relation: a catalog base table's as a
+  // dependency (views.md §6), a view reference's as a view column (§8). Every other relation records
+  // none.
+  traceRelColumn(rel: ScopeRel, ordinal: number): void {
+    if (this.viewTrace === null) return;
+    if (rel.base === true) this.traceColumn(rel.table.name, ordinal);
+    else if (rel.view !== undefined) this.viewTrace.addViewColumn(rel.view, ordinal);
+  }
+
   // traceStar records a written star's expansion (views.md §5).
   traceStar(pos: number, qualified: boolean, cols: [string | null, string][]): void {
     this.viewTrace?.stars.set(pos, { qualified, cols });
@@ -13122,6 +13152,7 @@ export class Engine {
     // 5. Column-list arity, then duplicate final output names, from the body as planned.
     const bodyNames = first.plan.columnNames;
     const bodyTypes = first.plan.columnTypes;
+    const bodyDerivs = queryPlanColumnDerivs(first.plan);
     const columns = viewOutputNames(bodyNames, cv.columns);
     // 6. Freeze every expanded `*` and verify the expanded text plans to the same output.
     let definition = cv.body;
@@ -13158,15 +13189,141 @@ export class Engine {
         }
       }
     }
-    // 8. A taken name.
+    // 8. A taken name: 42P07, or under OR REPLACE the replacement of a view (§1.2) and 42809 for any
+    //    other relation.
+    let replaced: ViewDef | undefined;
     if (this.relationExists(cv.name)) {
-      throw engineError("duplicate_table", `relation "${cv.name}" already exists`);
+      if (!cv.orReplace) {
+        throw engineError("duplicate_table", `relation "${cv.name}" already exists`);
+      }
+      replaced = this.readSnap().view(cv.name);
+      if (replaced === undefined) throw notAView(cv.name);
+      // 9. Column compatibility (42P16), 10. no cycle (42P17).
+      this.checkViewReplacement(replaced, columns, bodyTypes, bodyDerivs);
+      if (this.viewReads(deps, cv.name)) {
+        throw engineError(
+          "invalid_object_definition",
+          `infinite recursion detected in rules for relation "${cv.name}"`,
+        );
+      }
     }
-    // 9. Write the catalog entry; it must fit one catalog page.
+    // 9 (12 under OR REPLACE). Write the catalog entry; it must fit one catalog page.
     const def: ViewDef = { name: cv.name, columns, definition, deps, body, depth };
     this.checkViewEntryFits(def);
     this.working().putView(def);
+    // 11. The views that read a replaced view are re-validated against the replacement (§8).
+    if (replaced !== undefined) this.revalidateAfterReplace(replaced);
     return done;
+  }
+
+  // checkViewReplacement is the CREATE OR REPLACE VIEW column compatibility check (views.md §1.2 step
+  // 9, PostgreSQL's checkViewColumns): no fewer columns, then each existing column keeps its name,
+  // type, and collation, all 42P16. The existing types and collations come from planning the view's
+  // current body; a body that no longer plans compares only the names and the count.
+  private checkViewReplacement(
+    old: ViewDef,
+    names: string[],
+    types: ResolvedType[],
+    derivs: Deriv[],
+  ): void {
+    const invalid = (msg: string): EngineError => engineError("invalid_table_definition", msg);
+    if (names.length < old.columns.length) throw invalid("cannot drop columns from view");
+    let current: QueryPlan | null = null;
+    try {
+      current = this.traceViewBody(old.body).plan;
+    } catch {
+      current = null;
+    }
+    for (let i = 0; i < old.columns.length; i++) {
+      const oldName = old.columns[i]!;
+      if (names[i] !== oldName) {
+        throw invalid(`cannot change name of view column "${oldName}" to "${names[i]}"`);
+      }
+      if (current === null) continue;
+      const oldType = current.columnTypes[i]!;
+      if (!astDeepEqual(oldType, types[i])) {
+        throw invalid(
+          `cannot change data type of view column "${oldName}" from ${rtName(oldType)} to ${rtName(types[i]!)}`,
+        );
+      }
+      const was = this.viewCollation(queryPlanColumnDerivs(current)[i]!);
+      const is = this.viewCollation(derivs[i]!);
+      if (was !== is) {
+        throw invalid(
+          `cannot change collation of view column "${oldName}" from "${was ?? ""}" to "${is ?? ""}"`,
+        );
+      }
+    }
+  }
+
+  // viewCollation is a view output column's collation for the replacement check (views.md §1.2):
+  // the name its derivation carries, the database default for a column that derives none
+  // (PostgreSQL's `default`), and null for an indeterminate one.
+  private viewCollation(d: Deriv): string | null {
+    switch (d.kind) {
+      case "implicit":
+      case "explicit":
+        return d.name;
+      case "none":
+        return this.defaultCollation();
+      default:
+        return null;
+    }
+  }
+
+  // viewReads reports whether a body with dependency list `deps` reads the view `target`, directly
+  // or through other views (the 42P17 cycle check, views.md §1.2 step 10).
+  private viewReads(deps: ViewDep[], target: string): boolean {
+    const snap = this.readSnap();
+    const pending = deps.filter((d) => d.kind === "view").map((d) => d.name);
+    const seen = new Set<string>();
+    while (pending.length > 0) {
+      const name = pending.pop()!;
+      if (name === target) return true;
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const view = snap.view(name);
+      if (view !== undefined) {
+        for (const d of view.deps) if (d.kind === "view") pending.push(d.name);
+      }
+    }
+    return false;
+  }
+
+  // revalidateAfterReplace re-validates the views that read a view `old` just replaced (views.md
+  // §8): every view that reads it, directly or through other views, must plan in name byte order; a
+  // direct dependent must also keep its dependency list and reference no column the replacement
+  // appended.
+  private revalidateAfterReplace(old: ViewDef): void {
+    const snap = this.readSnap();
+    const readers = new Set<string>();
+    const pending = [old.name];
+    while (pending.length > 0) {
+      const name = pending.pop()!;
+      for (const v of snap.viewsDependingOn("view", name)) {
+        if (!readers.has(v.name)) {
+          readers.add(v.name);
+          pending.push(v.name);
+        }
+      }
+    }
+    const breaks = (view: string): EngineError =>
+      viewNotSupported(
+        `cannot replace view ${old.name} because it would change the definition of view ${view}`,
+      );
+    for (const name of [...readers].sort(compareTextC)) {
+      const view = snap.view(name)!;
+      let trace: ViewTrace;
+      try {
+        trace = this.traceViewBody(view.body).trace;
+      } catch {
+        throw breaks(name);
+      }
+      if (!view.deps.some((d) => d.kind === "view" && d.name === old.name)) continue;
+      const ordinals = trace.viewColumns.get(old.name) ?? new Set<number>();
+      const captured = [...ordinals].some((o) => o >= old.columns.length);
+      if (captured || !depsEqual(this.traceDependencies(trace), view.deps)) throw breaks(name);
+    }
   }
 
   // checkViewEntryFits: a view's catalog entry must fit one catalog page (format.md *Catalog*); a
@@ -13352,9 +13509,25 @@ export class Engine {
   // pre-statement catalog to find the FROM items that bind the table; a view that cannot be planned
   // fails the statement (0A000). null when no view depends on the table.
   private prepareViewAlter(table: Table, rewrites: boolean): ViewAlterPlan | null {
-    const dependents = this.readSnap().viewsDependingOn("table", table.name);
+    return this.prepareDependents(
+      "table",
+      table.name,
+      table.columns.map((c) => c.name),
+      rewrites,
+    );
+  }
+
+  // prepareDependents captures the views that depend on the table or view `name` before the
+  // statement that alters it runs (§7/§7.1/§8). null when no view depends on it.
+  private prepareDependents(
+    kind: ViewDepKind,
+    name: string,
+    columns: string[],
+    rewrites: boolean,
+  ): ViewAlterPlan | null {
+    const dependents = this.readSnap().viewsDependingOn(kind, name);
     if (dependents.length === 0) return null;
-    const views: { view: ViewDef; items: TraceItem[] }[] = [];
+    const plan: ViewAlterPlan = { kind, table: name, columns, views: [] };
     for (const view of dependents) {
       let items: TraceItem[] = [];
       if (rewrites) {
@@ -13362,15 +13535,69 @@ export class Engine {
         try {
           trace = this.traceViewBody(view.body).trace;
         } catch {
-          throw alterBreaksView(table.name, view.name);
+          throw alterBreaksView(plan, view.name);
         }
-        items = trace
-          .itemsInOrder()
-          .filter((i) => i.kind === "table" && i.name === table.name);
+        items = trace.itemsInOrder().filter((i) => i.kind === kind && i.name === name);
       }
-      views.push({ view, items });
+      plan.views.push({ view, items });
     }
-    return { table: table.name, columns: table.columns.map((c) => c.name), views };
+    return plan;
+  }
+
+  // executeAlterView runs `ALTER VIEW [IF EXISTS] [main.]v RENAME TO v2` / `RENAME [COLUMN] a TO b`,
+  // and the same ALTER TABLE forms on a view (views.md §7.1). The views that read v are rewritten to
+  // keep binding it, then re-validated (§8).
+  private executeAlterView(av: AlterView): Outcome {
+    const done: Outcome = { kind: "statement", cost: 0n, rowsAffected: null };
+    // 1. The database qualifier (the allow_ddl gate already ran in admission).
+    if (av.db !== undefined && av.db !== "main") {
+      if (av.db === "temp") throw viewNotSupported("temporary views are not supported");
+      if (this.attachReadSnap(av.db) === undefined) {
+        throw engineError("undefined_table", `database "${av.db}" is not attached`);
+      }
+      throw viewNotSupported("views in an attached database are not supported");
+    }
+    // 2. The name: a view, else 42809 for another relation, else 42P01 (IF EXISTS: no-op).
+    const view = this.readSnap().view(av.name);
+    if (view === undefined) {
+      if (isCatalogRelName(av.name) || this.relationExists(av.name)) throw notAView(av.name);
+      if (av.ifExists) return done;
+      throw engineError("undefined_table", `relation "${av.name}" does not exist`);
+    }
+    // 3. The new name or the column.
+    let change: ViewAlterChange;
+    if (av.action.kind === "renameTo") {
+      const next = av.action.newName;
+      checkReservedName("view", next);
+      if (isCatalogRelName(next) || this.relationExists(next)) {
+        throw engineError("duplicate_table", `relation "${next}" already exists`);
+      }
+      change = { kind: "renameRelation", newName: next };
+    } else {
+      const { oldName, newName } = av.action;
+      const ordinal = view.columns.indexOf(oldName);
+      if (ordinal < 0) throw engineError("undefined_column", `column "${oldName}" does not exist`);
+      if (view.columns.includes(newName)) {
+        throw engineError(
+          "duplicate_column",
+          `column "${newName}" of relation "${view.name}" already exists`,
+        );
+      }
+      change = { kind: "renameColumn", ordinal, newName };
+    }
+    // 4. Capture the dependents against the pre-statement catalog, rename, then rewrite and
+    //    re-validate them (5).
+    const plan = this.prepareDependents("view", view.name, view.columns.slice(), true);
+    const renamed: ViewDef = { ...view, columns: view.columns.slice() };
+    if (change.kind === "renameRelation") {
+      this.working().removeView(view.name);
+      renamed.name = change.newName;
+    } else if (change.kind === "renameColumn") {
+      renamed.columns[change.ordinal] = change.newName;
+    }
+    this.working().putView(renamed);
+    if (plan !== null) this.finishViewAlter(plan, change);
+    return done;
   }
 
   // finishViewAlter runs after an ALTER TABLE changed the working catalog: rewrite each dependent
@@ -13389,7 +13616,7 @@ export class Engine {
       try {
         ({ body, depth } = parseViewDefinition(definition));
       } catch {
-        throw alterBreaksView(plan.table, view.name);
+        throw alterBreaksView(plan, view.name);
       }
       if (definition !== view.definition || !depsEqual(expected, view.deps)) {
         const updated: ViewDef = {
@@ -13410,10 +13637,10 @@ export class Engine {
       try {
         trace = this.traceViewBody(body).trace;
       } catch {
-        throw alterBreaksView(plan.table, name);
+        throw alterBreaksView(plan, name);
       }
       if (!depsEqual(this.traceDependencies(trace), expected)) {
-        throw alterBreaksView(plan.table, name);
+        throw alterBreaksView(plan, name);
       }
     }
   }
@@ -14066,7 +14293,15 @@ export class Engine {
         }
         seenLabels.add(l);
       }
-      rels.push({ label, table: t, offset, cte: cteIdx, db: tref.db, base });
+      rels.push({
+        label,
+        table: t,
+        offset,
+        cte: cteIdx,
+        db: tref.db,
+        base,
+        view: viewItems[i]?.viewName,
+      });
       srfPlans.push(srf);
       derivedPlans.push(derived);
       lateralFlags.push(lateral);
@@ -14170,7 +14405,7 @@ export class Engine {
               `column "${name}" specified in USING clause does not exist in right table`,
             );
           }
-          if (rightRel.base === true) this.traceColumn(rightRel.table.name, rl);
+          this.traceRelColumn(rightRel, rl);
           const ri = rightRel.offset + rl;
           const lq = "\u0000l" + n;
           const rq = "\u0000r" + n;
@@ -32441,6 +32676,10 @@ export type ScopeRel = {
   // grammar.md §15). A view body's planning trace records the columns resolved against such a
   // relation as dependencies (spec/design/views.md §6); every other relation kind records none.
   base?: boolean;
+  // view is the view this relation is a reference to (spec/design/views.md §4), else undefined. A
+  // traced view body records the columns resolved against it, so re-validation after CREATE OR
+  // REPLACE VIEW can tell whether a dependent binds a column the replacement appended (§8).
+  view?: string;
 };
 
 // Resolved is how a column reference resolved against the scope CHAIN (spec/design/grammar.md

@@ -3,9 +3,10 @@
 # Views — the jed-specific behavior of spec/design/views.md that PostgreSQL cannot oracle-check:
 # the IF NOT EXISTS extension, the jed_ reservation, 55000 on writes to views PostgreSQL would
 # update, 0A000 for the deferred forms, temp scope, untracked dependencies, CASCADE to a view,
-# re-validation after ALTER TABLE (§8), the session privilege envelope (§9), and transactions.
+# re-validation after ALTER TABLE, CREATE OR REPLACE VIEW, and ALTER VIEW (§8), the cycle check and
+# typmod rule of OR REPLACE (§1.2), the session privilege envelope (§9), and transactions.
 # CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
-# requires: ddl.view, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.alter_table, ddl.sequence, ddl.temp_table, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.insert_on_conflict, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.aggregates, query.subquery_scalar, query.subquery_correlated, query.derived_table, query.cte, query.cte_recursive, query.cte_data_modifying, types.i32, types.i64, types.text, session.privileges, session.allow_ddl, session.allow_temp_ddl, txn.explicit, txn.read_only
+# requires: ddl.view, ddl.view_replace, ddl.view_alter, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.alter_table, ddl.sequence, ddl.temp_table, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.insert_on_conflict, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.aggregates, query.subquery_scalar, query.subquery_correlated, query.derived_table, query.cte, query.cte_recursive, query.cte_data_modifying, types.i32, types.i64, types.text, types.decimal, types.varchar_length, types.composite, cast.operator, session.privileges, session.allow_ddl, session.allow_temp_ddl, txn.explicit, txn.read_only
 
 statement ok
 CREATE TABLE t (a i32 PRIMARY KEY, b text)
@@ -98,9 +99,6 @@ y
 # --- deferred forms are recognized and refused with 0A000 -------------------------------------------
 
 statement error 0A000
-CREATE OR REPLACE VIEW v AS SELECT a FROM t
-
-statement error 0A000
 CREATE TEMP VIEW tv AS SELECT a FROM t
 
 statement error 0A000
@@ -125,16 +123,60 @@ statement error 0A000
 CREATE VIEW cv AS SELECT a FROM t WITH CASCADED CHECK OPTION
 
 statement error 0A000
-ALTER VIEW v RENAME TO v9
+CREATE OR REPLACE TEMP VIEW tv AS SELECT a FROM t
+
+# ALTER VIEW actions other than RENAME
+statement error 0A000
+ALTER VIEW v ALTER COLUMN a SET DEFAULT 1
 
 statement error 0A000
-ALTER TABLE v RENAME TO v9
+ALTER VIEW v ALTER a DROP DEFAULT
 
 statement error 0A000
-ALTER TABLE v RENAME COLUMN a TO a9
+ALTER VIEW v OWNER TO someone
+
+statement error 0A000
+ALTER VIEW v SET SCHEMA public
+
+statement error 0A000
+ALTER VIEW v SET (security_barrier = true)
+
+statement error 0A000
+ALTER VIEW v RESET (security_barrier)
 
 statement error 42P01
 SELECT * FROM cv
+
+# OR REPLACE and IF NOT EXISTS disagree about a taken name: a syntax error
+statement error 42601
+CREATE OR REPLACE VIEW IF NOT EXISTS v AS SELECT a FROM t
+
+# ALTER VIEW names views only: a table's column is not renamed through it (PostgreSQL renames it)
+statement error 42809
+ALTER VIEW t RENAME COLUMN a TO a9
+
+statement error 42809
+ALTER VIEW IF EXISTS t RENAME COLUMN a TO a9
+
+# the jed_ reservation applies to a view rename
+statement error 42939
+ALTER VIEW v RENAME TO jed_v
+
+# a qualifier other than main
+statement error 0A000
+ALTER VIEW temp.v RENAME TO v9
+
+statement error 42P01
+ALTER VIEW nosuchdb.v RENAME TO v9
+
+statement error 0A000
+CREATE OR REPLACE VIEW temp.v AS SELECT a, b FROM t
+
+statement ok
+ALTER VIEW main.v RENAME TO v9
+
+statement ok
+ALTER VIEW v9 RENAME TO v
 
 # a qualifier other than main
 statement ok
@@ -324,6 +366,183 @@ DROP VIEW cap, amb
 statement ok
 ALTER TABLE q ADD COLUMN x i32
 
+# --- re-validation after CREATE OR REPLACE VIEW (§8): an appended column may not capture ------------
+
+statement ok
+CREATE TABLE p2 (k i32 PRIMARY KEY, x i32)
+
+statement ok
+CREATE TABLE q2 (k i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO p2 VALUES (1, 1), (2, 5)
+
+statement ok
+INSERT INTO q2 VALUES (1), (2), (3)
+
+statement ok
+CREATE VIEW rv AS SELECT k FROM q2
+
+# `x` inside the subquery is p2.x (rv has no x). The body also reads p2.x directly, so a capture
+# leaves the dependency list unchanged and only the appended-column check can catch it.
+statement ok
+CREATE VIEW rcap AS SELECT k, x AS px, (SELECT count(*) FROM rv WHERE rv.k <= x) AS n FROM p2
+
+query III nosort
+SELECT * FROM rcap ORDER BY k
+----
+1
+1
+1
+2
+5
+3
+
+# appending rv.x would capture it: refused, and nothing changes (PostgreSQL accepts; its rcap stays
+# bound to p2.x)
+statement error 0A000
+CREATE OR REPLACE VIEW rv AS SELECT k, k AS x FROM q2
+
+query III nosort
+SELECT * FROM rcap ORDER BY k
+----
+1
+1
+1
+2
+5
+3
+
+# a bare `x` read beside rv would become ambiguous
+statement ok
+CREATE VIEW ramb AS SELECT x FROM p2 JOIN rv ON p2.k = rv.k
+
+statement error 0A000
+CREATE OR REPLACE VIEW rv AS SELECT k, k AS x FROM q2
+
+# a column that captures nothing is fine
+statement ok
+CREATE OR REPLACE VIEW rv AS SELECT k, 1 AS y FROM q2
+
+query III nosort
+SELECT * FROM rcap ORDER BY k
+----
+1
+1
+1
+2
+5
+3
+
+# --- a view that would read itself is 42P17 at definition (PostgreSQL fails each use instead) ------
+
+statement error 42P17
+CREATE OR REPLACE VIEW rv AS SELECT k, y FROM rv
+
+statement ok
+CREATE VIEW rv2 AS SELECT k FROM rv
+
+statement error 42P17
+CREATE OR REPLACE VIEW rv AS SELECT k, 1 AS y FROM rv2
+
+query II nosort
+SELECT * FROM rv ORDER BY k
+----
+1
+1
+2
+1
+3
+1
+
+# --- a view rename that a dependent's CTE would capture is refused ---------------------------------
+
+statement ok
+CREATE VIEW rcte AS WITH rv9 AS (SELECT 1 AS k) SELECT rv.k FROM rv, rv9 WHERE rv.k = rv9.k
+
+statement error 0A000
+ALTER VIEW rv RENAME TO rv9
+
+statement ok
+ALTER VIEW rv RENAME TO rv8
+
+query I nosort
+SELECT * FROM rcte
+----
+1
+
+statement ok
+DROP VIEW rcte, rv2, ramb, rcap, rv8
+
+statement ok
+DROP TABLE p2, q2
+
+# --- typmods are not part of a view column's type (PostgreSQL refuses these with 42P16) -----------
+
+statement ok
+CREATE TABLE tm (k i32 PRIMARY KEY, d varchar(3), n decimal(5,2))
+
+statement ok
+CREATE VIEW vtm AS SELECT d, n FROM tm
+
+statement ok
+CREATE OR REPLACE VIEW vtm AS SELECT d::varchar(4) AS d, n::decimal(6,2) AS n FROM tm
+
+statement ok
+CREATE OR REPLACE VIEW vtm AS SELECT d::text AS d, n FROM tm
+
+statement error 42P16
+CREATE OR REPLACE VIEW vtm AS SELECT d, n::i64 AS n FROM tm
+
+# a projected bare integer literal is i64 (types.md §6), so it cannot replace an i32 column
+# (PostgreSQL types it int4 and accepts)
+statement ok
+CREATE VIEW vlit AS SELECT k FROM tm
+
+statement error 42P16
+CREATE OR REPLACE VIEW vlit AS SELECT 0 AS k FROM tm
+
+statement ok
+CREATE OR REPLACE VIEW vlit AS SELECT 0::i32 AS k FROM tm
+
+statement ok
+DROP VIEW vlit
+
+statement ok
+DROP VIEW vtm
+
+statement ok
+DROP TABLE tm
+
+# --- a broken view (an untracked dependency was dropped) can be repaired by replacing it -----------
+
+statement ok
+CREATE TYPE pair AS (x i32, y i32)
+
+statement ok
+CREATE VIEW vbroken AS SELECT ('(1,2)'::pair).x AS n
+
+statement ok
+DROP TYPE pair
+
+statement error 42704
+SELECT * FROM vbroken
+
+# only the names and the count are compared: the type may differ from the broken body's
+statement ok
+CREATE OR REPLACE VIEW vbroken AS SELECT 'fixed' AS n
+
+query T nosort
+SELECT * FROM vbroken
+----
+fixed
+
+statement error 42P16
+CREATE OR REPLACE VIEW vbroken AS SELECT 'x' AS m
+
+statement ok
+DROP VIEW vbroken
+
 # --- transactions: CREATE / DROP VIEW roll back --------------------------------------------------
 
 statement ok
@@ -366,6 +585,54 @@ CREATE VIEW rov AS SELECT a FROM t
 statement ok
 ROLLBACK
 
+# CREATE OR REPLACE and ALTER VIEW roll back too
+statement ok
+BEGIN
+
+statement ok
+CREATE OR REPLACE VIEW vn AS SELECT a, 'extra' AS e FROM t WHERE a = 2
+
+statement ok
+ALTER VIEW vn RENAME TO vn2
+
+statement ok
+ALTER VIEW vn2 RENAME COLUMN a TO aa
+
+query IT nosort
+SELECT * FROM vn2
+----
+2
+extra
+
+statement ok
+ROLLBACK
+
+statement error 42P01
+SELECT * FROM vn2
+
+query I nosort
+SELECT * FROM vn
+----
+2
+
+statement ok
+BEGIN READ ONLY
+
+statement error 25006
+CREATE OR REPLACE VIEW vn AS SELECT a FROM t
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN READ ONLY
+
+statement error 25006
+ALTER VIEW vn RENAME TO vn2
+
+statement ok
+ROLLBACK
+
 # --- privileges (§9): CREATE needs allow_ddl + SELECT on what the body reads; reading needs only
 # SELECT on the view ---------------------------------------------------------------------------------
 
@@ -376,6 +643,19 @@ CREATE VIEW pv AS SELECT a FROM t
 # allow_ddl: off
 statement error 42501
 DROP VIEW vn
+
+# allow_ddl: off
+statement error 42501
+CREATE OR REPLACE VIEW vn AS SELECT a FROM t WHERE a = 2
+
+# allow_ddl: off
+statement error 42501
+ALTER VIEW vn RENAME TO vn2
+
+# OR REPLACE checks SELECT on what the new body reads
+# default_privileges: NONE
+statement error 42501
+CREATE OR REPLACE VIEW vn AS SELECT a FROM t WHERE a = 2
 
 # default_privileges: NONE
 statement error 42501

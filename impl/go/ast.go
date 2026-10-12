@@ -18,9 +18,10 @@ type statement struct {
 	CreateSequence *createSequence
 	AlterSequence  *alterSequence
 	DropSequence   *dropSequence
-	// CreateView/DropView are the view DDL statements (spec/design/views.md §1).
+	// CreateView/DropView/AlterView are the view DDL statements (spec/design/views.md §1, §7.1).
 	CreateView *createView
 	DropView   *dropView
+	AlterView  *alterView
 	Insert     *insert
 	Select     *selectStmt
 	// SetOp is a set operation (UNION/INTERSECT/EXCEPT) combining two query expressions
@@ -448,9 +449,20 @@ type dropSequence struct {
 type createView struct {
 	Name        string
 	DB          *string
+	OrReplace   bool
 	IfNotExists bool
 	Columns     []string // nil = no column list
 	Body        string
+}
+
+// alterView is `ALTER VIEW [IF EXISTS] [db.]name RENAME …` (spec/design/views.md §7.1): exactly one of
+// RenameTo / RenameColumn is set. `ALTER TABLE v RENAME …` on a view executes the same rename.
+type alterView struct {
+	Name         string
+	DB           *string
+	IfExists     bool
+	RenameTo     string
+	RenameColumn *renamePair
 }
 
 // dropView is `DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]` (spec/design/views.md §1). Each

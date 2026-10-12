@@ -21,6 +21,8 @@ pub enum Statement {
     CreateView(CreateView),
     /// `DROP VIEW` (spec/design/views.md §1).
     DropView(DropView),
+    /// `ALTER VIEW … RENAME` (spec/design/views.md §7.1).
+    AlterView(AlterView),
     Insert(Insert),
     Select(Select),
     /// A set operation (`UNION`/`INTERSECT`/`EXCEPT`) combining two query expressions
@@ -419,14 +421,16 @@ pub struct DropSequence {
     pub if_exists: bool,
 }
 
-/// `CREATE VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr` (spec/design/views.md §1,
-/// grammar.md §54). `body` is the canonical token text of the body (format.md *Check-expression
-/// text*) — the definition before `*` freezing; the executor parses it again on its own, so every
-/// token position the planner trace records is relative to the stored text.
+/// `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS subquery_expr`
+/// (spec/design/views.md §1/§1.2, grammar.md §54). `body` is the canonical token text of the body
+/// (format.md *Check-expression text*) — the definition before `*` freezing; the executor parses it
+/// again on its own, so every token position the planner trace records is relative to the stored
+/// text.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CreateView {
     pub name: String,
     pub db: Option<String>,
+    pub or_replace: bool,
     pub if_not_exists: bool,
     pub columns: Option<Vec<String>>,
     pub body: String,
@@ -440,6 +444,24 @@ pub struct DropView {
     pub names: Vec<(Option<String>, String)>,
     pub if_exists: bool,
     pub cascade: bool,
+}
+
+/// `ALTER VIEW [IF EXISTS] [db.]name RENAME …` (spec/design/views.md §7.1). `ALTER TABLE v RENAME …`
+/// on a view executes the same rename.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AlterView {
+    pub name: String,
+    pub db: Option<String>,
+    pub if_exists: bool,
+    pub action: AlterViewAction,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum AlterViewAction {
+    /// `RENAME TO new`.
+    RenameTo(String),
+    /// `RENAME [COLUMN] old TO new`.
+    RenameColumn { old: String, new: String },
 }
 
 /// `ALTER SEQUENCE [IF EXISTS] <name> <action>` (spec/design/sequences.md §4/§15). A missing

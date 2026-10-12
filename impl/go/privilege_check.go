@@ -25,7 +25,7 @@ func stmtIsWrite(stmt statement) bool {
 		stmt.CreateIndex != nil || stmt.DropIndex != nil ||
 		stmt.CreateType != nil || stmt.DropType != nil ||
 		stmt.CreateSequence != nil || stmt.AlterSequence != nil || stmt.DropSequence != nil ||
-		stmt.CreateView != nil || stmt.DropView != nil ||
+		stmt.CreateView != nil || stmt.DropView != nil || stmt.AlterView != nil ||
 		stmt.Insert != nil || stmt.Update != nil || stmt.Delete != nil {
 		return true
 	}
@@ -595,7 +595,7 @@ func collectStmtPrivs(stmt statement, req *privReq) {
 		req.isTempDDL = stmt.CreateTable.Temp
 	case stmt.DropTable != nil, stmt.AlterTable != nil, stmt.CreateIndex != nil, stmt.DropIndex != nil,
 		stmt.CreateType != nil, stmt.DropType != nil, stmt.CreateSequence != nil, stmt.DropSequence != nil,
-		stmt.AlterSequence != nil, stmt.CreateView != nil, stmt.DropView != nil:
+		stmt.AlterSequence != nil, stmt.CreateView != nil, stmt.DropView != nil, stmt.AlterView != nil:
 		req.isDDL = true
 	case stmt.Insert != nil:
 		collectInsertPrivs(stmt.Insert, req, locals)

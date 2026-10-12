@@ -1,0 +1,257 @@
+# CREATE OR REPLACE VIEW (spec/design/views.md §1.2, slice V5). A replacement keeps the view's
+# existing output columns (same names, types, and collations, in order) and may append new ones; the
+# views that read it keep working and see the new definition. Incompatible columns are 42P16 in
+# PostgreSQL's order (fewer columns, then per column name, type, collation); a non-view name is
+# 42809; body errors come first. Every record is PostgreSQL-oracle-checked; the jed-only behavior
+# (capture refusal, the cycle check, typmods) is in views_jed.test.
+# requires: ddl.view, ddl.view_replace, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.sequence, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.aggregates, query.qualified_column, cast.operator, query.derived_table, types.i32, types.i64, types.text
+
+statement ok
+CREATE TABLE t (a i32 PRIMARY KEY, b text, c i32)
+
+statement ok
+INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20), (3, 'z', 30)
+
+# OR REPLACE of a name that is not taken creates the view
+statement ok
+CREATE OR REPLACE VIEW v AS SELECT a, b FROM t WHERE a < 3
+
+query IT nosort
+SELECT * FROM v ORDER BY a
+----
+1
+x
+2
+y
+
+statement ok
+CREATE VIEW w AS SELECT v.a, v.b FROM v WHERE v.a > 1
+
+# --- a compatible replacement: same columns, a new body ---------------------------------------------
+
+statement ok
+CREATE OR REPLACE VIEW v AS SELECT a, b FROM t WHERE a > 1
+
+query IT nosort
+SELECT * FROM v ORDER BY a
+----
+2
+y
+3
+z
+
+# the dependent view reads the new definition
+query IT nosort
+SELECT * FROM w ORDER BY a
+----
+2
+y
+3
+z
+
+# --- appended columns -------------------------------------------------------------------------------
+
+statement ok
+CREATE OR REPLACE VIEW v AS SELECT a, b, c, c * 2 AS d FROM t WHERE a > 1
+
+query ITII nosort
+SELECT * FROM v ORDER BY a
+----
+2
+y
+20
+40
+3
+z
+30
+60
+
+query IT nosort
+SELECT * FROM w ORDER BY a
+----
+2
+y
+3
+z
+
+# the column list names the output; a shorter list is a partial rename
+statement ok
+CREATE OR REPLACE VIEW v (a, b, c) AS SELECT a, b, c, c + 1 AS d FROM t
+
+query ITII nosort
+SELECT a, b, c, d FROM v ORDER BY a
+----
+1
+x
+10
+11
+2
+y
+20
+21
+3
+z
+30
+31
+
+# --- incompatible replacements are 42P16, and nothing changes ---------------------------------------
+
+# fewer columns
+statement error 42P16
+CREATE OR REPLACE VIEW v AS SELECT a, b, c FROM t
+
+# a renamed column
+statement error 42P16
+CREATE OR REPLACE VIEW v AS SELECT a, b AS bb, c, 1 AS d FROM t
+
+# reordered columns are renamed columns
+statement error 42P16
+CREATE OR REPLACE VIEW v AS SELECT b, a, c, d FROM (SELECT a, b, c, 1 AS d FROM t) s
+
+# the column list cannot rename either
+statement error 42P16
+CREATE OR REPLACE VIEW v (a, b, z) AS SELECT a, b, c, 1 AS d FROM t
+
+# a changed type
+statement error 42P16
+CREATE OR REPLACE VIEW v AS SELECT a, b, c::i64 AS c, 1 AS d FROM t
+
+statement error 42P16
+CREATE OR REPLACE VIEW v AS SELECT a, b, 'q' AS c, 1 AS d FROM t
+
+# a duplicate appended name
+statement error 42701
+CREATE OR REPLACE VIEW v AS SELECT a, b, c, 1 AS d, 2 AS e, 3 AS e FROM t
+
+query ITII nosort
+SELECT a, b, c, d FROM v ORDER BY a
+----
+1
+x
+10
+11
+2
+y
+20
+21
+3
+z
+30
+31
+
+# --- body errors come before the name's kind or the column check -------------------------------------
+
+statement error 42P01
+CREATE OR REPLACE VIEW v AS SELECT * FROM nosuch
+
+statement error 42703
+CREATE OR REPLACE VIEW v AS SELECT nosuch FROM t
+
+statement error 42P01
+CREATE OR REPLACE VIEW t AS SELECT * FROM nosuch
+
+# --- a name that is not a view is 42809 ---------------------------------------------------------------
+
+statement error 42809
+CREATE OR REPLACE VIEW t AS SELECT 1 AS a
+
+statement ok
+CREATE SEQUENCE s
+
+statement error 42809
+CREATE OR REPLACE VIEW s AS SELECT 1 AS a
+
+statement ok
+CREATE INDEX ti ON t (c)
+
+statement error 42809
+CREATE OR REPLACE VIEW ti AS SELECT 1 AS a
+
+# --- the replacement may read other views, and other views keep reading it ---------------------------
+
+statement ok
+CREATE VIEW base AS SELECT a, c FROM t
+
+statement ok
+CREATE OR REPLACE VIEW v AS SELECT t.a, t.b, base.c, base.c - 1 AS d FROM t JOIN base ON t.a = base.a
+
+query ITII nosort
+SELECT a, b, c, d FROM v ORDER BY a
+----
+1
+x
+10
+9
+2
+y
+20
+19
+3
+z
+30
+29
+
+query IT nosort
+SELECT * FROM w ORDER BY a
+----
+2
+y
+3
+z
+
+# the new body's dependency on base is enforced; the old dependency on t still is
+statement error 2BP01
+DROP VIEW base
+
+statement error 2BP01
+DROP TABLE t
+
+# replacing it again releases base
+statement ok
+CREATE OR REPLACE VIEW v AS SELECT a, b, c, 0::i32 AS d FROM t
+
+statement ok
+DROP VIEW base
+
+query ITII nosort
+SELECT a, b, c, d FROM v ORDER BY a
+----
+1
+x
+10
+0
+2
+y
+20
+0
+3
+z
+30
+0
+
+# --- a chain: replacing the middle view changes what the top view reads ------------------------------
+
+statement ok
+CREATE VIEW top AS SELECT count(*) AS n FROM w
+
+query I nosort
+SELECT * FROM top
+----
+2
+
+statement ok
+CREATE OR REPLACE VIEW w AS SELECT v.a, v.b FROM v
+
+query I nosort
+SELECT * FROM top
+----
+3
+
+statement ok
+DROP VIEW top, w, v
+
+statement ok
+DROP SEQUENCE s
+
+statement ok
+DROP TABLE t

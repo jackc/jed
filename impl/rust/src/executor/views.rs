@@ -35,6 +35,9 @@ pub(crate) struct ViewTrace {
     pub(crate) catalog_rels: BTreeSet<String>,
     /// Every referenced base-table column, as `(table name, column ordinal)`.
     pub(crate) columns: BTreeSet<(String, usize)>,
+    /// Every referenced column of a view, as `(view name, column ordinal)`. Not a persisted
+    /// dependency (§6): re-validation after `CREATE OR REPLACE VIEW` reads it (§8).
+    pub(crate) view_columns: BTreeSet<(String, usize)>,
     /// Each written star's expansion, keyed by its token position.
     pub(crate) stars: BTreeMap<usize, TraceStar>,
 }
@@ -108,6 +111,18 @@ impl Engine {
     pub(crate) fn trace_column(&self, table: &str, ordinal: usize) {
         if let Some(trace) = self.view_trace.borrow_mut().as_mut() {
             trace.columns.insert((table.to_string(), ordinal));
+        }
+    }
+
+    /// Record a column resolved against a FROM relation: a catalog base table's as a dependency
+    /// (views.md §6), a view reference's as a view column (§8). Every other relation records none.
+    pub(crate) fn trace_rel_column(&self, rel: &ScopeRel, ordinal: usize) {
+        if rel.base {
+            self.trace_column(&rel.table.name, ordinal);
+        } else if let Some(view) = &rel.view
+            && let Some(trace) = self.view_trace.borrow_mut().as_mut()
+        {
+            trace.view_columns.insert((view.clone(), ordinal));
         }
     }
 
@@ -488,6 +503,7 @@ impl Engine {
         // 5. Column-list arity, then duplicate final output names, from the body as planned.
         let body_names = plan.column_names().to_vec();
         let body_types = plan.column_types().to_vec();
+        let body_derivs = plan.column_derivs().to_vec();
         let columns = view_output_names(&body_names, cv.columns.as_deref())?;
         // 6. Freeze every expanded `*` and verify the expanded text plans to the same output.
         let (definition, body, depth, trace) = if trace.stars.is_empty() {
@@ -529,14 +545,34 @@ impl Engine {
                 }
             }
         }
-        // 8. A taken name.
-        if self.relation_exists(&cv.name) {
-            return Err(EngineError::new(
-                SqlState::DuplicateTable,
-                format!("relation \"{}\" already exists", cv.name),
-            ));
-        }
-        // 9. Write the catalog entry; it must fit one catalog page.
+        // 8. A taken name: 42P07, or under OR REPLACE the replacement of a view (§1.2) and 42809
+        //    for any other relation.
+        let replaced = if self.relation_exists(&cv.name) {
+            if !cv.or_replace {
+                return Err(EngineError::new(
+                    SqlState::DuplicateTable,
+                    format!("relation \"{}\" already exists", cv.name),
+                ));
+            }
+            let Some(old) = self.read_snap().view(&cv.name).cloned() else {
+                return Err(not_a_view(&cv.name));
+            };
+            // 9. Column compatibility (42P16), 10. no cycle (42P17).
+            self.check_view_replacement(&old, &columns, &body_types, &body_derivs)?;
+            if self.view_reads(&deps, &cv.name) {
+                return Err(EngineError::new(
+                    SqlState::InvalidObjectDefinition,
+                    format!(
+                        "infinite recursion detected in rules for relation \"{}\"",
+                        cv.name
+                    ),
+                ));
+            }
+            Some(old)
+        } else {
+            None
+        };
+        // 9 (12 under OR REPLACE). Write the catalog entry; it must fit one catalog page.
         let def = ViewDef {
             name: cv.name.clone(),
             columns,
@@ -547,10 +583,148 @@ impl Engine {
         };
         self.check_view_entry_fits(&def)?;
         self.working_mut().put_view(def);
+        // 11. The views that read a replaced view are re-validated against the replacement (§8).
+        if let Some(old) = replaced {
+            self.revalidate_after_replace(&old)?;
+        }
         Ok(Outcome::Statement {
             cost: 0,
             rows_affected: None,
         })
+    }
+
+    /// `CREATE OR REPLACE VIEW` column compatibility (views.md §1.2 step 9, PostgreSQL's
+    /// checkViewColumns): no fewer columns, then each existing column keeps its name, type, and
+    /// collation, all 42P16. The existing types and collations come from planning the view's
+    /// current body; a body that no longer plans compares only the names and the count.
+    fn check_view_replacement(
+        &self,
+        old: &ViewDef,
+        names: &[String],
+        types: &[ResolvedType],
+        derivs: &[Deriv],
+    ) -> Result<()> {
+        let invalid = |msg: String| EngineError::new(SqlState::InvalidTableDefinition, msg);
+        if names.len() < old.columns.len() {
+            return Err(invalid("cannot drop columns from view".to_string()));
+        }
+        let current = self
+            .trace_view_body(&old.body)
+            .ok()
+            .map(|(plan, _)| (plan.column_types().to_vec(), plan.column_derivs().to_vec()));
+        for (i, old_name) in old.columns.iter().enumerate() {
+            if names[i] != *old_name {
+                return Err(invalid(format!(
+                    "cannot change name of view column \"{old_name}\" to \"{}\"",
+                    names[i]
+                )));
+            }
+            let Some((old_types, old_derivs)) = &current else {
+                continue;
+            };
+            if old_types[i] != types[i] {
+                return Err(invalid(format!(
+                    "cannot change data type of view column \"{old_name}\" from {} to {}",
+                    old_types[i].type_name(),
+                    types[i].type_name()
+                )));
+            }
+            let (was, is) = (
+                self.view_collation(&old_derivs[i]),
+                self.view_collation(&derivs[i]),
+            );
+            if was != is {
+                return Err(invalid(format!(
+                    "cannot change collation of view column \"{old_name}\" from \"{}\" to \"{}\"",
+                    was.unwrap_or_default(),
+                    is.unwrap_or_default()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// A view output column's collation for the replacement check (views.md §1.2): the name its
+    /// derivation carries, the database default for a column that derives none (PostgreSQL's
+    /// `default`), and `None` for an indeterminate one.
+    fn view_collation(&self, d: &Deriv) -> Option<String> {
+        match d {
+            Deriv::Implicit(n) | Deriv::Explicit(n) => Some(n.clone()),
+            Deriv::None => Some(self.default_collation()),
+            Deriv::Indeterminate | Deriv::Conflicted => None,
+        }
+    }
+
+    /// Whether a body with dependency list `deps` reads the view `target`, directly or through
+    /// other views (the 42P17 cycle check, views.md §1.2 step 10).
+    fn view_reads(&self, deps: &[ViewDep], target: &str) -> bool {
+        let snap = self.read_snap();
+        let mut pending: Vec<&str> = deps
+            .iter()
+            .filter(|d| d.kind == ViewDepKind::View)
+            .map(|d| d.name.as_str())
+            .collect();
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(name) = pending.pop() {
+            if name == target {
+                return true;
+            }
+            if !seen.insert(name) {
+                continue;
+            }
+            if let Some(view) = snap.view(name) {
+                pending.extend(
+                    view.deps
+                        .iter()
+                        .filter(|d| d.kind == ViewDepKind::View)
+                        .map(|d| d.name.as_str()),
+                );
+            }
+        }
+        false
+    }
+
+    /// Re-validate the views that read a view `old` just replaced (views.md §8): every view that
+    /// reads it, directly or through other views, must plan in name byte order; a direct dependent
+    /// must also keep its dependency list and reference no column the replacement appended.
+    fn revalidate_after_replace(&self, old: &ViewDef) -> Result<()> {
+        let snap = self.read_snap();
+        let mut readers: BTreeSet<String> = BTreeSet::new();
+        let mut pending = vec![old.name.clone()];
+        while let Some(name) = pending.pop() {
+            for v in snap.views_depending_on(ViewDepKind::View, &name) {
+                if readers.insert(v.name.clone()) {
+                    pending.push(v.name.clone());
+                }
+            }
+        }
+        let breaks = |view: &str| {
+            view_not_supported(format!(
+                "cannot replace view {} because it would change the definition of view {view}",
+                old.name
+            ))
+        };
+        for name in readers {
+            let view = snap.view(&name).expect("a dependent view");
+            let (_, trace) = self
+                .trace_view_body(&view.body)
+                .map_err(|_| breaks(&name))?;
+            let direct = view
+                .deps
+                .iter()
+                .any(|d| d.kind == ViewDepKind::View && d.name == old.name);
+            if !direct {
+                continue;
+            }
+            let captured = trace
+                .view_columns
+                .iter()
+                .any(|(v, ordinal)| *v == old.name && *ordinal >= old.columns.len());
+            if captured || self.trace_dependencies(&trace) != view.deps {
+                return Err(breaks(&name));
+            }
+        }
+        Ok(())
     }
 
     /// A view's catalog entry must fit one catalog page (format.md *Catalog*): a longer definition
@@ -893,20 +1067,22 @@ impl Engine {
 // ALTER TABLE: rewrites (views.md §7) and re-validation (§8).
 // -------------------------------------------------------------------------------------------------
 
-/// What an `ALTER TABLE` statement changed that the dependent views' text must follow (§7).
+/// What an `ALTER TABLE` / `ALTER VIEW` statement changed that the dependent views' text must
+/// follow (§7, §7.1).
 pub(crate) enum ViewAlterChange {
-    /// `RENAME TO new`.
-    RenameTable(String),
+    /// `RENAME TO new` of the table or view.
+    RenameRelation(String),
     /// `RENAME COLUMN` of the column at `ordinal` to `new`.
     RenameColumn { ordinal: usize, new: String },
     /// Every other action: the original ordinals of the columns it dropped (possibly none).
     Other { dropped: Vec<usize> },
 }
 
-/// The dependent views of a table captured before an `ALTER TABLE` runs (§7/§8): each view with
-/// the FROM items that bind the table, as traced against the pre-statement catalog, and the table's
-/// pre-statement name and column names.
+/// The dependent views of a table or view captured before an `ALTER TABLE` / `ALTER VIEW` runs
+/// (§7/§7.1/§8): each view with the FROM items that bind the altered relation, as traced against the
+/// pre-statement catalog, and the relation's kind, pre-statement name, and column names.
 pub(crate) struct ViewAlterPlan {
+    kind: ViewDepKind,
     table: String,
     columns: Vec<String>,
     views: Vec<(ViewDef, Vec<TraceItem>)>,
@@ -931,11 +1107,25 @@ impl ViewAlterPlan {
     }
 }
 
-/// The 0A000 an `ALTER TABLE` raises when a dependent view would not survive it (§8).
-fn alter_breaks_view(table: &str, view: &str) -> EngineError {
+/// The 0A000 an `ALTER TABLE` / `ALTER VIEW` raises when a dependent view would not survive it
+/// (§8).
+fn alter_breaks_view(plan: &ViewAlterPlan, view: &str) -> EngineError {
+    let kind = match plan.kind {
+        ViewDepKind::Table => "table",
+        ViewDepKind::View => "view",
+    };
     view_not_supported(format!(
-        "cannot alter table {table} because it would change the definition of view {view}"
+        "cannot alter {kind} {} because it would change the definition of view {view}",
+        plan.table
     ))
+}
+
+/// The 42809 a statement that names views only raises for any other relation.
+fn not_a_view(name: &str) -> EngineError {
+    EngineError::new(
+        SqlState::WrongObjectType,
+        format!("\"{name}\" is not a view"),
+    )
 }
 
 impl Engine {
@@ -948,36 +1138,142 @@ impl Engine {
         table: &Table,
         rewrites: bool,
     ) -> Result<Option<ViewAlterPlan>> {
+        let columns = table.columns.iter().map(|c| c.name.clone()).collect();
+        self.prepare_dependents(ViewDepKind::Table, &table.name, columns, rewrites)
+    }
+
+    /// Capture the views that depend on the table or view `name` before the statement that alters
+    /// it runs (§7/§7.1/§8). `None` when no view depends on it.
+    fn prepare_dependents(
+        &self,
+        kind: ViewDepKind,
+        name: &str,
+        columns: Vec<String>,
+        rewrites: bool,
+    ) -> Result<Option<ViewAlterPlan>> {
         let dependents: Vec<ViewDef> = self
             .read_snap()
-            .views_depending_on(ViewDepKind::Table, &table.name)
+            .views_depending_on(kind, name)
             .into_iter()
             .cloned()
             .collect();
         if dependents.is_empty() {
             return Ok(None);
         }
-        let mut views = Vec::with_capacity(dependents.len());
+        let mut plan = ViewAlterPlan {
+            kind,
+            table: name.to_string(),
+            columns,
+            views: Vec::with_capacity(dependents.len()),
+        };
         for view in dependents {
             let items = if rewrites {
                 let (_, trace) = self
                     .trace_view_body(&view.body)
-                    .map_err(|_| alter_breaks_view(&table.name, &view.name))?;
+                    .map_err(|_| alter_breaks_view(&plan, &view.name))?;
                 trace
                     .items
                     .into_values()
-                    .filter(|i| i.kind == ViewDepKind::Table && i.name == table.name)
+                    .filter(|i| i.kind == kind && i.name == name)
                     .collect()
             } else {
                 Vec::new()
             };
-            views.push((view, items));
+            plan.views.push((view, items));
         }
-        Ok(Some(ViewAlterPlan {
-            table: table.name.clone(),
-            columns: table.columns.iter().map(|c| c.name.clone()).collect(),
-            views,
-        }))
+        Ok(Some(plan))
+    }
+
+    /// `ALTER VIEW [IF EXISTS] [main.]v RENAME TO v2` / `RENAME [COLUMN] a TO b`, and the same
+    /// `ALTER TABLE` forms on a view (views.md §7.1). The views that read `v` are rewritten to keep
+    /// binding it, then re-validated (§8).
+    pub(crate) fn execute_alter_view(&mut self, av: AlterView) -> Result<Outcome> {
+        let done = Ok(Outcome::Statement {
+            cost: 0,
+            rows_affected: None,
+        });
+        // 1. The database qualifier (the allow_ddl gate already ran in admission).
+        match av.db.as_deref() {
+            None | Some("main") => {}
+            Some("temp") => {
+                return Err(view_not_supported("temporary views are not supported"));
+            }
+            Some(q) => {
+                if self.attach_read_snap(q).is_none() {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedTable,
+                        format!("database \"{q}\" is not attached"),
+                    ));
+                }
+                return Err(view_not_supported(
+                    "views in an attached database are not supported",
+                ));
+            }
+        }
+        // 2. The name: a view, else 42809 for another relation, else 42P01 (IF EXISTS: no-op).
+        let Some(view) = self.read_snap().view(&av.name).cloned() else {
+            if is_catalog_rel_name(&av.name) || self.relation_exists(&av.name) {
+                return Err(not_a_view(&av.name));
+            }
+            if av.if_exists {
+                return done;
+            }
+            return Err(EngineError::new(
+                SqlState::UndefinedTable,
+                format!("relation \"{}\" does not exist", av.name),
+            ));
+        };
+        // 3. The new name or the column.
+        let change = match av.action {
+            AlterViewAction::RenameTo(new) => {
+                check_reserved_name("view", &new)?;
+                if is_catalog_rel_name(&new) || self.relation_exists(&new) {
+                    return Err(EngineError::new(
+                        SqlState::DuplicateTable,
+                        format!("relation \"{new}\" already exists"),
+                    ));
+                }
+                ViewAlterChange::RenameRelation(new)
+            }
+            AlterViewAction::RenameColumn { old, new } => {
+                let Some(ordinal) = view.columns.iter().position(|c| *c == old) else {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedColumn,
+                        format!("column \"{old}\" does not exist"),
+                    ));
+                };
+                if view.columns.contains(&new) {
+                    return Err(EngineError::new(
+                        SqlState::DuplicateColumn,
+                        format!(
+                            "column \"{new}\" of relation \"{}\" already exists",
+                            view.name
+                        ),
+                    ));
+                }
+                ViewAlterChange::RenameColumn { ordinal, new }
+            }
+        };
+        // 4. Capture the dependents against the pre-statement catalog, rename, then rewrite and
+        //    re-validate them (5).
+        let plan =
+            self.prepare_dependents(ViewDepKind::View, &view.name, view.columns.clone(), true)?;
+        let mut renamed = view.clone();
+        match &change {
+            ViewAlterChange::RenameRelation(new) => {
+                self.working_mut().remove_view(&view.name);
+                renamed.name = new.clone();
+            }
+            ViewAlterChange::RenameColumn { ordinal, new } => {
+                renamed.columns[*ordinal] = new.clone();
+            }
+            ViewAlterChange::Other { .. } => unreachable!("ALTER VIEW only renames"),
+        }
+        self.working_mut().put_view(renamed);
+        if let Some(plan) = plan {
+            self.finish_view_alter(plan, &change)?;
+        }
+        done
     }
 
     /// After an `ALTER TABLE` changed the working catalog: rewrite each dependent view's text for
@@ -996,7 +1292,7 @@ impl Engine {
             let definition = rewrite_view_text(&view.definition, items, &plan, change)?;
             let expected = renamed_deps(&view.deps, &plan, change);
             let (body, depth) = parse_view_definition(&definition)
-                .map_err(|_| alter_breaks_view(&plan.table, &view.name))?;
+                .map_err(|_| alter_breaks_view(&plan, &view.name))?;
             if definition != view.definition || expected != view.deps {
                 let updated = ViewDef {
                     name: view.name.clone(),
@@ -1015,9 +1311,9 @@ impl Engine {
             let body = self.read_snap().view(&name).expect("view").body.clone();
             let (_, trace) = self
                 .trace_view_body(&body)
-                .map_err(|_| alter_breaks_view(&plan.table, &name))?;
+                .map_err(|_| alter_breaks_view(&plan, &name))?;
             if self.trace_dependencies(&trace) != expected {
-                return Err(alter_breaks_view(&plan.table, &name));
+                return Err(alter_breaks_view(&plan, &name));
             }
         }
         Ok(())
@@ -1029,11 +1325,11 @@ impl Engine {
 fn renamed_deps(deps: &[ViewDep], plan: &ViewAlterPlan, change: &ViewAlterChange) -> Vec<ViewDep> {
     let mut out: Vec<ViewDep> = deps.to_vec();
     for dep in &mut out {
-        if dep.kind != ViewDepKind::Table || dep.name != plan.table {
+        if dep.kind != plan.kind || dep.name != plan.table {
             continue;
         }
         match change {
-            ViewAlterChange::RenameTable(new) => dep.name = new.clone(),
+            ViewAlterChange::RenameRelation(new) => dep.name = new.clone(),
             ViewAlterChange::RenameColumn { ordinal, new } => {
                 let old = &plan.columns[*ordinal];
                 for c in &mut dep.columns {
@@ -1065,7 +1361,7 @@ fn rewrite_view_text(
     for item in items {
         let pos = item.pos;
         match change {
-            ViewAlterChange::RenameTable(new) => {
+            ViewAlterChange::RenameRelation(new) => {
                 edits.replace(pos.name, vec![quoted(new)]);
                 if pos.alias.is_none() {
                     edits.insert_after(

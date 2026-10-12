@@ -2453,6 +2453,7 @@ pub(crate) fn stmt_is_write(stmt: &Statement) -> bool {
             | Statement::DropSequence(_)
             | Statement::CreateView(_)
             | Statement::DropView(_)
+            | Statement::AlterView(_)
             | Statement::Insert(_)
             | Statement::Update(_)
             | Statement::Delete(_)
@@ -2669,7 +2670,8 @@ pub(crate) fn collect_stmt_privs(stmt: &Statement, req: &mut PrivReq) {
         | Statement::AlterSequence(_)
         | Statement::AlterTable(_)
         | Statement::CreateView(_)
-        | Statement::DropView(_) => req.is_ddl = true,
+        | Statement::DropView(_)
+        | Statement::AlterView(_) => req.is_ddl = true,
         Statement::Insert(ins) => collect_insert_privs(ins, req, &locals),
         Statement::Select(sel) => collect_select_privs(sel, req, &locals),
         Statement::SetOp(so) => collect_setop_privs(so, req, &locals),
@@ -3052,6 +3054,7 @@ pub(crate) fn stmt_kind(stmt: &Statement) -> &'static str {
         Statement::DropSequence(_) => "DROP SEQUENCE",
         Statement::CreateView(_) => "CREATE VIEW",
         Statement::DropView(_) => "DROP VIEW",
+        Statement::AlterView(_) => "ALTER VIEW",
         Statement::Insert(_) => "INSERT",
         Statement::Update(_) => "UPDATE",
         Statement::Delete(_) => "DELETE",

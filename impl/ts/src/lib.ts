@@ -871,6 +871,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // View text rewrites for ALTER TABLE RENAME TO / RENAME COLUMN / DROP COLUMN (views.md §7,
   // V2 + V4).
   "ddl.view_rename",
+  "ddl.view_replace",
+  "ddl.view_alter",
 ];
 
 // THIS FILE IS THE PUBLIC API of the TS core (CLAUDE.md §2 — the embedding surface): the converged

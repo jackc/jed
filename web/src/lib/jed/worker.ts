@@ -77,6 +77,8 @@ function commandTag(stmt: Statement, rowsAffected: number | null): string {
       return 'CREATE VIEW';
     case 'dropView':
       return 'DROP VIEW';
+    case 'alterView':
+      return 'ALTER VIEW';
     case 'insert':
       return `INSERT 0 ${rowsAffected ?? 0}`;
     case 'update':

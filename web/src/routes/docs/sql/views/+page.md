@@ -39,11 +39,20 @@ ALTER TABLE note ADD COLUMN pinned boolean DEFAULT false;`;
 	const rename = `ALTER TABLE employee RENAME COLUMN name TO full_name;
 ALTER TABLE employee RENAME TO staff;
 SELECT name, definition FROM jed_views ORDER BY name;`;
+
+	const replace = `CREATE OR REPLACE VIEW active_staff AS
+  SELECT id, name, dept, salary FROM employee WHERE active AND dept = 'eng';
+SELECT * FROM active_staff ORDER BY id;`;
+
+	const renameView = `CREATE VIEW eng_staff AS SELECT name FROM active_staff WHERE dept = 'eng';
+ALTER VIEW active_staff RENAME TO on_duty;
+ALTER VIEW on_duty RENAME COLUMN dept TO team;
+SELECT name, definition FROM jed_views ORDER BY name;`;
 </script>
 
 <svelte:head>
 	<title>Views — jed</title>
-	<meta name="description" content="CREATE VIEW and DROP VIEW in jed — named, persisted, read-only queries that read exactly like the equivalent subquery, with dependency tracking, rename rewriting, and per-view privileges." />
+	<meta name="description" content="CREATE [OR REPLACE] VIEW, ALTER VIEW, and DROP VIEW in jed — named, persisted, read-only queries that read exactly like the equivalent subquery, with dependency tracking, rename rewriting, and per-view privileges." />
 </svelte:head>
 
 # Views
@@ -71,11 +80,13 @@ Things to try in the panel above:
 - Drop a table a view reads — `DROP TABLE employee;` &rarr; error `2BP01`
 - Drop a column a view reads — `ALTER TABLE employee DROP COLUMN salary;` &rarr; error `2BP01`
 - Drop both views in one statement — `DROP VIEW active_staff, dept_payroll;`
+- Replace a view with fewer columns — `CREATE OR REPLACE VIEW active_staff AS SELECT id, name FROM employee;` &rarr; error `42P16`
+- Rename a view — `ALTER VIEW dept_payroll RENAME TO payroll;`
 
 ## Creating a view
 
 ```sql
-CREATE VIEW [IF NOT EXISTS] name [(column, …)] AS query
+CREATE [OR REPLACE] VIEW [IF NOT EXISTS] name [(column, …)] AS query
 ```
 
 The query can be anything a subquery in `FROM` accepts: joins, aggregates, window functions,
@@ -92,8 +103,8 @@ A view shares its name space with tables, indexes, and sequences, so a taken nam
 `CREATE VIEW IF NOT EXISTS` makes that a silent no-op instead. This is a jed extension, as in SQLite;
 PostgreSQL has no such form.
 
-`CREATE VIEW` and `DROP VIEW` are ordinary DDL. They are transactional and roll back with their
-transaction.
+`CREATE VIEW`, `ALTER VIEW`, and `DROP VIEW` are ordinary DDL. They are transactional and roll back
+with their transaction.
 
 ## Reading a view
 
@@ -170,6 +181,46 @@ jed rewrites each affected view's stored definition, using a [column alias list]
 
 After the renames, `SELECT name FROM active_staff` still works and returns the same rows.
 
+## Replacing a view
+
+`CREATE OR REPLACE VIEW` changes the query of an existing view, or creates the view if it does not
+exist yet. The views that read it keep working and see the new query. As in PostgreSQL, the new
+query must keep the view's existing columns, with the same names, types, and collations in the same
+order. It may add new columns at the end:
+
+<LiveSql {seed} query={replace} rows={2} />
+
+A change to an existing column is `42P16`: fewer columns, a different name, a different type, or a
+different collation. To rename a column, use `ALTER VIEW … RENAME COLUMN` (below). Two details
+differ from PostgreSQL:
+
+- Types are compared without their length or precision, so `varchar(3)` can become `varchar(4)` or
+  `text`. A bare integer such as `0` is an `i64` in jed, so `0 AS n` cannot replace an `i32` column;
+  write `0::i32 AS n`.
+- A replacement whose query would read the view itself, directly or through other views, is `42P17`.
+  PostgreSQL accepts it and fails every later read.
+
+Naming a table, index, or sequence is `42809`. `OR REPLACE` cannot be combined with `IF NOT EXISTS`
+(`42601`).
+
+## Renaming a view
+
+```sql
+ALTER VIEW [IF EXISTS] name RENAME TO new_name
+ALTER VIEW [IF EXISTS] name RENAME [COLUMN] column TO new_column
+```
+
+`ALTER TABLE` accepts the same two forms for a view. The views that read the renamed view keep
+working with the same column names: jed rewrites their stored definitions, as it does for a renamed
+table.
+
+<LiveSql {seed} query={renameView} rows={3} />
+
+A missing view is `42P01` unless you write `IF EXISTS`. Naming a table, index, or sequence is
+`42809`. A new name that is taken is `42P07`. Renaming a column that does not exist is `42703`, and
+to a name the view already has is `42701`. The other `ALTER VIEW` forms, such as `OWNER TO` and
+`SET (…)`, are not supported (`0A000`).
+
 ## Other table changes are checked
 
 Because a view is stored as text and its names are resolved each time it is read, a table change
@@ -177,6 +228,9 @@ could make a name in a view refer to a different column. After every `ALTER TABL
 view that reads the table. If the view's names would now resolve differently, the `ALTER TABLE`
 fails with `0A000` and nothing changes. For example, adding a column named `x` fails when a view's
 query uses a bare `x` that meant a column of another table.
+
+The same check runs after `CREATE OR REPLACE VIEW` adds a column: it fails with `0A000` when a view
+that reads the replaced view uses a bare name that the new column would capture.
 
 PostgreSQL accepts such changes. To avoid the error, qualify column references in view queries
 (`e.name` rather than `name`).
@@ -197,9 +251,9 @@ A view is a privilege boundary, as in PostgreSQL:
 - **Reading a view** needs `SELECT` on the **view** only. The session reading it needs no privilege
   on the tables inside. A host can use this to expose some columns or rows of a table to a session
   that cannot read the table itself.
-- **Creating a view** needs `allow_ddl` and `SELECT` on every table and view its query reads,
-  checked against the creating session (`42501`). A session cannot create a view over data it could
-  not read itself.
+- **Creating or replacing a view** needs `allow_ddl` and `SELECT` on every table and view its query
+  reads, checked against the creating session (`42501`). A session cannot create a view over data it
+  could not read itself. Renaming a view needs `allow_ddl`.
 - Functions the view calls still need `EXECUTE` for the session reading the view.
 
 Privileges are configured by the host. See [Authorization](../../api/authorization/).
@@ -215,7 +269,7 @@ are not listed in `jed_tables` or `jed_columns`. To learn a view's column types,
 
 Each of these is `0A000` today:
 
-- `CREATE OR REPLACE VIEW`, `ALTER VIEW`, and renaming a view (`ALTER TABLE v RENAME …`).
+- `ALTER VIEW` forms other than `RENAME`.
 - `WITH CHECK OPTION` and `WITH (options)`.
 - Writing through a view (updatable views).
 - `CREATE MATERIALIZED VIEW` and `CREATE RECURSIVE VIEW`.

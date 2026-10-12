@@ -428,6 +428,9 @@ template = "relation already exists: {name}"
 code = "42P16"
 name = "invalid_table_definition"
 class = "syntax error or access rule violation"
+# Also CREATE OR REPLACE VIEW whose new output columns are incompatible with the view's existing
+# ones (spec/design/views.md §1.2): fewer columns ("cannot drop columns from view"), or an existing
+# column whose name, type, or collation changes. PostgreSQL's checkViewColumns, same code and order.
 template = "invalid table definition: {detail}"
 
 [[error]]
@@ -478,12 +481,15 @@ template = "there is no parameter ${index}"
 code = "42P17"
 name = "invalid_object_definition"
 class = "syntax error or access rule violation"
-# An object definition that is structurally invalid. jed's one use is an INDEX EXPRESSION that
+# An object definition that is structurally invalid. jed's first use is an INDEX EXPRESSION that
 # calls a non-immutable function — the entropy/clock seam uuidv4/uuidv7/now/current_timestamp/
 # clock_timestamp (spec/design/indexes.md §2): an index must be a deterministic function of the
 # row, so a volatile/stable operand would let the index drift from the table. Matches PostgreSQL
 # (ComputeIndexAttrs, "functions in index expression must be marked IMMUTABLE"). Code matches;
 # jed's house message omits identifier quoting.
+# Also CREATE OR REPLACE VIEW whose new body would read the view itself, directly or through other
+# views (spec/design/views.md §1.2): "infinite recursion detected in rules for relation "v"". PG
+# raises the same code at each use of such a view; jed refuses the definition.
 template = "functions in index expression must be marked IMMUTABLE"
 
 [[error]]
@@ -547,7 +553,8 @@ code = "42809"
 name = "wrong_object_type"
 class = "syntax error or access rule violation"
 # kind is "a table" / "an index": DROP TABLE of an index name, DROP INDEX of a table
-# name (spec/design/indexes.md §2).
+# name (spec/design/indexes.md §2). "a view": DROP VIEW, ALTER VIEW, or CREATE OR REPLACE VIEW
+# naming a table, index, or sequence (spec/design/views.md §1.2/§2/§7.1).
 template = "{name} is not {kind}"
 
 # 42622 name_too_long — an identifier (table / column / type / alias / function name) exceeds

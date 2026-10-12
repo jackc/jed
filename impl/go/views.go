@@ -34,6 +34,9 @@ type viewTrace struct {
 	catalogRels map[string]bool
 	// columns is every referenced base-table column.
 	columns map[traceColumn]bool
+	// viewColumns is every referenced column of a view, as (view name, column ordinal). Not a
+	// persisted dependency (§6): re-validation after CREATE OR REPLACE VIEW reads it (§8).
+	viewColumns map[traceColumn]bool
 	// stars is each written star's expansion, keyed by its token position.
 	stars map[tokPos]traceStar
 }
@@ -43,6 +46,7 @@ func newViewTrace() *viewTrace {
 		items:       map[tokPos]traceItem{},
 		catalogRels: map[string]bool{},
 		columns:     map[traceColumn]bool{},
+		viewColumns: map[traceColumn]bool{},
 		stars:       map[tokPos]traceStar{},
 	}
 }
@@ -117,6 +121,20 @@ func (db *engine) viewTracing() bool { return db.viewTrace != nil }
 func (db *engine) traceColumn(table string, ordinal int) {
 	if db.viewTrace != nil {
 		db.viewTrace.columns[traceColumn{table: table, ordinal: ordinal}] = true
+	}
+}
+
+// traceRelColumn records a column resolved against a FROM relation: a catalog base table's as a
+// dependency (views.md §6), a view reference's as a view column (§8). Every other relation records
+// none.
+func (db *engine) traceRelColumn(rel *scopeRel, ordinal int) {
+	if db.viewTrace == nil {
+		return
+	}
+	if rel.base {
+		db.traceColumn(rel.table.Name, ordinal)
+	} else if rel.view != "" {
+		db.viewTrace.viewColumns[traceColumn{table: rel.view, ordinal: ordinal}] = true
 	}
 }
 
@@ -469,6 +487,7 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 	// 5. Column-list arity, then duplicate final output names, from the body as planned.
 	bodyNames := append([]string(nil), plan.columnNames()...)
 	bodyTypes := append([]resolvedType(nil), plan.columnTypes()...)
+	bodyDerivs := append([]deriv(nil), plan.columnDerivs()...)
 	columns, err := viewOutputNames(bodyNames, cv.Columns)
 	if err != nil {
 		return outcome{}, err
@@ -516,17 +535,170 @@ func (db *engine) executeCreateView(cv *createView) (outcome, error) {
 			}
 		}
 	}
-	// 8. A taken name.
+	// 8. A taken name: 42P07, or under OR REPLACE the replacement of a view (§1.2) and 42809 for any
+	//    other relation.
+	var replaced *viewDef
 	if db.relationExists(cv.Name) {
-		return outcome{}, newError(DuplicateTable, fmt.Sprintf("relation \"%s\" already exists", cv.Name))
+		if !cv.OrReplace {
+			return outcome{}, newError(DuplicateTable, fmt.Sprintf("relation \"%s\" already exists", cv.Name))
+		}
+		replaced = db.readSnap().view(cv.Name)
+		if replaced == nil {
+			return outcome{}, notAView(cv.Name)
+		}
+		// 9. Column compatibility (42P16), 10. no cycle (42P17).
+		if err := db.checkViewReplacement(replaced, columns, bodyTypes, bodyDerivs); err != nil {
+			return outcome{}, err
+		}
+		if db.viewReads(deps, cv.Name) {
+			return outcome{}, newError(InvalidObjectDefinition, fmt.Sprintf(
+				"infinite recursion detected in rules for relation \"%s\"", cv.Name))
+		}
 	}
-	// 9. Write the catalog entry; it must fit one catalog page.
+	// 9 (12 under OR REPLACE). Write the catalog entry; it must fit one catalog page.
 	def := &viewDef{Name: cv.Name, Columns: columns, Definition: definition, Deps: deps, Body: body, Depth: depth}
 	if err := db.checkViewEntryFits(def); err != nil {
 		return outcome{}, err
 	}
 	db.working().putView(def)
+	// 11. The views that read a replaced view are re-validated against the replacement (§8).
+	if replaced != nil {
+		if err := db.revalidateAfterReplace(replaced); err != nil {
+			return outcome{}, err
+		}
+	}
 	return outcome{Kind: outcomeStatement}, nil
+}
+
+// checkViewReplacement is the CREATE OR REPLACE VIEW column compatibility check (views.md §1.2 step 9,
+// PostgreSQL's checkViewColumns): no fewer columns, then each existing column keeps its name, type, and
+// collation, all 42P16. The existing types and collations come from planning the view's current body;
+// a body that no longer plans compares only the names and the count.
+func (db *engine) checkViewReplacement(old *viewDef, names []string, types []resolvedType, derivs []deriv) error {
+	invalid := func(msg string) error { return newError(InvalidTableDefinition, msg) }
+	if len(names) < len(old.Columns) {
+		return invalid("cannot drop columns from view")
+	}
+	current, _, err := db.traceViewBody(old.Body)
+	planned := err == nil
+	for i, oldName := range old.Columns {
+		if names[i] != oldName {
+			return invalid(fmt.Sprintf("cannot change name of view column \"%s\" to \"%s\"", oldName, names[i]))
+		}
+		if !planned {
+			continue
+		}
+		oldType := current.columnTypes()[i]
+		if !resolvedTypeEqual(oldType, types[i]) {
+			return invalid(fmt.Sprintf("cannot change data type of view column \"%s\" from %s to %s",
+				oldName, rtName(oldType), rtName(types[i])))
+		}
+		was, wasOK := db.viewCollation(current.columnDerivs()[i])
+		is, isOK := db.viewCollation(derivs[i])
+		if was != is || wasOK != isOK {
+			return invalid(fmt.Sprintf("cannot change collation of view column \"%s\" from \"%s\" to \"%s\"",
+				oldName, was, is))
+		}
+	}
+	return nil
+}
+
+// viewCollation is a view output column's collation for the replacement check (views.md §1.2): the
+// name its derivation carries, the database default for a column that derives none (PostgreSQL's
+// `default`), and none (false) for an indeterminate one.
+func (db *engine) viewCollation(d deriv) (string, bool) {
+	switch d.kind {
+	case derivImplicit, derivExplicit:
+		return d.name, true
+	case derivNone:
+		return db.DefaultCollation(), true
+	}
+	return "", false
+}
+
+// viewReads reports whether a body with dependency list deps reads the view target, directly or
+// through other views (the 42P17 cycle check, views.md §1.2 step 10).
+func (db *engine) viewReads(deps []viewDep, target string) bool {
+	snap := db.readSnap()
+	var pending []string
+	for _, d := range deps {
+		if d.Kind == viewDepView {
+			pending = append(pending, d.Name)
+		}
+	}
+	seen := map[string]bool{}
+	for len(pending) > 0 {
+		name := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if name == target {
+			return true
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		if view := snap.view(name); view != nil {
+			for _, d := range view.Deps {
+				if d.Kind == viewDepView {
+					pending = append(pending, d.Name)
+				}
+			}
+		}
+	}
+	return false
+}
+
+// revalidateAfterReplace re-validates the views that read a view old just replaced (views.md §8):
+// every view that reads it, directly or through other views, must plan in name byte order; a direct
+// dependent must also keep its dependency list and reference no column the replacement appended.
+func (db *engine) revalidateAfterReplace(old *viewDef) error {
+	snap := db.readSnap()
+	readers := map[string]bool{}
+	pending := []string{old.Name}
+	for len(pending) > 0 {
+		name := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		for _, v := range snap.viewsDependingOn(viewDepView, name) {
+			if !readers[v.Name] {
+				readers[v.Name] = true
+				pending = append(pending, v.Name)
+			}
+		}
+	}
+	names := make([]string, 0, len(readers))
+	for name := range readers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	breaks := func(view string) error {
+		return viewNotSupported(fmt.Sprintf(
+			"cannot replace view %s because it would change the definition of view %s", old.Name, view))
+	}
+	for _, name := range names {
+		view := snap.view(name)
+		_, trace, err := db.traceViewBody(view.Body)
+		if err != nil {
+			return breaks(name)
+		}
+		direct := false
+		for _, d := range view.Deps {
+			if d.Kind == viewDepView && d.Name == old.Name {
+				direct = true
+			}
+		}
+		if !direct {
+			continue
+		}
+		for col := range trace.viewColumns {
+			if col.table == old.Name && col.ordinal >= len(old.Columns) {
+				return breaks(name)
+			}
+		}
+		if !viewDepsEqual(db.traceDependencies(trace), view.Deps) {
+			return breaks(name)
+		}
+	}
+	return nil
 }
 
 // checkViewEntryFits requires a view's catalog entry to fit one catalog page (format.md *Catalog*): a
@@ -802,16 +974,16 @@ func (db *engine) checkDropTableViews(targets []string, cascade bool) error {
 
 // --- ALTER TABLE: rewrites (views.md §7) and re-validation (§8) -------------------------------------
 
-// viewAlterChangeKind is what an ALTER TABLE statement changed that the dependent views' text must
-// follow (§7).
+// viewAlterChangeKind is what an ALTER TABLE / ALTER VIEW statement changed that the dependent views'
+// text must follow (§7, §7.1).
 type viewAlterChangeKind int
 
 const (
 	// viewAlterOther is every other action: dropped holds the original ordinals of the columns it
 	// dropped (possibly none).
 	viewAlterOther viewAlterChangeKind = iota
-	// viewAlterRenameTable is RENAME TO newName.
-	viewAlterRenameTable
+	// viewAlterRenameRelation is RENAME TO newName of the table or view.
+	viewAlterRenameRelation
 	// viewAlterRenameColumn is RENAME COLUMN of the column at ordinal to newName.
 	viewAlterRenameColumn
 )
@@ -823,10 +995,11 @@ type viewAlterChange struct {
 	dropped []int
 }
 
-// viewAlterPlan is the dependent views of a table captured before an ALTER TABLE runs (§7/§8): each
-// view with the FROM items that bind the table, as traced against the pre-statement catalog, and the
-// table's pre-statement name and column names.
+// viewAlterPlan is the dependent views of a table or view captured before an ALTER TABLE / ALTER VIEW
+// runs (§7/§7.1/§8): each view with the FROM items that bind the altered relation, as traced against
+// the pre-statement catalog, and the relation's kind, pre-statement name, and column names.
 type viewAlterPlan struct {
+	kind    viewDepKind
 	table   string
 	columns []string
 	views   []*viewDef
@@ -847,9 +1020,19 @@ func (vp *viewAlterPlan) viewUsing(ordinal int) string {
 	return ""
 }
 
-// alterBreaksView is the 0A000 an ALTER TABLE raises when a dependent view would not survive it (§8).
-func alterBreaksView(table, view string) error {
-	return viewNotSupported(fmt.Sprintf("cannot alter table %s because it would change the definition of view %s", table, view))
+// alterBreaksView is the 0A000 an ALTER TABLE / ALTER VIEW raises when a dependent view would not
+// survive it (§8).
+func alterBreaksView(vp *viewAlterPlan, view string) error {
+	kind := "table"
+	if vp.kind == viewDepView {
+		kind = "view"
+	}
+	return viewNotSupported(fmt.Sprintf("cannot alter %s %s because it would change the definition of view %s", kind, vp.table, view))
+}
+
+// notAView is the 42809 a statement that names views only raises for any other relation.
+func notAView(name string) error {
+	return newError(WrongObjectType, fmt.Sprintf("\"%s\" is not a view", name))
 }
 
 // prepareViewAlter captures the views that depend on table (of the main database) before an ALTER
@@ -857,23 +1040,30 @@ func alterBreaksView(table, view string) error {
 // pre-statement catalog to find the FROM items that bind the table; a view that cannot be planned
 // fails the statement (0A000). nil when no view depends on the table.
 func (db *engine) prepareViewAlter(table *catTable, rewrites bool) (*viewAlterPlan, error) {
-	dependents := db.readSnap().viewsDependingOn(viewDepTable, table.Name)
+	columns := make([]string, 0, len(table.Columns))
+	for _, c := range table.Columns {
+		columns = append(columns, c.Name)
+	}
+	return db.prepareDependents(viewDepTable, table.Name, columns, rewrites)
+}
+
+// prepareDependents captures the views that depend on the table or view name before the statement
+// that alters it runs (§7/§7.1/§8). nil when no view depends on it.
+func (db *engine) prepareDependents(kind viewDepKind, name string, columns []string, rewrites bool) (*viewAlterPlan, error) {
+	dependents := db.readSnap().viewsDependingOn(kind, name)
 	if len(dependents) == 0 {
 		return nil, nil
 	}
-	vp := &viewAlterPlan{table: table.Name}
-	for _, c := range table.Columns {
-		vp.columns = append(vp.columns, c.Name)
-	}
+	vp := &viewAlterPlan{kind: kind, table: name, columns: columns}
 	for _, view := range dependents {
 		var items []traceItem
 		if rewrites {
 			_, trace, err := db.traceViewBody(view.Body)
 			if err != nil {
-				return nil, alterBreaksView(table.Name, view.Name)
+				return nil, alterBreaksView(vp, view.Name)
 			}
 			for _, item := range trace.items {
-				if item.kind == viewDepTable && item.name == table.Name {
+				if item.kind == kind && item.name == name {
 					items = append(items, item)
 				}
 			}
@@ -902,7 +1092,7 @@ func (db *engine) finishViewAlter(vp *viewAlterPlan, change viewAlterChange) err
 		expected := renamedDeps(view.Deps, vp, change)
 		body, depth, err := parseViewDefinition(definition)
 		if err != nil {
-			return alterBreaksView(vp.table, view.Name)
+			return alterBreaksView(vp, view.Name)
 		}
 		bodies[i], expecteds[i] = body, expected
 		if definition != view.Definition || !viewDepsEqual(expected, view.Deps) {
@@ -919,13 +1109,86 @@ func (db *engine) finishViewAlter(vp *viewAlterPlan, change viewAlterChange) err
 	for i, view := range vp.views {
 		_, trace, err := db.traceViewBody(bodies[i])
 		if err != nil {
-			return alterBreaksView(vp.table, view.Name)
+			return alterBreaksView(vp, view.Name)
 		}
 		if !viewDepsEqual(db.traceDependencies(trace), expecteds[i]) {
-			return alterBreaksView(vp.table, view.Name)
+			return alterBreaksView(vp, view.Name)
 		}
 	}
 	return nil
+}
+
+// executeAlterView runs `ALTER VIEW [IF EXISTS] [main.]v RENAME TO v2` / `RENAME [COLUMN] a TO b`, and
+// the same ALTER TABLE forms on a view (views.md §7.1). The views that read v are rewritten to keep
+// binding it, then re-validated (§8).
+func (db *engine) executeAlterView(av *alterView) (outcome, error) {
+	done := outcome{Kind: outcomeStatement}
+	// 1. The database qualifier (the allow_ddl gate already ran in admission).
+	if av.DB != nil {
+		switch *av.DB {
+		case "main":
+		case "temp":
+			return outcome{}, viewNotSupported("temporary views are not supported")
+		default:
+			if db.attachReadSnap(*av.DB) == nil {
+				return outcome{}, newError(UndefinedTable, `database "`+*av.DB+`" is not attached`)
+			}
+			return outcome{}, viewNotSupported("views in an attached database are not supported")
+		}
+	}
+	// 2. The name: a view, else 42809 for another relation, else 42P01 (IF EXISTS: no-op).
+	view := db.readSnap().view(av.Name)
+	if view == nil {
+		if isCatalogRelName(av.Name) || db.relationExists(av.Name) {
+			return outcome{}, notAView(av.Name)
+		}
+		if av.IfExists {
+			return done, nil
+		}
+		return outcome{}, newError(UndefinedTable, fmt.Sprintf("relation \"%s\" does not exist", av.Name))
+	}
+	// 3. The new name or the column.
+	var change viewAlterChange
+	if av.RenameColumn == nil {
+		if err := checkReservedName("view", av.RenameTo); err != nil {
+			return outcome{}, err
+		}
+		if isCatalogRelName(av.RenameTo) || db.relationExists(av.RenameTo) {
+			return outcome{}, newError(DuplicateTable, fmt.Sprintf("relation \"%s\" already exists", av.RenameTo))
+		}
+		change = viewAlterChange{kind: viewAlterRenameRelation, newName: av.RenameTo}
+	} else {
+		ordinal := slices.Index(view.Columns, av.RenameColumn.Old)
+		if ordinal < 0 {
+			return outcome{}, newError(UndefinedColumn, fmt.Sprintf("column \"%s\" does not exist", av.RenameColumn.Old))
+		}
+		if slices.Contains(view.Columns, av.RenameColumn.New) {
+			return outcome{}, newError(DuplicateColumn, fmt.Sprintf(
+				"column \"%s\" of relation \"%s\" already exists", av.RenameColumn.New, view.Name))
+		}
+		change = viewAlterChange{kind: viewAlterRenameColumn, newName: av.RenameColumn.New, ordinal: ordinal}
+	}
+	// 4. Capture the dependents against the pre-statement catalog, rename, then rewrite and re-validate
+	//    them (5).
+	vp, err := db.prepareDependents(viewDepView, view.Name, append([]string(nil), view.Columns...), true)
+	if err != nil {
+		return outcome{}, err
+	}
+	renamed := *view
+	renamed.Columns = append([]string(nil), view.Columns...)
+	if change.kind == viewAlterRenameRelation {
+		db.working().removeView(view.Name)
+		renamed.Name = change.newName
+	} else {
+		renamed.Columns[change.ordinal] = change.newName
+	}
+	db.working().putView(&renamed)
+	if vp != nil {
+		if err := db.finishViewAlter(vp, change); err != nil {
+			return outcome{}, err
+		}
+	}
+	return done, nil
 }
 
 // viewDepsEqual reports whether two dependency lists are identical.
@@ -947,9 +1210,9 @@ func renamedDeps(deps []viewDep, vp *viewAlterPlan, change viewAlterChange) []vi
 	out := make([]viewDep, len(deps))
 	for i, d := range deps {
 		d.Columns = append([]string(nil), d.Columns...)
-		if d.Kind == viewDepTable && d.Name == vp.table {
+		if d.Kind == vp.kind && d.Name == vp.table {
 			switch change.kind {
-			case viewAlterRenameTable:
+			case viewAlterRenameRelation:
 				d.Name = change.newName
 			case viewAlterRenameColumn:
 				old := vp.columns[change.ordinal]
@@ -981,7 +1244,7 @@ func rewriteViewText(definition string, items []traceItem, vp *viewAlterPlan, ch
 	for _, item := range items {
 		namePos := int(item.namePos)
 		switch change.kind {
-		case viewAlterRenameTable:
+		case viewAlterRenameRelation:
 			edits.replace(namePos, []token{nameToken(change.newName)})
 			if item.aliasPos == 0 {
 				edits.insertAfter(namePos, []token{asWord, nameToken(vp.table)})
