@@ -33,7 +33,7 @@ They are kept **separate on purpose**, because months and days are not fixed-len
 
 `micros` is microsecond resolution like the rest of the engine; the time-of-day part of an
 interval is **not** justified into days (`INTERVAL '100 hours'` keeps `micros = 100 h`, `days = 0`,
-and renders `100:00:00`).
+and renders `100:00:00`; `justify_hours` moves it, §5.1).
 
 ## 2. The canonical span — comparison, ordering, dedup
 
@@ -214,6 +214,31 @@ so the interval module stays float-free, and because it is a single correctly-ro
 resulting interval is **in-contract** (byte-identical cross-core, not an `R`-exempt float). It shares
 the `× / number` half-away-vs-half-even sub-µs tie divergence above (avoided in the corpus by using
 exactly-representable `secs`).
+
+### 5.1 Justification — `justify_hours` / `justify_days` / `justify_interval`
+
+PostgreSQL's three interval normalizers, each `interval → interval`, immutable, NULL-propagating, and
+ported **step for step** from PG's `interval_justify_*` (exact integer math; `/` and `%` truncate
+toward zero, as in C):
+
+- **`justify_hours(iv)`** moves whole 24 h chunks of `micros` into `days`
+  (`days += micros / 86_400_000_000`, `micros %= 86_400_000_000`), then gives `days` and `micros`
+  the same sign by borrowing one day (`days > 0 && micros < 0` → `micros += 24 h`, `days -= 1`, and
+  the mirror). `months` is untouched. `justify_hours('1 day -1 hour') = 23:00:00`.
+- **`justify_days(iv)`** moves whole 30-day chunks of `days` into `months`, then gives `months` and
+  `days` the same sign by borrowing one month. `micros` is untouched.
+  `justify_days('1 mon -1 day') = 29 days`.
+- **`justify_interval(iv)`** does both, leaving `|micros| < 24 h`, `|days| < 30`, and **all three
+  fields the same sign**: (1) when `days` and `micros` share a sign, pre-justify `days` into
+  `months` (it keeps step 3's sum within `i32`); (2) move whole days out of `micros`; (3) add them
+  to `days` and move whole months out of `days`; (4) if `months` and the remaining day+time disagree
+  in sign (a zero `days` defers to `micros`'s sign), borrow one month; (5) borrow one day as in
+  `justify_hours`. `justify_interval('1 mon -1 hour') = 29 days 23:00:00`.
+
+The only error is **`22008` "interval out of range"**, PostgreSQL's code and message: a `days` sum
+beyond `i32` in `justify_hours`, or a `months` sum beyond `i32` in `justify_days` /
+`justify_interval`. Each call charges one `operator_eval`, like every scalar function. PostgreSQL
+returns its infinite intervals unchanged; jed has no infinite interval, so every input is finite.
 
 ## 6. Literals, casts, keys, cost
 

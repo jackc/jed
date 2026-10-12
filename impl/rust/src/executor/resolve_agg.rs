@@ -627,6 +627,10 @@ pub(crate) fn scalar_func_id(name: &str) -> ScalarFunc {
         "make_date" => ScalarFunc::MakeDate,
         "current_date" => ScalarFunc::CurrentDate,
         "date_part" => ScalarFunc::DatePart,
+        // interval normalizers (interval.md §5.1).
+        "justify_hours" => ScalarFunc::JustifyHours,
+        "justify_days" => ScalarFunc::JustifyDays,
+        "justify_interval" => ScalarFunc::JustifyInterval,
         // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
         "uuid_extract_version" => ScalarFunc::UuidExtractVersion,

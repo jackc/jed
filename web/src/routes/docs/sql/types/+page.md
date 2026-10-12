@@ -99,6 +99,11 @@ RETURNING body, raw;`;
   EXTRACT(day FROM interval '40 days 5 hours')            AS interval_days,
   (timestamp '2024-03-15 13:47:23')::date                 AS as_date;`;
 
+	const justifyDemo = `SELECT
+  justify_hours(interval '50 hours')            AS hours_to_days,
+  justify_days(interval '45 days')              AS days_to_months,
+  justify_interval(interval '1 mon -1 hour')    AS same_sign;`;
+
 	const dateArithDemo = `SELECT
   date '2024-01-15' + 30                    AS in_30_days,
   date '2024-03-01' - date '2024-01-15'     AS days_between,
@@ -380,6 +385,13 @@ explicit zone:
 name is a runtime string, and over a `date` the timestamp fields exist (`date_part('hour', d)` is
 `0`), exactly as in PostgreSQL. (A runtime `text` value casts to every datetime type, and every
 datetime casts to `text` — a `timestamptz` in the session time zone.)
+
+An `interval` keeps its months, days, and time as separate fields, so `interval '50 hours'` stays
+`50:00:00`. PostgreSQL's `justify_hours` moves whole 24-hour chunks into days, `justify_days` moves
+whole 30-day chunks into months, and `justify_interval` does both and gives every field the same
+sign:
+
+<LiveSql demo="justifyDemo" query={justifyDemo} rows={1} />
 
 ### Date arithmetic
 

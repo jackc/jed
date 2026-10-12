@@ -325,6 +325,80 @@ export function tsDiff(a: bigint, b: bigint): Interval {
   return { months: 0, days: Number(days), micros: rem };
 }
 
+// justifyHours is PostgreSQL justify_hours (spec/design/interval.md §5.1): whole 24 h chunks of
+// micros move into days, then days and micros are given the same sign (borrowing one day). months
+// is untouched. A day count beyond i32 traps 22008.
+export function justifyHours(iv: Interval): Interval {
+  const wholeDay = iv.micros / MICROS_PER_DAY; // trunc toward zero
+  let micros = iv.micros - wholeDay * MICROS_PER_DAY;
+  let days = checkedI32(iv.days + Number(wholeDay));
+  if (days > 0 && micros < 0n) {
+    micros += MICROS_PER_DAY;
+    days--;
+  } else if (days < 0 && micros > 0n) {
+    micros -= MICROS_PER_DAY;
+    days++;
+  }
+  return { months: iv.months, days, micros };
+}
+
+// justifyDays is PostgreSQL justify_days (spec/design/interval.md §5.1): whole 30-day chunks of
+// days move into months, then months and days are given the same sign (borrowing one month).
+// micros is untouched. A month count beyond i32 traps 22008.
+export function justifyDays(iv: Interval): Interval {
+  const dpm = Number(DAYS_PER_MONTH);
+  const wholeMonth = Math.trunc(iv.days / dpm);
+  let days = iv.days - wholeMonth * dpm;
+  let months = checkedI32(iv.months + wholeMonth);
+  if (months > 0 && days < 0) {
+    days += dpm;
+    months--;
+  } else if (months < 0 && days > 0) {
+    days -= dpm;
+    months++;
+  }
+  return { months, days, micros: iv.micros };
+}
+
+// justifyInterval is PostgreSQL justify_interval (spec/design/interval.md §5.1): both
+// justifications, with 0 <= |micros| < 24 h, 0 <= |days| < 30, and all three fields made the same
+// sign. Ported step for step from PG's interval_justify_interval, including its pre-justification
+// of days (which keeps the day sum within i32). A month count beyond i32 traps 22008.
+export function justifyInterval(iv: Interval): Interval {
+  const dpm = Number(DAYS_PER_MONTH);
+  let months = iv.months;
+  let days = iv.days;
+  let micros = iv.micros;
+  // Pre-justify days when days and micros share a sign (it might prevent overflow).
+  if ((days > 0 && micros > 0n) || (days < 0 && micros < 0n)) {
+    const wholeMonth = Math.trunc(days / dpm);
+    days -= wholeMonth * dpm;
+    months = checkedI32(months + wholeMonth);
+  }
+  const wholeDay = micros / MICROS_PER_DAY; // trunc toward zero
+  micros -= wholeDay * MICROS_PER_DAY;
+  // Cannot overflow: |days| < 30 after the pre-justify, or days and wholeDay differ in sign.
+  days += Number(wholeDay);
+  const wholeMonth = Math.trunc(days / dpm);
+  days -= wholeMonth * dpm;
+  months = checkedI32(months + wholeMonth);
+  if (months > 0 && (days < 0 || (days === 0 && micros < 0n))) {
+    days += dpm;
+    months--;
+  } else if (months < 0 && (days > 0 || (days === 0 && micros > 0n))) {
+    days -= dpm;
+    months++;
+  }
+  if (days > 0 && micros < 0n) {
+    micros += MICROS_PER_DAY;
+    days--;
+  } else if (days < 0 && micros > 0n) {
+    micros -= MICROS_PER_DAY;
+    days++;
+  }
+  return { months, days, micros };
+}
+
 // --- parsing -----------------------------------------------------------------
 
 function invalidInterval(detail: string): EngineError {

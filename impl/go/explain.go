@@ -1624,6 +1624,12 @@ func explainScalarFunc(f scalarFunc) string {
 		return "current_date"
 	case sfDatePart:
 		return "date_part"
+	case sfJustifyHours:
+		return "justify_hours"
+	case sfJustifyDays:
+		return "justify_days"
+	case sfJustifyInterval:
+		return "justify_interval"
 	case sfUuidExtractVersion:
 		return "uuid_extract_version"
 	case sfUuidExtractTimestamp:

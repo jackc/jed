@@ -88,6 +88,17 @@ test('the types page autoruns the bytea functions demo', async ({ page }) => {
   await expect(rows).toContainText('255');
 });
 
+test('the types page autoruns the interval justify demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // justify_hours('50 hours') = 2 days 02:00:00, justify_days('45 days') = 1 mon 15 days,
+  // justify_interval('1 mon -1 hour') = 29 days 23:00:00.
+  const justifyPanel = livePanel(page, 'justifyDemo');
+  const rows = justifyPanel.getByTestId('result-rows');
+  await expect(rows).toContainText('2 days 02:00:00');
+  await expect(rows).toContainText('1 mon 15 days');
+  await expect(rows).toContainText('29 days 23:00:00');
+});
+
 test('the types page autoruns the array cast demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
   // The array cast demo: array→text ({1,2,3}), text→i32[], i32[]→i64[] widening, and

@@ -768,6 +768,11 @@ const (
 	// a RUNTIME text value validated per row; a date source WIDENS TO MIDNIGHT (the timestamp
 	// matrix applies — PG's own definition); a timestamptz source decomposes in the session zone.
 	sfDatePart
+	// interval normalizers (spec/design/interval.md §5.1): justify_hours / justify_days /
+	// justify_interval(interval) → interval; a field beyond i32 traps 22008.
+	sfJustifyHours
+	sfJustifyDays
+	sfJustifyInterval
 	// uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
 	// sfUuidExtractVersion → i16 (NULL off-RFC-variant); sfUuidExtractTimestamp → timestamptz
 	// (the embedded instant for v1/v7, else NULL).

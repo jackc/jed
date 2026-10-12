@@ -277,6 +277,96 @@ pub fn ts_diff(a: i64, b: i64) -> Result<Interval> {
     })
 }
 
+/// PostgreSQL `justify_hours` (spec/design/interval.md §5.1): whole 24 h chunks of `micros` move
+/// into `days`, then `days` and `micros` are given the same sign (borrowing one day). `months` is
+/// untouched. A day count beyond `i32` traps `22008`.
+pub fn justify_hours(iv: &Interval) -> Result<Interval> {
+    let whole_day = iv.micros / MICROS_PER_DAY;
+    let mut micros = iv.micros - whole_day * MICROS_PER_DAY;
+    let mut days = i32::try_from(iv.days as i64 + whole_day)
+        .map_err(|_| field_overflow("interval out of range"))?;
+    if days > 0 && micros < 0 {
+        micros += MICROS_PER_DAY;
+        days -= 1;
+    } else if days < 0 && micros > 0 {
+        micros -= MICROS_PER_DAY;
+        days += 1;
+    }
+    Ok(Interval {
+        months: iv.months,
+        days,
+        micros,
+    })
+}
+
+/// PostgreSQL `justify_days` (spec/design/interval.md §5.1): whole 30-day chunks of `days` move
+/// into `months`, then `months` and `days` are given the same sign (borrowing one month).
+/// `micros` is untouched. A month count beyond `i32` traps `22008`.
+pub fn justify_days(iv: &Interval) -> Result<Interval> {
+    let whole_month = iv.days / DAYS_PER_MONTH as i32;
+    let mut days = iv.days - whole_month * DAYS_PER_MONTH as i32;
+    let mut months = iv
+        .months
+        .checked_add(whole_month)
+        .ok_or_else(|| field_overflow("interval out of range"))?;
+    if months > 0 && days < 0 {
+        days += DAYS_PER_MONTH as i32;
+        months -= 1;
+    } else if months < 0 && days > 0 {
+        days -= DAYS_PER_MONTH as i32;
+        months += 1;
+    }
+    Ok(Interval {
+        months,
+        days,
+        micros: iv.micros,
+    })
+}
+
+/// PostgreSQL `justify_interval` (spec/design/interval.md §5.1): both justifications, with
+/// `0 <= |micros| < 24 h`, `0 <= |days| < 30`, and all three fields made the same sign. Ported
+/// step for step from PG's `interval_justify_interval`, including its pre-justification of days
+/// (which keeps the day sum within `i32`). A month count beyond `i32` traps `22008`.
+pub fn justify_interval(iv: &Interval) -> Result<Interval> {
+    let oor = || field_overflow("interval out of range");
+    let dpm = DAYS_PER_MONTH as i32;
+    let mut months = iv.months;
+    let mut days = iv.days;
+    let mut micros = iv.micros;
+    // Pre-justify days when days and micros share a sign (it might prevent overflow).
+    if (days > 0 && micros > 0) || (days < 0 && micros < 0) {
+        let whole_month = days / dpm;
+        days -= whole_month * dpm;
+        months = months.checked_add(whole_month).ok_or_else(oor)?;
+    }
+    let whole_day = micros / MICROS_PER_DAY;
+    micros -= whole_day * MICROS_PER_DAY;
+    // Cannot overflow: |days| < 30 after the pre-justify, or days and whole_day differ in sign.
+    days += whole_day as i32;
+    let whole_month = days / dpm;
+    days -= whole_month * dpm;
+    months = months.checked_add(whole_month).ok_or_else(oor)?;
+    if months > 0 && (days < 0 || (days == 0 && micros < 0)) {
+        days += dpm;
+        months -= 1;
+    } else if months < 0 && (days > 0 || (days == 0 && micros > 0)) {
+        days -= dpm;
+        months += 1;
+    }
+    if days > 0 && micros < 0 {
+        micros += MICROS_PER_DAY;
+        days -= 1;
+    } else if days < 0 && micros > 0 {
+        micros -= MICROS_PER_DAY;
+        days += 1;
+    }
+    Ok(Interval {
+        months,
+        days,
+        micros,
+    })
+}
+
 // Span-canonical equality/ordering/hash (spec/design/interval.md §2): `'1 mon'` and `'30 days'`
 // must compare equal and land in the same DISTINCT/GROUP BY bucket, while each keeps its own
 // field representation for rendering. Hand-written (not derived) so the canonical span — not the

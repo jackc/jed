@@ -27591,6 +27591,11 @@ export type ScalarFuncName =
   | "make_date"
   | "current_date"
   | "date_part"
+  // interval normalizers (spec/design/interval.md §5.1): justify_hours / justify_days /
+  // justify_interval(interval) → interval; a field beyond i32 traps 22008.
+  | "justify_hours"
+  | "justify_days"
+  | "justify_interval"
   // uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
   // uuid_extract_version → i16 (NULL off-RFC-variant); uuid_extract_timestamp → timestamptz
   // (the embedded instant for v1/v7, else NULL).

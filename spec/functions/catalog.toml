@@ -2866,6 +2866,46 @@ result         = "interval"
 null           = "propagates"
 errors         = ["22008"]
 
+# --- interval normalizers (justify_hours / justify_days / justify_interval) ----
+# PostgreSQL's interval justification functions (../design/interval.md §5.1), ported step for step
+# from PG's interval_justify_*: justify_hours moves whole 24 h chunks of the time field into days,
+# justify_days moves whole 30-day chunks of the day field into months, and justify_interval does
+# both and makes all three fields the same sign. Each then gives the fields it touched the same
+# sign by borrowing one unit (justify_hours('1 day -1 hour') = 23:00:00). A month or day count
+# beyond i32 traps 22008 ("interval out of range", PG). Exact integer math, no float.
+[[operator]]
+name           = "justify_hours"
+kind           = "function"
+arity          = 1
+arg_families   = ["interval"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+errors         = ["22008"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "justify_days"
+kind           = "function"
+arity          = 1
+arg_families   = ["interval"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+errors         = ["22008"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "justify_interval"
+kind           = "function"
+arity          = 1
+arg_families   = ["interval"]
+arg_resolution = "none"
+result         = "interval"
+null           = "propagates"
+errors         = ["22008"]
+volatility     = "immutable"
+
 # --- timestamp constructors (make_timestamp / make_timestamptz) --------------
 # PostgreSQL's timestamp builders, the make_interval siblings (../design/functions.md §11) — every
 # parameter NAMED (year, month, mday, hour, min, sec), but NONE defaulted (all are required, unlike

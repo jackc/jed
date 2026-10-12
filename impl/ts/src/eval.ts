@@ -133,6 +133,9 @@ import {
   intervalAdd,
   intervalNeg,
   intervalSub,
+  justifyDays,
+  justifyHours,
+  justifyInterval,
   makeInterval,
   mulByFraction,
   parseInterval,
@@ -1344,6 +1347,17 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const f = Number(d.render());
         if (!Number.isFinite(f)) throw overflow("f64");
         return float64Value(f);
+      }
+      // interval normalizers (spec/design/interval.md §5.1). The NULL-input case is already
+      // handled above.
+      if (e.func === "justify_hours") {
+        return intervalValue(justifyHours((vals[0] as { iv: Interval }).iv));
+      }
+      if (e.func === "justify_days") {
+        return intervalValue(justifyDays((vals[0] as { iv: Interval }).iv));
+      }
+      if (e.func === "justify_interval") {
+        return intervalValue(justifyInterval((vals[0] as { iv: Interval }).iv));
       }
       // uuid extractors (spec/design/functions.md §12): pure bit inspection; NULL for a non-RFC
       // variant (and, for the timestamp, any version other than 1/7). The NULL-input case is

@@ -1,0 +1,141 @@
+# justify_hours / justify_days / justify_interval — PostgreSQL's interval normalizers
+# (spec/design/interval.md §5.1). justify_hours moves whole 24 h chunks of the time field into days,
+# justify_days moves whole 30-day chunks of the day field into months, and justify_interval does
+# both and makes all three fields the same sign. Each gives the fields it touches the same sign by
+# borrowing one unit. NULL propagates. A month or day count beyond i32 traps 22008 ("interval out
+# of range"). Each call charges one operator_eval + one row_produced, so a single-row call costs 2.
+# PostgreSQL-oracle-verified (postgres:18).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.i32, types.interval, resource.cost_metering
+
+# --- justify_hours: whole days out of the time field ----------------------------------------
+# cost: 2
+query T nosort
+SELECT justify_hours(INTERVAL '27 hours')
+----
+1 day 03:00:00
+
+query TTTT nosort
+SELECT justify_hours(INTERVAL '1 day -1 hour'), justify_hours(INTERVAL '-1 day 1 hour'), justify_hours(INTERVAL '-50 hours'), justify_hours(INTERVAL '2 mons 100:00:00')
+----
+23:00:00
+-23:00:00
+-2 days -02:00:00
+2 mons 4 days 04:00:00
+
+# months are left alone, even against the sign of days
+query TT nosort
+SELECT justify_hours(INTERVAL '1 mon -1 day'), justify_hours(INTERVAL '-1 mon 30:00:00')
+----
+1 mon -1 days
+-1 mons +1 day 06:00:00
+
+# --- justify_days: whole months out of the day field ----------------------------------------
+# cost: 2
+query T nosort
+SELECT justify_days(INTERVAL '35 days')
+----
+1 mon 5 days
+
+query TTTT nosort
+SELECT justify_days(INTERVAL '1 mon -1 day'), justify_days(INTERVAL '-1 mon 1 day'), justify_days(INTERVAL '-65 days'), justify_days(INTERVAL '65 days 30:00:00')
+----
+29 days
+-29 days
+-2 mons -5 days
+2 mons 5 days 30:00:00
+
+# the time field is left alone, even against the sign of days
+query T nosort
+SELECT justify_days(INTERVAL '1 day -30:00:00')
+----
+1 day -30:00:00
+
+# --- justify_interval: both, with every field the same sign ---------------------------------
+# cost: 2
+query T nosort
+SELECT justify_interval(INTERVAL '1 mon -1 hour')
+----
+29 days 23:00:00
+
+query TTTTTT nosort
+SELECT justify_interval(INTERVAL '-1 mon 1 hour'), justify_interval(INTERVAL '29 days 25 hours'), justify_interval(INTERVAL '1 mon -30 days -1 hour'), justify_interval(INTERVAL '-1 mon 30 days 1 hour'), justify_interval(INTERVAL '1 year -400 days 3:00:00'), justify_interval(INTERVAL '0 sec')
+----
+-29 days -23:00:00
+1 mon 01:00:00
+-01:00:00
+01:00:00
+-1 mons -9 days -21:00:00
+00:00:00
+
+# pre-justified days keep a large same-sign sum within range
+query TT nosort
+SELECT justify_interval(INTERVAL '2147483647 days 2562047788:00:54.775807'), justify_interval(INTERVAL '-2147483648 days -2562047788:00:54.775807')
+----
+6261765 years 7 mons 28 days 04:00:54.775807
+-6261765 years -7 mons -29 days -04:00:54.775807
+
+query T nosort
+SELECT justify_interval(INTERVAL '2147483647 days -2562047788:00:54.775807')
+----
+5668699 years 15 days 19:59:05.224193
+
+# --- NULL propagates ------------------------------------------------------------------------
+query TTT nosort
+SELECT justify_hours(NULL), justify_days(NULL), justify_interval(CAST(NULL AS interval))
+----
+NULL
+NULL
+NULL
+
+# --- over a column; the result keeps comparing by span ---------------------------------------
+statement ok
+CREATE TABLE iv (id i32 PRIMARY KEY, v interval)
+
+statement ok
+INSERT INTO iv VALUES (1, '50 hours'), (2, '45 days -1 hour'), (3, NULL), (4, '-1 year 400 days')
+
+query ITTT rowsort
+SELECT id, justify_hours(v), justify_days(v), justify_interval(v) FROM iv
+----
+1
+2 days 02:00:00
+50:00:00
+2 days 02:00:00
+2
+44 days 23:00:00
+1 mon 15 days -01:00:00
+1 mon 14 days 23:00:00
+3
+NULL
+NULL
+NULL
+4
+-1 years +400 days
+1 mon 10 days
+1 mon 10 days
+
+query IT nosort
+SELECT id, justify_interval(v) FROM iv WHERE justify_interval(v) = v ORDER BY id
+----
+1
+2 days 02:00:00
+2
+1 mon 14 days 23:00:00
+4
+1 mon 10 days
+
+# --- overflow: a month or day count beyond i32 is 22008 --------------------------------------
+statement error 22008
+SELECT justify_days(INTERVAL '2147483647 months 30 days')
+
+statement error 22008
+SELECT justify_hours(INTERVAL '2147483647 days 24 hours')
+
+statement error 22008
+SELECT justify_interval(INTERVAL '2147483647 months 30 days 1 hour')
+
+statement error 22008
+SELECT justify_interval(INTERVAL '2147483647 months 29 days 24 hours')
+
+statement error 22008
+SELECT justify_interval(INTERVAL '-2147483648 months -30 days')

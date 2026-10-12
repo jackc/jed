@@ -345,6 +345,13 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfCurrentDate
 	case "date_part":
 		return sfDatePart
+	// interval normalizers (interval.md §5.1).
+	case "justify_hours":
+		return sfJustifyHours
+	case "justify_days":
+		return sfJustifyDays
+	case "justify_interval":
+		return sfJustifyInterval
 	// uuid extractors + generators (functions.md §12, entropy.md §3). The generators are volatile
 	// (drawn from the entropy seam at eval); the kernel id is still the name.
 	case "uuid_extract_version":

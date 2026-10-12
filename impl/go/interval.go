@@ -267,6 +267,90 @@ func tsDiff(a, b int64) (Interval, error) {
 	return Interval{Months: 0, Days: int32(days), Micros: rem}, nil
 }
 
+// justifyHours is PostgreSQL justify_hours (spec/design/interval.md §5.1): whole 24 h chunks of
+// Micros move into Days, then Days and Micros are given the same sign (borrowing one day). Months
+// is untouched. A day count beyond i32 traps 22008.
+func justifyHours(iv Interval) (Interval, error) {
+	wholeDay := iv.Micros / microsPerDay
+	micros := iv.Micros - wholeDay*microsPerDay
+	d := int64(iv.Days) + wholeDay
+	if d < -2147483648 || d > 2147483647 {
+		return Interval{}, intervalFieldOverflow("interval out of range")
+	}
+	days := int32(d)
+	if days > 0 && micros < 0 {
+		micros += microsPerDay
+		days--
+	} else if days < 0 && micros > 0 {
+		micros -= microsPerDay
+		days++
+	}
+	return Interval{Months: iv.Months, Days: days, Micros: micros}, nil
+}
+
+// justifyDays is PostgreSQL justify_days (spec/design/interval.md §5.1): whole 30-day chunks of
+// Days move into Months, then Months and Days are given the same sign (borrowing one month).
+// Micros is untouched. A month count beyond i32 traps 22008.
+func justifyDays(iv Interval) (Interval, error) {
+	dpm := int32(daysPerMonth)
+	wholeMonth := iv.Days / dpm
+	days := iv.Days - wholeMonth*dpm
+	months, ok := addI32(iv.Months, wholeMonth)
+	if !ok {
+		return Interval{}, intervalFieldOverflow("interval out of range")
+	}
+	if months > 0 && days < 0 {
+		days += dpm
+		months--
+	} else if months < 0 && days > 0 {
+		days -= dpm
+		months++
+	}
+	return Interval{Months: months, Days: days, Micros: iv.Micros}, nil
+}
+
+// justifyInterval is PostgreSQL justify_interval (spec/design/interval.md §5.1): both
+// justifications, with 0 <= |Micros| < 24 h, 0 <= |Days| < 30, and all three fields made the same
+// sign. Ported step for step from PG's interval_justify_interval, including its pre-justification
+// of days (which keeps the day sum within i32). A month count beyond i32 traps 22008.
+func justifyInterval(iv Interval) (Interval, error) {
+	dpm := int32(daysPerMonth)
+	months, days, micros := iv.Months, iv.Days, iv.Micros
+	var ok bool
+	// Pre-justify days when days and micros share a sign (it might prevent overflow).
+	if (days > 0 && micros > 0) || (days < 0 && micros < 0) {
+		wholeMonth := days / dpm
+		days -= wholeMonth * dpm
+		if months, ok = addI32(months, wholeMonth); !ok {
+			return Interval{}, intervalFieldOverflow("interval out of range")
+		}
+	}
+	wholeDay := micros / microsPerDay
+	micros -= wholeDay * microsPerDay
+	// Cannot overflow: |days| < 30 after the pre-justify, or days and wholeDay differ in sign.
+	days += int32(wholeDay)
+	wholeMonth := days / dpm
+	days -= wholeMonth * dpm
+	if months, ok = addI32(months, wholeMonth); !ok {
+		return Interval{}, intervalFieldOverflow("interval out of range")
+	}
+	if months > 0 && (days < 0 || (days == 0 && micros < 0)) {
+		days += dpm
+		months--
+	} else if months < 0 && (days > 0 || (days == 0 && micros > 0)) {
+		days -= dpm
+		months++
+	}
+	if days > 0 && micros < 0 {
+		micros += microsPerDay
+		days--
+	} else if days < 0 && micros > 0 {
+		micros -= microsPerDay
+		days++
+	}
+	return Interval{Months: months, Days: days, Micros: micros}, nil
+}
+
 // --- parsing -----------------------------------------------------------------
 
 func invalidInterval(detail string) error       { return newError(InvalidDatetimeFormat, detail) }

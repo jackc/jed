@@ -2824,6 +2824,23 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return Value{}, err
 			}
 			return Float64Value(f), nil
+		case sfJustifyHours, sfJustifyDays, sfJustifyInterval:
+			// interval normalizers (spec/design/interval.md §5.1). The NULL-input case is already
+			// handled above.
+			var iv Interval
+			var err error
+			switch e.sfunc {
+			case sfJustifyHours:
+				iv, err = justifyHours(vals[0].interval())
+			case sfJustifyDays:
+				iv, err = justifyDays(vals[0].interval())
+			default:
+				iv, err = justifyInterval(vals[0].interval())
+			}
+			if err != nil {
+				return Value{}, err
+			}
+			return IntervalValue(iv), nil
 		case sfUuidExtractVersion:
 			// uuid extractors (spec/design/functions.md §12): pure bit inspection; NULL for a
 			// non-RFC variant (and, for the timestamp, any version other than 1/7). The

@@ -2790,6 +2790,11 @@ pub(crate) enum ScalarFunc {
     /// per row; a date source WIDENS TO MIDNIGHT (the timestamp matrix applies — PG's own
     /// definition); a timestamptz source decomposes in the session zone.
     DatePart,
+    /// justify_hours / justify_days / justify_interval(interval) → interval — PostgreSQL's interval
+    /// normalizers (spec/design/interval.md §5.1); a field beyond i32 traps 22008.
+    JustifyHours,
+    JustifyDays,
+    JustifyInterval,
     /// uuid_extract_version(uuid) → i16 — the version nibble, NULL off-RFC-variant (§12).
     UuidExtractVersion,
     /// uuid_extract_timestamp(uuid) → timestamptz — the embedded instant for v1/v7, else NULL (§12).

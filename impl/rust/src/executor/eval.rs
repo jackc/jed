@@ -2284,6 +2284,18 @@ impl RExpr {
                         let d = crate::datetime_fn::extract_field(&field, src)?;
                         decimal_to_float(&d, ScalarType::Float64)
                     }
+                    // interval normalizers (spec/design/interval.md §5.1). The NULL-input case is
+                    // already handled above.
+                    ScalarFunc::JustifyHours
+                    | ScalarFunc::JustifyDays
+                    | ScalarFunc::JustifyInterval => match &vals[0] {
+                        Value::Interval(iv) => Ok(Value::Interval(match func {
+                            ScalarFunc::JustifyHours => crate::interval::justify_hours(iv)?,
+                            ScalarFunc::JustifyDays => crate::interval::justify_days(iv)?,
+                            _ => crate::interval::justify_interval(iv)?,
+                        })),
+                        _ => unreachable!("resolver restricts justify_* to an interval"),
+                    },
                     // uuid extractors (spec/design/functions.md §12): pure bit inspection. Both
                     // return NULL (Value::Null) for a non-RFC variant; the timestamp also for any
                     // version other than 1/7. The NULL-input case is already handled above.
