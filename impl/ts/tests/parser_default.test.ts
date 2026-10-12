@@ -12,5 +12,6 @@ test("UPDATE default keyword with a continuing RHS is a column", () => {
   assert.equal(assignment.isDefault, false);
   assert.equal(assignment.value.kind, "binary");
   if (assignment.value.kind !== "binary") return;
-  assert.deepEqual(assignment.value.lhs, { kind: "column", name: "default" });
+  // `loc` is the reference's source position (spec/design/error-fields.md §10.4).
+  assert.deepEqual(assignment.value.lhs, { kind: "column", name: "default", loc: 23 });
 });

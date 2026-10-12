@@ -121,11 +121,13 @@ export type BinaryOp =
 // comparison/logical/null-test node is boolean-valued; arithmetic and
 // columns/integer-literals are integer-valued.
 export type Expr =
-  | { kind: "column"; name: string }
+  // A bare column reference; `loc` is its source character position (SrcLoc).
+  | { kind: "column"; name: string; loc?: SrcLoc }
   // A qualified column reference `rel.col`, where `rel` is a relation label in the FROM clause
   // (its alias, else its table name). Resolved against exactly that one relation, never
-  // ambiguous (spec/design/grammar.md §15). Bare "column" stays the unqualified form.
-  | { kind: "qualifiedColumn"; qualifier: string; name: string }
+  // ambiguous (spec/design/grammar.md §15). Bare "column" stays the unqualified form. `loc` is the
+  // qualifier's source character position (SrcLoc).
+  | { kind: "qualifiedColumn"; qualifier: string; name: string; loc?: SrcLoc }
   | { kind: "literal"; literal: Literal }
   // A typed string literal `type '...'` (spec/design/grammar.md §36) — PostgreSQL's `type 'string'`,
   // equal to CAST('string' AS type) over a string-literal operand. typeName names the target scalar
@@ -390,6 +392,8 @@ export type OrderKey = {
   // column-reference key (ordinal and expr both null).
   qualifier: string | null;
   column: string;
+  // The column-reference key's source character position (SrcLoc).
+  loc?: SrcLoc;
   // An optional explicit `COLLATE "name"` on this sort key (spec/design/collation.md §1); null means
   // the column's collation (the database default, C, until slice 1d). A non-C name orders this key by
   // that collation's UCA sort key; an unknown name is 42704, a non-text column with a COLLATE is 42804.
@@ -486,7 +490,8 @@ export type ColumnDef = {
 // isDefault marks the standalone UPDATE-only `SET column = DEFAULT` form. `value` is a parser
 // placeholder in that case and is never resolved; ON CONFLICT keeps its ordinary-expression RHS
 // until its separate DEFAULT follow-on lands.
-export type Assignment = { column: string; isDefault: boolean; value: Expr };
+// `loc` is the target name's source character position (SrcLoc).
+export type Assignment = { column: string; loc?: SrcLoc; isDefault: boolean; value: Expr };
 
 // CreateTable is a CREATE TABLE statement. tablePks is the table-level
 // `PRIMARY KEY (a, b, ...)` constraints, each a list of member column names in key order
@@ -824,6 +829,9 @@ export type Insert = {
   // (spec/design/attached-databases.md §3). undefined = implicit scope.
   db?: string;
   columns: string[] | null;
+  // Each `columns` name's source character position (SrcLoc), index-aligned; undefined when there is
+  // no list or no positions were recorded.
+  columnLocs?: SrcLoc[];
   // The optional `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md §13),
   // governing IDENTITY columns. null is the default (no override).
   overriding: Overriding | null;
@@ -937,7 +945,18 @@ export type TableRef = {
   // rewrites edit this FROM item. Meaningful only when parsing a view definition; ignored by
   // structural AST equality (astDeepEqual skips every `pos` key).
   pos?: TableRefPos;
+  // The table name's source character position (SrcLoc) — the database qualifier's for `db.t` — for
+  // a 42P01 on this reference.
+  loc?: SrcLoc;
 };
+
+// SrcLoc is a 1-based CHARACTER (code point) position in the statement text the host passed
+// (spec/design/error-fields.md §10), recorded on the AST nodes that name things so a resolution error
+// can carry Position. Recorded only by a parse of host-written text (a parse of stored text leaves
+// every `loc` unset — §10.1) and only when known (> 0). Invisible to structural AST equality:
+// astDeepEqual skips every `loc` key, like the view-rewrite token positions (`pos`), so `a + b`
+// written twice still matches.
+export type SrcLoc = number;
 
 // TableRefPos is the token positions a base-table FROM item occupies in its statement's token
 // stream (views.md §5/§7): the table-name token, the alias identifier token (when aliased), and the
@@ -1264,6 +1283,11 @@ export type CreateView = {
   ifNotExists: boolean;
   columns: string[] | null;
   body: string;
+  // The source character positions (SrcLoc) of the body's tokens in the statement text, index-aligned
+  // with lex(body) (its eof gets the position just past the body), so validating the body reports
+  // positions into the text the host wrote (spec/design/error-fields.md §10.1). Empty when the
+  // statement was itself stored text.
+  bodyLocs: SrcLoc[];
   // A trailing `WITH [CASCADED | LOCAL] CHECK OPTION` (views.md §15.6); bare `WITH CHECK OPTION` is
   // "cascaded".
   checkOption: CheckOption | null;

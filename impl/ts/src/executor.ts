@@ -263,11 +263,12 @@ import {
   parseExpression,
   parseSQL,
   parseViewDefinition,
+  parseViewDefinitionAt,
   quoteIdentifier,
   rewriteColumnIdentifier,
   rewriteTableQualifier,
 } from "./parser.ts";
-import { lex } from "./lexer.ts";
+import { charCount, lex } from "./lexer.ts";
 import {
   type TraceItem,
   type ViewAlterChange,
@@ -2425,18 +2426,31 @@ export class Engine {
     let statementsRun = 0;
     let rowsAffectedTotal = 0;
     let cost = 0n;
+    // The characters before the current statement, counted incrementally: a statement's error
+    // position is shifted into the script's coordinates (spec/design/error-fields.md §10.1). Span
+    // offsets are UTF-16 indices; positions count code points.
+    let counted = 0;
+    let before = 0;
     for (const span of splitStatements(sql)) {
-      const ast = this.parse(span.text);
-      // Transaction control inside a script is the v1 narrowing (session.md §4.2): the implicit
-      // wrapper owns the boundary, so BEGIN/COMMIT/ROLLBACK is 0A000 (partitioning deferred).
-      if (ast.kind === "begin" || ast.kind === "commit" || ast.kind === "rollback") {
-        throw engineError(
-          "feature_not_supported",
-          "transaction control (BEGIN/COMMIT/ROLLBACK) is not supported inside execute_script; " +
-            "use splitStatements to run a self-managed multi-statement transaction",
-        );
+      before += charCount(sql, counted, span.offset);
+      counted = span.offset;
+      let out: Outcome;
+      try {
+        const ast = this.parse(span.text);
+        // Transaction control inside a script is the v1 narrowing (session.md §4.2): the implicit
+        // wrapper owns the boundary, so BEGIN/COMMIT/ROLLBACK is 0A000 (partitioning deferred).
+        if (ast.kind === "begin" || ast.kind === "commit" || ast.kind === "rollback") {
+          throw engineError(
+            "feature_not_supported",
+            "transaction control (BEGIN/COMMIT/ROLLBACK) is not supported inside execute_script; " +
+              "use splitStatements to run a self-managed multi-statement transaction",
+          );
+        }
+        out = this.executeStmtParams(ast, []);
+      } catch (e) {
+        if (e instanceof EngineError) e.shiftPosition(before);
+        throw e;
       }
-      const out = this.executeStmtParams(ast, []);
       statementsRun++;
       if (out.kind === "statement" && out.rowsAffected !== null)
         rowsAffectedTotal += out.rowsAffected;
@@ -9787,7 +9801,7 @@ export class Engine {
           throw engineError(
             "undefined_column",
             `column ${name} of relation ${table.name} does not exist`,
-          );
+          ).withPosition(ins.columnLocs?.[p]);
         }
         if (provided[idx]! >= 0) {
           throw engineError(
@@ -10036,7 +10050,7 @@ export class Engine {
           throw engineError(
             "undefined_column",
             `column ${name} of relation ${table.name} does not exist`,
-          );
+          ).withPosition(ins.columnLocs?.[p]);
         }
         if (provided[idx]! >= 0) {
           throw engineError(
@@ -10823,7 +10837,11 @@ export class Engine {
     const plans: AssignPlan[] = [];
     for (const a of oc.assignments) {
       const idx = columnIndex(table, a.column);
-      if (idx < 0) throw engineError("undefined_column", "column does not exist: " + a.column);
+      if (idx < 0) {
+        throw engineError("undefined_column", "column does not exist: " + a.column).withPosition(
+          a.loc,
+        );
+      }
       if (table.columns[idx]!.identity === "always") {
         throw engineError("generated_always", `column ${a.column} can only be updated to DEFAULT`);
       }
@@ -11943,7 +11961,9 @@ export class Engine {
     for (const a of upd.assignments) {
       const idx = columnIndex(table, a.column);
       if (idx < 0) {
-        throw engineError("undefined_column", "column does not exist: " + a.column);
+        throw engineError("undefined_column", "column does not exist: " + a.column).withPosition(
+          a.loc,
+        );
       }
       // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4).
       // An ordinary assignment is 428C9; DEFAULT is allowed and advances the owned sequence.
@@ -13354,13 +13374,15 @@ export class Engine {
   // prepareViewWrite validates a write through name and builds its layer chain (views.md §15.3 steps
   // 2–6), or returns null when the target is not a view. targets are the statement's target view
   // columns: the INSERT column list (null = every view column) or the UPDATE SET columns, in order;
-  // DELETE has none.
+  // DELETE has none. targetLocs holds each target's source character position, index-aligned
+  // (undefined when unknown), for a 42703 (spec/design/error-fields.md §10.2).
   private prepareViewWrite(
     db: string | undefined,
     name: string,
     kind: WriteKind,
     onConflict: boolean,
     targets: string[] | null,
+    targetLocs: (number | undefined)[] = [],
   ): ViewWrite | null {
     const view = this.dmlTargetView(db, name);
     if (view === undefined) return null;
@@ -13382,10 +13404,14 @@ export class Engine {
       if (targets === null) {
         cur = view.columns.map((_c, i) => i);
       } else {
-        for (const t of targets) {
+        for (let i = 0; i < targets.length; i++) {
+          const t = targets[i]!;
           const idx = view.columns.indexOf(t);
           if (idx < 0) {
-            throw engineError("undefined_column", `column ${t} of relation ${view.name} does not exist`);
+            throw engineError(
+              "undefined_column",
+              `column ${t} of relation ${view.name} does not exist`,
+            ).withPosition(targetLocs[i]);
           }
           if (cur.includes(idx)) {
             throw engineError(
@@ -13554,7 +13580,14 @@ export class Engine {
   // the statement (the written one is left intact) and the write, or the statement unchanged and null
   // when the target is not a view.
   rewriteInsertTarget(ins: Insert): { ins: Insert; vw: ViewWrite | null } {
-    const vw = this.prepareViewWrite(ins.db, ins.table, "insert", ins.onConflict !== null, ins.columns);
+    const vw = this.prepareViewWrite(
+      ins.db,
+      ins.table,
+      "insert",
+      ins.onConflict !== null,
+      ins.columns,
+      ins.columnLocs,
+    );
     if (vw === null) return { ins, vw };
     const { db: _db, ...rest } = ins;
     return { ins: { ...rest, table: vw.table, columns: vw.targets.slice() }, vw };
@@ -13570,6 +13603,7 @@ export class Engine {
       "update",
       false,
       upd.assignments.map((a) => a.column),
+      upd.assignments.map((a) => a.loc),
     );
     if (vw === null) return { upd, vw };
     const { db: _db, ...rest } = upd;
@@ -13621,7 +13655,7 @@ export class Engine {
     //    consumed by a special-cased form (a parameter CAST) is caught on the tokens right after
     //    planning.
     const tokens = lex(cv.body);
-    let { body, depth } = parseViewDefinition(cv.body);
+    let { body, depth } = parseViewDefinitionAt(cv.body, cv.bodyLocs);
     const first = this.traceViewBody(body);
     const param = tokens.find((t) => t.kind === "param");
     if (param !== undefined) {
@@ -13662,6 +13696,10 @@ export class Engine {
       definition = frozen;
       ({ body, depth } = refrozen);
       trace = second.trace;
+    } else if (cv.bodyLocs.length > 0) {
+      // The stored body carries no positions: they point into this statement, not into the view's
+      // later uses (spec/design/error-fields.md §10.1).
+      body = parseViewDefinition(cv.body).body;
     }
     const deps = this.traceDependencies(trace);
     // 7. The creating session's SELECT privilege on every relation the body reads (§9).
@@ -14690,7 +14728,13 @@ export class Engine {
           this.rejectAttachedView(tref.db, tref.name);
           // Validate the qualifier against the implicit scope, then resolve through the temp-first
           // funnel (which, by preclude-overlaps, lands in the validated scope).
-          this.checkTableQualifier(tref.db, tref.name);
+          try {
+            this.checkTableQualifier(tref.db, tref.name);
+          } catch (e) {
+            // An unknown qualified relation is positioned at the name (error-fields.md §10.2).
+            if (e instanceof EngineError && e.state === "undefined_table") e.withPosition(tref.loc);
+            throw e;
+          }
           // Route to the qualified database's catalog (attached-databases.md §3): main/temp fall through
           // to the temp-first funnel (preclude-overlaps lands them in the validated scope), a host
           // attachment resolves in its own snapshot — where its table lives ONLY. The 1a read path used
@@ -14700,7 +14744,7 @@ export class Engine {
             throw engineError(
               "undefined_table",
               "table does not exist: " + tref.db + "." + tref.name,
-            );
+            ).withPosition(tref.loc);
           }
           this.traceTableItem(tref, tbl);
           t =
@@ -14749,7 +14793,12 @@ export class Engine {
             srf = { kind, args: [], introspectScope: "main" };
           } else {
             const tbl = this.lkpTable(tref.name); // temp-first (temp-tables.md §3)
-            if (!tbl) throw engineError("undefined_table", "table does not exist: " + tref.name);
+            if (!tbl) {
+              throw engineError(
+                "undefined_table",
+                "table does not exist: " + tref.name,
+              ).withPosition(tref.loc);
+            }
             this.traceTableItem(tref, tbl);
             t =
               tref.columnAliases !== undefined
@@ -15212,13 +15261,13 @@ export class Engine {
         orderExpr = key.expr;
       } else if (key.qualifier !== null) {
         // A qualified key (`t.a`) is always an input column — never an output alias (PG; §10).
-        slotRes = scope.resolveQualified(key.qualifier, key.column);
+        slotRes = scope.resolveQualifiedAt(key.qualifier, key.column, key.loc);
       } else {
         // A bare name resolves an OUTPUT column (an AS alias or item's derived name) BEFORE an input
         // column — PostgreSQL's SQL92 rule (grammar.md §10). A match routes the item EXACTLY like the
         // same ORDER BY ordinal; no match falls through to the FROM scope (the prior behavior).
         const matched = orderAliasMatch(items, key.column, scope);
-        if (matched === null) slotRes = scope.resolveBare(key.column);
+        if (matched === null) slotRes = scope.resolveBareAt(key.column, key.loc);
         else if (matched.kind === "column") slotRes = scope.resolveBare(matched.name);
         else if (matched.kind === "qualifiedColumn")
           slotRes = scope.resolveQualified(matched.qualifier, matched.name);
@@ -26452,7 +26501,7 @@ export function resolveGroupNamed(
   if (term.kind === "column") {
     let r: Resolved;
     try {
-      r = scope.resolveBare(term.name);
+      r = scope.resolveBareAt(term.name, term.loc);
     } catch (e) {
       // No input column of this name: try an output alias (`SELECT a+b AS s … GROUP BY s`). If none
       // matches either, propagate the original 42703.
@@ -26471,7 +26520,7 @@ export function resolveGroupNamed(
     return { kind: "column", index: r.index };
   }
   if (term.kind === "qualifiedColumn") {
-    const r = scope.resolveQualified(term.qualifier, term.name);
+    const r = scope.resolveQualifiedAt(term.qualifier, term.name, term.loc);
     if (r.level !== 0) {
       throw engineError(
         "feature_not_supported",
@@ -26490,10 +26539,10 @@ export function resolveGroupNamed(
 // (aggregates.md §15).
 export function resolveGroupExpr(scope: Scope, e: Expr, params: ParamTypes): GroupKeyResolved {
   if (e.kind === "column") {
-    const r = scope.resolveBare(e.name);
+    const r = scope.resolveBareAt(e.name, e.loc);
     if (r.level === 0) return { kind: "column", index: r.index };
   } else if (e.kind === "qualifiedColumn") {
-    const r = scope.resolveQualified(e.qualifier, e.name);
+    const r = scope.resolveQualifiedAt(e.qualifier, e.name, e.loc);
     if (r.level === 0) return { kind: "column", index: r.index };
   }
   const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
@@ -30887,8 +30936,8 @@ export function resolveOrderedSetAggregate(
     key.expr !== null && key.expr !== undefined
       ? key.expr
       : key.qualifier !== null && key.qualifier !== undefined && key.qualifier !== ""
-        ? { kind: "qualifiedColumn", qualifier: key.qualifier, name: key.column }
-        : { kind: "column", name: key.column };
+        ? { kind: "qualifiedColumn", qualifier: key.qualifier, name: key.column, loc: key.loc }
+        : { kind: "column", name: key.column, loc: key.loc };
   const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
   const r = resolve(scope, keyExpr, null, sub, params);
   const operand = r.node;
@@ -31074,8 +31123,8 @@ export function resolveHypotheticalSetAggregate(
       key.expr !== null && key.expr !== undefined
         ? key.expr
         : key.qualifier !== null && key.qualifier !== undefined && key.qualifier !== ""
-          ? { kind: "qualifiedColumn", qualifier: key.qualifier, name: key.column }
-          : { kind: "column", name: key.column };
+          ? { kind: "qualifiedColumn", qualifier: key.qualifier, name: key.column, loc: key.loc }
+          : { kind: "column", name: key.column, loc: key.loc };
     const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
     const r = resolve(scope, keyExpr, null, sub, params);
     const ktype = r.type;
@@ -31201,8 +31250,9 @@ export function resolveGrouping(
   const positions: number[] = [];
   for (const arg of e.args) {
     let r: { level: number; index: number };
-    if (arg.kind === "column") r = scope.resolveBare(arg.name);
-    else if (arg.kind === "qualifiedColumn") r = scope.resolveQualified(arg.qualifier, arg.name);
+    if (arg.kind === "column") r = scope.resolveBareAt(arg.name, arg.loc);
+    else if (arg.kind === "qualifiedColumn")
+      r = scope.resolveQualifiedAt(arg.qualifier, arg.name, arg.loc);
     // A non-column argument is never a grouping column (jed groups by columns only).
     else throw groupingArgErr();
     if (r.level !== 0) throw groupingArgErr();

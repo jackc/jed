@@ -28,6 +28,12 @@ export class EngineError extends Error {
   // on the class-23 violations, subject to the session's SELECT privilege
   // (spec/design/error-fields.md §9). Never part of the rendered message.
   detail?: string;
+  // The 1-based CHARACTER (code point) offset into the statement text of the offending token — set
+  // for lexer/parser errors and name-resolution errors (spec/design/error-fields.md §10).
+  position?: number;
+  // PostgreSQL's HINT suggestion (`Perhaps you meant to reference the column "t.name".`) —
+  // spec/design/error-fields.md §11. Never part of the rendered message.
+  hint?: string;
 
   constructor(state: SqlState, message: string) {
     super(`${sqlStateCode(state)}: ${message}`);
@@ -64,6 +70,24 @@ export class EngineError extends Error {
   // through.
   withDetail(detail: string | undefined): this {
     this.detail = detail;
+    return this;
+  }
+  // withPosition sets Position unless one is already set: the innermost site that knows a location
+  // wins (spec/design/error-fields.md §10.2). A position of 0 (or undefined) means "unknown" and is
+  // ignored.
+  withPosition(pos: number | undefined): this {
+    if (this.position === undefined && pos !== undefined && pos > 0) this.position = pos;
+    return this;
+  }
+  // shiftPosition moves Position by `chars` characters — a statement's error moved into the
+  // coordinates of the script that contains it (spec/design/error-fields.md §10.1).
+  shiftPosition(chars: number): this {
+    if (this.position !== undefined) this.position += chars;
+    return this;
+  }
+  // withHint sets Hint unless one is already set (spec/design/error-fields.md §11).
+  withHint(hint: string | undefined): this {
+    if (this.hint === undefined) this.hint = hint;
     return this;
   }
 }

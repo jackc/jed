@@ -923,17 +923,24 @@ export function resolveSetopOrderKey(key: OrderKey, names: string[]): number {
     return ord - 1;
   }
   if (key.qualifier !== null) {
-    throw engineError("undefined_table", "missing FROM-clause entry for table " + key.qualifier);
+    throw engineError(
+      "undefined_table",
+      "missing FROM-clause entry for table " + key.qualifier,
+    ).withPosition(key.loc);
   }
   const idx = names.indexOf(key.column);
-  if (idx < 0) throw engineError("undefined_column", "column " + key.column + " does not exist");
+  if (idx < 0) {
+    throw engineError("undefined_column", "column " + key.column + " does not exist").withPosition(
+      key.loc,
+    );
+  }
   return idx;
 }
 
 // exprEqual reports whether two parsed expression trees are STRUCTURALLY equal (spec/design/grammar.md
 // §10) — the TS equivalent of the Rust core's derived PartialEq on Expr (and the Go core's
 // reflect.DeepEqual). Used by the SELECT DISTINCT ORDER BY restriction to decide whether an expression
-// sort key matches a select-list expression. The AST carries no source positions, so textually-
+// sort key matches a select-list expression. Source positions are ignored, so textually-
 // identical fragments (`a + b` here and there) compare equal; the recursion descends arrays and the
 // discriminated-union nodes, comparing primitives (incl. bigint and a Decimal's fields) by value.
 export function exprEqual(a: Expr, b: Expr): boolean {
@@ -955,10 +962,11 @@ export function astDeepEqual(a: unknown, b: unknown): boolean {
   const ao = a as Record<string, unknown>;
   const bo = b as Record<string, unknown>;
   // A `pos` key is a token position a view-definition parse records (TableRef / `*` / `rel.*` —
-  // spec/design/views.md §5/§7); it is invisible to structural equality, like Rust's always-equal
-  // TableRefPos / StarPos.
-  const ak = Object.keys(ao).filter((k) => k !== "pos");
-  if (ak.length !== Object.keys(bo).filter((k) => k !== "pos").length) return false;
+  // spec/design/views.md §5/§7), and a `loc` key a source character position (ast.ts SrcLoc,
+  // spec/design/error-fields.md §10.4); both are invisible to structural equality, like Rust's
+  // always-equal TableRefPos / StarPos / SrcPos.
+  const ak = Object.keys(ao).filter((k) => k !== "pos" && k !== "loc");
+  if (ak.length !== Object.keys(bo).filter((k) => k !== "pos" && k !== "loc").length) return false;
   for (const k of ak) {
     if (!Object.hasOwn(bo, k)) return false;
     if (!astDeepEqual(ao[k], bo[k])) return false;

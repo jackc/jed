@@ -224,3 +224,74 @@ test("error fields: detail shared cases", () => {
   }
   assert.deepEqual(failures, []);
 });
+
+// PositionCase is one case of the shared Position/Hint fixture (spec/errors/position_cases.txt).
+type PositionCase = {
+  name: string;
+  setup: string[];
+  run: string;
+  script: boolean;
+  code: string;
+  position: number | undefined;
+  hint: string | undefined;
+};
+
+function parsePositionCases(text: string): PositionCase[] {
+  const cases: PositionCase[] = [];
+  for (const line of text.split("\n")) {
+    if (line.trim() === "" || line.startsWith("#")) continue;
+    if (line.startsWith("case: ")) {
+      cases.push({
+        name: line.slice("case: ".length),
+        setup: [],
+        run: "",
+        script: false,
+        code: "",
+        position: undefined,
+        hint: undefined,
+      });
+      continue;
+    }
+    const c = cases[cases.length - 1];
+    if (c === undefined) throw new Error(`a directive before the first case: ${line}`);
+    const sep = line.indexOf(": ");
+    const key = sep < 0 ? line : line.slice(0, sep);
+    const v = sep < 0 ? "" : line.slice(sep + 2);
+    if (key === "setup") c.setup.push(v);
+    else if (key === "run") c.run = v;
+    else if (key === "script") {
+      c.run = v;
+      c.script = true;
+    } else if (key === "code") c.code = v;
+    else if (key === "position") c.position = Number(v);
+    else if (key === "hint") c.hint = v;
+    else if (line !== "no-position") throw new Error(`unknown position_cases directive: ${line}`);
+  }
+  return cases;
+}
+
+// The Position and Hint fields (spec/design/error-fields.md §10, §11): every case of the shared,
+// language-neutral fixture — the same file the Rust and Go cores run.
+test("error fields: position and hint shared cases", () => {
+  const path = new URL("../../../spec/errors/position_cases.txt", import.meta.url);
+  const cases = parsePositionCases(readFileSync(path, "utf8"));
+  assert.ok(cases.length > 0);
+  const failures: string[] = [];
+  for (const c of cases) {
+    const db = dbWith(c.setup);
+    try {
+      if (c.script) db.executeScript(c.run);
+      else db.execute(c.run);
+      failures.push(`${c.name}: expected ${c.code} but succeeded`);
+    } catch (e) {
+      if (!(e instanceof EngineError)) throw e;
+      if (e.code() !== c.code || e.position !== c.position || e.hint !== c.hint) {
+        failures.push(
+          `${c.name}: got ${e.code()} ${e.position} ${JSON.stringify(e.hint)} (${e.message}), ` +
+            `want ${c.code} ${c.position} ${JSON.stringify(c.hint)}`,
+        );
+      }
+    }
+  }
+  assert.deepEqual(failures, []);
+});

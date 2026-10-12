@@ -32,7 +32,8 @@ import {
   seqDataTypePgName,
   seqDataTypeRange,
 } from "./catalog.ts";
-import { type EngineError, engineError } from "./errors.ts";
+import { EngineError, engineError } from "./errors.ts";
+import { FuzzyColumnMatch, aliasHint } from "./error_hint.ts";
 import type { DecimalTypmod, ScalarType, Type } from "./types.ts";
 import {
   arrayT,
@@ -422,6 +423,88 @@ export class Scope {
     }
     if (this.parent !== null) return outerOf(this.parent.resolveQualified(qualifier, name));
     throw missingFromEntry(qualifier);
+  }
+
+  // resolveBareAt is resolveBare for a column reference written at `loc`: a name-resolution error
+  // carries the reference's position and its hint (spec/design/error-fields.md §10.2, §11).
+  resolveBareAt(name: string, loc: number | undefined): Resolved {
+    try {
+      return this.resolveBare(name);
+    } catch (e) {
+      throw this.locateColumnError(e, null, name, loc);
+    }
+  }
+
+  // resolveQualifiedAt is resolveQualified for a reference written at `loc` (§10.2, §11).
+  resolveQualifiedAt(qualifier: string, name: string, loc: number | undefined): Resolved {
+    try {
+      return this.resolveQualified(qualifier, name);
+    } catch (e) {
+      throw this.locateColumnError(e, qualifier, name, loc);
+    }
+  }
+
+  // locateColumnError stamps a column reference's 42703 / 42702 / 42P01 with its position, and adds
+  // the misspelled-column (§11.1) or table-alias (§11.2) hint. An error already positioned came from
+  // an inner site, which wins. Returns the (possibly annotated) error for the caller to rethrow.
+  private locateColumnError(
+    e: unknown,
+    qualifier: string | null,
+    name: string,
+    loc: number | undefined,
+  ): unknown {
+    if (!(e instanceof EngineError) || e.position !== undefined) return e;
+    const code = e.code();
+    if (code !== "42703" && code !== "42702" && code !== "42P01") return e;
+    let hint: string | undefined;
+    if (code === "42703") hint = this.fuzzyColumnHint(qualifier, name);
+    else if (code === "42P01" && qualifier !== null) hint = this.tableAliasHint(qualifier);
+    return e.withPosition(loc).withHint(hint);
+  }
+
+  // hintRelations is the labeled relations of the §11.1 walk at this level: the FROM relations in
+  // order, then the inner relations of an unaliased parenthesized join. Each yields its label and
+  // column names (a write through a view: the view's columns).
+  private hintRelations(): { label: string; cols: string[] }[] {
+    const out: { label: string; cols: string[] }[] = [];
+    for (const r of this.rels) {
+      if (r.label === "") continue;
+      const cols = r.layer !== undefined ? r.layer.columns : r.table.columns;
+      out.push({ label: r.label, cols: cols.map((c) => c.name) });
+    }
+    for (const sr of this.subRels) {
+      if (sr.label === "") continue;
+      out.push({ label: sr.label, cols: sr.table.columns.map((c) => c.name) });
+    }
+    return out;
+  }
+
+  // fuzzyColumnHint is PostgreSQL's misspelled-column hint over the scope chain
+  // (spec/design/error-fields.md §11.1).
+  private fuzzyColumnHint(qualifier: string | null, name: string): string | undefined {
+    const m = new FuzzyColumnMatch(qualifier, name);
+    for (let s: Scope | null = this; s !== null; s = s.parent) {
+      for (const { label, cols } of s.hintRelations()) {
+        const penalty = m.penalty(label);
+        for (const col of cols) m.offer(label, penalty, col);
+      }
+    }
+    return m.hint();
+  }
+
+  // tableAliasHint is the table-alias hint (spec/design/error-fields.md §11.2): the first base table
+  // or view reference in the scope chain whose catalog name is `qualifier` under a different label.
+  private tableAliasHint(qualifier: string): string | undefined {
+    for (let s: Scope | null = this; s !== null; s = s.parent) {
+      for (const r of s.rels) {
+        const catalogName =
+          r.view !== undefined ? r.view : r.base === true ? r.table.name : undefined;
+        if (catalogName === qualifier && r.label !== qualifier && r.label !== "") {
+          return aliasHint(r.label);
+        }
+      }
+    }
+    return undefined;
   }
 
   // columnAt returns the column at a flat index in THIS scope (index known valid).

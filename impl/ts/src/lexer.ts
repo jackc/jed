@@ -4,7 +4,7 @@
 // (matching Go's strconv.ParseInt(.., 64) behaviour). Errors throw EngineError.
 
 import { decimalFromParts, EXP_LIMIT } from "./decimal.ts";
-import { engineError } from "./errors.ts";
+import { EngineError, engineError } from "./errors.ts";
 import { utf8Length } from "./memsize.ts";
 import type { Token } from "./token.ts";
 
@@ -58,12 +58,79 @@ function scanExponent(sql: string, i: number): [number | null, number] {
 }
 
 // lex tokenizes sql into tokens terminated by an "eof" token.
+//
+// This is the stored-text entry point (a view body, a CHECK expression, a rename rewrite), so an
+// error carries no position: it would point into text the host never wrote
+// (spec/design/error-fields.md §10.1). lexRaw never sets one; only lexWithPositions stamps it.
 export function lex(sql: string): Token[] {
+  return lexRaw(sql, { starts: [], tokStart: 0 });
+}
+
+// lexWithPositions is lex, also returning each token's 1-based CHARACTER position in sql
+// (spec/design/error-fields.md §10.1), index-aligned with the tokens. The eof token's position is
+// one past the last character — PostgreSQL's "at end of input". An error carries the position of
+// the lexeme being scanned (spec/design/error-fields.md §10.2).
+export function lexWithPositions(sql: string): { tokens: Token[]; positions: number[] } {
+  const st: LexState = { starts: [], tokStart: 0 };
+  let tokens: Token[];
+  try {
+    tokens = lexRaw(sql, st);
+  } catch (e) {
+    if (e instanceof EngineError) e.withPosition(charPositions(sql, [st.tokStart])[0]);
+    throw e;
+  }
+  return { tokens, positions: charPositions(sql, st.starts) };
+}
+
+// charPositions converts ascending UTF-16 offsets into sql to 1-based character positions in one
+// pass. A character is a code point, so a surrogate pair counts once: count every code unit except
+// the low half of a pair.
+export function charPositions(sql: string, starts: number[]): number[] {
+  const out: number[] = [];
+  let b = 0;
+  let chars = 0;
+  for (const s of starts) {
+    while (b < s) {
+      if (!isPairLowHalf(sql, b)) chars++;
+      b++;
+    }
+    out.push(chars + 1);
+  }
+  return out;
+}
+
+// charCount is the number of characters (code points) in sql's UTF-16 range [from, to): a script
+// statement's error position is shifted by the characters before its span (error-fields.md §10.1).
+export function charCount(sql: string, from: number, to: number): number {
+  let chars = 0;
+  for (let b = from; b < to; b++) if (!isPairLowHalf(sql, b)) chars++;
+  return chars;
+}
+
+// isPairLowHalf reports whether the code unit at i is the low surrogate of a surrogate pair (the
+// second code unit of a code point that charPositions has already counted).
+function isPairLowHalf(sql: string, i: number): boolean {
+  const u = sql.charCodeAt(i);
+  if (u < 0xdc00 || u > 0xdfff || i === 0) return false;
+  const prev = sql.charCodeAt(i - 1);
+  return prev >= 0xd800 && prev <= 0xdbff;
+}
+
+// LexState is lexRaw's position bookkeeping: each token's start UTF-16 offset (index-aligned with
+// the tokens), and the offset where the lexeme being scanned began, so a caller can position an
+// error.
+type LexState = { starts: number[]; tokStart: number };
+
+// lexRaw is the lexer proper.
+function lexRaw(sql: string, st: LexState): Token[] {
   const tokens: Token[] = [];
   let i = 0;
   const n = sql.length;
 
   while (i < n) {
+    // The previous iteration's tokens started at its tokStart; this one's start at i.
+    while (st.starts.length < tokens.length) st.starts.push(st.tokStart);
+    st.tokStart = i;
     const c = sql[i]!;
     if (c === " " || c === "\t" || c === "\r" || c === "\n") {
       i++;
@@ -468,6 +535,9 @@ export function lex(sql: string): Token[] {
     }
   }
 
+  while (st.starts.length < tokens.length) st.starts.push(st.tokStart);
+  st.tokStart = n;
   tokens.push({ kind: "eof" });
+  st.starts.push(n);
   return tokens;
 }

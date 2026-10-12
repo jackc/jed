@@ -56,7 +56,8 @@ test("the exact boundary is MAX_EXPR_DEPTH", () => {
   assert.doesNotThrow(() => parseSQL(depthChain(MAX_EXPR_DEPTH - 1)));
   assert.throws(
     () => parseSQL(depthChain(MAX_EXPR_DEPTH)),
-    (e: unknown) => e instanceof EngineError && e.code() === "54001",
+    // A program limit is not a mistake at a place: no Position (spec/design/error-fields.md §10.2).
+    (e: unknown) => e instanceof EngineError && e.code() === "54001" && e.position === undefined,
   );
 });
 

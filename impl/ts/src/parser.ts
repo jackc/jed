@@ -48,6 +48,7 @@ import type {
   Statement,
   SubscriptSpec,
   TableRef,
+  SrcLoc,
   TableRefPos,
   TypeFieldDef,
   TypeMod,
@@ -62,7 +63,7 @@ import type {
 import { emptySeqOptions, seqOptionsHasAny } from "./ast.ts";
 import { Decimal } from "./decimal.ts";
 import { EngineError, engineError } from "./errors.ts";
-import { lex } from "./lexer.ts";
+import { lex, lexWithPositions } from "./lexer.ts";
 import type { Token, TokenKind } from "./token.ts";
 
 const I64_MIN = -9223372036854775808n;
@@ -248,6 +249,7 @@ function classifyOrderKey(
       expr: null,
       qualifier: null,
       column: expr.name,
+      loc: expr.loc,
       collation,
       descending,
       nullsFirst,
@@ -259,6 +261,7 @@ function classifyOrderKey(
       expr: null,
       qualifier: expr.qualifier,
       column: expr.name,
+      loc: expr.loc,
       collation,
       descending,
       nullsFirst,
@@ -274,6 +277,7 @@ function classifyOrderKey(
         expr: null,
         qualifier: null,
         column: expr.inner.name,
+        loc: expr.inner.loc,
         collation: expr.collation,
         descending,
         nullsFirst,
@@ -285,6 +289,7 @@ function classifyOrderKey(
         expr: null,
         qualifier: expr.inner.qualifier,
         column: expr.inner.name,
+        loc: expr.inner.loc,
         collation: expr.collation,
         descending,
         nullsFirst,
@@ -294,7 +299,6 @@ function classifyOrderKey(
   return { ordinal: null, expr, qualifier: null, column: "", collation, descending, nullsFirst };
 }
 
-// parseSQL parses a single complete statement from sql.
 // MAX_EXPR_DEPTH is the maximum expression / subquery / set-operation nesting depth a statement
 // may reach (spec/design/cost.md §7; CLAUDE.md §13). The §13 native-stack-safety gate for
 // untrusted input: the recursive-descent parser and the resolve/eval walks recurse to a
@@ -311,11 +315,20 @@ export const MAX_EXPR_DEPTH = 256;
 // so the two parser-level limits sit together (spec/design/cost.md §7; CLAUDE.md §13).
 export { MAX_IDENTIFIER_LENGTH } from "./lexer.ts";
 
+// parseSQL parses one statement of host-written text. An error carries the character position of
+// the token the parse stopped at (spec/design/error-fields.md §10.2/§10.3), except a class-54 program
+// limit.
 export function parseSQL(sql: string): Statement {
-  const p = new Parser(lex(sql));
-  const stmt = p.parseStatement();
-  p.expectEof();
-  return stmt;
+  const { tokens, positions } = lexWithPositions(sql);
+  const p = new Parser(tokens, positions);
+  try {
+    const stmt = p.parseStatement();
+    p.expectEof();
+    return stmt;
+  } catch (e) {
+    if (e instanceof EngineError && !e.code().startsWith("54")) e.withPosition(p.furthestLoc());
+    throw e;
+  }
 }
 
 // Parser is a token cursor over a single statement.
@@ -337,9 +350,19 @@ class Parser {
   // §25). Precomputed once in one backward pass so every probe is O(1) — a long run of `(` costs
   // linear time, not time per nesting level.
   private parenQuery: boolean[];
+  // Each token's 1-based character position in the statement text (spec/design/error-fields.md
+  // §10.1), index-aligned with tokens; empty for a parse of stored text, which records none.
+  private positions: number[];
+  // The furthest token index the parse has examined through peek / advance — the token a parse
+  // error is positioned at (spec/design/error-fields.md §10.3).
+  private furthest: number;
 
-  constructor(tokens: Token[]) {
+  // A parser over stored text passes no positions (error-fields.md §10.1); parseSQL passes the
+  // host-written text's.
+  constructor(tokens: Token[], positions: number[] = []) {
     this.tokens = tokens;
+    this.positions = positions;
+    this.furthest = 0;
     this.pos = 0;
     this.depth = 0;
     this.maxDepth = 0;
@@ -589,8 +612,21 @@ class Parser {
       throw engineError("syntax_error", "unexpected trailing input");
     }
     const body = renderTokens(this.tokens.slice(start, end));
+    // renderTokens re-lexes to the same token sequence, so the body's tokens keep the statement's
+    // positions (and its eof the position of the token after the body).
+    const bodyLocs = this.positions.slice(start, end + 1);
     const checkOption = trailing === null ? null : trailing.option;
-    return { kind: "createView", name, db, orReplace, ifNotExists, columns, body, checkOption };
+    return {
+      kind: "createView",
+      name,
+      db,
+      orReplace,
+      ifNotExists,
+      columns,
+      body,
+      bodyLocs,
+      checkOption,
+    };
   }
 
   // trailingCheckOption returns the index and option of a trailing `WITH [CASCADED | LOCAL] CHECK
@@ -1963,10 +1999,12 @@ class Parser {
     // Optional column list `( col [, col]* )` before VALUES. An empty `()` is rejected (the
     // first expectIdentifier errors 42601 on `)`).
     let columns: string[] | null = null;
+    const columnLocs: SrcLoc[] = [];
     if (this.peek().kind === "lparen") {
       this.advance(); // '('
       const names: string[] = [];
       for (;;) {
+        columnLocs.push(this.here() ?? 0);
         names.push(this.expectIdentifier());
         const k = this.advance().kind;
         if (k === "comma") continue;
@@ -2034,6 +2072,7 @@ class Parser {
         table,
         db,
         columns,
+        columnLocs,
         overriding,
         source: { kind: "select", select },
         onConflict,
@@ -2059,6 +2098,7 @@ class Parser {
       table,
       db,
       columns,
+      columnLocs,
       overriding,
       source: { kind: "values", rows },
       onConflict,
@@ -2107,10 +2147,11 @@ class Parser {
       this.expectKeyword("set");
       const assignments: Assignment[] = [];
       for (;;) {
+        const loc = this.here();
         const column = this.expectIdentifier();
         this.expect("eq");
         const value = this.parseExpr();
-        assignments.push({ column, isDefault: false, value });
+        assignments.push({ column, loc, isDefault: false, value });
         if (this.peek().kind === "comma") {
           this.advance();
           continue;
@@ -2948,6 +2989,7 @@ class Parser {
       return this.parseJsonTable();
     }
     let namePos = this.pos;
+    const loc = this.here();
     let name = this.expectIdentifier();
     // An optional DATABASE qualifier `db "." table` (spec/design/attached-databases.md §3): a `.`
     // after the first identifier makes it the database qualifier and the next identifier the table
@@ -3027,7 +3069,7 @@ class Parser {
     }
     // An SRF is implicitly lateral; `lateral` records only whether the keyword was written.
     const pos: TableRefPos = { name: namePos, alias: aliasPos, list: listPos, depth: this.depth };
-    return { name, db, alias, args, columnAliases, columnDefs, lateral, pos };
+    return { name, db, alias, args, columnAliases, columnDefs, lateral, pos, loc };
   }
 
   // parseDerivedTable parses a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42)
@@ -3496,6 +3538,7 @@ class Parser {
 
     const assignments: Assignment[] = [];
     for (;;) {
+      const loc = this.here();
       const column = this.expectIdentifier();
       this.expect("eq");
       // DEFAULT is special only when it is the complete assignment RHS. Keywords are legal
@@ -3516,7 +3559,7 @@ class Parser {
       } else {
         value = this.parseExpr();
       }
-      assignments.push({ column, isDefault, value });
+      assignments.push({ column, loc, isDefault, value });
       if (this.peek().kind === "comma") {
         this.advance();
         continue;
@@ -4132,10 +4175,11 @@ class Parser {
     // as literals or keyword-led expressions. Recognize the unambiguous `identifier.identifier`
     // shape first so a relation alias such as `null`, `cast`, or `case` remains usable.
     if (this.atQualifiedColumnRef()) {
+      const loc = this.here();
       const qualifier = this.expectIdentifier();
       this.expect("dot");
       const name = this.expectIdentifier();
-      return { kind: "qualifiedColumn", qualifier, name };
+      return { kind: "qualifiedColumn", qualifier, name, loc };
     }
     if (this.peek().kind === "lparen") {
       this.advance();
@@ -4475,10 +4519,11 @@ class Parser {
       if (this.tokens[this.pos + 1]?.kind === "lparen") {
         return this.parseFunctionCall();
       }
+      const loc = this.here();
       const [qualifier, name] = this.parseColumnRef();
       return qualifier !== null
-        ? { kind: "qualifiedColumn", qualifier, name }
-        : { kind: "column", name };
+        ? { kind: "qualifiedColumn", qualifier, name, loc }
+        : { kind: "column", name, loc };
     }
     if (t.kind === "quotedIdent") {
       // A quoted identifier is never a keyword (grammar.md §3): a call when IMMEDIATELY followed by
@@ -4486,10 +4531,11 @@ class Parser {
       if (this.tokens[this.pos + 1]?.kind === "lparen") {
         return this.parseFunctionCall();
       }
+      const loc = this.here();
       const [qualifier, name] = this.parseColumnRef();
       return qualifier !== null
-        ? { kind: "qualifiedColumn", qualifier, name }
-        : { kind: "column", name };
+        ? { kind: "qualifiedColumn", qualifier, name, loc }
+        : { kind: "column", name, loc };
     }
     throw engineError("syntax_error", "expected an expression");
   }
@@ -4936,7 +4982,25 @@ class Parser {
   }
 
   private peek(): Token {
+    this.note(this.pos);
     return this.tokens[this.pos]!;
+  }
+
+  // note records that the parse examined token i (error-fields.md §10.3). Only peek and advance
+  // note: multi-token lookahead (peekKeywordAt / peekKindAt / tokens[pos + n]) and the precomputed
+  // parenQuery table do not.
+  private note(i: number): void {
+    if (i > this.furthest) this.furthest = i;
+  }
+
+  // here is the current token's character position, or undefined for stored text (SrcLoc).
+  private here(): SrcLoc | undefined {
+    return this.positions[this.pos];
+  }
+
+  // furthestLoc is the character position of the furthest token examined (0 for stored text).
+  furthestLoc(): number {
+    return this.positions[this.furthest] ?? 0;
   }
 
   // peekKeyword returns the current token if it is a bare word (already folded by the lexer), else
@@ -4962,6 +5026,7 @@ class Parser {
   }
 
   private advance(): Token {
+    this.note(this.pos);
     const t = this.tokens[this.pos]!;
     if (this.pos + 1 < this.tokens.length) this.pos++;
     return t;
@@ -5031,7 +5096,20 @@ export function parseExpression(text: string): Expr {
 // (TableRef.pos, a star's pos) is an index into lex(text), which is what the rename rewrites and `*`
 // freezing edit.
 export function parseViewDefinition(text: string): { body: QueryExpr; depth: number } {
-  const p = new Parser(lex(text));
+  return parseViewDefinitionAt(text, []);
+}
+
+// parseViewDefinitionAt is parseViewDefinition for a CREATE VIEW body being validated: `positions`
+// are the body's tokens' character positions in the statement the host wrote (CreateView.bodyLocs),
+// recorded on the AST so a resolution error in the body carries Position
+// (spec/design/error-fields.md §10.1). They are used only when they align with lex(text); otherwise
+// none are recorded.
+export function parseViewDefinitionAt(
+  text: string,
+  positions: number[],
+): { body: QueryExpr; depth: number } {
+  const tokens = lex(text);
+  const p = new Parser(tokens, positions.length === tokens.length ? positions : []);
   const body = p.parseViewBody();
   p.expectEof();
   return { body, depth: p.maxDepth };

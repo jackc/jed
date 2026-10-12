@@ -636,7 +636,7 @@ export function resolve(
     case "column": {
       // Resolve against the scope CHAIN (§26). A Local match obeys the grouping rule; an Outer
       // (correlated) match is a per-outer-row constant exempt from it (resolveColumnRef).
-      return resolveColumnRef(scope, ag, scope.resolveBare(e.name), e.name);
+      return resolveColumnRef(scope, ag, scope.resolveBareAt(e.name, e.loc), e.name);
     }
     case "qualifiedColumn": {
       // A bare `rel.col` resolves STRICTLY against the FROM relations — `qualifier` MUST name a
@@ -644,7 +644,12 @@ export function resolve(
       // PARENS-REQUIRED `(col).field` form (spec/design/composite.md §1/§S4), a fieldAccess node,
       // never this bare qualified-column path (PG raises 42P01 for the unparenthesized `col.field` /
       // `t.col.field` spellings).
-      return resolveColumnRef(scope, ag, scope.resolveQualified(e.qualifier, e.name), e.name);
+      return resolveColumnRef(
+        scope,
+        ag,
+        scope.resolveQualifiedAt(e.qualifier, e.name, e.loc),
+        e.name,
+      );
     }
     case "fieldAccess": {
       // `(expr).field` — composite field selection (spec/design/composite.md §S4).
