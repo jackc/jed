@@ -4,11 +4,12 @@
 > **named, persisted query** that the FROM clause references like a table. This doc is the contract all three cores implement in lockstep
 > (CLAUDE.md §2). The grammar is in [../grammar/grammar.ebnf](../grammar/grammar.ebnf) and
 > [grammar.md](grammar.md) §54. The byte layout is in [../fileformat/format.md](../fileformat/format.md)
-> (`format_version` 38). The errors are existing codes in [../errors/registry.toml](../errors/registry.toml).
+> (`format_version` 38; the check option, 39). The errors are codes in [../errors/registry.toml](../errors/registry.toml).
 > PostgreSQL behavior was pinned against the live `postgres:18` oracle (CLAUDE.md §1).
 > A view with PostgreSQL's simple single-relation shape is **automatically updatable**: `INSERT`,
-> `UPDATE`, and `DELETE` on it write its base relation (§15). There is no `CHECK OPTION`, and no
-> materialized, recursive, or temporary view (§12). `CREATE OR REPLACE VIEW` (§1.2) and view renames
+> `UPDATE`, and `DELETE` on it write its base relation (§15), and `WITH [CASCADED | LOCAL] CHECK
+> OPTION` keeps those writes inside the view (§15.6). There is no materialized, recursive, or
+> temporary view (§12). `CREATE OR REPLACE VIEW` (§1.2) and view renames
 > (§7.1) redefine a view in place.
 
 A view is the fifth kind of database-level catalog object, after tables, composite types, sequences,
@@ -31,6 +32,7 @@ Everything below follows from three choices:
 
 ```
 CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [main.]name [( col [, …] )] AS query
+    [WITH [CASCADED | LOCAL] CHECK OPTION]
 DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]
 ALTER VIEW [IF EXISTS] [main.]name RENAME TO new_name
 ALTER VIEW [IF EXISTS] [main.]name RENAME [COLUMN] col TO new_col
@@ -57,6 +59,9 @@ ALTER VIEW [IF EXISTS] [main.]name RENAME [COLUMN] col TO new_col
   EXISTS` together are **`42601`**: the two disagree about a taken name, and PostgreSQL has neither
   combination.
 - **`OR REPLACE`** redefines an existing view in place (§1.2).
+- **`WITH [CASCADED | LOCAL] CHECK OPTION`** after the body gives the view a **check option**
+  (§15.6). `WITH CHECK OPTION` is `CASCADED`. The clause is not part of the body or of the stored
+  definition (§3).
 - **`ALTER VIEW … RENAME`** renames a view or one of its output columns (§7.1).
 - **`DROP VIEW`** follows `DROP TABLE`'s shape ([grammar.md](grammar.md) §13). It is two-phase and
   all-or-nothing over a comma list. A repeated name is deduplicated. A missing name is **`42P01`**
@@ -80,6 +85,12 @@ ALTER VIEW [IF EXISTS] [main.]name RENAME [COLUMN] col TO new_col
    `42P01`, `42703`, `42702`, `42883`, `42804`, and so on. A `$N` is **`42P02`** (*there is no
    parameter $N*, PostgreSQL). A data-modifying `WITH` is **`0A000`** (*views must not contain
    data-modifying statements in WITH*, PostgreSQL). A temp or attached relation is `0A000` (§10).
+   With a check option, the body must then have the updatable shape of §15.1 for `INSERT` and
+   `UPDATE`, including at least one updatable column, else **`0A000`** (*WITH CHECK OPTION is
+   supported only on automatically updatable views*, PostgreSQL). A `*` select item counts as
+   updatable columns, since it expands to column references (§5). Only the view's own body is
+   checked: its base relation may be a view that is not updatable, as in PostgreSQL, and a write
+   then fails with that view's `55000` (§15.3).
 5. Column-list arity (`42601`), then duplicate final output names (`42701`), computed from the
    body as planned in step 4.
 6. `*` is expanded and the expanded text is verified (§5).
@@ -123,6 +134,9 @@ privilege check all come first, as in PostgreSQL), and then:
 12. The catalog entry is replaced: the new definition, output columns, dependency list, and depth,
     under the same name. A definition that does not fit one catalog page is `0A000`, as at create.
 
+The replacement's check option, or its absence, replaces the view's (PostgreSQL's behavior):
+`CREATE OR REPLACE VIEW` without the clause removes a check option the view had.
+
 The replacement changes nothing else. Dependent views keep their stored text, which binds `v` and
 its existing columns by name, so they read the new definition with the same output names and
 types. This is PostgreSQL's observable behavior.
@@ -159,7 +173,7 @@ Statements that name a relation of a specific kind treat a view as the wrong kin
 not automatically updatable (§15.1). The rejection happens when the DML target is resolved, before
 any column, value, or `RETURNING` check (§15.3).
 
-## 3. Persistence (`format_version` 38)
+## 3. Persistence (`format_version` 38, check option 39)
 
 A view is a catalog entry with `entry_kind = 5` ([../fileformat/format.md](../fileformat/format.md)
 *View entry*). It records:
@@ -169,7 +183,8 @@ A view is a catalog entry with `entry_kind = 5` ([../fileformat/format.md](../fi
   frozen at `CREATE VIEW`;
 - the **definition**: the canonical token text of the body after `*` expansion (§5);
 - the **dependency list**: every table and view the body reads, with, for each table, the exact set
-  of its columns the body references (§6).
+  of its columns the body references (§6);
+- the **check option**: none, `LOCAL`, or `CASCADED` (§15.6, `format_version` 39).
 
 **Canonical text.** The body is the token sequence after `AS` to the end of the statement. Each
 token is rendered by the closed per-token table in format.md *Check-expression text* and the tokens
@@ -571,11 +586,12 @@ computed, read-only, scoped by the database qualifier, gated like a table, and c
 jed_views(
   name        text   NOT NULL,  -- the view name (exact, grammar.md §3)
   definition  text   NOT NULL,  -- the stored canonical definition (§3), after * expansion and renames
-  columns     text[] NOT NULL   -- the output column names, in order
+  columns     text[] NOT NULL,  -- the output column names, in order
+  check_option text  NOT NULL   -- 'NONE', 'LOCAL', or 'CASCADED' (§15.6)
 )
 ```
 
-Views are **not** listed in `jed_tables` or `jed_columns`, which describe stored tables. This is
+`check_option` uses `information_schema.views.check_option`'s spelling. Views are **not** listed in `jed_tables` or `jed_columns`, which describe stored tables. This is
 PostgreSQL's `pg_tables` / `pg_views` split. A view's column types are not catalog facts (§3); a
 client finds them by preparing `SELECT * FROM v`. Listing view columns in `jed_columns` is a
 follow-on.
@@ -584,7 +600,8 @@ follow-on.
 `CREATE VIEW <name> (<columns>) AS <definition>;`, after every table, its rows, and its indexes, and
 in dependency order among views (a view after every view it reads; ties in name byte order). The
 output column list is always written, so the recreated view has the same column names even when the
-body's own names differ.
+body's own names differ. A view with a check option ends `… <definition> WITH LOCAL CHECK OPTION;`
+or `… WITH CASCADED CHECK OPTION;`.
 
 ## 12. Divergences and deferred work
 
@@ -596,6 +613,8 @@ Recorded divergences from PostgreSQL (CLAUDE.md §1):
 | Assigning a read-only view column is `0A000` before the statement's expressions are resolved; PG reports it after them | the check belongs to the target columns (§15.3) |
 | Two view columns that reach the same base column, assigned together, are `42701`; PG says `42601` | jed's duplicate-assignment code for tables (`UPDATE t SET a = 1, a = 2`) |
 | `INSERT … ON CONFLICT` on an updatable view is `0A000`; PG supports it | a follow-on (§15.2) |
+| A row that violates both an `EXCLUDE` constraint and a check option is `44000`; PG reports `23P01` | jed checks `EXCLUDE` over the statement's end state, after the check option (§15.6) |
+| An `UPDATE` in which one row fails a check option and a later row fails a `CHECK`, primary-key, or `UNIQUE` check reports the later failure; PG reports `44000` for the earlier row | jed's `UPDATE` checks keys over its end state, so its check option is a pass over the new rows after those checks (§15.6) |
 | A write through a view checks only the writer's privilege on the view; PG also checks the view owner's privilege on the base relation | jed has no persistent owners, and the session that creates a view already holds `allow_ddl`, which is trusted schema authority (§15.4) |
 | `CREATE VIEW IF NOT EXISTS` is accepted; PG has no such syntax | SQLite parity; the `CREATE TABLE` precedent |
 | A view whose `*` expansion is not referenceable by name is `0A000` | jed stores text; PG invents aliases in its deparser |
@@ -619,7 +638,8 @@ Deferred follow-ons, none foreclosed:
 
 - the other `ALTER VIEW` actions: column defaults (`UPDATE v SET c = DEFAULT` would then assign
   them, §15.2), `SET` / `RESET` view options;
-- `WITH [CASCADED | LOCAL] CHECK OPTION` and `WITH (options)` (`0A000`);
+- `WITH (options)`, including `WITH (check_option = …)` and `ALTER VIEW … SET (check_option = …)`
+  (`0A000`; the `WITH … CHECK OPTION` clause is the supported spelling, §15.6);
 - `INSERT … ON CONFLICT` on an updatable view (`0A000`, §15.2);
 - `INSTEAD OF` behavior for views that are not automatically updatable (jed has no triggers or
   rules);
@@ -642,6 +662,8 @@ Deferred follow-ons, none foreclosed:
 - The `2BP01` and `0A000` messages name the first blocking view in name byte order.
 - A `CASCADE` closure (§6.1) is a set computed from the persisted dependency lists, so which views
   it drops never depends on iteration order.
+- A check option evaluates the checked views nearest the table first, on each new row in the order
+  §15.6 fixes, so the view a `44000` names is deterministic.
 - `CREATE OR REPLACE VIEW` compares columns in position order and reports the first difference in
   PostgreSQL's order (count, then per column name, type, collation).
 - A write through a view is its equivalent base statement on the base table (§15.2, §15.5), which is
@@ -670,10 +692,13 @@ Deferred follow-ons, none foreclosed:
    the view-vs-base-statement NoREC relation.
 8. **V8 — `DROP … CASCADE` of dependent views** (§6.1): `DROP TABLE`, `DROP VIEW`, and `ALTER TABLE
    … DROP COLUMN` drop the closure of the views that depend on what they drop.
+9. **V9 — `WITH [CASCADED | LOCAL] CHECK OPTION`** (§15.6): the clause, its `0A000` on a view that
+   is not updatable, the `format_version` 39 view entry, `jed_views.check_option`, the dump, and
+   the `44000` check on `INSERT` and `UPDATE` through a view.
 
 Capabilities: `ddl.view` (V1), `ddl.view_rename` (V2 + V4), `query.table_column_alias` (V3),
 `introspect.views` (V1), `ddl.view_replace` (V5), `ddl.view_alter` (V6), `dml.view_write` (V7),
-`ddl.view_cascade` (V8).
+`ddl.view_cascade` (V8), `dml.view_check_option` (V9).
 
 ## 15. Writing through a view
 
@@ -740,8 +765,8 @@ view's qualification to the statement's `WHERE`.)
 **`UPDATE v SET c = e, … WHERE p`** is `UPDATE b … WHERE w AND p`, with `w` as for `DELETE`. Each
 assignment to view column `c` assigns `c`'s base column the value of `e`. `SET c = DEFAULT` assigns the view column's own default, as in PostgreSQL. jed has no view column
 defaults (§12), so that is NULL, not the base column's default; on a `GENERATED ALWAYS` identity
-base column it is therefore `428C9`. An update may change a row so that `w` no longer holds; the
-row stays updated and leaves the view.
+base column it is therefore `428C9`. An update may change a row so that `w` no longer holds; unless a
+check option applies (§15.6), the row stays updated and leaves the view.
 
 **`INSERT INTO v [(c, …)] source`** inserts into `b`. The target view columns are the listed ones,
 or, without a list, every column of `v` in order. The source supplies exactly one value per target,
@@ -751,8 +776,8 @@ recorded narrowing for tables too), so a list-less `INSERT` into a view with a r
 own default, else NULL, exactly like an omitted column of a direct `INSERT INTO b`. That covers the columns `v`
 does not output, the view columns the statement omits, and a `DEFAULT` slot. `DEFAULT VALUES`
 assigns no column. `OVERRIDING SYSTEM VALUE` and `OVERRIDING USER VALUE` apply to `b`'s identity
-columns. `w` is not checked, so an inserted row may be one the view does not show. (`WITH CHECK
-OPTION` is a follow-on, §12.)
+columns. `w` is not checked unless a check option applies (§15.6), so without one an inserted row may
+be one the view does not show.
 
 **`RETURNING`** projects `v`'s columns over each affected base row: the stored row for `INSERT`, the
 new row for `UPDATE`, the deleted row for `DELETE`. `*` expands to `v`'s output columns, and
@@ -831,3 +856,56 @@ The NoREC generator pins the rows with a **view-write-vs-base-statement** relati
 through a view and written by hand against the base table, with the view's conditions inlined, must
 return the same `RETURNING` rows and leave the same table contents ([conformance.md](conformance.md)
 §8). The cost equality is pinned by `dml/view_write_jed.test`.
+
+### 15.6 `WITH CHECK OPTION`
+
+A view created `WITH [CASCADED | LOCAL] CHECK OPTION` refuses an `INSERT` or `UPDATE` through it
+whose new row the view would not show. Behavior was pinned against the PostgreSQL 18 oracle.
+
+**Which views are checked.** A write through `v` reaches the chain `v = vₙ, …, v₁`, where `v₁` reads
+the table (§15.2). View `vᵢ` is **checked** when it has a check option of its own, `LOCAL` or
+`CASCADED`, or when a view above it in the chain, between it and `v`, has `CASCADED`. So `LOCAL`
+checks the view's own `WHERE` and the views below that have their own check option, while
+`CASCADED` checks every view below as well. Views that read `v` are not part of the write and are
+never checked. A checked view with no `WHERE` always passes.
+
+**The check.** For each new row — each row an `INSERT` inserts, and the new version of each row an
+`UPDATE` changes — each checked view's `WHERE` is evaluated on the row, nearest the table first
+(`v₁` before `v₂`). The `WHERE` resolves exactly as in §15.2: in its body's isolated scope, over the
+base row. It is a filter: its top-level `AND` chain stops at the first conjunct that is not TRUE
+([cost.md](cost.md) §3), and the row passes only when the whole condition is TRUE. FALSE **or NULL**
+fails, unlike a `CHECK` constraint, where NULL passes. The first failure aborts the statement with
+**`44000`** (`with_check_option_violation`, *new row violates check option for view "v₁"*), naming
+the failing view. An error raised while evaluating the condition (a division by zero) is that error.
+Nothing is written: the check is part of the statement's two-phase, all-or-nothing validation.
+
+`DELETE` checks nothing. A row an `UPDATE`'s `WHERE` does not reach is not checked. Every column of
+the new row takes part, including base columns the view does not output, which an `INSERT` fills
+with their defaults: a view `WHERE c > 0` that does not output `c` refuses an `INSERT` whenever
+`c`'s default is not positive.
+
+**When.** The check runs after the checks PostgreSQL makes on a row before writing it: `NOT NULL`,
+`CHECK` constraints, and the primary-key and `UNIQUE` checks.
+
+- An **`INSERT`** checks each row in source order, right after that row's own `NOT NULL`, `CHECK`,
+  primary-key, and `UNIQUE` checks, so the first row that fails anything is reported, as in
+  PostgreSQL ([constraints.md](constraints.md) §4.4/§5.4).
+- An **`UPDATE`** checks the new rows in scan order, after the end-state primary-key and `UNIQUE`
+  checks ([constraints.md](constraints.md) §5.4, [indexes.md](indexes.md) §8).
+- In both, the `EXCLUDE` and `FOREIGN KEY` checks come after the check option, then `RETURNING`.
+
+A subquery in a checked `WHERE` reads the pre-statement snapshot, like a `RETURNING` subquery: rows
+the statement writes are not visible to it. An uncorrelated subquery is evaluated once per checked
+view, before the statement's rows are validated, whether or not a row reaches the check, as a
+`RETURNING` subquery is ([cost.md](cost.md) §3); a correlated one runs each time it is evaluated.
+
+**Privileges.** The check needs no privilege beyond the write's (§15.4). A function the `WHERE`
+calls needs the writer's `EXECUTE`, as when the view is read.
+
+**Cost and EXPLAIN.** The check is metered expression work: each node evaluated charges its
+`operator_eval`, and a subquery its ordinary cost. `EXPLAIN` renders no node for it, and the
+estimate does not include it ([estimator.md](estimator.md) §8.4: check expressions use the zero
+fallback). A write through a view with a check option therefore costs its equivalent base statement
+(§15.5) plus the checks.
+
+**`ON CONFLICT`** on a view stays `0A000` (§15.2), so no conflict path is checked.

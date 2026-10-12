@@ -83,6 +83,7 @@ export type SqlState =
   | "generated_always" // 428C9 — {detail}
   | "insufficient_privilege" // 42501 — permission denied for {object}
   | "feature_not_supported" // 0A000 — feature not supported: {detail}
+  | "with_check_option_violation" // 44000 — new row violates check option for view "{view}"
   | "program_limit_exceeded" // 54000 — SQL statement exceeds the maximum length of {max} bytes
   | "statement_too_complex" // 54001 — statement too complex: nesting depth exceeds the maximum of {max}
   | "cost_limit_exceeded" // 54P01 — query exceeded the cost limit of {limit} (accrued {cost})
@@ -175,6 +176,7 @@ const CODES: Record<SqlState, string> = {
   generated_always: "428C9",
   insufficient_privilege: "42501",
   feature_not_supported: "0A000",
+  with_check_option_violation: "44000",
   program_limit_exceeded: "54000",
   statement_too_complex: "54001",
   cost_limit_exceeded: "54P01",
@@ -283,6 +285,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "428C9", name: "generated_always", class: "syntax error or access rule violation" },
   { code: "42501", name: "insufficient_privilege", class: "syntax error or access rule violation" },
   { code: "0A000", name: "feature_not_supported", class: "feature not supported" },
+  { code: "44000", name: "with_check_option_violation", class: "with check option violation" },
   { code: "54000", name: "program_limit_exceeded", class: "program limit exceeded" },
   { code: "54001", name: "statement_too_complex", class: "program limit exceeded" },
   { code: "54P01", name: "cost_limit_exceeded", class: "program limit exceeded" },

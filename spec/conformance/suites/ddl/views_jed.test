@@ -110,15 +110,6 @@ statement error 0A000
 CREATE VIEW ov WITH (security_barrier) AS SELECT a FROM t
 
 statement error 0A000
-CREATE VIEW cv AS SELECT a FROM t WITH CHECK OPTION
-
-statement error 0A000
-CREATE VIEW cv AS SELECT a FROM t WITH LOCAL CHECK OPTION
-
-statement error 0A000
-CREATE VIEW cv AS SELECT a FROM t WITH CASCADED CHECK OPTION
-
-statement error 0A000
 CREATE OR REPLACE TEMP VIEW tv AS SELECT a FROM t
 
 # ALTER VIEW actions other than RENAME

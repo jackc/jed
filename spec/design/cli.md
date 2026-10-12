@@ -143,8 +143,9 @@ table-level `PRIMARY KEY` in key order; named `CHECK`s from their persisted text
 into the same rowids), then `CREATE [UNIQUE] INDEX` statements (after the rows, so a
 replay builds each index once — a UNIQUE *constraint* dumps as its backing unique index,
 which recreates the same state). After every table, each view follows as `CREATE VIEW name
-(columns) AS definition;` — its stored canonical text, in dependency order (a view after every view
-it reads; ties in name byte order — [views.md](views.md) §11). The script is wrapped in one
+(columns) AS definition;` — its stored canonical text, followed by ` WITH LOCAL CHECK OPTION` or ` WITH
+CASCADED CHECK OPTION` when it has a check option, in dependency order (a view after every view it
+reads; ties in name byte order — [views.md](views.md) §11). The script is wrapped in one
 `BEGIN`/`COMMIT` so a
 file-backed replay commits durably once. Round-trip contract: dump → replay into a fresh
 database → dump is **byte-identical**. `--dump` requires a DBFILE, excludes `-c`/`-f`/

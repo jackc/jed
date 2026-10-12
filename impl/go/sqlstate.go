@@ -161,6 +161,8 @@ const (
 	InsufficientPrivilege
 	// FeatureNotSupported is 0A000 — feature not supported: {detail}.
 	FeatureNotSupported
+	// WithCheckOptionViolation is 44000 — new row violates check option for view "{view}".
+	WithCheckOptionViolation
 	// ProgramLimitExceeded is 54000 — SQL statement exceeds the maximum length of {max} bytes.
 	ProgramLimitExceeded
 	// StatementTooComplex is 54001 — statement too complex: nesting depth exceeds the maximum of {max}.
@@ -346,6 +348,8 @@ func (s SqlState) Code() string {
 		return "42501"
 	case FeatureNotSupported:
 		return "0A000"
+	case WithCheckOptionViolation:
+		return "44000"
 	case ProgramLimitExceeded:
 		return "54000"
 	case StatementTooComplex:
@@ -469,6 +473,7 @@ var errorDescs = []errorDesc{
 	{Code: "428C9", Name: "generated_always", Class: "syntax error or access rule violation"},
 	{Code: "42501", Name: "insufficient_privilege", Class: "syntax error or access rule violation"},
 	{Code: "0A000", Name: "feature_not_supported", Class: "feature not supported"},
+	{Code: "44000", Name: "with_check_option_violation", Class: "with check option violation"},
 	{Code: "54000", Name: "program_limit_exceeded", Class: "program limit exceeded"},
 	{Code: "54001", Name: "statement_too_complex", Class: "program limit exceeded"},
 	{Code: "54P01", Name: "cost_limit_exceeded", Class: "program limit exceeded"},

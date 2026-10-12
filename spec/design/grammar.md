@@ -3219,6 +3219,7 @@ option's behavior are specified in [explain.md](explain.md).
 
 ```
 CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [main.]name [( col [, …] )] AS subquery_expr
+    [WITH [CASCADED | LOCAL] CHECK OPTION]
 DROP VIEW [IF EXISTS] name [, …] [CASCADE | RESTRICT]
 ALTER VIEW [IF EXISTS] [main.]name RENAME TO new_name
 ALTER VIEW [IF EXISTS] [main.]name RENAME [COLUMN] col TO new_col
@@ -3226,7 +3227,8 @@ ALTER VIEW [IF EXISTS] [main.]name RENAME [COLUMN] col TO new_col
 
 `VIEW` is recognized **positionally** after `CREATE`, `CREATE OR REPLACE`, `DROP`, and `ALTER`, and is
 not reserved (§3): `CREATE TABLE view (…)` names a table `view`, and `SELECT view FROM t` reads a
-column. The body runs from the token after `AS` to the end of the statement and is a `subquery_expr`
+column. The body runs from the token after `AS` to the end of the statement, or to a trailing `WITH
+[CASCADED | LOCAL] CHECK OPTION`, and is a `subquery_expr`
 (an optional `WITH`, then a query expression with its own `ORDER BY` / `LIMIT`). Its token sequence
 is the persisted definition, rendered by the closed per-token table of
 [../fileformat/format.md](../fileformat/format.md) *Check-expression text*, after the planner has
@@ -3238,9 +3240,14 @@ named `to` is renamed with `RENAME COLUMN to TO x`.
 
 Deferred forms are **recognized** so they fail with `0A000` rather than a syntax error: `CREATE TEMP`/
 `TEMPORARY VIEW`, `CREATE RECURSIVE VIEW`, `CREATE MATERIALIZED VIEW`, `CREATE VIEW v WITH ( … )`
-(view options), a trailing `WITH [CASCADED | LOCAL] CHECK OPTION`, and every `ALTER VIEW` action
-other than `RENAME`. Each is detected by its keyword sequence before the body is parsed, except
-`CHECK OPTION`, which is detected after it. Every error code, the validation order, the namespace
+(view options), and every `ALTER VIEW` action other than `RENAME`. Each is detected by its keyword
+sequence before the body is parsed.
+
+The trailing `WITH [CASCADED | LOCAL] CHECK OPTION` is recognized at the end of the token stream and
+cut off before the body is parsed, so the unreserved `with` is never read as a table alias; the rest
+must parse as the body (a body syntax error is reported as one). Bare `WITH CHECK OPTION` is
+`CASCADED`. The clause gives the view a check option ([views.md](views.md) §15.6) and is not part of
+the stored definition. Every error code, the validation order, the namespace
 matrix, dependencies, `RENAME` rewrites, and privileges are specified in [views.md](views.md).
 
 A view reference in `FROM` is the equivalent derived table (§42), so §8's output-name rules, §15's

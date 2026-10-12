@@ -448,7 +448,8 @@ name byte order, then ordinal.
 jed_views(
   name        text   NOT NULL,  -- the view name (exact, grammar.md §3)
   definition  text   NOT NULL,  -- the stored canonical definition (views.md §3/§5/§7)
-  columns     text[] NOT NULL   -- the output column names, in order
+  columns     text[] NOT NULL,  -- the output column names, in order
+  check_option text  NOT NULL   -- 'NONE', 'LOCAL', or 'CASCADED' (views.md §15.6)
 )
 ```
 

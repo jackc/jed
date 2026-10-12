@@ -27,7 +27,9 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 38 # v38: views — entry_kind 5 view entries emitted last, in name byte order (views.md §3);
+VERSION = 39 # v39: a trailing u8 check_option on every view entry (0 none, 1 LOCAL, 2 CASCADED —
+# views.md §15.6); no other byte layout change.
+# v38: views — entry_kind 5 view entries emitted last, in name byte order (views.md §3);
 # no other byte layout change.
 # v37: exact (folded) identifier names — no byte layout change; catalog groups sort by
 # exact-name bytes and persisted expression text renders bare words folded (grammar.md §3).
@@ -1217,20 +1219,22 @@ IDENTITY_TABLE = {
 # its emission LAST (after the table and statistics entries), in view-name byte order. A table t(a, b)
 # with two rows and three views: `v` stores the frozen `*` expansion and depends on t's columns a, b;
 # `w` renames its one output column through a column list and depends on the view v (a view dependency
-# carries no columns); `n` depends on t with ZERO columns. The cores build this via
+# carries no columns); `n` depends on t with ZERO columns. v39 adds the check options: `v` CASCADED
+# (2), `w` LOCAL (1), `n` none (0). The cores build this via
 #   CREATE TABLE t (a i32 PRIMARY KEY, b text); INSERT INTO t VALUES (1, 'x'), (2, 'y');
-#   CREATE VIEW v AS SELECT * FROM t WHERE a > 0; CREATE VIEW w (x) AS SELECT a FROM v;
+#   CREATE VIEW v AS SELECT * FROM t WHERE a > 0 WITH CHECK OPTION;
+#   CREATE VIEW w (x) AS SELECT a FROM v WITH LOCAL CHECK OPTION;
 #   CREATE VIEW n AS SELECT count(*) AS c FROM t
 VIEW_TABLE = {
   tables: [{ name: "t", columns: [col("a", "i32", pk: true), col("b", "text")],
              rows: [[1, "x"], [2, "y"]] }],
   views: [
     { name: "v", columns: %w[a b], definition: 'select "t" . "a" , "t" . "b" from t where a > 0',
-      deps: [{ kind: 0, name: "t", columns: %w[a b] }] },
+      deps: [{ kind: 0, name: "t", columns: %w[a b] }], check_option: 2 },
     { name: "w", columns: %w[x], definition: "select a from v",
-      deps: [{ kind: 1, name: "v", columns: [] }] },
+      deps: [{ kind: 1, name: "v", columns: [] }], check_option: 1 },
     { name: "n", columns: %w[c], definition: "select count ( * ) as c from t",
-      deps: [{ kind: 0, name: "t", columns: [] }] }
+      deps: [{ kind: 0, name: "t", columns: [] }], check_option: 0 }
   ]
 }.freeze
 
@@ -2236,7 +2240,7 @@ end
 # Serialize a view catalog entry's BODY (after the entry_kind=5 byte, v38 — format.md *View entry*):
 # the name, the output column names, the definition (u32 length + canonical token text), then the
 # dependency list in name byte order — per dependency a kind byte (0 table, 1 view), the name, and the
-# table's referenced column names in byte order (none for a view).
+# table's referenced column names in byte order (none for a view) — then (v39) the check_option byte.
 def view_entry_bytes(v)
   str = ->(x) { u16(x.bytesize) + x.b }
   out = str.(v[:name])
@@ -2251,6 +2255,7 @@ def view_entry_bytes(v)
     out << u16(cols.size)
     cols.each { |c| out << str.(c) }
   end
+  out << [v[:check_option] || 0].pack("C")
   out.b
 end
 
@@ -2284,14 +2289,20 @@ def decode_view_entry(buf, pos)
 
     deps << { kind: kind, name: dname, columns: cols }
   end
-  [{ name: name, columns: columns, definition: definition.force_encoding("UTF-8"), deps: deps }, pos]
+  cb, pos = take(buf, pos, 1)
+  check_option = cb.getbyte(0)
+  raise "unknown view check_option" unless [0, 1, 2].include?(check_option)
+
+  [{ name: name, columns: columns, definition: definition.force_encoding("UTF-8"), deps: deps,
+     check_option: check_option }, pos]
 end
 
 # The view content a fixture should decode to (name-sorted, dependencies and their columns sorted).
 def expected_views(fx)
   (fx[:views] || []).sort_by { |v| v[:name] }.map do |v|
     { name: v[:name], columns: v[:columns], definition: v[:definition],
-      deps: v[:deps].sort_by { |d| d[:name] }.map { |d| { kind: d[:kind], name: d[:name], columns: d[:columns].sort } } }
+      deps: v[:deps].sort_by { |d| d[:name] }.map { |d| { kind: d[:kind], name: d[:name], columns: d[:columns].sort } },
+      check_option: v[:check_option] || 0 }
   end
 end
 

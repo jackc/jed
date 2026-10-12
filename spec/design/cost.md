@@ -144,8 +144,8 @@ hard-fenced inputs retain their staged policies ([estimator.md §9–§10](estim
 - **A filter's top-level `AND` chain also stops at NULL.** A **filter context** is a predicate whose
   value is used only to keep a row when it is TRUE: a `WHERE` (of a `SELECT`, `UPDATE`, or `DELETE`,
   at any nesting depth, and a view's `WHERE` read or written through — views.md §15), a join's `ON`,
-  `HAVING`, a partial index's `WHERE` ([indexes.md](indexes.md) §9), and `ON CONFLICT … DO UPDATE …
-  WHERE`. There, the predicate's **top-level `AND` chain** — the `and` nodes reached from its root
+  `HAVING`, a partial index's `WHERE` ([indexes.md](indexes.md) §9), `ON CONFLICT … DO UPDATE …
+  WHERE`, and a view's `WHERE` evaluated as its check option (views.md §15.6). There, the predicate's **top-level `AND` chain** — the `and` nodes reached from its root
   through `and` nodes only — evaluates its conjuncts in source order and stops at the first one that
   is **not TRUE**, FALSE *or NULL*: the predicate can no longer be TRUE, so the row is rejected
   without evaluating or charging the rest. Each top-level `and` node reached charges its

@@ -347,9 +347,11 @@ drop_sequence  ::= "DROP" "SEQUENCE" ("IF" "EXISTS")? identifier ("," identifier
  * is planned. "OR REPLACE" redefines an existing view (views.md §1.2): the existing output columns
  * must keep their names, types, and collations (42P16), new columns may be appended, a body that
  * would read the view itself is 42P17, and a non-view name is 42809. "OR REPLACE" together with
- * "IF NOT EXISTS" is 42601. A database qualifier other than "main" is 0A000. Recognized with 0A000,
- * never 42601 (deferred follow-ons): "TEMP"/"TEMPORARY", "RECURSIVE", "MATERIALIZED", a
- * "WITH ( … )" option list after the name, and a trailing "WITH [CASCADED | LOCAL] CHECK OPTION".
+ * "IF NOT EXISTS" is 42601. A database qualifier other than "main" is 0A000. A trailing
+ * "WITH [CASCADED | LOCAL] CHECK OPTION" (bare "WITH CHECK OPTION" is CASCADED) gives the view a
+ * check option (views.md §15.6); it is not part of the stored body, and on a body that is not
+ * automatically updatable it is 0A000. Recognized with 0A000, never 42601 (deferred follow-ons):
+ * "TEMP"/"TEMPORARY", "RECURSIVE", "MATERIALIZED", and a "WITH ( … )" option list after the name.
  * VIEW is non-reserved and recognized positionally after CREATE [OR REPLACE] / DROP / ALTER, so
  * "CREATE TABLE view (…)" still names a table.
  *
@@ -365,6 +367,7 @@ drop_sequence  ::= "DROP" "SEQUENCE" ("IF" "EXISTS")? identifier ("," identifier
  * other ALTER VIEW action is recognized and refused with 0A000. */
 create_view    ::= "CREATE" ("OR" "REPLACE")? "VIEW" ("IF" "NOT" "EXISTS")? qualified_table
                    ("(" identifier ("," identifier)* ")")? "AS" subquery_expr
+                   ("WITH" ("CASCADED" | "LOCAL")? "CHECK" "OPTION")?
 drop_view      ::= "DROP" "VIEW" ("IF" "EXISTS")? qualified_table ("," qualified_table)*
                    ("CASCADE" | "RESTRICT")?
 alter_view     ::= "ALTER" "VIEW" ("IF" "EXISTS")? qualified_table "RENAME"

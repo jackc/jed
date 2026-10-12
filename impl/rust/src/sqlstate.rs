@@ -158,6 +158,8 @@ pub enum SqlState {
     InsufficientPrivilege,
     /// 0A000 — feature not supported: {detail}
     FeatureNotSupported,
+    /// 44000 — new row violates check option for view "{view}"
+    WithCheckOptionViolation,
     /// 54000 — SQL statement exceeds the maximum length of {max} bytes
     ProgramLimitExceeded,
     /// 54001 — statement too complex: nesting depth exceeds the maximum of {max}
@@ -271,6 +273,7 @@ impl SqlState {
             SqlState::GeneratedAlways => "428C9",
             SqlState::InsufficientPrivilege => "42501",
             SqlState::FeatureNotSupported => "0A000",
+            SqlState::WithCheckOptionViolation => "44000",
             SqlState::ProgramLimitExceeded => "54000",
             SqlState::StatementTooComplex => "54001",
             SqlState::CostLimitExceeded => "54P01",
@@ -369,6 +372,7 @@ impl SqlState {
             "428C9" => Some(SqlState::GeneratedAlways),
             "42501" => Some(SqlState::InsufficientPrivilege),
             "0A000" => Some(SqlState::FeatureNotSupported),
+            "44000" => Some(SqlState::WithCheckOptionViolation),
             "54000" => Some(SqlState::ProgramLimitExceeded),
             "54001" => Some(SqlState::StatementTooComplex),
             "54P01" => Some(SqlState::CostLimitExceeded),
@@ -476,6 +480,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "428C9", name: "generated_always", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42501", name: "insufficient_privilege", class: "syntax error or access rule violation" },
     ErrorDesc { code: "0A000", name: "feature_not_supported", class: "feature not supported" },
+    ErrorDesc { code: "44000", name: "with_check_option_violation", class: "with check option violation" },
     ErrorDesc { code: "54000", name: "program_limit_exceeded", class: "program limit exceeded" },
     ErrorDesc { code: "54001", name: "statement_too_complex", class: "program limit exceeded" },
     ErrorDesc { code: "54P01", name: "cost_limit_exceeded", class: "program limit exceeded" },

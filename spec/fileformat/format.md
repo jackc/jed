@@ -17,7 +17,13 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 38)
+## Version scope (`format_version` 39)
+
+`format_version` **39** — **view check options** ([../design/views.md §15.6](../design/views.md)).
+Every view entry gains a trailing `u8 check_option` after its dependency list: `0` = none, `1` =
+`LOCAL`, `2` = `CASCADED`; any other value is `XX001` (*View entry* below). A file with no view
+changes only by its version byte + meta CRC; a view golden gains one byte per view. Readers accept
+only the exact current version.
 
 `format_version` **38** — **views** ([../design/views.md](../design/views.md)). The catalog stream
 gains `entry_kind = 5` view entries, emitted **last** (after the statistics group) in ascending byte
@@ -894,7 +900,7 @@ comparison key no longer than 128 bytes. Distribution-ineligible summaries have 
 items. MCV values are distinct and ordered by descending frequency then comparison key; histogram
 bounds are nondecreasing. Bad flags/counts/order/references/types/bytes are `XX001`.
 
-### View entry (`entry_kind = 5`, v38)
+### View entry (`entry_kind = 5`, v38; `check_option` v39)
 
 A view entry records a `CREATE VIEW` definition ([../design/views.md](../design/views.md)). It owns
 no B-tree.
@@ -917,6 +923,7 @@ no B-tree.
 | &nbsp;&nbsp;`dep_name` | UTF-8 — the exact table or view name, in the same database |
 | &nbsp;&nbsp;`dep_col_count` | u16 — `0` for a view dependency (a non-zero count there is `XX001`); for a table, the number of its referenced columns (may be `0`, e.g. `SELECT count(*) FROM t`) |
 | &nbsp;&nbsp;per referenced column (×`dep_col_count`): `u16` length + UTF-8 | the exact column name |
+| `check_option` | u8 (v39) — `0` = none, `1` = `WITH LOCAL CHECK OPTION`, `2` = `WITH CASCADED CHECK OPTION` (views.md §15.6); other values `XX001` |
 
 Dependencies are emitted in ascending byte order of `dep_name` (a table and a view cannot share a
 name). Each dependency's columns are emitted in ascending byte order of the column name. Output

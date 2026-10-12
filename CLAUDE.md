@@ -622,14 +622,15 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   minus the previous catalog chain, GiST forest, and the B-tree pages outside the subtrees the two
   snapshots share — so open never walks the file. The file form of `max_storage_bytes` limits it
   (§13; [spec/design/memory.md](spec/design/memory.md) §8.7).
-- **Views (format v38).** A view is a catalog entry (`entry_kind 5`) holding its output column
-  names, its definition as canonical token text (the CHECK-text rendering, with `*` frozen at
-  CREATE), and its persisted table/column/view dependencies. Open parses but never plans a view;
+- **Views (format v38; check option v39).** A view is a catalog entry (`entry_kind 5`) holding its
+  output column names, its definition as canonical token text (the CHECK-text rendering, with `*`
+  frozen at CREATE), its persisted table/column/view dependencies, and its check option. Open parses but never plans a view;
   each use plans it as the equivalent derived table. `RENAME` (of a table or a
   view) rewrites the stored text, and `ALTER TABLE` and `CREATE OR REPLACE VIEW` re-validate
   dependent views, because text binds by name. A view of PostgreSQL's simple single-relation shape
   is automatically updatable: a write through it is the equivalent statement on its base relation,
-  authorized like a write to a table, by the writer's privilege on the view alone
+  authorized like a write to a table, by the writer's privilege on the view alone; `WITH [CASCADED |
+  LOCAL] CHECK OPTION` refuses (`44000`) a written row the checked views would not show
   ([spec/design/views.md](spec/design/views.md) §15).
 - On-disk format and key encoding are spec'd with byte fixtures (§8). **Status:** the
   single-file on-disk format is authored in `spec/fileformat/format.md` and is now the

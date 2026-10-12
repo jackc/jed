@@ -1,11 +1,12 @@
 # The jed_views catalog relation (spec/design/views.md §11, introspection.md §5.4) and the stored
-# canonical definition (views.md §3/§5): `name text`, `definition text`, `columns text[]`, one row per
-# view. The definition is the body's token sequence rendered by format.md's per-token table (bare
-# words folded, single spaces, comments gone) with every expanded `*` frozen into quoted
+# canonical definition (views.md §3/§5): `name text`, `definition text`, `columns text[]`,
+# `check_option text` (views.md §15.6), one row per view. The definition is the body's token
+# sequence rendered by format.md's per-token table (bare words folded, single spaces, comments
+# gone) with every expanded `*` frozen into quoted
 # `"label" . "column"` references (bare `"column"` for an unlabelled relation or a USING merge).
 # Views are not listed in jed_tables or jed_columns. Scoping, read-only rejection, privileges, and
 # cost follow jed_tables. jed-specific, so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
-# requires: introspect.views, introspect.tables, introspect.columns, ddl.view, ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.join_using, query.qualified_star, query.subquery_exists, query.derived_table, query.cte, query.explain, session.privileges, resource.cost_metering, types.i32, types.text
+# requires: introspect.views, dml.view_check_option, ddl.view_replace, introspect.tables, introspect.columns, ddl.view, ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.join_using, query.qualified_star, query.subquery_exists, query.derived_table, query.cte, query.explain, session.privileges, resource.cost_metering, types.i32, types.text
 
 # --- an empty database lists no views ----------------------------------------------------------------
 
@@ -78,6 +79,49 @@ SELECT definition FROM jed_views WHERE name = 'e'
 ----
 with cte as ( select "u" . "a" , "u" . "e" from u ) select a from t where exists ( select "cte" . "a" , "cte" . "e" from cte where cte . a = t . a )
 
+# --- check_option: NONE, LOCAL, or CASCADED; the clause is not part of the definition -------------
+
+query T nosort
+SELECT check_option FROM jed_views WHERE name = 'v'
+----
+NONE
+
+statement ok
+CREATE VIEW c1 AS SELECT a, b FROM t WHERE a > 0 WITH CHECK OPTION
+
+statement ok
+CREATE VIEW c2 AS SELECT a, b FROM c1 WITH LOCAL CHECK OPTION
+
+query TTT rowsort
+SELECT name, definition, check_option FROM jed_views WHERE name IN ('c1', 'c2')
+----
+c1
+select a , b from t where a > 0
+CASCADED
+c2
+select a , b from c1
+LOCAL
+
+# CREATE OR REPLACE VIEW replaces the check option; without the clause it is removed.
+statement ok
+CREATE OR REPLACE VIEW c2 AS SELECT a, b FROM c1
+
+query T nosort
+SELECT check_option FROM jed_views WHERE name = 'c2'
+----
+NONE
+
+statement ok
+CREATE OR REPLACE VIEW c2 AS SELECT a, b FROM c1 WITH CASCADED CHECK OPTION
+
+query T nosort
+SELECT check_option FROM jed_views WHERE name = 'c2'
+----
+CASCADED
+
+statement ok
+DROP VIEW c2, c1
+
 # --- canonical rendering: keywords and bare names fold, quoted names stay quoted, literals render
 # canonically, comments are dropped ------------------------------------------------------------------
 
@@ -133,7 +177,7 @@ SELECT name FROM nosuchdb.jed_views
 # --- read-only, and its name is reserved ---------------------------------------------------------------
 
 statement error 42809
-INSERT INTO jed_views VALUES ('x', 'select 1', '{x}')
+INSERT INTO jed_views VALUES ('x', 'select 1', '{x}', 'NONE')
 
 statement error 42809
 DROP VIEW jed_views

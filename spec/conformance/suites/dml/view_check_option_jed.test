@@ -1,0 +1,173 @@
+# WITH CHECK OPTION — the jed-specific behavior of spec/design/views.md §15.6 that PostgreSQL cannot
+# oracle-check: the session privilege envelope (the check needs nothing beyond the write's privilege
+# on the view, §15.4), the recorded divergences (§12: EXCLUDE and the UPDATE end-state checks come
+# before the check option; `WITH ( check_option = … )` is 0A000; CREATE VIEW IF NOT EXISTS), and
+# cost (the check is metered expression work on each new row; EXPLAIN is unchanged).
+# CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# requires: ddl.view, dml.view_write, dml.view_check_option, ddl.view_alter, ddl.create_table, ddl.primary_key, ddl.check, ddl.exclusion_constraint, types.range, dml.insert, dml.insert_multi_row, dml.update, dml.returning, query.select, query.where_eq, query.order_by, query.explain, dml.explain, func.abs, expr.arithmetic, expr.case, resource.cost_metering, types.i32, session.privileges
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 1), (2, 20, 2)
+
+statement ok
+CREATE VIEW v AS SELECT id, a FROM t WHERE a > 0 AND abs(b) < 100 WITH CHECK OPTION
+
+# --- privileges: the check needs nothing beyond the write's privilege on the view -----------------
+
+# The check reads base columns the view does not show, but INSERT on the view is enough.
+# default_privileges: NONE
+# grant: INSERT ON v
+statement ok
+INSERT INTO v VALUES (3, 30)
+
+# default_privileges: NONE
+# grant: INSERT ON v
+statement error 44000
+INSERT INTO v VALUES (4, -4)
+
+# A function the checked WHERE calls needs the writer's EXECUTE.
+# revoke: EXECUTE ON abs
+statement error 42501
+INSERT INTO v VALUES (4, 40)
+
+# --- view options and IF NOT EXISTS --------------------------------------------------------------
+
+# The `WITH ( … )` option spelling is not supported (PostgreSQL accepts check_option there).
+statement error 0A000
+CREATE VIEW o1 WITH (check_option = local) AS SELECT id, a FROM t WHERE a > 0
+
+statement error 0A000
+ALTER VIEW v SET (check_option = local)
+
+# IF NOT EXISTS on a taken name is a silent no-op; the skipped clause is not validated.
+statement ok
+CREATE VIEW IF NOT EXISTS v AS SELECT a + 1 AS x FROM t WITH CHECK OPTION
+
+statement ok
+CREATE VIEW IF NOT EXISTS v2 AS SELECT id, a FROM t WHERE a < 1000 WITH LOCAL CHECK OPTION
+
+statement error 44000
+INSERT INTO v2 VALUES (5, 5000)
+
+# --- divergences: checks PostgreSQL makes before the check option, and jed after -------------------
+
+# EXCLUDE is checked over the statement's end state, after the check option: a row that violates
+# both is 44000 (PostgreSQL reports 23P01).
+statement ok
+CREATE TABLE ex (id i32 PRIMARY KEY, a i32, span i32range, EXCLUDE USING gist (span WITH &&))
+
+statement ok
+INSERT INTO ex VALUES (1, 1, '[1,10)')
+
+statement ok
+CREATE VIEW exv AS SELECT id, a, span FROM ex WHERE a > 0 WITH CHECK OPTION
+
+statement error 44000
+INSERT INTO exv VALUES (2, -1, '[5,15)')
+
+statement error 23P01
+INSERT INTO exv VALUES (2, 1, '[5,15)')
+
+# An UPDATE checks keys over its end state, and its check option after them, so a later row's CHECK
+# failure is reported before an earlier row's check-option failure (PostgreSQL reports 44000).
+statement ok
+CREATE TABLE ck (id i32 PRIMARY KEY, a i32 CHECK (a < 50))
+
+statement ok
+INSERT INTO ck VALUES (1, 10), (2, 20)
+
+statement ok
+CREATE VIEW ckv AS SELECT id, a FROM ck WHERE a > 0 WITH CHECK OPTION
+
+statement error 23514
+UPDATE ckv SET a = CASE WHEN id = 1 THEN -1 ELSE 60 END
+
+statement error 44000
+UPDATE ckv SET a = CASE WHEN id = 1 THEN -1 ELSE 30 END
+
+# --- cost and EXPLAIN (views.md §15.6) ------------------------------------------------------------
+
+statement ok
+CREATE TABLE m (id i32 PRIMARY KEY, x i32, y i32)
+
+statement ok
+INSERT INTO m VALUES (1, 10, 1), (2, 20, 2)
+
+statement ok
+CREATE VIEW mv AS SELECT id, x FROM m WHERE y > 0 AND x < 100
+
+statement ok
+CREATE VIEW mc AS SELECT id, x FROM m WHERE y > 0 AND x < 100 WITH CHECK OPTION
+
+# A literal INSERT evaluates nothing, so through a view without a check option it costs 0.
+# cost: 0
+statement ok
+INSERT INTO mv VALUES (3, 30)
+
+# mc does not output y, so a row inserted through it has y NULL and fails at `y > 0`.
+statement error 44000
+INSERT INTO mc VALUES (4, 40)
+
+statement ok
+CREATE VIEW mcy AS SELECT id, x, y FROM m WHERE y > 0 AND x < 100 WITH CHECK OPTION
+
+# Each row: the AND + `>` + `<` = 3, so two rows cost 6.
+# cost: 6
+statement ok
+INSERT INTO mcy VALUES (4, 40, 1), (5, 50, 1)
+
+# The UPDATE is the base statement — 1 page + 1 row + the 5-node WHERE + the assignment's `+` = 8 —
+# plus the check on the new row (3) = 11.
+# cost: 11
+statement ok
+UPDATE mcy SET x = x + 1 WHERE id = 4
+
+# cost: 8
+statement ok
+UPDATE mv SET x = x + 1 WHERE id = 4
+
+# EXPLAIN renders no node for the check, and the estimate leaves it out.
+# names: depth, node, detail, est_rows, est_cost
+# types: i32, text, text, i64, i64
+query ITTII nosort
+EXPLAIN UPDATE mcy SET x = x + 1 WHERE id = 4
+----
+0
+Update m
+sets=1
+1
+5
+1
+Filter
+conjuncts=3
+1
+5
+2
+Scan m
+PK bound: id = 4; touched=3
+1
+2
+
+# names: depth, node, detail, est_rows, est_cost
+# types: i32, text, text, i64, i64
+query ITTII nosort
+EXPLAIN UPDATE mv SET x = x + 1 WHERE id = 4
+----
+0
+Update m
+sets=1
+1
+5
+1
+Filter
+conjuncts=3
+1
+5
+2
+Scan m
+PK bound: id = 4; touched=3
+1
+2

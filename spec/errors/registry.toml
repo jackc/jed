@@ -604,7 +604,17 @@ name = "feature_not_supported"
 class = "feature not supported"
 template = "feature not supported: {detail}"
 
-# --- program limit exceeded (class 54) --------------------------------------
+# --- with check option violation (class 44) ---------------------------------
+# A row written through a view with a CHECK OPTION fails the WHERE of a view the option checks
+# (spec/design/views.md §15.6): FALSE or NULL fails. PostgreSQL's code and message; the view named
+# is the first failing one, nearest the base table first.
+[[error]]
+code = "44000"
+name = "with_check_option_violation"
+class = "with check option violation"
+template = "new row violates check option for view \"{view}\""
+
+# --- program limit exceeded (class 54)--------------------------------------
 # A caller-imposed (or engine-fixed) limit was exceeded. The §13 untrusted-query
 # safety gates live here.
 #
