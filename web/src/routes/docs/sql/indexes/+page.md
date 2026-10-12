@@ -124,6 +124,16 @@ primary key cannot disturb the scan. An `IN` list on an indexed leading column u
 set of index point probes. The complete `WHERE` is still rechecked for every candidate; only the
 work changes, never which rows are updated or deleted.
 
+An index name shares the namespace of tables, sequences, and views, so creating an index whose name
+is taken is error `42P07`. `CREATE INDEX IF NOT EXISTS name ON …` makes it a no-op instead, for
+every index kind, so setup scripts can be re-run safely. The name is required in this form. As in
+PostgreSQL, the new definition is still checked first (an unknown column is still `42703`), but
+nothing is built and the existing index is left as it was, even if the new definition differs.
+
+```sql
+CREATE INDEX IF NOT EXISTS city_region ON city (region);   -- no-op: city_region exists
+```
+
 The same rule applies inside a join: `parent JOIN child ON child.parent_id = parent.id` opens the
 child index once per parent row instead of rescanning all children. With `ORDER BY parent.id LIMIT
 ...`, jed preserves that nested-loop order and stops opening later child bounds as soon as the result

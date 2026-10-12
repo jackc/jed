@@ -1265,8 +1265,8 @@ impl Parser {
         })
     }
 
-    /// `CREATE [UNIQUE] INDEX [name] ON <table> ( col [, col]* )` (spec/design/grammar.md
-    /// §30). The optional name needs one disambiguation because no word is reserved: the
+    /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS name | name] ON <table> ( col [, col]* )`
+    /// (spec/design/grammar.md §30). The optional name needs one disambiguation because no word is reserved: the
     /// word after INDEX is the index name UNLESS it is `ON` followed by a word and then `(`
     /// — that exact three-token shape can only be the unnamed form's `ON table (`. Key
     /// columns are bare identifiers (no expression / ordered / partial keys this slice — a
@@ -1278,11 +1278,22 @@ impl Parser {
             self.advance();
         }
         self.expect_keyword("index")?;
+        // `IF NOT EXISTS` (grammar.md §30) is recognized by a two-token lookahead, so a lone `if`
+        // stays an ordinary index name (`CREATE INDEX if ON t (a)`). PostgreSQL requires a name
+        // after it, so the unnamed lookahead below does not apply: `IF NOT EXISTS ON t (a)` is 42601.
+        let if_not_exists = if self.peek_keyword().as_deref() == Some("if")
+            && self.peek_keyword_at(1).as_deref() == Some("not")
+        {
+            self.parse_if_not_exists()?
+        } else {
+            false
+        };
         // The unnamed form is `INDEX ON <table> [USING <method>] (` — the word after INDEX is the
         // index NAME unless it is `ON` followed by a word and then `(` OR `USING` (the three-token
         // lookahead, extended for the optional USING clause — grammar.md §30, gin.md §3). A §8
         // determinism surface, byte-identical across the parsers.
-        let unnamed = self.peek_keyword().as_deref() == Some("on")
+        let unnamed = !if_not_exists
+            && self.peek_keyword().as_deref() == Some("on")
             && is_ident(self.peek_at(1))
             && (matches!(self.peek_at(2), Token::LParen)
                 || matches!(self.peek_at(2), Token::Word(w) if w.eq_ignore_ascii_case("using")));
@@ -1329,6 +1340,7 @@ impl Parser {
         };
         Ok(CreateIndex {
             name,
+            if_not_exists,
             table,
             keys,
             unique,

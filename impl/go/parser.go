@@ -1476,7 +1476,7 @@ func (p *parser) parseDropTable() (*dropTable, error) {
 	return &dropTable{Names: names, IfExists: ifExists, Cascade: cascade}, nil
 }
 
-// parseCreateIndex parses `CREATE INDEX [name] ON <table> ( col [, col]* )`
+// parseCreateIndex parses `CREATE INDEX [IF NOT EXISTS name | name] ON <table> ( col [, col]* )`
 // (spec/design/grammar.md §30). The optional name needs one disambiguation because no
 // word is reserved: the word after INDEX is the index name UNLESS it is `ON` followed by
 // a word and then `(` — that exact three-token shape can only be the unnamed form's
@@ -1493,10 +1493,20 @@ func (p *parser) parseCreateIndex() (*createIndex, error) {
 	if err := p.expectKeyword("index"); err != nil {
 		return nil, err
 	}
+	// `IF NOT EXISTS` (grammar.md §30) is recognized by a two-token lookahead, so a lone `if` stays an
+	// ordinary index name (`CREATE INDEX if ON t (a)`). PostgreSQL requires a name after it, so the
+	// unnamed lookahead below does not apply: `IF NOT EXISTS ON t (a)` is 42601.
+	ifNotExists := false
+	if p.peekKeyword() == "if" && p.peekKeywordAt(1) == "not" {
+		var err error
+		if ifNotExists, err = p.parseIfNotExists(); err != nil {
+			return nil, err
+		}
+	}
 	// The unnamed form is `INDEX ON <table> [USING <method>] (` — the word after INDEX is the
 	// index name unless it is `ON` followed by a word and then `(` OR `USING` (the three-token
 	// lookahead, extended for the optional USING clause — grammar.md §30, gin.md §3).
-	unnamed := p.peekKeyword() == "on" &&
+	unnamed := !ifNotExists && p.peekKeyword() == "on" &&
 		isIdentKind(p.peekKindAt(1)) &&
 		(p.peekKindAt(2) == tokLParen || p.peekKeywordAt(2) == "using")
 	name := ""
@@ -1560,7 +1570,7 @@ func (p *parser) parseCreateIndex() (*createIndex, error) {
 		}
 		predicate = &indexPredicate{Text: renderTokens(p.tokens[start:p.pos]), Expr: expr}
 	}
-	return &createIndex{Name: name, Table: table, DB: dbQualifier, Keys: keys, Unique: unique, Using: using, Predicate: predicate}, nil
+	return &createIndex{Name: name, IfNotExists: ifNotExists, Table: table, DB: dbQualifier, Keys: keys, Unique: unique, Using: using, Predicate: predicate}, nil
 }
 
 // parseIndexElement parses one index_element (grammar.md §30, indexes.md §1): a bare column, a

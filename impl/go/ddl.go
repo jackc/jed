@@ -3535,6 +3535,12 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			return outcome{}, err
 		}
 		if relationTaken(name) {
+			// IF NOT EXISTS turns the collision into a no-op success, decided here — after the whole
+			// definition validated, before the build scan (PostgreSQL's index_create order;
+			// indexes.md §1). The jed_ reservation above still applies.
+			if ci.IfNotExists {
+				return outcome{Kind: outcomeStatement, Cost: 0}, nil
+			}
 			return outcome{}, newError(DuplicateTable, "relation already exists: "+name)
 		}
 	} else {

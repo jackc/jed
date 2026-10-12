@@ -2054,7 +2054,8 @@ duplicate name `42710` (constraints.md §4.1–§4.3). The parser knows no catal
 Two new top-level statements ([indexes.md](indexes.md)):
 
 ```
-create_index  ::= "CREATE" "UNIQUE"? "INDEX" identifier? "ON" identifier using_clause?
+create_index  ::= "CREATE" "UNIQUE"? "INDEX" ( "IF" "NOT" "EXISTS" identifier | identifier? )
+                  "ON" identifier using_clause?
                   "(" index_element ("," index_element)* ")" ( "WHERE" expr )?
 index_element ::= column_ref | function_call | "(" expr ")"
 drop_index    ::= "DROP" "INDEX" identifier
@@ -2083,6 +2084,26 @@ form over a table named `on`. PostgreSQL reserves `ON` so the ambiguity cannot a
 there; the lookahead is jed's standing no-reserved-words mechanism (the same move as
 `DISTINCT`'s and `CHECK`'s).
 
+**`CREATE INDEX IF NOT EXISTS name` — the idempotent create.** A name already taken in the target
+database's relation namespace — a table, index, sequence, or view (the namespace is shared) — turns
+the bare form's `42P07` into a **no-op success** (PostgreSQL emits a *"relation already exists,
+skipping"* notice; jed has no notice channel, so it is silent, like `CREATE TABLE IF NOT EXISTS`
+§13 and `CREATE SEQUENCE IF NOT EXISTS`). It is not a "create or replace": the existing relation
+keeps its definition whatever the new one says (a skipped `UNIQUE` definition leaves a non-unique
+index non-unique). **Unlike `CREATE TABLE IF NOT EXISTS`, the skip comes late** — PostgreSQL checks
+the name in `index_create`, after `DefineIndex` has validated the whole definition — so jed decides
+it exactly where the bare form raises `42P07`: every error listed under *Where the errors fire*
+below (`42P01`, `42704`, `42703`, `0A000`, `42P17`, …) still fires, and only the build scan is
+skipped (zero cost, and no `23505` build-time check). The statement gating, the database
+qualifier, and the `jed_` reservation (`42939` — a reservation is not a collision) also still apply;
+the collision is checked in the namespace the bare form checks (an attachment's own namespace for
+`db.table`, the temp-aware session namespace otherwise — so under preclude-overlaps a temp table's
+index whose name a persistent relation holds is a no-op). PostgreSQL's grammar **requires a name**
+after `IF NOT EXISTS` (its production uses `name`, not `opt_single_name`), so the unnamed lookahead
+above does not apply there: `CREATE INDEX IF NOT EXISTS ON t (a)` is `42601`. The keywords are
+recognized by a **two-token lookahead** (`IF NOT`), so `CREATE INDEX if ON t (a)` still names an
+index `if`.
+
 **Key elements: column, function call, or parenthesized expression** ([indexes.md §1](indexes.md),
 PostgreSQL's `index_elem`). Each parser reads one element by peeking:
 
@@ -2106,7 +2127,8 @@ in PostgreSQL's order — table `42P01`, then each key element in list order (a 
 `42703` unknown / `0A000` unindexable; an expression key: resolve against the table
 [unknown column `42703`], then `42803` aggregate / `42P20` window / `0A000` subquery /
 `42P02` param / `42P17` non-immutable, then `0A000` for a composite result type), then the
-explicit name against the shared relation namespace (`42P07`) — and DROP INDEX raises
+explicit name against the shared relation namespace (`42P07`, or the `IF NOT EXISTS` no-op) — and
+DROP INDEX raises
 `42704` (missing) / `42809` (names a table). Semantics: [indexes.md §2](indexes.md).
 
 ## 31. `UNIQUE` constraints (`[CONSTRAINT name] UNIQUE [( cols )]`)

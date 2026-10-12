@@ -16,9 +16,16 @@
 ## 1. Surface
 
 ```sql
-CREATE [UNIQUE] INDEX [name] ON table (key [, key ...]) [WHERE predicate]
+CREATE [UNIQUE] INDEX [IF NOT EXISTS name | name] ON table (key [, key ...]) [WHERE predicate]
 DROP INDEX name
 ```
+
+**`IF NOT EXISTS`** (a name is required, as in PostgreSQL) turns a relation-namespace collision
+into a silent **no-op success** (PG's notice has no jed channel). PostgreSQL decides it in
+`index_create`, after the whole definition is validated, so jed decides it at the same point the
+bare form raises `42P07`: every definition error (§2, [gin.md §3](gin.md), [gist.md §5](gist.md),
+§9) still fires, and only the build is skipped — zero cost, no `23505` build check, the existing
+relation untouched. It applies identically to every index kind ([grammar.md §30](grammar.md)).
 
 The optional **`WHERE predicate`** makes the index **partial** (§9): only rows for which the
 predicate evaluates to **TRUE** are indexed (and, for a `UNIQUE` partial index, only those rows
@@ -70,7 +77,7 @@ three forms in one key list (`CREATE INDEX ON t (lower(email), a, (b + 1))`).
   deterministic function of the row, so the index stays consistent with the table under the
   §8/§10 contract.
 - **Still deferred** (each a relaxable narrowing, PostgreSQL features): per-key
-  `ASC`/`DESC`/`NULLS`, `IF NOT EXISTS`, `CONCURRENTLY`, and an explicit operator class /
+  `ASC`/`DESC`/`NULLS`, `CONCURRENTLY`, and an explicit operator class /
   `COLLATE` on a key element. An expression key's text result uses the expression's own
   effective collation (jed's ordinary text-collation resolution), not a per-key `COLLATE`.
   (Partial (`WHERE`) indexes have **landed** for B-tree — §9.)

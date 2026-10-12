@@ -308,6 +308,10 @@ pub enum IndexKeyElem {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CreateIndex {
     pub name: Option<String>,
+    /// `IF NOT EXISTS` (always with a `name` — the grammar requires one): a name already taken in
+    /// the relation namespace turns the 42P07 into a no-op success. Checked where the bare form
+    /// checks the collision — after every definition check, before the build (indexes.md §1).
+    pub if_not_exists: bool,
     pub table: String,
     pub keys: Vec<IndexKeyElem>,
     pub unique: bool,

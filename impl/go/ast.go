@@ -326,10 +326,14 @@ func (e indexKeyElem) isExpr() bool { return e.Expr != nil }
 // collision 42P07. A Unique index additionally verifies the existing rows at build (23505) and
 // enforces uniqueness thereafter (spec/design/indexes.md §8).
 type createIndex struct {
-	Name   string
-	Table  string
-	Keys   []indexKeyElem
-	Unique bool
+	Name string
+	// IfNotExists is `IF NOT EXISTS` (always with a Name — the grammar requires one): a name already
+	// taken in the relation namespace turns the 42P07 into a no-op success. Checked where the bare
+	// form checks the collision — after every definition check, before the build (indexes.md §1).
+	IfNotExists bool
+	Table       string
+	Keys        []indexKeyElem
+	Unique      bool
 	// Using is the `USING <method>` access method as written, or "" for the default ordered
 	// B-tree. Resolved at execution: ""/"btree" → B-tree, "gin" → GIN, else 42704 (gin.md §3).
 	Using string

@@ -8772,6 +8772,10 @@ export class Engine {
     if (ci.name !== null) {
       checkReservedName("index", ci.name);
       if (relationTaken(ci.name)) {
+        // IF NOT EXISTS turns the collision into a no-op success, decided here — after the whole
+        // definition validated, before the build scan (PostgreSQL's index_create order;
+        // indexes.md §1). The jed_ reservation above still applies.
+        if (ci.ifNotExists) return { kind: "statement", cost: 0n, rowsAffected: null };
         throw engineError("duplicate_table", "relation already exists: " + ci.name);
       }
       name = ci.name;

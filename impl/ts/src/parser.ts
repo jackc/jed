@@ -1354,7 +1354,7 @@ class Parser {
     return { kind: "dropTable", names, ifExists, cascade };
   }
 
-  // parseCreateIndex parses `CREATE INDEX [name] ON <table> ( col [, col]* )`
+  // parseCreateIndex parses `CREATE INDEX [IF NOT EXISTS name | name] ON <table> ( col [, col]* )`
   // (spec/design/grammar.md §30). The optional name needs one disambiguation because no
   // word is reserved: the word after INDEX is the index name UNLESS it is `ON` followed
   // by a word and then `(` — that exact three-token shape can only be the unnamed form's
@@ -1365,10 +1365,16 @@ class Parser {
     const unique = this.peekKeyword() === "unique";
     if (unique) this.advance();
     this.expectKeyword("index");
+    // `IF NOT EXISTS` (grammar.md §30) is recognized by a two-token lookahead, so a lone `if` stays an
+    // ordinary index name (`CREATE INDEX if ON t (a)`). PostgreSQL requires a name after it, so the
+    // unnamed lookahead below does not apply: `IF NOT EXISTS ON t (a)` is 42601.
+    const ifNotExists =
+      this.peekKeyword() === "if" && this.peekKeywordAt(1) === "not" && this.parseIfNotExists();
     // The unnamed form is `INDEX ON <table> [USING <method>] (` — the word after INDEX is the
     // index name unless it is `ON` followed by a word and then `(` OR `USING` (the three-token
     // lookahead, extended for the optional USING clause — grammar.md §30, gin.md §3).
     const unnamed =
+      !ifNotExists &&
       this.peekKeyword() === "on" &&
       isIdentKind(this.peekKindAt(1)) &&
       (this.peekKindAt(2) === "lparen" || this.peekKeywordAt(2) === "using");
@@ -1404,7 +1410,7 @@ class Parser {
       const expr = this.parseExpr();
       predicate = { text: renderTokens(this.tokens.slice(start, this.pos)), expr };
     }
-    return { kind: "createIndex", name, table, db, keys, unique, using, predicate };
+    return { kind: "createIndex", name, ifNotExists, table, db, keys, unique, using, predicate };
   }
 
   // parseIndexElement parses one `index_element` (grammar.md §30, indexes.md §1): a bare column,

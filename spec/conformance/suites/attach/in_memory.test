@@ -9,7 +9,7 @@
 # no embedded multi-database model), so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
 # attach: mydb
 # attach: refs
-# requires: attach.in_memory, harness.attach, query.qualified_table, ddl.create_table, ddl.create_table_if_not_exists, ddl.temp_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.check, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, types.i32, types.text, session.allow_temp_ddl
+# requires: attach.in_memory, harness.attach, query.qualified_table, ddl.create_table, ddl.create_table_if_not_exists, ddl.create_index_if_not_exists, ddl.drop_table, ddl.temp_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.check, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, types.i32, types.text, session.allow_temp_ddl
 
 # --- CREATE TABLE into an attachment + populate it --------------------------------------------
 
@@ -177,6 +177,24 @@ INSERT INTO mydb.acct VALUES (2, 'b@x', 5)
 
 statement ok
 CREATE INDEX acct_bal_idx ON mydb.acct (balance)
+
+# CREATE INDEX IF NOT EXISTS checks the TARGET database's own namespace: the name is taken in mydb, so
+# this is a no-op ...
+statement ok
+CREATE INDEX IF NOT EXISTS acct_bal_idx ON mydb.acct (email)
+
+# ... while main has no acct_bal_idx, so the same name is free there
+statement ok
+CREATE TABLE acct_main (id i32 PRIMARY KEY, balance i32)
+
+statement ok
+CREATE INDEX IF NOT EXISTS acct_bal_idx ON acct_main (balance)
+
+statement ok
+CREATE INDEX IF NOT EXISTS acct_bal_idx ON acct_main (balance)
+
+statement ok
+DROP TABLE acct_main
 
 # the index is used only for maintenance this slice (attachment scans full) — the rows are correct
 query IT nosort

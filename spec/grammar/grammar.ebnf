@@ -292,7 +292,14 @@ alter_column_action ::= "SET" "DEFAULT" expr
  * immutable and self-contained: a subquery is 0A000, a bind parameter 42P02, an aggregate 42803, a
  * window 42P20, a non-boolean result 42804, a non-immutable / timestamptz-dependent expression 42P17.
  * Narrowings this slice (each 0A000-free — simply not in the grammar): no per-key ASC/DESC/NULLS or
- * COLLATE, no IF NOT EXISTS, no NULLS NOT DISTINCT.
+ * COLLATE, no NULLS NOT DISTINCT.
+ *   "IF NOT EXISTS" (which REQUIRES a name, as in PG — "IF NOT EXISTS ON t (a)" is 42601) makes a name
+ * already taken in the target database's relation namespace a no-op success instead of 42P07. Unlike
+ * CREATE TABLE IF NOT EXISTS, the skip is decided where PostgreSQL's index_create decides it: AFTER
+ * the whole definition is validated (every code above still fires), before the build scan — so the
+ * skipped statement charges zero cost and runs no 23505 build check (../design/grammar.md §30). The
+ * jed_ reservation (42939) is not suppressed. Recognized by a two-token lookahead (IF NOT), so
+ * "CREATE INDEX if ON t (a)" names an index "if".
  *
  * DROP INDEX removes one index by name: 42704 if it does not exist, 42809 if the name is
  * a table ("is not an index"); symmetrically DROP TABLE of an index name is 42809 ("is
@@ -300,7 +307,7 @@ alter_column_action ::= "SET" "DEFAULT" expr
  * constraint-backed unique index drops the UNIQUE constraint with it (a documented PG
  * divergence — jed has no ALTER TABLE ... DROP CONSTRAINT, so the index name is the
  * constraint's only handle; indexes.md §8). */
-create_index   ::= "CREATE" "UNIQUE"? "INDEX" identifier? "ON" qualified_table
+create_index   ::= "CREATE" "UNIQUE"? "INDEX" ( "IF" "NOT" "EXISTS" identifier | identifier? ) "ON" qualified_table
                    using_clause? "(" index_element ("," index_element)* ")"
                    ( "WHERE" expr )?               /* an optional partial-index predicate (indexes.md §9) */
 index_element  ::= column_ref                    /* a bare column name */

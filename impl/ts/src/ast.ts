@@ -630,6 +630,10 @@ export type IndexKeyElem =
 export type CreateIndex = {
   kind: "createIndex";
   name: string | null;
+  // `IF NOT EXISTS` (always with a name — the grammar requires one): a name already taken in the
+  // relation namespace turns the 42P07 into a no-op success. Checked where the bare form checks the
+  // collision — after every definition check, before the build (indexes.md §1).
+  ifNotExists: boolean;
   table: string;
   // The optional database qualifier on the target table `CREATE INDEX … ON db.table (…)`
   // (spec/design/attached-databases.md §3, Slice 1b): the index is built ON a table in that database

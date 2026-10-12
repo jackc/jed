@@ -10,7 +10,7 @@
 # and engine-GENERATED names — a serial's <table>_<col>_seq and an index auto-name both stay legal
 # for a table named jed. IF NOT EXISTS does not suppress the error (a reservation is not a
 # collision).
-# requires: query.quoted_identifiers, introspect.tables, query.where_eq, ddl.drop_table, ddl.create_table, ddl.create_table_if_not_exists, ddl.primary_key, ddl.temp_table, session.allow_temp_ddl, ddl.secondary_index, ddl.unique, ddl.exclusion_constraint, ddl.check, ddl.sequence, ddl.alter_sequence, ddl.alter_table, ddl.serial, func.sequence, types.composite, types.range, dml.insert, dml.insert_column_list, query.select, types.i32
+# requires: query.quoted_identifiers, introspect.tables, query.where_eq, ddl.drop_table, ddl.create_table, ddl.create_table_if_not_exists, ddl.create_index_if_not_exists, ddl.primary_key, ddl.temp_table, session.allow_temp_ddl, ddl.secondary_index, ddl.unique, ddl.exclusion_constraint, ddl.check, ddl.sequence, ddl.alter_sequence, ddl.alter_table, ddl.serial, func.sequence, types.composite, types.range, dml.insert, dml.insert_column_list, query.select, types.i32
 
 # --- the relation namespace: tables (persistent + TEMP) --------------------------------------------
 
@@ -67,6 +67,10 @@ CREATE TABLE t (a i32)
 
 statement error 42939
 CREATE INDEX jed_idx ON t (a)
+
+# a reservation is not a collision: IF NOT EXISTS does not suppress it
+statement error 42939
+CREATE INDEX IF NOT EXISTS jed_idx ON t (a)
 
 statement error 42939
 CREATE SEQUENCE jed_seq

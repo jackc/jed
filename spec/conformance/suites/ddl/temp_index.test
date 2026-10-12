@@ -10,7 +10,7 @@
 # §5). jed-specific (the temp divergences + the host-configured gate cannot be reproduced via the
 # same SQL on PostgreSQL), so this suite is CROSS-CORE-checked, NOT PostgreSQL-oracle-checked — the
 # cost is part of the cross-core contract (§8). Format: ../../../design/conformance.md.
-# requires: ddl.temp_table, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.drop_table, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, query.point_lookup, types.i32, session.allow_temp_ddl, resource.cost_metering
+# requires: ddl.temp_table, ddl.create_table, ddl.create_index_if_not_exists, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.drop_table, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, query.point_lookup, types.i32, session.allow_temp_ddl, resource.cost_metering
 
 # --- a secondary index on a SESSION-LOCAL temp table is built AND used by the planner ----------
 # (the cost block mirrors query/index_scan.test on a temp table — same data, same costs)
@@ -97,6 +97,28 @@ DROP INDEX no_such_index
 # DROP INDEX naming a TABLE (temp t) is 42809, not 42704 — table() covers all scopes
 statement error 42809
 DROP INDEX t
+
+# --- CREATE INDEX IF NOT EXISTS on a temp table ------------------------------------------------
+
+# a taken name is a no-op: no build scan, zero cost
+# cost: 0
+statement ok
+CREATE INDEX IF NOT EXISTS t_w_key ON t (v)
+
+# under preclude-overlaps a persistent relation's name is taken for a temp index too
+statement ok
+CREATE TABLE pt (id i32 PRIMARY KEY)
+
+statement ok
+CREATE INDEX IF NOT EXISTS pt ON t (v)
+
+statement ok
+DROP TABLE pt
+
+# the gate is checked before the skip: even a no-op temp CREATE INDEX is denied
+# allow_temp_ddl: off
+statement error 42501
+CREATE INDEX IF NOT EXISTS t_w_key ON t (v)
 
 # --- the temp-scoped DDL gate covers temp index DDL (temp-tables.md §5) -------------------------
 

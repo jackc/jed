@@ -4603,6 +4603,15 @@ impl Engine {
             Some(n) => {
                 check_reserved_name("index", n)?;
                 if relation_taken(n) {
+                    // IF NOT EXISTS turns the collision into a no-op success, decided here — after
+                    // the whole definition validated, before the build scan (PostgreSQL's
+                    // index_create order; indexes.md §1). The jed_ reservation above still applies.
+                    if ci.if_not_exists {
+                        return Ok(Outcome::Statement {
+                            cost: 0,
+                            rows_affected: None,
+                        });
+                    }
                     return Err(EngineError::new(
                         SqlState::DuplicateTable,
                         format!("relation already exists: {n}"),
