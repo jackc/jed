@@ -502,13 +502,16 @@ in the `mise run ci` gate. Two families of relation are generated:
   the **aggregate-TLP** forms: the whole-table aggregate reconstructed from the same aggregate over the
   three partitions — `COUNT` (parts add directly), `SUM` (`COALESCE(part, 0)` supplies the additive
   identity an empty partition lacks, [grammar.md](grammar.md) §51), and `MIN`/`MAX` (`LEAST`/`GREATEST`
-  combine the parts, dropping an empty partition's NULL, [grammar.md](grammar.md) §52) — both **ungrouped**
+  combine the parts, dropping an empty partition's NULL, [grammar.md](grammar.md) §52), and `AVG` (not
+decomposable from partition averages: it reconstructs as the summed partition sums `::decimal` over the
+summed partition counts `::decimal` — the same division `AVG` finalizes with, [aggregates.md](aggregates.md)
+§3 — with a `CASE` mapping a zero count to `AVG`'s empty-group NULL) — both **ungrouped**
   (via scalar-subquery combination) and **grouped** (`GROUP BY`-level: each partition aggregated per group,
   `UNION ALL`'d in a derived table, then re-aggregated per group — the super-aggregate identity, with the
-  `SUM`/`COUNT` re-aggregation cast back to `i64` to match the direct type). `AVG` aggregate-TLP is
-  **deferred**: it reconstructs as total-`SUM` / total-`COUNT`, so its by-construction expected is an
-  exact-`decimal` division whose scale/rounding ([decimal.md](decimal.md) §3-4) the generator would have
-  to replicate — a future generator addition.
+  `SUM`/`COUNT` re-aggregation cast back to `i64` to match the direct type). `AVG`'s by-construction
+  expected is the exact-`decimal` quotient: the generator reproduces `select_div_scale` for an
+  integer/integer division and rounds half away from zero ([decimal.md](decimal.md) §3-4), so the
+  display scale is asserted as well as the value.
 
 **Why this catches what the differential cores cannot.** Running every `.test` on Rust/Go/TS
 catches the cores *disagreeing*; it is blind to a bug **all three share**. A metamorphic
@@ -606,9 +609,7 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   CROSS-JOIN-plus-filter equivalence (`a JOIN b ON a.k=b.k` ≡ `a CROSS JOIN b WHERE a.k=b.k`), the
   same projected pairs through different execution shapes.
 - **NOT yet covered (needs a new relation):** any future optimization without a scenario in
-  `scripts/norec_gen.rb`; on the TLP side,
-  `AVG` aggregate partitioning (deferred — its by-construction expected is an exact-`decimal`
-  `SUM`/`COUNT` division, above). Each is a future relation the sweep does **not** yet exercise — add a
+  `scripts/norec_gen.rb`. Each is a future relation the sweep does **not** yet exercise — add a
   scenario when it lands.
 
 **Reducing a discovered failure.** Generation is seeded, so a failure reproduces deterministically

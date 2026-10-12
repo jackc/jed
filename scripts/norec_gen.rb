@@ -314,7 +314,8 @@ TLP_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row qu
              query.where_eq query.comparison_order query.order_by query.is_null
              query.logical_connectives query.union query.aggregates query.group_by
              query.derived_table query.subquery_scalar expr.arithmetic expr.comparison_value
-             expr.coalesce expr.greatest_least cast.explicit types.i32 null.three_valued].freeze
+             expr.coalesce expr.greatest_least expr.case cast.explicit types.i32 types.decimal
+             null.three_valued].freeze
 CTE_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
              query.where_eq query.comparison_order query.order_by query.cte expr.arithmetic
              expr.between expr.comparison_value types.i32].freeze
@@ -2130,6 +2131,37 @@ def tlp_or(p, q)
   false
 end
 
+# PG's select_div_scale for an integer / integer quotient (both operands scale 0) — decimal.md §4,
+# reproduced so AVG's by-construction expected carries the exact display scale. `w` is the base-10⁴
+# weight of the leading digit group, `f` that group's value; a zero operand is w = 0, f = 0.
+def tlp_div_scale(n, d)
+  wf = lambda do |x|
+    x = x.abs
+    next [0, 0] if x.zero?
+
+    w = (x.to_s.size - 1) / 4
+    [w, x / 10**(4 * w)]
+  end
+  w1, f1 = wf.call(n)
+  w2, f2 = wf.call(d)
+  qweight = w1 - w2
+  qweight -= 1 if f1 <= f2
+  (16 - 4 * qweight).clamp(0, 1000)
+end
+
+# AVG = sum::decimal / count::decimal (aggregates.md §3): long-divide to select_div_scale, rounding
+# half away from zero (decimal.md §4), rendered as jed prints a decimal. count 0 (empty/all-NULL) is NULL.
+def tlp_avg(sum, count)
+  return "NULL" if count.zero?
+
+  scale = tlp_div_scale(sum, count)
+  q, r = (sum.abs * 10**scale).divmod(count)
+  q += 1 if 2 * r >= count
+  digits = q.to_s.rjust(scale + 1, "0")
+  text = scale.zero? ? digits : "#{digits[0...-scale]}.#{digits[-scale..]}"
+  sum.negative? && q.positive? ? "-#{text}" : text
+end
+
 # Ternary-Logic Partitioning (SQLancer): for ANY predicate p, every row falls into EXACTLY ONE of
 # three partitions — p is TRUE (`WHERE p`), p is FALSE (`WHERE NOT p`), or p is UNKNOWN
 # (`WHERE p IS NULL`). So the three partitions UNION ALL must reconstruct the unpartitioned table,
@@ -2240,6 +2272,22 @@ def gen_tlp(seed)
     "(SELECT max(b) FROM t WHERE (#{ap}) IS NULL))",
     [agg_lit.call(bs_all.max)])
 
+  # AVG — not decomposable from the partition averages: it reconstructs as (total SUM)::decimal /
+  # (total COUNT)::decimal, the same division AVG itself finalizes with (aggregates.md §3), so both
+  # sides carry the select_div_scale display scale. CASE turns an all-NULL column's 0 count into
+  # NULL (AVG's empty result) instead of a 22012 division by zero.
+  avg_all = tlp_avg(bs_all.sum, bs_all.size)
+  out << "# aggregate TLP: AVG over the whole = (summed partition sums)::decimal / (summed partition counts)::decimal"
+  q(out, "D", "SELECT avg(b) FROM t", [avg_all])
+  q(out, "D",
+    "SELECT CASE WHEN c = 0 THEN NULL ELSE s::decimal / c::decimal END FROM (SELECT " \
+    "COALESCE((SELECT sum(b) FROM t WHERE #{ap}), 0) " \
+    "+ COALESCE((SELECT sum(b) FROM t WHERE NOT (#{ap})), 0) " \
+    "+ COALESCE((SELECT sum(b) FROM t WHERE (#{ap}) IS NULL), 0) AS s, " \
+    "(SELECT count(b) FROM t WHERE #{ap}) + (SELECT count(b) FROM t WHERE NOT (#{ap})) " \
+    "+ (SELECT count(b) FROM t WHERE (#{ap}) IS NULL) AS c) x",
+    [avg_all])
+
   # (2) GROUPED (GROUP BY a), the aggregate-GROUP-BY-TLP super-aggregate: each partition is
   # aggregated PER GROUP, the three partials are UNION ALL'd in a derived table (grammar.md §42),
   # then re-aggregated per group (sum-of-sums, sum-of-counts, min-of-mins, max-of-maxes). p
@@ -2250,11 +2298,14 @@ def gen_tlp(seed)
   groups = rows.group_by { |_id, a, _b| a }
   gkeys = groups.keys.compact.sort + (groups.key?(nil) ? [nil] : [])
   grp_bs = ->(ga) { groups[ga].map { |_id, _a, b| b }.compact }
-  # the three partitions of t, each aggregated per group; only the first arm needs the alias.
-  part_arms = lambda do |agg, al|
-    "(SELECT a, #{agg} AS #{al} FROM t WHERE #{ap} GROUP BY a " \
-    "UNION ALL SELECT a, #{agg} FROM t WHERE NOT (#{ap}) GROUP BY a " \
-    "UNION ALL SELECT a, #{agg} FROM t WHERE (#{ap}) IS NULL GROUP BY a) x"
+  # the three partitions of t, each aggregated per group; only the first arm needs the aliases.
+  # `aggs` is {alias => aggregate expression}.
+  part_arms = lambda do |aggs|
+    named = aggs.map { |al, agg| "#{agg} AS #{al}" }.join(", ")
+    bare = aggs.values.join(", ")
+    "(SELECT a, #{named} FROM t WHERE #{ap} GROUP BY a " \
+    "UNION ALL SELECT a, #{bare} FROM t WHERE NOT (#{ap}) GROUP BY a " \
+    "UNION ALL SELECT a, #{bare} FROM t WHERE (#{ap}) IS NULL GROUP BY a) x"
   end
   flat_grp = ->(val) { gkeys.flat_map { |ga| [agg_lit.call(ga), val.call(ga)] } }
 
@@ -2263,26 +2314,33 @@ def gen_tlp(seed)
   count_g = ->(ga) { groups[ga].size.to_s }
   q(out, "II", "SELECT a, count(*) FROM t GROUP BY a ORDER BY a", flat_grp.call(count_g))
   q(out, "II",
-    "SELECT a, sum(c)::i64 FROM #{part_arms.call('count(*)', 'c')} GROUP BY a ORDER BY a",
+    "SELECT a, sum(c)::i64 FROM #{part_arms.call('c' => 'count(*)')} GROUP BY a ORDER BY a",
     flat_grp.call(count_g))
   out << "# SUM -> sum-of-sums (::i64: sum widens i32->i64->decimal under re-aggregation)"
   sum_g = ->(ga) { (b = grp_bs.call(ga)).empty? ? "NULL" : b.sum.to_s }
   q(out, "II", "SELECT a, sum(b) FROM t GROUP BY a ORDER BY a", flat_grp.call(sum_g))
   q(out, "II",
-    "SELECT a, sum(s)::i64 FROM #{part_arms.call('sum(b)', 's')} GROUP BY a ORDER BY a",
+    "SELECT a, sum(s)::i64 FROM #{part_arms.call('s' => 'sum(b)')} GROUP BY a ORDER BY a",
     flat_grp.call(sum_g))
   out << "# MIN -> min-of-mins (element type preserved, no cast)"
   min_g = ->(ga) { (b = grp_bs.call(ga)).empty? ? "NULL" : b.min.to_s }
   q(out, "II", "SELECT a, min(b) FROM t GROUP BY a ORDER BY a", flat_grp.call(min_g))
   q(out, "II",
-    "SELECT a, min(m) FROM #{part_arms.call('min(b)', 'm')} GROUP BY a ORDER BY a",
+    "SELECT a, min(m) FROM #{part_arms.call('m' => 'min(b)')} GROUP BY a ORDER BY a",
     flat_grp.call(min_g))
   out << "# MAX -> max-of-maxes (element type preserved, no cast)"
   max_g = ->(ga) { (b = grp_bs.call(ga)).empty? ? "NULL" : b.max.to_s }
   q(out, "II", "SELECT a, max(b) FROM t GROUP BY a ORDER BY a", flat_grp.call(max_g))
   q(out, "II",
-    "SELECT a, max(m) FROM #{part_arms.call('max(b)', 'm')} GROUP BY a ORDER BY a",
+    "SELECT a, max(m) FROM #{part_arms.call('m' => 'max(b)')} GROUP BY a ORDER BY a",
     flat_grp.call(max_g))
+  out << "# AVG -> sum-of-sums::decimal / sum-of-counts::decimal (CASE: an all-NULL-b group averages to NULL)"
+  avg_g = ->(ga) { tlp_avg((b = grp_bs.call(ga)).sum, b.size) }
+  q(out, "ID", "SELECT a, avg(b) FROM t GROUP BY a ORDER BY a", flat_grp.call(avg_g))
+  q(out, "ID",
+    "SELECT a, CASE WHEN sum(c) = 0 THEN NULL ELSE sum(s)::decimal / sum(c)::decimal END " \
+    "FROM #{part_arms.call('s' => 'sum(b)', 'c' => 'count(b)')} GROUP BY a ORDER BY a",
+    flat_grp.call(avg_g))
 
   out.join("\n") + "\n"
 end
