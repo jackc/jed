@@ -2572,12 +2572,13 @@ one grammar change AF2 makes:
   **looser than `+`/`-`**, and is **left-associative** (`a || b || c` is `(a || b) || c`). Every
   comparison/`IN`/`BETWEEN`/`LIKE` operand parses at the `concat` level, so `||` is usable inside
   them.
-- **AST + resolution.** One `BinaryOp::Concat` node; the resolver (`resolve_concat`) does overload
-  resolution over the three `concat` catalog rows in order (cat, append, prepend) and reuses the
-  AF1 array kernels. A bare untyped `NULL` operand resolves to `array_cat` (the NULL array is the
+- **AST + resolution.** One `BinaryOp::Concat` node; the resolver (`resolve_concat`) routes a jsonb,
+  bytea, or (with no typed array operand) text-like operand to its own concatenation
+  (string-functions.md §4/§5). With a typed array operand it does overload resolution over the
+  three anyarray `concat` catalog rows in order (cat, append, prepend) and reuses the AF1 array
+  kernels. A bare untyped `NULL` beside an array resolves to `array_cat` (the NULL array is the
   identity), matching PostgreSQL; a typed null element resolves to `array_append`
-  (array-functions.md §8.1). No matching overload — including text `||` and `int || int`, both
-  deferred — is `42883`.
+  (array-functions.md §8.1). No matching overload (`1 || 2`) is `42883`.
 
 ## 40. The array containment / overlap operators (`@>` / `<@` / `&&`)
 

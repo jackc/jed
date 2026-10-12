@@ -1166,10 +1166,12 @@ func resolveRangeCtor(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 		resolvedType{kind: rtRange, elem: &elemRT}, nil
 }
 
-// resolveConcat resolves the `||` array concatenation operator (array-functions.md §8): overload
-// resolution over the three Kind=="concat" catalog rows — (anyarray,anyarray) [array_cat],
-// (anyarray,anyelement) [array_append], (anyelement,anyarray) [array_prepend] — tried IN CATALOG
-// ORDER, first match wins. It is the operator spelling of the AF1 builders and reuses their kernels.
+// resolveConcat resolves the `||` operator. A jsonb, bytea, or (with no array operand) text operand
+// routes to its own concatenation first (json-sql-functions.md §1; string-functions.md §4/§5). The
+// array form (array-functions.md §8) is overload resolution over the three anyarray Kind=="concat"
+// catalog rows — (anyarray,anyarray) [array_cat], (anyarray,anyelement) [array_append],
+// (anyelement,anyarray) [array_prepend] — tried IN CATALOG ORDER, first match wins. It is the
+// operator spelling of the AF1 builders and reuses their kernels.
 //
 // Two passes like resolveArrayFunc, with one deliberate difference: a BARE untyped NULL operand is
 // left un-adapted. matchPoly defers a bare NULL in an anyarray slot, so cat-first makes `arr || NULL`
@@ -1189,14 +1191,25 @@ func resolveConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) 
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
+	// A TYPED text operand (not a bare string literal, which is PostgreSQL's `unknown` and adapts)
+	// takes a jsonb or bytea `||` to text concatenation: PG resolves `jsonb || text` and
+	// `bytea || text` to its `anynonarray || text` overloads (string-functions.md §5).
+	typedText := func(t resolvedType, e exprNode) bool { return t.kind == rtText && !isStringLiteral(e) }
+	anyTypedText := typedText(lt, lhs) || typedText(rt, rhs)
 	// JSONB axis: a jsonb operand routes `||` to jsonb concat/merge (json-sql-functions.md §1, J6).
-	if lt.kind == rtJsonb || rt.kind == rtJsonb {
+	if (lt.kind == rtJsonb || rt.kind == rtJsonb) && !anyTypedText {
 		return resolveJSONbConcat(s, lhs, rhs, ag, params)
 	}
 	// BYTEA axis: a bytea operand with no array operand routes `||` to bytea concatenation
 	// (string-functions.md §4). A bytea[] operand stays on the array overloads below.
-	if (lt.kind == rtBytea || rt.kind == rtBytea) && lt.kind != rtArray && rt.kind != rtArray {
+	if (lt.kind == rtBytea || rt.kind == rtBytea) && lt.kind != rtArray && rt.kind != rtArray && !anyTypedText {
 		return resolveByteaConcat(s, lhs, rhs, ag, params)
+	}
+	// TEXT axis: with no array operand, `||` is text concatenation when either operand is text, a bare
+	// string literal, or an untyped NULL / parameter (string-functions.md §5). The other operand renders
+	// through its text output (PG's anynonarray || text). Neither text-like (`1 || 2`) is 42883.
+	if lt.kind != rtArray && rt.kind != rtArray {
+		return resolveTextConcat(s, lhs, rhs, rl, lt, rr, rt, ag, params)
 	}
 	// The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
 	var hint *scalarType
@@ -1970,6 +1983,46 @@ func resolveByteaConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTy
 	}
 	return &rExpr{kind: reScalarFunc, sfunc: sfByteaConcat, sargs: []*rExpr{a, b}, result: scalarBytea},
 		resolvedType{kind: rtBytea}, nil
+}
+
+// resolveTextConcat resolves `text || text` and PG's `text || anynonarray` / `anynonarray || text`
+// (string-functions.md §5). rl/lt and rr/rt are the operands' hint-free resolutions. At least one
+// operand must be text-like: text, a bare string literal, or an untyped NULL / parameter (re-resolved
+// with a text hint, so a parameter is declared text). The other non-text operand converts through the
+// explicit text cast (castToText), so a timestamptz operand makes the expression STABLE and a
+// composite or range operand is 0A000. Neither operand text-like is 42883.
+func resolveTextConcat(s *scope, lhs, rhs exprNode, rl *rExpr, lt resolvedType, rr *rExpr, rt resolvedType,
+	ag *aggCtx, params *paramTypes,
+) (*rExpr, resolvedType, error) {
+	textLike := func(t resolvedType) bool { return t.kind == rtText || t.kind == rtNull }
+	if !textLike(lt) && !textLike(rt) {
+		return nil, resolvedType{}, newError(UndefinedFunction,
+			fmt.Sprintf("operator does not exist: %s || %s", rtName(lt), rtName(rt)))
+	}
+	textHint := scalarText
+	operand := func(e exprNode, r *rExpr, t resolvedType) (*rExpr, error) {
+		if t.kind == rtNull {
+			r, _, err := resolve(s, e, &textHint, ag, params)
+			return r, err
+		}
+		return castToText(r, t, scalarText, nil, params)
+	}
+	a, err := operand(lhs, rl, lt)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	b, err := operand(rhs, rr, rt)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	return &rExpr{kind: reScalarFunc, sfunc: sfTextConcat, sargs: []*rExpr{a, b}, result: scalarText},
+		resolvedType{kind: rtText}, nil
+}
+
+// isStringLiteral reports whether e is a bare string literal — PostgreSQL's `unknown`-typed
+// constant, which adapts to its context rather than being text.
+func isStringLiteral(e exprNode) bool {
+	return e.Kind == exprLiteral && e.Literal.Kind == literalText
 }
 
 // resolveJSONbDelete resolves a jsonb delete operator: `-` (key `text` / index `int` / keys

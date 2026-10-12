@@ -382,3 +382,35 @@ func TestLikeEscapeBoundParameters(t *testing.T) {
 		}
 	}
 }
+
+// A bare $N operand of `||` with no array operand is typed text (string-functions.md §5), as
+// PostgreSQL infers its unknown parameter for textcat / textanycat: it concatenates with a text,
+// string-literal, or non-text operand, and a NULL binding is a NULL result.
+func TestTextConcatBoundParameters(t *testing.T) {
+	t.Parallel()
+	db := dbWith(t,
+		"CREATE TABLE t (id i32 PRIMARY KEY, s text)",
+		"INSERT INTO t VALUES (1, 'x')",
+	)
+	for _, tc := range []struct {
+		sql    string
+		params []Value
+		want   Value
+	}{
+		{"SELECT $1 || 'b' FROM t", []Value{TextValue("a")}, TextValue("ab")},
+		{"SELECT s || $1 FROM t", []Value{TextValue("a")}, TextValue("xa")},
+		{"SELECT $1 || id FROM t", []Value{TextValue("a")}, TextValue("a1")},
+		{"SELECT $1 || $2 FROM t", []Value{TextValue("a"), TextValue("b")}, TextValue("ab")},
+		{"SELECT $1 || s FROM t", []Value{NullValue()}, NullValue()},
+	} {
+		rows := queryRows(t, db, tc.sql, tc.params...)
+		if len(rows) != 1 || rows[0][0].Kind != tc.want.Kind ||
+			(tc.want.Kind == ValText && rows[0][0].str() != tc.want.str()) {
+			t.Errorf("%q %v: got %v, want %v", tc.sql, tc.params, rows, tc.want)
+		}
+	}
+	// The parameter is declared text, so an integer binding does not coerce.
+	if code := paramErrCode(t, db, "SELECT $1 || id FROM t", IntValue(5)); code != "42804" {
+		t.Errorf("an integer binding for a text parameter: code %s, want 42804", code)
+	}
+}

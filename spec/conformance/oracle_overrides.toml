@@ -1316,10 +1316,5 @@ reason = "jed: an operator word the expression grammar continues with is always 
 
 [[override]]
 file = "expr/bytea_functions.test"
-sql = "SELECT bytea '\\x01' || 'a'::text"
-reason = "jed has no text `||` operator yet (TODO.md, text follow-ons), so bytea || text matches no overload (42883). PG resolves it to its `anynonarray || text` textcat (rendering the bytea as text) — a deferred-surface divergence (string-functions.md §4)."
-
-[[override]]
-file = "expr/bytea_functions.test"
 sql = "SELECT substring('hello' FROM 'l+')"
 reason = "PG's regular-expression substring forms (substring(text FROM pattern), SIMILAR … ESCAPE) are not implemented: the special form desugars to substring(text, text), which has no overload (42883). A deferred-surface divergence (string-functions.md §4)."

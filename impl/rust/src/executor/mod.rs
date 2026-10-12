@@ -2907,6 +2907,10 @@ pub(crate) enum ScalarFunc {
     /// bytea || bytea → bytea — the operands' bytes appended (§4). Reached only through the `||`
     /// resolver (it has no function-call name); a growth kernel (cost.md §8.1).
     ByteaConcat,
+    /// text || text → text — the operands' characters appended (§5). Reached only through the `||`
+    /// resolver, which renders a non-text operand through its text cast; a growth kernel (cost.md
+    /// §8.1).
+    TextConcat,
     /// quote_literal(text) → text — wrap as a SQL string literal (§3).
     QuoteLiteral,
     /// quote_ident(text) → text — wrap as a SQL identifier (§3).

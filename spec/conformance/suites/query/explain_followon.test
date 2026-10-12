@@ -1,7 +1,7 @@
 # EXPLAIN follow-on surface: parenthesized boolean options, canonical verbose expressions, exact
 # float literal text, lane classification, per-node ANALYZE costs, DML touched sets, and writable
 # WITH plans. This is jed-owned deterministic output (spec/design/explain.md).
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.sequence, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.returning, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.limit, query.order_by, query.order_by_pk_scan, query.order_by_index_scan, query.order_by_join_inl, query.order_by_topk, query.window, query.window_ranking, query.cte, query.cte_data_modifying, query.union, query.explain, query.explain_analyze, query.aggregates, query.subquery_scalar, query.derived_table, query.join_inner, query.qualified_column, query.hash_join, dml.explain, expr.arithmetic, expr.json_query_fns, func.sequence, func.jsonb_path, types.i32, types.i64, types.f64, types.bytea, types.jsonb, types.jsonpath, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.sequence, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.returning, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.limit, query.order_by, query.order_by_pk_scan, query.order_by_index_scan, query.order_by_join_inl, query.order_by_topk, query.window, query.window_ranking, query.cte, query.cte_data_modifying, query.union, query.explain, query.explain_analyze, query.aggregates, query.subquery_scalar, query.derived_table, query.join_inner, query.qualified_column, query.hash_join, dml.explain, expr.arithmetic, expr.json_query_fns, func.sequence, func.jsonb_path, types.i32, types.i64, types.f64, types.bytea, types.jsonb, types.jsonpath, expr.text_concat, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32)
@@ -52,6 +52,14 @@ EXPLAIN (VERBOSE, COSTS FALSE) SELECT bytea '\x01' || bytea '\x02', substring(by
 0
 Result
 output=[('\\x01' || '\\x02'), substr('\\x0102', 2), get_byte('\\x01', 0)]
+
+# text || prints as the binary operator too, with a non-text operand under its text cast.
+query ITT nosort
+EXPLAIN (VERBOSE, COSTS FALSE) SELECT 'a' || 'b', 'a' || 1
+----
+0
+Result
+output=[('a' || 'b'), ('a' || cast(1 as text))]
 
 statement error 42601
 EXPLAIN (COSTS, COSTS FALSE) SELECT 1

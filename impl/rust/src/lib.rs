@@ -831,6 +831,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "expr.like",
     "expr.ilike",
     "expr.like_escape",
+    "expr.text_concat",
     "expr.regex_match",
     "expr.regex_imatch",
     "expr.case",

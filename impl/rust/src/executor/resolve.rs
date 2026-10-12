@@ -834,6 +834,56 @@ pub(crate) fn resolve_bytea_concat(
     ))
 }
 
+/// Resolve `text || text` and PG's `text || anynonarray` / `anynonarray || text`
+/// (string-functions.md §5). `l` and `r` are the operands' hint-free resolutions. At least one operand
+/// must be text-like: text, a bare string literal, or an untyped NULL / parameter (re-resolved with a
+/// text hint, so a parameter is declared text). The other non-text operand converts through the
+/// explicit text cast (`cast_to_text`), so a timestamptz operand makes the expression STABLE and a
+/// composite or range operand is 0A000. Neither operand text-like is 42883.
+fn resolve_text_concat(
+    scope: &Scope,
+    lhs: &Expr,
+    rhs: &Expr,
+    l: (RExpr, ResolvedType),
+    r: (RExpr, ResolvedType),
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    let text_like = |t: &ResolvedType| matches!(t, ResolvedType::Text | ResolvedType::Null);
+    if !text_like(&l.1) && !text_like(&r.1) {
+        return Err(EngineError::new(
+            SqlState::UndefinedFunction,
+            format!(
+                "operator does not exist: {} || {}",
+                l.1.type_name(),
+                r.1.type_name()
+            ),
+        ));
+    }
+    let mut operand = |e: &Expr, (node, t): (RExpr, ResolvedType)| -> Result<RExpr> {
+        if matches!(t, ResolvedType::Null) {
+            return Ok(resolve(scope, e, Some(ScalarType::Text), agg, params)?.0);
+        }
+        cast_to_text(node, t, ScalarType::Text, None, params)
+    };
+    let a = operand(lhs, l)?;
+    let b = operand(rhs, r)?;
+    Ok((
+        RExpr::ScalarFunc {
+            func: ScalarFunc::TextConcat,
+            args: vec![a, b],
+            result: ScalarType::Text,
+        },
+        ResolvedType::Text,
+    ))
+}
+
+/// Whether `e` is a bare string literal — PostgreSQL's `unknown`-typed constant, which adapts to its
+/// context rather than being text.
+fn is_string_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Literal(Literal::Text(_)))
+}
+
 /// Resolve a jsonb delete operator: `-` (key `text` / index `int` / keys `text[]`) or `#-` (path
 /// `text[]`) — json-sql-functions.md §1, J6. The base must be jsonb (a json base is 42883). The
 /// form is chosen by the argument type; a bare `'{a,b}'` string literal adapts to `text[]`. Result
@@ -1391,10 +1441,11 @@ pub(crate) fn binary_op_symbol(op: BinaryOp) -> &'static str {
     }
 }
 
-/// Resolve the `||` array concatenation operator (array-functions.md §8): overload resolution over
-/// the three `concat` catalog rows — `(anyarray,anyarray)` [array_cat], `(anyarray,anyelement)`
-/// [array_append], `(anyelement,anyarray)` [array_prepend] — tried IN CATALOG ORDER, first match
-/// wins. It is the operator spelling of the AF1 builders and reuses their kernels.
+/// Resolve the `||` operator. A jsonb, bytea, or (with no array operand) text operand routes to its
+/// own concatenation first (json-sql-functions.md §1; string-functions.md §4/§5); the array form
+/// (array-functions.md §8) is overload resolution over the three anyarray `concat` catalog rows —
+/// `(anyarray,anyarray)` [array_cat], `(anyarray,anyelement)` [array_append],
+/// `(anyelement,anyarray)` [array_prepend] — tried IN CATALOG ORDER, first match wins. It is the operator spelling of the AF1 builders and reuses their kernels.
 ///
 /// Two passes like `resolve_array_func`, with one deliberate difference: a **bare untyped NULL**
 /// operand is left un-adapted. `match_poly` defers a bare NULL in an `anyarray` slot, so cat-first
@@ -1417,16 +1468,29 @@ pub(crate) fn resolve_concat(
     // Pass 1: resolve both operands with no hint.
     let (mut rl, mut lt) = resolve(scope, lhs, None, agg, params)?;
     let (mut rr, mut rt) = resolve(scope, rhs, None, agg, params)?;
+    // A TYPED text operand (not a bare string literal, which is PostgreSQL's `unknown` and adapts)
+    // takes a jsonb or bytea `||` to text concatenation: PG resolves `jsonb || text` and
+    // `bytea || text` to its `anynonarray || text` overloads (string-functions.md §5).
+    let typed_text =
+        |t: &ResolvedType, e: &Expr| matches!(t, ResolvedType::Text) && !is_string_literal(e);
+    let any_typed_text = typed_text(&lt, lhs) || typed_text(&rt, rhs);
     // JSONB axis: a jsonb operand routes `||` to jsonb concat/merge (json-sql-functions.md §1, J6).
-    if matches!(lt, ResolvedType::Jsonb) || matches!(rt, ResolvedType::Jsonb) {
+    if (matches!(lt, ResolvedType::Jsonb) || matches!(rt, ResolvedType::Jsonb)) && !any_typed_text {
         return resolve_jsonb_concat(scope, lhs, rhs, agg, params);
     }
     // BYTEA axis: a bytea operand with no array operand routes `||` to bytea concatenation
     // (string-functions.md §4). A bytea[] operand stays on the array overloads below.
     let is_bytea = |t: &ResolvedType| matches!(t, ResolvedType::Bytea);
     let is_array = |t: &ResolvedType| matches!(t, ResolvedType::Array(_));
-    if (is_bytea(&lt) || is_bytea(&rt)) && !is_array(&lt) && !is_array(&rt) {
+    if (is_bytea(&lt) || is_bytea(&rt)) && !is_array(&lt) && !is_array(&rt) && !any_typed_text {
         return resolve_bytea_concat(scope, lhs, rhs, agg, params);
+    }
+    // TEXT axis: with no array operand, `||` is text concatenation when either operand is text, a
+    // bare string literal, or an untyped NULL / parameter (string-functions.md §5). The other operand
+    // renders through its text output (PG's anynonarray || text). Neither text-like (`1 || 2`) is
+    // 42883.
+    if !is_array(&lt) && !is_array(&rt) {
+        return resolve_text_concat(scope, lhs, rhs, (rl, lt), (rr, rt), agg, params);
     }
     // The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
     let hint = match (&lt, &rt) {

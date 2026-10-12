@@ -374,9 +374,9 @@ are STRICT and ride the scalar-function mold (§1), except `||`, which has its o
   with no array operand** routes to bytea concatenation, which re-resolves both operands with a
   bytea hint. So a bare string literal decodes as `bytea` input (`b || '\x02'`) and an untyped
   NULL keeps the operator bytea (`b || NULL` is a NULL `bytea`), as in PostgreSQL. A `bytea[]`
-  operand stays on the array overloads (`ARRAY[b] || b` is `array_append`). Any other operand is
-  `42883`. That includes `bytea || text`, which PG resolves to its text concatenation: jed has no
-  text `||` yet, a ledgered divergence. It is a **growth kernel** ([cost.md](cost.md) §8.1): it
+  operand stays on the array overloads (`ARRAY[b] || b` is `array_append`). A **typed** `text`
+  operand (`b || 'a'::text`) takes the text route instead (§5), rendering the bytea as its `\x`
+  hex text, as PG's `anynonarray || text` does. Any other operand is `42883`. It is a **growth kernel** ([cost.md](cost.md) §8.1): it
   charges `scalar_byte` per output byte and is free over constant operands. EXPLAIN renders it as
   `(a || b)`.
 - **`substr(bytea, start [, count])`, `substring(bytea, start [, count])` → bytea** — §3's window
@@ -401,6 +401,48 @@ The argument must already be `bytea`: as with `encode`, a bare string literal ar
 adapts a literal, through its operand hint. Not implemented yet: `set_byte`, `get_bit` / `set_bit`,
 `overlay`, `position(bytea IN bytea)`, `btrim(bytea, bytea)`, and the hash functions (`md5`,
 `sha256`, …).
+
+## 5. Text concatenation (`||`)
+
+PostgreSQL's string concatenation operator (manual §9.4): **`text || text` → text** (`textcat`),
+plus its **`anynonarray || text`** and **`text || anynonarray`** (`anytextcat` / `textanycat`), which
+render the non-text operand through its output function: `'a' || 1 = 'a1'`, `true || 'x' = 'truex'`.
+The catalog row is the single `(text, text) → text` `concat` row; the mixed forms are the resolver's
+desugaring, below. STRICT: a NULL operand is a NULL result.
+
+**Routing.** `||` is resolved by hand ([array-functions.md](array-functions.md) §8.1). With no
+**typed array** operand, it is text concatenation when **either operand is text-like**: typed `text`
+(including `varchar`), a **bare string literal**, or an **untyped NULL / `$N` parameter** — the latter
+two are PG's `unknown`, which prefers `text`. Order matters, and each step matches PostgreSQL:
+
+1. A `jsonb` operand routes to jsonb concatenation, and a `bytea` operand (with no array operand) to
+   bytea concatenation (§4) — *unless the other operand is typed text*: PG resolves `jsonb || text`
+   and `bytea || text` to its `anynonarray || text`, so the jsonb/bytea operand renders as text
+   (`'{"a":1}'::jsonb || 'x'::text = '{"a": 1}x'`). A bare literal still adapts to the jsonb / bytea
+   operand (`j || '{"b":2}'` merges; `j || 'x'` is `22P02`).
+2. A typed array operand keeps the array overloads (`ARRAY['a'] || 'b'::text` appends).
+3. Otherwise text concatenation, or `42883` when neither operand is text-like (`1 || 2`,
+   `json || json`, `1 || 2 || 'x'` — PG's left-associative `(1 || 2)` fails first).
+
+So a bare NULL with a non-text operand is text, not an array: **`NULL || 1` and `1 || NULL` are a
+NULL `text`**, as in PG (before this slice jed resolved them to `array_append` / `array_prepend`).
+A bare literal is not text until resolved, so `'{1}' || 1 = '{1}1'`.
+
+**The non-text operand** converts through the explicit `x::text` cast ([types.md](types.md) §5) —
+the same rendering a result cell shows (decimal keeps its scale, bytea is `\x` hex, jsonb is
+canonical, json verbatim). Its volatility is the cast's: a `timestamptz` operand renders in the
+session zone, so `a || ts` is STABLE and an index expression over it is `42P17`; any other built-in
+scalar stays immutable (PG reaches the same answer by inlining `anytextcat` into `$1::text || $2`).
+A composite or range operand is `0A000`, the deferred cast surface. A NULL or `$N` operand is
+re-resolved with a `text` hint, so a parameter is declared `text` (an integer binding is `42804`).
+
+The kernel appends the two operands' characters. It is a **growth kernel** ([cost.md](cost.md)
+§8.1): with any non-constant operand it charges `scalar_byte` per output UTF-8 byte, after the
+operands (and any text cast's `operator_eval`); over constant operands it is free beyond its own
+evaluation. Recursion that doubles a value is therefore bounded by a cost ceiling. EXPLAIN renders
+it as `(a || b)`, with a non-text operand under its cast (`('a' || cast(1 as text))`). Collation
+derivation is unchanged: `||` combines its operands' derivations (collation.md), so two
+conflicting implicit collations are `42P21` where the result is compared or ordered.
 
 ## Resource admission for result amplification
 

@@ -5,7 +5,7 @@
 # their exact output before building it, even over constants. payload is memory.md §3's measure: UTF-8
 # bytes for text, the byte length for bytea, 16 per dimension plus 32 + payload per element for an array.
 # jed-SPECIFIC resource contract (PostgreSQL has no cost meter or scalar allowance).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, query.aggregates, func.array, func.regexp_replace, types.array, types.bytea, types.i32, types.text, resource.cost_metering, resource.cost_limit, resource.scalar_memory
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, query.aggregates, func.array, func.regexp_replace, types.array, types.bytea, types.i32, types.text, expr.text_concat, resource.cost_metering, resource.cost_limit, resource.scalar_memory
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32[], s text)
@@ -127,6 +127,40 @@ WITH RECURSIVE r(n, v) AS (SELECT 1, b FROM tb UNION ALL SELECT n + 1, v || v FR
 # max_cost: 100000
 statement error 54P01
 WITH RECURSIVE r(n, v) AS (SELECT 1, b FROM tb UNION ALL SELECT n + 1, v || v FROM r WHERE n < 30) SELECT max(length(v)) FROM r
+
+# Text || is the same growth kernel, charging UTF-8 bytes. The baseline scan:
+# cost: 3
+query T nosort
+SELECT s FROM t
+----
+banana
+
+# A column operand: payload(bananabanana) = 12 bytes over the baseline.
+# cost: 16
+query T nosort
+SELECT s || s FROM t
+----
+bananabanana
+
+# Constant operands are free.
+# cost: 2
+query T nosort
+SELECT 'ab' || 'cd'
+----
+abcd
+
+# A non-text operand renders through its text cast (one more evaluation); only the concatenation's
+# output is charged: payload(1banana) = 7 bytes over the baseline's 3, plus the two evaluations.
+# cost: 12
+query T nosort
+SELECT id || s FROM t
+----
+1banana
+
+# A ceiling stops thirty doublings of a text value too.
+# max_cost: 100000
+statement error 54P01
+WITH RECURSIVE r(n, v) AS (SELECT 1, s FROM t UNION ALL SELECT n + 1, v || v FROM r WHERE n < 30) SELECT max(length(v)) FROM r
 
 # === replace ===
 

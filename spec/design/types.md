@@ -581,8 +581,9 @@ golden. A text value too large to fit a node (its key cannot spill to overflow) 
   while an explicit `::varchar(n)` cast silently truncates (the PostgreSQL split). The two-word
   `character varying(n)` spelling is accepted everywhere a type name is (grammar.md §14).
 - **Text ⇄ other casts** (§5), **string functions** (`length`, `lower`/`upper`, `substring`),
-  **concatenation `||`**, and **`LIKE`** — separate slices; this slice is comparison + storage
-  only (`= < > <= >=`, `IS [NOT] DISTINCT FROM`).
+  **concatenation `||`** ([string-functions.md](string-functions.md) §5), and **`LIKE`** —
+  separate slices, all since landed; this slice is comparison + storage only (`= < > <= >=`,
+  `IS [NOT] DISTINCT FROM`).
 - **Multi-collation / ICU** — a second collation, a per-column collation field in the catalog
   (the on-disk format reserves room for it — format.md), a per-database default collation, and
   `COLLATE` clauses. **Design ratified** in [collation.md](collation.md): a jed-owned UCA

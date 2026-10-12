@@ -2569,8 +2569,9 @@ export function renderRExpr(e: RExpr): string {
     case "greatestLeast":
       return explainCall(e.greatest ? "greatest" : "least", e.args);
     case "scalarFunc":
-      // bytea || renders as its operator, like the jsonb concat (it has no function-call name).
-      if (e.func === "bytea_concat") return binary(e.args[0]!, "||", e.args[1]!);
+      // bytea / text || renders as its operator, like the jsonb concat (it has no function-call name).
+      if (e.func === "bytea_concat" || e.func === "text_concat")
+        return binary(e.args[0]!, "||", e.args[1]!);
       return explainCall(e.func, e.args);
     case "hostFunc":
       // The host function name is carried on the node so EXPLAIN renders it without the registry

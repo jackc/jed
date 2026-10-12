@@ -68,6 +68,15 @@ test('the types page autoruns the uuid ⇄ text/bytea cast demo', async ({ page 
   await expect(rows).toContainText('\\x550e8400e29b41d4a716446655440000');
 });
 
+test('the types page autoruns the text concatenation demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // 'jed' || '-' || 'db', 'row ' || 42, 1.50 || ' USD' (the numeric keeps its scale).
+  const rows = livePanel(page, 'concatDemo').getByTestId('result-rows');
+  await expect(rows).toContainText('jed-db');
+  await expect(rows).toContainText('row 42');
+  await expect(rows).toContainText('1.50 USD');
+});
+
 test('the types page autoruns the bytea functions demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
   // The bytea demo: length 3, \x0102 || \xff = \x0102ff, SUBSTRING(… FROM 2 FOR 3) = \x020304,

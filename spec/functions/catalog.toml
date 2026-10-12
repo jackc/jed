@@ -277,8 +277,8 @@ errors         = []
 # operand is not comparable (compare.toml lists only text×text), so it is a 42804
 # type error. Same precedence (35), same NULL discipline as the integer comparisons:
 # propagating for the ordering/equality ops, null_safe for IS [NOT] DISTINCT FROM. No
-# overflow or other failure is possible, so errors = []. Deferred: string functions,
-# concatenation (||), and LIKE (../design/types.md §11).
+# overflow or other failure is possible, so errors = []. String functions, concatenation (||), and
+# LIKE are their own rows (../design/string-functions.md).
 
 [[operator]]
 volatility     = "immutable"
@@ -3499,7 +3499,8 @@ errors         = ["0A000"]
 # resolve to array_cat (NULL array = identity), exactly as PostgreSQL does — while a TYPED null
 # element (`arr || NULL::i32`) is a concrete anyelement and resolves to array_append. The three
 # overloads reuse the AF1 array_cat / array_append / array_prepend kernels (and their 2202E / 22000
-# errors). Element-type / non-array operands that match no overload are 42883 (text `||` deferred).
+# errors). Element-type / non-array operands that match no overload are 42883; with no typed array
+# operand, `||` routes to the bytea / text rows below instead.
 
 [[operator]]
 volatility     = "immutable"
@@ -3555,6 +3556,26 @@ arity          = 2
 arg_families   = ["bytea", "bytea"]
 arg_resolution = "none"
 result         = "bytea"
+null           = "propagates"
+precedence     = 37
+errors         = []
+
+# text || text → text (string-functions.md §5) — PostgreSQL's textcat: the operands' characters
+# appended. NOT polymorphic, and hand-routed like the bytea row: with no array operand, `||` is text
+# concatenation when either operand is text, a bare string literal, or an untyped NULL / parameter
+# (which adapt to text). The other operand may be any non-array type, rendered through its explicit
+# text cast — PG's `anynonarray || text` / `text || anynonarray` (anytextcat / textanycat), which this
+# row stands for; a typed text operand also takes a jsonb or bytea `||` here. STRICT. A growth kernel
+# (cost.md §8.1).
+[[operator]]
+volatility     = "immutable"
+name           = "concat"
+symbol         = "||"
+kind           = "concat"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "text"
 null           = "propagates"
 precedence     = 37
 errors         = []

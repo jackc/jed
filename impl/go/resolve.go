@@ -1827,37 +1827,11 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
-			textRt := resolvedType{kind: rtText}
-			cast := &rExpr{kind: reCast, operand: rinner, result: target, varchar: varcharLen}
-			switch ity.kind {
-			case rtNull:
-				// A NULL adapts (NULL → NULL, no truncation needed).
-				return rinner, textRt, nil
-			case rtText:
-				// text → text: the identity, UNLESS a varchar(n) length is present — then it becomes a
-				// reCast node that silently truncates to n code points at eval.
-				if varcharLen != nil {
-					return cast, textRt, nil
-				}
-				return rinner, textRt, nil
-			case rtTimestamptz:
-				// timestamptz → text reads the session zone, so it is STABLE (42P17 in an index
-				// expression), as PG's timestamptz_out is.
-				params.nonimmutable = true
-				return cast, textRt, nil
-			case rtInt, rtDecimal, rtFloat32, rtFloat64, rtBool, rtBytea, rtUuid, rtTimestamp, rtDate,
-				rtInterval, rtJson, rtJsonb, rtJsonPath:
-				return cast, textRt, nil
-			case rtArray:
-				// array → text (spec/design/array.md §7): array_out renders {…} per row. Explicit only,
-				// like the scalar casts above. Handled by reArrayCast. A timestamptz anywhere in the
-				// element type renders in the session zone, so the cast is then STABLE (timezones.md
-				// §9.5).
-				params.nonimmutable = params.nonimmutable || (ity.elem != nil && ity.elem.containsTimestamptz())
-				return &rExpr{kind: reArrayCast, operand: rinner}, textRt, nil
-			default:
-				return nil, resolvedType{}, newError(FeatureNotSupported, "casting to text is not supported yet")
+			cast, err := castToText(rinner, ity, target, varcharLen, params)
+			if err != nil {
+				return nil, resolvedType{}, err
 			}
+			return cast, resolvedType{kind: rtText}, nil
 		}
 		// A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
 		// (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32 /
@@ -3392,4 +3366,41 @@ func widenFloatToF64(node *rExpr, t resolvedType) *rExpr {
 		return &rExpr{kind: reCast, operand: node, result: scalarFloat64}
 	}
 	return node
+}
+
+// castToText converts a resolved operand of type ity to text (casts.toml, types.md §5) — the
+// explicit `x::text` cast and the `text || anynonarray` operand rendering (string-functions.md §5)
+// share it. target is the text-family cast target (text, or varchar whose length varcharLen
+// truncates). Composite and range sources stay 0A000.
+func castToText(rinner *rExpr, ity resolvedType, target scalarType, varcharLen *uint32, params *paramTypes) (*rExpr, error) {
+	cast := &rExpr{kind: reCast, operand: rinner, result: target, varchar: varcharLen}
+	switch ity.kind {
+	case rtNull:
+		// A NULL adapts (NULL → NULL, no truncation needed).
+		return rinner, nil
+	case rtText:
+		// text → text: the identity, UNLESS a varchar(n) length is present — then it becomes a
+		// reCast node that silently truncates to n code points at eval.
+		if varcharLen != nil {
+			return cast, nil
+		}
+		return rinner, nil
+	case rtTimestamptz:
+		// timestamptz → text reads the session zone, so it is STABLE (42P17 in an index
+		// expression), as PG's timestamptz_out is.
+		params.nonimmutable = true
+		return cast, nil
+	case rtInt, rtDecimal, rtFloat32, rtFloat64, rtBool, rtBytea, rtUuid, rtTimestamp, rtDate,
+		rtInterval, rtJson, rtJsonb, rtJsonPath:
+		return cast, nil
+	case rtArray:
+		// array → text (spec/design/array.md §7): array_out renders {…} per row. Explicit only,
+		// like the scalar casts above. Handled by reArrayCast. A timestamptz anywhere in the
+		// element type renders in the session zone, so the cast is then STABLE (timezones.md
+		// §9.5).
+		params.nonimmutable = params.nonimmutable || (ity.elem != nil && ity.elem.containsTimestamptz())
+		return &rExpr{kind: reArrayCast, operand: rinner}, nil
+	default:
+		return nil, newError(FeatureNotSupported, "casting to text is not supported yet")
+	}
 }

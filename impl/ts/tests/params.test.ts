@@ -300,3 +300,25 @@ test("LIKE … ESCAPE with a bound pattern or escape", () => {
   assert.equal(cost(byPattern, [text("a#%")]), cost(literal, []));
   assert.equal(cost(byEscape, [text("#")]), cost(literal, []));
 });
+
+// A bare $N operand of `||` with no array operand is typed text (string-functions.md §5), as
+// PostgreSQL infers its unknown parameter for textcat / textanycat: it concatenates with a text,
+// string-literal, or non-text operand, and a NULL binding is a NULL result.
+test("text || with a bound operand", () => {
+  const db = dbWith([
+    "CREATE TABLE t (id i32 PRIMARY KEY, s text)",
+    "INSERT INTO t VALUES (1, 'x')",
+  ]);
+  const cases: [string, Value[], Value][] = [
+    ["SELECT $1 || 'b' FROM t", [text("a")], text("ab")],
+    ["SELECT s || $1 FROM t", [text("a")], text("xa")],
+    ["SELECT $1 || id FROM t", [text("a")], text("a1")],
+    ["SELECT $1 || $2 FROM t", [text("a"), text("b")], text("ab")],
+    ["SELECT $1 || s FROM t", [nullValue()], nullValue()],
+  ];
+  for (const [sql, params, want] of cases) {
+    assert.deepEqual(rows(db, sql, params), [[want]], sql);
+  }
+  // The parameter is declared text, so an integer binding does not coerce.
+  assert.equal(paramErrCode(db, "SELECT $1 || id FROM t", [intValue(5n)]), "42804");
+});

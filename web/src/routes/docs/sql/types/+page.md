@@ -35,6 +35,12 @@
   (interval '90 minutes')::text                 AS interval_to_text,
   12345::varchar(3)                             AS truncated;`;
 
+	const concatDemo = `SELECT
+  'jed' || '-' || 'db'  AS joined,
+  'row ' || 42          AS with_number,
+  1.50 || ' USD'        AS keeps_scale,
+  'x' || NULL           AS null_result;`;
+
 	const varcharDemo = `SELECT
   'hello world'::varchar(5)     AS truncated,
   'café'::varchar(4)            AS fits_by_codepoint,
@@ -205,6 +211,20 @@ exponent spelling between the Rust, Go, and TypeScript engines.
 
 Unlike PostgreSQL, the cast is **explicit only**: `INSERT INTO t (name) VALUES (42)` and
 `name = 42` stay type errors (`42804`). A composite or range value does not cast to `text` yet.
+
+## Concatenating text
+
+`||` joins two strings. As in PostgreSQL, one side may be any other non-array type, which is first
+converted with its text cast above — so `'row ' || 42` is `'row 42'` and a `numeric` keeps its scale.
+A `NULL` on either side makes the result `NULL`:
+
+<LiveSql demo="concatDemo" query={concatDemo} rows={1} />
+
+At least one side must be text, a quoted literal, or `NULL`: `1 || 2` is an error (`42883`). When
+one side is an array, `||` appends to the array instead; beside a `jsonb` or `bytea` value, a quoted
+literal is read as that type (`jsonb` merge, `bytea` concatenation), while a `text`-typed value makes
+it text concatenation. Like the cast, `|| timestamptz` renders in the session time zone, so it cannot
+appear in an index expression.
 
 ## varchar(n) length limits
 

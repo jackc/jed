@@ -451,3 +451,36 @@ fn like_escape_bound_parameters() {
     assert_eq!(cost(&mut db, by_pattern, &[text("a#%")]), lit);
     assert_eq!(cost(&mut db, by_escape, &[text("#")]), lit);
 }
+
+/// A bare $N operand of `||` with no array operand is typed text (string-functions.md §5), as
+/// PostgreSQL infers its unknown parameter for textcat / textanycat: it concatenates with a text,
+/// string-literal, or non-text operand, and a NULL binding is a NULL result.
+#[test]
+fn text_concat_bound_parameters() {
+    let mut db = db_with(&[
+        "CREATE TABLE t (id i32 PRIMARY KEY, s text)",
+        "INSERT INTO t VALUES (1, 'x')",
+    ]);
+    let text = |s: &str| Value::Text(s.to_string());
+    let cases: [(&str, Vec<Value>, Value); 5] = [
+        ("SELECT $1 || 'b' FROM t", vec![text("a")], text("ab")),
+        ("SELECT s || $1 FROM t", vec![text("a")], text("xa")),
+        ("SELECT $1 || id FROM t", vec![text("a")], text("a1")),
+        (
+            "SELECT $1 || $2 FROM t",
+            vec![text("a"), text("b")],
+            text("ab"),
+        ),
+        ("SELECT $1 || s FROM t", vec![Value::Null], Value::Null),
+    ];
+    for (sql, params, want) in cases {
+        let got = rows(&mut db, sql, &params);
+        assert_eq!(got.len(), 1, "{sql:?}");
+        assert_eq!(got[0][0], want, "{sql:?} {params:?}");
+    }
+    // The parameter is declared text, so an integer binding does not coerce.
+    assert_eq!(
+        err_code(&mut db, "SELECT $1 || id FROM t", &[Value::Int(5)]),
+        "42804"
+    );
+}

@@ -1657,6 +1657,12 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         out.set(b, a.length);
         return growthResult(m, e.args, byteaValue(out));
       }
+      if (e.func === "text_concat") {
+        // text || text → text. A growth kernel (cost.md §8.1), free over constant operands.
+        const a = (vals[0] as { text: string }).text;
+        const b = (vals[1] as { text: string }).text;
+        return growthResult(m, e.args, textValue(a + b));
+      }
       if (e.func === "quote_literal") {
         // quote_literal(text) → text — wrap as a SQL string literal. A growth kernel: quoting
         // doubles every quote (cost.md §8.1).

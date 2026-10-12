@@ -2718,6 +2718,23 @@ impl RExpr {
                         }
                         Ok(out)
                     }
+                    // text || text → text. A growth kernel (cost.md §8.1), free over constant
+                    // operands.
+                    ScalarFunc::TextConcat => {
+                        let out = match (&vals[0], &vals[1]) {
+                            (Value::Text(a), Value::Text(b)) => {
+                                let mut out = String::with_capacity(a.len() + b.len());
+                                out.push_str(a);
+                                out.push_str(b);
+                                Value::Text(out)
+                            }
+                            _ => unreachable!("resolver restricts text || to (text, text)"),
+                        };
+                        if !args.iter().all(rexpr_is_constant) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
+                    }
                     // quote_literal(text) → text — wrap as a SQL string literal.
                     // quote_ident(text) → text — wrap as a SQL identifier. Both are growth kernels:
                     // quoting doubles every quote (cost.md §8.1).

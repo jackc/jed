@@ -243,10 +243,10 @@ corpus lands, in [../conformance/oracle_overrides.toml](../conformance/oracle_ov
    (narrower) element type second (`array_cat(ARRAY[1,2], i32[]_col)` → `42883`), where PG would
    find a common type. jed is strict here (the same posture as its array comparison, which requires
    element-family compatibility); put the typed/column array first.
-9. **`||` is array-only — text `||` and `int || int` are deferred** (AF2, §8). jed has no text
-   concatenation operator and no implicit element→text cast yet, so `'a' || 'b'` and `1 || 2` are
-   `42883` (PG would return `'ab'` / `'12'`). The `||` overloads this slice are exactly the three
-   array forms; text `||` lands with the string-function surface (types.md §11).
+9. **`||` takes the array overloads only with a typed array operand** (AF2, §8). Text `||` has since
+   landed ([string-functions.md](string-functions.md) §5): with no array operand, `'a' || 'b'` is
+   `'ab'` and a bare NULL with an element (`NULL || 1`) is a NULL `text`, as in PG. `1 || 2` is
+   `42883`, as in PG.
 10. **Search/edit comparison is IS NOT DISTINCT FROM** (AF2, §8) — `array_remove`/`array_replace`/
     `array_position`/`array_positions` match an element with NULL-safe equality (jed reuses its total
     element comparator, `value_cmp == Equal`), so a NULL target finds/removes/replaces NULL elements
@@ -347,8 +347,10 @@ the surface's one grammar change:
 - **AST + dispatch** — one new `BinaryOp::Concat` node; `resolve_binary` routes it to
   `resolve_concat`.
 
-**`resolve_concat`** is overload resolution over the three `concat` catalog rows, tried **in catalog
-order — `(anyarray,anyarray)` [cat], `(anyarray,anyelement)` [append], `(anyelement,anyarray)`
+**`resolve_concat`** first routes a jsonb operand, a bytea operand, and (with no typed array operand)
+a text-like operand to their own concatenations ([string-functions.md](string-functions.md) §4/§5).
+What remains — a typed array operand — is overload resolution over the three anyarray `concat`
+catalog rows, tried **in catalog order — `(anyarray,anyarray)` [cat], `(anyarray,anyelement)` [append], `(anyelement,anyarray)`
 [prepend]** — taking the first whose slots unify (§2 `match_poly`). It:
 
 1. resolves both operands with no hint;

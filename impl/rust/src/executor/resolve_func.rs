@@ -2170,7 +2170,7 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
             explain_call(if *greatest { "greatest" } else { "least" }, args)
         }
         RExpr::ScalarFunc {
-            func: ScalarFunc::ByteaConcat,
+            func: ScalarFunc::ByteaConcat | ScalarFunc::TextConcat,
             args,
             ..
         } => binary(&args[0], "||", &args[1]),
@@ -4239,61 +4239,8 @@ pub(crate) fn resolve(
                 } else {
                     resolve(scope, inner, None, agg, params)?
                 };
-                let cast = |rinner: RExpr| RExpr::Cast {
-                    inner: Box::new(rinner),
-                    target,
-                    typmod: None,
-                    varchar_len,
-                };
-                return match ity {
-                    // A NULL adapts (NULL → NULL, no truncation needed).
-                    ResolvedType::Null => Ok((rinner, ResolvedType::Text)),
-                    // text → text: the identity, UNLESS a `varchar(n)` length is present — then it
-                    // becomes a real Cast node that silently truncates to n code points at eval.
-                    ResolvedType::Text => Ok((
-                        match varchar_len {
-                            Some(_) => cast(rinner),
-                            None => rinner,
-                        },
-                        ResolvedType::Text,
-                    )),
-                    // timestamptz → text reads the session zone, so it is STABLE (42P17 in an index
-                    // expression), as PG's timestamptz_out is.
-                    ResolvedType::Timestamptz => {
-                        params.nonimmutable = true;
-                        Ok((cast(rinner), ResolvedType::Text))
-                    }
-                    ResolvedType::Int(_)
-                    | ResolvedType::Decimal
-                    | ResolvedType::Float(_)
-                    | ResolvedType::Bool
-                    | ResolvedType::Bytea
-                    | ResolvedType::Uuid
-                    | ResolvedType::Timestamp
-                    | ResolvedType::Date
-                    | ResolvedType::Interval
-                    | ResolvedType::Json
-                    | ResolvedType::Jsonb
-                    | ResolvedType::JsonPath => Ok((cast(rinner), ResolvedType::Text)),
-                    // array → text (spec/design/array.md §7): `array_out` renders `{…}` per row.
-                    // Explicit only — like the scalar casts above. Handled by `ArrayCast`. A
-                    // `timestamptz` anywhere in the element type renders in the session zone, so the
-                    // cast is then STABLE (timezones.md §9.5).
-                    ResolvedType::Array(ref elem) => Ok((
-                        {
-                            params.nonimmutable |= elem.contains_timestamptz();
-                            RExpr::ArrayCast {
-                                inner: Box::new(rinner),
-                                to_elem: None,
-                            }
-                        },
-                        ResolvedType::Text,
-                    )),
-                    ResolvedType::Composite(_) | ResolvedType::Range(_) => Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        "casting to text is not supported yet",
-                    )),
-                };
+                let cast = cast_to_text(rinner, ity, target, varchar_len, params)?;
+                return Ok((cast, ResolvedType::Text));
             }
             // A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
             // (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32
@@ -5517,5 +5464,67 @@ pub(crate) fn collated_or_value_cmp(
         (Some(c), Value::Text(x), Value::Text(y)) => collated_cmp(c, x, y),
         (Some(c), Value::Array(x), Value::Array(y)) => collated_array_cmp(c, x, y, None),
         _ => Ok(value_cmp(a, b)),
+    }
+}
+
+/// Convert a resolved operand of type `ity` to text (casts.toml, types.md §5) — the explicit
+/// `x::text` cast and the `text || anynonarray` operand rendering (string-functions.md §5) share it.
+/// `target` is the text-family cast target (text, or varchar whose length `varchar_len` truncates).
+/// Composite and range sources stay 0A000.
+pub(crate) fn cast_to_text(
+    rinner: RExpr,
+    ity: ResolvedType,
+    target: ScalarType,
+    varchar_len: Option<u32>,
+    params: &mut ParamTypes,
+) -> Result<RExpr> {
+    let cast = |rinner: RExpr| RExpr::Cast {
+        inner: Box::new(rinner),
+        target,
+        typmod: None,
+        varchar_len,
+    };
+    match ity {
+        // A NULL adapts (NULL → NULL, no truncation needed).
+        ResolvedType::Null => Ok(rinner),
+        // text → text: the identity, UNLESS a `varchar(n)` length is present — then it becomes a
+        // real Cast node that silently truncates to n code points at eval.
+        ResolvedType::Text => Ok(match varchar_len {
+            Some(_) => cast(rinner),
+            None => rinner,
+        }),
+        // timestamptz → text reads the session zone, so it is STABLE (42P17 in an index
+        // expression), as PG's timestamptz_out is.
+        ResolvedType::Timestamptz => {
+            params.nonimmutable = true;
+            Ok(cast(rinner))
+        }
+        ResolvedType::Int(_)
+        | ResolvedType::Decimal
+        | ResolvedType::Float(_)
+        | ResolvedType::Bool
+        | ResolvedType::Bytea
+        | ResolvedType::Uuid
+        | ResolvedType::Timestamp
+        | ResolvedType::Date
+        | ResolvedType::Interval
+        | ResolvedType::Json
+        | ResolvedType::Jsonb
+        | ResolvedType::JsonPath => Ok(cast(rinner)),
+        // array → text (spec/design/array.md §7): `array_out` renders `{…}` per row. Explicit
+        // only — like the scalar casts above. Handled by `ArrayCast`. A `timestamptz` anywhere in
+        // the element type renders in the session zone, so the cast is then STABLE (timezones.md
+        // §9.5).
+        ResolvedType::Array(ref elem) => {
+            params.nonimmutable |= elem.contains_timestamptz();
+            Ok(RExpr::ArrayCast {
+                inner: Box::new(rinner),
+                to_elem: None,
+            })
+        }
+        ResolvedType::Composite(_) | ResolvedType::Range(_) => Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "casting to text is not supported yet",
+        )),
     }
 }

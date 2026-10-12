@@ -1309,47 +1309,10 @@ export function resolve(
       if (isText(target)) {
         const inner = resolve(scope, e.inner, e.inner.kind === "param" ? "text" : null, ag, params);
         const ik = inner.type.kind;
-        const textType: ResolvedType = { kind: "text" };
-        const cast: RExpr = { kind: "cast", target, typmod: null, varcharLen, operand: inner.node };
-        switch (ik) {
-          // A NULL adapts (NULL → NULL, no truncation needed).
-          case "null":
-            return { node: inner.node, type: textType };
-          // text → text: the identity, UNLESS a varchar(n) length is present — then it becomes a
-          // real cast node that silently truncates to n code points at eval.
-          case "text":
-            return { node: varcharLen !== null ? cast : inner.node, type: textType };
-          // timestamptz → text reads the session zone, so it is STABLE (42P17 in an index
-          // expression), as PG's timestamptz_out is.
-          case "timestamptz":
-            params.nonimmutable = true;
-            return { node: cast, type: textType };
-          case "int":
-          case "decimal":
-          case "float":
-          case "bool":
-          case "bytea":
-          case "uuid":
-          case "timestamp":
-          case "date":
-          case "interval":
-          case "json":
-          case "jsonb":
-          case "jsonpath":
-            return { node: cast, type: textType };
-          // array → text (spec/design/array.md §7): array_out renders {…} per row. Explicit only,
-          // like the scalar casts above. Handled by arrayCast (toElem null). A timestamptz anywhere in
-          // the element type renders in the session zone, so the cast is then STABLE (timezones.md
-          // §9.5).
-          case "array":
-            params.nonimmutable ||= containsTimestamptz(inner.type.elem);
-            return {
-              node: { kind: "arrayCast", toElem: null, operand: inner.node },
-              type: textType,
-            };
-          default:
-            throw engineError("feature_not_supported", "casting to text is not supported yet");
-        }
+        return {
+          node: castToText(inner.node, inner.type, target, varcharLen, params),
+          type: { kind: "text" },
+        };
       }
       // A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
       // (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32 / NULL
@@ -2607,10 +2570,12 @@ export function resolveBinary(
   }
 }
 
-// resolveConcat resolves the `||` array concatenation operator (array-functions.md §8): overload
-// resolution over the three kind=="concat" catalog rows — (anyarray,anyarray) [array_cat],
-// (anyarray,anyelement) [array_append], (anyelement,anyarray) [array_prepend] — tried IN CATALOG
-// ORDER, first match wins. It is the operator spelling of the AF1 builders and reuses their kernels.
+// resolveConcat resolves the `||` operator. A jsonb, bytea, or (with no array operand) text operand
+// routes to its own concatenation first (json-sql-functions.md §1; string-functions.md §4/§5). The
+// array form (array-functions.md §8) is overload resolution over the three anyarray kind=="concat"
+// catalog rows — (anyarray,anyarray) [array_cat], (anyarray,anyelement) [array_append],
+// (anyelement,anyarray) [array_prepend] — tried IN CATALOG ORDER, first match wins. It is the
+// operator spelling of the AF1 builders and reuses their kernels.
 //
 // Two passes like resolveArrayFunc, with one deliberate difference: a BARE untyped NULL operand is
 // left un-adapted. matchPoly defers a bare NULL in an anyarray slot, so cat-first makes `arr || NULL`
@@ -2631,8 +2596,13 @@ export function resolveConcat(
   // Pass 1: resolve both operands with no hint.
   let rl = resolve(scope, lhs, null, ag, params);
   let rr = resolve(scope, rhs, null, ag, params);
+  // A TYPED text operand (not a bare string literal, which is PostgreSQL's `unknown` and adapts)
+  // takes a jsonb or bytea `||` to text concatenation: PG resolves `jsonb || text` and
+  // `bytea || text` to its `anynonarray || text` overloads (string-functions.md §5).
+  const typedText = (t: ResolvedType, e: Expr): boolean => t.kind === "text" && !isStringLiteral(e);
+  const anyTypedText = typedText(rl.type, lhs) || typedText(rr.type, rhs);
   // JSONB axis: a jsonb operand routes `||` to jsonb concat/merge (json-sql-functions.md §1, J6).
-  if (rl.type.kind === "jsonb" || rr.type.kind === "jsonb") {
+  if ((rl.type.kind === "jsonb" || rr.type.kind === "jsonb") && !anyTypedText) {
     return resolveJsonbConcat(scope, lhs, rhs, ag, params);
   }
   // BYTEA axis: a bytea operand with no array operand routes `||` to bytea concatenation
@@ -2640,9 +2610,16 @@ export function resolveConcat(
   if (
     (rl.type.kind === "bytea" || rr.type.kind === "bytea") &&
     rl.type.kind !== "array" &&
-    rr.type.kind !== "array"
+    rr.type.kind !== "array" &&
+    !anyTypedText
   ) {
     return resolveByteaConcat(scope, lhs, rhs, ag, params);
+  }
+  // TEXT axis: with no array operand, `||` is text concatenation when either operand is text, a bare
+  // string literal, or an untyped NULL / parameter (string-functions.md §5). The other operand renders
+  // through its text output (PG's anynonarray || text). Neither text-like (`1 || 2`) is 42883.
+  if (rl.type.kind !== "array" && rr.type.kind !== "array") {
+    return resolveTextConcat(scope, lhs, rhs, rl, rr, ag, params);
   }
   // The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
   let hint: ScalarType | null = null;
@@ -3149,6 +3126,46 @@ export function resolveByteaConcat(
     node: { kind: "scalarFunc", func: "bytea_concat", args: [a.node, b.node], result: "bytea" },
     type: { kind: "bytea" },
   };
+}
+
+// resolveTextConcat resolves `text || text` and PG's `text || anynonarray` / `anynonarray || text`
+// (string-functions.md §5). rl and rr are the operands' hint-free resolutions. At least one operand
+// must be text-like: text, a bare string literal, or an untyped NULL / parameter (re-resolved with a
+// text hint, so a parameter is declared text). The other non-text operand converts through the
+// explicit text cast (castToText), so a timestamptz operand makes the expression STABLE and a
+// composite or range operand is 0A000. Neither operand text-like is 42883.
+function resolveTextConcat(
+  scope: Scope,
+  lhs: Expr,
+  rhs: Expr,
+  rl: { node: RExpr; type: ResolvedType },
+  rr: { node: RExpr; type: ResolvedType },
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  const textLike = (t: ResolvedType): boolean => t.kind === "text" || t.kind === "null";
+  if (!textLike(rl.type) && !textLike(rr.type)) {
+    throw engineError(
+      "undefined_function",
+      `operator does not exist: ${rtName(rl.type)} || ${rtName(rr.type)}`,
+    );
+  }
+  const operand = (e: Expr, r: { node: RExpr; type: ResolvedType }): RExpr =>
+    r.type.kind === "null"
+      ? resolve(scope, e, "text", ag, params).node
+      : castToText(r.node, r.type, "text", null, params);
+  const a = operand(lhs, rl);
+  const b = operand(rhs, rr);
+  return {
+    node: { kind: "scalarFunc", func: "text_concat", args: [a, b], result: "text" },
+    type: { kind: "text" },
+  };
+}
+
+// isStringLiteral reports whether e is a bare string literal — PostgreSQL's `unknown`-typed
+// constant, which adapts to its context rather than being text.
+function isStringLiteral(e: Expr): boolean {
+  return e.kind === "literal" && e.literal.kind === "text";
 }
 
 // resolveJsonbDelete resolves a jsonb delete operator: `-` (key `text` / index `int` / keys
@@ -3793,4 +3810,53 @@ export function minScaleOf(d: Decimal): number {
 // f64. A non-float node (a NULL arm) is returned unchanged.
 function widenTo(node: RExpr, t: ResolvedType, to: ScalarType): RExpr {
   return t.kind === "float" ? widenFloatTo(node, t.ty, to) : node;
+}
+
+// castToText converts a resolved operand of type t to text (casts.toml, types.md §5) — the explicit
+// `x::text` cast and the `text || anynonarray` operand rendering (string-functions.md §5) share it.
+// target is the text-family cast target (text, or varchar whose length varcharLen truncates).
+// Composite and range sources stay 0A000.
+export function castToText(
+  node: RExpr,
+  t: ResolvedType,
+  target: ScalarType,
+  varcharLen: number | null,
+  params: ParamTypes,
+): RExpr {
+  const cast: RExpr = { kind: "cast", target, typmod: null, varcharLen, operand: node };
+  switch (t.kind) {
+    // A NULL adapts (NULL → NULL, no truncation needed).
+    case "null":
+      return node;
+    // text → text: the identity, UNLESS a varchar(n) length is present — then it becomes a real cast
+    // node that silently truncates to n code points at eval.
+    case "text":
+      return varcharLen !== null ? cast : node;
+    // timestamptz → text reads the session zone, so it is STABLE (42P17 in an index expression), as
+    // PG's timestamptz_out is.
+    case "timestamptz":
+      params.nonimmutable = true;
+      return cast;
+    case "int":
+    case "decimal":
+    case "float":
+    case "bool":
+    case "bytea":
+    case "uuid":
+    case "timestamp":
+    case "date":
+    case "interval":
+    case "json":
+    case "jsonb":
+    case "jsonpath":
+      return cast;
+    // array → text (spec/design/array.md §7): array_out renders {…} per row. Explicit only, like the
+    // scalar casts above. Handled by arrayCast (toElem null). A timestamptz anywhere in the element
+    // type renders in the session zone, so the cast is then STABLE (timezones.md §9.5).
+    case "array":
+      params.nonimmutable ||= containsTimestamptz(t.elem);
+      return { kind: "arrayCast", toElem: null, operand: node };
+    default:
+      throw engineError("feature_not_supported", "casting to text is not supported yet");
+  }
 }

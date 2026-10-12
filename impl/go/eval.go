@@ -3205,6 +3205,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			out = append(out, a...)
 			out = append(out, b...)
 			return growthResult(m, e.sargs, ByteaValue(out))
+		case sfTextConcat:
+			// text || text → text. A growth kernel (cost.md §8.1), free over constant operands.
+			return growthResult(m, e.sargs, TextValue(vals[0].str()+vals[1].str()))
 		case sfQuoteLiteral:
 			// quote_literal(text) → text — wrap as a SQL string literal. A growth kernel: quoting
 			// doubles every quote (cost.md §8.1).

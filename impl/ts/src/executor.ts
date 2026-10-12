@@ -27700,6 +27700,9 @@ export type ScalarFuncName =
   // bytea || bytea → bytea — the operands' bytes appended (§4). Reached only through the `||`
   // resolver (it has no function-call name); a growth kernel (cost.md §8.1).
   | "bytea_concat"
+  // text || text → text — the operands' characters appended (§5). Reached only through the `||`
+  // resolver, which renders a non-text operand through its text cast; a growth kernel (cost.md §8.1).
+  | "text_concat"
   // quote_literal(text) → text — wrap as a SQL string literal (§3).
   | "quote_literal"
   // quote_ident(text) → text — wrap as a SQL identifier (§3).

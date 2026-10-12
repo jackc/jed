@@ -100,12 +100,15 @@ SELECT ARRAY[bytea '\x01'] || bytea '\x02', bytea '\x00' || ARRAY[bytea '\x01']
 {"\\x01","\\x02"}
 {"\\x00","\\x01"}
 
-# bytea || a non-bytea operand is no operator (text || is not supported)
+# bytea || a non-bytea, non-text operand is no operator
 statement error 42883
 SELECT bytea '\x01' || 1
 
-statement error 42883
+# a TYPED text operand makes it text concatenation, the bytea rendered as its text output
+query T nosort
 SELECT bytea '\x01' || 'a'::text
+----
+\x01a
 
 # === substr / substring(bytea, start[, count]) → bytea ======================================
 
