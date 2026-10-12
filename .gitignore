@@ -31,7 +31,7 @@
 # @playwright/test for the browser/OPFS host's demo + e2e — dev-only, spec/design/hosts.md §5).
 # package-lock.json IS committed for reproducibility; the engine/tests/harness run on
 # bare Node with no install.
-/impl/ts/node_modules/
+/impl/ts/node_modules
 # Browser/OPFS host build + e2e artifacts (Vite bundle, Playwright run output).
 /impl/ts/dist-browser/
 /impl/ts/test-results/
@@ -43,7 +43,7 @@
 /bench/results/
 /bench/go/bin/
 /bench/rust/target/
-/bench/ts/node_modules/
+/bench/ts/node_modules
 
 # Per-worktree runtime state: this checkout's allocated TCP ports (port-tamer.toml -> ports.env,
 # plus the derived.env scripts/devenv.rb computes from them) and its own PostgreSQL cluster. A git
@@ -68,4 +68,4 @@
 # jed-migrate packages (/migrate — a CONSUMER of the engine, not a core; design.md §2). Build
 # artifacts mirror the per-core ignores above; Cargo.lock / package-lock.json ARE committed.
 /migrate/rust/target/
-/migrate/ts/node_modules/
+/migrate/ts/node_modules
