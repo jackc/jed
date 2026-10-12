@@ -5,8 +5,9 @@
 // impl/go/error_fields_test.go.
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { EngineError } from "../src/tooling.ts";
+import { EngineError, PrivilegeSet, privilegeFromName } from "../src/tooling.ts";
 import { type Handle, dbWith } from "./util.ts";
 
 // efErr runs sql on db and returns the EngineError it throws (failing if none / a non-EngineError).
@@ -130,4 +131,96 @@ test("error fields: unrelated error has no fields", () => {
   assert.equal(e.tableName, undefined);
   assert.equal(e.columnName, undefined);
   assert.equal(e.dataTypeName, undefined);
+  assert.equal(e.detail, undefined);
+});
+
+// DetailCase is one case of the shared Detail fixture (spec/errors/detail_cases.txt).
+type DetailCase = {
+  name: string;
+  setup: string[];
+  defaultPrivileges: string | undefined;
+  grants: [string, string][];
+  revokes: [string, string][];
+  run: string;
+  code: string;
+  detail: string | undefined;
+};
+
+function parseDetailCases(text: string): DetailCase[] {
+  const cases: DetailCase[] = [];
+  const privObj = (rest: string): [string, string] => {
+    const sp = rest.indexOf(" ");
+    if (sp < 0) throw new Error(`PRIV object expected: ${rest}`);
+    return [rest.slice(0, sp), rest.slice(sp + 1)];
+  };
+  for (const line of text.split("\n")) {
+    if (line.trim() === "" || line.startsWith("#")) continue;
+    if (line.startsWith("case: ")) {
+      cases.push({
+        name: line.slice("case: ".length),
+        setup: [],
+        defaultPrivileges: undefined,
+        grants: [],
+        revokes: [],
+        run: "",
+        code: "",
+        detail: undefined,
+      });
+      continue;
+    }
+    const c = cases[cases.length - 1];
+    if (c === undefined) throw new Error(`a directive before the first case: ${line}`);
+    const sep = line.indexOf(": ");
+    const key = sep < 0 ? line : line.slice(0, sep);
+    const v = sep < 0 ? "" : line.slice(sep + 2);
+    if (key === "setup") c.setup.push(v);
+    else if (key === "default_privileges") c.defaultPrivileges = v;
+    else if (key === "grant") c.grants.push(privObj(v));
+    else if (key === "revoke") c.revokes.push(privObj(v));
+    else if (key === "run") c.run = v;
+    else if (key === "code") c.code = v;
+    else if (key === "detail") c.detail = v;
+    else if (line !== "no-detail") throw new Error(`unknown detail_cases directive: ${line}`);
+  }
+  return cases;
+}
+
+function privilegeSet(list: string): PrivilegeSet {
+  let set = PrivilegeSet.empty();
+  if (list === "-") return set;
+  for (const name of list.split(",")) {
+    const p = privilegeFromName(name);
+    if (p === undefined) throw new Error(`privilege name: ${name}`);
+    set = set.with(p);
+  }
+  return set;
+}
+
+// The Detail field (spec/design/error-fields.md §9): every case of the shared, language-neutral
+// fixture — the same file the Rust and Go cores run, so the text is pinned byte-identical.
+test("error fields: detail shared cases", () => {
+  const path = new URL("../../../spec/errors/detail_cases.txt", import.meta.url);
+  const cases = parseDetailCases(readFileSync(path, "utf8"));
+  assert.ok(cases.length > 0);
+  const failures: string[] = [];
+  for (const c of cases) {
+    const db = dbWith(c.setup);
+    if (c.defaultPrivileges !== undefined)
+      db.setDefaultPrivileges(privilegeSet(c.defaultPrivileges));
+    for (const [p, o] of c.grants) db.grant(privilegeSet(p), o);
+    for (const [p, o] of c.revokes) db.revoke(privilegeSet(p), o);
+    try {
+      db.execute(c.run);
+      failures.push(`${c.name}: expected ${c.code} but succeeded`);
+    } catch (e) {
+      if (!(e instanceof EngineError)) throw e;
+      if (e.code() !== c.code || e.detail !== c.detail) {
+        failures.push(
+          `${c.name}: got ${e.code()} ${JSON.stringify(e.detail)} (${e.message}), ` +
+            `want ${c.code} ${JSON.stringify(c.detail)}`,
+        );
+      }
+    }
+  }
+  assert.deepEqual(failures, []);
 });

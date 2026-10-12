@@ -24,6 +24,10 @@ export class EngineError extends Error {
   tableName?: string;
   columnName?: string;
   dataTypeName?: string;
+  // PostgreSQL's DETAIL sentence naming the offending values (`Key (id)=(1) already exists.`) — set
+  // on the class-23 violations, subject to the session's SELECT privilege
+  // (spec/design/error-fields.md §9). Never part of the rendered message.
+  detail?: string;
 
   constructor(state: SqlState, message: string) {
     super(`${sqlStateCode(state)}: ${message}`);
@@ -53,6 +57,13 @@ export class EngineError extends Error {
   }
   withDataType(name: string): this {
     this.dataTypeName = name;
+    return this;
+  }
+  // withDetail attaches a Detail (spec/design/error-fields.md §9). undefined (a gated or
+  // inapplicable detail) leaves the field unset, so a raise site can pass a helper's result straight
+  // through.
+  withDetail(detail: string | undefined): this {
+    this.detail = detail;
     return this;
   }
 }

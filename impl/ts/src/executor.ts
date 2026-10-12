@@ -243,6 +243,17 @@ import {
   stampTable,
   uniqueViolation,
 } from "./errors.ts";
+import {
+  DETAIL_DUPLICATED,
+  DETAIL_EXISTS,
+  exclusionDetail,
+  failingRowDetail,
+  fkChildDetail,
+  fkParentDetail,
+  indexDetail,
+  indexDetailByName,
+  pkDetail,
+} from "./error_detail.ts";
 import { type PrivilegeSet, Privileges } from "./privileges.ts";
 import type { ExtensionRegistry, HostFuncEntry } from "./extension.ts";
 import { type ScriptSummary, splitStatements } from "./split.ts";
@@ -6464,6 +6475,61 @@ export class Engine {
     return evalExpr(defaultRExpr, [], env, meter);
   }
 
+  // buildInsertRow builds + coerces one INSERT candidate row in column order (constraints.md §7 step
+  // 1): an omitted column takes its default — a constant, or its expression evaluated for this row
+  // through the shared per-statement seam/clock (constraints.md §2; evalDefault charges operator_eval
+  // for an expression default). NOT NULL is enforced over the COMPLETE row, so a later column's
+  // coercion/default error wins over an earlier NULL, and the 23502 can carry the whole failing row
+  // (PostgreSQL's order — error-fields.md §9.5). A column-store failure (23502/22003/22001) is stamped
+  // with the target relation, which is in scope here, not inside the coercion (error-fields.md §4).
+  private buildInsertRow(
+    table: Table,
+    colTypes: ColType[],
+    provided: number[],
+    values: Value[],
+    defaultExprs: (RExpr | null)[],
+    rng: StmtRng,
+    meter: Meter,
+  ): Row {
+    const n = table.columns.length;
+    const row: Row = new Array(n);
+    let nullCol = -1;
+    for (let i = 0; i < n; i++) {
+      const col = table.columns[i]!;
+      const p = provided[i]!;
+      const candidate: Value =
+        p >= 0 ? values[p]! : this.evalDefault(col, defaultExprs[i]!, rng, meter);
+      if (col.notNull && candidate.kind === "null") {
+        if (nullCol < 0) nullCol = i;
+        row[i] = candidate;
+        continue;
+      }
+      try {
+        row[i] = coerceForStore(
+          candidate,
+          colTypes[i]!,
+          col.decimal,
+          col.varcharLen,
+          col.notNull,
+          col.name,
+          this.inputZone(),
+        );
+      } catch (e) {
+        throw stampTable(e, table.name);
+      }
+    }
+    if (nullCol >= 0) throw this.notNullRowViolation(table.name, table.columns[nullCol]!.name, row);
+    return row;
+  }
+
+  // notNullRowViolation is the 23502 for a NULL in NOT NULL column of the complete candidate row
+  // (error-fields.md §9.5): the table stamped, the failing row as its Detail.
+  private notNullRowViolation(relation: string, column: string, row: Row): EngineError {
+    return notNullViolation(column)
+      .withTable(relation)
+      .withDetail(failingRowDetail(this.session, relation, row));
+  }
+
   // executeDropTable runs a DROP TABLE [IF EXISTS] a [, …] [CASCADE | RESTRICT]: remove each named
   // table's definition and row store from the catalog (keyed by exact name). Two-phase /
   // all-or-nothing (spec/design/grammar.md §13): every name is resolved and validated first — a
@@ -7679,7 +7745,10 @@ export class Engine {
           : entry.key;
         if (pkRekeyed) {
           const hash = Array.from(key).join(",");
-          if (seenKeys.has(hash)) throw uniqueViolation(table.name, pkeyName(table.name));
+          if (seenKeys.has(hash))
+            throw uniqueViolation(table.name, pkeyName(table.name)).withDetail(
+              pkDetail(this.session, table.name, table.columns, table.pk, row, DETAIL_DUPLICATED),
+            );
           seenKeys.add(hash);
         }
         compressUnits += BigInt(
@@ -7761,8 +7830,15 @@ export class Engine {
         meter.guard();
         if (rewriteRows === null) meter.charge(COSTS.storageRowRead);
         const row = store.resolveInlineColumns(entry.row);
-        for (const ck of checks)
-          evalChecks([ck], table.name, row, this.maintenanceEnv(new StmtRng()), meter);
+        // PostgreSQL's ADD CHECK validation carries no DETAIL (error-fields.md §9.2).
+        for (const ck of checks) {
+          try {
+            evalChecks([ck], table.name, row, this.maintenanceEnv(new StmtRng()), meter);
+          } catch (e) {
+            if (e instanceof EngineError) e.withDetail(undefined);
+            throw e;
+          }
+        }
         for (const ix of table.indexes) {
           const k = ix.name;
           if (!addedConstraints.has(k)) continue;
@@ -7776,7 +7852,19 @@ export class Engine {
                 seen.set(k, s);
               }
               const h = Array.from(p).join(",");
-              if (s.has(h)) throw uniqueViolation(table.name, ix.name);
+              if (s.has(h))
+                throw uniqueViolation(table.name, ix.name).withDetail(
+                  indexDetail(
+                    this.session,
+                    table.name,
+                    table.columns,
+                    ix,
+                    ri,
+                    row,
+                    this.maintenanceEnv(new StmtRng()),
+                    DETAIL_DUPLICATED,
+                  ),
+                );
               s.add(h);
             }
           }
@@ -7811,7 +7899,10 @@ export class Engine {
                   return pp !== null && compareBytes(fkProbeBytes(p), fkProbeBytes(pp)) === 0;
                 });
               } else hit = this.fkProbeHits(p, parent.name);
-              if (!hit) throw fkViolationInsert(table.name, fk.name);
+              if (!hit)
+                throw fkViolationInsert(table.name, fk.name).withDetail(
+                  fkChildDetail(this.session, table.name, table.columns, fk, row),
+                );
             }
           }
         }
@@ -7821,15 +7912,12 @@ export class Engine {
             for (let j = 0; j < i; j++) {
               meter.charge(COSTS.constraintCheck);
               meter.guard();
-              if (
-                exclusionPairConflicts(
-                  table.columns,
-                  ex,
-                  store.resolveInlineColumns(all.entries[i]!.row),
-                  store.resolveInlineColumns(all.entries[j]!.row),
-                )
-              )
-                throw exclusionViolation(table.name, ex.name);
+              const a = store.resolveInlineColumns(all.entries[i]!.row);
+              const b = store.resolveInlineColumns(all.entries[j]!.row);
+              if (exclusionPairConflicts(table.columns, ex, a, b))
+                throw exclusionViolation(table.name, ex.name).withDetail(
+                  exclusionDetail(this.session, table.name, table.columns, ex, a, b, false),
+                );
             }
       for (const es of constraintEntries.values()) es.sort(compareBytes);
     }
@@ -8662,7 +8750,9 @@ export class Engine {
         if (prefix !== null) {
           const k = prefix.join(",");
           if (seenPrefixes.has(k)) {
-            throw uniqueViolation(ci.table, def.name);
+            throw uniqueViolation(ci.table, def.name).withDetail(
+              indexDetail(this.session, table.name, columns, def, rindex, row, env, DETAIL_DUPLICATED),
+            );
           }
           seenPrefixes.add(k);
         }
@@ -10311,7 +10401,6 @@ export class Engine {
     ctes: CteCtx,
     meter: Meter,
   ): Value[][] | null {
-    const n = table.columns.length;
     // The columns' resolved ColTypes (a scalar, or a composite resolved to its field tree), for
     // composite-aware store coercion (spec/design/composite.md §4).
     // Phase-1 existence probes read the VISIBLE snapshot (the read pin under a data-modifying WITH —
@@ -10339,32 +10428,7 @@ export class Engine {
     const entryPrefixes: Uint8Array[][][] = [];
     let cunits = 0n;
     for (const values of rows) {
-      const row: Row = new Array(n);
-      for (let i = 0; i < n; i++) {
-        const col = table.columns[i]!;
-        const p = provided[i]!;
-        // An omitted column takes its default — a constant, or its expression evaluated for
-        // this row through the shared per-statement seam/clock (constraints.md §2). evalDefault
-        // charges operator_eval for an expression default; a constant (or no default → NULL) is
-        // free.
-        const candidate: Value =
-          p >= 0 ? values[p]! : this.evalDefault(col, defaultExprs[i]!, rng, meter);
-        try {
-          row[i] = coerceForStore(
-            candidate,
-            colTypes[i]!,
-            col.decimal,
-            col.varcharLen,
-            col.notNull,
-            col.name,
-            this.inputZone(),
-          );
-        } catch (e) {
-          // Stamp the target relation onto a column-store failure (23502/22003/22001) — the
-          // relation is in scope here, not inside the coercion (spec/design/error-fields.md §4).
-          throw stampTable(e, table.name);
-        }
-      }
+      const row = this.buildInsertRow(table, colTypes, provided, values, defaultExprs, rng, meter);
 
       // CHECK constraints, in name order, on the fully-coerced candidate row — after NOT
       // NULL (storeValue above), before the key/duplicate check (PG's per-row order,
@@ -10395,7 +10459,9 @@ export class Engine {
         // `<table>_pkey` — jed persists/reserves no such relation (constraints.md §5.4).
         const seen = key.join(",");
         if (seenKeys.has(seen) || readStore.get(key) !== undefined) {
-          throw uniqueViolation(table.name, pkeyName(table.name));
+          throw uniqueViolation(table.name, pkeyName(table.name)).withDetail(
+            pkDetail(this.session, table.name, table.columns, pk, row, DETAIL_EXISTS),
+          );
         }
         seenKeys.add(seen);
       }
@@ -10412,7 +10478,9 @@ export class Engine {
         const stored = istore.rangeEntries(uniqueProbeBound(prefix));
         const k = prefix.join(",");
         if (stored.length > 0 || seenPrefixes[u]!.has(k)) {
-          throw uniqueViolation(table.name, def.name);
+          throw uniqueViolation(table.name, def.name).withDetail(
+            indexDetailByName(this.session, table, def, row, env, DETAIL_EXISTS),
+          );
         }
         seenPrefixes[u]!.add(k);
       }
@@ -10462,7 +10530,7 @@ export class Engine {
         const probe = fkProbe(fk, parent, parentColls, pr.row, fk.columns);
         if (probe === null) continue; // a NULL local column → exempt (MATCH SIMPLE)
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
-        this.validateInsertFkStored(relation, fk, probe);
+        this.validateInsertFkStored(relation, table.columns, fk, probe, pr.row);
       }
     }
 
@@ -10476,14 +10544,21 @@ export class Engine {
       const tcols = table.columns;
       for (const exc of exclusions) {
         for (const pr of prepared) {
-          if (this.insertExclusionConflictsStored(tcols, exc, pr.row)) {
-            throw exclusionViolation(table.name, exc.name);
+          const other = this.insertExclusionConflictsStored(dbScope, table, tcols, exc, pr.row);
+          if (other !== null) {
+            throw exclusionViolation(table.name, exc.name).withDetail(
+              exclusionDetail(this.session, table.name, tcols, exc, pr.row, other, true),
+            );
           }
         }
         for (let i = 0; i < prepared.length; i++) {
           for (let j = 0; j < i; j++) {
-            if (exclusionPairConflicts(tcols, exc, prepared[i]!.row, prepared[j]!.row)) {
-              throw exclusionViolation(table.name, exc.name);
+            const fresh = prepared[i]!.row;
+            const other = prepared[j]!.row;
+            if (exclusionPairConflicts(tcols, exc, fresh, other)) {
+              throw exclusionViolation(table.name, exc.name).withDetail(
+                exclusionDetail(this.session, table.name, tcols, exc, fresh, other, true),
+              );
             }
           }
         }
@@ -10574,26 +10649,7 @@ export class Engine {
     const readStore = this.lkpStoreScoped(dbScope, table.name);
     const maintenanceEnv = this.maintenanceEnv(rng);
 
-    const row: Row = new Array(table.columns.length);
-    for (let i = 0; i < table.columns.length; i++) {
-      const col = table.columns[i]!;
-      const p = provided[i]!;
-      const candidate =
-        p >= 0 ? values[p]! : this.evalDefault(col, defaultExprs[i]!, rng, meter);
-      try {
-        row[i] = coerceForStore(
-          candidate,
-          colTypes[i]!,
-          col.decimal,
-          col.varcharLen,
-          col.notNull,
-          col.name,
-          this.inputZone(),
-        );
-      } catch (e) {
-        throw stampTable(e, table.name);
-      }
-    }
+    const row = this.buildInsertRow(table, colTypes, provided, values, defaultExprs, rng, meter);
 
     if (checks.length > 0) {
       meter.guard();
@@ -10613,7 +10669,9 @@ export class Engine {
     if (pk.length > 0) {
       key = encodePkKey(colTypes, pk, colls, row);
       if (readStore.get(key) !== undefined) {
-        throw uniqueViolation(table.name, pkeyName(table.name));
+        throw uniqueViolation(table.name, pkeyName(table.name)).withDetail(
+          pkDetail(this.session, table.name, table.columns, pk, row, DETAIL_EXISTS),
+        );
       }
     }
 
@@ -10624,7 +10682,10 @@ export class Engine {
       const stored = this.lkpIndexStoreScoped(dbScope, rindex.name).rangeEntries(
         uniqueProbeBound(prefix),
       );
-      if (stored.length > 0) throw uniqueViolation(table.name, rindex.name);
+      if (stored.length > 0)
+        throw uniqueViolation(table.name, rindex.name).withDetail(
+          indexDetailByName(this.session, table, rindex, row, maintenanceEnv, DETAIL_EXISTS),
+        );
     }
 
     const cunits = BigInt(store.writeCompressUnits(key ?? ZERO_STORAGE_KEY, row));
@@ -10661,12 +10722,15 @@ export class Engine {
       if (supplied !== null && cmpBytes(fkProbeBytes(supplied), fkProbeBytes(probe)) === 0) {
         continue;
       }
-      this.validateInsertFkStored(relation, fk, probe);
+      this.validateInsertFkStored(relation, table.columns, fk, probe, row);
     }
 
     for (const exc of this.table(table.name)?.exclusions ?? []) {
-      if (this.insertExclusionConflictsStored(table.columns, exc, row)) {
-        throw exclusionViolation(table.name, exc.name);
+      const other = this.insertExclusionConflictsStored(dbScope, table, table.columns, exc, row);
+      if (other !== null) {
+        throw exclusionViolation(table.name, exc.name).withDetail(
+          exclusionDetail(this.session, table.name, table.columns, exc, row, other, true),
+        );
       }
     }
 
@@ -10703,21 +10767,39 @@ export class Engine {
 
   // Complete one child-side FK check after the caller handles the statement end-state match. The
   // batch and one-row paths share the stored probe and violation construction.
-  private validateInsertFkStored(relation: string, fk: ForeignKey, probe: FkProbe): void {
-    if (!this.fkProbeHits(probe, fk.refTable)) throw fkViolationInsert(relation, fk.name);
+  private validateInsertFkStored(
+    relation: string,
+    columns: Column[],
+    fk: ForeignKey,
+    probe: FkProbe,
+    row: Row,
+  ): void {
+    if (!this.fkProbeHits(probe, fk.refTable))
+      throw fkViolationInsert(relation, fk.name).withDetail(
+        fkChildDetail(this.session, relation, columns, fk, row),
+      );
   }
 
   // Probe resident GiST rows for one exclusion candidate. The batch caller separately retains its
-  // pairwise end-state pass; the stored-row semantics are shared.
+  // pairwise end-state pass; the stored-row semantics are shared. Returns the conflicting stored row
+  // (the least storage key among the matches, for a deterministic Detail — error-fields.md §9.2), or
+  // null when nothing conflicts.
   private insertExclusionConflictsStored(
+    dbScope: string | undefined,
+    table: Table,
     columns: Column[],
     exc: ExclusionConstraint,
     row: Row,
-  ): boolean {
+  ): Row | null {
     const probe = exclusionProbeQuery(columns, exc, row);
-    if (probe === null) return false;
+    if (probe === null) return null;
     const tree = this.readSnap().gistTreeFor(exc.index);
-    return tree !== undefined && gistSearch(tree, probe.query, probe.strats).keys.length > 0;
+    if (tree === undefined) return null;
+    const first = leastKey(gistSearch(tree, probe.query, probe.strats).keys);
+    if (first === null) return null;
+    // A matched entry always names a stored row; an empty row stands in should it not, which only
+    // omits the Detail (the 23P01 itself is decided by the match).
+    return this.lkpStoreScoped(dbScope, table.name).get(first) ?? [];
   }
 
   // resolveOnConflict resolves an ON CONFLICT clause (spec/design/upsert.md §2/§5) into a
@@ -10959,7 +11041,6 @@ export class Engine {
     ctes: CteCtx,
     meter: Meter,
   ): { affected: number; returned: Value[][] | null } {
-    const n = table.columns.length;
     const relation = table.name;
     const colTypes = store.columnTypes();
     // Phase-1 existence/arbiter probes read the VISIBLE snapshot (the read pin under a data-modifying
@@ -10999,28 +11080,7 @@ export class Engine {
     for (const values of rows) {
       // Build + coerce the candidate row, then CHECK — the INSERT per-row order (NOT NULL before
       // CHECK before conflict; constraints.md §4.4).
-      const row: Row = new Array(n);
-      for (let i = 0; i < n; i++) {
-        const col = table.columns[i]!;
-        const p = provided[i]!;
-        const candidate: Value =
-          p >= 0 ? values[p]! : this.evalDefault(col, defaultExprs[i]!, rng, meter);
-        try {
-          row[i] = coerceForStore(
-            candidate,
-            colTypes[i]!,
-            col.decimal,
-            col.varcharLen,
-            col.notNull,
-            col.name,
-            this.inputZone(),
-          );
-        } catch (e) {
-          // Stamp the target relation onto a column-store failure (23502/22003/22001) — the
-          // relation is in scope here, not inside the coercion (spec/design/error-fields.md §4).
-          throw stampTable(e, table.name);
-        }
-      }
+      const row = this.buildInsertRow(table, colTypes, provided, values, defaultExprs, rng, meter);
       if (checks.length > 0) {
         meter.guard();
         evalChecks(checks, relation, row, checkEnv(), meter);
@@ -11093,17 +11153,22 @@ export class Engine {
       // — but the arbiter key was already proposed, so a second row still trips §4.
       if (plan.filter !== null && !evalFilter(plan.filter, combined, env, meter)) continue;
       const newRow = existing.row.slice();
+      let nullCol: string | null = null;
       for (const ap of plan.assignments) {
         try {
-          newRow[ap.idx] = checkAssign(
-            ap,
-            evalExpr(ap.source, combined, env, meter),
-            this.inputZone(),
-          );
+          const raw = evalExpr(ap.source, combined, env, meter);
+          // NOT NULL over the complete new row (error-fields.md §9.5).
+          if (ap.notNull && raw.kind === "null") {
+            nullCol ??= ap.name;
+            newRow[ap.idx] = raw;
+            continue;
+          }
+          newRow[ap.idx] = checkAssign(ap, raw, this.inputZone());
         } catch (e) {
           throw stampTable(e, table.name);
         }
       }
+      if (nullCol !== null) throw this.notNullRowViolation(relation, nullCol, newRow);
       if (checks.length > 0) evalChecks(checks, relation, newRow, checkEnv(), meter);
       updates.push({ key: existing.key, newRow, oldRow: existing.row });
     }
@@ -11117,7 +11182,9 @@ export class Engine {
         const k = encodePkKey(colTypes, pk, colls, row);
         const ks = k.join(",");
         if (readStore.get(k) !== undefined || seen.has(ks)) {
-          throw uniqueViolation(table.name, pkeyName(table.name));
+          throw uniqueViolation(table.name, pkeyName(table.name)).withDetail(
+            pkDetail(this.session, table.name, table.columns, pk, row, DETAIL_EXISTS),
+          );
         }
         seen.add(ks);
       }
@@ -11142,7 +11209,18 @@ export class Engine {
               .rangeEntries(uniqueProbeBound(prefix))
               .some((e) => !rewritten.has(e.key.slice(prefix.length).join(",")));
           if (conflict) {
-            throw uniqueViolation(table.name, def.name);
+            throw uniqueViolation(table.name, def.name).withDetail(
+              indexDetail(
+                this.session,
+                table.name,
+                table.columns,
+                def,
+                rindexes[ix]!,
+                newRow,
+                checkEnv(),
+                DETAIL_EXISTS,
+              ),
+            );
           }
           batch.add(k);
         }
@@ -11178,7 +11256,9 @@ export class Engine {
         if (probe === null) continue; // a NULL local column → exempt (MATCH SIMPLE)
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
         if (!this.fkProbeHits(probe, fk.refTable)) {
-          throw fkViolationInsert(relation, fk.name);
+          throw fkViolationInsert(relation, fk.name).withDetail(
+            fkChildDetail(this.session, relation, table.columns, fk, row),
+          );
         }
       }
     }
@@ -11480,7 +11560,9 @@ export class Engine {
           meter,
         )
       ) {
-        throw fkViolationDelete(check.parent.name, check.fk.name, check.childTable);
+        throw fkViolationDelete(check.parent.name, check.fk.name, check.childTable).withDetail(
+          fkParentDetail(this.session, check.parent, check.fk, check.childTable, check.values),
+        );
       }
     }
   }
@@ -12094,15 +12176,23 @@ export class Engine {
       // inline, so cost-free) so that maintenance sees resident values.
       const row = store.resolveInlineColumns(filtered);
       const newRow = row.slice();
+      let nullCol: string | null = null;
       for (const p of plans) {
         try {
           let raw = evalExpr(p.source, row, env, meter);
           if (mapped !== null) raw = mapped[upd.fkTarget!.fk.columns.indexOf(p.idx)]!;
+          // NOT NULL over the complete new row, after every assignment (error-fields.md §9.5).
+          if (p.notNull && raw.kind === "null") {
+            nullCol ??= p.name;
+            newRow[p.idx] = raw;
+            continue;
+          }
           newRow[p.idx] = checkAssign(p, raw, this.inputZone());
         } catch (e) {
           throw stampTable(e, table.name);
         }
       }
+      if (nullCol !== null) throw this.notNullRowViolation(table.name, nullCol, newRow);
       // The rewritten row is stored fully resident: resolve any still-unfetched (untouched)
       // columns so its weight/disposition re-plan exactly as an eager writer's would —
       // unmetered, part of the rewrite like commit work (large-values.md §14).
@@ -12134,7 +12224,9 @@ export class Engine {
         const nk = u.newKey.join(",");
         const collides = batch.has(nk) || (store.get(u.newKey) !== undefined && !rewritten.has(nk));
         if (collides) {
-          throw uniqueViolation(table.name, pkeyName(table.name));
+          throw uniqueViolation(table.name, pkeyName(table.name)).withDetail(
+            pkDetail(this.session, table.name, table.columns, pkMembers, u.row, DETAIL_EXISTS),
+          );
         }
         batch.add(nk);
       }
@@ -12163,7 +12255,9 @@ export class Engine {
               .rangeEntries(uniqueProbeBound(prefix))
               .some((e) => !rewritten.has(e.key.slice(prefix.length).join(",")));
           if (conflict) {
-            throw uniqueViolation(table.name, rindex.name);
+            throw uniqueViolation(table.name, rindex.name).withDetail(
+              indexDetailByName(this.session, table, rindex, u.row, env, DETAIL_EXISTS),
+            );
           }
           batch.add(k);
         }
@@ -12188,19 +12282,30 @@ export class Engine {
           const probe = exclusionProbeQuery(table.columns, exc, u.row);
           if (probe === null) continue;
           const tree = this.readSnap().gistTreeFor(ikey);
-          const conflict =
-            tree !== undefined &&
-            gistSearch(tree, probe.query, probe.strats).keys.some(
-              (h) => !rewritten.has(h.join(",")),
+          // The least non-vacated stored match (a deterministic Detail — error-fields.md §9.2).
+          const hit =
+            tree === undefined
+              ? null
+              : leastKey(
+                  gistSearch(tree, probe.query, probe.strats).keys.filter(
+                    (h) => !rewritten.has(h.join(",")),
+                  ),
+                );
+          if (hit !== null) {
+            const other = store.get(hit) ?? [];
+            throw exclusionViolation(table.name, exc.name).withDetail(
+              exclusionDetail(this.session, table.name, table.columns, exc, u.row, other, true),
             );
-          if (conflict) {
-            throw exclusionViolation(table.name, exc.name);
           }
         }
         for (let i = 0; i < updates.length; i++) {
           for (let j = 0; j < i; j++) {
-            if (exclusionPairConflicts(table.columns, exc, updates[i]!.row, updates[j]!.row)) {
-              throw exclusionViolation(table.name, exc.name);
+            const fresh = updates[i]!.row;
+            const other = updates[j]!.row;
+            if (exclusionPairConflicts(table.columns, exc, fresh, other)) {
+              throw exclusionViolation(table.name, exc.name).withDetail(
+                exclusionDetail(this.session, table.name, table.columns, exc, fresh, other, true),
+              );
             }
           }
         }
@@ -12234,7 +12339,9 @@ export class Engine {
         if (probe === null) continue; // a NULL local column → exempt (MATCH SIMPLE)
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
         if (!this.fkProbeHits(probe, fk.refTable)) {
-          throw fkViolationInsert(relation, fk.name);
+          throw fkViolationInsert(relation, fk.name).withDetail(
+            fkChildDetail(this.session, relation, table.columns, fk, u.row),
+          );
         }
       }
     }
@@ -23946,6 +24053,14 @@ export function arbiterKey(
   return indexPrefixKey(colTypes, colls, rindexes[arb.indexPos]!, row, env);
 }
 
+// leastKey is the byte-wise least of keys, or null when there are none — the deterministic pick of
+// the stored row an exclusion conflict's Detail names (error-fields.md §9.2).
+function leastKey(keys: Iterable<Uint8Array>): Uint8Array | null {
+  let least: Uint8Array | null = null;
+  for (const k of keys) if (least === null || compareBytes(k, least) < 0) least = k;
+  return least;
+}
+
 // indexPrefixKey builds a row's UNIQUENESS PROBE KEY for one unique index
 // (spec/design/indexes.md §8): the §3 entry key's slot prefix — without the storage-key
 // suffix — or null when any component is NULL (NULLS DISTINCT: such a tuple never
@@ -30132,7 +30247,9 @@ export function evalChecks(
   for (const c of checks) {
     const v = evalExpr(c.node, row, env, meter);
     if (v.kind === "bool" && !v.value) {
-      throw checkViolation(relation, c.name);
+      throw checkViolation(relation, c.name).withDetail(
+        failingRowDetail(env.exec.session, relation, row),
+      );
     }
   }
 }
