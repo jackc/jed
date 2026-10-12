@@ -63,6 +63,14 @@ ORDER BY category;`;
 FROM (VALUES ('a', 1), ('b', 2), ('c', 3)) AS v (label, qty)
 ORDER BY label;`;
 
+	const valuesLimited = `SELECT label
+FROM (VALUES ('a', 3), ('b', 1), ('c', 2) ORDER BY column2 LIMIT 2) AS v (label, qty);`;
+
+	const setOps = `(SELECT name, price FROM product WHERE category = 'office' ORDER BY price DESC LIMIT 1)
+UNION ALL
+(SELECT name, price FROM product WHERE category = 'kitchen' ORDER BY price DESC LIMIT 1)
+ORDER BY price;`;
+
 	const parenSeed = `CREATE TABLE customer (id i32 PRIMARY KEY, name text NOT NULL);
 CREATE TABLE product (id i32 PRIMARY KEY, name text NOT NULL);
 CREATE TABLE orders (
@@ -224,6 +232,22 @@ Filtering and ordering — edit the `WHERE` and `ORDER BY` and re-run:
 
 <LiveSql demo="filtered" {seed} query={filtered} rows={6} />
 
+## Set operations (`UNION` / `INTERSECT` / `EXCEPT`)
+
+`UNION`, `INTERSECT`, and `EXCEPT` combine two queries' rows; the bare form removes duplicates and
+`ALL` keeps them. `INTERSECT` binds tighter than `UNION` and `EXCEPT`. The output columns take the left
+query's names, and each column's type unifies across both sides. A trailing `ORDER BY` / `LIMIT`
+applies to the whole result.
+
+Parenthesize an operand to give it its own `ORDER BY` / `LIMIT` / `OFFSET` (or its own `WITH`) or to
+override precedence — here, the most expensive product of each category:
+
+<LiveSql demo="setOps" {seed} query={setOps} rows={2} />
+
+As in PostgreSQL, a parenthesized query is the same query as its contents: `(SELECT a FROM t) ORDER BY
+b` sorts the inner query, and writing the same clause inside and after the parentheses
+(`(SELECT … LIMIT 2) LIMIT 1`) is an error (`42601`).
+
 ## Common table expressions (`WITH`)
 
 A `WITH` clause names a query and exposes it to the `FROM` clause like a table. Define one or more —
@@ -338,8 +362,11 @@ is a general constant expression (`qty * 2` below):
 
 <LiveSql demo="valuesBody" {seed} query={valuesBody} rows={3} />
 
-Order or limit the **outer** query (`FROM (VALUES …) v ORDER BY x`); a trailing `ORDER BY` / `LIMIT`
-inside the parentheses is not yet supported.
+A trailing `ORDER BY` / `LIMIT` / `OFFSET` inside the parentheses sorts and windows the rows before
+the outer query sees them. Its keys name the `VALUES` columns `column1`, `column2`, … (or a position),
+not the alias's renamed columns:
+
+<LiveSql demo="valuesLimited" {seed} query={valuesLimited} rows={2} />
 
 ## `LATERAL` joins
 

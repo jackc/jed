@@ -1005,8 +1005,8 @@ unaliased derived table or join group — no longer resolves to the first unlabe
 - **A `LATERAL` item inside a right-hand parenthesized join** cannot reference relations outside the
   group (`42P01`; PostgreSQL allows it), because that group's body is planned as a derived body, which
   sees enclosing query levels but no sibling (§42). Inside a *spliced* (chain-leading) group it sees earlier relations normally.
-- **`((SELECT …)) AS s`** — redundant parentheses around a derived-table subquery — stay `42601` (the
-  inner item is not a join).
+- ~~**`((SELECT …)) AS s`**~~ — ✅ **landed** with parenthesized queries (§25): redundant
+  parentheses around a derived-table subquery make its body a parenthesized query.
 - **`UPDATE` / `DELETE` stay single-table** — they keep one table name and gain nothing here
   (though a qualified `WHERE t.a = 1` referencing their sole table now resolves, harmlessly).
 
@@ -1568,7 +1568,8 @@ intersect_expr ::= select_core ("INTERSECT" ("ALL" | "DISTINCT")? select_core)*
 ```
 
 A lone query (no set operator) is a single `select_core` whose trailing clauses fold back onto
-it — byte-for-byte the pre-set-operations `SELECT`. `UNION`/`INTERSECT`/`EXCEPT`/`ALL`/`DISTINCT`
+it — byte-for-byte the pre-set-operations `SELECT`. An operand may also be a **parenthesized
+query** (below), which is how an operand carries its own `ORDER BY`/`LIMIT`/`OFFSET`. `UNION`/`INTERSECT`/`EXCEPT`/`ALL`/`DISTINCT`
 are **not reserved** (§3), disambiguated positionally.
 
 **Precedence — PostgreSQL.** `INTERSECT` **binds tighter** than `UNION` and `EXCEPT`, so it is
@@ -1667,22 +1668,55 @@ SELECT 1.0` → `1`). This first-occurrence rule is deterministic and identical 
 **Trailing `ORDER BY` / `LIMIT` / `OFFSET` apply to the whole result**, after the combine. Keys
 resolve against the **output columns by name** (the left operand's names) — there is no relation
 scope after a set operation, so a **qualified** key (`ORDER BY t.x`) is an error (PostgreSQL:
-"missing FROM-clause entry"; the engine reports `42P01`/undefined). **Ordinals** (`ORDER BY 1`)
-stay deferred, consistent with the engine deferring ordinals everywhere (§5, §10). Direction and
+"missing FROM-clause entry"; the engine reports `42P01`/undefined). An **ordinal** (`ORDER BY 1`)
+names an output column by position (`42P10` out of range — §10). Direction and
 `NULLS FIRST|LAST` work exactly as §10 (the same `key_cmp` over the output-row value). `LIMIT`/
 `OFFSET` then window the ordered result (§9). Output order **without** a trailing `ORDER BY` is
 unspecified (CLAUDE.md §8/§10; the corpus compares such queries `rowsort`); the result *multiset*
 is exact and identical across cores regardless.
 
+**Parenthesized queries.** A set-operation operand may be a parenthesized query — `(SELECT …)
+UNION (SELECT …)` — whose body is a full `subquery_expr`: its own nested `WITH`, set operations
+(so parentheses override precedence: `(a UNION b) INTERSECT c`), and `ORDER BY`/`LIMIT`/`OFFSET`,
+which apply to **that operand** before the combine (oracle: `(SELECT a FROM t ORDER BY a LIMIT 2)
+UNION ALL (SELECT a FROM u ORDER BY a DESC LIMIT 1)`). The same form is accepted wherever a query
+expression is: a whole statement (`(SELECT a FROM t) ORDER BY b`), the main query of a `WITH`, a CTE
+or view body, a derived table, a scalar / `IN` / `EXISTS` / `ANY`/`ALL` subquery, and after
+`EXPLAIN`. Each `(` is one parser nesting level (`54001` past `MAX_EXPR_DEPTH`, [cost.md](cost.md)
+§7). A bare `select_core` operand still takes no trailing clause: `SELECT … ORDER BY a UNION …`
+leaves the `UNION` as a leftover token, `42601`, as in PostgreSQL.
+
+- **A parenthesized query is its contents (PostgreSQL).** The parentheses add no query level, so
+  trailing clauses written after the `)` **fold** onto the inner query: a clause it lacks is added
+  (`(SELECT a FROM t) ORDER BY b` may name a non-output column of `t`; `(SELECT … ORDER BY a)
+  LIMIT 1`), while a clause it already has is **`42601`** — PostgreSQL's "multiple ORDER BY clauses
+  not allowed", likewise `LIMIT` and `OFFSET`. A parenthesized nested `WITH` folds onto its main
+  query, and a `WITH` whose main query is itself a parenthesized `WITH` query (`WITH a AS (…) (WITH
+  b AS (…) SELECT …)`) is **`42601`** ("multiple WITH clauses not allowed"). A parenthesized `WITH`
+  statement is the top-level `WITH` query.
+- **Disambiguation (a §8 cross-core surface).** In operand and statement position a `(` can only
+  begin a query. In an **expression or FROM position** — where `(` also begins a parenthesized
+  expression, row, or join — the §26 leading-`SELECT`/`WITH` lookahead is extended: a `(` begins a
+  parenthesized query when a run of `(` ends at `SELECT` or a `WITH` clause and **every** `(` in the
+  run is closed by a `)` followed by `UNION`, `INTERSECT`, `EXCEPT`, `ORDER`, `LIMIT`, `OFFSET`, or
+  another `)` — tokens that can follow a query but never a parenthesized expression (all six are
+  stop keywords, never an implicit alias, §15). So `((SELECT 1) UNION SELECT 2)` and `((SELECT 1))`
+  are subqueries, `x IN ((SELECT a FROM t))` is the subquery form (a multi-row result is fine — the
+  oracle agrees), while `((SELECT 1) + 1)` and `((SELECT 1), 2)` stay expressions and `FROM ((SELECT
+  1) AS a JOIN b ON …)` stays a parenthesized join (§15). After `EXPLAIN`, a `(` opens the option list
+  unless `(`, `SELECT`, or a `WITH` clause follows it. Each core precomputes the classification for
+  every token in one backward pass over a matching-parenthesis table, so a long run of `(` costs
+  linear time and no recursion.
+- **Pushdown.** A predicate over a derived table is never moved into an arm that has its own
+  `LIMIT`/`OFFSET` (the existing body-pushability rule, [planner.md](planner.md) §3.2): the arm is
+  limited first, then filtered.
+
 **Deferred narrowings (each relaxable later).**
 
-- **No parenthesized operands** — `(SELECT …) UNION …` is not accepted.
-- **No `ORDER BY`/`LIMIT`/`OFFSET` inside an operand** — only on the whole result. Because a
-  `select_core` does not consume those clauses, an operand `ORDER BY` is left dangling and the
-  statement fails to consume all input → `42601` (the leftover-token rule). To order *then*
-  combine, the parenthesized-operand relaxation above is the eventual path.
-- **No ordinals** in the trailing `ORDER BY` (above).
-- **No set operation in an `INSERT … SELECT` source** (§24) — the source stays a single `select`.
+- **No set operation in an `INSERT … SELECT` source** (§24) — the source stays a single `select`
+  (including a parenthesized one).
+- **No `VALUES` operand** — `VALUES (1) UNION SELECT 2` and a top-level `VALUES` query are not
+  accepted; `VALUES` is only a derived-table body (§42).
 
 **Cost** is `lhs + rhs`, the combine itself unmetered — see [cost.md](cost.md) §3.
 
@@ -1716,7 +1750,8 @@ A row constructor on the left of a comparison, `IN`, or `ANY`/`ALL` makes the su
 is `SELECT`, otherwise a parenthesized expression. `IN (` likewise: a leading `SELECT` is the
 IN-subquery, otherwise the §20 value list. `EXISTS` is a keyword prefix taking `( query_expr )`.
 Because the operand is a full `query_expr`, `IN (SELECT … UNION …)` and `EXISTS (… INTERSECT …)`
-parse.
+parse. A nested `WITH` (cte.md §7) or a parenthesized query (§25 — `((SELECT …) UNION (SELECT …))`,
+recognized by the §25 run-of-`(` lookahead) also begins a subquery.
 
 ### Evaluation model — plan once, then fold or re-execute
 
@@ -2594,9 +2629,10 @@ must be **distinct** from the other FROM relations' labels: a collision is **`42
 
 **Disambiguation (a §8 cross-core determinism surface).** In `table_ref` position, a leading `(`
 followed by `SELECT` is a derived table — the *same* leading-`SELECT` lookahead scalar subqueries
-and IN-subqueries use (§26), so the three hand-written parsers stay byte-identical. A leading `(`
-followed by `VALUES` is the **VALUES-body derived table** (below). A leading `(` followed by
-**neither** (nor `WITH`) begins a **parenthesized join** `FROM (a JOIN b ON …)` (§15) — an aliased one
+and IN-subqueries use (§26), so the three hand-written parsers stay byte-identical; so is one
+followed by a nested `WITH` or a parenthesized query (`FROM ((SELECT …) UNION (SELECT …)) s`, the §25
+lookahead). A leading `(` followed by `VALUES` is the **VALUES-body derived table** (below). Any other
+leading `(` begins a **parenthesized join** `FROM (a JOIN b ON …)` (§15) — an aliased one
 is exactly the derived table `(SELECT * FROM a JOIN b ON …) AS g`. The base-table / SRF forms are unchanged: a `(` *after* a leading
 identifier is still the function form (§35).
 
@@ -2626,10 +2662,15 @@ always-inlined single-reference CTE — so the alias rules, the column-rename li
   arrays, composites, …), an all-`NULL` column is `text` (unknown→text); a pair with no common type
   is **`42804`** (`datatype_mismatch`). The unified column type then coerces each row's value (the
   only runtime changes are `int`→`decimal` and `f32`→`f64`, as for a set operation).
-- **No trailing `ORDER BY` / `LIMIT` on the body (a deferred narrowing).** `(VALUES … ORDER BY 1)` is
-  `42601` (a leftover token). Order/limit the *outer* query instead (`FROM (VALUES …) v ORDER BY x`).
-  A documented PG divergence (PG accepts a VALUES query's trailing clauses), recorded in the override
-  ledger.
+- **A trailing `ORDER BY` / `LIMIT` / `OFFSET` on the body.** `(VALUES (3),(1),(2) ORDER BY 1 LIMIT 2)
+  AS v` sorts and windows the rows before the outer query sees them (PostgreSQL). The body is then the
+  query `SELECT * FROM (VALUES …) ORDER BY … LIMIT … OFFSET …` over an **unaliased** inner VALUES
+  relation, so a key names `column1`, `column2`, … by name, by ordinal (`42P10` past the last
+  column), or in an expression — never the derived table's alias or rename list (`v.column1` is
+  `42P01`, a renamed `x` is `42703`; oracle-identical), and the alias and rename list apply to the
+  query's output unchanged. Its cost is the VALUES rows plus that query's scan and sort — the
+  ordinary derived-table and `ORDER BY` charges, no new unit ([cost.md](cost.md) §3). `LATERAL`
+  applies to the whole body.
 
 **The body sees no sibling (no `LATERAL`), but does see enclosing query levels.** A derived-table
 body sees its own FROM, the catalog, and the statement's **CTE bindings** (so `WITH c AS (…) SELECT
@@ -2676,7 +2717,7 @@ by the body's own context (§26); a `$N` with no type context errors `42P18` as 
 | VALUES-body rows of differing arity | `42601` | `VALUES lists must all be the same length` (the §12 rule). |
 | VALUES-body columns whose row types do not unify | `42804` | `datatype_mismatch`, the set-operation unification rule (§25). |
 | Column reference (not of an enclosing query level) / aggregate / no-context `$N` in a VALUES-body value | `42703` / `42803` / `42P18` | The body is a non-`LATERAL` relation with no FROM row. |
-| Trailing `ORDER BY` / `LIMIT` on a VALUES body | `42601` | Leftover token — a deferred narrowing (PG accepts it on a VALUES query). |
+| Trailing `ORDER BY` key naming the derived table's alias / rename list | `42P01` / `42703` | The keys see only the VALUES columns `column1`, … (PG). |
 | Body nesting exceeds `MAX_EXPR_DEPTH` | `54001` | The parser depth gate (cost.md §7). |
 
 **Deliberate narrowings (each relaxable later, [../../TODO.md](../../TODO.md)).**
@@ -2689,8 +2730,9 @@ by the body's own context (§26); a `$N` with no type context errors `42P18` as 
 - **A `WITH` *inside* the body** (nested `WITH`) — ✅ **landed** (cte.md §7): a derived-table body,
   like any parenthesized subquery, may be a `WITH`-prefixed query (`subquery_expr`), establishing its
   own child CTE scope over the enclosing statement's visible bindings. *(The
-  `VALUES` body itself has **landed** — see "The VALUES body" above; its own residual narrowings are a
-  trailing `ORDER BY`/`LIMIT` on the body and general expressions in the `INSERT … VALUES` slot.)*
+  `VALUES` body itself has **landed** — see "The VALUES body" above, including a trailing `ORDER
+  BY`/`LIMIT`/`OFFSET`; its residual narrowing is general expressions in the `INSERT … VALUES`
+  slot.)*
 - **Top-level `UPDATE`/`DELETE` FROM** stays single-table (§15) — a derived table reaches them only
   inside a subquery.
 

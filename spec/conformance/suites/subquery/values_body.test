@@ -168,7 +168,4 @@ SELECT * FROM (VALUES (sum(1))) AS v
 statement error 42P10
 SELECT * FROM (VALUES (1)) AS v (a, b)
 
-# A trailing ORDER BY on the VALUES body is a deferred narrowing -> 42601 (a documented PG
-# divergence; order the OUTER query instead).
-statement error 42601
-SELECT * FROM (VALUES (3), (1), (2) ORDER BY 1) AS v
+# (A trailing ORDER BY / LIMIT / OFFSET on the VALUES body: subquery/values_order_by.test.)

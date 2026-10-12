@@ -1,0 +1,95 @@
+# A trailing ORDER BY / LIMIT / OFFSET on a VALUES-body derived table (spec/design/grammar.md §42):
+# FROM (VALUES … ORDER BY … LIMIT …) AS v. The body is the query SELECT * FROM (VALUES …) ORDER BY …
+# over an unaliased VALUES relation, so a key names column1, column2, … or an ordinal — never the
+# derived table's alias or rename list (PostgreSQL). Rows verified against the live PostgreSQL 18
+# oracle; cost assertions are jed's deterministic cross-core contract (spec/design/cost.md §3).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.cross_join, query.qualified_column, query.table_alias, query.order_by, query.order_by_ordinal, query.order_by_expr, query.limit, query.offset, query.derived_table, query.values, query.values_order_by, query.lateral, query.subquery_scalar, expr.arithmetic, types.i32, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20)
+
+# ORDER BY an ordinal + LIMIT keeps the smallest rows.
+# cost: 7
+query I rowsort
+SELECT * FROM (VALUES (3), (1), (2) ORDER BY 1 LIMIT 2) AS v
+----
+1
+2
+
+# ORDER BY a default column name, descending.
+# cost: 5
+query IT rowsort
+SELECT * FROM (VALUES (3, 'a'), (1, 'b'), (2, 'c') ORDER BY column2 DESC LIMIT 1) AS v
+----
+2
+c
+
+# An expression key.
+# cost: 8
+query I rowsort
+SELECT * FROM (VALUES (3), (1), (2) ORDER BY column1 * -1 LIMIT 1) AS v
+----
+3
+
+# LIMIT alone, OFFSET alone, and OFFSET after ORDER BY.
+# cost: 8
+query I rowsort
+SELECT count(*) FROM (VALUES (3), (1), (2) LIMIT 2) AS v
+----
+2
+
+# cost: 8
+query I rowsort
+SELECT count(*) FROM (VALUES (3), (1), (2) OFFSET 1) AS v
+----
+2
+
+# cost: 7
+query I rowsort
+SELECT * FROM (VALUES (3), (1), (2) ORDER BY 1 OFFSET 1) AS v
+----
+2
+3
+
+# The rename list applies to the body's output; the outer query orders by the new name.
+# cost: 7
+query I nosort
+SELECT x FROM (VALUES (3), (1), (2) ORDER BY 1 DESC LIMIT 2) AS v (x) ORDER BY x
+----
+2
+3
+
+# The derived table's alias and rename list are not in scope inside the body.
+statement error 42P01
+SELECT * FROM (VALUES (3), (1) ORDER BY v.column1) AS v
+
+statement error 42703
+SELECT * FROM (VALUES (3), (1) ORDER BY x) AS v (x)
+
+# An ordinal past the body's columns is 42P10.
+statement error 42P10
+SELECT * FROM (VALUES (3, 4), (1, 2) ORDER BY 3) AS v
+
+# A LATERAL VALUES body orders per outer row.
+# cost: 21
+query II rowsort
+SELECT t.id, v.x FROM t, LATERAL (VALUES (t.a), (t.a + 5), (t.a + 1) ORDER BY 1 DESC LIMIT 2) AS v (x)
+----
+1
+11
+1
+15
+2
+21
+2
+25
+
+# A scalar subquery inside the body's ORDER BY.
+# cost: 8
+query I rowsort
+SELECT * FROM (VALUES (3), (1) ORDER BY (SELECT 1), 1 LIMIT 1) AS v
+----
+1

@@ -1,0 +1,276 @@
+# Parenthesized queries (spec/design/grammar.md §25): a set-operation operand, a statement, or a
+# subquery body may be a parenthesized query — `(SELECT …) UNION (SELECT …)` — carrying its own
+# WITH, set operations, and ORDER BY / LIMIT / OFFSET. A parenthesized query is the SAME query as
+# its contents (PostgreSQL), so trailing clauses written after the `)` fold onto it; giving one of
+# them twice is 42601. In an expression or FROM position a `(` begins a parenthesized query only
+# when it ends at a SELECT/WITH and each `)` is followed by a set operator, ORDER/LIMIT/OFFSET, or
+# another `)` — `((SELECT 1) + 1)` stays an expression. Rows verified against the live PostgreSQL 18
+# oracle; cost assertions are jed's deterministic cross-core contract (spec/design/cost.md §3).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.order_by_ordinal, query.limit, query.offset, query.union, query.intersect, query.except, query.setop_parenthesized, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_quantified, query.derived_table, query.derived_pushdown, query.cross_join, query.table_alias, query.cte, query.cte_nested, query.cte_recursive, query.values, ddl.view, expr.arithmetic, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 300), (2, 20, 200), (3, 30, 100)
+
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO u VALUES (1, 20), (2, 40)
+
+# Parenthesized operands combine exactly like bare ones.
+# cost: 12
+query I rowsort
+(SELECT a FROM t) UNION (SELECT a FROM u)
+----
+10
+20
+30
+40
+
+# Each operand carries its own ORDER BY / LIMIT, applied before the combine.
+# cost: 10
+query I rowsort
+(SELECT a FROM t ORDER BY a LIMIT 2) UNION ALL (SELECT a FROM u ORDER BY a DESC LIMIT 1)
+----
+10
+20
+40
+
+# An operand's ORDER BY key need not be one of its output columns.
+# cost: 10
+query I rowsort
+(SELECT a FROM t ORDER BY b LIMIT 1) UNION ALL (SELECT a FROM t ORDER BY b DESC LIMIT 1)
+----
+10
+30
+
+# OFFSET inside an operand.
+# cost: 10
+query I rowsort
+SELECT a FROM u UNION ALL (SELECT a FROM t ORDER BY a OFFSET 2)
+----
+20
+30
+40
+
+# A parenthesized operand overrides precedence: here the UNION ALL is evaluated before INTERSECT.
+# cost: 17
+query I rowsort
+(SELECT a FROM t UNION ALL SELECT a FROM u) INTERSECT SELECT a FROM u
+----
+20
+40
+
+# … and here the EXCEPT on the right is evaluated first (bare, it would be left-associative).
+# cost: 19
+query I rowsort
+SELECT a FROM t EXCEPT (SELECT a FROM t EXCEPT SELECT a FROM u)
+----
+20
+
+# A trailing ORDER BY / LIMIT after the last operand applies to the whole result.
+# cost: 10
+query I nosort
+(SELECT a FROM t ORDER BY a LIMIT 1) UNION (SELECT a FROM u) ORDER BY 1 DESC LIMIT 2
+----
+40
+20
+
+# A parenthesized statement is its contents; a trailing clause it lacks folds onto it, so the ORDER
+# BY may name a non-output column of the inner FROM.
+# cost: 7
+query I nosort
+(SELECT a FROM t) ORDER BY b
+----
+30
+20
+10
+
+# cost: 5
+query I nosort
+(SELECT a FROM t ORDER BY a DESC) LIMIT 1
+----
+30
+
+# Redundant parentheses nest freely.
+# cost: 6
+query I nosort
+((SELECT a FROM t ORDER BY a)) LIMIT 2
+----
+10
+20
+
+# A clause given both inside and after the parentheses is 42601 (PostgreSQL: "multiple ORDER BY
+# clauses not allowed").
+statement error 42601
+(SELECT a FROM t ORDER BY a) ORDER BY a DESC
+
+statement error 42601
+(SELECT a FROM t LIMIT 2) LIMIT 1
+
+statement error 42601
+((SELECT a FROM t OFFSET 1)) OFFSET 1
+
+# A set operation's own trailing clauses fold the same way.
+statement error 42601
+(SELECT a FROM t UNION SELECT a FROM u LIMIT 1) LIMIT 2
+
+# An unparenthesized operand still takes no trailing clause: the ORDER BY ends the query.
+statement error 42601
+SELECT a FROM t ORDER BY a UNION SELECT a FROM u
+
+# A parenthesized WITH query is an operand, a statement, or a WITH's body.
+# cost: 11
+query I rowsort
+(WITH c AS (SELECT a FROM u) SELECT a FROM c) UNION ALL SELECT a FROM t WHERE id = 1
+----
+10
+20
+40
+
+# cost: 7
+query I nosort
+(WITH c AS (SELECT a FROM u) SELECT a FROM c) ORDER BY a DESC
+----
+40
+20
+
+# cost: 6
+query I nosort
+WITH c AS (SELECT a FROM u) (SELECT a FROM c ORDER BY a DESC LIMIT 1)
+----
+40
+
+# A WITH whose main query is a parenthesized WITH query is 42601 ("multiple WITH clauses").
+statement error 42601
+WITH c AS (SELECT 1) (WITH d AS (SELECT 2) SELECT * FROM d)
+
+# CTE bodies take parenthesized operands, including a recursive CTE's terms.
+# cost: 11
+query I rowsort
+WITH c AS ((SELECT a FROM t ORDER BY a LIMIT 1) UNION ALL (SELECT a FROM u ORDER BY a LIMIT 1)) SELECT a FROM c
+----
+10
+20
+
+# cost: 17
+query I rowsort
+WITH RECURSIVE r (n) AS ((SELECT 1) UNION ALL (SELECT n + 1 FROM r WHERE n < 3)) SELECT n FROM r
+----
+1
+2
+3
+
+# A recursive term's own ORDER BY / LIMIT applies per iteration (to each step's new rows).
+# cost: 37
+query I rowsort
+WITH RECURSIVE r (n) AS ((SELECT 1) UNION ALL (SELECT n + k FROM r CROSS JOIN (VALUES (1), (10)) AS v (k) WHERE n < 30 ORDER BY 1 DESC LIMIT 1)) SELECT n FROM r
+----
+1
+11
+21
+31
+
+# A subquery body may be a parenthesized query: scalar, IN, EXISTS, and ANY.
+# cost: 11
+query I nosort
+SELECT ((SELECT a FROM t ORDER BY a DESC LIMIT 1) EXCEPT (SELECT a FROM u))
+----
+30
+
+# IN ((SELECT …)) is the subquery form, not a one-element list holding a scalar subquery, so a
+# multi-row subquery is fine.
+# cost: 19
+query I rowsort
+SELECT id FROM t WHERE a IN ((SELECT a FROM u))
+----
+2
+
+# cost: 20
+query I rowsort
+SELECT id FROM t WHERE a IN ((SELECT a FROM u ORDER BY a LIMIT 1) UNION (SELECT 30))
+----
+2
+3
+
+# cost: 29
+query I rowsort
+SELECT id FROM t WHERE EXISTS ((SELECT 1 FROM u WHERE u.a = t.a) UNION ALL (SELECT 1 WHERE t.id = 1))
+----
+1
+2
+
+# cost: 22
+query I rowsort
+SELECT id FROM t WHERE a = ANY ((SELECT a FROM u) UNION (SELECT 10))
+----
+1
+2
+
+# A parenthesized expression around a scalar subquery stays an expression.
+# cost: 6
+query I nosort
+SELECT ((SELECT a FROM u WHERE id = 1) + 1)
+----
+21
+
+# cost: 6
+query I nosort
+SELECT ((SELECT a FROM u WHERE id = 1)) * 2
+----
+40
+
+# A derived table's body may be a parenthesized query or a set operation of them.
+# cost: 19
+query I rowsort
+SELECT s.a FROM ((SELECT a FROM t) UNION (SELECT a FROM u)) AS s WHERE s.a > 15
+----
+20
+30
+40
+
+# cost: 6
+query I rowsort
+SELECT * FROM ((SELECT a FROM t ORDER BY a DESC LIMIT 1)) AS s
+----
+30
+
+# cost: 8
+query I rowsort
+SELECT * FROM ((SELECT a FROM t) ORDER BY b LIMIT 2) AS s
+----
+20
+30
+
+# A predicate on the derived table is not pushed into an arm that has its own LIMIT: the arm is
+# limited first, then filtered.
+# cost: 15
+query I rowsort
+SELECT s.a FROM ((SELECT a FROM t ORDER BY a LIMIT 1) UNION ALL (SELECT a FROM u)) AS s WHERE s.a > 15
+----
+20
+40
+
+# A FROM `(` whose inner `(SELECT …)` is followed by an alias or a join keyword is still a
+# parenthesized join.
+# cost: 3
+query II rowsort
+SELECT * FROM ((SELECT 1 AS x) AS l CROSS JOIN (SELECT 2 AS y) AS r)
+----
+1
+2
+
+# A view body may be a set operation of parenthesized operands.
+statement ok
+CREATE VIEW pv AS (SELECT a FROM t ORDER BY a LIMIT 1) UNION ALL (SELECT a FROM u)
+
+# cost: 13
+query I rowsort
+SELECT a FROM pv
+----
+10
+20
+40
