@@ -1057,7 +1057,7 @@ impl Engine {
 
     /// Render the chosen access path for a relation (spec/design/explain.md §5): a full scan, a
     /// primary-key range bound, or a secondary-index / GIN / GiST bound (the last three by index name,
-    /// the stored lowercased name). `inl` marks an index-nested-loop bound (cost.md §3 "JOIN") — a
+    /// the stored exact name). `inl` marks an index-nested-loop bound (cost.md §3 "JOIN") — a
     /// per-outer-row seek whose source is a sibling column — with a leading label.
     pub(crate) fn access_path(&self, table_name: &str, b: Option<&ScanBound>, inl: bool) -> String {
         let prefix = if inl { "Index-nested-loop " } else { "" };

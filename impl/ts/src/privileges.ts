@@ -90,7 +90,7 @@ export class PrivilegeSet {
 }
 
 // Privileges is the session's authorization envelope (spec/design/session.md §5.3): the default
-// table-privilege set plus per-object grant / revoke deltas (keyed lowercased — the canonical catalog
+// table-privilege set plus per-object grant / revoke deltas (keyed by exact name, grammar.md §3 — the canonical catalog
 // name). A fresh envelope is fully permissive (every table privilege, every function).
 export class Privileges {
   defaultTable: PrivilegeSet;
@@ -121,17 +121,17 @@ export class Privileges {
 
   // grant adds privs to object's grant delta (beyond the default).
   grant(privs: PrivilegeSet, object: string): void {
-    const key = object.toLowerCase();
+    const key = object;
     this.grants.set(key, (this.grants.get(key) ?? PrivilegeSet.empty()).union(privs));
   }
 
   // revoke adds privs to object's revoke delta (revoke wins over grant and the default).
   revoke(privs: PrivilegeSet, object: string): void {
-    const key = object.toLowerCase();
+    const key = object;
     this.revokes.set(key, (this.revokes.get(key) ?? PrivilegeSet.empty()).union(privs));
   }
 
-  // effective is the effective privilege set for object name (already lowercased) over a base default.
+  // effective is the effective privilege set for object name (the exact name, grammar.md §3) over a base default.
   private effective(name: string, base: PrivilegeSet): PrivilegeSet {
     const granted = this.grants.get(name) ?? PrivilegeSet.empty();
     const revoked = this.revokes.get(name) ?? PrivilegeSet.empty();
@@ -140,11 +140,11 @@ export class Privileges {
 
   // allowsTable reports whether table name holds privilege p.
   allowsTable(name: string, p: Privilege): boolean {
-    return this.effective(name.toLowerCase(), this.defaultTable).contains(p);
+    return this.effective(name, this.defaultTable).contains(p);
   }
 
   // allowsFunction reports whether function name holds EXECUTE (functions default to EXECUTE on all).
   allowsFunction(name: string): boolean {
-    return this.effective(name.toLowerCase(), PrivilegeSet.executeOnly()).contains("execute");
+    return this.effective(name, PrivilegeSet.executeOnly()).contains("execute");
   }
 }

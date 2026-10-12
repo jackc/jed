@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"slices"
 	"sort"
-	"strings"
 )
 
 // Value storage coercion, key encoding, and foreign-key probing — the seam between the
@@ -795,7 +794,7 @@ func typesEqual(a, b dataType) bool {
 			return false
 		}
 		if a.Comp != nil {
-			return strings.EqualFold(a.Comp.Name, b.Comp.Name)
+			return a.Comp.Name == b.Comp.Name
 		}
 		if a.Array != nil {
 			return typesEqual(*a.Array, *b.Array)
@@ -996,7 +995,7 @@ const (
 
 // fkProbe is a built foreign-key probe (spec/design/constraints.md §6.4/§6.8): the bytes to look
 // up in the parent, tagged with which physical tree to probe. For fkProbeUnique, index holds the
-// lowercased index name.
+// exact index name.
 type fkProbe struct {
 	kind  fkProbeKind
 	bytes []byte
@@ -1058,7 +1057,7 @@ func buildFkProbe(fk *foreignKey, parent *catTable, parentColls []*Collation, ro
 		prefix = append(prefix, 0x00)
 		prefix = append(prefix, b...)
 	}
-	return fkProbe{kind: fkProbeUnique, bytes: prefix, index: strings.ToLower(idx.Name)}, true, nil
+	return fkProbe{kind: fkProbeUnique, bytes: prefix, index: idx.Name}, true, nil
 }
 
 // fkProbeHits reports whether the parent currently holds the key/prefix probe (committed +
@@ -1080,7 +1079,7 @@ func (db *engine) fkProbeHits(probe fkProbe, parentTable string) (bool, error) {
 
 // fkReversePath is the access path a parent-side reverse match uses on the child table
 // (spec/design/constraints.md §6.5): the child's PK (index == ""), a plain-column ordered B-tree
-// secondary index (index = its lowercased name), or — cols == nil — the full-scan fallback. cols
+// secondary index (index = its exact name), or — cols == nil — the full-scan fallback. cols
 // are the leading child key columns, in key order, whose set is exactly the FK's local columns.
 type fkReversePath struct {
 	index string
@@ -1144,7 +1143,7 @@ func (db *engine) fkReversePrefix(path fkReversePath, fk *foreignKey, child *cat
 }
 
 // fkChooseReversePath picks the child reverse-match path deterministically: the child PK, then
-// usable non-partial plain-column B-tree indexes in ascending lowercased-name order (the planner's
+// usable non-partial plain-column B-tree indexes in ascending name byte order (the planner's
 // canonical tie order), else the full scan (constraints.md §6.5 steps 1–2).
 func fkChooseReversePath(snap *snapshot, fk *foreignKey, child, parent *catTable) fkReversePath {
 	k := len(fk.Columns)
@@ -1169,7 +1168,7 @@ func fkChooseReversePath(snap *snapshot, fk *foreignKey, child, parent *catTable
 		if len(leading) != k || !fkReverseTailFixed(child, ix.Keys[k:]) || !fkReverseKeyUsable(snap, fk, child, parent, leading) {
 			continue
 		}
-		name := strings.ToLower(ix.Name)
+		name := ix.Name
 		if bestCols == nil || name < best {
 			best, bestCols = name, leading
 		}
@@ -1335,7 +1334,7 @@ func (db *engine) fkKeyedScan(t *fkKeyedTarget, childTable string, mask []bool) 
 	var suffix []scalarType
 	if path.index != "" {
 		for i := range child.Indexes {
-			if strings.ToLower(child.Indexes[i].Name) == path.index {
+			if child.Indexes[i].Name == path.index {
 				for _, key := range child.Indexes[i].Keys[len(path.cols):] {
 					c, _ := key.asColumn()
 					suffix = append(suffix, child.Columns[c].Type.ScalarTy())
@@ -1385,13 +1384,13 @@ type fkReferencer struct {
 }
 
 // fkReferencers returns every (child table name, FK) pair in the visible snapshot whose FK
-// references parentName (case-insensitive), including a self-reference — the inbound FKs a parent
-// DELETE/UPDATE must not strand (spec/design/constraints.md §6.5). Sorted by (lowercased child
+// references parentName (exact name), including a self-reference — the inbound FKs a parent
+// DELETE/UPDATE must not strand (spec/design/constraints.md §6.5). Sorted by (child
 // table, FK name) for a deterministic report order; the FK is copied so the caller can probe
 // stores without a snapshot borrow.
 func (db *engine) fkReferencers(parentName string) []fkReferencer {
 	snap := db.readSnap()
-	key := strings.ToLower(parentName)
+	key := parentName
 	tableKeys := make([]string, 0, len(snap.tables))
 	for k := range snap.tables {
 		tableKeys = append(tableKeys, k)
@@ -1401,7 +1400,7 @@ func (db *engine) fkReferencers(parentName string) []fkReferencer {
 	for _, tk := range tableKeys {
 		t := snap.tables[tk]
 		for _, fk := range t.ForeignKeys {
-			if strings.EqualFold(fk.RefTable, key) {
+			if fk.RefTable == key {
 				out = append(out, fkReferencer{childTable: t.Name, fk: fk})
 			}
 		}

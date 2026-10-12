@@ -22,7 +22,7 @@ pub(crate) fn resolve_func_call(
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
-    let lname = name.to_ascii_lowercase();
+    let lname = name.to_string();
     // DISTINCT is an aggregate-only modifier: `abs(DISTINCT x)` is 42809 (PG's wrong_object_type,
     // "DISTINCT specified, but <fn> is not an aggregate function" — aggregates.md §5). Checked
     // before the per-kind dispatch so it covers every non-aggregate path (scalar, array, …).
@@ -367,7 +367,7 @@ pub(crate) fn resolve_func_call(
 /// case-insensitive `i` flag is statically known (the flags arg absent or a constant).
 pub(crate) fn resolve_regex_func(
     scope: &Scope,
-    name: &str, // already lowercased
+    name: &str, // the exact (folded) name
     args: &[Expr],
     agg: &mut AggCtx,
     params: &mut ParamTypes,
@@ -545,16 +545,12 @@ pub(crate) fn normalize_named_args(
             }
             Some(pn) => {
                 seen_named = true;
-                let idx = desc
-                    .arg_names
-                    .iter()
-                    .position(|p| p.eq_ignore_ascii_case(pn))
-                    .ok_or_else(|| {
-                        EngineError::new(
-                            SqlState::UndefinedFunction,
-                            format!("function {} has no parameter named \"{pn}\"", desc.name),
-                        )
-                    })?;
+                let idx = desc.arg_names.iter().position(|p| p == pn).ok_or_else(|| {
+                    EngineError::new(
+                        SqlState::UndefinedFunction,
+                        format!("function {} has no parameter named \"{pn}\"", desc.name),
+                    )
+                })?;
                 if slots[idx].is_some() {
                     return Err(EngineError::new(
                         SqlState::SyntaxError,
@@ -636,7 +632,7 @@ pub(crate) fn resolve_make_interval(
 /// string to the `text` `timezone` slot); a wrong family in a slot is 42883.
 pub(crate) fn resolve_make_timestamp(
     scope: &Scope,
-    name: &str, // "make_timestamp" | "make_timestamptz" | "make_date" (already lowercased)
+    name: &str, // "make_timestamp" | "make_timestamptz" | "make_date" (the exact name)
     args: &[Expr],
     arg_names: Option<&[Option<String>]>,
     star: bool,
@@ -661,11 +657,8 @@ pub(crate) fn resolve_make_timestamp(
             .enumerate()
             .filter(|(i, _)| arg_names.and_then(|ns| ns[*i].as_ref()).is_none())
             .count();
-        let names_timezone = arg_names.is_some_and(|ns| {
-            ns.iter()
-                .flatten()
-                .any(|n| n.eq_ignore_ascii_case("timezone"))
-        });
+        let names_timezone =
+            arg_names.is_some_and(|ns| ns.iter().flatten().any(|n| n == "timezone"));
         if positional > 6 || names_timezone {
             7
         } else {
@@ -740,7 +733,7 @@ pub(crate) fn f64_to_micros(secs: f64) -> Result<i64> {
 /// picked by the argument families; no match is 42883. spec/design/functions.md §9.
 pub(crate) fn resolve_scalar_func(
     scope: &Scope,
-    name: &str, // already lowercased
+    name: &str, // the exact (folded) name
     args: &[Expr],
     star: bool,
     agg: &mut AggCtx,
@@ -847,7 +840,7 @@ pub(crate) fn variadic_not_array() -> EngineError {
 /// the arguments.
 pub(crate) fn resolve_variadic_func(
     scope: &Scope,
-    name: &str, // already lowercased
+    name: &str, // the exact (folded) name
     args: &[Expr],
     star: bool,
     variadic: bool,
@@ -1028,7 +1021,7 @@ pub(crate) fn resolve_projections(
                 // relation and mixable with other items. Resolved against the LOCAL scope only
                 // (like bare `*`); an unknown label is 42P01, exactly as a qualified column ref.
                 if let Expr::QualifiedStar { qualifier } = &it.expr {
-                    let want = qualifier.to_ascii_lowercase();
+                    let want = qualifier.to_string();
                     let (table, slots): (&Table, Vec<usize>) =
                         match scope.rels.iter().find(|r| r.label == want) {
                             Some(rel) => (
@@ -1127,17 +1120,17 @@ pub(crate) fn output_name(scope: &Scope, e: &Expr) -> String {
             Ok(r) => scope.column_of(r).name.clone(),
             Err(_) => name.clone(),
         },
-        // An un-aliased aggregate call is named by its lowercased function name (PG;
+        // An un-aliased aggregate call is named by its exact function name (PG;
         // spec/design/grammar.md §8). A field selection takes the FIELD name (PG names the
         // output column after the selected field). Any other expression takes `?column?`.
-        Expr::FuncCall { name, .. } => name.to_ascii_lowercase(),
+        Expr::FuncCall { name, .. } => name.to_string(),
         // The fixed keyword lowercased (PG; grammar.md §51) — no expression printer needed.
         Expr::Coalesce(_) => "coalesce".to_string(),
         // The fixed keyword lowercased (PG; grammar.md §52).
         Expr::GreatestLeast { greatest, .. } => {
             if *greatest { "greatest" } else { "least" }.to_string()
         }
-        Expr::FieldAccess { field, .. } => field.to_ascii_lowercase(),
+        Expr::FieldAccess { field, .. } => field.to_string(),
         // A subscript takes the base array's name (PG names `a[1]` after `a`); a chained subscript
         // `a[1][2]` recurses to the same base name. A non-column base falls through to `?column?`.
         Expr::Subscript { base, .. } => output_name(scope, base),
@@ -1151,7 +1144,7 @@ pub(crate) fn output_name(scope: &Scope, e: &Expr) -> String {
 /// matching select-list item's **expression** (the caller routes it exactly like the same ordinal:
 /// a plain column stays on the slot fast path, a computed item is materialized), or `None` when no
 /// output name matches (the caller falls back to the FROM scope, the prior behavior). Matching is
-/// case-insensitive (§8). Only an explicit list is scanned — with `*` the output names are the scope
+/// byte-exact (§8). Only an explicit list is scanned — with `*` the output names are the scope
 /// columns, so the FROM-scope fallback already binds the same column. Two items of the same name
 /// with DIFFERENT expressions are ambiguous (`42702`); the same expression twice is not
 /// (`SELECT a, a … ORDER BY a`), matching PostgreSQL.
@@ -1169,7 +1162,7 @@ pub(crate) fn order_alias_match<'a>(
             Some(a) => a.clone(),
             None => output_name(scope, &it.expr),
         };
-        if !oname.eq_ignore_ascii_case(name) {
+        if oname != name {
             continue;
         }
         match found {
@@ -2187,9 +2180,9 @@ pub(crate) fn count_true(mask: &[bool]) -> usize {
 /// Map a `serial` pseudo-type name to its underlying integer scalar (spec/design/sequences.md §12) —
 /// `serial`/`serial4` → i32, `bigserial`/`serial8` → i64, `smallserial`/`serial2` → i16. `None` for
 /// any other name. Recognized **only** in a CREATE TABLE column-type position (the one caller); the
-/// match is case-insensitive (the parser passes the type name verbatim).
+/// match is byte-exact (the parser passes the folded / quoted name).
 pub(crate) fn serial_pseudo_type(name: &str) -> Option<ScalarType> {
-    match name.to_ascii_lowercase().as_str() {
+    match name.to_string().as_str() {
         "serial" | "serial4" => Some(ScalarType::Int32),
         "bigserial" | "serial8" => Some(ScalarType::Int64),
         "smallserial" | "serial2" => Some(ScalarType::Int16),
@@ -2527,9 +2520,7 @@ pub(crate) fn table_ref_calls(t: &TableRef) -> bool {
 pub(crate) fn expr_calls_seq_mutator(e: &Expr) -> bool {
     match e {
         Expr::FuncCall { name, args, .. } => {
-            name.eq_ignore_ascii_case("nextval")
-                || name.eq_ignore_ascii_case("setval")
-                || args.iter().any(expr_calls_seq_mutator)
+            name == "nextval" || name == "setval" || args.iter().any(expr_calls_seq_mutator)
         }
         Expr::Column(_)
         | Expr::QualifiedColumn { .. }
@@ -2733,7 +2724,7 @@ pub(crate) fn collect_query_privs(qe: &QueryExpr, req: &mut PrivReq, locals: &Ha
             let mut scope = locals.clone();
             for cte in &we.ctes {
                 collect_cte_body_privs(&cte.body, req, &scope);
-                scope.insert(cte.name.to_ascii_lowercase());
+                scope.insert(cte.name.to_string());
             }
             collect_query_privs(&we.body, req, &scope);
         }
@@ -2753,7 +2744,7 @@ pub(crate) fn collect_with_privs(wq: &WithQuery, req: &mut PrivReq, locals: &Has
     let mut scope = locals.clone();
     for cte in &wq.ctes {
         collect_cte_body_privs(&cte.body, req, &scope);
-        scope.insert(cte.name.to_ascii_lowercase());
+        scope.insert(cte.name.to_string());
     }
     collect_cte_body_privs(&wq.body, req, &scope);
 }
@@ -2808,7 +2799,7 @@ pub(crate) fn collect_table_ref_privs(t: &TableRef, req: &mut PrivReq, locals: &
         for e in rows.iter().flatten() {
             collect_expr_privs(e, req, locals);
         }
-    } else if !locals.contains(&t.name.to_ascii_lowercase()) {
+    } else if !locals.contains(&t.name.to_string()) {
         // A base-table reference (not a CTE / derived-table label) — needs SELECT.
         req.need_table(&t.name, Privilege::Select);
     }
@@ -3113,7 +3104,7 @@ pub(crate) fn resolve_column_ref(
 /// Resolve a composite field selection `base.field` (spec/design/composite.md §S4) given the
 /// already-resolved `base` node and its static type: `base` must be composite — else 42809
 /// (wrong_object_type, PG's "column notation applied to non-composite") — and `field` must name
-/// one of its fields case-insensitively (PG folds the identifier), else 42703 (undefined_column).
+/// one of its fields by exact name (PG folds the identifier), else 42703 (undefined_column).
 /// Returns the `RExpr::Field` node carrying the fixed field ordinal, plus the field's static type.
 pub(crate) fn resolve_field_of(
     base_node: RExpr,
@@ -3132,11 +3123,7 @@ pub(crate) fn resolve_field_of(
             ));
         }
     };
-    match c
-        .fields
-        .iter()
-        .position(|(n, _)| n.eq_ignore_ascii_case(field))
-    {
+    match c.fields.iter().position(|(n, _)| n == field) {
         Some(idx) => {
             let fty = c.fields[idx].1.clone();
             Ok((
@@ -3471,7 +3458,7 @@ pub(crate) fn resolve(
                         SqlState::FeatureNotSupported,
                         format!(
                             "OVER is not supported for hypothetical-set aggregate {}",
-                            name.to_ascii_lowercase()
+                            name
                         ),
                     ));
                 }
@@ -3494,14 +3481,11 @@ pub(crate) fn resolve(
                 if over.is_some() {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
-                        format!(
-                            "OVER is not supported for ordered-set aggregate {}",
-                            name.to_ascii_lowercase()
-                        ),
+                        format!("OVER is not supported for ordered-set aggregate {}", name),
                     ));
                 }
                 let Some(keys) = within_group.as_deref() else {
-                    return Err(no_agg_overload(&name.to_ascii_lowercase()));
+                    return Err(no_agg_overload(&name.to_string()));
                 };
                 return resolve_ordered_set_aggregate(
                     scope,
@@ -3517,13 +3501,13 @@ pub(crate) fn resolve(
             // WITHIN GROUP on a non-ordered-set function (an ordinary aggregate or a scalar function)
             // is 42883 — PG models it as a missing overload (`sum(numeric, numeric) does not exist`).
             if within_group.is_some() {
-                return Err(no_agg_overload(&name.to_ascii_lowercase()));
+                return Err(no_agg_overload(&name.to_string()));
             }
             // A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
             if let Some(wd) = over {
                 // GROUPING is not a window function — `GROUPING(a) OVER ()` is a syntax error in
                 // PostgreSQL (42601); match it rather than treating GROUPING as an unknown window fn.
-                if name.eq_ignore_ascii_case("grouping") {
+                if name == "grouping" {
                     return Err(EngineError::new(
                         SqlState::SyntaxError,
                         "OVER is not supported for GROUPING",
@@ -3564,10 +3548,7 @@ pub(crate) fn resolve(
             if is_window_only_name(name) {
                 return Err(EngineError::new(
                     SqlState::WrongObjectType,
-                    format!(
-                        "window function {} requires an OVER clause",
-                        name.to_ascii_lowercase()
-                    ),
+                    format!("window function {} requires an OVER clause", name),
                 ));
             }
             let names = arg_names.as_deref().map(Vec::as_slice);
@@ -5113,12 +5094,10 @@ pub(crate) fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
             name,
             within_group: Some(keys),
             ..
-        } if name.eq_ignore_ascii_case("mode") || name.eq_ignore_ascii_case("percentile_disc") => {
-            match keys.first() {
-                Some(k) => combine_deriv(Deriv::None, order_key_deriv(scope, k)?)?,
-                None => Deriv::None,
-            }
-        }
+        } if name == "mode" || name == "percentile_disc" => match keys.first() {
+            Some(k) => combine_deriv(Deriv::None, order_key_deriv(scope, k)?)?,
+            None => Deriv::None,
+        },
         // A scalar subquery: its output column's collation, recorded when `resolve` planned it.
         Expr::ScalarSubquery(q) => {
             let key: *const QueryExpr = q.as_ref();
@@ -5167,10 +5146,10 @@ pub(crate) fn order_key_deriv(scope: &Scope, key: &OrderKey) -> Result<Deriv> {
 fn agg_result_collatable(name: &str) -> bool {
     crate::operators::AGGREGATES
         .iter()
-        .any(|a| a.result == "same_as_input" && a.surface.eq_ignore_ascii_case(name))
+        .any(|a| a.result == "same_as_input" && surface_matches(a.surface, name))
         || crate::operators::WINDOWS
             .iter()
-            .any(|w| w.result == "same_as_input" && w.surface.eq_ignore_ascii_case(name))
+            .any(|w| w.result == "same_as_input" && surface_matches(w.surface, name))
 }
 
 /// Record a scalar subquery's output-column derivation on the scope it was resolved against
@@ -5227,7 +5206,7 @@ fn function_result_collatable(name: &str) -> bool {
     crate::operators::OPERATORS.iter().any(|o| {
         o.kind == "function"
             && (o.result == "text" || o.result == "text[]" || o.result == "anyarray")
-            && o.name.eq_ignore_ascii_case(name)
+            && o.name == name
     })
 }
 

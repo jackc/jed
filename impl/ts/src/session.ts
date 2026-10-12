@@ -73,9 +73,9 @@ export class SessionState {
   // no extensions were supplied — the built-in-only path.
   extensions: ExtensionRegistry | null;
   // SESSION currval state (sequences.md §6): the last value nextval/setval(…,true) produced IN THIS
-  // SESSION for each sequence (lowercased name). NOT in the snapshot, NOT persisted.
+  // SESSION for each sequence (exact name). NOT in the snapshot, NOT persisted.
   sessionSeq: Map<string, bigint>;
-  // SESSION lastval state (sequences.md §6): the lowercased name of the sequence the most recent
+  // SESSION lastval state (sequences.md §6): the exact name of the sequence the most recent
   // nextval ran on — null before the first nextval.
   sessionLastName: string | null;
   // Per-STATEMENT running sequence advances (sequences.md §4); flushed into the working snapshot on
@@ -879,7 +879,7 @@ export interface FileCoordinatorHost {
 }
 
 export type Attachment = {
-  name: string; // lowercased qualifier name (the registry key)
+  name: string; // exact qualifier name (the registry key)
   readOnly: boolean; // a read-only attachment rejects every write (DML + DDL) with 25006 (§4)
   storage: Engine; // the block store (file or in-memory) + pager + page accounting
   coordinator: FileCoordinatorHost | null;
@@ -912,8 +912,7 @@ export interface AttachmentCore {
 // implicit-scope name) counts as reserved for routing: it too keeps the temp-first funnels.
 export function isReservedScope(q: string | undefined): boolean {
   if (q === undefined) return true;
-  const l = q.toLowerCase();
-  return l === "main" || l === "temp";
+  return q === "main" || q === "temp";
 }
 
 // isAttachmentScope reports whether a database qualifier names a HOST-ATTACHED database (not undefined,

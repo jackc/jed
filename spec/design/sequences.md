@@ -93,7 +93,8 @@ SELECT lastval()               -- the value the most recent nextval returned thi
 A sequence is resident in the snapshot catalog beside `tables` and `types`:
 
 - A new `sequences` map on `Snapshot` (Rust `HashMap<String, SequenceDef>`, Go `map[string]*SequenceDef`,
-  TS `Map<string, SequenceDef>`), keyed by **lowercased name** — the same keying tables/types use.
+  TS `Map<string, SequenceDef>`), keyed by the **exact name** (byte-exact after identifier folding, [grammar.md §3](grammar.md)) — the
+  same keying tables/types use.
 - `SequenceDef = { name, increment, min_value, max_value, start, cache, cycle, last_value, is_called }`
   — all `i64` except `name`, `cycle`, and `is_called`. `last_value` + `is_called` are the **mutable
   counter state** (PG's sequence-tuple fields); the rest are immutable definition (PG's `pg_sequence`
@@ -114,7 +115,7 @@ third kind. The on-disk shape (full byte layout in [../fileformat/format.md](../
 
 - **`entry_kind = 2`** is a sequence entry. Emission order across the catalog is **composite-type
   entries (kind 1) first, then sequence entries (kind 2), then table entries (kind 0)**, each group in
-  ascending lowercased-name order; `item_count` per catalog page counts all entries, packed greedily
+  ascending name byte order; `item_count` per catalog page counts all entries, packed greedily
   exactly as before. Tables stay last because a column may reference a composite type by name at load;
   a sequence is referenced by **nothing** at load (a `DEFAULT nextval('s')` is stored expr-text,
   resolved at evaluation), so sequence entries need no two-pass and may sit anywhere ahead of the
@@ -154,7 +155,15 @@ normal overload path. Three things make them the first of their kind:
 
 - **Name → catalog object at evaluation time.** The argument is a `text` value naming a sequence. The
   evaluator (which already holds the executor/snapshot — the same access `now()` uses for the clock
-  seam) looks the name up in `Snapshot.sequences` (case-insensitively, the catalog keying). A missing
+  seam) first **parses the text as an identifier**, the way PostgreSQL parses a `regclass` string
+  ([grammar.md §3](grammar.md)): surrounding whitespace is ignored, a bare word folds to lowercase, a
+  double-quoted name is exact (`""` an embedded quote) — so `nextval('S')` advances `s` and
+  `nextval('"S"')` advances `S`. Malformed text (empty or all-whitespace, an unterminated quote,
+  internal whitespace in a bare word, trailing characters after the name) is `42602 invalid_name`
+  ("invalid name syntax", as PG). `'""'` parses to the empty name, which never exists (`42P01`, as PG).
+  A **dotted** name (`'a.b'`) is also `42602` — jed has no schemas and resolves no database-qualified
+  sequence name from text, where PG would look up schema `a` (a documented divergence, §10 decision 12).
+  The parsed name is then looked up in `Snapshot.sequences` byte-exactly (the catalog keying). A missing
   sequence is `42P01 undefined_table` (PG renders "relation \"s\" does not exist"). A **NULL** argument
   propagates NULL (the `null = "propagates"` discipline) — matching PG, where `nextval(NULL)` is NULL.
 - **`nextval`/`setval` mutate, so the statement is a WRITE.** A `SELECT nextval('s')` advances the
@@ -265,7 +274,7 @@ This makes the entire feature deterministic with no new seam: a sequence's value
 committed sequence value**. This is **per-handle transient state**, NOT part of the snapshot and NOT
 persisted:
 
-- Each `Database` handle carries a small `session_seq: map<lowercased-name → i64>` of the last value
+- Each `Database` handle carries a small `session_seq: map<name → i64>` (exact sequence name) of the last value
   this handle's `nextval`/`setval` produced for each sequence, plus a single `session_last: i64?` —
   the most-recent-overall value `nextval` returned (the `lastval` source).
 - `currval('s')` before any `nextval('s')`/`setval('s', …, true)` in this session is `55000
@@ -315,6 +324,7 @@ flat per-call weight is a sound bound.
 |---|---|
 | `CREATE SEQUENCE` name already a relation (no `IF NOT EXISTS`); `ALTER … RENAME TO` a name already a relation (incl. the same name, §15) | `42P07` duplicate_table |
 | `nextval`/`currval` on a missing sequence | `42P01` undefined_table |
+| `nextval`/`currval`/`setval` name text that is not a valid identifier (empty, unterminated quote, internal whitespace, trailing characters, or a dotted name — §4) | `42602` invalid_name |
 | `DROP SEQUENCE` of a missing sequence (no `IF EXISTS`) | `42P01` undefined_table |
 | `DROP SEQUENCE` of an `OWNED` (`serial`) sequence, RESTRICT (§12) | `2BP01` dependent_objects_still_exist |
 | `serial` column with an explicit `DEFAULT` (§12) | `42601` syntax_error |
@@ -368,6 +378,11 @@ are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle_ove
     … )` options is `42601` ("conflicting or redundant options" — the column type already fixes it).
     Identity columns are otherwise behaviorally PG-exact: ALWAYS/BY DEFAULT gating, `OVERRIDING`, the
     `42601` conflicts, the `22023` type gate, the owned-sequence auto-drop / `2BP01` (decision 10).
+12. **The name argument parses as an identifier; a dotted name is `42602`** (§4). The text form folds
+    a bare word and keeps a quoted name exact, exactly as PG's `regclass` input, with PG's `42602` for
+    malformed text. A dotted `'a.b'` is `42602` rather than PG's schema-qualified lookup: jed has no
+    schemas, and attached-database qualification is not resolved from text (a dotted name could only
+    ever be a schema reference in PG). Overriding reason: jed's surface (no schema namespace).
 
 ## 11. Delivery (sub-slices)
 
@@ -478,11 +493,14 @@ For each `serial` column `c` of table `t`, in column declaration order:
    would build, **plus** an `owned_by = (t, ordinal-of-c)` link (§3, persisted v14). The sequence
    itself is therefore bounded to the column's range (a too-large `nextval` traps `2200H`, matching
    PG). *(Before S5 the sequence was `bigint`-flavored and the column type alone bounded values.)*
-5. **The sequence name** is `lower(t)_lower(c)_seq`. If that name already names a relation
+5. **The sequence name** is `<t>_<c>_seq`, from the **exact** table and column names (no case change —
+   `CREATE TABLE "Tab" (id serial)` gives `Tab_id_seq`, as PostgreSQL). If that name already names a relation
    (table / index / sequence — the shared relation namespace, §2), including a sequence created by an
    *earlier* `serial` column of the **same** statement, the smallest integer suffix `1`, `2`, … is
    appended until free (`t_id_seq` taken → `t_id_seq1`), matching PG's `ChooseRelationName`.
-6. **The column `DEFAULT`** becomes the expression default `nextval ( '<seqname>' )` — stored as
+6. **The column `DEFAULT`** becomes the expression default `nextval ( '<seqname>' )`, the name written
+   bare when it matches `[a-z_][a-z0-9_]*` and otherwise double-quoted inside the literal (so it survives
+   §4's identifier parse — `nextval('"Tab_id_seq"')`, as PostgreSQL; [grammar.md §3](grammar.md)) — stored as
    expression text (the `format_version` 8 expression-default mechanism — [constraints.md §2](constraints.md)),
    evaluated per row at INSERT through the existing `nextval` write path (which advances the sequence
    and is transactional, §4/§5). Supplying an explicit value for the column at INSERT overrides the
@@ -754,13 +772,14 @@ crucially `last_value` and `is_called` — is preserved. Validation re-uses `CRE
 
 ### 15.3 `RENAME TO` and owned sequences
 
-`RENAME TO s2` checks the relation namespace: if `s2` (lowercased) already names a table / index /
+`RENAME TO s2` checks the relation namespace: if the name `s2` (byte-exact) already names a table / index /
 sequence — **including `s` itself** — it is `42P07` ("relation already exists"). Otherwise the entry
 moves to the new key with `name = s2`; the counter, options, and `owned_by` link are unchanged.
 
 The wrinkle jed's name-based `nextval` (§4) introduces over PG's OID reference: an **owned** sequence
 (§12) is named by its owning column's stored `DEFAULT nextval('s')` expression *text*. So on a rename of
-an owned sequence, jed **rewrites that column's default** to `nextval('s2')` (regenerating the
+an owned sequence, jed **rewrites that column's default** to `nextval('s2')` (the name quoted inside the literal when
+it is not `[a-z_][a-z0-9_]*`, as §12.2 step 6; regenerating the
 `expr_text` + re-parsing, exactly as `serial` synthesized it) in the same statement. After the rename a
 subsequent `INSERT` advances the renamed sequence — matching PG's observable behavior. The `owned_by`
 pair (`table`, column-ordinal) is untouched, so `DROP TABLE` auto-drop (§12.3) and the `2BP01` on a

@@ -47,13 +47,14 @@ SELECT start_value, min_value, max_value, increment_by FROM jed_sequences WHERE 
 
 # --- every option renders as declared; AS sets the bounds (the type itself is not persisted) ------
 
+# a bare name folds: the sequence is `opts`
 statement ok
 CREATE SEQUENCE Opts AS smallint START WITH 5 MINVALUE 3 CACHE 10 CYCLE
 
 query TIIIIBI nosort
-SELECT name, start_value, min_value, max_value, increment_by, cycle, cache_size FROM jed_sequences WHERE name = 'Opts'
+SELECT name, start_value, min_value, max_value, increment_by, cycle, cache_size FROM jed_sequences WHERE name = 'opts'
 ----
-Opts
+opts
 5
 3
 32767
@@ -122,8 +123,9 @@ NULL
 
 # --- the OWNED BY link: serial and IDENTITY columns own their sequence ---------------------------
 
+# a quoted table name is exact, and its owned sequence's name derives from the exact name
 statement ok
-CREATE TABLE Orders (id serial PRIMARY KEY, n i32)
+CREATE TABLE "Orders" (id serial PRIMARY KEY, n i32)
 
 statement ok
 CREATE TABLE items (sku i64 GENERATED ALWAYS AS IDENTITY PRIMARY KEY, label text)
@@ -135,25 +137,25 @@ CREATE TABLE notes (id i64 DEFAULT nextval('down') PRIMARY KEY)
 query TTT nosort
 SELECT name, owned_by_table, owned_by_column FROM jed_sequences ORDER BY name
 ----
-Opts
-NULL
-NULL
+Orders_id_seq
+Orders
+id
 down
 NULL
 NULL
 items_sku_seq
 items
 sku
-orders_id_seq
-Orders
-id
+opts
+NULL
+NULL
 s
 NULL
 NULL
 
 # the owning serial i32 column's sequence carries the i32 bounds
 query II nosort
-SELECT min_value, max_value FROM jed_sequences WHERE name = 'orders_id_seq'
+SELECT min_value, max_value FROM jed_sequences WHERE name = 'Orders_id_seq'
 ----
 1
 2147483647
@@ -169,15 +171,15 @@ ALTER TABLE items RENAME TO products
 query TTT nosort
 SELECT name, owned_by_table, owned_by_column FROM jed_sequences WHERE owned_by_table IS NOT NULL ORDER BY name
 ----
+Orders_id_seq
+Orders
+id
 items_sku_seq
 products
 item_id
-orders_id_seq
-Orders
-id
 
 statement ok
-ALTER SEQUENCE orders_id_seq RENAME TO order_ids
+ALTER SEQUENCE "Orders_id_seq" RENAME TO order_ids
 
 query TT nosort
 SELECT name, owned_by_table FROM jed_sequences WHERE owned_by_table = 'Orders'
@@ -212,7 +214,7 @@ down
 order_ids
 s
 
-# --- resolution: case-insensitive, alias renames the relation, qualifier scoping -----------------
+# --- resolution: a bare name folds, alias renames the relation, qualifier scoping ----------------
 
 query T nosort
 SELECT name FROM JED_Sequences ORDER BY name

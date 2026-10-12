@@ -6,15 +6,16 @@
 #
 # The check sits in the LEXER, at the identifier-token producer, so it bounds EVERY identifier on
 # EVERY parse path (table, column, type, alias, function name, table reference) and fires during
-# tokenization, BEFORE the parser dispatches on the statement kind. Identifiers are ASCII-only
-# (grammar.md §3), so 63 bytes = 63 characters. 63 matches PostgreSQL's NAMEDATALEN-1 boundary, but
+# tokenization, BEFORE the parser dispatches on the statement kind. A bare identifier is ASCII-only
+# (grammar.md §3), so 63 bytes = 63 characters; a QUOTED identifier is measured on its decoded
+# name's UTF-8 bytes (delimiters excluded, `""` counted as one `"`). 63 matches PostgreSQL's NAMEDATALEN-1 boundary, but
 # jed ERRORS where PG silently truncates (jed has no notices, and a silent truncation could collide
 # two distinct names — a documented divergence, CLAUDE.md §1). The limit is a fixed, cross-core
 # identical constant (CLAUDE.md §8): the 64-character names below are rejected, and the 63-character
 # names accepted, in Rust / Go / TS alike.
 #
 # jed-SPECIFIC (PG truncates rather than erroring), so the 42622 records are NOT oracle-checked.
-# requires: ddl.create_table, ddl.primary_key, query.select, types.i32, resource.identifier_length_limit
+# requires: ddl.create_table, ddl.primary_key, query.select, types.i32, resource.identifier_length_limit, query.quoted_identifiers
 
 # === Boundary: 63 bytes is the highest ACCEPTED identifier length. ===
 
@@ -49,3 +50,24 @@ SELECT 1 AS zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
 # (name_too_long), not 42883 (undefined_function) — the length gate is the outermost check.
 statement error 42622
 SELECT zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz(1)
+
+# === Quoted identifiers are bounded the same way, on the DECODED name's UTF-8 bytes. ===
+
+# 63 bytes quoted (mixed case kept) is accepted; 64 is not.
+statement ok
+CREATE TABLE "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ" (id i32 PRIMARY KEY)
+
+statement error 42622
+CREATE TABLE "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ" (id i32 PRIMARY KEY)
+
+# multi-byte: 31 × "é" (2 bytes each) + "a" = 63 bytes accepted; 32 × "é" = 64 bytes rejected,
+# although it is only 32 characters
+statement ok
+CREATE TABLE tq (id i32 PRIMARY KEY, "éééééééééééééééééééééééééééééééa" i32)
+
+statement error 42622
+SELECT 1 AS "éééééééééééééééééééééééééééééééé"
+
+# the delimiters are not counted and a doubled `""` counts as one byte: 61 + 1 = 62 bytes
+statement ok
+CREATE TABLE tq2 (id i32 PRIMARY KEY, "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ""" i32)

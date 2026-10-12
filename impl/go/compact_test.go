@@ -189,7 +189,7 @@ func TestInMemoryCompactionLowersStorageBytes(t *testing.T) {
 	}
 	rows, cost := rowsAndCost(t, db, compactProbe)
 	version := db.Version()
-	if err := db.Compact("MAIN"); err != nil {
+	if err := db.Compact("main"); err != nil {
 		t.Fatal(err)
 	}
 	after, err := db.StorageBytes("main")
@@ -331,7 +331,7 @@ func TestAttachmentsCompactIndependently(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := info.Size()
-	if err := db.Compact("Work"); err != nil {
+	if err := db.Compact("work"); err != nil {
 		t.Fatalf("compact work: %v", err)
 	}
 	if err := db.Compact("scratch"); err != nil {

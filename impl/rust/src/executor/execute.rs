@@ -12,7 +12,7 @@ impl Engine {
     /// into the working snapshot + `session_seq` on statement success ([`flush_pending_sequences`]).
     /// A missing sequence is 42P01; advancing past a bound without CYCLE is 2200H.
     pub(crate) fn seq_nextval(&self, name: &str) -> Result<i64> {
-        let key = name.to_ascii_lowercase();
+        let key = name.to_string();
         let mut pending = self.session.pending_seq.borrow_mut();
         let mut def = match pending.get(&key) {
             Some(d) => d.clone(),
@@ -75,7 +75,7 @@ impl Engine {
     /// when `is_called` is true the value also defines this session's `currval` (PG: `is_called =
     /// false` leaves `currval` untouched). `setval` never updates `lastval` (PG — §6).
     pub(crate) fn seq_setval(&self, name: &str, n: i64, is_called: bool) -> Result<i64> {
-        let key = name.to_ascii_lowercase();
+        let key = name.to_string();
         let mut pending = self.session.pending_seq.borrow_mut();
         let mut def = match pending.get(&key) {
             Some(d) => d.clone(),
@@ -152,7 +152,7 @@ impl Engine {
                 format!("relation does not exist: {name}"),
             ));
         }
-        let key = name.to_ascii_lowercase();
+        let key = name.to_string();
         if let Some(v) = self.session.pending_currval.borrow().get(&key) {
             return Ok(*v);
         }
@@ -476,7 +476,7 @@ impl Engine {
         self.path.as_deref()
     }
 
-    /// Look up a table definition by name (case-insensitive). SessionState-local temp tables resolve
+    /// Look up a table definition by exact name. SessionState-local temp tables resolve
     /// FIRST (spec/design/temp-tables.md §3); preclude-overlaps guarantees a name is temp XOR
     /// persistent, so this is just "where the table lives", not a precedence contest. Falls through
     /// to the currently-visible main snapshot (the open transaction's working set, else committed).
@@ -489,14 +489,14 @@ impl Engine {
         self.read_snap().table(name)
     }
 
-    /// Look up a composite type definition by name (case-insensitive) in the currently-visible
+    /// Look up a composite type definition by exact name in the currently-visible
     /// snapshot (spec/design/composite.md).
     pub fn composite_type(&self, name: &str) -> Option<&CompositeType> {
         self.read_snap().composite_type(name)
     }
 
     /// The canonical name of every table in the currently-visible snapshot, sorted ascending
-    /// by lowercased name (the catalog's standing order — no map-iteration order may leak,
+    /// by exact name (the catalog's standing order — no map-iteration order may leak,
     /// CLAUDE.md §8). Secondary indexes are not tables and are excluded (api.md §6).
     pub fn table_names(&self) -> Vec<String> {
         self.read_snap().table_names()
@@ -1162,7 +1162,7 @@ impl Engine {
                 || matches!(stmt, Statement::DropIndex(di) if self.is_temp_index(&di.name))
                 || matches!(stmt, Statement::DropSequence(ds) if ds.names.iter().any(|n| self.is_temp_sequence(n)))
                 || matches!(stmt, Statement::AlterTable(at) if match at.db.as_deref() {
-                    Some(q) => q.eq_ignore_ascii_case("temp"),
+                    Some(q) => q == "temp",
                     None => self.is_temp_table(&at.name),
                 })
                 || matches!(stmt, Statement::AlterSequence(als) if self.is_temp_sequence(&als.name))
@@ -1180,7 +1180,7 @@ impl Engine {
         }
         let snap = self.read_snap();
         for (name, priv_) in &req.tables {
-            let key = name.to_ascii_lowercase();
+            let key = name.to_string();
             // Only a name that resolves to an existing catalog table is privilege-checked; a missing
             // one is left to raise 42P01 in execution (existence before authorization). A built-in
             // catalog relation (jed_tables / jed_columns) is gated exactly like a user table —
@@ -1196,7 +1196,7 @@ impl Engine {
             }
         }
         for name in &req.functions {
-            let key = name.to_ascii_lowercase();
+            let key = name.to_string();
             if !self.session.privileges.allows_function(&key) {
                 return Err(EngineError::new(
                     SqlState::InsufficientPrivilege,
@@ -1243,7 +1243,7 @@ impl Engine {
             let Some(col) = table
                 .columns
                 .iter()
-                .find(|col| col.name.eq_ignore_ascii_case(&assignment.column))
+                .find(|col| col.name == assignment.column)
             else {
                 continue;
             };

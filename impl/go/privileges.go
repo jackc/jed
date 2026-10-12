@@ -75,7 +75,7 @@ func (s PrivilegeSet) Minus(other PrivilegeSet) PrivilegeSet { return s &^ other
 func (s PrivilegeSet) IsEmpty() bool { return s == 0 }
 
 // Privileges is the session's authorization envelope (spec/design/session.md §5.3): the default
-// table-privilege set plus per-object grant / revoke deltas. Object names are keyed lowercased
+// table-privilege set plus per-object grant / revoke deltas. Object names are keyed exactly
 // (matched against the canonical catalog name). The zero value is unusable — build with
 // newPrivileges (fully permissive: every table privilege, every function).
 type Privileges struct {
@@ -104,7 +104,7 @@ func (pv *Privileges) Grant(privs PrivilegeSet, object string) {
 	if pv.grant == nil {
 		pv.grant = map[string]PrivilegeSet{}
 	}
-	key := strings.ToLower(object)
+	key := object
 	pv.grant[key] = pv.grant[key].Union(privs)
 }
 
@@ -113,22 +113,22 @@ func (pv *Privileges) Revoke(privs PrivilegeSet, object string) {
 	if pv.revoke == nil {
 		pv.revoke = map[string]PrivilegeSet{}
 	}
-	key := strings.ToLower(object)
+	key := object
 	pv.revoke[key] = pv.revoke[key].Union(privs)
 }
 
-// effective is the effective privilege set for object name (already lowercased) over a base default.
+// effective is the effective privilege set for object name (the exact name) over a base default.
 func (pv *Privileges) effective(name string, base PrivilegeSet) PrivilegeSet {
 	return base.Union(pv.grant[name]).Minus(pv.revoke[name])
 }
 
-// AllowsTable reports whether table name (lowercased) holds privilege p.
+// AllowsTable reports whether table name (exact) holds privilege p.
 func (pv *Privileges) AllowsTable(name string, p Privilege) bool {
-	return pv.effective(strings.ToLower(name), pv.defaultTable).Contains(p)
+	return pv.effective(name, pv.defaultTable).Contains(p)
 }
 
-// AllowsFunction reports whether function name (lowercased) holds EXECUTE (functions default to
+// AllowsFunction reports whether function name (exact) holds EXECUTE (functions default to
 // EXECUTE granted on all).
 func (pv *Privileges) AllowsFunction(name string) bool {
-	return pv.effective(strings.ToLower(name), PrivSetExecute).Contains(PrivExecute)
+	return pv.effective(name, PrivSetExecute).Contains(PrivExecute)
 }

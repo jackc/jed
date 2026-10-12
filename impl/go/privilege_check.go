@@ -2,7 +2,6 @@ package jed
 
 import (
 	"fmt"
-	"strings"
 )
 
 // Per-statement admission checks: privilege enforcement, budgets, and lane gating (session.md,
@@ -158,7 +157,7 @@ func tableRefCallsSeqMutator(t *tableRef) bool {
 func exprCallsSeqMutator(e *exprNode) bool {
 	switch e.Kind {
 	case exprFuncCall:
-		if strings.EqualFold(e.FuncCall.Name, "nextval") || strings.EqualFold(e.FuncCall.Name, "setval") {
+		if e.FuncCall.Name == "nextval" || e.FuncCall.Name == "setval" {
 			return true
 		}
 		for _, a := range e.FuncCall.Args {
@@ -431,7 +430,7 @@ func (db *engine) checkPrivileges(stmt statement) error {
 	}
 	snap := db.readSnap()
 	for _, t := range req.tables {
-		key := strings.ToLower(t.name)
+		key := t.name
 		// Only a name that resolves to an existing catalog table is privilege-checked; a missing one is
 		// left to raise 42P01 in execution (existence before authorization). A built-in catalog relation
 		// (jed_tables / jed_columns) is gated exactly like a user table — per-table SELECT on its own
@@ -446,7 +445,7 @@ func (db *engine) checkPrivileges(stmt statement) error {
 		}
 	}
 	for _, fn := range req.functions {
-		key := strings.ToLower(fn)
+		key := fn
 		if !db.session.privileges.AllowsFunction(key) {
 			return newError(InsufficientPrivilege, "permission denied for function "+key)
 		}
@@ -492,7 +491,7 @@ func (db *engine) collectOneUpdateDefaultPrivs(upd *update, req *privReq) {
 		}
 		for ci := range table.Columns {
 			col := &table.Columns[ci]
-			if strings.EqualFold(col.Name, a.Column) && col.DefaultExpr != nil {
+			if col.Name == a.Column && col.DefaultExpr != nil {
 				collectExprPrivs(&col.DefaultExpr.Expr, req, locals)
 				break
 			}
@@ -505,7 +504,7 @@ func (db *engine) collectOneUpdateDefaultPrivs(upd *update, req *privReq) {
 // even when a same-named temp table exists. A bare name follows the normal temp-first resolution.
 func (db *engine) alterTableTargetsTemp(at *alterTable) bool {
 	if at.DB != nil {
-		return strings.EqualFold(*at.DB, "temp")
+		return *at.DB == "temp"
 	}
 	return db.isTempTable(at.Name)
 }
@@ -676,7 +675,7 @@ func collectQueryPrivs(qe *queryExpr, req *privReq, locals map[string]bool) {
 		}
 		for i := range qe.With.Ctes {
 			collectCteBodyPrivs(&qe.With.Ctes[i].Body, req, scope)
-			scope[strings.ToLower(qe.With.Ctes[i].Name)] = true
+			scope[qe.With.Ctes[i].Name] = true
 		}
 		collectQueryPrivs(qe.With.Body, req, scope)
 	}
@@ -698,7 +697,7 @@ func collectWithPrivs(wq *withQuery, req *privReq, locals map[string]bool) {
 	}
 	for i := range wq.Ctes {
 		collectCteBodyPrivs(&wq.Ctes[i].Body, req, scope)
-		scope[strings.ToLower(wq.Ctes[i].Name)] = true
+		scope[wq.Ctes[i].Name] = true
 	}
 	collectCteBodyPrivs(&wq.Body, req, scope)
 }
@@ -763,7 +762,7 @@ func collectTableRefPrivs(t *tableRef, req *privReq, locals map[string]bool) {
 		}
 	default:
 		// A base-table reference (not a CTE / derived-table label) — needs SELECT.
-		if !locals[strings.ToLower(t.Name)] {
+		if !locals[t.Name] {
 			req.needTable(t.Name, PrivSelect)
 		}
 	}

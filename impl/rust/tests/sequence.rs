@@ -395,3 +395,55 @@ fn serial_is_not_a_castable_type() {
     // 42704 undefined_object (serial is not a real type outside CREATE TABLE).
     assert_eq!(err_code(&mut db, "SELECT 1::serial"), "42704");
 }
+
+/// The regclass-style name text (grammar.md §3): a dotted name is `42602` — jed has no schemas and
+/// does not resolve a qualified name from text, where PostgreSQL would look up schema `a` (a
+/// documented divergence, so it cannot live in the PG-clean corpus).
+#[test]
+fn dotted_sequence_name_text_is_invalid_name() {
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    db.query_outcome("CREATE SEQUENCE b", &[]).unwrap();
+    for sql in [
+        "SELECT nextval('a.b')",
+        "SELECT nextval('main.b')",
+        "SELECT currval('a.b')",
+        "SELECT setval('a.b', 5)",
+    ] {
+        assert_eq!(err_code(&mut db, sql), "42602", "{sql}");
+    }
+}
+
+/// A serial column's generated DEFAULT renders the owned sequence's name by the quoting rule
+/// (grammar.md §3): bare when a plain lowercase identifier, else double-quoted inside the string —
+/// and a sequence RENAME rewrites it the same way.
+#[test]
+fn serial_default_text_quotes_the_sequence_name() {
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    let default_text = |db: &Session, table: &str| -> String {
+        db.table(table).unwrap().columns[0]
+            .default_expr
+            .as_ref()
+            .unwrap()
+            .expr_text
+            .clone()
+    };
+    db.query_outcome("CREATE TABLE plain (id serial PRIMARY KEY)", &[])
+        .unwrap();
+    assert_eq!(default_text(&db, "plain"), "nextval ( 'plain_id_seq' )");
+    db.query_outcome("CREATE TABLE \"Tab\" (id serial PRIMARY KEY)", &[])
+        .unwrap();
+    assert_eq!(default_text(&db, "Tab"), "nextval ( '\"Tab_id_seq\"' )");
+    db.query_outcome("ALTER SEQUENCE \"Tab_id_seq\" RENAME TO tab_ids", &[])
+        .unwrap();
+    assert_eq!(default_text(&db, "Tab"), "nextval ( 'tab_ids' )");
+    db.query_outcome("ALTER SEQUENCE plain_id_seq RENAME TO \"It's\"", &[])
+        .unwrap();
+    assert_eq!(default_text(&db, "plain"), "nextval ( '\"It''s\"' )");
+    db.query_outcome("INSERT INTO plain DEFAULT VALUES", &[])
+        .unwrap();
+    assert_eq!(one_int(&mut db, "SELECT id FROM plain"), Some(1));
+}

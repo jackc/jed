@@ -55,7 +55,6 @@ import (
 	"math"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -75,7 +74,7 @@ var afterPersistHook func()
 type roots struct {
 	committed *snapshot // the committed FILE snapshot (the `main` database)
 	// attached is the published committed root of every host-attached DATABASE-scoped in-memory
-	// database (spec/design/attached-databases.md §5), keyed by lowercased attachment name. A reader
+	// database (spec/design/attached-databases.md §5), keyed by exact attachment name. A reader
 	// pins the whole roots in one lock-free Load, so it sees a CONSISTENT cross-database snapshot
 	// (main + every attachment together). nil/empty when nothing is attached — the common case, and
 	// byte-for-byte the pre-attachment behavior. Session-local `temp` is NOT here: it is
@@ -85,7 +84,7 @@ type roots struct {
 	attached map[string]*snapshot
 }
 
-// attachSnapshots returns the attached root for name (lowercased), or nil. A tiny helper so the
+// attachSnapshots returns the attached root for name (exact), or nil. A tiny helper so the
 // resolution funnels stay readable; a nil map (nothing attached) yields nil.
 func (r *roots) attachSnapshot(name string) *snapshot {
 	if r.attached == nil {
@@ -115,7 +114,7 @@ type sharedCore struct {
 	// (sharedPaging).
 	storage *storage
 	// attachments is the registry of host-attached DATABASE-scoped databases (attached-databases.md
-	// §2/§5), keyed by lowercased name. Each attachment's MUTABLE storage identity (block store + pager
+	// §2/§5), keyed by exact name. Each attachment's MUTABLE storage identity (block store + pager
 	// + page accounting) lives here; its immutable published root lives in roots.attached under the same
 	// key. Populated by Database.Attach / cleared by Database.Detach (host-API, §4), both under the
 	// writer gate. nil/empty when nothing is attached — the common case, byte-for-byte the
@@ -487,7 +486,7 @@ const (
 // committed via stageInMemory). The storage kind is the sole source of the file/memory distinction — no
 // separate flag.
 type attachment struct {
-	name        string           // lowercased qualifier name (the map key)
+	name        string           // exact qualifier name (the map key)
 	mode        attachMode       // readWrite | readOnly (§4)
 	storage     *storage         // the block store (file or in-memory) + pager + page accounting
 	coordinator *fileCoordinator // independent file lock domain; nil for memory/locking=none
@@ -1292,10 +1291,10 @@ func (c *sharedCore) attachmentBudget(name string, stagesRows bool) *budgetCtx {
 	return &budgetCtx{name: name, prev: prev, canCompact: c.canCompactCommitted(), stagesRows: stagesRows}
 }
 
-// withStorage resolves the storage of database name (`main` or an attachment, case-insensitive;
+// withStorage resolves the storage of database name (`main` or an attachment, exact name;
 // 42704 otherwise — the session-local temp domain is not an attachment).
 func (c *sharedCore) withStorage(name string) (*storage, error) {
-	lname := strings.ToLower(name)
+	lname := name
 	if lname == "main" {
 		return c.storage, nil
 	}
@@ -1643,11 +1642,11 @@ func (db *Database) StorageBytes(name string) (int64, error) {
 // database on disk, Slice 2 — its committed state becomes the attachment's initial root, its own page
 // size honored). `readOnly` attaches it read-only: every write to it (DML or DDL) is 25006, it never
 // competes for the one-durable-writer slot (§5), and a file source is additionally opened O_RDONLY
-// (defense in depth). The name is case-folded; it must not name a reserved database (`main` / `temp`)
+// (defense in depth). The name is exact; it must not name a reserved database (`main` / `temp`)
 // or one already attached (42710). Opening a file surfaces the same host/file codes as opening `main`
 // (58P01/58P02/XX001/…, hosts.md §4). Publishing the new attachment root is atomic under the writer gate.
 func (db *Database) Attach(name string, source AttachSource, readOnly bool) error {
-	lname := strings.ToLower(name)
+	lname := name
 	if lname == "" {
 		return newError(DuplicateObject, "attachment name must not be empty")
 	}
@@ -1759,7 +1758,7 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 // On success the attachment's root is dropped from the published roots and its storage released, under
 // the writer gate.
 func (db *Database) Detach(name string) error {
-	lname := strings.ToLower(name)
+	lname := name
 	c := db.core
 	if err := c.acquireWriter(0); err != nil {
 		return err
@@ -1802,7 +1801,7 @@ func (db *Database) Detach(name string) error {
 	return err
 }
 
-// Compact compacts database name — `main` or an attachment, case-insensitive — returning its dead
+// Compact compacts database name — `main` or an attachment, exact name — returning its dead
 // space (spec/design/api.md §2.6): it rewrites the database as the garbage-free from-scratch image of
 // its committed snapshot at the next version and swaps the storage atomically (a file through temp
 // file + rename, an in-memory database by replacing its byte store). Rows, catalog, and later results
@@ -1811,7 +1810,7 @@ func (db *Database) Detach(name string) error {
 // has the file open. A host-API act — not metered and not reachable from SQL.
 func (db *Database) Compact(name string) error {
 	c := db.core
-	lname := strings.ToLower(name)
+	lname := name
 	var readOnly bool
 	if lname == "main" {
 		readOnly = c.readOnlyMode()
@@ -1906,7 +1905,7 @@ func (s *Database) committedEngine() *engine {
 	}
 }
 
-// Table is the definition of persistent table name (case-insensitive) in the latest committed
+// Table is the definition of persistent table name (exact name) in the latest committed
 // snapshot. The *catTable is the doc-hidden introspection type, not the embedding API — hosts
 // introspect through SQL (the jed_ catalog relations, introspection.md); white-box tests reach the
 // detail through it.
@@ -2626,7 +2625,7 @@ func (s *Session) InTransaction() bool { return s.engine.session.tx != nil }
 // committed); file-storage reads go through the shared core (the authoritative state, reflecting every
 // committed write). The *catTable / *compositeType returns are the doc-hidden introspection types. ---
 
-// Table is the definition of table name (case-insensitive) as this session sees it, or false.
+// Table is the definition of table name (exact name) as this session sees it, or false.
 func (s *Session) Table(name string) (*catTable, bool) { return s.engine.Table(name) }
 
 // CompositeType is the definition of composite type name as this session sees it, or nil.

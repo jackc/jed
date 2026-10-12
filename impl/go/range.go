@@ -12,10 +12,10 @@ import (
 // that produce a CANONICAL stored value (§4). The type-set facts come from the codegen'd Ranges
 // table (ranges_gen.go). The value model is RangeVal; bounds are element Values.
 
-// rangeByName looks up a range type by name (case-insensitive), matching the canonical id or any
+// rangeByName looks up a range type by name (exact name), matching the canonical id or any
 // alias (int4range → i32range). The second result is false if name is not one of the six ranges.
 func rangeByName(name string) (rangeDesc, bool) {
-	lname := strings.ToLower(name)
+	lname := name
 	for _, r := range ranges {
 		if r.ID == lname {
 			return r, true

@@ -312,10 +312,9 @@ func lex(sql string) ([]token, error) {
 			}
 			tokens = append(tokens, token{Kind: tokStr, Word: string(sb)})
 		case c == '"':
-			// Double-quoted identifier (collation names, spec/design/collation.md §1). `""` is an
-			// embedded double quote; the content is kept VERBATIM (case-sensitive). `"` is ASCII, so
-			// copying raw bytes between quotes preserves UTF-8 validity. The parser rejects an empty
-			// name; an empty `""` lexes fine here.
+			// Double-quoted identifier (spec/design/grammar.md §3): the name VERBATIM (case-sensitive,
+			// any UTF-8), `""` an embedded double quote. `"` is ASCII, so copying raw bytes between
+			// quotes preserves UTF-8 validity.
 			i++ // consume the opening quote
 			var sb []byte
 			closed := false
@@ -335,6 +334,16 @@ func lex(sql string) ([]token, error) {
 			}
 			if !closed {
 				return nil, newError(SyntaxError, "unterminated quoted identifier")
+			}
+			// A zero-length delimited identifier is a syntax error (PostgreSQL's rule,
+			// spec/design/grammar.md §3).
+			if len(sb) == 0 {
+				return nil, newError(SyntaxError, "zero-length delimited identifier")
+			}
+			// The identifier-length gate applies to a quoted name too, measured on its decoded
+			// UTF-8 bytes (spec/design/cost.md §7).
+			if len(sb) > maxIdentifierLength {
+				return nil, newError(NameTooLong, fmt.Sprintf("identifier exceeds the maximum length of %d bytes", maxIdentifierLength))
 			}
 			tokens = append(tokens, token{Kind: tokQuotedIdent, Word: string(sb)})
 		case isDigit(c):
@@ -437,7 +446,10 @@ func lex(sql string) ([]token, error) {
 			if i-start > maxIdentifierLength {
 				return nil, newError(NameTooLong, fmt.Sprintf("identifier exceeds the maximum length of %d bytes", maxIdentifierLength))
 			}
-			tokens = append(tokens, token{Kind: tokWord, Word: sql[start:i]})
+			// A bare word folds to lowercase (ASCII) here, so every later comparison of a name is
+			// byte-exact and keyword matching is case-insensitive by construction
+			// (spec/design/grammar.md §3).
+			tokens = append(tokens, token{Kind: tokWord, Word: asciiLower(sql[start:i])})
 		default:
 			return nil, newError(SyntaxError, fmt.Sprintf("unexpected character '%c'", c))
 		}
@@ -445,4 +457,21 @@ func lex(sql string) ([]token, error) {
 
 	tokens = append(tokens, token{Kind: tokEof})
 	return tokens, nil
+}
+
+// asciiLower folds ASCII A-Z to a-z and leaves every other byte unchanged — the bare-identifier
+// fold (spec/design/grammar.md §3). Returns s itself when it has no uppercase byte.
+func asciiLower(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			b := []byte(s)
+			for j := i; j < len(b); j++ {
+				if b[j] >= 'A' && b[j] <= 'Z' {
+					b[j] += 'a' - 'A'
+				}
+			}
+			return string(b)
+		}
+	}
+	return s
 }

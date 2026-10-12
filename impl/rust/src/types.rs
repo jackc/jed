@@ -91,7 +91,7 @@ impl ScalarType {
         }
     }
 
-    /// Resolve a type name (canonical or alias) to a type, case-insensitively.
+    /// Resolve a type name (canonical or alias) to a type, by exact (folded) name (grammar.md §3).
     /// Returns None for an unknown name. Canonical names state width in bits under the
     /// `i`/`f` prefix (i16/i32/i64, f32/f64 — the Rust/Zig convention). Accepted aliases:
     /// the SQL-standard words (smallint/int/integer/bigint, real/double precision/float)
@@ -102,7 +102,7 @@ impl ScalarType {
     /// §1/§4). The two-word `character varying` alias is recognized here, though this slice's
     /// parser only produces single-word type names (a documented narrowing — types.md §11).
     pub fn from_name(name: &str) -> Option<ScalarType> {
-        match name.to_ascii_lowercase().as_str() {
+        match name.to_string().as_str() {
             "i16" | "smallint" | "int2" => Some(ScalarType::Int16),
             "i32" | "int" | "integer" | "int4" => Some(ScalarType::Int32),
             "i64" | "bigint" | "int8" => Some(ScalarType::Int64),
@@ -416,7 +416,7 @@ pub struct DecimalTypmod {
 /// **composite** (row) type (spec/design/composite.md). This is the *open* wrapper above the
 /// closed `ScalarType` enum (CLAUDE.md §4): the scalar set stays a fixed compiled-in enum, but a
 /// column type can now also name a composite living in the database's type catalog. Referenced by
-/// name (case-insensitively, like a table) — the resolved field list lives once in the catalog
+/// name (byte-exactly, like a table) — the resolved field list lives once in the catalog
 /// (S2+), not inline here. Not `Copy` (it carries a name); scalar-only paths call `scalar()`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Type {

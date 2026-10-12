@@ -104,7 +104,7 @@ impl PrivilegeSet {
 }
 
 /// The session's authorization envelope (spec/design/session.md §5.3): the default table-privilege
-/// set plus per-object grant / revoke deltas. Object names are keyed **lowercased** (matched against
+/// set plus per-object grant / revoke deltas. Object names are keyed **exactly** (grammar.md §3) (matched against
 /// the canonical catalog name). A fresh envelope is fully permissive (every table privilege, every
 /// function), so a default session behaves as before the privilege model landed.
 #[derive(Clone, Debug)]
@@ -112,9 +112,9 @@ pub struct Privileges {
     /// The table-privilege set granted to **every** table (the "all tables" default). A read-only
     /// session is `{SELECT}`. Default: all four.
     default_table: PrivilegeSet,
-    /// Per-object additions beyond the default (the whitelist), keyed by lowercased object name.
+    /// Per-object additions beyond the default (the whitelist), keyed by exact object name.
     grant: HashMap<String, PrivilegeSet>,
-    /// Per-object removals (the blacklist), keyed by lowercased object name. Revoke wins over grant.
+    /// Per-object removals (the blacklist), keyed by exact object name. Revoke wins over grant.
     revoke: HashMap<String, PrivilegeSet>,
 }
 
@@ -145,29 +145,29 @@ impl Privileges {
 
     /// Add `privs` to `object`'s grant delta (beyond the default).
     pub fn grant(&mut self, privs: PrivilegeSet, object: &str) {
-        let e = self.grant.entry(object.to_ascii_lowercase()).or_default();
+        let e = self.grant.entry(object.to_string()).or_default();
         *e = e.union(privs);
     }
 
     /// Add `privs` to `object`'s revoke delta (revoke wins over grant and the default).
     pub fn revoke(&mut self, privs: PrivilegeSet, object: &str) {
-        let e = self.revoke.entry(object.to_ascii_lowercase()).or_default();
+        let e = self.revoke.entry(object.to_string()).or_default();
         *e = e.union(privs);
     }
 
-    /// The effective privilege set for object `name` (already lowercased) over a `base` default.
+    /// The effective privilege set for object `name` (the exact name) over a `base` default.
     fn effective(&self, name: &str, base: PrivilegeSet) -> PrivilegeSet {
         let granted = self.grant.get(name).copied().unwrap_or_default();
         let revoked = self.revoke.get(name).copied().unwrap_or_default();
         base.union(granted).minus(revoked)
     }
 
-    /// Whether table `name` (lowercased) holds privilege `p`.
+    /// Whether table `name` (exact) holds privilege `p`.
     pub fn allows_table(&self, name: &str, p: Privilege) -> bool {
         self.effective(name, self.default_table).contains(p)
     }
 
-    /// Whether function `name` (lowercased) holds `EXECUTE` (functions default to `EXECUTE` on all).
+    /// Whether function `name` (exact) holds `EXECUTE` (functions default to `EXECUTE` on all).
     pub fn allows_function(&self, name: &str) -> bool {
         self.effective(name, PrivilegeSet::EXECUTE)
             .contains(Privilege::Execute)

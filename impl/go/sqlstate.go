@@ -103,6 +103,8 @@ const (
 	ExternalRoutineException
 	// SyntaxError is 42601 — syntax error: {detail}.
 	SyntaxError
+	// InvalidName is 42602 — invalid name syntax.
+	InvalidName
 	// UndefinedTable is 42P01 — table does not exist: {name}.
 	UndefinedTable
 	// UndefinedColumn is 42703 — column does not exist: {name}.
@@ -286,6 +288,8 @@ func (s SqlState) Code() string {
 		return "38000"
 	case SyntaxError:
 		return "42601"
+	case InvalidName:
+		return "42602"
 	case UndefinedTable:
 		return "42P01"
 	case UndefinedColumn:
@@ -436,6 +440,7 @@ var errorDescs = []errorDesc{
 	{Code: "2BP01", Name: "dependent_objects_still_exist", Class: "dependent objects still exist"},
 	{Code: "38000", Name: "external_routine_exception", Class: "external routine exception"},
 	{Code: "42601", Name: "syntax_error", Class: "syntax error or access rule violation"},
+	{Code: "42602", Name: "invalid_name", Class: "syntax error or access rule violation"},
 	{Code: "42P01", Name: "undefined_table", Class: "syntax error or access rule violation"},
 	{Code: "42703", Name: "undefined_column", Class: "syntax error or access rule violation"},
 	{Code: "42702", Name: "ambiguous_column", Class: "syntax error or access rule violation"},

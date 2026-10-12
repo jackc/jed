@@ -913,7 +913,10 @@ sub-slices**, each independently testable (CLAUDE.md §10), in dependency order:
   ORDER BY sort (§11). A collated `ORDER BY` cannot use the `C`-ordered streaming/spill sorter, so
   it materializes + sorts via a decorate sorter (each sort key built once); collation is in-memory
   only, so it never spills (collated keys are slice 1e). The lexer gained a double-quoted-identifier
-  token (`Token::QuotedIdent`) for collation names, consumed only in the COLLATE / ORDER BY position.
+  token (`Token::QuotedIdent`) for collation names, consumed then only in the COLLATE / ORDER BY
+  position. *(Since generalized: a quoted identifier is legal wherever an identifier is, and bare
+  identifiers fold to lowercase — [grammar.md §3](grammar.md). Collation names stay quoted-only and
+  exact.)*
 - **1d — on-disk baking** ✅ *landed*: `format_version` 17 — the `entry_kind` 3 baked collation
   snapshot (a flags byte `is_default`/`reference` + the LZ4-compressed `.coll` artifact, the artifact
   byte-identical to `db.SaveCollation` so a golden doubles as an artifact fixture) emitted *composites
@@ -1229,8 +1232,8 @@ and Unicode casing is the optional ICU extension — and it is what lets a `C`/A
   `upper`/`lower` fold **ASCII `a`–`z`/`A`–`Z` only** and pass every other code point through
   unchanged (`upper('café') → 'CAFé'`) — exactly stock SQLite's default. ASCII folding is a *branch*,
   not a table, so it is free, deterministic, and **version-independent** (the ASCII case mappings are
-  fixed forever). `ILIKE` and any case-insensitive identifier matching use the same ASCII rule
-  (identifier folding is already ASCII-only, [grammar.md §3](grammar.md)). So the bare binary's casing
+  fixed forever). `ILIKE` and bare-identifier folding use the same ASCII rule
+  (identifier folding is ASCII-only, [grammar.md §3](grammar.md)). So the bare binary's casing
   is **always available** and makes **no Unicode-version promise**.
 - **Full Unicode casing (the loaded property section).** When a bundle's **property section** is
   loaded (§9/§13), `upper`/`lower`/`initcap` fold via the Unicode simple case mappings + SpecialCasing

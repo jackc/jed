@@ -469,8 +469,8 @@ trigger them ([collation.md §11](collation.md), CLAUDE.md §13). The host decid
 
 **Enforcement** is at **name resolution**, after a name resolves to a catalog object: a missing
 privilege raises **`42501 insufficient_privilege`** — PostgreSQL's own permission-denied code
-(messages "permission denied for table t" / "for function f"), matched on the canonical
-(lowercased) catalog name. The error is **explicit** — the caller learns the object exists but the
+(messages "permission denied for table t" / "for function f"), matched byte-exactly on the
+catalog name (a grant's table or function name is a host-API name, taken verbatim — grammar.md §3). The error is **explicit** — the caller learns the object exists but the
 operation is off-limits (the chosen behavior over hiding existence behind `42P01`); a host wanting
 to hide schema existence from adversarial callers layers that above the engine.
 

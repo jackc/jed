@@ -43,7 +43,7 @@ impl Engine {
         // Record-returning functions (R1, json-table.md §2): json[b]_to_record → one record row,
         // json[b]_to_recordset → setof record. They take their column shape from the C0 col-def list
         // `AS t(col type, …)`. Dispatched first, before the col-def-list guard below.
-        let lc = name.to_ascii_lowercase();
+        let lc = name.to_string();
         if matches!(
             lc.as_str(),
             "json_to_record" | "jsonb_to_record" | "json_to_recordset" | "jsonb_to_recordset"
@@ -70,16 +70,16 @@ impl Engine {
                 ),
             ));
         }
-        if name.eq_ignore_ascii_case("generate_series") {
+        if name == "generate_series" {
             return self.resolve_generate_series(args, alias, &arg_scope, ptypes);
         }
-        if name.eq_ignore_ascii_case("unnest") {
+        if name == "unnest" {
             return self.resolve_unnest(args, alias, &arg_scope, ptypes);
         }
         // json/jsonb two-column SRFs (B3, json-sql-functions.md §3): jsonb_each → (key text, value
         // jsonb), jsonb_each_text → (key text, value text). The json variants (verbatim sub-text,
         // json.md §4) are a deferred 0A000 follow-on. Built on the C0 multi-column synthetic table.
-        let lname = name.to_ascii_lowercase();
+        let lname = name.to_string();
         match lname.as_str() {
             "jsonb_each" => {
                 return self.resolve_json_each(
@@ -728,7 +728,7 @@ impl Engine {
     /// (54P01) mid-generation before the whole thing materializes (CLAUDE.md §13).
     /// Generate the rows of the `jed_tables` catalog relation (introspection.md §5): one row per
     /// USER table of the scope's pinned catalog snapshot — the canonical (CREATE TABLE-spelled)
-    /// name — in ascending lowercased-name order (deterministic, no map-iteration leak; the
+    /// name — in ascending name byte order (deterministic, no map-iteration leak; the
     /// multiset is the contract, order without ORDER BY stays unspecified — CLAUDE.md §8). Derived
     /// entirely from the resident catalog: zero `page_read` / `storage_row_read`; each produced row
     /// charges one `generated_row` AT THE SOURCE, guarded so a max_cost ceiling aborts
@@ -751,7 +751,7 @@ impl Engine {
     }
 
     /// Generate the rows of the `jed_columns` catalog relation (introspection.md §5): one row per
-    /// column of every user table of the scope's snapshot, in (lowercased table name, ordinal)
+    /// column of every user table of the scope's snapshot, in (table name, ordinal)
     /// order. `ordinal` is 1-based CREATE TABLE order; `type` is the canonical type text
     /// (`catalog_type_text`); `not_null` covers a declared NOT NULL and PRIMARY KEY membership;
     /// `pk_ordinal` is the 1-based position in the PRIMARY KEY in KEY order (which may differ from
@@ -786,7 +786,7 @@ impl Engine {
     }
 
     /// Generate the rows of the `jed_indexes` catalog relation (introspection.md §5.1): one row per
-    /// secondary index of every user table of the scope's snapshot, in (lowercased table name, then
+    /// secondary index of every user table of the scope's snapshot, in (table name, then
     /// the catalog's ascending index-name order) order. `columns` is the `text[]` of indexed column
     /// names in index-key order (duplicates included); `is_unique` the catalog flag; `method` the
     /// access-method name (`btree` / `gin` / `gist`). Cost mirrors jed_tables_rows (one
@@ -832,7 +832,7 @@ impl Engine {
     }
 
     /// Generate the rows of the `jed_sequences` catalog relation (introspection.md §5.3): one row per
-    /// sequence of the scope's snapshot, in ascending lowercased-name order. The definition fields
+    /// sequence of the scope's snapshot, in ascending name byte order. The definition fields
     /// render as stored; `last_value` is NULL until the sequence has been read (`!is_called` — PG's
     /// `pg_sequences` rule); `owned_by_table` / `owned_by_column` render the OWNED BY link of a
     /// serial / IDENTITY column (the owning table's canonical name, the column's current name), NULL
@@ -883,7 +883,7 @@ impl Engine {
     }
 
     /// Generate the rows of the `jed_types` catalog relation (introspection.md §5.3): one row per
-    /// user-defined type of the scope's snapshot, in ascending lowercased-name order. Every user type
+    /// user-defined type of the scope's snapshot, in ascending name byte order. Every user type
     /// is a composite today. Cost mirrors jed_tables_rows.
     pub(crate) fn jed_types_rows(&self, srf: &SrfPlan, meter: &mut Meter) -> Result<Vec<Row>> {
         let Some(snap) = self.snap_for_scope(&srf.introspect_scope) else {
@@ -905,7 +905,7 @@ impl Engine {
     }
 
     /// Generate the rows of the `jed_type_fields` catalog relation (introspection.md §5.3): one row
-    /// per field of every user-defined type of the scope's snapshot, in (lowercased type name,
+    /// per field of every user-defined type of the scope's snapshot, in (type name,
     /// ordinal) order — jed_columns' shape, with the same canonical type text. Cost mirrors
     /// jed_tables_rows.
     pub(crate) fn jed_type_fields_rows(
@@ -979,8 +979,8 @@ impl Engine {
 
     /// Generate the rows of the `jed_constraints` catalog relation (introspection.md §5.1): one row
     /// per CHECK / UNIQUE / FK / EXCLUDE constraint of every user table of the scope's snapshot, in
-    /// (lowercased table name, then a fixed KIND order — check, unique, foreign_key, exclude — each
-    /// already held in ascending lowercased-name order). PRIMARY KEY / NOT NULL are deliberately
+    /// (table name, then a fixed KIND order — check, unique, foreign_key, exclude — each
+    /// already held in ascending name byte order). PRIMARY KEY / NOT NULL are deliberately
     /// absent (they own no named object and are described by jed_columns). A `UNIQUE` constraint IS
     /// its backing unique b-tree index (constraints.md §5), so `type = 'unique'` lists every unique
     /// index; `expression` is the persisted canonical CHECK text (constraints.md §4.5). Cost mirrors

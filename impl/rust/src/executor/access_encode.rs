@@ -32,7 +32,7 @@ impl ScanBound {
 /// `plan.filter` at exec time by `gist_match`). No element type is carried: the gather descends the
 /// resident R-tree (gist.md §4.1), whose bounds are already decoded.
 pub(crate) struct GistBound {
-    /// The index store's key — the lowercased index name (its resident R-tree lives under this key).
+    /// The index store's key — the exact index name (its resident R-tree lives under this key).
     pub(crate) name_key: String,
     pub(crate) strategy: crate::gist::GistStrategy,
     /// The GiST-indexed column's global scope index (`rel.offset + ci`).
@@ -68,7 +68,7 @@ pub(crate) enum GinStrategy {
 /// query `Q` is NOT stored (`RExpr` is not `Clone`); it is re-found in `plan.filter` at exec time by
 /// `gin_match` and evaluated there.
 pub(crate) struct GinBound {
-    /// The index store's key — the lowercased index name.
+    /// The index store's key — the exact index name.
     pub(crate) name_key: String,
     /// The array element type, whose key encoding produces each term's bytes.
     pub(crate) elem_type: ScalarType,
@@ -104,7 +104,7 @@ pub(crate) struct IndexRange {
 /// the range column (if any) plus every trailing column — each FIXED-WIDTH so an admitted entry's
 /// row-key suffix is recovered by width-skipping them past P.
 pub(crate) struct IndexBound {
-    /// The index store's key — the lowercased index name.
+    /// The index store's key — the exact index name.
     pub(crate) name_key: String,
     pub(crate) eq_cols: Vec<IndexEqCol>,
     pub(crate) range: Option<IndexRange>,
@@ -228,7 +228,7 @@ pub(crate) fn build_index_access_predicate(
         suffix_types.push(s);
     }
     Some(IndexBound {
-        name_key: idx.name.to_ascii_lowercase(),
+        name_key: idx.name.to_string(),
         eq_cols,
         range,
         suffix_types,
@@ -249,7 +249,7 @@ pub(crate) enum ScanCandidateKind {
 }
 
 /// Collision-free physical identity of one base-relation access candidate. `index_name` is the
-/// lowercased catalog name for index-bearing paths and empty for PK/PK-interval/full paths.
+/// exact catalog name for index-bearing paths and empty for PK/PK-interval/full paths.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScanCandidateIdentity {
     pub(crate) kind: ScanCandidateKind,
@@ -991,7 +991,7 @@ fn estimator_candidate_selectivity(
                 return Selectivity::Zero;
             }
             let unique = rel.table.indexes.iter().any(|index| {
-                index.name.eq_ignore_ascii_case(&identity.index_name)
+                index.name == identity.index_name
                     && index.unique
                     && bound.eq_cols.len() == index.keys.len()
                     && bound.range.is_none()
@@ -1023,9 +1023,7 @@ fn estimator_candidate_selectivity(
         }
         Some(ScanBound::IndexSet(bound)) => {
             let unique = rel.table.indexes.iter().any(|index| {
-                index.name.eq_ignore_ascii_case(&identity.index_name)
-                    && index.unique
-                    && index.keys.len() == 1
+                index.name == identity.index_name && index.unique && index.keys.len() == 1
             });
             estimator_interval_selectivity(&bound.specs, &bound.clip, unique, bound.col_type)
         }
@@ -1092,7 +1090,7 @@ fn estimator_candidate_selectivity_with_statistics(
                     .table
                     .columns
                     .iter()
-                    .position(|column| column.name.eq_ignore_ascii_case(&eq.name))
+                    .position(|column| column.name == eq.name)
                 else {
                     return structural;
                 };
@@ -1107,7 +1105,7 @@ fn estimator_candidate_selectivity_with_statistics(
                     .table
                     .columns
                     .iter()
-                    .position(|column| column.name.eq_ignore_ascii_case(&range.name))
+                    .position(|column| column.name == range.name)
                 else {
                     return structural;
                 };
@@ -1123,7 +1121,7 @@ fn estimator_candidate_selectivity_with_statistics(
                 .table
                 .indexes
                 .iter()
-                .find(|index| index.name.eq_ignore_ascii_case(&identity.index_name))
+                .find(|index| index.name == identity.index_name)
             else {
                 return structural;
             };
@@ -1173,7 +1171,7 @@ fn estimator_candidate_selectivity_with_statistics(
                 .table
                 .indexes
                 .iter()
-                .find(|index| index.name.eq_ignore_ascii_case(&identity.index_name))
+                .find(|index| index.name == identity.index_name)
             else {
                 return structural;
             };
@@ -1530,39 +1528,14 @@ pub(crate) fn estimate_selected_scan(
     };
     let store = catalog.store_scoped(rel.db.as_deref(), &rel.table.name);
     let row_count = store.count().unwrap_or(0);
-    let structural_access_selectivity = match bound {
-        Some(ScanBound::Pk(bound)) => {
-            if bound
-                .eq_cols
-                .iter()
-                .any(|column| estimator_equality_sources_impossible(&column.srcs, column.col_type))
-            {
-                crate::estimator::Selectivity::Zero
-            } else if bound.eq_cols.len() == bound.member_count && bound.range.is_none() {
-                crate::estimator::Selectivity::Unique
-            } else {
-                let mut result = estimator_equality_prefix(bound.eq_cols.len());
-                if let Some(range) = &bound.range {
-                    result = result.and(estimator_range_terms(&range.terms, range.col_type));
-                }
-                result
-            }
-        }
-        Some(ScanBound::Index(bound)) => {
-            if bound
-                .eq_cols
-                .iter()
-                .any(|column| estimator_equality_sources_impossible(&column.srcs, column.col_type))
-            {
-                crate::estimator::Selectivity::Zero
-            } else {
-                let unique = rel.table.indexes.iter().any(|index| {
-                    index.name.eq_ignore_ascii_case(&bound.name_key)
-                        && index.unique
-                        && bound.eq_cols.len() == index.keys.len()
-                        && bound.range.is_none()
-                });
-                if unique {
+    let structural_access_selectivity =
+        match bound {
+            Some(ScanBound::Pk(bound)) => {
+                if bound.eq_cols.iter().any(|column| {
+                    estimator_equality_sources_impossible(&column.srcs, column.col_type)
+                }) {
+                    crate::estimator::Selectivity::Zero
+                } else if bound.eq_cols.len() == bound.member_count && bound.range.is_none() {
                     crate::estimator::Selectivity::Unique
                 } else {
                     let mut result = estimator_equality_prefix(bound.eq_cols.len());
@@ -1572,33 +1545,56 @@ pub(crate) fn estimate_selected_scan(
                     result
                 }
             }
-        }
-        Some(ScanBound::Gist(bound)) => crate::estimator::selectivity_class(
-            if bound.strategy == crate::gist::GistStrategy::Equal {
-                crate::estimator_constants::ACCESS_GIST_EQUAL
-            } else {
-                crate::estimator_constants::ACCESS_GIST_RANGE
-            },
-        ),
-        Some(ScanBound::Gin(bound)) => crate::estimator::selectivity_class(match bound.strategy {
-            GinStrategy::Contains => crate::estimator_constants::ACCESS_GIN_CONTAINS,
-            GinStrategy::Overlaps => crate::estimator_constants::ACCESS_GIN_OVERLAPS,
-            GinStrategy::Member => crate::estimator_constants::ACCESS_GIN_MEMBER,
-            GinStrategy::Equal => crate::estimator_constants::ACCESS_GIN_EQUAL,
-        }),
-        Some(ScanBound::PkSet(bound)) => {
-            estimator_interval_selectivity(&bound.specs, &bound.clip, true, bound.pk_type)
-        }
-        Some(ScanBound::IndexSet(bound)) => {
-            let unique = rel.table.indexes.iter().any(|index| {
-                index.name.eq_ignore_ascii_case(&bound.name_key)
-                    && index.unique
-                    && index.keys.len() == 1
-            });
-            estimator_interval_selectivity(&bound.specs, &bound.clip, unique, bound.col_type)
-        }
-        None => crate::estimator::Selectivity::All,
-    };
+            Some(ScanBound::Index(bound)) => {
+                if bound.eq_cols.iter().any(|column| {
+                    estimator_equality_sources_impossible(&column.srcs, column.col_type)
+                }) {
+                    crate::estimator::Selectivity::Zero
+                } else {
+                    let unique = rel.table.indexes.iter().any(|index| {
+                        index.name == bound.name_key
+                            && index.unique
+                            && bound.eq_cols.len() == index.keys.len()
+                            && bound.range.is_none()
+                    });
+                    if unique {
+                        crate::estimator::Selectivity::Unique
+                    } else {
+                        let mut result = estimator_equality_prefix(bound.eq_cols.len());
+                        if let Some(range) = &bound.range {
+                            result =
+                                result.and(estimator_range_terms(&range.terms, range.col_type));
+                        }
+                        result
+                    }
+                }
+            }
+            Some(ScanBound::Gist(bound)) => crate::estimator::selectivity_class(
+                if bound.strategy == crate::gist::GistStrategy::Equal {
+                    crate::estimator_constants::ACCESS_GIST_EQUAL
+                } else {
+                    crate::estimator_constants::ACCESS_GIST_RANGE
+                },
+            ),
+            Some(ScanBound::Gin(bound)) => {
+                crate::estimator::selectivity_class(match bound.strategy {
+                    GinStrategy::Contains => crate::estimator_constants::ACCESS_GIN_CONTAINS,
+                    GinStrategy::Overlaps => crate::estimator_constants::ACCESS_GIN_OVERLAPS,
+                    GinStrategy::Member => crate::estimator_constants::ACCESS_GIN_MEMBER,
+                    GinStrategy::Equal => crate::estimator_constants::ACCESS_GIN_EQUAL,
+                })
+            }
+            Some(ScanBound::PkSet(bound)) => {
+                estimator_interval_selectivity(&bound.specs, &bound.clip, true, bound.pk_type)
+            }
+            Some(ScanBound::IndexSet(bound)) => {
+                let unique = rel.table.indexes.iter().any(|index| {
+                    index.name == bound.name_key && index.unique && index.keys.len() == 1
+                });
+                estimator_interval_selectivity(&bound.specs, &bound.clip, unique, bound.col_type)
+            }
+            None => crate::estimator::Selectivity::All,
+        };
     let identity = ScanCandidateIdentity {
         kind,
         index_name: index_name.to_string(),
@@ -1789,7 +1785,7 @@ fn build_index_interval_set_plan(
         return None;
     }
     Some(IndexKeySet {
-        name_key: idx.name.to_ascii_lowercase(),
+        name_key: idx.name.to_string(),
         col_type: ty,
         coll,
         tail_types: cols[1..]
@@ -1817,7 +1813,7 @@ impl Engine {
     ) -> MutationScanPlan {
         let bound = filter.and_then(|f| {
             let rel = ScopeRel {
-                label: table.name.to_ascii_lowercase(),
+                label: table.name.to_string(),
                 table,
                 offset: 0,
                 qualifier_only: false,
@@ -2001,7 +1997,7 @@ pub(crate) fn inventory_inl_candidates<'a>(
         }
     }
     // Else a leading secondary-index equality bound to a sibling (indexes held in ascending
-    // lowercased-name order — the deterministic tie-break, matching detect_scan_bound).
+    // name byte order — the deterministic tie-break, matching detect_scan_bound).
     for idx in &rel.table.indexes {
         if idx.kind != IndexKind::Btree {
             continue;
@@ -2037,7 +2033,7 @@ pub(crate) fn inventory_inl_candidates<'a>(
             // column bound to a sibling); a multi-column / range INL bound is a follow-on (cost.md
             // §3 "index-nested-loop"). `suffix_types` are the trailing columns (columns[1..],
             // fixed-width by the check above), width-skipped past the single equality slot.
-            let name_key = idx.name.to_ascii_lowercase();
+            let name_key = idx.name.to_string();
             candidates.push(index_order_candidate(
                 ScanCandidateKind::Btree,
                 name_key.clone(),
@@ -2071,7 +2067,7 @@ pub(crate) fn inventory_inl_candidates<'a>(
             if col_ty.range_element().is_some() {
                 if let Some((strategy, _)) = gist_sibling_match(filter, col_global, sibling_columns)
                 {
-                    let name_key = idx.name.to_ascii_lowercase();
+                    let name_key = idx.name.to_string();
                     candidates.push(storage_order_candidate(
                         ScanCandidateKind::Gist,
                         name_key.clone(),
@@ -2088,7 +2084,7 @@ pub(crate) fn inventory_inl_candidates<'a>(
             } else if is_gist_scalar_type(col_ty)
                 && gist_scalar_sibling_match(filter, col_global, sibling_columns).is_some()
             {
-                let name_key = idx.name.to_ascii_lowercase();
+                let name_key = idx.name.to_string();
                 candidates.push(storage_order_candidate(
                     ScanCandidateKind::Gist,
                     name_key.clone(),
@@ -2115,7 +2111,7 @@ pub(crate) fn inventory_inl_candidates<'a>(
         };
         for filter in &filters {
             if let Some((strategy, _)) = gin_sibling_match(filter, col_global, sibling_columns) {
-                let name_key = idx.name.to_ascii_lowercase();
+                let name_key = idx.name.to_string();
                 candidates.push(storage_order_candidate(
                     ScanCandidateKind::Gin,
                     name_key.clone(),
@@ -2285,7 +2281,7 @@ pub(crate) fn pk_storage_width(table: &Table) -> Option<usize> {
 /// a sort, point-looking-up each row by its primary key (cost.md §3 "secondary-index order").
 #[derive(Clone)]
 pub(crate) struct IndexOrder {
-    /// The index store's key — the lowercased index name.
+    /// The index store's key — the exact index name.
     pub(crate) name_key: String,
     /// The fixed byte width of the PK suffix to peel off the END of each index entry key
     /// ([`pk_storage_width`]) — the row's storage key, fed to the table point lookup.
@@ -2354,7 +2350,7 @@ pub(crate) fn order_satisfied_by_indexes(
                 });
         if matches_order {
             matching_indexes.push(IndexOrder {
-                name_key: idx.name.to_ascii_lowercase(),
+                name_key: idx.name.to_string(),
                 pk_width,
             });
         }
@@ -2390,7 +2386,7 @@ pub(crate) fn build_gin_bound_for_index(
     let elem_ty = columns[ci].ty.array_element()?.scalar();
     if let Some((strategy, _)) = gin_match(filter, col_global) {
         return Some(GinBound {
-            name_key: idx.name.to_ascii_lowercase(),
+            name_key: idx.name.to_string(),
             elem_type: elem_ty,
             strategy,
             col_global,
@@ -2416,7 +2412,7 @@ pub(crate) fn build_gist_bound_for_index(
     if col_ty.range_element().is_some() {
         if let Some((strategy, _)) = gist_match(filter, col_global) {
             return Some(GistBound {
-                name_key: idx.name.to_ascii_lowercase(),
+                name_key: idx.name.to_string(),
                 strategy,
                 col_global,
                 scalar_type: None,
@@ -2424,7 +2420,7 @@ pub(crate) fn build_gist_bound_for_index(
         }
     } else if is_gist_scalar_type(col_ty) && gist_scalar_match(filter, col_global).is_some() {
         return Some(GistBound {
-            name_key: idx.name.to_ascii_lowercase(),
+            name_key: idx.name.to_string(),
             strategy: crate::gist::GistStrategy::Equal,
             col_global,
             scalar_type: Some(col_ty.scalar()),
@@ -3518,7 +3514,7 @@ pub(crate) fn encode_array_key(
 pub(crate) enum FkProbe {
     /// The parent's PK storage key (bare member encodings concatenated, in PK key order).
     Pk(Vec<u8>),
-    /// A parent unique index's prefix (0x00-tagged slots, in index-key order) + the lowercased
+    /// A parent unique index's prefix (0x00-tagged slots, in index-key order) + the exact
     /// index name.
     Unique { index: String, prefix: Vec<u8> },
 }
@@ -3597,7 +3593,7 @@ pub(crate) fn fk_probe(
             )?);
         }
         Ok(Some(FkProbe::Unique {
-            index: idx.name.to_ascii_lowercase(),
+            index: idx.name.to_string(),
             prefix,
         }))
     }
@@ -3605,7 +3601,7 @@ pub(crate) fn fk_probe(
 
 /// The access path a parent-side reverse match uses on the child table
 /// (spec/design/constraints.md §6.5): the child's PK (`index == None`) or a plain-column ordered
-/// B-tree secondary index (`index` = its lowercased name). `cols` are the leading child key
+/// B-tree secondary index (`index` = its exact name). `cols` are the leading child key
 /// columns, in key order, whose set is exactly the FK's local columns. No path ⇒ the full-scan
 /// fallback.
 pub(crate) struct FkReversePath {
@@ -3685,7 +3681,7 @@ pub(crate) fn fk_reverse_prefix(
 }
 
 /// Pick the child reverse-match path deterministically: the child PK, then usable non-partial
-/// plain-column B-tree indexes in ascending lowercased-name order (the planner's canonical tie
+/// plain-column B-tree indexes in ascending name byte order (the planner's canonical tie
 /// order), else `None` — the full scan (constraints.md §6.5 steps 1–2).
 pub(crate) fn fk_choose_reverse_path(
     snap: &Snapshot,
@@ -3717,7 +3713,7 @@ pub(crate) fn fk_choose_reverse_path(
         {
             continue;
         }
-        let name = ix.name.to_ascii_lowercase();
+        let name = ix.name.to_string();
         if best
             .as_ref()
             .is_none_or(|b| name < *b.index.as_ref().expect("an index path"))
@@ -5823,12 +5819,12 @@ pub(crate) fn resolve_window_clause(
     Ok(resolved)
 }
 
-/// Find a (resolved, `base = None`) window definition by name in `windows`, case-insensitively, or
+/// Find a (resolved, `base = None`) window definition by name in `windows`, byte-exactly, or
 /// raise 42704 `window "<name>" does not exist`. Returns an owned clone to avoid borrow conflicts.
 pub(crate) fn lookup_window(windows: &[(String, WindowDef)], name: &str) -> Result<WindowDef> {
     windows
         .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .find(|(n, _)| n == name)
         .map(|(_, d)| d.clone())
         .ok_or_else(|| {
             EngineError::new(
@@ -6171,10 +6167,7 @@ pub(crate) fn reject_default_structure(e: &Expr) -> Result<()> {
 pub(crate) fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
     pub(crate) fn walk(e: &Expr, columns: &[Column], out: &mut Vec<usize>) {
         let mut note = |name: &str| {
-            if let Some(i) = columns
-                .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(name))
-            {
+            if let Some(i) = columns.iter().position(|c| c.name == name) {
                 if !out.contains(&i) {
                     out.push(i);
                 }
@@ -6441,17 +6434,17 @@ pub(crate) fn index_expr_has_subquery(e: &Expr) -> bool {
 }
 
 /// The auto-name part for one index key element (spec/design/indexes.md §2, PG's
-/// `ChooseIndexColumnNames`): a column key contributes its (lowercased) column name; a
+/// `ChooseIndexColumnNames`): a column key contributes its (exact) column name; a
 /// bare-function-call expression its function name (`lower(email)` → `lower`); any other
 /// expression the literal `expr`.
 pub(crate) fn index_name_part(elem: &crate::ast::IndexKeyElem) -> String {
     use crate::ast::IndexKeyElem;
     match elem {
-        IndexKeyElem::Column(name) => name.to_ascii_lowercase(),
+        IndexKeyElem::Column(name) => name.to_string(),
         IndexKeyElem::Expr {
             expr: Expr::FuncCall { name, .. },
             ..
-        } => name.to_ascii_lowercase(),
+        } => name.to_string(),
         IndexKeyElem::Expr { .. } => "expr".to_string(),
     }
 }

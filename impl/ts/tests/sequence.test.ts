@@ -288,3 +288,38 @@ test("serial is recognized only in a column-type position — a CAST to it is un
   const db = memDb().session();
   assert.equal(errCode(db, "SELECT 1::serial"), "42704");
 });
+
+// The regclass-style name text (grammar.md §3): a dotted name is 42602 — jed has no schemas and does
+// not resolve a qualified name from text, where PostgreSQL would look up schema `a` (a documented
+// divergence, so it cannot live in the PG-clean corpus).
+test("a dotted sequence name text is 42602 invalid_name", () => {
+  const db = memDb().session();
+  db.execute("CREATE SEQUENCE b");
+  for (const sql of [
+    "SELECT nextval('a.b')",
+    "SELECT nextval('main.b')",
+    "SELECT currval('a.b')",
+    "SELECT setval('a.b', 5)",
+  ]) {
+    assert.equal(errCode(db, sql), "42602", sql);
+  }
+});
+
+// A serial column's generated DEFAULT renders the owned sequence's name by the quoting rule
+// (grammar.md §3): bare when a plain lowercase identifier, else double-quoted inside the string — and
+// a sequence RENAME rewrites it the same way.
+test("a serial default's text quotes the sequence name", () => {
+  const db = memDb().session();
+  const defaultText = (table: string): string | undefined =>
+    db.table(table)!.columns[0]!.defaultExpr?.exprText;
+  db.execute("CREATE TABLE plain (id serial PRIMARY KEY)");
+  assert.equal(defaultText("plain"), "nextval ( 'plain_id_seq' )");
+  db.execute('CREATE TABLE "Tab" (id serial PRIMARY KEY)');
+  assert.equal(defaultText("Tab"), `nextval ( '"Tab_id_seq"' )`);
+  db.execute('ALTER SEQUENCE "Tab_id_seq" RENAME TO tab_ids');
+  assert.equal(defaultText("Tab"), "nextval ( 'tab_ids' )");
+  db.execute(`ALTER SEQUENCE plain_id_seq RENAME TO "It's"`);
+  assert.equal(defaultText("plain"), `nextval ( '"It''s"' )`);
+  db.execute("INSERT INTO plain DEFAULT VALUES");
+  assert.equal(oneInt(db, "SELECT id FROM plain"), 1n);
+});

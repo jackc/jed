@@ -94,6 +94,10 @@ host `abs(i64)` is accepted but never reached), and overloading is by signature:
 and `discount(text, text)` are two different functions under one name. A call that matches no
 signature is `42883`, exactly as an unknown built-in.
 
+The registered name is used exactly as given. SQL folds a bare name to lowercase, so register names
+in lowercase: a function registered as `discount` is called as `discount(…)` or `DISCOUNT(…)`, but
+one registered as `Discount` can only be called with quotes, as `"Discount"(…)`.
+
 Registration itself rejects three mistakes up front: a **negative cost** is `22023`, an **unknown
 type name** is `42704` (Go and TypeScript name argument types by string), and a **second function
 with an identical `(name, arg-types)` signature** is `42723`.

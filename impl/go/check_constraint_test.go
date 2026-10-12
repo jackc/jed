@@ -326,7 +326,7 @@ func TestCheckRoundTripsThroughOnDiskImage(t *testing.T) {
 	}
 	tab, _ := loaded.Table("t")
 	wantNames := []string{"price_range", "t_b_check", "t_note_check"}
-	wantTexts := []string{"price >= 0.50 AND price <= 9999.99", "b > 0", "note = 'ok' OR note = 'a''b'"}
+	wantTexts := []string{"price >= 0.50 and price <= 9999.99", "b > 0", "note = 'ok' or note = 'a''b'"}
 	for i, c := range tab.Checks {
 		if c.Name != wantNames[i] || c.ExprText != wantTexts[i] {
 			t.Fatalf("check %d = (%q, %q), want (%q, %q)", i, c.Name, c.ExprText, wantNames[i], wantTexts[i])

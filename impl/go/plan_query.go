@@ -2,7 +2,6 @@ package jed
 
 import (
 	"fmt"
-	"strings"
 )
 
 // Query-expression orchestration — the layer above planSelect that composes SELECT, set operations,
@@ -75,7 +74,7 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, inherited []*cteBi
 	bindings := make([]*cteBinding, 0, len(ctes))
 	for i := range ctes {
 		cte := &ctes[i]
-		lname := strings.ToLower(cte.Name)
+		lname := cte.Name
 		for _, b := range bindings {
 			if b.name == lname {
 				return nil, newError(DuplicateAlias,
@@ -729,7 +728,7 @@ func countSelfRefsQuery(qe queryExpr, name string) int {
 		if !shadowed {
 			n += countCteRefsDml(&qe.With.Ctes[i].Body, name)
 		}
-		if strings.EqualFold(qe.With.Ctes[i].Name, name) {
+		if qe.With.Ctes[i].Name == name {
 			shadowed = true
 		}
 	}
@@ -757,7 +756,7 @@ func countSelfRefsSelect(s *selectStmt, name string) int {
 // / VALUES' argument exprs.
 func countSelfRefsTableref(tref *tableRef, name string) int {
 	if isPlainRelation(tref) {
-		if strings.EqualFold(tref.Name, name) {
+		if tref.Name == name {
 			return 1
 		}
 		return 0
@@ -996,7 +995,7 @@ func countReturningRefs(returning *returningClause, name string) int {
 func countDirectFromSelfRefs(s *selectStmt, name string) int {
 	n := 0
 	for _, tref := range fromRelations(s) {
-		if isPlainRelation(tref) && strings.EqualFold(tref.Name, name) {
+		if isPlainRelation(tref) && tref.Name == name {
 			n++
 		}
 	}
@@ -1048,7 +1047,7 @@ func directSelfRefOnNullableSide(s *selectStmt, name string) bool {
 		}
 	}
 	for i, tref := range rels {
-		if isPlainRelation(tref) && strings.EqualFold(tref.Name, name) && nullable[i] {
+		if isPlainRelation(tref) && tref.Name == name && nullable[i] {
 			return true
 		}
 	}
@@ -2006,7 +2005,7 @@ func resolveSetopOrderKey(key *orderKey, names []string) (int, error) {
 		return 0, newError(UndefinedTable, "missing FROM-clause entry for table "+key.Qualifier)
 	}
 	for i, n := range names {
-		if strings.EqualFold(n, key.Column) {
+		if n == key.Column {
 			return i, nil
 		}
 	}

@@ -348,9 +348,9 @@ fn round_trips_through_the_on_disk_image() {
     assert_eq!(
         stored,
         vec![
-            ("price_range", "price >= 0.50 AND price <= 9999.99"),
+            ("price_range", "price >= 0.50 and price <= 9999.99"),
             ("t_b_check", "b > 0"),
-            ("t_note_check", "note = 'ok' OR note = 'a''b'"),
+            ("t_note_check", "note = 'ok' or note = 'a''b'"),
         ]
     );
     // Still enforced, with the same message.

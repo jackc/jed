@@ -110,10 +110,12 @@ pub fn run(
 /// look the table up in the session's visible catalog, and build the atomic statement.
 fn import_statement(session: &Session, table: &str, text: &str) -> Result<Option<String>, String> {
     let records = csv::parse(text)?;
+    // TABLE is SQL identifier text (cli.md §3): `Orders` names `orders`, `"Orders"` names `Orders`.
+    let name = jed::tooling::parse_name_text(table).map_err(|e| e.to_string())?;
     let def = session
         .db
-        .table(table)
-        .ok_or_else(|| format!("table does not exist: {table}"))?;
+        .table(&name)
+        .ok_or_else(|| format!("table does not exist: {name}"))?;
     csv::import_statement(def, &records)
 }
 

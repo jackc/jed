@@ -27,7 +27,9 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 36 # v36: an array column entry's flags gain bit6 has_collation (a text[] column's
+VERSION = 37 # v37: exact (folded) identifier names — no byte layout change; catalog groups sort by
+# exact-name bytes and persisted expression text renders bare words folded (grammar.md §3).
+# v36: an array column entry's flags gain bit6 has_collation (a text[] column's
 # non-C collation, the name after the element descriptor) and a collated text[] key stores each
 # element's sort key (collation.md §1, encoding.md §2.14). v35: every CHECK entry gains a trailing check_flags byte (extensibility.md §7.1.3).
 # format_version 35: after each check's expression text, a u8 check_flags (bit0 has_host_deps; bits
@@ -304,9 +306,9 @@ CHECK_TABLE = {
   columns: [col("a", "i32", pk: true), col("b", "i32"),
             col("price", "decimal", precision: 8, scale: 2), col("note", "text")],
   checks: [
-    { name: "price_range", expr: "price >= 0.50 AND price <= 9999.99" },
+    { name: "price_range", expr: "price >= 0.50 and price <= 9999.99" },
     { name: "t_b_check", expr: "b > 0" },
-    { name: "t_note_check", expr: "note = 'ok' OR note = 'a''b'" }
+    { name: "t_note_check", expr: "note = 'ok' or note = 'a''b'" }
   ],
   rows: [[1, 5, "1.00", "ok"], [2, nil, "9999.99", "a'b"], [3, 100, "0.50", "ok"]]
 }.freeze
@@ -822,8 +824,8 @@ PARTIAL_INDEX_TABLE = {
 # A v32 expression + partial index pins two exact names, including an alias, in sorted order.
 TIMEZONE_INDEX_TABLE = {
   name: "t", columns: [col("id", "i32", pk: true), col("ts", "timestamptz")],
-  indexes: [{ name: "t_zone_idx", cols: [{expr: "ts AT TIME ZONE 'US/Eastern'"}, {expr: "ts AT TIME ZONE 'America/New_York'"}],
-    predicate: "ts IS NOT NULL", timezone_deps: { dynamic: false,
+  indexes: [{ name: "t_zone_idx", cols: [{expr: "ts at time zone 'US/Eastern'"}, {expr: "ts at time zone 'America/New_York'"}],
+    predicate: "ts is not null", timezone_deps: { dynamic: false,
       zones: %w[America/New_York US/Eastern].map { |name| { name: name, version: "2026a",
         checksum: Zlib.crc32(File.binread(File.join(__dir__, "../tz/2026a/zones/America/New_York"))) } } } }],
   rows: []
@@ -1641,7 +1643,7 @@ end
 $ctypes = {}
 
 # The field list of the composite type named `type` (case-insensitive), or nil for a scalar type.
-def composite_fields(type) = $ctypes[type.to_s.downcase]
+def composite_fields(type) = $ctypes[type.to_s]
 
 def encode_value(type, v)
   return "\x01".b if v.nil?
@@ -2996,10 +2998,10 @@ def build_image(types, sequences, tables, page_size, collations = [], start_page
   ps = page_size
   cap = ps - PAGE_HEADER
   # Composite types in scope for the recursive value codec, keyed by lowercased name (§4).
-  $ctypes = types.to_h { |t| [t[:name].downcase, t[:fields]] }
-  sorted = tables.sort_by { |t| t[:name].downcase }
-  sorted_types = types.sort_by { |t| t[:name].downcase }
-  sorted_seqs = sequences.sort_by { |s| s[:name].downcase }
+  $ctypes = types.to_h { |t| [t[:name], t[:fields]] }
+  sorted = tables.sort_by { |t| t[:name] }
+  sorted_types = types.sort_by { |t| t[:name] }
+  sorted_seqs = sequences.sort_by { |s| s[:name] }
   sorted_colls = collations.sort_by { |c| c[:name] }
 
   data_pages = {} # index => [page_type, item_count, payload]
@@ -4064,10 +4066,10 @@ def decode_statistics_entry(buf, pos, tables, statistics, expected)
   name, pos = take_str(buf, pos)
   cb, pos = take(buf, pos, 2)
   column = cb.unpack1("n")
-  table = tables.find { |t| t[:name].downcase == name.downcase } or raise "statistics reference unknown table"
+  table = tables.find { |t| t[:name] == name } or raise "statistics reference unknown table"
   raise "statistics reference unknown column" if column >= table[:columns].size
 
-  key = [name.downcase, column]
+  key = [name, column]
   if kind.zero?
     raise "duplicate statistics summary" if expected.key?(key)
     fb, pos = take(buf, pos, 1)
@@ -4094,7 +4096,7 @@ def decode_statistics_entry(buf, pos, tables, statistics, expected)
     return pos
   end
 
-  item = statistics.find { |s| s[:table].downcase == name.downcase && s[:column] == column } or
+  item = statistics.find { |s| s[:table] == name && s[:column] == column } or
     raise "statistics item precedes summary"
   counts = expected.fetch(key)
   ob, pos = take(buf, pos, 2)
@@ -4150,7 +4152,7 @@ def decode_image(image)
       if kind == 1
         ct, pos = decode_composite_type_entry(pg[:payload], pos)
         types << ct
-        $ctypes[ct[:name].downcase] = ct[:fields]
+        $ctypes[ct[:name]] = ct[:fields]
         next
       end
       if kind == 2
@@ -4186,7 +4188,7 @@ def decode_image(image)
     cat = pg[:next_page]
   end
   statistics_expected.each do |(table, column), (mcv_count, histogram_count)|
-    item = statistics.find { |s| s[:table].downcase == table && s[:column] == column }
+    item = statistics.find { |s| s[:table] == table && s[:column] == column }
     raise "incomplete statistics group" unless item && item[:mcv].size == mcv_count &&
                                                item[:histogram].size == histogram_count
   end
@@ -4228,7 +4230,7 @@ end
 
 # The sequence content a fixture should decode to (name-sorted).
 def expected_sequences(fx)
-  (fx[:sequences] || []).sort_by { |s| s[:name].downcase }
+  (fx[:sequences] || []).sort_by { |s| s[:name] }
 end
 
 def expected_collations(fx)
@@ -4237,14 +4239,14 @@ def expected_collations(fx)
 end
 
 def expected_statistics(fx)
-  fx[:tables].sort_by { |t| t[:name].downcase }.flat_map do |t|
+  fx[:tables].sort_by { |t| t[:name] }.flat_map do |t|
     (t[:statistics] || []).sort_by { |s| s[:column] }.map { |s| { table: t[:name], **s } }
   end
 end
 
 # The composite-type content a fixture should decode to (name-sorted, normalized fields).
 def expected_types(fx)
-  (fx[:types] || []).sort_by { |t| t[:name].downcase }.map do |t|
+  (fx[:types] || []).sort_by { |t| t[:name] }.map do |t|
     { name: t[:name],
       fields: t[:fields].map do |f|
         { name: f[:name], type: f[:type], not_null: f[:not_null] || false,
@@ -4256,7 +4258,7 @@ end
 # The logical content a fixture should decode to (torn fixtures decode to the
 # underlying pk_table content via the valid slot).
 def expected_tables(fx)
-  fx[:tables].sort_by { |t| t[:name].downcase }.map do |t|
+  fx[:tables].sort_by { |t| t[:name] }.map do |t|
     { name: t[:name],
       columns: t[:columns].map do |c|
         { name: c[:name], type: c[:type], pk: c[:pk], not_null: c[:not_null],

@@ -82,7 +82,7 @@ impl Engine {
         db_scope: Option<&str>,
         table_name: &str,
     ) -> Option<InsertTargetSignature> {
-        let table = table_name.to_ascii_lowercase();
+        let table = table_name.to_string();
         let snap = match db_scope {
             None => {
                 if self.temp_read_snap().table_by_key(&table).is_some() {
@@ -90,9 +90,9 @@ impl Engine {
                 }
                 self.read_snap()
             }
-            Some(scope) if scope.eq_ignore_ascii_case("temp") => return None,
-            Some(scope) if scope.eq_ignore_ascii_case("main") => self.read_snap(),
-            Some(scope) => self.attach_read_snap(&scope.to_ascii_lowercase())?,
+            Some(scope) if scope == "temp" => return None,
+            Some(scope) if scope == "main" => self.read_snap(),
+            Some(scope) => self.attach_read_snap(scope)?,
         };
         snap.table_by_key(&table)?;
         Some(InsertTargetSignature {
@@ -111,7 +111,7 @@ impl Engine {
         db_scope: Option<&str>,
         table_name: &str,
     ) -> Option<InsertTargetSignature> {
-        let table = table_name.to_ascii_lowercase();
+        let table = table_name.to_string();
         let snap = match db_scope {
             None => {
                 if self.temp_read_snap().table_by_key(&table).is_some() {
@@ -119,12 +119,9 @@ impl Engine {
                 }
                 &self.committed
             }
-            Some(scope) if scope.eq_ignore_ascii_case("temp") => return None,
-            Some(scope) if scope.eq_ignore_ascii_case("main") => &self.committed,
-            Some(scope) => self
-                .attached_committed
-                .get(&scope.to_ascii_lowercase())?
-                .as_ref(),
+            Some(scope) if scope == "temp" => return None,
+            Some(scope) if scope == "main" => &self.committed,
+            Some(scope) => self.attached_committed.get(&scope.to_string())?.as_ref(),
         };
         snap.table_by_key(&table)?;
         Some(InsertTargetSignature {
@@ -267,7 +264,7 @@ impl Engine {
                 for (p, name) in names.iter().enumerate() {
                     let idx = columns
                         .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(name))
+                        .position(|c| c.name == *name)
                         .ok_or_else(|| {
                             EngineError::new(
                                 SqlState::UndefinedColumn,
@@ -934,7 +931,7 @@ impl Engine {
                     let idx = table
                         .columns
                         .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(name))
+                        .position(|c| c.name == *name)
                         .ok_or_else(|| {
                             EngineError::new(
                                 SqlState::UndefinedColumn,
@@ -1359,7 +1356,7 @@ impl Engine {
                     // (constraints.md §5.4).
                     return Err(EngineError::unique_violation(
                         &relation,
-                        format!("{}_pkey", relation.to_ascii_lowercase()),
+                        format!("{}_pkey", relation),
                     ));
                 }
                 seen_keys.insert(k.clone());
@@ -1374,7 +1371,7 @@ impl Engine {
                 let Some(prefix) = index_prefix_key(col_types, &colls, rindex, &row, &env)? else {
                     continue;
                 };
-                let istore = self.index_store_scoped(db_scope, &rindex.name.to_ascii_lowercase());
+                let istore = self.index_store_scoped(db_scope, &rindex.name.to_string());
                 let stored = !istore
                     .range_entries(&unique_probe_bound(&prefix))?
                     .is_empty();
@@ -1430,7 +1427,7 @@ impl Engine {
             let parent_colls = self.column_collations(&parent.columns);
             // Only a self-reference can satisfy against this statement's batch (a different parent
             // table is unchanged by this INSERT). Collect the parent keys the batch supplies.
-            let batch: HashSet<Vec<u8>> = if fk.ref_table.eq_ignore_ascii_case(&relation) {
+            let batch: HashSet<Vec<u8>> = if fk.ref_table == relation {
                 let mut s = HashSet::new();
                 for (_, r) in &prepared {
                     if let Some(p) = fk_probe(fk, parent, &parent_colls, r, &fk.ref_columns)? {
@@ -1467,7 +1464,7 @@ impl Engine {
                 .map(|t| t.columns.clone())
                 .unwrap_or_default();
             for exc in &exclusions {
-                let ikey = exc.index.to_ascii_lowercase();
+                let ikey = exc.index.to_string();
                 for (_, row) in &prepared {
                     if self.insert_exclusion_conflicts_stored(&tcols, exc, row, &ikey)? {
                         return Err(EngineError::exclusion_violation(&relation, &exc.name));
@@ -1525,12 +1522,12 @@ impl Engine {
                 // single statement, phase 1 already caught every duplicate, so this is never reached.
                 return Err(EngineError::unique_violation(
                     &relation,
-                    format!("{}_pkey", relation.to_ascii_lowercase()),
+                    format!("{}_pkey", relation),
                 ));
             }
         }
         for (k, def) in indexes.iter().enumerate() {
-            let istore = self.index_store_mut_scoped(db_scope, &def.name.to_ascii_lowercase());
+            let istore = self.index_store_mut_scoped(db_scope, &def.name.to_string());
             for ek in index_inserts[k].drain(..) {
                 if !istore.insert(ek, Vec::new())? {
                     // A cross-sub-statement unique-index collision under the read pin (as above).
@@ -1608,7 +1605,7 @@ impl Engine {
             if self.store_scoped(db_scope, table).get(&key)?.is_some() {
                 return Err(EngineError::unique_violation(
                     &relation,
-                    format!("{}_pkey", relation.to_ascii_lowercase()),
+                    format!("{}_pkey", relation),
                 ));
             }
             Some(key)
@@ -1619,7 +1616,7 @@ impl Engine {
                 continue;
             };
             let stored = !self
-                .index_store_scoped(db_scope, &rindex.name.to_ascii_lowercase())
+                .index_store_scoped(db_scope, &rindex.name.to_string())
                 .range_entries(&unique_probe_bound(&prefix))?
                 .is_empty();
             if stored {
@@ -1657,7 +1654,7 @@ impl Engine {
                 continue;
             };
             let parent_colls = self.column_collations(&parent.columns);
-            let supplied = if fk.ref_table.eq_ignore_ascii_case(&relation) {
+            let supplied = if fk.ref_table == relation {
                 fk_probe(&fk, parent, &parent_colls, &row, &fk.ref_columns)?
                     .map(|p| p.bytes().to_vec())
             } else {
@@ -1682,7 +1679,7 @@ impl Engine {
                 .map(|t| t.columns.clone())
                 .unwrap_or_default();
             for exc in &exclusions {
-                let ikey = exc.index.to_ascii_lowercase();
+                let ikey = exc.index.to_string();
                 if self.insert_exclusion_conflicts_stored(&tcols, exc, &row, &ikey)? {
                     return Err(EngineError::exclusion_violation(&relation, &exc.name));
                 }
@@ -1714,11 +1711,11 @@ impl Engine {
         if !self.store_mut_scoped(db_scope, table).insert(key, row)? {
             return Err(EngineError::unique_violation(
                 &relation,
-                format!("{}_pkey", relation.to_ascii_lowercase()),
+                format!("{}_pkey", relation),
             ));
         }
         for (def, entries) in indexes.iter().zip(index_entries) {
-            let istore = self.index_store_mut_scoped(db_scope, &def.name.to_ascii_lowercase());
+            let istore = self.index_store_mut_scoped(db_scope, &def.name.to_string());
             for entry in entries {
                 if !istore.insert(entry, Vec::new())? {
                     return Err(EngineError::unique_violation(&relation, &def.name));
@@ -1854,7 +1851,7 @@ impl Engine {
             // suffix → fetch the row (indexes.md §8).
             Arbiter::Index(i) => {
                 let def = &indexes[*i];
-                let istore = self.index_store(&def.name.to_ascii_lowercase());
+                let istore = self.index_store(&def.name.to_string());
                 match istore.range_entries(&unique_probe_bound(ak))?.first() {
                     None => None,
                     Some((ekey, _)) => {
@@ -2074,7 +2071,7 @@ impl Engine {
                 if self.store(table).get(&k)?.is_some() || !seen.insert(k) {
                     return Err(EngineError::unique_violation(
                         &relation,
-                        format!("{}_pkey", relation.to_ascii_lowercase()),
+                        format!("{}_pkey", relation),
                     ));
                 }
             }
@@ -2087,7 +2084,7 @@ impl Engine {
             let rewritten: HashSet<&[u8]> = updates.iter().map(|(k, _, _)| k.as_slice()).collect();
             for &ix in &uniq_idx {
                 let rindex = &rindexes[ix];
-                let istore = self.index_store(&rindex.name.to_ascii_lowercase());
+                let istore = self.index_store(&rindex.name.to_string());
                 let mut batch: HashSet<Vec<u8>> = HashSet::new();
                 for new_row in updates.iter().map(|(_, nr, _)| nr).chain(inserts.iter()) {
                     let Some(prefix) = self.index_prefix(&col_types, &colls, rindex, new_row)?
@@ -2129,7 +2126,7 @@ impl Engine {
             let check_updates = fk.columns.iter().any(|c| assigned.contains(c));
             // End-state referenced keys this statement supplies, for a self-reference: from the
             // inserted rows and the updated NEW rows.
-            let batch: HashSet<Vec<u8>> = if fk.ref_table.eq_ignore_ascii_case(&relation) {
+            let batch: HashSet<Vec<u8>> = if fk.ref_table == relation {
                 let mut s = HashSet::new();
                 for r in inserts.iter().chain(updates.iter().map(|(_, nr, _)| nr)) {
                     if let Some(p) = fk_probe(fk, parent, &parent_colls, r, &fk.ref_columns)? {
@@ -2275,7 +2272,7 @@ impl Engine {
             store.replace(&key, new_row)?;
         }
         for (k, def) in indexes.iter().enumerate() {
-            let istore = self.index_store_mut(&def.name.to_ascii_lowercase());
+            let istore = self.index_store_mut(&def.name.to_string());
             for ek in index_adds[k].drain(..) {
                 assert!(
                     istore.insert(ek, Vec::new())?,
@@ -2392,7 +2389,7 @@ impl Engine {
                 continue;
             };
             if !self
-                .index_store(&rindex.name.to_ascii_lowercase())
+                .index_store(&rindex.name.to_string())
                 .range_entries(&unique_probe_bound(&prefix))?
                 .is_empty()
             {
@@ -2773,7 +2770,7 @@ impl Engine {
     /// tables are rejected at DDL; an explicit main qualifier survives a same-named temp overlap.
     fn main_dml_target(&self, scope: Option<&str>, table: &str) -> bool {
         match scope {
-            Some(scope) => scope.eq_ignore_ascii_case("main"),
+            Some(scope) => scope == "main",
             None => !self.is_temp_table(table),
         }
     }
@@ -3193,8 +3190,7 @@ impl Engine {
             store.remove(k)?;
         }
         for (kx, def) in indexes.iter().enumerate() {
-            let istore =
-                self.index_store_mut_scoped(del.db.as_deref(), &def.name.to_ascii_lowercase());
+            let istore = self.index_store_mut_scoped(del.db.as_deref(), &def.name.to_string());
             for ek in &to_remove[kx] {
                 istore.remove(ek)?;
             }
@@ -3653,7 +3649,7 @@ impl Engine {
                 if collides {
                     return Err(EngineError::unique_violation(
                         &relation,
-                        format!("{}_pkey", relation.to_ascii_lowercase()),
+                        format!("{}_pkey", relation),
                     ));
                 }
             }
@@ -3670,8 +3666,7 @@ impl Engine {
             let rewritten: HashSet<&[u8]> =
                 updates.iter().map(|(k, _, _, _)| k.as_slice()).collect();
             for rindex in rindexes.iter().filter(|d| d.unique) {
-                let istore =
-                    self.index_store_scoped(upd.db.as_deref(), &rindex.name.to_ascii_lowercase());
+                let istore = self.index_store_scoped(upd.db.as_deref(), &rindex.name.to_string());
                 let mut batch: HashSet<Vec<u8>> = HashSet::new();
                 for (_, _, new_row, _) in &updates {
                     let Some(prefix) = self.index_prefix(&col_types, &colls, rindex, new_row)?
@@ -3705,7 +3700,7 @@ impl Engine {
             let rewritten: HashSet<&[u8]> =
                 updates.iter().map(|(k, _, _, _)| k.as_slice()).collect();
             for exc in &exclusions {
-                let ikey = exc.index.to_ascii_lowercase();
+                let ikey = exc.index.to_string();
                 for (_, _, new_row, _) in &updates {
                     if let Some((q, strats)) = exclusion_probe_query(&tcolumns, exc, new_row)? {
                         let conflict = match self.gist_tree(&ikey) {
@@ -3751,7 +3746,7 @@ impl Engine {
             // The probe matches the parent's stored key, so a collated parent key column uses the
             // PARENT's collation (§2.12).
             let parent_colls = self.column_collations(&parent.columns);
-            let batch: HashSet<Vec<u8>> = if fk.ref_table.eq_ignore_ascii_case(&relation) {
+            let batch: HashSet<Vec<u8>> = if fk.ref_table == relation {
                 let mut s = HashSet::new();
                 for (_, _, new_row, _) in &updates {
                     if let Some(p) = fk_probe(fk, parent, &parent_colls, new_row, &fk.ref_columns)?
@@ -3849,7 +3844,7 @@ impl Engine {
         let updated = updates.len() as i64;
         let store = self.store_mut_scoped(upd.db.as_deref(), &upd.table);
         if pk_changed {
-            let relation_lc = relation.to_ascii_lowercase();
+            let relation_lc = relation.to_string();
             for (old_key, _, _, _) in &updates {
                 store.remove(old_key)?;
             }
@@ -3866,8 +3861,7 @@ impl Engine {
                 }
             }
             for (k, def) in indexes.iter().enumerate() {
-                let istore =
-                    self.index_store_mut_scoped(upd.db.as_deref(), &def.name.to_ascii_lowercase());
+                let istore = self.index_store_mut_scoped(upd.db.as_deref(), &def.name.to_string());
                 for (removals, _) in &index_moves[k] {
                     for old_ek in removals {
                         istore.remove(old_ek)?;
@@ -3887,8 +3881,7 @@ impl Engine {
                 store.replace(key, row.clone())?;
             }
             for (k, def) in indexes.iter().enumerate() {
-                let istore =
-                    self.index_store_mut_scoped(upd.db.as_deref(), &def.name.to_ascii_lowercase());
+                let istore = self.index_store_mut_scoped(upd.db.as_deref(), &def.name.to_string());
                 for (removals, insertions) in index_moves[k].drain(..) {
                     for old_ek in removals {
                         istore.remove(&old_ek)?;

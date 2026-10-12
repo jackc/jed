@@ -538,7 +538,7 @@ The cache is exercised inside the lane's explicit transaction: the first INSERT 
 the visible target schema exactly matches the committed schema, and the remaining 999 executions
 hit. Working DDL cannot fill or overwrite an older committed entry. Estimator revisions are absent
 from the DML signature because successful INSERTs advance them; database/attachment identity,
-catalog generation, lowercased target name, and temp-shadow state remain validity inputs. Exact
+catalog generation, target name, and temp-shadow state remain validity inputs. Exact
 cache-hit tests in all three cores cover DDL, drop/recreate, detach/reattach, collation upgrade,
 another core, temp shadowing, rollback restoration, privileges, read-only state, result/error/cost,
 and serialized tree bytes. Go additionally races concurrent sessions against the atomic cache slot.

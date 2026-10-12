@@ -5,6 +5,7 @@
 
 import { decimalFromParts, EXP_LIMIT } from "./decimal.ts";
 import { engineError } from "./errors.ts";
+import { utf8Length } from "./memsize.ts";
 import type { Token } from "./token.ts";
 
 // The maximum integer-literal MAGNITUDE the lexer accepts: 2^63, so that the unary
@@ -320,9 +321,9 @@ export function lex(sql: string): Token[] {
       }
       tokens.push({ kind: "str", str: s });
     } else if (c === '"') {
-      // Double-quoted identifier (collation names, spec/design/collation.md §1). `""` is an embedded
-      // double quote; the content is kept VERBATIM (case-sensitive). The parser rejects an empty
-      // name; an empty `""` lexes fine here.
+      // Double-quoted identifier (spec/design/grammar.md §3): the name VERBATIM (case-sensitive,
+      // any UTF-8), `""` an embedded double quote. Accumulating code units verbatim keeps a
+      // surrogate pair's halves together.
       i++; // consume the opening quote
       let s = "";
       let closed = false;
@@ -342,6 +343,19 @@ export function lex(sql: string): Token[] {
       }
       if (!closed) {
         throw engineError("syntax_error", "unterminated quoted identifier");
+      }
+      // A zero-length delimited identifier is a syntax error (PostgreSQL's rule,
+      // spec/design/grammar.md §3).
+      if (s === "") {
+        throw engineError("syntax_error", "zero-length delimited identifier");
+      }
+      // The identifier-length gate applies to a quoted name too, measured on its decoded UTF-8
+      // bytes (spec/design/cost.md §7) — NOT its UTF-16 .length.
+      if (utf8Length(s) > MAX_IDENTIFIER_LENGTH) {
+        throw engineError(
+          "name_too_long",
+          `identifier exceeds the maximum length of ${MAX_IDENTIFIER_LENGTH} bytes`,
+        );
       }
       tokens.push({ kind: "quotedIdent", str: s });
     } else if (isDigit(c)) {
@@ -445,7 +459,10 @@ export function lex(sql: string): Token[] {
           `identifier exceeds the maximum length of ${MAX_IDENTIFIER_LENGTH} bytes`,
         );
       }
-      tokens.push({ kind: "word", word: sql.slice(start, i) });
+      // A bare word folds to lowercase (ASCII — the word is ASCII-only) here, so every later
+      // comparison of a name is byte-exact and keyword matching is case-insensitive by
+      // construction (spec/design/grammar.md §3).
+      tokens.push({ kind: "word", word: sql.slice(start, i).toLowerCase() });
     } else {
       throw engineError("syntax_error", `unexpected character '${c}'`);
     }

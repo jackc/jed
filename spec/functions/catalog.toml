@@ -64,7 +64,9 @@ volatility     = "immutable"
 #                 per position (length == arity), enabling PostgreSQL named notation
 #                 f(name => value). Absent ⇒ the function has no named parameters and named
 #                 notation on it is 42883 (PG's behavior for abs/round/the aggregates). Names
-#                 resolve case-insensitively; no duplicates within a row. Codegen'd into the
+#                 are lowercase and match the folded argument name byte-exactly (a bare
+#                 YEARS => folds to years; a quoted "YEARS" => does not match — grammar.md §3);
+#                 no duplicates within a row. Codegen'd into the
 #                 descriptor so the hand-written resolver maps a named arg to its slot.
 # arg_defaults    OPTIONAL (scalar functions only). DEFAULT values for the TRAILING parameters,
 #                 as integer-literal strings (length ≤ arity; a default may occupy only a
@@ -5019,8 +5021,9 @@ errors         = ["22023", "0A000"]
 #               arg_families) is unique. COUNT has two rows: count_star (the COUNT(*) row
 #               counter) and count (COUNT(expr)).
 # kind          always "aggregate".
-# surface       SQL spelling, uppercase canonical (COUNT/SUM/MIN/MAX/AVG); resolved
-#               case-insensitively — aggregate names are not reserved (grammar.md §3).
+# surface       SQL spelling, uppercase canonical (COUNT/SUM/MIN/MAX/AVG); a bare spelling folds
+#               to the lowercase name, a quoted one must be exactly lowercase — aggregate names
+#               are not reserved (grammar.md §3).
 # arg           "star" = the COUNT(*) no-expression row counter; "expr" = one general
 #               expression argument. (DISTINCT inside an aggregate is deferred — 42601.)
 # arg_families  required family of the expression argument ("any" = unconstrained).
@@ -5209,8 +5212,8 @@ errors       = ["0A000"]
 # name           internal identity + AST/resolver WindowPlan selector. Uniqueness key is `name`
 #                (no overloading this slice — each window function has one signature).
 # kind           always "window".
-# surface        SQL spelling, uppercase canonical (resolved case-insensitively — window names are
-#                not reserved, grammar.md §3).
+# surface        SQL spelling, uppercase canonical (a bare spelling folds to the lowercase name, a
+#                quoted one must be exactly lowercase — window names are not reserved, grammar.md §3).
 # args           argument shape: "none" (row_number/rank/dense_rank/percent_rank/cume_dist —
 #                no argument), "one" (ntile(n)/first_value(e)/last_value(e) — one argument),
 #                "value_offset_default" (lag/lead — a value expr + optional integer offset +
@@ -5404,8 +5407,8 @@ errors         = ["22016"]
 #               and 3-arg generate_series share the name), so the uniqueness key is (name,
 #               arity), not (name, arg_families) — both forms take the same family per position.
 # kind          always "set_returning".
-# surface       SQL spelling, lowercase canonical (resolved case-insensitively — SRF names are
-#               not reserved, grammar.md §3).
+# surface       SQL spelling, lowercase canonical (matched byte-exactly on the folded name — a
+#               quoted spelling must be lowercase; SRF names are not reserved, grammar.md §3).
 # arity         operand count (generate_series: 2 = start/stop, 3 = start/stop/step; unnest: 1).
 # arg_families  required family of each operand, by position, referencing a `family` in
 #               ../types/scalars.toml. generate_series takes "integer" per position; unnest takes

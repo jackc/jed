@@ -351,10 +351,10 @@ pub struct Snapshot {
     /// snapshot automatically and no file-format state is involved.
     estimator_base_revision: std::sync::Arc<EstimatorRevision>,
     estimator_revisions: std::sync::Arc<HashMap<String, std::sync::Arc<EstimatorRevision>>>,
-    /// Persisted, transactional P9 column facts, keyed by lowercased table name then column ordinal.
+    /// Persisted, transactional P9 column facts, keyed by exact table name then column ordinal.
     statistics: std::sync::Arc<HashMap<String, HashMap<usize, ColumnStatistics>>>,
     tables: std::sync::Arc<HashMap<String, Table>>,
-    /// User-defined composite (row) types, keyed by lowercased name (spec/design/composite.md).
+    /// User-defined composite (row) types, keyed by exact name (spec/design/composite.md).
     /// A database-level object set, separate from `tables`; serialized into the catalog's
     /// composite-type entries (spec/fileformat/format.md). Sorted by key when serialized so
     /// hash-map iteration order never leaks (CLAUDE.md §8).
@@ -362,10 +362,10 @@ pub struct Snapshot {
     stores: std::sync::Arc<HashMap<String, TableStore>>,
     /// Each secondary index's B-tree (spec/design/indexes.md §3): a `TableStore` with ZERO
     /// value columns (entry keys only — the on-disk empty-payload record), keyed by the
-    /// lowercased index name (index names live in the relation namespace, globally unique).
+    /// exact index name (index names live in the relation namespace, globally unique).
     /// Which table owns an index is recorded in that table's `Table::indexes`.
     index_stores: std::sync::Arc<HashMap<String, TableStore>>,
-    /// Sequences, keyed by lowercased name (spec/design/sequences.md). A database-level object set
+    /// Sequences, keyed by exact name (spec/design/sequences.md). A database-level object set
     /// separate from `tables`/`types`; serialized into the catalog's sequence entries
     /// (spec/fileformat/format.md, `entry_kind = 2`). The mutable counter (`last_value`/`is_called`)
     /// lives here, so `nextval` advances the working snapshot and rolls back with it (sequences.md §5).
@@ -381,7 +381,7 @@ pub struct Snapshot {
     /// (`db.set_default_collation`); persisted as the `is_default` flag bit on that collation's
     /// `entry_kind = 3` snapshot, restored on load. `C` ⇒ no snapshot carries the bit.
     default_collation: Option<String>,
-    /// Each GiST index's **resident R-tree** (spec/design/gist.md §4.1), keyed by the lowercased
+    /// Each GiST index's **resident R-tree** (spec/design/gist.md §4.1), keyed by the exact
     /// index name. The leaf-key store (`index_stores`) stays the maintained source of truth (so all
     /// insert/update/delete index maintenance is reused, gist.md §4.1); this tree is the acceleration
     /// structure the planner descends. Rebuilt **canonically** (`build_from_leaf_keys` — content-
@@ -420,7 +420,7 @@ pub(crate) struct EstimatorRevision {
 /// being dropped. `RESTRICT` formats `ref_table_name`/`fk_name`/`dropped_name` into its 2BP01
 /// detail; `CASCADE` uses `ref_table_key`/`fk_name` to remove the now-dangling constraint.
 pub(crate) struct FkDependent {
-    /// Lowercased catalog key of the (surviving) referencing table — for the CASCADE removal.
+    /// Exact catalog key of the (surviving) referencing table — for the CASCADE removal.
     pub ref_table_key: String,
     /// The FK constraint's name.
     pub fk_name: String,
@@ -488,7 +488,7 @@ pub struct Engine {
     /// The version the current `free_pages` list is "as of" — the last compaction's txid, or the
     /// committed version at open. It gates within-session reuse under the reader-liveness watermark
     /// (transactions.md §8): a page dead at generation G is reusable only once no reader pins a version
-    /// older than G. A bare single-handle `Engine` has no live registry (oldest_live == committed), so the
+    /// older than G. A bare single-handle `Engine` has no live registry oldest_live == committed, so the
     /// gate always passes and the byte layout is unchanged.
     pub(crate) free_gen_txid: u64,
     /// The shared paging context for a file-backed database (spec/design/pager.md): the open pager
@@ -532,7 +532,7 @@ pub struct Engine {
     /// Set at session mint (shared.rs).
     pub(crate) core: Option<std::sync::Arc<crate::shared::Shared>>,
     /// The PINNED committed root of every host-attached DATABASE-scoped database
-    /// (attached-databases.md §5), keyed by lowercased name — this session's stable read view, snapshot
+    /// (attached-databases.md §5), keyed by exact name — this session's stable read view, snapshot
     /// isolated: refreshed from the core's published `Roots::attached` at each autocommit statement
     /// (`refresh_committed`) and pinned for the life of an explicit `BEGIN` block. Empty when nothing is
     /// attached. Session-local temp is NOT here (it rides `SessionState::temp_committed`); this holds
@@ -890,10 +890,10 @@ pub struct SessionState {
     /// copy on its shared core — the kernels are `Send + Sync`.
     pub(crate) extensions: std::sync::Arc<crate::extension::ExtensionRegistry>,
     /// **SessionState** `currval` state (spec/design/sequences.md §6): the last value `nextval`/
-    /// `setval(…,true)` produced **in this session** for each sequence (lowercased name). NOT in the
+    /// `setval(…,true)` produced **in this session** for each sequence (exact name). NOT in the
     /// snapshot and NOT persisted — strictly session-local, as in PostgreSQL.
     pub(crate) session_seq: HashMap<String, i64>,
-    /// **SessionState** `lastval` state (sequences.md §6): the lowercased name of the sequence the most
+    /// **SessionState** `lastval` state (sequences.md §6): the exact name of the sequence the most
     /// recent `nextval` (of any sequence) ran on — `None` before the first `nextval`.
     pub(crate) session_last_name: Option<String>,
     /// Per-**statement** running sequence advances (sequences.md §4), behind a `RefCell` for interior
@@ -1346,13 +1346,13 @@ pub(crate) struct ActiveTx {
     /// image; candidate domains are refined against their base snapshots before persistence.
     temp_dirty: bool,
     /// The transaction's working copy of each host-attached database's snapshot
-    /// (attached-databases.md §5), keyed by lowercased attachment name — the attachment analogue of
+    /// (attached-databases.md §5), keyed by exact attachment name — the attachment analogue of
     /// `temp_working`. Cloned lazily from [`Engine::attached_committed`] on the first write to that
     /// attachment ([`Engine::attach_write_snap`]), so a read-only cross-attachment query allocates
     /// nothing here. Adopted into `attached_committed` + persisted+published on a successful COMMIT,
     /// discarded on ROLLBACK. Empty until an attachment is written.
     attach_working: HashMap<String, Snapshot>,
-    /// Which attachments this transaction mutated (lowercased names) — the per-attachment analogue of
+    /// Which attachments this transaction mutated (exact names) — the per-attachment analogue of
     /// `main_dirty`/`temp_dirty`, the set the commit persists + publishes.
     attach_dirty: HashSet<String>,
 }
@@ -1394,8 +1394,8 @@ impl Default for Engine {
 // may fold on it (spec/design/grammar.md §15).
 // ============================================================================
 
-/// One relation in a FROM scope: its label (alias, else table name — lower-cased for
-/// case-insensitive matching), the table, and the flat offset of its first column in the
+/// One relation in a FROM scope: its label (alias, else table name — exact for
+/// byte-exact matching), the table, and the flat offset of its first column in the
 /// joined row. A `qualifier_only` relation is visible ONLY to qualified references — the
 /// RETURNING `old`/`new` row-version pseudo-relations (grammar.md §32): bare-column
 /// resolution skips it (no new ambiguity), every other statement never builds one.
@@ -1431,14 +1431,15 @@ impl ScopeRel<'_> {
 /// (attached-databases.md §3), which resolve to the SAME store the bare name would. A `None` qualifier
 /// (a bare implicit-scope name) counts as reserved for routing: it too keeps the temp-first funnels.
 /// Reject a USER-written catalog object name beginning `jed_` — the prefix is reserved for the
-/// engine's own catalog relations (spec/design/introspection.md §4). Case-insensitive (resolution
-/// folds case and there is no quoted-identifier escape — grammar.md §3). Engine-GENERATED names (a
+/// engine's own catalog relations (spec/design/introspection.md §4). Byte-exact on the (folded)
+/// name: a bare `JED_x` folds to `jed_x` and is rejected, a quoted `"JED_x"` is a different name and
+/// is allowed (grammar.md §3, PostgreSQL's `pg_` rule). Engine-GENERATED names (a
 /// serial's `<table>_<col>_seq`, an index auto-name — both legal for a table named `jed`) never
 /// pass through here; the check sits with each site's namespace-collision check so established
 /// validation orders (42P01/42703 before name checks) are preserved. `kind` is the object word in
 /// the message: table / index / sequence / type.
 fn check_reserved_name(kind: &str, name: &str) -> Result<()> {
-    if name.len() >= 4 && name.as_bytes()[..4].eq_ignore_ascii_case(b"jed_") {
+    if name.starts_with("jed_") {
         return Err(EngineError::new(
             SqlState::ReservedName,
             format!(
@@ -1452,7 +1453,7 @@ fn check_reserved_name(kind: &str, name: &str) -> Result<()> {
 fn is_reserved_scope(q: Option<&str>) -> bool {
     match q {
         None => true,
-        Some(s) => matches!(s.to_ascii_lowercase().as_str(), "main" | "temp"),
+        Some(s) => matches!(s, "main" | "temp"),
     }
 }
 
@@ -1542,8 +1543,8 @@ fn build_prefix_scope<'s>(
 }
 
 /// A planned common table expression, owned by `plan_with` for the whole statement (so the scopes
-/// that borrow its synthetic `table` outlive it — spec/design/cte.md §A.2). `name` is lowercased
-/// for case-insensitive FROM matching; `table` is the synthetic relation exposing the body's output
+/// that borrow its synthetic `table` outlive it — spec/design/cte.md §A.2). `name` is exact
+/// for byte-exact FROM matching; `table` is the synthetic relation exposing the body's output
 /// columns; `source` is the planned body (a query plan, or — spec/design/writable-cte.md — a
 /// data-modifying statement); `hint` is the `[NOT] MATERIALIZED` override; `refs` counts the FROM
 /// references resolved to it during planning (a `Cell` — planning borrows `&self`).
@@ -1603,7 +1604,7 @@ pub(crate) enum Resolved {
     Outer { level: usize, index: usize },
 }
 
-/// A `USING` / `NATURAL` **merged column** (spec/design/grammar.md §15): `name` is the (lowercased)
+/// A `USING` / `NATURAL` **merged column** (spec/design/grammar.md §15): `name` is the (exact)
 /// join column and `index` the flat row index a bare reference to it resolves to — the **surviving
 /// side**: the left column for `INNER`/`LEFT`, the right column for `RIGHT`. (`FULL JOIN ... USING`,
 /// whose merge is `COALESCE(left, right)` and so is not a single column, is a deferred `0A000`
@@ -1711,7 +1712,7 @@ impl<'a> Scope<'a> {
     fn single(catalog: &'a Engine, table: &'a Table) -> Scope<'a> {
         Scope {
             rels: vec![ScopeRel {
-                label: table.name.to_ascii_lowercase(),
+                label: table.name.to_string(),
                 table,
                 offset: 0,
                 qualifier_only: false,
@@ -1776,7 +1777,7 @@ impl<'a> Scope<'a> {
         returning: &ReturningClause,
     ) -> Result<Scope<'a>> {
         let n = table.columns.len();
-        let label = table.name.to_ascii_lowercase();
+        let label = table.name.to_string();
         let (old_offset, new_offset) = if base_is_old { (0, n) } else { (n, 0) };
         let mut rels = vec![ScopeRel {
             label: label.clone(),
@@ -1791,7 +1792,7 @@ impl<'a> Scope<'a> {
             (returning.new_alias.as_deref(), new_offset),
         ] {
             if let Some(alias) = alias {
-                let alias = alias.to_ascii_lowercase();
+                let alias = alias.to_string();
                 if rels.iter().any(|r| r.label == alias) {
                     return Err(EngineError::new(
                         SqlState::DuplicateAlias,
@@ -1846,7 +1847,7 @@ impl<'a> Scope<'a> {
     /// the RETURNING `old`/`new` qualifiers, §32).
     fn on_conflict_excluded(catalog: &'a Engine, table: &'a Table) -> Scope<'a> {
         let n = table.columns.len();
-        let label = table.name.to_ascii_lowercase();
+        let label = table.name.to_string();
         let mut rels = vec![ScopeRel {
             label: label.clone(),
             table,
@@ -1891,11 +1892,7 @@ impl<'a> Scope<'a> {
         // so the bare name binds the merged column rather than its two (hidden) underlying copies —
         // which is why such a join column is unambiguous. A *non-hidden* column elsewhere with the
         // same name still makes the reference ambiguous (a third relation sharing the name).
-        let mut found: Option<usize> = self
-            .merges
-            .iter()
-            .find(|m| m.name.eq_ignore_ascii_case(name))
-            .map(|m| m.index);
+        let mut found: Option<usize> = self.merges.iter().find(|m| m.name == name).map(|m| m.index);
         for r in &self.rels {
             if r.qualifier_only {
                 continue;
@@ -1911,7 +1908,7 @@ impl<'a> Scope<'a> {
                 if self.hidden.contains(&idx) {
                     continue;
                 }
-                if c.name.eq_ignore_ascii_case(name) {
+                if c.name == name {
                     if found.is_some() {
                         return Err(ambiguous_column(name));
                     }
@@ -1933,7 +1930,7 @@ impl<'a> Scope<'a> {
     /// an inner relation shadows a same-named outer one). Only an unknown qualifier walks
     /// outward (42P01 if no ancestor has it).
     fn resolve_qualified(&self, qualifier: &str, name: &str) -> Result<Resolved> {
-        let q = qualifier.to_ascii_lowercase();
+        let q = qualifier.to_string();
         if let Some(rel) = self.rels.iter().find(|r| r.label == q) {
             // A synthetic relation (a derived table, an aliased parenthesized join) may carry two
             // columns of one name; a qualified reference to it is ambiguous (42702) exactly as a bare
@@ -1942,7 +1939,7 @@ impl<'a> Scope<'a> {
             let mut visible: Option<usize> = None;
             let mut ambiguous = false;
             for (local, c) in rel.table.columns.iter().enumerate() {
-                if !c.name.eq_ignore_ascii_case(name) {
+                if c.name != name {
                     continue;
                 }
                 let idx = rel.offset + local;
@@ -2256,7 +2253,7 @@ impl CmpOp {
 }
 
 /// The scalar functions (kind = "function", spec/design/functions.md §9), parsed from a call
-/// name (case-insensitive). Evaluated per row; the overload (integer vs decimal) is recovered
+/// name (exact name). Evaluated per row; the overload (integer vs decimal) is recovered
 /// at eval from the argument's runtime value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScalarFunc {
@@ -3081,7 +3078,7 @@ pub(crate) enum RExpr {
     /// to host code.
     HostFunc {
         id: usize,
-        /// The (lowercased) function name, carried on the node so EXPLAIN can render it without the
+        /// The (exact) function name, carried on the node so EXPLAIN can render it without the
         /// registry (which the `&RExpr`-only printer does not have). Redundant with the registry
         /// entry at `id`; a few bytes per node.
         name: String,
@@ -3578,7 +3575,7 @@ fn count_self_refs_query(qe: &QueryExpr, name: &str) -> usize {
                 if !shadowed {
                     n += count_cte_refs_dml(&cte.body, name);
                 }
-                if cte.name.eq_ignore_ascii_case(name) {
+                if cte.name == name {
                     shadowed = true;
                 }
             }
@@ -3606,7 +3603,7 @@ fn count_self_refs_select(s: &Select, name: &str) -> usize {
 /// name (+1), a derived-table subquery (recurse), or a table-function's / VALUES' argument exprs.
 fn count_self_refs_tableref(tref: &TableRef, name: &str) -> usize {
     if is_plain_relation(tref) {
-        return usize::from(tref.name.eq_ignore_ascii_case(name));
+        return usize::from(tref.name == name);
     }
     let mut n = 0;
     if let Some(sub) = &tref.subquery {
@@ -3815,7 +3812,7 @@ fn count_returning_refs(returning: &Option<ReturningClause>, name: &str) -> usiz
 /// the name, not nested in a subquery). This is the only valid position for a recursive reference.
 fn count_direct_from_self_refs(s: &Select, name: &str) -> usize {
     from_relations(s)
-        .filter(|tref| is_plain_relation(tref) && tref.name.eq_ignore_ascii_case(name))
+        .filter(|tref| is_plain_relation(tref) && tref.name == name)
         .count()
 }
 
@@ -3844,9 +3841,9 @@ fn direct_self_ref_on_nullable_side(s: &Select, name: &str) -> bool {
             JoinKind::Inner | JoinKind::Cross => {}
         }
     }
-    rels.iter().enumerate().any(|(i, tref)| {
-        is_plain_relation(tref) && tref.name.eq_ignore_ascii_case(name) && nullable[i]
-    })
+    rels.iter()
+        .enumerate()
+        .any(|(i, tref)| is_plain_relation(tref) && tref.name == name && nullable[i])
 }
 
 /// A FROM relation that is a plain table NAME — not a derived-table subquery, a table function, or
@@ -4326,19 +4323,19 @@ pub(crate) struct SrfPlan {
     /// The resolved column tree for a `JSON_TABLE` SRF (`JsonTable`), else `None`.
     json_table: Option<Box<JtPlan>>,
     /// The validated database scope of a catalog relation (`JedTables` / `JedColumns` —
-    /// introspection.md §5): `"main"` (also the unqualified default), `"temp"`, or a lowercased
+    /// introspection.md §5): `"main"` (also the unqualified default), `"temp"`, or an exact
     /// attachment name. Empty for every other kind.
     introspect_scope: String,
 }
 
 /// Classify a relation name as a built-in catalog relation (introspection.md §5): the `jed_`-prefixed
-/// relation family, case-insensitively (identifier resolution folds case; grammar.md §3 leaves no
-/// quoted escape). Built-in names resolve in every database's relation namespace, checked AFTER a
+/// relation family, byte-exactly (a bare spelling is already folded; a quoted mixed-case spelling
+/// is a different name, grammar.md §3). Built-in names resolve in every database's relation namespace, checked AFTER a
 /// statement-local CTE (a CTE shadows a catalog relation — PG-matching, oracle-checked) and BEFORE
 /// the user catalog (post-I0 the two can never collide; for a pre-reservation legacy file the
 /// built-in wins and the user relation is unreachable by name — §5).
 fn catalog_rel_kind(name: &str) -> Option<SrfKind> {
-    match name.to_ascii_lowercase().as_str() {
+    match name.to_string().as_str() {
         "jed_tables" => Some(SrfKind::JedTables),
         "jed_columns" => Some(SrfKind::JedColumns),
         "jed_indexes" => Some(SrfKind::JedIndexes),
@@ -4378,10 +4375,7 @@ fn check_catalog_rel_write(name: &str) -> Result<()> {
     if is_catalog_rel_name(name) {
         return Err(EngineError::new(
             SqlState::WrongObjectType,
-            format!(
-                "cannot modify system relation \"{}\"",
-                name.to_ascii_lowercase()
-            ),
+            format!("cannot modify system relation \"{}\"", name),
         ));
     }
     Ok(())
@@ -4605,7 +4599,7 @@ fn apply_srf_column_aliases(
             SqlState::InvalidColumnReference,
             format!(
                 "table \"{}\" has {} columns available but {} columns specified",
-                relation_name.to_ascii_lowercase(),
+                relation_name,
                 table.columns.len(),
                 aliases.len()
             ),

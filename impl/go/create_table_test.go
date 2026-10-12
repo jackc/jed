@@ -3,7 +3,11 @@ package jed
 // Phase B: CREATE TABLE — parse, analyze, register in the catalog. Driven by unit
 // tests until the `core` profile is complete and the corpus runs (Phase E).
 
-import "testing"
+import (
+	"bytes"
+	"slices"
+	"testing"
+)
 
 func mustCreate(t *testing.T, db dbHandle, sql string) outcome {
 	t.Helper()
@@ -67,15 +71,94 @@ func TestSQLStandardTypeAliasesResolve(t *testing.T) {
 	}
 }
 
-func TestTableAndTypeNamesAreCaseInsensitive(t *testing.T) {
+// A bare name folds to lowercase; the host API looks a name up exactly (grammar.md §3).
+func TestBareNamesFoldAndHostLookupIsExact(t *testing.T) {
 	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustCreate(t, db, "create table T (Id I32 primary key)")
-	if _, ok := db.Table("t"); !ok {
-		t.Error("lowercase lookup failed")
+	tbl, ok := db.Table("t")
+	if !ok {
+		t.Fatal("lowercase lookup failed")
 	}
-	if _, ok := db.Table("T"); !ok {
-		t.Error("uppercase lookup failed")
+	if tbl.Columns[0].Name != "id" {
+		t.Errorf("column name = %q, want id", tbl.Columns[0].Name)
+	}
+	if _, ok := db.Table("T"); ok {
+		t.Error("uppercase lookup must not reach the folded table t")
+	}
+	mustCreate(t, db, `create table "T" ("Id" i32 primary key)`)
+	up, ok := db.Table("T")
+	if !ok || up.Columns[0].Name != "Id" {
+		t.Fatalf("quoted table T missing or wrong column: %v", up)
+	}
+}
+
+// The on-disk catalog emits each name group in ascending BYTE order of the exact name
+// (format_version 37): uppercase ASCII sorts before lowercase, so B < C < a, and the reload keeps
+// every name exact (a bare lookup never reaches a mixed-case name).
+func TestCatalogOrderIsExactNameBytesAcrossReload(t *testing.T) {
+	t.Parallel()
+	db := memDB().Session(SessionOptions{})
+	for _, sql := range []string{
+		"CREATE TABLE a (id i32 PRIMARY KEY)",
+		`CREATE TABLE "C" (id i32 PRIMARY KEY)`,
+		`CREATE TABLE "B" (id i32 PRIMARY KEY, "V" i32, v i32)`,
+		`CREATE INDEX "Zed" ON "B" (v)`,
+		`CREATE INDEX alpha ON "B" ("V")`,
+		`CREATE SEQUENCE "Seq"`,
+		"CREATE SEQUENCE aseq",
+	} {
+		mustCreate(t, db, sql)
+	}
+	image, err := db.ToImage(8192, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadEngine(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for name := range loaded.readSnap().tables {
+		got = append(got, name)
+	}
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"B", "C", "a"}) {
+		t.Fatalf("table names = %v", got)
+	}
+	b, ok := loaded.Table("B")
+	if !ok {
+		t.Fatal("table B missing")
+	}
+	var idx []string
+	for _, ix := range b.Indexes {
+		idx = append(idx, ix.Name)
+	}
+	if !slices.Equal(idx, []string{"Zed", "alpha"}) {
+		t.Fatalf("index order = %v", idx)
+	}
+	if b.Columns[1].Name != "V" || b.Columns[2].Name != "v" {
+		t.Fatalf("columns = %q, %q", b.Columns[1].Name, b.Columns[2].Name)
+	}
+	if _, ok := loaded.Table("b"); ok {
+		t.Fatal("bare b must not reach B")
+	}
+	if _, err := queryOutcome(loaded, `SELECT nextval('"Seq"')`, nil); err != nil {
+		t.Fatalf("nextval Seq: %v", err)
+	}
+	wantErr(t, loaded, "SELECT nextval('Seq')", "42P01") // the bare text folds to seq
+	// Re-serializing the catalog is byte-identical (the reader trusts the emitted order); the
+	// nextval above advanced "Seq", so compare against a fresh reload of the original image.
+	fresh, err := loadEngine(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := fresh.ToImage(8192, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(again, image) {
+		t.Fatal("re-serialized image differs")
 	}
 }
 

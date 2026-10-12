@@ -1,6 +1,7 @@
 // Hand-written recursive-descent parser (CLAUDE.md §5, §10). Mirrors parser.go /
 // parser.rs. Errors throw EngineError (42601). The lexer emits generic word tokens (no
-// reserved-keyword table), so keywords are matched case-insensitively here.
+// reserved-keyword table); the lexer folds every bare word to lowercase, so keywords match
+// byte-exactly here (and a quoted identifier is never a keyword — grammar.md §3).
 
 import type {
   AlterColumnAction,
@@ -66,11 +67,22 @@ import type { Token, TokenKind } from "./token.ts";
 const I64_MIN = -9223372036854775808n;
 const I64_MAX = 9223372036854775807n;
 
-function lower(s: string): string {
-  return s.toLowerCase();
+// isIdentKind reports whether a token kind can be an identifier: a bare word (folded) or a quoted
+// identifier (exact) — spec/design/grammar.md §3.
+function isIdentKind(k: TokenKind | undefined): boolean {
+  return k === "word" || k === "quotedIdent";
 }
 
-// isTableRefStopKeyword reports whether kw (already lower-cased) is a keyword that may legally
+// identName is the name an identifier token spells (a bare word's folded text, a quoted
+// identifier's exact content), or null for any other token.
+function identName(t: Token | undefined): string | null {
+  if (t === undefined) return null;
+  if (t.kind === "word") return t.word!;
+  if (t.kind === "quotedIdent") return t.str!;
+  return null;
+}
+
+// isTableRefStopKeyword reports whether kw (already folded by the lexer) is a keyword that may legally
 // follow a table_ref, and so must NOT be swallowed as an implicit table alias: a trailing clause
 // keyword (where/order/limit/offset) or any join-machinery keyword
 // (join/inner/cross/left/right/full/outer/on). `as` is handled separately. This set is a
@@ -1041,7 +1053,7 @@ class Parser {
     // lookahead, extended for the optional USING clause — grammar.md §30, gin.md §3).
     const unnamed =
       this.peekKeyword() === "on" &&
-      this.peekKindAt(1) === "word" &&
+      isIdentKind(this.peekKindAt(1)) &&
       (this.peekKindAt(2) === "lparen" || this.peekKeywordAt(2) === "using");
     const name = unnamed ? null : this.expectIdentifier();
     this.expectKeyword("on");
@@ -1094,7 +1106,7 @@ class Parser {
       this.expect("rparen");
       return this.indexKeyFromExpr(expr, text);
     }
-    if (this.peek().kind === "word" && this.peekKindAt(1) === "lparen") {
+    if (isIdentKind(this.peek().kind) && this.peekKindAt(1) === "lparen") {
       // A bare function call `f(args)` — parse ONLY the primary, so a trailing operator
       // (`lower(x) + 1`) leaves `+` for the element loop to reject (PG requires parens).
       const start = this.pos;
@@ -1949,7 +1961,7 @@ class Parser {
     }
     if (!negate && t.kind === "str") return { kind: "text", text: t.str! };
     if (!negate && t.kind === "word") {
-      const w = lower(t.word!);
+      const w = t.word!;
       if (w === "null") return { kind: "null" };
       if (w === "true") return { kind: "bool", value: true };
       if (w === "false") return { kind: "bool", value: false };
@@ -2130,7 +2142,7 @@ class Parser {
   private isWithClauseAtOffset(offset: number): boolean {
     if (this.peekKeywordAt(offset) !== "with") return false;
     if (this.peekKeywordAt(offset + 1) === "recursive") return true;
-    if (this.peekKindAt(offset + 1) === "word") {
+    if (isIdentKind(this.peekKindAt(offset + 1))) {
       return this.peekKindAt(offset + 2) === "lparen" || this.peekKeywordAt(offset + 2) === "as";
     }
     return false;
@@ -2276,8 +2288,7 @@ class Parser {
     let distinct = false;
     if (this.peekKeyword() === "distinct") {
       const next = this.tokens[this.pos + 1]!;
-      const modifier =
-        next.kind !== "eof" && !(next.kind === "word" && lower(next.word!) === "from");
+      const modifier = next.kind !== "eof" && !(next.kind === "word" && next.word! === "from");
       if (modifier) {
         this.advance();
         distinct = true;
@@ -2376,8 +2387,13 @@ class Parser {
   // a window named like a keyword would need quoting, which jed's window names do not support).
   private parseOptBaseWindowName(): string | null {
     const t = this.peek();
+    // A quoted name is never a keyword (grammar.md §3).
+    if (t.kind === "quotedIdent") {
+      this.advance();
+      return t.str!;
+    }
     if (t.kind !== "word") return null;
-    switch (lower(t.word!)) {
+    switch (t.word!) {
       case "partition":
       case "order":
       case "rows":
@@ -2577,7 +2593,7 @@ class Parser {
     const lateral =
       this.peekKeyword() === "lateral" &&
       (this.peekKindAt(1) === "lparen" ||
-        (this.peekKindAt(1) === "word" && this.peekKindAt(2) === "lparen"));
+        (isIdentKind(this.peekKindAt(1)) && this.peekKindAt(2) === "lparen"));
     if (lateral) {
       this.advance();
     }
@@ -2622,7 +2638,10 @@ class Parser {
       alias = this.expectIdentifier();
     } else {
       const t = this.peek();
-      if (t.kind === "word" && !isTableRefStopKeyword(lower(t.word!))) {
+      if (t.kind === "quotedIdent") {
+        alias = t.str!;
+        this.advance();
+      } else if (t.kind === "word" && !isTableRefStopKeyword(t.word!)) {
         alias = t.word!;
         this.advance();
       }
@@ -2644,7 +2663,7 @@ class Parser {
       // Disambiguate: a col-def list has `name type`; a rename list has `name ,`/`name )`. After the
       // opening `(`, the current token is the first column name, so a `word` in the NEXT slot means a
       // type follows (col-def list).
-      if (this.peekKindAt(1) === "word") {
+      if (isIdentKind(this.peekKindAt(1))) {
         columnDefs = this.parseFieldDefList();
       } else {
         columnAliases = [this.expectIdentifier()];
@@ -2698,7 +2717,10 @@ class Parser {
       alias = this.expectIdentifier();
     } else {
       const t = this.peek();
-      if (t.kind === "word" && !isTableRefStopKeyword(lower(t.word!))) {
+      if (t.kind === "quotedIdent") {
+        alias = t.str!;
+        this.advance();
+      } else if (t.kind === "word" && !isTableRefStopKeyword(t.word!)) {
         alias = t.word!;
         this.advance();
       }
@@ -2789,7 +2811,10 @@ class Parser {
       alias = this.expectIdentifier();
     } else {
       const t = this.peek();
-      if (t.kind === "word" && !isTableRefStopKeyword(lower(t.word!))) {
+      if (t.kind === "quotedIdent") {
+        alias = t.str!;
+        this.advance();
+      } else if (t.kind === "word" && !isTableRefStopKeyword(t.word!)) {
         alias = t.word!;
         this.advance();
       }
@@ -2966,7 +2991,9 @@ class Parser {
   // unary, or keyword-led primary meaning (spec/design/grammar.md §3).
   private atQualifiedColumnRef(): boolean {
     return (
-      this.peekKindAt(0) === "word" && this.peekKindAt(1) === "dot" && this.peekKindAt(2) === "word"
+      isIdentKind(this.peekKindAt(0)) &&
+      this.peekKindAt(1) === "dot" &&
+      isIdentKind(this.peekKindAt(2))
     );
   }
 
@@ -3225,7 +3252,7 @@ class Parser {
       // shape `identifier "." "*"` before the general expr parser, so `t.col` (Dot then a word)
       // and `a * b` (no Dot) are untouched, and a bare `*` was already handled above. No `AS` alias.
       if (
-        this.peek().kind === "word" &&
+        isIdentKind(this.peek().kind) &&
         this.peekKindAt(1) === "dot" &&
         this.peekKindAt(2) === "star"
       ) {
@@ -3827,15 +3854,15 @@ class Parser {
     // literals). The type name is resolved (and the string coerced to it) at resolve; unknown → 42704.
     const tlKw = this.peekKeyword();
     if (
-      tlKw !== "" &&
+      isIdentKind(this.peek().kind) &&
       tlKw !== "null" &&
       tlKw !== "true" &&
       tlKw !== "false" &&
       this.tokens[this.pos + 1]?.kind === "str"
     ) {
-      const nameTok = this.advance(); // the named type (original case; scalarFromName lowercases)
+      const typeName = this.expectIdentifier(); // the named type (folded or quoted — exact)
       const t = this.advance();
-      return { kind: "typedLiteral", typeName: nameTok.word!, text: t.str! };
+      return { kind: "typedLiteral", typeName, text: t.str! };
     }
     // The SQL/JSON query functions `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY`
     // (json-sql-functions.md §5, S2) — keyword-led primaries with sub-clauses, recognized when the
@@ -3912,15 +3939,20 @@ class Parser {
     }
     // EXTRACT(field FROM source) (grammar.md §50, timezones.md §9.2). Recognized only when `extract`
     // is immediately followed by `(`, so `extract` stays usable as a column / function name otherwise
-    // (the one-token lookahead, §8). The field is an identifier or a string literal (lowercased).
+    // (the one-token lookahead, §8). The field is a bare word or a string literal (lowercased —
+    // a string-valued vocabulary).
     if (this.peekKeyword() === "extract" && this.peekKindAt(1) === "lparen") {
       this.advance(); // EXTRACT
       this.expect("lparen");
       let field: string;
       if (this.peekKindAt(0) === "str") {
         field = this.advance().str!;
-      } else {
+      } else if (this.peekKindAt(0) === "word") {
+        // A bare word only — the field is a fixed vocabulary, so a quoted identifier is not
+        // accepted (grammar.ebnf `extract_expr`).
         field = this.expectIdentifier();
+      } else {
+        throw engineError("syntax_error", "expected an EXTRACT field");
       }
       this.expectKeyword("from");
       const source = this.parseExpr();
@@ -4021,7 +4053,7 @@ class Parser {
       return { kind: "literal", literal: { kind: "text", text: t.str! } };
     }
     if (t.kind === "word") {
-      const w = lower(t.word!);
+      const w = t.word!;
       if (w === "null") {
         this.advance();
         return { kind: "literal", literal: { kind: "null" } };
@@ -4070,6 +4102,17 @@ class Parser {
       // first call syntax — grammar.md §17). The one-token lookahead keeps function names
       // non-reserved (a column may be named `count`); a qualified name is never a call. Only
       // aggregates resolve (42883 otherwise).
+      if (this.tokens[this.pos + 1]?.kind === "lparen") {
+        return this.parseFunctionCall();
+      }
+      const [qualifier, name] = this.parseColumnRef();
+      return qualifier !== null
+        ? { kind: "qualifiedColumn", qualifier, name }
+        : { kind: "column", name };
+    }
+    if (t.kind === "quotedIdent") {
+      // A quoted identifier is never a keyword (grammar.md §3): a call when IMMEDIATELY followed by
+      // "(", else a column reference.
       if (this.tokens[this.pos + 1]?.kind === "lparen") {
         return this.parseFunctionCall();
       }
@@ -4136,7 +4179,7 @@ class Parser {
         // A named argument is `identifier "=>" expr` (grammar.md §17); a two-token lookahead
         // (word then "=>") distinguishes it from a bare expr that starts with an identifier.
         let argName: string | null = null;
-        if (this.peek().kind === "word" && this.peekKindAt(1) === "fatArrow") {
+        if (isIdentKind(this.peek().kind) && this.peekKindAt(1) === "fatArrow") {
           argName = this.expectIdentifier();
           this.expect("fatArrow");
           anyNamed = true;
@@ -4526,17 +4569,19 @@ class Parser {
     return this.tokens[this.pos]!;
   }
 
+  // peekKeyword returns the current token if it is a bare word (already folded by the lexer), else
+  // "". A quoted identifier is never a keyword (grammar.md §3).
   private peekKeyword(): string {
     const t = this.peek();
-    return t.kind === "word" ? lower(t.word!) : "";
+    return t.kind === "word" ? t.word! : "";
   }
 
-  // peekKeywordAt returns the keyword (lowercased) `offset` tokens ahead of the cursor if that
+  // peekKeywordAt returns the keyword (a bare word, already folded) `offset` tokens ahead of the cursor if that
   // token is a word, else "". Used for the two-token NOT IN/BETWEEN/LIKE lookahead (a
   // CLAUDE.md §8 determinism surface — byte-identical across the three parsers).
   private peekKeywordAt(offset: number): string {
     const t = this.tokens[this.pos + offset];
-    return t !== undefined && t.kind === "word" ? lower(t.word!) : "";
+    return t !== undefined && t.kind === "word" ? t.word! : "";
   }
 
   // peekKindAt returns the token kind `offset` tokens ahead of the cursor ("eof" past the
@@ -4560,16 +4605,19 @@ class Parser {
 
   private expectKeyword(kw: string): void {
     const t = this.advance();
-    if (t.kind === "word" && lower(t.word!) === kw) return;
+    if (t.kind === "word" && t.word! === kw) return;
     throw engineError("syntax_error", `expected keyword '${kw}'`);
   }
 
+  // expectIdentifier consumes an identifier — a bare word (folded) or a quoted identifier (exact) —
+  // and returns the name (grammar.md §3).
   private expectIdentifier(): string {
     const t = this.advance();
-    if (t.kind !== "word") {
+    const name = identName(t);
+    if (name === null) {
       throw engineError("syntax_error", "expected an identifier");
     }
-    return t.word!;
+    return name;
   }
 
   // expectCollationName consumes a quoted collation name after COLLATE (spec/design/collation.md §1).
@@ -4580,9 +4628,7 @@ class Parser {
     if (t.kind !== "quotedIdent") {
       throw engineError("syntax_error", "expected a quoted collation name after COLLATE");
     }
-    if (t.str === "") {
-      throw engineError("syntax_error", "collation name may not be empty");
-    }
+    // The lexer rejects a zero-length `""` (42601), so a quoted name is never empty.
     return t.str!;
   }
 
@@ -4623,7 +4669,7 @@ export function rewriteColumnIdentifier(
   const tokens = lex(text);
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i]!;
-    if (t.kind !== "word" || lower(t.word!) !== lower(oldName)) continue;
+    if (!tokenNames(t, oldName)) continue;
     const prev = tokens[i - 1];
     const prev2 = tokens[i - 2];
     const next = tokens[i + 1];
@@ -4632,10 +4678,10 @@ export function rewriteColumnIdentifier(
       next?.kind === "fatArrow" ||
       next?.kind === "str" ||
       prev?.kind === "doubleColon" ||
-      (prev?.kind === "word" && lower(prev.word!) === "as") ||
-      (prev?.kind === "dot" && !(prev2?.kind === "word" && lower(prev2.word!) === lower(table))) ||
-      (next?.kind === "dot" && lower(oldName) === lower(table));
-    if (!skip) t.word = newName;
+      (prev?.kind === "word" && prev.word! === "as") ||
+      (prev?.kind === "dot" && !tokenNames(prev2, table)) ||
+      (next?.kind === "dot" && oldName === table);
+    if (!skip) tokens[i] = nameToken(newName);
   }
   if (tokens.at(-1)?.kind === "eof") tokens.pop();
   const rewritten = renderTokens(tokens);
@@ -4650,12 +4696,88 @@ export function rewriteTableQualifier(
   const tokens = lex(text);
   for (let i = 0; i + 1 < tokens.length; i++) {
     const t = tokens[i]!;
-    if (t.kind === "word" && lower(t.word!) === lower(oldName) && tokens[i + 1]!.kind === "dot")
-      t.word = newName;
+    if (tokenNames(t, oldName) && tokens[i + 1]!.kind === "dot") tokens[i] = nameToken(newName);
   }
   if (tokens.at(-1)?.kind === "eof") tokens.pop();
   const rewritten = renderTokens(tokens);
   return { text: rewritten, expr: parseExpression(rewritten) };
+}
+
+// parseNameText parses a name-valued TEXT argument as exactly one identifier — the sequence
+// functions' `nextval('s')` regclass text form (spec/design/grammar.md §3), PostgreSQL's
+// SplitIdentifierString rule: surrounding whitespace (space, tab, LF, CR, FF) is ignored; a
+// double-quoted name is exact (`""` an embedded quote; `'""'` is the empty name, which never
+// exists); otherwise the run of characters up to whitespace or `.` is a bare name, folded to
+// lowercase (ASCII). Empty / all-whitespace text, an unterminated quote, anything after the name
+// (internal whitespace, trailing characters), or a dotted name is 42602 invalid_name — jed has no
+// schemas and does not resolve a qualified name from text. Not length-checked (cost.md §7).
+export function parseNameText(text: string): string {
+  const invalid = (): EngineError => engineError("invalid_name", "invalid name syntax");
+  const isWs = (c: string): boolean =>
+    c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f";
+  let i = 0;
+  const n = text.length;
+  while (i < n && isWs(text[i]!)) i++;
+  let name: string;
+  if (i < n && text[i] === '"') {
+    i++;
+    name = "";
+    for (;;) {
+      if (i >= n) throw invalid();
+      const c = text[i]!;
+      if (c === '"') {
+        if (i + 1 < n && text[i + 1] === '"') {
+          name += '"';
+          i += 2;
+          continue;
+        }
+        i++;
+        break;
+      }
+      name += c;
+      i++;
+    }
+  } else {
+    const start = i;
+    while (i < n && !isWs(text[i]!) && text[i] !== ".") i++;
+    if (i === start) throw invalid();
+    name = asciiLower(text.slice(start, i));
+  }
+  while (i < n && isWs(text[i]!)) i++;
+  if (i < n) throw invalid();
+  return name;
+}
+
+// asciiLower folds ASCII A-Z only (a non-ASCII character is left untouched — PostgreSQL's
+// downcase_identifier for a UTF-8 database).
+function asciiLower(s: string): string {
+  return s.replace(/[A-Z]+/g, (m) => m.toLowerCase());
+}
+
+// tokenNames reports whether an identifier token (bare word or quoted) spells exactly `name`
+// (byte-exact after the lexer's fold, grammar.md §3).
+function tokenNames(t: Token | undefined, name: string): boolean {
+  return identName(t) === name;
+}
+
+// isPlainIdentifier reports whether `name` survives the lexer written bare: `[a-z_][a-z0-9_]*`
+// (grammar.md §3's quoting rule). Any other name must be rendered double-quoted.
+export function isPlainIdentifier(name: string): boolean {
+  return /^[a-z_][a-z0-9_]*$/.test(name);
+}
+
+// nameToken is the token a RENAME rewrite substitutes into persisted expression text: ALWAYS a
+// quoted identifier, even for a plain lowercase name — jed has no reserved keywords, so a bare
+// `null` / `true` would re-lex as the literal (grammar.md §3, alter.md §2.2). Untouched tokens keep
+// their stored spelling.
+function nameToken(name: string): Token {
+  return { kind: "quotedIdent", str: name };
+}
+
+// quoteIdentifier renders `name` as SQL identifier text by grammar.md §3's quoting rule: bare when
+// it matches `[a-z_][a-z0-9_]*`, else double-quoted with each `"` doubled.
+export function quoteIdentifier(name: string): string {
+  return isPlainIdentifier(name) ? name : '"' + name.replaceAll('"', '""') + '"';
 }
 
 function renderToken(t: Token): string {
@@ -4676,8 +4798,8 @@ function renderToken(t: Token): string {
     case "str":
       return "'" + t.str!.replaceAll("'", "''") + "'";
     case "quotedIdent":
-      // A double-quoted identifier round-trips verbatim with `"` doubled (collation names in a
-      // persisted COLLATE expression, spec/design/collation.md §1).
+      // A double-quoted identifier round-trips verbatim with `"` doubled (format v37; a bare word
+      // renders as its folded lowercase spelling).
       return '"' + t.str!.replaceAll('"', '""') + '"';
     case "param":
       return "$" + t.paramIndex!.toString();

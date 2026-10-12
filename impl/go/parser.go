@@ -1154,7 +1154,7 @@ func (p *parser) parseCreateIndex() (*createIndex, error) {
 	// index name unless it is `ON` followed by a word and then `(` OR `USING` (the three-token
 	// lookahead, extended for the optional USING clause — grammar.md §30, gin.md §3).
 	unnamed := p.peekKeyword() == "on" &&
-		p.peekKindAt(1) == tokWord &&
+		isIdentKind(p.peekKindAt(1)) &&
 		(p.peekKindAt(2) == tokLParen || p.peekKeywordAt(2) == "using")
 	name := ""
 	if !unnamed {
@@ -1240,7 +1240,7 @@ func (p *parser) parseIndexElement() (indexKeyElem, error) {
 			return indexKeyElem{}, err
 		}
 		return p.indexKeyFromExpr(expr, start, end), nil
-	case p.peek().Kind == tokWord && p.peekKindAt(1) == tokLParen:
+	case isIdentKind(p.peek().Kind) && p.peekKindAt(1) == tokLParen:
 		// A bare function call `f(args)` — parse ONLY the primary, so a trailing operator
 		// (`lower(x) + 1`) leaves `+` for the element loop to reject (PG requires parens).
 		start := p.pos
@@ -2583,11 +2583,11 @@ func (p *parser) parseLiteral() (literal, error) {
 		return literal{Kind: literalDecimal, Dec: decimalFromDigitsScale(negate, t.Word, uint32(t.Int))}, nil
 	case !negate && t.Kind == tokStr:
 		return literal{Kind: literalText, Str: t.Word}, nil
-	case !negate && t.Kind == tokWord && toLowerASCII(t.Word) == "null":
+	case !negate && t.Kind == tokWord && t.Word == "null":
 		return literal{Kind: literalNull}, nil
-	case !negate && t.Kind == tokWord && toLowerASCII(t.Word) == "true":
+	case !negate && t.Kind == tokWord && t.Word == "true":
 		return literal{Kind: literalBool, Bool: true}, nil
-	case !negate && t.Kind == tokWord && toLowerASCII(t.Word) == "false":
+	case !negate && t.Kind == tokWord && t.Word == "false":
 		return literal{Kind: literalBool, Bool: false}, nil
 	default:
 		return literal{}, newError(SyntaxError, "expected a literal value")
@@ -2984,7 +2984,7 @@ func (p *parser) parseSelectCore() (*selectStmt, error) {
 	distinct := false
 	if p.peekKeyword() == "distinct" {
 		next := p.tokens[p.pos+1]
-		modifier := next.Kind != tokEof && !(next.Kind == tokWord && toLowerASCII(next.Word) == "from")
+		modifier := next.Kind != tokEof && !(next.Kind == tokWord && next.Word == "from")
 		if modifier {
 			p.advance()
 			distinct = true
@@ -3106,16 +3106,21 @@ func (p *parser) parseWindowDefinition() (windowDef, error) {
 }
 
 // parseOptBaseWindowName returns the optional leading base-window name of a window definition
-// (spec/design/window.md §5). Present when the next token is a bareword that is not a
-// clause-introducing keyword (PARTITION/ORDER/ROWS/RANGE/GROUPS) — those start the definition's own
-// clauses, so an unquoted occurrence is the keyword, never a base name (matching PostgreSQL; a
-// window named like a keyword would need quoting, which jed's window names do not support).
+// (spec/design/window.md §5). Present when the next token is a quoted identifier, or a bareword that
+// is not a clause-introducing keyword (PARTITION/ORDER/ROWS/RANGE/GROUPS) — those start the
+// definition's own clauses, so an unquoted occurrence is the keyword, never a base name (matching
+// PostgreSQL; a window named like a keyword must be quoted).
 func (p *parser) parseOptBaseWindowName() string {
 	t := p.peek()
+	if t.Kind == tokQuotedIdent {
+		// A quoted name is never a keyword (grammar.md §3).
+		p.advance()
+		return t.Word
+	}
 	if t.Kind != tokWord {
 		return ""
 	}
-	switch toLowerASCII(t.Word) {
+	switch t.Word {
 	case "partition", "order", "rows", "range", "groups":
 		return ""
 	}
@@ -3227,7 +3232,7 @@ func (p *parser) parseTableRef() (tableRef, error) {
 	// implicitly lateral regardless, so the keyword is redundant (but accepted) there.
 	lateral := p.peekKeyword() == "lateral" &&
 		(p.peekKindAt(1) == tokLParen ||
-			(p.peekKindAt(1) == tokWord && p.peekKindAt(2) == tokLParen))
+			(isIdentKind(p.peekKindAt(1)) && p.peekKindAt(2) == tokLParen))
 	if lateral {
 		p.advance()
 	}
@@ -3295,7 +3300,7 @@ func (p *parser) parseTableRef() (tableRef, error) {
 			return tableRef{}, err
 		}
 		alias = &a
-	} else if t := p.peek(); t.Kind == tokWord && !isTableRefStopKeyword(toLowerASCII(t.Word)) {
+	} else if t := p.peek(); t.Kind == tokQuotedIdent || (t.Kind == tokWord && !isTableRefStopKeyword(t.Word)) {
 		a := t.Word
 		p.advance()
 		alias = &a
@@ -3314,7 +3319,7 @@ func (p *parser) parseTableRef() (tableRef, error) {
 		// Disambiguate: a col-def list has `name type`; a rename list has `name ,`/`name )`. With the
 		// cursor still on `(`, the first column name is at offset 1, so a `Word` at offset 2 means a
 		// type follows (col-def list).
-		typed := p.peekKindAt(2) == tokWord
+		typed := isIdentKind(p.peekKindAt(2))
 		p.advance() // (
 		if typed {
 			defs, err := p.parseFieldDefList()
@@ -3394,7 +3399,7 @@ func (p *parser) parseJsonTable() (tableRef, error) {
 			return tableRef{}, err
 		}
 		alias = &a
-	} else if t := p.peek(); t.Kind == tokWord && !isTableRefStopKeyword(toLowerASCII(t.Word)) {
+	} else if t := p.peek(); t.Kind == tokQuotedIdent || (t.Kind == tokWord && !isTableRefStopKeyword(t.Word)) {
 		a := t.Word
 		p.advance()
 		alias = &a
@@ -3602,7 +3607,7 @@ func (p *parser) parseDerivedTable(lateral bool) (tableRef, error) {
 			return tableRef{}, err
 		}
 		alias = &a
-	} else if t := p.peek(); t.Kind == tokWord && !isTableRefStopKeyword(toLowerASCII(t.Word)) {
+	} else if t := p.peek(); t.Kind == tokQuotedIdent || (t.Kind == tokWord && !isTableRefStopKeyword(t.Word)) {
 		a := t.Word
 		p.advance()
 		alias = &a
@@ -3785,7 +3790,7 @@ func (p *parser) parseJoinClause() (joinClause, bool, error) {
 	return joinClause{Kind: kind, Table: table, On: on, Using: using, Natural: natural}, true, nil
 }
 
-// isTableRefStopKeyword reports whether kw (already lower-cased) is a keyword that may legally
+// isTableRefStopKeyword reports whether kw (a bare word, already folded) is a keyword that may legally
 // follow a table_ref, and so must NOT be swallowed as an implicit table alias: a trailing
 // clause keyword (where/order/limit/offset) or any join-machinery keyword
 // (join/inner/cross/left/right/full/outer/on). `as` is handled separately. This set is a
@@ -4313,7 +4318,7 @@ func (p *parser) parseSelectItems() (selectItems, error) {
 		// RETURNING item MIXABLE with other items (grammar.md §15). Recognized by the three-token
 		// shape `identifier "." "*"` before the general expr parser, so `t.col` (Dot then a word)
 		// and `a * b` (no Dot) are untouched, and a bare `*` was already handled above. No `AS` alias.
-		if p.peek().Kind == tokWord && p.peekKindAt(1) == tokDot && p.peekKindAt(2) == tokStar {
+		if isIdentKind(p.peek().Kind) && p.peekKindAt(1) == tokDot && p.peekKindAt(2) == tokStar {
 			qualifier, err := p.expectIdentifier()
 			if err != nil {
 				return selectItems{}, err
@@ -4568,7 +4573,7 @@ func (p *parser) parseComparison() (exprNode, error) {
 		}
 		return exprNode{Kind: exprBetween, Between: &betweenExpr{Lhs: lhs, Lo: lo, Hi: hi, Negated: predNegated}}, nil
 	}
-	// LIKE / ILIKE (case-insensitive) — grammar.md §22. `ilike` is just another peeked keyword.
+	// LIKE / ILIKE (exact name) — grammar.md §22. `ilike` is just another peeked keyword.
 	if p.peekKeyword() == "like" || p.peekKeyword() == "ilike" {
 		insensitive := p.peekKeyword() == "ilike"
 		p.advance()
@@ -5169,7 +5174,8 @@ func (p *parser) parsePrimary() (exprNode, error) {
 	}
 	// EXTRACT(field FROM source) (grammar.md §50, timezones.md §9.2). Recognized only when `extract`
 	// is immediately followed by `(`, so `extract` stays usable as a column / function name otherwise
-	// (the one-token lookahead, §8). The field is an identifier or a string literal (lowercased).
+	// (the one-token lookahead, §8). The field is a bare word or a string literal (lowercased — a
+	// string-valued vocabulary); a quoted identifier is not accepted (grammar.ebnf extract_expr).
 	if p.peekKeyword() == "extract" && p.peekKindAt(1) == tokLParen {
 		p.advance() // EXTRACT
 		if err := p.expect(tokLParen); err != nil {
@@ -5178,6 +5184,8 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		var field string
 		if p.peekKindAt(0) == tokStr {
 			field = p.advance().Word
+		} else if p.peekKindAt(0) != tokWord {
+			return exprNode{}, newError(SyntaxError, "expected an EXTRACT field")
 		} else {
 			id, err := p.expectIdentifier()
 			if err != nil {
@@ -5203,8 +5211,8 @@ func (p *parser) parsePrimary() (exprNode, error) {
 	// Recognized only when the next token is a string — a one-token lookahead — so the word stays
 	// usable as a column / function name otherwise. true/false/null are excluded (their own value
 	// literals). The type name is resolved (and the string coerced to it) at resolve; unknown → 42704.
-	if kw := p.peekKeyword(); kw != "" && kw != "null" && kw != "true" && kw != "false" && p.peekKindAt(1) == tokStr {
-		name := p.advance().Word // the named type (original case; ScalarFromName lowercases)
+	if t0 := p.peek(); isIdentKind(t0.Kind) && !(t0.Kind == tokWord && (t0.Word == "null" || t0.Word == "true" || t0.Word == "false")) && p.peekKindAt(1) == tokStr {
+		name := p.advance().Word // the named type (folded or quoted; resolved byte-exactly)
 		t := p.advance()
 		return exprNode{Kind: exprTypedLiteral, TypeLitName: name, TypeLitText: t.Word}, nil
 	}
@@ -5418,16 +5426,16 @@ func (p *parser) parsePrimary() (exprNode, error) {
 	case t.Kind == tokStr:
 		p.advance()
 		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalText, Str: t.Word}}, nil
-	case t.Kind == tokWord && toLowerASCII(t.Word) == "null":
+	case t.Kind == tokWord && t.Word == "null":
 		p.advance()
 		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalNull}}, nil
-	case t.Kind == tokWord && toLowerASCII(t.Word) == "true":
+	case t.Kind == tokWord && t.Word == "true":
 		p.advance()
 		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalBool, Bool: true}}, nil
-	case t.Kind == tokWord && toLowerASCII(t.Word) == "false":
+	case t.Kind == tokWord && t.Word == "false":
 		p.advance()
 		return exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalBool, Bool: false}}, nil
-	case t.Kind == tokWord && toLowerASCII(t.Word) == "current_timestamp" &&
+	case t.Kind == tokWord && t.Word == "current_timestamp" &&
 		!(p.pos+1 < len(p.tokens) && p.tokens[p.pos+1].Kind == tokLParen):
 		// `current_timestamp` — the SQL-standard bare keyword (no parens), reserved like the value
 		// literals above. Pure sugar: desugar to a `now()` call so resolution / execution / cost /
@@ -5435,7 +5443,7 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		// `(` (a precision typmod, deferred) so that form resolves normally (42883).
 		p.advance()
 		return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: "now"}}, nil
-	case t.Kind == tokWord && toLowerASCII(t.Word) == "current_date" &&
+	case t.Kind == tokWord && t.Word == "current_date" &&
 		!(p.pos+1 < len(p.tokens) && p.tokens[p.pos+1].Kind == tokLParen):
 		// `current_date` — the SQL-standard bare keyword, desugared to the current_date() catalog
 		// function (functions.md §12, date.md §6). Unlike current_timestamp there is no typmod
@@ -5443,8 +5451,8 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		// it as a syntax error — a documented jed-lenient divergence, catalog.toml).
 		p.advance()
 		return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: "current_date"}}, nil
-	case t.Kind == tokWord:
-		// Function call: a BARE identifier IMMEDIATELY followed by "(" is a call (the engine's
+	case isIdentKind(t.Kind):
+		// Function call: an identifier IMMEDIATELY followed by "(" is a call (the engine's
 		// first call syntax — grammar.md §17). The one-token lookahead keeps function names
 		// non-reserved (a column may be named `count`); a qualified name is never a call. Only
 		// aggregates resolve (42883 otherwise).
@@ -5527,7 +5535,7 @@ func (p *parser) parseFunctionCall() (exprNode, error) {
 			// A named argument is `identifier "=>" expr` (grammar.md §17); a two-token lookahead
 			// (word then "=>") distinguishes it from a bare expr that starts with an identifier.
 			var argName *string
-			if p.peek().Kind == tokWord && p.peekKindAt(1) == tokFatArrow {
+			if isIdentKind(p.peek().Kind) && p.peekKindAt(1) == tokFatArrow {
 				nm, err := p.expectIdentifier()
 				if err != nil {
 					return exprNode{}, err
@@ -5834,7 +5842,7 @@ func (p *parser) parseColumnRef() (string, string, error) {
 // expression disambiguation so a keyword-spelled relation label wins over the keyword's literal,
 // unary, or keyword-led primary meaning (spec/design/grammar.md §3).
 func (p *parser) atQualifiedColumnRef() bool {
-	return p.peekKindAt(0) == tokWord && p.peekKindAt(1) == tokDot && p.peekKindAt(2) == tokWord
+	return isIdentKind(p.peekKindAt(0)) && p.peekKindAt(1) == tokDot && isIdentKind(p.peekKindAt(2))
 }
 
 // parseQualifiedTableName parses `qualified_table ::= (identifier ".")? identifier` in DML-target
@@ -5861,22 +5869,23 @@ func (p *parser) parseQualifiedTableName() (*string, string, error) {
 // peek returns the current token without consuming it.
 func (p *parser) peek() token { return p.tokens[p.pos] }
 
-// peekKeyword returns the current token lowercased if it is a word, else "".
+// peekKeyword returns the current token if it is a bare word (already folded to lowercase by
+// the lexer), else "". A quoted identifier is never a keyword (grammar.md §3).
 func (p *parser) peekKeyword() string {
 	t := p.peek()
 	if t.Kind == tokWord {
-		return toLowerASCII(t.Word)
+		return t.Word
 	}
 	return ""
 }
 
-// peekKeywordAt returns the keyword (lowercased) offset tokens ahead of the cursor if that
+// peekKeywordAt returns the keyword (a bare, folded word) offset tokens ahead of the cursor if that
 // token is a word, else "". Used for the two-token NOT IN/BETWEEN/LIKE lookahead (a
 // CLAUDE.md §8 determinism surface — byte-identical across the three parsers).
 func (p *parser) peekKeywordAt(offset int) string {
 	if p.pos+offset < len(p.tokens) {
 		if t := p.tokens[p.pos+offset]; t.Kind == tokWord {
-			return toLowerASCII(t.Word)
+			return t.Word
 		}
 	}
 	return ""
@@ -5902,7 +5911,7 @@ func (p *parser) isWithClauseAtOffset(offset int) bool {
 	if p.peekKeywordAt(offset+1) == "recursive" {
 		return true
 	}
-	if p.peekKindAt(offset+1) == tokWord {
+	if isIdentKind(p.peekKindAt(offset + 1)) {
 		return p.peekKindAt(offset+2) == tokLParen || p.peekKeywordAt(offset+2) == "as"
 	}
 	return false
@@ -5938,20 +5947,21 @@ func (p *parser) expect(want tokenKind) error {
 	return nil
 }
 
-// expectKeyword consumes the current token, requiring it to be the given keyword
-// (case-insensitive).
+// expectKeyword consumes the current token, requiring it to be the given keyword: a bare word
+// (already folded by the lexer; kw is lowercase) — never a quoted identifier.
 func (p *parser) expectKeyword(kw string) error {
 	t := p.advance()
-	if t.Kind == tokWord && toLowerASCII(t.Word) == kw {
+	if t.Kind == tokWord && t.Word == kw {
 		return nil
 	}
 	return newError(SyntaxError, fmt.Sprintf("expected keyword '%s'", kw))
 }
 
-// expectIdentifier consumes the current token, requiring it to be a bare word.
+// expectIdentifier consumes the current token, requiring it to be an identifier — a bare word
+// (folded) or a quoted identifier (exact) — and returns the name (grammar.md §3).
 func (p *parser) expectIdentifier() (string, error) {
 	t := p.advance()
-	if t.Kind != tokWord {
+	if !isIdentKind(t.Kind) {
 		return "", newError(SyntaxError, "expected an identifier")
 	}
 	return t.Word, nil
@@ -5959,14 +5969,12 @@ func (p *parser) expectIdentifier() (string, error) {
 
 // expectCollationName consumes a quoted collation name after COLLATE (spec/design/collation.md §1).
 // The name is a double-quoted identifier — case-sensitive and kept verbatim ("C", "en-US") — so a
-// bare word is not accepted (it would case-fold). An empty name ("") is a 42601 syntax error.
+// bare word is not accepted (it would case-fold). The lexer rejects a zero-length "" (42601), so a
+// quoted name is never empty.
 func (p *parser) expectCollationName() (string, error) {
 	t := p.advance()
 	if t.Kind != tokQuotedIdent {
 		return "", newError(SyntaxError, "expected a quoted collation name after COLLATE")
-	}
-	if t.Word == "" {
-		return "", newError(SyntaxError, "collation name may not be empty")
 	}
 	return t.Word, nil
 }
@@ -6028,7 +6036,7 @@ func rewriteColumnIdentifier(text, table, old, next string) (string, exprNode, e
 		return "", exprNode{}, err
 	}
 	for i := range tokens {
-		if tokens[i].Kind != tokWord || !strings.EqualFold(tokens[i].Word, old) {
+		if !tokenNames(tokens[i], old) {
 			continue
 		}
 		var prev, prev2, after token
@@ -6042,11 +6050,11 @@ func rewriteColumnIdentifier(text, table, old, next string) (string, exprNode, e
 			after = tokens[i+1]
 		}
 		skip := after.Kind == tokLParen || after.Kind == tokFatArrow || after.Kind == tokStr ||
-			prev.Kind == tokDoubleColon || (prev.Kind == tokWord && strings.EqualFold(prev.Word, "as")) ||
-			(prev.Kind == tokDot && !(prev2.Kind == tokWord && strings.EqualFold(prev2.Word, table))) ||
-			(after.Kind == tokDot && strings.EqualFold(old, table))
+			prev.Kind == tokDoubleColon || (prev.Kind == tokWord && prev.Word == "as") ||
+			(prev.Kind == tokDot && !tokenNames(prev2, table)) ||
+			(after.Kind == tokDot && old == table)
 		if !skip {
-			tokens[i].Word = next
+			tokens[i] = nameToken(next)
 		}
 	}
 	if len(tokens) > 0 && tokens[len(tokens)-1].Kind == tokEof {
@@ -6063,8 +6071,8 @@ func rewriteTableQualifier(text, old, next string) (string, exprNode, error) {
 		return "", exprNode{}, err
 	}
 	for i := 0; i+1 < len(tokens); i++ {
-		if tokens[i].Kind == tokWord && strings.EqualFold(tokens[i].Word, old) && tokens[i+1].Kind == tokDot {
-			tokens[i].Word = next
+		if tokenNames(tokens[i], old) && tokens[i+1].Kind == tokDot {
+			tokens[i] = nameToken(next)
 		}
 	}
 	if len(tokens) > 0 && tokens[len(tokens)-1].Kind == tokEof {
@@ -6073,6 +6081,103 @@ func rewriteTableQualifier(text, old, next string) (string, exprNode, error) {
 	rewritten := renderTokens(tokens)
 	expr, err := parseExpression(rewritten)
 	return rewritten, expr, err
+}
+
+// parseNameText parses a name-valued TEXT argument as exactly one identifier — the sequence
+// functions' nextval('s') regclass text form (spec/design/grammar.md §3), PostgreSQL's
+// SplitIdentifierString rule: surrounding whitespace (space, tab, LF, CR, FF) is ignored; a
+// double-quoted name is exact ("" an embedded quote; '""' is the empty name, which never exists);
+// otherwise the run of characters up to whitespace or '.' is a bare name, folded to lowercase
+// (ASCII). Empty / all-whitespace text, an unterminated quote, anything after the name (internal
+// whitespace, trailing characters), or a dotted name is 42602 invalid_name — jed has no schemas and
+// does not resolve a qualified name from text. Not length-checked (cost.md §7).
+func parseNameText(text string) (string, error) {
+	invalid := func() error { return newError(InvalidName, "invalid name syntax") }
+	isWS := func(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' }
+	trimLeft := func(s string) string {
+		i := 0
+		for i < len(s) && isWS(s[i]) {
+			i++
+		}
+		return s[i:]
+	}
+	s := trimLeft(text)
+	var name, rest string
+	if strings.HasPrefix(s, "\"") {
+		body := s[1:]
+		var sb []byte
+		i := 0
+		for {
+			if i >= len(body) {
+				return "", invalid()
+			}
+			if body[i] == '"' {
+				if i+1 < len(body) && body[i+1] == '"' {
+					sb = append(sb, '"')
+					i += 2
+					continue
+				}
+				rest = body[i+1:]
+				break
+			}
+			sb = append(sb, body[i])
+			i++
+		}
+		name = string(sb)
+	} else {
+		end := len(s)
+		for i := 0; i < len(s); i++ {
+			if isWS(s[i]) || s[i] == '.' {
+				end = i
+				break
+			}
+		}
+		if end == 0 {
+			return "", invalid()
+		}
+		name, rest = asciiLower(s[:end]), s[end:]
+	}
+	if trimLeft(rest) != "" {
+		return "", invalid()
+	}
+	return name, nil
+}
+
+// tokenNames reports whether an identifier token (bare word or quoted) spells exactly name
+// (byte-exact after the lexer's fold, grammar.md §3).
+func tokenNames(t token, name string) bool {
+	return isIdentKind(t.Kind) && t.Word == name
+}
+
+// isPlainIdentifier reports whether name survives the lexer written bare: [a-z_][a-z0-9_]*
+// (grammar.md §3's quoting rule). Any other name must be rendered double-quoted.
+func isPlainIdentifier(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c == '_' || (c >= 'a' && c <= 'z') || (i > 0 && c >= '0' && c <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// nameToken is the token a RENAME rewrite substitutes into persisted expression text: ALWAYS a
+// quoted identifier, even for a plain lowercase name — jed has no reserved keywords, so a bare
+// `null` / `true` would re-lex as the literal (grammar.md §3, alter.md §2.2). Untouched tokens keep
+// their stored spelling.
+func nameToken(name string) token { return token{Kind: tokQuotedIdent, Word: name} }
+
+// quoteIdentifier renders name as SQL identifier text by grammar.md §3's quoting rule: bare when
+// it matches [a-z_][a-z0-9_]*, else double-quoted with each `"` doubled.
+func quoteIdentifier(name string) string {
+	if isPlainIdentifier(name) {
+		return name
+	}
+	return "\"" + strings.ReplaceAll(name, "\"", "\"\"") + "\""
 }
 
 func renderToken(t token) string {
@@ -6092,8 +6197,8 @@ func renderToken(t token) string {
 	case tokStr:
 		return "'" + strings.ReplaceAll(t.Word, "'", "''") + "'"
 	case tokQuotedIdent:
-		// A double-quoted identifier round-trips verbatim with `"` doubled (collation names in a
-		// persisted COLLATE expression, spec/design/collation.md §1).
+		// A double-quoted identifier round-trips verbatim with `"` doubled (format v37; a bare word
+		// above renders as its folded lowercase spelling).
 		return "\"" + strings.ReplaceAll(t.Word, "\"", "\"\"") + "\""
 	case tokParam:
 		return "$" + strconv.FormatUint(t.Int, 10)
@@ -6187,3 +6292,7 @@ func renderToken(t token) string {
 		return ""
 	}
 }
+
+// isIdentKind reports whether a token kind can be an identifier: a bare word or a quoted
+// identifier (grammar.md §3).
+func isIdentKind(k tokenKind) bool { return k == tokWord || k == tokQuotedIdent }

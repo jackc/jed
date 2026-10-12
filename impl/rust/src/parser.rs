@@ -959,7 +959,7 @@ impl Parser {
         // lookahead, extended for the optional USING clause — grammar.md §30, gin.md §3). A §8
         // determinism surface, byte-identical across the parsers.
         let unnamed = self.peek_keyword().as_deref() == Some("on")
-            && matches!(self.peek_at(1), Token::Word(_))
+            && is_ident(self.peek_at(1))
             && (matches!(self.peek_at(2), Token::LParen)
                 || matches!(self.peek_at(2), Token::Word(w) if w.eq_ignore_ascii_case("using")));
         let name = if unnamed {
@@ -1028,8 +1028,7 @@ impl Parser {
             let end = self.pos;
             self.expect(&Token::RParen)?;
             Ok(Self::index_key_from_expr(&self.tokens, expr, start, end))
-        } else if matches!(self.peek(), Token::Word(_)) && matches!(self.peek_at(1), Token::LParen)
-        {
+        } else if is_ident(self.peek()) && matches!(self.peek_at(1), Token::LParen) {
             // A bare function call `f(args)` — parse ONLY the primary, so a trailing operator
             // (`lower(x) + 1`) leaves `+` for the element loop to reject (PG requires parens).
             let start = self.pos;
@@ -2382,8 +2381,8 @@ impl Parser {
             return false;
         }
         match self.tokens.get(idx + 1) {
-            Some(Token::Word(w)) if w.eq_ignore_ascii_case("recursive") => true,
-            Some(Token::Word(_)) => {
+            Some(Token::Word(w)) if w == "recursive" => true,
+            Some(t) if is_ident(t) => {
                 matches!(self.tokens.get(idx + 2), Some(Token::LParen))
                     || matches!(self.tokens.get(idx + 2), Some(Token::Word(w)) if w.eq_ignore_ascii_case("as"))
             }
@@ -2643,13 +2642,15 @@ impl Parser {
     fn parse_opt_base_window_name(&mut self) -> Option<String> {
         let is_base = match self.peek() {
             Token::Word(w) => !matches!(
-                w.to_ascii_lowercase().as_str(),
+                w.as_str(),
                 "partition" | "order" | "rows" | "range" | "groups"
             ),
+            // A quoted name is never a keyword (grammar.md §3).
+            Token::QuotedIdent(_) => true,
             _ => false,
         };
         if is_base {
-            if let Token::Word(w) = self.advance() {
+            if let Token::Word(w) | Token::QuotedIdent(w) = self.advance() {
                 return Some(w);
             }
         }
@@ -2863,8 +2864,7 @@ impl Parser {
         // accepted) there.
         let lateral = self.peek_keyword().as_deref() == Some("lateral")
             && (matches!(self.peek_at(1), Token::LParen)
-                || (matches!(self.peek_at(1), Token::Word(_))
-                    && matches!(self.peek_at(2), Token::LParen)));
+                || (is_ident(self.peek_at(1)) && matches!(self.peek_at(2), Token::LParen)));
         if lateral {
             self.advance();
         }
@@ -2919,7 +2919,12 @@ impl Parser {
             Some(self.expect_identifier()?)
         } else {
             match self.peek() {
-                Token::Word(w) if !is_table_ref_stop_keyword(&w.to_ascii_lowercase()) => {
+                Token::QuotedIdent(w) => {
+                    let alias = w.clone();
+                    self.advance();
+                    Some(alias)
+                }
+                Token::Word(w) if !is_table_ref_stop_keyword(w) => {
                     let alias = w.clone();
                     self.advance();
                     Some(alias)
@@ -2943,7 +2948,7 @@ impl Parser {
                 // Disambiguate: a col-def list has `name type`; a rename list has `name ,`/`name )`.
                 // After the opening `(`, the current token is the first column name, so a `Word` in the
                 // NEXT slot means a type follows (col-def list).
-                let typed = matches!(self.peek_at(1), Token::Word(_));
+                let typed = is_ident(self.peek_at(1));
                 if typed {
                     (None, Some(self.parse_field_def_list()?))
                 } else {
@@ -3015,7 +3020,12 @@ impl Parser {
             Some(self.expect_identifier()?)
         } else {
             match self.peek() {
-                Token::Word(w) if !is_table_ref_stop_keyword(&w.to_ascii_lowercase()) => {
+                Token::QuotedIdent(w) => {
+                    let a = w.clone();
+                    self.advance();
+                    Some(a)
+                }
+                Token::Word(w) if !is_table_ref_stop_keyword(w) => {
                     let a = w.clone();
                     self.advance();
                     Some(a)
@@ -3096,7 +3106,12 @@ impl Parser {
             Some(self.expect_identifier()?)
         } else {
             match self.peek() {
-                Token::Word(w) if !is_table_ref_stop_keyword(&w.to_ascii_lowercase()) => {
+                Token::QuotedIdent(w) => {
+                    let a = w.clone();
+                    self.advance();
+                    Some(a)
+                }
+                Token::Word(w) if !is_table_ref_stop_keyword(w) => {
                     let a = w.clone();
                     self.advance();
                     Some(a)
@@ -3733,7 +3748,7 @@ impl Parser {
             // three-token shape `identifier "." "*"` before the general expr parser, so `t.col`
             // (Dot then a word) and `a * b` (no Dot) are untouched, and a bare `*` was already
             // handled above. It takes no `AS` alias (PG rejects one).
-            if matches!(self.peek(), Token::Word(_))
+            if is_ident(self.peek())
                 && matches!(self.peek_at(1), Token::Dot)
                 && matches!(self.peek_at(2), Token::Star)
             {
@@ -4416,8 +4431,8 @@ impl Parser {
         }
         // `EXTRACT(field FROM source)` (grammar.md §50, timezones.md §9.2). Recognized only when
         // `extract` is immediately followed by `(`, so `extract` stays usable as a column / function
-        // name otherwise (the one-token lookahead, §8). The field is an identifier or a string
-        // literal (lowercased); the source is any expression.
+        // name otherwise (the one-token lookahead, §8). The field is a bare word or a string
+        // literal (lowercased — a string-valued vocabulary); the source is any expression.
         if self.peek_keyword().as_deref() == Some("extract")
             && matches!(self.peek_at(1), Token::LParen)
         {
@@ -4431,7 +4446,14 @@ impl Parser {
                         unreachable!()
                     }
                 }
-                _ => self.expect_identifier()?,
+                // A bare word only — the field is a fixed vocabulary, so a quoted identifier is
+                // not accepted (grammar.ebnf `extract_expr`).
+                Token::Word(_) => self.expect_identifier()?,
+                other => {
+                    return Err(syntax(format!(
+                        "expected an EXTRACT field, found {other:?}"
+                    )));
+                }
             };
             self.expect_keyword("from")?;
             let source = self.parse_expr()?;
@@ -4498,9 +4520,9 @@ impl Parser {
         // name otherwise (`SELECT interval FROM t`). `true`/`false`/`null` are excluded: they are
         // their own value literals (handled below), not type names. The type name is resolved (and
         // the string coerced to it) at resolve time; an unknown type is 42704 there.
-        if let Token::Word(w) = self.peek()
+        if is_ident(self.peek())
             && matches!(self.tokens.get(self.pos + 1), Some(Token::Str(_)))
-            && !matches!(w.to_ascii_lowercase().as_str(), "null" | "true" | "false")
+            && !matches!(self.peek(), Token::Word(w) if matches!(w.as_str(), "null" | "true" | "false"))
         {
             let type_name = self.expect_identifier()?;
             if let Token::Str(text) = self.advance() {
@@ -4773,8 +4795,8 @@ impl Parser {
                     unreachable!("peeked a decimal literal")
                 }
             }
-            Token::Word(_) => {
-                // Function call: a BARE identifier IMMEDIATELY followed by "(" is a call
+            Token::Word(_) | Token::QuotedIdent(_) => {
+                // Function call: an identifier IMMEDIATELY followed by "(" is a call
                 // (grammar.md §17). The one-token lookahead keeps function names non-reserved
                 // (a column may be named `count`/`abs`); a qualified name (`t.col`) is never a
                 // call. Aggregate and scalar names resolve; any other name is 42883.
@@ -4799,7 +4821,7 @@ impl Parser {
     /// argument may not follow a named one (42601). `arg_names` stays empty when every argument
     /// is positional (byte-identical to a pre-named call); resolution checks per-function arity,
     /// rejects named notation on a function with no parameter names, and fills defaults. The
-    /// function name is resolved (case-insensitively) against the catalog later.
+    /// function name is resolved (byte-exactly) against the catalog later.
     fn parse_function_call(&mut self) -> Result<Expr> {
         let name = self.expect_identifier()?;
         self.expect(&Token::LParen)?;
@@ -4850,8 +4872,7 @@ impl Parser {
                 // A named argument is `identifier "=>" expr` (grammar.md §17); a two-token
                 // lookahead (Word then `=>`) distinguishes it from a bare expr that starts with
                 // an identifier (a column reference).
-                let argname = if matches!(self.peek(), Token::Word(_))
-                    && matches!(self.peek_at(1), Token::FatArrow)
+                let argname = if is_ident(self.peek()) && matches!(self.peek_at(1), Token::FatArrow)
                 {
                     let nm = self.expect_identifier()?;
                     self.expect(&Token::FatArrow)?;
@@ -5087,9 +5108,9 @@ impl Parser {
     /// disambiguation uses it so a keyword-spelled relation label wins over the keyword's literal,
     /// unary, or keyword-led primary meaning (spec/design/grammar.md §3).
     fn at_qualified_column_ref(&self) -> bool {
-        matches!(self.peek_at(0), Token::Word(_))
+        is_ident(self.peek_at(0))
             && matches!(self.peek_at(1), Token::Dot)
-            && matches!(self.peek_at(2), Token::Word(_))
+            && is_ident(self.peek_at(2))
     }
 
     /// Parse `qualified_table ::= (identifier ".")? identifier` in DML-target position
@@ -5122,10 +5143,11 @@ impl Parser {
         self.tokens.get(self.pos + offset).unwrap_or(&Token::Eof)
     }
 
-    /// The current token lowercased if it is a word, else None.
+    /// The current token if it is a bare word (already folded to lowercase by the lexer), else
+    /// None. A quoted identifier is never a keyword (grammar.md §3).
     pub fn peek_keyword(&self) -> Option<String> {
         match self.peek() {
-            Token::Word(w) => Some(w.to_ascii_lowercase()),
+            Token::Word(w) => Some(w.clone()),
             _ => None,
         }
     }
@@ -5135,7 +5157,7 @@ impl Parser {
     /// determinism surface — byte-identical across the three parsers).
     pub fn peek_keyword_at(&self, offset: usize) -> Option<String> {
         match self.tokens.get(self.pos + offset) {
-            Some(Token::Word(w)) => Some(w.to_ascii_lowercase()),
+            Some(Token::Word(w)) => Some(w.clone()),
             _ => None,
         }
     }
@@ -5159,8 +5181,8 @@ impl Parser {
         }
     }
 
-    /// Consume the current token, requiring it to be the given keyword
-    /// (case-insensitive).
+    /// Consume the current token, requiring it to be the given keyword: a bare word (already
+    /// folded by the lexer; `kw` is lowercase) — never a quoted identifier.
     pub fn expect_keyword(&mut self, kw: &str) -> Result<()> {
         match self.advance() {
             Token::Word(w) if w.eq_ignore_ascii_case(kw) => Ok(()),
@@ -5168,10 +5190,11 @@ impl Parser {
         }
     }
 
-    /// Consume the current token, requiring it to be a bare word, and return it.
+    /// Consume the current token, requiring it to be an identifier — a bare word (folded) or a
+    /// quoted identifier (exact) — and return the name (grammar.md §3).
     pub fn expect_identifier(&mut self) -> Result<String> {
         match self.advance() {
-            Token::Word(w) => Ok(w),
+            Token::Word(w) | Token::QuotedIdent(w) => Ok(w),
             other => Err(syntax(format!("expected an identifier, found {other:?}"))),
         }
     }
@@ -5181,8 +5204,8 @@ impl Parser {
     /// word is not accepted (it would case-fold). An empty name (`""`) is a 42601 syntax error.
     fn expect_collation_name(&mut self) -> Result<String> {
         match self.advance() {
-            Token::QuotedIdent(s) if !s.is_empty() => Ok(s),
-            Token::QuotedIdent(_) => Err(syntax("collation name may not be empty".to_string())),
+            // The lexer rejects a zero-length `""` (42601), so a quoted name is never empty.
+            Token::QuotedIdent(s) => Ok(s),
             other => Err(syntax(format!(
                 "expected a quoted collation name after COLLATE, found {other:?}"
             ))),
@@ -5230,8 +5253,7 @@ pub(crate) fn rewrite_column_identifier(
 ) -> Result<(String, Expr)> {
     let mut tokens = lex(text)?;
     for i in 0..tokens.len() {
-        let is_old = matches!(&tokens[i], Token::Word(w) if w.eq_ignore_ascii_case(old));
-        if !is_old {
+        if !token_names(&tokens[i], old) {
             continue;
         }
         let prev = i.checked_sub(1).and_then(|j| tokens.get(j));
@@ -5239,12 +5261,11 @@ pub(crate) fn rewrite_column_identifier(
         let next = tokens.get(i + 1);
         let skip = matches!(next, Some(Token::LParen | Token::FatArrow | Token::Str(_)))
             || matches!(prev, Some(Token::DoubleColon))
-            || matches!(prev, Some(Token::Word(w)) if w.eq_ignore_ascii_case("as"))
-            || (matches!(prev, Some(Token::Dot))
-                && !matches!(prev2, Some(Token::Word(w)) if w.eq_ignore_ascii_case(table)))
-            || (matches!(next, Some(Token::Dot)) && old.eq_ignore_ascii_case(table));
+            || matches!(prev, Some(Token::Word(w)) if w == "as")
+            || (matches!(prev, Some(Token::Dot)) && !prev2.is_some_and(|t| token_names(t, table)))
+            || (matches!(next, Some(Token::Dot)) && old == table);
         if !skip {
-            tokens[i] = Token::Word(new.to_string());
+            tokens[i] = name_token(new);
         }
     }
     if matches!(tokens.last(), Some(Token::Eof)) {
@@ -5259,10 +5280,8 @@ pub(crate) fn rewrite_column_identifier(
 pub(crate) fn rewrite_table_qualifier(text: &str, old: &str, new: &str) -> Result<(String, Expr)> {
     let mut tokens = lex(text)?;
     for i in 0..tokens.len().saturating_sub(1) {
-        if matches!(&tokens[i], Token::Word(w) if w.eq_ignore_ascii_case(old))
-            && matches!(tokens.get(i + 1), Some(Token::Dot))
-        {
-            tokens[i] = Token::Word(new.to_string());
+        if token_names(&tokens[i], old) && matches!(tokens.get(i + 1), Some(Token::Dot)) {
+            tokens[i] = name_token(new);
         }
     }
     if matches!(tokens.last(), Some(Token::Eof)) {
@@ -5271,6 +5290,83 @@ pub(crate) fn rewrite_table_qualifier(text: &str, old: &str, new: &str) -> Resul
     let rewritten = render_tokens(&tokens);
     let expr = parse_expression(&rewritten)?;
     Ok((rewritten, expr))
+}
+
+/// Parse a name-valued TEXT argument as exactly one identifier — the sequence functions'
+/// `nextval('s')` regclass text form (spec/design/grammar.md §3), PostgreSQL's
+/// `SplitIdentifierString` rule: surrounding whitespace (space, tab, LF, CR, FF) is ignored; a
+/// double-quoted name is exact (`""` an embedded quote; `'""'` is the empty name, which never
+/// exists); otherwise the run of characters up to whitespace or `.` is a bare name, folded to
+/// lowercase (ASCII). Empty / all-whitespace text, an unterminated quote, anything after the name
+/// (internal whitespace, trailing characters), or a dotted name is `42602 invalid_name` — jed has no
+/// schemas and does not resolve a qualified name from text. Not length-checked (cost.md §7).
+pub fn parse_name_text(text: &str) -> Result<String> {
+    let invalid = || EngineError::new(SqlState::InvalidName, "invalid name syntax");
+    let is_ws = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0c}');
+    let s = text.trim_start_matches(is_ws);
+    let (name, rest) = if let Some(body) = s.strip_prefix('"') {
+        let mut name = String::new();
+        let mut chars = body.char_indices();
+        let rest = loop {
+            match chars.next() {
+                None => return Err(invalid()),
+                Some((i, '"')) => {
+                    if body[i + 1..].starts_with('"') {
+                        name.push('"');
+                        chars.next();
+                    } else {
+                        break &body[i + 1..];
+                    }
+                }
+                Some((_, c)) => name.push(c),
+            }
+        };
+        (name, rest)
+    } else {
+        let end = s.find(|c: char| is_ws(c) || c == '.').unwrap_or(s.len());
+        if end == 0 {
+            return Err(invalid());
+        }
+        (s[..end].to_ascii_lowercase(), &s[end..])
+    };
+    if !rest.trim_start_matches(is_ws).is_empty() {
+        return Err(invalid());
+    }
+    Ok(name)
+}
+
+/// Whether an identifier token (bare word or quoted) spells exactly `name` (byte-exact after the
+/// lexer's fold, grammar.md §3).
+fn token_names(t: &Token, name: &str) -> bool {
+    matches!(t, Token::Word(w) | Token::QuotedIdent(w) if w == name)
+}
+
+/// Whether `name` survives the lexer written bare: `[a-z_][a-z0-9_]*` (grammar.md §3's quoting
+/// rule). Any other name must be rendered double-quoted.
+pub(crate) fn is_plain_identifier(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty()
+        && (b[0].is_ascii_lowercase() || b[0] == b'_')
+        && b.iter()
+            .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+}
+
+/// The token a RENAME rewrite substitutes into persisted expression text: ALWAYS a quoted
+/// identifier, even for a plain lowercase name — jed has no reserved keywords, so a bare `null` /
+/// `true` would re-lex as the literal (grammar.md §3, alter.md §2.2). Untouched tokens keep their
+/// stored spelling.
+fn name_token(name: &str) -> Token {
+    Token::QuotedIdent(name.to_string())
+}
+
+/// Render `name` as SQL identifier text by grammar.md §3's quoting rule: bare when it matches
+/// `[a-z_][a-z0-9_]*`, else double-quoted with each `"` doubled.
+pub fn quote_identifier(name: &str) -> String {
+    if is_plain_identifier(name) {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
 }
 
 fn render_token(t: &Token) -> String {
@@ -5287,8 +5383,8 @@ fn render_token(t: &Token) -> String {
             format!("{}.{}", &coeff[..split], &coeff[split..])
         }
         Token::Str(s) => format!("'{}'", s.replace('\'', "''")),
-        // A double-quoted identifier round-trips verbatim with `"` doubled (collation names in a
-        // persisted COLLATE expression, spec/design/collation.md §1).
+        // A double-quoted identifier round-trips verbatim with `"` doubled (format v37; a bare
+        // word above renders as its folded lowercase spelling).
         Token::QuotedIdent(s) => format!("\"{}\"", s.replace('"', "\"\"")),
         Token::Param(n) => format!("${n}"),
         Token::Comma => ",".into(),
@@ -5336,6 +5432,11 @@ fn render_token(t: &Token) -> String {
         Token::BangTildeStar => "!~*".into(),
         Token::Eof => String::new(),
     }
+}
+
+/// Whether a token can be an identifier: a bare word or a quoted identifier (grammar.md §3).
+fn is_ident(t: &Token) -> bool {
+    matches!(t, Token::Word(_) | Token::QuotedIdent(_))
 }
 
 fn syntax(msg: impl Into<String>) -> EngineError {

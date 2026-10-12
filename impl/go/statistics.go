@@ -8,7 +8,6 @@ import (
 	"math"
 	"math/big"
 	"sort"
-	"strings"
 )
 
 type statisticsValue struct {
@@ -928,7 +927,7 @@ func (db *engine) executeAnalyze(analyze *analyzeStmt) (outcome, error) {
 	if err := db.checkAttachmentWritable(analyze.DB); err != nil {
 		return outcome{}, err
 	}
-	if isCatalogRelName(strings.ToLower(analyze.Name)) {
+	if isCatalogRelName(analyze.Name) {
 		return outcome{}, newError(WrongObjectType, "cannot modify system relation "+analyze.Name)
 	}
 	table, ok := db.lkpTableScoped(analyze.DB, analyze.Name)
@@ -943,14 +942,14 @@ func (db *engine) executeAnalyze(analyze *analyzeStmt) (outcome, error) {
 		}
 	} else {
 		for _, name := range analyze.Columns {
-			key := strings.ToLower(name)
+			key := name
 			if seen[key] {
 				return outcome{}, newError(DuplicateColumn, "column "+name+" appears more than once")
 			}
 			seen[key] = true
 			column := -1
 			for i := range table.Columns {
-				if strings.EqualFold(table.Columns[i].Name, name) {
+				if table.Columns[i].Name == name {
 					column = i
 					break
 				}
@@ -1069,7 +1068,7 @@ func (db *engine) executeAnalyze(analyze *analyzeStmt) (outcome, error) {
 			database = "temp"
 		}
 	} else {
-		database = strings.ToLower(*analyze.DB)
+		database = *analyze.DB
 	}
 	var target *snapshot
 	switch database {

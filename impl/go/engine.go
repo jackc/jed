@@ -105,7 +105,7 @@ type engine struct {
 	// during a commit persist; the READ view of attachments is the pinned attachedCommitted below.
 	core *sharedCore
 	// attachedCommitted is the PINNED committed root of every host-attached DATABASE-scoped database
-	// (attached-databases.md §5), keyed by lowercased name — this session's stable read view, snapshot
+	// (attached-databases.md §5), keyed by exact name — this session's stable read view, snapshot
 	// isolated: refreshed from core.roots.attached at each autocommit statement (refreshCommitted) and
 	// pinned for the life of an explicit BEGIN block. nil/empty when nothing is attached. Session-local
 	// temp is NOT here (it is on sessionState.tempCommitted); this is only the Database-scoped roots.
@@ -273,9 +273,9 @@ type sessionState struct {
 	// byte-identical cross-core output.
 	seam seam
 	// sessionSeq is the SESSION currval state (sequences.md §6): the last value nextval/setval(…,true)
-	// produced IN THIS SESSION for each sequence (lowercased name). NOT in the snapshot, NOT persisted.
+	// produced IN THIS SESSION for each sequence (exact name). NOT in the snapshot, NOT persisted.
 	sessionSeq map[string]int64
-	// sessionLastName is the SESSION lastval state (sequences.md §6): the lowercased name of the
+	// sessionLastName is the SESSION lastval state (sequences.md §6): the exact name of the
 	// sequence the most recent nextval (of any sequence) ran on — "" before the first nextval.
 	sessionLastName string
 	// pendingSeq is the per-STATEMENT running sequence advances (sequences.md §4); flushed into the
@@ -453,13 +453,13 @@ type activeTx struct {
 	// commit skips it; unchanged domains are refined by snapshot.changedSince).
 	tempDirty bool
 	// attachWorking is the transaction's working copy of a host-attached database's snapshot
-	// (attached-databases.md §5), keyed by lowercased attachment name — the attachment analogue of
+	// (attached-databases.md §5), keyed by exact attachment name — the attachment analogue of
 	// tempWorking. Cloned lazily from engine.attachedCommitted[name] on the first write to that
 	// attachment (attachWriteSnap), so a read-only cross-attachment query allocates nothing here.
 	// Adopted into engine.attachedCommitted + persisted+published on a successful COMMIT, discarded on
 	// ROLLBACK. nil until an attachment is written.
 	attachWorking map[string]*snapshot
-	// attachDirty records which attachments this transaction mutated (lowercased name → true), the
+	// attachDirty records which attachments this transaction mutated (exact name → true), the
 	// per-attachment analogue of mainDirty/tempDirty — the set the commit persists + publishes.
 	attachDirty map[string]bool
 }
@@ -561,7 +561,7 @@ func (db *engine) columnCollationsScoped(scope *string, table string, columns []
 
 func (db *engine) columnStatisticsScoped(scope *string, table string, column int) *columnStatistics {
 	snap := db.relationSnap(scope, table)
-	definition := snap.tables[strings.ToLower(table)]
+	definition := snap.tables[table]
 	if definition == nil || column < 0 || column >= len(definition.Columns) {
 		return nil
 	}
@@ -647,12 +647,12 @@ func (db *engine) isTempTable(name string) bool {
 // would, so this is a VALIDATION GATE, not a routing change: it asserts the named relation lives in the
 // claimed database (else 42P01), and the downstream temp-first funnel then resolves it to the matching
 // scope. A nil qualifier (a bare, implicit-scope name) always passes. The qualifier is matched
-// case-insensitively (unquoted identifiers fold to lower case).
+// by exact name (unquoted identifiers fold to lower case).
 func (db *engine) checkTableQualifier(qualifier *string, name string) error {
 	if qualifier == nil {
 		return nil
 	}
-	switch strings.ToLower(*qualifier) {
+	switch *qualifier {
 	case "temp":
 		if !db.isTempTable(name) {
 			return newError(UndefinedTable, `relation "temp.`+name+`" does not exist`)
@@ -662,7 +662,7 @@ func (db *engine) checkTableQualifier(qualifier *string, name string) error {
 			return newError(UndefinedTable, `relation "main.`+name+`" does not exist`)
 		}
 	default:
-		snap := db.attachReadSnap(strings.ToLower(*qualifier))
+		snap := db.attachReadSnap(*qualifier)
 		if snap == nil {
 			return newError(UndefinedTable, `database "`+*qualifier+`" is not attached`)
 		}
@@ -681,7 +681,7 @@ func (db *engine) checkAttachmentWritable(scope *string) error {
 	if scope == nil || db.core == nil {
 		return nil
 	}
-	name := strings.ToLower(*scope)
+	name := *scope
 	if name == "main" || name == "temp" {
 		return nil
 	}
@@ -700,7 +700,7 @@ func isReservedScope(q *string) bool {
 	if q == nil {
 		return true
 	}
-	switch strings.ToLower(*q) {
+	switch *q {
 	case "main", "temp":
 		return true
 	}
@@ -722,7 +722,7 @@ func (rel scopeRel) isAttachment() bool { return isAttachmentScope(rel.db) }
 
 // attachReadSnap returns the READ snapshot of a host-attached database (attached-databases.md §5) — the
 // transaction's working clone if this tx wrote it, else the pinned committed root (attachedCommitted).
-// nil when no attachment is named `name` (the caller raises 42P01). name is expected lowercased.
+// nil when no attachment is named `name` (the caller raises 42P01). name is the exact name.
 func (db *engine) attachReadSnap(name string) *snapshot {
 	if db.session.tx != nil {
 		if ws := db.session.tx.attachWorking[name]; ws != nil {
@@ -735,7 +735,7 @@ func (db *engine) attachReadSnap(name string) *snapshot {
 // attachWriteSnap returns the WRITE snapshot of a host-attached database, cloning the pinned committed
 // root into the transaction's per-attachment working set on first write and marking it dirty (the
 // attachment analogue of working()/tempWorking). Returns nil if the attachment is unknown (unreachable
-// after the qualifier gate). name is expected lowercased.
+// after the qualifier gate). name is the exact name.
 func (db *engine) attachWriteSnap(name string) *snapshot {
 	tx := db.session.tx
 	if tx.attachWorking == nil {
@@ -797,13 +797,13 @@ func (db *engine) attachReadView() map[string]*snapshot {
 // gap: relocating temp into the Database-scoped attachment registry would re-share it across sessions
 // (what Slice 0 removed). So temp routes like an attachment here but keeps its own home.
 func (db *engine) snapForScope(scope string) *snapshot {
-	switch strings.ToLower(scope) {
+	switch scope {
 	case "temp":
 		return db.tempSnap()
 	case "main":
 		return db.readSnap()
 	default:
-		return db.attachReadSnap(strings.ToLower(scope))
+		return db.attachReadSnap(scope)
 	}
 }
 
@@ -839,14 +839,14 @@ func (db *engine) writeStoreScoped(scope *string, name string) *tableStore {
 	if scope == nil {
 		return db.writeStore(name)
 	}
-	switch strings.ToLower(*scope) {
+	switch *scope {
 	case "temp":
 		db.session.tx.tempDirty = true
 		return db.session.tx.tempWorking.store(name)
 	case "main":
 		return db.working().store(name)
 	default:
-		ws := db.attachWriteSnap(strings.ToLower(*scope))
+		ws := db.attachWriteSnap(*scope)
 		if ws == nil {
 			return nil
 		}
@@ -866,14 +866,14 @@ func (db *engine) markEstimatorMutation(scope *string, table string) {
 			return
 		}
 	} else {
-		database = strings.ToLower(*scope)
+		database = *scope
 		if database == "temp" {
 			db.session.tx.tempDirty = true
 			db.session.tx.tempWorking.markStatisticsStale(table)
 			return
 		}
 	}
-	key := estimatorTouchedRelation{database: database, table: strings.ToLower(table)}
+	key := estimatorTouchedRelation{database: database, table: table}
 	if db.estimatorTouched == nil {
 		db.estimatorTouched = make(map[estimatorTouchedRelation]struct{})
 	}
@@ -911,14 +911,14 @@ func (db *engine) writeIndexStoreScoped(scope *string, nameKey string) *tableSto
 	if scope == nil {
 		return db.writeIndexStore(nameKey)
 	}
-	switch strings.ToLower(*scope) {
+	switch *scope {
 	case "temp":
 		db.session.tx.tempDirty = true
 		return db.session.tx.tempWorking.indexStore(nameKey)
 	case "main":
 		return db.working().indexStore(nameKey)
 	default:
-		ws := db.attachWriteSnap(strings.ToLower(*scope))
+		ws := db.attachWriteSnap(*scope)
 		if ws == nil {
 			return nil
 		}
@@ -1007,7 +1007,7 @@ func (db *engine) putSequenceRouted(def *sequenceDef) {
 // removeSequenceRouted removes a sequence from whichever scope owns its name (the routed analogue of
 // putSequenceRouted). Used by DROP SEQUENCE and DROP TABLE's owned-sequence auto-drop.
 func (db *engine) removeSequenceRouted(name string) {
-	key := strings.ToLower(name)
+	key := name
 	if db.isTempSequence(name) {
 		db.session.tx.tempDirty = true
 		db.session.tx.tempWorking.removeSequence(key)
@@ -1385,12 +1385,12 @@ func (s *sessionState) ClearClockSource()            { s.seam.ClearClock() }
 // transaction defaults to READ ONLY, writes are 25006, and the file is never written.
 func (db *engine) ReadOnly() bool { return db.readOnly }
 
-// Table looks up a table definition by name (case-insensitive) in the visible snapshot.
+// Table looks up a table definition by name (exact name) in the visible snapshot.
 func (db *engine) Table(name string) (*catTable, bool) {
 	return db.readSnap().table(name)
 }
 
-// CompositeType looks up a composite type definition by name (case-insensitive) in the visible
+// CompositeType looks up a composite type definition by name (exact name) in the visible
 // snapshot (spec/design/composite.md); nil if absent.
 func (db *engine) CompositeType(name string) *compositeType {
 	return db.readSnap().compositeType(name)

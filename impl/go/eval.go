@@ -2846,13 +2846,22 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// per-statement pending state; currval is a pure session-state read. The NULL-arg case
 			// is handled by the blanket propagation above.
 			m.Charge(costs.SequenceAdvance)
-			n, err := env.exec.seqNextval(vals[0].str())
+			// The text names the sequence as one identifier (grammar.md §3).
+			name, err := parseNameText(vals[0].str())
+			if err != nil {
+				return Value{}, err
+			}
+			n, err := env.exec.seqNextval(name)
 			if err != nil {
 				return Value{}, err
 			}
 			return IntValue(n), nil
 		case sfCurrval:
-			n, err := env.exec.seqCurrval(vals[0].str())
+			name, err := parseNameText(vals[0].str())
+			if err != nil {
+				return Value{}, err
+			}
+			n, err := env.exec.seqCurrval(name)
 			if err != nil {
 				return Value{}, err
 			}
@@ -2861,11 +2870,15 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// setval charges sequence_advance (it rewrites the catalog tuple, like nextval). Arity 2
 			// → isCalled defaults true; arity 3 → the boolean third argument.
 			m.Charge(costs.SequenceAdvance)
+			name, err := parseNameText(vals[0].str())
+			if err != nil {
+				return Value{}, err
+			}
 			isCalled := true
 			if len(vals) > 2 {
 				isCalled = vals[2].boolVal()
 			}
-			n, err := env.exec.seqSetval(vals[0].str(), vals[1].Int, isCalled)
+			n, err := env.exec.seqSetval(name, vals[1].Int, isCalled)
 			if err != nil {
 				return Value{}, err
 			}

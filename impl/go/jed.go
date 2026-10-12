@@ -528,6 +528,11 @@ var SupportedCapabilities = []string{
 	// the ordering comparisons (< <= > >=) and ORDER BY; explicit-conflict 42P21, unknown 42704,
 	// non-text COLLATE 42804; the `collate` cost unit.
 	"expr.collate",
+	// Identifier folding + double-quoted identifiers (spec/design/grammar.md §3): a bare identifier
+	// folds to lowercase in the lexer, a quoted identifier is the exact name and never a keyword;
+	// every name compares byte-exactly; the sequence functions' text argument parses as one
+	// identifier (42602 when malformed).
+	"query.quoted_identifiers",
 	// The AT TIME ZONE operator (and the timezone(zone, value) function it desugars to) +
 	// host-loaded IANA time-zone data (spec/design/timezones.md §6, grammar.md §49): convert
 	// timestamptz↔timestamp through a named zone or fixed offset. A zone is provided by a host-loaded

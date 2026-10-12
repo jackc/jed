@@ -1106,7 +1106,7 @@ const (
 	// parenthesized / `ROW(…)` / cast / qualified-column base; a bare `a.b` stays
 	// ExprQualifiedColumn and only falls back to field access at resolve when `a` is no relation
 	// but a composite column (the ambiguity rule — table.column first, then column.field). Field
-	// lookup is case-insensitive; an unknown field is 42703, a non-composite base 42809.
+	// lookup is byte-exact; an unknown field is 42703, a non-composite base 42809.
 	exprFieldAccess
 	// ExprFieldStar is whole-row expansion `(expr).*` (spec/design/composite.md §S4) — expands a
 	// composite Base into one output column per field, in declaration order. Valid only in a
@@ -1281,7 +1281,7 @@ type exprNode struct {
 	// composite expression `(base).field` / `(base).*` selects from (spec/design/composite.md §S4).
 	Base *exprNode
 	// Field is the selected field name of an ExprFieldAccess (the `.field` part); lookup is
-	// case-insensitive at resolve.
+	// byte-exact at resolve (grammar.md §3).
 	Field string
 	// Subscripts are the bracketed specs of an ExprSubscript (`Base[..][..]`) — one or more index /
 	// slice specs (spec/design/array.md §6). Base holds the array operand.
@@ -1471,7 +1471,7 @@ type isDistinctExpr struct {
 }
 
 // FuncCallExpr is a function call — the shared aggregate/scalar call syntax
-// (spec/design/grammar.md §17). Name is the spelling as written, resolved case-insensitively:
+// (spec/design/grammar.md §17). Name is the spelling as written, resolved by exact name:
 // an aggregate (COUNT/SUM/MIN/MAX/AVG), a scalar function (abs/round, kind = "function",
 // spec/design/functions.md §9), or 42883 (undefined_function). Star is the COUNT(*) row-count
 // form (then Args is empty); otherwise Args is the comma-separated argument list — aggregates

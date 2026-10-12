@@ -61,10 +61,10 @@ fn db20() -> Session {
     db
 }
 
-/// Auto-naming matches PostgreSQL (oracle-probed, indexes.md §2): lowercased
-/// `<table>_<cols>_idx` + the smallest free suffix; duplicates in the column list are
-/// allowed and named through; an explicit name round-trips as written. The catalog holds
-/// indexes in ascending lowercased-name order.
+/// Auto-naming matches PostgreSQL (oracle-probed, indexes.md §2): `<table>_<cols>_idx` from the
+/// exact (folded) names + the smallest free suffix; duplicates in the column list are allowed and
+/// named through; an explicit name is the exact name. The catalog holds indexes in ascending
+/// name byte order.
 #[test]
 fn auto_naming_matches_postgres() {
     let mut db = Database::create(CreateOptions::default())
@@ -76,10 +76,10 @@ fn auto_naming_matches_postgres() {
     run(&mut db, "CREATE INDEX ON T (B)"); // t_b_idx2
     run(&mut db, "CREATE INDEX ON T (A, B)"); // t_a_b_idx
     run(&mut db, "CREATE INDEX ON T (B, B)"); // t_b_b_idx (duplicate column allowed — PG)
-    run(&mut db, "CREATE INDEX Mine ON T (B)"); // explicit, original case kept
+    run(&mut db, "CREATE INDEX \"Mine\" ON T (B)"); // explicit quoted name, exact case kept
     let t = db.table("t").unwrap();
     let names: Vec<&str> = t.indexes.iter().map(|i| i.name.as_str()).collect();
-    // Ascending lowercased-name order (the catalog/planner order).
+    // Ascending name byte order (the catalog/planner order): uppercase `M` sorts before `t`.
     assert_eq!(
         names,
         vec![
@@ -95,6 +95,13 @@ fn auto_naming_matches_postgres() {
     assert_eq!(t.indexes[2].column_ordinals().unwrap(), vec![1, 1]);
     // The PK list is independent of the indexes.
     assert_eq!(t.pk_indices(), vec![0]);
+    // Auto-names derive from the EXACT names (PG: `CREATE INDEX ON "Up"("K")` → `Up_K_idx`).
+    run(&mut db, "CREATE TABLE \"Up\" (\"K\" i32, k i32)");
+    run(&mut db, "CREATE INDEX ON \"Up\" (\"K\")");
+    run(&mut db, "CREATE INDEX ON \"Up\" (k)");
+    let up = db.table("Up").unwrap();
+    let names: Vec<&str> = up.indexes.iter().map(|i| i.name.as_str()).collect();
+    assert_eq!(names, vec!["Up_K_idx", "Up_k_idx"]);
 }
 
 /// DDL errors mirror PostgreSQL (oracle-probed, indexes.md §2): validation order is

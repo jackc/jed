@@ -64,7 +64,8 @@ leases.
 jed reuses the pages that deletes and updates free, but a file never shrinks by itself: after a big
 delete it keeps its peak size. To give that space back, compact the database:
 `db.compact("main")` (Rust), `db.Compact("main")` (Go), or `db.compact("main")` (TypeScript). Pass
-an attachment's name to compact that database instead.
+an attachment's name to compact that database instead. The name is matched exactly, as given when
+the database was attached.
 
 Compaction rewrites the committed data as a fresh, contiguous file next to the original
 (`<path>.jedtmp`), syncs it, and atomically renames it into place, so a crash at any point leaves

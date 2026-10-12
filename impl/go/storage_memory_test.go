@@ -53,7 +53,7 @@ func TestStorageLimitOptionsAndGauge(t *testing.T) {
 	storageExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v text)")
 	// Unlimited by default: a large insert commits.
 	storageExec(t, s, storageBatch(0, 200))
-	full := mustStorageBytes(t, db, "MAIN")
+	full := mustStorageBytes(t, db, "main")
 	if full <= fresh {
 		t.Fatalf("storage %d did not grow past %d", full, fresh)
 	}

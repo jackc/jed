@@ -424,7 +424,7 @@ function parseDefaultPrivilegesDirective(line: string): PrivilegeSet | null {
   return parsePrivSet(m[1]!);
 }
 
-// A parsed `# grant:` / `# revoke:` directive: a privilege set and the lowercased object it targets.
+// A parsed `# grant:` / `# revoke:` directive: a privilege set and the exact object it targets.
 type PrivDelta = { privs: PrivilegeSet; object: string };
 
 // parsePrivDelta parses a `PRIVS ON object` body: the privilege set and the single-word object name
@@ -755,7 +755,7 @@ function runFile(text: string, disk: boolean): void {
         const msb = parseMaxStorageBytesDirective(line);
         if (msb !== null) {
           attachDb.setMaxStorageBytes(msb[1], msb[0]);
-          if (msb[1].toLowerCase() === "main") mainStorageLimit = msb[0];
+          if (msb[1] === "main") mainStorageLimit = msb[0];
           c.i++;
           continue;
         }

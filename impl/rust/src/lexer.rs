@@ -334,11 +334,10 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 tokens.push(Token::Str(s));
             }
             b'"' => {
-                // Double-quoted identifier (collation names, spec/design/collation.md §1). `""`
-                // is an embedded double quote; the content is kept VERBATIM (case-sensitive). The
-                // input is valid UTF-8 and `"` is ASCII, so copying raw bytes between quotes
-                // preserves UTF-8 validity. Empty (`""`) is allowed by the lexer; the parser
-                // rejects an empty collation name.
+                // Double-quoted identifier (spec/design/grammar.md §3): the name VERBATIM
+                // (case-sensitive, any UTF-8), `""` an embedded double quote. The input is valid
+                // UTF-8 and `"` is ASCII, so copying raw bytes between quotes preserves UTF-8
+                // validity.
                 i += 1; // consume the opening quote
                 let mut buf: Vec<u8> = Vec::new();
                 loop {
@@ -358,6 +357,22 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                             i += 1;
                         }
                     }
+                }
+                // A zero-length delimited identifier is a syntax error (PostgreSQL's rule,
+                // spec/design/grammar.md §3).
+                if buf.is_empty() {
+                    return Err(syntax("zero-length delimited identifier".to_string()));
+                }
+                // The identifier-length gate applies to a quoted name too, measured on its
+                // decoded UTF-8 bytes (spec/design/cost.md §7).
+                if buf.len() > crate::parser::MAX_IDENTIFIER_LENGTH {
+                    return Err(EngineError::new(
+                        SqlState::NameTooLong,
+                        format!(
+                            "identifier exceeds the maximum length of {} bytes",
+                            crate::parser::MAX_IDENTIFIER_LENGTH
+                        ),
+                    ));
                 }
                 let s = String::from_utf8(buf)
                     .map_err(|_| syntax("invalid UTF-8 in quoted identifier".to_string()))?;
@@ -470,7 +485,10 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                         ),
                     ));
                 }
-                tokens.push(Token::Word(sql[start..i].to_string()));
+                // A bare word folds to lowercase (ASCII) here, so every later comparison of a
+                // name is byte-exact and keyword matching is case-insensitive by construction
+                // (spec/design/grammar.md §3).
+                tokens.push(Token::Word(sql[start..i].to_ascii_lowercase()));
             }
             _ => {
                 return Err(syntax(format!("unexpected character '{}'", c as char)));

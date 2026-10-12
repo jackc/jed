@@ -371,7 +371,7 @@ is:
 
 1. **PK tuple bound** (maximal equality prefix plus optional next-member range) — the row's own key;
    no second tree.
-2. **B-tree index access predicate** — the **lowest-lowercased-name** index yielding a
+2. **B-tree index access predicate** — the **lowest-name** (byte order) index yielding a
    non-empty equality-prefix (+ optional trailing range) predicate; column and expression
    keys; a partial index only when a WHERE conjunct structurally implies its predicate.
 3. **GiST bound** — a range/scalar operator conjunct over a GiST-indexed column.
@@ -401,7 +401,7 @@ also has only the full candidate.
 
 Each candidate carries these explicit planning facts:
 
-- a collision-free identity `(kind, lowercased_index_name)`, with an empty name for PK, PK interval,
+- a collision-free identity `(kind, index_name)`, with an empty name for PK, PK interval,
   and full paths;
 - the existing executor `ScanBound`, absent only for full scan;
 - its scan-order capability: reversible table-storage-key order, or forward order in one named
@@ -410,7 +410,7 @@ Each candidate carries these explicit planning facts:
 
 Inventory order is the canonical total access-path order: PK, ordered B-tree, GiST, GIN, PK interval,
 ordered-index interval, full. Index-bearing candidates of the same kind sort by raw UTF-8 bytes of
-their already-lowercased catalog name. Catalog container or map iteration must not affect this order.
+their exact catalog name ([grammar.md §3](grammar.md)). Catalog container or map iteration must not affect this order.
 This order is the cost selector's equal-estimate tie-break; the fixed barrier selector below
 deliberately preserves one older precedence exception and does not simply take the inventory's
 first element.
@@ -425,7 +425,7 @@ first element.
 The fixed selector, used only by SELECT barrier inputs, preserves one detail exactly: a same-key
 interval set with a direct clipping range replaces the broader contiguous PK/B-tree bound. Otherwise
 it takes PK, B-tree, GiST, GIN, PK interval, index interval, then full. Within every index-bearing
-kind, the lowest lowercased name wins. (UPDATE/DELETE used a variant of it, trying GIN before GiST,
+kind, the lowest name (byte order) wins. (UPDATE/DELETE used a variant of it, trying GIN before GiST,
 until §5.5 replaced it.)
 The planner inventories once per base relation and attaches one estimate per candidate: logical
 output rows, access scan rows expressed through scheduled unit counts, weighted cost, and the

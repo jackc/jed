@@ -349,6 +349,15 @@ class = "syntax error or access rule violation"
 template = "syntax error: {detail}"
 
 [[error]]
+code = "42602"
+name = "invalid_name"
+class = "syntax error or access rule violation"
+# A name-valued TEXT argument (the sequence functions' nextval('s') regclass form) that does not
+# parse as exactly one SQL identifier — empty, an unterminated quote, internal whitespace in a bare
+# word, trailing characters, or a dotted name (spec/design/grammar.md §3). PG's code and wording.
+template = "invalid name syntax"
+
+[[error]]
 code = "42P01"
 name = "undefined_table"
 class = "syntax error or access rule violation"
@@ -524,8 +533,8 @@ name = "reserved_name"
 class = "syntax error or access rule violation"
 # The jed_ name prefix is reserved for the engine's own catalog relations (the future
 # jed_tables / jed_columns — spec/design/introspection.md §4). Raised when DDL supplies a
-# USER-written name beginning jed_ (case-insensitive; there is no quoted-identifier escape)
-# for any object in the relation namespace (table — incl. TEMP — index, sequence, or a named
+# USER-written name beginning jed_ (byte-exact on the folded name: bare JED_x folds to jed_x and
+# is rejected, quoted "JED_x" is a different name and is allowed — PG's pg_ rule) for any object in the relation namespace (table — incl. TEMP — index, sequence, or a named
 # UNIQUE/EXCLUDE constraint, whose name IS its backing index) or the type namespace (composite
 # type). Engine-GENERATED names (a serial's <table>_<col>_seq for a table legally named jed)
 # are exempt. PG's code — PG uses it for the pg_ schema prefix; reserving in the relation/type

@@ -97,7 +97,7 @@ impl Engine {
     ) -> Result<Vec<CteBinding>> {
         let mut bindings: Vec<CteBinding> = Vec::new();
         for cte in ctes {
-            let lname = cte.name.to_ascii_lowercase();
+            let lname = cte.name.to_string();
             if bindings.iter().any(|b| b.name == lname) {
                 return Err(EngineError::new(
                     SqlState::DuplicateAlias,

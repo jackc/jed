@@ -302,8 +302,9 @@ the default is applied to an inserted row.
 
 ### 4.3 Naming
 
-An explicit `CONSTRAINT <name>` is used as written (names follow the engine's identifier
-convention: original case round-trips, comparisons are case-insensitive). Otherwise the name
+An explicit `CONSTRAINT <name>` is used as the name (names follow the engine's identifier
+convention: bare spellings fold to lowercase, quoted spellings are exact, comparisons are
+byte-exact — [grammar.md §3](grammar.md)). Otherwise the name
 is **derived, PostgreSQL's algorithm**: let the *referenced columns* be the distinct columns
 the expression mentions —
 
@@ -312,8 +313,8 @@ the expression mentions —
 - if that name is taken (by any earlier-named check, explicit or derived), append the
   smallest positive integer that frees it (`<table>_<column>_check1`, `…2`, …).
 
-Derived names are built from the **lowercased** table/column names (what PostgreSQL's
-identifier folding produces). Naming is a single pass in textual definition order — an
+Derived names are built from the **exact** table/column names (no case change — a quoted
+`"Tab"` gives `Tab_…_check`, as PostgreSQL). Naming is a single pass in textual definition order — an
 explicit name colliding with an *earlier* derived name is `42710` (derived names never
 yield; oracle-probed).
 
@@ -324,7 +325,7 @@ inside the existing two-phase / all-or-nothing pass (grammar.md §12): after the
 are coerced (`22003`) and `NOT NULL` is applied (`23502` — NOT NULL fires before CHECK,
 PG's order), and **before** the storage key is built and checked (`23505` — CHECK fires
 before a duplicate key, PG's order), every check constraint is evaluated against the
-candidate row **in name order** (ascending byte order of the lowercased name — PostgreSQL
+candidate row **in name order** (ascending byte order of the name — PostgreSQL
 evaluates checks sorted by name, oracle-probed; `aa` fires before `zz` regardless of
 definition order). The first FALSE aborts the statement with `23514`; nothing is written.
 
@@ -349,9 +350,12 @@ expression work.
 A check constraint is stored in the table's catalog entry as its **name** plus its
 **expression text**, under `format_version` **4** ([../fileformat/format.md
 ](../fileformat/format.md)): after the column entries, a `check_count` and per-check
-`(name, expr_text)` pairs, ordered by the **evaluation order** (lowercased-name byte order).
+`(name, expr_text)` pairs, ordered by the **evaluation order** (name byte order).
 The expression text is the **re-rendered source token sequence** (format.md defines the
-per-token rendering — a closed, recursion-free byte contract identical across cores); on
+per-token rendering — a closed, recursion-free byte contract identical across cores; since
+`format_version` 37 a bare word renders folded, i.e. lowercase, keywords included, and a quoted
+identifier renders quoted, so `CHECK ("Qty" > 0 AND b IS NOT NULL)` persists as
+`"Qty" > 0 and b is not null` — [grammar.md §3](grammar.md)); on
 load each core re-parses the stored text with its ordinary expression parser, and a commit
 writes the retained text back verbatim, so the catalog bytes are stable across
 create → commit → load → commit. Unparseable stored text in an otherwise-valid file is
@@ -413,12 +417,12 @@ A repeated bare `UNIQUE` on one column is the trivial case of the same fold.
 
 After the folds, each surviving constraint names its index, in textual order:
 
-- an **explicit** `CONSTRAINT <name>` is used as written; it is checked against the
+- an **explicit** `CONSTRAINT <name>` is used as the name; it is checked against the
   **relation namespace** first — tables (including the one being created) and indexes,
   `42P07` — then against the table's **constraint names** (its checks) — `42710`
   (`constraint <name> for relation <table> already exists`). Relation before constraint
   is PG's probed order;
-- an **omitted** name derives PostgreSQL's choice: the lowercased
+- an **omitted** name derives PostgreSQL's choice: the exact-name
   `<table>_<col>_<col>…_key` (members in list order), suffix-walked past **both**
   namespaces (a check named `t_a_key` pushes the derived name to `t_a_key1` — probed).
 
@@ -436,12 +440,12 @@ duplicate key value violates unique constraint: <name>
 ```
 
 `<name>` is the violated unique index's name. The **primary key's own** `23505` reports
-the derived `<table>_pkey` (lowercased — PostgreSQL's auto-name for the PK index). jed
+the derived `<table>_pkey` (from the exact table name — PostgreSQL's auto-name for the PK index). jed
 does **not** persist or reserve that name: `CREATE INDEX t_pkey ON t (a)` is legal in jed
 where PG would collide — a documented divergence (the PK has no index object here).
 
 When one row violates several uniqueness constraints, the reported one is: the **primary
-key first**, then the unique indexes in the catalog's **ascending lowercased-name order**
+key first**, then the unique indexes in the catalog's **ascending name byte order**
 (jed's standing deterministic order — checks fire in name order the same way, §4.4).
 PostgreSQL reports in index *creation* order, which jed does not persist — a documented
 divergence (the code is identical; only the choice of reported name differs).
@@ -489,7 +493,7 @@ FK constraints resolve **after** the table-level `PRIMARY KEY`, the `UNIQUE` con
    (`column <name> named in key does not exist`, the PK wording) — and appear once — **`42701`**
    (`column <name> appears twice in foreign key constraint`). A local column may be of any type
    here; the type gate is the cross-check in step 5.
-2. **Parent table.** Look it up case-insensitively (CLAUDE.md §1). It may be the table being
+2. **Parent table.** Look it up by exact name ([grammar.md §3](grammar.md)). It may be the table being
    created — a **self-reference** — in which case it resolves against the in-progress definition
    (its columns, its just-resolved PK, its just-named unique indexes). A missing parent is
    **`42P01`** (`table does not exist: <name>`).
@@ -506,7 +510,7 @@ FK constraints resolve **after** the table-level `PRIMARY KEY`, the `UNIQUE` con
    constraint matching given keys for referenced table <parent>`). This is what makes the existence
    probe (§6.4) a point/prefix lookup rather than a scan, and matches PG (which requires a unique or
    primary-key constraint on the referenced columns). When several match, the **primary key wins**,
-   then unique indexes in ascending lowercased-name order (jed's standing deterministic order) — the
+   then unique indexes in ascending name byte order (jed's standing deterministic order) — the
    choice only fixes which physical tree the probe walks; the result is identical.
 5. **Types must match.** Each local column and its paired referenced column must be the **same**
    scalar type — else **`42804`** (`foreign key constraint <name> cannot be implemented: key columns
@@ -518,8 +522,8 @@ FK constraints resolve **after** the table-level `PRIMARY KEY`, the `UNIQUE` con
 6. **Referential actions.** `NO ACTION` (the default), `RESTRICT`, `CASCADE`, `SET NULL`, and
    `SET DEFAULT` are accepted and stored. The three write actions are executed by the parent-side
    mutation closure described in §6.6.
-7. **Naming.** An explicit `CONSTRAINT <name>` is used as written; otherwise the name is derived,
-   PostgreSQL's algorithm: lowercased `<table>_<localcol>_<localcol>…_fkey` (every local column in
+7. **Naming.** An explicit `CONSTRAINT <name>` is used as the name; otherwise the name is derived,
+   PostgreSQL's algorithm: exact-name `<table>_<localcol>_<localcol>…_fkey` (every local column in
    list order, joined by `_`), suffix-walked past the table's **constraint namespace** (its checks
    and earlier FKs) with the smallest positive integer that frees it (`…_fkey1`, `…_fkey2`, …). An
    explicit name colliding with an existing check or FK name is **`42710`** (`constraint <name> for
@@ -612,7 +616,7 @@ the engine picks a **reverse access path** on the child table, deterministically
    can be located by skipping fixed-width slots (the [indexes.md §5.1](indexes.md) rule); a child
    PK always qualifies on this point, since its tail is the rest of the storage key itself.
 2. **Tie order.** When several qualify, the **primary key** wins, then indexes in ascending
-   lowercased-name order — the planner's canonical access-path tie order
+   name byte order — the planner's canonical access-path tie order
    ([estimator.md](estimator.md)). Every qualifying path returns the same answer; the order only
    fixes which tree is probed, and so the cost.
 3. **The probe.** The disappearing parent tuple's values are re-encoded in the **chosen child
@@ -632,7 +636,7 @@ Either path observes the statement's **end state** (the working snapshot after e
 write, whose index stores are maintained in phase 2). The answer is identical on every path, so the
 visible behavior — whether `23503` fires and which FK it names — does not depend on the choice. When
 more than one FK is violated, the reported one is deterministic: referencing tables in ascending
-lowercased-name order, then FKs in name order.
+name byte order, then FKs in name order.
 
 The scan fallback resolves the child's FK columns through the child store before encoding a
 probe. Persisted rows may defer even small inline values, as well as compressed or external
@@ -690,7 +694,7 @@ use the ordinary row pipeline: coercion / NOT NULL, CHECK, PK/UNIQUE/EXCLUDE, ou
 maintenance, and further inbound actions. A failure at any depth discards the whole statement (or
 aborts the containing explicit transaction), including every already-staged parent/child write.
 
-For one parent mutation batch, referencing tables are visited by ascending lowercased table name,
+For one parent mutation batch, referencing tables are visited by ascending table name byte order,
 then FK name. Within one FK, matching child rows use storage-key order. Write actions run in that
 order; the non-writing checks run only after every sibling write action. A cycle terminates naturally
 once its next generated mutation matches no current row. Cascading call depth is capped at 256;
@@ -748,7 +752,7 @@ Since `format_version` 30 each action occupies three bits (`NO ACTION = 0`, `RES
 `CASCADE = 2`, `SET NULL = 3`, `SET DEFAULT = 4`): `on_delete` uses bits 0–2, `on_update` bits
 3–5, and bits 6–7 are reserved, written 0 and read-validated to `XX001`. This supersedes v11's
 two-bit-per-action layout, which could represent only the two actions then implemented. The list is
-held in **ascending lowercased-name order** (the catalog's
+held in **ascending name byte order** (the catalog's
 standing deterministic order, like checks and indexes), which is also the §6.4 child-side
 name-evaluation order. An FK creates no B-tree, so — unlike an index — it stores no root page. On
 load the referenced-table/column names and ordinals are read back verbatim; a dangling reference in

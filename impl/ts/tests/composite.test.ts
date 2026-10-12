@@ -27,7 +27,7 @@ test("CREATE TYPE registers fields", () => {
   assert.equal(ct!.fields[1]!.name, "zip");
   assert.equal(ct!.fields[1]!.notNull, false);
   // Case-insensitive lookup.
-  assert.ok(db.compositeType("ADDR"), "ADDR resolves case-insensitively");
+  assert.equal(db.compositeType("ADDR"), undefined, "host-API lookup is by exact name");
 });
 
 test("DROP TYPE removes it", () => {

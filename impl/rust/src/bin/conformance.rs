@@ -471,7 +471,7 @@ fn parse_default_privileges_directive(rest: &str) -> Option<jed::PrivilegeSet> {
 }
 
 /// Parse a `# grant: PRIVS ON object` / `# revoke: PRIVS ON object` directive body (after the
-/// `grant:` / `revoke:` prefix is stripped): the privilege set and the lowercased object name. The
+/// `grant:` / `revoke:` prefix is stripped): the privilege set and the exact object name. The
 /// object is the single word after the `ON` keyword (spec/design/session.md §5.3).
 fn parse_priv_delta(body: &str) -> Option<(jed::PrivilegeSet, String)> {
     let lower = body.to_ascii_lowercase();
@@ -793,7 +793,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
             if let Some((bytes, name)) = parse_max_storage_bytes_directive(rest) {
                 db.set_max_storage_bytes(&name, bytes)
                     .map_err(|e| format!("max_storage_bytes {name:?}: {}", e.message))?;
-                if name.eq_ignore_ascii_case("main") {
+                if name == "main" {
                     main_storage_limit = bytes;
                 }
                 continue;

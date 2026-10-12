@@ -240,7 +240,7 @@ export type Expr =
   // has ≥1 entries (empty is 42601 at parse); argument types unify exactly like CASE result arms.
   | { kind: "greatestLeast"; args: Expr[]; greatest: boolean }
   // A function call — the shared aggregate/scalar call syntax (grammar.md §17). `name` is the
-  // spelling as written, resolved case-insensitively: an aggregate (COUNT/SUM/MIN/MAX/AVG), a
+  // (folded or quoted) name, resolved byte-exactly: an aggregate (COUNT/SUM/MIN/MAX/AVG), a
   // scalar function (abs/round, kind = "function", spec/design/functions.md §9), or 42883. `star`
   // is the COUNT(*) row-count form (then `args` is empty); otherwise `args` is the comma-separated
   // argument list — aggregates and abs take one, round one or two. `distinct` carries a leading
@@ -326,7 +326,7 @@ export type Expr =
   // a composite `base`. The parser produces this for a `.name` postfix on a parenthesized / ROW(…) /
   // cast / qualified-column base; a bare `a.b` stays qualifiedColumn and only falls back to field
   // access at resolve when `a` is no relation but a composite column (the ambiguity rule — table.column
-  // first, then column.field). Field lookup is case-insensitive; an unknown field is 42703, a
+  // first, then column.field). Field lookup is byte-exact on the folded name; an unknown field is 42703, a
   // non-composite base 42809.
   | { kind: "fieldAccess"; base: Expr; field: string }
   // Whole-row expansion `(expr).*` (spec/design/composite.md §S4) — expands a composite `base` into

@@ -427,7 +427,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 	targetTemp := ct.Temp
 	attachName := ""
 	if ct.DB != nil {
-		switch strings.ToLower(*ct.DB) {
+		switch *ct.DB {
 		case "main":
 			if ct.Temp {
 				return outcome{}, newError(SyntaxError, `cannot create a TEMP table in database "main"`)
@@ -438,7 +438,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			if ct.Temp {
 				return outcome{}, newError(SyntaxError, "cannot create a TEMP table in an attached database")
 			}
-			attachName = strings.ToLower(*ct.DB)
+			attachName = *ct.DB
 			if db.attachReadSnap(attachName) == nil {
 				return outcome{}, newError(UndefinedTable, `database "`+*ct.DB+`" is not attached`)
 			}
@@ -496,7 +496,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 	var pendingSerials []*sequenceDef
 	for _, def := range ct.Columns {
 		for _, c := range columns {
-			if strings.EqualFold(c.Name, def.Name) {
+			if c.Name == def.Name {
 				return outcome{}, newError(DuplicateColumn, "duplicate column name: "+def.Name)
 			}
 		}
@@ -667,9 +667,9 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			pendingSerials = append(pendingSerials, seqDef)
 			// Render the synthetic default exactly as the parser would the equivalent
 			// DEFAULT nextval('<seqName>') (space-joined tokens — the canonical expression-text form),
-			// so the in-memory expr matches what reload re-parses. The seqName is a lowercased
+			// so the in-memory expr matches what reload re-parses. The seqName is an exact
 			// identifier-derived name, so the quoting is always safe.
-			exprText := "nextval ( '" + strings.ReplaceAll(seqName, "'", "''") + "' )"
+			exprText := nextvalDefaultText(seqName)
 			expr, err := parseExpression(exprText)
 			if err != nil {
 				return outcome{}, err
@@ -773,7 +773,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		for _, name := range pkList {
 			idx := -1
 			for i := range columns {
-				if strings.EqualFold(columns[i].Name, name) {
+				if columns[i].Name == name {
 					idx = i
 					break
 				}
@@ -817,7 +817,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		for _, cname := range u.Columns {
 			idx := -1
 			for i := range columns {
-				if strings.EqualFold(columns[i].Name, cname) {
+				if columns[i].Name == cname {
 					idx = i
 					break
 				}
@@ -875,12 +875,12 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 	// used as written; a derived name is built from the LOWERCASED table/column names —
 	// `<table>_<col>_check` when the expression references exactly one distinct column,
 	// else `<table>_check` — suffixed with the smallest positive integer that frees it. A
-	// collision (case-insensitive, PG folds) is 42710; derived names never yield to a later
+	// collision (byte-exact names) is 42710; derived names never yield to a later
 	// explicit one (oracle-probed).
 	checks := make([]checkConstraint, 0, len(ct.Checks))
 	nameTaken := func(name string) bool {
 		for _, c := range checks {
-			if strings.EqualFold(c.Name, name) {
+			if c.Name == name {
 				return true
 			}
 		}
@@ -898,9 +898,9 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			cols := checkReferencedColumns(def.Expr, columns)
 			var base string
 			if len(cols) == 1 {
-				base = strings.ToLower(table.Name) + "_" + strings.ToLower(columns[cols[0]].Name) + "_check"
+				base = table.Name + "_" + columns[cols[0]].Name + "_check"
 			} else {
-				base = strings.ToLower(table.Name) + "_check"
+				base = table.Name + "_check"
 			}
 			name = base
 			for suffix := 1; nameTaken(name); suffix++ {
@@ -909,10 +909,10 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		}
 		checks = append(checks, checkConstraint{Name: name, ExprText: def.Text, Expr: def.Expr, HostDeps: checkDeps[i]})
 	}
-	// Evaluation (and on-disk) order: ascending byte order of the lowercased name
+	// Evaluation (and on-disk) order: ascending byte order of the exact name
 	// (constraints.md §4.4 — PG evaluates checks sorted by name, oracle-probed).
 	sort.SliceStable(checks, func(i, j int) bool {
-		return strings.ToLower(checks[i].Name) < strings.ToLower(checks[j].Name)
+		return checks[i].Name < checks[j].Name
 	})
 	table.Checks = checks
 
@@ -944,11 +944,11 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		}
 	}
 	relationTaken := func(n string) bool {
-		if db.relationExists(n) || strings.EqualFold(table.Name, n) {
+		if db.relationExists(n) || table.Name == n {
 			return true
 		}
 		for _, ix := range table.Indexes {
-			if strings.EqualFold(ix.Name, n) {
+			if ix.Name == n {
 				return true
 			}
 		}
@@ -956,7 +956,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 	}
 	checkNameTaken := func(n string) bool {
 		for _, c := range table.Checks {
-			if strings.EqualFold(c.Name, n) {
+			if c.Name == n {
 				return true
 			}
 		}
@@ -979,9 +979,9 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 					"constraint "+name+" for relation "+table.Name+" already exists")
 			}
 		} else {
-			base := strings.ToLower(table.Name)
+			base := table.Name
 			for _, i := range ru.cols {
-				base += "_" + strings.ToLower(table.Columns[i].Name)
+				base += "_" + table.Columns[i].Name
 			}
 			base += "_key"
 			name = base
@@ -989,12 +989,12 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 				name = base + strconv.Itoa(suffix)
 			}
 		}
-		// Insert in catalog (ascending lowercased-name) order — indexes.md §6.
+		// Insert in catalog (ascending name byte) order — indexes.md §6.
 		def := indexDef{Name: name, Keys: columnKeys(ru.cols), Unique: true, Kind: indexBtree}
-		nameKey := strings.ToLower(name)
+		nameKey := name
 		pos := len(table.Indexes)
 		for i, ix := range table.Indexes {
-			if strings.ToLower(ix.Name) > nameKey {
+			if ix.Name > nameKey {
 				pos = i
 				break
 			}
@@ -1018,7 +1018,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		for _, cname := range fk.Columns {
 			idx := -1
 			for i := range table.Columns {
-				if strings.EqualFold(table.Columns[i].Name, cname) {
+				if table.Columns[i].Name == cname {
 					idx = i
 					break
 				}
@@ -1034,7 +1034,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			local = append(local, idx)
 		}
 		// 2. Parent table — a self-reference resolves against the in-progress definition.
-		selfRef := strings.EqualFold(fk.RefTable, table.Name)
+		selfRef := fk.RefTable == table.Name
 		var parent *catTable
 		if selfRef {
 			parent = table
@@ -1061,7 +1061,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			for _, cname := range fk.RefColumns {
 				idx := -1
 				for i := range parent.Columns {
-					if strings.EqualFold(parent.Columns[i].Name, cname) {
+					if parent.Columns[i].Name == cname {
 						idx = i
 						break
 					}
@@ -1087,14 +1087,14 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		if fk.Name != "" {
 			collide := false
 			for _, c := range table.Checks {
-				if strings.EqualFold(c.Name, fk.Name) {
+				if c.Name == fk.Name {
 					collide = true
 					break
 				}
 			}
 			if !collide {
 				for _, f := range resolvedFks {
-					if strings.EqualFold(f.Name, fk.Name) {
+					if f.Name == fk.Name {
 						collide = true
 						break
 					}
@@ -1106,19 +1106,19 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			}
 			name = fk.Name
 		} else {
-			base := strings.ToLower(table.Name)
+			base := table.Name
 			for _, i := range local {
-				base += "_" + strings.ToLower(table.Columns[i].Name)
+				base += "_" + table.Columns[i].Name
 			}
 			base += "_fkey"
 			fkNameTaken := func(candidate string) bool {
 				for _, c := range table.Checks {
-					if strings.EqualFold(c.Name, candidate) {
+					if c.Name == candidate {
 						return true
 					}
 				}
 				for _, f := range resolvedFks {
-					if strings.EqualFold(f.Name, candidate) {
+					if f.Name == candidate {
 						return true
 					}
 				}
@@ -1179,9 +1179,9 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			OnUpdate:   onUpdate,
 		})
 	}
-	// Held in ascending lowercased-name order (the catalog's on-disk + evaluation order, §6.9).
+	// Held in ascending name byte order (the catalog's on-disk + evaluation order, §6.9).
 	sort.SliceStable(resolvedFks, func(i, j int) bool {
-		return strings.ToLower(resolvedFks[i].Name) < strings.ToLower(resolvedFks[j].Name)
+		return resolvedFks[i].Name < resolvedFks[j].Name
 	})
 	table.ForeignKeys = resolvedFks
 
@@ -1192,7 +1192,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 	// 42P07/42710 across the relation + constraint namespaces), and build the MULTI-COLUMN GiST index
 	// that enforces it. The probe + 23P01 live in INSERT/UPDATE.
 	for _, exc := range ct.Excludes {
-		if exc.Using != "" && !strings.EqualFold(exc.Using, "gist") {
+		if exc.Using != "" && exc.Using != "gist" {
 			return outcome{}, newError(UndefinedObject, "access method "+exc.Using+" does not support exclusion constraints")
 		}
 		indices := make([]int, 0, len(exc.Elements))
@@ -1200,7 +1200,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		for _, el := range exc.Elements {
 			ci := -1
 			for i := range table.Columns {
-				if strings.EqualFold(table.Columns[i].Name, el.Column) {
+				if table.Columns[i].Name == el.Column {
 					ci = i
 					break
 				}
@@ -1243,11 +1243,11 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		// namespace (42P07) then the table's constraint names (42710); a derived `<table>_<cols>_excl`
 		// suffix-walks both.
 		relTaken := func(n string) bool {
-			if db.relationExists(n) || strings.EqualFold(table.Name, n) {
+			if db.relationExists(n) || table.Name == n {
 				return true
 			}
 			for _, ix := range table.Indexes {
-				if strings.EqualFold(ix.Name, n) {
+				if ix.Name == n {
 					return true
 				}
 			}
@@ -1255,17 +1255,17 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		}
 		conTaken := func(n string) bool {
 			for _, c := range table.Checks {
-				if strings.EqualFold(c.Name, n) {
+				if c.Name == n {
 					return true
 				}
 			}
 			for _, f := range table.ForeignKeys {
-				if strings.EqualFold(f.Name, n) {
+				if f.Name == n {
 					return true
 				}
 			}
 			for _, e := range table.Exclusions {
-				if strings.EqualFold(e.Name, n) {
+				if e.Name == n {
 					return true
 				}
 			}
@@ -1286,9 +1286,9 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			}
 			name = exc.Name
 		} else {
-			base := strings.ToLower(table.Name)
+			base := table.Name
 			for _, i := range indices {
-				base += "_" + strings.ToLower(table.Columns[i].Name)
+				base += "_" + table.Columns[i].Name
 			}
 			base += "_excl"
 			name = base
@@ -1296,12 +1296,12 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 				name = base + strconv.Itoa(suffix)
 			}
 		}
-		// Insert the backing GiST index in catalog (ascending lowercased-name) order.
+		// Insert the backing GiST index in catalog (ascending name byte) order.
 		def := indexDef{Name: name, Keys: columnKeys(indices), Unique: false, Kind: indexGist}
-		nameKey := strings.ToLower(name)
+		nameKey := name
 		pos := len(table.Indexes)
 		for i, ix := range table.Indexes {
-			if strings.ToLower(ix.Name) > nameKey {
+			if ix.Name > nameKey {
 				pos = i
 				break
 			}
@@ -1309,9 +1309,9 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		table.Indexes = slices.Insert(table.Indexes, pos, def)
 		table.Exclusions = append(table.Exclusions, exclusionConstraint{Name: name, Index: name, Elements: elements})
 	}
-	// Held in ascending lowercased-name order (the catalog's on-disk order — gist.md §8).
+	// Held in ascending name byte order (the catalog's on-disk order — gist.md §8).
 	sort.SliceStable(table.Exclusions, func(i, j int) bool {
-		return strings.ToLower(table.Exclusions[i].Name) < strings.ToLower(table.Exclusions[j].Name)
+		return table.Exclusions[i].Name < table.Exclusions[j].Name
 	})
 
 	if attachName != "" {
@@ -1348,7 +1348,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		aps := db.attachPageSize(attachName)
 		ws.putTableResolved(table, colTypes, aps)
 		for _, ix := range table.Indexes {
-			ws.putIndexStore(strings.ToLower(ix.Name), newTableStore(pagePayload(aps), nil))
+			ws.putIndexStore(ix.Name, newTableStore(pagePayload(aps), nil))
 		}
 		return outcome{Kind: outcomeStatement, Cost: 0}, nil
 	}
@@ -1384,7 +1384,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		ts.storePaging = db.tempDomainPaging()
 		ts.putTableResolved(table, colTypes, db.pageSize)
 		for _, ix := range table.Indexes {
-			ts.putIndexStore(strings.ToLower(ix.Name), newTableStore(pagePayload(db.pageSize), nil))
+			ts.putIndexStore(ix.Name, newTableStore(pagePayload(db.pageSize), nil))
 		}
 		// Stage each serial/IDENTITY column's OWNED sequence into the SAME temp snapshot
 		// (spec/design/sequences.md §12, temp-tables.md §8) — never the main image, so the sequence
@@ -1400,7 +1400,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 	db.putTable(table)
 	// The table is brand new (no rows), so each backing index store starts empty.
 	for _, ix := range table.Indexes {
-		db.working().putIndexStore(strings.ToLower(ix.Name), newTableStore(pagePayload(db.pageSize), nil))
+		db.working().putIndexStore(ix.Name, newTableStore(pagePayload(db.pageSize), nil))
 	}
 	// Stage each serial column's OWNED sequence now that the table validated
 	// (spec/design/sequences.md §12). The names were resolved (collision-free) during the column
@@ -1651,12 +1651,12 @@ const (
 )
 
 type dropTarget struct {
-	key   string // lowercased catalog key
+	key   string // exact catalog key
 	scope dropScope
 }
 
 // executeDropTable runs a DROP TABLE [IF EXISTS] a [, …] [CASCADE | RESTRICT]: remove each named
-// table's definition and row store from the catalog (keyed by lower-cased name). Two-phase /
+// table's definition and row store from the catalog (keyed by exact name). Two-phase /
 // all-or-nothing (spec/design/grammar.md §13): every name is resolved and validated first — a
 // missing table is 42P01 (unless IF EXISTS skips just that name), a non-table relation is 42809,
 // and an external FK dependent is 2BP01 under RESTRICT — and only if the whole list checks out is
@@ -1666,11 +1666,11 @@ type dropTarget struct {
 func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 	// ---- Phase 1: resolve & classify every name into the drop set. Nothing is removed yet. A
 	// repeated name is deduplicated (PG collects the targets into a set, so `DROP TABLE a, a` drops
-	// `a` once and succeeds); seen is the set of lowercased keys actually being dropped.
+	// `a` once and succeeds); seen is the set of exact keys actually being dropped.
 	var targets []dropTarget
 	seen := map[string]bool{}
 	for _, name := range dt.Names {
-		key := strings.ToLower(name)
+		key := name
 		if seen[key] {
 			continue // already resolved this exact target (deduplicated)
 		}
@@ -1773,13 +1773,13 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			snap = db.readSnap()
 		}
 	} else {
-		switch strings.ToLower(*at.DB) {
+		switch *at.DB {
 		case "temp":
 			snap = db.tempSnap()
 		case "main":
 			snap = db.readSnap()
 		default:
-			snap = db.attachReadSnap(strings.ToLower(*at.DB))
+			snap = db.attachReadSnap(*at.DB)
 			if snap == nil {
 				return outcome{}, newError(UndefinedTable, `database "`+*at.DB+`" is not attached`)
 			}
@@ -1795,7 +1795,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		}
 		return outcome{}, newError(UndefinedTable, "table does not exist: "+at.Name)
 	}
-	oldKey := strings.ToLower(original.Name)
+	oldKey := original.Name
 	table := *original
 	table.Columns = append([]catColumn(nil), original.Columns...)
 	table.PK = append([]int(nil), original.PK...)
@@ -1850,17 +1850,17 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	// already occupied its new name.
 	workingRelationTaken := func(name string) bool {
 		for _, seq := range pendingSerials {
-			if strings.EqualFold(seq.Name, name) {
+			if seq.Name == name {
 				return true
 			}
 		}
 		for _, ix := range table.Indexes {
-			if strings.EqualFold(ix.Name, name) {
+			if ix.Name == name {
 				return true
 			}
 		}
 		for _, ix := range original.Indexes {
-			if strings.EqualFold(ix.Name, name) {
+			if ix.Name == name {
 				return false
 			}
 		}
@@ -1883,7 +1883,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		old, next := at.RenameColumn.Old, at.RenameColumn.New
 		ci := -1
 		for i := range table.Columns {
-			if strings.EqualFold(table.Columns[i].Name, old) {
+			if table.Columns[i].Name == old {
 				ci = i
 			}
 		}
@@ -1891,7 +1891,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			return outcome{}, newError(UndefinedColumn, "column does not exist: "+old)
 		}
 		for i := range table.Columns {
-			if strings.EqualFold(table.Columns[i].Name, next) {
+			if table.Columns[i].Name == next {
 				return outcome{}, newError(DuplicateColumn, "column already exists: "+next)
 			}
 		}
@@ -1903,22 +1903,22 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		old, next := at.RenameConstraint.Old, at.RenameConstraint.New
 		constraintExists := func(name string) bool {
 			for _, c := range table.Checks {
-				if strings.EqualFold(c.Name, name) {
+				if c.Name == name {
 					return true
 				}
 			}
 			for _, i := range table.Indexes {
-				if i.Unique && strings.EqualFold(i.Name, name) {
+				if i.Unique && i.Name == name {
 					return true
 				}
 			}
 			for _, f := range table.ForeignKeys {
-				if strings.EqualFold(f.Name, name) {
+				if f.Name == name {
 					return true
 				}
 			}
 			for _, e := range table.Exclusions {
-				if strings.EqualFold(e.Name, name) {
+				if e.Name == name {
 					return true
 				}
 			}
@@ -1931,23 +1931,23 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			return outcome{}, newError(DuplicateObject, "constraint already exists: "+next)
 		}
 		for i := range table.Checks {
-			if strings.EqualFold(table.Checks[i].Name, old) {
+			if table.Checks[i].Name == old {
 				table.Checks[i].Name = next
 			}
 		}
 		for i := range table.ForeignKeys {
-			if strings.EqualFold(table.ForeignKeys[i].Name, old) {
+			if table.ForeignKeys[i].Name == old {
 				table.ForeignKeys[i].Name = next
 			}
 		}
 		for i := range table.Exclusions {
-			if strings.EqualFold(table.Exclusions[i].Name, old) {
+			if table.Exclusions[i].Name == old {
 				table.Exclusions[i].Name, table.Exclusions[i].Index = next, next
 				indexOld, indexNew = old, next
 			}
 		}
 		for i := range table.Indexes {
-			if (table.Indexes[i].Unique || indexOld != "") && strings.EqualFold(table.Indexes[i].Name, old) {
+			if (table.Indexes[i].Unique || indexOld != "") && table.Indexes[i].Name == old {
 				table.Indexes[i].Name = next
 				indexOld, indexNew = old, next
 			}
@@ -1961,16 +1961,16 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			}
 		}
 		sort.Slice(table.Checks, func(i, j int) bool {
-			return strings.ToLower(table.Checks[i].Name) < strings.ToLower(table.Checks[j].Name)
+			return table.Checks[i].Name < table.Checks[j].Name
 		})
 		sort.Slice(table.Indexes, func(i, j int) bool {
-			return strings.ToLower(table.Indexes[i].Name) < strings.ToLower(table.Indexes[j].Name)
+			return table.Indexes[i].Name < table.Indexes[j].Name
 		})
 		sort.Slice(table.ForeignKeys, func(i, j int) bool {
-			return strings.ToLower(table.ForeignKeys[i].Name) < strings.ToLower(table.ForeignKeys[j].Name)
+			return table.ForeignKeys[i].Name < table.ForeignKeys[j].Name
 		})
 		sort.Slice(table.Exclusions, func(i, j int) bool {
-			return strings.ToLower(table.Exclusions[i].Name) < strings.ToLower(table.Exclusions[j].Name)
+			return table.Exclusions[i].Name < table.Exclusions[j].Name
 		})
 	} else {
 		actions := append([]alterTableEdit(nil), at.Actions...)
@@ -2083,15 +2083,15 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				oldPK := sortedUnique(table.PK)
 				localDeps := false
 				for _, fk := range table.ForeignKeys {
-					localDeps = localDeps || (strings.EqualFold(fk.RefTable, table.Name) && slices.Equal(sortedUnique(fk.RefColumns), oldPK))
+					localDeps = localDeps || (fk.RefTable == table.Name && slices.Equal(sortedUnique(fk.RefColumns), oldPK))
 				}
 				incomingDeps := false
 				for key, child := range snap.tables {
-					if strings.EqualFold(key, oldKey) {
+					if key == oldKey {
 						continue
 					}
 					for _, fk := range child.ForeignKeys {
-						incomingDeps = incomingDeps || (strings.EqualFold(fk.RefTable, original.Name) && slices.Equal(sortedUnique(fk.RefColumns), oldPK))
+						incomingDeps = incomingDeps || (fk.RefTable == original.Name && slices.Equal(sortedUnique(fk.RefColumns), oldPK))
 					}
 				}
 				if !a.DropPrimaryKey.Cascade && (localDeps || incomingDeps) {
@@ -2100,13 +2100,13 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				if a.DropPrimaryKey.Cascade {
 					kept := table.ForeignKeys[:0]
 					for _, fk := range table.ForeignKeys {
-						if !(strings.EqualFold(fk.RefTable, table.Name) && slices.Equal(sortedUnique(fk.RefColumns), oldPK)) {
+						if !(fk.RefTable == table.Name && slices.Equal(sortedUnique(fk.RefColumns), oldPK)) {
 							kept = append(kept, fk)
 						}
 					}
 					table.ForeignKeys = kept
 					for key, base := range snap.tables {
-						if strings.EqualFold(key, oldKey) {
+						if key == oldKey {
 							continue
 						}
 						child := base
@@ -2115,7 +2115,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 						}
 						keptFKs := append([]foreignKey(nil), child.ForeignKeys...)
 						keptFKs = slices.DeleteFunc(keptFKs, func(fk foreignKey) bool {
-							return strings.EqualFold(fk.RefTable, original.Name) && slices.Equal(sortedUnique(fk.RefColumns), oldPK)
+							return fk.RefTable == original.Name && slices.Equal(sortedUnique(fk.RefColumns), oldPK)
 						})
 						if len(keptFKs) != len(child.ForeignKeys) {
 							cp := *child
@@ -2151,7 +2151,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			edit := a.Column
 			ci := -1
 			for i := range table.Columns {
-				if strings.EqualFold(table.Columns[i].Name, edit.Column) {
+				if table.Columns[i].Name == edit.Column {
 					ci = i
 					break
 				}
@@ -2248,16 +2248,16 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				typeChanged = true
 				rowSteps = append(rowSteps, alterRowStep{kind: alterRowType, column: ci, value: value})
 				for _, c := range table.Checks {
-					constraintState.added[strings.ToLower(c.Name)] = true
+					constraintState.added[c.Name] = true
 				}
 				for _, ix := range table.Indexes {
-					constraintState.added[strings.ToLower(ix.Name)] = true
+					constraintState.added[ix.Name] = true
 				}
 				for _, fk := range table.ForeignKeys {
-					constraintState.added[strings.ToLower(fk.Name)] = true
+					constraintState.added[fk.Name] = true
 				}
 				for _, ex := range table.Exclusions {
-					constraintState.added[strings.ToLower(ex.Name)] = true
+					constraintState.added[ex.Name] = true
 				}
 			}
 		}
@@ -2265,7 +2265,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	if typeChanged {
 		for _, fk := range table.ForeignKeys {
 			parent := &table
-			if !strings.EqualFold(fk.RefTable, table.Name) {
+			if fk.RefTable != table.Name {
 				parent, _ = snap.table(fk.RefTable)
 			}
 			for i, local := range fk.Columns {
@@ -2276,14 +2276,14 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			}
 		}
 		for key, child := range snap.tables {
-			if strings.EqualFold(key, oldKey) {
+			if key == oldKey {
 				continue
 			}
 			if changed := constraintState.other[key]; changed != nil {
 				child = changed
 			}
 			for _, fk := range child.ForeignKeys {
-				if !strings.EqualFold(fk.RefTable, original.Name) {
+				if fk.RefTable != original.Name {
 					continue
 				}
 				for i, local := range fk.Columns {
@@ -2305,7 +2305,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 
 	alterPageSize := db.pageSize
 	if isAttachmentScope(at.DB) {
-		alterPageSize = db.attachPageSize(strings.ToLower(*at.DB))
+		alterPageSize = db.attachPageSize(*at.DB)
 	}
 	rewriteNeeded := len(columnSources) != len(original.Columns)
 	if !rewriteNeeded {
@@ -2358,14 +2358,14 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 					sw = db.working()
 				}
 			} else {
-				switch strings.ToLower(*at.DB) {
+				switch *at.DB {
 				case "temp":
 					db.session.tx.tempDirty = true
 					sw = db.session.tx.tempWorking
 				case "main":
 					sw = db.working()
 				default:
-					sw = db.attachWriteSnap(strings.ToLower(*at.DB))
+					sw = db.attachWriteSnap(*at.DB)
 				}
 			}
 			sw.putSequence(seq)
@@ -2496,7 +2496,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			if err != nil {
 				return outcome{}, err
 			}
-			key := strings.ToLower(ix.Name)
+			key := ix.Name
 			for _, entry := range rewriteRows {
 				es, err := db.indexEntries(table.Columns, rewriteColTypes, colls, &ri, entry.Key, entry.Row)
 				if err != nil {
@@ -2516,14 +2516,14 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			ws = db.working()
 		}
 	} else {
-		switch strings.ToLower(*at.DB) {
+		switch *at.DB {
 		case "temp":
 			db.session.tx.tempDirty = true
 			ws = db.session.tx.tempWorking
 		case "main":
 			ws = db.working()
 		default:
-			ws = db.attachWriteSnap(strings.ToLower(*at.DB))
+			ws = db.attachWriteSnap(*at.DB)
 		}
 	}
 	if rewriteRows != nil {
@@ -2562,7 +2562,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		}
 		pending := map[string]bool{}
 		for _, seq := range pendingSerials {
-			pending[strings.ToLower(seq.Name)] = true
+			pending[seq.Name] = true
 		}
 		ws.remapAlterColumnDependents(table.Name, originalToNew, pending)
 	}
@@ -2581,7 +2581,7 @@ func (db *engine) retypeAlterIdentitySequence(table, original *catTable, ci int,
 		panic("identity column is integer")
 	}
 	for i, seq := range pending {
-		if seq.OwnedBy != nil && strings.EqualFold(seq.OwnedBy.Table, table.Name) && int(seq.OwnedBy.Column) == ci {
+		if seq.OwnedBy != nil && seq.OwnedBy.Table == table.Name && int(seq.OwnedBy.Column) == ci {
 			next, err := retypeIdentitySequence(seq, oldDtype, newDtype)
 			if err != nil {
 				return err
@@ -2773,7 +2773,7 @@ func (db *engine) buildAlterAddedColumn(table *catTable, def *columnDef, pending
 			return catColumn{}, err
 		}
 		*pending = append(*pending, seq)
-		exprText := "nextval ( '" + strings.ReplaceAll(seqName, "'", "''") + "' )"
+		exprText := nextvalDefaultText(seqName)
 		expr, err := parseExpression(exprText)
 		if err != nil {
 			return catColumn{}, err
@@ -2860,18 +2860,18 @@ func rewriteAlterTableExpressions(table *catTable, old, next string, tableRename
 // earlier serial column of the same statement (pending), and not held by a caller-known pending
 // relation. All-lowercase identifier-derived.
 func (db *engine) chooseSerialSeqName(table, column string, pending []*sequenceDef, reserved []string) string {
-	base := strings.ToLower(table) + "_" + strings.ToLower(column) + "_seq"
+	base := table + "_" + column + "_seq"
 	taken := func(c string) bool {
-		if db.relationExists(c) || strings.EqualFold(c, table) {
+		if db.relationExists(c) || c == table {
 			return true
 		}
 		for _, s := range pending {
-			if strings.EqualFold(s.Name, c) {
+			if s.Name == c {
 				return true
 			}
 		}
 		for _, name := range reserved {
-			if strings.EqualFold(name, c) {
+			if name == c {
 				return true
 			}
 		}
@@ -3079,9 +3079,9 @@ func applySeqAlter(existing *sequenceDef, options seqOptions, restart *seqRestar
 // serialPseudoType maps a serial pseudo-type name to its underlying integer scalar
 // (spec/design/sequences.md §12) — serial/serial4 → Int32, bigserial/serial8 → Int64,
 // smallserial/serial2 → Int16. The bool is false for any other name. Recognized only in a
-// CREATE TABLE column-type position; the match is case-insensitive.
+// CREATE TABLE column-type position; the match is on the exact (folded) name.
 func serialPseudoType(name string) (scalarType, bool) {
-	switch strings.ToLower(name) {
+	switch name {
 	case "serial", "serial4":
 		return scalarInt32, true
 	case "bigserial", "serial8":
@@ -3094,27 +3094,28 @@ func serialPseudoType(name string) (scalarType, bool) {
 }
 
 // findIndex finds the table owning the named index in the visible snapshot
-// (case-insensitive).
+// (exact name).
 func (db *engine) findIndex(name string) (string, indexDef, bool) {
 	return db.readSnap().findIndex(name)
 }
 
 // checkReservedName rejects a USER-written catalog object name beginning jed_ — the prefix is
-// reserved for the engine's own catalog relations (spec/design/introspection.md §4). Case-insensitive
-// (resolution folds case and there is no quoted-identifier escape — grammar.md §3). Engine-GENERATED
+// reserved for the engine's own catalog relations (spec/design/introspection.md §4). Checked on
+// the exact name, byte-exact: a quoted "JED_x" is allowed, a bare JED_x folds and is rejected
+// (grammar.md §3). Engine-GENERATED
 // names (a serial's <table>_<col>_seq, an index auto-name — both legal for a table named jed) never
 // pass through here; the check sits with each site's namespace-collision check so established
 // validation orders (42P01/42703 before name checks) are preserved. kind is the object word in the
 // message: table / index / sequence / type.
 func checkReservedName(kind, name string) error {
-	if len(name) >= 4 && strings.EqualFold(name[:4], "jed_") {
+	if len(name) >= 4 && name[:4] == "jed_" {
 		return newError(ReservedName, kind+" name "+name+" is reserved (the jed_ prefix is reserved for system objects)")
 	}
 	return nil
 }
 
 // relationExists reports whether name is taken in the shared relation namespace (a table
-// OR an index — spec/design/indexes.md §2), case-insensitively.
+// OR an index — spec/design/indexes.md §2), by exact name.
 func (db *engine) relationExists(name string) bool {
 	// Session-local temp tables + their (UNIQUE) index names join the namespace too, so a name colliding
 	// with any temp relation is also 42P07 (preclude-overlaps — spec/design/temp-tables.md §3). db.Table
@@ -3141,7 +3142,7 @@ func (db *engine) relationExists(name string) bool {
 // each key column, in list order, must exist (42703) and be of a key-encodable type
 // (0A000 — the same narrowing as a PRIMARY KEY member); then an explicit name is checked
 // against the shared relation namespace (42P07), or an omitted name derives PG's choice —
-// the lowercased <table>_<col>..._idx with the smallest free suffix. The index is then
+// the exact-name <table>_<col>..._idx with the smallest free suffix. The index is then
 // built by scanning the table once: page_read per node + storage_row_read per row (the
 // metered build scan — cost.md §3); maintenance thereafter is unmetered.
 func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
@@ -3166,13 +3167,13 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 	}
 	attachName := ""
 	if isAttachmentScope(ci.DB) {
-		attachName = strings.ToLower(*ci.DB)
+		attachName = *ci.DB
 	}
 	table, ok := db.lkpTableScoped(ci.DB, ci.Table)
 	if !ok {
 		return outcome{}, newError(UndefinedTable, "table does not exist: "+ci.Table)
 	}
-	tableKey := strings.ToLower(table.Name)
+	tableKey := table.Name
 	columns := table.Columns
 	// Refuse building a collated index on a version-skewed table (slice 2d, collation.md §12, XX002):
 	// the new B-tree would be pinned inconsistently with the file's other structures.
@@ -3186,7 +3187,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 	// B-tree, "gin" a GIN inverted index; an unknown method is 42704. Resolved here (not in the
 	// parser) so the error is the resolve-time undefined_object, after the table-exists check.
 	var kind indexKind
-	switch strings.ToLower(ci.Using) {
+	switch ci.Using {
 	case "", "btree":
 		kind = indexBtree
 	case "gin":
@@ -3383,7 +3384,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			return outcome{}, newError(DuplicateTable, "relation already exists: "+name)
 		}
 	} else {
-		// PG's ChooseIndexName / ChooseIndexColumnNames (probed): lowercased table + one name part
+		// PG's ChooseIndexName / ChooseIndexColumnNames (probed): the exact table name + one name part
 		// per key element (list order, duplicates included) + "idx", then the smallest free suffix.
 		// A column key's part is the column name; a bare-function-call expression's is the function
 		// name (lower(email) → lower); any other expression's is the literal expr (indexes.md §2).
@@ -3479,7 +3480,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		return outcome{}, err
 	}
 
-	nameKey := strings.ToLower(def.Name)
+	nameKey := def.Name
 	// Register the index catalog entry + its (empty) store in the snapshot that owns the table (the
 	// resolution walk — temp-tables.md §2/§4/§8): a session-local temp table's index lives in the
 	// session temp snapshot, so the index makes ZERO file writes (the dirty bit lets the commit skip the
@@ -3525,7 +3526,7 @@ func (db *engine) executeDropIndex(di *dropIndex) (outcome, error) {
 	if _, ok := db.lkpTable(di.Name); ok {
 		return outcome{}, newError(WrongObjectType, di.Name+" is not an index")
 	}
-	nameKey := strings.ToLower(di.Name)
+	nameKey := di.Name
 	switch {
 	case db.isTempIndex(di.Name):
 		tableKey, _, _ := db.tempSnap().findIndex(di.Name)
@@ -3541,7 +3542,7 @@ func (db *engine) executeDropIndex(di *dropIndex) (outcome, error) {
 		// matching PG's "cannot drop index … because constraint … requires it" (gist.md §7).
 		if t, tok := db.lkpTable(tableKey); tok {
 			for _, e := range t.Exclusions {
-				if strings.EqualFold(e.Index, di.Name) {
+				if e.Index == di.Name {
 					return outcome{}, newError(DependentObjectsStillExist,
 						"cannot drop index "+di.Name+" because constraint "+di.Name+" on table "+t.Name+" requires it")
 				}
@@ -3566,7 +3567,7 @@ func (db *engine) executeCreateType(ct *createType) (outcome, error) {
 	fields := make([]compositeField, 0, len(ct.Fields))
 	for _, f := range ct.Fields {
 		for _, g := range fields {
-			if strings.EqualFold(g.Name, f.Name) {
+			if g.Name == f.Name {
 				return outcome{}, newError(DuplicateColumn, "attribute "+f.Name+" specified more than once")
 			}
 		}
@@ -3648,7 +3649,7 @@ func (db *engine) executeDropType(dt *dropType) (outcome, error) {
 		return outcome{}, newError(DependentObjectsStillExist,
 			"cannot drop type "+dt.Name+" because other objects depend on it: "+dep)
 	}
-	db.working().removeType(strings.ToLower(dt.Name))
+	db.working().removeType(dt.Name)
 	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 
@@ -3759,14 +3760,14 @@ func (db *engine) alterSequenceRename(existing *sequenceDef, newName string) err
 		return newError(DuplicateTable, "relation already exists: "+newName)
 	}
 	if existing.OwnedBy != nil {
-		exprText := "nextval ( '" + strings.ReplaceAll(strings.ToLower(newName), "'", "''") + "' )"
+		exprText := nextvalDefaultText(newName)
 		expr, err := parseExpression(exprText)
 		if err != nil {
 			return err
 		}
 		// Route to the owner's scope so a renamed owned TEMP sequence rewrites its column default in
 		// the temp snapshot (temp-tables.md §8).
-		db.setColumnDefaultExprRouted(strings.ToLower(existing.OwnedBy.Table),
+		db.setColumnDefaultExprRouted(existing.OwnedBy.Table,
 			int(existing.OwnedBy.Column), &defaultExprDef{ExprText: exprText, Expr: expr})
 	}
 	// Capture the owning scope BEFORE the remove: after dropping the old key the new name is in no
@@ -3781,7 +3782,15 @@ func (db *engine) alterSequenceRename(existing *sequenceDef, newName string) err
 	} else {
 		w = db.working()
 	}
-	w.removeSequence(strings.ToLower(existing.Name))
+	w.removeSequence(existing.Name)
 	w.putSequence(&def)
 	return nil
+}
+
+// nextvalDefaultText is the canonical expression text of an owned sequence's generated
+// DEFAULT nextval('<seq>'): the sequence name rendered by grammar.md §3's quoting rule inside the
+// string — bare when a plain lowercase identifier, else "…" — so the text argument parses back to
+// exactly that name (sequences.md §12).
+func nextvalDefaultText(seqName string) string {
+	return "nextval ( '" + strings.ReplaceAll(quoteIdentifier(seqName), "'", "''") + "' )"
 }

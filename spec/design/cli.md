@@ -120,8 +120,13 @@ for migrations in v1. Full contract: [`/migrate/design.md`](../../migrate/design
 **`--import-csv TABLE=FILE` imports a CSV** — the read half of the CSV story (`--format
 csv` + `-o` is the export half). It parses the RFC 4180 dialect the exporter writes
 (header row required; quoted fields, `""` escaping, CRLF or LF; quoted fields may span
-lines), maps the header's names case-insensitively to TABLE's columns (columns the CSV
-omits take their DEFAULT/NULL), and synthesizes **one multi-row `INSERT`** — so an import
+lines), maps the header's names to TABLE's columns (columns the CSV omits take their
+DEFAULT/NULL), and synthesizes **one multi-row `INSERT`**. TABLE is read as SQL identifier text
+([grammar.md §3](grammar.md) — `Orders` names `orders`, `'"Orders"'` names `Orders`). A header name
+maps to the column of exactly that name; failing that, to the **one** column equal to it ignoring
+ASCII case (CSV headers are not SQL, and `Name` should find `name`); zero or several such columns is
+an error. The synthesized statement writes every table and column name in the identifier quoting form
+(bare when `[a-z_][a-z0-9_]*`, else double-quoted). Being one statement, an import
 is **atomic** (the engine's per-statement all-or-nothing: one bad row imports nothing) and
 reports through the ordinary `OK, N rows (cost C)` footer. Values are built as typed SQL
 literals from each column's declared type — numerics and booleans are validated with their
@@ -160,17 +165,18 @@ The engine parses **exactly one statement per call, with no terminator** (gramma
 The CLI owns statement splitting — a character state machine shared by script mode and the
 TUI editor's run action:
 
-- States: `normal` / `in-string` / `in-line-comment` / `in-block-comment(depth)`,
-  mirroring the engine lexer's rules exactly (grammar.md §33; `'...'` with `''` escaping is
-  the **only** quoting — no double-quoted identifiers, no dollar-quoting).
-- `;` **outside** strings and comments terminates a statement. The semicolon is
+- States: `normal` / `in-string` / `in-quoted-identifier` / `in-line-comment` /
+  `in-block-comment(depth)`, mirroring the engine lexer's rules exactly (grammar.md §3/§33;
+  `'...'` with `''` escaping and `"..."` with `""` escaping are the two quoted forms — no
+  dollar-quoting).
+- `;` **outside** strings, quoted identifiers, and comments terminates a statement. The semicolon is
   **stripped**; everything else — including comments, which the engine accepts — passes
   through **verbatim**.
 - Whitespace-/comment-only statements are skipped (so `;;`, trailing `;`, and comment-only
   lines are not errors — the engine's "no statement" `42601` is never provoked by framing).
 - At end of input (EOF / the run key), a non-empty remainder runs as a final statement —
   `echo 'SELECT 1' | jed` needs no semicolon.
-- An unterminated string or block comment at end of input is a CLI-reported error (script
+- An unterminated string, quoted identifier, or block comment at end of input is a CLI-reported error (script
   mode: exit `2`).
 - The splitter tracks each statement's starting line for `file:line:` error prefixes.
 

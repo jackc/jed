@@ -2,7 +2,8 @@
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Token {
-    /// A bare word: keyword or identifier (callers compare case-insensitively).
+    /// A bare word: keyword or identifier, already FOLDED to lowercase by the lexer
+    /// (spec/design/grammar.md §3), so keyword and name comparisons are byte-exact.
     Word(String),
     /// An integer literal's UNSIGNED magnitude (the sign is the `Minus` operator).
     /// The lexer guarantees it is `<= 2^63`; `i64`/`i64` cannot hold `2^63`, so the
@@ -13,12 +14,11 @@ pub enum Token {
     /// strips the surrounding quotes and collapses each doubled `''` to one `'`
     /// (standard_conforming_strings; no backslash escapes). See spec/design/types.md §11.
     Str(String),
-    /// A double-quoted identifier's decoded content (`"en-US"`, `"C"`). The lexer strips the
+    /// A double-quoted identifier's decoded content (`"userId"`, `"en-US"`). The lexer strips the
     /// surrounding `"` and collapses each doubled `""` to one `"`; the content is preserved
-    /// VERBATIM (case-sensitive, hyphens allowed) — unlike a bare `Word`, which callers fold
-    /// case-insensitively. Used for collation names (spec/design/collation.md §1); the only
-    /// parse position that consumes one today is `COLLATE "name"`, so a quoted identifier
-    /// elsewhere is a 42601 syntax error.
+    /// VERBATIM (case-sensitive, any UTF-8) — unlike a bare `Word`, which the lexer folds. A
+    /// quoted identifier is a name wherever an identifier is accepted and is NEVER a keyword
+    /// (spec/design/grammar.md §3); collation names accept only this form.
     QuotedIdent(String),
     /// A decimal literal (a numeric literal containing a `.`): the unscaled coefficient as a
     /// decimal-digit string (leading zeros allowed, no sign) and the scale (fractional digit

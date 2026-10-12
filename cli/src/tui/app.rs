@@ -247,7 +247,7 @@ impl App {
     }
 
     /// Accept the highlighted candidate: replace the typed prefix with the candidate's
-    /// canonical spelling (so `use<Tab>` becomes `Users`, not `users`).
+    /// identifier text (so `use<Tab>` becomes `"Users"` for a table named `Users` — grammar.md §3).
     fn accept_completion(&mut self) {
         let Some(c) = self.completion.take() else {
             return;
@@ -325,8 +325,11 @@ mod tests {
         let mut db = jed::Database::create(jed::CreateOptions::default())
             .expect("in-memory create is infallible")
             .session(jed::SessionOptions::default());
-        db.execute("CREATE TABLE Users (id i32 PRIMARY KEY, score i32)", &[])
-            .unwrap();
+        db.execute(
+            "CREATE TABLE \"Users\" (id i32 PRIMARY KEY, score i32)",
+            &[],
+        )
+        .unwrap();
         db.execute("CREATE TABLE selections (sel i32 PRIMARY KEY)", &[])
             .unwrap();
         App::new(Session::new(db, "memory".to_string()))
@@ -351,7 +354,7 @@ mod tests {
         let mut a = app();
         type_str(&mut a, "SELECT * FROM use");
         press(&mut a, KeyCode::Tab);
-        assert_eq!(editor_text(&a), "SELECT * FROM Users");
+        assert_eq!(editor_text(&a), "SELECT * FROM \"Users\"");
         assert!(a.completion.is_none());
     }
 

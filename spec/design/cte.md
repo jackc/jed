@@ -67,8 +67,8 @@ A CTE is a **statement-local relation** resolved by name, ahead of the catalog:
   `WITH orders AS (…) SELECT * FROM orders` reads the CTE, not the table. The one exception is the
   CTE's **own body**: because the binding is not yet in scope for itself,
   `WITH orders AS (SELECT * FROM orders)` resolves the inner `orders` to the **base table** (PG
-  semantics), and is `42P01` only if no base table exists. Lookup is case-insensitive, like table
-  names.
+  semantics), and is `42P01` only if no base table exists. Lookup is byte-exact on the folded name, like table
+  names ([grammar.md §3](grammar.md)).
 - **Bodies are not correlated to the reference site.** A CTE body sees its own FROM, the catalog,
   and the **earlier CTE bindings**, never the scope at a reference site — a CTE is **not** a
   lateral subquery of the query that references it. A body is planned against the scope that

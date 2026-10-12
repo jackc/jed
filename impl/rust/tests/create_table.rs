@@ -61,13 +61,18 @@ fn sql_standard_type_aliases_resolve() {
 }
 
 #[test]
-fn table_and_type_names_are_case_insensitive() {
+fn bare_names_fold_and_host_lookup_is_exact() {
+    // A bare name folds to lowercase; the host API looks a name up exactly (grammar.md §3).
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
     create(&mut db, "create table T (Id I32 primary key)").unwrap();
     assert!(db.table("t").is_some());
-    assert!(db.table("T").is_some());
+    assert!(db.table("T").is_none());
+    assert_eq!(db.table("t").unwrap().columns[0].name, "id");
+    create(&mut db, "create table \"T\" (\"Id\" i32 primary key)").unwrap();
+    assert_eq!(db.table("T").unwrap().columns[0].name, "Id");
+    assert_eq!(db.table_names(), vec!["T".to_string(), "t".to_string()]);
 }
 
 #[test]
@@ -167,4 +172,48 @@ fn syntax_errors_are_reported() {
             .code(),
         "42601"
     );
+}
+
+/// The on-disk catalog emits each name group in ascending BYTE order of the exact name
+/// (format_version 37): uppercase ASCII sorts before lowercase, so `B` < `C` < `a`, and the reload
+/// keeps every name exact (a bare lookup never reaches a mixed-case name).
+#[test]
+fn catalog_order_is_exact_name_bytes_across_reload() {
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    for sql in [
+        "CREATE TABLE a (id i32 PRIMARY KEY)",
+        "CREATE TABLE \"C\" (id i32 PRIMARY KEY)",
+        "CREATE TABLE \"B\" (id i32 PRIMARY KEY, \"V\" i32, v i32)",
+        "CREATE INDEX \"Zed\" ON \"B\" (v)",
+        "CREATE INDEX alpha ON \"B\" (\"V\")",
+        "CREATE SEQUENCE \"Seq\"",
+        "CREATE SEQUENCE aseq",
+    ] {
+        create(&mut db, sql).unwrap();
+    }
+    let image = db.to_image(8192, 1).unwrap();
+    let mut loaded = Database::from_image(&image)
+        .unwrap()
+        .session(SessionOptions::default());
+    assert_eq!(
+        loaded.table_names(),
+        vec!["B".to_string(), "C".to_string(), "a".to_string()]
+    );
+    let b = loaded.table("B").unwrap();
+    let idx: Vec<&str> = b.indexes.iter().map(|i| i.name.as_str()).collect();
+    assert_eq!(idx, vec!["Zed", "alpha"]);
+    assert_eq!(b.columns[1].name, "V");
+    assert_eq!(b.columns[2].name, "v");
+    assert!(loaded.table("b").is_none());
+    assert!(create(&mut loaded, "SELECT nextval('\"Seq\"')").is_ok());
+    let err = create(&mut loaded, "SELECT nextval('Seq')").unwrap_err();
+    assert_eq!(err.code(), "42P01", "the bare text folds to seq");
+    // Re-serializing the catalog is byte-identical (the reader trusts the emitted order); the
+    // nextval above advanced "Seq", so compare against a fresh reload of the original image.
+    let fresh = Database::from_image(&image)
+        .unwrap()
+        .session(SessionOptions::default());
+    assert_eq!(fresh.to_image(8192, 1).unwrap(), image);
 }

@@ -1,7 +1,5 @@
 package jed
 
-import "strings"
-
 // ScalarType is a storable scalar type (CLAUDE.md §4): the three signed integers, text,
 // and boolean. Hand-written per CLAUDE.md §5, cross-checked against spec/types/scalars.toml
 // in tests so the two never drift. The integer-only accessors (WidthBytes/Min/Max/Rank/
@@ -119,7 +117,7 @@ func (t scalarType) CanonicalName() string {
 	}
 }
 
-// ScalarTypeFromName resolves a type name (canonical or alias) case-insensitively.
+// ScalarTypeFromName resolves a type name (canonical or alias) by exact name.
 // Canonical names state width in bits under the i/f prefix (i16/i32/i64, f32/f64 — the
 // Rust/Zig convention). Accepted aliases: the SQL-standard words (smallint/int/integer/
 // bigint, real/double precision/float) AND PG's byte-shorthand (int2/int4/int8, float4/
@@ -129,7 +127,7 @@ func (t scalarType) CanonicalName() string {
 // two-word "character varying" alias is recognized, though this slice's parser only
 // produces single-word type names (a documented narrowing — spec/design/types.md §11).
 func scalarTypeFromName(name string) (scalarType, bool) {
-	switch strings.ToLower(name) {
+	switch name {
 	case "i16", "smallint", "int2":
 		return scalarInt16, true
 	case "i32", "int", "integer", "int4":
@@ -343,7 +341,7 @@ func allScalarTypes() []scalarType {
 // composite (row) type (spec/design/composite.md). This is the *open* wrapper above the closed
 // ScalarType set (CLAUDE.md §4): the scalar set stays a fixed compiled-in set, but a column type
 // can now also name a composite living in the database's type catalog, referenced by name
-// (case-insensitively, like a table). The resolved field list lives once in the catalog (S2+),
+// (by exact name, like a table). The resolved field list lives once in the catalog (S2+),
 // not inline here.
 //
 // Go has no sum types, so the composite arm is a nil-pointer discriminant — the same idiom Value

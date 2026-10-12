@@ -23,7 +23,7 @@ import type {
 } from "./executor.ts";
 import {
   SCAN_CANDIDATE_KINDS,
-  compareLowerName,
+  compareName,
   collectTouched,
   detectINLBound,
   estimateScanCandidates,
@@ -314,11 +314,7 @@ function ruleCostedSingleRelationPipeline(
     const rank =
       SCAN_CANDIDATE_KINDS.indexOf(a.identity.kind) - SCAN_CANDIDATE_KINDS.indexOf(b.identity.kind);
     if (rank !== 0) return rank;
-    return a.identity.indexName < b.identity.indexName
-      ? -1
-      : a.identity.indexName > b.identity.indexName
-        ? 1
-        : 0;
+    return compareName({ name: a.identity.indexName }, { name: b.identity.indexName });
   });
 
   let winner: SingleRelationPipelineCandidate | null = null;
@@ -364,7 +360,7 @@ type TwoRelationCandidate = {
 
 function compareScanIdentity(a: ScanCandidateIdentity, b: ScanCandidateIdentity): number {
   const rank = SCAN_CANDIDATE_KINDS.indexOf(a.kind) - SCAN_CANDIDATE_KINDS.indexOf(b.kind);
-  return rank !== 0 ? rank : compareLowerName({ name: a.indexName }, { name: b.indexName });
+  return rank !== 0 ? rank : compareName({ name: a.indexName }, { name: b.indexName });
 }
 
 // P7 exhaustively composes every ordinary access path and legal join algorithm in both physical

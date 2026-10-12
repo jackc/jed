@@ -176,7 +176,7 @@ signature still matches. For every referenced persistent relation, in source ord
 signature contains:
 
 ```
-(database identity, catalog generation, lowercased table name, estimator revision)
+(database identity, catalog generation, table name, estimator revision)
 ```
 
 The database identity is an equality token, never a value read by the estimator or EXPLAIN. An
@@ -461,7 +461,7 @@ Candidate comparison never stops at numeric cost. The total order is:
 1. lower saturated `est_cost`;
 2. lexicographically smaller physical relation sequence by original FROM ordinal;
 3. per relation, the access-path rank from `estimator.toml`;
-4. within an index-bearing path, lowercased index name by raw UTF-8 bytes;
+4. within an index-bearing path, the exact index name by raw UTF-8 bytes;
 5. per join step, the join-algorithm rank from `estimator.toml`; and
 6. remaining physical booleans/ordinals in the fixed field order specified where that candidate is
    introduced.
@@ -501,7 +501,7 @@ For `ORDER BY ... LIMIT`, every eligible secondary B-tree order that has no same
 adds one **order-only B-tree** candidate. It walks that index and point-fetches table rows while
 retaining the complete WHERE residual. When the same index already supplies a legal bound, its one
 candidate composes the bound and order rather than duplicating the identity. Multiple matching
-ordering indexes are all inventoried and sorted by lowercased name; catalog order never chooses one.
+ordering indexes are all inventoried and sorted by name byte order; catalog order never chooses one.
 The existing exact-order, forward `ASC NULLS LAST`, fixed-width-PK, non-partial-index gates remain
 unchanged.
 

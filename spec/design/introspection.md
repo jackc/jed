@@ -94,12 +94,16 @@ attached-database model already provides for free.
 **Rule.** A **user-supplied** name for an object in the **relation namespace** — a table
 (persistent, `TEMP`, or in an attached database), an index, or a sequence
 ([sequences.md](sequences.md) §2: one shared namespace) — or in the **type namespace** (a
-composite type, [composite.md](composite.md)) must not begin with `jed_`. The comparison is
-**case-insensitive** (`JED_x` is rejected): identifier resolution folds case and there is no
-quoted-identifier escape (grammar.md §3), so no spelling smuggles the prefix past the check.
+composite type, [composite.md](composite.md)) must not begin with `jed_`. The check is on the
+**name** — the byte string after identifier folding (grammar.md §3) — and is **byte-exact**: a
+name whose first four bytes are the lowercase `jed_` is reserved. A bare `JED_x` folds to `jed_x`
+and is rejected; a quoted `"jed_x"` is the same name and is rejected; a quoted `"JED_x"` is a
+different name that does not begin with `jed_` and is **allowed** — PostgreSQL's exact rule for its
+`pg_` schema prefix, and safe because every built-in name is lowercase and every lookup is
+byte-exact, so `"JED_TABLES"` can never shadow or be shadowed by `jed_tables`.
 Violation is **`42939 reserved_name`** (PG's own code — PG uses it for the `pg_` schema prefix),
 message `{kind} name {name} is reserved (the jed_ prefix is reserved for system objects)` with
-*kind* ∈ `table` / `index` / `sequence` / `type` / `constraint` and the name as written.
+*kind* ∈ `table` / `index` / `sequence` / `type` / `constraint` and the (folded) name.
 
 **Checked sites** — every statement that introduces a user-supplied name into either namespace:
 
@@ -209,7 +213,7 @@ explicit-grant sessions.
 
 **Determinism & cost** (implemented; pinned in [cost.md](cost.md) "`generated_row`"). Content is
 a pure function of the pinned snapshot (CLAUDE.md §10). Rows are generated in ascending
-lowercased-name order (jed_columns: then ordinal) — a deterministic internal order with no
+name byte order (jed_columns: then ordinal) — a deterministic internal order with no
 map-iteration leak; the observable contract is the **multiset**, row order without `ORDER BY`
 stays unspecified (§8 — the corpus compares `rowsort`). Each produced row charges one
 **`generated_row`** at the source, under the meter guard (a ceiling aborts mid-generation,
@@ -221,7 +225,7 @@ is resident by construction — pager.md's catalog residency). `EXPLAIN` renders
 
 ```
 jed_tables(
-  name        text NOT NULL      -- canonical (CREATE TABLE-spelled) table name
+  name        text NOT NULL      -- the table name (exact stored name, grammar.md §3)
 )
 
 jed_columns(
@@ -268,7 +272,7 @@ name and value below is a **compatibility surface** from the moment it ships —
 
 ```
 jed_indexes(
-  name        text NOT NULL,     -- the index name (relation namespace, original case)
+  name        text NOT NULL,     -- the index name (relation namespace, exact)
   table_name  text NOT NULL,     -- the canonical owning-table name
   columns     text[] NOT NULL,   -- the indexed column names in index-key order (duplicates included)
   is_unique   boolean NOT NULL,  -- whether the index enforces uniqueness (indexes.md §8)
@@ -317,9 +321,9 @@ canonical-form work (contrast the deferred `DEFAULT` rendering of §5).
 
 **Generation order** (deterministic, no map-iteration leak — CLAUDE.md §8; the observable contract
 is the multiset, row order without `ORDER BY` unspecified). `jed_indexes`: tables in ascending
-lowercased-name order, then each table's indexes in the catalog's ascending lowercased-name order.
-`jed_constraints`: tables in ascending lowercased-name order, then per table by **kind** (check,
-unique, foreign_key, exclude), each kind already held in ascending lowercased-name order — a fixed
+name byte order, then each table's indexes in the catalog's ascending name byte order.
+`jed_constraints`: tables in ascending name byte order, then per table by **kind** (check,
+unique, foreign_key, exclude), each kind already held in ascending name byte order — a fixed
 kind order because an FK and a UNIQUE index may share a name within one table (FK names are checked
 only against the constraint namespace, constraints.md §6.2), so a global name sort is not a total
 order.
@@ -347,7 +351,7 @@ jed_statistics(
 analyzed population had no non-NULL value. Counts describe the stored analyzed fact, not a
 row-count-rescaled current estimate. `is_stale` becomes true after later DML and remains visible
 until explicit ANALYZE replaces the column fact ([statistics.md](statistics.md)). Rows generate by
-lowercased table name then column ordinal. The relation is independently privilege-gated under the
+table name (byte order) then column ordinal. The relation is independently privilege-gated under the
 name `jed_statistics`, charges one `generated_row` per summary, and exposes no typed MCV/histogram
 arrays in P9.
 
@@ -368,7 +372,7 @@ spanning records), and `jed_types.test`, with temp and attachment scoping in `te
 
 ```
 jed_sequences(
-  name             text NOT NULL,     -- the sequence name (relation namespace, original case)
+  name             text NOT NULL,     -- the sequence name (relation namespace, exact)
   start_value      i64 NOT NULL,      -- START WITH
   min_value        i64 NOT NULL,      -- MINVALUE (inclusive)
   max_value        i64 NOT NULL,      -- MAXVALUE (inclusive)
@@ -434,8 +438,8 @@ positional, cannot be filtered per field, and cannot carry a future per-field co
 another parallel array.
 
 **Generation order** (deterministic; the multiset is the contract). `jed_sequences`: ascending
-lowercased name. `jed_types`: ascending lowercased name. `jed_type_fields`: types in ascending
-lowercased name, then ordinal.
+name byte order. `jed_types`: ascending name byte order. `jed_type_fields`: types in ascending
+name byte order, then ordinal.
 
 ## 6. The host API carries no introspection convenience
 

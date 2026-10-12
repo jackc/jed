@@ -124,7 +124,7 @@ impl Engine {
                     }
                 };
                 lateral_flags.push(lateral_eligible && query_plan_references_outer(&plan, 0));
-                let label = tref.alias.clone().unwrap_or_default().to_ascii_lowercase();
+                let label = tref.alias.clone().unwrap_or_default().to_string();
                 let mut table = cte_synthetic_table(&label, &plan, tref.column_aliases.as_deref())?;
                 // An unaliased parenthesized join's columns are its inner columns, collation included.
                 if let Some(group) = derived_join_group(Some(&plan)) {
@@ -257,14 +257,14 @@ impl Engine {
                 }
             } else {
                 // A base table NAME — may resolve to a CTE, which SHADOWS a catalog table of the same
-                // name (cte.md §2; case-insensitive). A CTE hit bumps the binding's reference count
+                // name (cte.md §2; byte-exact). A CTE hit bumps the binding's reference count
                 // (the inline-vs-materialize decision — cost.md §3). A built-in catalog relation
                 // (introspection.md §5) is checked AFTER a CTE (a CTE shadows it — PG-matching) and
                 // BEFORE the user catalog; unqualified = the implicit scope (main).
                 lateral_flags.push(false);
                 derived_meta.push(None);
                 derived_plans.push(None);
-                let lname = tref.name.to_ascii_lowercase();
+                let lname = tref.name.to_string();
                 src = match ctes.iter().rposition(|b| b.name == lname) {
                     Some(ci) => {
                         // A data-modifying CTE with no RETURNING produces no columns, so a FROM
@@ -320,7 +320,7 @@ impl Engine {
                 .alias
                 .clone()
                 .unwrap_or_else(|| table.name.clone())
-                .to_ascii_lowercase();
+                .to_string();
             let col_count = table.columns.len();
             let mut labels = vec![label.clone()];
             // An unaliased parenthesized join (§15) is one relation with no label of its own, whose
@@ -528,9 +528,9 @@ impl Engine {
                     } else {
                         li
                     };
-                    merges.retain(|m| !m.name.eq_ignore_ascii_case(name));
+                    merges.retain(|m| m.name != *name);
                     merges.push(MergeCol {
-                        name: name.to_ascii_lowercase(),
+                        name: name.to_string(),
                         index: mi,
                     });
                     hidden.push(li);

@@ -53,8 +53,8 @@ fn create_type_registers_fields() {
     assert!(ct.fields[0].not_null);
     assert_eq!(ct.fields[1].name, "zip");
     assert!(!ct.fields[1].not_null);
-    // Case-insensitive lookup.
-    assert!(db.composite_type("ADDR").is_some());
+    // Host-API lookup is by exact name (grammar.md §3).
+    assert!(db.composite_type("ADDR").is_none());
 }
 
 #[test]

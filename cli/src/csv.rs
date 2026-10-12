@@ -96,18 +96,39 @@ pub fn parse(text: &str) -> Result<Vec<Vec<Field>>, String> {
 }
 
 /// Build the single atomic `INSERT` for `records` (header first) against `table`. The
-/// header's names map case-insensitively to table columns (unknown or duplicate names are
-/// errors); table columns absent from the CSV take their DEFAULT/NULL through the INSERT
-/// column list. Returns `None` for a header-only file (nothing to import).
+/// header's names map to table columns by exact name, falling back to the ONE column equal to the
+/// header ignoring ASCII case (CSV headers are not SQL, so `Name` finds `name` — cli.md §3); no
+/// such column, several, or a duplicate mapping is an error. Table columns absent from the CSV take
+/// their DEFAULT/NULL through the INSERT column list. Returns `None` for a header-only file.
+/// Map one header name to a column index: the exact name, else the unique ASCII-case-insensitive
+/// match (cli.md §3).
+fn header_column(table: &Table, header: &str) -> Result<usize, String> {
+    if let Some(idx) = table.column_index(header) {
+        return Ok(idx);
+    }
+    let folded: Vec<usize> = (0..table.columns.len())
+        .filter(|&i| table.columns[i].name.eq_ignore_ascii_case(header))
+        .collect();
+    match folded.as_slice() {
+        [idx] => Ok(*idx),
+        [] => Err(format!(
+            "column {header} does not exist in table {}",
+            table.name
+        )),
+        _ => Err(format!(
+            "header {header} matches several columns of table {} ignoring case; use the exact name",
+            table.name
+        )),
+    }
+}
+
 pub fn import_statement(table: &Table, records: &[Vec<Field>]) -> Result<Option<String>, String> {
     let Some((header, data)) = records.split_first() else {
         return Err("empty file (a header row is required)".to_string());
     };
     let mut cols: Vec<usize> = Vec::with_capacity(header.len());
     for h in header {
-        let idx = table
-            .column_index(&h.value)
-            .ok_or_else(|| format!("column {} does not exist in table {}", h.value, table.name))?;
+        let idx = header_column(table, &h.value)?;
         if cols.contains(&idx) {
             return Err(format!("duplicate column {} in the header", h.value));
         }
@@ -118,11 +139,11 @@ pub fn import_statement(table: &Table, records: &[Vec<Field>]) -> Result<Option<
     }
 
     let mut sql = String::from("INSERT INTO ");
-    sql.push_str(&table.name);
+    sql.push_str(&jed::tooling::quote_identifier(&table.name));
     sql.push_str(" (");
-    let names: Vec<&str> = cols
+    let names: Vec<String> = cols
         .iter()
-        .map(|&i| table.columns[i].name.as_str())
+        .map(|&i| jed::tooling::quote_identifier(&table.columns[i].name))
         .collect();
     sql.push_str(&names.join(", "));
     sql.push_str(") VALUES ");
@@ -251,18 +272,43 @@ mod tests {
     }
 
     #[test]
-    fn header_maps_case_insensitively_and_rejects_unknowns() {
-        let db = demo_table();
+    fn header_maps_exact_then_unique_folded_names_and_rejects_unknowns() {
+        let mut db = demo_table();
         let table = db.table("t").unwrap();
-        let ok = parse("ID,NAME\n1,x\n").unwrap();
+        let ok = parse("id,name\n1,x\n").unwrap();
         assert!(import_statement(table, &ok).unwrap().is_some());
+        // No exact match: `ID` falls back to the one column equal to it ignoring case.
+        let upper = parse("ID,Name\n1,x\n").unwrap();
+        assert_eq!(
+            import_statement(table, &upper).unwrap().unwrap(),
+            "INSERT INTO t (id, name) VALUES (1, 'x')"
+        );
+        // Exact wins over the fallback, and an ambiguous fallback is an error.
+        db.execute(
+            "CREATE TABLE m (a i32, \"A\" i32, \"Ab\" i32, \"aB\" i32)",
+            &[],
+        )
+        .unwrap();
+        let m = db.table("m").unwrap();
+        let exact = parse("A,Ab\n1,2\n").unwrap();
+        assert_eq!(
+            import_statement(m, &exact).unwrap().unwrap(),
+            "INSERT INTO m (\"A\", \"Ab\") VALUES (1, 2)"
+        );
+        let ambiguous = parse("ab\n1\n").unwrap();
+        assert!(
+            import_statement(m, &ambiguous)
+                .unwrap_err()
+                .contains("matches several")
+        );
+        let table = db.table("t").unwrap();
         let unknown = parse("id,nope\n1,x\n").unwrap();
         assert!(
             import_statement(table, &unknown)
                 .unwrap_err()
                 .contains("nope")
         );
-        let dup = parse("id,ID\n1,2\n").unwrap();
+        let dup = parse("id,id\n1,2\n").unwrap();
         assert!(
             import_statement(table, &dup)
                 .unwrap_err()

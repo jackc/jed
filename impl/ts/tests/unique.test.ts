@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { compareLowerName } from "../src/executor.ts";
+import { compareName } from "../src/executor.ts";
 import { Database, EngineError } from "../src/tooling.ts";
 import { type Handle, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
@@ -47,30 +47,33 @@ function names(db: Handle, table: string): string[] {
 }
 
 // Constraint naming matches PostgreSQL (oracle-probed, constraints.md §5.3): the
-// lowercased <table>_<cols>_key base with the smallest free suffix, walked past BOTH the
-// relation namespace and the table's check names; an explicit CONSTRAINT name is the
-// index name as written.
+// <table>_<cols>_key base (from the exact names) with the smallest free suffix, walked past BOTH
+// the relation namespace and the table's check names; an explicit CONSTRAINT name is the exact
+// index name.
 test("constraint naming matches PostgreSQL", () => {
   const db = memDb().session();
   run(db, "CREATE TABLE other (x i32)");
   run(db, "CREATE INDEX walk_a_key ON other (x)"); // occupies the derived base
   run(
     db,
-    "CREATE TABLE Walk (a i32 UNIQUE, b i32, CONSTRAINT Named UNIQUE (b, a), " +
+    'CREATE TABLE Walk (a i32 UNIQUE, b i32, CONSTRAINT "Named" UNIQUE (b, a), ' +
       "CONSTRAINT walk_b_check CHECK (b > 0), UNIQUE (b))",
   );
   assert.deepEqual(names(db, "walk"), ["Named!", "walk_a_key1!", "walk_b_key!"]);
   // A derived name walks past a CHECK name too (PG-probed: w1_a_key -> w1_a_key1).
   run(db, "CREATE TABLE w1 (a i32, CONSTRAINT w1_a_key CHECK (a > 0), UNIQUE (a))");
   assert.deepEqual(names(db, "w1"), ["w1_a_key1!"]);
+  // Derived from the EXACT names (PG: CREATE TABLE "Uq" ("K" int UNIQUE) → Uq_K_key).
+  run(db, 'CREATE TABLE "Uq" ("K" i32 UNIQUE)');
+  assert.deepEqual(names(db, "Uq"), ["Uq_K_key!"]);
 });
 
-// Catalog ordering is lowercased UTF-8 byte order, not host-locale order. ICU commonly places é
+// Catalog ordering is exact-name UTF-8 byte order, not host-locale order. ICU commonly places é
 // beside e, while raw UTF-8 places ASCII z before é; persisted bytes and violation precedence use
 // the latter in every core.
 test("ALTER constraint catalog order is locale-independent", () => {
   const names = [{ name: "😀" }, { name: "é" }, { name: "z" }, { name: "\uE000" }];
-  names.sort(compareLowerName);
+  names.sort(compareName);
   assert.deepEqual(
     names.map((x) => x.name),
     ["z", "é", "\uE000", "😀"],

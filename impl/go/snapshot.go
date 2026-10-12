@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"sort"
-	"strings"
 )
 
 // The committed-state snapshot — the in-memory catalog + per-table stores a reader sees and a writer
@@ -38,14 +37,14 @@ type snapshot struct {
 	// never serialized or exposed to planning/EXPLAIN (estimator.md §6).
 	estimatorIdentity *estimatorDatabaseIdentity
 	// estimatorBaseRevision is the revision token of every table that has not been mutated since
-	// this database identity was created. estimatorRevisions overrides it per lowercased table name.
+	// this database identity was created. estimatorRevisions overrides it per exact table name.
 	// Tokens are replaced (never incremented/hashes) so cache validation is exact and collision-free;
 	// the map and tokens clone transactionally with the snapshot and are never serialized.
 	estimatorBaseRevision *estimatorRevision
 	estimatorRevisions    map[string]*estimatorRevision
 	statistics            map[string]map[int]*columnStatistics
 	tables                map[string]*catTable
-	// types holds user-defined composite (row) types, keyed by lowercased name
+	// types holds user-defined composite (row) types, keyed by exact name
 	// (spec/design/composite.md). A database-level object set, separate from tables; serialized
 	// into the catalog's composite-type entries (spec/fileformat/format.md). Sorted by key when
 	// serialized so map-iteration order never leaks (CLAUDE.md §8).
@@ -53,11 +52,11 @@ type snapshot struct {
 	stores map[string]*tableStore
 	// indexStores holds each secondary index's B-tree (spec/design/indexes.md §3): a
 	// TableStore with ZERO value columns (entry keys only — the on-disk empty-payload
-	// record), keyed by the lowercased index name (index names live in the relation
+	// record), keyed by the exact index name (index names live in the relation
 	// namespace, globally unique). Which table owns an index is recorded in that table's
 	// Indexes list.
 	indexStores map[string]*tableStore
-	// sequences holds sequences, keyed by lowercased name (spec/design/sequences.md). A
+	// sequences holds sequences, keyed by exact name (spec/design/sequences.md). A
 	// database-level object set separate from tables/types; serialized into the catalog's
 	// sequence entries (spec/fileformat/format.md, entry_kind = 2). The mutable counter
 	// (LastValue/IsCalled) lives here, so nextval advances the working snapshot and rolls back
@@ -75,7 +74,7 @@ type snapshot struct {
 	// on that collation's entry_kind = 3 reference entry, restored on load.
 	defaultCollation string
 	// gistTrees holds each GiST index's resident R-tree (spec/design/gist.md §4.1), keyed by the
-	// lowercased index name. The leaf-key store (indexStores) stays the maintained source of truth;
+	// exact index name. The leaf-key store (indexStores) stays the maintained source of truth;
 	// this tree is the acceleration structure the planner descends. Rebuilt CANONICALLY
 	// (buildGistFromLeafKeys — content-deterministic, gist.md §3) at every mutating statement and on
 	// load, so a committed snapshot always carries a fresh, cross-core-identical tree a SELECT can
@@ -208,12 +207,12 @@ func (s *snapshot) freezeMutationGenerations() {
 }
 
 func (s *snapshot) columnStatistics(table string, column int) *columnStatistics {
-	return s.statistics[strings.ToLower(table)][column]
+	return s.statistics[table][column]
 }
 
 func (s *snapshot) putColumnStatistics(table string, column int, statistics *columnStatistics) {
 	s.dataGen++
-	key := strings.ToLower(table)
+	key := table
 	if s.statistics[key] == nil {
 		s.statistics[key] = make(map[int]*columnStatistics)
 	}
@@ -248,19 +247,19 @@ func (s *snapshot) statisticsSorted() []sortedColumnStatistics {
 
 func (s *snapshot) markStatisticsStale(table string) {
 	s.dataGen++
-	for _, statistics := range s.statistics[strings.ToLower(table)] {
+	for _, statistics := range s.statistics[table] {
 		statistics.Stale = true
 	}
 }
 
 func (s *snapshot) clearStatistics(table string) {
 	s.dataGen++
-	delete(s.statistics, strings.ToLower(table))
+	delete(s.statistics, table)
 }
 
 func (s *snapshot) clearColumnStatistics(table string, column int) {
 	s.dataGen++
-	key := strings.ToLower(table)
+	key := table
 	delete(s.statistics[key], column)
 	if len(s.statistics[key]) == 0 {
 		delete(s.statistics, key)
@@ -268,9 +267,9 @@ func (s *snapshot) clearColumnStatistics(table string, column int) {
 }
 
 // estimatorRevisionFor returns the exact cache-validity token for one persistent relation. Missing
-// entries share the database's base token; the lowercased table name is a separate signature field.
+// entries share the database's base token; the exact table name is a separate signature field.
 func (s *snapshot) estimatorRevisionFor(name string) *estimatorRevision {
-	return s.estimatorRevisionForKey(strings.ToLower(name))
+	return s.estimatorRevisionForKey(name)
 }
 
 func (s *snapshot) estimatorRevisionForKey(key string) *estimatorRevision {
@@ -283,7 +282,7 @@ func (s *snapshot) estimatorRevisionForKey(key string) *estimatorRevision {
 // bumpEstimatorRevision replaces one relation's transactional revision token. The caller de-dupes
 // within a top-level statement, so a successful statement advances each touched relation once.
 func (s *snapshot) bumpEstimatorRevision(name string) {
-	s.estimatorRevisions[strings.ToLower(name)] = &estimatorRevision{}
+	s.estimatorRevisions[name] = &estimatorRevision{}
 }
 
 // stagedBytes is the stored bytes every store of this snapshot has staged since its last publication
@@ -535,7 +534,7 @@ func (s *snapshot) upgradeCollations(pageSize uint32) (int, error) {
 					return 0, err
 				}
 			}
-			s.putIndexStore(strings.ToLower(def.Name), fresh)
+			s.putIndexStore(def.Name, fresh)
 		}
 	}
 	// Advance each skewed collation's pin to the loaded version.
@@ -551,9 +550,9 @@ func (s *snapshot) upgradeCollations(pageSize uint32) (int, error) {
 	return len(skewed), nil
 }
 
-// table looks up a table definition by name (case-insensitive).
+// table looks up a table definition by name (exact name).
 func (s *snapshot) table(name string) (*catTable, bool) {
-	t, ok := s.tables[strings.ToLower(name)]
+	t, ok := s.tables[name]
 	return t, ok
 }
 
@@ -563,22 +562,22 @@ func (s *snapshot) tableByKey(key string) (*catTable, bool) {
 }
 
 // store returns a table's store (the table is known to exist).
-func (s *snapshot) store(name string) *tableStore { return s.stores[strings.ToLower(name)] }
+func (s *snapshot) store(name string) *tableStore { return s.stores[name] }
 
-// compositeType looks up a composite type definition by name (case-insensitive); nil if absent.
+// compositeType looks up a composite type definition by name (exact name); nil if absent.
 func (s *snapshot) compositeType(name string) *compositeType {
-	return s.types[strings.ToLower(name)]
+	return s.types[name]
 }
 
 // bumpCatGen advances the catalog generation — called by every schema mutator (see catGen). A
 // SELECT plan cached against a prior generation is thereby invalidated on the next execute.
 func (s *snapshot) bumpCatGen() { s.catGen++ }
 
-// putType registers a composite type (CREATE TYPE). The lower-cased name is the key. The caller
+// putType registers a composite type (CREATE TYPE). The exact name is the key. The caller
 // has already resolved field types and checked for a duplicate.
 func (s *snapshot) putType(ct *compositeType) {
 	s.bumpCatGen()
-	s.types[strings.ToLower(ct.Name)] = ct
+	s.types[ct.Name] = ct
 }
 
 // removeType removes a composite type (DROP TYPE). The caller has checked there are no dependents.
@@ -587,7 +586,7 @@ func (s *snapshot) removeType(key string) {
 	delete(s.types, key)
 }
 
-// compositeTypesSorted returns all composite types in ascending lowercased-name order — the
+// compositeTypesSorted returns all composite types in ascending name byte order — the
 // on-disk emission order (spec/fileformat/format.md) and a deterministic order with no
 // map-iteration leak (CLAUDE.md §8).
 func (s *snapshot) compositeTypesSorted() []*compositeType {
@@ -603,7 +602,7 @@ func (s *snapshot) compositeTypesSorted() []*compositeType {
 	return out
 }
 
-// tablesSorted returns all tables in ascending lowercased-name order — a deterministic order
+// tablesSorted returns all tables in ascending name byte order — a deterministic order
 // with no map-iteration leak (CLAUDE.md §8); the jed_tables / jed_columns generation order
 // (spec/design/introspection.md §5).
 func (s *snapshot) tablesSorted() []*catTable {
@@ -619,16 +618,16 @@ func (s *snapshot) tablesSorted() []*catTable {
 	return out
 }
 
-// sequence looks up a sequence definition by name (case-insensitive); nil if absent.
+// sequence looks up a sequence definition by name (exact name); nil if absent.
 func (s *snapshot) sequence(name string) *sequenceDef {
-	return s.sequences[strings.ToLower(name)]
+	return s.sequences[name]
 }
 
-// putSequence registers a sequence (CREATE SEQUENCE). The lower-cased name is the key. The caller
+// putSequence registers a sequence (CREATE SEQUENCE). The exact name is the key. The caller
 // has already validated the option set and checked the relation namespace for a collision.
 func (s *snapshot) putSequence(seq *sequenceDef) {
 	s.dataGen++
-	s.sequences[strings.ToLower(seq.Name)] = seq
+	s.sequences[seq.Name] = seq
 }
 
 // removeSequence removes a sequence (DROP SEQUENCE). The caller has checked it exists.
@@ -637,7 +636,7 @@ func (s *snapshot) removeSequence(key string) {
 	delete(s.sequences, key)
 }
 
-// sequencesSorted returns all sequences in ascending lowercased-name order — the on-disk emission
+// sequencesSorted returns all sequences in ascending name byte order — the on-disk emission
 // order (spec/fileformat/format.md) and a deterministic order with no map-iteration leak
 // (CLAUDE.md §8).
 func (s *snapshot) sequencesSorted() []*sequenceDef {
@@ -653,14 +652,14 @@ func (s *snapshot) sequencesSorted() []*sequenceDef {
 	return out
 }
 
-// sequencesOwnedBy returns the lowercased keys of every sequence OWNED BY the table name
-// (case-insensitive) — the serial-created sequences DROP TABLE must auto-drop
+// sequencesOwnedBy returns the exact keys of every sequence OWNED BY the table name
+// (exact name) — the serial-created sequences DROP TABLE must auto-drop
 // (spec/design/sequences.md §12). Sorted so the auto-drop is deterministic (no map-iteration
 // leak, CLAUDE.md §8).
 func (s *snapshot) sequencesOwnedBy(name string) []string {
 	var keys []string
 	for k, seq := range s.sequences {
-		if seq.OwnedBy != nil && strings.EqualFold(seq.OwnedBy.Table, name) {
+		if seq.OwnedBy != nil && seq.OwnedBy.Table == name {
 			keys = append(keys, k)
 		}
 	}
@@ -669,12 +668,12 @@ func (s *snapshot) sequencesOwnedBy(name string) []string {
 }
 
 // compositeDependent reports whether any table column or composite-type field still references the
-// composite type name (case-insensitive) — the DROP TYPE ... RESTRICT dependency check (2BP01). It
+// composite type name (exact name) — the DROP TYPE ... RESTRICT dependency check (2BP01). It
 // returns the first dependent's description for the error detail, or ("", false) if there are no
-// dependents. Tables and types are scanned in lowercased-name order so the chosen dependent is
+// dependents. Tables and types are scanned in name byte order so the chosen dependent is
 // deterministic (CLAUDE.md §8).
 func (s *snapshot) compositeDependent(name string) (string, bool) {
-	key := strings.ToLower(name)
+	key := name
 	tableKeys := make([]string, 0, len(s.tables))
 	for k := range s.tables {
 		tableKeys = append(tableKeys, k)
@@ -685,7 +684,7 @@ func (s *snapshot) compositeDependent(name string) (string, bool) {
 	for _, tk := range tableKeys {
 		t := s.tables[tk]
 		for _, c := range t.Columns {
-			if r := c.Type.CompositeRefOf(); r != nil && strings.EqualFold(r.Name, key) {
+			if r := c.Type.CompositeRefOf(); r != nil && r.Name == key {
 				return "column " + c.Name + " of table " + t.Name, true
 			}
 		}
@@ -698,7 +697,7 @@ func (s *snapshot) compositeDependent(name string) (string, bool) {
 	for _, ck := range typeKeys {
 		ct := s.types[ck]
 		for _, f := range ct.Fields {
-			if r := f.Type.CompositeRefOf(); r != nil && strings.EqualFold(r.Name, key) {
+			if r := f.Type.CompositeRefOf(); r != nil && r.Name == key {
 				return "field " + f.Name + " of type " + ct.Name, true
 			}
 		}
@@ -711,18 +710,18 @@ func (s *snapshot) compositeDependent(name string) (string, bool) {
 // dropped. RESTRICT formats refTableName/fkName/droppedName into its 2BP01 detail; CASCADE uses
 // refTableKey/fkName to remove the now-dangling constraint.
 type fkDependent struct {
-	refTableKey  string // lowercased key of the (surviving) referencing table — for the CASCADE removal
+	refTableKey  string // exact key of the (surviving) referencing table — for the CASCADE removal
 	fkName       string // the FK constraint's name
 	refTableName string // canonical referencing-table name — for the RESTRICT detail
 	droppedName  string // canonical name of the dropped table the FK references — for the RESTRICT detail
 }
 
-// foreignKeyDependentsExcluding returns every FK on a table NOT in dropping (a set of lowercased
+// foreignKeyDependentsExcluding returns every FK on a table NOT in dropping (a set of exact
 // table keys) that references a table that IS in dropping — the dependency scan for a multi-table
 // DROP TABLE (spec/design/grammar.md §13, constraints.md §6.10). A dependent whose referencing
 // table is itself being dropped does not count (the drop-set exclusion), so a FK between two tables
 // both named in the same statement never blocks. Referencing tables are scanned in ascending
-// lowercased key order (each table's ForeignKeys is already name-ordered) for determinism (§8).
+// exact key order (each table's ForeignKeys is already name-ordered) for determinism (§8).
 // RESTRICT raises 2BP01 on the first entry; CASCADE removes every entry's FK.
 func (s *snapshot) foreignKeyDependentsExcluding(dropping map[string]bool) []fkDependent {
 	tableKeys := make([]string, 0, len(s.tables))
@@ -737,7 +736,7 @@ func (s *snapshot) foreignKeyDependentsExcluding(dropping map[string]bool) []fkD
 		}
 		t := s.tables[tk]
 		for _, fk := range t.ForeignKeys {
-			refKey := strings.ToLower(fk.RefTable)
+			refKey := fk.RefTable
 			if dropping[refKey] {
 				droppedName := fk.RefTable
 				if d, ok := s.tables[refKey]; ok {
@@ -768,7 +767,7 @@ func (s *snapshot) removeForeignKey(tableKey, fkName string) {
 	s.bumpCatGen()
 	kept := make([]foreignKey, 0, len(old.ForeignKeys))
 	for _, fk := range old.ForeignKeys {
-		if !strings.EqualFold(fk.Name, fkName) {
+		if fk.Name != fkName {
 			kept = append(kept, fk)
 		}
 	}
@@ -832,7 +831,7 @@ func (s *snapshot) validateCompositeTypes() error {
 				if r == nil {
 					continue
 				}
-				d, err := visit(strings.ToLower(r.Name), levelsAbove+1)
+				d, err := visit(r.Name, levelsAbove+1)
 				if err != nil {
 					return 0, err
 				}
@@ -861,7 +860,7 @@ func (s *snapshot) validateCompositeTypes() error {
 }
 
 // compositeTypeDepth returns the composite-type nesting depth of ty against this snapshot's type
-// catalog, memoized in cache (lowercased name → depth): a scalar is 0, T[] is depth(T) (array levels
+// catalog, memoized in cache (exact name → depth): a scalar is 0, T[] is depth(T) (array levels
 // are not composite levels — CompositeRefOf looks through one array level the same way), and a
 // composite is 1 + max(field depths) (an empty composite is 1). The CREATE TYPE gate uses this
 // against the *existing* catalog, every type of which already satisfies depth ≤ maxCompositeDepth
@@ -872,7 +871,7 @@ func (s *snapshot) compositeTypeDepth(ty dataType, cache map[string]int) int {
 	if r == nil {
 		return 0 // a scalar (or a scalar array) adds no composite level
 	}
-	key := strings.ToLower(r.Name)
+	key := r.Name
 	if d, ok := cache[key]; ok {
 		return d
 	}
@@ -914,7 +913,7 @@ func (s *snapshot) putTable(t *catTable, pageSize uint32) {
 // putTable resolves against s.types and delegates here.
 func (s *snapshot) putTableResolved(t *catTable, colTypes []colType, pageSize uint32) {
 	s.bumpCatGen()
-	key := strings.ToLower(t.Name)
+	key := t.Name
 	st := newTableStore(pagePayload(pageSize), colTypes)
 	// Bind the domain's pager (snapshot.storePaging) so the new store demand-pages like a loaded one:
 	// its committed leaves demote at each commit (demoteCleanLeaves) and fault back through the pool,
@@ -935,7 +934,7 @@ func (s *snapshot) removeTable(key string) {
 	s.bumpCatGen()
 	if t, ok := s.tables[key]; ok {
 		for _, idx := range t.Indexes {
-			delete(s.indexStores, strings.ToLower(idx.Name))
+			delete(s.indexStores, idx.Name)
 		}
 	}
 	delete(s.tables, key)
@@ -944,10 +943,10 @@ func (s *snapshot) removeTable(key string) {
 }
 
 // indexStore returns a secondary index's store (the index is known to exist). nameKey is
-// the lowercased index name.
+// the exact index name.
 func (s *snapshot) indexStore(nameKey string) *tableStore { return s.indexStores[nameKey] }
 
-// hasIndexStore reports whether this snapshot holds a store for the named index (lowercased key).
+// hasIndexStore reports whether this snapshot holds a store for the named index (exact key).
 // Used to route index access to the session temp snapshot vs the main snapshot (temp-tables.md §2).
 func (s *snapshot) hasIndexStore(nameKey string) bool {
 	_, ok := s.indexStores[nameKey]
@@ -969,12 +968,12 @@ func (s *snapshot) storageBytes() uint64 {
 }
 
 // putIndex registers a new (empty) secondary index on tableKey: insert its definition
-// into the table's Indexes in ascending lowercased-name order (the catalog/planner order —
+// into the table's Indexes in ascending name byte order (the catalog/planner order —
 // spec/design/indexes.md §6) and create its zero-column store. The Table struct is
 // re-allocated (catalog Tables are never mutated in place — snapshots share them).
 func (s *snapshot) putIndex(tableKey string, def indexDef, pageSize uint32) {
 	s.bumpCatGen()
-	nameKey := strings.ToLower(def.Name)
+	nameKey := def.Name
 	fresh := newTableStore(pagePayload(pageSize), nil)
 	if s.storePaging != nil {
 		fresh.attachPaging(s.storePaging) // bind the domain pager, like putTableResolved/putIndexStore
@@ -984,7 +983,7 @@ func (s *snapshot) putIndex(tableKey string, def indexDef, pageSize uint32) {
 	t := *old
 	pos := len(old.Indexes)
 	for i, ix := range old.Indexes {
-		if strings.ToLower(ix.Name) > nameKey {
+		if ix.Name > nameKey {
 			pos = i
 			break
 		}
@@ -1021,7 +1020,7 @@ func (s *snapshot) alterTableCatalog(oldKey string, t *catTable, renameTable, in
 	s.bumpCatGen()
 	newKey := oldKey
 	if renameTable != "" {
-		newKey = strings.ToLower(renameTable)
+		newKey = renameTable
 		delete(s.tables, oldKey)
 		if st, ok := s.stores[oldKey]; ok {
 			delete(s.stores, oldKey)
@@ -1034,7 +1033,7 @@ func (s *snapshot) alterTableCatalog(oldKey string, t *catTable, renameTable, in
 	}
 	s.tables[newKey] = t
 	if indexOld != "" {
-		ok, nk := strings.ToLower(indexOld), strings.ToLower(indexNew)
+		ok, nk := indexOld, indexNew
 		if st, found := s.indexStores[ok]; found {
 			delete(s.indexStores, ok)
 			s.indexStores[nk] = st
@@ -1052,7 +1051,7 @@ func (s *snapshot) alterTableCatalog(oldKey string, t *catTable, renameTable, in
 		fks := make([]foreignKey, len(old.ForeignKeys))
 		copy(fks, old.ForeignKeys)
 		for i := range fks {
-			if strings.EqualFold(fks[i].RefTable, oldKey) {
+			if fks[i].RefTable == oldKey {
 				fks[i].RefTable = t.Name
 				changed = true
 			}
@@ -1064,7 +1063,7 @@ func (s *snapshot) alterTableCatalog(oldKey string, t *catTable, renameTable, in
 		}
 	}
 	for key, seq := range s.sequences {
-		if seq.OwnedBy != nil && strings.EqualFold(seq.OwnedBy.Table, oldKey) {
+		if seq.OwnedBy != nil && seq.OwnedBy.Table == oldKey {
 			cp := *seq
 			owner := *seq.OwnedBy
 			owner.Table = t.Name
@@ -1075,7 +1074,7 @@ func (s *snapshot) alterTableCatalog(oldKey string, t *catTable, renameTable, in
 }
 
 func (s *snapshot) alterTableRewrite(t *catTable, colTypes []colType, entries []entry, nextRowid int64, pageSize uint32) error {
-	key := strings.ToLower(t.Name)
+	key := t.Name
 	statistics := s.statistics[key]
 	s.putTableResolved(t, colTypes, pageSize)
 	if statistics != nil {
@@ -1100,10 +1099,10 @@ func (s *snapshot) alterTableRewrite(t *catTable, colTypes []colType, entries []
 func (s *snapshot) syncAlterConstraintIndexes(old, next *catTable, entries map[string][][]byte, pageSize uint32) error {
 	live := make(map[string]bool, len(next.Indexes))
 	for _, ix := range next.Indexes {
-		live[strings.ToLower(ix.Name)] = true
+		live[ix.Name] = true
 	}
 	for _, ix := range old.Indexes {
-		key := strings.ToLower(ix.Name)
+		key := ix.Name
 		if !live[key] {
 			delete(s.indexStores, key)
 			delete(s.gistTrees, key)
@@ -1111,10 +1110,10 @@ func (s *snapshot) syncAlterConstraintIndexes(old, next *catTable, entries map[s
 	}
 	oldNames := make(map[string]bool, len(old.Indexes))
 	for _, ix := range old.Indexes {
-		oldNames[strings.ToLower(ix.Name)] = true
+		oldNames[ix.Name] = true
 	}
 	for _, ix := range next.Indexes {
-		key := strings.ToLower(ix.Name)
+		key := ix.Name
 		_, rebuild := entries[key]
 		if oldNames[key] && !rebuild {
 			continue
@@ -1143,12 +1142,12 @@ func (s *snapshot) syncAlterConstraintIndexes(old, next *catTable, entries map[s
 
 func (s *snapshot) rebuildAlterIndexes(old, next *catTable, entries map[string][][]byte, pageSize uint32) error {
 	for _, ix := range old.Indexes {
-		key := strings.ToLower(ix.Name)
+		key := ix.Name
 		delete(s.indexStores, key)
 		delete(s.gistTrees, key)
 	}
 	for _, ix := range next.Indexes {
-		key := strings.ToLower(ix.Name)
+		key := ix.Name
 		fresh := newTableStore(pagePayload(pageSize), nil)
 		if s.storePaging != nil {
 			fresh.attachPaging(s.storePaging)
@@ -1169,13 +1168,13 @@ func (s *snapshot) rebuildAlterIndexes(old, next *catTable, entries map[string][
 func (s *snapshot) remapAlterColumnDependents(parent string, originalToNew []int, pending map[string]bool) {
 	s.bumpCatGen() // catalog writes below bypass the generation-bumping funnels
 	for key, child := range s.tables {
-		if strings.EqualFold(child.Name, parent) {
+		if child.Name == parent {
 			continue
 		}
 		changed := false
 		fks := make([]foreignKey, 0, len(child.ForeignKeys))
 		for _, fk := range child.ForeignKeys {
-			if !strings.EqualFold(fk.RefTable, parent) {
+			if fk.RefTable != parent {
 				fks = append(fks, fk)
 				continue
 			}
@@ -1204,7 +1203,7 @@ func (s *snapshot) remapAlterColumnDependents(parent string, originalToNew []int
 		}
 	}
 	for key, seq := range s.sequences {
-		if pending[key] || seq.OwnedBy == nil || !strings.EqualFold(seq.OwnedBy.Table, parent) {
+		if pending[key] || seq.OwnedBy == nil || seq.OwnedBy.Table != parent {
 			continue
 		}
 		old := int(seq.OwnedBy.Column)
@@ -1220,7 +1219,7 @@ func (s *snapshot) remapAlterColumnDependents(parent string, originalToNew []int
 	}
 }
 
-// putIndexStore registers a loaded index store under its (lowercased) name — the file
+// putIndexStore registers a loaded index store under its (exact) name — the file
 // loader's hook (format.go): the owning table's Indexes list came from its catalog entry,
 // so only the store is registered here.
 func (s *snapshot) putIndexStore(nameKey string, store *tableStore) {
@@ -1232,7 +1231,7 @@ func (s *snapshot) putIndexStore(nameKey string, store *tableStore) {
 	s.indexStores[nameKey] = store
 }
 
-// gistTreeFor returns the resident GiST R-tree of the named index (lowercased key), or nil if the
+// gistTreeFor returns the resident GiST R-tree of the named index (exact key), or nil if the
 // index is not GiST / not present (spec/design/gist.md §4.1). The planner descends it for a &&/@>
 // bound.
 func (s *snapshot) gistTreeFor(nameKey string) *gistTree { return s.gistTrees[nameKey] }
@@ -1259,7 +1258,7 @@ func (s *snapshot) rebuildGistTrees() error {
 			}
 			// One opclass per indexed column (gist.md §7): single for a GX1/GX2 index, one per
 			// WITH column for an EXCLUDE backing index.
-			specs = append(specs, spec{nameKey: strings.ToLower(idx.Name), ops: gistOpclassesFor(idx.columnOrdinals(), t.Columns)})
+			specs = append(specs, spec{nameKey: idx.Name, ops: gistOpclassesFor(idx.columnOrdinals(), t.Columns)})
 		}
 	}
 	live := make(map[string]bool, len(specs))
@@ -1300,7 +1299,7 @@ func (s *snapshot) removeIndex(tableKey, nameKey string) {
 		t := *old
 		t.Indexes = nil
 		for _, ix := range old.Indexes {
-			if strings.ToLower(ix.Name) != nameKey {
+			if ix.Name != nameKey {
 				t.Indexes = append(t.Indexes, ix)
 			}
 		}
@@ -1309,12 +1308,12 @@ func (s *snapshot) removeIndex(tableKey, nameKey string) {
 	delete(s.indexStores, nameKey)
 }
 
-// findIndex finds the table owning the named index (case-insensitive): (tableKey, def, true).
+// findIndex finds the table owning the named index (exact name): (tableKey, def, true).
 func (s *snapshot) findIndex(name string) (string, indexDef, bool) {
-	key := strings.ToLower(name)
+	key := name
 	for tk, t := range s.tables {
 		for _, ix := range t.Indexes {
-			if strings.ToLower(ix.Name) == key {
+			if ix.Name == key {
 				return tk, ix, true
 			}
 		}

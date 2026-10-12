@@ -233,7 +233,7 @@ set, hence resolved, so GIN-entry maintenance over it stays correct. (`= ANY` is
 and the indexed column must be `ANY`'s **array** operand, with `c` the scalar. Array `=` is
 **commutative** — both `col = Q` and `Q = col` are recognized; the terms come from the constant
 `Q` either way. `<>` is *not* accelerated.) Among several eligible GIN indexes the **lowest
-lowercased name** wins (deterministic; cost-based selection is later). Otherwise the existing
+name** (byte order) wins (deterministic; cost-based selection is later). Otherwise the existing
 PK/ordered/full choice stands.
 
 **Execution** — the classic inverted gather + residual filter:

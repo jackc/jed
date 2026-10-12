@@ -124,7 +124,7 @@ struct Roots {
     /// (eventually) serialized (the `main` database).
     committed: Arc<Snapshot>,
     /// The published committed root of every host-attached DATABASE-scoped in-memory database
-    /// (spec/design/attached-databases.md §5), keyed by lowercased attachment name. A reader pins the
+    /// (spec/design/attached-databases.md §5), keyed by exact attachment name. A reader pins the
     /// whole `Roots` under one read lock, so it sees a CONSISTENT cross-database snapshot (main + every
     /// attachment together). Empty when nothing is attached — the common case, byte-for-byte the
     /// pre-attachment behavior. Session-local `temp` is NOT here (it is session-private, held on the
@@ -150,7 +150,7 @@ pub(crate) enum AttachMode {
 /// via [`Storage::commit_durable`]) or in-memory (`storage.path` is `None`, a `MemoryBlockStore`,
 /// committed via `stage_temp`). The storage kind is the sole source of the file/memory distinction.
 pub(crate) struct Attachment {
-    /// Lowercased qualifier name (the map key).
+    /// Exact qualifier name (the map key).
     #[allow(dead_code)]
     name: String,
     mode: AttachMode,
@@ -915,7 +915,7 @@ pub(crate) struct Shared {
     /// only under the writer gate, so the `Mutex` never contends with the publish path.
     storage: Mutex<Storage>,
     /// The registry of host-attached DATABASE-scoped databases (attached-databases.md §2/§5), keyed by
-    /// lowercased name. Each attachment's MUTABLE storage identity lives here; its immutable published
+    /// exact name. Each attachment's MUTABLE storage identity lives here; its immutable published
     /// root lives in [`Roots::attached`] under the same key. Populated by [`Database::attach`] / cleared
     /// by [`Database::detach`] (host-API, §4), both under the writer gate — so the `Mutex` never
     /// contends. Empty when nothing is attached (the common case). Session-local temp is NOT here.
@@ -1456,7 +1456,7 @@ impl Shared {
             .is_some()
     }
 
-    /// The mode of the host attachment named `name` (lowercased), or `None` if no such attachment —
+    /// The mode of the host attachment named `name` (exact), or `None` if no such attachment —
     /// the read-only write gate's inspection point ([`Engine::check_attachment_writable`]).
     pub(crate) fn attachment_mode(&self, name: &str) -> Option<AttachMode> {
         self.attachments
@@ -1585,7 +1585,7 @@ impl Shared {
 
     /// Run `f` on the storage of database `name` (`main` or an attachment; `42704` otherwise).
     fn with_storage<R>(&self, name: &str, f: impl FnOnce(&mut Storage) -> Result<R>) -> Result<R> {
-        let lname = name.to_ascii_lowercase();
+        let lname = name.to_string();
         if lname == "main" {
             return f(&mut self.storage.lock().expect("storage lock not poisoned"));
         }
@@ -1602,7 +1602,7 @@ impl Shared {
         }
     }
 
-    /// The published committed root of attachment `name` (lowercased), if attached.
+    /// The published committed root of attachment `name` (exact), if attached.
     fn committed_attachment(&self, name: &str) -> Option<Arc<Snapshot>> {
         self.roots
             .read()
@@ -1874,7 +1874,7 @@ impl Shared {
             .is_some()
     }
 
-    /// Whether the host attachment `name` (lowercased) is file-backed (durable, Slice 2) rather than
+    /// Whether the host attachment `name` (exact) is file-backed (durable, Slice 2) rather than
     /// in-memory — it counts against the one-durable-writer slot (§5) and selects the durable commit path.
     pub(crate) fn attachment_is_file(&self, name: &str) -> bool {
         self.attachments
@@ -2077,7 +2077,7 @@ impl Database {
     }
 
     /// The canonical name of every persistent table in the latest committed snapshot, sorted
-    /// ascending by lowercased name (the catalog's standing order — no map-iteration order may leak,
+    /// ascending by exact name (the catalog's standing order — no map-iteration order may leak,
     /// CLAUDE.md §8). Secondary indexes are not tables and are excluded (api.md §6). Reads a pinned
     /// snapshot lock-free; session-local temp tables are not visible here (use
     /// [`Session::table_names`] for a session's view).
@@ -2091,7 +2091,7 @@ impl Database {
         snap.table_names()
     }
 
-    /// The definition of persistent table `name` (case-insensitive) in the latest committed snapshot,
+    /// The definition of persistent table `name` (exact name) in the latest committed snapshot,
     /// or `None` if there is no such table. Returns an owned clone (the pinned snapshot is transient).
     /// The [`Table`] type is part of the doc-hidden `tooling` introspection seam, not the embedding
     /// API — SQL is the introspection surface (`jed_columns`, introspection.md); white-box tests / the
@@ -2101,7 +2101,7 @@ impl Database {
         snap.table(name).cloned()
     }
 
-    /// The definition of composite type `name` (case-insensitive) in the latest committed snapshot,
+    /// The definition of composite type `name` (exact name) in the latest committed snapshot,
     /// or `None`. Like [`table`](Database::table), the [`CompositeType`] return is the doc-hidden
     /// `tooling` introspection seam, not the embedding API.
     pub fn composite_type(&self, name: &str) -> Option<CompositeType> {
@@ -2154,7 +2154,7 @@ impl Database {
     /// `55006` while a write transaction or reader is open on this handle or another process has the
     /// file open. Not metered and not reachable from SQL.
     pub fn compact(&self, name: &str) -> Result<()> {
-        let lname = name.to_ascii_lowercase();
+        let lname = name.to_string();
         let read_only = if lname == "main" {
             self.0.read_only()
         } else {
@@ -2339,7 +2339,7 @@ impl Database {
     /// codes as opening `main` (`58P01`/`58P02`/`XX001`/…). Publishing the new root is atomic under the
     /// writer gate.
     pub fn attach(&self, name: &str, source: AttachSource, read_only: bool) -> Result<()> {
-        let lname = name.to_ascii_lowercase();
+        let lname = name.to_string();
         if lname.is_empty() {
             return Err(EngineError::new(
                 SqlState::DuplicateObject,
@@ -2478,7 +2478,7 @@ impl Database {
     /// detachable). On success the attachment's root is dropped from the published roots and its storage
     /// released, under the writer gate.
     pub fn detach(&self, name: &str) -> Result<()> {
-        let lname = name.to_ascii_lowercase();
+        let lname = name.to_string();
         self.0.acquire_writer(0)?;
         let mut removed = None;
         let result = (|| {
@@ -3195,7 +3195,7 @@ impl Session {
         self.base_version
     }
 
-    /// The canonical name of every table visible to this session, sorted ascending by lowercased
+    /// The canonical name of every table visible to this session, sorted ascending by exact
     /// name (CLAUDE.md §8). Unlike [`Database::table_names`], this sees the session's view — the open
     /// transaction's working set if any, else the session's pinned committed snapshot. (Temp tables
     /// are excluded, matching the persistent catalog listing.)
@@ -3208,7 +3208,7 @@ impl Session {
         self.engine.table_names()
     }
 
-    /// The definition of table `name` (case-insensitive) as this session sees it — session-local
+    /// The definition of table `name` (exact name) as this session sees it — session-local
     /// temp → the session's main snapshot (temp-tables.md §3) — or `None`. The [`Table`]
     /// type is the doc-hidden `tooling` introspection seam, not the embedding API (see
     /// [`Database::table`]).
@@ -3216,7 +3216,7 @@ impl Session {
         self.engine.table(name)
     }
 
-    /// The definition of composite type `name` (case-insensitive) as this session sees it, or `None`.
+    /// The definition of composite type `name` (exact name) as this session sees it, or `None`.
     /// The [`CompositeType`] return is the doc-hidden `tooling` introspection seam (see
     /// [`Database::composite_type`]).
     pub fn composite_type(&self, name: &str) -> Option<&CompositeType> {

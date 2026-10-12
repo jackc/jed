@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { Database } from "../src/tooling.ts";
 import { memDb } from "./mem_db.ts";
 import { queryOutcome } from "./util.ts";
 
@@ -53,5 +54,26 @@ test("ALTER TYPE and PRIMARY KEY rewrites match equivalent fresh-table bytes", (
       "ALTER TABLE t DROP PRIMARY KEY",
     ),
     image("CREATE TABLE t (id i32 NOT NULL, v text)", "INSERT INTO t VALUES (1, 'a'), (2, 'b')"),
+  );
+});
+
+// A RENAME rewrite substitutes the new name into persisted expression text as a QUOTED identifier
+// (grammar.md §3, alter.md §2.2) — even a plain lowercase name — while untouched tokens keep their
+// stored (folded) spelling, and the text survives a serialize → load round trip. The corpus
+// (ddl/alter_table.test) pins the behavior; this pins the persisted bytes of the text.
+test("a RENAME rewrite quotes the substituted name", () => {
+  const db = memDb().session();
+  queryOutcome(db, "CREATE TABLE r (a i32 CHECK (a > 0), b i32 CHECK (B IS NULL OR b > a))");
+  queryOutcome(db, 'ALTER TABLE r RENAME COLUMN a TO "null"');
+  queryOutcome(db, "ALTER TABLE r RENAME COLUMN b TO plain");
+  const want = ['"null" > 0', '"plain" is null or "plain" > "null"'];
+  assert.deepEqual(
+    db.table("r")!.checks.map((c) => c.exprText),
+    want,
+  );
+  const loaded = Database.fromImage(db.toImage(8192, 1n));
+  assert.deepEqual(
+    loaded.table("r")!.checks.map((c) => c.exprText),
+    want,
   );
 });

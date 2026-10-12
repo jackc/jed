@@ -1498,8 +1498,9 @@ mod registry_tests {
             );
             // Every overload is reachable: a star row via `aggregate_has_star`, an expr row via
             // `lookup_aggregate_overload` over a representative operand of its declared family.
+            let lname = a.surface.to_ascii_lowercase();
             if a.arg == "star" {
-                assert!(aggregate_has_star(a.surface), "{} star overload", a.surface);
+                assert!(aggregate_has_star(&lname), "{} star overload", a.surface);
             } else {
                 let probe = match a.arg_families.first().copied() {
                     Some("integer") => ResolvedType::Int(ScalarType::Int32),
@@ -1507,10 +1508,9 @@ mod registry_tests {
                     Some("float") => ResolvedType::Float(ScalarType::Float64),
                     _ => ResolvedType::Int(ScalarType::Int32), // "any"
                 };
-                let found = lookup_aggregate_overload(a.surface, &probe)
+                let found = lookup_aggregate_overload(&lname, &probe)
                     .expect("expr overload resolves for its declared family");
                 // And its plan/result selection is total (panics via unreachable! otherwise).
-                let lname = a.surface.to_ascii_lowercase();
                 let _ = aggregate_plan(&lname, found.result, &probe);
             }
         }

@@ -144,7 +144,7 @@ test("in-memory compaction lowers storage bytes", () => {
   const before = db.storageBytes("main");
   const probe = rowsAndCost(db, PROBE);
   const version = db.version;
-  db.compact("MAIN");
+  db.compact("main");
   assert.ok(db.storageBytes("main") * 4n < before);
   assert.equal(db.version, version + 1n);
   assert.deepEqual(rowsAndCost(db, PROBE), probe);
@@ -239,7 +239,7 @@ test("attachments compact independently", () => {
   db.attach("scratch", attachMemory(), false);
   const mainVersion = db.version;
   const before = statSync(work).size;
-  db.compact("Work");
+  db.compact("work");
   db.compact("scratch");
   assert.ok(statSync(work).size * 4 < before);
   assert.equal(db.version, mainVersion, "main is untouched");

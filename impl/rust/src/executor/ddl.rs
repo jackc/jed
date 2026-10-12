@@ -166,16 +166,10 @@ fn host_dep_matches(hf: &crate::extension::HostFunction, deps: &[HostFuncDep]) -
 }
 
 fn constraint_name_taken(t: &Table, name: &str) -> bool {
-    t.checks.iter().any(|c| c.name.eq_ignore_ascii_case(name))
-        || t.indexes
-            .iter()
-            .any(|i| i.unique && i.name.eq_ignore_ascii_case(name))
-        || t.foreign_keys
-            .iter()
-            .any(|f| f.name.eq_ignore_ascii_case(name))
-        || t.exclusions
-            .iter()
-            .any(|e| e.name.eq_ignore_ascii_case(name))
+    t.checks.iter().any(|c| c.name == name)
+        || t.indexes.iter().any(|i| i.unique && i.name == name)
+        || t.foreign_keys.iter().any(|f| f.name == name)
+        || t.exclusions.iter().any(|e| e.name == name)
 }
 
 /// Resolve the parts of an EXCLUDE definition that are independent of naming. CREATE TABLE and
@@ -187,7 +181,7 @@ fn resolve_exclusion_definition(
     elements: &[(String, String)],
 ) -> Result<(Vec<usize>, Vec<ExclusionElement>)> {
     if let Some(method) = using {
-        if !method.eq_ignore_ascii_case("gist") {
+        if method != "gist" {
             return Err(EngineError::new(
                 SqlState::UndefinedObject,
                 format!("access method {method} does not support exclusion constraints"),
@@ -200,7 +194,7 @@ fn resolve_exclusion_definition(
         let column = table
             .columns
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(column_name))
+            .position(|c| c.name == *column_name)
             .ok_or_else(|| {
                 EngineError::new(
                     SqlState::UndefinedColumn,
@@ -496,7 +490,7 @@ impl Engine {
         let mut target_temp = ct.temp;
         let mut attach_name: Option<String> = None;
         if let Some(qual) = &ct.db {
-            match qual.to_ascii_lowercase().as_str() {
+            match qual.to_string().as_str() {
                 "main" => {
                     if ct.temp {
                         return Err(EngineError::new(
@@ -589,10 +583,7 @@ impl Engine {
         // TABLE validates — so a later failure (e.g. a bad CHECK) discards them with the statement.
         let mut pending_serials: Vec<SequenceDef> = Vec::new();
         for def in &ct.columns {
-            if columns
-                .iter()
-                .any(|c: &Column| c.name.eq_ignore_ascii_case(&def.name))
-            {
+            if columns.iter().any(|c: &Column| c.name == def.name) {
                 return Err(EngineError::new(
                     SqlState::DuplicateColumn,
                     format!("duplicate column name: {}", def.name),
@@ -812,8 +803,9 @@ impl Engine {
                 // Build the synthetic default exactly as the parser would render the equivalent
                 // `DEFAULT nextval('<seqname>')` (space-joined tokens — the canonical expression-text
                 // form), so the in-memory expr matches what reload re-parses (constraints.md §2). The
-                // seqname is a lowercased identifier-derived name, so the quoting is always safe.
-                let expr_text = format!("nextval ( '{}' )", seqname.replace('\'', "''"));
+                // sequence name is quoted inside the text when it is not a plain lowercase identifier
+                // (grammar.md §3), so the regclass-style parse resolves it exactly.
+                let expr_text = nextval_default_text(&seqname);
                 let expr = crate::parser::parse_expression(&expr_text)?;
                 let identity_kind = def.identity.as_ref().map(|id| {
                     if id.always {
@@ -955,7 +947,7 @@ impl Engine {
             for name in pk_list {
                 let idx = columns
                     .iter()
-                    .position(|c: &Column| c.name.eq_ignore_ascii_case(name))
+                    .position(|c: &Column| c.name == *name)
                     .ok_or_else(|| {
                         EngineError::new(
                             SqlState::UndefinedColumn,
@@ -997,7 +989,7 @@ impl Engine {
             for cname in &u.columns {
                 let idx = columns
                     .iter()
-                    .position(|c: &Column| c.name.eq_ignore_ascii_case(cname))
+                    .position(|c: &Column| c.name == *cname)
                     .ok_or_else(|| {
                         EngineError::new(
                             SqlState::UndefinedColumn,
@@ -1081,16 +1073,16 @@ impl Engine {
             check_deps.push(collect_check_host_deps(&node, &self.session.extensions)?);
         }
         // Naming (constraints.md §4.3): a single pass in textual order. An explicit name is
-        // used as written; a derived name is built from the LOWERCASED table/column names —
+        // used as written; a derived name is built from the exact table/column names —
         // `<table>_<col>_check` when the expression references exactly one distinct column,
         // else `<table>_check` — suffixed with the smallest positive integer that frees it.
-        // A collision (case-insensitive, PG folds) is 42710; derived names never yield to a
+        // A collision (byte-exact; bare names are already folded) is 42710; derived names never yield to a
         // later explicit one (oracle-probed).
         let mut checks: Vec<CheckConstraint> = Vec::with_capacity(ct.checks.len());
         for (def, host_deps) in ct.checks.iter().zip(check_deps) {
             let name = match &def.name {
                 Some(n) => {
-                    if checks.iter().any(|c| c.name.eq_ignore_ascii_case(n)) {
+                    if checks.iter().any(|c| c.name == *n) {
                         return Err(EngineError::new(
                             SqlState::DuplicateObject,
                             format!("constraint {n} for relation {} already exists", table.name),
@@ -1101,19 +1093,12 @@ impl Engine {
                 None => {
                     let cols = check_referenced_columns(&def.expr, &table.columns);
                     let base = match cols.as_slice() {
-                        [i] => format!(
-                            "{}_{}_check",
-                            table.name.to_ascii_lowercase(),
-                            table.columns[*i].name.to_ascii_lowercase()
-                        ),
-                        _ => format!("{}_check", table.name.to_ascii_lowercase()),
+                        [i] => format!("{}_{}_check", table.name, table.columns[*i].name),
+                        _ => format!("{}_check", table.name),
                     };
                     let mut candidate = base.clone();
                     let mut suffix = 0u32;
-                    while checks
-                        .iter()
-                        .any(|c| c.name.eq_ignore_ascii_case(&candidate))
-                    {
+                    while checks.iter().any(|c| c.name == candidate) {
                         suffix += 1;
                         candidate = format!("{base}{suffix}");
                     }
@@ -1127,9 +1112,9 @@ impl Engine {
                 host_deps,
             });
         }
-        // Evaluation (and on-disk) order: ascending byte order of the lowercased name
+        // Evaluation (and on-disk) order: ascending byte order of the exact name
         // (constraints.md §4.4 — PG evaluates checks sorted by name, oracle-probed).
-        checks.sort_by_key(|c| c.name.to_ascii_lowercase());
+        checks.sort_by_key(|c| c.name.to_string());
         table.checks = checks;
 
         // UNIQUE fold + naming (constraints.md §5.2/§5.3, PG-probed). Fold first: a
@@ -1155,9 +1140,7 @@ impl Engine {
         }
         for (uname, cols) in survivors {
             let taken = |exec: &Self, t: &Table, n: &str| {
-                exec.relation_exists(n)
-                    || t.name.eq_ignore_ascii_case(n)
-                    || t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n))
+                exec.relation_exists(n) || t.name == n || t.indexes.iter().any(|i| i.name == n)
             };
             let name = match uname {
                 Some(n) => {
@@ -1171,7 +1154,7 @@ impl Engine {
                             format!("relation already exists: {n}"),
                         ));
                     }
-                    if table.checks.iter().any(|c| c.name.eq_ignore_ascii_case(&n)) {
+                    if table.checks.iter().any(|c| c.name == n) {
                         return Err(EngineError::new(
                             SqlState::DuplicateObject,
                             format!("constraint {n} for relation {} already exists", table.name),
@@ -1180,19 +1163,16 @@ impl Engine {
                     n
                 }
                 None => {
-                    let mut base = table.name.to_ascii_lowercase();
+                    let mut base = table.name.to_string();
                     for &i in &cols {
                         base.push('_');
-                        base.push_str(&table.columns[i].name.to_ascii_lowercase());
+                        base.push_str(&table.columns[i].name.to_string());
                     }
                     base.push_str("_key");
                     let mut candidate = base.clone();
                     let mut suffix = 0u32;
                     while taken(self, &table, &candidate)
-                        || table
-                            .checks
-                            .iter()
-                            .any(|c| c.name.eq_ignore_ascii_case(&candidate))
+                        || table.checks.iter().any(|c| c.name == candidate)
                     {
                         suffix += 1;
                         candidate = format!("{base}{suffix}");
@@ -1200,12 +1180,12 @@ impl Engine {
                     candidate
                 }
             };
-            // Insert in catalog (ascending lowercased-name) order — indexes.md §6.
-            let name_key = name.to_ascii_lowercase();
+            // Insert in catalog (ascending name byte) order — indexes.md §6.
+            let name_key = name.to_string();
             let pos = table
                 .indexes
                 .iter()
-                .position(|i| i.name.to_ascii_lowercase() > name_key)
+                .position(|i| i.name > name_key)
                 .unwrap_or(table.indexes.len());
             table.indexes.insert(
                 pos,
@@ -1239,7 +1219,7 @@ impl Engine {
                 let idx = table
                     .columns
                     .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(cname))
+                    .position(|c| c.name == *cname)
                     .ok_or_else(|| {
                         EngineError::new(
                             SqlState::UndefinedColumn,
@@ -1258,7 +1238,7 @@ impl Engine {
             // parent must be PERSISTENT (resolve against the main snapshot, not the temp-aware funnel):
             // a persistent table may not reference a temp parent, and a temp table has no FK at all
             // (rejected above) — so a temp parent reads as "does not exist" here (temp-tables.md §8).
-            let self_ref = fk.ref_table.eq_ignore_ascii_case(&table.name);
+            let self_ref = fk.ref_table == table.name;
             let parent: &Table = if self_ref {
                 &table
             } else {
@@ -1292,7 +1272,7 @@ impl Engine {
                         let idx = parent
                             .columns
                             .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(cname))
+                            .position(|c| c.name == *cname)
                             .ok_or_else(|| {
                                 EngineError::new(
                                     SqlState::UndefinedColumn,
@@ -1321,8 +1301,8 @@ impl Engine {
             // 5. Name — the per-table constraint namespace, shared with CHECK (§6.2/§6.7).
             let name = match &fk.name {
                 Some(n) => {
-                    if table.checks.iter().any(|c| c.name.eq_ignore_ascii_case(n))
-                        || resolved_fks.iter().any(|f| f.name.eq_ignore_ascii_case(n))
+                    if table.checks.iter().any(|c| c.name == *n)
+                        || resolved_fks.iter().any(|f| f.name == *n)
                     {
                         return Err(EngineError::new(
                             SqlState::DuplicateObject,
@@ -1332,21 +1312,16 @@ impl Engine {
                     n.clone()
                 }
                 None => {
-                    let mut base = table.name.to_ascii_lowercase();
+                    let mut base = table.name.to_string();
                     for &i in &local {
                         base.push('_');
-                        base.push_str(&table.columns[i].name.to_ascii_lowercase());
+                        base.push_str(&table.columns[i].name.to_string());
                     }
                     base.push_str("_fkey");
                     let mut candidate = base.clone();
                     let mut suffix = 0u32;
-                    while table
-                        .checks
-                        .iter()
-                        .any(|c| c.name.eq_ignore_ascii_case(&candidate))
-                        || resolved_fks
-                            .iter()
-                            .any(|f| f.name.eq_ignore_ascii_case(&candidate))
+                    while table.checks.iter().any(|c| c.name == candidate)
+                        || resolved_fks.iter().any(|f| f.name == candidate)
                     {
                         suffix += 1;
                         candidate = format!("{base}{suffix}");
@@ -1400,8 +1375,8 @@ impl Engine {
                 on_update,
             });
         }
-        // Held in ascending lowercased-name order (the catalog's on-disk + evaluation order, §6.9).
-        resolved_fks.sort_by_key(|f| f.name.to_ascii_lowercase());
+        // Held in ascending name byte order (the catalog's on-disk + evaluation order, §6.9).
+        resolved_fks.sort_by_key(|f| f.name.to_string());
         table.foreign_keys = resolved_fks;
 
         // EXCLUDE constraints (spec/design/gist.md §7). Resolved AFTER the PK / UNIQUE / CHECK / FK
@@ -1417,16 +1392,12 @@ impl Engine {
             // namespace (42P07) then the table's constraint names (42710); a derived
             // `<table>_<cols>_excl` suffix-walks both.
             let taken = |exec: &Self, t: &Table, n: &str| {
-                exec.relation_exists(n)
-                    || t.name.eq_ignore_ascii_case(n)
-                    || t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(n))
+                exec.relation_exists(n) || t.name == n || t.indexes.iter().any(|i| i.name == n)
             };
             let constraint_taken = |t: &Table, n: &str| {
-                t.checks.iter().any(|c| c.name.eq_ignore_ascii_case(n))
-                    || t.foreign_keys
-                        .iter()
-                        .any(|f| f.name.eq_ignore_ascii_case(n))
-                    || t.exclusions.iter().any(|e| e.name.eq_ignore_ascii_case(n))
+                t.checks.iter().any(|c| c.name == n)
+                    || t.foreign_keys.iter().any(|f| f.name == n)
+                    || t.exclusions.iter().any(|e| e.name == n)
             };
             let name = match &exc.name {
                 Some(n) => {
@@ -1448,10 +1419,10 @@ impl Engine {
                     n.clone()
                 }
                 None => {
-                    let mut base = table.name.to_ascii_lowercase();
+                    let mut base = table.name.to_string();
                     for &i in &indices {
                         base.push('_');
-                        base.push_str(&table.columns[i].name.to_ascii_lowercase());
+                        base.push_str(&table.columns[i].name.to_string());
                     }
                     base.push_str("_excl");
                     let mut candidate = base.clone();
@@ -1463,12 +1434,12 @@ impl Engine {
                     candidate
                 }
             };
-            // Insert the backing GiST index in catalog (ascending lowercased-name) order.
-            let name_key = name.to_ascii_lowercase();
+            // Insert the backing GiST index in catalog (ascending name byte) order.
+            let name_key = name.to_string();
             let pos = table
                 .indexes
                 .iter()
-                .position(|i| i.name.to_ascii_lowercase() > name_key)
+                .position(|i| i.name > name_key)
                 .unwrap_or(table.indexes.len());
             table.indexes.insert(
                 pos,
@@ -1489,16 +1460,10 @@ impl Engine {
                 elements,
             });
         }
-        // Held in ascending lowercased-name order (the catalog's on-disk order — gist.md §8).
-        table
-            .exclusions
-            .sort_by_key(|e| e.name.to_ascii_lowercase());
+        // Held in ascending name byte order (the catalog's on-disk order — gist.md §8).
+        table.exclusions.sort_by_key(|e| e.name.to_string());
 
-        let index_keys: Vec<String> = table
-            .indexes
-            .iter()
-            .map(|i| i.name.to_ascii_lowercase())
-            .collect();
+        let index_keys: Vec<String> = table.indexes.iter().map(|i| i.name.to_string()).collect();
         // The table is brand new (no rows), so each backing index store starts empty.
         let cap = crate::format::page_payload(self.page_size);
 
@@ -1643,10 +1608,10 @@ impl Engine {
         check_catalog_rel_write(&at.name)?;
         self.check_attachment_writable(at.db.as_deref())?;
         let temp_scope = match at.db.as_deref() {
-            Some(q) => q.eq_ignore_ascii_case("temp"),
+            Some(q) => q == "temp",
             None => self.is_temp_table(&at.name),
         };
-        let snap = match at.db.as_deref().map(str::to_ascii_lowercase) {
+        let snap = match at.db.as_deref().map(str::to_string) {
             None => {
                 if self.is_temp_table(&at.name)
                     || self.temp_read_snap().find_index(&at.name).is_some()
@@ -1686,7 +1651,7 @@ impl Engine {
             ));
         };
         let original = original_ref.clone();
-        let old_key = original.name.to_ascii_lowercase();
+        let old_key = original.name.to_string();
         let mut table = original.clone();
         let mut rename_table = false;
         let mut index_rename: Option<(String, String)> = None;
@@ -1724,7 +1689,7 @@ impl Engine {
         let attachment_scope = at
             .db
             .as_deref()
-            .is_some_and(|q| !matches!(q.to_ascii_lowercase().as_str(), "main" | "temp"));
+            .is_some_and(|q| !matches!(q.to_string().as_str(), "main" | "temp"));
         let main_namespace = self.read_snap().clone();
         let temp_namespace = self.temp_read_snap().clone();
         let relation_taken = |name: &str| {
@@ -1748,25 +1713,14 @@ impl Engine {
                                       pending_sequences: &[SequenceDef],
                                       dropped_sequences: &std::collections::HashSet<String>,
                                       name: &str| {
-            if pending_sequences
-                .iter()
-                .any(|s| s.name.eq_ignore_ascii_case(name))
-            {
+            if pending_sequences.iter().any(|s| s.name == name) {
                 return true;
             }
-            if working
-                .indexes
-                .iter()
-                .any(|i| i.name.eq_ignore_ascii_case(name))
-            {
+            if working.indexes.iter().any(|i| i.name == name) {
                 true
-            } else if original
-                .indexes
-                .iter()
-                .any(|i| i.name.eq_ignore_ascii_case(name))
-            {
+            } else if original.indexes.iter().any(|i| i.name == name) {
                 false
-            } else if dropped_sequences.contains(&name.to_ascii_lowercase()) {
+            } else if dropped_sequences.contains(&name.to_string()) {
                 false
             } else {
                 relation_taken(name)
@@ -1787,21 +1741,13 @@ impl Engine {
                 rename_table = true;
             }
             AlterTableAction::RenameColumn { old, new } => {
-                let Some(ci) = table
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(&old))
-                else {
+                let Some(ci) = table.columns.iter().position(|c| c.name == old) else {
                     return Err(EngineError::new(
                         SqlState::UndefinedColumn,
                         format!("column does not exist: {old}"),
                     ));
                 };
-                if table
-                    .columns
-                    .iter()
-                    .any(|c| c.name.eq_ignore_ascii_case(&new))
-                {
+                if table.columns.iter().any(|c| c.name == new) {
                     return Err(EngineError::new(
                         SqlState::DuplicateColumn,
                         format!("column already exists: {new}"),
@@ -1812,16 +1758,10 @@ impl Engine {
             }
             AlterTableAction::RenameConstraint { old, new } => {
                 let exists = |name: &str, t: &Table| {
-                    t.checks.iter().any(|c| c.name.eq_ignore_ascii_case(name))
-                        || t.indexes
-                            .iter()
-                            .any(|i| i.unique && i.name.eq_ignore_ascii_case(name))
-                        || t.foreign_keys
-                            .iter()
-                            .any(|f| f.name.eq_ignore_ascii_case(name))
-                        || t.exclusions
-                            .iter()
-                            .any(|e| e.name.eq_ignore_ascii_case(name))
+                    t.checks.iter().any(|c| c.name == name)
+                        || t.indexes.iter().any(|i| i.unique && i.name == name)
+                        || t.foreign_keys.iter().any(|f| f.name == name)
+                        || t.exclusions.iter().any(|e| e.name == name)
                 };
                 if !exists(&old, &table) {
                     return Err(EngineError::new(
@@ -1836,24 +1776,24 @@ impl Engine {
                     ));
                 }
                 for c in &mut table.checks {
-                    if c.name.eq_ignore_ascii_case(&old) {
+                    if c.name == old {
                         c.name = new.clone();
                     }
                 }
                 for f in &mut table.foreign_keys {
-                    if f.name.eq_ignore_ascii_case(&old) {
+                    if f.name == old {
                         f.name = new.clone();
                     }
                 }
                 for e in &mut table.exclusions {
-                    if e.name.eq_ignore_ascii_case(&old) {
+                    if e.name == old {
                         e.name = new.clone();
                         e.index = new.clone();
                         index_rename = Some((old.clone(), new.clone()));
                     }
                 }
                 for i in &mut table.indexes {
-                    if (i.unique || index_rename.is_some()) && i.name.eq_ignore_ascii_case(&old) {
+                    if (i.unique || index_rename.is_some()) && i.name == old {
                         i.name = new.clone();
                         index_rename = Some((old.clone(), new.clone()));
                     }
@@ -1867,14 +1807,10 @@ impl Engine {
                         ));
                     }
                 }
-                table.checks.sort_by_key(|x| x.name.to_ascii_lowercase());
-                table.indexes.sort_by_key(|x| x.name.to_ascii_lowercase());
-                table
-                    .foreign_keys
-                    .sort_by_key(|x| x.name.to_ascii_lowercase());
-                table
-                    .exclusions
-                    .sort_by_key(|x| x.name.to_ascii_lowercase());
+                table.checks.sort_by_key(|x| x.name.to_string());
+                table.indexes.sort_by_key(|x| x.name.to_string());
+                table.foreign_keys.sort_by_key(|x| x.name.to_string());
+                table.exclusions.sort_by_key(|x| x.name.to_string());
             }
             AlterTableAction::Actions(actions) => {
                 let mut actions = std::collections::VecDeque::from(actions);
@@ -1887,11 +1823,7 @@ impl Engine {
                         if_not_exists,
                     } = action
                     {
-                        if table
-                            .columns
-                            .iter()
-                            .any(|c| c.name.eq_ignore_ascii_case(&column.name))
-                        {
+                        if table.columns.iter().any(|c| c.name == column.name) {
                             if if_not_exists {
                                 continue;
                             }
@@ -1975,11 +1907,7 @@ impl Engine {
                         cascade,
                     } = action
                     {
-                        let Some(ci) = table
-                            .columns
-                            .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(&name))
-                        else {
+                        let Some(ci) = table.columns.iter().position(|c| c.name == name) else {
                             if if_exists {
                                 continue;
                             }
@@ -2002,8 +1930,7 @@ impl Engine {
                         let fk_uses_local_column =
                             |fk: &ForeignKeyConstraint| fk.columns.contains(&ci);
                         let fk_uses_self_ref_column = |fk: &ForeignKeyConstraint| {
-                            fk.ref_table.eq_ignore_ascii_case(&table_name)
-                                && fk.ref_columns.contains(&ci)
+                            fk.ref_table == table_name && fk.ref_columns.contains(&ci)
                         };
                         let self_ref_fk_dep = table
                             .foreign_keys
@@ -2011,14 +1938,12 @@ impl Engine {
                             .any(|fk| fk_uses_self_ref_column(fk) && !fk_uses_local_column(fk));
                         let incoming_dep = match column_sources[ci] {
                             ColumnSource::Original(old_ci) => snap.tables.iter().any(|(key, t)| {
-                                !key.eq_ignore_ascii_case(&old_key)
+                                key != &old_key
                                     && t.foreign_keys.iter().any(|fk| {
-                                        fk.ref_table.eq_ignore_ascii_case(&original.name)
+                                        fk.ref_table == original.name
                                             && fk.ref_columns.contains(&old_ci)
-                                            && !cascade_dropped_column_fks.contains(&(
-                                                key.to_ascii_lowercase(),
-                                                fk.name.to_ascii_lowercase(),
-                                            ))
+                                            && !cascade_dropped_column_fks
+                                                .contains(&(key.to_string(), fk.name.to_string()))
                                             && !cascade_unique_cols
                                                 .iter()
                                                 .any(|cols| *cols == sorted_unique(&fk.ref_columns))
@@ -2037,17 +1962,15 @@ impl Engine {
                         if cascade {
                             if let ColumnSource::Original(old_ci) = column_sources[ci] {
                                 for (key, child) in snap.tables.iter() {
-                                    if key.eq_ignore_ascii_case(&old_key) {
+                                    if key == &old_key {
                                         continue;
                                     }
                                     for fk in &child.foreign_keys {
-                                        if fk.ref_table.eq_ignore_ascii_case(&original.name)
+                                        if fk.ref_table == original.name
                                             && fk.ref_columns.contains(&old_ci)
                                         {
-                                            cascade_dropped_column_fks.insert((
-                                                key.to_ascii_lowercase(),
-                                                fk.name.to_ascii_lowercase(),
-                                            ));
+                                            cascade_dropped_column_fks
+                                                .insert((key.to_string(), fk.name.to_string()));
                                         }
                                     }
                                 }
@@ -2061,7 +1984,7 @@ impl Engine {
                             let keep =
                                 !check_referenced_columns(&c.expr, &table.columns).contains(&ci);
                             if !keep {
-                                removed.push(c.name.to_ascii_lowercase());
+                                removed.push(c.name.to_string());
                             }
                             keep
                         });
@@ -2075,14 +1998,14 @@ impl Engine {
                                 check_referenced_columns(&p.expr, &table.columns).contains(&ci)
                             });
                             if uses {
-                                removed.push(ix.name.to_ascii_lowercase());
+                                removed.push(ix.name.to_string());
                             }
                             !uses
                         });
                         table.exclusions.retain(|e| {
                             let uses = e.elements.iter().any(|x| x.column == ci);
                             if uses {
-                                removed.push(e.name.to_ascii_lowercase());
+                                removed.push(e.name.to_string());
                             }
                             !uses
                         });
@@ -2096,7 +2019,7 @@ impl Engine {
                             let remove = fk_uses_local_column(fk)
                                 || (cascade && fk_uses_self_ref_column(fk));
                             if remove {
-                                removed_fks.push(fk.name.to_ascii_lowercase());
+                                removed_fks.push(fk.name.to_string());
                             }
                             !remove
                         });
@@ -2127,7 +2050,7 @@ impl Engine {
                                     *c -= 1;
                                 }
                             }
-                            if fk.ref_table.eq_ignore_ascii_case(&table.name) {
+                            if fk.ref_table == table.name {
                                 for c in &mut fk.ref_columns {
                                     if *c > ci {
                                         *c -= 1;
@@ -2164,7 +2087,7 @@ impl Engine {
                             let Some(owner) = &mut seq.owned_by else {
                                 return true;
                             };
-                            if !owner.table.eq_ignore_ascii_case(&table.name) {
+                            if owner.table != table.name {
                                 return true;
                             }
                             if usize::from(owner.column) == ci {
@@ -2189,11 +2112,7 @@ impl Engine {
                         }
                         let mut pk = Vec::new();
                         for name in names {
-                            let Some(ci) = table
-                                .columns
-                                .iter()
-                                .position(|c| c.name.eq_ignore_ascii_case(&name))
-                            else {
+                            let Some(ci) = table.columns.iter().position(|c| c.name == name) else {
                                 return Err(EngineError::new(
                                     SqlState::UndefinedColumn,
                                     format!("column {name} named in key does not exist"),
@@ -2233,13 +2152,12 @@ impl Engine {
                         }
                         let old_pk = sorted_unique(&table.pk);
                         let local_deps = table.foreign_keys.iter().any(|fk| {
-                            fk.ref_table.eq_ignore_ascii_case(&table.name)
-                                && sorted_unique(&fk.ref_columns) == old_pk
+                            fk.ref_table == table.name && sorted_unique(&fk.ref_columns) == old_pk
                         });
                         let incoming_deps = snap.tables.iter().any(|(key, child)| {
-                            !key.eq_ignore_ascii_case(&old_key)
+                            key != &old_key
                                 && child.foreign_keys.iter().any(|fk| {
-                                    fk.ref_table.eq_ignore_ascii_case(&original.name)
+                                    fk.ref_table == original.name
                                         && sorted_unique(&fk.ref_columns) == old_pk
                                 })
                         });
@@ -2252,7 +2170,7 @@ impl Engine {
                         }
                         if cascade {
                             table.foreign_keys.retain(|fk| {
-                                !(fk.ref_table.eq_ignore_ascii_case(&table.name)
+                                !(fk.ref_table == table.name
                                     && sorted_unique(&fk.ref_columns) == old_pk)
                             });
                             cascade_unique_cols.push(old_pk);
@@ -2296,16 +2214,16 @@ impl Engine {
                                 }
                                 let host_deps =
                                     collect_check_host_deps(&node, &self.session.extensions)?;
-                                let mut name = d.name.clone().unwrap_or_else(|| {
-                                    format!("{}_check", table.name.to_ascii_lowercase())
-                                });
+                                let mut name = d
+                                    .name
+                                    .clone()
+                                    .unwrap_or_else(|| format!("{}_check", table.name));
                                 if d.name.is_none() {
                                     let rs = check_referenced_columns(&d.expr, &table.columns);
                                     if rs.len() == 1 {
                                         name = format!(
                                             "{}_{}_check",
-                                            table.name.to_ascii_lowercase(),
-                                            table.columns[rs[0]].name.to_ascii_lowercase()
+                                            table.name, table.columns[rs[0]].name
                                         );
                                     }
                                     let base = name.clone();
@@ -2329,16 +2247,13 @@ impl Engine {
                                     expr: d.expr,
                                     host_deps,
                                 });
-                                table.checks.sort_by_key(|x| x.name.to_ascii_lowercase());
-                                added_constraints.insert(name.to_ascii_lowercase());
+                                table.checks.sort_by_key(|x| x.name.to_string());
+                                added_constraints.insert(name.to_string());
                             }
                             AlterConstraintDef::Unique(d) => {
                                 let mut cols = Vec::new();
                                 for n in d.columns {
-                                    let Some(ci) = table
-                                        .columns
-                                        .iter()
-                                        .position(|c| c.name.eq_ignore_ascii_case(&n))
+                                    let Some(ci) = table.columns.iter().position(|c| c.name == n)
                                     else {
                                         return Err(EngineError::new(
                                             SqlState::UndefinedColumn,
@@ -2393,9 +2308,9 @@ impl Engine {
                                 } else {
                                     let base = format!(
                                         "{}_{}_key",
-                                        table.name.to_ascii_lowercase(),
+                                        table.name,
                                         cols.iter()
-                                            .map(|i| table.columns[*i].name.to_ascii_lowercase())
+                                            .map(|i| table.columns[*i].name.to_string())
                                             .collect::<Vec<_>>()
                                             .join("_")
                                     );
@@ -2422,16 +2337,13 @@ impl Engine {
                                     host_deps: Vec::new(),
                                     timezone_deps: TimeZoneDeps::default(),
                                 });
-                                table.indexes.sort_by_key(|x| x.name.to_ascii_lowercase());
-                                added_constraints.insert(name.to_ascii_lowercase());
+                                table.indexes.sort_by_key(|x| x.name.to_string());
+                                added_constraints.insert(name.to_string());
                             }
                             AlterConstraintDef::ForeignKey(d) => {
                                 let mut local = Vec::new();
                                 for n in d.columns {
-                                    let Some(ci) = table
-                                        .columns
-                                        .iter()
-                                        .position(|c| c.name.eq_ignore_ascii_case(&n))
+                                    let Some(ci) = table.columns.iter().position(|c| c.name == n)
                                     else {
                                         return Err(EngineError::new(
                                             SqlState::UndefinedColumn,
@@ -2448,7 +2360,7 @@ impl Engine {
                                     }
                                     local.push(ci)
                                 }
-                                let parent = if d.ref_table.eq_ignore_ascii_case(&table.name) {
+                                let parent = if d.ref_table == table.name {
                                     table.clone()
                                 } else {
                                     snap.table(&d.ref_table).cloned().ok_or_else(|| {
@@ -2461,10 +2373,8 @@ impl Engine {
                                 let refs = if let Some(ns) = d.ref_columns {
                                     let mut r = Vec::new();
                                     for n in ns {
-                                        let Some(i) = parent
-                                            .columns
-                                            .iter()
-                                            .position(|c| c.name.eq_ignore_ascii_case(&n))
+                                        let Some(i) =
+                                            parent.columns.iter().position(|c| c.name == n)
                                         else {
                                             return Err(EngineError::new(
                                                 SqlState::UndefinedColumn,
@@ -2530,10 +2440,10 @@ impl Engine {
                                 } else {
                                     let base = format!(
                                         "{}_{}_fkey",
-                                        table.name.to_ascii_lowercase(),
+                                        table.name,
                                         local
                                             .iter()
-                                            .map(|i| table.columns[*i].name.to_ascii_lowercase())
+                                            .map(|i| table.columns[*i].name.to_string())
                                             .collect::<Vec<_>>()
                                             .join("_")
                                     );
@@ -2567,10 +2477,8 @@ impl Engine {
                                     on_delete: fk_action(d.on_delete, "DELETE")?,
                                     on_update: fk_action(d.on_update, "UPDATE")?,
                                 });
-                                table
-                                    .foreign_keys
-                                    .sort_by_key(|x| x.name.to_ascii_lowercase());
-                                added_constraints.insert(name.to_ascii_lowercase());
+                                table.foreign_keys.sort_by_key(|x| x.name.to_string());
+                                added_constraints.insert(name.to_string());
                             }
                             AlterConstraintDef::Exclude(d) => {
                                 let (cols, els) = resolve_exclusion_definition(
@@ -2604,9 +2512,9 @@ impl Engine {
                                 } else {
                                     let base = format!(
                                         "{}_{}_excl",
-                                        table.name.to_ascii_lowercase(),
+                                        table.name,
                                         cols.iter()
-                                            .map(|i| table.columns[*i].name.to_ascii_lowercase())
+                                            .map(|i| table.columns[*i].name.to_string())
                                             .collect::<Vec<_>>()
                                             .join("_")
                                     );
@@ -2638,11 +2546,9 @@ impl Engine {
                                     index: name.clone(),
                                     elements: els,
                                 });
-                                table.indexes.sort_by_key(|x| x.name.to_ascii_lowercase());
-                                table
-                                    .exclusions
-                                    .sort_by_key(|x| x.name.to_ascii_lowercase());
-                                added_constraints.insert(name.to_ascii_lowercase());
+                                table.indexes.sort_by_key(|x| x.name.to_string());
+                                table.exclusions.sort_by_key(|x| x.name.to_string());
+                                added_constraints.insert(name.to_string());
                             }
                         }
                         continue;
@@ -2653,34 +2559,23 @@ impl Engine {
                         cascade,
                     } = action
                     {
-                        let k = name.to_ascii_lowercase();
+                        let k = name.to_string();
                         let mut found = false;
                         let n = table.checks.len();
-                        table.checks.retain(|x| !x.name.eq_ignore_ascii_case(&name));
+                        table.checks.retain(|x| x.name != name);
                         found |= n != table.checks.len();
                         let n = table.foreign_keys.len();
-                        table
-                            .foreign_keys
-                            .retain(|x| !x.name.eq_ignore_ascii_case(&name));
+                        table.foreign_keys.retain(|x| x.name != name);
                         found |= n != table.foreign_keys.len();
-                        if let Some(e) = table
-                            .exclusions
-                            .iter()
-                            .find(|x| x.name.eq_ignore_ascii_case(&name))
-                            .cloned()
-                        {
-                            table
-                                .exclusions
-                                .retain(|x| !x.name.eq_ignore_ascii_case(&name));
-                            table
-                                .indexes
-                                .retain(|x| !x.name.eq_ignore_ascii_case(&e.index));
+                        if let Some(e) = table.exclusions.iter().find(|x| x.name == name).cloned() {
+                            table.exclusions.retain(|x| x.name != name);
+                            table.indexes.retain(|x| x.name != e.index);
                             found = true;
                         }
                         if let Some(ix) = table
                             .indexes
                             .iter()
-                            .find(|x| x.unique && x.name.eq_ignore_ascii_case(&name))
+                            .find(|x| x.unique && x.name == name)
                             .cloned()
                         {
                             let cols = sorted_unique(&ix.column_ordinals().unwrap());
@@ -2696,24 +2591,22 @@ impl Engine {
                                 .foreign_keys
                                 .iter()
                                 .filter(|f| {
-                                    f.ref_table.eq_ignore_ascii_case(&table.name)
+                                    f.ref_table == table.name
                                         && sorted_unique(&f.ref_columns) == cols
                                 })
                                 .count();
                             let mut external_deps = 0usize;
                             if let Some(old_cols) = &original_cols {
                                 for (key, child) in snap.tables.iter() {
-                                    if key.eq_ignore_ascii_case(&old_key) {
+                                    if key == &old_key {
                                         continue;
                                     }
                                     for fk in &child.foreign_keys {
                                         let fk_cols = sorted_unique(&fk.ref_columns);
-                                        if fk.ref_table.eq_ignore_ascii_case(&table.name)
+                                        if fk.ref_table == table.name
                                             && fk_cols == *old_cols
-                                            && !cascade_dropped_column_fks.contains(&(
-                                                key.to_ascii_lowercase(),
-                                                fk.name.to_ascii_lowercase(),
-                                            ))
+                                            && !cascade_dropped_column_fks
+                                                .contains(&(key.to_string(), fk.name.to_string()))
                                             && !cascade_unique_cols
                                                 .iter()
                                                 .any(|prior| *prior == fk_cols)
@@ -2737,13 +2630,11 @@ impl Engine {
                                     cascade_unique_cols.push(old_cols);
                                 }
                                 table.foreign_keys.retain(|f| {
-                                    !(f.ref_table.eq_ignore_ascii_case(&table.name)
+                                    !(f.ref_table == table.name
                                         && sorted_unique(&f.ref_columns) == cols)
                                 });
                             }
-                            table
-                                .indexes
-                                .retain(|x| !x.name.eq_ignore_ascii_case(&name));
+                            table.indexes.retain(|x| x.name != name);
                             found = true;
                         }
                         if !found && !if_exists {
@@ -2758,11 +2649,7 @@ impl Engine {
                     let AlterTableEdit::AlterColumn(edit) = action else {
                         unreachable!()
                     };
-                    let Some(ci) = table
-                        .columns
-                        .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(&edit.column))
-                    else {
+                    let Some(ci) = table.columns.iter().position(|c| c.name == edit.column) else {
                         return Err(EngineError::new(
                             SqlState::UndefinedColumn,
                             format!("column does not exist: {}", edit.column),
@@ -2939,8 +2826,7 @@ impl Engine {
                                     .expect("identity column is integer");
                                 if let Some(si) = pending_serials.iter().position(|seq| {
                                     seq.owned_by.as_ref().is_some_and(|owner| {
-                                        owner.table.eq_ignore_ascii_case(&table.name)
-                                            && usize::from(owner.column) == ci
+                                        owner.table == table.name && usize::from(owner.column) == ci
                                     })
                                 }) {
                                     pending_serials[si] = retype_identity_sequence(
@@ -2980,16 +2866,16 @@ impl Engine {
                             type_changed = true;
                             row_steps.push(RowStep::SetType { column: ci, value });
                             for c in &table.checks {
-                                added_constraints.insert(c.name.to_ascii_lowercase());
+                                added_constraints.insert(c.name.to_string());
                             }
                             for i in &table.indexes {
-                                added_constraints.insert(i.name.to_ascii_lowercase());
+                                added_constraints.insert(i.name.to_string());
                             }
                             for f in &table.foreign_keys {
-                                added_constraints.insert(f.name.to_ascii_lowercase());
+                                added_constraints.insert(f.name.to_string());
                             }
                             for e in &table.exclusions {
-                                added_constraints.insert(e.name.to_ascii_lowercase());
+                                added_constraints.insert(e.name.to_string());
                             }
                         }
                     }
@@ -2999,7 +2885,7 @@ impl Engine {
 
         if type_changed {
             for fk in &table.foreign_keys {
-                let parent = if fk.ref_table.eq_ignore_ascii_case(&table.name) {
+                let parent = if fk.ref_table == table.name {
                     &table
                 } else {
                     snap.table(&fk.ref_table).expect("existing FK parent")
@@ -3018,15 +2904,14 @@ impl Engine {
                 }
             }
             for (key, child) in snap.tables.iter() {
-                if key.eq_ignore_ascii_case(&old_key) {
+                if key == &old_key {
                     continue;
                 }
                 for fk in &child.foreign_keys {
-                    if !fk.ref_table.eq_ignore_ascii_case(&original.name) {
+                    if fk.ref_table != original.name {
                         continue;
                     }
-                    if cascade_dropped_column_fks
-                        .contains(&(key.to_ascii_lowercase(), fk.name.to_ascii_lowercase()))
+                    if cascade_dropped_column_fks.contains(&(key.to_string(), fk.name.to_string()))
                         || cascade_unique_cols
                             .iter()
                             .any(|cols| *cols == sorted_unique(&fk.ref_columns))
@@ -3057,8 +2942,8 @@ impl Engine {
         let page_size = at
             .db
             .as_deref()
-            .filter(|q| !matches!(q.to_ascii_lowercase().as_str(), "main" | "temp"))
-            .map(|q| self.attach_page_size(&q.to_ascii_lowercase()))
+            .filter(|q| !matches!(q.to_string().as_str(), "main" | "temp"))
+            .map(|q| self.attach_page_size(q))
             .unwrap_or(self.page_size);
         let rewrite_needed = column_sources.len() != original.columns.len()
             || column_sources
@@ -3094,7 +2979,7 @@ impl Engine {
             // Make owned sequences visible to their synthesized nextval defaults. Statement-level
             // rollback restores the prior working root if any later validation fails.
             for seq in pending_serials.iter().cloned() {
-                match at.db.as_deref().map(str::to_ascii_lowercase) {
+                match at.db.as_deref().map(str::to_string) {
                     None if temp_scope => self.temp_working_mut().put_sequence(seq),
                     None => self.working_mut().put_sequence(seq),
                     Some(q) if q == "temp" => self.temp_working_mut().put_sequence(seq),
@@ -3182,7 +3067,7 @@ impl Engine {
                     if !seen_keys.insert(key.clone()) {
                         return Err(EngineError::unique_violation(
                             &table.name,
-                            format!("{}_pkey", table.name.to_ascii_lowercase()),
+                            format!("{}_pkey", table.name),
                         ));
                     }
                 }
@@ -3232,9 +3117,9 @@ impl Engine {
             for ix in table
                 .indexes
                 .iter()
-                .filter(|ix| added_constraints.contains(&ix.name.to_ascii_lowercase()))
+                .filter(|ix| added_constraints.contains(&ix.name.to_string()))
             {
-                constraint_entries.insert(ix.name.to_ascii_lowercase(), Vec::new());
+                constraint_entries.insert(ix.name.to_string(), Vec::new());
             }
             let store = self.store_scoped(at.db.as_deref(), &original.name);
             let rows = if let Some(rows) = &rewrite_entries {
@@ -3254,7 +3139,7 @@ impl Engine {
             // DROP + ADD performs, and it lets a type change select a different host overload.
             let mut checks: Vec<(String, RExpr)> = Vec::new();
             for i in 0..table.checks.len() {
-                if !added_constraints.contains(&table.checks[i].name.to_ascii_lowercase()) {
+                if !added_constraints.contains(&table.checks[i].name.to_string()) {
                     continue;
                 }
                 let (node, _) = resolve(
@@ -3296,19 +3181,19 @@ impl Engine {
                 for ix in table
                     .indexes
                     .iter()
-                    .filter(|i| added_constraints.contains(&i.name.to_ascii_lowercase()))
+                    .filter(|i| added_constraints.contains(&i.name.to_string()))
                 {
                     let ri = self.resolve_index(&table, ix)?;
                     if ix.unique {
                         if let Some(p) = self.index_prefix(&col_types, &colls, &ri, &row)? {
-                            let s = seen.entry(ix.name.to_ascii_lowercase()).or_default();
+                            let s = seen.entry(ix.name.to_string()).or_default();
                             if !s.insert(p) {
                                 return Err(EngineError::unique_violation(&table.name, &ix.name));
                             }
                         }
                     }
                     constraint_entries
-                        .entry(ix.name.to_ascii_lowercase())
+                        .entry(ix.name.to_string())
                         .or_default()
                         .extend(self.index_entries(
                             &table.columns,
@@ -3323,9 +3208,9 @@ impl Engine {
             for fk in table
                 .foreign_keys
                 .iter()
-                .filter(|f| added_constraints.contains(&f.name.to_ascii_lowercase()))
+                .filter(|f| added_constraints.contains(&f.name.to_string()))
             {
-                let parent = if fk.ref_table.eq_ignore_ascii_case(&table.name) {
+                let parent = if fk.ref_table == table.name {
                     &table
                 } else {
                     snap.table(&fk.ref_table).unwrap()
@@ -3362,7 +3247,7 @@ impl Engine {
             for ex in table
                 .exclusions
                 .iter()
-                .filter(|e| added_constraints.contains(&e.name.to_ascii_lowercase()))
+                .filter(|e| added_constraints.contains(&e.name.to_string()))
             {
                 for i in 0..rows.len() {
                     let mut a = rows[i].1.clone();
@@ -3393,9 +3278,7 @@ impl Engine {
                 .collect();
             for ix in &table.indexes {
                 let ri = self.resolve_index(&table, ix)?;
-                let out = constraint_entries
-                    .entry(ix.name.to_ascii_lowercase())
-                    .or_default();
+                let out = constraint_entries.entry(ix.name.to_string()).or_default();
                 for (key, row) in rewrite_entries.as_ref().unwrap() {
                     out.extend(self.index_entries(
                         &table.columns,
@@ -3410,7 +3293,7 @@ impl Engine {
             }
         }
         let ir = index_rename.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
-        let ws = match at.db.as_deref().map(str::to_ascii_lowercase) {
+        let ws = match at.db.as_deref().map(str::to_string) {
             None if self.is_temp_table(&original.name) => self.temp_working_mut(),
             None => self.working_mut(),
             Some(q) if q == "temp" => self.temp_working_mut(),
@@ -3444,10 +3327,8 @@ impl Engine {
                     original_to_new[*old] = Some(next);
                 }
             }
-            let pending: std::collections::HashSet<String> = pending_serials
-                .iter()
-                .map(|s| s.name.to_ascii_lowercase())
-                .collect();
+            let pending: std::collections::HashSet<String> =
+                pending_serials.iter().map(|s| s.name.to_string()).collect();
             ws.remap_alter_column_dependents(&table.name, &original_to_new, &pending);
         }
         Ok(Outcome::Statement {
@@ -3777,7 +3658,7 @@ impl Engine {
                     column: table.columns.len() as u16,
                 }),
             )?);
-            let expr_text = format!("nextval ( '{}' )", seqname.replace('\'', "''"));
+            let expr_text = nextval_default_text(&seqname);
             col.default_expr = Some(DefaultExpr {
                 expr: crate::parser::parse_expression(&expr_text)?,
                 expr_text,
@@ -4074,7 +3955,7 @@ impl Engine {
     }
 
     /// Run a `DROP TABLE [IF EXISTS] a [, …] [CASCADE | RESTRICT]`: remove each named table's
-    /// definition and row store from the catalog (keyed by lower-cased name). Two-phase /
+    /// definition and row store from the catalog (keyed by exact name). Two-phase /
     /// all-or-nothing (spec/design/grammar.md §13): every name is resolved and validated first
     /// — a missing table is 42P01 (unless `IF EXISTS` skips just that name), a non-table relation
     /// is 42809, and an external FK dependent is 2BP01 under `RESTRICT` — and only if the whole
@@ -4091,11 +3972,11 @@ impl Engine {
         }
         // ---- Phase 1: resolve & classify every name into the drop set. Nothing is removed yet.
         // A repeated name is deduplicated (PG collects the targets into a set, so `DROP TABLE a, a`
-        // drops `a` once and succeeds); `seen` is the set of lowercased keys actually being dropped.
+        // drops `a` once and succeeds); `seen` is the set of exact keys actually being dropped.
         let mut targets: Vec<(String, Scope)> = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
         for name in &dt.names {
-            let key = name.to_ascii_lowercase();
+            let key = name.to_string();
             if seen.contains(&key) {
                 continue; // already resolved this exact target (deduplicated)
             }
@@ -4200,7 +4081,7 @@ impl Engine {
     /// list order, must exist (42703) and be of a key-encodable type (0A000 — the same
     /// narrowing as a PRIMARY KEY member); then an explicit name is checked against the
     /// shared relation namespace (42P07), or an omitted name derives PG's choice — the
-    /// lowercased `<table>_<col>..._idx` with the smallest free suffix. The index is then
+    /// exact `<table>_<col>..._idx` with the smallest free suffix. The index is then
     /// built by scanning the table once: `page_read` per node + `storage_row_read` per row
     /// (the metered build scan — cost.md §3); maintenance thereafter is unmetered.
     pub(crate) fn execute_create_index(&mut self, ci: CreateIndex) -> Result<Outcome> {
@@ -4217,7 +4098,7 @@ impl Engine {
         self.check_attachment_writable(ci.db.as_deref())?;
         self.check_table_qualifier(ci.db.as_deref(), &ci.table)?; // attached-databases.md §3
         let attach_name: Option<String> = if is_attachment_scope(ci.db.as_deref()) {
-            ci.db.as_ref().map(|d| d.to_ascii_lowercase())
+            ci.db.as_ref().map(|d| d.to_string())
         } else {
             None
         };
@@ -4229,7 +4110,7 @@ impl Engine {
                     format!("table does not exist: {}", ci.table),
                 )
             })?;
-        let table_key = table.name.to_ascii_lowercase();
+        let table_key = table.name.to_string();
         let columns = table.columns.clone();
         // Refuse building a collated index on a version-skewed table (slice 2d, collation.md §12,
         // XX002): the new B-tree would be pinned inconsistently with the file's other structures.
@@ -4241,7 +4122,7 @@ impl Engine {
         // B-tree, `gin` a GIN inverted index; an unknown method is 42704. Resolved here (not in the
         // parser) so the error is the resolve-time undefined_object, after the table-exists check
         // and before the column checks.
-        let kind = match ci.using.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        let kind = match ci.using.as_deref().map(str::to_string).as_deref() {
             None | Some("btree") => IndexKind::Btree,
             Some("gin") => IndexKind::Gin,
             Some("gist") => IndexKind::Gist,
@@ -4515,7 +4396,7 @@ impl Engine {
                 n.clone()
             }
             None => {
-                // PG's ChooseIndexName / ChooseIndexColumnNames (probed): lowercased table + one
+                // PG's ChooseIndexName / ChooseIndexColumnNames (probed): exact table + one
                 // name part per key element (list order, duplicates included) + "idx", then the
                 // smallest free suffix. A column key's part is the column name; a bare-function-call
                 // expression's is the function name (`lower(email)` → `lower`); any other
@@ -4617,7 +4498,7 @@ impl Engine {
         }
         meter.guard()?;
 
-        let name_key = def.name.to_ascii_lowercase();
+        let name_key = def.name.to_string();
         let ps = self.page_size;
         // Register the index catalog entry + its (empty) store in the snapshot that owns the table
         // (the resolution walk — temp-tables.md §2/§8): a session-local temp table's index lives in the
@@ -4667,17 +4548,14 @@ impl Engine {
                 format!("{} is not an index", di.name),
             ));
         }
-        let name_key = di.name.to_ascii_lowercase();
+        let name_key = di.name.to_string();
         // An index that backs an EXCLUDE constraint cannot be dropped directly — the constraint owns
         // it (the UNIQUE-backing precedent; jed has no ALTER TABLE … DROP CONSTRAINT yet, so the
         // index lives until DROP TABLE). 2BP01, matching PG's "cannot drop index … because
         // constraint … requires it" (spec/design/gist.md §7).
         if let Some(table_key) = self.find_index(&di.name).map(|(tk, _)| tk.to_string()) {
             if let Some(t) = self.table(&table_key) {
-                if t.exclusions
-                    .iter()
-                    .any(|e| e.index.eq_ignore_ascii_case(&di.name))
-                {
+                if t.exclusions.iter().any(|e| e.index == di.name) {
                     return Err(EngineError::new(
                         SqlState::DependentObjectsStillExist,
                         format!(
@@ -4725,7 +4603,7 @@ impl Engine {
         }
         let mut fields: Vec<CompositeField> = Vec::with_capacity(ct.fields.len());
         for f in &ct.fields {
-            if fields.iter().any(|g| g.name.eq_ignore_ascii_case(&f.name)) {
+            if fields.iter().any(|g| g.name == f.name) {
                 return Err(EngineError::new(
                     SqlState::DuplicateColumn,
                     format!("attribute {} specified more than once", f.name),
@@ -4859,7 +4737,7 @@ impl Engine {
                 ),
             ));
         }
-        let key = dt.name.to_ascii_lowercase();
+        let key = dt.name.to_string();
         self.working_mut().remove_type(&key);
         Ok(Outcome::Statement {
             cost: 0,
@@ -5015,15 +4893,12 @@ impl Engine {
         // and store must survive, so this mutates the catalog column, not via `put_table`. The owner
         // table is always present (its DROP TABLE would have auto-dropped this sequence first).
         if let Some(owner) = &existing.owned_by {
-            let expr_text = format!(
-                "nextval ( '{}' )",
-                new_name.to_ascii_lowercase().replace('\'', "''")
-            );
+            let expr_text = nextval_default_text(new_name);
             let expr = crate::parser::parse_expression(&expr_text)?;
             // Route to the owner's scope so a renamed owned TEMP sequence rewrites its column default
             // in the temp snapshot (temp-tables.md §8).
             self.set_column_default_expr_routed(
-                &owner.table.to_ascii_lowercase(),
+                &owner.table.to_string(),
                 owner.column as usize,
                 DefaultExpr { expr_text, expr },
             );
@@ -5031,7 +4906,7 @@ impl Engine {
         // Capture the owning scope BEFORE the remove: after dropping the old key the new name is in no
         // scope, so a post-remove route would wrongly default to the main image (temp-tables.md §8).
         let is_temp = self.is_temp_sequence(&existing.name);
-        let old_key = existing.name.to_ascii_lowercase();
+        let old_key = existing.name.to_string();
         let mut def = existing.clone();
         def.name = new_name.to_string();
         let w = if is_temp {
@@ -5310,4 +5185,15 @@ mod partial_index_tests {
             "a non-partial index has NULL predicate"
         );
     }
+}
+
+/// The canonical expression text of an owned sequence's generated `DEFAULT nextval('<seq>')`
+/// (space-joined tokens, constraints.md §2). The sequence name is written by grammar.md §3's
+/// quoting rule inside the string — bare when a plain lowercase identifier, else `"…"` — so the
+/// regclass-style text parse resolves it exactly; the string literal then doubles any `'`.
+pub(crate) fn nextval_default_text(seqname: &str) -> String {
+    format!(
+        "nextval ( '{}' )",
+        crate::parser::quote_identifier(seqname).replace('\'', "''")
+    )
 }

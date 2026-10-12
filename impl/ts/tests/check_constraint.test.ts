@@ -266,9 +266,9 @@ test("round-trips through the on-disk image", () => {
   assert.deepEqual(
     loaded.table("t")!.checks.map((c) => [c.name, c.exprText]),
     [
-      ["price_range", "price >= 0.50 AND price <= 9999.99"],
+      ["price_range", "price >= 0.50 and price <= 9999.99"],
       ["t_b_check", "b > 0"],
-      ["t_note_check", "note = 'ok' OR note = 'a''b'"],
+      ["t_note_check", "note = 'ok' or note = 'a''b'"],
     ],
   );
   // Still enforced, with the same message.

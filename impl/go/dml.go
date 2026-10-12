@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"slices"
-	"strings"
 )
 
 func singleValuesInsertEligible(candidateCount int, hasConflict bool) bool {
@@ -84,7 +83,7 @@ type insertCache struct {
 }
 
 func (db *engine) insertTargetSignature(dbScope *string, tableName string) (insertTargetSignature, bool) {
-	table := strings.ToLower(tableName)
+	table := tableName
 	var snap *snapshot
 	if dbScope == nil {
 		if _, ok := db.tempSnap().tableByKey(table); ok {
@@ -92,13 +91,13 @@ func (db *engine) insertTargetSignature(dbScope *string, tableName string) (inse
 		}
 		snap = db.readSnap()
 	} else {
-		switch strings.ToLower(*dbScope) {
+		switch *dbScope {
 		case "temp":
 			return insertTargetSignature{}, false
 		case "main":
 			snap = db.readSnap()
 		default:
-			snap = db.attachReadSnap(strings.ToLower(*dbScope))
+			snap = db.attachReadSnap(*dbScope)
 		}
 	}
 	if snap == nil {
@@ -117,7 +116,7 @@ func (db *engine) insertTargetSignature(dbScope *string, tableName string) (inse
 // not change this signature, so the first INSERT in a long transaction can fill and the remainder
 // can hit; working DDL (including unrelated catalog DDL) makes it differ and therefore cannot fill.
 func (db *engine) committedInsertTargetSignature(dbScope *string, tableName string) (insertTargetSignature, bool) {
-	table := strings.ToLower(tableName)
+	table := tableName
 	var snap *snapshot
 	if dbScope == nil {
 		if _, ok := db.tempSnap().tableByKey(table); ok {
@@ -125,13 +124,13 @@ func (db *engine) committedInsertTargetSignature(dbScope *string, tableName stri
 		}
 		snap = db.committed
 	} else {
-		switch strings.ToLower(*dbScope) {
+		switch *dbScope {
 		case "temp":
 			return insertTargetSignature{}, false
 		case "main":
 			snap = db.committed
 		default:
-			snap = db.attachedCommitted[strings.ToLower(*dbScope)]
+			snap = db.attachedCommitted[*dbScope]
 		}
 	}
 	if snap == nil {
@@ -659,12 +658,12 @@ func resolveArbiter(table *catTable, target *conflictTarget) (*arbiter, error) {
 		return nil, newError(InvalidColumnReference,
 			"there is no unique or exclusion constraint matching the ON CONFLICT specification")
 	}
-	pkey := strings.ToLower(table.Name) + "_pkey"
-	if len(pk) > 0 && strings.EqualFold(target.Constraint, pkey) {
+	pkey := table.Name + "_pkey"
+	if len(pk) > 0 && target.Constraint == pkey {
 		return &arbiter{isPK: true}, nil
 	}
 	for i, def := range table.Indexes {
-		if def.Unique && strings.EqualFold(def.Name, target.Constraint) {
+		if def.Unique && def.Name == target.Constraint {
 			return &arbiter{indexPos: i}, nil
 		}
 	}
@@ -799,7 +798,7 @@ func (db *engine) arbiterExisting(arb *arbiter, store *tableStore, table *catTab
 		return ak, row, true, nil
 	}
 	def := table.Indexes[arb.indexPos]
-	istore := db.lkpIndexStore(strings.ToLower(def.Name))
+	istore := db.lkpIndexStore(def.Name)
 	entries, err := istore.RangeEntries(uniqueProbeBound(ak))
 	if err != nil {
 		return nil, nil, false, err
@@ -849,7 +848,7 @@ func (db *engine) rowConflictsCommitted(store *tableStore, table *catTable, pk [
 		if !ok {
 			continue
 		}
-		entries, err := db.lkpIndexStore(strings.ToLower(rindex.Name)).RangeEntries(uniqueProbeBound(prefix))
+		entries, err := db.lkpIndexStore(rindex.Name).RangeEntries(uniqueProbeBound(prefix))
 		if err != nil {
 			return false, err
 		}
@@ -1788,7 +1787,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 			if !ok {
 				continue
 			}
-			istore := db.lkpIndexStoreScoped(dbScope, strings.ToLower(rindex.Name))
+			istore := db.lkpIndexStoreScoped(dbScope, rindex.Name)
 			stored, err := istore.RangeEntries(uniqueProbeBound(prefix))
 			if err != nil {
 				return nil, err
@@ -1840,7 +1839,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 		// Only a self-reference can satisfy against this statement's batch (a different parent
 		// table is unchanged by this INSERT). Collect the parent keys the batch supplies.
 		batch := make(map[string]struct{})
-		if strings.EqualFold(fk.RefTable, relation) {
+		if fk.RefTable == relation {
 			for _, pr := range prepared {
 				probe, ok, err := buildFkProbe(fk, parent, parentColls, pr.row, fk.RefColumns)
 				if err != nil {
@@ -1952,7 +1951,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 		}
 	}
 	for k, def := range table.Indexes {
-		istore := db.writeIndexStoreScoped(dbScope, strings.ToLower(def.Name))
+		istore := db.writeIndexStoreScoped(dbScope, def.Name)
 		for _, ek := range indexInserts[k] {
 			inserted, err := istore.Insert(ek, nil)
 			if err != nil {
@@ -2026,7 +2025,7 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 		if !ok {
 			continue
 		}
-		stored, err := db.lkpIndexStoreScoped(dbScope, strings.ToLower(rindex.Name)).RangeEntries(uniqueProbeBound(prefix))
+		stored, err := db.lkpIndexStoreScoped(dbScope, rindex.Name).RangeEntries(uniqueProbeBound(prefix))
 		if err != nil {
 			return nil, err
 		}
@@ -2062,7 +2061,7 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 		parentColls := db.columnCollations(parent.Columns)
 		var supplied fkProbe
 		suppliedOK := false
-		if strings.EqualFold(fk.RefTable, relation) {
+		if fk.RefTable == relation {
 			supplied, suppliedOK, err = buildFkProbe(fk, parent, parentColls, row, fk.RefColumns)
 			if err != nil {
 				return nil, err
@@ -2122,7 +2121,7 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 		return nil, newUniqueViolation(table.Name, pkeyName(table.Name))
 	}
 	for i, def := range table.Indexes {
-		istore := db.writeIndexStoreScoped(dbScope, strings.ToLower(def.Name))
+		istore := db.writeIndexStoreScoped(dbScope, def.Name)
 		for _, entry := range indexEntries[i] {
 			inserted, err := istore.Insert(entry, nil)
 			if err != nil {
@@ -2156,7 +2155,7 @@ func (db *engine) insertExclusionConflictsStored(columns []catColumn, exc exclus
 	if err != nil || !ok {
 		return false, err
 	}
-	tree := db.readSnap().gistTreeFor(strings.ToLower(exc.Index))
+	tree := db.readSnap().gistTreeFor(exc.Index)
 	if tree == nil {
 		return false, nil
 	}
@@ -2440,7 +2439,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 		for _, ix := range uniqIdx {
 			def := table.Indexes[ix]
 			rindex := &rindexes[ix]
-			istore := db.lkpIndexStore(strings.ToLower(def.Name))
+			istore := db.lkpIndexStore(def.Name)
 			batch := make(map[string]struct{})
 			for _, newRow := range newRows {
 				prefix, ok, err := db.indexPrefix(store.colTypes, colls, rindex, newRow)
@@ -2500,7 +2499,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 		}
 		// End-state referenced keys this statement supplies, for a self-reference.
 		batch := make(map[string]struct{})
-		if strings.EqualFold(fk.RefTable, relation) {
+		if fk.RefTable == relation {
 			for _, row := range inserts {
 				probe, ok, err := buildFkProbe(fk, parent, parentColls, row, fk.RefColumns)
 				if err != nil {
@@ -2673,7 +2672,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 		}
 	}
 	for k, def := range table.Indexes {
-		istore := db.writeIndexStore(strings.ToLower(def.Name))
+		istore := db.writeIndexStore(def.Name)
 		for _, ek := range indexAdds[k] {
 			inserted, err := istore.Insert(ek, nil)
 			if err != nil {
@@ -3134,7 +3133,7 @@ func (db *engine) applyFkUpdateActions(parent *catTable, updates []fkUpdateTrans
 // same-named session-temp overlap.
 func (db *engine) mainDmlTarget(scope *string, table string) bool {
 	if scope != nil {
-		return strings.EqualFold(*scope, "main")
+		return *scope == "main"
 	}
 	return !db.isTempTable(table)
 }
@@ -3371,7 +3370,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 		}
 	}
 	for k, def := range table.Indexes {
-		istore := db.writeIndexStoreScoped(del.DB, strings.ToLower(def.Name))
+		istore := db.writeIndexStoreScoped(del.DB, def.Name)
 		for _, ek := range toRemove[k] {
 			if _, err := istore.Remove(ek); err != nil {
 				return outcome{}, err
@@ -3812,7 +3811,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 				continue
 			}
 			rindex := &rindexes[ix]
-			istore := db.lkpIndexStoreScoped(upd.DB, strings.ToLower(def.Name))
+			istore := db.lkpIndexStoreScoped(upd.DB, def.Name)
 			batch := make(map[string]struct{})
 			for _, u := range updates {
 				prefix, ok, err := db.indexPrefix(store.colTypes, colls, rindex, u.row)
@@ -3857,7 +3856,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			rewritten[string(u.key)] = struct{}{}
 		}
 		for _, exc := range table.Exclusions {
-			ikey := strings.ToLower(exc.Index)
+			ikey := exc.Index
 			for _, u := range updates {
 				q, strats, ok, err := exclusionProbeQuery(table.Columns, exc, u.row)
 				if err != nil {
@@ -3924,7 +3923,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 		// PARENT's collation (§2.12).
 		parentColls := db.columnCollations(parent.Columns)
 		batch := make(map[string]struct{})
-		if strings.EqualFold(fk.RefTable, relation) {
+		if fk.RefTable == relation {
 			for _, u := range updates {
 				probe, ok, err := buildFkProbe(fk, parent, parentColls, u.row, fk.RefColumns)
 				if err != nil {
@@ -4044,7 +4043,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			}
 		}
 		for k, def := range table.Indexes {
-			istore := db.writeIndexStoreScoped(upd.DB, strings.ToLower(def.Name))
+			istore := db.writeIndexStoreScoped(upd.DB, def.Name)
 			for _, mv := range indexMoves[k] {
 				for _, oldEk := range mv.removals {
 					if _, err := istore.Remove(oldEk); err != nil {
@@ -4072,7 +4071,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			}
 		}
 		for k, def := range table.Indexes {
-			istore := db.writeIndexStoreScoped(upd.DB, strings.ToLower(def.Name))
+			istore := db.writeIndexStoreScoped(upd.DB, def.Name)
 			for _, mv := range indexMoves[k] {
 				for _, oldEk := range mv.removals {
 					if _, err := istore.Remove(oldEk); err != nil {
@@ -4113,7 +4112,7 @@ func (db *engine) RowsInKeyOrder(name string) []storedRow {
 	if db.isTempTable(name) { // temp tables live in the session temp snapshot (temp-tables.md §2)
 		snap = db.tempSnap()
 	}
-	store, ok := snap.stores[strings.ToLower(name)]
+	store, ok := snap.stores[name]
 	if !ok {
 		return nil
 	}

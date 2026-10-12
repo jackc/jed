@@ -96,3 +96,34 @@ fn type_and_primary_key_rewrites_match_fresh_table_bytes() {
     ]);
     assert_eq!(altered, fresh);
 }
+
+/// A RENAME rewrite substitutes the new name into persisted expression text as a QUOTED
+/// identifier (grammar.md §3, alter.md §2.2) — even a plain lowercase name — while untouched tokens
+/// keep their stored (folded) spelling, and the text survives a serialize → load round trip. The
+/// corpus (ddl/alter_table.test) pins the behavior; this pins the persisted bytes of the text.
+#[test]
+fn rename_rewrite_quotes_the_substituted_name() {
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TABLE r (a i32 CHECK (a > 0), b i32 CHECK (B IS NULL OR b > a))",
+    );
+    run(&mut db, "ALTER TABLE r RENAME COLUMN a TO \"null\"");
+    run(&mut db, "ALTER TABLE r RENAME COLUMN b TO plain");
+    let texts = |db: &Session| -> Vec<String> {
+        let t = db.table("r").unwrap();
+        t.checks.iter().map(|c| c.expr_text.clone()).collect()
+    };
+    let want = vec![
+        "\"null\" > 0".to_string(),
+        "\"plain\" is null or \"plain\" > \"null\"".to_string(),
+    ];
+    assert_eq!(texts(&db), want);
+    let image = db.to_image(8192, 1).unwrap();
+    let loaded = Database::from_image(&image)
+        .unwrap()
+        .session(SessionOptions::default());
+    assert_eq!(texts(&loaded), want);
+}

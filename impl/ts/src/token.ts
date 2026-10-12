@@ -1,13 +1,14 @@
 // Lexer tokens. TokenKind is a string-literal union (not a TS enum — elidable subset).
 
 export type TokenKind =
-  | "word" // a bare word: keyword or identifier (compared case-insensitively)
+  | "word" // a bare word: keyword or identifier, already FOLDED to lowercase by the lexer
+  //          (spec/design/grammar.md §3), so keyword and name comparisons are byte-exact
   | "int" // an integer literal's unsigned magnitude (the sign is "minus")
   | "decimal" // a decimal literal (a numeric literal with a "."); see `decDigits`/`decScale`
   | "str" // a single-quoted string literal's decoded content (the text type)
-  | "quotedIdent" // a double-quoted identifier's decoded content ("en-US", "C") — kept VERBATIM
-  //                (case-sensitive); used for collation names (spec/design/collation.md §1). The only
-  //                parse position that consumes one today is COLLATE "name", so it is a 42601 elsewhere.
+  | "quotedIdent" // a double-quoted identifier's decoded content ("userId", "en-US") — kept VERBATIM
+  //                (case-sensitive, any UTF-8). A name wherever an identifier is accepted and NEVER a
+  //                keyword (spec/design/grammar.md §3); collation names accept only this form.
   | "comma" // ,
   | "dot" // . — the separator of a qualified column reference (t.col); emitted only when a
   //         "." is NOT part of a numeric literal (spec/design/grammar.md §4/§15)

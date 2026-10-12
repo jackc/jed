@@ -112,7 +112,11 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // element), the collation name (u16 len + UTF-8) following the element descriptor; a collated
 // text[] key encodes each present element as its UCA sort key (spec/design/collation.md §1,
 // encoding.md §2.14).
-const FORMAT_VERSION: u16 = 36;
+// v37: exact (folded) identifier names — no byte layout change; every catalog name is stored and
+// compared byte-exactly, every name-ordered group sorts by ascending byte order of the exact name,
+// and persisted expression text renders bare words folded and quoted identifiers as `"…"`
+// (spec/design/grammar.md §3).
+const FORMAT_VERSION: u16 = 37;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -1367,7 +1371,7 @@ impl Snapshot {
         }
         let cap = ps - PAGE_HEADER;
 
-        // Tables in ascending lowercased-name order (no hash-map order leak).
+        // Tables in ascending name byte order (no hash-map order leak).
         let mut tables = self.catalog_and_stores();
         tables.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -1403,7 +1407,7 @@ impl Snapshot {
                     }
                     root
                 } else {
-                    let istore = self.index_store(&idx.name.to_ascii_lowercase());
+                    let istore = self.index_store(&idx.name.to_string());
                     match istore.tree_root() {
                         Some(root) => {
                             serialize_node(root, istore, cap, &mut next_index, &mut body)?
@@ -1416,7 +1420,7 @@ impl Snapshot {
         }
 
         // The catalog chain follows the data; its head is the relocatable `root_page`. Each entry
-        // is kind-tagged (v9): composite-type entries (kind 1) first in lowercased-name order,
+        // is kind-tagged (v9): composite-type entries (kind 1) first in name byte order,
         // then table entries (kind 0) — spec/fileformat/format.md.
         let cat_root = next_index;
         let mut cat_entries: Vec<Vec<u8>> = Vec::new();
@@ -1921,7 +1925,7 @@ impl Snapshot {
                     }
                     root
                 } else {
-                    let istore = self.index_store(&idx.name.to_ascii_lowercase());
+                    let istore = self.index_store(&idx.name.to_string());
                     match istore.tree_root() {
                         Some(root) => serialize_dirty(
                             root,
@@ -2432,7 +2436,7 @@ impl Engine {
                     } else {
                         istore.attach_paging(paging.clone());
                     }
-                    snap.put_index_store(idx.name.to_ascii_lowercase(), istore);
+                    snap.put_index_store(idx.name.to_string(), istore);
                 }
             }
             cat_page = page.next_page;
@@ -2924,7 +2928,7 @@ fn serialize_gist_index<A: FnMut() -> u32>(
         .iter()
         .map(|&ci| crate::gist::opclass_for(&table.columns[ci].ty))
         .collect();
-    let istore = snap.index_store(&idx.name.to_ascii_lowercase());
+    let istore = snap.index_store(&idx.name.to_string());
     let keys: Vec<Vec<u8>> = istore.iter_entries()?.into_iter().map(|(k, _)| k).collect();
     if keys.is_empty() {
         return Ok((Vec::new(), 0));
@@ -3304,7 +3308,7 @@ fn decode_statistics_entry(
 ) -> Result<()> {
     let subkind = read_u8(buf, pos)?;
     let table_name = read_string(buf, pos)?;
-    let table_key = table_name.to_ascii_lowercase();
+    let table_key = table_name.to_string();
     let column = read_u16(buf, pos)? as usize;
     let table = snapshot
         .table(&table_key)
@@ -3590,7 +3594,7 @@ fn table_entry_bytes(
     // Secondary indexes (v5): count, then per index the name, key-column ordinals
     // (index-key order, duplicates allowed), the v6 flags byte (bit0 unique —
     // spec/design/indexes.md §8), and its tree's root page — in the catalog's ascending
-    // lowercased-name order (spec/design/indexes.md §6).
+    // name byte order (spec/design/indexes.md §6).
     debug_assert_eq!(table.indexes.len(), index_roots.len());
     out.extend_from_slice(&(table.indexes.len() as u16).to_be_bytes());
     for (idx, &root) in table.indexes.iter().zip(index_roots) {
@@ -3651,7 +3655,7 @@ fn table_entry_bytes(
     // Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS
     // table, list order), the referenced table name, the referenced-column ordinals (into the
     // PARENT, list order), and the v30 actions byte (bits 0-2 on_delete, bits 3-5 on_update) — in the
-    // catalog's ascending lowercased-name order (spec/design/constraints.md §6.9). An FK owns no
+    // catalog's ascending name byte order (spec/design/constraints.md §6.9). An FK owns no
     // B-tree (no root page).
     out.extend_from_slice(&(table.foreign_keys.len() as u16).to_be_bytes());
     for fk in &table.foreign_keys {
@@ -3673,7 +3677,7 @@ fn table_entry_bytes(
     }
     // EXCLUDE constraints (v21): count, then per exclusion the name, the backing GiST index name,
     // and the `(column ordinal, operator strategy)` element vector — in the catalog's ascending
-    // lowercased-name order (spec/design/gist.md §7/§8). The backing index is stored like any GiST
+    // name byte order (spec/design/gist.md §7/§8). The backing index is stored like any GiST
     // index (in the index list above); this entry layers the operator vector the §7 probe needs.
     out.extend_from_slice(&(table.exclusions.len() as u16).to_be_bytes());
     for exc in &table.exclusions {
@@ -4750,7 +4754,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         });
     }
     // Secondary indexes (v5): name + key-column ordinals + the v6 flags byte (bit0
-    // unique; the rest reserved-zero) + root page, in the catalog's (lowercased-name
+    // unique; the rest reserved-zero) + root page, in the catalog's (name byte
     // ascending) order — a reader trusts the order. Duplicate ordinals within one index
     // are legal (indexes.md §1).
     let index_count = read_u16(buf, pos)? as usize;
@@ -4878,7 +4882,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         });
     }
     // Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the
-    // actions byte, in the catalog's (lowercased-name ascending) order — a reader trusts the
+    // actions byte, in the catalog's (name byte order ascending) order — a reader trusts the
     // order. The local ordinals index THIS table; the referenced ordinals index the PARENT (whose
     // entry may be decoded later, so they are not cross-checked here — the writer keeps them
     // valid; a structurally impossible FK is rejected below).
@@ -4923,7 +4927,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         });
     }
     // EXCLUDE constraints (v21): name + backing index name + the `(column ordinal, operator)`
-    // element vector, in the catalog's (lowercased-name ascending) order — a reader trusts the
+    // element vector, in the catalog's (name byte order ascending) order — a reader trusts the
     // order. The column ordinals index THIS table (spec/design/gist.md §7/§8).
     let exc_count = read_u16(buf, pos)? as usize;
     let mut exclusions = Vec::with_capacity(exc_count);

@@ -87,7 +87,7 @@ classification. UTC interval arithmetic retains jed's existing [interval.md](int
 
 **Namespace.** Index names live in the **relation namespace, shared with tables**
 (PostgreSQL's model): a `CREATE INDEX` whose name (explicit) collides with an existing
-table *or* index — case-insensitively, jed's identifier rule — is **42P07**
+table *or* index — byte-exact on the name, jed's identifier rule ([grammar.md §3](grammar.md)) — is **42P07**
 `relation already exists: {name}`; symmetrically `CREATE TABLE` of an existing *index*
 name is the same 42P07. The 42P07 registry template is now the PG word "relation"
 (covering both kinds); previously "table", a message-text-only change (matching is on
@@ -117,7 +117,8 @@ code — [../errors/registry.toml](../errors/registry.toml)).
    cannot collide.
 
 **Auto-naming** (PostgreSQL's `ChooseIndexName` / `ChooseIndexColumnNames`, probed): the
-base is the **lowercased** `<table>_<part>_<part>..._idx` — one **name part** per key
+base is `<table>_<part>_<part>..._idx`, built from the **exact** names (no case change — a quoted
+`"Foo"` table gives `Foo_…_idx`, as PostgreSQL) — one **name part** per key
 element in list order, joined with `_`, where the part is:
 
 - a **column key** → the **column name** (`lower(email), a` → parts `lower`, `a`);
@@ -126,11 +127,11 @@ element in list order, joined with `_`, where the part is:
 - any **other expression** → the literal `expr` (`(a + b)` → `expr`, `(email || 'x')` →
   `expr`).
 
-If the base is taken (case-insensitive), try `<base>1`, `<base>2`, … and take the smallest
+If the base is taken (byte-exact), try `<base>1`, `<base>2`, … and take the smallest
 free suffix — so `CREATE INDEX ON t (lower(email))` then `CREATE UNIQUE INDEX ON t (lower(email))`
-yield `t_lower_idx`, `t_lower_idx1` (probed). An explicit name is stored **as written**
-(original case round-trips; comparisons are case-insensitive) — same rule as table and
-CHECK-constraint names.
+yield `t_lower_idx`, `t_lower_idx1` (probed). An explicit name is stored as the **name** (bare spellings fold to lowercase, quoted
+spellings are exact; comparisons are byte-exact — [grammar.md §3](grammar.md)) — same rule as
+table and CHECK-constraint names.
 
 **`CREATE UNIQUE INDEX`** validates identically; its auto-name keeps the `_idx` suffix
 (the `_key` spelling belongs to the `UNIQUE` *constraint* — constraints.md §5.3). Before
@@ -257,7 +258,7 @@ second bound kind. Candidate detection remains the following complete structural
 
 For a one-base-relation SELECT, the planner chooses the minimum complete-pipeline estimated cost
 among the PK candidate, every eligible B-tree/GiST/GIN/interval candidate, and full scan; exact ties
-use kind then lowest lowercased index name ([estimator.md §9.1](estimator.md)). Eligible
+use kind then lowest index name by byte order ([estimator.md §9.1](estimator.md)). Eligible
 multi-relation SELECTs feed the same access inventories into the bounded join search. UPDATE/DELETE
 choose their target path from the same inventory by the same estimate and tie order
 ([estimator.md §9.3](estimator.md)).
@@ -288,7 +289,7 @@ key operand on either side, `BETWEEN` desugared):
 - Stop at the first element with no usable term.
 
 The bound is used iff it is **non-empty** — at least one leading equality, or a leading
-range. The chosen index is the lowest-lowercased-name index that produces one.
+range. The chosen index is the lowest-name (byte order) index that produces one.
 
 **Execution.** Let `P` be the encoded equality prefix — the `0x00 ‖ encode(vᵢ)` slot of
 each prefix column's agreed value, concatenated ([encoding.md §2.2](encoding.md) present
@@ -374,7 +375,7 @@ The catalog reshape (v5) + the unique flag (v6)
   and **lifts the composite-PK order narrowing**: `PRIMARY KEY (b, a)` is now legal —
   list order is key order, persisted independently of declaration order
   ([constraints.md §3](constraints.md)).
-- The table entry gains its **index list**: per index, the name (original case) + a
+- The table entry gains its **index list**: per index, the name (exact bytes) + a
   **key-element list** (key order, duplicates allowed) + a **flags byte** (`bit0 unique` —
   added in v6; **`bit1 has_predicate`** — added in v27, §9; the remaining bits are reserved,
   written 0 and read-validated) + the index tree's **root page**, then — **only when `bit1`
@@ -383,7 +384,7 @@ The catalog reshape (v5) + the unique flag (v6)
   predicate re-parses (`XX001` on failure, like a stored CHECK) and re-resolves against the
   loaded table's columns per statement (never persisted-resolved — a deterministic function of
   the column types). A non-partial index writes no `bit1` and no predicate bytes and is
-  byte-identical to v26. Indexes are stored and held in **ascending lowercased-name order**
+  byte-identical to v26. Indexes are stored and held in **ascending name byte order**
   (the catalog's deterministic order, like checks; also the §5 tie-break order and the §8
   violation-report order).
 - **Each key element** is a `u16`: a **column ordinal** (`< col_count`) for a column key,
@@ -429,8 +430,8 @@ The catalog reshape (v5) + the unique flag (v6)
 - **UPDATE uniqueness is validated against the statement's end state**, not per-row in
   heap order — PG fails `UPDATE t SET v = v + 1` on a unique `v` where jed succeeds (§8;
   the overriding reason is the two-phase / all-or-nothing model, CLAUDE.md §11 step 6).
-- When one row violates **several** unique indexes, jed reports the lowest lowercased
-  name; PG reports creation order, which jed does not persist (constraints.md §5.4).
+- When one row violates **several** unique indexes, jed reports the lowest name (byte
+  order); PG reports creation order, which jed does not persist (constraints.md §5.4).
 
 ## 8. UNIQUE indexes (the enforcement)
 

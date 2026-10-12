@@ -3,7 +3,6 @@ package jed
 import (
 	"fmt"
 	"sort"
-	"strings"
 )
 
 // Statement execution entry, transaction control, and sequence runtime. This file holds the top-level
@@ -415,7 +414,7 @@ func (db *engine) rollbackTx() (outcome, error) {
 // statement success (flushPendingSequences). A missing sequence is 42P01; advancing past a bound
 // without CYCLE is 2200H.
 func (db *engine) seqNextval(name string) (int64, error) {
-	key := strings.ToLower(name)
+	key := name
 	var def sequenceDef
 	if db.session.pendingSeq != nil {
 		if d, ok := db.session.pendingSeq[key]; ok {
@@ -481,7 +480,7 @@ func (db *engine) seqNextval(name string) (int64, error) {
 // true the value also defines this session's currval (PG: isCalled=false leaves currval untouched).
 // setval never updates lastval (PG — §6).
 func (db *engine) seqSetval(name string, n int64, isCalled bool) (int64, error) {
-	key := strings.ToLower(name)
+	key := name
 	var def sequenceDef
 	if d, ok := db.session.pendingSeq[key]; ok {
 		def = *d
@@ -520,7 +519,7 @@ func (db *engine) seqCurrval(name string) (int64, error) {
 	if db.sequence(name) == nil {
 		return 0, newError(UndefinedTable, "relation does not exist: "+name)
 	}
-	key := strings.ToLower(name)
+	key := name
 	if v, ok := db.session.pendingCurrval[key]; ok {
 		return v, nil
 	}

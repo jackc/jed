@@ -6,7 +6,6 @@ import (
 	"slices"
 	"sort"
 	"strconv"
-	"strings"
 )
 
 // alterConstraintState is the statement-local catalog work needed by ALTER TABLE slice 2. The
@@ -51,7 +50,7 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 	// column only on its referenced side is still a dependency, like an FK from another table.
 	fkUsesLocalColumn := func(fk foreignKey) bool { return slices.Contains(fk.Columns, ci) }
 	fkUsesSelfRefColumn := func(fk foreignKey) bool {
-		return strings.EqualFold(fk.RefTable, t.Name) && slices.Contains(fk.RefColumns, ci)
+		return fk.RefTable == t.Name && slices.Contains(fk.RefColumns, ci)
 	}
 	selfRefFkDep := false
 	for _, fk := range t.ForeignKeys {
@@ -60,7 +59,7 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 	incomingDep := false
 	if source := droppedSource; source.original >= 0 {
 		for key, base := range snap.tables {
-			if strings.EqualFold(key, oldKey) {
+			if key == oldKey {
 				continue
 			}
 			child := base
@@ -68,7 +67,7 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 				child = changed
 			}
 			for _, fk := range child.ForeignKeys {
-				if strings.EqualFold(fk.RefTable, original.Name) && slices.Contains(fk.RefColumns, source.original) {
+				if fk.RefTable == original.Name && slices.Contains(fk.RefColumns, source.original) {
 					incomingDep = true
 				}
 			}
@@ -80,7 +79,7 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 	if d.Cascade && (*sources)[ci].original >= 0 {
 		oldColumn := (*sources)[ci].original
 		for key, base := range snap.tables {
-			if strings.EqualFold(key, oldKey) {
+			if key == oldKey {
 				continue
 			}
 			child := base
@@ -89,7 +88,7 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 			}
 			fks := make([]foreignKey, 0, len(child.ForeignKeys))
 			for _, fk := range child.ForeignKeys {
-				if strings.EqualFold(fk.RefTable, original.Name) && slices.Contains(fk.RefColumns, oldColumn) {
+				if fk.RefTable == original.Name && slices.Contains(fk.RefColumns, oldColumn) {
 					continue
 				}
 				fks = append(fks, fk)
@@ -107,7 +106,7 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 	checks := t.Checks[:0]
 	for _, c := range t.Checks {
 		if usesExpr(c.Expr) {
-			delete(st.added, strings.ToLower(c.Name))
+			delete(st.added, c.Name)
 		} else {
 			checks = append(checks, c)
 		}
@@ -116,7 +115,7 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 	indexes := t.Indexes[:0]
 	for _, ix := range t.Indexes {
 		if indexUses(ix) {
-			delete(st.added, strings.ToLower(ix.Name))
+			delete(st.added, ix.Name)
 		} else {
 			indexes = append(indexes, ix)
 		}
@@ -129,7 +128,7 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 			uses = uses || el.Column == ci
 		}
 		if uses {
-			delete(st.added, strings.ToLower(ex.Name))
+			delete(st.added, ex.Name)
 		} else {
 			exclusions = append(exclusions, ex)
 		}
@@ -140,7 +139,7 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 	fks := t.ForeignKeys[:0]
 	for _, fk := range t.ForeignKeys {
 		if fkUsesLocalColumn(fk) || (d.Cascade && fkUsesSelfRefColumn(fk)) {
-			delete(st.added, strings.ToLower(fk.Name))
+			delete(st.added, fk.Name)
 		} else {
 			fks = append(fks, fk)
 		}
@@ -166,7 +165,7 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 				t.ForeignKeys[i].Columns[j]--
 			}
 		}
-		if strings.EqualFold(t.ForeignKeys[i].RefTable, t.Name) {
+		if t.ForeignKeys[i].RefTable == t.Name {
 			for j := range t.ForeignKeys[i].RefColumns {
 				if t.ForeignKeys[i].RefColumns[j] > ci {
 					t.ForeignKeys[i].RefColumns[j]--
@@ -194,7 +193,7 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 	}
 	kept := (*pending)[:0]
 	for _, seq := range *pending {
-		if seq.OwnedBy == nil || !strings.EqualFold(seq.OwnedBy.Table, t.Name) {
+		if seq.OwnedBy == nil || seq.OwnedBy.Table != t.Name {
 			kept = append(kept, seq)
 			continue
 		}
@@ -216,22 +215,22 @@ func newAlterConstraintState() *alterConstraintState {
 
 func constraintNameTaken(t *catTable, name string) bool {
 	for _, c := range t.Checks {
-		if strings.EqualFold(c.Name, name) {
+		if c.Name == name {
 			return true
 		}
 	}
 	for _, i := range t.Indexes {
-		if i.Unique && strings.EqualFold(i.Name, name) {
+		if i.Unique && i.Name == name {
 			return true
 		}
 	}
 	for _, f := range t.ForeignKeys {
-		if strings.EqualFold(f.Name, name) {
+		if f.Name == name {
 			return true
 		}
 	}
 	for _, e := range t.Exclusions {
-		if strings.EqualFold(e.Name, name) {
+		if e.Name == name {
 			return true
 		}
 	}
@@ -262,9 +261,9 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 			}
 		} else {
 			refs := checkReferencedColumns(d.Expr, t.Columns)
-			base := strings.ToLower(t.Name) + "_check"
+			base := t.Name + "_check"
 			if len(refs) == 1 {
-				base = strings.ToLower(t.Name) + "_" + strings.ToLower(t.Columns[refs[0]].Name) + "_check"
+				base = t.Name + "_" + t.Columns[refs[0]].Name + "_check"
 			}
 			name = base
 			for n := 1; constraintNameTaken(t, name); n++ {
@@ -272,8 +271,8 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 			}
 		}
 		t.Checks = append(t.Checks, checkConstraint{Name: name, ExprText: d.Text, Expr: d.Expr, HostDeps: hostDeps})
-		sort.SliceStable(t.Checks, func(i, j int) bool { return strings.ToLower(t.Checks[i].Name) < strings.ToLower(t.Checks[j].Name) })
-		st.added[strings.ToLower(name)] = true
+		sort.SliceStable(t.Checks, func(i, j int) bool { return t.Checks[i].Name < t.Checks[j].Name })
+		st.added[name] = true
 		return nil
 	}
 	if def.Unique != nil {
@@ -305,9 +304,9 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 				return newError(DuplicateObject, "constraint "+name+" for relation "+t.Name+" already exists")
 			}
 		} else {
-			base := strings.ToLower(t.Name)
+			base := t.Name
 			for _, ci := range cols {
-				base += "_" + strings.ToLower(t.Columns[ci].Name)
+				base += "_" + t.Columns[ci].Name
 			}
 			base += "_key"
 			name = base
@@ -316,8 +315,8 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 			}
 		}
 		t.Indexes = append(t.Indexes, indexDef{Name: name, Keys: columnKeys(cols), Unique: true, Kind: indexBtree})
-		sort.SliceStable(t.Indexes, func(i, j int) bool { return strings.ToLower(t.Indexes[i].Name) < strings.ToLower(t.Indexes[j].Name) })
-		st.added[strings.ToLower(name)] = true
+		sort.SliceStable(t.Indexes, func(i, j int) bool { return t.Indexes[i].Name < t.Indexes[j].Name })
+		st.added[name] = true
 		return nil
 	}
 	if def.Foreign != nil {
@@ -334,7 +333,7 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 			local = append(local, ci)
 		}
 		var parent *catTable
-		if strings.EqualFold(d.RefTable, t.Name) {
+		if d.RefTable == t.Name {
 			parent = t
 		} else {
 			parent, _ = snap.table(d.RefTable)
@@ -369,9 +368,9 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 				return newError(DuplicateObject, "constraint "+name+" for relation "+t.Name+" already exists")
 			}
 		} else {
-			base := strings.ToLower(t.Name)
+			base := t.Name
 			for _, ci := range local {
-				base += "_" + strings.ToLower(t.Columns[ci].Name)
+				base += "_" + t.Columns[ci].Name
 			}
 			base += "_fkey"
 			name = base
@@ -407,13 +406,13 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 		}
 		t.ForeignKeys = append(t.ForeignKeys, foreignKey{Name: name, Columns: local, RefTable: parent.Name, RefColumns: refs, OnDelete: onDelete, OnUpdate: onUpdate})
 		sort.SliceStable(t.ForeignKeys, func(i, j int) bool {
-			return strings.ToLower(t.ForeignKeys[i].Name) < strings.ToLower(t.ForeignKeys[j].Name)
+			return t.ForeignKeys[i].Name < t.ForeignKeys[j].Name
 		})
-		st.added[strings.ToLower(name)] = true
+		st.added[name] = true
 		return nil
 	}
 	d := def.Exclude
-	if d.Using != "" && !strings.EqualFold(d.Using, "gist") {
+	if d.Using != "" && d.Using != "gist" {
 		return newError(UndefinedObject, "access method "+d.Using+" does not support exclusion constraints")
 	}
 	cols := make([]int, 0, len(d.Elements))
@@ -460,9 +459,9 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 			return newError(DuplicateObject, "constraint "+name+" for relation "+t.Name+" already exists")
 		}
 	} else {
-		base := strings.ToLower(t.Name)
+		base := t.Name
 		for _, ci := range cols {
-			base += "_" + strings.ToLower(t.Columns[ci].Name)
+			base += "_" + t.Columns[ci].Name
 		}
 		base += "_excl"
 		name = base
@@ -471,36 +470,36 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 		}
 	}
 	t.Indexes = append(t.Indexes, indexDef{Name: name, Keys: columnKeys(cols), Kind: indexGist})
-	sort.SliceStable(t.Indexes, func(i, j int) bool { return strings.ToLower(t.Indexes[i].Name) < strings.ToLower(t.Indexes[j].Name) })
+	sort.SliceStable(t.Indexes, func(i, j int) bool { return t.Indexes[i].Name < t.Indexes[j].Name })
 	t.Exclusions = append(t.Exclusions, exclusionConstraint{Name: name, Index: name, Elements: elements})
 	sort.SliceStable(t.Exclusions, func(i, j int) bool {
-		return strings.ToLower(t.Exclusions[i].Name) < strings.ToLower(t.Exclusions[j].Name)
+		return t.Exclusions[i].Name < t.Exclusions[j].Name
 	})
-	st.added[strings.ToLower(name)] = true
+	st.added[name] = true
 	return nil
 }
 
 func (db *engine) dropAlterConstraint(t *catTable, d *dropConstraintDef, snap *snapshot, sources []alterColumnSource, st *alterConstraintState) error {
-	nameKey := strings.ToLower(d.Name)
+	nameKey := d.Name
 	for i, c := range t.Checks {
-		if strings.EqualFold(c.Name, d.Name) {
+		if c.Name == d.Name {
 			t.Checks = slices.Delete(t.Checks, i, i+1)
 			delete(st.added, nameKey)
 			return nil
 		}
 	}
 	for i, f := range t.ForeignKeys {
-		if strings.EqualFold(f.Name, d.Name) {
+		if f.Name == d.Name {
 			t.ForeignKeys = slices.Delete(t.ForeignKeys, i, i+1)
 			delete(st.added, nameKey)
 			return nil
 		}
 	}
 	for i, e := range t.Exclusions {
-		if strings.EqualFold(e.Name, d.Name) {
+		if e.Name == d.Name {
 			t.Exclusions = slices.Delete(t.Exclusions, i, i+1)
 			for j, ix := range t.Indexes {
-				if strings.EqualFold(ix.Name, e.Index) {
+				if ix.Name == e.Index {
 					t.Indexes = slices.Delete(t.Indexes, j, j+1)
 					break
 				}
@@ -510,7 +509,7 @@ func (db *engine) dropAlterConstraint(t *catTable, d *dropConstraintDef, snap *s
 		}
 	}
 	for i, ix := range t.Indexes {
-		if ix.Unique && strings.EqualFold(ix.Name, d.Name) {
+		if ix.Unique && ix.Name == d.Name {
 			cols := sortedUnique(ix.columnOrdinals())
 			var originalCols []int
 			for _, col := range cols {
@@ -528,15 +527,15 @@ func (db *engine) dropAlterConstraint(t *catTable, d *dropConstraintDef, snap *s
 				fk  foreignKey
 			}
 			for _, fk := range t.ForeignKeys {
-				if strings.EqualFold(fk.RefTable, t.Name) && slices.Equal(sortedUnique(fk.RefColumns), cols) {
+				if fk.RefTable == t.Name && slices.Equal(sortedUnique(fk.RefColumns), cols) {
 					deps = append(deps, struct {
 						key string
 						fk  foreignKey
-					}{strings.ToLower(t.Name), fk})
+					}{t.Name, fk})
 				}
 			}
 			for key, base := range snap.tables {
-				if strings.EqualFold(key, t.Name) {
+				if key == t.Name {
 					continue
 				}
 				ot := base
@@ -544,7 +543,7 @@ func (db *engine) dropAlterConstraint(t *catTable, d *dropConstraintDef, snap *s
 					ot = changed
 				}
 				for _, fk := range ot.ForeignKeys {
-					if originalCols != nil && strings.EqualFold(fk.RefTable, t.Name) && slices.Equal(sortedUnique(fk.RefColumns), originalCols) {
+					if originalCols != nil && fk.RefTable == t.Name && slices.Equal(sortedUnique(fk.RefColumns), originalCols) {
 						deps = append(deps, struct {
 							key string
 							fk  foreignKey
@@ -557,9 +556,9 @@ func (db *engine) dropAlterConstraint(t *catTable, d *dropConstraintDef, snap *s
 			}
 			if d.Cascade {
 				for _, dep := range deps {
-					if dep.key == strings.ToLower(t.Name) {
+					if dep.key == t.Name {
 						for j := len(t.ForeignKeys) - 1; j >= 0; j-- {
-							if strings.EqualFold(t.ForeignKeys[j].Name, dep.fk.Name) {
+							if t.ForeignKeys[j].Name == dep.fk.Name {
 								t.ForeignKeys = slices.Delete(t.ForeignKeys, j, j+1)
 							}
 						}
@@ -573,7 +572,7 @@ func (db *engine) dropAlterConstraint(t *catTable, d *dropConstraintDef, snap *s
 							st.other[dep.key] = ot
 						}
 						for j := len(ot.ForeignKeys) - 1; j >= 0; j-- {
-							if strings.EqualFold(ot.ForeignKeys[j].Name, dep.fk.Name) {
+							if ot.ForeignKeys[j].Name == dep.fk.Name {
 								ot.ForeignKeys = slices.Delete(ot.ForeignKeys, j, j+1)
 							}
 						}
@@ -630,7 +629,7 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 	var checks []namedCheck
 	for i := range t.Checks {
 		c := &t.Checks[i]
-		if !st.added[strings.ToLower(c.Name)] {
+		if !st.added[c.Name] {
 			continue
 		}
 		node, _, err := resolve(singleScope(db, t), c.Expr, nil, &aggCtx{collecting: false}, &paramTypes{})
@@ -649,7 +648,7 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 	// identity marker for a newly-added backing index. This distinguishes DROP+ADD reuse of an old
 	// name from an unchanged old index whose store may be retained.
 	for _, ix := range t.Indexes {
-		nk := strings.ToLower(ix.Name)
+		nk := ix.Name
 		if st.added[nk] {
 			entries[nk] = nil
 		}
@@ -671,7 +670,7 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 			}
 		}
 		for _, ix := range t.Indexes {
-			nk := strings.ToLower(ix.Name)
+			nk := ix.Name
 			if !st.added[nk] {
 				continue
 			}
@@ -704,11 +703,11 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 	// FK validation uses byte-identical parent probes. A self-reference checks the scanned end state;
 	// other parents are unchanged by this statement and can use their existing PK/UNIQUE stores.
 	for _, fk := range t.ForeignKeys {
-		if !st.added[strings.ToLower(fk.Name)] {
+		if !st.added[fk.Name] {
 			continue
 		}
 		var parent *catTable
-		if strings.EqualFold(fk.RefTable, t.Name) {
+		if fk.RefTable == t.Name {
 			parent = t
 		} else {
 			parent, _ = snap.table(fk.RefTable)
@@ -758,7 +757,7 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 		}
 	}
 	for _, ex := range t.Exclusions {
-		if !st.added[strings.ToLower(ex.Name)] {
+		if !st.added[ex.Name] {
 			continue
 		}
 		for i := 0; i < len(rows); i++ {

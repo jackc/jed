@@ -1594,7 +1594,7 @@ impl Engine {
     }
 
     /// Shared read access to a secondary index's store (the index is known to exist). `name_key` is
-    /// the lowercased index name; a temp table's index lives in the temp snapshot (temp-tables.md §8).
+    /// the exact index name; a temp table's index lives in the temp snapshot (temp-tables.md §8).
     /// Walks session-local → main.
     pub(crate) fn index_store(&self, name_key: &str) -> &TableStore {
         if self.temp_read_snap().has_index_store(name_key) {
@@ -1765,7 +1765,7 @@ impl Engine {
             let ix = child
                 .indexes
                 .iter()
-                .find(|ix| ix.name.to_ascii_lowercase() == *name)
+                .find(|ix| ix.name.to_string() == *name)
                 .expect("the reverse-path index exists");
             for key in &ix.keys[path.cols.len()..] {
                 let c = key
@@ -1818,19 +1818,19 @@ impl Engine {
     }
 
     /// Every (child table name, FK) pair in the visible snapshot whose FK references `parent_name`
-    /// (case-insensitive), including a self-reference — the inbound FKs a parent DELETE/UPDATE must
-    /// not strand (spec/design/constraints.md §6.5). Sorted by (lowercased child table, FK name) for
+    /// (exact name), including a self-reference — the inbound FKs a parent DELETE/UPDATE must
+    /// not strand (spec/design/constraints.md §6.5). Sorted by (child table name, FK name) for
     /// a deterministic report order; cloned so the caller can probe stores without a snapshot borrow.
     pub(crate) fn fk_referencers(&self, parent_name: &str) -> Vec<(String, ForeignKeyConstraint)> {
         let snap = self.read_snap();
-        let key = parent_name.to_ascii_lowercase();
+        let key = parent_name.to_string();
         let mut out: Vec<(String, ForeignKeyConstraint)> = Vec::new();
         let mut tkeys: Vec<&String> = snap.tables.keys().collect();
         tkeys.sort();
         for tk in tkeys {
             let t = &snap.tables[tk];
             for fk in &t.foreign_keys {
-                if fk.ref_table.eq_ignore_ascii_case(&key) {
+                if fk.ref_table == key {
                     out.push((t.name.clone(), fk.clone()));
                 }
             }
@@ -1838,13 +1838,13 @@ impl Engine {
         out
     }
 
-    /// Find the table owning the named index in the visible snapshot (case-insensitive).
+    /// Find the table owning the named index in the visible snapshot (exact name).
     pub(crate) fn find_index(&self, name: &str) -> Option<(&str, &IndexDef)> {
         self.read_snap().find_index(name)
     }
 
     /// Whether `name` is taken in the shared relation namespace (a table OR an index —
-    /// spec/design/indexes.md §2), case-insensitively.
+    /// spec/design/indexes.md §2), by exact name.
     pub(crate) fn relation_exists(&self, name: &str) -> bool {
         // `self.table` already covers session-local temp tables (the resolution walk); the temp
         // snapshot's index names join the namespace too, so a name colliding with a temp table's
@@ -1868,16 +1868,12 @@ impl Engine {
         pending: &[SequenceDef],
         reserved: &[String],
     ) -> String {
-        let base = format!(
-            "{}_{}_seq",
-            table.to_ascii_lowercase(),
-            column.to_ascii_lowercase()
-        );
+        let base = format!("{}_{}_seq", table, column);
         let taken = |c: &str| {
             self.relation_exists(c)
-                || c.eq_ignore_ascii_case(table)
-                || pending.iter().any(|s| s.name.eq_ignore_ascii_case(c))
-                || reserved.iter().any(|name| name.eq_ignore_ascii_case(c))
+                || c == table
+                || pending.iter().any(|s| s.name == c)
+                || reserved.iter().any(|name| name == c)
         };
         if !taken(&base) {
             return base;

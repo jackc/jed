@@ -980,7 +980,7 @@ impl Engine {
             columns.extend(0..table.columns.len());
         } else {
             for name in &analyze.columns {
-                let key = name.to_ascii_lowercase();
+                let key = name.to_string();
                 if !seen.insert(key.clone()) {
                     return Err(EngineError::new(
                         SqlState::DuplicateColumn,
@@ -990,7 +990,7 @@ impl Engine {
                 let column = table
                     .columns
                     .iter()
-                    .position(|column| column.name.eq_ignore_ascii_case(name))
+                    .position(|column| column.name == *name)
                     .ok_or_else(|| {
                         EngineError::new(
                             SqlState::UndefinedColumn,
@@ -1121,7 +1121,7 @@ impl Engine {
         let database = match analyze.db.as_deref() {
             None if self.is_temp_table(&analyze.name) => "temp".to_string(),
             None => "main".to_string(),
-            Some(scope) => scope.to_ascii_lowercase(),
+            Some(scope) => scope.to_string(),
         };
         let target = match database.as_str() {
             "temp" => self.temp_working_mut(),

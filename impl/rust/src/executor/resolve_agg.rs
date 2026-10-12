@@ -409,7 +409,7 @@ pub(crate) fn natural_common_cols(left_names: &[&str], right: &ScopeRel) -> Vec<
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for &name in left_names {
-        if seen.insert(name.to_ascii_lowercase()) && right.table.column_index(name).is_some() {
+        if seen.insert(name.to_string()) && right.table.column_index(name).is_some() {
             out.push(name.to_string());
         }
     }
@@ -458,21 +458,21 @@ pub(crate) fn family_matches(slot: &str, t: &ResolvedType) -> bool {
     slot == "any" || arg_family(t) == Some(slot)
 }
 
-/// Whether `name` (case-insensitive) is a registered scalar function (catalog kind="function").
+/// Whether `name` (exact, grammar.md §3) is a registered scalar function (catalog kind="function").
 /// This is the data-driven replacement for the old hand-written known-name gate.
 pub(crate) fn is_scalar_func_name(name: &str) -> bool {
     OPERATORS
         .iter()
-        .any(|o| o.kind == "function" && o.name.eq_ignore_ascii_case(name))
+        .any(|o| o.kind == "function" && o.name == name)
 }
 
-/// Whether `name` (case-insensitive) is a VARIADIC scalar function (array-functions.md §12) — a
+/// Whether `name` (exact, grammar.md §3) is a VARIADIC scalar function (array-functions.md §12) — a
 /// `kind="function"` row with `variadic = true` (`num_nulls`/`num_nonnulls`). Data-driven, so
 /// adding a variadic row to the catalog wires it here without touching this gate.
 pub(crate) fn is_variadic_func_name(name: &str) -> bool {
     OPERATORS
         .iter()
-        .any(|o| o.kind == "function" && o.variadic && o.name.eq_ignore_ascii_case(name))
+        .any(|o| o.kind == "function" && o.variadic && o.name == name)
 }
 
 /// The matched scalar-function overload row for `name` over the resolved argument types: the
@@ -669,13 +669,13 @@ pub(crate) fn resolved_to_scalar(t: &ResolvedType) -> Option<ScalarType> {
 // `anyelement` slot's type, by structural equality (`ResolvedType: Eq`), and read back into the
 // reserved result codes `anyarray` (= ELEM[]) and `anyelement` (= ELEM).
 
-/// Whether `name` (case-insensitive) is a polymorphic array function — a `kind="function"`
+/// Whether `name` (exact, grammar.md §3) is a polymorphic array function — a `kind="function"`
 /// catalog row whose `arg_families` mention `anyarray`/`anyelement`. Data-driven, so adding an
 /// array-function row to the catalog wires it here without touching this gate.
 pub(crate) fn is_array_func_name(name: &str) -> bool {
     OPERATORS.iter().any(|o| {
         o.kind == "function"
-            && o.name.eq_ignore_ascii_case(name)
+            && o.name == name
             && o.arg_families
                 .iter()
                 .any(|f| *f == "anyarray" || *f == "anyelement")
@@ -856,7 +856,7 @@ pub(crate) fn elem_scalar_hint(t: &ResolvedType) -> Option<ScalarType> {
 /// `array_length`/`lower`/`upper` keeps its pass-1 resolution.)
 pub(crate) fn resolve_array_func(
     scope: &Scope,
-    name: &str, // already lowercased
+    name: &str, // the exact (folded) name
     args: &[Expr],
     agg: &mut AggCtx,
     params: &mut ParamTypes,
@@ -904,14 +904,12 @@ pub(crate) fn resolve_array_func(
     ))
 }
 
-/// Whether `name` (case-insensitive) is a polymorphic range function — a `kind="function"` catalog
+/// Whether `name` (exact, grammar.md §3) is a polymorphic range function — a `kind="function"` catalog
 /// row whose `arg_families` mention `anyrange` (range-functions.md §1). Data-driven, so a new
 /// range-function row wires here without touching this gate.
 pub(crate) fn is_range_func_name(name: &str) -> bool {
     OPERATORS.iter().any(|o| {
-        o.kind == "function"
-            && o.name.eq_ignore_ascii_case(name)
-            && o.arg_families.iter().any(|f| *f == "anyrange")
+        o.kind == "function" && o.name == name && o.arg_families.iter().any(|f| *f == "anyrange")
     })
 }
 
@@ -936,7 +934,7 @@ pub(crate) fn range_func_id(name: &str) -> RangeFunc {
 /// (the bound type), the rest to boolean.
 pub(crate) fn resolve_range_func(
     scope: &Scope,
-    name: &str, // already lowercased
+    name: &str, // the exact (folded) name
     args: &[Expr],
     agg: &mut AggCtx,
     params: &mut ParamTypes,
@@ -986,7 +984,7 @@ pub(crate) fn resolve_range_func(
 /// result the range's element type); anything else is `42883` (no overload).
 pub(crate) fn resolve_lower_upper(
     scope: &Scope,
-    name: &str, // "lower" | "upper", already lowercased
+    name: &str, // "lower" | "upper", the exact (folded) name
     args: &[Expr],
     agg: &mut AggCtx,
     params: &mut ParamTypes,
@@ -1106,7 +1104,7 @@ pub(crate) fn resolve_date_trunc(
     ))
 }
 
-/// Whether `name` (case-insensitive) is a range CONSTRUCTOR call (range-functions.md §2): a call
+/// Whether `name` (exact, grammar.md §3) is a range CONSTRUCTOR call (range-functions.md §2): a call
 /// whose name is a range type name or alias (`i32range`/`int4range`/`numrange`/…). The constructor
 /// functions are the only ones whose name is a range type name, so `range::range_by_name` resolving
 /// is exactly the gate — data-driven over the RANGES table, no hand-written name list.
@@ -1141,7 +1139,7 @@ pub(crate) fn range_bound_assignable(t: &ResolvedType, elem: ScalarType) -> bool
 /// element coercion (assignment-style, 22003), the flags parse (42601 / 22000), and `finalize`.
 pub(crate) fn resolve_range_ctor(
     scope: &Scope,
-    name: &str, // already lowercased
+    name: &str, // the exact (folded) name
     args: &[Expr],
     agg: &mut AggCtx,
     params: &mut ParamTypes,
@@ -1178,12 +1176,24 @@ pub(crate) fn resolve_range_ctor(
     ))
 }
 
-/// Whether aggregate `surface` (case-insensitive) has a `COUNT(*)`-style star overload — only
+/// Whether a function NAME (already folded / exact, grammar.md §3) names the catalog `surface`
+/// spelling. Catalog surfaces are a fixed vocabulary authored in uppercase (`COUNT`), so the name
+/// matches the surface's lowercase spelling byte-exactly — `count` resolves, a quoted `"COUNT"`
+/// does not (PostgreSQL's rule).
+pub(crate) fn surface_matches(surface: &str, name: &str) -> bool {
+    surface.len() == name.len()
+        && surface
+            .bytes()
+            .zip(name.bytes())
+            .all(|(s, n)| s.to_ascii_lowercase() == n)
+}
+
+/// Whether aggregate `surface` (lowercase function name) has a `COUNT(*)`-style star overload — only
 /// COUNT does. The data-driven replacement for the special-cased `_ if star` arm.
 pub(crate) fn aggregate_has_star(surface: &str) -> bool {
     AGGREGATES
         .iter()
-        .any(|a| a.surface.eq_ignore_ascii_case(surface) && a.arg == "star")
+        .any(|a| surface_matches(a.surface, surface) && a.arg == "star")
 }
 
 /// The matched aggregate overload row for `surface` over a single operand of resolved type `t`:
@@ -1194,7 +1204,7 @@ pub(crate) fn lookup_aggregate_overload(
     t: &ResolvedType,
 ) -> Option<&'static AggregateDesc> {
     AGGREGATES.iter().find(|a| {
-        a.surface.eq_ignore_ascii_case(surface)
+        surface_matches(a.surface, surface)
             && a.arg == "expr"
             && a.arg_families.len() == 1
             && family_matches(a.arg_families[0], t)
@@ -1205,7 +1215,7 @@ pub(crate) fn lookup_aggregate_overload(
 /// overload's `surface` + catalog `result` code (the PG widening — aggregates.md §3). The plan
 /// is the aggregate's kernel id (fold/finalize switch on it); selecting it from the registered
 /// `result` code keeps the name gate + overload validation data-driven while the kernel stays
-/// hand-written (§5). `surface` is the lowercased call name; `result` the matched row's code.
+/// hand-written (§5). `surface` is the (folded) call name; `result` the matched row's code.
 pub(crate) fn aggregate_plan(
     surface: &str,
     result: &str,
@@ -1532,7 +1542,7 @@ pub(crate) fn resolve_ordered_set_aggregate(
         None => None,
     };
 
-    let lname = name.to_ascii_lowercase();
+    let lname = name.to_string();
     let (plan, frac, result) = match lname.as_str() {
         "mode" => {
             // mode() takes no direct argument; mode(x) matches no overload (42883).
@@ -1638,7 +1648,7 @@ pub(crate) fn resolve_ordered_set_aggregate(
 /// window functions; the `WITHIN GROUP` clause routes them here instead of the window path.
 pub(crate) fn is_hypothetical_set_name(name: &str) -> bool {
     matches!(
-        name.to_ascii_lowercase().as_str(),
+        name.to_string().as_str(),
         "rank" | "dense_rank" | "percent_rank" | "cume_dist"
     )
 }
@@ -1672,7 +1682,7 @@ pub(crate) fn resolve_hypothetical_set_aggregate(
             "DISTINCT is not allowed with ordered-set aggregates",
         ));
     }
-    let lname = name.to_ascii_lowercase();
+    let lname = name.to_string();
     // The number of hypothetical direct arguments must match the number of ordering columns (PG
     // models a mismatch as a missing overload → 42883).
     if args.is_empty() || args.len() != keys.len() {
@@ -2001,15 +2011,13 @@ pub(crate) fn no_agg_overload(func: &str) -> EngineError {
     )
 }
 
-/// Whether `name` (case-insensitive) is a registered aggregate surface (COUNT/SUM/MIN/MAX/AVG).
+/// Whether `name` (exact, grammar.md §3) is a registered aggregate surface (COUNT/SUM/MIN/MAX/AVG).
 /// Data-driven over the catalog (`AGGREGATES`); consulted by the grouping + CHECK-structure walks.
 /// The ordered-set aggregates (`is_ordered_set_aggregate_name`) are aggregates for these purposes
 /// too — they fold a set of rows — but are not catalog rows (their result/arg mold is special,
 /// like `GROUPING()`), so they are OR'd in here rather than carried in `AGGREGATES`.
 pub(crate) fn is_aggregate_name(name: &str) -> bool {
-    AGGREGATES
-        .iter()
-        .any(|a| a.surface.eq_ignore_ascii_case(name))
+    AGGREGATES.iter().any(|a| surface_matches(a.surface, name))
         || object_agg_classify(name).is_some()
         || is_ordered_set_aggregate_name(name)
 }
@@ -2018,7 +2026,7 @@ pub(crate) fn is_aggregate_name(name: &str) -> bool {
 /// 2-argument aggregates are hand-resolved (the single-operand aggregate catalog can't express a
 /// key/value pair), like `jsonb_set` among the scalar functions. (json-sql-functions.md §4)
 pub(crate) fn object_agg_classify(name: &str) -> Option<(bool, bool)> {
-    match name.to_ascii_lowercase().as_str() {
+    match name.to_string().as_str() {
         "jsonb_object_agg" => Some((false, false)),
         "json_object_agg" => Some((true, false)),
         "jsonb_object_agg_unique" => Some((false, true)),
@@ -2032,7 +2040,7 @@ pub(crate) fn object_agg_classify(name: &str) -> Option<(bool, bool)> {
 /// by `resolve_ordered_set_aggregate`, intercepted before the generic aggregate/scalar dispatch.
 pub(crate) fn is_ordered_set_aggregate_name(name: &str) -> bool {
     matches!(
-        name.to_ascii_lowercase().as_str(),
+        name.to_string().as_str(),
         "mode" | "percentile_cont" | "percentile_disc"
     )
 }
@@ -2042,7 +2050,7 @@ pub(crate) fn is_ordered_set_aggregate_name(name: &str) -> bool {
 /// 42P20 (spec/design/window.md §7). The catalog aggregates double as window functions but are not
 /// in `WINDOWS`, so they are still valid without `OVER`.
 pub(crate) fn is_window_only_name(name: &str) -> bool {
-    WINDOWS.iter().any(|w| w.surface.eq_ignore_ascii_case(name))
+    WINDOWS.iter().any(|w| surface_matches(w.surface, name))
 }
 
 /// Resolve a window-function call `f(args) OVER (window_definition)` (spec/design/window.md §5.1).
@@ -2060,7 +2068,7 @@ pub(crate) fn resolve_window_call(
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
-    let lname = name.to_ascii_lowercase();
+    let lname = name.to_string();
     // Validate the context and build the sub-context window ARGUMENTS *and keys* resolve in
     // (spec/design/window.md §5.1). In a grouped query (`GroupedWindow`) they resolve against the
     // grouped row — a nested aggregate collects into the query's SHARED `agg_specs` and a bare column

@@ -89,7 +89,7 @@ query TT nosort
 SELECT type, expression FROM jed_constraints WHERE table_name = 'checked' ORDER BY name
 ----
 check
-a + b < 100 AND c <> 5
+a + b < 100 and c <> 5
 
 # --- UNIQUE: a bare CREATE UNIQUE INDEX is a uniqueness constraint too (jed's model) --------------
 

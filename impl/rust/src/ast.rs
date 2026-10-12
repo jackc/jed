@@ -1051,7 +1051,7 @@ pub enum Expr {
     /// of a composite `base`. The parser produces this for a `.name` postfix on a parenthesized /
     /// `ROW(…)` / cast / qualified-column base; a bare `a.b` stays `QualifiedColumn` and only falls
     /// back to field access at resolve when `a` is no relation but a composite column (the ambiguity
-    /// rule — table.column first, then column.field). Field lookup is case-insensitive; an unknown
+    /// rule — table.column first, then column.field). Field lookup is byte-exact on the folded name; an unknown
     /// field is 42703, a non-composite base 42809.
     FieldAccess {
         base: Box<Expr>,
@@ -1260,7 +1260,7 @@ pub enum Expr {
         greatest: bool,
     },
     /// A function call — the shared aggregate/scalar call syntax (grammar.md §17). `name` is
-    /// the spelling as written, resolved case-insensitively: an aggregate (COUNT/SUM/MIN/MAX/
+    /// the (folded or quoted) name, resolved byte-exactly: an aggregate (COUNT/SUM/MIN/MAX/
     /// AVG, kind = "aggregate"), a scalar function (abs/round, kind = "function",
     /// spec/design/functions.md §9), or 42883 (undefined_function). `star` is the `COUNT(*)`
     /// row-count form (then `args` is empty); otherwise `args` is the comma-separated argument

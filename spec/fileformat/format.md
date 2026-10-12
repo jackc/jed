@@ -17,7 +17,21 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 36)
+## Version scope (`format_version` 37)
+
+`format_version` **37** — **exact (folded) identifier names**
+([../design/grammar.md §3](../design/grammar.md)). No byte layout changes; the *meaning* of every
+persisted name changes. Bare identifiers now fold to lowercase in the lexer and quoted identifiers
+are exact, so every catalog name (table, column, index, sequence, composite type and field,
+constraint, collation reference) is stored and compared **byte-exactly**, and every name-ordered
+group below sorts by **ascending byte order of the exact name** (through v36: of the lowercased
+name; the two orders agree whenever no name contains an uppercase ASCII letter). Persisted
+expression text renders a bare word as its folded (lowercase) spelling — keywords included — and a
+name that is not a plain lowercase identifier as a quoted identifier, so it re-lexes to the same
+names. A v36 file is refused like any other non-current version: its names were written under
+case-insensitive resolution and its expression text in original case, which the v37 rules would
+misresolve. A file whose names, keywords, and expression text were all lowercase changes only by
+its version byte + meta CRC. Readers accept only the exact current version.
 
 `format_version` **36** — **`text[]` column collations**
 ([../design/collation.md §1](../design/collation.md)). An array column entry's `flags` byte gains
@@ -222,7 +236,7 @@ GX3). The table entry gains a per-table **exclusion list** *after* the foreign-k
 `root_data_page`): `excl_count u16`, then per exclusion the constraint **name** (`u16` length +
 UTF-8), the backing **GiST index name** (`u16` length + UTF-8), and an **element vector**
 (`elem_count u16`, then per element a `column_ordinal u16` + an `operator_strategy u8` — `&&` = 0,
-`=` = 1) — in ascending lowercased-name order (*Exclusion list* in the *Catalog* section below). The
+`=` = 1) — in ascending name byte order (*Exclusion list* in the *Catalog* section below). The
 backing GiST index is stored like any GiST index, but the **index list now admits multi-column GiST
 indexes**: a leaf/interior bound is the per-column component bounds **concatenated** (each `range_ops`
 range body or scalar `[min,max]` key blob), so a single-column GX1/GX2 index is byte-unchanged. An
@@ -323,7 +337,7 @@ and adds no value-codec change, so the only on-disk change is a **third kind of 
 fixed `i64` fields (`increment`, `min_value`, `max_value`, `start`, `cache`, `last_value`), and a
 `flags` byte (bit 0 `cycle`, bit 1 `is_called`) — the *Sequence entry* table in the *Catalog* section
 below. Emission order across the catalog is **composite-type entries (kind 1), then sequence
-entries (kind 2), then table entries (kind 0)**, each group in ascending lowercased-name order; a
+entries (kind 2), then table entries (kind 0)**, each group in ascending name byte order; a
 sequence is referenced by nothing at load (a `DEFAULT nextval('s')` is stored expr-text, resolved at
 evaluation), so it needs no two-pass.
 
@@ -357,7 +371,7 @@ coupled changes, all in the catalog (the per-table data B-tree and the meta page
 
 1. **Every catalog entry gains a leading `entry_kind` u8**: `0` = a table entry (the v8 layout,
    unchanged after this byte), `1` = a composite-type entry. Composite-type entries are emitted
-   **first** (ascending lowercased-name order), then table entries (ascending lowercased-name
+   **first** (ascending name byte order), then table entries (ascending name byte
    order); `item_count` counts all entries, packed greedily exactly as before. The catalog stays
    a uniform "sequence of entries" — no special head page, no separate page chain.
 2. **A composite-type entry** carries the type's name and ordered field list (the *Composite-type
@@ -418,7 +432,7 @@ reserved (written 0, read-validated).
    declaration order is now expressible — which lifted the composite-PK order narrowing
    ([../design/constraints.md](../design/constraints.md) §3).
 2. The catalog table entry gains the table's **index list** (name + key-column ordinals +
-   root page, in ascending lowercased-name order).
+   root page, in ascending name byte order).
 3. Each index is an on-disk **B-tree of empty-payload records** — the same node pages,
    split/merge rules, and commit model as a table tree; only the record's value-column
    count (zero) differs (*The per-table data B+tree* below).
@@ -695,13 +709,13 @@ a sequence entry ([../design/sequences.md §3](../design/sequences.md)), `3` = a
 ([../design/statistics.md §7](../design/statistics.md)). Entries are emitted in kind order
 **composite-type (1), then sequence (2), then collation (3), table (0), then statistics (4)**, each
 object group in ascending
-lowercased-name order (collations sort by their exact, case-sensitive name). Each page's `item_count` is the number of entries (of any kind) it holds;
+name byte order (v37: every group, collations included, sorts by its exact name). Each page's `item_count` is the number of entries (of any kind) it holds;
 entries are packed greedily into the chain, kind-tagged in stream order, exactly as table entries
 were through v8 (a single entry must fit one page, i.e. ≤ `C`, else `0A000`; the `RECORD_MAX = C/2`
 cap is a B-tree-record rule and does **not** apply to catalog entries, which never split). Each group
-is emitted in **ascending order of the lowercased name** (the engine stores each object set in a hash
-map keyed by lowercased name; sorting by that key removes any iteration-order leak — CLAUDE.md §8;
-names are unique after lowercasing, so there are no ties).
+is emitted in **ascending byte order of the name** (the engine stores each object set in a map
+keyed by the exact name; sorting by that key removes any iteration-order leak — CLAUDE.md §8;
+names are unique, so there are no ties).
 
 **Load is two-pass (v9):** the reader walks the whole chain collecting every composite-type entry
 into a name→definition map, validates that every composite **referenced** by a column or a field
@@ -779,18 +793,18 @@ columns and the index list after the checks, and retires column-flag bit0):
 | `row_count` | i64 — **new in v28**: exact nonnegative table cardinality, eight-byte big-endian two's-complement; must be `0..i64::MAX`, and `(root_data_page == 0) == (row_count == 0)` or the file is `XX001` |
 
 Columns are emitted in declaration order. Checks are emitted in their **evaluation order** —
-ascending byte order of the lowercased `check_name` ([../design/constraints.md
+ascending byte order of the `check_name` ([../design/constraints.md
 §4.4](../design/constraints.md)); a reader trusts that order (it never re-sorts). Indexes
-are emitted in **ascending byte order of the lowercased `index_name`** (the catalog's
+are emitted in **ascending byte order of the `index_name`** (the catalog's
 in-memory order and the planner's tie-break order — [../design/indexes.md
 §5/§6](../design/indexes.md)); a reader trusts that order too. Foreign keys are emitted in
-**ascending byte order of the lowercased `fk_name`** (the catalog's in-memory order and the
+**ascending byte order of the `fk_name`** (the catalog's in-memory order and the
 §6.4 child-side evaluation order — [../design/constraints.md §6.9](../design/constraints.md));
 the reader trusts that order. A foreign key owns no B-tree, so it stores no root page; the
 referenced table/column ordinals are resolved by name against the loaded catalog, and a
 reference to a missing table or out-of-range parent column in an otherwise-valid file is
 `XX001`. **Exclusion constraints** (v21) are emitted **after** the foreign-key list, in
-**ascending byte order of the lowercased `excl_name`** (the catalog's in-memory order —
+**ascending byte order of the `excl_name`** (the catalog's in-memory order —
 [../design/gist.md §7/§8](../design/gist.md)); the reader trusts that order. An exclusion
 constraint owns no extra B-tree (its backing GiST index is in the index list); an out-of-range
 `excl_col_ordinal` or an unknown `excl_op` in an otherwise-valid file is `XX001`.
@@ -824,7 +838,7 @@ identity bits restore the INSERT/UPDATE gating (`428C9`) after a reopen.
 
 ### Column-statistics entries (`entry_kind = 4`, v29)
 
-Statistics entries follow every table entry and sort by `(lowercase table_name, column_ordinal,
+Statistics entries follow every table entry and sort by `(table_name bytes, column_ordinal,
 stats_kind, item_ordinal)`. Every entry begins:
 
 | field | encoding |
@@ -832,7 +846,7 @@ stats_kind, item_ordinal)`. Every entry begins:
 | `entry_kind` | u8 = `4` |
 | `stats_kind` | u8: `0` summary, `1` MCV, `2` histogram; other values `XX001` |
 | `table_name_len` | u16 |
-| `table_name` | UTF-8 original table name; must resolve case-insensitively |
+| `table_name` | UTF-8 table name; must name a table entry exactly |
 | `column_ordinal` | u16; must be `< col_count` |
 
 A **summary** (`stats_kind = 0`) continues:
@@ -974,15 +988,17 @@ at open.
 
 | token | rendering |
 |---|---|
-| word (keyword / identifier) | as written (original case; comparisons are case-insensitive at parse) |
+| bare word (keyword / identifier) | its folded spelling — lowercase, since the lexer folds every bare word (v37; through v36 the original case) |
+| quoted identifier | `"` + the name with each `"` doubled + `"` (v37 — a name substituted by a `RENAME` rewrite is always emitted in this form, grammar.md §3) |
 | integer literal | the unsigned decimal digits of its magnitude, no sign, no leading zeros |
 | decimal literal `(coeff, scale)` | the digit string `coeff` with `.` inserted `scale` digits from the right — `("150", 2)` → `1.50`, `("5", 1)` → `.5`, `("1", 0)` → `1.` (always contains the `.`, so it re-lexes as a decimal) |
 | string literal | `'` + content with each `'` doubled + `'` |
 | bind parameter | `$N` (unreachable in a *stored* check — rejected at CREATE TABLE, 42P02) |
 | punctuation / operators | their fixed spelling: `,` `.` `(` `)` `*` `+` `-` `/` `%` `=` `<` `>` `<=` `>=` |
 
-Example: `CHECK (a>0 AND b IS NOT NULL)` persists as `a > 0 AND b IS NOT NULL`; `CHECK
-(price * qty <= 10000.00)` persists as `price * qty <= 10000.00`.
+Example: `CHECK (a>0 AND b IS NOT NULL)` persists as `a > 0 and b is not null`; `CHECK
+(price * qty <= 10000.00)` persists as `price * qty <= 10000.00`; `CHECK ("Qty" > 0)` persists as
+`"Qty" > 0`.
 
 **Composite primary key.** A composite `PRIMARY KEY` ([../design/constraints.md
 §3](../design/constraints.md)) is persisted as the `pk_count`/`pk_ordinal` list in **key
@@ -1469,10 +1485,10 @@ only its **dirty** pages, then publishing the new root. Atomicity uses validated
    *Reclamation* below).
 2. **Write** the dirty body pages in this **deterministic order**, so the bytes are
    cross-core identical:
-   - For each table in **lowercased-name order**, the dirty nodes of its B-tree in
+   - For each table in **name byte order**, the dirty nodes of its B-tree in
      **post-order** (a node's children before the node — so a parent's child pointers
      reference already-allocated pages), left to right; **then each of its index trees**
-     (v5), in the catalog's index order (lowercased-name ascending), post-order each.
+     (v5), in the catalog's index order (name byte order ascending), post-order each.
    - Then the **catalog chain** (always rewritten fresh: it carries the possibly-moved
      `root_data_page` of every table), as consecutive pages.
    - Then the **free-list pages**, allocated from safe remaining free pages before high-water;

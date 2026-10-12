@@ -233,18 +233,24 @@ fn detach_in_use_is_55006() {
     db.detach("mydb").expect("detach after reader closed");
 }
 
-/// A reserved name (main/temp) or an already-attached name is 42710; detaching an unknown / reserved
+/// A reserved name (main/temp) or an already-attached name is 42710 (exact names); detaching an unknown / reserved
 /// database is 42704.
 #[test]
 fn attach_name_errors() {
     let db = mem_db();
     db.attach("mydb", AttachSource::memory(), false)
         .expect("attach");
-    for name in ["main", "temp", "MAIN", "Temp", "mydb", "MyDB"] {
+    for name in ["main", "temp", "mydb"] {
         let err = db
             .attach(name, AttachSource::memory(), false)
             .expect_err(&format!("attach {name:?} should fail"));
         assert_eq!(err.code(), "42710", "{name:?}");
+    }
+    // Host-API names are exact (grammar.md §3): a different letter case is a different name, so it
+    // collides with neither a reserved scope nor an existing attachment.
+    for name in ["MAIN", "Temp", "MyDB"] {
+        db.attach(name, AttachSource::memory(), false)
+            .unwrap_or_else(|e| panic!("attach {name:?}: {}", e.message));
     }
     for name in ["nope", "main", "temp"] {
         let err = db
@@ -530,15 +536,36 @@ fn attach_file_missing_is_58p01() {
         .expect("re-attach after failed file attach");
 }
 
-/// An attachment is reached case-insensitively by its qualifier (unquoted identifiers fold to lower
-/// case), matching how main/temp resolve.
+/// A host-API attach name is taken VERBATIM as an exact name (grammar.md §3): `attach("Reports")` is
+/// reached from SQL only by the quoted `"Reports"` qualifier, while a bare `reports` / `REPORTS` folds
+/// to `reports` and names nothing; `attach("reports")` is reached by any bare spelling.
 #[test]
-fn attach_case_insensitive_qualifier() {
+fn attach_names_are_exact() {
     let db = mem_db();
     db.attach("Reports", AttachSource::memory(), false)
         .expect("attach");
     let mut s = db.session(SessionOptions::default());
-    exec(&mut s, "CREATE TABLE reports.sales (id i32 PRIMARY KEY)");
-    exec(&mut s, "INSERT INTO REPORTS.sales VALUES (1)");
-    assert_eq!(query_ints(&mut s, "SELECT id FROM Reports.sales"), vec![1]);
+    exec(
+        &mut s,
+        "CREATE TABLE \"Reports\".sales (id i32 PRIMARY KEY)",
+    );
+    exec(&mut s, "INSERT INTO \"Reports\".sales VALUES (1)");
+    assert_eq!(
+        query_ints(&mut s, "SELECT id FROM \"Reports\".sales"),
+        vec![1]
+    );
+    assert_eq!(
+        err_code(&mut s, "SELECT id FROM Reports.sales"),
+        "42P01",
+        "a bare qualifier folds to reports"
+    );
+    db.attach("reports", AttachSource::memory(), false)
+        .expect("a lowercase attach name is distinct from Reports");
+    exec(&mut s, "CREATE TABLE REPORTS.sales (id i32 PRIMARY KEY)");
+    exec(&mut s, "INSERT INTO Reports.sales VALUES (2)");
+    assert_eq!(query_ints(&mut s, "SELECT id FROM reports.sales"), vec![2]);
+    assert_eq!(
+        query_ints(&mut s, "SELECT id FROM \"Reports\".sales"),
+        vec![1]
+    );
 }

@@ -38,20 +38,83 @@ notation legend is duplicated at the top of
 [grammar.ebnf](../grammar/grammar.ebnf) so that file is self-contained — a reader never
 needs this doc to *read* the grammar, only to understand *why* it is shaped as it is.
 
-## 3. Keywords are not reserved; matching is case-insensitive
+## 3. Identifiers: unquoted names fold to lowercase, quoted names are exact; keywords are not reserved
 
-The lexer has **no reserved-keyword table**: it emits one `identifier` token for every
-bare word, and the parser recognises keywords purely by grammatical position, comparing
-case-insensitively (`SELECT` = `select` = `SeLeCt`). Two consequences the grammar
-encodes:
+**Two identifier spellings, one name.** An identifier is written either **bare** or
+**double-quoted**, and both produce a *name* — a byte string — which is all the rest of the
+engine ever sees. This is PostgreSQL's rule (CLAUDE.md §1), adopted exactly:
+
+- A **bare identifier** (`[A-Za-z_][A-Za-z0-9_]*`, ASCII only) **folds to lowercase** in the
+  lexer: `Orders`, `ORDERS`, and `orders` are all the name `orders`. Folding is ASCII-only
+  (there are no non-ASCII bare identifiers to fold).
+- A **quoted identifier** (`"…"`, [grammar.ebnf](../grammar/grammar.ebnf) `quoted_identifier`) is
+  the name **verbatim** — case kept, any UTF-8 character allowed (spaces, hyphens, `.`, non-ASCII),
+  an embedded `"` written by doubling it (`"a""b"` is the name `a"b`). `"userId"`, `"order"`, and
+  `"my table"` are names. A **zero-length** quoted identifier `""` is **`42601`** (PostgreSQL's
+  *"zero-length delimited identifier"*). Unicode-escape identifiers (`U&"…"`) are not a jed surface.
+
+**Names compare by exact bytes, everywhere.** After the fold, every name comparison and every
+catalog key is **byte-exact** — tables (persistent, `TEMP`, attached), columns, indexes,
+sequences, composite types and their fields, constraints, databases (attachment names), CTE and
+relation aliases, window names, select-list output names (the `ORDER BY` output-name match,
+§10), function names, and type names. So `"Orders"` and `orders` are **different** names (both
+may exist in one table namespace), `CREATE TABLE Orders` then `SELECT * FROM "Orders"` is `42P01`
+(the table is `orders`), and `"userId"` must be written quoted at every reference. Built-in
+functions and types are named in lowercase, so `LOWER(x)`, `I32`, and `"lower"(x)` resolve while
+`"LOWER"(x)` is `42883` and `CAST(x AS "I32")` is `42704`, exactly as PostgreSQL. Collation names
+were already quoted and exact (§47) and are unchanged. Every canonical **name order** the spec
+defines (catalog emission order, constraint evaluation order, access-path tie order, FK visitation
+order, …) is ascending **byte order of the name**; earlier spec text that says "lowercased name"
+or "case-insensitively" about a catalog name means the name itself — for every name written bare
+the two are the same thing, because the bare spelling is already lowercase.
+
+**Names supplied through the host API are exact.** A name passed to the host/embedding API as a
+string — an attachment name, `compact(name)`, a privilege grant's table name, a host-registered
+function or type name — is taken **verbatim** as a catalog name: it is not folded and not parsed
+for quotes (the host API speaks names, not SQL text). `attach("Reports", …)` is therefore reached
+from SQL as `"Reports".t`, and `attach("reports", …)` as `reports.t` or `Reports.t`.
+
+**Name-valued text arguments parse as an identifier.** The sequence functions' name argument
+(`nextval('s')`, `currval`, `setval` — the PostgreSQL `regclass` text form, [sequences.md](sequences.md)
+§4) is parsed the way PostgreSQL parses a `regclass` string: surrounding whitespace is ignored; a
+bare word folds to lowercase; a double-quoted name is exact (with `""` an embedded quote). So
+`nextval('S')` advances `s`, and `nextval('"S"')` advances `S`. Any other text — empty or
+all-whitespace, an unterminated quote, internal whitespace in a bare word (`'my seq'`), trailing
+characters after the name — is **`42602`** (`invalid_name`, *"invalid name syntax"*), as in
+PostgreSQL. `'""'` parses (to the empty name, which never exists: `42P01`, as PostgreSQL). A dotted
+name (`'a.b'`) is also `42602`: jed has no schemas and does not resolve a database-qualified
+sequence name from text (PostgreSQL would look up schema `a` — a documented divergence). An engine-generated reference to a name
+that would not survive this parse bare — a `serial` column's `DEFAULT nextval('…')` naming a
+sequence derived from a quoted table — is written **quoted** (`nextval('"Foo_id_seq"')`, as
+PostgreSQL does). The quoting rule for a name inside such a text literal: a name matching
+`[a-z_][a-z0-9_]*` is written bare, any other name double-quoted with `"` doubled. A name the
+engine substitutes into persisted **expression** text (a `RENAME` rewrite of CHECK / DEFAULT /
+index-expression / partial-predicate text, [alter.md](alter.md) §2.2) is **always** written
+double-quoted: jed has no reserved-keyword table, so a bare `null` or `true` there would re-lex as
+the keyword, not the renamed column.
+
+**Keywords are not reserved.** The lexer has **no reserved-keyword table**: it emits one bare
+identifier token for every bare word, and the parser recognises keywords purely by grammatical
+position (since the word is already folded, `SELECT` = `select` = `SeLeCt`). Two consequences
+the grammar encodes:
 
 - A keyword spelling is a **legal identifier** wherever the grammar expects one — e.g. a
-  column may be named `select`. There is no quoted-identifier escape for *identifiers* (a
-  bare keyword-as-name suffices). A double-quoted token (`Token::QuotedIdent`) **does** exist,
-  but only as a **collation name** after `COLLATE` (§47, [collation.md](collation.md) §1); it is
-  not a general identifier escape, so a `"…"` in any other position is a `42601` syntax error.
-- Keyword terminals in the grammar (`"SELECT"`, `"FROM"`, …) denote a case-insensitive
-  match, while punctuation terminals (`"("`, `"="`) match literally.
+  column may be named `select`, bare or quoted.
+- A keyword terminal in the grammar (`"SELECT"`, `"FROM"`, …) matches **only a bare word**,
+  never a quoted identifier: `SELECT "from" FROM t` selects the column `from`, and `"null"` is a
+  column reference, not the null literal. Keyword-like words in fixed vocabularies — `EXPLAIN`
+  options, `EXTRACT` fields, frame bounds, multi-word type names (`double precision`,
+  `timestamp with time zone`) — are keywords in this sense and accept only bare words.
+  Punctuation terminals (`"("`, `"="`) match literally.
+
+**Output names fold too.** A select item's `AS alias` is an identifier like any other, so
+`SELECT 1 AS Total` names its column `total` and `SELECT 1 AS "Total"` names it `Total` (§8),
+matching PostgreSQL.
+
+**The `jed_` reservation** is checked on the **name**, byte-exact: a name beginning with the four
+lowercase bytes `jed_` is reserved ([introspection.md](introspection.md) §4). `CREATE TABLE
+JED_x` folds to `jed_x` and is rejected; `CREATE TABLE "JED_x"` is the name `JED_x`, which does
+not begin with `jed_`, and is allowed — PostgreSQL's exact rule for its `pg_` prefix.
 
 A qualified reference's structural `identifier "." identifier` shape takes precedence over
 every expression-keyword interpretation of its first word. Thus relation aliases such as
@@ -128,8 +191,10 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
 - **`LIMIT` / `OFFSET` take a non-negative integer literal**, not a general expression. The two clauses may appear in either
   order, each at most once (§9). There is **no `LIMIT ALL`**, **no `OFFSET … ROWS` /
   `FETCH NEXT … ROWS ONLY`**, and **no SQLite `LIMIT off, cnt` comma form**.
-- **ASCII-only identifiers**; the one double-quoted token is a collation name after `COLLATE`,
-  not a general quoted-identifier escape (§3, §47).
+- **ASCII-only bare identifiers**; a non-ASCII name is written quoted (`"café"`, §3). No
+  `U&"…"` Unicode-escape identifiers. A bare or quoted identifier longer than **63 bytes** (a quoted
+  one measured on its decoded UTF-8 name) is **`42622`** `name_too_long`, where PostgreSQL silently
+  truncates to `NAMEDATALEN − 1` ([cost.md](cost.md) §7, the identifier-length limit).
 - **Literal forms.** Integer, **decimal** (`1.50`, `.5`, and scientific `e`-notation
   `1.5e3` / `5e2` / `1e-3` — §14), **single-quoted string** (the `text` type, `'alice'`, with
   `''` for an embedded quote), `TRUE`/`FALSE`, and `NULL`. `boolean` is now a storable column
@@ -160,8 +225,8 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
 
 ## 6. Type names: an `identifier` plus an optional type modifier
 
-The grammar parses a column's and a `CAST`'s type as a bare `identifier` — the catalog
-owns the type lattice and resolves the name case-insensitively, rejecting unknowns at
+The grammar parses a column's and a `CAST`'s type as an `identifier` — the catalog
+owns the type lattice and resolves the (folded, §3) name exactly, rejecting unknowns at
 execution time (`42704`). Keeping resolution out of the grammar means the scalar set can
 grow ([types.md](types.md)) without touching the grammar, and a misspelled type yields a
 clean structured error instead of a parse failure. The accepted names are listed as an
@@ -198,22 +263,23 @@ here and asserted in the corpus via the `# names:` directive
 ([conformance.md](conformance.md) §1). The resolver derives each select item's name in
 this order:
 
-1. **`expr AS alias`** → the `alias`, **as written**. The alias is a pure output label, so
-   it is *not* case-folded and *not* entered into the **input** resolution namespace —
+1. **`expr AS alias`** → the `alias` **name** — folded like any identifier (§3), so `AS Total`
+   names the column `total` and `AS "Total"` names it `Total` (PostgreSQL). The alias is a pure
+   output label, *not* entered into the **input** resolution namespace —
    WHERE, HAVING, and sibling select items never see it (they resolve against the FROM
    columns). The one place an alias *is* visible is the trailing **`ORDER BY`** of the same
    query (and a set-operation `ORDER BY`), which resolves a bare sort-key name against the
-   **output** columns first — the SQL-standard rule (§10). Matching there is
-   **case-insensitive** (an `ORDER BY` name folds like any unquoted identifier — §3 — so
-   `… AS Total … ORDER BY total` binds), even though the *printed* name stays as written.
+   **output** columns first — the SQL-standard rule (§10). Matching there is byte-exact on
+   names, so `… AS Total … ORDER BY TOTAL` binds (both fold to `total`) while
+   `… AS "Total" … ORDER BY total` does not.
    Aliases may collide with a real column name or with each other (no uniqueness check); a
    colliding bare-name `ORDER BY` key is the one place that is observable — two output
    columns of the same name with **different** expressions make such a key `42702`
    (*ambiguous*, §10).
 2. **A bare column reference** (no alias) → the **catalog's canonical column name** at the
-   resolved index, i.e. the spelling from `CREATE TABLE`, *not* the spelling typed in the
-   SELECT. So with `c i32` declared, `SELECT C FROM t` names the column `c`. (Identifiers
-   match case-insensitively — §3 — so the user's casing must not leak into the output.)
+   resolved index, i.e. the name from `CREATE TABLE`. With `c i32` declared, `SELECT C FROM t`
+   names the column `c` (`C` folds to `c`, §3); with `"C" i32` declared, the column is `C` and
+   is referenced as `"C"`.
 3. **`*`** → expands to each underlying column's canonical name, in column order — the same
    expansion that produces the projections.
 4. **An un-aliased aggregate function call** → the **lowercased function name**
@@ -330,7 +396,7 @@ exists, and a bare name shadows a same-named input column — `SELECT a AS b FRO
 sorts by `a` (the output column `b`), not the table column `b`. The match uses each select item's
 **output name** — its `AS` alias, else its derived name (a bare column's canonical name, an
 un-aliased aggregate's lowercased function name, so `SELECT count(*) FROM t ORDER BY count`
-binds), case-insensitively (§8); an un-nameable item (`?column?`) never matches. A matched name
+binds), byte-exactly on names (§3, §8); an un-nameable item (`?column?`) never matches. A matched name
 behaves exactly like the **ordinal** pointing at that item: a plain-column item stays on the
 column fast path (so PK-scan elision still applies — `SELECT id AS k FROM t ORDER BY k` over the
 primary key needs no sort), and a **computed** item is materialized like a general-expression key.
@@ -508,8 +574,8 @@ exactly the embedded `SELECT`'s cost (§24).
 (`drop_table` in the grammar). It is the inverse of `CREATE TABLE`: where CREATE registers
 a name in the catalog (and rejects a name already taken, §1, `42P07`), DROP removes one
 (and rejects a name not present). Both stores the table touches — the catalog entry and the
-per-table row store — are dropped together, keyed by the table's lower-cased name (§3,
-case-insensitive: `DROP TABLE T` drops `t`). After a drop the name is free again, so
+per-table row store — are dropped together, keyed by the table's name (§3: `DROP TABLE T`
+folds to and drops `t`; `DROP TABLE "T"` drops only a table named `T`). After a drop the name is free again, so
 `DROP TABLE t` then `CREATE TABLE t (...)` re-creates it from empty.
 
 **A missing table is `42P01` — unless `IF EXISTS`.** Dropping a table that does not exist
@@ -657,8 +723,9 @@ the table name when there is none, is the relation's **label**. Labels qualify c
 be **distinct**: two relations with the same label — a self-join written without aliases
 (`FROM t JOIN t ...`) — is **`42712`** (`duplicate_alias`, *"table name t specified more than
 once"*, [../errors/registry.toml](../errors/registry.toml)), matching PostgreSQL. A self-join is
-therefore written with two distinct aliases (`FROM t AS a JOIN t AS b ON ...`). Comparison is
-case-insensitive (§3), like every other identifier.
+therefore written with two distinct aliases (`FROM t AS a JOIN t AS b ON ...`). Labels compare
+byte-exactly after folding (§3), like every other name — `FROM t AS A JOIN u AS a` is `42712`, while
+`FROM t AS "A" JOIN u AS a` is two distinct labels.
 
 **The database qualifier (`qualified_table`).** `qualified_table ::= (identifier ".")? identifier`
 — an OPTIONAL leading `db "."` names the **attached database** a table lives in (`reports.sales`),
@@ -2341,7 +2408,7 @@ field }` for `.field` and `Expr::FieldStar { base }` for `.*`.
   `col.field` fallback (the original plan assumed one; the differential oracle showed PG rejects
   every unparenthesized field reference, so jed matches PG). To select a field of a composite
   column you must parenthesize: `(home).zip`.
-- **Errors.** Field lookup is case-insensitive (PG folds the identifier). An unknown field is
+- **Errors.** Field lookup is byte-exact on the folded name (§3, as PG). An unknown field is
   `42703` (undefined_column); a non-composite base is `42809` (wrong_object_type, PG's "column
   notation … applied to type …, which is not a composite type"); `.*` outside a projection list is
   `0A000`.
@@ -2794,10 +2861,9 @@ postfix operators (`a :: text COLLATE "x"` is `(a :: text) COLLATE "x"`). The pa
 the same `parse_postfix` loop as `::`.
 
 **The name is a double-quoted identifier.** Collation names contain hyphens and are case-sensitive
-(`"en-US"`, `"C"`), so the lexer gained a `quoted_identifier` token (`Token::QuotedIdent`,
-case-sensitive, `""` an embedded quote — [grammar.ebnf](../grammar/grammar.ebnf) `quoted_identifier`).
-Today it is consumed **only** after `COLLATE` (in an expression or an `ORDER BY` key); a quoted
-identifier anywhere else is a `42601` syntax error.
+(`"en-US"`, `"C"`), so `COLLATE` takes **only** the quoted form ([grammar.ebnf](../grammar/grammar.ebnf)
+`quoted_identifier`, §3) — a bare word after `COLLATE` is `42601`. (This was the lexer's first use of
+the quoted token; quoted identifiers are now general names, §3.)
 
 **`ORDER BY col COLLATE "name"`.** A sort key may carry an explicit COLLATE between the column and
 the `ASC`/`DESC` direction ([grammar.ebnf](../grammar/grammar.ebnf) `sort_key`). The key is then

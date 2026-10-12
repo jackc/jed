@@ -425,6 +425,10 @@ id = "query.column_alias"
 description = "Select-list output naming: bare column → canonical name, expr AS alias → alias, other expr → ?column?"
 
 [[capability]]
+id = "query.quoted_identifiers"
+description = "Identifier folding + double-quoted identifiers (spec/design/grammar.md §3): a bare identifier folds to lowercase in the lexer, a quoted identifier (\"userId\", \"my col\", \"a\"\"b\") is the name verbatim and is never a keyword; every name (table, column, alias, CTE, composite type/field, sequence, function, type) compares byte-exactly after the fold; a zero-length \"\" is 42601; the sequence functions' text argument parses as one identifier (fold unless quoted; malformed 42602); a serial column of a quoted table quotes its generated nextval default. PostgreSQL's rule exactly (oracle-clean)."
+
+[[capability]]
 id = "query.limit"
 description = "LIMIT clause: cap the number of returned rows (non-negative integer literal)"
 

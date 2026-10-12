@@ -25,7 +25,7 @@ func (db *engine) resolveSRF(name string, args []*exprNode, alias *string, colum
 	// The args see only params/outer — never sibling FROM tables (non-LATERAL); CTE bindings are
 	// inherited so an arg subquery can reference a CTE (cte.md §2).
 	argScope := &scope{rels: nil, parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
-	lname := strings.ToLower(name)
+	lname := name
 	// Record-returning functions (R1, json-table.md §2): json[b]_to_record → one record row,
 	// json[b]_to_recordset → setof record. They take their column shape from the C0 col-def list
 	// `AS t(col type, …)`. Dispatched first, before the col-def-list guard below.
@@ -47,9 +47,9 @@ func (db *engine) resolveSRF(name string, args []*exprNode, alias *string, colum
 			"a column definition list is only allowed for a record-returning function, not "+name)
 	}
 	switch {
-	case strings.EqualFold(name, "generate_series"):
+	case name == "generate_series":
 		return db.resolveGenerateSeries(args, alias, argScope, ptypes)
-	case strings.EqualFold(name, "unnest"):
+	case name == "unnest":
 		return db.resolveUnnest(args, alias, argScope, ptypes)
 	}
 	// json/jsonb two-column SRFs (B3, json-sql-functions.md §3): jsonb_each → (key text, value
@@ -473,7 +473,7 @@ func applySRFColumnAliases(table *catTable, relationName string, aliases []strin
 	if len(aliases) > len(table.Columns) {
 		return newError(InvalidColumnReference, fmt.Sprintf(
 			"table \"%s\" has %d columns available but %d columns specified",
-			strings.ToLower(relationName), len(table.Columns), len(aliases),
+			relationName, len(table.Columns), len(aliases),
 		))
 	}
 	for i, alias := range aliases {
@@ -518,13 +518,13 @@ func srfKindName(kind srfKind) string {
 }
 
 // catalogRelKind classifies a relation name as a built-in catalog relation (introspection.md §5):
-// the jed_-prefixed relation family, case-insensitively (identifier resolution folds case; grammar.md §3
+// the jed_-prefixed relation family, by exact name (identifier resolution folds case; grammar.md §3
 // leaves no quoted escape). Built-in names resolve in every database's relation namespace, checked
 // AFTER a statement-local CTE (a CTE shadows a catalog relation — PG-matching, oracle-checked) and
 // BEFORE the user catalog (post-I0 the two can never collide; for a pre-reservation legacy file
 // the built-in wins and the user relation is unreachable by name — §5).
 func catalogRelKind(name string) (srfKind, bool) {
-	switch strings.ToLower(name) {
+	switch name {
 	case "jed_tables":
 		return srfJedTables, true
 	case "jed_columns":
@@ -572,7 +572,7 @@ func isCatalogRelName(name string) bool { _, ok := catalogRelKind(name); return 
 func checkCatalogRelWrite(name string) error {
 	if isCatalogRelName(name) {
 		return newError(WrongObjectType,
-			`cannot modify system relation "`+strings.ToLower(name)+`"`)
+			`cannot modify system relation "`+name+`"`)
 	}
 	return nil
 }
@@ -670,7 +670,7 @@ func (db *engine) resolveCatalogScope(qualifier *string) (string, error) {
 	if qualifier == nil {
 		return "main", nil
 	}
-	q := strings.ToLower(*qualifier)
+	q := *qualifier
 	if q == "main" || q == "temp" {
 		return q, nil
 	}
@@ -707,7 +707,7 @@ func catalogTypeText(ty dataType, dec *decimalTypmod, vlen *uint32) string {
 
 // jedTablesRows generates the rows of the jed_tables catalog relation (introspection.md §5): one
 // row per USER table of the scope's pinned catalog snapshot — the canonical (CREATE TABLE-spelled)
-// name — in ascending lowercased-name order (deterministic, no map-iteration leak; the multiset is
+// name — in ascending name byte order (deterministic, no map-iteration leak; the multiset is
 // the contract, order without ORDER BY stays unspecified — CLAUDE.md §8). Derived entirely from
 // the resident catalog: zero page_read / storage_row_read; each produced row charges one
 // generated_row AT THE SOURCE, guarded so a max_cost ceiling aborts deterministically (§13).
@@ -729,7 +729,7 @@ func (db *engine) jedTablesRows(sp *srfPlan, m *costMeter) ([]storedRow, error) 
 }
 
 // jedColumnsRows generates the rows of the jed_columns catalog relation (introspection.md §5): one
-// row per column of every user table of the scope's snapshot, in (lowercased table name, ordinal)
+// row per column of every user table of the scope's snapshot, in (exact table name, ordinal)
 // order. ordinal is 1-based CREATE TABLE order; type is the canonical type text (catalogTypeText);
 // not_null covers a declared NOT NULL and PRIMARY KEY membership; pk_ordinal is the 1-based
 // position in the PRIMARY KEY in KEY order (which may differ from declaration order —
@@ -767,7 +767,7 @@ func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 }
 
 // jedIndexesRows generates the rows of the jed_indexes catalog relation (introspection.md §5.1):
-// one row per secondary index of every user table of the scope's snapshot, in (lowercased table
+// one row per secondary index of every user table of the scope's snapshot, in (exact table
 // name, then the catalog's ascending index-name order) order. columns is the text[] of indexed
 // column names in index-key order (duplicates included); is_unique the catalog flag; method the
 // access-method name (btree/gin/gist). Cost mirrors jedTablesRows.
@@ -849,8 +849,8 @@ func (db *engine) jedStatisticsRows(sp *srfPlan, m *costMeter) ([]storedRow, err
 
 // jedConstraintsRows generates the rows of the jed_constraints catalog relation (introspection.md
 // §5.1): one row per CHECK / UNIQUE / FK / EXCLUDE constraint of every user table of the scope's
-// snapshot, in (lowercased table name, then a fixed KIND order — check, unique, foreign_key,
-// exclude — each already held in ascending lowercased-name order). PRIMARY KEY / NOT NULL are
+// snapshot, in (exact table name, then a fixed KIND order — check, unique, foreign_key,
+// exclude — each already held in ascending name byte order). PRIMARY KEY / NOT NULL are
 // deliberately absent (they own no named object and are described by jed_columns). A UNIQUE
 // constraint IS its backing unique b-tree index (constraints.md §5), so type='unique' lists every
 // unique index; expression is the persisted canonical CHECK text (constraints.md §4.5). Cost
@@ -972,7 +972,7 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 }
 
 // jedSequencesRows generates the rows of the jed_sequences catalog relation (introspection.md
-// §5.3): one row per sequence of the scope's snapshot, in ascending lowercased-name order. The
+// §5.3): one row per sequence of the scope's snapshot, in ascending name byte order. The
 // definition fields render as stored; last_value is NULL until the sequence has been read
 // (!IsCalled — PG's pg_sequences rule); owned_by_table / owned_by_column render the OWNED BY link
 // of a serial / IDENTITY column (the owning table's canonical name, the column's current name),
@@ -1020,7 +1020,7 @@ func (db *engine) jedSequencesRows(sp *srfPlan, m *costMeter) ([]storedRow, erro
 }
 
 // jedTypesRows generates the rows of the jed_types catalog relation (introspection.md §5.3): one
-// row per user-defined type of the scope's snapshot, in ascending lowercased-name order. Every user
+// row per user-defined type of the scope's snapshot, in ascending name byte order. Every user
 // type is a composite today. Cost mirrors jedTablesRows.
 func (db *engine) jedTypesRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
 	snap := db.snapForScope(sp.introspectScope)
@@ -1039,7 +1039,7 @@ func (db *engine) jedTypesRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
 }
 
 // jedTypeFieldsRows generates the rows of the jed_type_fields catalog relation (introspection.md
-// §5.3): one row per field of every user-defined type of the scope's snapshot, in (lowercased type
+// §5.3): one row per field of every user-defined type of the scope's snapshot, in (exact type
 // name, ordinal) order — jed_columns' shape, with the same canonical type text. Cost mirrors
 // jedTablesRows.
 func (db *engine) jedTypeFieldsRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {

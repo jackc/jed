@@ -74,15 +74,15 @@ func uqNames(t *testing.T, db dbHandle, table string) []string {
 }
 
 // Constraint naming matches PostgreSQL (oracle-probed, constraints.md §5.3): the
-// lowercased <table>_<cols>_key base with the smallest free suffix, walked past BOTH the
-// relation namespace and the table's check names; an explicit CONSTRAINT name is the
-// index name as written.
+// <table>_<cols>_key base (from the exact names) with the smallest free suffix, walked past BOTH
+// the relation namespace and the table's check names; an explicit CONSTRAINT name is the exact
+// index name.
 func TestUniqueConstraintNamingMatchesPostgres(t *testing.T) {
 	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	uqRun(t, db, "CREATE TABLE other (x i32)")
 	uqRun(t, db, "CREATE INDEX walk_a_key ON other (x)") // occupies the derived base
-	uqRun(t, db, "CREATE TABLE Walk (a i32 UNIQUE, b i32, CONSTRAINT Named UNIQUE (b, a), "+
+	uqRun(t, db, "CREATE TABLE Walk (a i32 UNIQUE, b i32, CONSTRAINT \"Named\" UNIQUE (b, a), "+
 		"CONSTRAINT walk_b_check CHECK (b > 0), UNIQUE (b))")
 	if got := uqNames(t, db, "walk"); !slices.Equal(got, []string{"Named!", "walk_a_key1!", "walk_b_key!"}) {
 		t.Fatalf("walk indexes = %v", got)
@@ -91,6 +91,11 @@ func TestUniqueConstraintNamingMatchesPostgres(t *testing.T) {
 	uqRun(t, db, "CREATE TABLE w1 (a i32, CONSTRAINT w1_a_key CHECK (a > 0), UNIQUE (a))")
 	if got := uqNames(t, db, "w1"); !slices.Equal(got, []string{"w1_a_key1!"}) {
 		t.Fatalf("w1 indexes = %v", got)
+	}
+	// Derived from the EXACT names (PG: CREATE TABLE "Uq" ("K" int UNIQUE) → Uq_K_key).
+	uqRun(t, db, `CREATE TABLE "Uq" ("K" i32 UNIQUE)`)
+	if got := uqNames(t, db, "Uq"); !slices.Equal(got, []string{"Uq_K_key!"}) {
+		t.Fatalf("Uq indexes = %v", got)
 	}
 }
 

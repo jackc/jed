@@ -324,7 +324,7 @@ commit. `close` is idempotent.
   cost of a trivial-plan / high-frequency lookup (planning is ~⅔ of a point lookup's latency and
   ~88% of its allocations). The cache entry carries the shared-core identity (so a relation-free
   plan cannot cross databases) plus an exact relation signature, in source order, of
-  `(database identity, catalog generation, lowercased table name, estimator revision)`. Identity and
+  `(database identity, catalog generation, table name, estimator revision)`. Identity and
   revision are opaque equality tokens, not hashes; they clone with a snapshot, change transactionally,
   and are never persisted or exposed. Every successful statement that mutates rows advances each
   affected persistent relation once, so a relevant statistics/structure change forces re-planning
@@ -385,7 +385,7 @@ commit. `close` is idempotent.
 
   INSERT validity deliberately has its own schema signature, not SELECT's estimator signature. It
   is the exact tuple `(owning core identity, target database identity, target catalog generation,
-  lowercased target relation name)`. A bare target additionally misses when the executing session's
+  target relation name)`. A bare target additionally misses when the executing session's
   temp domain shadows that name; an explicit `main` target does not. An attached target contributes
   the attachment snapshot's identity/generation, so detach/reattach misses even when the replacement
   has the same schema. Relevant DDL, target drop/recreate, index/constraint changes, and collation
@@ -466,7 +466,8 @@ host-API act — CLAUDE.md §13).
 | Go | `db.Compact(name string) error` |
 | TS | `db.compact(name: string): void` |
 
-`name` is `main` or an attached database (attached-databases.md §4), case-insensitive. Compaction
+`name` is `main` or an attached database (attached-databases.md §4), matched **exactly** — a host-API
+name is verbatim, never folded ([grammar.md §3](grammar.md)). Compaction
 works on both backings: a file is rewritten as described below, and an in-memory database (or
 in-memory attachment) swaps its `MemoryBlockStore` for the compact image, releasing its dead pages
 from RAM and lowering `storage_bytes` (memory.md §8). A file's `storage_bytes` counts only live pages
@@ -710,8 +711,8 @@ CLI and white-box tests reach the full catalog definition — columns (name, typ
 membership, default), the primary key's ordinals in key order, CHECK constraints, and secondary
 indexes — through it, richer than the `jed_` relations expose today (e.g. column DEFAULTs, still
 un-rendered in `jed_columns`). It reads the **currently-visible snapshot** (an open transaction's
-working set, else the committed state) and returns the **canonical** (CREATE TABLE-spelled) names,
-sorted ascending by **lowercased** name so no hash-map iteration order leaks (CLAUDE.md §8);
+working set, else the committed state) and returns the exact catalog names,
+sorted ascending by **name byte order** so no hash-map iteration order leaks (CLAUDE.md §8);
 secondary indexes are relations but not tables and are excluded. Per core the tooling seam differs
 by necessity: Rust keeps `table`/`table_names` as `#[doc(hidden)]` handle accessors (the CLI is a
 separate crate); Go drops the `TableNames` wrappers outright; TS's tools reach `Engine.tableNames()`
@@ -1106,7 +1107,8 @@ NULL before the kernel runs), **exact scalar signatures** (no implicit promotion
 **single-row or batch kernel** (the column-in → column-out ABI, extensibility.md §4.2.1). Since step 4 an `immutable` host function
 that also declares a **component identity** may back a **persisted index** (below).
 
-- **Register.** A function carries a name, an exact scalar argument signature, a scalar result type,
+- **Register.** A function carries a name (taken **verbatim**, never folded — register a lowercase
+  name to make it callable with a bare spelling, grammar.md §3), an exact scalar argument signature, a scalar result type,
   a kernel, and three declarations: **`volatility`** (`immutable`/`stable`/`volatile`, recorded
   forward-compat — not yet enforced), **`cross_core`** (recorded — governs the future determinism
   ledger; jed has no runtime taint yet), and **`cost`** (a non-negative declared static weight,

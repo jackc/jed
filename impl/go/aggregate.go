@@ -1257,13 +1257,13 @@ func windowsHaveAggregate(windows []namedWindow) bool {
 	return false
 }
 
-// isAggregateName reports whether name (case-insensitive) is a registered aggregate surface
+// isAggregateName reports whether name (exact name) is a registered aggregate surface
 // (COUNT/SUM/MIN/MAX/AVG). Data-driven over the catalog (Aggregates); consulted by the grouping
 // + CHECK-structure walks.
 func isAggregateName(name string) bool {
-	lname := toLowerASCII(name)
+	lname := name
 	for i := range aggregates {
-		if toLowerASCII(aggregates[i].Surface) == lname {
+		if surfaceMatches(aggregates[i].Surface, lname) {
 			return true
 		}
 	}
@@ -1280,7 +1280,7 @@ func isAggregateName(name string) bool {
 // (ORDER BY …) clause and are resolved by resolveOrderedSetAggregate, intercepted before the generic
 // aggregate/scalar dispatch.
 func isOrderedSetAggregateName(name string) bool {
-	switch toLowerASCII(name) {
+	switch name {
 	case "mode", "percentile_cont", "percentile_disc":
 		return true
 	}
@@ -1292,7 +1292,7 @@ func isOrderedSetAggregateName(name string) bool {
 // These names are ALSO window functions; the WITHIN GROUP clause routes them here instead of the
 // window path.
 func isHypotheticalSetName(name string) bool {
-	switch toLowerASCII(name) {
+	switch name {
 	case "rank", "dense_rank", "percent_rank", "cume_dist":
 		return true
 	}
@@ -1303,7 +1303,7 @@ func isHypotheticalSetName(name string) bool {
 // aggregates are hand-resolved (the single-operand aggregate catalog can't express a key/value
 // pair), like jsonb_set among the scalar functions (json-sql-functions.md §4).
 func objectAggClassify(name string) (aggPlan, bool) {
-	switch toLowerASCII(name) {
+	switch name {
 	case "jsonb_object_agg":
 		return planJsonbObjectAgg, true
 	case "json_object_agg":
@@ -1322,9 +1322,9 @@ func objectAggClassify(name string) (aggPlan, bool) {
 // used without one it is 42809 (spec/design/window.md §7). The catalog aggregates double as window
 // functions but are not in Windows, so they are still valid without OVER.
 func isWindowOnlyName(name string) bool {
-	lname := toLowerASCII(name)
+	lname := name
 	for i := range windows {
-		if toLowerASCII(windows[i].Surface) == lname {
+		if surfaceMatches(windows[i].Surface, lname) {
 			return true
 		}
 	}
@@ -1663,10 +1663,10 @@ func resolveWindowClause(windows []namedWindow) ([]namedWindow, error) {
 }
 
 // lookupWindow finds a (resolved, Base == "") window definition by name in windows,
-// case-insensitively, or raises 42704 `window "<name>" does not exist`.
+// by exact name, or raises 42704 `window "<name>" does not exist`.
 func lookupWindow(windows []namedWindow, name string) (windowDef, error) {
 	for i := range windows {
-		if strings.EqualFold(windows[i].Name, name) {
+		if windows[i].Name == name {
 			return windows[i].Def, nil
 		}
 	}
@@ -2051,4 +2051,24 @@ func desugarNamedWindows(e exprNode, windows []namedWindow) (exprNode, error) {
 		// Leaves, subscripts, and subqueries (independent) carry no top-level window ref to rewrite.
 		return e, nil
 	}
+}
+
+// surfaceMatches reports whether a function NAME (already folded / exact, grammar.md §3) names the
+// catalog surface spelling. Catalog surfaces are a fixed vocabulary authored in uppercase (COUNT),
+// so the name matches the surface's lowercase spelling byte-exactly — count resolves, a quoted
+// "COUNT" does not (PostgreSQL's rule).
+func surfaceMatches(surface, name string) bool {
+	if len(surface) != len(name) {
+		return false
+	}
+	for i := 0; i < len(surface); i++ {
+		c := surface[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != name[i] {
+			return false
+		}
+	}
+	return true
 }

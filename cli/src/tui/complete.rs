@@ -101,7 +101,8 @@ pub fn current_word(line: &str, col: usize) -> (usize, String) {
 }
 
 /// Completion candidates for `prefix` (case-insensitive), deduplicated and sorted:
-/// catalog names first (tables, then columns — completed in their canonical spelling),
+/// catalog names first (tables, then columns — completed as SQL identifier text: the exact name,
+/// double-quoted when it is not a plain lowercase identifier, grammar.md §3),
 /// then grammar words (case-styled after the prefix). An empty prefix matches nothing —
 /// Tab at a non-word position should stay an ordinary key.
 pub fn candidates(db: &jed::Session, prefix: &str) -> Vec<String> {
@@ -116,18 +117,18 @@ pub fn candidates(db: &jed::Session, prefix: &str) -> Vec<String> {
     let mut columns: Vec<String> = Vec::new();
     for name in db.table_names() {
         if matches(&name) {
-            tables.push(name.clone());
+            tables.push(jed::tooling::quote_identifier(&name));
         }
         let Some(table) = db.table(&name) else {
             continue;
         };
         for col in &table.columns {
             if matches(&col.name) {
-                columns.push(col.name.clone());
+                columns.push(jed::tooling::quote_identifier(&col.name));
             }
         }
     }
-    columns.sort_by_key(|c| c.to_ascii_lowercase());
+    columns.sort();
     columns.dedup();
 
     // Keywords follow the typed case: an all-uppercase prefix completes uppercase.
@@ -157,8 +158,11 @@ mod tests {
         let mut db = jed::Database::create(jed::CreateOptions::default())
             .expect("in-memory create is infallible")
             .session(jed::SessionOptions::default());
-        db.execute("CREATE TABLE Users (id i32 PRIMARY KEY, score i32)", &[])
-            .unwrap();
+        db.execute(
+            "CREATE TABLE \"Users\" (id i32 PRIMARY KEY, score i32)",
+            &[],
+        )
+        .unwrap();
         db.execute("CREATE TABLE selections (sel i32 PRIMARY KEY)", &[])
             .unwrap();
         db
@@ -178,8 +182,9 @@ mod tests {
         let db = db();
         // `sel` hits the table `selections` (catalog first) and the keyword `select`.
         assert_eq!(candidates(&db, "sel"), vec!["selections", "select"]);
-        // Catalog names complete in canonical spelling regardless of typed case.
-        assert_eq!(candidates(&db, "use"), vec!["Users"]);
+        // Catalog names complete as identifier text regardless of typed case: a mixed-case name
+        // completes quoted (grammar.md §3).
+        assert_eq!(candidates(&db, "use"), vec!["\"Users\""]);
         // Columns complete too.
         assert_eq!(candidates(&db, "sco"), vec!["score"]);
         // An uppercase prefix completes keywords uppercase.

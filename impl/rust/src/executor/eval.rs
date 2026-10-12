@@ -2326,6 +2326,8 @@ impl RExpr {
                             Value::Text(s) => s,
                             _ => unreachable!("resolver restricts nextval's argument to text"),
                         };
+                        // The text names the sequence as one identifier (grammar.md §3).
+                        let name = &crate::parser::parse_name_text(name)?;
                         Ok(Value::Int(env.exec.seq_nextval(name)?))
                     }
                     ScalarFunc::Currval => {
@@ -2333,6 +2335,7 @@ impl RExpr {
                             Value::Text(s) => s,
                             _ => unreachable!("resolver restricts currval's argument to text"),
                         };
+                        let name = &crate::parser::parse_name_text(name)?;
                         Ok(Value::Int(env.exec.seq_currval(name)?))
                     }
                     // setval charges sequence_advance (it rewrites the catalog tuple, like nextval).
@@ -2343,6 +2346,7 @@ impl RExpr {
                             Value::Text(s) => s,
                             _ => unreachable!("resolver restricts setval's first argument to text"),
                         };
+                        let name = &crate::parser::parse_name_text(name)?;
                         let n = match &vals[1] {
                             Value::Int(n) => *n,
                             _ => unreachable!("resolver restricts setval's value to integer"),

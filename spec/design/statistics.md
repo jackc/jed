@@ -274,7 +274,7 @@ single catalog entry must still fit one page. `entry_kind = 4` has a `stats_kind
 - `2` histogram: table name, column ordinal, bound ordinal, and one typed non-NULL value.
 
 The 128-byte retained-value limit plus 63-byte identifier limit guarantees each value entry fits the
-minimum 256-byte page payload. Entries sort by `(lowercase table name, column ordinal, stats_kind,
+minimum 256-byte page payload. Entries sort by `(table name bytes, column ordinal, stats_kind,
 ordinal)`. On load, summaries must be unique; referenced tables/ordinals must exist; counts and
 ordinals must be exact/contiguous; MCV values must be distinct and in canonical frequency/key order;
 histogram bounds must be nondecreasing; every value must decode under the column type and satisfy
@@ -302,7 +302,7 @@ jed_statistics(
 )
 ```
 
-One row exists per collected column, ordered internally by lowercased table name then column ordinal.
+One row exists per collected column, ordered internally by table name (byte order) then column ordinal.
 It charges one `generated_row` at the source, no page/storage row units, is independently SELECT-
 gated as `jed_statistics`, and scopes through `main`/`temp`/attachments like the other catalog
 relations. Typed MCV/histogram arrays stay internal in the current surface.

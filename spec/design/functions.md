@@ -277,6 +277,9 @@ expression is** — projection, `WHERE`, `JOIN ON`. The shared `function_call` g
 ([grammar.md](grammar.md) §17) is disambiguated at resolve time: an aggregate name collects
 into the aggregate context; a scalar-function name resolves to an ordinary per-row
 expression node in the current context; any other name is `42883` (`undefined_function`).
+Built-in function names are lowercase and match the **folded** name byte-exactly
+([grammar.md §3](grammar.md)): `LOWER(x)` and `"lower"(x)` resolve, `"LOWER"(x)` is `42883`, as
+PostgreSQL.
 A scalar function may still *contain* an aggregate (`abs(sum(x))`) — its argument resolves
 in the same context the call sits in, so `sum` inside it is collected in a projection and
 rejected `42803` in a `WHERE`.
@@ -449,7 +452,8 @@ guards future named overloads).
 **Resolution — normalize-then-dispatch.** A shared per-core `normalize_named_args` step runs
 *before* the ordinary family dispatch. Given the call's positional + named arguments and the
 catalog row, it builds the positional argument vector of length `arity`: positional args fill
-their index in order; each named arg is placed at its `arg_names` index (unknown name `42883`,
+their index in order; each named arg is placed at its `arg_names` index (matched byte-exactly on the folded name;
+unknown name `42883`,
 duplicate / collision `42601`); every still-empty trailing slot is filled from `arg_defaults`,
 and a still-empty *non*-defaulted slot means no overload matches (`42883`). Each resolved
 argument is then resolved **with its declared family as the expected-type hint** — this is what

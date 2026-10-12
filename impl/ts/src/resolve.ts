@@ -192,7 +192,7 @@ export function resolveProjections(
     // other items. Resolved against the LOCAL scope only (like bare `*`); an unknown label is 42P01,
     // exactly as a qualified column ref.
     if (it.expr.kind === "qualifiedStar") {
-      const want = it.expr.qualifier.toLowerCase();
+      const want = it.expr.qualifier;
       let table: Table | undefined;
       let slots: number[] = [];
       const rel = scope.rels.find((r) => r.label === want);
@@ -277,14 +277,14 @@ export function outputName(scope: Scope, e: Expr): string {
       return e.name;
     }
   }
-  // An un-aliased aggregate call is named by its lowercased function name (PG; §8). A field
-  // selection takes the FIELD name lowercased (PG names the output column after the field).
-  if (e.kind === "funcCall") return e.name.toLowerCase();
+  // An un-aliased aggregate call is named by its exact function name (PG; §8). A field
+  // selection takes the FIELD name (PG names the output column after the field).
+  if (e.kind === "funcCall") return e.name;
   // The fixed keyword lowercased (PG; grammar.md §51) — no expression printer needed.
   if (e.kind === "coalesce") return "coalesce";
   // The fixed keyword lowercased (PG; grammar.md §52).
   if (e.kind === "greatestLeast") return e.greatest ? "greatest" : "least";
-  if (e.kind === "fieldAccess") return e.field.toLowerCase();
+  if (e.kind === "fieldAccess") return e.field;
   // A subscript takes the base array's name (PG names `a[1]` after `a`); `a[1][2]` recurses to the
   // same base. A non-column base falls through to `?column?`.
   if (e.kind === "subscript") return outputName(scope, e.base);
@@ -297,16 +297,16 @@ export function outputName(scope: Scope, e: Expr): string {
 // the matching select-list item's expression (the caller routes it exactly like the same ordinal: a
 // plain column stays on the slot fast path, a computed item is materialized), or null when no output
 // name matches (the caller falls back to the FROM scope, the prior behavior). Matching is
-// case-insensitive (§8). Only an explicit list is scanned — with * the output names are the scope
+// byte-exact (§8). Only an explicit list is scanned — with * the output names are the scope
 // columns, so the FROM-scope fallback already binds the same column. Two items of the same name with
 // DIFFERENT expressions are ambiguous (42702); the same expression twice is not, matching PG.
 export function orderAliasMatch(items: SelectItems, name: string, scope: Scope): Expr | null {
   if (items.kind !== "list") return null;
-  const lower = name.toLowerCase();
+  const lower = name;
   let found: Expr | null = null;
   for (const it of items.items) {
     const oname = it.alias ?? outputName(scope, it.expr);
-    if (oname.toLowerCase() !== lower) continue;
+    if (oname !== lower) continue;
     if (found === null) found = it.expr;
     else if (!exprEqual(found, it.expr))
       throw engineError("ambiguous_column", `ORDER BY "${name}" is ambiguous`);
@@ -351,7 +351,7 @@ export function resolveColumnRef(
 // resolveFieldOf resolves a composite field selection `base.field` (spec/design/composite.md §S4)
 // given the already-resolved `base` node and its static type: `base` must be composite — else 42809
 // (wrong_object_type, PG's "column notation applied to non-composite") — and `field` must name one
-// of its fields case-insensitively (PG folds the identifier), else 42703 (undefined_column). Returns
+// of its fields by exact name (PG folds the identifier), else 42703 (undefined_column). Returns
 // the `field` RExpr node carrying the fixed field ordinal, plus the field's static type.
 export function resolveFieldOf(
   baseNode: RExpr,
@@ -368,8 +368,8 @@ export function resolveFieldOf(
         ", which is not a composite type",
     );
   }
-  const lower = field.toLowerCase();
-  const idx = baseType.fields.findIndex((f) => f.name.toLowerCase() === lower);
+  const lower = field;
+  const idx = baseType.fields.findIndex((f) => f.name === lower);
   if (idx < 0) throw undefinedColumn(field);
   return {
     node: { kind: "field", base: baseNode, index: idx },
@@ -635,7 +635,7 @@ export function resolve(
         ) {
           throw engineError(
             "feature_not_supported",
-            `OVER is not supported for hypothetical-set aggregate ${e.name.toLowerCase()}`,
+            `OVER is not supported for hypothetical-set aggregate ${e.name}`,
           );
         }
         return resolveHypotheticalSetAggregate(scope, e, ag, params);
@@ -651,24 +651,24 @@ export function resolve(
         ) {
           throw engineError(
             "feature_not_supported",
-            `OVER is not supported for ordered-set aggregate ${e.name.toLowerCase()}`,
+            `OVER is not supported for ordered-set aggregate ${e.name}`,
           );
         }
         if (e.withinGroup === undefined || e.withinGroup === null) {
-          throw noAggOverload(e.name.toLowerCase());
+          throw noAggOverload(e.name);
         }
         return resolveOrderedSetAggregate(scope, e, ag, params);
       }
       // WITHIN GROUP on a non-ordered-set function (an ordinary aggregate or a scalar function) is
       // 42883 — PG models it as a missing overload (`sum(numeric, numeric) does not exist`).
       if (e.withinGroup !== undefined && e.withinGroup !== null) {
-        throw noAggOverload(e.name.toLowerCase());
+        throw noAggOverload(e.name);
       }
       // A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
       if (e.over !== undefined && e.over !== null) {
         // GROUPING is not a window function — GROUPING(a) OVER () is a syntax error in PostgreSQL
         // (42601); match it rather than treating GROUPING as an unknown window function.
-        if (e.name.toLowerCase() === "grouping") {
+        if (e.name === "grouping") {
           throw engineError("syntax_error", "OVER is not supported for GROUPING");
         }
         // DISTINCT is not implemented for window functions (PG 0A000 — aggregates.md §5): a window
@@ -699,10 +699,7 @@ export function resolve(
       // A window-only function (row_number/…) used WITHOUT OVER is 42809 (PG's wrong_object_type,
       // not the windowing_error 42P20 it uses for a window in WHERE — window.md §7, oracle-verified).
       if (isWindowOnlyName(e.name)) {
-        throw engineError(
-          "wrong_object_type",
-          `window function ${e.name.toLowerCase()} requires an OVER clause`,
-        );
+        throw engineError("wrong_object_type", `window function ${e.name} requires an OVER clause`);
       }
       return resolveFuncCall(scope, e, ag, params);
     }
@@ -1176,10 +1173,7 @@ export function resolve(
           };
         }
         // An identical named composite is the identity cast.
-        if (
-          inner.type.kind === "composite" &&
-          inner.type.name?.toLowerCase() === ct.name.toLowerCase()
-        ) {
+        if (inner.type.kind === "composite" && inner.type.name === ct.name) {
           return inner;
         }
         throw engineError(
@@ -1966,7 +1960,7 @@ export function deriveCollation(scope: Scope, e: Expr): Deriv {
     }
     // An ordered-set aggregate returning its key's type (mode / percentile_disc): the one key.
     const wg = e.withinGroup ?? null;
-    const lname = asciiLower(e.name);
+    const lname = e.name;
     if (wg !== null && (lname === "mode" || lname === "percentile_disc")) {
       if (wg.length === 0) return { kind: "none" };
       return combineDeriv({ kind: "none" }, orderKeyDeriv(scope, wg[0]!));
@@ -2024,7 +2018,7 @@ function aggResultCollatable(name: string): boolean {
       ...WINDOWS.filter((w) => w.result === "same_as_input").map((w) => asciiLower(w.surface)),
     ]);
   }
-  return aggResultCollatableNames.has(asciiLower(name));
+  return aggResultCollatableNames.has(name); // byte-exact against the lowercased surface (surfaceMatches)
 }
 
 // noteSubqueryDeriv records a scalar subquery's output-column derivation on the scope it was
@@ -2108,10 +2102,10 @@ function functionResultCollatable(name: string): boolean {
         (o) =>
           o.kind === "function" &&
           (o.result === "text" || o.result === "text[]" || o.result === "anyarray"),
-      ).map((o) => asciiLower(o.name)),
+      ).map((o) => o.name),
     );
   }
-  return collatableFunctionNames.has(asciiLower(name));
+  return collatableFunctionNames.has(name);
 }
 
 // commonCollation is the common collation of one set-operation / VALUES output column

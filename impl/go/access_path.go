@@ -5,7 +5,6 @@ import (
 	"math"
 	"slices"
 	"sort"
-	"strings"
 )
 
 // Access-path MECHANISMS — turning a WHERE filter into a bounded scan (spec/design/cost.md §3;
@@ -132,7 +131,7 @@ const (
 )
 
 // scanCandidateIdentity is a candidate's canonical, collision-free physical identity. indexName is
-// the lowercased catalog name for an index-bearing path and empty for PK/PK-interval/full paths.
+// the exact catalog name for an index-bearing path and empty for PK/PK-interval/full paths.
 // Index names are unique within the relation namespace, so (kind, indexName) is total for an
 // inventory.
 type scanCandidateIdentity struct {
@@ -357,7 +356,7 @@ type indexEqCol struct {
 // prefix (columns[len(eqCols):]) — the range column (if any) plus every trailing column — each
 // FIXED-WIDTH so an admitted entry's row-key suffix is recovered by width-skipping them past P.
 type indexBoundPlan struct {
-	nameKey     string // the index store's key — the lowercased index name
+	nameKey     string // the index store's key — the exact index name
 	eqCols      []indexEqCol
 	rangeType   scalarType  // the range column's type (meaningful iff rangeTerms != nil)
 	rangeTerms  []boundTerm // range conjuncts on the column after the equality prefix (nil ⇒ none)
@@ -485,7 +484,7 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 		suffix = append(suffix, s)
 	}
 	return &indexBoundPlan{
-		nameKey: strings.ToLower(idx.Name), eqCols: eqCols,
+		nameKey: idx.Name, eqCols: eqCols,
 		rangeType: rangeType, rangeTerms: rangeTerms, suffixTypes: suffix,
 	}
 }
@@ -510,7 +509,7 @@ func inventoryScanCandidates(filter *rExpr, rel scopeRel, db *engine) []scanCand
 		candidates = append(candidates, storageOrderCandidate(scanCandidatePK, "", &scanBound{pk: bp}, filter))
 	}
 	// Do not trust catalog/container iteration for identity order. The final sort applies the shared
-	// kind rank followed by raw UTF-8 bytes of the already-lowercased index name.
+	// kind rank followed by raw UTF-8 bytes of the exact index name.
 	for _, idx := range rel.table.Indexes {
 		if ib := db.buildIndexAccessPredicate(filter, rel, idx, nil); ib != nil {
 			candidates = append(candidates, indexOrderCandidate(scanCandidateBtree, ib.nameKey, &scanBound{index: ib}, filter))
@@ -671,7 +670,7 @@ func (db *engine) buildIndexIntervalSetPlan(filter *rExpr, rel scopeRel, idx ind
 	for _, c := range cols[1:] {
 		tail = append(tail, rel.table.Columns[c].Type.ScalarTy())
 	}
-	return &indexKeySetPlan{nameKey: strings.ToLower(idx.Name), colType: ty, coll: coll, tailTypes: tail, specs: specs, clip: clip}
+	return &indexKeySetPlan{nameKey: idx.Name, colType: ty, coll: coll, tailTypes: tail, specs: specs, clip: clip}
 }
 
 // planMutationScan selects an UPDATE/DELETE target access path by cost (estimator.md §9.3): every
@@ -686,7 +685,7 @@ func (db *engine) planMutationScan(scope *string, table *catTable, filter *rExpr
 	if filter == nil {
 		return plan
 	}
-	rel := scopeRel{label: strings.ToLower(table.Name), table: table, offset: 0, db: scope}
+	rel := scopeRel{label: table.Name, table: table, offset: 0, db: scope}
 	candidates := inventoryScanCandidates(filter, rel, db)
 	plan.bound = selectCostedScanCandidate(candidates, db.estimateScanCandidates(candidates, rel, false), selectLegacyScanCandidate(candidates))
 	return plan
@@ -907,7 +906,7 @@ func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, sibling
 				tail = append(tail, rel.table.Columns[c].Type.ScalarTy())
 			}
 			bound := &scanBound{index: &indexBoundPlan{
-				nameKey:     strings.ToLower(idx.Name),
+				nameKey:     idx.Name,
 				eqCols:      []indexEqCol{{colType: ty, coll: coll, srcs: eqs}},
 				suffixTypes: tail,
 			}}
@@ -928,13 +927,13 @@ func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, sibling
 		for _, filter := range filters {
 			if colTy.IsRange() {
 				if s, _, ok := gistSiblingMatch(filter, colGlobal, siblingColumns); ok {
-					bound := &scanBound{gist: &gistBoundPlan{nameKey: strings.ToLower(idx.Name), strategy: s, colGlobal: colGlobal}}
+					bound := &scanBound{gist: &gistBoundPlan{nameKey: idx.Name, strategy: s, colGlobal: colGlobal}}
 					candidates = append(candidates, storageOrderCandidate(scanCandidateGist, bound.gist.nameKey, bound, whereFilter))
 					break
 				}
 			} else if isGistScalarType(colTy) {
 				if _, _, ok := gistScalarSiblingMatch(filter, colGlobal, siblingColumns); ok {
-					bound := &scanBound{gist: &gistBoundPlan{nameKey: strings.ToLower(idx.Name), strategy: gistEqual, colGlobal: colGlobal, scalarType: colTy.ScalarTy()}}
+					bound := &scanBound{gist: &gistBoundPlan{nameKey: idx.Name, strategy: gistEqual, colGlobal: colGlobal, scalarType: colTy.ScalarTy()}}
 					candidates = append(candidates, storageOrderCandidate(scanCandidateGist, bound.gist.nameKey, bound, whereFilter))
 					break
 				}
@@ -954,7 +953,7 @@ func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, sibling
 		for _, filter := range filters {
 			if s, _, ok := ginSiblingMatch(filter, colGlobal, siblingColumns); ok {
 				bound := &scanBound{gin: &ginBoundPlan{
-					nameKey: strings.ToLower(idx.Name), elemType: at.Array.ScalarTy(), strategy: s, colGlobal: colGlobal,
+					nameKey: idx.Name, elemType: at.Array.ScalarTy(), strategy: s, colGlobal: colGlobal,
 				}}
 				candidates = append(candidates, storageOrderCandidate(scanCandidateGin, bound.gin.nameKey, bound, whereFilter))
 				break
@@ -1012,7 +1011,7 @@ func buildGinBoundForIndex(filter *rExpr, idx indexDef, columns []catColumn, off
 	}
 	if s, _, ok := ginMatch(filter, colGlobal); ok {
 		return &ginBoundPlan{
-			nameKey: strings.ToLower(idx.Name), elemType: at.Array.ScalarTy(), strategy: s, colGlobal: colGlobal,
+			nameKey: idx.Name, elemType: at.Array.ScalarTy(), strategy: s, colGlobal: colGlobal,
 		}
 	}
 	return nil
@@ -1099,12 +1098,12 @@ func buildGistBoundForIndex(filter *rExpr, idx indexDef, columns []catColumn, of
 	if colTy.IsRange() {
 		// range_ops (GX1): a `col && Q` / `col @> Q` conjunct.
 		if s, _, ok := gistMatch(filter, colGlobal); ok {
-			return &gistBoundPlan{nameKey: strings.ToLower(idx.Name), strategy: s, colGlobal: colGlobal}
+			return &gistBoundPlan{nameKey: idx.Name, strategy: s, colGlobal: colGlobal}
 		}
 	} else if isGistScalarType(colTy) {
 		// scalar `=` opclass (GX2): a `col = Q` conjunct over a fixed-width keyable scalar.
 		if _, _, ok := gistScalarMatch(filter, colGlobal); ok {
-			return &gistBoundPlan{nameKey: strings.ToLower(idx.Name), strategy: gistEqual, colGlobal: colGlobal, scalarType: colTy.ScalarTy()}
+			return &gistBoundPlan{nameKey: idx.Name, strategy: gistEqual, colGlobal: colGlobal, scalarType: colTy.ScalarTy()}
 		}
 	}
 	return nil
@@ -2818,7 +2817,7 @@ func pkStorageWidth(table *catTable) (int, bool) {
 // indexOrderPlan is the secondary-index-order plan: walk a B-tree index in key order to satisfy an
 // ORDER BY without a sort, point-looking-up each row by its primary key (cost.md §3).
 type indexOrderPlan struct {
-	nameKey string // the index store's key — the lowercased index name
+	nameKey string // the index store's key — the exact index name
 	pkWidth int    // the fixed PK-suffix byte width to peel off the END of each index entry key
 }
 
@@ -2884,7 +2883,7 @@ func (db *engine) orderSatisfiedByIndexes(table *catTable, offset int, order []o
 			}
 		}
 		if matchesOrder {
-			matches = append(matches, indexOrderPlan{nameKey: strings.ToLower(idx.Name), pkWidth: pkWidth})
+			matches = append(matches, indexOrderPlan{nameKey: idx.Name, pkWidth: pkWidth})
 		}
 	}
 	sort.SliceStable(matches, func(i, j int) bool {

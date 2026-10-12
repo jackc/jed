@@ -129,6 +129,10 @@ free because `table_ref` is currently unqualified:
   names table `sales` in the attachment `reports`; a bare `sales` resolves in **implicit** scope
   (§2). An unknown qualifier is **`42P01`** (`undefined_table`, PG's own, reused with the message
   *"database \"reports\" is not attached"* — see §11 on whether a dedicated code is warranted).
+  The qualifier is an identifier like any other ([grammar.md §3](grammar.md)): a bare qualifier folds
+  to lowercase, a quoted one is exact, and it matches the attachment name **byte-exactly** — so
+  `attach("Reports", …)` is reached as `"Reports".sales`, and `attach("reports", …)` as
+  `reports.sales` or `Reports.sales`.
 - **Column position is unchanged — `rel.col` stays 2-part**, where `rel` is the relation's **label**
   (its alias, or its table name when unaliased — grammar.md §15). To reference a column of an attached
   table, you use the relation's label exactly as today: `FROM reports.sales s` then `s.amount`, or
@@ -163,7 +167,9 @@ the sanctioned host-supplied inputs (storage bytes, unicode data, entropy/clock)
 so it lands the same way:
 
 - **`db.attach(name, source, mode)`** / **`db.detach(name)`** are **host-API** methods on the
-  `Database` handle ([api.md](api.md) is authoritative for their signatures). `source` is either an
+  `Database` handle ([api.md](api.md) is authoritative for their signatures). `name` is taken
+  **verbatim** — never folded or parsed for quotes (host-API names are exact, grammar.md §3), so the
+  reserved-name check (`main`/`temp`, `42710`) and the duplicate check are byte-exact. `source` is either an
   already-open file `BlockStore` (the host does the `open`, mapping `58P01`/`58P02` as for `main`,
   hosts.md §4) or a request for a fresh **in-memory** attachment. These sit **outside** the SQL
   capability envelope entirely (session.md §5.3) — an untrusted, `{SELECT}`-only session **cannot**

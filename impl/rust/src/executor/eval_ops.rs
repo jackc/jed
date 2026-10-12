@@ -1056,15 +1056,12 @@ pub(crate) fn resolve_setop_order_key(key: &OrderKey, names: &[String]) -> Resul
             format!("missing FROM-clause entry for table {q}"),
         ));
     }
-    names
-        .iter()
-        .position(|n| n.eq_ignore_ascii_case(&key.column))
-        .ok_or_else(|| {
-            EngineError::new(
-                SqlState::UndefinedColumn,
-                format!("column {} does not exist", key.column),
-            )
-        })
+    names.iter().position(|n| n == &key.column).ok_or_else(|| {
+        EngineError::new(
+            SqlState::UndefinedColumn,
+            format!("column {} does not exist", key.column),
+        )
+    })
 }
 
 pub(crate) fn require_bool(ty: &ResolvedType, msg: &str) -> Result<()> {
@@ -1814,14 +1811,14 @@ pub(crate) fn resolve_arbiter(
             ))
         }
         ConflictTarget::Constraint(name) => {
-            let pkey = format!("{}_pkey", tdef.name.to_ascii_lowercase());
-            if !pk.is_empty() && name.eq_ignore_ascii_case(&pkey) {
+            let pkey = format!("{}_pkey", tdef.name);
+            if !pk.is_empty() && name == &pkey {
                 return Ok(Some(Arbiter::PrimaryKey));
             }
             if let Some(i) = tdef
                 .indexes
                 .iter()
-                .position(|d| d.unique && d.name.eq_ignore_ascii_case(name))
+                .position(|d| d.unique && d.name == *name)
             {
                 return Ok(Some(Arbiter::Index(i)));
             }

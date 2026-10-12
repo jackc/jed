@@ -56,9 +56,9 @@ fn index_names(db: &Session, table: &str) -> Vec<(String, bool)> {
 }
 
 /// Constraint naming matches PostgreSQL (oracle-probed, constraints.md §5.3): the
-/// lowercased `<table>_<cols>_key` base with the smallest free suffix, walked past BOTH
+/// `<table>_<cols>_key` base (from the exact names) with the smallest free suffix, walked past BOTH
 /// the relation namespace and the table's check names; an explicit CONSTRAINT name is the
-/// index name as written.
+/// exact index name.
 #[test]
 fn constraint_naming_matches_postgres() {
     let mut db = Database::create(CreateOptions::default())
@@ -68,7 +68,7 @@ fn constraint_naming_matches_postgres() {
     run(&mut db, "CREATE INDEX walk_a_key ON other (x)"); // occupies the derived base
     run(
         &mut db,
-        "CREATE TABLE Walk (a i32 UNIQUE, b i32, CONSTRAINT Named UNIQUE (b, a), CONSTRAINT walk_b_check CHECK (b > 0), UNIQUE (b))",
+        "CREATE TABLE Walk (a i32 UNIQUE, b i32, CONSTRAINT \"Named\" UNIQUE (b, a), CONSTRAINT walk_b_check CHECK (b > 0), UNIQUE (b))",
     );
     // walk_a_key taken by a relation -> walk_a_key1; walk_b_key derived past the CHECK
     // name walk_b_check (different name, no walk needed); Named kept as written.
@@ -89,6 +89,9 @@ fn constraint_naming_matches_postgres() {
         index_names(&db, "w1"),
         vec![("w1_a_key1".to_string(), true)]
     );
+    // Derived from the EXACT names (PG: `CREATE TABLE "Uq" ("K" int UNIQUE)` → `Uq_K_key`).
+    run(&mut db, "CREATE TABLE \"Uq\" (\"K\" i32 UNIQUE)");
+    assert_eq!(index_names(&db, "Uq"), vec![("Uq_K_key".to_string(), true)]);
 }
 
 /// The dedup/fold rules match PostgreSQL (oracle-probed, constraints.md §5.2): identical

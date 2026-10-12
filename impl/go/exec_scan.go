@@ -2,7 +2,6 @@ package jed
 
 import (
 	"bytes"
-	"strings"
 	"sync/atomic"
 )
 
@@ -147,7 +146,7 @@ func (db *engine) planTouchesTemp(sp *selectPlan) bool {
 	for i := range sp.rels {
 		r := &sp.rels[i]
 		if r.db != nil {
-			if strings.EqualFold(*r.db, "temp") {
+			if *r.db == "temp" {
 				return true
 			}
 			continue
@@ -169,19 +168,19 @@ func (db *engine) estimatorInputFor(r *planRel) (estimatorInputSignature, bool) 
 		}
 		snap = db.readSnap()
 	} else {
-		switch strings.ToLower(*r.db) {
+		switch *r.db {
 		case "temp":
 			return estimatorInputSignature{}, false
 		case "main":
 			snap = db.readSnap()
 		default:
-			snap = db.attachReadSnap(strings.ToLower(*r.db))
+			snap = db.attachReadSnap(*r.db)
 		}
 	}
 	if snap == nil {
 		return estimatorInputSignature{}, false
 	}
-	table := strings.ToLower(r.tableName)
+	table := r.tableName
 	def, ok := snap.table(table)
 	if !ok {
 		return estimatorInputSignature{}, false
@@ -224,12 +223,12 @@ func (db *engine) estimatorInputsMatch(sp *selectPlan, want []estimatorInputSign
 				return false
 			}
 			snap = db.readSnap()
-		} else if strings.EqualFold(*rel.db, "temp") {
+		} else if *rel.db == "temp" {
 			return false
-		} else if strings.EqualFold(*rel.db, "main") {
+		} else if *rel.db == "main" {
 			snap = db.readSnap()
 		} else {
-			snap = db.attachReadSnap(strings.ToLower(*rel.db))
+			snap = db.attachReadSnap(*rel.db)
 		}
 		if snap == nil {
 			return false

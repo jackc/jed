@@ -814,7 +814,7 @@ nothing new.
   follow it. The column-list analysis (`42703`/`42701`, the `OVERRIDING` adjustment) runs before
   defaults resolve, because it determines which defaults the statement needs. So a statement that both hits
   a stale check (`XX002`) or a missing check function (`42883`) and needs a missing default function
-  reports the **check** error. Checks verify in evaluation (lowercased-name) order and defaults in
+  reports the **check** error. Checks verify in evaluation (name byte) order and defaults in
   column-ordinal order, so the first failure is deterministic.
 - **Cost.** Dependency collection and verification are resolution-time work and are unmetered, as
   in §8.1. Evaluation cost is unchanged: a host call charges its declared `cost` per call (§9).

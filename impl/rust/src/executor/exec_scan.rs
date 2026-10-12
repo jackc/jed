@@ -1104,7 +1104,7 @@ impl Engine {
     /// Cheap: one map lookup per relation, against a usually-empty temp catalog.
     pub(crate) fn plan_touches_temp(&self, sp: &SelectPlan) -> bool {
         sp.rels.iter().any(|r| match r.db.as_deref() {
-            Some(scope) => scope.eq_ignore_ascii_case("temp"),
+            Some(scope) => scope == "temp",
             None => self.is_temp_table(&r.table_name),
         })
     }
@@ -1119,11 +1119,11 @@ impl Engine {
                 }
                 self.read_snap()
             }
-            Some(scope) if scope.eq_ignore_ascii_case("temp") => return None,
-            Some(scope) if scope.eq_ignore_ascii_case("main") => self.read_snap(),
-            Some(scope) => self.attach_read_snap(&scope.to_ascii_lowercase())?,
+            Some(scope) if scope == "temp" => return None,
+            Some(scope) if scope == "main" => self.read_snap(),
+            Some(scope) => self.attach_read_snap(scope)?,
         };
-        let table = rel.table_name.to_ascii_lowercase();
+        let table = rel.table_name.to_string();
         let def = snap.table(&table)?;
         // A dynamic timezone set can change independently of the catalog generation.
         if def.indexes.iter().any(|ix| ix.timezone_deps.dynamic) {
@@ -1160,9 +1160,9 @@ impl Engine {
                     }
                     self.read_snap()
                 }
-                Some(scope) if scope.eq_ignore_ascii_case("temp") => return false,
-                Some(scope) if scope.eq_ignore_ascii_case("main") => self.read_snap(),
-                Some(scope) => match self.attach_read_snap(&scope.to_ascii_lowercase()) {
+                Some(scope) if scope == "temp" => return false,
+                Some(scope) if scope == "main" => self.read_snap(),
+                Some(scope) => match self.attach_read_snap(scope) {
                     Some(snap) => snap,
                     None => return false,
                 },

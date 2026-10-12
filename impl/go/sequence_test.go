@@ -412,3 +412,53 @@ func TestSerialIsNotACastableType(t *testing.T) {
 		t.Fatalf("expected 42704, got %s", code)
 	}
 }
+
+// TestDottedSequenceNameTextIsInvalidName — the regclass-style name text (grammar.md §3): a dotted
+// name is 42602 — jed has no schemas and does not resolve a qualified name from text, where
+// PostgreSQL would look up schema a (a documented divergence, so it cannot live in the PG-clean
+// corpus).
+func TestDottedSequenceNameTextIsInvalidName(t *testing.T) {
+	t.Parallel()
+	db := memDB().Session(SessionOptions{})
+	mustCreate(t, db, "CREATE SEQUENCE b")
+	for _, sql := range []string{
+		"SELECT nextval('a.b')",
+		"SELECT nextval('main.b')",
+		"SELECT currval('a.b')",
+		"SELECT setval('a.b', 5)",
+	} {
+		wantErr(t, db, sql, "42602")
+	}
+}
+
+// TestSerialDefaultTextQuotesTheSequenceName — a serial column's generated DEFAULT renders the owned
+// sequence's name by the quoting rule (grammar.md §3): bare when a plain lowercase identifier, else
+// double-quoted inside the string — and a sequence RENAME rewrites it the same way.
+func TestSerialDefaultTextQuotesTheSequenceName(t *testing.T) {
+	t.Parallel()
+	db := memDB().Session(SessionOptions{})
+	defaultText := func(table string) string {
+		t.Helper()
+		tbl, ok := db.Table(table)
+		if !ok || tbl.Columns[0].DefaultExpr == nil {
+			t.Fatalf("table %s has no column-0 expression default", table)
+		}
+		return tbl.Columns[0].DefaultExpr.ExprText
+	}
+	check := func(table, want string) {
+		t.Helper()
+		if got := defaultText(table); got != want {
+			t.Fatalf("%s default = %q, want %q", table, got, want)
+		}
+	}
+	mustCreate(t, db, "CREATE TABLE plain (id serial PRIMARY KEY)")
+	check("plain", "nextval ( 'plain_id_seq' )")
+	mustCreate(t, db, `CREATE TABLE "Tab" (id serial PRIMARY KEY)`)
+	check("Tab", `nextval ( '"Tab_id_seq"' )`)
+	mustCreate(t, db, `ALTER SEQUENCE "Tab_id_seq" RENAME TO tab_ids`)
+	check("Tab", "nextval ( 'tab_ids' )")
+	mustCreate(t, db, `ALTER SEQUENCE plain_id_seq RENAME TO "It's"`)
+	check("plain", `nextval ( '"It''s"' )`)
+	mustCreate(t, db, "INSERT INTO plain DEFAULT VALUES")
+	seqMustInt(t, db, "SELECT id FROM plain", 1)
+}

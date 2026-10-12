@@ -88,17 +88,17 @@ export type Table = {
   // membership convenience; this list is the authority for order.
   pk: number[];
   // The table's CHECK constraints in EVALUATION ORDER — ascending byte order of the
-  // lowercased name (spec/design/constraints.md §4.4); the on-disk catalog stores them in
+  // exact name (spec/design/constraints.md §4.4); the on-disk catalog stores them in
   // this same order. Empty for an unchecked table.
   checks: CheckConstraint[];
-  // The table's secondary indexes in ascending lowercased-name order (the catalog's
+  // The table's secondary indexes in ascending name byte order (the catalog's
   // on-disk order and the planner's tie-break order — spec/design/indexes.md).
   indexes: IndexDef[];
-  // The table's FOREIGN KEY constraints in ascending lowercased-name order (the catalog's
+  // The table's FOREIGN KEY constraints in ascending name byte order (the catalog's
   // on-disk order and the child-side evaluation order — spec/design/constraints.md §6.9).
   // Empty for a table with none.
   fks: ForeignKey[];
-  // The table's EXCLUDE constraints in ascending lowercased-name order (the catalog's on-disk
+  // The table's EXCLUDE constraints in ascending name byte order (the catalog's on-disk
   // order — spec/design/gist.md §7/§8). Each is backed by a GiST index in `indexes`. Empty for a
   // table with none.
   exclusions: ExclusionConstraint[];
@@ -136,7 +136,7 @@ export type FkAction = "noAction" | "restrict" | "cascade" | "setNull" | "setDef
 // list order, the referenced (parent) table name, the referenced column ordinals into the PARENT
 // in list order (same length as columns), and the referential actions. An FK owns no B-tree;
 // enforcement probes the parent's PK store or a unique index (§6.4). Held in ascending
-// lowercased-name order on the table (the catalog's on-disk order and the child-side evaluation
+// name byte order on the table (the catalog's on-disk order and the child-side evaluation
 // order — §6.9).
 export type ForeignKey = {
   name: string;
@@ -155,7 +155,7 @@ export type ForeignKey = {
 // writes — never a silent stale-key read). Sorted by (name, arg-type codes) when stored so
 // registration order never leaks (CLAUDE.md §8).
 export type HostFuncDep = {
-  // The (lowercased) SQL function name — the correlation key to a re-resolved hostFunc node.
+  // The exact SQL function name — the correlation key to a re-resolved hostFunc node.
   name: string;
   // The exact scalar argument signature — with `name`, identifies which overload this dependency pins.
   argTypes: ScalarType[];
@@ -182,7 +182,7 @@ export type IndexKey =
 // IndexDef is one secondary index of a table (spec/design/indexes.md): its
 // (relation-namespace) name and its key elements in index-key order (columns and/or
 // expressions, duplicates allowed — PG). The index's B-tree lives in the snapshot's
-// index-store map, keyed by the lowercased name. A unique index enforces uniqueness over
+// index-store map, keyed by the exact name. A unique index enforces uniqueness over
 // its key tuple (NULLS DISTINCT — spec/design/indexes.md §8); it is what backs a UNIQUE
 // constraint (spec/design/constraints.md §5).
 export type IndexDef = {
@@ -262,7 +262,7 @@ export type CheckConstraint = {
 // column's Type. Recursive — a field's type may itself be a composite (a nested composite,
 // persisted by name; spec/fileformat/format.md *Composite-type entry*).
 export type CompositeType = {
-  // The type name (original case — round-trips what the user typed); looked up case-insensitively.
+  // The exact type name (grammar.md §3); looked up byte-exactly.
   name: string;
   // The fields in declaration order (>= 1).
   fields: CompositeField[];
@@ -289,7 +289,7 @@ export type CompositeField = {
 // catalog, so the counter is transactional by construction (sequences.md §5). The i64 fields are
 // bigint (the TS core's exact-i64 representation).
 export type SequenceDef = {
-  // The sequence name (original case; looked up case-insensitively).
+  // The exact sequence name (grammar.md §3); looked up byte-exactly.
   name: string;
   // The step per nextval (non-zero). Positive = ascending, negative = descending.
   increment: bigint;
@@ -452,8 +452,8 @@ export function colTypeKeyable(ct: ColType): boolean {
 }
 
 // resolveColType resolves a catalog Type into a self-contained ColType against the database's
-// composite definitions (keyed by lowercased name, the Snapshot.types map). A composite reference
-// is looked up case-insensitively and recursively resolved; the lookup is guaranteed to succeed
+// composite definitions (keyed by exact name, the Snapshot.types map). A composite reference
+// is looked up by exact name and recursively resolved; the lookup is guaranteed to succeed
 // because validateCompositeTypes (the two-pass load / CREATE TYPE gate) proved every reference
 // exists and the graph is acyclic before any store is built (spec/design/composite.md §3).
 export function resolveColType(ty: Type, types: Map<string, CompositeType>): ColType {
@@ -465,7 +465,7 @@ export function resolveColType(ty: Type, types: Map<string, CompositeType>): Col
     // scalar ColType immediately.
     return { kind: "range", elem: resolveColType(ty.elem, types) };
   }
-  const def = types.get(ty.name.toLowerCase());
+  const def = types.get(ty.name);
   if (def === undefined) {
     throw new Error("composite type reference resolved by validateCompositeTypes");
   }
@@ -482,11 +482,10 @@ export function resolveColType(ty: Type, types: Map<string, CompositeType>): Col
   };
 }
 
-// columnIndex returns the index of the named column (case-insensitive), or -1.
+// columnIndex returns the index of the named column (exact name, grammar.md §3), or -1.
 export function columnIndex(t: Table, name: string): number {
-  const lower = name.toLowerCase();
   for (let i = 0; i < t.columns.length; i++) {
-    if (t.columns[i]!.name.toLowerCase() === lower) return i;
+    if (t.columns[i]!.name === name) return i;
   }
   return -1;
 }

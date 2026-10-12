@@ -16,10 +16,10 @@ use crate::types::ScalarType;
 use crate::value::{RangeVal, Value};
 use std::cmp::Ordering;
 
-/// Look up a range type by name (case-insensitive), matching the canonical id or any alias
+/// Look up a range type by name (exact name), matching the canonical id or any alias
 /// (`int4range` → `i32range`). `None` if `name` is not one of the six range types.
 pub fn range_by_name(name: &str) -> Option<&'static RangeDesc> {
-    let lname = name.to_ascii_lowercase();
+    let lname = name.to_string();
     RANGES
         .iter()
         .find(|r| r.id == lname || r.aliases.iter().any(|a| *a == lname))

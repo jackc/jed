@@ -59,9 +59,9 @@ function db20(): Session {
 }
 
 test("auto-naming matches PostgreSQL", () => {
-  // Lowercased <table>_<cols>_idx + the smallest free suffix (oracle-probed, indexes.md
-  // §2); duplicates in the column list are allowed and named through; an explicit name
-  // round-trips as written. The catalog holds indexes in ascending lowercased-name order.
+  // <table>_<cols>_idx from the exact (folded) names + the smallest free suffix (oracle-probed,
+  // indexes.md §2); duplicates in the column list are allowed and named through; an explicit name is
+  // the exact name. The catalog holds indexes in ascending name byte order (uppercase M < t).
   const db = memDb().session();
   run(db, "CREATE TABLE T (A i32 PRIMARY KEY, B i32)");
   run(db, "CREATE INDEX ON T (B)"); // t_b_idx
@@ -69,7 +69,7 @@ test("auto-naming matches PostgreSQL", () => {
   run(db, "CREATE INDEX ON T (B)"); // t_b_idx2
   run(db, "CREATE INDEX ON T (A, B)"); // t_a_b_idx
   run(db, "CREATE INDEX ON T (B, B)"); // t_b_b_idx (duplicate column allowed — PG)
-  run(db, "CREATE INDEX Mine ON T (B)");
+  run(db, 'CREATE INDEX "Mine" ON T (B)'); // explicit quoted name, exact case kept
   const t = db.table("t")!;
   assert.deepEqual(
     t.indexes.map((i) => i.name),
@@ -78,6 +78,14 @@ test("auto-naming matches PostgreSQL", () => {
   assert.deepEqual(indexColumnOrdinals(t.indexes[1]!), [0, 1]);
   assert.deepEqual(indexColumnOrdinals(t.indexes[2]!), [1, 1]);
   assert.deepEqual(pkIndices(t), [0]);
+  // Auto-names derive from the EXACT names (PG: CREATE INDEX ON "Up"("K") → Up_K_idx).
+  run(db, 'CREATE TABLE "Up" ("K" i32, k i32)');
+  run(db, 'CREATE INDEX ON "Up" ("K")');
+  run(db, 'CREATE INDEX ON "Up" (k)');
+  assert.deepEqual(
+    db.table("Up")!.indexes.map((i) => i.name),
+    ["Up_K_idx", "Up_k_idx"],
+  );
 });
 
 test("DDL errors match PostgreSQL", () => {

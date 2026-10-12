@@ -467,7 +467,7 @@ const (
 	reScalarFunc
 	// reHostFunc is a HOST-defined scalar-function call (spec/design/extensibility.md §4.2 / §5.1) —
 	// the injection seam that reaches a host-registered kernel, which the compiled scalarFunc switch
-	// cannot. Reuses `index` for the frozen-registry id, `cText` for the (lowercased) name (so
+	// cannot. Reuses `index` for the frozen-registry id, `cText` for the (exact) name (so
 	// EXPLAIN renders it without the registry), `sargs` for the argument nodes, and `result` for the
 	// declared scalar result type. STRICT (a NULL arg → NULL, short-circuited in eval like
 	// reScalarFunc). Kept a distinct kind so the built-in path stays monomorphized (§5).
@@ -1299,7 +1299,7 @@ const (
 )
 
 // cteBinding is a planned common table expression, owned by runWith for the whole statement
-// (spec/design/cte.md). name is lowercased for case-insensitive FROM matching; table is the
+// (spec/design/cte.md). name is the exact name for byte-exact FROM matching; table is the
 // synthetic relation exposing the body's output columns; source is the planned body (a query plan,
 // or — spec/design/writable-cte.md — a data-modifying statement); hint is the [NOT] MATERIALIZED
 // override (nil = default); refs counts the FROM references resolved to it during planning (the
@@ -1532,7 +1532,7 @@ type srfPlan struct {
 	jsonTable *jtPlan
 	// introspectScope is the validated database scope of a catalog relation (srfJedTables /
 	// srfJedColumns — introspection.md §5): "main" (also the unqualified default), "temp", or a
-	// lowercased attachment name. "" for every other kind.
+	// exact attachment name. "" for every other kind.
 	introspectScope string
 }
 

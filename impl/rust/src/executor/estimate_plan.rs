@@ -205,7 +205,7 @@ impl Engine {
     fn estimate_plan_rel_scope<'a>(&'a self, rel: &PlanRel) -> Option<ScopeRel<'a>> {
         let table = self.table_scoped(rel.db.as_deref(), &rel.table_name)?;
         Some(ScopeRel {
-            label: rel.table_name.to_ascii_lowercase(),
+            label: rel.table_name.to_string(),
             table,
             offset: rel.offset,
             qualifier_only: false,
@@ -1249,7 +1249,7 @@ impl Engine {
         ctx: Option<&EstimateCteCtx>,
     ) -> EstimatedPlan {
         let rel = ScopeRel {
-            label: table.name.to_ascii_lowercase(),
+            label: table.name.to_string(),
             table,
             offset: 0,
             qualifier_only: false,

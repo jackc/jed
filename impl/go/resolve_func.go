@@ -69,7 +69,7 @@ func familyMatches(slot string, t resolvedType) bool {
 	return slot == "any" || argFamily(t) == slot
 }
 
-// isScalarFuncName reports whether name (lowercased) is a registered scalar function (catalog
+// isScalarFuncName reports whether name (exact) is a registered scalar function (catalog
 // Kind=="function") — the data-driven replacement for the old hand-written known-name gate.
 func isScalarFuncName(name string) bool {
 	for i := range operators {
@@ -80,7 +80,7 @@ func isScalarFuncName(name string) bool {
 	return false
 }
 
-// isVariadicFuncName reports whether name (lowercased) is a VARIADIC scalar function
+// isVariadicFuncName reports whether name (exact) is a VARIADIC scalar function
 // (array-functions.md §12) — a Kind=="function" row with Variadic set (num_nulls/num_nonnulls).
 // Data-driven, so adding a variadic row to the catalog wires it here without touching this gate.
 func isVariadicFuncName(name string) bool {
@@ -375,7 +375,7 @@ func resolvedScalarType(t resolvedType) scalarType {
 // slot's type by structural equality, read back into the reserved result codes anyarray (= ELEM[])
 // and anyelement (= ELEM).
 
-// isArrayFuncName reports whether name (lowercased) is a polymorphic array function — a
+// isArrayFuncName reports whether name (exact) is a polymorphic array function — a
 // Kind=="function" catalog row whose ArgFamilies mention anyarray/anyelement. Data-driven.
 func isArrayFuncName(name string) bool {
 	for i := range operators {
@@ -679,7 +679,7 @@ func resolveArrayFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	if fc.Star {
 		return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 	}
-	name := toLowerASCII(fc.Name)
+	name := fc.Name
 	// Each array-function name is single-overload; find its row by (name, arity). A wrong argument
 	// count matches no overload (42883), exactly as a missing scalar overload does.
 	var desc *operatorDesc
@@ -749,7 +749,7 @@ func resolveRegexFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	if fc.Star {
 		return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 	}
-	name := toLowerASCII(fc.Name)
+	name := fc.Name
 	var rfn regexFunc
 	flagsIdx := -1
 	// intPositions are the integer-typed argument indices; source(0) and pattern(1) are always text.
@@ -870,7 +870,7 @@ func resolveRegexFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	return &rExpr{kind: reRegexFunc, rxFunc: rfn, sargs: rargs, rxProgram: prog}, result, nil
 }
 
-// isRangeFuncName reports whether name (lowercased) is a polymorphic range function — a
+// isRangeFuncName reports whether name (exact) is a polymorphic range function — a
 // Kind=="function" catalog row whose ArgFamilies mention anyrange (range-functions.md §1).
 // Data-driven, so a new range-function row wires here without touching this gate.
 func isRangeFuncName(name string) bool {
@@ -1034,7 +1034,7 @@ func resolveRangeFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	if fc.Star {
 		return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 	}
-	name := toLowerASCII(fc.Name)
+	name := fc.Name
 	var desc *operatorDesc
 	for i := range operators {
 		o := &operators[i]
@@ -1075,7 +1075,7 @@ func resolveRangeFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	return &rExpr{kind: reRangeFunc, rfunc: rangeFuncID(name), sargs: rargs}, result, nil
 }
 
-// isRangeCtorName reports whether name (lowercased) is a range CONSTRUCTOR call (range-functions.md
+// isRangeCtorName reports whether name (exact) is a range CONSTRUCTOR call (range-functions.md
 // §2): a call whose name is a range type name or alias (i32range/int4range/numrange/…). The
 // constructor functions are the only ones whose name is a range type name, so rangeByName resolving
 // is exactly the gate — data-driven over the Ranges table, no hand-written name list.
@@ -1121,7 +1121,7 @@ func resolveRangeCtor(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	if fc.Star {
 		return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 	}
-	name := toLowerASCII(fc.Name)
+	name := fc.Name
 	desc, ok := rangeByName(name)
 	if !ok {
 		panic("resolveRangeCtor: isRangeCtorName gated the call")
@@ -2306,24 +2306,24 @@ func binaryOpSymbol(op binaryOp) string {
 	}
 }
 
-// aggregateHasStar reports whether aggregate surface (lowercased) has a COUNT(*)-style star
+// aggregateHasStar reports whether aggregate surface (exact) has a COUNT(*)-style star
 // overload — only COUNT does. The data-driven replacement for the special-cased star arm.
 func aggregateHasStar(surface string) bool {
 	for i := range aggregates {
-		if toLowerASCII(aggregates[i].Surface) == surface && aggregates[i].Arg == "star" {
+		if surfaceMatches(aggregates[i].Surface, surface) && aggregates[i].Arg == "star" {
 			return true
 		}
 	}
 	return false
 }
 
-// lookupAggregateOverload returns the matched aggregate overload row for surface (lowercased)
+// lookupAggregateOverload returns the matched aggregate overload row for surface (exact)
 // over a single operand of resolved type t: the Arg=="expr" catalog row whose lone ArgFamilies
 // slot matches. nil ⇒ no overload (42883, e.g. SUM(text)). MIN/MAX/COUNT take "any".
 func lookupAggregateOverload(surface string, t resolvedType) *aggregateDesc {
 	for i := range aggregates {
 		a := &aggregates[i]
-		if toLowerASCII(a.Surface) == surface && a.Arg == "expr" && len(a.ArgFamilies) == 1 && familyMatches(a.ArgFamilies[0], t) {
+		if surfaceMatches(a.Surface, surface) && a.Arg == "expr" && len(a.ArgFamilies) == 1 && familyMatches(a.ArgFamilies[0], t) {
 			return a
 		}
 	}
@@ -2334,7 +2334,7 @@ func lookupAggregateOverload(surface string, t resolvedType) *aggregateDesc {
 // matched overload's surface + catalog result code (the PG widening — aggregates.md §3). The plan
 // is the aggregate's kernel id (fold/finalize switch on it); selecting it from the registered
 // result code keeps the name gate + overload validation data-driven while the kernel stays
-// hand-written (§5). surface is the lowercased call name; result the matched row's code.
+// hand-written (§5). surface is the (folded) call name; result the matched row's code.
 func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedType) {
 	switch {
 	case surface == "count":
@@ -2383,7 +2383,7 @@ func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedTyp
 // §17); they are distinguished here. Named notation (name => value) is valid only for a function
 // that declares parameter names (make_interval); on every other function it is 42883.
 func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
-	name := toLowerASCII(fc.Name)
+	name := fc.Name
 	// DISTINCT is an aggregate-only modifier: `abs(DISTINCT x)` is 42809 (PG's wrong_object_type,
 	// "DISTINCT specified, but <fn> is not an aggregate function" — aggregates.md §5). Checked
 	// before the per-kind dispatch so it covers every non-aggregate path (scalar, array, …).
@@ -2751,7 +2751,7 @@ func normalizeNamedArgs(desc *operatorDesc, args []*exprNode, argNames []*string
 		seenNamed = true
 		idx := -1
 		for j, pn := range desc.ArgNames {
-			if toLowerASCII(pn) == toLowerASCII(*nm) {
+			if pn == *nm {
 				idx = j
 				break
 			}
@@ -2848,7 +2848,7 @@ func resolveMakeTimestamp(s *scope, name string, fc *funcCallExpr, ag *aggCtx, p
 			}
 			if nm == nil {
 				positional++
-			} else if strings.EqualFold(*nm, "timezone") {
+			} else if *nm == "timezone" {
 				namesTimezone = true
 			}
 		}
@@ -2925,7 +2925,7 @@ func resolveScalarFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramType
 	if fc.Star {
 		return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 	}
-	name := toLowerASCII(fc.Name)
+	name := fc.Name
 	rargs := make([]*rExpr, 0, len(fc.Args))
 	tys := make([]resolvedType, 0, len(fc.Args))
 	for _, a := range fc.Args {
@@ -3001,7 +3001,7 @@ func resolveVariadicFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTy
 	if fc.Star {
 		return nil, resolvedType{}, newError(SyntaxError, "* is only valid as the argument of COUNT")
 	}
-	name := toLowerASCII(fc.Name)
+	name := fc.Name
 	desc := scalarFuncDesc(name)
 	k := desc.Arity                    // declared parameter count (the last is variadic)
 	varFamily := desc.ArgFamilies[k-1] // the variadic element family (last slot)

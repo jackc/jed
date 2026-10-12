@@ -154,14 +154,14 @@ function databaseFromSnapshot(snap: Snapshot, core: SharedCore): Engine {
 class SharedCore {
   committed: Snapshot;
   // attached is the published committed root of every host-attached DATABASE-scoped in-memory database
-  // (spec/design/attached-databases.md §5), keyed by lowercased name. A minted session captures this map
+  // (spec/design/attached-databases.md §5), keyed by exact name. A minted session captures this map
   // (with the committed root) so it sees a CONSISTENT cross-database snapshot; attach/detach REPLACE it
   // (never mutate in place) so a pinned reader is unaffected. A publish swaps the committing session's
   // adopted attached view in. Empty when nothing is attached — byte-for-byte the pre-attachment behavior.
   // Session-local `temp` is NOT here (it is session-private, on SessionState.tempCommitted).
   attached = new Map<string, Snapshot>();
   // attachments is the core-owned registry of host-attached databases (attached-databases.md §2/§5),
-  // keyed by lowercased name — each attachment's MUTABLE storage identity (a MemoryBlockStore Engine,
+  // keyed by exact name — each attachment's MUTABLE storage identity (a MemoryBlockStore Engine,
   // like the temp domain) + its write mode. The immutable published root lives in `attached` under the
   // same key. Populated by Database.attach / cleared by Database.detach. Read by the executor via
   // Engine.core (the structural AttachmentCore view) during a commit persist.
@@ -505,7 +505,7 @@ class SharedCore {
     );
   }
 
-  // committedAttachment is the published committed root of attachment name (lowercased), if attached.
+  // committedAttachment is the published committed root of attachment name (exact), if attached.
   committedAttachment(name: string): Snapshot | undefined {
     return this.attached.get(name);
   }
@@ -552,10 +552,10 @@ class SharedCore {
     });
   }
 
-  // storageFor returns the storage Engine of database name — main or an attachment, case-insensitive;
+  // storageFor returns the storage Engine of database name — main or an attachment, by exact name (grammar.md §3);
   // the session-local temp domain and an unknown name are 42704.
   storageFor(name: string): Engine {
-    const lname = name.toLowerCase();
+    const lname = name;
     if (lname === "main") return this.storage;
     const att = lname === "temp" ? undefined : this.attachments.get(lname);
     if (att === undefined) {
@@ -803,11 +803,11 @@ export class Database {
   // jed database on disk, Slice 2 — its committed state becomes the attachment's initial root, its own
   // page size honored). `readOnly` attaches it read-only: every write to it (DML or DDL) is 25006, it
   // never competes for the one-durable-writer slot (§5), and a file source is additionally opened
-  // read-only. The name is case-folded; it must not name a reserved database (`main` / `temp`) or one
+  // read-only. The name is exact (verbatim, never folded — grammar.md §3); it must not name a reserved database (`main` / `temp`) or one
   // already attached (42710). Opening a file surfaces the same host/file codes as opening `main`
   // (58P01/XX001/…). Publishing the new root replaces the attached map (a pinned reader keeps its old map).
   attach(name: string, source: AttachSource = attachMemory(), readOnly = false): void {
-    const lname = name.toLowerCase();
+    const lname = name;
     if (lname === "") {
       throw engineError("duplicate_object", "attachment name must not be empty");
     }
@@ -873,7 +873,7 @@ export class Database {
   // detachable). On success the attachment's root is dropped from the published roots and its storage
   // released.
   detach(name: string): void {
-    const lname = name.toLowerCase();
+    const lname = name;
     const c = this.core;
     c.acquireWriter(0);
     let att: Attachment;
@@ -898,7 +898,7 @@ export class Database {
     att.coordinator?.close();
   }
 
-  // compact compacts database name — `main` or an attachment, case-insensitive — returning its dead
+  // compact compacts database name — `main` or an attachment, by exact name — returning its dead
   // space (spec/design/api.md §2.6): rewrite it as the garbage-free from-scratch image of its committed
   // snapshot at the next version and swap the storage atomically (a file through temp file + rename, an
   // in-memory database by replacing its byte store). Rows, catalog, and later results and costs are
@@ -907,7 +907,7 @@ export class Database {
   // is open on this handle or another process has the file open. Not metered and not reachable from SQL.
   compact(name: string): void {
     const c = this.core;
-    const lname = name.toLowerCase();
+    const lname = name;
     let storage: Engine;
     let readOnly: boolean;
     if (lname === "main") {

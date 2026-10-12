@@ -3,7 +3,6 @@ package jed
 import (
 	"fmt"
 	"slices"
-	"strings"
 )
 
 // SELECT planning, Stage 1 — the RESOLVE half (spec/design/planner.md §2): planSelect resolves a
@@ -103,7 +102,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			lateralFlags[i] = lateralEligible && queryPlanReferencesOuter(&plan, 0)
 			label := ""
 			if tref.Alias != nil {
-				label = strings.ToLower(*tref.Alias)
+				label = *tref.Alias
 			}
 			tbl, terr := cteSyntheticTable(label, &plan, tref.ColumnAliases)
 			if terr != nil {
@@ -197,9 +196,9 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			}
 		} else {
 			// A plain FROM name (not an SRF call) may resolve to a CTE, which SHADOWS a catalog
-			// table of the same name (cte.md §2); lookup is case-insensitive. A hit bumps the
+			// table of the same name (cte.md §2); lookup is byte-exact. A hit bumps the
 			// binding's reference count (the inline-vs-materialize decision — cost.md §3).
-			lname := strings.ToLower(tref.Name)
+			lname := tref.Name
 			ci := -1
 			for j := len(ctes) - 1; j >= 0; j-- {
 				if ctes[j].name == lname {
@@ -239,9 +238,9 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			return nil, newError(InvalidColumnReference,
 				"invalid reference to FROM-clause entry for a LATERAL item: the combining JOIN type must be INNER or LEFT")
 		}
-		label := strings.ToLower(t.Name)
+		label := t.Name
 		if tref.Alias != nil {
-			label = strings.ToLower(*tref.Alias)
+			label = *tref.Alias
 		}
 		// An unaliased derived table (grammar.md §42, PG 18) has an EMPTY label — it has no
 		// qualifier, so two of them never collide and the duplicate-label check is skipped (its bare
@@ -383,8 +382,8 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 				if j.Kind == joinRight {
 					mi = ri
 				}
-				merges = slices.DeleteFunc(merges, func(m mergeCol) bool { return strings.EqualFold(m.name, name) })
-				merges = append(merges, mergeCol{name: strings.ToLower(name), index: mi})
+				merges = slices.DeleteFunc(merges, func(m mergeCol) bool { return m.name == name })
+				merges = append(merges, mergeCol{name: name, index: mi})
 				hidden = append(hidden, li, ri)
 				merged, leftDrop, rightDrop = append(merged, mi), append(leftDrop, li), append(rightDrop, ri)
 			}

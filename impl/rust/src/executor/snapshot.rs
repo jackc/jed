@@ -34,7 +34,7 @@ impl Snapshot {
 
     /// Exact relation revision used only for prepared-plan cache validation (estimator.md §6).
     pub(crate) fn estimator_revision(&self, name: &str) -> std::sync::Arc<EstimatorRevision> {
-        let key = name.to_ascii_lowercase();
+        let key = name.to_string();
         self.estimator_revision_by_key(&key)
     }
 
@@ -49,7 +49,7 @@ impl Snapshot {
     /// de-duplicates calls, so data-modifying CTEs still advance a relation exactly once.
     pub(crate) fn bump_estimator_revision(&mut self, name: &str) {
         std::sync::Arc::make_mut(&mut self.estimator_revisions).insert(
-            name.to_ascii_lowercase(),
+            name.to_string(),
             std::sync::Arc::new(EstimatorRevision::default()),
         );
     }
@@ -60,7 +60,7 @@ impl Snapshot {
         column: usize,
     ) -> Option<&ColumnStatistics> {
         self.statistics
-            .get(&table.to_ascii_lowercase())
+            .get(&table.to_string())
             .and_then(|columns| columns.get(&column))
     }
 
@@ -70,7 +70,7 @@ impl Snapshot {
         column: usize,
     ) -> Option<&mut ColumnStatistics> {
         std::sync::Arc::make_mut(&mut self.statistics)
-            .get_mut(&table.to_ascii_lowercase())
+            .get_mut(&table.to_string())
             .and_then(|columns| columns.get_mut(&column))
     }
 
@@ -93,7 +93,7 @@ impl Snapshot {
     ) {
         self.data_gen += 1;
         let all = std::sync::Arc::make_mut(&mut self.statistics);
-        all.entry(table.to_ascii_lowercase())
+        all.entry(table.to_string())
             .or_default()
             .insert(column, statistics);
     }
@@ -101,7 +101,7 @@ impl Snapshot {
     pub(crate) fn mark_statistics_stale(&mut self, table: &str) {
         self.data_gen += 1;
         let all = std::sync::Arc::make_mut(&mut self.statistics);
-        if let Some(columns) = all.get_mut(&table.to_ascii_lowercase()) {
+        if let Some(columns) = all.get_mut(&table.to_string()) {
             for statistics in columns.values_mut() {
                 statistics.stale = true;
             }
@@ -110,12 +110,12 @@ impl Snapshot {
 
     pub(crate) fn clear_statistics(&mut self, table: &str) {
         self.data_gen += 1;
-        std::sync::Arc::make_mut(&mut self.statistics).remove(&table.to_ascii_lowercase());
+        std::sync::Arc::make_mut(&mut self.statistics).remove(&table.to_string());
     }
 
     pub(crate) fn clear_column_statistics(&mut self, table: &str, column: usize) {
         self.data_gen += 1;
-        let key = table.to_ascii_lowercase();
+        let key = table.to_string();
         let all = std::sync::Arc::make_mut(&mut self.statistics);
         if let Some(columns) = all.get_mut(&key) {
             columns.remove(&column);
@@ -125,16 +125,16 @@ impl Snapshot {
         }
     }
 
-    /// Look up a table definition by name (case-insensitive).
+    /// Look up a table definition by exact name.
     pub fn table(&self, name: &str) -> Option<&Table> {
-        self.tables.get(&name.to_ascii_lowercase())
+        self.tables.get(&name.to_string())
     }
 
     pub(crate) fn table_by_key(&self, key: &str) -> Option<&Table> {
         self.tables.get(key)
     }
 
-    /// The canonical name of every table in this snapshot, sorted ascending by lowercased name (the
+    /// The canonical name of every table in this snapshot, sorted ascending by exact name (the
     /// catalog's standing order — no map-iteration order may leak, CLAUDE.md §8). Secondary indexes
     /// are not tables and are excluded (api.md §6).
     pub fn table_names(&self) -> Vec<String> {
@@ -150,7 +150,7 @@ impl Snapshot {
             .collect()
     }
 
-    /// All tables in ascending lowercased-name order — a deterministic order with no map-iteration
+    /// All tables in ascending name byte order — a deterministic order with no map-iteration
     /// leak (CLAUDE.md §8); the jed_tables / jed_columns generation order
     /// (spec/design/introspection.md §5).
     pub(crate) fn tables_sorted(&self) -> Vec<&Table> {
@@ -159,9 +159,9 @@ impl Snapshot {
         keys.into_iter().map(|k| &self.tables[k]).collect()
     }
 
-    /// Look up a composite type definition by name (case-insensitive).
+    /// Look up a composite type definition by exact name.
     pub fn composite_type(&self, name: &str) -> Option<&CompositeType> {
-        self.types.get(&name.to_ascii_lowercase())
+        self.types.get(&name.to_string())
     }
 
     /// Resolve a catalog [`Type`] to its self-contained [`ColType`] against this snapshot's composite
@@ -185,11 +185,11 @@ impl Snapshot {
         self.store_paging = Some(paging);
     }
 
-    /// Register a composite type (CREATE TYPE). Lower-cased name is the key. The caller has
+    /// Register a composite type (CREATE TYPE). The exact name is the key. The caller has
     /// already resolved field types and checked for a duplicate.
     pub(crate) fn put_type(&mut self, ty: CompositeType) {
         self.bump_cat_gen();
-        std::sync::Arc::make_mut(&mut self.types).insert(ty.name.to_ascii_lowercase(), ty);
+        std::sync::Arc::make_mut(&mut self.types).insert(ty.name.to_string(), ty);
     }
 
     /// Remove a composite type (DROP TYPE). The caller has checked there are no dependents.
@@ -198,7 +198,7 @@ impl Snapshot {
         std::sync::Arc::make_mut(&mut self.types).remove(key);
     }
 
-    /// All composite types in ascending lowercased-name order — the on-disk emission order
+    /// All composite types in ascending name byte order — the on-disk emission order
     /// (spec/fileformat/format.md) and a deterministic order with no hash-iteration leak (§8).
     pub(crate) fn composite_types_sorted(&self) -> Vec<&CompositeType> {
         let mut keys: Vec<&String> = self.types.keys().collect();
@@ -206,16 +206,16 @@ impl Snapshot {
         keys.into_iter().map(|k| &self.types[k]).collect()
     }
 
-    /// Look up a sequence by name (case-insensitive).
+    /// Look up a sequence by exact name.
     pub fn sequence(&self, name: &str) -> Option<&SequenceDef> {
-        self.sequences.get(&name.to_ascii_lowercase())
+        self.sequences.get(&name.to_string())
     }
 
-    /// Register a sequence (CREATE SEQUENCE). Lower-cased name is the key. The caller has already
+    /// Register a sequence (CREATE SEQUENCE). The exact name is the key. The caller has already
     /// validated the option set and checked the relation namespace for a collision.
     pub(crate) fn put_sequence(&mut self, seq: SequenceDef) {
         self.data_gen += 1;
-        std::sync::Arc::make_mut(&mut self.sequences).insert(seq.name.to_ascii_lowercase(), seq);
+        std::sync::Arc::make_mut(&mut self.sequences).insert(seq.name.to_string(), seq);
     }
 
     /// Remove a sequence (DROP SEQUENCE). The caller has checked it exists.
@@ -447,7 +447,7 @@ impl Snapshot {
                 for ek in ekeys {
                     fresh.insert(ek, Vec::new())?;
                 }
-                self.put_index_store(def.name.to_ascii_lowercase(), fresh);
+                self.put_index_store(def.name.to_string(), fresh);
             }
         }
 
@@ -477,7 +477,7 @@ impl Snapshot {
         self.default_collation = name;
     }
 
-    /// All sequences in ascending lowercased-name order — the on-disk emission order
+    /// All sequences in ascending name byte order — the on-disk emission order
     /// (spec/fileformat/format.md) and a deterministic order with no hash-iteration leak (§8).
     pub(crate) fn sequences_sorted(&self) -> Vec<&SequenceDef> {
         let mut keys: Vec<&String> = self.sequences.keys().collect();
@@ -485,18 +485,14 @@ impl Snapshot {
         keys.into_iter().map(|k| &self.sequences[k]).collect()
     }
 
-    /// The lowercased keys of every sequence **owned by** the table `name` (case-insensitive) — the
+    /// The exact keys of every sequence **owned by** the table `name` (exact name) — the
     /// `serial`-created sequences `DROP TABLE` must auto-drop (spec/design/sequences.md §12). Returned
     /// in ascending key order so the auto-drop is deterministic (no hash-iteration leak, §8).
     pub(crate) fn sequences_owned_by(&self, name: &str) -> Vec<String> {
         let mut keys: Vec<String> = self
             .sequences
             .iter()
-            .filter(|(_, s)| {
-                s.owned_by
-                    .as_ref()
-                    .is_some_and(|o| o.table.eq_ignore_ascii_case(name))
-            })
+            .filter(|(_, s)| s.owned_by.as_ref().is_some_and(|o| o.table == name))
             .map(|(k, _)| k.clone())
             .collect();
         keys.sort();
@@ -504,28 +500,22 @@ impl Snapshot {
     }
 
     /// Whether any table column or composite-type field still references the composite type
-    /// `name` (case-insensitive) — the `DROP TYPE ... RESTRICT` dependency check (2BP01). Returns
+    /// `name` (exact name) — the `DROP TYPE ... RESTRICT` dependency check (2BP01). Returns
     /// the first dependent's description for the error detail, or `None` if there are no dependents.
     pub(crate) fn composite_dependent(&self, name: &str) -> Option<String> {
-        let key = name.to_ascii_lowercase();
+        let key = name.to_string();
         // `composite_ref` looks through one array level, so an `addr[]` column / field counts as a
         // dependent of `addr` exactly as a bare `addr` one does (spec/design/array.md §12).
         for t in self.tables.values() {
             for c in &t.columns {
-                if c.ty
-                    .composite_ref()
-                    .is_some_and(|r| r.name.eq_ignore_ascii_case(&key))
-                {
+                if c.ty.composite_ref().is_some_and(|r| r.name == key) {
                     return Some(format!("column {} of table {}", c.name, t.name));
                 }
             }
         }
         for ct in self.types.values() {
             for f in &ct.fields {
-                if f.ty
-                    .composite_ref()
-                    .is_some_and(|r| r.name.eq_ignore_ascii_case(&key))
-                {
+                if f.ty.composite_ref().is_some_and(|r| r.name == key) {
                     return Some(format!("field {} of type {}", f.name, ct.name));
                 }
             }
@@ -533,12 +523,12 @@ impl Snapshot {
         None
     }
 
-    /// Every FK on a table **not** in `dropping` (a set of lowercased table keys) that references
+    /// Every FK on a table **not** in `dropping` (a set of exact table keys) that references
     /// a table that **is** in `dropping` — the dependency scan for a multi-table `DROP TABLE`
     /// (spec/design/grammar.md §13, constraints.md §6.10). A dependent whose referencing table is
     /// itself being dropped does not count (the drop-set exclusion), so a FK between two tables
     /// both named in the same statement never blocks. Referencing tables are scanned in ascending
-    /// lowercased key order (each table's `foreign_keys` is already name-ordered) for determinism
+    /// exact key order (each table's `foreign_keys` is already name-ordered) for determinism
     /// (§8). `RESTRICT` raises 2BP01 on the first entry; `CASCADE` removes every entry's FK.
     pub(crate) fn foreign_key_dependents_excluding(
         &self,
@@ -553,7 +543,7 @@ impl Snapshot {
             }
             let t = &self.tables[tk];
             for fk in &t.foreign_keys {
-                let ref_key = fk.ref_table.to_ascii_lowercase();
+                let ref_key = fk.ref_table.to_string();
                 if dropping.contains(&ref_key) {
                     let dropped_name = self
                         .tables
@@ -578,9 +568,7 @@ impl Snapshot {
     pub(crate) fn remove_foreign_key(&mut self, table_key: &str, fk_name: &str) {
         if let Some(table) = std::sync::Arc::make_mut(&mut self.tables).get_mut(table_key) {
             self.cat_gen += 1;
-            table
-                .foreign_keys
-                .retain(|fk| !fk.name.eq_ignore_ascii_case(fk_name));
+            table.foreign_keys.retain(|fk| fk.name != fk_name);
         }
     }
 
@@ -646,7 +634,7 @@ impl Snapshot {
             if let Some(ct) = snap.types.get(key) {
                 for f in &ct.fields {
                     if let Some(r) = f.ty.composite_ref() {
-                        let ck = r.name.to_ascii_lowercase();
+                        let ck = r.name.to_string();
                         child = child.max(visit(snap, &ck, levels_above + 1, color, cache)?);
                     }
                 }
@@ -676,7 +664,7 @@ impl Snapshot {
     }
 
     /// The composite-type nesting depth of `ty` against this snapshot's type catalog, memoized in
-    /// `cache` (lowercased name → depth): a scalar is 0, `T[]` is `depth(T)` (array levels are not
+    /// `cache` (exact name → depth): a scalar is 0, `T[]` is `depth(T)` (array levels are not
     /// composite levels — `composite_ref` looks through one array level the same way), and a
     /// composite is `1 + max(field depths)` (an empty composite is 1). The `CREATE TYPE` gate uses
     /// this against the *existing* catalog, every type of which already satisfies depth ≤
@@ -691,7 +679,7 @@ impl Snapshot {
             Some(r) => r,
             None => return 0, // a scalar (or a scalar array) adds no composite level
         };
-        let key = r.name.to_ascii_lowercase();
+        let key = r.name.to_string();
         if let Some(&d) = cache.get(&key) {
             return d;
         }
@@ -713,14 +701,14 @@ impl Snapshot {
     /// The store for a table (panics if absent — callers resolve the table first).
     pub(crate) fn store(&self, name: &str) -> &TableStore {
         self.stores
-            .get(&name.to_ascii_lowercase())
+            .get(&name.to_string())
             .expect("store exists for a resolved table")
     }
 
     /// The store for a table, mutable (panics if absent).
     pub(crate) fn store_mut(&mut self, name: &str) -> &mut TableStore {
         std::sync::Arc::make_mut(&mut self.stores)
-            .get_mut(&name.to_ascii_lowercase())
+            .get_mut(&name.to_string())
             .expect("store exists for a resolved table")
     }
 
@@ -729,7 +717,7 @@ impl Snapshot {
     /// I/O errors); every value is fully materialized — the helper's callers compare whole rows, so
     /// no unfetched reference may escape (large-values.md §14). The fault-`Result` is unwrapped here.
     pub(crate) fn rows_in_key_order(&self, name: &str) -> Option<Vec<Row>> {
-        self.stores.get(&name.to_ascii_lowercase()).map(|s| {
+        self.stores.get(&name.to_string()).map(|s| {
             let mut rows = s.iter_in_key_order().expect("test-helper read failed");
             for row in &mut rows {
                 s.resolve_all(row).expect("test-helper resolve failed");
@@ -738,7 +726,7 @@ impl Snapshot {
         })
     }
 
-    /// Register a new table and its (empty) store. Lower-cased name is the key. The store carries
+    /// Register a new table and its (empty) store. The exact name is the key. The store carries
     /// the page payload `cap` (= `page_size − 16`) and the column types so the page-backed B-tree
     /// can weigh records for its size-driven split (spec/fileformat/format.md).
     pub(crate) fn put_table(&mut self, table: Table, page_size: u32) {
@@ -769,7 +757,7 @@ impl Snapshot {
         page_size: u32,
     ) {
         self.bump_cat_gen();
-        let key = table.name.to_ascii_lowercase();
+        let key = table.name.to_string();
         let cap = crate::format::page_payload(page_size);
         let mut st = TableStore::new(cap, col_types);
         // Bind the domain's pager (`Snapshot::store_paging`) so the new store demand-pages like a
@@ -792,7 +780,7 @@ impl Snapshot {
             // Disjoint field borrows: `t` reads `self.tables` while we mutate `self.index_stores`.
             let index_stores = std::sync::Arc::make_mut(&mut self.index_stores);
             for idx in &t.indexes {
-                index_stores.remove(&idx.name.to_ascii_lowercase());
+                index_stores.remove(&idx.name.to_string());
             }
         }
         std::sync::Arc::make_mut(&mut self.tables).remove(key);
@@ -815,7 +803,7 @@ impl Snapshot {
             .expect("store exists for a resolved index")
     }
 
-    /// Whether this snapshot holds a store for the named index (lowercased key). Used to route
+    /// Whether this snapshot holds a store for the named index (exact key). Used to route
     /// index access to the session temp snapshot vs the main snapshot (temp-tables.md §2).
     pub(crate) fn has_index_store(&self, name_key: &str) -> bool {
         self.index_stores.contains_key(name_key)
@@ -831,11 +819,11 @@ impl Snapshot {
     }
 
     /// Register a new (empty) secondary index on `table_key`: insert its definition into the
-    /// table's `indexes` in ascending lowercased-name order (the catalog/planner order —
+    /// table's `indexes` in ascending name byte order (the catalog/planner order —
     /// spec/design/indexes.md §6) and create its zero-column store.
     pub(crate) fn put_index(&mut self, table_key: &str, def: IndexDef, page_size: u32) {
         self.bump_cat_gen();
-        let name_key = def.name.to_ascii_lowercase();
+        let name_key = def.name.to_string();
         let cap = crate::format::page_payload(page_size);
         let mut fresh = TableStore::new(cap, Vec::new());
         if let Some(paging) = &self.store_paging {
@@ -849,7 +837,7 @@ impl Snapshot {
         let pos = table
             .indexes
             .iter()
-            .position(|i| i.name.to_ascii_lowercase() > name_key)
+            .position(|i| i.name > name_key)
             .unwrap_or(table.indexes.len());
         table.indexes.insert(pos, def);
     }
@@ -882,7 +870,7 @@ impl Snapshot {
     ) {
         self.bump_cat_gen();
         let new_key = if rename_table {
-            table.name.to_ascii_lowercase()
+            table.name.to_string()
         } else {
             old_key.to_string()
         };
@@ -898,8 +886,8 @@ impl Snapshot {
         }
         std::sync::Arc::make_mut(&mut self.tables).insert(new_key.clone(), table.clone());
         if let Some((old, new)) = index_rename {
-            let old = old.to_ascii_lowercase();
-            let new = new.to_ascii_lowercase();
+            let old = old.to_string();
+            let new = new.to_string();
             if let Some(store) = std::sync::Arc::make_mut(&mut self.index_stores).remove(&old) {
                 std::sync::Arc::make_mut(&mut self.index_stores).insert(new.clone(), store);
             }
@@ -915,16 +903,12 @@ impl Snapshot {
             let Some(old) = self.tables.get(&key) else {
                 continue;
             };
-            if !old
-                .foreign_keys
-                .iter()
-                .any(|fk| fk.ref_table.eq_ignore_ascii_case(old_key))
-            {
+            if !old.foreign_keys.iter().any(|fk| fk.ref_table == old_key) {
                 continue;
             }
             let mut changed = old.clone();
             for fk in &mut changed.foreign_keys {
-                if fk.ref_table.eq_ignore_ascii_case(old_key) {
+                if fk.ref_table == old_key {
                     fk.ref_table = table.name.clone();
                 }
             }
@@ -935,11 +919,7 @@ impl Snapshot {
             let Some(seq) = self.sequences.get(&key) else {
                 continue;
             };
-            if !seq
-                .owned_by
-                .as_ref()
-                .is_some_and(|o| o.table.eq_ignore_ascii_case(old_key))
-            {
+            if !seq.owned_by.as_ref().is_some_and(|o| o.table == old_key) {
                 continue;
             }
             let mut changed = seq.clone();
@@ -959,7 +939,7 @@ impl Snapshot {
         next_rowid: i64,
         page_size: u32,
     ) -> Result<()> {
-        let key = table.name.to_ascii_lowercase();
+        let key = table.name.to_string();
         self.put_table_resolved(table, col_types, page_size);
         let store = self.store_mut(&key);
         store.bump_rowid_to(next_rowid);
@@ -978,25 +958,19 @@ impl Snapshot {
         entries: &std::collections::HashMap<String, Vec<Vec<u8>>>,
         page_size: u32,
     ) -> Result<()> {
-        let live: std::collections::HashSet<String> = next
-            .indexes
-            .iter()
-            .map(|i| i.name.to_ascii_lowercase())
-            .collect();
+        let live: std::collections::HashSet<String> =
+            next.indexes.iter().map(|i| i.name.to_string()).collect();
         for i in &old.indexes {
-            let k = i.name.to_ascii_lowercase();
+            let k = i.name.to_string();
             if !live.contains(&k) {
                 std::sync::Arc::make_mut(&mut self.index_stores).remove(&k);
                 std::sync::Arc::make_mut(&mut self.gist_trees).remove(&k);
             }
         }
-        let prior: std::collections::HashSet<String> = old
-            .indexes
-            .iter()
-            .map(|i| i.name.to_ascii_lowercase())
-            .collect();
+        let prior: std::collections::HashSet<String> =
+            old.indexes.iter().map(|i| i.name.to_string()).collect();
         for i in &next.indexes {
-            let k = i.name.to_ascii_lowercase();
+            let k = i.name.to_string();
             let rebuild = entries.contains_key(&k);
             if prior.contains(&k) && !rebuild {
                 continue;
@@ -1025,13 +999,13 @@ impl Snapshot {
         page_size: u32,
     ) -> Result<()> {
         for ix in &old.indexes {
-            let key = ix.name.to_ascii_lowercase();
+            let key = ix.name.to_string();
             std::sync::Arc::make_mut(&mut self.index_stores).remove(&key);
             std::sync::Arc::make_mut(&mut self.gist_trees).remove(&key);
         }
         let cap = crate::format::page_payload(page_size);
         for ix in &next.indexes {
-            let key = ix.name.to_ascii_lowercase();
+            let key = ix.name.to_string();
             let mut store = TableStore::new(cap, Vec::new());
             if let Some(paging) = &self.store_paging {
                 store.attach_paging(paging.clone());
@@ -1050,11 +1024,11 @@ impl Snapshot {
         }
         self.bump_cat_gen(); // direct catalog writes must still mark main changed (changed_since)
         for child in std::sync::Arc::make_mut(&mut self.tables).values_mut() {
-            if child.name.eq_ignore_ascii_case(parent) {
+            if child.name == parent {
                 continue;
             }
             child.foreign_keys.retain(|fk| {
-                !fk.ref_table.eq_ignore_ascii_case(parent)
+                fk.ref_table != parent
                     || !dropped.iter().any(|c| *c == sorted_unique(&fk.ref_columns))
             });
         }
@@ -1070,15 +1044,15 @@ impl Snapshot {
         pending_sequences: &std::collections::HashSet<String>,
     ) {
         self.bump_cat_gen(); // catalog writes below bypass the generation-bumping funnels
-        let parent_key = parent.to_ascii_lowercase();
+        let parent_key = parent.to_string();
         for (key, child) in std::sync::Arc::make_mut(&mut self.tables) {
-            if key.eq_ignore_ascii_case(&parent_key) {
+            if key == &parent_key {
                 continue;
             }
             let mut changed = false;
             let mut fks = Vec::with_capacity(child.foreign_keys.len());
             for fk in &child.foreign_keys {
-                if !fk.ref_table.eq_ignore_ascii_case(parent) {
+                if fk.ref_table != parent {
                     fks.push(fk.clone());
                     continue;
                 }
@@ -1112,7 +1086,7 @@ impl Snapshot {
             let Some(owner) = &seq.owned_by else {
                 continue;
             };
-            if !owner.table.eq_ignore_ascii_case(parent) {
+            if owner.table != parent {
                 continue;
             }
             let mapped = original_to_new
@@ -1129,7 +1103,7 @@ impl Snapshot {
         }
     }
 
-    /// Register a loaded index store under its (lowercased) name — the file loader's hook
+    /// Register a loaded index store under its (exact) name — the file loader's hook
     /// (format.rs): the owning table's `indexes` list came from its catalog entry, so only
     /// the store is registered here.
     pub(crate) fn put_index_store(&mut self, name_key: String, mut store: TableStore) {
@@ -1155,7 +1129,7 @@ impl Snapshot {
         self.index_stores.values()
     }
 
-    /// The resident GiST R-tree of the named index (lowercased key), or `None` if the index is not
+    /// The resident GiST R-tree of the named index (exact key), or `None` if the index is not
     /// GiST / not present (spec/design/gist.md §4.1). The planner descends it for a `&&`/`@>` bound.
     pub(crate) fn gist_tree(
         &self,
@@ -1191,7 +1165,7 @@ impl Snapshot {
                     .iter()
                     .map(|&ci| crate::gist::opclass_for(&table.columns[ci].ty))
                     .collect();
-                specs.push((idx.name.to_ascii_lowercase(), ops));
+                specs.push((idx.name.to_string(), ops));
             }
         }
         let live: std::collections::HashSet<&str> = specs.iter().map(|(k, _)| k.as_str()).collect();
@@ -1214,19 +1188,18 @@ impl Snapshot {
     pub(crate) fn remove_index(&mut self, table_key: &str, name_key: &str) {
         self.bump_cat_gen();
         if let Some(t) = std::sync::Arc::make_mut(&mut self.tables).get_mut(table_key) {
-            t.indexes
-                .retain(|i| i.name.to_ascii_lowercase() != name_key);
+            t.indexes.retain(|i| i.name != name_key);
         }
         std::sync::Arc::make_mut(&mut self.index_stores).remove(name_key);
     }
 
-    /// Find the table owning the named index (case-insensitive): `(table_key, &IndexDef)`.
+    /// Find the table owning the named index (exact name): `(table_key, &IndexDef)`.
     pub(crate) fn find_index(&self, name: &str) -> Option<(&str, &IndexDef)> {
-        let key = name.to_ascii_lowercase();
+        let key = name.to_string();
         self.tables.iter().find_map(|(tk, t)| {
             t.indexes
                 .iter()
-                .find(|i| i.name.to_ascii_lowercase() == key)
+                .find(|i| i.name == key)
                 .map(|i| (tk.as_str(), i))
         })
     }
@@ -1269,8 +1242,8 @@ impl Snapshot {
         }
     }
 
-    /// Every table with its store, as `(lowercased key, table, store)` tuples, for the on-disk
-    /// serializer (spec/fileformat/format.md). The serializer sorts by the lowercased key so
+    /// Every table with its store, as `(exact key, table, store)` tuples, for the on-disk
+    /// serializer (spec/fileformat/format.md). The serializer sorts by the exact key so
     /// hash-map iteration order never leaks (CLAUDE.md §8).
     pub(crate) fn catalog_and_stores(&self) -> Vec<(&str, &Table, &TableStore)> {
         self.tables

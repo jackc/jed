@@ -164,7 +164,7 @@ export function canonicalName(t: ScalarType): string {
   return t;
 }
 
-// scalarTypeFromName resolves a type name (canonical or alias) case-insensitively, or
+// scalarTypeFromName resolves a type name (canonical or alias) by exact (folded) name (grammar.md §3), or
 // undefined. Canonical names state width in bits under the i/f prefix (i16/i32/i64, f32/f64
 // — the Rust/Zig convention). Accepted aliases: the SQL-standard words (smallint/int/integer/
 // bigint, real/double precision/float) AND PG's byte-shorthand (int2/int4/int8, float4/float8).
@@ -172,7 +172,7 @@ export function canonicalName(t: ScalarType): string {
 // is lexically disjoint from PG's byte-namespace (int2…int8), so int8 → i64 with no collision
 // and a future 8-bit i8 stays free (spec/design/types.md §11; CLAUDE.md §1/§4).
 export function scalarTypeFromName(name: string): ScalarType | undefined {
-  switch (name.toLowerCase()) {
+  switch (name) {
     case "i16":
     case "smallint":
     case "int2":

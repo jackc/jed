@@ -66,6 +66,39 @@ ALTER TABLE rewrite_names RENAME COLUMN lower TO label
 statement ok
 INSERT INTO rewrite_names VALUES (1, 'abc')
 
+# A rename substitutes the new name into persisted expression text as a QUOTED identifier, so a
+# keyword-spelled (or mixed-case) name still re-parses as a column: after the rename the CHECK text
+# reads `"null" > 0` and `b is null or b > "null"` — never the null literal (grammar.md §3). Disk
+# mode reopens before each record, so the inserts below run against the re-parsed text.
+statement ok
+CREATE TABLE kw_rename (a i32 CHECK (a > 0), b i32 CHECK (b IS NULL OR b > a))
+
+statement ok
+ALTER TABLE kw_rename RENAME COLUMN a TO "null"
+
+statement ok
+ALTER TABLE kw_rename RENAME COLUMN b TO "Bee"
+
+statement error 23514
+INSERT INTO kw_rename VALUES (-1, NULL)
+
+statement ok
+INSERT INTO kw_rename VALUES (1, NULL)
+
+statement error 23514
+INSERT INTO kw_rename VALUES (2, 1)
+
+statement ok
+INSERT INTO kw_rename VALUES (2, 3)
+
+query II rowsort
+SELECT "null", "Bee" FROM kw_rename
+----
+1
+NULL
+2
+3
+
 # Constraint renames are visible handles; UNIQUE moves its backing index too.
 statement ok
 ALTER TABLE renamed_parent RENAME CONSTRAINT parent_v_check TO amount_check

@@ -12,6 +12,7 @@ package jed
 
 import (
 	"path/filepath"
+	"slices"
 	"strconv"
 	"testing"
 )
@@ -201,19 +202,26 @@ func TestDetachInUseIs55006(t *testing.T) {
 	}
 }
 
-// TestAttachNameErrors — a reserved name (main/temp) or an already-attached name is 42710; detaching
-// an unknown / reserved database is 42704.
+// TestAttachNameErrors — a reserved name (main/temp) or an already-attached name is 42710 (exact
+// names); detaching an unknown / reserved database is 42704.
 func TestAttachNameErrors(t *testing.T) {
 	t.Parallel()
 	db := memDB()
 	if err := db.Attach("mydb", AttachMemory(), false); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
-	for _, name := range []string{"main", "temp", "MAIN", "Temp", "mydb", "MyDB"} {
+	for _, name := range []string{"main", "temp", "mydb"} {
 		if err := db.Attach(name, AttachMemory(), false); err == nil {
 			t.Fatalf("attach %q: want 42710, got nil", name)
 		} else if code := err.(*EngineError).Code(); code != "42710" {
 			t.Fatalf("attach %q: want 42710, got %s", name, code)
+		}
+	}
+	// Host-API names are exact (grammar.md §3): a different letter case is a different name, so it
+	// collides with neither a reserved scope nor an existing attachment.
+	for _, name := range []string{"MAIN", "Temp", "MyDB"} {
+		if err := db.Attach(name, AttachMemory(), false); err != nil {
+			t.Fatalf("attach %q: %v", name, err)
 		}
 	}
 	for _, name := range []string{"nope", "main", "temp"} {
@@ -534,18 +542,33 @@ func TestAttachFileMissingIs58P01(t *testing.T) {
 	}
 }
 
-// TestAttachCaseInsensitiveQualifier — an attachment is reached case-insensitively by its qualifier
-// (unquoted identifiers fold to lower case), matching how main/temp resolve.
-func TestAttachCaseInsensitiveQualifier(t *testing.T) {
+// TestAttachNamesAreExact — a host-API attach name is taken VERBATIM as an exact name (grammar.md
+// §3): attach("Reports") is reached from SQL only by the quoted "Reports" qualifier, while a bare
+// reports / REPORTS folds to reports and names nothing; attach("reports") is reached by any bare
+// spelling.
+func TestAttachNamesAreExact(t *testing.T) {
 	t.Parallel()
 	db := memDB()
 	if err := db.Attach("Reports", AttachMemory(), false); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
 	s := db.Session(SessionOptions{})
-	attachExec(t, s, "CREATE TABLE reports.sales (id i32 PRIMARY KEY)")
-	attachExec(t, s, "INSERT INTO REPORTS.sales VALUES (1)")
-	if _, err := s.queryValues("SELECT id FROM Reports.sales", nil); err != nil {
-		t.Fatalf("case-insensitive qualifier: %v", err)
+	attachExec(t, s, `CREATE TABLE "Reports".sales (id i32 PRIMARY KEY)`)
+	attachExec(t, s, `INSERT INTO "Reports".sales VALUES (1)`)
+	ids := func(sql string) []int64 { return mustIds(t, s, sql) }
+	if got := ids(`SELECT id FROM "Reports".sales`); !slices.Equal(got, []int64{1}) {
+		t.Fatalf("quoted qualifier = %v", got)
+	}
+	wantErr(t, s, "SELECT id FROM Reports.sales", "42P01") // a bare qualifier folds to reports
+	if err := db.Attach("reports", AttachMemory(), false); err != nil {
+		t.Fatalf("a lowercase attach name is distinct from Reports: %v", err)
+	}
+	attachExec(t, s, "CREATE TABLE REPORTS.sales (id i32 PRIMARY KEY)")
+	attachExec(t, s, "INSERT INTO Reports.sales VALUES (2)")
+	if got := ids("SELECT id FROM reports.sales"); !slices.Equal(got, []int64{2}) {
+		t.Fatalf("bare qualifier = %v", got)
+	}
+	if got := ids(`SELECT id FROM "Reports".sales`); !slices.Equal(got, []int64{1}) {
+		t.Fatalf("quoted qualifier after second attach = %v", got)
 	}
 }

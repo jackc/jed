@@ -925,7 +925,7 @@ export function resolveSetopOrderKey(key: OrderKey, names: string[]): number {
   if (key.qualifier !== null) {
     throw engineError("undefined_table", "missing FROM-clause entry for table " + key.qualifier);
   }
-  const idx = names.findIndex((n) => n.toLowerCase() === key.column.toLowerCase());
+  const idx = names.indexOf(key.column);
   if (idx < 0) throw engineError("undefined_column", "column " + key.column + " does not exist");
   return idx;
 }

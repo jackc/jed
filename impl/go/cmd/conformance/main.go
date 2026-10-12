@@ -549,8 +549,8 @@ func parseDefaultPrivilegesDirective(line string) (jed.PrivilegeSet, bool) {
 	return parsePrivSet(rest)
 }
 
-// privDelta is a parsed `# grant:` / `# revoke:` directive: a privilege set and the lowercased
-// object it applies to.
+// privDelta is a parsed `# grant:` / `# revoke:` directive: a privilege set and the exact object
+// name it applies to.
 type privDelta struct {
 	privs  jed.PrivilegeSet
 	object string
@@ -1014,7 +1014,7 @@ func runFile(text string, disk bool) error {
 				if err := db.SetMaxStorageBytes(name, bytes); err != nil {
 					return fmt.Errorf("max_storage_bytes %q: %w", name, err)
 				}
-				if strings.EqualFold(name, "main") {
+				if name == "main" {
 					mainStorageLimit = bytes
 				}
 				i++

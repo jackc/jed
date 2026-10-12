@@ -1,6 +1,6 @@
 # The jed_tables catalog relation (spec/design/introspection.md §5, slice I1): a read-only
-# COMPUTED relation — one row per USER table (`name text NOT NULL`, the canonical CREATE
-# TABLE-spelled name) — resolved like any table and scoped by the database qualifier (unqualified =
+# COMPUTED relation — one row per USER table (`name text NOT NULL`, the exact table name — bare
+# names folded, quoted names verbatim, grammar.md §3) — resolved like any table and scoped by the database qualifier (unqualified =
 # main). Rows derive at execution from the pinned catalog snapshot: no storage, self-excluding
 # (catalog relations list user objects only). Resolution order: a statement-local CTE shadows it
 # (PG-matching); it wins over the user catalog (the I0 reservation makes a collision impossible).
@@ -22,9 +22,9 @@ statement ok
 CREATE TABLE items (id i32 PRIMARY KEY, label text)
 
 statement ok
-CREATE TABLE Orders (id i32 PRIMARY KEY)
+CREATE TABLE "Orders" (id i32 PRIMARY KEY)
 
-# --- one row per user table; `name` is the canonical CREATE TABLE-spelled name (case preserved) ---
+# --- one row per user table; `name` is the exact name (the quoted "Orders" keeps its case) -------
 
 query T nosort
 SELECT name FROM jed_tables ORDER BY name
@@ -32,12 +32,16 @@ SELECT name FROM jed_tables ORDER BY name
 Orders
 items
 
-# resolution is case-insensitive, like any relation name (identifier resolution folds case)
+# a bare JED_Tables folds to jed_tables, like any relation name
 query T nosort
 SELECT name FROM JED_Tables ORDER BY name
 ----
 Orders
 items
+
+# ...but a quoted mixed-case spelling is a different (nonexistent) name — lookups are byte-exact
+statement error 42P01
+SELECT name FROM "JED_Tables"
 
 # a FROM alias renames the RELATION, never its column (no single-column function-alias rule —
 # these are relations, not set-returning functions)
@@ -111,7 +115,7 @@ UPDATE jed_tables SET name = 'x'
 statement error 42809
 DELETE FROM jed_tables
 
-# case-insensitive, like resolution
+# a bare spelling folds to jed_tables, like resolution
 statement error 42809
 DELETE FROM JED_TABLES
 

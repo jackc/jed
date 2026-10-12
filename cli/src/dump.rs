@@ -27,11 +27,16 @@ pub fn dump(db: &mut jed::Session, out: &mut dyn Write) -> io::Result<()> {
         };
         writeln!(out, "{create}")?;
         let rows = db
-            .query(&format!("SELECT * FROM {name}{order_by}"), &[])
+            .query(&format!("SELECT * FROM {}{order_by}", q(name)), &[])
             .expect("a full-table scan of a cataloged table cannot fail");
         for row in rows {
             let values: Vec<String> = row.iter().map(value_literal).collect();
-            writeln!(out, "INSERT INTO {name} VALUES ({});", values.join(", "))?;
+            writeln!(
+                out,
+                "INSERT INTO {} VALUES ({});",
+                q(name),
+                values.join(", ")
+            )?;
         }
         for i in 0..n_indexes {
             let table = db.table(name).expect("listed table exists");
@@ -44,7 +49,7 @@ pub fn dump(db: &mut jed::Session, out: &mut dyn Write) -> io::Result<()> {
                 .keys
                 .iter()
                 .map(|k| match k {
-                    jed::tooling::IndexKey::Column(c) => table.columns[*c].name.clone(),
+                    jed::tooling::IndexKey::Column(c) => q(&table.columns[*c].name),
                     jed::tooling::IndexKey::Expr(e) => format!("({})", e.expr_text),
                 })
                 .collect();
@@ -57,8 +62,8 @@ pub fn dump(db: &mut jed::Session, out: &mut dyn Write) -> io::Result<()> {
             writeln!(
                 out,
                 "CREATE {unique}INDEX {} ON {} ({}){where_clause};",
-                idx.name,
-                table.name,
+                q(&idx.name),
+                q(&table.name),
                 cols.join(", ")
             )?;
         }
@@ -76,7 +81,7 @@ fn create_table_sql(table: &Table) -> String {
             Some(m) => format!("numeric({},{})", m.precision, m.scale),
             None => col.ty.canonical_name().to_string(),
         };
-        let mut line = format!("  {} {ty}", col.name);
+        let mut line = format!("  {} {ty}", q(&col.name));
         if col.not_null && !col.primary_key {
             line.push_str(" NOT NULL");
         }
@@ -92,20 +97,25 @@ fn create_table_sql(table: &Table) -> String {
         parts.push(line);
     }
     if !table.pk.is_empty() {
-        let cols: Vec<&str> = table
+        let cols: Vec<String> = table
             .pk
             .iter()
-            .map(|&i| table.columns[i].name.as_str())
+            .map(|&i| q(&table.columns[i].name))
             .collect();
         parts.push(format!("  PRIMARY KEY ({})", cols.join(", ")));
     }
     for check in &table.checks {
         parts.push(format!(
             "  CONSTRAINT {} CHECK ({})",
-            check.name, check.expr_text
+            q(&check.name),
+            check.expr_text
         ));
     }
-    format!("CREATE TABLE {} (\n{}\n);", table.name, parts.join(",\n"))
+    format!(
+        "CREATE TABLE {} (\n{}\n);",
+        q(&table.name),
+        parts.join(",\n")
+    )
 }
 
 /// `ORDER BY` over the primary-key columns in key order, or empty for a no-PK table.
@@ -113,10 +123,10 @@ fn pk_order_by(table: &Table) -> String {
     if table.pk.is_empty() {
         return String::new();
     }
-    let cols: Vec<&str> = table
+    let cols: Vec<String> = table
         .pk
         .iter()
-        .map(|&i| table.columns[i].name.as_str())
+        .map(|&i| q(&table.columns[i].name))
         .collect();
     format!(" ORDER BY {}", cols.join(", "))
 }
@@ -130,6 +140,12 @@ pub fn value_literal(v: &Value) -> String {
         Value::Int(_) | Value::Bool(_) | Value::Decimal(_) => v.render(),
         other => format!("'{}'", other.render().replace('\'', "''")),
     }
+}
+
+/// A name as SQL identifier text (grammar.md §3's quoting rule), so a mixed-case or otherwise
+/// non-plain name round-trips through the dump.
+fn q(name: &str) -> String {
+    jed::tooling::quote_identifier(name)
 }
 
 #[cfg(test)]

@@ -91,7 +91,7 @@ type HostFunction struct {
 // call instead.
 func NewHostFunction(name string, argTypes []string, resultType string, kernel HostKernel) *HostFunction {
 	return &HostFunction{
-		name:         toLowerASCII(name),
+		name:         name,
 		argTypeNames: argTypes,
 		resultName:   resultType,
 		volatility:   VolatilityVolatile,
@@ -106,7 +106,7 @@ func NewHostFunction(name string, argTypes []string, resultType string, kernel H
 // defaults as NewHostFunction.
 func NewHostBatchFunction(name string, argTypes []string, resultType string, kernel HostBatchKernel) *HostFunction {
 	return &HostFunction{
-		name:         toLowerASCII(name),
+		name:         name,
 		argTypeNames: argTypes,
 		resultName:   resultType,
 		volatility:   VolatilityVolatile,
@@ -270,7 +270,7 @@ func (r *ExtensionRegistry) RegisterFunction(f *HostFunction) error {
 	return nil
 }
 
-// hasFunction reports whether any registered host function has this (lowercased) name — the
+// hasFunction reports whether any registered host function has this (exact) name — the
 // resolve-time routing gate. nil-safe (a handle with no extensions).
 func (r *ExtensionRegistry) hasFunction(name string) bool {
 	if r == nil {

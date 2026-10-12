@@ -100,7 +100,8 @@ new catalog field could even stay version-compatible — decided per slice).
 Move the catalog key to the new name. `42P07` (`relation already exists`) if the new name is
 already a table/index/sequence in the same database (the shared relation namespace); renaming
 to the current name is `42P07` too (PG-faithful). An owned sequence's `nextval` default text
-references its table by name — a table rename rewrites those owned-sequence defaults (the
+references its table by name — a table rename rewrites those owned-sequence defaults, quoting
+the sequence name inside the literal when it is not a plain lowercase identifier (the
 mirror of `ALTER SEQUENCE … RENAME`'s §15.3 rewrite, [sequences.md](sequences.md)).
 
 ### 2.2 `RENAME COLUMN … TO …`
@@ -113,8 +114,11 @@ its expression-index keys and partial predicates, and — because a *parent*'s F
 child columns by name only at load — nothing on the parent side (FK stores ordinals), but a
 **child** table's dependency is by ordinal too, so only *this table's own* expression text is
 at risk. The rewrite re-parses each stored expression, substitutes the identifier, and
-re-serializes the canonical text; a name that appears only as a quoted string or unrelated
-identifier is untouched. (This is the one Tier-A form with a sharp edge — it is why `RENAME`
+re-serializes the canonical text, emitting each substituted name **always as a double-quoted
+identifier** (`"a2"`), so it re-lexes to the same name even when the new name is spelled like a
+keyword (`RENAME COLUMN a TO "null"` must not turn a stored `a IS NULL` into `null IS NULL`) —
+[grammar.md §3](grammar.md); tokens the rewrite does not substitute keep their stored spelling;
+a name that appears only as a string literal or unrelated identifier is untouched. (This is the one Tier-A form with a sharp edge — it is why `RENAME`
 is its own slice.)
 
 ### 2.3 `RENAME CONSTRAINT … TO …`

@@ -160,7 +160,7 @@ export class Scope {
   // outer environment (the subquery's parent is this scope), an uncorrelated one folds once
   // (spec/design/grammar.md §26). SELECT builds its own scope in planSelect.
   static single(catalog: Engine, t: Table): Scope {
-    return new Scope([{ label: t.name.toLowerCase(), table: t, offset: 0 }], catalog, null, true);
+    return new Scope([{ label: t.name, table: t, offset: 0 }], catalog, null, true);
   }
 
   // index is the scope a PERSISTED index expression (an expression key or a partial-index predicate)
@@ -196,7 +196,7 @@ export class Scope {
     returning: ReturningClause,
   ): Scope {
     const n = t.columns.length;
-    const label = t.name.toLowerCase();
+    const label = t.name;
     const oldOffset = baseIsOld ? 0 : n;
     const newOffset = baseIsOld ? n : 0;
     const rels: ScopeRel[] = [{ label, table: t, offset: 0 }];
@@ -205,7 +205,7 @@ export class Scope {
       { alias: returning.newAlias, offset: newOffset },
     ]) {
       if (explicit.alias !== null) {
-        const alias = explicit.alias.toLowerCase();
+        const alias = explicit.alias;
         if (rels.some((r) => r.label === alias)) {
           throw engineError("duplicate_alias", `table name ${alias} specified more than once`);
         }
@@ -241,7 +241,7 @@ export class Scope {
   // RETURNING old/new qualifiers).
   static onConflictExcluded(catalog: Engine, t: Table): Scope {
     const n = t.columns.length;
-    const label = t.name.toLowerCase();
+    const label = t.name;
     const rels: ScopeRel[] = [{ label, table: t, offset: 0 }];
     if (label !== "excluded") {
       rels.push({
@@ -261,7 +261,7 @@ export class Scope {
   // A qualifier-only rel (the RETURNING old/new pseudo-relations) is invisible here — no
   // new ambiguity (grammar.md §32).
   resolveBare(name: string): Resolved {
-    const lower = name.toLowerCase();
+    const lower = name;
     // A USING/NATURAL MERGE column resolves to its surviving side (grammar.md §15), seeded here so
     // the bare name binds the merged column rather than its two (hidden) underlying copies — which is
     // why such a join column is unambiguous. A non-hidden column elsewhere with the same name still
@@ -283,7 +283,7 @@ export class Scope {
         const idx = r.offset + local;
         // A merge's underlying copies are superseded by the merge above — skip them.
         if (this.hidden.includes(idx)) continue;
-        if (r.table.columns[local]!.name.toLowerCase() === lower) {
+        if (r.table.columns[local]!.name === lower) {
           if (found >= 0) throw ambiguousColumn(name);
           found = idx;
         }
@@ -298,18 +298,18 @@ export class Scope {
   // naming a relation here binds — a missing column is then 42703 (no fall-through). Only an
   // unknown qualifier walks outward (42P01 if no ancestor has it).
   resolveQualified(qualifier: string, name: string): Resolved {
-    const q = qualifier.toLowerCase();
+    const q = qualifier;
     for (const r of this.rels) {
       if (r.label === q) {
         // A synthetic relation (a derived table, an aliased parenthesized join) may carry two
         // columns of one name; a qualified reference to it is ambiguous (42702) exactly as a bare
         // one is (PG). A USING/NATURAL copy hidden by a merge yields to the visible column.
-        const lowerName = name.toLowerCase();
+        const lowerName = name;
         let found = -1;
         let visible = -1;
         let ambiguous = false;
         for (let local = 0; local < r.table.columns.length; local++) {
-          if (r.table.columns[local]!.name.toLowerCase() !== lowerName) continue;
+          if (r.table.columns[local]!.name !== lowerName) continue;
           const idx = r.offset + local;
           if (found < 0) found = idx;
           if (!this.hidden.includes(idx)) {
@@ -506,8 +506,8 @@ export function resolvedRangeElementScalar(elem: ResolvedType): ScalarType | und
 // recursive CTE must take the well-formed shape `non_recursive_term UNION [ALL] recursive_term`
 // with the self-reference appearing exactly once, as a direct FROM/JOIN relation of the recursive
 // term. These structural checks mirror PostgreSQL's checkWellFormedRecursion, run on the parsed AST
-// before planning; the error surface is recursive-cte.md §6. The `name` argument is already
-// lowercased (the CTE's lname).
+// before planning; the error surface is recursive-cte.md §6. The `name` argument is the
+// exact CTE name.
 
 // analyzeRecursiveCte classifies a CTE body for WITH RECURSIVE (recursive-cte.md §6). It returns
 // { recursive: false } when the body does not reference name (an ordinary CTE, even under
@@ -675,7 +675,7 @@ export function countSelfRefsQuery(qe: QueryExpr, name: string): number {
     let shadowed = false;
     for (const cte of qe.ctes) {
       if (!shadowed) n += countCteRefsDml(cte.body, name);
-      if (cte.name.toLowerCase() === name) shadowed = true;
+      if (cte.name === name) shadowed = true;
     }
     if (!shadowed) n += countSelfRefsQuery(qe.body, name);
     return n;
@@ -696,7 +696,7 @@ export function countSelfRefsSelect(s: Select, name: string): number {
 // reference with the matching name (+1), a derived-table subquery (recurse), or a table-function's
 // / VALUES' argument exprs.
 export function countSelfRefsTableref(tref: TableRef, name: string): number {
-  if (isPlainRelation(tref)) return tref.name.toLowerCase() === name ? 1 : 0;
+  if (isPlainRelation(tref)) return tref.name === name ? 1 : 0;
   let n = 0;
   if (tref.subquery !== undefined) n += countSelfRefsQuery(tref.subquery, name);
   if (tref.args !== null && tref.args !== undefined) {
@@ -788,7 +788,7 @@ export function countSelfRefsExpr(e: Expr, name: string): number {
 export function countDirectFromSelfRefs(s: Select, name: string): number {
   let n = 0;
   for (const tref of fromRelations(s)) {
-    if (isPlainRelation(tref) && tref.name.toLowerCase() === name) n++;
+    if (isPlainRelation(tref) && tref.name === name) n++;
   }
   return n;
 }
@@ -834,9 +834,7 @@ export function directSelfRefOnNullableSide(s: Select, name: string): boolean {
         break;
     }
   }
-  return rels.some(
-    (tref, i) => isPlainRelation(tref) && tref.name.toLowerCase() === name && nullable[i]!,
-  );
+  return rels.some((tref, i) => isPlainRelation(tref) && tref.name === name && nullable[i]!);
 }
 
 // isPlainRelation reports whether a FROM relation is a plain table NAME — not a derived-table
@@ -1331,9 +1329,9 @@ export function applySeqAlter(
 // serialPseudoType maps a serial pseudo-type name to its underlying integer scalar
 // (spec/design/sequences.md §12) — serial/serial4 → i32, bigserial/serial8 → i64,
 // smallserial/serial2 → i16. undefined for any other name. Recognized only in a CREATE TABLE
-// column-type position; the match is case-insensitive.
+// column-type position; the match is byte-exact (the parser passes the folded / quoted name).
 export function serialPseudoType(name: string): ScalarType | undefined {
-  switch (name.toLowerCase()) {
+  switch (name) {
     case "serial":
     case "serial4":
       return "i32";
@@ -1460,7 +1458,7 @@ export function tableRefCallsSeqMutator(t: TableRef): boolean {
 export function exprCallsSeqMutator(e: Expr): boolean {
   switch (e.kind) {
     case "funcCall": {
-      const n = e.name.toLowerCase();
+      const n = e.name;
       return n === "nextval" || n === "setval" || e.args.some(exprCallsSeqMutator);
     }
     case "column":
@@ -1650,7 +1648,7 @@ export function collectQueryPrivs(qe: QueryExpr, req: PrivReq, locals: Set<strin
     const scope = new Set(locals);
     for (const cte of qe.ctes) {
       collectCteBodyPrivs(cte.body, req, scope);
-      scope.add(cte.name.toLowerCase());
+      scope.add(cte.name);
     }
     collectQueryPrivs(qe.body, req, scope);
   } else collectSelectPrivs(qe, req, locals);
@@ -1669,7 +1667,7 @@ export function collectWithPrivs(wq: WithQuery, req: PrivReq, locals: Set<string
   const scope = new Set(locals);
   for (const cte of wq.ctes) {
     collectCteBodyPrivs(cte.body, req, scope);
-    scope.add(cte.name.toLowerCase());
+    scope.add(cte.name);
   }
   collectCteBodyPrivs(wq.body, req, scope);
 }
@@ -1707,7 +1705,7 @@ export function collectTableRefPrivs(t: TableRef, req: PrivReq, locals: Set<stri
     collectQueryPrivs(t.subquery, req, locals);
   } else if (t.values !== undefined) {
     for (const row of t.values) for (const e of row) collectExprPrivs(e, req, locals);
-  } else if (!locals.has(t.name.toLowerCase())) {
+  } else if (!locals.has(t.name)) {
     // A base-table reference (not a CTE / derived-table label) — needs SELECT.
     req.tables.push({ name: t.name, priv: "select" });
   }

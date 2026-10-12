@@ -36,7 +36,7 @@ test("storage limit options and gauge", () => {
   s.execute("CREATE TABLE t (id i32 PRIMARY KEY, v text)");
   // Unlimited by default: a large insert commits.
   s.execute(batch(0, 200));
-  const full = db.storageBytes("MAIN");
+  const full = db.storageBytes("main");
   assert.ok(full > fresh);
   // Lowering the limit below the current size blocks growth, not the database.
   db.setMaxStorageBytes("main", fresh);

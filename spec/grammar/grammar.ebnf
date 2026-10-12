@@ -22,11 +22,15 @@
  *
  * Conventions specific to this grammar:
  *   - Keywords ("SELECT", "FROM", ...) are written as quoted terminals but are
- *     NOT reserved words: the lexer emits one `identifier` token for every bare
- *     word and the parser distinguishes keywords by position, case-insensitively.
- *     So a keyword spelling is a legal identifier where the grammar expects one.
- *   - Keyword terminals match case-insensitively (SELECT = select = SeLeCt).
+ *     NOT reserved words: the lexer emits one `bare_identifier` token for every
+ *     bare word and the parser distinguishes keywords by position. So a keyword
+ *     spelling is a legal identifier where the grammar expects one.
+ *   - A bare word folds to lowercase in the lexer, so keyword terminals match
+ *     case-insensitively (SELECT = select = SeLeCt). A keyword terminal matches
+ *     ONLY a bare word, never a quoted_identifier ("from" is always a name).
  *     Punctuation terminals match literally.
+ *   - `identifier` (below) is a bare or quoted name; names compare byte-exactly
+ *     after the fold (../design/grammar.md §3).
  *   - Whitespace (space, tab, CR, LF) separates tokens and is otherwise
  *     insignificant. SQL comments are whitespace (../design/grammar.md §33):
  *     two hyphens start a line comment running to the end of the line, and a
@@ -1113,7 +1117,7 @@ greatest_least_expr ::= ( "GREATEST" | "LEAST" ) "(" expr ( "," expr )* ")"
  * is DEFERRED — it returns `double precision` and jed has no `float` type (timezones.md §9.2).
  * "EXTRACT" is recognized only when immediately followed by "(" (a one-token lookahead, §8), so it
  * stays usable as a column / function name otherwise — like the typed_literal lookahead. */
-extract_expr   ::= "EXTRACT" "(" ( identifier | string ) "FROM" expr ")"
+extract_expr   ::= "EXTRACT" "(" ( bare_identifier | string ) "FROM" expr ")"
 
 /* The shared function-call syntax. A name resolves to an AGGREGATE function
  * (../functions/catalog.toml, kind = "aggregate" — COUNT/SUM/MIN/MAX/AVG) or a SCALAR
@@ -1293,14 +1297,19 @@ colon          ::= ":"
  * character other than a single quote. */
 string         ::= "'" ( char | "''" )* "'"
 
-/* Bare identifiers are ASCII only and case-insensitive (callers fold them). */
-identifier     ::= (letter | "_") (letter | digit | "_")*
+/* A name: bare or double-quoted (../design/grammar.md §3). Every `identifier` position in this
+ * grammar accepts either spelling; the resulting name compares byte-exactly everywhere. */
+identifier     ::= bare_identifier | quoted_identifier
 
-/* A double-quoted identifier — case-sensitive, kept VERBATIM, an embedded `"` written by doubling
- * it (`""`). Added for collation names (../design/collation.md §1); the ONLY parse position that
- * consumes one today is COLLATE "name" (collate_clause), so a quoted identifier elsewhere is a 42601
- * syntax error. `qchar` is any character other than a double quote. */
-quoted_identifier ::= "\"" ( qchar | "\"\"" )* "\""
+/* Bare identifiers are ASCII only and FOLD TO LOWERCASE in the lexer (`Orders` is the name
+ * `orders`). A bare word is also how every keyword is spelled. */
+bare_identifier ::= (letter | "_") (letter | digit | "_")*
+
+/* A double-quoted identifier — case-sensitive, kept VERBATIM (any UTF-8), an embedded `"` written
+ * by doubling it (`""`). Never a keyword. Zero-length (`""`) is a 42601 syntax error. Collation
+ * names (collate_clause) accept ONLY this form. `qchar` is any character other than a double
+ * quote. */
+quoted_identifier ::= "\"" ( qchar | "\"\"" )+ "\""
 
 letter         ::= [A-Za-z]
 digit          ::= [0-9]

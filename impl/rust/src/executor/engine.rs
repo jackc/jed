@@ -86,13 +86,13 @@ impl Engine {
                 return;
             }
             None => "main".to_string(),
-            Some(s) if s.eq_ignore_ascii_case("temp") => {
+            Some(s) if s == "temp" => {
                 self.temp_working_mut().mark_statistics_stale(table);
                 return;
             }
-            Some(s) => s.to_ascii_lowercase(),
+            Some(s) => s.to_string(),
         };
-        let key = (database.clone(), table.to_ascii_lowercase());
+        let key = (database.clone(), table.to_string());
         if !self.estimator_touched.insert(key) {
             return;
         }
@@ -285,12 +285,12 @@ impl Engine {
     /// name would, so this is a VALIDATION GATE, not a routing change: it asserts the named relation
     /// lives in the claimed database (else 42P01), and the downstream temp-first funnel then resolves it
     /// to the matching scope. A `None` qualifier (a bare, implicit-scope name) always passes. The
-    /// qualifier is matched case-insensitively (unquoted identifiers fold to lower case).
+    /// qualifier is matched byte-exactly (unquoted identifiers already folded, grammar.md §3).
     pub(crate) fn check_table_qualifier(&self, qualifier: Option<&str>, name: &str) -> Result<()> {
         let Some(q) = qualifier else {
             return Ok(());
         };
-        match q.to_ascii_lowercase().as_str() {
+        match q.to_string().as_str() {
             "temp" => {
                 if !self.is_temp_table(name) {
                     return Err(EngineError::new(
@@ -312,7 +312,7 @@ impl Engine {
                 // attachment (else 42P01 "database … is not attached") and it must carry the table
                 // (else 42P01 "relation … does not exist"). Slice 1a's default case was always 42P01;
                 // Slice 1b routes it to the attachment registry.
-                let scope = q.to_ascii_lowercase();
+                let scope = q.to_string();
                 match self.attach_read_snap(&scope) {
                     None => {
                         return Err(EngineError::new(
@@ -343,7 +343,7 @@ impl Engine {
         let Some(core) = &self.core else {
             return Ok(());
         };
-        let name = q.to_ascii_lowercase();
+        let name = q.to_string();
         if name == "main" || name == "temp" {
             return Ok(());
         }
@@ -379,7 +379,7 @@ impl Engine {
 
     /// The READ snapshot of a host-attached database (attached-databases.md §5) — the transaction's
     /// working clone if this tx wrote it, else the pinned committed root (`attached_committed`). `None`
-    /// when no attachment is named `name` (the caller raises 42P01). `name` is expected lowercased.
+    /// when no attachment is named `name` (the caller raises 42P01). `name` is the exact attachment name.
     pub(crate) fn attach_read_snap(&self, name: &str) -> Option<&Snapshot> {
         if let Some(tx) = &self.session.tx
             && let Some(ws) = tx.attach_working.get(name)
@@ -393,7 +393,7 @@ impl Engine {
     /// transaction's per-attachment working set on first write and marking it dirty (the attachment
     /// analogue of `working_mut`/`temp_working_mut`). A write runs within a transaction, and the
     /// attachment is known to exist (the qualifier gate ran), so this never panics in a correct flow.
-    /// `name` is expected lowercased.
+    /// `name` is the exact attachment name.
     pub(crate) fn attach_write_snap(&mut self, name: &str) -> &mut Snapshot {
         let present = self
             .session
@@ -457,7 +457,7 @@ impl Engine {
     /// attachment registry would re-share it across sessions (what Slice 0 removed). So temp routes like
     /// an attachment here but keeps its own home.
     pub(crate) fn snap_for_scope(&self, scope: &str) -> Option<&Snapshot> {
-        match scope.to_ascii_lowercase().as_str() {
+        match scope.to_string().as_str() {
             "temp" => Some(self.temp_read_snap()),
             "main" => Some(self.read_snap()),
             other => self.attach_read_snap(other),
@@ -474,7 +474,7 @@ impl Engine {
         let Some(q) = qualifier else {
             return Ok("main".to_string());
         };
-        let lq = q.to_ascii_lowercase();
+        let lq = q.to_string();
         if lq == "main" || lq == "temp" {
             return Ok(lq);
         }
@@ -501,7 +501,7 @@ impl Engine {
     pub(crate) fn store_scoped(&self, scope: Option<&str>, name: &str) -> &TableStore {
         match scope {
             None => self.store(name),
-            Some(q) => match q.to_ascii_lowercase().as_str() {
+            Some(q) => match q.to_string().as_str() {
                 "temp" => self.temp_read_snap().store(name),
                 "main" => self.read_snap().store(name),
                 other => self
@@ -517,7 +517,7 @@ impl Engine {
     pub(crate) fn store_mut_scoped(&mut self, scope: Option<&str>, name: &str) -> &mut TableStore {
         match scope {
             None => self.store_mut(name),
-            Some(q) => match q.to_ascii_lowercase().as_str() {
+            Some(q) => match q.to_string().as_str() {
                 "temp" => self.temp_working_mut().store_mut(name),
                 "main" => self.working_mut().store_mut(name),
                 other => {
@@ -533,7 +533,7 @@ impl Engine {
     pub(crate) fn index_store_scoped(&self, scope: Option<&str>, name_key: &str) -> &TableStore {
         match scope {
             None => self.index_store(name_key),
-            Some(q) => match q.to_ascii_lowercase().as_str() {
+            Some(q) => match q.to_string().as_str() {
                 "temp" => self.temp_read_snap().index_store(name_key),
                 "main" => self.read_snap().index_store(name_key),
                 other => self
@@ -553,7 +553,7 @@ impl Engine {
     ) -> &mut TableStore {
         match scope {
             None => self.index_store_mut(name_key),
-            Some(q) => match q.to_ascii_lowercase().as_str() {
+            Some(q) => match q.to_string().as_str() {
                 "temp" => self.temp_working_mut().index_store_mut(name_key),
                 "main" => self.working_mut().index_store_mut(name_key),
                 other => {
@@ -621,7 +621,7 @@ impl Engine {
     /// [`put_sequence_routed`](Engine::put_sequence_routed)). Used by `DROP SEQUENCE` and
     /// `DROP TABLE`'s owned-sequence auto-drop.
     pub(crate) fn remove_sequence_routed(&mut self, name: &str) {
-        let key = name.to_ascii_lowercase();
+        let key = name.to_string();
         if self.is_temp_sequence(name) {
             self.temp_working_mut().remove_sequence(&key);
         } else {

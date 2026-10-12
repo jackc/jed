@@ -31,8 +31,8 @@ import (
 // is NULL-extended at runtime regardless of its declared nullability (grammar.md §15).
 // ============================================================================
 
-// scopeRel is one relation in a FROM scope: its label (alias, else table name, lower-cased
-// for case-insensitive matching), the table, and the flat offset of its first column. A
+// scopeRel is one relation in a FROM scope: its label (alias, else table name — the exact
+// name, matched byte-exactly), the table, and the flat offset of its first column. A
 // qualifierOnly relation is visible ONLY to qualified references — the RETURNING old/new
 // row-version pseudo-relations (grammar.md §32): bare-column resolution skips it (no new
 // ambiguity), every other statement never builds one.
@@ -131,7 +131,7 @@ func subRelsWithin(subs []subRel, lo, hi int) []subRel {
 	return out
 }
 
-// mergeCol is a USING/NATURAL merged column (spec/design/grammar.md §15): name is the (lowercased)
+// mergeCol is a USING/NATURAL merged column (spec/design/grammar.md §15): name is the (exact)
 // join column and index the flat row index a bare reference resolves to — the surviving side (the
 // left column for INNER/LEFT, the right for RIGHT; FULL JOIN USING, a COALESCE, is deferred 0A000).
 // Both underlying copies are recorded in the scope's hidden set.
@@ -145,7 +145,7 @@ type mergeCol struct {
 // outer environment (the subquery's parent is this scope), an uncorrelated one folds once
 // (spec/design/grammar.md §26). SELECT builds its own scope in planSelect.
 func singleScope(catalog *engine, t *catTable) *scope {
-	return &scope{rels: []scopeRel{{label: strings.ToLower(t.Name), table: t, offset: 0}}, catalog: catalog, allowSubquery: true}
+	return &scope{rels: []scopeRel{{label: t.Name, table: t, offset: 0}}, catalog: catalog, allowSubquery: true}
 }
 
 // indexScope is the scope a PERSISTED index expression (an expression key or a partial-index
@@ -175,7 +175,7 @@ func emptyScope(catalog *engine) *scope {
 // target table). Explicit aliases may not collide with the target or each other (42712).
 func returningScope(catalog *engine, t *catTable, baseIsOld bool, returning *returningClause) (*scope, error) {
 	n := len(t.Columns)
-	label := strings.ToLower(t.Name)
+	label := t.Name
 	oldOffset, newOffset := n, 0
 	if baseIsOld {
 		oldOffset, newOffset = 0, n
@@ -186,7 +186,7 @@ func returningScope(catalog *engine, t *catTable, baseIsOld bool, returning *ret
 		offset int
 	}{{returning.OldAlias, oldOffset}, {returning.NewAlias, newOffset}} {
 		if explicit.alias != nil {
-			alias := strings.ToLower(*explicit.alias)
+			alias := *explicit.alias
 			for _, rel := range rels {
 				if rel.label == alias {
 					return nil, newError(DuplicateAlias, "table name "+alias+" specified more than once")
@@ -219,7 +219,7 @@ func returningScope(catalog *engine, t *catTable, baseIsOld bool, returning *ret
 // RETURNING old/new qualifiers).
 func onConflictExcludedScope(catalog *engine, t *catTable) *scope {
 	n := len(t.Columns)
-	label := strings.ToLower(t.Name)
+	label := t.Name
 	rels := []scopeRel{{label: label, table: t, offset: 0}}
 	if label != "excluded" {
 		rels = append(rels, scopeRel{label: "excluded", table: t, offset: n, qualifierOnly: true})
@@ -245,7 +245,7 @@ func (s *scope) resolveBare(name string) (resolved, error) {
 	// still makes the reference ambiguous (a third relation sharing the name).
 	found := -1
 	for _, m := range s.merges {
-		if strings.EqualFold(m.name, name) {
+		if m.name == name {
 			found = m.index
 			break
 		}
@@ -265,7 +265,7 @@ func (s *scope) resolveBare(name string) (resolved, error) {
 			if slices.Contains(s.hidden, idx) {
 				continue
 			}
-			if strings.EqualFold(c.Name, name) {
+			if c.Name == name {
 				if found >= 0 {
 					return resolved{}, ambiguousColumn(name)
 				}
@@ -290,7 +290,7 @@ func (s *scope) resolveBare(name string) (resolved, error) {
 // naming a relation here binds — a missing column is then 42703 (no fall-through). Only an
 // unknown qualifier walks outward (42P01 if no ancestor has it).
 func (s *scope) resolveQualified(qualifier, name string) (resolved, error) {
-	q := strings.ToLower(qualifier)
+	q := qualifier
 	for _, r := range s.rels {
 		if r.label == q {
 			// A synthetic relation (a derived table, an aliased parenthesized join) may carry two
@@ -298,7 +298,7 @@ func (s *scope) resolveQualified(qualifier, name string) (resolved, error) {
 			// one is (PG). A USING/NATURAL copy hidden by a merge yields to the visible column.
 			found, visible, ambiguous := -1, -1, false
 			for local, c := range r.table.Columns {
-				if !strings.EqualFold(c.Name, name) {
+				if c.Name != name {
 					continue
 				}
 				idx := r.offset + local
@@ -371,7 +371,7 @@ func naturalCommonCols(leftNames []string, right *scopeRel) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, name := range leftNames {
-		lc := strings.ToLower(name)
+		lc := name
 		if !seen[lc] {
 			seen[lc] = true
 			if right.table.ColumnIndex(name) >= 0 {
@@ -404,7 +404,7 @@ func undefinedColumn(name string) error {
 // resolveFieldOf builds field selection `(base).field` over an already-resolved `base` node and
 // its static type (spec/design/composite.md §S4): `base` must be composite — else 42809
 // (wrong_object_type, PG's "column notation applied to non-composite") — and `field` must name one
-// of its fields case-insensitively (PG folds the identifier), else 42703 (undefined_column).
+// of its fields by exact name (PG folds the identifier), else 42703 (undefined_column).
 // Returns the reField node carrying the fixed field ordinal, plus the field's static type.
 func resolveFieldOf(baseNode *rExpr, baseTy resolvedType, field string) (*rExpr, resolvedType, error) {
 	if baseTy.kind != rtComposite {
@@ -414,7 +414,7 @@ func resolveFieldOf(baseNode *rExpr, baseTy resolvedType, field string) (*rExpr,
 		))
 	}
 	for i, f := range baseTy.comp.fields {
-		if strings.EqualFold(f.name, field) {
+		if f.name == field {
 			return &rExpr{kind: reField, operand: baseNode, index: i}, f.ty, nil
 		}
 	}
@@ -694,7 +694,7 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 		// other items. Resolved against the LOCAL scope only (like bare `*`); an unknown label is
 		// 42P01, exactly as a qualified column ref.
 		if it.Expr.Kind == exprQualifiedStar {
-			want := toLowerASCII(it.Expr.Qualifier)
+			want := it.Expr.Qualifier
 			var table *catTable
 			var slots []int
 			for i := range s.rels {
@@ -787,8 +787,8 @@ func outputName(s *scope, e exprNode) string {
 		}
 		return e.Column
 	case exprFuncCall:
-		// An un-aliased aggregate call is named by its lowercased function name (PG; §8).
-		return toLowerASCII(e.FuncCall.Name)
+		// An un-aliased aggregate call is named by its exact function name (PG; §8).
+		return e.FuncCall.Name
 	case exprCoalesce:
 		// The fixed keyword lowercased (PG; grammar.md §51) — no expression printer needed.
 		return "coalesce"
@@ -800,8 +800,8 @@ func outputName(s *scope, e exprNode) string {
 		return "least"
 	case exprFieldAccess:
 		// A field selection takes the FIELD name (PG names the output column after the selected
-		// field, lowercased — spec/design/composite.md §S4).
-		return toLowerASCII(e.Field)
+		// field, exact — spec/design/composite.md §S4).
+		return e.Field
 	case exprSubscript:
 		// A subscript takes the base array's name (PG names `a[1]` after `a`); `a[1][2]` recurses to
 		// the same base. A non-column base falls through to `?column?`.
@@ -817,7 +817,7 @@ func outputName(s *scope, e exprNode) string {
 // the matching select-list item's expression (the caller routes it exactly like the same ordinal:
 // a plain column stays on the slot fast path, a computed item is materialized), or nil when no
 // output name matches (the caller falls back to the FROM scope, the prior behavior). Matching is
-// case-insensitive (§8). Only an explicit list is scanned — with * the output names are the scope
+// byte-exact on the folded name (grammar.md §3). Only an explicit list is scanned — with * the output names are the scope
 // columns, so the FROM-scope fallback already binds the same column. Two items of the same name
 // with DIFFERENT expressions are ambiguous (42702); the same expression twice is not, matching PG.
 func orderAliasMatch(items selectItems, name string, s *scope) (*exprNode, error) {
@@ -833,7 +833,7 @@ func orderAliasMatch(items selectItems, name string, s *scope) (*exprNode, error
 		} else {
 			oname = outputName(s, it.Expr)
 		}
-		if !strings.EqualFold(oname, name) {
+		if oname != name {
 			continue
 		}
 		if found == nil {
@@ -1133,7 +1133,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		if isHypotheticalSetName(e.FuncCall.Name) && e.FuncCall.WithinGroup != nil {
 			if e.FuncCall.Over != nil || e.FuncCall.OverName != "" {
 				return nil, resolvedType{}, newError(FeatureNotSupported,
-					fmt.Sprintf("OVER is not supported for hypothetical-set aggregate %s", toLowerASCII(e.FuncCall.Name)))
+					fmt.Sprintf("OVER is not supported for hypothetical-set aggregate %s", e.FuncCall.Name))
 			}
 			return resolveHypotheticalSetAggregate(s, e.FuncCall, ag, params)
 		}
@@ -1144,21 +1144,21 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		if isOrderedSetAggregateName(e.FuncCall.Name) {
 			if e.FuncCall.Over != nil || e.FuncCall.OverName != "" {
 				return nil, resolvedType{}, newError(FeatureNotSupported,
-					fmt.Sprintf("OVER is not supported for ordered-set aggregate %s", toLowerASCII(e.FuncCall.Name)))
+					fmt.Sprintf("OVER is not supported for ordered-set aggregate %s", e.FuncCall.Name))
 			}
 			if e.FuncCall.WithinGroup == nil {
-				return nil, resolvedType{}, noAggOverload(toLowerASCII(e.FuncCall.Name))
+				return nil, resolvedType{}, noAggOverload(e.FuncCall.Name)
 			}
 			return resolveOrderedSetAggregate(s, e.FuncCall, ag, params)
 		}
 		// WITHIN GROUP on a non-ordered-set function (an ordinary aggregate or a scalar function) is
 		// 42883 — PG models it as a missing overload (`sum(numeric, numeric) does not exist`).
 		if e.FuncCall.WithinGroup != nil {
-			return nil, resolvedType{}, noAggOverload(toLowerASCII(e.FuncCall.Name))
+			return nil, resolvedType{}, noAggOverload(e.FuncCall.Name)
 		}
 		// A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
 		if e.FuncCall.Over != nil {
-			if strings.EqualFold(e.FuncCall.Name, "grouping") {
+			if e.FuncCall.Name == "grouping" {
 				// GROUPING is not a window function — GROUPING(a) OVER () is a syntax error in
 				// PostgreSQL (42601); match it rather than treating GROUPING as an unknown window fn.
 				return nil, resolvedType{}, newError(SyntaxError, "OVER is not supported for GROUPING")
@@ -1183,7 +1183,7 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		// not the windowing_error 42P20 it uses for a window in WHERE — window.md §7, oracle-verified).
 		if isWindowOnlyName(e.FuncCall.Name) {
 			return nil, resolvedType{}, newError(WrongObjectType,
-				fmt.Sprintf("window function %s requires an OVER clause", toLowerASCII(e.FuncCall.Name)))
+				fmt.Sprintf("window function %s requires an OVER clause", e.FuncCall.Name))
 		}
 		return resolveFuncCall(s, e.FuncCall, ag, params)
 	case exprLiteral:
@@ -2362,7 +2362,7 @@ func deriveCollation(s *scope, e exprNode) (deriv, error) {
 			// An input-typed aggregate / window function (min/max, lag/lead/first_value/…): its value
 			// arguments. FILTER, OVER and an in-aggregate ORDER BY contribute nothing.
 			return combineDerivPtrs(s, f.Args)
-		case f.WithinGroup != nil && (strings.EqualFold(f.Name, "mode") || strings.EqualFold(f.Name, "percentile_disc")):
+		case f.WithinGroup != nil && (f.Name == "mode" || f.Name == "percentile_disc"):
 			// An ordered-set aggregate returning its key's type (mode / percentile_disc): the one key.
 			if len(f.WithinGroup) == 0 {
 				return deriv{}, nil
@@ -2489,12 +2489,12 @@ func orderKeyDeriv(s *scope, key *orderKey) (deriv, error) {
 // same_as_input. A non-text argument derives nothing, so sum/avg over numbers are unaffected.
 func aggResultCollatable(name string) bool {
 	for i := range aggregates {
-		if aggregates[i].Result == "same_as_input" && strings.EqualFold(aggregates[i].Surface, name) {
+		if aggregates[i].Result == "same_as_input" && surfaceMatches(aggregates[i].Surface, name) {
 			return true
 		}
 	}
 	for i := range windows {
-		if windows[i].Result == "same_as_input" && strings.EqualFold(windows[i].Surface, name) {
+		if windows[i].Result == "same_as_input" && surfaceMatches(windows[i].Surface, name) {
 			return true
 		}
 	}
@@ -2572,7 +2572,7 @@ func functionResultCollatable(name string) bool {
 	for i := range operators {
 		o := &operators[i]
 		if o.Kind == "function" && (o.Result == "text" || o.Result == "text[]" || o.Result == "anyarray") &&
-			strings.EqualFold(o.Name, name) {
+			o.Name == name {
 			return true
 		}
 	}

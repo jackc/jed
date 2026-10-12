@@ -4,7 +4,8 @@ package jed
 type tokenKind int
 
 const (
-	// TokWord is a bare word: keyword or identifier (compared case-insensitively).
+	// TokWord is a bare word: keyword or identifier, already FOLDED to lowercase by the lexer
+	// (spec/design/grammar.md §3), so keyword and name comparisons are byte-exact.
 	tokWord tokenKind = iota
 	// TokInt is an integer literal's unsigned magnitude (the sign is TokMinus).
 	tokInt
@@ -12,10 +13,11 @@ const (
 	// lexer strips the quotes and collapses each doubled '' to one ' (no backslash
 	// escapes — standard_conforming_strings, spec/design/types.md §11).
 	tokStr
-	// TokQuotedIdent is a double-quoted identifier's decoded content ("en-US", "C"): the lexer
-	// strips the surrounding " and collapses each doubled "" to one ". Unlike TokWord it is kept
-	// VERBATIM (case-sensitive). Used for collation names (spec/design/collation.md §1); the only
-	// parse position consuming one today is COLLATE "name", so it is a 42601 syntax error elsewhere.
+	// TokQuotedIdent is a double-quoted identifier's decoded content ("userId", "en-US"): the lexer
+	// strips the surrounding " and collapses each doubled "" to one ". Unlike TokWord (folded) it
+	// is kept VERBATIM (case-sensitive, any UTF-8). A quoted identifier is a name wherever an
+	// identifier is accepted and is NEVER a keyword (spec/design/grammar.md §3); collation names
+	// accept only this form.
 	tokQuotedIdent
 	// TokDecimal is a decimal literal (a numeric literal containing a '.'): Word holds the
 	// unscaled coefficient as a decimal-digit string (leading zeros allowed, no sign) and Int

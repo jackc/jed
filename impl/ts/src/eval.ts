@@ -35,6 +35,7 @@ import {
   uuidValue,
   zoneRenderCount,
 } from "./value.ts";
+import { parseNameText } from "./parser.ts";
 import { COSTS } from "./costs.ts";
 import { makeDate } from "./date.ts";
 import {
@@ -1362,23 +1363,19 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // state; currval is a pure session-state read. The NULL-arg case is handled above (propagates).
       if (e.func === "nextval") {
         m.charge(COSTS.sequenceAdvance);
-        return intValue(env.exec.seqNextval((vals[0] as { text: string }).text));
+        // The text names the sequence as one identifier (grammar.md §3; 42602 when malformed).
+        return intValue(env.exec.seqNextval(parseNameText((vals[0] as { text: string }).text)));
       }
       if (e.func === "currval") {
-        return intValue(env.exec.seqCurrval((vals[0] as { text: string }).text));
+        return intValue(env.exec.seqCurrval(parseNameText((vals[0] as { text: string }).text)));
       }
       // setval charges sequence_advance (it rewrites the catalog tuple, like nextval). Arity 2 →
       // isCalled defaults true; arity 3 → the boolean third argument.
       if (e.func === "setval") {
         m.charge(COSTS.sequenceAdvance);
+        const seqName = parseNameText((vals[0] as { text: string }).text);
         const isCalled = vals.length > 2 ? (vals[2] as { value: boolean }).value : true;
-        return intValue(
-          env.exec.seqSetval(
-            (vals[0] as { text: string }).text,
-            (vals[1] as { int: bigint }).int,
-            isCalled,
-          ),
-        );
+        return intValue(env.exec.seqSetval(seqName, (vals[1] as { int: bigint }).int, isCalled));
       }
       if (e.func === "lastval") {
         return intValue(env.exec.seqLastval());

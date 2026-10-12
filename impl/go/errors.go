@@ -7,7 +7,6 @@ package jed
 import (
 	"errors"
 	"fmt"
-	"strings"
 )
 
 // The SqlState type + its Code() mapping are generated from spec/errors/registry.toml
@@ -122,4 +121,4 @@ func newNotNullViolation(column string) *EngineError {
 
 // pkeyName is the derived <table>_pkey constraint name PostgreSQL auto-assigns a primary
 // key (jed persists no such relation — constraints.md §5.4).
-func pkeyName(table string) string { return strings.ToLower(table) + "_pkey" }
+func pkeyName(table string) string { return table + "_pkey" }

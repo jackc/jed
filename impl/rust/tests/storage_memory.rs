@@ -35,7 +35,7 @@ fn storage_limit_options_and_gauge() {
         .unwrap();
     // Unlimited by default: a large insert commits.
     s.execute(&batch(0, 200), &[]).unwrap();
-    let full = db.storage_bytes("MAIN").unwrap();
+    let full = db.storage_bytes("main").unwrap();
     assert!(full > fresh);
     // Lowering the limit below the current size blocks growth, not the database.
     db.set_max_storage_bytes("main", fresh).unwrap();

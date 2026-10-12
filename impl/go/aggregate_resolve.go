@@ -19,7 +19,7 @@ func resolveAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes
 	if !ag.collecting {
 		return nil, resolvedType{}, newError(GroupingError, "aggregate functions are not allowed here")
 	}
-	name := toLowerASCII(fc.Name)
+	name := fc.Name
 	sub := &aggCtx{collecting: false}
 	var (
 		plan    aggPlan
@@ -133,7 +133,7 @@ func resolveOrderedSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *
 	if fc.Distinct {
 		return nil, resolvedType{}, newError(SyntaxError, "DISTINCT is not allowed with ordered-set aggregates")
 	}
-	name := toLowerASCII(fc.Name)
+	name := fc.Name
 	// Exactly one WITHIN GROUP sort key (PG models a second as a missing overload → 42883).
 	if len(fc.WithinGroup) != 1 {
 		return nil, resolvedType{}, noAggOverload(name)
@@ -253,7 +253,7 @@ func resolveHypotheticalSetAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, par
 	if fc.Distinct {
 		return nil, resolvedType{}, newError(SyntaxError, "DISTINCT is not allowed with ordered-set aggregates")
 	}
-	name := toLowerASCII(fc.Name)
+	name := fc.Name
 	// The number of hypothetical direct arguments must match the number of ordering columns (PG
 	// models a mismatch as a missing overload → 42883).
 	if len(fc.Args) == 0 || len(fc.Args) != len(fc.WithinGroup) {
@@ -499,7 +499,7 @@ func resolveGrouping(s *scope, fc *funcCallExpr, ag *aggCtx) (*rExpr, resolvedTy
 // else (WHERE / JOIN ON / HAVING / an aggregate query) it is 42P20. The call collects into a
 // windowSpec and resolves to the synthetic slot windowBase+window_index. S0: only row_number().
 func resolveWindowCall(s *scope, fc *funcCallExpr, filter *exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
-	name := toLowerASCII(fc.Name)
+	name := fc.Name
 	// The plan + result type from the function name. S0: only row_number(); an aggregate name with
 	// OVER (a window aggregate, S3) resolves to planAgg carrying the aggregate plan in wagg; any
 	// other name is 42883.

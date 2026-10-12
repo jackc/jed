@@ -475,7 +475,7 @@ per-relation pushdown seam. Every eligible B-tree contributes an access candidat
 **equality prefix** on the leading key columns plus an **optional range** on the next column
 (indexes.md §5.1; the same const-source rule as above — literal / `$N` / correlated outer / sibling
 column, type-matched). For a one-base-relation SELECT, P6a compares all such candidates against the
-PK and full paths by estimated scheduled cost; exact ties use PK, then lowercased index name, then
+PK and full paths by estimated scheduled cost; exact ties use PK, then index name (byte order), then
 full scan. UPDATE/DELETE use the same comparison ([estimator.md §9.3](estimator.md)); joins search
 their own candidates. Gated by the
 `ddl.secondary_index` capability (a leading/trailing-column **range** by
@@ -1752,8 +1752,13 @@ gets its own tighter gate because identifiers persist to the catalog and keys.)
 identifier — table / column / type / alias / function name — longer than 63 bytes is rejected with
 **`42622` `name_too_long`**. The check sits in the **lexer**, at the identifier-token *producer*
 (the same "bound at the producer" reasoning as §7's parser gate), so it bounds **every** identifier
-on **every** parse path and fires during tokenization, before the parser dispatches. Identifiers
-are ASCII-only ([grammar.md](grammar.md) §3), so 63 bytes = 63 characters. **63** matches
+on **every** parse path and fires during tokenization, before the parser dispatches. It bounds a
+**bare** identifier (ASCII-only, so 63 bytes = 63 characters) and a **quoted** identifier alike —
+for a quoted one the limit is on the decoded name's UTF-8 bytes (after `""` collapses to `"`, without
+the delimiters), so `"café"` counts 5 bytes ([grammar.md](grammar.md) §3); a collation name after
+`COLLATE` is a quoted identifier and is bounded the same way. A name taken from a text argument
+(`nextval('…')`) or the host API is not length-checked — an over-long name simply names nothing.
+**63** matches
 PostgreSQL's `NAMEDATALEN − 1` boundary, but jed **errors** where PG silently *truncates* — jed has
 no notices, and a silent truncation could collide two distinct names (a documented PG divergence,
 CLAUDE.md §1). A fixed, cross-core-identical constant (§8), like `MAX_EXPR_DEPTH`.

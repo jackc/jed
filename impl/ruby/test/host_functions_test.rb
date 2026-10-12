@@ -324,8 +324,9 @@ class HostFunctionsTest < Minitest::Test
     reg = Jed::ExtensionRegistry.new
     reg.register("f", [:i64], :i64) { |x| x }
     reg.register("f", [:text], :text) { |x| x } # an overload on another signature is fine
+    reg.register("F", [:i64], :i64) { |x| x } # host-API names are exact: "F" is a different name
     {
-      "42723" => -> { reg.register("F", [:bigint], :i64) { |x| x } },
+      "42723" => -> { reg.register("f", [:bigint], :i64) { |x| x } },
       "22023" => -> { reg.register("g", [:i64], :i64, cost: -1) { |x| x } },
       "42704" => -> { reg.register("g", [:nonsense], :i64) { |x| x } },
       "0A000" => -> { reg.register("g", [:uuid], :i64) { |x| x } },

@@ -12,10 +12,10 @@ import { emptyRangeValue, rangeValue, render, renderIn, type Value } from "./val
 import type { ZoneRef } from "./timezone.ts";
 import { engineError } from "./errors.ts";
 
-// rangeByName looks up a range type by name (case-insensitive), matching the canonical id or any
+// rangeByName looks up a range type by name (exact name), matching the canonical id or any
 // alias (int4range → i32range). undefined if name is not one of the six range types.
 export function rangeByName(name: string): RangeDesc | undefined {
-  const lname = name.toLowerCase();
+  const lname = name;
   return RANGES.find((r) => r.id === lname || r.aliases.includes(lname));
 }
 

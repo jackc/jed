@@ -128,7 +128,7 @@ pub enum IndexKind {
 /// hash-map/registration order never leaks (CLAUDE.md §8).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct HostFuncDep {
-    /// The (lowercased) SQL function name — the correlation key to a re-resolved `HostFunc` node.
+    /// The exact SQL function name — the correlation key to a re-resolved `HostFunc` node.
     pub name: String,
     /// The exact scalar argument signature — with `name`, identifies which overload this dependency
     /// pins.
@@ -188,7 +188,7 @@ pub struct TimeZoneDeps {
 
 /// One secondary index of a table (spec/design/indexes.md): its (relation-namespace) name
 /// and its key elements in index-key order (columns and/or expressions, duplicates allowed —
-/// PG). The index's B-tree lives in the snapshot's index-store map, keyed by the lowercased
+/// PG). The index's B-tree lives in the snapshot's index-store map, keyed by the exact
 /// name. A `unique` index enforces uniqueness over its key tuple (NULLS DISTINCT —
 /// spec/design/indexes.md §8); it is what backs a `UNIQUE` constraint
 /// (spec/design/constraints.md §5). `kind` selects ordered-B-tree vs GIN
@@ -258,7 +258,7 @@ pub enum FkAction {
 /// list order, the referenced (parent) table name, the referenced column ordinals into the
 /// **parent** in list order (same length as `columns`), and the referential actions. An FK owns no
 /// B-tree; enforcement probes the parent's PK store or a unique index (§6.4). Held in ascending
-/// lowercased-name order on the table (the catalog's on-disk order and the child-side evaluation
+/// name byte order on the table (the catalog's on-disk order and the child-side evaluation
 /// order — §6.9).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ForeignKeyConstraint {
@@ -295,7 +295,7 @@ pub struct ExclusionElement {
 /// **GiST** index that enforces it (by name — the constraint *is* its index, the UNIQUE-is-its-index
 /// model generalized from a single implicit `=` to an explicit operator list), and the
 /// `(column, operator)` element vector the conjunction probe needs. Held in ascending
-/// lowercased-name order on the table (the catalog's on-disk order). The NULL rule (§7) is enforced
+/// name byte order on the table (the catalog's on-disk order). The NULL rule (§7) is enforced
 /// at probe time: a row with a NULL in any excluded column never conflicts.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ExclusionConstraint {
@@ -312,7 +312,7 @@ pub struct ExclusionConstraint {
 /// by name; spec/fileformat/format.md *Composite-type entry*).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CompositeType {
-    /// The type name (original case — round-trips what the user typed); looked up case-insensitively.
+    /// The exact type name (grammar.md §3); looked up byte-exactly.
     pub name: String,
     /// The fields in declaration order (≥ 1).
     pub fields: Vec<CompositeField>,
@@ -339,7 +339,7 @@ pub struct CompositeField {
 /// lives in the snapshot catalog, so the counter is transactional by construction (sequences.md §5).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SequenceDef {
-    /// The sequence name (original case; looked up case-insensitively).
+    /// The exact sequence name (grammar.md §3); looked up byte-exactly.
     pub name: String,
     /// The step per `nextval` (non-zero). Positive = ascending, negative = descending.
     pub increment: i64,
@@ -442,17 +442,17 @@ pub struct Table {
     /// membership convenience; this list is the authority for order.
     pub pk: Vec<usize>,
     /// The table's CHECK constraints in **evaluation order** — ascending byte order of the
-    /// lowercased name (spec/design/constraints.md §4.4); the on-disk catalog stores them in
+    /// exact name (spec/design/constraints.md §4.4); the on-disk catalog stores them in
     /// this same order. Empty for an unchecked table.
     pub checks: Vec<CheckConstraint>,
-    /// The table's secondary indexes in **ascending lowercased-name order** (the catalog's
+    /// The table's secondary indexes in **ascending name byte order** (the catalog's
     /// on-disk order and the planner's tie-break order — spec/design/indexes.md §5/§6).
     pub indexes: Vec<IndexDef>,
-    /// The table's FOREIGN KEY constraints in **ascending lowercased-name order** (the catalog's
+    /// The table's FOREIGN KEY constraints in **ascending name byte order** (the catalog's
     /// on-disk order and the child-side evaluation order — spec/design/constraints.md §6.9).
     /// Empty for a table with none.
     pub foreign_keys: Vec<ForeignKeyConstraint>,
-    /// The table's `EXCLUDE` constraints in **ascending lowercased-name order** (the catalog's
+    /// The table's `EXCLUDE` constraints in **ascending name byte order** (the catalog's
     /// on-disk order — spec/design/gist.md §7/§8). Each is backed by a GiST index in `indexes`.
     /// Empty for a table with none.
     pub exclusions: Vec<ExclusionConstraint>,
@@ -500,8 +500,8 @@ pub struct ColField {
 }
 
 /// Resolve a catalog [`Type`] into a self-contained [`ColType`] against the database's composite
-/// definitions (keyed by lowercased name, the `Snapshot.types` map). A composite reference is
-/// looked up case-insensitively and recursively resolved; the lookup is guaranteed to succeed
+/// definitions (keyed by exact name, the `Snapshot.types` map). A composite reference is
+/// looked up by exact name and recursively resolved; the lookup is guaranteed to succeed
 /// because `validate_composite_types` (the two-pass load / `CREATE TYPE` gate) proved every
 /// reference exists and the graph is acyclic before any store is built (spec/design/composite.md §3).
 pub fn resolve_col_type(ty: &Type, types: &HashMap<String, CompositeType>) -> ColType {
@@ -509,7 +509,7 @@ pub fn resolve_col_type(ty: &Type, types: &HashMap<String, CompositeType>) -> Co
         Type::Scalar(s) => ColType::Scalar(*s),
         Type::Composite(r) => {
             let def = types
-                .get(&r.name.to_ascii_lowercase())
+                .get(&r.name.to_string())
                 .expect("composite type reference resolved by validate_composite_types");
             ColType::Composite {
                 name: def.name.clone(),
@@ -575,11 +575,9 @@ impl ColType {
 }
 
 impl Table {
-    /// Index of the named column (case-insensitive), if present.
+    /// Index of the named column (exact name, grammar.md §3), if present.
     pub fn column_index(&self, name: &str) -> Option<usize> {
-        self.columns
-            .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(name))
+        self.columns.iter().position(|c| c.name == name)
     }
 
     /// The primary-key member columns' indices in KEY order (the explicit `pk` list — the

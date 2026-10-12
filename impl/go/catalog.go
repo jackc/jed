@@ -2,7 +2,6 @@ package jed
 
 import (
 	"math"
-	"strings"
 )
 
 // Column is a column definition: name, declared type, nullability, primary-key flag.
@@ -91,17 +90,17 @@ type catTable struct {
 	// membership convenience; this list is the authority for order.
 	PK []int
 	// Checks is the table's CHECK constraints in EVALUATION ORDER — ascending byte order
-	// of the lowercased name (spec/design/constraints.md §4.4); the on-disk catalog stores
+	// of the exact name (spec/design/constraints.md §4.4); the on-disk catalog stores
 	// them in this same order. Empty for an unchecked table.
 	Checks []checkConstraint
-	// Indexes is the table's secondary indexes in ascending lowercased-name order (the
+	// Indexes is the table's secondary indexes in ascending name byte order (the
 	// catalog's on-disk order and the planner's tie-break order — spec/design/indexes.md).
 	Indexes []indexDef
-	// ForeignKeys is the table's FOREIGN KEY constraints in ascending lowercased-name order
+	// ForeignKeys is the table's FOREIGN KEY constraints in ascending name byte order
 	// (the catalog's on-disk order and the child-side evaluation order —
 	// spec/design/constraints.md §6.9). Empty for a table with none.
 	ForeignKeys []foreignKey
-	// Exclusions is the table's EXCLUDE constraints in ascending lowercased-name order (the
+	// Exclusions is the table's EXCLUDE constraints in ascending name byte order (the
 	// catalog's on-disk order — spec/design/gist.md §7/§8). Each is backed by a GiST index in
 	// Indexes. Empty for a table with none.
 	Exclusions []exclusionConstraint
@@ -132,7 +131,7 @@ type exclusionElement struct {
 // ExclusionConstraint is one EXCLUDE constraint (spec/design/gist.md §7): its (relation-namespace)
 // name, the backing GiST index that enforces it (by name — the constraint IS its index, the
 // UNIQUE-is-its-index model generalized to an explicit operator list), and the (column, operator)
-// element vector the conjunction probe needs. Held in ascending lowercased-name order on the table.
+// element vector the conjunction probe needs. Held in ascending name byte order on the table.
 // The NULL rule (§7) is enforced at probe time: a row with a NULL in any excluded column never
 // conflicts.
 type exclusionConstraint struct {
@@ -164,7 +163,7 @@ const (
 // list order, the referenced (parent) table name, the referenced column ordinals into the PARENT
 // in list order (same length as Columns), and the referential actions. An FK owns no B-tree;
 // enforcement probes the parent's PK store or a unique index (§6.4). Held in ascending
-// lowercased-name order on the table (the catalog's on-disk order and the child-side evaluation
+// name byte order on the table (the catalog's on-disk order and the child-side evaluation
 // order — §6.9).
 type foreignKey struct {
 	Name       string
@@ -183,7 +182,7 @@ type foreignKey struct {
 // writes — never a silent stale-key read). Sorted by (Name, ArgTypes) when stored so registration
 // order never leaks (CLAUDE.md §8).
 type hostFuncDep struct {
-	// Name is the (lowercased) SQL function name — the correlation key to a re-resolved reHostFunc node.
+	// Name is the (exact) SQL function name — the correlation key to a re-resolved reHostFunc node.
 	Name string
 	// ArgTypes is the exact scalar argument signature — with Name, identifies which overload this pins.
 	ArgTypes []scalarType
@@ -237,7 +236,7 @@ func (k indexKey) asColumn() (int, bool) {
 // IndexDef is one secondary index of a table (spec/design/indexes.md): its
 // (relation-namespace) name and its key elements in index-key order (columns and/or
 // expressions, duplicates allowed — PG). The index's B-tree lives in the snapshot's
-// index-store map, keyed by the lowercased name. A Unique index enforces uniqueness over its
+// index-store map, keyed by the exact name. A Unique index enforces uniqueness over its
 // key tuple (NULLS DISTINCT — spec/design/indexes.md §8); it is what backs a UNIQUE constraint
 // (spec/design/constraints.md §5).
 type indexDef struct {
@@ -303,7 +302,7 @@ func (d *indexDef) firstColumn() int {
 // + IsCalled are the mutable counter state a nextval advances. The whole struct lives in the
 // snapshot catalog, so the counter is transactional by construction (sequences.md §5).
 type sequenceDef struct {
-	// Name is the sequence name (original case; looked up case-insensitively).
+	// Name is the sequence name (exact name; looked up byte-exactly).
 	Name string
 	// Increment is the step per nextval (non-zero). Positive = ascending, negative = descending.
 	Increment int64
@@ -430,7 +429,7 @@ const (
 // persisted by name; spec/fileformat/format.md *Composite-type entry*).
 type compositeType struct {
 	// Name is the type name (original case — round-trips what the user typed); looked up
-	// case-insensitively.
+	// by exact name.
 	Name string
 	// Fields are the fields in declaration order (≥ 1).
 	Fields []compositeField
@@ -523,8 +522,8 @@ func (ct colType) keyable() bool {
 }
 
 // ResolveColType resolves a catalog Type into a self-contained ColType against the database's
-// composite definitions (keyed by lowercased name, the Snapshot.types map). A composite reference is
-// looked up case-insensitively and recursively resolved; the lookup is guaranteed to succeed because
+// composite definitions (keyed by exact name, the Snapshot.types map). A composite reference is
+// looked up by exact name and recursively resolved; the lookup is guaranteed to succeed because
 // validateCompositeTypes (the two-pass load / CREATE TYPE gate) proved every reference exists and the
 // graph is acyclic before any store is built (spec/design/composite.md §3).
 func resolveColType(ty dataType, types map[string]*compositeType) colType {
@@ -542,7 +541,7 @@ func resolveColType(ty dataType, types map[string]*compositeType) colType {
 	if ty.Comp == nil {
 		return colType{Scalar: ty.Scalar}
 	}
-	def := types[strings.ToLower(ty.Comp.Name)]
+	def := types[ty.Comp.Name]
 	fields := make([]colField, len(def.Fields))
 	for i, f := range def.Fields {
 		fields[i] = colField{
@@ -571,10 +570,10 @@ type checkConstraint struct {
 	HostDeps []hostFuncDep
 }
 
-// ColumnIndex returns the index of the named column (case-insensitive), or -1.
+// ColumnIndex returns the index of the named column (exact name), or -1.
 func (t *catTable) ColumnIndex(name string) int {
 	for i, c := range t.Columns {
-		if strings.EqualFold(c.Name, name) {
+		if c.Name == name {
 			return i
 		}
 	}

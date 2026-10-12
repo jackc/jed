@@ -242,6 +242,7 @@ import type { SharedPaging } from "./paging.ts";
 import {
   parseExpression,
   parseSQL,
+  quoteIdentifier,
   rewriteColumnIdentifier,
   rewriteTableQualifier,
 } from "./parser.ts";
@@ -308,6 +309,7 @@ import {
   byteaValue,
   boolValue,
   canonFloat,
+  compareTextC,
   dateValue,
   decimalValue,
   encodeFloat32Key,
@@ -676,7 +678,7 @@ export function sortedEmitter(sorted: Pick<SortedRows, "next" | "close">, remain
 
 // Engine is the whole database: catalog + per-table in-memory stores. Single
 // committed state (CLAUDE.md §3); the staging-buffer commit model lands later. Names
-// are keyed case-insensitively (lowercased).
+// are keyed by exact name (bare identifiers are folded by the lexer — grammar.md §3).
 // DEFAULT_PAGE_SIZE is the default serialization page size (8 KiB — spec/design/storage.md §3),
 // used for a fresh in-memory or newly-created database when no explicit size is given.
 export const DEFAULT_PAGE_SIZE = 8192;
@@ -721,29 +723,35 @@ export const MAX_COMPOSITE_DEPTH = 32;
 // host), so this stays host-agnostic.
 export const SQL_BYTE_ENCODER = new TextEncoder();
 
-// Catalog names are ordered by the UTF-8 bytes of their lowercased form, matching Rust/Go raw
-// string ordering. String#localeCompare is locale/ICU-sensitive and JavaScript's native UTF-16
-// ordering differs from UTF-8 for supplementary code points.
-export function compareLowerName(a: { name: string }, b: { name: string }): number {
-  return compareBytes(
-    SQL_BYTE_ENCODER.encode(a.name.toLowerCase()),
-    SQL_BYTE_ENCODER.encode(b.name.toLowerCase()),
-  );
+// Catalog names are ordered by the UTF-8 bytes of their exact name (spec/design/grammar.md §3),
+// matching Rust/Go raw string ordering. String#localeCompare is locale/ICU-sensitive and
+// JavaScript's native UTF-16 ordering differs from UTF-8 for supplementary code points.
+export function compareName(a: { name: string }, b: { name: string }): number {
+  return compareTextC(a.name, b.name);
 }
 // checkReservedName rejects a USER-written catalog object name beginning jed_ — the prefix is
-// reserved for the engine's own catalog relations (spec/design/introspection.md §4). Case-insensitive
-// (resolution folds case and there is no quoted-identifier escape — grammar.md §3). Engine-GENERATED
-// names (a serial's <table>_<col>_seq, an index auto-name — both legal for a table named jed) never
-// pass through here; the check sits with each site's namespace-collision check so established
-// validation orders (42P01/42703 before name checks) are preserved. kind is the object word in the
-// message: table / index / sequence / type / constraint.
+// reserved for the engine's own catalog relations (spec/design/introspection.md §4). Byte-exact on
+// the (folded) name: a bare JED_x folds to jed_x and is rejected, a quoted "JED_x" is a different
+// name and is allowed (grammar.md §3, PostgreSQL's pg_ rule). Engine-GENERATED names (a serial's
+// <table>_<col>_seq, an index auto-name — both legal for a table named jed) never pass through here;
+// the check sits with each site's namespace-collision check so established validation orders
+// (42P01/42703 before name checks) are preserved. kind is the object word in the message: table /
+// index / sequence / type / constraint.
 export function checkReservedName(kind: string, name: string): void {
-  if (name.length >= 4 && name.slice(0, 4).toLowerCase() === "jed_") {
+  if (name.startsWith("jed_")) {
     throw engineError(
       "reserved_name",
       `${kind} name ${name} is reserved (the jed_ prefix is reserved for system objects)`,
     );
   }
+}
+
+// nextvalDefaultText is the canonical expression text of an owned sequence's generated
+// DEFAULT nextval('<seq>') (space-joined tokens, constraints.md §2). The sequence name is written by
+// grammar.md §3's quoting rule inside the string — bare when a plain lowercase identifier, else
+// "…" — so the regclass-style text parse resolves it exactly; the string literal then doubles any '.
+export function nextvalDefaultText(seqName: string): string {
+  return `nextval ( '${quoteIdentifier(seqName).replace(/'/g, "''")}' )`;
 }
 
 export function utf8ByteLength(s: string): number {
@@ -1247,7 +1255,7 @@ export type CollationInfo = {
 // dropped. RESTRICT formats refTableName/fkName/droppedName into its 2BP01 detail; CASCADE uses
 // refTableKey/fkName to remove the now-dangling constraint.
 export type FkDependent = {
-  refTableKey: string; // lowercased key of the (surviving) referencing table — for the CASCADE removal
+  refTableKey: string; // exact key of the (surviving) referencing table — for the CASCADE removal
   fkName: string; // the FK constraint's name
   refTableName: string; // canonical referencing-table name — for the RESTRICT detail
   droppedName: string; // canonical name of the dropped table the FK references — for the RESTRICT detail
@@ -1277,7 +1285,7 @@ export class Engine {
   // (core.attachments) during a commit persist; the READ view of attachments is attachedCommitted below.
   core: AttachmentCore | null = null;
   // attachedCommitted is the PINNED committed root of every host-attached DATABASE-scoped database
-  // (attached-databases.md §5), keyed by lowercased name — this session's stable read view, snapshot
+  // (attached-databases.md §5), keyed by exact name — this session's stable read view, snapshot
   // isolated: refreshed from the core's attached roots at each autocommit statement and pinned for the
   // life of an explicit BEGIN block. Empty when nothing is attached. Session-local temp is NOT here (it
   // is on SessionState.tempCommitted); this is only the Database-scoped roots.
@@ -1705,12 +1713,12 @@ export class Engine {
   // SAME store the bare name would, so this is a VALIDATION GATE, not a routing change: it asserts the
   // named relation lives in the claimed database (else 42P01), and the downstream temp-first funnel
   // then resolves it to the matching scope. An undefined qualifier (a bare, implicit-scope name) always
-  // passes. The qualifier is matched case-insensitively (unquoted identifiers fold to lower case).
+  // passes. The qualifier is matched byte-exactly (a bare spelling is already folded — grammar.md §3).
   private checkTableQualifier(qualifier: string | undefined, name: string): void {
     if (qualifier === undefined) {
       return;
     }
-    switch (qualifier.toLowerCase()) {
+    switch (qualifier) {
       case "temp":
         if (!this.isTempTable(name)) {
           throw engineError("undefined_table", `relation "temp.${name}" does not exist`);
@@ -1725,7 +1733,7 @@ export class Engine {
         // A host-attached database (attached-databases.md §5): resolve its pinned/working snapshot, then
         // assert the relation lives there. An unknown name is 42P01 "not attached"; a known database
         // missing the table is 42P01 "relation … does not exist".
-        const snap = this.attachReadSnap(qualifier.toLowerCase());
+        const snap = this.attachReadSnap(qualifier);
         if (snap === undefined) {
           throw engineError("undefined_table", `database "${qualifier}" is not attached`);
         }
@@ -1742,7 +1750,7 @@ export class Engine {
   // passes. Unknown attachments are caught by the qualifier gate, so this only inspects the mode.
   private checkAttachmentWritable(scope: string | undefined): void {
     if (scope === undefined || this.core === null) return;
-    const name = scope.toLowerCase();
+    const name = scope;
     if (name === "main" || name === "temp") return;
     const att = this.core.attachments.get(name);
     if (att?.readOnly) {
@@ -1756,7 +1764,7 @@ export class Engine {
   // attachReadSnap returns the READ snapshot of a host-attached database (attached-databases.md §5) —
   // the transaction's working clone if this tx wrote it, else the pinned committed root
   // (attachedCommitted). undefined when no attachment is named `name` (the caller raises 42P01). name
-  // is expected lowercased.
+  // is the exact attachment name.
   private attachReadSnap(name: string): Snapshot | undefined {
     const tx = this.session.tx;
     if (tx !== null && tx.attachWorking !== undefined) {
@@ -1769,7 +1777,7 @@ export class Engine {
   // attachWriteSnap returns the WRITE snapshot of a host-attached database, cloning the pinned committed
   // root into the transaction's per-attachment working set on first write and marking it dirty (the
   // attachment analogue of working()/tempWorking). undefined if the attachment is unknown (unreachable
-  // after the qualifier gate). name is expected lowercased.
+  // after the qualifier gate). name is the exact attachment name.
   private attachWriteSnap(name: string): Snapshot | undefined {
     const tx = this.session.tx!;
     if (tx.attachWorking === undefined) {
@@ -1826,13 +1834,13 @@ export class Engine {
   // it across sessions (what Slice 0 removed). So temp routes like an attachment here but keeps its own
   // home.
   private snapForScope(scope: string): Snapshot | undefined {
-    switch (scope.toLowerCase()) {
+    switch (scope) {
       case "temp":
         return this.tempSnap();
       case "main":
         return this.readSnap();
       default:
-        return this.attachReadSnap(scope.toLowerCase());
+        return this.attachReadSnap(scope);
     }
   }
 
@@ -1860,14 +1868,14 @@ export class Engine {
   // right domain dirty (main / temp / the attachment); an undefined scope keeps the bare temp-first funnel.
   private writeStoreScoped(scope: string | undefined, name: string): TableStore {
     if (scope === undefined) return this.writeStore(name);
-    switch (scope.toLowerCase()) {
+    switch (scope) {
       case "temp":
         this.session.tx!.tempDirty = true;
         return this.session.tx!.tempWorking.store(name);
       case "main":
         return this.working().store(name);
       default:
-        return this.attachWriteSnap(scope.toLowerCase())!.store(name);
+        return this.attachWriteSnap(scope)!.store(name);
     }
   }
 
@@ -1885,14 +1893,14 @@ export class Engine {
 
   private writeIndexStoreScoped(scope: string | undefined, nameKey: string): TableStore {
     if (scope === undefined) return this.writeIndexStore(nameKey);
-    switch (scope.toLowerCase()) {
+    switch (scope) {
       case "temp":
         this.session.tx!.tempDirty = true;
         return this.session.tx!.tempWorking.indexStore(nameKey);
       case "main":
         return this.working().indexStore(nameKey);
       default:
-        return this.attachWriteSnap(scope.toLowerCase())!.indexStore(nameKey);
+        return this.attachWriteSnap(scope)!.indexStore(nameKey);
     }
   }
 
@@ -1947,7 +1955,7 @@ export class Engine {
   // removeSequenceRouted removes a sequence from whichever scope owns its name (the routed analogue of
   // putSequenceRouted). Used by DROP SEQUENCE and DROP TABLE's owned-sequence auto-drop.
   private removeSequenceRouted(name: string): void {
-    const key = name.toLowerCase();
+    const key = name;
     if (this.isTempSequence(name)) {
       this.session.tx!.tempDirty = true;
       this.session.tx!.tempWorking.removeSequence(key);
@@ -2095,7 +2103,7 @@ export class Engine {
   // success (flushPendingSequences). A missing sequence is 42P01; advancing past a bound without
   // CYCLE is 2200H.
   seqNextval(name: string): bigint {
-    const key = name.toLowerCase();
+    const key = name;
     let def = this.session.pendingSeq.get(key);
     if (def === undefined) {
       const committed = this.sequence(name);
@@ -2145,7 +2153,7 @@ export class Engine {
   // is true the value also defines this session's currval (PG: isCalled=false leaves currval
   // untouched). setval never updates lastval (PG — §6).
   seqSetval(name: string, n: bigint, isCalled: boolean): bigint {
-    const key = name.toLowerCase();
+    const key = name;
     let def = this.session.pendingSeq.get(key);
     if (def === undefined) {
       const committed = this.sequence(name);
@@ -2203,7 +2211,7 @@ export class Engine {
     if (this.sequence(name) === undefined) {
       throw engineError("undefined_table", `relation does not exist: ${name}`);
     }
-    const key = name.toLowerCase();
+    const key = name;
     const pending = this.session.pendingCurrval.get(key);
     if (pending !== undefined) return pending;
     const v = this.session.sessionSeq.get(key);
@@ -2340,12 +2348,12 @@ export class Engine {
     return { statementsRun, rowsAffectedTotal, cost };
   }
 
-  // table looks up a table definition by name (case-insensitive) in the visible snapshot.
+  // table looks up a table definition by exact name in the visible snapshot.
   table(name: string): Table | undefined {
     return this.readSnap().table(name);
   }
 
-  // compositeType looks up a composite type definition by name (case-insensitive) in the visible
+  // compositeType looks up a composite type definition by exact name in the visible
   // snapshot (spec/design/composite.md).
   compositeType(name: string): CompositeType | undefined {
     return this.readSnap().compositeType(name);
@@ -2379,12 +2387,12 @@ export class Engine {
   }
 
   // tableNames is the canonical name of every table in the visible snapshot, sorted ascending
-  // by lowercased name (the catalog's standing order — no map-iteration order may leak,
-  // CLAUDE.md §8; keys are ASCII, so code-unit sort == byte sort). Secondary indexes are not
+  // by exact-name UTF-8 byte order (the catalog's standing order — no map-iteration order may leak,
+  // CLAUDE.md §8). Secondary indexes are not
   // tables and are excluded (api.md §6).
   tableNames(): string[] {
     const snap = this.readSnap();
-    return [...snap.tables.keys()].sort().map((k) => snap.tables.get(k)!.name);
+    return [...snap.tables.keys()].sort(compareTextC).map((k) => snap.tables.get(k)!.name);
   }
 
   // putTable registers a new table and its empty store in the working snapshot (DDL is
@@ -2694,14 +2702,14 @@ export class Engine {
         return;
       }
     } else {
-      database = scope.toLowerCase();
+      database = scope;
       if (database === "temp") {
         this.session.tx!.tempDirty = true;
         this.session.tx!.tempWorking.markStatisticsStale(table);
         return;
       }
     }
-    const key = database + "\0" + table.toLowerCase();
+    const key = database + "\0" + table;
     if (this.estimatorTouched.has(key)) return;
     this.estimatorTouched.add(key);
     const snapshot = database === "main" ? this.working() : this.attachWriteSnap(database)!;
@@ -2850,7 +2858,7 @@ export class Engine {
       // last, so only main's persist follows its durable point.
       const isFile = (name: string): boolean => (core.attachments.get(name)?.storage.path ?? null) !== null;
       const names = [...tx.attachDirty].sort((a, b) =>
-        isFile(a) !== isFile(b) ? (isFile(a) ? 1 : -1) : a < b ? -1 : a > b ? 1 : 0,
+        isFile(a) !== isFile(b) ? (isFile(a) ? 1 : -1) : compareTextC(a, b),
       );
       const staged: StagedCommit[] = [];
       for (const name of names) {
@@ -3054,7 +3062,7 @@ export class Engine {
         (stmt.kind === "dropSequence" && stmt.names.some((n) => this.isTempSequence(n))) ||
         (stmt.kind === "alterTable" &&
           (stmt.db !== undefined
-            ? stmt.db.toLowerCase() === "temp"
+            ? stmt.db === "temp"
             : this.isTempTable(stmt.name))) ||
         (stmt.kind === "alterSequence" && this.isTempSequence(stmt.name))
       ) {
@@ -3071,7 +3079,7 @@ export class Engine {
     }
     const snap = this.readSnap();
     for (const t of req.tables) {
-      const key = t.name.toLowerCase();
+      const key = t.name;
       // Only a name that resolves to an existing catalog table is privilege-checked; a missing one is
       // left to raise 42P01 in execution (existence before authorization). A built-in catalog relation
       // (jed_tables / jed_columns) is gated exactly like a user table — per-table SELECT on its own
@@ -3083,7 +3091,7 @@ export class Engine {
       }
     }
     for (const fn of req.functions) {
-      const key = fn.toLowerCase();
+      const key = fn;
       if (!this.session.privileges.allowsFunction(key)) {
         throw engineError("insufficient_privilege", "permission denied for function " + key);
       }
@@ -3113,7 +3121,7 @@ export class Engine {
     for (const assignment of upd.assignments) {
       if (!assignment.isDefault) continue;
       const col = table.columns.find(
-        (candidate) => candidate.name.toLowerCase() === assignment.column.toLowerCase(),
+        (candidate) => candidate.name === assignment.column,
       );
       if (col !== undefined && col.defaultExpr !== null) {
         collectExprPrivs(col.defaultExpr.expr, req, locals);
@@ -3254,7 +3262,7 @@ export class Engine {
 
   private executeAnalyze(analyze: Analyze): Outcome {
     this.checkAttachmentWritable(analyze.db);
-    if (isCatalogRelName(analyze.name.toLowerCase())) {
+    if (isCatalogRelName(analyze.name)) {
       throw engineError("wrong_object_type", `cannot modify system relation ${analyze.name}`);
     }
     const table = this.lkpTableScoped(analyze.db, analyze.name);
@@ -3266,11 +3274,11 @@ export class Engine {
       for (let i = 0; i < table.columns.length; i++) columns.push(i);
     } else {
       for (const name of analyze.columns) {
-        const key = name.toLowerCase();
+        const key = name;
         if (seen.has(key))
           throw engineError("duplicate_column", `column ${name} appears more than once`);
         seen.add(key);
-        const column = table.columns.findIndex((candidate) => candidate.name.toLowerCase() === key);
+        const column = table.columns.findIndex((candidate) => candidate.name === key);
         if (column < 0)
           throw engineError("undefined_column", `column does not exist: ${name}`);
         columns.push(column);
@@ -3288,7 +3296,7 @@ export class Engine {
         ? this.isTempTable(analyze.name)
           ? "temp"
           : "main"
-        : analyze.db.toLowerCase();
+        : analyze.db;
     let target: Snapshot;
     if (database === "temp") {
       this.session.tx!.tempDirty = true;
@@ -3461,7 +3469,7 @@ export class Engine {
   private estimatePlanRelScope(rel: PlanRel): ScopeRel | null {
     const table = this.lkpTableScoped(rel.db, rel.tableName);
     if (table === undefined) return null;
-    return { label: rel.tableName.toLowerCase(), table, offset: rel.offset, ...(rel.db === undefined ? {} : { db: rel.db }) };
+    return { label: rel.tableName, table, offset: rel.offset, ...(rel.db === undefined ? {} : { db: rel.db }) };
   }
 
   private estimateColumnStatistics(
@@ -4255,7 +4263,7 @@ export class Engine {
     filter: RExpr | null,
     ctx: EstimateCteContext | null,
   ): EstimatedPlan {
-    const rel: ScopeRel = { label: table.name.toLowerCase(), table, offset: 0, ...(db === undefined ? {} : { db }) };
+    const rel: ScopeRel = { label: table.name, table, offset: 0, ...(db === undefined ? {} : { db }) };
     const contradiction = whereContradicts(filter);
     let scan = leafEstimatedPlan(
       this.estimateSelectedScan(rel, this.planMutationScan(db, table, filter, contradiction).bound, filter),
@@ -4817,7 +4825,7 @@ export class Engine {
   ): MutationScanPlan {
     if (filter === null) return { bound: null, db, contradiction };
     const rel: ScopeRel = {
-      label: table.name.toLowerCase(),
+      label: table.name,
       table,
       offset: 0,
       ...(db !== undefined ? { db } : {}),
@@ -5216,7 +5224,7 @@ export class Engine {
     let targetTemp = ct.temp;
     let attachName = "";
     if (ct.db !== undefined) {
-      switch (ct.db.toLowerCase()) {
+      switch (ct.db) {
         case "main":
           if (ct.temp) {
             throw engineError("syntax_error", `cannot create a TEMP table in database "main"`);
@@ -5229,7 +5237,7 @@ export class Engine {
           if (ct.temp) {
             throw engineError("syntax_error", "cannot create a TEMP table in an attached database");
           }
-          attachName = ct.db.toLowerCase();
+          attachName = ct.db;
           if (this.attachReadSnap(attachName) === undefined) {
             throw engineError("undefined_table", `database "${ct.db}" is not attached`);
           }
@@ -5295,7 +5303,7 @@ export class Engine {
     const pendingSerials: SequenceDef[] = [];
     for (const def of ct.columns) {
       for (const c of columns) {
-        if (c.name.toLowerCase() === def.name.toLowerCase()) {
+        if (c.name === def.name) {
           throw engineError("duplicate_column", "duplicate column name: " + def.name);
         }
       }
@@ -5483,9 +5491,9 @@ export class Engine {
         pendingSerials.push(buildSequenceDef(seqName, opts, owner));
         // Render the synthetic default exactly as the parser would the equivalent
         // DEFAULT nextval('<seqName>') (space-joined tokens — the canonical expression-text form),
-        // so the in-memory expr matches what reload re-parses. The seqName is a lowercased
-        // identifier-derived name, so the quoting is always safe.
-        const exprText = `nextval ( '${seqName.replace(/'/g, "''")}' )`;
+        // so the in-memory expr matches what reload re-parses. The sequence name is quoted inside the
+        // text when it is not a plain lowercase identifier (grammar.md §3).
+        const exprText = nextvalDefaultText(seqName);
         def_defaultExpr = { exprText, expr: parseExpression(exprText) };
         if (def.identity !== null) identityKind = def.identity.always ? "always" : "byDefault";
       } else if (
@@ -5589,8 +5597,8 @@ export class Engine {
       pkSeen = true;
       const indices: number[] = [];
       for (const name of pkList) {
-        const lower = name.toLowerCase();
-        const idx = columns.findIndex((c) => c.name.toLowerCase() === lower);
+        const lower = name;
+        const idx = columns.findIndex((c) => c.name === lower);
         if (idx < 0) {
           throw engineError("undefined_column", "column " + name + " named in key does not exist");
         }
@@ -5629,8 +5637,8 @@ export class Engine {
     for (const u of ct.uniques) {
       const indices: number[] = [];
       for (const cname of u.columns) {
-        const lower = cname.toLowerCase();
-        const idx = columns.findIndex((c) => c.name.toLowerCase() === lower);
+        const lower = cname;
+        const idx = columns.findIndex((c) => c.name === lower);
         if (idx < 0) {
           throw engineError("undefined_column", "column " + cname + " named in key does not exist");
         }
@@ -5692,14 +5700,14 @@ export class Engine {
       checkDeps.push(collectCheckHostDeps(node, this.session.extensions));
     }
     // Naming (constraints.md §4.3): a single pass in textual order. An explicit name is
-    // used as written; a derived name is built from the LOWERCASED table/column names —
+    // used as written; a derived name is built from the exact table/column names —
     // `<table>_<col>_check` when the expression references exactly one distinct column,
     // else `<table>_check` — suffixed with the smallest positive integer that frees it. A
-    // collision (case-insensitive, PG folds) is 42710; derived names never yield to a
+    // collision (byte-exact; bare names are already folded) is 42710; derived names never yield to a
     // later explicit one (oracle-probed).
     const checks: CheckConstraint[] = [];
     const nameTaken = (name: string): boolean =>
-      checks.some((c) => c.name.toLowerCase() === name.toLowerCase());
+      checks.some((c) => c.name === name);
     for (let ci = 0; ci < ct.checks.length; ci++) {
       const def = ct.checks[ci]!;
       let name: string;
@@ -5715,16 +5723,16 @@ export class Engine {
         const cols = checkReferencedColumns(def.expr, columns);
         const base =
           cols.length === 1
-            ? table.name.toLowerCase() + "_" + columns[cols[0]!]!.name.toLowerCase() + "_check"
-            : table.name.toLowerCase() + "_check";
+            ? table.name + "_" + columns[cols[0]!]!.name + "_check"
+            : table.name + "_check";
         name = base;
         for (let suffix = 1; nameTaken(name); suffix++) name = base + suffix.toString();
       }
       checks.push({ name, exprText: def.text, expr: def.expr, hostDeps: checkDeps[ci] });
     }
-    // Evaluation (and on-disk) order: ascending byte order of the lowercased name
+    // Evaluation (and on-disk) order: ascending byte order of the exact name
     // (constraints.md §4.4 — PG evaluates checks sorted by name, oracle-probed).
-    checks.sort(compareLowerName);
+    checks.sort(compareName);
     table.checks = checks;
 
     // UNIQUE fold + naming (constraints.md §5.2/§5.3, PG-probed). Fold first: a
@@ -5749,10 +5757,10 @@ export class Engine {
     }
     const relationTaken = (n: string): boolean =>
       this.relationExists(n) ||
-      table.name.toLowerCase() === n.toLowerCase() ||
-      table.indexes.some((ix) => ix.name.toLowerCase() === n.toLowerCase());
+      table.name === n ||
+      table.indexes.some((ix) => ix.name === n);
     const checkNameTaken = (n: string): boolean =>
-      table.checks.some((c) => c.name.toLowerCase() === n.toLowerCase());
+      table.checks.some((c) => c.name === n);
     for (const ru of survivors) {
       let name: string;
       if (ru.name !== null) {
@@ -5771,16 +5779,16 @@ export class Engine {
         }
         name = ru.name;
       } else {
-        let base = table.name.toLowerCase();
-        for (const i of ru.cols) base += "_" + columns[i]!.name.toLowerCase();
+        let base = table.name;
+        for (const i of ru.cols) base += "_" + columns[i]!.name;
         base += "_key";
         name = base;
         for (let suffix = 1; relationTaken(name) || checkNameTaken(name); suffix++) {
           name = base + suffix.toString();
         }
       }
-      // Insert in catalog (ascending lowercased-name) order — indexes.md §6.
-      let pos = table.indexes.findIndex((ix) => compareLowerName(ix, { name }) > 0);
+      // Insert in catalog (ascending name byte) order — indexes.md §6.
+      let pos = table.indexes.findIndex((ix) => compareName(ix, { name }) > 0);
       if (pos < 0) pos = table.indexes.length;
       table.indexes.splice(pos, 0, {
         name,
@@ -5817,7 +5825,7 @@ export class Engine {
         local.push(idx);
       }
       // 2. Parent table — a self-reference resolves against the in-progress definition.
-      const selfRef = fk.refTable.toLowerCase() === table.name.toLowerCase();
+      const selfRef = fk.refTable === table.name;
       let parent: Table;
       if (selfRef) {
         parent = table;
@@ -5869,8 +5877,8 @@ export class Engine {
       }
       // 5. Name — the per-table constraint namespace, shared with CHECK (§6.2/§6.7).
       const nameTakenFk = (n: string): boolean =>
-        table.checks.some((c) => c.name.toLowerCase() === n.toLowerCase()) ||
-        resolvedFks.some((f) => f.name.toLowerCase() === n.toLowerCase());
+        table.checks.some((c) => c.name === n) ||
+        resolvedFks.some((f) => f.name === n);
       let fkName: string;
       if (fk.name !== null) {
         if (nameTakenFk(fk.name)) {
@@ -5881,8 +5889,8 @@ export class Engine {
         }
         fkName = fk.name;
       } else {
-        let base = table.name.toLowerCase();
-        for (const i of local) base += "_" + table.columns[i]!.name.toLowerCase();
+        let base = table.name;
+        for (const i of local) base += "_" + table.columns[i]!.name;
         base += "_fkey";
         fkName = base;
         for (let suffix = 1; nameTakenFk(fkName); suffix++) fkName = base + suffix.toString();
@@ -5935,8 +5943,8 @@ export class Engine {
         onUpdate,
       });
     }
-    // Held in ascending lowercased-name order (the catalog's on-disk + evaluation order, §6.9).
-    resolvedFks.sort(compareLowerName);
+    // Held in ascending name byte order (the catalog's on-disk + evaluation order, §6.9).
+    resolvedFks.sort(compareName);
     table.fks = resolvedFks;
 
     // EXCLUDE constraints (spec/design/gist.md §7). Resolved AFTER the PK / UNIQUE / CHECK / FK
@@ -5952,12 +5960,12 @@ export class Engine {
       // suffix-walks both.
       const relTaken = (n: string): boolean =>
         this.relationExists(n) ||
-        table.name.toLowerCase() === n.toLowerCase() ||
-        table.indexes.some((ix) => ix.name.toLowerCase() === n.toLowerCase());
+        table.name === n ||
+        table.indexes.some((ix) => ix.name === n);
       const conTaken = (n: string): boolean =>
-        table.checks.some((c) => c.name.toLowerCase() === n.toLowerCase()) ||
-        table.fks.some((f) => f.name.toLowerCase() === n.toLowerCase()) ||
-        table.exclusions.some((e) => e.name.toLowerCase() === n.toLowerCase());
+        table.checks.some((c) => c.name === n) ||
+        table.fks.some((f) => f.name === n) ||
+        table.exclusions.some((e) => e.name === n);
       let name: string;
       if (exc.name !== null) {
         // The named EXCLUDE constraint's backing GiST index carries the user-written name
@@ -5974,16 +5982,16 @@ export class Engine {
         }
         name = exc.name;
       } else {
-        let base = table.name.toLowerCase();
-        for (const i of indices) base += "_" + table.columns[i]!.name.toLowerCase();
+        let base = table.name;
+        for (const i of indices) base += "_" + table.columns[i]!.name;
         base += "_excl";
         name = base;
         for (let suffix = 1; relTaken(name) || conTaken(name); suffix++) {
           name = base + suffix.toString();
         }
       }
-      // Insert the backing GiST index in catalog (ascending lowercased-name) order.
-      let pos = table.indexes.findIndex((ix) => compareLowerName(ix, { name }) > 0);
+      // Insert the backing GiST index in catalog (ascending name byte) order.
+      let pos = table.indexes.findIndex((ix) => compareName(ix, { name }) > 0);
       if (pos < 0) pos = table.indexes.length;
       table.indexes.splice(pos, 0, {
         name,
@@ -5993,8 +6001,8 @@ export class Engine {
       });
       table.exclusions.push({ name, index: name, elements });
     }
-    // Held in ascending lowercased-name order (the catalog's on-disk order — gist.md §8).
-    table.exclusions.sort(compareLowerName);
+    // Held in ascending name byte order (the catalog's on-disk order — gist.md §8).
+    table.exclusions.sort(compareName);
 
     if (attachName !== "") {
       // Deferred narrowings on an attached-database table this slice (attached-databases.md §8), each a
@@ -6036,7 +6044,7 @@ export class Engine {
       const aps = this.attachPageSize(attachName);
       ws.putTableResolved(table, colTypes, aps);
       for (const ix of table.indexes) {
-        ws.putIndexStore(ix.name.toLowerCase(), new TableStore(pagePayload(aps), []));
+        ws.putIndexStore(ix.name, new TableStore(pagePayload(aps), []));
       }
       return { kind: "statement", cost: 0n, rowsAffected: null };
     }
@@ -6072,7 +6080,7 @@ export class Engine {
       ts.storePaging = this.tempDomainPaging();
       ts.putTableResolved(table, colTypes, this.pageSize);
       for (const ix of table.indexes) {
-        ts.putIndexStore(ix.name.toLowerCase(), new TableStore(pagePayload(this.pageSize), []));
+        ts.putIndexStore(ix.name, new TableStore(pagePayload(this.pageSize), []));
       }
       // Stage each serial/IDENTITY column's OWNED sequence into the SAME temp snapshot
       // (spec/design/sequences.md §12, temp-tables.md §8) — never the main image, so the sequence
@@ -6087,7 +6095,7 @@ export class Engine {
     // The table is brand new (no rows), so each backing index store starts empty.
     for (const ix of table.indexes) {
       this.working().putIndexStore(
-        ix.name.toLowerCase(),
+        ix.name,
         new TableStore(pagePayload(this.pageSize), []),
       );
     }
@@ -6111,12 +6119,12 @@ export class Engine {
     pending: SequenceDef[],
     reserved: string[],
   ): string {
-    const base = `${table.toLowerCase()}_${column.toLowerCase()}_seq`;
+    const base = `${table}_${column}_seq`;
     const taken = (c: string): boolean =>
       this.relationExists(c) ||
-      c.toLowerCase() === table.toLowerCase() ||
-      pending.some((s) => s.name.toLowerCase() === c.toLowerCase()) ||
-      reserved.some((name) => name.toLowerCase() === c.toLowerCase());
+      c === table ||
+      pending.some((s) => s.name === c) ||
+      reserved.some((name) => name === c);
     if (!taken(base)) return base;
     for (let n = 1; ; n++) {
       const cand = base + n.toString();
@@ -6334,7 +6342,7 @@ export class Engine {
   }
 
   // executeDropTable runs a DROP TABLE [IF EXISTS] a [, …] [CASCADE | RESTRICT]: remove each named
-  // table's definition and row store from the catalog (keyed by lower-cased name). Two-phase /
+  // table's definition and row store from the catalog (keyed by exact name). Two-phase /
   // all-or-nothing (spec/design/grammar.md §13): every name is resolved and validated first — a
   // missing table is 42P01 (unless IF EXISTS skips just that name), a non-table relation is 42809,
   // and an external FK dependent is 2BP01 under RESTRICT — and only if the whole list checks out is
@@ -6344,12 +6352,12 @@ export class Engine {
   private executeDropTable(dt: DropTable): Outcome {
     // ---- Phase 1: resolve & classify every name into the drop set. Nothing is removed yet. A
     // repeated name is deduplicated (PG collects the targets into a set, so `DROP TABLE a, a` drops
-    // `a` once and succeeds); `seen` is the set of lowercased keys actually being dropped.
+    // `a` once and succeeds); `seen` is the set of exact keys actually being dropped.
     type Scope = "temp" | "persistent";
     const targets: { key: string; scope: Scope }[] = [];
     const seen = new Set<string>();
     for (const name of dt.names) {
-      const key = name.toLowerCase();
+      const key = name;
       if (seen.has(key)) continue; // already resolved this exact target (deduplicated)
       // A built-in catalog relation resolves BEFORE the user catalog (introspection.md §5), and a
       // system relation cannot be dropped: 42809. IF EXISTS does not suppress this (the relation
@@ -6439,7 +6447,7 @@ export class Engine {
           ? this.tempSnap()
           : this.readSnap();
     else
-      switch (at.db.toLowerCase()) {
+      switch (at.db) {
         case "temp":
           snap = this.tempSnap();
           break;
@@ -6447,7 +6455,7 @@ export class Engine {
           snap = this.readSnap();
           break;
         default:
-          snap = this.attachReadSnap(at.db.toLowerCase());
+          snap = this.attachReadSnap(at.db);
           if (snap === undefined)
             throw engineError("undefined_table", `database "${at.db}" is not attached`);
       }
@@ -6458,7 +6466,7 @@ export class Engine {
       if (at.ifExists) return { kind: "statement", cost: 0n, rowsAffected: null };
       throw engineError("undefined_table", `table does not exist: ${at.name}`);
     }
-    const oldKey = original.name.toLowerCase();
+    const oldKey = original.name;
     let table: Table = {
       ...original,
       columns: original.columns.map((c) => ({ ...c })),
@@ -6470,9 +6478,9 @@ export class Engine {
     let renameTable = false;
     let indexRename: { oldName: string; newName: string } | undefined;
     const tempScope =
-      at.db === undefined ? this.isTempTable(at.name) : at.db.toLowerCase() === "temp";
+      at.db === undefined ? this.isTempTable(at.name) : at.db === "temp";
     const attachmentScope =
-      at.db !== undefined && at.db.toLowerCase() !== "main" && at.db.toLowerCase() !== "temp";
+      at.db !== undefined && at.db !== "main" && at.db !== "temp";
     const relationTaken = (name: string) =>
       attachmentScope
         ? snap.table(name) !== undefined ||
@@ -6481,9 +6489,9 @@ export class Engine {
         : this.relationExists(name);
     const pendingSerials: SequenceDef[] = [];
     const workingRelationTaken = (name: string): boolean => {
-      if (pendingSerials.some((s) => s.name.toLowerCase() === name.toLowerCase())) return true;
-      if (table.indexes.some((i) => i.name.toLowerCase() === name.toLowerCase())) return true;
-      if (original.indexes.some((i) => i.name.toLowerCase() === name.toLowerCase())) return false;
+      if (pendingSerials.some((s) => s.name === name)) return true;
+      if (table.indexes.some((i) => i.name === name)) return true;
+      if (original.indexes.some((i) => i.name === name)) return false;
       return relationTaken(name);
     };
     const addedConstraints = new Set<string>();
@@ -6570,29 +6578,29 @@ export class Engine {
         const old = at.action.oldName,
           next = at.action.newName;
         const exists = (name: string) =>
-          table.checks.some((c) => c.name.toLowerCase() === name.toLowerCase()) ||
-          table.indexes.some((i) => i.unique && i.name.toLowerCase() === name.toLowerCase()) ||
-          table.fks.some((f) => f.name.toLowerCase() === name.toLowerCase()) ||
-          table.exclusions.some((e) => e.name.toLowerCase() === name.toLowerCase());
+          table.checks.some((c) => c.name === name) ||
+          table.indexes.some((i) => i.unique && i.name === name) ||
+          table.fks.some((f) => f.name === name) ||
+          table.exclusions.some((e) => e.name === name);
         if (!exists(old))
           throw engineError("undefined_object", `constraint does not exist: ${old}`);
         if (exists(next))
           throw engineError("duplicate_object", `constraint already exists: ${next}`);
         table.checks = table.checks.map((c) =>
-          c.name.toLowerCase() === old.toLowerCase() ? { ...c, name: next } : c,
+          c.name === old ? { ...c, name: next } : c,
         );
         table.fks = table.fks.map((f) =>
-          f.name.toLowerCase() === old.toLowerCase() ? { ...f, name: next } : f,
+          f.name === old ? { ...f, name: next } : f,
         );
         table.exclusions = table.exclusions.map((e) => {
-          if (e.name.toLowerCase() !== old.toLowerCase()) return e;
+          if (e.name !== old) return e;
           indexRename = { oldName: old, newName: next };
           return { ...e, name: next, index: next };
         });
         table.indexes = table.indexes.map((i) => {
           if (
             (!i.unique && indexRename === undefined) ||
-            i.name.toLowerCase() !== old.toLowerCase()
+            i.name !== old
           )
             return i;
           indexRename = { oldName: old, newName: next };
@@ -6603,19 +6611,19 @@ export class Engine {
           if (relationTaken(next))
             throw engineError("duplicate_table", `relation already exists: ${next}`);
         }
-        table.checks.sort(compareLowerName);
-        table.indexes.sort(compareLowerName);
-        table.fks.sort(compareLowerName);
-        table.exclusions.sort(compareLowerName);
+        table.checks.sort(compareName);
+        table.indexes.sort(compareName);
+        table.fks.sort(compareName);
+        table.exclusions.sort(compareName);
         break;
       }
       case "actions": {
         const added = addedConstraints;
         const taken = (n: string) =>
-          table.checks.some((c) => c.name.toLowerCase() === n.toLowerCase()) ||
-          table.indexes.some((i) => i.unique && i.name.toLowerCase() === n.toLowerCase()) ||
-          table.fks.some((f) => f.name.toLowerCase() === n.toLowerCase()) ||
-          table.exclusions.some((e) => e.name.toLowerCase() === n.toLowerCase());
+          table.checks.some((c) => c.name === n) ||
+          table.indexes.some((i) => i.unique && i.name === n) ||
+          table.fks.some((f) => f.name === n) ||
+          table.exclusions.some((e) => e.name === n);
         const actions = [...at.action.actions];
         while (actions.length > 0) {
           const action = actions.shift()!;
@@ -6712,7 +6720,7 @@ export class Engine {
             // side remains a dependency.
             const fkUsesLocalColumn = (fk: ForeignKey) => fk.columns.includes(ci);
             const fkUsesSelfRefColumn = (fk: ForeignKey) =>
-              fk.refTable.toLowerCase() === table.name.toLowerCase() &&
+              fk.refTable === table.name &&
               fk.refColumns.includes(ci);
             const selfRefFkDep = table.fks.some(
               (fk) => fkUsesSelfRefColumn(fk) && !fkUsesLocalColumn(fk),
@@ -6722,12 +6730,12 @@ export class Engine {
               source.kind === "original" &&
               [...snap.tables].some(
                 ([key, child]) =>
-                  key.toLowerCase() !== oldKey &&
+                  key !== oldKey &&
                   child.fks.some(
                     (fk) =>
-                      fk.refTable.toLowerCase() === original.name.toLowerCase() &&
+                      fk.refTable === original.name &&
                       fk.refColumns.includes(source.column) &&
-                      !cascadeDroppedColumnFks.has(`${key.toLowerCase()}\0${fk.name.toLowerCase()}`) &&
+                      !cascadeDroppedColumnFks.has(`${key}\0${fk.name}`) &&
                       !cascadeUniqueCols.some((cols) => sameSet(sortedUnique(fk.refColumns), cols)),
                   ),
               );
@@ -6739,14 +6747,14 @@ export class Engine {
             if (action.cascade) {
               if (source.kind === "original")
                 for (const [key, child] of snap.tables)
-                  if (key.toLowerCase() !== oldKey)
+                  if (key !== oldKey)
                     for (const fk of child.fks)
                       if (
-                        fk.refTable.toLowerCase() === original.name.toLowerCase() &&
+                        fk.refTable === original.name &&
                         fk.refColumns.includes(source.column)
                       )
                         cascadeDroppedColumnFks.add(
-                          `${key.toLowerCase()}\0${fk.name.toLowerCase()}`,
+                          `${key}\0${fk.name}`,
                         );
             }
             // PostgreSQL treats same-table CHECKs, indexes (including UNIQUE), and EXCLUDE
@@ -6754,17 +6762,17 @@ export class Engine {
             // RESTRICT; CASCADE is needed only for external dependents such as incoming FKs.
             table.checks = table.checks.filter((check) => {
               const keep = !usesExpr(check.expr);
-              if (!keep) added.delete(check.name.toLowerCase());
+              if (!keep) added.delete(check.name);
               return keep;
             });
             table.indexes = table.indexes.filter((index) => {
               const keep = !indexUses(index);
-              if (!keep) added.delete(index.name.toLowerCase());
+              if (!keep) added.delete(index.name);
               return keep;
             });
             table.exclusions = table.exclusions.filter((ex) => {
               const keep = !ex.elements.some((el) => el.column === ci);
-              if (!keep) added.delete(ex.name.toLowerCase());
+              if (!keep) added.delete(ex.name);
               return keep;
             });
             // A local-side FK is internally owned by the dropped column and disappears without
@@ -6772,7 +6780,7 @@ export class Engine {
             table.fks = table.fks.filter((fk) => {
               const keep =
                 !fkUsesLocalColumn(fk) && !(action.cascade && fkUsesSelfRefColumn(fk));
-              if (!keep) added.delete(fk.name.toLowerCase());
+              if (!keep) added.delete(fk.name);
               return keep;
             });
             table.columns.splice(ci, 1);
@@ -6792,7 +6800,7 @@ export class Engine {
               ...fk,
               columns: fk.columns.map((column) => (column > ci ? column - 1 : column)),
               refColumns:
-                fk.refTable.toLowerCase() === table.name.toLowerCase()
+                fk.refTable === table.name
                   ? fk.refColumns.map((column) => (column > ci ? column - 1 : column))
                   : fk.refColumns,
             }));
@@ -6812,7 +6820,7 @@ export class Engine {
               }
             for (let i = pendingSerials.length - 1; i >= 0; i--) {
               const seq = pendingSerials[i]!, owner = seq.ownedBy;
-              if (owner === undefined || owner.table.toLowerCase() !== table.name.toLowerCase())
+              if (owner === undefined || owner.table !== table.name)
                 continue;
               if (owner.column === ci) pendingSerials.splice(i, 1);
               else if (owner.column > ci)
@@ -6861,15 +6869,15 @@ export class Engine {
             const oldPk = sortedUnique(table.pk);
             const localDeps = table.fks.some(
               (fk) =>
-                fk.refTable.toLowerCase() === table.name.toLowerCase() &&
+                fk.refTable === table.name &&
                 sameSet(sortedUnique(fk.refColumns), oldPk),
             );
             const incomingDeps = [...snap.tables].some(
               ([key, child]) =>
-                key.toLowerCase() !== oldKey &&
+                key !== oldKey &&
                 child.fks.some(
                   (fk) =>
-                    fk.refTable.toLowerCase() === original.name.toLowerCase() &&
+                    fk.refTable === original.name &&
                     sameSet(sortedUnique(fk.refColumns), oldPk),
                 ),
             );
@@ -6881,7 +6889,7 @@ export class Engine {
             if (action.cascade) {
               table.fks = table.fks.filter(
                 (fk) =>
-                  fk.refTable.toLowerCase() !== table.name.toLowerCase() ||
+                  fk.refTable !== table.name ||
                   !sameSet(sortedUnique(fk.refColumns), oldPk),
               );
               cascadeUniqueCols.push(oldPk);
@@ -6919,11 +6927,11 @@ export class Engine {
               if (rt.kind !== "bool" && rt.kind !== "null")
                 throw typeError("argument of CHECK must be boolean");
               const hostDeps = collectCheckHostDeps(rn, this.session.extensions);
-              let name = d.name ?? `${table.name.toLowerCase()}_check`;
+              let name = d.name ?? `${table.name}_check`;
               if (d.name === null) {
                 const rs = checkReferencedColumns(d.expr, table.columns);
                 if (rs.length === 1)
-                  name = `${table.name.toLowerCase()}_${table.columns[rs[0]!]!.name.toLowerCase()}_check`;
+                  name = `${table.name}_${table.columns[rs[0]!]!.name}_check`;
                 for (let n = 1; taken(name); n++) name = name.replace(/\d+$/, "") + n;
               } else if (taken(name))
                 throw engineError(
@@ -6931,8 +6939,8 @@ export class Engine {
                   `constraint ${name} for relation ${table.name} already exists`,
                 );
               table.checks.push({ name, exprText: d.text, expr: d.expr, hostDeps });
-              table.checks.sort(compareLowerName);
-              added.add(name.toLowerCase());
+              table.checks.sort(compareName);
+              added.add(name);
             } else if (c.kind === "unique") {
               const d = c.def,
                 cols: number[] = [];
@@ -6969,7 +6977,7 @@ export class Engine {
                     `constraint ${name} for relation ${table.name} already exists`,
                   );
               } else {
-                const base = `${table.name.toLowerCase()}_${cols.map((i) => table.columns[i]!.name.toLowerCase()).join("_")}_key`;
+                const base = `${table.name}_${cols.map((i) => table.columns[i]!.name).join("_")}_key`;
                 name = base;
                 for (let suffix = 1; workingRelationTaken(name) || taken(name); suffix++)
                   name = base + suffix.toString();
@@ -6980,8 +6988,8 @@ export class Engine {
                 unique: true,
                 kind: "btree",
               });
-              table.indexes.sort(compareLowerName);
-              added.add(name.toLowerCase());
+              table.indexes.sort(compareName);
+              added.add(name);
             } else if (c.kind === "foreignKey") {
               const d = c.def,
                 local: number[] = [];
@@ -6997,7 +7005,7 @@ export class Engine {
                 local.push(ci);
               }
               const parent =
-                d.refTable.toLowerCase() === table.name.toLowerCase()
+                d.refTable === table.name
                   ? table
                   : snap.table(d.refTable);
               if (!parent)
@@ -7054,7 +7062,7 @@ export class Engine {
                     `constraint ${name} for relation ${table.name} already exists`,
                   );
               } else {
-                const base = `${table.name.toLowerCase()}_${local.map((i) => table.columns[i]!.name.toLowerCase()).join("_")}_fkey`;
+                const base = `${table.name}_${local.map((i) => table.columns[i]!.name).join("_")}_fkey`;
                 name = base;
                 for (let suffix = 1; taken(name); suffix++) name = base + suffix.toString();
               }
@@ -7075,8 +7083,8 @@ export class Engine {
                 onDelete: fkAction(d.onDelete, "DELETE"),
                 onUpdate: fkAction(d.onUpdate, "UPDATE"),
               });
-              table.fks.sort(compareLowerName);
-              added.add(name.toLowerCase());
+              table.fks.sort(compareName);
+              added.add(name);
             } else {
               const d = c.def;
               const { columns: cols, elements } = resolveExclusionDefinition(table, d);
@@ -7092,7 +7100,7 @@ export class Engine {
                     `constraint ${name} for relation ${table.name} already exists`,
                   );
               } else {
-                const base = `${table.name.toLowerCase()}_${cols.map((i) => table.columns[i]!.name.toLowerCase()).join("_")}_excl`;
+                const base = `${table.name}_${cols.map((i) => table.columns[i]!.name).join("_")}_excl`;
                 name = base;
                 for (let suffix = 1; workingRelationTaken(name) || taken(name); suffix++)
                   name = base + suffix.toString();
@@ -7104,30 +7112,30 @@ export class Engine {
                 kind: "gist",
               });
               table.exclusions.push({ name, index: name, elements });
-              table.indexes.sort(compareLowerName);
-              table.exclusions.sort(compareLowerName);
-              added.add(name.toLowerCase());
+              table.indexes.sort(compareName);
+              table.exclusions.sort(compareName);
+              added.add(name);
             }
             continue;
           }
           if (action.kind === "dropConstraint") {
-            const k = action.name.toLowerCase();
+            const k = action.name;
             let found = false;
             const before = table.checks.length;
-            table.checks = table.checks.filter((c) => c.name.toLowerCase() !== k);
+            table.checks = table.checks.filter((c) => c.name !== k);
             found = table.checks.length !== before || found;
             const bf = table.fks.length;
-            table.fks = table.fks.filter((f) => f.name.toLowerCase() !== k);
+            table.fks = table.fks.filter((f) => f.name !== k);
             found = table.fks.length !== bf || found;
-            const ex = table.exclusions.find((e) => e.name.toLowerCase() === k);
+            const ex = table.exclusions.find((e) => e.name === k);
             if (ex) {
               table.exclusions = table.exclusions.filter((e) => e !== ex);
               table.indexes = table.indexes.filter(
-                (i) => i.name.toLowerCase() !== ex.index.toLowerCase(),
+                (i) => i.name !== ex.index,
               );
               found = true;
             }
-            const ux = table.indexes.find((i) => i.unique && i.name.toLowerCase() === k);
+            const ux = table.indexes.find((i) => i.unique && i.name === k);
             if (ux) {
               const cols = sortedUnique(indexColumnOrdinals(ux)!);
               const originalCols = cols.flatMap((column) => {
@@ -7137,19 +7145,19 @@ export class Engine {
               const hasOriginalCols = originalCols.length === cols.length;
               const localDeps = table.fks.filter(
                   (f) =>
-                    f.refTable.toLowerCase() === table.name.toLowerCase() &&
+                    f.refTable === table.name &&
                     sameSet(sortedUnique(f.refColumns), cols),
                 );
               const externalDeps: ForeignKey[] = [];
               for (const [key, ot] of snap.tables)
-                if (ot.name.toLowerCase() !== table.name.toLowerCase() && hasOriginalCols)
+                if (ot.name !== table.name && hasOriginalCols)
                   externalDeps.push(
                     ...ot.fks.filter(
                       (f) =>
-                        f.refTable.toLowerCase() === table.name.toLowerCase() &&
+                        f.refTable === table.name &&
                         sameSet(sortedUnique(f.refColumns), sortedUnique(originalCols)) &&
                         !cascadeDroppedColumnFks.has(
-                          `${key.toLowerCase()}\0${f.name.toLowerCase()}`,
+                          `${key}\0${f.name}`,
                         ) &&
                         !cascadeUniqueCols.some((prior) =>
                           sameSet(prior, sortedUnique(f.refColumns)),
@@ -7166,7 +7174,7 @@ export class Engine {
                 cascadeUniqueCols.push(sortedUnique(originalCols));
               if (action.cascade)
                 table.fks = table.fks.filter(
-                  (f) => !localDeps.some((d) => d.name.toLowerCase() === f.name.toLowerCase()),
+                  (f) => !localDeps.some((d) => d.name === f.name),
                 );
               table.indexes = table.indexes.filter((i) => i !== ux);
               found = true;
@@ -7306,7 +7314,7 @@ export class Engine {
                 const pi = pendingSerials.findIndex(
                   (seq) =>
                     seq.ownedBy !== undefined &&
-                    seq.ownedBy.table.toLowerCase() === table.name.toLowerCase() &&
+                    seq.ownedBy.table === table.name &&
                     seq.ownedBy.column === ci,
                 );
                 if (pi >= 0)
@@ -7332,11 +7340,11 @@ export class Engine {
               typeChangedColumns[ci] = true;
               typeChanged = true;
               rowSteps.push({ kind: "setType", column: ci, value: resolved.node });
-              for (const check of table.checks) addedConstraints.add(check.name.toLowerCase());
-              for (const index of table.indexes) addedConstraints.add(index.name.toLowerCase());
-              for (const fk of table.fks) addedConstraints.add(fk.name.toLowerCase());
+              for (const check of table.checks) addedConstraints.add(check.name);
+              for (const index of table.indexes) addedConstraints.add(index.name);
+              for (const fk of table.fks) addedConstraints.add(fk.name);
               for (const exclusion of table.exclusions)
-                addedConstraints.add(exclusion.name.toLowerCase());
+                addedConstraints.add(exclusion.name);
               break;
             }
           }
@@ -7348,7 +7356,7 @@ export class Engine {
     if (typeChanged) {
       for (const fk of table.fks) {
         const parent =
-          fk.refTable.toLowerCase() === table.name.toLowerCase() ? table : snap.table(fk.refTable)!;
+          fk.refTable === table.name ? table : snap.table(fk.refTable)!;
         fk.columns.forEach((local, i) => {
           const ref = fk.refColumns[i]!;
           if (!fkTypesEqual(table.columns[local]!.type, parent.columns[ref]!.type))
@@ -7358,11 +7366,11 @@ export class Engine {
         });
       }
       for (const [key, child] of snap.tables) {
-        if (key.toLowerCase() === oldKey) continue;
+        if (key === oldKey) continue;
         for (const fk of child.fks) {
-          if (fk.refTable.toLowerCase() !== original.name.toLowerCase()) continue;
+          if (fk.refTable !== original.name) continue;
           if (
-            cascadeDroppedColumnFks.has(`${key.toLowerCase()}\0${fk.name.toLowerCase()}`) ||
+            cascadeDroppedColumnFks.has(`${key}\0${fk.name}`) ||
             cascadeUniqueCols.some((cols) => sameSet(cols, sortedUnique(fk.refColumns)))
           )
             continue;
@@ -7380,7 +7388,7 @@ export class Engine {
       }
     }
 
-    const alterPageSize = attachmentScope ? this.attachPageSize(at.db!.toLowerCase()) : this.pageSize;
+    const alterPageSize = attachmentScope ? this.attachPageSize(at.db!) : this.pageSize;
     const rewriteNeeded =
       columnSources.length !== original.columns.length ||
       columnSources.some(
@@ -7414,11 +7422,11 @@ export class Engine {
             this.session.tx!.tempDirty = true;
             sw = this.session.tx!.tempWorking;
           } else sw = this.working();
-        } else if (at.db.toLowerCase() === "temp") {
+        } else if (at.db === "temp") {
           this.session.tx!.tempDirty = true;
           sw = this.session.tx!.tempWorking;
-        } else if (at.db.toLowerCase() === "main") sw = this.working();
-        else sw = this.attachWriteSnap(at.db.toLowerCase())!;
+        } else if (at.db === "main") sw = this.working();
+        else sw = this.attachWriteSnap(at.db)!;
         sw.putSequence(seq);
       }
       const store = this.lkpStoreScoped(at.db, original.name);
@@ -7504,8 +7512,8 @@ export class Engine {
       // Presence in this map is also the publication-time identity marker for a newly-added backing
       // index. Seed empty indexes so DROP+ADD name reuse cannot retain the old store.
       for (const index of table.indexes)
-        if (addedConstraints.has(index.name.toLowerCase()))
-          constraintEntries.set(index.name.toLowerCase(), []);
+        if (addedConstraints.has(index.name))
+          constraintEntries.set(index.name, []);
       const store = this.lkpStoreScoped(at.db, original.name),
         all =
           rewriteRows === null
@@ -7522,7 +7530,7 @@ export class Engine {
       const checks: NamedCheck[] = [];
       for (let i = 0; i < table.checks.length; i++) {
         const c = table.checks[i]!;
-        if (!addedConstraints.has(c.name.toLowerCase())) continue;
+        if (!addedConstraints.has(c.name)) continue;
         const node = resolve(
           Scope.single(this, table),
           c.expr,
@@ -7548,7 +7556,7 @@ export class Engine {
         for (const ck of checks)
           evalChecks([ck], table.name, row, this.maintenanceEnv(new StmtRng()), meter);
         for (const ix of table.indexes) {
-          const k = ix.name.toLowerCase();
+          const k = ix.name;
           if (!addedConstraints.has(k)) continue;
           const ri = this.resolveIndex(table, ix);
           if (ix.unique) {
@@ -7570,9 +7578,9 @@ export class Engine {
         }
       }
       for (const fk of table.fks)
-        if (addedConstraints.has(fk.name.toLowerCase())) {
+        if (addedConstraints.has(fk.name)) {
           const parent =
-            fk.refTable.toLowerCase() === table.name.toLowerCase()
+            fk.refTable === table.name
               ? table
               : snap.table(fk.refTable)!;
           const pc = this.columnCollations(parent.columns);
@@ -7600,7 +7608,7 @@ export class Engine {
           }
         }
       for (const ex of table.exclusions)
-        if (addedConstraints.has(ex.name.toLowerCase()))
+        if (addedConstraints.has(ex.name))
           for (let i = 0; i < all.entries.length; i++)
             for (let j = 0; j < i; j++) {
               meter.charge(COSTS.constraintCheck);
@@ -7629,7 +7637,7 @@ export class Engine {
             ...this.indexEntries(table.columns, rewriteColTypes!, colls, resolved, row.key, row.row),
           );
         entries.sort(compareBytes);
-        constraintEntries.set(index.name.toLowerCase(), entries);
+        constraintEntries.set(index.name, entries);
       }
     }
     let ws: Snapshot;
@@ -7639,7 +7647,7 @@ export class Engine {
         ws = this.session.tx!.tempWorking;
       } else ws = this.working();
     } else
-      switch (at.db.toLowerCase()) {
+      switch (at.db) {
         case "temp":
           this.session.tx!.tempDirty = true;
           ws = this.session.tx!.tempWorking;
@@ -7648,7 +7656,7 @@ export class Engine {
           ws = this.working();
           break;
         default:
-          ws = this.attachWriteSnap(at.db.toLowerCase())!;
+          ws = this.attachWriteSnap(at.db)!;
       }
     if (rewriteRows !== null) {
       ws.alterTableRewrite(table, rewriteColTypes!, rewriteRows, rewriteNextRowid, alterPageSize);
@@ -7659,10 +7667,10 @@ export class Engine {
     else ws.syncAlterConstraintIndexes(original, table, constraintEntries, alterPageSize);
     for (const cols of cascadeUniqueCols) {
       for (const [key, child] of [...ws.tables]) {
-        if (child.name.toLowerCase() === table.name.toLowerCase()) continue;
+        if (child.name === table.name) continue;
         const fks = child.fks.filter(
           (fk) =>
-            fk.refTable.toLowerCase() !== table.name.toLowerCase() ||
+            fk.refTable !== table.name ||
             !sameSet(sortedUnique(fk.refColumns), cols),
         );
         if (fks.length !== child.fks.length) {
@@ -7679,7 +7687,7 @@ export class Engine {
       ws.remapAlterColumnDependents(
         table.name,
         originalToNew,
-        new Set(pendingSerials.map((seq) => seq.name.toLowerCase())),
+        new Set(pendingSerials.map((seq) => seq.name)),
       );
     }
     return { kind: "statement", cost: meter.accrued, rowsAffected: null };
@@ -7869,7 +7877,7 @@ export class Engine {
       pending.push(
         buildSequenceDef(seqName, opts, { table: table.name, column: table.columns.length }),
       );
-      const exprText = `nextval ( '${seqName.replace(/'/g, "''")}' )`;
+      const exprText = nextvalDefaultText(seqName);
       col = {
         ...col,
         defaultExpr: { exprText, expr: parseExpression(exprText) },
@@ -7887,14 +7895,14 @@ export class Engine {
   }
 
   // findIndex finds the table owning the named index in the visible snapshot
-  // (case-insensitive).
+  // (exact name).
   private findIndex(name: string): [string, IndexDef] | null {
     return this.readSnap().findIndex(name);
   }
 
   // relationExists reports whether name is taken in the shared relation namespace (a
   // table OR an index OR a sequence — spec/design/indexes.md §2, sequences.md §2),
-  // case-insensitively.
+  // by exact name.
   private relationExists(name: string): boolean {
     // Session-local temp tables + their (UNIQUE) index names join the namespace too, so a name
     // colliding with any temp relation is also 42P07 (preclude-overlaps — spec/design/temp-tables.md
@@ -8045,7 +8053,7 @@ export class Engine {
     }
     const suffix: ScalarType[] = [];
     if (path.index !== null) {
-      const ix = child.indexes.find((i) => i.name.toLowerCase() === path.index);
+      const ix = child.indexes.find((i) => i.name === path.index);
       if (ix !== undefined) {
         for (const key of ix.keys.slice(path.cols.length)) {
           if (key.kind === "column") suffix.push(typeAsScalar(child.columns[key.column]!.type)!);
@@ -8082,19 +8090,19 @@ export class Engine {
   }
 
   // fkReferencers returns every (child table name, FK) pair in the visible snapshot whose FK
-  // references `parentName` (case-insensitive), including a self-reference — the inbound FKs a
-  // parent DELETE/UPDATE must not strand (spec/design/constraints.md §6.5). Sorted by (lowercased
+  // references `parentName` (exact), including a self-reference — the inbound FKs a
+  // parent DELETE/UPDATE must not strand (spec/design/constraints.md §6.5). Sorted by (exact
   // child table, FK name) for a deterministic report order. The FK objects are the snapshot's
   // (the caller probes stores without mutating the catalog).
   private fkReferencers(parentName: string): { childTable: string; fk: ForeignKey }[] {
     const snap = this.readSnap();
-    const key = parentName.toLowerCase();
+    const key = parentName;
     const out: { childTable: string; fk: ForeignKey }[] = [];
-    const tkeys = [...snap.tables.keys()].sort();
+    const tkeys = [...snap.tables.keys()].sort(compareTextC);
     for (const tk of tkeys) {
       const t = snap.tables.get(tk)!;
       for (const fk of t.fks) {
-        if (fk.refTable.toLowerCase() === key) out.push({ childTable: t.name, fk });
+        if (fk.refTable === key) out.push({ childTable: t.name, fk });
       }
     }
     return out;
@@ -8105,7 +8113,7 @@ export class Engine {
   // each key column, in list order, must exist (42703) and be of a key-encodable type
   // (0A000 — the same narrowing as a PRIMARY KEY member); then an explicit name is
   // checked against the shared relation namespace (42P07), or an omitted name derives
-  // PG's choice — the lowercased <table>_<col>..._idx with the smallest free suffix. The
+  // PG's choice — the exact <table>_<col>..._idx with the smallest free suffix. The
   // index is then built by scanning the table once: page_read per node + storage_row_read
   // per row (the metered build scan — cost.md §3); maintenance thereafter is unmetered.
   private executeCreateIndex(ci: CreateIndex): Outcome {
@@ -8122,12 +8130,12 @@ export class Engine {
     // existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
     this.checkAttachmentWritable(ci.db);
     this.checkTableQualifier(ci.db, ci.table); // attached-databases.md §3
-    const attachName = isAttachmentScope(ci.db) ? ci.db!.toLowerCase() : "";
+    const attachName = isAttachmentScope(ci.db) ? ci.db! : "";
     const table = this.lkpTableScoped(ci.db, ci.table);
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + ci.table);
     }
-    const tableKey = table.name.toLowerCase();
+    const tableKey = table.name;
     const columns = table.columns;
     // Refuse building a collated index on a version-skewed table (slice 2d, collation.md §12, XX002):
     // the new B-tree would be pinned inconsistently with the file's other structures.
@@ -8138,7 +8146,7 @@ export class Engine {
     // Resolve the access method (spec/design/gin.md §3): undefined / "btree" is the ordered
     // B-tree, "gin" a GIN inverted index; an unknown method is 42704. Resolved here (not in the
     // parser) so the error is the resolve-time undefined_object, after the table-exists check.
-    const method = (ci.using ?? "btree").toLowerCase();
+    const method = (ci.using ?? "btree");
     let kind: "btree" | "gin" | "gist";
     if (method === "btree") kind = "btree";
     else if (method === "gin") kind = "gin";
@@ -8358,7 +8366,7 @@ export class Engine {
       }
       name = ci.name;
     } else {
-      // PG's ChooseIndexName / ChooseIndexColumnNames (probed): lowercased table + one name part per
+      // PG's ChooseIndexName / ChooseIndexColumnNames (probed): exact table + one name part per
       // key element (list order, duplicates included) + "idx", then the smallest free suffix. A
       // column key's part is the column name; a bare-function-call expression's is the function name
       // (`lower(email)` → `lower`); any other expression's is the literal `expr` (indexes.md §2).
@@ -8430,7 +8438,7 @@ export class Engine {
     }
     meter.guard();
 
-    const nameKey = def.name.toLowerCase();
+    const nameKey = def.name;
     // Register the index catalog entry + its (empty) store in the snapshot that owns the table (the
     // resolution walk — temp-tables.md §2/§8): a session-local temp table's index lives in the session
     // temp snapshot, so the index makes ZERO file writes (the dirty bit lets the commit skip the main
@@ -8471,7 +8479,7 @@ export class Engine {
     if (this.lkpTable(di.name)) {
       throw engineError("wrong_object_type", di.name + " is not an index");
     }
-    const nameKey = di.name.toLowerCase();
+    const nameKey = di.name;
     if (this.isTempIndex(di.name)) {
       const tableKey = this.tempSnap().findIndex(di.name)![0];
       this.session.tx!.tempDirty = true;
@@ -8485,7 +8493,7 @@ export class Engine {
       // (the UNIQUE-backing precedent; jed has no ALTER TABLE … DROP CONSTRAINT yet). 2BP01, matching
       // PG's "cannot drop index … because constraint … requires it" (gist.md §7).
       const owner = this.table(found[0]);
-      if (owner?.exclusions.some((e) => e.index.toLowerCase() === nameKey)) {
+      if (owner?.exclusions.some((e) => e.index === nameKey)) {
         throw engineError(
           "dependent_objects_still_exist",
           "cannot drop index " +
@@ -8515,7 +8523,7 @@ export class Engine {
     const fields: CompositeField[] = [];
     for (const f of ct.fields) {
       for (const g of fields) {
-        if (g.name.toLowerCase() === f.name.toLowerCase()) {
+        if (g.name === f.name) {
           throw engineError(
             "duplicate_column",
             "attribute " + f.name + " specified more than once",
@@ -8615,7 +8623,7 @@ export class Engine {
         "cannot drop type " + dt.name + " because other objects depend on it: " + dep,
       );
     }
-    this.working().removeType(dt.name.toLowerCase());
+    this.working().removeType(dt.name);
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
@@ -8703,11 +8711,11 @@ export class Engine {
       throw engineError("duplicate_table", `relation already exists: ${newName}`);
     }
     if (existing.ownedBy !== undefined) {
-      const exprText = `nextval ( '${newName.toLowerCase().replace(/'/g, "''")}' )`;
+      const exprText = nextvalDefaultText(newName);
       // Route to the owner's scope so a renamed owned TEMP sequence rewrites its column default in the
       // temp snapshot (temp-tables.md §8).
       this.setColumnDefaultExprRouted(
-        existing.ownedBy.table.toLowerCase(),
+        existing.ownedBy.table,
         existing.ownedBy.column,
         {
           exprText,
@@ -8724,7 +8732,7 @@ export class Engine {
     } else {
       w = this.working();
     }
-    w.removeSequence(existing.name.toLowerCase());
+    w.removeSequence(existing.name);
     w.putSequence({ ...existing, name: newName });
   }
 
@@ -9231,11 +9239,11 @@ export class Engine {
       if (this.isTempTable(tableName)) return null;
       snap = this.readSnap();
     } else {
-      const db = scope.toLowerCase();
+      const db = scope;
       if (db === "temp") return null;
       snap = db === "main" ? this.readSnap() : this.attachReadSnap(db);
     }
-    const table = tableName.toLowerCase();
+    const table = tableName;
     if (snap === undefined || snap.table(table) === undefined) return null;
     return {
       core: this.core ?? this,
@@ -9257,11 +9265,11 @@ export class Engine {
       if (this.isTempTable(tableName)) return null;
       snap = this.committed;
     } else {
-      const db = scope.toLowerCase();
+      const db = scope;
       if (db === "temp") return null;
       snap = db === "main" ? this.committed : this.attachedCommitted.get(db);
     }
-    const table = tableName.toLowerCase();
+    const table = tableName;
     if (snap === undefined || snap.table(table) === undefined) return null;
     return {
       core: this.core ?? this,
@@ -10142,7 +10150,7 @@ export class Engine {
         const def = uniqDefs[u]!;
         const prefix = indexPrefixKey(colTypes, colls, def, row, env);
         if (prefix === null) continue;
-        const istore = this.lkpIndexStoreScoped(dbScope, def.name.toLowerCase());
+        const istore = this.lkpIndexStoreScoped(dbScope, def.name);
         const stored = istore.rangeEntries(uniqueProbeBound(prefix));
         const k = prefix.join(",");
         if (stored.length > 0 || seenPrefixes[u]!.has(k)) {
@@ -10183,7 +10191,7 @@ export class Engine {
       // Only a self-reference can satisfy against this statement's batch (a different parent table
       // is unchanged by this INSERT). Collect the parent keys the batch supplies.
       const batch = new Set<string>();
-      if (fk.refTable.toLowerCase() === relation.toLowerCase()) {
+      if (fk.refTable === relation) {
         for (const pr of prepared) {
           const p = fkProbe(fk, parent, parentColls, pr.row, fk.refColumns);
           if (p !== null) batch.add(fkProbeBytes(p).join(","));
@@ -10268,7 +10276,7 @@ export class Engine {
     }
     for (let k = 0; k < table.indexes.length; k++) {
       const def = table.indexes[k]!;
-      const istore = this.writeIndexStoreScoped(dbScope, def.name.toLowerCase());
+      const istore = this.writeIndexStoreScoped(dbScope, def.name);
       for (const ek of indexInserts[k]!) {
         if (!istore.insert(ek, [])) {
           // A cross-sub-statement unique-index collision under the read pin (as above).
@@ -10351,7 +10359,7 @@ export class Engine {
       if (!rindex.unique) continue;
       const prefix = indexPrefixKey(colTypes, colls, rindex, row, maintenanceEnv);
       if (prefix === null) continue;
-      const stored = this.lkpIndexStoreScoped(dbScope, rindex.name.toLowerCase()).rangeEntries(
+      const stored = this.lkpIndexStoreScoped(dbScope, rindex.name).rangeEntries(
         uniqueProbeBound(prefix),
       );
       if (stored.length > 0) throw uniqueViolation(table.name, rindex.name);
@@ -10382,7 +10390,7 @@ export class Engine {
       if (parent === undefined) continue;
       const parentColls = this.columnCollations(parent.columns);
       const supplied =
-        fk.refTable.toLowerCase() === relation.toLowerCase()
+        fk.refTable === relation
           ? fkProbe(fk, parent, parentColls, row, fk.refColumns)
           : null;
       const probe = fkProbe(fk, parent, parentColls, row, fk.columns);
@@ -10422,7 +10430,7 @@ export class Engine {
     }
     for (let i = 0; i < table.indexes.length; i++) {
       const def = table.indexes[i]!;
-      const istore = this.writeIndexStoreScoped(dbScope, def.name.toLowerCase());
+      const istore = this.writeIndexStoreScoped(dbScope, def.name);
       for (const entry of indexEntries[i]!) {
         if (!istore.insert(entry, [])) throw uniqueViolation(table.name, def.name);
       }
@@ -10445,7 +10453,7 @@ export class Engine {
   ): boolean {
     const probe = exclusionProbeQuery(columns, exc, row);
     if (probe === null) return false;
-    const tree = this.readSnap().gistTreeFor(exc.index.toLowerCase());
+    const tree = this.readSnap().gistTreeFor(exc.index);
     return tree !== undefined && gistSearch(tree, probe.query, probe.strats).keys.length > 0;
   }
 
@@ -10546,7 +10554,7 @@ export class Engine {
     }
     const def = table.indexes[arb.indexPos]!;
     const entries = this.readSnap()
-      .indexStore(def.name.toLowerCase())
+      .indexStore(def.name)
       .rangeEntries(uniqueProbeBound(ak));
     if (entries.length === 0) return null;
     const suffix = entries[0]!.key.slice(ak.length);
@@ -10572,7 +10580,7 @@ export class Engine {
       const prefix = this.indexPrefix(store.columnTypes(), colls, rindex, row);
       if (prefix === null) continue;
       if (
-        this.readSnap().indexStore(rindex.name.toLowerCase()).rangeEntries(uniqueProbeBound(prefix))
+        this.readSnap().indexStore(rindex.name).rangeEntries(uniqueProbeBound(prefix))
           .length > 0
       ) {
         return true;
@@ -10857,7 +10865,7 @@ export class Engine {
       const newRows = updates.map((u) => u.newRow).concat(inserts);
       for (const ix of uniqIdx) {
         const def = table.indexes[ix]!;
-        const istore = this.lkpIndexStore(def.name.toLowerCase());
+        const istore = this.lkpIndexStore(def.name);
         const batch = new Set<string>();
         for (const newRow of newRows) {
           const prefix = this.indexPrefix(store.columnTypes(), colls, rindexes[ix]!, newRow);
@@ -10889,7 +10897,7 @@ export class Engine {
       const parentColls = this.columnCollations(parent.columns);
       const checkUpdates = fk.columns.some((c) => assigned.has(c));
       const batch = new Set<string>();
-      if (fk.refTable.toLowerCase() === relation.toLowerCase()) {
+      if (fk.refTable === relation) {
         for (const row of inserts) {
           const p = fkProbe(fk, parent, parentColls, row, fk.refColumns);
           if (p !== null) batch.add(fkProbeBytes(p).join(","));
@@ -10981,7 +10989,7 @@ export class Engine {
     }
     for (const u of updates) store.replace(u.key, u.newRow);
     for (let k = 0; k < table.indexes.length; k++) {
-      const istore = this.writeIndexStore(table.indexes[k]!.name.toLowerCase());
+      const istore = this.writeIndexStore(table.indexes[k]!.name);
       for (const ek of indexAdds[k]!) {
         if (!istore.insert(ek, []))
           throw new Error("index entry keys are unique (storage-key suffix)");
@@ -11214,7 +11222,7 @@ export class Engine {
   // Whether a DML target resolves to the persistent main catalog. FKs involving temp/attached
   // tables are rejected at DDL; an explicit main qualifier survives a same-named temp overlap.
   private mainDmlTarget(scope: string | undefined, table: string): boolean {
-    return scope === undefined ? !this.isTempTable(table) : scope.toLowerCase() === "main";
+    return scope === undefined ? !this.isTempTable(table) : scope === "main";
   }
 
   private applyFkDeleteActions(
@@ -11502,7 +11510,7 @@ export class Engine {
     for (const m of matched) writeStore.remove(m.key);
     for (let kx = 0; kx < table.indexes.length; kx++) {
       const def = table.indexes[kx]!;
-      const istore = this.writeIndexStoreScoped(del.db, def.name.toLowerCase());
+      const istore = this.writeIndexStoreScoped(del.db, def.name);
       for (const ek of toRemove[kx]!) istore.remove(ek);
     }
     if (matched.length > 0) this.markEstimatorMutation(del.db, del.table);
@@ -11865,7 +11873,7 @@ export class Engine {
       const rewritten = new Set<string>(updates.map((u) => u.key.join(",")));
       for (const rindex of rindexes) {
         if (!rindex.unique) continue;
-        const istore = this.lkpIndexStoreScoped(upd.db, rindex.name.toLowerCase());
+        const istore = this.lkpIndexStoreScoped(upd.db, rindex.name);
         const batch = new Set<string>();
         for (const u of updates) {
           const prefix = this.indexPrefix(store.columnTypes(), colls, rindex, u.row);
@@ -11893,7 +11901,7 @@ export class Engine {
     if (table.exclusions.length > 0 && updates.length > 0) {
       const rewritten = new Set<string>(updates.map((u) => u.key.join(",")));
       for (const exc of table.exclusions) {
-        const ikey = exc.index.toLowerCase();
+        const ikey = exc.index;
         for (const u of updates) {
           const probe = exclusionProbeQuery(table.columns, exc, u.row);
           if (probe === null) continue;
@@ -11933,7 +11941,7 @@ export class Engine {
       // PARENT's collation (§2.12).
       const parentColls = this.columnCollations(parent.columns);
       const batch = new Set<string>();
-      if (fk.refTable.toLowerCase() === relation.toLowerCase()) {
+      if (fk.refTable === relation) {
         for (const u of updates) {
           const p = fkProbe(fk, parent, parentColls, u.row, fk.refColumns);
           if (p !== null) batch.add(fkProbeBytes(p).join(","));
@@ -12020,7 +12028,7 @@ export class Engine {
         }
       }
       for (let k = 0; k < table.indexes.length; k++) {
-        const istore = this.writeIndexStoreScoped(upd.db, table.indexes[k]!.name.toLowerCase());
+        const istore = this.writeIndexStoreScoped(upd.db, table.indexes[k]!.name);
         for (const mv of indexMoves[k]!) for (const oldEk of mv.removals) istore.remove(oldEk);
         for (const mv of indexMoves[k]!)
           for (const newEk of mv.insertions) {
@@ -12033,7 +12041,7 @@ export class Engine {
     } else {
       for (const u of updates) writeStore.replace(u.key, u.row);
       for (let k = 0; k < table.indexes.length; k++) {
-        const istore = this.writeIndexStoreScoped(upd.db, table.indexes[k]!.name.toLowerCase());
+        const istore = this.writeIndexStoreScoped(upd.db, table.indexes[k]!.name);
         for (const mv of indexMoves[k]!) {
           for (const oldEk of mv.removals) istore.remove(oldEk);
           for (const newEk of mv.insertions) {
@@ -12151,7 +12159,7 @@ export class Engine {
   ): CteBinding[] {
     const bindings: CteBinding[] = [];
     for (const cte of ctes) {
-      const lname = cte.name.toLowerCase();
+      const lname = cte.name;
       if (bindings.some((b) => b.name === lname)) {
         throw engineError("duplicate_alias", `WITH query name ${lname} specified more than once`);
       }
@@ -13105,7 +13113,7 @@ export class Engine {
             ? this.planQuery(tref.subquery, bodyParent, ctes, ptypes)
             : this.planValues(tref.values!, bodyParent, ctes, ptypes);
         lateral = lateralEligible && queryPlanReferencesOuter(plan, 0);
-        const label = tref.alias === null ? "" : tref.alias.toLowerCase();
+        const label = tref.alias === null ? "" : tref.alias;
         t = cteSyntheticTable(label, plan, tref.columnAliases ?? null);
         // An unaliased parenthesized join's columns are its inner columns, collation included.
         const group = derivedJoinGroup(plan);
@@ -13178,9 +13186,9 @@ export class Engine {
         }
       } else {
         // A plain FROM name (not an SRF call) may resolve to a CTE, which SHADOWS a catalog table of
-        // the same name (cte.md §2); lookup is case-insensitive. A hit bumps the binding's reference
+        // the same name (cte.md §2); lookup is byte-exact. A hit bumps the binding's reference
         // count (the inline-vs-materialize decision — cost.md §3).
-        const lname = tref.name.toLowerCase();
+        const lname = tref.name;
         let ci = -1;
         for (let j = ctes.length - 1; j >= 0; j--) {
           if (ctes[j]!.name === lname) {
@@ -13224,7 +13232,7 @@ export class Engine {
           "invalid reference to FROM-clause entry for a LATERAL item: the combining JOIN type must be INNER or LEFT",
         );
       }
-      const label = (tref.alias ?? t.name).toLowerCase();
+      const label = (tref.alias ?? t.name);
       // An unaliased derived table (grammar.md §42, PG 18) has an EMPTY label — it has no qualifier,
       // so two of them never collide and the duplicate-label check is skipped (its bare columns still
       // resolve, and stay ambiguous via resolveBare). Every other relation has a non-empty label.
@@ -13366,9 +13374,9 @@ export class Engine {
           };
           predAst = predAst === null ? eq : { kind: "binary", op: "and", lhs: predAst, rhs: eq };
           const mi = j.kind === "right" ? ri : li;
-          const ex = merges.findIndex((m) => m.name === name.toLowerCase());
+          const ex = merges.findIndex((m) => m.name === name);
           if (ex >= 0) merges.splice(ex, 1);
-          merges.push({ name: name.toLowerCase(), index: mi });
+          merges.push({ name: name, index: mi });
           hidden.push(li, ri);
           merged.push(mi);
           leftDrop.push(li);
@@ -14067,7 +14075,7 @@ export class Engine {
     // The args see only params/outer — never sibling FROM tables (non-LATERAL); CTE bindings are
     // inherited so an arg subquery can reference a CTE (cte.md §2).
     const argScope = new Scope([], this, parent, true, ctes);
-    const lname = name.toLowerCase();
+    const lname = name;
     // Record-returning functions (R1, json-table.md §2): json[b]_to_record → one record row,
     // json[b]_to_recordset → setof record. They take their column shape from the C0 col-def list
     // `AS t(col type, …)`. Dispatched FIRST, before the col-def-list guard below.
@@ -14623,7 +14631,7 @@ export class Engine {
   // half — the relation exists in EVERY valid scope, so only the scope itself is validated.
   private resolveCatalogScope(qualifier: string | undefined): string {
     if (qualifier === undefined) return "main";
-    const q = qualifier.toLowerCase();
+    const q = qualifier;
     if (q === "main" || q === "temp") return q;
     if (this.attachReadSnap(q) === undefined) {
       throw engineError("undefined_table", `database "${qualifier}" is not attached`);
@@ -14633,7 +14641,7 @@ export class Engine {
 
   // jedTablesRows generates the rows of the jed_tables catalog relation (introspection.md §5): one
   // row per USER table of the scope's pinned catalog snapshot — the canonical (CREATE
-  // TABLE-spelled) name — in ascending lowercased-name order (deterministic, no map-iteration
+  // TABLE-spelled) name — in ascending name byte order (deterministic, no map-iteration
   // leak; the multiset is the contract, order without ORDER BY stays unspecified — CLAUDE.md §8).
   // Derived entirely from the resident catalog: zero page_read / storage_row_read; each produced
   // row charges one generated_row AT THE SOURCE, guarded so a maxCost ceiling aborts
@@ -14654,7 +14662,7 @@ export class Engine {
   }
 
   // jedColumnsRows generates the rows of the jed_columns catalog relation (introspection.md §5):
-  // one row per column of every user table of the scope's snapshot, in (lowercased table name,
+  // one row per column of every user table of the scope's snapshot, in (table name,
   // ordinal) order. ordinal is 1-based CREATE TABLE order; type is the canonical type text
   // (catalogTypeText); not_null covers a declared NOT NULL and PRIMARY KEY membership; pk_ordinal
   // is the 1-based position in the PRIMARY KEY in KEY order (which may differ from declaration
@@ -14685,7 +14693,7 @@ export class Engine {
   }
 
   // jedIndexesRows generates the rows of the jed_indexes catalog relation (introspection.md §5.1):
-  // one row per secondary index of every user table of the scope's snapshot, in (lowercased table
+  // one row per secondary index of every user table of the scope's snapshot, in (table
   // name, then the catalog's ascending index-name order) order. columns is the text[] of indexed
   // column names in index-key order (duplicates included); is_unique the catalog flag; method the
   // access-method name (btree/gin/gist). Cost mirrors jedTablesRows.
@@ -14714,7 +14722,7 @@ export class Engine {
   }
 
   // jedSequencesRows generates the rows of the jed_sequences catalog relation (introspection.md
-  // §5.3): one row per sequence of the scope's snapshot, in ascending lowercased-name order. The
+  // §5.3): one row per sequence of the scope's snapshot, in ascending name byte order. The
   // definition fields render as stored; last_value is NULL until the sequence has been read
   // (!isCalled — PG's pg_sequences rule); owned_by_table / owned_by_column render the OWNED BY link
   // of a serial / IDENTITY column (the owning table's canonical name, the column's current name),
@@ -14757,7 +14765,7 @@ export class Engine {
   }
 
   // jedTypesRows generates the rows of the jed_types catalog relation (introspection.md §5.3): one
-  // row per user-defined type of the scope's snapshot, in ascending lowercased-name order. Every
+  // row per user-defined type of the scope's snapshot, in ascending name byte order. Every
   // user type is a composite today. Cost mirrors jedTablesRows.
   private jedTypesRows(srf: SrfPlan, meter: Meter): Row[] {
     const snap = this.snapForScope(srf.introspectScope!);
@@ -14774,7 +14782,7 @@ export class Engine {
   }
 
   // jedTypeFieldsRows generates the rows of the jed_type_fields catalog relation (introspection.md
-  // §5.3): one row per field of every user-defined type of the scope's snapshot, in (lowercased type
+  // §5.3): one row per field of every user-defined type of the scope's snapshot, in (type
   // name, ordinal) order — jed_columns' shape, with the same canonical type text. Cost mirrors
   // jedTablesRows.
   private jedTypeFieldsRows(srf: SrfPlan, meter: Meter): Row[] {
@@ -14806,7 +14814,7 @@ export class Engine {
       throw engineError("undefined_table", `database "${srf.introspectScope}" is not attached`);
     }
     const out: Row[] = [];
-    for (const tableKey of [...snap.statistics.keys()].sort()) {
+    for (const tableKey of [...snap.statistics.keys()].sort(compareTextC)) {
       const table = snap.tables.get(tableKey);
       if (table === undefined) continue;
       const columns = snap.statistics.get(tableKey)!;
@@ -14843,8 +14851,8 @@ export class Engine {
 
   // jedConstraintsRows generates the rows of the jed_constraints catalog relation (introspection.md
   // §5.1): one row per CHECK / UNIQUE / FK / EXCLUDE constraint of every user table of the scope's
-  // snapshot, in (lowercased table name, then a fixed KIND order — check, unique, foreign_key,
-  // exclude — each already held in ascending lowercased-name order). PRIMARY KEY / NOT NULL are
+  // snapshot, in (table name, then a fixed KIND order — check, unique, foreign_key,
+  // exclude — each already held in ascending name byte order). PRIMARY KEY / NOT NULL are
   // deliberately absent (they own no named object and are described by jed_columns). A UNIQUE
   // constraint IS its backing unique b-tree index (constraints.md §5), so type='unique' lists every
   // unique index; expression is the persisted canonical CHECK text (constraints.md §4.5). Cost
@@ -15361,7 +15369,7 @@ export class Engine {
   planTouchesTemp(sp: SelectPlan): boolean {
     for (const r of sp.rels) {
       if (r.db !== undefined) {
-        if (r.db.toLowerCase() === "temp") return true;
+        if (r.db === "temp") return true;
         continue;
       }
       if (this.isTempTable(r.tableName)) return true;
@@ -15375,12 +15383,12 @@ export class Engine {
       if (this.isTempTable(rel.tableName)) return null;
       snap = this.readSnap();
     } else {
-      const scope = rel.db.toLowerCase();
+      const scope = rel.db;
       if (scope === "temp") return null;
       snap = scope === "main" ? this.readSnap() : (this.attachReadSnap(scope) ?? null);
     }
     if (snap === null) return null;
-    const table = rel.tableName.toLowerCase();
+    const table = rel.tableName;
     const def = snap.tableByKey(table);
     if (!def || def.indexes.some((ix) => ix.timezoneDeps?.dynamic)) return null;
     return {
@@ -15410,12 +15418,12 @@ export class Engine {
       if (rel.db === undefined) {
         if (this.tempSnap().tableByKey(expected.table) !== undefined) return false;
         snap = this.readSnap();
-      } else if (rel.db.toLowerCase() === "temp") {
+      } else if (rel.db === "temp") {
         return false;
-      } else if (rel.db.toLowerCase() === "main") {
+      } else if (rel.db === "main") {
         snap = this.readSnap();
       } else {
-        snap = this.attachReadSnap(rel.db.toLowerCase()) ?? null;
+        snap = this.attachReadSnap(rel.db) ?? null;
       }
       if (
         snap === null ||
@@ -19072,7 +19080,7 @@ export const SCAN_CANDIDATE_KINDS = [
 ] as const;
 export type ScanCandidateKind = (typeof SCAN_CANDIDATE_KINDS)[number];
 
-// (kind, lowercased indexName) is a candidate's collision-free physical identity. indexName is
+// (kind, exact indexName) is a candidate's collision-free physical identity. indexName is
 // empty for PK/PK-interval/full paths; catalog index names are unique within the relation namespace.
 export type ScanCandidateIdentity = { kind: ScanCandidateKind; indexName: string };
 
@@ -19354,7 +19362,7 @@ export function buildIndexAccessPredicate(
     if (s === undefined || !isFixedWidth(s)) return null;
     suffixTypes.push(s);
   }
-  return { nameKey: idx.name.toLowerCase(), eqCols, range, suffixTypes };
+  return { nameKey: idx.name, eqCols, range, suffixTypes };
 }
 
 // detectScanBound picks one SELECT relation's scan bound. It is the fixed-policy wrapper over the
@@ -19450,7 +19458,7 @@ export function inventoryScanCandidates(
       SCAN_CANDIDATE_KINDS.indexOf(a.identity.kind) -
       SCAN_CANDIDATE_KINDS.indexOf(b.identity.kind);
     if (rank !== 0) return rank;
-    return compareLowerName({ name: a.identity.indexName }, { name: b.identity.indexName });
+    return compareName({ name: a.identity.indexName }, { name: b.identity.indexName });
   });
   return candidates;
 }
@@ -20606,7 +20614,7 @@ function estimatorCandidateSelectivity(candidate: ScanCandidate, rel: ScopeRel):
       )
         return { kind: "zero" };
       const index = rel.table.indexes.find(
-        (definition) => definition.name.toLowerCase() === candidate.identity.indexName,
+        (definition) => definition.name === candidate.identity.indexName,
       );
       if (
         index?.unique === true &&
@@ -20644,7 +20652,7 @@ function estimatorCandidateSelectivity(candidate: ScanCandidate, rel: ScopeRel):
       );
     case "indexSet": {
       const index = rel.table.indexes.find(
-        (definition) => definition.name.toLowerCase() === candidate.identity.indexName,
+        (definition) => definition.name === candidate.identity.indexName,
       );
       return estimatorIntervalSelectivity(
         bound.indexSet.specs,
@@ -20719,7 +20727,7 @@ function estimatorCandidateSelectivityWithStatistics(
     }
     case "index": {
       const index = rel.table.indexes.find(
-        (definition) => definition.name.toLowerCase() === candidate.identity.indexName,
+        (definition) => definition.name === candidate.identity.indexName,
       );
       if (index === undefined) return structural;
       let result: Selectivity = { kind: "all" };
@@ -20758,7 +20766,7 @@ function estimatorCandidateSelectivityWithStatistics(
     }
     case "indexSet": {
       const index = rel.table.indexes.find(
-        (definition) => definition.name.toLowerCase() === candidate.identity.indexName,
+        (definition) => definition.name === candidate.identity.indexName,
       );
       const key = index?.keys[0];
       if (index === undefined || key?.kind !== "column") return structural;
@@ -21070,7 +21078,7 @@ function buildIndexIntervalSetPlan(
   const set = detectIntervalSet(filter, rel.offset + ci, ty, ctx.coll);
   if (set === null || (intervalPlanHasRange(set.specs, set.clip) && !isFixedWidth(ty))) return null;
   return {
-    nameKey: idx.name.toLowerCase(),
+    nameKey: idx.name,
     colType: ty,
     coll: ctx.coll,
     tailTypes: cols.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type)),
@@ -21221,7 +21229,7 @@ export function inventoryINLCandidates(
   ) {
     candidates.push(storageOrderCandidate("pk", "", { kind: "pk", pk }, whereFilter));
   }
-  // Else a leading secondary-index equality bound to a sibling (indexes in ascending lowercased name
+  // Else a leading secondary-index equality bound to a sibling (indexes in ascending name byte
   // order — the deterministic tie-break, matching detectScanBound).
   for (const idx of rel.table.indexes) {
     if (idx.kind !== "btree") continue;
@@ -21260,13 +21268,13 @@ export function inventoryINLCandidates(
       const bound: ScanBound = {
         kind: "index",
         index: {
-          nameKey: idx.name.toLowerCase(),
+          nameKey: idx.name,
           eqCols: [{ colType: ty, coll: ctx.coll, srcs: eqs }],
           range: null,
           suffixTypes,
         },
       };
-      candidates.push(indexOrderCandidate("btree", idx.name.toLowerCase(), bound, whereFilter));
+      candidates.push(indexOrderCandidate("btree", idx.name, bound, whereFilter));
     }
   }
   // Opclass sibling bounds follow the cheaper PK and ordered-B-tree paths. GiST precedes GIN,
@@ -21284,10 +21292,10 @@ export function inventoryINLCandidates(
           candidates.push(
             storageOrderCandidate(
               "gist",
-              idx.name.toLowerCase(),
+              idx.name,
               {
                 kind: "gist",
-                gist: { nameKey: idx.name.toLowerCase(), strategy: m.strategy, colGlobal },
+                gist: { nameKey: idx.name, strategy: m.strategy, colGlobal },
               },
               whereFilter,
             ),
@@ -21297,11 +21305,11 @@ export function inventoryINLCandidates(
           candidates.push(
             storageOrderCandidate(
               "gist",
-              idx.name.toLowerCase(),
+              idx.name,
               {
                 kind: "gist",
                 gist: {
-                  nameKey: idx.name.toLowerCase(),
+                  nameKey: idx.name,
                   strategy: "equal",
                   colGlobal,
                   scalarType: typeScalar(colType),
@@ -21311,7 +21319,7 @@ export function inventoryINLCandidates(
             ),
           );
       }
-      if (candidates.at(-1)?.identity.indexName === idx.name.toLowerCase()) break;
+      if (candidates.at(-1)?.identity.indexName === idx.name) break;
     }
   }
   for (const idx of rel.table.indexes) {
@@ -21326,11 +21334,11 @@ export function inventoryINLCandidates(
         candidates.push(
           storageOrderCandidate(
             "gin",
-            idx.name.toLowerCase(),
+            idx.name,
             {
               kind: "gin",
               gin: {
-                nameKey: idx.name.toLowerCase(),
+                nameKey: idx.name,
                 elemType: typeScalar(colType.elem),
                 strategy: m.strategy,
                 colGlobal,
@@ -21339,13 +21347,13 @@ export function inventoryINLCandidates(
             whereFilter,
           ),
         );
-      if (candidates.at(-1)?.identity.indexName === idx.name.toLowerCase()) break;
+      if (candidates.at(-1)?.identity.indexName === idx.name) break;
     }
   }
   candidates.sort((a, b) => {
     const rank = SCAN_CANDIDATE_KINDS.indexOf(a.identity.kind) - SCAN_CANDIDATE_KINDS.indexOf(b.identity.kind);
     if (rank !== 0) return rank;
-    return a.identity.indexName < b.identity.indexName ? -1 : a.identity.indexName > b.identity.indexName ? 1 : 0;
+    return compareTextC(a.identity.indexName, b.identity.indexName);
   });
   return candidates;
 }
@@ -21489,9 +21497,9 @@ export function orderSatisfiedByIndexes(
         break;
       }
     }
-    if (matches) matchingIndexes.push({ nameKey: idx.name.toLowerCase(), pkWidth });
+    if (matches) matchingIndexes.push({ nameKey: idx.name, pkWidth });
   }
-  matchingIndexes.sort((a, b) => compareLowerName({ name: a.nameKey }, { name: b.nameKey }));
+  matchingIndexes.sort((a, b) => compareName({ name: a.nameKey }, { name: b.nameKey }));
   return matchingIndexes;
 }
 
@@ -21520,7 +21528,7 @@ export function buildGinBoundForIndex(
   const m = ginMatch(filter, colGlobal);
   if (m !== null) {
     return {
-      nameKey: idx.name.toLowerCase(),
+      nameKey: idx.name,
       elemType: typeScalar(colType.elem),
       strategy: m.strategy,
       colGlobal,
@@ -21621,12 +21629,12 @@ export function buildGistBoundForIndex(
   if (colType.kind === "range") {
     const m = gistMatch(filter, colGlobal);
     if (m !== null) {
-      return { nameKey: idx.name.toLowerCase(), strategy: m.strategy, colGlobal };
+      return { nameKey: idx.name, strategy: m.strategy, colGlobal };
     }
   } else if (isGistScalarType(colType)) {
     if (gistScalarMatch(filter, colGlobal) !== null) {
       return {
-        nameKey: idx.name.toLowerCase(),
+        nameKey: idx.name,
         strategy: "equal",
         colGlobal,
         scalarType: typeScalar(colType),
@@ -22154,7 +22162,7 @@ function resolveExclusionDefinition(
   table: Table,
   def: ExcludeDef,
 ): { columns: number[]; elements: ExclusionElement[] } {
-  if (def.using !== null && def.using.toLowerCase() !== "gist")
+  if (def.using !== null && def.using !== "gist")
     throw engineError(
       "undefined_object",
       `access method ${def.using} does not support exclusion constraints`,
@@ -22394,11 +22402,11 @@ export function resolveArbiter(table: Table, target: ConflictTarget | null): Arb
       "there is no unique or exclusion constraint matching the ON CONFLICT specification",
     );
   }
-  const pkey = table.name.toLowerCase() + "_pkey";
-  if (pk.length > 0 && target.name.toLowerCase() === pkey) return { isPK: true };
+  const pkey = table.name + "_pkey";
+  if (pk.length > 0 && target.name === pkey) return { isPK: true };
   for (let i = 0; i < table.indexes.length; i++) {
     const def = table.indexes[i]!;
-    if (def.unique && def.name.toLowerCase() === target.name.toLowerCase())
+    if (def.unique && def.name === target.name)
       return { isPK: false, indexPos: i };
   }
   throw engineError(
@@ -22460,7 +22468,7 @@ export function indexPrefixKey(
 
 // fkReversePath is the access path a parent-side reverse match uses on the child table
 // (spec/design/constraints.md §6.5): the child's PK (index === null) or a plain-column ordered
-// B-tree secondary index (index = its lowercased name); null from fkChooseReversePath is the
+// B-tree secondary index (index = its exact name); null from fkChooseReversePath is the
 // full-scan fallback. cols are the leading child key columns, in key order, whose set is exactly
 // the FK's local columns.
 type FkReversePath = { index: string | null; cols: number[] };
@@ -22503,7 +22511,7 @@ function fkReverseTailFixed(child: Table, tail: IndexKey[]): boolean {
 }
 
 // fkChooseReversePath picks the child reverse-match path deterministically: the child PK, then
-// usable non-partial plain-column B-tree indexes in ascending lowercased-name order (the planner's
+// usable non-partial plain-column B-tree indexes in ascending name byte order (the planner's
 // canonical tie order), else null — the full scan (constraints.md §6.5 steps 1–2).
 function fkChooseReversePath(
   snap: Snapshot,
@@ -22530,8 +22538,8 @@ function fkChooseReversePath(
     ) {
       continue;
     }
-    const name = ix.name.toLowerCase();
-    if (best === null || name < best.index!) best = { index: name, cols: leading };
+    const name = ix.name;
+    if (best === null || compareTextC(name, best.index!) < 0) best = { index: name, cols: leading };
   }
   return best;
 }
@@ -22890,7 +22898,7 @@ export function typeIsArrayKeyable(t: Type): boolean {
 // FkProbe is a built foreign-key probe (spec/design/constraints.md §6.4/§6.8): the bytes to look
 // up in the parent, tagged with which physical tree to probe — the parent's PK store (bare member
 // encodings concatenated, in PK key order) or a parent unique index's prefix (0x00-tagged slots,
-// in index-key order, plus the lowercased index name). A discriminated union (the TS idiom), with
+// in index-key order, plus the exact index name). A discriminated union (the TS idiom), with
 // fkProbeBytes returning the raw bytes for batch-membership comparison.
 export type FkProbe =
   | { kind: "pk"; bytes: Uint8Array }
@@ -22948,7 +22956,7 @@ export function fkProbe(
   }
   return {
     kind: "unique",
-    index: idx.name.toLowerCase(),
+    index: idx.name,
     prefix: concatBytes(parts),
   };
 }
@@ -26029,14 +26037,14 @@ export type SrfPlan = {
   // else absent.
   jtPlan?: JtPlan;
   // The validated database scope of a catalog relation (the `jed_tables` / `jed_columns` kinds —
-  // introspection.md §5): "main" (also the unqualified default), "temp", or a lowercased
+  // introspection.md §5): "main" (also the unqualified default), "temp", or an exact
   // attachment name. Absent for every other kind.
   introspectScope?: string;
 };
 
 // catalogRelKind classifies a relation name as a built-in catalog relation (introspection.md §5):
-// the jed_-prefixed relation family, case-insensitively (identifier resolution folds case; grammar.md §3
-// leaves no quoted escape). Built-in names resolve in every database's relation namespace, checked
+// the jed_-prefixed relation family, byte-exactly (a bare spelling is already folded; a quoted
+// mixed-case spelling is a different name — grammar.md §3). Built-in names resolve in every database's relation namespace, checked
 // AFTER a statement-local CTE (a CTE shadows a catalog relation — PG-matching, oracle-checked) and
 // BEFORE the user catalog (post-I0 the two can never collide; for a pre-reservation legacy file the
 // built-in wins and the user relation is unreachable by name — §5).
@@ -26051,7 +26059,7 @@ export type CatalogRelKind =
   | "jed_type_fields";
 
 export function catalogRelKind(name: string): CatalogRelKind | undefined {
-  const lname = name.toLowerCase();
+  const lname = name;
   if (
     lname === "jed_tables" ||
     lname === "jed_columns" ||
@@ -26089,7 +26097,7 @@ export function isCatalogRelName(name: string): boolean {
 // rejection is scope-independent.
 export function checkCatalogRelWrite(name: string): void {
   if (isCatalogRelName(name)) {
-    throw engineError("wrong_object_type", `cannot modify system relation "${name.toLowerCase()}"`);
+    throw engineError("wrong_object_type", `cannot modify system relation "${name}"`);
   }
 }
 
@@ -26292,7 +26300,7 @@ export function applySrfColumnAliases(
   if (aliases.length > table.columns.length) {
     throw engineError(
       "invalid_column_reference",
-      `table "${relationName.toLowerCase()}" has ${table.columns.length} columns available but ${aliases.length} columns specified`,
+      `table "${relationName}" has ${table.columns.length} columns available but ${aliases.length} columns specified`,
     );
   }
   for (let i = 0; i < aliases.length; i++) table.columns[i]!.name = aliases[i]!;
@@ -27122,7 +27130,7 @@ export type CteMode = "inline" | "materialize";
 
 // CteBinding is a planned common table expression (spec/design/cte.md), built by planCteBindings for
 // the whole statement so the scopes that reference its synthetic `table` can see it. `name` is
-// lowercased for case-insensitive FROM matching; `table` is the synthetic relation exposing the
+// exact for byte-exact FROM matching; `table` is the synthetic relation exposing the
 // body's output columns; `source` is the planned body (a query plan, or — spec/design/writable-cte.md
 // — a data-modifying statement); `hint` is the [NOT] MATERIALIZED override (true/false/null); `refs`
 // counts the FROM references resolved to it during planning (the inline-vs-materialize decision —
@@ -28222,11 +28230,11 @@ export function windowsHaveAggregate(windows: [string, WindowDef][]): boolean {
   return windows.some(([, wd]) => windowDefHasAggregate(wd));
 }
 
-// isAggregateName reports whether name (case-insensitive) is a catalog aggregate, one of the
+// isAggregateName reports whether name (exact) is a catalog aggregate, one of the
 // hand-resolved json[b]_object_agg[_unique] aggregates (no catalog row, B4), or an ordered-set
 // aggregate (mode/percentile_*, §13 — also not catalog rows, their result/arg mold is special).
 export function isAggregateName(name: string): boolean {
-  const lname = name.toLowerCase();
+  const lname = name;
   return (
     AGGREGATES.some((a) => a.surface.toLowerCase() === lname) ||
     objectAggClassify(name) !== null ||
@@ -28238,7 +28246,7 @@ export function isAggregateName(name: string): boolean {
 // These 2-argument aggregates are hand-resolved (the single-operand aggregate catalog can't express a
 // key/value pair), like jsonb_set among the scalar functions (json-sql-functions.md §4).
 export function objectAggClassify(name: string): { asJson: boolean; unique: boolean } | null {
-  switch (name.toLowerCase()) {
+  switch (name) {
     case "jsonb_object_agg":
       return { asJson: false, unique: false };
     case "json_object_agg":
@@ -28252,12 +28260,12 @@ export function objectAggClassify(name: string): { asJson: boolean; unique: bool
   }
 }
 
-// isOrderedSetAggregateName reports whether name (case-insensitive) is an ordered-set aggregate
+// isOrderedSetAggregateName reports whether name (exact) is an ordered-set aggregate
 // surface (mode / percentile_cont / percentile_disc — spec/design/aggregates.md §13). These take a
 // WITHIN GROUP (ORDER BY …) clause and are resolved by resolveOrderedSetAggregate, intercepted before
 // the generic aggregate/scalar dispatch.
 export function isOrderedSetAggregateName(name: string): boolean {
-  const lname = name.toLowerCase();
+  const lname = name;
   return lname === "mode" || lname === "percentile_cont" || lname === "percentile_disc";
 }
 
@@ -28473,10 +28481,10 @@ export function resolveWindowClause(windows: [string, WindowDef][]): [string, Wi
 }
 
 // lookupWindow finds a (resolved, base = null) window definition by name in `windows`,
-// case-insensitively, returning a structured clone (to avoid aliasing), or throws 42704
+// byte-exactly, returning a structured clone (to avoid aliasing), or throws 42704
 // `window "<name>" does not exist`.
 export function lookupWindow(windows: [string, WindowDef][], name: string): WindowDef {
-  const found = windows.find(([n]) => n.toLowerCase() === name.toLowerCase());
+  const found = windows.find(([n]) => n === name);
   if (found === undefined) {
     throw engineError("undefined_object", `window "${name}" does not exist`);
   }
@@ -28497,7 +28505,7 @@ export function desugarItems(items: SelectItems, windows: [string, WindowDef][])
 }
 
 // desugarNamedWindows is the recursive Expr walk behind desugarItems: it replaces a funcCall's
-// `overName` with the matching WINDOW-clause definition (case-insensitively), throwing 42704 for an
+// `overName` with the matching WINDOW-clause definition (byte-exactly), throwing 42704 for an
 // undefined name. Mirrors Rust's desugar_named_windows exactly (leaves, subscripts, and subqueries
 // carry no top-level window ref to rewrite).
 export function desugarNamedWindows(e: Expr, windows: [string, WindowDef][]): void {
@@ -28797,11 +28805,11 @@ export function rejectDefaultStructure(e: Expr): void {
 }
 
 // indexNamePart is the auto-name part for one index key element (spec/design/indexes.md §2, PG's
-// ChooseIndexColumnNames): a column key contributes its (lowercased) column name; a bare-function-call
+// ChooseIndexColumnNames): a column key contributes its (exact) column name; a bare-function-call
 // expression its function name (`lower(email)` → `lower`); any other expression the literal `expr`.
 export function indexNamePart(elem: IndexKeyElem): string {
-  if (elem.kind === "column") return elem.name.toLowerCase();
-  if (elem.expr.kind === "funcCall") return elem.expr.name.toLowerCase();
+  if (elem.kind === "column") return elem.name;
+  if (elem.expr.kind === "funcCall") return elem.expr.name;
   return "expr";
 }
 
@@ -28998,8 +29006,8 @@ export function indexExprFirstParam(e: Expr): number | null {
 export function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
   const out: number[] = [];
   const note = (name: string): void => {
-    const lower = name.toLowerCase();
-    const i = columns.findIndex((c) => c.name.toLowerCase() === lower);
+    const lower = name;
+    const i = columns.findIndex((c) => c.name === lower);
     if (i >= 0 && !out.includes(i)) out.push(i);
   };
   const walk = (e: Expr): void => {
@@ -29093,7 +29101,7 @@ export function resolveAggregate(
   if (!ag.collecting) {
     throw engineError("grouping_error", "aggregate functions are not allowed here");
   }
-  const name = e.name.toLowerCase();
+  const name = e.name;
   const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
   // json[b]_object_agg[_unique] take TWO operands (key, value) — resolve both and encode as a Row
   // operand for the single-operand aggregate framework (the fold splits the composite back out, B4).
@@ -29220,7 +29228,7 @@ export function resolveOrderedSetAggregate(
   if (e.distinct) {
     throw engineError("syntax_error", "DISTINCT is not allowed with ordered-set aggregates");
   }
-  const name = e.name.toLowerCase();
+  const name = e.name;
   const keys = e.withinGroup ?? [];
   // Exactly one WITHIN GROUP sort key (PG models a second as a missing overload → 42883).
   if (keys.length !== 1) throw noAggOverload(name);
@@ -29368,7 +29376,7 @@ export function arrayIf(t: ResolvedType, isArray: boolean): ResolvedType {
 // These names are ALSO window functions; the WITHIN GROUP clause routes them here instead of the
 // window path.
 export function isHypotheticalSetName(name: string): boolean {
-  const lname = name.toLowerCase();
+  const lname = name;
   return (
     lname === "rank" || lname === "dense_rank" || lname === "percent_rank" || lname === "cume_dist"
   );
@@ -29398,7 +29406,7 @@ export function resolveHypotheticalSetAggregate(
   if (e.distinct) {
     throw engineError("syntax_error", "DISTINCT is not allowed with ordered-set aggregates");
   }
-  const name = e.name.toLowerCase();
+  const name = e.name;
   const keys = e.withinGroup ?? [];
   // The number of hypothetical direct arguments must match the number of ordering columns (PG models
   // a mismatch as a missing overload → 42883).
@@ -29595,7 +29603,7 @@ export function noFuncOverload(fn: string): EngineError {
 // clause — used without one it is 42809 (spec/design/window.md §7). The catalog aggregates double
 // as window functions but are not in WINDOWS, so they are still valid without OVER.
 export function isWindowOnlyName(name: string): boolean {
-  const lname = name.toLowerCase();
+  const lname = name;
   return WINDOWS.some((w) => w.surface.toLowerCase() === lname);
 }
 
@@ -29609,7 +29617,7 @@ export function resolveWindowCall(
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  const lname = e.name.toLowerCase();
+  const lname = e.name;
   // The plan + result type from the function name. S0: only row_number(); an aggregate name with
   // OVER (a window aggregate) is deferred to S3; any other name is 42883.
   let plan: WindowPlan;
@@ -30115,13 +30123,13 @@ export function familyMatches(slot: string, t: ResolvedType): boolean {
   return slot === "any" || argFamily(t) === slot;
 }
 
-// isScalarFuncName reports whether name (lowercased) is a registered scalar function (catalog
+// isScalarFuncName reports whether name (exact) is a registered scalar function (catalog
 // kind === "function") — the data-driven replacement for the old hand-written known-name gate.
 export function isScalarFuncName(name: string): boolean {
   return OPERATORS.some((o) => o.kind === "function" && o.name === name);
 }
 
-// isVariadicFuncName reports whether name (lowercased) is a VARIADIC scalar function
+// isVariadicFuncName reports whether name (exact) is a VARIADIC scalar function
 // (array-functions.md §12) — a kind === "function" row with `variadic` set (num_nulls/num_nonnulls).
 export function isVariadicFuncName(name: string): boolean {
   return OPERATORS.some((o) => o.kind === "function" && o.variadic && o.name === name);
@@ -30164,15 +30172,16 @@ export function scalarResultType(code: string, tys: ResolvedType[]): ScalarType 
   return ty;
 }
 
-// aggregateHasStar reports whether aggregate surface (lowercased) has a COUNT(*)-style star
-// overload — only COUNT does. The data-driven replacement for the special-cased star arm.
+// aggregateHasStar reports whether aggregate surface (the exact call name, matched against the
+// lowercased catalog surface) has a COUNT(*)-style star overload — only COUNT does. The
+// data-driven replacement for the special-cased star arm.
 export function aggregateHasStar(surface: string): boolean {
   return AGGREGATES.some((a) => a.surface.toLowerCase() === surface && a.arg === "star");
 }
 
-// lookupAggregateOverload returns the matched aggregate overload row for surface (lowercased) over
-// a single operand of resolved type t: the arg === "expr" catalog row whose lone argFamilies slot
-// matches. undefined ⇒ no overload (42883, e.g. SUM(text)). MIN/MAX/COUNT take "any".
+// lookupAggregateOverload returns the matched aggregate overload row for surface (the exact call
+// name, matched against the lowercased catalog surface) over a single operand of resolved type t:
+// the arg === "expr" catalog row whose lone argFamilies slot matches. undefined ⇒ no overload (42883, e.g. SUM(text)). MIN/MAX/COUNT take "any".
 export function lookupAggregateOverload(
   surface: string,
   t: ResolvedType,
@@ -30190,7 +30199,7 @@ export function lookupAggregateOverload(
 // aggregate over operand type t, from the matched overload's surface + catalog result code (the PG
 // widening — aggregates.md §3). The plan is the aggregate's kernel id (fold/finalize switch on it);
 // selecting it from the registered result code keeps the name gate + overload validation
-// data-driven while the kernel stays hand-written (§5). surface is the lowercased call name.
+// data-driven while the kernel stays hand-written (§5). surface is the (folded) call name.
 export function aggregatePlan(
   surface: string,
   code: string,
@@ -30251,7 +30260,7 @@ export function resolveFuncCall(
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  const lname = e.name.toLowerCase();
+  const lname = e.name;
   // DISTINCT is an aggregate-only modifier: `abs(DISTINCT x)` is 42809 (PG's wrong_object_type,
   // "DISTINCT specified, but <fn> is not an aggregate function" — aggregates.md §5). Checked before
   // the per-kind dispatch so it covers every non-aggregate path (scalar, array, …).
@@ -30475,7 +30484,7 @@ export function resolveRegexFunc(
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
-  const name = e.name.toLowerCase();
+  const name = e.name;
   let func: "replace" | "match" | "like" | "count" | "substr" | "instr";
   let flagsIdx = -1;
   // intPositions are the integer-typed argument indices; source(0) and pattern(1) are always text.
@@ -30640,7 +30649,7 @@ export function normalizeNamedArgs(
       continue;
     }
     seenNamed = true;
-    const idx = desc.argNames.findIndex((p) => p.toLowerCase() === nm.toLowerCase());
+    const idx = desc.argNames.findIndex((p) => p === nm);
     if (idx < 0) {
       throw engineError(
         "undefined_function",
@@ -30726,7 +30735,7 @@ export function resolveMakeTimestamp(
     for (let i = 0; i < e.args.length; i++) {
       const nm = namesEmpty ? null : e.argNames[i];
       if (nm === null || nm === undefined) positional++;
-      else if (nm.toLowerCase() === "timezone") namesTimezone = true;
+      else if (nm === "timezone") namesTimezone = true;
     }
     if (positional > 6 || namesTimezone) arity = 7;
   }
@@ -30782,7 +30791,7 @@ export function resolveScalarFunc(
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
-  let name = e.name.toLowerCase() as ScalarFuncName;
+  let name = e.name as ScalarFuncName;
   // char_length / character_length are SQL-standard aliases of length (string-functions.md) with NO
   // catalog row of their own, so rewrite them to length BEFORE the lookup (unlike power/ceiling,
   // which DO have their own catalog rows and are looked up by the spelled name — matching Rust/Go).
@@ -30804,7 +30813,7 @@ export function resolveScalarFunc(
     // promotion. A built-in overload (above) always wins; a host function is reached only when no
     // built-in matches. Use the ORIGINAL name (not the char_length→length built-in alias rewrite).
     // `id` indexes the frozen registry; the kernel is reached by id at eval.
-    const host = resolveHostScalar(scope, e.name.toLowerCase(), rargs, tys);
+    const host = resolveHostScalar(scope, e.name, rargs, tys);
     if (host) return host;
     throw noFuncOverload(name);
   }
@@ -30886,7 +30895,7 @@ export function resolveVariadicFunc(
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
-  const name = e.name.toLowerCase();
+  const name = e.name;
   const desc = scalarFuncDesc(name)!;
   const k = desc.arity; // declared parameter count (the last is variadic)
   const varFamily = desc.argFamilies[k - 1]!; // the variadic element family (last slot)
@@ -30976,7 +30985,7 @@ export function jsonBuildClassify(
 // slot's type by structural equality, read back into the reserved result codes anyarray (= ELEM[])
 // and anyelement (= ELEM).
 
-// isArrayFuncName reports whether name (lowercased) is a polymorphic array function — a
+// isArrayFuncName reports whether name (exact) is a polymorphic array function — a
 // kind === "function" catalog row whose argFamilies mention anyarray/anyelement. Data-driven.
 export function isArrayFuncName(name: string): boolean {
   return OPERATORS.some(
@@ -31217,7 +31226,7 @@ export function resolveArrayFunc(
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
-  const name = e.name.toLowerCase() as ArrayFuncName;
+  const name = e.name as ArrayFuncName;
   // Each array-function name is single-overload; find its row by (name, arity). A wrong argument count
   // matches no overload (42883), exactly as a missing scalar overload does.
   const desc = OPERATORS.find(
@@ -31257,7 +31266,7 @@ export function resolveArrayFunc(
   return { node: { kind: "arrayFunc", func: name, args: rargs }, type };
 }
 
-// isRangeFuncName reports whether name (lowercased) is a polymorphic range function — a
+// isRangeFuncName reports whether name (exact) is a polymorphic range function — a
 // kind === "function" catalog row whose argFamilies mention anyrange (range-functions.md §1).
 // Data-driven, so a new range-function row wires here without touching this gate.
 export function isRangeFuncName(name: string): boolean {
@@ -31395,7 +31404,7 @@ export function resolveRangeFunc(
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
-  const name = e.name.toLowerCase();
+  const name = e.name;
   const desc = OPERATORS.find(
     (o) => o.kind === "function" && o.name === name && o.arity === e.args.length,
   );
@@ -31424,7 +31433,7 @@ export function resolveRangeFunc(
   };
 }
 
-// isRangeCtorName reports whether name (lowercased) is a range CONSTRUCTOR call
+// isRangeCtorName reports whether name (exact) is a range CONSTRUCTOR call
 // (range-functions.md §2): a call whose name is a range type name or alias (i32range/int4range/
 // numrange/…). The constructor functions are the only ones whose name is a range type name, so
 // rangeByName resolving is exactly the gate — data-driven over the RANGES table, no hand-written
@@ -31474,7 +31483,7 @@ export function resolveRangeCtor(
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
-  const name = e.name.toLowerCase();
+  const name = e.name;
   const desc = rangeByName(name);
   if (desc === undefined) throw new Error("isRangeCtorName gated the call");
   const elem = elementScalar(desc);
@@ -31525,8 +31534,8 @@ export function groupingErrorColumn(name: string): EngineError {
 // is NULL-extended at runtime regardless of its declared nullability (grammar.md §15).
 // ============================================================================
 
-// ScopeRel is one relation in a FROM scope: its label (alias, else table name, lower-cased
-// for case-insensitive matching), the table, and the flat offset of its first column. A
+// ScopeRel is one relation in a FROM scope: its label (alias, else table name — exact
+// for byte-exact matching), the table, and the flat offset of its first column. A
 // qualifierOnly relation is visible ONLY to qualified references — the RETURNING old/new
 // row-version pseudo-relations (grammar.md §32): bare-column resolution skips it (no new
 // ambiguity), every other statement never builds one.
@@ -31553,7 +31562,7 @@ export type ScopeRel = {
 // index within that ancestor's row).
 export type Resolved = { level: number; index: number };
 
-// MergeCol is a USING/NATURAL merged column (spec/design/grammar.md §15): `name` is the (lowercased)
+// MergeCol is a USING/NATURAL merged column (spec/design/grammar.md §15): `name` is the (exact)
 // join column and `index` the flat row index a bare reference resolves to — the surviving side (the
 // left column for INNER/LEFT, the right for RIGHT; FULL JOIN USING, a COALESCE, is deferred 0A000).
 // Both underlying copies are recorded in the scope's `hidden` set.
@@ -31573,7 +31582,7 @@ export function naturalCommonCols(leftNames: string[], right: ScopeRel): string[
   const seen = new Set<string>();
   const out: string[] = [];
   for (const name of leftNames) {
-    const lc = name.toLowerCase();
+    const lc = name;
     if (!seen.has(lc)) {
       seen.add(lc);
       if (columnIndex(right.table, name) >= 0) out.push(name);

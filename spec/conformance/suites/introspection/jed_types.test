@@ -24,10 +24,10 @@ statement ok
 CREATE TYPE addr AS (street text NOT NULL, zip i32)
 
 statement ok
-CREATE TYPE Money AS (amount decimal(10,2), currency varchar(3) NOT NULL)
+CREATE TYPE "Money" AS (amount decimal(10,2), currency varchar(3) NOT NULL)
 
 statement ok
-CREATE TYPE person AS (name text, home addr, tags text[], wallet Money)
+CREATE TYPE person AS (name text, home addr, tags text[], wallet "Money")
 
 query TT nosort
 SELECT name, kind FROM jed_types ORDER BY name
@@ -131,7 +131,7 @@ SELECT count(*) FROM jed_type_fields
 ----
 4
 
-# --- resolution: case-insensitive, alias renames the relation, qualifier scoping -----------------
+# --- resolution: a bare name folds, alias renames the relation, qualifier scoping ----------------
 
 query T nosort
 SELECT name FROM JED_Types ORDER BY name

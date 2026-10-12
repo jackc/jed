@@ -73,7 +73,7 @@ export function stampTable(err: unknown, table: string): unknown {
 // pkeyName is the derived <table>_pkey constraint name PostgreSQL auto-assigns a primary key
 // (jed persists no such relation — constraints.md §5.4).
 export function pkeyName(table: string): string {
-  return table.toLowerCase() + "_pkey";
+  return table + "_pkey";
 }
 
 // --- typed integrity-violation constructors (spec/design/error-fields.md §5) ----------

@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { typeScalar } from "../src/types.ts";
+import { Database, loadEngine } from "../src/tooling.ts";
 import { dbWith, errCode } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
@@ -29,10 +30,48 @@ test("SQL-standard type aliases resolve to canonical types", () => {
   );
 });
 
-test("case-insensitive table lookup", () => {
-  const db = dbWith(["CREATE TABLE Foo (id i32 PRIMARY KEY)"]);
+test("bare names fold and host lookup is exact", () => {
+  // A bare name folds to lowercase; the host API looks a name up exactly (grammar.md §3).
+  const db = dbWith(["CREATE TABLE Foo (Id i32 PRIMARY KEY)"]);
   assert.ok(db.table("foo"));
-  assert.ok(db.table("FOO"));
+  assert.equal(db.table("FOO"), undefined);
+  assert.equal(db.table("foo")!.columns[0]!.name, "id");
+  db.execute('CREATE TABLE "Foo" ("Id" i32 PRIMARY KEY)');
+  assert.equal(db.table("Foo")!.columns[0]!.name, "Id");
+});
+
+// The on-disk catalog emits each name group in ascending BYTE order of the exact name
+// (format_version 37): uppercase ASCII sorts before lowercase, so B < C < a, and the reload keeps
+// every name exact (a bare lookup never reaches a mixed-case name).
+test("catalog order is exact-name bytes across reload", () => {
+  const db = dbWith([
+    "CREATE TABLE a (id i32 PRIMARY KEY)",
+    'CREATE TABLE "C" (id i32 PRIMARY KEY)',
+    'CREATE TABLE "B" (id i32 PRIMARY KEY, "V" i32, v i32)',
+    'CREATE INDEX "Zed" ON "B" (v)',
+    'CREATE INDEX alpha ON "B" ("V")',
+    'CREATE SEQUENCE "Seq"',
+    "CREATE SEQUENCE aseq",
+  ]);
+  const image = db.toImage(8192, 1n);
+  assert.deepEqual(loadEngine(image).tableNames(), ["B", "C", "a"]);
+  const loaded = Database.fromImage(image);
+  const b = loaded.table("B")!;
+  assert.deepEqual(
+    b.indexes.map((i) => i.name),
+    ["Zed", "alpha"],
+  );
+  assert.equal(b.columns[1]!.name, "V");
+  assert.equal(b.columns[2]!.name, "v");
+  assert.equal(loaded.table("b"), undefined);
+  loaded.execute(`SELECT nextval('"Seq"')`);
+  assert.equal(
+    errCode(() => loaded.execute("SELECT nextval('Seq')")),
+    "42P01",
+    "the bare text folds to seq",
+  );
+  // Re-serializing the catalog is byte-identical (the reader trusts the emitted order).
+  assert.deepEqual(Database.fromImage(image).toImage(8192, 1n), image);
 });
 
 test("duplicate table name traps 42P07", () => {

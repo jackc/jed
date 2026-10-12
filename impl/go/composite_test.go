@@ -52,9 +52,9 @@ func TestCreateTypeRegistersFields(t *testing.T) {
 	if ct.Fields[1].Name != "zip" || ct.Fields[1].NotNull {
 		t.Errorf("field 1 wrong: %+v", ct.Fields[1])
 	}
-	// Case-insensitive lookup.
-	if db.CompositeType("ADDR") == nil {
-		t.Error("ADDR should resolve case-insensitively")
+	// Host-API lookup is by exact name (grammar.md §3).
+	if db.CompositeType("ADDR") != nil {
+		t.Error("ADDR must not resolve: host-API names are exact")
 	}
 }
 

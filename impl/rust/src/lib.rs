@@ -143,6 +143,14 @@ pub mod tooling {
     pub fn set_spill_dir(db: &crate::Database, dir: std::path::PathBuf) {
         db.set_spill_dir_for_test(dir);
     }
+    /// Parse SQL identifier text to a name by spec/design/grammar.md §3 (the `nextval('…')` rule:
+    /// a bare word folds to lowercase, `"…"` is exact; malformed is `42602`) — for tools (the CLI's
+    /// `--import-csv TABLE=FILE`) that take a name typed as SQL.
+    pub use crate::parser::parse_name_text;
+    /// Render a name as SQL identifier text by spec/design/grammar.md §3's quoting rule: bare when
+    /// it matches `[a-z_][a-z0-9_]*`, else double-quoted with `"` doubled — for tools (the CLI's
+    /// dump / CSV import / completion) that write names back into SQL.
+    pub use crate::parser::quote_identifier;
     pub use crate::types::{ScalarType, Type};
 
     pub mod collation {
@@ -708,6 +716,11 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // the ordering comparisons (< <= > >=) and ORDER BY; explicit-conflict 42P21, unknown 42704,
     // non-text COLLATE 42804; the `collate` cost unit. In-memory only (no persistence yet).
     "expr.collate",
+    // Identifier folding + double-quoted identifiers (spec/design/grammar.md §3): a bare identifier
+    // folds to lowercase in the lexer, a quoted identifier is the exact name and never a keyword;
+    // every name compares byte-exactly; the sequence functions' text argument parses as one
+    // identifier (42602 when malformed).
+    "query.quoted_identifiers",
     // The `AT TIME ZONE` operator (and the `timezone(zone, value)` function it desugars to) +
     // host-loaded IANA time-zone data (spec/design/timezones.md §6, grammar.md §49): convert
     // timestamptz↔timestamp through a named zone or fixed offset. A zone is provided by a host-loaded

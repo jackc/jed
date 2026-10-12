@@ -60,7 +60,7 @@ SELECT * FROM person WHERE home = ROW('Main', 90210)
   (`SELECT home.zip` where `home` is a composite column is `42P01`, exactly as PG — you must write
   `(home).zip`). This was an **oracle correction**: the original plan assumed a "bare `col.field`
   fallback" (table.column-then-column.field), but live PG rejects every unparenthesized field
-  reference, so jed matches PG (no fallback). Field lookup is case-insensitive; an unknown field is
+  reference, so jed matches PG (no fallback). Field lookup is byte-exact on the folded name ([grammar.md §3](grammar.md)); an unknown field is
   `42703`, a non-composite base `42809`. `(expr).*` expands a composite into one output column per
   field (declaration order) and is a **projection-list** construct only — `.*` in a scalar position
   is `0A000`.
@@ -101,7 +101,7 @@ layout in [../fileformat/format.md](../fileformat/format.md)):
 
 - **Every catalog entry gains a leading `entry_kind u8`**: `0` = a table entry (the v8 shape,
   unchanged after the tag byte), `1` = a composite-type entry. Composite-type entries are emitted
-  **first** (ascending lowercased-name order), then the table entries (ascending lowercased-name
+  **first** (ascending name byte order), then the table entries (ascending name byte
   order); `item_count` per catalog page counts all entries, packed greedily exactly as before.
   This keeps the catalog a uniform "sequence of entries" — no special head page, no separate page
   chain, no meta-page change.

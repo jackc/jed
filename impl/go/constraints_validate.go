@@ -3,7 +3,6 @@ package jed
 import (
 	"slices"
 	"strconv"
-	"strings"
 )
 
 // Structural validation of CHECK and column DEFAULT expressions (spec/design/constraints.md). A
@@ -325,7 +324,7 @@ func checkReferencedColumns(e exprNode, columns []catColumn) []int {
 	var walk func(e exprNode)
 	note := func(name string) {
 		for i := range columns {
-			if strings.EqualFold(columns[i].Name, name) {
+			if columns[i].Name == name {
 				if !slices.Contains(out, i) {
 					out = append(out, i)
 				}
@@ -707,15 +706,15 @@ func indexExprFirstParam(e exprNode) (uint64, bool) {
 }
 
 // indexNamePart is the auto-name part for one index key element (spec/design/indexes.md §2, PG's
-// ChooseIndexColumnNames): a column key contributes its (lowercased) column name; a bare-function-
+// ChooseIndexColumnNames): a column key contributes its (exact) column name; a bare-function-
 // call expression its function name (`lower(email)` → `lower`); any other expression the literal
 // `expr`.
 func indexNamePart(elem indexKeyElem) string {
 	if elem.Expr == nil {
-		return strings.ToLower(elem.Column)
+		return elem.Column
 	}
 	if elem.Expr.Kind == exprFuncCall {
-		return strings.ToLower(elem.Expr.FuncCall.Name)
+		return elem.Expr.FuncCall.Name
 	}
 	return "expr"
 }

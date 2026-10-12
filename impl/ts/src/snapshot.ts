@@ -29,6 +29,7 @@ import { loadedCollation, versionSkew } from "./collation.ts";
 import { engineError } from "./errors.ts";
 import type { Entry, Row } from "./storage.ts";
 import { compareBytes } from "./pmap.ts";
+import { compareTextC } from "./value.ts";
 import { pagePayload } from "./format.ts";
 import { compositeRefName } from "./types.ts";
 import type { FkDependent } from "./executor.ts";
@@ -57,7 +58,7 @@ export class Snapshot {
   private estimatorRevisions: Map<string, object> = new Map();
   statistics: Map<string, Map<number, ColumnStatistics>> = new Map();
   tables: Map<string, Table>;
-  // types holds the user-defined composite (row) types, keyed by lowercased name
+  // types holds the user-defined composite (row) types, keyed by exact name
   // (spec/design/composite.md). A database-level object set, separate from tables; serialized into
   // the catalog's composite-type entries (spec/fileformat/format.md). Sorted by key when serialized
   // so map-iteration order never leaks (CLAUDE.md §8). CompositeType objects are never mutated in
@@ -66,11 +67,11 @@ export class Snapshot {
   stores: Map<string, TableStore>;
   // indexStores holds each secondary index's B-tree (spec/design/indexes.md §3): a
   // TableStore with ZERO value columns (entry keys only — the on-disk empty-payload
-  // record), keyed by the lowercased index name (index names live in the relation
+  // record), keyed by the exact index name (index names live in the relation
   // namespace, globally unique). Which table owns an index is recorded in that table's
   // indexes list.
   indexStores: Map<string, TableStore>;
-  // sequences holds the database-level sequences, keyed by lowercased name
+  // sequences holds the database-level sequences, keyed by exact name
   // (spec/design/sequences.md). A separate object set from tables/types; serialized into the
   // catalog's sequence entries (spec/fileformat/format.md, entry_kind = 2). The mutable counter
   // (lastValue/isCalled) lives here, so nextval advances the working snapshot and rolls back with
@@ -88,7 +89,7 @@ export class Snapshot {
   // An un-annotated text column inherits this at CREATE TABLE. Persisted as the is_default flag bit
   // on that collation's entry_kind = 3 reference entry, restored on load.
   defaultCollation: string | null;
-  // gistTrees holds each GiST index's resident R-tree (spec/design/gist.md §4.1), keyed by lowercased
+  // gistTrees holds each GiST index's resident R-tree (spec/design/gist.md §4.1), keyed by exact
   // index name. The leaf-key store (indexStores) stays the maintained source of truth; this tree is
   // the acceleration structure the planner descends. Rebuilt CANONICALLY (buildGistFromLeafKeys —
   // content-deterministic, gist.md §3) at every mutating statement and on load. Never mutated in
@@ -208,7 +209,7 @@ export class Snapshot {
   }
 
   estimatorRevisionFor(name: string): object {
-    return this.estimatorRevisionForKey(name.toLowerCase());
+    return this.estimatorRevisionForKey(name);
   }
 
   estimatorRevisionForKey(key: string): object {
@@ -216,16 +217,16 @@ export class Snapshot {
   }
 
   bumpEstimatorRevision(name: string): void {
-    this.estimatorRevisions.set(name.toLowerCase(), {});
+    this.estimatorRevisions.set(name, {});
   }
 
   columnStatistics(table: string, column: number): ColumnStatistics | undefined {
-    return this.statistics.get(table.toLowerCase())?.get(column);
+    return this.statistics.get(table)?.get(column);
   }
 
   putColumnStatistics(table: string, column: number, statistics: ColumnStatistics): void {
     this.dataGen++;
-    const key = table.toLowerCase();
+    const key = table;
     let columns = this.statistics.get(key);
     if (columns === undefined) {
       columns = new Map();
@@ -236,26 +237,26 @@ export class Snapshot {
 
   markStatisticsStale(table: string): void {
     this.dataGen++;
-    const columns = this.statistics.get(table.toLowerCase());
+    const columns = this.statistics.get(table);
     if (columns === undefined) return;
     for (const statistics of columns.values()) statistics.stale = true;
   }
 
   clearStatistics(table: string): void {
     this.dataGen++;
-    this.statistics.delete(table.toLowerCase());
+    this.statistics.delete(table);
   }
 
   clearColumnStatistics(table: string, column: number): void {
     this.dataGen++;
-    const key = table.toLowerCase();
+    const key = table;
     const columns = this.statistics.get(key);
     if (columns === undefined) return;
     columns.delete(column);
     if (columns.size === 0) this.statistics.delete(key);
   }
 
-  // gistTreeFor returns the resident GiST R-tree of the named index (lowercased key), or undefined if
+  // gistTreeFor returns the resident GiST R-tree of the named index (exact key), or undefined if
   // the index is not GiST / not present (spec/design/gist.md §4.1).
   gistTreeFor(nameKey: string): GistTree | undefined {
     return this.gistTrees.get(nameKey);
@@ -275,7 +276,7 @@ export class Snapshot {
         // One opclass per indexed column (gist.md §7): single for a GX1/GX2 index, one per WITH
         // column for an EXCLUDE backing index.
         specs.push({
-          nameKey: idx.name.toLowerCase(),
+          nameKey: idx.name,
           ops: indexColumnOrdinals(idx)!.map((ci) => gistOpclassFor(t.columns[ci]!.type)),
         });
       }
@@ -343,25 +344,25 @@ export class Snapshot {
     return [cat.unicodeVersion, cat.cldrVersion, loaded[0], loaded[1]];
   }
 
-  // table looks up a table definition by name (case-insensitive).
+  // table looks up a table definition by exact name.
   table(name: string): Table | undefined {
-    return this.tables.get(name.toLowerCase());
+    return this.tables.get(name);
   }
 
   tableByKey(key: string): Table | undefined {
     return this.tables.get(key);
   }
 
-  // compositeType looks up a composite type definition by name (case-insensitive).
+  // compositeType looks up a composite type definition by exact name.
   compositeType(name: string): CompositeType | undefined {
-    return this.types.get(name.toLowerCase());
+    return this.types.get(name);
   }
 
-  // putType registers a composite type (CREATE TYPE). Lower-cased name is the key. The caller has
+  // putType registers a composite type (CREATE TYPE). The exact name is the key. The caller has
   // already resolved field types and checked for a duplicate.
   putType(ty: CompositeType): void {
     this.bumpCatGen();
-    this.types.set(ty.name.toLowerCase(), ty);
+    this.types.set(ty.name, ty);
   }
 
   // removeType removes a composite type (DROP TYPE). The caller has checked there are no dependents.
@@ -370,30 +371,30 @@ export class Snapshot {
     this.types.delete(key);
   }
 
-  // tablesSorted is all tables in ascending lowercased-name order — a deterministic order with no
+  // tablesSorted is all tables in ascending name byte order — a deterministic order with no
   // map-iteration leak (CLAUDE.md §8); the jed_tables / jed_columns generation order
   // (spec/design/introspection.md §5).
   tablesSorted(): Table[] {
-    return [...this.tables.keys()].sort().map((k) => this.tables.get(k)!);
+    return [...this.tables.keys()].sort(compareTextC).map((k) => this.tables.get(k)!);
   }
 
-  // compositeTypesSorted is all composite types in ascending lowercased-name order — the on-disk
+  // compositeTypesSorted is all composite types in ascending name byte order — the on-disk
   // emission order (spec/fileformat/format.md) and a deterministic order with no map-iteration leak
   // (§8). Keys are ASCII (so code-unit sort == byte sort).
   compositeTypesSorted(): CompositeType[] {
-    return [...this.types.keys()].sort().map((k) => this.types.get(k)!);
+    return [...this.types.keys()].sort(compareTextC).map((k) => this.types.get(k)!);
   }
 
-  // sequence looks up a sequence by name (case-insensitive).
+  // sequence looks up a sequence by exact name.
   sequence(name: string): SequenceDef | undefined {
-    return this.sequences.get(name.toLowerCase());
+    return this.sequences.get(name);
   }
 
-  // putSequence registers a sequence (CREATE SEQUENCE). Lower-cased name is the key. The caller has
+  // putSequence registers a sequence (CREATE SEQUENCE). The exact name is the key. The caller has
   // already validated the option set and checked the relation namespace for a collision.
   putSequence(seq: SequenceDef): void {
     this.dataGen++;
-    this.sequences.set(seq.name.toLowerCase(), seq);
+    this.sequences.set(seq.name, seq);
   }
 
   // removeSequence removes a sequence (DROP SEQUENCE). The caller has checked it exists.
@@ -402,10 +403,10 @@ export class Snapshot {
     this.sequences.delete(key);
   }
 
-  // sequencesSorted is all sequences in ascending lowercased-name order — the on-disk emission
+  // sequencesSorted is all sequences in ascending name byte order — the on-disk emission
   // order (spec/fileformat/format.md) and a deterministic order with no map-iteration leak (§8).
   sequencesSorted(): SequenceDef[] {
-    return [...this.sequences.keys()].sort().map((k) => this.sequences.get(k)!);
+    return [...this.sequences.keys()].sort(compareTextC).map((k) => this.sequences.get(k)!);
   }
 
   // referencedCollations is the collations the database SCHEMA references — every column's frozen
@@ -423,7 +424,7 @@ export class Snapshot {
       }
     }
     if (this.defaultCollation !== null) names.add(this.defaultCollation);
-    return [...names].sort().map((name) => {
+    return [...names].sort(compareTextC).map((name) => {
       const c = this.resolveCollation(name);
       if (c === undefined) {
         throw engineError(
@@ -456,7 +457,7 @@ export class Snapshot {
 
     // Sorted table order (no Map-iteration leak, CLAUDE.md §8; the per-table rebuilds are independent
     // and the re-pin is order-free, so the result is order-invariant regardless).
-    for (const key of [...this.tables.keys()].sort()) {
+    for (const key of [...this.tables.keys()].sort(compareTextC)) {
       const table = this.tables.get(key)!;
       // A collated PK re-encode moves every storage key ⇒ a full table rewrite, and an index entry
       // carries the storage key as its suffix (indexes.md §3) ⇒ every index of the table is rebuilt.
@@ -516,7 +517,7 @@ export class Snapshot {
         ekeys.sort(compareBytes);
         const fresh = new TableStore(pagePayload(pageSize), []);
         for (const ek of ekeys) fresh.insert(ek, []);
-        this.putIndexStore(def.name.toLowerCase(), fresh);
+        this.putIndexStore(def.name, fresh);
       }
     }
     // Advance each skewed collation's pin to the loaded version.
@@ -531,30 +532,30 @@ export class Snapshot {
     return skewed.size;
   }
 
-  // sequencesOwnedBy returns the lowercased keys of every sequence OWNED BY the table `name`
-  // (case-insensitive) — the serial-created sequences DROP TABLE must auto-drop
+  // sequencesOwnedBy returns the exact keys of every sequence OWNED BY the table `name`
+  // (exact) — the serial-created sequences DROP TABLE must auto-drop
   // (spec/design/sequences.md §12). Sorted so the auto-drop is deterministic (no map-iteration
   // leak, §8).
   sequencesOwnedBy(name: string): string[] {
-    const lower = name.toLowerCase();
+    const lower = name;
     const keys: string[] = [];
     for (const [k, s] of this.sequences) {
-      if (s.ownedBy !== undefined && s.ownedBy.table.toLowerCase() === lower) keys.push(k);
+      if (s.ownedBy !== undefined && s.ownedBy.table === lower) keys.push(k);
     }
-    return keys.sort();
+    return keys.sort(compareTextC);
   }
 
   // compositeDependent reports whether any table column or composite-type field still references the
-  // composite type `name` (case-insensitive) — the DROP TYPE ... RESTRICT dependency check (2BP01).
+  // composite type `name` (exact) — the DROP TYPE ... RESTRICT dependency check (2BP01).
   // Returns the first dependent's description for the error detail, or null if there are none.
   compositeDependent(name: string): string | null {
-    const key = name.toLowerCase();
+    const key = name;
     // compositeRefName looks through one array level, so an addr[] column / field counts as a
     // dependent of addr exactly as a bare addr one does (spec/design/array.md §12).
     for (const t of this.tables.values()) {
       for (const c of t.columns) {
         const r = compositeRefName(c.type);
-        if (r !== null && r.toLowerCase() === key) {
+        if (r !== null && r === key) {
           return `column ${c.name} of table ${t.name}`;
         }
       }
@@ -562,7 +563,7 @@ export class Snapshot {
     for (const ct of this.types.values()) {
       for (const f of ct.fields) {
         const r = compositeRefName(f.type);
-        if (r !== null && r.toLowerCase() === key) {
+        if (r !== null && r === key) {
           return `field ${f.name} of type ${ct.name}`;
         }
       }
@@ -570,21 +571,21 @@ export class Snapshot {
     return null;
   }
 
-  // fkDependentsExcluding returns every FK on a table NOT in `dropping` (a set of lowercased table
+  // fkDependentsExcluding returns every FK on a table NOT in `dropping` (a set of exact table
   // keys) that references a table that IS in `dropping` — the dependency scan for a multi-table
   // DROP TABLE (spec/design/grammar.md §13, constraints.md §6.10). A dependent whose referencing
   // table is itself being dropped does not count (the drop-set exclusion), so a FK between two
   // tables both named in the same statement never blocks. Referencing tables are scanned in
-  // ascending lowercased key order (each table's fks is already name-ordered) for determinism (§8).
+  // ascending key byte order (each table's fks is already name-ordered) for determinism (§8).
   // RESTRICT raises 2BP01 on the first entry; CASCADE removes every entry's FK.
   fkDependentsExcluding(dropping: Set<string>): FkDependent[] {
     const out: FkDependent[] = [];
-    const tkeys = [...this.tables.keys()].sort();
+    const tkeys = [...this.tables.keys()].sort(compareTextC);
     for (const tk of tkeys) {
       if (dropping.has(tk)) continue; // the referencing table is itself being dropped — no dependency
       const t = this.tables.get(tk)!;
       for (const fk of t.fks) {
-        const refKey = fk.refTable.toLowerCase();
+        const refKey = fk.refTable;
         if (dropping.has(refKey)) {
           const droppedName = this.tables.get(refKey)?.name ?? fk.refTable;
           out.push({
@@ -608,7 +609,7 @@ export class Snapshot {
     const old = this.tables.get(tableKey);
     if (old === undefined) return;
     this.bumpCatGen();
-    const fks = old.fks.filter((fk) => fk.name.toLowerCase() !== fkName.toLowerCase());
+    const fks = old.fks.filter((fk) => fk.name !== fkName);
     this.tables.set(tableKey, { ...old, fks });
   }
 
@@ -660,7 +661,7 @@ export class Snapshot {
       if (ct) {
         for (const f of ct.fields) {
           const r = compositeRefName(f.type);
-          if (r !== null) child = Math.max(child, visit(r.toLowerCase(), levelsAbove + 1));
+          if (r !== null) child = Math.max(child, visit(r, levelsAbove + 1));
         }
       }
       const depth = 1 + child;
@@ -680,7 +681,7 @@ export class Snapshot {
   }
 
   // compositeTypeDepth returns the composite-type nesting depth of ty against this snapshot's type
-  // catalog, memoized in cache (lowercased name → depth): a scalar is 0, T[] is depth(T) (array
+  // catalog, memoized in cache (exact name → depth): a scalar is 0, T[] is depth(T) (array
   // levels are not composite levels — compositeRefName looks through one array level the same way),
   // and a composite is 1 + max(field depths) (an empty composite is 1). The CREATE TYPE gate uses
   // this against the *existing* catalog, every type of which already satisfies depth ≤
@@ -689,7 +690,7 @@ export class Snapshot {
   compositeTypeDepth(ty: Type, cache: Map<string, number>): number {
     const r = compositeRefName(ty);
     if (r === null) return 0; // a scalar (or a scalar array) adds no composite level
-    const key = r.toLowerCase();
+    const key = r;
     const cached = cache.get(key);
     if (cached !== undefined) return cached;
     const def = this.types.get(key);
@@ -705,7 +706,7 @@ export class Snapshot {
 
   // store returns a table's store (the table is known to exist).
   store(name: string): TableStore {
-    return this.stores.get(name.toLowerCase())!;
+    return this.stores.get(name)!;
   }
 
   // putTable registers a new table and its empty store. The store carries the page payload cap (=
@@ -728,7 +729,7 @@ export class Snapshot {
   // putTable resolves against this.types and delegates here.
   putTableResolved(t: Table, colTypes: ColType[], pageSize: number): void {
     this.bumpCatGen();
-    const key = t.name.toLowerCase();
+    const key = t.name;
     const st = new TableStore(pagePayload(pageSize), colTypes);
     // Bind the domain's pager (Snapshot.storePaging) so the new store demand-pages like a loaded one:
     // its committed leaves demote at each commit (demoteCleanLeaves) and fault back through the pool,
@@ -746,19 +747,19 @@ export class Snapshot {
   removeTable(key: string): void {
     this.bumpCatGen();
     const t = this.tables.get(key);
-    if (t) for (const idx of t.indexes) this.indexStores.delete(idx.name.toLowerCase());
+    if (t) for (const idx of t.indexes) this.indexStores.delete(idx.name);
     this.tables.delete(key);
     this.stores.delete(key);
     this.estimatorRevisions.delete(key);
   }
 
   // indexStore returns a secondary index's store (the index is known to exist). nameKey
-  // is the lowercased index name.
+  // is the exact index name.
   indexStore(nameKey: string): TableStore {
     return this.indexStores.get(nameKey)!;
   }
 
-  // hasIndexStore reports whether this snapshot holds a store for the named index (lowercased key).
+  // hasIndexStore reports whether this snapshot holds a store for the named index (exact key).
   // Used to route index access to the session temp snapshot vs the main snapshot (temp-tables.md §2).
   hasIndexStore(nameKey: string): boolean {
     return this.indexStores.has(nameKey);
@@ -775,12 +776,12 @@ export class Snapshot {
   }
 
   // putIndex registers a new (empty) secondary index on tableKey: insert its definition
-  // into the table's indexes in ascending lowercased-name order (the catalog/planner
+  // into the table's indexes in ascending name byte order (the catalog/planner
   // order — spec/design/indexes.md §6) and create its zero-column store. The Table object
   // is re-allocated (catalog Tables are never mutated in place — snapshots share them).
   putIndex(tableKey: string, def: IndexDef, pageSize: number): void {
     this.bumpCatGen();
-    const nameKey = def.name.toLowerCase();
+    const nameKey = def.name;
     const fresh = new TableStore(pagePayload(pageSize), []);
     // Bind the domain pager, like putTableResolved / putIndexStore.
     if (this.storePaging !== null) fresh.attachPaging(this.storePaging);
@@ -788,7 +789,7 @@ export class Snapshot {
     const old = this.tables.get(tableKey)!;
     let pos = old.indexes.length;
     for (let i = 0; i < old.indexes.length; i++) {
-      if (old.indexes[i]!.name.toLowerCase() > nameKey) {
+      if (compareTextC(old.indexes[i]!.name, nameKey) > 0) {
         pos = i;
         break;
       }
@@ -818,7 +819,7 @@ export class Snapshot {
     indexRename?: { oldName: string; newName: string },
   ): void {
     this.bumpCatGen();
-    const newKey = renameTable ? table.name.toLowerCase() : oldKey;
+    const newKey = renameTable ? table.name : oldKey;
     if (renameTable) {
       this.tables.delete(oldKey);
       const store = this.stores.get(oldKey);
@@ -834,8 +835,8 @@ export class Snapshot {
     }
     this.tables.set(newKey, table);
     if (indexRename) {
-      const old = indexRename.oldName.toLowerCase();
-      const next = indexRename.newName.toLowerCase();
+      const old = indexRename.oldName;
+      const next = indexRename.newName;
       const store = this.indexStores.get(old);
       if (store) {
         this.indexStores.delete(old);
@@ -849,16 +850,14 @@ export class Snapshot {
     }
     if (!renameTable) return;
     for (const [key, old] of [...this.tables]) {
-      if (!old.fks.some((fk) => fk.refTable.toLowerCase() === oldKey)) continue;
+      if (!old.fks.some((fk) => fk.refTable === oldKey)) continue;
       this.tables.set(key, {
         ...old,
-        fks: old.fks.map((fk) =>
-          fk.refTable.toLowerCase() === oldKey ? { ...fk, refTable: table.name } : fk,
-        ),
+        fks: old.fks.map((fk) => (fk.refTable === oldKey ? { ...fk, refTable: table.name } : fk)),
       });
     }
     for (const [key, seq] of [...this.sequences]) {
-      if (seq.ownedBy?.table.toLowerCase() === oldKey) {
+      if (seq.ownedBy?.table === oldKey) {
         this.sequences.set(key, { ...seq, ownedBy: { ...seq.ownedBy, table: table.name } });
       }
     }
@@ -871,7 +870,7 @@ export class Snapshot {
     nextRowid: bigint,
     pageSize: number,
   ): void {
-    const key = table.name.toLowerCase();
+    const key = table.name;
     const statistics = this.statistics.get(key);
     this.putTableResolved(table, colTypes, pageSize);
     if (statistics !== undefined) this.statistics.set(key, statistics);
@@ -888,15 +887,15 @@ export class Snapshot {
     entries: Map<string, Uint8Array[]>,
     pageSize: number,
   ): void {
-    const live = new Set(next.indexes.map((i) => i.name.toLowerCase()));
+    const live = new Set(next.indexes.map((i) => i.name));
     for (const i of old.indexes)
-      if (!live.has(i.name.toLowerCase())) {
-        this.indexStores.delete(i.name.toLowerCase());
-        this.gistTrees.delete(i.name.toLowerCase());
+      if (!live.has(i.name)) {
+        this.indexStores.delete(i.name);
+        this.gistTrees.delete(i.name);
       }
-    const prior = new Set(old.indexes.map((i) => i.name.toLowerCase()));
+    const prior = new Set(old.indexes.map((i) => i.name));
     for (const i of next.indexes) {
-      const k = i.name.toLowerCase();
+      const k = i.name;
       const rebuild = entries.has(k);
       if (prior.has(k) && !rebuild) continue;
       if (rebuild) {
@@ -917,12 +916,12 @@ export class Snapshot {
     pageSize: number,
   ): void {
     for (const index of old.indexes) {
-      const key = index.name.toLowerCase();
+      const key = index.name;
       this.indexStores.delete(key);
       this.gistTrees.delete(key);
     }
     for (const index of next.indexes) {
-      const key = index.name.toLowerCase();
+      const key = index.name;
       const store = new TableStore(pagePayload(pageSize), []);
       if (this.storePaging !== null) store.attachPaging(this.storePaging);
       for (const entry of entries.get(key) ?? []) store.insert(entry, []);
@@ -939,10 +938,10 @@ export class Snapshot {
   ): void {
     this.bumpCatGen(); // catalog writes below bypass the generation-bumping funnels
     for (const [key, child] of [...this.tables]) {
-      if (child.name.toLowerCase() === parent.toLowerCase()) continue;
+      if (child.name === parent) continue;
       let changed = false;
       const fks = child.fks.flatMap((fk) => {
-        if (fk.refTable.toLowerCase() !== parent.toLowerCase()) return [fk];
+        if (fk.refTable !== parent) return [fk];
         const mapped = fk.refColumns.map((old) => originalToNew[old] ?? -1);
         if (mapped.some((column) => column < 0)) {
           changed = true;
@@ -954,11 +953,7 @@ export class Snapshot {
       if (changed) this.tables.set(key, { ...child, fks });
     }
     for (const [key, seq] of [...this.sequences]) {
-      if (
-        pendingSequences.has(key) ||
-        seq.ownedBy === undefined ||
-        seq.ownedBy.table.toLowerCase() !== parent.toLowerCase()
-      )
+      if (pendingSequences.has(key) || seq.ownedBy === undefined || seq.ownedBy.table !== parent)
         continue;
       const column = originalToNew[seq.ownedBy.column] ?? -1;
       if (column < 0) this.sequences.delete(key);
@@ -966,7 +961,7 @@ export class Snapshot {
     }
   }
 
-  // putIndexStore registers a loaded index store under its (lowercased) name — the file
+  // putIndexStore registers a loaded index store under its (exact) name — the file
   // loader's hook (format.ts): the owning table's indexes list came from its catalog
   // entry, so only the store is registered here.
   putIndexStore(nameKey: string, store: TableStore): void {
@@ -982,19 +977,19 @@ export class Snapshot {
     this.bumpCatGen();
     const old = this.tables.get(tableKey);
     if (old) {
-      const indexes = old.indexes.filter((ix) => ix.name.toLowerCase() !== nameKey);
+      const indexes = old.indexes.filter((ix) => ix.name !== nameKey);
       this.tables.set(tableKey, { ...old, indexes });
     }
     this.indexStores.delete(nameKey);
   }
 
-  // findIndex finds the table owning the named index (case-insensitive):
+  // findIndex finds the table owning the named index (exact name):
   // [tableKey, def] or null.
   findIndex(name: string): [string, IndexDef] | null {
-    const key = name.toLowerCase();
+    const key = name;
     for (const [tk, t] of this.tables) {
       for (const ix of t.indexes) {
-        if (ix.name.toLowerCase() === key) return [tk, ix];
+        if (ix.name === key) return [tk, ix];
       }
     }
     return null;
@@ -1004,7 +999,7 @@ export class Snapshot {
   // Every value is fully materialized — the helper's callers compare whole rows, so no
   // unfetched reference may escape (large-values.md §14).
   rowsInKeyOrder(name: string): Row[] {
-    const store = this.stores.get(name.toLowerCase());
+    const store = this.stores.get(name);
     return store ? store.iterInKeyOrder().map((r) => store.resolveAll(r)) : [];
   }
 }
@@ -1036,13 +1031,13 @@ export type ActiveTx = {
   mainDirty: boolean;
   tempDirty: boolean;
   // attachWorking is the transaction's working copy of a host-attached database's snapshot
-  // (spec/design/attached-databases.md §5), keyed by lowercased attachment name — the attachment
+  // (spec/design/attached-databases.md §5), keyed by exact attachment name — the attachment
   // analogue of tempWorking. Cloned lazily from Engine.attachedCommitted[name] on the first write to
   // that attachment (attachWriteSnap), so a read-only cross-attachment query allocates nothing here.
   // Adopted into attachedCommitted + persisted+published on a successful COMMIT, discarded on ROLLBACK.
   // undefined until an attachment is written.
   attachWorking?: Map<string, Snapshot>;
-  // attachDirty records which attachments this transaction mutated (lowercased names), the
+  // attachDirty records which attachments this transaction mutated (exact names), the
   // per-attachment analogue of mainDirty/tempDirty — the set the commit persists + publishes.
   attachDirty?: Set<string>;
 };

@@ -54,6 +54,7 @@ export type SqlState =
   | "dependent_objects_still_exist" // 2BP01 — cannot drop type {name} because other objects depend on it: {detail}
   | "external_routine_exception" // 38000 — host function {name} raised {detail}
   | "syntax_error" // 42601 — syntax error: {detail}
+  | "invalid_name" // 42602 — invalid name syntax
   | "undefined_table" // 42P01 — table does not exist: {name}
   | "undefined_column" // 42703 — column does not exist: {name}
   | "ambiguous_column" // 42702 — column reference {name} is ambiguous
@@ -145,6 +146,7 @@ const CODES: Record<SqlState, string> = {
   dependent_objects_still_exist: "2BP01",
   external_routine_exception: "38000",
   syntax_error: "42601",
+  invalid_name: "42602",
   undefined_table: "42P01",
   undefined_column: "42703",
   ambiguous_column: "42702",
@@ -252,6 +254,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "2BP01", name: "dependent_objects_still_exist", class: "dependent objects still exist" },
   { code: "38000", name: "external_routine_exception", class: "external routine exception" },
   { code: "42601", name: "syntax_error", class: "syntax error or access rule violation" },
+  { code: "42602", name: "invalid_name", class: "syntax error or access rule violation" },
   { code: "42P01", name: "undefined_table", class: "syntax error or access rule violation" },
   { code: "42703", name: "undefined_column", class: "syntax error or access rule violation" },
   { code: "42702", name: "ambiguous_column", class: "syntax error or access rule violation" },

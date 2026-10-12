@@ -55,9 +55,9 @@ is never an arbiter.)
   unique index / PK has exactly that column set → **`42P10`** (*there is no unique or
   exclusion constraint matching the ON CONFLICT specification*). When more than one matches
   (jed folds identical-list uniques, so this is rare), the **primary key wins**, then unique
-  indexes in ascending lowercased-name order (the catalog's standing deterministic order,
+  indexes in ascending name byte order (the catalog's standing deterministic order,
   constraints.md §5.4).
-- **`ON CONSTRAINT name`.** Case-insensitively (CLAUDE.md §1): the synthesized
+- **`ON CONSTRAINT name`.** By exact name ([grammar.md §3](grammar.md)): the synthesized
   **`<table>_pkey`** names the primary key (jed does not persist that name but accepts it as
   an arbiter spelling — symmetric with the `23505` message, constraints.md §5.4); otherwise
   a **unique index** of that name. A name matching neither — including a *non-unique* index —
@@ -211,7 +211,7 @@ an `ON CONFLICT`-specific message needs no registry edit. The codes:
   two-phase / all-or-nothing model. A value *swap* under `DO UPDATE` succeeds where PG's
   per-row check could fail on the transient.
 - **Which constraint name a `23505` reports** when several are violated follows jed's standing
-  deterministic order (PK first, then unique indexes by lowercased name), not PG's
+  deterministic order (PK first, then unique indexes by name byte order), not PG's
   index-creation order (constraints.md §5.4). The code is identical.
 - **No `INSERT INTO t AS alias`.** Table aliasing on `INSERT` is not in the grammar this
   slice, so the existing row is referenced by the table's own name (PG allows an alias). A

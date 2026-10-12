@@ -68,6 +68,26 @@ scans the whole child table, and each action scans it once per statement. Create
 starts with the foreign-key columns (or make them the leading primary-key columns), and each check
 or action becomes one index lookup per parent row. This work counts toward a session's `max_cost`.
 
+## Names and quoted identifiers
+
+Names follow PostgreSQL's rules. A bare name is folded to lowercase, so `Orders`, `ORDERS`, and
+`orders` are the same table. A name in double quotes keeps its exact spelling, so it can hold
+uppercase letters, spaces, or a keyword such as `order`. Write a literal `"` inside one by doubling
+it. After folding, names match exactly: `"userId"` must be written with quotes everywhere you use
+it, and `"Orders"` is a different table from `orders`.
+
+```sql
+CREATE TABLE Orders (Id i32 PRIMARY KEY, "userId" i32, "order" text);
+SELECT id, "userId", "order" FROM orders;   -- the table is orders, the column id
+SELECT userId FROM orders;                  -- error 42703: userid does not exist
+SELECT 1 AS Total, 2 AS "Total";            -- columns named total and Total
+```
+
+Built-in function and type names are lowercase, so `LOWER(x)` works but `"LOWER"(x)` does not. The
+name passed to `nextval('…')` is read the same way: `nextval('MySeq')` means `myseq`, and
+`nextval('"MySeq"')` means `MySeq`. A name may be at most 63 bytes (error `42622`). Names that start
+with `jed_` are reserved for jed's own catalog relations (error `42939`).
+
 ## Applying defaults
 
 Omitting a column or using `DEFAULT` in a VALUES slot applies its declared default. To insert one

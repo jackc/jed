@@ -67,7 +67,7 @@ pub type HostBatchKernel = Box<dyn Fn(&[Vec<Value>], &mut Vec<Value>) -> Result<
 /// One registered host scalar function (extensibility.md §4.2). Built with [`HostFunction::new`]
 /// (safe defaults: `Volatile`, not cross-core, unit cost) and refined with the builder setters.
 pub struct HostFunction {
-    /// Lowercased function name (SQL identifiers are case-insensitive).
+    /// The exact function name (host-API names are verbatim — grammar.md §3).
     pub(crate) name: String,
     /// The exact scalar argument signature; overload resolution matches resolved arg types by
     /// equality against this (§4.2).
@@ -135,7 +135,7 @@ impl HostFunction {
         kernel: Kernel,
     ) -> Self {
         HostFunction {
-            name: name.into().to_ascii_lowercase(),
+            name: name.into().to_string(),
             arg_types,
             result,
             volatility: Volatility::Volatile,
@@ -325,7 +325,7 @@ impl ExtensionRegistry {
         Ok(())
     }
 
-    /// Whether any registered host function has this (lowercased) name — the resolve-time routing
+    /// Whether any registered host function has this (exact) name — the resolve-time routing
     /// gate (a host-only name is still routed to scalar-function resolution).
     pub(crate) fn has_function(&self, name: &str) -> bool {
         self.functions.iter().any(|f| f.name == name)

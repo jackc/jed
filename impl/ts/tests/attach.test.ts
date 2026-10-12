@@ -226,13 +226,18 @@ test("detach while a reader is live is 55006", () => {
   db.detach("mydb"); // now succeeds
 });
 
-// TestAttachNameErrors — a reserved name (main/temp) or an already-attached name is 42710; detaching
-// an unknown / reserved database is 42704. Both are case-insensitive.
+// TestAttachNameErrors — a reserved name (main/temp) or an already-attached name is 42710 (exact
+// names); detaching an unknown / reserved database is 42704.
 test("reserved / duplicate attach names are 42710; unknown detach is 42704", () => {
   const db = memDb();
   db.attach("mydb", attachMemory(), false);
-  for (const name of ["main", "temp", "MAIN", "Temp", "mydb", "MyDB"]) {
+  for (const name of ["main", "temp", "mydb"]) {
     assert.equal(attachErrCode(db, name), "42710", `attach ${name}`);
+  }
+  // Host-API names are exact (grammar.md §3): a different letter case is a different name, so it
+  // collides with neither a reserved scope nor an existing attachment.
+  for (const name of ["MAIN", "Temp", "MyDB"]) {
+    db.attach(name, attachMemory(), false);
   }
   for (const name of ["nope", "main", "temp"]) {
     assert.equal(detachErrCode(db, name), "42704", `detach ${name}`);
@@ -471,17 +476,21 @@ test("file attach: missing file is 58P01, leaves the name free", () => {
   }
 });
 
-// TestAttachCaseInsensitiveQualifier — an attachment is reached case-insensitively by its qualifier
-// (unquoted identifiers fold to lower case), matching how main/temp resolve.
-test("attachment qualifier is case-insensitive", () => {
+// TestAttachNamesAreExact — a host-API attach name is taken VERBATIM as an exact name (grammar.md
+// §3): attach("Reports") is reached from SQL only by the quoted "Reports" qualifier, while a bare
+// reports / REPORTS folds to reports and names nothing; attach("reports") is reached by any bare
+// spelling.
+test("attachment names are exact", () => {
   const db = memDb();
   db.attach("Reports", attachMemory(), false);
   const s = db.session();
-  s.execute("CREATE TABLE reports.sales (id i32 PRIMARY KEY)");
-  s.execute("INSERT INTO REPORTS.sales VALUES (1)");
-  const rows = s.query("SELECT id FROM Reports.sales");
-  let n = 0;
-  for (const _ of rows) n++;
-  rows.close();
-  assert.equal(n, 1);
+  s.execute('CREATE TABLE "Reports".sales (id i32 PRIMARY KEY)');
+  s.execute('INSERT INTO "Reports".sales VALUES (1)');
+  assert.deepEqual(intCol(s, 'SELECT id FROM "Reports".sales'), [1n]);
+  assert.equal(errCode(s, "SELECT id FROM Reports.sales"), "42P01", "a bare qualifier folds");
+  db.attach("reports", attachMemory(), false); // distinct from Reports
+  s.execute("CREATE TABLE REPORTS.sales (id i32 PRIMARY KEY)");
+  s.execute("INSERT INTO Reports.sales VALUES (2)");
+  assert.deepEqual(intCol(s, "SELECT id FROM reports.sales"), [2n]);
+  assert.deepEqual(intCol(s, 'SELECT id FROM "Reports".sales'), [1n]);
 });

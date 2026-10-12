@@ -143,7 +143,7 @@ fn in_memory_compaction_lowers_storage_bytes() {
     let before = db.storage_bytes("main").unwrap();
     let (rows, cost) = rows_and_cost(&db, PROBE);
     let version = db.version();
-    db.compact("MAIN").unwrap();
+    db.compact("main").unwrap();
     assert!(db.storage_bytes("main").unwrap() * 4 < before);
     assert_eq!(db.version(), version + 1);
     assert_eq!(rows_and_cost(&db, PROBE), (rows, cost));
@@ -230,7 +230,7 @@ fn attachments_compact_independently() {
     db.attach("scratch", AttachSource::memory(), false).unwrap();
     let main_version = db.version();
     let before = std::fs::metadata(&work).unwrap().len();
-    db.compact("Work").unwrap();
+    db.compact("work").unwrap();
     db.compact("scratch").unwrap();
     assert!(std::fs::metadata(&work).unwrap().len() * 4 < before);
     assert_eq!(db.version(), main_version, "main is untouched");

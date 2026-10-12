@@ -82,6 +82,12 @@ conformance corpus's `query` column-type tags. Why one canonical name: determini
 vs `i16` — in output, the conformance corpus would spuriously diverge. Aliases are an
 input convenience only; they normalize to the canonical id immediately at parse time.
 
+Every canonical id and alias is **lowercase**, and a type name is matched **byte-exactly on the
+folded name** ([grammar.md §3](grammar.md)), as PostgreSQL: a bare `INT4` / `Int4` folds to `int4`
+and resolves to `i32`, a quoted `"int4"` resolves too, but a quoted `"INT4"` is an unknown type
+(`42704`). Multi-word names (`double precision`, `timestamp with time zone`) are keyword sequences
+and accept only bare words. User type names (composite types) follow the same exact-name rule.
+
 We name the canonical types by their width **in bits** under the **`i`/`f` prefix**
 (`i16`/`i32`/`i64`, `f32`/`f64`) — the convention common across programming languages
 (Rust `i32`, Go/Zig `i64`, `f64`) — rather than PostgreSQL's byte-count spellings

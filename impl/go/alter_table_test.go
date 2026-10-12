@@ -2,6 +2,7 @@ package jed
 
 import (
 	"bytes"
+	"slices"
 	"testing"
 )
 
@@ -77,5 +78,41 @@ func TestAlterTypeAndPrimaryKeyRewritesMatchFreshTableBytes(t *testing.T) {
 		image("CREATE TABLE t (id i32 NOT NULL, v text)", "INSERT INTO t VALUES (1, 'a'), (2, 'b')"),
 	) {
 		t.Fatal("ADD/DROP PRIMARY KEY rewrite differs from an equivalent fresh table")
+	}
+}
+
+// A RENAME rewrite substitutes the new name into persisted expression text as a QUOTED identifier
+// (grammar.md §3, alter.md §2.2) — even a plain lowercase name — while untouched tokens keep their
+// stored (folded) spelling, and the text survives a serialize → load round trip. The corpus
+// (ddl/alter_table.test) pins the behavior; this pins the persisted bytes of the text.
+func TestRenameRewriteQuotesTheSubstitutedName(t *testing.T) {
+	t.Parallel()
+	db := memDB().Session(SessionOptions{})
+	uqRun(t, db, "CREATE TABLE r (a i32 CHECK (a > 0), b i32 CHECK (B IS NULL OR b > a))")
+	uqRun(t, db, `ALTER TABLE r RENAME COLUMN a TO "null"`)
+	uqRun(t, db, "ALTER TABLE r RENAME COLUMN b TO plain")
+	want := []string{`"null" > 0`, `"plain" is null or "plain" > "null"`}
+	texts := func(tbl *catTable) []string {
+		var out []string
+		for _, c := range tbl.Checks {
+			out = append(out, c.ExprText)
+		}
+		return out
+	}
+	tbl, _ := db.Table("r")
+	if got := texts(tbl); !slices.Equal(got, want) {
+		t.Fatalf("check texts = %q, want %q", got, want)
+	}
+	image, err := db.ToImage(8192, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadEngine(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ltbl, _ := loaded.Table("r")
+	if got := texts(ltbl); !slices.Equal(got, want) {
+		t.Fatalf("reloaded check texts = %q, want %q", got, want)
 	}
 }

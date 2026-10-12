@@ -784,7 +784,7 @@ func candidateAccessSelectivity(candidate scanCandidate, rel scopeRel) selectivi
 		}
 		unique := false
 		for _, idx := range rel.table.Indexes {
-			if strings.EqualFold(idx.Name, candidate.identity.indexName) {
+			if idx.Name == candidate.identity.indexName {
 				unique = idx.Unique && len(bound.eqCols) == len(idx.Keys) && len(bound.rangeTerms) == 0
 				break
 			}
@@ -818,7 +818,7 @@ func candidateAccessSelectivity(candidate scanCandidate, rel scopeRel) selectivi
 	case scanCandidateIndexInterval:
 		unique := false
 		for _, idx := range rel.table.Indexes {
-			if strings.EqualFold(idx.Name, candidate.identity.indexName) {
+			if idx.Name == candidate.identity.indexName {
 				unique = idx.Unique && len(idx.Keys) == 1
 				break
 			}
@@ -905,7 +905,7 @@ func (db *engine) candidateAccessSelectivityWithStatistics(candidate scanCandida
 	case scanCandidateBtree:
 		var index *indexDef
 		for i := range rel.table.Indexes {
-			if strings.EqualFold(rel.table.Indexes[i].Name, candidate.identity.indexName) {
+			if rel.table.Indexes[i].Name == candidate.identity.indexName {
 				index = &rel.table.Indexes[i]
 				break
 			}
@@ -947,7 +947,7 @@ func (db *engine) candidateAccessSelectivityWithStatistics(candidate scanCandida
 	case scanCandidateIndexInterval:
 		var index *indexDef
 		for i := range rel.table.Indexes {
-			if strings.EqualFold(rel.table.Indexes[i].Name, candidate.identity.indexName) {
+			if rel.table.Indexes[i].Name == candidate.identity.indexName {
 				index = &rel.table.Indexes[i]
 				break
 			}
@@ -1262,7 +1262,7 @@ func (db *engine) planRelScope(rel planRel) (scopeRel, bool) {
 	if !ok {
 		return scopeRel{}, false
 	}
-	return scopeRel{label: strings.ToLower(rel.tableName), table: table, offset: rel.offset, db: rel.db}, true
+	return scopeRel{label: rel.tableName, table: table, offset: rel.offset, db: rel.db}, true
 }
 
 func (db *engine) estimateColumnStatistics(sp *selectPlan, global int) (int, *currentColumnStatistics, bool) {
@@ -1451,7 +1451,7 @@ func (db *engine) estimateCatalogRows(srf *srfPlan) int64 {
 				}
 			}
 		case srfJedStatistics:
-			rows = satEstimateAdd(rows, int64(len(snap.statistics[strings.ToLower(table.Name)])))
+			rows = satEstimateAdd(rows, int64(len(snap.statistics[table.Name])))
 		}
 	}
 	return rows
@@ -2104,7 +2104,7 @@ func (db *engine) estimateQueryPlan(qp queryPlan, ctx *estimateCTECtx) estimated
 }
 
 func (db *engine) estimateMutationScan(table *catTable, dbScope *string, filter *rExpr, ctx *estimateCTECtx) estimatedPlan {
-	rel := scopeRel{label: strings.ToLower(table.Name), table: table, offset: 0, db: dbScope}
+	rel := scopeRel{label: table.Name, table: table, offset: 0, db: dbScope}
 	contradiction := whereContradicts(filter)
 	bound := db.planMutationScan(dbScope, table, filter, contradiction).bound
 	scan := leafEstimatedPlan(db.estimateSelectedScan(rel, bound, filter))

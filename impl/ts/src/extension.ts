@@ -191,7 +191,7 @@ export class ExtensionRegistry {
   // a name across argument types, §4.2). A signature that shadows a built-in is accepted but never
   // reached (built-ins win).
   registerFunction(spec: HostFunctionSpec): void {
-    const name = spec.name.toLowerCase();
+    const name = spec.name; // exact — host-API names are verbatim (grammar.md §3)
     const cost = spec.cost ?? 1n;
     if (cost < 0n)
       throw engineError(
@@ -222,7 +222,7 @@ export class ExtensionRegistry {
     this.functions.push(new HostFuncEntry(name, spec, cost, kernel, batchKernel));
   }
 
-  // Whether any registered host function has this (lowercased) name — the resolve-time routing gate.
+  // Whether any registered host function has this (exact) name — the resolve-time routing gate.
   hasFunction(name: string): boolean {
     return this.functions.some((f) => f.name === name);
   }
