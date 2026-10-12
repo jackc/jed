@@ -1264,7 +1264,13 @@ export type CreateView = {
   ifNotExists: boolean;
   columns: string[] | null;
   body: string;
+  // A trailing `WITH [CASCADED | LOCAL] CHECK OPTION` (views.md §15.6); bare `WITH CHECK OPTION` is
+  // "cascaded".
+  checkOption: CheckOption | null;
 };
+
+// CheckOption is a view's check option (spec/design/views.md §15.6).
+export type CheckOption = "local" | "cascaded";
 
 // AlterView is `ALTER VIEW [IF EXISTS] [db.]name RENAME …` (spec/design/views.md §7.1). `ALTER TABLE v
 // RENAME …` on a view executes the same rename.

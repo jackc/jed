@@ -10,10 +10,14 @@
 // target relation carries the top layer, so a name binds to the view's column (a layered
 // resolution). An updatable column resolves to the base column itself; a read-only one to its
 // select item, resolved in the view body's isolated scope at the depth of the reference. The views'
-// WHERE clauses resolve the same way and are AND-ed ahead of the statement's own.
+// WHERE clauses resolve the same way and are AND-ed ahead of the statement's own; the checked views'
+// WHERE clauses become the statement's check-option checks (resolveViewChecks, §15.6).
 
-import type { Expr } from "./ast.ts";
+import type { CheckOption, Expr } from "./ast.ts";
 import type { Column } from "./catalog.ts";
+import type { EngineError } from "./errors.ts";
+import { engineError } from "./errors.ts";
+import type { RExpr } from "./executor.ts";
 
 // WriteKind is the statement kind a write through a view performs.
 export type WriteKind = "insert" | "update" | "delete";
@@ -43,6 +47,8 @@ export type WriteLayer = {
   belowLabel: string;
   // The view's WHERE, written against below.
   filter: Expr | null;
+  // The view's own check option (views.md §15.6); null for the table.
+  check: CheckOption | null;
 };
 
 // LayerFollow is where a layer column leads: a base table column, or the read-only select item that
@@ -69,6 +75,19 @@ export function viewsBottomUp(layer: WriteLayer): WriteLayer[] {
 // ViewWrite is a validated write through a view: the target view, the base table, the top layer,
 // and the base column each statement target maps to (in the statement's target order).
 export type ViewWrite = { view: string; table: string; top: WriteLayer; targets: string[] };
+
+// ViewCheck is one check-option check of a write through a view (views.md §15.6): the checked view's
+// name and its WHERE, resolved over the base row.
+export type ViewCheck = { view: string; check: RExpr };
+
+// checkOptionViolation is the 44000 a new row that fails a checked view's WHERE raises (views.md
+// §15.6).
+export function checkOptionViolation(view: string): EngineError {
+  return engineError(
+    "with_check_option_violation",
+    `new row violates check option for view "${view}"`,
+  );
+}
 
 // columnRefPosition is the position of the FROM item's column a select item names, when the item is
 // a plain column reference (bare, or qualified by the FROM item's label) — an updatable view column

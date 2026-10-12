@@ -9,6 +9,7 @@ import type {
   Assignment,
   BinaryOp,
   CheckDef,
+  CheckOption,
   Cte,
   CteBody,
   DefaultDef,
@@ -539,10 +540,10 @@ class Parser {
 
   // parseCreateView parses `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] [db.]name [(col, …)] AS
   // subquery_expr` (views.md §1, grammar.md §54). The body runs from the token after `AS` to the end
-  // of the statement and is captured as its canonical token text. A `WITH ( … )` option list after
-  // the name and a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` are deferred forms (0A000); the
-  // check option is detected after the body is parsed, so a body syntax error is reported first.
-  // `OR REPLACE` with `IF NOT EXISTS` is 42601.
+  // of the statement and is captured as its canonical token text. A trailing `WITH [CASCADED |
+  // LOCAL] CHECK OPTION` is cut off before the body and gives the view a check option (§15.6). A
+  // `WITH ( … )` option list after the name is a deferred form (0A000). `OR REPLACE` with `IF NOT
+  // EXISTS` is 42601.
   private parseCreateView(): Statement {
     this.expectKeyword("create");
     const orReplace = this.peekKeyword() === "or";
@@ -578,23 +579,24 @@ class Parser {
     }
     this.expectKeyword("as");
     // A trailing `WITH [CASCADED | LOCAL] CHECK OPTION` is cut off before the body is parsed (an
-    // unreserved `with` would otherwise be read as a table alias) and refused after it.
-    const checkOption = this.trailingCheckOption();
-    if (checkOption !== null) this.tokens[checkOption] = { kind: "eof" };
+    // unreserved `with` would otherwise be read as a table alias).
+    const trailing = this.trailingCheckOption();
+    if (trailing !== null) this.tokens[trailing.at] = { kind: "eof" };
     const start = this.pos;
     this.parseSubquery();
     const end = this.pos;
-    if (checkOption !== null) {
-      if (end !== checkOption) throw engineError("syntax_error", "unexpected trailing input");
-      throw engineError("feature_not_supported", "WITH CHECK OPTION is not supported");
+    if (trailing !== null && end !== trailing.at) {
+      throw engineError("syntax_error", "unexpected trailing input");
     }
     const body = renderTokens(this.tokens.slice(start, end));
-    return { kind: "createView", name, db, orReplace, ifNotExists, columns, body };
+    const checkOption = trailing === null ? null : trailing.option;
+    return { kind: "createView", name, db, orReplace, ifNotExists, columns, body, checkOption };
   }
 
-  // trailingCheckOption returns the index of a trailing `WITH [CASCADED | LOCAL] CHECK OPTION` at the
-  // end of the token stream (views.md §12), or null if the statement does not end with one.
-  private trailingCheckOption(): number | null {
+  // trailingCheckOption returns the index and option of a trailing `WITH [CASCADED | LOCAL] CHECK
+  // OPTION` at the end of the token stream (views.md §15.6), or null if the statement does not end
+  // with one. Bare `WITH CHECK OPTION` is CASCADED.
+  private trailingCheckOption(): { at: number; option: CheckOption } | null {
     let end = this.tokens.length;
     if (this.tokens[end - 1]?.kind === "eof") end--;
     const word = (i: number, w: string): boolean => {
@@ -602,13 +604,10 @@ class Parser {
       return t !== undefined && t.kind === "word" && t.word === w;
     };
     if (end < this.pos + 3 || !word(end - 1, "option") || !word(end - 2, "check")) return null;
-    if (word(end - 3, "with")) return end - 3;
-    if (
-      end >= this.pos + 4 &&
-      (word(end - 3, "cascaded") || word(end - 3, "local")) &&
-      word(end - 4, "with")
-    ) {
-      return end - 4;
+    if (word(end - 3, "with")) return { at: end - 3, option: "cascaded" };
+    if (end >= this.pos + 4 && word(end - 4, "with")) {
+      if (word(end - 3, "cascaded")) return { at: end - 4, option: "cascaded" };
+      if (word(end - 3, "local")) return { at: end - 4, option: "local" };
     }
     return null;
   }

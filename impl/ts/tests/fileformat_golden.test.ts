@@ -944,16 +944,17 @@ function identityTableDB(): Engine {
   return db;
 }
 
-// viewTableDB (v38): three entry_kind = 5 view entries after the table entry, in name order (n, v,
-// w) — the frozen `*` expansion, a column-list rename with a view dependency, and a table dependency
-// with zero columns. Must match the Ruby reference's VIEW_TABLE (spec/fileformat/verify.rb),
+// viewTableDB (v38, check options v39): three entry_kind = 5 view entries after the table entry, in
+// name order (n, v, w) — the frozen `*` expansion with a CASCADED check option, a column-list rename
+// with a view dependency and a LOCAL check option, and a table dependency with zero columns and no
+// check option. Must match the Ruby reference's VIEW_TABLE (spec/fileformat/verify.rb),
 // spec/design/views.md §3.
 function viewTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE t (a i32 PRIMARY KEY, b text)");
   run(db, "INSERT INTO t VALUES (1, 'x'), (2, 'y')");
-  run(db, "CREATE VIEW v AS SELECT * FROM t WHERE a > 0");
-  run(db, "CREATE VIEW w (x) AS SELECT a FROM v");
+  run(db, "CREATE VIEW v AS SELECT * FROM t WHERE a > 0 WITH CHECK OPTION");
+  run(db, "CREATE VIEW w (x) AS SELECT a FROM v WITH LOCAL CHECK OPTION");
   run(db, "CREATE VIEW n AS SELECT count(*) AS c FROM t");
   return db;
 }
@@ -1423,6 +1424,26 @@ test("view golden reads back", () => {
   ]);
   assert.deepStrictEqual(rows(db, "SELECT x FROM w ORDER BY x"), [[intValue(1n)], [intValue(2n)]]);
   assert.deepStrictEqual(rows(db, "SELECT c FROM n"), [[intValue(2n)]]);
+  assert.deepStrictEqual(rows(db, "SELECT name, check_option FROM jed_views ORDER BY name"), [
+    [text("n"), text("NONE")],
+    [text("v"), text("CASCADED")],
+    [text("w"), text("LOCAL")],
+  ]);
+});
+
+// A view entry's check_option byte outside 0–2 is corruption (XX001, format.md *View entry*).
+test("view unknown check option is rejected", () => {
+  const image = fixture("view_table.jed");
+  // View n's entry ends with its one dependency (kind 0, "t", zero columns), then check_option 0.
+  const ends = new TextEncoder().encode("select count ( * ) as c from t");
+  const optionAt = findBytes(image, ends) + ends.length + 2 + 6; // after dep_count and the dependency
+  assert.equal(image[optionAt], 0);
+  image[optionAt] = 3;
+  refreshPageCrc(image, optionAt);
+  assert.throws(
+    () => loadEngine(image),
+    (e: unknown) => e instanceof Error && e.message.startsWith("XX001"),
+  );
 });
 
 // A stored view definition that no longer parses is corruption (XX001) at open — the body is parsed

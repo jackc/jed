@@ -1,7 +1,7 @@
 // Table metadata: column definitions and lookups. Data-shaped (a type + free
 // functions) to match the boring/explicit style (CLAUDE.md §10).
 
-import type { Expr, QueryExpr } from "./ast.ts";
+import type { CheckOption, Expr, QueryExpr } from "./ast.ts";
 import {
   type DecimalTypmod,
   type ScalarType,
@@ -306,6 +306,8 @@ export type ViewDef = {
   body: QueryExpr;
   // The body's nesting depth (spec/design/views.md §4.1), from the same parse as `body`.
   depth: number;
+  // The view's check option, if any (spec/design/views.md §15.6).
+  checkOption: CheckOption | null;
 };
 
 // ViewDepKind is what a view dependency names (format.md *View entry* dep_kind: table 0, view 1).

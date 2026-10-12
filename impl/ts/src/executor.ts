@@ -478,9 +478,11 @@ import {
 } from "./resolve.ts";
 import {
   type LayerCol,
+  type ViewCheck,
   type ViewWrite,
   type WriteKind,
   type WriteLayer,
+  checkOptionViolation,
   columnRefPosition,
   renamedNames,
   viewsBottomUp,
@@ -9848,6 +9850,7 @@ export class Engine {
           ins.db,
           plan.pk,
           plan.checks,
+          [],
           plan.defaultExprs,
           plan.rindexes,
           plan.colls,
@@ -9866,6 +9869,7 @@ export class Engine {
           ins.db,
           plan.pk,
           plan.checks,
+          [],
           plan.defaultExprs,
           plan.rindexes,
           plan.colls,
@@ -9921,6 +9925,9 @@ export class Engine {
     // The CHECK constraints, resolved once per statement in evaluation (name) order;
     // insertRows evaluates them per candidate row (constraints.md §4.4).
     const checks = this.resolveChecks(table);
+    // The check-option checks of a write through a view (views.md §15.6), nearest the table first;
+    // insertRows evaluates them per candidate row after its UNIQUE checks.
+    const viewChecks = this.resolveViewChecks(table, vw);
     const stmtRng = new StmtRng();
 
     // Resolve the optional column list once. provided[i] >= 0 means table column i takes that
@@ -10022,6 +10029,10 @@ export class Engine {
         );
       }
       this.foldConflictPlan(cplan, bound, foldCost);
+      // A check option's uncorrelated subqueries fold once too (views.md §15.6).
+      for (const vc of viewChecks) {
+        vc.check = this.foldUncorrelatedInRExpr(vc.check, bound, ctx, foldCost);
+      }
       meter.charge(foldCost.value);
       const q = this.execQueryPlan(plan, [], bound, ctx);
       // Arity: the SELECT's output column count must match the target — checked before any row is
@@ -10080,6 +10091,7 @@ export class Engine {
         ins.db,
         pk,
         checks,
+        viewChecks,
         defaultExprs,
         stmtRng,
         provided,
@@ -10215,6 +10227,10 @@ export class Engine {
       ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, ctx, foldCost));
     }
     this.foldConflictPlan(cplan, bound, foldCost);
+    // A check option's uncorrelated subqueries fold once too (views.md §15.6).
+    for (const vc of viewChecks) {
+      vc.check = this.foldUncorrelatedInRExpr(vc.check, bound, ctx, foldCost);
+    }
     meter.charge(foldCost.value);
     const { affected, returned } = useSingle
       ? {
@@ -10225,6 +10241,7 @@ export class Engine {
             ins.db,
             pk,
             checks,
+            viewChecks,
             defaultExprs,
             this.resolveTableIndexes(table),
             this.columnCollations(table.columns),
@@ -10244,6 +10261,7 @@ export class Engine {
           ins.db,
           pk,
           checks,
+          viewChecks,
           defaultExprs,
           stmtRng,
           provided,
@@ -10279,6 +10297,8 @@ export class Engine {
     dbScope: string | undefined,
     pk: number[],
     checks: NamedCheck[],
+    // The check-option checks of a write through a view (views.md §15.6), nearest the table first.
+    viewChecks: ViewCheck[],
     defaultExprs: (RExpr | null)[],
     rindexes: ResolvedIndex[],
     colls: (Collation | null)[],
@@ -10408,6 +10428,9 @@ export class Engine {
           indexEntryKeys(table.columns, colTypes, colls, rindex, new Uint8Array(0), row, env),
         ),
       );
+      // The check option (views.md §15.6), after the row's own NOT NULL / CHECK / PK / UNIQUE
+      // checks and its index keys, before the batch FOREIGN KEY and EXCLUDE passes.
+      evalViewChecks(viewChecks, row, env, meter);
       prepared.push({ key, row });
     }
 
@@ -10535,6 +10558,7 @@ export class Engine {
     dbScope: string | undefined,
     pk: number[],
     checks: NamedCheck[],
+    viewChecks: ViewCheck[],
     defaultExprs: (RExpr | null)[],
     rindexes: ResolvedIndex[],
     colls: (Collation | null)[],
@@ -10621,6 +10645,7 @@ export class Engine {
         ),
       );
     }
+    evalViewChecks(viewChecks, row, maintenanceEnv, meter);
 
     const relation = table.name;
     for (const fk of this.table(table.name)?.fks ?? []) {
@@ -10858,6 +10883,7 @@ export class Engine {
     dbScope: string | undefined,
     pk: number[],
     checks: NamedCheck[],
+    viewChecks: ViewCheck[],
     defaultExprs: (RExpr | null)[],
     rng: StmtRng,
     provided: number[],
@@ -10895,6 +10921,7 @@ export class Engine {
       dbScope,
       pk,
       checks,
+      viewChecks,
       defaultExprs,
       rindexes,
       colls,
@@ -11942,6 +11969,9 @@ export class Engine {
     // The CHECK constraints, resolved once per statement in evaluation (name) order;
     // phase 1 evaluates them on each post-assignment row (constraints.md §4.4).
     const checks = this.resolveChecks(table);
+    // The check-option checks of an UPDATE through a view (views.md §15.6), evaluated on the new
+    // rows after the end-state key checks.
+    const viewChecks = this.resolveViewChecks(table, vw);
     // All assignment RHSs + the WHERE + the RETURNING are resolved: finalize + bind before
     // any scan.
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
@@ -11961,6 +11991,9 @@ export class Engine {
     if (filter !== null) filter = this.foldUncorrelatedInRExpr(filter, bound, ctx, foldCost);
     if (ret !== null) {
       ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, ctx, foldCost));
+    }
+    for (const vc of viewChecks) {
+      vc.check = this.foldUncorrelatedInRExpr(vc.check, bound, ctx, foldCost);
     }
     meter.charge(foldCost.value);
     const env: EvalEnv = {
@@ -12136,6 +12169,10 @@ export class Engine {
         }
       }
     }
+
+    // The check option (views.md §15.6): each new row, in scan order, after the end-state PK and
+    // UNIQUE checks and before EXCLUDE and FOREIGN KEY.
+    for (const u of updates) evalViewChecks(viewChecks, u.row, env, meter);
 
     // EXCLUDE end-state validation (spec/design/gist.md §7), mirroring UNIQUE's: each updated NEW row
     // must conflict with no OTHER row in the statement's END STATE — neither a STORED row that is NOT
@@ -13157,7 +13194,8 @@ export class Engine {
 
   // updatableShape returns the single FROM item of an automatically updatable body (views.md §15.1),
   // or null. For INSERT / UPDATE (checkCols) the body must also output at least one plain column
-  // reference.
+  // reference. A stored body has no `*`; at CREATE VIEW a `*` or `label.*` item counts as plain
+  // column references, which it expands to (§1.1 step 4).
   private updatableShape(body: QueryExpr, checkCols: boolean): { sel: Select; tref: TableRef } | null {
     if (body.kind !== "select") return null;
     const sel = body;
@@ -13168,12 +13206,11 @@ export class Engine {
       sel.limit !== null ||
       sel.offset !== null ||
       sel.joins.length > 0 ||
-      sel.joinGroup === true ||
-      sel.items.kind !== "list"
+      sel.joinGroup === true
     ) {
       return null;
     }
-    const items = sel.items.items;
+    const items = sel.items.kind === "list" ? sel.items.items : [];
     const levelHas = (e: Expr) => exprHasAggregate(e) || exprHasWindow(e);
     if (items.some((it) => levelHas(it.expr))) return null;
     if (sel.orderBy.some((k) => k.expr !== null && levelHas(k.expr))) return null;
@@ -13194,10 +13231,14 @@ export class Engine {
     if (snap.table(tref.name) === undefined && snap.view(tref.name) === undefined) return null;
     if (checkCols) {
       const label = tref.alias ?? tref.name;
-      const plain = items.some(
-        (it) =>
-          it.expr.kind === "column" || (it.expr.kind === "qualifiedColumn" && it.expr.qualifier === label),
-      );
+      const plain =
+        sel.items.kind === "all" ||
+        items.some(
+          (it) =>
+            it.expr.kind === "column" ||
+            ((it.expr.kind === "qualifiedColumn" || it.expr.kind === "qualifiedStar") &&
+              it.expr.qualifier === label),
+        );
       if (!plain) return null;
     }
     return { sel, tref };
@@ -13312,6 +13353,7 @@ export class Engine {
       below: null,
       belowLabel: "",
       filter: null,
+      check: null,
     };
     for (let i = levels.length - 1; i >= 0; i--) {
       const level = levels[i]!;
@@ -13325,6 +13367,7 @@ export class Engine {
         below: layer,
         belowLabel: level.label,
         filter: level.filter,
+        check: level.view.checkOption,
       };
     }
     return {
@@ -13377,6 +13420,26 @@ export class Engine {
     }
     if (user !== null) join(resolveBooleanFilter(scope, user, ptypes));
     return filter;
+  }
+
+  // resolveViewChecks resolves the check-option checks of a write through a view (views.md §15.6):
+  // the WHERE of every checked view — one with its own check option, or below a CASCADED one —
+  // nearest the table first, each resolved in its body's isolated scope over the base row. Empty
+  // when the target is a table or no view in the chain is checked.
+  resolveViewChecks(table: Table, vw: ViewWrite | null): ViewCheck[] {
+    const out: ViewCheck[] = [];
+    if (vw === null) return out;
+    let cascaded = false;
+    for (let l: WriteLayer | null = vw.top; l !== null; l = l.below) {
+      if (l.view === null) continue;
+      if ((l.check !== null || cascaded) && l.filter !== null) {
+        const lscope = Scope.layerBody(this, table, 0, l.belowLabel, l.below!);
+        out.push({ view: l.view, check: resolveBooleanFilter(lscope, l.filter, new ParamTypes()) });
+      }
+      if (l.check === "cascaded") cascaded = true;
+    }
+    out.reverse();
+    return out;
   }
 
   // rewriteInsertTarget retargets an INSERT through an updatable view at its base table (views.md
@@ -13457,6 +13520,12 @@ export class Engine {
     if (param !== undefined) {
       throw engineError("undefined_parameter", `there is no parameter $${param.paramIndex}`);
     }
+    // A check option needs the view's own body to be updatable for INSERT / UPDATE (§15.6).
+    if (cv.checkOption !== null && this.updatableShape(body, true) === null) {
+      throw viewNotSupported(
+        "WITH CHECK OPTION is supported only on automatically updatable views",
+      );
+    }
     // 5. Column-list arity, then duplicate final output names, from the body as planned.
     const bodyNames = first.plan.columnNames;
     const bodyTypes = first.plan.columnTypes;
@@ -13516,7 +13585,15 @@ export class Engine {
       }
     }
     // 9 (12 under OR REPLACE). Write the catalog entry; it must fit one catalog page.
-    const def: ViewDef = { name: cv.name, columns, definition, deps, body, depth };
+    const def: ViewDef = {
+      name: cv.name,
+      columns,
+      definition,
+      deps,
+      body,
+      depth,
+      checkOption: cv.checkOption,
+    };
     this.checkViewEntryFits(def);
     this.working().putView(def);
     // 11. The views that read a replaced view are re-validated against the replacement (§8).
@@ -13938,6 +14015,7 @@ export class Engine {
           deps: expected,
           body,
           depth,
+          checkOption: view.checkOption,
         };
         this.checkViewEntryFits(updated);
         this.working().putView(updated);
@@ -16115,8 +16193,9 @@ export class Engine {
   }
 
   // jedViewsRows generates the rows of the jed_views catalog relation (introspection.md §5.4): one
-  // row per view of the scope's snapshot, in ascending name byte order — the stored definition text
-  // and the output column names. Cost mirrors jedTablesRows.
+  // row per view of the scope's snapshot, in ascending name byte order — the stored definition
+  // text, the output column names, and the check option (NONE / LOCAL / CASCADED). Cost mirrors
+  // jedTablesRows.
   private jedViewsRows(srf: SrfPlan, meter: Meter): Row[] {
     const snap = this.snapForScope(srf.introspectScope!);
     if (snap === undefined) {
@@ -16130,6 +16209,9 @@ export class Engine {
         textValue(v.name),
         textValue(v.definition),
         arrayValue(v.columns.map((c) => textValue(c))),
+        textValue(
+          v.checkOption === null ? "NONE" : v.checkOption === "local" ? "LOCAL" : "CASCADED",
+        ),
       ]);
     }
     return out;
@@ -27615,6 +27697,7 @@ export function catalogRelTable(kind: CatalogRelKind): Table {
         col("name", "text", true),
         col("definition", "text", true),
         textArr("columns", true),
+        col("check_option", "text", true),
       ]);
     case "jed_type_fields":
       return table("jed_type_fields", [
@@ -30051,6 +30134,17 @@ export function evalChecks(
     if (v.kind === "bool" && !v.value) {
       throw checkViolation(relation, c.name);
     }
+  }
+}
+
+// evalViewChecks evaluates the check-option checks (views.md §15.6) on one new row, nearest the
+// table first: each WHERE is a filter, so FALSE or NULL fails with 44000 naming the view. Metered
+// expression work.
+export function evalViewChecks(checks: ViewCheck[], row: Row, env: EvalEnv, meter: Meter): void {
+  if (checks.length === 0) return;
+  meter.guard();
+  for (const c of checks) {
+    if (!evalFilter(c.check, row, env, meter)) throw checkOptionViolation(c.view);
   }
 }
 

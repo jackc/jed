@@ -877,6 +877,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "ddl.view_replace",
   "ddl.view_alter",
   "dml.view_write",
+  "dml.view_check_option",
   "ddl.view_cascade",
 ];
 
