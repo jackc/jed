@@ -894,38 +894,42 @@ impl Engine {
 
     /// After an `ALTER TABLE` changed the working catalog: rewrite each dependent view's text for
     /// the statement's renames / dropped columns (§7), then re-validate it — it must plan in the
-    /// post-statement catalog and bind exactly its (renamed) dependency list (§8). A failure is
-    /// 0A000 and the statement fails, which discards every change it made.
+    /// post-statement catalog and bind exactly its (renamed) dependency list (§8). Every rewrite is
+    /// installed before any view is re-validated, because a dependent view may also read another
+    /// dependent view, whose body must already be the rewritten one. A failure is 0A000 and the
+    /// statement fails, which discards every change it made.
     pub(crate) fn finish_view_alter(
         &mut self,
         plan: ViewAlterPlan,
         change: &ViewAlterChange,
     ) -> Result<()> {
-        let mut updated: Vec<ViewDef> = Vec::with_capacity(plan.views.len());
+        let mut rewritten: Vec<(String, Vec<ViewDep>)> = Vec::with_capacity(plan.views.len());
         for (view, items) in &plan.views {
             let definition = rewrite_view_text(&view.definition, items, &plan, change)?;
             let expected = renamed_deps(&view.deps, &plan, change);
             let body = parse_view_definition(&definition)
                 .map_err(|_| alter_breaks_view(&plan.table, &view.name))?;
-            let (_, trace) = self
-                .trace_view_body(&body)
-                .map_err(|_| alter_breaks_view(&plan.table, &view.name))?;
-            if self.trace_dependencies(&trace) != expected {
-                return Err(alter_breaks_view(&plan.table, &view.name));
-            }
             if definition != view.definition || expected != view.deps {
-                updated.push(ViewDef {
+                let updated = ViewDef {
                     name: view.name.clone(),
                     columns: view.columns.clone(),
                     definition,
-                    deps: expected,
+                    deps: expected.clone(),
                     body: std::sync::Arc::new(body),
-                });
+                };
+                self.check_view_entry_fits(&updated)?;
+                self.working_mut().put_view(updated);
             }
+            rewritten.push((view.name.clone(), expected));
         }
-        for view in updated {
-            self.check_view_entry_fits(&view)?;
-            self.working_mut().put_view(view);
+        for (name, expected) in rewritten {
+            let body = self.read_snap().view(&name).expect("view").body.clone();
+            let (_, trace) = self
+                .trace_view_body(&body)
+                .map_err(|_| alter_breaks_view(&plan.table, &name))?;
+            if self.trace_dependencies(&trace) != expected {
+                return Err(alter_breaks_view(&plan.table, &name));
+            }
         }
         Ok(())
     }

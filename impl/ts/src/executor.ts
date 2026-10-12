@@ -13295,31 +13295,38 @@ export class Engine {
 
   // finishViewAlter runs after an ALTER TABLE changed the working catalog: rewrite each dependent
   // view's text for the statement's renames / dropped columns (§7), then re-validate it — it must
-  // plan in the post-statement catalog and bind exactly its (renamed) dependency list (§8). A failure
-  // is 0A000 and the statement fails, which discards every change it made.
+  // plan in the post-statement catalog and bind exactly its (renamed) dependency list (§8). Every
+  // rewrite is installed before any view is re-validated, because a dependent view may also read
+  // another dependent view, whose body must already be the rewritten one. A failure is 0A000 and the
+  // statement fails, which discards every change it made.
   private finishViewAlter(plan: ViewAlterPlan, change: ViewAlterChange): void {
-    const updated: ViewDef[] = [];
+    const rewritten: { name: string; body: QueryExpr; expected: ViewDep[] }[] = [];
     for (const { view, items } of plan.views) {
       const definition = rewriteViewText(view.definition, items, plan, change);
       const expected = renamedDeps(view.deps, plan, change);
       let body: QueryExpr;
-      let trace: ViewTrace;
       try {
         body = parseViewDefinition(definition);
-        trace = this.traceViewBody(body).trace;
       } catch {
         throw alterBreaksView(plan.table, view.name);
       }
-      if (!depsEqual(this.traceDependencies(trace), expected)) {
-        throw alterBreaksView(plan.table, view.name);
-      }
       if (definition !== view.definition || !depsEqual(expected, view.deps)) {
-        updated.push({ name: view.name, columns: view.columns.slice(), definition, deps: expected, body });
+        const updated: ViewDef = { name: view.name, columns: view.columns.slice(), definition, deps: expected, body };
+        this.checkViewEntryFits(updated);
+        this.working().putView(updated);
       }
+      rewritten.push({ name: view.name, body, expected });
     }
-    for (const view of updated) {
-      this.checkViewEntryFits(view);
-      this.working().putView(view);
+    for (const { name, body, expected } of rewritten) {
+      let trace: ViewTrace;
+      try {
+        trace = this.traceViewBody(body).trace;
+      } catch {
+        throw alterBreaksView(plan.table, name);
+      }
+      if (!depsEqual(this.traceDependencies(trace), expected)) {
+        throw alterBreaksView(plan.table, name);
+      }
     }
   }
 

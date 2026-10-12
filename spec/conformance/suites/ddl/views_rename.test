@@ -227,6 +227,41 @@ SELECT * FROM mn
 m2
 n2
 
+# --- a view that reads both another view and that view's table is rewritten consistently -----------
+
+statement ok
+CREATE TABLE emp (id i32 PRIMARY KEY, name text, dept text)
+
+statement ok
+INSERT INTO emp VALUES (1, 'ann', 'eng'), (2, 'bob', 'ops')
+
+statement ok
+CREATE VIEW ea AS SELECT id, name, dept FROM emp
+
+statement ok
+CREATE VIEW eb AS SELECT ea.dept, e.name FROM ea JOIN emp e ON ea.id = e.id
+
+statement ok
+ALTER TABLE emp RENAME TO staff
+
+statement ok
+ALTER TABLE staff RENAME COLUMN dept TO team
+
+# names: dept, name
+query TT nosort
+SELECT * FROM eb ORDER BY name
+----
+eng
+ann
+ops
+bob
+
+statement ok
+DROP VIEW eb, ea
+
+statement ok
+DROP TABLE staff
+
 statement ok
 DROP VIEW v, v2, v3, vcte, rv, cap, mn
 

@@ -832,10 +832,13 @@ func (db *engine) prepareViewAlter(table *catTable, rewrites bool) (*viewAlterPl
 
 // finishViewAlter runs after an ALTER TABLE changed the working catalog: rewrite each dependent
 // view's text for the statement's renames / dropped columns (§7), then re-validate it — it must plan
-// in the post-statement catalog and bind exactly its (renamed) dependency list (§8). A failure is
-// 0A000 and the statement fails, which discards every change it made.
+// in the post-statement catalog and bind exactly its (renamed) dependency list (§8). Every rewrite
+// is installed before any view is re-validated, because a dependent view may also read another
+// dependent view, whose body must already be the rewritten one. A failure is 0A000 and the
+// statement fails, which discards every change it made.
 func (db *engine) finishViewAlter(vp *viewAlterPlan, change viewAlterChange) error {
-	var updated []*viewDef
+	bodies := make([]*queryExpr, len(vp.views))
+	expecteds := make([][]viewDep, len(vp.views))
 	for i, view := range vp.views {
 		definition, err := rewriteViewText(view.Definition, vp.items[i], vp, change)
 		if err != nil {
@@ -846,24 +849,25 @@ func (db *engine) finishViewAlter(vp *viewAlterPlan, change viewAlterChange) err
 		if err != nil {
 			return alterBreaksView(vp.table, view.Name)
 		}
-		_, trace, err := db.traceViewBody(body)
+		bodies[i], expecteds[i] = body, expected
+		if definition != view.Definition || !viewDepsEqual(expected, view.Deps) {
+			updated := &viewDef{
+				Name: view.Name, Columns: view.Columns, Definition: definition, Deps: expected, Body: body,
+			}
+			if err := db.checkViewEntryFits(updated); err != nil {
+				return err
+			}
+			db.working().putView(updated)
+		}
+	}
+	for i, view := range vp.views {
+		_, trace, err := db.traceViewBody(bodies[i])
 		if err != nil {
 			return alterBreaksView(vp.table, view.Name)
 		}
-		if !viewDepsEqual(db.traceDependencies(trace), expected) {
+		if !viewDepsEqual(db.traceDependencies(trace), expecteds[i]) {
 			return alterBreaksView(vp.table, view.Name)
 		}
-		if definition != view.Definition || !viewDepsEqual(expected, view.Deps) {
-			updated = append(updated, &viewDef{
-				Name: view.Name, Columns: view.Columns, Definition: definition, Deps: expected, Body: body,
-			})
-		}
-	}
-	for _, view := range updated {
-		if err := db.checkViewEntryFits(view); err != nil {
-			return err
-		}
-		db.working().putView(view)
 	}
 	return nil
 }
