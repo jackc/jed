@@ -37,16 +37,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ## Core query / DML completeness
 
-- [x] **`EXPLAIN` / `EXPLAIN ANALYZE`** — render the planner's chosen plan as a deterministic
-  `depth`/`node`/`detail`/`est_rows`/`est_cost` result set (pre-order, `nosort`), without executing
-  the inner statement;
-  `ANALYZE` runs it and reports the actual (deterministic) accrued cost + row count on an `Analyze`
-  root. Covers read queries + DML (plan-only, never mutates); `ANALYZE` of a write executes + commits.
-  The observability substrate for the cost-based planner. → [explain.md](spec/design/explain.md)
-  - [x] _follow-on:_ per-node actual cost attribution under `ANALYZE`; a full expression printer for
-    the residual filter / projections (currently a `conjuncts=N` count) + exact float-literal bound
-    rendering (each needs a determinism-ledger entry); an `EXPLAIN (…)` option list; a
-    streaming/buffered/deferred lane tag; the DML touched-set count; `EXPLAIN` of a data-modifying `WITH`.
 - [x] **Predicate forms — `IN`/`BETWEEN`/`LIKE`/`CASE`** — plus `ILIKE`, and the regex operators `~`/`~*`/`!~`/`!~*` + `regexp_replace`/`regexp_match` (a hand-written linear-time Pike VM, ReDoS-immune). → grammar.md §20–§23, [regex.md](spec/design/regex.md)
   - [ ] _follow-on:_ LIKE `ESCAPE 'c'`; `SIMILAR TO` (deliberately excluded — the SQL-standard surface); set-returning `regexp_matches` / `regexp_split_to_table`; the Oracle-compat `regexp_count`/`instr`/`substr`/`like`; Unicode-property char classes (`\p{…}`).
 - [x] **Left-to-right short-circuit `AND` / `OR`** — a FALSE left operand decides `AND` and a TRUE
@@ -65,7 +55,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **Scalar string / text functions** — PG's string surface as built-ins with code-point semantics (`length`/`substr`/`lpad`/`btrim`/`replace`/`translate`/`repeat`/`strpos`/`split_part`/`encode`/`decode`/`quote_*`/…). → [string-functions.md](spec/design/string-functions.md)
   - [ ] _follow-on:_ full-Unicode `initcap` word classification + non-ASCII titlecasing; keyword-aware `quote_ident`.
 - [x] **Double-quoted identifiers + PostgreSQL identifier folding** — bare identifiers fold to lowercase, `"…"` names are exact (any UTF-8, `""` escape, `""` → `42601`); every name comparison, catalog key, and canonical name order is byte-exact; host-API names are verbatim; `nextval('…')` text parses as an identifier (`42602`); auto-names derive from exact names; the `jed_` reservation is byte-exact; `format_version` 37. → [grammar.md §3](spec/design/grammar.md)
-  - [x] _follow-on:_ **select-list aliases without `AS`** — `SELECT count(*) total`, `SELECT id "X"`; the no-bare-label set is exactly PostgreSQL's 39 `AS_LABEL` keywords (dangling operator words and postfix `ISNULL`/`NOTNULL` are ledgered divergences). → [grammar.md §8](spec/design/grammar.md)
   - [ ] _follow-on:_ PG surface still narrower around names — a quoted `EXTRACT` field, `U&"…"` Unicode-escape identifiers, and 63-byte truncation of over-long engine auto-names (an auto-name past the identifier limit can't be referenced from SQL).
 - [x] **Named + optional (DEFAULT) function arguments** — PG named notation `f(name => value)` + DEFAULT params; `make_interval`, then `make_timestamp`/`make_timestamptz`; `VARIADIC` (landed as **AF6** with the array type). → [functions.md §11](spec/design/functions.md)
   - [ ] _follow-on:_ general non-integer DEFAULT values (no consumer yet — built-ins use overloads or `make_interval`-style 0-defaults); user-defined-function defaults (jed has no UDFs).
@@ -95,7 +84,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **`json` / `jsonb` + SQL/JSON** — the committed XL headline feature: all non-deferred slices across all three cores, oracle-clean; spec'd across [json.md](spec/design/json.md), [jsonpath.md](spec/design/jsonpath.md), [json-sql-functions.md](spec/design/json-sql-functions.md), [json-table.md](spec/design/json-table.md); type codes 18/19/20, one `format_version` bump (v18→v19).
   - [ ] _follow-ons (deferred `0A000`, hoisted from the done slices):_ the string-**dictionary builder** (opens the [json.md §3](spec/design/json.md) door); `jsonb`-as-PK/index ([encoding.md §2.13](spec/design/encoding.md)); GIN **`jsonb_ops`** opclass for `@>`/`?`; `JSON_TABLE` explicit `PLAN` (T2); `ON ERROR/EMPTY DEFAULT <expr>` (S3); the remaining **jsonpath** surface (`like_regex` → Pike VM, item methods `.type()`/`.size()`/`.double()`/…, arithmetic, `vars`/`silent` args, the `_tz` query-function variants — P2/P3); the **verbatim-`json`** SRF / accessor variants (`json_array_elements[_text]`, `json_each[_text]`, the `->`/`#>` json overloads); `jsonb_set_lax`; `row_to_json`; in-aggregate `ORDER BY` for `json[b]_agg`.
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — COMPLETE (S0–S6): the open `Type { Scalar | Composite(catalog-ref) }`, `CREATE`/`DROP TYPE`, nested + recursive types, storable composite column + recursive codec (`format_version` 9), `ROW(…)`, field access, element-wise compare/ORDER BY/DISTINCT/GROUP BY. Named composites only. → [composite.md](spec/design/composite.md)
-  - [x] _composite-as-key landed:_ a composite-typed `PRIMARY KEY` / ordered secondary index / `UNIQUE` column of an all-keyable-field type — the third container key (`composite-field-slots`, [encoding.md §2.15](spec/design/encoding.md)); point-lookup pushdown deferred like the other container keys.
   - [ ] _still narrowed (relaxable later):_ `INSERT … SELECT` / `UPDATE` of a composite column, and an anonymous `ROW(…)` *expression* (non-literal fields) in an `INSERT … VALUES` slot; an **array-of-composite** field as a key + a composite **FK** pairing (the remaining `0A000` key axes); `DEFAULT` on a composite column; runtime non-literal text→composite + `composite::text` + anonymous `ROW(…)::type` casts; the nested `ROW(ROW(…),…)`-into-column constructor.
 
 ---
@@ -111,14 +99,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ parenthesized operands `(SELECT …) UNION …`; ORDER BY/LIMIT inside an operand; a set op in an `INSERT … SELECT` source.
 - [x] **Common table expressions (`WITH`)** — named derived tables (PG hybrid inline/materialize), `WITH RECURSIVE`, data-modifying (writable) CTEs, nested `WITH`. → [cte.md](spec/design/cte.md), [recursive-cte.md](spec/design/recursive-cte.md), [writable-cte.md](spec/design/writable-cte.md)
   - [ ] _follow-on:_ recursive-CTE deferrals (`SEARCH`/`CYCLE`, a set-op / `FROM`-subquery recursive term, mutual recursion).
-- [x] **Set-returning functions** — `generate_series` in FROM, a synthetic one-column relation, a `generated_row` cost unit. → [functions.md §10](spec/design/functions.md)
-  - [x] _follow-on:_ the column-alias-list `AS g(c)` — explicit left-to-right output renaming for every fixed-shape table function (partial lists allowed; too many names → `42P10`). (`LATERAL` ✅ landed; `unnest(array)` ✅ landed — AF3.)
 - [x] **`FOREIGN KEY` constraints** — column-/table-level `REFERENCES`, composite + self-reference, same-type pairing (`42804`), MATCH SIMPLE, enforced at four write sites (`23503`), plus recursive `ON DELETE`/`ON UPDATE` `CASCADE | SET NULL | SET DEFAULT` action closures (`format_version` 30's three-bit action fields). → [constraints.md §6](spec/design/constraints.md)
-  - [x] **Child-index reverse match** — a parent DELETE/UPDATE's NO ACTION/RESTRICT search probes a usable child key (the child PK or a non-partial plain-column B-tree leading with the FK columns) and otherwise full-scans; both paths are metered, so `max_cost` bounds the O(parents × children) fallback. No index is auto-created (PG-matching). → [constraints.md §6.5/§6.11](spec/design/constraints.md)
-  - [x] **Keyed referential actions** — generated `CASCADE`/`SET NULL`/`SET DEFAULT` statements gather their child rows through the same reverse path (one prefix probe per distinct parent tuple, else one child scan with a hash membership test) instead of a generated OR of tuple equalities, and `ON UPDATE CASCADE` maps old→new tuples instead of an N-arm `CASE`: O(parents × log children) indexed, O(children + parents) unindexed, single- and multi-column. → [constraints.md §6.6](spec/design/constraints.md)
   - [ ] _follow-on:_ `MATCH FULL`; FK type pairing relaxed to PG's comparable-types.
 - [x] **Secondary indexes** (`CREATE INDEX` / `DROP INDEX`) — on-disk B-trees with equality/range and multi-column-prefix bounds, expression and partial keys, bounded mutation scans, and LIMIT streaming; `format_version` 5/26/27. → [indexes.md](spec/design/indexes.md)
-  - [x] Safe `timestamptz` expression keys and partial predicates: compositional admission, named-zone version/checksum pins, dynamic-zone cache safety, and atomic transactional rebuilds (format 32). → [index-dependencies.md](spec/design/index-dependencies.md)
   - [ ] _follow-on (each its own slice + NoREC obligation):_ a variable-width range/tail column (self-delimiting skip, not fixed width); ordered (`ASC`/`DESC`/`NULLS`) keys; `IF NOT EXISTS`; **partial-index relaxations** — a full partial-index scan without a leading access predicate, partial OR/IN / ORDER-BY-skip / INL bounds, an ON CONFLICT partial arbiter, a general predicate-implication prover (beyond the syntactic match). (`jsonb` and composite keys are tracked separately above.)
 - [x] **GIN inverted indexes** (`CREATE INDEX … USING gin`) — a second index *kind* via a type-generic operator-class seam: the **`array_ops`** opclass (one entry per distinct non-NULL element, `format_version` 12's `index_kind` byte, a `gin_entry` cost unit) accelerating `@>`/`&&`/`= ANY(col)`/array `=` for SELECT + GIN-bounded UPDATE/DELETE, over the fixed-width key-encodable element types. → [gin.md](spec/design/gin.md)
   Bounded LIMIT streaming completes the posting gather, then stops candidate table lookups/filtering at the window.
@@ -126,7 +109,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **GiST index access method → `EXCLUDE` constraints** — a third index *kind* (`index_kind = 2`) whose payoff is PG exclusion constraints (`EXCLUDE USING gist (col WITH op)`, `23P01`); an operation-deterministic R-tree (a structural divergence — jed's own tree bytes), the `range_ops` + fixed-width scalar-`=` opclasses, multi-column GiST; `format_version` 21. → [gist.md](spec/design/gist.md), [constraints.md §5](spec/design/constraints.md)
   - [ ] _follow-on (each its own slice + NoREC/oracle obligation):_ the `EXCLUDE … WHERE (predicate)` partial form; `DEFERRABLE` / `INITIALLY DEFERRED` (jed has no deferred-constraint machinery — its own axis); `EXCLUDE USING btree (a WITH =)` lowering an all-`=` exclude onto an ordered unique index; **SP-GiST** (`index_kind = 3`) and GiST KNN `ORDER BY col <-> const` (needs a distance scalar — far off); general-expression WITH operands; multi-column GiST beyond the exclusion shape.
   - [ ] _follow-on — future GiST opclasses (each gated on its type/operator surface landing first):_ **`multirange_ops`** once a multirange type lands ([ranges.md §10](spec/design/ranges.md)); an **`hstore`/dictionary-type opclass** (`@>`/`?`/`?&`/`?|`) for a future map type (a new type axis, or riding the [json.md §3](spec/design/json.md) dictionary door — which brings a **GIN** opclass too); a **`pg_trgm`-style trigram `text` opclass** accelerating similarity (`%`) / `LIKE` / `ILIKE`; an **`intarray`-style signature GiST opclass** over array columns. Each is "build it when its type / operator surface exists"; none is foreclosed by the GiST seam.
-- [x] **`RETURNING`** — `INSERT`/`UPDATE`/`DELETE … RETURNING <items>` evaluated after validation before any write; the PG-18 `old.`/`new.` row-version qualifiers and `WITH (OLD AS o, NEW AS n)` aliasing form have landed, including qualified-star expansion. → [grammar.md §32](spec/design/grammar.md)
 - [x] **`UPSERT` / `ON CONFLICT`** — `INSERT … ON CONFLICT [target] { DO NOTHING | DO UPDATE SET … [WHERE …] }`; the `excluded` pseudo-relation; column-SET or `ON CONSTRAINT name` arbiter; two-phase / all-or-nothing. → [upsert.md](spec/design/upsert.md), [grammar.md §46](spec/design/grammar.md)
   - [ ] _follow-on:_ `DO UPDATE SET col = DEFAULT`; `INSERT INTO t AS alias`; the partial-index `WHERE index_predicate` / `COLLATE`/opclass inference decorations; relaxing the DO UPDATE PK-column assignment (`0A000`) — the standalone UPDATE re-keying has landed, but the conflict-path re-key is still deferred. → [upsert.md §10](spec/design/upsert.md)
 - [x] **`ALTER TABLE`** — catalog-only rename/default/nullability/constraint edits plus the
@@ -200,10 +182,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   transactional v29 `ANALYZE` statistics. The canonical contracts are
   [estimator.md](spec/design/estimator.md), [statistics.md](spec/design/statistics.md),
   [planner.md](spec/design/planner.md), and [explain.md](spec/design/explain.md).
-  - [x] _follow-on:_ cost-based `UPDATE`/`DELETE` access policy — the target scan takes the
-    estimated-cheapest inventory candidate with the canonical tie order; the selected path's
-    emission order is the phase-one visitation (error and `nextval`) order
-    ([estimator.md §9.3](spec/design/estimator.md), `dml.costed_access`).
   - [ ] _follow-on:_ parameter-sensitive/custom prepared plans; planning remains pre-bind today.
   - [ ] _follow-on:_ statistics quality — pattern selectivity, extended/multi-column correlation,
     configurable targets, MCV-aware join skew, automatic analyze, and distribution facts for
@@ -223,25 +201,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   admitted row, before the join and the row account); only the residual is applied to joined rows.
   EXPLAIN shows pushed filters on their Scan; the estimator models both; NoREC `where_pushdown` and
   `contradiction` relations.
-  - [x] _follow-on:_ push WHERE/ON conjuncts **into derived-table bodies** (`query.derived_pushdown`
-    — the body is planned again with them, so they can bound its key), onto **CTE references, SRFs,
-    and catalog relations** in a join, and **single-side ON conjuncts** (`query.on_pushdown` — either
-    side of INNER, the NULL-extended side of LEFT/RIGHT; a pushed ON conjunct is also an access-path
-    input for its relation). [planner.md §3.2–§3.3](spec/design/planner.md); NoREC `on_pushdown` and
-    `derived_pushdown`.
-  - [x] _follow-on:_ push into **grouped bodies** (a conjunct over bare-input grouping columns of a
-    single grouping set moves below the grouping into the body's WHERE; ROLLUP/CUBE/several sets,
-    expression keys, and aggregate outputs stay outside) and into **every set-operation arm** (all six
-    operators, nested; each arm's column must be bare and of exactly the unified output type).
-    [planner.md §3.2](spec/design/planner.md); NoREC `grouped_setop_pushdown`.
   - [ ] _follow-on:_ push into **inlined CTE bodies** (needs per-reference body specialization: the
     inline/materialize mode is decided after the referencing query is planned), **below a window**
     (a conjunct over every PARTITION BY column), and into a **widened set-operation arm** (would need
     the conjunct re-resolved at the arm's type).
-  - [x] _follow-on:_ **contradiction proofs for UPDATE/DELETE** (`dml.where_contradiction`) — the
-    SELECT proof over the target's resolved, unfolded WHERE; a proven mutation reads no target page
-    or row and evaluates no WHERE/SET/CHECK/RETURNING item, while uncorrelated subqueries still fold
-    and charge. [planner.md §3.1](spec/design/planner.md); NoREC `dml_contradiction`.
   - [ ] _follow-on:_ broader safe-conjunct gate (non-trapping casts/functions via a catalog
     `traps` classification) and parameter-time proofs.
   - [ ] _follow-on:_ plan-time **constant folding** / CSE / eliding a pushed recheck that its own
@@ -262,9 +225,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   process/reuse byte parity, and real durable Go benchmarks (1.60–1.65× in the measured Linux cases).
   → [validated COW](spec/design/validated-cow.md),
   [experiment report](spec/design/durable-commit-experiments.md). _(size: L)_
-  - [x] **Recover from serialization-only commit errors** — defer the storage commit guard until
-    encoding succeeds; retain writer/coordinator usability across exclusive, shared, and attachment
-    paths, with shared process coverage and fault-device checks for zero storage mutations.
   - [ ] **macOS measurements** — run the existing pure-Go `F_BARRIERFSYNC`/`F_FULLFSYNC` probe
     and the production validated-COW benchmarks on Mac hardware; Linux cannot establish Apple
     hardware durability or latency. Retain the existing full durable-completion guarantee.
@@ -276,16 +236,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ **OPFS compaction** — write the image to a sibling OPFS file and swap it in once a crash-safe replace is designed for the browser host (`0A000` today). _(size: M)_
   - [ ] _follow-on:_ **in-place trailing-free truncation** — lower `page_count` and truncate when the top pages are all free (the SQLite `incremental_vacuum` flavor): no rewrite, but sequenced against the two-meta fallback and the watermark. _(size: M)_
   - [ ] _follow-on:_ compaction options — repack half-empty leaves (today nodes are kept as-is so costs are unchanged), change `page_size` during the rewrite, and stream the GiST R-tree pages instead of building one index's pages at a time. _(size: M)_
-- [ ] **Attached (linked) databases — Slice 3: multi-file atomic write** — everything else is landed
-  (all 3 cores): the design plus Slices 0 (retire `SHARED` temp), 1a (qualified names), 1b (in-memory
-  `db.attach`/`detach`, N-root commit, cross-attachment joins, read-only `25006`, detach-in-use
-  `55006`), 1b-3 (attachments inside the concurrency differential net), 1c (temp as scoped routing),
-  and 2 (host-API *file* attach + single-database durable write, one-durable-writer `0A000` at
-  commit). Load-bearing decisions are recorded in the doc: attach is host-API only, never SQL; the
-  qualifier is a database, not a schema; no silent shadowing; the linkage is never persisted.
-  Remaining: **multi-file atomic write** — 2PC via a super-journal, lifting the one-durable-writer
-  rule. → [attached-databases.md](spec/design/attached-databases.md) _(size: L; deps: N-root commit
-  (done); §9/§13)_
 - [x] **Blocking sort and hash-operator spill** — `ORDER BY`, hash `JOIN`, `GROUP BY`/aggregate and `DISTINCT` use bounded row/state buffers under `work_mem` on native file hosts. Ordered disk hash partitions preserve JOIN candidate order, aggregate fold order, first occurrence and exact costs; direct scan feeds and cost prepasses stream. Aggregate DISTINCT and growing ordered-set/hypothetical collections spill, with bounded external ordering and descriptor counts. Shared forced-spill corpus checks run in CI; `mise run bench:spill` checks wide-input results/costs and measures RSS. → [spill.md](spec/design/spill.md)
   - [ ] **Remaining query-memory owners** — Q1 (row buffers, result collectors), Q2 (operator state), Q3 (pending writes), and the storage limit (Q4a in-memory, Q4c file-backed — memory.md §8.7) have landed; remaining scalar kernels and host scratch support for OPFS/WASI remain. `work_mem` is an operator threshold, not a whole-query memory ceiling. → [memory.md](spec/design/memory.md), [hosts.md](spec/design/hosts.md)
 - [x] **Point-lookup, cold-read, and INSERT performance work** — the measured point-lookup,
@@ -345,7 +295,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 - [ ] **Differential-testing harness** vs the PostgreSQL oracle (§7) — **PARTIAL.** The live-`db` oracle-import tool is built (`scripts/oracle_import.rb`; `mise run corpus:import` / `corpus:check`; the override ledger `spec/conformance/oracle_overrides.toml`). *Remaining:* the **bulk** bootstrap from PG's *source* test suite (gated on **user-initiated** reference provisioning §12 — never auto-provision). SQLite is deliberately not an oracle; mining its sqllogictest corpus for query *shapes* (answers from PG) is the only oracle-adjacent use. _(size: M remaining)_
 - [ ] **SQLancer-style metamorphic / generative testing** — **PARTIAL.** Built so far (`scripts/norec_gen.rb`; `mise run corpus:norec_sweep`, in `mise run ci`): the **NoREC** slice (pushdown vs non-optimizable rewrite must agree), the **TLP** slice (ternary-logic partitioning — now including **aggregate-TLP** for `COUNT`/`SUM`/`MIN`/`MAX`, both ungrouped via scalar-subquery combination — `SUM` by `COALESCE` (grammar.md §51), `MIN`/`MAX` by `LEAST`/`GREATEST` (grammar.md §52) — and per-`GROUP BY`-group via a UNION-ALL derived-table super-aggregate), and an automatic **reducer** (`scripts/reduce.rb`, ddmin). *Remaining:* **PQS** (pivoted query synthesis — needs an in-harness expression evaluator), `AVG` aggregate-TLP (deferred — its by-construction expected is an exact-`decimal` `SUM`/`COUNT` division whose scale/rounding the generator would have to replicate), and broader NoREC relations. _(size: M remaining)_
-- [x] **Oracle decoupling: stop being calibrated to one PostgreSQL** — **DONE (O1 + O2 + O3).** The corpus's expected output is filled from a live PG server, whose *cluster configuration* — not PostgreSQL itself — changed the answers. **O1:** the oracle's configuration is declared data (`spec/conformance/oracle_profile.toml`) — `[cluster]` facts asserted once per process at connect (abort on mismatch, warn on tzdata drift), `[session]` GUCs applied as `SET LOCAL` in every probe's preamble, a static completeness check in `mise run verify`, and `mise run oracle:setup` / `reset` / `status` / `check`. **O2:** the oracle moved onto a dedicated `jed_oracle` database using PG 17+'s platform-independent **`builtin` `C.UTF-8`** provider, whose code-point ordering *is* jed's single defined `C` collation, so text ordering agrees by construction; four collation entries retired from the override ledger (192 → 188) and a fifth amended (it was really a scan-order entry). **O3:** the RQG firehose's `COLLATE "C"` chokepoint is gone (`scripts/lib/rqg/expr.rb` + 5 `ctx.use(:collate)` sites), and **set-op `ORDER BY` coverage is restored** — `shapes/setop.rb` had omitted it *because* a set-op ORDER BY cannot carry an explicit collation. A 1500-case sweep agreed 1500/1500 with zero divergence, which is the evidence the oracle is locale-independent; `suites/rqg/*.test` regenerated (25 → 30 blocks per shape, zero `COLLATE`, 15 ordered set-op cases). _(size: done)_
 - [ ] **Corpus growth** (ongoing) — keep adding `.test` coverage as each feature lands. Two **standing obligations** (conformance.md §5/§8): (a) on the PG-comparable surface, run `mise run corpus:check` and register any intentional divergence in the override ledger; (b) **when you add a query optimization or a new evaluable query shape, add a NoREC relation for it** to `norec_gen.rb` — the sweep does not discover new optimizations.
 - [ ] **Benchmark backfill** (ongoing) — grow `bench/corpus` beyond the v1 set (benchmarks.md §11): GROUP BY aggregate, miss-heavy point lookups, text/large-value-heavy rows, concurrent-reader cross-engine (PG/SQLite) + truly larger-than-pool eviction/thrashing variants (the jed-only resident and cold-population `concurrent_read_pk*_r{1,4}` pairs landed — benchmarks.md §8.1), cold-open time, durable-commit batch-size sweep. **Standing obligation** (§10): a perf-relevant feature lands with a benchmark; a perf-sensitive change runs the affected benchmarks before/after. _(size: M, ongoing)_
 
@@ -368,13 +317,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ built-in type-vtable dogfood (Fork A).
 - [x] **Host scalar functions over existing types** (extensibility.md §14 step 3, all 3 cores) — a host builds an `ExtensionRegistry` (scalar functions over the built-in types), passes it in `CreateOptions`/`OpenOptions`, and the engine freezes it for the handle + resolves/evaluates host calls through a registry dispatch arm beside the built-in one (reached by id). Exact-signature overloading (built-ins win an exact collision, `42723` on a duplicate registration); ephemeral (no persisted use / no DDL); strict; declared static **cost** charged per call + guarded; wrong-typed kernel result caught (`22000`). → [extensibility.md §4.2 / §5.1](spec/design/extensibility.md)
   - [x] _follow-on:_ **vectorized/batched host-function ABI** — **DONE (all 3 cores).** Every host function runs through a column-in→column-out batch kernel (a single-row kernel is looped); the buffered projection prefetches a chunk of ≤1,024 rows per non-volatile call and replays row by row, so rows/cost/errors are identical to batch-of-one by construction (speculation capped by the cost headroom). Benchmarked by `host_function_{none,row,batch}` (benchmarks.md §8.2). → [extensibility.md §4.2.1](spec/design/extensibility.md)
-    - [x] _follow-on:_ **batch at the pulled sites** — **DONE (all 3 cores).** The streaming primary-key scan (full, range, and interval-set; projection **and** `WHERE`) and the streaming sort/spool emission read their source ahead into a ≤64-row window and replay it row by row; the pull is unmetered and a source error is deferred to its row, so rows/cost/abort points/errors stay identical to batch-of-one (window capped by `LIMIT` and cost headroom). Eligibility widened to calls beneath casts/arithmetic/comparison/unary minus/`NOT`/`IS NULL` and narrowed to functions registered with a batch kernel (a single-row kernel stays batch-of-one — prefetching it saved nothing and cost time); a speculative error on a row replay never evaluates starts a new chunk. Benchmarked by `host_function_stream_{none,row,batch}` (Go −40 ns/row, TS −70 ns/row; Rust's +25 ns/row retention cost was removed by decoding each scan refill into the spent window's row buffers; benchmarks.md §8.2). → [extensibility.md §4.2.1](spec/design/extensibility.md)
     - [ ] _follow-on:_ batch at the remaining row-evaluation sites — index-driven streaming scans (carry the per-row point-lookup charge to replay), streaming joins, `WHERE`/`ON` filters inside blocking scans and joins, aggregate arguments, `INSERT … VALUES`, `UPDATE … SET`, `RETURNING`, index build/maintenance; and calls with arguments beyond column/constant/param. The Ruby gem now exposes host functions, so the bench triples measure a real boundary (benchmarks.md §8.2); the Node/Rust package remains. _(size: M)_
   - [ ] _follow-on:_ non-strict host functions, host functions over container args, and runtime **enforcement** of the recorded `cross_core` declaration (taint/containment of non-cross-core results — no runtime taint mechanism exists yet, matching how `float` is handled at the spec layer). _(`immutable` is now enforced for index-backing, and an immutable host function may back an index — below.)_
 - [x] **Host functions in persisted indexes** (extensibility.md §14 step 4, all 3 cores, `format_version` 31) — **Model B (registry-only, no SQL DDL)**: a `HostFunction` gains `component_id` + `semantic_version`; an `immutable` + versioned host function may back an expression / partial index (`CREATE INDEX ON t (geo_hash(a))`). The index catalog persists a per-index host-function **dependency list** (`index_flags` bit2 `has_host_deps` + the `(name, arg types, result, component_id, semantic_version)` tuples); the per-statement re-resolution re-checks it — a **read** whose candidate index no longer matches skips it (correct heap scan), a **write** is refused (`XX002` component/version mismatch, `42883` missing function), never a silent stale-key read. Also **fixed a latent bug**: a host function (even `volatile`) previously leaked into an index expression (the immutability gate was purely syntactic) — now `42P17`. → [extensibility.md §7 / §8.1 / §11](spec/design/extensibility.md)
-  - [x] **Host functions in `DEFAULT` / `CHECK`** (step 4b, all 3 cores, `format_version` 35) — **DONE.** Before this they were accepted **unchecked**: an unversioned or volatile host function could sit in a `CHECK`, and a swapped implementation silently invalidated the check over stored rows. A `CHECK` now gets the index treatment: a required `component_id` (`42P17`), a per-check dependency list, and `XX002` for any statement that evaluates a check whose registration no longer matches. Reads and `DELETE` are unaffected, and `DROP CONSTRAINT c, ADD CONSTRAINT c CHECK (…)` rebuilds it. A `DEFAULT` persists nothing and resolves lazily, so a missing function is `42883` only for a statement that would apply it. Generated columns are out of scope (jed has no stored generated columns). → [extensibility.md §7.1](spec/design/extensibility.md)
   - [ ] _follow-on:_ the full [compatibility.md](spec/design/compatibility.md) per-object graded reopen manifest (step 4 landed the index-only form); `REINDEX` to rebuild a stale/unusable index.
-- [x] **Host-defined functions must contribute to the cost system** — **design (a) (declared static weight) landed** for the ephemeral slice above: registration carries a non-negative `cost`, charged once per call and guarded against `max_cost` (aborts `54P01` before the kernel runs). The two contracts hold (the untrusted-query bound §13 + cross-core cost identity §8). _Remaining:_ the richer cost designs (b) declared cost-as-a-function-of-arguments and (c) a metering callback for chunk-boundary mid-call abort, and the "no cost ⇒ `max_cost = 0` only" admission (this slice makes `cost` required, always admissible). → cost.md §6. _(size: S; §2/§13)_
 
 ---
 
@@ -411,16 +357,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ## Resource admission follow-through
 
-- [x] **Bound planning work for nested derived tables and views.** Predicate pushdown planned a
-  derived body in full and again with its pushed conjuncts, so planning doubled per nesting level
-  (258 chained views did not finish planning in 10 minutes). Each body is now planned first as a
-  cheap *shape* (outputs and pushability only, reusing the columns of views already planned in the
-  same expansion) and then once for real, so a chain of `d` views plans in `O(d)` and `d` nested
-  derived tables in `O(d²)`. View fan-out (views that each name the previous view twice) is bounded
-  by `MAX_VIEW_EXPANSIONS = 1024` per written view reference (`54001`). Planning stays unmetered.
-  → [planner.md §3.2](spec/design/planner.md), [views.md §4.1](spec/design/views.md),
-  [cost.md §7e](spec/design/cost.md)
-
 - [x] **JSON nesting-depth limit.** A fixed `MAX_JSON_DEPTH = 256` bounds every `json`/`jsonb`
   document where it is produced: the text parser and every nesting constructor (builders,
   aggregates, `to_json[b]`/`array_to_json`, `||`, `jsonb_set`/`jsonb_insert`,
@@ -432,17 +368,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ when jsonpath `.**` lands, keep its recursive descent bounded by document
     depth; when a storable `jsonpath` column lands, its decoder must re-run the compiler's
     nesting gate (`XX001` on a crafted body).
-- [x] Proportional UTF-8 work charging and pre-allocation byte guards for repeat/padding;
-  guarded decimal transcendental entry/series/range-reduction/power steps; finite 64 MiB
-  cumulative scalar allocation allowance (`max_scalar_bytes`, `54P04`), shared across
-  internal meters and frozen cursors. See [cost.md §8](spec/design/cost.md) and
-  [memory.md](spec/design/memory.md).
-- [x] **Q1 — rows.** Live, opt-in `max_query_memory_bytes` account (`54P05`, unlimited by
-  default) over row buffers and engine result collectors, in deterministic logical bytes
-  from the shared schedule (`spec/cost/schedule.toml` `[memory]`, vectors in
-  `spec/cost/memory_sizes.toml`); exact thresholds pinned by `resource/query_memory*.test`;
-  `mise run conformance:query_memory` runs the whole corpus with accounting active. See
-  [memory.md](spec/design/memory.md) §2–§5.
 - [x] **Q2 — operator state.** Hash-join, group, DISTINCT, set-operation and recursive-CTE
   tables (`ENTRY` 32 + key), retained aggregate inputs, window partitions, sort state,
   columnar lanes, and spill structures' resident elements; spill residency is measured on
@@ -461,7 +386,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ a within-statement check (today a statement's own writes are checked once it
     completes, like `max_temp_storage_bytes`), and a net-residency measure (today a rewrite charges again).
 - [x] **Q4a — committed in-memory storage.** A database-owned `max_storage_bytes` (create/attach
-  option + handle setter, unlimited by default; the file form is Q4c below) over
+  option + handle setter, unlimited by default; the file form, Q4c, has landed — memory.md §8.7) over
   `page_count × page_size`, checked at commit before any write; a commit that raises the
   high-water past the limit fails `54P06` after one forced compaction, with a repair exemption for
   pure deletes and drops and a multi-root precheck. The compaction trigger is shared data
@@ -469,33 +394,4 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   cross-core storage comparison in `mise run conformance:query_memory` back it. Thresholds pinned by
   `resource/storage_memory.test` and `concurrency/storage_watermark.test`. Page caches stay
   evict-only under `cache_bytes`. See [memory.md](spec/design/memory.md) §8.
-  - [x] _Q4b:_ the resource-limits web page documents the §8.6 cache rules (evict-only,
-    live-reference overshoot, the interior skeleton and GiST tree outside `cache_bytes`) and the
-    B/2–B sizing note.
-  - [x] _Q4c:_ the file form — `max_storage_bytes` on a file-backed database or file attachment
-    limits its **live** pages (reachable from the catalog root), an exact count persisted at meta
-    offset 56 (`format_version` 34) and advanced by an exact per-commit delta, so the trip point is
-    independent of the free list, the watermark, and co-resident append-only allocation. Create /
-    open / attach options and the setter; no forced compaction. Pinned by
-    `resource/storage_file.test` (disk) and `process/storage_limit.process.toml` (alone vs
-    co-resident); every core recounts each commit by reachability under the disk corpus.
-    See [memory.md](spec/design/memory.md) §8.7.
   - [ ] _follow-on:_ bounding the interior skeleton and resident GiST R-tree once they page.
-- [x] **Output-constructing kernels** ([cost.md §8.1](spec/design/cost.md)). Growth kernels
-  (array/JSON construction, concatenation, escaping renders) charge `scalar_byte × payload(result)`
-  to cost after construction, which closes the geometric-growth hole (a recursive CTE doubling a
-  value for a few units). Amplifiers (`replace`, `regexp_replace`, `array_replace`,
-  `jsonb_pretty`) size their output first, then charge it and reserve it against the scalar
-  allowance. Public docs must still distinguish the implemented budgets from a full heap limit.
-  - [x] _S1:_ `ARRAY[…]`, array `||`/append/prepend/cat; `replace`, `regexp_replace`,
-    `array_replace` (`resource/scalar_output.test`).
-  - [x] _S2:_ JSON construction (jsonb `||`, `jsonb_set`/`insert`, the build/ctor functions,
-    `to_json[b]`, `array_to_json`, `json_scalar`/`json_serialize`, `jsonb_path_query_array`, the
-    `JSON_QUERY` wrapper) and `jsonb_pretty` (`resource/scalar_output_json.test`).
-  - [x] _S3:_ escaping renders: `encode`, `quote_*`, array → text, and jsonb → text/json
-    (`resource/scalar_output_render.test`), and bytea → text (scalar and element-wise). Casts to text
-    from composites and ranges join when those casts land.
-  - [x] _follow-on:_ jsonpath metering ([jsonpath.md §7](spec/design/jsonpath.md)): `jsonpath_compile`
-    per compiled byte and `jsonpath_step` per step application, emitted item, member examined, and
-    comparison pair (`resource/jsonpath_cost.test`). The Rust evaluator now borrows items instead of
-    deep-copying them.
