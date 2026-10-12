@@ -570,6 +570,11 @@ pub struct Engine {
     /// again. A shape skips its own bodies' second planning and stage 3, so every derived body is
     /// planned at most twice per enclosing planning and nesting depth `d` costs `O(d²)`, not `2^d`.
     pub(crate) plan_shape: std::cell::Cell<bool>,
+    /// Whether a FROM reference to a CTE inlined at its reference may plan that CTE's body there
+    /// (spec/design/planner.md §3.4). Off while such a CTE's own definition is planned, so the
+    /// definition — which runs only if the reference is never expanded — expands nothing, and a
+    /// chain of such CTEs plans each body a bounded number of times.
+    pub(crate) cte_expansion_off: std::cell::Cell<bool>,
     /// How many views the outermost view reference being expanded has expanded so far, itself
     /// included (views.md §4.1): at most `MAX_VIEW_EXPANSIONS` (54001).
     pub(crate) view_expansions: std::cell::Cell<usize>,
@@ -1630,6 +1635,14 @@ fn build_prefix_scope<'s>(
 /// term** (its column types fix the synthetic relation's) and `recursive` carries the recursive
 /// term + the `UNION ALL` flag; the binding is in scope inside its own recursive term, so the
 /// self-reference resolves to it (`refs` then counts the self-reference too).
+///
+/// A CTE **inlined at its reference** (`at_reference`, spec/design/planner.md §3.4) — a
+/// non-recursive, uncorrelated query CTE, not `MATERIALIZED`, whose statement names it exactly once
+/// — keeps its body syntax (`body_ast`): its one FROM reference plans the body again, there, like a
+/// derived table, so stage 2 can push conjuncts into it. `source` is then the body planned without
+/// any such expansion (its own references to other such CTEs stay unexpanded), which runs only if
+/// the reference was never expanded. `expanded` records that the reference was: a binding is
+/// expanded at most once per statement, and an expanded binding is always inlined.
 pub(crate) struct CteBinding {
     name: String,
     table: Box<Table>,
@@ -1637,6 +1650,53 @@ pub(crate) struct CteBinding {
     recursive: Option<RecursiveTerm>,
     hint: Option<bool>,
     refs: std::cell::Cell<usize>,
+    at_reference: bool,
+    body_ast: Option<QueryExpr>,
+    expanded: std::cell::Cell<bool>,
+}
+
+/// The query that owns a `WITH` list — its main body, which (with the later CTE bodies) holds the
+/// static references that decide whether a CTE is inlined at its reference (planner.md §3.4).
+#[derive(Clone, Copy)]
+pub(crate) enum CtePrimary<'q> {
+    Body(&'q CteBody),
+    Query(&'q QueryExpr),
+}
+
+impl CtePrimary<'_> {
+    /// The static (syntactic) references to CTE `name` in the primary: `(query, data-modifying)`.
+    fn refs(self, name: &str) -> (usize, usize) {
+        match self {
+            CtePrimary::Body(b) => static_cte_refs(b, name),
+            CtePrimary::Query(q) => (count_self_refs_query(q, name), 0),
+        }
+    }
+}
+
+/// The static references to CTE `name` in one part of a `WITH` statement, as `(query,
+/// data-modifying)`: a data-modifying part's references are counted apart, because such a part is
+/// planned only when it runs, so a CTE it names is never inlined at its reference (planner.md
+/// §3.4).
+fn static_cte_refs(body: &CteBody, name: &str) -> (usize, usize) {
+    let n = count_cte_refs_dml(body, name);
+    if body.is_data_modifying() {
+        (0, n)
+    } else {
+        (n, 0)
+    }
+}
+
+/// Whether the CTE at `ci` in a `WITH` list may be inlined at its reference (planner.md §3.4): not
+/// `MATERIALIZED`, and named exactly once by the later CTE bodies and the primary, by a query part.
+fn cte_reference_candidate(ctes: &[Cte], ci: usize, primary: CtePrimary<'_>) -> bool {
+    let name = ctes[ci].name.as_str();
+    let (mut query, mut dml) = primary.refs(name);
+    for later in &ctes[ci + 1..] {
+        let (q, d) = static_cte_refs(&later.body, name);
+        query += q;
+        dml += d;
+    }
+    query == 1 && dml == 0 && ctes[ci].materialized != Some(true)
 }
 
 /// What a CTE binding evaluates to (spec/design/cte.md, writable-cte.md). A plain CTE holds a
@@ -4064,6 +4124,11 @@ fn cte_modes(bindings: &[CteBinding]) -> Vec<CteMode> {
         .map(|b| {
             if b.recursive.is_some() || matches!(b.source, CteSource::Dml(_)) {
                 return CteMode::Materialize;
+            }
+            // A body planned at its reference is inlined there (planner.md §3.4), even if the
+            // static count missed a reference the planner then resolved.
+            if b.expanded.get() {
+                return CteMode::Inline;
             }
             match b.hint {
                 Some(true) => CteMode::Materialize,

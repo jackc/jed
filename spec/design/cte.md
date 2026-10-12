@@ -114,6 +114,13 @@ CTE is planned and type-checked (its errors still surface) but **not executed**.
 The deterministic cost formula for both paths is specified in [cost.md](cost.md) §3 (the
 `cte_scan_row` unit for materialized buffer scans; inlined bodies charge their intrinsic cost).
 
+**Planned at its reference.** A single-reference inlined CTE whose one reference is in a query part
+(not a data-modifying one) and whose body is uncorrelated is planned **at that reference**, like a
+derived table, so the referencing query's predicates can be pushed into its body ([planner.md](
+planner.md) §3.4). The decision is made from the static count when the `WITH` is planned; such a CTE is
+always inlined. Its rows are unchanged — it was inlined either way — and its cost changes only by the
+pushdowns its body now takes.
+
 ## 4. Errors
 
 | Condition | Code | Notes |

@@ -87,6 +87,11 @@ impl Engine {
     /// body is never the recursive `UNION` shape, so it is always `NonRecursive`. The `refs` counters
     /// are bumped as later query bodies / a query primary reference each binding (a data-modifying
     /// part's references are static-counted by the orchestrator, since it is not planned here).
+    ///
+    /// `primary` is the query that owns the list: a CTE that the later bodies and `primary` name
+    /// exactly once is a candidate to be inlined at its reference (planner.md §3.4). Its definition
+    /// is planned with reference expansion off, so a chain of such CTEs plans each body a bounded
+    /// number of times.
     pub(crate) fn plan_cte_bindings<'a>(
         &'a self,
         ctes: &[Cte],
@@ -94,9 +99,10 @@ impl Engine {
         inherited: &[&CteBinding],
         parent: Option<&Scope<'a>>,
         ptypes: &mut ParamTypes,
+        primary: CtePrimary<'_>,
     ) -> Result<Vec<CteBinding>> {
         let mut bindings: Vec<CteBinding> = Vec::new();
-        for cte in ctes {
+        for (ci, cte) in ctes.iter().enumerate() {
             let lname = cte.name.to_string();
             if bindings.iter().any(|b| b.name == lname) {
                 return Err(EngineError::new(
@@ -131,6 +137,9 @@ impl Engine {
                         recursive: None,
                         hint: cte.materialized,
                         refs: std::cell::Cell::new(0),
+                        at_reference: false,
+                        body_ast: None,
+                        expanded: std::cell::Cell::new(false),
                     });
                     // Plan the recursive term with the self-binding now visible.
                     let i = bindings.len() - 1;
@@ -155,7 +164,25 @@ impl Engine {
                     CteBody::Query(q) => {
                         let visible: Vec<&CteBinding> =
                             inherited.iter().copied().chain(bindings.iter()).collect();
-                        let plan = self.plan_query(q, parent, &visible, ptypes)?;
+                        // Named exactly once, by a query part, and not MATERIALIZED: a candidate
+                        // to be inlined at its reference (planner.md §3.4). Its definition then
+                        // expands no reference of its own; an uncorrelated candidate keeps that
+                        // definition, a correlated one is planned again with expansion on (it
+                        // stays an ordinary CTE).
+                        let candidate = cte_reference_candidate(ctes, ci, primary);
+                        let mut plan = if candidate {
+                            self.without_cte_expansion(|| {
+                                self.plan_query(q, parent, &visible, ptypes)
+                            })?
+                        } else {
+                            self.plan_query(q, parent, &visible, ptypes)?
+                        };
+                        let at_reference = candidate && !query_plan_references_outer(&plan, 0);
+                        if candidate && !at_reference {
+                            plan = self.plan_again(&visible, || {
+                                self.plan_query(q, parent, &visible, ptypes)
+                            })?;
+                        }
                         let table = cte_synthetic_table(&lname, &plan, cte.columns.as_deref())?;
                         bindings.push(CteBinding {
                             name: lname,
@@ -164,6 +191,9 @@ impl Engine {
                             recursive: None,
                             hint: cte.materialized,
                             refs: std::cell::Cell::new(0),
+                            at_reference,
+                            body_ast: at_reference.then(|| q.clone()),
+                            expanded: std::cell::Cell::new(false),
                         });
                     }
                     dm_body => {
@@ -185,6 +215,9 @@ impl Engine {
                             recursive: None,
                             hint: cte.materialized,
                             refs: std::cell::Cell::new(0),
+                            at_reference: false,
+                            body_ast: None,
+                            expanded: std::cell::Cell::new(false),
                         });
                     }
                 },
@@ -285,7 +318,14 @@ impl Engine {
     /// parts.
     pub(crate) fn run_with(&self, wq: WithQuery, params: &[Value]) -> Result<SelectResult> {
         let mut ptypes = ParamTypes::default();
-        let bindings = self.plan_cte_bindings(&wq.ctes, wq.recursive, &[], None, &mut ptypes)?;
+        let bindings = self.plan_cte_bindings(
+            &wq.ctes,
+            wq.recursive,
+            &[],
+            None,
+            &mut ptypes,
+            CtePrimary::Body(&wq.body),
+        )?;
         // (2) Plan the main body with all bindings visible (the pure-query path always has a query
         //     primary — a data-modifying primary routes to execute_with_dml).
         let body_q = wq.body.as_query().expect("run_with is the pure-query path");
@@ -529,7 +569,14 @@ impl Engine {
         } = wq;
         let mut ptypes = ParamTypes::default();
         // (1) Plan every CTE binding (query plans + data-modifying RETURNING schemas).
-        let bindings = self.plan_cte_bindings(&ctes, recursive, &[], None, &mut ptypes)?;
+        let bindings = self.plan_cte_bindings(
+            &ctes,
+            recursive,
+            &[],
+            None,
+            &mut ptypes,
+            CtePrimary::Body(&body),
+        )?;
         // (2) Plan a query primary now (to bump refs + surface resolution errors, incl. a 0A000 FROM
         //     reference to a no-RETURNING data-modifying CTE). A data-modifying primary is resolved
         //     and run later (it sees the bindings via the threaded context); its references are
@@ -764,7 +811,14 @@ impl Engine {
                 ),
             ));
         }
-        let bindings = self.plan_cte_bindings(&we.ctes, we.recursive, ctes, parent, ptypes)?;
+        let bindings = self.plan_cte_bindings(
+            &we.ctes,
+            we.recursive,
+            ctes,
+            parent,
+            ptypes,
+            CtePrimary::Query(&we.body),
+        )?;
         let visible: Vec<&CteBinding> = ctes.iter().copied().chain(bindings.iter()).collect();
         let body = self.plan_query(&we.body, parent, &visible, ptypes)?;
         let modes = cte_modes(&bindings);

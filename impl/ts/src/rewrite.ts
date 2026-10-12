@@ -314,12 +314,13 @@ function bodyPushable(rel: PlanRel): QueryPlan | null {
 }
 
 // queryBodyPushable is the structural half of body-pushability (planner.md §3.2): a SELECT with no
-// window function, LIMIT, or OFFSET that is either ungrouped or grouped by exactly one grouping set
-// with at least one key; or a set operation without LIMIT/OFFSET whose two arms are body-pushable.
+// LIMIT or OFFSET that is either ungrouped or grouped by exactly one grouping set with at least one
+// key (window functions admitted — bodyInputColumn then requires every window to partition by the
+// column); or a set operation without LIMIT/OFFSET whose two arms are body-pushable.
 function queryBodyPushable(q: QueryPlan): boolean {
   switch (q.kind) {
     case "select":
-      if (q.hasWindow || q.limit !== null || q.offset !== null) return false;
+      if (q.limit !== null || q.offset !== null) return false;
       return !q.isAgg || (q.groupSets.length === 1 && q.groupKeys.length > 0);
     case "setOp":
       return (
@@ -335,10 +336,13 @@ function queryBodyPushable(q: QueryPlan): boolean {
 
 // bodyInputColumn returns the FROM slot a body-pushable SELECT's output column j reads, null when
 // the select-list item is not a bare column. In a grouped body the item must be a grouping column: a
-// plain input column of the master grouping list (an expression key's synthetic slot is not).
+// plain input column of the master grouping list (an expression key's synthetic slot is not). Below a
+// window the item's slot must also be a bare PARTITION BY key of every window function, so a conjunct
+// over it keeps or drops whole partitions.
 function bodyInputColumn(b: SelectPlan, j: number): number | null {
   const item = b.projections[j];
   if (item === undefined || item.kind !== "column") return null;
+  if (b.hasWindow && !b.windowSpecs.every((w) => w.partition.includes(item.index))) return null;
   if (!b.isAgg) return item.index;
   const gk = b.groupKeys[item.index];
   if (gk === undefined) return null;

@@ -397,7 +397,7 @@ type explainWithPlan struct {
 
 func (db *engine) planExplainWithDml(wq *withQuery) (*explainWithPlan, error) {
 	ptypes := &paramTypes{}
-	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, nil, nil, ptypes)
+	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, nil, nil, ptypes, ctePrimary{body: &wq.Body})
 	if err != nil {
 		return nil, err
 	}
@@ -437,8 +437,11 @@ func (db *engine) renderExplainWithDml(r *explainRender, wq *withQuery, depth in
 			if err := db.renderExplainWithBindings(r, &stmt, depth+2, plan.bindings[:i]); err != nil {
 				return err
 			}
-		} else if err := db.renderQueryPlan(r, binding.plan, depth+2); err != nil {
-			return err
+		} else if !binding.expanded {
+			// A body planned at its reference renders there instead (planner.md §3.4).
+			if err := db.renderQueryPlan(r, binding.plan, depth+2); err != nil {
+				return err
+			}
 		}
 	}
 	if plan.primary != nil {
@@ -922,6 +925,10 @@ func (db *engine) renderRelLeaf(r *explainRender, sp *selectPlan, i, depth int, 
 		return nil
 	case rel.cte != nil:
 		r.emit(depth, "CTE Scan "+rel.tableName, withNote(pushedFilterDetail(sp, i, "", r.verbose), note))
+		// A CTE inlined at its reference renders the body planned there (planner.md §3.4).
+		if rel.derived != nil {
+			return db.renderQueryPlan(r, *rel.derived, depth+1)
+		}
 		return nil
 	case rel.derived != nil:
 		r.emit(depth, "Subquery "+rel.tableName, withNote(pushedFilterDetail(sp, i, "", r.verbose), note))
@@ -993,7 +1000,8 @@ func (db *engine) renderWithPlan(r *explainRender, wp *withPlan, depth int) erro
 			mode = wp.modes[i]
 		}
 		r.emit(depth+1, "CTE "+b.name, cteDetail(b, mode))
-		if !b.isDml() {
+		// A body planned at its reference renders there instead (planner.md §3.4).
+		if !b.isDml() && !b.expanded {
 			if err := db.renderQueryPlan(r, b.plan, depth+2); err != nil {
 				return err
 			}

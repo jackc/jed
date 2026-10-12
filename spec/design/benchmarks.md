@@ -140,6 +140,25 @@ per-lane checksums. The `jed/wasm/wrap` lane did not run: the WASI wrap opens fi
 corpus pins (subquery/grouped_setop_pushdown.test, oracle-checked) and the `grouped_setop_pushdown`
 NoREC relation are the correctness proof.
 
+**Window and inlined-CTE pushdown result (2026-10-12).** `window_pushdown_pk` reads
+`SELECT … FROM (SELECT g, id, row_number() OVER (PARTITION BY g ORDER BY v, id) FROM t) d WHERE d.g =
+500 ORDER BY d.id` over 100k rows keyed `(g, id)`; every window partitions by `g`, so the conjunct
+moves below the window, bounds the primary-key prefix, and only one 100-row partition is read and
+numbered. `cte_pushdown_pk` reads `WITH c AS (SELECT id, v FROM t) SELECT … FROM c WHERE c.id =
+50000`; the CTE is named once, so it is planned at its reference and the conjunct seeks the 100k-row
+table's primary key. Each `_residual` reference spells the conjunct `+ 0`, which is exactly the plan
+these queries had before (window bodies and inlined CTE bodies were not pushed into). Median per-query
+time, reference → pushed: `window_pushdown_pk` **52.2 ms → 66.8 µs Go**, 39.0 ms → 47.6 µs Rust,
+108.3 ms → 251.2 µs TypeScript (PostgreSQL via pgx 1.67 ms → 54.7 µs); `cte_pushdown_pk`
+**18.2 ms → 26.6 µs Go**, 18.1 ms → 16.3 µs Rust, 20.6 ms → 49.2 µs TypeScript (PostgreSQL via pgx
+1.57 ms → 7.3 µs). The window lane returns 100 rows, so hosts that marshal rows (the TS core, the
+Node and Ruby wraps) spend most of their pushed time there. The `derived_pushdown_pk`,
+`grouped_pushdown_pk`, and `setop_pushdown_pk` controls stayed at 7.6–22.4 µs, 52.4–119.2 µs, and
+12.6–37.2 µs across the cores. Every jed core and wrap (including `jed/wasm/wrap`, which ran this
+time) and every PostgreSQL driver returned the same per-lane checksums. The shared corpus pins
+(subquery/cte_window_pushdown.test, oracle-checked) and the `cte_window_pushdown` NoREC relation are
+the correctness proof.
+
 **DML contradiction result (2026-10-09).** The new `dml_contradiction` lane deletes from the
 1M-row `orders` table with `amount > 100000 AND amount < 50` (unindexed, provably empty) and rolls
 back each iteration. Before the rule each core full-scanned every row and evaluated the WHERE; now no

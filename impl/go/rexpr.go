@@ -1309,6 +1309,14 @@ const (
 // (its column types fix the synthetic relation's) and recursive carries the recursive term + the
 // UNION ALL flag; the binding is in scope inside its own recursive term, so the self-reference
 // resolves to it (refs then counts the self-reference too).
+//
+// A CTE inlined at its reference (atReference, spec/design/planner.md §3.4) — a non-recursive,
+// uncorrelated query CTE, not MATERIALIZED, whose statement names it exactly once — keeps its body
+// syntax (bodyAst): its one FROM reference plans the body again, there, like a derived table, so
+// stage 2 can push conjuncts into it. plan is then the body planned without any such expansion (its
+// own references to other such CTEs stay unexpanded), which runs only if the reference was never
+// expanded. expanded records that the reference was: a binding is expanded at most once per
+// statement, and an expanded binding is always inlined.
 type cteBinding struct {
 	name  string
 	table *catTable
@@ -1321,6 +1329,10 @@ type cteBinding struct {
 	recursive *recursiveTerm
 	hint      *bool
 	refs      int
+	// atReference, bodyAst, and expanded are the inlined-at-reference state described above.
+	atReference bool
+	bodyAst     *queryExpr
+	expanded    bool
 }
 
 // isDml reports whether this binding is a data-modifying CTE (its source is a statement, not a query

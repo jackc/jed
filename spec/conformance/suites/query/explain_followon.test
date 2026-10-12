@@ -123,13 +123,13 @@ deferred
 CTE q
 inlined
 deferred
-2
-Scan t
-Full scan; touched=1
-deferred
 1
 CTE Scan q
 -
+deferred
+2
+Scan t
+Full scan; touched=1
 deferred
 
 # Actual attribution is execution-only. An unused definition remains visible as plan metadata, but

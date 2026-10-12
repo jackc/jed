@@ -101,6 +101,12 @@
 #              keeps them outside. Grouped bodies (HAVING, joined), a never-pushed ROLLUP body, all
 #              six set operators, and a grouped arm over NULL-bearing data must match by-construction
 #              rows.
+#   cte_window_pushdown — conjuncts over every window's PARTITION BY column move below the window, and
+#              conjuncts over a CTE inlined at its one reference move into its body (planner.md
+#              §3.2/§3.4); `col + 0` keeps them outside. Row numbers, running and whole-partition
+#              aggregates, a never-pushed non-partition column, a grouped window body, single-reference
+#              CTEs (joined, chained, grouped, windowed, NULL-extended) and a two-reference
+#              (materialized) CTE must match by-construction rows.
 #   contradiction — a provably-never-TRUE bare-column literal AND-chain reads no relation
 #              (planner.md §3.1); the same predicate over `col + 0` is not proven and scans. Both must be
 #              empty (an ungrouped COUNT returns 0), and satisfiable near-miss ranges must match.
@@ -371,6 +377,15 @@ GROUPED_SETOP_PUSHDOWN_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.
                                 query.is_null query.is_distinct_from query.where_pushdown
                                 query.derived_pushdown query.derived_table expr.arithmetic expr.between
                                 expr.comparison_value null.three_valued types.i32].freeze
+CTE_WINDOW_PUSHDOWN_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row
+                             query.select query.where_eq query.comparison_order
+                             query.logical_connectives query.order_by query.order_by_keys
+                             query.qualified_column query.join_inner query.join_left query.aggregates
+                             query.group_by query.union query.is_null query.is_distinct_from
+                             query.where_pushdown query.derived_pushdown query.on_pushdown
+                             query.derived_table query.cte query.window query.window_aggregate
+                             expr.arithmetic expr.between expr.comparison_value null.three_valued
+                             types.i32].freeze
 VIEW_REQ = %w[ddl.view ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
               query.where_eq query.comparison_order query.logical_connectives query.order_by
               query.order_by_keys query.qualified_column query.join_inner query.aggregates
@@ -3193,6 +3208,157 @@ def gen_grouped_setop_pushdown(seed)
   out.join("\n") + "\n"
 end
 
+# Pushdown below a window and into inlined CTE bodies (planner.md §3.2/§3.4). A conjunct over a column
+# every window partitions by moves below the window; a conjunct over a CTE inlined at its one reference
+# moves into its body. The `+ 0` spelling never moves. Row numbers, running and whole-partition
+# aggregates, a non-partition column (never pushed below the window), a grouped window body, and
+# single- and two-reference CTEs over NULL-bearing data must match by-construction rows.
+def gen_cte_window_pushdown(seed)
+  rng = Random.new(seed)
+  val = -> { rng.rand < 0.2 ? nil : rng.rand(0..10) }
+  t = (1..30).to_a.sample(10, random: rng).sort.map { |id| [id, rng.rand < 0.15 ? nil : rng.rand(1..5), val.call] }
+  u = (1..6).to_a.sample(4, random: rng).sort.map { |id| [id, val.call] }
+  lit = ->(x) { x.nil? ? "NULL" : x.to_s }
+  nkey = ->(x) { x.nil? ? [1, 0] : [0, x] }
+  flat = lambda do |rows|
+    rows.sort_by { |r| r.flat_map { |x| nkey.call(x) } }.flat_map { |r| r.map { |x| lit.call(x) } }
+  end
+  pick = lambda do |col|
+    sql, fn = WHERE_PUSHDOWN_TEMPLATES.sample(random: rng).call(col, rng)
+    [sql, fn, sql.gsub(col, "#{col} + 0")]
+  end
+  pair = lambda do |out, cols, sql, exp|
+    out << "# pushed spelling"
+    q(out, cols, sql.call(0), flat.call(exp))
+    out << "# `+ 0` spelling is never pushed — MUST match"
+    q(out, cols, sql.call(1), flat.call(exp))
+  end
+  sum = ->(xs) { (vs = xs.compact).empty? ? nil : vs.sum }
+  # t's rows of the partition of k (NULL is one partition), in id order (t is id-sorted).
+  part = ->(k) { t.select { |r| r[1] == k } }
+
+  out = header(seed, CTE_WINDOW_PUSHDOWN_REQ, "pushdown below a window and into inlined CTE bodies")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, k i32, v i32)")
+  stmt(out, "CREATE TABLE u (id i32 PRIMARY KEY, w i32)")
+  stmt(out, "INSERT INTO t VALUES #{t.map { |id, k, v| "(#{id}, #{lit.call(k)}, #{lit.call(v)})" }.join(', ')}")
+  stmt(out, "INSERT INTO u VALUES #{u.map { |id, w| "(#{id}, #{lit.call(w)})" }.join(', ')}")
+
+  pk_sql, pk, pk_scan = pick.call("d.k")
+  exp = t.select { |_, k, _| pk.call(k) == true }.map { |id, k, _| [id, k, part.call(k).index { |r| r[0] == id } + 1] }
+  out << "# row_number() partitioned by k: the k conjunct moves below the window"
+  pair.call(out, "III", lambda { |m|
+    "SELECT d.id, d.k, d.rn FROM (SELECT id, k, row_number() OVER (PARTITION BY k ORDER BY id) AS rn FROM t) d " \
+      "WHERE #{[pk_sql, pk_scan][m]} ORDER BY d.id, d.k, d.rn"
+  }, exp)
+
+  pk_sql, pk, pk_scan = pick.call("d.k")
+  exp = t.select { |_, k, _| pk.call(k) == true }.map do |id, k, _|
+    rows = part.call(k)
+    [id, k, sum.call(rows.take_while { |r| r[0] <= id }.map { |r| r[2] }), rows.size, sum.call(rows.map { |r| r[2] })]
+  end
+  out << "# running and whole-partition window aggregates"
+  pair.call(out, "IIIII", lambda { |m|
+    "SELECT d.id, d.k, d.run, d.n, d.tot FROM (SELECT id, k, sum(v) OVER (PARTITION BY k ORDER BY id) AS run, " \
+      "count(*) OVER (PARTITION BY k) AS n, sum(v) OVER (PARTITION BY k) AS tot FROM t) d " \
+      "WHERE #{[pk_sql, pk_scan][m]} ORDER BY d.id, d.k, d.run, d.n, d.tot"
+  }, exp)
+
+  pk_sql, pk, pk_scan = pick.call("d.k")
+  exp = t.select { |_, k, _| pk.call(k) == true }
+         .map { |id, k, v| [id, k, t.count { |r| r[1] == k && r[2] == v }] }
+  out << "# two windows, partitioned by k and by (k, v): a k conjunct is in both partitions"
+  pair.call(out, "III", lambda { |m|
+    "SELECT d.id, d.k, d.n FROM (SELECT id, k, count(*) OVER (PARTITION BY k, v) AS n, " \
+      "row_number() OVER (PARTITION BY k ORDER BY id) AS rn FROM t) d " \
+      "WHERE #{[pk_sql, pk_scan][m]} ORDER BY d.id, d.k, d.n"
+  }, exp)
+
+  pv_sql, pv, pv_scan = pick.call("d.v")
+  exp = t.select { |_, _, v| pv.call(v) == true }.map { |id, k, v| [id, v, part.call(k).index { |r| r[0] == id } + 1] }
+  out << "# a conjunct over v, which the window does not partition by, is never pushed below it"
+  pair.call(out, "III", lambda { |m|
+    "SELECT d.id, d.v, d.rn FROM (SELECT id, k, v, row_number() OVER (PARTITION BY k ORDER BY id) AS rn FROM t) d " \
+      "WHERE #{[pv_sql, pv_scan][m]} ORDER BY d.id, d.v, d.rn"
+  }, exp)
+
+  pk_sql, pk, pk_scan = pick.call("d.k")
+  groups = t.map { |_, k, v| [k, v] }.uniq
+  exp = groups.select { |k, _| pk.call(k) == true }
+              .map { |k, v| [k, v, t.count { |r| r[1] == k && r[2] == v }, groups.count { |g| g[0] == k }] }
+  out << "# a grouped body with a window partitioned by a grouping column"
+  pair.call(out, "IIII", lambda { |m|
+    "SELECT d.k, d.v, d.n, d.g FROM (SELECT k, v, count(*) AS n, count(*) OVER (PARTITION BY k) AS g " \
+      "FROM t GROUP BY k, v) d WHERE #{[pk_sql, pk_scan][m]} ORDER BY d.k, d.v, d.n, d.g"
+  }, exp)
+
+  pk_sql, pk, pk_scan = pick.call("c.k")
+  pv_sql, pv, pv_scan = pick.call("c.v")
+  exp = t.select { |_, k, v| pk.call(k) == true && pv.call(v) == true }
+  out << "# a single-reference CTE: both conjuncts move into its body"
+  pair.call(out, "III", lambda { |m|
+    "WITH c AS (SELECT id, k, v FROM t) SELECT c.id, c.k, c.v FROM c " \
+      "WHERE #{[pk_sql, pk_scan][m]} AND #{[pv_sql, pv_scan][m]} ORDER BY c.id, c.k, c.v"
+  }, exp)
+
+  pv_sql, pv, pv_scan = pick.call("c.v")
+  exp = t.select { |_, _, v| pv.call(v) == true }
+         .flat_map { |id, k, _| u.select { |ur| ur[0] == k }.map { |ur| [id, ur[1]] } }
+  out << "# a single-reference CTE joined to u"
+  pair.call(out, "II", lambda { |m|
+    "WITH c AS (SELECT id, k, v FROM t) SELECT c.id, u.w FROM c JOIN u ON c.k = u.id " \
+      "WHERE #{[pv_sql, pv_scan][m]} ORDER BY c.id, u.w"
+  }, exp)
+
+  pv_sql, pv, pv_scan = pick.call("a.v")
+  pk_sql, pk, pk_scan = pick.call("b.k")
+  exp = t.select { |_, k, v| pv.call(v) == true && pk.call(k) == true }.map { |id, k, _| [id, k] }
+  out << "# a chain: b's own conjunct and the outer one both move into a"
+  pair.call(out, "II", lambda { |m|
+    "WITH a AS (SELECT id, k, v FROM t), b AS (SELECT id, k FROM a WHERE #{[pv_sql, pv_scan][m]}) " \
+      "SELECT b.id, b.k FROM b WHERE #{[pk_sql, pk_scan][m]} ORDER BY b.id, b.k"
+  }, exp)
+
+  pk_sql, pk, pk_scan = pick.call("s.k")
+  exp = t.group_by { |_, k, _| k }.select { |k, _| pk.call(k) == true }
+         .map { |k, rows| [k, rows.size, sum.call(rows.map { |r| r[2] })] }
+  out << "# a grouped CTE body"
+  pair.call(out, "III", lambda { |m|
+    "WITH s AS (SELECT k, count(*) AS n, sum(v) AS total FROM t GROUP BY k) SELECT s.k, s.n, s.total FROM s " \
+      "WHERE #{[pk_sql, pk_scan][m]} ORDER BY s.k, s.n, s.total"
+  }, exp)
+
+  pk_sql, pk, pk_scan = pick.call("r.k")
+  exp = t.select { |_, k, _| pk.call(k) == true }.map { |id, k, _| [id, k, part.call(k).size] }
+  out << "# a CTE body with a window partitioned by the pushed column"
+  pair.call(out, "III", lambda { |m|
+    "WITH r AS (SELECT id, k, count(*) OVER (PARTITION BY k) AS n FROM t) SELECT r.id, r.k, r.n FROM r " \
+      "WHERE #{[pk_sql, pk_scan][m]} ORDER BY r.id, r.k, r.n"
+  }, exp)
+
+  pv_sql, pv, pv_scan = pick.call("c.v")
+  exp = u.flat_map do |uid, _|
+    hits = t.select { |_, k, v| k == uid && pv.call(v) == true }
+    hits.empty? ? [[uid, nil]] : hits.map { |id, _, _| [uid, id] }
+  end
+  out << "# the NULL-extended side of a LEFT JOIN takes the ON conjunct into its body"
+  pair.call(out, "II", lambda { |m|
+    "WITH c AS (SELECT id, k, v FROM t) SELECT u.id, c.id FROM u LEFT JOIN c ON c.k = u.id " \
+      "AND #{[pv_sql, pv_scan][m]} ORDER BY u.id, c.id"
+  }, exp)
+
+  p1_sql, p1, p1_scan = pick.call("c.k")
+  p2_sql, p2, p2_scan = pick.call("c.v")
+  exp = t.select { |_, k, _| p1.call(k) == true }.map { |id, _, _| [id] } +
+        t.select { |_, _, v| p2.call(v) == true }.map { |id, _, _| [id] }
+  out << "# two references materialize the CTE: no body pushdown, the same rows"
+  pair.call(out, "I", lambda { |m|
+    "WITH c AS (SELECT id, k, v FROM t) SELECT x.id FROM (SELECT c.id FROM c WHERE #{[p1_sql, p1_scan][m]} " \
+      "UNION ALL SELECT c.id FROM c WHERE #{[p2_sql, p2_scan][m]}) x ORDER BY x.id"
+  }, exp)
+
+  out.join("\n") + "\n"
+end
+
 SCENARIOS = {
   "pushdown" => method(:gen_pushdown),
   "composite_pk" => method(:gen_composite_pk),
@@ -3239,6 +3405,7 @@ SCENARIOS = {
   "on_pushdown" => method(:gen_on_pushdown),
   "derived_pushdown" => method(:gen_derived_pushdown),
   "grouped_setop_pushdown" => method(:gen_grouped_setop_pushdown),
+  "cte_window_pushdown" => method(:gen_cte_window_pushdown),
   "view" => method(:gen_view),
   "view_write" => method(:gen_view_write),
 }.freeze

@@ -71,16 +71,17 @@ with resolution, not with the rules.
 
 Stage 2 sits at a fixed position in each core's `planSelect`, after the logical plan and its
 `relMasks` annotation are complete and before `optimizeSelect`. Its one driver, `rewriteWhere`, runs
-contradiction detection (§3.1) and, when that does not fire, predicate pushdown of the WHERE (§3.2) and
-of each join's ON (§3.3). It records its decision in a `pushdown` annotation of the plan and **never
-rewrites `filter` or an ON**: the complete WHERE and every complete ON remain the input every
-access-path detector, index-nested-loop detector, hash-key detector, join-dependency walk, touched-set
-walk, and selectivity rule reads, so bounds and estimates see exactly the predicates they saw before.
+contradiction detection (§3.1) and, when that does not fire, predicate pushdown of the WHERE (§3.2)
+and of each join's ON (§3.3) — including into the body of a CTE inlined at its reference (§3.4). It
+records its decision in a `pushdown` annotation of the plan and **never rewrites `filter` or an
+ON**: the complete WHERE and every complete ON remain the input every access-path detector,
+index-nested-loop detector, hash-key detector, join-dependency walk, touched-set walk, and
+selectivity rule reads, so bounds and estimates see exactly the predicates they saw before.
 Execution reads the annotation: a contradiction reads nothing, a pushed filter runs inside its
 relation's scan, and only the **residuals** (`postJoinFilter`, and each join's residual ON) are
-evaluated over joined rows. The one rewrite that does change a predicate is §3.2's **body pushdown**,
-and it changes only a derived table's *body*, which is planned again as if the conjuncts had been
-written there.
+evaluated over joined rows. The one rewrite that does change a predicate is §3.2's **body
+pushdown**, and it changes only a derived table's (or an inlined CTE's, §3.4) *body*, which is
+planned again as if the conjuncts had been written there.
 
 The contract every rewrite rule meets:
 
@@ -174,11 +175,12 @@ With no contradiction, each top-level WHERE conjunct, in source order, is **push
 
 A pushed conjunct then takes the first of these forms that applies:
 
-1. **Body pushdown** (`query.derived_pushdown`) — relation `i` is a derived table whose body is
-   **body-pushable** (below) and every column the conjunct references is a **pushable output
-   column** (below). The conjunct is rewritten with each reference replaced by the body column that
-   output reads, and moves *into* the body — into every SELECT of a set operation. Applies with any
-   number of FROM relations, including one (`SELECT … FROM (SELECT …) d WHERE d.k = 5`).
+1. **Body pushdown** (`query.derived_pushdown`) — relation `i` is a derived table, or a reference to
+   a CTE inlined at its reference (§3.4), whose body is **body-pushable** (below) and every column
+   the conjunct references is a **pushable output column** (below). The conjunct is rewritten with
+   each reference replaced by the body column that output reads, and moves *into* the body — into
+   every SELECT of a set operation. Applies with any number of FROM relations, including one
+   (`SELECT … FROM (SELECT …) d WHERE d.k = 5`).
 2. **Scan pushdown** — the SELECT has at least two FROM relations. A base table (`query.where_pushdown`)
    or a derived table, CTE reference, set-returning function, or catalog relation
    (`query.derived_pushdown`) runs the conjunct over its own rows before they reach the join.
@@ -187,9 +189,9 @@ A pushed conjunct then takes the first of these forms that applies:
 
 A derived body is **body-pushable** when it is
 
-- a SELECT with no window function and no `LIMIT` or `OFFSET` that is either ungrouped or
-  **grouped by exactly one grouping set with at least one key** — a plain `GROUP BY` (`HAVING`
-  admitted), not `ROLLUP`, `CUBE`, several `GROUPING SETS`, or an aggregate without grouping keys; or
+- a SELECT with no `LIMIT` or `OFFSET` that is either ungrouped or **grouped by exactly one grouping
+  set with at least one key** — a plain `GROUP BY` (`HAVING` admitted), not `ROLLUP`, `CUBE`, several
+  `GROUPING SETS`, or an aggregate without grouping keys — with or without window functions; or
 - a **set operation** (`UNION`, `INTERSECT`, `EXCEPT`, each with or without `ALL`, nested to any
   depth) with no `LIMIT` or `OFFSET` of its own, whose two arms are both body-pushable.
 
@@ -200,6 +202,11 @@ A derived body is **body-pushable** when it is
   is a bare input column (a column grouped through its table's primary key, aggregates.md §16,
   counts; an expression key such as `GROUP BY k + 0`, an aggregate result, or an expression over a
   grouping column does not);
+- for a SELECT with window functions, additionally, the item is a bare `PARTITION BY` key of **every**
+  window function of the SELECT ([window.md](window.md) §3, §5.1): a window without `PARTITION BY`, or one
+  that partitions by an expression (`PARTITION BY k + 0`) or by other columns only, blocks the column.
+  In a grouped SELECT the key is the grouping column itself (window keys resolve against the grouped
+  row);
 - for a set operation, column `j` is pushable in both arms **and** each arm's column type is exactly
   the set operation's unified output type, recursively — an arm the set operation widens
   (`i32` under an `i64` output, `i32` under `decimal`, `f32` under `f64`) blocks the column, since the
@@ -216,6 +223,14 @@ collation is deterministic):
   or drops **whole groups** before they are aggregated; `HAVING` then judges the surviving groups as
   before. With several grouping sets a column is NULL in rolled-up rows whatever its input value, so
   filtering the input would change them; an ungrouped aggregate always produces its one row.
+- A window function reads only its own partition, and partitions are equality classes of the
+  `PARTITION BY` keys, bucketed by value-canonical form with NULL as one class exactly as grouping
+  buckets ([window.md](window.md) §3). A conjunct over columns every window partitions by therefore
+  keeps or drops **whole partitions** of every window, and each surviving row's window values — its
+  rank, frame, running or whole-partition aggregate, `lag`/`lead` neighbors, `ntile` bucket — are
+  computed over exactly the partition they were before. A column some window does not partition by
+  would cut into that window's partitions and change its values; a window without `PARTITION BY` has
+  one partition, the whole input.
 - A set operation matches rows by NULL-safe equality of whole rows, so the left and right rows of
   any match judge the conjunct alike: `filter(A op B) = filter(A) op filter(B)` for every operator and
   multiplicity (an `EXCEPT ALL` right row the filter drops could only have cancelled a left row the
@@ -236,7 +251,8 @@ unchanged. A conjunct that moved into a body is evaluated nowhere in the outer S
 **Planning work.** Planning is unmetered, so its work must not grow faster than the statement.
 Planning each body in full and then again with its pushed conjuncts doubles the work per nesting
 level: a chain of `d` derived tables or views, each with a `WHERE` that pushes into the next, took
-`2^d` plannings. Each core therefore plans a derived body in two passes when the enclosing SELECT
+`2^d` plannings. Each core therefore plans a derived body (and the body of a CTE inlined at its
+reference, §3.4) in two passes when the enclosing SELECT
 has a WHERE, an ON, or pushed conjuncts of its own (the only SELECTs that can push into a body):
 
 1. The body's **shape** is planned first. A shape is resolved like any body, through stage 2, but
@@ -285,7 +301,10 @@ rows it excludes are never read, projected, or charged at all. In a grouped body
 row** below the grouping, instead of once per group row above it; the rows it rejects are never
 grouped or aggregated (no aggregate-argument, `FILTER`, or `HAVING` work for a dropped group). In a set
 operation it charges once per row of **each arm**, instead of once per combined output row; the rows it
-rejects never reach the combine. The residual charges as the old WHERE did, over joined rows. Both
+rejects never reach the combine. Below a window it charges once per input row, before the window stage,
+instead of once per window output row (the same number of rows for an ungrouped body); the rows it
+rejects are never partitioned, sorted, or given a window value (no window argument, frame, or `FILTER`
+work for a dropped partition). The residual charges as the old WHERE did, over joined rows. Both
 rules are unconditional (PostgreSQL's choice), so the change is usually a reduction but is not
 monotone: when a join discards more rows than it multiplies, evaluating the conjunct on every base row
 can cost more than evaluating it on the few joined survivors — and likewise on every input row of a
@@ -295,19 +314,17 @@ estimator models the split ([estimator.md](estimator.md) §8.3), so cost-based j
 the actual meter remains authoritative. Because only non-trapping conjuncts move, pushdown never raises
 an error the unrewritten plan would not; it can leave unraised an error on a row the moved conjunct
 now rejects first — an ON-predicate error on a pair, a body's select-list error on a body row, or an
-aggregate-argument error in a group the conjunct drops — the same narrowing a scan bound already
+aggregate- or window-argument error in a group or partition the conjunct drops — the same narrowing a scan bound already
 performs (PostgreSQL pushes the same quals, so it skips the same errors).
 
 EXPLAIN renders a scan-pushed filter on its relation's node (`Scan`, `Subquery`, `CTE Scan`, `SRF`,
 `Catalog Scan`), a body-pushed conjunct inside the body's own plan (below a grouped body's
-`Aggregate`; once under each SELECT of a set operation), and the residual as the Filter node
-([explain.md](explain.md) §5).
+`Aggregate` and below a `Window`; once under each SELECT of a set operation), and the residual as the
+Filter node ([explain.md](explain.md) §5).
 
-**Not pushed into a body.** A CTE reference is scan-pushed only, even when its CTE is inlined: whether
-a CTE is inlined is decided from its reference count after the whole statement is planned, so
-pushing into an inlined CTE's body needs a per-reference body specialization (with its own EXPLAIN
-and estimate attribution) and is a follow-on. So is pushdown through a lateral relation, below a
-window function (a conjunct over every PARTITION BY column), and into an arm a set operation widens.
+**Not pushed into a body.** A materialized CTE (§3.4) is scan-pushed only: its body runs once for every
+reference. Pushdown through a lateral relation and into an arm a set operation widens remain
+follow-ons.
 
 ### 3.3 ON pushdown (`query.on_pushdown`)
 
@@ -343,6 +360,75 @@ the complete ON; the hash keys are always cross-relation equalities and therefor
 the residual. The cost decision is §3.2's: per relation row instead of per pair, unconditional, not
 monotone, modelled by the estimator. EXPLAIN shows the residual ON on the join node (`on:conjuncts=N`
 / VERBOSE `on=<expr>`, omitted when none remains) and the pushed conjuncts on the relation, as §3.2.
+
+### 3.4 Inlined CTE bodies (`query.derived_pushdown`)
+
+An inlined CTE runs in place at its reference, like a derived table ([cte.md](cte.md) §3), so a
+conjunct over the reference can move into its body (§3.2 body form) — but only if the body is planned
+at that reference. A CTE's inline/materialize mode is decided from its reference count after its
+owning query is planned, while stage 2 of the SELECT holding a reference runs before then; so the
+decision to plan a body at its reference is made from the statement's syntax instead, when the `WITH`
+is planned.
+
+**Inlined at its reference.** A CTE is **inlined at its reference** when all of these hold:
+
+- it is a query CTE (not data-modifying), not recursive, and not marked `MATERIALIZED`;
+- its **static reference count** is exactly 1 and that reference is in a **query part** of the `WITH`
+  statement: the count is taken over the later CTE bodies of its `WITH` list and the query that owns
+  the list, by the same syntactic count the writable-CTE orchestrator uses ([cte.md](cte.md) §3,
+  `count_cte_refs_dml`, which follows nested-`WITH` shadowing); a reference inside a data-modifying
+  part (a data-modifying CTE body or primary, planned only when it runs) disqualifies it;
+- its definition (below) does not reference an enclosing query level — a correlated nested-`WITH` body
+  stays an ordinary CTE.
+
+`NOT MATERIALIZED` with one reference qualifies; with two or more it does not (each reference then runs
+the definition, as before): planning a body at every reference of a multiply-referenced CTE would
+re-plan a chain of them exponentially.
+
+**Planning.** The CTE's **definition** is planned when the `WITH` is, as every CTE is, but with
+**reference expansion off**: within it, a reference to another CTE inlined at its reference is not
+expanded. The definition supplies the CTE's output columns and types and surfaces its errors at the
+same point as before; it runs only if its reference is never expanded. (A candidate whose definition
+turns out to be correlated is planned again with expansion on, and is not inlined at its reference.)
+
+A FROM reference to such a CTE, planned for real (not as a shape, §3.2) with expansion on, is
+**expanded**: the CTE's body is planned there, from its syntax, against the CTE bindings earlier than
+it in scope and no enclosing scope — exactly as its definition was — with the derived-table machinery
+of §3.2: its shape first when the referencing SELECT can push, then the real plan with whatever stage
+2 pushed into it. The relation is then both a CTE reference and a derived body: stage 2 treats it as
+a derived table (body pushdown when body-pushable, scan pushdown otherwise), and stage 3 as the same
+fence. Expanding a body has no other effect: CTE reference counts are restored (as for §3.2's second
+planning), so every other CTE keeps its mode.
+
+A binding is **expanded at most once per statement**: the first expanded reference marks it, and any
+later reference planned for real — which, for a correct static count, never occurs — keeps the plain
+CTE reference. An expanded CTE is always **inlined** whatever its final reference count (a reference
+without its own body then runs the definition in place), so a missed static reference can never make
+the expanded body and a materialized buffer disagree. Together these bound the planning work: each
+definition is planned once (twice for a correlated candidate) and each body is expanded at most once,
+so a chain of `d` such CTEs plans in `O(d)`.
+
+**Execution.** An expanded reference runs its own body in place, exactly as an inlined CTE's body runs
+at its reference today (in the declaring `WITH` node's frame, charging its intrinsic cost, its rows
+re-measured under the reference's touched mask); its scan-pushed filter, if any, runs over those rows
+as §3.2's. A CTE that is not expanded is unchanged.
+
+**Cost decision.** An expanded reference charges what its body plan charges. With nothing pushed
+into it the body plan is the definition's — so the cost is unchanged — except where its own references
+to other CTEs inlined at their references are now expanded and take their pushdowns. A conjunct pushed
+into the body charges as §3.2's body form: per body row (or per admitted base row when it moves
+further), and not at all on rows a bound it enables excludes; it is no longer evaluated on the
+reference's rows. Like every pushdown, the decision is unconditional, the estimator models it (the
+reference's estimate is its own body's), and the actual meter is authoritative. Because only
+non-trapping conjuncts move, no new error is raised; one on a body row the conjunct now rejects can go
+unraised, as for a derived table.
+
+**EXPLAIN.** An expanded reference's `CTE Scan` node carries its body plan as children, like a
+`Subquery` node, and EXPLAIN ANALYZE attributes the body's actual work there. The `CTE` definition
+node under the `WITH` node then renders no body (it would never run); its estimate is still the
+definition's rows with zero cost, as for any inlined CTE. A CTE that is not expanded — materialized,
+unreferenced, or referenced only from a data-modifying part — keeps its body under the `WITH` node
+([explain.md](explain.md) §5).
 
 ## 4. Stage 3 — physical/access-path selection: the rule inventory
 
@@ -571,7 +657,7 @@ bound.
 
 ## 7. Where future passes plug in
 
-- **Further stage-2 rewrites** (TODO.md) — pushdown into inlined CTE bodies and below window
-  partitions; constant folding — each under the §3 contract with its own cost decision.
+- **Further stage-2 rewrites** (TODO.md) — pushdown into widened set-operation arms and through
+  lateral relations; constant folding — each under the §3 contract with its own cost decision.
 - **New physical rules** (the hash join above and later access paths tracked in TODO.md) land as
   discrete rule functions in the §4 inventory, each with its NoREC relation.

@@ -2077,7 +2077,8 @@ func (db *engine) estimateWithPlan(wp *withPlan, inherited *estimateCTECtx) esti
 			bindingContribution = addPlanEstimates(bindingContribution, body.root)
 		}
 		definitionNodes = append(definitionNodes, cteEstimate)
-		if !binding.isDml() {
+		// A body planned at its reference is estimated there (planner.md §3.4).
+		if !binding.isDml() && !binding.expanded {
 			definitionNodes = append(definitionNodes, body.nodes...)
 		}
 	}
@@ -2233,7 +2234,9 @@ func (db *engine) estimateExplainWithDml(wq *withQuery) ([]planEstimate, error) 
 			contribution = addPlanEstimates(contribution, body.root)
 		}
 		definitionNodes = append(definitionNodes, cteEstimate)
-		definitionNodes = append(definitionNodes, body.nodes...)
+		if !binding.expanded {
+			definitionNodes = append(definitionNodes, body.nodes...)
+		}
 	}
 	var primary estimatedPlan
 	if wp.primary != nil {

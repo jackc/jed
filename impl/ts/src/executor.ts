@@ -521,6 +521,7 @@ import {
   cteDetail,
   explainActualCosts,
   cteModes,
+  cteReferenceCandidate,
   cteSyntheticTable,
   cteSyntheticTableCols,
   dmlOutcome,
@@ -1484,6 +1485,11 @@ export class Engine {
   // skips its own bodies' second planning and stage 3, so every derived body is planned at most twice
   // per enclosing planning and nesting depth d costs O(d²), not 2^d.
   private planShape = false;
+  // Whether a FROM reference to a CTE inlined at its reference may plan that CTE's body there
+  // (spec/design/planner.md §3.4). Off while such a CTE's own definition is planned, so the
+  // definition — which runs only if the reference is never expanded — expands nothing, and a chain
+  // of such CTEs plans each body a bounded number of times.
+  private cteExpansionOff = false;
   // How many views the outermost view reference being expanded has expanded so far, itself included
   // (views.md §4.1): at most MAX_VIEW_EXPANSIONS (54001).
   private viewExpansions = 0;
@@ -4383,7 +4389,8 @@ export class Engine {
         bindingContribution = addPlanEstimates(bindingContribution, body.root);
       }
       definitionNodes.push(cteEstimate);
-      if (binding.source.kind === "query") definitionNodes.push(...body.nodes);
+      // A body planned at its reference is estimated there (planner.md §3.4).
+      if (binding.source.kind === "query" && !binding.expanded) definitionNodes.push(...body.nodes);
     }
     const body = this.estimateQueryPlan(plan.body, ctx);
     const root = addPlanEstimates(bindingContribution, body.root);
@@ -4475,7 +4482,8 @@ export class Engine {
         cteEstimate = clonePlanEstimate(body.root);
         contribution = addPlanEstimates(contribution, body.root);
       }
-      definitionNodes.push(cteEstimate, ...body.nodes);
+      definitionNodes.push(cteEstimate);
+      if (!binding.expanded) definitionNodes.push(...body.nodes);
     }
     const primary = wp.primary !== null
       ? this.estimateQueryPlan(wp.primary, ctx)
@@ -4751,7 +4759,7 @@ export class Engine {
     body: CteBody;
   } {
     const ptypes = new ParamTypes();
-    const bindings = this.planCteBindings(wq.ctes, wq.recursive, [], null, ptypes);
+    const bindings = this.planCteBindings(wq.ctes, wq.recursive, [], null, ptypes, wq.body);
     const query = cteBodyAsQuery(wq.body);
     const primary = query === null ? null : this.planQuery(query, null, bindings, ptypes);
     for (const cte of wq.ctes) {
@@ -4770,8 +4778,10 @@ export class Engine {
     for (let i = 0; i < plan.bindings.length; i++) {
       const binding = plan.bindings[i]!;
       r.emit(depth + 1, "CTE " + binding.name, cteDetail(binding, plan.modes[i]!));
-      if (binding.source.kind === "query") this.renderQueryPlan(r, binding.source.plan, depth + 2);
-      else this.renderExplain(r, binding.source.dm.stmt, depth + 2, plan.bindings.slice(0, i));
+      // A body planned at its reference renders there (planner.md §3.4).
+      if (binding.source.kind === "query") {
+        if (!binding.expanded) this.renderQueryPlan(r, binding.source.plan, depth + 2);
+      } else this.renderExplain(r, binding.source.dm.stmt, depth + 2, plan.bindings.slice(0, i));
     }
     if (plan.primary !== null) this.renderQueryPlan(r, plan.primary, depth + 1);
     else this.renderExplain(r, plan.body as Insert | Update | Delete, depth + 1, plan.bindings);
@@ -5219,6 +5229,8 @@ export class Engine {
     }
     if (rel.cte !== undefined) {
       r.emit(depth, "CTE Scan " + rel.tableName, withNote(pushedFilterDetail(sp, i, "", r.verbose), note));
+      // A CTE inlined at its reference renders the body planned there (planner.md §3.4).
+      if (rel.derived !== undefined) this.renderQueryPlan(r, rel.derived, depth + 1);
       return;
     }
     if (rel.derived !== undefined) {
@@ -5266,8 +5278,9 @@ export class Engine {
       const mode: CteMode = i < wp.modes.length ? wp.modes[i]! : "inline";
       r.emit(depth + 1, "CTE " + b.name, cteDetail(b, mode));
       // A data-modifying CTE has no query plan to render (a "dml" source); a plain / recursive CTE
-      // renders its body (the recursive anchor plan for a RECURSIVE CTE) one level deeper.
-      if (b.source.kind === "query") {
+      // renders its body (the recursive anchor plan for a RECURSIVE CTE) one level deeper. A body
+      // planned at its reference renders there instead (planner.md §3.4).
+      if (b.source.kind === "query" && !b.expanded) {
         this.renderQueryPlan(r, b.source.plan, depth + 2);
       }
     }
@@ -12560,15 +12573,22 @@ export class Engine {
   // non-recursive. The `refs` counters are bumped as later query bodies / a query primary reference
   // each binding (a data-modifying part's references are static-counted by the orchestrator, since
   // it is not planned here).
+  //
+  // `primary` is the query that owns the list: a CTE that the later bodies and `primary` name
+  // exactly once is a candidate to be inlined at its reference (planner.md §3.4). Its definition is
+  // planned with reference expansion off, so a chain of such CTEs plans each body a bounded number
+  // of times.
   private planCteBindings(
     ctes: Cte[],
     recursive: boolean,
     inherited: CteBinding[],
     parent: Scope | null,
     ptypes: ParamTypes,
+    primary: CteBody,
   ): CteBinding[] {
     const bindings: CteBinding[] = [];
-    for (const cte of ctes) {
+    for (let ci = 0; ci < ctes.length; ci++) {
+      const cte = ctes[ci]!;
       const lname = cte.name;
       if (bindings.some((b) => b.name === lname)) {
         throw engineError("duplicate_alias", `WITH query name ${lname} specified more than once`);
@@ -12590,6 +12610,9 @@ export class Engine {
           recursive: null,
           hint: cte.materialized,
           refs: 0,
+          atReference: false,
+          bodyAst: null,
+          expanded: false,
         });
         const bi = bindings.length - 1;
         const rhsPlan = this.planQuery(so.rhs, parent, [...inherited, ...bindings], ptypes);
@@ -12602,7 +12625,19 @@ export class Engine {
         continue;
       }
       if (bodyQuery !== null) {
-        const plan = this.planQuery(bodyQuery, parent, [...inherited, ...bindings], ptypes);
+        const visible = [...inherited, ...bindings];
+        // Named exactly once, by a query part, and not MATERIALIZED: a candidate to be inlined at
+        // its reference (planner.md §3.4). Its definition then expands no reference of its own; an
+        // uncorrelated candidate keeps that definition, a correlated one is planned again with
+        // expansion on (it stays an ordinary CTE).
+        const candidate = cteReferenceCandidate(ctes, ci, primary);
+        let plan = candidate
+          ? this.withoutCteExpansion(() => this.planQuery(bodyQuery, parent, visible, ptypes))
+          : this.planQuery(bodyQuery, parent, visible, ptypes);
+        const atReference = candidate && !queryPlanReferencesOuter(plan, 0);
+        if (candidate && !atReference) {
+          plan = this.planAgain(visible, () => this.planQuery(bodyQuery, parent, visible, ptypes));
+        }
         const table = cteSyntheticTable(lname, plan, cte.columns);
         bindings.push({
           name: lname,
@@ -12611,6 +12646,9 @@ export class Engine {
           recursive: null,
           hint: cte.materialized,
           refs: 0,
+          atReference,
+          bodyAst: atReference ? bodyQuery : null,
+          expanded: false,
         });
       } else {
         // A data-modifying CTE (writable-cte.md): resolve its RETURNING schema for the synthetic
@@ -12629,6 +12667,9 @@ export class Engine {
           recursive: null,
           hint: cte.materialized,
           refs: 0,
+          atReference: false,
+          bodyAst: null,
+          expanded: false,
         });
       }
     }
@@ -12707,7 +12748,7 @@ export class Engine {
   // operations — a sum of the parts.
   private runWith(wq: WithQuery, params: Value[]): SelectResult {
     const ptypes = new ParamTypes();
-    const bindings = this.planCteBindings(wq.ctes, wq.recursive, [], null, ptypes);
+    const bindings = this.planCteBindings(wq.ctes, wq.recursive, [], null, ptypes, wq.body);
     // (2) Plan the main body with all bindings visible (the pure-query path always has a query
     //     primary — a data-modifying primary routes to executeWithDml).
     const bodyQuery = cteBodyAsQuery(wq.body);
@@ -12938,7 +12979,7 @@ export class Engine {
     const { ctes, body, recursive } = wq;
     const ptypes = new ParamTypes();
     // (1) Plan every CTE binding (query plans + data-modifying RETURNING schemas).
-    const bindings = this.planCteBindings(ctes, recursive, [], null, ptypes);
+    const bindings = this.planCteBindings(ctes, recursive, [], null, ptypes, body);
     // (2) Plan a query primary now (to bump refs + surface resolution errors, incl. a 0A000 FROM
     //     reference to a no-RETURNING data-modifying CTE). A data-modifying primary is resolved and
     //     run later (it sees the bindings via the threaded context); its references are
@@ -14201,7 +14242,7 @@ export class Engine {
         );
       }
     }
-    const bindings = this.planCteBindings(we.ctes, we.recursive, ctes, parent, ptypes);
+    const bindings = this.planCteBindings(we.ctes, we.recursive, ctes, parent, ptypes, we.body);
     const body = this.planQuery(we.body, parent, [...ctes, ...bindings], ptypes);
     return {
       kind: "with",
@@ -14591,6 +14632,9 @@ export class Engine {
       !shaping &&
       (sel.filter !== null || pushed.length > 0 || sel.joins.some((j) => j.on !== null));
     const shaped: boolean[] = tableRefs.map(() => false);
+    // cteBodies[i] is ci when FROM item i is a reference to CTE ci whose body it plans in place
+    // (planner.md §3.4), else null.
+    const cteBodies: (number | null)[] = tableRefs.map(() => null);
     const seenLabels = new Set<string>();
     let offset = 0;
     // The inner labels and hidden USING copies of each unaliased parenthesized join (§15).
@@ -14778,6 +14822,22 @@ export class Engine {
             );
           }
           ctes[ci]!.refs += 1;
+          // A CTE inlined at its reference plans its body here, like a derived table (planner.md
+          // §3.4) — once per statement, never inside a shape or a definition planned with expansion
+          // off. Only the earlier bindings are in its scope, and it is uncorrelated, so it is planned
+          // against no parent.
+          const binding = ctes[ci]!;
+          if (binding.atReference && !shaping && !this.cteExpansionOff && !binding.expanded) {
+            binding.expanded = true;
+            const bodyAst = binding.bodyAst;
+            if (bodyAst === null) throw new Error("a CTE inlined at its reference keeps its body");
+            const earlier = ctes.slice(0, ci);
+            derived = this.planBodyFirst(shapeBodies, () =>
+              this.planAgain(ctes, () => this.planQuery(bodyAst, null, earlier, ptypes)),
+            );
+            shaped[i] = shapeBodies;
+            cteBodies[i] = ci;
+          }
           t =
             tref.columnAliases !== undefined
               ? renamedBaseTable(ctes[ci]!.table, tref, tref.columnAliases)
@@ -15586,7 +15646,7 @@ export class Engine {
     rewriteWhere(plan);
     // A shape is read for its outputs and pushability only, then discarded (planner.md §3.2).
     if (shaping) return plan;
-    this.planDerivedBodies(plan, tableRefs, isolated, shaped, parent, ctes, ptypes);
+    this.planDerivedBodies(plan, tableRefs, isolated, shaped, cteBodies, parent, ctes, ptypes);
     //
     // ——— Stage 3: physical/access-path selection (spec/design/planner.md §4) ———
     optimizeSelect(plan, scope.rels, this.readSnap(), this);
@@ -15623,15 +15683,29 @@ export class Engine {
     }
   }
 
+  // withoutCteExpansion runs f with CTE reference expansion off (planner.md §3.4): the definition of
+  // a CTE that its reference may plan again.
+  private withoutCteExpansion<T>(f: () => T): T {
+    const saved = this.cteExpansionOff;
+    this.cteExpansionOff = true;
+    try {
+      return f();
+    } finally {
+      this.cteExpansionOff = saved;
+    }
+  }
+
   // planDerivedBodies plans each derived body whose shape stage 2 read for real, from its syntax
   // (spec/design/planner.md §3.2). A body that stage 2 moved conjuncts into gets them appended to its
   // WHERE, so its own rewrite and access-path selection see them; any other body is planned as
-  // written.
+  // written. A CTE reference that plans its CTE's body (cteBodies, planner.md §3.4) plans it from the
+  // CTE's syntax against the earlier bindings and no parent scope.
   private planDerivedBodies(
     plan: SelectPlan,
     tableRefs: TableRef[],
     isolated: (ViewSite | null)[],
     shaped: boolean[],
+    cteBodies: (number | null)[],
     parent: Scope | null,
     ctes: CteBinding[],
     ptypes: ParamTypes,
@@ -15642,17 +15716,32 @@ export class Engine {
     shaped.forEach((isShaped, i) => {
       if (!isShaped) return;
       const pushed = pushes[i] ?? [];
-      const body = tableRefs[i]!.subquery!;
+      const ci = cteBodies[i] ?? null;
+      let body: QueryExpr;
+      if (ci !== null) {
+        const ast = ctes[ci]!.bodyAst;
+        if (ast === null) throw new Error("a CTE inlined at its reference keeps its body");
+        body = ast;
+      } else {
+        const sub = tableRefs[i]!.subquery;
+        if (sub === undefined) {
+          throw new Error("a shaped relation is a derived table or an inlined CTE");
+        }
+        body = sub;
+      }
       const shape = plan.rels[i]!.derived!;
       const replan = (parent: Scope | null, ctes: CteBinding[]): QueryPlan =>
         pushed.length === 0
           ? this.planQuery(body, parent, ctes, ptypes)
           : this.replanPushedQuery(body, shape, pushed, parent, ctes, ptypes);
-      // A view body is planned in its isolated scope (views.md §4.1).
+      // A view body is planned in its isolated scope (views.md §4.1); an inlined CTE's body against
+      // the bindings before it (planner.md §3.4).
       const site = isolated[i] ?? null;
-      plan.rels[i]!.derived = this.planAgain(ctes, () =>
-        site !== null ? this.inViewBody(site, () => replan(null, [])) : replan(parent, ctes),
-      );
+      plan.rels[i]!.derived = this.planAgain(ctes, () => {
+        if (site !== null) return this.inViewBody(site, () => replan(null, []));
+        if (ci !== null) return replan(null, ctes.slice(0, ci));
+        return replan(parent, ctes);
+      });
     });
   }
 
@@ -16813,6 +16902,7 @@ export class Engine {
     e.viewDepth = 0;
     e.viewBase = 0;
     e.planShape = false;
+    e.cteExpansionOff = false;
     e.viewExpansions = 0;
     e.viewColumns = new Map();
     // Not profiling EXPLAIN ANALYZE: the lane gates test `explainActualProfile === null`, so leaving it
@@ -17182,7 +17272,7 @@ export class Engine {
       return { columnNames: plan.columnNames, columnTypes: typeNames(plan.columnTypes) };
     }
     // The planning prefix of runWith (cte.md): plan the CTE bindings, then the body with them visible.
-    const bindings = this.planCteBindings(stmt.ctes, stmt.recursive, [], null, ptypes);
+    const bindings = this.planCteBindings(stmt.ctes, stmt.recursive, [], null, ptypes, stmt.body);
     const bodyQuery = cteBodyAsQuery(stmt.body); // pure-query WITH (DML excluded by stmtIsWrite)
     if (bodyQuery === null) throw new Error("a pure-query WITH is required here");
     const plan = this.planQuery(bodyQuery, null, bindings, ptypes);
@@ -18245,14 +18335,21 @@ export class Engine {
         return buf.slice();
       }
       // Only a plain (query) CTE is ever inlined; a data-modifying CTE is always materialized
-      // (writable-cte.md §3), so its buffer was filled above.
-      const src = env.ctes.bindings[ci]!.source;
-      if (src.kind !== "query") {
-        throw new Error("a data-modifying CTE is always materialized, never inlined");
+      // (writable-cte.md §3), so its buffer was filled above. A reference that planned the body
+      // itself runs that plan (planner.md §3.4).
+      let body: QueryPlan;
+      if (rel.derived !== undefined) {
+        body = rel.derived;
+      } else {
+        const src = env.ctes.bindings[ci]!.source;
+        if (src.kind !== "query") {
+          throw new Error("a data-modifying CTE is always materialized, never inlined");
+        }
+        body = src.plan;
       }
       // The body runs in the frame of the WITH node that declared it (cte.md §7) — not this
       // reference site's, which may sit deeper.
-      const r = this.execQueryPlan(src.plan, env.ctes.outers[ci]!, params, env.ctes);
+      const r = this.execQueryPlan(body, env.ctes.outers[ci]!, params, env.ctes);
       meter.charge(r.cost);
       // The body's charged result becomes this relation's rows (memory.md §5.2), re-measured under
       // the relation's touched mask.
@@ -28827,6 +28924,13 @@ export type CteMode = "inline" | "materialize";
 // (its column types fix the synthetic relation's) and `recursive` carries the recursive term + the
 // UNION ALL flag; the binding is in scope inside its own recursive term, so the self-reference
 // resolves to it.
+// A CTE inlined at its reference (`atReference`, spec/design/planner.md §3.4) — a non-recursive,
+// uncorrelated query CTE, not MATERIALIZED, whose statement names it exactly once — keeps its body
+// syntax (`bodyAst`): its one FROM reference plans the body again, there, like a derived table, so
+// stage 2 can push conjuncts into it. `source` is then the body planned without any such expansion
+// (its own references to other such CTEs stay unexpanded), which runs only if the reference was
+// never expanded. `expanded` records that the reference was: a binding is expanded at most once per
+// statement, and an expanded binding is always inlined.
 export type RecursiveTerm = { plan: QueryPlan; unionAll: boolean };
 export type CteBinding = {
   name: string;
@@ -28835,6 +28939,9 @@ export type CteBinding = {
   recursive: RecursiveTerm | null;
   hint: boolean | null;
   refs: number;
+  atReference: boolean;
+  bodyAst: QueryExpr | null;
+  expanded: boolean;
 };
 
 // CteSource is what a CTE binding evaluates to (spec/design/cte.md, writable-cte.md). A plain CTE

@@ -198,10 +198,11 @@ NULL
 3
 30
 
-# A CTE reference is filtered as its rows are read (an inlined CTE's body is not pushed into).
-# cost: 53
+# A materialized CTE reference is filtered as its rows are read (an inlined CTE's body is pushed into
+# instead — subquery/cte_window_pushdown.test).
+# cost: 65
 query II nosort
-WITH c AS (SELECT id, k FROM t) SELECT c.id, u.w FROM c JOIN u ON c.k = u.id WHERE c.id < 5 ORDER BY c.id
+WITH c AS MATERIALIZED (SELECT id, k FROM t) SELECT c.id, u.w FROM c JOIN u ON c.k = u.id WHERE c.id < 5 ORDER BY c.id
 ----
 1
 10

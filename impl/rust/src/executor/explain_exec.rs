@@ -316,7 +316,14 @@ impl Engine {
         wq: &WithQuery,
     ) -> Result<(Vec<CteBinding>, Vec<CteMode>, Option<QueryPlan>)> {
         let mut ptypes = ParamTypes::default();
-        let bindings = self.plan_cte_bindings(&wq.ctes, wq.recursive, &[], None, &mut ptypes)?;
+        let bindings = self.plan_cte_bindings(
+            &wq.ctes,
+            wq.recursive,
+            &[],
+            None,
+            &mut ptypes,
+            CtePrimary::Body(&wq.body),
+        )?;
         let primary = match &wq.body {
             CteBody::Query(query) => {
                 let visible: Vec<&CteBinding> = bindings.iter().collect();
@@ -359,6 +366,8 @@ impl Engine {
                 cte_detail(binding, modes[i]),
             );
             match &binding.source {
+                // A body planned at its reference renders there (planner.md §3.4).
+                CteSource::Query(_) if binding.expanded.get() => {}
                 CteSource::Query(plan) => self.render_query_plan(r, plan, depth + 2)?,
                 CteSource::Dml(dm) => match &dm.stmt {
                     DmStmt::Insert(insert) => {
@@ -969,7 +978,11 @@ impl Engine {
                 format!("CTE Scan {}", rel.table_name),
                 with_note(pushed_filter_detail(sp, i, String::new(), r.verbose), note),
             );
-            Ok(())
+            // A CTE inlined at its reference renders the body planned there (planner.md §3.4).
+            match &rel.derived {
+                Some(body) => self.render_query_plan(r, body, depth + 1),
+                None => Ok(()),
+            }
         } else if let Some(derived) = &rel.derived {
             r.emit(
                 depth,
@@ -1044,8 +1057,11 @@ impl Engine {
             r.emit(depth + 1, format!("CTE {}", b.name), cte_detail(b, mode));
             // A data-modifying CTE has no query body to walk (writable-cte.md §3); only a query CTE
             // recurses. This EXPLAIN slice reaches a WITH only through the read-only path, so a Dml
-            // binding does not currently arise, but the guard keeps the walk total.
-            if let CteSource::Query(plan) = &b.source {
+            // binding does not currently arise, but the guard keeps the walk total. A body planned
+            // at its reference renders there instead (planner.md §3.4).
+            if let CteSource::Query(plan) = &b.source
+                && !b.expanded.get()
+            {
                 self.render_query_plan(r, plan, depth + 2)?;
             }
         }

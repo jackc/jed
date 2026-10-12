@@ -409,7 +409,7 @@ The following attribution rules close the remaining current-plan shapes:
   relation with produced rows `P` and logical rows `N`, the node adds `nodes(F) × P` `operator_eval`
   and its logical and delivered rows become `F`'s selectivity applied to `N`, capped by `P`. A
   conjunct moved into a derived body is simply part of the body's own WHERE, estimated there (below a
-  grouped body's grouping, and in each SELECT of a set operation);
+  grouped body's grouping or a window, and in each SELECT of a set operation);
 - the access path estimate of a base relation reads the **access predicate**: the complete WHERE
   plus every ON conjunct scan-pushed to a relation, so a pushed ON conjunct can bound, and shape the
   candidate estimate of, its relation exactly like a WHERE conjunct;
@@ -433,7 +433,9 @@ The following attribution rules close the remaining current-plan shapes:
   plus expression work; an SRF owns argument work plus `generated_row`; and a FROM-less `Result`
   starts from one virtual row and owns no scan work;
 - a materialized CTE body contributes once and each reference adds `cte_scan_row`; an inlined body
-  contributes at each reference; an unreferenced read-only body contributes zero. Definition
+  contributes at each reference — a reference that planned the body itself ([planner.md](planner.md)
+  §3.4) owns that body's estimate, exactly as a derived-table `Subquery` does, and its definition
+  subtree is not displayed; an unreferenced read-only body contributes zero. Definition
   subtrees remain intrinsically estimated for display, but a `WITH` root sums semantic execution
   contributions rather than blindly summing those metadata edges; and
 - subqueries inside expressions contribute once when uncorrelated and once per estimated invoking

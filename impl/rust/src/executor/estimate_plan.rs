@@ -1223,7 +1223,8 @@ impl Engine {
                 binding_contribution = binding_contribution.add(&body.root);
             }
             definition_nodes.push(cte_estimate);
-            if matches!(binding.source, CteSource::Query(_)) {
+            // A body planned at its reference is estimated there (planner.md §3.4).
+            if matches!(binding.source, CteSource::Query(_)) && !binding.expanded.get() {
                 definition_nodes.extend(body.nodes.iter().cloned());
             }
             ctx.bodies.push(body);
@@ -1418,7 +1419,9 @@ impl Engine {
                 contribution = contribution.add(&body.root);
             }
             definition_nodes.push(cte_estimate);
-            definition_nodes.extend(body.nodes.iter().cloned());
+            if !binding.expanded.get() {
+                definition_nodes.extend(body.nodes.iter().cloned());
+            }
             ctx.bodies.push(body);
         }
         let primary = if let Some(plan) = primary_plan {

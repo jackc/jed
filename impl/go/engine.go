@@ -128,6 +128,11 @@ type engine struct {
 	// planned again. A shape skips its own bodies' second planning and stage 3, so every derived body
 	// is planned at most twice per enclosing planning and nesting depth d costs O(d²), not 2^d.
 	planShape bool
+	// cteExpansionOff is whether a FROM reference to a CTE inlined at its reference may NOT plan
+	// that CTE's body there (spec/design/planner.md §3.4). Set while such a CTE's own definition is
+	// planned, so the definition — which runs only if the reference is never expanded — expands
+	// nothing, and a chain of such CTEs plans each body a bounded number of times.
+	cteExpansionOff bool
 	// viewExpansions is how many views the outermost view reference being expanded has expanded so
 	// far, itself included (views.md §4.1): at most maxViewExpansions (54001).
 	viewExpansions int

@@ -96,6 +96,9 @@ impl Engine {
                 || !pushed.is_empty()
                 || sel.joins.iter().any(|j| j.on.is_some()));
         let mut shaped: Vec<bool> = vec![false; from_items.len()];
+        // Per FROM item: `Some(ci)` when it is a reference to CTE `ci` whose body it plans in place
+        // (planner.md §3.4), else `None`.
+        let mut cte_bodies: Vec<Option<usize>> = vec![None; from_items.len()];
         // Per FROM item: the index into `synthetic` of a derived table's relation, else `None`.
         let mut derived_meta: Vec<Option<usize>> = Vec::with_capacity(from_items.len());
         // Per FROM item: true when it is a CORRELATED lateral relation (§44) — its body / SRF args
@@ -367,6 +370,30 @@ impl Engine {
                             }
                         }
                         ctes[ci].refs.set(ctes[ci].refs.get() + 1);
+                        // A CTE inlined at its reference plans its body here, like a derived table
+                        // (planner.md §3.4) — once per statement, never inside a shape or a
+                        // definition planned with expansion off. Only the earlier bindings are in
+                        // its scope, and it is uncorrelated, so it is planned against no parent.
+                        if ctes[ci].at_reference
+                            && !shaping
+                            && !self.cte_expansion_off.get()
+                            && !ctes[ci].expanded.get()
+                        {
+                            ctes[ci].expanded.set(true);
+                            let body_ast = ctes[ci]
+                                .body_ast
+                                .as_ref()
+                                .expect("a CTE inlined at its reference keeps its body");
+                            let earlier: &'a [&'a CteBinding] = &ctes[..ci];
+                            let body = self.plan_body_first(shape_bodies, || {
+                                self.plan_again(ctes, || {
+                                    self.plan_query(body_ast, None, earlier, ptypes)
+                                })
+                            })?;
+                            *derived_plans.last_mut().expect("pushed above") = Some(body);
+                            shaped[i] = shape_bodies;
+                            cte_bodies[i] = Some(ci);
+                        }
                         srf_meta.push(None);
                         match &tref.column_aliases {
                             Some(list) => {
@@ -1548,6 +1575,7 @@ impl Engine {
             &from_items,
             &isolated,
             &shaped,
+            &cte_bodies,
             parent,
             ctes,
             ptypes,
@@ -1576,7 +1604,11 @@ impl Engine {
     /// Run `f` as the second planning of a body whose shape was already planned. Planning again
     /// must have no other effect: the CTE reference counts the shape recorded are restored, keeping
     /// every CTE's mode unchanged.
-    fn plan_again<T>(&self, ctes: &[&CteBinding], f: impl FnOnce() -> Result<T>) -> Result<T> {
+    pub(crate) fn plan_again<T>(
+        &self,
+        ctes: &[&CteBinding],
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         let refs: Vec<usize> = ctes.iter().map(|b| b.refs.get()).collect();
         let out = f();
         for (b, r) in ctes.iter().zip(refs) {
@@ -1585,9 +1617,20 @@ impl Engine {
         out
     }
 
+    /// Run `f` with CTE reference expansion off (planner.md §3.4): the definition of a CTE that its
+    /// reference may plan again.
+    pub(crate) fn without_cte_expansion<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let saved = self.cte_expansion_off.replace(true);
+        let out = f();
+        self.cte_expansion_off.set(saved);
+        out
+    }
+
     /// Plan each derived body whose shape stage 2 read for real, from its syntax (spec/design/
-    /// planner.md §3.2). A body that stage 2 moved conjuncts into gets them appended to its WHERE, so
-    /// its own rewrite and access-path selection see them; any other body is planned as written.
+    /// planner.md §3.2). A body that stage 2 moved conjuncts into gets them appended to its WHERE,
+    /// so its own rewrite and access-path selection see them; any other body is planned as written.
+    /// A CTE reference that plans its CTE's body (`cte_bodies`, planner.md §3.4) plans it from the
+    /// CTE's syntax against the earlier bindings and no parent scope.
     #[allow(clippy::too_many_arguments)]
     fn plan_derived_bodies<'a>(
         &'a self,
@@ -1595,6 +1638,7 @@ impl Engine {
         from_items: &[&TableRef],
         isolated: &[Option<ViewSite>],
         shaped: &[bool],
+        cte_bodies: &[Option<usize>],
         parent: Option<&Scope<'a>>,
         ctes: &'a [&'a CteBinding],
         ptypes: &mut ParamTypes,
@@ -1609,8 +1653,15 @@ impl Engine {
             if !shaped[i] {
                 continue;
             }
-            let Some(body_expr) = from_items[i].subquery.as_deref() else {
-                unreachable!("a shaped relation is a derived table")
+            let body_expr = match cte_bodies[i] {
+                Some(ci) => ctes[ci]
+                    .body_ast
+                    .as_ref()
+                    .expect("a CTE inlined at its reference keeps its body"),
+                None => from_items[i]
+                    .subquery
+                    .as_deref()
+                    .expect("a shaped relation is a derived table or an inlined CTE"),
             };
             let shape = plan.rels[i]
                 .derived
@@ -1623,10 +1674,13 @@ impl Engine {
                     self.replan_pushed_query(body_expr, *shape, &pushed, parent, ctes, ptypes)
                 }
             };
-            // A view body is planned in its isolated scope (views.md §4.1).
+            // A view body is planned in its isolated scope (views.md §4.1); an inlined CTE's body
+            // against the bindings before it (planner.md §3.4).
             let body = self.plan_again(ctes, || {
                 if let Some(site) = isolated[i] {
                     self.in_view_body(site, || replan(None, &[], ptypes))
+                } else if let Some(ci) = cte_bodies[i] {
+                    replan(None, &ctes[..ci], ptypes)
                 } else {
                     replan(parent, ctes, ptypes)
                 }

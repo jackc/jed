@@ -439,13 +439,14 @@ fn body_pushable(rel: &PlanRel) -> Option<&QueryPlan> {
     query_body_pushable(body).then_some(body)
 }
 
-/// The structural half of body-pushability (planner.md §3.2): a SELECT with no window function,
-/// LIMIT, or OFFSET that is either ungrouped or grouped by exactly one grouping set with at least one
-/// key; or a set operation without LIMIT/OFFSET whose two arms are body-pushable.
+/// The structural half of body-pushability (planner.md §3.2): a SELECT with no LIMIT or OFFSET that
+/// is either ungrouped or grouped by exactly one grouping set with at least one key (window
+/// functions admitted — [`body_input_column`] then requires every window to partition by the
+/// column); or a set operation without LIMIT/OFFSET whose two arms are body-pushable.
 fn query_body_pushable(q: &QueryPlan) -> bool {
     match q {
         QueryPlan::Select(b) => {
-            if b.has_window || b.limit.is_some() || b.offset.is_some() {
+            if b.limit.is_some() || b.offset.is_some() {
                 return false;
             }
             !b.is_agg || (b.group_sets.len() == 1 && !b.group_keys.is_empty())
@@ -462,11 +463,16 @@ fn query_body_pushable(q: &QueryPlan) -> bool {
 
 /// The FROM slot a body-pushable SELECT's output column `j` reads; `None` when the select-list item
 /// is not a bare column. In a grouped body the item must be a grouping column: a plain input column
-/// of the master grouping list (an expression key's synthetic slot is not).
+/// of the master grouping list (an expression key's synthetic slot is not). Below a window the
+/// item's slot must also be a bare PARTITION BY key of every window function, so a conjunct over it
+/// keeps or drops whole partitions.
 fn body_input_column(b: &SelectPlan, j: usize) -> Option<usize> {
     let RExpr::Column(idx) = b.projections.get(j)? else {
         return None;
     };
+    if b.has_window && !b.window_specs.iter().all(|w| w.partition.contains(idx)) {
+        return None;
+    }
     if !b.is_agg {
         return Some(*idx);
     }

@@ -70,7 +70,11 @@ func (db *engine) executeWith(wq *withQuery, params []Value) (outcome, error) {
 // the recursive UNION shape, so it is always non-recursive. The refs counters are bumped as later
 // query bodies / a query primary reference each binding (a data-modifying part's references are
 // static-counted by the orchestrator, since it is not planned here).
-func (db *engine) planCteBindings(ctes []cte, recursive bool, inherited []*cteBinding, parent *scope, ptypes *paramTypes) ([]*cteBinding, error) {
+//
+// primary is the query that owns the list: a CTE that the later bodies and primary name exactly once
+// is a candidate to be inlined at its reference (planner.md §3.4). Its definition is planned with
+// reference expansion off, so a chain of such CTEs plans each body a bounded number of times.
+func (db *engine) planCteBindings(ctes []cte, recursive bool, inherited []*cteBinding, parent *scope, ptypes *paramTypes, primary ctePrimary) ([]*cteBinding, error) {
 	bindings := make([]*cteBinding, 0, len(ctes))
 	for i := range ctes {
 		cte := &ctes[i]
@@ -128,17 +132,43 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, inherited []*cteBi
 		}
 		if q := cte.Body.AsQuery(); q != nil {
 			visible := append(append([]*cteBinding{}, inherited...), bindings...)
-			plan, err := db.planQuery(*q, parent, visible, ptypes)
+			// Named exactly once, by a query part, and not MATERIALIZED: a candidate to be inlined at
+			// its reference (planner.md §3.4). Its definition then expands no reference of its own; an
+			// uncorrelated candidate keeps that definition, a correlated one is planned again with
+			// expansion on (it stays an ordinary CTE).
+			candidate := cteReferenceCandidate(ctes, i, primary)
+			var plan queryPlan
+			planDefinition := func() error {
+				p, perr := db.planQuery(*q, parent, visible, ptypes)
+				plan = p
+				return perr
+			}
+			var err error
+			if candidate {
+				err = db.withoutCteExpansion(planDefinition)
+			} else {
+				err = planDefinition()
+			}
 			if err != nil {
 				return nil, err
+			}
+			atReference := candidate && !queryPlanReferencesOuter(&plan, 0)
+			if candidate && !atReference {
+				if err := db.planAgain(visible, planDefinition); err != nil {
+					return nil, err
+				}
 			}
 			table, err := cteSyntheticTable(lname, &plan, cte.Columns)
 			if err != nil {
 				return nil, err
 			}
-			bindings = append(bindings, &cteBinding{
-				name: lname, table: table, plan: plan, hint: cte.Materialized,
-			})
+			binding := &cteBinding{
+				name: lname, table: table, plan: plan, hint: cte.Materialized, atReference: atReference,
+			}
+			if atReference {
+				binding.bodyAst = q
+			}
+			bindings = append(bindings, binding)
 			continue
 		}
 		// A data-modifying CTE (writable-cte.md): resolve its RETURNING schema for the synthetic
@@ -153,6 +183,51 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, inherited []*cteBi
 		})
 	}
 	return bindings, nil
+}
+
+// ctePrimary is the query that owns a WITH list — its main body, which (with the later CTE bodies)
+// holds the static references that decide whether a CTE is inlined at its reference (planner.md
+// §3.4). Exactly one field is set: body for a statement-level WITH (whose primary may be
+// data-modifying), query for a nested WITH's query body.
+type ctePrimary struct {
+	body  *cteBody
+	query *queryExpr
+}
+
+// refs returns the static (syntactic) references to CTE name in the primary, as (query,
+// data-modifying).
+func (p ctePrimary) refs(name string) (int, int) {
+	if p.body != nil {
+		return staticCteRefs(p.body, name)
+	}
+	return countSelfRefsQuery(*p.query, name), 0
+}
+
+// staticCteRefs returns the static references to CTE name in one part of a WITH statement, as
+// (query, data-modifying): a data-modifying part's references are counted apart, because such a part
+// is planned only when it runs, so a CTE it names is never inlined at its reference (planner.md
+// §3.4).
+func staticCteRefs(body *cteBody, name string) (int, int) {
+	n := countCteRefsDml(body, name)
+	if body.IsDataModifying() {
+		return 0, n
+	}
+	return n, 0
+}
+
+// cteReferenceCandidate reports whether the CTE at ci in a WITH list may be inlined at its reference
+// (planner.md §3.4): not MATERIALIZED, and named exactly once by the later CTE bodies and the
+// primary, by a query part.
+func cteReferenceCandidate(ctes []cte, ci int, primary ctePrimary) bool {
+	name := ctes[ci].Name
+	query, dml := primary.refs(name)
+	for k := ci + 1; k < len(ctes); k++ {
+		q, d := staticCteRefs(&ctes[k].Body, name)
+		query += q
+		dml += d
+	}
+	materialized := ctes[ci].Materialized != nil && *ctes[ci].Materialized
+	return query == 1 && dml == 0 && !materialized
 }
 
 func hasCteBinding(bindings []*cteBinding, name string) bool {
@@ -241,7 +316,7 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 // CTE context. Cost composes like set operations — a sum of the parts.
 func (db *engine) runWith(wq *withQuery, params []Value) (selectResult, error) {
 	ptypes := &paramTypes{}
-	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, nil, nil, ptypes)
+	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, nil, nil, ptypes, ctePrimary{body: &wq.Body})
 	if err != nil {
 		return selectResult{}, err
 	}
@@ -488,7 +563,7 @@ func (db *engine) executeWithDml(wq *withQuery, params []Value) (outcome, error)
 func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 	ptypes := &paramTypes{}
 	// (1) Plan every CTE binding (query plans + data-modifying RETURNING schemas).
-	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, nil, nil, ptypes)
+	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, nil, nil, ptypes, ctePrimary{body: &wq.Body})
 	if err != nil {
 		return outcome{}, err
 	}
@@ -924,6 +999,10 @@ func cteModes(bindings []*cteBinding) []cteMode {
 		switch {
 		case b.recursive != nil || b.isDml():
 			modes[i] = cteMaterialize
+		case b.expanded:
+			// A body planned at its reference is inlined there (planner.md §3.4), even if the
+			// static count missed a reference the planner then resolved.
+			modes[i] = cteInline
 		case b.hint != nil && *b.hint:
 			modes[i] = cteMaterialize
 		case b.hint != nil && !*b.hint:
@@ -1398,7 +1477,7 @@ func (db *engine) planWithExpr(we *withExpr, parent *scope, ctes []*cteBinding, 
 				fmt.Sprintf("WITH clause containing a data-modifying statement (%s) is only supported at the top level", we.Ctes[i].Name))
 		}
 	}
-	bindings, err := db.planCteBindings(we.Ctes, we.Recursive, ctes, parent, ptypes)
+	bindings, err := db.planCteBindings(we.Ctes, we.Recursive, ctes, parent, ptypes, ctePrimary{query: we.Body})
 	if err != nil {
 		return nil, err
 	}

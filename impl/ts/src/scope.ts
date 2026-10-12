@@ -60,6 +60,7 @@ import {
 import { rangeNameForElement } from "./range.ts";
 import type {
   BinaryOp,
+  Cte,
   CteBody,
   Delete,
   Expr,
@@ -783,10 +784,36 @@ export function withHasDml(wq: WithQuery): boolean {
 export function cteModes(bindings: CteBinding[]): CteMode[] {
   return bindings.map((b) => {
     if (b.recursive !== null || b.source.kind === "dml") return "materialize";
+    // A body planned at its reference is inlined there (planner.md §3.4), even if the static count
+    // missed a reference the planner then resolved.
+    if (b.expanded) return "inline";
     if (b.hint === true) return "materialize";
     if (b.hint === false) return "inline";
     return b.refs >= 2 ? "materialize" : "inline";
   });
+}
+
+// staticCteRefs counts the static references to CTE `name` in one part of a WITH statement, as
+// [query, data-modifying]: a data-modifying part's references are counted apart, because such a part
+// is planned only when it runs, so a CTE it names is never inlined at its reference (planner.md
+// §3.4). A query expression is a CteBody too, so it also serves the primary of a nested WITH.
+function staticCteRefs(body: CteBody, name: string): [number, number] {
+  const n = countCteRefsDml(body, name);
+  return cteBodyIsDataModifying(body) ? [0, n] : [n, 0];
+}
+
+// cteReferenceCandidate reports whether the CTE at ci in a WITH list may be inlined at its reference
+// (planner.md §3.4): not MATERIALIZED, and named exactly once by the later CTE bodies and `primary`
+// (the query that owns the list), by a query part.
+export function cteReferenceCandidate(ctes: Cte[], ci: number, primary: CteBody): boolean {
+  const name = ctes[ci]!.name;
+  let [query, dml] = staticCteRefs(primary, name);
+  for (const later of ctes.slice(ci + 1)) {
+    const [q, d] = staticCteRefs(later.body, name);
+    query += q;
+    dml += d;
+  }
+  return query === 1 && dml === 0 && ctes[ci]!.materialized !== true;
 }
 
 // addOutcomeCost adds extra cost to an outcome (the writable-CTE orchestrator folds the

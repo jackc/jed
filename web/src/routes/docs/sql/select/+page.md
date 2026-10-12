@@ -256,8 +256,10 @@ each is visible to later ones and to the main query:
 <LiveSql demo="cte" {seed} query={cte} rows={4} />
 
 CTEs follow PostgreSQL's evaluation rule: a CTE referenced once is **inlined**, one referenced
-several times (or marked `MATERIALIZED`) runs once and its rows are **buffered** and reused. Add an
-optional column-rename list (`WITH t (a, b) AS (…)`).
+several times (or marked `MATERIALIZED`) runs once and its rows are **buffered** and reused. An
+inlined CTE is planned where it is used, so the main query's `WHERE` conditions on it are pushed into
+its body — `WITH c AS (SELECT * FROM t) SELECT * FROM c WHERE id = 5` looks up `id = 5` by key (see
+[EXPLAIN](../explain/)). Add an optional column-rename list (`WITH t (a, b) AS (…)`).
 
 ### Data-modifying CTEs
 

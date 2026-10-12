@@ -545,7 +545,12 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   `col + 0`; **grouped_setop_pushdown** — conjuncts moved below a grouped body's grouping (with
   HAVING, joined to another table) and into every arm of each of the six set operators and a grouped
   arm, over NULL-bearing keys, plus a ROLLUP body that must keep its conjunct
-  ([planner.md §3.2](planner.md)), defeated by `col + 0`; **view** — a query over a view and the same
+  ([planner.md §3.2](planner.md)), defeated by `col + 0`; **cte_window_pushdown** — conjuncts moved
+  below a window over every window's PARTITION BY column (row numbers, running and whole-partition
+  aggregates, a grouped window body) and into the bodies of CTEs inlined at their one reference
+  (joined, chained through another such CTE, grouped, windowed, the NULL-extended side of a LEFT
+  JOIN), plus a non-partition column and a two-reference CTE that must keep their conjuncts outside
+  ([planner.md §3.2/§3.4](planner.md)), defeated by `col + 0`; **view** — a query over a view and the same
   query over its inlined derived table `(<definition>) AS v(<columns>)` ([views.md §4](views.md)):
   pushed-down predicates, a join view joined to a table, an aggregate view, and a view over a view
   under a column alias list must return the same rows; **view_write** — UPDATE, DELETE, and INSERT

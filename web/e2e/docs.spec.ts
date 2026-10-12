@@ -578,6 +578,22 @@ test('the explain page shows a WHERE conjunct moved below a grouped subquery', a
   await expect(panel.getByTestId('result-rows')).toContainText('Index bound: using city_region');
 });
 
+test('the explain page shows a WHERE conjunct moved below a window', async ({ page }) => {
+  await page.goto('/docs/sql/explain/');
+  // `region = 2` is every window's PARTITION BY key, so it bounds city_region below the Window (§3.2).
+  const panel = livePanel(page, 'windowPushdown');
+  await expect(panel.getByTestId('result-rows')).toContainText('Window');
+  await expect(panel.getByTestId('result-rows')).toContainText('Index bound: using city_region');
+});
+
+test('the explain page shows a WHERE conjunct moved into an inlined CTE', async ({ page }) => {
+  await page.goto('/docs/sql/explain/');
+  // The single-reference CTE is planned at its CTE Scan, where `id = 3` is a PK lookup (§3.4).
+  const panel = livePanel(page, 'ctePushdown');
+  await expect(panel.getByTestId('result-rows')).toContainText('CTE Scan c');
+  await expect(panel.getByTestId('result-rows')).toContainText('PK bound: id = 3');
+});
+
 test('the explain page shows a WHERE conjunct moved into every set-operation branch', async ({
   page
 }) => {

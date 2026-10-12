@@ -1,0 +1,584 @@
+# Predicate pushdown below a window function and into inlined CTE bodies (spec/design/planner.md
+# §3.2/§3.4). A pushdown-safe conjunct over a derived body with window functions moves into the body
+# — below the window — when every column it references is a bare PARTITION BY key of every window
+# function in that body: it keeps or drops whole partitions, so each window sees the same partitions.
+# A conjunct over any other column, a window without PARTITION BY, or an expression partition key
+# keeps it outside. A CTE inlined at its reference — named exactly once by a query part, not
+# MATERIALIZED, uncorrelated, non-recursive — is planned at that reference like a derived table, so
+# its body takes the same pushdown; a CTE referenced twice (materialized, or NOT MATERIALIZED) or
+# marked MATERIALIZED does not. The rows are PostgreSQL's; the `# cost:` pins are jed's cross-core
+# contract.
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.column_alias, query.table_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.join_left, query.aggregates, query.group_by, query.having, query.union, query.derived_table, query.subquery_scalar, query.subquery_correlated, query.cte, query.cte_nested, query.cte_recursive, query.cte_data_modifying, dml.with_clause, dml.returning, dml.insert_select, query.subquery_exists, query.subquery_in, query.distinct, query.limit, query.window_frame, ddl.view, query.window, query.window_ranking, query.window_aggregate, query.window_grouped, query.window_expr_keys, query.point_lookup, query.composite_pk_pushdown, query.join_pushdown, query.hash_join, query.index_nested_loop, query.where_pushdown, query.derived_pushdown, query.on_pushdown, query.is_null, expr.arithmetic, null.three_valued, types.i32, types.i64, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, k i32, v i32)
+
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, w i32)
+
+statement ok
+CREATE TABLE g (a i32, b i32, c i32, PRIMARY KEY (a, b))
+
+statement ok
+INSERT INTO t VALUES (1, 1, 10), (2, 2, 20), (3, 3, 30), (4, 1, 40), (5, 2, NULL), (6, 3, 60), (7, 1, 70), (8, 2, 80), (9, 3, 90), (10, 1, 100), (11, 2, 110), (12, NULL, 120)
+
+statement ok
+INSERT INTO u VALUES (1, 10), (2, NULL), (3, 30)
+
+statement ok
+INSERT INTO g VALUES (1, 1, 5), (1, 2, 6), (2, 1, 7), (2, 2, 8), (2, 3, NULL), (3, 1, 9)
+
+# ---------------------------------------------------------------------------------------------------
+# Below a window.
+
+# A conjunct over the PARTITION BY column moves below the window: only k = 2's partition is read and
+# numbered, and its row numbers are the same as over the whole table.
+# cost: 37
+query III nosort
+SELECT d.id, d.v, d.rn FROM (SELECT id, k, v, row_number() OVER (PARTITION BY k ORDER BY id) AS rn FROM t) d WHERE d.k = 2 ORDER BY d.id
+----
+2
+20
+1
+5
+NULL
+2
+8
+80
+3
+11
+110
+4
+
+# A conjunct over a column that is not a partition key stays above the window, which numbers every
+# row of each partition first.
+# cost: 54
+query III nosort
+SELECT d.id, d.k, d.rn FROM (SELECT id, k, v, row_number() OVER (PARTITION BY k ORDER BY id) AS rn FROM t) d WHERE d.v > 70 ORDER BY d.id
+----
+8
+2
+3
+9
+3
+3
+10
+1
+4
+11
+2
+4
+12
+NULL
+1
+
+# Of a mixed WHERE, the partition-key conjunct moves and the other stays above the window.
+# cost: 39
+query III nosort
+SELECT d.id, d.k, d.rn FROM (SELECT id, k, v, row_number() OVER (PARTITION BY k ORDER BY id) AS rn FROM t) d WHERE d.k = 1 AND d.v > 40 ORDER BY d.id
+----
+7
+1
+3
+10
+1
+4
+
+# A partition-key conjunct moves below a window aggregate too; the running and whole-partition sums
+# are those of the full partition.
+# cost: 67
+query IIII nosort
+SELECT d.id, d.k, d.run, d.tot FROM (SELECT id, k, sum(v) OVER (PARTITION BY k ORDER BY id) AS run, sum(v) OVER (PARTITION BY k) AS tot FROM t) d WHERE d.k >= 2 ORDER BY d.id
+----
+2
+2
+20
+210
+3
+3
+30
+180
+5
+2
+20
+210
+6
+3
+90
+180
+8
+2
+100
+210
+9
+3
+180
+180
+11
+2
+210
+210
+
+# The NULL partition: partitioning keeps NULLs together, and IS NULL judges every member alike.
+# cost: 29
+query III nosort
+SELECT d.id, d.k, d.n FROM (SELECT id, k, count(*) OVER (PARTITION BY k) AS n FROM t) d WHERE d.k IS NULL
+----
+12
+NULL
+1
+
+# Every window must partition by the column: here the second window partitions by (k, v), the first by
+# k alone, so a conjunct on k moves (k is in both) and one on v does not.
+# cost: 40
+query IIII nosort
+SELECT d.id, d.k, d.a, d.b FROM (SELECT id, k, v, count(*) OVER (PARTITION BY k) AS a, rank() OVER (PARTITION BY k, v ORDER BY id) AS b FROM t) d WHERE d.k = 3 ORDER BY d.id
+----
+3
+3
+3
+1
+6
+3
+3
+1
+9
+3
+3
+1
+
+# cost: 74
+query IIII nosort
+SELECT d.id, d.v, d.a, d.b FROM (SELECT id, k, v, count(*) OVER (PARTITION BY k) AS a, rank() OVER (PARTITION BY k, v ORDER BY id) AS b FROM t) d WHERE d.v = 30 ORDER BY d.id
+----
+3
+30
+3
+1
+
+# A window without PARTITION BY spans every row, so nothing moves below it.
+# cost: 53
+query II nosort
+SELECT d.id, d.rn FROM (SELECT id, k, row_number() OVER (ORDER BY id) AS rn FROM t) d WHERE d.k = 2 ORDER BY d.id
+----
+2
+2
+5
+5
+8
+8
+11
+11
+
+# An expression partition key is not a bare column, so the conjunct stays above the window.
+# cost: 77
+query II nosort
+SELECT d.id, d.n FROM (SELECT id, k, count(*) OVER (PARTITION BY k + 0) AS n FROM t) d WHERE d.k = 2 ORDER BY d.id
+----
+2
+4
+5
+4
+8
+4
+11
+4
+
+# A grouped body with a window: a conjunct over a grouping column that every window partitions by
+# moves below the grouping and bounds g's primary-key prefix.
+# cost: 22
+query IIII nosort
+SELECT d.a, d.b, d.s, d.r FROM (SELECT a, b, sum(c) AS s, rank() OVER (PARTITION BY a ORDER BY sum(c) DESC) AS r FROM g GROUP BY a, b) d WHERE d.a = 2 ORDER BY d.b
+----
+2
+1
+7
+3
+2
+2
+8
+2
+2
+3
+NULL
+1
+
+# A grouping column the window does not partition by stays above the window.
+# cost: 40
+query IIII nosort
+SELECT d.a, d.b, d.s, d.r FROM (SELECT a, b, sum(c) AS s, rank() OVER (PARTITION BY a ORDER BY sum(c) DESC) AS r FROM g GROUP BY a, b) d WHERE d.b = 1 ORDER BY d.a
+----
+1
+1
+5
+2
+2
+1
+7
+3
+3
+1
+9
+1
+
+# Window bodies in both arms of a set operation, each partitioned by the pushed column.
+# cost: 48
+query III nosort
+SELECT d.id, d.k, d.n FROM (SELECT id, k, count(*) OVER (PARTITION BY k) AS n FROM t UNION ALL SELECT id, w, count(*) OVER (PARTITION BY w) FROM u) d WHERE d.k = 1 ORDER BY d.id, d.n
+----
+1
+1
+4
+4
+1
+4
+7
+1
+4
+10
+1
+4
+
+# An ON conjunct over the window body's partition key moves below the window too.
+# cost: 105
+query III nosort
+SELECT u.id, d.id, d.rn FROM u JOIN (SELECT id, k, row_number() OVER (PARTITION BY k ORDER BY id DESC) AS rn FROM t) d ON d.k = u.id AND d.k = 2 ORDER BY d.id
+----
+2
+2
+4
+2
+5
+3
+2
+8
+2
+2
+11
+1
+
+# ---------------------------------------------------------------------------------------------------
+# Into an inlined CTE body.
+
+# A single-reference CTE is planned at its reference: the conjunct moves into the body and bounds t's
+# primary key.
+# cost: 5
+query III nosort
+WITH c AS (SELECT id, k, v FROM t) SELECT * FROM c WHERE c.id = 5
+----
+5
+2
+NULL
+
+# The same through a join: c's conjunct moves into its body, and the hash join reads only its rows.
+# cost: 29
+query II nosort
+WITH c AS (SELECT id, k FROM t) SELECT c.id, u.w FROM c JOIN u ON c.k = u.id WHERE c.id < 5 ORDER BY c.id
+----
+1
+10
+2
+NULL
+3
+30
+4
+10
+
+# NOT MATERIALIZED on a single reference is the same inlined CTE.
+# cost: 5
+query III nosort
+WITH c AS NOT MATERIALIZED (SELECT id, k, v FROM t) SELECT * FROM c WHERE c.id = 5
+----
+5
+2
+NULL
+
+# MATERIALIZED keeps the body whole: it runs once into a buffer the reference scans and filters.
+# cost: 50
+query III nosort
+WITH c AS MATERIALIZED (SELECT id, k, v FROM t) SELECT * FROM c WHERE c.id = 5
+----
+5
+2
+NULL
+
+# Two references materialize the CTE; each reference filters the buffer (scan pushdown only).
+# cost: 108
+query II nosort
+WITH c AS (SELECT id, k FROM t) SELECT c1.id, c2.id FROM c c1 JOIN c c2 ON c1.k = c2.k WHERE c1.id = 3 AND c2.id > 6 ORDER BY c2.id
+----
+3
+9
+
+# NOT MATERIALIZED with two references runs the body at each reference, but takes no pushdown.
+# cost: 109
+query II nosort
+WITH c AS NOT MATERIALIZED (SELECT id, k FROM t) SELECT c1.id, c2.id FROM c c1 JOIN c c2 ON c1.k = c2.k WHERE c1.id = 3 AND c2.id > 6 ORDER BY c2.id
+----
+3
+9
+
+# A chain: b's WHERE moves into a, and the outer conjunct moves through b into a too.
+# cost: 34
+query II nosort
+WITH a AS (SELECT id, k, v FROM t), b AS (SELECT id, v FROM a WHERE a.k = 1) SELECT b.id, b.v FROM b WHERE b.id < 8 ORDER BY b.id
+----
+1
+10
+4
+40
+7
+70
+
+# A grouped CTE body: the conjunct over the grouping column moves below the grouping.
+# cost: 12
+query II nosort
+WITH s AS (SELECT a, sum(c) AS total FROM g GROUP BY a) SELECT s.a, s.total FROM s WHERE s.a = 2
+----
+2
+15
+
+# A CTE whose body has a window: the partition-key conjunct moves below the window.
+# cost: 36
+query III nosort
+WITH r AS (SELECT id, k, row_number() OVER (PARTITION BY k ORDER BY v DESC) AS rn FROM t) SELECT r.id, r.k, r.rn FROM r WHERE r.k = 3 AND r.rn <= 2 ORDER BY r.id
+----
+6
+3
+2
+9
+3
+1
+
+# A set-operation CTE body takes the conjunct into each arm.
+# cost: 16
+query I nosort
+WITH s AS (SELECT id FROM t UNION SELECT id FROM u) SELECT s.id FROM s WHERE s.id <= 2 ORDER BY s.id
+----
+1
+2
+
+# The CTE's column rename list renames the outputs the conjunct references.
+# cost: 5
+query II nosort
+WITH c(x, y) AS (SELECT id, v FROM t) SELECT c.x, c.y FROM c WHERE c.x = 9
+----
+9
+90
+
+# A single reference inside a scalar subquery: its conjunct moves into the body.
+# cost: 35
+query I nosort
+WITH c AS (SELECT id, k, v FROM t) SELECT (SELECT max(c.v) FROM c WHERE c.k = 2)
+----
+110
+
+# A single reference in a correlated subquery: the uncorrelated conjunct moves into the body, the
+# correlated one stays, and the body runs per outer row.
+# cost: 81
+query II nosort
+WITH c AS (SELECT id, k, v FROM t) SELECT u.id, (SELECT count(*) FROM c WHERE c.k = u.id AND c.id < 6) FROM u ORDER BY u.id
+----
+1
+2
+2
+2
+3
+1
+
+# A nested WITH in a derived table is inlined at its reference the same way.
+# cost: 6
+query II nosort
+SELECT s.id, s.v FROM (WITH c AS (SELECT id, v FROM t) SELECT id, v FROM c WHERE c.id = 7) s
+----
+7
+70
+
+# The NULL-extended side of a LEFT JOIN keeps a WHERE conjunct outside; its ON conjunct moves in.
+# cost: 32
+query II nosort
+WITH c AS (SELECT id, k FROM t) SELECT u.id, c.id FROM u LEFT JOIN c ON c.k = u.id AND c.id > 8 ORDER BY u.id, c.id
+----
+1
+10
+2
+11
+3
+9
+
+# A non-pushdown-safe conjunct (arithmetic) stays outside the inlined body.
+# cost: 53
+query II nosort
+WITH c AS (SELECT id, k FROM t) SELECT c.id, c.k FROM c WHERE c.k + 1 = 3 ORDER BY c.id
+----
+2
+2
+5
+2
+8
+2
+11
+2
+
+# ---------------------------------------------------------------------------------------------------
+# Inlined CTEs in other positions.
+
+statement ok
+CREATE TABLE w (id i32 PRIMARY KEY, x i32)
+
+statement ok
+CREATE VIEW tv AS SELECT id, k, v FROM t
+
+# A single-reference CTE read by a recursive CTE's anchor is expanded there.
+# cost: 41
+query II rowsort
+WITH RECURSIVE a AS (SELECT id, k FROM t), r AS (SELECT id, k FROM a WHERE a.id < 3 UNION ALL SELECT r.id + 10, r.k FROM r WHERE r.id < 20) SELECT r.id, r.k FROM r
+----
+1
+1
+11
+1
+12
+2
+2
+2
+21
+1
+22
+2
+
+# A single reference inside a correlated EXISTS: the uncorrelated conjunct moves into the body.
+# cost: 510
+query I rowsort
+WITH c AS (SELECT id, k FROM t) SELECT t.id FROM t WHERE EXISTS (SELECT 1 FROM c WHERE c.k = t.k AND c.id > 3)
+----
+1
+10
+11
+2
+3
+4
+5
+6
+7
+8
+9
+
+# A single reference inside an IN subquery.
+# cost: 110
+query I rowsort
+WITH c AS (SELECT id, k FROM t) SELECT t.id FROM t WHERE t.id IN (SELECT c.id FROM c WHERE c.k = 2)
+----
+11
+2
+5
+8
+
+# A query CTE read only by the query primary of a data-modifying WITH is expanded; the INSERT runs.
+# cost: 10
+query II rowsort
+WITH q AS (SELECT id, v FROM t), i AS (INSERT INTO w SELECT id, v FROM t WHERE id = 1 RETURNING id) SELECT q.id, q.v FROM q WHERE q.id = 2
+----
+2
+20
+
+# A query CTE read from a data-modifying CTE body is never expanded (that part is planned when it
+# runs): its definition runs in place.
+# cost: 41
+query II rowsort
+WITH q AS (SELECT id, v FROM t), i AS (INSERT INTO w SELECT id, v FROM q WHERE q.id = 3 RETURNING id) SELECT i.id, 0 FROM i
+----
+3
+0
+
+# A CTE body reading a view: the conjunct moves through the CTE into the view's body.
+# cost: 6
+query III rowsort
+WITH c AS (SELECT id, k, v FROM tv) SELECT * FROM c WHERE c.id = 4
+----
+4
+1
+40
+
+# A nested WITH shadowing an outer CTE of the same name; the inner body reads the outer one.
+# cost: 44
+query II rowsort
+WITH c AS (SELECT id, k FROM t) SELECT * FROM (WITH c AS (SELECT id, k FROM c WHERE c.k = 1) SELECT * FROM c) s WHERE s.id > 1
+----
+10
+1
+4
+1
+7
+1
+
+# A CTE referenced twice by a single-reference CTE is materialized, while the outer one is expanded.
+# cost: 53
+query III rowsort
+WITH c AS (SELECT id, k, v FROM t), d AS (SELECT * FROM c WHERE c.k = 1) SELECT d.id, d.k, (SELECT count(*) FROM d d2) FROM d WHERE d.id > 1
+----
+10
+1
+4
+4
+1
+4
+7
+1
+4
+
+# A body with LIMIT is not body-pushable: the conjunct stays outside the expanded body.
+# cost: 11
+query II rowsort
+WITH c AS (SELECT id, k FROM t ORDER BY id LIMIT 3) SELECT * FROM c WHERE c.k = 2
+----
+2
+2
+
+# A DISTINCT body takes the conjunct.
+# cost: 33
+query II rowsort
+WITH c AS (SELECT DISTINCT k, v FROM t) SELECT * FROM c WHERE c.k = 1
+----
+1
+10
+1
+100
+1
+40
+1
+70
+
+# A window frame partitioned by the pushed column.
+# cost: 76
+query IIII rowsort
+WITH c AS (SELECT id, k, v, sum(v) OVER (PARTITION BY k ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM t) SELECT * FROM c WHERE c.k IN (1, 3)
+----
+1
+1
+10
+10
+10
+1
+100
+170
+3
+3
+30
+30
+4
+1
+40
+50
+6
+3
+60
+90
+7
+1
+70
+110
+9
+3
+90
+150

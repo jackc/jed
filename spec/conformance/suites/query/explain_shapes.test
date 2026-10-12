@@ -257,19 +257,66 @@ CTE c
 inlined
 1
 0
+1
+CTE Scan c
+-
+1
+4
+2
+Scan t
+Full scan; touched=1
+1
+3
+
+# A nested WITH estimate retains the enclosing CTE body, so its inherited scan has the same
+# deterministic cardinality/cost facts as a top-level CTE scan.
+query ITTII nosort
+EXPLAIN WITH e AS MATERIALIZED (SELECT v FROM t)
+SELECT * FROM (WITH inner_c AS (SELECT v FROM e) SELECT v FROM inner_c) s
+----
+0
+WITH
+ctes=1
+1
+7
+1
+CTE e
+materialized
+1
+3
 2
 Scan t
 Full scan; touched=1
 1
 3
 1
-CTE Scan c
+Subquery s
 -
 1
 4
+2
+WITH
+ctes=1
+1
+3
+3
+CTE inner_c
+inlined
+1
+0
+3
+CTE Scan inner_c
+-
+1
+3
+4
+CTE Scan e
+-
+1
+2
 
-# A nested WITH estimate retains the enclosing CTE body, so its inherited scan has the same
-# deterministic cardinality/cost facts as a top-level CTE scan.
+# The same with e inlined: each CTE is planned at its one reference, so the chain nests there
+# (planner.md §3.4).
 query ITTII nosort
 EXPLAIN WITH e AS (SELECT v FROM t)
 SELECT * FROM (WITH inner_c AS (SELECT v FROM e) SELECT v FROM inner_c) s
@@ -284,11 +331,6 @@ CTE e
 inlined
 1
 0
-2
-Scan t
-Full scan; touched=1
-1
-3
 1
 Subquery s
 -
@@ -304,16 +346,21 @@ CTE inner_c
 inlined
 1
 0
-4
-CTE Scan e
--
-1
-4
 3
 CTE Scan inner_c
 -
 1
 5
+4
+CTE Scan e
+-
+1
+4
+5
+Scan t
+Full scan; touched=1
+1
+3
 
 # A window function adds a Window node carrying the number of window functions.
 query ITTII nosort

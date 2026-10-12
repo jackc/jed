@@ -81,6 +81,12 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	}
 	shapeBodies := !shaping && mayPush
 	shaped := make([]bool, len(tableRefs))
+	// cteBodies[i] is ci when FROM item i is a reference to CTE ci whose body it plans in place
+	// (planner.md §3.4), else -1.
+	cteBodies := make([]int, len(tableRefs))
+	for i := range cteBodies {
+		cteBodies[i] = -1
+	}
 	seenLabels := make(map[string]bool)
 	offset := 0
 	// The inner labels and hidden USING copies of each unaliased parenthesized join (§15).
@@ -306,6 +312,28 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 						"WITH query "+lname+" does not have a RETURNING clause")
 				}
 				ctes[ci].refs++
+				// A CTE inlined at its reference plans its body here, like a derived table (planner.md
+				// §3.4) — once per statement, never inside a shape or a definition planned with
+				// expansion off. Only the earlier bindings are in its scope, and it is uncorrelated,
+				// so it is planned against no parent.
+				if ctes[ci].atReference && !shaping && !db.cteExpansionOff && !ctes[ci].expanded {
+					ctes[ci].expanded = true
+					earlier := ctes[:ci:ci]
+					var body queryPlan
+					err := db.planBodyFirst(shapeBodies, func() error {
+						return db.planAgain(ctes, func() error {
+							p, perr := db.planQuery(*ctes[ci].bodyAst, nil, earlier, ptypes)
+							body = p
+							return perr
+						})
+					})
+					if err != nil {
+						return nil, err
+					}
+					derivedPlans[i] = &body
+					shaped[i] = shapeBodies
+					cteBodies[i] = ci
+				}
 				idx := ci
 				cteIdx = &idx
 				t = ctes[ci].table
@@ -1197,7 +1225,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	if shaping {
 		return plan, nil
 	}
-	if err := db.planDerivedBodies(plan, tableRefs, isolated, shaped, parent, ctes, ptypes); err != nil {
+	if err := db.planDerivedBodies(plan, tableRefs, isolated, shaped, cteBodies, parent, ctes, ptypes); err != nil {
 		return nil, err
 	}
 	//
@@ -1235,10 +1263,22 @@ func (db *engine) planAgain(ctes []*cteBinding, f func() error) error {
 	return err
 }
 
+// withoutCteExpansion runs f with CTE reference expansion off (planner.md §3.4): the definition of a
+// CTE that its reference may plan again.
+func (db *engine) withoutCteExpansion(f func() error) error {
+	saved := db.cteExpansionOff
+	db.cteExpansionOff = true
+	err := f()
+	db.cteExpansionOff = saved
+	return err
+}
+
 // planDerivedBodies plans each derived body whose shape stage 2 read for real, from its syntax
 // (spec/design/planner.md §3.2). A body that stage 2 moved conjuncts into gets them appended to its
 // WHERE, so its own rewrite and access-path selection see them; any other body is planned as written.
-func (db *engine) planDerivedBodies(plan *selectPlan, tableRefs []tableRef, isolated []*viewSite, shaped []bool, parent *scope, ctes []*cteBinding, ptypes *paramTypes) error {
+// A CTE reference that plans its CTE's body (cteBodies, planner.md §3.4) plans it from the CTE's
+// syntax against the earlier bindings and no parent scope.
+func (db *engine) planDerivedBodies(plan *selectPlan, tableRefs []tableRef, isolated []*viewSite, shaped []bool, cteBodies []int, parent *scope, ctes []*cteBinding, ptypes *paramTypes) error {
 	var pushes [][]*rExpr
 	if plan.pushdown != nil {
 		pushes = plan.pushdown.bodyPushes
@@ -1252,12 +1292,16 @@ func (db *engine) planDerivedBodies(plan *selectPlan, tableRefs []tableRef, isol
 		if i < len(pushes) {
 			pushed = pushes[i]
 		}
+		bodyExpr := tableRefs[i].Subquery
+		if ci := cteBodies[i]; ci >= 0 {
+			bodyExpr = ctes[ci].bodyAst
+		}
 		shape := plan.rels[i].derived
 		replan := func(parent *scope, ctes []*cteBinding) (queryPlan, error) {
 			if len(pushed) == 0 {
-				return db.planQuery(*tableRefs[i].Subquery, parent, ctes, ptypes)
+				return db.planQuery(*bodyExpr, parent, ctes, ptypes)
 			}
-			return db.replanPushedQuery(*tableRefs[i].Subquery, shape, pushed, parent, ctes, ptypes)
+			return db.replanPushedQuery(*bodyExpr, shape, pushed, parent, ctes, ptypes)
 		}
 		var body queryPlan
 		err := db.planAgain(ctes, func() error {
@@ -1268,6 +1312,11 @@ func (db *engine) planDerivedBodies(plan *selectPlan, tableRefs []tableRef, isol
 					body, rerr = replan(nil, nil)
 					return rerr
 				})
+			}
+			if ci := cteBodies[i]; ci >= 0 {
+				// An inlined CTE's body is planned against the bindings before it (planner.md §3.4).
+				body, rerr = replan(nil, ctes[:ci:ci])
+				return rerr
 			}
 			body, rerr = replan(parent, ctes)
 			return rerr

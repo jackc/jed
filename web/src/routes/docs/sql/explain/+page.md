@@ -50,6 +50,13 @@ WHERE v.id = 3;`;
 	const groupedPushdown = `EXPLAIN SELECT g.region, g.cities
 FROM (SELECT region, count(*) AS cities FROM city GROUP BY region) g
 WHERE g.region = 2;`;
+	const windowPushdown = `EXPLAIN SELECT r.name, r.pos
+FROM (SELECT name, region,
+             row_number() OVER (PARTITION BY region ORDER BY name) AS pos
+      FROM city) r
+WHERE r.region = 2;`;
+	const ctePushdown = `EXPLAIN WITH c AS (SELECT id, name, region FROM city)
+SELECT c.name FROM c WHERE c.id = 3;`;
 	const setopPushdown = `EXPLAIN SELECT x.id
 FROM (SELECT id FROM city UNION SELECT city_id FROM trip) x
 WHERE x.id = 3;`;
@@ -222,11 +229,11 @@ none of its `SET` or `RETURNING` expressions, and changes nothing.
 <LiveSql demo="contradiction" seed={seed} query={contradiction} rows={4} />
 
 A condition on a subquery in `FROM` moves **into** the subquery when it only compares the subquery's
-plain output columns and the subquery has no window function, `LIMIT`, or `OFFSET`. The subquery is
-then planned as if you had written the condition inside it — here it becomes a primary-key lookup on
-`city` rather than a filter over every row the subquery returns. (A subquery that doesn't qualify, a
-`WITH` query, or a set-returning function in a join still gets the condition applied to its rows
-before the join, shown as `filter:conjuncts=N` on its node.)
+plain output columns and the subquery has no `LIMIT` or `OFFSET`. The subquery is then planned as if
+you had written the condition inside it — here it becomes a primary-key lookup on `city` rather than a
+filter over every row the subquery returns. (A subquery that doesn't qualify, a materialized `WITH`
+query, or a set-returning function in a join still gets the condition applied to its rows before the
+join, shown as `filter:conjuncts=N` on its node.)
 
 <LiveSql demo="derivedPushdown" seed={seed} query={derivedPushdown} rows={4} />
 
@@ -236,6 +243,21 @@ the `Aggregate`, and only one region's cities are counted. A condition on an agg
 `ROLLUP`/`CUBE`/`GROUPING SETS` subquery, stays outside.
 
 <LiveSql demo="groupedPushdown" seed={seed} query={groupedPushdown} rows={4} />
+
+A subquery with a window function takes the condition when every window is `PARTITION BY` the columns
+it compares: it then keeps or drops whole partitions, so each row's window value is unchanged. Here
+`r.region = 2` runs below the `Window` and bounds `city_region`, and only region 2's cities are
+numbered. A condition on any other column — or on a window without `PARTITION BY` — stays outside,
+since filtering first would change the numbering.
+
+<LiveSql demo="windowPushdown" seed={seed} query={windowPushdown} rows={4} />
+
+A `WITH` query that is used **exactly once** (and not marked `MATERIALIZED`) runs in place, like a
+subquery — and is planned there like one, so it takes the condition the same way. Its body appears
+under its `CTE Scan` node; here it becomes a primary-key lookup. A `WITH` query used twice is computed
+once into a buffer, so a condition is only applied to the rows each use reads from it.
+
+<LiveSql demo="ctePushdown" seed={seed} query={ctePushdown} rows={5} />
 
 A `UNION`, `INTERSECT`, or `EXCEPT` subquery takes the condition into **every branch**, and each branch
 plans it on its own table: here it is a primary-key lookup on `city` and a filter on `trip`'s scan.

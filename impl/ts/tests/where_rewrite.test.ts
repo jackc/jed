@@ -69,8 +69,9 @@ test("where pushdown: bound parameters filter inside the scan and charge like li
   }
 });
 
-// A bound parameter in a conjunct moved into a derived body — below a grouped body's grouping, and
-// into every set-operation arm (planner.md §3.2) — or pushed from an ON (§3.3) reads the bound value where it now runs, charges exactly like the literal spelling, and a
+// A bound parameter in a conjunct moved into a derived body — below a grouped body's grouping or a
+// window, into every set-operation arm (planner.md §3.2), and into a CTE inlined at its reference
+// (§3.4) — or pushed from an ON (§3.3) reads the bound value where it now runs, charges exactly like the literal spelling, and a
 // prepared statement's cached plan keeps the rewrite (the body was planned again once, before bind).
 test("derived and ON pushdown: bound parameters charge like literals", () => {
   const db = new Engine();
@@ -98,6 +99,20 @@ test("derived and ON pushdown: bound parameters charge like literals", () => {
         "SELECT s.id FROM (SELECT id FROM a UNION ALL SELECT id FROM b) s WHERE s.id >= 12 ORDER BY s.id",
       value: 12n,
       want: [12n, 13n, 14n, 15n],
+    },
+    {
+      param:
+        "SELECT d.id FROM (SELECT id, k, row_number() OVER (PARTITION BY k ORDER BY id) AS rn FROM a) d WHERE d.k = $1",
+      literal:
+        "SELECT d.id FROM (SELECT id, k, row_number() OVER (PARTITION BY k ORDER BY id) AS rn FROM a) d WHERE d.k = 2",
+      value: 2n,
+      want: [2n],
+    },
+    {
+      param: "WITH c AS (SELECT id, v FROM a) SELECT c.id FROM c WHERE c.id = $1",
+      literal: "WITH c AS (SELECT id, v FROM a) SELECT c.id FROM c WHERE c.id = 2",
+      value: 2n,
+      want: [2n],
     },
     {
       param:

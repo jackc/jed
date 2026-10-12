@@ -70,20 +70,21 @@ Full scan; touched=2
 5
 6
 
-# An inlined CTE reference renders its scan-pushed filter on the CTE Scan.
+# A materialized CTE reference renders its scan-pushed filter on the CTE Scan. (An inlined CTE takes
+# the conjunct into its body instead — query/cte_window_pushdown_explain.test.)
 query ITTII nosort
-EXPLAIN WITH c AS (SELECT id, k FROM a) SELECT c.id, b.id FROM c JOIN b ON c.k = b.k WHERE c.id < 3
+EXPLAIN WITH c AS MATERIALIZED (SELECT id, k FROM a) SELECT c.id, b.id FROM c JOIN b ON c.k = b.k WHERE c.id < 3
 ----
 0
 WITH
 ctes=1
 1
-57
+61
 1
 CTE c
-inlined
+materialized
 4
-0
+9
 2
 Scan a
 Full scan; touched=2
@@ -93,12 +94,12 @@ Full scan; touched=2
 Hash Join
 inner; keys=1; on:conjuncts=1
 1
-57
+52
 2
 CTE Scan c
 filter:conjuncts=1
 2
-13
+8
 2
 Scan b
 Full scan; touched=2

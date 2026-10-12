@@ -424,6 +424,83 @@ setup_sql = [
   "INSERT INTO so_ref_b SELECT g, g % 997 FROM generate_series(1, 100000) AS g"
 ]
 
+# Stage-2 pushdown below a window (query.derived_pushdown, planner.md §3.2) and its results-identical
+# outer-filter reference. Every window partitions by g, so `d.g = 500` moves below the window and
+# bounds the (g, id) primary-key prefix: one 100-row partition is read and numbered. Spelled
+# `d.g + 0`, all 100k rows are partitioned, sorted, and numbered before the outer filter keeps one
+# partition.
+[[bench]]
+name = "window_pushdown_pk"
+description = "A partition-key conjunct moves below a window and seeks one 100-row partition of 100k rows"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT d.g, d.id, d.rn FROM (SELECT g, id, row_number() OVER (PARTITION BY g ORDER BY v, id) AS rn FROM wp_orders) d WHERE d.g = 500 ORDER BY d.id"
+warmup = 50
+iterations = 1000
+seed = 4803
+expect_rows_per_iter = 100
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS wp_orders",
+  "CREATE TABLE wp_orders (g bigint, id bigint, v bigint, PRIMARY KEY (g, id))",
+  "INSERT INTO wp_orders SELECT g % 1000, g, g % 97 FROM generate_series(1, 100000) AS g"
+]
+
+[[bench]]
+name = "window_pushdown_pk_residual"
+description = "Residual reference for window_pushdown_pk: `d.g + 0 = 500` numbers all 100k rows first"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT d.g, d.id, d.rn FROM (SELECT g, id, row_number() OVER (PARTITION BY g ORDER BY v, id) AS rn FROM wp_ref_orders) d WHERE d.g + 0 = 500 ORDER BY d.id"
+warmup = 2
+iterations = 20
+seed = 4804
+expect_rows_per_iter = 100
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS wp_ref_orders",
+  "CREATE TABLE wp_ref_orders (g bigint, id bigint, v bigint, PRIMARY KEY (g, id))",
+  "INSERT INTO wp_ref_orders SELECT g % 1000, g, g % 97 FROM generate_series(1, 100000) AS g"
+]
+
+# Stage-2 pushdown into a CTE inlined at its one reference (query.derived_pushdown, planner.md §3.4)
+# and its results-identical outer-filter reference. Planned at its reference, the CTE takes
+# `c.id = 50000` into its body, which seeks the 100k-row table's primary key; spelled `c.id + 0`, the
+# body runs whole and every row is filtered (the plan every inlined CTE had before).
+[[bench]]
+name = "cte_pushdown_pk"
+description = "A conjunct on a single-reference CTE moves into its body and seeks a 100k-row table's PK"
+dataset = "scratch"
+kind = "query"
+sql = "WITH c AS (SELECT id, v FROM cp_orders) SELECT c.id, c.v FROM c WHERE c.id = 50000"
+warmup = 100
+iterations = 5000
+seed = 4805
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS cp_orders",
+  "CREATE TABLE cp_orders (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO cp_orders SELECT g, g % 1000 FROM generate_series(1, 100000) AS g"
+]
+
+[[bench]]
+name = "cte_pushdown_pk_residual"
+description = "Residual reference for cte_pushdown_pk: `c.id + 0 = 50000` runs the 100k-row body whole"
+dataset = "scratch"
+kind = "query"
+sql = "WITH c AS (SELECT id, v FROM cp_ref_orders) SELECT c.id, c.v FROM c WHERE c.id + 0 = 50000"
+warmup = 2
+iterations = 20
+seed = 4806
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS cp_ref_orders",
+  "CREATE TABLE cp_ref_orders (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO cp_ref_orders SELECT g, g % 1000 FROM generate_series(1, 100000) AS g"
+]
+
 # Stage-2 ON pushdown (query.on_pushdown) and its results-identical ON-resident reference. The pushed
 # `r.flag = 1` filters each 4,000-row input's inner side to 2% before an expression-keyed nested loop;
 # spelled `r.flag + 0 = 1` it stays in the ON and is evaluated over all 16M pairs.

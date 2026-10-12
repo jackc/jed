@@ -20,6 +20,8 @@ package jed
 // again with the moved conjuncts appended to its WHERE — to each SELECT of a set operation, and
 // below a grouped SELECT's grouping (bodyPushes).
 
+import "slices"
+
 // wherePushdown is the stage-2 predicate split. relFilters / relLocal hold one entry per relation
 // (nil: nothing scan-pushed); residual is the post-join WHERE when whereSplit (nil when every
 // conjunct moved); onResidual[k] is join k's remaining ON when onSplit[k].
@@ -241,13 +243,14 @@ func bodyPushable(rel planRel) *queryPlan {
 }
 
 // queryBodyPushable is the structural half of body-pushability (planner.md §3.2): a SELECT with no
-// window function, LIMIT, or OFFSET that is either ungrouped or grouped by exactly one grouping set
-// with at least one key; or a set operation without LIMIT/OFFSET whose two arms are body-pushable.
+// LIMIT or OFFSET that is either ungrouped or grouped by exactly one grouping set with at least one
+// key (window functions admitted — bodyInputColumn then requires every window to partition by the
+// column); or a set operation without LIMIT/OFFSET whose two arms are body-pushable.
 func queryBodyPushable(q *queryPlan) bool {
 	switch {
 	case q.sel != nil:
 		b := q.sel
-		if b.hasWindow || b.limit != nil || b.offset != nil {
+		if b.limit != nil || b.offset != nil {
 			return false
 		}
 		return !b.isAgg || len(b.groupSets) == 1 && len(b.groupKeys) > 0
@@ -262,11 +265,20 @@ func queryBodyPushable(q *queryPlan) bool {
 // bodyInputColumn returns the FROM slot a body-pushable SELECT's output column j reads, false when
 // the select-list item is not a bare column. In a grouped body the item must be a grouping column:
 // a plain input column of the master grouping list (an expression key's synthetic slot is not).
+// Below a window the item's slot must also be a bare PARTITION BY key of every window function, so a
+// conjunct over it keeps or drops whole partitions.
 func bodyInputColumn(b *selectPlan, j int) (int, bool) {
 	if j < 0 || j >= len(b.projections) || b.projections[j].kind != reColumn {
 		return 0, false
 	}
 	idx := b.projections[j].index
+	if b.hasWindow {
+		for k := range b.windowSpecs {
+			if !slices.Contains(b.windowSpecs[k].partition, idx) {
+				return 0, false
+			}
+		}
+	}
 	if !b.isAgg {
 		return idx, true
 	}

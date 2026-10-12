@@ -1245,8 +1245,14 @@ impl Engine {
             Statement::With(wq) => {
                 // The planning prefix of `run_with` (cte.md): plan the CTE bindings, then the body with
                 // them visible. The body's column names/types are the WITH's output names/types.
-                let bindings =
-                    self.plan_cte_bindings(&wq.ctes, wq.recursive, &[], None, &mut ptypes)?;
+                let bindings = self.plan_cte_bindings(
+                    &wq.ctes,
+                    wq.recursive,
+                    &[],
+                    None,
+                    &mut ptypes,
+                    CtePrimary::Body(&wq.body),
+                )?;
                 let body_q = wq
                     .body
                     .as_query()
@@ -2120,9 +2126,16 @@ impl Engine {
                 }
                 CteMode::Inline => {
                     // Only a plain (query) CTE is ever inlined; a data-modifying CTE is always
-                    // materialized (writable-cte.md §3), so its buffer was filled above.
-                    let CteSource::Query(plan) = &env.ctes.bindings[ci].source else {
-                        unreachable!("a data-modifying CTE is always materialized, never inlined")
+                    // materialized (writable-cte.md §3), so its buffer was filled above. A
+                    // reference that planned the body itself runs that plan (planner.md §3.4).
+                    let plan = match &rel.derived {
+                        Some(body) => body.as_ref(),
+                        None => match &env.ctes.bindings[ci].source {
+                            CteSource::Query(plan) => plan,
+                            CteSource::Dml(_) => unreachable!(
+                                "a data-modifying CTE is always materialized, never inlined"
+                            ),
+                        },
                     };
                     // The body runs in the frame of the WITH node that declared it (cte.md §7) —
                     // not this reference site's, which may sit deeper.

@@ -202,10 +202,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   admitted row, before the join and the row account); only the residual is applied to joined rows.
   EXPLAIN shows pushed filters on their Scan; the estimator models both; NoREC `where_pushdown` and
   `contradiction` relations.
-  - [ ] _follow-on:_ push into **inlined CTE bodies** (needs per-reference body specialization: the
-    inline/materialize mode is decided after the referencing query is planned), **below a window**
-    (a conjunct over every PARTITION BY column), and into a **widened set-operation arm** (would need
-    the conjunct re-resolved at the arm's type).
+  - [x] push into **inlined CTE bodies** and **below a window** — a conjunct over columns every
+    window partitions by moves below the window ([planner.md §3.2](spec/design/planner.md)); a CTE
+    named exactly once (by a query part), not MATERIALIZED, uncorrelated, is planned at its reference
+    like a derived table and takes the same body pushdown (§3.4; its definition plans with reference
+    expansion off and each body expands at most once, so chains plan linearly). EXPLAIN renders such
+    a body under its `CTE Scan`. NoREC `cte_window_pushdown`.
+  - [ ] _follow-on:_ push into a **widened set-operation arm** (would need the conjunct re-resolved at
+    the arm's type), into each reference of a multiply-referenced `NOT MATERIALIZED` CTE (needs a
+    planning-work bound: expanding every reference re-plans a chain exponentially), into a CTE
+    referenced from a data-modifying part (planned only when it runs), and through a lateral
+    relation.
   - [ ] _follow-on:_ broader safe-conjunct gate (non-trapping casts/functions via a catalog
     `traps` classification) and parameter-time proofs.
   - [ ] _follow-on:_ plan-time **constant folding** / CSE / eliding a pushed recheck that its own
