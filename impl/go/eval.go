@@ -1897,11 +1897,16 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return Value{}, err
 		}
 		return JsonbValue(result), nil
+	// AND / OR short-circuit left to right (cost.md §3): a FALSE left operand decides AND, a TRUE one
+	// decides OR, and the right operand is then never evaluated or charged.
 	case reAnd:
 		m.Charge(operatorCost("and"))
 		a, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
+		}
+		if to3(a) == False {
+			return a, nil
 		}
 		b, err := e.rhs.eval(row, env, m)
 		if err != nil {
@@ -1913,6 +1918,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		a, err := e.lhs.eval(row, env, m)
 		if err != nil {
 			return Value{}, err
+		}
+		if to3(a) == True {
+			return a, nil
 		}
 		b, err := e.rhs.eval(row, env, m)
 		if err != nil {
