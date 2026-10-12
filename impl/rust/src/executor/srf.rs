@@ -755,7 +755,8 @@ impl Engine {
     /// order. `ordinal` is 1-based CREATE TABLE order; `type` is the canonical type text
     /// (`catalog_type_text`); `not_null` covers a declared NOT NULL and PRIMARY KEY membership;
     /// `pk_ordinal` is the 1-based position in the PRIMARY KEY in KEY order (which may differ from
-    /// declaration order — constraints.md §3), NULL for a non-member. Cost mirrors jed_tables_rows.
+    /// declaration order — constraints.md §3), NULL for a non-member; `column_default` is the
+    /// canonical DEFAULT text (`Column::default_text`). Cost mirrors jed_tables_rows.
     pub(crate) fn jed_columns_rows(&self, srf: &SrfPlan, meter: &mut Meter) -> Result<Vec<Row>> {
         let Some(snap) = self.snap_for_scope(&srf.introspect_scope) else {
             return Err(EngineError::new(
@@ -779,6 +780,7 @@ impl Engine {
                     Value::Text(catalog_type_text(&c.ty, c.decimal.as_ref(), c.varchar_len)),
                     Value::Bool(c.not_null || c.primary_key),
                     pk_ordinal,
+                    c.default_text().map_or(Value::Null, Value::Text),
                 ]);
             }
         }

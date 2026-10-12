@@ -30,7 +30,7 @@ pub fn dump(db: &mut jed::Session, out: &mut dyn Write) -> io::Result<()> {
             .query(&format!("SELECT * FROM {}{order_by}", q(name)), &[])
             .expect("a full-table scan of a cataloged table cannot fail");
         for row in rows {
-            let values: Vec<String> = row.iter().map(value_literal).collect();
+            let values: Vec<String> = row.iter().map(Value::sql_literal).collect();
             writeln!(
                 out,
                 "INSERT INTO {} VALUES ({});",
@@ -104,14 +104,12 @@ fn create_table_sql(table: &Table) -> String {
         if col.not_null && !col.primary_key {
             line.push_str(" NOT NULL");
         }
-        if let Some(default) = &col.default {
+        // The canonical DEFAULT text jed_columns.column_default shows (introspection.md §5): an
+        // expression default's persisted expr-text (it re-parses to the same expression on replay),
+        // or a constant's SQL literal. `DEFAULT NULL` is omitted — it is the same as no default.
+        if let Some(default) = col.default_text() {
             line.push_str(" DEFAULT ");
-            line.push_str(&value_literal(default));
-        } else if let Some(de) = &col.default_expr {
-            // An EXPRESSION default (constraints.md §2) dumps its persisted expr-text verbatim —
-            // it re-parses to the same expression on replay (the same token contract a CHECK uses).
-            line.push_str(" DEFAULT ");
-            line.push_str(&de.expr_text);
+            line.push_str(&default);
         }
         parts.push(line);
     }
@@ -148,17 +146,6 @@ fn pk_order_by(table: &Table) -> String {
         .map(|&i| q(&table.columns[i].name))
         .collect();
     format!(" ORDER BY {}", cols.join(", "))
-}
-
-/// A SQL literal that parses back to `v`: ints/decimals/booleans as bare tokens, NULL as
-/// the keyword, everything else as a quoted string the engine coerces by column context
-/// (text, `\x`-hex bytea, uuid, timestamps — their canonical `render()` forms all re-parse).
-pub fn value_literal(v: &Value) -> String {
-    match v {
-        Value::Null => "NULL".to_string(),
-        Value::Int(_) | Value::Bool(_) | Value::Decimal(_) => v.render(),
-        other => format!("'{}'", other.render().replace('\'', "''")),
-    }
 }
 
 /// A name as SQL identifier text (grammar.md §3's quoting rule), so a mixed-case or otherwise

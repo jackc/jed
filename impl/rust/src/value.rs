@@ -659,6 +659,18 @@ impl Value {
         }
     }
 
+    /// Render as a SQL literal that re-parses to this value when assigned to a column of its type
+    /// (introspection.md §5 `column_default`): an integer, decimal, or boolean renders bare by
+    /// [`Value::render`]; every other value renders its canonical text quoted, `'` doubled. NULL
+    /// renders `NULL`.
+    pub fn sql_literal(&self) -> String {
+        match self {
+            Value::Null => "NULL".to_string(),
+            Value::Int(_) | Value::Bool(_) | Value::Decimal(_) => self.render(),
+            other => format!("'{}'", other.render().replace('\'', "''")),
+        }
+    }
+
     /// Render as PostgreSQL shows a result column in a session zone (timezones.md §9.5): exactly
     /// [`Value::render`], except every `timestamptz` — at any depth inside an array, composite, or
     /// range — renders in `zone` (`+HH` / `+HH:MM` / `+HH:MM:SS`; ±infinity bare). Fails `22008` only
