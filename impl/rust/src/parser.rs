@@ -5240,6 +5240,8 @@ impl Parser {
     /// rejects named notation on a function with no parameter names, and fills defaults. The
     /// function name is resolved (byte-exactly) against the catalog later.
     fn parse_function_call(&mut self) -> Result<Expr> {
+        // An UNQUOTED `substring` admits the SQL special form after its first argument (below).
+        let substring_form = matches!(self.peek(), Token::Word(w) if w == "substring");
         let name = self.expect_identifier()?;
         self.expect(&Token::LParen)?;
         // A leading DISTINCT (`COUNT(DISTINCT x)`, aggregates.md §5) folds only the distinct
@@ -5301,8 +5303,21 @@ impl Parser {
                 } else {
                     None
                 };
+                let positional = argname.is_none();
                 args.push(self.parse_expr()?);
                 arg_names.push(argname);
+                // `SUBSTRING(x FROM s [FOR l])` / `SUBSTRING(x FOR l [FROM s])` (grammar.ebnf
+                // `substring_expr`, string-functions.md §4): a FROM/FOR keyword after the first
+                // positional argument selects the special form.
+                if substring_form
+                    && positional
+                    && !distinct
+                    && args.len() == 1
+                    && matches!(self.peek_keyword().as_deref(), Some("from" | "for"))
+                {
+                    let source = args.pop().expect("one argument parsed");
+                    return self.parse_substring_tail(name, source);
+                }
                 if matches!(self.peek(), Token::Comma) {
                     self.advance();
                 } else {
@@ -5401,6 +5416,45 @@ impl Parser {
             over,
             over_name,
             within_group,
+        })
+    }
+
+    /// The tail of the SQL special form `SUBSTRING(x FROM s [FOR l])` / `SUBSTRING(x FOR l [FROM s])`
+    /// (grammar.ebnf `substring_expr`), the cursor on FROM or FOR. Desugars to the ordinary call
+    /// `substring(x, s[, l])` — PostgreSQL's rewrite — with a FOR-only form starting at 1. No
+    /// FILTER / OVER may follow (the form is not a function application).
+    fn parse_substring_tail(&mut self, name: String, source: Expr) -> Result<Expr> {
+        let mut start = None;
+        let mut count = None;
+        if self.peek_keyword().as_deref() == Some("from") {
+            self.advance();
+            start = Some(self.parse_expr()?);
+            if self.peek_keyword().as_deref() == Some("for") {
+                self.advance();
+                count = Some(self.parse_expr()?);
+            }
+        } else {
+            self.expect_keyword("for")?;
+            count = Some(self.parse_expr()?);
+            if self.peek_keyword().as_deref() == Some("from") {
+                self.advance();
+                start = Some(self.parse_expr()?);
+            }
+        }
+        self.expect(&Token::RParen)?;
+        let mut args = vec![source, start.unwrap_or(Expr::Literal(Literal::Int(1)))];
+        args.extend(count);
+        Ok(Expr::FuncCall {
+            name,
+            args,
+            arg_names: None,
+            star: false,
+            distinct: false,
+            filter: None,
+            variadic: false,
+            over: None,
+            over_name: None,
+            within_group: None,
         })
     }
 

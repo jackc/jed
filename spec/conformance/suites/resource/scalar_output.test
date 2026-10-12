@@ -3,9 +3,9 @@
 # and never reserve the scalar allowance; constant-only operands are free, like a literal. Amplifiers
 # (replace, regexp_replace, array_replace) charge their input scan, then size, charge, and reserve
 # their exact output before building it, even over constants. payload is memory.md §3's measure: UTF-8
-# bytes for text, 16 per dimension plus 32 + payload per element for an array.
+# bytes for text, the byte length for bytea, 16 per dimension plus 32 + payload per element for an array.
 # jed-SPECIFIC resource contract (PostgreSQL has no cost meter or scalar allowance).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, query.aggregates, func.array, func.regexp_replace, types.array, types.i32, types.text, resource.cost_metering, resource.cost_limit, resource.scalar_memory
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, query.aggregates, func.array, func.regexp_replace, types.array, types.bytea, types.i32, types.text, resource.cost_metering, resource.cost_limit, resource.scalar_memory
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32[], s text)
@@ -71,6 +71,62 @@ query I nosort
 WITH a1 AS (SELECT a || a AS v FROM t), a2 AS (SELECT v || v AS v FROM a1), a3 AS (SELECT v || v AS v FROM a2) SELECT cardinality(v) FROM a3
 ----
 16
+
+# === bytea || ===
+
+statement ok
+CREATE TABLE tb (id i32 PRIMARY KEY, b bytea)
+
+statement ok
+INSERT INTO tb VALUES (1, '\x6162')
+
+# The baseline scan for the bytea cases below.
+# cost: 3
+query T nosort
+SELECT b FROM tb
+----
+\x6162
+
+# A column operand makes bytea || a growth kernel: payload(\x61626162) = 4 bytes over the baseline.
+# cost: 8
+query T nosort
+SELECT b || b FROM tb
+----
+\x61626162
+
+# Constant operands are free.
+# cost: 2
+query T nosort
+SELECT bytea '\x6162' || bytea '\x6162'
+----
+\x61626162
+
+# A NULL result charges nothing.
+# cost: 4
+query T nosort
+SELECT b || NULL FROM tb
+----
+NULL
+
+# A growth kernel reserves nothing against the scalar allowance.
+# max_scalar_bytes: 1
+query T nosort
+SELECT b || b FROM tb
+----
+\x61626162
+
+# Recursion doubles the value each step, and the output charge makes the cost grow with the bytes
+# built (4 + 8 + … + 1024 here)...
+# cost: 2125
+query I nosort
+WITH RECURSIVE r(n, v) AS (SELECT 1, b FROM tb UNION ALL SELECT n + 1, v || v FROM r WHERE n < 10) SELECT max(length(v)) FROM r
+----
+1024
+
+# ...so a cost ceiling stops thirty doublings long before they build two gigabytes.
+# max_cost: 100000
+statement error 54P01
+WITH RECURSIVE r(n, v) AS (SELECT 1, b FROM tb UNION ALL SELECT n + 1, v || v FROM r WHERE n < 30) SELECT max(length(v)) FROM r
 
 # === replace ===
 

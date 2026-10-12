@@ -2495,30 +2495,35 @@ impl RExpr {
                     }
                     // length(text) → i32 — the number of characters (Unicode code points). Rust
                     // String is UTF-8, so `chars()` yields one item per code point (string-functions.md §3).
+                    // Over bytea, length is the byte count (string-functions.md §4).
                     ScalarFunc::Length => match &vals[0] {
                         Value::Text(s) => Ok(Value::Int(s.chars().count() as i64)),
-                        _ => unreachable!("resolver restricts length to text"),
+                        Value::Bytea(b) => Ok(Value::Int(b.len() as i64)),
+                        _ => unreachable!("resolver restricts length to text/bytea"),
                     },
                     // octet_length(text) → i32 — the UTF-8 byte count (`len()` of the String's
                     // bytes), distinct from length's code-point count (string-functions.md §3).
                     ScalarFunc::OctetLength => match &vals[0] {
                         Value::Text(s) => Ok(Value::Int(s.len() as i64)),
-                        _ => unreachable!("resolver restricts octet_length to text"),
+                        Value::Bytea(b) => Ok(Value::Int(b.len() as i64)),
+                        _ => unreachable!("resolver restricts octet_length to text/bytea"),
                     },
                     // bit_length(text) → i32 — the UTF-8 bit count = byte count × 8.
                     ScalarFunc::BitLength => match &vals[0] {
                         Value::Text(s) => Ok(Value::Int(s.len() as i64 * 8)),
-                        _ => unreachable!("resolver restricts bit_length to text"),
+                        Value::Bytea(b) => Ok(Value::Int(b.len() as i64 * 8)),
+                        _ => unreachable!("resolver restricts bit_length to text/bytea"),
                     },
-                    // substr(text, start[, count]) → text — the function form of SUBSTRING.
+                    // substr / substring(text, start[, count]) → text — the function form of
+                    // SUBSTRING; over bytea the same window over bytes (string-functions.md §4).
                     ScalarFunc::Substr => {
-                        let s = match &vals[0] {
-                            Value::Text(s) => s,
-                            _ => unreachable!("resolver restricts substr to text"),
-                        };
                         let start = int_value(&vals[1]);
                         let count = vals.get(2).map(int_value);
-                        Ok(Value::Text(substr_chars(s, start, count)?))
+                        match &vals[0] {
+                            Value::Text(s) => Ok(Value::Text(substr_chars(s, start, count)?)),
+                            Value::Bytea(b) => Ok(Value::Bytea(substr_bytes(b, start, count)?)),
+                            _ => unreachable!("resolver restricts substr to text/bytea"),
+                        }
                     }
                     // left(text, n) → text — the first n characters (negative n drops the last |n|).
                     ScalarFunc::Left => match &vals[0] {
@@ -2690,6 +2695,28 @@ impl RExpr {
                             _ => unreachable!("resolver restricts decode to (text, text)"),
                         };
                         Ok(Value::Bytea(decode_text(s, fmt)?))
+                    }
+                    // get_byte(bytea, n) → i32 — the n-th byte (0-based), unsigned.
+                    ScalarFunc::GetByte => match &vals[0] {
+                        Value::Bytea(b) => Ok(Value::Int(get_byte(b, int_value(&vals[1]))?)),
+                        _ => unreachable!("resolver restricts get_byte to (bytea, int)"),
+                    },
+                    // bytea || bytea → bytea. A growth kernel (cost.md §8.1), free over constant
+                    // operands.
+                    ScalarFunc::ByteaConcat => {
+                        let out = match (&vals[0], &vals[1]) {
+                            (Value::Bytea(a), Value::Bytea(b)) => {
+                                let mut out = Vec::with_capacity(a.len() + b.len());
+                                out.extend_from_slice(a);
+                                out.extend_from_slice(b);
+                                Value::Bytea(out)
+                            }
+                            _ => unreachable!("resolver restricts bytea || to (bytea, bytea)"),
+                        };
+                        if !args.iter().all(rexpr_is_constant) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
                     }
                     // quote_literal(text) → text — wrap as a SQL string literal.
                     // quote_ident(text) → text — wrap as a SQL identifier. Both are growth kernels:

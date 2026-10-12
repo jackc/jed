@@ -3032,21 +3032,34 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 		case sfLength:
 			// length(text) → i32 — the number of characters (Unicode code points). Go strings are
-			// UTF-8, so utf8.RuneCountInString counts code points (string-functions.md §3).
+			// UTF-8, so utf8.RuneCountInString counts code points (string-functions.md §3). Over
+			// bytea, length is the byte count (string-functions.md §4).
+			if vals[0].Kind == ValBytea {
+				return IntValue(int64(len(vals[0].str()))), nil
+			}
 			return IntValue(int64(utf8.RuneCountInString(vals[0].str()))), nil
 		case sfOctetLength:
 			// octet_length(text) → i32 — the UTF-8 byte count (len of the Go string's bytes),
-			// distinct from length's code-point count (string-functions.md §3).
+			// distinct from length's code-point count (string-functions.md §3). A bytea holds its
+			// raw bytes in the same string, so the byte count is the same expression (§4).
 			return IntValue(int64(len(vals[0].str()))), nil
 		case sfBitLength:
-			// bit_length(text) → i32 — the UTF-8 bit count = byte count × 8.
+			// bit_length(text) → i32 — the UTF-8 bit count = byte count × 8 (bytea: bytes × 8).
 			return IntValue(int64(len(vals[0].str())) * 8), nil
 		case sfSubstr:
-			// substr(text, start[, count]) → text — the function form of SUBSTRING.
+			// substr / substring(text, start[, count]) → text — the function form of SUBSTRING;
+			// over bytea the same window over bytes (string-functions.md §4).
 			var count *int64
 			if len(vals) > 2 {
 				c := vals[2].Int
 				count = &c
+			}
+			if vals[0].Kind == ValBytea {
+				r, err := substrBytes([]byte(vals[0].str()), vals[1].Int, count)
+				if err != nil {
+					return Value{}, err
+				}
+				return ByteaValue(r), nil
 			}
 			r, err := substrChars(vals[0].str(), vals[1].Int, count)
 			if err != nil {
@@ -3178,6 +3191,20 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return Value{}, err
 			}
 			return ByteaValue(r), nil
+		case sfGetByte:
+			// get_byte(bytea, n) → i32 — the n-th byte (0-based), unsigned.
+			r, err := getByte([]byte(vals[0].str()), vals[1].Int)
+			if err != nil {
+				return Value{}, err
+			}
+			return IntValue(r), nil
+		case sfByteaConcat:
+			// bytea || bytea → bytea. A growth kernel (cost.md §8.1), free over constant operands.
+			a, b := vals[0].str(), vals[1].str()
+			out := make([]byte, 0, len(a)+len(b))
+			out = append(out, a...)
+			out = append(out, b...)
+			return growthResult(m, e.sargs, ByteaValue(out))
 		case sfQuoteLiteral:
 			// quote_literal(text) → text — wrap as a SQL string literal. A growth kernel: quoting
 			// doubles every quote (cost.md §8.1).

@@ -68,6 +68,17 @@ test('the types page autoruns the uuid ⇄ text/bytea cast demo', async ({ page 
   await expect(rows).toContainText('\\x550e8400e29b41d4a716446655440000');
 });
 
+test('the types page autoruns the bytea functions demo', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  // The bytea demo: length 3, \x0102 || \xff = \x0102ff, SUBSTRING(… FROM 2 FOR 3) = \x020304,
+  // get_byte(…, 2) = 255.
+  const byteaPanel = livePanel(page, 'byteaDemo');
+  const rows = byteaPanel.getByTestId('result-rows');
+  await expect(rows).toContainText('\\x0102ff');
+  await expect(rows).toContainText('\\x020304');
+  await expect(rows).toContainText('255');
+});
+
 test('the types page autoruns the array cast demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
   // The array cast demo: array→text ({1,2,3}), text→i32[], i32[]→i64[] widening, and

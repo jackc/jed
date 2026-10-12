@@ -1990,6 +1990,7 @@ existing members.
 |---|---|---|---|---|
 | `ARRAY[…]` constructor | growth | S1 | — | `payload(array)` |
 | array `\|\|`, `array_append`, `array_prepend`, `array_cat` | growth | S1 | — | `payload(array)` |
+| bytea `\|\|` | growth | S1 | — | byte length of the result |
 | `replace(s, from, to)` | amplifier | S1 | UTF-8 bytes of `s` | UTF-8 bytes of the result |
 | `regexp_replace` | amplifier | S1 | none beyond `regex_step` | UTF-8 bytes of the result |
 | `array_replace(a, old, new)` | amplifier | S1 | `payload(a)` | `payload(result)` |

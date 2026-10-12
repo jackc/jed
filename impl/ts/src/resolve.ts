@@ -2635,6 +2635,15 @@ export function resolveConcat(
   if (rl.type.kind === "jsonb" || rr.type.kind === "jsonb") {
     return resolveJsonbConcat(scope, lhs, rhs, ag, params);
   }
+  // BYTEA axis: a bytea operand with no array operand routes `||` to bytea concatenation
+  // (string-functions.md §4). A bytea[] operand stays on the array overloads below.
+  if (
+    (rl.type.kind === "bytea" || rr.type.kind === "bytea") &&
+    rl.type.kind !== "array" &&
+    rr.type.kind !== "array"
+  ) {
+    return resolveByteaConcat(scope, lhs, rhs, ag, params);
+  }
   // The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
   let hint: ScalarType | null = null;
   if (rl.type.kind === "array") hint = elemScalarHint(rl.type.elem);
@@ -2651,7 +2660,9 @@ export function resolveConcat(
   let chosen: { argFamilies: readonly string[]; result: string } | undefined;
   let elem: ResolvedType | null = null;
   for (const o of OPERATORS) {
-    if (o.kind !== "concat") continue;
+    // Only the polymorphic (anyarray-result) rows: matchPoly ignores a concrete slot, so the bytea
+    // row (routed above) must not take part.
+    if (o.kind !== "concat" || o.result !== "anyarray") continue;
     const m = matchPoly(o.argFamilies, tys);
     if (m.matched) {
       chosen = o;
@@ -3113,6 +3124,31 @@ export function resolveJsonbConcat(
   const a = resolveJsonb(lhs);
   const b = resolveJsonb(rhs);
   return { node: { kind: "jsonConcat", a, b }, type: { kind: "jsonb" } };
+}
+
+// resolveByteaConcat resolves `bytea || bytea` (string-functions.md §4): each operand is re-resolved
+// with a bytea hint, so a bare string literal decodes as bytea input and an untyped NULL stays NULL
+// (the strict kernel then yields NULL). Any other operand type is 42883.
+export function resolveByteaConcat(
+  scope: Scope,
+  lhs: Expr,
+  rhs: Expr,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  const a = resolve(scope, lhs, "bytea", ag, params);
+  const b = resolve(scope, rhs, "bytea", ag, params);
+  const ok = (t: ResolvedType): boolean => t.kind === "bytea" || t.kind === "null";
+  if (!ok(a.type) || !ok(b.type)) {
+    throw engineError(
+      "undefined_function",
+      `operator does not exist: ${rtName(a.type)} || ${rtName(b.type)}`,
+    );
+  }
+  return {
+    node: { kind: "scalarFunc", func: "bytea_concat", args: [a.node, b.node], result: "bytea" },
+    type: { kind: "bytea" },
+  };
 }
 
 // resolveJsonbDelete resolves a jsonb delete operator: `-` (key `text` / index `int` / keys

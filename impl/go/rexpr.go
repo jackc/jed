@@ -821,14 +821,18 @@ const (
 	// --- string / text functions (spec/design/string-functions.md). All STRICT (NULL propagates via
 	// the generic scalarFunc short-circuit). Character functions count Unicode code points (Go strings
 	// are UTF-8, so `range`/utf8.RuneCountInString); octet/bit functions count UTF-8 bytes.
-	// length(text) → i32 — the number of characters (code points). length('héllo') = 5.
+	// length(text) → i32 — the number of characters (code points). length('héllo') = 5. Over
+	// bytea, the number of bytes (§4).
 	sfLength
-	// octet_length(text) → i32 — the number of UTF-8 bytes. octet_length('héllo') = 6.
+	// octet_length(text) → i32 — the number of UTF-8 bytes. octet_length('héllo') = 6. Over bytea,
+	// the number of bytes (§4).
 	sfOctetLength
 	// bit_length(text) → i32 — the number of UTF-8 bits = octet_length × 8. bit_length('héllo') = 48.
+	// Over bytea, bytes × 8 (§4).
 	sfBitLength
-	// substr(text, start[, count]) → text — the function form of SUBSTRING (1-based, code-point
-	// indexed). A negative count is 22011 (string-functions.md §3).
+	// substr / substring(text, start[, count]) → text — the function form of SUBSTRING (1-based,
+	// code-point indexed); over bytea the same window over bytes. A negative count is 22011
+	// (string-functions.md §3/§4).
 	sfSubstr
 	// left(text, n) → text — the first n characters; a negative n drops the last |n| (§3).
 	sfLeft
@@ -871,6 +875,11 @@ const (
 	sfEncode
 	// decode(text, format) → bytea — parse hex / base64 / escape back to binary (§3).
 	sfDecode
+	// get_byte(bytea, n) → i32 — the n-th byte (0-based); out of range traps 2202E (§4).
+	sfGetByte
+	// bytea || bytea → bytea — the operands' bytes appended (§4). Reached only through the `||`
+	// resolver (it has no function-call name); a growth kernel (cost.md §8.1).
+	sfByteaConcat
 	// quote_literal(text) → text — wrap as a SQL string literal (§3).
 	sfQuoteLiteral
 	// quote_ident(text) → text — wrap as a SQL identifier (§3).

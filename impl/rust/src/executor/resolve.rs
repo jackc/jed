@@ -801,6 +801,39 @@ pub(crate) fn resolve_jsonb_concat(
     ))
 }
 
+/// Resolve `bytea || bytea` (string-functions.md §4): each operand is re-resolved with a bytea hint,
+/// so a bare string literal decodes as bytea input and an untyped NULL stays NULL (the strict
+/// kernel then yields NULL). Any other operand type is 42883.
+pub(crate) fn resolve_bytea_concat(
+    scope: &Scope,
+    lhs: &Expr,
+    rhs: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    let (a, at) = resolve(scope, lhs, Some(ScalarType::Bytea), agg, params)?;
+    let (b, bt) = resolve(scope, rhs, Some(ScalarType::Bytea), agg, params)?;
+    let ok = |t: &ResolvedType| matches!(t, ResolvedType::Bytea | ResolvedType::Null);
+    if !ok(&at) || !ok(&bt) {
+        return Err(EngineError::new(
+            SqlState::UndefinedFunction,
+            format!(
+                "operator does not exist: {} || {}",
+                at.type_name(),
+                bt.type_name()
+            ),
+        ));
+    }
+    Ok((
+        RExpr::ScalarFunc {
+            func: ScalarFunc::ByteaConcat,
+            args: vec![a, b],
+            result: ScalarType::Bytea,
+        },
+        ResolvedType::Bytea,
+    ))
+}
+
 /// Resolve a jsonb delete operator: `-` (key `text` / index `int` / keys `text[]`) or `#-` (path
 /// `text[]`) — json-sql-functions.md §1, J6. The base must be jsonb (a json base is 42883). The
 /// form is chosen by the argument type; a bare `'{a,b}'` string literal adapts to `text[]`. Result
@@ -1388,6 +1421,13 @@ pub(crate) fn resolve_concat(
     if matches!(lt, ResolvedType::Jsonb) || matches!(rt, ResolvedType::Jsonb) {
         return resolve_jsonb_concat(scope, lhs, rhs, agg, params);
     }
+    // BYTEA axis: a bytea operand with no array operand routes `||` to bytea concatenation
+    // (string-functions.md §4). A bytea[] operand stays on the array overloads below.
+    let is_bytea = |t: &ResolvedType| matches!(t, ResolvedType::Bytea);
+    let is_array = |t: &ResolvedType| matches!(t, ResolvedType::Array(_));
+    if (is_bytea(&lt) || is_bytea(&rt)) && !is_array(&lt) && !is_array(&rt) {
+        return resolve_bytea_concat(scope, lhs, rhs, agg, params);
+    }
     // The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
     let hint = match (&lt, &rt) {
         (ResolvedType::Array(e), _) => elem_scalar_hint(e),
@@ -1408,9 +1448,11 @@ pub(crate) fn resolve_concat(
 
     // Try the three concat overloads in catalog order; the first whose slots unify wins.
     let tys = [lt, rt];
+    // Only the polymorphic (anyarray-result) rows: `match_poly` ignores a concrete slot, so the
+    // bytea row (routed above) must not take part.
     let overload = OPERATORS
         .iter()
-        .filter(|o| o.kind == "concat")
+        .filter(|o| o.kind == "concat" && o.result == "anyarray")
         .find_map(|o| match_poly(o.arg_families, &tys).map(|elem| (o, elem)));
     let (desc, elem) = overload.ok_or_else(no_overload)?;
     let result = poly_result_type(desc.result, &elem)?;

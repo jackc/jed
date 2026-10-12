@@ -686,8 +686,9 @@ over-`RECORD_MAX` bytea key is rejected `0A000` (the same node-fit limit as text
   the hex form `\x…` is the only input this slice. A deliberate, documented divergence from PG
   (which also accepts the escape format on input), justified by determinism and a smaller surface;
   the hex form is the modern canonical spelling and matches the render output.
-- **Binary functions** (`length`, `||`, `substring`, `get_byte`/`set_byte`, …) — separate slices.
-  (The `text ⇄ bytea` casts and `uuid ⇄ bytea` have landed — §5, §14; every other bytea cast is a
+- **The remaining binary functions** (`set_byte`, `get_bit`/`set_bit`, `overlay`, …). `length` /
+  `octet_length` / `bit_length`, `||`, `substr` / `substring`, and `get_byte` have landed
+  ([string-functions.md](string-functions.md) §4). (The `text ⇄ bytea` casts and `uuid ⇄ bytea` have landed — §5, §14; every other bytea cast is a
   forbidden pair, `42804`.)
 
 **Practical size note.** As for text (§11), a single stored bytea value (or row) larger than one

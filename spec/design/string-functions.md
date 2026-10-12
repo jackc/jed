@@ -53,9 +53,8 @@ an astral character (e.g. `U+1F600`) so a UTF-16-unit bug is caught.
 The number of **characters** (code points) in the string. `length('héllo') = 5`
 (é is one code point), `length('') = 0`, `length('𝄞') = 1` (one astral code point, two UTF-16
 units — the TS trap). STRICT: `length(NULL) → NULL`. Result is `int` (i32); a realistic
-string never exceeds the i32 range, matching PG's `int4` result. PostgreSQL also defines
-`length(bytea)` and an encoding-name 2-arg form; jed implements the `text` overload (the
-byte count is `octet_length`).
+string never exceeds the i32 range, matching PG's `int4` result. `length(bytea)` is the byte
+count (§4); PostgreSQL's encoding-name 2-arg form is not implemented.
 
 ### `char_length(text) → int`, `character_length(text) → int`
 
@@ -70,17 +69,18 @@ The number of **bytes** in the UTF-8 encoding — `octet_length('héllo') = 6` (
 two bytes), `octet_length('') = 0`, `octet_length('😀') = 4`. The byte counterpart of
 `length`. Rust/Go take the byte length of the UTF-8 string directly (`String::len` /
 `len(s)`); TS computes it through the shared UTF-8 encoder (`utf8ByteLength`), since a JS
-string is UTF-16 and `.length` would be neither bytes nor code points. PostgreSQL also
-defines `octet_length(bytea)`; jed implements the `text` overload.
+string is UTF-16 and `.length` would be neither bytes nor code points. `octet_length(bytea)`
+is the bytea's length (§4).
 
 ### `bit_length(text) → int`
 
 The number of **bits** in the UTF-8 encoding — `octet_length × 8`. `bit_length('héllo') = 48`,
 `bit_length('') = 0`. Same code path as `octet_length`, multiplied by eight.
 
-### `substr(text, start [, count]) → text`
+### `substr(text, start [, count]) → text`, `substring(text, start [, count]) → text`
 
-The **function** spelling of `SUBSTRING` (jed's `SUBSTRING … FROM … FOR` syntax is separate);
+The **function** spelling of `SUBSTRING`; `substring` is the same function under its SQL name
+(one kernel), and the special form `SUBSTRING(s FROM start FOR count)` desugars to it (§4).
 1-based and **code-point indexed** (`substr('héllo', 2, 3) = 'éll'`). Two overloads:
 
 - `substr(s, start)` — the characters from position `start` to the end of the string.
@@ -334,6 +334,48 @@ The PostgreSQL quoting helpers for building SQL text.
   central list — grammar.md), so jed quotes only by the **lexical** safety pattern: `quote_ident
   ('select') = 'select'`. The oracle corpus exercises the non-keyword cases (which match
   PostgreSQL); keyword-aware quoting is a deferred refinement, recorded here.
+
+## 4. Binary string (bytea) functions
+
+PostgreSQL's binary-string surface (manual §9.5) over `bytea`. Every function counts and indexes
+**bytes**, so the §2 code-point trap does not arise: each core works on its native byte buffer. All
+are STRICT and ride the scalar-function mold (§1), except `||`, which has its own resolver route.
+
+- **`length(bytea)`, `octet_length(bytea)` → int** — the byte count. **`bit_length(bytea)` → int**
+  — bytes × 8. These are bytea overloads of the §3 names, sharing their kernels (the kernel branches
+  on the value). `length(bytea '\x68c3a96c6c6f') = 6`, while `length('héllo') = 5`.
+- **`bytea || bytea` → bytea** — the operands' bytes appended (PG's `byteacat`). `||` is resolved
+  by hand ([array-functions.md](array-functions.md) §8): after the jsonb route, a **bytea operand
+  with no array operand** routes to bytea concatenation, which re-resolves both operands with a
+  bytea hint. So a bare string literal decodes as `bytea` input (`b || '\x02'`) and an untyped
+  NULL keeps the operator bytea (`b || NULL` is a NULL `bytea`), as in PostgreSQL. A `bytea[]`
+  operand stays on the array overloads (`ARRAY[b] || b` is `array_append`). Any other operand is
+  `42883`. That includes `bytea || text`, which PG resolves to its text concatenation: jed has no
+  text `||` yet, a ledgered divergence. It is a **growth kernel** ([cost.md](cost.md) §8.1): it
+  charges `scalar_byte` per output byte and is free over constant operands. EXPLAIN renders it as
+  `(a || b)`.
+- **`substr(bytea, start [, count])`, `substring(bytea, start [, count])` → bytea** — §3's window
+  rule over bytes: the window `[start, start+count)` intersected with `[1, n]`. A start ≤ 0 or past
+  the end clips, a negative count is `22011`, and `start + count` saturates. The result is a slice
+  of the operand, so it charges no output bytes.
+- **`SUBSTRING(x FROM start [FOR count])` / `SUBSTRING(x FOR count [FROM start])`** — the SQL
+  special form ([grammar.ebnf](../grammar/grammar.ebnf) `substring_expr`). The parser rewrites it to
+  `substring(x, start[, count])`, with `start = 1` when only `FOR` is given (PostgreSQL's rewrite),
+  so it applies to `text` and `bytea` alike and is labelled `substring`. It is recognized only for
+  an unquoted `substring` whose first argument is followed by `FROM` or `FOR`; the comma form is an
+  ordinary call. PG's regular-expression forms (`substring(text FROM pattern)`, `SIMILAR … ESCAPE`)
+  are not implemented: they reach `substring(text, text)`, which has no overload (`42883`, ledgered).
+- **`get_byte(bytea, n)` → int** — the `n`-th byte, **0-based**, as an unsigned 0–255. An index
+  outside `[0, length − 1]` (negative, or any index into an empty value) traps **`2202E`** with
+  PostgreSQL's message, `index n out of valid range, 0..length−1` (`0..-1` for an empty value).
+  jed's `integer` family also accepts a `bigint` index, which PG's `int4` parameter rejects
+  (`42883`); such an index is always out of range.
+
+The argument must already be `bytea`: as with `encode`, a bare string literal argument resolves as
+`text`, so `get_byte('\x01', 0)` is `42883` (write `bytea '\x01'` or `'\x01'::bytea`). Only `||`
+adapts a literal, through its operand hint. Not implemented yet: `set_byte`, `get_bit` / `set_bit`,
+`overlay`, `position(bytea IN bytea)`, `btrim(bytea, bytea)`, and the hash functions (`md5`,
+`sha256`, …).
 
 ## Resource admission for result amplification
 

@@ -1114,6 +1114,7 @@ primary        ::= number
                  | typed_literal
                  | "CAST" "(" expr "AS" type_name ")"
                  | extract_expr
+                 | substring_expr
                  | case_expr
                  | coalesce_expr
                  | greatest_least_expr
@@ -1212,6 +1213,17 @@ greatest_least_expr ::= ( "GREATEST" | "LEAST" ) "(" expr ( "," expr )* ")"
  * "EXTRACT" is recognized only when immediately followed by "(" (a one-token lookahead, §8), so it
  * stays usable as a column / function name otherwise — like the typed_literal lookahead. */
 extract_expr   ::= "EXTRACT" "(" ( bare_identifier | string ) "FROM" expr ")"
+
+/* SUBSTRING(x FROM start [FOR count]) / SUBSTRING(x FOR count [FROM start]) (../design/string-
+ * functions.md §4, ../design/grammar.md §55) — the SQL special form, desugared by the parser to the
+ * ordinary call substring(x, start[, count]) (start = 1 when only FOR is given — PostgreSQL's
+ * rewrite), so it resolves like any function_call and is labelled `substring`. Recognized only for
+ * an UNQUOTED `substring` call whose FIRST argument (positional, no DISTINCT) is followed by FROM or
+ * FOR; otherwise the call is an ordinary function_call (the comma form substring(x, s, l)). The form
+ * is not a function application, so no WITHIN GROUP / FILTER / OVER may follow. "SUBSTRING" is not
+ * reserved. PG's regular-expression forms (substring(text FROM pattern), SIMILAR … ESCAPE) parse as
+ * this form and fail resolution (42883). */
+substring_expr ::= "SUBSTRING" "(" expr ( "FROM" expr ( "FOR" expr )? | "FOR" expr ( "FROM" expr )? ) ")"
 
 /* The shared function-call syntax. A name resolves to an AGGREGATE function
  * (../functions/catalog.toml, kind = "aggregate" — COUNT/SUM/MIN/MAX/AVG) or a SCALAR

@@ -3266,3 +3266,27 @@ A view reference in `FROM` is the equivalent derived table (§42), so §8's outp
 labels and column alias lists, and §42's column-rename rules apply to it unchanged.
 An automatically updatable view is also a valid `INSERT` / `UPDATE` / `DELETE` target, with the
 statement's grammar unchanged ([views.md](views.md) §15).
+
+## 55. `SUBSTRING` ([string-functions.md §4](string-functions.md))
+
+`SUBSTRING(x FROM start FOR count)` is the SQL special form of `substring`, for `text` and `bytea`.
+
+```sql
+SELECT substring(bytea '\x0102030405' FROM 2 FOR 3)  -- \x020304
+SELECT substring('hello' FROM 2)                     -- ello   = substring('hello', 2)
+SELECT substring('hello' FOR 2)                      -- he     = substring('hello', 1, 2)
+SELECT substring('hello' FOR 2 FROM 3)               -- ll     (either order)
+```
+
+- **Grammar.** `SUBSTRING "(" expr ( FROM expr [FOR expr] | FOR expr [FROM expr] ) ")"`
+  ([grammar.ebnf](../grammar/grammar.ebnf) `substring_expr`). The parser starts an ordinary
+  `function_call`; when the callee is an unquoted `substring` and its first positional argument is
+  followed by `FROM` or `FOR`, the call switches to the special form. `SUBSTRING` stays an ordinary,
+  non-reserved name, and `substring(x, s, l)` is an ordinary call.
+- **Desugaring.** The form becomes `substring(x, start)` or `substring(x, start, count)`; a FOR-only
+  form uses `start = 1`. This is PostgreSQL's own rewrite, so resolution, NULL handling, errors, cost,
+  and the output label (`substring`) are those of the call. No `WITHIN GROUP`, `FILTER`, or `OVER`
+  may follow, since the form is not a function application.
+- **Not supported.** PostgreSQL also uses this syntax for regular-expression extraction
+  (`substring(text FROM pattern)`, `substring(text SIMILAR pattern ESCAPE e)`). jed parses the first
+  as this form, where `substring(text, text)` has no overload (`42883`); `SIMILAR` is a syntax error.

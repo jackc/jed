@@ -99,7 +99,9 @@ import {
   rexprIsConstant,
   rightChars,
   splitPart,
+  substrBytes,
   substrChars,
+  getByte,
   translateChars,
   trimChars,
   truncateToChars,
@@ -1490,24 +1492,34 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // length(text) → i32 — the number of characters (Unicode code points). TS strings are
         // UTF-16, so [...s] (the code-point iterator) counts code points, NOT s.length, which
         // would over-count astral characters as surrogate pairs (string-functions.md §2/§3).
-        const s = (vals[0] as { text: string }).text;
+        // Over bytea, length is the byte count (string-functions.md §4).
+        const v0 = vals[0]!;
+        if (v0.kind === "bytea") return intValue(BigInt(v0.bytes.length));
+        const s = (v0 as { text: string }).text;
         return intValue(BigInt([...s].length));
       }
       if (e.func === "octet_length") {
         // octet_length(text) → i32 — the UTF-8 byte count, distinct from length's code-point
-        // count (string-functions.md §3). utf8ByteLength encodes via TextEncoder.
-        return intValue(BigInt(utf8ByteLength((vals[0] as { text: string }).text)));
+        // count (string-functions.md §3). utf8ByteLength encodes via TextEncoder. Over bytea, the
+        // byte count (§4).
+        const v0 = vals[0]!;
+        if (v0.kind === "bytea") return intValue(BigInt(v0.bytes.length));
+        return intValue(BigInt(utf8ByteLength((v0 as { text: string }).text)));
       }
       if (e.func === "bit_length") {
-        // bit_length(text) → i32 — the UTF-8 bit count = byte count × 8.
-        return intValue(BigInt(utf8ByteLength((vals[0] as { text: string }).text) * 8));
+        // bit_length(text) → i32 — the UTF-8 bit count = byte count × 8. Over bytea, bytes × 8.
+        const v0 = vals[0]!;
+        if (v0.kind === "bytea") return intValue(BigInt(v0.bytes.length * 8));
+        return intValue(BigInt(utf8ByteLength((v0 as { text: string }).text) * 8));
       }
       if (e.func === "substr") {
-        // substr(text, start[, count]) → text — the function form of SUBSTRING.
-        const s = (vals[0] as { text: string }).text;
+        // substr / substring(text, start[, count]) → text — the function form of SUBSTRING; over
+        // bytea the same window over bytes (string-functions.md §4).
         const start = (vals[1] as { int: bigint }).int;
         const count = vals.length > 2 ? (vals[2] as { int: bigint }).int : null;
-        return textValue(substrChars(s, start, count));
+        const v0 = vals[0]!;
+        if (v0.kind === "bytea") return byteaValue(substrBytes(v0.bytes, start, count));
+        return textValue(substrChars((v0 as { text: string }).text, start, count));
       }
       if (e.func === "left") {
         // left(text, n) → text — the first n characters (negative n drops the last |n|).
@@ -1629,6 +1641,20 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const s = (vals[0] as { text: string }).text;
         const fmt = (vals[1] as { text: string }).text;
         return byteaValue(decodeText(s, fmt));
+      }
+      if (e.func === "get_byte") {
+        // get_byte(bytea, n) → i32 — the n-th byte (0-based), unsigned.
+        const bytes = (vals[0] as { bytes: Uint8Array }).bytes;
+        return intValue(getByte(bytes, (vals[1] as { int: bigint }).int));
+      }
+      if (e.func === "bytea_concat") {
+        // bytea || bytea → bytea. A growth kernel (cost.md §8.1), free over constant operands.
+        const a = (vals[0] as { bytes: Uint8Array }).bytes;
+        const b = (vals[1] as { bytes: Uint8Array }).bytes;
+        const out = new Uint8Array(a.length + b.length);
+        out.set(a, 0);
+        out.set(b, a.length);
+        return growthResult(m, e.args, byteaValue(out));
       }
       if (e.func === "quote_literal") {
         // quote_literal(text) → text — wrap as a SQL string literal. A growth kernel: quoting

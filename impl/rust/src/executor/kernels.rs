@@ -570,6 +570,41 @@ pub(crate) fn substr_chars(s: &str, start: i64, count: Option<i64>) -> Result<St
         .collect())
 }
 
+/// `substr(b, start[, count])` over BYTES (string-functions.md §4): `substr_chars`'s window rule
+/// applied to a bytea — `[start, start+count)` intersected with `[1, n]`, a negative count 22011.
+pub(crate) fn substr_bytes(b: &[u8], start: i64, count: Option<i64>) -> Result<Vec<u8>> {
+    let n = b.len() as i64;
+    let to = match count {
+        Some(c) => {
+            if c < 0 {
+                return Err(EngineError::new(
+                    SqlState::SubstringError,
+                    "negative substring length not allowed",
+                ));
+            }
+            start.saturating_add(c).min(n + 1)
+        }
+        None => n + 1,
+    };
+    let from = start.max(1);
+    if to <= from {
+        return Ok(Vec::new());
+    }
+    Ok(b[(from - 1) as usize..(to - 1) as usize].to_vec())
+}
+
+/// `get_byte(b, n)` (string-functions.md §4): the 0-based `n`-th byte as an unsigned integer. An
+/// index outside `[0, len-1]` is 2202E with PostgreSQL's exact message (`0..-1` when empty).
+pub(crate) fn get_byte(b: &[u8], n: i64) -> Result<i64> {
+    match usize::try_from(n).ok().and_then(|i| b.get(i)) {
+        Some(byte) => Ok(i64::from(*byte)),
+        None => Err(EngineError::new(
+            SqlState::ArraySubscriptError,
+            format!("index {n} out of valid range, 0..{}", b.len() as i64 - 1),
+        )),
+    }
+}
+
 /// `left(s, n)` over CODE POINTS (string-functions.md §3): the first `n` characters; a negative
 /// `n` returns all but the last `|n|`. Matches PostgreSQL's `left`.
 pub(crate) fn left_chars(s: &str, n: i64) -> String {

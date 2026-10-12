@@ -47,6 +47,12 @@
   '550e8400-e29b-41d4-a716-446655440000'::uuid::bytea   AS uuid_to_bytea,
   '\\x550e8400e29b41d4a716446655440000'::bytea::uuid    AS bytea_to_uuid;`;
 
+	const byteaDemo = `SELECT
+  length('\\x0102ff'::bytea)                      AS len,
+  '\\x0102'::bytea || '\\xff'                     AS concatenated,
+  substring('\\x0102030405'::bytea FROM 2 FOR 3)  AS middle,
+  get_byte('\\x0102ff'::bytea, 2)                 AS last_byte;`;
+
 	const arrayCastDemo = `SELECT
   (ARRAY[1, 2, 3])::text                     AS array_to_text,
   ('{10,20,30}'::text)::i32[]                AS text_to_array,
@@ -227,6 +233,16 @@ bytes and raises `22P02` otherwise:
 `text → uuid` matches PostgreSQL. The other three are deliberately stricter or additional: jed makes
 `uuid → text` explicit-only (PostgreSQL assignment-casts any type to `text`), and the `bytea` ↔ `uuid`
 casts are a jed convenience PostgreSQL does not offer at all.
+
+## Binary strings (bytea)
+
+`bytea` has PostgreSQL's binary-string functions, all counting and indexing **bytes** (the `text`
+versions count characters). `length` and `octet_length` return the byte count and `bit_length` eight
+times that; `||` concatenates two `bytea` values; `substr` / `substring` take a 1-based window, also
+spelled `SUBSTRING(b FROM start FOR count)`; and `get_byte` reads one 0-based byte as an integer
+0–255, raising `2202E` for an index outside the value:
+
+<LiveSql demo="byteaDemo" query={byteaDemo} rows={1} />
 
 ## Array casts
 

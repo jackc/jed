@@ -5929,6 +5929,8 @@ func (p *parser) parsePrimary() (exprNode, error) {
 // one (42601). ArgNames stays nil when every argument is positional. DISTINCT inside the parens is
 // deferred (rejected 42601). Resolution checks per-function arity and fills defaults.
 func (p *parser) parseFunctionCall() (exprNode, error) {
+	// An UNQUOTED `substring` admits the SQL special form after its first argument (below).
+	substringForm := p.peekKeyword() == "substring"
 	name, err := p.expectIdentifier()
 	if err != nil {
 		return exprNode{}, err
@@ -6003,6 +6005,14 @@ func (p *parser) parseFunctionCall() (exprNode, error) {
 			}
 			fc.Args = append(fc.Args, &arg)
 			names = append(names, argName)
+			// `SUBSTRING(x FROM s [FOR l])` / `SUBSTRING(x FOR l [FROM s])` (grammar.ebnf
+			// `substring_expr`, string-functions.md §4): a FROM/FOR keyword after the first
+			// positional argument selects the special form.
+			if substringForm && argName == nil && !fc.Distinct && len(fc.Args) == 1 {
+				if kw := p.peekKeyword(); kw == "from" || kw == "for" {
+					return p.parseSubstringTail(name, arg)
+				}
+			}
 			if p.peek().Kind != tokComma {
 				break
 			}
@@ -6312,6 +6322,58 @@ func (p *parser) parseQualifiedTableName() (*string, string, error) {
 		return &q, tbl, nil
 	}
 	return nil, name, nil
+}
+
+// parseSubstringTail parses the tail of the SQL special form `SUBSTRING(x FROM s [FOR l])` /
+// `SUBSTRING(x FOR l [FROM s])` (grammar.ebnf `substring_expr`), the cursor on FROM or FOR. It
+// desugars to the ordinary call `substring(x, s[, l])` — PostgreSQL's rewrite — with a FOR-only form
+// starting at 1. No FILTER / OVER may follow (the form is not a function application).
+func (p *parser) parseSubstringTail(name string, source exprNode) (exprNode, error) {
+	var start, count *exprNode
+	if p.peekKeyword() == "from" {
+		p.advance()
+		e, err := p.parseExpr()
+		if err != nil {
+			return exprNode{}, err
+		}
+		start = &e
+		if p.peekKeyword() == "for" {
+			p.advance()
+			c, err := p.parseExpr()
+			if err != nil {
+				return exprNode{}, err
+			}
+			count = &c
+		}
+	} else {
+		if err := p.expectKeyword("for"); err != nil {
+			return exprNode{}, err
+		}
+		c, err := p.parseExpr()
+		if err != nil {
+			return exprNode{}, err
+		}
+		count = &c
+		if p.peekKeyword() == "from" {
+			p.advance()
+			e, err := p.parseExpr()
+			if err != nil {
+				return exprNode{}, err
+			}
+			start = &e
+		}
+	}
+	if err := p.expect(tokRParen); err != nil {
+		return exprNode{}, err
+	}
+	if start == nil {
+		start = &exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalInt, Int: 1}}
+	}
+	args := []*exprNode{&source, start}
+	if count != nil {
+		args = append(args, count)
+	}
+	return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: name, Args: args}}, nil
 }
 
 // peek returns the current token without consuming it.

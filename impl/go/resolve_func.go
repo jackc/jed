@@ -284,7 +284,7 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfOctetLength
 	case "bit_length":
 		return sfBitLength
-	case "substr":
+	case "substr", "substring":
 		return sfSubstr
 	case "left":
 		return sfLeft
@@ -326,6 +326,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfEncode
 	case "decode":
 		return sfDecode
+	case "get_byte":
+		return sfGetByte
 	case "quote_literal":
 		return sfQuoteLiteral
 	case "quote_ident":
@@ -1189,6 +1191,11 @@ func resolveConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) 
 	if lt.kind == rtJsonb || rt.kind == rtJsonb {
 		return resolveJSONbConcat(s, lhs, rhs, ag, params)
 	}
+	// BYTEA axis: a bytea operand with no array operand routes `||` to bytea concatenation
+	// (string-functions.md §4). A bytea[] operand stays on the array overloads below.
+	if (lt.kind == rtBytea || rt.kind == rtBytea) && lt.kind != rtArray && rt.kind != rtArray {
+		return resolveByteaConcat(s, lhs, rhs, ag, params)
+	}
 	// The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
 	var hint *scalarType
 	if lt.kind == rtArray {
@@ -1215,13 +1222,15 @@ func resolveConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) 
 			}
 		}
 	}
-	// Try the three concat overloads in catalog order; the first whose slots unify wins.
+	// Try the three concat overloads in catalog order; the first whose slots unify wins. Only the
+	// polymorphic (anyarray-result) rows: matchPoly ignores a concrete slot, so the bytea row (routed
+	// above) must not take part.
 	tys := []resolvedType{lt, rt}
 	var desc *operatorDesc
 	var elem *resolvedType
 	for i := range operators {
 		o := &operators[i]
-		if o.Kind != "concat" {
+		if o.Kind != "concat" || o.Result != "anyarray" {
 			continue
 		}
 		if e, matched := matchPoly(o.ArgFamilies, tys); matched {
@@ -1937,6 +1946,28 @@ func resolveJSONbConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTy
 		return nil, resolvedType{}, err
 	}
 	return &rExpr{kind: reJsonConcat, lhs: a, rhs: b}, resolvedType{kind: rtJsonb}, nil
+}
+
+// resolveByteaConcat resolves `bytea || bytea` (string-functions.md §4): each operand is re-resolved
+// with a bytea hint, so a bare string literal decodes as bytea input and an untyped NULL stays NULL
+// (the strict kernel then yields NULL). Any other operand type is 42883.
+func resolveByteaConcat(s *scope, lhs, rhs exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	byteaHint := scalarBytea
+	a, at, err := resolve(s, lhs, &byteaHint, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	b, bt, err := resolve(s, rhs, &byteaHint, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	ok := func(t resolvedType) bool { return t.kind == rtBytea || t.kind == rtNull }
+	if !ok(at) || !ok(bt) {
+		return nil, resolvedType{}, newError(UndefinedFunction,
+			fmt.Sprintf("operator does not exist: %s || %s", rtName(at), rtName(bt)))
+	}
+	return &rExpr{kind: reScalarFunc, sfunc: sfByteaConcat, sargs: []*rExpr{a, b}, result: scalarBytea},
+		resolvedType{kind: rtBytea}, nil
 }
 
 // resolveJSONbDelete resolves a jsonb delete operator: `-` (key `text` / index `int` / keys

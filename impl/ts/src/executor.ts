@@ -1274,6 +1274,32 @@ export function substrChars(s: string, start: bigint, count: bigint | null): str
   return chars.slice(Number(from - 1n), Number(to - 1n)).join("");
 }
 
+// substrBytes is substr(b, start[, count]) over BYTES (string-functions.md §4): substrChars's window
+// rule applied to a bytea — [start, start+count) intersected with [1, n], a negative count 22011.
+export function substrBytes(b: Uint8Array, start: bigint, count: bigint | null): Uint8Array {
+  const n = BigInt(b.length);
+  let to: bigint;
+  if (count !== null) {
+    if (count < 0n) throw engineError("substring_error", "negative substring length not allowed");
+    to = start + count;
+    if (to > n + 1n) to = n + 1n;
+  } else {
+    to = n + 1n;
+  }
+  const from = start < 1n ? 1n : start;
+  if (to <= from) return new Uint8Array(0);
+  return b.slice(Number(from - 1n), Number(to - 1n));
+}
+
+// getByte is get_byte(b, n) (string-functions.md §4): the 0-based n-th byte as an unsigned integer.
+// An index outside [0, len-1] is 2202E with PostgreSQL's exact message (0..-1 when empty).
+export function getByte(b: Uint8Array, n: bigint): bigint {
+  if (n < 0n || n >= BigInt(b.length)) {
+    throw engineError("array_subscript_error", `index ${n} out of valid range, 0..${b.length - 1}`);
+  }
+  return BigInt(b[Number(n)]!);
+}
+
 // leftChars is left(s, n) over CODE POINTS (string-functions.md §3): the first n characters; a
 // negative n returns all but the last |n|. Matches PostgreSQL's left.
 export function leftChars(s: string, n: bigint): string {
@@ -27587,13 +27613,15 @@ export type ScalarFuncName =
   // the generic scalarFunc short-circuit). Character functions count Unicode CODE POINTS — TS strings
   // are UTF-16, so iterate with [...s] (code-point units), NOT .length; octet/bit functions count
   // UTF-8 bytes (via TextEncoder). length(text) → i32 — the number of characters. length('héllo') = 5.
+  // Over bytea, length / octet_length are the byte count and bit_length is bytes × 8 (§4).
   | "length"
   // octet_length(text) → i32 — the number of UTF-8 bytes (utf8ByteLength). octet_length('héllo') = 6.
   | "octet_length"
   // bit_length(text) → i32 — the number of UTF-8 bits = octet_length × 8. bit_length('héllo') = 48.
   | "bit_length"
-  // substr(text, start[, count]) → text — the function form of SUBSTRING (1-based, code-point
-  // indexed). A negative count is 22011 (string-functions.md §3).
+  // substr / substring(text, start[, count]) → text — the function form of SUBSTRING (1-based,
+  // code-point indexed); over bytea the same window over bytes. A negative count is 22011
+  // (string-functions.md §3/§4). `substring` resolves to this kernel id.
   | "substr"
   // left(text, n) → text — the first n characters; a negative n drops the last |n| (§3).
   | "left"
@@ -27636,6 +27664,11 @@ export type ScalarFuncName =
   | "encode"
   // decode(text, format) → bytea — parse hex / base64 / escape back to binary (§3).
   | "decode"
+  // get_byte(bytea, n) → i32 — the n-th byte (0-based); out of range traps 2202E (§4).
+  | "get_byte"
+  // bytea || bytea → bytea — the operands' bytes appended (§4). Reached only through the `||`
+  // resolver (it has no function-call name); a growth kernel (cost.md §8.1).
+  | "bytea_concat"
   // quote_literal(text) → text — wrap as a SQL string literal (§3).
   | "quote_literal"
   // quote_ident(text) → text — wrap as a SQL identifier (§3).
@@ -32680,6 +32713,8 @@ export function resolveScalarFunc(
   let func: ScalarFuncName = name;
   if ((func as string) === "power") func = "pow";
   if ((func as string) === "ceiling") func = "ceil";
+  // `substring` is the SQL name of substr (string-functions.md §4); both share the substr kernel.
+  if ((func as string) === "substring") func = "substr";
   // Every float function computes at the operand's float width (argWidth), so a f32 operand
   // rounds at binary32 even where the catalog's result is f64; abs(float) also keeps that width
   // as its result. Non-float args carry no width. pow is the one (float, float) function — it

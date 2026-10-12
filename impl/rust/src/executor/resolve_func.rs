@@ -2169,6 +2169,11 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
         RExpr::GreatestLeast { args, greatest, .. } => {
             explain_call(if *greatest { "greatest" } else { "least" }, args)
         }
+        RExpr::ScalarFunc {
+            func: ScalarFunc::ByteaConcat,
+            args,
+            ..
+        } => binary(&args[0], "||", &args[1]),
         RExpr::ScalarFunc { func, args, .. } => explain_call(&explain_scalar_func(*func), args),
         RExpr::HostFunc { name, args, .. } => explain_call(name, args),
         RExpr::ArrayFunc { func, args } => explain_call(explain_array_func(func), args),

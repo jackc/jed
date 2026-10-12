@@ -1464,6 +1464,10 @@ func renderRExpr(e *rExpr) string {
 		}
 		return explainExprCall("least", e.sargs)
 	case reScalarFunc:
+		if e.sfunc == sfByteaConcat {
+			// bytea || bytea renders as its binary operator form, like jsonb `||`.
+			return "(" + renderRExpr(e.sargs[0]) + " || " + renderRExpr(e.sargs[1]) + ")"
+		}
 		return explainExprCall(explainScalarFunc(e.sfunc), e.sargs)
 	case reHostFunc:
 		// The host function name is carried on the node (cText) so EXPLAIN renders it without the
@@ -1712,6 +1716,8 @@ func explainScalarFunc(f scalarFunc) string {
 		return "encode"
 	case sfDecode:
 		return "decode"
+	case sfGetByte:
+		return "get_byte"
 	case sfQuoteLiteral:
 		return "quote_literal"
 	case sfQuoteIdent:

@@ -4559,6 +4559,8 @@ class Parser {
   // named one (42601). argNames stays empty when every argument is positional. DISTINCT inside the
   // parens is deferred (rejected 42601). Resolution checks per-function arity and fills defaults.
   private parseFunctionCall(): Expr {
+    // An UNQUOTED `substring` admits the SQL special form after its first argument (below).
+    const substringForm = this.peek().kind === "word" && this.peek().word === "substring";
     const name = this.expectIdentifier();
     this.expect("lparen");
     // A leading DISTINCT (`COUNT(DISTINCT x)`, aggregates.md §5) folds only the distinct argument
@@ -4615,6 +4617,18 @@ class Parser {
         }
         args.push(this.parseExpr());
         names.push(argName);
+        // `SUBSTRING(x FROM s [FOR l])` / `SUBSTRING(x FOR l [FROM s])` (grammar.ebnf
+        // `substring_expr`, string-functions.md §4): a FROM/FOR keyword after the first positional
+        // argument selects the special form.
+        if (
+          substringForm &&
+          argName === null &&
+          !distinct &&
+          args.length === 1 &&
+          (this.peekKeyword() === "from" || this.peekKeyword() === "for")
+        ) {
+          return this.parseSubstringTail(name, args[0]!);
+        }
         if (this.peek().kind !== "comma") break;
         this.advance();
       }
@@ -4700,6 +4714,42 @@ class Parser {
       over,
       overName,
       withinGroup,
+    };
+  }
+
+  // parseSubstringTail parses the tail of the SQL special form `SUBSTRING(x FROM s [FOR l])` /
+  // `SUBSTRING(x FOR l [FROM s])` (grammar.ebnf `substring_expr`), the cursor on FROM or FOR.
+  // Desugars to the ordinary call `substring(x, s[, l])` — PostgreSQL's rewrite — with a FOR-only
+  // form starting at 1. No FILTER / OVER may follow (the form is not a function application).
+  private parseSubstringTail(name: string, source: Expr): Expr {
+    let start: Expr | null = null;
+    let count: Expr | null = null;
+    if (this.peekKeyword() === "from") {
+      this.advance();
+      start = this.parseExpr();
+      if (this.peekKeyword() === "for") {
+        this.advance();
+        count = this.parseExpr();
+      }
+    } else {
+      this.expectKeyword("for");
+      count = this.parseExpr();
+      if (this.peekKeyword() === "from") {
+        this.advance();
+        start = this.parseExpr();
+      }
+    }
+    this.expect("rparen");
+    const args: Expr[] = [source, start ?? { kind: "literal", literal: { kind: "int", int: 1n } }];
+    if (count !== null) args.push(count);
+    return {
+      kind: "funcCall",
+      name,
+      args,
+      argNames: [],
+      star: false,
+      distinct: false,
+      variadic: false,
     };
   }
 

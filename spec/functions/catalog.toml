@@ -3539,6 +3539,25 @@ null           = "none"
 precedence     = 37
 errors         = ["22000"]
 
+# bytea || bytea → bytea (string-functions.md §4) — PostgreSQL's byteacat: the operands' bytes
+# appended. NOT polymorphic: the hand-written resolver routes `||` here whenever one operand is
+# bytea and neither is an array (a bytea[] operand stays on the array overloads above), BEFORE the
+# polymorphic loop — which matches only the anyarray-result rows (match_poly does not check a
+# concrete slot). A bare string literal / untyped NULL operand adapts to bytea, so
+# `b || '\x02'` and `b || NULL` are bytea (PG). STRICT. A growth kernel (cost.md §8.1).
+[[operator]]
+volatility     = "immutable"
+name           = "concat"
+symbol         = "||"
+kind           = "concat"
+arity          = 2
+arg_families   = ["bytea", "bytea"]
+arg_resolution = "none"
+result         = "bytea"
+null           = "propagates"
+precedence     = 37
+errors         = []
+
 # --- the array containment / overlap operators (../design/array-functions.md §10) ------------
 # Three new operators of KIND "containment": binary infix `@>` (contains), `<@` (contained by), and
 # `&&` (overlaps), each `(anyarray, anyarray) → boolean`. They share `||`'s precedence (37 — the
@@ -3817,6 +3836,18 @@ result         = "i32"
 null           = "propagates"
 errors         = []
 
+# length(bytea) → int — the number of BYTES (PG's byteaoctetlen; string-functions.md §4).
+[[operator]]
+volatility     = "immutable"
+name           = "length"
+kind           = "function"
+arity          = 1
+arg_families   = ["bytea"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = []
+
 # char_length / character_length — SQL-standard aliases of length(text): the same code-point count,
 # same kernel. PG exposes all three (char_length and character_length are the SQL spellings).
 [[operator]]
@@ -3854,6 +3885,18 @@ result         = "i32"
 null           = "propagates"
 errors         = []
 
+# octet_length(bytea) → int — the number of bytes (string-functions.md §4).
+[[operator]]
+volatility     = "immutable"
+name           = "octet_length"
+kind           = "function"
+arity          = 1
+arg_families   = ["bytea"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = []
+
 # bit_length(text) → int — the number of BITS in the UTF-8 encoding = octet_length × 8.
 # bit_length('héllo') = 48.
 [[operator]]
@@ -3862,6 +3905,18 @@ name           = "bit_length"
 kind           = "function"
 arity          = 1
 arg_families   = ["text"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = []
+
+# bit_length(bytea) → int — the number of bits = bytes × 8 (string-functions.md §4).
+[[operator]]
+volatility     = "immutable"
+name           = "bit_length"
+kind           = "function"
+arity          = 1
+arg_families   = ["bytea"]
 arg_resolution = "none"
 result         = "i32"
 null           = "propagates"
@@ -3890,6 +3945,78 @@ arity          = 3
 arg_families   = ["text", "integer", "integer"]
 arg_resolution = "none"
 result         = "text"
+null           = "propagates"
+errors         = ["22011"]
+
+# substr(bytea, start[, count]) → bytea — the same window rule over BYTES (1-based; a start ≤ 0 or
+# past the end clips, a negative count is 22011). (string-functions.md §4)
+[[operator]]
+volatility     = "immutable"
+name           = "substr"
+kind           = "function"
+arity          = 2
+arg_families   = ["bytea", "integer"]
+arg_resolution = "none"
+result         = "bytea"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+volatility     = "immutable"
+name           = "substr"
+kind           = "function"
+arity          = 3
+arg_families   = ["bytea", "integer", "integer"]
+arg_resolution = "none"
+result         = "bytea"
+null           = "propagates"
+errors         = ["22011"]
+
+# substring(string, start[, count]) — the SQL-standard name of substr, for text and bytea (the same
+# kernel). The parser also desugars the special form SUBSTRING(x FROM s [FOR l]) / SUBSTRING(x FOR l
+# [FROM s]) to these calls (grammar.ebnf `substring_expr`; FOR-only starts at 1). PG's regex forms
+# (substring(text FROM pattern), SIMILAR … ESCAPE) are not catalogued: a text `from` is 42883.
+[[operator]]
+volatility     = "immutable"
+name           = "substring"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "integer"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+volatility     = "immutable"
+name           = "substring"
+kind           = "function"
+arity          = 3
+arg_families   = ["text", "integer", "integer"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["22011"]
+
+[[operator]]
+volatility     = "immutable"
+name           = "substring"
+kind           = "function"
+arity          = 2
+arg_families   = ["bytea", "integer"]
+arg_resolution = "none"
+result         = "bytea"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+volatility     = "immutable"
+name           = "substring"
+kind           = "function"
+arity          = 3
+arg_families   = ["bytea", "integer", "integer"]
+arg_resolution = "none"
+result         = "bytea"
 null           = "propagates"
 errors         = ["22011"]
 
@@ -4230,6 +4357,20 @@ arg_resolution = "none"
 result         = "bytea"
 null           = "propagates"
 errors         = ["22023", "22P02"]
+
+# get_byte(bytea, n int) → int — the n-th byte (0-based) as an unsigned integer 0..255. An index
+# outside [0, length-1] traps 2202E "index n out of valid range, 0..length-1" (PG's exact text;
+# an empty value gives "0..-1"). NULL args propagate. (string-functions.md §4)
+[[operator]]
+volatility     = "immutable"
+name           = "get_byte"
+kind           = "function"
+arity          = 2
+arg_families   = ["bytea", "integer"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = ["2202E"]
 
 # quote_literal(text) → text — the string wrapped as a SQL string literal: surrounded by single
 # quotes with each internal quote doubled, and (if it contains a backslash) doubled backslashes plus

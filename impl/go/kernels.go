@@ -673,6 +673,42 @@ func substrChars(s string, start int64, count *int64) (string, error) {
 	return string(runes[from-1 : to-1]), nil
 }
 
+// substrBytes is substr(b, start[, count]) over BYTES (string-functions.md §4): substrChars's window
+// rule applied to a bytea — [start, start+count) intersected with [1, n], a negative count 22011.
+func substrBytes(b []byte, start int64, count *int64) ([]byte, error) {
+	n := int64(len(b))
+	var to int64
+	if count != nil {
+		if *count < 0 {
+			return nil, newError(SubstringError, "negative substring length not allowed")
+		}
+		to = satAddInt64(start, *count)
+		if to > n+1 {
+			to = n + 1
+		}
+	} else {
+		to = n + 1
+	}
+	from := start
+	if from < 1 {
+		from = 1
+	}
+	if to <= from {
+		return []byte{}, nil
+	}
+	return b[from-1 : to-1], nil
+}
+
+// getByte is get_byte(b, n) (string-functions.md §4): the 0-based n-th byte as an unsigned integer.
+// An index outside [0, len-1] is 2202E with PostgreSQL's exact message (`0..-1` when empty).
+func getByte(b []byte, n int64) (int64, error) {
+	if n < 0 || n >= int64(len(b)) {
+		return 0, newError(ArraySubscriptError,
+			fmt.Sprintf("index %d out of valid range, 0..%d", n, int64(len(b))-1))
+	}
+	return int64(b[n]), nil
+}
+
 // leftChars is left(s, n) over CODE POINTS (string-functions.md §3): the first n characters; a
 // negative n returns all but the last |n|. Matches PostgreSQL's left.
 func leftChars(s string, n int64) string {
