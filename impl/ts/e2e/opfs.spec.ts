@@ -1,8 +1,9 @@
 // Real-browser end-to-end test for the Browser/OPFS host (spec/design/hosts.md §5). Drives headless
 // Chromium against the Vite-served demo (browser/main.ts), exercising the FULL stack the node parity
 // test cannot: a real FileSystemSyncAccessHandle, in a real dedicated Worker, over the async RPC client.
-// Gated — run with `npm run test:browser` after `npx playwright install chromium`; NOT in the node unit
-// suite or `mise run ci` (which the OPFS host leaves untouched — it adds no SQL semantics, hosts.md §5).
+// Runs in `mise run ci` as the `e2e:ts` step (or `npm run test:browser` here), after `mise run
+// dev:browsers` installs Chromium; NOT in the node unit suite. The OPFS host adds no SQL semantics, so
+// the conformance corpus is untouched (hosts.md §5).
 //
 // Each test gets a fresh browser context, so OPFS starts empty; a unique db name per test avoids the
 // exclusive-handle clash even if state lingered.

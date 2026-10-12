@@ -117,7 +117,7 @@ than importing different answers. Consequences worth internalising:
 
 | Command | What it does |
 |---|---|
-| `mise run ci` | the full merge gate (spec verification, formatting, lint, tests, process locking) |
+| `mise run ci` | the full merge gate (spec verification, formatting, lint, tests, process locking, browser e2e) |
 | `mise run test` | conformance corpus on all three cores + unit + CLI + gem + migrate |
 | `mise run verify` | spec data tables and byte fixtures; needs no engine build |
 | `mise run fmt` / `fmt:fix` | formatting across cores, host artifacts, tooling, and web |
@@ -125,7 +125,8 @@ than importing different answers. Consequences worth internalising:
 | `mise run dev:ports` | this checkout's port allocation, and what is listening on it |
 | `mise run db:init` / `db:psql` | create / open this checkout's cluster |
 | `mise run oracle:status` / `oracle:setup` / `oracle:reset` | the oracle's profile and database |
-| `mise run dev:browsers` | Chromium for the two Playwright suites (~150 MB, not needed by `ci`) |
+| `mise run dev:browsers` | Chromium for the two Playwright suites (~150 MB; `ci` needs it) |
+| `mise run e2e` | both real-browser suites: `e2e:ts` (OPFS host) and `e2e:web` (website) |
 
 `mise tasks` lists every task, including the ones not in this table (`bench:*`, `corpus:*`,
 `rqg:*`, `stress`, `fuzz`, `mutation`, `references:*`), and `mise run <task> --help` shows a task's

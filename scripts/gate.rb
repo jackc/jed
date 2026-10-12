@@ -12,7 +12,9 @@
 # Steps that already fan out (conformance:all, concurrency:process, unit:ts) share the machine with
 # the rest; the OS schedules them. The one constraint is the corpus tree: corpus:norec_sweep and
 # corpus:reduce_selftest WRITE files into spec/conformance/suites, which `verify` and
-# conformance:all READ, so they start only after those finish.
+# conformance:all READ, so they start only after those finish. Likewise e2e:web builds the website
+# (`vite build` rewrites web/.svelte-kit), which web:check's `svelte-kit sync` also writes, so it
+# starts after web:check.
 #
 # `ci` is `test` plus the steps below it, by construction: add a step to test_steps and both gates run it.
 
@@ -40,7 +42,8 @@ end
 
 # The merge gate: `test` (with the Rust corpus walks under debug assertions + overflow checks) plus
 # spec-data + byte-fixture verification + codegen drift, formatting, the TS linter, the downstream
-# web type check, the real-process shared-file corpus, and generative differential testing.
+# web type check, the real-process shared-file corpus, the real-browser e2e suites (headless
+# Chromium: the TS core's OPFS host and the website), and generative differential testing.
 def ci_steps
   corpus_readers = ["verify", "conformance:all --checked"]
   [
@@ -50,6 +53,8 @@ def ci_steps
     step("web:check"),
     *test_steps(checked: true),
     step("concurrency:process"),
+    step("e2e:ts"),
+    step("e2e:web", after: ["web:check"]),
     step("corpus:norec_sweep", after: corpus_readers),
     step("corpus:reduce_selftest", after: corpus_readers),
   ]

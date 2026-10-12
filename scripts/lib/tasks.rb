@@ -81,15 +81,22 @@ module Tasks
   # check correct across git checkouts, and the stamp is wiped whenever node_modules is (including
   # by `npm ci` itself, which removes it first). Without this a gate silently skips the install
   # when the lockfile grows a dependency — the `prettier: not found` foot-gun.
+  #
+  # Concurrent gate steps install the same package (fmt, web:check, and e2e:web all need web's
+  # deps), and `npm ci` deletes node_modules before reinstalling, so the check-and-install holds an
+  # exclusive lock on the package's package.json: a second caller waits, then finds the stamp fresh.
   def npm_ci_if_stale(dir)
     dir = File.expand_path(dir, ROOT)
     modules = File.join(dir, "node_modules")
     lock = File.join(dir, "package-lock.json")
     stamp_file = File.join(modules, ".jed-deps-stamp")
-    want = File.exist?(lock) ? Digest::SHA256.file(lock).hexdigest : ""
-    return if File.directory?(modules) && File.exist?(stamp_file) && File.read(stamp_file) == want
+    File.open(File.join(dir, "package.json")) do |guard|
+      guard.flock(File::LOCK_EX)
+      want = File.exist?(lock) ? Digest::SHA256.file(lock).hexdigest : ""
+      return if File.directory?(modules) && File.exist?(stamp_file) && File.read(stamp_file) == want
 
-    sh "npm", "ci", "--silent", "--prefix", dir
-    File.write(stamp_file, want)
+      sh "npm", "ci", "--silent", "--prefix", dir
+      File.write(stamp_file, want)
+    end
   end
 end

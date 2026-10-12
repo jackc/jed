@@ -2,7 +2,8 @@
 // first-class" contract). Like impl/ts, Playwright is a DEV-ONLY tool (CLAUDE.md §14): it drives
 // headless Chromium against the BUILT static site (vite preview) — so the suite also catches
 // prerender / base-path / worker-404 regressions, not just component behavior. Run with
-// `npm run test:browser`; needs the Chromium binary (already in PLAYWRIGHT_BROWSERS_PATH here).
+// `npm run test:browser`, or `mise run e2e:web` (a `mise run ci` step); needs the Chromium binary
+// (`mise run dev:browsers`; already in PLAYWRIGHT_BROWSERS_PATH in the devcontainer).
 
 import { defineConfig, devices } from '@playwright/test';
 

@@ -45,4 +45,5 @@ on `test:browser` and builds with `BASE_PATH=/<repo>`.
 When a user-facing SQL feature or the host API changes, update the matching page here in the same
 change: an `api/` page (and its `examples/<topic>` sources) or a `sql/` page (and its `<LiveSql>`),
 and add to `src/lib/content/docs-nav.ts`. The type/function/error reference regenerates from the
-spec automatically. Run `npm run test:browser` when touching the bridge or a documented behavior.
+spec automatically. Run `npm run test:browser` when touching the bridge or a documented behavior;
+the repo's `mise run ci` also runs it (the `e2e:web` step).

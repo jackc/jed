@@ -265,7 +265,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     (`max_storage_bytes` has landed as the storage limit, memory.md §8 / Q4a and Q4c; next a spill `temp_dir`, then a thread count);
     optionally sweep the async OPFS/browser host (`createOpfs`/`OpfsDatabase.create`) into the
     unified `create(opts)` shape.
-- [ ] **Storage hosts** — the five-method `BlockStore` byte device, host catalog, and decoration layering (encryption codec above the seam, replication tee below) authored in [hosts.md](spec/design/hosts.md). **Landed:** the per-core `FileBlockStore`s, the Node `fs` host, and the **Browser/OPFS host** (`FileSystemSyncAccessHandle` → engine in a Web Worker, file-host parity vs goldens, gated Playwright e2e). **Open:** OPFS disk-spill and running the real-browser e2e inside `mise run ci`. → [hosts.md §3/§5/§7](spec/design/hosts.md)
+- [ ] **Storage hosts** — the five-method `BlockStore` byte device, host catalog, and decoration layering (encryption codec above the seam, replication tee below) authored in [hosts.md](spec/design/hosts.md). **Landed:** the per-core `FileBlockStore`s, the Node `fs` host, and the **Browser/OPFS host** (`FileSystemSyncAccessHandle` → engine in a Web Worker, file-host parity vs goldens, a Playwright real-browser e2e run inside `mise run ci`). **Open:** OPFS disk-spill. → [hosts.md §3/§5/§7](spec/design/hosts.md)
 - [x] **jed-migrate — the schema-migration library** — tern-modeled, opt-in migration packages at
   `/migrate` (Go + Rust + TS; a NON-CORE consumer per language) over one shared contract +
   `testdata` corpus; one committed transaction per step (resumable); bundled by the CLI as

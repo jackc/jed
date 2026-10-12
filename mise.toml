@@ -97,11 +97,12 @@ run = [{ task = "test" }]
 # `test` and `ci` run their steps concurrently, each step's output buffered and printed in order;
 # the step lists live in scripts/gate.rb, where `ci` is `test` plus its extra steps by construction.
 [tasks.ci]
-description = "Full merge gate: spec verification, formatting, lint, tests, real-process locking, metamorphic sweep"
+description = "Full merge gate: spec verification, formatting, lint, tests, real-process locking, real-browser e2e, metamorphic sweep"
 # A SUPERSET of `test`: adds spec-data + byte-fixture verification + codegen drift (`verify`), the
 # formatter gate (`fmt`), the TS linter (`lint`), the downstream web type check (`web:check`), the
 # Rust corpus walks with debug assertions + overflow checks (`conformance:all --checked`), the
-# real-process shared-file corpus, and generative differential testing — the NoREC/TLP metamorphic
+# real-process shared-file corpus, the real-browser e2e suites (`e2e:ts`, `e2e:web` — they need
+# `mise run dev:browsers` once), and generative differential testing — the NoREC/TLP metamorphic
 # sweep + the reducer self-test.
 run = "ruby scripts/gate.rb ci"
 
@@ -136,6 +137,32 @@ run = "biome lint --write impl/ts impl/node bench/ts migrate/ts"
 [tasks."web:check"]
 description = "Type-check the website and its browser-consumed TypeScript core modules"
 run = ["ruby scripts/npm_ci.rb web", "npm run --silent --prefix web check"]
+
+# --- Real-browser e2e (Playwright + headless Chromium) ------------------------------------------
+# Two suites, both in `ci`: the TS core's Browser/OPFS host (spec/design/hosts.md §5 — a real
+# FileSystemSyncAccessHandle in a real Worker, incl. durability across a reload) and the website's
+# interactive-feature contract (CLAUDE.md §10 — the BUILT static site). Both need the Chromium build
+# `mise run dev:browsers` installs; Playwright's own missing-browser error is followed by that hint.
+
+[tasks.e2e]
+description = "Run both real-browser Playwright suites (TS core OPFS host, then the website)"
+run = [{ task = "e2e:ts" }, { task = "e2e:web" }]
+
+[tasks."e2e:ts"]
+description = "Run the TS core's Browser/OPFS host e2e in headless Chromium (Vite-served demo)"
+run = '''
+ruby scripts/npm_ci.rb impl/ts
+npm run --silent --prefix impl/ts test:browser || { echo "e2e:ts failed (if Chromium is missing: mise run dev:browsers)" >&2; exit 1; }
+'''
+
+# CI=1 makes the Playwright config build the site fresh instead of reusing a server already on the
+# port, which may be serving a stale build.
+[tasks."e2e:web"]
+description = "Build the website and run its Playwright interactive-feature suite in headless Chromium"
+run = '''
+ruby scripts/npm_ci.rb web
+CI=1 npm run --silent --prefix web test:browser || { echo "e2e:web failed (if Chromium is missing: mise run dev:browsers)" >&2; exit 1; }
+'''
 
 # --- Conformance (the §7 cross-core contract) ---------------------------------------------------
 # Every core walks the hand-authored corpus (spec/conformance/suites) TWICE — the two storage modes
@@ -600,7 +627,7 @@ run = [
 [tasks."dev:browsers"]
 description = "Install the Chromium build the browser e2e suites drive (impl/ts + web)"
 # Separate from dev:init because it is a ~150 MB download that only the two Playwright suites need
-# — `ci` does not. --with-deps installs OS packages via apt and exists only on Linux, so it is
+# (e2e:ts, e2e:web — part of `ci`, not `test`). --with-deps installs OS packages via apt and exists only on Linux, so it is
 # applied there and omitted elsewhere; on macOS the browser bundle is self-contained.
 run = '''
 if [ "$(uname -s)" = "Linux" ]; then deps="--with-deps"; else deps=""; fi

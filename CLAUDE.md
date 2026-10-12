@@ -785,8 +785,9 @@ The design is optimized for AI agents even more than for humans. In practice:
   `CodeTabs` source (`web/examples/<topic>/{rust.rs,go.go,ts.ts}`), and — if the type/function/error
   set changed — nothing by hand, since the reference pages generate from the spec TOML. The site runs
   the **TS core in a browser Web Worker** (in-memory + OPFS), so its `web/e2e/` Playwright suite
-  (`npm run test:browser` in `/web`) is the interactive-feature contract; run it when touching the
-  bridge (`web/src/lib/jed/`) or a documented behavior. Internal-only changes need no `/web` update.
+  (`mise run e2e:web`, a `mise run ci` step beside the TS core's OPFS e2e `e2e:ts`) is the
+  interactive-feature contract; run it when touching the bridge (`web/src/lib/jed/`) or a documented
+  behavior. Internal-only changes need no `/web` update.
 - **Boring, explicit code over clever abstraction.** In Rust, resist deep generics and
   macro magic. In Go, resist over-interfacing. Flat, well-named, single-responsibility
   modules with small context footprints are easier for agents (and humans) to reason
