@@ -78,6 +78,39 @@ impl Column {
             Some(v) => Some(v.sql_literal()),
         }
     }
+
+    /// The column's declared type as canonical SQL text (introspection.md §5, the `jed_columns.type`
+    /// text): the typmod applied at the leaf (`varchar(10)`, `decimal(8,2)`, `varchar(5)[]`), a
+    /// composite's name, a range's canonical id. It re-parses to the same declared type, so a tool
+    /// (the CLI's dump) can write it back into `CREATE TABLE`.
+    pub fn type_text(&self) -> String {
+        catalog_type_text(&self.ty, self.decimal.as_ref(), self.varchar_len)
+    }
+}
+
+/// Render a column's declared type in the CANONICAL introspection form (introspection.md §5): the
+/// scalar's canonical name with its typmod applied at the leaf (`varchar(10)`, `decimal(8,2)`), a
+/// composite's name as created, a range's canonical id (`i32range`, `numrange`, …), and `[]`
+/// appended for an array (the typmod applies to the element: `varchar(5)[]`). This text is a
+/// compatibility surface the moment it ships — pinned by the corpus.
+pub(crate) fn catalog_type_text(
+    ty: &Type,
+    dec: Option<&DecimalTypmod>,
+    vlen: Option<u32>,
+) -> String {
+    match ty {
+        Type::Array(elem) => format!("{}[]", catalog_type_text(elem, dec, vlen)),
+        Type::Scalar(ScalarType::Text) if vlen.is_some() => {
+            format!("varchar({})", vlen.unwrap())
+        }
+        Type::Scalar(ScalarType::Decimal) if dec.is_some() => {
+            let d = dec.unwrap();
+            format!("decimal({},{})", d.precision, d.scale)
+        }
+        // The scalar / composite / range canonical rendering is shared with error messages
+        // (types.rs): composite → its name as created, range → the ranges.toml id.
+        _ => ty.canonical_name(),
+    }
 }
 
 /// The kind of an IDENTITY column (spec/design/sequences.md §13). `Always` (`GENERATED ALWAYS`)

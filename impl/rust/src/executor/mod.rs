@@ -20,7 +20,8 @@ pub(crate) use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
     ExclusionConstraint, ExclusionElement, ExclusionOp, FkAction, ForeignKeyConstraint,
     HostFuncDep, IdentityKind, IndexDef, IndexKey, IndexKeyExpr, IndexKind, SeqDataType, SeqOwner,
-    SequenceDef, Table, TimeZoneDep, TimeZoneDeps, ViewDef, ViewDep, ViewDepKind, resolve_col_type,
+    SequenceDef, Table, TimeZoneDep, TimeZoneDeps, ViewDef, ViewDep, ViewDepKind,
+    catalog_type_text, resolve_col_type,
 };
 pub(crate) use crate::collation::{self, Collation};
 pub(crate) use crate::cost::{Lifetime, Meter};
@@ -4953,27 +4954,6 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
             ],
         ),
         _ => unreachable!("only catalog-relation kinds reach catalog_rel_table"),
-    }
-}
-
-/// Render a column's declared type in the CANONICAL introspection form (introspection.md §5): the
-/// scalar's canonical name with its typmod applied at the leaf (`varchar(10)`, `decimal(8,2)`), a
-/// composite's name as created, a range's canonical id (`i32range`, `numrange`, …), and `[]`
-/// appended for an array (the typmod applies to the element: `varchar(5)[]`). This text is a
-/// compatibility surface the moment it ships — pinned by the corpus.
-fn catalog_type_text(ty: &Type, dec: Option<&DecimalTypmod>, vlen: Option<u32>) -> String {
-    match ty {
-        Type::Array(elem) => format!("{}[]", catalog_type_text(elem, dec, vlen)),
-        Type::Scalar(ScalarType::Text) if vlen.is_some() => {
-            format!("varchar({})", vlen.unwrap())
-        }
-        Type::Scalar(ScalarType::Decimal) if dec.is_some() => {
-            let d = dec.unwrap();
-            format!("decimal({},{})", d.precision, d.scale)
-        }
-        // The scalar / composite / range canonical rendering is shared with error messages
-        // (types.rs): composite → its name as created, range → the ranges.toml id.
-        _ => ty.canonical_name(),
     }
 }
 

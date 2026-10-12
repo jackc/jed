@@ -90,17 +90,14 @@ pub fn dump(db: &mut jed::Session, out: &mut dyn Write) -> io::Result<()> {
     writeln!(out, "COMMIT;")
 }
 
-/// The CREATE TABLE statement for a catalog entry: columns with type (incl. the
-/// `numeric(p,s)` typmod), NOT NULL (skipped on PK members — implied), DEFAULT; then a
-/// table-level PRIMARY KEY in key order and each CHECK with its persisted name and text.
+/// The CREATE TABLE statement for a catalog entry: columns with their canonical type text
+/// (introspection.md §5, typmods included: `decimal(p,s)`, `varchar(n)`), NOT
+/// NULL (skipped on PK members — implied), DEFAULT; then a table-level PRIMARY KEY in key
+/// order and each CHECK with its persisted name and text.
 fn create_table_sql(table: &Table) -> String {
     let mut parts: Vec<String> = Vec::new();
     for col in &table.columns {
-        let ty = match &col.decimal {
-            Some(m) => format!("numeric({},{})", m.precision, m.scale),
-            None => col.ty.canonical_name().to_string(),
-        };
-        let mut line = format!("  {} {ty}", q(&col.name));
+        let mut line = format!("  {} {}", q(&col.name), col.type_text());
         if col.not_null && !col.primary_key {
             line.push_str(" NOT NULL");
         }
@@ -186,6 +183,14 @@ mod tests {
             "INSERT INTO users (id, age, name, score) VALUES (1, 40, 'alice', 9.50)",
             "CREATE TABLE nopk (v i64)",
             "INSERT INTO nopk VALUES (10), (20)",
+            "CREATE TABLE typed (
+                id i32 PRIMARY KEY,
+                code varchar(10),
+                tags text[],
+                amounts decimal[],
+                span i32range
+             )",
+            "INSERT INTO typed VALUES (1, 'abc', ARRAY['x', 'yz'], ARRAY[1.50, 2.00], '[1,5)')",
             // `a_top` reads `z_base`, so dependency order puts it after `z_base` even though it
             // sorts first by name; `Mixed` leads by name byte order.
             "CREATE VIEW z_base AS SELECT id, name FROM users WHERE age > 18 WITH LOCAL CHECK OPTION",
@@ -206,11 +211,20 @@ mod tests {
              CREATE TABLE nopk (\n  v i64\n);\n\
              INSERT INTO nopk VALUES (10);\n\
              INSERT INTO nopk VALUES (20);\n\
+             CREATE TABLE typed (\n\
+             \x20 id i32,\n\
+             \x20 code varchar(10),\n\
+             \x20 tags text[],\n\
+             \x20 amounts decimal[],\n\
+             \x20 span i32range,\n\
+             \x20 PRIMARY KEY (id)\n\
+             );\n\
+             INSERT INTO typed VALUES (1, 'abc', '{x,yz}', '{1.50,2.00}', '[1,5)');\n\
              CREATE TABLE users (\n\
              \x20 id i32,\n\
              \x20 age i32,\n\
              \x20 name text NOT NULL,\n\
-             \x20 score numeric(5,2) DEFAULT 0.50,\n\
+             \x20 score decimal(5,2) DEFAULT 0.50,\n\
              \x20 ok boolean DEFAULT true,\n\
              \x20 n i32 DEFAULT 1 + 1,\n\
              \x20 blob bytea,\n\
@@ -240,6 +254,14 @@ mod tests {
             replayed.execute(&stmt.sql, &[]).unwrap();
         }
         assert_eq!(dump_to_string(&mut replayed), first);
+        // The replayed `varchar(10)` keeps its length check.
+        let err = replayed
+            .execute(
+                "INSERT INTO typed (id, code) VALUES (2, 'abcdefghijk')",
+                &[],
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), "22001");
     }
 
     #[test]
