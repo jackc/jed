@@ -278,6 +278,8 @@ the gap instead:
 
 <LiveSql query={rangeDemo} rows={3} />
 
+<a id="time-zones"></a>
+
 ## Time zones
 
 `timestamptz` stores a UTC instant; a time zone is an I/O-time interpretation, never part of the
