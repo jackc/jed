@@ -550,15 +550,19 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           return from3(or3(gt3(a, b), eq3(a, b)));
       }
     }
+    // AND / OR short-circuit left to right (cost.md §3): a FALSE left operand decides AND, a TRUE
+    // one decides OR, and the right operand is then never evaluated or charged.
     case "and": {
       m.charge(operatorCost("and"));
       const a = evalExpr(e.lhs, row, env, m);
+      if (a.kind === "bool" && !a.value) return a;
       const b = evalExpr(e.rhs, row, env, m);
       return boolAnd(a, b);
     }
     case "or": {
       m.charge(operatorCost("or"));
       const a = evalExpr(e.lhs, row, env, m);
+      if (a.kind === "bool" && a.value) return a;
       const b = evalExpr(e.rhs, row, env, m);
       return boolOr(a, b);
     }
