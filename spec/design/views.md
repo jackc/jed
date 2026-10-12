@@ -616,7 +616,7 @@ Deferred follow-ons, none foreclosed:
 - The `2BP01` and `0A000` messages name the first blocking view in name byte order.
 - `CREATE OR REPLACE VIEW` compares columns in position order and reports the first difference in
   PostgreSQL's order (count, then per column name, type, collation).
-- A write through a view is a write to the base table with a staged `WHERE` (§15.2, §15.5), which is
+- A write through a view is its equivalent base statement on the base table (§15.2, §15.5), which is
   deterministic in rows, end state, cost, plan, and errors. The `0A000` for a read-only column names the first one in the
   view's column order, and the view-level checks run from the target view down (§15.3).
 
@@ -698,16 +698,16 @@ the body's label and column alias list, and never against the statement's relati
 reference to an updatable column is therefore the base column itself. A reference to a read-only
 column evaluates its select item each time, exactly as if the expression were written in its place.
 
-**`DELETE FROM v WHERE p`** deletes the rows of `b` that satisfy `w` and then `p`, where `w` is
-`v`'s `WHERE` (just `p` when `v` has none, just `w` when the statement has none). `w` is a separate
-**stage**, not an operand of an `AND`: `p` is evaluated only on the rows `w` keeps, so a row the view
-does not show can never raise an error from `p`. This is the order the two conditions apply when the
-view is read (§4), where `w` filters the derived table's body. (jed's `AND` evaluates both operands,
-[cost.md](cost.md) §3, so `w AND p` would not be the same statement.)
+**`DELETE FROM v WHERE p`** is `DELETE FROM b WHERE w AND p`, where `w` is `v`'s `WHERE` (just `p`
+when `v` has none, just `w` when the statement has none). A `WHERE` is a filter, so its top-level
+`AND` chain evaluates left to right and stops at the first conjunct that is not TRUE
+([cost.md](cost.md) §3): `p` is evaluated only on the rows `w` keeps, and a row the view does not show — `w` FALSE or
+NULL — can never raise an error from `p`. This is the order the two conditions apply when the view
+is read (§4), where `w` filters the derived table's body. (PostgreSQL's rewriter likewise adds the
+view's qualification to the statement's `WHERE`.)
 
-**`UPDATE v SET c = e, … WHERE p`** updates the rows of `b` that satisfy `w` and then `p`, staged
-as for `DELETE`. Each assignment to view column `c` assigns `c`'s base column the value of `e`.
-`SET c = DEFAULT` assigns the view column's own default, as in PostgreSQL. jed has no view column
+**`UPDATE v SET c = e, … WHERE p`** is `UPDATE b … WHERE w AND p`, with `w` as for `DELETE`. Each
+assignment to view column `c` assigns `c`'s base column the value of `e`. `SET c = DEFAULT` assigns the view column's own default, as in PostgreSQL. jed has no view column
 defaults (§12), so that is NULL, not the base column's default; on a `GENERATED ALWAYS` identity
 base column it is therefore `428C9`. An update may change a row so that `w` no longer holds; the
 row stays updated and leaves the view.
@@ -729,8 +729,8 @@ new row for `UPDATE`, the deleted row for `DELETE`. `*` expands to `v`'s output 
 select item observes the pre-statement snapshot, like any `RETURNING` subquery.
 
 **Chains.** When `b` is a view, the equivalent base statement is itself a write through `b`, so the
-rule applies again until it reaches a table. Every view's `WHERE` is a stage, the view nearest the
-table first, then the statement's `p`.
+rule applies again until it reaches a table. The views' `WHERE` clauses are AND-ed left-deep, the
+view nearest the table first, then the statement's `p`: `(w₁ AND w₂) AND p`.
 
 **Everything else** is the base statement's own behavior: two-phase validation, `NOT NULL`, `CHECK`,
 `UNIQUE`, primary-key re-keying, foreign keys, identity and serial columns, collated keys, the
@@ -789,18 +789,14 @@ host that must prevent that withholds `allow_ddl`.
 
 ### 15.5 Plan, cost, and EXPLAIN
 
-A write through a view is planned and executed as a write to the base table, with no charge for the
-view. Its **complete predicate** is every stage's condition joined by `AND`, left-deep, in stage order
-(`w AND p` for one view): that is what access-path selection, estimation, contradiction detection,
-and `EXPLAIN` read, so `UPDATE v SET b = 1 WHERE id = 5` on a view that outputs the primary key `id`
-is a point lookup, and `EXPLAIN` renders exactly the plan of `UPDATE t SET b = 1 WHERE w AND id = 5`,
-its root naming the table (`Update t`). Only the per-row evaluation differs: each row the scan reads
-is charged `storage_row_read` and evaluated stage by stage, each stage's nodes charged as usual, and a
-row a stage does not keep (FALSE or NULL) is not evaluated by the later stages. The `AND` nodes that
-join stages perform no `AND` and charge nothing. Everything else (assignments, defaults, checks,
-`RETURNING`, the writes) costs what the base statement's does.
+A write through a view is planned and executed as its equivalent base statement (§15.2), with no
+charge for the view: the same access path, estimates, contradiction detection, `EXPLAIN`, rows,
+errors, and **cost** as the hand-written statement on the base table. So `UPDATE v SET b = 1 WHERE
+id = 5` on a view that outputs the primary key `id` is a point lookup, and `EXPLAIN` renders exactly
+the plan of `UPDATE t SET b = 1 WHERE w AND id = 5`, its root naming the table (`Update t`). Each
+`AND` node of the `WHERE` charges its `operator_eval` like any other.
 
 The NoREC generator pins the rows with a **view-write-vs-base-statement** relation: the same write
 through a view and written by hand against the base table, with the view's conditions inlined, must
 return the same `RETURNING` rows and leave the same table contents ([conformance.md](conformance.md)
-§8). Cost is pinned by `dml/view_write_jed.test`.
+§8). The cost equality is pinned by `dml/view_write_jed.test`.

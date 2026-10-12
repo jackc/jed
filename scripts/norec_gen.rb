@@ -3010,7 +3010,8 @@ end
 # Writes through an updatable view against the same writes on its base table (spec/design/views.md
 # §15). Two identically seeded tables: `vt` is written through `wv` (and `wv2`, a view over `wv`), `bt`
 # directly, with the views' WHERE clauses AND-ed in and the read-only column `s` spelled out as
-# `v + k`. The predicate templates never trap, so the staged view WHERE and the plain AND agree.
+# `v + k` — exactly the equivalent base statement of views.md §15.2, whose WHERE is the views' WHERE
+# clauses AND-ed ahead of the statement's.
 def gen_view_write(seed)
   rng = Random.new(seed)
   val = -> { rng.rand < 0.2 ? nil : rng.rand(0..10) }

@@ -160,9 +160,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   re-validation of every reader with an appended-column capture check), and V6 (`ALTER VIEW … RENAME
   TO` / `RENAME [COLUMN]` and the same `ALTER TABLE` forms on a view, rewriting dependents) all
   landed in every core. V7 (automatically updatable views: `INSERT`/`UPDATE`/`DELETE` through a view
-  of PostgreSQL's simple single-relation shape, chains, staged view `WHERE`s, `RETURNING`, writable
-  CTEs, privileges checked on the view as for a table, and the `view_write` NoREC relation) landed
-  in every core too. → [views.md](spec/design/views.md)
+  of PostgreSQL's simple single-relation shape, chains, view `WHERE`s AND-ed ahead of the
+  statement's, `RETURNING`, writable CTEs, privileges checked on the view as for a table, and the
+  `view_write` NoREC relation) landed in every core too. → [views.md](spec/design/views.md)
   - [ ] _follow-on:_ `WITH CHECK OPTION`, `ON CONFLICT` on an updatable view, view column defaults,
     view options and the other `ALTER VIEW` actions, materialized and recursive views, temporary views, views in or over attached
     databases, `DROP … CASCADE` of dependent views, dependency tracking for

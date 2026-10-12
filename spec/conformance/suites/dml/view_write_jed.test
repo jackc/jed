@@ -202,27 +202,34 @@ PK bound: id = 3; touched=3
 1
 2
 
-# cost: 7
+# The write is the base statement `UPDATE m SET x = x + 1 WHERE y > 0 AND id = 3 RETURNING id, s`,
+# and costs what it does: 1 page + 1 row + the 3-node WHERE + the assignment's `+` + `x + y` for
+# `s` + 1 produced = 8.
+# cost: 8
 query II nosort
 UPDATE mv SET x = x + 1 WHERE id = 3 RETURNING id, s
 ----
 3
 32
 
-# The view's WHERE is a stage, not an AND operand: it runs on every row the scan reads and the
-# statement's WHERE only on the rows it keeps (here 2 of 3), with no AND between them.
-# cost: 12
+# The view's WHERE is the first conjunct of a filter, so `x * 2 > 50` runs only where `y > 0` is
+# TRUE: 1 page + 3 rows + the AND on every row (4 nodes on rows 1 and 3, 2 on row 2) + 1 produced
+# = 15.
+# cost: 15
 query I nosort
 DELETE FROM mv WHERE x * 2 > 50 RETURNING id
 ----
 3
 
-# On the table, the AND runs on every row (the two rows left) and `x * 2 > 50` only where `y > 0` is
-# not FALSE.
-# cost: 9
+statement ok
+INSERT INTO m VALUES (3, 31, 1)
+
+# The hand-written base statement over the same rows costs the same.
+# cost: 15
 query I nosort
 DELETE FROM m WHERE y > 0 AND x * 2 > 50 RETURNING id
 ----
+3
 
 query III nosort
 SELECT * FROM v ORDER BY id

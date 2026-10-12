@@ -212,6 +212,21 @@ DELETE FROM vz WHERE 10 / d < 1 RETURNING id
 ----
 3
 
+# A NULL view WHERE keeps a row out as well: row 1's `g > 0` is NULL, so it is never divided by.
+statement ok
+CREATE TABLE zg (id i32 PRIMARY KEY, d i32, g i32)
+
+statement ok
+INSERT INTO zg VALUES (1, 0, NULL), (2, 5, 1)
+
+statement ok
+CREATE VIEW vzg AS SELECT id, d FROM zg WHERE g > 0
+
+query I rowsort
+DELETE FROM vzg WHERE 10 / d > 1 RETURNING id
+----
+2
+
 # --- writable CTEs -----------------------------------------------------------------------------------
 
 query I nosort
