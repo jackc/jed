@@ -983,15 +983,23 @@ impl RExpr {
                     env, m,
                 )
             }
+            // AND / OR short-circuit left to right (cost.md §3): a FALSE left operand decides AND,
+            // a TRUE one decides OR, and the right operand is then never evaluated or charged.
             RExpr::And(l, r) => {
                 m.charge(operator_cost("and"));
                 let lv = l.eval(row, env, m)?;
+                if matches!(lv, Value::Bool(false)) {
+                    return Ok(lv);
+                }
                 let rv = r.eval(row, env, m)?;
                 Ok(and3(&lv, &rv))
             }
             RExpr::Or(l, r) => {
                 m.charge(operator_cost("or"));
                 let lv = l.eval(row, env, m)?;
+                if matches!(lv, Value::Bool(true)) {
+                    return Ok(lv);
+                }
                 let rv = r.eval(row, env, m)?;
                 Ok(or3(&lv, &rv))
             }
