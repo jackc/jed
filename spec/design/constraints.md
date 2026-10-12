@@ -496,7 +496,8 @@ FK constraints resolve **after** the table-level `PRIMARY KEY`, the `UNIQUE` con
 2. **Parent table.** Look it up by exact name ([grammar.md §3](grammar.md)). It may be the table being
    created — a **self-reference** — in which case it resolves against the in-progress definition
    (its columns, its just-resolved PK, its just-named unique indexes). A missing parent is
-   **`42P01`** (`table does not exist: <name>`).
+   **`42P01`** (`table does not exist: <name>`). A parent that is a **view** is **`42809`**
+   (*referenced relation "v" is not a table*, PostgreSQL's code; [views.md](views.md) §2).
 3. **Referenced columns.** An omitted `(refcol …)` list defaults to the **parent's primary key**
    (in PK key order); a parent with no primary key is **`42704`**
    (`there is no primary key for referenced table <parent>`) — PG's code for the omitted-list case

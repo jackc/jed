@@ -102,7 +102,10 @@ already a table/index/sequence in the same database (the shared relation namespa
 to the current name is `42P07` too (PG-faithful). An owned sequence's `nextval` default text
 references its table by name — a table rename rewrites those owned-sequence defaults, quoting
 the sequence name inside the literal when it is not a plain lowercase identifier (the
-mirror of `ALTER SEQUENCE … RENAME`'s §15.3 rewrite, [sequences.md](sequences.md)).
+mirror of `ALTER SEQUENCE … RENAME`'s §15.3 rewrite, [sequences.md](sequences.md)). A **view**
+that reads the table has its stored definition rewritten too: each FROM item that binds the table
+gets the quoted new name, plus `as "<old name>"` when it had no alias, so its label is unchanged
+([views.md](views.md) §7). The new name may also not be a view's name (`42P07`).
 
 ### 2.2 `RENAME COLUMN … TO …`
 
@@ -119,7 +122,9 @@ identifier** (`"a2"`), so it re-lexes to the same name even when the new name is
 keyword (`RENAME COLUMN a TO "null"` must not turn a stored `a IS NULL` into `null IS NULL`) —
 [grammar.md §3](grammar.md); tokens the rewrite does not substitute keep their stored spelling;
 a name that appears only as a string literal or unrelated identifier is untouched. (This is the one Tier-A form with a sharp edge — it is why `RENAME`
-is its own slice.)
+is its own slice.) **Views** are not rewritten by substituting the column name: every FROM item
+of a dependent view that binds the table gets a quoted column alias list that keeps exposing the
+pre-rename names, so the view keeps its column names as in PostgreSQL ([views.md](views.md) §7).
 
 ### 2.3 `RENAME CONSTRAINT … TO …`
 
@@ -227,6 +232,9 @@ side is likewise dropped automatically. An FK that uses the column only on its r
 `CASCADE` drops it. Dropping a column also rewrites any stored expression text (§0.2) that survives;
 a `CHECK`, expression index, or partial-index predicate that referenced the column is removed with
 its owning object.
+A column a **view** references is an external dependency too: `2BP01` under `RESTRICT`, `0A000`
+under `CASCADE` (dropping dependent views is a follow-on). Dropping an unreferenced column removes
+its entry from any view column alias list that reaches it ([views.md](views.md) §6/§7).
 Dropping a **PK member** implies dropping the whole PK and re-keying to synthetic rowid (§3.4)
 — the hairy case; deferred to its own slice. A column referenced by a **parent** FK (this
 table is the parent) blocks under RESTRICT.
@@ -261,6 +269,9 @@ index/constraint that touches it. The hardest form: a failed cast is the cast's 
 expression over the row's columns. If the column is a key member, its key encoding changes, so
 the table (and dependent indexes) re-key — a full rebuild with final-key uniqueness validation.
 The target type must be key-encodable before PRIMARY KEY metadata is retained (`0A000` otherwise).
+
+A column a **view** references cannot change type: `0A000` (*cannot alter type of a column used by
+a view*), as in PostgreSQL ([views.md](views.md) §6).
 
 The conversion uses jed's explicit cast matrix: without `USING`, the old column value is cast to
 the named target; with `USING`, the expression result is cast to it. Actions apply left-to-right,
@@ -297,6 +308,12 @@ carry ([constraints.md §6.5](constraints.md)). The two-phase pass (validate the
 state, then write) gives per-statement atomicity without cross-statement transactions.
 Incoming-FK validation reads this final cascade-adjusted state, so an FK removed by an earlier
 `DROP PRIMARY KEY CASCADE` or dependent-column cascade cannot reject a later type action.
+
+**Views are re-validated after the statement.** After any `ALTER TABLE` on a table that a view
+reads, each such view is planned again against the end state; if it no longer plans or a name in
+it would bind differently, the whole statement fails with `0A000` and nothing changes
+([views.md](views.md) §8). `ALTER TABLE` naming a view is `42809`, except `RENAME TO` /
+`RENAME COLUMN`, which are `0A000` follow-ons.
 
 ## 5. Conformance and cost obligations
 

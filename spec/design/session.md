@@ -483,6 +483,14 @@ a function (the deny-list — `revoke uuidv4`/`now()` to pin determinism). A fun
 (default-off + per-function `grant`) is the symmetric shape but needs a function-default toggle the v1
 `SessionOptions` (which carries only the *table* `default_privileges`) does not expose; deferred (§11).
 
+**Views** ([views.md](views.md) §9). A view is a relation for privilege purposes: grants and
+`default_privileges` name it like a table. Reading a view needs `SELECT` on the view only; the
+relations its body reads are not checked against the reading session (PostgreSQL's default view
+semantics, with the "owner" check done once at `CREATE VIEW`: the creating session needs
+`allow_ddl` and `SELECT` on every relation the body reads). Function `EXECUTE` inside a view body is
+checked against the reading session. So a host can expose some rows or columns of a table through a
+view to a session that has no grant on the table.
+
 ### 5.4 Session lifetime cost budget
 
 ✅ **Landed (all 3 cores, §10 slice 4).** `max_cost` bounds **one statement**; `lifetime_max_cost`

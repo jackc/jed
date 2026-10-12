@@ -1261,6 +1261,9 @@ contract: it decides whether a CTE's body runs once-and-is-buffered or runs in p
   reference costs the same as writing the body inline. A **derived table** (`FROM (SELECT …) AS t`,
   [grammar.md §42](grammar.md#42-derived-tables-from--query_expr--as-t)) takes this same inline path
   — it has no name to reference twice, so it is always inlined and never charges `cte_scan_row`.
+  A **view reference** is that derived table, `( <definition> ) AS <label> ( <columns> )`, so it
+  costs exactly the same and adds nothing for the view itself ([views.md](views.md) §4). `CREATE
+  VIEW` and `DROP VIEW` cost zero, like the other DDL.
 - **Materialized** (referenced ≥ 2 times, or `MATERIALIZED`): the body runs **once**, accruing its
   full intrinsic cost into a row buffer, and **each reference** charges one **`cte_scan_row`** per
   buffered row — accrued **at the source** (before the row enters the join/WHERE pipeline) with a

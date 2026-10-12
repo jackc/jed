@@ -344,6 +344,10 @@ Kept deliberately narrow, and each consistent with an existing jed deferral:
 - **DDL targets a single database.** `CREATE TABLE reports.t` creates in `reports` (subject to the
   one-durable-writer rule, §5, and `allow_ddl`, session.md §5.3, which still governs — DDL on an
   attachment is DDL). A persisted definition inside that DDL may not name a *different* database (§7).
+- **No views in or over attachments (v1).** `CREATE VIEW reports.v`, a view body naming
+  `reports.t`, and reading a view through an attachment qualifier are `0A000`. An attached file that
+  already contains views keeps enforcing their dependencies (`DROP TABLE reports.t` is `2BP01` when a
+  view in `reports` reads `t`) ([views.md](views.md) §10).
 - **Detach-while-referenced.** `db.detach(name)` fails (`55006`-style *object_in_use*, §11) while any
   live transaction/cursor pins a snapshot of that attachment — the watermark (§5) already tracks this.
 
@@ -523,6 +527,8 @@ Sequenced to put the durability-risky part last:
 - **SQL-level attach** — deliberately *excluded* in v1 (§4), not merely deferred; revisit only for an
   in-`:memory:`-only, capability-gated form if a host need appears.
 - **3-part column references** `db.table.col` (§3) — an ergonomic sugar, not a semantic gap.
+- **Views in and over attachments** (§8, [views.md](views.md) §10) — reading an attached file's views
+  and creating views in an attachment.
 
 (Deliberately **not** a follow-on: an implicit **search path** into attachments — §3 makes it a firm
 non-goal, not a deferral.)

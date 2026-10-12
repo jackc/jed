@@ -106,7 +106,8 @@ A sequence is resident in the snapshot catalog beside `tables` and `types`:
 The name occupies the **relation namespace** it shares with tables and indexes: `CREATE SEQUENCE s`
 when a table, index, or sequence `s` exists is `42P07 duplicate_table` (PG), and a `CREATE TABLE s`
 after `CREATE SEQUENCE s` is likewise `42P07`. (This slice enforces the sequence↔sequence and
-sequence↔table collisions; a sequence↔index collision rides the same name set.)
+sequence↔table collisions; a sequence↔index collision rides the same name set.) Views joined the same namespace
+([views.md](views.md) §2): a sequence and a view never share a name.
 
 ## 3. Catalog & on-disk format (`format_version` 12, owner added in `14`, identity bits in `15`)
 

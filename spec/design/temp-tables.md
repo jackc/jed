@@ -492,4 +492,6 @@ and memory-only per the design decision:
 - `FOREIGN KEY` involving temp tables (§8) — start with FKs among same-kind temp tables.
 - A host-configurable spill directory (shared with the external sort — spill.md), so a WASI or OPFS
   host could offer a temp spill target; and migrating a shrunken spilled domain back into RAM.
-- Temporary **views** / a session-local relation namespace object beyond tables.
+- Temporary **views** / a session-local relation namespace object beyond tables. Persistent views
+  have landed ([views.md](views.md)); `CREATE TEMP VIEW` and a persistent view over a temp relation
+  are `0A000` until then (views.md §10).
